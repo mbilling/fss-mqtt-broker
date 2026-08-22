@@ -185,9 +185,8 @@ impl Hub {
         // stays a withhold rather than a reason code — the store errored, and no reason
         // code honestly says "I do not know what happened" (`DurableOutcome::Failed`
         // therefore dominates any refusal).
-        let (durable, _matched) = self
-            .deliver_local(topic, payload, qos, message_expiry, app, targets, gate)
-            .await;
+        let (durable, _matched) =
+            self.deliver_local(topic, payload, qos, message_expiry, app, targets, gate);
         let durable = if retained_ok {
             durable
         } else {
@@ -266,7 +265,7 @@ impl Hub {
     }
 
     #[allow(clippy::too_many_arguments)] // the delivery fields, plus the two subscription options
-    pub(super) async fn deliver_local(
+    pub(super) fn deliver_local(
         &mut self,
         topic: &str,
         payload: &Bytes,
@@ -297,19 +296,16 @@ impl Hub {
                     w.seen.insert(topic.to_string(), id);
                 }
             }
-            all_durable = all_durable.and(
-                self.deliver_to_client(
-                    &c,
-                    topic,
-                    payload,
-                    min_qos(qos, granted),
-                    message_expiry,
-                    app,
-                    retain,
-                    gate,
-                )
-                .await,
-            );
+            all_durable = all_durable.and(self.deliver_to_client(
+                &c,
+                topic,
+                payload,
+                min_qos(qos, granted),
+                message_expiry,
+                app,
+                retain,
+                gate,
+            ));
         }
         (all_durable, matched)
     }
@@ -336,7 +332,7 @@ impl Hub {
     /// refusal therefore delivers live anyway (recorded nowhere, so nothing is owed) and
     /// is counted as the genuine drop it is (issue #238).
     #[allow(clippy::too_many_arguments)] // the delivery fields, plus the RAP retain flag
-    pub(super) async fn deliver_to_client(
+    pub(super) fn deliver_to_client(
         &mut self,
         client: &ClientId,
         topic: &str,
@@ -424,8 +420,7 @@ impl Hub {
                             );
                             return DurableOutcome::Ok;
                         }
-                        self.send_to_client(client, &tx, &message, retain, message_expiry, None)
-                            .await;
+                        self.send_to_client(client, &tx, &message, retain, message_expiry, None);
                         if let Some(m) = &self.metrics {
                             m.publish_delivered(qos_num(qos));
                         }
@@ -453,8 +448,7 @@ impl Hub {
                 let _ = self.submit_passthrough(client, &message, message_expiry, Some(conn_id));
                 return DurableOutcome::Ok;
             }
-            self.send_to_client(client, &tx, &message, retain, message_expiry, None)
-                .await;
+            self.send_to_client(client, &tx, &message, retain, message_expiry, None);
             if let Some(m) = &self.metrics {
                 m.publish_delivered(qos_num(qos));
             }
@@ -504,7 +498,7 @@ impl Hub {
     /// and no longer reachable. `QoS` 0 deliveries and proto-6 peers keep today's
     /// fire-and-forget `SharedDeliver`: nothing is owed, or the link cannot carry the
     /// answer (a documented rolling-upgrade skew residual).
-    pub(super) async fn deliver_shared(
+    pub(super) fn deliver_shared(
         &mut self,
         topic: &str,
         payload: &Bytes,
@@ -529,19 +523,16 @@ impl Hub {
             let delivered_qos = min_qos(qos, chosen.qos);
             match chosen.node {
                 None => {
-                    all_durable = all_durable.and(
-                        self.deliver_to_client(
-                            &chosen.client,
-                            topic,
-                            payload,
-                            delivered_qos,
-                            message_expiry,
-                            app,
-                            false, // shared delivery clears RETAIN (#198)
-                            &append_gate,
-                        )
-                        .await,
-                    );
+                    all_durable = all_durable.and(self.deliver_to_client(
+                        &chosen.client,
+                        topic,
+                        payload,
+                        delivered_qos,
+                        message_expiry,
+                        app,
+                        false, // shared delivery clears RETAIN (#198)
+                        &append_gate,
+                    ));
                 }
                 Some(node) => {
                     let answerable_remote = answerable
@@ -584,7 +575,7 @@ impl Hub {
     /// most once per publish (`tried`), so the pass is bounded; only an EXHAUSTED pass
     /// answers the publisher, with the last refusal it saw — or a withhold when the last
     /// answer claimed nothing.
-    pub(super) async fn reselect_shared(
+    pub(super) fn reselect_shared(
         &mut self,
         id: u64,
         obligation: ForwardObligation,
@@ -634,18 +625,16 @@ impl Hub {
             let delivered_qos = min_qos(qos, chosen.qos);
             tried.push((chosen.node.clone(), chosen.client.clone()));
             let Some(node) = chosen.node.clone() else {
-                let out = self
-                    .deliver_to_client(
-                        &chosen.client,
-                        &topic,
-                        &payload,
-                        delivered_qos,
-                        message_expiry,
-                        &app,
-                        false,
-                        &AppendGate::Pending(id),
-                    )
-                    .await;
+                let out = self.deliver_to_client(
+                    &chosen.client,
+                    &topic,
+                    &payload,
+                    delivered_qos,
+                    message_expiry,
+                    &app,
+                    false,
+                    &AppendGate::Pending(id),
+                );
                 match out {
                     // `Ok` = the append is SUBMITTED (issue #242): the obligation is
                     // in `appends_outstanding`, so this releases nothing early.
@@ -865,7 +854,7 @@ impl Hub {
     /// the packet reaches the wire. It is tracked as owed here, whether the message goes
     /// out now or waits in the flow-control backlog, and released when the subscriber
     /// acknowledges it.
-    pub(super) async fn send_to_client(
+    pub(super) fn send_to_client(
         &mut self,
         client: &ClientId,
         tx: &Outbound,
@@ -969,7 +958,7 @@ impl Hub {
                 warn_backlog_eviction(client, &evicted, bytes, &limits);
                 // Nothing will deliver the evicted messages, so their offsets no longer
                 // hold the truncation point back.
-                self.truncate_acked(client).await;
+                self.truncate_acked(client);
             }
             // Quota free but the backlog holds a deferred delivery: retry the drain now,
             // in order — traffic is the retry clock, so a store that recovered gets the

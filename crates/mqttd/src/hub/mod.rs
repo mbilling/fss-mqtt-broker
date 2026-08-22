@@ -1917,6 +1917,11 @@ pub struct Hub {
     /// stopped cluster over the same data dirs and failed on the held lock, where every
     /// local run had won the race.
     owned_tasks: tokio::task::JoinSet<()>,
+    /// ADR 0074: sender into the truncate flusher — the task that coalesces
+    /// per-session ack watermarks and flushes them to the store OFF the hub
+    /// loop, so a subscriber ack never waits a truncate round-trip. `None`
+    /// until [`run`](Self::run) spawns the flusher.
+    truncate_tx: Option<mpsc::UnboundedSender<(ClientId, Offset)>>,
     /// Peer verdict aggregates for forwards whose fan-out submitted lane jobs
     /// (issue #242): `(origin, seq)` → what is still owed before the verdict can be
     /// answered. Entries drain via [`HubCommand::AppendDone`].
@@ -2037,6 +2042,7 @@ impl Hub {
                 connecting: HashMap::new(),
                 append_lanes: HashMap::new(),
                 owned_tasks: tokio::task::JoinSet::new(),
+                truncate_tx: None,
                 remote_append_pending: HashMap::new(),
                 node_id,
                 online: HashMap::new(),
@@ -2186,6 +2192,13 @@ impl Hub {
     pub async fn run(mut self) {
         let mut sweep = tokio::time::interval(SESSION_SWEEP_INTERVAL);
         sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // ADR 0074: the truncate flusher. Owned by `owned_tasks` so it aborts with
+        // the hub; a send after abort is the documented not-fatal case (entries
+        // replay at next resume, the subscriber re-acks, the watermark re-advances).
+        let (truncate_tx, truncate_rx) = mpsc::unbounded_channel();
+        self.truncate_tx = Some(truncate_tx);
+        self.owned_tasks
+            .spawn(run_truncate_flusher(self.store.clone(), truncate_rx));
         // The boot window's FIRST inherited-session scan runs immediately, not a
         // sweep tick later: on a fresh or restarted node it completes in
         // milliseconds and releases any publish acks gated on it (ADR 0042 T9).
@@ -2219,7 +2232,7 @@ impl Hub {
                     self.kick_retained_queue();
                     // Retransmit / re-route acked publish forwards (ADR 0042 T9,
                     // exhibit ⑤); no-op when none are pending.
-                    self.sweep_pending_forwards().await;
+                    self.sweep_pending_forwards();
                     // Reap idle append lanes (issue #242): dropping the sender ends
                     // the worker; a later submission re-spawns one. Only with zero
                     // outstanding jobs, so no completion is ever orphaned.
@@ -2426,12 +2439,12 @@ impl Hub {
                 let _ = done.send(snapshot);
             }
             HubCommand::AppendDone { job, outcome } => {
-                self.append_done(*job, outcome).await;
+                self.append_done(*job, outcome);
             }
             HubCommand::PkidBlockReserved { client, result } => {
                 self.pkid_block_reserved(&client, result);
             }
-            HubCommand::PubAck { client, pkid } => self.pub_ack(&client, pkid).await,
+            HubCommand::PubAck { client, pkid } => self.pub_ack(&client, pkid),
             HubCommand::PubRec { client, pkid } => self.pub_rec(&client, pkid).await,
             HubCommand::PubComp { client, pkid } => self.pub_comp(&client, pkid).await,
             HubCommand::Detach {
@@ -2543,10 +2556,10 @@ impl Hub {
                 } else {
                     ForwardVerdict::Failed
                 };
-                self.forward_answered(&node, seq, verdict).await;
+                self.forward_answered(&node, seq, verdict);
             }
             HubCommand::RemotePublishVerdict { node, seq, verdict } => {
-                self.forward_answered(&node, seq, verdict).await;
+                self.forward_answered(&node, seq, verdict);
             }
             HubCommand::RemoteSharedDeliverAcked {
                 node,
@@ -2564,21 +2577,19 @@ impl Hub {
                 // re-select within the group instead of acking a message that reached
                 // nobody. Arrives only from a proto-7 sender, so a verdict can always be
                 // sent back.
-                let out = self
-                    .deliver_to_client(
-                        &client,
-                        &topic,
-                        &payload,
-                        qos,
-                        message_expiry,
-                        &app,
-                        false, // shared delivery clears RETAIN (#198)
-                        &AppendGate::Peer {
-                            node: node.clone(),
-                            seq,
-                        },
-                    )
-                    .await;
+                let out = self.deliver_to_client(
+                    &client,
+                    &topic,
+                    &payload,
+                    qos,
+                    message_expiry,
+                    &app,
+                    false, // shared delivery clears RETAIN (#198)
+                    &AppendGate::Peer {
+                        node: node.clone(),
+                        seq,
+                    },
+                );
                 // Answered now, or at the append's `AppendDone` (issue #242).
                 self.finish_peer_verdict(&node, seq, out);
             }
@@ -2633,7 +2644,7 @@ impl Hub {
                 self.peer_disconnected(&node, conn_id);
             }
             HubCommand::PeerDead { node } => {
-                self.peer_dead(&node).await;
+                self.peer_dead(&node);
                 // The takeover window (ADR 0042 T9, exhibit ⑥): reconcile inherited
                 // sessions eagerly for the next several sweep ticks so their
                 // subscriptions materialize within seconds of the owner's death.
@@ -2643,7 +2654,7 @@ impl Hub {
                 self.handle_durable_frame(&node, frame);
             }
             HubCommand::InheritedSessions { sessions, complete } => {
-                self.inherit_sessions(sessions, complete).await;
+                self.inherit_sessions(sessions, complete);
             }
             HubCommand::Ping { reply } => {
                 // Reached the loop → it is live. The receiver may be gone if the
@@ -2843,18 +2854,16 @@ impl Hub {
                 // truth, and it is what keeps the live send when the durable copy is
                 // refused: nobody will be told and nobody will retry, so suppressing the
                 // delivery would destroy the message rather than defer it.
-                let _ = self
-                    .deliver_to_client(
-                        &client,
-                        &topic,
-                        &payload,
-                        qos,
-                        message_expiry,
-                        &app,
-                        false,
-                        &AppendGate::None,
-                    )
-                    .await;
+                let _ = self.deliver_to_client(
+                    &client,
+                    &topic,
+                    &payload,
+                    qos,
+                    message_expiry,
+                    &app,
+                    false,
+                    &AppendGate::None,
+                );
             }
             // Client/session commands are handled in `dispatch`; they never route here.
             _ => {}
@@ -2917,10 +2926,7 @@ impl Hub {
         // subscriber, and a failed enqueue for the chosen member must withhold the
         // publisher's ack exactly as an ordinary subscriber's would — otherwise the
         // publisher is told a message survived that was never recorded.
-        durable = durable.and(
-            self.deliver_shared(topic, payload, qos, message_expiry, app, gate)
-                .await,
-        );
+        durable = durable.and(self.deliver_shared(topic, payload, qos, message_expiry, app, gate));
         self.forward_to_peers(topic, payload, qos, retain, message_expiry, app, gate);
         // Durable retained (ADR 0037): after the live fan-out — which stays undelayed —
         // route the retained mutation to its topic's group lease-owner for the
@@ -3495,8 +3501,7 @@ impl Hub {
                                 false,
                                 Some(remaining),
                                 Some(qm.offset),
-                            )
-                            .await;
+                            );
                         }
                         None => {
                             self.send_to_client(
@@ -3506,8 +3511,7 @@ impl Hub {
                                 false,
                                 None,
                                 Some(qm.offset),
-                            )
-                            .await;
+                            );
                         }
                     }
                 }
@@ -3516,7 +3520,7 @@ impl Hub {
                     // Truncate only the entries this replay let go of — a `QoS` > 0
                     // message that went on the wire is truncated when the subscriber
                     // acknowledges it, not when it was sent (#124).
-                    self.truncate_acked(&client).await;
+                    self.truncate_acked(&client);
                 }
             }
 
@@ -3772,8 +3776,7 @@ impl Hub {
                     Some(d) => Some(u32::try_from(d - now).unwrap_or(u32::MAX)),
                     None => None,
                 };
-                self.send_to_client(client, &tx, &m, true, remaining, None)
-                    .await;
+                self.send_to_client(client, &tx, &m, true, remaining, None);
             }
         } else if !retained_replay.is_empty() {
             // #87 item 5: the subscription resolved retained values but the client is not
@@ -3847,10 +3850,10 @@ impl Hub {
 
     /// PUBACK: completes a `QoS` 1 delivery, freeing a quota slot (ADR 0012) and
     /// releasing the message's durable log entry (#124).
-    async fn pub_ack(&mut self, client: &ClientId, pkid: u16) {
+    fn pub_ack(&mut self, client: &ClientId, pkid: u16) {
         let completed = self.complete_pending(client, pkid, OutState::AwaitingPubAck);
         if completed {
-            self.truncate_acked(client).await;
+            self.truncate_acked(client);
             self.drain_backlog(client);
         }
     }
@@ -3871,9 +3874,33 @@ impl Hub {
     }
 
     /// Truncate the session's durable log through the **contiguous** prefix the subscriber
-    /// has acknowledged (#124). A message is written before it goes on the wire, so this is
-    /// what finally lets go of it; nothing is truncated on send.
-    async fn truncate_acked(&mut self, client: &ClientId) {
+    /// has acknowledged (#124) — DETACHED (ADR 0074): the watermark is handed to the
+    /// flusher and this path never waits a truncate round-trip. Measured twice on the
+    /// scale curve, the inline await was the durable ceiling: one serialized barrier
+    /// per message pinned msg/s to the slowest disk's barrier RATE while the ADR 0071
+    /// writer idled at 2.3 ops/batch. A message is written before it goes on the wire,
+    /// so truncation is what finally lets go of it; nothing is truncated on send.
+    fn truncate_acked(&mut self, client: &ClientId) {
+        let Some(up_to) = self
+            .inflight
+            .get_mut(client)
+            .and_then(Inflight::advance_ack)
+        else {
+            return;
+        };
+        // A closed/absent flusher is the documented not-fatal case: the entries stay
+        // in the log and are replayed on the next resume. A duplicate at QoS 1 is
+        // spec-legal; losing one would not be.
+        if let Some(tx) = &self.truncate_tx {
+            let _ = tx.send((client.clone(), up_to));
+        }
+    }
+
+    /// [`truncate_acked`](Self::truncate_acked), but awaited inline — the `QoS` 2
+    /// completion path keeps this (ADR 0074 Decision 2): its exactly-once rests on
+    /// the durable outbound id-state (ADR 0057), and the pre-existing crash window
+    /// between the outbound-id clear and the truncate must stay exactly as wide as it is.
+    async fn truncate_acked_now(&mut self, client: &ClientId) {
         let Some(up_to) = self
             .inflight
             .get_mut(client)
@@ -3954,7 +3981,7 @@ impl Hub {
                   "outbound QoS2 id clear failed; a restore may send one spurious PUBREL");
         }
         if completed {
-            self.truncate_acked(client).await;
+            self.truncate_acked_now(client).await;
             self.drain_backlog(client);
         }
     }
@@ -4545,7 +4572,7 @@ impl Hub {
     /// which an orphaned session would never expire on the new owner). A later
     /// real attach takes over cleanly: registration is idempotent and
     /// `finish_attach` overwrites the placeholder expiry interval.
-    async fn inherit_sessions(
+    fn inherit_sessions(
         &mut self,
         sessions: Vec<(ClientId, Vec<Subscription>, Option<u64>)>,
         complete: bool,
@@ -4613,7 +4640,7 @@ impl Hub {
             self.gossip_interest();
         }
         self.release_moved_sessions();
-        self.settle_pending_publishes().await;
+        self.settle_pending_publishes();
     }
 
     /// The mirror of [`inherit_sessions`] for a ring that GREW (ADR 0043 P2):
@@ -5412,7 +5439,7 @@ impl Hub {
     ///
     /// Removing the peer entry also drops its outbound sender, which closes the
     /// link's pump on whichever side still holds the socket open.
-    async fn peer_dead(&mut self, node: &NodeId) {
+    fn peer_dead(&mut self, node: &NodeId) {
         let had_link = self.peers.remove(node).is_some();
         self.known_peer_protos.remove(node);
         let had_interest = self.remote_interest.remove(node).is_some();
@@ -5458,8 +5485,7 @@ impl Hub {
         }
         for (id, obligation) in dead_shared {
             // `Failed`, not a refusal: a dead node says nothing about what it stored.
-            self.reselect_shared(id, obligation, DurableOutcome::Failed)
-                .await;
+            self.reselect_shared(id, obligation, DurableOutcome::Failed);
         }
         if had_link || had_interest {
             info!(peer = %node.0, "peer declared dead; routing state dropped");
@@ -5691,6 +5717,64 @@ pub(crate) fn publish_packet(
         pkid,
         payload,
     })
+}
+
+/// The ADR 0074 truncate flusher: coalesce per-session ack watermarks and flush
+/// them to the store off the hub loop. One map entry per session (max offset
+/// wins — a burst of N acks becomes ONE truncate at the final watermark), a
+/// small bounded number of concurrent flushes, and the documented not-fatal
+/// tolerance on failure: the entries stay in the log and replay at next resume.
+/// Truncates are monotonic and idempotent, so a flush racing a newer watermark
+/// (or the `QoS` 2 path's inline truncate) is harmless — the higher offset wins
+/// at the store, the lower one deletes nothing extra.
+async fn run_truncate_flusher(
+    store: Arc<dyn SessionStore>,
+    mut rx: mpsc::UnboundedReceiver<(ClientId, Offset)>,
+) {
+    /// Concurrent flushes in flight: enough to keep the truncate pipeline busy
+    /// across sessions without turning the flusher into an unbounded spawner.
+    const FLUSH_CONCURRENCY: usize = 8;
+    let mut latest: HashMap<ClientId, Offset> = HashMap::new();
+    let mut flushes: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
+    loop {
+        // Wait for work: a new watermark, or a finished flush freeing a slot.
+        tokio::select! {
+            msg = rx.recv() => {
+                let Some((client, up_to)) = msg else { break }; // hub gone
+                let slot = latest.entry(client).or_insert(up_to);
+                *slot = (*slot).max(up_to);
+            }
+            Some(_) = flushes.join_next(), if !flushes.is_empty() => {}
+        }
+        // Opportunistically drain the channel so a burst coalesces before flushing.
+        while let Ok((client, up_to)) = rx.try_recv() {
+            let slot = latest.entry(client).or_insert(up_to);
+            *slot = (*slot).max(up_to);
+        }
+        while flushes.len() < FLUSH_CONCURRENCY {
+            let Some(client) = latest.keys().next().cloned() else {
+                break;
+            };
+            let Some(up_to) = latest.remove(&client) else {
+                break;
+            };
+            let store = store.clone();
+            flushes.spawn(async move {
+                if let Err(e) = store.ack(&client, up_to).await {
+                    // Not fatal: the entries stay in the log and are replayed on the
+                    // next resume. A duplicate at QoS 1 is spec-legal; losing one
+                    // would not be.
+                    debug!(client = %client.0, up_to, error = %e,
+                           "detached truncate of the acknowledged session log failed");
+                }
+            });
+        }
+    }
+    // Hub dropped its sender: flush what remains, best-effort, then stop.
+    while flushes.join_next().await.is_some() {}
+    for (client, up_to) in latest {
+        let _ = store.ack(&client, up_to).await;
+    }
 }
 
 async fn recover_session(
@@ -14638,6 +14722,10 @@ mod tests {
         /// client id → number of upcoming enqueues to answer `Rejected` (the
         /// queue-cap reject-newest model, for the detach-spill tests).
         reject_next: std::sync::Mutex<std::collections::HashMap<String, usize>>,
+        /// client id → release gate for `ack` (ADR 0074): the stand-in for a slow
+        /// quorum truncate, parking the DETACHED flusher rather than the hub loop.
+        ack_gates:
+            std::sync::Mutex<std::collections::HashMap<String, tokio::sync::watch::Receiver<bool>>>,
     }
 
     impl ParkingStore {
@@ -14650,6 +14738,7 @@ mod tests {
                 outbound_gates: std::sync::Mutex::new(std::collections::HashMap::new()),
                 reserve_gates: std::sync::Mutex::new(std::collections::HashMap::new()),
                 reject_next: std::sync::Mutex::new(std::collections::HashMap::new()),
+                ack_gates: std::sync::Mutex::new(std::collections::HashMap::new()),
             })
         }
 
@@ -14680,6 +14769,14 @@ mod tests {
         fn park_reserve(&self, client: &str) -> tokio::sync::watch::Sender<bool> {
             let (tx, rx) = tokio::sync::watch::channel(false);
             self.reserve_gates.lock().unwrap().insert(client.into(), rx);
+            tx
+        }
+
+        /// Park every future `ack` (truncate) for `client` (ADR 0074); the returned
+        /// sender releases them all with `send(true)`.
+        fn park_ack(&self, client: &str) -> tokio::sync::watch::Sender<bool> {
+            let (tx, rx) = tokio::sync::watch::channel(false);
+            self.ack_gates.lock().unwrap().insert(client.into(), rx);
             tx
         }
 
@@ -14813,6 +14910,8 @@ mod tests {
             client: &ClientId,
             up_to: mqtt_storage::Offset,
         ) -> Result<(), mqtt_storage::StorageError> {
+            Self::await_gate(&self.ack_gates, client).await;
+            self.log("ack", format!("{} {up_to}", client.0));
             self.inner.ack(client, up_to).await
         }
         async fn record_received(
@@ -15018,6 +15117,134 @@ mod tests {
             .expect("released append completes the strict publish")
             .unwrap();
         assert_eq!(out, PublishOutcome::Accepted);
+    }
+
+    /// ADR 0074 — a subscriber's PUBACK completes without waiting the durable
+    /// truncate: with the store's `ack` PARKED, the hub keeps delivering (the
+    /// old inline await blocked the whole loop on exactly this gate — RED
+    /// before the fix), and the released flusher then truncates at the right
+    /// watermark. The failure path's tolerance is unchanged: entries outlive
+    /// the ack only until the flush lands.
+    #[tokio::test]
+    async fn a_subscriber_ack_completes_while_its_truncate_is_still_parked() {
+        let store = ParkingStore::new();
+        let release = store.park_ack("s");
+        let tx = start_hub_with_arc(store.clone());
+
+        let (mut rx, _) = attach(&tx, "s", 1, false).await;
+        subscribe_qos(&tx, "s", "tr/t", QoS::AtLeastOnce);
+
+        publish_qos1(&tx, "tr/t", b"one");
+        let pkid = pkid_of(
+            &timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .expect("first delivery")
+                .unwrap(),
+        );
+        pub_ack(&tx, "s", pkid);
+
+        // The loop must stay live while the truncate is parked: a second publish
+        // still flows end to end. Under the old inline await this hung forever.
+        publish_qos1(&tx, "tr/t", b"two");
+        let pkid2 = pkid_of(
+            &timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .expect("the hub must not block on a parked truncate")
+                .unwrap(),
+        );
+        assert_ne!(pkid, pkid2);
+
+        release.send(true).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if store
+                .ops()
+                .iter()
+                .any(|(op, d)| op == "ack" && d.starts_with("s "))
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the released flusher must truncate the acked prefix; ops: {:?}",
+                store.ops()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// ADR 0074 — a burst of acks COALESCES: five acknowledged deliveries reach
+    /// the store as at most two truncates (one that was already parked in
+    /// flight, plus one carrying the final watermark), and the last truncate
+    /// covers the entire acked prefix. This is the O(sessions)-not-O(messages)
+    /// property the watermark exists for.
+    #[tokio::test]
+    async fn a_burst_of_acks_coalesces_into_one_watermark_truncate() {
+        let store = ParkingStore::new();
+        let release = store.park_ack("s");
+        let tx = start_hub_with_arc(store.clone());
+
+        let (mut rx, _) = attach(&tx, "s", 1, false).await;
+        subscribe_qos(&tx, "s", "co/t", QoS::AtLeastOnce);
+
+        let mut pkids = Vec::new();
+        for _ in 0..5 {
+            publish_qos1(&tx, "co/t", b"m");
+            pkids.push(pkid_of(
+                &timeout(Duration::from_secs(2), rx.recv())
+                    .await
+                    .expect("delivery")
+                    .unwrap(),
+            ));
+        }
+        for pkid in pkids {
+            pub_ack(&tx, "s", pkid);
+        }
+
+        release.send(true).unwrap();
+        // The flusher settles when a truncate covering the FULL prefix has landed.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let final_up_to = loop {
+            let acks: Vec<u64> = store
+                .ops()
+                .iter()
+                .filter(|(op, d)| op == "ack" && d.starts_with("s "))
+                .map(|(_, d)| d.split(' ').nth(1).unwrap().parse::<u64>().unwrap())
+                .collect();
+            if let Some(&last) = acks.last() {
+                if acks.iter().all(|a| *a <= last) && !acks.is_empty() {
+                    // Wait until no NEW ack has landed for a beat — then judge.
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    let settled: Vec<u64> = store
+                        .ops()
+                        .iter()
+                        .filter(|(op, d)| op == "ack" && d.starts_with("s "))
+                        .map(|(_, d)| d.split(' ').nth(1).unwrap().parse::<u64>().unwrap())
+                        .collect();
+                    if settled.len() == acks.len() {
+                        assert!(
+                            settled.len() <= 2,
+                            "five acks must coalesce to at most two truncates, got {settled:?}"
+                        );
+                        break *settled.last().unwrap();
+                    }
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no truncate landed after release; ops: {:?}",
+                store.ops()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        // The final watermark covers everything the earlier flushes covered.
+        let all: Vec<u64> = store
+            .ops()
+            .iter()
+            .filter(|(op, d)| op == "ack" && d.starts_with("s "))
+            .map(|(_, d)| d.split(' ').nth(1).unwrap().parse::<u64>().unwrap())
+            .collect();
+        assert_eq!(final_up_to, *all.iter().max().unwrap());
     }
 
     /// Issue #242 — the head-of-line acceptance criterion (RED before the fix): a

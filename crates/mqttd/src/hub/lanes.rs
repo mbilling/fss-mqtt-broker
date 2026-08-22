@@ -599,7 +599,7 @@ impl Hub {
     /// half of a durable append. Runs on the single-threaded loop like every dispatch,
     /// so all pending-publish, in-flight, and lane mutation stays race-free —
     /// ADR 0017's argument, applied to appends.
-    pub(super) async fn append_done(&mut self, job: AppendJob, outcome: LaneOutcome) {
+    pub(super) fn append_done(&mut self, job: AppendJob, outcome: LaneOutcome) {
         if let Some(lane) = self.append_lanes.get_mut(&job.client) {
             lane.outstanding = lane.outstanding.saturating_sub(1);
         }
@@ -651,7 +651,7 @@ impl Hub {
                     }
                 },
             };
-        if send && self.park_ordering_gated_qos0(&job).await {
+        if send && self.park_ordering_gated_qos0(&job) {
             send = false;
         }
         if send {
@@ -663,8 +663,7 @@ impl Hub {
                     job.retain,
                     job.message_expiry,
                     offset,
-                )
-                .await;
+                );
                 if let Some(m) = &self.metrics {
                     m.publish_delivered(qos_num(job.message.qos));
                 }
@@ -715,7 +714,7 @@ impl Hub {
     /// (delaying a `QoS` 0 is always legal; overtaking is what nothing permits).
     /// `QoS` > 0 passthroughs need no re-check: their send runs through
     /// `send_to_client`, whose backlog gate already diverts them.
-    pub(super) async fn park_ordering_gated_qos0(&mut self, job: &AppendJob) -> bool {
+    pub(super) fn park_ordering_gated_qos0(&mut self, job: &AppendJob) -> bool {
         let gated = matches!(job.work, LaneWork::Passthrough)
             && job.message.qos == QoS::AtMostOnce
             && self.inflight.get(&job.client).is_some_and(|i| {
@@ -741,7 +740,7 @@ impl Hub {
                 }
             }
             warn_backlog_eviction(&job.client, &evicted, bytes, &limits);
-            self.truncate_acked(&job.client).await;
+            self.truncate_acked(&job.client);
         }
         true
     }

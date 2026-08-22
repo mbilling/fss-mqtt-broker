@@ -850,7 +850,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 336 test(s)
+## `crates/mqttd/src/lib.rs` — 338 test(s)
 
 - `admission::tests::the_global_cap_refuses_at_the_bound_and_recovers`
 - `admission::tests::the_penalty_box_refuses_after_the_threshold`
@@ -981,6 +981,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::a_brownout_refusal_delivers_to_nobody_even_when_a_subscriber_owed_no_durability`
 - `hub::tests::a_brownout_refusal_is_counted_as_a_quota_rejection_not_a_drop`
 - `hub::tests::a_brownout_refused_will_does_not_overtake_an_inflight_qos1_append`
+- `hub::tests::a_burst_of_acks_coalesces_into_one_watermark_truncate`
 - `hub::tests::a_cleared_retained_topic_is_not_resurrected_after_a_restart`
 - `hub::tests::a_cleared_topic_stays_cleared_for_a_peer_that_missed_the_clear`
 - `hub::tests::a_co_subscribed_filter_releases_the_ack_while_a_moved_durable_copy_is_lost`
@@ -1059,6 +1060,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::a_stalled_packet_id_reservation_does_not_park_the_loop`
 - `hub::tests::a_stalled_qos0_subscriber_is_shed_not_queued_without_limit`
 - `hub::tests::a_stalled_record_outbound_does_not_delay_a_group_b_publish`
+- `hub::tests::a_subscriber_ack_completes_while_its_truncate_is_still_parked`
 - `hub::tests::a_successful_shared_enqueue_still_acks`
 - `hub::tests::a_third_node_composes_a_refusal_and_a_store_into_a_withhold`
 - `hub::tests::a_tombstone_only_node_still_offers_its_digest`
