@@ -1262,7 +1262,7 @@ checksum = "fc0fef456e4baa96da950455cd02c081ca953b141298e41db3fc7e36b1da849c"
 
 [[package]]
 name = "history-check"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "serde",
  "serde_json",
@@ -1962,7 +1962,7 @@ dependencies = [
 
 [[package]]
 name = "mqtt-auth"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "argon2",
  "async-trait",
@@ -1980,7 +1980,7 @@ dependencies = [
 
 [[package]]
 name = "mqtt-bridge"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "bytes",
  "criterion",
@@ -2004,7 +2004,7 @@ dependencies = [
 
 [[package]]
 name = "mqtt-cluster"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "async-trait",
  "aws-lc-rs",
@@ -2024,7 +2024,7 @@ dependencies = [
 
 [[package]]
 name = "mqtt-codec"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "bytes",
  "criterion",
@@ -2033,7 +2033,7 @@ dependencies = [
 
 [[package]]
 name = "mqtt-config"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "serde",
  "serde_ignored",
@@ -2043,7 +2043,7 @@ dependencies = [
 
 [[package]]
 name = "mqtt-core"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "bytes",
  "mqtt-codec",
@@ -2052,7 +2052,7 @@ dependencies = [
 
 [[package]]
 name = "mqtt-net"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "bytes",
  "futures-util",
@@ -2069,7 +2069,7 @@ dependencies = [
 
 [[package]]
 name = "mqtt-observability"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "aws-lc-rs",
  "opentelemetry",
@@ -2083,7 +2083,7 @@ dependencies = [
 
 [[package]]
 name = "mqtt-storage"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "async-trait",
  "bytes",
@@ -2098,7 +2098,7 @@ dependencies = [
 
 [[package]]
 name = "mqttd"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "argon2",
  "async-trait",
@@ -2133,7 +2133,7 @@ dependencies = [
 
 [[package]]
 name = "mqttd-operator"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "aws-lc-rs",
  "futures-util",
@@ -3997,9 +3997,9 @@ dependencies = [
 
 [[package]]
 name = "validit"
-version = "0.2.5"
+version = "0.2.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4efba0434d5a0a62d4f22070b44ce055dc18cb64d4fa98276aa523dadfaba0e7"
+checksum = "4417835826b78aa6265724624d424df2b1e6e71a33329227d8b04a88950780dc"
 dependencies = [
  "anyerror",
 ]
