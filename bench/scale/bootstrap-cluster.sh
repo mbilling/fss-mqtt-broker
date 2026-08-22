@@ -79,6 +79,10 @@ render_env() { # render_env <index> <ready-min> <seeds> > file
 		-e "s|@READY_MIN_MEMBERS@|$ready|g" \
 		-e "s|@DURABLE_LINE@|$durable_line|g" \
 		"$SCALE_DIR/templates/mqttd.env.tmpl"
+	# Disclosed per-variant override (e.g. MQTTD_LEASE_VOTERS=7 for the
+	# past-the-cap lane). Appended last so it wins, and it lands in the env
+	# dumps the run archives — a variant can never run undisclosed.
+	[ -z "${EXTRA_BROKER_ENV:-}" ] || printf '%s\n' "$EXTRA_BROKER_ENV"
 }
 
 # ── 3. Push secrets + env to every node ──────────────────────────────────────

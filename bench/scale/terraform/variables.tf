@@ -1,10 +1,10 @@
 variable "node_count" {
-  description = "Broker nodes in this cluster. ADR 0048 §2 fixes the curve's points at 1, 3 and 5 — other sizes would not be comparable to the published curve."
+  description = "Broker nodes in this cluster. ADR 0048 §2 fixes the curve's canonical points at 1, 3 and 5; 7 is the past-the-voter-cap extension (durable capacity is architecturally flat there per ADR 0049 unless the MQTTD_LEASE_VOTERS variant is run beside it — run-curve.sh does both and the doc publishes both)."
   type        = number
 
   validation {
-    condition     = contains([1, 3, 5], var.node_count)
-    error_message = "node_count must be 1, 3 or 5 (the ADR 0048 §2 curve points)."
+    condition     = contains([1, 3, 5, 7], var.node_count)
+    error_message = "node_count must be 1, 3, 5 or 7 (the curve points plus the past-the-cap extension)."
   }
 }
 
