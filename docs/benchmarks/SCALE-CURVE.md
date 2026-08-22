@@ -196,8 +196,24 @@ Near-linear scaling with the tail *tightening* as nodes are added (the p99
 bound fell 100→25 ms from 1 to 5 nodes) — the ADR 0015 shared-subscription
 mechanism distributing load exactly as claimed, and consistent with the
 `v1.0.1` run to within a few percent (this lane is untouched by 0071/0072, as
-it should be). **Every rung was driver-limited**: two drivers saturated before
-any cluster size did, so these are floors and no knee exists in this data.
+it should be). **Every rung was flagged driver-limited** (drivers offered <97%
+of the ladder rate), and this run's doc originally read that as "two drivers
+saturated first — these are floors."
+
+*(2026-08-22 correction, issue #376: a 3-driver rerun falsified that reading.
++50% driver capacity moved no rung at sizes 1 and 3 — same rates within noise —
+while drivers averaged ~55% idle and brokers ~65% idle. The real ceiling is the
+broker's hub loop: over one 60 s rung a broker's `publish` dispatches consumed
+80.6 loop-seconds at a mean 127 µs each (shared-group fan-out resolution),
+while 1 µs PUBACK dispatches queued behind them — and the window-100 closed-loop
+publishers are paced by exactly those acks. So Curve 2's numbers are close to
+the broker's real ceiling FOR THIS SHAPE (600 window-100 QoS 1 publishers → 300
+shared subscribers), the 1→3 scaling is real broker scaling rather than a
+driver artifact, and the lever for raising the ceiling is publish-dispatch cost
+/ ack scheduling on the broker — not a bigger driver fleet. The 5-node 3-driver
+point was not measured: it needs 44 dedicated vCPUs against the account's ~40
+limit.)*
+
 Driver-sent vs broker-received counters disagree by ~10–50% on every rung
 because a stopped publisher container's last printed total lags its true
 count; the broker-side counter is authoritative and the summarizer flags every
@@ -242,8 +258,10 @@ measured with the observability stack running).
 - **On fast hardware the durability tiers buy ~nothing** — see the tier
   section; the honest summary is "quorum is already cheap here", and the tiers'
   value is confined to slow-barrier or high-RTT deployments.
-- **Curve 2's numbers are floors** — every rung driver-limited; no knee was
-  found at any size.
+- **Curve 2's ceiling is the hub loop's publish dispatch, not the cluster's
+  CPU** (issue #376, found by the 3-driver rerun): acks starve behind ~127 µs
+  fan-out resolutions, pacing every closed-loop publisher. The numbers are
+  near-ceiling for this shape, but the shape's ceiling is one hot code path.
 - Lane B p99s are bucket bounds; cross-driver clock skew bounds the finest
   readable bucket.
 - Multi-tenant NVMe variance (3.0× across nominally identical hosts this run)
