@@ -1346,8 +1346,7 @@ impl Hub {
         // fresh that its interest had not reached the publish's landing node: for
         // exactly those (open windows, ledger-deduped), this apply IS the vehicle.
         if deliver_windowed {
-            self.deliver_to_windowed_subscribers(topic, payload, qos, app, expires_at)
-                .await;
+            self.deliver_to_windowed_subscribers(topic, payload, qos, app, expires_at);
         }
     }
 
@@ -1361,7 +1360,7 @@ impl Hub {
     /// zero-length publish [MQTT-3.3.1-10]. An offline persistent subscriber gets
     /// the queue semantics `deliver_to_client` always applies, closing the same
     /// window for the resume replay. No-op in the steady state (no open windows).
-    pub(super) async fn deliver_to_windowed_subscribers(
+    pub(super) fn deliver_to_windowed_subscribers(
         &mut self,
         topic: &str,
         payload: &Bytes,
@@ -1406,18 +1405,16 @@ impl Hub {
             // Unanswerable (issue #238): this back-fill has no publisher behind it, so a
             // refused durable copy must not cost the live delivery too — the message
             // would simply be gone, with nobody to retry it.
-            let _ = self
-                .deliver_to_client(
-                    &c,
-                    topic,
-                    payload,
-                    delivery_qos,
-                    remaining,
-                    app,
-                    retain,
-                    &AppendGate::None,
-                )
-                .await;
+            let _ = self.deliver_to_client(
+                &c,
+                topic,
+                payload,
+                delivery_qos,
+                remaining,
+                app,
+                retain,
+                &AppendGate::None,
+            );
             if let Some(w) = self.retained_windows.get_mut(&c) {
                 w.seen.insert(topic.to_string(), id);
             }

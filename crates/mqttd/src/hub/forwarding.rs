@@ -130,7 +130,7 @@ impl Hub {
     /// registered before it began — the publisher waited out the window and is then
     /// told `0x97`. That is the same class as today's `Failed` → withhold, but with a
     /// reason it can act on (0041-T11, issue #238).
-    pub(super) async fn redeliver_pending(&mut self, id: u64) -> DurableOutcome {
+    pub(super) fn redeliver_pending(&mut self, id: u64) -> DurableOutcome {
         let Some(p) = self.pending_publishes.get(&id) else {
             return DurableOutcome::Ok;
         };
@@ -154,23 +154,20 @@ impl Hub {
             .collect();
         let mut all_durable = DurableOutcome::Ok;
         for (c, granted) in targets {
-            all_durable = all_durable.and(
-                self.deliver_to_client(
-                    &c,
-                    &topic,
-                    &payload,
-                    min_qos(qos, granted),
-                    expiry,
-                    &app,
-                    false,
-                    // A gated publisher IS waiting on this id, so a refusal here is
-                    // answerable — but only as a WITHHOLD if the original fan-out
-                    // already stored the message (or still might, via an in-flight
-                    // lane append), which `refuse_pending` enforces.
-                    &AppendGate::Pending(id),
-                )
-                .await,
-            );
+            all_durable = all_durable.and(self.deliver_to_client(
+                &c,
+                &topic,
+                &payload,
+                min_qos(qos, granted),
+                expiry,
+                &app,
+                false,
+                // A gated publisher IS waiting on this id, so a refusal here is
+                // answerable — but only as a WITHHOLD if the original fan-out
+                // already stored the message (or still might, via an in-flight
+                // lane append), which `refuse_pending` enforces.
+                &AppendGate::Pending(id),
+            ));
         }
         all_durable
     }
@@ -180,7 +177,7 @@ impl Hub {
     /// just-materialized subscriptions (duplicates are legal at `QoS` 1 — the
     /// alternative was an ack into the void, exhibit ⑥), then re-checks remote
     /// interest via the sweep's re-route path before its ack can release.
-    pub(super) async fn settle_pending_publishes(&mut self) {
+    pub(super) fn settle_pending_publishes(&mut self) {
         let held: Vec<u64> = self
             .pending_publishes
             .iter()
@@ -199,7 +196,7 @@ impl Hub {
         // the one observable-state predicate for all of it.
         let window_over = !self.routing_unsettled();
         for id in held {
-            let out = self.redeliver_pending(id).await;
+            let out = self.redeliver_pending(id);
             match out {
                 DurableOutcome::Ok => {}
                 // The re-delivery's durable append failed terminally: withhold.
@@ -540,12 +537,7 @@ impl Hub {
     /// stored a copy while peer Y refused, so the publisher hears `0x97` and its retry
     /// duplicates on X — is the one [`refuse_pending`](Self::refuse_pending) already
     /// documents; duplicates are legal at `QoS` 1, a false ack is not.
-    pub(super) async fn forward_answered(
-        &mut self,
-        node: &NodeId,
-        seq: u64,
-        verdict: ForwardVerdict,
-    ) {
+    pub(super) fn forward_answered(&mut self, node: &NodeId, seq: u64, verdict: ForwardVerdict) {
         let Some(id) = self.forward_index.remove(&seq) else {
             return; // stale answer (entry dropped or already resolved)
         };
@@ -588,8 +580,7 @@ impl Hub {
                 // A shared group's whole point: one member's browned-out node is a
                 // RE-BALANCE, not a cluster-wide publish refusal.
                 ForwardKind::Shared { .. } => {
-                    self.reselect_shared(id, obligation, DurableOutcome::Refused(r))
-                        .await;
+                    self.reselect_shared(id, obligation, DurableOutcome::Refused(r));
                 }
                 ForwardKind::Ordinary => self.refuse_pending(id, r),
             },
@@ -606,7 +597,7 @@ impl Hub {
     /// obligation is moot (the interest genuinely ended) and the ack releases.
     // Retransmit, downgrade, re-route, grace: one linear sweep pass per pending —
     // splitting it would scatter the obligation lifecycle.
-    pub(super) async fn sweep_pending_forwards(&mut self) {
+    pub(super) fn sweep_pending_forwards(&mut self) {
         let ids: Vec<u64> = self.pending_publishes.keys().copied().collect();
         for id in ids {
             // Retransmit outstanding forwards over live links.
@@ -671,7 +662,7 @@ impl Hub {
                     publish = id,
                     "re-route grace expired; final local re-delivery"
                 );
-                let out = self.redeliver_pending(id).await;
+                let out = self.redeliver_pending(id);
                 match out {
                     DurableOutcome::Ok => {}
                     DurableOutcome::Failed => {
