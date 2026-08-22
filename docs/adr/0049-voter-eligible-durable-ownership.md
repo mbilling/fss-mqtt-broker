@@ -57,6 +57,16 @@ succeed, and nothing said so.
 
 ### 1. Durable ownership is restricted to lease-eligible nodes
 
+> **Amended by [ADR 0073](0073-scale-out-durable-ownership.md) (2026-08-22):** this
+> restriction becomes the *fallback* posture rather than the permanent rule. Under the
+> cluster-wide scale-out capability (every member at peer proto ≥ 8, operator default
+> `durable.ownership_domain = "members"`) ownership hashes over ALL admitted members
+> again — the serving path this ADR's incident proved missing exists now, gated on the
+> committed lease map. The restriction below remains exactly in force for any
+> mixed-version window, under the operator's `"voters"` escape hatch, and as the
+> conservative default whenever the capability cannot be confirmed; §3's observability
+> contract carries forward unchanged.
+
 A durable group's **owner** is selected by HRW over the **voter-eligible set** — the current
 lease voters — not over the full SWIM-eligible set. Every group therefore has an owner that
 can hold a servable lease, so no session id is structurally unrecoverable. Concretely:

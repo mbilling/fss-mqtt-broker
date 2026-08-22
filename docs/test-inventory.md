@@ -241,7 +241,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `two_bridge_instances_do_not_duplicate_forwarding`
 - `two_partitioned_instances_deliver_each_inbound_message_exactly_once`
 
-## `crates/mqtt-cluster/src/lib.rs` — 263 test(s)
+## `crates/mqtt-cluster/src/lib.rs` — 264 test(s)
 
 - `cluster_identity::tests::a_founder_mints_once_and_reloads_stably`
 - `cluster_identity::tests::a_joiner_adopts_once_and_persists`
@@ -304,6 +304,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `durable_node::tests::admit_desired_drops_a_member_evicted_from_placement`
 - `durable_node::tests::admit_desired_keeps_a_current_voter_through_a_link_blip`
 - `durable_node::tests::single_node_durable_store_bootstraps_and_serves`
+- `durable_plane::tests::a_learner_is_ready_under_the_scale_out_capability`
 - `durable_plane::tests::deliver_to_unregistered_peer_is_unreachable`
 - `durable_plane::tests::lease_group_ready_tracks_leadership_and_voter_membership`
 - `durable_plane::tests::owner_writes_group_commit_with_follower_applies`
@@ -606,7 +607,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 
 - `publish_codec_round_trip_clears_the_floor`
 
-## `crates/mqtt-config/src/lib.rs` — 30 test(s)
+## `crates/mqtt-config/src/lib.rs` — 31 test(s)
 
 - `tests::a_backup_dir_inside_the_data_dir_is_a_config_error`
 - `tests::a_bad_enum_value_is_rejected`
@@ -628,6 +629,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::min_replicas_defaults_to_the_derived_majority_floor_and_accepts_explicit_floors`
 - `tests::oidc_env_maps_and_is_https_gated_at_use_not_parse`
 - `tests::out_of_range_values_are_rejected`
+- `tests::ownership_domain_parses_both_values_and_refuses_others`
 - `tests::per_var_boolean_conventions_are_honoured`
 - `tests::the_env_surface_is_a_deduplicated_curated_list`
 - `tests::the_gossip_key_is_inline_xor_by_reference`
@@ -848,7 +850,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 335 test(s)
+## `crates/mqttd/src/lib.rs` — 336 test(s)
 
 - `admission::tests::the_global_cap_refuses_at_the_bound_and_recovers`
 - `admission::tests::the_penalty_box_refuses_after_the_threshold`
@@ -1149,6 +1151,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::the_memory_axis_refuses_the_publishers_ack_just_as_the_disk_axis_does`
 - `hub::tests::the_outbound_byte_cap_sheds_qos0_before_the_packet_count_cap`
 - `hub::tests::the_outbound_byte_counter_returns_to_zero_when_the_writer_drains`
+- `hub::tests::the_ownership_domain_flag_needs_every_member_capable_and_the_operator_choice`
 - `hub::tests::the_raw_broadcast_no_longer_warms_caches_under_durable`
 - `hub::tests::the_rehome_scan_is_skipped_while_ownership_has_not_moved`
 - `hub::tests::the_retained_digest_is_order_independent_and_set_sensitive`
@@ -1345,7 +1348,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `multi_host_preflight` — `#[ignore]`d
 - `store_append_floor` — `#[ignore]`d
 
-## `crates/mqttd/tests/durable_sessions.rs` — 10 test(s)
+## `crates/mqttd/tests/durable_sessions.rs` — 11 test(s)
 
 - `a_bounded_voter_cluster_owns_every_session_on_a_voter_and_survives_failures`
 - `a_clean_session_client_connects_promptly_on_the_group_owner`
@@ -1357,6 +1360,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `enqueue_is_durable_across_a_three_node_cluster`
 - `lease_group_forms_and_is_stable_under_slow_durable_commits`
 - `qos2_inbound_dedup_survives_owner_takeover`
+- `the_scale_out_domain_owns_sessions_on_learners_that_serve`
 
 ## `crates/mqttd/tests/end_to_end.rs` — 5 test(s)
 
