@@ -1,6 +1,6 @@
 # OpenSSF Best Practices badge — the self-certification answer sheet
 
-**Verified against `v1.0.2` (2026-08-21).** ADR 0069 T7. The registration at
+**Verified against `v1.0.3` (2026-08-22).** ADR 0069 T7. The registration at
 <https://www.bestpractices.dev> is a maintainer act (browser login, ~15 min);
 this sheet makes it paste-through: every **passing-level** criterion, the
 answer, and the evidence URL. It stays in-tree afterwards as the public record
