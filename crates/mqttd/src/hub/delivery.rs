@@ -19,6 +19,69 @@
 // re-couple every future hub change to six import lists. Scoped to these files.
 use super::*;
 
+/// The fields shared selection reads, over either an owned or a borrowed
+/// candidate (issue #376) — one policy in [`Hub::choose_shared_index`], two
+/// representations, no drift.
+trait SharedSelectable {
+    fn online(&self) -> bool;
+    fn is_local(&self) -> bool;
+    fn client(&self) -> &ClientId;
+}
+
+impl SharedSelectable for SharedCandidate {
+    fn online(&self) -> bool {
+        self.online
+    }
+    fn is_local(&self) -> bool {
+        self.node.is_none()
+    }
+    fn client(&self) -> &ClientId {
+        &self.client
+    }
+}
+
+/// One selectable member, borrowed from the shared tables (issue #376): the
+/// per-publish plan holds these instead of cloning every member's identity to
+/// pick one.
+struct SharedCandidateRef<'a> {
+    node: Option<&'a NodeId>,
+    client: &'a ClientId,
+    qos: QoS,
+    online: bool,
+}
+
+impl SharedCandidateRef<'_> {
+    fn to_owned_candidate(&self) -> SharedCandidate {
+        SharedCandidate {
+            node: self.node.cloned(),
+            client: self.client.clone(),
+            qos: self.qos,
+            online: self.online,
+        }
+    }
+}
+
+impl SharedSelectable for SharedCandidateRef<'_> {
+    fn online(&self) -> bool {
+        self.online
+    }
+    fn is_local(&self) -> bool {
+        self.node.is_none()
+    }
+    fn client(&self) -> &ClientId {
+        self.client
+    }
+}
+
+/// One group's planned selection for one publish (issue #376): the key to
+/// advance, the cursor value to advance it to, and the member the policy chose
+/// (`None` when no member was choosable — the cursor still advances).
+pub(super) struct SharedPlan {
+    pub(super) key: SharedKey,
+    pub(super) next_cursor: usize,
+    pub(super) chosen: Option<SharedCandidate>,
+}
+
 impl Hub {
     /// The Subscription Identifiers a delivery of `topic` to `client` must carry
     /// ([MQTT-3.3.4-3..5], issue #266): the ids of EVERY subscription of this
@@ -453,8 +516,13 @@ impl Hub {
         let answerable = gate.is_some();
         let append_gate = gate.map_or(AppendGate::None, AppendGate::Pending);
         let mut all_durable = DurableOutcome::Ok;
-        for (key, candidates) in self.shared_candidates(topic) {
-            let Some(chosen) = self.select_shared(&key, &candidates) else {
+        for plan in self.plan_shared(topic) {
+            // COMMIT the plan: advance the cursor exactly as `select_shared` would
+            // have — including when no member was choosable (the rotation was spent).
+            self.shared_cursor
+                .insert(plan.key.clone(), plan.next_cursor);
+            let key = plan.key;
+            let Some(chosen) = plan.chosen else {
                 debug!(topic = %topic, "shared group has no reachable member");
                 continue;
             };
@@ -665,6 +733,75 @@ impl Hub {
         by_key.into_iter().collect()
     }
 
+    /// Plan every shared selection for one publish WITHOUT touching hub state and
+    /// without materializing the candidate lists (issue #376): the owned
+    /// [`shared_candidates`](Self::shared_candidates) clones every member of every
+    /// matching group per publish only to keep ONE — measured at ~64% of the hub
+    /// loop's publish dispatch under the fan-out-ladder shape, the ceiling the
+    /// scale curve hit. This pass borrows the tables, chooses by index with the
+    /// same policy and the same cursor value `select_shared` would have used, and
+    /// clones exactly the chosen member (plus the group key). The caller COMMITS
+    /// the plan by advancing each group's cursor — including for a group where no
+    /// member was choosable, exactly as `select_shared` always has.
+    pub(super) fn plan_shared(&self, topic: &str) -> Vec<SharedPlan> {
+        let mut by_key: BTreeMap<(&str, &str), Vec<SharedCandidateRef<'_>>> = BTreeMap::new();
+        for (group, filter, members) in self.shared.matching_refs(topic) {
+            let entry = by_key.entry((group, filter)).or_default();
+            for (client, qos) in members {
+                entry.push(SharedCandidateRef {
+                    node: None,
+                    client,
+                    qos: *qos,
+                    online: self.online.contains_key(client),
+                });
+            }
+        }
+        for (node, groups) in self.remote_shared.iter().collect::<BTreeMap<_, _>>() {
+            for g in groups {
+                if !topic_matches(&g.filter, topic) {
+                    continue;
+                }
+                let entry = by_key
+                    .entry((g.group.as_str(), g.filter.as_str()))
+                    .or_default();
+                for (client, qos, online) in &g.members {
+                    entry.push(SharedCandidateRef {
+                        node: Some(node),
+                        client,
+                        qos: *qos,
+                        online: *online,
+                    });
+                }
+            }
+        }
+        by_key
+            .into_iter()
+            .filter(|(_, cands)| !cands.is_empty())
+            .map(|((group, filter), cands)| {
+                let n = cands.len();
+                // Zero-alloc cursor read: a `get` on the String-keyed map would need a
+                // per-publish key allocation — the very cost this path exists to remove.
+                // The map holds one entry per group ever served here; the scan is tiny.
+                let start = self
+                    .shared_cursor
+                    .iter()
+                    .find_map(|((g, f), c)| {
+                        (g.as_str() == group && f.as_str() == filter).then_some(*c)
+                    })
+                    .unwrap_or(0)
+                    % n;
+                let chosen = self
+                    .choose_shared_index(&cands, start)
+                    .map(|i| cands[i].to_owned_candidate());
+                SharedPlan {
+                    key: (group.to_string(), filter.to_string()),
+                    next_cursor: (start + 1) % n,
+                    chosen,
+                }
+            })
+            .collect()
+    }
+
     /// Round-robin one member for a shared group, advancing the per-group cursor.
     /// Prefers a member that can receive now — a **local online** or **any remote**
     /// member — and falls back to a **local persistent** (queued) member (ADR 0015 §4).
@@ -682,22 +819,6 @@ impl Hub {
         self.choose_shared(candidates, start)
     }
 
-    /// [`select_shared`](Self::select_shared) without advancing the cursor — the PLAN
-    /// pass's view of who this publish would land on (issue #238). A publish that is
-    /// about to be refused must not consume a group member's turn.
-    pub(super) fn peek_shared(
-        &self,
-        key: &SharedKey,
-        candidates: &[SharedCandidate],
-    ) -> Option<SharedCandidate> {
-        let n = candidates.len();
-        if n == 0 {
-            return None;
-        }
-        let start = self.shared_cursor.get(key).copied().unwrap_or(0) % n;
-        self.choose_shared(candidates, start)
-    }
-
     /// The selection rule itself, shared by [`select_shared`](Self::select_shared) and
     /// [`peek_shared`](Self::peek_shared) so a peek can never disagree with the
     /// selection it is predicting.
@@ -706,18 +827,33 @@ impl Hub {
         candidates: &[SharedCandidate],
         start: usize,
     ) -> Option<SharedCandidate> {
+        self.choose_shared_index(candidates, start)
+            .map(|i| candidates[i].clone())
+    }
+
+    /// The selection policy itself, by index, over either representation (issue
+    /// #376): one policy, two candidate shapes (owned for the cold reselect path,
+    /// borrowed for the per-publish plan), zero drift.
+    fn choose_shared_index<T: SharedSelectable>(
+        &self,
+        candidates: &[T],
+        start: usize,
+    ) -> Option<usize> {
         let n = candidates.len();
-        let rotated = || candidates.iter().cycle().skip(start).take(n);
+        let rotated = || (0..n).map(move |i| (start + i) % n);
         // Immediately deliverable: any member online on its home node — local (our
         // `online`) or remote (its home node's gossiped liveness, ADR 0015 T8). Targeting a
         // member offline at home would only queue there while a live member could deliver now.
-        let immediate = rotated().find(|c| c.online);
+        let immediate = rotated().find(|&i| candidates[i].online());
         immediate
             // No one online: a local persistent member queues for replay (ADR 0015 §4)...
-            .or_else(|| rotated().find(|c| c.node.is_none() && self.is_persistent(&c.client)))
+            .or_else(|| {
+                rotated().find(|&i| {
+                    candidates[i].is_local() && self.is_persistent(candidates[i].client())
+                })
+            })
             // ...else a remote member (it queues at its home) so the message is not dropped.
-            .or_else(|| rotated().find(|c| c.node.is_some()))
-            .cloned()
+            .or_else(|| rotated().find(|&i| !candidates[i].is_local()))
     }
 
     /// Send one message to an online client at its (already downgraded) `QoS`,

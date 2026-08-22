@@ -110,6 +110,20 @@ impl SharedSubscriptionTable {
         }
     }
 
+    /// Iterator form of [`for_each_matching`](Self::for_each_matching) (issue #376):
+    /// the borrowed `(group, filter, members)` tuples live as long as `&self`, so the
+    /// per-publish selection path can hold them across its plan pass without a closure
+    /// and without cloning a single member. Arbitrary order, like `for_each_matching`.
+    pub fn matching_refs<'a>(
+        &'a self,
+        topic: &'a str,
+    ) -> impl Iterator<Item = (&'a str, &'a str, &'a [(ClientId, QoS)])> + 'a {
+        self.groups
+            .iter()
+            .filter(move |((_, filter), _)| topic_matches(filter, topic))
+            .map(|((group, filter), members)| (group.as_str(), filter.as_str(), members.as_slice()))
+    }
+
     /// Every group whose `{filter}` matches `topic`, with its members (an owned snapshot).
     /// The hub merges these with peer members and selects one per group (ADR 0015). The
     /// per-publish hot path uses [`for_each_matching`](Self::for_each_matching) to avoid

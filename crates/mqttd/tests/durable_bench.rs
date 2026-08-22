@@ -139,6 +139,13 @@ struct Cfg {
     /// means — the point of the measurement. `None` (default): v3.1.1
     /// publishers, full quorum acks, byte-identical to the historical lanes.
     tier: Option<String>,
+    /// `MQTTD_BENCH_SHARED=1` (issue #376): subscribers join ONE shared group
+    /// (`$share/g1/bench/<tag>/#`) instead of each taking its own 1:1 topic.
+    /// Publishers still publish the same distinct topics, and a shared group
+    /// delivers each message to exactly one member — so totals stay comparable
+    /// to the 1:1 arm and the DELTA between the two runs isolates the broker's
+    /// shared-resolution cost on the hub loop, the scale rig's lane-B shape.
+    shared: bool,
 }
 
 impl Cfg {
@@ -160,13 +167,14 @@ impl Cfg {
                 matches!(t.as_str(), "local" | "relaxed")
                     || panic!("MQTTD_BENCH_TIER must be 'local' or 'relaxed', got {t:?}")
             }),
+            shared: env_usize("MQTTD_BENCH_SHARED", 0) == 1,
         }
     }
 
     fn describe(&self) -> String {
         format!(
             "publishers={} window={} (={}, in flight) subs={} payload={}B warmup={}s measure={}s reps={} \
-             node_workers={} RUST_LOG={} profile={} placement={} tier={}",
+             node_workers={} RUST_LOG={} profile={} placement={} tier={} subscription={}",
             self.publishers,
             self.window,
             self.publishers * self.window,
@@ -184,6 +192,11 @@ impl Cfg {
                 "pinned (all sessions owned by node 0)"
             },
             self.tier.as_deref().unwrap_or("quorum (default acks)"),
+            if self.shared {
+                "one shared group ($share/g1, issue #376's lane-B shape)"
+            } else {
+                "1:1 (one topic per subscriber)"
+            },
         )
     }
 }
@@ -1237,7 +1250,15 @@ async fn run_arm(cl: &mut Cluster, cfg: &Cfg, arm: &Arm, tag: &str) -> RunStats 
             .await
             {
                 // The SUBACK is durability-gated in the durable arm: retry until granted.
-                let ack = c.subscribe(1, &topics[i], QoS::AtLeastOnce).await;
+                // Shared mode (issue #376): every subscriber joins the SAME group over a
+                // wildcard, so each publish is resolved through the shared-subscription
+                // path and delivered to exactly one member — lane B's shape in pure Rust.
+                let filter = if cfg.shared {
+                    format!("$share/g1/bench/{tag}/#")
+                } else {
+                    topics[i].clone()
+                };
+                let ack = c.subscribe(1, &filter, QoS::AtLeastOnce).await;
                 if ack.return_codes.iter().all(|rc| *rc != 0x80) {
                     subs.push(c);
                     break;
@@ -1256,7 +1277,52 @@ async fn run_arm(cl: &mut Cluster, cfg: &Cfg, arm: &Arm, tag: &str) -> RunStats 
     // from EVERY node that will publish to a topic must be observed to arrive before
     // the clock starts. Pinned mode has one such node (`pub_addr`); spread mode warms
     // from each distinct node whose publishers target the topic.
-    for i in 0..cfg.subs {
+    if cfg.shared {
+        // Shared warm-up (issue #376): the group delivers each message to exactly ONE
+        // member, so convergence is observed on ANY subscriber, never a paired one.
+        // Warm once from every distinct publishing node against the single wildcard
+        // interest the group registered.
+        let mut warm_from: Vec<SocketAddr> = pub_addrs.clone();
+        warm_from.sort_unstable_by_key(std::string::ToString::to_string);
+        warm_from.dedup();
+        for (w, warm_addr) in warm_from.into_iter().enumerate() {
+            let warm = format!("warm-{tag}-shared-{w}").into_bytes();
+            let deadline = Instant::now() + Duration::from_secs(60);
+            'converge: loop {
+                if let Some((mut p, _)) = common::Client::connect_v311_within(
+                    warm_addr,
+                    &format!("warmpub-{tag}-shared-{w}"),
+                    true,
+                    Duration::from_secs(20),
+                )
+                .await
+                {
+                    p.publish(&topics[0], &warm, QoS::AtLeastOnce, Some(1), vec![])
+                        .await;
+                    let _ = p.recv_bounded(Duration::from_secs(5)).await;
+                }
+                for s in &mut subs {
+                    while let common::Recv::Packet(pkt) =
+                        s.recv_bounded(Duration::from_millis(200)).await
+                    {
+                        if let Packet::Publish(pb) = pkt {
+                            if let Some(pkid) = pb.pkid {
+                                s.puback(pkid).await;
+                            }
+                            if pb.payload.as_ref() == warm.as_slice() {
+                                break 'converge;
+                            }
+                        }
+                    }
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "arm {tag}: shared interest from {warm_addr} never converged"
+                );
+            }
+        }
+    }
+    for i in 0..if cfg.shared { 0 } else { cfg.subs } {
         let mut warm_from: Vec<SocketAddr> = (0..cfg.publishers)
             .filter(|k| k % cfg.subs == i)
             .map(|k| pub_addrs[k])
@@ -1615,6 +1681,7 @@ async fn durable_path_floor() {
                     "nodes": cl.endpoints.len(),
                     "spread": cfg.spread,
                     "tier": cfg.tier.as_deref().unwrap_or("quorum"),
+                    "shared": cfg.shared,
                     "external": cl.external,
                     "publishers": cfg.publishers,
                     "window": cfg.window,
