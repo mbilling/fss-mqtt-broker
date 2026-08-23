@@ -1355,7 +1355,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `multi_host_preflight` — `#[ignore]`d
 - `store_append_floor` — `#[ignore]`d
 
-## `crates/mqttd/tests/durable_sessions.rs` — 11 test(s)
+## `crates/mqttd/tests/durable_sessions.rs` — 12 test(s)
 
 - `a_bounded_voter_cluster_owns_every_session_on_a_voter_and_survives_failures`
 - `a_clean_session_client_connects_promptly_on_the_group_owner`
@@ -1365,6 +1365,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `a_replica_serves_the_session_after_the_owner_dies`
 - `concurrent_retained_publishes_on_two_nodes_converge_cluster_wide`
 - `enqueue_is_durable_across_a_three_node_cluster`
+- `growing_the_scaled_out_cluster_migrates_ownership_with_zero_acked_loss`
 - `lease_group_forms_and_is_stable_under_slow_durable_commits`
 - `qos2_inbound_dedup_survives_owner_takeover`
 - `the_scale_out_domain_owns_sessions_on_learners_that_serve`

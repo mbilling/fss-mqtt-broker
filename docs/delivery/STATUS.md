@@ -194,7 +194,7 @@
 
 **0073 — # 0073. Scale-out durable ownership: the voter set is a control plane, not the data path**
 
-- `0073-T3` ⬜ planned: "Grow/shrink migration soak at scale: 5→10 nodes, ownership spreads ~1/N via eager migration (ADR 0043 P2 machinery), zero acked loss under load" — "The migration machinery is ADR 0043's and unchanged; the soak proves it under the widened domain at fleet size. Natural to run beside T4 on the same paid hardware."
+- `0073-T3` ⬜ planned: "Grow/shrink migration soak: ownership spreads onto new (learner) members via eager migration, zero acked loss" — "PARTIAL, and the soak DID ITS JOB: the in-process grow test (durable_sessions::growing_the_scaled_out_cluster_migrates_ownership_with_zero_acked_loss) proves the spread half — 3->6 grow under the flag, ownership migrates onto learner newcomers, a newcomer owner serves a fresh durable session. The zero-acked-loss half FOUND issue #390: under load, lease reassignment outruns the old owner's eager data hand-off and strands pre-grow history in a permanent fail-closed NoQuorum on the data-less new owner. T3 completes when #390's fix lands (its acceptance test is the untrimmed soak); the fleet-size version rides T4."
 - `0073-T4` ⬜ planned: "The measured slope: 7- and 10-node durable curve, capped vs uncapped ownership A/B on identical hardware; SCALE-CURVE.md + COMPARISON.md publication of the scale-out claim with the up-vs-out economics case" — "Needs the Hetzner quota raise (~100 dedicated vCPU). The PR #375 lease-voters rig variant becomes the A/B control arm; the default arm now measures the ADR 0073 domain."
 
 **0074 — # 0074. The subscriber-ack truncate leaves the hub loop's critical path**

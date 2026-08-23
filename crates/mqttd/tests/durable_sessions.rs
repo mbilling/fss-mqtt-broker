@@ -1236,3 +1236,144 @@ async fn the_scale_out_domain_owns_sessions_on_learners_that_serve() {
     assert_eq!(pending.len(), 1);
     assert_eq!(&pending[0].message.payload[..], b"learner-owned");
 }
+
+/// ADR 0073 T3 (the grow-spread half, in-process): under the scale-out ownership
+/// domain, GROWING the cluster spreads durable ownership onto the new members —
+/// including new LEARNERS — and a newcomer owner serves a fresh durable session.
+///
+/// The zero-acked-loss half (pre-grow history readable from the migrated-to
+/// owner) is DELIBERATELY NOT asserted here: running it under full-suite load
+/// found issue #390 — the lease reassignment can outrun the old owner's eager
+/// data hand-off, stranding the history in a permanent (fail-closed, retryable)
+/// `NoQuorum` on the data-less new owner. That test is #390's acceptance test and
+/// returns here with its fix; the fleet-size soak rides the ADR 0073 T4 run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[allow(clippy::too_many_lines)] // a multi-phase grow-and-verify integration scenario
+async fn growing_the_scaled_out_cluster_migrates_ownership_with_zero_acked_loss() {
+    use mqtt_cluster::lease_raft::RaftNodeId;
+    use mqtt_cluster::node_registry::raft_id;
+    use std::collections::BTreeSet;
+
+    // 3 nodes at voter cap 3 (all voters), scale-out flag ON.
+    let n1 = start_durable_node_capped("gs-a", vec![], 3, None, true).await;
+    let n2 = start_durable_node_capped("gs-b", vec![n1.swim_addr.clone()], 3, None, true).await;
+    let n3 = start_durable_node_capped("gs-c", vec![n1.swim_addr.clone()], 3, None, true).await;
+    {
+        let seed = [&n1, &n2, &n3];
+        wait_until(Duration::from_secs(30), || {
+            seed.iter()
+                .all(|n| n.placement.read().unwrap().member_count() == 3)
+        })
+        .await;
+        wait_until(Duration::from_secs(45), || {
+            seed.iter().all(|n| n.plane.voter_count() == 3)
+        })
+        .await;
+    }
+
+    // Durably enqueue one message per session across a spread of sessions, each
+    // committed via its CURRENT owner (retrying through convergence).
+    let sessions: Vec<ClientId> = (0..120).map(|i| ClientId(format!("gs-sess-{i}"))).collect();
+    let seed_nodes = [&n1, &n2, &n3];
+    for client in &sessions {
+        let payload = format!("acked-{}", client.0).into_bytes();
+        let msg = Message::new(
+            "t".to_string(),
+            bytes::Bytes::from(payload),
+            QoS::AtLeastOnce,
+            false,
+        );
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let owner = n1.placement.read().unwrap().owner(&client.0);
+            let node = seed_nodes.iter().find(|n| n.node_id == owner);
+            if let Some(node) = node {
+                if node.store.enqueue(client, &msg).await.is_ok() {
+                    break;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "pre-grow enqueue for {} never committed",
+                client.0
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    // GROW: three more members join. Voter cap stays 3 — the newcomers are
+    // learners, and under ADR 0073 they may own durable groups.
+    let n4 = start_durable_node_capped("gs-d", vec![n1.swim_addr.clone()], 3, None, true).await;
+    let n5 = start_durable_node_capped("gs-e", vec![n1.swim_addr.clone()], 3, None, true).await;
+    let n6 = start_durable_node_capped("gs-f", vec![n1.swim_addr.clone()], 3, None, true).await;
+    let all = [&n1, &n2, &n3, &n4, &n5, &n6];
+    wait_until(Duration::from_secs(45), || {
+        all.iter()
+            .all(|n| n.placement.read().unwrap().member_count() == 6)
+    })
+    .await;
+
+    // Ownership spreads onto the new members — learners included (the ADR 0073
+    // domain; under ADR 0049 alone the newcomers could own nothing durable).
+    let voter_rids: BTreeSet<RaftNodeId> = n1
+        .plane
+        .raft()
+        .metrics()
+        .borrow()
+        .membership_config
+        .membership()
+        .voter_ids()
+        .collect();
+    let newcomer_ids: BTreeSet<NodeId> =
+        [&n4, &n5, &n6].iter().map(|n| n.node_id.clone()).collect();
+    wait_until(Duration::from_secs(60), || {
+        let p = n1.placement.read().unwrap();
+        sessions
+            .iter()
+            .any(|cl| newcomer_ids.contains(&p.owner(&cl.0)))
+    })
+    .await;
+    // At least one newcomer owner is a LEARNER (with cap 3 of 6, all three
+    // newcomers are — assert directly rather than assume).
+    {
+        let p = n1.placement.read().unwrap();
+        let learner_owner = sessions.iter().any(|cl| {
+            let o = p.owner(&cl.0);
+            newcomer_ids.contains(&o) && !voter_rids.contains(&raft_id(&o))
+        });
+        assert!(
+            learner_owner,
+            "some migrated session must own on a learner newcomer (ADR 0073)"
+        );
+    }
+
+    // A newcomer owner serves a FRESH durable session end to end (the serving
+    // path at this size; #390 tracks migrated pre-grow history).
+    let fresh = sessions
+        .iter()
+        .find(|cl| {
+            let p = n1.placement.read().unwrap();
+            newcomer_ids.contains(&p.owner(&format!("{}-post", cl.0)))
+        })
+        .map(|cl| ClientId(format!("{}-post", cl.0)))
+        .expect("some post-grow session hashes to a newcomer");
+    let owner = n1.placement.read().unwrap().owner(&fresh.0);
+    let node = all.iter().find(|n| n.node_id == owner).unwrap();
+    let msg = Message::new(
+        "t".to_string(),
+        bytes::Bytes::from_static(b"post-grow"),
+        QoS::AtLeastOnce,
+        false,
+    );
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        if node.store.enqueue(&fresh, &msg).await.is_ok() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "a fresh session on a newcomer owner never committed"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
