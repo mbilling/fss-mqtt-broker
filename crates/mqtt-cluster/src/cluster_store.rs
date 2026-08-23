@@ -402,14 +402,104 @@ impl<S: LeaseSource, T: ReplicaTransport + Clone + 'static> GroupRoutedLog<S, T>
                 }
             }
         }
-        if !enough(&reads) {
+        if reads.len() < quorum {
             return Err(ReplError::NoQuorum);
+        }
+        if !reads.iter().any(|r| r.complete) {
+            // Issue #390 — the grow hand-off race: a quorum of the CURRENT set
+            // responded but every copy is hollow (fresh joiners), because the
+            // lease moved onto data-less newcomers before the old owner's eager
+            // hand-off re-committed the history. The history still exists — on
+            // roster members OUTSIDE the current set — and reads cannot violate
+            // epoch fencing, so recover it by reading, not by letting a stale
+            // owner write. The fallback is deliberately stricter than the fast
+            // path: EVERY known roster member must answer (a full sweep — only
+            // when nothing is left unread can no committed entry be silently
+            // missing from the union), the roster must have no unobservable
+            // members, and the merged UNION must be gap-free (a union gap after
+            // a full sweep is genuine loss, which must refuse, never truncate).
+            return self.recover_key_from_roster(key, replica_set, reads).await;
         }
         // The floor: the highest truncation low-water across the reads. The merge
         // applies it to the entries; the caller also needs it to keep the key's
         // offset space above it (ADR 0042 T6).
         let floor = reads.iter().map(|r| r.watermark).max().unwrap_or(0);
         Ok((merge_replica_logs(&reads), floor))
+    }
+
+    /// The issue #390 fallback of [`recover_key`](Self::recover_key): the full-roster
+    /// sweep. See the call site for the safety argument; the invariants enforced here:
+    ///
+    /// 1. the durable roster is fully known (an unobservable member might hold
+    ///    history — refuse);
+    /// 2. EVERY roster member outside the current set answers the read (one silent
+    ///    member could hold the only copy of a committed entry — refuse);
+    /// 3. the merged union is gap-free: no read may hold an entry above what the
+    ///    merge served (a swallowed tail after a full sweep is genuine loss — refuse,
+    ///    fail closed, exactly like `NoQuorum` always has).
+    async fn recover_key_from_roster(
+        &self,
+        key: &str,
+        replica_set: &[NodeId],
+        mut reads: Vec<crate::cluster_log::ReplicaRead>,
+    ) -> Result<(Vec<LogEntry>, Offset), ReplError> {
+        let Some((known, unknown)) = self
+            .placement
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .durable_roster()
+            .cloned()
+        else {
+            return Err(ReplError::NoQuorum); // roster not known yet: cannot sweep
+        };
+        if unknown > 0 {
+            return Err(ReplError::NoQuorum); // an unobservable member might hold history
+        }
+        let extras: Vec<NodeId> = known
+            .iter()
+            .filter(|n| **n != self.local && !replica_set.contains(n))
+            .cloned()
+            .collect();
+        let mut inflight = tokio::task::JoinSet::new();
+        for member in &extras {
+            let transport = self.transport.clone();
+            let member = member.clone();
+            let key = key.to_string();
+            inflight.spawn(async move { transport.read_replica(&member, &key).await });
+        }
+        let mut answered = 0usize;
+        while let Some(res) = inflight.join_next().await {
+            // A member that did not answer breaks the full-sweep guarantee.
+            if let Ok(Some(read)) = res {
+                answered += 1;
+                reads.push(read);
+            }
+        }
+        if answered < extras.len() {
+            return Err(ReplError::NoQuorum);
+        }
+        let floor = reads.iter().map(|r| r.watermark).max().unwrap_or(0);
+        let merged = merge_replica_logs(&reads);
+        // Union gap check: the merge stops at a gap; anything any read holds above
+        // the served prefix would then be silently truncated. After a full sweep
+        // that is genuine loss — refuse.
+        let served_high = floor + merged.len() as Offset;
+        let holds_above = reads
+            .iter()
+            .flat_map(|r| r.entries.iter())
+            .any(|e| e.offset > served_high);
+        if holds_above {
+            return Err(ReplError::NoQuorum);
+        }
+        tracing::info!(
+            key,
+            swept = extras.len(),
+            recovered = merged.len(),
+            "recovery fell back to a full roster sweep (issue #390): the current \
+             replica set was all-hollow; history recovered read-only from former \
+             holders and will re-commit at this owner's epoch"
+        );
+        Ok((merged, floor))
     }
 }
 

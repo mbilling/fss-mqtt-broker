@@ -1377,3 +1377,111 @@ async fn growing_the_scaled_out_cluster_migrates_ownership_with_zero_acked_loss(
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
 }
+
+/// Issue #390's acceptance test — the untrimmed grow soak: every message durably
+/// enqueued BEFORE the grow is read back intact from whatever node owns its
+/// session afterwards, including data-less learner newcomers. Before the fix
+/// this failed DETERMINISTICALLY under full-suite load (`NoQuorum` forever on
+/// the stranded owner: the lease outran the old owner's hand-off and the
+/// current-set-only recovery read had no complete anchor). The fix: when a
+/// quorum of the current set is all-hollow, recovery falls back to a FULL
+/// roster sweep — read-only, so epoch fencing holds — and serves the union only
+/// if every member answered and the union is gap-free.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[allow(clippy::too_many_lines)] // a multi-phase grow-and-verify integration scenario
+async fn pre_grow_history_survives_migration_onto_data_less_newcomers() {
+    let n1 = start_durable_node_capped("hs-a", vec![], 3, None, true).await;
+    let n2 = start_durable_node_capped("hs-b", vec![n1.swim_addr.clone()], 3, None, true).await;
+    let n3 = start_durable_node_capped("hs-c", vec![n1.swim_addr.clone()], 3, None, true).await;
+    {
+        let seed = [&n1, &n2, &n3];
+        wait_until(Duration::from_secs(30), || {
+            seed.iter()
+                .all(|n| n.placement.read().unwrap().member_count() == 3)
+        })
+        .await;
+        wait_until(Duration::from_secs(45), || {
+            seed.iter().all(|n| n.plane.voter_count() == 3)
+        })
+        .await;
+    }
+
+    let sessions: Vec<ClientId> = (0..120).map(|i| ClientId(format!("hs-sess-{i}"))).collect();
+    let seed_nodes = [&n1, &n2, &n3];
+    for client in &sessions {
+        let payload = format!("acked-{}", client.0).into_bytes();
+        let msg = Message::new(
+            "t".to_string(),
+            bytes::Bytes::from(payload),
+            QoS::AtLeastOnce,
+            false,
+        );
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let owner = n1.placement.read().unwrap().owner(&client.0);
+            let node = seed_nodes.iter().find(|n| n.node_id == owner);
+            if let Some(node) = node {
+                if node.store.enqueue(client, &msg).await.is_ok() {
+                    break;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "pre-grow enqueue for {} never committed",
+                client.0
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    let n4 = start_durable_node_capped("hs-d", vec![n1.swim_addr.clone()], 3, None, true).await;
+    let n5 = start_durable_node_capped("hs-e", vec![n1.swim_addr.clone()], 3, None, true).await;
+    let n6 = start_durable_node_capped("hs-f", vec![n1.swim_addr.clone()], 3, None, true).await;
+    let all = [&n1, &n2, &n3, &n4, &n5, &n6];
+    wait_until(Duration::from_secs(45), || {
+        all.iter()
+            .all(|n| n.placement.read().unwrap().member_count() == 6)
+    })
+    .await;
+    let newcomer_ids: std::collections::BTreeSet<NodeId> =
+        [&n4, &n5, &n6].iter().map(|n| n.node_id.clone()).collect();
+    wait_until(Duration::from_secs(60), || {
+        let p = n1.placement.read().unwrap();
+        sessions
+            .iter()
+            .any(|cl| newcomer_ids.contains(&p.owner(&cl.0)))
+    })
+    .await;
+
+    // ZERO ACKED LOSS: every pre-grow message reads back from the session's
+    // CURRENT owner — the stranded-NoQuorum livelock is gone.
+    for client in &sessions {
+        let expect = format!("acked-{}", client.0).into_bytes();
+        let deadline = Instant::now() + Duration::from_secs(120);
+        let mut last: String = "never polled".into();
+        loop {
+            let owner = n1.placement.read().unwrap().owner(&client.0);
+            let node = all.iter().find(|n| n.node_id == owner);
+            if let Some(node) = node {
+                match node.store.pending(client, 0, 10).await {
+                    Ok(pending) => {
+                        if pending.len() == 1
+                            && pending[0].message.payload.as_ref() == expect.as_slice()
+                        {
+                            break;
+                        }
+                        last = format!("Ok, {} entries", pending.len());
+                    }
+                    Err(e) => last = format!("{e:?}"),
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{}: pre-grow history did not survive (owner {:?}; last poll: {last})",
+                client.0,
+                n1.placement.read().unwrap().owner(&client.0)
+            );
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+}
