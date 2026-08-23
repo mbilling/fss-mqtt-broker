@@ -119,6 +119,9 @@
 //! - `MQTTD_SWIM_BIND`      — SWIM gossip UDP bind, e.g. `127.0.0.1:7946`
 //!   (requires `MQTTD_PEER_BIND`; peer links are then established from
 //!   membership, no `MQTTD_PEERS` needed)
+//! - `MQTTD_SWIM_ADVERTISE` — gossip address this node claims as its own; default
+//!   the bind. Set it when the dialable address differs from the bound one (NAT,
+//!   port mapping) or the bind is `0.0.0.0` (issue #396)
 //! - `MQTTD_SWIM_SEEDS`     — comma-separated SWIM addresses of existing members
 //! - `MQTTD_SWIM_KEY`       — 64-hex-char cluster gossip key (ADR 0003), inline, e.g.
 //!   from `openssl rand -hex 32`; without it (or `MQTTD_SWIM_KEY_FILE`) gossip is
@@ -2747,7 +2750,32 @@ async fn start_swim(
     }
     let socket = UdpSocket::bind(&bind).await?;
     let seeds: Vec<String> = config.cluster.swim.seeds.clone();
-    info!(%bind, seeds = seeds.len(), authenticated = auth.is_some(), "starting SWIM gossip membership");
+    // The address this node claims as its own in gossip (issue #396): the explicit
+    // advertise when set (NAT, container port mapping), else the bind. An
+    // unspecified-host claim cannot be dialed by peers — the state machine defends
+    // against circulating it, and members still learn us from our datagram sources,
+    // but that only works on symmetric networks; say so loudly rather than silently.
+    let swim_advertise = config
+        .cluster
+        .swim
+        .advertise
+        .clone()
+        .unwrap_or_else(|| bind.clone());
+    {
+        let host = swim_advertise
+            .rsplit_once(':')
+            .map_or(swim_advertise.as_str(), |(h, _)| h);
+        if host.is_empty() || host == "0.0.0.0" || host == "[::]" || host == "::" {
+            warn!(
+                bind = %bind,
+                "SWIM advertises the unspecified address: peers can only learn this \
+                 node's gossip address from its datagram sources (correct on symmetric \
+                 networks, wrong behind NAT) — set MQTTD_SWIM_ADVERTISE or bind a \
+                 routable address (issue #396)"
+            );
+        }
+    }
+    info!(%bind, advertise = %swim_advertise, seeds = seeds.len(), authenticated = auth.is_some(), "starting SWIM gossip membership");
     // This process's gossip GENERATION (issue #92). A node id outlives the process
     // that holds it — a Kubernetes pod keeps its name across every restart — while
     // incarnation numbers do not survive a restart, so peers could not tell a
@@ -2762,7 +2790,7 @@ async fn start_swim(
         .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
     let swim = Swim::new(
         node_id.clone(),
-        bind,
+        swim_advertise,
         peer_addr,
         // Advertise this node's own failure-domain label over gossip (ADR 0016 T5).
         config.node.failure_domain.clone(),

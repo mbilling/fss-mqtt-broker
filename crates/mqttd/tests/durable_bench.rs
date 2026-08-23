@@ -1634,9 +1634,16 @@ async fn durable_path_floor() {
     let mut all: Vec<(&'static str, Vec<RunStats>)> =
         arms.iter().map(|a| (a.label, Vec::new())).collect();
 
+    // Per-invocation salt in every client id and topic (issue #394): against a
+    // long-lived EXTERNAL cluster, consecutive invocations (the tier lanes)
+    // otherwise reconnect into the previous run's durable sessions, and the
+    // broker's spec-correct post-CONNACK redelivery of their inflight backlog
+    // breaks the harness. Each invocation is a fresh tenant. Spawned-local runs
+    // never needed this (fresh cluster per invocation) but carry it identically.
+    let salt = format!("{:x}", std::process::id());
     for rep in 0..cfg.reps {
         for (ai, arm) in arms.iter().enumerate() {
-            let tag = format!("{}-r{rep}", arm.label);
+            let tag = format!("{salt}-{}-r{rep}", arm.label);
             let st = run_arm(&mut cl, &cfg, arm, &tag).await;
             println!(
                 "  rep {rep} {:<20} {:>9.0} msg/s  p50 {:>7.2}ms p95 {:>7.2}ms p99 {:>7.2}ms p999 {:>8.2}ms max {:>8.2}ms stalls>=1s {:>3}  \

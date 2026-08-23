@@ -335,6 +335,14 @@ pub struct PeerTls {
 pub struct Swim {
     /// Gossip UDP bind (`MQTTD_SWIM_BIND`); requires [`Cluster::peer_bind`].
     pub bind: Option<String>,
+    /// Gossip address this node ADVERTISES as its own (`MQTTD_SWIM_ADVERTISE`);
+    /// default the bind. Set it where the dialable address differs from the bound
+    /// one — NAT, container port mapping — or whenever the bind is the unspecified
+    /// host (`0.0.0.0`), which peers cannot dial (issue #396): without it they rely
+    /// on learning this node's address from its datagram sources, which is correct
+    /// on symmetric networks and wrong behind NAT. The unspecified host is refused
+    /// here by `validate()` for the same reason.
+    pub advertise: Option<String>,
     /// Seed member gossip addresses (`MQTTD_SWIM_SEEDS`).
     pub seeds: Vec<String>,
     /// 64-hex cluster gossip key, **inline** (`MQTTD_SWIM_KEY`). A raw secret; prefer
@@ -1122,6 +1130,9 @@ impl Config {
         on!("MQTTD_SWIM_BIND", v, {
             self.cluster.swim.bind = Some(v);
         });
+        on!("MQTTD_SWIM_ADVERTISE", v, {
+            self.cluster.swim.advertise = Some(v);
+        });
         on!("MQTTD_SWIM_SEEDS", v, {
             self.cluster.swim.seeds = list(&v);
         });
@@ -1456,6 +1467,19 @@ impl Config {
                 )));
             }
         }
+        // An advertised gossip address exists to be dialed by PEERS — the
+        // unspecified host cannot be (issue #396: it loops back to the dialer's
+        // own socket). Refuse it here rather than let it circulate.
+        if let Some(adv) = &self.cluster.swim.advertise {
+            let host = adv.rsplit_once(':').map_or(adv.as_str(), |(h, _)| h);
+            if host.is_empty() || host == "0.0.0.0" || host == "[::]" || host == "::" {
+                return Err(ConfigError::Invalid(format!(
+                    "cluster.swim.advertise (MQTTD_SWIM_ADVERTISE) must be an address \
+                     peers can dial, got {adv:?}: the unspecified host loops back to \
+                     the dialer's own socket (issue #396)"
+                )));
+            }
+        }
         // The gossip key is inline XOR by-reference — not both (ADR 0046 T5).
         if self.cluster.swim.key.is_some() && self.cluster.swim.key_file.is_some() {
             return Err(ConfigError::Invalid(
@@ -1569,6 +1593,7 @@ pub const ENV_VARS: &[&str] = &[
     "MQTTD_PEER_TLS_KEY",
     "MQTTD_PEER_TLS_CRL",
     "MQTTD_SWIM_BIND",
+    "MQTTD_SWIM_ADVERTISE",
     "MQTTD_SWIM_SEEDS",
     "MQTTD_SWIM_KEY",
     "MQTTD_SWIM_KEY_FILE",
@@ -2220,6 +2245,28 @@ mod tests {
     }
 
     #[test]
+    fn an_unspecified_swim_advertise_is_refused() {
+        // The advertise exists to be dialed by PEERS (issue #396): the unspecified
+        // host loops back to the dialer's own socket, so claiming it is always a
+        // misconfiguration. A routable advertise validates; 0.0.0.0/[::] do not.
+        let flag = "\n[durable]\nallow_ephemeral = true\n";
+        assert!(Config::from_toml(&format!(
+            "[cluster.swim]\nadvertise = \"node-1.internal:7946\"{flag}"
+        ))
+        .is_ok());
+        for bad in ["0.0.0.0:7946", "[::]:7946", ":::7946"] {
+            let err = Config::from_toml(&format!("[cluster.swim]\nadvertise = \"{bad}\"{flag}"))
+                .unwrap_err();
+            match err {
+                super::ConfigError::Invalid(m) => {
+                    assert!(m.contains("peers can dial"), "{bad}: {m}");
+                }
+                super::ConfigError::Parse(m) => panic!("wrong error kind for {bad}: {m}"),
+            }
+        }
+    }
+
+    #[test]
     fn the_env_surface_is_a_deduplicated_curated_list() {
         // Every var appears exactly once — a duplicate would be a copy/paste bug that hides a
         // missing mapping.
@@ -2234,8 +2281,9 @@ mod tests {
             // 79 before #249 (which itself included #241's four backlog/in-flight knobs)
             // plus this change's six MQTTD_BACKUP_* / MQTTD_RESTORE_* variables,
             // plus MQTTD_ALLOW_RELAXED_PUBLISH (ADR 0072),
-            // plus MQTTD_OWNERSHIP_DOMAIN (ADR 0073).
-            87,
+            // plus MQTTD_OWNERSHIP_DOMAIN (ADR 0073),
+            // plus MQTTD_SWIM_ADVERTISE (issue #396).
+            88,
             "the MQTTD_* surface changed — update ENV_VARS"
         );
         // Issue #239: MQTTD_MIN_REPLICAS was wired in `overlay_from` but never

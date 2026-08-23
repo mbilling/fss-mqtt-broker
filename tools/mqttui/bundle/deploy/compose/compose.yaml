@@ -216,6 +216,7 @@ services:
       MQTTD_PEER_TLS_CERT: /etc/mqttd/tls/mqttd-1.pem
       MQTTD_PEER_TLS_KEY: /etc/mqttd/tls/mqttd-1.key
       MQTTD_PEER_ADVERTISE: mqttd-1:7001   # peers dial THIS, never the 0.0.0.0 bind
+      MQTTD_SWIM_ADVERTISE: mqttd-1:7946   # same rule on the gossip plane (issue #396)
       MQTTD_SWIM_SEEDS: ${MQTTD_1_SEEDS:-}
       # The founder must be able to come Ready alone, or ordered bring-up never starts —
       # so it starts at 1, and that is an EXEMPTION FROM THE MAJORITY RULE, not the rule.
@@ -254,6 +255,7 @@ services:
       MQTTD_PEER_TLS_CERT: /etc/mqttd/tls/mqttd-2.pem
       MQTTD_PEER_TLS_KEY: /etc/mqttd/tls/mqttd-2.key
       MQTTD_PEER_ADVERTISE: mqttd-2:7001
+      MQTTD_SWIM_ADVERTISE: mqttd-2:7946
       MQTTD_SWIM_SEEDS: mqttd-1:7946
     ports: ["8884:8883", "127.0.0.1:8081:8080"]
     volumes:
@@ -279,6 +281,7 @@ services:
       MQTTD_PEER_TLS_CERT: /etc/mqttd/tls/mqttd-3.pem
       MQTTD_PEER_TLS_KEY: /etc/mqttd/tls/mqttd-3.key
       MQTTD_PEER_ADVERTISE: mqttd-3:7001
+      MQTTD_SWIM_ADVERTISE: mqttd-3:7946
       # Two seeds, so a node-1 outage does not stop node 3 rejoining after a restart.
       MQTTD_SWIM_SEEDS: mqttd-1:7946,mqttd-2:7946
     ports: ["8885:8883", "127.0.0.1:8082:8080"]

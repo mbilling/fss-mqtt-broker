@@ -241,7 +241,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `two_bridge_instances_do_not_duplicate_forwarding`
 - `two_partitioned_instances_deliver_each_inbound_message_exactly_once`
 
-## `crates/mqtt-cluster/src/lib.rs` — 267 test(s)
+## `crates/mqtt-cluster/src/lib.rs` — 273 test(s)
 
 - `cluster_identity::tests::a_founder_mints_once_and_reloads_stably`
 - `cluster_identity::tests::a_joiner_adopts_once_and_persists`
@@ -438,10 +438,14 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `swim::tests::a_dead_member_is_not_revived_by_stale_higher_incarnation_gossip`
 - `swim::tests::a_deaf_member_gets_a_certificate_carrying_regreet`
 - `swim::tests::a_first_hand_refutation_pierces_the_tombstone_but_a_relay_does_not`
+- `swim::tests::a_fully_removed_member_is_readmitted_on_direct_contact_and_a_refutation_sticks`
 - `swim::tests::a_leaving_node_does_not_refute_its_own_dead`
 - `swim::tests::a_node_advertises_its_own_domain_on_outgoing_gossip`
 - `swim::tests::a_peer_marks_a_leaving_node_dead_immediately`
+- `swim::tests::a_ping_req_naming_an_unroutable_target_is_relayed_to_our_learned_address`
 - `swim::tests::a_receiver_learns_a_peers_gossiped_failure_domain`
+- `swim::tests::a_reflected_datagram_from_ourselves_is_ignored`
+- `swim::tests::a_relay_poisoned_record_heals_on_first_direct_contact`
 - `swim::tests::a_restarted_node_is_not_re_killed_by_its_previous_lifes_dead_claim`
 - `swim::tests::a_run_of_unanswered_probe_rounds_marks_the_node_isolated_while_gossip_keeps_the_view_fresh`
 - `swim::tests::a_single_ack_of_our_probe_clears_isolation`
@@ -451,6 +455,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `swim::tests::address_change_at_higher_incarnation_is_adopted`
 - `swim::tests::an_unacquainted_seed_is_re_greeted_until_it_answers`
 - `swim::tests::an_unlabelled_relay_does_not_erase_a_known_domain`
+- `swim::tests::an_unroutable_self_claim_cannot_overwrite_a_source_learned_address`
 - `swim::tests::awareness_is_capped_at_awareness_max`
 - `swim::tests::awareness_rises_on_self_refutation_and_decays_on_a_clean_probe`
 - `swim::tests::awareness_scales_the_suspicion_timeout`
@@ -460,6 +465,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `swim::tests::duplicate_suspicion_from_one_node_does_not_fast_track`
 - `swim::tests::equal_incarnation_uses_state_precedence`
 - `swim::tests::first_contact_teaches_the_senders_domain`
+- `swim::tests::gossip_about_an_unroutable_subject_is_relayed_at_our_learned_address`
 - `swim::tests::gossip_updates_stop_after_transmit_limit`
 - `swim::tests::helper_relays_pingreq_and_reports_indirect_ack`
 - `swim::tests::higher_incarnation_supersedes`
@@ -610,7 +616,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 
 - `publish_codec_round_trip_clears_the_floor`
 
-## `crates/mqtt-config/src/lib.rs` — 31 test(s)
+## `crates/mqtt-config/src/lib.rs` — 32 test(s)
 
 - `tests::a_backup_dir_inside_the_data_dir_is_a_config_error`
 - `tests::a_bad_enum_value_is_rejected`
@@ -622,6 +628,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::an_unknown_mtls_identity_source_is_rejected_rather_than_defaulted`
 - `tests::an_unknown_top_level_table_is_rejected`
 - `tests::an_unset_env_leaves_file_and_defaults_intact`
+- `tests::an_unspecified_swim_advertise_is_refused`
 - `tests::comma_lists_and_the_domain_map_parse`
 - `tests::defaults_are_secure`
 - `tests::durable_on_without_a_data_dir_refuses_naming_both_remedies`

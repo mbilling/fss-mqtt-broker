@@ -19,6 +19,7 @@ peer_advertise = "__PEER_ADVERTISE__"
 
 [cluster.swim]
 bind = "0.0.0.0:7946"
+advertise = "__SWIM_ADVERTISE__"
 seeds = [__SEEDS__]
 
 [durable]
