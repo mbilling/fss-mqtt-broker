@@ -132,6 +132,30 @@ for ((i = 0; i < ND; i++)); do
 	rssh "$dip" "chmod 644 /opt/bench-certs/*"
 done
 
+# ── 3.5 private-net full-mesh gate (issue #393 forensics) ────────────────────
+# After the cloud-init attach retry the fabric can drop a host's OUTBOUND
+# private-net packets for tens of minutes while still DELIVERING inbound —
+# a cluster formed inside that window evicts and permanently removes the
+# muted node (SWIM acks and raft dials all die one-way; #393). Prove every
+# broker reaches every other over the private net, stably, before the first
+# mqttd starts.
+mesh_sweep() {
+	local i j targets
+	for ((i = 0; i < N; i++)); do
+		targets=""
+		for ((j = 0; j < N; j++)); do
+			[ "$i" = "$j" ] || targets="$targets $(broker_priv_ip "$j")"
+		done
+		rssh "$(broker_pub_ip "$i")" "for t in$targets; do ping -c1 -W2 \$t >/dev/null || exit 1; done" || return 1
+	done
+}
+mesh_stable() { mesh_sweep && sleep 5 && mesh_sweep && sleep 5 && mesh_sweep; }
+if [ "$N" -gt 1 ]; then
+	wait_for "private-net full mesh (every broker reaches every other)" 1200 mesh_sweep
+	wait_for "private-net mesh stability (3 clean sweeps 5s apart)" 300 mesh_stable
+	say "private-net full mesh verified stable"
+fi
+
 # ── 4. Founder-first start, then the rest, then ARM the founder ──────────────
 # Founder: no seeds, floor 1 (or it can never come up alone).
 push_node 0 1 ""
