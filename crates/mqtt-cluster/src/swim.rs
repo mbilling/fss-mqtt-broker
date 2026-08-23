@@ -160,6 +160,18 @@ pub struct Member {
     unanswered_probes: u32,
 }
 
+/// True when `addr` names the unspecified host (`0.0.0.0` / `[::]`) or is empty —
+/// an address that cannot be dialed from another machine (issue #396). A node
+/// bound to the unspecified address self-claims it verbatim; on the receiving
+/// host, dialing it loops back to the receiver's OWN socket, so every relayed
+/// record carrying it is a dead link (and a probe of it self-acks — see
+/// [`Swim::handle`]). Loopback is deliberately NOT in this set: single-host
+/// clusters address each other via `127.0.0.1:<port>` legitimately.
+fn unroutable(addr: &str) -> bool {
+    let host = addr.rsplit_once(':').map_or(addr, |(h, _)| h);
+    host.is_empty() || host == "0.0.0.0" || host == "[::]" || host == "::"
+}
+
 /// A membership update disseminated via gossip.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Update {
@@ -657,7 +669,15 @@ impl Swim {
             let inc_advanced = new_life || u.incarnation > m.incarnation;
             m.generation = u.generation;
             m.incarnation = u.incarnation;
-            m.addr.clone_from(&u.addr);
+            // An unroutable claim must not overwrite an address we can actually
+            // dial (issue #396): a node bound to `0.0.0.0` self-claims it in every
+            // update it emits — including its own refutations, which supersede by
+            // incarnation — and without this guard one such claim clobbers the
+            // source-learned address and every later probe of the member dials
+            // our own loopback. Same shape as `peer_addr`'s empty-claim rule.
+            if !unroutable(&u.addr) {
+                m.addr.clone_from(&u.addr);
+            }
             // Never let a claimant that hasn't learned the routing address yet
             // erase one we already know.
             let prev_peer_addr = m.peer_addr.clone();
@@ -742,7 +762,22 @@ impl Swim {
                 domain: u.failure_domain.clone(),
             });
         }
-        self.enqueue_gossip(u.clone());
+        // Relay with the best address we hold, not the claim's verbatim one
+        // (issue #396): an update whose subject self-claimed an unroutable bind
+        // would otherwise poison every third party's record — the receiver can
+        // never repair it, because repairing requires hearing from the subject
+        // first-hand at an address it cannot dial. Substituting our
+        // source-learned address turns every hop that knows better into a cure
+        // instead of a carrier.
+        let mut relay = u.clone();
+        if unroutable(&relay.addr) {
+            if let Some(m) = self.members.get(&NodeId(relay.id.clone())) {
+                if !unroutable(&m.addr) {
+                    relay.addr.clone_from(&m.addr);
+                }
+            }
+        }
+        self.enqueue_gossip(relay);
     }
 
     /// Locally declare a member `Suspect`/`Dead` and gossip it.
@@ -1029,21 +1064,39 @@ impl Swim {
     pub fn handle(&mut self, msg: Message, now: u64) -> Vec<Action> {
         let mut out = Vec::new();
 
-        // Learn the sender as an alive member if new.
+        // A datagram from OURSELVES is a reflection, not a peer (issue #396): a
+        // probe of a member recorded at an unroutable address lands on our own
+        // socket, and answering it would ack our own probe — falsely confirming
+        // the unreachable member alive, forever. Drop reflections outright.
+        if msg.from == self.local.0 {
+            return out;
+        }
+
+        // Learn the sender as an alive member if new; if known, refresh its SWIM
+        // address from where this datagram ACTUALLY came from (the driver stamps
+        // `from_addr` with the UDP source). Refreshing on EVERY datagram — not
+        // just first contact — is what lets a record poisoned by an unroutable
+        // relay heal the moment the member speaks to us directly (issue #396).
         let from_id = NodeId(msg.from.clone());
-        if from_id != self.local && !self.members.contains_key(&from_id) {
-            let update = Update {
-                id: msg.from.clone(),
-                addr: msg.from_addr.clone(),
-                peer_addr: msg.from_peer_addr.clone(),
-                incarnation: 0,
-                generation: msg.from_generation,
-                state: MemberState::Alive,
-                suspecter: None,
-                // First contact teaches the sender's label directly (ADR 0016 T5).
-                failure_domain: msg.from_domain.clone(),
-            };
-            self.apply_update_from(&update, now, &mut out, true);
+        if from_id != self.local {
+            if let Some(m) = self.members.get_mut(&from_id) {
+                if m.addr != msg.from_addr && !unroutable(&msg.from_addr) {
+                    m.addr.clone_from(&msg.from_addr);
+                }
+            } else {
+                let update = Update {
+                    id: msg.from.clone(),
+                    addr: msg.from_addr.clone(),
+                    peer_addr: msg.from_peer_addr.clone(),
+                    incarnation: 0,
+                    generation: msg.from_generation,
+                    state: MemberState::Alive,
+                    suspecter: None,
+                    // First contact teaches the sender's label directly (ADR 0016 T5).
+                    failure_domain: msg.from_domain.clone(),
+                };
+                self.apply_update_from(&update, now, &mut out, true);
+            }
         }
 
         // Merge piggybacked gossip. A claim about the SENDER ITSELF is first-hand
@@ -1067,14 +1120,27 @@ impl Swim {
                 target,
                 target_addr,
             } => {
-                // Relay: probe the target, remembering who to answer.
+                // Relay: probe the target, remembering who to answer. If the
+                // requester only knows the target at an unroutable address
+                // (issue #396) but WE hold a dialable one — typically source-
+                // learned from the target's own datagrams — probe that instead:
+                // the indirect ack that follows is exactly how the requester's
+                // poisoned record gets repaired.
+                let dial = if unroutable(&target_addr) {
+                    self.members
+                        .get(&NodeId(target.clone()))
+                        .filter(|m| !unroutable(&m.addr))
+                        .map_or(target_addr, |m| m.addr.clone())
+                } else {
+                    target_addr
+                };
                 self.seq += 1;
                 let relay_seq = self.seq;
                 self.relays
                     .insert(relay_seq, (msg.from_addr, NodeId(target.clone())));
                 let ping = self.message(Kind::Ping { seq: relay_seq });
                 out.push(Action::Send {
-                    to: target_addr,
+                    to: dial,
                     msg: ping,
                 });
             }
@@ -2385,5 +2451,208 @@ mod tests {
         // ...and its self-update in the piggybacked gossip does too.
         let self_update = sync.gossip.iter().find(|u| u.id == "a").unwrap();
         assert_eq!(self_update.failure_domain.as_deref(), Some("rack-a"));
+    }
+
+    fn swim_addr_of(s: &Swim, id: &str) -> String {
+        s.members()
+            .into_iter()
+            .find(|m| m.id.0 == id)
+            .map_or_else(|| panic!("{id} not in members"), |m| m.addr)
+    }
+
+    #[test]
+    fn an_unroutable_self_claim_cannot_overwrite_a_source_learned_address() {
+        // Issue #396: a node bound to 0.0.0.0 stamps that bind into every
+        // self-update it emits — including refutations, which supersede by
+        // incarnation. The source-learned address must survive them.
+        let mut s = node("a", "a:1", &[]);
+        s.handle(m("b", "b:1", Kind::Join, vec![]), 0);
+        assert_eq!(swim_addr_of(&s, "b"), "b:1");
+        // b's own (first-hand) higher-incarnation self-claim carries its bind.
+        s.handle(
+            m(
+                "b",
+                "b:1",
+                Kind::Sync,
+                vec![alive_update("b", "0.0.0.0:7946", 5)],
+            ),
+            1,
+        );
+        let b = s.members().into_iter().find(|m| m.id.0 == "b").unwrap();
+        assert_eq!(b.addr, "b:1", "the unroutable claim must not stick");
+        assert_eq!(b.incarnation, 5, "the claim's incarnation still applies");
+    }
+
+    #[test]
+    fn a_relay_poisoned_record_heals_on_first_direct_contact() {
+        // Learned only via relay, c is recorded at the poison address...
+        let mut s = node("a", "a:1", &[]);
+        s.handle(
+            m(
+                "x",
+                "x:1",
+                Kind::Sync,
+                vec![alive_update("c", "0.0.0.0:7946", 2)],
+            ),
+            0,
+        );
+        assert_eq!(swim_addr_of(&s, "c"), "0.0.0.0:7946");
+        // ...until c speaks to us directly: the datagram's UDP source (stamped
+        // into `from_addr` by the driver) repairs the record — on ANY datagram,
+        // not just first contact.
+        s.handle(m("c", "c:9", Kind::Ping { seq: 7 }, vec![]), 1);
+        assert_eq!(swim_addr_of(&s, "c"), "c:9");
+    }
+
+    #[test]
+    fn gossip_about_an_unroutable_subject_is_relayed_at_our_learned_address() {
+        // a knows b's real address first-hand; a relayed claim about b carrying
+        // b's 0.0.0.0 bind must be re-broadcast at the address a actually holds
+        // — every hop that knows better is a cure, not a carrier (issue #396).
+        let mut s = node("a", "a:1", &[]);
+        s.handle(m("b", "b:1", Kind::Join, vec![]), 0);
+        s.handle(
+            m(
+                "x",
+                "x:1",
+                Kind::Sync,
+                vec![alive_update("b", "0.0.0.0:7946", 5)],
+            ),
+            1,
+        );
+        // Any outbound datagram piggybacks the queued gossip; b's entry must
+        // carry the learned address.
+        let sync = s
+            .handle(m("y", "y:1", Kind::Join, vec![]), 2)
+            .into_iter()
+            .find_map(|a| match a {
+                Action::Send { msg, .. } if msg.kind == Kind::Sync => Some(msg),
+                _ => None,
+            })
+            .expect("a Sync reply");
+        let b = sync.gossip.iter().find(|u| u.id == "b").unwrap();
+        assert_eq!(b.addr, "b:1");
+    }
+
+    #[test]
+    fn a_ping_req_naming_an_unroutable_target_is_relayed_to_our_learned_address() {
+        // The helper holds the target's real (source-learned) address; the
+        // requester only holds the poison. The relayed probe must dial the real
+        // one — its indirect ack is how the requester's record gets repaired.
+        let mut s = node("a", "a:1", &[]);
+        s.handle(m("t", "t:5", Kind::Join, vec![]), 0);
+        let out = s.handle(
+            m(
+                "r",
+                "r:1",
+                Kind::PingReq {
+                    target: "t".into(),
+                    target_addr: "0.0.0.0:7946".into(),
+                },
+                vec![],
+            ),
+            1,
+        );
+        let ping_to = out
+            .iter()
+            .find_map(|a| match a {
+                Action::Send { to, msg } if matches!(msg.kind, Kind::Ping { .. }) => {
+                    Some(to.clone())
+                }
+                _ => None,
+            })
+            .expect("a relayed Ping");
+        assert_eq!(ping_to, "t:5");
+    }
+
+    #[test]
+    fn a_reflected_datagram_from_ourselves_is_ignored() {
+        // Probing a member recorded at an unroutable address lands on our OWN
+        // socket (dialing 0.0.0.0 loops back). Without the reflection guard we
+        // would ack our own probe and confirm the unreachable member alive
+        // forever (issue #396 — how the ghosted node's view stayed green).
+        let mut s = node("a", "a:1", &[]);
+        s.handle(
+            m(
+                "x",
+                "x:1",
+                Kind::Sync,
+                vec![alive_update("z", "0.0.0.0:7946", 1)],
+            ),
+            0,
+        );
+        // Drive a probe round and capture the Ping's seq wherever it went.
+        let mut now = 100;
+        let mut seq = None;
+        for _ in 0..10 {
+            for a in s.tick(now) {
+                if let Action::Send { msg, .. } = a {
+                    if let Kind::Ping { seq: q } = msg.kind {
+                        if s.members().iter().any(|m| m.id.0 == "z") {
+                            seq = Some(q);
+                        }
+                    }
+                }
+            }
+            if seq.is_some() {
+                break;
+            }
+            now += 100;
+        }
+        let seq = seq.expect("a probe was issued");
+        // The reflected datagrams: our own Ping arrives back at us, and the Ack
+        // we would send to "ourselves at 0.0.0.0" arrives too. Both must be dropped
+        // — no reply, no self-ack.
+        let refl = s.handle(m("a", "a:1", Kind::Ping { seq }, vec![]), now);
+        assert!(refl.is_empty(), "a reflected Ping must not be answered");
+        s.handle(m("a", "a:1", Kind::Ack { seq }, vec![]), now);
+        // With no self-ack the probe round runs to its honest conclusion:
+        // z (unreachable) becomes Suspect once both deadlines lapse.
+        for _ in 0..20 {
+            now += 100;
+            s.tick(now);
+        }
+        let z = s.members().into_iter().find(|m| m.id.0 == "z").unwrap();
+        assert_ne!(
+            z.state,
+            MemberState::Alive,
+            "an unreachable member must not be kept alive by our own reflection"
+        );
+    }
+
+    #[test]
+    fn a_fully_removed_member_is_readmitted_on_direct_contact_and_a_refutation_sticks() {
+        // Issue #393's terminal ghost, replayed with routable addresses: once the
+        // address poison (issue #396) is out of the picture, the existing
+        // machinery — first-contact re-admission, the tombstone, and the
+        // first-hand pierce (issue #383) — converges back to Alive.
+        let mut s = node("a", "a:1", &[]);
+        s.handle(m("b", "b:1", Kind::Join, vec![]), 0);
+        let mut out = Vec::new();
+        s.apply_update(&dead_update("b", "b:1", 3), 10, &mut out);
+        // The tombstone expires and the member is pruned entirely.
+        s.tick(10 + 2000 + 100);
+        assert!(
+            !s.members().iter().any(|m| m.id.0 == "b"),
+            "b should be pruned after dead_ttl"
+        );
+        // b speaks to us directly: re-admitted on first contact.
+        let now = 3000;
+        s.handle(m("b", "b:1", Kind::Ping { seq: 1 }, vec![]), now);
+        assert!(s.members().iter().any(|m| m.id.0 == "b"));
+        // A stale Dead claim still circulating at the old incarnation re-kills
+        // the freshly re-admitted (incarnation 0) record...
+        let mut out = Vec::new();
+        s.apply_update(&dead_update("b", "b:1", 3), now + 1, &mut out);
+        // ...but b's own first-hand refutation at a higher incarnation pierces
+        // the fence (issue #383) and stays, because no poisoned third party is
+        // left to manufacture fresh kills.
+        s.handle(
+            m("b", "b:1", Kind::Sync, vec![alive_update("b", "b:1", 4)]),
+            now + 2,
+        );
+        let b = s.members().into_iter().find(|m| m.id.0 == "b").unwrap();
+        assert_eq!(b.state, MemberState::Alive);
+        assert_eq!(b.addr, "b:1");
     }
 }
