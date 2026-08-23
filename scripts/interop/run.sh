@@ -57,11 +57,18 @@ print(*[s.getsockname()[1] for s in ss])
 
 # Block until the broker's /readyz returns 200, or fail after ~6s.
 wait_ready() { # <health_port>
+  wait_ready_soft "$1" && return 0
+  echo "FATAL: broker never became ready on health port $1"; exit 2
+}
+
+# As wait_ready, but returns nonzero instead of exiting — for the #360 bind-race
+# retry loops, which mint fresh ports and try again on AddrInUse.
+wait_ready_soft() { # <health_port>
   for _ in $(seq 1 60); do
     curl -fsS "http://127.0.0.1:$1/readyz" >/dev/null 2>&1 && return 0
     sleep 0.1
   done
-  echo "FATAL: broker never became ready on health port $1"; exit 2
+  return 1
 }
 
 SETTLE="${INTEROP_SETTLE:-0.5}"  # subscription-establish wait before publishing
@@ -109,18 +116,28 @@ gen_pki() {
 echo
 echo "── Phase A: plaintext + server-TLS ────────────────────────────────────"
 gen_pki
-read -r MQTT TLSP HEALTH < <(free_ports 3)
-MQTTD_NODE_ID=interop-a \
-MQTTD_ALLOW_EPHEMERAL_DURABILITY=1 \
-MQTTD_PLAINTEXT_BIND="127.0.0.1:$MQTT" \
-MQTTD_TLS_BIND="127.0.0.1:$TLSP" \
-MQTTD_TLS_CERT="$WORK/pki/server.crt" \
-MQTTD_TLS_KEY="$WORK/pki/server.key" \
-MQTTD_ALLOW_ANONYMOUS=1 \
-MQTTD_HEALTH_BIND="127.0.0.1:$HEALTH" \
-RUST_LOG=off "$MQTTD_BIN" &
-PIDS+=("$!")
-wait_ready "$HEALTH"
+# Bounded bind-race retry (#360): the free_ports mint is TOCTOU, so an AddrInUse
+# boot gets fresh ports and another try instead of a misleading "never ready".
+for attempt in 1 2 3; do
+  read -r MQTT TLSP HEALTH < <(free_ports 3)
+  MQTTD_NODE_ID=interop-a \
+  MQTTD_ALLOW_EPHEMERAL_DURABILITY=1 \
+  MQTTD_PLAINTEXT_BIND="127.0.0.1:$MQTT" \
+  MQTTD_TLS_BIND="127.0.0.1:$TLSP" \
+  MQTTD_TLS_CERT="$WORK/pki/server.crt" \
+  MQTTD_TLS_KEY="$WORK/pki/server.key" \
+  MQTTD_ALLOW_ANONYMOUS=1 \
+  MQTTD_HEALTH_BIND="127.0.0.1:$HEALTH" \
+  RUST_LOG=off "$MQTTD_BIN" > "$WORK/boot-a.log" 2>&1 &
+  BROKER_A=$!
+  if wait_ready_soft "$HEALTH"; then PIDS+=("$BROKER_A"); break; fi
+  kill "$BROKER_A" 2>/dev/null || true; wait "$BROKER_A" 2>/dev/null || true
+  if grep -qE "AddrInUse|Address already in use" "$WORK/boot-a.log" && [ "$attempt" -lt 3 ]; then
+    echo "note: bind race (AddrInUse) on attempt $attempt; retrying with fresh ports (#360)"
+    continue
+  fi
+  echo "FATAL: broker A never became ready:"; tail -5 "$WORK/boot-a.log"; exit 2
+done
 
 # v3.1.1 payload integrity at every QoS.
 for q in 0 1 2; do
@@ -162,18 +179,26 @@ roundtrip "TLS 1.3 round-trip (OpenSSL↔rustls)" "$TLSP" "tls/a" "over-tls" "ov
 # ===========================================================================
 echo
 echo "── Phase B: mutual TLS ────────────────────────────────────────────────"
-read -r MTLSP HEALTHB < <(free_ports 2)
-MQTTD_NODE_ID=interop-b \
-MQTTD_ALLOW_EPHEMERAL_DURABILITY=1 \
-MQTTD_TLS_BIND="127.0.0.1:$MTLSP" \
-MQTTD_TLS_CERT="$WORK/pki/server.crt" \
-MQTTD_TLS_KEY="$WORK/pki/server.key" \
-MQTTD_TLS_CLIENT_CA="$WORK/pki/ca.crt" \
-MQTTD_ALLOW_ANONYMOUS=1 \
-MQTTD_HEALTH_BIND="127.0.0.1:$HEALTHB" \
-RUST_LOG=off "$MQTTD_BIN" &
-PIDS+=("$!")
-wait_ready "$HEALTHB"
+for attempt in 1 2 3; do
+  read -r MTLSP HEALTHB < <(free_ports 2)
+  MQTTD_NODE_ID=interop-b \
+  MQTTD_ALLOW_EPHEMERAL_DURABILITY=1 \
+  MQTTD_TLS_BIND="127.0.0.1:$MTLSP" \
+  MQTTD_TLS_CERT="$WORK/pki/server.crt" \
+  MQTTD_TLS_KEY="$WORK/pki/server.key" \
+  MQTTD_TLS_CLIENT_CA="$WORK/pki/ca.crt" \
+  MQTTD_ALLOW_ANONYMOUS=1 \
+  MQTTD_HEALTH_BIND="127.0.0.1:$HEALTHB" \
+  RUST_LOG=off "$MQTTD_BIN" > "$WORK/boot-b.log" 2>&1 &
+  BROKER_B=$!
+  if wait_ready_soft "$HEALTHB"; then PIDS+=("$BROKER_B"); break; fi
+  kill "$BROKER_B" 2>/dev/null || true; wait "$BROKER_B" 2>/dev/null || true
+  if grep -qE "AddrInUse|Address already in use" "$WORK/boot-b.log" && [ "$attempt" -lt 3 ]; then
+    echo "note: bind race (AddrInUse) on attempt $attempt; retrying with fresh ports (#360)"
+    continue
+  fi
+  echo "FATAL: broker B never became ready:"; tail -5 "$WORK/boot-b.log"; exit 2
+done
 
 # A client presenting a CA-signed cert completes mTLS and round-trips.
 CL=(--cafile "$WORK/pki/ca.crt" --cert "$WORK/pki/client.crt" --key "$WORK/pki/client.key" --tls-version tlsv1.3)
