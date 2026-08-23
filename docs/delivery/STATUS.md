@@ -80,7 +80,7 @@
 | [0070](../adr/0070-stakeholder-documentation.md) | Usage documentation is owned by stakeholders, not by features | Proposed | [0/8 done](0070-stakeholder-documentation.md) | 8 open |
 | [0071](../adr/0071-owner-side-group-commit.md) | # 0071. Owner-side group commit: one durable-write serializer per node | Accepted | [2/3 done](0071-owner-side-group-commit.md) | 1 open |
 | [0072](../adr/0072-per-message-durability-selection.md) | # 0072. Per-message durability selection: the `mqttd-durability` user property | Accepted | [1/2 done](0072-per-message-durability-selection.md) | 1 open |
-| [0073](../adr/0073-scale-out-durable-ownership.md) | # 0073. Scale-out durable ownership: the voter set is a control plane, not the data path | Accepted | [2/4 done](0073-scale-out-durable-ownership.md) | 2 open |
+| [0073](../adr/0073-scale-out-durable-ownership.md) | # 0073. Scale-out durable ownership: the voter set is a control plane, not the data path | Accepted | [3/4 done](0073-scale-out-durable-ownership.md) | 1 open |
 | [0074](../adr/0074-detached-ack-truncate.md) | # 0074. The subscriber-ack truncate leaves the hub loop's critical path | Accepted | [1/2 done](0074-detached-ack-truncate.md) | 1 open |
 
 ## Open and deferred work
@@ -198,7 +198,6 @@
 
 **0073 — # 0073. Scale-out durable ownership: the voter set is a control plane, not the data path**
 
-- `0073-T3` ⬜ planned: "Grow/shrink migration soak at scale: 5→10 nodes, ownership spreads ~1/N via eager migration (ADR 0043 P2 machinery), zero acked loss under load" — "The migration machinery is ADR 0043's and unchanged; the soak proves it under the widened domain at fleet size. Natural to run beside T4 on the same paid hardware."
 - `0073-T4` ⬜ planned: "The measured slope: 7- and 10-node durable curve, capped vs uncapped ownership A/B on identical hardware; SCALE-CURVE.md + COMPARISON.md publication of the scale-out claim with the up-vs-out economics case" — "Needs the Hetzner quota raise (~100 dedicated vCPU). The PR #375 lease-voters rig variant becomes the A/B control arm; the default arm now measures the ADR 0073 domain."
 
 **0074 — # 0074. The subscriber-ack truncate leaves the hub loop's critical path**
