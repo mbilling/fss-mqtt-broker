@@ -724,7 +724,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::sink_records_through_a_trait_object`
 - `tests::tampering_with_any_field_changes_the_head`
 
-## `crates/mqtt-storage/src/lib.rs` — 77 test(s)
+## `crates/mqtt-storage/src/lib.rs` — 79 test(s)
 
 - `app_props::tests::converts_to_and_from_core_properties_losslessly`
 - `app_props::tests::encode_decode_roundtrips_and_fails_closed`
@@ -757,8 +757,10 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `logged::tests::the_session_owner_is_durable_across_the_log`
 - `open::tests::opens_a_fresh_database`
 - `open::tests::reopens_after_the_first_handle_drops`
+- `persistent_log::tests::a_concurrent_append_burst_group_commits_without_changing_the_contract`
 - `persistent_log::tests::a_foreign_schema_version_fails_closed`
 - `persistent_log::tests::append_assigns_monotonic_offsets_per_key`
+- `persistent_log::tests::dropping_the_log_releases_the_writer_before_a_reopen`
 - `persistent_log::tests::keys_enumerates_every_live_key_and_forgets_removed_ones`
 - `persistent_log::tests::live_range_and_truncate_keep_offsets_monotonic`
 - `persistent_log::tests::remove_clears_the_key_and_resets_offsets`

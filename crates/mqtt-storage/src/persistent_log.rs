@@ -51,9 +51,135 @@ fn backend<E: Display>(e: E) -> ReplError {
 }
 
 /// A durable, single-node [`ReplicatedLog`] persisting to a `redb` file (ADR 0018).
+///
+/// Appends **group-commit** (ADR 0071 T3): a dedicated writer thread drains every
+/// append queued while the previous fsync was in flight into ONE
+/// `Durability::Immediate` transaction, so concurrent appends share barriers
+/// instead of queuing behind each other's — the same shape the clustered plane's
+/// replica writer proved (2.3–3 ops/barrier under load there; here the batch is
+/// whatever concurrency the hub's append lanes present). Every other mutation
+/// keeps its own transaction: they are not the hot path, and `redb`'s
+/// single-writer lock serializes them against the batch commits exactly as
+/// before.
 #[derive(Debug, Clone)]
 pub struct PersistentLog {
     db: Arc<Database>,
+    /// The append writer thread, joined DETERMINISTICALLY when the last log
+    /// clone drops (see [`WriterHandle`]) — the thread holds a database clone,
+    /// and a reopen over the same path must never race its exit (ADR 0018
+    /// phase 5: the lock releases with the last handle).
+    writer: Arc<WriterHandle>,
+    /// Group-commit observability: fsync'd batches and ops (test- and
+    /// metrics-pollable; ops/batches = mean batch depth).
+    stats: Arc<WriterStats>,
+}
+
+/// Owns the writer's sender and join handle. Dropping the last clone drops the
+/// sender FIRST (disconnecting the channel, which ends the writer's `recv` loop)
+/// and then JOINS the thread — so by the time the last [`PersistentLog`] clone is
+/// gone, the thread's database handle is gone too, and a reopen cannot hit
+/// `DatabaseAlreadyOpen`.
+#[derive(Debug)]
+struct WriterHandle {
+    tx: Option<std::sync::mpsc::Sender<AppendJob>>,
+    join: Option<std::thread::JoinHandle<()>>,
+}
+
+impl WriterHandle {
+    fn send(&self, job: AppendJob) -> Result<(), ReplError> {
+        self.tx
+            .as_ref()
+            .expect("sender lives until drop")
+            .send(job)
+            .map_err(|_| ReplError::Backend("append writer stopped".into()))
+    }
+}
+
+impl Drop for WriterHandle {
+    fn drop(&mut self) {
+        drop(self.tx.take()); // disconnect: the writer drains and exits
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
+/// One queued append: key, record, and the oneshot resolving to its offset.
+struct AppendJob {
+    key: String,
+    record: Vec<u8>,
+    done: tokio::sync::oneshot::Sender<Result<Offset, ReplError>>,
+}
+
+/// The append writer's counters (ADR 0071 T3).
+#[derive(Debug, Default)]
+pub struct WriterStats {
+    /// Fsync'd batch commits.
+    pub batches: std::sync::atomic::AtomicU64,
+    /// Appends committed across all batches.
+    pub ops: std::sync::atomic::AtomicU64,
+    /// Largest single batch since open.
+    pub max_batch: std::sync::atomic::AtomicU64,
+}
+
+/// The writer thread: drain-then-commit. Whole-batch reject on a failed commit —
+/// every waiter in the batch sees the error, none is told its append survived.
+fn run_append_writer(
+    db: &Arc<Database>,
+    rx: &std::sync::mpsc::Receiver<AppendJob>,
+    stats: &Arc<WriterStats>,
+) {
+    use std::sync::atomic::Ordering::Relaxed;
+    while let Ok(first) = rx.recv() {
+        let mut jobs = vec![first];
+        while let Ok(next) = rx.try_recv() {
+            jobs.push(next);
+        }
+        let mut results: Vec<(
+            tokio::sync::oneshot::Sender<Result<Offset, ReplError>>,
+            Offset,
+        )> = Vec::with_capacity(jobs.len());
+        let commit = (|| -> Result<(), ReplError> {
+            let mut txn = db.begin_write().map_err(backend)?;
+            txn.set_durability(Durability::Immediate); // ONE fsync for the whole batch
+            {
+                let mut counters = txn.open_table(NEXT_OFFSET).map_err(backend)?;
+                let mut entries = txn.open_table(ENTRIES).map_err(backend)?;
+                for job in jobs.drain(..) {
+                    let next = counters
+                        .get(job.key.as_str())
+                        .map_err(backend)?
+                        .map_or(0, |g| g.value())
+                        + 1;
+                    counters.insert(job.key.as_str(), next).map_err(backend)?;
+                    entries
+                        .insert(entry_key(&job.key, next).as_slice(), job.record.as_slice())
+                        .map_err(backend)?;
+                    results.push((job.done, next));
+                }
+            }
+            txn.commit().map_err(backend)?;
+            Ok(())
+        })();
+        match commit {
+            Ok(()) => {
+                stats.batches.fetch_add(1, Relaxed);
+                stats.ops.fetch_add(results.len() as u64, Relaxed);
+                stats.max_batch.fetch_max(results.len() as u64, Relaxed);
+                for (done, offset) in results {
+                    let _ = done.send(Ok(offset));
+                }
+            }
+            Err(e) => {
+                // Nothing in this batch reached the disk: fail every waiter (the
+                // clustered writer's whole-batch-reject rule). Jobs not yet drained
+                // into `results` failed before their offset was even assigned.
+                for (done, _) in results {
+                    let _ = done.send(Err(ReplError::Backend(e.to_string())));
+                }
+            }
+        }
+    }
 }
 
 impl PersistentLog {
@@ -74,7 +200,33 @@ impl PersistentLog {
             let _ = txn.open_table(NEXT_OFFSET).map_err(backend)?;
         }
         txn.commit().map_err(backend)?;
-        Ok(Self { db: Arc::new(db) })
+        let db = Arc::new(db);
+        let (append_tx, append_rx) = std::sync::mpsc::channel::<AppendJob>();
+        let stats = Arc::new(WriterStats::default());
+        let join = {
+            let db = db.clone();
+            let stats = stats.clone();
+            // A plain OS thread: the writer blocks on fsync by design, and it must
+            // not occupy the async runtime's blocking pool for the process lifetime.
+            std::thread::Builder::new()
+                .name("persistent-log-writer".into())
+                .spawn(move || run_append_writer(&db, &append_rx, &stats))
+                .map_err(backend)?
+        };
+        Ok(Self {
+            db,
+            writer: Arc::new(WriterHandle {
+                tx: Some(append_tx),
+                join: Some(join),
+            }),
+            stats,
+        })
+    }
+
+    /// The append writer's group-commit counters (ADR 0071 T3).
+    #[must_use]
+    pub fn writer_stats(&self) -> Arc<WriterStats> {
+        self.stats.clone()
     }
 
     /// Run a closure on a blocking thread with a cloned database handle, so the
@@ -133,31 +285,17 @@ impl ReplicatedLog for PersistentLog {
     type Key = String;
 
     async fn append(&self, key: &String, record: Vec<u8>) -> Result<Offset, ReplError> {
-        let key = key.clone();
-        self.run(move |db| {
-            let mut txn = db.begin_write().map_err(backend)?;
-            txn.set_durability(Durability::Immediate); // fsync on commit (ADR 0018)
-            let offset = {
-                let mut counters = txn.open_table(NEXT_OFFSET).map_err(backend)?;
-                // 1-based, monotonic per key (survives truncation; reset only by remove).
-                let next = counters
-                    .get(key.as_str())
-                    .map_err(backend)?
-                    .map_or(0, |g| g.value())
-                    + 1;
-                counters.insert(key.as_str(), next).map_err(backend)?;
-                next
-            };
-            {
-                let mut entries = txn.open_table(ENTRIES).map_err(backend)?;
-                entries
-                    .insert(entry_key(&key, offset).as_slice(), record.as_slice())
-                    .map_err(backend)?;
-            }
-            txn.commit().map_err(backend)?;
-            Ok(offset)
-        })
-        .await
+        // Group commit (ADR 0071 T3): queue on the writer thread and await the
+        // batch's single fsync. Offsets stay 1-based and monotonic per key
+        // (assigned inside the batch's transaction, in arrival order).
+        let (done, wait) = tokio::sync::oneshot::channel();
+        self.writer.send(AppendJob {
+            key: key.clone(),
+            record,
+            done,
+        })?;
+        wait.await
+            .map_err(|_| ReplError::Backend("append writer dropped the job".into()))?
     }
 
     async fn read(
@@ -448,5 +586,94 @@ mod tests {
         assert_eq!(&entries[0].record, b"b");
         // The offset counter persisted: the next append does not reuse offset 2.
         assert_eq!(log.append(&k, rec(b"c")).await.unwrap(), 3);
+    }
+
+    /// ADR 0071 T3: a concurrent append burst group-commits — strictly fewer
+    /// fsync'd batches than appends, at least one batch carrying several ops —
+    /// while every append still gets a unique, monotonic per-key offset and
+    /// every record survives a reopen (the equivalence half: batching changes
+    /// the COST, never the contract).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_concurrent_append_burst_group_commits_without_changing_the_contract() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log.redb");
+        let log = PersistentLog::open(&path).unwrap();
+        let stats = log.writer_stats();
+
+        const KEYS: usize = 8;
+        const PER_KEY: usize = 25;
+        let mut handles = Vec::new();
+        for kidx in 0..KEYS {
+            let log = log.clone();
+            handles.push(tokio::spawn(async move {
+                let key = format!("burst-{kidx}");
+                let mut offsets = Vec::new();
+                for i in 0..PER_KEY {
+                    let off = log
+                        .append(&key, format!("{kidx}-{i}").into_bytes())
+                        .await
+                        .unwrap();
+                    offsets.push(off);
+                }
+                (key, offsets)
+            }));
+        }
+        let mut results = Vec::new();
+        for h in handles {
+            results.push(h.await.unwrap());
+        }
+
+        // Contract: per-key offsets are exactly 1..=PER_KEY, in issue order.
+        for (key, offsets) in &results {
+            assert_eq!(
+                offsets,
+                &(1..=PER_KEY as u64).collect::<Vec<_>>(),
+                "{key}: offsets must be dense, 1-based and in append order"
+            );
+        }
+        // Group commit: the burst must have shared fsyncs. With 8 concurrent
+        // writers the writer thread cannot help draining >1 job per cycle at
+        // least once; total batches must come in under total ops.
+        let ops = stats.ops.load(Relaxed);
+        let batches = stats.batches.load(Relaxed);
+        let max = stats.max_batch.load(Relaxed);
+        assert_eq!(ops, (KEYS * PER_KEY) as u64);
+        assert!(
+            batches < ops,
+            "group commit must batch: {batches} batches for {ops} ops"
+        );
+        assert!(
+            max >= 2,
+            "at least one batch carries several appends (max {max})"
+        );
+        eprintln!("group-commit burst: {ops} ops in {batches} batches (max {max})");
+
+        // Durability across reopen: every record is there.
+        drop(log);
+        let log = PersistentLog::open(&path).unwrap();
+        for (key, _) in &results {
+            let entries = log.read(key, 0, PER_KEY + 1).await.unwrap();
+            assert_eq!(entries.len(), PER_KEY, "{key}: all appends survived reopen");
+        }
+    }
+
+    /// ADR 0071 T3: dropping the last log clone JOINS the writer thread before
+    /// returning, so an immediate reopen over the same path never races the
+    /// thread's database handle (`DatabaseAlreadyOpen`) — the ADR 0018 phase-5
+    /// lock rule, preserved under the new writer.
+    #[tokio::test]
+    async fn dropping_the_log_releases_the_writer_before_a_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log.redb");
+        for cycle in 0..5u64 {
+            let log = PersistentLog::open(&path).unwrap();
+            let off = log
+                .append(&"k".to_string(), vec![cycle as u8])
+                .await
+                .unwrap();
+            assert_eq!(off, cycle + 1);
+            drop(log); // must join the writer; the next open must not collide
+        }
     }
 }
