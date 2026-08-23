@@ -93,8 +93,12 @@ fi
 # dial the advertised address over the headless service, and 0.0.0.0 is unroutable
 # (the mesh never links). Per-pod DNS is <pod>.<headless>.<ns>.svc.cluster.local.
 PEER_ADVERTISE="${POD_NAME}.${HEADLESS_DOMAIN}:7001"
+# Same rule for the gossip plane (issue #396): a self-claimed 0.0.0.0 in gossip
+# loops third parties back to their own socket.
+SWIM_ADVERTISE="${POD_NAME}.${HEADLESS_DOMAIN}:7946"
 sed -e "s/__NODE_ID__/${POD_NAME}/g" -e "s|__SEEDS__|${SEEDS}|g" \
   -e "s|__PEER_ADVERTISE__|${PEER_ADVERTISE}|g" \
+  -e "s|__SWIM_ADVERTISE__|${SWIM_ADVERTISE}|g" \
   -e "s/__READY_MIN__/${READY_MIN}/g" \
   -e "s/__STORE_MAX_BYTES__/${STORE_MAX_BYTES:-0}/g" \
   "${TMPL_DIR:-/tmpl}/mqttd.toml.tmpl" > "${OUT_DIR:-/config}/mqttd.toml"

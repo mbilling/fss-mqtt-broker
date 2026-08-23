@@ -136,6 +136,10 @@ peer_bind = "0.0.0.0:7001"
 # SWIM gossip membership (needs [cluster] peer_bind). Seeds = existing members to join through;
 # a node with no seeds founds the lease group (exactly one founder per cluster).
 bind = "0.0.0.0:7946"
+# The gossip address this node CLAIMS as its own; default the bind. With a 0.0.0.0 bind,
+# set it to an address peers can dial (issue #396) — gossip disseminates it to members
+# that have never heard from this node directly.
+advertise = "node-1.mqttd.svc:7946"
 seeds = ["node-2.mqttd.svc:7946", "node-3.mqttd.svc:7946"]
 # The 64-hex gossip key. Prefer key_file (secret-by-reference) over the inline key; setting both
 # is an error. `openssl rand -hex 32` generates one.
