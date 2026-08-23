@@ -289,6 +289,7 @@ fn sim_cfg() -> Config {
         gossip_multiplier: 4,
         awareness_max: 8,
         isolation_rounds: 5,
+        reprime_after: 3,
     }
 }
 
