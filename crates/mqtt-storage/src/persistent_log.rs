@@ -596,13 +596,13 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_concurrent_append_burst_group_commits_without_changing_the_contract() {
         use std::sync::atomic::Ordering::Relaxed;
+        const KEYS: usize = 8;
+        const PER_KEY: usize = 25;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("log.redb");
         let log = PersistentLog::open(&path).unwrap();
         let stats = log.writer_stats();
 
-        const KEYS: usize = 8;
-        const PER_KEY: usize = 25;
         let mut handles = Vec::new();
         for kidx in 0..KEYS {
             let log = log.clone();
@@ -669,7 +669,7 @@ mod tests {
         for cycle in 0..5u64 {
             let log = PersistentLog::open(&path).unwrap();
             let off = log
-                .append(&"k".to_string(), vec![cycle as u8])
+                .append(&"k".to_string(), vec![u8::try_from(cycle).unwrap()])
                 .await
                 .unwrap();
             assert_eq!(off, cycle + 1);
