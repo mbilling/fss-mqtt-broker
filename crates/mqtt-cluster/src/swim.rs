@@ -94,6 +94,13 @@ pub struct Config {
     /// threshold trades detection delay against false positives from a run of
     /// genuinely-dead targets. Clamped to `>= 1`.
     pub isolation_rounds: u32,
+    /// Consecutive unanswered direct probes of ONE member after which the next probe
+    /// of it is accompanied by a `Join` re-greet — the certificate-carrying prime
+    /// frame (issue #383). Heals the auth-layer deadlock where a receiver that lost
+    /// our certificate drops every fingerprint-sealed datagram (`cert-miss`) and we
+    /// never learn: to us the peer is merely deaf, and after this many silent
+    /// probes we reintroduce ourselves with the full certificate.
+    pub reprime_after: u32,
 }
 
 impl Default for Config {
@@ -110,6 +117,7 @@ impl Default for Config {
             gossip_multiplier: 3,
             awareness_max: 8,
             isolation_rounds: 5,
+            reprime_after: 3,
         }
     }
 }
@@ -144,6 +152,12 @@ pub struct Member {
     /// (ADR 0016 §3). Its size shrinks the effective suspicion window; reset whenever the
     /// member's `(incarnation, state)` identity changes.
     suspecters: BTreeSet<NodeId>,
+    /// Consecutive direct probes of OURS this member never answered (directly or via
+    /// helpers). Reset by any ack that clears a probe of it. At
+    /// `Config::reprime_after` the next probe is accompanied by a `Join` re-greet —
+    /// the certificate-carrying prime frame that heals a receiver-side cert-cache
+    /// loss (issue #383): its `Sync` reply re-primes both directions.
+    unanswered_probes: u32,
 }
 
 /// A membership update disseminated via gossip.
@@ -535,8 +549,20 @@ impl Swim {
     ///
     /// Handles self-refutation: a `Suspect`/`Dead` claim about us at an incarnation
     /// `>=` ours triggers a bump-and-`Alive` to override it everywhere.
-    #[allow(clippy::too_many_lines)]
+    ///
+    /// Third-party/relayed form: the tombstone fence applies in full. The message
+    /// handler uses [`apply_update_from`](Self::apply_update_from) so a FIRST-HAND
+    /// self-claim can pierce the fence (issue #383).
     fn apply_update(&mut self, u: &Update, now: u64, out: &mut Vec<Action>) {
+        self.apply_update_from(u, now, out, false);
+    }
+
+    /// [`apply_update`](Self::apply_update) with provenance: `first_hand` is true iff
+    /// the update is a claim **about the sender itself**, arriving in the sender's own
+    /// datagram (in the signed posture the sender identity is certificate-bound, and
+    /// anti-replay windows reject captured datagrams — so first-hand is trustworthy).
+    #[allow(clippy::too_many_lines)]
+    fn apply_update_from(&mut self, u: &Update, now: u64, out: &mut Vec<Action>, first_hand: bool) {
         if u.id == self.local.0 {
             // A claim about an EARLIER life of this id is not about this process
             // (issue #92): incarnations are only comparable within one life, so
@@ -584,8 +610,28 @@ impl Swim {
             // prune in `tick` clears the tombstone, after which the id may rejoin.
             // The fence is scoped to the life it was raised for: a *restart* is not a
             // resurrection, and blocking it is what left a rolled pod dead forever.
-            if !new_life && m.tombstone_deadline.is_some() && u.state != MemberState::Dead {
+            //
+            // FIRST-HAND EXCEPTION (issue #383): a live node FALSELY declared dead
+            // refutes with a higher-incarnation Alive — and if only relays could carry
+            // it, the fence livelocks: every evictor's re-application of the still-
+            // circulating Dead claim re-arms the fence with fresh gossip budget, the
+            // pruned-then-readded member is re-killed by the same claim, and a healthy
+            // node stays evicted FOREVER (the 5-node curve incident, five runs). A
+            // higher-incarnation Alive about the SENDER ITSELF, in the sender's own
+            // authenticated datagram, is proof of life a crashed node can never fake —
+            // #92's protection (stale relayed refutations of a truly dead node) holds,
+            // because those arrive relayed, never first-hand.
+            let pierces =
+                first_hand && u.state == MemberState::Alive && u.incarnation > m.incarnation;
+            if !new_life
+                && m.tombstone_deadline.is_some()
+                && u.state != MemberState::Dead
+                && !pierces
+            {
                 return;
+            }
+            if pierces && m.tombstone_deadline.is_some() {
+                m.tombstone_deadline = None;
             }
             // Record an independent suspecter of the *current* incarnation even when the
             // update does not supersede (a second node suspecting an already-`Suspect`
@@ -685,6 +731,7 @@ impl Swim {
                         }
                         _ => BTreeSet::new(),
                     },
+                    unanswered_probes: 0,
                 },
             );
             out.push(Action::StateChange {
@@ -866,6 +913,10 @@ impl Swim {
                 // RUN of silent round-robin targets means the silence is ours.
                 self.failed_probe_rounds = self.failed_probe_rounds.saturating_add(1);
                 let target = p.target.clone();
+                if let Some(m) = self.members.get_mut(&target) {
+                    // Per-member deafness (issue #383): drives the Join re-greet.
+                    m.unanswered_probes = m.unanswered_probes.saturating_add(1);
+                }
                 self.probe = None;
                 self.declare(&target, MemberState::Suspect, now, out);
             }
@@ -905,7 +956,27 @@ impl Swim {
         self.seq += 1;
         let seq = self.seq;
         let msg = self.message(Kind::Ping { seq });
-        out.push(Action::Send { to: addr, msg });
+        out.push(Action::Send {
+            to: addr.clone(),
+            msg,
+        });
+        // Deaf-peer re-prime (issue #383): a member that has ignored `reprime_after`
+        // consecutive probes of ours may simply be DROPPING our fingerprint-sealed
+        // datagrams (it lost our certificate — cert-miss). Reintroduce ourselves with
+        // a `Join`: the driver seals Join/Sync frames with the FULL certificate, and
+        // the peer's `Sync` reply re-primes our cache with its certificate in turn.
+        // Cheap and self-limiting: only fires while the deafness persists.
+        let deaf = self
+            .members
+            .get(&target)
+            .is_some_and(|m| m.unanswered_probes >= self.cfg.reprime_after.max(1));
+        if deaf {
+            let greet = self.message(Kind::Join);
+            out.push(Action::Send {
+                to: addr,
+                msg: greet,
+            });
+        }
         let ack_deadline = now + self.scaled_ack_timeout();
         self.probe = Some(Probe {
             target,
@@ -972,12 +1043,15 @@ impl Swim {
                 // First contact teaches the sender's label directly (ADR 0016 T5).
                 failure_domain: msg.from_domain.clone(),
             };
-            self.apply_update(&update, now, &mut out);
+            self.apply_update_from(&update, now, &mut out, true);
         }
 
-        // Merge piggybacked gossip.
+        // Merge piggybacked gossip. A claim about the SENDER ITSELF is first-hand
+        // (issue #383) — its own refutation may pierce a tombstone; everything else
+        // is a relay and stays fully fenced.
         for u in &msg.gossip {
-            self.apply_update(u, now, &mut out);
+            let first_hand = u.id == msg.from;
+            self.apply_update_from(u, now, &mut out, first_hand);
         }
 
         match msg.kind {
@@ -1010,6 +1084,9 @@ impl Swim {
                         self.probe = None;
                         self.lower_awareness(); // an indirect probe still succeeded
                         self.failed_probe_rounds = 0; // our PingReq reached a helper
+                        if let Some(m) = self.members.get_mut(&NodeId(target)) {
+                            m.unanswered_probes = 0;
+                        }
                     }
                 }
             }
@@ -1031,9 +1108,13 @@ impl Swim {
         // Direct ack for our own probe?
         if let Some(p) = &self.probe {
             if p.seq == seq {
+                let target = p.target.clone();
                 self.probe = None;
                 self.lower_awareness(); // a clean round (ADR 0016 §2)
                 self.failed_probe_rounds = 0; // our outbound path demonstrably works
+                if let Some(m) = self.members.get_mut(&target) {
+                    m.unanswered_probes = 0; // this member can hear us again
+                }
                 return;
             }
         }
@@ -1099,6 +1180,7 @@ mod tests {
             gossip_multiplier: 3,
             awareness_max: 8,
             isolation_rounds: 3,
+            reprime_after: 3,
         }
     }
 
@@ -1446,6 +1528,134 @@ mod tests {
         s.handle(m("b", "b:1", Kind::Ack { seq }, vec![]), 401);
         assert!(!s.isolated(), "one confirmed round trip clears isolation");
         assert_eq!(s.failed_probe_rounds(), 0);
+    }
+
+    /// Issue #383 (the livelock half): a LIVE node falsely declared dead refutes
+    /// with a higher-incarnation Alive in its OWN datagram — first-hand — and that
+    /// pierces the tombstone fence. The same claim arriving as a third-party relay
+    /// stays fenced (#92's crashed-node protection intact: a dead node can never
+    /// send first-hand).
+    #[test]
+    fn a_first_hand_refutation_pierces_the_tombstone_but_a_relay_does_not() {
+        let mut s = node("a", "a:1", &[]);
+        let mut out = Vec::new();
+        s.apply_update(&alive_update("b", "b:1", 0), 0, &mut out);
+        s.apply_update(&dead_update("b", "b:1", 0), 0, &mut out);
+        assert_eq!(member_state(&s, "b"), Some(MemberState::Dead));
+
+        // A RELAY: node c's datagram carries a higher-incarnation Alive about b —
+        // fenced, exactly as before this change.
+        s.handle(
+            m("c", "c:1", Kind::Sync, vec![alive_update("b", "b:1", 7)]),
+            1,
+        );
+        assert_eq!(
+            member_state(&s, "b"),
+            Some(MemberState::Dead),
+            "a relayed refutation must stay fenced (#92)"
+        );
+
+        // FIRST-HAND: b's own datagram carries its refutation — the fence opens,
+        // because a crashed node cannot produce this message.
+        s.handle(
+            m("b", "b:1", Kind::Sync, vec![alive_update("b", "b:1", 8)]),
+            2,
+        );
+        assert_eq!(
+            member_state(&s, "b"),
+            Some(MemberState::Alive),
+            "the member's own higher-incarnation Alive is proof of life"
+        );
+    }
+
+    /// Issue #383 (the livelock, end to end in miniature): after the first-hand
+    /// revival, a still-circulating stale Dead claim (same incarnation it was
+    /// killed at) must NOT re-kill the member — the refutation's higher
+    /// incarnation outranks it. This is the loop that kept a healthy node
+    /// evicted for the whole 5-node measurement window.
+    #[test]
+    fn a_stale_circulating_dead_claim_cannot_rekill_the_refuted_member() {
+        let mut s = node("a", "a:1", &[]);
+        let mut out = Vec::new();
+        s.apply_update(&alive_update("b", "b:1", 0), 0, &mut out);
+        s.apply_update(&dead_update("b", "b:1", 0), 0, &mut out);
+        s.handle(
+            m("b", "b:1", Kind::Sync, vec![alive_update("b", "b:1", 1)]),
+            1,
+        );
+        assert_eq!(member_state(&s, "b"), Some(MemberState::Alive));
+        // The old Dead claim (incarnation 0) is still circulating among evictors.
+        s.handle(
+            m("c", "c:1", Kind::Sync, vec![dead_update("b", "b:1", 0)]),
+            2,
+        );
+        assert_eq!(
+            member_state(&s, "b"),
+            Some(MemberState::Alive),
+            "a stale lower-incarnation Dead claim must not re-kill the refuted member"
+        );
+    }
+
+    /// Issue #383 (the cert half): a member that ignores `reprime_after`
+    /// consecutive probes gets the NEXT probe accompanied by a `Join` re-greet —
+    /// the frame the driver seals with the full certificate, healing a receiver
+    /// whose cert cache lost us (every fingerprint-sealed datagram of ours was
+    /// dropping as cert-miss, and we could not know).
+    #[test]
+    fn a_deaf_member_gets_a_certificate_carrying_regreet() {
+        let mut s = node("a", "a:1", &[]);
+        let mut out = Vec::new();
+        s.apply_update(&alive_update("b", "b:1", 0), 0, &mut out);
+        s.tick(0); // bootstrap
+        let joins = |actions: &[Action]| {
+            actions
+                .iter()
+                .filter(|a| matches!(a, Action::Send { msg, .. } if matches!(msg.kind, Kind::Join)))
+                .count()
+        };
+        // Rounds 1-3: silent — no re-greet yet (threshold is 3 unanswered).
+        for round in 1..=3u64 {
+            let t = round * 100;
+            let actions = s.tick(t);
+            assert_eq!(joins(&actions), 0, "round {round}: below the threshold");
+            s.tick(t + 21);
+            s.tick(t + 41); // concludes unanswered; counter -> round
+                            // Keep b probe-able: fresh first-hand Alive each round.
+            s.handle(
+                m(
+                    "b",
+                    "b:1",
+                    Kind::Sync,
+                    vec![alive_update("b", "b:1", round)],
+                ),
+                t + 50,
+            );
+        }
+        // Round 4: the probe of the now-deaf b carries a Join re-greet.
+        let actions = s.tick(400);
+        assert_eq!(
+            joins(&actions),
+            1,
+            "the deaf member is re-greeted: {actions:?}"
+        );
+        // An ack resets the deafness: the next round has no re-greet.
+        let seq = actions
+            .iter()
+            .find_map(|a| match a {
+                Action::Send { msg, .. } => match &msg.kind {
+                    Kind::Ping { seq } => Some(*seq),
+                    _ => None,
+                },
+                Action::StateChange { .. } => None,
+            })
+            .expect("round 4 sends a Ping");
+        s.handle(m("b", "b:1", Kind::Ack { seq }, vec![]), 401);
+        let actions = s.tick(500);
+        assert_eq!(
+            joins(&actions),
+            0,
+            "an answered member is no longer re-greeted"
+        );
     }
 
     #[test]

@@ -241,7 +241,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `two_bridge_instances_do_not_duplicate_forwarding`
 - `two_partitioned_instances_deliver_each_inbound_message_exactly_once`
 
-## `crates/mqtt-cluster/src/lib.rs` — 264 test(s)
+## `crates/mqtt-cluster/src/lib.rs` — 267 test(s)
 
 - `cluster_identity::tests::a_founder_mints_once_and_reloads_stably`
 - `cluster_identity::tests::a_joiner_adopts_once_and_persists`
@@ -436,6 +436,8 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `replay::tests::strictly_increasing_sequences_are_all_fresh`
 - `swim::tests::a_changed_routing_address_is_surfaced_even_when_the_state_is_unchanged`
 - `swim::tests::a_dead_member_is_not_revived_by_stale_higher_incarnation_gossip`
+- `swim::tests::a_deaf_member_gets_a_certificate_carrying_regreet`
+- `swim::tests::a_first_hand_refutation_pierces_the_tombstone_but_a_relay_does_not`
 - `swim::tests::a_leaving_node_does_not_refute_its_own_dead`
 - `swim::tests::a_node_advertises_its_own_domain_on_outgoing_gossip`
 - `swim::tests::a_peer_marks_a_leaving_node_dead_immediately`
@@ -443,6 +445,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `swim::tests::a_restarted_node_is_not_re_killed_by_its_previous_lifes_dead_claim`
 - `swim::tests::a_run_of_unanswered_probe_rounds_marks_the_node_isolated_while_gossip_keeps_the_view_fresh`
 - `swim::tests::a_single_ack_of_our_probe_clears_isolation`
+- `swim::tests::a_stale_circulating_dead_claim_cannot_rekill_the_refuted_member`
 - `swim::tests::a_tombstone_fences_the_dead_life_but_not_a_new_one`
 - `swim::tests::a_tombstone_is_pruned_after_its_ttl_and_the_id_can_rejoin`
 - `swim::tests::address_change_at_higher_incarnation_is_adopted`
