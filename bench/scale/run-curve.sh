@@ -171,6 +171,37 @@ probe_one() {
 every_broker probe_one
 
 # ── 2. lane A — durable QoS1 closed-loop (cluster is in durable mode) ────────
+# A transient one-way UDP loss in the minutes after boot can get one member
+# evicted and fully REMOVED (issue #393; the ghost survives even a process
+# restart, because its probes still get acked and nobody probes a non-member).
+# Bootstrap only enforces the majority floor, so the run would otherwise burn
+# every lane A arm's whole preflight deadline against an N-1/N split. Gate on
+# full membership here; if the split already formed, re-form the cluster once —
+# by then the private net has converged, and the shrunk voter roster is
+# committed state, so only a wipe-and-re-form heals it (no in-place path does).
+full_membership() {
+	local i out
+	for ((i = 0; i < N; i++)); do
+		out=$(rssh "$(broker_pub_ip "$i")" "curl -sf -m 4 http://localhost:8080/readyz") || return 1
+		jq -e --argjson n "$N" '.ready == true and .members == $n' <<<"$out" >/dev/null || return 1
+	done
+}
+membership_gate() {
+	local deadline=$(($(date +%s) + 120))
+	until full_membership; do
+		[ "$(date +%s)" -lt "$deadline" ] || return 1
+		sleep 5
+	done
+}
+if ! membership_gate; then
+	warn "membership split after boot (the issue #393 shape) — wiping and re-forming once"
+	wipe_for_reform() {
+		rssh "$(broker_pub_ip "$1")" "systemctl stop mqttd; rm -rf /var/lib/mqttd/*"
+	}
+	every_broker wipe_for_reform
+	"$SCALE_DIR/bootstrap-cluster.sh" "$RUN" "$INVENTORY" durable
+	wait_for "full membership after re-formation" 180 full_membership
+fi
 say "[$N nodes] lane A: durable QoS1 closed-loop (spread ownership)"
 mkdir -p "$OUT/laneA"
 BROKERS_LIST=$(brokers_csv '.mqtt_plain')
