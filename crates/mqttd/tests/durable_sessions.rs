@@ -1250,11 +1250,11 @@ async fn growing_the_scaled_out_cluster_migrates_ownership_with_zero_acked_loss(
     use std::collections::BTreeSet;
 
     // 3 nodes at voter cap 3 (all voters), scale-out flag ON.
-    let a = start_durable_node_capped("gs-a", vec![], 3, None, true).await;
-    let b = start_durable_node_capped("gs-b", vec![a.swim_addr.clone()], 3, None, true).await;
-    let c = start_durable_node_capped("gs-c", vec![a.swim_addr.clone()], 3, None, true).await;
+    let n1 = start_durable_node_capped("gs-a", vec![], 3, None, true).await;
+    let n2 = start_durable_node_capped("gs-b", vec![n1.swim_addr.clone()], 3, None, true).await;
+    let n3 = start_durable_node_capped("gs-c", vec![n1.swim_addr.clone()], 3, None, true).await;
     {
-        let seed = [&a, &b, &c];
+        let seed = [&n1, &n2, &n3];
         wait_until(Duration::from_secs(30), || {
             seed.iter()
                 .all(|n| n.placement.read().unwrap().member_count() == 3)
@@ -1269,7 +1269,7 @@ async fn growing_the_scaled_out_cluster_migrates_ownership_with_zero_acked_loss(
     // Durably enqueue one message per session across a spread of sessions, each
     // committed via its CURRENT owner (retrying through convergence).
     let sessions: Vec<ClientId> = (0..120).map(|i| ClientId(format!("gs-sess-{i}"))).collect();
-    let seed_nodes = [&a, &b, &c];
+    let seed_nodes = [&n1, &n2, &n3];
     for client in &sessions {
         let payload = format!("acked-{}", client.0).into_bytes();
         let msg = Message::new(
@@ -1280,7 +1280,7 @@ async fn growing_the_scaled_out_cluster_migrates_ownership_with_zero_acked_loss(
         );
         let deadline = Instant::now() + Duration::from_secs(60);
         loop {
-            let owner = a.placement.read().unwrap().owner(&client.0);
+            let owner = n1.placement.read().unwrap().owner(&client.0);
             let node = seed_nodes.iter().find(|n| n.node_id == owner);
             if let Some(node) = node {
                 if node.store.enqueue(client, &msg).await.is_ok() {
@@ -1298,10 +1298,10 @@ async fn growing_the_scaled_out_cluster_migrates_ownership_with_zero_acked_loss(
 
     // GROW: three more members join. Voter cap stays 3 — the newcomers are
     // learners, and under ADR 0073 they may own durable groups.
-    let d = start_durable_node_capped("gs-d", vec![a.swim_addr.clone()], 3, None, true).await;
-    let e = start_durable_node_capped("gs-e", vec![a.swim_addr.clone()], 3, None, true).await;
-    let f = start_durable_node_capped("gs-f", vec![a.swim_addr.clone()], 3, None, true).await;
-    let all = [&a, &b, &c, &d, &e, &f];
+    let n4 = start_durable_node_capped("gs-d", vec![n1.swim_addr.clone()], 3, None, true).await;
+    let n5 = start_durable_node_capped("gs-e", vec![n1.swim_addr.clone()], 3, None, true).await;
+    let n6 = start_durable_node_capped("gs-f", vec![n1.swim_addr.clone()], 3, None, true).await;
+    let all = [&n1, &n2, &n3, &n4, &n5, &n6];
     wait_until(Duration::from_secs(45), || {
         all.iter()
             .all(|n| n.placement.read().unwrap().member_count() == 6)
@@ -1319,9 +1319,10 @@ async fn growing_the_scaled_out_cluster_migrates_ownership_with_zero_acked_loss(
         .membership()
         .voter_ids()
         .collect();
-    let newcomer_ids: BTreeSet<NodeId> = [&d, &e, &f].iter().map(|n| n.node_id.clone()).collect();
+    let newcomer_ids: BTreeSet<NodeId> =
+        [&n4, &n5, &n6].iter().map(|n| n.node_id.clone()).collect();
     wait_until(Duration::from_secs(60), || {
-        let p = a.placement.read().unwrap();
+        let p = n1.placement.read().unwrap();
         sessions
             .iter()
             .any(|cl| newcomer_ids.contains(&p.owner(&cl.0)))
@@ -1330,7 +1331,7 @@ async fn growing_the_scaled_out_cluster_migrates_ownership_with_zero_acked_loss(
     // At least one newcomer owner is a LEARNER (with cap 3 of 6, all three
     // newcomers are — assert directly rather than assume).
     {
-        let p = a.placement.read().unwrap();
+        let p = n1.placement.read().unwrap();
         let learner_owner = sessions.iter().any(|cl| {
             let o = p.owner(&cl.0);
             newcomer_ids.contains(&o) && !voter_rids.contains(&raft_id(&o))
@@ -1347,11 +1348,12 @@ async fn growing_the_scaled_out_cluster_migrates_ownership_with_zero_acked_loss(
         let expect = format!("acked-{}", client.0).into_bytes();
         let deadline = Instant::now() + Duration::from_secs(90);
         loop {
-            let owner = a.placement.read().unwrap().owner(&client.0);
+            let owner = n1.placement.read().unwrap().owner(&client.0);
             let node = all.iter().find(|n| n.node_id == owner);
             if let Some(node) = node {
                 if let Ok(pending) = node.store.pending(client, 0, 10).await {
-                    if pending.len() == 1 && pending[0].message.payload.as_ref() == expect.as_slice()
+                    if pending.len() == 1
+                        && pending[0].message.payload.as_ref() == expect.as_slice()
                     {
                         break;
                     }
@@ -1361,7 +1363,7 @@ async fn growing_the_scaled_out_cluster_migrates_ownership_with_zero_acked_loss(
                 Instant::now() < deadline,
                 "{}: the acked message did not survive the grow (owner {:?})",
                 client.0,
-                a.placement.read().unwrap().owner(&client.0)
+                n1.placement.read().unwrap().owner(&client.0)
             );
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
