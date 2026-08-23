@@ -466,28 +466,44 @@ echo "  ok   — --help claims exactly what this converter has"
 # so BOOTING the broker is the only check that the translated policy loads — and it is run on the
 # anonymous-scoped policy too, because `identities = ["anonymous"]` is a construct this converter
 # only started emitting on 2026-08-15.
-boot_on_acl() {
-  local acl="$1" what="$2" port hport
-  port=$(python3 -c "import socket;s=socket.socket();s.bind(('127.0.0.1',0));print(s.getsockname()[1]);s.close()")
-  hport=$(python3 -c "import socket;s=socket.socket();s.bind(('127.0.0.1',0));print(s.getsockname()[1]);s.close()")
-  MQTTD_ACL_FILE="$acl" MQTTD_PLAINTEXT_BIND="127.0.0.1:$port" \
-    MQTTD_ALLOW_EPHEMERAL_DURABILITY=1 \
-    MQTTD_ALLOW_ANONYMOUS=1 MQTTD_HEALTH_BIND="127.0.0.1:$hport" RUST_LOG=warn \
-    "$MQTTD_BIN" > "$WORK/boot.log" 2>&1 &
-  local broker=$!
-  for _ in $(seq 1 100); do
-    curl -fsS "http://127.0.0.1:$hport/readyz" >/dev/null 2>&1 && break
-    sleep 0.1
-  done
-  if ! curl -fsS "http://127.0.0.1:$hport/readyz" >/dev/null 2>&1; then
+boot_on_acl() {  # $1 = acl file, $2 = what it proves
+  local acl="$1" what="$2" port hport attempt broker
+  # Issue #360: the bind(0)/close/reuse port mint is TOCTOU — any process on the
+  # runner can take the port between the close and the broker's own bind. Bounded
+  # retry with FRESH ports on AddrInUse, and the failure report distinguishes
+  # "could not bind" from "rejected the config" (the incident misattributed a
+  # bind race as an ACL rejection).
+  for attempt in 1 2 3; do
+    port=$(python3 -c "import socket;s=socket.socket();s.bind(('127.0.0.1',0));print(s.getsockname()[1]);s.close()")
+    hport=$(python3 -c "import socket;s=socket.socket();s.bind(('127.0.0.1',0));print(s.getsockname()[1]);s.close()")
+    MQTTD_ACL_FILE="$acl" MQTTD_PLAINTEXT_BIND="127.0.0.1:$port" \
+      MQTTD_ALLOW_EPHEMERAL_DURABILITY=1 \
+      MQTTD_ALLOW_ANONYMOUS=1 MQTTD_HEALTH_BIND="127.0.0.1:$hport" RUST_LOG=warn \
+      "$MQTTD_BIN" > "$WORK/boot.log" 2>&1 &
+    broker=$!
+    for _ in $(seq 1 100); do
+      curl -fsS "http://127.0.0.1:$hport/readyz" >/dev/null 2>&1 && break
+      sleep 0.1
+    done
+    if curl -fsS "http://127.0.0.1:$hport/readyz" >/dev/null 2>&1; then
+      kill "$broker" 2>/dev/null || true
+      wait "$broker" 2>/dev/null || true   # reap it quietly; an unreaped job prints "Terminated"
+      echo "  ok   — the broker booted on $what"
+      return 0
+    fi
+    kill "$broker" 2>/dev/null || true
+    wait "$broker" 2>/dev/null || true
+    if grep -qE "AddrInUse|Address already in use" "$WORK/boot.log"; then
+      echo "  note — bind race (AddrInUse) on attempt $attempt; retrying with fresh ports"
+      continue
+    fi
     echo "  FAIL — the broker REJECTED $what:"
     tail -5 "$WORK/boot.log" | sed 's/^/         /'
-    kill "$broker" 2>/dev/null || true
     exit 1
-  fi
-  kill "$broker" 2>/dev/null || true
-  wait "$broker" 2>/dev/null || true   # reap it quietly; an unreaped job prints "Terminated"
-  echo "  ok   — the broker booted on $what"
+  done
+  echo "  FAIL — the broker could NOT BIND after 3 attempts (AddrInUse each time — runner port pressure, not a config rejection):"
+  tail -5 "$WORK/boot.log" | sed 's/^/         /'
+  exit 1
 }
 boot_on_acl "$WORK/acl.toml" "the converted ACL"
 boot_on_acl "$WORK/anon-acl.toml" "the ACL holding the anonymous-scoped rules"
