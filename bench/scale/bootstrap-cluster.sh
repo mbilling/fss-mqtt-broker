@@ -101,6 +101,10 @@ push_node() { # push_node <index> <ready-min> <seeds>
 	# glob chmod would hand every key on the host to the mqttd group.
 	rssh "$ip" '
 		set -e
+		# A boot-time auto-start before the config existed may have exhausted
+		# the unit start limit (the clean+reboot retry path); clear it so the
+		# restart below is judged on THIS start, not the doomed earlier ones.
+		systemctl reset-failed mqttd 2>/dev/null || true
 		install -m 0640 -o root -g mqttd /tmp/mqttd.env /etc/mqttd/mqttd.env
 		install -m 0640 -o root -g mqttd /tmp/swim.key /etc/mqttd/swim.key
 		install -m 0644 -o root -g mqttd /tmp/peer-ca.pem /etc/mqttd/tls/peer-ca.pem
