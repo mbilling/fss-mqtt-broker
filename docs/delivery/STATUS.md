@@ -78,7 +78,7 @@
 | [0068](../adr/0068-fips-cryptographic-option.md) | A FIPS 140-3 cryptographic option | Accepted | [4/4 done](0068-fips-cryptographic-option.md) | — |
 | [0069](../adr/0069-scorecard-remediation.md) | Scorecard remediation: a solution per check, honestly bounded | Accepted | [7/7 done](0069-scorecard-remediation.md) | — |
 | [0070](../adr/0070-stakeholder-documentation.md) | Usage documentation is owned by stakeholders, not by features | Proposed | [0/8 done](0070-stakeholder-documentation.md) | 8 open |
-| [0071](../adr/0071-owner-side-group-commit.md) | # 0071. Owner-side group commit: one durable-write serializer per node | Accepted | [2/3 done](0071-owner-side-group-commit.md) | 1 open |
+| [0071](../adr/0071-owner-side-group-commit.md) | # 0071. Owner-side group commit: one durable-write serializer per node | Accepted | [3/3 done](0071-owner-side-group-commit.md) | — |
 | [0072](../adr/0072-per-message-durability-selection.md) | # 0072. Per-message durability selection: the `mqttd-durability` user property | Accepted | [1/2 done](0072-per-message-durability-selection.md) | 1 open |
 | [0073](../adr/0073-scale-out-durable-ownership.md) | # 0073. Scale-out durable ownership: the voter set is a control plane, not the data path | Accepted | [2/4 done](0073-scale-out-durable-ownership.md) | 2 open |
 | [0074](../adr/0074-detached-ack-truncate.md) | # 0074. The subscriber-ack truncate leaves the hub loop's critical path | Accepted | [1/2 done](0074-detached-ack-truncate.md) | 1 open |
@@ -187,10 +187,6 @@
 - `0070-T6` ⬜ planned: "ARCHITECTURE.md for contributors (the main.rs module-doc map and hub seams, promoted to prose)"
 - `0070-T7` ⬜ planned: "EVALUATION.md one-pager; MIGRATION.md gains per-source entry points; CAPABILITY-PLAN refreshed or retired"
 - `0070-T8` ⬜ planned: "The index gate: docs/README.md completeness check joins check-readme-facts.py; version stamps on every stakeholder doc"
-
-**0071 — # 0071. Owner-side group commit: one durable-write serializer per node**
-
-- `0071-T3` ⬜ planned: Single-node backend (PersistentLog / sessions.redb) batching — "The non-cluster backend still commits one Immediate txn per append; its run() closure is the seam. Worth doing when single-node durable throughput matters as much as clustered."
 
 **0072 — # 0072. Per-message durability selection: the `mqttd-durability` user property**
 
