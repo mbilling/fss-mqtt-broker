@@ -89,3 +89,46 @@ per-message and publisher-explicit.
   (e.g. an ACL forbidding tiers per principal), which composes with this.
 - **A new refusal reason code** for disallowed tiers: rejected for v1 — the
   ignore-and-upgrade behavior is strictly safer and needs no wire vocabulary.
+
+## Amendment (2026-08-24) — the congestion valve (issue #399)
+
+The v1.0.5 hardware curve found the relaxed tier's failure mode under
+saturation: an instant ack refills the publisher's window immediately, so a
+relaxed publisher submits at wire speed while the bounded session lanes drain
+at disk speed. Nothing throttles before the lane cap — the first backpressure
+a relaxed publisher ever feels is the lane **overflowing**, which fails the
+publish and closes the connection; at curve scale that is a reconnect storm,
+not flow control.
+
+The valve: a gated submit that finds its append lane at or past **half the
+lane cap** marks that publish *congested*, and a congested relaxed publish
+completes by the **quorum rule** — the ack waits for its appends. The
+publisher's window then throttles to the drain rate, well before overflow.
+Below the threshold nothing changes: the ack still outruns the append, which
+is the tier's whole point. Relaxed grants latency below congestion, not
+immunity from capacity — the same ack, arriving later exactly when later is
+the truth.
+
+The valve has two halves, one per side of the peer bus:
+
+- **Local** (the publisher's own node): a gated submit that finds its lane
+  congested marks the *pending publish* congested; its relaxed ack then waits
+  for its appends.
+- **Owner** (a remote-owned subscriber session): the origin cannot see the
+  owner's lanes, so the owner enforces its own valve on the forward's
+  *verdict*. An uncongested relaxed forward is answered `Stored` at
+  **submit-acceptance** — which is precisely what a relaxed ack means — and a
+  congested one is answered only at append completion. Correspondingly, a
+  relaxed pending now always **awaits its forward verdicts**: one peer round
+  trip when the mesh is healthy, the owner's drain rate when it is not. This
+  also closes the cross-node half of the refusal hole: a remote lane's
+  rejection reaches the publisher as a withheld/refused ack instead of an
+  Accepted for a message the owner just dropped. An append that degrades
+  *after* an early verdict surfaces as
+  `publish_dropped{reason="relaxed-post-verdict-append"}` — the tier's stated
+  asymmetry, now observable.
+
+This is per-publish and per-lane, decided at the same synchronous submit that
+already counts lane depth: no new state machine, no config. The overflow path
+itself is unchanged (fail-closed, ADR 0061); the valve exists so that under
+sustained load it is no longer the *first* thing a relaxed publisher hits.

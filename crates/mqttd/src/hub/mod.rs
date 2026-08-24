@@ -2126,6 +2126,21 @@ impl Hub {
         self.allow_relaxed_publish = on;
     }
 
+    /// ADR 0072 / issue #399: does this message ask for the relaxed tier, and
+    /// does THIS node's operator allow it? Derived per node at the point it is
+    /// acted on — a forwarded publish is re-derived here under the receiving
+    /// node's own opt-in, exactly like the origin's freeze point.
+    fn relaxed_requested(&self, app: &mqtt_core::AppProperties) -> bool {
+        self.allow_relaxed_publish
+            && app
+                .user_properties
+                .iter()
+                .rev()
+                .find(|(k, _)| k == mqtt_storage::repl::DURABILITY_PROPERTY)
+                .and_then(|(_, v)| mqtt_storage::repl::DurabilityTier::parse(v))
+                == Some(mqtt_storage::repl::DurabilityTier::Relaxed)
+    }
+
     /// Wire the ADR 0073 scale-out ownership capability: `flag` is shared with the
     /// durable driver and plane; `enabled` is the operator's
     /// `durable.ownership_domain = "members"` choice (false = the "voters" escape
@@ -2545,8 +2560,12 @@ impl Hub {
                 // Answered now if no lane job was submitted; otherwise folded into
                 // the `(node, seq)` aggregate and answered when the last `AppendDone`
                 // lands — a peer is never told `Stored` before the store actually
-                // stored (issue #242).
-                self.finish_peer_verdict(&node, seq, sync);
+                // stored (issue #242). Exception, by explicit contract: a RELAXED
+                // forward below the congestion threshold answers at
+                // submit-acceptance (issue #399) — `Stored` then means what the
+                // relaxed ack means.
+                let relaxed = self.relaxed_requested(&app);
+                self.finish_peer_verdict(&node, seq, sync, relaxed);
             }
             HubCommand::RemotePublishAck { node, seq, ok } => {
                 // A proto-6 peer's boolean: `false` means only "not stored, reason
@@ -2590,8 +2609,11 @@ impl Hub {
                         seq,
                     },
                 );
-                // Answered now, or at the append's `AppendDone` (issue #242).
-                self.finish_peer_verdict(&node, seq, out);
+                // Answered now, or at the append's `AppendDone` (issue #242) —
+                // or, for an uncongested RELAXED delivery, at submit-acceptance
+                // (issue #399).
+                let relaxed = self.relaxed_requested(&app);
+                self.finish_peer_verdict(&node, seq, out, relaxed);
             }
             HubCommand::RemotePublish {
                 topic,
@@ -3840,9 +3862,35 @@ impl Hub {
     /// aggregate that the last [`AppendDone`](HubCommand::AppendDone) completes
     /// (issue #242). Either way the peer hears `Stored` only after every owed append
     /// actually stored.
-    fn finish_peer_verdict(&mut self, node: &NodeId, seq: u64, sync: DurableOutcome) {
+    /// `relaxed` is derived by THIS node from the forwarded message's own
+    /// properties under THIS node's opt-in (ADR 0072's placement rule: the tier
+    /// is derived where it is acted on).
+    fn finish_peer_verdict(
+        &mut self,
+        node: &NodeId,
+        seq: u64,
+        sync: DurableOutcome,
+        relaxed: bool,
+    ) {
         if let Some(g) = self.remote_append_pending.get_mut(&(node.clone(), seq)) {
             g.worst = g.worst.and(sync);
+            // The congestion valve's owner half (issue #399): a relaxed forward
+            // whose every lane submit was admitted BELOW the congestion
+            // threshold is answered `Stored` now, at submit-acceptance — which
+            // is exactly what a relaxed ack means (ADR 0072), and what lets the
+            // origin's relaxed pending complete on one peer round trip instead
+            // of an append. A congested or already-degraded forward keeps
+            // today's behavior: the verdict waits for the appends (the quorum
+            // rule), so the origin's window throttles to this node's drain
+            // rate. Refusals stay refusals either way.
+            let answer_early =
+                relaxed && !g.congested && !g.answered && matches!(g.worst, DurableOutcome::Ok);
+            if answer_early {
+                g.answered = true;
+            }
+            if answer_early {
+                self.answer_forward(node, seq, ForwardVerdict::Stored);
+            }
             return;
         }
         self.answer_forward(node, seq, sync.to_verdict());
@@ -5334,7 +5382,21 @@ impl Hub {
     fn try_complete_pending(&mut self, id: u64) {
         let complete = self.pending_publishes.get(&id).is_some_and(|p| {
             p.local_done
-                && (p.relaxed // ADR 0072: relaxed acks at submit; obligations still run
+                // ADR 0072: relaxed acks at submit; obligations still run.
+                // Issue #399 carves two exceptions, both congestion valves:
+                // a CONGESTED publish (its own lane was deep at submit) falls
+                // through to the quorum rule below, and REMOTE obligations are
+                // always awaited — each owner answers an uncongested relaxed
+                // forward at submit-acceptance (one peer round trip, still the
+                // relaxed meaning), and holds a congested one to append
+                // completion, so the publisher's window throttles to whichever
+                // node is drowning. Refusals travel those same verdicts: a
+                // relaxed ack can no longer outrun a remote refusal.
+                && ((p.relaxed
+                    && !p.congested
+                    && p.awaiting.is_empty()
+                    && !p.awaiting_settle
+                    && p.reroute_grace.unwrap_or(0) == 0)
                     || (p.appends_outstanding == 0
                         && !p.awaiting_retained
                         && !p.awaiting_settle
@@ -15067,6 +15129,244 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+    }
+
+    /// Issue #399 — the relaxed congestion valve: a relaxed publish whose
+    /// append lane is already at [`crate::hub::lanes::RELAXED_CONGESTION_DEPTH`] does NOT
+    /// ack at submit — it completes by the quorum rule, after its append
+    /// lands. Without the valve, instant acks refill the publisher's window
+    /// forever while the bounded lane only drains at disk speed; the lane
+    /// overflows, the overflow fails the publish and closes the connection,
+    /// and the curve measured the resulting reconnect storm. Relaxed grants
+    /// latency below congestion, not immunity from capacity.
+    #[tokio::test]
+    async fn a_congested_relaxed_publish_waits_for_its_append() {
+        let store = ParkingStore::new();
+        let release = store.park("r");
+        let (mut hub, tx) = Hub::with_config(NodeId("hub-test".into()), store.clone());
+        hub.set_allow_relaxed_publish(true);
+        tokio::spawn(hub.run());
+
+        let (_rx, _) = attach(&tx, "r", 1, false).await;
+        subscribe_qos(&tx, "r", "rt/t", QoS::AtLeastOnce);
+        detach(&tx, "r", 1);
+
+        // Park the lane at the threshold: after these strict publishes, the
+        // NEXT submit observes a depth of exactly RELAXED_CONGESTION_DEPTH.
+        for i in 0..(crate::hub::lanes::RELAXED_CONGESTION_DEPTH - 1) {
+            tx.send(HubCommand::Publish {
+                topic: "rt/t".into(),
+                payload: Bytes::from(format!("fill{i}")),
+                qos: QoS::AtLeastOnce,
+                retain: false,
+                message_expiry: None,
+                app: mqtt_core::AppProperties::default(),
+                done: None,
+                v5: true,
+                publisher: None,
+            })
+            .unwrap();
+        }
+
+        let (done_tx, done_rx) = oneshot::channel();
+        tx.send(HubCommand::Publish {
+            topic: "rt/t".into(),
+            payload: Bytes::from_static(b"throttled"),
+            qos: QoS::AtLeastOnce,
+            retain: false,
+            message_expiry: None,
+            app: mqtt_core::AppProperties {
+                user_properties: vec![("mqttd-durability".into(), "relaxed".into())],
+                ..Default::default()
+            },
+            done: Some(done_tx),
+            v5: true,
+            publisher: None,
+        })
+        .unwrap();
+
+        // The valve holds the ack: no early completion while the lane drains.
+        let mut done_rx = done_rx;
+        assert!(
+            timeout(Duration::from_millis(300), &mut done_rx)
+                .await
+                .is_err(),
+            "a congested relaxed publish must NOT ack at submit — that instant \
+             refill is exactly the overflow-then-conn-close storm of issue #399"
+        );
+
+        // Releasing the store drains the lane; the ack now arrives by the
+        // quorum rule — throttled, never refused.
+        release.send(true).unwrap();
+        let out = timeout(Duration::from_secs(5), done_rx)
+            .await
+            .expect("a congested relaxed publish completes once its append lands")
+            .unwrap();
+        assert_eq!(out, PublishOutcome::Accepted);
+    }
+
+    /// Issue #399, the valve's owner half, fast path: a RELAXED forward whose
+    /// lane submits were all admitted below the congestion threshold is
+    /// answered `Stored` at submit-acceptance — while its append is still
+    /// parked in the store. `Stored` then means exactly what the relaxed ack
+    /// means (ADR 0072: accepted and submitted), and the origin's relaxed
+    /// pending completes on one peer round trip instead of a durability wait.
+    #[tokio::test]
+    async fn an_uncongested_relaxed_forward_is_answered_at_submit() {
+        let store = ParkingStore::new();
+        let release = store.park("r");
+        let (mut hub, tx) = Hub::with_config(NodeId("hub-test".into()), store.clone());
+        hub.set_allow_relaxed_publish(true);
+        tokio::spawn(hub.run());
+
+        let (_rx, _) = attach(&tx, "r", 1, false).await;
+        subscribe_qos(&tx, "r", "rt/t", QoS::AtLeastOnce);
+        detach(&tx, "r", 1);
+        let mut peer = connect_peer(&tx, "origin-node", 1);
+
+        tx.send(HubCommand::RemotePublishAcked {
+            node: NodeId("origin-node".into()),
+            seq: 9,
+            topic: "rt/t".into(),
+            payload: Bytes::from_static(b"fast"),
+            qos: QoS::AtLeastOnce,
+            retain: false,
+            message_expiry: None,
+            app: mqtt_core::AppProperties {
+                user_properties: vec![("mqttd-durability".into(), "relaxed".into())],
+                ..Default::default()
+            },
+        })
+        .unwrap();
+
+        // The verdict arrives while the append is STILL parked.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let verdict = loop {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "no early PublishVerdict for the uncongested relaxed forward"
+            );
+            match timeout(Duration::from_millis(200), peer.recv()).await {
+                Ok(Some(PeerMessage::PublishVerdict { seq: 9, verdict })) => break verdict,
+                Ok(Some(_)) | Err(_) => {}
+                Ok(None) => panic!("peer channel closed before a verdict"),
+            }
+        };
+        assert_eq!(
+            verdict,
+            mqtt_cluster::peer::ForwardVerdict::Stored,
+            "an uncongested relaxed forward answers Stored at submit-acceptance"
+        );
+        assert!(
+            store.ops().iter().all(|(op, _)| op != "enqueue"),
+            "the append must not have completed yet — the verdict outran it by design"
+        );
+
+        // The write still happens, and no second verdict is ever sent.
+        release.send(true).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !store
+            .ops()
+            .iter()
+            .any(|(op, d)| op == "enqueue" && d == "r fast")
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the relaxed forward's append must still complete after release"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        // SETTLE(early-verdict-uniqueness): the completed append's would-be
+        // second answer is only observable by its absence; one drain of the
+        // peer channel after the append provably landed is the check.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        while let Ok(msg) = peer.try_recv() {
+            assert!(
+                !matches!(msg, PeerMessage::PublishVerdict { seq: 9, .. }),
+                "the early-answered forward must not be answered a second time"
+            );
+        }
+    }
+
+    /// Issue #399, the valve's owner half, throttle path: a RELAXED forward
+    /// that finds its lane at the congestion threshold is answered only at
+    /// append completion (the quorum rule) — the origin's publisher window
+    /// then throttles to THIS node's drain rate, which it cannot see directly.
+    #[tokio::test]
+    async fn a_congested_relaxed_forward_is_answered_at_append_completion() {
+        let store = ParkingStore::new();
+        let release = store.park("r");
+        let (mut hub, tx) = Hub::with_config(NodeId("hub-test".into()), store.clone());
+        hub.set_allow_relaxed_publish(true);
+        tokio::spawn(hub.run());
+
+        let (_rx, _) = attach(&tx, "r", 1, false).await;
+        subscribe_qos(&tx, "r", "rt/t", QoS::AtLeastOnce);
+        detach(&tx, "r", 1);
+        let mut peer = connect_peer(&tx, "origin-node", 1);
+
+        // Park the lane at the threshold with local strict publishes.
+        for i in 0..(crate::hub::lanes::RELAXED_CONGESTION_DEPTH - 1) {
+            tx.send(HubCommand::Publish {
+                topic: "rt/t".into(),
+                payload: Bytes::from(format!("fill{i}")),
+                qos: QoS::AtLeastOnce,
+                retain: false,
+                message_expiry: None,
+                app: mqtt_core::AppProperties::default(),
+                done: None,
+                v5: true,
+                publisher: None,
+            })
+            .unwrap();
+        }
+
+        tx.send(HubCommand::RemotePublishAcked {
+            node: NodeId("origin-node".into()),
+            seq: 11,
+            topic: "rt/t".into(),
+            payload: Bytes::from_static(b"throttled"),
+            qos: QoS::AtLeastOnce,
+            retain: false,
+            message_expiry: None,
+            app: mqtt_core::AppProperties {
+                user_properties: vec![("mqttd-durability".into(), "relaxed".into())],
+                ..Default::default()
+            },
+        })
+        .unwrap();
+
+        // No early verdict: the lane is congested, the valve holds it.
+        let early = timeout(Duration::from_millis(300), async {
+            loop {
+                match peer.recv().await {
+                    Some(PeerMessage::PublishVerdict { seq: 11, verdict }) => break verdict,
+                    Some(_) => {}
+                    None => panic!("peer channel closed"),
+                }
+            }
+        })
+        .await;
+        assert!(
+            early.is_err(),
+            "a congested relaxed forward must NOT be answered at submit — \
+             that instant refill is issue #399's cross-node overflow"
+        );
+
+        // Release: the appends land, and only then does Stored go out.
+        release.send(true).unwrap();
+        let verdict = timeout(Duration::from_secs(5), async {
+            loop {
+                match peer.recv().await {
+                    Some(PeerMessage::PublishVerdict { seq: 11, verdict }) => break verdict,
+                    Some(_) => {}
+                    None => panic!("peer channel closed"),
+                }
+            }
+        })
+        .await
+        .expect("the congested relaxed forward answers once its append lands");
+        assert_eq!(verdict, mqtt_cluster::peer::ForwardVerdict::Stored);
     }
 
     /// ADR 0072 — the `mqttd-durability` property is INERT without the operator

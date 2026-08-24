@@ -39,6 +39,7 @@ caller changes this file and the gate fails until it is regenerated and re-read.
 | `crates/mqttd/src/admission.rs` | `the_penalty_decays_back_to_admission` | `admission-penalty-decay` | 120ms | in the test itself |
 | `crates/mqttd/src/http_auth.rs` | `the_cache_expires_and_is_bounded` | `http-auth-cache-ttl` | 80ms | in the test itself |
 | `crates/mqttd/src/hub/mod.rs` | `enqueue_with_expiry` | `store-slow-first-enqueue` | ? | helper, 7 call site(s) |
+| `crates/mqttd/src/hub/mod.rs` | `an_uncongested_relaxed_forward_is_answered_at_submit` | `early-verdict-uniqueness` | 100ms | in the test itself |
 | `crates/mqttd/src/hub/mod.rs` | `the_durability_property_is_inert_without_the_operator_opt_in` | `inert-property-negative-window` | 300ms | in the test itself |
 | `crates/mqttd/tests/backup_restore.rs` | `sigusr2_on_a_node_with_no_backup_dir_is_a_no_op_not_a_death` | `sigusr2-default-disposition-is-death` | 600ms | in the test itself |
 | `crates/mqttd/tests/cluster.rs` | `retained_mqtt5_properties_replay_from_any_nodes_cache` | `cluster-sever-eof-props` | 400ms | in the test itself |
