@@ -49,6 +49,11 @@ pub struct WriterStats {
     pub ops: std::sync::atomic::AtomicU64,
     /// Largest single batch since boot.
     pub max_batch: std::sync::atomic::AtomicU64,
+    /// Cumulative nanoseconds spent committing batches (the fsync'd
+    /// `apply_batch`, lock wait included — the latency callers feel). With
+    /// `batches` this yields the mean commit time, the passive barrier-latency
+    /// signal ADR 0076's self-measurement publishes per epoch.
+    pub commit_nanos: std::sync::atomic::AtomicU64,
 }
 
 /// Serves a [`PeerMessage::ReplicaCatchUp`] request on the **owner** side
@@ -545,6 +550,7 @@ fn spawn_replica_writer(
             stats.ops.fetch_add(n as u64, Relaxed);
             stats.max_batch.fetch_max(n as u64, Relaxed);
             let replicas = replicas.clone();
+            let commit_started = std::time::Instant::now();
             let results = tokio::task::spawn_blocking(move || {
                 replicas
                     .lock()
@@ -553,6 +559,10 @@ fn spawn_replica_writer(
             })
             .await
             .unwrap_or_else(|_| vec![false; n]);
+            stats.commit_nanos.fetch_add(
+                u64::try_from(commit_started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                Relaxed,
+            );
             for (reply, accepted) in replies.into_iter().zip(results) {
                 let _ = reply.send(accepted);
             }

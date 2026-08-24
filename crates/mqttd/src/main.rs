@@ -512,6 +512,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (hub_tx, store, retained_store, durable_plane, lease_driver) =
         start_hub(&config, &node_id, &placement, &metrics, &brownout_status).await?;
 
+    // ADR 0076 T1: the broker measures its OWN volume once, shortly after
+    // start (never contending with recovery), and publishes the result — the
+    // barrier floor every durable figure should be read against, without a
+    // bench rig. Durable nodes only: an in-memory node has no volume to probe.
+    let store_probe_slot = Arc::new(mqttd::store_probe::ProbeSlot::default());
+    if durable_plane.is_some() {
+        if let Some(dir) = config.node.data_dir.clone() {
+            let slot = store_probe_slot.clone();
+            let m = metrics.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                let probed = tokio::task::spawn_blocking(move || {
+                    mqttd::store_probe::measure(std::path::Path::new(&dir), 48)
+                })
+                .await;
+                match probed {
+                    Ok(Ok(p)) => {
+                        info!(
+                            barriers_per_sec = p.single_per_sec,
+                            four_stream_per_sec = p.four_stream_per_sec,
+                            "data-dir volume probed (ADR 0076): durable throughput \
+                             should be read against this floor"
+                        );
+                        m.set_store_barrier_probe(p.single_per_sec, p.four_stream_per_sec);
+                        slot.set(p);
+                    }
+                    Ok(Err(e)) => warn!(error = %e, "data-dir barrier probe failed; \
+                         store metrics stay unprobed"),
+                    Err(e) => warn!(error = %e, "data-dir barrier probe task failed"),
+                }
+            });
+        }
+    }
+
     // ADR 0071: poll the durable-write serializer's counters into Prometheus.
     // Counters are inc'd by delta so the exposed series stay true counters.
     if let Some(plane) = &durable_plane {
@@ -519,17 +553,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let m = metrics.clone();
         tokio::spawn(async move {
             use std::sync::atomic::Ordering::Relaxed;
-            let (mut seen_batches, mut seen_ops) = (0u64, 0u64);
+            let (mut seen_batches, mut seen_ops, mut seen_micros) = (0u64, 0u64, 0u64);
             loop {
                 tokio::time::sleep(Duration::from_secs(5)).await;
                 let batches = stats.batches.load(Relaxed);
                 let ops = stats.ops.load(Relaxed);
+                let micros = stats.commit_nanos.load(Relaxed) / 1_000;
                 m.durable_writer_progress(
                     batches - seen_batches,
                     ops - seen_ops,
                     stats.max_batch.load(Relaxed),
+                    micros - seen_micros,
                 );
-                (seen_batches, seen_ops) = (batches, ops);
+                (seen_batches, seen_ops, seen_micros) = (batches, ops, micros);
             }
         });
     }
@@ -554,6 +590,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Arm the guard only for a cluster node that has not opted out.
         (cluster_configured && config.cluster.refound_guard).then(|| foreign_cluster_seen.clone()),
         cluster_configured.then(|| swim_isolated.clone()),
+        store_probe_slot.clone(),
+        durable_plane
+            .as_ref()
+            .map(mqtt_cluster::durable_plane::DurablePlane::writer_stats),
     )
     .await?;
 
@@ -2075,6 +2115,8 @@ async fn start_health(
     backup_status: &Arc<mqttd::backup::BackupStatus>,
     refound_evidence: Option<Arc<std::sync::atomic::AtomicBool>>,
     swim_isolated: Option<Arc<std::sync::atomic::AtomicBool>>,
+    store_probe: Arc<mqttd::store_probe::ProbeSlot>,
+    writer_stats: Option<Arc<mqtt_cluster::durable_plane::WriterStats>>,
 ) -> Result<
     (
         Arc<std::sync::atomic::AtomicBool>,
@@ -2125,6 +2167,7 @@ async fn start_health(
         Some(evidence) => state.with_refound_guard(evidence),
         None => state,
     };
+    let state = state.with_store_probe(store_probe, writer_stats);
     let state = match swim_isolated {
         Some(flag) => state.with_swim_isolated(flag),
         None => state,

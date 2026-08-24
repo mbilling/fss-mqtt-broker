@@ -19,6 +19,7 @@ pub mod memory_watch;
 pub mod oidc;
 pub mod peer;
 pub mod reload;
+pub mod store_probe;
 pub mod store_watch;
 
 pub use hub::{Hub, HubCommand};
