@@ -74,12 +74,33 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 
 /// The redb store files a node may hold (ADR 0018): gauge label per store.
+///
+/// The `replicas` entry names the single-file layout; since ADR 0076 T2 that
+/// store may instead span K shard files, so [`store_bytes`] measures a store by
+/// **every file it owns**, not by one name. A watcher that stopped counting the
+/// dominant store would silently stop protecting the disk — the failure mode is
+/// invisible (an absent file reads as zero bytes), which is why the shard sweep
+/// lives here rather than in each caller.
 pub const STORE_FILES: [(&str, &str); 4] = [
     ("sessions", "sessions.redb"),
     ("retained", "retained.redb"),
     ("replicas", "replicas.redb"),
     ("lease", "lease.redb"),
 ];
+
+/// Bytes held under `dir` by the store whose single-file name is `file` —
+/// summing its shards when it has them (ADR 0076 T2). Absent files count zero.
+#[must_use]
+pub fn store_bytes(dir: &Path, file: &str) -> u64 {
+    let one = |p: std::path::PathBuf| std::fs::metadata(p).map_or(0, |m| m.len());
+    let single = one(dir.join(file));
+    if single > 0 || file != "replicas.redb" {
+        return single;
+    }
+    (0..mqtt_cluster::cluster_log::R_MAX_SHARDS)
+        .map(|shard| one(dir.join(mqtt_cluster::cluster_log::shard_file_name(shard))))
+        .sum()
+}
 
 /// The share of the aggregate mark one store may hold before it is named in a WARN.
 const SKEW_ON_PCT: u64 = 70;
@@ -222,7 +243,7 @@ pub fn scan(dir: &Path) -> (Vec<(&'static str, u64)>, u64) {
     let sizes = STORE_FILES
         .iter()
         .map(|(name, file)| {
-            let bytes = std::fs::metadata(dir.join(file)).map_or(0, |m| m.len());
+            let bytes = store_bytes(dir, file);
             total += bytes;
             (*name, bytes)
         })

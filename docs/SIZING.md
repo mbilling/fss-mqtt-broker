@@ -342,6 +342,21 @@ divided by the replication factor's share on multi-node clusters. If
 above the boot figure, the volume has degraded (a noisy neighbor, throttling)
 — alert on it.
 
+**Why more parallel-stream headroom does not mean more throughput.** A volume
+that serves 3.7× the barriers at 8 streams looks like 3.7× of headroom going
+unused by a single-file store. It is not. Group commit (ADR 0071/0075) already
+turns concurrency into **batch depth**: throughput is `barrier rate × mean
+batch`. Splitting the store into K files divides that batch by K to buy `P(K)`
+more barriers, so it scales `P(K)/K` — a loss unless the device serves K truly
+independent queues. Measured: 0.85× at K=2, 0.58× at K=4 (ADR 0076 T2). The
+store is therefore one file; the broker measures your volume's `P(K)` curve at
+boot and only raises `store_reshard_advice` if yours is the rare device where
+sharding would pay. `MQTTD_STORE_SHARDS` exists for that case and is
+experimental — bring your own A/B.
+
+The lever that *does* raise durable throughput is the one that makes batches
+deeper, not narrower: more concurrent in-flight publishes per node.
+
 ## Worked example — 4 GiB RAM / 20 GiB disk
 
 Target: leave ~1 GiB for OS/page cache; broker budget ~3 GiB RSS, 16 GiB store.

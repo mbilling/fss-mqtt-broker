@@ -1931,9 +1931,15 @@ pub fn restore_disposition(dir: &Path, requested_from: &str) -> Result<RestoreDi
 pub fn require_fresh_data_dir(dir: &Path) -> Result<(), String> {
     let mut found: Vec<String> = crate::store_watch::STORE_FILES
         .iter()
-        .map(|(_, file)| *file)
+        .map(|(_, file)| (*file).to_string())
+        // A sharded replica store (ADR 0076 T2) is store files too: missing them
+        // here would let a restore land on top of a node's existing durable
+        // copy, which is precisely what this check exists to refuse.
+        .chain(
+            (0..mqtt_cluster::cluster_log::R_MAX_SHARDS)
+                .map(mqtt_cluster::cluster_log::shard_file_name),
+        )
         .filter(|f| dir.join(f).exists())
-        .map(str::to_string)
         .collect();
     found.sort();
     if found.is_empty() {

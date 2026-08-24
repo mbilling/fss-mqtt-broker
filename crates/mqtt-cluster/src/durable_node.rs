@@ -97,6 +97,7 @@ pub async fn build_durable_node(
     commit_delay: Option<Arc<std::sync::atomic::AtomicU64>>,
     allow_relaxed_publish: bool,
     ownership_domain_all: Arc<std::sync::atomic::AtomicBool>,
+    store_shards: Option<usize>,
 ) -> (
     Arc<dyn SessionStore>,
     Arc<dyn DurableRetained>,
@@ -134,8 +135,12 @@ pub async fn build_durable_node(
     // into it, and the store reads it back for takeover recovery (workstream F).
     // Persistent (ADR 0018 phase 3) when a data dir is given, so the committed copy
     // survives a restart.
+    // ADR 0076 T2: the replica store may span K files, one per shard. The layout
+    // on disk decides K — a store that already exists keeps the layout it was
+    // created with, and only a FRESH store takes `store_shards` (the caller's
+    // calibration) as its committed K.
     let replicas = Arc::new(Mutex::new(match data_dir {
-        Some(dir) => ReplicaState::open(dir.join("replicas.redb"))
+        Some(dir) => ReplicaState::open_sharded(dir, store_shards.unwrap_or(1))
             .unwrap_or_else(|e| panic!("open the replica store: {e}")),
         None => ReplicaState::new(),
     }));
@@ -716,6 +721,7 @@ mod tests {
             None,
             false,
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            None,
         )
         .await;
 
@@ -811,6 +817,10 @@ mod tests {
             None,
             false,
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            // ADR 0076 T2: run this restart test on a SHARDED store — every
+            // shard's writer must release its file, or lifetime #2 cannot
+            // reopen the dir. K writers make that K chances to leak one.
+            Some(4),
         )
         .await;
         wait_writable(&store, &client, &msg).await;
@@ -843,6 +853,10 @@ mod tests {
             None,
             false,
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            // ADR 0076 T2: run this restart test on a SHARDED store — every
+            // shard's writer must release its file, or lifetime #2 cannot
+            // reopen the dir. K writers make that K chances to leak one.
+            Some(4),
         )
         .await;
         // Becoming writable again proves the persisted lease store reopened (no

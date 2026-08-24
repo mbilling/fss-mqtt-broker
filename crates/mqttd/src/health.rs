@@ -133,6 +133,10 @@ pub struct HealthState {
         Arc<crate::store_probe::ProbeSlot>,
         Option<Arc<mqtt_cluster::durable_plane::WriterStats>>,
     )>,
+    /// How many files the replica store spans (ADR 0076 T2). Reported in the
+    /// `store` block so the layout an operator is running is answerable from
+    /// the node, not inferred from `ls`.
+    store_shards: Option<usize>,
 }
 
 impl std::fmt::Debug for HealthState {
@@ -225,6 +229,7 @@ impl HealthState {
             refound: None,
             swim_isolated: None,
             store_probe: None,
+            store_shards: None,
             backup: None,
             brownout: None,
             stores: None,
@@ -302,6 +307,13 @@ impl HealthState {
         writer: Option<Arc<mqtt_cluster::durable_plane::WriterStats>>,
     ) -> Self {
         self.store_probe = Some((probe, writer));
+        self
+    }
+
+    /// Report the replica store's committed shard count (ADR 0076 T2).
+    #[must_use]
+    pub fn with_store_shards(mut self, shards: usize) -> Self {
+        self.store_shards = Some(shards);
         self
     }
 
@@ -508,6 +520,9 @@ impl HealthState {
                     );
                 }
                 None => s.push_str("\"probed\":false"),
+            }
+            if let Some(shards) = self.store_shards {
+                let _ = write!(s, ",\"shards\":{shards}");
             }
             if let Some(w) = writer {
                 use std::sync::atomic::Ordering::Relaxed;

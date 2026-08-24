@@ -173,7 +173,8 @@ struct Loaded {
 }
 
 /// The logical key an op addresses (every op carries exactly one).
-fn op_key(op: &ReplOp) -> &str {
+#[must_use]
+pub fn op_key(op: &ReplOp) -> &str {
     match op {
         ReplOp::Append { key, .. } | ReplOp::Truncate { key, .. } | ReplOp::Remove { key } => key,
     }
@@ -248,8 +249,71 @@ pub struct ReplicaState {
     /// Per group, the replica set this node last completed catch-up against —
     /// the durable caught-up watermark (ADR 0043 P1). See [`R_CAUGHT`].
     caught_up: CaughtUp,
-    /// `Some` when persisting to disk; `None` for the in-memory default.
-    db: Option<Arc<Database>>,
+    /// The store's files, one per shard (ADR 0076 T2). Empty for the in-memory
+    /// default; exactly one entry for a single-file store (every store written
+    /// before T2, and every store an operator pinned to K=1).
+    ///
+    /// A shard owns whole placement groups — [`shard_of_group`] — and every
+    /// row in every table is group-derived (`fence/<group>`, the caught-up
+    /// row, and the entry/trunc rows via [`group_of_key`]), so the K files
+    /// partition the store with no row belonging to two of them. That is what
+    /// makes the split pure-performance: per-shard FIFO is per-group FIFO.
+    dbs: Vec<Arc<Database>>,
+}
+
+/// Which shard owns `group` (ADR 0076 T2).
+///
+/// [`GroupId`] is already a uniform hash output in `0..NUM_GROUPS`, so the
+/// modulo needs no re-hashing — and being derived from the group (never from
+/// the key directly) is what keeps the fence, the caught-up stamp and the
+/// entries of one group in one file. Stated once here so the router and the
+/// writer can never disagree, the same argument [`group_of_key`] makes.
+#[must_use]
+pub fn shard_of_group(group: GroupId, shards: usize) -> usize {
+    if shards <= 1 {
+        return 0;
+    }
+    usize::try_from(group % shards as u64).unwrap_or(0)
+}
+
+/// The `schema_meta` fact recording how many files this store was created with
+/// (ADR 0076 T2). Absent means one — which is exactly what every store written
+/// before T2 reads as, and why an upgrade never reshards.
+pub const R_SHARD_COUNT_FACT: &str = "shard_count";
+
+/// The upper bound on K. The device's measured parallel-barrier headroom is the
+/// calibration input, but the bound is a property of the design: past a handful
+/// of files the per-shard batches get too shallow to amortize their own barrier,
+/// and every shard is another open redb handle to release at shutdown.
+pub const R_MAX_SHARDS: usize = 8;
+
+/// A shard's file name within the data dir. Shard 0 of a **sharded** store is
+/// `replicas.0.redb`; a single-file store is `replicas.redb` and keeps that name
+/// forever (no rename on upgrade — the file an operator backed up is the file
+/// the next boot opens).
+#[must_use]
+pub fn shard_file_name(shard: usize) -> String {
+    format!("replicas.{shard}.redb")
+}
+
+/// The legacy single-file store's name.
+pub const R_LEGACY_FILE: &str = "replicas.redb";
+
+/// One shard's share of a batch: what to persist, and the bookkeeping needed to
+/// finish the batch once the (unlocked) commit answers.
+///
+/// Borrows the ops from the caller's batch — the batch outlives every phase, and
+/// a durable record is the message payload itself, so copying one per op would
+/// put a memcpy of the whole batch on the hot path to save nothing.
+#[derive(Debug, Default)]
+struct ShardPlan<'a> {
+    /// Fences this sub-batch advances, per group (all groups on this shard).
+    advanced: Fences,
+    /// The ops to persist.
+    ops: Vec<(Epoch, &'a ReplOp)>,
+    /// The per-key truncation low-water each `Truncate` op must write, computed
+    /// under the lock so the commit itself needs no state access.
+    watermarks: BTreeMap<String, Offset>,
 }
 
 impl ReplicaState {
@@ -265,10 +329,118 @@ impl ReplicaState {
     /// # Errors
     /// [`ReplError::Backend`] if the database cannot be opened or its contents decoded.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, ReplError> {
+        let db = Self::open_one(path.as_ref(), None)?;
+        let mut state = Self {
+            dbs: vec![Arc::new(db)],
+            ..Self::default()
+        };
+        state.load_all()?;
+        Ok(state)
+    }
+
+    /// Open (creating if absent) the replica store under `dir`, sharded per
+    /// ADR 0076 T2.
+    ///
+    /// The layout is decided by what is already on disk, never by the argument:
+    ///
+    /// - a `replicas.redb` present ⇒ **K = 1 on that exact file**, forever. An
+    ///   upgrade never reshards: resharding moves committed data, and doing it
+    ///   implicitly under an operator who only changed binaries is the silent
+    ///   migration this ADR refuses.
+    /// - `replicas.0.redb` present ⇒ K is read from its committed
+    ///   `shard_count` fact and every shard `0..K` must be present; a missing
+    ///   one is data loss, not a layout to guess at, so the open fails closed.
+    /// - nothing present ⇒ a **fresh** store: `shards` files are created and K
+    ///   is committed into every one of them.
+    ///
+    /// `shards` is therefore only ever the *calibration input for a fresh
+    /// store*, clamped to `1..=`[`R_MAX_SHARDS`].
+    ///
+    /// # Errors
+    /// [`ReplError::Backend`] if a shard cannot be opened, its schema gate
+    /// refuses, its committed shard count disagrees, or a shard file is missing.
+    pub fn open_sharded(dir: impl AsRef<Path>, shards: usize) -> Result<Self, ReplError> {
+        let dir = dir.as_ref();
+        let legacy = dir.join(R_LEGACY_FILE);
+        if legacy.exists() {
+            return Self::open(legacy);
+        }
+        let first = dir.join(shard_file_name(0));
+        // Snapshot BEFORE anything is created: opening shard 0 below makes
+        // `first` exist, and a fresh store would then look like a committed one
+        // missing every other shard.
+        let committed = first.exists();
+        // The DEFAULT layout is the original one. A fresh single-file store is
+        // `replicas.redb` — not `replicas.0.redb` — so every name the rest of
+        // the system already knows (the disk-watermark scan, the restore
+        // guard, an operator's backup script, a downgrade to a pre-T2 binary)
+        // keeps working with no special case. Shard names appear only when an
+        // operator deliberately asks for shards.
+        if !committed && shards <= 1 {
+            return Self::open(legacy);
+        }
+        let k = if committed {
+            // Committed layout: read K before opening anything else.
+            let probe = mqtt_storage::open::create_with_lock_retry(&first).map_err(rdb)?;
+            let k = mqtt_storage::schema::read_fact(&probe, R_SHARD_COUNT_FACT)
+                .map_err(rdb)?
+                .unwrap_or(1);
+            drop(probe);
+            usize::try_from(k).unwrap_or(1).max(1)
+        } else {
+            shards.clamp(1, R_MAX_SHARDS)
+        };
+        let mut dbs = Vec::with_capacity(k);
+        for shard in 0..k {
+            let path = dir.join(shard_file_name(shard));
+            // A committed layout with a hole is a store that lost a file: every
+            // key it held is silently unreadable, and creating the missing shard
+            // empty would turn that into "recovered, with data gone". Refuse.
+            if committed && shard > 0 && !path.exists() {
+                return Err(ReplError::Backend(format!(
+                    "replica store at {} says it has {k} shards but {} is missing — \
+                     a shard file is not optional: restore it (or the whole data dir) \
+                     from backup rather than starting with a hole",
+                    dir.display(),
+                    path.display()
+                )));
+            }
+            let db = Self::open_one(&path, Some(k))?;
+            dbs.push(Arc::new(db));
+        }
+        let mut state = Self {
+            dbs,
+            ..Self::default()
+        };
+        state.load_all()?;
+        Ok(state)
+    }
+
+    /// Whether `dir` holds no replica store yet — the one moment a fresh K may
+    /// be chosen (ADR 0076 T2). Cheap: two `exists` checks, no open.
+    #[must_use]
+    pub fn is_fresh(dir: impl AsRef<Path>) -> bool {
+        let dir = dir.as_ref();
+        !dir.join(R_LEGACY_FILE).exists() && !dir.join(shard_file_name(0)).exists()
+    }
+
+    /// Open one shard file: lock-retry, schema gate, shard-count stamp, tables.
+    fn open_one(path: &Path, shards: Option<usize>) -> Result<Database, ReplError> {
         let db = mqtt_storage::open::create_with_lock_retry(path).map_err(rdb)?;
         // Layout version gate (ADR 0038 T2): stamp fresh, fail closed on foreign.
-        mqtt_storage::schema::gate_or_migrate(&db, "replicas.redb", R_SCHEMA_VERSION, R_MIGRATIONS)
+        mqtt_storage::schema::gate_or_migrate(&db, R_LEGACY_FILE, R_SCHEMA_VERSION, R_MIGRATIONS)
             .map_err(rdb)?;
+        if let Some(k) = shards {
+            // Write-once, and fail closed if this file was created as part of a
+            // differently-sized store (ADR 0076 T2: K is committed, not tuned).
+            mqtt_storage::schema::stamp_fact_once(
+                &db,
+                R_LEGACY_FILE,
+                R_SHARD_COUNT_FACT,
+                u32::try_from(k).unwrap_or(1),
+            )
+            .map_err(rdb)?;
+        }
         let txn = db.begin_write().map_err(rdb)?;
         {
             let _ = txn.open_table(R_ENTRIES).map_err(rdb)?;
@@ -277,19 +449,31 @@ impl ReplicaState {
             let _ = txn.open_table(R_CAUGHT).map_err(rdb)?;
         }
         txn.commit().map_err(rdb)?;
-        let Loaded {
-            fences,
-            logs,
-            truncated,
-            caught_up,
-        } = Self::load(&db)?;
-        Ok(Self {
-            fences,
-            logs,
-            truncated,
-            caught_up,
-            db: Some(Arc::new(db)),
-        })
+        Ok(db)
+    }
+
+    /// Rebuild the in-memory cache from every shard. The shards partition the
+    /// keyspace, so the merge is a disjoint union — no conflict resolution.
+    fn load_all(&mut self) -> Result<(), ReplError> {
+        for db in &self.dbs.clone() {
+            let Loaded {
+                fences,
+                logs,
+                truncated,
+                caught_up,
+            } = Self::load(db)?;
+            self.fences.extend(fences);
+            self.logs.extend(logs);
+            self.truncated.extend(truncated);
+            self.caught_up.extend(caught_up);
+        }
+        Ok(())
+    }
+
+    /// How many files this store spans (1 for in-memory and single-file stores).
+    #[must_use]
+    pub fn shard_count(&self) -> usize {
+        self.dbs.len().max(1)
     }
 
     /// Reconstruct the in-memory cache from the on-disk tables.
@@ -349,10 +533,83 @@ impl ReplicaState {
     /// coalesced so a burst of replicated messages costs a single fsync rather than one
     /// each (ADR 0027). Ops apply in slice order. No-op (`Ok`) when in-memory.
     fn persist_batch(&self, fences: &Fences, ops: &[(Epoch, &ReplOp)]) -> Result<(), ReplError> {
-        let Some(db) = &self.db else {
+        if self.dbs.is_empty() {
             return Ok(());
-        };
+        }
+        if self.dbs.len() == 1 {
+            let watermarks = ops
+                .iter()
+                .filter_map(|(_, op)| match op {
+                    ReplOp::Truncate { key, .. } => Some((key.clone(), self.watermark(key))),
+                    _ => None,
+                })
+                .collect();
+            let plan = ShardPlan {
+                advanced: fences.clone(),
+                ops: ops.to_vec(),
+                watermarks,
+            };
+            return commit_shard(&self.dbs[0], &plan);
+        }
+        // Sharded (ADR 0076 T2): one transaction per shard, committed
+        // concurrently — the device's parallel-barrier capacity is exactly what
+        // the split buys, and it is only reachable with separate files.
+        let mut plans: BTreeMap<usize, ShardPlan> = BTreeMap::new();
+        for (group, epoch) in fences {
+            plans
+                .entry(shard_of_group(*group, self.dbs.len()))
+                .or_default()
+                .advanced
+                .insert(*group, *epoch);
+        }
+        for (epoch, op) in ops {
+            let key = op_key(op);
+            let shard = shard_of_group(group_of_key(key), self.dbs.len());
+            let plan = plans.entry(shard).or_default();
+            if let ReplOp::Truncate { key, .. } = op {
+                if !plan.watermarks.contains_key(key) {
+                    plan.watermarks.insert(key.clone(), self.watermark(key));
+                }
+            }
+            plan.ops.push((*epoch, op));
+        }
+        let mut failures = Vec::new();
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = plans
+                .iter()
+                .map(|(shard, plan)| {
+                    let db = &self.dbs[*shard];
+                    scope.spawn(move || commit_shard(db, plan))
+                })
+                .collect();
+            for h in handles {
+                match h.join() {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => failures.push(e.to_string()),
+                    Err(_) => failures.push("shard commit thread panicked".to_string()),
+                }
+            }
+        });
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(ReplError::Backend(failures.join("; ")))
+        }
+    }
+}
+
+/// Commit one shard's share of a batch in a single fsync'd transaction.
+///
+/// Takes no `ReplicaState`: every state read a commit needs (the per-key
+/// truncation low-water) is resolved into the plan while the caller holds the
+/// lock, so the commit — the expensive, blocking part — runs against nothing
+/// but this shard's own file. That is what lets K of them run at once.
+fn commit_shard(db: &Database, plan: &ShardPlan) -> Result<(), ReplError> {
+    {
         let mut txn = db.begin_write().map_err(rdb)?;
+        let fences = &plan.advanced;
+        let ops = plan.ops.as_slice();
+        let watermarks = &plan.watermarks;
         txn.set_durability(Durability::Immediate); // one fsync for the whole batch (ADR 0018/0027)
         {
             let mut meta = txn.open_table(R_META).map_err(rdb)?;
@@ -386,7 +643,8 @@ impl ReplicaState {
                         let base = wm
                             .get(key.as_str())
                             .copied()
-                            .unwrap_or_else(|| self.watermark(key));
+                            .or_else(|| watermarks.get(key.as_str()).copied())
+                            .unwrap_or(0);
                         let new_wm = base.max(*up_to);
                         trunc.insert(key.as_str(), new_wm).map_err(rdb)?;
                         wm.insert(key.as_str(), new_wm);
@@ -402,7 +660,9 @@ impl ReplicaState {
         txn.commit().map_err(rdb)?;
         Ok(())
     }
+}
 
+impl ReplicaState {
     /// Apply one op's mutation to the in-memory copy (after it is durable on disk).
     fn apply_in_memory(&mut self, epoch: Epoch, op: &ReplOp) {
         match op {
@@ -544,6 +804,95 @@ impl ReplicaState {
         accepted
     }
 
+    /// [`apply_batch`](Self::apply_batch) for one shard's writer, with the fsync
+    /// taken **outside** the state lock (ADR 0076 T2).
+    ///
+    /// Three phases: decide under the lock, commit this shard's file with the
+    /// lock released, apply under the lock. The K writers therefore hold the
+    /// device concurrently instead of queueing behind one another — the reason K
+    /// files exist at all, since redb serializes writers within one database.
+    ///
+    /// **Why this is safe.** Every op in `batch` belongs to `shard` (the sender
+    /// routes by group), and a shard's groups have exactly ONE writer. Nothing
+    /// else mutates a fence, log or watermark of those groups, so no decision
+    /// made in phase 1 can be invalidated before phase 3 — the property the
+    /// single-writer design already relied on, now stated per shard. Readers
+    /// between the phases see pre-apply state, exactly as they do today between
+    /// batches. Persist-before-mutate is unchanged: nothing is applied in memory
+    /// that is not already on disk.
+    ///
+    /// A commit failure rejects this shard's whole batch, as before.
+    #[must_use]
+    pub fn apply_batch_sharded(
+        state: &std::sync::Mutex<Self>,
+        shard: usize,
+        batch: &[(Epoch, ReplOp)],
+    ) -> Vec<bool> {
+        let lock = || {
+            state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        };
+        // ── phase 1: decide (locked) ────────────────────────────────────────
+        let (accepted, superseded, advanced, plan, db) = {
+            let this = lock();
+            let mut accepted = Vec::with_capacity(batch.len());
+            let mut superseded = vec![false; batch.len()];
+            let mut advanced = Fences::new();
+            let mut plan = ShardPlan::default();
+            for (i, (epoch, op)) in batch.iter().enumerate() {
+                let group = group_of_key(op_key(op));
+                let running = advanced
+                    .get(&group)
+                    .or_else(|| this.fences.get(&group))
+                    .copied()
+                    .unwrap_or(0);
+                if *epoch < running {
+                    accepted.push(false);
+                } else if this.is_stale_attempt(*epoch, op) {
+                    advanced.insert(group, *epoch);
+                    superseded[i] = true;
+                    accepted.push(true);
+                } else {
+                    advanced.insert(group, *epoch);
+                    if let ReplOp::Truncate { key, .. } = op {
+                        if !plan.watermarks.contains_key(key) {
+                            plan.watermarks.insert(key.clone(), this.watermark(key));
+                        }
+                    }
+                    plan.ops.push((*epoch, op));
+                    accepted.push(true);
+                }
+            }
+            plan.advanced = advanced.clone();
+            let db = this.dbs.get(shard).cloned();
+            (accepted, superseded, advanced, plan, db)
+        };
+        if plan.ops.is_empty() {
+            lock().fences.extend(advanced);
+            return accepted;
+        }
+        // ── phase 2: commit (UNLOCKED — this is the win) ────────────────────
+        if let Some(db) = &db {
+            if let Err(e) = commit_shard(db, &plan) {
+                tracing::warn!(
+                    error = %e, shard,
+                    "replica batch persist failed; not acking the batch"
+                );
+                return vec![false; batch.len()];
+            }
+        }
+        // ── phase 3: apply (locked) ─────────────────────────────────────────
+        let mut this = lock();
+        this.fences.extend(advanced);
+        for (i, ((epoch, op), ok)) in batch.iter().zip(&accepted).enumerate() {
+            if *ok && !superseded[i] {
+                this.apply_in_memory(*epoch, op);
+            }
+        }
+        accepted
+    }
+
     /// The truncation low-water for `key`: the highest acked offset this replica knows
     /// was dropped (ADR 0018 phase 3b). `0` if it has applied no truncation for the key.
     #[must_use]
@@ -624,26 +973,52 @@ impl ReplicaState {
         if stamps.is_empty() {
             return;
         }
-        if let Some(db) = &self.db {
-            let persist = || -> Result<(), ReplError> {
-                let mut txn = db.begin_write().map_err(rdb)?;
-                txn.set_durability(Durability::Immediate);
-                {
-                    let mut caught = txn.open_table(R_CAUGHT).map_err(rdb)?;
-                    for (group, set) in stamps {
-                        let value = r_caught_value(&set.iter().cloned().collect());
-                        caught
-                            .insert(group.to_string().as_str(), value.as_slice())
-                            .map_err(rdb)?;
-                    }
-                }
-                txn.commit().map_err(rdb)?;
-                Ok(())
-            };
-            if let Err(e) = persist() {
-                tracing::warn!(error = %e, "caught-up stamp persist failed; groups stay pending");
-                return;
+        if !self.dbs.is_empty() {
+            // A sweep stamps arbitrary groups, so the stamps fan across shards
+            // exactly like a batch does (ADR 0076 T2). One transaction per
+            // shard that owns any of them; a shard whose commit fails leaves
+            // ITS groups pending, and the others still advance — the watermark
+            // per group still never claims more than that group's disk holds.
+            let mut by_shard: BTreeMap<usize, Vec<&(GroupId, Vec<NodeId>)>> = BTreeMap::new();
+            for stamp in stamps {
+                by_shard
+                    .entry(shard_of_group(stamp.0, self.dbs.len()))
+                    .or_default()
+                    .push(stamp);
             }
+            let mut persisted: Vec<GroupId> = Vec::with_capacity(stamps.len());
+            for (shard, stamps) in &by_shard {
+                let db = &self.dbs[*shard];
+                let persist = || -> Result<(), ReplError> {
+                    let mut txn = db.begin_write().map_err(rdb)?;
+                    txn.set_durability(Durability::Immediate);
+                    {
+                        let mut caught = txn.open_table(R_CAUGHT).map_err(rdb)?;
+                        for (group, set) in stamps {
+                            let value = r_caught_value(&set.iter().cloned().collect());
+                            caught
+                                .insert(group.to_string().as_str(), value.as_slice())
+                                .map_err(rdb)?;
+                        }
+                    }
+                    txn.commit().map_err(rdb)?;
+                    Ok(())
+                };
+                if let Err(e) = persist() {
+                    tracing::warn!(
+                        error = %e, shard,
+                        "caught-up stamp persist failed; this shard's groups stay pending"
+                    );
+                } else {
+                    persisted.extend(stamps.iter().map(|(g, _)| *g));
+                }
+            }
+            for (group, set) in stamps {
+                if persisted.contains(group) {
+                    self.caught_up.insert(*group, set.iter().cloned().collect());
+                }
+            }
+            return;
         }
         for (group, set) in stamps {
             self.caught_up.insert(*group, set.iter().cloned().collect());
@@ -1617,9 +1992,11 @@ mod tests {
     }
 
     use super::{
-        merge_replica_logs, ClusterLog, ReplOp, ReplicaRead, ReplicaState, ReplicaTransport,
+        merge_replica_logs, shard_file_name, shard_of_group, ClusterLog, ReplOp, ReplicaRead,
+        ReplicaState, ReplicaTransport, R_LEGACY_FILE,
     };
     use crate::lease::{Epoch, OwnershipLease};
+    use crate::placement::group_of_key;
     use crate::NodeId;
     use async_trait::async_trait;
     use mqtt_storage::logged::ReplicatedSessionStore;
@@ -1781,6 +2158,187 @@ mod tests {
         // The truncation low-water persisted too (ADR 0018 §3b), so recovery still
         // fences the acked prefix after a restart.
         assert_eq!(r.watermark("q/c"), 1);
+    }
+
+    // --- ADR 0076 T2: the sharded store -------------------------------------
+
+    /// A sharded store is the single-file store's behaviour, spread over K
+    /// files: the same keys survive a reopen with the same entries, fences and
+    /// watermarks, and each key lands in the ONE file its group maps to. The
+    /// keys here deliberately span several groups, so a batch fans across
+    /// shards — the case a single-file store never exercised.
+    #[test]
+    fn a_sharded_store_round_trips_every_key_and_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let keys: Vec<String> = (0..40).map(|i| format!("q/c{i}")).collect();
+        {
+            let mut r = ReplicaState::open_sharded(dir.path(), 4).unwrap();
+            assert_eq!(r.shard_count(), 4, "a fresh store takes the requested K");
+            let batch: Vec<(Epoch, ReplOp)> = keys.iter().map(|k| (2, ap(k, 1, b"one"))).collect();
+            assert!(
+                r.apply_batch(&batch).iter().all(|ok| *ok),
+                "every op in a cross-shard batch is accepted"
+            );
+        }
+        // The files exist, and only those files.
+        for shard in 0..4 {
+            assert!(
+                dir.path().join(shard_file_name(shard)).exists(),
+                "shard {shard} must be on disk"
+            );
+        }
+        assert!(
+            !dir.path().join(R_LEGACY_FILE).exists(),
+            "a sharded store never writes the single-file name"
+        );
+
+        // Reopen WITHOUT saying how many shards: K comes from the committed fact.
+        let r = ReplicaState::open_sharded(dir.path(), 1).unwrap();
+        assert_eq!(
+            r.shard_count(),
+            4,
+            "the committed shard count wins over the caller's request — an \
+             existing store keeps its layout"
+        );
+        for key in &keys {
+            let entries = r.entries(key);
+            assert_eq!(entries.len(), 1, "{key} recovered from its shard");
+            assert_eq!(&entries[0].record, b"one");
+            assert_eq!(r.fence_for_key(key), 2, "{key}'s fence recovered");
+        }
+    }
+
+    /// The default layout is ONE file (ADR 0076 T2, amended): `open_sharded`
+    /// with `shards = 1` creates exactly the store every pre-T2 build wrote,
+    /// under its original name. Sharding is an explicit operator act, and the
+    /// measurement says it is a losing one on ordinary volumes — so the shape
+    /// a node gets without asking is the shape that measured fastest.
+    #[test]
+    fn the_default_layout_is_a_single_file_under_its_original_name() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut r = ReplicaState::open_sharded(dir.path(), 1).unwrap();
+            assert_eq!(r.shard_count(), 1);
+            assert!(r.apply(2, &ap("q/plain", 1, b"x")));
+        }
+        assert!(
+            dir.path().join(R_LEGACY_FILE).exists(),
+            "the default store is replicas.redb — the name every backup, \
+             watermark scan and restore guard already knows"
+        );
+        assert!(
+            !dir.path().join(shard_file_name(0)).exists(),
+            "no shard file is created for the default layout"
+        );
+        let r = ReplicaState::open_sharded(dir.path(), 1).unwrap();
+        assert_eq!(r.entries("q/plain").len(), 1);
+    }
+
+    /// An existing SINGLE-FILE store is never resharded by an upgrade, however
+    /// many shards the new binary would like: the file an operator backed up is
+    /// the file the next boot opens (ADR 0076 T2's no-silent-migration rule).
+    #[test]
+    fn an_existing_single_file_store_is_never_resharded() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut r = ReplicaState::open(dir.path().join(R_LEGACY_FILE)).unwrap();
+            assert!(r.apply(2, &ap("q/legacy", 1, b"old")));
+        }
+        let r = ReplicaState::open_sharded(dir.path(), 8).unwrap();
+        assert_eq!(r.shard_count(), 1, "an upgrade never reshards");
+        assert_eq!(r.entries("q/legacy").len(), 1, "its data is right there");
+        assert!(
+            !dir.path().join(shard_file_name(0)).exists(),
+            "no shard file is created beside a single-file store"
+        );
+    }
+
+    /// A committed layout with a shard file missing is a store that lost data.
+    /// Opening it and creating the gap empty would report a healthy recovery
+    /// over silently-vanished keys, so the open fails closed and says which
+    /// file is gone.
+    #[test]
+    fn a_missing_shard_fails_the_open_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let _ = ReplicaState::open_sharded(dir.path(), 4).unwrap();
+        }
+        std::fs::remove_file(dir.path().join(shard_file_name(2))).unwrap();
+        let err = ReplicaState::open_sharded(dir.path(), 4)
+            .expect_err("a store missing a shard must not open");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("replicas.2.redb") && msg.contains("missing"),
+            "the error must name the missing shard: {msg}"
+        );
+    }
+
+    /// Each key's rows live in exactly ONE shard — the property that makes the
+    /// split pure-performance (per-shard FIFO is per-group FIFO). Proven from
+    /// disk: after writing every key, exactly one shard's file can produce each.
+    #[test]
+    fn a_key_lives_in_exactly_one_shard() {
+        let dir = tempfile::tempdir().unwrap();
+        let keys: Vec<String> = (0..24).map(|i| format!("q/k{i}")).collect();
+        {
+            let mut r = ReplicaState::open_sharded(dir.path(), 4).unwrap();
+            for key in &keys {
+                assert!(r.apply(3, &ap(key, 1, b"x")));
+            }
+        }
+        for key in &keys {
+            let want = shard_of_group(group_of_key(key), 4);
+            let mut found = Vec::new();
+            for shard in 0..4 {
+                // Open each shard alone and ask whether it holds the key.
+                let one = ReplicaState::open(dir.path().join(shard_file_name(shard))).unwrap();
+                if !one.entries(key).is_empty() {
+                    found.push(shard);
+                }
+            }
+            assert_eq!(
+                found,
+                vec![want],
+                "{key} must live only in the shard its group maps to"
+            );
+        }
+    }
+
+    /// The valve on the writer path: `apply_batch_sharded` — which commits with
+    /// the state lock RELEASED — must be observationally identical to
+    /// `apply_batch` for a batch of one shard's ops: same verdicts, same
+    /// persisted entries, same fences after a reopen.
+    #[test]
+    fn the_unlocked_shard_writer_matches_apply_batch() {
+        let dir = tempfile::tempdir().unwrap();
+        let keys: Vec<String> = (0..40).map(|i| format!("q/w{i}")).collect();
+        let shard = 1;
+        let mine: Vec<&String> = keys
+            .iter()
+            .filter(|k| shard_of_group(group_of_key(k), 4) == shard)
+            .collect();
+        assert!(!mine.is_empty(), "the fixture must reach shard {shard}");
+        {
+            let state = std::sync::Mutex::new(ReplicaState::open_sharded(dir.path(), 4).unwrap());
+            let batch: Vec<(Epoch, ReplOp)> = mine.iter().map(|k| (5, ap(k, 1, b"via"))).collect();
+            let out = ReplicaState::apply_batch_sharded(&state, shard, &batch);
+            assert!(out.iter().all(|ok| *ok), "every op accepted");
+            // A stale epoch for the same group is still fenced — the decision
+            // half is unchanged by moving the commit out of the lock.
+            let fenced: Vec<(Epoch, ReplOp)> = vec![(1, ap(mine[0], 2, b"stale"))];
+            assert_eq!(
+                ReplicaState::apply_batch_sharded(&state, shard, &fenced),
+                vec![false],
+                "the fence still rejects a stale epoch"
+            );
+        }
+        let r = ReplicaState::open_sharded(dir.path(), 4).unwrap();
+        for key in &mine {
+            let entries = r.entries(key);
+            assert_eq!(entries.len(), 1, "{key} persisted through the shard writer");
+            assert_eq!(&entries[0].record, b"via");
+            assert_eq!(r.fence_for_key(key), 5);
+        }
     }
 
     fn ap(key: &str, offset: u64, rec: &[u8]) -> ReplOp {

@@ -133,10 +133,13 @@ pub struct GroupRoutedLog<S: LeaseSource, T: ReplicaTransport + Clone + 'static>
     /// Per-group cached log + recovery markers, built lazily and rebuilt when the
     /// lease epoch advances. Cached so a group's offset state is stable across calls.
     groups: Mutex<BTreeMap<GroupId, Arc<GroupEntry<T>>>>,
-    /// The node-wide durable-write serializer (ADR 0071), handed to every group's
-    /// `ClusterLog` so owner local acks group-commit with each other (and with the
-    /// follower's replica applies) instead of paying one fsync each.
-    owner_writer: Option<tokio::sync::mpsc::UnboundedSender<crate::cluster_log::DurableWrite>>,
+    /// The durable-write serializers (ADR 0071), one per store shard (ADR 0076
+    /// T2). Each group's `ClusterLog` is handed the sender for ITS OWN shard, so
+    /// owner local acks group-commit with each other (and with the follower's
+    /// replica applies) on that shard instead of paying one fsync each — and
+    /// different shards commit at the same time.
+    owner_writer:
+        Option<Arc<Vec<tokio::sync::mpsc::UnboundedSender<crate::cluster_log::DurableWrite>>>>,
 }
 
 impl<S: LeaseSource, T: ReplicaTransport + Clone + 'static> std::fmt::Debug
@@ -177,10 +180,20 @@ impl<S: LeaseSource, T: ReplicaTransport + Clone + 'static> GroupRoutedLog<S, T>
     #[must_use]
     pub fn with_owner_writer(
         mut self,
-        writer: tokio::sync::mpsc::UnboundedSender<crate::cluster_log::DurableWrite>,
+        writers: Arc<Vec<tokio::sync::mpsc::UnboundedSender<crate::cluster_log::DurableWrite>>>,
     ) -> Self {
-        self.owner_writer = Some(writer);
+        self.owner_writer = Some(writers);
         self
+    }
+
+    /// The writer that owns `group`'s shard (ADR 0076 T2).
+    fn writer_for(
+        &self,
+        group: GroupId,
+    ) -> Option<tokio::sync::mpsc::UnboundedSender<crate::cluster_log::DurableWrite>> {
+        let writers = self.owner_writer.as_ref()?;
+        let shard = crate::cluster_log::shard_of_group(group, writers.len());
+        writers.get(shard).or_else(|| writers.first()).cloned()
     }
 
     fn cache(&self) -> std::sync::MutexGuard<'_, BTreeMap<GroupId, Arc<GroupEntry<T>>>> {
@@ -304,7 +317,7 @@ impl<S: LeaseSource, T: ReplicaTransport + Clone + 'static> GroupRoutedLog<S, T>
                             // writer attached (ADR 0071) those applies
                             // group-commit through the shared serializer.
                             .with_local_store(self.local_replicas.clone())
-                            .maybe_owner_writer(self.owner_writer.clone()),
+                            .maybe_owner_writer(self.writer_for(group)),
                         ),
                         recovered: Mutex::new(BTreeSet::new()),
                         replica_set: replica_set.clone(),

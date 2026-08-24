@@ -359,6 +359,10 @@ pub struct Metrics {
     durable_writer_commit_micros_total: Counter,
     store_barrier_floor: Gauge,
     store_barrier_floor_4stream: Gauge,
+    /// Files the replica store spans (ADR 0076 T2) and, when the volume's
+    /// measurements outgrow it, the count they suggest — advisory only.
+    store_shards: Gauge,
+    store_reshard_advice: Gauge,
     crypto_module_info: Family<CryptoModuleLabel, Gauge>,
     /// Brownout STATE (ADR 0054): 1 while growth writes are refused on `axis`
     /// (`disk`, `memory`), 0 otherwise. The rejection counters record symptoms; this
@@ -795,6 +799,22 @@ impl Metrics {
              probed",
         );
 
+        let store_shards = register_gauge(
+            &mut registry,
+            "store_shards",
+            "How many files the replica store spans (ADR 0076 T2): committed at \
+             first boot from this volume's measured barrier knee and fixed for \
+             the life of the data dir; 1 for a single-file store",
+        );
+        let store_reshard_advice = register_gauge(
+            &mut registry,
+            "store_reshard_advice",
+            "The shard count this volume's measurements now suggest (ADR 0076 \
+             T2), when it differs from the committed one — an ADVISORY for the \
+             operator, never an automatic migration; 0 when the committed \
+             layout still fits",
+        );
+
         let brownout = register_gauge_family(
             &mut registry,
             "brownout",
@@ -999,6 +1019,8 @@ impl Metrics {
             durable_writer_commit_micros_total,
             store_barrier_floor,
             store_barrier_floor_4stream,
+            store_shards,
+            store_reshard_advice,
             durable_writer_ops_total,
             durable_writer_max_batch,
             crypto_module_info,
@@ -1781,6 +1803,16 @@ impl Metrics {
         self.store_barrier_floor_4stream.set(clamp_gauge(
             usize::try_from(four_stream_per_sec).unwrap_or(usize::MAX),
         ));
+    }
+
+    /// Publish the replica store's committed layout and, when the volume's own
+    /// measurements disagree with it, the shard count they suggest (ADR 0076
+    /// T2). `advice` is `None` while the committed layout still fits — the
+    /// advisor is silent by default, and never reshards anything itself.
+    pub fn set_store_shards(&self, shards: usize, advice: Option<usize>) {
+        self.store_shards.set(clamp_gauge(shards));
+        self.store_reshard_advice
+            .set(clamp_gauge(advice.unwrap_or(0)));
     }
 
     /// Force any pending OTLP export to be pushed now (a no-op without OTLP). Best-effort;

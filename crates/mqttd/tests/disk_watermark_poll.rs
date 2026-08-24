@@ -16,8 +16,9 @@
 //! nothing about cadence: it sets a 1 KiB mark that a live broker's stores exceed on the
 //! watcher's FIRST sample, so it passes identically with the wiring reverted.
 //!
-//! How the crossing is staged without corrupting anything: `store_watch::scan` sizes four
-//! FIXED filenames with `metadata().len()`. The test EXTENDS one of them with `set_len`,
+//! How the crossing is staged without corrupting anything: `store_watch::scan` sizes each
+//! store with `metadata().len()` (summing the replica store's shards, ADR 0076 T2). The
+//! test EXTENDS one replica file with `set_len`,
 //! which reserves no blocks (a sparse hole, so this costs no disk and no time) and leaves
 //! every existing byte untouched; truncating back to the recorded original length stages
 //! the recovery edge and restores the file exactly. `replicas.redb` is the target because
@@ -146,7 +147,18 @@ async fn time_until(
 /// Stage a store-size crossing by EXTENDING an existing store file into a sparse hole.
 /// Returns its path and its original length, so the caller can restore it byte-for-byte.
 fn stage_crossing(dir: &std::path::Path) -> (std::path::PathBuf, u64) {
-    let path = dir.join("replicas.redb");
+    // Since ADR 0076 T2 the replica store may be a single file OR K shards, and
+    // `store_watch::scan` sums whichever it finds — so extending any ONE of them
+    // moves the `replicas` total by exactly the same amount. Take the file the
+    // broker actually created rather than assuming the layout.
+    let path = [
+        "replicas.redb".to_string(),
+        mqtt_cluster::cluster_log::shard_file_name(0),
+    ]
+    .into_iter()
+    .map(|name| dir.join(name))
+    .find(|p| p.exists())
+    .expect("the broker created a replica store");
     let f = std::fs::OpenOptions::new()
         .write(true)
         .open(&path)

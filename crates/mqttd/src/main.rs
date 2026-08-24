@@ -546,14 +546,53 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // ADR 0076 T2 (amended): the same volume, asked the SHARDING question —
+    // would splitting the store into K files pay on this device? Throughput
+    // scales P(K)/K, so it pays only where the device serves K nearly
+    // independent queues. Measured here and reported; never acted on. The
+    // curve costs a few hundred fsyncs once, after the barrier probe.
+    let shard_advice = Arc::new(std::sync::OnceLock::<usize>::new());
+    if durable_plane.is_some() {
+        if let Some(dir) = config.node.data_dir.clone() {
+            let advice = shard_advice.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(4)).await;
+                let curve = tokio::task::spawn_blocking(move || {
+                    mqttd::store_probe::parallel_barrier_curve(std::path::Path::new(&dir), 32)
+                })
+                .await;
+                match curve {
+                    Ok(Ok(curve)) => {
+                        let pays = mqttd::store_probe::sharding_would_pay(&curve);
+                        info!(
+                            curve = ?curve, sharding_would_pay = ?pays,
+                            "data-dir parallel-barrier curve (ADR 0076 T2): sharding the \
+                             store into K files divides the group-commit batch by K and \
+                             multiplies the barrier rate by only P(K), so it pays only \
+                             where P(K) ~ K"
+                        );
+                        if let Some(k) = pays {
+                            let _ = advice.set(k);
+                        }
+                    }
+                    Ok(Err(e)) => warn!(error = %e, "parallel-barrier curve failed"),
+                    Err(e) => warn!(error = %e, "parallel-barrier curve task failed"),
+                }
+            });
+        }
+    }
+
     // ADR 0071: poll the durable-write serializer's counters into Prometheus.
     // Counters are inc'd by delta so the exposed series stay true counters.
     if let Some(plane) = &durable_plane {
         let stats = plane.writer_stats();
         let m = metrics.clone();
+        let shards = plane.shard_count();
+        let advice_slot = shard_advice.clone();
         tokio::spawn(async move {
             use std::sync::atomic::Ordering::Relaxed;
             let (mut seen_batches, mut seen_ops, mut seen_micros) = (0u64, 0u64, 0u64);
+            let mut advised = false;
             loop {
                 tokio::time::sleep(Duration::from_secs(5)).await;
                 let batches = stats.batches.load(Relaxed);
@@ -566,6 +605,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     micros - seen_micros,
                 );
                 (seen_batches, seen_ops, seen_micros) = (batches, ops, micros);
+                // The shard ADVISOR (ADR 0076 T2, amended). The layout is never
+                // changed under a running node — a reshard moves committed
+                // data — so the broker only ever SAYS what its own measurement
+                // found. And it says it rarely: the boot curve has to show this
+                // device serving K nearly-independent queues (P(K) ~ K) before
+                // splitting the group-commit batch K ways could pay at all.
+                // On every volume measured so far it does not, which is why the
+                // store is one file and this gauge stays 0.
+                let advice = advice_slot.get().copied().filter(|k| *k > shards);
+                m.set_store_shards(shards, advice);
+                if let Some(suggested) = advice {
+                    if !advised {
+                        advised = true;
+                        tracing::warn!(
+                            committed = shards,
+                            suggested,
+                            "this volume serves parallel fsync streams nearly \
+                             independently (P(K) ~ K), so a {suggested}-shard replica \
+                             store could out-run the single file here — unusual, and \
+                             worth your own A/B before believing it. The layout is NOT \
+                             changed automatically: to take it, bring up a node on a \
+                             FRESH data dir with MQTTD_STORE_SHARDS={suggested} and let \
+                             it re-replicate (ADR 0076 T2)"
+                        );
+                    }
+                }
             }
         });
     }
@@ -594,6 +659,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         durable_plane
             .as_ref()
             .map(mqtt_cluster::durable_plane::DurablePlane::writer_stats),
+        durable_plane
+            .as_ref()
+            .map(mqtt_cluster::durable_plane::DurablePlane::shard_count),
     )
     .await?;
 
@@ -1752,6 +1820,55 @@ async fn start_hub(
         // member advertises peer proto >= 8 AND the operator kept the default
         // `durable.ownership_domain = "members"`.
         let ownership_domain_all = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // ADR 0076 T2 (amended): the replica store is ONE file unless an
+        // operator explicitly pins `MQTTD_STORE_SHARDS`.
+        //
+        // The ADR proposed calibrating K at first boot and sharding by default.
+        // Measurement rejected it: after ADR 0075 the group-commit writer turns
+        // in-flight work into BATCH DEPTH, and sharding divides that depth by K
+        // while the device multiplies its barrier rate by only P(K) — so
+        // throughput scales by P(K)/K, which is < 1 on every volume measured
+        // (P(2)≈1.7, P(4)≈2.3). Sharding pays only where a device serves K
+        // genuinely independent queues. So the layout stays K=1 and the probe's
+        // job is to SAY what this volume's P(K) is (below), not to act on it.
+        let store_shards = data_dir.as_deref().map(Path::new).and_then(|dir| {
+            let pin = std::env::var("MQTTD_STORE_SHARDS").ok()?;
+            if !mqtt_cluster::cluster_log::ReplicaState::is_fresh(dir) {
+                tracing::warn!(
+                    "MQTTD_STORE_SHARDS is set but this data dir already holds a replica \
+                     store — its committed layout stands (a reshard moves committed data \
+                     and is never implicit, ADR 0076 T2)"
+                );
+                return None;
+            }
+            match pin
+                .parse::<usize>()
+                .ok()
+                .filter(|k| (1..=mqtt_cluster::cluster_log::R_MAX_SHARDS).contains(k))
+            {
+                Some(1) => None,
+                Some(k) => {
+                    tracing::warn!(
+                        shards = k,
+                        "MQTTD_STORE_SHARDS pins this FRESH store to {k} shards. This is \
+                         EXPERIMENTAL and measured SLOWER than the single-file default on \
+                         every volume tested (throughput scales P(K)/K; see ADR 0076 T2). \
+                         Take it only on a device that serves K independent queues, and \
+                         only with your own A/B in hand. K is committed for the life of \
+                         this data dir",
+                    );
+                    Some(k)
+                }
+                None => {
+                    tracing::warn!(
+                        value = %pin, max = mqtt_cluster::cluster_log::R_MAX_SHARDS,
+                        "MQTTD_STORE_SHARDS is not a shard count in 1..=max — ignoring it; \
+                         the store stays a single file"
+                    );
+                    None
+                }
+            }
+        });
         let (store, durable_retained, plane, driver) =
             mqtt_cluster::durable_node::build_durable_node(
                 node_id.clone(),
@@ -1763,6 +1880,7 @@ async fn start_hub(
                 None, // no commit-latency fault injection in production (ADR 0026)
                 config.durable.allow_relaxed_publish, // ADR 0072 operator opt-in
                 ownership_domain_all.clone(),
+                store_shards, // ADR 0076 T2, fresh stores only
             )
             .await;
         let (mut hub, hub_tx) = hub::Hub::with_config_and_placement(
@@ -2117,6 +2235,7 @@ async fn start_health(
     swim_isolated: Option<Arc<std::sync::atomic::AtomicBool>>,
     store_probe: Arc<mqttd::store_probe::ProbeSlot>,
     writer_stats: Option<Arc<mqtt_cluster::durable_plane::WriterStats>>,
+    store_shards: Option<usize>,
 ) -> Result<
     (
         Arc<std::sync::atomic::AtomicBool>,
@@ -2168,6 +2287,10 @@ async fn start_health(
         None => state,
     };
     let state = state.with_store_probe(store_probe, writer_stats);
+    let state = match store_shards {
+        Some(shards) => state.with_store_shards(shards),
+        None => state,
+    };
     let state = match swim_isolated {
         Some(flag) => state.with_swim_isolated(flag),
         None => state,

@@ -85,11 +85,15 @@ pub struct DurablePlane {
     network: MeshRaftNetwork,
     transport: Arc<PeerReplicaTransport>,
     replicas: Arc<Mutex<ReplicaState>>,
-    /// Sender into the single **replica-writer** task (ADR 0027): inbound `Replicate`
-    /// frames hand their op here instead of each fsyncing on its own, so the writer can
-    /// group-commit a burst into one transaction. The recovery-read path still locks
+    /// Senders into the **replica-writer** tasks, one per store shard (ADR 0027,
+    /// sharded by ADR 0076 T2): inbound `Replicate` frames hand their op to the
+    /// writer that owns its placement group instead of each fsyncing on its own,
+    /// so each writer group-commits its shard's burst into one transaction — and
+    /// K writers put K commits on the device at once, which is the whole point of
+    /// K files. Length 1 for a single-file store, in which case this is exactly
+    /// the pre-T2 single serializer. The recovery-read path still locks
     /// `replicas` directly (between batches).
-    replica_tx: mpsc::UnboundedSender<ReplicaWrite>,
+    replica_tx: Arc<Vec<mpsc::UnboundedSender<ReplicaWrite>>>,
     /// The owner-side server for catch-up requests (ADR 0043 P1). Set after
     /// construction ([`set_catch_up_source`](Self::set_catch_up_source)) because
     /// the group-routed store is built on top of the plane's shared handles; a
@@ -99,11 +103,12 @@ pub struct DurablePlane {
     /// (ADR 0043 P1) compares this node's durable caught-up stamp against the
     /// group's **current** replica set.
     placement: Arc<RwLock<Placement>>,
-    /// Aborts the replica-writer when the **last** plane clone drops. The writer holds a
-    /// clone of `replicas` (hence of the persistent `replicas.redb` handle); without this,
-    /// the writer outlives the plane and the file lock is never released, so a restart
+    /// Aborts EVERY replica-writer when the **last** plane clone drops. A writer holds a
+    /// clone of `replicas` (hence of the persistent replica file handles); without this,
+    /// a writer outlives the plane and a file lock is never released, so a restart
     /// over the same data dir cannot reopen it (ADR 0018 phase 5 / ADR 0019 shutdown).
-    _writer: Arc<AbortOnDrop>,
+    /// Sharding makes this K handles — one leaked writer is one unopenable shard.
+    _writers: Arc<Vec<AbortOnDrop>>,
     /// The serializer's counters (ADR 0071), polled into metrics by `mqttd`.
     writer_stats: Arc<WriterStats>,
     /// ADR 0073: true while the WHOLE cluster advertises the scale-out ownership
@@ -143,16 +148,28 @@ impl DurablePlane {
         placement: Arc<RwLock<Placement>>,
     ) -> Self {
         let writer_stats = Arc::new(WriterStats::default());
-        let (replica_tx, writer) = spawn_replica_writer(replicas.clone(), writer_stats.clone());
+        // One writer per shard (ADR 0076 T2). A single-file store gets exactly
+        // one, so this is the pre-T2 shape verbatim.
+        let shards = replicas
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .shard_count();
+        let (senders, aborts): (Vec<_>, Vec<_>) = (0..shards)
+            .map(|shard| {
+                let (tx, abort) =
+                    spawn_replica_writer(replicas.clone(), writer_stats.clone(), shard);
+                (tx, AbortOnDrop(abort))
+            })
+            .unzip();
         Self {
             raft,
             network,
             transport,
             replicas,
-            replica_tx,
+            replica_tx: Arc::new(senders),
             catch_up: Arc::new(Mutex::new(None)),
             placement,
-            _writer: Arc::new(AbortOnDrop(writer)),
+            _writers: Arc::new(aborts),
             writer_stats,
             ownership_domain_all: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
@@ -165,13 +182,37 @@ impl DurablePlane {
         self
     }
 
-    /// A sender into the node-wide durable-write serializer, for the OWNER path
-    /// (ADR 0071): `ClusterLog::with_owner_writer` routes local acks through it
-    /// so concurrent owner appends and follower replica applies group-commit
-    /// into shared fsync'd transactions.
+    /// The per-shard senders into the durable-write serializers, for the OWNER
+    /// path (ADR 0071): `GroupRoutedLog::with_owner_writer` hands each per-group
+    /// `ClusterLog` the sender for ITS group's shard, so concurrent owner appends
+    /// and follower replica applies group-commit into shared fsync'd transactions
+    /// — one per shard, running at once (ADR 0076 T2).
     #[must_use]
-    pub fn owner_writer(&self) -> mpsc::UnboundedSender<crate::cluster_log::DurableWrite> {
+    pub fn owner_writer(
+        &self,
+    ) -> Arc<Vec<mpsc::UnboundedSender<crate::cluster_log::DurableWrite>>> {
         self.replica_tx.clone()
+    }
+
+    /// How many store shards (hence writers) this plane runs.
+    #[must_use]
+    pub fn shard_count(&self) -> usize {
+        self.replica_tx.len().max(1)
+    }
+
+    /// The writer that owns `key`'s shard (ADR 0076 T2) — the one routing rule,
+    /// used by the follower path and by anything handing a single op straight to
+    /// the serializer. A key never changes shard, so this is also the key's FIFO.
+    #[must_use]
+    pub fn writer_for_key(&self, key: &str) -> mpsc::UnboundedSender<ReplicaWrite> {
+        let shard = crate::cluster_log::shard_of_group(
+            crate::placement::group_of_key(key),
+            self.replica_tx.len(),
+        );
+        self.replica_tx
+            .get(shard)
+            .unwrap_or(&self.replica_tx[0])
+            .clone()
     }
 
     /// The serializer's counters (ADR 0071) — batches, ops, max batch size —
@@ -383,7 +424,11 @@ impl DurablePlane {
                 // If the writer is gone (shutdown) or never answers, the op is not durable
                 // → do not ack acceptance.
                 let started = std::time::Instant::now();
-                let accepted = if self.replica_tx.send((epoch, op, reply_tx)).is_ok() {
+                // Route to the writer that owns this op's shard (ADR 0076 T2):
+                // one file, one writer, one FIFO — the ordering the follower
+                // plane relies on is per key, and a key never changes shard.
+                let writer = self.writer_for_key(crate::cluster_log::op_key(&op));
+                let accepted = if writer.send((epoch, op, reply_tx)).is_ok() {
                     reply_rx.await.unwrap_or(false)
                 } else {
                     false
@@ -525,6 +570,7 @@ impl DurablePlane {
 fn spawn_replica_writer(
     replicas: Arc<Mutex<ReplicaState>>,
     stats: Arc<WriterStats>,
+    shard: usize,
 ) -> (
     mpsc::UnboundedSender<ReplicaWrite>,
     tokio::task::AbortHandle,
@@ -551,11 +597,14 @@ fn spawn_replica_writer(
             stats.max_batch.fetch_max(n as u64, Relaxed);
             let replicas = replicas.clone();
             let commit_started = std::time::Instant::now();
+            // ADR 0076 T2: `apply_batch_sharded` takes the state lock only to
+            // decide and to apply — the fsync itself runs against this shard's
+            // own file with the lock RELEASED, so the K writers commit
+            // concurrently instead of queueing behind one another. Safe because
+            // a shard's groups have exactly one writer: nothing else can mutate
+            // them between the decision and the apply.
             let results = tokio::task::spawn_blocking(move || {
-                replicas
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .apply_batch(&ops)
+                ReplicaState::apply_batch_sharded(&replicas, shard, &ops)
             })
             .await
             .unwrap_or_else(|_| vec![false; n]);
@@ -954,7 +1003,7 @@ mod tests {
 
         let mut tasks: Vec<tokio::task::JoinHandle<bool>> = Vec::new();
         for i in 0..30u8 {
-            let writer = p.owner_writer();
+            let writer = p.writer_for_key(&format!("own/{i}"));
             tasks.push(tokio::spawn(async move {
                 let (tx, rx) = tokio::sync::oneshot::channel();
                 let op = ReplOp::Append {
