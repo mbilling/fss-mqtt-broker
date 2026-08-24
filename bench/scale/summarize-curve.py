@@ -11,7 +11,9 @@ Honesty mechanics, enforced here rather than remembered:
   - Curve 1 (durable) REFUSES to render for any size missing its per-host barrier
     probes (DURABLE-PATH.md's prerequisite for interpreting fsync-bound numbers).
   - Lane B latency percentiles are histogram BUCKET UPPER BOUNDS, labeled as such.
-    Histograms are merged across drivers by summing per-`le` cumulative counts.
+    Histograms are merged across drivers, and DIFFERENCED against a post-ramp
+    baseline so they describe the measured window rather than the container's
+    lifetime (a rung's connect ramp otherwise lands in the published tail).
   - A rung that did not reach its offered rate is flagged OFFER NOT MET and
     excluded from knee detection. It is NOT called driver-limited: lane B's
     publishers are windowed QoS 1, so the shortfall may be the drivers' publish
@@ -146,20 +148,52 @@ def driver_rate(log: Path, counter: str) -> tuple[int, float]:
     return points[-1][1], (c1 - c0) / max(t1 - t0, 1)
 
 
+def _histogram_of(prom: Path) -> tuple[dict[float, int], int]:
+    """One scrape's cumulative buckets and count."""
+    buckets: dict[float, int] = {}
+    count = 0
+    if not prom.exists():
+        return buckets, count
+    for line in prom.read_text(errors="replace").splitlines():
+        m = re.match(r'e2e_latency_bucket\{le="([\d.+eInf]+)"\}\s+(\d+)', line)
+        if m:
+            le = float("inf") if m.group(1) == "+Inf" else float(m.group(1))
+            buckets[le] = buckets.get(le, 0) + int(m.group(2))
+        m = re.match(r"e2e_latency_count\s+(\d+)", line)
+        if m:
+            count += int(m.group(1))
+    return buckets, count
+
+
 def merged_histogram(proms: list[Path]) -> tuple[dict[float, int], int]:
+    """Merged latency histogram over the MEASURED window, across drivers.
+
+    emqtt-bench's histogram is cumulative over a container's whole life, so a
+    single end-of-rung scrape reports the rung's *lifetime* latency — every
+    message delivered while the publishers were still connecting included.
+    That reads as a healthy median with a heavy tail, for reasons that have
+    nothing to do with the broker's steady state: measured at the 300k rung,
+    3000 publishers gave p50 ≤10ms / p99 ≤25ms while 4000 and 6000 — whose
+    ramps are longer and busier — both gave p50 ≤25ms / p99 ≤500ms.
+
+    When a rung carries a `-base.prom` baseline (scraped once the ramp has
+    settled), the buckets are DIFFERENCED against it, so the percentiles
+    describe the same window the throughput numbers do. Rungs recorded before
+    the baseline existed fall back to the lifetime histogram, which is all
+    they have.
+    """
     buckets: dict[float, int] = {}
     count = 0
     for prom in proms:
-        if not prom.exists():
-            continue
-        for line in prom.read_text(errors="replace").splitlines():
-            m = re.match(r'e2e_latency_bucket\{le="([\d.+eInf]+)"\}\s+(\d+)', line)
-            if m:
-                le = float("inf") if m.group(1) == "+Inf" else float(m.group(1))
-                buckets[le] = buckets.get(le, 0) + int(m.group(2))
-            m = re.match(r"e2e_latency_count\s+(\d+)", line)
-            if m:
-                count += int(m.group(1))
+        after, after_count = _histogram_of(prom)
+        base, base_count = _histogram_of(prom.with_name(f"{prom.stem}-base.prom"))
+        for le, v in after.items():
+            delta = v - base.get(le, 0)
+            if delta > 0:
+                buckets[le] = buckets.get(le, 0) + delta
+        delta_count = after_count - base_count
+        if delta_count > 0:
+            count += delta_count
     return buckets, count
 
 

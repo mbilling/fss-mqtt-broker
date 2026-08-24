@@ -101,6 +101,9 @@ LANE_B_SUBS=300 # total subscribers, ONE shared group ($share/g1)
 # every rung identical). 100 matches bench/run.sh's saturate posture.
 LANE_B_INFLIGHT=100
 LANE_B_REF_RUNG=50000
+# Seconds between the publishers starting and the latency baseline scrape: the
+# ramp, excluded from the measured window (see the scrape in lane_b_rung).
+LANE_B_SETTLE="${LANE_B_SETTLE:-15}"
 BENCH_IMG="emqx/emqtt-bench:0.6.3"
 
 # ── helpers ──────────────────────────────────────────────────────────────────
@@ -344,7 +347,7 @@ lane_b_rung() { # lane_b_rung <total-rate> <posture:plain|mtls>
 	local args="" port_base=9200
 	[ "$posture" = mtls ] && args="$TLS_ARGS"
 	snapshot_metrics "$rdir" before
-	start_cpu_sampling "$rdir/cpu" "$LANE_B_SECS"
+	start_cpu_sampling "$rdir/cpu" $((LANE_B_SETTLE + LANE_B_SECS))
 	local di bi host port
 	# subscribers first (they expose the e2e histogram), then publishers
 	for ((di = 0; di < D; di++)); do
@@ -364,6 +367,21 @@ lane_b_rung() { # lane_b_rung <total-rate> <posture:plain|mtls>
 			drun "$di" "pub-$di-$bi" "-v /opt/bench-certs:/opt/bench-certs:ro $BENCH_IMG \
 				pub -h $host -p $port -c $pubs_per -t 'bench/%i' -q 1 -s 256 \
 				-I $interval -F $LANE_B_INFLIGHT --payload-hdrs ts $args"
+		done
+	done
+	# Let the publisher ramp finish BEFORE the latency measurement starts. The
+	# subscriber histograms are CUMULATIVE over the container's life, so a
+	# single end-of-rung scrape bakes every message delivered while the
+	# publishers were still connecting into the published percentiles — a fine
+	# median with a heavy tail, for reasons that have nothing to do with the
+	# broker's steady state. Baseline here, scrape again at the end, and the
+	# summarizer reports the DIFFERENCE: the same steady-window discipline the
+	# throughput numbers already use.
+	sleep "$LANE_B_SETTLE"
+	for ((di = 0; di < D; di++)); do
+		for ((bi = 0; bi < N; bi++)); do
+			rssh "$(driver_pub_ip "$di")" "curl -s http://localhost:$((port_base + bi))/metrics" \
+				>"$rdir/sub-$di-$bi-base.prom" 2>/dev/null || true
 		done
 	done
 	sleep "$LANE_B_SECS"
