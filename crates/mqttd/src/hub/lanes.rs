@@ -267,6 +267,13 @@ impl AppendJob {
 /// retries nothing and decides nothing; and it always runs an accepted job to a real
 /// store outcome, even if the hub is already gone (the completion send then no-ops and
 /// the publisher's pending entry died withheld — fail closed).
+/// How many of one session's durable appends may be awaiting durability at
+/// once (ADR 0075). Submission stays serial — offset order is delivery order —
+/// but the quorum round trips overlap, so a publisher's window stops paying
+/// one full round trip per message. Sized above the default publisher window
+/// so the lane, not this constant, is what a busy session saturates.
+pub(super) const LANE_PIPELINE_DEPTH: usize = 16;
+
 pub(super) async fn append_lane_worker(
     store: Arc<dyn SessionStore>,
     self_tx: mpsc::UnboundedSender<HubCommand>,
@@ -274,41 +281,116 @@ pub(super) async fn append_lane_worker(
     metrics: Option<Arc<mqtt_observability::metrics::Metrics>>,
     durable: bool,
 ) {
-    while let Some(job) = rx.recv().await {
-        match job {
-            LaneJob::Deliver(job) => {
-                let outcome = run_lane_job(&store, &job, metrics.as_ref(), durable).await;
-                let _ = self_tx.send(HubCommand::AppendDone { job, outcome });
+    // The pipelined durability waits (ADR 0075). Owned by this worker — a
+    // hub-owned task — so abort at shutdown drops them with it; the futures
+    // hold no store handle (they capture the log's Arc'd watermark state and
+    // the writer's completion), upholding the issue #242 teardown rule.
+    let mut inflight: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
+    loop {
+        tokio::select! {
+            job = rx.recv(), if inflight.len() < LANE_PIPELINE_DEPTH => {
+                let Some(job) = job else { break };
+                match job {
+                    LaneJob::Deliver(job) if matches!(job.work, LaneWork::Append { .. }) => {
+                        let LaneWork::Append { expiry_at } = job.work else {
+                            unreachable!("matched above");
+                        };
+                        // SUBMIT in lane order (ADR 0075): cap policy, tier and
+                        // offset assignment happen here, cheaply; the wait is
+                        // pipelined.
+                        let started = Instant::now();
+                        let mut pending = store
+                            .submit_enqueue_with_expiry(&job.client, &job.message, expiry_at)
+                            .await;
+                        // Already resolved (the eager default backends): complete
+                        // inline, exactly as the serial worker did — spawning a
+                        // task per resolved job would only slow the drain and
+                        // reorder completions for nothing.
+                        if let Some(result) = pending.try_ready() {
+                            if durable {
+                                if let Some(m) = &metrics {
+                                    m.observe_durable_append_latency(
+                                        started.elapsed().as_secs_f64(),
+                                    );
+                                }
+                            }
+                            let outcome = classify_enqueue(&job, result, metrics.as_ref());
+                            let _ = self_tx.send(HubCommand::AppendDone { job, outcome });
+                            continue;
+                        }
+                        let self_tx = self_tx.clone();
+                        let metrics = metrics.clone();
+                        inflight.spawn(async move {
+                            let result = pending.await;
+                            if durable {
+                                if let Some(m) = &metrics {
+                                    m.observe_durable_append_latency(
+                                        started.elapsed().as_secs_f64(),
+                                    );
+                                }
+                            }
+                            let outcome = classify_enqueue(&job, result, metrics.as_ref());
+                            let _ = self_tx.send(HubCommand::AppendDone { job, outcome });
+                        });
+                    }
+                    LaneJob::Deliver(job) => {
+                        // BARRIER: every non-append job keeps ADR 0061's total
+                        // order — the pipeline drains before it runs.
+                        while inflight.join_next().await.is_some() {}
+                        let outcome = run_lane_job(&store, &job, metrics.as_ref(), durable).await;
+                        let _ = self_tx.send(HubCommand::AppendDone { job, outcome });
+                    }
+                    other => {
+                        while inflight.join_next().await.is_some() {}
+                        run_barrier_job(&store, &self_tx, other).await;
+                    }
+                }
             }
-            LaneJob::Discard(pending) => {
-                // The clean-start durable discard (ADR 0017), serialized BEHIND every
-                // admitted append for this session so a late append cannot re-create
-                // the queue it just emptied (issue #242). Best-effort like the
-                // spawned path; the in-memory wipe already happened on-loop.
-                let client = pending.client.clone();
-                let _ = store.remove(&client).await;
-                let _ = self_tx.send(HubCommand::SessionRecovered {
-                    pending: *pending,
-                    recovery: SessionRecovery::Cleaned,
-                });
-                let _ = self_tx.send(HubCommand::AppendDone {
-                    job: Box::new(AppendJob::discard_mark(client)),
-                    outcome: LaneOutcome::Passed,
-                });
-            }
-            LaneJob::Remove { client } => {
-                // The zero-expiry-detach / expiry-sweep durable discard (issue
-                // #242 finding C), serialized BEHIND every admitted append for
-                // this session so a late append cannot re-create the queue it
-                // just emptied. Best-effort like the spawned path; the in-memory
-                // wipe already happened on-loop.
-                let _ = store.remove(&client).await;
-                let _ = self_tx.send(HubCommand::AppendDone {
-                    job: Box::new(AppendJob::discard_mark(client)),
-                    outcome: LaneOutcome::Passed,
-                });
-            }
+            Some(_) = inflight.join_next(), if !inflight.is_empty() => {}
         }
+    }
+    // Channel closed: run the admitted pipeline to its real outcomes (fail
+    // closed happens inside each wait; completions no-op if the hub is gone).
+    while inflight.join_next().await.is_some() {}
+}
+
+/// The lane's non-`Deliver` jobs, unchanged from the serial worker (ADR 0061):
+/// each runs its store call and posts its completions.
+async fn run_barrier_job(
+    store: &Arc<dyn SessionStore>,
+    self_tx: &mpsc::UnboundedSender<HubCommand>,
+    job: LaneJob,
+) {
+    match job {
+        LaneJob::Discard(pending) => {
+            // The clean-start durable discard (ADR 0017), serialized BEHIND every
+            // admitted append for this session so a late append cannot re-create
+            // the queue it just emptied (issue #242). Best-effort like the
+            // spawned path; the in-memory wipe already happened on-loop.
+            let client = pending.client.clone();
+            let _ = store.remove(&client).await;
+            let _ = self_tx.send(HubCommand::SessionRecovered {
+                pending: *pending,
+                recovery: SessionRecovery::Cleaned,
+            });
+            let _ = self_tx.send(HubCommand::AppendDone {
+                job: Box::new(AppendJob::discard_mark(client)),
+                outcome: LaneOutcome::Passed,
+            });
+        }
+        LaneJob::Remove { client } => {
+            // The zero-expiry-detach / expiry-sweep durable discard (issue
+            // #242 finding C), serialized BEHIND every admitted append for
+            // this session so a late append cannot re-create the queue it
+            // just emptied. Best-effort like the spawned path; the in-memory
+            // wipe already happened on-loop.
+            let _ = store.remove(&client).await;
+            let _ = self_tx.send(HubCommand::AppendDone {
+                job: Box::new(AppendJob::discard_mark(client)),
+                outcome: LaneOutcome::Passed,
+            });
+        }
+        LaneJob::Deliver(_) => unreachable!("Deliver jobs are handled by the worker"),
     }
 }
 
@@ -365,6 +447,17 @@ pub(super) async fn run_lane_job(
             m.observe_durable_append_latency(started.elapsed().as_secs_f64());
         }
     }
+    classify_enqueue(job, result, metrics)
+}
+
+/// Map an enqueue's store outcome to the lane's report, with its logging and
+/// counters — shared verbatim between the serial (barrier) path and the
+/// pipelined append path (ADR 0075), so the two can never drift.
+fn classify_enqueue(
+    job: &AppendJob,
+    result: Result<Enqueued, StorageError>,
+    metrics: Option<&Arc<mqtt_observability::metrics::Metrics>>,
+) -> LaneOutcome {
     match result {
         Ok(Enqueued::Stored { offset, evicted }) => {
             if evicted > 0 {

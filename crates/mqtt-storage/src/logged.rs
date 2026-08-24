@@ -279,6 +279,63 @@ impl<L: ReplicatedLog<Key = String>> SessionStore for ReplicatedSessionStore<L> 
         Ok(Enqueued::Stored { offset, evicted })
     }
 
+    async fn submit_enqueue_with_expiry(
+        &self,
+        client: &ClientId,
+        message: &Message,
+        expiry_at: Option<u64>,
+    ) -> crate::PendingEnqueue {
+        // The two-phase split (ADR 0075): everything that must happen in
+        // submission order — cap policy, tier selection, offset assignment —
+        // runs here, mirroring `enqueue_with_expiry` exactly; only the
+        // durability wait rides in the returned pending.
+        let qkey = Self::queue_key(client);
+        let cap = self.limits.max_messages.max(1);
+        let mut evicted = 0u64;
+        match self.log.live_range(&qkey).await {
+            Err(e) => return crate::PendingEnqueue::ready(Err(e.into())),
+            Ok(None) => {}
+            Ok(Some((low, high))) => {
+                let count = usize::try_from(high - low + 1).unwrap_or(usize::MAX);
+                if count >= cap {
+                    match self.limits.overflow {
+                        crate::OverflowPolicy::RejectNewest => {
+                            return crate::PendingEnqueue::ready(Ok(Enqueued::Rejected));
+                        }
+                        crate::OverflowPolicy::DropOldest => {
+                            let evict_count = count - cap + 1;
+                            let up_to = low + evict_count as u64 - 1;
+                            if let Err(e) = self.log.truncate(&qkey, up_to).await {
+                                return crate::PendingEnqueue::ready(Err(e.into()));
+                            }
+                            evicted = evict_count as u64;
+                        }
+                    }
+                }
+            }
+        }
+        let tier = if self.tier_selection {
+            message
+                .app
+                .user_properties
+                .iter()
+                .rev()
+                .find(|(k, _)| k == crate::repl::DURABILITY_PROPERTY)
+                .and_then(|(_, v)| crate::repl::DurabilityTier::parse(v))
+                .unwrap_or_default()
+        } else {
+            crate::repl::DurabilityTier::Quorum
+        };
+        let pending = self
+            .log
+            .submit_tiered(&qkey, encode_queued(message, expiry_at), tier)
+            .await;
+        crate::PendingEnqueue::new(async move {
+            let offset = pending.await?;
+            Ok(Enqueued::Stored { offset, evicted })
+        })
+    }
+
     async fn pending(
         &self,
         client: &ClientId,

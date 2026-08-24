@@ -147,6 +147,60 @@ pub enum Enqueued {
     Rejected,
 }
 
+/// The durability wait of a two-phase enqueue (ADR 0075): resolves to what
+/// [`SessionStore::enqueue_with_expiry`] would have returned, once the append
+/// is durable per its tier. `'static` by construction — it captures no borrow
+/// of the store — so a session lane may hold several in flight while
+/// continuing to submit in order.
+pub struct PendingEnqueue(
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<Enqueued, StorageError>> + Send>>,
+);
+
+impl std::fmt::Debug for PendingEnqueue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PendingEnqueue")
+    }
+}
+
+impl PendingEnqueue {
+    /// An already-resolved pending — the one-shot (default) backend shape.
+    #[must_use]
+    pub fn ready(result: Result<Enqueued, StorageError>) -> Self {
+        Self(Box::pin(std::future::ready(result)))
+    }
+
+    /// Wrap a future as the durability wait.
+    #[must_use]
+    pub fn new(
+        fut: impl std::future::Future<Output = Result<Enqueued, StorageError>> + Send + 'static,
+    ) -> Self {
+        Self(Box::pin(fut))
+    }
+
+    /// The result, if already resolved — one poll with a no-op waker. The
+    /// eager (default) backends resolve at construction, and a driver that
+    /// completes those inline instead of scheduling a task for them keeps the
+    /// non-pipelined paths byte-for-byte on their old timing (ADR 0075).
+    pub fn try_ready(&mut self) -> Option<Result<Enqueued, StorageError>> {
+        let waker = std::task::Waker::noop();
+        let mut cx = std::task::Context::from_waker(waker);
+        match std::future::Future::poll(std::pin::Pin::new(self), &mut cx) {
+            std::task::Poll::Ready(r) => Some(r),
+            std::task::Poll::Pending => None,
+        }
+    }
+}
+
+impl std::future::Future for PendingEnqueue {
+    type Output = Result<Enqueued, StorageError>;
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        self.0.as_mut().poll(cx)
+    }
+}
+
 /// What the inbound QoS-2 dedup window already knew about a packet id
 /// ([`SessionStore::record_received`]).
 ///
@@ -331,6 +385,26 @@ pub trait SessionStore: Send + Sync + std::fmt::Debug {
         message: &Message,
         expiry_at: Option<u64>,
     ) -> Result<Enqueued, StorageError>;
+
+    /// Two-phase [`enqueue_with_expiry`](Self::enqueue_with_expiry) (ADR 0075):
+    /// the call is the ordered SUBMIT — queue-cap policy, tier selection and
+    /// offset assignment happen before it returns — and the returned
+    /// [`PendingEnqueue`] resolves once the append is durable per its tier.
+    /// A session's submits must be made in delivery order; the waits may then
+    /// overlap, which is what lets a publisher's whole window replicate
+    /// concurrently instead of one round trip at a time.
+    ///
+    /// The default performs the whole enqueue eagerly and returns an
+    /// already-resolved pending — non-clustered backends stay exactly as
+    /// before.
+    async fn submit_enqueue_with_expiry(
+        &self,
+        client: &ClientId,
+        message: &Message,
+        expiry_at: Option<u64>,
+    ) -> PendingEnqueue {
+        PendingEnqueue::ready(self.enqueue_with_expiry(client, message, expiry_at).await)
+    }
 
     /// Replay undelivered messages with offset strictly greater than `after`, up
     /// to `limit` items, in offset order. Used on reconnect / takeover.

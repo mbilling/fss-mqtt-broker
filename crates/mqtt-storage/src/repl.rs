@@ -176,6 +176,25 @@ pub trait ReplicatedLog: Send + Sync + std::fmt::Debug {
         self.append(key, record).await
     }
 
+    /// Two-phase [`append_tiered`](Self::append_tiered) (ADR 0075): the call
+    /// itself is the ordered, cheap SUBMIT — offset assignment and entry into
+    /// the durability machinery happen before it returns — and the returned
+    /// [`PendingAppend`] resolves once the record is durable per the tier.
+    /// Submitting in call order is what fixes the offset (= delivery) order;
+    /// the waits may then overlap freely.
+    ///
+    /// The default performs the whole append eagerly and returns an
+    /// already-resolved pending — a backend that does not override this is
+    /// exactly as serial (and exactly as correct) as before.
+    async fn submit_tiered(
+        &self,
+        key: &Self::Key,
+        record: Vec<u8>,
+        tier: DurabilityTier,
+    ) -> PendingAppend {
+        PendingAppend::ready(self.append_tiered(key, record, tier).await)
+    }
+
     /// Read entries with offset strictly greater than `after`, up to `limit`, in
     /// offset order. `after = 0` starts from the beginning of the retained log.
     async fn read(
@@ -265,6 +284,56 @@ impl<L: ReplicatedLog + ?Sized> ReplicatedLog for std::sync::Arc<L> {
 
     async fn epoch_for(&self, key: &Self::Key) -> Result<u64, ReplError> {
         (**self).epoch_for(key).await
+    }
+
+    async fn submit_tiered(
+        &self,
+        key: &Self::Key,
+        record: Vec<u8>,
+        tier: DurabilityTier,
+    ) -> PendingAppend {
+        (**self).submit_tiered(key, record, tier).await
+    }
+}
+
+/// The durability wait of a two-phase append (ADR 0075): resolves to the
+/// assigned offset once the record is durable per the tier the submit named,
+/// or the error the append would have returned. `'static` by construction —
+/// it captures no borrow of the log — so a caller may hold several in flight
+/// while continuing to submit.
+pub struct PendingAppend(
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<Offset, ReplError>> + Send>>,
+);
+
+impl std::fmt::Debug for PendingAppend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PendingAppend")
+    }
+}
+
+impl PendingAppend {
+    /// An already-resolved pending — the one-shot (default) backend shape.
+    #[must_use]
+    pub fn ready(result: Result<Offset, ReplError>) -> Self {
+        Self(Box::pin(std::future::ready(result)))
+    }
+
+    /// Wrap a future as the durability wait.
+    #[must_use]
+    pub fn new(
+        fut: impl std::future::Future<Output = Result<Offset, ReplError>> + Send + 'static,
+    ) -> Self {
+        Self(Box::pin(fut))
+    }
+}
+
+impl std::future::Future for PendingAppend {
+    type Output = Result<Offset, ReplError>;
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        self.0.as_mut().poll(cx)
     }
 }
 

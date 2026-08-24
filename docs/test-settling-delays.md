@@ -35,6 +35,7 @@ caller changes this file and the gate fails until it is regenerated and re-read.
 | --- | --- | --- | --- | --- |
 | `crates/mqtt-bridge/tests/engine.rs` | `a_full_spool_must_not_shed_a_message_the_bridge_already_accepted` | `bridge-spool-refusal` | 20ms | in the test itself |
 | `crates/mqtt-cluster/src/cluster_log.rs` | `deliver` | `local-tier-slow-followers` | 400ms | helper, 17 call site(s) |
+| `crates/mqtt-cluster/src/cluster_log.rs` | `pipelined_appends_overlap_and_commit_in_offset_order` | `pipelined-commit-holdback` | 100ms | in the test itself |
 | `crates/mqttd/src/admission.rs` | `the_penalty_decays_back_to_admission` | `admission-penalty-decay` | 120ms | in the test itself |
 | `crates/mqttd/src/http_auth.rs` | `the_cache_expires_and_is_bounded` | `http-auth-cache-ttl` | 80ms | in the test itself |
 | `crates/mqttd/src/hub/mod.rs` | `enqueue_with_expiry` | `store-slow-first-enqueue` | ? | helper, 7 call site(s) |

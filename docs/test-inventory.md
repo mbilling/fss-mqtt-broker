@@ -241,16 +241,18 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `two_bridge_instances_do_not_duplicate_forwarding`
 - `two_partitioned_instances_deliver_each_inbound_message_exactly_once`
 
-## `crates/mqtt-cluster/src/lib.rs` — 273 test(s)
+## `crates/mqtt-cluster/src/lib.rs` — 276 test(s)
 
 - `cluster_identity::tests::a_founder_mints_once_and_reloads_stably`
 - `cluster_identity::tests::a_joiner_adopts_once_and_persists`
 - `cluster_identity::tests::two_foundings_yield_distinct_ids`
 - `cluster_log::tests::a_durable_session_log_survives_a_full_restart_via_persisted_replicas`
+- `cluster_log::tests::a_failed_pipelined_append_fails_the_staged_tail_and_leaves_no_hole`
 - `cluster_log::tests::a_foreign_replica_schema_version_fails_closed`
 - `cluster_log::tests::a_groups_fence_does_not_reject_another_groups_older_epoch`
 - `cluster_log::tests::a_local_tier_append_returns_on_the_owners_durability_alone`
 - `cluster_log::tests::a_replica_keeps_the_newer_version_of_an_offset`
+- `cluster_log::tests::an_earlier_pipelined_append_is_unaffected_by_a_later_failure`
 - `cluster_log::tests::an_empty_recommit_still_requires_a_write_quorum`
 - `cluster_log::tests::an_empty_recovered_log_still_fences_the_old_owner`
 - `cluster_log::tests::append_below_quorum_is_rejected_and_leaves_no_committed_hole`
@@ -269,6 +271,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `cluster_log::tests::merge_stops_at_gaps_and_handles_truncation`
 - `cluster_log::tests::merge_takes_the_contiguous_run_from_a_quorum`
 - `cluster_log::tests::merge_truncates_a_tail_whose_tag_regresses`
+- `cluster_log::tests::pipelined_appends_overlap_and_commit_in_offset_order`
 - `cluster_log::tests::recommit_requires_a_write_quorum_for_the_recovered_base`
 - `cluster_log::tests::recovered_log_serves_seeded_entries_and_continues`
 - `cluster_log::tests::replica_state_survives_reopen`

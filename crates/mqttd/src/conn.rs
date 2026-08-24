@@ -1543,6 +1543,95 @@ fn negotiate_v5_properties(
 }
 
 #[allow(clippy::too_many_arguments)] // a connection's full serving context
+/// One inbound `QoS` 1 publish whose durability round trip is still in flight
+/// (ADR 0075): the PUBACK is written by `serve`'s drain branch — strictly in
+/// publish order — once the hub answers. `done: None` is an ack whose verdict
+/// was decided at receipt (an ACL denial): it still rides the queue so acks
+/// can never overtake each other.
+struct PendingPuback {
+    ack: mqtt_codec::packet::Ack,
+    done: Option<oneshot::Receiver<crate::hub::PublishOutcome>>,
+}
+
+/// Hard cap on a connection's pipelined `QoS` 1 acks: beyond it the reader
+/// resolves the oldest inline before parking another (backpressure), bounding
+/// per-connection memory for clients that ignore flow control (v3.1.1 has no
+/// Receive Maximum to police them with).
+const CONN_ACK_PIPELINE_MAX: usize = 256;
+
+/// Apply the hub's outcome to a parked ack. `true` = write it; `false` = the
+/// connection must close without one (hub gone mid-shutdown, or a refusal
+/// v3.1.1 can only say by hanging up) — the publisher retries, fail closed.
+fn apply_publish_outcome(
+    entry: &mut PendingPuback,
+    outcome: Result<crate::hub::PublishOutcome, ()>,
+    is_v5: bool,
+    client: &ClientId,
+) -> bool {
+    match outcome {
+        // The hub disappearing mid-shutdown means the message may never be
+        // stored: close without a PUBACK rather than acknowledge a message
+        // that could be lost.
+        Err(()) => false,
+        Ok(crate::hub::PublishOutcome::Accepted) => true,
+        Ok(crate::hub::PublishOutcome::Refused(r)) => {
+            if is_v5 {
+                entry.ack.reason = r.v5_reason();
+                true
+            } else if r.v311() == crate::hub::Refusal311::CloseNoAck {
+                warn!(client = %client.0, refusal = r.as_str(),
+                      "publish refused and v3.1.1 cannot say so; closing \
+                       without a PUBACK (the publisher retries)");
+                false
+            } else {
+                true
+            }
+        }
+    }
+}
+
+/// Write every ALREADY-RESOLVED parked ack (ADR 0075), front-first, without
+/// waiting. Called before any outbound packet is written: the hub releases a
+/// publish's ack before it queues the fan-out deliveries, so flushing here
+/// keeps the old observable order — a message's own PUBACK still precedes any
+/// delivery that followed from it. Returns `false` when the connection must
+/// close (hub gone / v3.1.1 close-no-ack).
+async fn flush_ready_pubacks<W: AsyncWrite + Unpin>(
+    writer: &mut FrameWriter<W>,
+    current: &mut Option<PendingPuback>,
+    pending: &mut std::collections::VecDeque<PendingPuback>,
+    qos2_inflight: &mut usize,
+    is_v5: bool,
+    client: &ClientId,
+) -> Result<bool, NetError> {
+    loop {
+        if current.is_none() {
+            *current = pending.pop_front();
+        }
+        let Some(entry) = current.as_mut() else {
+            return Ok(true);
+        };
+        let outcome = match &mut entry.done {
+            None => Ok(crate::hub::PublishOutcome::Accepted),
+            Some(rx) => match rx.try_recv() {
+                Ok(v) => Ok(v),
+                Err(oneshot::error::TryRecvError::Empty) => return Ok(true),
+                Err(oneshot::error::TryRecvError::Closed) => Err(()),
+            },
+        };
+        let mut entry = current.take().expect("checked above");
+        *qos2_inflight = qos2_inflight.saturating_sub(1);
+        if !apply_publish_outcome(&mut entry, outcome, is_v5, client) {
+            return Ok(false);
+        }
+        writer.send(&Packet::PubAck(entry.ack)).await?;
+    }
+}
+
+// The connection's one event loop: keepalive, inbound, outbound, and (since
+// ADR 0075) the ordered puback drain are a single select by design — splitting
+// it would scatter the borrow discipline the drain depends on.
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 async fn serve<R, W>(
     reader: &mut FrameReader<R>,
     writer: &mut FrameWriter<W>,
@@ -1585,13 +1674,23 @@ where
     // connection; a persistent session's window lives in the store.
     let mut qos2_inbound: HashMap<u16, bool> = HashMap::new();
     // Count of distinct unreleased inbound QoS>0 publishes — the client's outstanding
-    // window against the server's Receive Maximum (ADR 0012). QoS 1 is acked inline so
-    // never accumulates; QoS 2 holds a slot from PUBLISH until PUBREL. Overrun → 0x93.
+    // window against the server's Receive Maximum (ADR 0012). A QoS 1 publish holds a
+    // slot until its pipelined PUBACK is written (ADR 0075); QoS 2 holds one from
+    // PUBLISH until PUBREL. Overrun → 0x93.
     let mut qos2_inflight: usize = 0;
     // Per-connection publish-rate limiter (ADR 0041 T3); `None` = unlimited.
     let mut publish_rate = wire_limits().publish_rate.map(PublishRateLimiter::new);
+    // Pipelined QoS 1 acks (ADR 0075): parked in publish order; only the
+    // promoted FRONT (`current`) is awaited, so acks can never reorder and
+    // the drain future borrows nothing the other branches' handlers touch.
+    let mut pending_pubacks: std::collections::VecDeque<PendingPuback> =
+        std::collections::VecDeque::new();
+    let mut current: Option<PendingPuback> = None;
 
     loop {
+        if current.is_none() {
+            current = pending_pubacks.pop_front();
+        }
         let idle = async {
             match deadline {
                 Some(d) => tokio::time::sleep_until(d).await,
@@ -1650,7 +1749,7 @@ where
                         // [MQTT-3.14.4-3]); so is a v5 DISCONNECT with a non-zero
                         // reason, where the CLIENT asks for its Will (issue #265,
                         // [MQTT-3.1.2-10]).
-                        match handle_inbound(packet, writer, hub, client, &principal, policy, &mut qos2_inbound, &mut qos2_inflight, is_v5, inbound_aliases, session_expiry, session_expiry_override).await? {
+                        match handle_inbound(packet, writer, hub, client, &principal, policy, &mut qos2_inbound, &mut qos2_inflight, &mut pending_pubacks, &mut current, is_v5, inbound_aliases, session_expiry, session_expiry_override).await? {
                             PacketOutcome::Continue => {}
                             PacketOutcome::ClientDisconnect => return Ok(true),
                             PacketOutcome::ClientDisconnectWithWill
@@ -1659,6 +1758,24 @@ where
                     }
                 }
             }
+            outcome = async {
+                let entry = current.as_mut().expect("branch guarded on is_some");
+                match &mut entry.done {
+                    None => Ok(crate::hub::PublishOutcome::Accepted),
+                    Some(rx) => rx.await.map_err(|_| ()),
+                }
+            }, if current.is_some() => {
+                let mut entry = current.take().expect("guarded");
+                qos2_inflight = qos2_inflight.saturating_sub(1);
+                if !apply_publish_outcome(&mut entry, outcome, is_v5, client) {
+                    return Ok(false);
+                }
+                writer.send(&Packet::PubAck(entry.ack)).await?;
+                // A client whose window is exhausted is WAITING ON US — the old
+                // inline await never ran the keepalive check during that wait,
+                // so writing an ack extends the deadline to keep the tolerance.
+                deadline = grace.map(|g| Instant::now() + g);
+            }
             maybe_out = out_rx.recv() => {
                 // Metered on the packet AS RECEIVED — before the topic-alias rewrite
                 // below, which only shrinks it: add and subtract are then the same pure
@@ -1666,6 +1783,22 @@ where
                 // return to zero instead of drifting (issue #241).
                 if let Some(pkt) = &maybe_out {
                     out_meter.drained(pkt);
+                }
+                // Acks already resolved leave BEFORE this outbound packet (ADR
+                // 0075): the hub releases a publish's ack before queueing its
+                // fan-out, so this preserves the old order — a message's own
+                // PUBACK precedes any delivery that followed from it.
+                if !flush_ready_pubacks(
+                    writer,
+                    &mut current,
+                    &mut pending_pubacks,
+                    &mut qos2_inflight,
+                    is_v5,
+                    client,
+                )
+                .await?
+                {
+                    return Ok(false);
                 }
                 match maybe_out {
                     // Rewrite outbound PUBLISHes to use topic aliases where the
@@ -1754,6 +1887,8 @@ async fn handle_publish<W: AsyncWrite + Unpin>(
     policy: &ConnPolicy,
     qos2_inbound: &mut HashMap<u16, bool>,
     qos2_inflight: &mut usize,
+    pending_pubacks: &mut std::collections::VecDeque<PendingPuback>,
+    current_puback: &mut Option<PendingPuback>,
     is_v5: bool,
     inbound_aliases: &mut InboundAliases,
 ) -> Result<PacketOutcome, NetError> {
@@ -1870,40 +2005,41 @@ async fn handle_publish<W: AsyncWrite + Unpin>(
                 return Ok(PacketOutcome::BrokerClose);
             }
             let mut ack = mqtt_codec::packet::Ack::from(id);
-            if let Some(done) = forward(hub) {
-                // The hub disappearing mid-shutdown means the message may never be
-                // stored: close without a PUBACK (the publisher retries) rather than
-                // acknowledge a message that could be lost.
-                match done.await {
-                    Err(_) => return Ok(PacketOutcome::BrokerClose),
-                    Ok(crate::hub::PublishOutcome::Accepted) => {}
-                    // The hub refused the publish under a stated policy (ADR 0041
-                    // T4 retained quota, T11 brownout). v5 carries the reason on the
-                    // PUBACK; v3.1.1 has no reason byte, so each refusal declares
-                    // whether it is sayable as a plain ack or only as no-ack-and-close.
-                    // No Reason String property is attached: nothing here tracks
-                    // Request Problem Information, and sending one unconditionally
-                    // would violate [MQTT-3.1.2-29].
-                    Ok(crate::hub::PublishOutcome::Refused(r)) => {
-                        if is_v5 {
-                            ack.reason = r.v5_reason();
-                        } else if r.v311() == crate::hub::Refusal311::CloseNoAck {
-                            warn!(client = %client.0, refusal = r.as_str(),
-                                  "publish refused and v3.1.1 cannot say so; closing \
-                                   without a PUBACK (the publisher retries)");
-                            return Ok(PacketOutcome::BrokerClose);
-                        }
-                    }
-                }
-            } else if is_v5 {
-                // The ACL denied this publish (`forward` returned `None`) and v5
-                // can say so: PUBACK 0x87 Not authorized (issue #246). Per-publish,
-                // not a connection verdict — the connection stays open. v3.1.1
-                // falls through to the plain ack: it has no reason byte, and a
-                // retry cannot change an ACL decision.
+            // ADR 0075: park the ack and keep reading, so the publisher's whole
+            // window replicates concurrently instead of one round trip at a
+            // time. `serve`'s drain branch writes the PUBACK — strictly in
+            // publish order — once the hub answers; the refusal handling (ADR
+            // 0041 T4/T11: v5 reason on the ack, v3.1.1 close-no-ack) moved
+            // with it into `apply_publish_outcome`, verbatim. An ACL denial
+            // (`forward` = `None`, issue #246) rides the same queue with its
+            // verdict pre-decided, so acks can never overtake each other.
+            let done = forward(hub);
+            if done.is_none() && is_v5 {
                 ack.reason = mqtt_codec::reason::NOT_AUTHORIZED;
             }
-            writer.send(&Packet::PubAck(ack)).await?;
+            // Backpressure: past the cap, resolve the oldest inline before
+            // parking another — same order, bounded memory.
+            while pending_pubacks.len() + usize::from(current_puback.is_some())
+                >= CONN_ACK_PIPELINE_MAX
+            {
+                let mut entry = match current_puback.take() {
+                    Some(e) => e,
+                    None => pending_pubacks
+                        .pop_front()
+                        .expect("cap check implies non-empty"),
+                };
+                let outcome = match &mut entry.done {
+                    None => Ok(crate::hub::PublishOutcome::Accepted),
+                    Some(rx) => rx.await.map_err(|_| ()),
+                };
+                *qos2_inflight = qos2_inflight.saturating_sub(1);
+                if !apply_publish_outcome(&mut entry, outcome, is_v5, client) {
+                    return Ok(PacketOutcome::BrokerClose);
+                }
+                writer.send(&Packet::PubAck(entry.ack)).await?;
+            }
+            *qos2_inflight += 1;
+            pending_pubacks.push_back(PendingPuback { ack, done });
         }
         (QoS::ExactlyOnce, Some(id)) => {
             // Exactly-once inbound [MQTT-4.3.3-2]: forward only the first
@@ -2166,6 +2302,8 @@ async fn handle_inbound<W: AsyncWrite + Unpin>(
     policy: &ConnPolicy,
     qos2_inbound: &mut HashMap<u16, bool>,
     qos2_inflight: &mut usize,
+    pending_pubacks: &mut std::collections::VecDeque<PendingPuback>,
+    current_puback: &mut Option<PendingPuback>,
     is_v5: bool,
     inbound_aliases: &mut InboundAliases,
     // The interval agreed at CONNECT, needed to spot the zero-to-non-zero
@@ -2189,6 +2327,8 @@ async fn handle_inbound<W: AsyncWrite + Unpin>(
                 policy,
                 qos2_inbound,
                 qos2_inflight,
+                pending_pubacks,
+                current_puback,
                 is_v5,
                 inbound_aliases,
             )

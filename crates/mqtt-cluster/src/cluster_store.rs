@@ -31,7 +31,7 @@ use crate::lease_store::LeaseStore;
 use crate::placement::{group_of_key, Placement};
 use crate::NodeId;
 use async_trait::async_trait;
-use mqtt_storage::repl::{DurabilityTier, LogEntry, ReplError, ReplicatedLog};
+use mqtt_storage::repl::{DurabilityTier, LogEntry, PendingAppend, ReplError, ReplicatedLog};
 use mqtt_storage::Offset;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, RwLock};
@@ -576,6 +576,21 @@ impl<S: LeaseSource, T: ReplicaTransport + Clone + 'static> ReplicatedLog for Gr
             .await?
             .append_tiered(key, record, tier)
             .await
+    }
+
+    async fn submit_tiered(
+        &self,
+        key: &String,
+        record: Vec<u8>,
+        tier: DurabilityTier,
+    ) -> PendingAppend {
+        // Two-phase append (ADR 0075), same floor gating as `append_tiered`:
+        // routing and the min-replicas write floor are decided at submit time;
+        // only the durability wait rides in the pending.
+        match self.log_for_key(key, true).await {
+            Ok(log) => log.submit_tiered(key, record, tier).await,
+            Err(e) => PendingAppend::ready(Err(e)),
+        }
     }
 
     async fn read(

@@ -82,6 +82,7 @@
 | [0072](../adr/0072-per-message-durability-selection.md) | # 0072. Per-message durability selection: the `mqttd-durability` user property | Accepted | [1/2 done](0072-per-message-durability-selection.md) | 1 open |
 | [0073](../adr/0073-scale-out-durable-ownership.md) | # 0073. Scale-out durable ownership: the voter set is a control plane, not the data path | Accepted | [3/4 done](0073-scale-out-durable-ownership.md) | 1 open |
 | [0074](../adr/0074-detached-ack-truncate.md) | # 0074. The subscriber-ack truncate leaves the hub loop's critical path | Accepted | [2/2 done](0074-detached-ack-truncate.md) | — |
+| [0075](../adr/0075-pipelined-durable-appends.md) | # 0075. Pipelined durable appends — the window stops paying the round trip per message | Accepted | [1/1 done](0075-pipelined-durable-appends.md) | — |
 
 ## Open and deferred work
 
