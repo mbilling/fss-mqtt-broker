@@ -2809,6 +2809,11 @@ mod tests {
         // offset 1 is still pending.
         gate.release(3, true);
         gate.release(2, true);
+        // SETTLE(pipelined-commit-holdback): the wait IS the assertion window for
+        // a must-NOT-happen — offsets 2/3 completing while offset 1 is pending.
+        // There is no observable to poll (we assert absence); a slower machine
+        // only narrows the window, which can only make the check more lenient,
+        // never flaky. The positive half (completion order) is asserted after.
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         assert!(
             done.lock().unwrap().is_empty(),
