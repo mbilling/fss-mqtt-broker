@@ -57,11 +57,15 @@ elif [ "${STANDARD:-0}" = 1 ]; then
 	# regression gate makes and a published curve does not.
 	LANE_B_RUNGS=(50000 150000 300000)
 	LANE_B_SECS=45
-	LANE_C_CONNS=50000
-	LANE_C_RAMP=2500
-	LANE_C_HOLD=60
 	A_REPS=1 A_SECS=45 A_WARMUP=10
 	BARRIER_OPS=150
+	# Lane C does NOT run in this profile — `run.sh standard` sets LANES=AB.
+	# These exist only so an explicit `LANES=ABC ./run.sh standard` still has
+	# them defined (this script runs under `set -u`); at the full profile's
+	# hold, since a deliberately re-enabled lane should measure, not sample.
+	LANE_C_CONNS=50000
+	LANE_C_RAMP=2500
+	LANE_C_HOLD=120
 else
 	# Overridable for a focused knee hunt (issue #258 follow-up: the 7-node
 	# fan-out plateau at ~140k with idle aggregate CPU): a space-separated
