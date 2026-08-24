@@ -80,6 +80,16 @@ pub(super) struct PendingPublish {
     /// only the ack's meaning is weakened, at the publisher's explicit request.
     /// A refusal decided at the plan pass (brownout) still refuses.
     pub(super) relaxed: bool,
+    /// The relaxed congestion valve (issue #399): set at submit time when any
+    /// of this publish's append lanes was already past the soft depth
+    /// threshold. A congested relaxed publish completes by the QUORUM rule
+    /// (ack after its appends land), so the publisher's window throttles to
+    /// the drain rate BEFORE the lanes overflow — without it, instant acks
+    /// refill the window forever, the bounded lanes overflow, and every
+    /// overflow fails the publish and closes the connection (the measured
+    /// reconnect storm). Relaxed grants latency below congestion, not
+    /// immunity from capacity.
+    pub(super) congested: bool,
 }
 
 /// One outstanding cross-node obligation of a gated publish (ADR 0042 T9 exhibit ⑤;
@@ -409,6 +419,7 @@ impl Hub {
                 // every early publish for nothing.
                 awaiting_settle: self.routing_unsettled(),
                 relaxed: false,
+                congested: false,
             },
         );
         id

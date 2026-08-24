@@ -5334,7 +5334,10 @@ impl Hub {
     fn try_complete_pending(&mut self, id: u64) {
         let complete = self.pending_publishes.get(&id).is_some_and(|p| {
             p.local_done
-                && (p.relaxed // ADR 0072: relaxed acks at submit; obligations still run
+                && ((p.relaxed && !p.congested) // ADR 0072: relaxed acks at submit;
+                    // obligations still run. A CONGESTED relaxed publish (issue
+                    // #399) falls through to the quorum rule below — the valve
+                    // that keeps relaxed windows from overflowing the lanes.
                     || (p.appends_outstanding == 0
                         && !p.awaiting_retained
                         && !p.awaiting_settle
@@ -15067,6 +15070,80 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+    }
+
+    /// Issue #399 — the relaxed congestion valve: a relaxed publish whose
+    /// append lane is already at [`crate::hub::lanes::RELAXED_CONGESTION_DEPTH`] does NOT
+    /// ack at submit — it completes by the quorum rule, after its append
+    /// lands. Without the valve, instant acks refill the publisher's window
+    /// forever while the bounded lane only drains at disk speed; the lane
+    /// overflows, the overflow fails the publish and closes the connection,
+    /// and the curve measured the resulting reconnect storm. Relaxed grants
+    /// latency below congestion, not immunity from capacity.
+    #[tokio::test]
+    async fn a_congested_relaxed_publish_waits_for_its_append() {
+        let store = ParkingStore::new();
+        let release = store.park("r");
+        let (mut hub, tx) = Hub::with_config(NodeId("hub-test".into()), store.clone());
+        hub.set_allow_relaxed_publish(true);
+        tokio::spawn(hub.run());
+
+        let (_rx, _) = attach(&tx, "r", 1, false).await;
+        subscribe_qos(&tx, "r", "rt/t", QoS::AtLeastOnce);
+        detach(&tx, "r", 1);
+
+        // Park the lane at the threshold: after these strict publishes, the
+        // NEXT submit observes a depth of exactly RELAXED_CONGESTION_DEPTH.
+        for i in 0..(crate::hub::lanes::RELAXED_CONGESTION_DEPTH - 1) {
+            tx.send(HubCommand::Publish {
+                topic: "rt/t".into(),
+                payload: Bytes::from(format!("fill{i}")),
+                qos: QoS::AtLeastOnce,
+                retain: false,
+                message_expiry: None,
+                app: mqtt_core::AppProperties::default(),
+                done: None,
+                v5: true,
+                publisher: None,
+            })
+            .unwrap();
+        }
+
+        let (done_tx, done_rx) = oneshot::channel();
+        tx.send(HubCommand::Publish {
+            topic: "rt/t".into(),
+            payload: Bytes::from_static(b"throttled"),
+            qos: QoS::AtLeastOnce,
+            retain: false,
+            message_expiry: None,
+            app: mqtt_core::AppProperties {
+                user_properties: vec![("mqttd-durability".into(), "relaxed".into())],
+                ..Default::default()
+            },
+            done: Some(done_tx),
+            v5: true,
+            publisher: None,
+        })
+        .unwrap();
+
+        // The valve holds the ack: no early completion while the lane drains.
+        let mut done_rx = done_rx;
+        assert!(
+            timeout(Duration::from_millis(300), &mut done_rx)
+                .await
+                .is_err(),
+            "a congested relaxed publish must NOT ack at submit — that instant \
+             refill is exactly the overflow-then-conn-close storm of issue #399"
+        );
+
+        // Releasing the store drains the lane; the ack now arrives by the
+        // quorum rule — throttled, never refused.
+        release.send(true).unwrap();
+        let out = timeout(Duration::from_secs(5), done_rx)
+            .await
+            .expect("a congested relaxed publish completes once its append lands")
+            .unwrap();
+        assert_eq!(out, PublishOutcome::Accepted);
     }
 
     /// ADR 0072 — the `mqttd-durability` property is INERT without the operator

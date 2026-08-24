@@ -30,3 +30,12 @@ frontmatter above · this file is the plan, progress log, and changelog.
 
 - **2026-08-21** — T1 shipped: quorum | local | relaxed, double opt-in
   (publisher property + operator knob), no wire change anywhere.
+- **2026-08-24** — Congestion valve (issue #399, ADR amendment): a gated
+  submit that finds its append lane at ≥ half the lane cap marks the publish
+  congested; a congested relaxed publish completes by the quorum rule, so the
+  publisher's window throttles to the drain rate BEFORE the lane overflows
+  (overflow fails the publish and closes the connection — the v1.0.5 curve's
+  relaxed-arm reconnect storm). Below the threshold the tier is untouched.
+  Test: a_congested_relaxed_publish_waits_for_its_append (lane parked at the
+  threshold: the relaxed ack does NOT arrive in 300ms, then arrives after the
+  store releases).

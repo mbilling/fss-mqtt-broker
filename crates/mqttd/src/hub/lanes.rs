@@ -177,6 +177,15 @@ pub(super) struct RemoteAppendGate {
 /// session spends up to half its headroom on records.
 pub(super) const LANE_QUEUE_CAP: usize = 256;
 
+/// The relaxed tier's congestion threshold (issue #399): a gated submit that
+/// finds its lane already this deep marks the publish CONGESTED, and a
+/// congested relaxed publish completes by the quorum rule — the publisher's
+/// window then throttles to the drain rate instead of refilling instantly and
+/// overflowing the lane (which fails the publish and closes the connection).
+/// Half the cap: early enough that the valve engages well before overflow,
+/// late enough that an uncongested relaxed publisher never feels it.
+pub(super) const RELAXED_CONGESTION_DEPTH: usize = LANE_QUEUE_CAP / 2;
+
 /// WHO is told about this fan-out's outcome — threaded from each entry point down to
 /// [`Hub::deliver_to_client`], where it becomes the submitted job's [`AppendThen`].
 /// Replaces the old bare `answerable` flag: with appends completing asynchronously
@@ -664,7 +673,11 @@ impl Hub {
             }
             return Submitted::Full;
         }
-        self.lane_for(&client).outstanding += 1;
+        let lane_depth = {
+            let lane = self.lane_for(&client);
+            lane.outstanding += 1;
+            lane.outstanding
+        };
         // Record the obligation SYNCHRONOUSLY, inside the same dispatch that
         // created the gate, so no interleaved command can observe the gate
         // with obligations not yet registered (ACK-AFTER-DURABLE, #124).
@@ -672,6 +685,12 @@ impl Hub {
             AppendThen::Gate(id) => {
                 if let Some(p) = self.pending_publishes.get_mut(&id) {
                     p.appends_outstanding += 1;
+                    // The relaxed congestion valve (issue #399): a deep lane
+                    // downgrades THIS publish's relaxed completion to the
+                    // quorum rule, throttling the window before overflow.
+                    if lane_depth >= RELAXED_CONGESTION_DEPTH {
+                        p.congested = true;
+                    }
                 }
             }
             AppendThen::Peer(node, seq) => {

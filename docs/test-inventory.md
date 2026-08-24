@@ -865,7 +865,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 340 test(s)
+## `crates/mqttd/src/lib.rs` — 341 test(s)
 
 - `admission::tests::the_global_cap_refuses_at_the_bound_and_recovers`
 - `admission::tests::the_penalty_box_refuses_after_the_threshold`
@@ -1003,6 +1003,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::a_co_subscribed_filter_releases_the_ack_while_a_moved_durable_copy_is_lost`
 - `hub::tests::a_committed_clear_back_fills_as_a_tombstone_and_fences`
 - `hub::tests::a_committed_retained_publish_fans_out_with_its_token`
+- `hub::tests::a_congested_relaxed_publish_waits_for_its_append`
 - `hub::tests::a_crashed_hub_releases_the_store_so_the_node_can_restart`
 - `hub::tests::a_cross_node_shared_delivery_is_answered_and_reselects_before_refusing`
 - `hub::tests::a_detach_spill_rides_the_lane_keeping_the_loop_live_and_replay_order`
