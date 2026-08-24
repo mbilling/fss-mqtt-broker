@@ -12,8 +12,13 @@ Honesty mechanics, enforced here rather than remembered:
     probes (DURABLE-PATH.md's prerequisite for interpreting fsync-bound numbers).
   - Lane B latency percentiles are histogram BUCKET UPPER BOUNDS, labeled as such.
     Histograms are merged across drivers by summing per-`le` cumulative counts.
-  - A rung where the drivers achieved <97% of the offered rate is DRIVER-LIMITED:
-    printed, excluded from knee detection, never presented as a broker limit.
+  - A rung that did not reach its offered rate is flagged OFFER NOT MET and
+    excluded from knee detection. It is NOT called driver-limited: lane B's
+    publishers are windowed QoS 1, so the shortfall may be the drivers' publish
+    timer OR the brokers throttling the window, and this measurement cannot
+    tell them apart.
+  - Delivery is judged on TOTALS, not on the windowed rates: the publisher and
+    subscriber containers do not share a measurement window.
   - Broker-side counter deltas cross-check driver-reported totals; a mismatch
     beyond ±2% is flagged on the row.
   - durable_bench's own verdicts (violations/caveats) are carried verbatim.
@@ -28,7 +33,7 @@ import sys
 from pathlib import Path
 
 TOLERANCE = 0.02  # counter cross-check band
-DRIVER_OK = 0.97  # a rung counts only if drivers achieved this much of the offer
+DRIVER_OK = 0.97  # a rung counts only if the offered rate was actually reached
 KNEE_OK = 0.99  # delivered/sent ratio a sustained rung must reach
 # Seconds at the END of a rung's driver series that count as the measurement.
 # The rung's opening seconds are ramp (subscribers first, then publishers), and
@@ -207,16 +212,32 @@ def lane_b_rung(rdir: Path, offered: int) -> dict:
     buckets, count = merged_histogram(sorted(rdir.glob("sub-*.prom")))
     broker_recv = counter_delta(rdir, "before", "after", 'mqttd_publish_received_total{qos="1"}')
     flags = []
-    driver_limited = sent_rate < DRIVER_OK * offered
-    if driver_limited:
-        flags.append("DRIVER-LIMITED")
+    # The rung did not reach its offered rate. Deliberately NOT called
+    # "driver-limited": lane B's publishers are windowed QoS 1 (`-F 100`), so a
+    # shortfall is a closed loop with two possible causes — the drivers could
+    # not generate the rate (an integer-millisecond publish timer at a high
+    # rung), or the BROKERS did not ack fast enough and the window throttled the
+    # publishers. This measurement cannot tell those apart, and asserting the
+    # first is how a broker limit hides for a whole campaign. The per-rung
+    # mpstat samples are the evidence that separates them.
+    offer_not_met = sent_rate < DRIVER_OK * offered
+    if offer_not_met:
+        flags.append(f"OFFER NOT MET ({sent_rate / offered * 100:.0f}% of offer)")
     if sent and broker_recv and abs(broker_recv - sent) / sent > TOLERANCE:
         flags.append(f"counter mismatch: broker received {broker_recv:.0f} vs driver sent {sent:.0f}")
     return {
         "offered": offered,
         "sent_rate": sent_rate,
         "recv_rate": recv_rate,
-        "sustained": (not driver_limited) and sent_rate > 0 and recv_rate >= KNEE_OK * sent_rate,
+        # Delivery is judged on TOTALS, never on the windowed rates. The
+        # publisher and subscriber containers do not live on the same clock —
+        # subscribers start first and are stopped last — so a subscriber's
+        # measurement window carries a tail in which the publishers had already
+        # stopped. That drags its RATE ~1.5% below the publishers' while the
+        # totals match to within 0.1%, which was enough to fail a rung that
+        # delivered every message it was sent. Totals have no window to
+        # misalign.
+        "sustained": (not offer_not_met) and sent > 0 and recv >= KNEE_OK * sent,
         "p50": bucket_pct(buckets, count, 0.50),
         "p99": bucket_pct(buckets, count, 0.99),
         "p999": bucket_pct(buckets, count, 0.999),
@@ -388,7 +409,7 @@ def main() -> None:
                 cell += " ⚠ " + "; ".join(r["flags"])
             cells.append(cell)
         print(f"| {offer} | " + " | ".join(cells) + " |")
-    print("\nknee (highest sustained rung, driver-limited rungs excluded):\n")
+    print("\nknee (highest sustained rung; rungs whose offer was not met excluded):\n")
     knee_x, knee_y = [], []
     for n, _ in found:
         sustained = [r for r in c2[n] if r["sustained"]]
