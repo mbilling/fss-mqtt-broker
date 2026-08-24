@@ -577,12 +577,37 @@ fn spawn_replica_writer(
 ) {
     use std::sync::atomic::Ordering::Relaxed;
     let (tx, mut rx) = mpsc::unbounded_channel::<ReplicaWrite>();
+    let linger = linger_fraction();
     let join = tokio::spawn(async move {
+        // The measured mean commit, maintained by this writer for its own
+        // linger (ADR 0076 T3). Starts at zero: the first batch never lingers,
+        // because a linger derived from no measurement is a guess.
+        let mut mean_commit = std::time::Duration::ZERO;
         while let Some(first) = rx.recv().await {
             // Coalesce the current backlog: this op plus everything already queued.
             let mut batch = vec![first];
             while let Ok(next) = rx.try_recv() {
                 batch.push(next);
+            }
+            // ADR 0076 T3, the ADAPTIVE half: after ADR 0075's group commit,
+            // throughput is `batch depth x barrier rate`, and the depth a burst
+            // reaches is whatever arrived during the previous commit. A batch
+            // that starts SHALLOW right before a burst lands pays a whole
+            // barrier for a handful of ops. So when the writer is running hot,
+            // wait a fraction of ONE measured commit and re-drain — the cost is
+            // bounded by a fraction of a barrier this volume already pays, and
+            // only ever spent when a barrier is about to be spent anyway.
+            //
+            // Deliberately NOT engaged at rest: `mean_commit` is zero until a
+            // commit has been measured, and the wait is skipped whenever the
+            // drained batch is a single op (an uncontended writer must keep its
+            // latency exactly as it is today).
+            if linger > 0.0 && batch.len() > 1 && mean_commit > std::time::Duration::ZERO {
+                let wait = mean_commit.mul_f64(linger);
+                tokio::time::sleep(wait).await;
+                while let Ok(next) = rx.try_recv() {
+                    batch.push(next);
+                }
             }
             let mut ops = Vec::with_capacity(batch.len());
             let mut replies = Vec::with_capacity(batch.len());
@@ -608,10 +633,19 @@ fn spawn_replica_writer(
             })
             .await
             .unwrap_or_else(|_| vec![false; n]);
+            let commit = commit_started.elapsed();
             stats.commit_nanos.fetch_add(
-                u64::try_from(commit_started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                u64::try_from(commit.as_nanos()).unwrap_or(u64::MAX),
                 Relaxed,
             );
+            // The linger's own input, kept per writer (ADR 0076 T3): an EWMA of
+            // this shard's commit time, so a volume that degrades lingers
+            // proportionally longer and one that recovers stops.
+            mean_commit = if mean_commit.is_zero() {
+                commit
+            } else {
+                (mean_commit.mul_f64(0.75)) + commit.mul_f64(0.25)
+            };
             for (reply, accepted) in replies.into_iter().zip(results) {
                 let _ = reply.send(accepted);
             }
@@ -621,9 +655,45 @@ fn spawn_replica_writer(
     (tx, abort)
 }
 
+/// How much of ONE measured commit the writer may wait to deepen a batch
+/// (ADR 0076 T3), from `MQTTD_STORE_LINGER` — a fraction in `0.0..=1.0`.
+///
+/// **Default 0 (off).** The linger is an experiment: after ADR 0075 a saturated
+/// writer already reaches ~113 ops per barrier by natural coalescing (every op
+/// arriving during a commit joins the next batch), so there may be nothing left
+/// for a linger to gather. Whether it pays is a measurement, and until that
+/// measurement says yes the default cannot be anything but off.
+fn linger_fraction() -> f64 {
+    let Ok(raw) = std::env::var("MQTTD_STORE_LINGER") else {
+        return 0.0;
+    };
+    match raw.parse::<f64>() {
+        Ok(f) if (0.0..=1.0).contains(&f) => {
+            if f > 0.0 {
+                tracing::warn!(
+                    fraction = f,
+                    "MQTTD_STORE_LINGER engages the EXPERIMENTAL group-commit linger \
+                     (ADR 0076 T3): the durable writer waits this fraction of one \
+                     measured commit before committing a multi-op batch, trading \
+                     latency for batch depth"
+                );
+            }
+            f
+        }
+        _ => {
+            tracing::warn!(
+                value = %raw,
+                "MQTTD_STORE_LINGER is not a fraction in 0.0..=1.0 — ignoring it; the \
+                 writer commits as soon as it has drained the queue"
+            );
+            0.0
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::DurablePlane;
+    use super::{linger_fraction, DurablePlane};
     use crate::cluster_log::{ReplOp, ReplicaState, ReplicaTransport};
     use crate::lease_group::{config, LeaseRaft};
     use crate::lease_raft::LeaseRequest;
@@ -641,6 +711,42 @@ mod tests {
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
     use tokio::sync::mpsc;
+
+    /// ADR 0076 T3: the group-commit linger is OFF unless an operator asks for
+    /// it, and nonsense is ignored rather than guessed at. Off is not a
+    /// preference here — it is the measured answer (the linger cost 13–20% of
+    /// throughput AND latency at every setting tried, because the writer
+    /// already coalesces everything that arrives during a commit).
+    ///
+    /// The env var is process-global, so this test owns it start to finish
+    /// rather than sharing it with a parallel test.
+    #[test]
+    fn the_linger_is_off_unless_asked_for_and_rejects_nonsense() {
+        let restore = std::env::var("MQTTD_STORE_LINGER").ok();
+        // SAFETY-of-intent: single-threaded test, variable restored below.
+        std::env::remove_var("MQTTD_STORE_LINGER");
+        assert!(
+            (linger_fraction() - 0.0).abs() < f64::EPSILON,
+            "unset means off — today's writer, unchanged"
+        );
+        for nonsense in ["yes", "-1", "1.5", ""] {
+            std::env::set_var("MQTTD_STORE_LINGER", nonsense);
+            assert!(
+                (linger_fraction() - 0.0).abs() < f64::EPSILON,
+                "{nonsense:?} is not a fraction in 0.0..=1.0 and must be ignored, \
+                 not rounded into a behaviour change"
+            );
+        }
+        std::env::set_var("MQTTD_STORE_LINGER", "0.25");
+        assert!(
+            (linger_fraction() - 0.25).abs() < f64::EPSILON,
+            "an explicit fraction is honored"
+        );
+        match restore {
+            Some(v) => std::env::set_var("MQTTD_STORE_LINGER", v),
+            None => std::env::remove_var("MQTTD_STORE_LINGER"),
+        }
+    }
 
     fn n(s: &str) -> NodeId {
         NodeId(s.to_string())

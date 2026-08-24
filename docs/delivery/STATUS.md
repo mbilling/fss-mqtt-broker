@@ -83,7 +83,7 @@
 | [0073](../adr/0073-scale-out-durable-ownership.md) | # 0073. Scale-out durable ownership: the voter set is a control plane, not the data path | Accepted | [3/4 done](0073-scale-out-durable-ownership.md) | 1 open |
 | [0074](../adr/0074-detached-ack-truncate.md) | # 0074. The subscriber-ack truncate leaves the hub loop's critical path | Accepted | [2/2 done](0074-detached-ack-truncate.md) | — |
 | [0075](../adr/0075-pipelined-durable-appends.md) | # 0075. Pipelined durable appends — the window stops paying the round trip per message | Accepted | [1/1 done](0075-pipelined-durable-appends.md) | — |
-| [0076](../adr/0076-self-measuring-sharded-store.md) | # 0076. The self-measuring sharded store — the volume's capacity becomes the broker's business | Accepted | [2/3 done](0076-self-measuring-sharded-store.md) | 1 open |
+| [0076](../adr/0076-self-measuring-sharded-store.md) | # 0076. The self-measuring sharded store — the volume's capacity becomes the broker's business | Accepted | [3/3 done](0076-self-measuring-sharded-store.md) | — |
 
 ## Open and deferred work
 
@@ -197,7 +197,3 @@
 **0073 — # 0073. Scale-out durable ownership: the voter set is a control plane, not the data path**
 
 - `0073-T4` ⬜ planned: "The measured slope: 7- and 10-node durable curve, capped vs uncapped ownership A/B on identical hardware; SCALE-CURVE.md + COMPARISON.md publication of the scale-out claim with the up-vs-out economics case" — "Needs the Hetzner quota raise (~100 dedicated vCPU). The PR #375 lease-voters rig variant becomes the A/B control arm; the default arm now measures the ADR 0073 domain."
-
-**0076 — # 0076. The self-measuring sharded store — the volume's capacity becomes the broker's business**
-
-- `0076-T3` ⬜ planned: "Epoch-adaptive coalescing: a per-shard linger derived from the measured commit time, engaged only under saturation, pinnable off"
