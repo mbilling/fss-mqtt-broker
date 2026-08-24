@@ -66,6 +66,24 @@ re-run with `RUN_DIR=.runs/<stamp>` skips sizes already marked done.
 meter is running. Ctrl-C is safe (trapped); `kill -9` is not — after one, run
 `./teardown.sh`.
 
+## Anatomy of one size (what `full` executes, in order)
+
+| step | what | knobs (full profile) |
+|---|---|---|
+| provision | terraform apply, cloud-init (checksum-verified release binary), private-net mesh gate, founder-first bring-up + arm, full-membership gate | one clean+reboot retry per host |
+| barrier probes | `device_barrier_floor` + `store_append_floor` on EVERY broker's data-dir volume — gates Curve 1 | 150 ops |
+| lane A `sat` | durable QoS1 closed loop, spread ownership — the headline row (+ qos2 and clean-session arms inside) | 48 pubs × window 8, 48 subs, 3 reps × 60 s |
+| lane A `lat` | uncontended ack RTT | N pubs × window 1, 3 reps |
+| lane A `tier-local` / `tier-relaxed` | same shape per ADR 0072 tier (`MQTTD_ALLOW_RELAXED_PUBLISH=1`) | sat + lat each |
+| lane A voters variant (N>5 only) | wipe + fresh formation with `MQTTD_LEASE_VOTERS=N` — prices the committee against the ADR 0073 default | sat + lat |
+| re-form (clean mode) | durable plane OFF for the routing-bound lanes | — |
+| lane B | non-durable `$share` fan-out ladder (+ one mTLS rung) | 600 pubs / 300 subs, 20k…300k offered, 60 s/rung |
+| lane C | idle-connection scaling, plaintext + mTLS | 50k conns, ramp 2.5k/s, 120 s hold |
+| teardown | destroy before the next size (fresh clusters only), host logs collected on failure | — |
+
+`smoke` runs the same pipeline with every knob shrunk (1 rep, 15 s, 2k conns) —
+it proves the rig end to end for cents and its numbers are never published.
+
 ## What runs where
 
 - **This machine:** Terraform; PKI minting (`deploy/systemd/gen-certs.sh` — the
