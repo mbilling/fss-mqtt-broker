@@ -3,15 +3,15 @@
 #
 #   export HCLOUD_TOKEN=...     # Read & Write token from a DEDICATED project
 #   ./run.sh smoke              # 1 node, minutes, <€0.50 — proves the whole rig
-#   ./run.sh standard           # the ~€10 release profile: sizes 1, 5, 10
+#   ./run.sh standard           # the release gate: one 10-node cluster, ~30 min
 #   ./run.sh full               # the curve: fresh 1-, 3- and 5-node clusters
 #   ./run.sh full 3 5           # a subset of sizes
 #
-# WHICH PROFILE: `standard` is the default for a release — three sizes (the
-# floor, the voter cap, the biggest cluster we run) with the shape trimmed to
-# what a release claim actually rests on. `full` is for durable-PATH releases,
-# where the tier arms and every rung are themselves the evidence; it costs
-# ~3-4× as much and takes ~3× as long.
+# WHICH PROFILE: `standard` is a REGRESSION GATE — one cluster at the top of our
+# range, measured once (lanes A+B, 1 rep, three rungs, plain posture). It says
+# "nothing got worse" in half an hour. `full` is what PUBLISHED numbers come
+# from and what a release touching the durable path should run: every size,
+# medians over reps, both postures, the tier arms.
 #
 # Each size is applied FRESH and destroyed before the next: a grown cluster is a
 # known-degraded configuration (replica groups tracked under an earlier
@@ -38,21 +38,29 @@ smoke)
 	DRIVER_TYPE="${DRIVER_TYPE:-cpx42}"
 	;;
 standard)
-	# The ~€10 release profile. Same rig, same measurement code, same
-	# dedicated-core machine types — only the SHAPE is trimmed, and only
-	# where the trimmed part is not itself a release claim:
-	#   sizes 1, 5, 10   the floor, the voter cap, and the top of our range
-	#                    (3 and 7 interpolate a line we have measured five
-	#                    times; they come back the moment the line bends)
+	# The short release profile: ONE cluster, one pass, ~25 minutes and a
+	# couple of euros. Same rig, same measurement code, same dedicated-core
+	# machine types — the SHAPE is what shrinks:
+	#   size 10 only     the top of our range, where a regression shows first
+	#                    (the 1- and 5-node points interpolate a line five
+	#                    campaigns have measured; they come back on `full`)
+	#   1 lane-A rep     a point estimate, not a median — enough to catch a
+	#                    regression, not enough to publish a p99
+	#   lanes A + B      the connection lane is skipped entirely: 50k idle
+	#                    connections cost ~4 minutes to establish and answer a
+	#                    question (memory per connection) that no durable-path
+	#                    change moves
+	#   3 lane-B rungs   50k / 150k / 300k — the knee bracket, one posture
 	#   no tier arms     ADR 0072's tiers are a durable-PATH claim, measured
-	#                    on `full`; a release that does not touch them does
-	#                    not re-pay for them
-	#   3 lane-B rungs   the knee bracket, not the full ladder
-	#   shorter lane C   50k connections still established, held 60s not 120
-	#   2 lane-A reps    median of 2 with the spread reported, not 3
+	#                    on `full`
+	# A standard run is a REGRESSION GATE, not a publishable curve point: one
+	# rep, one posture, one size. Publishing numbers means running `full`.
 	shift || true
-	if [ $# -gt 0 ]; then SIZES=("$@"); else SIZES=(1 5 10); fi
+	if [ $# -gt 0 ]; then SIZES=("$@"); else SIZES=(10); fi
 	export STANDARD=1
+	# Lanes A and B only. Still overridable — `LANES=A ./run.sh standard` is a
+	# durable-path-only gate in under fifteen minutes.
+	export LANES="${LANES:-AB}"
 	;;
 full)
 	shift || true

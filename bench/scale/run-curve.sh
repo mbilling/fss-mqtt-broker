@@ -49,17 +49,18 @@ if [ "${SMOKE:-0}" = 1 ]; then
 	A_REPS=1 A_SECS=15 A_WARMUP=3
 	BARRIER_OPS=50
 elif [ "${STANDARD:-0}" = 1 ]; then
-	# The ~€10 release profile (run.sh standard): the same measurements at a
-	# trimmed shape. Every knob below is a DURATION or a COUNT — nothing here
-	# changes what is measured or how, so a standard point is directly
-	# comparable to a full one, with a wider confidence interval on lane A
-	# (2 reps) and a coarser ladder (the knee bracket only).
+	# The short release profile (run.sh standard): the same measurements, one
+	# pass. Every knob below is a DURATION or a COUNT — nothing here changes
+	# what is measured or how, so a standard number is directly comparable to a
+	# full one; what it loses is CONFIDENCE (one rep, no median, no spread) and
+	# COVERAGE (one size, one posture, no ladder tail). That is the trade a
+	# regression gate makes and a published curve does not.
 	LANE_B_RUNGS=(50000 150000 300000)
 	LANE_B_SECS=45
 	LANE_C_CONNS=50000
 	LANE_C_RAMP=2500
 	LANE_C_HOLD=60
-	A_REPS=2 A_SECS=45 A_WARMUP=10
+	A_REPS=1 A_SECS=45 A_WARMUP=10
 	BARRIER_OPS=150
 else
 	# Overridable for a focused knee hunt (issue #258 follow-up: the 7-node
@@ -372,8 +373,10 @@ for rate in "${LANE_B_RUNGS[@]}"; do
 	lane_b_rung "$rate" plain
 done
 # mTLS posture: the reference rung only, per size (ADR 0048 §3 discloses both
-# postures without paying for the full ladder twice).
-if [ "${SMOKE:-0}" != 1 ]; then
+# postures without paying for the full ladder twice). The standard profile skips
+# it — one posture is a regression gate; TWO is what ADR 0048 §3 requires of a
+# PUBLISHED curve, which is `full`'s job.
+if [ "${SMOKE:-0}" != 1 ] && [ "${STANDARD:-0}" != 1 ]; then
 	lane_b_rung "$LANE_B_REF_RUNG" mtls
 fi
 fi # LANES *B*
