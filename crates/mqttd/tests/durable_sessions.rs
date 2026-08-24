@@ -143,6 +143,7 @@ async fn start_durable_node_capped(
         // ADR 0073: the scale-out ownership flag, PRE-SET for the falsifier test
         // (the hub sweep that computes it in production has its own unit test).
         Arc::new(std::sync::atomic::AtomicBool::new(scale_out)),
+        None, // in-memory store: no shard layout to choose (ADR 0076 T2)
     )
     .await;
     let plane_observer = plane.clone();

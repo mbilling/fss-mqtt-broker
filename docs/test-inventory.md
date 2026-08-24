@@ -241,7 +241,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `two_bridge_instances_do_not_duplicate_forwarding`
 - `two_partitioned_instances_deliver_each_inbound_message_exactly_once`
 
-## `crates/mqtt-cluster/src/lib.rs` — 276 test(s)
+## `crates/mqtt-cluster/src/lib.rs` — 282 test(s)
 
 - `cluster_identity::tests::a_founder_mints_once_and_reloads_stably`
 - `cluster_identity::tests::a_joiner_adopts_once_and_persists`
@@ -250,11 +250,15 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `cluster_log::tests::a_failed_pipelined_append_fails_the_staged_tail_and_leaves_no_hole`
 - `cluster_log::tests::a_foreign_replica_schema_version_fails_closed`
 - `cluster_log::tests::a_groups_fence_does_not_reject_another_groups_older_epoch`
+- `cluster_log::tests::a_key_lives_in_exactly_one_shard`
 - `cluster_log::tests::a_local_tier_append_returns_on_the_owners_durability_alone`
+- `cluster_log::tests::a_missing_shard_fails_the_open_closed`
 - `cluster_log::tests::a_replica_keeps_the_newer_version_of_an_offset`
+- `cluster_log::tests::a_sharded_store_round_trips_every_key_and_survives_reopen`
 - `cluster_log::tests::an_earlier_pipelined_append_is_unaffected_by_a_later_failure`
 - `cluster_log::tests::an_empty_recommit_still_requires_a_write_quorum`
 - `cluster_log::tests::an_empty_recovered_log_still_fences_the_old_owner`
+- `cluster_log::tests::an_existing_single_file_store_is_never_resharded`
 - `cluster_log::tests::append_below_quorum_is_rejected_and_leaves_no_committed_hole`
 - `cluster_log::tests::append_commits_at_quorum_without_waiting_on_a_wedged_replica`
 - `cluster_log::tests::append_is_quorum_durable_and_assigns_offsets`
@@ -277,7 +281,9 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `cluster_log::tests::replica_state_survives_reopen`
 - `cluster_log::tests::session_store_over_cluster_log_survives_replica_loss`
 - `cluster_log::tests::stale_leader_is_fenced`
+- `cluster_log::tests::the_default_layout_is_a_single_file_under_its_original_name`
 - `cluster_log::tests::the_migration_registry_covers_the_contract_range`
+- `cluster_log::tests::the_unlocked_shard_writer_matches_apply_batch`
 - `cluster_log::tests::truncate_is_local_first_and_propagates`
 - `cluster_log::tests::truncate_succeeds_with_followers_down`
 - `cluster_store::tests::a_foreign_topics_retained_write_is_refused_not_diverged`
@@ -865,7 +871,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 343 test(s)
+## `crates/mqttd/src/lib.rs` — 345 test(s)
 
 - `admission::tests::the_global_cap_refuses_at_the_bound_and_recovers`
 - `admission::tests::the_penalty_box_refuses_after_the_threshold`
@@ -1204,6 +1210,8 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `reload::tests::checksum_is_sha256_lowercase_hex`
 - `reload::tests::reload_increments_the_metric_by_outcome`
 - `store_probe::tests::probes_a_volume_and_cleans_up`
+- `store_probe::tests::sharding_pays_only_when_parallel_streams_are_nearly_independent`
+- `store_probe::tests::the_parallel_barrier_curve_covers_every_stream_count`
 - `store_watch::tests::a_recovered_watermark_lifts_the_brownout_at_the_accelerated_cadence`
 - `store_watch::tests::nearing_the_watermark_shortens_the_poll_so_overshoot_is_bounded`
 - `store_watch::tests::scan_reports_per_store_sizes_and_the_total`

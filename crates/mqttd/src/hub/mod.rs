@@ -12837,6 +12837,7 @@ mod tests {
             None,
             false,
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            None,
         )
         .await;
         driver.abort();
@@ -12922,6 +12923,7 @@ mod tests {
             None,
             false,
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            None,
         )
         .await;
         driver.abort();
@@ -13055,6 +13057,7 @@ mod tests {
             None,
             false,
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            None,
         )
         .await;
         driver.abort();
@@ -13388,6 +13391,7 @@ mod tests {
             None,
             false,
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            None,
         )
         .await;
         driver.abort();

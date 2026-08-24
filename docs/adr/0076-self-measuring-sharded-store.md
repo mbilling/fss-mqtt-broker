@@ -71,3 +71,61 @@ flapping (issue #403):
   device's extra streams are only reachable with separate files.
 - **Tuning by documentation (SIZING.md tables):** goes stale with the
   volume; the broker measuring itself is the only version that stays true.
+
+## Amendment (2026-08-24) — T2's sharding hypothesis is FALSIFIED
+
+Decision 2 above is wrong, and the measurement it asked for is what shows it.
+The store stays **one file by default**; K > 1 survives only as an explicit,
+loudly-warned operator pin.
+
+**The arithmetic.** ADR 0075's group-commit writer converts in-flight work
+into batch **depth**: throughput is `D × barriers/s`, where `D` is how many
+ops coalesce into one barrier (measured at ~113 on the campaign hosts).
+Splitting the store into K files gives each shard depth `D/K`, while the
+device multiplies its barrier rate by only `P(K)` — its parallel-stream gain.
+So:
+
+```text
+    sharded / single  =  P(K) / K
+```
+
+Sharding needs `P(K) ≈ K`: a device serving K *genuinely independent* queues.
+The context table above reads `P(4) ≈ 1.9`, `P(8) ≈ 3.7` — which this ADR
+mistook for headroom to exploit. It is headroom that costs more than it pays.
+
+**The measurement** (local, release, the same 48×8×48 shape ADR 0075 used, one
+node, `MQTTD_STORE_SHARDS` pinned):
+
+| K | acked msg/s | vs K=1 | append mean | predicted `P(K)/K` |
+|---|---|---|---|---|
+| 1 | 25,270 / 24,884 | — | 11.4 / 11.8 ms | 1.00 |
+| 2 | 21,344 | 0.85× | 16.6 ms | 0.85 |
+| 4 | 14,531 | 0.58× | 24.9 ms | 0.58 |
+
+Prediction and measurement agree to within run-to-run noise, so this is a
+mechanism, not a bad afternoon on one disk.
+
+**What ships instead:**
+
+1. **K = 1 by default, forever, on every store.** No first-boot calibration —
+   there is nothing to calibrate toward.
+2. **The mechanism is retained** behind `MQTTD_STORE_SHARDS=<2..8>`, honored
+   only for a **fresh** data dir and committed to that store's schema for its
+   life. It warns at boot that it is experimental and measured slower. It
+   exists so the finding stays falsifiable on hardware we have not met — a
+   device with independent per-file queues would show `P(K) ≈ K`.
+3. **The self-measurement is kept and sharpened** (T1's whole point): the boot
+   probe now also measures the volume's parallel-barrier **curve** at 1/2/4/8
+   streams, publishes it, and applies the `P(K)/K` rule. `store_shards`
+   reports the committed layout; `store_reshard_advice` stays **0** unless the
+   device really would pay — a gauge whose silence is the finding.
+4. **The commit moved out of the state lock** regardless of K. The writer now
+   decides under the lock, fsyncs with it **released**, and applies under it
+   again — safe because a shard's groups have exactly one writer. At K=1 that
+   is a pure latency win for every reader (recovery reads, `/statusz`, the
+   catch-up sweep) that used to queue behind an 11 ms fsync.
+
+The ADR's own rule — *measurement before adaptation* — is what produced this,
+and the honest outcome of measuring first is sometimes not adapting. The
+store's ceiling is still the store's ceiling; ADR 0076 T3 (adaptive
+coalescing, which raises `D` rather than dividing it) is now the live lead.

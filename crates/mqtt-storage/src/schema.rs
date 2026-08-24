@@ -190,6 +190,68 @@ pub fn force_version(db: &Database, version: u32) -> Result<(), SchemaError> {
     Ok(())
 }
 
+/// Read a store-level layout fact stamped beside the schema version — `None` when
+/// the store has never recorded one.
+///
+/// The marker table is the right home for facts that describe the store's own
+/// **layout** rather than its contents (ADR 0076 T2's `shard_count` is the first):
+/// they must be readable before the store's tables are interpreted, and they must
+/// never change under a running cluster. [`gate`], [`gate_or_migrate`] and
+/// [`force_version`] touch only the version key, so a fact stored here is never
+/// clobbered by the version machinery.
+///
+/// # Errors
+/// [`SchemaError::Backend`] if the marker cannot be read.
+pub fn read_fact(db: &Database, key: &str) -> Result<Option<u32>, SchemaError> {
+    let be = |e: &dyn std::fmt::Display| SchemaError::Backend(format!("schema fact {key}: {e}"));
+    let txn = db.begin_read().map_err(|e| be(&e))?;
+    let table = match txn.open_table(SCHEMA_META) {
+        Ok(t) => t,
+        // A store whose marker table does not exist yet has no facts, which is
+        // not an error — it is the fresh case.
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+        Err(e) => return Err(be(&e)),
+    };
+    Ok(table.get(key).map_err(|e| be(&e))?.map(|v| v.value()))
+}
+
+/// Stamp a layout fact **once**: writes `value` if the key is unset, and otherwise
+/// fails closed when the stored value differs. A layout fact that changed under a
+/// store is not a fact — it is data loss waiting to be discovered, so the store
+/// refuses to open instead (ADR 0076 T2: K is calibrated once and committed).
+///
+/// # Errors
+/// [`SchemaError::Mismatch`] when `key` is already stamped with a different value;
+/// [`SchemaError::Backend`] if the marker cannot be read or written.
+pub fn stamp_fact_once(
+    db: &Database,
+    store: &'static str,
+    key: &str,
+    value: u32,
+) -> Result<(), SchemaError> {
+    let be = |e: &dyn std::fmt::Display| SchemaError::Backend(format!("{store}: fact {key}: {e}"));
+    let txn = db.begin_write().map_err(|e| be(&e))?;
+    {
+        let mut table = txn.open_table(SCHEMA_META).map_err(|e| be(&e))?;
+        let found = table.get(key).map_err(|e| be(&e))?.map(|v| v.value());
+        match found {
+            Some(found) if found != value => {
+                return Err(SchemaError::Mismatch {
+                    store,
+                    found,
+                    expected: value,
+                })
+            }
+            Some(_) => {}
+            None => {
+                table.insert(key, value).map_err(|e| be(&e))?;
+            }
+        }
+    }
+    txn.commit().map_err(|e| be(&e))?;
+    Ok(())
+}
+
 /// Assert a store's migration registry can carry any store from `floor` up to `expected`
 /// (ADR 0058 T2). The chain must contain exactly one step for each version in
 /// `[floor, expected)` — no gaps (a gap means a store stuck mid-way), no duplicates, no

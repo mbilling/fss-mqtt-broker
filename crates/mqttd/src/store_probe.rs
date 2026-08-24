@@ -126,9 +126,99 @@ pub fn measure(data_dir: &Path, ops: usize) -> std::io::Result<BarrierProbe> {
     })
 }
 
+/// The stream counts the first-boot calibration tries, in order. Powers of two
+/// up to the design bound (`R_MAX_SHARDS`) — enough resolution to find a knee,
+/// few enough to stay well under a second on a slow volume.
+const CALIBRATION_STREAMS: [usize; 4] = [1, 2, 4, 8];
+
+/// How close `P(K)` must come to `K` before sharding into K files could pay
+/// (ADR 0076 T2, amended). Sharding divides the group-commit batch depth by K
+/// and multiplies the barrier rate by P(K), so throughput scales by `P(K)/K`:
+/// break-even is `P(K) == K`, and 0.9 is the margin at which it is worth an
+/// operator's A/B rather than a certain loss.
+const SHARDING_BREAK_EVEN: f64 = 0.9;
+
+/// Measure this volume's parallel-barrier curve: `(streams, aggregate
+/// barriers/s)` at 1, 2, 4 and 8 concurrent writers on separate files.
+///
+/// This is the input to the ADR 0076 T2 question — *would splitting the store
+/// into K files help?* — and, since the measurement rejected sharding as a
+/// default, its output is a REPORT rather than a decision. See
+/// [`sharding_would_pay`] for the rule the numbers feed.
+///
+/// Blocking, a few hundred milliseconds.
+///
+/// # Errors
+/// Propagates the probe's IO error.
+pub fn parallel_barrier_curve(data_dir: &Path, ops: usize) -> std::io::Result<Vec<(usize, u64)>> {
+    let scratch = data_dir.join(".shard-calibration");
+    std::fs::create_dir_all(&scratch)?;
+    let sweep = (|| -> std::io::Result<Vec<(usize, u64)>> {
+        let mut out = Vec::with_capacity(CALIBRATION_STREAMS.len());
+        for streams in CALIBRATION_STREAMS {
+            let per_stream = ops.div_ceil(streams).max(1);
+            let started = std::time::Instant::now();
+            let handles: Vec<_> = (0..streams)
+                .map(|i| {
+                    let path = scratch.join(format!("s{streams}-{i}"));
+                    std::thread::spawn(move || barrier_loop(&path, per_stream))
+                })
+                .collect();
+            let mut ok = true;
+            for h in handles {
+                if !matches!(h.join(), Ok(Ok(_))) {
+                    ok = false;
+                }
+            }
+            if !ok {
+                return Err(std::io::Error::other("a calibration stream failed"));
+            }
+            out.push((streams, rate(per_stream * streams, started.elapsed())));
+        }
+        Ok(out)
+    })();
+    let _ = std::fs::remove_dir_all(&scratch);
+    sweep
+}
+
+/// The largest K on this volume's measured curve for which splitting the store
+/// into K files could pay — `None` (the normal answer) when none can.
+///
+/// The rule is arithmetic, not a heuristic. A group-commit writer converts
+/// in-flight work into batch depth `D`, and throughput is `D × barriers/s`.
+/// Splitting into K files gives each shard depth `D/K` while the device serves
+/// `P(K)` times the barrier rate, so:
+///
+/// ```text
+///     sharded / single  =  P(K) / K
+/// ```
+///
+/// Sharding therefore needs `P(K) ≈ K` — a device with K genuinely independent
+/// queues. Real volumes measure far below that (`P(2)≈1.7`, `P(4)≈2.3` on the
+/// campaign hosts and on developer laptops alike), which is why the store is
+/// one file by default and this function almost always says `None`.
+#[must_use]
+pub fn sharding_would_pay(curve: &[(usize, u64)]) -> Option<usize> {
+    let single = curve
+        .iter()
+        .find(|(streams, _)| *streams == 1)
+        .map(|(_, rate)| *rate)
+        .filter(|r| *r > 0)?;
+    #[allow(clippy::cast_precision_loss)]
+    curve
+        .iter()
+        .filter(|(streams, _)| *streams > 1)
+        .filter(|(streams, rate)| {
+            let parallel_gain = *rate as f64 / single as f64;
+            parallel_gain / *streams as f64 >= SHARDING_BREAK_EVEN
+        })
+        .map(|(streams, _)| *streams)
+        .max()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::measure;
+    use super::{measure, parallel_barrier_curve, sharding_would_pay};
 
     /// The probe measures a real rate on a real filesystem, cleans up its
     /// scratch, and the 4-stream aggregate is at least a meaningful fraction
@@ -150,5 +240,52 @@ mod tests {
             !dir.path().join(".barrier-probe").exists(),
             "the probe scratch must be removed"
         );
+    }
+
+    /// The curve measures every stream count in order, on a real filesystem,
+    /// and leaves no scratch behind. The rates themselves are a property of the
+    /// machine's disk, so the assertion is the SHAPE, not a number.
+    #[test]
+    fn the_parallel_barrier_curve_covers_every_stream_count() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let curve = parallel_barrier_curve(dir.path(), 16).expect("curve");
+        assert_eq!(
+            curve.iter().map(|(s, _)| *s).collect::<Vec<_>>(),
+            vec![1, 2, 4, 8],
+            "the curve must cover the sweep, in order"
+        );
+        assert!(
+            curve.iter().all(|(_, rate)| *rate > 0),
+            "every stream count measures a real rate: {curve:?}"
+        );
+        assert!(
+            !dir.path().join(".shard-calibration").exists(),
+            "the curve's scratch must be removed"
+        );
+    }
+
+    /// The sharding rule is `P(K)/K >= break-even`, and it is the reason the
+    /// store is one file: a device would have to serve K nearly-independent
+    /// queues before splitting the group-commit batch K ways could pay.
+    #[test]
+    fn sharding_pays_only_when_parallel_streams_are_nearly_independent() {
+        // A real volume: 4 streams give 2.3x, not 4x. P(4)/4 = 0.58 — sharding
+        // would LOSE, which is what the campaign measured end to end.
+        let real = vec![(1, 2162), (2, 3600), (4, 4900), (8, 8041)];
+        assert_eq!(
+            sharding_would_pay(&real),
+            None,
+            "no stream count on a real volume reaches break-even: {real:?}"
+        );
+        // A hypothetical device with independent queues: P(K) tracks K.
+        let independent = vec![(1, 2000), (2, 3960), (4, 7900), (8, 15800)];
+        assert_eq!(
+            sharding_would_pay(&independent),
+            Some(8),
+            "with truly independent queues the largest paying K is advised"
+        );
+        // A device that measures nothing advises nothing.
+        assert_eq!(sharding_would_pay(&[]), None);
+        assert_eq!(sharding_would_pay(&[(1, 0), (4, 9000)]), None);
     }
 }

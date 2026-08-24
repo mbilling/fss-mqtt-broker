@@ -326,6 +326,7 @@ async fn start_stress_node_in_zone(
         None,
         false,
         Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        None,
     )
     .await;
     // The hub's session-store seam, wrapped for write-error injection (T4):
