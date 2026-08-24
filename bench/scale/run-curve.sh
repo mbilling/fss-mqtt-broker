@@ -346,6 +346,17 @@ lane_b_rung() { # lane_b_rung <total-rate> <posture:plain|mtls>
 	[ "$pubs_per" -ge 1 ] || pubs_per=1
 	local args="" port_base=9200
 	[ "$posture" = mtls ] && args="$TLS_ARGS"
+	# emqtt-bench's socket mode. Its own help: "once" is the LEGACY DEFAULT,
+	# "suitable for high-concurrency clients with LOW MESSAGE FREQUENCY"; "true"
+	# is "highly active (RECOMMENDED), optimized for full speed, ideal for
+	# HIGH-FREQUENCY messages and balanced scheduling". Every rung this rig has
+	# ever run is a high-frequency saturation test, and every one of them ran on
+	# the low-frequency default: `once` re-arms the socket after each message,
+	# so every message costs a syscall and a scheduler round trip. That is
+	# latency-bound, not CPU-bound — which is exactly the shape we measured
+	# (a hard ceiling near 950 msg/s per connection with idle cores on both
+	# sides). Use what the tool recommends for what we are actually doing.
+	local active="-A true"
 	snapshot_metrics "$rdir" before
 	start_cpu_sampling "$rdir/cpu" $((LANE_B_SETTLE + LANE_B_SECS))
 	local di bi host port
@@ -355,7 +366,7 @@ lane_b_rung() { # lane_b_rung <total-rate> <posture:plain|mtls>
 			host=$(inv ".brokers[$bi].private_ip")
 			port=$([ "$posture" = mtls ] && echo 8883 || echo 1883)
 			drun "$di" "sub-$di-$bi" "-v /opt/bench-certs:/opt/bench-certs:ro $BENCH_IMG \
-				sub -h $host -p $port -c $subs_per -t '\$share/g1/bench/#' -q 1 \
+				sub -h $host -p $port -c $subs_per -t '\$share/g1/bench/#' -q 1 $active \
 				--payload-hdrs ts --prometheus --restapi $((port_base + bi)) $args"
 		done
 	done
@@ -364,9 +375,20 @@ lane_b_rung() { # lane_b_rung <total-rate> <posture:plain|mtls>
 		for ((bi = 0; bi < N; bi++)); do
 			host=$(inv ".brokers[$bi].private_ip")
 			port=$([ "$posture" = mtls ] && echo 8883 || echo 1883)
+			# `-t bench/%i` numbers topics by CLIENT SEQNO, which restarts at
+			# --startnumber in every container. Without an offset all D*N
+			# containers publish the same `bench/1..pubs_per` set, so the run
+			# has `LANE_B_PUBS / (D*N)` distinct topics — 60 where the doc
+			# claims 3000 — and the count silently changes with fleet shape,
+			# which is precisely what ADR 0048 §2's same-workload-at-every-size
+			# rule forbids. emqtt-bench documents `-n` for exactly this ("useful
+			# when running multiple emqtt-bench instances to test the same
+			# broker"). Offset each container's block so topics are globally
+			# distinct and the topic count IS LANE_B_PUBS by construction.
+			local seq_base=$(((di * N + bi) * pubs_per))
 			drun "$di" "pub-$di-$bi" "-v /opt/bench-certs:/opt/bench-certs:ro $BENCH_IMG \
-				pub -h $host -p $port -c $pubs_per -t 'bench/%i' -q 1 -s 256 \
-				-I $interval -F $LANE_B_INFLIGHT --payload-hdrs ts $args"
+				pub -h $host -p $port -c $pubs_per -t 'bench/%i' -q 1 -s 256 $active \
+				-n $seq_base -I $interval -F $LANE_B_INFLIGHT --payload-hdrs ts $args"
 		done
 	done
 	# Let the publisher ramp finish BEFORE the latency measurement starts. The
