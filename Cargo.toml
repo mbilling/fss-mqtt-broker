@@ -103,7 +103,7 @@ futures-util = "0.3"
 # aws-lc-rs through feature unification).
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-aws-lc-rs", "log"] }
 # Micro-benchmarks (ADR 0044 P6): dev-only, statistical timing of the hot paths.
-criterion = "0.5"
+criterion = "0.8"
 
 # Test/dev builds keep file:line panic locations but drop full debuginfo:
 # the workspace's ~30 integration-test binaries at debug=2 exceed 20 GiB of
