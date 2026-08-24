@@ -214,12 +214,18 @@ judgement call. All hold as of ADR acceptance (2026-07-17):
       in the `docs` job (text rules), and by `--check-inventory` / `--check-results` in the
       jobs that build and run. Its known limits are tabled in TEST-PLAN; the open one worth
       naming here is five ignored `durable_bench` benchmarks that no tier runs.
-- [ ] **Adjacent-release skew smoke in CI** (0039-T3): the machinery exists (P3);
-      the test itself needs two released versions — impossible before 1.0 by
-      definition. This is the one gate that opens *at* 1.0, not before.
+- [x] **Adjacent-release skew smoke in CI** (0039-T3, checked 2026-08-18,
+      recorded here at the v1.0.6 cut): `BASELINE_REF` pins a real **release
+      commit** and the scheduled nightly is the only lane that runs
+      `cluster_upgrade --ignored`, so every night rolls an adjacent release
+      pair — previous release ↔ this line — one node at a time in **both**
+      directions under the acked-facts oracle. `BASELINE_REF` advances with
+      each cut per ADR 0039's skew policy (previous minor within a major, the
+      gateway minor across a boundary), which is a step in RELEASING.md rather
+      than a thing to remember.
 
-When the first release ships, 0039-T3's box is checked by pointing P3's
-rolling-upgrade test at two release tags; nothing else on the list moves.
+This was the one gate that opened *at* 1.0 rather than before; it opened, and
+nothing else on the list moved. The list is now green end to end.
 
 ## Alternatives considered
 
