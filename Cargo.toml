@@ -95,7 +95,7 @@ rustls-pki-types = "1"
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
 # WebSocket transport (ADR 0035): the HTTP Upgrade handshake + WS frame codec only — TLS is
 # done by our own rustls (no tungstenite TLS feature), so there is one TLS stack in the broker.
-tokio-tungstenite = { version = "0.24", default-features = false, features = ["handshake"] }
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
 # Stream/Sink adapters for the WebSocket byte-stream shim (already in-tree transitively).
 futures-util = "0.3"
 # QUIC transport (ADR 0036): MQTT-over-QUIC on the same aws-lc-rs provider as the rest
