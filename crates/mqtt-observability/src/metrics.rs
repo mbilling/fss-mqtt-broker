@@ -356,6 +356,9 @@ pub struct Metrics {
     durable_writer_ops_total: Counter,
     /// Largest single batch since boot — how deep the coalescing gets under load.
     durable_writer_max_batch: Gauge,
+    durable_writer_commit_micros_total: Counter,
+    store_barrier_floor: Gauge,
+    store_barrier_floor_4stream: Gauge,
     crypto_module_info: Family<CryptoModuleLabel, Gauge>,
     /// Brownout STATE (ADR 0054): 1 while growth writes are refused on `axis`
     /// (`disk`, `memory`), 0 otherwise. The rejection counters record symptoms; this
@@ -767,6 +770,30 @@ impl Metrics {
             "durable_writer_max_batch",
             "Largest single group-commit batch since boot (ADR 0071)",
         );
+        let durable_writer_commit_micros_total = register_counter(
+            &mut registry,
+            "durable_writer_commit_micros",
+            "Cumulative microseconds the durable-write serializer spent \
+             committing batches (ADR 0076): divided by durable_writer_batches \
+             over the same window this is the LIVE mean commit (barrier) \
+             latency — the passive volume-health signal, measured from real \
+             traffic",
+        );
+        let store_barrier_floor = register_gauge(
+            &mut registry,
+            "store_barrier_floor",
+            "Boot-probed single-writer barrier rate (fsync round trips per \
+             second) of the data-dir volume (ADR 0076): the denominator every \
+             durable throughput figure should be read against; 0 until probed",
+        );
+        let store_barrier_floor_4stream = register_gauge(
+            &mut registry,
+            "store_barrier_floor_4stream",
+            "Boot-probed AGGREGATE barrier rate across 4 concurrent writers on \
+             separate files (ADR 0076): how much parallel-stream headroom the \
+             volume has beyond one fsync stream — the sharding signal; 0 until \
+             probed",
+        );
 
         let brownout = register_gauge_family(
             &mut registry,
@@ -969,6 +996,9 @@ impl Metrics {
             audit_export_dropped_total,
             publish_tier_total,
             durable_writer_batches_total,
+            durable_writer_commit_micros_total,
+            store_barrier_floor,
+            store_barrier_floor_4stream,
             durable_writer_ops_total,
             durable_writer_max_batch,
             crypto_module_info,
@@ -1726,11 +1756,30 @@ impl Metrics {
     /// Advance the durable-write serializer's counters (ADR 0071) by the deltas a
     /// poll observed, and refresh the max-batch gauge. Deltas, so the exposed
     /// series stay true monotonic counters over a poll-based source.
-    pub fn durable_writer_progress(&self, batches: u64, ops: u64, max_batch: u64) {
+    pub fn durable_writer_progress(
+        &self,
+        batches: u64,
+        ops: u64,
+        max_batch: u64,
+        commit_micros: u64,
+    ) {
         self.durable_writer_batches_total.inc_by(batches);
         self.durable_writer_ops_total.inc_by(ops);
         self.durable_writer_max_batch.set(clamp_gauge(
             usize::try_from(max_batch).unwrap_or(usize::MAX),
+        ));
+        self.durable_writer_commit_micros_total
+            .inc_by(commit_micros);
+    }
+
+    /// Record the boot-time volume probe (ADR 0076): the single-writer barrier
+    /// floor and the 4-stream aggregate of the data-dir volume.
+    pub fn set_store_barrier_probe(&self, single_per_sec: u64, four_stream_per_sec: u64) {
+        self.store_barrier_floor.set(clamp_gauge(
+            usize::try_from(single_per_sec).unwrap_or(usize::MAX),
+        ));
+        self.store_barrier_floor_4stream.set(clamp_gauge(
+            usize::try_from(four_stream_per_sec).unwrap_or(usize::MAX),
         ));
     }
 

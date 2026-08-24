@@ -330,6 +330,18 @@ host's **per-volume** disk barrier (~215–240 flushes/s, shared by every store 
 rather than by CPU — which is the number to re-measure on your own hardware before sizing
 a write rate, because it is the one that decides it.
 
+**The broker now measures that number for you** (ADR 0076): a durable node
+probes its data-dir volume shortly after start and publishes the result —
+`store_barrier_floor` (single-writer fsync round trips per second) and
+`store_barrier_floor_4stream` (the parallel-stream aggregate) on `/metrics`,
+and the same pair with the live group-commit shape under `store` on
+`/statusz`. Sizing rule of thumb: sustainable durable msg/s ≈ barrier floor ×
+the writer's mean batch (`durable_writer_ops` / `durable_writer_batches`),
+divided by the replication factor's share on multi-node clusters. If
+`rate(durable_writer_commit_micros)/rate(durable_writer_batches)` drifts well
+above the boot figure, the volume has degraded (a noisy neighbor, throttling)
+— alert on it.
+
 ## Worked example — 4 GiB RAM / 20 GiB disk
 
 Target: leave ~1 GiB for OS/page cache; broker budget ~3 GiB RSS, 16 GiB store.

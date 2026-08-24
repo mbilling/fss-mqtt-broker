@@ -126,6 +126,13 @@ pub struct HealthState {
     /// looking healthy while peers evict us). Surfaced on `/statusz` so an operator
     /// reading the evictee sees the contradiction the counts alone hide.
     swim_isolated: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// The boot-time volume probe (ADR 0076) + the durable writer's counters,
+    /// for the `/statusz` `store` block: the barrier floor durable throughput
+    /// should be read against, and the live group-commit shape.
+    store_probe: Option<(
+        Arc<crate::store_probe::ProbeSlot>,
+        Option<Arc<mqtt_cluster::durable_plane::WriterStats>>,
+    )>,
 }
 
 impl std::fmt::Debug for HealthState {
@@ -217,6 +224,7 @@ impl HealthState {
             identity: None,
             refound: None,
             swim_isolated: None,
+            store_probe: None,
             backup: None,
             brownout: None,
             stores: None,
@@ -282,6 +290,18 @@ impl HealthState {
     #[must_use]
     pub fn with_swim_isolated(mut self, flag: Arc<std::sync::atomic::AtomicBool>) -> Self {
         self.swim_isolated = Some(flag);
+        self
+    }
+
+    /// Surface the data-dir volume probe and the durable writer's live
+    /// counters (ADR 0076) as the `/statusz` `store` block.
+    #[must_use]
+    pub fn with_store_probe(
+        mut self,
+        probe: Arc<crate::store_probe::ProbeSlot>,
+        writer: Option<Arc<mqtt_cluster::durable_plane::WriterStats>>,
+    ) -> Self {
+        self.store_probe = Some((probe, writer));
         self
     }
 
@@ -471,6 +491,44 @@ impl HealthState {
             if flag.load(std::sync::atomic::Ordering::Relaxed) {
                 s.push_str(",\"swim_isolated\":true");
             }
+        }
+        // The store's self-measurement (ADR 0076): the boot-probed barrier
+        // floor of the data-dir volume, and the durable writer's cumulative
+        // group-commit shape. The floor is the number every durable-throughput
+        // figure should be read against — published by the broker itself so an
+        // operator does not need a bench rig to learn it.
+        if let Some((probe, writer)) = &self.store_probe {
+            s.push_str(",\"store\":{");
+            match probe.get() {
+                Some(p) => {
+                    let _ = write!(
+                        s,
+                        "\"barrier_floor\":{},\"barrier_floor_4stream\":{},\"probed_at\":{}",
+                        p.single_per_sec, p.four_stream_per_sec, p.probed_epoch_secs
+                    );
+                }
+                None => s.push_str("\"probed\":false"),
+            }
+            if let Some(w) = writer {
+                use std::sync::atomic::Ordering::Relaxed;
+                let batches = w.batches.load(Relaxed);
+                let ops = w.ops.load(Relaxed);
+                let commit_ms = w
+                    .commit_nanos
+                    .load(Relaxed)
+                    .checked_div(batches)
+                    .unwrap_or(0)
+                    / 1_000_000;
+                let mean_batch_x100 = (ops * 100).checked_div(batches).unwrap_or(0);
+                let _ = write!(
+                    s,
+                    ",\"writer\":{{\"batches\":{batches},\"ops\":{ops},\
+                     \"mean_batch_x100\":{mean_batch_x100},\"max_batch\":{},\
+                     \"commit_ms_mean\":{commit_ms}}}",
+                    w.max_batch.load(Relaxed)
+                );
+            }
+            s.push('}');
         }
         // Membership: the placement view (self + non-dead peers). Deterministic order.
         if let Some(p) = &self.placement {
@@ -887,6 +945,51 @@ mod tests {
             )
             .with_refound_guard(seen.clone());
         (state, seen)
+    }
+
+    /// ADR 0076: once wired, `/statusz` carries the `store` block — the
+    /// boot-probed barrier floor (or `probed:false` until the probe lands)
+    /// and the durable writer's live group-commit shape.
+    #[tokio::test]
+    async fn statusz_reports_the_store_self_measurement() {
+        let cluster = Arc::new(
+            mqtt_cluster::cluster_identity::ClusterIdentity::load_or_mint(true, None).unwrap(),
+        );
+        let slot = Arc::new(crate::store_probe::ProbeSlot::default());
+        let writer = Arc::new(mqtt_cluster::durable_plane::WriterStats::default());
+        writer
+            .batches
+            .store(4, std::sync::atomic::Ordering::Relaxed);
+        writer.ops.store(100, std::sync::atomic::Ordering::Relaxed);
+        writer
+            .commit_nanos
+            .store(8_000_000, std::sync::atomic::Ordering::Relaxed);
+        let state = HealthState::new(spawn_live_hub(), Some(placement(1)), None, 1)
+            .with_status(
+                "node-a".into(),
+                cluster,
+                Arc::new(super::BrownoutStatus::default()),
+                Arc::new(crate::reload::ConfigStamp::default()),
+                Arc::new(std::sync::OnceLock::new()),
+                None,
+            )
+            .with_store_probe(slot.clone(), Some(writer));
+        // Before the probe lands: the block exists and says so.
+        let (_, body, _) = super::route(&state, "/statusz").await;
+        assert!(body.contains("\"store\":{\"probed\":false"), "{body}");
+        assert!(
+            body.contains("\"mean_batch_x100\":2500"),
+            "100 ops over 4 batches is a mean batch of 25.00: {body}"
+        );
+        // After: the floor pair and the probe time are reported.
+        slot.set(crate::store_probe::BarrierProbe {
+            single_per_sec: 2162,
+            four_stream_per_sec: 8041,
+            probed_epoch_secs: 1_755_000_000,
+        });
+        let (_, body, _) = super::route(&state, "/statusz").await;
+        assert!(body.contains("\"barrier_floor\":2162"), "{body}");
+        assert!(body.contains("\"barrier_floor_4stream\":8041"), "{body}");
     }
 
     /// A NON-DURABLE node alone must be healthy when it is *meant* to be alone.

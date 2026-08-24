@@ -865,7 +865,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 338 test(s)
+## `crates/mqttd/src/lib.rs` — 340 test(s)
 
 - `admission::tests::the_global_cap_refuses_at_the_bound_and_recovers`
 - `admission::tests::the_penalty_box_refuses_after_the_threshold`
@@ -983,6 +983,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `health::tests::serves_a_real_http_request_over_tcp`
 - `health::tests::statusz_reports_identity_members_brownout_and_proto`
 - `health::tests::statusz_reports_the_derived_write_floor_and_its_source`
+- `health::tests::statusz_reports_the_store_self_measurement`
 - `health::tests::the_healthy_majority_is_not_quarantined_by_foreign_gossip`
 - `health::tests::unknown_paths_are_404`
 - `health::tests::waits_for_the_full_request_head_before_responding`
@@ -1199,6 +1200,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `reload::tests::a_successful_reload_swaps_the_policy`
 - `reload::tests::checksum_is_sha256_lowercase_hex`
 - `reload::tests::reload_increments_the_metric_by_outcome`
+- `store_probe::tests::probes_a_volume_and_cleans_up`
 - `store_watch::tests::a_recovered_watermark_lifts_the_brownout_at_the_accelerated_cadence`
 - `store_watch::tests::nearing_the_watermark_shortens_the_poll_so_overshoot_is_bounded`
 - `store_watch::tests::scan_reports_per_store_sizes_and_the_total`
