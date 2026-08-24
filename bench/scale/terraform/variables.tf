@@ -3,8 +3,8 @@ variable "node_count" {
   type        = number
 
   validation {
-    condition     = contains([1, 3, 5, 7], var.node_count)
-    error_message = "node_count must be 1, 3, 5 or 7 (the curve points plus the past-the-cap extension)."
+    condition     = contains([1, 3, 5, 7, 10], var.node_count)
+    error_message = "node_count must be 1, 3, 5, 7 or 10 (the curve points plus the ADR 0073 scale-out extensions; 10 exactly fills the spread placement group's limit)."
   }
 }
 
@@ -14,8 +14,8 @@ variable "driver_count" {
   default     = 2
 
   validation {
-    condition     = var.driver_count >= 1 && var.driver_count <= 3
-    error_message = "driver_count must be between 1 and 3."
+    condition     = var.driver_count >= 1 && var.driver_count <= 6
+    error_message = "driver_count must be between 1 and 6 (six CCX33s offer ~240k msg/s on lane B — the fan-out knee hunt at 7 nodes; the 100-vCPU quota bounds the rest)."
   }
 }
 

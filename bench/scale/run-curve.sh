@@ -49,7 +49,14 @@ if [ "${SMOKE:-0}" = 1 ]; then
 	A_REPS=1 A_SECS=15 A_WARMUP=3
 	BARRIER_OPS=50
 else
-	LANE_B_RUNGS=(20000 50000 100000 200000 300000)
+	# Overridable for a focused knee hunt (issue #258 follow-up: the 7-node
+	# fan-out plateau at ~140k with idle aggregate CPU): a space-separated
+	# rung list, e.g. LANE_B_RUNGS_OVERRIDE="50000 100000 200000 300000".
+	if [ -n "${LANE_B_RUNGS_OVERRIDE:-}" ]; then
+		read -r -a LANE_B_RUNGS <<<"$LANE_B_RUNGS_OVERRIDE"
+	else
+		LANE_B_RUNGS=(20000 50000 100000 200000 300000)
+	fi
 	LANE_B_SECS=60
 	LANE_C_CONNS=50000
 	LANE_C_RAMP=2500
@@ -86,12 +93,12 @@ start_cpu_sampling() { # start_cpu_sampling <dir> <secs> — background mpstat o
 	CPU_PIDS=()
 	mkdir -p "$dir"
 	for ((i = 0; i < N; i++)); do
-		rssh "$(broker_pub_ip "$i")" "mpstat 5 $((secs / 5 + 1))" \
+		rssh "$(broker_pub_ip "$i")" "mpstat -P ALL 5 $((secs / 5 + 1))" \
 			>"$dir/cpu-broker$i.txt" 2>/dev/null &
 		CPU_PIDS+=($!)
 	done
 	for ((i = 0; i < D; i++)); do
-		rssh "$(driver_pub_ip "$i")" "mpstat 5 $((secs / 5 + 1))" \
+		rssh "$(driver_pub_ip "$i")" "mpstat -P ALL 5 $((secs / 5 + 1))" \
 			>"$dir/cpu-driver$i.txt" 2>/dev/null &
 		CPU_PIDS+=($!)
 	done
