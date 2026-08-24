@@ -30,6 +30,10 @@ from pathlib import Path
 TOLERANCE = 0.02  # counter cross-check band
 DRIVER_OK = 0.97  # a rung counts only if drivers achieved this much of the offer
 KNEE_OK = 0.99  # delivered/sent ratio a sustained rung must reach
+# Seconds at the END of a rung's driver series that count as the measurement.
+# The rung's opening seconds are ramp (subscribers first, then publishers), and
+# averaging them in is what turned a healthy ladder into a phantom knee.
+STEADY_WINDOW = 60
 
 
 def sizes(root: Path) -> list[tuple[int, Path]]:
@@ -100,18 +104,41 @@ def probe_floor(size_dir: Path, n: int) -> list[str] | None:
 
 
 def driver_rate(log: Path, counter: str) -> tuple[int, float]:
-    """(final total, achieved rate) from emqtt-bench '<t>s <counter> total=N rate=' lines."""
+    """(final total, achieved rate) from emqtt-bench progress lines.
+
+    Two things this has to get right, both of which it once got wrong and both
+    of which manufactured a broker limit that did not exist:
+
+    1. **The timestamp format changes at one minute.** emqtt-bench prints `59s`
+       and then `1m0s`. A `^(\\d+)s` pattern silently stops matching at the
+       minute mark, so every rung was read from its first 59 seconds only.
+    2. **Those first seconds are the RAMP**, not the measurement. Publishers
+       start staggered behind the subscribers, so a rate averaged from the
+       start understates the steady state — and understates it by more at
+       higher rungs, which is exactly the shape of a knee. The reported
+       "~140k plateau with idle CPU everywhere" was this artifact: recomputed
+       over the steady window the same run sustained 199k at the 200k rung and
+       220k at the 300k rung, with received tracking sent to within 0.5%.
+
+    So: parse `[Nm]Ns`, and measure over the LAST [`STEADY_WINDOW`] seconds of
+    the series — the part of the rung that is actually the rung.
+    """
     if not log.exists():
         return 0, 0.0
     points = []
     for line in log.read_text(errors="replace").splitlines():
-        m = re.search(rf"^(\d+)s {counter} total=(\d+) rate=", line)
+        m = re.search(rf"^(?:(\d+)m)?(\d+)s {counter} total=(\d+) rate=", line)
         if m:
-            points.append((int(m.group(1)), int(m.group(2))))
+            secs = int(m.group(1) or 0) * 60 + int(m.group(2))
+            points.append((secs, int(m.group(3))))
     if len(points) < 2:
         return (points[0][1], 0.0) if points else (0, 0.0)
-    (t0, c0), (t1, c1) = points[0], points[-1]
-    return c1, (c1 - c0) / max(t1 - t0, 1)
+    end = points[-1][0]
+    window = [p for p in points if p[0] >= max(end - STEADY_WINDOW, points[0][0])]
+    if len(window) < 2:
+        window = points
+    (t0, c0), (t1, c1) = window[0], window[-1]
+    return points[-1][1], (c1 - c0) / max(t1 - t0, 1)
 
 
 def merged_histogram(proms: list[Path]) -> tuple[dict[float, int], int]:

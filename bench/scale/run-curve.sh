@@ -82,7 +82,18 @@ else
 	A_REPS=3 A_SECS=60 A_WARMUP=10
 	BARRIER_OPS=150
 fi
-LANE_B_PUBS=600 # total publishers; per-rung rate = 600 * 1000/I
+# Total publishers. Sized so EVERY rung of the ladder is actually offerable:
+# each publisher sends on an INTEGER-millisecond timer (emqtt-bench `-I`), so
+# the offered rate is `LANE_B_PUBS * 1000 / interval_ms` and a high rung with
+# few publishers demands a sub-5ms timer the drivers cannot hold. Measured on
+# the v1.0.5 7-node campaign with 600 publishers: the drivers tracked the offer
+# to 96% at 6ms (100k) and then collapsed — 74% at 3ms (200k), 52% at 2ms
+# (300k), saturating near 150k/s no matter what was asked. Every "knee" above
+# that was the LOAD GENERATOR's timer, not the broker, and the idle CPU on both
+# sides was the tell. 3000 keeps the top rung at a 10ms timer, inside the
+# regime the drivers demonstrably sustain.
+# LANE_B_PUBS_OVERRIDE reproduces an older campaign's population verbatim.
+LANE_B_PUBS="${LANE_B_PUBS_OVERRIDE:-3000}" # per-rung rate = LANE_B_PUBS * 1000/I
 LANE_B_SUBS=300 # total subscribers, ONE shared group ($share/g1)
 # Publisher in-flight window. Without it each QoS1 publisher is a WINDOW-1
 # closed loop whose send rate tracks the broker's ack rate — the ladder then
