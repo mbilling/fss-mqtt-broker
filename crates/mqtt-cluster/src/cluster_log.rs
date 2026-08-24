@@ -34,7 +34,7 @@ use crate::lease_raft::GroupId;
 use crate::placement::group_of_key;
 use crate::NodeId;
 use async_trait::async_trait;
-use mqtt_storage::repl::{DurabilityTier, LogEntry, ReplError, ReplicatedLog};
+use mqtt_storage::repl::{DurabilityTier, LogEntry, PendingAppend, ReplError, ReplicatedLog};
 use mqtt_storage::Offset;
 use redb::{Database, Durability, ReadableTable, TableDefinition};
 use std::collections::BTreeMap;
@@ -749,7 +749,7 @@ impl<T: ReplicaTransport + ?Sized> ReplicaTransport for std::sync::Arc<T> {
 /// The leader's per-key state: its own copy of the log and the commit watermark.
 #[derive(Debug, Default)]
 struct KeyState {
-    /// Leader's copy (may hold an uncommitted tail at `committed + 1`).
+    /// Leader's copy (may hold an uncommitted pipelined tail above `committed`).
     entries: BTreeMap<Offset, Vec<u8>>,
     /// Highest quorum-durable offset. Reads never expose beyond this.
     committed: Offset,
@@ -759,6 +759,28 @@ struct KeyState {
     /// call — including failed ones, so a reused offset's next attempt carries a
     /// higher `seq` and supersedes any replica still holding the failed one.
     seq: u64,
+    /// Highest offset handed out to an in-flight (pipelined) append (ADR 0075);
+    /// `>= committed` while the pipeline is busy, reset to `committed` when it
+    /// drains — which is what makes a retry after failure reuse the failed
+    /// offset, exactly as the serial scheme did.
+    assigned: Offset,
+    /// In-flight pipelined appends for this key.
+    pending: usize,
+    /// The lowest offset that failed in the current pipeline (ADR 0075): every
+    /// pending append at or above it fails too (tail-fail — the committed range
+    /// stays gap-free by construction). Cleared when the pipeline drains.
+    abort_floor: Option<Offset>,
+}
+
+/// The submit half's view of the owner's own durability (ADR 0075): either
+/// already known (inline apply, or a closed writer reading as not-durable) or
+/// pending on the shared writer's completion.
+enum LocalAck {
+    /// The self-ack outcome is already known.
+    Done(bool),
+    /// The op is queued on the ADR 0071 writer; the receiver resolves when its
+    /// batch commits (or fails / the writer shuts down — read as not durable).
+    Pending(oneshot::Receiver<bool>),
 }
 
 /// The lease-holder's quorum-replicated [`ReplicatedLog`].
@@ -772,7 +794,12 @@ pub struct ClusterLog<T: ReplicaTransport> {
     followers: Vec<NodeId>,
     quorum: usize,
     transport: T,
-    state: tokio::sync::Mutex<BTreeMap<String, KeyState>>,
+    /// Arc'd so a pipelined append's durability wait (ADR 0075) can carry a
+    /// `'static` handle to the commit watermark without borrowing the log.
+    state: Arc<tokio::sync::Mutex<BTreeMap<String, KeyState>>>,
+    /// Wakes parked pipelined appends whenever any append resolves, so
+    /// in-order commits cascade (ADR 0075).
+    commit_notify: Arc<tokio::sync::Notify>,
     /// The node's own **durable** replica copy (ADR 0042 T8, exhibit ④). When
     /// attached, the owner's self-ack counts toward a write quorum only after
     /// the op is durably applied here — so an acked entry exists on a full
@@ -831,7 +858,8 @@ impl<T: ReplicaTransport> ClusterLog<T> {
             followers,
             quorum,
             transport,
-            state: tokio::sync::Mutex::new(BTreeMap::new()),
+            state: Arc::new(tokio::sync::Mutex::new(BTreeMap::new())),
+            commit_notify: Arc::new(tokio::sync::Notify::new()),
             local_store: None,
             writer: None,
         }
@@ -877,19 +905,47 @@ impl<T: ReplicaTransport> ClusterLog<T> {
     /// this async worker thread. A closed writer (shutdown) reads as NOT
     /// durable — fail closed, matching the follower path.
     async fn local_ack(&self, epoch: Epoch, op: &ReplOp) -> bool {
+        match self.local_ack_split(epoch, op) {
+            LocalAck::Done(b) => b,
+            LocalAck::Pending(rx) => rx.await.unwrap_or(false),
+        }
+    }
+
+    /// One pipelined append resolved (ADR 0075): when the key's pipeline
+    /// drains, retries resume from the watermark — a failed tail's offsets are
+    /// reused at a higher seq, exactly as the serial scheme reused
+    /// `committed + 1`.
+    fn pipeline_resolved(ks: &mut KeyState) {
+        ks.pending = ks.pending.saturating_sub(1);
+        if ks.pending == 0 {
+            ks.assigned = ks.committed;
+            ks.abort_floor = None;
+        }
+    }
+
+    /// The submit half of [`local_ack`](Self::local_ack) (ADR 0075): hands the
+    /// op to the writer (or applies it inline) WITHOUT awaiting durability, so
+    /// a pipelined submit can enqueue same-key ops in offset order — the
+    /// writer's FIFO then preserves it — while the wait rides in the pending.
+    fn local_ack_split(&self, epoch: Epoch, op: &ReplOp) -> LocalAck {
         match (&self.writer, &self.local_store) {
             (Some(writer), Some(_)) => {
                 let (tx, rx) = oneshot::channel();
                 if writer.send((epoch, op.clone(), tx)).is_err() {
-                    return false;
+                    // Writer gone (shutdown): fail closed, matching the
+                    // follower path.
+                    LocalAck::Done(false)
+                } else {
+                    LocalAck::Pending(rx)
                 }
-                rx.await.unwrap_or(false)
             }
-            (_, Some(store)) => store
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .apply(epoch, op),
-            (_, None) => true,
+            (_, Some(store)) => LocalAck::Done(
+                store
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .apply(epoch, op),
+            ),
+            (_, None) => LocalAck::Done(true),
         }
     }
 
@@ -936,6 +992,7 @@ impl<T: ReplicaTransport> ClusterLog<T> {
                 ks.seq += 1;
             }
             ks.truncated = lowest.map_or(0, |l| l.saturating_sub(1));
+            ks.assigned = ks.committed;
             state.insert(key, ks);
         }
         Self {
@@ -944,7 +1001,8 @@ impl<T: ReplicaTransport> ClusterLog<T> {
             followers,
             quorum,
             transport,
-            state: tokio::sync::Mutex::new(state),
+            state: Arc::new(tokio::sync::Mutex::new(state)),
+            commit_notify: Arc::new(tokio::sync::Notify::new()),
             local_store: None,
             writer: None,
         }
@@ -1296,6 +1354,19 @@ impl<T: ReplicaTransport + Clone + 'static> ReplicatedLog for ClusterLog<T> {
         record: Vec<u8>,
         tier: DurabilityTier,
     ) -> Result<Offset, ReplError> {
+        self.submit_tiered(key, record, tier).await.await
+    }
+
+    // One straight-line pipeline stage (submit → wait → in-order commit);
+    // splitting it would scatter the ordering invariants it exists to keep
+    // adjacent (ADR 0075).
+    #[allow(clippy::too_many_lines)]
+    async fn submit_tiered(
+        &self,
+        key: &String,
+        record: Vec<u8>,
+        tier: DurabilityTier,
+    ) -> PendingAppend {
         // ADR 0072: `Local` returns once the owner's OWN durable copy has the
         // op (required acks = 1, and the local ack only counts when durable —
         // ADR 0042 T8 — so this is single-copy durability, not zero-copy);
@@ -1306,79 +1377,146 @@ impl<T: ReplicaTransport + Clone + 'static> ReplicatedLog for ClusterLog<T> {
             DurabilityTier::Local => 1,
             DurabilityTier::Quorum | DurabilityTier::Relaxed => self.quorum,
         };
-        let mut state = self.state.lock().await;
-        let ks = state.entry(key.clone()).or_default();
-        // Offset is committed + 1: a failed append leaves no committed hole, and a
-        // retry reuses the same offset (idempotent on any follower that stored it).
-        let offset = ks.committed + 1;
-        ks.entries.insert(offset, record.clone());
-        // Every attempt gets a fresh seq (ADR 0042 T7) — a retry that reuses this
-        // offset after a failed quorum supersedes the failed attempt everywhere.
-        ks.seq += 1;
-
-        let op = ReplOp::Append {
-            key: key.clone(),
-            offset,
-            seq: ks.seq,
-            record,
+        // SUBMIT (ADR 0075): under a SHORT lock — assign the next offset,
+        // stage the entry, and hand the op to the shared writer, whose FIFO
+        // then preserves same-key offset order. No durability is awaited here,
+        // so a session's whole window can be in flight at once.
+        let (offset, op, local) = {
+            let mut state = self.state.lock().await;
+            let ks = state.entry(key.clone()).or_default();
+            if ks.assigned < ks.committed {
+                ks.assigned = ks.committed;
+            }
+            let offset = ks.assigned + 1;
+            ks.assigned = offset;
+            ks.pending += 1;
+            ks.entries.insert(offset, record.clone());
+            // Every attempt gets a fresh seq (ADR 0042 T7) — a retry that
+            // reuses this offset after a failure supersedes the failed attempt
+            // everywhere.
+            ks.seq += 1;
+            let op = ReplOp::Append {
+                key: key.clone(),
+                offset,
+                seq: ks.seq,
+                record,
+            };
+            let local = self.local_ack_split(self.lease.epoch, &op);
+            (offset, op, local)
         };
 
-        // Fan out to every follower **concurrently** and commit as soon as the
-        // required acks have accepted — the leader's own copy is one ack, counted
-        // only once it is DURABLY applied to the node's own replica copy (ADR 0042
-        // T8): an acked entry is then on ≥ required durable copies, which a quorum
-        // recovery-read — including a restarted owner reading its own copy — is
-        // guaranteed to intersect (for the quorum tier). A slow or wedged replica
-        // no longer serializes the append: once the requirement is met the
-        // remaining deliveries are abandoned (their frames were already sent, so a
-        // reachable replica still applies them for best-effort spread; the
-        // transport reaps the in-flight entry on timeout).
-        let mut acks = usize::from(self.local_ack(self.lease.epoch, &op).await);
-        if acks < required {
-            let mut inflight = tokio::task::JoinSet::new();
-            for follower in &self.followers {
-                let transport = self.transport.clone();
-                let follower = follower.clone();
-                let epoch = self.lease.epoch;
-                let op = op.clone();
-                inflight.spawn(async move { transport.deliver(&follower, epoch, &op).await });
-            }
-            while acks < required {
-                match inflight.join_next().await {
-                    Some(Ok(true)) => acks += 1,
-                    // A reject/unreachable, or a delivery task that failed — keep
-                    // waiting for the other followers.
-                    Some(Ok(false) | Err(_)) => {}
-                    // Every follower has reported; the requirement was not reached.
-                    None => break,
+        // WAIT: everything below runs without the state lock, concurrently
+        // with later submits. The future captures only Arc'd plain state, the
+        // writer's completion, and the transport — never a store handle — so
+        // whoever drives it (the session lane, a hub-owned task) carries the
+        // right teardown semantics for free (ADR 0061 / issue #242).
+        let state = Arc::clone(&self.state);
+        let notify = Arc::clone(&self.commit_notify);
+        let transport = self.transport.clone();
+        let followers = self.followers.clone();
+        let epoch = self.lease.epoch;
+        let quorum = self.quorum;
+        let key = key.clone();
+        PendingAppend::new(async move {
+            // Fan out to every follower **concurrently** and count acks until
+            // the requirement is met — the leader's own copy is one ack,
+            // counted only once it is DURABLY applied (ADR 0042 T8). A slow or
+            // wedged replica does not serialize the append: once the
+            // requirement is met the remaining deliveries are abandoned (their
+            // frames were already sent, so a reachable replica still applies
+            // them for best-effort spread).
+            let mut acks = usize::from(match local {
+                LocalAck::Done(b) => b,
+                LocalAck::Pending(rx) => rx.await.unwrap_or(false),
+            });
+            if acks < required {
+                let mut inflight = tokio::task::JoinSet::new();
+                for follower in &followers {
+                    let transport = transport.clone();
+                    let follower = follower.clone();
+                    let op = op.clone();
+                    inflight.spawn(async move { transport.deliver(&follower, epoch, &op).await });
+                }
+                while acks < required {
+                    match inflight.join_next().await {
+                        Some(Ok(true)) => acks += 1,
+                        // A reject/unreachable, or a delivery task that failed —
+                        // keep waiting for the other followers.
+                        Some(Ok(false) | Err(_)) => {}
+                        // Every follower has reported; not reached.
+                        None => break,
+                    }
+                }
+            } else if required < quorum {
+                // A Local-tier append satisfied by the owner's copy must still
+                // start its replication, detached and best-effort — the entry
+                // reaching followers is what lets a later owner recover it if
+                // this node's disk dies.
+                for follower in &followers {
+                    let transport = transport.clone();
+                    let follower = follower.clone();
+                    let op = op.clone();
+                    tokio::spawn(async move {
+                        let _ = transport.deliver(&follower, epoch, &op).await;
+                    });
                 }
             }
-            // Abandoning the JoinSet cancels frames not yet SENT; a Local-tier
-            // append that never entered the loop must still start its
-            // replication. Spawn the fan-out detached so it completes
-            // best-effort — the entry reaching followers is what lets a later
-            // owner recover it if this node's disk dies.
-        } else if required < self.quorum {
-            for follower in &self.followers {
-                let transport = self.transport.clone();
-                let follower = follower.clone();
-                let epoch = self.lease.epoch;
-                let op = op.clone();
-                tokio::spawn(async move {
-                    let _ = transport.deliver(&follower, epoch, &op).await;
-                });
-            }
-        }
+            let met = acks >= required;
 
-        if acks >= required {
-            ks.committed = offset;
-            Ok(offset)
-        } else {
-            // Not durable: do not advance the commit watermark. The uncommitted
-            // entry stays in the leader's copy (invisible to reads, which gate on
-            // `committed`) and is overwritten when the next append reuses `offset`.
-            Err(ReplError::NoQuorum)
-        }
+            // COMMIT, strictly in offset order (ADR 0075): a success is only
+            // ever reported at or below the watermark, so an acked append can
+            // never be retroactively lost to an earlier offset's failure; a
+            // failure fails every staged offset above it (tail-fail) and the
+            // committed range stays gap-free by construction.
+            loop {
+                let notified = notify.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                {
+                    let mut guard = state.lock().await;
+                    let Some(ks) = guard.get_mut(&key) else {
+                        // The key was removed mid-flight (session discard):
+                        // there is no watermark left to commit into.
+                        return Err(ReplError::NoQuorum);
+                    };
+                    if ks.abort_floor.is_some_and(|floor| offset >= floor) {
+                        // An earlier offset failed under us: tail-fail.
+                        ks.entries.remove(&offset);
+                        Self::pipeline_resolved(ks);
+                        notify.notify_waiters();
+                        return Err(ReplError::NoQuorum);
+                    }
+                    if !met {
+                        // Not durable: fail this offset and everything staged
+                        // above it. Do not advance the watermark; the retries
+                        // reuse these offsets at a higher seq (ADR 0042 T7),
+                        // superseding any replica that stored a failed attempt.
+                        ks.abort_floor = Some(ks.abort_floor.map_or(offset, |f| f.min(offset)));
+                        let doomed: Vec<Offset> = ks
+                            .entries
+                            .range((Excluded(ks.committed), Included(ks.assigned)))
+                            .map(|(o, _)| *o)
+                            .filter(|o| *o >= offset)
+                            .collect();
+                        for o in doomed {
+                            ks.entries.remove(&o);
+                        }
+                        Self::pipeline_resolved(ks);
+                        notify.notify_waiters();
+                        return Err(ReplError::NoQuorum);
+                    }
+                    if ks.committed + 1 == offset {
+                        ks.committed = offset;
+                        Self::pipeline_resolved(ks);
+                        notify.notify_waiters();
+                        return Ok(offset);
+                    }
+                    // An earlier offset is still pending: park until any
+                    // append resolves, then re-check.
+                }
+                notified.await;
+            }
+        })
     }
 
     async fn read(
@@ -2587,5 +2725,169 @@ mod tests {
         );
         assert_eq!(&served[1].record, b"m2");
         crate::invariants::assert_holds(&ledger.verify_recovered(&k, &served));
+    }
+
+    // --- ADR 0075: pipelined appends -------------------------------------
+
+    use mqtt_storage::repl::{DurabilityTier, ReplError};
+    use mqtt_storage::Offset;
+
+    /// A follower transport whose per-offset verdicts are released by the test:
+    /// a delivery parks until `release(offset, ok)` decides it. Both followers
+    /// behave identically, so releasing an offset `true` grants the one
+    /// follower ack a quorum-2 append needs beyond the (storeless) local ack.
+    #[derive(Clone)]
+    struct GatedFollowers {
+        inner: Arc<GatedInner>,
+    }
+    struct GatedInner {
+        decisions: std::sync::Mutex<BTreeMap<Offset, bool>>,
+        notify: tokio::sync::Notify,
+    }
+    impl GatedFollowers {
+        fn new() -> Self {
+            Self {
+                inner: Arc::new(GatedInner {
+                    decisions: std::sync::Mutex::new(BTreeMap::new()),
+                    notify: tokio::sync::Notify::new(),
+                }),
+            }
+        }
+        fn release(&self, offset: Offset, ok: bool) {
+            self.inner.decisions.lock().unwrap().insert(offset, ok);
+            self.inner.notify.notify_waiters();
+        }
+    }
+    #[async_trait]
+    impl ReplicaTransport for GatedFollowers {
+        async fn deliver(&self, _replica: &NodeId, _epoch: Epoch, op: &ReplOp) -> bool {
+            let ReplOp::Append { offset, .. } = op else {
+                return true;
+            };
+            let offset = *offset;
+            loop {
+                let notified = self.inner.notify.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                if let Some(d) = self.inner.decisions.lock().unwrap().get(&offset) {
+                    return *d;
+                }
+                notified.await;
+            }
+        }
+    }
+
+    fn pipelined_log(transport: GatedFollowers) -> ClusterLog<GatedFollowers> {
+        let local = n("a");
+        let set = vec![n("a"), n("b"), n("c")]; // R=3, quorum=2
+        let lease = OwnershipLease {
+            holder: local.clone(),
+            epoch: 1,
+        };
+        ClusterLog::new(local, lease, &set, transport)
+    }
+
+    /// Three same-key submits overlap their quorum waits, yet report success in
+    /// offset order even when the acks arrive in reverse — a success is only
+    /// ever reported at or below the commit watermark (ADR 0075).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn pipelined_appends_overlap_and_commit_in_offset_order() {
+        let gate = GatedFollowers::new();
+        let log = Arc::new(pipelined_log(gate.clone()));
+        let k = "x".to_string();
+        let done: Arc<std::sync::Mutex<Vec<Offset>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut waits = tokio::task::JoinSet::new();
+        for i in 1..=3u8 {
+            let pending = log.submit_tiered(&k, vec![i], DurabilityTier::Quorum).await;
+            let done = done.clone();
+            waits.spawn(async move {
+                let off = pending.await.unwrap();
+                done.lock().unwrap().push(off);
+            });
+        }
+        // Acks arrive in REVERSE offset order; nothing may complete while
+        // offset 1 is still pending.
+        gate.release(3, true);
+        gate.release(2, true);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            done.lock().unwrap().is_empty(),
+            "no append may report success while an earlier offset is pending"
+        );
+        gate.release(1, true);
+        while waits.join_next().await.is_some() {}
+        assert_eq!(*done.lock().unwrap(), vec![1, 2, 3]);
+        let all = log.read(&k, 0, 100).await.unwrap();
+        assert_eq!(
+            all.iter().map(|e| e.offset).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+    }
+
+    /// A mid-pipeline failure fails every staged offset above it (tail-fail),
+    /// leaves the committed range gap-free, and the drained pipeline reuses
+    /// the failed offsets at a higher seq — exactly the serial retry contract.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_failed_pipelined_append_fails_the_staged_tail_and_leaves_no_hole() {
+        let gate = GatedFollowers::new();
+        let log = Arc::new(pipelined_log(gate.clone()));
+        let k = "x".to_string();
+        let p1 = log
+            .submit_tiered(&k, b"1".to_vec(), DurabilityTier::Quorum)
+            .await;
+        let p2 = log
+            .submit_tiered(&k, b"2".to_vec(), DurabilityTier::Quorum)
+            .await;
+        let p3 = log
+            .submit_tiered(&k, b"3".to_vec(), DurabilityTier::Quorum)
+            .await;
+        gate.release(1, true);
+        gate.release(2, false); // offset 2 cannot reach quorum
+        gate.release(3, true); // offset 3's replication SUCCEEDS — and must still fail
+        let (r1, r2, r3) = tokio::join!(p1, p2, p3);
+        assert_eq!(r1.unwrap(), 1);
+        assert!(matches!(r2, Err(ReplError::NoQuorum)));
+        assert!(
+            matches!(r3, Err(ReplError::NoQuorum)),
+            "an acked offset above a failed one must fail too — committing it would leave a hole"
+        );
+        let all = log.read(&k, 0, 100).await.unwrap();
+        assert_eq!(all.iter().map(|e| e.offset).collect::<Vec<_>>(), vec![1]);
+        // The drained pipeline reuses offsets 2 and 3 (higher seq supersedes).
+        gate.release(2, true);
+        assert_eq!(log.append(&k, b"2r".to_vec()).await.unwrap(), 2);
+        assert_eq!(log.append(&k, b"3r".to_vec()).await.unwrap(), 3);
+        let all = log.read(&k, 0, 100).await.unwrap();
+        assert_eq!(
+            all.iter().map(|e| e.offset).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        assert_eq!(&all[1].record, b"2r");
+    }
+
+    /// A LATER offset failing does not disturb an earlier in-flight append: the
+    /// tail-fail floor only covers offsets at or above the failure.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_earlier_pipelined_append_is_unaffected_by_a_later_failure() {
+        let gate = GatedFollowers::new();
+        let log = Arc::new(pipelined_log(gate.clone()));
+        let k = "x".to_string();
+        let p1 = log
+            .submit_tiered(&k, b"1".to_vec(), DurabilityTier::Quorum)
+            .await;
+        let p2 = log
+            .submit_tiered(&k, b"2".to_vec(), DurabilityTier::Quorum)
+            .await;
+        // Offset 2 fails FIRST, while offset 1 is still replicating.
+        gate.release(2, false);
+        let r2 = p2.await;
+        assert!(matches!(r2, Err(ReplError::NoQuorum)));
+        gate.release(1, true);
+        assert_eq!(p1.await.unwrap(), 1);
+        let all = log.read(&k, 0, 100).await.unwrap();
+        assert_eq!(all.iter().map(|e| e.offset).collect::<Vec<_>>(), vec![1]);
+        // Pipeline drained: the next append reuses offset 2.
+        gate.release(2, true);
+        assert_eq!(log.append(&k, b"2r".to_vec()).await.unwrap(), 2);
     }
 }

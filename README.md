@@ -147,7 +147,7 @@ measured on one host, limits printed beside every number
 
 See [`docs/adr/`](docs/adr/) for the decisions and the
 [**delivery dashboard**](docs/delivery/STATUS.md) — the authoritative, live
-record of exactly what is built (74 ADRs, per-task status).
+record of exactly what is built (75 ADRs, per-task status).
 
 ## The runnable map: mqttui
 
