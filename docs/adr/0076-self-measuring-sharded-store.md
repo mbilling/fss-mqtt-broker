@@ -126,6 +126,45 @@ mechanism, not a bad afternoon on one disk.
    catch-up sweep) that used to queue behind an 11 ms fsync.
 
 The ADR's own rule — *measurement before adaptation* — is what produced this,
-and the honest outcome of measuring first is sometimes not adapting. The
-store's ceiling is still the store's ceiling; ADR 0076 T3 (adaptive
-coalescing, which raises `D` rather than dividing it) is now the live lead.
+and the honest outcome of measuring first is sometimes not adapting.
+
+## Amendment (2026-08-24) — T3's linger is falsified too, for the same reason
+
+T2 divided the batch; T3 proposed to deepen it by waiting. Measured at the
+same shape, with the linger set to a fraction of one measured commit and
+engaged only on a multi-op batch:
+
+| `MQTTD_STORE_LINGER` | acked msg/s | vs off | p50 |
+|---|---|---|---|
+| 0 (off) | 24,488 | — | 15.3 ms |
+| 0.25 | 19,591 | 0.80× | 18.8 ms |
+| 0.5 | 21,303 | 0.87× | 17.8 ms |
+
+**Why there was nothing to gather.** The writer already coalesces everything
+that arrives *during* a commit: it takes one op, drains the queue, commits,
+and every op that queued behind the fsync joins the next batch. So in the
+saturated regime the depth self-balances at
+
+```text
+    D  =  arrival rate × commit time
+```
+
+and throughput `D / commit time` is exactly the arrival rate — the writer is
+already at the optimum the linger was meant to reach. Adding a wait cannot
+deepen a batch that is already gathering a full commit's worth of arrivals; it
+only idles the device for a fraction of a barrier it then still has to pay.
+
+**Both halves of this ADR's adaptation therefore fail against the same
+property.** ADR 0075's group commit did not leave headroom for a smarter
+batching policy — it *removed* the headroom by making the batch self-balancing.
+Dividing that batch (T2) loses `K/P(K)`; delaying it (T3) loses the wait. What
+remains true is T1: the store's ceiling is the volume's barrier rate times a
+depth we no longer control, and the broker should keep measuring and publishing
+both.
+
+**What ships for T3:** the linger, implemented and **off by default**
+(`MQTTD_STORE_LINGER=<0.0..1.0>`, warned loudly when engaged), for the same
+reason T2's shards survive — so the finding stays falsifiable on a workload
+whose arrivals are burstier than a saturating benchmark's. The durable path's
+next real lead is not in the writer at all: it is the fan-out knee at ~140k
+with idle CPU (issue #258), where the limiter is a hub core, not a disk.

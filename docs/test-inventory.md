@@ -241,7 +241,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `two_bridge_instances_do_not_duplicate_forwarding`
 - `two_partitioned_instances_deliver_each_inbound_message_exactly_once`
 
-## `crates/mqtt-cluster/src/lib.rs` — 282 test(s)
+## `crates/mqtt-cluster/src/lib.rs` — 283 test(s)
 
 - `cluster_identity::tests::a_founder_mints_once_and_reloads_stably`
 - `cluster_identity::tests::a_joiner_adopts_once_and_persists`
@@ -321,6 +321,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `durable_plane::tests::reads_carry_completeness_and_catch_up_reaches_the_source`
 - `durable_plane::tests::recovery_read_returns_a_replicas_log_over_the_wire`
 - `durable_plane::tests::replica_writer_group_commits_a_concurrent_burst`
+- `durable_plane::tests::the_linger_is_off_unless_asked_for_and_rejects_nonsense`
 - `hrw::tests::adding_a_node_moves_only_a_minority_of_keys`
 - `hrw::tests::distribution_is_roughly_even`
 - `hrw::tests::empty_has_no_owner`
