@@ -3,8 +3,15 @@
 #
 #   export HCLOUD_TOKEN=...     # Read & Write token from a DEDICATED project
 #   ./run.sh smoke              # 1 node, minutes, <€0.50 — proves the whole rig
+#   ./run.sh standard           # the ~€10 release profile: sizes 1, 5, 10
 #   ./run.sh full               # the curve: fresh 1-, 3- and 5-node clusters
 #   ./run.sh full 3 5           # a subset of sizes
+#
+# WHICH PROFILE: `standard` is the default for a release — three sizes (the
+# floor, the voter cap, the biggest cluster we run) with the shape trimmed to
+# what a release claim actually rests on. `full` is for durable-PATH releases,
+# where the tier arms and every rung are themselves the evidence; it costs
+# ~3-4× as much and takes ~3× as long.
 #
 # Each size is applied FRESH and destroyed before the next: a grown cluster is a
 # known-degraded configuration (replica groups tracked under an earlier
@@ -30,12 +37,29 @@ smoke)
 	BROKER_TYPE="${BROKER_TYPE:-cpx32}"
 	DRIVER_TYPE="${DRIVER_TYPE:-cpx42}"
 	;;
+standard)
+	# The ~€10 release profile. Same rig, same measurement code, same
+	# dedicated-core machine types — only the SHAPE is trimmed, and only
+	# where the trimmed part is not itself a release claim:
+	#   sizes 1, 5, 10   the floor, the voter cap, and the top of our range
+	#                    (3 and 7 interpolate a line we have measured five
+	#                    times; they come back the moment the line bends)
+	#   no tier arms     ADR 0072's tiers are a durable-PATH claim, measured
+	#                    on `full`; a release that does not touch them does
+	#                    not re-pay for them
+	#   3 lane-B rungs   the knee bracket, not the full ladder
+	#   shorter lane C   50k connections still established, held 60s not 120
+	#   2 lane-A reps    median of 2 with the spread reported, not 3
+	shift || true
+	if [ $# -gt 0 ]; then SIZES=("$@"); else SIZES=(1 5 10); fi
+	export STANDARD=1
+	;;
 full)
 	shift || true
 	if [ $# -gt 0 ]; then SIZES=("$@"); else SIZES=(1 3 5); fi
 	;;
 *)
-	echo "usage: $0 smoke | full [sizes...]" >&2
+	echo "usage: $0 smoke | standard [sizes...] | full [sizes...]" >&2
 	exit 2
 	;;
 esac
