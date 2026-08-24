@@ -1,19 +1,17 @@
 # The scaling curve — throughput and p99 vs node count
 
-**Verified against `v1.0.4` (2026-08-23).** Fourth published run of the ADR 0048
+**Verified against `v1.0.5` (2026-08-24).** Fifth published run of the ADR 0048
 §2 curve: the same workload against fresh 1-, 3- and 5-node clusters of the
-signed `v1.0.4` release, one dedicated-vCPU cloud host and one local NVMe disk
+signed `v1.0.5` release, one dedicated-vCPU cloud host and one local NVMe disk
 per broker, measured by `bench/scale/run.sh` and rendered by
-`bench/scale/summarize-curve.py`. This run existed to answer one question —
-**was ADR 0074 right that the durable rows were pinned to the disk's barrier
-rate by a single detached-able wait?** It was: the durable curve moved 3.9× at
-1 node, 12× at 3 nodes, and produced the **first successful 5-node durable
-measurement in the project's history** — 16,378 msg/s, the first size where
-scale-OUT beats one node on the durable path. Getting that 5-node number took
-seven cluster formations and a live packet capture, which found a SWIM
-address-dissemination defect (issue #396) that had been manufacturing every
-"5-node split" since v1.0.2 — disclosed in full below, per the standing rule
-that **a flat curve is a finding to fix, not a number to bury**.
+`bench/scale/summarize-curve.py`. Two questions this run answers: **does the
+scale-out shape survive a second release and a second disk draw** (yes —
+5 nodes beats 1 node by 1.6× on the durable path, again), and **does the
+issue #396 SWIM fix make 5-node formation routine** (yes — first-attempt
+formation, against v1.0.4's seven attempts). One new finding, disclosed per
+the standing rule that **a flat curve is a finding to fix, not a number to
+bury**: the first honest measurement of the `relaxed` tier found it broken
+(issue #399 — acked-then-dropped under saturation; its rows are absent below).
 
 ## Read this first
 
@@ -30,12 +28,17 @@ that **a flat curve is a finding to fix, not a number to bury**.
   merged across drivers — coarse, but incapable of flattering.
 - **Driver fleet per size:** sizes 1 and 3 ran with **three** drivers, size 5
   with two — the account's ~40-dedicated-vCPU ceiling refuses 5×CCX23 +
-  3×CCX33. Every lane B rung's driver-limited flag is reproduced below rather
-  than hidden.
-- **Provenance:** sizes 1/3 and the 5-node lanes B–C are run
-  `20260823T083536Z`; the 5-node lane A is the same-day `LANES=A` rerun
-  (`20260823T143528Z`) after the issue #396 diagnosis — same signed build,
-  host class, region, and rig, fresh hardware.
+  3×CCX33. A quota raise to ~100 vCPU is requested; until then every lane B
+  driver-limited flag is reproduced below rather than hidden.
+- **Absolute durable numbers move with the disk draw** (multi-tenant NVMe):
+  this run drew slower volumes than v1.0.4's (floors 1,941–2,395 vs
+  2,051–2,521 barriers/s, and ~2× the append latency), so its absolute rates
+  sit below v1.0.4's while the *shape* and the barrier-rate decoupling hold.
+  Read the ratios, not just the cells.
+- **Provenance:** size 1 is run `20260823T190100Z`; sizes 3 and 5 are the
+  same-night continuation `20260823T205824Z` after a rig fix (the run died
+  between sizes when a cloud-init retry poisoned a systemd start limit —
+  mechanism and fix in PR #400). Same signed build, host class, region, rig.
 
 ## Host, build, configuration
 
@@ -44,7 +47,7 @@ that **a flat curve is a finding to fix, not a number to bury**.
   24.04, kernel 6.8.0-137. Data dir on the host's local NVMe — never network
   storage.
 - **Broker build:** the released, cosign-signed, byte-reproducible
-  `mqttd-1.0.4-x86_64-unknown-linux-musl`, checksum-verified at install.
+  `mqttd-1.0.5-x86_64-unknown-linux-musl`, checksum-verified at install.
   Config: the shipped `deploy/systemd/mqttd.service` + the disclosed drop-in
   and env template in `bench/scale/` (health on 0.0.0.0 for private-net
   scraping, `MQTTD_MAX_CONNECTIONS=60000`, plaintext listener on the private
@@ -52,34 +55,28 @@ that **a flat curve is a finding to fix, not a number to bury**.
   `TOKIO_WORKER_THREADS` unset, `MQTTD_ALLOW_RELAXED_PUBLISH=1` for the ADR
   0072 tier lanes — disclosed in the template; default lanes publish v3.1.1
   and are unaffected). Cluster PKI from `deploy/systemd/gen-certs.sh`; SWIM
-  signed. Changed mid-campaign and disclosed: `MQTTD_SWIM_BIND` now binds the
-  **private IP, not 0.0.0.0** — the bind is what SWIM gossips to third
-  parties, and the unroutable default was the mechanism behind every prior
-  5-node formation split (issue #396).
+  signed, bound to the routable private IP.
 - **Drivers:** CCX33 (8 dedicated vCPU) on the same private network;
   emqtt-bench 0.6.3 (docker, host network) for lanes B–C; `durable_bench`
   built from the release commit for lane A.
-- **Topology per size:** fresh cluster (apply → measure → destroy) — a grown
-  cluster is a known-degraded configuration. Founder-first bring-up, founder
-  armed to the majority floor before any load; since this campaign the rig
-  also proves the private-net full mesh before the first broker starts and
-  gates lane A on full membership (both in `bench/scale/`, PR #395).
-  Date: 2026-08-23.
+- **Topology per size:** fresh cluster (apply → measure → destroy). Founder-
+  first bring-up, founder armed to the majority floor before any load; the rig
+  proves the private-net full mesh before the first broker starts and gates
+  lane A on full membership. Date: 2026-08-23→24.
 
 ## Per-host durability barrier floors
 
 Measured on every broker host before any lane (`device_barrier_floor`, scratch
-on the data-dir filesystem) — the per-volume ceiling durable rows used to be
-read against:
+on the data-dir filesystem):
 
 | nodes | per-broker floor (single-writer barriers/s) |
 |---|---|
-| 1 | 2,382 |
-| 3 | 2,416 / 2,373 / 2,195 |
-| 5 | 2,521 / 2,143 / 2,263 / 2,222 / 2,051 |
+| 1 | 2,162 |
+| 3 | 2,177 / 1,954 / 2,096 |
+| 5 | 2,395 / 2,031 / 1,941 / 2,261 / 2,109 |
 
-A clean draw this time (no ~700-barriers/s outlier volumes; v1.0.3 drew two).
-The floors matter differently now — see the falsifier verdict below.
+A uniformly slower draw than v1.0.4's, with ~2× its append latency (p99
+12.8 ms vs 6.4 ms at size 1) — the honest denominator for every durable row.
 
 ## Curve 1 — durable QoS 1, closed loop (spread ownership)
 
@@ -90,66 +87,64 @@ quorum-replicated (ADR 0057).
 
 | nodes | acked msg/s (saturating) | exact p99 (saturating) | exact p99 (uncontended: window 1, one publisher per node) | verdict |
 |---|---|---|---|---|
-| 1 | 11,833 [10,957..12,005] | 65 ms [64..95] | 0.93 ms [0.92..0.95] | valid |
-| 3 | 10,393 [10,325..10,398] | 84 ms [82..86] | 1.79 ms [1.76..1.79] | valid |
-| 5 | **16,378 [16,333..16,679]** | 53 ms [43..64] | 1.59 ms [1.58..1.63] | valid — **first 5-node durable measurement ever** |
+| 1 | 8,503 [8,134..8,636] | 90 ms [88..93] | 1.01 ms [1.00..1.02] | valid |
+| 3 | 8,647 [8,352..8,725] | 82 ms [81..84] | 1.81 ms [1.78..1.86] | valid |
+| 5 | **13,893 [13,799..14,214]** | 56 ms [55..77] | 1.69 ms [1.68..1.76] | valid — **first-attempt formation** |
 
-QoS 2, same shape: 4,685 [4,681..4,716] msg/s at 1 node, 2,425 [2,415..2,628]
-at 3, 3,309 [3,309..3,448] at 5. Clean sessions (nothing durable to write):
-43.6k [35.0k..57.4k] at 1 node, 99.1k [91.1k..102.1k] at 3, 102.5k
-[102.4k..103.1k] at 5 — the durable price tag is now ~4–9×, down from
-~14–120× last run.
+QoS 2, same shape: 2,970 [2,965..3,023] msg/s at 1 node, 2,124 [2,111..2,248]
+at 3, 3,009 [3,006..3,075] at 5. Clean sessions (nothing durable to write):
+32.1k [27.4k..38.7k] at 1 node, 89.4k [79.6k..93.9k] at 3, 109.6k
+[109.1k..110.0k] at 5.
 
-**The ADR 0074 falsifier — verdict: PASSED.** The v1.0.2/v1.0.3 rows sat at a
-near-constant 0.8–1.35× of their slowest disk's barrier *rate* across four
-independent draws — the signature of one serialized barrier-wait per message
-(the subscriber-ack truncate) on the hub loop. ADR 0074 predicted that
-detaching it would decouple durable throughput from the disk draw entirely,
-and staked itself on this run. The rows now sit at **5.0×** (1 node), **4.7×**
-(3 nodes) and **8.0×** (5 nodes) of the slowest member's barrier rate — the
-pinning is gone, and the group-commit writer (ADR 0071) finally runs at real
-batch depth instead of the 2.29 ops/fsync measured last release.
+**The v1.0.4 findings hold on a second release and a second draw.** The rows
+sit at **3.9× / 4.4× / 7.2×** of the slowest member's barrier rate (the
+pre-0074 pinning was 0.8–1.35× across four draws) — durable throughput stays
+decoupled from the disk. The shape repeats: 3 nodes ≈ 1 node (the quorum tax
+fully absorbed — this draw actually reads +1.7%), and **5 nodes = 1.63× a
+single node** (v1.0.4: 1.38×) — ownership spread across five owners beats the
+quorum tax with room to spare, twice in a row now. Saturating p99 *improves*
+with size (90 → 82 → 56 ms): more owners means shallower per-owner queues at
+the same offered load.
 
-**The curve's new shape — 11.8k → 10.4k → 16.4k — is the honest geometry of
-quorum + spread ownership.** Three nodes is the worst durable size: every
-write pays majority replication but ownership spreading only buys three
-owners' disks (quorum tax vs 1 node: **12%**, down from 72% in v1.0.3). Five
-nodes pays the same tax and buys five owners — **1.38× a single node**, the
-first time the durable path has scaled OUT past one machine. The uncontended
-ack stays ~1.6 ms at 5 nodes vs 0.93 ms at 1 — quorum's latency cost when the
-pipeline is empty.
+**v1.0.4 → v1.0.5, honestly:** the absolute cells read lower (8.5k vs 11.8k
+at 1 node) on a draw whose volumes are ~10% slower on barrier rate and ~2× on
+append latency; the barrier-rate multiples above are the like-for-like
+comparison, and they match. No durable-path change shipped in v1.0.5 (its
+changes are SWIM addressing and bench hygiene), so the draw is the whole
+difference — the multi-tenant-NVMe caveat this doc has carried since v1.0.3.
 
-**v1.0.3 → v1.0.4, honestly:** 1-node 3,048 → 11,833 (**3.9×**, comparable
-disks); 3-node 867 → 10,393 (nominally 12×, but v1.0.3's row was hostage to a
-706-barriers/s volume — against v1.0.2's 1,753 on a healthy draw it is
-**5.9×**); 5-node — no prior number has ever existed to compare against.
-QoS 2: 2.6× / 2.7× at sizes 1 / 3.
+**Formation, the v1.0.5 proof:** v1.0.4's 5-node point took seven formations
+across four paid launches to land once, by luck (issues #393/#396). This
+run's 5-node cluster formed **on the first attempt** with the #396 fix aboard
+(unroutable addresses can neither poison nor survive in gossip) — the
+membership gate passed without a re-form, and the same held at size 3.
 
 ## Durability tiers (ADR 0072) — same workload, publisher-selected ack meaning
 
-Saturating plus an uncontended (window 1) variant per tier — at closed-loop
-saturation the lanes flow-control every tier to the pipeline's rate, so the
-tier's real face is the uncontended ack RTT:
-
 | nodes | tier | acked msg/s (sat) | exact p99 (sat) | exact p99 (uncontended) |
 |---|---|---|---|---|
-| 1 | `quorum` | 11,833 [10,957..12,005] | 65 ms | 0.93 ms [0.92..0.95] |
-| 1 | `local` | 11,683 [11,664..11,888] | 65 ms | 0.93 ms [0.92..0.94] |
-| 3 | `quorum` | 10,393 [10,325..10,398] | 84 ms | 1.79 ms [1.76..1.79] |
-| 3 | `local` | 9,941 [9,667..10,252] | 85 ms | 1.78 ms [1.78..1.81] |
-| 5 | `quorum` | 16,378 [16,333..16,679] | 53 ms | 1.59 ms [1.58..1.63] |
-| 5 | `local` | 16,303 [16,142..16,601] | 54 ms | 1.55 ms [1.55..1.57] |
+| 1 | `quorum` | 8,503 [8,134..8,636] | 90 ms | 1.01 ms [1.00..1.02] |
+| 1 | `local` | 8,734 [8,716..8,773] | 82 ms | 1.03 ms [1.02..1.06] |
+| 3 | `quorum` | 8,647 [8,352..8,725] | 82 ms | 1.81 ms [1.78..1.86] |
+| 3 | `local` | 8,230 [8,208..8,325] | 83 ms | 1.83 ms [1.82..1.86] |
+| 5 | `quorum` | 13,893 [13,799..14,214] | 56 ms | 1.69 ms [1.68..1.76] |
+| 5 | `local` | 13,584 [13,055..13,681] | 77 ms | 1.72 ms [1.68..1.74] |
 
-The two-run finding **holds for a third run and a third disk draw: the tiers
-converge on datacenter NVMe** — weakening the ack's meaning buys nothing here;
-quorum is already the cheapest honest thing this hardware can say. **The
-`relaxed` rows are absent this run — a bench defect, not a broker one**
-(issue #394): the tier arms reuse durable client-ids across invocations
-against the same long-lived cluster, and the relaxed arm (which runs last)
-inherits the local arm's still-queued sessions; the broker's spec-correct
-post-CONNACK redelivery then trips the harness's rigid frame-order
-assertion. The defect was filed with the fix direction (per-invocation id
-salt); the rows return next run.
+`quorum` and `local` converge for the fourth run in a row — on datacenter
+NVMe, weakening the ack to single-copy buys nothing.
+
+**The `relaxed` rows are absent because the tier is broken, and this run is
+the first to measure it (issue #399).** With the #394 bench defect fixed, the
+relaxed lane ran honestly for the first time since ADR 0074 shipped: a
+relaxed pending is acked `Accepted` on submit even when the append lane
+refused the job, and with the ack released early the publisher has no flow
+control at all — it free-runs into the bounded lanes and the completions
+collapse (measured 0 / 215 / 3,762 msg/s across reps at 1 node; 0 / 0 / 0 at
+3 and 5 nodes; deliveries flowing throughout). The hole has existed since ADR
+0072 but was masked first by the pre-0074 hub-loop throttle (v1.0.3 measured
+2,489 msg/s clean because *everything* was slow), then by #394 hiding the
+lanes in v1.0.4. Fix directions are in the issue; the rows return when it
+closes.
 
 ## Curve 2 — non-durable `$share` fan-out (the ADR 0015 mechanism)
 
@@ -163,24 +158,23 @@ emqtt-bench-counted):
 
 | offered | 1 node | 3 nodes | 5 nodes (2 drivers) |
 |---|---|---|---|
-| 20k | 19.6k | 18.8k, p99 ≤ 5ms | 14.9k |
-| 50k | 22.5k ← plateau | 47.1k, p99 ≤ 25ms | 36.3k |
-| 100k | 22.5k | 67.1k | 59.6k |
-| 200–300k | ~22.9k | **~68.5k ← plateau** | ~54k |
+| 20k | 18.1k | 18.7k, p99 ≤ 5ms | 19.1k, p99 ≤ 5ms |
+| 50k | 18.2k ← plateau | 46.1k, p99 ≤ 25ms | 47.0k, p99 ≤ 5ms |
+| 100k | 18.1k | 53.1k | 79.3k |
+| 200–300k | ~18.6k | **~53.9k ← plateau** | **~81.4k ← plateau** |
 
-Statistically unchanged from v1.0.3 (22.8k / 69k / 70k) at sizes 1 and 3 —
-expected: v1.0.4's changes are durable-path, and this lane runs with the
-durable plane off. Two disclosures keep the table honest:
+Every rung above 50k is driver-limited (flagged per cell), so these are
+floors. Two observations worth carrying anyway:
 
-- **Broker-received exceeds driver-sent at every rung** (flagged per cell by
-  the summarizer): under deliberate overload the closed-loop QoS 1 window
-  retransmits, and the broker counts each accepted redelivery. The
-  subscriber-delivered number is the one tabled.
-- **The 5-node column is a two-driver floor** (quota ceiling), and this
-  floor read *lower* than v1.0.3's two-driver floor (~54k vs ~70k at the top
-  rungs) — driver-side variance between runs of an explicitly driver-limited
-  configuration, not a broker verdict in either direction. The real 5-node
-  knee still waits on the quota raise.
+- **The 5-node floor jumped ~50% against v1.0.4's identical two-driver
+  configuration** (~81k vs ~54k delivered). No fan-out code changed in
+  v1.0.5; the suspect is the #396 fix — v1.0.4's 5-node cluster ran with
+  relay-poisoned SWIM records even when formation succeeded, and v1.0.5's
+  gossip is clean. A floor-vs-floor comparison proves nothing alone; the
+  three-driver rerun after the quota raise is the test.
+- **Broker-received exceeds driver-sent at every rung** — closed-loop QoS 1
+  retransmission under deliberate overload; the subscriber-delivered number
+  is the one tabled.
 
 ## Connections at 50,000
 
@@ -188,43 +182,30 @@ durable plane off. Two disclosures keep the table honest:
 |---|---|---|---|
 | 1 | 49,998 | 945 MiB | 19.4 |
 | 3 | 49,998 | 960 MiB | 19.7 |
-| 5 | 50,000 | 943 MiB | 19.3 |
+| 5 | 50,000 | 944 MiB | 19.3 |
 
-Flat per-connection memory in cluster size, fourth run in a row (~15 KiB/conn
+Flat per-connection memory in cluster size, fifth run in a row (~15 KiB/conn
 claimed in `docs/SIZING.md`; 19.3–19.7 measured with observability running).
 
 ## Losing dimensions, stated first
 
-- **The 5-node durable point took seven formations to measure, and the reason
-  is a real product defect (issue #396).** SWIM gossips a member's
-  self-claimed bind address to third parties; bound to the documented default
-  `0.0.0.0:7946`, every member learned by relay (rather than from a seed's
-  first-hand UDP source) is recorded at an unroutable address and dialed at
-  loopback. On this rig's seed graph the three non-seed brokers had no
-  working SWIM links among themselves, and the ring-middle member was
-  probe-failed by both neighbors and evicted — the same node, every
-  formation, on provably healthy fabric (live tcpdump: the victim's probes of
-  gossip-learned peers landing on its own loopback; ping, TCP and sized-UDP
-  sweeps clean throughout). Recovery is then impossible: the evicted member's
-  probes still get *answered* by nodes that no longer list it, so the #383
-  re-greet never fires, and nothing re-admits a fully removed member (issue
-  #393) — restart included, because the poisoned records live on the other
-  nodes. Whether a formation survives is a race between indirect-probe
-  address repair and the suspicion timeout: six formations lost it, the
-  seventh won, and the rig now binds SWIM to the routable private IP so the
-  class is closed for the bench. This also retroactively explains the
-  v1.0.2/v1.0.3 "5-node splits" attributed to #383 — whose shipped fixes,
-  for the record, were observed behaving exactly as designed in the wild
-  (first-hand tombstone pierces landing mid-incident).
-- **The `relaxed` tier is unmeasured this run** — bench defect #394,
-  disclosed in the tier section.
-- **Curve 2's 5-node column is a two-driver floor** (quota), with the
-  floor-vs-floor variance against v1.0.3 disclosed above.
+- **The `relaxed` tier is broken and unmeasured** — issue #399, first honest
+  measurement, full mechanism in the tier section. The other two tiers are
+  unaffected (their flow control is the ack-wait itself).
+- **The run died once between sizes** — a cloud-init clean+reboot retry left
+  the enabled mqttd unit crash-looping against a not-yet-pushed config until
+  systemd's start limit poisoned it, and bootstrap's own restart was then
+  refused. Rig-fixed the same night (PR #400: config-less boots are inert
+  via `ConditionPathExists`; bootstrap runs `reset-failed` before its
+  restart), and sizes 3/5 completed on the relaunch.
+- **Curve 2's 5-node column is a two-driver floor** (quota), and both its
+  cells and the v1.0.4 comparison above are floor-vs-floor.
 - Lane B p99s are bucket bounds; cross-driver clock skew bounds the finest
   readable bucket.
-- Multi-tenant NVMe variance is real (3.7× across nominally identical hosts
-  in v1.0.3); this run's draw was clean (2,051–2,521), and with ADR 0074
-  shipped the durable rows no longer inherit the draw either way.
+- Multi-tenant NVMe variance is real and measured per run — this run's
+  uniformly slower draw moved every absolute durable cell down ~25–30% while
+  the barrier-rate multiples held; the doc's rule stands: read durable rows
+  against their printed floors.
 
 ## A run judges itself
 
@@ -232,11 +213,11 @@ Enforced mechanically: per-host barrier probes gate Curve 1 (a size without
 probes renders UNINTERPRETABLE); `durable_bench`'s verdicts are carried
 verbatim; broker counter deltas cross-check driver totals with every mismatch
 flagged; driver-limited rungs are excluded from knee detection; preflight
-captures every node's `/readyz` + `/statusz`; and since this campaign the rig
-proves the private-net full mesh before the first broker starts, gates lane A
-on full membership with one wipe-and-re-form retry, and collects every host's
-journal on failure — which is how issue #396 went from "fifth mystery split"
-to a packet-capture-proven root cause inside one afternoon.
+captures every node's `/readyz` + `/statusz`; the rig proves the private-net
+full mesh before the first broker starts, gates lane A on full membership,
+and collects every host's journal on failure — which is how both of this
+campaign's rig defects (#400's start-limit poison, and v1.0.4's #396) went
+from mystery to mechanism within hours.
 
 ## Reproducing everything above
 
@@ -244,10 +225,10 @@ to a packet-capture-proven root cause inside one afternoon.
 cd bench/scale
 export HCLOUD_TOKEN=...   # Read & Write token, dedicated Hetzner project
 ./run.sh smoke            # ~20 min, <€0.50 — proves the rig end to end
-MQTTD_VERSION=1.0.4 OBSERVE=1 DRIVER_COUNT=3 ./run.sh full 1 3
-MQTTD_VERSION=1.0.4 OBSERVE=1 DRIVER_COUNT=2 ./run.sh full 5
+MQTTD_VERSION=1.0.5 OBSERVE=1 DRIVER_COUNT=3 ./run.sh full 1 3
+MQTTD_VERSION=1.0.5 OBSERVE=1 DRIVER_COUNT=2 ./run.sh full 5
 # a single lane can be rerun in isolation, e.g. the durable lane only:
-LANES=A MQTTD_VERSION=1.0.4 DRIVER_COUNT=2 ./run.sh full 5
+LANES=A MQTTD_VERSION=1.0.5 DRIVER_COUNT=2 ./run.sh full 5
 python3 summarize-curve.py .runs/<stamp>/results
 ```
 
@@ -261,15 +242,14 @@ variants, the `LANES` filter and the lane A membership gate),
 ## Related
 
 - `docs/benchmarks/DURABLE-PATH.md` — the single-host durable floor and method.
-- `docs/adr/0071-owner-side-group-commit.md`, `docs/adr/0072-per-message-durability-selection.md`,
+- `docs/adr/0071-owner-side-group-commit.md`, `docs/adr/0072-per-message-durability-selection.md`
+  (its `relaxed` tier is the subject of issue #399),
   `docs/adr/0073-scale-out-durable-ownership.md` (awaiting its 7/10-node
   measurement behind the quota raise), `docs/adr/0074-detached-ack-truncate.md`
-  — **its hardware falsifier is this run, and it passed** (3.9× / 12× /
-  first-ever 5-node point; disk-draw pinning gone).
+  (hardware-verified two releases running: durable rows at 3.9–7.2× the
+  slowest disk's barrier rate vs the 0.8–1.35× pinning it removed).
 - `docs/adr/0048-comparative-benchmarking.md` §2 — the mandate and honesty
   rules; `docs/delivery/0048-comparative-benchmarking.md` T3/T4 track this work.
-- Issues: #358 (fixed v1.0.1), #368 (observability fixed v1.0.3), #376 (fixed
-  v1.0.3), #383 (fixed v1.0.4 — fixes observed working in the wild this run),
-  #390 (fixed, ships next release), #393 / #396 (open — the removal trap and
-  the address-dissemination defect this campaign diagnosed), #394 (open —
-  the relaxed-tier bench defect).
+- Issues: #383 (fixed v1.0.4), #390 / #393 / #394 / #396 (fixed v1.0.5 —
+  this run's first-attempt 5-node formation is #396's proof), #399 (open —
+  the relaxed tier, found by this run), #400 (rig, fixed mid-campaign).
