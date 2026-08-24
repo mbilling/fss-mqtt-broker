@@ -101,6 +101,9 @@ LANE_B_SUBS=300 # total subscribers, ONE shared group ($share/g1)
 # every rung identical). 100 matches bench/run.sh's saturate posture.
 LANE_B_INFLIGHT=100
 LANE_B_REF_RUNG=50000
+# Seconds between the publishers starting and the latency baseline scrape: the
+# ramp, excluded from the measured window (see the scrape in lane_b_rung).
+LANE_B_SETTLE="${LANE_B_SETTLE:-15}"
 BENCH_IMG="emqx/emqtt-bench:0.6.3"
 
 # ── helpers ──────────────────────────────────────────────────────────────────
@@ -343,8 +346,19 @@ lane_b_rung() { # lane_b_rung <total-rate> <posture:plain|mtls>
 	[ "$pubs_per" -ge 1 ] || pubs_per=1
 	local args="" port_base=9200
 	[ "$posture" = mtls ] && args="$TLS_ARGS"
+	# emqtt-bench's socket mode. Its own help: "once" is the LEGACY DEFAULT,
+	# "suitable for high-concurrency clients with LOW MESSAGE FREQUENCY"; "true"
+	# is "highly active (RECOMMENDED), optimized for full speed, ideal for
+	# HIGH-FREQUENCY messages and balanced scheduling". Every rung this rig has
+	# ever run is a high-frequency saturation test, and every one of them ran on
+	# the low-frequency default: `once` re-arms the socket after each message,
+	# so every message costs a syscall and a scheduler round trip. That is
+	# latency-bound, not CPU-bound — which is exactly the shape we measured
+	# (a hard ceiling near 950 msg/s per connection with idle cores on both
+	# sides). Use what the tool recommends for what we are actually doing.
+	local active="-A true"
 	snapshot_metrics "$rdir" before
-	start_cpu_sampling "$rdir/cpu" "$LANE_B_SECS"
+	start_cpu_sampling "$rdir/cpu" $((LANE_B_SETTLE + LANE_B_SECS))
 	local di bi host port
 	# subscribers first (they expose the e2e histogram), then publishers
 	for ((di = 0; di < D; di++)); do
@@ -352,7 +366,7 @@ lane_b_rung() { # lane_b_rung <total-rate> <posture:plain|mtls>
 			host=$(inv ".brokers[$bi].private_ip")
 			port=$([ "$posture" = mtls ] && echo 8883 || echo 1883)
 			drun "$di" "sub-$di-$bi" "-v /opt/bench-certs:/opt/bench-certs:ro $BENCH_IMG \
-				sub -h $host -p $port -c $subs_per -t '\$share/g1/bench/#' -q 1 \
+				sub -h $host -p $port -c $subs_per -t '\$share/g1/bench/#' -q 1 $active \
 				--payload-hdrs ts --prometheus --restapi $((port_base + bi)) $args"
 		done
 	done
@@ -361,9 +375,35 @@ lane_b_rung() { # lane_b_rung <total-rate> <posture:plain|mtls>
 		for ((bi = 0; bi < N; bi++)); do
 			host=$(inv ".brokers[$bi].private_ip")
 			port=$([ "$posture" = mtls ] && echo 8883 || echo 1883)
+			# `-t bench/%i` numbers topics by CLIENT SEQNO, which restarts at
+			# --startnumber in every container. Without an offset all D*N
+			# containers publish the same `bench/1..pubs_per` set, so the run
+			# has `LANE_B_PUBS / (D*N)` distinct topics — 60 where the doc
+			# claims 3000 — and the count silently changes with fleet shape,
+			# which is precisely what ADR 0048 §2's same-workload-at-every-size
+			# rule forbids. emqtt-bench documents `-n` for exactly this ("useful
+			# when running multiple emqtt-bench instances to test the same
+			# broker"). Offset each container's block so topics are globally
+			# distinct and the topic count IS LANE_B_PUBS by construction.
+			local seq_base=$(((di * N + bi) * pubs_per))
 			drun "$di" "pub-$di-$bi" "-v /opt/bench-certs:/opt/bench-certs:ro $BENCH_IMG \
-				pub -h $host -p $port -c $pubs_per -t 'bench/%i' -q 1 -s 256 \
-				-I $interval -F $LANE_B_INFLIGHT --payload-hdrs ts $args"
+				pub -h $host -p $port -c $pubs_per -t 'bench/%i' -q 1 -s 256 $active \
+				-n $seq_base -I $interval -F $LANE_B_INFLIGHT --payload-hdrs ts $args"
+		done
+	done
+	# Let the publisher ramp finish BEFORE the latency measurement starts. The
+	# subscriber histograms are CUMULATIVE over the container's life, so a
+	# single end-of-rung scrape bakes every message delivered while the
+	# publishers were still connecting into the published percentiles — a fine
+	# median with a heavy tail, for reasons that have nothing to do with the
+	# broker's steady state. Baseline here, scrape again at the end, and the
+	# summarizer reports the DIFFERENCE: the same steady-window discipline the
+	# throughput numbers already use.
+	sleep "$LANE_B_SETTLE"
+	for ((di = 0; di < D; di++)); do
+		for ((bi = 0; bi < N; bi++)); do
+			rssh "$(driver_pub_ip "$di")" "curl -s http://localhost:$((port_base + bi))/metrics" \
+				>"$rdir/sub-$di-$bi-base.prom" 2>/dev/null || true
 		done
 	done
 	sleep "$LANE_B_SECS"
