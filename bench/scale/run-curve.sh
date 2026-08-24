@@ -48,6 +48,19 @@ if [ "${SMOKE:-0}" = 1 ]; then
 	LANE_C_HOLD=20
 	A_REPS=1 A_SECS=15 A_WARMUP=3
 	BARRIER_OPS=50
+elif [ "${STANDARD:-0}" = 1 ]; then
+	# The ~€10 release profile (run.sh standard): the same measurements at a
+	# trimmed shape. Every knob below is a DURATION or a COUNT — nothing here
+	# changes what is measured or how, so a standard point is directly
+	# comparable to a full one, with a wider confidence interval on lane A
+	# (2 reps) and a coarser ladder (the knee bracket only).
+	LANE_B_RUNGS=(50000 150000 300000)
+	LANE_B_SECS=45
+	LANE_C_CONNS=50000
+	LANE_C_RAMP=2500
+	LANE_C_HOLD=60
+	A_REPS=2 A_SECS=45 A_WARMUP=10
+	BARRIER_OPS=150
 else
 	# Overridable for a focused knee hunt (issue #258 follow-up: the 7-node
 	# fan-out plateau at ~140k with idle aggregate CPU): a space-separated
@@ -256,7 +269,10 @@ lane_a_tier() { # lane_a_tier <tier>
 		>"$OUT/laneA/tier-$t-lat.txt" 2>&1 || warn "lane A tier $t lat exited nonzero — kept output"
 	say "  lane A tier $t done"
 }
-if [ "${SMOKE:-0}" != 1 ]; then
+# The tier arms are a durable-PATH claim: they belong to the release that
+# changes the durable path, and the standard profile does not re-pay for them
+# (they are ~a third of lane A's wall clock).
+if [ "${SMOKE:-0}" != 1 ] && [ "${STANDARD:-0}" != 1 ]; then
 	lane_a_tier local
 	lane_a_tier relaxed
 fi
@@ -268,7 +284,10 @@ fi
 # state, so only a fresh formation honestly measures the larger cap) and runs
 # the same sat/lat shape — the actually-new question at this size: what does a
 # majority-of-N quorum cost over a majority-of-5?
-if [ "$N" -gt 5 ] && [ "${SMOKE:-0}" != 1 ]; then
+# Skipped on the standard profile: the committee-tax question was answered at
+# 7 nodes (zero steady-state cost over majority-of-5), and re-answering it
+# costs a whole extra formation plus two lane-A runs at the largest size.
+if [ "$N" -gt 5 ] && [ "${SMOKE:-0}" != 1 ] && [ "${STANDARD:-0}" != 1 ]; then
 	say "[$N nodes] lane A voters variant: fresh formation with MQTTD_LEASE_VOTERS=$N"
 	wipe_broker_data() {
 		rssh "$(broker_pub_ip "$1")" "systemctl stop mqttd; rm -rf /var/lib/mqttd/*"

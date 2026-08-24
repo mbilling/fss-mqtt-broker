@@ -40,10 +40,21 @@ workflows.
 | run | servers | ≈ wall time | ≈ cost |
 |---|---|---|---|
 | `smoke` | 1×CCX23 + 1×CCX33 | 20–30 min | <€0.50 |
+| `standard` (1+5+10) | up to 10×CCX23 + 4×CCX33, one size at a time | 4–5 h | €8–10 |
 | `full` (1+3+5) | up to 5×CCX23 + 2×CCX33, one size at a time | 4–5 h | €1.50–2 |
+| `full` (1+3+5+7+10) | up to 10×CCX23 + 6×CCX33, one size at a time | 12–14 h | €33–40 |
 | forgotten 5-node stack | — | per day | ≈€8.50 |
 
-Budget **€10** and the worst case is covered. The last line is why teardown is
+**Which profile.** `standard` is the release default: sizes 1, 5 and 10 — the
+floor, the voter cap, and the top of our range — with the shape trimmed only
+where the trimmed part is not itself a release claim (no ADR 0072 tier arms,
+a 3-rung lane-B knee bracket instead of the 5-rung ladder, lane C held 60 s
+instead of 120, 2 lane-A reps instead of 3, and no past-the-voter-cap
+variant). Nothing about *what* is measured changes, so a standard point is
+directly comparable to a full one. Run `full` when the release changes the
+durable path — then the tier arms and every rung are the evidence.
+
+Budget **€10** and a standard run plus the worst case is covered. The last line is why teardown is
 trapped on EXIT/INT/TERM, why `teardown.sh` exists separately, and why step 1
 says *dedicated project*: after any run, `hcloud server list` (or the console)
 must show zero servers.
@@ -54,6 +65,7 @@ must show zero servers.
 cd bench/scale
 export HCLOUD_TOKEN=...
 ./run.sh smoke     # proves token → apply → PKI → bring-up → lanes → destroy
+./run.sh standard  # the ~€10 release profile: sizes 1, 5, 10
 ./run.sh full      # the curve; or ./run.sh full 3 5 for a subset
 python3 summarize-curve.py .runs/<stamp>/results   # markdown for the doc
 ```
