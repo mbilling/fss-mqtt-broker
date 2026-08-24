@@ -865,7 +865,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 341 test(s)
+## `crates/mqttd/src/lib.rs` — 343 test(s)
 
 - `admission::tests::the_global_cap_refuses_at_the_bound_and_recovers`
 - `admission::tests::the_penalty_box_refuses_after_the_threshold`
@@ -1003,6 +1003,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::a_co_subscribed_filter_releases_the_ack_while_a_moved_durable_copy_is_lost`
 - `hub::tests::a_committed_clear_back_fills_as_a_tombstone_and_fences`
 - `hub::tests::a_committed_retained_publish_fans_out_with_its_token`
+- `hub::tests::a_congested_relaxed_forward_is_answered_at_append_completion`
 - `hub::tests::a_congested_relaxed_publish_waits_for_its_append`
 - `hub::tests::a_crashed_hub_releases_the_store_so_the_node_can_restart`
 - `hub::tests::a_cross_node_shared_delivery_is_answered_and_reselects_before_refusing`
@@ -1094,6 +1095,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::an_owner_dedups_a_retransmitted_handoff`
 - `hub::tests::an_owner_reaps_an_expired_retained_value_as_a_committed_clear`
 - `hub::tests::an_unanswered_shared_forward_holds_the_ack_and_retransmits_the_shared_frame`
+- `hub::tests::an_uncongested_relaxed_forward_is_answered_at_submit`
 - `hub::tests::an_unconverged_or_unnameable_roster_member_blocks_the_reap`
 - `hub::tests::an_unknown_refusal_code_withholds_and_never_acks`
 - `hub::tests::an_unreachable_owner_queues_mutations_until_the_link_heals`

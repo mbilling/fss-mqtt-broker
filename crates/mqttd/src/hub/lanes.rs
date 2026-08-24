@@ -166,6 +166,17 @@ pub(super) struct RemoteAppendGate {
     pub(super) awaiting: usize,
     /// The composed verdict so far ([`DurableOutcome::and`] precedence).
     pub(super) worst: DurableOutcome,
+    /// The congestion valve's owner half (issue #399): true when any of this
+    /// forward's lane submits found its lane at or past
+    /// [`RELAXED_CONGESTION_DEPTH`]. A relaxed forward is then answered only
+    /// at append completion — the quorum rule — so the origin's publisher
+    /// window throttles to this node's drain rate instead of flooding a lane
+    /// it cannot see.
+    pub(super) congested: bool,
+    /// The verdict already went out at submit-acceptance (a relaxed,
+    /// uncongested forward — issue #399); completion must not answer twice,
+    /// and a post-answer degradation surfaces in metrics, not on the wire.
+    pub(super) answered: bool,
 }
 
 /// Bound on jobs queued in one session's append lane (issue #242). At the cap the
@@ -694,13 +705,21 @@ impl Hub {
                 }
             }
             AppendThen::Peer(node, seq) => {
-                self.remote_append_pending
+                let g = self
+                    .remote_append_pending
                     .entry((node, seq))
                     .or_insert(RemoteAppendGate {
                         awaiting: 0,
                         worst: DurableOutcome::Ok,
-                    })
-                    .awaiting += 1;
+                        congested: false,
+                        answered: false,
+                    });
+                g.awaiting += 1;
+                // The valve's owner half (issue #399): a deep lane holds a
+                // relaxed forward's verdict back to append completion.
+                if lane_depth >= RELAXED_CONGESTION_DEPTH {
+                    g.congested = true;
+                }
             }
             AppendThen::Ungated => {}
         }
@@ -808,7 +827,26 @@ impl Hub {
                     g.worst = g.worst.and(out);
                     if g.awaiting == 0 {
                         if let Some(g) = self.remote_append_pending.remove(&(node.clone(), seq)) {
-                            self.answer_forward(&node, seq, g.worst.to_verdict());
+                            if g.answered {
+                                // The relaxed early verdict (issue #399) already
+                                // went out at submit-acceptance; a degradation
+                                // after it is the tier's stated asymmetry —
+                                // surfaced here, never re-answered.
+                                if !matches!(g.worst, DurableOutcome::Ok) {
+                                    warn!(
+                                        origin = %node.0, seq,
+                                        "relaxed forward's append degraded after its \
+                                         early verdict (issue #399): the durable copy \
+                                         did not land — the publisher accepted this \
+                                         trade per message (ADR 0072)"
+                                    );
+                                    if let Some(m) = &self.metrics {
+                                        m.publish_dropped("relaxed-post-verdict-append");
+                                    }
+                                }
+                            } else {
+                                self.answer_forward(&node, seq, g.worst.to_verdict());
+                            }
                         }
                     }
                 }
