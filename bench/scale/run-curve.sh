@@ -112,11 +112,6 @@ LANE_B_REF_RUNG=50000
 # Seconds between the publishers starting and the latency baseline scrape: the
 # ramp, excluded from the measured window (see the scrape in lane_b_rung).
 LANE_B_SETTLE="${LANE_B_SETTLE:-15}"
-# Milliseconds between client connects within a container (emqtt-bench `-i`,
-# default 10 => ~100/s). Stated rather than inherited: one container per driver
-# now carries every client for that driver, so the connect phase is longer and
-# must finish inside LANE_B_SETTLE.
-LANE_B_CONNECT_MS="${LANE_B_CONNECT_MS:-2}"
 BENCH_IMG="emqx/emqtt-bench:0.6.3"
 
 # ── helpers ──────────────────────────────────────────────────────────────────
@@ -354,24 +349,9 @@ lane_b_rung() { # lane_b_rung <total-rate> <posture:plain|mtls>
 	mkdir -p "$rdir"
 	local interval=$((LANE_B_PUBS * 1000 / rate)) # ms between msgs per publisher
 	[ "$interval" -ge 1 ] || die "rung $rate needs sub-ms publish intervals with $LANE_B_PUBS publishers"
-	# ONE pub and ONE sub container per DRIVER, each spanning every broker via
-	# emqtt-bench's comma-separated `-h` — not one container per (driver,broker)
-	# pair. The old topology ran 2*N containers on each 8-core driver, and each
-	# container starts its own 8 Erlang schedulers: at N=10 that is ~160
-	# scheduler threads competing for 8 cores. It shows up as a hard per-CONTAINER
-	# ceiling (measured 5,634–6,449 msg/s in eleven runs across five
-	# configurations) with the host at only ~50% CPU, because the threads are
-	# context-switching rather than working. Total delivered was therefore
-	# containers x ~5,700 = D*N*5,700, which is the ~285-326k wall every campaign
-	# in this project has hit — a property of the load generator's process count,
-	# never of the broker (which idled at 23-35% CPU throughout).
-	local subs_per=$((LANE_B_SUBS / D)) pubs_per=$((LANE_B_PUBS / D))
+	local subs_per=$((LANE_B_SUBS / (D * N))) pubs_per=$((LANE_B_PUBS / (D * N)))
 	[ "$subs_per" -ge 1 ] || subs_per=1
 	[ "$pubs_per" -ge 1 ] || pubs_per=1
-	# Every broker's private address, comma-separated: one container's clients
-	# spread across the whole cluster instead of pinning to a single node.
-	local hosts
-	hosts=$(brokers_csv ".private_ip")
 	local args="" port_base=9200
 	[ "$posture" = mtls ] && args="$TLS_ARGS"
 	# emqtt-bench's socket mode. Its own help: "once" is the LEGACY DEFAULT,
@@ -387,29 +367,37 @@ lane_b_rung() { # lane_b_rung <total-rate> <posture:plain|mtls>
 	local active="-A true"
 	snapshot_metrics "$rdir" before
 	start_cpu_sampling "$rdir/cpu" $((LANE_B_SETTLE + LANE_B_SECS))
-	local di port
-	port=$([ "$posture" = mtls ] && echo 8883 || echo 1883)
+	local di bi host port
 	# subscribers first (they expose the e2e histogram), then publishers
 	for ((di = 0; di < D; di++)); do
-		drun "$di" "sub-$di-0" "-v /opt/bench-certs:/opt/bench-certs:ro $BENCH_IMG \
-			sub -h $hosts -p $port -c $subs_per -t '\$share/g1/bench/#' -q 1 $active \
-			-i $LANE_B_CONNECT_MS \
-			--payload-hdrs ts --prometheus --restapi $port_base $args"
+		for ((bi = 0; bi < N; bi++)); do
+			host=$(inv ".brokers[$bi].private_ip")
+			port=$([ "$posture" = mtls ] && echo 8883 || echo 1883)
+			drun "$di" "sub-$di-$bi" "-v /opt/bench-certs:/opt/bench-certs:ro $BENCH_IMG \
+				sub -h $host -p $port -c $subs_per -t '\$share/g1/bench/#' -q 1 $active \
+				--payload-hdrs ts --prometheus --restapi $((port_base + bi)) $args"
+		done
 	done
 	sleep 5
 	for ((di = 0; di < D; di++)); do
-		# `-t bench/%i` numbers topics by CLIENT SEQNO, which restarts at
-		# --startnumber in every container, so without an offset every driver
-		# would publish the same `bench/1..pubs_per` set — the topic count would
-		# be LANE_B_PUBS/D rather than LANE_B_PUBS, and would drift with fleet
-		# shape, which ADR 0048 §2's same-workload-at-every-size rule forbids.
-		# emqtt-bench documents `-n` for exactly this case ("useful when running
-		# multiple emqtt-bench instances to test the same broker").
-		local seq_base=$((di * pubs_per))
-		drun "$di" "pub-$di-0" "-v /opt/bench-certs:/opt/bench-certs:ro $BENCH_IMG \
-			pub -h $hosts -p $port -c $pubs_per -t 'bench/%i' -q 1 -s 256 $active \
-			-n $seq_base -i $LANE_B_CONNECT_MS \
-			-I $interval -F $LANE_B_INFLIGHT --payload-hdrs ts $args"
+		for ((bi = 0; bi < N; bi++)); do
+			host=$(inv ".brokers[$bi].private_ip")
+			port=$([ "$posture" = mtls ] && echo 8883 || echo 1883)
+			# `-t bench/%i` numbers topics by CLIENT SEQNO, which restarts at
+			# --startnumber in every container. Without an offset all D*N
+			# containers publish the same `bench/1..pubs_per` set, so the run
+			# has `LANE_B_PUBS / (D*N)` distinct topics — 60 where the doc
+			# claims 3000 — and the count silently changes with fleet shape,
+			# which is precisely what ADR 0048 §2's same-workload-at-every-size
+			# rule forbids. emqtt-bench documents `-n` for exactly this ("useful
+			# when running multiple emqtt-bench instances to test the same
+			# broker"). Offset each container's block so topics are globally
+			# distinct and the topic count IS LANE_B_PUBS by construction.
+			local seq_base=$(((di * N + bi) * pubs_per))
+			drun "$di" "pub-$di-$bi" "-v /opt/bench-certs:/opt/bench-certs:ro $BENCH_IMG \
+				pub -h $host -p $port -c $pubs_per -t 'bench/%i' -q 1 -s 256 $active \
+				-n $seq_base -I $interval -F $LANE_B_INFLIGHT --payload-hdrs ts $args"
+		done
 	done
 	# Let the publisher ramp finish BEFORE the latency measurement starts. The
 	# subscriber histograms are CUMULATIVE over the container's life, so a
@@ -421,18 +409,24 @@ lane_b_rung() { # lane_b_rung <total-rate> <posture:plain|mtls>
 	# throughput numbers already use.
 	sleep "$LANE_B_SETTLE"
 	for ((di = 0; di < D; di++)); do
-		rssh "$(driver_pub_ip "$di")" "curl -s http://localhost:$port_base/metrics" \
-			>"$rdir/sub-$di-0-base.prom" 2>/dev/null || true
+		for ((bi = 0; bi < N; bi++)); do
+			rssh "$(driver_pub_ip "$di")" "curl -s http://localhost:$((port_base + bi))/metrics" \
+				>"$rdir/sub-$di-$bi-base.prom" 2>/dev/null || true
+		done
 	done
 	sleep "$LANE_B_SECS"
 	# scrape each subscriber's histogram BEFORE stopping anything
 	for ((di = 0; di < D; di++)); do
-		rssh "$(driver_pub_ip "$di")" "curl -s http://localhost:$port_base/metrics" \
-			>"$rdir/sub-$di-0.prom" 2>/dev/null || true
+		for ((bi = 0; bi < N; bi++)); do
+			rssh "$(driver_pub_ip "$di")" "curl -s http://localhost:$((port_base + bi))/metrics" \
+				>"$rdir/sub-$di-$bi.prom" 2>/dev/null || true
+		done
 	done
 	for ((di = 0; di < D; di++)); do
-		dstop "$di" "pub-$di-0" "$rdir/pub-$di-0.log"
-		dstop "$di" "sub-$di-0" "$rdir/sub-$di-0.log"
+		for ((bi = 0; bi < N; bi++)); do
+			dstop "$di" "pub-$di-$bi" "$rdir/pub-$di-$bi.log"
+			dstop "$di" "sub-$di-$bi" "$rdir/sub-$di-$bi.log"
+		done
 	done
 	stop_cpu_sampling
 	snapshot_metrics "$rdir" after
