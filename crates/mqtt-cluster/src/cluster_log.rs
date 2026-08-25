@@ -3379,7 +3379,14 @@ mod tests {
         );
         gate.release(1, true);
         while waits.join_next().await.is_some() {}
-        assert_eq!(*done.lock().unwrap(), vec![1, 2, 3]);
+        // Releasing offset 1 commits 1..=3 in ONE watermark step, so all three
+        // pending futures wake together and their tasks push into `done` in
+        // whatever order the multi-thread runtime schedules them — CI observed
+        // [1, 3, 2]. The ordering property lives in the absence check above (no
+        // success below the watermark); here only completeness is asserted.
+        let mut completed = done.lock().unwrap().clone();
+        completed.sort_unstable();
+        assert_eq!(completed, vec![1, 2, 3]);
         let all = log.read(&k, 0, 100).await.unwrap();
         assert_eq!(
             all.iter().map(|e| e.offset).collect::<Vec<_>>(),
