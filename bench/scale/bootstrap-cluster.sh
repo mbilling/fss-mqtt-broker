@@ -160,6 +160,40 @@ if [ "$N" -gt 1 ]; then
 	say "private-net full mesh verified stable"
 fi
 
+# ready_within <index> <secs>: 0 once the node's /readyz answers 200, 1 when the
+# budget runs out — the non-dying sibling of lib.sh's wait_ready, for a retry.
+ready_within() {
+	local i="$1" budget="$2" start
+	start=$(date +%s)
+	until rssh "$(broker_pub_ip "$i")" "curl -sf http://localhost:8080/readyz" >/dev/null 2>&1; do
+		[ $(($(date +%s) - start)) -lt "$budget" ] || return 1
+		sleep 3
+	done
+}
+# follower_ready <index>: every 10-node formation on record goes through an
+# election storm ~30s after the followers start (early joiners cannot reach the
+# founder, terms climb, the founder re-wins); it normally settles inside the
+# 180s budget, but twice on 2026-08-25 one follower's join was lost in it and
+# the node sat SWIM-green and Raft-leaderless for the whole budget, which then
+# cost the entire run (issue #426). A follower's readiness cannot be waited for
+# one at a time (it needs the majority floor of members alive), so the remedy
+# is what an operator would do: keep the evidence, restart THAT node once so it
+# re-announces and joins after the storm has settled, and wait once more.
+follower_ready() {
+	local i="$1" ip id
+	ip=$(broker_pub_ip "$i")
+	id=$(broker_node_id "$i")
+	ready_within "$i" 180 && return 0
+	mkdir -p "$RUN/formation"
+	rssh "$ip" "curl -s 'http://localhost:8080/readyz?verbose=1'; echo; curl -s http://localhost:8080/statusz; echo; journalctl -u mqttd --no-pager | tail -60" \
+		>"$RUN/formation/$id-not-ready.txt" 2>&1 || true
+	warn "$id not ready after 180s — evidence kept in $RUN/formation/$id-not-ready.txt; restarting it once (issue #426)"
+	rssh "$ip" "systemctl restart mqttd"
+	ready_within "$i" 180 ||
+		die "$id still not ready 180s after a restart — see $RUN/formation/$id-not-ready.txt"
+	say "  $id ready after its restart"
+}
+
 # ── 4. Founder-first start, then the rest, then ARM the founder ──────────────
 # Founder: no seeds, floor 1 (or it can never come up alone).
 push_node 0 1 ""
@@ -172,7 +206,7 @@ for ((i = 1; i < N; i++)); do
 	rssh "$(broker_pub_ip "$i")" "systemctl restart mqttd"
 done
 for ((i = 1; i < N; i++)); do
-	wait_ready "$i" 180
+	follower_ready "$i"
 done
 
 if [ "$N" -gt 1 ]; then
