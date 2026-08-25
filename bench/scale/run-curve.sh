@@ -94,7 +94,15 @@ fi
 # regime the drivers demonstrably sustain.
 # LANE_B_PUBS_OVERRIDE reproduces an older campaign's population verbatim.
 LANE_B_PUBS="${LANE_B_PUBS_OVERRIDE:-3000}" # per-rung rate = LANE_B_PUBS * 1000/I
-LANE_B_SUBS=300 # total subscribers, ONE shared group ($share/g1)
+# Total subscribers in the ONE shared group ($share/g1). This is the variable
+# that has never changed in this project's history, and the fan-out ceiling has
+# tracked it exactly: every saturated configuration — publisher counts 3000,
+# 4000 and 6000, socket mode `once` and `true`, offers from 200k to 800k —
+# delivered 300-326k, which is ~1000 msg/s per subscriber every time, with
+# brokers at 26-35% CPU and latency flat at p50 <=10ms. A per-subscriber
+# ceiling and a fixed subscriber count multiply out to a fixed wall.
+# LANE_B_SUBS_OVERRIDE raises it to test exactly that.
+LANE_B_SUBS="${LANE_B_SUBS_OVERRIDE:-300}"
 # Publisher in-flight window. Without it each QoS1 publisher is a WINDOW-1
 # closed loop whose send rate tracks the broker's ack rate — the ladder then
 # degenerates into a saturation probe that can never offer above it (measured:
