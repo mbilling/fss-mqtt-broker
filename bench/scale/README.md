@@ -70,6 +70,7 @@ must show zero servers.
 ```sh
 cd bench/scale
 export HCLOUD_TOKEN=...
+export MQTTD_VERSION=1.0.6   # the release under test — required, recorded in the run
 ./run.sh smoke     # proves token → apply → PKI → bring-up → lanes → destroy
 ./run.sh standard  # the release gate: one 10-node cluster, ~30 min, ~€2
 ./run.sh full      # the curve; or ./run.sh full 3 5 for a subset
