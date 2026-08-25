@@ -215,8 +215,14 @@ if [ "$N" -gt 1 ]; then
 	# During measurement, readiness means majority on every node.
 	push_node 0 "$MAJORITY" "$(broker_priv_ip 1):7946,$(broker_priv_ip $((N - 1))):7946"
 	rssh "$(broker_pub_ip 0)" "systemctl restart mqttd"
-	for ((i = 0; i < N; i++)); do
-		wait_ready "$i" 180
+	# The founder's restart is the second fragile moment (run 170554Z, mqttd
+	# 1.0.6): one follower's peer link to the restarted founder was never
+	# rebuilt — peer_links 8 on both ends, SWIM alive 10 — and it campaigned
+	# alone to term 45 while the other eight sat ready at term 15. The same
+	# one-restart retry as the join phase: a fresh process re-greets.
+	wait_ready 0 180
+	for ((i = 1; i < N; i++)); do
+		follower_ready "$i"
 	done
 	say "founder armed; all $N nodes READY at majority floor $MAJORITY"
 fi
