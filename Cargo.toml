@@ -50,7 +50,7 @@ reqwest = { version = "0.13", default-features = false, features = ["rustls-no-p
 # async runtime
 tokio = { version = "1", features = ["full"] }
 # error handling
-thiserror = "1"
+thiserror = "2"
 # bytes for zero-copy wire buffers
 bytes = "1"
 # tracing / observability

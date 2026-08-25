@@ -1972,7 +1972,7 @@ dependencies = [
  "rcgen",
  "serde",
  "serde_json",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
  "tokio",
  "toml",
  "x509-parser",
@@ -1994,7 +1994,7 @@ dependencies = [
  "rustls-pki-types",
  "serde",
  "tempfile",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
  "tokio",
  "tokio-rustls",
  "toml",
@@ -2017,7 +2017,7 @@ dependencies = [
  "redb",
  "serde",
  "tempfile",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
  "tokio",
  "tracing",
 ]
@@ -2028,7 +2028,7 @@ version = "1.0.6"
 dependencies = [
  "bytes",
  "criterion",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -2037,7 +2037,7 @@ version = "1.0.6"
 dependencies = [
  "serde",
  "serde_ignored",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
  "toml",
 ]
 
@@ -2047,7 +2047,7 @@ version = "1.0.6"
 dependencies = [
  "bytes",
  "mqtt-codec",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -2061,7 +2061,7 @@ dependencies = [
  "rcgen",
  "rustls",
  "rustls-pki-types",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
  "tokio",
  "tokio-rustls",
  "tokio-tungstenite",
@@ -2092,7 +2092,7 @@ dependencies = [
  "redb",
  "serde",
  "tempfile",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
  "tokio",
 ]
 
@@ -2144,7 +2144,7 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
  "tokio",
  "tracing",
  "tracing-subscriber",
