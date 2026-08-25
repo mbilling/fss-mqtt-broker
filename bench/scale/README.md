@@ -85,9 +85,10 @@ re-run with `RUN_DIR=.runs/<stamp>` skips sizes already marked done.
 meter is running. Ctrl-C is safe (trapped); `kill -9` is not — after one, run
 `./teardown.sh`.
 
-**Checking a shape without paying.** Lane B's population must split exactly
-over `drivers × brokers × LANE_B_CONTAINERS`, and every rung must need an
-integer `-I` of at least `LANE_B_MIN_INTERVAL` ms — `run-curve.sh` refuses
+**Checking a shape without paying.** Lane B's populations must split exactly
+over their containers (`drivers × LANE_B_PUB_CONTAINERS`, `drivers ×
+LANE_B_SUB_CONTAINERS`), each container's clients exactly over the brokers it
+spans, and every rung must need an integer `-I` of at least `LANE_B_MIN_INTERVAL` ms — `run-curve.sh` refuses
 anything else before its first ssh, so a wrong shape costs the provisioning
 minutes rather than lane A's hour (a floored split used to run fewer clients
 than the doc says; a floored timer used to offer a rate other than the label).
@@ -96,7 +97,7 @@ a synthesized inventory:
 
 ```sh
 jq -n '{brokers: [range(10) | {}], drivers: [range(5) | {}]}' > /tmp/inv.json
-LANE_B_CONTAINERS=4 SHAPE_ONLY=1 ./run-curve.sh /tmp/shape-check /tmp/inv.json
+LANE_B_PUB_CONTAINERS=6 SHAPE_ONLY=1 ./run-curve.sh /tmp/shape-check /tmp/inv.json
 ```
 
 The table it prints is what a real run keeps as `laneB/shape.txt`.
@@ -112,7 +113,7 @@ The table it prints is what a real run keeps as `laneB/shape.txt`.
 | lane A `tier-local` / `tier-relaxed` | same shape per ADR 0072 tier (`MQTTD_ALLOW_RELAXED_PUBLISH=1`) | sat + lat each |
 | lane A voters variant (N>5 only) | wipe + fresh formation with `MQTTD_LEASE_VOTERS=N` — prices the committee against the ADR 0073 default | sat + lat |
 | re-form (clean mode) | durable plane OFF for the routing-bound lanes | — |
-| lane B | non-durable `$share` fan-out ladder (+ one mTLS rung) | 3000 pubs / 300 subs, 20k…300k offered, 60 s/rung |
+| lane B | non-durable `$share` fan-out ladder (+ one mTLS rung) | 3000 pubs / 300 subs in 5 + 3 one-vCPU containers per driver, 300k…20k offered (top rung first), 60 s/rung |
 | lane C | idle-connection scaling, plaintext + mTLS | 50k conns, ramp 2.5k/s, 120 s hold |
 | teardown | destroy before the next size (fresh clusters only), host logs collected on failure | — |
 
