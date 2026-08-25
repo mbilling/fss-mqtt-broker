@@ -14,6 +14,7 @@ use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
+use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
@@ -70,7 +71,7 @@ where
 pub struct WsByteStream<S> {
     ws: WebSocketStream<S>,
     /// Leftover bytes from the last binary frame not yet handed to the reader.
-    read_rem: Vec<u8>,
+    read_rem: Bytes,
     read_pos: usize,
 }
 
@@ -83,7 +84,7 @@ impl<S> WsByteStream<S> {
     pub fn wrap(ws: WebSocketStream<S>) -> Self {
         Self {
             ws,
-            read_rem: Vec::new(),
+            read_rem: Bytes::new(),
             read_pos: 0,
         }
     }
@@ -155,7 +156,7 @@ where
         // the actual send happens on flush (which FrameWriter calls after a packet).
         match self.ws.poll_ready_unpin(cx) {
             Poll::Ready(Ok(())) => {
-                let msg = Message::Binary(buf.to_vec());
+                let msg = Message::Binary(Bytes::copy_from_slice(buf));
                 self.ws.start_send_unpin(msg).map_err(io::Error::other)?;
                 Poll::Ready(Ok(buf.len()))
             }
