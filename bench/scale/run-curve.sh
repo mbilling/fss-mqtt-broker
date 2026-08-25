@@ -38,7 +38,7 @@ if [ "${SMOKE:-0}" = 1 ]; then
 	A_REPS=1 A_SECS=15 A_WARMUP=3
 	BARRIER_OPS=50
 else
-	LANE_B_RUNGS=(20000 50000 100000 200000 300000)
+	LANE_B_RUNGS=(20000 50000 100000 200000 400000 600000 800000)
 	LANE_B_SECS=60
 	LANE_C_CONNS=50000
 	LANE_C_RAMP=2500
@@ -46,8 +46,17 @@ else
 	A_REPS=3 A_SECS=60 A_WARMUP=10
 	BARRIER_OPS=150
 fi
-LANE_B_PUBS=600 # total publishers; per-rung rate = 600 * 1000/I
-LANE_B_SUBS=300 # total subscribers, ONE shared group ($share/g1)
+# Total publishers. Offered rate = LANE_B_PUBS * 1000/I with -I in WHOLE
+# milliseconds per client (emqtt-bench paces per client; one publisher can never
+# exceed 1000 msg/s, and pacing near that floor is jitter-fragile) — so rate is
+# scaled by ADDING publishers, never by shrinking the interval. The value must
+# (a) divide every rung into an integer -I >= 5, and (b) split evenly over
+# D drivers x N brokers at every cluster size; lane_b_rung refuses otherwise.
+# 4800 satisfies both for this ladder at the documented sizes (N=1/3/5, D=2 or
+# 5) and up to D x N = 50; a shape it cannot split evenly (e.g. 28 brokers x 5
+# drivers = 140) fails loudly at the guard, which names the fix.
+LANE_B_PUBS=4800
+LANE_B_SUBS=600 # total subscribers, ONE shared group ($share/g1); same even-split rule
 # Publisher in-flight window. Without it each QoS1 publisher is a WINDOW-1
 # closed loop whose send rate tracks the broker's ack rate — the ladder then
 # degenerates into a saturation probe that can never offer above it (measured:
@@ -55,6 +64,13 @@ LANE_B_SUBS=300 # total subscribers, ONE shared group ($share/g1)
 LANE_B_INFLIGHT=100
 LANE_B_REF_RUNG=50000
 BENCH_IMG="emqx/emqtt-bench:0.6.3"
+# Erlang schedulers BUSY-WAIT by default: with 2xN bench VMs sharing one driver
+# host the spinning burns cores invisibly and slips the millisecond pacing
+# timers — the load stack then undershoots its offered rate while every axis
+# still looks unsaturated (the exact signature that first capped the ladder).
+# Disabling the spin lets idle schedulers really sleep. Overridable, e.g. to
+# add "+S 2:2" caps when containers badly outnumber cores.
+BENCH_ERL_FLAGS="${BENCH_ERL_FLAGS:-+sbwt none +sbwtdcpu none +sbwtdio none}"
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 brokers_csv() { # brokers_csv <suffix-jq> — comma list over brokers
@@ -190,11 +206,22 @@ lane_b_rung() { # lane_b_rung <total-rate> <posture:plain|mtls>
 	local rate="$1" posture="$2"
 	local rdir="$OUT/laneB/rung-$rate-$posture"
 	mkdir -p "$rdir"
+	# The old integer division here silently offered LANE_B_PUBS*1000/I for
+	# whatever rung was asked — a 400k rung with 600 publishers offered 600k and
+	# was LABELLED 400k. A rung is honest only if it needs an integer -I.
+	[ $((LANE_B_PUBS * 1000 % rate)) -eq 0 ] ||
+		die "rung $rate is not exactly offerable by $LANE_B_PUBS publishers (fractional -I); pick a divisor of $((LANE_B_PUBS * 1000))"
 	local interval=$((LANE_B_PUBS * 1000 / rate)) # ms between msgs per publisher
-	[ "$interval" -ge 1 ] || die "rung $rate needs sub-ms publish intervals with $LANE_B_PUBS publishers"
+	[ "$interval" -ge 5 ] ||
+		die "rung $rate needs -I ${interval}ms; per-client pacing collapses near the 1ms floor — raise LANE_B_PUBS instead"
 	local subs_per=$((LANE_B_SUBS / (D * N))) pubs_per=$((LANE_B_PUBS / (D * N)))
-	[ "$subs_per" -ge 1 ] || subs_per=1
-	[ "$pubs_per" -ge 1 ] || pubs_per=1
+	# Populations must split EVENLY or the floored per-container counts quietly
+	# offer less than the rung's label at some cluster sizes — the §2 same-workload
+	# rule, enforced rather than assumed.
+	[ $((pubs_per * D * N)) -eq "$LANE_B_PUBS" ] ||
+		die "LANE_B_PUBS=$LANE_B_PUBS does not split evenly over $D drivers x $N brokers"
+	[ $((subs_per * D * N)) -eq "$LANE_B_SUBS" ] ||
+		die "LANE_B_SUBS=$LANE_B_SUBS does not split evenly over $D drivers x $N brokers"
 	local args="" port_base=9200
 	[ "$posture" = mtls ] && args="$TLS_ARGS"
 	snapshot_metrics "$rdir" before
@@ -205,7 +232,7 @@ lane_b_rung() { # lane_b_rung <total-rate> <posture:plain|mtls>
 		for ((bi = 0; bi < N; bi++)); do
 			host=$(inv ".brokers[$bi].private_ip")
 			port=$([ "$posture" = mtls ] && echo 8883 || echo 1883)
-			drun "$di" "sub-$di-$bi" "-v /opt/bench-certs:/opt/bench-certs:ro $BENCH_IMG \
+			drun "$di" "sub-$di-$bi" "-e ERL_FLAGS='$BENCH_ERL_FLAGS' -v /opt/bench-certs:/opt/bench-certs:ro $BENCH_IMG \
 				sub -h $host -p $port -c $subs_per -t '\$share/g1/bench/#' -q 1 \
 				--payload-hdrs ts --prometheus --restapi $((port_base + bi)) $args"
 		done
@@ -215,7 +242,7 @@ lane_b_rung() { # lane_b_rung <total-rate> <posture:plain|mtls>
 		for ((bi = 0; bi < N; bi++)); do
 			host=$(inv ".brokers[$bi].private_ip")
 			port=$([ "$posture" = mtls ] && echo 8883 || echo 1883)
-			drun "$di" "pub-$di-$bi" "-v /opt/bench-certs:/opt/bench-certs:ro $BENCH_IMG \
+			drun "$di" "pub-$di-$bi" "-e ERL_FLAGS='$BENCH_ERL_FLAGS' -v /opt/bench-certs:/opt/bench-certs:ro $BENCH_IMG \
 				pub -h $host -p $port -c $pubs_per -t 'bench/%i' -q 1 -s 256 \
 				-I $interval -F $LANE_B_INFLIGHT --payload-hdrs ts $args"
 		done
@@ -277,7 +304,7 @@ lane_c() { # lane_c <total-conns> <posture>
 			bi=$(((di * containers + j) % N))
 			host=$(inv ".brokers[$bi].private_ip")
 			port=$([ "$posture" = mtls ] && echo 8883 || echo 1883)
-			drun "$di" "conn-$di-$j" "-v /opt/bench-certs:/opt/bench-certs:ro $BENCH_IMG \
+			drun "$di" "conn-$di-$j" "-e ERL_FLAGS='$BENCH_ERL_FLAGS' -v /opt/bench-certs:/opt/bench-certs:ro $BENCH_IMG \
 				conn -h $host -p $port -c $per_container -R $ramp_per $args"
 		done
 	done

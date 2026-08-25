@@ -42,7 +42,7 @@ per-node scaling — scaling the offer with N would assume the conclusion.
 | Lane | Population (identical at N=1/3/5) | Measures |
 |---|---|---|
 | A durable QoS 1 | 48 closed-loop publishers × window 8 + 48 durable subscribers, 256 B, sessions round-robin across all owners (`MQTTD_BENCH_SPREAD=1`) | acked durable msg/s, exact p99 |
-| B `$share` fan-out | 600 publishers → `bench/%i`, one shared group `$share/g1/bench/#` of 300 subscribers, QoS 1, 256 B; ladder 20/50/100/200/300k msg/s | sustained knee, bucket-bound p99 |
+| B `$share` fan-out | 4 800 publishers → `bench/%i`, one shared group `$share/g1/bench/#` of 600 subscribers, QoS 1, 256 B; ladder 20/50/100/200/400/600/800k msg/s (rungs are exact divisors: emqtt-bench paces per client in whole ms, so rate scales by adding publishers, never sub-ms intervals) | sustained knee, bucket-bound p99 |
 | C idle connections | 50 000 connections, ramp 2 500/s, hold 120 s | establishment, KiB per connection |
 
 Throughput vs node count cannot come from one fixed offered rate (every size
