@@ -1666,6 +1666,16 @@ where
         Duration::from_secs(u64::from(keep_alive) * KEEPALIVE_GRACE_NUM / KEEPALIVE_GRACE_DEN)
     });
     let mut deadline = grace.map(|g| Instant::now() + g);
+    // ONE keep-alive timer per connection, re-armed only when it fires (see the
+    // `idle` branch below). The previous shape built a fresh `sleep_until` on
+    // every turn of the loop and dropped it on every packet: two registrations
+    // on tokio's shared timer wheel — a single mutex in tokio 1.53 — per inbound
+    // packet per connection. Profiled under the fan-out shape that lock was the
+    // busiest thing in the process, ~6x the samples of the whole hub dispatch.
+    // Activity now only moves `deadline` (an Instant assignment); the timer is
+    // touched at most once per grace period, and never when keep-alive is 0.
+    let idle = tokio::time::sleep_until(deadline.unwrap_or_else(Instant::now));
+    tokio::pin!(idle);
     // Inbound QoS 2 ids held but not yet PUBREL-released, each with whether its PUBREC
     // was RELEASED: forwarding only on first sight of an ACKNOWLEDGED id is what makes
     // inbound QoS 2 exactly-once [MQTT-4.3.3-2] without fabricating success for a flow
@@ -1691,12 +1701,6 @@ where
         if current.is_none() {
             current = pending_pubacks.pop_front();
         }
-        let idle = async {
-            match deadline {
-                Some(d) => tokio::time::sleep_until(d).await,
-                None => std::future::pending().await,
-            }
-        };
         tokio::select! {
             inbound = reader.next_packet() => {
                 // Any client packet resets the keepalive deadline.
@@ -1836,10 +1840,18 @@ where
                     None => return Ok(false),
                 }
             }
-            () = idle => {
-                debug!(client = %client.0, keep_alive, "keepalive expired; closing connection");
-                count_connection_error(policy, "keepalive");
-                return Ok(false);
+            () = &mut idle, if deadline.is_some() => {
+                // The timer fired at the deadline it was armed with; packets since
+                // then only moved `deadline`. Re-arm to the current one while it is
+                // still ahead — otherwise the client really has gone quiet.
+                match deadline {
+                    Some(d) if d > Instant::now() => idle.as_mut().reset(d),
+                    _ => {
+                        debug!(client = %client.0, keep_alive, "keepalive expired; closing connection");
+                        count_connection_error(policy, "keepalive");
+                        return Ok(false);
+                    }
+                }
             }
             () = drain_signal(policy) => {
                 // Graceful shutdown (ADR 0019): close cleanly without firing the will —

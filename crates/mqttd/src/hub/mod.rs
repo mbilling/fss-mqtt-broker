@@ -2918,7 +2918,12 @@ impl Hub {
         // planned here because `deliver` cannot see it, and it is peeked rather than
         // selected so a refused publish does not consume a group member's turn.
         let append_gate = gate.map_or(AppendGate::None, AppendGate::Pending);
-        if append_gate.answerable() && self.shared_plan_owes_durable(topic, qos) {
+        // `plan_refusal(true)` can only ever be Brownout, so the shared peek — a
+        // full plan of every matching group, measured at ~26% of the hub loop's
+        // publish dispatch with the durable plane OFF — is only worth computing
+        // while a brownout is in force. Same refusal, same (absent) side effects;
+        // the peek is pure and `brownout` is the cheaper operand.
+        if append_gate.answerable() && self.brownout && self.shared_plan_owes_durable(topic, qos) {
             if let Some(r) = self.plan_refusal(true) {
                 self.count_refusal(r);
                 return DurableOutcome::Refused(r);
