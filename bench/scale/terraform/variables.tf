@@ -56,7 +56,7 @@ variable "admin_cidr" {
 }
 
 variable "mqttd_version" {
-  description = "Released broker version (no leading v). The brokers run this signed, byte-reproducible release artifact — the published curve is attributable to it."
+  description = "Released broker version (no leading v). The brokers run this signed, byte-reproducible release artifact — the published curve is attributable to it. run.sh ALWAYS passes this (it refuses to run without MQTTD_VERSION); the default exists only so teardown.sh's destroy has a value and must not be relied on."
   type        = string
   default     = "1.0.0"
 }

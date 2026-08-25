@@ -2,6 +2,7 @@
 # The scale-curve orchestrator (ADR 0048 T3). Run from a laptop, never from CI:
 #
 #   export HCLOUD_TOKEN=...     # Read & Write token from a DEDICATED project
+#   export MQTTD_VERSION=1.0.6  # the release under test — required, recorded in the run
 #   ./run.sh smoke              # 1 node, minutes, <€0.50 — proves the whole rig
 #   ./run.sh standard           # the release gate: one 10-node cluster, ~30 min
 #   ./run.sh full               # the curve: fresh 1-, 3- and 5-node clusters
@@ -73,6 +74,13 @@ full)
 esac
 
 [ -n "${HCLOUD_TOKEN:-}" ] || die "HCLOUD_TOKEN is not set (Read & Write token from the dedicated Hetzner project)"
+# The binary under test is a disclosure item, never a default: terraform's
+# mqttd_version fallback was stale within a week (1.0.0 while the published
+# campaigns ran 1.0.5/1.0.6), and on 2026-08-25 two 15-host formations were
+# burned diagnosing a six-releases-old broker (issue #426). Name it every time;
+# it lands in the run's env dumps.
+LATEST_TAG=$(git -C "$SCALE_DIR" describe --tags --abbrev=0 2>/dev/null | sed 's/^v//' || true)
+[ -n "${MQTTD_VERSION:-}" ] || die "MQTTD_VERSION is not set — name the release under test explicitly (e.g. MQTTD_VERSION=${LATEST_TAG:-1.0.6}); terraform's default is not a choice"
 command -v terraform >/dev/null || command -v tofu >/dev/null || die "terraform (or tofu) not installed"
 command -v jq >/dev/null || die "jq not installed"
 TF=$(command -v terraform || command -v tofu)
