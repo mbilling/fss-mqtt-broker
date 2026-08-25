@@ -349,7 +349,8 @@ lane_b_rung() { # lane_b_rung <total-rate> <posture:plain|mtls>
 	mkdir -p "$rdir"
 	local interval=$((LANE_B_PUBS * 1000 / rate)) # ms between msgs per publisher
 	[ "$interval" -ge 1 ] || die "rung $rate needs sub-ms publish intervals with $LANE_B_PUBS publishers"
-	local subs_per=$((LANE_B_SUBS / (D * N))) pubs_per=$((LANE_B_PUBS / (D * N)))
+	local nc=$LANE_B_CONTAINERS
+	local subs_per=$((LANE_B_SUBS / (D * N * nc))) pubs_per=$((LANE_B_PUBS / (D * N * nc)))
 	[ "$subs_per" -ge 1 ] || subs_per=1
 	[ "$pubs_per" -ge 1 ] || pubs_per=1
 	local args="" port_base=9200
@@ -367,15 +368,17 @@ lane_b_rung() { # lane_b_rung <total-rate> <posture:plain|mtls>
 	local active="-A true"
 	snapshot_metrics "$rdir" before
 	start_cpu_sampling "$rdir/cpu" $((LANE_B_SETTLE + LANE_B_SECS))
-	local di bi host port
+	local di bi k host port
 	# subscribers first (they expose the e2e histogram), then publishers
 	for ((di = 0; di < D; di++)); do
 		for ((bi = 0; bi < N; bi++)); do
 			host=$(inv ".brokers[$bi].private_ip")
 			port=$([ "$posture" = mtls ] && echo 8883 || echo 1883)
-			drun "$di" "sub-$di-$bi" "-v /opt/bench-certs:/opt/bench-certs:ro $BENCH_IMG \
-				sub -h $host -p $port -c $subs_per -t '\$share/g1/bench/#' -q 1 $active \
-				--payload-hdrs ts --prometheus --restapi $((port_base + bi)) $args"
+			for ((k = 0; k < nc; k++)); do
+				drun "$di" "sub-$di-$bi-$k" "-v /opt/bench-certs:/opt/bench-certs:ro $BENCH_IMG \
+					sub -h $host -p $port -c $subs_per -t '\$share/g1/bench/#' -q 1 $active \
+					--payload-hdrs ts --prometheus --restapi $((port_base + bi * nc + k)) $args"
+			done
 		done
 	done
 	sleep 5
@@ -393,10 +396,12 @@ lane_b_rung() { # lane_b_rung <total-rate> <posture:plain|mtls>
 			# when running multiple emqtt-bench instances to test the same
 			# broker"). Offset each container's block so topics are globally
 			# distinct and the topic count IS LANE_B_PUBS by construction.
-			local seq_base=$(((di * N + bi) * pubs_per))
-			drun "$di" "pub-$di-$bi" "-v /opt/bench-certs:/opt/bench-certs:ro $BENCH_IMG \
-				pub -h $host -p $port -c $pubs_per -t 'bench/%i' -q 1 -s 256 $active \
-				-n $seq_base -I $interval -F $LANE_B_INFLIGHT --payload-hdrs ts $args"
+			for ((k = 0; k < nc; k++)); do
+				local seq_base=$((((di * N + bi) * nc + k) * pubs_per))
+				drun "$di" "pub-$di-$bi-$k" "-v /opt/bench-certs:/opt/bench-certs:ro $BENCH_IMG \
+					pub -h $host -p $port -c $pubs_per -t 'bench/%i' -q 1 -s 256 $active \
+					-n $seq_base -I $interval -F $LANE_B_INFLIGHT --payload-hdrs ts $args"
+			done
 		done
 	done
 	# Let the publisher ramp finish BEFORE the latency measurement starts. The
@@ -410,22 +415,28 @@ lane_b_rung() { # lane_b_rung <total-rate> <posture:plain|mtls>
 	sleep "$LANE_B_SETTLE"
 	for ((di = 0; di < D; di++)); do
 		for ((bi = 0; bi < N; bi++)); do
-			rssh "$(driver_pub_ip "$di")" "curl -s http://localhost:$((port_base + bi))/metrics" \
-				>"$rdir/sub-$di-$bi-base.prom" 2>/dev/null || true
+			for ((k = 0; k < nc; k++)); do
+				rssh "$(driver_pub_ip "$di")" "curl -s http://localhost:$((port_base + bi * nc + k))/metrics" \
+					>"$rdir/sub-$di-$bi-$k-base.prom" 2>/dev/null || true
+			done
 		done
 	done
 	sleep "$LANE_B_SECS"
 	# scrape each subscriber's histogram BEFORE stopping anything
 	for ((di = 0; di < D; di++)); do
 		for ((bi = 0; bi < N; bi++)); do
-			rssh "$(driver_pub_ip "$di")" "curl -s http://localhost:$((port_base + bi))/metrics" \
-				>"$rdir/sub-$di-$bi.prom" 2>/dev/null || true
+			for ((k = 0; k < nc; k++)); do
+				rssh "$(driver_pub_ip "$di")" "curl -s http://localhost:$((port_base + bi * nc + k))/metrics" \
+					>"$rdir/sub-$di-$bi-$k.prom" 2>/dev/null || true
+			done
 		done
 	done
 	for ((di = 0; di < D; di++)); do
 		for ((bi = 0; bi < N; bi++)); do
-			dstop "$di" "pub-$di-$bi" "$rdir/pub-$di-$bi.log"
-			dstop "$di" "sub-$di-$bi" "$rdir/sub-$di-$bi.log"
+			for ((k = 0; k < nc; k++)); do
+				dstop "$di" "pub-$di-$bi-$k" "$rdir/pub-$di-$bi-$k.log"
+				dstop "$di" "sub-$di-$bi-$k" "$rdir/sub-$di-$bi-$k.log"
+			done
 		done
 	done
 	stop_cpu_sampling
