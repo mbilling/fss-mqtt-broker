@@ -87,18 +87,26 @@ fi
 if [ -n "${LANE_B_RUNGS_OVERRIDE:-}" ]; then
 	read -r -a LANE_B_RUNGS <<<"$LANE_B_RUNGS_OVERRIDE"
 fi
-# Total publishers. Sized so EVERY rung of the ladder is actually offerable:
-# each publisher sends on an INTEGER-millisecond timer (emqtt-bench `-I`), so
-# the offered rate is `LANE_B_PUBS * 1000 / interval_ms` and a high rung with
-# few publishers demands a sub-5ms timer the drivers cannot hold. Measured on
-# the v1.0.5 7-node campaign with 600 publishers: the drivers tracked the offer
-# to 96% at 6ms (100k) and then collapsed — 74% at 3ms (200k), 52% at 2ms
-# (300k), saturating near 150k/s no matter what was asked. Every "knee" above
-# that was the LOAD GENERATOR's timer, not the broker, and the idle CPU on both
-# sides was the tell. 3000 keeps the top rung at a 10ms timer, inside the
-# regime the drivers demonstrably sustain.
-# LANE_B_PUBS_OVERRIDE reproduces an older campaign's population verbatim.
-LANE_B_PUBS="${LANE_B_PUBS_OVERRIDE:-3000}" # per-rung rate = LANE_B_PUBS * 1000/I
+# Total publishers. Sized so EVERY rung of the ladder is actually offerable,
+# against the two floors the load generator has:
+#  * the TIMER floor: each publisher sends on an INTEGER-millisecond timer
+#    (emqtt-bench `-I`), so the offered rate is LANE_B_PUBS * 1000 / interval_ms
+#    and the drivers collapse below ~6ms (#421: 96% at 6ms, 74% at 3ms, 52% at
+#    2ms with 600 publishers);
+#  * the ROUND-TRIP floor: emqtt-bench's TCP publish is SYNCHRONOUS per client
+#    (emqtt:publish/4 returns on the PUBACK; `-F` only sets emqtt's max_inflight,
+#    which a one-at-a-time loop never fills), so a client can never exceed
+#    1/RTT. Measured 2026-08-25 at 10 nodes with 3000 publishers: 50/s per
+#    client (150k) on time, 100/s per client (300k) capped at ~80/s with 99% of
+#    publishes late and every CPU idle — a ~12ms PUBACK round trip under load.
+#    That one mechanism is every "wall" this rig ever hit: 3000 x ~1/12ms is
+#    the ~250-300k of five campaigns, and 60 clients x ~95/s the "~5.5k per
+#    container".
+# 12000 puts the 300k rung at 25/s per client (a 40ms budget) and a 40ms timer;
+# every ladder rung is an exact integer timer and 480 per container spreads
+# exactly over 3, 5 and 10 brokers. LANE_B_PUBS_OVERRIDE reproduces an older
+# campaign's population verbatim (and its ceilings).
+LANE_B_PUBS="${LANE_B_PUBS_OVERRIDE:-12000}" # per-rung rate = LANE_B_PUBS * 1000/I
 # Total subscribers in the ONE shared group ($share/g1). This is the variable
 # that has never changed in this project's history, and the fan-out ceiling has
 # tracked it exactly: every saturated configuration — publisher counts 3000,
@@ -133,11 +141,18 @@ LANE_B_SUB_CONTAINERS="${LANE_B_SUB_CONTAINERS:-3}"
 # regime a full ladder has sustained. Lowering the floor is for knowingly
 # reproducing a collapsed campaign.
 LANE_B_MIN_INTERVAL="${LANE_B_MIN_INTERVAL:-6}"
-# Publisher in-flight window. Without it each QoS1 publisher is a WINDOW-1
-# closed loop whose send rate tracks the broker's ack rate — the ladder then
-# degenerates into a saturation probe that can never offer above it (measured:
-# every rung identical). 100 matches bench/run.sh's saturate posture.
+# Publisher in-flight window, passed as emqtt-bench `-F`. It sets emqtt's
+# max_inflight and nothing else: the tool's TCP publish loop is one synchronous
+# publish per client at a time (see LANE_B_PUBS), so this window never fills
+# and does NOT decouple the publishers from the broker's ack rate — the
+# population does that. Kept at 100 for parity with bench/run.sh's posture.
 LANE_B_INFLIGHT=100
+# Connect pacing for every load container (emqtt-bench `-R`, connections per
+# second). The default 10ms-per-client ramp would put 480 publishers on the
+# wire over ~5s and a 1-node smoke's 2400 over 24s — past the settle. Kept
+# below 1000: emqtt-bench adds a worker per 1000/s of connect rate, and a
+# second worker would break the one-worker broker spread (see BENCH_ERL_FLAGS).
+LANE_B_CONNECT_RATE="${LANE_B_CONNECT_RATE:-500}"
 LANE_B_REF_RUNG=50000
 # Seconds between the publishers starting and the latency baseline scrape: the
 # ramp, excluded from the measured window (see the scrape in lane_b_rung).
@@ -252,6 +267,9 @@ lane_b_shape() { # prints the shape as key=value lines; dies on any distortion
 	positive_int LANE_B_PUBS "$LANE_B_PUBS"
 	positive_int LANE_B_SUBS "$LANE_B_SUBS"
 	positive_int LANE_B_MIN_INTERVAL "$LANE_B_MIN_INTERVAL"
+	positive_int LANE_B_CONNECT_RATE "$LANE_B_CONNECT_RATE"
+	[ "$LANE_B_CONNECT_RATE" -le 1000 ] ||
+		die "LANE_B_CONNECT_RATE=$LANE_B_CONNECT_RATE: emqtt-bench adds a worker per 1000 connections/s and a second worker breaks the one-worker broker spread — keep it at or below 1000"
 	# Each population must split evenly over its containers (D x per-driver
 	# count). Within a container emqtt-bench places client i on host i mod N
 	# (one worker — see BENCH_ERL_FLAGS), and lane_b_rung rotates each
@@ -284,7 +302,12 @@ lane_b_shape() { # prints the shape as key=value lines; dies on any distortion
 			die "$name=$total does not split evenly over $D drivers x $per_driver containers ($cells cells) — set ${name}_OVERRIDE to a multiple of $cells, or change the container count / DRIVER_COUNT"
 		fi
 		range=$(spread_range "$total" "$cells")
-		if [ $((${range#*..} - ${range%..*})) -gt 1 ]; then
+		# A skew of one client is the granularity of the split; beyond that it is
+		# refused once it exceeds 1% of a broker's share (600 publishers over 25
+		# containers on 10 brokers: 58..62 — refused; 12000 on 7 brokers: 1713..1716
+		# — accepted and printed).
+		local skew=$((${range#*..} - ${range%..*})) min=${range%..*}
+		if [ "$skew" -gt 1 ] && [ $((skew * 100)) -gt "$min" ]; then
 			die "$name=$total spreads unevenly over $N brokers ($range per broker): $((total / cells)) clients per container with $cells containers — make N divide the per-container count, or the container count a multiple of N"
 		fi
 		echo "$range"
@@ -308,7 +331,7 @@ lane_b_shape() { # prints the shape as key=value lines; dies on any distortion
 		interval=$(lane_b_interval "$rate")
 		echo "rung=$rate interval_ms=$interval per_pub_container_msg_s=$((rate / pub_cells))"
 	done
-	echo "inflight=$LANE_B_INFLIGHT settle_s=$LANE_B_SETTLE measure_s=$LANE_B_SECS min_interval_ms=$LANE_B_MIN_INTERVAL"
+	echo "inflight=$LANE_B_INFLIGHT connect_rate=$LANE_B_CONNECT_RATE settle_s=$LANE_B_SETTLE measure_s=$LANE_B_SECS min_interval_ms=$LANE_B_MIN_INTERVAL"
 	echo "image=$BENCH_IMG erl_flags='$BENCH_ERL_FLAGS'"
 }
 if [[ "$LANES" == *B* ]]; then
@@ -578,7 +601,7 @@ lane_b_rung() { # lane_b_rung <total-rate> <posture:plain|mtls>
 		names[di]=""
 		for ((j = 0; j < S; j++)); do
 			hosts=$(rotated_hosts $((di * S + j)))
-			subs[di]+="$DOCKER_RUN --name sub-$di-$j -v /opt/bench-certs:/opt/bench-certs:ro $BENCH_IMG sub -h $hosts -p $port -c $subs_per -t '\$share/g1/bench/#' -q 1 $active --payload-hdrs ts --prometheus --restapi $((port_base + j)) $args >/dev/null"$'\n'
+			subs[di]+="$DOCKER_RUN --name sub-$di-$j -v /opt/bench-certs:/opt/bench-certs:ro $BENCH_IMG sub -h $hosts -p $port -c $subs_per -R $LANE_B_CONNECT_RATE -t '\$share/g1/bench/#' -q 1 $active --payload-hdrs ts --prometheus --restapi $((port_base + j)) $args >/dev/null"$'\n'
 			scrape[di]+="printf '\\n@@@ sub-$di-$j\\n'; curl -s http://localhost:$((port_base + j))/metrics"$'\n'
 			stop[di]+="printf '\\n@@@ sub-$di-$j\\n'; docker logs sub-$di-$j 2>&1"$'\n'
 			names[di]+=" sub-$di-$j"
@@ -592,7 +615,7 @@ lane_b_rung() { # lane_b_rung <total-rate> <posture:plain|mtls>
 			# block, so the topic count IS LANE_B_PUBS by construction.
 			seq_base=$(((di * P + j) * pubs_per))
 			hosts=$(rotated_hosts $((di * P + j)))
-			pubs[di]+="$DOCKER_RUN --name pub-$di-$j -v /opt/bench-certs:/opt/bench-certs:ro $BENCH_IMG pub -h $hosts -p $port -c $pubs_per -t 'bench/%i' -q 1 -s 256 $active -n $seq_base -I $interval -F $LANE_B_INFLIGHT --payload-hdrs ts $args >/dev/null"$'\n'
+			pubs[di]+="$DOCKER_RUN --name pub-$di-$j -v /opt/bench-certs:/opt/bench-certs:ro $BENCH_IMG pub -h $hosts -p $port -c $pubs_per -R $LANE_B_CONNECT_RATE -t 'bench/%i' -q 1 -s 256 $active -n $seq_base -I $interval -F $LANE_B_INFLIGHT --payload-hdrs ts $args >/dev/null"$'\n'
 			stop[di]+="printf '\\n@@@ pub-$di-$j\\n'; docker logs pub-$di-$j 2>&1"$'\n'
 			names[di]+=" pub-$di-$j"
 		done

@@ -36,6 +36,7 @@ from pathlib import Path
 
 TOLERANCE = 0.02  # counter cross-check band
 DRIVER_OK = 0.97  # a rung counts only if the offered rate was actually reached
+LATE_OK = 0.05  # share of publishes behind their own schedule before a rung is flagged
 KNEE_OK = 0.99  # delivered/sent ratio a sustained rung must reach
 # Seconds at the END of a rung's driver series that count as the measurement.
 # The rung's opening seconds are ramp (subscribers first, then publishers), and
@@ -235,10 +236,16 @@ def counter_delta(rdir: Path, label_from: str, label_to: str, metric: str) -> fl
 
 def lane_b_rung(rdir: Path, offered: int) -> dict:
     sent = sent_rate = recv = recv_rate = 0.0
+    late_rate = 0.0
     for log in rdir.glob("pub-*.log"):
         t, r = driver_rate(log, "pub")
         sent += t
         sent_rate += r
+        # emqtt-bench counts a publish that ran behind its own schedule as
+        # pub_overrun; the share of them in the steady window is the direct
+        # symptom of the round-trip floor described below.
+        _, late = driver_rate(log, "pub_overrun")
+        late_rate += late
     for log in rdir.glob("sub-*.log"):
         t, r = driver_rate(log, "recv")
         recv += t
@@ -247,22 +254,30 @@ def lane_b_rung(rdir: Path, offered: int) -> dict:
     broker_recv = counter_delta(rdir, "before", "after", 'mqttd_publish_received_total{qos="1"}')
     flags = []
     # The rung did not reach its offered rate. Deliberately NOT called
-    # "driver-limited": lane B's publishers are windowed QoS 1 (`-F 100`), so a
-    # shortfall is a closed loop with two possible causes — the drivers could
-    # not generate the rate (an integer-millisecond publish timer at a high
-    # rung), or the BROKERS did not ack fast enough and the window throttled the
-    # publishers. This measurement cannot tell those apart, and asserting the
-    # first is how a broker limit hides for a whole campaign. The per-rung
-    # mpstat samples are the evidence that separates them.
+    # "driver-limited": emqtt-bench's TCP publish is SYNCHRONOUS per client
+    # (it returns on the PUBACK; `-F` never engages), so every publisher is a
+    # window-1 closed loop capped at 1/RTT, and a shortfall has two possible
+    # causes — the drivers could not generate the rate (an integer-millisecond
+    # timer at a high rung, or too few publishers for the round trip), or the
+    # BROKERS acked slowly enough that 1/RTT fell below the per-client rate.
+    # The late-publish share below is the symptom either way; the per-rung
+    # mpstat samples and the population size are what separate the causes.
     offer_not_met = sent_rate < DRIVER_OK * offered
     if offer_not_met:
         flags.append(f"OFFER NOT MET ({sent_rate / offered * 100:.0f}% of offer)")
+    late_share = late_rate / sent_rate if sent_rate else 0.0
+    if late_share > LATE_OK:
+        flags.append(
+            f"PUBLISHERS LATE ({late_share * 100:.0f}% of publishes behind schedule — "
+            "synchronous QoS 1 publish caps each client at 1/PUBACK-RTT; more publishers, or a slower broker)"
+        )
     if sent and broker_recv and abs(broker_recv - sent) / sent > TOLERANCE:
         flags.append(f"counter mismatch: broker received {broker_recv:.0f} vs driver sent {sent:.0f}")
     return {
         "offered": offered,
         "sent_rate": sent_rate,
         "recv_rate": recv_rate,
+        "late_share": late_share,
         # Delivery is judged on TOTALS, never on the windowed rates. The
         # publisher and subscriber containers do not live on the same clock —
         # subscribers start first and are stopped last — so a subscriber's
