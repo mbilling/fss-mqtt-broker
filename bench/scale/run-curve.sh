@@ -58,7 +58,7 @@ elif [ "${STANDARD:-0}" = 1 ]; then
 	# full one; what it loses is CONFIDENCE (one rep, no median, no spread) and
 	# COVERAGE (one size, one posture, no ladder tail). That is the trade a
 	# regression gate makes and a published curve does not.
-	LANE_B_RUNGS=(50000 150000 300000)
+	LANE_B_RUNGS=(300000 150000 50000)
 	LANE_B_SECS=45
 	A_REPS=1 A_SECS=45 A_WARMUP=10
 	BARRIER_OPS=150
@@ -70,20 +70,22 @@ elif [ "${STANDARD:-0}" = 1 ]; then
 	LANE_C_RAMP=2500
 	LANE_C_HOLD=120
 else
-	# Overridable for a focused knee hunt (issue #258 follow-up: the 7-node
-	# fan-out plateau at ~140k with idle aggregate CPU): a space-separated
-	# rung list, e.g. LANE_B_RUNGS_OVERRIDE="50000 100000 200000 300000".
-	if [ -n "${LANE_B_RUNGS_OVERRIDE:-}" ]; then
-		read -r -a LANE_B_RUNGS <<<"$LANE_B_RUNGS_OVERRIDE"
-	else
-		LANE_B_RUNGS=(20000 50000 100000 200000 300000)
-	fi
+	LANE_B_RUNGS=(300000 200000 100000 50000 20000)
 	LANE_B_SECS=60
 	LANE_C_CONNS=50000
 	LANE_C_RAMP=2500
 	LANE_C_HOLD=120
 	A_REPS=3 A_SECS=60 A_WARMUP=10
 	BARRIER_OPS=150
+fi
+# Ladders run TOP RUNG FIRST: the most demanding rung is the one that decides
+# whether the rig can offer the load at all, so its verdict should not wait
+# behind rungs that were never in doubt. Rungs are independent (fresh
+# containers each, brokers stay up), so the order changes nothing measured.
+# LANE_B_RUNGS_OVERRIDE (a space-separated list, any profile) replaces the
+# ladder — one rung is the cheapest way to ask one question.
+if [ -n "${LANE_B_RUNGS_OVERRIDE:-}" ]; then
+	read -r -a LANE_B_RUNGS <<<"$LANE_B_RUNGS_OVERRIDE"
 fi
 # Total publishers. Sized so EVERY rung of the ladder is actually offerable:
 # each publisher sends on an INTEGER-millisecond timer (emqtt-bench `-I`), so
@@ -106,15 +108,21 @@ LANE_B_PUBS="${LANE_B_PUBS_OVERRIDE:-3000}" # per-rung rate = LANE_B_PUBS * 1000
 # ceiling and a fixed subscriber count multiply out to a fixed wall.
 # LANE_B_SUBS_OVERRIDE raises it to test exactly that.
 LANE_B_SUBS="${LANE_B_SUBS_OVERRIDE:-300}"
-# Containers per (driver, broker) pair. Every dedicated-hardware measurement so
-# far has put ONE emqtt-bench process at ~5.3-6.5k msg/s — whether it carried
-# 60 clients or 3000, with 1 sibling or 19 — so lane B has looked like
-# "D*N containers x ~5.5k" (5 x 10 x ~5.7k is the ~285k wall). k containers per
-# pair carry the SAME total population split k ways; only the number of OS
-# processes changes. Default 1 = today's rig exactly. Untested on dedicated
-# hardware so far — and the shape check below refuses a k the population does
-# not divide (k=4 at 5x10 would silently have run 200 of the 300 subscribers).
-LANE_B_CONTAINERS="${LANE_B_CONTAINERS:-1}"
+# Load containers per DRIVER, one vCPU each, every container spanning ALL
+# brokers (emqtt-bench's `-h a,b,c` places client i on host i mod |hosts|, so
+# the per-broker spread is exact — and checked below). Why this shape:
+#  * a bench VM costs ~575 MB whatever it carries (measured 2026-08-25: 20 or
+#    75 clients, 8 schedulers or 1 — 572-585 MiB), so containers are memory-
+#    bound at ~40 per 32 GB driver; the 60-per-driver experiment (run
+#    133322Z) had the kernel OOM-kill beam processes mid-rung;
+#  * a VM's default scheduler set burns 2.5x the CPU of one scheduler for the
+#    same work (30k msg/s: 235% vs 96% for +S 1:1), and 60 of them put the
+#    drivers at 98% CPU while the brokers sat at 65%;
+#  * one scheduler pushes ~38k QoS1 msg/s on a laptop core; a 300k rung over
+#    25 publisher containers is 12k each.
+# 5 + 3 = 8 = a CCX33's vCPUs. Keep PUB + SUB at or below the driver's cores.
+LANE_B_PUB_CONTAINERS="${LANE_B_PUB_CONTAINERS:-5}"
+LANE_B_SUB_CONTAINERS="${LANE_B_SUB_CONTAINERS:-3}"
 # Floor for the per-publisher timer (`-I`, whole milliseconds). Measured on the
 # v1.0.5 7-node campaign (#421): the drivers track the offer to 96% at a 6ms
 # timer and collapse below it (74% at 3ms, 52% at 2ms). A rung that needs a
@@ -135,20 +143,16 @@ LANE_B_REF_RUNG=50000
 # ramp, excluded from the measured window (see the scrape in lane_b_rung).
 LANE_B_SETTLE="${LANE_B_SETTLE:-15}"
 BENCH_IMG="emqx/emqtt-bench:0.6.3"
-# Extra Erlang VM flags for every bench container, passed as ERL_FLAGS (read by
-# erlexec — verified against this image: a refused value fails at startup with
-# "bad scheduler busy wait threshold", and the preflight below turns that into
-# a die instead of a campaign of zeros). Default EMPTY: no env var is passed and
-# the containers run exactly as before the knob existed. One candidate lever,
-# untested on dedicated hardware: Erlang schedulers BUSY-WAIT by default, and
-# with D*N*k VMs sharing one driver host the spin competes for the cores the
-# publishers need. The mechanism would be a throughput ceiling, not timer
-# drift: emqtt-bench 0.6.3 paces on an absolute schedule (next = begin +
-# attempts x interval) and counts a late wake as `pub_overrun` instead of
-# letting lateness accumulate —
-#   BENCH_ERL_FLAGS="+sbwt none +sbwtdcpu none +sbwtdio none"
-# One variable per campaign: do not move this and LANE_B_CONTAINERS together.
-BENCH_ERL_FLAGS="${BENCH_ERL_FLAGS-}"
+# Erlang VM flags for every bench container, passed as ERL_FLAGS (read by
+# erlexec — a refused value fails at startup with "bad scheduler busy wait
+# threshold", and the preflight below turns that into a die instead of a
+# campaign of zeros). Default: ONE scheduler per container — the container is
+# one vCPU (see LANE_B_PUB_CONTAINERS) — and no busy-wait, since an idle
+# scheduler spinning is a core stolen from a neighbour. Measured on one VM at
+# 30k msg/s: 235% CPU with the default scheduler set, 110% with +S 2:2, 96%
+# with +S 1:1, the delivered rate identical. BENCH_ERL_FLAGS= (empty) runs the
+# VM's own defaults; whatever is used lands in laneB/shape.txt.
+BENCH_ERL_FLAGS="${BENCH_ERL_FLAGS-+S 1:1 +sbwt none +sbwtdcpu none +sbwtdio none}"
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 brokers_csv() { # brokers_csv <suffix-jq> — comma list over brokers
@@ -217,7 +221,8 @@ TLS_ARGS="-S true --cacertfile /opt/bench-certs/peer-ca.pem --certfile /opt/benc
 #  * populations were floored per container, so a shape that does not divide
 #    them ran FEWER clients than the doc says (7 brokers x 5 drivers: 2975
 #    publishers, 280 subscribers) — the ADR 0048 §2 same-workload rule, broken
-#    by rounding. LANE_B_CONTAINERS makes this easy to hit.
+#    by rounding. A container count the population does not divide, or a
+#    per-container count the broker count does not divide, hits it.
 # Pure arithmetic on knobs the script already has, so it runs before the first
 # ssh: a wrong shape costs the provisioning minutes, not lane A's hour, and the
 # message names the fix. The table it prints is kept as laneB/shape.txt — the
@@ -242,27 +247,66 @@ lane_b_interval() { # lane_b_interval <total-rate> — per-publisher timer in ms
 	echo "$interval"
 }
 lane_b_shape() { # prints the shape as key=value lines; dies on any distortion
-	positive_int LANE_B_CONTAINERS "$LANE_B_CONTAINERS"
+	positive_int LANE_B_PUB_CONTAINERS "$LANE_B_PUB_CONTAINERS"
+	positive_int LANE_B_SUB_CONTAINERS "$LANE_B_SUB_CONTAINERS"
 	positive_int LANE_B_PUBS "$LANE_B_PUBS"
 	positive_int LANE_B_SUBS "$LANE_B_SUBS"
 	positive_int LANE_B_MIN_INTERVAL "$LANE_B_MIN_INTERVAL"
-	local cells=$((D * N * LANE_B_CONTAINERS))
-	local over="$D drivers x $N brokers x $LANE_B_CONTAINERS containers ($cells cells)"
-	local fix="set the _OVERRIDE to a multiple of $cells, or change LANE_B_CONTAINERS / DRIVER_COUNT"
-	if [ $((LANE_B_PUBS % cells)) -ne 0 ] || [ "$LANE_B_PUBS" -lt "$cells" ]; then
-		die "LANE_B_PUBS=$LANE_B_PUBS does not split evenly over $over — $fix"
-	fi
-	if [ $((LANE_B_SUBS % cells)) -ne 0 ] || [ "$LANE_B_SUBS" -lt "$cells" ]; then
-		die "LANE_B_SUBS=$LANE_B_SUBS does not split evenly over $over — $fix"
-	fi
-	echo "brokers=$N drivers=$D containers_per_pair=$LANE_B_CONTAINERS cells=$cells"
-	echo "publishers=$LANE_B_PUBS per_container=$((LANE_B_PUBS / cells))"
-	echo "subscribers=$LANE_B_SUBS per_container=$((LANE_B_SUBS / cells)) group=\$share/g1"
+	# Each population must split evenly over its containers (D x per-driver
+	# count). Within a container emqtt-bench places client i on host i mod N
+	# (one worker — see BENCH_ERL_FLAGS), and lane_b_rung rotates each
+	# container's host list by its index, so a per-container remainder lands on
+	# different brokers from one container to the next. spread_range works out
+	# the resulting per-broker min..max exactly; the totals are exact whenever
+	# N divides the per-container count or the container count, and a skew of
+	# one client is the granularity of the split. More than one is refused.
+	local pub_cells=$((D * LANE_B_PUB_CONTAINERS)) sub_cells=$((D * LANE_B_SUB_CONTAINERS))
+	spread_range() { # spread_range <total> <cells> — min..max clients per broker
+		local per=$(($1 / $2)) cells="$2" base extra c i
+		local -a count
+		for ((i = 0; i < N; i++)); do count[i]=0; done
+		base=$((per / N))
+		extra=$((per % N))
+		for ((c = 0; c < cells; c++)); do
+			for ((i = 0; i < N; i++)); do count[i]=$((count[i] + base)); done
+			for ((i = 0; i < extra; i++)); do count[(c + i) % N]=$((count[(c + i) % N] + 1)); done
+		done
+		local min=${count[0]} max=${count[0]}
+		for ((i = 1; i < N; i++)); do
+			[ "${count[i]}" -lt "$min" ] && min=${count[i]}
+			[ "${count[i]}" -gt "$max" ] && max=${count[i]}
+		done
+		echo "$min..$max"
+	}
+	split_check() { # split_check <knob> <total> <cells> <containers-per-driver> — prints the per-broker range
+		local name="$1" total="$2" cells="$3" per_driver="$4" range
+		if [ $((total % cells)) -ne 0 ] || [ "$total" -lt "$cells" ]; then
+			die "$name=$total does not split evenly over $D drivers x $per_driver containers ($cells cells) — set ${name}_OVERRIDE to a multiple of $cells, or change the container count / DRIVER_COUNT"
+		fi
+		range=$(spread_range "$total" "$cells")
+		if [ $((${range#*..} - ${range%..*})) -gt 1 ]; then
+			die "$name=$total spreads unevenly over $N brokers ($range per broker): $((total / cells)) clients per container with $cells containers — make N divide the per-container count, or the container count a multiple of N"
+		fi
+		echo "$range"
+	}
+	local pub_range sub_range
+	pub_range=$(split_check LANE_B_PUBS "$LANE_B_PUBS" "$pub_cells" "$LANE_B_PUB_CONTAINERS")
+	sub_range=$(split_check LANE_B_SUBS "$LANE_B_SUBS" "$sub_cells" "$LANE_B_SUB_CONTAINERS")
+	# The spread above assumes ONE emqtt-bench worker per container: the tool
+	# runs one worker per Erlang scheduler and every worker round-robins from
+	# host 0, so with the VM's default scheduler count the spread skews.
+	case " $BENCH_ERL_FLAGS " in
+	*" +S 1:1 "* | *" +S 1 "*) ;;
+	*) warn "BENCH_ERL_FLAGS has no +S 1:1 — emqtt-bench runs one worker per scheduler and each worker round-robins from the first broker, so the per-broker spread will NOT be the range printed" ;;
+	esac
+	echo "brokers=$N drivers=$D pub_containers_per_driver=$LANE_B_PUB_CONTAINERS sub_containers_per_driver=$LANE_B_SUB_CONTAINERS"
+	echo "publishers=$LANE_B_PUBS per_container=$((LANE_B_PUBS / pub_cells)) per_broker=$pub_range"
+	echo "subscribers=$LANE_B_SUBS per_container=$((LANE_B_SUBS / sub_cells)) per_broker=$sub_range group=\$share/g1"
 	local rungs=("${LANE_B_RUNGS[@]}") rate interval
 	if [ "${SMOKE:-0}" != 1 ] && [ "${STANDARD:-0}" != 1 ]; then rungs+=("$LANE_B_REF_RUNG"); fi
 	for rate in "${rungs[@]}"; do
 		interval=$(lane_b_interval "$rate")
-		echo "rung=$rate interval_ms=$interval per_container_msg_s=$((rate / cells))"
+		echo "rung=$rate interval_ms=$interval per_pub_container_msg_s=$((rate / pub_cells))"
 	done
 	echo "inflight=$LANE_B_INFLIGHT settle_s=$LANE_B_SETTLE measure_s=$LANE_B_SECS min_interval_ms=$LANE_B_MIN_INTERVAL"
 	echo "image=$BENCH_IMG erl_flags='$BENCH_ERL_FLAGS'"
@@ -470,7 +514,8 @@ else
 say "[$N nodes] lane B: \$share fan-out ladder (${LANE_B_RUNGS[*]} msg/s)"
 # ── batched container control: one ssh per driver per phase, drivers in parallel
 # Every container used to cost its own ssh round-trip (~1.3s from a laptop to
-# fsn1). At LANE_B_CONTAINERS=1 that is 50 per phase; at k=3 it is 150, which
+# fsn1). At one container per driver-broker pair that was 50 per phase; at
+# three per pair it was 150, which
 # turned a 65-second rung into ~20 minutes, let the 60s CPU sample expire before
 # a publisher existed, and put the summarizer's "last 60s" inside the stop
 # loop. Each phase is now ONE script per driver, fed on stdin to `bash -s` so
@@ -489,11 +534,12 @@ lane_b_rung() { # lane_b_rung <total-rate> <posture:plain|mtls>
 	local rate="$1" posture="$2"
 	local rdir="$OUT/laneB/rung-$rate-$posture"
 	mkdir -p "$rdir/.batch"
-	# The timer and the per-container split were both verified exact by
+	# The timer and both per-container splits were verified exact by
 	# lane_b_shape at the top of the run; nothing here can floor.
-	local interval nc=$LANE_B_CONTAINERS
+	local interval
 	interval=$(lane_b_interval "$rate") # ms between msgs per publisher
-	local subs_per=$((LANE_B_SUBS / (D * N * nc))) pubs_per=$((LANE_B_PUBS / (D * N * nc)))
+	local P=$LANE_B_PUB_CONTAINERS S=$LANE_B_SUB_CONTAINERS
+	local subs_per=$((LANE_B_SUBS / (D * S))) pubs_per=$((LANE_B_PUBS / (D * P)))
 	local args="" port_base=9200
 	[ "$posture" = mtls ] && args="$TLS_ARGS"
 	# emqtt-bench's socket mode. Its own help: "once" is the LEGACY DEFAULT,
@@ -509,9 +555,20 @@ lane_b_rung() { # lane_b_rung <total-rate> <posture:plain|mtls>
 	local active="-A true"
 	local port
 	port=$([ "$posture" = mtls ] && echo 8883 || echo 1883)
+	# Every container spans every broker: client i lands on host i mod N, and
+	# each container's list is rotated by its index so a remainder lands on
+	# different brokers from one container to the next (lane_b_shape proved
+	# the resulting per-broker totals).
+	local -a HOSTS
+	IFS=, read -r -a HOSTS <<<"$(brokers_csv '.private_ip')"
+	rotated_hosts() { # rotated_hosts <container-index>
+		local rot=$(($1 % N)) i out=""
+		for ((i = 0; i < N; i++)); do out+="${HOSTS[(rot + i) % N]},"; done
+		echo "${out%,}"
+	}
 	# Compose every driver's four scripts up front: subscriber starts, publisher
 	# starts, histogram scrape (used twice), and log capture + stop.
-	local di bi k host rp seq_base
+	local di j seq_base hosts
 	local -a subs pubs scrape stop names
 	for ((di = 0; di < D; di++)); do
 		subs[di]="set -e"$'\n'
@@ -519,29 +576,25 @@ lane_b_rung() { # lane_b_rung <total-rate> <posture:plain|mtls>
 		scrape[di]=""
 		stop[di]=""
 		names[di]=""
-	done
-	for ((di = 0; di < D; di++)); do
-		for ((bi = 0; bi < N; bi++)); do
-			host=$(inv ".brokers[$bi].private_ip")
-			for ((k = 0; k < nc; k++)); do
-				rp=$((port_base + bi * nc + k))
-				# `-t bench/%i` numbers topics by CLIENT SEQNO, which restarts at
-				# --startnumber in every container. Without an offset all D*N*k
-				# containers publish the same `bench/1..pubs_per` set, so the run
-				# has `LANE_B_PUBS / (D*N*k)` distinct topics — 60 where the doc
-				# claims 3000 — and the count silently changes with fleet shape,
-				# which is precisely what ADR 0048 §2's same-workload-at-every-size
-				# rule forbids. emqtt-bench documents `-n` for exactly this ("useful
-				# when running multiple emqtt-bench instances to test the same
-				# broker"). Offset each container's block so topics are globally
-				# distinct and the topic count IS LANE_B_PUBS by construction.
-				seq_base=$((((di * N + bi) * nc + k) * pubs_per))
-				subs[di]+="$DOCKER_RUN --name sub-$di-$bi-$k -v /opt/bench-certs:/opt/bench-certs:ro $BENCH_IMG sub -h $host -p $port -c $subs_per -t '\$share/g1/bench/#' -q 1 $active --payload-hdrs ts --prometheus --restapi $rp $args >/dev/null"$'\n'
-				pubs[di]+="$DOCKER_RUN --name pub-$di-$bi-$k -v /opt/bench-certs:/opt/bench-certs:ro $BENCH_IMG pub -h $host -p $port -c $pubs_per -t 'bench/%i' -q 1 -s 256 $active -n $seq_base -I $interval -F $LANE_B_INFLIGHT --payload-hdrs ts $args >/dev/null"$'\n'
-				scrape[di]+="printf '\\n@@@ sub-$di-$bi-$k\\n'; curl -s http://localhost:$rp/metrics"$'\n'
-				stop[di]+="printf '\\n@@@ pub-$di-$bi-$k\\n'; docker logs pub-$di-$bi-$k 2>&1; printf '\\n@@@ sub-$di-$bi-$k\\n'; docker logs sub-$di-$bi-$k 2>&1"$'\n'
-				names[di]+=" pub-$di-$bi-$k sub-$di-$bi-$k"
-			done
+		for ((j = 0; j < S; j++)); do
+			hosts=$(rotated_hosts $((di * S + j)))
+			subs[di]+="$DOCKER_RUN --name sub-$di-$j -v /opt/bench-certs:/opt/bench-certs:ro $BENCH_IMG sub -h $hosts -p $port -c $subs_per -t '\$share/g1/bench/#' -q 1 $active --payload-hdrs ts --prometheus --restapi $((port_base + j)) $args >/dev/null"$'\n'
+			scrape[di]+="printf '\\n@@@ sub-$di-$j\\n'; curl -s http://localhost:$((port_base + j))/metrics"$'\n'
+			stop[di]+="printf '\\n@@@ sub-$di-$j\\n'; docker logs sub-$di-$j 2>&1"$'\n'
+			names[di]+=" sub-$di-$j"
+		done
+		for ((j = 0; j < P; j++)); do
+			# `-t bench/%i` numbers topics by CLIENT SEQNO, which restarts at
+			# --startnumber in every container; without an offset every container
+			# would publish the same `bench/1..pubs_per` set and the topic count
+			# would change with fleet shape (ADR 0048 §2 forbids exactly that).
+			# emqtt-bench documents `-n` for this; each container gets its own
+			# block, so the topic count IS LANE_B_PUBS by construction.
+			seq_base=$(((di * P + j) * pubs_per))
+			hosts=$(rotated_hosts $((di * P + j)))
+			pubs[di]+="$DOCKER_RUN --name pub-$di-$j -v /opt/bench-certs:/opt/bench-certs:ro $BENCH_IMG pub -h $hosts -p $port -c $pubs_per -t 'bench/%i' -q 1 -s 256 $active -n $seq_base -I $interval -F $LANE_B_INFLIGHT --payload-hdrs ts $args >/dev/null"$'\n'
+			stop[di]+="printf '\\n@@@ pub-$di-$j\\n'; docker logs pub-$di-$j 2>&1"$'\n'
+			names[di]+=" pub-$di-$j"
 		done
 	done
 	local -a pids
