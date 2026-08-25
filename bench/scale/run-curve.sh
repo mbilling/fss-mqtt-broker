@@ -119,8 +119,11 @@ LANE_B_CONTAINERS="${LANE_B_CONTAINERS:-1}"
 # v1.0.5 7-node campaign (#421): the drivers track the offer to 96% at a 6ms
 # timer and collapse below it (74% at 3ms, 52% at 2ms). A rung that needs a
 # shorter timer is a driver measurement, not a broker one, so the shape check
-# refuses it — raise LANE_B_PUBS_OVERRIDE instead. Lowering the floor is for
-# knowingly reproducing a collapsed campaign.
+# refuses it — raise LANE_B_PUBS_OVERRIDE instead. 6 is the evidenced floor,
+# not a safe harbour: 96% sits just under the summarizer's 0.97 DRIVER_OK gate,
+# so a 6-9ms rung can still be struck DRIVER-LIMITED downstream; 10ms is the
+# regime a full ladder has sustained. Lowering the floor is for knowingly
+# reproducing a collapsed campaign.
 LANE_B_MIN_INTERVAL="${LANE_B_MIN_INTERVAL:-6}"
 # Publisher in-flight window. Without it each QoS1 publisher is a WINDOW-1
 # closed loop whose send rate tracks the broker's ack rate — the ladder then
@@ -133,12 +136,16 @@ LANE_B_REF_RUNG=50000
 LANE_B_SETTLE="${LANE_B_SETTLE:-15}"
 BENCH_IMG="emqx/emqtt-bench:0.6.3"
 # Extra Erlang VM flags for every bench container, passed as ERL_FLAGS (read by
-# erlexec — verified against this image: a bad value fails at startup with
-# "bad scheduler busy wait threshold"). Default EMPTY: no env var is passed and
+# erlexec — verified against this image: a refused value fails at startup with
+# "bad scheduler busy wait threshold", and the preflight below turns that into
+# a die instead of a campaign of zeros). Default EMPTY: no env var is passed and
 # the containers run exactly as before the knob existed. One candidate lever,
 # untested on dedicated hardware: Erlang schedulers BUSY-WAIT by default, and
-# with D*N*k VMs sharing one driver host the spin burns cores invisibly and can
-# slip the millisecond pacing timers —
+# with D*N*k VMs sharing one driver host the spin competes for the cores the
+# publishers need. The mechanism would be a throughput ceiling, not timer
+# drift: emqtt-bench 0.6.3 paces on an absolute schedule (next = begin +
+# attempts x interval) and counts a late wake as `pub_overrun` instead of
+# letting lateness accumulate —
 #   BENCH_ERL_FLAGS="+sbwt none +sbwtdcpu none +sbwtdio none"
 # One variable per campaign: do not move this and LANE_B_CONTAINERS together.
 BENCH_ERL_FLAGS="${BENCH_ERL_FLAGS-}"
@@ -202,8 +209,8 @@ TLS_ARGS="-S true --cacertfile /opt/bench-certs/peer-ca.pem --certfile /opt/benc
 # ── lane B shape: refused HERE, before any lane pays for anything ────────────
 # Two ways the rig has quietly offered something other than the rung's label:
 #  * `-I` is WHOLE milliseconds per client, so a rung that does not divide
-#    LANE_B_PUBS*1000 got a floored timer — 3000 publishers asked for 400k ran
-#    I=7 and offered 428k under a 400k label. A rung is honest only if it needs
+#    LANE_B_PUBS*1000 got a floored timer — 3000 publishers asked for 400k get
+#    I=7 and offer 428k under a 400k label. A rung is honest only if it needs
 #    an integer timer at or above LANE_B_MIN_INTERVAL.
 #  * populations were floored per container, so a shape that does not divide
 #    them ran FEWER clients than the doc says (7 brokers x 5 drivers: 2975
@@ -215,8 +222,16 @@ TLS_ARGS="-S true --cacertfile /opt/bench-certs/peer-ca.pem --certfile /opt/benc
 # disclosure record of what the load stack was actually asked to do.
 # SHAPE_ONLY=1 stops right after it, so a knob set can be checked offline
 # against a synthesized inventory (README: "Checking a shape without paying").
+positive_int() { # positive_int <what> <value> — a plain positive integer, or die
+	[[ "$2" =~ ^[1-9][0-9]*$ ]] || die "$1 must be a positive integer (got '$2')"
+}
 lane_b_interval() { # lane_b_interval <total-rate> — per-publisher timer in ms, or die
 	local rate="$1"
+	# Unvalidated, a rung token reaches bash arithmetic: "0" divides by zero with
+	# no die message, "20000,50000" evaluates the comma operator to the 50k rung
+	# and files it under a directory name the summarizer cannot parse, "0200000"
+	# is octal.
+	positive_int "lane B rung" "$rate"
 	[ $((LANE_B_PUBS * 1000 % rate)) -eq 0 ] ||
 		die "lane B rung $rate is not exactly offerable by $LANE_B_PUBS publishers (fractional -I) — use a divisor of $((LANE_B_PUBS * 1000)), or a LANE_B_PUBS_OVERRIDE that every rung divides"
 	local interval=$((LANE_B_PUBS * 1000 / rate))
@@ -225,8 +240,10 @@ lane_b_interval() { # lane_b_interval <total-rate> — per-publisher timer in ms
 	echo "$interval"
 }
 lane_b_shape() { # prints the shape as key=value lines; dies on any distortion
-	[[ "$LANE_B_CONTAINERS" =~ ^[1-9][0-9]*$ ]] ||
-		die "LANE_B_CONTAINERS must be a positive integer (got '$LANE_B_CONTAINERS')"
+	positive_int LANE_B_CONTAINERS "$LANE_B_CONTAINERS"
+	positive_int LANE_B_PUBS "$LANE_B_PUBS"
+	positive_int LANE_B_SUBS "$LANE_B_SUBS"
+	positive_int LANE_B_MIN_INTERVAL "$LANE_B_MIN_INTERVAL"
 	local cells=$((D * N * LANE_B_CONTAINERS))
 	local over="$D drivers x $N brokers x $LANE_B_CONTAINERS containers ($cells cells)"
 	local fix="set the _OVERRIDE to a multiple of $cells, or change LANE_B_CONTAINERS / DRIVER_COUNT"
@@ -257,6 +274,20 @@ fi
 if [ "${SHAPE_ONLY:-0}" = 1 ]; then
 	say "SHAPE_ONLY=1 — knobs and lane B shape verified; touching no host"
 	exit 0
+fi
+
+# ── bench VM flags: proved on a driver before any container is paid for ─────
+# `docker run -d` returns 0 whether or not beam accepts ERL_FLAGS. A refused
+# value kills every load container ~100ms after start and nothing downstream
+# would notice: the rung sleeps out its window, the scrapes come back empty
+# under `|| true`, and the summarizer prints a campaign of zeros. So a
+# non-empty BENCH_ERL_FLAGS is tried once against the image on driver 0 —
+# `pub --help` exits 1 with beam's own message when a flag is refused, 0 when
+# it is accepted (verified against 0.6.3) — before lanes B/C start anything.
+if [[ "$LANES" == *[BC]* ]] && [ -n "$BENCH_ERL_FLAGS" ]; then
+	probe=$(rssh "$(driver_pub_ip 0)" "docker run --rm -e ERL_FLAGS='$BENCH_ERL_FLAGS' $BENCH_IMG pub --help 2>&1") ||
+		die "BENCH_ERL_FLAGS='$BENCH_ERL_FLAGS' is refused by the Erlang VM in $BENCH_IMG: $(printf '%s\n' "$probe" | head -1)"
+	say "BENCH_ERL_FLAGS accepted by $BENCH_IMG on driver 0: $BENCH_ERL_FLAGS"
 fi
 
 # ── 0. preflight snapshot ────────────────────────────────────────────────────
