@@ -22,6 +22,9 @@
 # pay for lane A's hour). Skipping lane A also skips its barrier probes; a
 # lane-B/C-only result dir is therefore NOT a Curve 1 point and the summarizer
 # will render it as such.
+#
+# SHAPE_ONLY=1 validates the knobs and lane B's shape against the inventory and
+# exits before the first ssh (README: "Checking a shape without paying").
 
 set -euo pipefail
 . "$(dirname "$0")/lib.sh"
@@ -94,7 +97,34 @@ fi
 # regime the drivers demonstrably sustain.
 # LANE_B_PUBS_OVERRIDE reproduces an older campaign's population verbatim.
 LANE_B_PUBS="${LANE_B_PUBS_OVERRIDE:-3000}" # per-rung rate = LANE_B_PUBS * 1000/I
-LANE_B_SUBS=300 # total subscribers, ONE shared group ($share/g1)
+# Total subscribers in the ONE shared group ($share/g1). This is the variable
+# that has never changed in this project's history, and the fan-out ceiling has
+# tracked it exactly: every saturated configuration — publisher counts 3000,
+# 4000 and 6000, socket mode `once` and `true`, offers from 200k to 800k —
+# delivered 300-326k, which is ~1000 msg/s per subscriber every time, with
+# brokers at 26-35% CPU and latency flat at p50 <=10ms. A per-subscriber
+# ceiling and a fixed subscriber count multiply out to a fixed wall.
+# LANE_B_SUBS_OVERRIDE raises it to test exactly that.
+LANE_B_SUBS="${LANE_B_SUBS_OVERRIDE:-300}"
+# Containers per (driver, broker) pair. Every dedicated-hardware measurement so
+# far has put ONE emqtt-bench process at ~5.3-6.5k msg/s — whether it carried
+# 60 clients or 3000, with 1 sibling or 19 — so lane B has looked like
+# "D*N containers x ~5.5k" (5 x 10 x ~5.7k is the ~285k wall). k containers per
+# pair carry the SAME total population split k ways; only the number of OS
+# processes changes. Default 1 = today's rig exactly. Untested on dedicated
+# hardware so far — and the shape check below refuses a k the population does
+# not divide (k=4 at 5x10 would silently have run 200 of the 300 subscribers).
+LANE_B_CONTAINERS="${LANE_B_CONTAINERS:-1}"
+# Floor for the per-publisher timer (`-I`, whole milliseconds). Measured on the
+# v1.0.5 7-node campaign (#421): the drivers track the offer to 96% at a 6ms
+# timer and collapse below it (74% at 3ms, 52% at 2ms). A rung that needs a
+# shorter timer is a driver measurement, not a broker one, so the shape check
+# refuses it — raise LANE_B_PUBS_OVERRIDE instead. 6 is the evidenced floor,
+# not a safe harbour: 96% sits just under the summarizer's 0.97 DRIVER_OK gate,
+# so a 6-9ms rung can still be struck DRIVER-LIMITED downstream; 10ms is the
+# regime a full ladder has sustained. Lowering the floor is for knowingly
+# reproducing a collapsed campaign.
+LANE_B_MIN_INTERVAL="${LANE_B_MIN_INTERVAL:-6}"
 # Publisher in-flight window. Without it each QoS1 publisher is a WINDOW-1
 # closed loop whose send rate tracks the broker's ack rate — the ladder then
 # degenerates into a saturation probe that can never offer above it (measured:
@@ -105,6 +135,20 @@ LANE_B_REF_RUNG=50000
 # ramp, excluded from the measured window (see the scrape in lane_b_rung).
 LANE_B_SETTLE="${LANE_B_SETTLE:-15}"
 BENCH_IMG="emqx/emqtt-bench:0.6.3"
+# Extra Erlang VM flags for every bench container, passed as ERL_FLAGS (read by
+# erlexec — verified against this image: a refused value fails at startup with
+# "bad scheduler busy wait threshold", and the preflight below turns that into
+# a die instead of a campaign of zeros). Default EMPTY: no env var is passed and
+# the containers run exactly as before the knob existed. One candidate lever,
+# untested on dedicated hardware: Erlang schedulers BUSY-WAIT by default, and
+# with D*N*k VMs sharing one driver host the spin competes for the cores the
+# publishers need. The mechanism would be a throughput ceiling, not timer
+# drift: emqtt-bench 0.6.3 paces on an absolute schedule (next = begin +
+# attempts x interval) and counts a late wake as `pub_overrun` instead of
+# letting lateness accumulate —
+#   BENCH_ERL_FLAGS="+sbwt none +sbwtdcpu none +sbwtdio none"
+# One variable per campaign: do not move this and LANE_B_CONTAINERS together.
+BENCH_ERL_FLAGS="${BENCH_ERL_FLAGS-}"
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 brokers_csv() { # brokers_csv <suffix-jq> — comma list over brokers
@@ -144,8 +188,11 @@ stop_cpu_sampling() {
 drun() { # drun <driver-index> <name> <docker args...> — detached container on a driver
 	local di="$1" name="$2"
 	shift 2
+	# BENCH_ERL_FLAGS rides in as ERL_FLAGS only when set; its single quotes
+	# survive the rssh single-string hop the way `-t '$share/...'` already does.
+	# shellcheck disable=SC2016 # those quotes are for the REMOTE shell; $BENCH_ERL_FLAGS expands here
 	rssh "$(driver_pub_ip "$di")" \
-		"docker run -d --network host --ulimit nofile=1048576:1048576 --name $name $*" >/dev/null
+		"docker run -d --network host --ulimit nofile=1048576:1048576 --name $name ${BENCH_ERL_FLAGS:+-e ERL_FLAGS='$BENCH_ERL_FLAGS' }$*" >/dev/null
 }
 
 dstop() { # dstop <driver-index> <name> <log-file> — capture logs, remove
@@ -158,6 +205,90 @@ dstop() { # dstop <driver-index> <name> <log-file> — capture logs, remove
 # pushes it): peer-ca.pem verifies the broker's server cert, client.pem/key is
 # the mTLS identity against the separate client CA.
 TLS_ARGS="-S true --cacertfile /opt/bench-certs/peer-ca.pem --certfile /opt/bench-certs/client.pem --keyfile /opt/bench-certs/client.key"
+
+# ── lane B shape: refused HERE, before any lane pays for anything ────────────
+# Two ways the rig has quietly offered something other than the rung's label:
+#  * `-I` is WHOLE milliseconds per client, so a rung that does not divide
+#    LANE_B_PUBS*1000 got a floored timer — 3000 publishers asked for 400k get
+#    I=7 and offer 428k under a 400k label. A rung is honest only if it needs
+#    an integer timer at or above LANE_B_MIN_INTERVAL.
+#  * populations were floored per container, so a shape that does not divide
+#    them ran FEWER clients than the doc says (7 brokers x 5 drivers: 2975
+#    publishers, 280 subscribers) — the ADR 0048 §2 same-workload rule, broken
+#    by rounding. LANE_B_CONTAINERS makes this easy to hit.
+# Pure arithmetic on knobs the script already has, so it runs before the first
+# ssh: a wrong shape costs the provisioning minutes, not lane A's hour, and the
+# message names the fix. The table it prints is kept as laneB/shape.txt — the
+# disclosure record of what the load stack was actually asked to do.
+# SHAPE_ONLY=1 stops right after it, so a knob set can be checked offline
+# against a synthesized inventory (README: "Checking a shape without paying").
+positive_int() { # positive_int <what> <value> — a plain positive integer, or die
+	[[ "$2" =~ ^[1-9][0-9]*$ ]] || die "$1 must be a positive integer (got '$2')"
+}
+lane_b_interval() { # lane_b_interval <total-rate> — per-publisher timer in ms, or die
+	local rate="$1"
+	# Unvalidated, a rung token reaches bash arithmetic: "0" divides by zero with
+	# no die message, "20000,50000" evaluates the comma operator to the 50k rung
+	# and files it under a directory name the summarizer cannot parse, "0200000"
+	# is octal.
+	positive_int "lane B rung" "$rate"
+	[ $((LANE_B_PUBS * 1000 % rate)) -eq 0 ] ||
+		die "lane B rung $rate is not exactly offerable by $LANE_B_PUBS publishers (fractional -I) — use a divisor of $((LANE_B_PUBS * 1000)), or a LANE_B_PUBS_OVERRIDE that every rung divides"
+	local interval=$((LANE_B_PUBS * 1000 / rate))
+	[ "$interval" -ge "$LANE_B_MIN_INTERVAL" ] ||
+		die "lane B rung $rate needs -I ${interval}ms with $LANE_B_PUBS publishers; the drivers collapse below ${LANE_B_MIN_INTERVAL}ms (#421) — raise LANE_B_PUBS_OVERRIDE (LANE_B_MIN_INTERVAL lowers the floor knowingly)"
+	echo "$interval"
+}
+lane_b_shape() { # prints the shape as key=value lines; dies on any distortion
+	positive_int LANE_B_CONTAINERS "$LANE_B_CONTAINERS"
+	positive_int LANE_B_PUBS "$LANE_B_PUBS"
+	positive_int LANE_B_SUBS "$LANE_B_SUBS"
+	positive_int LANE_B_MIN_INTERVAL "$LANE_B_MIN_INTERVAL"
+	local cells=$((D * N * LANE_B_CONTAINERS))
+	local over="$D drivers x $N brokers x $LANE_B_CONTAINERS containers ($cells cells)"
+	local fix="set the _OVERRIDE to a multiple of $cells, or change LANE_B_CONTAINERS / DRIVER_COUNT"
+	if [ $((LANE_B_PUBS % cells)) -ne 0 ] || [ "$LANE_B_PUBS" -lt "$cells" ]; then
+		die "LANE_B_PUBS=$LANE_B_PUBS does not split evenly over $over — $fix"
+	fi
+	if [ $((LANE_B_SUBS % cells)) -ne 0 ] || [ "$LANE_B_SUBS" -lt "$cells" ]; then
+		die "LANE_B_SUBS=$LANE_B_SUBS does not split evenly over $over — $fix"
+	fi
+	echo "brokers=$N drivers=$D containers_per_pair=$LANE_B_CONTAINERS cells=$cells"
+	echo "publishers=$LANE_B_PUBS per_container=$((LANE_B_PUBS / cells))"
+	echo "subscribers=$LANE_B_SUBS per_container=$((LANE_B_SUBS / cells)) group=\$share/g1"
+	local rungs=("${LANE_B_RUNGS[@]}") rate interval
+	if [ "${SMOKE:-0}" != 1 ] && [ "${STANDARD:-0}" != 1 ]; then rungs+=("$LANE_B_REF_RUNG"); fi
+	for rate in "${rungs[@]}"; do
+		interval=$(lane_b_interval "$rate")
+		echo "rung=$rate interval_ms=$interval per_container_msg_s=$((rate / cells))"
+	done
+	echo "inflight=$LANE_B_INFLIGHT settle_s=$LANE_B_SETTLE measure_s=$LANE_B_SECS min_interval_ms=$LANE_B_MIN_INTERVAL"
+	echo "image=$BENCH_IMG erl_flags='$BENCH_ERL_FLAGS'"
+}
+if [[ "$LANES" == *B* ]]; then
+	mkdir -p "$OUT/laneB"
+	lane_b_shape >"$OUT/laneB/shape.txt"
+	say "[$N nodes] lane B shape (kept as laneB/shape.txt):"
+	sed 's/^/    /' "$OUT/laneB/shape.txt" >&2
+fi
+if [ "${SHAPE_ONLY:-0}" = 1 ]; then
+	say "SHAPE_ONLY=1 — knobs and lane B shape verified; touching no host"
+	exit 0
+fi
+
+# ── bench VM flags: proved on a driver before any container is paid for ─────
+# `docker run -d` returns 0 whether or not beam accepts ERL_FLAGS. A refused
+# value kills every load container ~100ms after start and nothing downstream
+# would notice: the rung sleeps out its window, the scrapes come back empty
+# under `|| true`, and the summarizer prints a campaign of zeros. So a
+# non-empty BENCH_ERL_FLAGS is tried once against the image on driver 0 —
+# `pub --help` exits 1 with beam's own message when a flag is refused, 0 when
+# it is accepted (verified against 0.6.3) — before lanes B/C start anything.
+if [[ "$LANES" == *[BC]* ]] && [ -n "$BENCH_ERL_FLAGS" ]; then
+	probe=$(rssh "$(driver_pub_ip 0)" "docker run --rm -e ERL_FLAGS='$BENCH_ERL_FLAGS' $BENCH_IMG pub --help 2>&1") ||
+		die "BENCH_ERL_FLAGS='$BENCH_ERL_FLAGS' is refused by the Erlang VM in $BENCH_IMG: $(printf '%s\n' "$probe" | head -1)"
+	say "BENCH_ERL_FLAGS accepted by $BENCH_IMG on driver 0: $BENCH_ERL_FLAGS"
+fi
 
 # ── 0. preflight snapshot ────────────────────────────────────────────────────
 say "[$N nodes] preflight: readyz + statusz per broker"
@@ -339,11 +470,11 @@ lane_b_rung() { # lane_b_rung <total-rate> <posture:plain|mtls>
 	local rate="$1" posture="$2"
 	local rdir="$OUT/laneB/rung-$rate-$posture"
 	mkdir -p "$rdir"
-	local interval=$((LANE_B_PUBS * 1000 / rate)) # ms between msgs per publisher
-	[ "$interval" -ge 1 ] || die "rung $rate needs sub-ms publish intervals with $LANE_B_PUBS publishers"
-	local subs_per=$((LANE_B_SUBS / (D * N))) pubs_per=$((LANE_B_PUBS / (D * N)))
-	[ "$subs_per" -ge 1 ] || subs_per=1
-	[ "$pubs_per" -ge 1 ] || pubs_per=1
+	# The timer and the per-container split were both verified exact by
+	# lane_b_shape at the top of the run; nothing here can floor.
+	local interval nc=$LANE_B_CONTAINERS
+	interval=$(lane_b_interval "$rate") # ms between msgs per publisher
+	local subs_per=$((LANE_B_SUBS / (D * N * nc))) pubs_per=$((LANE_B_PUBS / (D * N * nc)))
 	local args="" port_base=9200
 	[ "$posture" = mtls ] && args="$TLS_ARGS"
 	# emqtt-bench's socket mode. Its own help: "once" is the LEGACY DEFAULT,
@@ -359,15 +490,17 @@ lane_b_rung() { # lane_b_rung <total-rate> <posture:plain|mtls>
 	local active="-A true"
 	snapshot_metrics "$rdir" before
 	start_cpu_sampling "$rdir/cpu" $((LANE_B_SETTLE + LANE_B_SECS))
-	local di bi host port
+	local di bi k host port
 	# subscribers first (they expose the e2e histogram), then publishers
 	for ((di = 0; di < D; di++)); do
 		for ((bi = 0; bi < N; bi++)); do
 			host=$(inv ".brokers[$bi].private_ip")
 			port=$([ "$posture" = mtls ] && echo 8883 || echo 1883)
-			drun "$di" "sub-$di-$bi" "-v /opt/bench-certs:/opt/bench-certs:ro $BENCH_IMG \
-				sub -h $host -p $port -c $subs_per -t '\$share/g1/bench/#' -q 1 $active \
-				--payload-hdrs ts --prometheus --restapi $((port_base + bi)) $args"
+			for ((k = 0; k < nc; k++)); do
+				drun "$di" "sub-$di-$bi-$k" "-v /opt/bench-certs:/opt/bench-certs:ro $BENCH_IMG \
+					sub -h $host -p $port -c $subs_per -t '\$share/g1/bench/#' -q 1 $active \
+					--payload-hdrs ts --prometheus --restapi $((port_base + bi * nc + k)) $args"
+			done
 		done
 	done
 	sleep 5
@@ -385,10 +518,12 @@ lane_b_rung() { # lane_b_rung <total-rate> <posture:plain|mtls>
 			# when running multiple emqtt-bench instances to test the same
 			# broker"). Offset each container's block so topics are globally
 			# distinct and the topic count IS LANE_B_PUBS by construction.
-			local seq_base=$(((di * N + bi) * pubs_per))
-			drun "$di" "pub-$di-$bi" "-v /opt/bench-certs:/opt/bench-certs:ro $BENCH_IMG \
-				pub -h $host -p $port -c $pubs_per -t 'bench/%i' -q 1 -s 256 $active \
-				-n $seq_base -I $interval -F $LANE_B_INFLIGHT --payload-hdrs ts $args"
+			for ((k = 0; k < nc; k++)); do
+				local seq_base=$((((di * N + bi) * nc + k) * pubs_per))
+				drun "$di" "pub-$di-$bi-$k" "-v /opt/bench-certs:/opt/bench-certs:ro $BENCH_IMG \
+					pub -h $host -p $port -c $pubs_per -t 'bench/%i' -q 1 -s 256 $active \
+					-n $seq_base -I $interval -F $LANE_B_INFLIGHT --payload-hdrs ts $args"
+			done
 		done
 	done
 	# Let the publisher ramp finish BEFORE the latency measurement starts. The
@@ -402,22 +537,28 @@ lane_b_rung() { # lane_b_rung <total-rate> <posture:plain|mtls>
 	sleep "$LANE_B_SETTLE"
 	for ((di = 0; di < D; di++)); do
 		for ((bi = 0; bi < N; bi++)); do
-			rssh "$(driver_pub_ip "$di")" "curl -s http://localhost:$((port_base + bi))/metrics" \
-				>"$rdir/sub-$di-$bi-base.prom" 2>/dev/null || true
+			for ((k = 0; k < nc; k++)); do
+				rssh "$(driver_pub_ip "$di")" "curl -s http://localhost:$((port_base + bi * nc + k))/metrics" \
+					>"$rdir/sub-$di-$bi-$k-base.prom" 2>/dev/null || true
+			done
 		done
 	done
 	sleep "$LANE_B_SECS"
 	# scrape each subscriber's histogram BEFORE stopping anything
 	for ((di = 0; di < D; di++)); do
 		for ((bi = 0; bi < N; bi++)); do
-			rssh "$(driver_pub_ip "$di")" "curl -s http://localhost:$((port_base + bi))/metrics" \
-				>"$rdir/sub-$di-$bi.prom" 2>/dev/null || true
+			for ((k = 0; k < nc; k++)); do
+				rssh "$(driver_pub_ip "$di")" "curl -s http://localhost:$((port_base + bi * nc + k))/metrics" \
+					>"$rdir/sub-$di-$bi-$k.prom" 2>/dev/null || true
+			done
 		done
 	done
 	for ((di = 0; di < D; di++)); do
 		for ((bi = 0; bi < N; bi++)); do
-			dstop "$di" "pub-$di-$bi" "$rdir/pub-$di-$bi.log"
-			dstop "$di" "sub-$di-$bi" "$rdir/sub-$di-$bi.log"
+			for ((k = 0; k < nc; k++)); do
+				dstop "$di" "pub-$di-$bi-$k" "$rdir/pub-$di-$bi-$k.log"
+				dstop "$di" "sub-$di-$bi-$k" "$rdir/sub-$di-$bi-$k.log"
+			done
 		done
 	done
 	stop_cpu_sampling
