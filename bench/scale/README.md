@@ -113,7 +113,7 @@ The table it prints is what a real run keeps as `laneB/shape.txt`.
 | lane A `tier-local` / `tier-relaxed` | same shape per ADR 0072 tier (`MQTTD_ALLOW_RELAXED_PUBLISH=1`) | sat + lat each |
 | lane A voters variant (N>5 only) | wipe + fresh formation with `MQTTD_LEASE_VOTERS=N` — prices the committee against the ADR 0073 default | sat + lat |
 | re-form (clean mode) | durable plane OFF for the routing-bound lanes | — |
-| lane B | non-durable `$share` fan-out ladder (+ one mTLS rung) | 3000 pubs / 300 subs in 5 + 3 one-vCPU containers per driver, 300k…20k offered (top rung first), 60 s/rung |
+| lane B | non-durable `$share` fan-out ladder (+ one mTLS rung) | 12 000 pubs / 300 subs in 5 + 3 one-vCPU containers per driver, 300k…20k offered (top rung first), 60 s/rung |
 | lane C | idle-connection scaling, plaintext + mTLS | 50k conns, ramp 2.5k/s, 120 s hold |
 | teardown | destroy before the next size (fresh clusters only), host logs collected on failure | — |
 
