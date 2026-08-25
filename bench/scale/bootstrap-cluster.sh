@@ -173,9 +173,10 @@ ready_within() {
 # follower_ready <index>: every 10-node formation on record goes through an
 # election storm ~30s after the followers start (early joiners cannot reach the
 # founder, terms climb, the founder re-wins); it normally settles inside the
-# 180s budget, but twice on 2026-08-25 one follower's join was lost in it and
-# the node sat SWIM-green and Raft-leaderless for the whole budget, which then
-# cost the entire run (issue #426). A follower's readiness cannot be waited for
+# 180s budget, but twice on 2026-08-25 — on a 1.0.0 binary the rig had defaulted
+# to, six releases behind the formation fixes — one follower's join was lost in
+# it and the node sat SWIM-green and Raft-leaderless for the whole budget, which
+# then cost the entire run (issue #426). A follower's readiness cannot be waited for
 # one at a time (it needs the majority floor of members alive), so the remedy
 # is what an operator would do: keep the evidence, restart THAT node once so it
 # re-announces and joins after the storm has settled, and wait once more.
