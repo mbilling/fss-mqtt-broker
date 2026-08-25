@@ -22,7 +22,7 @@ members = [
 exclude = ["tools/mqttui"]
 
 [workspace.package]
-version = "1.0.6"
+version = "1.0.7"
 edition = "2021"
 # Raised from 1.75 by the OTLP/HTTP metric exporter (ADR 0020 T9: the OpenTelemetry
 # SDK + reqwest stack requires Rust 1.85), then from 1.85 by jsonwebtoken 11
