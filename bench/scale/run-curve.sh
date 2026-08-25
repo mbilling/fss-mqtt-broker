@@ -185,14 +185,16 @@ stop_cpu_sampling() {
 	CPU_PIDS=()
 }
 
+# The fleet-wide docker run prefix: host networking, the fd limit the 50k lane
+# needs, and BENCH_ERL_FLAGS as ERL_FLAGS only when set — its single quotes
+# survive the rssh single-string hop the way `-t '$share/...'` already does.
+# shellcheck disable=SC2016 # those quotes are for the REMOTE shell; $BENCH_ERL_FLAGS expands here
+DOCKER_RUN="docker run -d --network host --ulimit nofile=1048576:1048576${BENCH_ERL_FLAGS:+ -e ERL_FLAGS='$BENCH_ERL_FLAGS'}"
+
 drun() { # drun <driver-index> <name> <docker args...> — detached container on a driver
 	local di="$1" name="$2"
 	shift 2
-	# BENCH_ERL_FLAGS rides in as ERL_FLAGS only when set; its single quotes
-	# survive the rssh single-string hop the way `-t '$share/...'` already does.
-	# shellcheck disable=SC2016 # those quotes are for the REMOTE shell; $BENCH_ERL_FLAGS expands here
-	rssh "$(driver_pub_ip "$di")" \
-		"docker run -d --network host --ulimit nofile=1048576:1048576 --name $name ${BENCH_ERL_FLAGS:+-e ERL_FLAGS='$BENCH_ERL_FLAGS' }$*" >/dev/null
+	rssh "$(driver_pub_ip "$di")" "$DOCKER_RUN --name $name $*" >/dev/null
 }
 
 dstop() { # dstop <driver-index> <name> <log-file> — capture logs, remove
@@ -466,10 +468,27 @@ if [[ "$LANES" != *B* ]]; then
 	say "[$N nodes] LANES=$LANES — skipping lane B"
 else
 say "[$N nodes] lane B: \$share fan-out ladder (${LANE_B_RUNGS[*]} msg/s)"
+# ── batched container control: one ssh per driver per phase, drivers in parallel
+# Every container used to cost its own ssh round-trip (~1.3s from a laptop to
+# fsn1). At LANE_B_CONTAINERS=1 that is 50 per phase; at k=3 it is 150, which
+# turned a 65-second rung into ~20 minutes, let the 60s CPU sample expire before
+# a publisher existed, and put the summarizer's "last 60s" inside the stop
+# loop. Each phase is now ONE script per driver, fed on stdin to `bash -s` so
+# the docker lines keep exactly the quoting drun used, and the drivers run in
+# parallel. Scrapes and log captures come back as one '@@@ <name>'-delimited
+# stream per driver and are split locally into the files the summarizer reads.
+lane_b_batch() { # lane_b_batch <driver-index> <script> — run the script on the driver; its stdout
+	rssh "$(driver_pub_ip "$1")" "bash -s" <<<"$2"
+}
+lane_b_split() { # lane_b_split <dir> <suffix> <stream-file> — '@@@ name' chunks -> <dir>/<name><suffix>
+	awk -v dir="$1" -v sfx="$2" '
+		/^@@@ / { if (f) close(f); f = dir "/" $2 sfx; printf "" > f; next }
+		f { print > f }' "$3"
+}
 lane_b_rung() { # lane_b_rung <total-rate> <posture:plain|mtls>
 	local rate="$1" posture="$2"
 	local rdir="$OUT/laneB/rung-$rate-$posture"
-	mkdir -p "$rdir"
+	mkdir -p "$rdir/.batch"
 	# The timer and the per-container split were both verified exact by
 	# lane_b_shape at the top of the run; nothing here can floor.
 	local interval nc=$LANE_B_CONTAINERS
@@ -488,44 +507,57 @@ lane_b_rung() { # lane_b_rung <total-rate> <posture:plain|mtls>
 	# (a hard ceiling near 950 msg/s per connection with idle cores on both
 	# sides). Use what the tool recommends for what we are actually doing.
 	local active="-A true"
+	local port
+	port=$([ "$posture" = mtls ] && echo 8883 || echo 1883)
+	# Compose every driver's four scripts up front: subscriber starts, publisher
+	# starts, histogram scrape (used twice), and log capture + stop.
+	local di bi k host rp seq_base
+	local -a subs pubs scrape stop names
+	for ((di = 0; di < D; di++)); do
+		subs[di]="set -e"$'\n'
+		pubs[di]="set -e"$'\n'
+		scrape[di]=""
+		stop[di]=""
+		names[di]=""
+	done
+	for ((di = 0; di < D; di++)); do
+		for ((bi = 0; bi < N; bi++)); do
+			host=$(inv ".brokers[$bi].private_ip")
+			for ((k = 0; k < nc; k++)); do
+				rp=$((port_base + bi * nc + k))
+				# `-t bench/%i` numbers topics by CLIENT SEQNO, which restarts at
+				# --startnumber in every container. Without an offset all D*N*k
+				# containers publish the same `bench/1..pubs_per` set, so the run
+				# has `LANE_B_PUBS / (D*N*k)` distinct topics — 60 where the doc
+				# claims 3000 — and the count silently changes with fleet shape,
+				# which is precisely what ADR 0048 §2's same-workload-at-every-size
+				# rule forbids. emqtt-bench documents `-n` for exactly this ("useful
+				# when running multiple emqtt-bench instances to test the same
+				# broker"). Offset each container's block so topics are globally
+				# distinct and the topic count IS LANE_B_PUBS by construction.
+				seq_base=$((((di * N + bi) * nc + k) * pubs_per))
+				subs[di]+="$DOCKER_RUN --name sub-$di-$bi-$k -v /opt/bench-certs:/opt/bench-certs:ro $BENCH_IMG sub -h $host -p $port -c $subs_per -t '\$share/g1/bench/#' -q 1 $active --payload-hdrs ts --prometheus --restapi $rp $args >/dev/null"$'\n'
+				pubs[di]+="$DOCKER_RUN --name pub-$di-$bi-$k -v /opt/bench-certs:/opt/bench-certs:ro $BENCH_IMG pub -h $host -p $port -c $pubs_per -t 'bench/%i' -q 1 -s 256 $active -n $seq_base -I $interval -F $LANE_B_INFLIGHT --payload-hdrs ts $args >/dev/null"$'\n'
+				scrape[di]+="printf '\\n@@@ sub-$di-$bi-$k\\n'; curl -s http://localhost:$rp/metrics"$'\n'
+				stop[di]+="printf '\\n@@@ pub-$di-$bi-$k\\n'; docker logs pub-$di-$bi-$k 2>&1; printf '\\n@@@ sub-$di-$bi-$k\\n'; docker logs sub-$di-$bi-$k 2>&1"$'\n'
+				names[di]+=" pub-$di-$bi-$k sub-$di-$bi-$k"
+			done
+		done
+	done
+	local -a pids
+	local p
 	snapshot_metrics "$rdir" before
-	start_cpu_sampling "$rdir/cpu" $((LANE_B_SETTLE + LANE_B_SECS))
-	local di bi k host port
 	# subscribers first (they expose the e2e histogram), then publishers
-	for ((di = 0; di < D; di++)); do
-		for ((bi = 0; bi < N; bi++)); do
-			host=$(inv ".brokers[$bi].private_ip")
-			port=$([ "$posture" = mtls ] && echo 8883 || echo 1883)
-			for ((k = 0; k < nc; k++)); do
-				drun "$di" "sub-$di-$bi-$k" "-v /opt/bench-certs:/opt/bench-certs:ro $BENCH_IMG \
-					sub -h $host -p $port -c $subs_per -t '\$share/g1/bench/#' -q 1 $active \
-					--payload-hdrs ts --prometheus --restapi $((port_base + bi * nc + k)) $args"
-			done
-		done
-	done
+	pids=()
+	for ((di = 0; di < D; di++)); do lane_b_batch "$di" "${subs[di]}" & pids+=($!); done
+	for p in "${pids[@]}"; do wait "$p" || die "starting subscriber containers failed on a driver (rung $rate $posture)"; done
 	sleep 5
-	for ((di = 0; di < D; di++)); do
-		for ((bi = 0; bi < N; bi++)); do
-			host=$(inv ".brokers[$bi].private_ip")
-			port=$([ "$posture" = mtls ] && echo 8883 || echo 1883)
-			# `-t bench/%i` numbers topics by CLIENT SEQNO, which restarts at
-			# --startnumber in every container. Without an offset all D*N
-			# containers publish the same `bench/1..pubs_per` set, so the run
-			# has `LANE_B_PUBS / (D*N)` distinct topics — 60 where the doc
-			# claims 3000 — and the count silently changes with fleet shape,
-			# which is precisely what ADR 0048 §2's same-workload-at-every-size
-			# rule forbids. emqtt-bench documents `-n` for exactly this ("useful
-			# when running multiple emqtt-bench instances to test the same
-			# broker"). Offset each container's block so topics are globally
-			# distinct and the topic count IS LANE_B_PUBS by construction.
-			for ((k = 0; k < nc; k++)); do
-				local seq_base=$((((di * N + bi) * nc + k) * pubs_per))
-				drun "$di" "pub-$di-$bi-$k" "-v /opt/bench-certs:/opt/bench-certs:ro $BENCH_IMG \
-					pub -h $host -p $port -c $pubs_per -t 'bench/%i' -q 1 -s 256 $active \
-					-n $seq_base -I $interval -F $LANE_B_INFLIGHT --payload-hdrs ts $args"
-			done
-		done
-	done
+	pids=()
+	for ((di = 0; di < D; di++)); do lane_b_batch "$di" "${pubs[di]}" & pids+=($!); done
+	for p in "${pids[@]}"; do wait "$p" || die "starting publisher containers failed on a driver (rung $rate $posture)"; done
+	# CPU is sampled over exactly the settle + measure window, now that the
+	# publishers exist — started any earlier it measures the container ramp.
+	start_cpu_sampling "$rdir/cpu" $((LANE_B_SETTLE + LANE_B_SECS))
 	# Let the publisher ramp finish BEFORE the latency measurement starts. The
 	# subscriber histograms are CUMULATIVE over the container's life, so a
 	# single end-of-rung scrape bakes every message delivered while the
@@ -535,32 +567,22 @@ lane_b_rung() { # lane_b_rung <total-rate> <posture:plain|mtls>
 	# summarizer reports the DIFFERENCE: the same steady-window discipline the
 	# throughput numbers already use.
 	sleep "$LANE_B_SETTLE"
-	for ((di = 0; di < D; di++)); do
-		for ((bi = 0; bi < N; bi++)); do
-			for ((k = 0; k < nc; k++)); do
-				rssh "$(driver_pub_ip "$di")" "curl -s http://localhost:$((port_base + bi * nc + k))/metrics" \
-					>"$rdir/sub-$di-$bi-$k-base.prom" 2>/dev/null || true
-			done
-		done
-	done
+	pids=()
+	for ((di = 0; di < D; di++)); do lane_b_batch "$di" "${scrape[di]}" >"$rdir/.batch/base-$di" 2>/dev/null & pids+=($!); done
+	for p in "${pids[@]}"; do wait "$p" || true; done
+	for ((di = 0; di < D; di++)); do lane_b_split "$rdir" "-base.prom" "$rdir/.batch/base-$di"; done
 	sleep "$LANE_B_SECS"
 	# scrape each subscriber's histogram BEFORE stopping anything
-	for ((di = 0; di < D; di++)); do
-		for ((bi = 0; bi < N; bi++)); do
-			for ((k = 0; k < nc; k++)); do
-				rssh "$(driver_pub_ip "$di")" "curl -s http://localhost:$((port_base + bi * nc + k))/metrics" \
-					>"$rdir/sub-$di-$bi-$k.prom" 2>/dev/null || true
-			done
-		done
-	done
-	for ((di = 0; di < D; di++)); do
-		for ((bi = 0; bi < N; bi++)); do
-			for ((k = 0; k < nc; k++)); do
-				dstop "$di" "pub-$di-$bi-$k" "$rdir/pub-$di-$bi-$k.log"
-				dstop "$di" "sub-$di-$bi-$k" "$rdir/sub-$di-$bi-$k.log"
-			done
-		done
-	done
+	pids=()
+	for ((di = 0; di < D; di++)); do lane_b_batch "$di" "${scrape[di]}" >"$rdir/.batch/final-$di" 2>/dev/null & pids+=($!); done
+	for p in "${pids[@]}"; do wait "$p" || true; done
+	for ((di = 0; di < D; di++)); do lane_b_split "$rdir" ".prom" "$rdir/.batch/final-$di"; done
+	# logs off every container, then one docker rm per driver
+	pids=()
+	for ((di = 0; di < D; di++)); do lane_b_batch "$di" "${stop[di]}docker rm -f${names[di]} >/dev/null 2>&1" >"$rdir/.batch/stop-$di" 2>/dev/null & pids+=($!); done
+	for p in "${pids[@]}"; do wait "$p" || true; done
+	for ((di = 0; di < D; di++)); do lane_b_split "$rdir" ".log" "$rdir/.batch/stop-$di"; done
+	rm -rf "$rdir/.batch"
 	stop_cpu_sampling
 	snapshot_metrics "$rdir" after
 	say "  rung $rate ($posture) done"
