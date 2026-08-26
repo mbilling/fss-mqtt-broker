@@ -14,7 +14,7 @@ so a run is reproducible from its `.env` file and comparable across releases.
 | `telematics` | massive fan-in, 100k connections, QoS 1 @ 1 msg/s | B (`$share`) | routing/hub, session memory |
 | `industrial` | durable QoS 1/2, low volume, latency-critical | A | fsync barrier, durable p99 |
 | `smart-home` | enormous idle connection count, reconnect storms | C | memory/conn, establishment |
-| `logistics` | store-and-forward, disconnect/resume | — | **not runnable — needs a lane** |
+| `logistics` | store-and-forward, disconnect/resume | D | offline queues, session resume |
 
 ## Running
 
@@ -47,7 +47,23 @@ run it with** (`full`, not `STANDARD=1`) or the ref rung is not checked.
 
 ## Reading the result
 
-Use **TPS = received + sent**, from the brokers' own counters
+**`logistics` is the exception to everything in this section** — it does not
+report a rate. Lane D measures a *cycle*: 1920 persistent sessions attach,
+detach, 160 000 messages are published to them while they are offline, and the
+same sessions resume. Its `laneD/summary.txt` answers three questions —
+
+| number | meaning |
+|---|---|
+| accepted while offline | what the cluster took in with nobody listening (broker counter, not the driver's) |
+| drained after resume | what the resumed sessions actually received, as a % of accepted |
+| drain time | how long the backlog took to clear, and at what rate |
+
+A shortfall is a **defect only if `dropped` does not explain it**: an over-cap
+queue is a disclosed bound (ADR 0001 §6), a silent loss is not. The lane refuses
+QoS 0 outright — an offline session queues nothing at QoS 0, so the measurement
+would be a guaranteed zero.
+
+For the other four workloads, use **TPS = received + sent**, from the brokers' own counters
 (`mqttd_publish_received_total` + `mqttd_publish_delivered_total`) — it counts
 total broker work in both directions and does not depend on driver-side rates,
 which oscillate near saturation.

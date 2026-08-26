@@ -39,7 +39,7 @@ mkdir -p "$OUT"
 
 LANES="${LANES:-ABC}"
 case "$LANES" in
-*[!ABC]* | "") die "LANES must be a non-empty subset of ABC (got: $LANES)" ;;
+*[!ABCD]* | "") die "LANES must be a non-empty subset of ABCD (got: $LANES)" ;;
 esac
 
 # ── knobs (each SMOKE value proves the path, not the number) ─────────────────
@@ -49,6 +49,9 @@ if [ "${SMOKE:-0}" = 1 ]; then
 	LANE_C_CONNS=2000
 	LANE_C_RAMP=200
 	LANE_C_HOLD=20
+	LANE_D_SESSIONS=120
+	LANE_D_OFFLINE_SECS=15
+	LANE_D_DRAIN_SECS=60
 	A_REPS=1 A_SECS=15 A_WARMUP=3
 	BARRIER_OPS=50
 elif [ "${STANDARD:-0}" = 1 ]; then
@@ -69,12 +72,18 @@ elif [ "${STANDARD:-0}" = 1 ]; then
 	LANE_C_CONNS=50000
 	LANE_C_RAMP=2500
 	LANE_C_HOLD=120
+	LANE_D_SESSIONS=1920
+	LANE_D_OFFLINE_SECS=30
+	LANE_D_DRAIN_SECS=120
 else
 	LANE_B_RUNGS=(300000 200000 100000 50000 20000)
 	LANE_B_SECS=60
 	LANE_C_CONNS=50000
 	LANE_C_RAMP=2500
 	LANE_C_HOLD=120
+	LANE_D_SESSIONS=1920
+	LANE_D_OFFLINE_SECS=40
+	LANE_D_DRAIN_SECS=180
 	A_REPS=3 A_SECS=60 A_WARMUP=10
 	BARRIER_OPS=150
 fi
@@ -87,6 +96,13 @@ fi
 if [ -n "${LANE_B_RUNGS_OVERRIDE:-}" ]; then
 	read -r -a LANE_B_RUNGS <<<"$LANE_B_RUNGS_OVERRIDE"
 fi
+# Lane D's population and window are profile-set (a smoke must stay cheap), so
+# a NAMED workload pins them the same way lane B's ladder does: through an
+# _OVERRIDE that outranks the profile, which is what makes `logistics` measure
+# the same cycle whether it is run under smoke, standard or full.
+LANE_D_SESSIONS="${LANE_D_SESSIONS_OVERRIDE:-$LANE_D_SESSIONS}"
+LANE_D_OFFLINE_SECS="${LANE_D_OFFLINE_SECS_OVERRIDE:-$LANE_D_OFFLINE_SECS}"
+LANE_D_DRAIN_SECS="${LANE_D_DRAIN_SECS_OVERRIDE:-$LANE_D_DRAIN_SECS}"
 # Total publishers. Sized so EVERY rung of the ladder is actually offerable,
 # against the two floors the load generator has:
 #  * the TIMER floor: each publisher sends on an INTEGER-millisecond timer
@@ -196,9 +212,65 @@ BENCH_IMG="emqx/emqtt-bench:0.6.3"
 # VM's own defaults; whatever is used lands in laneB/shape.txt.
 BENCH_ERL_FLAGS="${BENCH_ERL_FLAGS-+S 1:1 +sbwt none +sbwtdcpu none +sbwtdio none}"
 
+# ── lane D — store-and-forward (the logistics shape) ─────────────────────────
+# Lanes A/B/C all measure a broker with its subscribers PRESENT. A logistics
+# fleet is defined by their absence: a vehicle drops out of coverage, the
+# platform keeps publishing to it, and the broker must hold that traffic until
+# the session comes back. What is under test is therefore not a rate but a
+# CYCLE — attach, detach, fill, resume, drain — and its honest measurements are
+# how much survived the offline window and how long the backlog took to clear.
+#
+# The cycle is expressible because emqtt-bench 0.6.3 gives us all three pieces:
+# `-C false` (clean_start=false) plus `-x` (MQTT5 session-expiry) makes the
+# session outlive its connection, and `--prefix` makes the client id
+# DETERMINISTIC ("<prefix>_bench_sub_<n>") — so a container started a second
+# time with identical flags resumes the very same sessions rather than opening
+# new ones. Without the prefix the id carries a random component and the resume
+# phase would silently measure 2N fresh sessions instead of N resumed ones.
+LANE_D_CONTAINERS="${LANE_D_CONTAINERS:-2}"
+# Offered rate while the sessions are OFFLINE. Each session owns one topic
+# (`bench/%i`, numbered by client seqno exactly as lane B does it), and one
+# publisher is aimed at each — so the queued depth per session is
+# LANE_D_OFFLINE_SECS * LANE_D_RATE / LANE_D_SESSIONS, and the total offered is
+# the rate times the window. Keep both modest: this lane is about the backlog,
+# and a depth past MQTTD_MAX_QUEUED_MESSAGES measures the drop policy instead.
+LANE_D_RATE="${LANE_D_RATE:-4000}"
+# QoS 0 is not queued for an offline session by any broker, ours included —
+# at QoS 0 this lane would measure nothing at all, so it is refused below.
+LANE_D_QOS="${LANE_D_QOS:-1}"
+# Session expiry must outlast (offline window + drain budget) or the broker is
+# entitled to discard the session mid-measurement and the lane reports a loss
+# that is protocol-correct behaviour rather than a defect. Checked in the shape.
+LANE_D_EXPIRY="${LANE_D_EXPIRY:-900}"
+LANE_D_PAYLOAD="${LANE_D_PAYLOAD:-256}"
+LANE_D_CONNECT_RATE="${LANE_D_CONNECT_RATE:-500}"
+# Drain polling: how often to scrape the resumed subscribers, and how many
+# consecutive flat polls end the drain. Two is deliberate — one flat poll can
+# land inside a scrape gap and end the measurement early.
+LANE_D_POLL="${LANE_D_POLL:-5}"
+# CPU during the drain is sampled for a BOUNDED window, not the whole budget:
+# stop_cpu_sampling *waits* for mpstat rather than killing it, so a 180s budget
+# would idle for ~3 minutes after a 20s drain. 30s covers the peak of any drain
+# this lane produces; the file is named for what it is (the first 30s).
+LANE_D_DRAIN_SAMPLE="${LANE_D_DRAIN_SAMPLE:-30}"
+LANE_D_FLAT_POLLS="${LANE_D_FLAT_POLLS:-2}"
+
 # ── helpers ──────────────────────────────────────────────────────────────────
 brokers_csv() { # brokers_csv <suffix-jq> — comma list over brokers
 	jq -r "[.brokers[] | $1] | join(\",\")" "$INVENTORY"
+}
+
+# Driver-side batching, shared by lanes B and D: one ssh per driver per phase
+# instead of one per container. These MUST live outside any lane's conditional —
+# they were once defined inside lane B's block, where a LANES=D run reached
+# lane D with them undefined.
+driver_batch() { # driver_batch <driver-index> <script> — run the script on the driver; its stdout
+	rssh "$(driver_pub_ip "$1")" "bash -s" <<<"$2"
+}
+batch_split() { # batch_split <dir> <suffix> <stream-file> — '@@@ name' chunks -> <dir>/<name><suffix>
+	awk -v dir="$1" -v sfx="$2" '
+		/^@@@ / { if (f) close(f); f = dir "/" $2 sfx; printf "" > f; next }
+		f { print > f }' "$3"
 }
 
 snapshot_metrics() { # snapshot_metrics <dir> <label>
@@ -376,8 +448,52 @@ if [[ "$LANES" == *B* ]]; then
 	say "[$N nodes] lane B shape (kept as laneB/shape.txt):"
 	sed 's/^/    /' "$OUT/laneB/shape.txt" >&2
 fi
+# ── lane D shape: same discipline as lane B, refused before the first ssh ────
+# Every way this lane can silently measure something other than its label:
+#  * a floored per-container split runs fewer sessions than the name says;
+#  * a floored `-I` offers a rate other than LANE_D_RATE (whole ms per client);
+#  * a session that expires mid-cycle turns a correct discard into "loss";
+#  * QoS 0 is never queued for an offline session, so the lane measures zero.
+lane_d_shape() {
+	[[ "$LANES" == *D* ]] || return 0
+	positive_int "LANE_D_SESSIONS" "$LANE_D_SESSIONS"
+	positive_int "LANE_D_CONTAINERS" "$LANE_D_CONTAINERS"
+	positive_int "LANE_D_RATE" "$LANE_D_RATE"
+	positive_int "LANE_D_OFFLINE_SECS" "$LANE_D_OFFLINE_SECS"
+	positive_int "LANE_D_DRAIN_SECS" "$LANE_D_DRAIN_SECS"
+	[ "$LANE_D_QOS" -ge 1 ] 2>/dev/null ||
+		die "LANE_D_QOS=$LANE_D_QOS: an offline session queues nothing at QoS 0, so lane D would measure zero — use 1"
+	local slots=$((D * LANE_D_CONTAINERS))
+	[ $((LANE_D_SESSIONS % slots)) -eq 0 ] ||
+		die "lane D: $LANE_D_SESSIONS sessions do not split evenly over $slots containers ($D drivers x $LANE_D_CONTAINERS) — a floored split runs fewer sessions than the label"
+	local per=$((LANE_D_SESSIONS / slots))
+	[ $((per % N)) -eq 0 ] ||
+		die "lane D: $per sessions per container do not split evenly over $N brokers — ownership would be lopsided and the resume phase unattributable"
+	[ $((LANE_D_SESSIONS * 1000 % LANE_D_RATE)) -eq 0 ] ||
+		die "lane D: rate $LANE_D_RATE is not exactly offerable by $LANE_D_SESSIONS publishers (fractional -I) — use a divisor of $((LANE_D_SESSIONS * 1000))"
+	local interval=$((LANE_D_SESSIONS * 1000 / LANE_D_RATE))
+	[ "$interval" -ge "$LANE_B_MIN_INTERVAL" ] ||
+		die "lane D needs -I ${interval}ms; the drivers collapse below ${LANE_B_MIN_INTERVAL}ms (#421) — lower LANE_D_RATE or raise LANE_D_SESSIONS"
+	# The session must outlive the whole cycle with room to spare, or a
+	# protocol-correct expiry gets reported as broker loss.
+	local cycle=$((LANE_D_OFFLINE_SECS + LANE_D_DRAIN_SECS))
+	[ "$LANE_D_EXPIRY" -gt $((cycle + 60)) ] ||
+		die "lane D: LANE_D_EXPIRY=$LANE_D_EXPIRY must exceed the offline+drain cycle (${cycle}s) by >60s, or the broker may correctly discard sessions mid-measurement"
+	local depth=$((LANE_D_OFFLINE_SECS * LANE_D_RATE / LANE_D_SESSIONS))
+	mkdir -p "$OUT/laneD"
+	{
+		echo "lane D shape (nodes=$N drivers=$D)"
+		echo "  sessions          $LANE_D_SESSIONS ($slots containers x $per, $((per / N)) per broker per container)"
+		echo "  publishers        $LANE_D_SESSIONS (one per session topic, bench/%i)"
+		echo "  offered offline   $LANE_D_RATE msg/s for ${LANE_D_OFFLINE_SECS}s = $((LANE_D_RATE * LANE_D_OFFLINE_SECS)) msgs, -I ${interval}ms"
+		echo "  expected depth    ~$depth queued per session (cap: MQTTD_MAX_QUEUED_MESSAGES)"
+		echo "  qos $LANE_D_QOS  expiry ${LANE_D_EXPIRY}s  drain budget ${LANE_D_DRAIN_SECS}s"
+	} | tee "$OUT/laneD/shape.txt" >&2
+}
+lane_d_shape
+
 if [ "${SHAPE_ONLY:-0}" = 1 ]; then
-	say "SHAPE_ONLY=1 — knobs and lane B shape verified; touching no host"
+	say "SHAPE_ONLY=1 — knobs and lane B/D shapes verified; touching no host"
 	exit 0
 fi
 
@@ -581,14 +697,6 @@ say "[$N nodes] lane B: \$share fan-out ladder (${LANE_B_RUNGS[*]} msg/s)"
 # the docker lines keep exactly the quoting drun used, and the drivers run in
 # parallel. Scrapes and log captures come back as one '@@@ <name>'-delimited
 # stream per driver and are split locally into the files the summarizer reads.
-lane_b_batch() { # lane_b_batch <driver-index> <script> — run the script on the driver; its stdout
-	rssh "$(driver_pub_ip "$1")" "bash -s" <<<"$2"
-}
-lane_b_split() { # lane_b_split <dir> <suffix> <stream-file> — '@@@ name' chunks -> <dir>/<name><suffix>
-	awk -v dir="$1" -v sfx="$2" '
-		/^@@@ / { if (f) close(f); f = dir "/" $2 sfx; printf "" > f; next }
-		f { print > f }' "$3"
-}
 lane_b_rung() { # lane_b_rung <total-rate> <posture:plain|mtls>
 	local rate="$1" posture="$2"
 	local rdir="$OUT/laneB/rung-$rate-$posture"
@@ -665,11 +773,11 @@ lane_b_rung() { # lane_b_rung <total-rate> <posture:plain|mtls>
 	snapshot_metrics "$rdir" before
 	# subscribers first (they expose the e2e histogram), then publishers
 	pids=()
-	for ((di = 0; di < D; di++)); do lane_b_batch "$di" "${subs[di]}" & pids+=($!); done
+	for ((di = 0; di < D; di++)); do driver_batch "$di" "${subs[di]}" & pids+=($!); done
 	for p in "${pids[@]}"; do wait "$p" || die "starting subscriber containers failed on a driver (rung $rate $posture)"; done
 	sleep 5
 	pids=()
-	for ((di = 0; di < D; di++)); do lane_b_batch "$di" "${pubs[di]}" & pids+=($!); done
+	for ((di = 0; di < D; di++)); do driver_batch "$di" "${pubs[di]}" & pids+=($!); done
 	for p in "${pids[@]}"; do wait "$p" || die "starting publisher containers failed on a driver (rung $rate $posture)"; done
 	# CPU is sampled over exactly the settle + measure window, now that the
 	# publishers exist — started any earlier it measures the container ramp.
@@ -684,20 +792,20 @@ lane_b_rung() { # lane_b_rung <total-rate> <posture:plain|mtls>
 	# throughput numbers already use.
 	sleep "$LANE_B_SETTLE"
 	pids=()
-	for ((di = 0; di < D; di++)); do lane_b_batch "$di" "${scrape[di]}" >"$rdir/.batch/base-$di" 2>/dev/null & pids+=($!); done
+	for ((di = 0; di < D; di++)); do driver_batch "$di" "${scrape[di]}" >"$rdir/.batch/base-$di" 2>/dev/null & pids+=($!); done
 	for p in "${pids[@]}"; do wait "$p" || true; done
-	for ((di = 0; di < D; di++)); do lane_b_split "$rdir" "-base.prom" "$rdir/.batch/base-$di"; done
+	for ((di = 0; di < D; di++)); do batch_split "$rdir" "-base.prom" "$rdir/.batch/base-$di"; done
 	sleep "$LANE_B_SECS"
 	# scrape each subscriber's histogram BEFORE stopping anything
 	pids=()
-	for ((di = 0; di < D; di++)); do lane_b_batch "$di" "${scrape[di]}" >"$rdir/.batch/final-$di" 2>/dev/null & pids+=($!); done
+	for ((di = 0; di < D; di++)); do driver_batch "$di" "${scrape[di]}" >"$rdir/.batch/final-$di" 2>/dev/null & pids+=($!); done
 	for p in "${pids[@]}"; do wait "$p" || true; done
-	for ((di = 0; di < D; di++)); do lane_b_split "$rdir" ".prom" "$rdir/.batch/final-$di"; done
+	for ((di = 0; di < D; di++)); do batch_split "$rdir" ".prom" "$rdir/.batch/final-$di"; done
 	# logs off every container, then one docker rm per driver
 	pids=()
-	for ((di = 0; di < D; di++)); do lane_b_batch "$di" "${stop[di]}docker rm -f${names[di]} >/dev/null 2>&1" >"$rdir/.batch/stop-$di" 2>/dev/null & pids+=($!); done
+	for ((di = 0; di < D; di++)); do driver_batch "$di" "${stop[di]}docker rm -f${names[di]} >/dev/null 2>&1" >"$rdir/.batch/stop-$di" 2>/dev/null & pids+=($!); done
 	for p in "${pids[@]}"; do wait "$p" || true; done
-	for ((di = 0; di < D; di++)); do lane_b_split "$rdir" ".log" "$rdir/.batch/stop-$di"; done
+	for ((di = 0; di < D; di++)); do batch_split "$rdir" ".log" "$rdir/.batch/stop-$di"; done
 	rm -rf "$rdir/.batch"
 	stop_cpu_sampling
 	snapshot_metrics "$rdir" after
@@ -769,6 +877,185 @@ if [ "${SMOKE:-0}" != 1 ]; then
 	lane_c 10000 mtls
 fi
 fi # LANES *C*
+
+# ── 4b. lane D — store-and-forward across an offline window ──────────────────
+if [[ "$LANES" != *D* ]]; then
+	say "[$N nodes] LANES=$LANES — skipping lane D"
+else
+say "[$N nodes] lane D: $LANE_D_SESSIONS persistent sessions, ${LANE_D_OFFLINE_SECS}s offline at $LANE_D_RATE msg/s"
+lane_d() {
+	local ddir="$OUT/laneD"
+	mkdir -p "$ddir/.batch"
+	local C=$LANE_D_CONTAINERS
+	local per=$((LANE_D_SESSIONS / (D * C)))
+	local interval=$((LANE_D_SESSIONS * 1000 / LANE_D_RATE))
+	local -a HOSTS
+	IFS=, read -r -a HOSTS <<<"$(brokers_csv '.private_ip')"
+	local di j seq_base hosts rot i
+	local -a subs pubs scrape pscrape stopsub stoppub subnames pubnames
+	for ((di = 0; di < D; di++)); do
+		subs[di]="set -e"$'\n'
+		pubs[di]="set -e"$'\n'
+		scrape[di]="" pscrape[di]="" stopsub[di]="" stoppub[di]="" subnames[di]="" pubnames[di]=""
+		for ((j = 0; j < C; j++)); do
+			seq_base=$(((di * C + j) * per))
+			rot=$(((di * C + j) % N))
+			hosts=""
+			for ((i = 0; i < N; i++)); do hosts+="${HOSTS[(rot + i) % N]},"; done
+			hosts="${hosts%,}"
+			# The three flags that make a session outlive its connection, plus the
+			# deterministic id that lets the SAME session be resumed later.
+			subs[di]+="$DOCKER_RUN --name dsub-$di-$j $BENCH_IMG sub -h $hosts -p 1883 -c $per -R $LANE_D_CONNECT_RATE -t 'bench/%i' -q $LANE_D_QOS -n $seq_base -C false -x $LANE_D_EXPIRY --prefix dsub-$di-$j -A true --prometheus --restapi $((9300 + j)) >/dev/null"$'\n'
+			scrape[di]+="printf '\\n@@@ dsub-$di-$j\\n'; curl -s http://localhost:$((9300 + j))/metrics"$'\n'
+			stopsub[di]+="printf '\\n@@@ dsub-$di-$j\\n'; docker logs dsub-$di-$j 2>&1"$'\n'
+			subnames[di]+=" dsub-$di-$j"
+			pubs[di]+="$DOCKER_RUN --name dpub-$di-$j $BENCH_IMG pub -h $hosts -p 1883 -c $per -R $LANE_D_CONNECT_RATE -t 'bench/%i' -q $LANE_D_QOS -s $LANE_D_PAYLOAD -n $seq_base -I $interval -A true --prometheus --restapi $((9400 + j)) >/dev/null"$'\n'
+			pscrape[di]+="printf '\\n@@@ dpub-$di-$j\\n'; curl -s http://localhost:$((9400 + j))/metrics"$'\n'
+			stoppub[di]+="printf '\\n@@@ dpub-$di-$j\\n'; docker logs dpub-$di-$j 2>&1"$'\n'
+			pubnames[di]+=" dpub-$di-$j"
+		done
+	done
+	local -a pids
+	local pp
+	# bash 3.2 is the only bash on macOS, so these take the per-driver scripts as
+	# positional arguments rather than by name (namerefs are 4.3+, and the failure
+	# would land only on a paid run).
+	fan() { # fan <what> <script-per-driver...> — same phase on every driver, in parallel
+		local what="$1"
+		shift
+		local -a scr=("$@")
+		pids=()
+		for ((di = 0; di < D; di++)); do driver_batch "$di" "${scr[di]}" >/dev/null & pids+=($!); done
+		for pp in "${pids[@]}"; do wait "$pp" || die "lane D: $what failed on a driver"; done
+	}
+	gather() { # gather <tag> <suffix> <script-per-driver...> — scrape every driver
+		local tag="$1" sfx="$2"
+		shift 2
+		local -a scr=("$@")
+		pids=()
+		for ((di = 0; di < D; di++)); do driver_batch "$di" "${scr[di]}" >"$ddir/.batch/$tag-$di" 2>/dev/null & pids+=($!); done
+		for pp in "${pids[@]}"; do wait "$pp" || true; done
+		for ((di = 0; di < D; di++)); do batch_split "$ddir" "$sfx" "$ddir/.batch/$tag-$di"; done
+	}
+	recv_total() { # sum `recv` across every resumed subscriber
+		pids=()
+		for ((di = 0; di < D; di++)); do driver_batch "$di" "${scrape[di]}" >"$ddir/.batch/poll-$di" 2>/dev/null & pids+=($!); done
+		for pp in "${pids[@]}"; do wait "$pp" || true; done
+		cat "$ddir"/.batch/poll-* 2>/dev/null | awk '/^recv /{s += $2} END{print s + 0}'
+	}
+
+	# Which session store this lane actually ran against. A LANES=D run stays in
+	# the durable posture run.sh bootstrapped, but LANES=BD would have switched to
+	# the in-memory backend for lane B first — same cycle, a materially different
+	# guarantee. Record it rather than leave the number orphaned from its posture.
+	local store_posture
+	store_posture=$(rssh "$(broker_pub_ip 0)" \
+		"grep -qE '^MQTTD_DURABLE_SESSIONS=(0|false|off|no)' /etc/mqttd/mqttd.env && echo in-memory || echo durable" 2>/dev/null || echo unknown)
+	# An ssh that succeeds but prints nothing would otherwise leave this empty and
+	# the summary would disclose a blank where a posture belongs.
+	[ -n "$store_posture" ] || store_posture=unknown
+	[ "$store_posture" = durable ] ||
+		warn "lane D is running against the $store_posture session store (ADR 0001 §6), not the durable plane — the cycle is the same, the guarantee is not"
+	snapshot_metrics "$ddir" before
+	# ── phase 1: attach ─────────────────────────────────────────────────────
+	say "  [D] attaching $LANE_D_SESSIONS persistent sessions"
+	fan "attaching subscribers" "${subs[@]}"
+	sleep $((LANE_D_SESSIONS / LANE_D_CONNECT_RATE / D + 15))
+	snapshot_metrics "$ddir" attached
+	# ── phase 2: detach — kill the containers, keep the sessions ────────────
+	say "  [D] detaching (sessions go offline, expiry ${LANE_D_EXPIRY}s)"
+	gather attach "-attach.log" "${stopsub[@]}"
+	pids=()
+	for ((di = 0; di < D; di++)); do rssh "$(driver_pub_ip "$di")" "docker rm -f${subnames[di]}" >/dev/null 2>&1 & pids+=($!); done
+	for pp in "${pids[@]}"; do wait "$pp" || true; done
+	sleep 5
+	snapshot_metrics "$ddir" offline
+	# ── phase 3: fill the offline queues ────────────────────────────────────
+	say "  [D] publishing ${LANE_D_RATE}/s for ${LANE_D_OFFLINE_SECS}s into offline sessions"
+	fan "starting publishers" "${pubs[@]}"
+	start_cpu_sampling "$ddir/cpu-fill" "$LANE_D_OFFLINE_SECS"
+	sleep "$LANE_D_OFFLINE_SECS"
+	gather fill ".prom" "${pscrape[@]}"
+	gather fill "-fill.log" "${stoppub[@]}"
+	pids=()
+	for ((di = 0; di < D; di++)); do rssh "$(driver_pub_ip "$di")" "docker rm -f${pubnames[di]}" >/dev/null 2>&1 & pids+=($!); done
+	for pp in "${pids[@]}"; do wait "$pp" || true; done
+	stop_cpu_sampling
+	sleep 5
+	snapshot_metrics "$ddir" filled
+	# ── phase 4: resume — identical flags, therefore identical client ids ───
+	say "  [D] resuming the same sessions; draining (budget ${LANE_D_DRAIN_SECS}s)"
+	local t0 elapsed last=-1 flat=0 total=0
+	t0=$(date +%s)
+	fan "resuming subscribers" "${subs[@]}"
+	start_cpu_sampling "$ddir/cpu-drain-first-${LANE_D_DRAIN_SAMPLE}s" "$LANE_D_DRAIN_SAMPLE"
+	echo -e "elapsed_s\trecv_total" >"$ddir/drain.tsv"
+	while :; do
+		sleep "$LANE_D_POLL"
+		elapsed=$(($(date +%s) - t0))
+		total=$(recv_total)
+		printf '%s\t%s\n' "$elapsed" "$total" >>"$ddir/drain.tsv"
+		if [ "$total" -le "$last" ]; then
+			flat=$((flat + 1))
+			[ "$flat" -ge "$LANE_D_FLAT_POLLS" ] && break
+		else
+			flat=0
+		fi
+		last="$total"
+		[ "$elapsed" -lt "$LANE_D_DRAIN_SECS" ] || {
+			warn "lane D: drain budget ${LANE_D_DRAIN_SECS}s elapsed with the backlog still moving"
+			break
+		}
+	done
+	stop_cpu_sampling
+	local drain_secs=$((elapsed - LANE_D_POLL * flat))
+	[ "$drain_secs" -ge 0 ] || drain_secs=0
+	gather drain ".prom" "${scrape[@]}"
+	snapshot_metrics "$ddir" drained
+	gather drain "-drain.log" "${stopsub[@]}"
+	pids=()
+	for ((di = 0; di < D; di++)); do rssh "$(driver_pub_ip "$di")" "docker rm -f${subnames[di]}" >/dev/null 2>&1 & pids+=($!); done
+	for pp in "${pids[@]}"; do wait "$pp" || true; done
+	rm -rf "$ddir/.batch"
+
+	# ── the result ──────────────────────────────────────────────────────────
+	# Offered is taken from the BROKER's received counter across the offline
+	# window, not the publishers' own tally: what the drivers handed to a socket
+	# is not what the cluster accepted, and only the latter can be queued.
+	sum_metric() { # sum_metric <label> <metric-prefix> — across all brokers
+		cat "$ddir"/metrics-"$1"-broker*.prom 2>/dev/null |
+			awk -v m="$2" '$1 ~ "^" m {s += $2} END{print s + 0}'
+	}
+	local off_recv fill_recv drained queued_bytes dropped sessions_off
+	off_recv=$(sum_metric offline mqttd_publish_received_total)
+	fill_recv=$(sum_metric filled mqttd_publish_received_total)
+	sessions_off=$(sum_metric offline mqttd_sessions)
+	queued_bytes=$(sum_metric filled mqttd_backlog_bytes)
+	dropped=$(($(sum_metric filled mqttd_publish_dropped_total) - $(sum_metric offline mqttd_publish_dropped_total)))
+	local accepted=$((fill_recv - off_recv))
+	drained=$(awk 'END{print $2 + 0}' "$ddir/drain.tsv")
+	local pct=0
+	[ "$accepted" -gt 0 ] && pct=$((drained * 100 / accepted))
+	local rate=0
+	[ "$drain_secs" -gt 0 ] && rate=$((drained / drain_secs))
+	{
+		echo "lane D — store-and-forward (nodes=$N)"
+		echo "  session store             $store_posture (MQTTD_DURABLE_SESSIONS)"
+		echo "  sessions held offline     $sessions_off (of $LANE_D_SESSIONS attached)"
+		echo "  accepted while offline    $accepted msgs (broker received delta over the ${LANE_D_OFFLINE_SECS}s window)"
+		echo "  dropped while offline     $dropped msgs (see metrics-filled-*.prom for reason labels)"
+		echo "  backlog at resume         $queued_bytes bytes"
+		echo "  drained after resume      $drained msgs (${pct}% of accepted)"
+		echo "  drain time                ${drain_secs}s  (~${rate} msg/s)"
+		echo
+		echo "  A gap between accepted and drained is only a DEFECT if 'dropped' does"
+		echo "  not explain it: an over-cap queue is a disclosed bound (ADR 0001 §6),"
+		echo "  a silent loss is not."
+	} | tee "$ddir/summary.txt" >&2
+	say "  lane D done -> $ddir"
+}
+lane_d
+fi # LANES *D*
 
 # ── 5. host facts for the disclosure block ───────────────────────────────────
 mkdir -p "$OUT/env"
