@@ -153,6 +153,20 @@ LANE_B_INFLIGHT=100
 # below 1000: emqtt-bench adds a worker per 1000/s of connect rate, and a
 # second worker would break the one-worker broker spread (see BENCH_ERL_FLAGS).
 LANE_B_CONNECT_RATE="${LANE_B_CONNECT_RATE:-500}"
+# Fan-out PERCENTAGE, 0-100: the share of subscriber CONTAINERS that receive
+# the FULL publish stream on a plain `bench/#` wildcard; the rest stay in one
+# $share/g1 group and collectively get one copy per publish. So:
+#   0   = today's ADR 0015 fan-IN exactly (delivered ~= offered);
+#   100 = every subscriber gets every publish (delivered ~= offered x SUBS);
+#   P   = the first P% of sub containers are wildcard, delivered ~=
+#         offered x (P% of SUBS + 1 for the shared remainder).
+# Egress fan-out is what stresses the per-connection write path — issue
+# #443's batching only engages when a subscriber's outbound backlog is deep,
+# which $share (~1/SUBS of the traffic per connection) never produces. Above
+# 0 the rung value is the PUBLISH rate; keep it modest (a 5000 rung at 100%
+# x 300 subs is 1.5M deliveries/s). The offered-rate honesty checks are
+# unchanged: they police what the PUBLISHERS emit, which the rung still names.
+LANE_B_FANOUT="${LANE_B_FANOUT:-0}"
 LANE_B_REF_RUNG=50000
 # Seconds between the publishers starting and the latency baseline scrape: the
 # ramp, excluded from the measured window (see the scrape in lane_b_rung).
@@ -268,6 +282,8 @@ lane_b_shape() { # prints the shape as key=value lines; dies on any distortion
 	positive_int LANE_B_SUBS "$LANE_B_SUBS"
 	positive_int LANE_B_MIN_INTERVAL "$LANE_B_MIN_INTERVAL"
 	positive_int LANE_B_CONNECT_RATE "$LANE_B_CONNECT_RATE"
+	[[ "$LANE_B_FANOUT" =~ ^[0-9]+$ ]] && [ "$LANE_B_FANOUT" -le 100 ] ||
+		die "LANE_B_FANOUT must be a percentage 0-100 (0=shared fan-in, 100=full wildcard fan-out), got '$LANE_B_FANOUT'"
 	[ "$LANE_B_CONNECT_RATE" -le 1000 ] ||
 		die "LANE_B_CONNECT_RATE=$LANE_B_CONNECT_RATE: emqtt-bench adds a worker per 1000 connections/s and a second worker breaks the one-worker broker spread — keep it at or below 1000"
 	# Each population must split evenly over its containers (D x per-driver
@@ -324,7 +340,13 @@ lane_b_shape() { # prints the shape as key=value lines; dies on any distortion
 	esac
 	echo "brokers=$N drivers=$D pub_containers_per_driver=$LANE_B_PUB_CONTAINERS sub_containers_per_driver=$LANE_B_SUB_CONTAINERS"
 	echo "publishers=$LANE_B_PUBS per_container=$((LANE_B_PUBS / pub_cells)) per_broker=$pub_range"
-	echo "subscribers=$LANE_B_SUBS per_container=$((LANE_B_SUBS / sub_cells)) per_broker=$sub_range group=\$share/g1"
+	# fanout containers = floor(pct x total sub containers / 100); each carries
+	# subs_per connections that receive EVERY publish. The rest share one copy.
+	local fo_containers=$((LANE_B_FANOUT * sub_cells / 100)) sper=$((LANE_B_SUBS / sub_cells))
+	local fo_subs=$((fo_containers * sper)) sh_subs=$((LANE_B_SUBS - fo_containers * sper))
+	local amp=$((fo_subs + (sh_subs > 0 ? 1 : 0)))
+	echo "subscribers=$LANE_B_SUBS per_container=$sper per_broker=$sub_range"
+	echo "fanout_pct=$LANE_B_FANOUT fanout_containers=$fo_containers/$sub_cells fanout_subs=$fo_subs shared_subs=$sh_subs (delivered ~= offered x $amp)"
 	local rungs=("${LANE_B_RUNGS[@]}") rate interval
 	if [ "${SMOKE:-0}" != 1 ] && [ "${STANDARD:-0}" != 1 ]; then rungs+=("$LANE_B_REF_RUNG"); fi
 	for rate in "${rungs[@]}"; do
@@ -601,7 +623,11 @@ lane_b_rung() { # lane_b_rung <total-rate> <posture:plain|mtls>
 		names[di]=""
 		for ((j = 0; j < S; j++)); do
 			hosts=$(rotated_hosts $((di * S + j)))
-			subs[di]+="$DOCKER_RUN --name sub-$di-$j -v /opt/bench-certs:/opt/bench-certs:ro $BENCH_IMG sub -h $hosts -p $port -c $subs_per -R $LANE_B_CONNECT_RATE -t '\$share/g1/bench/#' -q 1 $active --payload-hdrs ts --prometheus --restapi $((port_base + j)) $args >/dev/null"$'\n'
+			# The first LANE_B_FANOUT% of sub containers (by global index) take a
+			# plain wildcard — every publish reaches every one of their
+			# connections; the rest join the one $share group and split one copy.
+			if [ $((di * S + j)) -lt $((LANE_B_FANOUT * D * S / 100)) ]; then sub_filter="bench/#"; else sub_filter="\$share/g1/bench/#"; fi
+			subs[di]+="$DOCKER_RUN --name sub-$di-$j -v /opt/bench-certs:/opt/bench-certs:ro $BENCH_IMG sub -h $hosts -p $port -c $subs_per -R $LANE_B_CONNECT_RATE -t '$sub_filter' -q 1 $active --payload-hdrs ts --prometheus --restapi $((port_base + j)) $args >/dev/null"$'\n'
 			scrape[di]+="printf '\\n@@@ sub-$di-$j\\n'; curl -s http://localhost:$((port_base + j))/metrics"$'\n'
 			stop[di]+="printf '\\n@@@ sub-$di-$j\\n'; docker logs sub-$di-$j 2>&1"$'\n'
 			names[di]+=" sub-$di-$j"
