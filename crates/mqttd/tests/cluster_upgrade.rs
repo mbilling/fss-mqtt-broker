@@ -43,16 +43,16 @@ use proc_common::{
 /// with each release cut (RELEASING.md): the previous minor within a major, the
 /// previous major's gateway minor across a boundary — never bumped to absorb a
 /// reshape, because the reshape-in-place motion closed at the freeze.
-/// Previous baselines: the `v1.0.6` release commit (`ea50bbb7…`), before it
-/// `v1.0.5` (`bf0bc1f9…`), `v1.0.4` (`81658d62…`), `v1.0.3` (`e93bdc7b…`),
-/// `v1.0.2` (`ab735581…`), `v1.0.1` (`aa4739e1…`), `v1.0.0` (`101554fc…` —
-/// the freeze tag itself), and before that `v0.9.1` (`0f7042c2…`), which
-/// proved the roll INTO the 1.0 line before the freeze tag was cut.
+/// Previous baselines: the `v1.0.7` release commit (`38497aba…`), before it
+/// `v1.0.6` (`ea50bbb7…`), `v1.0.5` (`bf0bc1f9…`), `v1.0.4` (`81658d62…`),
+/// `v1.0.3` (`e93bdc7b…`), `v1.0.2` (`ab735581…`), `v1.0.1` (`aa4739e1…`),
+/// `v1.0.0` (`101554fc…` — the freeze tag itself), and before that `v0.9.1`
+/// (`0f7042c2…`), which proved the roll INTO the 1.0 line before the freeze.
 /// Pre-1.0 history (kept as the process scar it is): the baseline was a
 /// hand-bumped commit pin — last `c6b84f23…` (the issue #227/#232 retained-expiry
 /// reshape, which landed WITHOUT its bump and broke the next oracle run), before
 /// that `e39b6e13…` (the issue #92 SWIM generation reshape).
-const BASELINE_REF: &str = "38497abaee13cd0fbbd17a44a70f198017ad08f7";
+const BASELINE_REF: &str = "e5172514c2db7c733d538b75b73a5873f777f05a";
 
 /// The baseline `mqttd` binary: `MQTTD_BASELINE_BIN` if set (nightly / CI
 /// supplies a prebuilt one), else built from [`BASELINE_REF`] via a git
