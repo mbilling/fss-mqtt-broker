@@ -1559,6 +1559,12 @@ struct PendingPuback {
 /// Receive Maximum to police them with).
 const CONN_ACK_PIPELINE_MAX: usize = 256;
 
+/// Most outbound packets coalesced into one write + flush per drain (issue
+/// #443). A ceiling, not a target: the drain stops early the moment the backlog
+/// empties, so it only bites a connection so far behind it never catches up —
+/// there it bounds the write buffer and keeps the other select arms live.
+const OUTBOUND_BATCH_MAX: usize = 1024;
+
 /// Apply the hub's outcome to a parked ack. `true` = write it; `false` = the
 /// connection must close without one (hub gone mid-shutdown, or a refusal
 /// v3.1.1 can only say by hanging up) — the publisher retries, fail closed.
@@ -1781,14 +1787,7 @@ where
                 deadline = grace.map(|g| Instant::now() + g);
             }
             maybe_out = out_rx.recv() => {
-                // Metered on the packet AS RECEIVED — before the topic-alias rewrite
-                // below, which only shrinks it: add and subtract are then the same pure
-                // function of the same packet, which is what makes the byte counter
-                // return to zero instead of drifting (issue #241).
-                if let Some(pkt) = &maybe_out {
-                    out_meter.drained(pkt);
-                }
-                // Acks already resolved leave BEFORE this outbound packet (ADR
+                // Acks already resolved leave BEFORE this outbound batch (ADR
                 // 0075): the hub releases a publish's ack before queueing its
                 // fan-out, so this preserves the old order — a message's own
                 // PUBACK precedes any delivery that followed from it.
@@ -1804,41 +1803,53 @@ where
                 {
                     return Ok(false);
                 }
-                match maybe_out {
+                // Batch the whole current backlog into one write + flush (issue
+                // #443): `recv` woke us with one packet; drain the rest that are
+                // already queued with `try_recv`, encode them all onto the
+                // writer's buffer, and flush once. On small-message fan-out this
+                // is the difference between a syscall (and TLS record) per
+                // message and one per drain. Bounded so a client that can never
+                // keep up cannot hold this loop or grow the buffer without limit;
+                // the single writer task still guarantees per-connection order.
+                let Some(mut pkt) = maybe_out else {
+                    // The hub dropped our sender: taken over by a new connection
+                    // for this client id, or the hub shut down.
+                    return Ok(false);
+                };
+                for _ in 0..OUTBOUND_BATCH_MAX {
+                    // Metered on the packet AS RECEIVED — before the topic-alias
+                    // rewrite below, which only shrinks it: add and subtract are
+                    // then the same pure function of the same packet, which is
+                    // what keeps the byte counter from drifting (issue #241).
+                    out_meter.drained(&pkt);
                     // Rewrite outbound PUBLISHes to use topic aliases where the
                     // client allowed them (ADR 0011 §3); other packets pass through.
-                    Some(mut pkt) => {
-                        if let Packet::Publish(p) = &mut pkt {
-                            outbound_aliases.apply(p);
-                        }
-                        // The client's Maximum Packet Size (ADR 0041 T4): a message
-                        // too large for THIS subscriber is dropped for it alone,
-                        // per spec — measured after the alias rewrite (which only
-                        // shrinks), counted, never a connection error.
-                        if let (Some(max), Packet::Publish(_)) = (client_max_packet, &pkt) {
-                            let mut encoded = Vec::new();
-                            let version = if is_v5 {
-                                ProtocolVersion::V5
-                            } else {
-                                ProtocolVersion::V311
-                            };
-                            if pkt.encode(&mut encoded, version).is_ok()
-                                && encoded.len() > max as usize
-                            {
-                                debug!(client = %client.0, size = encoded.len(), max,
-                                       "outbound publish exceeds the client's Maximum Packet Size; dropped for this subscriber");
-                                if let Some(m) = &policy.metrics {
-                                    m.publish_dropped("too-large");
-                                }
-                                continue;
+                    if let Packet::Publish(p) = &mut pkt {
+                        outbound_aliases.apply(p);
+                    }
+                    let start = writer.queued_len();
+                    writer.queue(&pkt)?;
+                    // The client's Maximum Packet Size (ADR 0041 T4): a message
+                    // too large for THIS subscriber is dropped for it alone, per
+                    // spec — measured from the bytes just queued (one encode, no
+                    // throwaway second pass — issue #443 5b), counted, never a
+                    // connection error. Un-queue it and carry on with the batch.
+                    if let (Some(max), Packet::Publish(_)) = (client_max_packet, &pkt) {
+                        if writer.queued_len() - start > max as usize {
+                            debug!(client = %client.0, size = writer.queued_len() - start, max,
+                                   "outbound publish exceeds the client's Maximum Packet Size; dropped for this subscriber");
+                            writer.truncate_queued(start);
+                            if let Some(m) = &policy.metrics {
+                                m.publish_dropped("too-large");
                             }
                         }
-                        writer.send(&pkt).await?;
                     }
-                    // The hub dropped our sender: we were taken over by a new
-                    // connection for the same client id, or the hub shut down.
-                    None => return Ok(false),
+                    match out_rx.try_recv() {
+                        Ok(next) => pkt = next,
+                        Err(_) => break,
+                    }
                 }
+                writer.flush_queued().await?;
             }
             () = &mut idle, if deadline.is_some() => {
                 // The timer fired at the deadline it was armed with; packets since

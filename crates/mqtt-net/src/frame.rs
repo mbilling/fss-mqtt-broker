@@ -204,12 +204,19 @@ pub(crate) fn declared_frame_len(buf: &BytesMut) -> Result<Option<usize>, NetErr
 pub struct FrameWriter<W> {
     inner: W,
     version: ProtocolVersion,
+    /// Reused encode buffer: the outbound drain encodes a whole backlog into it
+    /// and writes it in one syscall (issue #443).
+    scratch: Vec<u8>,
 }
 
 impl<W: AsyncWrite + Unpin> FrameWriter<W> {
     /// Create a writer over `inner` for the given protocol `version`.
     pub fn new(inner: W, version: ProtocolVersion) -> Self {
-        Self { inner, version }
+        Self {
+            inner,
+            version,
+            scratch: Vec::with_capacity(4096),
+        }
     }
 
     /// Update the protocol version.
@@ -229,16 +236,56 @@ impl<W: AsyncWrite + Unpin> FrameWriter<W> {
         self.inner
     }
 
-    /// Encode and send a single packet, flushing the stream.
+    /// Encode `packet` onto the pending write buffer WITHOUT touching the socket.
+    /// Pair with [`flush_queued`](Self::flush_queued) to write a whole batch in
+    /// one syscall (issue #443). Encoding appends, so several packets accumulate.
+    ///
+    /// # Errors
+    /// [`NetError::Codec`] if the packet cannot be encoded.
+    pub fn queue(&mut self, packet: &Packet) -> Result<(), NetError> {
+        packet.encode(&mut self.scratch, self.version)?;
+        Ok(())
+    }
+
+    /// Bytes currently queued but not yet flushed — the offset a caller records
+    /// before [`queue`](Self::queue) so it can [`truncate_queued`](Self::truncate_queued)
+    /// a packet it decided, AFTER encoding it once, not to send (issue #443 5b:
+    /// the client's Maximum Packet Size is now measured from the bytes actually
+    /// queued, never a throwaway second encode).
+    #[must_use]
+    pub fn queued_len(&self) -> usize {
+        self.scratch.len()
+    }
+
+    /// Drop everything queued past `len` (an offset from [`queued_len`](Self::queued_len)).
+    pub fn truncate_queued(&mut self, len: usize) {
+        self.scratch.truncate(len);
+    }
+
+    /// Write everything queued in one `write_all` + `flush`, then clear the
+    /// buffer. A no-op when nothing is queued, so a drain that dropped every
+    /// packet costs no syscall.
+    ///
+    /// # Errors
+    /// [`NetError::Io`] on a transport error.
+    pub async fn flush_queued(&mut self) -> Result<(), NetError> {
+        if self.scratch.is_empty() {
+            return Ok(());
+        }
+        self.inner.write_all(&self.scratch).await?;
+        self.inner.flush().await?;
+        self.scratch.clear();
+        Ok(())
+    }
+
+    /// Encode and send a single packet, flushing the stream. Convenience for
+    /// control packets (CONNACK/AUTH/…) written outside the batched drain.
     ///
     /// # Errors
     /// [`NetError::Codec`] if the packet cannot be encoded, or [`NetError::Io`].
     pub async fn send(&mut self, packet: &Packet) -> Result<(), NetError> {
-        let mut out = Vec::new();
-        packet.encode(&mut out, self.version)?;
-        self.inner.write_all(&out).await?;
-        self.inner.flush().await?;
-        Ok(())
+        self.queue(packet)?;
+        self.flush_queued().await
     }
 }
 
