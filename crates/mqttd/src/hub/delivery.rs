@@ -82,6 +82,14 @@ pub(super) struct SharedPlan {
     pub(super) chosen: Option<SharedCandidate>,
 }
 
+/// One recipient's aggregated subscription terms for a topic — the answer of
+/// [`Hub::delivery_terms`]'s single wildcard pass (issue #445).
+pub(super) struct DeliveryTerms {
+    pub granted: QoS,
+    pub no_local: bool,
+    pub retain_as_published: bool,
+}
+
 impl Hub {
     /// The Subscription Identifiers a delivery of `topic` to `client` must carry
     /// ([MQTT-3.3.4-3..5], issue #266): the ids of EVERY subscription of this
@@ -207,31 +215,56 @@ impl Hub {
             .unwrap_or(QoS::AtMostOnce)
     }
 
-    /// Deliver a message to this node's **ordinary** local subscribers at
-    /// `min(qos, granted)` each. Shared subscriptions are routed separately by
-    /// [`deliver_shared`](Self::deliver_shared) (ADR 0015).
-    /// Returns `false` when any recipient's durable enqueue failed (ADR 0041 T5).
-    pub(super) fn suppressed_by_no_local(
-        &self,
-        client: &ClientId,
-        topic: &str,
-        publisher: Option<&ClientId>,
-    ) -> bool {
-        publisher == Some(client)
-            && self
-                .no_local
-                .get(client)
-                .is_some_and(|fs| fs.iter().any(|f| mqtt_core::topic_matches(f, topic)))
-    }
-
-    /// Retain As Published (#198, MQTT 5 §3.8.3.1): whether `client` holds a RAP subscription
-    /// matching `topic`, so a message forwarded to it keeps the RETAIN flag it was published
-    /// with instead of the flag being cleared [MQTT-3.3.1-9]. This is what lets a re-forwarder
-    /// (the boundary bridge) carry *live* retained state across a boundary (#189).
-    pub(super) fn keeps_retain_flag(&self, client: &ClientId, topic: &str) -> bool {
-        self.retain_as_published
-            .get(client)
-            .is_some_and(|fs| fs.iter().any(|f| mqtt_core::topic_matches(f, topic)))
+    /// One recipient's delivery terms for `topic`, in ONE wildcard pass over its
+    /// filters (issue #445) instead of the three separate walks this replaces:
+    ///
+    /// - `granted` — the highest `QoS` across matching filters (as
+    ///   [`granted_qos`](Self::granted_qos), which remains for the callers that
+    ///   need nothing else);
+    /// - `no_local` — whether any matching filter was subscribed No Local
+    ///   (#198); the CALLER combines this with "publisher == client", which is
+    ///   connection state, not subscription state;
+    /// - `retain_as_published` — whether any matching filter keeps the RETAIN
+    ///   flag (#198, MQTT 5 §3.8.3.1) [MQTT-3.3.1-9], which is what lets a
+    ///   re-forwarder (the boundary bridge) carry *live* retained state across a
+    ///   boundary (#189).
+    ///
+    /// The option maps are scanned via O(1) membership against the granted-filter
+    /// walk, PLUS a residue pass over any option filter *not* in
+    /// `subs_by_client` — `record_sub_option` runs before quota filtering, so a
+    /// quota-denied filter can hold an option without a granted subscription, and
+    /// the walks this replaces honoured that corner. The residue is empty in
+    /// every non-degenerate case, so it costs hash lookups, not wildcard walks.
+    pub(super) fn delivery_terms(&self, client: &ClientId, topic: &str) -> DeliveryTerms {
+        let held = self.subs_by_client.get(client);
+        let nl = self.no_local.get(client);
+        let rap = self.retain_as_published.get(client);
+        let mut terms = DeliveryTerms {
+            granted: QoS::AtMostOnce,
+            no_local: false,
+            retain_as_published: false,
+        };
+        for (f, q) in held.into_iter().flatten() {
+            if !topic_matches(f, topic) {
+                continue;
+            }
+            if *q as u8 > terms.granted as u8 {
+                terms.granted = *q;
+            }
+            terms.no_local |= nl.is_some_and(|s| s.contains(f));
+            terms.retain_as_published |= rap.is_some_and(|s| s.contains(f));
+        }
+        let residue = |set: Option<&HashSet<String>>, already: bool| {
+            already
+                || set.is_some_and(|s| {
+                    s.iter()
+                        .filter(|f| !held.is_some_and(|m| m.contains_key(*f)))
+                        .any(|f| topic_matches(f, topic))
+                })
+        };
+        terms.no_local = residue(nl, terms.no_local);
+        terms.retain_as_published = residue(rap, terms.retain_as_published);
+        terms
     }
 
     /// The ordinary (non-shared) local recipients of `topic` and each one's delivery
@@ -248,11 +281,14 @@ impl Hub {
         self.table
             .matching_clients(topic)
             .into_iter()
-            .filter(|c| !self.suppressed_by_no_local(c, topic, publisher))
-            .map(|c| {
-                let granted = self.granted_qos(&c, topic);
-                let retain = source_retain && self.keeps_retain_flag(&c, topic);
-                (c, granted, retain)
+            .filter_map(|c| {
+                let terms = self.delivery_terms(&c, topic);
+                // No Local suppresses only the publisher's own copy (#198).
+                if publisher == Some(&c) && terms.no_local {
+                    return None;
+                }
+                let retain = source_retain && terms.retain_as_published;
+                Some((c, terms.granted, retain))
             })
             .collect()
     }
