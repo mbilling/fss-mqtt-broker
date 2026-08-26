@@ -102,6 +102,8 @@ LANE_B_PUB_CONTAINERS=6 SHAPE_ONLY=1 ./run-curve.sh /tmp/shape-check /tmp/inv.js
 
 The table it prints is what a real run keeps as `laneB/shape.txt`.
 
+**Fan-out percentage.** `LANE_B_FANOUT` (0–100) is the share of subscriber containers that receive the *full* publish stream on a plain `bench/#` wildcard; the rest stay in one `$share/g1` group and split one copy per publish. `0` (default) is today's `$share` fan-in (delivered ≈ offered); `100` gives every subscriber every publish (delivered ≈ offered × `LANE_B_SUBS`); `50` makes half the containers wildcard. Egress fan-out is the shape that stresses the per-connection write path (issue #443). Above 0 the rung is the *publish* rate, so keep it modest — `shape.txt` prints the resulting `delivered ≈ offered × N`.
+
 ## Anatomy of one size (what `full` executes, in order)
 
 | step | what | knobs (full profile) |
