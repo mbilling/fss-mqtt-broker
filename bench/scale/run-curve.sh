@@ -1022,9 +1022,12 @@ lane_d() {
 	# Offered is taken from the BROKER's received counter across the offline
 	# window, not the publishers' own tally: what the drivers handed to a socket
 	# is not what the cluster accepted, and only the latter can be queued.
-	sum_metric() { # sum_metric <label> <metric-prefix> — across all brokers
+	# Exact name, or exact name + label braces — NOT a prefix: `mqttd_backlog_bytes`
+	# as a prefix also matches `mqttd_backlog_bytes_max` and silently doubles the
+	# reported backlog.
+	sum_metric() { # sum_metric <label> <metric-name> — across all brokers
 		cat "$ddir"/metrics-"$1"-broker*.prom 2>/dev/null |
-			awk -v m="$2" '$1 ~ "^" m {s += $2} END{print s + 0}'
+			awk -v m="$2" '$1 == m || index($1, m "{") == 1 {s += $2} END{print s + 0}'
 	}
 	local off_recv fill_recv drained queued_bytes dropped sessions_off
 	off_recv=$(sum_metric offline mqttd_publish_received_total)
