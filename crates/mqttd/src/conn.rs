@@ -743,7 +743,7 @@ where
         connack_props
             .0
             .push(mqtt_codec::Property::AssignedClientIdentifier(
-                client.0.clone(),
+                client.0.to_string(),
             ));
     }
     writer
@@ -1026,9 +1026,9 @@ where
             return Ok(None);
         }
         let n = AUTO_ID.fetch_add(1, Ordering::Relaxed);
-        return Ok(Some((ClientId(assigned_client_id(node, n)), true)));
+        return Ok(Some((ClientId(assigned_client_id(node, n).into()), true)));
     }
-    Ok(Some((ClientId(connect.client_id.clone()), false)))
+    Ok(Some((ClientId(connect.client_id.clone().into()), false)))
 }
 
 /// The authentication gate: run the MQTT 5.0 enhanced (AUTH) exchange when the
@@ -3127,7 +3127,7 @@ mod tests {
                         reply,
                         ..
                     } => {
-                        record.lock().unwrap().push(client.0.clone());
+                        record.lock().unwrap().push(client.0.to_string());
                         keep_alive.push(outbound);
                         let _ = reply.send(AttachOutcome::Present(false));
                     }

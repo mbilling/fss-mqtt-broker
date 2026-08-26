@@ -2972,7 +2972,7 @@ mod tests {
         sim.down(&followers[0]); // one replica down, quorum still met
 
         let store = ReplicatedSessionStore::new(log);
-        let c = ClientId("client".to_string());
+        let c = ClientId("client".into());
         let msg = Message::new(
             "t".to_string(),
             bytes::Bytes::from_static(b"payload"),

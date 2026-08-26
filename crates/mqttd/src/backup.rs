@@ -525,7 +525,7 @@ pub async fn export(
         sessions: scan.sessions.len() as u64,
         queued,
         retained: retained_all.len() as u64,
-        not_owned: scan.not_owned.iter().map(|c| c.0.clone()).collect(),
+        not_owned: scan.not_owned.iter().map(|c| c.0.to_string()).collect(),
         started_unix_ms: started_ms,
         finished_unix_ms: finished_ms,
         sha256: sha256_hex(&body),
@@ -571,7 +571,7 @@ pub async fn export(
 fn session_record(s: &SessionExport) -> SessionRecord {
     SessionRecord {
         kind: "session".to_string(),
-        client: s.client.0.clone(),
+        client: s.client.0.to_string(),
         owner: s.owner.clone(),
         subscriptions: s
             .subscriptions
@@ -1641,7 +1641,7 @@ async fn apply_session(
     record: &SessionRecord,
     store: &Arc<dyn SessionStore>,
 ) -> Result<SessionOutcome, String> {
-    let client = ClientId(record.client.clone());
+    let client = ClientId(record.client.clone().into());
     // Retry a transient refusal (a quorum momentarily unreachable) before giving up: a
     // restore runs at cold start, where those are expected and self-healing. `NotOwner` is
     // NOT retried here — it is retried in ROUNDS by the caller, because a fresh cluster's
@@ -2925,7 +2925,7 @@ mod tests {
         let sessions: Arc<dyn SessionStore> =
             Arc::new(mqtt_storage::logged::ReplicatedSessionStore::new(live));
         sessions
-            .claim_session(&ClientId("c1".to_string()), "alice")
+            .claim_session(&ClientId("c1".into()), "alice")
             .await
             .unwrap();
 
@@ -3065,7 +3065,7 @@ mod tests {
             Arc::new(mqtt_storage::logged::ReplicatedSessionStore::new(
                 mqtt_storage::repl::InMemoryReplicatedLog::new(),
             ));
-        let client = ClientId("c1".to_string());
+        let client = ClientId("c1".into());
         assert!(matches!(
             sessions.claim_session(&client, "alice").await.unwrap(),
             SessionClaim::Granted { present: false }

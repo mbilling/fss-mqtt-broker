@@ -713,7 +713,7 @@ fn forward_inbound(
             let _ = hub.send(HubCommand::RemoteSharedDeliverAcked {
                 node: remote.clone(),
                 seq,
-                client: mqtt_core::ClientId(client),
+                client: mqtt_core::ClientId(client.into()),
                 topic,
                 payload: payload.into(),
                 qos: mqtt_codec::QoS::from_u8(qos).unwrap_or(mqtt_codec::QoS::AtMostOnce),
@@ -732,7 +732,7 @@ fn forward_inbound(
                         .into_iter()
                         .map(|m| {
                             (
-                                mqtt_core::ClientId(m.client),
+                                mqtt_core::ClientId(m.client.into()),
                                 mqtt_codec::QoS::from_u8(m.qos)
                                     .unwrap_or(mqtt_codec::QoS::AtMostOnce),
                                 m.online,
@@ -755,7 +755,7 @@ fn forward_inbound(
             app,
         } => {
             let _ = hub.send(HubCommand::RemoteSharedDeliver {
-                client: mqtt_core::ClientId(client),
+                client: mqtt_core::ClientId(client.into()),
                 topic,
                 payload: payload.into(),
                 qos: mqtt_codec::QoS::from_u8(qos).unwrap_or(mqtt_codec::QoS::AtMostOnce),

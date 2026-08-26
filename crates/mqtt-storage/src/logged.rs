@@ -505,7 +505,7 @@ impl<L: ReplicatedLog<Key = String>> SessionStore for ReplicatedSessionStore<L> 
             let Some(id) = key.strip_prefix("m/") else {
                 continue;
             };
-            let client = ClientId(id.to_string());
+            let client = ClientId(id.into());
             if let Some(deadline) = self
                 .load_meta(&client)
                 .await?
@@ -529,7 +529,7 @@ impl<L: ReplicatedLog<Key = String>> SessionStore for ReplicatedSessionStore<L> 
             let Some(id) = key.strip_prefix("m/") else {
                 continue;
             };
-            let client = ClientId(id.to_string());
+            let client = ClientId(id.into());
             // A per-key error is skipped, not fatal — but the KIND matters
             // (0043-P4 exhibit ②): `NotOwner` is a clean skip (a replica copy
             // held for another node — its owner materializes it), while a
@@ -647,7 +647,7 @@ impl<L: ReplicatedLog<Key = String>> SessionStore for ReplicatedSessionStore<L> 
             ..SessionExportScan::default()
         };
         for id in clients {
-            let client = ClientId(id);
+            let client = ClientId(id.into());
             // The skip KINDS are the same distinction `all_sessions` draws (0043-P4
             // exhibit ②) and carry the same weight here: `NotOwner` is CLEAN — the value
             // lives on another node, whose own export holds it, and whose absence from a
@@ -1092,7 +1092,7 @@ mod tests {
     use std::sync::Arc;
 
     fn cid(s: &str) -> ClientId {
-        ClientId(s.to_string())
+        ClientId(s.into())
     }
 
     fn store() -> ReplicatedSessionStore<InMemoryReplicatedLog> {
@@ -1953,7 +1953,7 @@ mod export_order_tests {
     async fn the_queue_is_read_before_the_metadata_that_covers_it() {
         let log = Arc::new(RecordingLog::new());
         let store = ReplicatedSessionStore::new(log.clone());
-        let client = ClientId("c1".to_string());
+        let client = ClientId("c1".into());
         store.ensure_session(&client).await.unwrap();
         store
             .enqueue(

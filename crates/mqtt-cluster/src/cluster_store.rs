@@ -766,7 +766,7 @@ mod tests {
         for i in 0..100_000 {
             let c = format!("client-{i}");
             if group_of(&c) == group {
-                return (group, ClientId(c));
+                return (group, ClientId(c.into()));
             }
         }
         panic!("no client hashes to the owned group");
@@ -777,7 +777,7 @@ mod tests {
         for i in 0..100_000 {
             let c = format!("client-{i}");
             if !p.owns_group(group_of(&c)) {
-                return ClientId(c);
+                return ClientId(c.into());
             }
         }
         panic!("this node owns every group");

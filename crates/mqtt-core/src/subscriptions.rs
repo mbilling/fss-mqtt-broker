@@ -245,7 +245,7 @@ mod tests {
     use std::collections::HashSet;
 
     fn cid(s: &str) -> ClientId {
-        ClientId(s.to_string())
+        ClientId(s.into())
     }
 
     #[test]

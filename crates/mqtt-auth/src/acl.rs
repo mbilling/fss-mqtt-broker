@@ -509,11 +509,11 @@ mod tests {
     }
 
     fn can_pub_as(p: &AclPolicy, id: &Identity, client: &str, topic: &str) -> bool {
-        p.authorize_publish(id, &ClientId(client.to_string()), &topic.to_string())
+        p.authorize_publish(id, &ClientId(client.into()), &topic.to_string())
     }
 
     fn can_sub_as(p: &AclPolicy, id: &Identity, client: &str, filter: &str) -> bool {
-        p.authorize_subscribe(id, &ClientId(client.to_string()), &filter.to_string())
+        p.authorize_subscribe(id, &ClientId(client.into()), &filter.to_string())
     }
 
     // ----- parse / validation failures -----
@@ -1167,7 +1167,7 @@ mod tests {
     // ----- connect rules (ADR 0031 option B) -----
 
     fn can_connect(p: &AclPolicy, id: &Identity, client_id: &str) -> bool {
-        p.authorize_connect(id, &mqtt_core::ClientId(client_id.to_string()))
+        p.authorize_connect(id, &mqtt_core::ClientId(client_id.into()))
     }
 
     #[test]

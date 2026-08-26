@@ -41,8 +41,40 @@ pub type TopicName = String;
 pub type TopicFilter = String;
 
 /// Stable identifier for a connected client.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct ClientId(pub String);
+///
+/// Interned as `Arc<str>` (issue #446): the id is cloned on nearly every hot-path
+/// map touch (inflight table, subscription sets, per-delivery bookkeeping), and an
+/// `Arc<str>` clone is a refcount bump rather than a string allocation. `Arc<str>`
+/// hashes and orders by its `str` content exactly as `String` does, so map keys and
+/// on-disk keys derived from it are byte-identical — no schema change.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ClientId(pub std::sync::Arc<str>);
+
+impl ClientId {
+    /// The id as a string slice.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<String> for ClientId {
+    fn from(s: String) -> Self {
+        ClientId(std::sync::Arc::from(s))
+    }
+}
+
+impl From<&str> for ClientId {
+    fn from(s: &str) -> Self {
+        ClientId(std::sync::Arc::from(s))
+    }
+}
+
+impl std::fmt::Display for ClientId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
 
 /// A subscription request from a client.
 #[derive(Debug, Clone)]

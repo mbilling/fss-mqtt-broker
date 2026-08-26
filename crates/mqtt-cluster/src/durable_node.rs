@@ -725,7 +725,7 @@ mod tests {
         )
         .await;
 
-        let client = ClientId("c".to_string());
+        let client = ClientId("c".into());
         let msg = Message::new(
             "t".to_string(),
             bytes::Bytes::from_static(b"durable"),
@@ -797,7 +797,7 @@ mod tests {
     async fn a_persistent_durable_node_restarts_from_its_data_dir() {
         let dir = tempfile::tempdir().unwrap();
         let node = NodeId("durable-restart".to_string());
-        let client = ClientId("c".to_string());
+        let client = ClientId("c".into());
         let msg = Message::new(
             "t".to_string(),
             bytes::Bytes::from_static(b"durable"),
