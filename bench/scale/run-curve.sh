@@ -167,6 +167,14 @@ LANE_B_CONNECT_RATE="${LANE_B_CONNECT_RATE:-500}"
 # x 300 subs is 1.5M deliveries/s). The offered-rate honesty checks are
 # unchanged: they police what the PUBLISHERS emit, which the rung still names.
 LANE_B_FANOUT="${LANE_B_FANOUT:-0}"
+# Publish/subscribe QoS for the lane, 0 or 1 (default 1), applied to BOTH
+# sides. A QoS 1 publisher is synchronous — it waits for each PUBACK, so its
+# rate is throttled by the broker and the offered load oscillates near
+# saturation. QoS 0 fires at a steady rate regardless, which a clean
+# broker-saturation sweep needs; on the sub side QoS 0 lets the broker shed
+# what a slow subscriber cannot take rather than backpressure. QoS 2 is out
+# of scope for this lane.
+LANE_B_QOS="${LANE_B_QOS:-1}"
 LANE_B_REF_RUNG=50000
 # Seconds between the publishers starting and the latency baseline scrape: the
 # ramp, excluded from the measured window (see the scrape in lane_b_rung).
@@ -282,6 +290,7 @@ lane_b_shape() { # prints the shape as key=value lines; dies on any distortion
 	positive_int LANE_B_SUBS "$LANE_B_SUBS"
 	positive_int LANE_B_MIN_INTERVAL "$LANE_B_MIN_INTERVAL"
 	positive_int LANE_B_CONNECT_RATE "$LANE_B_CONNECT_RATE"
+	case "$LANE_B_QOS" in 0 | 1) ;; *) die "LANE_B_QOS must be 0 or 1, got '$LANE_B_QOS'" ;; esac
 	[[ "$LANE_B_FANOUT" =~ ^[0-9]+$ ]] && [ "$LANE_B_FANOUT" -le 100 ] ||
 		die "LANE_B_FANOUT must be a percentage 0-100 (0=shared fan-in, 100=full wildcard fan-out), got '$LANE_B_FANOUT'"
 	[ "$LANE_B_CONNECT_RATE" -le 1000 ] ||
@@ -353,7 +362,7 @@ lane_b_shape() { # prints the shape as key=value lines; dies on any distortion
 		interval=$(lane_b_interval "$rate")
 		echo "rung=$rate interval_ms=$interval per_pub_container_msg_s=$((rate / pub_cells))"
 	done
-	echo "inflight=$LANE_B_INFLIGHT connect_rate=$LANE_B_CONNECT_RATE settle_s=$LANE_B_SETTLE measure_s=$LANE_B_SECS min_interval_ms=$LANE_B_MIN_INTERVAL"
+	echo "qos=$LANE_B_QOS inflight=$LANE_B_INFLIGHT connect_rate=$LANE_B_CONNECT_RATE settle_s=$LANE_B_SETTLE measure_s=$LANE_B_SECS min_interval_ms=$LANE_B_MIN_INTERVAL"
 	echo "image=$BENCH_IMG erl_flags='$BENCH_ERL_FLAGS'"
 }
 if [[ "$LANES" == *B* ]]; then
@@ -627,7 +636,7 @@ lane_b_rung() { # lane_b_rung <total-rate> <posture:plain|mtls>
 			# plain wildcard — every publish reaches every one of their
 			# connections; the rest join the one $share group and split one copy.
 			if [ $((di * S + j)) -lt $((LANE_B_FANOUT * D * S / 100)) ]; then sub_filter="bench/#"; else sub_filter="\$share/g1/bench/#"; fi
-			subs[di]+="$DOCKER_RUN --name sub-$di-$j -v /opt/bench-certs:/opt/bench-certs:ro $BENCH_IMG sub -h $hosts -p $port -c $subs_per -R $LANE_B_CONNECT_RATE -t '$sub_filter' -q 1 $active --payload-hdrs ts --prometheus --restapi $((port_base + j)) $args >/dev/null"$'\n'
+			subs[di]+="$DOCKER_RUN --name sub-$di-$j -v /opt/bench-certs:/opt/bench-certs:ro $BENCH_IMG sub -h $hosts -p $port -c $subs_per -R $LANE_B_CONNECT_RATE -t '$sub_filter' -q $LANE_B_QOS $active --payload-hdrs ts --prometheus --restapi $((port_base + j)) $args >/dev/null"$'\n'
 			scrape[di]+="printf '\\n@@@ sub-$di-$j\\n'; curl -s http://localhost:$((port_base + j))/metrics"$'\n'
 			stop[di]+="printf '\\n@@@ sub-$di-$j\\n'; docker logs sub-$di-$j 2>&1"$'\n'
 			names[di]+=" sub-$di-$j"
@@ -641,7 +650,7 @@ lane_b_rung() { # lane_b_rung <total-rate> <posture:plain|mtls>
 			# block, so the topic count IS LANE_B_PUBS by construction.
 			seq_base=$(((di * P + j) * pubs_per))
 			hosts=$(rotated_hosts $((di * P + j)))
-			pubs[di]+="$DOCKER_RUN --name pub-$di-$j -v /opt/bench-certs:/opt/bench-certs:ro $BENCH_IMG pub -h $hosts -p $port -c $pubs_per -R $LANE_B_CONNECT_RATE -t 'bench/%i' -q 1 -s 256 $active -n $seq_base -I $interval -F $LANE_B_INFLIGHT --payload-hdrs ts $args >/dev/null"$'\n'
+			pubs[di]+="$DOCKER_RUN --name pub-$di-$j -v /opt/bench-certs:/opt/bench-certs:ro $BENCH_IMG pub -h $hosts -p $port -c $pubs_per -R $LANE_B_CONNECT_RATE -t 'bench/%i' -q $LANE_B_QOS -s 256 $active -n $seq_base -I $interval -F $LANE_B_INFLIGHT --payload-hdrs ts $args >/dev/null"$'\n'
 			stop[di]+="printf '\\n@@@ pub-$di-$j\\n'; docker logs pub-$di-$j 2>&1"$'\n'
 			names[di]+=" pub-$di-$j"
 		done
