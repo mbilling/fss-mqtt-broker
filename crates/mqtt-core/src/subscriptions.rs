@@ -37,9 +37,18 @@ struct TrieNode {
     terminal: Option<TopicFilter>,
 }
 
-impl TrieNode {
-    fn is_empty(&self) -> bool {
-        self.children.is_empty() && self.terminal.is_none()
+impl Drop for TrieNode {
+    /// Dismantle the subtree iteratively. Node depth tracks the (client-supplied)
+    /// filter length, so the derived recursive drop of nested `HashMap`s would
+    /// otherwise overflow the stack and abort the broker when a deep filter's
+    /// path is pruned or the table is torn down — the same hazard the insert,
+    /// match, and remove walks avoid by staying iterative.
+    fn drop(&mut self) {
+        let mut stack: Vec<TrieNode> = self.children.drain().map(|(_, n)| n).collect();
+        while let Some(mut node) = stack.pop() {
+            stack.extend(node.children.drain().map(|(_, n)| n));
+            // `node` now has no children; its own drop recurses no further.
+        }
     }
 }
 
@@ -51,20 +60,52 @@ fn trie_insert(root: &mut TrieNode, filter: &str) {
     node.terminal = Some(filter.to_string());
 }
 
-/// Remove `filter`'s terminal and prune now-empty nodes on the way back up.
-/// Returns whether `node` itself became empty (so the parent unlinks it).
-fn trie_remove(node: &mut TrieNode, mut levels: std::str::Split<'_, char>) -> bool {
-    match levels.next() {
-        None => node.terminal = None,
-        Some(level) => {
-            if let Some(child) = node.children.get_mut(level) {
-                if trie_remove(child, levels) {
-                    node.children.remove(level);
-                }
-            }
+/// Remove `filter`'s terminal and prune the trailing chain of nodes it leaves
+/// empty. Two iterative passes — depth tracks the filter's level count, which is
+/// client-controlled input, so recursion here would let one deep SUBSCRIBE
+/// overflow the stack and abort the broker (the insert and match walks are
+/// iterative for the same reason).
+fn trie_remove(root: &mut TrieNode, filter: &str) {
+    let levels: Vec<&str> = filter.split('/').collect();
+    // Pass 1 (immutable): confirm the path exists and find the deepest node on it
+    // that OUTLIVES the removal — one holding its own terminal or a second child
+    // once this filter's leaf is gone. The root always outlives it.
+    let mut node = &*root;
+    let mut cut = 0usize; // index, on the path, of the deepest surviving node
+    for (depth, level) in levels.iter().enumerate() {
+        let Some(child) = node.children.get(*level) else {
+            return; // filter not registered — nothing to remove
+        };
+        if depth == 0 || node.terminal.is_some() || node.children.len() > 1 {
+            cut = depth;
         }
+        node = child;
     }
-    node.is_empty()
+    // `node` is the leaf (index `levels.len()`); it outlives the removal iff it
+    // still has children once we drop this terminal.
+    if !node.children.is_empty() {
+        cut = levels.len();
+    }
+    // Pass 2 (mutable): clear the terminal if the leaf survives, else detach the
+    // whole dead chain at the surviving node — one child removal drops it all.
+    let mut node = &mut *root;
+    if cut == levels.len() {
+        for level in &levels {
+            node = node
+                .children
+                .get_mut(*level)
+                .expect("path verified in pass 1");
+        }
+        node.terminal = None;
+    } else {
+        for level in &levels[..cut] {
+            node = node
+                .children
+                .get_mut(*level)
+                .expect("path verified in pass 1");
+        }
+        node.children.remove(levels[cut]);
+    }
 }
 
 /// Maps topic filters to the set of clients subscribed to each.
@@ -100,7 +141,7 @@ impl SubscriptionTable {
             clients.remove(client);
             if clients.is_empty() {
                 self.by_filter.remove(filter);
-                trie_remove(&mut self.root, filter.split('/'));
+                trie_remove(&mut self.root, filter);
             }
         }
     }
@@ -118,7 +159,7 @@ impl SubscriptionTable {
             }
         });
         for filter in emptied {
-            trie_remove(&mut self.root, filter.split('/'));
+            trie_remove(&mut self.root, &filter);
         }
     }
 
@@ -324,10 +365,34 @@ mod tests {
         assert_eq!(t.matching_clients("a/b/c"), HashSet::from([cid("y")]));
     }
 
+    /// Removal must not recurse per topic level (the insert and match walks are
+    /// iterative for exactly this reason): a filter deep enough to blow a worker
+    /// thread's stack under recursive teardown is subscribed, then torn down by
+    /// BOTH removal paths. The test reaching its asserts at all is the proof —
+    /// recursive teardown would abort the process here.
+    #[test]
+    fn deep_filter_teardown_stays_iterative() {
+        let deep = vec!["a"; 100_000].join("/");
+        let mut t = SubscriptionTable::new();
+        t.subscribe(cid("x"), deep.clone());
+        t.subscribe(cid("y"), deep.clone());
+        assert_eq!(
+            t.matching_clients(&deep),
+            HashSet::from([cid("x"), cid("y")])
+        );
+        t.unsubscribe(&cid("x"), &deep); // unsubscribe path
+        t.remove_client(&cid("y")); // remove_client path
+        assert!(t.matching_clients(&deep).is_empty());
+        // Fully pruned: the shallow prefix left behind matches nothing either.
+        assert!(t.matching_clients("a").is_empty());
+    }
+
     /// The net under everything above: the trie walk agrees with the linear
     /// `topic_matches` reference on EVERY (valid filter, topic) pair drawn from a
-    /// generated corpus — wildcards at every position, `$`-roots, empty levels,
-    /// depths 1..=4 — through subscribe/unsubscribe churn.
+    /// generated corpus — wildcards at every position, empty levels, depths
+    /// 1..=4 from the alphabet, plus an explicit block of `$`-rooted filters and
+    /// topics (which the alphabet cannot spell) — through interleaved
+    /// `subscribe`/`unsubscribe`/`remove_client` churn.
     #[test]
     fn trie_matches_exactly_what_the_linear_reference_matches() {
         let alphabet = ["a", "b", "+", "#", ""];
@@ -342,20 +407,46 @@ mod tests {
                 for d3 in alphabet {
                     filters.push(format!("{d1}/{d2}/{d3}"));
                     topics.push(format!("{d1}/{d2}/{d3}"));
+                    for d4 in alphabet {
+                        filters.push(format!("{d1}/{d2}/{d3}/{d4}"));
+                        topics.push(format!("{d1}/{d2}/{d3}/{d4}"));
+                    }
                 }
             }
         }
+        // `$`-rooted FILTERS the alphabet can never spell: [MQTT-4.7.2-1] excludes
+        // only a filter whose FIRST level is a wildcard, so a literal `$SYS` root
+        // with a deeper wildcard must still match, and a leading `+`/`#` must not.
+        for f in [
+            "$SYS",
+            "$SYS/#",
+            "$SYS/+",
+            "$SYS/broker",
+            "$SYS/+/uptime",
+            "$share/g/a",
+            "+/broker",
+            "#",
+        ] {
+            filters.push(f.to_string());
+        }
+        for t in ["$SYS", "$SYS/broker", "$SYS/broker/uptime", "$share/g/a"] {
+            topics.push(t.to_string());
+        }
         filters.retain(|f| valid_filter(f));
+        // `by_filter` is keyed by filter STRING, so a duplicate filter would make
+        // the per-index reference reconstruction below diverge from the shared
+        // table state — dedup keeps one index per distinct filter.
+        filters.sort();
+        filters.dedup();
 
         let mut table = SubscriptionTable::new();
+        // Interleave subscribe with both removal paths so they run against a
+        // live, already-populated trie rather than in separate phases. The final
+        // state is still "c{i} gone iff i%3==0, everyone gone iff i%5==0", which
+        // the reference loop reconstructs.
         for (i, f) in filters.iter().enumerate() {
-            // Two clients per filter so removal churn leaves survivors behind.
             table.subscribe(cid(&format!("c{i}")), f.clone());
             table.subscribe(cid("everyone"), f.clone());
-        }
-        // Churn: drop every third filter's dedicated client entirely, and
-        // "everyone" from every fifth filter, exercising both removal paths.
-        for (i, f) in filters.iter().enumerate() {
             if i % 3 == 0 {
                 table.remove_client(&cid(&format!("c{i}")));
             }
@@ -379,5 +470,19 @@ mod tests {
             }
             assert_eq!(got, want, "trie and reference disagree on topic {topic:?}");
         }
+    }
+
+    /// A filter torn down to its last subscriber and back: removal must actually
+    /// prune the trie path, and a later subscribe must rebuild it — a husk left
+    /// behind would either keep matching after removal or refuse to re-register.
+    #[test]
+    fn a_fully_removed_filter_can_be_resubscribed() {
+        let mut t = SubscriptionTable::new();
+        t.subscribe(cid("a"), "x/+/z".into());
+        assert_eq!(t.matching_clients("x/y/z"), HashSet::from([cid("a")]));
+        t.remove_client(&cid("a"));
+        assert!(t.matching_clients("x/y/z").is_empty());
+        t.subscribe(cid("b"), "x/+/z".into());
+        assert_eq!(t.matching_clients("x/y/z"), HashSet::from([cid("b")]));
     }
 }

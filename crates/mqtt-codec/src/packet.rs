@@ -507,7 +507,7 @@ impl Packet {
     /// exercises (issue #445).
     fn hot_body_len(&self, version: ProtocolVersion) -> Result<Option<usize>, CodecError> {
         let v5 = version == ProtocolVersion::V5;
-        Ok(match self {
+        let body: Option<usize> = match self {
             Packet::Publish(p) => {
                 if u16::try_from(p.topic.len()).is_err() {
                     return Err(CodecError::ValueOutOfRange("binary data length"));
@@ -541,7 +541,18 @@ impl Packet {
             }
             Packet::PingReq | Packet::PingResp => Some(0),
             _ => None,
-        })
+        };
+        // The remaining length is a varint: a body past its ceiling cannot be
+        // encoded at all, and this is where `encode` learns it — BEFORE writing
+        // the fixed header — so the no-partial-write guarantee holds for the one
+        // shape sizing would otherwise wave through (a body in `varint::MAX+1
+        // ..= u32::MAX`, which `u32::try_from` alone accepts).
+        if let Some(n) = body {
+            if !u32::try_from(n).is_ok_and(|n32| n32 <= varint::MAX) {
+                return Err(CodecError::ValueOutOfRange("remaining length"));
+            }
+        }
+        Ok(body)
     }
 
     /// A v5 property block's full length: body plus its own varint prefix.
@@ -1833,5 +1844,37 @@ mod tests {
                 out.len()
             );
         }
+    }
+
+    /// The overflow shape the sizing checks above would otherwise wave through:
+    /// a PUBLISH whose body exceeds the varint ceiling of the remaining-length
+    /// field. `u32::try_from(body_len)` alone accepts anything up to `u32::MAX`,
+    /// so without the ceiling check in `hot_body_len` the fixed header would be
+    /// written and only the varint encode would fail — leaving one torn byte in
+    /// `out`. (No `{packet:?}` in the asserts: the payload is 256 MiB.)
+    #[test]
+    fn a_publish_body_over_the_varint_ceiling_leaves_the_buffer_untouched() {
+        // body = 2 (topic length prefix) + 1 (topic "t") + payload; make it
+        // exactly varint::MAX + 1, one past the largest encodable remaining len.
+        let payload_len = varint::MAX as usize + 1 - 3;
+        let packet = Packet::Publish(Publish {
+            properties: Properties::new(),
+            dup: false,
+            qos: QoS::AtMostOnce,
+            retain: false,
+            topic: "t".into(),
+            pkid: None,
+            payload: Bytes::from(vec![0u8; payload_len]),
+        });
+        let mut out = Vec::new();
+        assert!(
+            packet.encode(&mut out, V5).is_err(),
+            "a body past the varint ceiling must fail to encode"
+        );
+        assert!(
+            out.is_empty(),
+            "a failed encode left {} bytes behind",
+            out.len()
+        );
     }
 }
