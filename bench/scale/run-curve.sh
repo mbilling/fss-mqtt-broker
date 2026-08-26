@@ -175,7 +175,12 @@ LANE_B_FANOUT="${LANE_B_FANOUT:-0}"
 # what a slow subscriber cannot take rather than backpressure. QoS 2 is out
 # of scope for this lane.
 LANE_B_QOS="${LANE_B_QOS:-1}"
-LANE_B_REF_RUNG=50000
+# The mTLS reference rung (ADR 0048 §3 discloses both postures per size without
+# paying for the full ladder twice). Overridable because it must SUIT THE SHAPE:
+# 50000 is a sane publish rate for a fan-in ladder, but under a fan-out workload
+# it is 50000 x LANE_B_SUBS deliveries — and it must divide LANE_B_PUBS*1000 into
+# an integer -I like any other rung, which the shape check enforces for it too.
+LANE_B_REF_RUNG="${LANE_B_REF_RUNG:-50000}"
 # Seconds between the publishers starting and the latency baseline scrape: the
 # ramp, excluded from the measured window (see the scrape in lane_b_rung).
 LANE_B_SETTLE="${LANE_B_SETTLE:-15}"

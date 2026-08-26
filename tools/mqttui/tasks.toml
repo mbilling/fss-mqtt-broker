@@ -882,6 +882,32 @@ duration = "~30m smoke, ~4-5h full"
 caution = "Creates PAID cloud servers under your HCLOUD_TOKEN. Ctrl-C tears down; kill -9 does not — run teardown.sh after one."
 
 [[task]]
+id = "scale-workload"
+group = "Benchmark"
+name = "Run one named workload pattern's scale curve (PAID)"
+script = "bench/scale/workloads/run-workload.sh"
+about = """
+Five industries, five different traffic shapes, one curve each: market-data
+(broadcast fan-out, QoS 0), telematics (100k connections, fan-in, QoS 1 at 1 msg/s),
+industrial (durable, latency-critical), smart-home (idle connections), logistics
+(store-and-forward — declared but not runnable yet, it needs a lane the rig does not
+have). Each workload is a CONFIGURATION of a lane run-curve.sh already has, so a run
+is reproducible from its .env file and comparable across releases.
+
+Why it exists: "how many messages per second" is not a property of a broker. The same
+cluster on the same hardware measured 188k TPS on one shape and 20k on another, so a
+number only means something with the workload named. The file's values are DEFAULTS —
+anything exported in the environment wins, which is how a tuning pass toggles one
+MQTTD_* setting or sweeps the workload's own axis without editing the file. Read
+bench/scale/workloads/README.md for the levers per workload and the two traps
+(a QoS 1 number can measure the harness, not the broker; broadcast fan-out cannot
+scale linearly with node count).
+"""
+requires = ["terraform", "jq", "ssh"]
+duration = "~40m per workload curve (sizes 1, 3, 5)"
+caution = "Creates PAID cloud servers under your HCLOUD_TOKEN. Needs MQTTD_VERSION set — the binary under test is a disclosure item, never a default."
+
+[[task]]
 id = "scale-teardown"
 group = "Benchmark"
 name = "Destroy any leftover scale-curve cloud resources"
