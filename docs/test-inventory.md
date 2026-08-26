@@ -560,7 +560,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `a_stopped_node_is_detected_as_dead_by_every_survivor`
 - `the_simulation_is_reproducible_for_a_fixed_seed`
 
-## `crates/mqtt-codec/src/lib.rs` — 59 test(s)
+## `crates/mqtt-codec/src/lib.rs` — 62 test(s)
 
 - `io::tests::an_embedded_null_is_rejected_even_though_it_is_valid_utf8`
 - `io::tests::invalid_utf8_rejected`
@@ -570,6 +570,8 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `io::tests::string_length_overflow_rejected`
 - `io::tests::surrogates_and_overlong_encodings_are_rejected`
 - `io::tests::underflow_is_malformed_not_panic`
+- `packet::tests::a_failing_publish_leaves_the_output_buffer_untouched`
+- `packet::tests::a_publish_body_over_the_varint_ceiling_leaves_the_buffer_untouched`
 - `packet::tests::ack_v5_short_and_long_no_property_forms_agree`
 - `packet::tests::auth_is_rejected_on_v3_1_1`
 - `packet::tests::partial_buffer_returns_none`
@@ -591,6 +593,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `packet::tests::roundtrip_subscribe_suback`
 - `packet::tests::roundtrip_subscribe_v5_with_options_and_properties`
 - `packet::tests::roundtrip_unsubscribe`
+- `packet::tests::sized_encode_is_byte_identical_to_the_buffered_reference`
 - `packet::tests::subscribe_v5_reserved_and_bad_retain_handling_are_rejected`
 - `packet::tests::subscribe_wrong_flags_rejected`
 - `packet::tests::two_packets_in_one_buffer`
@@ -661,7 +664,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::the_whole_env_surface_overlays_without_collision`
 - `tests::warn_mode_boots_a_newer_config_and_reports_the_ignored_keys`
 
-## `crates/mqtt-core/src/lib.rs` — 38 test(s)
+## `crates/mqtt-core/src/lib.rs` — 45 test(s)
 
 - `retry::tests::delays_ramp_within_jitter_bounds_and_cap`
 - `retry::tests::reset_returns_to_base`
@@ -676,9 +679,16 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `shared::tests::resubscribe_updates_qos_in_place`
 - `shared::tests::snapshot_lists_every_group_with_members`
 - `shared::tests::unsubscribe_and_remove_client_prune_groups`
+- `subscriptions::tests::a_fully_removed_filter_can_be_resubscribed`
 - `subscriptions::tests::client_with_overlapping_filters_appears_once`
+- `subscriptions::tests::deep_filter_teardown_stays_iterative`
+- `subscriptions::tests::dollar_topics_are_hidden_from_leading_wildcards_only`
+- `subscriptions::tests::empty_levels_and_literal_wildcard_spellings`
+- `subscriptions::tests::multilevel_wildcard_matches_its_parent_level`
 - `subscriptions::tests::resubscribe_is_idempotent_and_filters_are_distinct`
 - `subscriptions::tests::routes_to_matching_subscribers_only`
+- `subscriptions::tests::shared_prefix_pruning_keeps_the_survivor_routable`
+- `subscriptions::tests::trie_matches_exactly_what_the_linear_reference_matches`
 - `subscriptions::tests::unsubscribe_and_remove_client`
 - `tests::covers_dollar_root_does_not_cover_plain_wildcard_request`
 - `tests::covers_empty_levels_consistent_with_topic_matches`
