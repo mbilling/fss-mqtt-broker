@@ -1391,11 +1391,10 @@ impl Hub {
                     .is_some_and(|w| w.until > now && w.seen.get(topic) != Some(&id))
             })
             .map(|c| {
-                let granted = self.granted_qos(&c, topic);
+                let terms = self.delivery_terms(&c, topic);
                 // Retained-originated: RAP subscribers keep the flag, everyone else
                 // gets 0 — the live path's rule (#198).
-                let retain = self.keeps_retain_flag(&c, topic);
-                (c, granted, retain)
+                (c, terms.granted, terms.retain_as_published)
             })
             .collect();
         for (c, granted, retain) in targets {

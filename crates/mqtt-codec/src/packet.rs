@@ -495,6 +495,77 @@ impl Packet {
         Ok(Some(packet))
     }
 
+    /// The encoded BODY length of the steady-state packets — PUBLISH, the `QoS`
+    /// acknowledgement family, and PING — or `None` for the connect-phase
+    /// packets, which keep the buffered path (they are rare and structurally
+    /// involved; a fast path there would be duplication without a workload).
+    ///
+    /// Performs the SAME value validations encoding would, so a packet that
+    /// fails to size fails BEFORE the fixed header is written — `encode` never
+    /// leaves a partial packet in `out`. Drift between this and the encoders is
+    /// caught by a `debug_assert` on every encode, which the entire test suite
+    /// exercises (issue #445).
+    fn hot_body_len(&self, version: ProtocolVersion) -> Result<Option<usize>, CodecError> {
+        let v5 = version == ProtocolVersion::V5;
+        let body: Option<usize> = match self {
+            Packet::Publish(p) => {
+                if u16::try_from(p.topic.len()).is_err() {
+                    return Err(CodecError::ValueOutOfRange("binary data length"));
+                }
+                let mut n = 2 + p.topic.len();
+                match (p.qos, p.pkid) {
+                    (QoS::AtMostOnce, None) => {}
+                    (QoS::AtMostOnce, Some(_)) => {
+                        return Err(CodecError::ProtocolViolation(
+                            "packet id present on QoS 0 PUBLISH",
+                        ))
+                    }
+                    (_, Some(_)) => n += 2,
+                    (_, None) => {
+                        return Err(CodecError::ProtocolViolation(
+                            "missing packet id on QoS>0 PUBLISH",
+                        ))
+                    }
+                }
+                if v5 {
+                    n += Self::props_block_len(&p.properties)?;
+                }
+                Some(n + p.payload.len())
+            }
+            Packet::PubAck(a) | Packet::PubRec(a) | Packet::PubComp(a) | Packet::PubRel(a) => {
+                if v5 && (a.reason != 0 || !a.properties.is_empty()) {
+                    Some(2 + 1 + Self::props_block_len(&a.properties)?)
+                } else {
+                    Some(2)
+                }
+            }
+            Packet::PingReq | Packet::PingResp => Some(0),
+            _ => None,
+        };
+        // The remaining length is a varint: a body past its ceiling cannot be
+        // encoded at all, and this is where `encode` learns it — BEFORE writing
+        // the fixed header — so the no-partial-write guarantee holds for the one
+        // shape sizing would otherwise wave through (a body in `varint::MAX+1
+        // ..= u32::MAX`, which `u32::try_from` alone accepts).
+        if let Some(n) = body {
+            if !u32::try_from(n).is_ok_and(|n32| n32 <= varint::MAX) {
+                return Err(CodecError::ValueOutOfRange("remaining length"));
+            }
+        }
+        Ok(body)
+    }
+
+    /// A v5 property block's full length: body plus its own varint prefix.
+    fn props_block_len(props: &Properties) -> Result<usize, CodecError> {
+        let body = props.encoded_body_len()?;
+        let body32 =
+            u32::try_from(body).map_err(|_| CodecError::ValueOutOfRange("properties length"))?;
+        if body32 > varint::MAX {
+            return Err(CodecError::ValueOutOfRange("variable byte integer"));
+        }
+        Ok(varint::encoded_len(body32) + body)
+    }
+
     /// Encode this packet into `out` for the given protocol `version`.
     ///
     /// # Errors
@@ -504,6 +575,38 @@ impl Packet {
         // AUTH does not exist in v3.1.1.
         if version != ProtocolVersion::V5 && matches!(self, Packet::Auth(_)) {
             return Err(CodecError::ProtocolViolation("AUTH is MQTT 5.0 only"));
+        }
+        // The steady-state packets — what the delivery path emits once per
+        // message — take the sized single-pass path: body length computed up
+        // front, then encoded DIRECTLY into `out`. The buffered path below
+        // copied every byte of topic + properties + payload twice per packet
+        // purely to learn the remaining length (issue #445).
+        if let Some(body_len) = self.hot_body_len(version)? {
+            let flags = match self {
+                Packet::Publish(p) => publish_flags(p),
+                Packet::PubRel(_) => 0x02,
+                _ => 0,
+            };
+            let remaining = u32::try_from(body_len)
+                .map_err(|_| CodecError::ValueOutOfRange("remaining length"))?;
+            io::put_u8(out, (self.packet_type().to_nibble() << 4) | flags);
+            varint::encode(remaining, out)?;
+            let start = out.len();
+            match self {
+                Packet::Publish(p) => encode_publish(p, out, version)?,
+                Packet::PubAck(a) | Packet::PubRec(a) | Packet::PubComp(a) | Packet::PubRel(a) => {
+                    encode_ack(a, out, version)?;
+                }
+                Packet::PingReq | Packet::PingResp => {}
+                _ => unreachable!("hot_body_len returned Some for a buffered-path packet"),
+            }
+            debug_assert_eq!(
+                out.len() - start,
+                body_len,
+                "hot_body_len drifted from the encoder for {:?}",
+                self.packet_type()
+            );
+            return Ok(());
         }
         // Build the body separately so we can prefix it with the remaining length.
         let mut body = Vec::new();
@@ -1584,5 +1687,194 @@ mod tests {
     fn ping_decodes_over_v5() {
         let mut buf = BytesMut::from(&[0xC0u8, 0x00][..]); // PINGREQ
         assert_eq!(Packet::decode(&mut buf, V5).unwrap(), Some(Packet::PingReq));
+    }
+
+    // --- the sized single-pass encode path (issue #445) ----------------------
+
+    /// The buffered reference: the algorithm the sized path replaced — body into
+    /// a temporary Vec, then header + remaining-length + copy. The sized path
+    /// must be BYTE-identical to it, not merely round-trippable.
+    fn buffered_reference(p: &Packet, version: ProtocolVersion) -> Vec<u8> {
+        let mut body = Vec::new();
+        let flags = match p {
+            Packet::Publish(pu) => {
+                encode_publish(pu, &mut body, version).unwrap();
+                publish_flags(pu)
+            }
+            Packet::PubAck(a) | Packet::PubRec(a) | Packet::PubComp(a) => {
+                encode_ack(a, &mut body, version).unwrap();
+                0
+            }
+            Packet::PubRel(a) => {
+                encode_ack(a, &mut body, version).unwrap();
+                0x02
+            }
+            Packet::PingReq | Packet::PingResp => 0,
+            other => panic!("not a hot-path packet: {other:?}"),
+        };
+        let mut out = Vec::new();
+        io::put_u8(&mut out, (p.packet_type().to_nibble() << 4) | flags);
+        varint::encode(u32::try_from(body.len()).unwrap(), &mut out).unwrap();
+        out.extend_from_slice(&body);
+        out
+    }
+
+    /// Every hot-path shape × both protocol versions: `QoS` 0/1/2, retain, DUP,
+    /// property mixes (varint sub-ids, strings, binary, user pairs), payloads
+    /// sized to force 1-, 2- and 3-byte remaining-length varints, and the ack
+    /// family with and without reason/properties.
+    #[test]
+    fn sized_encode_is_byte_identical_to_the_buffered_reference() {
+        let props = |v: Vec<Property>| Properties(v);
+        let rich = props(vec![
+            Property::SubscriptionIdentifier(1),
+            Property::SubscriptionIdentifier(268_435_455),
+            Property::MessageExpiryInterval(30),
+            Property::PayloadFormatIndicator(1),
+            Property::ContentType("application/json".into()),
+            Property::ResponseTopic("r/t".into()),
+            Property::CorrelationData(Bytes::from_static(b"\x00id")),
+            Property::UserProperty("k".into(), "v".into()),
+            Property::UserProperty(String::new(), String::new()),
+        ]);
+        let mut corpus: Vec<Packet> = vec![Packet::PingReq, Packet::PingResp];
+        for (qos, pkid) in [
+            (QoS::AtMostOnce, None),
+            (QoS::AtLeastOnce, Some(7)),
+            (QoS::ExactlyOnce, Some(65535)),
+        ] {
+            for payload_len in [0usize, 100, 200_000] {
+                for properties in [Properties::new(), rich.clone()] {
+                    corpus.push(Packet::Publish(Publish {
+                        properties,
+                        dup: payload_len == 100,
+                        qos,
+                        retain: payload_len == 0,
+                        topic: "a/b/c".into(),
+                        pkid,
+                        payload: Bytes::from(vec![0xAB; payload_len]),
+                    }));
+                }
+            }
+        }
+        for reason in [0u8, 0x10, 0x87] {
+            for properties in [
+                Properties::new(),
+                props(vec![Property::ReasonString("why".into())]),
+            ] {
+                let a = Ack {
+                    pkid: 3,
+                    reason,
+                    properties,
+                };
+                corpus.extend([
+                    Packet::PubAck(a.clone()),
+                    Packet::PubRec(a.clone()),
+                    Packet::PubRel(a.clone()),
+                    Packet::PubComp(a),
+                ]);
+            }
+        }
+        for packet in &corpus {
+            for version in [ProtocolVersion::V311, V5] {
+                let mut sized = Vec::new();
+                packet.encode(&mut sized, version).unwrap();
+                assert_eq!(
+                    sized,
+                    buffered_reference(packet, version),
+                    "sized path diverged for {packet:?} over {version:?}"
+                );
+            }
+        }
+    }
+
+    /// A packet that cannot encode must fail BEFORE the fixed header is written:
+    /// the sized path validates while sizing, so `out` stays untouched — the
+    /// property the writer loop depends on to never emit a torn packet.
+    #[test]
+    fn a_failing_publish_leaves_the_output_buffer_untouched() {
+        let bad = [
+            // Topic longer than a u16 length prefix can carry.
+            Packet::Publish(Publish {
+                properties: Properties::new(),
+                dup: false,
+                qos: QoS::AtMostOnce,
+                retain: false,
+                topic: "t".repeat(70_000),
+                pkid: None,
+                payload: Bytes::new(),
+            }),
+            // QoS 0 with a packet id is a protocol violation.
+            Packet::Publish(Publish {
+                properties: Properties::new(),
+                dup: false,
+                qos: QoS::AtMostOnce,
+                retain: false,
+                topic: "t".into(),
+                pkid: Some(1),
+                payload: Bytes::new(),
+            }),
+            // QoS 1 without a packet id is the mirror violation.
+            Packet::Publish(Publish {
+                properties: Properties::new(),
+                dup: false,
+                qos: QoS::AtLeastOnce,
+                retain: false,
+                topic: "t".into(),
+                pkid: None,
+                payload: Bytes::new(),
+            }),
+            // An oversize property value, caught at the sizing pass.
+            Packet::Publish(Publish {
+                properties: Properties(vec![Property::ContentType("c".repeat(70_000))]),
+                dup: false,
+                qos: QoS::AtLeastOnce,
+                retain: false,
+                topic: "t".into(),
+                pkid: Some(1),
+                payload: Bytes::new(),
+            }),
+        ];
+        for packet in bad {
+            let mut out = Vec::new();
+            assert!(packet.encode(&mut out, V5).is_err(), "{packet:?}");
+            assert!(
+                out.is_empty(),
+                "a failed encode left {} bytes behind for {packet:?}",
+                out.len()
+            );
+        }
+    }
+
+    /// The overflow shape the sizing checks above would otherwise wave through:
+    /// a PUBLISH whose body exceeds the varint ceiling of the remaining-length
+    /// field. `u32::try_from(body_len)` alone accepts anything up to `u32::MAX`,
+    /// so without the ceiling check in `hot_body_len` the fixed header would be
+    /// written and only the varint encode would fail — leaving one torn byte in
+    /// `out`. (No `{packet:?}` in the asserts: the payload is 256 MiB.)
+    #[test]
+    fn a_publish_body_over_the_varint_ceiling_leaves_the_buffer_untouched() {
+        // body = 2 (topic length prefix) + 1 (topic "t") + payload; make it
+        // exactly varint::MAX + 1, one past the largest encodable remaining len.
+        let payload_len = varint::MAX as usize + 1 - 3;
+        let packet = Packet::Publish(Publish {
+            properties: Properties::new(),
+            dup: false,
+            qos: QoS::AtMostOnce,
+            retain: false,
+            topic: "t".into(),
+            pkid: None,
+            payload: Bytes::from(vec![0u8; payload_len]),
+        });
+        let mut out = Vec::new();
+        assert!(
+            packet.encode(&mut out, V5).is_err(),
+            "a body past the varint ceiling must fail to encode"
+        );
+        assert!(
+            out.is_empty(),
+            "a failed encode left {} bytes behind",
+            out.len()
+        );
     }
 }

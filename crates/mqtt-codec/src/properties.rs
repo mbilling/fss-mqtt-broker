@@ -157,6 +157,52 @@ impl Property {
         Ok(())
     }
 
+    /// The exact byte length [`encode`](Self::encode) would append — identifier
+    /// byte included — performing the SAME value validations, so a property that
+    /// would fail to encode fails here first, before any caller has written a
+    /// prefix it cannot honour (issue #445).
+    pub(crate) fn encoded_len(&self) -> Result<usize, CodecError> {
+        fn prefixed(len: usize) -> Result<usize, CodecError> {
+            if u16::try_from(len).is_err() {
+                return Err(CodecError::ValueOutOfRange("binary data length"));
+            }
+            Ok(2 + len)
+        }
+        Ok(1 + match self {
+            Property::PayloadFormatIndicator(_)
+            | Property::RequestProblemInformation(_)
+            | Property::RequestResponseInformation(_)
+            | Property::MaximumQoS(_)
+            | Property::RetainAvailable(_)
+            | Property::WildcardSubscriptionAvailable(_)
+            | Property::SubscriptionIdentifierAvailable(_)
+            | Property::SharedSubscriptionAvailable(_) => 1,
+            Property::ServerKeepAlive(_)
+            | Property::ReceiveMaximum(_)
+            | Property::TopicAliasMaximum(_)
+            | Property::TopicAlias(_) => 2,
+            Property::MessageExpiryInterval(_)
+            | Property::SessionExpiryInterval(_)
+            | Property::WillDelayInterval(_)
+            | Property::MaximumPacketSize(_) => 4,
+            Property::SubscriptionIdentifier(v) => {
+                if *v > varint::MAX {
+                    return Err(CodecError::ValueOutOfRange("variable byte integer"));
+                }
+                varint::encoded_len(*v)
+            }
+            Property::ContentType(v)
+            | Property::ResponseTopic(v)
+            | Property::AssignedClientIdentifier(v)
+            | Property::AuthenticationMethod(v)
+            | Property::ResponseInformation(v)
+            | Property::ServerReference(v)
+            | Property::ReasonString(v) => prefixed(v.len())?,
+            Property::CorrelationData(v) | Property::AuthenticationData(v) => prefixed(v.len())?,
+            Property::UserProperty(key, value) => prefixed(key.len())? + prefixed(value.len())?,
+        })
+    }
+
     /// Decode the property with identifier `id`, reading its value from `r`.
     ///
     /// # Errors
@@ -396,16 +442,29 @@ impl Properties {
     /// [`CodecError`] if a property value is out of range, or the block exceeds the
     /// variable-byte-integer maximum.
     pub fn encode(&self, out: &mut Vec<u8>) -> Result<(), CodecError> {
-        // Encode the body first so its length can prefix it.
-        let mut body = Vec::new();
+        // One pass to size, one to write — the temporary body Vec this replaces
+        // copied every property twice (issue #445). Sizing first also front-runs
+        // every value error, so nothing is appended unless the block encodes.
+        let len = self.encoded_body_len()?;
+        let len32 =
+            u32::try_from(len).map_err(|_| CodecError::ValueOutOfRange("properties length"))?;
+        varint::encode(len32, out)?;
+        let start = out.len();
         for property in &self.0 {
-            property.encode(&mut body)?;
+            property.encode(out)?;
         }
-        let len = u32::try_from(body.len())
-            .map_err(|_| CodecError::ValueOutOfRange("properties length"))?;
-        varint::encode(len, out)?;
-        out.extend_from_slice(&body);
+        debug_assert_eq!(
+            out.len() - start,
+            len,
+            "Property::encoded_len drifted from Property::encode"
+        );
         Ok(())
+    }
+
+    /// The byte length of the property block's BODY (the bytes after the length
+    /// prefix), with the same validations encoding performs (issue #445).
+    pub(crate) fn encoded_body_len(&self) -> Result<usize, CodecError> {
+        self.0.iter().try_fold(0, |n, p| Ok(n + p.encoded_len()?))
     }
 
     /// Decode a length-prefixed block from `r`, parsing exactly the declared number
