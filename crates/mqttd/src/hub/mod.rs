@@ -5617,7 +5617,7 @@ impl Hub {
                     .into_iter()
                     .map(|(c, q)| SharedMemberWire {
                         online: self.online.contains_key(&c),
-                        client: c.0,
+                        client: c.0.to_string(),
                         qos: q as u8,
                     })
                     .collect();
@@ -5666,7 +5666,7 @@ impl Hub {
     ) {
         if let Some(peer) = self.peers.get(node) {
             let _ = peer.tx.send(PeerMessage::SharedDeliver {
-                client: client.0.clone(),
+                client: client.0.to_string(),
                 topic: topic.to_string(),
                 payload: payload.to_vec(),
                 qos: qos as u8,
@@ -5700,7 +5700,7 @@ fn forward_frame(p: &PendingPublish, seq: u64, obligation: &ForwardObligation) -
         },
         ForwardKind::Shared { client, qos, .. } => PeerMessage::SharedDeliverAcked {
             seq,
-            client: client.0.clone(),
+            client: client.0.to_string(),
             topic: p.topic.clone(),
             payload: p.payload.to_vec(),
             qos: *qos as u8,
@@ -7048,7 +7048,7 @@ mod tests {
                 };
                 let (reply_tx, reply_rx) = oneshot::channel();
                 tx.send(HubCommand::Attach {
-                    client: ClientId(client),
+                    client: ClientId(client.into()),
                     admission: adm,
                     conn_id,
                     clean_start: true,
@@ -12813,7 +12813,7 @@ mod tests {
         // The durable store already holds the persistent session + subscription
         // (as if it attached and disconnected before this hub's lifetime).
         let store = Arc::new(MemorySessionStore::new());
-        let client = ClientId(mover.clone());
+        let client = ClientId(mover.clone().into());
         store.ensure_session(&client).await.unwrap();
         store
             .set_subscriptions(
@@ -12945,7 +12945,7 @@ mod tests {
             .map(|i| format!("co-mover-{i}"))
             .find(|c| placement.read().unwrap().owner(c) == local)
             .expect("some client is HRW-owned locally");
-        let mover_id = ClientId(mover.clone());
+        let mover_id = ClientId(mover.clone().into());
         let (_mover_rx, _) = attach(&tx, &mover, 1, false).await;
         subscribe(&tx, &mover, "co/t");
         detach(&tx, &mover, 1);
@@ -14864,7 +14864,7 @@ mod tests {
             >,
             client: &ClientId,
         ) {
-            let gate = map.lock().unwrap().get(&client.0).cloned();
+            let gate = map.lock().unwrap().get(client.as_str()).cloned();
             if let Some(mut rx) = gate {
                 while !*rx.borrow() {
                     if rx.changed().await.is_err() {
@@ -14911,7 +14911,7 @@ mod tests {
             message: &mqtt_core::Message,
             expiry_at: Option<u64>,
         ) -> Result<mqtt_storage::Enqueued, mqtt_storage::StorageError> {
-            let gate = self.gates.lock().unwrap().get(&client.0).cloned();
+            let gate = self.gates.lock().unwrap().get(client.as_str()).cloned();
             if let Some(mut rx) = gate {
                 while !*rx.borrow() {
                     if rx.changed().await.is_err() {
@@ -14919,7 +14919,7 @@ mod tests {
                     }
                 }
             }
-            let delay = self.slow_first.lock().unwrap().remove(&client.0);
+            let delay = self.slow_first.lock().unwrap().remove(client.as_str());
             if let Some(delay) = delay {
                 // SETTLE(store-slow-first-enqueue): the delay IS the fault. `slow_first` makes
                 // one enqueue slow so a caller racing it can be observed, and there is nothing
@@ -14933,7 +14933,7 @@ mod tests {
             // backlog entry carries no offset, the one shape the detach spill owes.
             let reject = {
                 let mut m = self.reject_next.lock().unwrap();
-                match m.get_mut(&client.0) {
+                match m.get_mut(client.as_str()) {
                     Some(n) if *n > 0 => {
                         *n -= 1;
                         true
@@ -15040,7 +15040,7 @@ mod tests {
             Self::await_gate(&self.reserve_gates, client).await;
             let out = self.inner.reserve_packet_ids(client, count).await;
             if out.is_ok() {
-                self.log("reserve", client.0.clone());
+                self.log("reserve", client.0.to_string());
             }
             out
         }
@@ -15070,7 +15070,7 @@ mod tests {
         async fn remove(&self, client: &ClientId) -> Result<(), mqtt_storage::StorageError> {
             let out = self.inner.remove(client).await;
             if out.is_ok() {
-                self.log("remove", client.0.clone());
+                self.log("remove", client.0.to_string());
             }
             out
         }

@@ -341,7 +341,7 @@ async fn enqueue_is_durable_across_a_three_node_cluster() {
     .await;
 
     // A persistent client; its group owner is consistent across nodes (HRW).
-    let client = ClientId("durable-session-1".to_string());
+    let client = ClientId::from("durable-session-1");
     let owner = a.placement.read().unwrap().owner(&client.0);
     let owner_node = nodes.iter().find(|n| n.node_id == owner).unwrap();
 
@@ -696,7 +696,7 @@ async fn a_queued_message_is_replayed_to_the_client_after_takeover() {
     // message is guaranteed to survive the owner's loss. (The hub's publish→offline-
     // queue path is covered by unit tests; here we drive the durable queue directly so
     // the failover assertion is deterministic.)
-    let cid = ClientId(client_id.to_string());
+    let cid = ClientId::from(client_id.to_string());
     let msg = Message::new(
         "t".to_string(),
         bytes::Bytes::from_static(b"in-flight"),
@@ -785,7 +785,7 @@ async fn qos2_inbound_dedup_survives_owner_takeover() {
     .await;
 
     let client_id = "failover-qos2-1";
-    let cid = ClientId(client_id.to_string());
+    let cid = ClientId::from(client_id.to_string());
     let owner = a.placement.read().unwrap().owner(client_id);
     let owner_node = nodes.iter().find(|n| n.node_id == owner).unwrap();
 
@@ -875,7 +875,7 @@ async fn a_replica_serves_the_session_after_the_owner_dies() {
     // A persistent client; durably enqueue a message on its owner. A committed
     // enqueue on a three-node group is quorum-durable (owner + ≥1 follower), so the
     // surviving replicas hold it even once the owner is gone.
-    let client = ClientId("takeover-session-1".to_string());
+    let client = ClientId::from("takeover-session-1");
     let owner = a.placement.read().unwrap().owner(&client.0);
     let owner_node = nodes.iter().find(|n| n.node_id == owner).unwrap();
     let msg = Message::new(
@@ -1003,7 +1003,7 @@ async fn a_bounded_voter_cluster_owns_every_session_on_a_voter_and_survives_fail
     // NO session id maps to a learner owner across a large sample. (Under the pre-0049 code
     // ~2/5 of these would own on a learner and be permanently unrecoverable.)
     let sample: Vec<ClientId> = (0..4000)
-        .map(|i| ClientId(format!("bv-sess-{i}")))
+        .map(|i| ClientId::from(format!("bv-sess-{i}")))
         .collect();
     // Wait for genuine cross-node convergence: every node has the 3-voter set plumbed into
     // its ring and agrees ownership is voter-restricted (not just node a in fallback).
@@ -1183,7 +1183,9 @@ async fn the_scale_out_domain_owns_sessions_on_learners_that_serve() {
     // Under the scale-out flag the driver pushes NO voter restriction, so HRW
     // spreads ownership over all three members — some session must own on a
     // learner (under ADR 0049 alone, zero of these could).
-    let sample: Vec<ClientId> = (0..600).map(|i| ClientId(format!("so-sess-{i}"))).collect();
+    let sample: Vec<ClientId> = (0..600)
+        .map(|i| ClientId::from(format!("so-sess-{i}")))
+        .collect();
     wait_until(Duration::from_secs(45), || {
         nodes.iter().all(|n| {
             let p = n.placement.read().unwrap();
@@ -1274,7 +1276,9 @@ async fn growing_the_scaled_out_cluster_migrates_ownership_with_zero_acked_loss(
 
     // Durably enqueue one message per session across a spread of sessions, each
     // committed via its CURRENT owner (retrying through convergence).
-    let sessions: Vec<ClientId> = (0..120).map(|i| ClientId(format!("gs-sess-{i}"))).collect();
+    let sessions: Vec<ClientId> = (0..120)
+        .map(|i| ClientId::from(format!("gs-sess-{i}")))
+        .collect();
     let seed_nodes = [&n1, &n2, &n3];
     for client in &sessions {
         let payload = format!("acked-{}", client.0).into_bytes();
@@ -1356,7 +1360,7 @@ async fn growing_the_scaled_out_cluster_migrates_ownership_with_zero_acked_loss(
             let p = n1.placement.read().unwrap();
             newcomer_ids.contains(&p.owner(&format!("{}-post", cl.0)))
         })
-        .map(|cl| ClientId(format!("{}-post", cl.0)))
+        .map(|cl| ClientId::from(format!("{}-post", cl.0)))
         .expect("some post-grow session hashes to a newcomer");
     let owner = n1.placement.read().unwrap().owner(&fresh.0);
     let node = all.iter().find(|n| n.node_id == owner).unwrap();
@@ -1407,7 +1411,9 @@ async fn pre_grow_history_survives_migration_onto_data_less_newcomers() {
         .await;
     }
 
-    let sessions: Vec<ClientId> = (0..120).map(|i| ClientId(format!("hs-sess-{i}"))).collect();
+    let sessions: Vec<ClientId> = (0..120)
+        .map(|i| ClientId::from(format!("hs-sess-{i}")))
+        .collect();
     let seed_nodes = [&n1, &n2, &n3];
     for client in &sessions {
         let payload = format!("acked-{}", client.0).into_bytes();

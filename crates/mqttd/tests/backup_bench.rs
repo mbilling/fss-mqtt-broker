@@ -93,7 +93,7 @@ async fn export_and_restore_wall_clock_at_stated_fixtures() {
     // ---- fixture ----
     let built = Instant::now();
     for i in 0..n_sessions {
-        let client = ClientId(format!("bench-{i}"));
+        let client = ClientId::from(format!("bench-{i}"));
         sessions
             .claim_session(&client, "bench-principal")
             .await
@@ -170,7 +170,7 @@ async fn export_and_restore_wall_clock_at_stated_fixtures() {
     assert_eq!(restore_report.sessions as usize, n_sessions);
     assert_eq!(restore_report.retained as usize, n_retained);
     assert_eq!(restore_report.queued as usize, n_sessions * n_queued);
-    let probe = ClientId(format!("bench-{}", n_sessions / 2));
+    let probe = ClientId::from(format!("bench-{}", n_sessions / 2));
     let pending = t_sessions.pending(&probe, 0, usize::MAX).await.unwrap();
     assert_eq!(
         pending.len(),

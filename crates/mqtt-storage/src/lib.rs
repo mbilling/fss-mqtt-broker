@@ -1047,7 +1047,7 @@ mod tests {
     use mqtt_core::{ClientId, Message, QoS};
 
     fn cid(s: &str) -> ClientId {
-        ClientId(s.to_string())
+        ClientId(s.into())
     }
 
     /// Offset of a `Stored` outcome; panics on `Rejected` (the tests that expect

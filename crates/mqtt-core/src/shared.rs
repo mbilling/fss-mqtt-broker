@@ -168,7 +168,7 @@ mod tests {
     use crate::{ClientId, QoS};
 
     fn cid(s: &str) -> ClientId {
-        ClientId(s.to_string())
+        ClientId(s.into())
     }
 
     /// Member client ids of the single group matching `topic`, sorted.
@@ -177,7 +177,7 @@ mod tests {
         assert!(groups.len() <= 1, "tests use one matching group");
         let mut ids: Vec<String> = groups
             .first()
-            .map(|g| g.members.iter().map(|(c, _)| c.0.clone()).collect())
+            .map(|g| g.members.iter().map(|(c, _)| c.0.to_string()).collect())
             .unwrap_or_default();
         ids.sort();
         ids
@@ -260,7 +260,7 @@ mod tests {
         let mut ids: Vec<String> = t
             .matching("t")
             .iter()
-            .flat_map(|g| g.members.iter().map(|(c, _)| c.0.clone()))
+            .flat_map(|g| g.members.iter().map(|(c, _)| c.0.to_string()))
             .collect();
         ids.sort();
         assert_eq!(ids, vec!["a", "b"], "both groups match");
