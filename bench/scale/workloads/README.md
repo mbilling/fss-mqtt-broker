@@ -37,6 +37,14 @@ LANE_B_PUBS_OVERRIDE=200000 LANE_B_RUNGS_OVERRIDE=200000 \
 LANE_C_CONNS=200000 LANE_C_RAMP=5000 ./run-workload.sh smart-home 5
 ```
 
+**A note on the mTLS reference rung.** `run.sh full` runs one extra rung per size
+in the mTLS posture (ADR 0048 §3: disclose both postures without paying for the
+ladder twice). It is a rung like any other, so it must divide `LANE_B_PUBS*1000`
+into an integer `-I` — and it must *suit the shape*: the rig default (50 000) is a
+sane publish rate for fan-in but 50 000 x subscribers under fan-out. Workloads set
+`LANE_B_REF_RUNG` accordingly. **Validate a new workload under the profile you will
+run it with** (`full`, not `STANDARD=1`) or the ref rung is not checked.
+
 ## Reading the result
 
 Use **TPS = received + sent**, from the brokers' own counters
