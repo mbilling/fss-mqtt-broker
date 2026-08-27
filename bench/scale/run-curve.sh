@@ -248,12 +248,21 @@ LANE_D_CONNECT_RATE="${LANE_D_CONNECT_RATE:-500}"
 # consecutive flat polls end the drain. Two is deliberate — one flat poll can
 # land inside a scrape gap and end the measurement early.
 LANE_D_POLL="${LANE_D_POLL:-5}"
+# The subscriber containers expose their counters on a REST port, and the resume
+# phase restarts them under the SAME names. On the first hardware run the
+# resumed container lost the race to rebind the attach phase's port and died
+# with `eaddrinuse` — it drained its share correctly but reported nothing, and
+# the lane silently counted that container as ZERO (nodes=5, reported 75%
+# complete when the true figure was 100.6%). Attach and resume now use disjoint
+# ranges so a lingering socket cannot collide.
+LANE_D_PORT_ATTACH="${LANE_D_PORT_ATTACH:-9300}"
+LANE_D_PORT_RESUME="${LANE_D_PORT_RESUME:-9340}"
 # CPU during the drain is sampled for a BOUNDED window, not the whole budget:
 # stop_cpu_sampling *waits* for mpstat rather than killing it, so a 180s budget
 # would idle for ~3 minutes after a 20s drain. 30s covers the peak of any drain
 # this lane produces; the file is named for what it is (the first 30s).
 LANE_D_DRAIN_SAMPLE="${LANE_D_DRAIN_SAMPLE:-30}"
-LANE_D_FLAT_POLLS="${LANE_D_FLAT_POLLS:-2}"
+LANE_D_FLAT_POLLS="${LANE_D_FLAT_POLLS:-3}"
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 brokers_csv() { # brokers_csv <suffix-jq> — comma list over brokers
@@ -742,6 +751,7 @@ lane_b_rung() { # lane_b_rung <total-rate> <posture:plain|mtls>
 	local -a subs pubs scrape stop names
 	for ((di = 0; di < D; di++)); do
 		subs[di]="set -e"$'\n'
+		resumes[di]="set -e"$'\n'
 		pubs[di]="set -e"$'\n'
 		scrape[di]=""
 		stop[di]=""
@@ -895,9 +905,10 @@ lane_d() {
 	local -a HOSTS
 	IFS=, read -r -a HOSTS <<<"$(brokers_csv '.private_ip')"
 	local di j seq_base hosts rot i
-	local -a subs pubs scrape pscrape stopsub stoppub subnames pubnames
+	local -a subs resumes pubs scrape pscrape stopsub stoppub subnames pubnames
 	for ((di = 0; di < D; di++)); do
 		subs[di]="set -e"$'\n'
+		resumes[di]="set -e"$'\n'
 		pubs[di]="set -e"$'\n'
 		scrape[di]="" pscrape[di]="" stopsub[di]="" stoppub[di]="" subnames[di]="" pubnames[di]=""
 		for ((j = 0; j < C; j++)); do
@@ -908,8 +919,11 @@ lane_d() {
 			hosts="${hosts%,}"
 			# The three flags that make a session outlive its connection, plus the
 			# deterministic id that lets the SAME session be resumed later.
-			subs[di]+="$DOCKER_RUN --name dsub-$di-$j $BENCH_IMG sub -h $hosts -p 1883 -c $per -R $LANE_D_CONNECT_RATE -t 'bench/%i' -q $LANE_D_QOS -n $seq_base -C false -x $LANE_D_EXPIRY --prefix dsub-$di-$j -A true --prometheus --restapi $((9300 + j)) >/dev/null"$'\n'
-			scrape[di]+="printf '\\n@@@ dsub-$di-$j\\n'; curl -s http://localhost:$((9300 + j))/metrics"$'\n'
+			# identical flags EXCEPT the REST port, so the resumed container reattaches
+			# to the same sessions (same client ids) without fighting for the same socket
+			subs[di]+="$DOCKER_RUN --name dsub-$di-$j $BENCH_IMG sub -h $hosts -p 1883 -c $per -R $LANE_D_CONNECT_RATE -t 'bench/%i' -q $LANE_D_QOS -n $seq_base -C false -x $LANE_D_EXPIRY --prefix dsub-$di-$j -A true --prometheus --restapi $((LANE_D_PORT_ATTACH + j)) >/dev/null"$'\n'
+			resumes[di]+="$DOCKER_RUN --name dsub-$di-$j $BENCH_IMG sub -h $hosts -p 1883 -c $per -R $LANE_D_CONNECT_RATE -t 'bench/%i' -q $LANE_D_QOS -n $seq_base -C false -x $LANE_D_EXPIRY --prefix dsub-$di-$j -A true --prometheus --restapi $((LANE_D_PORT_RESUME + j)) >/dev/null"$'\n'
+			scrape[di]+="printf '\\n@@@ dsub-$di-$j\\n'; curl -s http://localhost:$((LANE_D_PORT_RESUME + j))/metrics"$'\n'
 			stopsub[di]+="printf '\\n@@@ dsub-$di-$j\\n'; docker logs dsub-$di-$j 2>&1"$'\n'
 			subnames[di]+=" dsub-$di-$j"
 			pubs[di]+="$DOCKER_RUN --name dpub-$di-$j $BENCH_IMG pub -h $hosts -p 1883 -c $per -R $LANE_D_CONNECT_RATE -t 'bench/%i' -q $LANE_D_QOS -s $LANE_D_PAYLOAD -n $seq_base -I $interval -A true --prometheus --restapi $((9400 + j)) >/dev/null"$'\n'
@@ -990,7 +1004,7 @@ lane_d() {
 	say "  [D] resuming the same sessions; draining (budget ${LANE_D_DRAIN_SECS}s)"
 	local t0 elapsed last=-1 flat=0 total=0
 	t0=$(date +%s)
-	fan "resuming subscribers" "${subs[@]}"
+	fan "resuming subscribers" "${resumes[@]}"
 	start_cpu_sampling "$ddir/cpu-drain-first-${LANE_D_DRAIN_SAMPLE}s" "$LANE_D_DRAIN_SAMPLE"
 	echo -e "elapsed_s\trecv_total" >"$ddir/drain.tsv"
 	while :; do
@@ -1046,7 +1060,27 @@ lane_d() {
 	# drain to within QoS 1's at-least-once redelivery (+89, 0.05%).
 	dropped=$(($(sum_metric filled mqttd_publish_dropped_total) - $(sum_metric offline mqttd_publish_dropped_total)))
 	local accepted=$((fill_recv - off_recv))
-	drained=$(awk 'END{print $2 + 0}' "$ddir/drain.tsv")
+	# The authoritative drained total comes from the CONTAINERS' OWN LOGS, never
+	# from the REST scrape. A container whose REST endpoint fails to bind still
+	# drains its share correctly and still logs its counters — but the scrape
+	# returns nothing for it and the sum silently treats it as ZERO. That is
+	# exactly how the first hardware run reported nodes=5 as 75% complete when the
+	# true figure was 100.6%: three containers scraped, the fourth invisible.
+	# The scrape still drives the drain LOOP (it is the only thing readable while
+	# the containers run); it just no longer decides the number.
+	local logged_total=0 logged_n=0 lf lv
+	for lf in "$ddir"/dsub-*-drain.log; do
+		[ -f "$lf" ] || continue
+		logged_n=$((logged_n + 1))
+		lv=$(grep -oE 'recv total=[0-9]+' "$lf" 2>/dev/null | tail -1 | grep -oE '[0-9]+$')
+		logged_total=$((logged_total + ${lv:-0}))
+		grep -q eaddrinuse "$lf" 2>/dev/null &&
+			warn "lane D: $(basename "$lf" -drain.log) could not bind its REST port (eaddrinuse); its counters came from the container log instead"
+	done
+	local expect_c=$((D * C))
+	[ "$logged_n" -eq "$expect_c" ] ||
+		warn "lane D: only $logged_n of $expect_c subscriber logs were captured — the drained total is INCOMPLETE and its percentage must not be read as completeness"
+	drained="$logged_total"
 	local pct=0
 	[ "$accepted" -gt 0 ] && pct=$((drained * 100 / accepted))
 	local rate=0
@@ -1058,7 +1092,7 @@ lane_d() {
 		echo "  accepted while offline    $accepted msgs (broker received delta over the ${LANE_D_OFFLINE_SECS}s window)"
 		echo "  dropped while offline     $dropped msgs (see metrics-filled-*.prom for reason labels)"
 		echo "  backlog held at resume    $((accepted - dropped)) msgs (inferred — see note below)"
-		echo "  drained after resume      $drained msgs (${pct}% of accepted)"
+		echo "  drained after resume      $drained msgs (${pct}% of accepted, from $logged_n/$expect_c container logs)"
 		echo "  drain time                ${drain_secs}s  (~${rate} msg/s)"
 		echo
 		echo "  A gap between accepted and drained is only a DEFECT if 'dropped' does"
