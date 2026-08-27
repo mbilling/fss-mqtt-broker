@@ -4363,6 +4363,21 @@ impl Hub {
         self.session_expiry.contains_key(client)
     }
 
+    /// Whether this node has already materialized `client`'s routing state.
+    ///
+    /// **Presence, deliberately — never non-emptiness.** `unsubscribe` removes a
+    /// filter from the inner map but does NOT prune the outer key, unlike `sub_ids`,
+    /// `no_local` and `retain_as_published` three lines below it, which do. So a
+    /// client that has unsubscribed from everything still answers `true` here, and
+    /// that is the intended answer: its session is known to this node.
+    ///
+    /// Reading this as `!is_empty()` inverts it for exactly that client, and the
+    /// inherited-session scan would then re-subscribe its stale durable filters and
+    /// stamp `session_expiry = u32::MAX` over a session that deliberately holds none.
+    fn has_materialized_subs(&self, client: &ClientId) -> bool {
+        self.subs_by_client.contains_key(client)
+    }
+
     /// Discard a session entirely: routing subscriptions, in-flight state, the stored
     /// queue/metadata, and all expiry bookkeeping. Used by a zero-expiry disconnect
     /// and the expiry sweep (Clean Start has its own lane-serialized path in
@@ -4661,10 +4676,10 @@ impl Hub {
             debug!(
                 client = %client.0,
                 subs = subs.len(),
-                known = self.subs_by_client.contains_key(&client),
+                known = self.has_materialized_subs(&client),
                 "inherited-session scan: owned offline session"
             );
-            if subs.is_empty() || self.subs_by_client.contains_key(&client) {
+            if subs.is_empty() || self.has_materialized_subs(&client) {
                 continue; // nothing to route, or already materialized
             }
             for sub in subs {
