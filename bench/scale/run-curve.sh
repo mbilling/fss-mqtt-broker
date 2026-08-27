@@ -72,7 +72,7 @@ elif [ "${STANDARD:-0}" = 1 ]; then
 	LANE_C_CONNS=50000
 	LANE_C_RAMP=2500
 	LANE_C_HOLD=120
-	LANE_D_SESSIONS=1920
+	LANE_D_SESSIONS=1680
 	LANE_D_OFFLINE_SECS=30
 	LANE_D_DRAIN_SECS=120
 else
@@ -81,7 +81,7 @@ else
 	LANE_C_CONNS=50000
 	LANE_C_RAMP=2500
 	LANE_C_HOLD=120
-	LANE_D_SESSIONS=1920
+	LANE_D_SESSIONS=1680
 	LANE_D_OFFLINE_SECS=40
 	LANE_D_DRAIN_SECS=180
 	A_REPS=3 A_SECS=60 A_WARMUP=10
@@ -467,6 +467,9 @@ lane_d_shape() {
 	[ $((LANE_D_SESSIONS % slots)) -eq 0 ] ||
 		die "lane D: $LANE_D_SESSIONS sessions do not split evenly over $slots containers ($D drivers x $LANE_D_CONTAINERS) — a floored split runs fewer sessions than the label"
 	local per=$((LANE_D_SESSIONS / slots))
+	# 420 per container (the shipped 1680) is 4 x 105, which divides 1, 3, 5, 7 and
+	# 10 — every size this rig documents. A population that divides only some of
+	# them fails here at the first size it does not, mid-campaign.
 	[ $((per % N)) -eq 0 ] ||
 		die "lane D: $per sessions per container do not split evenly over $N brokers — ownership would be lopsided and the resume phase unattributable"
 	[ $((LANE_D_SESSIONS * 1000 % LANE_D_RATE)) -eq 0 ] ||
