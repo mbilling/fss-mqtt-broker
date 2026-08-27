@@ -1032,11 +1032,18 @@ lane_d() {
 		cat "$ddir"/metrics-"$1"-broker*.prom 2>/dev/null |
 			awk -v m="$2" '$1 == m || index($1, m "{") == 1 {s += $2} END{print s + 0}'
 	}
-	local off_recv fill_recv drained queued_bytes dropped sessions_off
+	local off_recv fill_recv drained dropped sessions_off
 	off_recv=$(sum_metric offline mqttd_publish_received_total)
 	fill_recv=$(sum_metric filled mqttd_publish_received_total)
 	sessions_off=$(sum_metric offline mqttd_sessions)
-	queued_bytes=$(sum_metric filled mqttd_backlog_bytes)
+	# NOT mqttd_backlog_bytes: that gauge is the per-connection OUTBOUND backlog,
+	# so it reads 0 exactly when every session is offline — which is this lane's
+	# whole measurement window. No metric exposes offline-queue depth (mqttd_sessions
+	# counts sessions, nothing counts what is queued inside them), so the held
+	# backlog is INFERRED: everything accepted for offline sessions that no one has
+	# received yet. Verified against the first hardware run (nodes=1, 2026-08-27):
+	# 163097 accepted, 0 dropped, 163186 drained — the inferred backlog matched the
+	# drain to within QoS 1's at-least-once redelivery (+89, 0.05%).
 	dropped=$(($(sum_metric filled mqttd_publish_dropped_total) - $(sum_metric offline mqttd_publish_dropped_total)))
 	local accepted=$((fill_recv - off_recv))
 	drained=$(awk 'END{print $2 + 0}' "$ddir/drain.tsv")
@@ -1050,13 +1057,18 @@ lane_d() {
 		echo "  sessions held offline     $sessions_off (of $LANE_D_SESSIONS attached)"
 		echo "  accepted while offline    $accepted msgs (broker received delta over the ${LANE_D_OFFLINE_SECS}s window)"
 		echo "  dropped while offline     $dropped msgs (see metrics-filled-*.prom for reason labels)"
-		echo "  backlog at resume         $queued_bytes bytes"
+		echo "  backlog held at resume    $((accepted - dropped)) msgs (inferred — see note below)"
 		echo "  drained after resume      $drained msgs (${pct}% of accepted)"
 		echo "  drain time                ${drain_secs}s  (~${rate} msg/s)"
 		echo
 		echo "  A gap between accepted and drained is only a DEFECT if 'dropped' does"
 		echo "  not explain it: an over-cap queue is a disclosed bound (ADR 0001 §6),"
-		echo "  a silent loss is not."
+		echo "  a silent loss is not. Drained may also EXCEED accepted by a small"
+		echo "  margin: QoS 1 is at-least-once, so a session resuming with unacked"
+		echo "  messages in flight is entitled to see them again."
+		echo
+		echo "  'backlog held' is inferred, not read: no broker metric exposes the"
+		echo "  depth of an offline session's queue."
 	} | tee "$ddir/summary.txt" >&2
 	say "  lane D done -> $ddir"
 }
