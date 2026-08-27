@@ -4231,7 +4231,7 @@ mod tests {
             &self,
             _id: &mqtt_auth::Identity,
             _client: &mqtt_core::ClientId,
-            _f: &mqtt_core::TopicFilter,
+            _f: &str,
         ) -> bool {
             true
         }

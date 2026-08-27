@@ -3237,7 +3237,8 @@ impl Hub {
                 self.shared
                     .subscribe(client.clone(), group, filter, s.max_qos);
             } else {
-                self.table.subscribe(client.clone(), s.filter.clone());
+                let key = self.table.intern(&s.filter);
+                self.table.subscribe(client.clone(), key);
             }
             if let Some(id) = s.sub_id {
                 // Restored session state (issue #266, §4.1): the id survives
@@ -3689,7 +3690,8 @@ impl Hub {
             debug!(client = %client.0, filter = %f, qos = *q as u8, "subscribe");
             ordinary_granted = true;
             let already_held = prior.as_ref().is_some_and(|m| m.contains_key(f));
-            self.table.subscribe(client.clone(), f.clone());
+            let key = self.table.intern(f);
+            self.table.subscribe(client.clone(), key);
             // Retain Handling (#198, MQTT 5 §3.8.3.1): 0 = send retained at subscribe
             // (default), 1 = send only if this subscription did not already exist, 2 = never.
             // A re-forwarder (the bridge) uses 2 to avoid a replay storm on reconnect.
@@ -3754,7 +3756,8 @@ impl Hub {
                     if let Some((group, filter)) = parse_shared(f) {
                         self.shared.subscribe(client.clone(), group, filter, *q);
                     } else {
-                        self.table.subscribe(client.clone(), f.clone());
+                        let key = self.table.intern(f);
+                        self.table.subscribe(client.clone(), key);
                     }
                 }
                 self.subs_by_client.insert(client.clone(), prior);
@@ -4669,7 +4672,8 @@ impl Hub {
                     self.shared
                         .subscribe(client.clone(), group, filter, sub.max_qos);
                 } else {
-                    self.table.subscribe(client.clone(), sub.filter.clone());
+                    let key = self.table.intern(&sub.filter);
+                    self.table.subscribe(client.clone(), key);
                 }
                 self.subs_by_client
                     .entry(client.clone())
@@ -7013,7 +7017,7 @@ mod tests {
             fn authorize_publish(&self, _: &Identity, _: &ClientId, _: &String) -> bool {
                 true
             }
-            fn authorize_subscribe(&self, _: &Identity, _: &ClientId, _: &String) -> bool {
+            fn authorize_subscribe(&self, _: &Identity, _: &ClientId, _: &str) -> bool {
                 true
             }
             fn authorize_connect(&self, identity: &Identity, _: &ClientId) -> bool {
@@ -7140,7 +7144,7 @@ mod tests {
             fn authorize_publish(&self, _: &Identity, _: &ClientId, _: &String) -> bool {
                 true
             }
-            fn authorize_subscribe(&self, _: &Identity, _: &ClientId, filter: &String) -> bool {
+            fn authorize_subscribe(&self, _: &Identity, _: &ClientId, filter: &str) -> bool {
                 !filter.starts_with("secret/")
             }
         }
@@ -7197,7 +7201,7 @@ mod tests {
             fn authorize_publish(&self, _: &Identity, _: &ClientId, _: &String) -> bool {
                 true
             }
-            fn authorize_subscribe(&self, _: &Identity, _: &ClientId, filter: &String) -> bool {
+            fn authorize_subscribe(&self, _: &Identity, _: &ClientId, filter: &str) -> bool {
                 !filter.starts_with("secret/")
             }
         }
