@@ -1,6 +1,6 @@
 # Audit export schema
 
-**Verified against `v1.0.9` + ADR 0066 T3 (2026-08-26).** The contract a SIEM
+**Verified against `v1.0.10` + ADR 0066 T3 (2026-08-27).** The contract a SIEM
 parser is written against: the record format, the complete kind vocabulary, the
 boundary invariants, the delivery semantics, and the verification procedure.
 Stability promise: **fields and semantics below are frozen; new `kind` values
