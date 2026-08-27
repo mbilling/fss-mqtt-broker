@@ -23,7 +23,7 @@
 //! wildcard in their first level and behave as literals here, exactly as they
 //! did under the linear scan.
 
-use crate::{ClientId, TopicFilter};
+use crate::{ClientId, FilterKey, TopicFilter};
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 
@@ -32,9 +32,10 @@ use std::collections::{HashMap, HashSet};
 #[derive(Debug, Default)]
 struct TrieNode {
     children: HashMap<String, TrieNode>,
-    /// Set when a registered filter ends at this node: the filter string itself,
-    /// which is the key back into `by_filter`.
-    terminal: Option<TopicFilter>,
+    /// Set when a registered filter ends at this node: **the same allocation**
+    /// `by_filter` is keyed by, not a copy of it. This used to be an owned
+    /// `String`, so every distinct filter was stored twice.
+    terminal: Option<FilterKey>,
 }
 
 impl Drop for TrieNode {
@@ -52,12 +53,13 @@ impl Drop for TrieNode {
     }
 }
 
-fn trie_insert(root: &mut TrieNode, filter: &str) {
+fn trie_insert(root: &mut TrieNode, filter: &FilterKey) {
     let mut node = root;
     for level in filter.split('/') {
         node = node.children.entry(level.to_string()).or_default();
     }
-    node.terminal = Some(filter.to_string());
+    // Share the caller's allocation rather than copying the filter a second time.
+    node.terminal = Some(FilterKey::clone(filter));
 }
 
 /// Remove `filter`'s terminal and prune the trailing chain of nodes it leaves
@@ -111,7 +113,7 @@ fn trie_remove(root: &mut TrieNode, filter: &str) {
 /// Maps topic filters to the set of clients subscribed to each.
 #[derive(Debug, Default)]
 pub struct SubscriptionTable {
-    by_filter: HashMap<TopicFilter, HashSet<ClientId>>,
+    by_filter: HashMap<FilterKey, HashSet<ClientId>>,
     root: TrieNode,
 }
 
@@ -123,7 +125,11 @@ impl SubscriptionTable {
     }
 
     /// Record that `client` is subscribed to `filter`. Idempotent.
-    pub fn subscribe(&mut self, client: ClientId, filter: TopicFilter) {
+    ///
+    /// Takes an owned [`FilterKey`]: pass [`intern`](Self::intern)'s result so the
+    /// table, the trie terminal and the caller's own per-client bookkeeping all
+    /// share one allocation.
+    pub fn subscribe(&mut self, client: ClientId, filter: FilterKey) {
         match self.by_filter.entry(filter) {
             Entry::Vacant(v) => {
                 trie_insert(&mut self.root, v.key());
@@ -148,7 +154,7 @@ impl SubscriptionTable {
 
     /// Remove all of `client`'s subscriptions (called on disconnect).
     pub fn remove_client(&mut self, client: &ClientId) {
-        let mut emptied: Vec<TopicFilter> = Vec::new();
+        let mut emptied: Vec<FilterKey> = Vec::new();
         self.by_filter.retain(|filter, clients| {
             clients.remove(client);
             if clients.is_empty() {
@@ -166,7 +172,7 @@ impl SubscriptionTable {
     /// Every registered filter matching `topic`, via one walk of the topic's
     /// levels. The callback may fire in any order and each filter at most once
     /// (a filter is one trie path).
-    fn for_each_matching_filter<'a>(&'a self, topic: &str, mut cb: impl FnMut(&'a TopicFilter)) {
+    fn for_each_matching_filter<'a>(&'a self, topic: &str, mut cb: impl FnMut(&'a FilterKey)) {
         let levels: Vec<&str> = topic.split('/').collect();
         // [MQTT-4.7.2-1]: a filter whose FIRST level is a wildcard never matches a
         // `$`-rooted topic. Deeper levels are unaffected, so the skip applies to
@@ -232,16 +238,38 @@ impl SubscriptionTable {
     /// All distinct topic filters with at least one subscriber.
     ///
     /// Used to build the interest snapshot a node gossips to its cluster peers.
+    ///
+    /// `String::from(&**k)`, deliberately, not `k.to_string()`: `Arc<str>` has no
+    /// `ToString` specialization, so `to_string` formats through `Formatter::pad`
+    /// instead of copying the bytes. This runs on every SUBSCRIBE and UNSUBSCRIBE
+    /// via the interest gossip, so the difference is not academic.
     #[must_use]
     pub fn filters(&self) -> Vec<TopicFilter> {
-        self.by_filter.keys().cloned().collect()
+        self.by_filter.keys().map(|k| String::from(&**k)).collect()
+    }
+
+    /// The canonical [`FilterKey`] for `filter` — the existing allocation if this
+    /// table already holds the filter, otherwise a fresh one.
+    ///
+    /// Callers should intern **before** [`subscribe`](Self::subscribe) and reuse the
+    /// result for their own per-client bookkeeping, so one filter is one allocation
+    /// no matter how many clients subscribe to it.
+    ///
+    /// Best-effort by construction: a filter interned while its last subscriber is
+    /// being removed yields a new `Arc`. Equality is therefore always by value —
+    /// never `Arc::ptr_eq`.
+    #[must_use]
+    pub fn intern(&self, filter: &str) -> FilterKey {
+        self.by_filter
+            .get_key_value(filter)
+            .map_or_else(|| FilterKey::from(filter), |(k, _)| FilterKey::clone(k))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::SubscriptionTable;
-    use crate::{topic_matches, valid_filter, ClientId};
+    use crate::{topic_matches, valid_filter, ClientId, FilterKey};
     use std::collections::HashSet;
 
     fn cid(s: &str) -> ClientId {
@@ -374,8 +402,8 @@ mod tests {
     fn deep_filter_teardown_stays_iterative() {
         let deep = vec!["a"; 100_000].join("/");
         let mut t = SubscriptionTable::new();
-        t.subscribe(cid("x"), deep.clone());
-        t.subscribe(cid("y"), deep.clone());
+        t.subscribe(cid("x"), deep.as_str().into());
+        t.subscribe(cid("y"), deep.as_str().into());
         assert_eq!(
             t.matching_clients(&deep),
             HashSet::from([cid("x"), cid("y")])
@@ -445,8 +473,8 @@ mod tests {
         // state is still "c{i} gone iff i%3==0, everyone gone iff i%5==0", which
         // the reference loop reconstructs.
         for (i, f) in filters.iter().enumerate() {
-            table.subscribe(cid(&format!("c{i}")), f.clone());
-            table.subscribe(cid("everyone"), f.clone());
+            table.subscribe(cid(&format!("c{i}")), f.as_str().into());
+            table.subscribe(cid("everyone"), f.as_str().into());
             if i % 3 == 0 {
                 table.remove_client(&cid(&format!("c{i}")));
             }
@@ -484,5 +512,49 @@ mod tests {
         assert!(t.matching_clients("x/y/z").is_empty());
         t.subscribe(cid("b"), "x/+/z".into());
         assert_eq!(t.matching_clients("x/y/z"), HashSet::from([cid("b")]));
+    }
+
+    /// The point of interning: one distinct filter is ONE allocation, shared by the
+    /// table's key and the trie's terminal, no matter how many clients subscribe.
+    ///
+    /// `ptr_eq` is the right tool *here* — this asserts sharing, not equality. Callers
+    /// must still compare filters by value (see [`FilterKey`]).
+    #[test]
+    fn a_distinct_filter_is_allocated_once_however_many_subscribers() {
+        let mut t = SubscriptionTable::new();
+        let k = t.intern("sensors/+/temp");
+        t.subscribe(cid("a"), FilterKey::clone(&k));
+
+        // The table already holds it, so a second subscriber gets the SAME allocation
+        // rather than minting another.
+        let k2 = t.intern("sensors/+/temp");
+        assert!(
+            FilterKey::ptr_eq(&k, &k2),
+            "intern handed back a copy instead of the stored allocation"
+        );
+        t.subscribe(cid("b"), k2);
+
+        // Our handle + the by_filter key + the trie terminal. Before interning, the
+        // terminal was an independent String, so this was 2, not 3.
+        assert_eq!(
+            FilterKey::strong_count(&k),
+            3,
+            "expected the by_filter key and the trie terminal to share one allocation"
+        );
+
+        assert_eq!(
+            t.matching_clients("sensors/kitchen/temp"),
+            HashSet::from([cid("a"), cid("b")]),
+            "interning must not change matching"
+        );
+
+        // And the allocation is released when the last subscriber goes.
+        t.unsubscribe(&cid("a"), "sensors/+/temp");
+        t.unsubscribe(&cid("b"), "sensors/+/temp");
+        assert_eq!(
+            FilterKey::strong_count(&k),
+            1,
+            "table and trie must both drop their handle on the last unsubscribe"
+        );
     }
 }

@@ -40,6 +40,20 @@ pub type TopicName = String;
 /// A topic filter that may contain `+` (single level) or `#` (multi level) wildcards.
 pub type TopicFilter = String;
 
+/// An **interned** topic filter: one allocation per distinct filter, shared by the
+/// subscription table's key, the match trie's terminal, and every per-client
+/// subscription record that names it.
+///
+/// The same reasoning as [`ClientId`] (issue #446), applied to the other string the
+/// hot path clones constantly. A filter previously cost one `String` in `by_filter`,
+/// a second in the trie terminal, and one more per subscribing client; at fleet scale
+/// — millions of devices on a handful of filter shapes — those copies dominate.
+///
+/// **Never compare these with `Arc::ptr_eq`.** Interning is best-effort: two `Arc`s
+/// with equal contents can legitimately coexist (a filter re-interned while the last
+/// subscriber was being removed), so equality is always by value.
+pub type FilterKey = std::sync::Arc<str>;
+
 /// Stable identifier for a connected client.
 ///
 /// Interned as `Arc<str>` (issue #446): the id is cloned on nearly every hot-path
