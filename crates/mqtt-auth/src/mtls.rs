@@ -484,13 +484,10 @@ mod tests {
             &policy,
             &id,
             &client,
-            &"dev/spiffe:/trust.example/ns/prod/sa/device/#".to_string()
+            "dev/spiffe:/trust.example/ns/prod/sa/device/#"
         ));
         assert!(!crate::Authorizer::authorize_subscribe(
-            &policy,
-            &id,
-            &client,
-            &"dev/+/#".to_string()
+            &policy, &id, &client, "dev/+/#"
         ));
     }
 

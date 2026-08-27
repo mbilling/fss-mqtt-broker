@@ -20,7 +20,7 @@ pub mod token;
 
 pub use enhanced::{AuthSession, AuthStep, EnhancedAuthenticator, HmacChallengeAuthenticator};
 
-use mqtt_core::{ClientId, TopicFilter, TopicName};
+use mqtt_core::{ClientId, TopicName};
 
 /// An authenticated principal's identity within the broker.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -142,12 +142,7 @@ pub trait Authorizer: Send + Sync {
         topic: &TopicName,
     ) -> bool;
     /// Returns `true` if subscribing to `filter` is permitted.
-    fn authorize_subscribe(
-        &self,
-        identity: &Identity,
-        client_id: &ClientId,
-        filter: &TopicFilter,
-    ) -> bool;
+    fn authorize_subscribe(&self, identity: &Identity, client_id: &ClientId, filter: &str) -> bool;
 
     /// Returns `true` if `identity` may connect with `client_id` (ADR 0031 option B — the
     /// optional connect ACL that constrains *which* client ids an identity may claim, e.g. a
@@ -171,7 +166,7 @@ impl Authorizer for AllowAll {
     fn authorize_publish(&self, _id: &Identity, _client: &ClientId, _topic: &TopicName) -> bool {
         true
     }
-    fn authorize_subscribe(&self, _id: &Identity, _client: &ClientId, _f: &TopicFilter) -> bool {
+    fn authorize_subscribe(&self, _id: &Identity, _client: &ClientId, _f: &str) -> bool {
         true
     }
 }
@@ -184,7 +179,7 @@ impl Authorizer for DenyAll {
     fn authorize_publish(&self, _id: &Identity, _client: &ClientId, _topic: &TopicName) -> bool {
         false
     }
-    fn authorize_subscribe(&self, _id: &Identity, _client: &ClientId, _f: &TopicFilter) -> bool {
+    fn authorize_subscribe(&self, _id: &Identity, _client: &ClientId, _f: &str) -> bool {
         false
     }
 }
@@ -202,7 +197,7 @@ mod tests {
         let z = DenyAll;
         let c = ClientId("c".into());
         assert!(!z.authorize_publish(&id, &c, &"a/b".to_string()));
-        assert!(!z.authorize_subscribe(&id, &c, &"a/#".to_string()));
+        assert!(!z.authorize_subscribe(&id, &c, "a/#"));
     }
 
     /// The allow path through the trait object: a custom policy can grant
@@ -215,8 +210,12 @@ mod tests {
             fn authorize_publish(&self, id: &Identity, c: &ClientId, topic: &TopicName) -> bool {
                 topic.starts_with(&format!("users/{}/{}/", id.subject, c.0))
             }
-            fn authorize_subscribe(&self, id: &Identity, c: &ClientId, f: &TopicFilter) -> bool {
-                id.groups.iter().any(|g| g == "readers") || self.authorize_publish(id, c, f)
+            fn authorize_subscribe(&self, id: &Identity, c: &ClientId, f: &str) -> bool {
+                // `authorize_publish` still takes `&TopicName` (`&String`): topic NAMES are
+                // not interned, only filters are, so only this trait's filter parameter
+                // widened to `&str`. This is a test policy, so the allocation is free.
+                id.groups.iter().any(|g| g == "readers")
+                    || self.authorize_publish(id, c, &f.to_string())
             }
         }
 
@@ -237,7 +236,7 @@ mod tests {
         // Both halves of the principal bind independently: the right identity on the
         // wrong session handle is refused just as the wrong identity is.
         assert!(!z.authorize_publish(&alice, &phone, &"users/alice/laptop/state".to_string()));
-        assert!(z.authorize_subscribe(&reader, &laptop, &"anything/#".to_string()));
-        assert!(!z.authorize_subscribe(&alice, &laptop, &"anything/#".to_string()));
+        assert!(z.authorize_subscribe(&reader, &laptop, "anything/#"));
+        assert!(!z.authorize_subscribe(&alice, &laptop, "anything/#"));
     }
 }

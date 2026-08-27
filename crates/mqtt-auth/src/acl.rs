@@ -78,7 +78,7 @@
 //! Publish targets are concrete topics and use plain MQTT filter matching.
 
 use crate::{Action, Authorizer, Identity};
-use mqtt_core::{ClientId, TopicFilter, TopicName};
+use mqtt_core::{ClientId, TopicName};
 use serde::Deserialize;
 
 /// Errors from parsing or validating an ACL policy.
@@ -463,12 +463,7 @@ impl Authorizer for AclPolicy {
     ) -> bool {
         self.evaluate(identity, &client_id.0, Action::Publish, topic)
     }
-    fn authorize_subscribe(
-        &self,
-        identity: &Identity,
-        client_id: &ClientId,
-        filter: &TopicFilter,
-    ) -> bool {
+    fn authorize_subscribe(&self, identity: &Identity, client_id: &ClientId, filter: &str) -> bool {
         self.evaluate(identity, &client_id.0, Action::Subscribe, filter)
     }
     fn authorize_connect(&self, identity: &Identity, client_id: &ClientId) -> bool {
@@ -513,7 +508,7 @@ mod tests {
     }
 
     fn can_sub_as(p: &AclPolicy, id: &Identity, client: &str, filter: &str) -> bool {
-        p.authorize_subscribe(id, &ClientId(client.into()), &filter.to_string())
+        p.authorize_subscribe(id, &ClientId(client.into()), filter)
     }
 
     // ----- parse / validation failures -----

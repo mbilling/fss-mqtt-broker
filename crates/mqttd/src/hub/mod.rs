@@ -7013,7 +7013,7 @@ mod tests {
             fn authorize_publish(&self, _: &Identity, _: &ClientId, _: &String) -> bool {
                 true
             }
-            fn authorize_subscribe(&self, _: &Identity, _: &ClientId, _: &String) -> bool {
+            fn authorize_subscribe(&self, _: &Identity, _: &ClientId, _: &str) -> bool {
                 true
             }
             fn authorize_connect(&self, identity: &Identity, _: &ClientId) -> bool {
@@ -7140,7 +7140,7 @@ mod tests {
             fn authorize_publish(&self, _: &Identity, _: &ClientId, _: &String) -> bool {
                 true
             }
-            fn authorize_subscribe(&self, _: &Identity, _: &ClientId, filter: &String) -> bool {
+            fn authorize_subscribe(&self, _: &Identity, _: &ClientId, filter: &str) -> bool {
                 !filter.starts_with("secret/")
             }
         }
@@ -7197,7 +7197,7 @@ mod tests {
             fn authorize_publish(&self, _: &Identity, _: &ClientId, _: &String) -> bool {
                 true
             }
-            fn authorize_subscribe(&self, _: &Identity, _: &ClientId, filter: &String) -> bool {
+            fn authorize_subscribe(&self, _: &Identity, _: &ClientId, filter: &str) -> bool {
                 !filter.starts_with("secret/")
             }
         }
