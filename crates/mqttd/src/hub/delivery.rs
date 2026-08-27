@@ -636,7 +636,7 @@ impl Hub {
                 p.payload.clone(),
                 p.qos,
                 p.message_expiry,
-                p.app.clone(),
+                p.app().clone(),
             );
             let candidates: Vec<SharedCandidate> = self
                 .shared_candidates(&topic)
