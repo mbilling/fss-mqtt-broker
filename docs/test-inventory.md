@@ -882,7 +882,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 345 test(s)
+## `crates/mqttd/src/lib.rs` — 347 test(s)
 
 - `admission::tests::the_global_cap_refuses_at_the_bound_and_recovers`
 - `admission::tests::the_penalty_box_refuses_after_the_threshold`
@@ -1011,6 +1011,8 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `http_auth::tests::no_url_means_no_hook`
 - `http_auth::tests::the_cache_expires_and_is_bounded`
 - `http_auth::tests::the_cache_key_is_unambiguous_across_field_boundaries`
+- `hub::forwarding::footprint::a_forward_obligation_stays_small`
+- `hub::forwarding::footprint::a_pending_publish_stays_small`
 - `hub::tests::a_brownout_refusal_delivers_to_nobody_even_when_a_subscriber_owed_no_durability`
 - `hub::tests::a_brownout_refusal_is_counted_as_a_quota_rejection_not_a_drop`
 - `hub::tests::a_brownout_refused_will_does_not_overtake_an_inflight_qos1_append`
