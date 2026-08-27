@@ -664,7 +664,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::the_whole_env_surface_overlays_without_collision`
 - `tests::warn_mode_boots_a_newer_config_and_reports_the_ignored_keys`
 
-## `crates/mqtt-core/src/lib.rs` — 45 test(s)
+## `crates/mqtt-core/src/lib.rs` — 46 test(s)
 
 - `retry::tests::delays_ramp_within_jitter_bounds_and_cap`
 - `retry::tests::reset_returns_to_base`
@@ -679,6 +679,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `shared::tests::resubscribe_updates_qos_in_place`
 - `shared::tests::snapshot_lists_every_group_with_members`
 - `shared::tests::unsubscribe_and_remove_client_prune_groups`
+- `subscriptions::tests::a_distinct_filter_is_allocated_once_however_many_subscribers`
 - `subscriptions::tests::a_fully_removed_filter_can_be_resubscribed`
 - `subscriptions::tests::client_with_overlapping_filters_appears_once`
 - `subscriptions::tests::deep_filter_teardown_stays_iterative`
