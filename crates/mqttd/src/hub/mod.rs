@@ -5696,7 +5696,7 @@ fn forward_frame(p: &PendingPublish, seq: u64, obligation: &ForwardObligation) -
             qos: p.qos as u8,
             retain: p.retain,
             message_expiry: p.message_expiry,
-            app: app_to_wire(&p.app),
+            app: app_to_wire(p.app()),
         },
         ForwardKind::Shared { client, qos, .. } => PeerMessage::SharedDeliverAcked {
             seq,
@@ -5705,7 +5705,7 @@ fn forward_frame(p: &PendingPublish, seq: u64, obligation: &ForwardObligation) -
             payload: p.payload.to_vec(),
             qos: *qos as u8,
             message_expiry: p.message_expiry,
-            app: app_to_wire(&p.app),
+            app: app_to_wire(p.app()),
         },
     }
 }
