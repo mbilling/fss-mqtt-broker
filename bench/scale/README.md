@@ -92,6 +92,12 @@ spans, and every rung must need an integer `-I` of at least `LANE_B_MIN_INTERVAL
 anything else before its first ssh, so a wrong shape costs the provisioning
 minutes rather than lane A's hour (a floored split used to run fewer clients
 than the doc says; a floored timer used to offer a rate other than the label).
+Lane D is held to the same discipline and refused in the same place: its
+sessions must split exactly over their containers *and* over the brokers, its
+offered rate must need an integer `-I`, its session expiry must outlast the
+whole offline+drain cycle, and QoS 0 is rejected outright (an offline session
+queues nothing at QoS 0, so the lane would measure a guaranteed zero).
+
 `SHAPE_ONLY=1` runs only that check, so a knob set can be tried offline against
 a synthesized inventory:
 
@@ -100,7 +106,8 @@ jq -n '{brokers: [range(10) | {}], drivers: [range(5) | {}]}' > /tmp/inv.json
 LANE_B_PUB_CONTAINERS=6 SHAPE_ONLY=1 ./run-curve.sh /tmp/shape-check /tmp/inv.json
 ```
 
-The table it prints is what a real run keeps as `laneB/shape.txt`.
+The tables it prints are what a real run keeps as `laneB/shape.txt` and
+`laneD/shape.txt`.
 
 **Fan-out percentage.** `LANE_B_FANOUT` (0–100) is the share of subscriber containers that receive the *full* publish stream on a plain `bench/#` wildcard; the rest stay in one `$share/g1` group and split one copy per publish. `0` (default) is today's `$share` fan-in (delivered ≈ offered); `100` gives every subscriber every publish (delivered ≈ offered × `LANE_B_SUBS`); `50` makes half the containers wildcard. Egress fan-out is the shape that stresses the per-connection write path (issue #443). Above 0 the rung is the *publish* rate, so keep it modest — `shape.txt` prints the resulting `delivered ≈ offered × N`.
 
@@ -117,6 +124,7 @@ The table it prints is what a real run keeps as `laneB/shape.txt`.
 | re-form (clean mode) | durable plane OFF for the routing-bound lanes | — |
 | lane B | non-durable `$share` fan-out ladder (+ one mTLS rung) | 12 000 pubs / 300 subs in 5 + 3 one-vCPU containers per driver, 300k…20k offered (top rung first), 60 s/rung |
 | lane C | idle-connection scaling, plaintext + mTLS | 50k conns, ramp 2.5k/s, 120 s hold |
+| lane D — **opt-in, not in the default `full`** (`LANES` defaults to `ABC`; the `logistics` workload selects it) | store-and-forward: persistent sessions attach, detach, are published to while offline, then resume and drain | 1920 sessions, 4000 msg/s for 40 s offline, 180 s drain budget |
 | teardown | destroy before the next size (fresh clusters only), host logs collected on failure | — |
 
 `smoke` runs the same pipeline with every knob shrunk (1 rep, 15 s, 2k conns) —
