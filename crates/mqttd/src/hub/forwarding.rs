@@ -20,6 +20,17 @@
 // re-couple every future hub change to six import lists. Scoped to these files.
 use super::*;
 
+/// The empty property block every propertyless publish borrows instead of
+/// storing its own. `const`-constructible, so it costs one static, not one
+/// allocation per in-flight message.
+static NO_APP_PROPERTIES: AppProperties = AppProperties {
+    payload_format: None,
+    content_type: None,
+    response_topic: None,
+    correlation_data: None,
+    user_properties: Vec::new(),
+};
+
 #[allow(clippy::struct_excessive_bools)]
 /// A `QoS` 1 publish whose acknowledgement is gated on **cluster-wide** durability
 /// (ADR 0042 T9): the local fan-out's durable appends (synchronous), the retained
@@ -36,7 +47,14 @@ pub(super) struct PendingPublish {
     pub(super) qos: QoS,
     pub(super) retain: bool,
     pub(super) message_expiry: Option<u32>,
-    pub(super) app: AppProperties,
+    /// The publisher's MQTT 5 application properties — **boxed, and only when a
+    /// publish actually carries any**. Inline this block is 112 bytes on an entry
+    /// that is otherwise 208, and a telemetry PUBLISH sets none of it (the wire
+    /// form's own doc calls empty "the common case"). `None` here is the same
+    /// thing as an empty `AppProperties`; read it through [`PendingPublish::app`],
+    /// which hands back a shared empty block so callers cannot tell the
+    /// difference.
+    pub(super) app: Option<Box<AppProperties>>,
     /// Outstanding forward answers: forward seq → what was forwarded, and where.
     pub(super) awaiting: HashMap<u64, ForwardObligation>,
     /// Whether this publish is known to be durably STORED somewhere — locally, or on
@@ -90,6 +108,14 @@ pub(super) struct PendingPublish {
     /// reconnect storm). Relaxed grants latency below congestion, not
     /// immunity from capacity.
     pub(super) congested: bool,
+}
+
+impl PendingPublish {
+    /// The publish's application properties, empty block and all — so a caller
+    /// never has to know whether this entry paid to store any.
+    pub(super) fn app(&self) -> &AppProperties {
+        self.app.as_deref().unwrap_or(&NO_APP_PROPERTIES)
+    }
 }
 
 /// One outstanding cross-node obligation of a gated publish (ADR 0042 T9 exhibit ⑤;
@@ -149,7 +175,7 @@ impl Hub {
             p.payload.clone(),
             p.qos,
             p.message_expiry,
-            p.app.clone(),
+            p.app().clone(),
             p.created_at,
         );
         let targets: Vec<(ClientId, QoS)> = self
@@ -402,7 +428,7 @@ impl Hub {
                 qos,
                 retain,
                 message_expiry,
-                app: app.clone(),
+                app: (!app.is_empty()).then(|| Box::new(app.clone())),
                 awaiting: HashMap::new(),
                 stored: false,
                 acked_nodes: HashSet::new(),
@@ -711,7 +737,7 @@ mod footprint {
     /// affordable at the same budget, and nothing else would notice.
     #[test]
     fn a_pending_publish_stays_small() {
-        const BUDGETED: usize = 320;
+        const BUDGETED: usize = 216;
         let actual = std::mem::size_of::<PendingPublish>();
         assert!(
             actual <= BUDGETED,
