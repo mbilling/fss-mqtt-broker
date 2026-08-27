@@ -16,6 +16,26 @@ so a run is reproducible from its `.env` file and comparable across releases.
 | `smart-home` | enormous idle connection count, reconnect storms | C | memory/conn, establishment |
 | `logistics` | store-and-forward, disconnect/resume | D | offline queues, session resume |
 
+A second set, added 2026-08-27, chosen for the dimensions the first five never
+touch — payload size, topic cardinality, delivery amplification, connection
+ceiling, and establishment rate:
+
+| Workload | Shape | Lane | Stresses |
+|---|---|---|---|
+| `video-surveillance` | 64 KB frames, 60 cameras → 120 viewers | B | **bytes**/s not msgs/s: write path, backlog byte bound |
+| `energy-metering` | 100k meters, one reading each per 10 s | B (`$share`) | topic **cardinality** at rest, not throughput |
+| `emergency-alerting` | 30 pubs → 3 000 subs, full fan-out | B | delivery **amplification** (300×) |
+| `wearables` | 150 000 idle connections | C | the connection **ceiling** past smart-home's 50k |
+| `gaming-presence` | 50k connections at 10 000/s | C | **establishment rate**, not capacity |
+
+`video-surveillance` is a **1/3/5** curve: 60 publishers cannot spread over 7
+brokers, and the smallest population that could (420) is a different workload at
+64 KB. The other four run 1/3/5/7.
+
+Still uncovered by any workload, and honest to say so: retained-message load,
+QoS 2 at scale (lane B refuses it; only lane A's arm exercises it), MQTT 5
+user properties on the hot path, and request/response correlation.
+
 ## Running
 
 ```sh

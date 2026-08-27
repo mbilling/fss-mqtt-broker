@@ -191,6 +191,13 @@ LANE_B_FANOUT="${LANE_B_FANOUT:-0}"
 # what a slow subscriber cannot take rather than backpressure. QoS 2 is out
 # of scope for this lane.
 LANE_B_QOS="${LANE_B_QOS:-1}"
+# Publish payload in bytes. Every shape this rig has ever run used 256 — telemetry
+# sized — so the whole ladder measures MESSAGES per second and nothing measures
+# BYTES per second. A broker moving 64 KB frames is a different machine: the same
+# message rate is 250x the egress, and the per-connection write path, the backlog
+# byte bound (issue #241) and MQTTD_MAX_PACKET_SIZE all start to matter where at
+# 256 B they never do.
+LANE_B_PAYLOAD="${LANE_B_PAYLOAD:-256}"
 # The mTLS reference rung (ADR 0048 §3 discloses both postures per size without
 # paying for the full ladder twice). Overridable because it must SUIT THE SHAPE:
 # 50000 is a sane publish rate for a fan-in ladder, but under a fan-out workload
@@ -462,7 +469,7 @@ lane_b_shape() { # prints the shape as key=value lines; dies on any distortion
 		interval=$(lane_b_interval "$rate")
 		echo "rung=$rate interval_ms=$interval per_pub_container_msg_s=$((rate / pub_cells))"
 	done
-	echo "qos=$LANE_B_QOS inflight=$LANE_B_INFLIGHT connect_rate=$LANE_B_CONNECT_RATE settle_s=$LANE_B_SETTLE measure_s=$LANE_B_SECS min_interval_ms=$LANE_B_MIN_INTERVAL"
+	echo "qos=$LANE_B_QOS payload_b=$LANE_B_PAYLOAD inflight=$LANE_B_INFLIGHT connect_rate=$LANE_B_CONNECT_RATE settle_s=$LANE_B_SETTLE measure_s=$LANE_B_SECS min_interval_ms=$LANE_B_MIN_INTERVAL"
 	echo "image=$BENCH_IMG erl_flags='$BENCH_ERL_FLAGS'"
 }
 if [[ "$LANES" == *B* ]]; then
@@ -790,7 +797,7 @@ lane_b_rung() { # lane_b_rung <total-rate> <posture:plain|mtls>
 			# block, so the topic count IS LANE_B_PUBS by construction.
 			seq_base=$(((di * P + j) * pubs_per))
 			hosts=$(rotated_hosts $((di * P + j)))
-			pubs[di]+="$DOCKER_RUN --name pub-$di-$j -v /opt/bench-certs:/opt/bench-certs:ro $BENCH_IMG pub -h $hosts -p $port -c $pubs_per -R $LANE_B_CONNECT_RATE -t 'bench/%i' -q $LANE_B_QOS -s 256 $active -n $seq_base -I $interval -F $LANE_B_INFLIGHT --payload-hdrs ts $args >/dev/null"$'\n'
+			pubs[di]+="$DOCKER_RUN --name pub-$di-$j -v /opt/bench-certs:/opt/bench-certs:ro $BENCH_IMG pub -h $hosts -p $port -c $pubs_per -R $LANE_B_CONNECT_RATE -t 'bench/%i' -q $LANE_B_QOS -s $LANE_B_PAYLOAD $active -n $seq_base -I $interval -F $LANE_B_INFLIGHT --payload-hdrs ts $args >/dev/null"$'\n'
 			stop[di]+="printf '\\n@@@ pub-$di-$j\\n'; docker logs pub-$di-$j 2>&1"$'\n'
 			names[di]+=" pub-$di-$j"
 		done
