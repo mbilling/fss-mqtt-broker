@@ -46,8 +46,8 @@ use mqtt_codec::{
     Packet, ProtocolVersion, QoS,
 };
 use mqtt_core::{
-    parse_shared, topic_matches, AppProperties, ClientId, Message, SharedSubscriptionTable,
-    Subscription, SubscriptionTable,
+    parse_shared, topic_matches, AppProperties, ClientId, FilterKey, Message,
+    SharedSubscriptionTable, Subscription, SubscriptionTable,
 };
 use mqtt_storage::app_props::AppProps;
 use mqtt_storage::retained_log::DurableRetained;
@@ -56,6 +56,7 @@ use mqtt_storage::{
     SessionStore, StorageError,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::num::NonZeroU32;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
@@ -1576,27 +1577,125 @@ struct Peer {
     interest_synced: bool,
 }
 
-/// Record one MQTT 5 subscription option (#198) for `client` over the filters it just
-/// subscribed: `set` names the filters that carry the option; every other (re)subscribed
-/// filter has it CLEARED, because a re-subscribe replaces a subscription's options
-/// [MQTT-3.8.4-3]. The client's entry is dropped when no filter carries the option.
-fn record_sub_option(
-    map: &mut HashMap<ClientId, HashSet<String>>,
-    client: &ClientId,
-    filters: &[(String, QoS)],
-    set: &[String],
-) {
-    let on: HashSet<&String> = set.iter().collect();
-    let entry = map.entry(client.clone()).or_default();
-    for (f, _) in filters {
-        if on.contains(f) {
-            entry.insert(f.clone());
-        } else {
-            entry.remove(f);
+/// One subscription a client holds: its filter and everything MQTT 5 attaches to
+/// that filter, in one record.
+///
+/// This replaces four parallel `HashMap<ClientId, _>` maps that were keyed by the
+/// same client and the same filter string four times over. Two consequences:
+///
+///  * **One interned filter, not four copies.** `filter` is the [`FilterKey`] the
+///    subscription table already owns, so a filter costs one allocation across the
+///    trie, the table and every client that subscribes to it.
+///  * **One lookup on the delivery path.** `delivery_terms` used to hash the client
+///    three times (grants, No Local, Retain As Published) and then run a residue
+///    pass; it now hashes once and walks this list — which is what the old code did
+///    anyway, since it scanned every filter and called `topic_matches`. The hashing
+///    was never buying anything where it was hot.
+///
+/// The options are bit-packed because they are two booleans that only ever exist
+/// alongside a grant. Keeping them in their own maps allowed an option to exist for
+/// a filter with no grant, which `record_sub_option` had to defend against.
+#[derive(Debug, Clone)]
+pub(super) struct SubEntry {
+    /// The full filter as subscribed — `$share/<group>/` prefix included, exactly as
+    /// the old `subs_by_client` key was, so one lookup answers ordinary and shared
+    /// filters alike.
+    pub(super) filter: FilterKey,
+    /// Subscription Identifier (§3.8.2.1.2), when the SUBSCRIBE carried one.
+    /// `NonZeroU32` because the codec already refuses 0, so `Option` costs nothing.
+    pub(super) sub_id: Option<NonZeroU32>,
+    /// The granted maximum `QoS` [MQTT-3.8.4-6].
+    pub(super) qos: QoS,
+    /// bit 0 = No Local, bit 1 = Retain As Published.
+    flags: u8,
+}
+
+impl SubEntry {
+    const NO_LOCAL: u8 = 0b01;
+    const RETAIN_AS_PUBLISHED: u8 = 0b10;
+
+    fn new(
+        filter: FilterKey,
+        qos: QoS,
+        no_local: bool,
+        rap: bool,
+        sub_id: Option<NonZeroU32>,
+    ) -> Self {
+        let mut flags = 0;
+        if no_local {
+            flags |= Self::NO_LOCAL;
+        }
+        if rap {
+            flags |= Self::RETAIN_AS_PUBLISHED;
+        }
+        Self {
+            filter,
+            sub_id,
+            qos,
+            flags,
         }
     }
-    if entry.is_empty() {
-        map.remove(client);
+
+    /// MQTT 5 §3.8.3.1 No Local: never deliver back to the connection that published
+    /// it. The bridge's unforgeable loop-prevention primitive (ADR 0059/0025).
+    pub(super) fn no_local(&self) -> bool {
+        self.flags & Self::NO_LOCAL != 0
+    }
+
+    /// MQTT 5 §3.8.3.1 Retain As Published.
+    pub(super) fn retain_as_published(&self) -> bool {
+        self.flags & Self::RETAIN_AS_PUBLISHED != 0
+    }
+}
+
+/// Every subscription one client holds, as a flat list.
+///
+/// `Box<[_]>` rather than `Vec`: this is rebuilt on the rare SUBSCRIBE/UNSUBSCRIBE
+/// and read on every delivery, so it is exactly sized with no spare capacity. A
+/// client holds a handful of filters, and the read path scans all of them anyway to
+/// run wildcard matching — so a linear scan over contiguous memory beats a hash
+/// table it never looked up by key.
+///
+/// An **empty** list is a real, meaningful state: `unsubscribe` leaves one behind
+/// rather than removing the client, and [`Hub::has_materialized_subs`] depends on
+/// that. Do not "tidy up" by dropping empty entries.
+#[derive(Debug, Clone, Default)]
+pub(super) struct ClientSubs(Box<[SubEntry]>);
+
+impl ClientSubs {
+    pub(super) fn iter(&self) -> impl Iterator<Item = &SubEntry> {
+        self.0.iter()
+    }
+
+    pub(super) fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub(super) fn find(&self, filter: &str) -> Option<&SubEntry> {
+        self.0.iter().find(|e| &*e.filter == filter)
+    }
+
+    /// Insert or replace the entry for `filter`. Replace-don't-merge
+    /// [MQTT-3.8.4-3]: a re-SUBSCRIBE overwrites the previous grant and ALL of its
+    /// options, including clearing a Subscription Identifier that is absent now.
+    pub(super) fn upsert(&mut self, entry: SubEntry) {
+        if let Some(slot) = self.0.iter_mut().find(|e| e.filter == entry.filter) {
+            *slot = entry;
+            return;
+        }
+        let mut v: Vec<SubEntry> = std::mem::take(&mut self.0).into_vec();
+        v.push(entry);
+        self.0 = v.into_boxed_slice();
+    }
+
+    /// Remove `filter`'s entry, reporting whether it was held.
+    pub(super) fn remove(&mut self, filter: &str) -> bool {
+        let before = self.0.len();
+        let mut v: Vec<SubEntry> = std::mem::take(&mut self.0).into_vec();
+        v.retain(|e| &*e.filter != filter);
+        let removed = v.len() != before;
+        self.0 = v.into_boxed_slice();
+        removed
     }
 }
 
@@ -1656,25 +1755,20 @@ pub struct Hub {
     /// Sweep-tick counter driving the retained anti-entropy cadence (issue #87),
     /// kept separate from the expiry counter so neither's phase perturbs the other.
     retained_antientropy_tick: u32,
-    /// Per-client subscription filters with their granted `QoS`.
-    subs_by_client: HashMap<ClientId, HashMap<String, QoS>>,
-    /// Filters each client subscribed with **No Local** set (MQTT 5 §3.8.3.1, #198): a
-    /// message is not delivered back to the connection that published it on such a filter —
-    /// the unforgeable loop-prevention primitive the boundary bridge relies on (ADR 0059/0025).
-    no_local: HashMap<ClientId, HashSet<String>>,
-    /// Per-session Subscription Identifiers (issue #266, §3.8.2.1.2): `filter -> id`
-    /// for every subscription made with one. Absence means the subscription carries
-    /// no id (obligation: a match on only id-less subscriptions attaches NO property).
-    /// Keyed by the FULL filter string (`$share/...` included), like
-    /// [`subs_by_client`](Self::subs_by_client). Replace-don't-merge
-    /// [MQTT-3.8.4-3]: a re-SUBSCRIBE of the filter with a different or ABSENT id
-    /// overwrites or removes the entry.
-    sub_ids: HashMap<ClientId, HashMap<String, u32>>,
-    /// Filters each client subscribed with **Retain As Published** set (MQTT 5 §3.8.3.1,
-    /// #198): a message forwarded because it matched such a filter keeps the RETAIN flag it
-    /// was published with, instead of the flag being cleared [MQTT-3.3.1-9]. This is what lets
-    /// a re-forwarder (the boundary bridge) carry *live* retained state across (#189).
-    retain_as_published: HashMap<ClientId, HashSet<String>>,
+    /// Every subscription each client holds: the filter, its granted `QoS`, and the
+    /// MQTT 5 options attached to it — in one record per (client, filter).
+    ///
+    /// This replaced four parallel maps keyed by the same client and the same filter
+    /// string four times over (`subs_by_client`, `no_local`, `sub_ids`,
+    /// `retain_as_published`). See [`SubEntry`] for what each field meant and
+    /// [`ClientSubs`] for why the inner collection is a flat list rather than a map.
+    ///
+    /// Filters are keyed as SUBSCRIBED — `$share/<group>/` prefix included — so one
+    /// lookup answers ordinary and shared subscriptions alike.
+    ///
+    /// An empty entry is meaningful and must not be pruned; see
+    /// [`has_materialized_subs`](Self::has_materialized_subs).
+    subs: HashMap<ClientId, ClientSubs>,
     /// Routing index covering online clients and offline persistent sessions.
     table: SubscriptionTable,
     /// Local shared-subscription groups (`$share/<group>/<filter>`) — this node's
@@ -2051,10 +2145,7 @@ impl Hub {
                 expiring: HashMap::new(),
                 expiry_reconcile_tick: 0,
                 retained_antientropy_tick: 0,
-                subs_by_client: HashMap::new(),
-                no_local: HashMap::new(),
-                sub_ids: HashMap::new(),
-                retain_as_published: HashMap::new(),
+                subs: HashMap::new(),
                 table: SubscriptionTable::new(),
                 shared: SharedSubscriptionTable::new(),
                 remote_shared: HashMap::new(),
@@ -3233,25 +3324,34 @@ impl Hub {
         // for a clean start).
         let recovered_any = !subscriptions.is_empty();
         for s in subscriptions {
+            // Interned on the FULL filter, `$share/<group>/` prefix included, because
+            // that is how the record is keyed. A shared filter is not in the match
+            // trie, so this mints rather than shares — the dedup applies to ordinary
+            // filters, which is where the fleet-scale duplication lives.
+            let key = self.table.intern(&s.filter);
             if let Some((group, filter)) = parse_shared(&s.filter) {
                 self.shared
                     .subscribe(client.clone(), group, filter, s.max_qos);
             } else {
-                let key = self.table.intern(&s.filter);
-                self.table.subscribe(client.clone(), key);
+                self.table.subscribe(client.clone(), FilterKey::clone(&key));
             }
-            if let Some(id) = s.sub_id {
-                // Restored session state (issue #266, §4.1): the id survives
-                // reconnect exactly like the subscription it belongs to.
-                self.sub_ids
-                    .entry(client.clone())
-                    .or_default()
-                    .insert(s.filter.clone(), id);
-            }
-            self.subs_by_client
+            // Restored session state (issue #266, §4.1): the Subscription Identifier
+            // survives reconnect exactly like the subscription it belongs to.
+            //
+            // `upsert` into whatever this node already holds — NEVER a wholesale
+            // replace. A takeover can arrive carrying no stored subscriptions at all
+            // (a Clean Start = 0 / Expiry = 0 client never persists any), and
+            // replacing would wipe live routing the attach path just established.
+            self.subs
                 .entry(client.clone())
                 .or_default()
-                .insert(s.filter, s.max_qos);
+                .upsert(SubEntry::new(
+                    key,
+                    s.max_qos,
+                    s.no_local,
+                    false,
+                    s.sub_id.and_then(NonZeroU32::new),
+                ));
         }
         // A resumed session registers filters WITHOUT a SUBSCRIBE, so peers must
         // learn them here (ADR 0042 T9): after a takeover, this advertisement is
@@ -3502,15 +3602,15 @@ impl Hub {
                     // denies. A topic a surviving grant also matches still replays.
                     if !revoked_grants.is_empty() {
                         let topic = &qm.message.topic;
-                        let admits = |f: &String| {
-                            let f = parse_shared(f).map_or(f.as_str(), |(_, inner)| inner);
+                        let admits = |f: &str| {
+                            let f = parse_shared(f).map_or(f, |(_, inner)| inner);
                             topic_matches(f, topic)
                         };
                         let survives = self
-                            .subs_by_client
+                            .subs
                             .get(&client)
-                            .is_some_and(|m| m.keys().any(admits));
-                        if revoked_grants.iter().any(admits) && !survives {
+                            .is_some_and(|subs| subs.iter().any(|e| admits(&e.filter)));
+                        if revoked_grants.iter().map(String::as_str).any(admits) && !survives {
                             debug!(client = %client.0, offset = qm.offset, %topic,
                                    "dropping queued message for a revoked grant (ADR 0040 T3)");
                             continue;
@@ -3593,32 +3693,30 @@ impl Hub {
             .zip(retain_handling.iter().copied().chain(std::iter::repeat(0)))
             .map(|((f, _), h)| (f.clone(), h))
             .collect();
-        // MQTT 5 subscription options (#198): record which filters carry No Local / Retain As
-        // Published, and CLEAR the option for any (re)subscribed filter that did not set it —
-        // a re-subscribe replaces the options [MQTT-3.8.4-3]. Only ACL-granted filters reach
-        // here; both options are applied on the ordinary-delivery path.
-        record_sub_option(&mut self.no_local, client, &filters, &no_local_filters);
-        record_sub_option(
-            &mut self.retain_as_published,
-            client,
-            &filters,
-            &rap_filters,
-        );
+        // MQTT 5 subscription options (#198) are carried ON the grant now, applied in
+        // the loop below. That is the whole reason the options cannot outlive their
+        // subscription: they used to be recorded HERE, before quota filtering, so a
+        // quota-denied filter could leave an option behind with no grant to attach it
+        // to — a corner `delivery_terms` had to run a residue pass to honour.
+        // Re-subscribe replaces the options [MQTT-3.8.4-3]; `upsert` gives that for
+        // free, since it overwrites the whole entry.
+        let no_local_set: HashSet<&str> = no_local_filters.iter().map(String::as_str).collect();
+        let rap_set: HashSet<&str> = rap_filters.iter().map(String::as_str).collect();
         // Subscription quota (ADR 0041 T3): count how many NEW filters the cap
         // admits — an already-held filter replaces (never consumes quota). The
         // SUBACK itself is answered only after the durable persist below
         // (ADR 0042 T9): granted must mean durably granted.
         let filters: (Vec<(String, QoS)>, Vec<bool>) = {
-            let held = self.subs_by_client.get(client);
+            let held = self.subs.get(client);
             let mut admitted_new = 0;
             let verdicts: Vec<bool> = filters
                 .iter()
                 .map(|(f, _)| {
-                    let replaces = held.is_some_and(|m| m.contains_key(f));
+                    let replaces = held.is_some_and(|s| s.find(f).is_some());
                     let admit = replaces
                         || match self.quotas.max_subscriptions_per_client {
                             None => true,
-                            Some(cap) => held.map_or(0, HashMap::len) + admitted_new < cap,
+                            Some(cap) => held.map_or(0, ClientSubs::len) + admitted_new < cap,
                         };
                     if admit && !replaces {
                         admitted_new += 1;
@@ -3646,7 +3744,7 @@ impl Hub {
         let (filters, verdicts) = filters;
         // Snapshot for rollback: a failed durable persist must leave the routing
         // state exactly as before, so the failure SUBACK tells the truth.
-        let prior = self.subs_by_client.get(client).cloned();
+        let prior = self.subs.get(client).cloned();
 
         // Retained messages are replayed only for ordinary subscriptions; a new
         // shared subscription does not receive them (ADR 0010 §3, [MQTT-3.8.4]).
@@ -3659,29 +3757,21 @@ impl Hub {
         for (f, q) in &filters {
             // Keep the full filter string (including any `$share/` prefix) so it is
             // persisted; `$share/...` never matches a concrete topic in `granted_qos`.
-            self.subs_by_client
+            // One record per grant: the filter, its QoS, both MQTT 5 options, and the
+            // packet's Subscription Identifier. `upsert` replaces the whole entry, which
+            // IS replace-don't-merge [MQTT-3.8.4-3] — including a re-SUBSCRIBE with no
+            // id, which must REMOVE a stored one rather than keep it (issue #266).
+            let key = self.table.intern(f);
+            self.subs
                 .entry(client.clone())
                 .or_default()
-                .insert(f.clone(), *q);
-            // Subscription Identifier, replace-don't-merge [MQTT-3.8.4-3] (issue
-            // #266): the packet's one id applies to every filter it granted; a
-            // re-SUBSCRIBE without one REMOVES a stored id rather than keeping it.
-            match sub_id {
-                Some(id) => {
-                    self.sub_ids
-                        .entry(client.clone())
-                        .or_default()
-                        .insert(f.clone(), id);
-                }
-                None => {
-                    if let Some(ids) = self.sub_ids.get_mut(client) {
-                        ids.remove(f);
-                        if ids.is_empty() {
-                            self.sub_ids.remove(client);
-                        }
-                    }
-                }
-            }
+                .upsert(SubEntry::new(
+                    key,
+                    *q,
+                    no_local_set.contains(f.as_str()),
+                    rap_set.contains(f.as_str()),
+                    sub_id.and_then(NonZeroU32::new),
+                ));
             if let Some((group, filter)) = parse_shared(f) {
                 debug!(client = %client.0, group, filter, qos = *q as u8, "shared subscribe");
                 self.shared.subscribe(client.clone(), group, filter, *q);
@@ -3689,7 +3779,7 @@ impl Hub {
             }
             debug!(client = %client.0, filter = %f, qos = *q as u8, "subscribe");
             ordinary_granted = true;
-            let already_held = prior.as_ref().is_some_and(|m| m.contains_key(f));
+            let already_held = prior.as_ref().is_some_and(|s| s.find(f).is_some());
             let key = self.table.intern(f);
             self.table.subscribe(client.clone(), key);
             // Retain Handling (#198, MQTT 5 §3.8.3.1): 0 = send retained at subscribe
@@ -3752,15 +3842,18 @@ impl Hub {
             );
             self.drop_subscriptions(client);
             if let Some(prior) = prior {
-                for (f, q) in &prior {
-                    if let Some((group, filter)) = parse_shared(f) {
-                        self.shared.subscribe(client.clone(), group, filter, *q);
+                for e in prior.iter() {
+                    if let Some((group, filter)) = parse_shared(&e.filter) {
+                        self.shared.subscribe(client.clone(), group, filter, e.qos);
                     } else {
-                        let key = self.table.intern(f);
-                        self.table.subscribe(client.clone(), key);
+                        self.table
+                            .subscribe(client.clone(), FilterKey::clone(&e.filter));
                     }
                 }
-                self.subs_by_client.insert(client.clone(), prior);
+                // A wholesale insert is right HERE and only here: `drop_subscriptions`
+                // just removed the entry, so this restores the pre-SUBSCRIBE state
+                // exactly, options and identifiers included.
+                self.subs.insert(client.clone(), prior);
             }
             if let Some(tx) = reply {
                 let _ = tx.send(vec![false; verdicts.len()]);
@@ -3823,32 +3916,21 @@ impl Hub {
     }
 
     /// Returns, per filter in request order, whether a subscription existed and
-    /// was removed (issue #290). `subs_by_client` is the authority: it keeps the
-    /// full filter string — `$share/` prefix included — for every grant, so one
-    /// `remove` answers ordinary and shared filters alike.
+    /// was removed (issue #290). `subs` is the authority: it keeps the full filter
+    /// string — `$share/` prefix included — for every grant, so one `remove`
+    /// answers ordinary and shared filters alike.
+    ///
+    /// The client's entry is left in place even when its last filter goes, which is
+    /// what [`has_materialized_subs`](Self::has_materialized_subs) reads as "this
+    /// node knows the session". Dropping the empty entry would make the
+    /// inherited-session scan treat the client as unmaterialized and re-subscribe
+    /// its stale durable filters.
     async fn unsubscribe(&mut self, client: &ClientId, filters: &[String]) -> Vec<bool> {
         let mut existed = Vec::with_capacity(filters.len());
         for f in filters {
-            existed.push(
-                self.subs_by_client
-                    .get_mut(client)
-                    .is_some_and(|map| map.remove(f).is_some()),
-            );
-            // #198: drop the subscription options with the subscription.
-            if let Some(ids) = self.sub_ids.get_mut(client) {
-                ids.remove(f);
-                if ids.is_empty() {
-                    self.sub_ids.remove(client);
-                }
-            }
-            for map in [&mut self.no_local, &mut self.retain_as_published] {
-                if let Some(set) = map.get_mut(client) {
-                    set.remove(f);
-                    if set.is_empty() {
-                        map.remove(client);
-                    }
-                }
-            }
+            // One removal takes the grant AND its options with it (#198) — they are
+            // the same record now, so an option can no longer outlive its grant.
+            existed.push(self.subs.get_mut(client).is_some_and(|subs| subs.remove(f)));
             if let Some((group, filter)) = parse_shared(f) {
                 self.shared.unsubscribe(client, group, filter);
             } else {
@@ -4126,11 +4208,15 @@ impl Hub {
             .filter_map(|(client, online)| {
                 let identity = &online.admission.identity;
                 let revoked: Vec<String> = self
-                    .subs_by_client
+                    .subs
                     .get(client)?
-                    .keys()
-                    .filter(|f| !policy.authorizer.authorize_subscribe(identity, client, f))
-                    .cloned()
+                    .iter()
+                    .filter(|e| {
+                        !policy
+                            .authorizer
+                            .authorize_subscribe(identity, client, &e.filter)
+                    })
+                    .map(|e| String::from(&*e.filter))
                     .collect();
                 (!revoked.is_empty()).then(|| (client.clone(), revoked))
             })
@@ -4375,7 +4461,7 @@ impl Hub {
     /// inherited-session scan would then re-subscribe its stale durable filters and
     /// stamp `session_expiry = u32::MAX` over a session that deliberately holds none.
     fn has_materialized_subs(&self, client: &ClientId) -> bool {
-        self.subs_by_client.contains_key(client)
+        self.subs.contains_key(client)
     }
 
     /// Discard a session entirely: routing subscriptions, in-flight state, the stored
@@ -4683,17 +4769,24 @@ impl Hub {
                 continue; // nothing to route, or already materialized
             }
             for sub in subs {
+                // Interned on the FULL filter, as the record is keyed.
+                let key = self.table.intern(&sub.filter);
                 if let Some((group, filter)) = parse_shared(&sub.filter) {
                     self.shared
                         .subscribe(client.clone(), group, filter, sub.max_qos);
                 } else {
-                    let key = self.table.intern(&sub.filter);
-                    self.table.subscribe(client.clone(), key);
+                    self.table.subscribe(client.clone(), FilterKey::clone(&key));
                 }
-                self.subs_by_client
+                self.subs
                     .entry(client.clone())
                     .or_default()
-                    .insert(sub.filter, sub.max_qos);
+                    .upsert(SubEntry::new(
+                        key,
+                        sub.max_qos,
+                        sub.no_local,
+                        false,
+                        sub.sub_id.and_then(NonZeroU32::new),
+                    ));
             }
             // Persistent from the routing path's point of view (offline enqueue).
             // The placeholder interval is corrected by the next real attach; the
@@ -4766,7 +4859,7 @@ impl Hub {
             return;
         }
         let moved: Vec<ClientId> = self
-            .subs_by_client
+            .subs
             .keys()
             .filter(|c| {
                 !self.online.contains_key(*c)
@@ -5302,7 +5395,7 @@ impl Hub {
             .filter(|c| !self.online.contains_key(*c))
             .count();
         m.set_sessions(self.online.len() + offline_persistent);
-        m.set_subscriptions(self.subs_by_client.values().map(HashMap::len).sum());
+        m.set_subscriptions(self.subs.values().map(ClientSubs::len).sum());
         m.set_inflight_messages(self.inflight.values().map(|i| i.pending.len()).sum());
         // Flow-control backlog bytes across sessions (issue #241): so an operator can SEE
         // the number before choosing a byte cap, and watch it after.
@@ -5369,15 +5462,20 @@ impl Hub {
             return true; // nothing durable is promised for a clean session
         }
         let subs: Vec<mqtt_core::Subscription> = self
-            .subs_by_client
+            .subs
             .get(client)
             .into_iter()
-            .flatten()
-            .map(|(f, q)| mqtt_core::Subscription {
-                filter: f.clone(),
-                max_qos: *q,
+            .flat_map(ClientSubs::iter)
+            .map(|e| mqtt_core::Subscription {
+                // The durable record keeps the filter as a String: this is the
+                // store/wire boundary, and interning stops here.
+                filter: String::from(&*e.filter),
+                max_qos: e.qos,
+                // Unchanged, deliberately: the durable record has never carried No
+                // Local, and starting to would alter what already-written sessions
+                // mean on restore. Out of scope for a memory-layout change.
                 no_local: false,
-                sub_id: self.sub_ids.get(client).and_then(|m| m.get(f)).copied(),
+                sub_id: e.sub_id.map(NonZeroU32::get),
             })
             .collect();
         match self.store.set_subscriptions(client, &subs).await {
@@ -5391,10 +5489,7 @@ impl Hub {
 
     /// Remove all of a client's subscriptions from the routing table.
     fn drop_subscriptions(&mut self, client: &ClientId) {
-        self.subs_by_client.remove(client);
-        self.no_local.remove(client);
-        self.sub_ids.remove(client);
-        self.retain_as_published.remove(client);
+        self.subs.remove(client);
         self.table.remove_client(client);
         self.shared.remove_client(client);
     }

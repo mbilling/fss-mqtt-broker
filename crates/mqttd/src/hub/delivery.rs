@@ -103,15 +103,19 @@ impl Hub {
     /// holding BOTH an ordinary and a shared match on one topic receives two
     /// copies that each carry the union rather than only their own cause's id.
     pub(super) fn matching_sub_ids(&self, client: &ClientId, topic: &str) -> Vec<u32> {
-        let Some(ids) = self.sub_ids.get(client) else {
+        let Some(subs) = self.subs.get(client) else {
             return Vec::new();
         };
-        ids.iter()
-            .filter(|(f, _)| {
-                let effective = parse_shared(f).map_or(f.as_str(), |(_, inner)| inner);
+        subs.iter()
+            .filter(|e| {
+                // A shared subscription matches through its INNER filter; resolving
+                // it here is what keeps a `$share` grant from attaching its id to
+                // every delivery [MQTT-3.3.4-3..5].
+                let f: &str = &e.filter;
+                let effective = parse_shared(f).map_or(f, |(_, inner)| inner);
                 mqtt_core::topic_matches(effective, topic)
             })
-            .map(|(_, id)| *id)
+            .filter_map(|e| e.sub_id.map(NonZeroU32::get))
             .collect()
     }
 
@@ -205,12 +209,12 @@ impl Hub {
 
     /// The highest `QoS` granted to `client` across its filters matching `topic`.
     pub(super) fn granted_qos(&self, client: &ClientId, topic: &str) -> QoS {
-        self.subs_by_client
+        self.subs
             .get(client)
             .into_iter()
-            .flatten()
-            .filter(|(f, _)| topic_matches(f, topic))
-            .map(|(_, q)| *q)
+            .flat_map(ClientSubs::iter)
+            .filter(|e| topic_matches(&e.filter, topic))
+            .map(|e| e.qos)
             .max_by_key(|q| *q as u8)
             .unwrap_or(QoS::AtMostOnce)
     }
@@ -229,41 +233,31 @@ impl Hub {
     ///   re-forwarder (the boundary bridge) carry *live* retained state across a
     ///   boundary (#189).
     ///
-    /// The option maps are scanned via O(1) membership against the granted-filter
-    /// walk, PLUS a residue pass over any option filter *not* in
-    /// `subs_by_client` — `record_sub_option` runs before quota filtering, so a
-    /// quota-denied filter can hold an option without a granted subscription, and
-    /// the walks this replaces honoured that corner. The residue is empty in
-    /// every non-degenerate case, so it costs hash lookups, not wildcard walks.
+    /// One hash lookup, then one wildcard pass over the client's own list.
+    ///
+    /// This used to hash the client THREE times — grants, No Local, Retain As
+    /// Published — and then run a residue pass over any option filter that had no
+    /// grant, because `record_sub_option` ran before quota filtering and a
+    /// quota-denied filter could hold an option with no subscription behind it.
+    ///
+    /// With the options living on the grant itself that corner cannot arise, so the
+    /// residue pass is gone rather than ported.
     pub(super) fn delivery_terms(&self, client: &ClientId, topic: &str) -> DeliveryTerms {
-        let held = self.subs_by_client.get(client);
-        let nl = self.no_local.get(client);
-        let rap = self.retain_as_published.get(client);
         let mut terms = DeliveryTerms {
             granted: QoS::AtMostOnce,
             no_local: false,
             retain_as_published: false,
         };
-        for (f, q) in held.into_iter().flatten() {
-            if !topic_matches(f, topic) {
+        for e in self.subs.get(client).into_iter().flat_map(ClientSubs::iter) {
+            if !topic_matches(&e.filter, topic) {
                 continue;
             }
-            if *q as u8 > terms.granted as u8 {
-                terms.granted = *q;
+            if e.qos as u8 > terms.granted as u8 {
+                terms.granted = e.qos;
             }
-            terms.no_local |= nl.is_some_and(|s| s.contains(f));
-            terms.retain_as_published |= rap.is_some_and(|s| s.contains(f));
+            terms.no_local |= e.no_local();
+            terms.retain_as_published |= e.retain_as_published();
         }
-        let residue = |set: Option<&HashSet<String>>, already: bool| {
-            already
-                || set.is_some_and(|s| {
-                    s.iter()
-                        .filter(|f| !held.is_some_and(|m| m.contains_key(*f)))
-                        .any(|f| topic_matches(f, topic))
-                })
-        };
-        terms.no_local = residue(nl, terms.no_local);
-        terms.retain_as_published = residue(rap, terms.retain_as_published);
         terms
     }
 
