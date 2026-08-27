@@ -697,3 +697,41 @@ impl Hub {
         }
     }
 }
+
+#[cfg(test)]
+mod footprint {
+    use super::*;
+
+    /// The in-flight table is bounded, so the size of one entry decides how many
+    /// publishes a given memory budget buys. Measured 2026-08-27: 320 bytes, of
+    /// which `AppProperties` is 112 — a block a fleet-telemetry PUBLISH almost
+    /// never populates, paid on every entry.
+    ///
+    /// This guards against silent growth: an entry that doubles halves the cap
+    /// affordable at the same budget, and nothing else would notice.
+    #[test]
+    fn a_pending_publish_stays_small() {
+        const BUDGETED: usize = 320;
+        let actual = std::mem::size_of::<PendingPublish>();
+        assert!(
+            actual <= BUDGETED,
+            "PendingPublish grew to {actual} bytes (budget {BUDGETED}). The in-flight \
+             bound is sized on this: at {actual} bytes, N entries now cost \
+             {} KiB of fixed overhead alone. Either shrink the struct or re-derive \
+             the bound deliberately — do not just raise this number.",
+            4096 * actual / 1024
+        );
+    }
+
+    /// One obligation per destination node, held for as long as the publish is
+    /// unacknowledged, so a fan-out across a large cluster multiplies it.
+    #[test]
+    fn a_forward_obligation_stays_small() {
+        const BUDGETED: usize = 120;
+        let actual = std::mem::size_of::<ForwardObligation>();
+        assert!(
+            actual <= BUDGETED,
+            "ForwardObligation grew to {actual} bytes (budget {BUDGETED})"
+        );
+    }
+}

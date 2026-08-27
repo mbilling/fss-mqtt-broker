@@ -282,6 +282,20 @@ batch_split() { # batch_split <dir> <suffix> <stream-file> — '@@@ name' chunks
 		f { print > f }' "$3"
 }
 
+# Broker RSS + fd count, the same three facts lane C collects. Lane D needs them
+# too: the cost of an OFFLINE persistent session is the number that sizes a fleet
+# deployment (millions of devices asleep at any moment), and it is invisible in
+# every other lane — lanes A/B/C all measure brokers whose clients are connected.
+rss_snapshot() { # rss_snapshot <dir> <label>
+	local dir="$1" label="$2" i
+	mkdir -p "$dir"
+	for ((i = 0; i < N; i++)); do
+		rssh "$(broker_pub_ip "$i")" \
+			"grep VmRSS /proc/\$(systemctl show -p MainPID --value mqttd)/status; systemctl show -p MemoryCurrent --value mqttd; ls /proc/\$(systemctl show -p MainPID --value mqttd)/fd | wc -l" \
+			>"$dir/rss-$label-broker$i.txt" || true
+	done
+}
+
 snapshot_metrics() { # snapshot_metrics <dir> <label>
 	local dir="$1" label="$2" i
 	mkdir -p "$dir"
@@ -973,11 +987,13 @@ lane_d() {
 	[ -n "$store_posture" ] || store_posture=unknown
 	[ "$store_posture" = durable ] ||
 		warn "lane D is running against the $store_posture session store (ADR 0001 §6), not the durable plane — the cycle is the same, the guarantee is not"
+	rss_snapshot "$ddir" before
 	snapshot_metrics "$ddir" before
 	# ── phase 1: attach ─────────────────────────────────────────────────────
 	say "  [D] attaching $LANE_D_SESSIONS persistent sessions"
 	fan "attaching subscribers" "${subs[@]}"
 	sleep $((LANE_D_SESSIONS / LANE_D_CONNECT_RATE / D + 15))
+	rss_snapshot "$ddir" attached
 	snapshot_metrics "$ddir" attached
 	# ── phase 2: detach — kill the containers, keep the sessions ────────────
 	say "  [D] detaching (sessions go offline, expiry ${LANE_D_EXPIRY}s)"
@@ -986,6 +1002,7 @@ lane_d() {
 	for ((di = 0; di < D; di++)); do rssh "$(driver_pub_ip "$di")" "docker rm -f${subnames[di]}" >/dev/null 2>&1 & pids+=($!); done
 	for pp in "${pids[@]}"; do wait "$pp" || true; done
 	sleep 5
+	rss_snapshot "$ddir" offline
 	snapshot_metrics "$ddir" offline
 	# ── phase 3: fill the offline queues ────────────────────────────────────
 	say "  [D] publishing ${LANE_D_RATE}/s for ${LANE_D_OFFLINE_SECS}s into offline sessions"
@@ -999,6 +1016,7 @@ lane_d() {
 	for pp in "${pids[@]}"; do wait "$pp" || true; done
 	stop_cpu_sampling
 	sleep 5
+	rss_snapshot "$ddir" filled
 	snapshot_metrics "$ddir" filled
 	# ── phase 4: resume — identical flags, therefore identical client ids ───
 	say "  [D] resuming the same sessions; draining (budget ${LANE_D_DRAIN_SECS}s)"
@@ -1028,6 +1046,7 @@ lane_d() {
 	local drain_secs=$((elapsed - LANE_D_POLL * flat))
 	[ "$drain_secs" -ge 0 ] || drain_secs=0
 	gather drain ".prom" "${scrape[@]}"
+	rss_snapshot "$ddir" drained
 	snapshot_metrics "$ddir" drained
 	gather drain "-drain.log" "${stopsub[@]}"
 	pids=()
@@ -1060,6 +1079,28 @@ lane_d() {
 	# drain to within QoS 1's at-least-once redelivery (+89, 0.05%).
 	dropped=$(($(sum_metric filled mqttd_publish_dropped_total) - $(sum_metric offline mqttd_publish_dropped_total)))
 	local accepted=$((fill_recv - off_recv))
+	# ── the footprint numbers ───────────────────────────────────────────────
+	# VmRSS across all brokers at each phase boundary. The DIFFERENCES are what
+	# matter, and each isolates one cost that no other lane can see:
+	#   attached - before : a session WITH its connection
+	#   offline  - before : a session with NO connection — the fleet-sizing number,
+	#                       since most devices are asleep at any moment
+	#   filled   - offline: what a queued message costs while it waits, which is
+	#                       what a memory-derived in-flight bound must be sized on
+	rss_kb() { # rss_kb <label> — VmRSS summed over every broker, in kB
+		cat "$ddir"/rss-"$1"-broker*.txt 2>/dev/null |
+			awk '/VmRSS/ { s += $2 } END { print s + 0 }'
+	}
+	local r_before r_att r_off r_fill per_conn per_sess per_msg
+	r_before=$(rss_kb before) r_att=$(rss_kb attached)
+	r_off=$(rss_kb offline) r_fill=$(rss_kb filled)
+	per_conn=0 per_sess=0 per_msg=0
+	[ "$LANE_D_SESSIONS" -gt 0 ] && [ "$r_att" -gt "$r_before" ] &&
+		per_conn=$(((r_att - r_before) * 1024 / LANE_D_SESSIONS))
+	[ "$LANE_D_SESSIONS" -gt 0 ] && [ "$r_off" -gt "$r_before" ] &&
+		per_sess=$(((r_off - r_before) * 1024 / LANE_D_SESSIONS))
+	[ "$accepted" -gt 0 ] && [ "$r_fill" -gt "$r_off" ] &&
+		per_msg=$(((r_fill - r_off) * 1024 / accepted))
 	# The authoritative drained total comes from the CONTAINERS' OWN LOGS, never
 	# from the REST scrape. A container whose REST endpoint fails to bind still
 	# drains its share correctly and still logs its counters — but the scrape
@@ -1094,6 +1135,11 @@ lane_d() {
 		echo "  backlog held at resume    $((accepted - dropped)) msgs (inferred — see note below)"
 		echo "  drained after resume      $drained msgs (${pct}% of accepted, from $logged_n/$expect_c container logs)"
 		echo "  drain time                ${drain_secs}s  (~${rate} msg/s)"
+		echo
+		echo "  footprint (broker RSS deltas, summed over $N broker(s)):"
+		echo "    per session, connected  ${per_conn} bytes"
+		echo "    per session, OFFLINE    ${per_sess} bytes   <- the fleet-sizing number"
+		echo "    per queued message      ${per_msg} bytes"
 		echo
 		echo "  A gap between accepted and drained is only a DEFECT if 'dropped' does"
 		echo "  not explain it: an over-cap queue is a disclosed bound (ADR 0001 §6),"
