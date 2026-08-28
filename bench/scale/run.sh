@@ -123,6 +123,27 @@ trap teardown EXIT INT TERM
 	die "terraform init failed"
 }
 
+# The durable_bench driver is built from BENCH_GIT_REF. Its default was "main",
+# which is the one thing a pinned ref must not be: main moves, so two lane A runs
+# days apart measure different HARNESSES as well as different brokers. Measured
+# 2026-08-28 — the same broker (v1.0.9), same size, same shape, built from main on
+# 08-26 vs from a pinned commit: 20 394 vs 25 292 msg/s, non-overlapping across
+# three reps each. A 24% swing from the harness alone, which is larger than most
+# effects this rig is used to detect.
+#
+# Default to the release tag of the version under test, so a run is reproducible
+# from what it reports. A CROSS-VERSION comparison must pin BENCH_GIT_REF
+# explicitly to one commit for every arm — otherwise the harness varies with the
+# broker and the difference cannot be attributed.
+if [ -z "${BENCH_GIT_REF:-}" ] && [ -n "${MQTTD_VERSION:-}" ]; then
+	if git -C "$REPO_ROOT" rev-parse -q --verify "refs/tags/v$MQTTD_VERSION" >/dev/null 2>&1; then
+		BENCH_GIT_REF="v$MQTTD_VERSION"
+		say "bench driver pinned to tag $BENCH_GIT_REF (set BENCH_GIT_REF to override; pin it explicitly when comparing versions)"
+	else
+		warn "no tag v$MQTTD_VERSION — the bench driver builds from main, so this run is NOT reproducible and NOT comparable to another"
+	fi
+fi
+
 for N in "${SIZES[@]}"; do
 	if [ -f "$RUN/done-$N" ]; then
 		say "size $N already completed in this run dir — skipping (RESUME)"

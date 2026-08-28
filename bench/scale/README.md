@@ -144,6 +144,19 @@ it proves the rig end to end for cents and its numbers are never published.
   serves the binary to the brokers for the per-host fsync **barrier probes**
   that gate Curve 1.
 
+**The bench driver is pinned to the release under test.** Lane A's `durable_bench`
+is built from `BENCH_GIT_REF`, which now defaults to the tag matching
+`MQTTD_VERSION` — it used to default to `main`, and `main` moves. Two lane A runs
+days apart therefore measured different *harnesses* as well as different brokers:
+on 2026-08-28 the same broker (v1.0.9), same size and same shape gave 20 394 vs
+25 292 msg/s depending only on which `main` the driver came from, non-overlapping
+across three reps each. That 24% is larger than most effects this rig is used to
+detect.
+
+For a **cross-version comparison, pin `BENCH_GIT_REF` explicitly** to one commit
+for every arm. Otherwise the harness varies with the broker and any difference is
+unattributable.
+
 Lane definitions, the ladder, and every validity rule live in `run-curve.sh`
 and are documented in `docs/benchmarks/SCALE-CURVE.md` — the method is fixed
 before the first paid run.
