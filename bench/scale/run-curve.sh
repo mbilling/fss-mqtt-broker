@@ -123,14 +123,32 @@ LANE_D_DRAIN_SECS="${LANE_D_DRAIN_SECS_OVERRIDE:-$LANE_D_DRAIN_SECS}"
 # exactly over 3, 5 and 10 brokers. LANE_B_PUBS_OVERRIDE reproduces an older
 # campaign's population verbatim (and its ceilings).
 LANE_B_PUBS="${LANE_B_PUBS_OVERRIDE:-12000}" # per-rung rate = LANE_B_PUBS * 1000/I
-# Total subscribers in the ONE shared group ($share/g1). This is the variable
-# that has never changed in this project's history, and the fan-out ceiling has
-# tracked it exactly: every saturated configuration — publisher counts 3000,
-# 4000 and 6000, socket mode `once` and `true`, offers from 200k to 800k —
-# delivered 300-326k, which is ~1000 msg/s per subscriber every time, with
-# brokers at 26-35% CPU and latency flat at p50 <=10ms. A per-subscriber
-# ceiling and a fixed subscriber count multiply out to a fixed wall.
-# LANE_B_SUBS_OVERRIDE raises it to test exactly that.
+# Total subscribers in the ONE shared group ($share/g1).
+#
+# This comment used to read a ~1000 msg/s PER-SUBSCRIBER ceiling out of the fact
+# that every saturated configuration — publisher counts 3000/4000/6000, both
+# socket modes, offers from 200k to 800k — delivered 300-326k against 300
+# subscribers, with brokers at 26-35% CPU. It called that a per-subscriber
+# ceiling multiplied by a fixed subscriber count.
+#
+# MEASURED DIRECTLY AND FALSE (ADR 0077 T7, 2026-08-28). A $share group of 10 on
+# one node, sweeping the offered rate so per-subscriber is the rung over ten:
+#
+#     labelled     QoS 0 per sub     QoS 1 per sub
+#       20 000             2 000             2 000
+#       50 000             5 000             5 000
+#      100 000             9 978             9 956
+#
+# Both QoS levels sustained ~10 000 msg/s per subscriber — ten times the figure
+# this comment asserted, and QoS 1 cleared it as easily as QoS 0, so it was not
+# an acknowledgement cost either. What the old runs actually hit was a limit
+# elsewhere in that shape: 300 subscribers against thousands of publishers is
+# the same fan-in that PENDING_PUBLISH_CAP stalls, which voided the telematics
+# workload twice before it was understood.
+#
+# The lesson is the arithmetic, not the number: "delivered / subscribers" is a
+# QUOTIENT, and reading it as a per-subscriber ceiling assumes the subscribers
+# were the constraint. They were not. LANE_B_SUBS_OVERRIDE raises the count.
 LANE_B_SUBS="${LANE_B_SUBS_OVERRIDE:-300}"
 # Load containers per DRIVER, one vCPU each, every container spanning ALL
 # brokers (emqtt-bench's `-h a,b,c` places client i on host i mod |hosts|, so
