@@ -82,7 +82,16 @@ keeps replica groups tracked under an earlier membership and never re-greens,
 so growing 1→3→5 would measure a known-degraded configuration. `RESUME`: a
 re-run with `RUN_DIR=.runs/<stamp>` skips sizes already marked done.
 `KEEP_INFRA=1` skips teardown for debugging and prints a red reminder that the
-meter is running. Ctrl-C is safe (trapped); `kill -9` is not — after one, run
+meter is running.
+
+**Live dashboards are ON.** Each size attaches Grafana on `localhost:3000`, fed by
+an Alloy scraper on driver-1 that reads every broker's `/metrics` over the private
+network every 2s and reverse-tunnels it to the laptop (`observe.sh`). Nothing runs
+on the broker hosts, and the scrape is a plain HTTP GET: the expensive gauges (the
+per-session sums for subscriptions, inflight and backlog bytes) are recomputed on
+the hub's own sweep tick, not per scrape. If the local stack cannot start the run
+continues unobserved with a warning. `OBSERVE=0` opts out — worth doing for a run
+whose numbers are published, if you want the measured path provably untouched. Ctrl-C is safe (trapped); `kill -9` is not — after one, run
 `./teardown.sh`.
 
 **Checking a shape without paying.** Lane B's populations must split exactly
