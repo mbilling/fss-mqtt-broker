@@ -27,12 +27,22 @@ FILE="./$WORKLOAD.env"
 	exit 2
 }
 # The file's values are DEFAULTS: only set what the caller has not.
+seen=""
 while IFS= read -r line; do
 	case "$line" in '' | \#*) continue ;; esac
 	key=${line%%=*}
 	val=${line#*=}
 	val=${val%\"}
 	val=${val#\"}
+	# A key repeated in the file is ALWAYS a mistake, and a silent one: the rule
+	# below is first-wins, so the later assignment — usually the corrected one
+	# someone appended — never takes effect. This is not hypothetical: a
+	# LANE_B_SUBS_OVERRIDE=420 appended to telematics.env was defeated by a
+	# stale =100 near the top, and a whole benchmark ran the wrong shape.
+	case " $seen " in
+	*" $key "*) echo "$FILE: '$key' is assigned twice; the later one would be silently ignored (first-wins)" >&2; exit 2 ;;
+	esac
+	seen="$seen $key"
 	[ -n "${!key+x}" ] || export "${key?}=$val"
 done <"$FILE"
 [ -z "${WORKLOAD_NOT_IMPLEMENTED:-}" ] || {
