@@ -251,15 +251,31 @@ for N in "${SIZES[@]}"; do
 		rssh "$(jq -r '.drivers[0].public_ip' "$INVENTORY")" "test -s /run/bench-driver-build-done"
 
 	"$SCALE_DIR/bootstrap-cluster.sh" "$RUN" "$INVENTORY" durable
-	# OBSERVE=1: live Grafana on the laptop, fed by an Alloy scraper on
-	# driver-1 through a reverse tunnel (bench/scale/observe.sh). Off by
-	# default so the unobserved measurement path stays byte-identical.
-	if [ "${OBSERVE:-0}" = 1 ]; then
+	# Live Grafana on the laptop, fed by an Alloy scraper on driver-1 through a
+	# reverse tunnel (bench/scale/observe.sh). ON by default; OBSERVE=0 opts out.
+	#
+	# It was off, to keep the measured path "byte-identical". That cost more than
+	# it protected. Runs across 2026-08-26..28 were all unobserved, and three
+	# problems that a live graph shows at a glance took hours to find in static
+	# snapshots afterwards: sessions still converging at N=7 (1553 -> 1537 -> 1610
+	# -> 1680 across four phases), publishers stalling on `pending-cap` drops while
+	# broker CPU sat flat, and one broker running 13 points hotter than its peers
+	# inside a mean that looked clean.
+	#
+	# The load it adds is an HTTP GET per broker every 2s. The expensive gauges —
+	# the O(sessions) sums for subscriptions, inflight and backlog bytes — are
+	# recomputed on the hub's own SWEEP TICK (hub/mod.rs, `refresh_gauges` under
+	# `sweep.tick()`), not on the scrape, so a scrape reads precomputed values and
+	# does not make the broker do the walk. Attach failure is already non-fatal.
+	#
+	# Set OBSERVE=0 for a run whose numbers are published, if you want the path
+	# provably untouched — that is a purity argument, not a measured cost.
+	if [ "${OBSERVE:-1}" = 1 ]; then
 		"$SCALE_DIR/observe.sh" attach "$RUN" "$INVENTORY" || warn "observe attach failed — continuing unobserved"
 	fi
 	"$SCALE_DIR/run-curve.sh" "$RUN" "$INVENTORY"
 	"$SCALE_DIR/collect.sh" "$RUN" "$INVENTORY"
-	if [ "${OBSERVE:-0}" = 1 ]; then
+	if [ "${OBSERVE:-1}" = 1 ]; then
 		"$SCALE_DIR/observe.sh" detach || true
 	fi
 
