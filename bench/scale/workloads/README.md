@@ -16,6 +16,17 @@ so a run is reproducible from its `.env` file and comparable across releases.
 | `smart-home` | enormous idle connection count, reconnect storms | C | memory/conn, establishment |
 | `logistics` | store-and-forward, disconnect/resume | D | offline queues, session resume |
 
+### Diagnostics, not industry shapes
+
+| probe | question | why it matters |
+|---|---|---|
+| `probe-subscriber-ceiling` | is the ~1000 msg/s per-subscriber ceiling the broker or the bench? | decides 2 vs 30 datalake consumers per site — ~6 000 vs 90 000 writers across a 3 000-site estate (ADR 0077 T7) |
+
+A probe answers one question and is read once; it is not a curve and does not
+belong in a release comparison. Run `probe-subscriber-ceiling` twice, the second
+time with `LANE_B_QOS=1` in the environment, because the figure it is testing
+came from a different shape and is not otherwise a fair comparison.
+
 A second set, added 2026-08-27, chosen for the dimensions the first five never
 touch — payload size, topic cardinality, delivery amplification, connection
 ceiling, and establishment rate:
