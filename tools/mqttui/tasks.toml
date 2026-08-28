@@ -908,6 +908,47 @@ duration = "~40m per workload curve (sizes 1, 3, 5)"
 caution = "Creates PAID cloud servers under your HCLOUD_TOKEN. Needs MQTTD_VERSION set — the binary under test is a disclosure item, never a default."
 
 [[task]]
+id = "scale-report"
+group = "Benchmark"
+name = "Build the cross-run scale report (free — reads finished runs)"
+script = "bench/scale/report.py"
+about = """
+One self-contained HTML page from run directories you already have, keyed by the mqttd
+version each recorded. Adding a cluster size, a workload or a release is pointing it at
+another run and re-running; nothing is hand-written.
+
+    ./report.py --out report.html .runs/<stamp> [.runs/<stamp> ...]
+    ./report.py --out report.html --all
+
+It reuses summarize-curve.py's parsers rather than copying them — above all the lane B
+latency histogram, which must be differenced against a post-ramp baseline and merged
+across drivers, since an end-of-rung scrape reports the container's whole lifetime and
+would otherwise put a rung's connect ramp in its published tail.
+
+Why it exists (ADR 0077): the report used to be assembled by hand, and shipped a headline
+of 1,047,236 TPS without the p99 that belongs beside it — 7.5 seconds at that rung. The
+numbers were in the raw results the whole time. Every rate now prints its tail latency, a
+rung whose offer was not met keeps its flag, lane A is marked as the only lane that
+replicates, and the footer states what the page does NOT measure.
+"""
+requires = ["python3"]
+duration = "~2s"
+
+[[task]]
+id = "scale-report-html"
+group = "Benchmark"
+name = "(module) page rendering for scale-report"
+script = "bench/scale/report_html.py"
+hidden = true
+about = """
+Imported by bench/scale/report.py, never run directly. It is kept apart from the
+extraction so the wording and layout of the page can be edited without touching
+anything that parses a measurement.
+"""
+requires = ["python3"]
+duration = "n/a — imported, not run"
+
+[[task]]
 id = "scale-teardown"
 group = "Benchmark"
 name = "Destroy any leftover scale-curve cloud resources"
