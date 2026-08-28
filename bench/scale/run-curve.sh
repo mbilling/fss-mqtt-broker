@@ -269,6 +269,11 @@ LANE_D_PORT_RESUME="${LANE_D_PORT_RESUME:-9340}"
 # would idle for ~3 minutes after a 20s drain. 30s covers the peak of any drain
 # this lane produces; the file is named for what it is (the first 30s).
 LANE_D_DRAIN_SAMPLE="${LANE_D_DRAIN_SAMPLE:-30}"
+# How long to wait for every session to register before the cycle starts. Generous
+# on purpose: exceeding it aborts a fully provisioned cluster, which costs far more
+# than waiting. The 2026-08-27 N=7 run needed well under a minute to reach the full
+# count — it simply was not asked to wait at all.
+LANE_D_ATTACH_BUDGET="${LANE_D_ATTACH_BUDGET:-300}"
 LANE_D_FLAT_POLLS="${LANE_D_FLAT_POLLS:-3}"
 
 # ── helpers ──────────────────────────────────────────────────────────────────
@@ -999,7 +1004,28 @@ lane_d() {
 	# ── phase 1: attach ─────────────────────────────────────────────────────
 	say "  [D] attaching $LANE_D_SESSIONS persistent sessions"
 	fan "attaching subscribers" "${subs[@]}"
-	sleep $((LANE_D_SESSIONS / LANE_D_CONNECT_RATE / D + 15))
+	# Wait for the sessions to EXIST, rather than sleeping a fixed interval and
+	# hoping. The old `sleep 16` held at 1-5 nodes and did not at 7, where session
+	# ownership resolves by HRW across more nodes: the 2026-08-27 run opened its
+	# offline window with 1553 of 1680 sessions registered and the count still
+	# climbing (1553 -> 1537 -> 1610 -> 1680 across the four phases). The publishers
+	# then aimed 40 seconds of traffic at sessions that did not exist yet, and the
+	# lane reported a 7% "shortfall" with ZERO drops — because there was no session
+	# to drop for. Both the v1.0.9 and v1.0.10 N=7 numbers are void for this reason;
+	# 1/3/5 reached the full count immediately and are unaffected.
+	sessions_registered() {
+		local i total=0 v
+		for ((i = 0; i < N; i++)); do
+			v=$(rssh "$(broker_pub_ip "$i")" \
+				"curl -s http://localhost:8080/metrics | awk '/^mqttd_sessions /{print \$2}'" 2>/dev/null)
+			total=$((total + ${v:-0}))
+		done
+		[ "$total" -ge "$LANE_D_SESSIONS" ]
+	}
+	wait_for "all $LANE_D_SESSIONS sessions registered across $N broker(s)" "$LANE_D_ATTACH_BUDGET" sessions_registered
+	# One more settle so the count is not merely reached but stable — the metric is
+	# a per-node gauge summed across nodes, so it can touch the target transiently.
+	sleep 5
 	rss_snapshot "$ddir" attached
 	snapshot_metrics "$ddir" attached
 	# ── phase 2: detach — kill the containers, keep the sessions ────────────
