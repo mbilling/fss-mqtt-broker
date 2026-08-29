@@ -39,7 +39,7 @@ mkdir -p "$OUT"
 
 LANES="${LANES:-ABC}"
 case "$LANES" in
-*[!ABCD]* | "") die "LANES must be a non-empty subset of ABCD (got: $LANES)" ;;
+*[!ABCDE]* | "") die "LANES must be a non-empty subset of ABCDE (got: $LANES)" ;;
 esac
 
 # ── knobs (each SMOKE value proves the path, not the number) ─────────────────
@@ -52,6 +52,8 @@ if [ "${SMOKE:-0}" = 1 ]; then
 	LANE_D_SESSIONS=120
 	LANE_D_OFFLINE_SECS=15
 	LANE_D_DRAIN_SECS=60
+	LANE_E_SITES=(1)
+	LANE_E_SECS=15
 	A_REPS=1 A_SECS=15 A_WARMUP=3
 	BARRIER_OPS=50
 elif [ "${STANDARD:-0}" = 1 ]; then
@@ -75,6 +77,8 @@ elif [ "${STANDARD:-0}" = 1 ]; then
 	LANE_D_SESSIONS=1680
 	LANE_D_OFFLINE_SECS=30
 	LANE_D_DRAIN_SECS=120
+	LANE_E_SITES=(1 2 4)
+	LANE_E_SECS=45
 else
 	LANE_B_RUNGS=(300000 200000 100000 50000 20000)
 	LANE_B_SECS=60
@@ -84,6 +88,8 @@ else
 	LANE_D_SESSIONS=1680
 	LANE_D_OFFLINE_SECS=40
 	LANE_D_DRAIN_SECS=180
+	LANE_E_SITES=(1 2 4 8)
+	LANE_E_SECS=60
 	A_REPS=3 A_SECS=60 A_WARMUP=10
 	BARRIER_OPS=150
 fi
@@ -95,6 +101,14 @@ fi
 # ladder — one rung is the cheapest way to ask one question.
 if [ -n "${LANE_B_RUNGS_OVERRIDE:-}" ]; then
 	read -r -a LANE_B_RUNGS <<<"$LANE_B_RUNGS_OVERRIDE"
+fi
+# Lane E's ladder is a SITE COUNT, so it is profile-set for the same reason and
+# overridable the same way. Unlike lane B's, it runs BOTTOM RUNG FIRST: a site
+# ladder is looking for the count at which latency leaves its budget, and the
+# rung below the knee is the answer — so reaching it must not depend on the rung
+# above it having already been paid for.
+if [ -n "${LANE_E_SITES_OVERRIDE:-}" ]; then
+	read -r -a LANE_E_SITES <<<"$LANE_E_SITES_OVERRIDE"
 fi
 # Lane D's population and window are profile-set (a smoke must stay cheap), so
 # a NAMED workload pins them the same way lane B's ladder does: through an
@@ -293,6 +307,60 @@ LANE_D_DRAIN_SAMPLE="${LANE_D_DRAIN_SAMPLE:-30}"
 # count — it simply was not asked to wait at all.
 LANE_D_ATTACH_BUDGET="${LANE_D_ATTACH_BUDGET:-300}"
 LANE_D_FLAT_POLLS="${LANE_D_FLAT_POLLS:-3}"
+
+# ── lane E — scale-out by tenant (the SCADA shape) ───────────────────────────
+# Every other lane varies ONE dimension against a fixed population: lane B's
+# rungs change the offered rate while the publisher and subscriber counts stay
+# put. A real estate does not grow that way. A wind operator adds a SITE, and a
+# site arrives with its own turbines, its own message rate and its own consumers
+# all at once. So the rung here is a site count and everything scales with it —
+# which is also why lane B's knee detection cannot express this shape.
+#
+# One site, measured rather than invented: LANE_E_SITE_RATE msg/s of QoS 0
+# telemetry at LANE_E_PAYLOAD bytes, published by LANE_E_PUBS_PER_SITE clients
+# on `site/<s>/%i`, consumed by LANE_E_SUBS_PER_SITE clients in that site's OWN
+# $share group. Sites are independent — a site's traffic never reaches another
+# site's consumers — which is what makes this a tenancy question rather than
+# another fan-out.
+LANE_E_SITE_RATE="${LANE_E_SITE_RATE:-30000}"
+# 1,200 rather than the estate's nominal 1,000 turbines, for exactly the reason
+# lane B refuses a fractional rung: 1,000 publishers sharing 30,000 msg/s needs
+# -I 33.33ms and emqtt-bench takes WHOLE milliseconds — 33 offers 30,303 and 34
+# offers 29,412, neither of which is the number on the label. 1,200 at 25 msg/s
+# is exactly 40ms and exactly 30,000. Any combination that does not divide is
+# refused in the shape check rather than silently rounded.
+LANE_E_PUBS_PER_SITE="${LANE_E_PUBS_PER_SITE:-1200}"
+# SIX, not the two ADR 0077 T3 was first written with. The T7 probe measured a
+# QoS 0 $share consumer holding 5,000 msg/s at p99 <=1ms and 9,977 msg/s at
+# <=1000ms, then collapsing (46,028 delivered of 200,000 offered). Two consumers
+# per site puts each at 15,000 msg/s — past everything we have sustained — and
+# the FIRST rung would have failed for a reason that has nothing to do with
+# tenancy. Six puts each consumer at 5,000, inside the band worth advertising.
+LANE_E_SUBS_PER_SITE="${LANE_E_SUBS_PER_SITE:-6}"
+LANE_E_QOS="${LANE_E_QOS:-0}"
+LANE_E_PAYLOAD="${LANE_E_PAYLOAD:-200}"
+# A site's publishers are split over this many containers. One container per
+# site would ask a single emqtt-bench worker for the whole 30,000 msg/s; the
+# most any container on this rig has been measured to sustain is ~27,000
+# (2026-08-26: 25 containers offering 667k). Two keeps each at 15,000, which is
+# comfortably inside the 20,000/container the T7 probe held exactly.
+LANE_E_PUB_CONTAINERS_PER_SITE="${LANE_E_PUB_CONTAINERS_PER_SITE:-2}"
+LANE_E_SUB_CONTAINERS_PER_SITE="${LANE_E_SUB_CONTAINERS_PER_SITE:-1}"
+LANE_E_CONNECT_RATE="${LANE_E_CONNECT_RATE:-500}"
+LANE_E_SETTLE="${LANE_E_SETTLE:-20}"
+LANE_E_MIN_INTERVAL="${LANE_E_MIN_INTERVAL:-5}"
+# A rung PASSES only if its p99 stays under this many ms. The point of a tenancy
+# ladder is the site count at which latency leaves the band, not the count at
+# which the broker finally refuses traffic — those are far apart, and only the
+# first one is sellable.
+LANE_E_P99_BUDGET_MS="${LANE_E_P99_BUDGET_MS:-1000}"
+# Containers per driver is the HARNESS's ceiling and it is easy to cross by
+# accident, because it grows with the rung: each container is pinned to one vCPU
+# and the drivers are 8-vCPU CCX33s. Crossing it does not fail loudly — it just
+# quietly stops offering the labelled rate, which is the single most expensive
+# failure mode this rig has (every wrong answer in the 2026-08 campaign was the
+# harness). Refused in the shape check, where it costs nothing.
+LANE_E_MAX_CONTAINERS_PER_DRIVER="${LANE_E_MAX_CONTAINERS_PER_DRIVER:-8}"
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 brokers_csv() { # brokers_csv <suffix-jq> — comma list over brokers
@@ -548,8 +616,89 @@ lane_d_shape() {
 }
 lane_d_shape
 
+# ── lane E shape: the ladder GROWS the population, so every rung is checked ───
+# Lane B's shape is verified once because its population is fixed. Lane E's is
+# not: publishers, consumers and containers all scale with the site count, so a
+# ladder can be perfectly valid at 1 site and impossible at 8. Every rung is
+# therefore checked here, before the first ssh — the top rung failing after the
+# bottom three have been paid for is the expensive version of this.
+lane_e_shape() {
+	[[ "$LANES" == *E* ]] || return 0
+	positive_int LANE_E_SITE_RATE "$LANE_E_SITE_RATE"
+	positive_int LANE_E_PUBS_PER_SITE "$LANE_E_PUBS_PER_SITE"
+	positive_int LANE_E_SUBS_PER_SITE "$LANE_E_SUBS_PER_SITE"
+	positive_int LANE_E_PUB_CONTAINERS_PER_SITE "$LANE_E_PUB_CONTAINERS_PER_SITE"
+	positive_int LANE_E_SUB_CONTAINERS_PER_SITE "$LANE_E_SUB_CONTAINERS_PER_SITE"
+	positive_int LANE_E_MAX_CONTAINERS_PER_DRIVER "$LANE_E_MAX_CONTAINERS_PER_DRIVER"
+	case "$LANE_E_QOS" in 0 | 1) ;; *) die "LANE_E_QOS must be 0 or 1, got '$LANE_E_QOS'" ;; esac
+	[ "${#LANE_E_SITES[@]}" -gt 0 ] || die "LANE_E_SITES is empty — nothing to run"
+
+	# The per-publisher timer. Whole milliseconds, exactly as lane B: a floored
+	# -I offers a rate other than the label, and the label is what gets published.
+	local per_pub_rate interval
+	[ $((LANE_E_SITE_RATE % LANE_E_PUBS_PER_SITE)) -eq 0 ] ||
+		die "lane E: $LANE_E_PUBS_PER_SITE publishers cannot share $LANE_E_SITE_RATE msg/s evenly — each would carry $LANE_E_SITE_RATE/$LANE_E_PUBS_PER_SITE msg/s. Use a LANE_E_PUBS_PER_SITE that divides LANE_E_SITE_RATE"
+	per_pub_rate=$((LANE_E_SITE_RATE / LANE_E_PUBS_PER_SITE))
+	[ $((1000 % per_pub_rate)) -eq 0 ] ||
+		die "lane E: $per_pub_rate msg/s per publisher needs -I $((1000 / per_pub_rate)).$(((1000 * 10 / per_pub_rate) % 10))ms and emqtt-bench takes whole ms — pick a LANE_E_PUBS_PER_SITE whose per-publisher rate divides 1000 (25 -> 40ms, 20 -> 50ms, 50 -> 20ms)"
+	interval=$((1000 / per_pub_rate))
+	[ "$interval" -ge "$LANE_E_MIN_INTERVAL" ] ||
+		die "lane E: -I ${interval}ms is below LANE_E_MIN_INTERVAL=$LANE_E_MIN_INTERVAL — the drivers collapse below it (#421)"
+
+	# Each site's populations must split exactly over that site's own containers.
+	[ $((LANE_E_PUBS_PER_SITE % LANE_E_PUB_CONTAINERS_PER_SITE)) -eq 0 ] ||
+		die "lane E: $LANE_E_PUBS_PER_SITE publishers do not split over $LANE_E_PUB_CONTAINERS_PER_SITE containers per site"
+	[ $((LANE_E_SUBS_PER_SITE % LANE_E_SUB_CONTAINERS_PER_SITE)) -eq 0 ] ||
+		die "lane E: $LANE_E_SUBS_PER_SITE consumers do not split over $LANE_E_SUB_CONTAINERS_PER_SITE containers per site"
+	local pubs_per_c=$((LANE_E_PUBS_PER_SITE / LANE_E_PUB_CONTAINERS_PER_SITE))
+	local subs_per_c=$((LANE_E_SUBS_PER_SITE / LANE_E_SUB_CONTAINERS_PER_SITE))
+	local per_c_rate=$((LANE_E_SITE_RATE / LANE_E_PUB_CONTAINERS_PER_SITE))
+	local per_sub_rate=$((LANE_E_SITE_RATE / LANE_E_SUBS_PER_SITE))
+
+	{
+		echo "brokers=$N drivers=$D"
+		echo "site = $LANE_E_PUBS_PER_SITE publishers x $per_pub_rate msg/s x ${LANE_E_PAYLOAD}B qos $LANE_E_QOS = $LANE_E_SITE_RATE msg/s"
+		echo "       -> \$share group of $LANE_E_SUBS_PER_SITE on site/<s>/# = $per_sub_rate msg/s per consumer"
+		echo "per_publisher_interval_ms=$interval"
+		echo "containers per site: $LANE_E_PUB_CONTAINERS_PER_SITE pub ($pubs_per_c clients, $per_c_rate msg/s each) + $LANE_E_SUB_CONTAINERS_PER_SITE sub ($subs_per_c clients)"
+		echo "p99 budget: ${LANE_E_P99_BUDGET_MS}ms (a rung above it is reported as OVER BUDGET, not as a failure)"
+		echo
+		echo "  sites | publishers | consumers |   offered/s | containers | per driver | verdict"
+	} >"$OUT/laneE/shape.txt"
+
+	local sites cps total_c per_driver verdict worst=0
+	for sites in "${LANE_E_SITES[@]}"; do
+		positive_int "lane E rung" "$sites"
+		cps=$((LANE_E_PUB_CONTAINERS_PER_SITE + LANE_E_SUB_CONTAINERS_PER_SITE))
+		total_c=$((sites * cps))
+		# Sites are dealt round-robin to drivers, so the busiest driver carries
+		# ceil(sites/D) sites' worth of containers.
+		per_driver=$(((sites + D - 1) / D * cps))
+		if [ "$per_driver" -gt "$LANE_E_MAX_CONTAINERS_PER_DRIVER" ]; then
+			verdict="REFUSED: $per_driver containers on the busiest driver > $LANE_E_MAX_CONTAINERS_PER_DRIVER"
+			worst=1
+		else
+			verdict="ok"
+		fi
+		printf '  %5d | %10d | %9d | %11d | %10d | %10d | %s\n' \
+			"$sites" "$((sites * LANE_E_PUBS_PER_SITE))" "$((sites * LANE_E_SUBS_PER_SITE))" \
+			"$((sites * LANE_E_SITE_RATE))" "$total_c" "$per_driver" "$verdict" \
+			>>"$OUT/laneE/shape.txt"
+	done
+	if [ "$worst" = 1 ]; then
+		sed 's/^/    /' "$OUT/laneE/shape.txt" >&2
+		die "lane E: a rung needs more containers per driver than $LANE_E_MAX_CONTAINERS_PER_DRIVER (one vCPU each on 8-vCPU drivers). Raise DRIVER_COUNT, shorten LANE_E_SITES, or lower LANE_E_PUB_CONTAINERS_PER_SITE — a driver that cannot offer the rate makes the rung look like a broker limit"
+	fi
+	say "[$N nodes] lane E shape (kept as laneE/shape.txt):"
+	sed 's/^/    /' "$OUT/laneE/shape.txt" >&2
+}
+if [[ "$LANES" == *E* ]]; then
+	mkdir -p "$OUT/laneE"
+	lane_e_shape
+fi
+
 if [ "${SHAPE_ONLY:-0}" = 1 ]; then
-	say "SHAPE_ONLY=1 — knobs and lane B/D shapes verified; touching no host"
+	say "SHAPE_ONLY=1 — knobs and lane B/D/E shapes verified; touching no host"
 	exit 0
 fi
 
@@ -1205,6 +1354,116 @@ lane_d() {
 }
 lane_d
 fi # LANES *D*
+
+# ── 4c. lane E — scale-out by tenant ─────────────────────────────────────────
+if [[ "$LANES" != *E* ]]; then
+	say "[$N nodes] LANES=$LANES — skipping lane E"
+else
+say "[$N nodes] lane E: site ladder ${LANE_E_SITES[*]} x $LANE_E_SITE_RATE msg/s"
+lane_e_rung() { # lane_e_rung <sites>
+	local sites="$1"
+	local rdir="$OUT/laneE/sites-$sites"
+	mkdir -p "$rdir/.batch"
+	# Verified exact by lane_e_shape before any host was touched.
+	local per_pub_rate=$((LANE_E_SITE_RATE / LANE_E_PUBS_PER_SITE))
+	local interval=$((1000 / per_pub_rate))
+	local pubs_per_c=$((LANE_E_PUBS_PER_SITE / LANE_E_PUB_CONTAINERS_PER_SITE))
+	local subs_per_c=$((LANE_E_SUBS_PER_SITE / LANE_E_SUB_CONTAINERS_PER_SITE))
+	local port_base=9400 active="-A true" port=1883
+	local -a HOSTS
+	IFS=, read -r -a HOSTS <<<"$(brokers_csv '.private_ip')"
+	# Same spread discipline as lane B: client i lands on host i mod N, and each
+	# container's host list is rotated by its global index so a remainder does not
+	# always land on broker 0.
+	rotated_hosts() { # rotated_hosts <container-index>
+		local rot=$(($1 % N)) i out=""
+		for ((i = 0; i < N; i++)); do out+="${HOSTS[(rot + i) % N]},"; done
+		echo "${out%,}"
+	}
+	local di s j sdi hosts filter seq_base cidx
+	local -a subs pubs scrape stop names portn
+	for ((di = 0; di < D; di++)); do
+		subs[di]="set -e"$'\n'
+		pubs[di]="set -e"$'\n'
+		scrape[di]=""
+		stop[di]=""
+		names[di]=""
+		portn[di]=0
+	done
+	# Sites are dealt round-robin to drivers. A site is a UNIT: its publishers and
+	# its consumers live on the same driver, so a rung never measures a site whose
+	# two halves were competing for different hardware.
+	for ((s = 0; s < sites; s++)); do
+		sdi=$((s % D))
+		for ((j = 0; j < LANE_E_SUB_CONTAINERS_PER_SITE; j++)); do
+			cidx=$((s * LANE_E_SUB_CONTAINERS_PER_SITE + j))
+			hosts=$(rotated_hosts "$cidx")
+			# Each site has its OWN $share group. One group per site is what makes
+			# these tenants rather than one big shared subscription: a publish for
+			# site 3 is selected among site 3's consumers only.
+			filter="\$share/site$s/site/$s/#"
+			subs[sdi]+="$DOCKER_RUN --name sub-s$s-$j $BENCH_IMG sub -h $hosts -p $port -c $subs_per_c -R $LANE_E_CONNECT_RATE -t '$filter' -q $LANE_E_QOS $active --payload-hdrs ts --prometheus --restapi $((port_base + portn[sdi])) >/dev/null"$'\n'
+			scrape[sdi]+="printf '\\n@@@ sub-s$s-$j\\n'; curl -s http://localhost:$((port_base + portn[sdi]))/metrics"$'\n'
+			stop[sdi]+="printf '\\n@@@ sub-s$s-$j\\n'; docker logs sub-s$s-$j 2>&1"$'\n'
+			names[sdi]+=" sub-s$s-$j"
+			portn[sdi]=$((portn[sdi] + 1))
+		done
+		for ((j = 0; j < LANE_E_PUB_CONTAINERS_PER_SITE; j++)); do
+			cidx=$((s * LANE_E_PUB_CONTAINERS_PER_SITE + j))
+			hosts=$(rotated_hosts "$cidx")
+			# `-n` offsets the topic numbering per container so a site's topic set is
+			# site/<s>/1..LANE_E_PUBS_PER_SITE regardless of how many containers carry
+			# it — the same reason lane B does it (ADR 0048 §2: the topic count must
+			# not change with fleet shape).
+			seq_base=$((j * pubs_per_c))
+			pubs[sdi]+="$DOCKER_RUN --name pub-s$s-$j $BENCH_IMG pub -h $hosts -p $port -c $pubs_per_c -R $LANE_E_CONNECT_RATE -t 'site/$s/%i' -q $LANE_E_QOS -s $LANE_E_PAYLOAD $active -n $seq_base -I $interval --payload-hdrs ts >/dev/null"$'\n'
+			stop[sdi]+="printf '\\n@@@ pub-s$s-$j\\n'; docker logs pub-s$s-$j 2>&1"$'\n'
+			names[sdi]+=" pub-s$s-$j"
+		done
+	done
+	local -a pids
+	local pd
+	snapshot_metrics "$rdir" before
+	pids=()
+	for ((di = 0; di < D; di++)); do driver_batch "$di" "${subs[di]}" & pids+=($!); done
+	for pd in "${pids[@]}"; do wait "$pd" || die "lane E: starting consumer containers failed (rung $sites sites)"; done
+	sleep 5
+	pids=()
+	for ((di = 0; di < D; di++)); do driver_batch "$di" "${pubs[di]}" & pids+=($!); done
+	for pd in "${pids[@]}"; do wait "$pd" || die "lane E: starting publisher containers failed (rung $sites sites)"; done
+	start_cpu_sampling "$rdir/cpu" $((LANE_E_SETTLE + LANE_E_SECS))
+	# Baseline the histograms AFTER the ramp, exactly as lane B does: the counters
+	# are cumulative over the container's life, so a single end-of-rung scrape
+	# bakes the connect ramp into the published tail.
+	sleep "$LANE_E_SETTLE"
+	pids=()
+	for ((di = 0; di < D; di++)); do driver_batch "$di" "${scrape[di]}" >"$rdir/.batch/base-$di" 2>/dev/null & pids+=($!); done
+	for pd in "${pids[@]}"; do wait "$pd" || true; done
+	for ((di = 0; di < D; di++)); do batch_split "$rdir" "-base.prom" "$rdir/.batch/base-$di"; done
+	sleep "$LANE_E_SECS"
+	pids=()
+	for ((di = 0; di < D; di++)); do driver_batch "$di" "${scrape[di]}" >"$rdir/.batch/final-$di" 2>/dev/null & pids+=($!); done
+	for pd in "${pids[@]}"; do wait "$pd" || true; done
+	for ((di = 0; di < D; di++)); do batch_split "$rdir" ".prom" "$rdir/.batch/final-$di"; done
+	pids=()
+	for ((di = 0; di < D; di++)); do driver_batch "$di" "${stop[di]}docker rm -f${names[di]} >/dev/null 2>&1" >"$rdir/.batch/stop-$di" 2>/dev/null & pids+=($!); done
+	for pd in "${pids[@]}"; do wait "$pd" || true; done
+	for ((di = 0; di < D; di++)); do batch_split "$rdir" ".log" "$rdir/.batch/stop-$di"; done
+	rm -rf "$rdir/.batch"
+	stop_cpu_sampling
+	snapshot_metrics "$rdir" after
+	echo "sites=$sites offered=$((sites * LANE_E_SITE_RATE)) publishers=$((sites * LANE_E_PUBS_PER_SITE)) consumers=$((sites * LANE_E_SUBS_PER_SITE)) per_consumer=$((LANE_E_SITE_RATE / LANE_E_SUBS_PER_SITE)) p99_budget_ms=$LANE_E_P99_BUDGET_MS" >"$rdir/rung.txt"
+	say "  lane E: $sites site(s) done ($((sites * LANE_E_SITE_RATE)) msg/s offered)"
+}
+# BOTTOM RUNG FIRST — the opposite of lane B, deliberately. Lane B's top rung is
+# the one that decides whether the rig can offer the load at all. Lane E is
+# looking for the site count at which latency leaves its budget, and that answer
+# lives at the BOTTOM of the ladder; reaching it must not depend on the rungs
+# above it having already been paid for.
+for e_sites in "${LANE_E_SITES[@]}"; do
+	lane_e_rung "$e_sites"
+done
+fi # LANES *E*
 
 # ── 5. host facts for the disclosure block ───────────────────────────────────
 mkdir -p "$OUT/env"
