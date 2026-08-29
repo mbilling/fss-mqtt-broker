@@ -20,10 +20,36 @@ so a run is reproducible from its `.env` file and comparable across releases.
 
 | probe | question | why it matters |
 |---|---|---|
-| `probe-subscriber-ceiling` | is the ~1000 msg/s per-subscriber ceiling the broker or the bench? | decides 2 vs 30 datalake consumers per site — ~6 000 vs 90 000 writers across a 3 000-site estate (ADR 0077 T7) |
+| `probe-subscriber-ceiling` | is the ~1000 msg/s per-subscriber ceiling real? | **ANSWERED 2026-08-28: no.** ~10 000 msg/s per subscriber at BOTH QoS 0 and QoS 1 — ten times the figure that was documented (ADR 0077 T7) |
 
 A probe answers one question and is read once; it is not a curve and does not
-belong in a release comparison. Run `probe-subscriber-ceiling` twice, the second
+belong in a release comparison.
+
+**What T7 found.** A `$share` group of 10 on one node, sweeping the offered rate
+so per-subscriber is the rung over ten:
+
+| labelled | QoS 0 per sub | QoS 1 per sub |
+|---|---|---|
+| 20 000 | 2 000 | 2 000 |
+| 50 000 | 5 000 | 5 000 |
+| **100 000** | **9 978** | **9 956** |
+
+`pub_overrun` was 0 for QoS 0 through 100 000, so the publishers held schedule
+and the delivered rate is the broker's, not a driver artifact. The broker's own
+counters show `received == delivered` at every rung — in a shared group each
+message goes to exactly one member, and none were lost.
+
+QoS 1 cleared the old figure as easily as QoS 0, so it was never an
+acknowledgement cost. The old runs put 300 subscribers against thousands of
+publishers, which is the fan-in shape `PENDING_PUBLISH_CAP` stalls — the same
+limit that voided `telematics` twice. "Delivered ÷ subscribers" is a quotient;
+reading it as a per-subscriber ceiling assumed the subscribers were the
+constraint, and they were not.
+
+**Consequence for sizing.** A site producing 30 000 msg/s needs **2–4** shared
+consumers, not 30. Across a 3 000-site estate that is ~12 000 datalake writers
+rather than 90 000 — which also removes the small-file problem that many writers
+would create in object storage. Run `probe-subscriber-ceiling` twice, the second
 time with `LANE_B_QOS=1` in the environment, because the figure it is testing
 came from a different shape and is not otherwise a fair comparison.
 
