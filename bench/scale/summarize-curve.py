@@ -238,9 +238,35 @@ def lane_b_rung(rdir: Path, offered: int) -> dict:
     sent = sent_rate = recv = recv_rate = 0.0
     late_rate = 0.0
     for log in rdir.glob("pub-*.log"):
-        t, r = driver_rate(log, "pub")
-        sent += t
-        sent_rate += r
+        # emqtt-bench 0.6.3 counts a QoS 0 publish TWICE. `publish/2` increments
+        # `pub` when `emqtt:publish` returns a bare `ok` (emqtt_bench.erl:913),
+        # then its caller in `loop/5` matches that same `ok` and increments `pub`
+        # again (:713). At QoS > 0 the return is `{ok, #{reason_code := ...}}`,
+        # so the callee increments `pub_succ` instead and only the caller touches
+        # `pub` — one count each.
+        #
+        # So `pub` alone is 2x the truth at QoS 0 and 1x at QoS 1, which is
+        # exactly what the rig measured (2.00x on every QoS 0 rung of the T7
+        # probe AND of market-data; 1.00x on every QoS 1 rung). `pub + pub_succ`
+        # is therefore 2x in BOTH cases, and half of it is the real rate at
+        # either QoS — verified against both arms, 1.00x at every rung.
+        #
+        # The blast radius is narrow but it hit exactly one real shape.
+        # `sustained` below is recv >= KNEE_OK * sent, so a doubled `sent` only
+        # breaks the test where recv is CLOSE to sent:
+        #
+        #   market-data  QoS 0, fan-out 240 subs   recv/sent 240/2 = 120  fine
+        #   telematics   QoS 1, $share            recv/sent   1/1 =   1  fine
+        #   T7 probe     QoS 0, $share            recv/sent   1/2 = 0.5  BROKEN
+        #
+        # So no published curve was wrong — fan-out shapes cleared 0.99 even at
+        # 2x, and QoS 1 never doubled. But QoS 0 + $share is precisely the SCADA
+        # telemetry shape, and on it this module reported "NO sustained rung" for
+        # a run whose first three rungs delivered their offer exactly.
+        t_pub, r_pub = driver_rate(log, "pub")
+        t_succ, r_succ = driver_rate(log, "pub_succ")
+        sent += (t_pub + t_succ) // 2
+        sent_rate += (r_pub + r_succ) / 2
         # emqtt-bench counts a publish that ran behind its own schedule as
         # pub_overrun; the share of them in the steady window is the direct
         # symptom of the round-trip floor described below.
@@ -345,7 +371,57 @@ def xychart(title: str, xs: list[int], ys: list[float], ylabel: str) -> str:
     )
 
 
+def self_test() -> None:
+    """Pin the emqtt-bench publish double-count correction (issue: lane B T9).
+
+    Runs against synthesized driver logs — no cluster, no cost — so CI catches a
+    regression in the one arithmetic step that decides whether a rung counts as
+    sustained. See the long comment in `lane_b_rung` for the upstream cause.
+    """
+    import tempfile
+
+    def log_for(qos: int, rate: int, secs: int = 70) -> str:
+        """Reproduce what emqtt-bench 0.6.3 actually writes.
+
+        QoS 0: `pub` is incremented by BOTH publish/2 and its caller, and
+        `pub_succ` is never touched. QoS 1: each increments a different counter,
+        so both land on `rate` exactly.
+        """
+        lines = []
+        for t in range(secs + 1):
+            stamp = f"{t // 60}m{t % 60}s" if t >= 60 else f"{t}s"
+            pub = rate * t * (2 if qos == 0 else 1)
+            succ = 0 if qos == 0 else rate * t
+            lines.append(f"{stamp} pub total={pub} rate={rate}/sec")
+            lines.append(f"{stamp} pub_succ total={succ} rate={rate}/sec")
+        return "\n".join(lines) + "\n"
+
+    failures = []
+    with tempfile.TemporaryDirectory() as td:
+        for qos in (0, 1):
+            for rate in (20_000, 50_000, 100_000):
+                f = Path(td) / f"pub-q{qos}-{rate}.log"
+                f.write_text(log_for(qos, rate))
+                t_pub, r_pub = driver_rate(f, "pub")
+                t_succ, r_succ = driver_rate(f, "pub_succ")
+                got = (r_pub + r_succ) / 2
+                if abs(got - rate) > 1:
+                    failures.append(f"QoS {qos} @ {rate}/s: corrected rate {got} != {rate}")
+                # and the uncorrected read is wrong in exactly the way we claim
+                if qos == 0 and abs(r_pub - 2 * rate) > 1:
+                    failures.append(f"QoS {qos} @ {rate}/s: expected raw pub to be 2x, got {r_pub}")
+
+    if failures:
+        for f in failures:
+            print(f"FAIL {f}", file=sys.stderr)
+        sys.exit(1)
+    print("summarize-curve self-test: publish double-count correction OK (6 cases)")
+
+
 def main() -> None:
+    if len(sys.argv) == 2 and sys.argv[1] == "--self-test":
+        self_test()
+        return
     if len(sys.argv) != 2:
         sys.exit(__doc__)
     root = Path(sys.argv[1])
