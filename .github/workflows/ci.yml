@@ -175,6 +175,11 @@ jobs:
       # not. Runs before the gate itself would be trusted on real source.
       - name: The hygiene gate's rules still draw the lines they document
         run: python3 scripts/check-test-hygiene.py --self-test
+      # The scale rig's knee detection turns on one division. emqtt-bench counts a QoS 0
+      # publish twice, so reading its `pub` counter raw doubled the offered rate and marked
+      # every QoS 0 $share rung unsustained. Synthesized logs, no cluster, no cost.
+      - name: The scale summarizer still corrects emqtt-bench's publish double-count
+        run: python3 bench/scale/summarize-curve.py --self-test
 
   interop:
     name: foreign-client interop (mosquitto + paho)
