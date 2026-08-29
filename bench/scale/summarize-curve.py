@@ -443,6 +443,24 @@ def lane_e_rung(rdir: Path) -> dict:
             if "=" in tok:
                 k, v = tok.split("=", 1)
                 meta[k] = v
+    else:
+        # rung.txt is the LAST thing the lane writes, so its absence means the
+        # rung is still in flight (or died). Without this, a rung being watched
+        # live reads as offered=0 and p99="—", which the budget check below then
+        # reports as OVER BUDGET — a running rung looking like a failed one.
+        return {
+            "sites": int(rdir.name.rsplit("-", 1)[-1]),
+            "offered": 0.0,
+            "sent_rate": 0.0,
+            "recv_rate": 0.0,
+            "per_consumer": 0.0,
+            "p50": "—",
+            "p99": "—",
+            "budget_ms": 0.0,
+            "pass": False,
+            "incomplete": True,
+            "flags": ["INCOMPLETE (no rung.txt — still running, or the rung died)"],
+        }
     sites = int(meta.get("sites", rdir.name.rsplit("-", 1)[-1]))
     offered = float(meta.get("offered", 0))
     budget = float(meta.get("p99_budget_ms", 1000))
@@ -665,10 +683,11 @@ def main() -> None:
                 print("\n**No rung passed.** The ladder starts above this cluster's capacity.")
             # A ladder whose TOP rung passed has not found a ceiling; saying so
             # is the difference between a measurement and an advertisement.
-            if rungs[-1]["pass"]:
+            done_rungs = [r for r in rungs if not r.get("incomplete")]
+            if done_rungs and done_rungs[-1]["pass"]:
                 print(
                     f"\n> The top rung passed, so this is a FLOOR, not a ceiling — "
-                    f"{rungs[-1]['sites']} sites is where the ladder stopped, not where "
+                    f"{done_rungs[-1]['sites']} sites is where the ladder stopped, not where "
                     f"the cluster did. Extend LANE_E_SITES to find the knee."
                 )
 
