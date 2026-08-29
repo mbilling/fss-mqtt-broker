@@ -87,6 +87,16 @@ TF=$(command -v terraform || command -v tofu)
 
 STAMP=$(date -u +%Y%m%dT%H%M%SZ)
 RUN="${RUN_DIR:-$SCALE_DIR/.runs/$STAMP}"
+# A RELATIVE RUN_DIR is resolved against the rig, not against wherever the
+# caller happened to stand. workloads/run-workload.sh execs ../run.sh, so a
+# caller who exports RUN_DIR=.runs/foo from bench/scale sees every later write
+# land somewhere else — the run dies at the first redirect with "No such file
+# or directory" and the teardown trap then fails the same way. Cheap to hit,
+# confusing to read, and the default above is already absolute.
+case "$RUN" in
+/*) ;;
+*) RUN="$SCALE_DIR/$RUN" ;;
+esac
 mkdir -p "$RUN"
 say "run dir: $RUN"
 

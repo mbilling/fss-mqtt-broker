@@ -67,7 +67,7 @@ def workload_of(run: Path) -> str:
 
 
 def collect(run: Path) -> dict:
-    """One run -> {version, workload, sizes: {n: {laneA, laneB, laneC, laneD}}}."""
+    """One run -> {version, workload, sizes: {n: {laneA, laneB, laneC, laneD, laneE}}}."""
     root = run / "results"
     out = {"run": run.name, "version": run_version(run), "workload": workload_of(run), "sizes": {}}
     if not root.is_dir():
@@ -122,6 +122,21 @@ def collect(run: Path) -> dict:
                 "session_bytes": grab(r"per session, OFFLINE\s+(\d+)"),
                 "logs": (lambda m: m.group(1) if m else None)(re.search(r"from (\d+/\d+) container logs", txt)),
             }
+        # lane E: the tenancy ladder. Each rung is a SITE count, so unlike lane B
+        # the x-axis is tenants rather than an offered rate — and a rung passes
+        # only if it also stayed inside its p99 budget.
+        laneE = size_dir / "laneE"
+        if laneE.is_dir():
+            e_rungs = []
+            for rdir in sorted(laneE.glob("sites-*"), key=lambda q: int(q.name.split("-")[1])):
+                try:
+                    r = SC.lane_e_rung(rdir)
+                except Exception as exc:  # a partial rung must not sink the report
+                    r = {"sites": int(rdir.name.split("-")[1]), "flags": [f"unparsed: {exc}"], "pass": False}
+                if not r.get("incomplete"):
+                    e_rungs.append(r)
+            if e_rungs:
+                entry["laneE"] = e_rungs
         if entry:
             out["sizes"][str(n)] = entry
     return out

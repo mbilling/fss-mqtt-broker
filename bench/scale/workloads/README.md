@@ -15,6 +15,7 @@ so a run is reproducible from its `.env` file and comparable across releases.
 | `industrial` | durable QoS 1/2, low volume, latency-critical | A | fsync barrier, durable p99 |
 | `smart-home` | enormous idle connection count, reconnect storms | C | memory/conn, establishment |
 | `logistics` | store-and-forward, disconnect/resume | D | offline queues, session resume |
+| `scada-sites` | scale-out by tenant: the rung is a SITE, not a rate | E | **tenancy** — how many independent sites fit on a cluster |
 
 ### Diagnostics, not industry shapes
 

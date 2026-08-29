@@ -418,6 +418,95 @@ def self_test() -> None:
     print("summarize-curve self-test: publish double-count correction OK (6 cases)")
 
 
+def p99_ms(label: str) -> float:
+    """The numeric upper bound behind a bucket_pct label ('<=1ms' -> 1.0).
+
+    Returns inf for '—' and for a '>N' label: both mean "past the last finite
+    bucket", and a budget verdict must treat that as over, never as N.
+    """
+    if not label or label == "—" or label.startswith(">"):
+        return float("inf")
+    return float(label.lstrip("<=").rstrip("ms"))
+
+
+def lane_e_rung(rdir: Path) -> dict:
+    """One site-ladder rung. Same counters as lane B, keyed by tenant count.
+
+    The rung's own metadata is read from rung.txt rather than re-derived: the
+    lane knows its site rate and consumer count, and a summarizer that guesses
+    them would drift from the harness the first time a knob changes.
+    """
+    meta = {}
+    rt = rdir / "rung.txt"
+    if rt.exists():
+        for tok in rt.read_text().split():
+            if "=" in tok:
+                k, v = tok.split("=", 1)
+                meta[k] = v
+    else:
+        # rung.txt is the LAST thing the lane writes, so its absence means the
+        # rung is still in flight (or died). Without this, a rung being watched
+        # live reads as offered=0 and p99="—", which the budget check below then
+        # reports as OVER BUDGET — a running rung looking like a failed one.
+        return {
+            "sites": int(rdir.name.rsplit("-", 1)[-1]),
+            "offered": 0.0,
+            "sent_rate": 0.0,
+            "recv_rate": 0.0,
+            "per_consumer": 0.0,
+            "p50": "—",
+            "p99": "—",
+            "budget_ms": 0.0,
+            "pass": False,
+            "incomplete": True,
+            "flags": ["INCOMPLETE (no rung.txt — still running, or the rung died)"],
+        }
+    sites = int(meta.get("sites", rdir.name.rsplit("-", 1)[-1]))
+    offered = float(meta.get("offered", 0))
+    budget = float(meta.get("p99_budget_ms", 1000))
+
+    sent_rate = recv_rate = 0.0
+    sent = recv = 0.0
+    for log in rdir.glob("pub-*.log"):
+        # Same emqtt-bench double-count correction as lane B — see lane_b_rung.
+        t_pub, r_pub = driver_rate(log, "pub")
+        t_succ, r_succ = driver_rate(log, "pub_succ")
+        sent += (t_pub + t_succ) // 2
+        sent_rate += (r_pub + r_succ) / 2
+    for log in rdir.glob("sub-*.log"):
+        t, r = driver_rate(log, "recv")
+        recv += t
+        recv_rate += r
+    buckets, count = merged_histogram(sorted(rdir.glob("sub-*.prom")))
+    p99 = bucket_pct(buckets, count, 0.99)
+
+    flags = []
+    offer_met = offered and sent_rate >= DRIVER_OK * offered
+    if offered and not offer_met:
+        flags.append(f"OFFER NOT MET ({sent_rate / offered * 100:.0f}% of offer)")
+    delivered = sent > 0 and recv >= KNEE_OK * sent
+    if not delivered and sent > 0:
+        flags.append(f"LOSS (delivered {recv / sent * 100:.1f}% of what was published)")
+    within = p99_ms(p99) <= budget
+    if not within:
+        flags.append(f"OVER P99 BUDGET ({p99} > {budget:g}ms)")
+    return {
+        "sites": sites,
+        "offered": offered,
+        "sent_rate": sent_rate,
+        "recv_rate": recv_rate,
+        "per_consumer": float(meta.get("per_consumer", 0)),
+        "p50": bucket_pct(buckets, count, 0.50),
+        "p99": p99,
+        "budget_ms": budget,
+        # A rung PASSES only on all three: the drivers offered the load, the
+        # broker delivered it, and it stayed inside the latency budget. Any one
+        # of those failing makes the site count above it meaningless.
+        "pass": bool(offer_met and delivered and within),
+        "flags": flags,
+    }
+
+
 def main() -> None:
     if len(sys.argv) == 2 and sys.argv[1] == "--self-test":
         self_test()
@@ -561,6 +650,46 @@ def main() -> None:
         rss = f"{c['rss_delta_mib']:.0f} MiB" if c["rss_delta_mib"] is not None else "—"
         kib = f"{c['kib_per_conn']:.1f}" if c["kib_per_conn"] else "—"
         print(f"| {n} | {c['connected']} | {rss} | {kib} |")
+
+    # Curve 4 — lane E, the tenancy ladder
+    e_sizes = [(n, d) for n, d in found if (d / "laneE").is_dir()]
+    if e_sizes:
+        print("\n## Curve 4 — scale-out by tenant (the rung is a SITE)\n")
+        for n, d in e_sizes:
+            rungs = sorted(
+                (lane_e_rung(r) for r in (d / "laneE").glob("sites-*")),
+                key=lambda r: r["sites"],
+            )
+            if not rungs:
+                continue
+            print(f"### {n} node(s)\n")
+            print("| sites | offered msg/s | delivered/s | per consumer | p99 | verdict |")
+            print("|---|---|---|---|---|---|")
+            for r in rungs:
+                verdict = "pass" if r["pass"] else "; ".join(r["flags"]) or "fail"
+                print(
+                    f"| {r['sites']} | {r['offered']:,.0f} | {r['recv_rate']:,.0f} | "
+                    f"{r['per_consumer']:,.0f} | {r['p99']} | {verdict} |"
+                )
+            passed = [r for r in rungs if r["pass"]]
+            if passed:
+                best = max(passed, key=lambda r: r["sites"])
+                print(
+                    f"\n**{best['sites']} site(s) per {n}-node cluster** at p99 "
+                    f"<= {best['budget_ms']:g}ms — {best['offered']:,.0f} msg/s, "
+                    f"{best['sites'] / n:.1f} sites per node."
+                )
+            else:
+                print("\n**No rung passed.** The ladder starts above this cluster's capacity.")
+            # A ladder whose TOP rung passed has not found a ceiling; saying so
+            # is the difference between a measurement and an advertisement.
+            done_rungs = [r for r in rungs if not r.get("incomplete")]
+            if done_rungs and done_rungs[-1]["pass"]:
+                print(
+                    f"\n> The top rung passed, so this is a FLOOR, not a ceiling — "
+                    f"{done_rungs[-1]['sites']} sites is where the ladder stopped, not where "
+                    f"the cluster did. Extend LANE_E_SITES to find the knee."
+                )
 
     print("\n> Raw results are untracked scratch; cite only tracked paths in the doc.")
 
