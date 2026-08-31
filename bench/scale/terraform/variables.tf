@@ -61,6 +61,28 @@ variable "mqttd_version" {
   default     = "1.0.0"
 }
 
+variable "mqttd_url" {
+  description = <<-EOT
+    Fetch the broker from this URL instead of the published release for
+    `mqttd_version`. Empty (the default) = the release, which is what every
+    published number must come from.
+
+    Set ONLY to measure a binary that has not shipped — a candidate under test,
+    a pre-release, a build from a branch. `mqttd_sha256` becomes MANDATORY when
+    this is set: the release path can fall back to the `.sha256` published
+    beside the artifact, and an arbitrary URL has no such companion, so without
+    a hash there would be no verification at all. run.sh refuses the
+    combination before terraform is invoked.
+
+    A run using this is stamped `UNRELEASED` in its run directory. The rig's
+    whole claim is that a published curve is attributable to a signed release
+    (see `mqttd_version`); a number measured against an unreleased binary is
+    not, and must never be quoted as one.
+  EOT
+  type        = string
+  default     = ""
+}
+
 variable "mqttd_sha256" {
   description = "Optional pinned sha256 of the mqttd release binary. Empty = verify against the .sha256 file published with the release (integrity only); set = verify against a hash you obtained independently."
   type        = string

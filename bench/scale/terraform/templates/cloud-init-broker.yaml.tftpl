@@ -78,18 +78,31 @@ runcmd:
   - install -d -m 0777 /var/lib/mqttd-probe
   # The released, signed, byte-reproducible binary — hard-fail on checksum
   # mismatch so a bad download is a loud cloud-init error, not a silent variable.
+  #
+  # `mqttd_url` overrides the source for measuring a binary that has not shipped.
+  # It carries NO published `.sha256` companion, so the pinned hash is mandatory
+  # there and the fallback below is unreachable on that path — verification is
+  # never weaker, only sourced differently. run.sh refuses a URL without a hash
+  # before terraform runs; this template would fail closed anyway, because with
+  # neither branch supplying a checksum there is nothing to verify against.
   - |
     set -e
     NAME="mqttd-${mqttd_version}-x86_64-unknown-linux-musl"
-    BASE="https://github.com/mbilling/fss-mqtt-broker/releases/download/v${mqttd_version}"
     cd /tmp
-    curl -fsSLO "$BASE/$NAME"
-    %{ if mqttd_sha256 != "" ~}
+%{ if mqttd_url != "" ~}
+    curl -fsSL -o "$NAME" "${mqttd_url}"
     echo "${mqttd_sha256}  $NAME" | sha256sum -c -
-    %{ else ~}
+    echo "UNRELEASED BROKER: fetched from ${mqttd_url}, verified against the pinned hash." >&2
+%{ else ~}
+    BASE="https://github.com/mbilling/fss-mqtt-broker/releases/download/v${mqttd_version}"
+    curl -fsSLO "$BASE/$NAME"
+%{ if mqttd_sha256 != "" ~}
+    echo "${mqttd_sha256}  $NAME" | sha256sum -c -
+%{ else ~}
     curl -fsSLO "$BASE/$NAME.sha256"
     sha256sum -c "$NAME.sha256"
-    %{ endif ~}
+%{ endif ~}
+%{ endif ~}
     install -m 0755 "$NAME" /usr/local/bin/mqttd
     rm -f "$NAME" "$NAME.sha256"
   - systemctl daemon-reload
