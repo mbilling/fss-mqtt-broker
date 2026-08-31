@@ -14,9 +14,9 @@
 //! the clustered backend lands.
 
 use async_trait::async_trait;
-use mqtt_core::{topic_matches, ClientId, Message, Subscription};
+use mqtt_core::{ClientId, Message, Subscription};
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 pub mod app_props;
 pub mod data_dir;
@@ -645,6 +645,19 @@ pub trait RetainedStore: Send + Sync + std::fmt::Debug {
     async fn count(&self) -> Result<usize, StorageError> {
         Ok(self.all().await?.len())
     }
+
+    /// Whether a retained message is held for this EXACT topic.
+    ///
+    /// A concrete topic, never a filter — this is the O(1) map question the retained
+    /// QUOTA check asks at the cap ("would storing this GROW the set, or merely
+    /// overwrite a topic we already hold?", ADR 0041 T4), which used to be answered
+    /// by [`matching`](Self::matching) walking every retained message to return the
+    /// one that could ever be equal. The default preserves exactly that answer for
+    /// stores that cannot do better; both in-tree backends override it with a single
+    /// hash lookup.
+    async fn contains(&self, topic: &str) -> Result<bool, StorageError> {
+        Ok(self.matching(topic).await?.iter().any(|m| m.topic == topic))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -980,10 +993,268 @@ impl SessionStore for MemorySessionStore {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The retained set and its match index (issue #445's shape, mirrored).
+// ---------------------------------------------------------------------------
+
+/// The canonical allocation of a retained TOPIC: shared by the backing map's key
+/// and the index's terminal, so indexing a topic costs a refcount, not a copy.
+type TopicKey = Arc<str>;
+
+/// One topic level in the retained match index. `+` and `#` are ordinary keys here
+/// — a *topic* level spelled `+` is a literal — because in this index the wildcards
+/// live in the FILTER being walked, never in the indexed strings.
+#[derive(Debug, Default)]
+struct RetainedNode {
+    children: HashMap<String, RetainedNode>,
+    /// Set when a retained topic ends at this node: **the same allocation** the
+    /// backing map is keyed by.
+    terminal: Option<TopicKey>,
+}
+
+impl Drop for RetainedNode {
+    /// Dismantle the subtree iteratively. Node depth tracks the (client-supplied)
+    /// topic length, so the derived recursive drop of nested `HashMap`s would
+    /// otherwise overflow the stack and abort the broker when a deep topic's path
+    /// is pruned or the store is torn down — the same hazard the insert, match, and
+    /// remove walks avoid by staying iterative. Copied in shape from
+    /// `mqtt_core::subscriptions`' `TrieNode`, for exactly the same reason.
+    fn drop(&mut self) {
+        let mut stack: Vec<RetainedNode> = self.children.drain().map(|(_, n)| n).collect();
+        while let Some(mut node) = stack.pop() {
+            stack.extend(node.children.drain().map(|(_, n)| n));
+            // `node` now has no children; its own drop recurses no further.
+        }
+    }
+}
+
+/// A trie over retained TOPICS — the mirror of the subscription trie in
+/// `mqtt_core::subscriptions`.
+///
+/// There, indexed FILTERS are walked against an incoming topic; here, indexed
+/// TOPICS are walked against an incoming filter, because on the subscribe path it
+/// is the filter that carries the wildcards. `+` descends into every child at that
+/// level; `#` collects the whole subtree from the current node down, that node's
+/// own terminal included (`a/#` matches `a`); a literal is one hash lookup. So a
+/// SUBSCRIBE costs O(filter depth × branching it actually visits + matches)
+/// instead of one `topic_matches` call per retained message in the broker.
+///
+/// Derived, never authoritative: [`RetainedState`] owns both this and the map they
+/// index, behind one lock, and is the only writer of either.
+#[derive(Debug, Default)]
+struct RetainedIndex {
+    root: RetainedNode,
+}
+
+impl RetainedIndex {
+    /// Index `topic`, sharing the caller's allocation rather than copying it.
+    fn insert(&mut self, topic: &TopicKey) {
+        let mut node = &mut self.root;
+        for level in topic.split('/') {
+            node = node.children.entry(level.to_string()).or_default();
+        }
+        node.terminal = Some(TopicKey::clone(topic));
+    }
+
+    /// Drop `topic`'s terminal and prune the trailing chain of nodes it leaves
+    /// empty. Two iterative passes, as in `subscriptions::trie_remove`: depth tracks
+    /// the topic's level count, which is client-controlled input, so recursion here
+    /// would let one deep retained PUBLISH overflow the stack and abort the broker.
+    fn remove(&mut self, topic: &str) {
+        let levels: Vec<&str> = topic.split('/').collect();
+        // Pass 1 (immutable): confirm the path exists and find the deepest node on
+        // it that OUTLIVES the removal — one holding its own terminal or a second
+        // child once this topic's leaf is gone. The root always outlives it.
+        let mut node = &self.root;
+        let mut cut = 0usize; // index, on the path, of the deepest surviving node
+        for (depth, level) in levels.iter().enumerate() {
+            let Some(child) = node.children.get(*level) else {
+                return; // topic not indexed — nothing to remove
+            };
+            if depth == 0 || node.terminal.is_some() || node.children.len() > 1 {
+                cut = depth;
+            }
+            node = child;
+        }
+        // `node` is the leaf (index `levels.len()`); it outlives the removal iff it
+        // still has children once we drop this terminal.
+        if !node.children.is_empty() {
+            cut = levels.len();
+        }
+        // Pass 2 (mutable): clear the terminal if the leaf survives, else detach the
+        // whole dead chain at the surviving node — one child removal drops it all.
+        let mut node = &mut self.root;
+        if cut == levels.len() {
+            for level in &levels {
+                node = node
+                    .children
+                    .get_mut(*level)
+                    .expect("path verified in pass 1");
+            }
+            node.terminal = None;
+        } else {
+            for level in &levels[..cut] {
+                node = node
+                    .children
+                    .get_mut(*level)
+                    .expect("path verified in pass 1");
+            }
+            node.children.remove(levels[cut]);
+        }
+    }
+
+    /// Every indexed topic matching `filter`, via one walk of the FILTER's levels.
+    /// The callback fires in unspecified order and at most once per topic (a topic
+    /// is one trie path, and each `(node, depth)` frame is reachable once).
+    ///
+    /// Agrees with [`mqtt_core::topic_matches`] pair for pair — pinned by an
+    /// equivalence corpus in this module's tests — including its two edges: `#`
+    /// matches from its parent level down and makes any later filter level
+    /// unreachable, and a filter opening with a wildcard never reaches a `$`-rooted
+    /// topic [MQTT-4.7.2-1], at the FIRST level only.
+    fn for_each_match<'a>(&'a self, filter: &str, mut cb: impl FnMut(&'a TopicKey)) {
+        let levels: Vec<&str> = filter.split('/').collect();
+        // Exactly `topic_matches`' own test, on the filter's first character: a
+        // literal first level starting with `+`/`#` can only equal a topic level
+        // starting with the same character, which is never `$`-rooted, so the two
+        // spellings of the rule cannot disagree.
+        let skip_dollar = matches!(filter.chars().next(), Some('+' | '#'));
+        // Iterative: recursion depth would otherwise track filter depth, which is
+        // client-controlled input.
+        let mut stack: Vec<(&RetainedNode, usize, bool)> = vec![(&self.root, 0, skip_dollar)];
+        while let Some((node, depth, at_root)) = stack.pop() {
+            if depth == levels.len() {
+                // Filter exhausted: only a topic ending exactly here matches.
+                if let Some(topic) = &node.terminal {
+                    cb(topic);
+                }
+                continue;
+            }
+            match levels[depth] {
+                // `#` matches this level and every level below it — and
+                // `topic_matches` returns AT the `#`, so any remaining filter levels
+                // are unreachable and the entire subtree matches, this node's own
+                // terminal included ("a/#" matches "a").
+                "#" => {
+                    let mut subtree = vec![(node, at_root)];
+                    while let Some((n, root_frame)) = subtree.pop() {
+                        if let Some(topic) = &n.terminal {
+                            cb(topic);
+                        }
+                        for (level, child) in &n.children {
+                            if root_frame && level.starts_with('$') {
+                                continue;
+                            }
+                            subtree.push((child, false));
+                        }
+                    }
+                }
+                // `+` matches exactly one level, whatever it spells (`+`, `#` and
+                // the empty level included) — but a level must EXIST, which is what
+                // descending into a child means.
+                "+" => {
+                    for (level, child) in &node.children {
+                        if at_root && level.starts_with('$') {
+                            continue;
+                        }
+                        stack.push((child, depth + 1, false));
+                    }
+                }
+                // A literal level: one hash lookup. `at_root` is irrelevant here —
+                // a literal can only reach the identically-spelled topic level.
+                level => {
+                    if let Some(child) = node.children.get(level) {
+                        stack.push((child, depth + 1, false));
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The retained set behind ONE lock: `by_topic` is the authority (`all`, `count`,
+/// `contains` read it), and `index` is a derived match index over the same topics.
+/// Every mutation goes through [`insert`](Self::insert) / [`remove`](Self::remove),
+/// which move both together, so the two cannot disagree about which topics exist —
+/// the property that lets `matching` trust the index and never fall back to a scan.
+///
+/// Shared by both in-tree backends: the persistent store rebuilds one of these from
+/// disk on `open`, which is why a reopened database indexes exactly what it holds.
+#[derive(Debug, Default)]
+pub(crate) struct RetainedState {
+    by_topic: HashMap<TopicKey, Message>,
+    index: RetainedIndex,
+}
+
+impl RetainedState {
+    /// Store `message` under `topic` (overwriting any current value), indexing the
+    /// topic if it is new. The only insert path: `set` and the persistent store's
+    /// reload both come through here, so no caller can add a topic the index misses.
+    pub(crate) fn insert(&mut self, topic: &str, message: Message) {
+        if let Some(slot) = self.by_topic.get_mut(topic) {
+            *slot = message; // already indexed; the index keys on the topic only
+        } else {
+            let key: TopicKey = TopicKey::from(topic);
+            self.index.insert(&key);
+            self.by_topic.insert(key, message);
+        }
+    }
+
+    /// Drop `topic`'s retained message and its index entry.
+    pub(crate) fn remove(&mut self, topic: &str) {
+        if self.by_topic.remove(topic).is_some() {
+            self.index.remove(topic);
+        }
+    }
+
+    /// Apply one [`RetainedStore::set`]: an empty payload clears the topic (MQTT
+    /// zero-length retained-PUBLISH semantics), anything else stores it.
+    pub(crate) fn set(&mut self, message: &Message) {
+        if message.payload.is_empty() {
+            self.remove(&message.topic);
+        } else {
+            self.insert(&message.topic, message.clone());
+        }
+    }
+
+    /// Every retained message whose topic matches `filter`.
+    pub(crate) fn matching(&self, filter: &str) -> Vec<Message> {
+        // The fast path, and the common one: a filter with no wildcard CHARACTER
+        // anywhere matches the one topic spelled exactly like it and nothing else
+        // (the `$` rule needs a leading wildcard to bite, and level-by-level
+        // equality at equal depth is string equality). One hash lookup.
+        if !filter.contains('+') && !filter.contains('#') {
+            return self.by_topic.get(filter).cloned().into_iter().collect();
+        }
+        let mut out = Vec::new();
+        self.index.for_each_match(filter, |topic| {
+            if let Some(m) = self.by_topic.get(topic) {
+                out.push(m.clone());
+            }
+        });
+        out
+    }
+
+    /// Whether an exact topic is retained. One hash lookup.
+    pub(crate) fn contains(&self, topic: &str) -> bool {
+        self.by_topic.contains_key(topic)
+    }
+
+    /// Every retained message.
+    pub(crate) fn all(&self) -> Vec<Message> {
+        self.by_topic.values().cloned().collect()
+    }
+
+    /// How many topics are retained.
+    pub(crate) fn len(&self) -> usize {
+        self.by_topic.len()
+    }
+}
+
 /// A non-durable, single-process [`RetainedStore`].
 #[derive(Debug, Default)]
 pub struct MemoryRetainedStore {
-    by_topic: Mutex<HashMap<String, Message>>,
+    state: Mutex<RetainedState>,
 }
 
 impl MemoryRetainedStore {
@@ -992,49 +1263,38 @@ impl MemoryRetainedStore {
     pub fn new() -> Self {
         Self::default()
     }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, RetainedState> {
+        // A poisoned lock means another thread panicked while holding it; recover
+        // the guard rather than propagating the panic — the map and its index are
+        // moved together under this lock, so neither is left torn.
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
 }
 
 #[async_trait]
 impl RetainedStore for MemoryRetainedStore {
     async fn set(&self, message: &Message) -> Result<(), StorageError> {
-        let mut map = self
-            .by_topic
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if message.payload.is_empty() {
-            map.remove(&message.topic);
-        } else {
-            map.insert(message.topic.clone(), message.clone());
-        }
+        self.lock().set(message);
         Ok(())
     }
 
     async fn matching(&self, filter: &str) -> Result<Vec<Message>, StorageError> {
-        let map = self
-            .by_topic
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        Ok(map
-            .values()
-            .filter(|m| topic_matches(filter, &m.topic))
-            .cloned()
-            .collect())
+        Ok(self.lock().matching(filter))
     }
 
     async fn all(&self) -> Result<Vec<Message>, StorageError> {
-        let map = self
-            .by_topic
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        Ok(map.values().cloned().collect())
+        Ok(self.lock().all())
     }
 
     async fn count(&self) -> Result<usize, StorageError> {
-        Ok(self
-            .by_topic
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .len())
+        Ok(self.lock().len())
+    }
+
+    async fn contains(&self, topic: &str) -> Result<bool, StorageError> {
+        Ok(self.lock().contains(topic))
     }
 }
 
@@ -1042,9 +1302,11 @@ impl RetainedStore for MemoryRetainedStore {
 mod tests {
     use super::{
         Enqueued, InboundSighting, MemoryRetainedStore, MemorySessionStore, Offset, OverflowPolicy,
-        QueueLimits, RetainedStore, SessionClaim, SessionStore,
+        QueueLimits, RetainedStore, SessionClaim, SessionStore, StorageError,
     };
-    use mqtt_core::{ClientId, Message, QoS};
+    use async_trait::async_trait;
+    use bytes::Bytes;
+    use mqtt_core::{topic_matches, ClientId, Message, QoS};
 
     fn cid(s: &str) -> ClientId {
         ClientId(s.into())
@@ -1400,5 +1662,337 @@ mod tests {
         assert_eq!(replay[0].offset, o);
         // Still there until acked.
         assert_eq!(store.pending(&c, 0, 100).await.unwrap().len(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // The retained match index: `matching` must answer exactly what the linear
+    // `topic_matches` scan it replaced answered, and the index must never drift
+    // from the map it indexes.
+    // -----------------------------------------------------------------------
+
+    /// A retained message whose payload names its topic, so a wrong topic → message
+    /// association shows up as a payload mismatch and not just a count.
+    fn retained(topic: &str) -> Message {
+        Message::new(
+            topic.to_string(),
+            Bytes::from(format!("v:{topic}")),
+            QoS::AtLeastOnce,
+            true,
+        )
+    }
+
+    /// The zero-length retained PUBLISH that clears `topic` — also how the hub's
+    /// expiry reaper deletes an expired retained copy (issue #227).
+    fn clear(topic: &str) -> Message {
+        Message::new(topic.to_string(), Bytes::new(), QoS::AtMostOnce, true)
+    }
+
+    /// Topics x filters covering wildcards at every position, empty levels, literal
+    /// `+`/`#` spellings inside a topic, depths 1..=4, and a `$`-rooted block the
+    /// alphabet cannot spell.
+    fn corpus() -> (Vec<String>, Vec<String>) {
+        let alphabet = ["a", "b", "+", "#", ""];
+        let mut topics: Vec<String> = Vec::new();
+        for d1 in alphabet {
+            topics.push(d1.to_string());
+            for d2 in alphabet {
+                topics.push(format!("{d1}/{d2}"));
+                for d3 in alphabet {
+                    topics.push(format!("{d1}/{d2}/{d3}"));
+                    for d4 in alphabet {
+                        topics.push(format!("{d1}/{d2}/{d3}/{d4}"));
+                    }
+                }
+            }
+        }
+        // Filters and topics are drawn from the same alphabet — every filter is also
+        // tried as a retained topic and vice versa — plus the `$` block, which needs
+        // both a literal `$SYS` root (which MUST match) and a leading wildcard
+        // (which must NOT) to pin [MQTT-4.7.2-1].
+        let mut filters = topics.clone();
+        for extra in [
+            "$SYS",
+            "$SYS/#",
+            "$SYS/+",
+            "$SYS/broker",
+            "$SYS/+/uptime",
+            "$share/g/a",
+            "+/broker",
+            "#",
+            "+",
+            "a/#/b",
+            "#/a",
+            "+/+/+/+/+",
+        ] {
+            filters.push(extra.to_string());
+        }
+        for extra in [
+            "$SYS",
+            "$SYS/broker",
+            "$SYS/broker/uptime",
+            "$share/g/a",
+            "$x",
+        ] {
+            topics.push(extra.to_string());
+        }
+        (topics, filters)
+    }
+
+    /// What `matching` used to compute: one `topic_matches` call per retained
+    /// message. Sorted, so it compares as a set (neither form promises an order).
+    fn linear_reference(topics: &[String], filter: &str) -> Vec<String> {
+        let mut out: Vec<String> = topics
+            .iter()
+            .filter(|t| topic_matches(filter, t))
+            .cloned()
+            .collect();
+        out.sort();
+        out
+    }
+
+    async fn matched_topics(store: &dyn RetainedStore, filter: &str) -> Vec<String> {
+        let mut out: Vec<String> = store
+            .matching(filter)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|m| m.topic)
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// The net under the whole change: for EVERY (filter, topic) pair in the corpus
+    /// the indexed walk yields exactly the set the linear scan yielded. Retained
+    /// delivery is spec-visible, so a divergence here is a dropped or duplicated
+    /// retained message on subscribe.
+    #[tokio::test]
+    async fn indexed_matching_agrees_with_the_linear_reference() {
+        let (topics, filters) = corpus();
+        let store = MemoryRetainedStore::new();
+        for t in &topics {
+            store.set(&retained(t)).await.unwrap();
+        }
+        assert_eq!(store.count().await.unwrap(), topics.len());
+        for f in &filters {
+            assert_eq!(
+                matched_topics(&store, f).await,
+                linear_reference(&topics, f),
+                "index and linear reference disagree on filter {f:?}"
+            );
+        }
+        // The message that comes back is the one stored under that topic, not just
+        // the right count.
+        let m = store.matching("a/+/b").await.unwrap();
+        assert!(!m.is_empty());
+        for msg in m {
+            assert_eq!(msg.payload, Bytes::from(format!("v:{}", msg.topic)));
+        }
+    }
+
+    /// The no-wildcard fast path (`matching` collapsing to one hash lookup) must be
+    /// the same function as the walk: a filter with neither `+` nor `#` returns the
+    /// single identically-spelled topic and nothing else — including for topics that
+    /// merely CONTAIN a wildcard character in a level ("+x"), which are literals.
+    #[tokio::test]
+    async fn the_no_wildcard_fast_path_returns_exactly_the_named_topic() {
+        let store = MemoryRetainedStore::new();
+        for t in ["a", "a/b", "a/b/c", "a//b", "$SYS/broker", "+x/y", "x/#y"] {
+            store.set(&retained(t)).await.unwrap();
+        }
+        for f in [
+            "a",
+            "a/b",
+            "a/b/c",
+            "a//b",
+            "$SYS/broker",
+            "a/x",
+            "",
+            "a/b/c/d",
+        ] {
+            let got = matched_topics(&store, f).await;
+            assert_eq!(
+                got,
+                linear_reference(
+                    &["a", "a/b", "a/b/c", "a//b", "$SYS/broker", "+x/y", "x/#y"].map(String::from),
+                    f
+                ),
+                "fast path disagrees on filter {f:?}"
+            );
+            assert!(
+                got.len() <= 1,
+                "a wildcard-free filter matches at most one topic"
+            );
+        }
+        // A first level that merely STARTS with a wildcard character is a literal,
+        // and takes the walk — it must still find its topic.
+        assert_eq!(
+            matched_topics(&store, "+x/+").await,
+            vec!["+x/y".to_string()]
+        );
+    }
+
+    /// The index is DERIVED: after set / overwrite / delete-by-empty-payload churn it
+    /// must still describe exactly the map's contents — no husk that keeps matching a
+    /// deleted topic, no pruned-too-eagerly node that loses a live one.
+    #[tokio::test]
+    async fn the_index_follows_set_overwrite_and_delete() {
+        let store = MemoryRetainedStore::new();
+        for t in ["a/b", "a/b/c", "a/x"] {
+            store.set(&retained(t)).await.unwrap();
+        }
+        assert_eq!(matched_topics(&store, "a/+").await, ["a/b", "a/x"]);
+        assert_eq!(matched_topics(&store, "a/#").await, ["a/b", "a/b/c", "a/x"]);
+
+        // An overwrite is one topic, not two: the index keys on the topic only.
+        let mut newer = retained("a/b");
+        newer.payload = Bytes::from_static(b"newer");
+        store.set(&newer).await.unwrap();
+        assert_eq!(store.count().await.unwrap(), 3);
+        let got = store.matching("+/b").await.unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(&got[0].payload[..], b"newer");
+
+        // Delete by empty payload: gone from map and index, and the shared prefix
+        // "a/b/c" underneath it survives the prune.
+        store.set(&clear("a/b")).await.unwrap();
+        assert!(store.matching("+/b").await.unwrap().is_empty());
+        assert!(!store.contains("a/b").await.unwrap());
+        assert_eq!(matched_topics(&store, "a/#").await, ["a/b/c", "a/x"]);
+        assert_eq!(store.count().await.unwrap(), 2);
+
+        // Clearing a topic that was never retained is harmless.
+        store.set(&clear("never/stored")).await.unwrap();
+        assert_eq!(store.count().await.unwrap(), 2);
+
+        // A fully removed topic can be re-retained: removal must have pruned the
+        // path, and the re-insert must rebuild it.
+        store.set(&retained("a/b")).await.unwrap();
+        assert_eq!(matched_topics(&store, "+/b").await, ["a/b"]);
+        assert_eq!(matched_topics(&store, "a/#").await, ["a/b", "a/b/c", "a/x"]);
+
+        // Removing the deepest topic leaves its ancestors matchable.
+        store.set(&clear("a/b/c")).await.unwrap();
+        assert_eq!(matched_topics(&store, "a/#").await, ["a/b", "a/x"]);
+    }
+
+    /// Expiry deletes through the same zero-length `set` the hub's reaper uses
+    /// (issue #227), and the index must follow it. Until then the store returns the
+    /// expired copy unchanged — filtering an expired retained value out of a replay
+    /// is the hub's job [MQTT-3.3.2-5], and the index must not quietly take it over.
+    #[tokio::test]
+    async fn the_index_follows_expiry_reaping() {
+        let store = MemoryRetainedStore::new();
+        let mut perishable = retained("sensors/a/temp");
+        perishable.expires_at = Some(1_000);
+        store.set(&perishable).await.unwrap();
+        store.set(&retained("sensors/b/temp")).await.unwrap();
+
+        // Still stored, deadline intact, still matched: the store does not filter.
+        let got = store.matching("sensors/+/temp").await.unwrap();
+        assert_eq!(got.len(), 2);
+        assert_eq!(
+            got.iter()
+                .find(|m| m.topic == "sensors/a/temp")
+                .and_then(|m| m.expires_at),
+            Some(1_000)
+        );
+
+        // The reaper's clear removes it from the map and the index together.
+        store.set(&clear("sensors/a/temp")).await.unwrap();
+        assert_eq!(
+            matched_topics(&store, "sensors/+/temp").await,
+            ["sensors/b/temp"]
+        );
+        assert_eq!(matched_topics(&store, "#").await, ["sensors/b/temp"]);
+        assert!(!store.contains("sensors/a/temp").await.unwrap());
+    }
+
+    /// `contains` is the O(1) form of the question the retained quota check asks, so
+    /// it must answer exactly what `matching(topic)` did for a concrete topic — for
+    /// every wildcard-free topic in the corpus, retained and not.
+    #[tokio::test]
+    async fn contains_agrees_with_matching_for_concrete_topics() {
+        let (topics, _) = corpus();
+        let concrete: Vec<String> = topics
+            .iter()
+            .filter(|t| !t.contains('+') && !t.contains('#'))
+            .cloned()
+            .collect();
+        let store = MemoryRetainedStore::new();
+        for t in &concrete {
+            store.set(&retained(t)).await.unwrap();
+        }
+        for t in &concrete {
+            let m = store.matching(t).await.unwrap();
+            let held = m.len() == 1 && m[0].topic == *t;
+            assert!(held, "a retained topic must match itself: {t:?}");
+            assert_eq!(store.contains(t).await.unwrap(), held, "topic {t:?}");
+        }
+        // ... and for topics that are not retained, including one that a wildcard
+        // filter WOULD reach.
+        for t in ["a/b/c/d/e", "zzz", "a/absent"] {
+            assert!(store.matching(t).await.unwrap().is_empty());
+            assert!(!store.contains(t).await.unwrap());
+        }
+        // Deleting flips it back.
+        store.set(&clear("a/b")).await.unwrap();
+        assert!(!store.contains("a/b").await.unwrap());
+    }
+
+    /// The trait's DEFAULT `contains` — what an out-of-tree store (and the hub's own
+    /// test doubles) inherit — must give the same answer as the backends' O(1)
+    /// override, or the quota check changes meaning depending on the backend.
+    #[tokio::test]
+    async fn the_default_contains_agrees_with_the_indexed_override() {
+        /// A store that overrides nothing: `contains` falls through to the default.
+        #[derive(Debug, Default)]
+        struct DefaultsOnly(MemoryRetainedStore);
+
+        #[async_trait]
+        impl RetainedStore for DefaultsOnly {
+            async fn set(&self, message: &Message) -> Result<(), StorageError> {
+                self.0.set(message).await
+            }
+            async fn matching(&self, filter: &str) -> Result<Vec<Message>, StorageError> {
+                self.0.matching(filter).await
+            }
+            async fn all(&self) -> Result<Vec<Message>, StorageError> {
+                self.0.all().await
+            }
+        }
+
+        let store = DefaultsOnly::default();
+        for t in ["a", "a/b", "$SYS/broker", "a//b"] {
+            store.set(&retained(t)).await.unwrap();
+        }
+        for t in ["a", "a/b", "$SYS/broker", "a//b", "a/c", "b"] {
+            assert_eq!(
+                store.contains(t).await.unwrap(),
+                store.0.contains(t).await.unwrap(),
+                "default and override disagree on {t:?}"
+            );
+        }
+    }
+
+    /// Topic depth is client-controlled input, so every walk — insert, match, remove
+    /// and the node teardown removal triggers — must be iterative. Recursive versions
+    /// abort the process here rather than failing an assert, so reaching the end of
+    /// this test IS the assertion.
+    #[tokio::test]
+    async fn deep_topics_stay_iterative() {
+        let deep = vec!["a"; 100_000].join("/");
+        let store = MemoryRetainedStore::new();
+        store.set(&retained(&deep)).await.unwrap(); // insert walk
+        assert_eq!(store.matching(&deep).await.unwrap().len(), 1); // fast path
+        assert_eq!(store.matching("#").await.unwrap().len(), 1); // subtree walk
+        let all_plus = vec!["+"; 100_000].join("/");
+        assert_eq!(store.matching(&all_plus).await.unwrap().len(), 1); // filter walk
+                                                                       // The clear detaches a 100_000-node chain at the root: this is the drop that
+                                                                       // must not recurse.
+        store.set(&clear(&deep)).await.unwrap();
+        assert!(store.matching("#").await.unwrap().is_empty());
+        // And one left in place, so dropping the whole store tears the chain down too.
+        store.set(&retained(&deep)).await.unwrap();
     }
 }

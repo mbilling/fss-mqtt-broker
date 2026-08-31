@@ -294,26 +294,21 @@ impl Hub {
         // now, the frame flows when the link returns (sweep), or re-routes to
         // the successor when membership confirms death (`peer_dead`).
         let gated = gate.is_some() && qos_num(qos) >= 1;
+        // ONE trie walk answers both questions below — who must be forwarded to,
+        // and whether a given connected peer is interested. This used to be a
+        // scan of every peer's whole filter set, per question, per message.
+        let interested_nodes = self.interest.nodes_matching(topic);
         if gated {
-            let targets: Vec<NodeId> = self
-                .remote_interest
-                .iter()
-                .filter(|(_, filters)| filters.iter().any(|f| topic_matches(f, topic)))
-                .map(|(node, _)| node.clone())
-                .collect();
             let id = gate.unwrap_or_default();
-            for node in targets {
-                self.send_acked_forward(id, &node);
+            for node in &interested_nodes {
+                self.send_acked_forward(id, node);
             }
             if !retain_broadcasts {
                 return;
             }
         }
         for (node, peer) in &self.peers {
-            let interested = self
-                .remote_interest
-                .get(node)
-                .is_some_and(|filters| filters.iter().any(|f| topic_matches(f, topic)));
+            let interested = interested_nodes.contains(node);
             if gated && interested {
                 continue; // already handled (acked or legacy) above
             }
@@ -339,15 +334,15 @@ impl Hub {
         let Some(p) = self.pending_publishes.get(&id) else {
             return Vec::new();
         };
+        // Off the message path (takeover re-route), but the same one-walk shape:
+        // resolve the interested set once, then test membership per peer.
+        let interested_nodes = self.interest.nodes_matching(&p.topic);
         self.peers
             .iter()
             .filter(|(n, _)| {
                 !p.acked_nodes.contains(*n)
                     && !p.awaiting.values().any(|o| &o.node == *n)
-                    && self
-                        .remote_interest
-                        .get(*n)
-                        .is_some_and(|fs| fs.iter().any(|f| topic_matches(f, &p.topic)))
+                    && interested_nodes.contains(*n)
             })
             .map(|(n, _)| n.clone())
             .collect()
@@ -721,6 +716,209 @@ impl Hub {
             }
             self.try_complete_pending(id);
         }
+    }
+}
+
+/// Inverted interest index: which peer nodes want a given topic.
+///
+/// Interest is announced node-keyed (a node sends the full list of filters its
+/// sessions hold), and it used to be STORED that way too — `NodeId -> filters`.
+/// Answering "who wants this topic?" then meant scanning every peer's entire
+/// filter set on every forwarded message: O(all cluster-wide subscriptions) per
+/// publish. That is the factor that turns forwarding into O(nodes²) work
+/// cluster-wide, and it is why adding nodes bent the latency curve instead of
+/// buying throughput.
+///
+/// This inverts it. [`SubscriptionTable`] is a filter->subscriber index with a
+/// topic trie beneath it: ONE walk of the topic's levels yields the subscribers,
+/// O(topic depth + matches), no matter how many filters the cluster holds. Its
+/// subscriber is an opaque id, so here it is keyed by NODE id — that pun is the
+/// whole trick, and containing it in this wrapper is why there is no second copy
+/// of a trie whose wildcard rules and iterative teardown are already hardened and
+/// equivalence-tested in `mqtt-core`.
+#[derive(Debug, Default)]
+pub(super) struct InterestIndex {
+    /// Filter -> interested nodes, the node id wearing `ClientId`'s clothing.
+    /// Also the only place the filter strings are stored.
+    by_filter: SubscriptionTable,
+    /// Nodes that have advertised interest at all — including a node that
+    /// advertised an EMPTY filter list, which still counts as "has interest"
+    /// exactly as the old `HashMap` entry did. The table cannot answer this
+    /// (it only knows filters that have subscribers), so removal consults this.
+    nodes: HashSet<NodeId>,
+}
+
+impl InterestIndex {
+    /// A node id as the table's opaque subscriber key.
+    fn key(node: &NodeId) -> ClientId {
+        ClientId(std::sync::Arc::from(node.0.as_str()))
+    }
+
+    /// Replace `node`'s advertised interest wholesale — peers send full
+    /// snapshots, so this is a remove-then-insert, not a merge.
+    pub(super) fn replace(&mut self, node: NodeId, filters: Vec<String>) {
+        let key = Self::key(&node);
+        self.by_filter.remove_client(&key);
+        for f in filters {
+            let interned = self.by_filter.intern(&f);
+            self.by_filter.subscribe(key.clone(), interned);
+        }
+        self.nodes.insert(node);
+    }
+
+    /// Drop `node`'s interest entirely; `true` if it had an entry, matching the
+    /// old `HashMap::remove(..).is_some()`.
+    pub(super) fn remove(&mut self, node: &NodeId) -> bool {
+        self.by_filter.remove_client(&Self::key(node));
+        self.nodes.remove(node)
+    }
+
+    /// Every node whose advertised interest matches `topic`, in one trie walk.
+    pub(super) fn nodes_matching(&self, topic: &str) -> HashSet<NodeId> {
+        self.by_filter
+            .matching_clients(topic)
+            .into_iter()
+            .map(|c| NodeId(c.as_str().to_string()))
+            .collect()
+    }
+
+    /// Whether `node` has advertised any interest (test/diagnostic helper).
+    #[cfg(test)]
+    pub(super) fn has_node(&self, node: &NodeId) -> bool {
+        self.nodes.contains(node)
+    }
+}
+
+#[cfg(test)]
+mod interest_index_tests {
+    use super::*;
+
+    /// The linear scan the index replaced: every node whose advertised filters
+    /// contain one matching `topic`. The reference the corpus is checked against.
+    fn reference(topic: &str, per_node: &HashMap<NodeId, Vec<String>>) -> HashSet<NodeId> {
+        per_node
+            .iter()
+            .filter(|(_, fs)| fs.iter().any(|f| topic_matches(f, topic)))
+            .map(|(n, _)| n.clone())
+            .collect()
+    }
+
+    /// The index must answer EXACTLY what the old per-peer linear scan answered.
+    /// Generated corpus: wildcards at every position, `$`-rooted topics, empty
+    /// levels, multi-level topics — checked against the linear `topic_matches`
+    /// reference the scan used, through replace/remove churn.
+    #[test]
+    fn interest_index_matches_the_linear_scan_it_replaced() {
+        let alphabet = ["a", "b", "+", "#", ""];
+        let mut filters: Vec<String> = Vec::new();
+        let mut topics: Vec<String> = vec![
+            "$SYS/broker".into(),
+            "$SYS".into(),
+            "a".into(),
+            "a/b/c/d".into(),
+        ];
+        for d1 in alphabet {
+            filters.push(d1.to_string());
+            topics.push(d1.to_string());
+            for d2 in alphabet {
+                filters.push(format!("{d1}/{d2}"));
+                topics.push(format!("{d1}/{d2}"));
+                for d3 in alphabet {
+                    filters.push(format!("{d1}/{d2}/{d3}"));
+                    topics.push(format!("{d1}/{d2}/{d3}"));
+                }
+            }
+        }
+        filters.retain(|f| mqtt_core::valid_filter(f));
+        filters.sort();
+        filters.dedup();
+
+        // Spread the filters over several nodes, as peers announce them.
+        let mut per_node: HashMap<NodeId, Vec<String>> = HashMap::new();
+        for (i, f) in filters.iter().enumerate() {
+            per_node
+                .entry(NodeId(format!("n{}", i % 4)))
+                .or_default()
+                .push(f.clone());
+        }
+
+        let mut idx = InterestIndex::default();
+        for (node, fs) in &per_node {
+            idx.replace(node.clone(), fs.clone());
+        }
+
+        for topic in &topics {
+            assert_eq!(
+                idx.nodes_matching(topic),
+                reference(topic, &per_node),
+                "index and linear scan disagree on topic {topic:?}"
+            );
+        }
+
+        // Churn: drop one node entirely, re-announce another with a narrower list.
+        let dropped = NodeId("n1".into());
+        assert!(idx.remove(&dropped));
+        per_node.remove(&dropped);
+
+        let narrowed = NodeId("n2".into());
+        let keep: Vec<String> = per_node[&narrowed].iter().take(3).cloned().collect();
+        idx.replace(narrowed.clone(), keep.clone());
+        per_node.insert(narrowed, keep);
+
+        for topic in &topics {
+            assert_eq!(
+                idx.nodes_matching(topic),
+                reference(topic, &per_node),
+                "after churn, index and linear scan disagree on topic {topic:?}"
+            );
+        }
+    }
+
+    /// A node announcing an EMPTY filter list still "has interest": the old
+    /// `HashMap` stored an empty set and `remove(..).is_some()` was true, and
+    /// `peer_dead` branches on that answer.
+    #[test]
+    fn a_node_with_no_filters_still_has_an_interest_entry() {
+        let mut idx = InterestIndex::default();
+        let n = NodeId("quiet".into());
+        idx.replace(n.clone(), Vec::new());
+        assert!(idx.has_node(&n));
+        assert!(idx.nodes_matching("anything").is_empty());
+        assert!(idx.remove(&n), "an empty announcement is still an entry");
+        assert!(!idx.remove(&n), "removing twice reports no entry");
+    }
+
+    /// Re-announcing REPLACES rather than merges: a filter dropped from the new
+    /// snapshot must stop matching, or a node keeps receiving traffic for
+    /// subscriptions it no longer has.
+    #[test]
+    fn re_announcing_replaces_the_previous_snapshot() {
+        let mut idx = InterestIndex::default();
+        let n = NodeId("n".into());
+        idx.replace(n.clone(), vec!["a/#".into(), "b/c".into()]);
+        assert_eq!(idx.nodes_matching("b/c"), HashSet::from([n.clone()]));
+        idx.replace(n.clone(), vec!["a/#".into()]);
+        assert!(
+            idx.nodes_matching("b/c").is_empty(),
+            "a filter absent from the new snapshot must stop matching"
+        );
+        assert_eq!(idx.nodes_matching("a/x"), HashSet::from([n]));
+    }
+
+    /// Two nodes sharing one filter both match, and removing one leaves the
+    /// other routable — the shared-terminal case the trie prunes on last use.
+    #[test]
+    fn nodes_sharing_a_filter_are_independent() {
+        let mut idx = InterestIndex::default();
+        let (n1, n2) = (NodeId("n1".into()), NodeId("n2".into()));
+        idx.replace(n1.clone(), vec!["s/+/t".into()]);
+        idx.replace(n2.clone(), vec!["s/+/t".into()]);
+        assert_eq!(
+            idx.nodes_matching("s/x/t"),
+            HashSet::from([n1.clone(), n2.clone()])
+        );
+        idx.remove(&n1);
+        assert_eq!(idx.nodes_matching("s/x/t"), HashSet::from([n2]));
     }
 }
 
