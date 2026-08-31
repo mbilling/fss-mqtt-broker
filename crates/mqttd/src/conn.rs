@@ -1989,12 +1989,36 @@ async fn handle_publish<W: AsyncWrite + Unpin>(
     }
     // Forward to the hub; the returned receiver resolves once the hub's fan-out —
     // including any durable (fsync'd) offline-queue appends — has completed, so a
-    // QoS ≥ 1 acknowledgement can be released only for a message the broker durably
+    // QoS >= 1 acknowledgement can be released only for a message the broker durably
     // owns (ADR 0018). `None` when the publish was dropped by the ACL.
+    //
+    // At QoS 0 there is NO channel, deliberately. The hub gates on
+    // `done.is_some()`, not on QoS, so a `Some` here would register the publish in
+    // `pending_publishes` — a table bounded by `PENDING_PUBLISH_CAP` (4096) and
+    // documented for "publishes whose acknowledgement is gated on cluster-wide
+    // durability" (ADR 0042 T9). A QoS 0 publish has no acknowledgement to gate,
+    // and at the cap the oldest entry is evicted with its ack withheld "so the
+    // publisher retries" — which at QoS 0 means the message is simply LOST.
+    //
+    // That is not hypothetical. Measured on the ADR 0077 lane E ladder (issue
+    // #492): with 10,800 concurrent QoS 0 publishers against a 4096 cap, drops
+    // jumped 13x between rungs and delivery fell to 79.7% while ~20% of the
+    // cluster's CPU sat idle and no core was saturated. The cap's own rationale —
+    // "publisher inflight windows bound this naturally" — does not hold once the
+    // publisher count exceeds it.
+    //
+    // Skipping the channel also skips a `oneshot::channel` allocation per QoS 0
+    // publish, on a path already measured at ~31% of its cycles in malloc (#490).
+    let gated = !matches!(qos, QoS::AtMostOnce);
     let forward = |hub: &mpsc::UnboundedSender<HubCommand>|
      -> Option<oneshot::Receiver<crate::hub::PublishOutcome>> {
         if authorized {
-            let (done_tx, done_rx) = oneshot::channel();
+            let (done, rx) = if gated {
+                let (tx, rx) = oneshot::channel();
+                (Some(tx), Some(rx))
+            } else {
+                (None, None)
+            };
             let _ = hub.send(HubCommand::Publish {
                 topic,
                 payload,
@@ -2002,11 +2026,11 @@ async fn handle_publish<W: AsyncWrite + Unpin>(
                 retain,
                 message_expiry,
                 app,
-                done: Some(done_tx),
+                done,
                 v5: is_v5,
                 publisher: Some(client.clone()), // #198: No Local excludes this publisher
             });
-            Some(done_rx)
+            rx
         } else {
             None
         }
@@ -3289,6 +3313,37 @@ mod tests {
         rx
     }
 
+    /// Hub stub that answers Attach and reports, per `Publish`, whether the command
+    /// carried a completion channel — i.e. whether the hub would register it in the
+    /// durability-gating `pending_publishes` table, which gates on `done.is_some()`
+    /// rather than on `QoS`.
+    fn stub_hub_gating(
+        mut hub_rx: mpsc::UnboundedReceiver<HubCommand>,
+    ) -> mpsc::UnboundedReceiver<(QoS, bool)> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            let mut keep_alive = Vec::new();
+            while let Some(cmd) = hub_rx.recv().await {
+                match cmd {
+                    HubCommand::Attach {
+                        outbound, reply, ..
+                    } => {
+                        keep_alive.push(outbound);
+                        let _ = reply.send(AttachOutcome::Present(false));
+                    }
+                    HubCommand::Publish { qos, done, .. } => {
+                        let _ = tx.send((qos, done.is_some()));
+                        if let Some(done) = done {
+                            let _ = done.send(crate::hub::PublishOutcome::Accepted);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        });
+        rx
+    }
+
     /// Hub stub that answers Attach and hands the connection's outbound sender back
     /// to the test, so it can drive server→client publishes through the writer path.
     fn stub_hub_capture_outbound(
@@ -3784,6 +3839,57 @@ mod tests {
             }
             other => panic!("expected SUBACK, got {other:?}"),
         }
+    }
+
+    /// A `QoS 0` publish must NOT carry a completion channel (issue #492).
+    ///
+    /// The hub registers a publish in `pending_publishes` when `done.is_some()` —
+    /// not when the `QoS` warrants it. That table is bounded by
+    /// `PENDING_PUBLISH_CAP` (4096) and exists to gate acknowledgements on
+    /// cluster-wide durability, which a `QoS 0` publish does not have. At the cap
+    /// the oldest entry is evicted and its ack withheld "so the publisher
+    /// retries"; at `QoS 0` there is no ack and no retry, so the message is lost.
+    ///
+    /// Measured before the fix on the ADR 0077 lane E ladder: 10,800 concurrent
+    /// `QoS 0` publishers against a 4096 cap dropped 1.17M messages and delivery
+    /// fell to 79.7%, with no CPU core saturated and ~20% of the cluster idle.
+    #[tokio::test]
+    async fn qos0_publish_is_not_durability_gated() {
+        let (mut reader, mut writer, hub_rx) = v5_pipe();
+        let mut seen = stub_hub_gating(hub_rx);
+        writer.send(&connect_v5("c", vec![])).await.unwrap();
+        assert!(matches!(recv(&mut reader).await, Some(Packet::ConnAck(_))));
+
+        let publish = |qos: QoS, pkid: Option<u16>| {
+            Packet::Publish(Publish {
+                properties: Properties::new(),
+                dup: false,
+                qos,
+                retain: false,
+                topic: "t/1".into(),
+                pkid,
+                payload: Bytes::from_static(b"x"),
+            })
+        };
+
+        writer.send(&publish(QoS::AtMostOnce, None)).await.unwrap();
+        assert_eq!(
+            seen.recv().await,
+            Some((QoS::AtMostOnce, false)),
+            "a QoS 0 publish must not be registered for durability gating"
+        );
+
+        // The contrast that makes the assertion meaningful: QoS 1 still gates, or
+        // the fix would have been "never gate anything".
+        writer
+            .send(&publish(QoS::AtLeastOnce, Some(1)))
+            .await
+            .unwrap();
+        assert_eq!(
+            seen.recv().await,
+            Some((QoS::AtLeastOnce, true)),
+            "a QoS 1 publish must still be gated — its ack depends on it"
+        );
     }
 
     /// The v5 CONNACK advertises the server's inbound Topic Alias Maximum, and an

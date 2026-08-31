@@ -123,5 +123,9 @@ panic = "abort"
 # shipped release artifact is unaffected, so the reproducible-build guarantee
 # and the binary's size are untouched.
 [profile.bench]
+# Debug info only — it adds DWARF sections beside identical instructions, so a
+# profile is attributable without the numbers moving. `force-frame-pointers`
+# was tried here and REMOVED: it changes code generation and cost 25-30% on this
+# bench, which is larger than most effects the bench exists to detect and would
+# have made every measurement taken under it wrong.
 debug = true
-force-frame-pointers = true
