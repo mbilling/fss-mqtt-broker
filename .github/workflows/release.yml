@@ -166,7 +166,12 @@ jobs:
           # addresses. Its executable section is proven identical to the shipped
           # binary's by build-repro.sh, so a profile taken against it describes the
           # code that ships.
-          cp "target/${{ matrix.target }}/release/mqttd-symbols" "out/${SYMBOLS_NAME}"
+          # Optional: build-repro.sh declines to produce the twin when its executable
+          # section does not match the shipped binary's, and a profiling convenience
+          # must not block a release. Its absence is reported in that step's log.
+          if [ -f "target/${{ matrix.target }}/release/mqttd-symbols" ]; then
+            cp "target/${{ matrix.target }}/release/mqttd-symbols" "out/${SYMBOLS_NAME}"
+          fi
           # The container images copy from dist/<binary> (arch-native).
           cp "target/${{ matrix.target }}/release/mqttd" dist/mqttd
           cp "target/${{ matrix.target }}/release/mqtt-bridge" dist/mqtt-bridge
@@ -176,7 +181,12 @@ jobs:
           ( cd out && sha256sum "${UI_NAME}" > "${UI_NAME}.sha256" )
           ( cd out && sha256sum "${OPERATOR_NAME}" > "${OPERATOR_NAME}.sha256" )
           ( cd out && sha256sum "${FIPS_NAME}" > "${FIPS_NAME}.sha256" )
-          ( cd out && sha256sum "${SYMBOLS_NAME}" > "${SYMBOLS_NAME}.sha256" )
+          # `if`, not `[ -f ... ] && ...`: these blocks run under `bash -e`, so a
+          # false test as the last command in the chain would fail the step in
+          # exactly the case this is here to tolerate.
+          if [ -f "out/${SYMBOLS_NAME}" ]; then
+            ( cd out && sha256sum "${SYMBOLS_NAME}" > "${SYMBOLS_NAME}.sha256" )
+          fi
           echo "name=${NAME}" >> "$GITHUB_OUTPUT"
           echo "bridge_name=${BRIDGE_NAME}" >> "$GITHUB_OUTPUT"
           echo "ui_name=${UI_NAME}" >> "$GITHUB_OUTPUT"

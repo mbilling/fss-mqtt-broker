@@ -140,14 +140,25 @@ if [ "${BUILD_SYMBOLS:-0}" = 1 ]; then
 	b="$(sha256sum "${SYM_BIN}.text.bin" | cut -d' ' -f1)"
 	rm -f "${SHIPPED}.text.bin" "${SYM_BIN}.text.bin"
 	if [ "$a" != "$b" ]; then
+		# Not fatal. A twin that does not describe the shipped code is useless, so it
+		# is not produced — but a profiling CONVENIENCE must never block a release
+		# that carries real fixes. The absence is loud here and the staging step
+		# treats the file as optional.
+		#
+		# This fires in practice: `-C debuginfo=2` was assumed to be codegen-neutral
+		# (it adds DWARF sections beside the same instructions) and on
+		# aarch64-unknown-linux-musl it is NOT — the executable sections differ.
+		# Debug info can change LLVM's decisions, so the assumption was wrong and
+		# this check is what caught it rather than a mismatched twin shipping.
 		echo "BUILD_SYMBOLS: .text differs between the shipped and symbols builds" >&2
 		echo "  shipped $a" >&2
 		echo "  symbols $b" >&2
-		echo "  the symbols binary would not describe the code that ships — refusing" >&2
-		exit 1
+		echo "  NOT producing mqttd-symbols for ${TARGET}: it would describe different" >&2
+		echo "  instructions from the ones that ship, which is worse than shipping none." >&2
+	else
+		cp "$SYM_BIN" "${REPO_ROOT}/target/${TARGET}/release/mqttd-symbols"
+		echo "BUILD_SYMBOLS: .text identical ($a) — mqttd-symbols is a faithful stand-in" >&2
 	fi
-	cp "$SYM_BIN" "${REPO_ROOT}/target/${TARGET}/release/mqttd-symbols"
-	echo "BUILD_SYMBOLS: .text identical ($a) — mqttd-symbols is a faithful stand-in" >&2
 fi
 
 # stdout stays the broker path: callers (and RELEASING.md) treat this script's
