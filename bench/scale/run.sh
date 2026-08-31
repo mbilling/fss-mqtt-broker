@@ -81,6 +81,22 @@ esac
 # it lands in the run's env dumps.
 LATEST_TAG=$(git -C "$SCALE_DIR" describe --tags --abbrev=0 2>/dev/null | sed 's/^v//' || true)
 [ -n "${MQTTD_VERSION:-}" ] || die "MQTTD_VERSION is not set — name the release under test explicitly (e.g. MQTTD_VERSION=${LATEST_TAG:-1.0.6}); terraform's default is not a choice"
+
+# MQTTD_URL measures a binary that has NOT shipped — a candidate, a pre-release, a
+# branch build. It exists because the rig could otherwise only ever measure
+# published releases, so a performance change had to be released in order to be
+# measured (issue #483). That inverts the normal order: a change should earn its
+# release, not be released to earn evidence.
+#
+# Two things are non-negotiable when it is used.
+#
+# The hash. The release path may fall back to the `.sha256` published beside the
+# artifact; an arbitrary URL has no such companion, so without MQTTD_SHA256 there
+# would be NO verification at all. Refused here rather than in terraform so the
+# error names the fix, and refused before anything is provisioned.
+if [ -n "${MQTTD_URL:-}" ] && [ -z "${MQTTD_SHA256:-}" ]; then
+	die "MQTTD_URL is set but MQTTD_SHA256 is not. An arbitrary URL publishes no .sha256 beside it, so the broker would be installed unverified. Compute it (sha256sum <binary>) and pass MQTTD_SHA256."
+fi
 command -v terraform >/dev/null || command -v tofu >/dev/null || die "terraform (or tofu) not installed"
 command -v jq >/dev/null || die "jq not installed"
 TF=$(command -v terraform || command -v tofu)
@@ -99,6 +115,28 @@ case "$RUN" in
 esac
 mkdir -p "$RUN"
 say "run dir: $RUN"
+
+# The second non-negotiable for MQTTD_URL: mark the run, loudly and on disk.
+#
+# The rig's whole claim is that a published number is attributable to a signed,
+# byte-reproducible release. A number measured against an unreleased binary is
+# not, and the difference is invisible in a results directory a week later — so
+# it is written INTO the results rather than left to whoever remembers.
+if [ -n "${MQTTD_URL:-}" ]; then
+	{
+		echo "UNRELEASED"
+		echo "url=$MQTTD_URL"
+		echo "sha256=${MQTTD_SHA256:-}"
+		echo "nominal_version=${MQTTD_VERSION:-}"
+		echo
+		echo "The broker under test was NOT the published release for this version."
+		echo "It was fetched from the URL above and verified against the pinned hash."
+		echo "Numbers from this run are attributable to that binary and to nothing"
+		echo "else — they are not a published-curve point and must not be cited as"
+		echo "one (bench/scale/README.md, ADR 0048)."
+	} >"$RUN/UNRELEASED-BINARY.txt"
+	warn "MQTTD_URL is set — this run measures an UNRELEASED binary; results are stamped $RUN/UNRELEASED-BINARY.txt and are NOT a published-curve point"
+fi
 
 TFDIR="$SCALE_DIR/terraform"
 CURRENT_SIZE=""
@@ -165,6 +203,8 @@ for N in "${SIZES[@]}"; do
 	(cd "$TFDIR" && "$TF" apply -auto-approve -input=false \
 		-var node_count="$N" -var run_label="$STAMP" \
 		${MQTTD_VERSION:+-var mqttd_version="$MQTTD_VERSION"} \
+		${MQTTD_URL:+-var mqttd_url="$MQTTD_URL"} \
+		${MQTTD_SHA256:+-var mqttd_sha256="$MQTTD_SHA256"} \
 		${BENCH_GIT_REF:+-var bench_git_ref="$BENCH_GIT_REF"} \
 		${SSH_KEY:+-var ssh_public_key_path="${SSH_KEY}.pub"} \
 		${DRIVER_COUNT:+-var driver_count="$DRIVER_COUNT"} \
