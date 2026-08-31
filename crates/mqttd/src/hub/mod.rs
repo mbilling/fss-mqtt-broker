@@ -45,6 +45,7 @@ use mqtt_codec::{
     packet::{Disconnect, Publish},
     Packet, ProtocolVersion, QoS,
 };
+use mqtt_core::filter_index::FilterIndex;
 use mqtt_core::{
     parse_shared, topic_matches, AppProperties, ClientId, FilterKey, Message,
     SharedSubscriptionTable, Subscription, SubscriptionTable,
@@ -1777,6 +1778,26 @@ pub struct Hub {
     /// Each peer's last-announced shared-subscription membership, so this node can
     /// select one member per group across the whole cluster (ADR 0015 §2).
     remote_shared: HashMap<NodeId, Vec<RemoteSharedGroup>>,
+    /// Derived match index over every PEER's shared filters (ADR 0077 T4
+    /// follow-up). `remote_shared` above stays the source of truth — it is what
+    /// a node's interest update replaces and what its death removes — and these
+    /// two are rebuilt from it whenever it changes, which is a membership-rate
+    /// event rather than a publish-rate one.
+    ///
+    /// Before this, every publish scanned every peer's every group with
+    /// `topic_matches`, and collected the peer map into a `BTreeMap` purely for
+    /// stable ordering. Measured, that cost a node ~19 ns per publish per remote
+    /// group plus ~32 ns per peer, and it was paid whether or not any peer's
+    /// filter matched: a node that merely KNEW about 4 peers lost half its
+    /// publish dispatch (`crates/mqttd/benches/shared_plan.rs`).
+    remote_shared_index: FilterIndex,
+    /// Filter → the peers announcing it, each with its index into that peer's
+    /// `remote_shared` vector. Built in sorted node order, which is what makes
+    /// the candidate list stable per publish WITHOUT the per-publish sort the
+    /// `BTreeMap` collect used to provide — the round-robin cursor indexes into
+    /// that list, so an order that varied between publishes would make selection
+    /// arbitrary.
+    remote_by_filter: HashMap<FilterKey, Vec<(NodeId, usize)>>,
     /// Per-group round-robin cursor for cluster-wide shared selection (ADR 0015).
     shared_cursor: HashMap<SharedKey, usize>,
     /// Per-session outbound `QoS` > 0 in-flight state.
@@ -2151,6 +2172,8 @@ impl Hub {
                 table: SubscriptionTable::new(),
                 shared: SharedSubscriptionTable::new(),
                 remote_shared: HashMap::new(),
+                remote_shared_index: FilterIndex::new(),
+                remote_by_filter: HashMap::new(),
                 shared_cursor: HashMap::new(),
                 inflight: HashMap::new(),
                 store,
@@ -2226,6 +2249,43 @@ impl Hub {
     /// off by default.
     pub fn set_shared_prefer_local(&mut self, on: bool) {
         self.shared_prefer_local = on;
+    }
+
+    /// Rebuild the derived remote-shared match index from `remote_shared`.
+    ///
+    /// Called on every change to a peer's shared interest and on peer death —
+    /// membership-rate events. A full rebuild rather than an incremental edit:
+    /// a peer's groups are replaced wholesale by `RemoteSharedInterest`, the
+    /// populations are small, and "obviously correct at the cold path's cost" is
+    /// the right trade against an incremental update that could silently diverge
+    /// from the source of truth.
+    ///
+    /// Nodes are visited in sorted order so each filter's peer list is stable —
+    /// the property the per-publish `BTreeMap` collect used to buy, now paid for
+    /// once per membership change instead of once per message.
+    fn rebuild_remote_shared_index(&mut self) {
+        let mut index = FilterIndex::new();
+        let mut by_filter: HashMap<FilterKey, Vec<(NodeId, usize)>> = HashMap::new();
+        let mut nodes: Vec<&NodeId> = self.remote_shared.keys().collect();
+        nodes.sort();
+        for node in nodes {
+            let Some(groups) = self.remote_shared.get(node) else {
+                continue;
+            };
+            for (idx, g) in groups.iter().enumerate() {
+                match by_filter.entry(FilterKey::from(g.filter.as_str())) {
+                    std::collections::hash_map::Entry::Vacant(v) => {
+                        index.insert(v.key());
+                        v.insert(vec![(node.clone(), idx)]);
+                    }
+                    std::collections::hash_map::Entry::Occupied(mut o) => {
+                        o.get_mut().push((node.clone(), idx));
+                    }
+                }
+            }
+        }
+        self.remote_shared_index = index;
+        self.remote_by_filter = by_filter;
     }
 
     /// ADR 0072 / issue #399: does this message ask for the relaxed tier, and
@@ -2805,6 +2865,7 @@ impl Hub {
             HubCommand::RemoteSharedInterest { node, groups } => {
                 debug!(node = %node.0, groups = groups.len(), "remote shared interest updated");
                 self.remote_shared.insert(node, groups);
+                self.rebuild_remote_shared_index();
             }
             HubCommand::RemoteRetainedSnapshot { node, messages } => {
                 self.apply_retained_snapshot(&node, messages).await;
@@ -5621,6 +5682,7 @@ impl Hub {
         // second face: a publish in the disconnect-to-confirmation window found
         // no interest anywhere and acked a trivially-empty fan-out.
         self.remote_shared.remove(node);
+        self.rebuild_remote_shared_index();
         if let Some(plane) = &self.durable_plane {
             plane.fail(node);
         }
@@ -5636,6 +5698,7 @@ impl Hub {
         self.known_peer_protos.remove(node);
         let had_interest = self.remote_interest.remove(node).is_some();
         self.remote_shared.remove(node);
+        self.rebuild_remote_shared_index();
         // Acked forwards to the dead node re-route to its successor once it
         // advertises the inherited interest (ADR 0042 T9, exhibit ⑤ + ⑥): drop
         // the dead obligations and engage the sweep's re-route grace.

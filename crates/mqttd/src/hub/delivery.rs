@@ -731,24 +731,35 @@ impl Hub {
                     });
                 }
             });
-        for (node, groups) in self.remote_shared.iter().collect::<BTreeMap<_, _>>() {
-            for g in groups {
-                if !topic_matches(&g.filter, topic) {
+        // Via the same index and the same sorted-node order `plan_shared` uses.
+        // This is the cold reselect path, not the per-publish one, but the two
+        // representations must produce IDENTICALLY ORDERED candidate lists —
+        // the round-robin cursor indexes into them, so a divergence here would
+        // make a reselection disagree with the selection it is replacing.
+        let index = &self.remote_shared_index;
+        let by_filter = &self.remote_by_filter;
+        let remote = &self.remote_shared;
+        index.for_each_matching(topic, |filter| {
+            let Some(locations) = by_filter.get(filter) else {
+                return;
+            };
+            for (node, idx) in locations {
+                let Some(g) = remote.get(node).and_then(|groups| groups.get(*idx)) else {
                     continue;
-                }
+                };
                 let entry = by_key
                     .entry((g.group.clone(), g.filter.clone()))
                     .or_default();
                 for (client, qos, online) in &g.members {
                     entry.push(SharedCandidate {
-                        node: Some((*node).clone()),
+                        node: Some(node.clone()),
                         client: client.clone(),
                         qos: *qos,
                         online: *online,
                     });
                 }
             }
-        }
+        });
         by_key.into_iter().collect()
     }
 
@@ -775,11 +786,23 @@ impl Hub {
                 });
             }
         }
-        for (node, groups) in self.remote_shared.iter().collect::<BTreeMap<_, _>>() {
-            for g in groups {
-                if !topic_matches(&g.filter, topic) {
+        // Peers, via the derived index rather than a scan of every peer's every
+        // group. `remote_by_filter` was built in sorted node order, so the
+        // candidate list is stable per publish — the property the old
+        // `collect::<BTreeMap>()` bought on every message and this now pays for
+        // once per membership change. Borrows are split explicitly so the
+        // closure can read the tables while `by_key` is being filled.
+        let index = &self.remote_shared_index;
+        let by_filter = &self.remote_by_filter;
+        let remote = &self.remote_shared;
+        index.for_each_matching(topic, |filter| {
+            let Some(locations) = by_filter.get(filter) else {
+                return;
+            };
+            for (node, idx) in locations {
+                let Some(g) = remote.get(node).and_then(|groups| groups.get(*idx)) else {
                     continue;
-                }
+                };
                 let entry = by_key
                     .entry((g.group.as_str(), g.filter.as_str()))
                     .or_default();
@@ -792,7 +815,7 @@ impl Hub {
                     });
                 }
             }
-        }
+        });
         by_key
             .into_iter()
             .filter(|(_, cands)| !cands.is_empty())

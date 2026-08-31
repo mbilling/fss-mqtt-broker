@@ -100,14 +100,15 @@ async fn publish_burst(tx: &mpsc::UnboundedSender<HubCommand>, count: usize) {
     }
 }
 
+const BURST: usize = 2_000;
+/// lane E: one `$share` group of 6 consumers per site.
+const GROUPS_PER_NODE: usize = 6;
+
 fn bench(c: &mut Criterion) {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .expect("runtime");
-
-    const BURST: usize = 2_000;
-    const GROUPS_PER_NODE: usize = 6; // lane E: one $share group of 6 per site
 
     let mut g = c.benchmark_group("publish_dispatch_vs_known_peers");
     g.throughput(Throughput::Elements(BURST as u64));
