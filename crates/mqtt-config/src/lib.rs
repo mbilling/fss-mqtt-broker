@@ -298,6 +298,28 @@ pub struct Cluster {
     ///
     /// Set `false` only to re-bootstrap deliberately beside a cluster you are abandoning.
     pub refound_guard: bool,
+    /// Prefer a **local** `$share` member when one is online
+    /// (`MQTTD_SHARED_PREFER_LOCAL`, presence = on). Default **off**, which is
+    /// plain round-robin over every online member, local or remote.
+    ///
+    /// Why it exists: shared selection is round-robin across the whole group, so
+    /// a group spread over N nodes picks a REMOTE member roughly (N-1)/N of the
+    /// time and every one of those publishes crosses the cluster bus. For a
+    /// workload that is already partitioned by topic — one tenant per group, its
+    /// consumers present on every node — that forwarding is pure overhead: a
+    /// local member could have served the message with no network hop at all.
+    /// Measured on the ADR 0077 lane E tenancy ladder, where cluster capacity
+    /// grew as `sites = N + 2` rather than proportionally.
+    ///
+    /// What it costs, and why it is OFF by default: round-robin is what makes a
+    /// shared subscription *fair* — every member takes an equal share regardless
+    /// of where publishers connect. Local-first ties a member's load to the
+    /// publishers co-located with it, so an uneven publisher spread produces an
+    /// uneven consumer load, and a group with no local member on some node still
+    /// falls back to remote (never drops). Turn it on when the deployment places
+    /// group members on every node and throughput matters more than even
+    /// distribution; leave it off otherwise.
+    pub shared_prefer_local: bool,
 }
 
 impl Default for Cluster {
@@ -311,6 +333,10 @@ impl Default for Cluster {
             // Data-safe default (as with `durable.enabled`): a node that re-founds beside
             // a live cluster must not serve from an empty store.
             refound_guard: true,
+            // Off: round-robin is the fair behaviour and the one every existing
+            // deployment already has. Locality preference trades that fairness for
+            // throughput and must be asked for.
+            shared_prefer_local: false,
         }
     }
 }
@@ -1185,6 +1211,12 @@ impl Config {
         if get("MQTTD_ALLOW_RELAXED_PUBLISH").is_some() {
             self.durable.allow_relaxed_publish = true;
         }
+        // Presence = on, same rule: this changes which member of a shared group
+        // receives a message, and a behaviour switch should not hinge on parsing
+        // "false".
+        if get("MQTTD_SHARED_PREFER_LOCAL").is_some() {
+            self.cluster.shared_prefer_local = true;
+        }
         on!("MQTTD_OWNERSHIP_DOMAIN", v, {
             self.durable.ownership_domain = match v.as_str() {
                 "members" => OwnershipDomain::Members,
@@ -1608,6 +1640,7 @@ pub const ENV_VARS: &[&str] = &[
     "MQTTD_STORE_MAX_BYTES",
     "MQTTD_ALLOW_EPHEMERAL_DURABILITY",
     "MQTTD_ALLOW_RELAXED_PUBLISH",
+    "MQTTD_SHARED_PREFER_LOCAL",
     "MQTTD_OWNERSHIP_DOMAIN",
     // limits
     "MQTTD_MAX_CONNECTIONS",

@@ -1791,6 +1791,8 @@ pub struct Hub {
     /// operator's `MQTTD_ALLOW_RELAXED_PUBLISH` opt-in. Off = the property is
     /// ignored and every ack keeps its full quorum-durable meaning.
     allow_relaxed_publish: bool,
+    /// `MQTTD_SHARED_PREFER_LOCAL`: prefer a local member in shared selection.
+    shared_prefer_local: bool,
     /// ADR 0073: the cluster-wide scale-out ownership capability. `Some((flag,
     /// enabled))` on a cluster node: `enabled` is the operator's
     /// `durable.ownership_domain = "members"` choice; `flag` is the shared verdict
@@ -2154,6 +2156,7 @@ impl Hub {
                 store,
                 durable_plane: None,
                 allow_relaxed_publish: false,
+                shared_prefer_local: false,
                 ownership_domain: None,
                 known_peer_protos: HashMap::new(),
                 retained: Arc::new(MemoryRetainedStore::new()),
@@ -2215,6 +2218,14 @@ impl Hub {
     /// `MQTTD_ALLOW_RELAXED_PUBLISH` opt-in, threaded to the ack gate.
     pub fn set_allow_relaxed_publish(&mut self, on: bool) {
         self.allow_relaxed_publish = on;
+    }
+
+    /// Prefer a local `$share` member over a remote one when both are online
+    /// (`MQTTD_SHARED_PREFER_LOCAL`). See [`Hub::choose_shared_index`] for what
+    /// this changes and `mqtt_config::Cluster::shared_prefer_local` for why it is
+    /// off by default.
+    pub fn set_shared_prefer_local(&mut self, on: bool) {
+        self.shared_prefer_local = on;
     }
 
     /// ADR 0072 / issue #399: does this message ask for the relaxed tier, and
@@ -6092,6 +6103,17 @@ mod tests {
         tx
     }
 
+    /// A hub with `MQTTD_SHARED_PREFER_LOCAL` on, for the locality-preference tests.
+    fn start_hub_prefer_local() -> HubTx {
+        let (mut hub, tx) = Hub::with_config(
+            NodeId("hub-test".into()),
+            std::sync::Arc::new(MemorySessionStore::new()),
+        );
+        hub.set_shared_prefer_local(true);
+        tokio::spawn(hub.run());
+        tx
+    }
+
     /// A controllable wall clock for deterministic absolute-deadline tests: time only
     /// moves when the test calls [`advance`](TestClock::advance).
     #[derive(Debug, Clone)]
@@ -6922,6 +6944,25 @@ mod tests {
         }
     }
 
+    /// Whether ANY `SharedDeliver` arrives within the usual window — the negative
+    /// of [`next_shared_deliver`], for asserting that nothing crossed the bus.
+    /// Bounded-wait rather than `try_recv`, so a forward that is merely slow still
+    /// fails the assertion instead of passing it.
+    async fn no_shared_deliver(rx: &mut mpsc::UnboundedReceiver<PeerMessage>) -> bool {
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(300);
+        loop {
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if left.is_zero() {
+                return true;
+            }
+            match timeout(left, rx.recv()).await {
+                Ok(Some(PeerMessage::SharedDeliver { .. })) => return false,
+                Ok(Some(_)) => {}
+                Ok(None) | Err(_) => return true,
+            }
+        }
+    }
+
     /// The next `SharedDeliver` from a peer, skipping interest snapshots.
     async fn next_shared_deliver(rx: &mut mpsc::UnboundedReceiver<PeerMessage>) -> PeerMessage {
         loop {
@@ -7425,6 +7466,63 @@ mod tests {
             recv_packet(&mut ra).await.is_none(),
             "single delivery per publish"
         );
+    }
+
+    /// `MQTTD_SHARED_PREFER_LOCAL`: the same group and the same two publishes as
+    /// `shared_selection_round_robins_local_and_remote_member`, which sends the
+    /// second one across the cluster bus. With locality preference the LOCAL member
+    /// takes both and nothing is forwarded — the whole point of the knob.
+    #[tokio::test]
+    async fn prefer_local_keeps_shared_delivery_off_the_cluster_bus() {
+        let tx = start_hub_prefer_local();
+        let mut peer = connect_peer(&tx, "n", 1);
+        assert!(matches!(
+            recv_peer(&mut peer).await,
+            Some(PeerMessage::Interest { .. })
+        ));
+
+        let (mut ra, _) = attach(&tx, "ra", 1, true).await;
+        subscribe(&tx, "ra", "$share/g/t");
+        remote_shared_interest(&tx, "n", "g", "t", &["rb"]);
+
+        // Both publishes land on the local member; round-robin would have sent the
+        // second to "rb" on peer "n".
+        publish(&tx, "t", b"m1");
+        assert_eq!(payload_of(&recv_packet(&mut ra).await.unwrap()), b"m1");
+        publish(&tx, "t", b"m2");
+        assert_eq!(payload_of(&recv_packet(&mut ra).await.unwrap()), b"m2");
+
+        assert!(
+            no_shared_deliver(&mut peer).await,
+            "a local member was online, so nothing should have crossed the bus"
+        );
+    }
+
+    /// Locality preference is a PREFERENCE, never a restriction: a group whose only
+    /// online member is remote still gets its message, exactly as round-robin would.
+    /// This is the fallback that keeps the knob safe to turn on anywhere.
+    #[tokio::test]
+    async fn prefer_local_still_uses_a_remote_member_when_there_is_no_local_one() {
+        let tx = start_hub_prefer_local();
+        let mut peer = connect_peer(&tx, "n", 1);
+        assert!(matches!(
+            recv_peer(&mut peer).await,
+            Some(PeerMessage::Interest { .. })
+        ));
+
+        // No local member at all — only a remote one.
+        remote_shared_interest(&tx, "n", "g", "t", &["rb"]);
+
+        publish(&tx, "t", b"m1");
+        match next_shared_deliver(&mut peer).await {
+            PeerMessage::SharedDeliver {
+                client, payload, ..
+            } => {
+                assert_eq!(client, "rb");
+                assert_eq!(&payload[..], b"m1");
+            }
+            other => panic!("expected SharedDeliver, got {other:?}"),
+        }
     }
 
     /// A remote member offline on its home node is skipped while a member online

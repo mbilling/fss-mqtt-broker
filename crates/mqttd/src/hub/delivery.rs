@@ -863,7 +863,20 @@ impl Hub {
         // Immediately deliverable: any member online on its home node — local (our
         // `online`) or remote (its home node's gossiped liveness, ADR 0015 T8). Targeting a
         // member offline at home would only queue there while a live member could deliver now.
-        let immediate = rotated().find(|&i| candidates[i].online());
+        //
+        // With `MQTTD_SHARED_PREFER_LOCAL`, a LOCAL online member is taken first and a
+        // remote one only if this node hosts none. Rotation still applies within each
+        // class, so members on this node keep taking equal turns — the round-robin
+        // fairness is preserved locally and given up only ACROSS nodes, which is exactly
+        // the trade the knob names. Selection remains deterministic and every existing
+        // fallback below is untouched: a group with no local member behaves as before.
+        let immediate = if self.shared_prefer_local {
+            rotated()
+                .find(|&i| candidates[i].online() && candidates[i].is_local())
+                .or_else(|| rotated().find(|&i| candidates[i].online()))
+        } else {
+            rotated().find(|&i| candidates[i].online())
+        };
         immediate
             // No one online: a local persistent member queues for replay (ADR 0015 §4)...
             .or_else(|| {
