@@ -14,9 +14,15 @@ variable "driver_count" {
   default     = 2
 
   validation {
-    condition     = var.driver_count >= 1 && var.driver_count <= 6
-    error_message = "driver_count must be between 1 and 6 (six CCX33s offer ~240k msg/s on lane B — the fan-out knee hunt at 7 nodes; the 100-vCPU quota bounds the rest)."
+    condition     = var.driver_count >= 1 && var.driver_count <= 8
+    error_message = "driver_count must be between 1 and 8. Six CCX33s offer ~240k msg/s on lane B (the fan-out knee hunt at 7 nodes); eight is what lane E needs to reach 16 sites, since sites are dealt round-robin and each carries 3 one-vCPU containers, so the busiest driver holds ceil(sites/drivers)*3 <= 8. Eight is also the last count that fits the vCPU quota beside a 5-node cluster (5 x ccx23 + 8 x ccx33 = 84); quota.tf refuses the combinations that do not."
   }
+}
+
+variable "vcpu_quota" {
+  description = "vCPUs the Hetzner project is allowed to run at once. Enforced by quota.tf BEFORE any server is created, because a quota rejection part way through an apply leaves the already-created servers running and billing with no teardown reached."
+  type        = number
+  default     = 100
 }
 
 variable "broker_server_type" {
