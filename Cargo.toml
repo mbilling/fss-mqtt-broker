@@ -116,3 +116,12 @@ debug = "line-tables-only"
 lto = "thin"
 codegen-units = 1
 panic = "abort"
+
+# Benchmarks are compiled with release optimisations but KEEP frame pointers and
+# debug info, so a sampling profiler can attribute cycles to functions rather
+# than to bare addresses. This profile is used by `cargo bench` only — the
+# shipped release artifact is unaffected, so the reproducible-build guarantee
+# and the binary's size are untouched.
+[profile.bench]
+debug = true
+force-frame-pointers = true
