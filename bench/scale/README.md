@@ -126,9 +126,11 @@ checked *per rung* rather than once, because a shape can be valid at 1 site and
 impossible at 8 — and the binding constraint is usually the harness: sites are
 dealt round-robin to drivers at three one-vCPU containers each, so 16 sites
 needs 12 containers on the busiest of 5 drivers and is **refused**. Reaching 16
-needs `DRIVER_COUNT=8`. That bound belongs to the load generators, not the
-broker, and the shape check prints it rather than letting a driver shortfall
-read as a broker limit.
+needs `DRIVER_COUNT=8`, which `driver_count` permits (it caps at 8, and
+`quota.tf` refuses any broker/driver combination that would exceed the project's
+vCPU quota part way through an apply). That bound belongs to the load
+generators, not the broker, and the shape check prints it rather than letting a
+driver shortfall read as a broker limit.
 
 **Fan-out percentage.** `LANE_B_FANOUT` (0–100) is the share of subscriber containers that receive the *full* publish stream on a plain `bench/#` wildcard; the rest stay in one `$share/g1` group and split one copy per publish. `0` (default) is today's `$share` fan-in (delivered ≈ offered); `100` gives every subscriber every publish (delivered ≈ offered × `LANE_B_SUBS`); `50` makes half the containers wildcard. Egress fan-out is the shape that stresses the per-connection write path (issue #443). Above 0 the rung is the *publish* rate, so keep it modest — `shape.txt` prints the resulting `delivered ≈ offered × N`.
 
