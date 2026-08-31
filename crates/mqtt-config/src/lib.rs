@@ -2315,8 +2315,9 @@ mod tests {
             // plus this change's six MQTTD_BACKUP_* / MQTTD_RESTORE_* variables,
             // plus MQTTD_ALLOW_RELAXED_PUBLISH (ADR 0072),
             // plus MQTTD_OWNERSHIP_DOMAIN (ADR 0073),
-            // plus MQTTD_SWIM_ADVERTISE (issue #396).
-            88,
+            // plus MQTTD_SWIM_ADVERTISE (issue #396),
+            // plus MQTTD_SHARED_PREFER_LOCAL (ADR 0077 T4 follow-up).
+            89,
             "the MQTTD_* surface changed — update ENV_VARS"
         );
         // Issue #239: MQTTD_MIN_REPLICAS was wired in `overlay_from` but never
