@@ -7008,6 +7008,30 @@ mod tests {
         }
     }
 
+    /// The sequence number a `m<N>` test payload carries.
+    fn seq_of(payload: &[u8]) -> usize {
+        std::str::from_utf8(payload)
+            .ok()
+            .and_then(|s| s.strip_prefix('m'))
+            .and_then(|n| n.parse().ok())
+            .unwrap_or_else(|| panic!("payload {payload:?} is not m<N>"))
+    }
+
+    /// The next `SharedDeliver`'s payload sequence number, or `None` once the
+    /// peer has gone quiet — so a test can drain a peer's deliveries without
+    /// knowing in advance how many it took.
+    async fn next_shared_seq(rx: &mut mpsc::UnboundedReceiver<PeerMessage>) -> Option<usize> {
+        loop {
+            match timeout(Duration::from_millis(300), rx.recv()).await {
+                Ok(Some(PeerMessage::SharedDeliver { payload, .. })) => {
+                    return Some(seq_of(&payload))
+                }
+                Ok(Some(_)) => {}
+                Ok(None) | Err(_) => return None,
+            }
+        }
+    }
+
     /// Whether ANY `SharedDeliver` arrives within the usual window — the negative
     /// of [`next_shared_deliver`], for asserting that nothing crossed the bus.
     /// Bounded-wait rather than `try_recv`, so a forward that is merely slow still
@@ -7532,6 +7556,103 @@ mod tests {
         );
     }
 
+    /// Cross-node round-robin is STABLE across publishes, with a group spanning
+    /// TWO peers rather than one.
+    ///
+    /// This is the invariant the shared-selection rewrite could have broken
+    /// silently. The cursor is an INDEX into the candidate list, so the list must
+    /// be ordered the same way on every publish or a member's "turn" lands on
+    /// whoever happens to be at that index this time. The old code got that from
+    /// sorting the peer map into a `BTreeMap` per publish; the index-based code
+    /// gets it from sorting nodes once when the index is rebuilt.
+    ///
+    /// Every other shared test uses a SINGLE peer, where ordering is preserved
+    /// trivially by either scheme and a regression would be invisible. With two
+    /// peers a reordering shows up as an uneven or non-repeating rotation.
+    ///
+    /// Race-free by construction: all six publishes are sent first and each
+    /// carries its sequence number, so the rotation is reconstructed from the
+    /// payloads afterwards rather than by racing three channels per publish.
+    #[tokio::test]
+    async fn shared_selection_order_is_stable_across_two_peers() {
+        // Two full rotations, each publish carrying its own index.
+        const ROUNDS: usize = 6;
+        const PAYLOADS: [&[u8]; ROUNDS] = [b"m0", b"m1", b"m2", b"m3", b"m4", b"m5"];
+
+        let tx = start_hub();
+        let mut p1 = connect_peer(&tx, "n1", 1);
+        let mut p2 = connect_peer(&tx, "n2", 2);
+        assert!(matches!(
+            recv_peer(&mut p1).await,
+            Some(PeerMessage::Interest { .. })
+        ));
+        assert!(matches!(
+            recv_peer(&mut p2).await,
+            Some(PeerMessage::Interest { .. })
+        ));
+
+        // One group, three members: one here, one on each peer.
+        let (mut ra, _) = attach(&tx, "ra", 1, true).await;
+        subscribe(&tx, "ra", "$share/g/t");
+        remote_shared_interest(&tx, "n1", "g", "t", &["rb"]);
+        remote_shared_interest(&tx, "n2", "g", "t", &["rc"]);
+
+        for pl in PAYLOADS {
+            publish(&tx, "t", pl);
+        }
+
+        // Which sequence numbers reached each member?
+        let mut local: Vec<usize> = Vec::new();
+        while let Some(pkt) = recv_packet(&mut ra).await {
+            local.push(seq_of(payload_of(&pkt)));
+        }
+        let mut on_n1: Vec<usize> = Vec::new();
+        while let Some(seq) = next_shared_seq(&mut p1).await {
+            on_n1.push(seq);
+        }
+        let mut on_n2: Vec<usize> = Vec::new();
+        while let Some(seq) = next_shared_seq(&mut p2).await {
+            on_n2.push(seq);
+        }
+
+        // Exactly one member per publish, and no publish lost.
+        let mut all: Vec<usize> = local
+            .iter()
+            .chain(on_n1.iter())
+            .chain(on_n2.iter())
+            .copied()
+            .collect();
+        all.sort_unstable();
+        assert_eq!(
+            all,
+            (0..ROUNDS).collect::<Vec<_>>(),
+            "each publish must reach exactly one member of the group"
+        );
+
+        // Fair: three members, six publishes, two each.
+        for (who, got) in [("local", &local), ("n1", &on_n1), ("n2", &on_n2)] {
+            assert_eq!(
+                got.len(),
+                ROUNDS / 3,
+                "{who} took {got:?} of {ROUNDS} publishes; the rotation is uneven"
+            );
+        }
+
+        // STABLE: whoever took publish i also took publish i+3. This is what an
+        // unstable candidate order breaks — the counts above can stay even while
+        // the turns are handed out to different members each round.
+        for (who, got) in [("local", &local), ("n1", &on_n1), ("n2", &on_n2)] {
+            let mut sorted = got.clone();
+            sorted.sort_unstable();
+            assert_eq!(
+                sorted[1] - sorted[0],
+                3,
+                "{who} took {got:?}: a member's turns must repeat every 3 publishes, \
+                 so the candidate order is the same on every publish"
+            );
+        }
+    }
+
     /// `MQTTD_SHARED_PREFER_LOCAL`: the same group and the same two publishes as
     /// `shared_selection_round_robins_local_and_remote_member`, which sends the
     /// second one across the cluster bus. With locality preference the LOCAL member
@@ -7559,6 +7680,66 @@ mod tests {
         assert!(
             no_shared_deliver(&mut peer).await,
             "a local member was online, so nothing should have crossed the bus"
+        );
+    }
+
+    /// With prefer-local on and TWO local members beside remote ones, the locals
+    /// must still take equal turns — the invariant the knob's own documentation
+    /// promises ("rotation still applies within each class ... fairness is
+    /// preserved locally and given up only ACROSS nodes").
+    ///
+    /// Locals occupy candidate positions [0, L) and remotes [L, n), and the
+    /// cursor advances by one across ALL n positions. A `find` over the rotated
+    /// order therefore lands on position 0 for every cursor start that begins in
+    /// the remote range, because it wraps past the remotes and hits the FIRST
+    /// local. So the first local takes (R+1)/n of the traffic and the others
+    /// take 1/n each.
+    ///
+    /// The other prefer-local tests use a single local member, where every
+    /// selection is trivially "fair" and the skew cannot appear.
+    #[tokio::test]
+    async fn prefer_local_still_rotates_among_several_local_members() {
+        // One full cursor cycle over the four candidates.
+        const ROUNDS: usize = 4;
+        const PAYLOADS: [&[u8]; ROUNDS] = [b"m0", b"m1", b"m2", b"m3"];
+
+        let tx = start_hub_prefer_local();
+        let mut peer = connect_peer(&tx, "n1", 1);
+        assert!(matches!(
+            recv_peer(&mut peer).await,
+            Some(PeerMessage::Interest { .. })
+        ));
+
+        // Two local members and two remote ones in the same group.
+        let (mut ra, _) = attach(&tx, "ra", 1, true).await;
+        subscribe(&tx, "ra", "$share/g/t");
+        let (mut rb, _) = attach(&tx, "rb", 2, true).await;
+        subscribe(&tx, "rb", "$share/g/t");
+        remote_shared_interest(&tx, "n1", "g", "t", &["rc", "rd"]);
+
+        for pl in PAYLOADS {
+            publish(&tx, "t", pl);
+        }
+
+        let mut a = 0usize;
+        while recv_packet(&mut ra).await.is_some() {
+            a += 1;
+        }
+        let mut b = 0usize;
+        while recv_packet(&mut rb).await.is_some() {
+            b += 1;
+        }
+
+        // Nothing should have crossed the bus: local members were online.
+        assert!(
+            no_shared_deliver(&mut peer).await,
+            "local members were online, so no publish should have gone to a peer"
+        );
+        assert_eq!(a + b, ROUNDS, "every publish must reach one local member");
+        assert_eq!(
+            (a, b),
+            (ROUNDS / 2, ROUNDS / 2),
+            "the two local members must take equal turns; got ra={a} rb={b}"
         );
     }
 

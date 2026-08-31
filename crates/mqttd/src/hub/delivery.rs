@@ -894,9 +894,30 @@ impl Hub {
         // the trade the knob names. Selection remains deterministic and every existing
         // fallback below is untouched: a group with no local member behaves as before.
         let immediate = if self.shared_prefer_local {
-            rotated()
-                .find(|&i| candidates[i].online() && candidates[i].is_local())
-                .or_else(|| rotated().find(|&i| candidates[i].online()))
+            // Rotate WITHIN the local members, not across the whole list.
+            //
+            // Locals occupy positions [0, L) and remotes [L, n) — `plan_shared`
+            // pushes them in that order — while the cursor advances by one across
+            // all n. A `find` over the rotated order therefore wraps past every
+            // remote and lands on position 0 for EVERY start in the remote range,
+            // so the first local would take (R+1)/n of the traffic and each other
+            // local 1/n. With two locals and two remotes that is a 3:1 skew, which
+            // is the opposite of what this knob documents: fairness is meant to be
+            // given up across nodes and kept within one.
+            //
+            // Counting and then indexing keeps that promise without allocating a
+            // list of locals per publish, which would reintroduce exactly the kind
+            // of per-message cost the index work removed.
+            let local_online = (0..n)
+                .filter(|&i| candidates[i].online() && candidates[i].is_local())
+                .count();
+            if local_online > 0 {
+                (0..n)
+                    .filter(|&i| candidates[i].online() && candidates[i].is_local())
+                    .nth(start % local_online)
+            } else {
+                rotated().find(|&i| candidates[i].online())
+            }
         } else {
             rotated().find(|&i| candidates[i].online())
         };
