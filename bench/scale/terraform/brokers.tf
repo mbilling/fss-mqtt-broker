@@ -37,6 +37,7 @@ resource "hcloud_server" "broker" {
     mqttd_service_unit = file("${path.module}/../../../deploy/systemd/mqttd.service")
     mqttd_override     = file("${path.module}/files/mqttd-override.conf")
     sysctl_conf        = file("${path.module}/files/sysctl-broker.conf")
+    nic_spread         = var.broker_nic_spread
   })
 
   depends_on = [hcloud_network_subnet.bench]

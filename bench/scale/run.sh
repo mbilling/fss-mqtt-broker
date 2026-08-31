@@ -210,6 +210,7 @@ for N in "${SIZES[@]}"; do
 		${DRIVER_COUNT:+-var driver_count="$DRIVER_COUNT"} \
 		${BROKER_TYPE:+-var broker_server_type="$BROKER_TYPE"} \
 		${DRIVER_TYPE:+-var driver_server_type="$DRIVER_TYPE"} \
+		${BROKER_NIC_SPREAD:+-var broker_nic_spread="$BROKER_NIC_SPREAD"} \
 		>"$RUN/tf-apply-$N.log" 2>&1) || {
 		tail -30 "$RUN/tf-apply-$N.log" >&2
 		die "terraform apply failed for size $N"

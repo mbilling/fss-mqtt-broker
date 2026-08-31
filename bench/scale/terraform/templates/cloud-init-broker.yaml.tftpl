@@ -22,6 +22,7 @@ packages:
   - jq
   - chrony
   - sysstat
+  - ethtool
 
 users:
   - name: mqttd
@@ -69,6 +70,37 @@ runcmd:
       echo "no unconfigured NIC appeared for the private network (${private_ip})" >&2
     fi
   - sysctl --system
+  # ISSUE #505: on this rig ONE core per broker carries all the network softirq
+  # and saturates near 96% while the others idle — mqttd is squeezed off it
+  # (user time fell 21.5% -> 10.9% as load rose, softirq 66.7% -> 81.8%). With
+  # a single virtio RX queue every packet's bottom half runs on the one CPU the
+  # IRQ is pinned to. This block spreads that work; `broker_nic_spread` gates it
+  # so the tuned and untuned kernels are the SAME image otherwise, which is what
+  # makes the A/B honest.
+  #
+  # Two mechanisms, deliberately both: `ethtool -L combined` asks the NIC for
+  # real multi-queue (virtio offers it only if the host does, so this is
+  # best-effort and must not fail the boot), while RPS steers packets to other
+  # cores in software and works even when the device stays single-queue. RFS
+  # then keeps a flow on the CPU its socket is read from, which matters here
+  # because a broker's sockets are long-lived.
+  - |
+    if [ "${nic_spread}" = "true" ]; then
+      NCPU=$(nproc)
+      MASK=$(printf '%x' $(( (1 << NCPU) - 1 )))
+      echo 32768 > /proc/sys/net/core/rps_sock_flow_entries || true
+      for IF in $(ls /sys/class/net | grep -v '^lo$'); do
+        ethtool -L "$IF" combined "$NCPU" 2>&1 | sed "s/^/nic-spread $IF ethtool: /" || true
+        for Q in /sys/class/net/"$IF"/queues/rx-*; do
+          [ -d "$Q" ] || continue
+          echo "$MASK" > "$Q"/rps_cpus 2>/dev/null || true
+          echo 2048   > "$Q"/rps_flow_cnt 2>/dev/null || true
+        done
+        echo "nic-spread $IF: rps_cpus=$MASK queues=$(ls -d /sys/class/net/$IF/queues/rx-* 2>/dev/null | wc -l)"
+      done
+    else
+      echo "nic-spread: disabled (broker_nic_spread=false)"
+    fi
   # Directories per deploy/systemd/README.md: config root readable by the
   # service group, data dir private to the service user.
   - install -d -m 0750 -o root -g mqttd /etc/mqttd /etc/mqttd/tls
