@@ -241,7 +241,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `two_bridge_instances_do_not_duplicate_forwarding`
 - `two_partitioned_instances_deliver_each_inbound_message_exactly_once`
 
-## `crates/mqtt-cluster/src/lib.rs` — 283 test(s)
+## `crates/mqtt-cluster/src/lib.rs` — 290 test(s)
 
 - `cluster_identity::tests::a_founder_mints_once_and_reloads_stably`
 - `cluster_identity::tests::a_joiner_adopts_once_and_persists`
@@ -288,6 +288,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `cluster_log::tests::truncate_succeeds_with_followers_down`
 - `cluster_store::tests::a_foreign_topics_retained_write_is_refused_not_diverged`
 - `cluster_store::tests::a_higher_lease_epoch_rebuilds_and_re_recovers_the_log`
+- `cluster_store::tests::a_joiner_enters_the_hot_paths_replica_set_on_the_next_append`
 - `cluster_store::tests::a_lone_survivor_of_a_known_three_node_group_refuses_appends_by_default`
 - `cluster_store::tests::a_node_that_never_knew_a_cluster_acks_durable_writes_under_the_default_floor`
 - `cluster_store::tests::a_retained_set_commits_through_the_group_and_replicates`
@@ -305,6 +306,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `cluster_store::tests::recovery_refuses_a_quorum_of_hollow_replicas`
 - `cluster_store::tests::takeover_recommits_an_adopted_orphan_to_a_write_quorum`
 - `cluster_store::tests::takeover_recovers_a_keys_log_from_the_shared_replica_state`
+- `cluster_store::tests::the_ownership_gate_follows_the_committed_lease_in_both_directions`
 - `decommission::tests::a_solo_drain_completes_immediately`
 - `decommission::tests::a_successor_with_divergent_content_is_not_sufficient`
 - `decommission::tests::the_drain_hands_off_and_verifies_a_held_key`
@@ -397,11 +399,13 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `peer::tests::the_frozen_frames_encode_byte_for_byte_stably`
 - `peer::tests::trailing_bytes_after_a_postcard_body_are_rejected`
 - `peer::tests::two_frames_in_one_buffer`
+- `placement::tests::a_cloned_ring_keeps_a_correct_memo`
 - `placement::tests::a_dead_holders_lease_falls_back_to_hrw_a_suspect_holders_does_not`
 - `placement::tests::a_dead_node_only_moves_the_keys_it_owned`
 - `placement::tests::a_dead_peer_drops_its_domain`
 - `placement::tests::a_declared_member_count_arms_the_write_floor_before_gossip_or_the_roster`
 - `placement::tests::a_joining_node_moves_only_a_minority`
+- `placement::tests::a_memo_hit_does_not_recompute_the_hrw_pass`
 - `placement::tests::alive_and_suspect_are_eligible_dead_is_removed`
 - `placement::tests::alone_this_node_owns_everything`
 - `placement::tests::an_empty_durable_roster_is_not_a_membership_witness`
@@ -419,12 +423,15 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `placement::tests::owns_and_is_replica_agree_with_the_ring`
 - `placement::tests::replica_set_shrinks_gracefully_below_r`
 - `placement::tests::replicas_still_span_learners`
+- `placement::tests::replication_health_is_unchanged_by_the_memo`
 - `placement::tests::replication_health_reports_under_replication_below_r`
 - `placement::tests::the_committed_group_owner_never_falls_back_to_the_hrw_ring`
 - `placement::tests::the_committed_lease_overrides_the_hrw_ring_on_the_data_path`
 - `placement::tests::the_committed_ownership_snapshot_filters_a_corpse_and_reports_routability`
 - `placement::tests::the_derived_write_floor_is_one_alone_and_two_once_the_cluster_is_known`
 - `placement::tests::the_durable_roster_is_the_authority_for_the_derived_floor`
+- `placement::tests::the_memo_invalidates_on_every_input_that_moves_a_replica_set`
+- `placement::tests::the_memoized_replica_set_equals_the_direct_hrw_computation`
 - `placement::tests::the_ownership_version_moves_only_on_a_real_committed_change`
 - `placement::tests::this_node_is_never_removed`
 - `placement::tests::voter_restricted_owner_is_always_a_voter`
@@ -755,7 +762,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::sink_records_through_a_trait_object`
 - `tests::tampering_with_any_field_changes_the_head`
 
-## `crates/mqtt-storage/src/lib.rs` — 79 test(s)
+## `crates/mqtt-storage/src/lib.rs` — 87 test(s)
 
 - `app_props::tests::converts_to_and_from_core_properties_losslessly`
 - `app_props::tests::encode_decode_roundtrips_and_fails_closed`
@@ -799,6 +806,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `persistent_log::tests::the_migration_registry_covers_the_contract_range`
 - `persistent_retained::tests::a_foreign_schema_version_fails_closed`
 - `persistent_retained::tests::retained_survives_reopen_and_clear_persists`
+- `persistent_retained::tests::the_match_index_is_rebuilt_on_reopen`
 - `persistent_retained::tests::the_migration_registry_covers_the_contract_range`
 - `repl::tests::append_assigns_monotonic_offsets_per_key`
 - `repl::tests::live_range_tracks_the_retained_offsets`
@@ -827,14 +835,21 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::ack_is_idempotent_and_ignores_stale_offsets`
 - `tests::ack_truncates_the_log`
 - `tests::claim_session_binds_then_guards_the_owner`
+- `tests::contains_agrees_with_matching_for_concrete_topics`
+- `tests::deep_topics_stay_iterative`
 - `tests::drop_oldest_evicts_oldest_and_keeps_newest`
 - `tests::enqueue_assigns_monotonic_offsets_and_replays`
+- `tests::indexed_matching_agrees_with_the_linear_reference`
 - `tests::pending_pages_through_the_log_in_offset_order`
 - `tests::qos2_dedup_and_packet_id_allocation`
 - `tests::reject_newest_keeps_oldest_and_drops_new`
 - `tests::remove_clears_session`
 - `tests::retained_set_get_and_clear`
 - `tests::subscriptions_roundtrip_and_replace`
+- `tests::the_default_contains_agrees_with_the_indexed_override`
+- `tests::the_index_follows_expiry_reaping`
+- `tests::the_index_follows_set_overwrite_and_delete`
+- `tests::the_no_wildcard_fast_path_returns_exactly_the_named_topic`
 - `tests::unacked_messages_survive_for_replay`
 
 ## `crates/mqttd-operator/src/bin/gen_crd.rs` — 0 test(s)
@@ -883,7 +898,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 349 test(s)
+## `crates/mqttd/src/lib.rs` — 353 test(s)
 
 - `admission::tests::the_global_cap_refuses_at_the_bound_and_recovers`
 - `admission::tests::the_penalty_box_refuses_after_the_threshold`
@@ -1014,6 +1029,10 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `http_auth::tests::the_cache_key_is_unambiguous_across_field_boundaries`
 - `hub::forwarding::footprint::a_forward_obligation_stays_small`
 - `hub::forwarding::footprint::a_pending_publish_stays_small`
+- `hub::forwarding::interest_index_tests::a_node_with_no_filters_still_has_an_interest_entry`
+- `hub::forwarding::interest_index_tests::interest_index_matches_the_linear_scan_it_replaced`
+- `hub::forwarding::interest_index_tests::nodes_sharing_a_filter_are_independent`
+- `hub::forwarding::interest_index_tests::re_announcing_replaces_the_previous_snapshot`
 - `hub::tests::a_brownout_refusal_delivers_to_nobody_even_when_a_subscriber_owed_no_durability`
 - `hub::tests::a_brownout_refusal_is_counted_as_a_quota_rejection_not_a_drop`
 - `hub::tests::a_brownout_refused_will_does_not_overtake_an_inflight_qos1_append`

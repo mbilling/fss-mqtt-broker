@@ -156,12 +156,13 @@ impl Hub {
         if !over {
             return false;
         }
-        // At the bound: only an overwrite of an existing topic may proceed.
-        !self
-            .retained
-            .matching(topic)
-            .await
-            .is_ok_and(|m| m.iter().any(|r| r.topic == topic))
+        // At the bound: only an overwrite of an existing topic may proceed. This is
+        // an exact-topic question, so it asks `contains` (one hash lookup) rather
+        // than `matching`, which answered it by walking every retained message in
+        // the broker — an O(all retained) scan on the publish path, at exactly the
+        // moment the retained set is at its cap and therefore largest. A store error
+        // still reads as "exceeded", fail-closed, as before.
+        !self.retained.contains(topic).await.unwrap_or(false)
     }
 
     /// The retained authority commit obligation resolved (ADR 0042 T9, exhibit ⑦).

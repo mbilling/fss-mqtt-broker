@@ -1,11 +1,16 @@
 //! On-disk [`RetainedStore`] backed by `redb` (ADR 0018 phase 4).
 //!
 //! The persistent counterpart to
-//! [`MemoryRetainedStore`](crate::MemoryRetainedStore): an in-memory topic → message
-//! map serves reads (`matching`/`all`, on the subscribe hot path), and every `set` is
+//! [`MemoryRetainedStore`](crate::MemoryRetainedStore): an in-memory
+//! [`RetainedState`] — the topic → message map plus its match index — serves reads
+//! (`matching`/`all`, on the subscribe hot path), and every `set` is
 //! **write-through fsync'd** to a `redb` database before it returns, so retained
-//! messages survive a restart. On `open` the map is reloaded from disk; cross-node
+//! messages survive a restart. On `open` that state is rebuilt from disk, index
+//! included, so a reopened database indexes exactly the rows it holds; cross-node
 //! back-fill (ADR 0014 §3) still reconciles any divergence afterwards.
+//!
+//! The index is a purely in-memory accelerator: nothing about it is persisted, and
+//! the on-disk layout below is untouched by it.
 //!
 //! ## On-disk layout
 //!
@@ -18,12 +23,11 @@
 //! retained-PUBLISH semantics).
 
 use crate::app_props::AppProps;
-use crate::{RetainedStore, StorageError};
+use crate::{RetainedState, RetainedStore, StorageError};
 use async_trait::async_trait;
 use bytes::Bytes;
-use mqtt_core::{topic_matches, Message, QoS};
+use mqtt_core::{Message, QoS};
 use redb::{Database, Durability, TableDefinition};
-use std::collections::HashMap;
 use std::fmt::Display;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -88,8 +92,9 @@ fn decode(topic: &str, bytes: &[u8]) -> Option<Message> {
 /// A durable [`RetainedStore`] persisting to a `redb` file (ADR 0018 phase 4).
 #[derive(Debug)]
 pub struct PersistentRetainedStore {
-    /// In-memory cache (source of truth for reads).
-    by_topic: Mutex<HashMap<String, Message>>,
+    /// In-memory cache (source of truth for reads) and its derived match index,
+    /// behind one lock — see [`RetainedState`].
+    state: Mutex<RetainedState>,
     db: Arc<Database>,
 }
 
@@ -109,23 +114,27 @@ impl PersistentRetainedStore {
         }
         txn.commit().map_err(backend)?;
 
-        let mut by_topic = HashMap::new();
+        // Rebuild the cache AND its match index from the rows on disk: the index
+        // is in-memory only, so this reload is the single place a restart could
+        // otherwise leave `matching` blind to a persisted topic. Both go through
+        // `RetainedState::insert`, so they cannot be rebuilt out of step.
+        let mut state = RetainedState::default();
         let rtxn = db.begin_read().map_err(backend)?;
         let table = rtxn.open_table(RETAINED).map_err(backend)?;
         for item in table.range::<&str>(..).map_err(backend)? {
             let (k, v) = item.map_err(backend)?;
             if let Some(m) = decode(k.value(), v.value()) {
-                by_topic.insert(k.value().to_string(), m);
+                state.insert(k.value(), m);
             }
         }
         Ok(Self {
-            by_topic: Mutex::new(by_topic),
+            state: Mutex::new(state),
             db: Arc::new(db),
         })
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, Message>> {
-        self.by_topic
+    fn lock(&self) -> std::sync::MutexGuard<'_, RetainedState> {
+        self.state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
@@ -153,7 +162,6 @@ fn persist(db: &Database, topic: &str, value: Option<&[u8]>) -> Result<(), Stora
 #[async_trait]
 impl RetainedStore for PersistentRetainedStore {
     async fn set(&self, message: &Message) -> Result<(), StorageError> {
-        let topic = message.topic.clone();
         // An empty-payload retained PUBLISH clears the topic (MQTT semantics).
         let value = if message.payload.is_empty() {
             None
@@ -163,35 +171,31 @@ impl RetainedStore for PersistentRetainedStore {
 
         // Persist (fsync) before updating the cache, off the async worker.
         let db = self.db.clone();
-        let topic_for_persist = topic.clone();
+        let topic_for_persist = message.topic.clone();
         tokio::task::spawn_blocking(move || persist(&db, &topic_for_persist, value.as_deref()))
             .await
             .map_err(backend)??;
 
-        let mut map = self.lock();
-        if message.payload.is_empty() {
-            map.remove(&topic);
-        } else {
-            map.insert(topic, message.clone());
-        }
+        // Cache and index move together, under one lock, after the durable write —
+        // the ordering (and its fsync) is exactly as it was.
+        self.lock().set(message);
         Ok(())
     }
 
     async fn matching(&self, filter: &str) -> Result<Vec<Message>, StorageError> {
-        Ok(self
-            .lock()
-            .values()
-            .filter(|m| topic_matches(filter, &m.topic))
-            .cloned()
-            .collect())
+        Ok(self.lock().matching(filter))
     }
 
     async fn all(&self) -> Result<Vec<Message>, StorageError> {
-        Ok(self.lock().values().cloned().collect())
+        Ok(self.lock().all())
     }
 
     async fn count(&self) -> Result<usize, StorageError> {
         Ok(self.lock().len())
+    }
+
+    async fn contains(&self, topic: &str) -> Result<bool, StorageError> {
+        Ok(self.lock().contains(topic))
     }
 }
 
@@ -293,5 +297,109 @@ mod tests {
             app.user_properties,
             vec![("origin".to_string(), "sensor-7".to_string())]
         );
+    }
+
+    /// Corpus for the reopen check: wildcards at every position, empty levels, and
+    /// `$`-rooted topics — kept small because every `set` here is an fsync.
+    fn reopen_corpus() -> (Vec<String>, Vec<String>) {
+        let alphabet = ["a", "b", ""];
+        let mut topics: Vec<String> = Vec::new();
+        for d1 in alphabet {
+            topics.push(d1.to_string());
+            for d2 in alphabet {
+                topics.push(format!("{d1}/{d2}"));
+                for d3 in alphabet {
+                    topics.push(format!("{d1}/{d2}/{d3}"));
+                }
+            }
+        }
+        for extra in ["$SYS", "$SYS/broker", "$share/g/a"] {
+            topics.push(extra.to_string());
+        }
+        let mut filters = topics.clone();
+        for extra in [
+            "#",
+            "+",
+            "+/#",
+            "a/#",
+            "a/+",
+            "+/b",
+            "+/+/+",
+            "a/+/b",
+            "$SYS/#",
+            "$SYS/+",
+            "$SYS/broker",
+            "a//b",
+            "/a",
+        ] {
+            filters.push(extra.to_string());
+        }
+        (topics, filters)
+    }
+
+    /// The match index is an in-memory accelerator over the redb rows, so `open` must
+    /// REBUILD it from disk: a store that reloaded the map but not the index would
+    /// answer every wildcard subscribe with nothing after a restart, silently. Checked
+    /// the only way that proves it — against the linear `topic_matches` scan the index
+    /// replaced, over the whole corpus, after the reopen.
+    #[tokio::test]
+    async fn the_match_index_is_rebuilt_on_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("retained.redb");
+        let (mut topics, filters) = reopen_corpus();
+        {
+            let store = PersistentRetainedStore::open(&path).unwrap();
+            for t in &topics {
+                store
+                    .set(&msg(t, format!("v:{t}").as_bytes()))
+                    .await
+                    .unwrap();
+            }
+            // One cleared before the close: the reopened index must not resurrect it.
+            store.set(&msg("a/b", b"")).await.unwrap();
+        }
+        topics.retain(|t| t != "a/b");
+
+        let store = PersistentRetainedStore::open(&path).unwrap();
+        assert_eq!(store.count().await.unwrap(), topics.len());
+        for f in &filters {
+            let mut got: Vec<String> = store
+                .matching(f)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|m| m.topic)
+                .collect();
+            got.sort();
+            let mut want: Vec<String> = topics
+                .iter()
+                .filter(|t| mqtt_core::topic_matches(f, t))
+                .cloned()
+                .collect();
+            want.sort();
+            assert_eq!(got, want, "rebuilt index disagrees with the scan on {f:?}");
+        }
+
+        // `contains` is answered off the same rebuilt state.
+        assert!(store.contains("a/a/b").await.unwrap());
+        assert!(!store.contains("a/b").await.unwrap());
+        assert!(!store.contains("never/stored").await.unwrap());
+
+        // And the rebuilt index stays live: a set and a clear after the reopen move
+        // map and index together, durably.
+        store.set(&msg("a/b", b"back")).await.unwrap();
+        assert!(store.contains("a/b").await.unwrap());
+        // "a/b", "b/b" and "/b" — the re-inserted topic is back in the index.
+        assert_eq!(store.matching("+/b").await.unwrap().len(), 3);
+        store.set(&msg("a/a/b", b"")).await.unwrap();
+        // "a/b/b" and "a//b" survive the sibling's removal.
+        assert_eq!(store.matching("a/+/b").await.unwrap().len(), 2);
+        drop(store);
+
+        let store = PersistentRetainedStore::open(&path).unwrap();
+        assert!(store.contains("a/b").await.unwrap());
+        assert!(!store.contains("a/a/b").await.unwrap());
+        assert_eq!(store.matching("+/b").await.unwrap().len(), 3);
+        assert_eq!(store.matching("a/+/b").await.unwrap().len(), 2);
     }
 }

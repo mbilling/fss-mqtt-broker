@@ -222,17 +222,31 @@ impl<S: LeaseSource, T: ReplicaTransport + Clone + 'static> GroupRoutedLog<S, T>
         let group = group_of_key(key);
 
         // Resolve ownership + replica set without holding a lock across an await.
-        // Capture an ownership snapshot for diagnostics (DIAG 0047-T5): the ring owner,
-        // the voter set, and the eligible members this node sees — so a split between
-        // the placement ring (routing) and the lease store (commit) is visible.
-        let (replica_set, diag_owner, diag_voters, diag_members) = {
+        //
+        // The owner is resolved ONCE and reused: it gates ownership here and names the
+        // ring owner in the cold diagnostic below. It used to be resolved three times per
+        // durable message (`owns_group`, again inside `group_replica_set`, and again as
+        // the diagnostic's `ring_owner`), each able to fall back to an O(N) HRW pass.
+        // `owner != *placement.local()` is exactly `!placement.owns_group(group)`, minus
+        // the redundant resolution.
+        //
+        // The voter/member snapshots the diagnostic wants are NOT taken here: they are
+        // two N-element `Vec<NodeId>` clones read only inside the rare `Err(e)` arm, so
+        // on the success path they were ~2N `String` allocations per message, allocated
+        // and immediately dropped. They are taken in that arm instead.
+        let (replica_set, ring_owner) = {
             let placement = self
                 .placement
                 .read()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if !placement.owns_group(group) {
+            let ring_owner = placement.group_owner(group);
+            if ring_owner != *placement.local() {
                 return Err(ReplError::NotOwner);
             }
+            // Memoized inside `Placement` on its ring version, so the O(N log N) HRW pass
+            // this used to run on every message is paid once per topology change. Still
+            // read under THIS guard (see the doc above) so the floor below is judged
+            // against the very set the returned `ClusterLog` is built over.
             let replica_set = placement.group_replica_set(group);
             // The min-replicas write floor (issues #167, #239): replica sets truncate to
             // min(R, members), so a shrinking cluster silently commits new durability
@@ -252,12 +266,7 @@ impl<S: LeaseSource, T: ReplicaTransport + Clone + 'static> GroupRoutedLog<S, T>
                     });
                 }
             }
-            (
-                replica_set,
-                placement.group_owner(group),
-                placement.voter_ids(),
-                placement.members(),
-            )
+            (replica_set, ring_owner)
         };
 
         // Read the group's current lease epoch on every call. A higher epoch than the
@@ -273,11 +282,25 @@ impl<S: LeaseSource, T: ReplicaTransport + Clone + 'static> GroupRoutedLog<S, T>
             // views converge. A persistent occurrence is the 2026-07-20 durable-ownership
             // split — kept as a debug signal for that class.
             Err(e) => {
+                // The ownership snapshot for diagnostics (DIAG 0047-T5): the voter set and
+                // the eligible members this node sees, so a split between the placement
+                // ring (routing) and the lease store (commit) is visible. Read HERE — the
+                // rare path — under a fresh read guard rather than on every durable
+                // message; the log's content is unchanged. A membership change between the
+                // two acquisitions can only make this snapshot fresher than the routing
+                // decision above, which is all a diagnostic wants.
+                let (diag_voters, diag_members) = {
+                    let placement = self
+                        .placement
+                        .read()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    (placement.voter_ids(), placement.members())
+                };
                 tracing::debug!(
                     key,
                     group,
                     local = %self.local.0,
-                    ring_owner = %diag_owner.0,
+                    ring_owner = %ring_owner.0,
                     voters = ?diag_voters.iter().map(|n| &n.0).collect::<Vec<_>>(),
                     members = ?diag_members.iter().map(|n| &n.0).collect::<Vec<_>>(),
                     error = ?e,
@@ -908,6 +931,136 @@ mod tests {
             ),
             "below the floor again, the next append must refuse"
         );
+    }
+
+    /// The hot path's replica set is memoized inside `Placement` on its ring version, so
+    /// this test is the end-to-end guard that the memo cannot pin a stale set: a joiner
+    /// must start receiving replicas on the very next durable append, which only happens
+    /// if the memo invalidated AND the cached `GroupEntry` was rebuilt over the new set.
+    /// Without invalidation the joiner stays hollow forever (the ADR 0043 P1 hazard).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_joiner_enters_the_hot_paths_replica_set_on_the_next_append() {
+        let owner = nid("owner");
+        let placement = Arc::new(RwLock::new(Placement::new(owner.clone(), DEFAULT_REPLICAS)));
+        let transport = Arc::new(PeerReplicaTransport::new());
+        let replicas = Arc::new(Mutex::new(ReplicaState::new()));
+        let log = GroupRoutedLog::new(
+            owner.clone(),
+            placement.clone(),
+            transport.clone(),
+            FixedLease(1),
+            replicas.clone(),
+        );
+        // The boot sweep stamped this node's (self-only) sets (ADR 0043 P1).
+        stamp_current(&replicas, &placement.read().unwrap());
+
+        // A key whose group this node still owns AFTER the join, so the test observes the
+        // replica-set change rather than an ownership move.
+        let mut probe = Placement::new(owner.clone(), DEFAULT_REPLICAS);
+        probe.observe(&nid("f1"), MemberState::Alive, "f1:7000", None);
+        let group = (0..NUM_GROUPS)
+            .find(|g| probe.owns_group(*g))
+            .expect("owns some group once f1 joins");
+        let key = (0..100_000)
+            .map(|i| format!("q/client-{i}"))
+            .find(|k| crate::placement::group_of_key(k) == group)
+            .expect("some key hashes to the group");
+
+        // Alone: the append commits on this node's single copy, warming the memo for
+        // the key's group over the lone-node replica set.
+        log.append(&key, vec![1]).await.expect("alone, quorum is 1");
+
+        // A follower joins.
+        let f1_state = Arc::new(Mutex::new(ReplicaState::new()));
+        let (tx, rx) = mpsc::unbounded_channel();
+        transport.register(nid("f1"), tx);
+        spawn_follower(transport.clone(), f1_state.clone(), rx);
+        placement
+            .write()
+            .unwrap()
+            .observe(&nid("f1"), MemberState::Alive, "f1:7000", None);
+        // The converged post-join state (the reconcile loop's sweep, which this unit
+        // harness does not run).
+        stamp_current(&replicas, &placement.read().unwrap());
+
+        log.append(&key, vec![2])
+            .await
+            .expect("the two-member quorum commits");
+        assert!(
+            !f1_state.lock().unwrap().entries(&key).is_empty(),
+            "the joiner must be in the replica set the hot path resolved — a memo that \
+             failed to invalidate would still be replicating to the lone-node set"
+        );
+    }
+
+    /// The ownership gate now compares a SINGLY-resolved owner against the ring's own
+    /// local id (instead of re-resolving through `owns_group`), so it must still refuse —
+    /// and admit — in both directions the committed lease can move ownership: a group HRW
+    /// hands us but the lease hands elsewhere, and a group HRW hands away but the lease
+    /// hands to us.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_ownership_gate_follows_the_committed_lease_in_both_directions() {
+        use mqtt_storage::repl::ReplError;
+        use std::collections::BTreeMap;
+
+        let owner = nid("owner");
+        let mut p = Placement::new(owner.clone(), DEFAULT_REPLICAS);
+        p.observe(&nid("f1"), MemberState::Alive, "f1:7000", None);
+        p.observe(&nid("f2"), MemberState::Alive, "f2:7000", None);
+        let ours = (0..NUM_GROUPS).find(|g| p.hrw_owner(*g) == owner).unwrap();
+        let theirs = (0..NUM_GROUPS).find(|g| p.hrw_owner(*g) != owner).unwrap();
+        let placement = Arc::new(RwLock::new(p));
+
+        let transport = Arc::new(PeerReplicaTransport::new());
+        for peer in ["f1", "f2"] {
+            let (tx, rx) = mpsc::unbounded_channel();
+            transport.register(nid(peer), tx);
+            spawn_follower(
+                transport.clone(),
+                Arc::new(Mutex::new(ReplicaState::new())),
+                rx,
+            );
+        }
+        let replicas = Arc::new(Mutex::new(ReplicaState::new()));
+        let log = GroupRoutedLog::new(
+            owner.clone(),
+            placement.clone(),
+            transport.clone(),
+            FixedLease(1),
+            replicas.clone(),
+        );
+        stamp_current(&replicas, &placement.read().unwrap());
+
+        // A key in each group (the `q/` prefix is stripped before hashing).
+        let key_for = |g: GroupId| {
+            (0..100_000)
+                .map(|i| format!("q/client-{i}"))
+                .find(|k| crate::placement::group_of_key(k) == g)
+                .expect("some key hashes to the group")
+        };
+        let ours_key = key_for(ours);
+        let theirs_key = key_for(theirs);
+
+        // Pure HRW: ours serves, theirs is NotOwner.
+        log.read(&ours_key, 0, 1).await.expect("we own this group");
+        assert!(
+            matches!(log.read(&theirs_key, 0, 1).await, Err(ReplError::NotOwner)),
+            "the HRW ring hands this group to a peer"
+        );
+
+        // The committed lease inverts both.
+        let mut owners = BTreeMap::new();
+        owners.insert(ours, nid("f1"));
+        owners.insert(theirs, owner.clone());
+        placement.write().unwrap().set_lease_owners(owners);
+        stamp_current(&replicas, &placement.read().unwrap());
+        assert!(
+            matches!(log.read(&ours_key, 0, 1).await, Err(ReplError::NotOwner)),
+            "the committed lease revoked our HRW group"
+        );
+        log.read(&theirs_key, 0, 1)
+            .await
+            .expect("the committed lease granted us the other group");
     }
 
     /// Issue #239, the defect itself: with the SHIPPED default posture (the derived

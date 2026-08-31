@@ -28,6 +28,7 @@ use crate::lease_raft::GroupId;
 use crate::swim::MemberState;
 use crate::{hrw, NodeId};
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::RwLock;
 
 /// Default replication factor: each session's replica set spans R nodes
 /// (ADR 0001 §1).
@@ -79,6 +80,61 @@ pub fn group_of_key(key: &str) -> GroupId {
 /// The HRW key for a placement group (so groups hash independently of any client).
 fn group_key(group: GroupId) -> String {
     format!("group/{group}")
+}
+
+/// The contents of the replica-set memo: the sets, and the ring version they were
+/// computed at. A version mismatch invalidates the whole map at once (one comparison),
+/// which is what keeps invalidation impossible to get subtly wrong per-group.
+#[derive(Debug, Clone, Default)]
+struct MemoState {
+    /// The [`Placement::ring_version`] these sets were computed at. Anything else is
+    /// stale and the map is discarded wholesale.
+    version: u64,
+    /// `group -> owner-led replica set` at `version`.
+    sets: BTreeMap<GroupId, Vec<NodeId>>,
+    /// How many full HRW passes the memo has had to run — its MISS count. Kept so the
+    /// unit tests can prove a hit does not recompute (and so the cost is observable at
+    /// all: a memo whose hit rate silently collapsed would look exactly like a working
+    /// one from the outside).
+    computes: u64,
+}
+
+/// A memo of each placement group's owner-led replica set, keyed on
+/// [`Placement::ring_version`].
+///
+/// **Why this exists.** [`Placement::group_replica_set`] is the funnel every durable
+/// append, read, ack, truncate and epoch resolution passes through
+/// (`cluster_store::GroupRoutedLog::log_for_key`), and it was `O(N log N)` in cluster
+/// size on *every message*: [`hrw::replica_set`] scores and sorts all N nodes, on top of
+/// an `O(N)` clone of the eligible set. The set is a pure function of the ring's
+/// topology, which moves on the order of once per membership event — so it is computed
+/// once per `(group, topology)` and read back thereafter. Exactly the trick
+/// [`Placement::ownership_epoch`] already establishes for the hub's ownership pass
+/// (issue #284 round-2 finding 3), applied to the durable data path.
+///
+/// **Why it lives inside `Placement`** rather than in the caller: the memo then cannot
+/// outlive the topology it was derived from — it is a field of the very struct whose
+/// mutators bump the version — and *every* caller benefits, including
+/// [`Placement::replication_health`]'s 256-group sweep and [`Placement::is_replica`].
+///
+/// **Why interior mutability**: the hot path holds only a `RwLock<Placement>` *read*
+/// guard, so a `&mut self` rebuild is not available to it. An `RwLock` rather than a
+/// `Mutex` so the steady state — all hits — stays parallel across concurrent durable
+/// writers instead of introducing a new node-wide serialization point.
+#[derive(Debug, Default)]
+struct ReplicaSetMemo(RwLock<MemoState>);
+
+impl Clone for ReplicaSetMemo {
+    /// Clones the memoized sets along with the version they belong to, so a cloned
+    /// `Placement` (whose `ring_version` is cloned too) starts warm and still correct.
+    fn clone(&self) -> Self {
+        Self(RwLock::new(
+            self.0
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
+        ))
+    }
 }
 
 /// The placement ring for one node: maps client ids to their owner and replica
@@ -149,6 +205,18 @@ pub struct Placement {
     /// ASSIGNER's target (`hrw_owner`), never the committed map this version tracks — and
     /// where a lease IS committed, `group_owner` is that lease regardless of voters.
     ownership_epoch: u64,
+    /// A monotone version of everything a group's **replica set** is derived from — the
+    /// invalidation key for [`ReplicaSetMemo`]. Strictly broader than `ownership_epoch`:
+    /// it takes every bump that one takes (eligible membership, addressing, the committed
+    /// lease map) *plus* an actual change of the voter set, which `ownership_epoch`
+    /// deliberately ignores but which DOES move a replica set — a group with no committed
+    /// lease falls back to the voter-restricted `hrw_owner`, and that owner leads its
+    /// set. The remaining inputs (`replicas`, `local`) are builder-only and cannot change
+    /// after construction. Private: this is an invalidation key, not an ownership signal —
+    /// a caller wanting the latter wants [`Placement::ownership_epoch`].
+    ring_version: u64,
+    /// See [`ReplicaSetMemo`]. Valid only while `ring_version` is unchanged.
+    replica_memo: ReplicaSetMemo,
 }
 
 /// A cheap, lock-free snapshot of COMMITTED group ownership and the owners this node can
@@ -234,6 +302,8 @@ impl Placement {
             peak_members: 1,
             durable_roster: None,
             ownership_epoch: 0,
+            ring_version: 0,
+            replica_memo: ReplicaSetMemo::default(),
         }
     }
 
@@ -359,6 +429,16 @@ impl Placement {
         self.durable_roster.as_ref()
     }
 
+    /// Record a change that can move a group's COMMITTED owner (or this node's ability to
+    /// route to it). The single bump site for both versions, so the broader
+    /// `ring_version` — the replica-set memo's invalidation key —
+    /// can never drift *behind* `ownership_epoch` as new mutators are added: anything
+    /// that moves committed ownership moves the ring too.
+    fn note_ownership_change(&mut self) {
+        self.ownership_epoch += 1;
+        self.ring_version += 1;
+    }
+
     /// Apply an observed membership state. A non-`Dead` peer becomes eligible
     /// for placement (recording its peer-link `addr` for relocation); a `Dead`
     /// peer is removed. This node is always eligible and is never removed — it
@@ -373,18 +453,18 @@ impl Placement {
                 // what makes an owner relocatable — so a real change moves the ownership
                 // version (a repeat observation of the same state does not).
                 if self.eligible.remove(id) | self.addrs.remove(id).is_some() {
-                    self.ownership_epoch += 1;
+                    self.note_ownership_change();
                 }
                 self.domains.remove(id);
             }
             MemberState::Alive | MemberState::Suspect => {
                 if self.eligible.insert(id.clone()) {
-                    self.ownership_epoch += 1;
+                    self.note_ownership_change();
                 }
                 if !addr.is_empty()
                     && self.addrs.insert(id.clone(), addr.to_string()).as_deref() != Some(addr)
                 {
-                    self.ownership_epoch += 1;
+                    self.note_ownership_change();
                 }
                 // Learn the peer's failure-domain label; a membership event that never
                 // carried one must not erase a label we already learned (ADR 0016 T5).
@@ -443,6 +523,15 @@ impl Placement {
     /// by the durable driver with the committed voters (mapped back to `NodeId`).
     /// An empty set means "unknown" and ownership falls back to the eligible set.
     pub fn set_voters(&mut self, voters: BTreeSet<NodeId>) {
+        // Voters do NOT move COMMITTED ownership, so `ownership_epoch` deliberately stays
+        // put (see its doc). They DO move a replica set: a group with no committed lease
+        // falls back to `hrw_owner`, which draws from voters ∩ eligible, and that owner
+        // leads the set. So a real voter change must invalidate the replica-set memo —
+        // compared first because this is pushed every reconcile tick and is identical
+        // almost every time.
+        if self.voters != voters {
+            self.ring_version += 1;
+        }
         self.voters = voters;
     }
 
@@ -456,7 +545,7 @@ impl Placement {
         // a real move bumps the ownership version, so a poller gated on it does no work
         // while nothing has moved (issue #284 round-2 finding 3).
         if self.lease_owners != owners {
-            self.ownership_epoch += 1;
+            self.note_ownership_change();
         }
         self.lease_owners = owners;
     }
@@ -469,6 +558,57 @@ impl Placement {
     #[must_use]
     pub fn ownership_epoch(&self) -> u64 {
         self.ownership_epoch
+    }
+
+    /// This node's own id — the identity every ownership answer is compared against.
+    /// Exposed so a caller that has already resolved [`group_owner`](Self::group_owner)
+    /// can decide ownership from it instead of paying a second resolution through
+    /// [`owns_group`](Self::owns_group).
+    #[must_use]
+    pub fn local(&self) -> &NodeId {
+        &self.local
+    }
+
+    /// The memoized replica set of `group`, or `None` when the memo is cold or was
+    /// computed at an older `ring_version` (see [`ReplicaSetMemo`]).
+    fn memo_get(&self, group: GroupId) -> Option<Vec<NodeId>> {
+        let memo = self
+            .replica_memo
+            .0
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if memo.version != self.ring_version {
+            return None;
+        }
+        memo.sets.get(&group).cloned()
+    }
+
+    /// Record a freshly computed replica set, discarding the whole map first if it
+    /// belongs to a superseded `ring_version`.
+    fn memo_put(&self, group: GroupId, set: &[NodeId]) {
+        let mut memo = self
+            .replica_memo
+            .0
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if memo.version != self.ring_version {
+            memo.version = self.ring_version;
+            memo.sets.clear();
+        }
+        memo.computes += 1;
+        memo.sets.insert(group, set.to_vec());
+    }
+
+    /// How many full HRW replica-set passes the memo has had to run — its MISS count.
+    /// Test-only introspection: a memo whose hit rate collapsed would be indistinguishable
+    /// from a working one by its answers alone.
+    #[cfg(test)]
+    pub(crate) fn replica_set_computations(&self) -> u64 {
+        self.replica_memo
+            .0
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .computes
     }
 
     /// Snapshot COMMITTED ownership and relocatability for a lock-free pass — see
@@ -608,9 +748,22 @@ impl Placement {
     /// The ordered replica set of a placement `group` — the **committed** owner leads
     /// (so the lease holder always holds the group's data), followed by the HRW replica
     /// set, capped at `R` and at the current member count.
+    ///
+    /// Memoized per `(group, ring_version)` — see [`ReplicaSetMemo`]. This is the funnel
+    /// every durable message passes through, and the answer is a pure function of a
+    /// topology that moves once per membership event, so the `O(N log N)` HRW pass is
+    /// paid once per change rather than once per message.
     #[must_use]
     pub fn group_replica_set(&self, group: GroupId) -> Vec<NodeId> {
-        self.owner_led_replica_set(group, &self.nodes(), self.group_owner(group))
+        if let Some(set) = self.memo_get(group) {
+            return set;
+        }
+        // Miss: pay the HRW pass (and the `nodes()` clone it needs) once for this
+        // `(group, topology)`. Computed exactly as it always was, so the memo can only
+        // ever return what a direct computation would.
+        let set = self.owner_led_replica_set(group, &self.nodes(), self.group_owner(group));
+        self.memo_put(group, &set);
+        set
     }
 
     /// Whether this node holds placement `group`'s committed lease (its actual owner).
@@ -639,11 +792,19 @@ impl Placement {
     #[must_use]
     pub fn replication_health(&self) -> ReplicationHealth {
         let desired = self.replicas;
+        // Shares the hot path's memo (see [`ReplicaSetMemo`]), so a poll over a settled
+        // ring is 256 map lookups instead of 256 HRW passes. `nodes()` is still built
+        // ONCE here and threaded into the misses, so a cold sweep costs no more than it
+        // did before the memo existed.
         let nodes = self.nodes();
         let min_actual = (0..NUM_GROUPS)
             .map(|g| {
-                self.owner_led_replica_set(g, &nodes, self.group_owner(g))
-                    .len()
+                if let Some(set) = self.memo_get(g) {
+                    return set.len();
+                }
+                let set = self.owner_led_replica_set(g, &nodes, self.group_owner(g));
+                self.memo_put(g, &set);
+                set.len()
             })
             .min()
             .unwrap_or(0);
@@ -1504,5 +1665,244 @@ mod tests {
             .with_write_floor(super::WriteFloor::Majority { declared: 1 });
         alone.set_durable_roster(BTreeSet::new(), 0);
         assert_eq!(alone.min_replicas(), 1);
+    }
+
+    // --- the replica-set memo (hot-path scaling): `group_replica_set` is the funnel
+    // every durable append/read/ack/truncate passes through, and used to run a full
+    // O(N log N) HRW pass per message. It is now memoized on `ring_version`. ---
+
+    /// The reference answer, computed straight from `hrw` with the memo out of the
+    /// picture — deliberately a transcription of `owner_led_replica_set` rather than a
+    /// call to it, so the test cannot be satisfied by a memo that returns a *consistent*
+    /// wrong set.
+    fn direct_replica_set(p: &Placement, group: u64) -> Vec<NodeId> {
+        let nodes = p.members();
+        let owner = p.group_owner(group);
+        let r = p.desired_replicas();
+        let mut set = crate::hrw::replica_set(super::group_key(group).as_bytes(), &nodes, r);
+        set.retain(|n| n != &owner);
+        set.insert(0, owner);
+        set.truncate(r.max(1));
+        set
+    }
+
+    /// Assert the memo agrees with a direct HRW computation for EVERY group.
+    fn assert_memo_matches_hrw(p: &Placement, shape: &str) {
+        for g in 0..super::NUM_GROUPS {
+            assert_eq!(
+                p.group_replica_set(g),
+                direct_replica_set(p, g),
+                "memoized replica set diverged from HRW for group {g} ({shape})"
+            );
+        }
+    }
+
+    /// The memo must be a pure accelerator: for every group, over several membership
+    /// shapes and both ownership regimes (lease-less HRW fallback and a committed lease),
+    /// it returns exactly what HRW computes today. This governs data placement, so a
+    /// divergence here is a durability bug, not a perf regression.
+    #[test]
+    fn the_memoized_replica_set_equals_the_direct_hrw_computation() {
+        use std::collections::{BTreeMap, BTreeSet};
+
+        // A lone node, a quorum, and a cluster wider than R.
+        assert_memo_matches_hrw(&ring("a", &[]), "alone");
+        assert_memo_matches_hrw(&ring("a", &["b", "c"]), "three");
+        let wide = ring("a", &["b", "c", "d", "e", "f", "g"]);
+        assert_memo_matches_hrw(&wide, "seven");
+
+        // With a voter restriction (ownership is drawn from voters ∩ eligible).
+        let mut voted = ring("a", &["b", "c", "d", "e", "f", "g"]);
+        voted.set_voters(
+            ["a", "b", "c"]
+                .iter()
+                .map(|i| node(i))
+                .collect::<BTreeSet<_>>(),
+        );
+        assert_memo_matches_hrw(&voted, "seven, three voters");
+
+        // With committed leases that CONTRADICT HRW for a slice of the groups — the
+        // committed owner must lead the memoized set exactly as it leads a fresh one.
+        let mut leased = ring("a", &["b", "c", "d", "e", "f", "g"]);
+        let holders = ["a", "b", "c", "d", "e", "f", "g"];
+        let mut owners = BTreeMap::new();
+        for g in (0..super::NUM_GROUPS).step_by(3) {
+            owners.insert(
+                g,
+                node(holders[usize::try_from(g).unwrap() % holders.len()]),
+            );
+        }
+        leased.set_lease_owners(owners);
+        assert_memo_matches_hrw(&leased, "seven, partially leased");
+
+        // Fewer members than R: sets truncate to the member count.
+        let mut pair = ring("a", &["b"]);
+        pair.set_voters(BTreeSet::new());
+        assert_memo_matches_hrw(&pair, "two");
+    }
+
+    /// A HIT must not recompute. Non-vacuous in both directions: the miss count moves by
+    /// exactly one for a cold group, then not at all across many repeats — and
+    /// `ownership_epoch` is unmoved throughout, which is precisely the condition under
+    /// which the memo is allowed to answer from cache.
+    #[test]
+    fn a_memo_hit_does_not_recompute_the_hrw_pass() {
+        let p = ring("a", &["b", "c", "d", "e"]);
+        let g = 7;
+
+        let before = p.replica_set_computations();
+        let first = p.group_replica_set(g);
+        assert_eq!(
+            p.replica_set_computations(),
+            before + 1,
+            "the cold group must pay exactly one HRW pass"
+        );
+
+        let settled = p.ownership_epoch();
+        let hot = p.replica_set_computations();
+        for _ in 0..200 {
+            assert_eq!(
+                p.group_replica_set(g),
+                first,
+                "a hit must answer identically"
+            );
+        }
+        assert_eq!(
+            p.replica_set_computations(),
+            hot,
+            "200 hits recomputed the HRW pass"
+        );
+        assert_eq!(
+            p.ownership_epoch(),
+            settled,
+            "nothing moved, so nothing could legitimately have invalidated"
+        );
+
+        // A second group is its own miss; it does not evict the first.
+        let _ = p.group_replica_set(g + 1);
+        assert_eq!(p.replica_set_computations(), hot + 1);
+        let hot = p.replica_set_computations();
+        assert_eq!(p.group_replica_set(g), first);
+        assert_eq!(p.replica_set_computations(), hot);
+    }
+
+    /// The memo must invalidate on ANY change that can move a set. Each leg below is
+    /// non-vacuous: the assertion after the mutation would fail against the value cached
+    /// before it.
+    #[test]
+    fn the_memo_invalidates_on_every_input_that_moves_a_replica_set() {
+        use std::collections::{BTreeMap, BTreeSet};
+
+        // --- 1. a peer joins: the sets widen and re-order ---
+        let mut p = ring("a", &["b"]);
+        let g = 11;
+        let two = p.group_replica_set(g);
+        assert_eq!(two.len(), 2, "two members, R=3");
+        p.observe(&node("c"), MemberState::Alive, "c:7000", None);
+        let three = p.group_replica_set(g);
+        assert_eq!(three.len(), 3, "the joiner must appear in the set");
+        assert_ne!(three, two);
+        assert_memo_matches_hrw(&p, "after a join");
+
+        // --- 2. a member dies: it must leave every set ---
+        p.observe(&node("c"), MemberState::Dead, "", None);
+        let back = p.group_replica_set(g);
+        assert!(
+            !back.contains(&node("c")),
+            "a dead node must not survive in a memoized set"
+        );
+        assert_eq!(back, two);
+        assert_memo_matches_hrw(&p, "after a death");
+
+        // --- 3. a committed lease moves: the new holder must LEAD its set ---
+        let mut p = ring("a", &["b", "c"]);
+        let g_peer = (0..super::NUM_GROUPS)
+            .find(|g| p.hrw_owner(*g) == node("b"))
+            .unwrap();
+        assert_eq!(p.group_replica_set(g_peer)[0], node("b"));
+        let mut owners = BTreeMap::new();
+        owners.insert(g_peer, node("c"));
+        p.set_lease_owners(owners);
+        assert_eq!(
+            p.group_replica_set(g_peer)[0],
+            node("c"),
+            "the committed lease holder must lead the set the memo returns"
+        );
+        assert_memo_matches_hrw(&p, "after a lease move");
+
+        // --- 4. the VOTER set changes: `ownership_epoch` deliberately does not move,
+        // so this is exactly the case a memo keyed on `ownership_epoch` would get
+        // wrong. A lease-less group falls back to the voter-restricted HRW owner. ---
+        let mut p = ring("a", &["b", "c"]);
+        let g_b = (0..super::NUM_GROUPS)
+            .find(|g| p.hrw_owner(*g) == node("b"))
+            .unwrap();
+        assert_eq!(p.group_replica_set(g_b)[0], node("b"));
+        let epoch_before = p.ownership_epoch();
+        p.set_voters(std::iter::once(node("a")).collect::<BTreeSet<_>>());
+        assert_eq!(
+            p.ownership_epoch(),
+            epoch_before,
+            "voters must not move the COMMITTED-ownership version (its documented contract)"
+        );
+        assert_eq!(
+            p.group_replica_set(g_b)[0],
+            node("a"),
+            "restricting ownership to voter `a` must re-lead the set, memo or not"
+        );
+        assert_memo_matches_hrw(&p, "after a voter change");
+
+        // A no-op voter push (the steady state, every reconcile tick) must not thrash
+        // the memo.
+        let hot = p.replica_set_computations();
+        p.set_voters(std::iter::once(node("a")).collect::<BTreeSet<_>>());
+        let _ = p.group_replica_set(g_b);
+        assert_eq!(
+            p.replica_set_computations(),
+            hot,
+            "an identical voter push must not invalidate the memo"
+        );
+    }
+
+    /// `replication_health` shares the hot path's memo, so its answer must be unchanged —
+    /// including the under-replication verdict the write floor is reported against.
+    #[test]
+    fn replication_health_is_unchanged_by_the_memo() {
+        let alone = ring("a", &[]);
+        let h = alone.replication_health();
+        assert_eq!((h.desired, h.min_actual), (DEFAULT_REPLICAS, 1));
+        assert!(h.is_under_replicated());
+        // Warm the memo, then ask again: the same verdict, from cache.
+        let _ = alone.group_replica_set(0);
+        assert_eq!(alone.replication_health(), h);
+
+        let full = ring("a", &["b", "c"]);
+        let h = full.replication_health();
+        assert_eq!((h.desired, h.min_actual), (DEFAULT_REPLICAS, 3));
+        assert!(!h.is_under_replicated());
+        assert_eq!(
+            full.replication_health(),
+            h,
+            "a warm sweep answers the same"
+        );
+        for g in 0..super::NUM_GROUPS {
+            assert_eq!(full.group_replica_set(g), direct_replica_set(&full, g));
+        }
+    }
+
+    /// A cloned ring carries its memo AND the version that memo belongs to, so the clone
+    /// cannot answer from sets its own topology never produced.
+    #[test]
+    fn a_cloned_ring_keeps_a_correct_memo() {
+        let mut p = ring("a", &["b", "c"]);
+        let _ = p.group_replica_set(3);
+        let mut clone = p.clone();
+        assert_eq!(clone.group_replica_set(3), p.group_replica_set(3));
+        // The clone diverges: its own membership change must invalidate only its memo.
+        clone.observe(&node("d"), MemberState::Alive, "d:7000", None);
+        assert_memo_matches_hrw(&clone, "clone after a join");
+        assert_memo_matches_hrw(&p, "original after the clone diverged");
+        p.observe(&node("e"), MemberState::Alive, "e:7000", None);
+        assert_memo_matches_hrw(&p, "original after its own join");
     }
 }

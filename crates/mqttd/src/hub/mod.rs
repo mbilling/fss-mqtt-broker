@@ -65,7 +65,7 @@ use tokio::time::Instant;
 use tracing::{debug, info, warn};
 
 mod forwarding;
-use forwarding::{ForwardKind, ForwardObligation, PendingPublish};
+use forwarding::{ForwardKind, ForwardObligation, InterestIndex, PendingPublish};
 mod delivery;
 mod lanes;
 #[allow(clippy::wildcard_imports)] // an intra-hub module split (#258): the five
@@ -1994,8 +1994,10 @@ pub struct Hub {
     ownership_epoch_seen: Option<u64>,
     /// Connected peer nodes.
     peers: HashMap<NodeId, Peer>,
-    /// Each peer's last-announced subscription interest (filters).
-    remote_interest: HashMap<NodeId, HashSet<String>>,
+    /// Each peer's last-announced subscription interest, stored INVERTED
+    /// (filter -> nodes) so a publish resolves its forward targets in one trie
+    /// walk instead of scanning every peer's filter set. See [`InterestIndex`].
+    interest: InterestIndex,
     /// Live session-placement ring (ADR 0005). `None` outside a cluster. Read at
     /// persistent CONNECT to identify the session's owner.
     placement: Option<Arc<RwLock<Placement>>>,
@@ -2224,7 +2226,7 @@ impl Hub {
                 misplaced: HashMap::new(),
                 ownership_epoch_seen: None,
                 peers: HashMap::new(),
-                remote_interest: HashMap::new(),
+                interest: InterestIndex::default(),
                 placement,
                 metrics: None,
                 clock: crate::clock::system_clock(),
@@ -2859,8 +2861,7 @@ impl Hub {
                         }
                     }
                 }
-                self.remote_interest
-                    .insert(node, filters.into_iter().collect());
+                self.interest.replace(node, filters);
             }
             HubCommand::RemoteSharedInterest { node, groups } => {
                 debug!(node = %node.0, groups = groups.len(), "remote shared interest updated");
@@ -5696,7 +5697,7 @@ impl Hub {
     fn peer_dead(&mut self, node: &NodeId) {
         let had_link = self.peers.remove(node).is_some();
         self.known_peer_protos.remove(node);
-        let had_interest = self.remote_interest.remove(node).is_some();
+        let had_interest = self.interest.remove(node);
         self.remote_shared.remove(node);
         self.rebuild_remote_shared_index();
         // Acked forwards to the dead node re-route to its successor once it
