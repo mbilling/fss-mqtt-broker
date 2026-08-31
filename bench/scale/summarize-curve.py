@@ -452,6 +452,14 @@ def lane_e_rung(rdir: Path) -> dict:
             # `sites-<n>` or `sites-<n>-rep<k>`: the count is the SECOND token, not
             # the last one, since a repeated rung carries a suffix.
             "sites": int(rdir.name.split("-")[1]),
+            # The repeat index belongs here too: without it an in-flight REPEAT
+            # renders as run 1 and appears to contradict the completed run 1
+            # sitting beside it in the table.
+            "rep": (
+                int(rdir.name.split("-")[2][3:])
+                if len(rdir.name.split("-")) > 2 and rdir.name.split("-")[2].startswith("rep")
+                else 1
+            ),
             "offered": 0.0,
             "sent_rate": 0.0,
             "recv_rate": 0.0,

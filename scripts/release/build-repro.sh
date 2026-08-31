@@ -102,6 +102,54 @@ for pkg in "${PACKAGES[@]}"; do
   fi
 done
 
+# ── optional: a matching SYMBOLS build of the broker (BUILD_SYMBOLS=1) ───────
+#
+# `perf` on a broker host reports bare addresses, because the shipped binary is
+# stripped (`-C strip=symbols` above). That is the right default — the artifact
+# stays small and its bytes stay verifiable — but it means the one place we can
+# profile the real workload is the one place we cannot read a profile.
+#
+# So build the broker a SECOND time, identically except that `-C debuginfo=2`
+# replaces `-C strip=symbols`. Debug info does not change code generation: it
+# adds DWARF sections beside the same instructions. The check below PROVES that
+# for each build rather than asserting it — if the executable sections ever
+# differ, the symbols binary is not a faithful stand-in for the shipped one and
+# this fails rather than shipping something misleading.
+#
+# The shipped artifact is untouched: it is built by the loop above, from its own
+# target dir, and is not re-linked here.
+if [ "${BUILD_SYMBOLS:-0}" = 1 ]; then
+	SYM_DIR="${REPO_ROOT}/target/symbols-build"
+	(
+		export RUSTFLAGS="--remap-path-prefix=${CARGO_HOME_DIR}=/cargo --remap-path-prefix=${REPO_ROOT}=/build -C debuginfo=2 -C target-feature=+crt-static"
+		cargo build --release --locked --target "$TARGET" -p mqttd --target-dir "$SYM_DIR" >&2
+	)
+	SYM_BIN="${SYM_DIR}/${TARGET}/release/mqttd"
+	SHIPPED="${REPO_ROOT}/target/${TARGET}/release/mqttd"
+
+	# Same instructions, or this is not a stand-in. Compare the executable
+	# section's contents, not the whole file: the symbols build legitimately
+	# carries extra DWARF sections and therefore a different size and layout.
+	need() { command -v "$1" >/dev/null || { echo "BUILD_SYMBOLS needs $1" >&2; exit 1; }; }
+	need objcopy
+	need sha256sum
+	for b in "$SHIPPED" "$SYM_BIN"; do
+		objcopy -O binary --only-section=.text "$b" "${b}.text.bin"
+	done
+	a="$(sha256sum "${SHIPPED}.text.bin" | cut -d' ' -f1)"
+	b="$(sha256sum "${SYM_BIN}.text.bin" | cut -d' ' -f1)"
+	rm -f "${SHIPPED}.text.bin" "${SYM_BIN}.text.bin"
+	if [ "$a" != "$b" ]; then
+		echo "BUILD_SYMBOLS: .text differs between the shipped and symbols builds" >&2
+		echo "  shipped $a" >&2
+		echo "  symbols $b" >&2
+		echo "  the symbols binary would not describe the code that ships — refusing" >&2
+		exit 1
+	fi
+	cp "$SYM_BIN" "${REPO_ROOT}/target/${TARGET}/release/mqttd-symbols"
+	echo "BUILD_SYMBOLS: .text identical ($a) — mqttd-symbols is a faithful stand-in" >&2
+fi
+
 # stdout stays the broker path: callers (and RELEASING.md) treat this script's
 # output as "the binary to checksum", and quietly changing that would break them.
 echo "${REPO_ROOT}/target/${TARGET}/release/mqttd"

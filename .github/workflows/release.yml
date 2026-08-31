@@ -126,6 +126,20 @@ jobs:
           fi
           echo "reproducible:"; paste <(printf 'mqttd\nmqtt-bridge\nmqttd-operator\nmqttd-fips\nmqttui\n') first.sha256
 
+      # AFTER the reproducibility check, deliberately: that step runs `cargo clean`
+      # and rebuilds, so anything produced before it is deleted. Building here also
+      # means the symbols binary is derived from the tree the check just proved
+      # reproducible.
+      #
+      # `-C debuginfo=2` replaces `-C strip=symbols`; nothing else changes. Debug
+      # info does not alter code generation, and build-repro.sh REFUSES to emit
+      # this binary unless its executable section hashes identically to the shipped
+      # one — so it can never describe code that did not ship.
+      - name: Build the symbols twin (for profiling; never deployed)
+        run: scripts/release/build-repro.sh ${{ matrix.target }} mqttd
+        env:
+          BUILD_SYMBOLS: 1
+
       - name: Stage artifact + checksum
         id: stage
         run: |
@@ -135,6 +149,7 @@ jobs:
           UI_NAME="mqttui-${VERSION}-${{ matrix.target }}"
           OPERATOR_NAME="mqttd-operator-${VERSION}-${{ matrix.target }}"
           FIPS_NAME="mqttd-fips-${VERSION}-${{ matrix.target }}"
+          SYMBOLS_NAME="mqttd-symbols-${VERSION}-${{ matrix.target }}"
           mkdir -p dist out
           cp "target/${{ matrix.target }}/release/mqttd" "out/${NAME}"
           cp "target/${{ matrix.target }}/release/mqtt-bridge" "out/${BRIDGE_NAME}"
@@ -146,6 +161,12 @@ jobs:
           # The fips variant (ADR 0068 T4): a binary artifact only — the container
           # images stay single-variant; a fips image is its own future decision.
           cp "target/${{ matrix.target }}/release/mqttd-fips" "out/${FIPS_NAME}"
+          # The unstripped twin of the shipped broker (ADR 0045). NOT for deployment:
+          # it exists so `perf` on a broker host can name functions instead of
+          # addresses. Its executable section is proven identical to the shipped
+          # binary's by build-repro.sh, so a profile taken against it describes the
+          # code that ships.
+          cp "target/${{ matrix.target }}/release/mqttd-symbols" "out/${SYMBOLS_NAME}"
           # The container images copy from dist/<binary> (arch-native).
           cp "target/${{ matrix.target }}/release/mqttd" dist/mqttd
           cp "target/${{ matrix.target }}/release/mqtt-bridge" dist/mqtt-bridge
@@ -155,6 +176,7 @@ jobs:
           ( cd out && sha256sum "${UI_NAME}" > "${UI_NAME}.sha256" )
           ( cd out && sha256sum "${OPERATOR_NAME}" > "${OPERATOR_NAME}.sha256" )
           ( cd out && sha256sum "${FIPS_NAME}" > "${FIPS_NAME}.sha256" )
+          ( cd out && sha256sum "${SYMBOLS_NAME}" > "${SYMBOLS_NAME}.sha256" )
           echo "name=${NAME}" >> "$GITHUB_OUTPUT"
           echo "bridge_name=${BRIDGE_NAME}" >> "$GITHUB_OUTPUT"
           echo "ui_name=${UI_NAME}" >> "$GITHUB_OUTPUT"
