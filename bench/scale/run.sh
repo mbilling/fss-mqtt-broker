@@ -256,9 +256,26 @@ for N in "${SIZES[@]}"; do
 	say "private-net mesh verified: every host reaches every private address"
 
 	# lane A's driver binary: wait for driver-1's background cargo build.
-	say "waiting for driver-1's durable_bench build (overlaps with nothing else now)"
-	wait_for "durable_bench build on driver-1" 1800 \
-		rssh "$(jq -r '.drivers[0].public_ip' "$INVENTORY")" "test -s /run/bench-driver-build-done"
+	#
+	# ONLY when something needs it. `durable_bench` carries lane A's closed loop
+	# and the per-host barrier probes that gate Curve 1, and those probes are
+	# skipped whenever lane A is (run-curve.sh). A `LANES=B` or `LANES=E` run was
+	# still blocking here for a binary it would never execute — on the slowest
+	# serial step in bring-up, on billed wall-clock, and on exactly the cheap
+	# single-lane runs the README recommends for a quick question (issue #477).
+	#
+	# The build itself is started by cloud-init and keeps running harmlessly in
+	# the background; this only stops the run WAITING on it.
+	case "${LANES:-ABC}" in
+	*A*)
+		say "waiting for driver-1's durable_bench build (overlaps with nothing else now)"
+		wait_for "durable_bench build on driver-1" 1800 \
+			rssh "$(jq -r '.drivers[0].public_ip' "$INVENTORY")" "test -s /run/bench-driver-build-done"
+		;;
+	*)
+		say "LANES=${LANES:-ABC} — not waiting for durable_bench (lane A not selected)"
+		;;
+	esac
 
 	"$SCALE_DIR/bootstrap-cluster.sh" "$RUN" "$INVENTORY" durable
 	# Live Grafana on the laptop, fed by an Alloy scraper on driver-1 through a

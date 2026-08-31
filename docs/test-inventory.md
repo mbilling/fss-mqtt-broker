@@ -898,7 +898,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 355 test(s)
+## `crates/mqttd/src/lib.rs` — 356 test(s)
 
 - `admission::tests::the_global_cap_refuses_at_the_bound_and_recovers`
 - `admission::tests::the_penalty_box_refuses_after_the_threshold`
@@ -981,6 +981,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `conn::tests::non_connect_first_packet_closes_without_connack`
 - `conn::tests::pingreq_and_qos2_release_are_answered`
 - `conn::tests::proxied_session_records_the_relaying_node_in_the_audit`
+- `conn::tests::qos0_publish_is_not_durability_gated`
 - `conn::tests::rejected_auth_increments_the_error_counter`
 - `conn::tests::splice_relays_owner_bytes_after_client_half_close`
 - `conn::tests::unknown_protocol_version_closes_without_connack`
