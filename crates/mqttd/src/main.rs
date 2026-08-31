@@ -2441,6 +2441,7 @@ fn wire_hub(
     hub.set_subscriber_limits(subscriber_limits_from_config(config)?);
     // ADR 0072: per-message durability tiers, only under the operator's opt-in.
     hub.set_allow_relaxed_publish(config.durable.allow_relaxed_publish);
+    hub.set_shared_prefer_local(config.cluster.shared_prefer_local);
     Ok(())
 }
 

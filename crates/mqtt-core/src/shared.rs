@@ -7,7 +7,9 @@
 //! members, advancing the cursor) is the hub's job (ADR 0015), so the table just
 //! reports matching groups and their members via [`SharedSubscriptionTable::matching`].
 
-use crate::{topic_matches, ClientId, QoS, TopicFilter};
+use crate::filter_index::FilterIndex;
+use crate::{ClientId, FilterKey, QoS, TopicFilter};
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 
 /// Parse a `$share/{ShareName}/{filter}` shared-subscription filter into its
@@ -47,10 +49,28 @@ pub struct SharedGroup {
     pub members: Vec<(ClientId, QoS)>,
 }
 
-/// Maps `(ShareName, filter)` to its ordered members.
+/// One matching group as the per-publish path borrows it: `(share name, filter,
+/// members)`, all tied to the table's lifetime — nothing cloned.
+pub type MatchedGroup<'a> = (&'a str, &'a str, &'a [(ClientId, QoS)]);
+
+/// Maps a topic filter to the share-named groups over it, each with its ordered
+/// members.
+///
+/// **Filter-first, and indexed** (ADR 0077 T4 follow-up). It used to key on
+/// `(ShareName, filter)` and test every group with `topic_matches` per publish;
+/// with the filter outermost the derived [`FilterIndex`] answers "which filters
+/// match this topic" in one walk of the TOPIC's levels, and the groups under a
+/// matched filter are then reached directly — no scan, no allocation. This is
+/// the same index issue #445 gave ordinary subscriptions and shared ones never
+/// received.
 #[derive(Debug, Default)]
 pub struct SharedSubscriptionTable {
-    groups: HashMap<(String, TopicFilter), Vec<(ClientId, QoS)>>,
+    /// Source of truth: filter → share-name → ordered members.
+    groups: HashMap<FilterKey, HashMap<String, Vec<(ClientId, QoS)>>>,
+    /// Derived match index over `groups`' keys. A filter enters when its first
+    /// group appears and leaves when its last one goes, so the two cannot
+    /// disagree about which filters exist.
+    index: FilterIndex,
 }
 
 impl SharedSubscriptionTable {
@@ -64,10 +84,20 @@ impl SharedSubscriptionTable {
     /// Re-subscribing updates the granted `QoS` in place and keeps the member's
     /// insertion position.
     pub fn subscribe(&mut self, client: ClientId, group: &str, filter: &str, max_qos: QoS) {
-        let members = self
-            .groups
-            .entry((group.to_string(), filter.to_string()))
-            .or_default();
+        // Disjoint field borrows let the index be updated from inside the entry,
+        // exactly as `SubscriptionTable::subscribe` does — the filter enters the
+        // index precisely when its first group appears, so the two cannot
+        // disagree about which filters exist. This is a per-SUBSCRIBE path, so
+        // the one key allocation is not on any hot path.
+        let index = &mut self.index;
+        let by_group = match self.groups.entry(FilterKey::from(filter)) {
+            Entry::Vacant(v) => {
+                index.insert(v.key());
+                v.insert(HashMap::new())
+            }
+            Entry::Occupied(o) => o.into_mut(),
+        };
+        let members = by_group.entry(group.to_string()).or_default();
         if let Some(m) = members.iter_mut().find(|(c, _)| *c == client) {
             m.1 = max_qos;
         } else {
@@ -77,21 +107,39 @@ impl SharedSubscriptionTable {
 
     /// Remove `client` from one `(group, filter)` shared subscription.
     pub fn unsubscribe(&mut self, client: &ClientId, group: &str, filter: &str) {
-        let key = (group.to_string(), filter.to_string());
-        if let Some(members) = self.groups.get_mut(&key) {
+        let Some(by_group) = self.groups.get_mut(filter) else {
+            return;
+        };
+        if let Some(members) = by_group.get_mut(group) {
             members.retain(|(c, _)| c != client);
             if members.is_empty() {
-                self.groups.remove(&key);
+                by_group.remove(group);
             }
+        }
+        if by_group.is_empty() {
+            self.groups.remove(filter);
+            self.index.remove(filter);
         }
     }
 
     /// Remove `client` from every shared group (called on disconnect/discard).
     pub fn remove_client(&mut self, client: &ClientId) {
-        self.groups.retain(|_, members| {
-            members.retain(|(c, _)| c != client);
-            !members.is_empty()
+        let mut emptied: Vec<FilterKey> = Vec::new();
+        self.groups.retain(|filter, by_group| {
+            by_group.retain(|_, members| {
+                members.retain(|(c, _)| c != client);
+                !members.is_empty()
+            });
+            if by_group.is_empty() {
+                emptied.push(FilterKey::clone(filter));
+                false
+            } else {
+                true
+            }
         });
+        for filter in emptied {
+            self.index.remove(&filter);
+        }
     }
 
     /// Visit each group whose `{filter}` matches `topic`, **by reference** — the
@@ -103,25 +151,36 @@ impl SharedSubscriptionTable {
     where
         F: FnMut(&str, &str, &[(ClientId, QoS)]),
     {
-        for ((group, filter), members) in &self.groups {
-            if topic_matches(filter, topic) {
-                f(group, filter, members);
+        self.index.for_each_matching(topic, |filter| {
+            if let Some(by_group) = self.groups.get(filter) {
+                for (group, members) in by_group {
+                    f(group, filter, members);
+                }
             }
-        }
+        });
     }
 
     /// Iterator form of [`for_each_matching`](Self::for_each_matching) (issue #376):
     /// the borrowed `(group, filter, members)` tuples live as long as `&self`, so the
     /// per-publish selection path can hold them across its plan pass without a closure
     /// and without cloning a single member. Arbitrary order, like `for_each_matching`.
+    ///
+    /// Collects into a `Vec` because the index walk is callback-shaped; the vector
+    /// holds borrows only — no member list is cloned, which is the cost #376 removed.
     pub fn matching_refs<'a>(
         &'a self,
         topic: &'a str,
-    ) -> impl Iterator<Item = (&'a str, &'a str, &'a [(ClientId, QoS)])> + 'a {
-        self.groups
-            .iter()
-            .filter(move |((_, filter), _)| topic_matches(filter, topic))
-            .map(|((group, filter), members)| (group.as_str(), filter.as_str(), members.as_slice()))
+    ) -> impl Iterator<Item = MatchedGroup<'a>> + 'a {
+        let mut out: Vec<MatchedGroup<'a>> = Vec::new();
+        // Vec::new() does not allocate, so an empty table costs nothing here.
+        self.index.for_each_matching(topic, |filter| {
+            if let Some(by_group) = self.groups.get(filter) {
+                for (group, members) in by_group {
+                    out.push((group.as_str(), &**filter, members.as_slice()));
+                }
+            }
+        });
+        out.into_iter()
     }
 
     /// Every group whose `{filter}` matches `topic`, with its members (an owned snapshot).
@@ -147,10 +206,12 @@ impl SharedSubscriptionTable {
     pub fn snapshot(&self) -> Vec<SharedGroup> {
         self.groups
             .iter()
-            .map(|((group, filter), members)| SharedGroup {
-                group: group.clone(),
-                filter: filter.clone(),
-                members: members.clone(),
+            .flat_map(|(filter, by_group)| {
+                by_group.iter().map(move |(group, members)| SharedGroup {
+                    group: group.clone(),
+                    filter: filter.to_string(),
+                    members: members.clone(),
+                })
             })
             .collect()
     }
@@ -158,7 +219,7 @@ impl SharedSubscriptionTable {
     /// Number of distinct shared groups currently registered.
     #[must_use]
     pub fn group_count(&self) -> usize {
-        self.groups.len()
+        self.groups.values().map(HashMap::len).sum()
     }
 }
 

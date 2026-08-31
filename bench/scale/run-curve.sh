@@ -361,6 +361,25 @@ LANE_E_P99_BUDGET_MS="${LANE_E_P99_BUDGET_MS:-1000}"
 # failure mode this rig has (every wrong answer in the 2026-08 campaign was the
 # harness). Refused in the shape check, where it costs nothing.
 LANE_E_MAX_CONTAINERS_PER_DRIVER="${LANE_E_MAX_CONTAINERS_PER_DRIVER:-8}"
+# SITE AFFINITY. Off by default, which is how T3/T4 were measured: every
+# container spans every broker (rotated_hosts), inherited from lane B where one
+# shared workload SHOULD be spread. For a tenancy lane that inheritance is
+# actively wrong. A site is semantically independent — site 3's publishes only
+# ever reach site 3's consumers — so the workload is partitionable; spreading
+# each site over all N brokers converts it into an all-to-all one.
+#
+# The cost is not incidental. `Hub::choose_shared_index` picks a $share member
+# ROUND-ROBIN over every online candidate with no locality preference, so with a
+# group spread across N nodes roughly (N-1)/N of publishes select a REMOTE
+# member and cross the network. That is the suspected mechanism behind T4's
+# `sites = N + 2`: each added node brought a hub thread (+1 site) but also
+# forwarding work for every existing node (hence not +3).
+#
+# With LANE_E_PIN_SITES=1 a site's publishers AND consumers connect only to
+# broker (site mod N). Cross-node forwarding for that site's traffic goes to
+# zero, and if forwarding is the ceiling capacity should become ~3N rather than
+# N+2. Falsifiable either way, which is the point.
+LANE_E_PIN_SITES="${LANE_E_PIN_SITES:-0}"
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 brokers_csv() { # brokers_csv <suffix-jq> — comma list over brokers
@@ -662,8 +681,22 @@ lane_e_shape() {
 		echo "per_publisher_interval_ms=$interval"
 		echo "containers per site: $LANE_E_PUB_CONTAINERS_PER_SITE pub ($pubs_per_c clients, $per_c_rate msg/s each) + $LANE_E_SUB_CONTAINERS_PER_SITE sub ($subs_per_c clients)"
 		echo "p99 budget: ${LANE_E_P99_BUDGET_MS}ms (a rung above it is reported as OVER BUDGET, not as a failure)"
+		if [ "$LANE_E_PIN_SITES" = 1 ]; then
+			echo "site affinity: ON — each site's publishers AND consumers dial ONLY broker (site mod $N),"
+			echo "               so its traffic never crosses a node. The busiest broker carries"
+			echo "               ceil(sites/$N) sites; that per-broker figure is what to compare against"
+			echo "               the N=1 knee, NOT the cluster total."
+		else
+			echo "site affinity: off — every container spans all $N brokers (rotated_hosts). With"
+			echo "               round-robin \$share selection roughly (N-1)/N of publishes pick a"
+			echo "               REMOTE member and cross the network."
+		fi
 		echo
-		echo "  sites | publishers | consumers |   offered/s | containers | per driver | verdict"
+		if [ "$LANE_E_PIN_SITES" = 1 ]; then
+			echo "  sites | publishers | consumers |   offered/s | containers | per driver | per broker | verdict"
+		else
+			echo "  sites | publishers | consumers |   offered/s | containers | per driver | verdict"
+		fi
 	} >"$OUT/laneE/shape.txt"
 
 	local sites cps total_c per_driver verdict worst=0
@@ -680,10 +713,17 @@ lane_e_shape() {
 		else
 			verdict="ok"
 		fi
-		printf '  %5d | %10d | %9d | %11d | %10d | %10d | %s\n' \
-			"$sites" "$((sites * LANE_E_PUBS_PER_SITE))" "$((sites * LANE_E_SUBS_PER_SITE))" \
-			"$((sites * LANE_E_SITE_RATE))" "$total_c" "$per_driver" "$verdict" \
-			>>"$OUT/laneE/shape.txt"
+		if [ "$LANE_E_PIN_SITES" = 1 ]; then
+			printf '  %5d | %10d | %9d | %11d | %10d | %10d | %10s | %s\n' \
+				"$sites" "$((sites * LANE_E_PUBS_PER_SITE))" "$((sites * LANE_E_SUBS_PER_SITE))" \
+				"$((sites * LANE_E_SITE_RATE))" "$total_c" "$per_driver" \
+				"$(((sites + N - 1) / N)) sites" "$verdict" >>"$OUT/laneE/shape.txt"
+		else
+			printf '  %5d | %10d | %9d | %11d | %10d | %10d | %s\n' \
+				"$sites" "$((sites * LANE_E_PUBS_PER_SITE))" "$((sites * LANE_E_SUBS_PER_SITE))" \
+				"$((sites * LANE_E_SITE_RATE))" "$total_c" "$per_driver" "$verdict" \
+				>>"$OUT/laneE/shape.txt"
+		fi
 	done
 	if [ "$worst" = 1 ]; then
 		sed 's/^/    /' "$OUT/laneE/shape.txt" >&2
@@ -1380,6 +1420,12 @@ lane_e_rung() { # lane_e_rung <sites>
 		for ((i = 0; i < N; i++)); do out+="${HOSTS[(rot + i) % N]},"; done
 		echo "${out%,}"
 	}
+	# With affinity on, every container of site s dials ONE broker — the same one
+	# for its publishers and its consumers — so the site's traffic never leaves
+	# that node.
+	site_hosts() { # site_hosts <site> <container-index>
+		if [ "$LANE_E_PIN_SITES" = 1 ]; then echo "${HOSTS[$1 % N]}"; else rotated_hosts "$2"; fi
+	}
 	local di s j sdi hosts filter seq_base cidx
 	local -a subs pubs scrape stop names portn
 	for ((di = 0; di < D; di++)); do
@@ -1397,7 +1443,7 @@ lane_e_rung() { # lane_e_rung <sites>
 		sdi=$((s % D))
 		for ((j = 0; j < LANE_E_SUB_CONTAINERS_PER_SITE; j++)); do
 			cidx=$((s * LANE_E_SUB_CONTAINERS_PER_SITE + j))
-			hosts=$(rotated_hosts "$cidx")
+			hosts=$(site_hosts "$s" "$cidx")
 			# Each site has its OWN $share group. One group per site is what makes
 			# these tenants rather than one big shared subscription: a publish for
 			# site 3 is selected among site 3's consumers only.
@@ -1410,7 +1456,7 @@ lane_e_rung() { # lane_e_rung <sites>
 		done
 		for ((j = 0; j < LANE_E_PUB_CONTAINERS_PER_SITE; j++)); do
 			cidx=$((s * LANE_E_PUB_CONTAINERS_PER_SITE + j))
-			hosts=$(rotated_hosts "$cidx")
+			hosts=$(site_hosts "$s" "$cidx")
 			# `-n` offsets the topic numbering per container so a site's topic set is
 			# site/<s>/1..LANE_E_PUBS_PER_SITE regardless of how many containers carry
 			# it — the same reason lane B does it (ADR 0048 §2: the topic count must

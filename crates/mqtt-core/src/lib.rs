@@ -7,6 +7,7 @@
 
 pub use mqtt_codec::QoS;
 
+pub mod filter_index;
 pub mod subscriptions;
 pub use subscriptions::SubscriptionTable;
 

@@ -98,6 +98,42 @@ several user properties (~597 ns at four) — a known allocation-per-property co
 obvious optimisation target if the bridge ever needs one. It is not on the critical path for
 T8.
 
+## Shared-subscription dispatch (`cargo bench -p mqttd --bench shared_plan`)
+
+What a cluster costs the publish path when **nothing crosses the network**. The
+benchmark drives the real hub through its command channel with identical
+publishes and identical local state, varying only how many peers' shared
+interest the node knows about. The peers' filters deliberately do not match the
+published topic, so no message is delivered to them — this isolates the cost of
+a peer merely being *known*.
+
+Measured on an Apple M-series laptop rather than the Xeon reference machine
+above, so the absolute values are not comparable with the other sections; the
+before/after ratio on one machine is the number that matters.
+
+| Known peers | Before | After | |
+|---|---|---|---|
+| 0 (standalone) | 1.354 ms | **0.962 ms** | 1.41× |
+| 2 (a 3-node cluster) | 2.035 ms | **1.393 ms** | 1.46× |
+| 4 (a 5-node cluster) | 2.554 ms | **1.397 ms** | 1.83× |
+| 9 (a 10-node cluster) | 3.947 ms | **1.391 ms** | 2.84× |
+| 4 peers × 24 groups | 5.335 ms | **1.387 ms** | 3.85× |
+
+Per 2000 publishes. "Before" is the linear scan every publish ran over every
+peer's every shared group, plus a `BTreeMap` collect of the peer map for stable
+ordering; "after" is the [`FilterIndex`](../../crates/mqtt-core/src/filter_index.rs)
+walk, built at membership rate.
+
+The point is not the ratio but the **shape**: cost is now flat in both peer
+count and groups per peer. It previously grew at ~19 ns per publish per remote
+group plus ~32 ns per peer, so a node lost throughput simply by being in a
+larger cluster — which is what made ADR 0077 lane E's tenant capacity grow as
+`sites = N + 2` instead of proportionally.
+
+Ordinary subscriptions received this index in issue #445 (+29% routing
+throughput per core, v1.0.8 → v1.0.9). Shared subscriptions did not, and were
+still scanning until this change.
+
 ## The regression gate
 
 Two layers watch these numbers:

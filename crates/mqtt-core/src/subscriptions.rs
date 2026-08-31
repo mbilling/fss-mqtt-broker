@@ -23,98 +23,19 @@
 //! wildcard in their first level and behave as literals here, exactly as they
 //! did under the linear scan.
 
+use crate::filter_index::FilterIndex;
 use crate::{ClientId, FilterKey, TopicFilter};
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
-
-/// One topic level in the match index. `+` and `#` are stored as ordinary keys;
-/// their wildcard meaning lives in the walk, not the structure.
-#[derive(Debug, Default)]
-struct TrieNode {
-    children: HashMap<String, TrieNode>,
-    /// Set when a registered filter ends at this node: **the same allocation**
-    /// `by_filter` is keyed by, not a copy of it. This used to be an owned
-    /// `String`, so every distinct filter was stored twice.
-    terminal: Option<FilterKey>,
-}
-
-impl Drop for TrieNode {
-    /// Dismantle the subtree iteratively. Node depth tracks the (client-supplied)
-    /// filter length, so the derived recursive drop of nested `HashMap`s would
-    /// otherwise overflow the stack and abort the broker when a deep filter's
-    /// path is pruned or the table is torn down — the same hazard the insert,
-    /// match, and remove walks avoid by staying iterative.
-    fn drop(&mut self) {
-        let mut stack: Vec<TrieNode> = self.children.drain().map(|(_, n)| n).collect();
-        while let Some(mut node) = stack.pop() {
-            stack.extend(node.children.drain().map(|(_, n)| n));
-            // `node` now has no children; its own drop recurses no further.
-        }
-    }
-}
-
-fn trie_insert(root: &mut TrieNode, filter: &FilterKey) {
-    let mut node = root;
-    for level in filter.split('/') {
-        node = node.children.entry(level.to_string()).or_default();
-    }
-    // Share the caller's allocation rather than copying the filter a second time.
-    node.terminal = Some(FilterKey::clone(filter));
-}
-
-/// Remove `filter`'s terminal and prune the trailing chain of nodes it leaves
-/// empty. Two iterative passes — depth tracks the filter's level count, which is
-/// client-controlled input, so recursion here would let one deep SUBSCRIBE
-/// overflow the stack and abort the broker (the insert and match walks are
-/// iterative for the same reason).
-fn trie_remove(root: &mut TrieNode, filter: &str) {
-    let levels: Vec<&str> = filter.split('/').collect();
-    // Pass 1 (immutable): confirm the path exists and find the deepest node on it
-    // that OUTLIVES the removal — one holding its own terminal or a second child
-    // once this filter's leaf is gone. The root always outlives it.
-    let mut node = &*root;
-    let mut cut = 0usize; // index, on the path, of the deepest surviving node
-    for (depth, level) in levels.iter().enumerate() {
-        let Some(child) = node.children.get(*level) else {
-            return; // filter not registered — nothing to remove
-        };
-        if depth == 0 || node.terminal.is_some() || node.children.len() > 1 {
-            cut = depth;
-        }
-        node = child;
-    }
-    // `node` is the leaf (index `levels.len()`); it outlives the removal iff it
-    // still has children once we drop this terminal.
-    if !node.children.is_empty() {
-        cut = levels.len();
-    }
-    // Pass 2 (mutable): clear the terminal if the leaf survives, else detach the
-    // whole dead chain at the surviving node — one child removal drops it all.
-    let mut node = &mut *root;
-    if cut == levels.len() {
-        for level in &levels {
-            node = node
-                .children
-                .get_mut(*level)
-                .expect("path verified in pass 1");
-        }
-        node.terminal = None;
-    } else {
-        for level in &levels[..cut] {
-            node = node
-                .children
-                .get_mut(*level)
-                .expect("path verified in pass 1");
-        }
-        node.children.remove(levels[cut]);
-    }
-}
 
 /// Maps topic filters to the set of clients subscribed to each.
 #[derive(Debug, Default)]
 pub struct SubscriptionTable {
     by_filter: HashMap<FilterKey, HashSet<ClientId>>,
-    root: TrieNode,
+    /// The derived match index (issue #445). Lives in [`crate::filter_index`] so
+    /// the local and remote `$share` populations can share one walk rather than
+    /// each scanning their filters per publish.
+    index: FilterIndex,
 }
 
 impl SubscriptionTable {
@@ -132,7 +53,7 @@ impl SubscriptionTable {
     pub fn subscribe(&mut self, client: ClientId, filter: FilterKey) {
         match self.by_filter.entry(filter) {
             Entry::Vacant(v) => {
-                trie_insert(&mut self.root, v.key());
+                self.index.insert(v.key());
                 v.insert(HashSet::from([client]));
             }
             Entry::Occupied(mut o) => {
@@ -147,7 +68,7 @@ impl SubscriptionTable {
             clients.remove(client);
             if clients.is_empty() {
                 self.by_filter.remove(filter);
-                trie_remove(&mut self.root, filter);
+                self.index.remove(filter);
             }
         }
     }
@@ -165,54 +86,14 @@ impl SubscriptionTable {
             }
         });
         for filter in emptied {
-            trie_remove(&mut self.root, &filter);
+            self.index.remove(&filter);
         }
     }
 
-    /// Every registered filter matching `topic`, via one walk of the topic's
-    /// levels. The callback may fire in any order and each filter at most once
-    /// (a filter is one trie path).
-    fn for_each_matching_filter<'a>(&'a self, topic: &str, mut cb: impl FnMut(&'a FilterKey)) {
-        let levels: Vec<&str> = topic.split('/').collect();
-        // [MQTT-4.7.2-1]: a filter whose FIRST level is a wildcard never matches a
-        // `$`-rooted topic. Deeper levels are unaffected, so the skip applies to
-        // the root frame only.
-        let skip_root_wildcards = topic.starts_with('$');
-        // Iterative: recursion depth would otherwise track topic depth, which is
-        // client-controlled input.
-        let mut stack: Vec<(&TrieNode, usize, bool)> = vec![(&self.root, 0, skip_root_wildcards)];
-        while let Some((node, i, skip_wildcards)) = stack.pop() {
-            if !skip_wildcards {
-                // A `#` child matches from its parent's level down — INCLUDING the
-                // parent level itself: "a/#" matches "a" (its terminal, checked
-                // here, not its subtree).
-                if let Some(h) = node.children.get("#") {
-                    if let Some(f) = &h.terminal {
-                        cb(f);
-                    }
-                }
-            }
-            if i == levels.len() {
-                if let Some(f) = &node.terminal {
-                    cb(f);
-                }
-                continue;
-            }
-            if !skip_wildcards {
-                if let Some(p) = node.children.get("+") {
-                    stack.push((p, i + 1, false));
-                }
-            }
-            let level = levels[i];
-            // A topic level spelled "+" or "#" was already answered by the wildcard
-            // arms above (those keys ARE the wildcard children); looking it up as a
-            // literal would visit the same node twice.
-            if level != "+" && level != "#" {
-                if let Some(c) = node.children.get(level) {
-                    stack.push((c, i + 1, false));
-                }
-            }
-        }
+    /// Every registered filter matching `topic`. Delegates to the shared
+    /// [`FilterIndex`] walk.
+    fn for_each_matching_filter<'a>(&'a self, topic: &str, cb: impl FnMut(&'a FilterKey)) {
+        self.index.for_each_matching(topic, cb);
     }
 
     /// Return the de-duplicated set of clients whose filters match `topic`.

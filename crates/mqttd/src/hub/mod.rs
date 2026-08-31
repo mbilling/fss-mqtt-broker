@@ -45,6 +45,7 @@ use mqtt_codec::{
     packet::{Disconnect, Publish},
     Packet, ProtocolVersion, QoS,
 };
+use mqtt_core::filter_index::FilterIndex;
 use mqtt_core::{
     parse_shared, topic_matches, AppProperties, ClientId, FilterKey, Message,
     SharedSubscriptionTable, Subscription, SubscriptionTable,
@@ -1777,6 +1778,26 @@ pub struct Hub {
     /// Each peer's last-announced shared-subscription membership, so this node can
     /// select one member per group across the whole cluster (ADR 0015 §2).
     remote_shared: HashMap<NodeId, Vec<RemoteSharedGroup>>,
+    /// Derived match index over every PEER's shared filters (ADR 0077 T4
+    /// follow-up). `remote_shared` above stays the source of truth — it is what
+    /// a node's interest update replaces and what its death removes — and these
+    /// two are rebuilt from it whenever it changes, which is a membership-rate
+    /// event rather than a publish-rate one.
+    ///
+    /// Before this, every publish scanned every peer's every group with
+    /// `topic_matches`, and collected the peer map into a `BTreeMap` purely for
+    /// stable ordering. Measured, that cost a node ~19 ns per publish per remote
+    /// group plus ~32 ns per peer, and it was paid whether or not any peer's
+    /// filter matched: a node that merely KNEW about 4 peers lost half its
+    /// publish dispatch (`crates/mqttd/benches/shared_plan.rs`).
+    remote_shared_index: FilterIndex,
+    /// Filter → the peers announcing it, each with its index into that peer's
+    /// `remote_shared` vector. Built in sorted node order, which is what makes
+    /// the candidate list stable per publish WITHOUT the per-publish sort the
+    /// `BTreeMap` collect used to provide — the round-robin cursor indexes into
+    /// that list, so an order that varied between publishes would make selection
+    /// arbitrary.
+    remote_by_filter: HashMap<FilterKey, Vec<(NodeId, usize)>>,
     /// Per-group round-robin cursor for cluster-wide shared selection (ADR 0015).
     shared_cursor: HashMap<SharedKey, usize>,
     /// Per-session outbound `QoS` > 0 in-flight state.
@@ -1791,6 +1812,8 @@ pub struct Hub {
     /// operator's `MQTTD_ALLOW_RELAXED_PUBLISH` opt-in. Off = the property is
     /// ignored and every ack keeps its full quorum-durable meaning.
     allow_relaxed_publish: bool,
+    /// `MQTTD_SHARED_PREFER_LOCAL`: prefer a local member in shared selection.
+    shared_prefer_local: bool,
     /// ADR 0073: the cluster-wide scale-out ownership capability. `Some((flag,
     /// enabled))` on a cluster node: `enabled` is the operator's
     /// `durable.ownership_domain = "members"` choice; `flag` is the shared verdict
@@ -2149,11 +2172,14 @@ impl Hub {
                 table: SubscriptionTable::new(),
                 shared: SharedSubscriptionTable::new(),
                 remote_shared: HashMap::new(),
+                remote_shared_index: FilterIndex::new(),
+                remote_by_filter: HashMap::new(),
                 shared_cursor: HashMap::new(),
                 inflight: HashMap::new(),
                 store,
                 durable_plane: None,
                 allow_relaxed_publish: false,
+                shared_prefer_local: false,
                 ownership_domain: None,
                 known_peer_protos: HashMap::new(),
                 retained: Arc::new(MemoryRetainedStore::new()),
@@ -2215,6 +2241,51 @@ impl Hub {
     /// `MQTTD_ALLOW_RELAXED_PUBLISH` opt-in, threaded to the ack gate.
     pub fn set_allow_relaxed_publish(&mut self, on: bool) {
         self.allow_relaxed_publish = on;
+    }
+
+    /// Prefer a local `$share` member over a remote one when both are online
+    /// (`MQTTD_SHARED_PREFER_LOCAL`). See [`Hub::choose_shared_index`] for what
+    /// this changes and `mqtt_config::Cluster::shared_prefer_local` for why it is
+    /// off by default.
+    pub fn set_shared_prefer_local(&mut self, on: bool) {
+        self.shared_prefer_local = on;
+    }
+
+    /// Rebuild the derived remote-shared match index from `remote_shared`.
+    ///
+    /// Called on every change to a peer's shared interest and on peer death —
+    /// membership-rate events. A full rebuild rather than an incremental edit:
+    /// a peer's groups are replaced wholesale by `RemoteSharedInterest`, the
+    /// populations are small, and "obviously correct at the cold path's cost" is
+    /// the right trade against an incremental update that could silently diverge
+    /// from the source of truth.
+    ///
+    /// Nodes are visited in sorted order so each filter's peer list is stable —
+    /// the property the per-publish `BTreeMap` collect used to buy, now paid for
+    /// once per membership change instead of once per message.
+    fn rebuild_remote_shared_index(&mut self) {
+        let mut index = FilterIndex::new();
+        let mut by_filter: HashMap<FilterKey, Vec<(NodeId, usize)>> = HashMap::new();
+        let mut nodes: Vec<&NodeId> = self.remote_shared.keys().collect();
+        nodes.sort();
+        for node in nodes {
+            let Some(groups) = self.remote_shared.get(node) else {
+                continue;
+            };
+            for (idx, g) in groups.iter().enumerate() {
+                match by_filter.entry(FilterKey::from(g.filter.as_str())) {
+                    std::collections::hash_map::Entry::Vacant(v) => {
+                        index.insert(v.key());
+                        v.insert(vec![(node.clone(), idx)]);
+                    }
+                    std::collections::hash_map::Entry::Occupied(mut o) => {
+                        o.get_mut().push((node.clone(), idx));
+                    }
+                }
+            }
+        }
+        self.remote_shared_index = index;
+        self.remote_by_filter = by_filter;
     }
 
     /// ADR 0072 / issue #399: does this message ask for the relaxed tier, and
@@ -2794,6 +2865,7 @@ impl Hub {
             HubCommand::RemoteSharedInterest { node, groups } => {
                 debug!(node = %node.0, groups = groups.len(), "remote shared interest updated");
                 self.remote_shared.insert(node, groups);
+                self.rebuild_remote_shared_index();
             }
             HubCommand::RemoteRetainedSnapshot { node, messages } => {
                 self.apply_retained_snapshot(&node, messages).await;
@@ -5610,6 +5682,7 @@ impl Hub {
         // second face: a publish in the disconnect-to-confirmation window found
         // no interest anywhere and acked a trivially-empty fan-out.
         self.remote_shared.remove(node);
+        self.rebuild_remote_shared_index();
         if let Some(plane) = &self.durable_plane {
             plane.fail(node);
         }
@@ -5625,6 +5698,7 @@ impl Hub {
         self.known_peer_protos.remove(node);
         let had_interest = self.remote_interest.remove(node).is_some();
         self.remote_shared.remove(node);
+        self.rebuild_remote_shared_index();
         // Acked forwards to the dead node re-route to its successor once it
         // advertises the inherited interest (ADR 0042 T9, exhibit ⑤ + ⑥): drop
         // the dead obligations and engage the sweep's re-route grace.
@@ -6088,6 +6162,17 @@ mod tests {
 
     fn start_hub_with_store(store: MemorySessionStore) -> HubTx {
         let (hub, tx) = Hub::with_config(NodeId("hub-test".into()), std::sync::Arc::new(store));
+        tokio::spawn(hub.run());
+        tx
+    }
+
+    /// A hub with `MQTTD_SHARED_PREFER_LOCAL` on, for the locality-preference tests.
+    fn start_hub_prefer_local() -> HubTx {
+        let (mut hub, tx) = Hub::with_config(
+            NodeId("hub-test".into()),
+            std::sync::Arc::new(MemorySessionStore::new()),
+        );
+        hub.set_shared_prefer_local(true);
         tokio::spawn(hub.run());
         tx
     }
@@ -6922,6 +7007,25 @@ mod tests {
         }
     }
 
+    /// Whether ANY `SharedDeliver` arrives within the usual window — the negative
+    /// of [`next_shared_deliver`], for asserting that nothing crossed the bus.
+    /// Bounded-wait rather than `try_recv`, so a forward that is merely slow still
+    /// fails the assertion instead of passing it.
+    async fn no_shared_deliver(rx: &mut mpsc::UnboundedReceiver<PeerMessage>) -> bool {
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(300);
+        loop {
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if left.is_zero() {
+                return true;
+            }
+            match timeout(left, rx.recv()).await {
+                Ok(Some(PeerMessage::SharedDeliver { .. })) => return false,
+                Ok(Some(_)) => {}
+                Ok(None) | Err(_) => return true,
+            }
+        }
+    }
+
     /// The next `SharedDeliver` from a peer, skipping interest snapshots.
     async fn next_shared_deliver(rx: &mut mpsc::UnboundedReceiver<PeerMessage>) -> PeerMessage {
         loop {
@@ -7425,6 +7529,63 @@ mod tests {
             recv_packet(&mut ra).await.is_none(),
             "single delivery per publish"
         );
+    }
+
+    /// `MQTTD_SHARED_PREFER_LOCAL`: the same group and the same two publishes as
+    /// `shared_selection_round_robins_local_and_remote_member`, which sends the
+    /// second one across the cluster bus. With locality preference the LOCAL member
+    /// takes both and nothing is forwarded — the whole point of the knob.
+    #[tokio::test]
+    async fn prefer_local_keeps_shared_delivery_off_the_cluster_bus() {
+        let tx = start_hub_prefer_local();
+        let mut peer = connect_peer(&tx, "n", 1);
+        assert!(matches!(
+            recv_peer(&mut peer).await,
+            Some(PeerMessage::Interest { .. })
+        ));
+
+        let (mut ra, _) = attach(&tx, "ra", 1, true).await;
+        subscribe(&tx, "ra", "$share/g/t");
+        remote_shared_interest(&tx, "n", "g", "t", &["rb"]);
+
+        // Both publishes land on the local member; round-robin would have sent the
+        // second to "rb" on peer "n".
+        publish(&tx, "t", b"m1");
+        assert_eq!(payload_of(&recv_packet(&mut ra).await.unwrap()), b"m1");
+        publish(&tx, "t", b"m2");
+        assert_eq!(payload_of(&recv_packet(&mut ra).await.unwrap()), b"m2");
+
+        assert!(
+            no_shared_deliver(&mut peer).await,
+            "a local member was online, so nothing should have crossed the bus"
+        );
+    }
+
+    /// Locality preference is a PREFERENCE, never a restriction: a group whose only
+    /// online member is remote still gets its message, exactly as round-robin would.
+    /// This is the fallback that keeps the knob safe to turn on anywhere.
+    #[tokio::test]
+    async fn prefer_local_still_uses_a_remote_member_when_there_is_no_local_one() {
+        let tx = start_hub_prefer_local();
+        let mut peer = connect_peer(&tx, "n", 1);
+        assert!(matches!(
+            recv_peer(&mut peer).await,
+            Some(PeerMessage::Interest { .. })
+        ));
+
+        // No local member at all — only a remote one.
+        remote_shared_interest(&tx, "n", "g", "t", &["rb"]);
+
+        publish(&tx, "t", b"m1");
+        match next_shared_deliver(&mut peer).await {
+            PeerMessage::SharedDeliver {
+                client, payload, ..
+            } => {
+                assert_eq!(client, "rb");
+                assert_eq!(&payload[..], b"m1");
+            }
+            other => panic!("expected SharedDeliver, got {other:?}"),
+        }
     }
 
     /// A remote member offline on its home node is skipped while a member online
