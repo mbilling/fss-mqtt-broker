@@ -449,7 +449,9 @@ def lane_e_rung(rdir: Path) -> dict:
         # live reads as offered=0 and p99="—", which the budget check below then
         # reports as OVER BUDGET — a running rung looking like a failed one.
         return {
-            "sites": int(rdir.name.rsplit("-", 1)[-1]),
+            # `sites-<n>` or `sites-<n>-rep<k>`: the count is the SECOND token, not
+            # the last one, since a repeated rung carries a suffix.
+            "sites": int(rdir.name.split("-")[1]),
             "offered": 0.0,
             "sent_rate": 0.0,
             "recv_rate": 0.0,
@@ -461,7 +463,9 @@ def lane_e_rung(rdir: Path) -> dict:
             "incomplete": True,
             "flags": ["INCOMPLETE (no rung.txt — still running, or the rung died)"],
         }
-    sites = int(meta.get("sites", rdir.name.rsplit("-", 1)[-1]))
+    sites = int(meta.get("sites", rdir.name.split("-")[1]))
+    parts = rdir.name.split("-")
+    rep = int(parts[2][3:]) if len(parts) > 2 and parts[2].startswith("rep") else 1
     offered = float(meta.get("offered", 0))
     budget = float(meta.get("p99_budget_ms", 1000))
 
@@ -492,6 +496,7 @@ def lane_e_rung(rdir: Path) -> dict:
         flags.append(f"OVER P99 BUDGET ({p99} > {budget:g}ms)")
     return {
         "sites": sites,
+        "rep": rep,
         "offered": offered,
         "sent_rate": sent_rate,
         "recv_rate": recv_rate,
@@ -656,38 +661,76 @@ def main() -> None:
     if e_sizes:
         print("\n## Curve 4 — scale-out by tenant (the rung is a SITE)\n")
         for n, d in e_sizes:
+            # Sort by site count, then by repeat index, so a repeated rung sits
+            # beside its twin rather than at the end of the table.
             rungs = sorted(
                 (lane_e_rung(r) for r in (d / "laneE").glob("sites-*")),
-                key=lambda r: r["sites"],
+                key=lambda r: (r["sites"], r.get("rep", 1)),
             )
             if not rungs:
                 continue
             print(f"### {n} node(s)\n")
-            print("| sites | offered msg/s | delivered/s | per consumer | p99 | verdict |")
-            print("|---|---|---|---|---|---|")
+            repeated = len({r["sites"] for r in rungs}) < len(rungs)
+            head = "| sites | offered msg/s | delivered/s | per consumer | p99 | verdict |"
+            if repeated:
+                head = "| sites | run | offered msg/s | delivered/s | per consumer | p99 | verdict |"
+            print(head)
+            print("|---|---|---|---|---|---|" + ("---|" if repeated else ""))
             for r in rungs:
                 verdict = "pass" if r["pass"] else "; ".join(r["flags"]) or "fail"
+                run_col = f" {r.get('rep', 1)} |" if repeated else ""
                 print(
-                    f"| {r['sites']} | {r['offered']:,.0f} | {r['recv_rate']:,.0f} | "
+                    f"| {r['sites']} |{run_col} {r['offered']:,.0f} | {r['recv_rate']:,.0f} | "
                     f"{r['per_consumer']:,.0f} | {r['p99']} | {verdict} |"
                 )
-            passed = [r for r in rungs if r["pass"]]
-            if passed:
-                best = max(passed, key=lambda r: r["sites"])
+            # A site count counts as passing only if EVERY run of it passed. A rung
+            # that passes once and fails on a repeat has not established capacity
+            # at that count — it has established that this rig's variance spans
+            # the budget there, which is the opposite of a result. Measured
+            # 2026-08-31: the same binary at the same shape delivered 210,217
+            # msg/s on one provisioning and saturated at 148,080 on another.
+            by_count: dict[int, list[dict]] = {}
+            for r in rungs:
+                by_count.setdefault(r["sites"], []).append(r)
+            flaky = sorted(c for c, rs in by_count.items() if any(x["pass"] for x in rs) and not all(x["pass"] for x in rs))
+            passed = [rs[0] for c, rs in by_count.items() if all(x["pass"] for x in rs)]
+            if flaky:
+                print(
+                    f"\n> **{', '.join(str(c) for c in flaky)} site(s): PASSED ON ONE RUN AND FAILED ON ANOTHER.** "
+                    "The spread at that count crosses the budget, so no capacity is "
+                    "established there and nothing above it can be claimed."
+                )
+            # A capacity claim above an inconsistent rung is not supportable: the
+            # cluster demonstrably failed at a LOWER count, so a higher one cannot
+            # be its capacity. Suppress the headline rather than print a number
+            # the table above it contradicts.
+            candidate = max(passed, key=lambda r: r["sites"]) if passed else None
+            if candidate and any(c <= candidate["sites"] for c in flaky):
+                print(
+                    f"\n**No capacity is claimed.** {candidate['sites']} site(s) passed, but "
+                    f"{', '.join(str(c) for c in flaky if c <= candidate['sites'])} did not pass "
+                    "consistently below it — a cluster that fails at a lower count has not "
+                    "established a higher one. Repeat the rungs until the spread is inside the "
+                    "budget, or widen the budget to something the spread fits."
+                )
+                candidate = None
+            if candidate:
+                best = candidate
                 print(
                     f"\n**{best['sites']} site(s) per {n}-node cluster** at p99 "
                     f"<= {best['budget_ms']:g}ms — {best['offered']:,.0f} msg/s, "
                     f"{best['sites'] / n:.1f} sites per node."
                 )
-            else:
+            elif not passed:
                 print("\n**No rung passed.** The ladder starts above this cluster's capacity.")
             # A ladder whose TOP rung passed has not found a ceiling; saying so
             # is the difference between a measurement and an advertisement.
             done_rungs = [r for r in rungs if not r.get("incomplete")]
-            if done_rungs and done_rungs[-1]["pass"]:
+            top = max((r["sites"] for r in done_rungs), default=0)
+            if done_rungs and not flaky and all(r["pass"] for r in by_count.get(top, [])):
                 print(
                     f"\n> The top rung passed, so this is a FLOOR, not a ceiling — "
-                    f"{done_rungs[-1]['sites']} sites is where the ladder stopped, not where "
+                    f"{top} sites is where the ladder stopped, not where "
                     f"the cluster did. Extend LANE_E_SITES to find the knee."
                 )
 
