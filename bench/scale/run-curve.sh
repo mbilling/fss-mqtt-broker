@@ -1400,9 +1400,15 @@ if [[ "$LANES" != *E* ]]; then
 	say "[$N nodes] LANES=$LANES — skipping lane E"
 else
 say "[$N nodes] lane E: site ladder ${LANE_E_SITES[*]} x $LANE_E_SITE_RATE msg/s"
-lane_e_rung() { # lane_e_rung <sites>
-	local sites="$1"
+lane_e_rung() { # lane_e_rung <sites> [repeat-index]
+	local sites="$1" rep="${2:-1}"
+	# A REPEATED rung gets its own directory. Running the same site count twice in
+	# one provisioning is how the rig's own noise floor is measured — without a
+	# distinct name the second pass silently overwrote the first and the
+	# repetition measured nothing. `sites-<n>` stays the name of a rung that runs
+	# once, so every existing run directory and every reader of one is unaffected.
 	local rdir="$OUT/laneE/sites-$sites"
+	[ "$rep" -gt 1 ] && rdir="$OUT/laneE/sites-$sites-rep$rep"
 	mkdir -p "$rdir/.batch"
 	# Verified exact by lane_e_shape before any host was touched.
 	local per_pub_rate=$((LANE_E_SITE_RATE / LANE_E_PUBS_PER_SITE))
@@ -1506,8 +1512,20 @@ lane_e_rung() { # lane_e_rung <sites>
 # looking for the site count at which latency leaves its budget, and that answer
 # lives at the BOTTOM of the ladder; reaching it must not depend on the rungs
 # above it having already been paid for.
+# A site count may appear more than once in the ladder: repeating a rung inside
+# ONE provisioning is the only way to separate this rig's own variance from a
+# change in the broker. Measured 2026-08-31: two provisionings of nominally
+# identical hardware carried 210,217 and 148,080 msg/s for the same binary at
+# the same shape — a ~40% spread, wider than most effects this rig is used to
+# detect, and invisible while every rung ran once.
+declare -a e_seen=()
 for e_sites in "${LANE_E_SITES[@]}"; do
-	lane_e_rung "$e_sites"
+	e_rep=1
+	for e_prev in ${e_seen[@]+"${e_seen[@]}"}; do
+		[ "$e_prev" = "$e_sites" ] && e_rep=$((e_rep + 1))
+	done
+	e_seen+=("$e_sites")
+	lane_e_rung "$e_sites" "$e_rep"
 done
 fi # LANES *E*
 
