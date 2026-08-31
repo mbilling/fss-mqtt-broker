@@ -209,7 +209,16 @@ impl SharedSubscriptionTable {
             .flat_map(|(filter, by_group)| {
                 by_group.iter().map(move |(group, members)| SharedGroup {
                     group: group.clone(),
-                    filter: filter.to_string(),
+                    // `String::from(&**filter)`, not `filter.to_string()`: the key
+                    // is a `FilterKey` (`Arc<str>`) since this table became
+                    // filter-first, and `Arc<str>` has no `ToString`
+                    // specialization — `to_string` formats through
+                    // `Formatter::pad` instead of copying the bytes. The sibling
+                    // `SubscriptionTable::filters` documents the same trap for the
+                    // same reason: this feeds the peer gossip (ADR 0015 §2) and
+                    // runs whenever shared membership changes. It was a cheap
+                    // `String` clone before the key changed type.
+                    filter: String::from(&**filter),
                     members: members.clone(),
                 })
             })
