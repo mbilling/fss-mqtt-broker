@@ -711,6 +711,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tinytemplate",
+ "tokio",
  "walkdir",
 ]
 
@@ -2163,6 +2164,7 @@ dependencies = [
  "async-trait",
  "aws-lc-rs",
  "bytes",
+ "criterion",
  "history-check",
  "jsonwebtoken",
  "mqtt-auth",

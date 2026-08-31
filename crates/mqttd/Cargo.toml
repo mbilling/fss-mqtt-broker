@@ -53,6 +53,10 @@ rustix = { version = "1", features = ["process"] }
 fips = ["aws-lc-rs/fips", "mqtt-net/fips", "mqtt-auth/fips", "mqtt-cluster/fips", "mqtt-observability/fips"]
 
 [dev-dependencies]
+# Criterion for the publish-dispatch benchmark (ADR 0077 T4 follow-up). Already
+# in the tree for mqtt-cluster/mqtt-codec/mqtt-bridge benches — no new
+# supply-chain surface.
+criterion = { workspace = true, features = ["async_tokio"] }
 # The independent history checker (issue #231): the out-of-process harness records
 # client-visible events and verifies them in-test through code that shares nothing
 # with the broker; the same JSONL feeds the nightly `history-check` binary.
@@ -78,3 +82,7 @@ tempfile = "3"
 
 [lints]
 workspace = true
+
+[[bench]]
+name = "shared_plan"
+harness = false
