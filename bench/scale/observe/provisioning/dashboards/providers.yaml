@@ -1,0 +1,29 @@
+# Two dashboard providers for the bench stack.
+#
+# The demo dashboards are reused as-is; the rig-only one lives in its own
+# directory because it CANNOT be dropped into demo/grafana/dashboards: the demo
+# stack ships to users, and bench_run_phase is pushed by run.sh, so the panel
+# would sit permanently at "no data" there.
+#
+# It also cannot be bind-mounted as a single file into the demo directory —
+# that directory is mounted read-only, and Docker cannot create a mountpoint
+# inside a read-only mount ("create target of file bind-mount: read-only file
+# system"). Hence a second path and a second provider.
+apiVersion: 1
+
+providers:
+  - name: mqttd
+    type: file
+    disableDeletion: false
+    allowUiUpdates: true
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false
+
+  - name: bench
+    type: file
+    disableDeletion: false
+    allowUiUpdates: true
+    options:
+      path: /var/lib/grafana/dashboards-bench
+      foldersFromFilesStructure: false

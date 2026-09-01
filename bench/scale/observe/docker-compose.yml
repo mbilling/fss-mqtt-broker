@@ -75,8 +75,16 @@ services:
     ports:
       - "3000:3000"
     volumes:
-      - ../../../demo/grafana/provisioning:/etc/grafana/provisioning:ro
+      # Our own providers (demo dashboards + the rig-only one), with the demo's
+      # datasource mounted back in over the empty placeholder so there is one
+      # definition of Prometheus, not two that can drift.
+      - ./provisioning:/etc/grafana/provisioning:ro
+      - ../../../demo/grafana/provisioning/datasources:/etc/grafana/provisioning/datasources:ro
       - ../../../demo/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      # Rig-only dashboard in its OWN directory: it cannot be bind-mounted as a
+      # single file into the demo directory above, because Docker cannot create
+      # a mountpoint inside a read-only mount.
+      - ./dashboards:/var/lib/grafana/dashboards-bench:ro
     depends_on:
       - prometheus
 
