@@ -7688,6 +7688,102 @@ mod tests {
     /// `shared_selection_round_robins_local_and_remote_member`, which sends the
     /// second one across the cluster bus. With locality preference the LOCAL member
     /// takes both and nothing is forwarded — the whole point of the knob.
+    /// Issue #504: can a shared group actually reach "no member choosable"?
+    ///
+    /// `deliver_shared` has an arm for it and it now carries a counter, but
+    /// `choose_shared_index` guards it with two fallbacks — a local persistent
+    /// member, then ANY remote member — so this probes whether normal client
+    /// behaviour can get past both. A clean-start subscriber is not in
+    /// `session_expiry` (so the persistent fallback cannot catch it) and there is
+    /// no peer here (so the remote fallback has nothing to find), which is the
+    /// only shape that could.
+    ///
+    /// Measured answer: it cannot. The detach takes the subscription with it, so
+    /// the group yields no plan at all and there is nothing to discard — which is
+    /// the direct evidence that this arm did NOT cause lane E's shortfall, and
+    /// why the counter beside it is defensive rather than a fix. The test pins
+    /// the behaviour so a future change to the detach path shows up here instead
+    /// of quietly making the arm live.
+    #[tokio::test]
+    async fn a_clean_start_member_leaving_does_not_silently_discard() {
+        let metrics = std::sync::Arc::new(mqtt_observability::metrics::Metrics::new("t"));
+        let (mut hub, tx) = Hub::with_config(
+            NodeId("hub-test".into()),
+            std::sync::Arc::new(MemorySessionStore::new()),
+        );
+        hub.attach_metrics(metrics.clone());
+        tokio::spawn(hub.run());
+
+        // clean_session = true, so no `session_expiry` entry and no persistent
+        // fallback. No peer is connected, so no remote fallback either.
+        let (mut rx, _) = attach(&tx, "a", 1, true).await;
+        subscribe(&tx, "a", "$share/g/t");
+        publish(&tx, "t", b"first");
+        assert!(
+            matches!(recv_packet(&mut rx).await, Some(Packet::Publish(_))),
+            "the member is online, so the first publish must reach it"
+        );
+
+        detach(&tx, "a", 1);
+        publish(&tx, "t", b"second");
+
+        // Flush the hub queue behind the publish: a reply-bearing command cannot
+        // be answered until everything queued ahead of it has been handled.
+        let (done, wait) = tokio::sync::oneshot::channel();
+        tx.send(HubCommand::Subscribe {
+            client: ClientId("probe".into()),
+            filters: vec![("probe/flush".into(), QoS::AtMostOnce)],
+            sub_id: None,
+            no_local_filters: Vec::new(),
+            rap_filters: Vec::new(),
+            retain_handling: Vec::new(),
+            reply: Some(done),
+        })
+        .unwrap();
+        let _ = timeout(Duration::from_millis(500), wait).await;
+
+        let out = metrics.render();
+        let received: u64 = out
+            .lines()
+            .filter(|l| l.starts_with("mqttd_publish_received_total"))
+            .filter_map(|l| l.rsplit(' ').next()?.parse::<u64>().ok())
+            .sum();
+        let delivered: u64 = out
+            .lines()
+            .filter(|l| l.starts_with("mqttd_publish_delivered_total"))
+            .filter_map(|l| l.rsplit(' ').next()?.parse::<u64>().ok())
+            .sum();
+        let dropped: u64 = out
+            .lines()
+            .filter(|l| l.starts_with("mqttd_publish_dropped_total"))
+            .filter_map(|l| l.rsplit(' ').next()?.parse::<u64>().ok())
+            .sum();
+
+        assert_eq!(received, 2, "both publishes were received; got:\n{out}");
+        // THE ANSWER: the departing clean-start member takes its subscription
+        // with it, so the second publish matches no group at all — there is no
+        // plan, and therefore no discard to count. `chosen == None` is NOT
+        // reachable this way, which is why it did not explain lane E's shortfall.
+        //
+        // A publish that matches nothing is ordinary MQTT and correctly counted
+        // as received-and-not-delivered; that is not the silent-discard case.
+        assert_eq!(
+            delivered, 1,
+            "only the first publish had a member to reach; got:\n{out}"
+        );
+        assert_eq!(
+            dropped, 0,
+            "no group matched, so there was nothing to discard; got:\n{out}"
+        );
+        // Pins the behaviour rather than the reasoning: if a future change to the
+        // detach path leaves the member behind, this flips and the new
+        // `no-shared-member` counter is what will show it.
+        assert!(
+            !out.contains("no-shared-member"),
+            "the silent-discard arm fired unexpectedly; got:\n{out}"
+        );
+    }
+
     /// Issue #504: a publish FORWARDED to a peer is counted `received` here and
     /// then accounted by nothing at all until the remote node delivers it.
     ///
