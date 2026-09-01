@@ -1035,16 +1035,51 @@ hidden = true
 [[task]]
 id = "scale-observe"
 group = "Benchmark"
-name = "Live Grafana for a scale-curve run (laptop + reverse tunnel)"
+name = "Live Grafana for a scale-curve run (laptop + forward tunnel)"
 script = "bench/scale/observe.sh"
 about = """
-Opt-in live observation of a bench/scale run (OBSERVE=1, or attach by hand): a
-local docker compose runs Grafana (:3000, the demo mqttd dashboards) and
-Prometheus (:9090, remote-write receiver); a Grafana Alloy container on
-driver-1 scrapes every broker over the PRIVATE network at 2s and remote-writes
-through a reverse SSH tunnel the rig opens. Zero agents and zero load on the
-measured broker hosts — the brokers only ever see /metrics GETs from inside
-the private net, same as the collector's.
+Opt-in live observation of a bench/scale run (ON by default; OBSERVE=0 opts
+out): a local docker compose runs Grafana (:3000), Prometheus (:9090, on a
+named volume so history survives a container recreate), a Pushgateway carrying
+the run-phase heartbeat, and Alloy. Alloy runs on the OPERATOR's machine and
+scrapes a curl-bridge on driver-1 through a FORWARD ssh tunnel (laptop:8096 ->
+driver-1:8096), so it outlives each teardown instead of dying with the cluster.
+
+The bridge cannot move with it: the released broker's health server RSTs real
+Prometheus clients (#364), so only a curl loop inside the private network can
+read /metrics. Zero agents and zero load on the measured broker hosts — the
+brokers only ever see /metrics GETs from inside the private net, same as the
+collector's.
+
+run.sh publishes its phase (provisioning / bootstrapping / running / collecting
+/ teardown / idle) so a blank dashboard says WHICH it is: during provisioning
+and teardown there is legitimately nothing to scrape, and that used to be
+indistinguishable from a dead collector.
 """
 requires = ["docker", "ssh"]
 duration = "runs alongside a bench/scale run"
+
+# Maintenance plumbing, not something to start against a cluster: it only rewrites
+# JSON on disk. Declared `hidden` because the manifest must know about every
+# script (ADR 0056 §3), not because it is unimportant — a stale bench dashboard is
+# how the phase strip would quietly stop matching the demo panels it derives from.
+[[task]]
+id = "scale-observe-dashboards"
+group = "Benchmark"
+hidden = true
+name = "Regenerate the bench copies of the demo Grafana dashboards"
+script = "bench/scale/observe/build-bench-dashboards.py"
+about = """
+Derives bench/scale/observe/dashboards/*-bench.json from
+demo/grafana/dashboards/*.json, adding the run-phase strip across the top.
+
+The demo dashboards ship to users, where `bench_run_phase` — pushed by
+bench/scale's run.sh — would sit permanently at "no data", so the strip cannot
+be added to them directly. These derived copies carry it and get their own
+uid/title so both sets coexist in one Grafana.
+
+Run after changing a demo dashboard; the output is committed, so a diff after
+running means the copies had drifted.
+"""
+requires = ["python3"]
+duration = "instant"

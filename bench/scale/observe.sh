@@ -43,6 +43,13 @@ attach)
 	INVENTORY="${3:?inventory.json}"
 	command -v docker >/dev/null || die "docker is not running locally (needed for the Grafana/Prometheus stack)"
 
+	# The per-run Alloy config is GENERATED into the compose mount below, so it is
+	# untracked; recreate the idle placeholder if this is a fresh checkout, or the
+	# stack would start with no config file at all.
+	if [ ! -f "$OBS_DIR/alloy/config.alloy" ]; then
+		mkdir -p "$OBS_DIR/alloy"
+		cp "$OBS_DIR/alloy/config.alloy.idle" "$OBS_DIR/alloy/config.alloy"
+	fi
 	say "observe: starting local Grafana(:3000) + Prometheus(:9090)"
 	(cd "$OBS_DIR" && docker compose up -d --quiet-pull 2>/dev/null || docker compose up -d)
 
