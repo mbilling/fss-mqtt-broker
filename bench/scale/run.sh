@@ -141,6 +141,14 @@ fi
 TFDIR="$SCALE_DIR/terraform"
 CURRENT_SIZE=""
 
+# Publish the run's current phase to the observe stack (no-op when OBSERVE=0).
+# The dashboard's hardest question is "is it broken, or still provisioning?" — a
+# blank panel answers neither, and that cost three interruptions in one session.
+phase() {
+	[ "${OBSERVE:-1}" = 1 ] || return 0
+	"$SCALE_DIR/observe.sh" phase "$1" "${2:-}" 2>/dev/null || true
+}
+
 teardown() {
 	local rc=$?
 	trap - EXIT INT TERM
@@ -200,6 +208,7 @@ for N in "${SIZES[@]}"; do
 	CURRENT_SIZE="$N"
 	say "════ cluster size $N ════"
 
+	phase provisioning "$N brokers"
 	(cd "$TFDIR" && "$TF" apply -auto-approve -input=false \
 		-var node_count="$N" -var run_label="$STAMP" \
 		${MQTTD_VERSION:+-var mqttd_version="$MQTTD_VERSION"} \
@@ -318,6 +327,7 @@ for N in "${SIZES[@]}"; do
 		;;
 	esac
 
+	phase bootstrapping "$N nodes"
 	"$SCALE_DIR/bootstrap-cluster.sh" "$RUN" "$INVENTORY" durable
 	# Live Grafana on the laptop, fed by an Alloy scraper on driver-1 through a
 	# reverse tunnel (bench/scale/observe.sh). ON by default; OBSERVE=0 opts out.
@@ -341,12 +351,15 @@ for N in "${SIZES[@]}"; do
 	if [ "${OBSERVE:-1}" = 1 ]; then
 		"$SCALE_DIR/observe.sh" attach "$RUN" "$INVENTORY" || warn "observe attach failed — continuing unobserved"
 	fi
+	phase running "$N nodes"
 	"$SCALE_DIR/run-curve.sh" "$RUN" "$INVENTORY"
+	phase collecting "$N nodes"
 	"$SCALE_DIR/collect.sh" "$RUN" "$INVENTORY"
 	if [ "${OBSERVE:-1}" = 1 ]; then
 		"$SCALE_DIR/observe.sh" detach || true
 	fi
 
+	phase teardown "$N nodes"
 	say "destroying size $N before the next point (fresh clusters only)"
 	(cd "$TFDIR" && "$TF" destroy -auto-approve \
 		-var node_count="$N" -var run_label="$STAMP" >"$RUN/tf-destroy-$N.log" 2>&1) || {
@@ -357,5 +370,6 @@ for N in "${SIZES[@]}"; do
 done
 
 CURRENT_SIZE=""
+phase idle
 say "curve complete. Summarize with:"
 say "  python3 bench/scale/summarize-curve.py $RUN/results"
