@@ -299,8 +299,8 @@ pub struct Cluster {
     /// Set `false` only to re-bootstrap deliberately beside a cluster you are abandoning.
     pub refound_guard: bool,
     /// Prefer a **local** `$share` member when one is online
-    /// (`MQTTD_SHARED_PREFER_LOCAL`, presence = on). Default **off**, which is
-    /// plain round-robin over every online member, local or remote.
+    /// (`MQTTD_SHARED_PREFER_LOCAL`, default `true`; set `0`/`false`/`off`/`no`
+    /// for plain round-robin over every online member, local or remote).
     ///
     /// Why it exists: shared selection is round-robin across the whole group, so
     /// a group spread over N nodes picks a REMOTE member roughly (N-1)/N of the
@@ -308,17 +308,32 @@ pub struct Cluster {
     /// workload that is already partitioned by topic — one tenant per group, its
     /// consumers present on every node — that forwarding is pure overhead: a
     /// local member could have served the message with no network hop at all.
-    /// Measured on the ADR 0077 lane E tenancy ladder, where cluster capacity
-    /// grew as `sites = N + 2` rather than proportionally.
+    /// Measured on the ADR 0077 lane E tenancy ladder (issue #508): a 5-node
+    /// cluster carried **12 sites / 360,000 msg/s** at p99 <=1s with round-robin
+    /// and **17 sites / 510,000 msg/s** with this on — **+42%** — and past the
+    /// knee it degrades gracefully (98.9% delivered at 594k) where round-robin
+    /// collapsed to 53%. Per node that is 102,000 msg/s against a single-node
+    /// knee of 90,000-120,000, i.e. capacity that scales with the cluster. The
+    /// ceiling it removes is the cluster bus itself: round-robin over a group
+    /// spread across N nodes picks a REMOTE member roughly (N-1)/N of the time,
+    /// so at N=5 about 80% of publishes crossed the network for no reason.
     ///
-    /// What it costs, and why it is OFF by default: round-robin is what makes a
-    /// shared subscription *fair* — every member takes an equal share regardless
-    /// of where publishers connect. Local-first ties a member's load to the
-    /// publishers co-located with it, so an uneven publisher spread produces an
-    /// uneven consumer load, and a group with no local member on some node still
-    /// falls back to remote (never drops). Turn it on when the deployment places
-    /// group members on every node and throughput matters more than even
-    /// distribution; leave it off otherwise.
+    /// What it costs, and why it is still worth defaulting ON: round-robin is
+    /// what makes a shared subscription *fair* — every member takes an equal
+    /// share regardless of where publishers connect. Local-first keeps that
+    /// fairness WITHIN a node and gives it up ACROSS nodes, so an uneven
+    /// publisher spread produces an uneven consumer load. MQTT 5 does not
+    /// require even distribution among shared subscribers, so this is a
+    /// spec-legal trade, but it IS a behaviour change: a deployment that relies
+    /// on equal shares across nodes should set this off.
+    ///
+    /// It is not always a win. The preference only applies when the publishing
+    /// node hosts an online member of that group; a group with no local member
+    /// falls back to remote exactly as before (it never drops). So a deployment
+    /// with few consumers per group spread thinly over many nodes — say two
+    /// members across ten nodes — finds no local member on most nodes and gains
+    /// nothing, while paying the fairness cost. Structural partition ownership,
+    /// not this knob, is what that case needs.
     pub shared_prefer_local: bool,
 }
 
@@ -336,7 +351,7 @@ impl Default for Cluster {
             // Off: round-robin is the fair behaviour and the one every existing
             // deployment already has. Locality preference trades that fairness for
             // throughput and must be asked for.
-            shared_prefer_local: false,
+            shared_prefer_local: true,
         }
     }
 }
@@ -1211,12 +1226,16 @@ impl Config {
         if get("MQTTD_ALLOW_RELAXED_PUBLISH").is_some() {
             self.durable.allow_relaxed_publish = true;
         }
-        // Presence = on, same rule: this changes which member of a shared group
-        // receives a message, and a behaviour switch should not hinge on parsing
-        // "false".
-        if get("MQTTD_SHARED_PREFER_LOCAL").is_some() {
-            self.cluster.shared_prefer_local = true;
-        }
+        // Default ON since #508, so this must be able to express OFF — a
+        // presence-only flag could no longer turn it off at all. Same falsey set
+        // as MQTTD_REFOUND_GUARD and MQTTD_DURABLE_SESSIONS, the other
+        // default-on switches.
+        on!("MQTTD_SHARED_PREFER_LOCAL", v, {
+            self.cluster.shared_prefer_local = !matches!(
+                v.to_ascii_lowercase().as_str(),
+                "0" | "false" | "off" | "no"
+            );
+        });
         on!("MQTTD_OWNERSHIP_DOMAIN", v, {
             self.durable.ownership_domain = match v.as_str() {
                 "members" => OwnershipDomain::Members,
@@ -2148,7 +2167,7 @@ mod tests {
     fn distinct_value(var: &str) -> &'static str {
         match var {
             // Data-safe defaults are ON, so only a falsey value *changes* them.
-            "MQTTD_DURABLE_SESSIONS" | "MQTTD_REFOUND_GUARD" => "off",
+            "MQTTD_DURABLE_SESSIONS" | "MQTTD_REFOUND_GUARD" | "MQTTD_SHARED_PREFER_LOCAL" => "off",
             // Presence flips these on (default off).
             "MQTTD_ALLOW_ANONYMOUS"
             | "MQTTD_OIDC_ALLOW_HTTP"
