@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use argon2::password_hash::SaltString;
+use argon2::password_hash::phc::Salt;
 use argon2::{Argon2, PasswordHasher};
 use mqtt_auth::password::PasswordAuthenticator;
 use mqtt_auth::{AllowAll, Authenticator, Authorizer};
@@ -39,9 +39,9 @@ const ANSWER_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Produce a real Argon2id PHC hash for `password` (fixed salt → deterministic test).
 fn hash(password: &str) -> String {
-    let salt = SaltString::encode_b64(b"fixed-salt-bytes").expect("valid salt");
+    let salt = Salt::new(b"fixed-salt-bytes").expect("valid salt");
     Argon2::default()
-        .hash_password(password.as_bytes(), &salt)
+        .hash_password_with_salt(password.as_bytes(), &salt)
         .expect("hash")
         .to_string()
 }

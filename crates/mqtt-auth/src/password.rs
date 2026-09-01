@@ -5,7 +5,9 @@
 //! (`$argon2id$v=19$...`); a password file is one `username:phc-hash` per line.
 
 use crate::{AuthError, Authenticator, Credentials, Identity};
-use argon2::password_hash::{Salt, SaltString};
+// `password-hash` 0.6 (via argon2 0.6) moved the PHC string types into the `phc`
+// crate and re-exports it; `Salt`/`SaltString` are no longer at the root.
+use argon2::password_hash::phc::Salt;
 use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
 use aws_lc_rs::rand::{SecureRandom, SystemRandom};
 use mqtt_core::ClientId;
@@ -33,10 +35,19 @@ pub fn hash_password(password: &str) -> Result<String, AuthError> {
     SystemRandom::new()
         .fill(&mut bytes)
         .map_err(|_| AuthError::Backend("system RNG unavailable for the password salt".into()))?;
-    let salt = SaltString::encode_b64(&bytes)
+    // 0.6 dropped `SaltString::encode_b64`; `Salt::new` is the raw-bytes
+    // constructor it kept — the same one `Salt::generate()` calls internally after
+    // filling its own entropy. Ours still comes from ring's `SystemRandom` above,
+    // so the crate keeps one RNG rather than pulling in the `getrandom` feature
+    // for a second.
+    let salt = Salt::new(&bytes)
         .map_err(|e| AuthError::Backend(format!("failed to encode the password salt: {e}")))?;
     Argon2::default()
-        .hash_password(password.as_bytes(), &salt)
+        // 0.6 split the trait method: `hash_password` now takes the password
+        // alone and generates a salt itself, while the explicit-salt form is
+        // `hash_password_with_salt`. The salt stays ours — it comes from ring's
+        // `SystemRandom` above rather than from the crate's own RNG feature.
+        .hash_password_with_salt(password.as_bytes(), &salt)
         .map(|h| h.to_string())
         .map_err(|e| AuthError::Backend(format!("failed to hash password: {e}")))
 }
@@ -117,7 +128,7 @@ impl Authenticator for PasswordAuthenticator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use argon2::password_hash::SaltString;
+    use argon2::password_hash::phc::Salt;
     use argon2::{Argon2, PasswordHasher};
 
     fn client() -> ClientId {
@@ -127,10 +138,47 @@ mod tests {
     /// Produce a real Argon2id PHC hash for `password` with a FIXED salt, so tests
     /// that want a deterministic string get one. Named apart from the crate's
     /// `hash_password` (random salt, the shipping path) so neither shadows the other.
+    /// A PHC string minted by **argon2 0.5.3**, verified against whatever version
+    /// this build links. The one property an argon2 upgrade can break that no
+    /// other test here would notice.
+    ///
+    /// Every other password test mints its hash at runtime, so it would pass just
+    /// as happily if a bump changed the encoding — both sides would move
+    /// together. What operators actually have is a file of hashes written by an
+    /// OLDER build, and that file must keep working across an upgrade or every
+    /// deployment locks itself out on restart. This literal is that file.
+    ///
+    /// Produced with argon2 0.5.3 and salt bytes `0123456789abcdef`:
+    ///   `Argon2::default().hash_password(b"correct horse battery staple", &salt)`
+    ///
+    /// If a future bump fails this, the upgrade needs a migration path — not a
+    /// regenerated constant.
+    #[test]
+    fn a_hash_minted_by_argon2_0_5_still_verifies() {
+        const STORED: &str = "$argon2id$v=19$m=19456,t=2,p=1$\
+MDEyMzQ1Njc4OWFiY2RlZg$gy5SuVm5Z7Vw7keB9se9p87QGcomaseB/S2U1OhTsM0";
+
+        let parsed = PasswordHash::new(STORED).expect("a 0.5-minted PHC string must still parse");
+        assert!(
+            Argon2::default()
+                .verify_password(b"correct horse battery staple", &parsed)
+                .is_ok(),
+            "the stored hash must still verify — an operator's password file is \
+             written by whichever version ran last, not by this one"
+        );
+        assert!(
+            Argon2::default()
+                .verify_password(b"wrong password", &parsed)
+                .is_err(),
+            "and it must still REFUSE the wrong password: a verifier that accepts \
+             everything would also pass the assertion above"
+        );
+    }
+
     fn fixed_salt_hash(password: &[u8]) -> String {
-        let salt = SaltString::encode_b64(b"fixed-salt-bytes").expect("valid salt");
+        let salt = Salt::new(b"fixed-salt-bytes").expect("valid salt");
         Argon2::default()
-            .hash_password(password, &salt)
+            .hash_password_with_salt(password, &salt)
             .expect("hash")
             .to_string()
     }
