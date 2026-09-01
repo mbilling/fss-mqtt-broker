@@ -477,6 +477,15 @@ where
     // and spread-ownership durable appends starved. Two queues, one socket — the
     // pump drains control first; the wire format is untouched.
     let (ctl_tx, mut ctl_rx): (PeerOutbound, _) = mpsc::unbounded_channel();
+    // Issue #504: both lanes are UNBOUNDED, so a frame the hub has queued but the
+    // wire has not taken is reported by nothing — it is not `delivered`, nothing
+    // dropped it, and it is not in `backlog_bytes` (the per-subscriber egress
+    // queue). On the lane E ladder that gap held a fifth of the stream while
+    // every drop counter read zero. An `UnboundedSender` cannot be asked its
+    // depth, only the receiver can, so the PUMP publishes it here and the hub
+    // reads it for the gauge. Relaxed ordering throughout: this is a diagnostic,
+    // and a gauge one loop iteration stale is worth none of a fence.
+    let depth = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     // The pump keeps WEAK sender handles so inbound durable-plane requests can
     // spawn their handling and route the reply straight back onto the link's
     // lanes — never through the hub command queue (issue #358). Weak, so the
@@ -489,6 +498,7 @@ where
             conn_id,
             tx: out_tx,
             ctl: ctl_tx,
+            depth: depth.clone(),
             cert_serial,
             proto,
         })
@@ -507,6 +517,7 @@ where
         &mut out_rx,
         &reply_ctl,
         &reply_bulk,
+        &depth,
         plane.as_ref(),
     )
     .await;
@@ -528,13 +539,27 @@ async fn pump<R, W>(
     out_rx: &mut mpsc::UnboundedReceiver<PeerMessage>,
     reply_ctl: &mpsc::WeakUnboundedSender<PeerMessage>,
     reply_bulk: &mpsc::WeakUnboundedSender<PeerMessage>,
+    depth: &std::sync::atomic::AtomicUsize,
     plane: Option<&DurablePlane>,
 ) -> Result<(), std::io::Error>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
+    // Owned by the link and reused for its lifetime (issue #7): `write_batch`
+    // only ever clears them, so steady state costs no allocation per frame. One
+    // per lane, since both can be mid-batch across a `select!` iteration.
+    let mut out_buf: Vec<u8> = Vec::with_capacity(PEER_WRITE_BUDGET);
+    let mut ctl_buf: Vec<u8> = Vec::with_capacity(8 * 1024);
+    let (out_buf, ctl_buf) = (&mut out_buf, &mut ctl_buf);
     loop {
+        // What the hub's `peer_forwards_in_flight` gauge reads (issue #504).
+        // Updated here rather than at the hub's send sites because only the
+        // RECEIVER can report its own depth.
+        depth.store(
+            ctl_rx.len() + out_rx.len(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
         // `biased` makes the polling order the PRIORITY order: control frames
         // (raft RPCs, replication acks — small by construction) always drain
         // before bulk data. Starving bulk is not a concern — control traffic is
@@ -545,12 +570,13 @@ where
             biased;
             maybe_ctl = ctl_rx.recv() => {
                 match maybe_ctl {
-                    Some(msg) => match write_frame(wh, &msg).await {
-                        Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
-                            warn!(error = %e, "dropping oversized/unencodable peer control frame");
-                        }
-                        other => other?,
-                    },
+                    // The control lane batches too: with durable sessions on,
+                    // ReplicateAck is per-record, so a replication burst is
+                    // exactly the case that was paying one syscall per ack.
+                    // Priority is unaffected — `biased` still drains this lane
+                    // first, and a batch only ever contains frames already
+                    // queued on it.
+                    Some(msg) => write_batch(wh, ctl_buf, &msg, ctl_rx, remote).await?,
                     None => return Ok(()), // taken over or hub gone
                 }
             }
@@ -567,17 +593,7 @@ where
                     // severing every message on the link (and a link-up back-fill that
                     // dies on send would die again on every reconnect). Other I/O
                     // errors still end the link as before.
-                    Some(msg) => {
-                        if let PeerMessage::Replicate { req_id, .. } = &msg {
-                            tracing::debug!(req_id, peer = %remote.0, "replicate: writing to wire");
-                        }
-                        match write_frame(wh, &msg).await {
-                            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
-                                warn!(error = %e, "dropping oversized/unencodable peer frame");
-                            }
-                            other => other?,
-                        }
-                    }
+                    Some(msg) => write_batch(wh, out_buf, &msg, out_rx, remote).await?,
                     None => return Ok(()), // taken over or hub gone
                 }
             }
@@ -859,6 +875,72 @@ fn forward_inbound(
     }
 }
 
+/// How many bytes of frames one `write_all` may carry (issue #7 / ADR 0077).
+///
+/// A budget rather than a frame count, because peer frames span four orders of
+/// magnitude — a `SharedDeliverAcked` is tens of bytes, a `RetainedSnapshot`
+/// chunk is megabytes — so "K frames" would mean wildly different syscall sizes.
+/// 256 KiB is comfortably above a TCP window and far below `MAX_FRAME`, so a
+/// batch is always one write and never an unbounded stall.
+const PEER_WRITE_BUDGET: usize = 256 * 1024;
+
+/// Drain what is already queued and write it as ONE syscall.
+///
+/// The pump previously took one message per loop iteration and paid a
+/// `write_all` + `flush` for each: its own TLS record, its own TCP segment. On
+/// the ADR 0077 lane E ladder ~80% of publishes crossed the bus at N=5, and each
+/// carried an ack back, so that was roughly half a million syscalls a second
+/// across the cluster — visible as `sys` time comparable to user time at a
+/// plateau where no core was saturated.
+///
+/// SELF-ADAPTIVE by construction: `try_recv` returns nothing when the queue is
+/// empty, so an idle link writes a batch of one and behaves exactly as before.
+/// Batching engages only under backlog, which is when it is worth anything.
+///
+/// `buf` is owned by the link and only ever `clear()`ed, so steady state is zero
+/// allocations per frame. It is shrunk back after an oversized batch: `MAX_FRAME`
+/// is 16 MiB and a retained snapshot would otherwise leave that capacity
+/// resident on the link for the rest of its life.
+async fn write_batch<W: AsyncWrite + Unpin>(
+    wh: &mut W,
+    buf: &mut Vec<u8>,
+    first: &PeerMessage,
+    rx: &mut mpsc::UnboundedReceiver<PeerMessage>,
+    remote: &NodeId,
+) -> Result<(), std::io::Error> {
+    buf.clear();
+    let encode_into = |buf: &mut Vec<u8>, msg: &PeerMessage| {
+        if let PeerMessage::Replicate { req_id, .. } = msg {
+            tracing::debug!(req_id, peer = %remote.0, "replicate: writing to wire");
+        }
+        // An oversized or unencodable frame is skipped, not fatal: losing one
+        // best-effort message beats severing every message on the link (and a
+        // link-up back-fill that died on send would die again on every
+        // reconnect). `encode` truncates its partial write, so the frames
+        // already batched here are untouched and still go out.
+        if let Err(e) = peer::encode(msg, buf) {
+            warn!(error = %e, peer = %remote.0, "dropping oversized/unencodable peer frame");
+        }
+    };
+    encode_into(buf, first);
+    while buf.len() < PEER_WRITE_BUDGET {
+        match rx.try_recv() {
+            Ok(msg) => encode_into(buf, &msg),
+            Err(_) => break, // empty, or closed — the closed case is seen by recv() next loop
+        }
+    }
+    if buf.is_empty() {
+        return Ok(()); // every frame in the batch was refused
+    }
+    wh.write_all(buf).await?;
+    wh.flush().await?;
+    // Give back the capacity a huge frame forced us to take.
+    if buf.capacity() > PEER_WRITE_BUDGET * 2 {
+        buf.shrink_to(PEER_WRITE_BUDGET);
+    }
+    Ok(())
+}
+
 async fn write_frame<W: AsyncWrite + Unpin>(
     wh: &mut W,
     msg: &PeerMessage,
@@ -941,6 +1023,7 @@ mod tests {
                 &mut out_rx,
                 &reply_ctl,
                 &reply_bulk,
+                &std::sync::atomic::AtomicUsize::new(0),
                 None,
             )
             .await

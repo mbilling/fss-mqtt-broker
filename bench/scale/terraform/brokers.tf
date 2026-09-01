@@ -31,11 +31,13 @@ resource "hcloud_server" "broker" {
     private_ip     = local.broker_ips[count.index]
     mqttd_version  = var.mqttd_version
     mqttd_sha256   = var.mqttd_sha256
+    mqttd_url      = var.mqttd_url
     # The SHIPPED unit, verbatim — the rig reuses the reference deployment
     # artifact instead of restating it, and a drop-in carries the bench deltas.
     mqttd_service_unit = file("${path.module}/../../../deploy/systemd/mqttd.service")
     mqttd_override     = file("${path.module}/files/mqttd-override.conf")
     sysctl_conf        = file("${path.module}/files/sysctl-broker.conf")
+    nic_spread         = var.broker_nic_spread
   })
 
   depends_on = [hcloud_network_subnet.bench]

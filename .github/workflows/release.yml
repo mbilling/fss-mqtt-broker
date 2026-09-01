@@ -126,20 +126,6 @@ jobs:
           fi
           echo "reproducible:"; paste <(printf 'mqttd\nmqtt-bridge\nmqttd-operator\nmqttd-fips\nmqttui\n') first.sha256
 
-      # AFTER the reproducibility check, deliberately: that step runs `cargo clean`
-      # and rebuilds, so anything produced before it is deleted. Building here also
-      # means the symbols binary is derived from the tree the check just proved
-      # reproducible.
-      #
-      # `-C debuginfo=2` replaces `-C strip=symbols`; nothing else changes. Debug
-      # info does not alter code generation, and build-repro.sh REFUSES to emit
-      # this binary unless its executable section hashes identically to the shipped
-      # one — so it can never describe code that did not ship.
-      - name: Build the symbols twin (for profiling; never deployed)
-        run: scripts/release/build-repro.sh ${{ matrix.target }} mqttd
-        env:
-          BUILD_SYMBOLS: 1
-
       - name: Stage artifact + checksum
         id: stage
         run: |
@@ -149,7 +135,6 @@ jobs:
           UI_NAME="mqttui-${VERSION}-${{ matrix.target }}"
           OPERATOR_NAME="mqttd-operator-${VERSION}-${{ matrix.target }}"
           FIPS_NAME="mqttd-fips-${VERSION}-${{ matrix.target }}"
-          SYMBOLS_NAME="mqttd-symbols-${VERSION}-${{ matrix.target }}"
           mkdir -p dist out
           cp "target/${{ matrix.target }}/release/mqttd" "out/${NAME}"
           cp "target/${{ matrix.target }}/release/mqtt-bridge" "out/${BRIDGE_NAME}"
@@ -166,7 +151,6 @@ jobs:
           # addresses. Its executable section is proven identical to the shipped
           # binary's by build-repro.sh, so a profile taken against it describes the
           # code that ships.
-          cp "target/${{ matrix.target }}/release/mqttd-symbols" "out/${SYMBOLS_NAME}"
           # The container images copy from dist/<binary> (arch-native).
           cp "target/${{ matrix.target }}/release/mqttd" dist/mqttd
           cp "target/${{ matrix.target }}/release/mqtt-bridge" dist/mqtt-bridge
@@ -176,7 +160,6 @@ jobs:
           ( cd out && sha256sum "${UI_NAME}" > "${UI_NAME}.sha256" )
           ( cd out && sha256sum "${OPERATOR_NAME}" > "${OPERATOR_NAME}.sha256" )
           ( cd out && sha256sum "${FIPS_NAME}" > "${FIPS_NAME}.sha256" )
-          ( cd out && sha256sum "${SYMBOLS_NAME}" > "${SYMBOLS_NAME}.sha256" )
           echo "name=${NAME}" >> "$GITHUB_OUTPUT"
           echo "bridge_name=${BRIDGE_NAME}" >> "$GITHUB_OUTPUT"
           echo "ui_name=${UI_NAME}" >> "$GITHUB_OUTPUT"
@@ -209,7 +192,7 @@ jobs:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
       - name: Build and push single-arch image by digest
         id: push
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
@@ -302,7 +285,7 @@ jobs:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
 
       - name: Set version
         id: v

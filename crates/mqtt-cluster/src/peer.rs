@@ -726,7 +726,101 @@ pub enum PeerCodecError {
 ///
 /// # Errors
 /// Returns [`PeerCodecError::Serde`] if serialization fails.
+/// A postcard sink that appends straight into a caller-owned `Vec`.
+///
+/// `serialize_with_flavor` needs a `Flavor` that owns its sink, and `&mut Vec<u8>`
+/// does not implement `Extend<u8>`, so the borrow is wrapped here. This is what
+/// lets [`encode`] serialize a frame body IN PLACE instead of building a throwaway
+/// `Vec` with `to_allocvec` and then copying it in — two costs paid on every frame
+/// the peer bus writes.
+struct AppendTo<'a>(&'a mut Vec<u8>);
+
+impl postcard::ser_flavors::Flavor for AppendTo<'_> {
+    type Output = ();
+
+    #[inline]
+    fn try_push(&mut self, data: u8) -> postcard::Result<()> {
+        self.0.push(data);
+        Ok(())
+    }
+
+    #[inline]
+    fn try_extend(&mut self, data: &[u8]) -> postcard::Result<()> {
+        self.0.extend_from_slice(data);
+        Ok(())
+    }
+
+    #[inline]
+    fn finalize(self) -> postcard::Result<Self::Output> {
+        Ok(())
+    }
+}
+
 pub fn encode(msg: &PeerMessage, out: &mut Vec<u8>) -> Result<(), PeerCodecError> {
+    // The frozen bootstrap frames keep their pinned pre-negotiation bytes
+    // (ADR 0038 T4) and are produced by a hand-rolled codec that returns an owned
+    // Vec, so they take the copying path. They are two frames per link at
+    // handshake, not per message.
+    let frozen_body = match msg {
+        PeerMessage::Hello {
+            node_id,
+            proto_min,
+            proto_max,
+        } => Some(frozen::encode_hello(node_id, *proto_min, *proto_max)),
+        PeerMessage::ProxyHello { identity, via } => Some(frozen::encode_proxy_hello(
+            identity.as_deref(),
+            via.as_deref(),
+        )),
+        _ => None,
+    };
+    if let Some(body) = frozen_body {
+        if body.len() > MAX_FRAME {
+            return Err(PeerCodecError::FrameTooLarge);
+        }
+        let len = u32::try_from(body.len()).map_err(|_| PeerCodecError::FrameTooLarge)?;
+        out.extend_from_slice(&len.to_be_bytes());
+        out.extend_from_slice(&body);
+        return Ok(());
+    }
+
+    // Everything else serializes DIRECTLY into `out`: reserve the 4-byte length,
+    // append the body, then patch the prefix once the length is known.
+    let start = out.len();
+    out.extend_from_slice(&[0u8; 4]);
+    if let Err(e) = postcard::serialize_with_flavor(msg, AppendTo(out)) {
+        out.truncate(start);
+        return Err(PeerCodecError::Serde(e.to_string()));
+    }
+    let body_len = out.len() - start - 4;
+    // Enforce the frame bound on the SENDING side too: an oversized frame would not
+    // fail here but on the receiver, which tears down the link — and a sender that
+    // retries on reconnect (e.g. a link-up back-fill) would then kill the link in a
+    // loop. Failing the send keeps the link (and every other message on it) alive.
+    //
+    // The partial body is truncated away first, so a refused frame leaves `out`
+    // exactly as it was — which is what makes it safe to keep BATCHING into the
+    // same buffer after one frame is rejected.
+    if body_len > MAX_FRAME {
+        out.truncate(start);
+        return Err(PeerCodecError::FrameTooLarge);
+    }
+    let len = u32::try_from(body_len).map_err(|_| {
+        out.truncate(start);
+        PeerCodecError::FrameTooLarge
+    })?;
+    out[start..start + 4].copy_from_slice(&len.to_be_bytes());
+    Ok(())
+}
+
+/// The pre-#7 encoder, kept as a byte-equivalence ORACLE for the tests below.
+///
+/// The in-place rewrite changes how a frame is built, not what it contains, and
+/// this is a WIRE FORMAT — a peer that decoded the old bytes must decode the new
+/// ones identically or a rolling upgrade tears links down. Asserting equality
+/// against the previous implementation is stronger than asserting a round-trip,
+/// because a round-trip would also pass if BOTH sides changed.
+#[cfg(test)]
+fn encode_legacy(msg: &PeerMessage, out: &mut Vec<u8>) -> Result<(), PeerCodecError> {
     let body = match msg {
         // The two frozen bootstrap frames keep their pinned pre-negotiation
         // bytes (ADR 0038 T4) — see [`frozen`].
@@ -797,9 +891,9 @@ pub fn decode(buf: &mut BytesMut) -> Result<Option<PeerMessage>, PeerCodecError>
 #[cfg(test)]
 mod tests {
     use super::{
-        decode, encode, negotiate_proto, ForwardVerdict, PeerCodecError, PeerMessage,
-        ReplicaEntryWire, RetainedWireEntry, SharedGroupWire, SharedMemberWire, WireAppProps,
-        MAX_FRAME, PROTO_MAX, PROTO_MIN,
+        decode, encode, encode_legacy, negotiate_proto, ForwardVerdict, PeerCodecError,
+        PeerMessage, ReplicaEntryWire, RetainedWireEntry, SharedGroupWire, SharedMemberWire,
+        WireAppProps, MAX_FRAME, PROTO_MAX, PROTO_MIN,
     };
     use bytes::BytesMut;
 
@@ -809,6 +903,29 @@ mod tests {
         let mut buf = BytesMut::from(&out[..]);
         assert_eq!(decode(&mut buf).unwrap().as_ref(), Some(msg));
         assert!(buf.is_empty());
+
+        // The in-place encoder must be BYTE-IDENTICAL to the one it replaced.
+        // This is a wire format: a peer running the previous build has to decode
+        // these bytes during a rolling upgrade. Asserting against the old
+        // implementation is stronger than the round-trip above, which would still
+        // pass if encode and decode changed together.
+        //
+        // Every variant `roundtrips_all_variants` constructs is checked here for
+        // free, which is why the assertion lives in this helper rather than in a
+        // test of its own.
+        let mut legacy = Vec::new();
+        encode_legacy(msg, &mut legacy).unwrap();
+        assert_eq!(
+            out, legacy,
+            "in-place encoding changed the bytes for {msg:?}"
+        );
+
+        // Appending into a NON-EMPTY buffer must not disturb what is already there
+        // and must produce the same frame — the property batching depends on.
+        let mut batched = vec![0xAA, 0xBB, 0xCC];
+        encode(msg, &mut batched).unwrap();
+        assert_eq!(&batched[..3], &[0xAA, 0xBB, 0xCC], "prefix was disturbed");
+        assert_eq!(&batched[3..], &out[..], "framing differed mid-buffer");
     }
 
     // One roundtrip per wire variant — the length tracks the enum, not complexity.

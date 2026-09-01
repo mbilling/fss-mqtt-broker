@@ -81,6 +81,22 @@ esac
 # it lands in the run's env dumps.
 LATEST_TAG=$(git -C "$SCALE_DIR" describe --tags --abbrev=0 2>/dev/null | sed 's/^v//' || true)
 [ -n "${MQTTD_VERSION:-}" ] || die "MQTTD_VERSION is not set — name the release under test explicitly (e.g. MQTTD_VERSION=${LATEST_TAG:-1.0.6}); terraform's default is not a choice"
+
+# MQTTD_URL measures a binary that has NOT shipped — a candidate, a pre-release, a
+# branch build. It exists because the rig could otherwise only ever measure
+# published releases, so a performance change had to be released in order to be
+# measured (issue #483). That inverts the normal order: a change should earn its
+# release, not be released to earn evidence.
+#
+# Two things are non-negotiable when it is used.
+#
+# The hash. The release path may fall back to the `.sha256` published beside the
+# artifact; an arbitrary URL has no such companion, so without MQTTD_SHA256 there
+# would be NO verification at all. Refused here rather than in terraform so the
+# error names the fix, and refused before anything is provisioned.
+if [ -n "${MQTTD_URL:-}" ] && [ -z "${MQTTD_SHA256:-}" ]; then
+	die "MQTTD_URL is set but MQTTD_SHA256 is not. An arbitrary URL publishes no .sha256 beside it, so the broker would be installed unverified. Compute it (sha256sum <binary>) and pass MQTTD_SHA256."
+fi
 command -v terraform >/dev/null || command -v tofu >/dev/null || die "terraform (or tofu) not installed"
 command -v jq >/dev/null || die "jq not installed"
 TF=$(command -v terraform || command -v tofu)
@@ -100,8 +116,38 @@ esac
 mkdir -p "$RUN"
 say "run dir: $RUN"
 
+# The second non-negotiable for MQTTD_URL: mark the run, loudly and on disk.
+#
+# The rig's whole claim is that a published number is attributable to a signed,
+# byte-reproducible release. A number measured against an unreleased binary is
+# not, and the difference is invisible in a results directory a week later — so
+# it is written INTO the results rather than left to whoever remembers.
+if [ -n "${MQTTD_URL:-}" ]; then
+	{
+		echo "UNRELEASED"
+		echo "url=$MQTTD_URL"
+		echo "sha256=${MQTTD_SHA256:-}"
+		echo "nominal_version=${MQTTD_VERSION:-}"
+		echo
+		echo "The broker under test was NOT the published release for this version."
+		echo "It was fetched from the URL above and verified against the pinned hash."
+		echo "Numbers from this run are attributable to that binary and to nothing"
+		echo "else — they are not a published-curve point and must not be cited as"
+		echo "one (bench/scale/README.md, ADR 0048)."
+	} >"$RUN/UNRELEASED-BINARY.txt"
+	warn "MQTTD_URL is set — this run measures an UNRELEASED binary; results are stamped $RUN/UNRELEASED-BINARY.txt and are NOT a published-curve point"
+fi
+
 TFDIR="$SCALE_DIR/terraform"
 CURRENT_SIZE=""
+
+# Publish the run's current phase to the observe stack (no-op when OBSERVE=0).
+# The dashboard's hardest question is "is it broken, or still provisioning?" — a
+# blank panel answers neither, and that cost three interruptions in one session.
+phase() {
+	[ "${OBSERVE:-1}" = 1 ] || return 0
+	"$SCALE_DIR/observe.sh" phase "$1" "${2:-}" 2>/dev/null || true
+}
 
 teardown() {
 	local rc=$?
@@ -162,14 +208,18 @@ for N in "${SIZES[@]}"; do
 	CURRENT_SIZE="$N"
 	say "════ cluster size $N ════"
 
+	phase provisioning "$N brokers"
 	(cd "$TFDIR" && "$TF" apply -auto-approve -input=false \
 		-var node_count="$N" -var run_label="$STAMP" \
 		${MQTTD_VERSION:+-var mqttd_version="$MQTTD_VERSION"} \
+		${MQTTD_URL:+-var mqttd_url="$MQTTD_URL"} \
+		${MQTTD_SHA256:+-var mqttd_sha256="$MQTTD_SHA256"} \
 		${BENCH_GIT_REF:+-var bench_git_ref="$BENCH_GIT_REF"} \
 		${SSH_KEY:+-var ssh_public_key_path="${SSH_KEY}.pub"} \
 		${DRIVER_COUNT:+-var driver_count="$DRIVER_COUNT"} \
 		${BROKER_TYPE:+-var broker_server_type="$BROKER_TYPE"} \
 		${DRIVER_TYPE:+-var driver_server_type="$DRIVER_TYPE"} \
+		${BROKER_NIC_SPREAD:+-var broker_nic_spread="$BROKER_NIC_SPREAD"} \
 		>"$RUN/tf-apply-$N.log" 2>&1) || {
 		tail -30 "$RUN/tf-apply-$N.log" >&2
 		die "terraform apply failed for size $N"
@@ -277,6 +327,7 @@ for N in "${SIZES[@]}"; do
 		;;
 	esac
 
+	phase bootstrapping "$N nodes"
 	"$SCALE_DIR/bootstrap-cluster.sh" "$RUN" "$INVENTORY" durable
 	# Live Grafana on the laptop, fed by an Alloy scraper on driver-1 through a
 	# reverse tunnel (bench/scale/observe.sh). ON by default; OBSERVE=0 opts out.
@@ -300,12 +351,15 @@ for N in "${SIZES[@]}"; do
 	if [ "${OBSERVE:-1}" = 1 ]; then
 		"$SCALE_DIR/observe.sh" attach "$RUN" "$INVENTORY" || warn "observe attach failed — continuing unobserved"
 	fi
+	phase running "$N nodes"
 	"$SCALE_DIR/run-curve.sh" "$RUN" "$INVENTORY"
+	phase collecting "$N nodes"
 	"$SCALE_DIR/collect.sh" "$RUN" "$INVENTORY"
 	if [ "${OBSERVE:-1}" = 1 ]; then
 		"$SCALE_DIR/observe.sh" detach || true
 	fi
 
+	phase teardown "$N nodes"
 	say "destroying size $N before the next point (fresh clusters only)"
 	(cd "$TFDIR" && "$TF" destroy -auto-approve \
 		-var node_count="$N" -var run_label="$STAMP" >"$RUN/tf-destroy-$N.log" 2>&1) || {
@@ -316,5 +370,6 @@ for N in "${SIZES[@]}"; do
 done
 
 CURRENT_SIZE=""
+phase idle
 say "curve complete. Summarize with:"
 say "  python3 bench/scale/summarize-curve.py $RUN/results"

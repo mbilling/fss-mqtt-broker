@@ -35,18 +35,20 @@ Every release publishes, for the tagged commit:
   a TUI, and putting one there would grow the runtime attack surface for no one. It is also
   published to crates.io as its own crate (step 8 below), from its own workspace, so
   `ratatui` never enters the broker's dependency graph.
-- **A symbols twin of the broker** — `mqttd-symbols-X.Y.Z-<target>`, built from the
-  same tag with `-C debuginfo=2` where the shipped binary uses `-C strip=symbols`.
-  Nothing else differs, and `scripts/release/build-repro.sh` **refuses to emit it**
-  unless its executable section hashes identically to the shipped binary's, so it
-  can never describe code that did not ship.
+- **No symbols twin, currently.** `scripts/release/build-repro.sh` can build one
+  (`BUILD_SYMBOLS=1`) — the same tag with `-C debuginfo=2` where the shipped
+  binary uses `-C strip=symbols` — and it verifies the twin's executable section
+  hashes identically to the shipped binary's before emitting it. On **both**
+  published targets that check fails, so no twin is produced and the release does
+  not build one.
 
-  It exists for one job: `perf` against a broker under real load reports bare
-  addresses, because the shipped binary is stripped — so the one place the real
-  workload can be profiled was the one place a profile could not be read. Run the
-  symbols twin on a host you are profiling, keep the stripped binary everywhere
-  else. It is **not** a deployment artifact: it is larger, and it is not what the
-  container images or the published checksums describe.
+  The reason is the comparison itself: those two builds differ in *two* ways
+  (strip removed, debug info added), and debug info is not codegen-neutral. A
+  faithful twin has to come from ONE compilation — build with debug info, then
+  strip a copy to ship — which changes how the shipped binary is produced and is
+  therefore a deliberate decision rather than a build-flag tweak. Tracked
+  separately; until then `perf` on a broker host reports bare addresses.
+
 - **Keyless signatures** — every binary, checksum, and the SBOM is
   cosign-signed via GitHub OIDC (no long-lived key); the image is cosign-signed
   by digest. All signatures are recorded in the public Rekor transparency log.

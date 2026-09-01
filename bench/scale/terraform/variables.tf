@@ -14,9 +14,21 @@ variable "driver_count" {
   default     = 2
 
   validation {
-    condition     = var.driver_count >= 1 && var.driver_count <= 6
-    error_message = "driver_count must be between 1 and 6 (six CCX33s offer ~240k msg/s on lane B — the fan-out knee hunt at 7 nodes; the 100-vCPU quota bounds the rest)."
+    condition     = var.driver_count >= 1 && var.driver_count <= 8
+    error_message = "driver_count must be between 1 and 8. Six CCX33s offer ~240k msg/s on lane B (the fan-out knee hunt at 7 nodes); eight is what lane E needs to reach 16 sites, since sites are dealt round-robin and each carries 3 one-vCPU containers, so the busiest driver holds ceil(sites/drivers)*3 <= 8. Eight is also the last count that fits the vCPU quota beside a 5-node cluster (5 x ccx23 + 8 x ccx33 = 84); quota.tf refuses the combinations that do not."
   }
+}
+
+variable "vcpu_quota" {
+  description = "vCPUs the Hetzner project is allowed to run at once. Enforced by quota.tf BEFORE any server is created, because a quota rejection part way through an apply leaves the already-created servers running and billing with no teardown reached."
+  type        = number
+  default     = 100
+}
+
+variable "broker_nic_spread" {
+  description = "Spread network softirq across every broker core (RPS, plus ethtool -L when the NIC supports it). Default false so the published curve keeps the untuned kernel it was measured on. ADR 0077 / issue #505: lane E measured ONE core per broker carrying all softirq and saturating at ~96% while the other three idled at 61-78% and mqttd itself held only ~11-20% of that core — this is the knob that tests whether that single queue is the ceiling."
+  type        = bool
+  default     = false
 }
 
 variable "broker_server_type" {
@@ -59,6 +71,28 @@ variable "mqttd_version" {
   description = "Released broker version (no leading v). The brokers run this signed, byte-reproducible release artifact — the published curve is attributable to it. run.sh ALWAYS passes this (it refuses to run without MQTTD_VERSION); the default exists only so teardown.sh's destroy has a value and must not be relied on."
   type        = string
   default     = "1.0.0"
+}
+
+variable "mqttd_url" {
+  description = <<-EOT
+    Fetch the broker from this URL instead of the published release for
+    `mqttd_version`. Empty (the default) = the release, which is what every
+    published number must come from.
+
+    Set ONLY to measure a binary that has not shipped — a candidate under test,
+    a pre-release, a build from a branch. `mqttd_sha256` becomes MANDATORY when
+    this is set: the release path can fall back to the `.sha256` published
+    beside the artifact, and an arbitrary URL has no such companion, so without
+    a hash there would be no verification at all. run.sh refuses the
+    combination before terraform is invoked.
+
+    A run using this is stamped `UNRELEASED` in its run directory. The rig's
+    whole claim is that a published curve is attributable to a signed release
+    (see `mqttd_version`); a number measured against an unreleased binary is
+    not, and must never be quoted as one.
+  EOT
+  type        = string
+  default     = ""
 }
 
 variable "mqttd_sha256" {

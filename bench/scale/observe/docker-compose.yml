@@ -1,9 +1,15 @@
 # Local live-observation stack for bench/scale runs (opt-in: OBSERVE=1 ./run.sh …).
 #
-# Runs on the OPERATOR's machine, not in the cloud: Prometheus receives
-# remote-written samples from a Grafana Alloy container on driver-1 (which
-# scrapes every broker over the PRIVATE network), arriving through a reverse
-# SSH tunnel the rig opens. Grafana serves the demo stack's mqttd dashboards.
+# Runs entirely on the OPERATOR's machine: Alloy scrapes the curl-bridge on
+# driver-1 through a FORWARD ssh tunnel (laptop:8096 -> driver-1:8096) and
+# remote-writes to Prometheus over the compose network. Grafana serves the demo
+# stack's mqttd dashboards.
+#
+# Alloy is LOCAL rather than on driver-1 so it outlives the cluster: a teardown
+# no longer destroys the agent and its write-ahead log, and the only thing that
+# stops between runs is the tunnel. The curl-bridge cannot move with it — the
+# released broker's health server RSTs real Prometheus clients (#364), so only a
+# curl loop inside the private network can read /metrics.
 #
 # Nothing here touches the measurement path: the brokers only ever see
 # /metrics GETs from inside the private network, same as the collector's.
@@ -18,6 +24,41 @@ services:
       - "127.0.0.1:9090:9090"
     volumes:
       - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      # The TSDB on a NAMED VOLUME, not the container's writable layer. Without
+      # this every `docker compose up` that recreates the container silently
+      # destroys the history — which for this stack is every run ever observed,
+      # and the retention below says two days of it is meant to survive.
+      - prom-data:/prometheus
+
+  # Run-phase heartbeat. The dashboard's hardest question is "is it broken or is
+  # it still provisioning?" — a blank panel answers neither. run.sh pushes its
+  # current phase here at every transition, so the panel reads "provisioning" or
+  # "tearing down" instead of going ambiguously empty. Pushgateway is the right
+  # shape for it: the phases are ephemeral job state, not a scrapable target, and
+  # a push is one line of curl from bash.
+  pushgateway:
+    image: prom/pushgateway:latest
+    ports:
+      - "127.0.0.1:9091:9091"
+
+  # Scrape targets are rewritten per run by observe.sh into ./alloy/config.alloy
+  # (the committed file is an idle placeholder with no targets), after which the
+  # service is restarted to pick them up.
+  alloy:
+    image: grafana/alloy:latest
+    command:
+      - run
+      - /etc/alloy/config.alloy
+    volumes:
+      - ./alloy:/etc/alloy:ro
+    # host.docker.internal is how the container reaches the ssh tunnel the rig
+    # opens on the operator's own loopback; on Linux it needs the explicit
+    # host-gateway mapping that Docker Desktop provides implicitly.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      - prometheus
+      - pushgateway
 
   grafana:
     image: grafana/grafana:latest
@@ -34,7 +75,22 @@ services:
     ports:
       - "3000:3000"
     volumes:
-      - ../../../demo/grafana/provisioning:/etc/grafana/provisioning:ro
+      # Our own providers (demo dashboards + the rig-only one), with the demo's
+      # datasource mounted back in over the empty placeholder so there is one
+      # definition of Prometheus, not two that can drift.
+      - ./provisioning:/etc/grafana/provisioning:ro
+      - ../../../demo/grafana/provisioning/datasources:/etc/grafana/provisioning/datasources:ro
       - ../../../demo/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      # Rig-only dashboard in its OWN directory: it cannot be bind-mounted as a
+      # single file into the demo directory above, because Docker cannot create
+      # a mountpoint inside a read-only mount.
+      - ./dashboards:/var/lib/grafana/dashboards-bench:ro
     depends_on:
       - prometheus
+
+volumes:
+  # Named so it outlives container recreates; `docker compose down -v` is the
+  # deliberate way to discard the history, and nothing else should.
+  prom-data:
+    external: true
+    name: observe_prom-data

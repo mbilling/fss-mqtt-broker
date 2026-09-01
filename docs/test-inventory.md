@@ -899,7 +899,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 356 test(s)
+## `crates/mqttd/src/lib.rs` — 358 test(s)
 
 - `admission::tests::the_global_cap_refuses_at_the_bound_and_recovers`
 - `admission::tests::the_penalty_box_refuses_after_the_threshold`
@@ -1039,6 +1039,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::a_brownout_refusal_is_counted_as_a_quota_rejection_not_a_drop`
 - `hub::tests::a_brownout_refused_will_does_not_overtake_an_inflight_qos1_append`
 - `hub::tests::a_burst_of_acks_coalesces_into_one_watermark_truncate`
+- `hub::tests::a_clean_start_member_leaving_does_not_silently_discard`
 - `hub::tests::a_cleared_retained_topic_is_not_resurrected_after_a_restart`
 - `hub::tests::a_cleared_topic_stays_cleared_for_a_peer_that_missed_the_clear`
 - `hub::tests::a_co_subscribed_filter_releases_the_ack_while_a_moved_durable_copy_is_lost`
@@ -1067,6 +1068,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::a_failed_shared_enqueue_withholds_the_publishers_ack`
 - `hub::tests::a_foreign_topics_retained_publish_routes_the_commit_to_its_owner`
 - `hub::tests::a_forward_for_a_just_released_moved_session_is_not_answered_stored`
+- `hub::tests::a_forwarded_publish_is_counted_received_and_then_accounted_nowhere`
 - `hub::tests::a_full_append_lane_withholds_the_publisher_and_reorders_nothing`
 - `hub::tests::a_group_with_no_committed_lease_is_never_rehomed`
 - `hub::tests::a_handoff_is_retransmitted_until_the_owner_acks`

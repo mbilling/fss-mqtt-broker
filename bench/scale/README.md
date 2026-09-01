@@ -126,9 +126,11 @@ checked *per rung* rather than once, because a shape can be valid at 1 site and
 impossible at 8 — and the binding constraint is usually the harness: sites are
 dealt round-robin to drivers at three one-vCPU containers each, so 16 sites
 needs 12 containers on the busiest of 5 drivers and is **refused**. Reaching 16
-needs `DRIVER_COUNT=8`. That bound belongs to the load generators, not the
-broker, and the shape check prints it rather than letting a driver shortfall
-read as a broker limit.
+needs `DRIVER_COUNT=8`, which `driver_count` permits (it caps at 8, and
+`quota.tf` refuses any broker/driver combination that would exceed the project's
+vCPU quota part way through an apply). That bound belongs to the load
+generators, not the broker, and the shape check prints it rather than letting a
+driver shortfall read as a broker limit.
 
 **Fan-out percentage.** `LANE_B_FANOUT` (0–100) is the share of subscriber containers that receive the *full* publish stream on a plain `bench/#` wildcard; the rest stay in one `$share/g1` group and split one copy per publish. `0` (default) is today's `$share` fan-in (delivered ≈ offered); `100` gives every subscriber every publish (delivered ≈ offered × `LANE_B_SUBS`); `50` makes half the containers wildcard. Egress fan-out is the shape that stresses the per-connection write path (issue #443). Above 0 the rung is the *publish* rate, so keep it modest — `shape.txt` prints the resulting `delivered ≈ offered × N`.
 
@@ -165,6 +167,33 @@ it proves the rig end to end for cents and its numbers are never published.
   builds `crates/mqttd/tests/durable_bench.rs` from a pinned ref for lane A and
   serves the binary to the brokers for the per-host fsync **barrier probes**
   that gate Curve 1.
+
+**Measuring a binary that has not shipped.** By default the brokers run the
+published, signed release for `MQTTD_VERSION` — that is what makes a published
+number attributable. It also meant a performance change had to be *released in
+order to be measured*, which inverts the normal order: a change should earn its
+release, not be released to earn evidence. (#445's +29% was measured v1.0.8 →
+v1.0.9 for exactly this reason.)
+
+`MQTTD_URL` overrides the source:
+
+```sh
+MQTTD_VERSION=1.0.13 \
+MQTTD_URL=https://…/mqttd-candidate-x86_64-unknown-linux-musl \
+MQTTD_SHA256=$(sha256sum mqttd-candidate | cut -d' ' -f1) \
+  ./run.sh standard
+```
+
+Two things are enforced, not advisory:
+
+- **`MQTTD_SHA256` is mandatory.** The release path can fall back to the
+  `.sha256` published beside the artifact; an arbitrary URL has no companion, so
+  without a hash there would be no verification at all. `run.sh` refuses the
+  combination before anything is provisioned.
+- **The run is stamped.** `UNRELEASED-BINARY.txt` is written into the run
+  directory recording the URL, the hash and the nominal version. A results
+  directory read a week later cannot otherwise tell you which binary produced
+  it, and a number from an unreleased build is **not** a published-curve point.
 
 **The bench driver is pinned to the release under test.** Lane A's `durable_bench`
 is built from `BENCH_GIT_REF`, which now defaults to the tag matching
