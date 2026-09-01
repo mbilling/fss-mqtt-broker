@@ -547,6 +547,23 @@ impl Hub {
                 .insert(plan.key.clone(), plan.next_cursor);
             let key = plan.key;
             let Some(chosen) = plan.chosen else {
+                // The last silent discard on this path (issue #504). Every other
+                // way a publish can end is counted; this one was a `debug!` and a
+                // `continue`, so a message that matched a group and reached no
+                // member left no trace at any log level an operator runs.
+                //
+                // `choose_shared_index` makes this narrow on purpose — it falls
+                // back past the online check to a local persistent member, and
+                // then to ANY remote member "so the message is not dropped" — so
+                // reaching here needs a group whose every candidate is local,
+                // offline and absent from `session_expiry`, with no remote member
+                // at all. That is why it did NOT explain lane E's shortfall (the
+                // peer-link queues did). It is counted anyway: a discard that
+                // cannot be seen is worse than a rare one, and if this ever does
+                // fire the reason names itself.
+                if let Some(m) = &self.metrics {
+                    m.publish_dropped("no-shared-member");
+                }
                 debug!(topic = %topic, "shared group has no reachable member");
                 continue;
             };

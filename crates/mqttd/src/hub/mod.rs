@@ -1216,6 +1216,11 @@ pub enum HubCommand {
         /// The peer-bus protocol version this link negotiated (ADR 0038), so the hub
         /// can choose per-link between a proto-6 and a proto-7 frame (0041-T12).
         proto: u32,
+        /// The link pump's live queue depth (issue #504). Both peer lanes are
+        /// unbounded, so this is the only report of frames that have left the hub
+        /// and not yet reached the wire — the population sitting between
+        /// `publish_received` and `publish_delivered`.
+        depth: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     },
     /// A peer node's link went down.
     PeerDisconnected {
@@ -1555,6 +1560,8 @@ struct Misplaced {
 struct Peer {
     conn_id: u64,
     tx: PeerOutbound,
+    /// Frames queued on this link's two lanes, published by its pump (issue #504).
+    depth: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     /// The link's CONTROL lane (issue #358): raft RPCs and replication acks jump
     /// the bulk queue here, so a heartbeat is never behind a retained snapshot.
     /// Same TCP connection — the pump drains this receiver first (`biased`).
@@ -2815,8 +2822,9 @@ impl Hub {
                 ctl,
                 cert_serial,
                 proto,
+                depth,
             } => {
-                self.peer_connected(node.clone(), conn_id, tx, ctl, cert_serial, proto);
+                self.peer_connected(node.clone(), conn_id, tx, ctl, cert_serial, proto, depth);
                 // Offer the new peer our retained topic-set digest (ADR 0014 §3,
                 // 0014-T6): it pulls the (chunked) snapshot only if the sets differ,
                 // so a steady-state link-up or flap costs one small frame, not the
@@ -5491,6 +5499,15 @@ impl Hub {
         }
         // Cluster shape (ADR 0020-T6): placement-eligible members and live peer links.
         m.set_peer_links(self.peers.len());
+        // Issue #504: both lanes are unbounded, so this is the only report of the
+        // frames that have left the hub and not yet reached the wire — the
+        // population that sits between `received` and `delivered`.
+        m.set_peer_forwards_in_flight(
+            self.peers
+                .values()
+                .map(|p| p.depth.load(std::sync::atomic::Ordering::Relaxed))
+                .sum::<usize>(),
+        );
         if let Some(placement) = &self.placement {
             if let Ok(p) = placement.read() {
                 m.set_cluster_members(p.member_count());
@@ -5603,6 +5620,12 @@ impl Hub {
         }
     }
 
+    // A link is identified by more than clippy's seven: its node, connection,
+    // two lanes, negotiated proto, peer certificate and (issue #504) the depth
+    // cell its pump publishes. Grouping them into a struct would move the same
+    // fields behind one name without making any call site clearer, since there
+    // is exactly one caller.
+    #[allow(clippy::too_many_arguments)]
     fn peer_connected(
         &mut self,
         node: NodeId,
@@ -5611,6 +5634,7 @@ impl Hub {
         ctl: PeerOutbound,
         cert_serial: Option<Vec<u8>>,
         proto: u32,
+        depth: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     ) {
         info!(local = %self.node_id.0, peer = %node.0, proto, "peer link established");
         // Operator-visible rolling-upgrade skew (0041-T12, issue #238): a proto-6 link
@@ -5655,6 +5679,7 @@ impl Hub {
                 conn_id,
                 tx,
                 ctl,
+                depth,
                 cert_serial,
                 interest_synced: false,
                 proto,
@@ -6895,6 +6920,9 @@ mod tests {
             ctl: peer_tx.clone(), // tests observe both lanes through one receiver
             tx: peer_tx,
             cert_serial: None,
+            // No pump runs in these in-process tests, so nothing ever writes
+            // this; the gauge it feeds is exercised on a real link.
+            depth: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             // The current ceiling: a test peer speaks what this build speaks, so the
             // proto-7 frames are exercised by default and the proto-6 collapse is opted
             // into explicitly (see `connect_peer_at_proto`).
@@ -6919,6 +6947,9 @@ mod tests {
             ctl: peer_tx.clone(), // tests observe both lanes through one receiver
             tx: peer_tx,
             cert_serial: None,
+            // No pump runs in these in-process tests, so nothing ever writes
+            // this; the gauge it feeds is exercised on a real link.
+            depth: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             proto,
         })
         .unwrap();
@@ -7657,6 +7688,203 @@ mod tests {
     /// `shared_selection_round_robins_local_and_remote_member`, which sends the
     /// second one across the cluster bus. With locality preference the LOCAL member
     /// takes both and nothing is forwarded — the whole point of the knob.
+    /// Issue #504: can a shared group actually reach "no member choosable"?
+    ///
+    /// `deliver_shared` has an arm for it and it now carries a counter, but
+    /// `choose_shared_index` guards it with two fallbacks — a local persistent
+    /// member, then ANY remote member — so this probes whether normal client
+    /// behaviour can get past both. A clean-start subscriber is not in
+    /// `session_expiry` (so the persistent fallback cannot catch it) and there is
+    /// no peer here (so the remote fallback has nothing to find), which is the
+    /// only shape that could.
+    ///
+    /// Measured answer: it cannot. The detach takes the subscription with it, so
+    /// the group yields no plan at all and there is nothing to discard — which is
+    /// the direct evidence that this arm did NOT cause lane E's shortfall, and
+    /// why the counter beside it is defensive rather than a fix. The test pins
+    /// the behaviour so a future change to the detach path shows up here instead
+    /// of quietly making the arm live.
+    #[tokio::test]
+    async fn a_clean_start_member_leaving_does_not_silently_discard() {
+        let metrics = std::sync::Arc::new(mqtt_observability::metrics::Metrics::new("t"));
+        let (mut hub, tx) = Hub::with_config(
+            NodeId("hub-test".into()),
+            std::sync::Arc::new(MemorySessionStore::new()),
+        );
+        hub.attach_metrics(metrics.clone());
+        tokio::spawn(hub.run());
+
+        // clean_session = true, so no `session_expiry` entry and no persistent
+        // fallback. No peer is connected, so no remote fallback either.
+        let (mut rx, _) = attach(&tx, "a", 1, true).await;
+        subscribe(&tx, "a", "$share/g/t");
+        publish(&tx, "t", b"first");
+        assert!(
+            matches!(recv_packet(&mut rx).await, Some(Packet::Publish(_))),
+            "the member is online, so the first publish must reach it"
+        );
+
+        detach(&tx, "a", 1);
+        publish(&tx, "t", b"second");
+
+        // Flush the hub queue behind the publish: a reply-bearing command cannot
+        // be answered until everything queued ahead of it has been handled.
+        let (done, wait) = tokio::sync::oneshot::channel();
+        tx.send(HubCommand::Subscribe {
+            client: ClientId("probe".into()),
+            filters: vec![("probe/flush".into(), QoS::AtMostOnce)],
+            sub_id: None,
+            no_local_filters: Vec::new(),
+            rap_filters: Vec::new(),
+            retain_handling: Vec::new(),
+            reply: Some(done),
+        })
+        .unwrap();
+        let _ = timeout(Duration::from_millis(500), wait).await;
+
+        let out = metrics.render();
+        let received: u64 = out
+            .lines()
+            .filter(|l| l.starts_with("mqttd_publish_received_total"))
+            .filter_map(|l| l.rsplit(' ').next()?.parse::<u64>().ok())
+            .sum();
+        let delivered: u64 = out
+            .lines()
+            .filter(|l| l.starts_with("mqttd_publish_delivered_total"))
+            .filter_map(|l| l.rsplit(' ').next()?.parse::<u64>().ok())
+            .sum();
+        let dropped: u64 = out
+            .lines()
+            .filter(|l| l.starts_with("mqttd_publish_dropped_total"))
+            .filter_map(|l| l.rsplit(' ').next()?.parse::<u64>().ok())
+            .sum();
+
+        assert_eq!(received, 2, "both publishes were received; got:\n{out}");
+        // THE ANSWER: the departing clean-start member takes its subscription
+        // with it, so the second publish matches no group at all — there is no
+        // plan, and therefore no discard to count. `chosen == None` is NOT
+        // reachable this way, which is why it did not explain lane E's shortfall.
+        //
+        // A publish that matches nothing is ordinary MQTT and correctly counted
+        // as received-and-not-delivered; that is not the silent-discard case.
+        assert_eq!(
+            delivered, 1,
+            "only the first publish had a member to reach; got:\n{out}"
+        );
+        assert_eq!(
+            dropped, 0,
+            "no group matched, so there was nothing to discard; got:\n{out}"
+        );
+        // Pins the behaviour rather than the reasoning: if a future change to the
+        // detach path leaves the member behind, this flips and the new
+        // `no-shared-member` counter is what will show it.
+        assert!(
+            !out.contains("no-shared-member"),
+            "the silent-discard arm fired unexpectedly; got:\n{out}"
+        );
+    }
+
+    /// Issue #504: a publish FORWARDED to a peer is counted `received` here and
+    /// then accounted by nothing at all until the remote node delivers it.
+    ///
+    /// This is the in-process reproduction of the ~20% shortfall the ADR 0077
+    /// lane E ladder showed at N=5: `received` held steady at 32-35M per rung
+    /// while `delivered` fell to 79%, with `pending_publishes` at 0, every
+    /// `publish_dropped` reason at 0, and `mqttd_backlog_bytes` at 0. Nothing
+    /// was lost and nothing was dropped — the messages were in the peer links,
+    /// which are `mpsc::unbounded_channel()` (peer.rs:471, :479) and whose depth
+    /// no metric reports. The only peer metric is `mqttd_peer_links`, a count.
+    ///
+    /// It reproduces without a cluster: give the group exactly one member and
+    /// put it on a peer, so every publish is forwarded and none is delivered
+    /// locally. The counters then show the gap directly.
+    ///
+    /// Three other explanations were eliminated before this one. The
+    /// `plan.chosen == None` arm in `deliver_shared` IS a silent discard, but
+    /// `choose_shared_index` falls back to a local persistent member and then to
+    /// any remote member "so the message is not dropped", so it is far too
+    /// narrow. `RemoteSharedDeliver` DOES count on the receiving side (it calls
+    /// `deliver_to_client`, which holds the counters). And the per-subscriber
+    /// egress backlog has its own reasons, which read zero.
+    #[tokio::test]
+    async fn a_forwarded_publish_is_counted_received_and_then_accounted_nowhere() {
+        const FORWARDED: usize = 5;
+
+        let metrics = std::sync::Arc::new(mqtt_observability::metrics::Metrics::new("t"));
+        let (mut hub, tx) = Hub::with_config(
+            NodeId("hub-test".into()),
+            std::sync::Arc::new(MemorySessionStore::new()),
+        );
+        hub.attach_metrics(metrics.clone());
+        tokio::spawn(hub.run());
+
+        let mut peer = connect_peer(&tx, "n", 1);
+        assert!(matches!(
+            recv_peer(&mut peer).await,
+            Some(PeerMessage::Interest { .. })
+        ));
+
+        // The group's ONLY member lives on the peer, so nothing can be served
+        // locally and every publish crosses the bus — the N=5 round-robin case,
+        // where roughly (N-1)/N of publishes did exactly this.
+        remote_shared_interest(&tx, "n", "g", "t", &["rb"]);
+
+        for _ in 0..FORWARDED {
+            publish(&tx, "t", b"m");
+        }
+
+        // Draining the link is what synchronises the test: seeing the frames
+        // proves the hub really forwarded them, and it is the ONLY way to know,
+        // which is the whole complaint.
+        for i in 0..FORWARDED {
+            assert!(
+                matches!(
+                    recv_peer(&mut peer).await,
+                    Some(PeerMessage::SharedDeliver { .. })
+                ),
+                "forward {i} should have reached the link"
+            );
+        }
+
+        let out = metrics.render();
+        assert!(
+            out.contains(&format!(
+                "mqttd_publish_received_total{{qos=\"0\"}} {FORWARDED}"
+            )),
+            "all {FORWARDED} publishes must be counted received; got:\n{out}"
+        );
+
+        // THE GAP. Not delivered (this node never delivered them), not dropped
+        // (nothing dropped them), and no gauge reports them as in flight. A
+        // fifth of a production stream can sit here invisibly.
+        let delivered: u64 = out
+            .lines()
+            .filter(|l| l.starts_with("mqttd_publish_delivered_total"))
+            .filter_map(|l| l.rsplit(' ').next()?.parse::<u64>().ok())
+            .sum();
+        let dropped: u64 = out
+            .lines()
+            .filter(|l| l.starts_with("mqttd_publish_dropped_total"))
+            .filter_map(|l| l.rsplit(' ').next()?.parse::<u64>().ok())
+            .sum();
+        assert_eq!(delivered, 0, "nothing was delivered locally; got:\n{out}");
+        assert_eq!(dropped, 0, "nothing was dropped either; got:\n{out}");
+
+        // The fix: the difference is now attributable. The gauge is present in the
+        // exposition, so an operator seeing received > delivered has somewhere to
+        // look instead of an unexplained fifth of the stream.
+        //
+        // Its VALUE is necessarily 0 here: the depth is published by the link
+        // pump (peer.rs), and these in-process tests drive the hub directly
+        // without one. What this asserts is that the accounting surface exists —
+        // the population it reports is covered on a real link.
+        assert!(
+            out.contains("mqttd_peer_forwards_in_flight"),
+            "the in-flight gauge must be exposed so received - delivered is \
+             attributable; got:\n{out}"
+        );
+    }
+
     #[tokio::test]
     async fn prefer_local_keeps_shared_delivery_off_the_cluster_bus() {
         let tx = start_hub_prefer_local();

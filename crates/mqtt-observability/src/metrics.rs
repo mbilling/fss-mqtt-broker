@@ -145,6 +145,7 @@ struct OtelInstruments {
     backlog_bytes_max: OtelGauge<i64>,
     cluster_members: OtelGauge<i64>,
     peer_links: OtelGauge<i64>,
+    peer_forwards_in_flight: OtelGauge<i64>,
     replication_desired: OtelGauge<i64>,
     replication_min_actual: OtelGauge<i64>,
     replication_write_floor: OtelGauge<i64>,
@@ -218,6 +219,7 @@ impl OtelInstruments {
             backlog_bytes_max: meter.i64_gauge("backlog_bytes_max").build(),
             cluster_members: meter.i64_gauge("cluster_members").build(),
             peer_links: meter.i64_gauge("peer_links").build(),
+            peer_forwards_in_flight: meter.i64_gauge("peer_forwards_in_flight").build(),
             replication_desired: meter.i64_gauge("replication_desired").build(),
             replication_min_actual: meter.i64_gauge("replication_min_actual").build(),
             replication_write_floor: meter.i64_gauge("replication_write_floor").build(),
@@ -313,6 +315,7 @@ pub struct Metrics {
     retained_tombstones: Gauge,
     misplaced_sessions: Gauge,
     peer_links: Gauge,
+    peer_forwards_in_flight: Gauge,
     members_by_state: Family<StateLabel, Gauge>,
     lease_leader: Gauge,
     lease_epoch: Gauge,
@@ -566,6 +569,19 @@ impl Metrics {
             &mut registry,
             "peer_links",
             "Currently connected inter-node peer links",
+        );
+        // Issue #504: the peer links are `mpsc::unbounded_channel()`, so a publish
+        // forwarded to a peer is counted `received` here and then reported by
+        // NOTHING until the remote node delivers it — not delivered, not dropped,
+        // and not in `backlog_bytes` (that is the per-subscriber egress queue).
+        // The lane E ladder showed a fifth of the stream sitting in exactly this
+        // gap while every drop counter read zero. Unbounded also means this is the
+        // memory that grows when a peer stops draining, so the gauge is both the
+        // accounting fix and the leading indicator.
+        let peer_forwards_in_flight = register_gauge(
+            &mut registry,
+            "peer_forwards_in_flight",
+            "Frames queued on inter-node peer links, not yet written to the wire",
         );
         let replication_desired = register_gauge(
             &mut registry,
@@ -987,6 +1003,7 @@ impl Metrics {
             backlog_bytes_max,
             cluster_members,
             peer_links,
+            peer_forwards_in_flight,
             replication_desired,
             replication_min_actual,
             replication_write_floor,
@@ -1252,6 +1269,16 @@ impl Metrics {
     pub fn set_peer_links(&self, n: usize) {
         self.peer_links.set(clamp_gauge(n));
         self.otel.peer_links.record(clamp_gauge(n), &[]);
+    }
+
+    /// Set the number of frames queued on peer links but not yet written
+    /// (issue #504). This is the population that is counted `received` and is not
+    /// yet `delivered`, and without it the difference is unattributable.
+    pub fn set_peer_forwards_in_flight(&self, n: usize) {
+        self.peer_forwards_in_flight.set(clamp_gauge(n));
+        self.otel
+            .peer_forwards_in_flight
+            .record(clamp_gauge(n), &[]);
     }
 
     /// Set cluster-wide replication health (issues #167, #239): the configured
