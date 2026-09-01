@@ -29,14 +29,35 @@
 //! Static analysis said these were the right SHAPE; it cannot say the magnitude,
 //! and on this workload the obvious mechanism has already been wrong twice. Hence
 //! a measurement.
+//!
+//! ## The recipients arm (2026-09-01, main @ 0cf9e84, one box)
+//!
+//! Every arm above publishes to a topic no subscriber matches, so they price a
+//! publish that reaches no one. `publish_dispatch_vs_local_recipients` attaches
+//! R real, online, QoS 0 subscribers of the published topic and drains their
+//! queues on a separate runtime, so the measured thread does only hub work:
+//!
+//! | R | ms / 2000 | ns / publish |
+//! |---|---|---|
+//! | 0 | 1.381 | 691 |
+//! | 1 | 3.563 | 1,781 |
+//! | 6 | 7.064 | 3,532 |
+//! | 60 | 45.861 | 22,930 |
+//!
+//! Fit `t = a + b*R`: a ~ 0.69 us, plus ~1.1 us of once-per-publish work the
+//! moment R > 0 (targets, `Message`, plan), and **b ~ 355 ns per recipient** —
+//! the slopes 1->6 and 6->60 agree within 3%. At lane E's six consumers the
+//! recipient term is 80% of dispatch; at sixty, 97%. The peers arms on the same
+//! run: 659 ns at 0 peers, then a flat ~980 ns at 2/4/9 peers and at 1/6/24
+//! groups per peer — a +320 ns cluster tax that no longer grows with either.
 
 use bytes::Bytes;
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use mqtt_cluster::NodeId;
 use mqtt_codec::QoS;
+use mqtt_codec::{Packet, ProtocolVersion};
 use mqtt_core::{AppProperties, ClientId};
 use mqtt_storage::MemorySessionStore;
-use mqtt_codec::{Packet, ProtocolVersion};
 use mqttd::hub::{Admission, AuthMethod, Hub, Outbound, RemoteSharedGroup};
 use mqttd::HubCommand;
 use std::sync::Arc;
