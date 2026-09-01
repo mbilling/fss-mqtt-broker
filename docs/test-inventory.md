@@ -37,7 +37,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/history-check/src/main.rs` — 0 test(s)
 
 
-## `crates/mqtt-auth/src/lib.rs` — 122 test(s)
+## `crates/mqtt-auth/src/lib.rs` — 123 test(s)
 
 - `acl::tests::a_bad_client_id_does_not_disturb_rules_that_never_use_it`
 - `acl::tests::a_bare_percent_is_literal`
@@ -120,6 +120,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `oidc::tests::staleness_beyond_the_window_fails_closed_then_reinstall_recovers`
 - `oidc::tests::wrong_issuer_audience_and_expiry_are_rejected`
 - `password::tests::a_generated_hash_authenticates_through_a_password_file`
+- `password::tests::a_hash_minted_by_argon2_0_5_still_verifies`
 - `password::tests::correct_password_authenticates_with_username_as_subject`
 - `password::tests::file_parsing_handles_comments_and_blank_lines`
 - `password::tests::file_parsing_rejects_a_duplicate_username`

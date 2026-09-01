@@ -312,7 +312,8 @@ async fn connect_from(
 /// normally throughout, and the penalty decays back to admission.
 #[tokio::test]
 async fn repeated_auth_failures_penalize_the_source_address_then_decay() {
-    use argon2::password_hash::{PasswordHasher, SaltString};
+    use argon2::password_hash::phc::Salt;
+    use argon2::password_hash::PasswordHasher;
     use argon2::Argon2;
     // Per-SOURCE-ADDRESS isolation is the point, and that needs a second loopback
     // address. Linux has all of 127/8 on lo by default; stock macOS has only
@@ -327,9 +328,9 @@ async fn repeated_auth_failures_penalize_the_source_address_then_decay() {
              Linux, which has all of 127/8 on lo, so this must never be taken there."
         );
     }
-    let salt = SaltString::encode_b64(b"penalty-salt-b").unwrap();
+    let salt = Salt::new(b"penalty-salt-b").unwrap();
     let phc = Argon2::default()
-        .hash_password(b"right-pw", &salt)
+        .hash_password_with_salt(b"right-pw", &salt)
         .unwrap()
         .to_string();
     let pw_path = std::env::temp_dir().join(format!("mqttd-pen-{}.pw", std::process::id()));
