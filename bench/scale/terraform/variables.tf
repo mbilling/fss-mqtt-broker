@@ -25,6 +25,12 @@ variable "vcpu_quota" {
   default     = 100
 }
 
+variable "broker_nic_spread" {
+  description = "Spread network softirq across every broker core (RPS, plus ethtool -L when the NIC supports it). Default false so the published curve keeps the untuned kernel it was measured on. ADR 0077 / issue #505: lane E measured ONE core per broker carrying all softirq and saturating at ~96% while the other three idled at 61-78% and mqttd itself held only ~11-20% of that core — this is the knob that tests whether that single queue is the ceiling."
+  type        = bool
+  default     = false
+}
+
 variable "broker_server_type" {
   description = "Dedicated-vCPU type for brokers. Shared-vCPU (cx/cpx) steal ruins p99 honesty; local NVMe is required — a network volume would make the per-host fsync floor a measurement of Ceph, not the disk."
   type        = string
