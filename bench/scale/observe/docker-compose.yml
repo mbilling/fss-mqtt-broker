@@ -1,9 +1,15 @@
 # Local live-observation stack for bench/scale runs (opt-in: OBSERVE=1 ./run.sh …).
 #
-# Runs on the OPERATOR's machine, not in the cloud: Prometheus receives
-# remote-written samples from a Grafana Alloy container on driver-1 (which
-# scrapes every broker over the PRIVATE network), arriving through a reverse
-# SSH tunnel the rig opens. Grafana serves the demo stack's mqttd dashboards.
+# Runs entirely on the OPERATOR's machine: Alloy scrapes the curl-bridge on
+# driver-1 through a FORWARD ssh tunnel (laptop:8096 -> driver-1:8096) and
+# remote-writes to Prometheus over the compose network. Grafana serves the demo
+# stack's mqttd dashboards.
+#
+# Alloy is LOCAL rather than on driver-1 so it outlives the cluster: a teardown
+# no longer destroys the agent and its write-ahead log, and the only thing that
+# stops between runs is the tunnel. The curl-bridge cannot move with it — the
+# released broker's health server RSTs real Prometheus clients (#364), so only a
+# curl loop inside the private network can read /metrics.
 #
 # Nothing here touches the measurement path: the brokers only ever see
 # /metrics GETs from inside the private network, same as the collector's.
@@ -18,6 +24,24 @@ services:
       - "127.0.0.1:9090:9090"
     volumes:
       - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+
+  # Scrape targets are rewritten per run by observe.sh into ./alloy/config.alloy
+  # (the committed file is an idle placeholder with no targets), after which the
+  # service is restarted to pick them up.
+  alloy:
+    image: grafana/alloy:latest
+    command:
+      - run
+      - /etc/alloy/config.alloy
+    volumes:
+      - ./alloy:/etc/alloy:ro
+    # host.docker.internal is how the container reaches the ssh tunnel the rig
+    # opens on the operator's own loopback; on Linux it needs the explicit
+    # host-gateway mapping that Docker Desktop provides implicitly.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      - prometheus
 
   grafana:
     image: grafana/grafana:latest

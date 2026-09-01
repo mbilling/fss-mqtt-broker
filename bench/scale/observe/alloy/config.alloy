@@ -1,0 +1,16 @@
+// Generated per run by observe.sh; this committed copy is the IDLE placeholder
+// that lets the stack start before (and persist after) any run.
+//
+// Alloy runs on the OPERATOR's machine rather than on driver-1, so it survives
+// teardown and its WAL is not thrown away with the cluster. It scrapes the
+// curl-bridge on driver-1 through a FORWARD ssh tunnel (laptop:8096 ->
+// driver-1:8096) — the bridge itself cannot move, because the released broker's
+// health server RSTs real Prometheus clients (#364) and only a curl loop inside
+// the private network can read /metrics.
+//
+// With no run attached there are no scrape targets and Alloy simply idles.
+prometheus.remote_write "local" {
+  endpoint {
+    url = "http://prometheus:9090/api/v1/write"
+  }
+}
