@@ -477,6 +477,15 @@ where
     // and spread-ownership durable appends starved. Two queues, one socket — the
     // pump drains control first; the wire format is untouched.
     let (ctl_tx, mut ctl_rx): (PeerOutbound, _) = mpsc::unbounded_channel();
+    // Issue #504: both lanes are UNBOUNDED, so a frame the hub has queued but the
+    // wire has not taken is reported by nothing — it is not `delivered`, nothing
+    // dropped it, and it is not in `backlog_bytes` (the per-subscriber egress
+    // queue). On the lane E ladder that gap held a fifth of the stream while
+    // every drop counter read zero. An `UnboundedSender` cannot be asked its
+    // depth, only the receiver can, so the PUMP publishes it here and the hub
+    // reads it for the gauge. Relaxed ordering throughout: this is a diagnostic,
+    // and a gauge one loop iteration stale is worth none of a fence.
+    let depth = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     // The pump keeps WEAK sender handles so inbound durable-plane requests can
     // spawn their handling and route the reply straight back onto the link's
     // lanes — never through the hub command queue (issue #358). Weak, so the
@@ -489,6 +498,7 @@ where
             conn_id,
             tx: out_tx,
             ctl: ctl_tx,
+            depth: depth.clone(),
             cert_serial,
             proto,
         })
@@ -507,6 +517,7 @@ where
         &mut out_rx,
         &reply_ctl,
         &reply_bulk,
+        &depth,
         plane.as_ref(),
     )
     .await;
@@ -528,6 +539,7 @@ async fn pump<R, W>(
     out_rx: &mut mpsc::UnboundedReceiver<PeerMessage>,
     reply_ctl: &mpsc::WeakUnboundedSender<PeerMessage>,
     reply_bulk: &mpsc::WeakUnboundedSender<PeerMessage>,
+    depth: &std::sync::atomic::AtomicUsize,
     plane: Option<&DurablePlane>,
 ) -> Result<(), std::io::Error>
 where
@@ -535,6 +547,13 @@ where
     W: AsyncWrite + Unpin,
 {
     loop {
+        // What the hub's `peer_forwards_in_flight` gauge reads (issue #504).
+        // Updated here rather than at the hub's send sites because only the
+        // RECEIVER can report its own depth.
+        depth.store(
+            ctl_rx.len() + out_rx.len(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
         // `biased` makes the polling order the PRIORITY order: control frames
         // (raft RPCs, replication acks — small by construction) always drain
         // before bulk data. Starving bulk is not a concern — control traffic is
@@ -941,6 +960,7 @@ mod tests {
                 &mut out_rx,
                 &reply_ctl,
                 &reply_bulk,
+                &std::sync::atomic::AtomicUsize::new(0),
                 None,
             )
             .await
