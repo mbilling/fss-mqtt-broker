@@ -24,6 +24,22 @@ services:
       - "127.0.0.1:9090:9090"
     volumes:
       - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      # The TSDB on a NAMED VOLUME, not the container's writable layer. Without
+      # this every `docker compose up` that recreates the container silently
+      # destroys the history — which for this stack is every run ever observed,
+      # and the retention below says two days of it is meant to survive.
+      - prom-data:/prometheus
+
+  # Run-phase heartbeat. The dashboard's hardest question is "is it broken or is
+  # it still provisioning?" — a blank panel answers neither. run.sh pushes its
+  # current phase here at every transition, so the panel reads "provisioning" or
+  # "tearing down" instead of going ambiguously empty. Pushgateway is the right
+  # shape for it: the phases are ephemeral job state, not a scrapable target, and
+  # a push is one line of curl from bash.
+  pushgateway:
+    image: prom/pushgateway:latest
+    ports:
+      - "127.0.0.1:9091:9091"
 
   # Scrape targets are rewritten per run by observe.sh into ./alloy/config.alloy
   # (the committed file is an idle placeholder with no targets), after which the
@@ -42,6 +58,7 @@ services:
       - "host.docker.internal:host-gateway"
     depends_on:
       - prometheus
+      - pushgateway
 
   grafana:
     image: grafana/grafana:latest
@@ -62,3 +79,10 @@ services:
       - ../../../demo/grafana/dashboards:/var/lib/grafana/dashboards:ro
     depends_on:
       - prometheus
+
+volumes:
+  # Named so it outlives container recreates; `docker compose down -v` is the
+  # deliberate way to discard the history, and nothing else should.
+  prom-data:
+    external: true
+    name: observe_prom-data

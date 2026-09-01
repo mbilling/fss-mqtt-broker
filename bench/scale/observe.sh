@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# observe.sh attach <run-dir> <inventory.json> | detach | stop
+# observe.sh attach <run-dir> <inventory.json> | detach | stop | phase <name> [detail]
 #
 # Live Grafana for a bench/scale run (opt-in; run.sh calls this with OBSERVE=1):
 #
@@ -28,7 +28,7 @@ set -euo pipefail
 OBS_DIR="$SCALE_DIR/observe"
 TUNNEL_PID_FILE="${TMPDIR:-/tmp}/bench-scale-observe-tunnel.pid"
 
-cmd="${1:?usage: observe.sh attach <run-dir> <inventory.json> | detach | stop}"
+cmd="${1:?usage: observe.sh attach <run-dir> <inventory.json> | detach | stop | phase <name> [detail]}"
 
 stop_tunnel() {
 	if [ -f "$TUNNEL_PID_FILE" ]; then
@@ -88,6 +88,14 @@ attach)
 			echo '}'
 			i=$((i + 1))
 		done < <(jq -r '.brokers[].node_id' "$INVENTORY")
+		echo 'prometheus.scrape "bench_phase" {'
+		echo '  targets         = [{ __address__ = "pushgateway:9091" }]'
+		echo '  scrape_interval = "5s"'
+		# Alloy's default scrape_timeout (10s) is refused against a 5s interval.
+		echo '  scrape_timeout  = "3s"'
+		echo '  honor_labels    = true'
+		echo '  forward_to      = [prometheus.remote_write.local.receiver]'
+		echo '}'
 		echo 'prometheus.remote_write "local" {'
 		echo '  endpoint { url = "http://prometheus:9090/api/v1/write" }'
 		echo '}'
@@ -106,6 +114,19 @@ attach)
 	(cd "$OBS_DIR" && docker compose restart alloy >/dev/null 2>&1) || \
 		warn "observe: could not restart the local Alloy container"
 	say "observe: live at http://localhost:3000 (dashboards: mqttd)"
+	;;
+phase)
+	# Push the run's current phase so a blank dashboard is never ambiguous.
+	# Pushgateway replaces the whole group per push, so the previous phase clears
+	# itself and exactly one is ever set. Best-effort by design: a rig run must
+	# never fail because the operator's Grafana stack is not up.
+	NAME="${2:?usage: observe.sh phase <name> [detail]}"
+	DETAIL="${3:-}"
+	printf '%s\n' \
+		'# TYPE bench_run_phase gauge' \
+		"bench_run_phase{phase=\"$NAME\",detail=\"$DETAIL\"} 1" |
+		curl -sf --max-time 3 --data-binary @- \
+			http://localhost:9091/metrics/job/bench_run >/dev/null 2>&1 || true
 	;;
 detach)
 	stop_tunnel

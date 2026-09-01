@@ -9,6 +9,20 @@
 // the private network can read /metrics.
 //
 // With no run attached there are no scrape targets and Alloy simply idles.
+// The run-phase heartbeat. Present in BOTH this idle placeholder and the
+// per-run config observe.sh generates, so the dashboard can say "provisioning"
+// during the window when there are no brokers to scrape yet.
+prometheus.scrape "bench_phase" {
+  targets         = [{ __address__ = "pushgateway:9091" }]
+  scrape_interval = "5s"
+  // Alloy defaults scrape_timeout to 10s, which is REFUSED against a 5s
+  // interval ("scrape_timeout greater than scrape_interval"), so it must be
+  // set explicitly here rather than left to the default.
+  scrape_timeout  = "3s"
+  honor_labels    = true
+  forward_to      = [prometheus.remote_write.local.receiver]
+}
+
 prometheus.remote_write "local" {
   endpoint {
     url = "http://prometheus:9090/api/v1/write"
