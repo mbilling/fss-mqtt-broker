@@ -42,3 +42,6 @@ bench/scale/terraform/.terraform.lock.hcl
 *.tfstate
 *.tfstate.*
 *.tfvars
+
+# Generated per run by observe.sh into the compose mount (see config.alloy.idle).
+bench/scale/observe/alloy/config.alloy
