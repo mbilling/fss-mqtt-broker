@@ -7787,6 +7787,27 @@ mod tests {
         );
     }
 
+    /// Issue #513: the two copies of the peer-frame limit must not drift.
+    ///
+    /// `mqtt-config` refuses a clustered node whose `max_packet_size` exceeds the
+    /// cluster peer-frame body limit, but it does not depend on `mqtt-cluster` and
+    /// should not gain a peer-bus dependency to read one number — so the value is
+    /// duplicated. `mqttd` is the only crate that sees both, which makes this the
+    /// only place the copy can be checked.
+    ///
+    /// If this fails, the refusal is guarding the wrong number: either packets the
+    /// bus cannot carry are being accepted, or ones it can are being refused.
+    #[test]
+    fn the_config_packet_limit_matches_the_peer_frame_limit() {
+        assert_eq!(
+            mqtt_config::PEER_MAX_FRAME_BYTES,
+            // Widen rather than truncate: usize -> u64 is lossless on every
+            // target, where u64 -> usize is not on a 32-bit one.
+            u64::try_from(mqtt_cluster::peer::MAX_FRAME).expect("a frame limit fits in u64"),
+            "mqtt-config's mirrored peer-frame limit drifted from the real one"
+        );
+    }
+
     /// Issue #480: forwarding is COUNTED, and local delivery is not.
     ///
     /// `received`/`delivered` structurally cannot express what fraction of traffic
