@@ -853,6 +853,15 @@ pub enum ConfigError {
     Invalid(String),
 }
 
+/// The cluster peer-frame body limit, mirrored from `mqtt_cluster::peer::MAX_FRAME`.
+///
+/// Duplicated rather than imported because `mqtt-config` does not depend on
+/// `mqtt-cluster` and should not gain a peer-bus dependency to read one number.
+/// `mqttd` sees both crates and asserts they are equal, so the copy cannot drift
+/// silently — which is the only reason duplicating a protocol constant is
+/// acceptable here.
+pub const PEER_MAX_FRAME_BYTES: u64 = 16 * 1024 * 1024;
+
 impl Config {
     /// Whether durability is **ephemeral** (#166): durable sessions are ON but no
     /// `data_dir` is set, so the consensus-backed replicated state lives only in memory.
@@ -1399,6 +1408,40 @@ impl Config {
         // is 1. The default is the derived `majority` posture (#239), which is always
         // satisfiable. The upper bound (<= replication factor) is checked at assembly,
         // where the factor is known.
+        // Issue #513: a packet the broker will ACCEPT but cannot FORWARD.
+        //
+        // `MQTTD_MAX_PACKET_SIZE` has no upper bound while the peer frame body is
+        // capped at 16 MiB (`mqtt_cluster::peer::MAX_FRAME`, "to bound memory from
+        // a bad peer"). Above that the broker takes the packet, delivers it to
+        // LOCAL subscribers, and the peer link refuses the frame — dropped with a
+        // warning, no ack withheld, no retry at QoS 0. Remote subscribers silently
+        // miss a message local ones received, which reads as a cluster-consistency
+        // bug rather than a size limit.
+        //
+        // Refused rather than warned, and only when this node is CLUSTERED: a
+        // standalone broker with a large packet size is perfectly valid and must
+        // stay so. Both remedies are named, as #240's refusal does.
+        //
+        // The EFFECTIVE ceiling is what matters, not the raw Option: the field is
+        // None unless an operator set it, while the enforced value is
+        // WireLimits::default() (1 MiB). Gating on the Option is the bug main.rs
+        // already documents at its own max_packet_size comparison — a check that
+        // could not fire in the default configuration.
+        let clustered = self.cluster.peer_bind.is_some() || !self.cluster.peers.is_empty();
+        if clustered {
+            if let Some(max) = self.limits.max_packet_size {
+                if max > PEER_MAX_FRAME_BYTES {
+                    return Err(ConfigError::Invalid(format!(
+                        "MQTTD_MAX_PACKET_SIZE is {max} bytes, above the {PEER_MAX_FRAME_BYTES}-byte \
+                         cluster peer-frame limit: packets larger than that are accepted from \
+                         clients but cannot be forwarded to other nodes, so remote subscribers \
+                         would silently miss messages local ones received. Lower it to \
+                         {PEER_MAX_FRAME_BYTES} or below, or run this node standalone (no \
+                         MQTTD_PEER_BIND, no MQTTD_PEERS)."
+                    )));
+                }
+            }
+        }
         if self.durable.min_replicas == MinReplicas::Count(0) {
             return Err(ConfigError::Invalid(
                 "durable.min_replicas must be >= 1 (1 = no floor) or \"majority\"".to_string(),
@@ -2385,6 +2428,57 @@ mod tests {
     /// Issue #240: durable ON (the default) with no data dir is REFUSED at validation —
     /// a warning log is not a substitute for refusing the configuration — and the
     /// refusal names both ways out.
+    /// Issue #513: a clustered node may not accept packets it cannot forward.
+    ///
+    /// The three cases matter separately. STANDALONE with a huge packet size is
+    /// valid and must stay valid — the refusal is about the cluster bus, not about
+    /// large messages. CLUSTERED at or below the frame limit is fine. Only
+    /// clustered ABOVE it is refused, because there the broker would deliver to
+    /// local subscribers and silently drop the peer frame, which presents as a
+    /// consistency bug rather than a limit.
+    #[test]
+    fn a_clustered_node_refuses_a_packet_size_it_cannot_forward() {
+        const OVER: u64 = 32 * 1024 * 1024;
+        const AT_LIMIT: u64 = 16 * 1024 * 1024;
+
+        let mut standalone = Config::default();
+        standalone.node.data_dir = Some("/var/lib/mqttd".into());
+        standalone.limits.max_packet_size = Some(OVER);
+        assert!(
+            standalone.validate().is_ok(),
+            "a standalone broker may accept packets larger than a peer frame"
+        );
+
+        let mut clustered = standalone.clone();
+        clustered.cluster.peer_bind = Some("0.0.0.0:7001".into());
+        let err = clustered
+            .validate()
+            .expect_err("clustered + oversized must be refused");
+        let msg = err.to_string();
+        for named in ["MQTTD_MAX_PACKET_SIZE", "16777216", "standalone"] {
+            assert!(msg.contains(named), "the refusal must name {named}: {msg}");
+        }
+
+        let mut at_limit = clustered.clone();
+        at_limit.limits.max_packet_size = Some(AT_LIMIT);
+        assert!(
+            at_limit.validate().is_ok(),
+            "exactly at the frame limit is forwardable, so it is allowed"
+        );
+
+        // The DEFAULT clustered configuration must pass: `max_packet_size` is None
+        // there and the enforced ceiling is 1 MiB, far under the limit. A check
+        // that refused the default would be the mirror of the bug main.rs
+        // documents — one that could never fire in it.
+        let mut default_clustered = Config::default();
+        default_clustered.node.data_dir = Some("/var/lib/mqttd".into());
+        default_clustered.cluster.peer_bind = Some("0.0.0.0:7001".into());
+        assert!(
+            default_clustered.validate().is_ok(),
+            "the default clustered configuration must not be refused"
+        );
+    }
+
     #[test]
     fn durable_on_without_a_data_dir_refuses_naming_both_remedies() {
         let err = Config::default()
