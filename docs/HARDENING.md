@@ -1,6 +1,6 @@
 # Hardening baseline
 
-**Verified against `v1.0.13` (2026-08-31).** The checkable companion to the
+**Verified against `v1.0.14` (2026-09-02).** The checkable companion to the
 [threat model](THREAT-MODEL.md) (ADR 0066 T2): numbered items, each stating the
 control, the knob that enforces it, the shipped default, and a **verification an
 auditor can run**. The [SECURED-CLUSTER-TUTORIAL](SECURED-CLUSTER-TUTORIAL.md)
