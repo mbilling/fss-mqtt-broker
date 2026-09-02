@@ -34,7 +34,7 @@
 //!
 //! Every arm above publishes to a topic no subscriber matches, so they price a
 //! publish that reaches no one. `publish_dispatch_vs_local_recipients` attaches
-//! R real, online, QoS 0 subscribers of the published topic and drains their
+//! R real, online, `QoS` 0 subscribers of the published topic and drains their
 //! queues on a separate runtime, so the measured thread does only hub work:
 //!
 //! | R | ms / 2000 | ns / publish |
@@ -112,7 +112,7 @@ fn admission(subject: &str) -> Admission {
     }
 }
 
-/// A hub with `subs` attached, online, QoS 0 subscribers of [`TOPIC`] — the
+/// A hub with `subs` attached, online, `QoS` 0 subscribers of [`TOPIC`] — the
 /// dimension the peer arms above hold at ZERO. Their filters miss on purpose, so
 /// those arms price a publish that reaches nobody. Lane E's shape is 6 consumers
 /// per site; the cost of actually handing a message to R recipients — the plan,
@@ -120,7 +120,7 @@ fn admission(subject: &str) -> Admission {
 ///
 /// Each subscriber's outbound queue is drained on `drain`, a SEPARATE multi-thread
 /// runtime, so the measured current-thread runtime runs only the hub and the
-/// publisher loop, exactly as the peer arms do. QoS 0 keeps inflight/pkid/durable
+/// publisher loop, exactly as the peer arms do. `QoS` 0 keeps inflight/pkid/durable
 /// machinery out: this isolates dispatch + hand-off, nothing else.
 fn hub_with_subscribers(
     rt: &tokio::runtime::Runtime,
