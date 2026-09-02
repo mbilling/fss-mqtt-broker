@@ -637,11 +637,12 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 
 - `publish_codec_round_trip_clears_the_floor`
 
-## `crates/mqtt-config/src/lib.rs` — 32 test(s)
+## `crates/mqtt-config/src/lib.rs` — 33 test(s)
 
 - `tests::a_backup_dir_inside_the_data_dir_is_a_config_error`
 - `tests::a_bad_enum_value_is_rejected`
 - `tests::a_bad_numeric_env_value_is_a_located_error`
+- `tests::a_clustered_node_refuses_a_packet_size_it_cannot_forward`
 - `tests::a_crl_without_its_ca_is_rejected`
 - `tests::a_full_toml_round_trips`
 - `tests::a_type_mismatch_is_rejected`
@@ -899,7 +900,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 359 test(s)
+## `crates/mqttd/src/lib.rs` — 360 test(s)
 
 - `admission::tests::the_global_cap_refuses_at_the_bound_and_recovers`
 - `admission::tests::the_penalty_box_refuses_after_the_threshold`
@@ -1160,6 +1161,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::expired_queued_message_is_dropped_at_replay`
 - `hub::tests::flow_control_backlog_is_bounded_drop_oldest`
 - `hub::tests::forwarded_publish_carries_message_expiry`
+- `hub::tests::forwarding_is_counted_and_local_delivery_is_not`
 - `hub::tests::gauge_refresh_snapshots_sessions_and_subscriptions`
 - `hub::tests::growth_releases_moved_sessions_on_the_old_owner`
 - `hub::tests::hub_dispatch_time_is_exported_and_stays_flat_while_a_store_is_parked`
@@ -1211,6 +1213,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::takeover_replaces_connection_and_ignores_stale_detach`
 - `hub::tests::the_apply_path_stays_silent_once_the_window_has_closed`
 - `hub::tests::the_backlog_byte_bound_sheds_acked_entries_and_counts_them`
+- `hub::tests::the_config_packet_limit_matches_the_peer_frame_limit`
 - `hub::tests::the_durability_property_is_inert_without_the_operator_opt_in`
 - `hub::tests::the_fanout_and_snapshot_carry_the_deadline`
 - `hub::tests::the_grant_sweep_removes_revoked_subscriptions_without_disconnecting`

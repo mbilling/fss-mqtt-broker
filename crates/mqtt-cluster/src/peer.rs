@@ -18,7 +18,13 @@ use bytes::{Buf, BytesMut};
 use serde::{Deserialize, Serialize};
 
 /// Maximum size of a single peer frame body, to bound memory from a bad peer.
-const MAX_FRAME: usize = 16 * 1024 * 1024;
+///
+/// Public because it bounds what a CLIENT may be allowed to publish: a packet
+/// larger than this is accepted by the broker and then cannot be forwarded, so
+/// `mqtt-config` refuses that combination on a clustered node (issue #513). The
+/// two constants are checked equal by a test in `mqttd`, which is the only crate
+/// that can see both.
+pub const MAX_FRAME: usize = 16 * 1024 * 1024;
 
 /// The oldest peer-bus protocol version this build can speak (ADR 0038).
 ///
