@@ -29,14 +29,36 @@
 //! Static analysis said these were the right SHAPE; it cannot say the magnitude,
 //! and on this workload the obvious mechanism has already been wrong twice. Hence
 //! a measurement.
+//!
+//! ## The recipients arm (2026-09-01, main @ 0cf9e84, one box)
+//!
+//! Every arm above publishes to a topic no subscriber matches, so they price a
+//! publish that reaches no one. `publish_dispatch_vs_local_recipients` attaches
+//! R real, online, `QoS` 0 subscribers of the published topic and drains their
+//! queues on a separate runtime, so the measured thread does only hub work:
+//!
+//! | R | ms / 2000 | ns / publish |
+//! |---|---|---|
+//! | 0 | 1.381 | 691 |
+//! | 1 | 3.563 | 1,781 |
+//! | 6 | 7.064 | 3,532 |
+//! | 60 | 45.861 | 22,930 |
+//!
+//! Fit `t = a + b*R`: a ~ 0.69 us, plus ~1.1 us of once-per-publish work the
+//! moment R > 0 (targets, `Message`, plan), and **b ~ 355 ns per recipient** —
+//! the slopes 1->6 and 6->60 agree within 3%. At lane E's six consumers the
+//! recipient term is 80% of dispatch; at sixty, 97%. The peers arms on the same
+//! run: 659 ns at 0 peers, then a flat ~980 ns at 2/4/9 peers and at 1/6/24
+//! groups per peer — a +320 ns cluster tax that no longer grows with either.
 
 use bytes::Bytes;
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use mqtt_cluster::NodeId;
 use mqtt_codec::QoS;
+use mqtt_codec::{Packet, ProtocolVersion};
 use mqtt_core::{AppProperties, ClientId};
 use mqtt_storage::MemorySessionStore;
-use mqttd::hub::{Hub, RemoteSharedGroup};
+use mqttd::hub::{Admission, AuthMethod, Hub, Outbound, RemoteSharedGroup};
 use mqttd::HubCommand;
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
@@ -74,6 +96,75 @@ fn hub_with_peers(
     tx
 }
 
+/// The topic every arm publishes to. Subscribers below match it EXACTLY, so each
+/// one is a real recipient: the hub must plan it, enqueue it, and wake its conn.
+const TOPIC: &str = "site/0/turbine/7/rpm";
+
+fn admission(subject: &str) -> Admission {
+    Admission {
+        identity: mqtt_auth::Identity {
+            subject: subject.to_string(),
+            groups: vec![],
+        },
+        method: AuthMethod::Password,
+        cert_serial: None,
+        protocol: ProtocolVersion::V311,
+    }
+}
+
+/// A hub with `subs` attached, online, `QoS` 0 subscribers of [`TOPIC`] — the
+/// dimension the peer arms above hold at ZERO. Their filters miss on purpose, so
+/// those arms price a publish that reaches nobody. Lane E's shape is 6 consumers
+/// per site; the cost of actually handing a message to R recipients — the plan,
+/// the per-recipient enqueue, the per-recipient wake — was never on the bench.
+///
+/// Each subscriber's outbound queue is drained on `drain`, a SEPARATE multi-thread
+/// runtime, so the measured current-thread runtime runs only the hub and the
+/// publisher loop, exactly as the peer arms do. `QoS` 0 keeps inflight/pkid/durable
+/// machinery out: this isolates dispatch + hand-off, nothing else.
+fn hub_with_subscribers(
+    rt: &tokio::runtime::Runtime,
+    drain: &tokio::runtime::Runtime,
+    subs: usize,
+) -> mpsc::UnboundedSender<HubCommand> {
+    let (hub, tx) = Hub::with_config(NodeId("bench".into()), Arc::new(MemorySessionStore::new()));
+    rt.spawn(hub.run());
+    rt.block_on(async {
+        for i in 0..subs {
+            let client = ClientId(Arc::from(format!("sub{i}").as_str()));
+            let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Packet>();
+            drain.spawn(async move { while out_rx.recv().await.is_some() {} });
+            let (reply_tx, reply_rx) = oneshot::channel();
+            tx.send(HubCommand::Attach {
+                client: client.clone(),
+                admission: admission(&format!("sub{i}")),
+                conn_id: i as u64 + 1,
+                clean_start: true,
+                session_expiry: 0,
+                receive_maximum: u16::MAX,
+                will: None,
+                outbound: Outbound::new(out_tx).0,
+                reply: reply_tx,
+            })
+            .expect("hub alive");
+            let _ = reply_rx.await;
+            let (reply_tx, reply_rx) = oneshot::channel();
+            tx.send(HubCommand::Subscribe {
+                client,
+                filters: vec![(TOPIC.to_string(), QoS::AtMostOnce)],
+                no_local_filters: vec![],
+                sub_id: None,
+                rap_filters: vec![],
+                retain_handling: vec![0],
+                reply: Some(reply_tx),
+            })
+            .expect("hub alive");
+            let _ = reply_rx.await;
+        }
+    });
+    tx
+}
+
 /// Publish `count` messages and wait only for the LAST to complete. The hub
 /// processes its queue in order, so the final completion means every earlier one
 /// was dispatched too — this measures dispatch throughput rather than per-message
@@ -84,7 +175,7 @@ async fn publish_burst(tx: &mpsc::UnboundedSender<HubCommand>, count: usize) {
         let last = i + 1 == count;
         let (done_tx, done_rx) = oneshot::channel();
         let _ = tx.send(HubCommand::Publish {
-            topic: "site/0/turbine/7/rpm".to_string(),
+            topic: TOPIC.to_string(),
             payload: payload.clone(),
             qos: QoS::AtMostOnce,
             retain: false,
@@ -135,6 +226,24 @@ fn bench(c: &mut Criterion) {
     for groups in [1usize, 6, 24] {
         let tx = hub_with_peers(&rt, 4, groups);
         g.bench_with_input(BenchmarkId::from_parameter(groups), &groups, |b, _| {
+            b.to_async(&rt).iter(|| publish_burst(&tx, BURST));
+        });
+    }
+    g.finish();
+
+    // The dimension every arm above holds at zero. 0 is the same publish-to-nobody
+    // baseline; 1 prices the first real hand-off; 6 is lane E's consumers per site;
+    // 60 is the fan-out at which per-recipient cost, not matching, owns the hub.
+    let drain = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("drain runtime");
+    let mut g = c.benchmark_group("publish_dispatch_vs_local_recipients");
+    g.throughput(Throughput::Elements(BURST as u64));
+    for subs in [0usize, 1, 6, 60] {
+        let tx = hub_with_subscribers(&rt, &drain, subs);
+        g.bench_with_input(BenchmarkId::from_parameter(subs), &subs, |b, _| {
             b.to_async(&rt).iter(|| publish_burst(&tx, BURST));
         });
     }
