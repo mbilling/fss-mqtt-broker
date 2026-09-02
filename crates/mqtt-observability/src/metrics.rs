@@ -134,6 +134,7 @@ struct OtelInstruments {
     publish_received: OtelCounter<u64>,
     publish_delivered: OtelCounter<u64>,
     publish_dropped: OtelCounter<u64>,
+    publish_forwarded: OtelCounter<u64>,
     deliver_latency: OtelHistogram<f64>,
     hub_dispatch: OtelHistogram<f64>,
     append_lane_jobs: OtelGauge<i64>,
@@ -208,6 +209,7 @@ impl OtelInstruments {
             publish_received: meter.u64_counter("publish_received").build(),
             publish_delivered: meter.u64_counter("publish_delivered").build(),
             publish_dropped: meter.u64_counter("publish_dropped").build(),
+            publish_forwarded: meter.u64_counter("publish_forwarded").build(),
             deliver_latency: meter.f64_histogram("deliver_latency_seconds").build(),
             hub_dispatch: meter.f64_histogram("hub_dispatch_seconds").build(),
             append_lane_jobs: meter.i64_gauge("append_lane_jobs").build(),
@@ -299,6 +301,7 @@ pub struct Metrics {
     publish_received_total: Family<QosLabel, Counter>,
     publish_delivered_total: Family<QosLabel, Counter>,
     publish_dropped_total: Family<ReasonLabel, Counter>,
+    publish_forwarded_total: Family<ReasonLabel, Counter>,
     deliver_latency_seconds: Histogram,
     hub_dispatch_seconds: Family<CommandLabel, Histogram>,
     append_lane_jobs: Gauge,
@@ -501,6 +504,14 @@ impl Metrics {
             &mut registry,
             "publish_dropped",
             "Messages dropped, by reason (no-subscriber, queue-overflow, backlog-overflow, outbound-full, outbound-id-write-failed, pending-cap, append-backlog-full, brownout, too-large, retained-replay-client-offline, retained-replay-read-failed)",
+        );
+
+        // Issue #480: the fraction of publishes that cross a node boundary, which
+        // `received`/`delivered` structurally cannot express.
+        let publish_forwarded_total = register_family(
+            &mut registry,
+            "publish_forwarded",
+            "Publishes handed to a peer link rather than delivered locally, by reason (shared-remote, subscriber-remote)",
         );
 
         let deliver_latency_seconds = register_latency_histogram(
@@ -992,6 +1003,7 @@ impl Metrics {
             publish_received_total,
             publish_delivered_total,
             publish_dropped_total,
+            publish_forwarded_total,
             deliver_latency_seconds,
             hub_dispatch_seconds,
             append_lane_jobs,
@@ -1162,6 +1174,32 @@ impl Metrics {
     /// | `append-backlog-full` | a session's durable-append lane hit `LANE_QUEUE_CAP` (issue #242): the NEWEST job was rejected at submit (reject-newest keeps the lane FIFO). An answerable publish is WITHHELD (fail closed, the publisher retries); an unanswerable one is a genuine drop. Watch `append_lane_jobs` for the pre-drop warning |
     /// | `brownout` | a durable copy lost above the watermark that NOBODY was told about: a `QoS` 0 offline enqueue (nothing was owed), or an UNGATED publish with no publisher to answer — a Will, a retained-window back-fill — whose live delivery still happens. A `QoS` >= 1 refusal a publisher IS told about is `quota_rejections_total{reason="brownout-publish"}` instead, because it was answered rather than lost (issue #238) |
     /// | `too-large` | the encoded packet exceeded that subscriber's Maximum Packet Size |
+    /// A publish handed to a PEER LINK rather than delivered locally (issue #480).
+    ///
+    /// `received` and `delivered` cannot answer "what fraction crossed a node
+    /// boundary": summed cluster-wide they are equal either way, because a message
+    /// received at A and delivered by B increments A's received and B's delivered
+    /// exactly as a local message would. Per broker they are near-equal under any
+    /// even client spread, so the ratio says nothing either.
+    ///
+    /// That gap cost real time. ADR 0077's forwarding ceiling had to be established
+    /// by INFERENCE — CPU-per-message deltas across cluster sizes, a harness
+    /// experiment pinning every site to one broker, and finally a config flag —
+    /// because three fully-collected runs on disk could not say how much traffic
+    /// crossed the bus. `forwarded / received` per broker answers it from any run
+    /// directory, and gives a locality change an immediate before/after instead of
+    /// a topology experiment.
+    pub fn publish_forwarded(&self, reason: &str) {
+        self.publish_forwarded_total
+            .get_or_create(&ReasonLabel {
+                reason: reason.to_string(),
+            })
+            .inc();
+        self.otel
+            .publish_forwarded
+            .add(1, &[KeyValue::new("reason", reason.to_string())]);
+    }
+
     pub fn publish_dropped(&self, reason: &str) {
         self.publish_dropped_total
             .get_or_create(&ReasonLabel {
