@@ -899,7 +899,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 358 test(s)
+## `crates/mqttd/src/lib.rs` — 359 test(s)
 
 - `admission::tests::the_global_cap_refuses_at_the_bound_and_recovers`
 - `admission::tests::the_penalty_box_refuses_after_the_threshold`
@@ -1228,6 +1228,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::the_subscribe_replay_seeds_the_windows_ledger`
 - `hub::tests::the_windowed_apply_defers_to_a_live_copy_already_delivered`
 - `hub::tests::transient_lease_does_not_downgrade_a_persistent_attach`
+- `hub::tests::two_groups_on_one_filter_rotate_independently`
 - `hub::tests::two_publishes_to_one_offline_subscriber_append_in_arrival_order`
 - `hub::tests::without_no_local_a_publisher_receives_its_own_delivery`
 - `memory_watch::tests::a_similar_looking_line_is_not_mistaken_for_vm_rss`
