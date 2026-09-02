@@ -900,7 +900,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 359 test(s)
+## `crates/mqttd/src/lib.rs` — 360 test(s)
 
 - `admission::tests::the_global_cap_refuses_at_the_bound_and_recovers`
 - `admission::tests::the_penalty_box_refuses_after_the_threshold`
@@ -1161,6 +1161,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::expired_queued_message_is_dropped_at_replay`
 - `hub::tests::flow_control_backlog_is_bounded_drop_oldest`
 - `hub::tests::forwarded_publish_carries_message_expiry`
+- `hub::tests::forwarding_is_counted_and_local_delivery_is_not`
 - `hub::tests::gauge_refresh_snapshots_sessions_and_subscriptions`
 - `hub::tests::growth_releases_moved_sessions_on_the_old_owner`
 - `hub::tests::hub_dispatch_time_is_exported_and_stays_flat_while_a_store_is_parked`

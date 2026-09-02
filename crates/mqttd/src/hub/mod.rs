@@ -5879,6 +5879,9 @@ impl Hub {
         app: &AppProperties,
     ) {
         if let Some(peer) = self.peers.get(node) {
+            if let Some(m) = &self.metrics {
+                m.publish_forwarded("shared-remote");
+            }
             let _ = peer.tx.send(PeerMessage::SharedDeliver {
                 client: client.0.to_string(),
                 topic: topic.to_string(),
@@ -7802,6 +7805,65 @@ mod tests {
             // target, where u64 -> usize is not on a 32-bit one.
             u64::try_from(mqtt_cluster::peer::MAX_FRAME).expect("a frame limit fits in u64"),
             "mqtt-config's mirrored peer-frame limit drifted from the real one"
+        );
+    }
+
+    /// Issue #480: forwarding is COUNTED, and local delivery is not.
+    ///
+    /// `received`/`delivered` structurally cannot express what fraction of traffic
+    /// crosses a node boundary — cluster-wide they are equal either way, since a
+    /// message received at A and delivered by B moves A's received and B's
+    /// delivered exactly as a local message moves both on one node. ADR 0077 had
+    /// to establish the forwarding ceiling by inference for that reason.
+    ///
+    /// Both halves are asserted because a counter that fires on every publish
+    /// would be worse than none: `forwarded / received` is the ratio operators
+    /// will read, and it is meaningless if local deliveries inflate the numerator.
+    #[tokio::test]
+    async fn forwarding_is_counted_and_local_delivery_is_not() {
+        let metrics = std::sync::Arc::new(mqtt_observability::metrics::Metrics::new("t"));
+        let (mut hub, tx) = Hub::with_config(
+            NodeId("hub-test".into()),
+            std::sync::Arc::new(MemorySessionStore::new()),
+        );
+        hub.attach_metrics(metrics.clone());
+        tokio::spawn(hub.run());
+
+        let mut peer = connect_peer(&tx, "n", 1);
+        assert!(matches!(
+            recv_peer(&mut peer).await,
+            Some(PeerMessage::Interest { .. })
+        ));
+
+        // A LOCAL shared member: this publish must not be counted as forwarded.
+        let (mut local, _) = attach(&tx, "a", 1, true).await;
+        subscribe(&tx, "a", "$share/g/local");
+        publish(&tx, "local", b"m");
+        assert!(
+            matches!(recv_packet(&mut local).await, Some(Packet::Publish(_))),
+            "the local member must receive it"
+        );
+
+        // A group whose ONLY member is on the peer: this one crosses the bus.
+        remote_shared_interest(&tx, "n", "g2", "remote", &["rb"]);
+        publish(&tx, "remote", b"m");
+        // `next_shared_deliver`, not `recv_peer`: subscribing the local member
+        // above makes the hub send this peer an interest update, which arrives
+        // first and is not what this assertion is about.
+        match next_shared_deliver(&mut peer).await {
+            PeerMessage::SharedDeliver { client, .. } => assert_eq!(client, "rb"),
+            other => panic!("expected SharedDeliver, got {other:?}"),
+        }
+
+        let out = metrics.render();
+        assert!(
+            out.contains("mqttd_publish_forwarded_total{reason=\"shared-remote\"} 1"),
+            "exactly the cross-node publish is counted; got:\n{out}"
+        );
+        // Two publishes were received, one was forwarded — the ratio the issue asks for.
+        assert!(
+            out.contains("mqttd_publish_received_total{qos=\"0\"} 2"),
+            "both publishes were received; got:\n{out}"
         );
     }
 

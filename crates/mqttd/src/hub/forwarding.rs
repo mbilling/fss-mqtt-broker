@@ -315,6 +315,9 @@ impl Hub {
             if !(retain_broadcasts || interested) {
                 continue;
             }
+            if let Some(m) = &self.metrics {
+                m.publish_forwarded("subscriber-remote");
+            }
             let _ = peer.tx.send(PeerMessage::Publish {
                 topic: topic.to_string(),
                 payload: payload.to_vec(),
@@ -376,6 +379,17 @@ impl Hub {
             return;
         };
         let frame = forward_frame(p, seq, &obligation);
+        // Issue #480. Counted where the obligation is RECORDED rather than where
+        // the frame is written, so a forward to a link that is momentarily down
+        // still counts: the sweep will send it when the link returns, and it
+        // crossed a node boundary either way. Counting at the write would
+        // undercount exactly during the link flaps worth investigating.
+        if let Some(m) = &self.metrics {
+            m.publish_forwarded(match obligation.kind {
+                ForwardKind::Shared { .. } => "shared-remote",
+                ForwardKind::Ordinary => "subscriber-remote",
+            });
+        }
         p.awaiting.insert(seq, obligation);
         self.forward_index.insert(seq, id);
         debug!(publish = id, seq, target = %node.0, "forward obligation recorded");
