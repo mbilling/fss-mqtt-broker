@@ -1806,7 +1806,9 @@ pub struct Hub {
     /// arbitrary.
     remote_by_filter: HashMap<FilterKey, Vec<(NodeId, usize)>>,
     /// Per-group round-robin cursor for cluster-wide shared selection (ADR 0015).
-    shared_cursor: HashMap<SharedKey, usize>,
+    /// Round-robin cursors, keyed by `shared_cursor_hash(group, filter)` with the
+    /// owned key kept beside the value for collision checking (issue #490).
+    shared_cursor: HashMap<u64, (SharedKey, usize)>,
     /// Per-session outbound `QoS` > 0 in-flight state.
     inflight: HashMap<ClientId, Inflight>,
     /// Durable session/queue storage. `Arc` so connections can share it (e.g. for
@@ -7784,6 +7786,70 @@ mod tests {
         assert!(
             !out.contains("no-shared-member"),
             "the silent-discard arm fired unexpectedly; got:\n{out}"
+        );
+    }
+
+    /// Issue #490: two groups on the SAME filter keep independent rotations.
+    ///
+    /// The cursor is now keyed by a hash of `(group, filter)` rather than by the
+    /// pair itself, so this is the property that hashing could silently break —
+    /// and it would break quietly, as a fairness skew rather than a failure. A
+    /// hash that ignored the group, or concatenated without a separator, would
+    /// merge these two groups onto one cursor and neither the delivery counts nor
+    /// any existing test would notice.
+    ///
+    /// Each group must receive every publish (they are independent subscriptions),
+    /// and each must rotate over its own members on its own schedule.
+    #[tokio::test]
+    async fn two_groups_on_one_filter_rotate_independently() {
+        async fn count(rx: &mut mpsc::UnboundedReceiver<Packet>) -> usize {
+            let mut n = 0;
+            while let Ok(Some(Packet::Publish(_))) =
+                timeout(Duration::from_millis(200), rx.recv()).await
+            {
+                n += 1;
+            }
+            n
+        }
+
+        let tx = start_hub();
+        let (mut a1, _) = attach(&tx, "a1", 1, true).await;
+        let (mut a2, _) = attach(&tx, "a2", 2, true).await;
+        let (mut b1, _) = attach(&tx, "b1", 3, true).await;
+        let (mut b2, _) = attach(&tx, "b2", 4, true).await;
+        subscribe(&tx, "a1", "$share/ga/t");
+        subscribe(&tx, "a2", "$share/ga/t");
+        subscribe(&tx, "b1", "$share/gb/t");
+        subscribe(&tx, "b2", "$share/gb/t");
+
+        // Four publishes: each group takes all four, split two-and-two over its
+        // own members. A shared cursor between the groups would skew this.
+        for _ in 0..4 {
+            publish(&tx, "t", b"m");
+        }
+
+        let (na1, na2) = (count(&mut a1).await, count(&mut a2).await);
+        let (nb1, nb2) = (count(&mut b1).await, count(&mut b2).await);
+
+        assert_eq!(
+            na1 + na2,
+            4,
+            "group ga must receive every publish exactly once"
+        );
+        assert_eq!(
+            nb1 + nb2,
+            4,
+            "group gb must receive every publish exactly once"
+        );
+        assert_eq!(
+            (na1, na2),
+            (2, 2),
+            "ga must rotate over its own two members"
+        );
+        assert_eq!(
+            (nb1, nb2),
+            (2, 2),
+            "gb must rotate over its own two members"
         );
     }
 
