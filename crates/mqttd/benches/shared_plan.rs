@@ -132,7 +132,7 @@ fn hub_with_subscribers(
     rt.block_on(async {
         for i in 0..subs {
             let client = ClientId(Arc::from(format!("sub{i}").as_str()));
-            let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Packet>();
+            let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Box<Packet>>();
             drain.spawn(async move { while out_rx.recv().await.is_some() {} });
             let (reply_tx, reply_rx) = oneshot::channel();
             tx.send(HubCommand::Attach {
