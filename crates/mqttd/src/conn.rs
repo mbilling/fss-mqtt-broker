@@ -1505,8 +1505,21 @@ fn negotiate_v5_properties(
     let is_v5 = protocol == ProtocolVersion::V5;
     let limits = wire_limits();
     let server_alias_max = if is_v5 { limits.topic_alias_max } else { 0 };
+    // Clamped by the server's own maximum rather than taken at the client's word.
+    // The outbound table is assign-until-full and keyed by an OWNED topic string
+    // with no eviction (ADR 0011 §3), so an unclamped Topic Alias Maximum lets a
+    // client size a server-side allocation: up to 65,535 entries of
+    // arbitrary-length topics, on its own connection, held for its lifetime. The
+    // inbound direction has always been bounded by this same number; this makes
+    // the two symmetric. Refusing to assign is spec-safe at any point — ADR 0011
+    // §3: "using aliases at all is optional per spec, so this is always safe" —
+    // so a client asking for more simply gets aliases for the first
+    // `topic_alias_max` topics and full topic names thereafter.
     let client_alias_max = if is_v5 {
-        properties.topic_alias_maximum().unwrap_or(0)
+        properties
+            .topic_alias_maximum()
+            .unwrap_or(0)
+            .min(limits.topic_alias_max)
     } else {
         0
     };
@@ -3732,6 +3745,55 @@ mod tests {
             }
             other => panic!("expected v5 CONNACK, got {other:?}"),
         }
+    }
+
+    /// A client cannot size a server-side allocation by declaring a large Topic
+    /// Alias Maximum: the outbound table is clamped to the server's own maximum.
+    ///
+    /// The outbound map is assign-until-full, keyed by an OWNED topic string, and
+    /// never evicts (ADR 0011 §3), so an unclamped 65,535 would let one client
+    /// hold 65,535 arbitrary-length topics on its own connection for its
+    /// lifetime. Only the OUTBOUND side was unclamped; inbound always used the
+    /// server maximum, which is what made this asymmetric rather than obvious.
+    /// Clamping is spec-safe because assigning an alias is optional at every
+    /// step: past the bound the topic simply travels in full.
+    #[test]
+    fn a_client_cannot_size_the_outbound_alias_table_by_asking_for_more() {
+        let server_max = wire_limits().topic_alias_max;
+        let asked = u16::MAX;
+        assert!(
+            asked > server_max,
+            "the test is only meaningful if the client asks for more than we allow"
+        );
+
+        let (_props, _inbound, mut outbound) = super::negotiate_v5_properties(
+            super::ProtocolVersion::V5,
+            &Properties(vec![Property::TopicAliasMaximum(asked)]),
+        );
+
+        // Drive the assigner past the server bound with distinct topics and count
+        // how many were actually given an alias.
+        let mut assigned = 0u32;
+        for i in 0..u32::from(server_max) + 8 {
+            let mut p = Publish {
+                properties: Properties::new(),
+                dup: false,
+                qos: QoS::AtMostOnce,
+                retain: false,
+                topic: format!("t/{i}"),
+                pkid: None,
+                payload: Bytes::from_static(b"x"),
+            };
+            outbound.apply(&mut p);
+            if p.properties.topic_alias().is_some() {
+                assigned += 1;
+            }
+        }
+        assert_eq!(
+            assigned,
+            u32::from(server_max),
+            "the table stops at the SERVER's maximum, not the client's"
+        );
     }
 
     /// Guard (passes today, must keep passing): a v3.1.1 CONNACK carries no properties at
