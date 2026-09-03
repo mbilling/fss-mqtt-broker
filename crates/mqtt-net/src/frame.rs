@@ -206,8 +206,23 @@ pub struct FrameWriter<W> {
     version: ProtocolVersion,
     /// Reused encode buffer: the outbound drain encodes a whole backlog into it
     /// and writes it in one syscall (issue #443).
+    ///
+    /// Allocated on first use, not at construction. A connection that only ever
+    /// publishes writes exactly one packet — its CONNACK — so an eager
+    /// batch-sized buffer was pure per-connection overhead for the majority of
+    /// clients in a fan-in deployment. The first `queue` takes
+    /// [`SCRATCH_FIRST_USE`], and a real fan-out drain grows it to its own
+    /// high-water mark on the first batch and keeps it there, because
+    /// [`flush_queued`](FrameWriter::flush_queued) clears without shrinking.
     scratch: Vec<u8>,
 }
+
+/// What the encode buffer reserves the first time a packet is queued.
+///
+/// Sized for a control packet (CONNACK/AUTH/PUBACK), not for a fan-out batch:
+/// the batch path grows past it once and then reuses the grown buffer, so the
+/// only connections that ever hold a large buffer are the ones that fan out.
+const SCRATCH_FIRST_USE: usize = 512;
 
 impl<W: AsyncWrite + Unpin> FrameWriter<W> {
     /// Create a writer over `inner` for the given protocol `version`.
@@ -215,7 +230,7 @@ impl<W: AsyncWrite + Unpin> FrameWriter<W> {
         Self {
             inner,
             version,
-            scratch: Vec::with_capacity(4096),
+            scratch: Vec::new(),
         }
     }
 
@@ -243,6 +258,9 @@ impl<W: AsyncWrite + Unpin> FrameWriter<W> {
     /// # Errors
     /// [`NetError::Codec`] if the packet cannot be encoded.
     pub fn queue(&mut self, packet: &Packet) -> Result<(), NetError> {
+        if self.scratch.capacity() == 0 {
+            self.scratch.reserve(SCRATCH_FIRST_USE);
+        }
         packet.encode(&mut self.scratch, self.version)?;
         Ok(())
     }

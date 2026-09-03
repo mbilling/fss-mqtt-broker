@@ -243,7 +243,7 @@ pub struct RemoteSharedGroup {
 /// single-owner exactness of [`BacklogQueue::bytes`].
 #[derive(Clone, Debug)]
 pub struct Outbound {
-    tx: mpsc::UnboundedSender<Packet>,
+    tx: mpsc::UnboundedSender<Box<Packet>>,
     depth: Arc<AtomicUsize>,
     bytes: Arc<AtomicUsize>,
 }
@@ -282,7 +282,7 @@ impl Outbound {
     /// Wrap a channel, returning the sender and the meter its reader must call as it
     /// drains.
     #[must_use]
-    pub fn new(tx: mpsc::UnboundedSender<Packet>) -> (Self, OutboundMeter) {
+    pub fn new(tx: mpsc::UnboundedSender<Box<Packet>>) -> (Self, OutboundMeter) {
         let depth = Arc::new(AtomicUsize::new(0));
         let bytes = Arc::new(AtomicUsize::new(0));
         (
@@ -304,7 +304,15 @@ impl Outbound {
         let n = packet_bytes(&packet);
         self.depth.fetch_add(1, Ordering::Relaxed);
         self.bytes.fetch_add(n, Ordering::Relaxed);
-        if self.tx.send(packet).is_err() {
+        // Boxed so the channel's element is a pointer, not a `Packet`. Tokio
+        // allocates the first 32-slot block eagerly at channel creation — one
+        // channel per connection — so the element size is a per-connection cost
+        // paid whether or not anything is ever queued: 32 x 200 B + header =
+        // 6,432 B against 288 B for a pointer. `Packet` is 200 B only because of
+        // its CONNECT variant, which cannot travel this hub-to-client channel at
+        // all. The box costs one allocation per QUEUED packet, so a connection
+        // that only publishes never pays it.
+        if self.tx.send(Box::new(packet)).is_err() {
             // Never queued, so never drained: keep both counts honest.
             self.depth.fetch_sub(1, Ordering::Relaxed);
             self.bytes.fetch_sub(n, Ordering::Relaxed);
@@ -6585,7 +6593,7 @@ mod tests {
         client: &str,
         conn_id: u64,
         clean_session: bool,
-    ) -> (mpsc::UnboundedReceiver<Packet>, bool) {
+    ) -> (mpsc::UnboundedReceiver<Box<Packet>>, bool) {
         let expiry = if clean_session { 0 } else { u32::MAX };
         attach_v5(tx, client, conn_id, clean_session, expiry).await
     }
@@ -6598,7 +6606,7 @@ mod tests {
         conn_id: u64,
         clean_start: bool,
         session_expiry: u32,
-    ) -> (mpsc::UnboundedReceiver<Packet>, bool) {
+    ) -> (mpsc::UnboundedReceiver<Box<Packet>>, bool) {
         attach_full(tx, client, conn_id, clean_start, session_expiry, u16::MAX).await
     }
 
@@ -6610,7 +6618,7 @@ mod tests {
         clean_start: bool,
         session_expiry: u32,
         receive_maximum: u16,
-    ) -> (mpsc::UnboundedReceiver<Packet>, bool) {
+    ) -> (mpsc::UnboundedReceiver<Box<Packet>>, bool) {
         let (out_tx, out_rx) = {
             let (t, r) = mpsc::unbounded_channel();
             (Outbound::new(t).0, r)
@@ -6650,7 +6658,7 @@ mod tests {
         conn_id: u64,
         clean_start: bool,
         will: Message,
-    ) -> (mpsc::UnboundedReceiver<Packet>, bool) {
+    ) -> (mpsc::UnboundedReceiver<Box<Packet>>, bool) {
         // Delay 0: these predate Will Delay and assert the publish-at-once path.
         let will = Will {
             message: will,
@@ -6804,7 +6812,7 @@ mod tests {
             .await
             .expect("delivery")
             .expect("a packet");
-        assert!(matches!(pkt, Packet::Publish(_)));
+        assert!(matches!(*pkt, Packet::Publish(_)));
 
         let out = metrics.render();
         assert!(
@@ -7100,8 +7108,11 @@ mod tests {
         }
     }
 
-    async fn recv_packet(rx: &mut mpsc::UnboundedReceiver<Packet>) -> Option<Packet> {
-        timeout(Duration::from_millis(300), rx.recv()).await.ok()?
+    async fn recv_packet(rx: &mut mpsc::UnboundedReceiver<Box<Packet>>) -> Option<Packet> {
+        let boxed = timeout(Duration::from_millis(300), rx.recv())
+            .await
+            .ok()??;
+        Some(*boxed)
     }
 
     /// The next peer message, skipping the `SharedInterest` snapshots that now ride
@@ -7802,11 +7813,12 @@ mod tests {
     /// and each must rotate over its own members on its own schedule.
     #[tokio::test]
     async fn two_groups_on_one_filter_rotate_independently() {
-        async fn count(rx: &mut mpsc::UnboundedReceiver<Packet>) -> usize {
+        async fn count(rx: &mut mpsc::UnboundedReceiver<Box<Packet>>) -> usize {
             let mut n = 0;
-            while let Ok(Some(Packet::Publish(_))) =
-                timeout(Duration::from_millis(200), rx.recv()).await
-            {
+            while let Ok(Some(pkt)) = timeout(Duration::from_millis(200), rx.recv()).await {
+                if !matches!(*pkt, Packet::Publish(_)) {
+                    break;
+                }
                 n += 1;
             }
             n
@@ -14308,7 +14320,7 @@ mod tests {
     }
 
     /// Wait for the rehome close (`0x9C` Use another server) on a v5 client's socket.
-    async fn await_rehome_disconnect(out: &mut mpsc::UnboundedReceiver<Packet>) {
+    async fn await_rehome_disconnect(out: &mut mpsc::UnboundedReceiver<Box<Packet>>) {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
         loop {
             match recv_packet(out).await {
@@ -14333,7 +14345,7 @@ mod tests {
         tx: &HubTx,
         client: &str,
         conn_id: u64,
-    ) -> mpsc::UnboundedReceiver<Packet> {
+    ) -> mpsc::UnboundedReceiver<Box<Packet>> {
         attach_persistent_v5_full(tx, client, conn_id, u32::MAX, None).await
     }
 
@@ -14346,7 +14358,7 @@ mod tests {
         conn_id: u64,
         session_expiry: u32,
         will: Option<Will>,
-    ) -> mpsc::UnboundedReceiver<Packet> {
+    ) -> mpsc::UnboundedReceiver<Box<Packet>> {
         let (out_tx, out_rx) = {
             let (t, r) = mpsc::unbounded_channel();
             (Outbound::new(t).0, r)

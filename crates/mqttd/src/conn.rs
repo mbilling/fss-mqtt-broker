@@ -1646,7 +1646,7 @@ async fn serve<R, W>(
     mut principal: Identity,
     auth_method: Option<String>,
     policy: &ConnPolicy,
-    out_rx: &mut mpsc::UnboundedReceiver<Packet>,
+    out_rx: &mut mpsc::UnboundedReceiver<Box<Packet>>,
     // Called as packets are drained (packets AND accounted bytes, issue #241), so the
     // hub can see this client's backlog and shed `QoS 0` rather than queue it without
     // limit (#123).
@@ -1824,7 +1824,7 @@ where
                     out_meter.drained(&pkt);
                     // Rewrite outbound PUBLISHes to use topic aliases where the
                     // client allowed them (ADR 0011 §3); other packets pass through.
-                    if let Packet::Publish(p) = &mut pkt {
+                    if let Packet::Publish(p) = &mut *pkt {
                         outbound_aliases.apply(p);
                     }
                     let start = writer.queued_len();
@@ -1834,7 +1834,7 @@ where
                     // spec — measured from the bytes just queued (one encode, no
                     // throwaway second pass — issue #443 5b), counted, never a
                     // connection error. Un-queue it and carry on with the batch.
-                    if let (Some(max), Packet::Publish(_)) = (client_max_packet, &pkt) {
+                    if let (Some(max), Packet::Publish(_)) = (client_max_packet, &*pkt) {
                         if writer.queued_len() - start > max as usize {
                             debug!(client = %client.0, size = writer.queued_len() - start, max,
                                    "outbound publish exceeds the client's Maximum Packet Size; dropped for this subscriber");
