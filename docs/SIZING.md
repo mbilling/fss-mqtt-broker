@@ -49,7 +49,7 @@ publisher**. Read `mqttd_backlog_bytes_max` before choosing a number (the larges
 There is no `memory_limit` in the allocation-denial sense. Size RSS from the caps you set:
 
 ```
-RSS ≈ base (~70 MiB idle + ~15 KiB per idle connection — see the note below)
+RSS ≈ base (~15 MiB idle + ~24 KiB per idle connection — see the note below)
     + connections × max_packet_size            (read buffering, worst case)
     + sessions × queued_messages × avg_msg     (offline queues — THE dominant term)
     + retained_topics × avg_retained_value
@@ -70,17 +70,32 @@ a bound on *message bytes held for one subscriber* — the sum of `256 + topic +
 forwarded application properties` over the resident entries — not an RSS measurement, which
 is why this formula keeps its own slack rather than treating the cap as a ceiling.
 
-> **Where the base term comes from, honestly.** The ~70 MiB / ~15 KiB figures are from an
-> unpublished dev-grade run of `bench/` (its `results/` directory is untracked scratch), so
-> they are **not** reproducible from this repository — treat them as an order of magnitude
-> to size against, not a measured constant, and re-measure on your own host before they
-> matter. They have not been replaced with a number from
-> [benchmarks/DURABLE-PATH.md](benchmarks/DURABLE-PATH.md) on purpose: that harness runs on
-> macOS, where `ps` RSS (compressed memory, shared pages) is not comparable to the Linux
-> `VmRSS` this formula is written against. For reference only, the same three broker
-> processes there sat at **10–20 MiB RSS each** while serving durable traffic — which says
-> the base term is dominated by whatever an idle deployment configures, not by the broker's
-> floor.
+> **Where the base term comes from.** These are now measured on the scale rig, not
+> estimated. On `mqttd` v1.0.10, lane C held 50 000 idle plaintext MQTT v5 connections
+> (clean-start, unsubscribed, durable sessions off) across a cluster: an idle broker sat
+> at **14.3 MiB** `VmRSS`, and each connection cost **24 354 B**. That per-connection
+> figure is stable — it varied 0.19 % across nine loaded brokers and stayed flat from
+> 12 500 to 50 000 connections on one host — so it extrapolates linearly with more
+> confidence than the old estimate it replaces.
+>
+> **These numbers superseded a 5× / 1.6× error.** This formula previously read
+> `~70 MiB idle + ~15 KiB per connection`, from an unpublished dev-grade run. The idle
+> base was five times too high and the per-connection term **38 % too low**, so the
+> formula happened to look right at a few thousand connections and understated RSS badly
+> above that. If you sized `MQTTD_MAX_CONNECTIONS` from the old figures — which
+> [HARDENING.md](HARDENING.md) control H-5.1 tells you to do — recompute: on the shipped
+> systemd unit (`MemoryMax=2G`) the corrected arithmetic moves the memory-derived cap from
+> roughly 140 000 connections to roughly 61 000, i.e. **below** the unit's
+> `LimitNOFILE=65535`, changing which limit you actually hit.
+>
+> **Two caveats that matter at scale.** First, the 24 354 B is *process* RSS; the cgroup is
+> additionally charged about **1.6 KiB per connection** of kernel socket and slab memory
+> that `VmRSS` cannot see, and `MQTTD_MEMORY_MAX_BYTES` is compared against `VmRSS`, so set
+> the watermark against what the broker will *report*, not against the cgroup limit.
+> Second, every figure here is from **idle** connections carrying no traffic; the read
+> buffer and the encode scratch grow under load, so re-measure at your own message rate
+> before trusting it for a busy fleet. TLS is more expensive again: the same lane measured
+> **31–38 KiB** per mTLS connection.
 
 The offline-queue term is why the 100 000-message default must be re-decided on a
 bounded node: it is sized for *one important session*, not for thousands. **The offline
