@@ -1064,6 +1064,27 @@ duration = "runs alongside a bench/scale run"
 # script (ADR 0056 §3), not because it is unimportant — a stale bench dashboard is
 # how the phase strip would quietly stop matching the demo panels it derives from.
 [[task]]
+id = "scale-observe-dashboards"
+group = "Benchmark"
+hidden = true
+name = "Regenerate the bench copies of the demo Grafana dashboards"
+script = "bench/scale/observe/build-bench-dashboards.py"
+about = """
+Derives bench/scale/observe/dashboards/*-bench.json from
+demo/grafana/dashboards/*.json, adding the run-phase strip across the top.
+
+The demo dashboards ship to users, where `bench_run_phase` — pushed by
+bench/scale's run.sh — would sit permanently at "no data", so the strip cannot
+be added to them directly. These derived copies carry it and get their own
+uid/title so both sets coexist in one Grafana.
+
+Run after changing a demo dashboard; the output is committed, so a diff after
+running means the copies had drifted.
+"""
+requires = ["python3"]
+duration = "instant"
+
+[[task]]
 id = "scale-swap-binary"
 group = "Benchmark"
 hidden = true
@@ -1089,24 +1110,4 @@ Run A, then B, then A again, and void the comparison if the two A arms differ.
 The script prints that recipe when it finishes.
 """
 requires = ["jq", "ssh"]
-duration = "instant"
-
-id = "scale-observe-dashboards"
-group = "Benchmark"
-hidden = true
-name = "Regenerate the bench copies of the demo Grafana dashboards"
-script = "bench/scale/observe/build-bench-dashboards.py"
-about = """
-Derives bench/scale/observe/dashboards/*-bench.json from
-demo/grafana/dashboards/*.json, adding the run-phase strip across the top.
-
-The demo dashboards ship to users, where `bench_run_phase` — pushed by
-bench/scale's run.sh — would sit permanently at "no data", so the strip cannot
-be added to them directly. These derived copies carry it and get their own
-uid/title so both sets coexist in one Grafana.
-
-Run after changing a demo dashboard; the output is committed, so a diff after
-running means the copies had drifted.
-"""
-requires = ["python3"]
 duration = "instant"
