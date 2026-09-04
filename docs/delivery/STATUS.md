@@ -80,7 +80,7 @@
 | [0070](../adr/0070-stakeholder-documentation.md) | Usage documentation is owned by stakeholders, not by features | Proposed | [0/8 done](0070-stakeholder-documentation.md) | 8 open |
 | [0071](../adr/0071-owner-side-group-commit.md) | # 0071. Owner-side group commit: one durable-write serializer per node | Accepted | [3/3 done](0071-owner-side-group-commit.md) | — |
 | [0072](../adr/0072-per-message-durability-selection.md) | # 0072. Per-message durability selection: the `mqttd-durability` user property | Accepted | [1/2 done](0072-per-message-durability-selection.md) | 1 open |
-| [0073](../adr/0073-scale-out-durable-ownership.md) | # 0073. Scale-out durable ownership: the voter set is a control plane, not the data path | Accepted | [3/4 done](0073-scale-out-durable-ownership.md) | 1 open |
+| [0073](../adr/0073-scale-out-durable-ownership.md) | # 0073. Scale-out durable ownership: the voter set is a control plane, not the data path | Accepted | [3/9 done](0073-scale-out-durable-ownership.md) | 6 open |
 | [0074](../adr/0074-detached-ack-truncate.md) | # 0074. The subscriber-ack truncate leaves the hub loop's critical path | Accepted | [2/2 done](0074-detached-ack-truncate.md) | — |
 | [0075](../adr/0075-pipelined-durable-appends.md) | # 0075. Pipelined durable appends — the window stops paying the round trip per message | Accepted | [1/1 done](0075-pipelined-durable-appends.md) | — |
 | [0076](../adr/0076-self-measuring-sharded-store.md) | # 0076. The self-measuring sharded store — the volume's capacity becomes the broker's business | Accepted | [3/3 done](0076-self-measuring-sharded-store.md) | — |
@@ -197,7 +197,12 @@
 
 **0073 — # 0073. Scale-out durable ownership: the voter set is a control plane, not the data path**
 
-- `0073-T4` ⬜ planned: "The measured slope: 7- and 10-node durable curve, capped vs uncapped ownership A/B on identical hardware; SCALE-CURVE.md + COMPARISON.md publication of the scale-out claim with the up-vs-out economics case" — "Needs the Hetzner quota raise (~100 dedicated vCPU). The PR #375 lease-voters rig variant becomes the A/B control arm; the default arm now measures the ADR 0073 domain."
+- `0073-T4.0` ⬜ planned: "The A/B arm is ONE provisioning, not two clusters — run-curve sequences both ownership domains on a single cluster (clean broker restart between arms), summarizer renders the A/B, SHAPE_ONLY validates offline" — "ADR 0077-T4: two fresh clusters differ ~40%, wider than the slope being measured."
+- `0073-T4.1` ⬜ planned: "Simulated fleet-size migration soak in-tree: ADR 0042 schedules grow 3->6->9 and shrink under load, zero-acked-loss invariant" — "€0; the cheap place to find #390-class defects."
+- `0073-T4.2` ⬜ planned: "Smoke run proves the arm plumbing end to end (1 broker + 1 driver, ~€0.50)" — "A rig bug found here costs cents."
+- `0073-T4.3` ⬜ planned: "Small paid runs: 3-node durable run with voters arm at MQTTD_LEASE_VOTERS=2 (domain difference visible at cheap size); 1->3->5 grow/shrink soak under lane A load" — "€2–4; the last stage where defects are cheap."
+- `0073-T4.4` ⬜ planned: "The measured slope: 7- and 10-node durable curve, both arms per size on one provisioning, repeated rungs + control rung; SCALE-CURVE.md + COMPARISON.md publication with the up-vs-out economics case" — "Lane A needs ONE driver: 10+1 = 11 servers / 44 vCPU, inside current quota, no console raise. €5–10 in one session."
+- `0073-T4.5` ⬜ planned: "The expensive tail, only on green T4.0–T4.4: hours-scale soak on 10x CCX23 with grow/shrink cycles, node kills and a partition arm (ADR 0077-T8), plus the paid rolling upgrade through the proto 7<->8 window" — "~€30–40. Publication never cites gate runs."
 
 **0077 — # 0077. Workload-targeted performance — a shape is not a result without its tail**
 
