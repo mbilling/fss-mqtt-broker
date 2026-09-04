@@ -1064,6 +1064,33 @@ duration = "runs alongside a bench/scale run"
 # script (ADR 0056 §3), not because it is unimportant — a stale bench dashboard is
 # how the phase strip would quietly stop matching the demo panels it derives from.
 [[task]]
+id = "scale-swap-binary"
+group = "Benchmark"
+hidden = true
+name = "Swap the broker binary on a live bench cluster (A/B on one provisioning)"
+script = "bench/scale/swap-binary.sh"
+about = """
+Replaces mqttd on every broker of an already-provisioned cluster, so two builds
+can be compared on the SAME hardware.
+
+The rig provisions fresh per run, so comparing two builds meant comparing two
+provisionings — and two provisionings of nominally identical hardware measured
+40% apart on the same binary at the same shape (ADR 0077 T4). Within one
+provisioning the rig is far tighter: auditing every repeated rung in the archive
+put 15 of 17 within 1% of their first pass. Swapping in place buys that
+resolution, which is the difference between measuring a 40% effect and a 5% one.
+
+Needs KEEP_INFRA=1 on the run that provisions the cluster. Verifies the binary
+against a pinned sha256 and fails closed, clears the data dir so a new build
+never starts on the previous arm state, and stamps SWAPPED-BINARY.txt beside the
+inventory — a number measured this way is not a published-curve point.
+
+Run A, then B, then A again, and void the comparison if the two A arms differ.
+The script prints that recipe when it finishes.
+"""
+requires = ["jq", "ssh"]
+duration = "instant"
+
 id = "scale-observe-dashboards"
 group = "Benchmark"
 hidden = true
