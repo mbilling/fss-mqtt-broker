@@ -45,7 +45,7 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
     pub fn new(inner: R, version: ProtocolVersion) -> Self {
         Self {
             inner,
-            buf: BytesMut::with_capacity(2048),
+            buf: BytesMut::with_capacity(READ_BUF_INIT),
             version,
         }
     }
@@ -217,12 +217,32 @@ pub struct FrameWriter<W> {
     scratch: Vec<u8>,
 }
 
+/// What a reader reserves for inbound framing, eagerly, per connection.
+///
+/// Unlike the encode buffer this one is paid by every connection whether it
+/// publishes or subscribes, because every connection reads. It is named rather
+/// than inlined so it is visible as a per-connection cost and guarded below: at
+/// 50,000 connections a node this is 100 MiB of the broker's floor.
+pub(crate) const READ_BUF_INIT: usize = 2048;
+
 /// What the encode buffer reserves the first time a packet is queued.
 ///
 /// Sized for a control packet (CONNACK/AUTH/PUBACK), not for a fan-out batch:
 /// the batch path grows past it once and then reuses the grown buffer, so the
 /// only connections that ever hold a large buffer are the ones that fan out.
 const SCRATCH_FIRST_USE: usize = 512;
+
+/// Per-connection eager allocation budget, asserted at compile time.
+///
+/// These two buffers are allocated per connection and are the broker's
+/// per-connection memory floor. The encode scratch was raised to 4,096 in
+/// v1.0.8 for the fan-out drain (issue #443) and inflated every connection by
+/// 23% for four releases before anyone measured it. Naming the numbers and
+/// asserting them here is what makes the next such change a deliberate,
+/// reviewed act: if one of these trips, raise the constant AND update the
+/// formula in `docs/SIZING.md` in the same commit.
+const _: () = assert!(READ_BUF_INIT <= 2048);
+const _: () = assert!(SCRATCH_FIRST_USE <= 512);
 
 impl<W: AsyncWrite + Unpin> FrameWriter<W> {
     /// Create a writer over `inner` for the given protocol `version`.
@@ -309,7 +329,7 @@ impl<W: AsyncWrite + Unpin> FrameWriter<W> {
 
 #[cfg(test)]
 mod tests {
-    use super::{FrameReader, FrameWriter};
+    use super::{FrameReader, FrameWriter, READ_BUF_INIT, SCRATCH_FIRST_USE};
     use crate::NetError;
     use mqtt_codec::{packet::ConnAck, CodecError, Packet, ProtocolVersion};
     use tokio::io::AsyncWriteExt;
@@ -318,6 +338,80 @@ mod tests {
 
     // Sanity for the oversized-packet test: its claimed size (2 MiB) really is
     // beyond the buffer ceiling.
+
+    /// A connection that never writes never pays for an encode buffer.
+    ///
+    /// The scratch is the fan-out drain's batching buffer (issue #443). In a
+    /// fan-in deployment most connections only publish and write exactly one
+    /// packet — their CONNACK — so allocating a batch-sized buffer at
+    /// construction charged the majority of clients for machinery only
+    /// subscribers use.
+    #[test]
+    fn a_new_writer_allocates_no_encode_buffer() {
+        let w = FrameWriter::new(Vec::<u8>::new(), V4);
+        assert_eq!(
+            w.scratch.capacity(),
+            0,
+            "the encode buffer must be allocated on first use, not at construction"
+        );
+    }
+
+    /// The first packet takes a CONTROL-sized buffer, not a batch-sized one — a
+    /// client that only ever writes a CONNACK keeps a small buffer for life.
+    #[tokio::test]
+    async fn the_first_queued_packet_takes_a_control_sized_buffer() {
+        let mut w = FrameWriter::new(Vec::<u8>::new(), V4);
+        w.queue(&Packet::ConnAck(ConnAck {
+            properties: mqtt_codec::Properties::new(),
+            session_present: false,
+            code: 0,
+        }))
+        .unwrap();
+        assert!(
+            w.scratch.capacity() <= SCRATCH_FIRST_USE,
+            "a control packet grew the buffer to {} bytes; it must stay within {SCRATCH_FIRST_USE}",
+            w.scratch.capacity()
+        );
+    }
+
+    /// A real drain still gets one buffer it reuses: capacity survives the flush,
+    /// so the batching win (#443) is unchanged for the connections that fan out.
+    #[tokio::test]
+    async fn a_drain_grows_the_buffer_once_and_keeps_it() {
+        let mut w = FrameWriter::new(Vec::<u8>::new(), V4);
+        // A v3.1.1 CONNACK is 4 bytes on the wire, so this is ~1.2 KiB queued —
+        // comfortably past the control-sized floor, which is the point.
+        for _ in 0..300 {
+            w.queue(&Packet::ConnAck(ConnAck {
+                properties: mqtt_codec::Properties::new(),
+                session_present: false,
+                code: 0,
+            }))
+            .unwrap();
+        }
+        let grown = w.scratch.capacity();
+        assert!(
+            grown > SCRATCH_FIRST_USE,
+            "a batch must grow past the floor"
+        );
+        w.flush_queued().await.unwrap();
+        assert_eq!(
+            w.scratch.capacity(),
+            grown,
+            "flushing clears without shrinking, so the next batch reuses the buffer"
+        );
+    }
+
+    /// The reader's buffer IS eager, and deliberately so: every connection reads.
+    /// Pinned so its per-connection cost stays visible.
+    #[test]
+    fn a_new_reader_takes_the_named_read_buffer() {
+        let r = FrameReader::new(tokio::io::empty(), V4);
+        assert!(
+            r.buf.capacity() >= READ_BUF_INIT,
+            "the read buffer is allocated up front at READ_BUF_INIT"
+        );
+    }
 
     #[tokio::test]
     async fn write_then_read_roundtrip_over_duplex() {

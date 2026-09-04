@@ -722,11 +722,15 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::system_topics_excluded_from_leading_wildcards`
 - `tests::topic_name_validity_rejects_wildcards_and_emptiness`
 
-## `crates/mqtt-net/src/lib.rs` — 21 test(s)
+## `crates/mqtt-net/src/lib.rs` — 25 test(s)
 
+- `frame::tests::a_drain_grows_the_buffer_once_and_keeps_it`
+- `frame::tests::a_new_reader_takes_the_named_read_buffer`
+- `frame::tests::a_new_writer_allocates_no_encode_buffer`
 - `frame::tests::eof_mid_packet_is_an_error`
 - `frame::tests::next_raw_frame_returns_whole_decodable_packets`
 - `frame::tests::oversized_packet_is_rejected_not_buffered`
+- `frame::tests::the_first_queued_packet_takes_a_control_sized_buffer`
 - `frame::tests::write_then_read_roundtrip_over_duplex`
 - `quic::tests::publish_topic_extracts_topic_across_varint_lengths`
 - `quic::tests::publish_topic_ignores_non_publish_packets`
@@ -900,7 +904,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 361 test(s)
+## `crates/mqttd/src/lib.rs` — 362 test(s)
 
 - `admission::tests::the_global_cap_refuses_at_the_bound_and_recovers`
 - `admission::tests::the_penalty_box_refuses_after_the_threshold`
@@ -953,6 +957,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `config_watch::tests::a_settled_edit_applies_exactly_once`
 - `config_watch::tests::an_atomic_rename_is_detected`
 - `config_watch::tests::no_change_does_not_reload`
+- `conn::tests::a_client_cannot_size_the_outbound_alias_table_by_asking_for_more`
 - `conn::tests::a_client_disconnect_is_still_reported_as_graceful`
 - `conn::tests::a_denied_qos0_publish_stays_a_silent_drop_in_both_versions`
 - `conn::tests::a_keepalive_expiry_detaches_ungracefully_so_the_will_fires`
