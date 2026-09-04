@@ -1,6 +1,6 @@
 # Cryptographic policy
 
-**Verified against `v1.0.15` + ADR 0068 (2026-09-04).** What each build variant's
+**Verified against `v1.0.16` + ADR 0068 (2026-09-04).** What each build variant's
 cryptography is, precisely — written so the true claim is quotable and the
 overclaim is impossible.
 

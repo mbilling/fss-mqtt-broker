@@ -1,6 +1,6 @@
 # EU Cyber Resilience Act — readiness statement
 
-**Verified against `v1.0.15` (2026-09-04).** ADR 0067 T2: the CRA's essential
+**Verified against `v1.0.16` (2026-09-04).** ADR 0067 T2: the CRA's essential
 requirements as a checklist against shipped, checkable facts, plus the
 reporting-duty runbook. **This is not a conformity assessment and confers no CE
 marking**; it is the technical-documentation groundwork a manufacturer or
