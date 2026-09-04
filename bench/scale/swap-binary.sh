@@ -44,6 +44,15 @@ case "$SHA" in
 *) die "sha256 must be lowercase hex, got '$SHA'" ;;
 esac
 
+# rssh keys its known_hosts off RUN and refuses to fall back to the operator's
+# default file — an unset RUN once had rig traffic evict github.com from it. The
+# inventory lives in the run directory that provisioned this cluster, and that
+# is the run whose known_hosts already trusts these hosts, so derive it rather
+# than asking the caller for something it has no way to get wrong.
+RUN="$(cd "$(dirname "$INVENTORY")" && pwd)"
+export RUN
+[ -f "$RUN/known_hosts" ] || warn "no known_hosts in $RUN — every host will be accepted on first sight"
+
 N=$(broker_count)
 say "swapping the broker binary on $N node(s)"
 say "  url    $URL"
@@ -70,14 +79,13 @@ done
 # Stamp it the way run.sh stamps an unreleased run: a number measured against a
 # hand-swapped binary is not a published-curve point and must not be mistaken
 # for one.
-RUNDIR="$(cd "$(dirname "$INVENTORY")" && pwd)"
 {
 	echo "BINARY SWAPPED IN PLACE"
 	echo "url=$URL"
 	echo "sha256=$SHA"
 	echo "brokers=$N"
 	echo "inventory=$INVENTORY"
-} >"$RUNDIR/SWAPPED-BINARY.txt"
+} >"$RUN/SWAPPED-BINARY.txt"
 
 say "every broker now holds the new binary and is STOPPED"
 say "next: bootstrap-cluster.sh <new-run-dir> $INVENTORY clean   # starts them"
