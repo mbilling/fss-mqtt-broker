@@ -3421,8 +3421,9 @@ impl Hub {
             // filters, which is where the fleet-scale duplication lives.
             let key = self.table.intern(&s.filter);
             if let Some((group, filter)) = parse_shared(&s.filter) {
+                let online = self.online.contains_key(&client);
                 self.shared
-                    .subscribe(client.clone(), group, filter, s.max_qos);
+                    .subscribe(client.clone(), group, filter, s.max_qos, online);
             } else {
                 self.table.subscribe(client.clone(), FilterKey::clone(&key));
             }
@@ -3532,6 +3533,8 @@ impl Hub {
                 attached_at: Instant::now(),
             },
         );
+        // Its groups' online prefixes must include it from here on (ADR 0015).
+        self.shared.set_client_online(&client, true);
         info!(client = %client.0, persistent = session_expiry != 0, session_present, "client attached");
 
         // Issue #284 round 3: a session becomes misplaced by ARRIVING, not only by an
@@ -3865,7 +3868,9 @@ impl Hub {
                 ));
             if let Some((group, filter)) = parse_shared(f) {
                 debug!(client = %client.0, group, filter, qos = *q as u8, "shared subscribe");
-                self.shared.subscribe(client.clone(), group, filter, *q);
+                let online = self.online.contains_key(client);
+                self.shared
+                    .subscribe(client.clone(), group, filter, *q, online);
                 continue;
             }
             debug!(client = %client.0, filter = %f, qos = *q as u8, "subscribe");
@@ -3935,7 +3940,9 @@ impl Hub {
             if let Some(prior) = prior {
                 for e in prior.iter() {
                     if let Some((group, filter)) = parse_shared(&e.filter) {
-                        self.shared.subscribe(client.clone(), group, filter, e.qos);
+                        let online = self.online.contains_key(client);
+                        self.shared
+                            .subscribe(client.clone(), group, filter, e.qos, online);
                     } else {
                         self.table
                             .subscribe(client.clone(), FilterKey::clone(&e.filter));
@@ -4406,6 +4413,9 @@ impl Hub {
             return;
         }
         let departed = self.online.remove(client);
+        // Out of every group's online prefix: a member offline here is not
+        // immediately deliverable, which is what the selection reads.
+        self.shared.set_client_online(client, false);
         // Deliveries still staged behind an outbound-id record never reached this
         // connection's wire (issue #242 finding A): drop them — the durable copy
         // owns delivery on reattach, and their offsets stay owed (untouched in
@@ -4863,8 +4873,9 @@ impl Hub {
                 // Interned on the FULL filter, as the record is keyed.
                 let key = self.table.intern(&sub.filter);
                 if let Some((group, filter)) = parse_shared(&sub.filter) {
+                    let online = self.online.contains_key(&client);
                     self.shared
-                        .subscribe(client.clone(), group, filter, sub.max_qos);
+                        .subscribe(client.clone(), group, filter, sub.max_qos, online);
                 } else {
                     self.table.subscribe(client.clone(), FilterKey::clone(&key));
                 }

@@ -673,7 +673,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::the_whole_env_surface_overlays_without_collision`
 - `tests::warn_mode_boots_a_newer_config_and_reports_the_ignored_keys`
 
-## `crates/mqtt-core/src/lib.rs` — 46 test(s)
+## `crates/mqtt-core/src/lib.rs` — 51 test(s)
 
 - `retry::tests::delays_ramp_within_jitter_bounds_and_cap`
 - `retry::tests::reset_returns_to_base`
@@ -685,8 +685,13 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `shared::tests::matching_reports_group_members_in_order_with_qos`
 - `shared::tests::non_matching_topic_yields_nothing`
 - `shared::tests::parse_accepts_wellformed_and_rejects_malformed`
+- `shared::tests::removing_a_client_clears_it_from_every_group_it_joined`
 - `shared::tests::resubscribe_updates_qos_in_place`
+- `shared::tests::resubscribing_updates_qos_without_duplicating_or_reordering`
+- `shared::tests::selection_is_empty_when_no_member_is_online`
+- `shared::tests::selection_rotates_only_over_online_members`
 - `shared::tests::snapshot_lists_every_group_with_members`
+- `shared::tests::the_online_prefix_survives_every_transition_order`
 - `shared::tests::unsubscribe_and_remove_client_prune_groups`
 - `subscriptions::tests::a_distinct_filter_is_allocated_once_however_many_subscribers`
 - `subscriptions::tests::a_fully_removed_filter_can_be_resubscribed`
