@@ -842,9 +842,50 @@ impl Hub {
     /// member was choosable, exactly as `select_shared` always has.
     pub(super) fn plan_shared(&self, topic: &str) -> Vec<SharedPlan> {
         let mut by_key: BTreeMap<(&str, &str), Vec<SharedCandidateRef<'_>>> = BTreeMap::new();
+        let mut plans: Vec<SharedPlan> = Vec::new();
+        // Groups already decided by the constant-time path below, so the peer
+        // pass does not resurrect them as candidates.
+        let mut decided: std::collections::HashSet<(&str, &str)> = std::collections::HashSet::new();
         for (group, filter, members) in self.shared.matching_refs(topic) {
+            // CONSTANT-TIME PATH. With locality on (the default since #511) a
+            // group that has ANY online member on this node is answered by that
+            // member: no peer can outrank it, and which local member takes the
+            // turn is an index into the group's online prefix. So the whole
+            // decision is one lookup, independent of how many members the group
+            // has — the property that lets one `$share` group serve both a
+            // six-member fan-in tenant and a broadcast group of tens of
+            // thousands. Building a candidate per member to then discard all but
+            // one was linear in group size and cost ~42ns per member per publish.
+            if self.shared_prefer_local && members.online_count() > 0 {
+                let key_hash = shared_cursor_hash(group, filter);
+                let existing = self
+                    .shared_cursor
+                    .get(&key_hash)
+                    .filter(|(k, _)| k.0.as_str() == group && k.1.as_str() == filter);
+                let cursor = existing.map_or(0, |(_, c)| *c);
+                let chosen = members
+                    .select_online(cursor)
+                    .map(|(client, qos)| SharedCandidate {
+                        node: None,
+                        client: client.clone(),
+                        qos: *qos,
+                        online: true,
+                    });
+                plans.push(SharedPlan {
+                    key_hash,
+                    key_if_new: existing
+                        .is_none()
+                        .then(|| (group.to_string(), filter.to_string())),
+                    // Rotation is over the ONLINE members, so an offline member
+                    // never consumes a turn.
+                    next_cursor: cursor.wrapping_add(1) % members.online_count().max(1),
+                    chosen,
+                });
+                decided.insert((group, filter));
+                continue;
+            }
             let entry = by_key.entry((group, filter)).or_default();
-            for (client, qos) in members {
+            for (client, qos) in members.iter() {
                 entry.push(SharedCandidateRef {
                     node: None,
                     client,
@@ -870,6 +911,9 @@ impl Hub {
                 let Some(g) = remote.get(node).and_then(|groups| groups.get(*idx)) else {
                     continue;
                 };
+                if decided.contains(&(g.group.as_str(), g.filter.as_str())) {
+                    continue;
+                }
                 let entry = by_key
                     .entry((g.group.as_str(), g.filter.as_str()))
                     .or_default();
@@ -883,34 +927,36 @@ impl Hub {
                 }
             }
         });
-        by_key
-            .into_iter()
-            .filter(|(_, cands)| !cands.is_empty())
-            .map(|((group, filter), cands)| {
-                let n = cands.len();
-                // O(1) cursor read with no per-publish allocation. The stored key is
-                // compared so a hash collision reads as "absent" (start 0) rather
-                // than as another group's rotation.
-                let key_hash = shared_cursor_hash(group, filter);
-                let existing = self
-                    .shared_cursor
-                    .get(&key_hash)
-                    .filter(|(k, _)| k.0.as_str() == group && k.1.as_str() == filter);
-                let start = existing.map_or(0, |(_, c)| *c) % n;
-                let chosen = self
-                    .choose_shared_index(&cands, start)
-                    .map(|i| cands[i].to_owned_candidate());
-                SharedPlan {
-                    key_hash,
-                    // Allocated once per group ever served, not once per publish.
-                    key_if_new: existing
-                        .is_none()
-                        .then(|| (group.to_string(), filter.to_string())),
-                    next_cursor: (start + 1) % n,
-                    chosen,
-                }
-            })
-            .collect()
+        plans.extend(
+            by_key
+                .into_iter()
+                .filter(|(_, cands)| !cands.is_empty())
+                .map(|((group, filter), cands)| {
+                    let n = cands.len();
+                    // O(1) cursor read with no per-publish allocation. The stored key is
+                    // compared so a hash collision reads as "absent" (start 0) rather
+                    // than as another group's rotation.
+                    let key_hash = shared_cursor_hash(group, filter);
+                    let existing = self
+                        .shared_cursor
+                        .get(&key_hash)
+                        .filter(|(k, _)| k.0.as_str() == group && k.1.as_str() == filter);
+                    let start = existing.map_or(0, |(_, c)| *c) % n;
+                    let chosen = self
+                        .choose_shared_index(&cands, start)
+                        .map(|i| cands[i].to_owned_candidate());
+                    SharedPlan {
+                        key_hash,
+                        // Allocated once per group ever served, not once per publish.
+                        key_if_new: existing
+                            .is_none()
+                            .then(|| (group.to_string(), filter.to_string())),
+                        next_cursor: (start + 1) % n,
+                        chosen,
+                    }
+                }),
+        );
+        plans
     }
 
     /// Round-robin one member for a shared group, advancing the per-group cursor.
