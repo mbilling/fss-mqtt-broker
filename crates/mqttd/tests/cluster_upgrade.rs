@@ -52,7 +52,7 @@ use proc_common::{
 /// hand-bumped commit pin — last `c6b84f23…` (the issue #227/#232 retained-expiry
 /// reshape, which landed WITHOUT its bump and broke the next oracle run), before
 /// that `e39b6e13…` (the issue #92 SWIM generation reshape).
-const BASELINE_REF: &str = "f0f664aaca1aa1c98a271c37b5f6aa0a7702cf40";
+const BASELINE_REF: &str = "011bfb1123786f48cbb2b2cf8f7b4f59ad104d3b";
 
 /// The baseline `mqttd` binary: `MQTTD_BASELINE_BIN` if set (nightly / CI
 /// supplies a prebuilt one), else built from [`BASELINE_REF`] via a git
