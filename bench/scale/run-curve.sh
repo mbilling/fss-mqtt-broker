@@ -32,6 +32,15 @@ set -euo pipefail
 RUN="${1:?usage: run-curve.sh <run-dir> <inventory.json>}"
 INVENTORY="${2:?inventory.json}"
 
+# Same relative-path guard as run.sh and bootstrap-cluster.sh: several lanes
+# `cd` and then redirect through the same path. run.sh always hands this an
+# absolute dir; a caller driving the A/B recipe by hand does not.
+case "$RUN" in
+/*) ;;
+*) RUN="$SCALE_DIR/$RUN" ;;
+esac
+mkdir -p "$RUN"
+
 N=$(broker_count)
 D=$(driver_count)
 OUT="$RUN/results/nodes=$N"
