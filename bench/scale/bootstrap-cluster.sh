@@ -20,6 +20,18 @@ RUN="${1:?usage: bootstrap-cluster.sh <run-dir> <inventory.json> <durable|clean>
 INVENTORY="${2:?inventory.json}"
 MODE="${3:?durable|clean}"
 
+# The inventory path must be absolute for the same reason the run dir must be:
+# steps below expand `inv()` INSIDE a subshell that has already `cd`-ed
+# elsewhere (the PKI mint does exactly this), and a relative path stops
+# resolving there. It fails as empty jq output rather than an error, so the
+# symptom is a certificate minted with no CN — not "file not found".
+case "$INVENTORY" in
+/*) ;;
+*) INVENTORY="$PWD/$INVENTORY" ;;
+esac
+[ -f "$INVENTORY" ] || die "no such inventory: $INVENTORY"
+
+
 # A RELATIVE run dir is resolved against the rig, exactly as run.sh does and for
 # exactly the same reason: several steps `cd` into a subdirectory and then
 # redirect using the same path, which stops resolving the moment it is relative.

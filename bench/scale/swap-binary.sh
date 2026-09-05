@@ -38,6 +38,10 @@ INVENTORY="${1:?usage: swap-binary.sh <inventory.json> <url> <sha256>}"
 URL="${2:?a URL for a musl x86_64 mqttd binary}"
 SHA="${3:?the sha256 of that binary — an arbitrary URL publishes no .sha256 beside it}"
 
+case "$INVENTORY" in
+/*) ;;
+*) INVENTORY="$PWD/$INVENTORY" ;;
+esac
 [ -f "$INVENTORY" ] || die "no such inventory: $INVENTORY"
 case "$SHA" in
 [0-9a-f]*) [ ${#SHA} -eq 64 ] || die "sha256 must be 64 hex characters, got ${#SHA}" ;;
