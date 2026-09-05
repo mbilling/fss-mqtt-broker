@@ -32,6 +32,18 @@ set -euo pipefail
 RUN="${1:?usage: run-curve.sh <run-dir> <inventory.json>}"
 INVENTORY="${2:?inventory.json}"
 
+# The inventory path must be absolute for the same reason the run dir must be:
+# steps below expand `inv()` INSIDE a subshell that has already `cd`-ed
+# elsewhere (the PKI mint does exactly this), and a relative path stops
+# resolving there. It fails as empty jq output rather than an error, so the
+# symptom is a certificate minted with no CN — not "file not found".
+case "$INVENTORY" in
+/*) ;;
+*) INVENTORY="$PWD/$INVENTORY" ;;
+esac
+[ -f "$INVENTORY" ] || die "no such inventory: $INVENTORY"
+
+
 # Same relative-path guard as run.sh and bootstrap-cluster.sh: several lanes
 # `cd` and then redirect through the same path. run.sh always hands this an
 # absolute dir; a caller driving the A/B recipe by hand does not.
