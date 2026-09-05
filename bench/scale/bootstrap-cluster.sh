@@ -20,6 +20,18 @@ RUN="${1:?usage: bootstrap-cluster.sh <run-dir> <inventory.json> <durable|clean>
 INVENTORY="${2:?inventory.json}"
 MODE="${3:?durable|clean}"
 
+# A RELATIVE run dir is resolved against the rig, exactly as run.sh does and for
+# exactly the same reason: several steps `cd` into a subdirectory and then
+# redirect using the same path, which stops resolving the moment it is relative.
+# run.sh always passes an absolute path, so this only bites a caller driving the
+# scripts directly — which is precisely what the swap-binary.sh A/B recipe does.
+case "$RUN" in
+/*) ;;
+*) RUN="$SCALE_DIR/$RUN" ;;
+esac
+mkdir -p "$RUN"
+
+
 N=$(broker_count)
 say "bootstrapping a $N-node cluster (mode: $MODE)"
 
