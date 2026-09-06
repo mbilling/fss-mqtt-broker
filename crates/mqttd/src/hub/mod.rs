@@ -16339,6 +16339,66 @@ mod tests {
         }
     }
 
+    /// ADR 0074-T3 / issue #575 — the falsifier Decision 2 never had.
+    ///
+    /// ADR 0074 says `QoS` 2 completion KEEPS the synchronous truncate, and that is
+    /// a deliberate, documented trade. But nothing fails if the cost of that trade
+    /// changes, so this pins it: with one `QoS` 2 subscriber's truncate parked,
+    /// UNRELATED work must still cross the hub.
+    ///
+    /// Note what the oracle is NOT. The obvious test — stall the store and watch
+    /// `hub_dispatch` for other command classes — cannot work: `Hub::run` starts
+    /// that timer AFTER `rx.recv()` returns, so a command that waited a second in
+    /// the channel still reports a microsecond dispatch. The histogram stays flat
+    /// under a total stall, and reads as proof of isolation. Here the assertion is
+    /// a reply that must ARRIVE while the stall is held — no timing threshold, and
+    /// nothing a scheduler can flatter.
+    ///
+    /// IGNORED, and red on purpose: `pub_comp` awaits `store.clear_outbound` and
+    /// then `truncate_acked_now` -> `store.ack` INSIDE `Hub::dispatch`, so a
+    /// stalled `QoS` 2 store stalls every other session on the node. That is
+    /// today's shipped behaviour and this test is its reproduction. Un-ignore it
+    /// with the outbound-isolation work in #405; do not "fix" it by detaching the
+    /// writes, which #533 must settle first.
+    #[tokio::test]
+    #[ignore = "reproduction for #575: QoS 2 completion blocks the hub loop (ADR 0074 Decision 2); un-ignore with #405"]
+    async fn a_parked_qos2_truncate_does_not_stall_unrelated_sessions() {
+        let store = ParkingStore::new();
+        let tx = start_hub_with_arc(store.clone());
+
+        // A durable QoS 2 subscriber, taken to the last step of the handshake.
+        let (mut rx, _) = attach(&tx, "q2", 1, false).await;
+        subscribe_qos(&tx, "q2", "iso/t", QoS::ExactlyOnce);
+        publish_qos2(&tx, "iso/t", b"one");
+        let pkid = pkid_of(
+            &timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .expect("the QoS 2 delivery")
+                .unwrap(),
+        );
+        pub_rec(&tx, "q2", pkid);
+
+        // Park the truncate, THEN complete: the PUBCOMP handler runs into the gate
+        // and holds the loop there.
+        let release = store.park_ack("q2");
+        pub_comp(&tx, "q2", pkid);
+
+        // The whole assertion: an unrelated session's attach must be answered
+        // while "q2"'s truncate is still parked. Attach carries its own reply
+        // channel, so this is a completion signal, not a latency measurement.
+        let unrelated = timeout(Duration::from_secs(2), attach(&tx, "other", 1, false)).await;
+
+        // Release before asserting, so a failure does not also wedge the teardown.
+        release.send(true).unwrap();
+        assert!(
+            unrelated.is_ok(),
+            "an unrelated session could not attach while a QoS 2 truncate was \
+             parked: the completion path is awaiting storage on the hub loop, so \
+             one slow QoS 2 store operation stalls every session on the node \
+             (ADR 0074 Decision 2, issue #575)"
+        );
+    }
+
     /// ADR 0074 — a burst of acks COALESCES: five acknowledged deliveries reach
     /// the store as at most two truncates (one that was already parked in
     /// flight, plus one carrying the final watermark), and the last truncate
