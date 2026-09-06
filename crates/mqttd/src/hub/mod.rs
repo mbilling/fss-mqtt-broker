@@ -16339,6 +16339,146 @@ mod tests {
         }
     }
 
+    /// Issue #533, the CONTROL for the test below — without a lost truncate, the
+    /// same flow does NOT replay.
+    ///
+    /// Without this the reproduction proves nothing: if a completed `QoS` 2
+    /// delivery replayed after every restart, the finding would be "restore
+    /// replays" and have nothing to do with the crash window. Identical setup,
+    /// identical restart, the only difference being that the truncate is allowed
+    /// to land.
+    #[tokio::test]
+    async fn a_completed_qos2_delivery_does_not_replay_when_the_truncate_lands() {
+        let store = ParkingStore::new();
+        let hub1 = start_hub_with_arc(store.clone());
+
+        let (mut rx, _) = attach(&hub1, "s533ok", 1, false).await;
+        subscribe_qos(&hub1, "s533ok", "x/t", QoS::ExactlyOnce);
+        publish_qos2(&hub1, "x/t", b"once");
+        let pkid = pkid_of(
+            &timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .expect("the QoS 2 delivery")
+                .unwrap(),
+        );
+        pub_rec(&hub1, "s533ok", pkid);
+        pub_comp(&hub1, "s533ok", pkid);
+
+        // Let the truncate land — the ONLY difference from the reproduction.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !store
+            .ops()
+            .iter()
+            .any(|(op, d)| op == "ack" && d.starts_with("s533ok "))
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the truncate never landed; ops: {:?}",
+                store.ops()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        drop(rx);
+        drop(hub1);
+        let hub2 = start_hub_with_arc(store.clone());
+        let (mut rx2, _) = attach(&hub2, "s533ok", 2, false).await;
+        let replayed = timeout(Duration::from_millis(750), rx2.recv()).await;
+        assert!(
+            replayed.is_err(),
+            "a completed QoS 2 delivery whose truncate LANDED still replayed, so \
+             the reproduction below is not about the crash window at all: {replayed:?}"
+        );
+    }
+
+    /// Issue #533 — is the clear-before-truncate window actually reachable?
+    ///
+    /// `pub_comp` clears the durable outbound id and THEN truncates, two awaits
+    /// with a crash window between them. ADR 0074 Decision 2 refuses to widen
+    /// that window; what nobody had established is what happens if a crash lands
+    /// inside it. If the entry is still in the log while the id record is gone,
+    /// a restore has nothing left to suppress the replay: the subscriber already
+    /// answered PUBCOMP and has no packet id to dedup against, so a re-delivery
+    /// is a duplicate at `QoS` 2 — the one thing exactly-once forbids, and NOT
+    /// covered by the "a duplicate at `QoS` 1 is spec-legal" tolerance the ADR's
+    /// removability argument rests on.
+    ///
+    /// The window is opened deterministically rather than by timing: the store's
+    /// `ack` is parked, so the clear lands and the truncate never does, which is
+    /// precisely the crash state. A second hub over the SAME store is the
+    /// restart.
+    ///
+    /// This test asserts the OUTCOME, whichever way it falls, and says which in
+    /// its failure message — it is an investigation, and a negative result is a
+    /// result. If it fails, the gap is real in today's inline path and a shorter
+    /// window is not the fix; the repair is atomic or recoverable completion
+    /// covering both the id retirement and the delivery retirement.
+    ///
+    /// REPRODUCED, and `#[ignore]`d as an unfixed defect rather than deleted or
+    /// weakened: the control above passes, so the replay is caused by the lost
+    /// truncate and nothing else. Un-ignore it with the repair.
+    #[tokio::test]
+    #[ignore = "reproduction for #533: a completed QoS 2 delivery replays if a crash lands between clear_outbound and the truncate"]
+    async fn a_completed_qos2_delivery_does_not_replay_when_the_truncate_is_lost() {
+        let store = ParkingStore::new();
+        let hub1 = start_hub_with_arc(store.clone());
+
+        // A PERSISTENT QoS 2 subscriber: the delivery must reach the durable log,
+        // which is the thing the lost truncate leaves behind.
+        let (mut rx, _) = attach(&hub1, "s533", 1, false).await;
+        subscribe_qos(&hub1, "s533", "x/t", QoS::ExactlyOnce);
+        publish_qos2(&hub1, "x/t", b"once");
+        let pkid = pkid_of(
+            &timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .expect("the QoS 2 delivery")
+                .unwrap(),
+        );
+
+        // Complete the handshake with the truncate parked: `clear_outbound` lands,
+        // `ack` does not. That IS the crash window, held open.
+        let _release = store.park_ack("s533");
+        pub_rec(&hub1, "s533", pkid);
+        pub_comp(&hub1, "s533", pkid);
+
+        // Wait for the clear to be durable, so we are past it and inside the window.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !store
+            .ops()
+            .iter()
+            .any(|(op, d)| op == "clear" && d.starts_with("s533 "))
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the outbound id clear never landed; ops: {:?}",
+                store.ops()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        // CRASH: abandon this hub (its loop is parked in the truncate) and restore
+        // from the durable state exactly as a restart would.
+        drop(rx);
+        drop(hub1);
+        let hub2 = start_hub_with_arc(store.clone());
+        let (mut rx2, present) = attach(&hub2, "s533", 2, false).await;
+        assert!(present, "the persistent session must be restored");
+
+        // The subscriber already answered PUBCOMP. Anything arriving now is a
+        // second copy of a completed exactly-once delivery.
+        let replayed = timeout(Duration::from_millis(750), rx2.recv()).await;
+        assert!(
+            replayed.is_err(),
+            "a COMPLETED QoS 2 delivery replayed after a crash between \
+             clear_outbound and the truncate (#533): the subscriber answered \
+             PUBCOMP, its packet id is gone, and it has nothing left to dedup \
+             against — so this is a duplicate at QoS 2, in TODAY's inline path. \
+             Window width was never the safety mechanism; the repair is atomic or \
+             recoverable completion covering both id and delivery retirement. \
+             Got: {replayed:?}"
+        );
+    }
+
     /// ADR 0074-T3 / issue #575 — the falsifier Decision 2 never had.
     ///
     /// ADR 0074 says `QoS` 2 completion KEEPS the synchronous truncate, and that is
