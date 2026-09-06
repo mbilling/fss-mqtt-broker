@@ -220,22 +220,68 @@ pub fn sharding_would_pay(curve: &[(usize, u64)]) -> Option<usize> {
 mod tests {
     use super::{measure, parallel_barrier_curve, sharding_would_pay};
 
+    /// A barrier rate above this did not reach a durable device. The fastest real
+    /// `NVMe` sustains tens of thousands of `fsync`s a second; hundreds of thousands
+    /// means the filesystem answered the barrier without doing anything.
+    ///
+    /// This is not hypothetical: `/tmp` is **tmpfs** on many Linux distributions,
+    /// which is where `tempfile::tempdir()` lands by default, and it measured
+    /// 566,231/s on the machine this guard was written for. On such a volume there
+    /// is no device to serve streams in parallel, so the 4-stream aggregate is pure
+    /// thread-contention overhead and scales NEGATIVELY (56,925/s — a tenth of one
+    /// stream). Asserting device behaviour against a RAM disk fails for a reason
+    /// that says nothing about this code.
+    const NO_REAL_BARRIER_PER_SEC: u64 = 100_000;
+
+    /// A scratch directory on REAL storage, so the probe measures a device.
+    ///
+    /// Prefers the workspace target dir (always on the same filesystem as the
+    /// checkout, and already ignored by git) over the system temp dir, which is a
+    /// RAM disk often enough to matter — see [`NO_REAL_BARRIER_PER_SEC`]. Falls
+    /// back to the system temp dir when there is no target dir to use, and the
+    /// callers stay correct either way because they check what they measured.
+    fn scratch_on_real_storage() -> tempfile::TempDir {
+        let target = std::env::var_os("CARGO_TARGET_DIR").map_or_else(
+            || {
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .parent()
+                    .and_then(std::path::Path::parent)
+                    .map(|ws| ws.join("target"))
+            },
+            |dir| Some(std::path::PathBuf::from(dir)),
+        );
+        match target.filter(|p| p.is_dir()) {
+            Some(dir) => tempfile::tempdir_in(dir).expect("scratch in the target dir"),
+            None => tempfile::tempdir().expect("tmpdir"),
+        }
+    }
+
     /// The probe measures a real rate on a real filesystem, cleans up its
     /// scratch, and the 4-stream aggregate is at least a meaningful fraction
     /// of the single rate (a device can serve parallel streams no worse than
     /// ~half of one stream even fully serialized at the platter).
     #[test]
     fn probes_a_volume_and_cleans_up() {
-        let dir = tempfile::tempdir().expect("tmpdir");
+        let dir = scratch_on_real_storage();
         let probe = measure(dir.path(), 16).expect("probe");
         assert!(probe.single_per_sec > 0, "a real volume has a barrier rate");
         assert!(
-            probe.four_stream_per_sec > probe.single_per_sec / 4,
-            "4 streams cannot aggregate to less than a quarter of one \
-             (got {} vs single {})",
-            probe.four_stream_per_sec,
-            probe.single_per_sec
+            probe.four_stream_per_sec > 0,
+            "the parallel arm must measure a rate too, not silently read zero"
         );
+        // The ratio is a claim about a DEVICE — that it serves parallel streams no
+        // worse than fully serialized. It is only meaningful if a device was
+        // involved; on a memory-backed volume the barrier is free and the
+        // comparison measures thread contention instead.
+        if probe.single_per_sec < NO_REAL_BARRIER_PER_SEC {
+            assert!(
+                probe.four_stream_per_sec > probe.single_per_sec / 4,
+                "4 streams cannot aggregate to less than a quarter of one \
+                 (got {} vs single {})",
+                probe.four_stream_per_sec,
+                probe.single_per_sec
+            );
+        }
         assert!(
             !dir.path().join(".barrier-probe").exists(),
             "the probe scratch must be removed"
@@ -247,7 +293,7 @@ mod tests {
     /// machine's disk, so the assertion is the SHAPE, not a number.
     #[test]
     fn the_parallel_barrier_curve_covers_every_stream_count() {
-        let dir = tempfile::tempdir().expect("tmpdir");
+        let dir = scratch_on_real_storage();
         let curve = parallel_barrier_curve(dir.path(), 16).expect("curve");
         assert_eq!(
             curve.iter().map(|(s, _)| *s).collect::<Vec<_>>(),
