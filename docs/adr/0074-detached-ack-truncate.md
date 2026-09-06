@@ -56,6 +56,16 @@ off-loop; the publisher/subscriber ack paths never wait on it.**
    id-state (ADR 0057); the pre-existing crash window between `clear_outbound`
    and the truncate stays exactly the width it is today — this ADR widens no
    QoS 2 window. QoS 2 is also not the hot path this ADR exists for.
+
+   > **2026-09-07 (issue #533).** Not widening that window was the right call,
+   > but the window itself was never safe: a crash inside it replayed a COMPLETED
+   > QoS 2 delivery under a fresh packet id. Reproduced, then closed by inverting
+   > the order — the id record now outlives the queued delivery (see ADR 0057's
+   > as-delivered note). Read this decision as "QoS 2 completion stays ordered
+   > and on-loop", not as "that window is tolerable": the ordering is the
+   > correctness property, and it is why an off-loop flush cannot serve this path.
+   > Decision 1's removability argument does not transfer, resting as it does on
+   > "a duplicate at QoS 1 is spec-legal".
 3. **Bounds, stated:** the flusher's map holds at most one offset per session;
    per-session disk lag is bounded by the flush cadence (milliseconds at the
    measured truncate latency), and entries above the flushed watermark are

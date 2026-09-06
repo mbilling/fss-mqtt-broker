@@ -4134,22 +4134,31 @@ impl Hub {
 
     /// [`truncate_acked`](Self::truncate_acked), but awaited inline — the `QoS` 2
     /// completion path keeps this (ADR 0074 Decision 2): its exactly-once rests on
-    /// the durable outbound id-state (ADR 0057), and the pre-existing crash window
-    /// between the outbound-id clear and the truncate must stay exactly as wide as it is.
-    async fn truncate_acked_now(&mut self, client: &ClientId) {
+    /// the durable outbound id-state (ADR 0057), so the completion's two durable
+    /// steps must stay ORDERED against each other, which an off-loop flush cannot
+    /// promise.
+    ///
+    /// Returns `false` only when a truncate was attempted and FAILED — the caller
+    /// uses that to keep the outbound id record alive, because an id retired over a
+    /// delivery still in the log is the one combination that replays as a duplicate
+    /// (issue #533). "Nothing to truncate" is `true`: there is no entry to outlive.
+    #[must_use]
+    async fn truncate_acked_now(&mut self, client: &ClientId) -> bool {
         let Some(up_to) = self
             .inflight
             .get_mut(client)
             .and_then(Inflight::advance_ack)
         else {
-            return;
+            return true;
         };
         if let Err(e) = self.store.ack(client, up_to).await {
             // Not fatal: the entries stay in the log and are replayed on the next resume.
             // A duplicate at QoS 1 is spec-legal; losing one would not be.
             debug!(client = %client.0, up_to, error = %e,
                    "failed to truncate the acknowledged session log");
+            return false;
         }
+        true
     }
 
     /// PUBREC: advances a `QoS` 2 delivery to the release phase (send PUBREL).
@@ -4206,18 +4215,49 @@ impl Hub {
             return;
         }
         let completed = self.complete_pending(client, pkid, OutState::AwaitingPubComp);
-        // ADR 0057: release the durable id UNCONDITIONALLY, not only when an in-memory
-        // entry completed. A PUBCOMP with no pending entry is how an ORPHANED table entry
-        // (a clear that failed earlier, tolerated by design) finally releases: the
-        // restore sent its spurious PUBREL, the subscriber answered (MQTT-4.3.3), and
-        // this is the retry the tolerance was counting on. Clearing an id the store does
-        // not hold is a no-op. A failure here is logged, and the same cycle retries it.
-        if let Err(e) = self.store.clear_outbound(client, pkid).await {
-            warn!(client = %client.0, pkid, error = %e,
-                  "outbound QoS2 id clear failed; a restore may send one spurious PUBREL");
+        // ORDER IS THE CORRECTNESS PROPERTY HERE (issue #533): the durable id record
+        // must OUTLIVE the queued delivery, never the other way round.
+        //
+        // This used to clear the id first and truncate second, which left one crash
+        // window with no recovery: the entry still in the log, its id record gone, and
+        // a restore with nothing left to suppress the replay — so a subscriber that had
+        // already answered PUBCOMP was re-sent the message as a FRESH publish, dup=false,
+        // under a new packet id it could not dedup against. A duplicate at QoS 2.
+        //
+        // Truncating first inverts that. A crash between the two now leaves an id
+        // record whose message has left the log, which is a state the design already
+        // prices in and `finish_attach` already handles: released phase sends the
+        // spurious PUBREL, the subscriber answers PUBCOMP (MQTT-4.3.3), and the clear
+        // below — unconditional for exactly this reason — finally retires it. A
+        // tolerated extra PUBREL in place of an unrecoverable duplicate.
+        let truncated = if completed {
+            self.truncate_acked_now(client).await
+        } else {
+            // Nothing completed here, so there is no log entry for the id to outlive.
+            // This is the ORPHAN-RELEASE path the unconditional clear below exists for.
+            true
+        };
+        // ADR 0057: release the durable id UNCONDITIONALLY of `completed`, not only when
+        // an in-memory entry completed. A PUBCOMP with no pending entry is how an
+        // ORPHANED table entry (a clear that failed earlier, tolerated by design) finally
+        // releases: the restore sent its spurious PUBREL, the subscriber answered
+        // (MQTT-4.3.3), and this is the retry the tolerance was counting on. Clearing an
+        // id the store does not hold is a no-op. A failure here is logged, and the same
+        // cycle retries it.
+        //
+        // Skipped only when the truncate itself FAILED: the entry is then still in the
+        // log, and retiring its id would manufacture the very state above.
+        if truncated {
+            if let Err(e) = self.store.clear_outbound(client, pkid).await {
+                warn!(client = %client.0, pkid, error = %e,
+                      "outbound QoS2 id clear failed; a restore may send one spurious PUBREL");
+            }
+        } else {
+            warn!(client = %client.0, pkid,
+                  "keeping the outbound QoS2 id: its truncate failed, so the delivery is \
+                   still in the log and retiring the id now would replay it as a duplicate");
         }
         if completed {
-            self.truncate_acked_now(client).await;
             self.drain_backlog(client);
         }
     }
@@ -16418,7 +16458,6 @@ mod tests {
     /// weakened: the control above passes, so the replay is caused by the lost
     /// truncate and nothing else. Un-ignore it with the repair.
     #[tokio::test]
-    #[ignore = "reproduction for #533: a completed QoS 2 delivery replays if a crash lands between clear_outbound and the truncate"]
     async fn a_completed_qos2_delivery_does_not_replay_when_the_truncate_is_lost() {
         let store = ParkingStore::new();
         let hub1 = start_hub_with_arc(store.clone());
@@ -16441,20 +16480,20 @@ mod tests {
         pub_rec(&hub1, "s533", pkid);
         pub_comp(&hub1, "s533", pkid);
 
-        // Wait for the clear to be durable, so we are past it and inside the window.
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while !store
-            .ops()
-            .iter()
-            .any(|(op, d)| op == "clear" && d.starts_with("s533 "))
-        {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the outbound id clear never landed; ops: {:?}",
-                store.ops()
-            );
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+        // Confirm we are INSIDE the window rather than assuming it: the completion
+        // path is now parked in the truncate, which (per #575) blocks the whole hub
+        // loop, so an unrelated attach cannot finish. That is the observable.
+        assert!(
+            timeout(
+                Duration::from_millis(500),
+                attach(&hub1, "probe533", 9, true)
+            )
+            .await
+            .is_err(),
+            "the hub was not parked in the truncate, so this test never opened the \
+             crash window it exists to close; ops: {:?}",
+            store.ops()
+        );
 
         // CRASH: abandon this hub (its loop is parked in the truncate) and restore
         // from the durable state exactly as a restart would.
@@ -16464,19 +16503,42 @@ mod tests {
         let (mut rx2, present) = attach(&hub2, "s533", 2, false).await;
         assert!(present, "the persistent session must be restored");
 
-        // The subscriber already answered PUBCOMP. Anything arriving now is a
-        // second copy of a completed exactly-once delivery.
-        let replayed = timeout(Duration::from_millis(750), rx2.recv()).await;
-        assert!(
-            replayed.is_err(),
-            "a COMPLETED QoS 2 delivery replayed after a crash between \
-             clear_outbound and the truncate (#533): the subscriber answered \
-             PUBCOMP, its packet id is gone, and it has nothing left to dedup \
-             against — so this is a duplicate at QoS 2, in TODAY's inline path. \
-             Window width was never the safety mechanism; the repair is atomic or \
-             recoverable completion covering both id and delivery retirement. \
-             Got: {replayed:?}"
-        );
+        // What may arrive is the whole question, so assert on IDENTITY, not silence.
+        //
+        // LEGAL: nothing; a bare PUBREL (the orphan path — the subscriber answers
+        // PUBCOMP and the id retires); or the SAME message resumed under its ORIGINAL
+        // packet id with DUP set, which is what QoS 2 recovery is supposed to look
+        // like and what the subscriber dedups against.
+        //
+        // ILLEGAL, and what this test exists to catch: the message under a DIFFERENT
+        // packet id with dup=false. The subscriber completed this exchange; a fresh id
+        // gives it nothing to dedup against and it cannot even tell this is a
+        // retransmission. That is a duplicate at QoS 2.
+        match timeout(Duration::from_millis(750), rx2.recv()).await {
+            Err(_) | Ok(None) => {}
+            Ok(Some(packet)) => match *packet {
+                Packet::PubRel(_) => {}
+                Packet::Publish(ref pub_) => {
+                    assert_eq!(
+                        pub_.pkid,
+                        Some(pkid),
+                        "a COMPLETED QoS 2 delivery came back under a DIFFERENT packet \
+                         id after a crash in the completion window (#533): the \
+                         subscriber answered PUBCOMP and has nothing to dedup this \
+                         against, so it is a duplicate at QoS 2. The id record must \
+                         outlive the queued delivery, never the reverse"
+                    );
+                    assert!(
+                        pub_.dup,
+                        "a QoS 2 resume must carry DUP so the subscriber can recognise \
+                         it as a retransmission of an id it may already hold; got a \
+                         fresh-looking publish under pkid {:?}",
+                        pub_.pkid
+                    );
+                }
+                ref other => panic!("unexpected packet after restore: {other:?}"),
+            },
+        }
     }
 
     /// ADR 0074-T3 / issue #575 — the falsifier Decision 2 never had.
