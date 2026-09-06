@@ -22,6 +22,7 @@ ROOT = Path(__file__).resolve().parent.parent
 ADR_DIR = ROOT / "docs" / "adr"
 DELIVERY_DIR = ROOT / "docs" / "delivery"
 STATUS_FILE = DELIVERY_DIR / "STATUS.md"
+ISSUE_URL = "https://github.com/mbilling/fss-mqtt-broker/issues/"
 
 # Controlled task-status vocabulary -> display label. Order is the dashboard sort
 # order for the "open work" view (most actionable first).
@@ -97,6 +98,25 @@ def parse_frontmatter(text: str, path: Path) -> dict:
             raise DocError(f"{path.name}: done task {t['id']} needs 'evidence'")
         if t["status"] in ("blocked", "deferred") and not t.get("notes"):
             raise DocError(f"{path.name}: {t['status']} task {t['id']} needs 'notes'")
+        # Every task that still needs doing is owned by a GitHub issue, and the
+        # delivery record is the reflection of that state — not a second, drifting
+        # plan. This is the gate: an open task with no issue is work that exists
+        # only here, which is how the 0073 T3/T4 footer went stale for a month.
+        if t["status"] in OPEN_STATUSES and not t.get("issue"):
+            raise DocError(
+                f"{path.name}: {t['status']} task {t['id']} has no 'issue' — open work "
+                "must be tracked in a GitHub issue (see docs/delivery/README.md)"
+            )
+        if t.get("issue") and not re.fullmatch(r"\d+", t["issue"]):
+            raise DocError(
+                f"{path.name}: task {t['id']} has issue {t['issue']!r} — bare number only "
+                "(e.g. `issue: 537`), no '#' and no URL"
+            )
+        # A closed task keeps its issue for the audit trail, but a done task must
+        # point at evidence, not at a plan.
+        if t["status"] in ("done", "cut") and t.get("issue") and not t.get("evidence") \
+                and t["status"] == "done":
+            raise DocError(f"{path.name}: done task {t['id']} needs 'evidence'")
     # A duplicated task id renders the same row twice and lets two different statuses
     # claim one id — the dashboard then says two contradictory things about one task.
     # (Caught in the wild: 0060 carried T1/T2 twice after an edit re-added them.)
@@ -107,12 +127,23 @@ def parse_frontmatter(text: str, path: Path) -> dict:
     return meta
 
 
+def issue_cell(t: dict) -> str:
+    """The task's owning GitHub issue, as a linked `#NNN`, or an em dash."""
+    num = t.get("issue")
+    return f"[#{num}]({ISSUE_URL}{num})" if num else "—"
+
+
 def task_table(tasks: list[dict]) -> str:
-    rows = ["| Task | Status | When | Evidence / notes |", "|------|--------|------|------------------|"]
+    rows = [
+        "| Task | Status | Issue | When | Evidence / notes |",
+        "|------|--------|-------|------|------------------|",
+    ]
     for t in tasks:
         when = t.get("date", "—") or "—"
         info = t.get("evidence") or t.get("notes") or ""
-        rows.append(f"| {t['id']} | {STATUS_LABEL[t['status']]} | {when} | {info} |")
+        rows.append(
+            f"| {t['id']} | {STATUS_LABEL[t['status']]} | {issue_cell(t)} | {when} | {info} |"
+        )
     return "\n".join(rows)
 
 
@@ -220,7 +251,10 @@ def build_dashboard(docs: list[dict]) -> str:
         for t in items:
             note = t.get("notes") or t.get("evidence") or ""
             suffix = f" — {note}" if note else ""
-            out.append(f"- `{t['id']}` {STATUS_LABEL[t['status']]}: {t['title']}{suffix}")
+            owner = f" ({issue_cell(t)})" if t.get("issue") else ""
+            out.append(
+                f"- `{t['id']}` {STATUS_LABEL[t['status']]}{owner}: {t['title']}{suffix}"
+            )
         out.append("")
     if not any_item:
         out += ["_None — every migrated task is done or cut._", ""]

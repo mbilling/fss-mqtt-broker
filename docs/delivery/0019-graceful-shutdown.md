@@ -72,17 +72,17 @@ id used by commits, tests, and the dashboard.
 ## Progress
 
 <!-- status-table:0019 -->
-| Task | Status | When | Evidence / notes |
-|------|--------|------|------------------|
-| 0019-T1 | ✅ done | 2026-06-21 | wait_for_shutdown_signal / graceful_shutdown |
-| 0019-T2 | ✅ done | 2026-06-21 | graceful_shutdown_drains_an_established_connection |
-| 0019-T3 | ✅ done | 2026-06-21 | health.rs draining AtomicBool |
-| 0019-T4 | ✅ done | 2026-06-22 | graceful_shutdown_sends_v5_server_shutting_down_disconnect |
-| 0019-T5 | ✅ done | 2026-06-22 | main.rs graceful_shutdown (driver.abort + raft shutdown) |
-| 0019-T6 | ✅ done | 2026-06-22 | a_graceful_leave_is_seen_dead_faster_than_failure_detection |
-| 0019-T7 | ✅ done | 2026-06-22 | persistence.rs; durable_node::a_persistent_durable_node_restarts_from_its_data_dir |
-| 0019-T8 | 💤 deferred | — | "Spike 2026-06-25 (openraft 0.9 transfer-API evaluation, the task's stated prerequisite): openraft 0.9.24 exposes NO public leadership-transfer/TimeoutNow API — Trigger has only elect/heartbeat/snapshot/purge_log. change_membership-remove-self steps the leader down internally (raft_core.rs:1311 -> leader_step_down) but does not provoke an immediate election, so the remaining voters still wait out their election timeout: it does not close the gap. Trigger::transfer_leader exists only on the alpha-only 0.10 line (latest 0.10.0-alpha.23, Jun 2026; no beta/RC/stable, no v0.9->v0.10 upgrade guide; maintainer keeps 0.9.24 as the production default). Deferred pending a stable openraft release exposing transfer_leader — pulling an alpha into the consensus core is a poor trade for a bounded ~1.5-3s graceful-leave gap (relaxed ADR 0026 timing) that already degrades safely via survivors' election." |
-| 0019-T9 | 💤 deferred | — | drain closes after current packet; durable state already protected by ADR 0018 + raft shutdown |
+| Task | Status | Issue | When | Evidence / notes |
+|------|--------|-------|------|------------------|
+| 0019-T1 | ✅ done | — | 2026-06-21 | wait_for_shutdown_signal / graceful_shutdown |
+| 0019-T2 | ✅ done | — | 2026-06-21 | graceful_shutdown_drains_an_established_connection |
+| 0019-T3 | ✅ done | — | 2026-06-21 | health.rs draining AtomicBool |
+| 0019-T4 | ✅ done | — | 2026-06-22 | graceful_shutdown_sends_v5_server_shutting_down_disconnect |
+| 0019-T5 | ✅ done | — | 2026-06-22 | main.rs graceful_shutdown (driver.abort + raft shutdown) |
+| 0019-T6 | ✅ done | — | 2026-06-22 | a_graceful_leave_is_seen_dead_faster_than_failure_detection |
+| 0019-T7 | ✅ done | — | 2026-06-22 | persistence.rs; durable_node::a_persistent_durable_node_restarts_from_its_data_dir |
+| 0019-T8 | 💤 deferred | — | — | "Spike 2026-06-25 (openraft 0.9 transfer-API evaluation, the task's stated prerequisite): openraft 0.9.24 exposes NO public leadership-transfer/TimeoutNow API — Trigger has only elect/heartbeat/snapshot/purge_log. change_membership-remove-self steps the leader down internally (raft_core.rs:1311 -> leader_step_down) but does not provoke an immediate election, so the remaining voters still wait out their election timeout: it does not close the gap. Trigger::transfer_leader exists only on the alpha-only 0.10 line (latest 0.10.0-alpha.23, Jun 2026; no beta/RC/stable, no v0.9->v0.10 upgrade guide; maintainer keeps 0.9.24 as the production default). Deferred pending a stable openraft release exposing transfer_leader — pulling an alpha into the consensus core is a poor trade for a bounded ~1.5-3s graceful-leave gap (relaxed ADR 0026 timing) that already degrades safely via survivors' election." |
+| 0019-T9 | 💤 deferred | — | — | drain closes after current packet; durable state already protected by ADR 0018 + raft shutdown |
 <!-- /status-table:0019 -->
 
 ## Changelog

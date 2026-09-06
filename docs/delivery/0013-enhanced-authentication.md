@@ -76,17 +76,17 @@ and the no-per-round-timeout limit remain open.
 ## Progress
 
 <!-- status-table:0013 -->
-| Task | Status | When | Evidence / notes |
-|------|--------|------|------------------|
-| 0013-T1 | ✅ done | 2026-06-17 | mqtt-auth/src/enhanced.rs (EnhancedAuthenticator, AuthSession, AuthStep) |
-| 0013-T2 | ✅ done | 2026-06-17 | conn.rs enhanced_auth + drive_auth_exchange |
-| 0013-T3 | ✅ done | 2026-06-17 | v5_enhanced_auth_unknown_method_is_rejected (CONNACK_V5_BAD_AUTH_METHOD 0x8C) |
-| 0013-T4 | ✅ done | 2026-06-17 | HmacChallengeAuthenticator; correct_proof_succeeds / wrong_secret_fails |
-| 0013-T5 | ✅ done | 2026-06-17 | v5_enhanced_auth_hmac_succeeds / v5_enhanced_auth_wrong_proof_is_rejected |
-| 0013-T6 | ✅ done | 2026-06-17 | reauthenticate(); v5_enhanced_auth_then_reauthentication |
-| 0013-T7 | ✅ done | 2026-06-17 | v5_reauthentication_method_change_is_protocol_error / v5_reauthentication_wrong_proof_disconnects |
-| 0013-T8 | 💤 deferred | — | ADR section 4 explicitly defers this — needs a trigger mechanism and interacts with the select-loop outbound path; only client-initiated re-auth is implemented (no server-side AUTH 0x19 send exists in conn.rs). |
-| 0013-T9 | ✅ done | 2026-06-24 | "drive_auth_exchange wraps each round's reply read in a tokio timeout of WireLimits.auth_round_timeout (configurable via MQTTD_AUTH_TIMEOUT); a stalled round aborts the exchange rather than pinning the connection." |
+| Task | Status | Issue | When | Evidence / notes |
+|------|--------|-------|------|------------------|
+| 0013-T1 | ✅ done | — | 2026-06-17 | mqtt-auth/src/enhanced.rs (EnhancedAuthenticator, AuthSession, AuthStep) |
+| 0013-T2 | ✅ done | — | 2026-06-17 | conn.rs enhanced_auth + drive_auth_exchange |
+| 0013-T3 | ✅ done | — | 2026-06-17 | v5_enhanced_auth_unknown_method_is_rejected (CONNACK_V5_BAD_AUTH_METHOD 0x8C) |
+| 0013-T4 | ✅ done | — | 2026-06-17 | HmacChallengeAuthenticator; correct_proof_succeeds / wrong_secret_fails |
+| 0013-T5 | ✅ done | — | 2026-06-17 | v5_enhanced_auth_hmac_succeeds / v5_enhanced_auth_wrong_proof_is_rejected |
+| 0013-T6 | ✅ done | — | 2026-06-17 | reauthenticate(); v5_enhanced_auth_then_reauthentication |
+| 0013-T7 | ✅ done | — | 2026-06-17 | v5_reauthentication_method_change_is_protocol_error / v5_reauthentication_wrong_proof_disconnects |
+| 0013-T8 | 💤 deferred | — | — | ADR section 4 explicitly defers this — needs a trigger mechanism and interacts with the select-loop outbound path; only client-initiated re-auth is implemented (no server-side AUTH 0x19 send exists in conn.rs). |
+| 0013-T9 | ✅ done | — | 2026-06-24 | "drive_auth_exchange wraps each round's reply read in a tokio timeout of WireLimits.auth_round_timeout (configurable via MQTTD_AUTH_TIMEOUT); a stalled round aborts the exchange rather than pinning the connection." |
 <!-- /status-table:0013 -->
 
 ## Changelog

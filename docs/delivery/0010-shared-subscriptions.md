@@ -68,16 +68,16 @@ id used by commits, tests, and the dashboard.
 ## Progress
 
 <!-- status-table:0010 -->
-| Task | Status | When | Evidence / notes |
-|------|--------|------|------------------|
-| 0010-T1 | ✅ done | 2026-06-17 | SharedSubscriptionTable in mqtt-core/src/shared.rs (matching_reports_group_members_in_order_with_qos) |
-| 0010-T2 | ✅ done | 2026-06-17 | parse_shared / parse_accepts_wellformed_and_rejects_malformed |
-| 0010-T3 | ✅ done | 2026-06-17 | select_shared (hub.rs); v5_shared_subscription_round_robins_one_member_each |
-| 0010-T4 | ✅ done | 2026-06-17 | v5_shared_subscription_skips_retained_but_ordinary_gets_it |
-| 0010-T5 | ✅ done | 2026-06-17 | min_qos in deliver_shared (hub.rs); shared membership rebuilt from persisted subscriptions (hub.rs reconcile loop, parse_shared) |
-| 0010-T6 | ✅ done | 2026-06-17 | shared_subscription_delivers_once_cluster_wide (cluster_chaos.rs) |
-| 0010-T7 | 💤 deferred | — | "STAYS DEFERRED — issue #245 shipped only the honest wire posture (CONNACK 0x29 = 0; a SUBSCRIBE using an identifier is refused with DISCONNECT 0xA1), NOT delivery, so nothing here is done. Delivery is tracked by issue #266, which owns this task. Design fact to preserve: the peer wire does NOT need to grow. Per §3.3.4 only the RECEIVING client's own identifiers may appear on a shared delivery — never another session's — so RemoteSharedDeliver resolves them locally on the target node and SharedMemberWire / WireAppProps stay unchanged. Also §3.8.4: no retained messages on a shared subscribe, so the retained-with-identifier case does not arise here." |
-| 0010-T8 | ✅ done | 2026-06-24 | "SharedSubscriptionTable::for_each_matching visits matching groups by reference (no member-list clone / allocation); hub::shared_candidates uses it on the per-publish path, cloning only the key + each retained candidate. matching() kept as the owned form (delegates to the visitor). Test for_each_matching_visits_the_same_groups_without_cloning; hub shared-selection suite green." |
+| Task | Status | Issue | When | Evidence / notes |
+|------|--------|-------|------|------------------|
+| 0010-T1 | ✅ done | — | 2026-06-17 | SharedSubscriptionTable in mqtt-core/src/shared.rs (matching_reports_group_members_in_order_with_qos) |
+| 0010-T2 | ✅ done | — | 2026-06-17 | parse_shared / parse_accepts_wellformed_and_rejects_malformed |
+| 0010-T3 | ✅ done | — | 2026-06-17 | select_shared (hub.rs); v5_shared_subscription_round_robins_one_member_each |
+| 0010-T4 | ✅ done | — | 2026-06-17 | v5_shared_subscription_skips_retained_but_ordinary_gets_it |
+| 0010-T5 | ✅ done | — | 2026-06-17 | min_qos in deliver_shared (hub.rs); shared membership rebuilt from persisted subscriptions (hub.rs reconcile loop, parse_shared) |
+| 0010-T6 | ✅ done | — | 2026-06-17 | shared_subscription_delivers_once_cluster_wide (cluster_chaos.rs) |
+| 0010-T7 | 💤 deferred | — | — | "STAYS DEFERRED — issue #245 shipped only the honest wire posture (CONNACK 0x29 = 0; a SUBSCRIBE using an identifier is refused with DISCONNECT 0xA1), NOT delivery, so nothing here is done. Delivery is tracked by issue #266, which owns this task. Design fact to preserve: the peer wire does NOT need to grow. Per §3.3.4 only the RECEIVING client's own identifiers may appear on a shared delivery — never another session's — so RemoteSharedDeliver resolves them locally on the target node and SharedMemberWire / WireAppProps stay unchanged. Also §3.8.4: no retained messages on a shared subscribe, so the retained-with-identifier case does not arise here." |
+| 0010-T8 | ✅ done | — | 2026-06-24 | "SharedSubscriptionTable::for_each_matching visits matching groups by reference (no member-list clone / allocation); hub::shared_candidates uses it on the per-publish path, cloning only the key + each retained candidate. matching() kept as the owned form (delegates to the visitor). Test for_each_matching_visits_the_same_groups_without_cloning; hub shared-selection suite green." |
 <!-- /status-table:0010 -->
 
 **Note:** ADR 0010 §5's per-node single-delivery limitation is explicitly superseded by

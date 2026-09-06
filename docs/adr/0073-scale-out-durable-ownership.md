@@ -197,7 +197,26 @@ again automatically.
 [docs/delivery/0073-scale-out-durable-ownership.md](../delivery/0073-scale-out-durable-ownership.md):
 T1 (the capability-gated domain + learner readiness + the end-to-end
 falsifier) and T2 (the mixed-version conservatism, unit-tested edge by edge)
-shipped together with this ADR's acceptance; T3 (grow/shrink migration soak
-at scale) and T4 (the measured 7/10-node capped-vs-uncapped A/B and the
-SCALE-CURVE.md/COMPARISON.md publication) remain planned — T4 gated on the
-Hetzner quota raise.
+shipped together with this ADR's acceptance. T3 (grow/shrink migration soak)
+is **done** — completed 2026-08-23 with the #390 grow hand-off fix and its
+deterministic falsifier.
+
+T4 is decomposed into the cost-ordered stages **T4.0–T4.5**, all planned: rig
+plumbing (both ownership arms on ONE provisioning, because ADR 0077-T4 measured
+~40% variance between separately provisioned clusters running the same binary),
+then an in-tree fleet-size migration soak, a ~€0.50 smoke, small paid runs, the
+measured 7/10-node slope with its SCALE-CURVE.md/COMPARISON.md publication, and
+an hours-scale soak/node-kill/partition tail last.
+
+The earlier "T4 gated on the Hetzner quota raise" note is **withdrawn**: that
+applied to full-ladder shapes. The durable lane's shape is 10+1 = 11 servers /
+44 vCPU, inside the existing project limits with no console raise (T4.4).
+
+T5 (planned) records the decision on the alternative this ADR does not take:
+independent regional/tenant cells with bounded cross-cell bridging, rather than
+one indefinitely scalable mesh. It composes with this decision rather than
+superseding it — the question is the unit of scaling, not whether the mesh
+should be efficient.
+
+Task status is carried in the delivery doc's frontmatter, and every open task
+names the GitHub issue that owns it — see the `issue:` field there.

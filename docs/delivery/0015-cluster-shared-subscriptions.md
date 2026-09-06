@@ -43,6 +43,11 @@ tasks:
     status: done
     date: 2026-06-24
     evidence: "SharedGroupsWire carries per-member liveness (client,qos,online); shared_snapshot tags each member from self.online; inbound gossip builds hub::RemoteSharedGroup with the bit; select_shared prefers any member online on its home node (local or gossiped-remote) and falls back to local-persistent then any-remote, so an offline-at-home remote member is no longer chosen over a live one. Test shared_selection_skips_an_offline_remote_member; round-robin + peer roundtrip still green."
+  - id: 0015-T9
+    title: "ADR prose matches shipped selection: document the locality preference (#511 default) and the indexed remote path (#481/#524) alongside the original global-round-robin description, and state the load-distribution consequence"
+    status: planned
+    issue: 574
+    notes: "Selection policy is operator-visible: with locality on, a consumer's share of a shared group follows its host node's share of publishers, not round-robin across the group — an operator sizing a $share fan-in from the current ADR text would predict even distribution and measure skew. MQTT leaves shared selection implementation-defined, so this is documentation accuracy, not a conformance defect; fairness/spillover itself is a separate option under #537 Phase 3. Raised by the 2026-09-06 scaling review.
 ---
 
 # Delivery — ADR 0015: Cluster-wide shared subscriptions
@@ -71,16 +76,17 @@ flags as costs, not unbuilt mechanism.
 ## Progress
 
 <!-- status-table:0015 -->
-| Task | Status | When | Evidence / notes |
-|------|--------|------|------------------|
-| 0015-T1 | ✅ done | 2026-06-17 | hub.rs cluster-wide shared selection (~1133) -> deliver_to_client / PeerMessage::SharedDeliver |
-| 0015-T2 | ✅ done | 2026-06-17 | PeerMessage::SharedInterest send/handle; RemoteSharedInterest handler; per-peer snapshot in node-id order |
-| 0015-T3 | ✅ done | 2026-06-17 | RemotePublish delivers to ordinary subscribers only (no shared selection); shared rides SharedDeliver only |
-| 0015-T4 | ✅ done | 2026-06-17 | RemoteSharedDeliver -> deliver_to_client; deliver_to_client online-or-queue helper |
-| 0015-T5 | ✅ done | 2026-06-17 | shared_selection_round_robins_local_and_remote_member; shared_subscription_round_robins_one_member |
-| 0015-T6 | ✅ done | 2026-06-17 | shared_subscription_delivers_once_cluster_wide (cluster_chaos.rs); v5_shared_subscription_round_robins_one_member_each |
-| 0015-T7 | ✅ done | 2026-06-24 | "PeerMessage::SharedDeliver gained message_expiry: Option<u32>; send_shared_to_peer carries the publisher's interval and the RemoteSharedDeliver handler applies it to deliver_to_client instead of None. Peer roundtrip covers the wire field." |
-| 0015-T8 | ✅ done | 2026-06-24 | "SharedGroupsWire carries per-member liveness (client,qos,online); shared_snapshot tags each member from self.online; inbound gossip builds hub::RemoteSharedGroup with the bit; select_shared prefers any member online on its home node (local or gossiped-remote) and falls back to local-persistent then any-remote, so an offline-at-home remote member is no longer chosen over a live one. Test shared_selection_skips_an_offline_remote_member; round-robin + peer roundtrip still green." |
+| Task | Status | Issue | When | Evidence / notes |
+|------|--------|-------|------|------------------|
+| 0015-T1 | ✅ done | — | 2026-06-17 | hub.rs cluster-wide shared selection (~1133) -> deliver_to_client / PeerMessage::SharedDeliver |
+| 0015-T2 | ✅ done | — | 2026-06-17 | PeerMessage::SharedInterest send/handle; RemoteSharedInterest handler; per-peer snapshot in node-id order |
+| 0015-T3 | ✅ done | — | 2026-06-17 | RemotePublish delivers to ordinary subscribers only (no shared selection); shared rides SharedDeliver only |
+| 0015-T4 | ✅ done | — | 2026-06-17 | RemoteSharedDeliver -> deliver_to_client; deliver_to_client online-or-queue helper |
+| 0015-T5 | ✅ done | — | 2026-06-17 | shared_selection_round_robins_local_and_remote_member; shared_subscription_round_robins_one_member |
+| 0015-T6 | ✅ done | — | 2026-06-17 | shared_subscription_delivers_once_cluster_wide (cluster_chaos.rs); v5_shared_subscription_round_robins_one_member_each |
+| 0015-T7 | ✅ done | — | 2026-06-24 | "PeerMessage::SharedDeliver gained message_expiry: Option<u32>; send_shared_to_peer carries the publisher's interval and the RemoteSharedDeliver handler applies it to deliver_to_client instead of None. Peer roundtrip covers the wire field." |
+| 0015-T8 | ✅ done | — | 2026-06-24 | "SharedGroupsWire carries per-member liveness (client,qos,online); shared_snapshot tags each member from self.online; inbound gossip builds hub::RemoteSharedGroup with the bit; select_shared prefers any member online on its home node (local or gossiped-remote) and falls back to local-persistent then any-remote, so an offline-at-home remote member is no longer chosen over a live one. Test shared_selection_skips_an_offline_remote_member; round-robin + peer roundtrip still green." |
+| 0015-T9 | ⬜ planned | [#574](https://github.com/mbilling/fss-mqtt-broker/issues/574) | — | "Selection policy is operator-visible: with locality on, a consumer's share of a shared group follows its host node's share of publishers, not round-robin across the group — an operator sizing a $share fan-in from the current ADR text would predict even distribution and measure skew. MQTT leaves shared selection implementation-defined, so this is documentation accuracy, not a conformance defect; fairness/spillover itself is a separate option under #537 Phase 3. Raised by the 2026-09-06 scaling review. |
 <!-- /status-table:0015 -->
 
 ## Changelog

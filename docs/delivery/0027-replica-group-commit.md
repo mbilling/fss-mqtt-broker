@@ -46,12 +46,12 @@ group-commit writer.
 ## Progress
 
 <!-- status-table:0027 -->
-| Task | Status | When | Evidence / notes |
-|------|--------|------|------------------|
-| 0027-T1 | ✅ done | 2026-06-24 | "cluster_log::ReplicaState::apply_batch persists all accepted ops in one Durability::Immediate transaction; apply delegates to the shared persist_batch/apply_in_memory helpers. Tests: apply_batch_persists_a_whole_burst_in_one_commit (durable across reopen), apply_batch_fences_stale_ops_in_slice_order (per-op fencing == apply), apply_batch_applies_in_order_with_a_trailing_truncate (order + watermark survive reopen), apply_batch_of_one_equals_apply." |
-| 0027-T2 | ✅ done | 2026-06-24 | "durable_plane::spawn_replica_writer drains its mpsc backlog (recv + try_recv) and applies the burst with one apply_batch off a spawn_blocking; DurablePlane::handle's Replicate arm sends to it and awaits a oneshot instead of per-op spawn_blocking. Test replica_writer_group_commits_a_concurrent_burst (50 concurrent frames all accepted + durable); plane_carries_consensus_and_replication_over_the_wire still green through the new path." |
-| 0027-T3 | ✅ done | 2026-06-24 | "Durable overlay rebuilt with the writer, run under the loadgen: after formation the lease epoch went flat at 8 with a stable leader for 3+ minutes UNDER LOAD. Before group-commit the same load climbed the epoch continuously (8 -> 23 in 2 min, never settling). Steady-state under-load churn eliminated; only a one-time formation transient remains." |
-| 0027-T4 | ✅ done | 2026-06-24 | ADR 0026 delivery T5 marked done, pointing here as the implementation. |
+| Task | Status | Issue | When | Evidence / notes |
+|------|--------|-------|------|------------------|
+| 0027-T1 | ✅ done | — | 2026-06-24 | "cluster_log::ReplicaState::apply_batch persists all accepted ops in one Durability::Immediate transaction; apply delegates to the shared persist_batch/apply_in_memory helpers. Tests: apply_batch_persists_a_whole_burst_in_one_commit (durable across reopen), apply_batch_fences_stale_ops_in_slice_order (per-op fencing == apply), apply_batch_applies_in_order_with_a_trailing_truncate (order + watermark survive reopen), apply_batch_of_one_equals_apply." |
+| 0027-T2 | ✅ done | — | 2026-06-24 | "durable_plane::spawn_replica_writer drains its mpsc backlog (recv + try_recv) and applies the burst with one apply_batch off a spawn_blocking; DurablePlane::handle's Replicate arm sends to it and awaits a oneshot instead of per-op spawn_blocking. Test replica_writer_group_commits_a_concurrent_burst (50 concurrent frames all accepted + durable); plane_carries_consensus_and_replication_over_the_wire still green through the new path." |
+| 0027-T3 | ✅ done | — | 2026-06-24 | "Durable overlay rebuilt with the writer, run under the loadgen: after formation the lease epoch went flat at 8 with a stable leader for 3+ minutes UNDER LOAD. Before group-commit the same load climbed the epoch continuously (8 -> 23 in 2 min, never settling). Steady-state under-load churn eliminated; only a one-time formation transient remains." |
+| 0027-T4 | ✅ done | — | 2026-06-24 | ADR 0026 delivery T5 marked done, pointing here as the implementation. |
 <!-- /status-table:0027 -->
 
 ## Changelog

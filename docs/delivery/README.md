@@ -42,6 +42,14 @@ Task status (`status`): one of —
 
 Only `done` requires `evidence`. `blocked`/`deferred` require `notes`.
 
+**Every open task requires `issue`.** `planned`, `in-progress` and `blocked` are
+the statuses that mean *this still needs doing*, and work that needs doing is
+owned by a GitHub issue — the delivery record reflects that state, it is not a
+second plan running beside it. `gen-status.py` fails if an open task has no
+issue, so the two cannot drift. `deferred` and `cut` need no issue (they are
+explicitly not work in progress); `done` keeps whatever issue it had, next to
+its `evidence`.
+
 ## Frontmatter schema
 
 The delivery doc begins with a YAML block. Keep it to this constrained shape — the
@@ -60,6 +68,10 @@ tasks:
     date: 2026-06-21        # YYYY-MM-DD; when it reached its current status
     evidence: graceful_shutdown_drains_an_established_connection
     notes: optional one-liner
+  - id: 0019-T2
+    title: Drain deadline surfaced to the operator
+    status: planned
+    issue: 544              # REQUIRED while open. Bare number: no '#', no URL.
 ---
 ```
 
@@ -68,7 +80,14 @@ reference them, so never renumber — append new ids, mark obsolete ones `cut`.
 
 ## Workflow
 
-- Adding work to a decision → add a task to its delivery doc's frontmatter (`planned`).
-- Starting it → `in-progress`; finishing it → `done` + `evidence` + `date`.
+- Adding work to a decision → **open a GitHub issue first**, then add the task to
+  its delivery doc's frontmatter (`planned` + `issue:`). The issue is where the
+  work is discussed and closed; the task is where its status is recorded.
+- Starting it → `in-progress`; finishing it → `done` + `evidence` + `date`. Keep
+  the `issue:` line: a done task's issue is its audit trail.
+- Closing an issue → set its task `done` with `evidence` in the same change, so
+  the dashboard never claims planned work that has already shipped.
 - Regenerate the dashboard: `python3 scripts/gen-status.py`.
-- The ADR body does not change — if the *decision* changed, write a new ADR.
+- The ADR body does not change — if the *decision* changed, write a new ADR. An
+  ADR's **Delivery** footer summarises task state in prose, so it goes stale the
+  moment tasks move; re-read it whenever you change a task's status.

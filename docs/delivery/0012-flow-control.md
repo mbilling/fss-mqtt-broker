@@ -57,14 +57,14 @@ dashboard.
 ## Progress
 
 <!-- status-table:0012 -->
-| Task | Status | When | Evidence / notes |
-|------|--------|------|------------------|
-| 0012-T1 | ✅ done | 2026-06-17 | push_backlog/drain_backlog (hub.rs); v5_receive_maximum_limits_inflight_until_acked |
-| 0012-T2 | ✅ done | 2026-06-17 | flush_backlog_to_store (hub.rs); quota_backlog_spills_to_store_on_persistent_detach |
-| 0012-T3 | ✅ done | 2026-06-17 | SERVER_RECEIVE_MAXIMUM in conn.rs; v5_receive_maximum_is_advertised_and_forwarded / v311_receive_maximum_defaults_to_unlimited |
-| 0012-T4 | ✅ done | 2026-06-17 | Inflight.pending.len() gates send (hub.rs); v5_receive_maximum_limits_inflight_until_acked |
-| 0012-T5 | ✅ done | 2026-06-17 | MAX_BACKLOG / push_backlog; flow_control_backlog_is_bounded_drop_oldest |
-| 0012-T6 | ✅ done | 2026-06-24 | "The serve loop tracks unreleased inbound QoS2 ids (qos2_inflight); a new id beyond WireLimits.receive_maximum (configurable via MQTTD_RECEIVE_MAXIMUM) is answered with DISCONNECT 0x93 (v5 only). Test v5_receive_maximum_exceeded_disconnects_0x93." |
+| Task | Status | Issue | When | Evidence / notes |
+|------|--------|-------|------|------------------|
+| 0012-T1 | ✅ done | — | 2026-06-17 | push_backlog/drain_backlog (hub.rs); v5_receive_maximum_limits_inflight_until_acked |
+| 0012-T2 | ✅ done | — | 2026-06-17 | flush_backlog_to_store (hub.rs); quota_backlog_spills_to_store_on_persistent_detach |
+| 0012-T3 | ✅ done | — | 2026-06-17 | SERVER_RECEIVE_MAXIMUM in conn.rs; v5_receive_maximum_is_advertised_and_forwarded / v311_receive_maximum_defaults_to_unlimited |
+| 0012-T4 | ✅ done | — | 2026-06-17 | Inflight.pending.len() gates send (hub.rs); v5_receive_maximum_limits_inflight_until_acked |
+| 0012-T5 | ✅ done | — | 2026-06-17 | MAX_BACKLOG / push_backlog; flow_control_backlog_is_bounded_drop_oldest |
+| 0012-T6 | ✅ done | — | 2026-06-24 | "The serve loop tracks unreleased inbound QoS2 ids (qos2_inflight); a new id beyond WireLimits.receive_maximum (configurable via MQTTD_RECEIVE_MAXIMUM) is answered with DISCONNECT 0x93 (v5 only). Test v5_receive_maximum_exceeded_disconnects_0x93." |
 <!-- /status-table:0012 -->
 
 **Documented limit still in force:** the client→server (inbound) direction is advertised

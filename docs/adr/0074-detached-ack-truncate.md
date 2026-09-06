@@ -111,3 +111,11 @@ untouched (see Decision 2).
 T1 the watermark flusher + detached QoS 1 path (+ parked-store and coalescing
 tests, replay honesty covered by the existing truncation-prefix suites);
 T2 the measured A/B (`durable_bench`, and the next curve run's durable rows).
+
+T3 (planned) is Decision 2's missing falsifier: this ADR states that QoS 2
+completion keeps the inline truncate and that no QoS 2 window is widened, but
+nothing currently FAILS if that stops being true. It pins the cost the decision
+accepts — a stalled QoS 2 store must not stall unrelated sessions — with an
+assertion that does not depend on scheduler timing. Note that the `hub_dispatch`
+histogram cannot serve as that oracle: its timer starts after the command is
+dequeued, so time spent waiting in the channel is invisible to it.
