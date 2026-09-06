@@ -3037,6 +3037,44 @@ async fn start_swim(
     Ok(())
 }
 
+/// How long the accept loop pauses after `accept()` returns an error.
+///
+/// Fixed rather than exponential on purpose: the failure this exists for is a
+/// full fd table, which clears when connections drain and not as a function of
+/// how long we have been failing. 100 ms is ten attempts a second — free at this
+/// scale — so the listener is back within 100 ms of the resource returning,
+/// while a tight retry loop would burn a core and free nothing.
+const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
+
+/// How long to wait before accepting again after `accept()` failed.
+///
+/// The listener must NEVER exit on an accept error (issue #504). It used to
+/// `return` on any error, which killed that listener for the life of the
+/// process: the broker stayed up, kept answering `/metrics`, drained its
+/// existing connections to zero and never accepted another client — observed on
+/// v1.0.13 as `connections_total` frozen across two rungs while
+/// `connections_active` fell 4,099 → 1,171 → 0. A `warn!` was the only trace.
+///
+/// Every accept error is either per-connection or transient, so the loop always
+/// continues; the only question is whether to pause first.
+///
+/// - `ConnectionAborted` and `Interrupted` are routine, not faults: the peer
+///   vanished between its SYN and our `accept()`, or a signal landed. The next
+///   accept is unaffected, so retry immediately — pausing here would add latency
+///   for every other waiting client in response to a non-event. This is also the
+///   cheapest possible trigger for the old bug: one client hanging up at the
+///   wrong moment was enough to take the listener down.
+/// - Everything else is treated as resource exhaustion — EMFILE/ENFILE (the
+///   per-process and system fd limits) and ENOBUFS are what an overloaded broker
+///   actually hits — and pauses, because retrying an exhausted fd table in a
+///   tight loop empties nothing.
+fn accept_backoff(e: &std::io::Error) -> Duration {
+    match e.kind() {
+        std::io::ErrorKind::ConnectionAborted | std::io::ErrorKind::Interrupted => Duration::ZERO,
+        _ => ACCEPT_ERROR_BACKOFF,
+    }
+}
+
 /// The shared accept loop behind every TCP-based client listener (TLS, plaintext,
 /// WS, WSS): shutdown-select accept (ADR 0019), the admission gate BEFORE any
 /// per-connection work (ADR 0041 T1), the accepted-connection metric under `label`,
@@ -3068,11 +3106,33 @@ async fn serve_tcp_clients<F, Fut>(
             accepted = listener.accept() => match accepted {
                 Ok(accepted) => accepted,
                 Err(e) => {
-                    warn!(error = %e, listener = label, "listener accept failed");
+                    // Issue #504: continue, never return. A dead listener is
+                    // indistinguishable from a healthy idle one from outside —
+                    // the process is up, /metrics answers — so an accept error
+                    // that ended the loop was a silent, permanent outage.
+                    let pause = accept_backoff(&e);
+                    if pause.is_zero() {
+                        // Routine (the peer went away before we accepted it);
+                        // logging this at warn would drown the real thing.
+                        debug!(error = %e, listener = label, "accept skipped a dead peer");
+                    } else {
+                        warn!(error = %e, listener = label,
+                              backoff_ms = u64::try_from(pause.as_millis()).unwrap_or(u64::MAX),
+                              "listener accept failed; pausing, listener stays up");
+                    }
                     if let Some(m) = &policy.metrics {
                         m.connection_error("accept");
                     }
-                    return;
+                    if !pause.is_zero() {
+                        // Stay responsive to shutdown while paused (ADR 0019): a
+                        // broker asked to drain during an fd squeeze must not
+                        // wait out the backoff first.
+                        tokio::select! {
+                            () = shutdown.cancelled() => return,
+                            () = tokio::time::sleep(pause) => {}
+                        }
+                    }
+                    continue;
                 }
             },
         };
@@ -4381,12 +4441,13 @@ async fn wait_for_shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::{
-        hub, identity_source_from_config, positive_cap, queue_limits_from_config, requires_restart,
-        resolve_write_floor, runtime_precheck, subscriber_limits_from_config, unknown_flags,
-        watched_policy_paths, wire_limits_from_config, WriteFloor,
+        accept_backoff, hub, identity_source_from_config, positive_cap, queue_limits_from_config,
+        requires_restart, resolve_write_floor, runtime_precheck, subscriber_limits_from_config,
+        unknown_flags, watched_policy_paths, wire_limits_from_config, WriteFloor,
     };
     use mqtt_config::{Config, MinReplicas};
     use mqtt_storage::OverflowPolicy;
+    use std::time::Duration;
 
     /// Issue #269: the peer-bus CA/cert/key are IN the file-watch scope. Before this,
     /// only the peer CRL was watched — with a full bus configured, a rotated leaf sat
@@ -4743,5 +4804,71 @@ mod tests {
             resolve_write_floor(&on).unwrap(),
             WriteFloor::Majority { declared: 2 }
         );
+    }
+
+    // ---- accept-loop resilience (issue #504) -------------------------------
+    //
+    // The defect these pin was not that the backoff was wrong — there was no
+    // backoff. `serve_tcp_clients` returned on any accept error, so ONE failure
+    // ended that listener for the life of the process while the broker went on
+    // looking healthy from outside. The contract is therefore about what the
+    // loop does NOT do: it never stops accepting.
+
+    #[test]
+    fn a_vanished_peer_is_retried_immediately_not_paused() {
+        // ECONNABORTED: the client sent SYN then went away before we accepted it.
+        // Routine on any public listener, and under the old code sufficient on its
+        // own to kill the listener — no overload required.
+        let e = std::io::Error::from(std::io::ErrorKind::ConnectionAborted);
+        assert_eq!(
+            accept_backoff(&e),
+            Duration::ZERO,
+            "a dead peer must not delay the clients queued behind it"
+        );
+        let e = std::io::Error::from(std::io::ErrorKind::Interrupted);
+        assert_eq!(accept_backoff(&e), Duration::ZERO, "EINTR is not a fault");
+    }
+
+    #[test]
+    fn fd_exhaustion_pauses_so_the_listener_can_recover_instead_of_spinning() {
+        // EMFILE (24) / ENFILE (23) are what an overloaded broker actually hits;
+        // #504 froze accepts at ~38k connections. Retrying a full fd table in a
+        // tight loop burns a core and frees nothing, so these must pause — and
+        // must pause a BOUNDED amount, because the fds come back when the
+        // existing connections drain, which they did in the #504 run.
+        for raw in [24, 23, 105] {
+            let e = std::io::Error::from_raw_os_error(raw);
+            let pause = accept_backoff(&e);
+            assert!(
+                !pause.is_zero(),
+                "errno {raw} must back off rather than spin"
+            );
+            assert!(
+                pause <= Duration::from_secs(1),
+                "errno {raw} backed off {pause:?}; recovery must stay prompt once fds free"
+            );
+        }
+    }
+
+    #[test]
+    fn every_accept_error_still_leaves_the_listener_accepting() {
+        // The regression that matters: no error classification may be a stop.
+        // `accept_backoff` is total and returns a Duration — there is no "fatal"
+        // value it can return — so this asserts the property across a spread of
+        // kinds rather than trusting the match arms to stay exhaustive by eye.
+        for kind in [
+            std::io::ErrorKind::ConnectionAborted,
+            std::io::ErrorKind::Interrupted,
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::InvalidInput,
+            std::io::ErrorKind::OutOfMemory,
+            std::io::ErrorKind::Other,
+        ] {
+            let pause = accept_backoff(&std::io::Error::from(kind));
+            assert!(
+                pause <= Duration::from_secs(1),
+                "{kind:?} must yield a bounded pause, never an exit"
+            );
+        }
     }
 }

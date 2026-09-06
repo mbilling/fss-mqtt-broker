@@ -597,3 +597,112 @@ async fn the_audit_export_ships_a_verifiable_chain() {
         "the chain must close with the shutdown record"
     );
 }
+
+/// Issue #504 — the accept loop must SURVIVE an accept error.
+///
+/// Runs the real binary under a low `RLIMIT_NOFILE`, exhausts it with more
+/// sockets than the process has file descriptors, releases them, and then
+/// requires a fresh client to complete a full MQTT CONNECT.
+///
+/// This is the falsifier for the reported outage, not a unit of the fix: before
+/// the fix `serve_tcp_clients` returned on any `accept()` error, so the first
+/// `EMFILE` killed that listener for the life of the process — the broker
+/// stayed up, kept answering, and never accepted another client. Observed on
+/// v1.0.13 (ADR 0077 lane E) as `connections_total` frozen across two rungs and
+/// three minutes while `connections_active` drained 4,099 → 1,171 → 0.
+///
+/// The log assertion is what stops this passing vacuously: if the squeeze never
+/// actually produced an accept error, the reconnect proves nothing, so the test
+/// requires the broker to have logged one.
+///
+/// `ulimit -n` lowers the soft limit and needs no privilege. The TCP connects
+/// themselves always succeed — the kernel completes them into the listen
+/// backlog whether or not the application ever calls `accept()` — which is
+/// exactly why the assertion is an MQTT handshake and not a socket connect.
+#[tokio::test]
+async fn the_listener_survives_fd_exhaustion_and_accepts_again() {
+    const FD_LIMIT: usize = 128;
+    const SOCKETS: usize = 400;
+
+    let addr: SocketAddr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+    let mut cmd = Command::new("/bin/sh");
+    cmd.arg("-c")
+        .arg(format!("ulimit -n {FD_LIMIT}; exec \"$0\""))
+        .arg(env!("CARGO_BIN_EXE_mqttd"));
+    for (k, _) in std::env::vars() {
+        if k.starts_with("MQTTD_") {
+            cmd.env_remove(k);
+        }
+    }
+    let child = cmd
+        .env("MQTTD_NODE_ID", "fd-squeeze")
+        .env("MQTTD_PLAINTEXT_BIND", addr.to_string())
+        .env("MQTTD_ALLOW_ANONYMOUS", "1")
+        .env("MQTTD_ALLOW_EPHEMERAL_DURABILITY", "1")
+        .env("RUST_LOG", "warn")
+        // The accept-failure warning lands on STDOUT with the tracing subscriber.
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn the mqttd binary");
+    let mut guard = ChildGuard(child);
+
+    wait_until_listening(addr).await;
+
+    // Squeeze: hold far more sockets open than the broker has descriptors, so its
+    // accept() runs out. Held in a Vec — dropping one would hand the fd back.
+    let mut held = Vec::with_capacity(SOCKETS);
+    for _ in 0..SOCKETS {
+        match tokio::time::timeout(
+            Duration::from_millis(200),
+            tokio::net::TcpStream::connect(addr),
+        )
+        .await
+        {
+            Ok(Ok(s)) => held.push(s),
+            // Refused/timed out is fine and expected once the backlog fills: the
+            // squeeze is already on by then.
+            _ => break,
+        }
+    }
+    // Give the broker time to hit the wall and log it.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    // Release. The broker's own descriptors come back as its connection tasks end.
+    drop(held);
+
+    // The assertion: a full MQTT handshake, because a bare TCP connect would
+    // succeed into the backlog even with the listener dead.
+    let mut recovered = false;
+    for _ in 0..100 {
+        if Client::connect_v311_within(addr, "after-squeeze", true, Duration::from_millis(300))
+            .await
+            .is_some()
+        {
+            recovered = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    let _ = guard.0.kill();
+    let mut logs = String::new();
+    guard
+        .0
+        .stdout
+        .take()
+        .expect("stdout piped")
+        .read_to_string(&mut logs)
+        .unwrap();
+
+    assert!(
+        logs.contains("listener accept failed"),
+        "the squeeze never forced an accept error, so this test proves nothing about \
+         surviving one — raise SOCKETS or lower FD_LIMIT. Logs were: {logs}"
+    );
+    assert!(
+        recovered,
+        "the listener never accepted again after an accept error (#504): the broker \
+         process was still alive and the descriptors had been released. Logs were: {logs}"
+    );
+}
