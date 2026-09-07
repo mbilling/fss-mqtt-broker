@@ -356,11 +356,12 @@ LANE_E_MIN_INTERVAL="${LANE_E_MIN_INTERVAL:-5}"
 LANE_E_P99_BUDGET_MS="${LANE_E_P99_BUDGET_MS:-1000}"
 # Containers per driver is the HARNESS's ceiling and it is easy to cross by
 # accident, because it grows with the rung: each container is pinned to one vCPU
-# and the drivers are 8-vCPU CCX33s. Crossing it does not fail loudly — it just
+# and legacy inventories describe 8-vCPU CCX33s. New provider inventories
+# report vcpus explicitly; use the smallest driver's budget. Crossing it just
 # quietly stops offering the labelled rate, which is the single most expensive
 # failure mode this rig has (every wrong answer in the 2026-08 campaign was the
 # harness). Refused in the shape check, where it costs nothing.
-LANE_E_MAX_CONTAINERS_PER_DRIVER="${LANE_E_MAX_CONTAINERS_PER_DRIVER:-8}"
+LANE_E_MAX_CONTAINERS_PER_DRIVER="${LANE_E_MAX_CONTAINERS_PER_DRIVER:-$(inv '[.drivers[] | (.vcpus // 8)] | min')}"
 # SITE AFFINITY. Off by default, which is how T3/T4 were measured: every
 # container spans every broker (rotated_hosts), inherited from lane B where one
 # shared workload SHOULD be spread. For a tenancy lane that inheritance is
@@ -727,7 +728,7 @@ lane_e_shape() {
 	done
 	if [ "$worst" = 1 ]; then
 		sed 's/^/    /' "$OUT/laneE/shape.txt" >&2
-		die "lane E: a rung needs more containers per driver than $LANE_E_MAX_CONTAINERS_PER_DRIVER (one vCPU each on 8-vCPU drivers). Raise DRIVER_COUNT, shorten LANE_E_SITES, or lower LANE_E_PUB_CONTAINERS_PER_SITE — a driver that cannot offer the rate makes the rung look like a broker limit"
+		die "lane E: a rung needs more containers per driver than $LANE_E_MAX_CONTAINERS_PER_DRIVER (one vCPU each; budget from inventory or explicit override). Raise DRIVER_COUNT, shorten LANE_E_SITES, or lower LANE_E_PUB_CONTAINERS_PER_SITE — a driver that cannot offer the rate makes the rung look like a broker limit"
 	fi
 	say "[$N nodes] lane E shape (kept as laneE/shape.txt):"
 	sed 's/^/    /' "$OUT/laneE/shape.txt" >&2

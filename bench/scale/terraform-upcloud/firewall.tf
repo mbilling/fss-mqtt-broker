@@ -1,10 +1,7 @@
-# UpCloud firewalls are PER SERVER (no shared firewall object like Hetzner's),
-# and once rules exist the server defaults to DROP for unmatched inbound.
-# Posture identical to the Hetzner rig's shared firewall: SSH + ICMP in from
-# the public interface, everything in from the private mesh, all outbound.
-#
-# MQTTD_HEALTH_BIND is 0.0.0.0:8080 on the brokers and the drivers scrape it —
-# rule 3 keeps that bind reachable solely over the private network.
+# UpCloud firewalls are PER SERVER and cover public/utility interfaces only;
+# private SDN traffic bypasses them. Explicitly drop unmatched public inbound
+# traffic rather than relying on an implicit provider default. SSH + ICMP are
+# public; the MQTT/health/peer listeners remain reachable over private SDN.
 
 locals {
   bench_firewall_rules = [
@@ -29,19 +26,19 @@ locals {
       source    = "0.0.0.0/0"
     },
     {
-      comment   = "Everything from the private mesh"
-      direction = "in"
+      comment   = "All outbound IPv4"
+      direction = "out"
       action    = "accept"
       protocol  = ""
       family    = "IPv4"
       dport_s   = ""
       dport_e   = ""
-      source    = "10.99.1.0/24"
+      source    = "0.0.0.0/0"
     },
     {
-      comment   = "All outbound IPv4"
-      direction = "out"
-      action    = "accept"
+      comment   = "Drop unmatched public inbound"
+      direction = "in"
+      action    = "drop"
       protocol  = ""
       family    = "IPv4"
       dport_s   = ""

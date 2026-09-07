@@ -11,12 +11,26 @@
 
 set -euo pipefail
 . "$(dirname "$0")/lib.sh"
+. "$SCALE_DIR/cloud.sh"
+select_scale_cloud
 
 FORCE=0
 [ "${1:-}" = --force ] && FORCE=1
 
-TFDIR="$SCALE_DIR/terraform"
 TF=$(command -v terraform || command -v tofu || true)
+
+if [ "$CLOUD" = upcloud ]; then
+	# No hcloud commands here: a provider mismatch could delete an unrelated
+	# Hetzner benchmark while leaving every UpCloud server billing.
+	[ "$FORCE" = 0 ] || die "CLOUD=upcloud does not support --force; use state-backed teardown or inspect the UpCloud console"
+	require_scale_token
+	[ -n "$TF" ] || die "terraform (or tofu) not installed"
+	[ -f "$TFDIR/terraform.tfstate" ] || die "UpCloud state missing; inspect servers, storage, networks and server groups in the UpCloud console (do not use the Hetzner sweeper)"
+	(cd "$TFDIR" && "$TF" init -input=false && "$TF" destroy -auto-approve -input=false -var node_count=1) ||
+		die "UpCloud destroy failed; preserve state and inspect the UpCloud console before retrying"
+	say "UpCloud resources tracked in this state destroyed. No account-wide leak audit was performed; verify orphaned resources in the UpCloud console."
+	exit 0
+fi
 
 if [ -n "$TF" ] && [ -f "$TFDIR/terraform.tfstate" ]; then
 	say "terraform destroy from local state"

@@ -1,11 +1,12 @@
-# The inventory every bench/scale script consumes — byte-for-byte the same
-# schema as the Hetzner rig's output, so run.sh / run-curve.sh / collect.sh /
-# bootstrap-cluster.sh cannot tell the clouds apart:
+# Compatible inventory schema with extra cloud/storage/CPU disclosure fields.
+# Existing consumers keep using the same host/address fields:
 #   tofu output -json inventory > ../.runs/<stamp>/inventory-<N>.json
 
 output "inventory" {
   description = "Hosts of this cluster size, with the fixed private addresses the harness drives."
   value = {
+    cloud         = "upcloud"
+    storage_tier  = "maxiops"
     node_count    = var.node_count
     location      = var.zone
     mqttd_version = var.mqttd_version
@@ -22,6 +23,7 @@ output "inventory" {
       peer        = "${local.broker_ips[i]}:7001"
       swim        = "${local.broker_ips[i]}:7946"
       server_type = s.plan
+      vcpus       = local.broker_cores
     }]
 
     drivers = [for i, s in upcloud_server.driver : {
@@ -30,6 +32,7 @@ output "inventory" {
       private_ip   = local.driver_ips[i]
       builds_bench = i == 0
       server_type  = s.plan
+      vcpus        = local.driver_cores
     }]
   }
 }

@@ -23,6 +23,8 @@ resource "upcloud_network" "bench" {
   name = "mqttd-bench-${var.run_label}"
   zone = var.zone
 
+  depends_on = [terraform_data.quota_guard]
+
   ip_network {
     address            = "10.99.1.0/24"
     dhcp               = true

@@ -23,6 +23,8 @@
 
 set -euo pipefail
 . "$(dirname "$0")/lib.sh"
+. "$SCALE_DIR/cloud.sh"
+select_scale_cloud
 
 MODE="${1:-}"
 case "$MODE" in
@@ -35,8 +37,11 @@ smoke)
 	# need dedicated cores — only the published measurement runs do, and those
 	# require the limit increase the README describes anyway. Overridable.
 	DRIVER_COUNT="${DRIVER_COUNT:-1}"
-	BROKER_TYPE="${BROKER_TYPE:-cpx32}"
-	DRIVER_TYPE="${DRIVER_TYPE:-cpx42}"
+	if [ "$CLOUD" = hcloud ]; then
+		BROKER_TYPE="${BROKER_TYPE:-cpx32}"
+		DRIVER_TYPE="${DRIVER_TYPE:-cpx42}"
+	fi
+	# UpCloud uses its own module defaults; never pass Hetzner plan names.
 	;;
 standard)
 	# The short release profile: ONE cluster, one pass, ~25 minutes and a
@@ -73,21 +78,12 @@ full)
 	;;
 esac
 
-# The cloud the rig runs on: hcloud (default, the published curve's platform)
-# or upcloud. Each cloud has its own terraform directory; everything downstream
-# (inventory JSON, bootstrap, lanes, collector) is provider-agnostic.
-CLOUD="${CLOUD:-hcloud}"
-case "$CLOUD" in
-hcloud)
-	[ -n "${HCLOUD_TOKEN:-}" ] || die "HCLOUD_TOKEN is not set (Read & Write token from the dedicated Hetzner project)"
-	;;
-upcloud)
-	[ -n "${UPCLOUD_TOKEN:-}" ] || die "UPCLOUD_TOKEN is not set (a Bearer API token; CLOUD=upcloud)"
-	;;
-*)
-	die "unknown CLOUD=$CLOUD (supported: hcloud, upcloud)"
-	;;
-esac
+require_scale_token
+# The UpCloud cloud-init template does not implement this Hetzner tuning arm.
+# Refuse explicitly before provisioning rather than silently measuring a no-op.
+if [ "$CLOUD" = upcloud ] && [ -n "${BROKER_NIC_SPREAD:-}" ]; then
+	die "BROKER_NIC_SPREAD is not supported with CLOUD=upcloud; unset it"
+fi
 # The binary under test is a disclosure item, never a default: terraform's
 # mqttd_version fallback was stale within a week (1.0.0 while the published
 # campaigns ran 1.0.5/1.0.6), and on 2026-08-25 two 15-host formations were
@@ -152,9 +148,8 @@ if [ -n "${MQTTD_URL:-}" ]; then
 	warn "MQTTD_URL is set — this run measures an UNRELEASED binary; results are stamped $RUN/UNRELEASED-BINARY.txt and are NOT a published-curve point"
 fi
 
-TFDIR="$SCALE_DIR/terraform"
-[ "$CLOUD" = hcloud ] || TFDIR="$SCALE_DIR/terraform-$CLOUD"
 CURRENT_SIZE=""
+TEARDOWN_CMD="CLOUD=$CLOUD bench/scale/teardown.sh"
 
 # Publish the run's current phase to the observe stack (no-op when OBSERVE=0).
 # The dashboard's hardest question is "is it broken, or still provisioning?" — a
@@ -169,7 +164,7 @@ teardown() {
 	trap - EXIT INT TERM
 	if [ "${KEEP_INFRA:-0}" = 1 ]; then
 		printf '\033[1;31m!! KEEP_INFRA=1 — PAID SERVERS ARE STILL RUNNING. %s\033[0m\n' \
-			"Destroy with: bench/scale/teardown.sh" >&2
+			"Destroy with: $TEARDOWN_CMD" >&2
 		exit "$rc"
 	fi
 	# A failed run's evidence dies with its servers — pull journals/cloud-init
@@ -181,7 +176,7 @@ teardown() {
 	say "tearing down (trap; exit code was $rc)"
 	if ! (cd "$TFDIR" && "$TF" destroy -auto-approve \
 		-var node_count="${CURRENT_SIZE:-1}" -var run_label="$STAMP" >>"$RUN/teardown.log" 2>&1); then
-		warn "terraform destroy FAILED — sweep with: bench/scale/teardown.sh --force"
+		warn "terraform destroy FAILED — recover with: $TEARDOWN_CMD (see the provider's README recovery limits)"
 		exit 1
 	fi
 	say "all cloud resources destroyed"
@@ -379,7 +374,7 @@ for N in "${SIZES[@]}"; do
 	(cd "$TFDIR" && "$TF" destroy -auto-approve \
 		-var node_count="$N" -var run_label="$STAMP" >"$RUN/tf-destroy-$N.log" 2>&1) || {
 		tail -20 "$RUN/tf-destroy-$N.log" >&2
-		die "terraform destroy failed for size $N — sweep with teardown.sh --force before re-running"
+		die "terraform destroy failed for size $N — recover with $TEARDOWN_CMD before re-running"
 	}
 	touch "$RUN/done-$N"
 done

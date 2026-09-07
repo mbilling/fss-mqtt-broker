@@ -18,6 +18,7 @@ resource "upcloud_server_group" "brokers" {
   title                = "mqttd-bench-brokers-${var.run_label}"
   anti_affinity_policy = "strict"
   track_members        = false
+  depends_on           = [terraform_data.quota_guard]
 }
 
 resource "upcloud_server" "broker" {
@@ -45,6 +46,7 @@ resource "upcloud_server" "broker" {
   template {
     storage = var.image
     size    = var.storage_size_gb
+    tier    = "maxiops"
   }
 
   network_interface {

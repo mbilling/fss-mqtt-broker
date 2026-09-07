@@ -23,6 +23,7 @@ resource "upcloud_server" "driver" {
   template {
     storage = var.image
     size    = var.storage_size_gb
+    tier    = "maxiops"
   }
 
   network_interface {
@@ -34,7 +35,7 @@ resource "upcloud_server" "driver" {
   network_interface {
     index             = 2
     type              = "private"
-    network         = upcloud_network.bench.id
+    network           = upcloud_network.bench.id
     ip_address_family = "IPv4"
     ip_address        = local.driver_ips[count.index]
   }

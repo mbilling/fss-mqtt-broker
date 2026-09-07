@@ -14,8 +14,8 @@ variable "driver_count" {
   default     = 2
 
   validation {
-    condition     = var.driver_count >= 1 && var.driver_count <= 12
-    error_message = "driver_count must be between 1 and 12."
+    condition     = var.driver_count >= 1 && var.driver_count <= 12 && floor(var.driver_count) == var.driver_count
+    error_message = "driver_count must be an integer between 1 and 12."
   }
 }
 
@@ -32,13 +32,13 @@ variable "public_ip_quota" {
 }
 
 variable "broker_server_type" {
-  description = "UpCloud plan for brokers. The direct analog of Hetzner's ccx23 (4 dedicated vCPU / 8 GB)."
+  description = "UpCloud plan for brokers. The default has 4 vCPUs and 8 GB RAM; equivalent core counts do not imply equivalent CPU guarantees or performance across providers."
   type        = string
   default     = "4xCPU-8GB"
 }
 
 variable "driver_server_type" {
-  description = "UpCloud plan for drivers. The Hetzner rig uses 8-vCPU CCX33s; on UpCloud the account's 100-core cap forces 10+10 onto 4xCPU-8GB (10x4 + 10x4 = 80 of 100 cores). Lane E's container-per-driver ceiling is untouched — the busiest of 10 drivers carries 3 one-vCPU containers."
+  description = "UpCloud plan for drivers. Defaults to four vCPUs, not Hetzner's eight. The inventory exposes vcpus so lane E can cap its container budget to the smallest driver. Set the site ladder and driver count together."
   type        = string
   default     = "4xCPU-8GB"
 }
@@ -71,6 +71,11 @@ variable "admin_cidr" {
   description = "CIDR allowed to reach SSH on the public interface. Narrow it to your own address if you have a stable one."
   type        = string
   default     = "0.0.0.0/0"
+
+  validation {
+    condition     = can(cidrnetmask(var.admin_cidr))
+    error_message = "admin_cidr must be an IPv4 CIDR (the rig provisions IPv4 public interfaces)."
+  }
 }
 
 variable "mqttd_version" {
