@@ -353,6 +353,11 @@ impl ReplicatedLog for PersistentLog {
         .await
     }
 
+    async fn truncate_durable(&self, key: &String, up_to: Offset) -> Result<(), ReplError> {
+        // The local implementation already commits with Immediate durability.
+        self.truncate(key, up_to).await
+    }
+
     async fn truncate(&self, key: &String, up_to: Offset) -> Result<(), ReplError> {
         let key = key.clone();
         self.run(move |db| {

@@ -355,6 +355,17 @@ impl<L: ReplicatedLog<Key = String>> SessionStore for ReplicatedSessionStore<L> 
         Ok(out)
     }
 
+    async fn ack_durable(
+        &self,
+        client: &ClientId,
+        up_to: crate::Offset,
+    ) -> Result<(), StorageError> {
+        self.log
+            .truncate_durable(&Self::queue_key(client), up_to)
+            .await?;
+        Ok(())
+    }
+
     async fn ack(&self, client: &ClientId, up_to: crate::Offset) -> Result<(), StorageError> {
         // Local-first, lazy, idempotent — truncation tolerates stale offsets.
         self.log.truncate(&Self::queue_key(client), up_to).await?;

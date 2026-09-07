@@ -645,6 +645,12 @@ impl<S: LeaseSource, T: ReplicaTransport + Clone + 'static> ReplicatedLog for Gr
         self.log_for_key(key, false).await?.live_range(key).await
     }
 
+    async fn truncate_durable(&self, key: &String, up_to: Offset) -> Result<(), ReplError> {
+        // Resolve ownership/epoch and recover before promising durable retirement.
+        let log = self.log_for_key(key, false).await?;
+        log.truncate_durable(key, up_to).await
+    }
+
     async fn truncate(&self, key: &String, up_to: Offset) -> Result<(), ReplError> {
         self.log_for_key(key, false)
             .await?
