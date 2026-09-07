@@ -75,6 +75,7 @@ if [ "${SMOKE:-0}" = 1 ]; then
 	LANE_D_DRAIN_SECS=60
 	LANE_E_SITES=(1)
 	LANE_E_SECS=15
+	LANE_E_DRAIN_SECS="${LANE_E_DRAIN_SECS:-15}"
 	A_REPS=1 A_SECS=15 A_WARMUP=3
 	BARRIER_OPS=50
 elif [ "${STANDARD:-0}" = 1 ]; then
@@ -100,6 +101,7 @@ elif [ "${STANDARD:-0}" = 1 ]; then
 	LANE_D_DRAIN_SECS=120
 	LANE_E_SITES=(1 2 4)
 	LANE_E_SECS=45
+	LANE_E_DRAIN_SECS="${LANE_E_DRAIN_SECS:-30}"
 else
 	LANE_B_RUNGS=(300000 200000 100000 50000 20000)
 	LANE_B_SECS=60
@@ -111,6 +113,7 @@ else
 	LANE_D_DRAIN_SECS=180
 	LANE_E_SITES=(1 2 4 8)
 	LANE_E_SECS=60
+	LANE_E_DRAIN_SECS="${LANE_E_DRAIN_SECS:-60}"
 	A_REPS=3 A_SECS=60 A_WARMUP=10
 	BARRIER_OPS=150
 fi
@@ -380,6 +383,27 @@ LANE_E_SUB_CONTAINERS_PER_SITE="${LANE_E_SUB_CONTAINERS_PER_SITE:-1}"
 LANE_E_CONNECT_RATE="${LANE_E_CONNECT_RATE:-500}"
 LANE_E_SETTLE="${LANE_E_SETTLE:-20}"
 LANE_E_MIN_INTERVAL="${LANE_E_MIN_INTERVAL:-5}"
+# THE DRAIN DEADLINE (#534, acceptance 7). Publishers and consumers used to be
+# torn down in the same batch, so anything the broker still held, or that was on
+# the wire, at that instant was never received — and the summarizer then called
+# the shortfall LOSS. Three different situations wear that one label: the broker
+# DROPPED it, the broker still HOLDS it, or it was in flight. Only the first is a
+# finding about the broker; reporting the other two as loss invents a defect, and
+# reporting them as delivered would invent capacity.
+#
+# So the publishers stop first and the consumers keep draining, bounded by this
+# deadline. Bounded matters: waiting for quiet hangs a paid rung on a broker that
+# is never going to reach it, which is exactly #504's non-recovery. Whether the
+# drain converged is recorded in rung.txt, and a rung that hit the deadline still
+# short is reported UNRESOLVED — not loss, not capacity.
+#
+# The deadline itself is LANE_E_DRAIN_SECS, set with the other durations in the
+# profile block above (15 smoke / 30 standard / 60 full) and overridable from the
+# environment there; LANE_E_DRAIN_POLL is how often it looks. Setting the deadline
+# to 0 disables the drain and restores the pre-#534 teardown, which no profile
+# does — it exists so a rung can be run without it deliberately, not by accident.
+LANE_E_DRAIN_POLL="${LANE_E_DRAIN_POLL:-5}"
+LANE_E_FLAT_POLLS="${LANE_E_FLAT_POLLS:-3}"
 # A rung PASSES only if its p99 stays under this many ms. The point of a tenancy
 # ladder is the site count at which latency leaves the band, not the count at
 # which the broker finally refuses traffic — those are far apart, and only the
@@ -681,6 +705,13 @@ lane_e_shape() {
 	positive_int LANE_E_PUB_CONTAINERS_PER_SITE "$LANE_E_PUB_CONTAINERS_PER_SITE"
 	positive_int LANE_E_SUB_CONTAINERS_PER_SITE "$LANE_E_SUB_CONTAINERS_PER_SITE"
 	positive_int LANE_E_MAX_CONTAINERS_PER_DRIVER "$LANE_E_MAX_CONTAINERS_PER_DRIVER"
+	positive_int LANE_E_DRAIN_POLL "$LANE_E_DRAIN_POLL"
+	positive_int LANE_E_FLAT_POLLS "$LANE_E_FLAT_POLLS"
+	# 0 is legal here and means "no drain" — the one lane E count that may be zero.
+	[[ "$LANE_E_DRAIN_SECS" =~ ^(0|[1-9][0-9]*)$ ]] ||
+		die "LANE_E_DRAIN_SECS must be a non-negative integer (got '$LANE_E_DRAIN_SECS')"
+	[ "$LANE_E_DRAIN_SECS" -eq 0 ] || [ "$LANE_E_DRAIN_SECS" -ge $((LANE_E_FLAT_POLLS * LANE_E_DRAIN_POLL)) ] ||
+		die "lane E: LANE_E_DRAIN_SECS=$LANE_E_DRAIN_SECS cannot fit $LANE_E_FLAT_POLLS polls of ${LANE_E_DRAIN_POLL}s, so the drain could never observe a flat run and every rung would report UNRESOLVED"
 	case "$LANE_E_QOS" in 0 | 1) ;; *) die "LANE_E_QOS must be 0 or 1, got '$LANE_E_QOS'" ;; esac
 	[ "${#LANE_E_SITES[@]}" -gt 0 ] || die "LANE_E_SITES is empty — nothing to run"
 
@@ -1464,14 +1495,35 @@ lane_e_rung() { # lane_e_rung <sites> [repeat-index]
 	site_hosts() { # site_hosts <site> <container-index>
 		if [ "$LANE_E_PIN_SITES" = 1 ]; then echo "${HOSTS[$1 % N]}"; else rotated_hosts "$2"; fi
 	}
+	# Sum `recv` across every consumer container, from the same REST scrape the
+	# rung already uses for its histograms. Deliberately identical to lane D's
+	# `recv_total`, which has polled a drain on real hardware since it was
+	# written — this lane needs the same question answered, and a second read
+	# path (parsing `docker logs`) would be a second thing to get wrong.
+	lane_e_recv_total() {
+		local q
+		local -a rp=()
+		for ((q = 0; q < D; q++)); do
+			driver_batch "$q" "${scrape[q]}" >"$rdir/.batch/poll-$q" 2>/dev/null &
+			rp+=($!)
+		done
+		for q in ${rp[@]+"${rp[@]}"}; do wait "$q" || true; done
+		cat "$rdir"/.batch/poll-* 2>/dev/null | awk '/^recv /{s += $2} END{print s + 0}'
+	}
 	local di s j sdi hosts filter seq_base cidx
-	local -a subs pubs scrape stop names portn
+	local -a subs pubs scrape stop names portn pubnames subnames subdump
 	for ((di = 0; di < D; di++)); do
 		subs[di]="set -e"$'\n'
 		pubs[di]="set -e"$'\n'
 		scrape[di]=""
 		stop[di]=""
 		names[di]=""
+		# The drain stops the PUBLISHERS and leaves the consumers running, so the
+		# two populations need separate name lists — `names` alone could only ever
+		# kill them together, which is the teardown #534 is replacing.
+		pubnames[di]=""
+		subnames[di]=""
+		subdump[di]=""
 		portn[di]=0
 	done
 	# Sites are dealt round-robin to drivers. A site is a UNIT: its publishers and
@@ -1489,7 +1541,9 @@ lane_e_rung() { # lane_e_rung <sites> [repeat-index]
 			subs[sdi]+="$DOCKER_RUN --name sub-s$s-$j $BENCH_IMG sub -h $hosts -p $port -c $subs_per_c -R $LANE_E_CONNECT_RATE -t '$filter' -q $LANE_E_QOS $active --payload-hdrs ts --prometheus --restapi $((port_base + portn[sdi])) >/dev/null"$'\n'
 			scrape[sdi]+="printf '\\n@@@ sub-s$s-$j\\n'; curl -s http://localhost:$((port_base + portn[sdi]))/metrics"$'\n'
 			stop[sdi]+="printf '\\n@@@ sub-s$s-$j\\n'; docker logs sub-s$s-$j 2>&1"$'\n'
+			subdump[sdi]+="printf '\\n@@@ sub-s$s-$j\\n'; docker logs sub-s$s-$j 2>&1"$'\n'
 			names[sdi]+=" sub-s$s-$j"
+			subnames[sdi]+=" sub-s$s-$j"
 			portn[sdi]=$((portn[sdi] + 1))
 		done
 		for ((j = 0; j < LANE_E_PUB_CONTAINERS_PER_SITE; j++)); do
@@ -1503,6 +1557,7 @@ lane_e_rung() { # lane_e_rung <sites> [repeat-index]
 			pubs[sdi]+="$DOCKER_RUN --name pub-s$s-$j $BENCH_IMG pub -h $hosts -p $port -c $pubs_per_c -R $LANE_E_CONNECT_RATE -t 'site/$s/%i' -q $LANE_E_QOS -s $LANE_E_PAYLOAD $active -n $seq_base -I $interval --payload-hdrs ts >/dev/null"$'\n'
 			stop[sdi]+="printf '\\n@@@ pub-s$s-$j\\n'; docker logs pub-s$s-$j 2>&1"$'\n'
 			names[sdi]+=" pub-s$s-$j"
+			pubnames[sdi]+=" pub-s$s-$j"
 		done
 	done
 	local -a pids
@@ -1529,14 +1584,75 @@ lane_e_rung() { # lane_e_rung <sites> [repeat-index]
 	for ((di = 0; di < D; di++)); do driver_batch "$di" "${scrape[di]}" >"$rdir/.batch/final-$di" 2>/dev/null & pids+=($!); done
 	for pd in "${pids[@]}"; do wait "$pd" || true; done
 	for ((di = 0; di < D; di++)); do batch_split "$rdir" ".prom" "$rdir/.batch/final-$di"; done
+	# The steady-window artifacts are complete at this point. Everything below is
+	# the DRAIN (#534), and it deliberately writes to new filenames: `driver_rate`
+	# measures over the last STEADY_WINDOW seconds of a series, so letting the
+	# consumers' `.log` run on into a draining tail would drag every reported rate
+	# down and make the rung look slower than it ran.
 	pids=()
-	for ((di = 0; di < D; di++)); do driver_batch "$di" "${stop[di]}docker rm -f${names[di]} >/dev/null 2>&1" >"$rdir/.batch/stop-$di" 2>/dev/null & pids+=($!); done
+	for ((di = 0; di < D; di++)); do driver_batch "$di" "${stop[di]}" >"$rdir/.batch/stop-$di" 2>/dev/null & pids+=($!); done
 	for pd in "${pids[@]}"; do wait "$pd" || true; done
 	for ((di = 0; di < D; di++)); do batch_split "$rdir" ".log" "$rdir/.batch/stop-$di"; done
+	local drained=no drain_secs=0 prev=-1 cur elapsed=0 flat=0 t0
+	if [ "$LANE_E_DRAIN_SECS" -gt 0 ]; then
+		# Publishers only. The consumers stay up and keep acknowledging whatever
+		# the broker still owes this rung.
+		pids=()
+		for ((di = 0; di < D; di++)); do [ -n "${pubnames[di]}" ] && driver_batch "$di" "docker rm -f${pubnames[di]} >/dev/null 2>&1" >/dev/null 2>&1 & pids+=($!); done
+		for pd in "${pids[@]}"; do wait "$pd" || true; done
+		echo -e "elapsed_s\trecv_total" >"$rdir/drain.tsv"
+		t0=$(date +%s)
+		while :; do
+			sleep "$LANE_E_DRAIN_POLL"
+			elapsed=$(($(date +%s) - t0))
+			cur=$(lane_e_recv_total)
+			printf '%s\t%s\n' "$elapsed" "$cur" >>"$rdir/drain.tsv"
+			# LANE_E_FLAT_POLLS consecutive non-increasing polls, not one: a single
+			# flat poll can land inside a scrape gap and end the drain early, which
+			# is the mistake lane D's knob exists to avoid. `cur > 0` additionally
+			# guards a poll that failed on every driver and summed to zero — that
+			# must read as NOT drained, so a broken poll reports UNRESOLVED rather
+			# than a clean drain.
+			if [ "$cur" -gt 0 ] && [ "$cur" -le "$prev" ]; then
+				flat=$((flat + 1))
+				if [ "$flat" -ge "$LANE_E_FLAT_POLLS" ]; then
+					drained=yes
+					break
+				fi
+			else
+				flat=0
+			fi
+			prev=$cur
+			[ "$elapsed" -lt "$LANE_E_DRAIN_SECS" ] || {
+				warn "lane E: drain budget ${LANE_E_DRAIN_SECS}s elapsed with the backlog still moving — rung $sites reports UNRESOLVED"
+				break
+			}
+		done
+		# Discount the flat polls: the backlog was already gone when the first of
+		# them was taken, so counting them would inflate every drain by a fixed
+		# LANE_E_FLAT_POLLS * LANE_E_DRAIN_POLL. Same correction as lane D.
+		drain_secs=$((elapsed - LANE_E_DRAIN_POLL * flat))
+		[ "$drain_secs" -ge 0 ] || drain_secs=0
+		# Taken AT the deadline, with the consumers still connected: what the
+		# broker holds here is the difference between "pending" and "dropped",
+		# and the driver side cannot see it at all.
+		snapshot_metrics "$rdir" drain
+		pids=()
+		for ((di = 0; di < D; di++)); do driver_batch "$di" "${subdump[di]}" >"$rdir/.batch/drain-$di" 2>/dev/null & pids+=($!); done
+		for pd in "${pids[@]}"; do wait "$pd" || true; done
+		for ((di = 0; di < D; di++)); do batch_split "$rdir" ".drain" "$rdir/.batch/drain-$di"; done
+		pids=()
+		for ((di = 0; di < D; di++)); do [ -n "${subnames[di]}" ] && driver_batch "$di" "docker rm -f${subnames[di]} >/dev/null 2>&1" >/dev/null 2>&1 & pids+=($!); done
+		for pd in "${pids[@]}"; do wait "$pd" || true; done
+	else
+		pids=()
+		for ((di = 0; di < D; di++)); do [ -n "${names[di]}" ] && driver_batch "$di" "docker rm -f${names[di]} >/dev/null 2>&1" >/dev/null 2>&1 & pids+=($!); done
+		for pd in "${pids[@]}"; do wait "$pd" || true; done
+	fi
 	rm -rf "$rdir/.batch"
 	stop_cpu_sampling
 	snapshot_metrics "$rdir" after
-	echo "sites=$sites offered=$((sites * LANE_E_SITE_RATE)) publishers=$((sites * LANE_E_PUBS_PER_SITE)) consumers=$((sites * LANE_E_SUBS_PER_SITE)) per_consumer=$((LANE_E_SITE_RATE / LANE_E_SUBS_PER_SITE)) p99_budget_ms=$LANE_E_P99_BUDGET_MS" >"$rdir/rung.txt"
+	echo "sites=$sites offered=$((sites * LANE_E_SITE_RATE)) publishers=$((sites * LANE_E_PUBS_PER_SITE)) consumers=$((sites * LANE_E_SUBS_PER_SITE)) per_consumer=$((LANE_E_SITE_RATE / LANE_E_SUBS_PER_SITE)) p99_budget_ms=$LANE_E_P99_BUDGET_MS drained=$drained drain_secs=$drain_secs drain_deadline_s=$LANE_E_DRAIN_SECS" >"$rdir/rung.txt"
 	say "  lane E: $sites site(s) done ($((sites * LANE_E_SITE_RATE)) msg/s offered)"
 }
 # BOTTOM RUNG FIRST — the opposite of lane B, deliberately. Lane B's top rung is

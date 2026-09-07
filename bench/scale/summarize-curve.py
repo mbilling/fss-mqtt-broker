@@ -417,24 +417,43 @@ def self_test() -> None:
     # They are cheap to get wrong in the direction that flatters the broker,
     # which is why they are pinned here rather than left to a reviewer's eye.
     def lane_e_fixture(td: Path, name: str, *, offered: int, sent: int,
-                       recv: int, late: int, secs: int = 70) -> Path:
-        """A lane E rung directory whose driver logs say exactly this."""
+                       recv: int, late: int, secs: int = 70,
+                       drained: str | None = None, settled: int | None = None) -> Path:
+        """A lane E rung directory whose driver logs say exactly this.
+
+        `drained` and `settled` describe the DRAIN (#534): `drained` is what the
+        harness recorded in rung.txt ("yes" converged, "no" hit the deadline,
+        None = a run directory from before the drain existed), and `settled` is
+        the consumers' post-drain total in `sub-*.drain`. Leaving both out
+        reproduces a pre-drain rung exactly, which is what the older cases below
+        rely on.
+        """
         d = td / name
         d.mkdir(parents=True)
+        drain_meta = "" if drained is None else f" drained={drained} drain_secs=10 drain_deadline_s=60"
         (d / "rung.txt").write_text(
-            f"sites=4 offered={offered} per_consumer=100 p99_budget_ms=1000\n"
+            f"sites=4 offered={offered} per_consumer=100 p99_budget_ms=1000{drain_meta}\n"
         )
-        def counter_log(path: Path, counters: dict[str, int]) -> None:
+        def counter_log(path: Path, counters: dict[str, int], final: int | None = None) -> None:
             lines = []
             for s in range(secs + 1):
                 stamp = f"{s // 60}m{s % 60}s" if s >= 60 else f"{s}s"
                 for cname, rate in counters.items():
                     lines.append(f"{stamp} {cname} total={rate * s} rate={rate}/sec")
+            if final is not None:
+                # One trailing line pins the FINAL TOTAL exactly, which is all
+                # `driver_rate` takes from a `.drain` log — its rate is deliberately
+                # discarded, since a draining tail is not a rung's rate.
+                stamp = f"{(secs + 1) // 60}m{(secs + 1) % 60}s"
+                for cname in counters:
+                    lines.append(f"{stamp} {cname} total={final} rate=0/sec")
             path.write_text("\n".join(lines) + "\n")
         # `pub` and `pub_succ` are halved by the double-count correction, so a
         # rung that really sent N/s writes N to each.
         counter_log(d / "pub-0.log", {"pub": sent, "pub_succ": sent, "pub_overrun": late})
         counter_log(d / "sub-0.log", {"recv": recv})
+        if settled is not None:
+            counter_log(d / "sub-0.drain", {"recv": recv}, final=settled)
         # A latency histogram, or every rung reads p99 "—" and fails the budget
         # for want of data rather than for being slow. Two scrapes because the
         # summarizer subtracts the first from the last to get the measured
@@ -470,11 +489,64 @@ def self_test() -> None:
                 f"rung with 33% late publishes was accepted: flags={r['flags']}"
             )
 
-        # 3. LOSS: delivered materially less than published.
+        # 3. LOSS on a PRE-DRAIN run directory: rejected, but the flag has to say
+        #    that pending and dropped were never separable there rather than
+        #    assert a broker defect the run cannot support.
         r = lane_e_rung(lane_e_fixture(root, "sites-4-loss", offered=30_000,
                                        sent=30_000, recv=15_000, late=0))
         if r["pass"] or not any("LOSS" in f for f in r["flags"]):
             failures.append(f"lossy rung was not rejected: {r['flags']}")
+        if not any("predates" in f for f in r["flags"]):
+            failures.append(
+                f"a pre-drain rung claimed loss without disclosing it could not tell "
+                f"pending from dropped: {r['flags']}"
+            )
+        if r.get("unresolved"):
+            failures.append("a pre-drain rung was reported UNRESOLVED rather than loss")
+
+        # 3a. PENDING IS NOT LOSS. The steady window ends 10% short, the drain
+        #     then converges and every message arrives. Under the teardown this
+        #     replaces — publishers and consumers killed in the same batch — this
+        #     rung read as 10% LOSS and was rejected. It is a clean rung.
+        r = lane_e_rung(lane_e_fixture(root, "sites-4-pending", offered=30_000,
+                                       sent=30_000, recv=27_000, late=0,
+                                       drained="yes", settled=30_000 * 70))
+        if not r["pass"] or r["flags"]:
+            failures.append(
+                f"a rung whose backlog DRAINED was still rejected: {r['flags']}"
+            )
+
+        # 3b. UNRESOLVED: the deadline expired with traffic still outstanding.
+        #     Not a pass, and specifically NOT a loss finding — the rung stopped
+        #     watching, which settles nothing about the broker either way.
+        r = lane_e_rung(lane_e_fixture(root, "sites-4-unresolved", offered=30_000,
+                                       sent=30_000, recv=20_000, late=0,
+                                       drained="no", settled=24_000 * 70))
+        if r["pass"] or not r.get("unresolved"):
+            failures.append(f"a rung that hit the drain deadline was not UNRESOLVED: {r}")
+        if not any("UNRESOLVED" in f for f in r["flags"]):
+            failures.append(f"deadline-expired rung carried no UNRESOLVED flag: {r['flags']}")
+        if any("LOSS" in f for f in r["flags"]):
+            failures.append(
+                f"traffic still pending at the deadline was reported as broker LOSS: {r['flags']}"
+            )
+
+        # 3c. REAL LOSS: the drain converged — the consumers went a whole poll
+        #     interval receiving nothing — and the broker still owed 20%. That
+        #     one IS a broker finding, and must not be softened to UNRESOLVED.
+        r = lane_e_rung(lane_e_fixture(root, "sites-4-dropped", offered=30_000,
+                                       sent=30_000, recv=20_000, late=0,
+                                       drained="yes", settled=24_000 * 70))
+        if r["pass"] or r.get("unresolved"):
+            failures.append(f"a drained rung short 20% was not reported as loss: {r}")
+        # "LOSS" alone is too weak an assertion here: the pre-drain branch says
+        # LOSS too, and says it while disclaiming that it could tell pending from
+        # dropped. A rung that DID drain has to be described as one — otherwise a
+        # regression that stops reading `drained` looks identical to this case.
+        if not any("LOSS" in f and "DRAINED" in f for f in r["flags"]):
+            failures.append(
+                f"a drained rung short 20% was not reported as loss AFTER a drain: {r['flags']}"
+            )
 
         # 4. The CONTROL: a clean rung must still pass, or the rules above are
         #    just a way of never reporting anything.
@@ -496,8 +568,11 @@ def self_test() -> None:
         sys.exit(1)
     print(
         "summarize-curve self-test: publish double-count correction OK (6 cases); "
-        "lane E validity OK (5 rungs — under-offer, late publishers, loss, a clean "
-        "control that must still pass, and an in-flight rung)"
+        "lane E validity OK (8 rungs — under-offer, late publishers, loss on a "
+        "pre-drain directory, a backlog that DRAINED and must pass, a drain "
+        "deadline that expired and must read UNRESOLVED rather than loss, real "
+        "loss after a converged drain, a clean control that must still pass, and "
+        "an in-flight rung)"
     )
 
 
@@ -582,6 +657,21 @@ def lane_e_rung(rdir: Path) -> dict:
         t, r = driver_rate(log, "recv")
         recv += t
         recv_rate += r
+    # #534: the delivery question and the rate question need DIFFERENT reads of
+    # the same containers. The RATE comes from the steady window (`sub-*.log`,
+    # dumped while the publishers were still running); the DELIVERY TOTAL comes
+    # from after the drain (`sub-*.drain`, dumped once the publishers stopped and
+    # the consumers were given a bounded deadline to finish). Reading the rate
+    # from the drained log would average a decaying tail into the rung and
+    # understate every one of them.
+    #
+    # A run directory recorded before the drain existed has no `.drain` files at
+    # all, so fall back to the steady-window total: those runs stay readable, and
+    # `drained` below is "" for them, which is its own verdict. `max` rather than
+    # a plain substitution because `recv` is CUMULATIVE and read twice — the later
+    # read can only be larger, so max is a no-op on any real pair and a floor
+    # under a drain dump that came back partial.
+    settled = max(recv, sum(driver_rate(log, "recv")[0] for log in rdir.glob("sub-*.drain")))
     buckets, count = merged_histogram(sorted(rdir.glob("sub-*.prom")))
     p99 = bucket_pct(buckets, count, 0.99)
 
@@ -595,9 +685,40 @@ def lane_e_rung(rdir: Path) -> dict:
             f"PUBLISHERS LATE ({late_share * 100:.0f}% of publishes behind schedule — "
             "the drivers could not hold the offered rate, so this rung measures them)"
         )
-    delivered = sent > 0 and recv >= KNEE_OK * sent
+    # PENDING IS NOT LOSS (#534, acceptance 7). A shortfall means one of three
+    # things — the broker dropped it, the broker still holds it, or it was in
+    # flight — and only the first is a finding about the broker. Before the drain
+    # existed the publishers and consumers were killed in the same batch, so
+    # every rung's in-flight tail was booked as loss by construction.
+    #
+    # `drained` from rung.txt is what separates them: "yes" means the consumers
+    # went a whole poll interval receiving nothing, so the shortfall is real
+    # loss; "no" means the deadline expired with traffic still moving, which is
+    # UNRESOLVED and settles nothing either way; "" is a pre-drain run directory,
+    # where the two are simply not distinguishable.
+    drained = meta.get("drained", "")
+    deadline = meta.get("drain_deadline_s", "?")
+    delivered = sent > 0 and settled >= KNEE_OK * sent
+    unresolved = False
     if not delivered and sent > 0:
-        flags.append(f"LOSS (delivered {recv / sent * 100:.1f}% of what was published)")
+        short = (sent - settled) / sent * 100
+        if drained == "yes":
+            flags.append(
+                f"LOSS ({short:.1f}% of what was published never arrived, and the rung "
+                f"DRAINED — the consumers stopped receiving while the broker still owed it)"
+            )
+        elif drained == "no":
+            unresolved = True
+            flags.append(
+                f"UNRESOLVED ({short:.1f}% still undelivered when the {deadline}s drain "
+                "deadline expired — pending or dropped, and this rung cannot tell which)"
+            )
+        else:
+            flags.append(
+                f"LOSS ({short:.1f}% of what was published never arrived; run directory "
+                "predates the drain deadline, so pending traffic here is indistinguishable "
+                "from dropped)"
+            )
     within = p99_ms(p99) <= budget
     if not within:
         flags.append(f"OVER P99 BUDGET ({p99} > {budget:g}ms)")
@@ -609,6 +730,12 @@ def lane_e_rung(rdir: Path) -> dict:
         "recv_rate": recv_rate,
         "per_consumer": float(meta.get("per_consumer", 0)),
         "late_share": late_share,
+        "settled": settled,
+        "drained": drained,
+        # An UNRESOLVED rung is not a pass, and it is not a broker finding either.
+        # It rides beside `pass` so a reader — and report_html — can tell "the
+        # broker lost traffic" from "the rig stopped watching too early".
+        "unresolved": unresolved,
         "p50": bucket_pct(buckets, count, 0.50),
         "p99": p99,
         "budget_ms": budget,
@@ -813,11 +940,35 @@ def main() -> None:
                     "The spread at that count crosses the budget, so no capacity is "
                     "established there and nothing above it can be claimed."
                 )
+            # #534: an UNRESOLVED rung did not fail. The drain deadline expired
+            # with traffic still outstanding, so the rig stopped watching before
+            # the broker finished — which settles nothing in either direction.
+            # Leaving it to render as a plain non-pass would quietly convert "we
+            # did not measure this" into "the cluster could not do it", and a
+            # ladder is read for exactly that number.
+            unresolved = sorted(c for c, rs in by_count.items() if any(x.get("unresolved") for x in rs))
+            if unresolved:
+                print(
+                    f"\n> **{', '.join(str(c) for c in unresolved)} site(s): UNRESOLVED, not failed.** "
+                    "The drain deadline expired with traffic still outstanding, so whether "
+                    "the broker dropped it or still held it is unknown. Raise "
+                    "LANE_E_DRAIN_SECS and repeat before reading these as a limit."
+                )
             # A capacity claim above an inconsistent rung is not supportable: the
             # cluster demonstrably failed at a LOWER count, so a higher one cannot
             # be its capacity. Suppress the headline rather than print a number
-            # the table above it contradicts.
+            # the table above it contradicts. An UNRESOLVED rung below the
+            # candidate blocks it for the weaker but sufficient reason that the
+            # ladder has a hole in it there.
             candidate = max(passed, key=lambda r: r["sites"]) if passed else None
+            if candidate and any(c < candidate["sites"] for c in unresolved):
+                print(
+                    f"\n**No capacity is claimed.** {candidate['sites']} site(s) passed, but "
+                    f"{', '.join(str(c) for c in unresolved if c < candidate['sites'])} site(s) "
+                    "below it went UNRESOLVED, so the ladder has a hole under the number. "
+                    "Repeat those rungs with a longer drain."
+                )
+                candidate = None
             if candidate and any(c <= candidate["sites"] for c in flaky):
                 print(
                     f"\n**No capacity is claimed.** {candidate['sites']} site(s) passed, but "

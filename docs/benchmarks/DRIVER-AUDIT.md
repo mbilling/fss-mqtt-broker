@@ -166,13 +166,91 @@ sound existing driver functionality; replace it only if a demonstrated limitatio
 requires that". The remaining work is on the *subscriber* side — recording the
 identities seen — not on the publisher.
 
+## 5. The rung had no drain, so pending traffic was booked as loss
+
+Not a driver fact — a rig one, found while writing the accounting the sections
+above call for, and fixed here (`run-curve.sh`, `lane_e_rung`).
+
+Lane E used to tear down publishers and consumers in the **same batch**:
+
+```bash
+driver_batch "$di" "${stop[di]}docker rm -f${names[di]} ..."
+```
+
+So every message the broker still held, or that was on the wire, at that instant
+was never received — and `summarize-curve.py` then reported the shortfall as
+
+```
+LOSS (delivered 98.7% of what was published)
+```
+
+Three different situations wear that one label: the broker **dropped** it, the
+broker still **holds** it, or it was **in flight**. Only the first is a finding
+about the broker, and the rung's own teardown manufactured the other two.
+
+What replaces it, per #534's seventh acceptance criterion:
+
+1. The **publishers** stop. The consumers stay connected.
+2. `recv` is polled across every consumer container every `LANE_E_DRAIN_POLL`
+   seconds, bounded by `LANE_E_DRAIN_SECS` (15/30/60 by profile). The drain ends
+   after `LANE_E_FLAT_POLLS` (3) consecutive **non-increasing** totals — not one,
+   because a single flat poll can land inside a scrape gap and end the
+   measurement early. Those polls are then discounted from the reported
+   `drain_secs`, since the backlog was already gone when the first was taken.
+   The poll is lane D's `recv_total` — the same REST scrape the rung already
+   uses for its histograms, and the same loop lane D has run against real
+   hardware since it was written. A second read path would be a second thing to
+   get wrong.
+3. The deadline is **explicit and bounded** deliberately. Waiting for quiet
+   instead would hang a paid rung on a broker that is never going to reach it,
+   which is #504's non-recovery.
+4. `rung.txt` records `drained=yes|no`, `drain_secs` and `drain_deadline_s`, and
+   a broker-side `snapshot_metrics … drain` is taken **at** the deadline with the
+   consumers still connected — what the broker holds there is the difference
+   between pending and dropped, and no driver counter can see it.
+
+The summarizer then classifies rather than assumes:
+
+| `drained` | shortfall reads as |
+|---|---|
+| `yes` | **LOSS** — the consumers stopped receiving with the broker still owing it |
+| `no` | **UNRESOLVED** — pending or dropped, and this rung cannot tell which |
+| absent | **LOSS**, disclosing that a pre-drain run directory cannot separate them |
+
+A drain that exhausts its budget with the backlog still moving also `warn`s at
+the time, so the operator sees it during the run and not only in the summary.
+
+An `UNRESOLVED` rung is not a pass and **not a broker finding**; the ladder says
+so in its own verdict rather than letting "we did not measure this" render as
+"the cluster could not do it".
+
+Two consequences worth stating plainly:
+
+- The post-drain total (`sub-*.drain`) is what the **delivery** check reads; the
+  steady-window total (`sub-*.log`) is what the **rate** reads. `driver_rate`
+  averages over the last 60 seconds of a series, so letting the consumers' log
+  run into a draining tail would understate every rung's rate.
+- **Every lane E `LOSS` flag recorded before this** was measured with this
+  teardown. Those runs keep reporting LOSS, and now say in the flag itself that
+  they could not tell pending from dropped.
+
 ## What this audit does NOT establish
 
-- Nothing here was **run**. These are source facts about the pinned versions,
-  which is what task 1 asked for; the behavioural validation (both ends at QoS 2,
-  duplicate detection, drain deadlines) is still open.
-- The subscriber-side accounting, per-driver achievable offer, and the
-  reset/control-rung requirements remain unaddressed — see #534.
+
+- Nothing here was **run**. Sections 1-4 are source facts about the pinned
+  versions, which is what task 1 asked for; section 5 is a rig change pinned by
+  self-test fixtures. The behavioural validation — both ends at QoS 2, duplicate
+  detection, and a drain observed against a real broker — is still open.
+- The drain is **implemented and unit-pinned, never exercised on a cluster**. Its
+  convergence rule (two equal polls) and its default deadlines are arguments from
+  the shape of the teardown, not measurements; the first real run should report
+  `drain_secs` well inside `drain_deadline_s` at the low rungs, and that has not
+  been seen.
+- The subscriber-side unique-identity accounting, the per-driver achievable
+  offer, the warmed-baseline and measurement-window rules, and the
+  drained/reset-broker **control rung** remain unaddressed — see #534. The drain
+  supplies the "demonstrably drained" half of the control-rung criterion; the
+  repeated low-load control itself does not exist yet.
 - `pub_overrun` is described from source and is now read by lane E as well as
   lane B, with self-test fixtures; it has not been observed on a real run.
 - Lane E remains QoS 0/1 only. Nothing here enables QoS 2 there, and it should

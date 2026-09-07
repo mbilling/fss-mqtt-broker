@@ -184,10 +184,14 @@ jobs:
       # not. Runs before the gate itself would be trusted on real source.
       - name: The hygiene gate's rules still draw the lines they document
         run: python3 scripts/check-test-hygiene.py --self-test
-      # The scale rig's knee detection turns on one division. emqtt-bench counts a QoS 0
-      # publish twice, so reading its `pub` counter raw doubled the offered rate and marked
-      # every QoS 0 $share rung unsustained. Synthesized logs, no cluster, no cost.
-      - name: The scale summarizer still corrects emqtt-bench's publish double-count
+      # Two things, both against synthesized driver logs — no cluster, no cost. (1) The rig's
+      # knee detection turns on one division: emqtt-bench counts a QoS 0 publish twice, so
+      # reading its `pub` counter raw doubled the offered rate and marked every QoS 0 $share
+      # rung unsustained. (2) Lane E's validity rules (#534) — a rung must be rejected when its
+      # drivers under-offered or ran late, real loss must be told from traffic still pending at
+      # the drain deadline, and a CLEAN rung must still pass, without which the rest is just a
+      # way of never reporting anything.
+      - name: The scale summarizer corrects the publish double-count and enforces lane E validity
         run: python3 bench/scale/summarize-curve.py --self-test
       - name: Scale provider selection and recovery (offline)
         run: python3 bench/scale/test-cloud.py
