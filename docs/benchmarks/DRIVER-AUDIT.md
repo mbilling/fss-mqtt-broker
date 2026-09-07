@@ -166,14 +166,250 @@ sound existing driver functionality; replace it only if a demonstrated limitatio
 requires that". The remaining work is on the *subscriber* side — recording the
 identities seen — not on the publisher.
 
+## 5. The rung had no drain, so pending traffic was booked as loss
+
+Not a driver fact — a rig one, found while writing the accounting the sections
+above call for, and fixed here (`run-curve.sh`, `lane_e_rung`).
+
+Lane E used to tear down publishers and consumers in the **same batch**:
+
+```bash
+driver_batch "$di" "${stop[di]}docker rm -f${names[di]} ..."
+```
+
+So every message the broker still held, or that was on the wire, at that instant
+was never received — and `summarize-curve.py` then reported the shortfall as
+
+```
+LOSS (delivered 98.7% of what was published)
+```
+
+Three different situations wear that one label: the broker **dropped** it, the
+broker still **holds** it, or it was **in flight**. Only the first is a finding
+about the broker, and the rung's own teardown manufactured the other two.
+
+What replaces it, per #534's seventh acceptance criterion:
+
+1. The **publishers** stop. The consumers stay connected.
+2. `recv` is polled across every consumer container every `LANE_E_DRAIN_POLL`
+   seconds, bounded by `LANE_E_DRAIN_SECS` (15/30/60 by profile). The drain ends
+   after `LANE_E_FLAT_POLLS` (3) consecutive **non-increasing** totals — not one,
+   because a single flat poll can land inside a scrape gap and end the
+   measurement early. Those polls are then discounted from the reported
+   `drain_secs`, since the backlog was already gone when the first was taken.
+   The poll is lane D's `recv_total` — the same REST scrape the rung already
+   uses for its histograms, and the same loop lane D has run against real
+   hardware since it was written. A second read path would be a second thing to
+   get wrong.
+3. The deadline is **explicit and bounded** deliberately. Waiting for quiet
+   instead would hang a paid rung on a broker that is never going to reach it,
+   which is #504's non-recovery.
+4. `rung.txt` records `drained=yes|no`, `drain_secs` and `drain_deadline_s`, and
+   a broker-side `snapshot_metrics … drain` is taken **at** the deadline with the
+   consumers still connected — what the broker holds there is the difference
+   between pending and dropped, and no driver counter can see it.
+
+The summarizer then classifies rather than assumes:
+
+| `drained` | shortfall reads as |
+|---|---|
+| `yes` | **LOSS** — the consumers stopped receiving with the broker still owing it |
+| `no` | **UNRESOLVED** — pending or dropped, and this rung cannot tell which |
+| absent | **LOSS**, disclosing that a pre-drain run directory cannot separate them |
+
+A drain that exhausts its budget with the backlog still moving also `warn`s at
+the time, so the operator sees it during the run and not only in the summary.
+
+An `UNRESOLVED` rung is not a pass and **not a broker finding**; the ladder says
+so in its own verdict rather than letting "we did not measure this" render as
+"the cluster could not do it".
+
+Two consequences worth stating plainly:
+
+- The post-drain total (`sub-*.drain`) is what the **delivery** check reads; the
+  steady-window total (`sub-*.log`) is what the **rate** reads. `driver_rate`
+  averages over the last 60 seconds of a series, so letting the consumers' log
+  run into a draining tail would understate every rung's rate.
+- **Every lane E `LOSS` flag recorded before this** was measured with this
+  teardown. Those runs keep reporting LOSS, and now say in the flag itself that
+  they could not tell pending from dropped.
+
+## 6. What the rig now records, and what it still cannot
+
+`#534`'s remaining criteria are accounting rules, and most of them turned on a
+question the rig had never asked: *of the eight things that can happen to a
+message, which end can actually see each one?*
+
+| count | read from | notes |
+|---|---|---|
+| offered | `rung.txt` rate x the publishers' own run span | not the measurement window — see below |
+| sent | driver `pub`/`pub_succ`, double-count corrected | at QoS 2 this is PUBREC, **not** completion |
+| broker-received | `mqttd_publish_received_total`, by QoS | |
+| protocol-completed | QoS 1 only | **not measurable at QoS 2** — see below |
+| uniquely delivered | consumer `recv`, post-drain | exact at QoS 2 (`awaiting_rel` + `maps:take`) |
+| duplicate | broker delivered − consumer unique | the only place it is visible |
+| dropped | `mqttd_publish_dropped_total`, by reason | |
+| still-pending | sent − delivered at the drain deadline | only when the drain did not converge |
+
+### QoS 2 protocol completion cannot be measured by anything
+
+Section 3 established that `emqtt` fires the publish callback at PUBREC and
+evaluates no callback on PUBCOMP, so the DRIVER stops one round trip short. The
+broker's side was then checked, and it is no better: the entire relevant metric
+surface is
+
+```
+mqttd_publish_received_total{qos}   mqttd_publish_delivered_total{qos}
+mqttd_publish_dropped_total{reason} mqttd_sessions   mqttd_connections_active
+```
+
+There is **no PUBCOMP counter**. Neither end can certify that an exactly-once
+handshake finished, so the rig reports completion as `n/a` at QoS 2 and flags the
+rung `QOS2 COMPLETION UNVERIFIABLE`, which prevents it passing. Reporting `sent`
+there would overcount exactly where #534 exists to prevent overcounting.
+
+**This is the thing that blocks QoS 2 in lane E**, and it is a one-counter fix in
+the broker rather than anything about the driver.
+
+### What the QoS labels DO buy
+
+`mqttd_publish_delivered_total` is labelled by QoS, so the QoS a delivery
+actually went out at is a measured fact rather than the one the rung asked for. A
+subscription granted a lower QoS than it requested is now detected
+(`QOS DOWNGRADE`) instead of silently measuring a different protocol.
+
+### Queue depth, bytes and age are NOT available
+
+`#534` asks for them "where available". They are not: there is no
+`mqttd_backlog_bytes` metric — the name appears only in comments — and nothing
+counts what is queued inside a session. Sessions and connections ARE recorded, at
+the drain deadline. The table says so rather than putting a number where a gap is.
+
+## 7. Measured — the first run of any of this (2026-09-07)
+
+One `LANES=E` smoke on Hetzner, 1 broker (cpx32) + 1 driver (cpx42), 1.0.16,
+ladder 1 and 2 sites at 5,000 msg/s per site, QoS 0. Not a capacity measurement
+and not offered as one; it exists to make the machinery above something that has
+run rather than something that type-checks.
+
+- **Provenance** resolved: harness `18c768e` clean, broker binary
+  `34db6a24…`, and the driver image digest the driver actually pulled matched the
+  pinned one exactly.
+- **Calibration**: asked 5,000/s of one container, achieved 5,000/s, **0 late
+  publishes**. The ceiling guard is now anchored to a measurement on the metal
+  that was billed, not to another campaign's comment.
+- **Settle**: 202/202 and 404/404 clients connected before the window opened.
+- **Reset**: 0 connections carried between rungs.
+- **Drain converged in 7-8 s against a 45 s deadline** — the prediction this
+  audit recorded before the run, and the reason `drained=yes` rather than
+  `UNRESOLVED` is the expected reading of a healthy rung.
+- **Control**: the 1-site rung repeated after the ladder delivered 4,983/s
+  against 5,000/s, a 0.3% drift — inside the 5% bound, so the trial is conclusive.
+- Accounting closed: broker-received equalled uniquely-delivered **exactly** at
+  every rung, with 0 dropped and 0 pending.
+
+Two findings from that run, both about the rig rather than the broker:
+
+1. **`offered` was being computed over the measurement window while every other
+   count is a lifetime total**, which rendered a healthy rung as having sent 2.4x
+   what was asked. Fixed to the publishers' own run span; the numbers then close
+   to 99.2%.
+2. **The driver's lifetime total undercounts the broker's by ~4%.**
+   `emqtt-bench` writes a progress line once a second and the last one predates
+   container teardown, so up to a second of publishes is never logged. Broker
+   counters are the better denominator for anything that has to balance.
+
+## 8. Measured — QoS 2, both ends (2026-09-07)
+
+The same shape, `LANE_E_QOS=2 LANE_E_SUB_QOS=2`. This is the both-ends arm #534
+asks for and #405 says the old durable_bench rows never measured. Every validity
+rule in this document fired, and three of them fired on behaviour nobody
+arranged.
+
+| rung | delivered/s | p99 | verdict |
+|---|---|---|---|
+| 1 site | 5,003 (100.1% of offer) | ≤50 ms | **9% of publishes late** |
+| 2 sites | 6,067 (61% of offer) | ≤100 ms | offer not met, **100% late** |
+| 1 site (control) | 4,975 | ≤50 ms | **41% late** |
+
+### The "meets its offer while running late" case is real
+
+The 1-site rung delivered **100.1% of its offered rate** and was still **9%
+behind its own schedule**. An offered-rate average cannot see that, and until
+#534 lane E had nothing else — this is the exact rung that would have been
+published as a passing site count. It is now flagged, and the flag is load-
+bearing: it is why the rung does not pass.
+
+The mechanism is section 1's deadline-based timer. At QoS 2 a publish returns on
+PUBREC, so a client's ceiling is ~1/RTT; at `-I 40` with 200 clients per
+container on a shared-vCPU driver, the deadline is missed and the scheduler fires
+immediately to catch up. Average rate preserved, schedule not. **Calibration saw
+it before the ladder started** — 5,112/s achieved with 48,866 late publishes —
+and warned.
+
+### The control rung caught something on its first outing
+
+The 1-site rung was 9% late at the start of the ladder and **41% late when
+repeated at the end**. Same rung, same cluster, four times worse. So the trial is
+reported `INCONCLUSIVE — no capacity is claimed`, which is what #534 asks for
+("report failed controls as inconclusive trials, not capacity findings"). Without
+the control this run would have published a 1-site pass and a 2-site failure and
+called that a capacity ladder.
+
+### QoS 2 accounting held
+
+Broker-received equalled uniquely-delivered **exactly** on all three rungs
+(188,082 / 189,146 / 228,638), with 0 dropped and 0 pending — consistent with
+section 3's claim that a QoS 2 subscriber's `recv` is a true unique-delivery
+oracle, now observed rather than only read from source. `completed` is `n/a` on
+every row, for the reason section 6 gives.
+
+Latency is the other visible cost: ≤5 ms at QoS 0 against ≤50 ms at QoS 2 for the
+same offered rate.
+
+### What this does NOT say
+
+It does not say the broker is slow at QoS 2, and nothing here measures the
+broker at all. Every rung is driver-limited on a shared-vCPU cpx42 — that is what
+"PUBLISHERS LATE" means — so the honest reading is that **this hardware cannot
+offer QoS 2 at this shape**, and a QoS 2 capacity question needs dedicated cores
+and fewer clients per container. Which is the point: the rig now says so instead
+of publishing the number.
+
 ## What this audit does NOT establish
 
-- Nothing here was **run**. These are source facts about the pinned versions,
-  which is what task 1 asked for; the behavioural validation (both ends at QoS 2,
-  duplicate detection, drain deadlines) is still open.
-- The subscriber-side accounting, per-driver achievable offer, and the
-  reset/control-rung requirements remain unaddressed — see #534.
-- `pub_overrun` is described from source and is now read by lane E as well as
-  lane B, with self-test fixtures; it has not been observed on a real run.
-- Lane E remains QoS 0/1 only. Nothing here enables QoS 2 there, and it should
-  stay that way until the both-ends behavioural validation exists.
+
+- **This is not a capacity measurement, and none of these numbers sizes
+  anything.** One node, one driver, shared-vCPU machines, 5,000 msg/s per site,
+  a 15-second window. It establishes that the validity machinery runs and agrees
+  with itself; it establishes nothing about how many SCADA sites a cluster holds.
+  Those come from `full`, on dedicated cores, after #536.
+- **QoS 2 stays disabled in lane E** (`LANE_E_QOS=0`), and the blocker is now
+  named precisely: nothing on either side can certify a QoS 2 handshake finished.
+  Enabling it needs a broker-side completion counter, not more driver work.
+- **The asymmetric arm (publisher QoS 2 / subscriber QoS 1) has a knob and no
+  run.** `LANE_E_SUB_QOS` exists and is shape-checked, and the both-ends arm has
+  now run (section 8); #405's inbound-vs-outbound split is answerable, not
+  answered.
+- **The ceilings are calibrated per run, not per machine type.** The probe proves
+  one container can offer a rung's rate on the driver in front of it. It does not
+  build a table of what a cpx42 or a CCX33 can do, and the 20,000/container and
+  10,000/consumer defaults still come from 0077-T7's campaign.
+- **The drain's convergence rule is an argument, not a measurement.** Three
+  consecutive non-increasing polls ended every drain well inside the deadline in
+  both runs — but nothing has yet exercised the case it exists for, a broker that
+  does not drain. `UNRESOLVED` has fired only against fixtures.
+- **The control rung has now caught a real degradation** (section 8) and has also
+  passed cleanly at 0.3% drift (section 7), so it is neither inert nor a
+  false-positive generator. What it has not done is distinguish a DEGRADED BROKER
+  from a degraded driver: the QoS 2 run's control failed on publisher lateness,
+  which is a driver fact. The residual-overload case it was built for is still
+  unobserved.
+- **Duplicate delivery and QoS downgrade have fixtures, not sightings.** Both are
+  detectable from the broker's QoS-labelled counters; neither has been observed,
+  because nothing in these runs misbehaved. The QoS 2 run does confirm the
+  downgrade check does not FALSE-positive: deliveries were labelled `qos="2"`
+  throughout and no flag was raised.
+- **Sections 1-4 remain source facts, not behaviour.** The PUBREC/PUBCOMP claim
+  in section 3 is read from `emqtt` 1.15.1's source; it has not been confirmed by
+  watching packets on the wire.
