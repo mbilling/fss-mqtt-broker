@@ -215,6 +215,9 @@ const SWIM_TICK: Duration = Duration::from_millis(100);
 #[allow(clippy::too_many_lines)]
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Validate the entire invocation before even help/version dispatch. A typo,
+    // stray value or misplaced option must never start a broker or signal one.
+    reject_invalid_cli();
     // Process-default crypto provider (aws-lc-rs, ADR 0053): reqwest's rustls-no-provider
     // build (the OIDC JWKS fetcher, ADR 0050) resolves its TLS provider from here. With a
     // single provider compiled into the build this is belt-and-braces determinism — no
@@ -229,7 +232,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `--version` / `-V` and `--help` / `-h`: local, print-and-exit, before any subcommand
     // or config work (#169). `--version` in particular MUST exist — an operator typing it
     // expecting a version once silently BOOTED A BROKER, because unrecognised flags fell
-    // through to startup (the reject-unknown-flags check below now closes that).
+    // through to startup (the complete-invocation check above closes that).
     if std::env::args()
         .skip(1)
         .any(|a| a == "--version" || a == "-V")
@@ -241,12 +244,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         print_usage();
         std::process::exit(0);
     }
-
-    // #169: a flag the broker does not recognise must be an ERROR, not a silent boot. Three
-    // reviewers independently hit `mqttd --version` (or a typo) quietly starting a real
-    // broker. Checked before any subcommand dispatch or resource acquisition, so a
-    // mistyped flag never reaches startup.
-    reject_unknown_flags();
 
     // ADR 0046 T3: `--check-config` validates the config the broker would boot with and exits,
     // without binding a port or starting the hub — the GitOps/pre-rollout gate. Handled here,
@@ -3655,13 +3652,74 @@ fn unknown_flags<I: IntoIterator<Item = String>>(args: I) -> Vec<String> {
         .collect()
 }
 
-/// Reject any unrecognised flag with a clear error and exit `2`, rather than falling
-/// through to boot a broker (#169 — the footgun three review reviewers hit with
-/// `mqttd --version`). Recognised subcommands are dispatched by the callers above.
-fn reject_unknown_flags() {
-    let unknown = unknown_flags(std::env::args().skip(1));
+/// Validate command shape as well as flag spelling (#544). No config, stdin,
+/// network or process signals are touched here. Values must follow their option;
+/// positional arguments are allowed only immediately after hash/probe commands.
+fn validate_cli(args: &[String]) -> Result<(), String> {
+    let unknown = unknown_flags(args.iter().cloned());
     if !unknown.is_empty() {
-        eprintln!("mqttd: unrecognised argument(s): {}", unknown.join(", "));
+        return Err(format!("unrecognised argument(s): {}", unknown.join(", ")));
+    }
+    let mut mode = None;
+    let mut options = std::collections::BTreeSet::new();
+    let mut tokens = args.iter().map(String::as_str).peekable();
+    while let Some(arg) = tokens.next() {
+        match arg {
+            "--config" | "--url" | "--pid" | "--timeout" => {
+                if !options.insert(arg) {
+                    return Err(format!("repeated option: {arg}"));
+                }
+                let value = tokens
+                    .next()
+                    .filter(|value| !value.is_empty() && !value.starts_with('-'));
+                if value.is_none() {
+                    return Err(format!("{arg} requires a value"));
+                }
+            }
+            "--check-config" | "--hash-password" | "--probe" | "--decommission" | "--backup"
+            | "--version" | "-V" | "--help" | "-h" => {
+                if let Some(previous) = mode.replace(arg) {
+                    return Err(format!("choose one command, not {previous} and {arg}"));
+                }
+                if matches!(arg, "--hash-password" | "--probe") {
+                    if let Some(value) = tokens.next_if(|value| !value.starts_with('-')) {
+                        if value.is_empty() || (arg == "--probe" && !value.starts_with('/')) {
+                            return Err(format!(
+                                "invalid positional argument for {arg}: {value:?}"
+                            ));
+                        }
+                    }
+                }
+            }
+            _ => return Err(format!("unexpected positional argument: {arg:?}")),
+        }
+    }
+    let mode = mode.unwrap_or("start");
+    for option in options {
+        let allowed = match option {
+            "--config" => matches!(mode, "start" | "--check-config" | "--probe" | "--backup"),
+            "--url" => mode == "--probe",
+            "--pid" | "--timeout" => matches!(mode, "--decommission" | "--backup"),
+            _ => unreachable!("only value options enter this set"),
+        };
+        if !allowed {
+            return Err(format!("{option} is not valid with {mode}"));
+        }
+    }
+    Ok(())
+}
+
+/// Fail usage errors before any command dispatch, including help/version.
+fn reject_invalid_cli() {
+    let args = std::env::args_os()
+        .skip(1)
+        .map(|arg| {
+            arg.into_string()
+                .map_err(|_| "arguments must be valid UTF-8".to_string())
+        })
+        .collect::<Result<Vec<_>, _>>();
+    if let Err(error) = args.and_then(|args| validate_cli(&args)) {
+        eprintln!("mqttd: {error}");
         eprintln!("Try 'mqttd --help' for the list of flags.");
         std::process::exit(2);
     }
@@ -3681,6 +3739,12 @@ fn print_usage() {
            mqttd --backup            take an online backup on the running broker and wait\n  \
            mqttd --version           print the version and exit\n  \
            mqttd --help              print this help and exit\n\n\
+         OPTIONS:\n  \
+           --config <path>          config for startup, --check-config, --probe or --backup\n  \
+           --url <host:port>        explicit endpoint for --probe\n  \
+           --pid <n>                target process for --decommission or --backup\n  \
+           --timeout <secs>         deadline for --decommission or --backup\n\n\
+         Choose one command. Unexpected, repeated or misplaced arguments exit 2 before startup.\n\
          Configuration is via MQTTD_* environment variables and/or a --config TOML file;\n\
          see docs/mqttd.example.toml and the README.",
         env!("CARGO_PKG_VERSION")
@@ -4502,8 +4566,81 @@ mod tests {
         );
     }
 
-    /// #169 — a mistyped or unrecognised flag is reported, not silently booted; known
-    /// flags and their (dash-less) values pass through clean.
+    /// #544: every documented command shape retains its positive control.
+    #[test]
+    fn cli_shape_accepts_documented_invocations() {
+        for args in [
+            vec![],
+            vec!["--version"],
+            vec!["-V"],
+            vec!["--help"],
+            vec!["-h"],
+            vec!["--config", "broker.toml"],
+            vec!["--check-config", "--config", "broker.toml"],
+            vec!["--config", "broker.toml", "--check-config"],
+            vec!["--hash-password"],
+            vec!["--hash-password", "alice"],
+            vec!["--probe"],
+            vec!["--probe", "/livez", "--url", "127.0.0.1:8080"],
+            vec!["--url", "127.0.0.1:8080", "--probe", "/readyz"],
+            vec!["--probe", "--config", "broker.toml"],
+            vec!["--decommission", "--pid", "123", "--timeout", "10"],
+            vec![
+                "--backup",
+                "--config",
+                "broker.toml",
+                "--pid",
+                "123",
+                "--timeout",
+                "10",
+            ],
+        ] {
+            let values: Vec<_> = args.iter().map(ToString::to_string).collect();
+            assert!(
+                super::validate_cli(&values).is_ok(),
+                "valid invocation: {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cli_shape_rejects_ignored_arguments_and_conflicting_commands() {
+        for args in [
+            vec!["start"],
+            vec!["--check-confg"],
+            vec!["--check-config", "stray"],
+            vec!["--config"],
+            vec!["--config", "--help"],
+            vec!["--config", ""],
+            vec!["--config", "one", "--config", "two"],
+            vec!["--config=broker.toml"],
+            vec!["--pid", "123"],
+            vec!["--timeout", "10"],
+            vec!["--url", "localhost:8080"],
+            vec!["--hash-password", "alice", "stray"],
+            vec!["--hash-password", ""],
+            vec!["--hash-password", "--config", "broker.toml"],
+            vec!["--probe", "readyz"],
+            vec!["--probe", "/readyz", "stray"],
+            vec!["--probe", "--url"],
+            vec!["--probe", "--pid", "123"],
+            vec!["--check-config", "--decommission"],
+            vec!["--backup", "--decommission"],
+            vec!["--check-config", "--check-config"],
+            vec!["--version", "--unknown"],
+            vec!["--help", "--unknown"],
+            vec!["--version", "--backup"],
+            vec!["--help", "--version"],
+            vec!["--help", "stray"],
+        ] {
+            let values: Vec<_> = args.iter().map(ToString::to_string).collect();
+            assert!(
+                super::validate_cli(&values).is_err(),
+                "must reject: {args:?}"
+            );
+        }
+    }
+
     #[test]
     fn unknown_flags_are_caught_and_known_ones_pass() {
         let v = |a: &[&str]| unknown_flags(a.iter().map(|s| (*s).to_string()));
