@@ -151,7 +151,7 @@
 
 **0046 — File-based configuration (layered over env, hot-reloadable, GitOps-friendly)**
 
-- `0046-T6` ⬜ planned ([#544](https://github.com/mbilling/fss-mqtt-broker/issues/544)): Unrecognized CLI arguments are an error, not silence — mqttd accepts only --check-config and --decommission and IGNORES everything else, so a typo (`--check-confg`) or an unsupported flag (`--version`) starts a real broker instead of failing; refuse unknown args at startup and print the accepted set (2026-08-07 amendment)
+- `0046-T6` 🚧 in-progress ([#544](https://github.com/mbilling/fss-mqtt-broker/issues/544)): Reject unknown or malformed CLI invocations before dispatch, configuration, listeners, storage or process signals; preserve documented commands and list their options in help — "The original task description was stale: #169 had already added help/version and dash-prefixed unknown-flag rejection. Remaining gaps were positional arguments, unscoped value options, duplicate options, conflicting commands, and help/version bypassing validation. No new CLI dependency, wire format or storage format."
 
 **0048 — Comparative performance benchmarking (published, reproducible, honest)**
 
