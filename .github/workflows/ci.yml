@@ -189,6 +189,8 @@ jobs:
       # every QoS 0 $share rung unsustained. Synthesized logs, no cluster, no cost.
       - name: The scale summarizer still corrects emqtt-bench's publish double-count
         run: python3 bench/scale/summarize-curve.py --self-test
+      - name: Scale provider selection and recovery (offline)
+        run: python3 bench/scale/test-cloud.py
 
   interop:
     name: foreign-client interop (mosquitto + paho)

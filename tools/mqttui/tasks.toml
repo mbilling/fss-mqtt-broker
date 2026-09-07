@@ -879,7 +879,7 @@ duration = "~1s"
 [[task]]
 id = "scale-curve"
 group = "Benchmark"
-name = "Run the multi-host scaling curve on Hetzner Cloud (PAID)"
+name = "Run the multi-host scaling curve on Hetzner or UpCloud (PAID)"
 script = "bench/scale/run.sh"
 about = """
 The ADR 0048 §2 curve: fresh 1-, 3- and 5-node clusters on real Hetzner hosts (one
@@ -887,11 +887,13 @@ broker, one local NVMe disk per host), the same workload at every size, results 
 docs/benchmarks/SCALE-CURVE.md. Start with `smoke` (one node, <€0.50) before `full`
 (~€2). Needs HCLOUD_TOKEN from a DEDICATED Hetzner project in the environment and an
 SSH keypair — read bench/scale/README.md first. Teardown is trapped on every exit
-path; after any run, verify zero servers remain.
+path; after any run, verify zero servers remain. CLOUD=upcloud selects UpCloud and
+UPCLOUD_TOKEN instead; read bench/scale/terraform-upcloud/README.md for different
+storage, CPU budgets and recovery limits. Never mix providers in a published curve.
 """
 requires = ["terraform", "jq", "ssh"]
 duration = "~30m smoke, ~4-5h full"
-caution = "Creates PAID cloud servers under your HCLOUD_TOKEN. Ctrl-C tears down; kill -9 does not — run teardown.sh after one."
+caution = "Creates PAID servers on CLOUD (default hcloud). Ctrl-C tears down; kill -9 does not. Recover with the SAME CLOUD selection."
 
 [[task]]
 id = "scale-workload"
@@ -917,7 +919,7 @@ scale linearly with node count).
 """
 requires = ["terraform", "jq", "ssh"]
 duration = "~40m per workload curve (sizes 1, 3, 5)"
-caution = "Creates PAID cloud servers under your HCLOUD_TOKEN. Needs MQTTD_VERSION set — the binary under test is a disclosure item, never a default."
+caution = "Creates PAID cloud servers on CLOUD (default hcloud). Needs MQTTD_VERSION set — the binary under test is a disclosure item, never a default."
 
 [[task]]
 id = "scale-report"
@@ -969,8 +971,10 @@ about = """
 The leak sweeper for bench/scale: terraform destroy from local state, then an audit of
 everything labeled purpose=mqttd-bench-scale (add --force to delete what the audit
 finds; needs the hcloud CLI). Run it after a killed run, a dead laptop, or before
-reading the invoice — exit 0 with "nothing leaked" means you are not paying for
-anything.
+reading the invoice. With CLOUD=upcloud, only UpCloud's local state is destroyed:
+there is no account-wide audit or --force sweep, and missing state fails explicitly.
+Always preserve the run's CLOUD selection and verify remaining resources in that
+provider's console; a successful state-backed destroy cannot rule out orphans.
 """
 requires = ["terraform"]
 duration = "~2m"
@@ -1042,6 +1046,32 @@ ssh/scp wrappers with a per-run known_hosts file, inventory accessors over terra
 JSON output, bounded wait loops, and the OpenSSL picker (macOS LibreSSL cannot mint
 the PKI). Sourced by every bench/scale script; running it directly does nothing.
 """
+hidden = true
+
+[[task]]
+id = "scale-cloud"
+group = "Benchmark"
+name = "Provider selection for bench/scale (sourced, not executed)"
+script = "bench/scale/cloud.sh"
+about = "Shared provider directory and token selection for run.sh and teardown.sh. No API calls."
+hidden = true
+
+[[task]]
+id = "scale-cloud-tests"
+group = "Benchmark"
+name = "Offline provider selection and recovery regression tests"
+script = "bench/scale/test-cloud.py"
+about = "Runs stub cloud CLIs in temporary directories; also checks lane E's inventory CPU ceiling. No provisioning. Invoked by CI with python3."
+requires = ["python3", "jq"]
+hidden = true
+
+[[task]]
+id = "scale-upcloud-quota-tests"
+group = "Benchmark"
+name = "Offline UpCloud HCL quota regression tests"
+script = "bench/scale/test-upcloud-quota.py"
+about = "Run with python3 and OpenTofu (or Terraform). Evaluates the real quota preconditions using only terraform_data in an isolated directory. No cloud provider or credentials."
+requires = ["python3"]
 hidden = true
 
 [[task]]

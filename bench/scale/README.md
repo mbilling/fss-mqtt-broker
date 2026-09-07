@@ -7,6 +7,11 @@ raw results that become `docs/benchmarks/SCALE-CURVE.md`. Runs from a laptop,
 **never from CI** — no cloud credential exists in this repository or its
 workflows.
 
+For **UpCloud**, select `CLOUD=upcloud` and follow the
+[provider setup and recovery guide](terraform-upcloud/README.md). It uses
+network-replicated maxiops storage, not local NVMe; keep its results separate.
+The prerequisites and pricing below describe the default Hetzner platform.
+
 ## Prerequisites (once)
 
 1. **A dedicated Hetzner Cloud project** (e.g. `mqttd-bench`). Dedicated so the
