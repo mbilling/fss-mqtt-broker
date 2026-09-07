@@ -1,0 +1,15 @@
+# Development toolchain, for `mise install` one-command setup.
+#
+# DELIBERATELY DECLARES NO RUST VERSION. `rust-toolchain.toml` is the pin — the
+# reproducible-build anchor of ADR 0045 T2, and what rustup, CI and the release
+# pipeline already obey. Repeating "1.97.0" here would create a second source of
+# truth for the one value the build's reproducibility rests on, and the second
+# copy is always the one that goes stale (the same reasoning retired this repo's
+# hand-maintained CHANGELOG and its ADR index).
+#
+# Instead this teaches mise to READ that file: with the setting below, `mise
+# install` provisions exactly the pinned toolchain, and bumping
+# rust-toolchain.toml moves both. Verify with `mise ls --current`, which prints
+# rust-toolchain.toml as the source.
+[settings]
+idiomatic_version_file_enable_tools = ["rust"]
