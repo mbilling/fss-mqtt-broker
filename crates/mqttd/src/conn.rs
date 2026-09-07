@@ -746,13 +746,42 @@ where
                 client.0.to_string(),
             ));
     }
-    writer
+    // THE ATTACH ABOVE SUCCEEDED, so the hub is holding this session: every exit
+    // from here on must tell it so, or the session is stranded for the life of the
+    // process. Nothing else reclaims it — only this client id connecting again
+    // would, and a `Detach` is the sole path out of `Hub::online`.
+    //
+    // A bare `?` here used to skip the `Detach` at the end of this function
+    // (issue #504). The leak was also INVISIBLE on the connection gauges, because
+    // `count_connection_opened` is below this point: the session was counted,
+    // the connection never was. That is how a node came to report 10,855 sessions
+    // against zero active connections and never move again — the CONNACK write is
+    // exactly what fails when an overloaded broker's clients have already given up.
+    if let Err(e) = writer
         .send(&Packet::ConnAck(ConnAck {
             properties: connack_props,
             session_present,
             code: 0,
         }))
-        .await?;
+        .await
+    {
+        // Loud, because it is the shape of a real outage rather than a stray
+        // client: a burst of these means clients are giving up before the broker
+        // can answer them, and every one of them cost a full attach.
+        warn!(
+            client = %client.0, error = %e,
+            "CONNACK write failed after the session attached; detaching it (#504)"
+        );
+        // Ungraceful by construction: the client never learned it had a session,
+        // so this is not a clean DISCONNECT and the will (if any) is owed.
+        let _ = hub.send(HubCommand::Detach {
+            client,
+            conn_id,
+            graceful: false,
+            session_expiry_override: None,
+        });
+        return Err(e);
+    }
     debug!(client = %client.0, session_present, "CONNECT accepted");
     count_connection_opened(policy, connect.protocol);
 
@@ -3408,6 +3437,88 @@ mod tests {
             }
         });
         rx
+    }
+
+    /// Issue #504, second symptom — the hub attaches the session BEFORE the
+    /// CONNACK goes out (deliberately: a publish racing in must not be missed).
+    /// So once `AttachOutcome::Present` comes back, the hub is HOLDING that
+    /// session, and only a `Detach` ever releases it from `Hub::online`.
+    ///
+    /// The CONNACK write used to be a bare `?`. When it failed, `run_framed`
+    /// returned before the `Detach` at the end of the function, stranding the
+    /// session for the life of the process — and invisibly, because
+    /// `count_connection_opened` sits below that write, so the session was
+    /// counted while the connection never was. A node reported 10,855 sessions
+    /// against zero active connections and never moved again.
+    ///
+    /// Deterministic where a socket test could not be: dropping the client half
+    /// of the duplex makes the server's next write fail with `BrokenPipe`, and
+    /// the drop is sequenced AFTER the `Attach` arrives (so the CONNECT was
+    /// certainly read) and BEFORE the reply (so the CONNACK certainly fails).
+    /// An earlier attempt drove this through a real socket; a plain close never
+    /// failed the write at all, because the first write after a FIN succeeds
+    /// into the send buffer.
+    #[tokio::test]
+    async fn a_failed_connack_still_detaches_the_attached_session() {
+        let (client, server) = tokio::io::duplex(4096);
+        let (hub_tx, mut hub_rx) = mpsc::unbounded_channel();
+        let policy = Arc::new(ConnPolicy {
+            auth: auth_handle(Arc::new(BasicAuthenticator {
+                allow_anonymous: true,
+            })),
+            authz: authz_handle(Arc::new(mqtt_auth::AllowAll)),
+            identity_source: mqtt_auth::mtls::IdentitySource::default(),
+            audit: Arc::new(mqtt_observability::AuditLog::new()),
+            proxy: None,
+            node: None,
+            store: None,
+            connect_timeout: DEFAULT_CONNECT_TIMEOUT,
+            enhanced: None,
+            shutdown: None,
+            metrics: None,
+        });
+        let conn = tokio::spawn(handle_stream(server, None, None, policy, hub_tx));
+
+        let (rh, wh) = tokio::io::split(client);
+        let reader = FrameReader::new(rh, V4);
+        let mut writer = FrameWriter::new(wh, V4);
+        writer
+            .send(&connect_packet("stranded", true))
+            .await
+            .unwrap();
+
+        // The attach lands first — proof the CONNECT was read and the hub now
+        // holds the session.
+        let (attached, reply) = match timeout(Duration::from_secs(5), hub_rx.recv())
+            .await
+            .expect("the attach should arrive promptly")
+        {
+            Some(HubCommand::Attach { client, reply, .. }) => (client, reply),
+            other => panic!("expected an Attach first, got {other:?}"),
+        };
+
+        // Break the pipe, THEN answer: the CONNACK write cannot now succeed.
+        drop(reader);
+        drop(writer);
+        let _ = reply.send(AttachOutcome::Present(false));
+
+        // The invariant: a session the hub was told to hold must be released.
+        let detached = loop {
+            match timeout(Duration::from_secs(5), hub_rx.recv()).await {
+                Ok(Some(HubCommand::Detach { client, .. })) => break Some(client),
+                // Tolerate anything else the handshake emits on its way out.
+                Ok(Some(_)) => {}
+                Ok(None) | Err(_) => break None,
+            }
+        };
+        assert_eq!(
+            detached.as_ref(),
+            Some(&attached),
+            "a session attached before a failed CONNACK write was never detached \
+             (#504): nothing else reclaims it from Hub::online"
+        );
+
+        let _ = timeout(Duration::from_secs(5), conn).await;
     }
 
     fn connect_packet(id: &str, clean_session: bool) -> Packet {

@@ -57,14 +57,14 @@ any wire/IO work builds on them.
 ## Progress
 
 <!-- status-table:0023 -->
-| Task | Status | When | Evidence / notes |
-|------|--------|------|------------------|
-| 0023-P1 | ✅ done | 2026-06-22 | replay.rs ReplayWindow; an_exact_duplicate_is_rejected; out_of_order_within_the_window_is_accepted_once_then_rejected; a_sequence_below_the_window_is_rejected; a_large_forward_gap_slides_the_window_and_accepts |
-| 0023-P2 | ✅ done | 2026-06-22 | replay.rs SequenceAllocator/SeqStore; reserves_one_block_per_block_of_numbers; reopening_resumes_above_the_last_reserved_block_never_reusing |
-| 0023-P3 | ✅ done | 2026-06-22 | swim_auth.rs seal_sequenced/parse_v3/with_sequencing; Opened.seq; sequenced_seal_open_roundtrips_with_seq_and_identity; v3_body_framing_is_pinned; a_sequenced_node_rejects_v1_and_v2_but_accepts_v3; a_non_sequenced_node_rejects_a_v3_datagram; tampering_any_v3_byte_is_rejected_by_the_hmac |
-| 0023-P4 | ✅ done | 2026-06-22 | swim_driver per-sender ReplayWindows + SeqAlloc; sequenced sends + inbound replay drop; proven by a_replayed_v3_datagram_is_dropped |
-| 0023-P5 | ✅ done | 2026-06-22 | main.rs FileSeqStore (fsync'd <dir>/gossip-seq, fail-stop on persist error) + apply_anti_replay; MQTTD_SWIM_REPLAY require/off with signed-require + data-dir guards |
-| 0023-P6 | ✅ done | 2026-06-22 | swim_cluster.rs sequenced_nodes_converge; a_replayed_v3_datagram_is_dropped (replay yields no second Ack over real UDP); swim_auth a_sequenced_node_rejects_v1_and_v2_but_accepts_v3 |
+| Task | Status | Issue | When | Evidence / notes |
+|------|--------|-------|------|------------------|
+| 0023-P1 | ✅ done | — | 2026-06-22 | replay.rs ReplayWindow; an_exact_duplicate_is_rejected; out_of_order_within_the_window_is_accepted_once_then_rejected; a_sequence_below_the_window_is_rejected; a_large_forward_gap_slides_the_window_and_accepts |
+| 0023-P2 | ✅ done | — | 2026-06-22 | replay.rs SequenceAllocator/SeqStore; reserves_one_block_per_block_of_numbers; reopening_resumes_above_the_last_reserved_block_never_reusing |
+| 0023-P3 | ✅ done | — | 2026-06-22 | swim_auth.rs seal_sequenced/parse_v3/with_sequencing; Opened.seq; sequenced_seal_open_roundtrips_with_seq_and_identity; v3_body_framing_is_pinned; a_sequenced_node_rejects_v1_and_v2_but_accepts_v3; a_non_sequenced_node_rejects_a_v3_datagram; tampering_any_v3_byte_is_rejected_by_the_hmac |
+| 0023-P4 | ✅ done | — | 2026-06-22 | swim_driver per-sender ReplayWindows + SeqAlloc; sequenced sends + inbound replay drop; proven by a_replayed_v3_datagram_is_dropped |
+| 0023-P5 | ✅ done | — | 2026-06-22 | main.rs FileSeqStore (fsync'd <dir>/gossip-seq, fail-stop on persist error) + apply_anti_replay; MQTTD_SWIM_REPLAY require/off with signed-require + data-dir guards |
+| 0023-P6 | ✅ done | — | 2026-06-22 | swim_cluster.rs sequenced_nodes_converge; a_replayed_v3_datagram_is_dropped (replay yields no second Ack over real UDP); swim_auth a_sequenced_node_rejects_v1_and_v2_but_accepts_v3 |
 <!-- /status-table:0023 -->
 
 ## Changelog

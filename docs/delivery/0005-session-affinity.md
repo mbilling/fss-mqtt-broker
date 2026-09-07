@@ -55,14 +55,14 @@ items. Each carries a stable id used by commits, tests, and the dashboard.
 ## Progress
 
 <!-- status-table:0005 -->
-| Task | Status | When | Evidence / notes |
-|------|--------|------|------------------|
-| 0005-P1 | ✅ done | 2026-06-12 | placement.rs Placement::owner / owns; swim_routing.rs membership-driven placement |
-| 0005-P2 | ✅ done | 2026-06-12 | swim_routing::persistent_session_is_relocated_to_its_owner; conn.rs serve_proxied / PeerMessage::ProxyHello |
-| 0005-P2b | ✅ done | 2026-06-12 | conn.rs serve_proxied -> run_framed -> authenticate_connect records auth.success "relayed by node {via}" |
-| 0005-P2c | 💤 deferred | — | splice is best-effort on half-close; a delivery/lifecycle hardening pass is a documented follow-up |
-| 0005-P2d | ✅ done | 2026-07-02 | "Verification-close: the workstream this task was deferred to (ADR 0006/0007, durable-by-default per ADR 0029) delivered exactly what P2d asked for, so this closes on that evidence rather than new code. Owner death mid-session necessarily drops the live CONNECTION (the spliced TCP path terminates at the owner), but the SESSION — subscriptions, queued messages, the QoS-2 dedup window, and the session-expiry deadline — lives in the quorum-replicated store and is served by the new owner on reconnect. Proven by durable_sessions.rs a_persistent_client_resumes_its_session_on_the_new_owner_after_takeover, a_queued_message_is_replayed_to_the_client_after_takeover, qos2_inbound_dedup_survives_owner_takeover, a_replica_serves_the_session_after_the_owner_dies, plus 0001-T10 (expiry deadline survives takeover). Honest residual: a client reconnect RACING the promotion window and spec-legal QoS-1 redelivery bounds remain 0001-T11 (deferred there, not here)." |
-| 0005-P3 | 💤 deferred | — | "Re-assessed 2026-07-02: the original blocker (no v5 codec) is gone (ADR 0008), so this is now buildable — but parked on the OTHER half of the original condition: mainstream v5 clients (paho, mosquitto) do not auto-follow Server Reference / 0x9C redirects, so the relay must remain the universal path regardless and a redirect would only serve clients that opt into handling it. Revisit if a redirect-capable client population materialises; the proxy serves 3.1.1 and v5 alike meanwhile." |
+| Task | Status | Issue | When | Evidence / notes |
+|------|--------|-------|------|------------------|
+| 0005-P1 | ✅ done | — | 2026-06-12 | placement.rs Placement::owner / owns; swim_routing.rs membership-driven placement |
+| 0005-P2 | ✅ done | — | 2026-06-12 | swim_routing::persistent_session_is_relocated_to_its_owner; conn.rs serve_proxied / PeerMessage::ProxyHello |
+| 0005-P2b | ✅ done | — | 2026-06-12 | conn.rs serve_proxied -> run_framed -> authenticate_connect records auth.success "relayed by node {via}" |
+| 0005-P2c | 💤 deferred | — | — | splice is best-effort on half-close; a delivery/lifecycle hardening pass is a documented follow-up |
+| 0005-P2d | ✅ done | — | 2026-07-02 | "Verification-close: the workstream this task was deferred to (ADR 0006/0007, durable-by-default per ADR 0029) delivered exactly what P2d asked for, so this closes on that evidence rather than new code. Owner death mid-session necessarily drops the live CONNECTION (the spliced TCP path terminates at the owner), but the SESSION — subscriptions, queued messages, the QoS-2 dedup window, and the session-expiry deadline — lives in the quorum-replicated store and is served by the new owner on reconnect. Proven by durable_sessions.rs a_persistent_client_resumes_its_session_on_the_new_owner_after_takeover, a_queued_message_is_replayed_to_the_client_after_takeover, qos2_inbound_dedup_survives_owner_takeover, a_replica_serves_the_session_after_the_owner_dies, plus 0001-T10 (expiry deadline survives takeover). Honest residual: a client reconnect RACING the promotion window and spec-legal QoS-1 redelivery bounds remain 0001-T11 (deferred there, not here)." |
+| 0005-P3 | 💤 deferred | — | — | "Re-assessed 2026-07-02: the original blocker (no v5 codec) is gone (ADR 0008), so this is now buildable — but parked on the OTHER half of the original condition: mainstream v5 clients (paho, mosquitto) do not auto-follow Server Reference / 0x9C redirects, so the relay must remain the universal path regardless and a redirect would only serve clients that opt into handling it. Revisit if a redirect-capable client population materialises; the proxy serves 3.1.1 and v5 alike meanwhile." |
 <!-- /status-table:0005 -->
 
 **Note carried from the ADR (resolved):** phase 2 shipped in *ephemeral mode* — sharded

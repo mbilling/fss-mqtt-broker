@@ -101,3 +101,46 @@ under the original id).
 | 0057-T4 | The SIGKILL acceptance test, both phases |
 | 0057-T5 | Measure the QoS 2 delta in the bench lane; record it; revisit Decision 2 if indefensible |
 | 0057-T6 | Remove the Limitations entry the fix retires — the README claim and the code must change together |
+
+## As delivered — 2026-09-07: the completion order was the hole (issue #533)
+
+This ADR's Acceptance already required the invariant: *"on resume the subscriber
+receives PUBREL for the id it already knows — not a second PUBLISH under a new
+one."* The implementation did not hold it. `pub_comp` retired the durable
+outbound id BEFORE truncating the queued delivery, so a crash between the two
+left the entry in the log with its id record gone — and the restore, which
+resumes only offsets it still finds in the log, had nothing left to suppress. A
+subscriber that had already answered PUBCOMP was re-sent the message as a FRESH
+publish, `dup=false`, under a new packet id it could not dedup against.
+
+That is a duplicate at `QoS` 2, and it was NOT covered by the tolerance the
+neighbouring designs lean on: `SessionStore::ack`, ADR 0074 Decision 2 and the
+`truncate_acked` comment all scope replay tolerance to `QoS` 1 in those words,
+which is precisely why `QoS` 2 was carved out of ADR 0074.
+
+**The fix is the order, not a schema.** The durable id record must OUTLIVE the
+queued delivery. `pub_comp` now truncates first and clears the id second, and
+skips the clear entirely when the truncate failed. A crash in the remaining
+window leaves an id record whose message has left the log — a state
+`finish_attach` already handles and this ADR already priced in: released phase
+sends the spurious PUBREL, the subscriber answers PUBCOMP (MQTT-4.3.3), and the
+unconditional clear retires it. A tolerated extra PUBREL in place of an
+unrecoverable duplicate.
+
+Evidence: `hub::a_completed_qos2_delivery_does_not_replay_when_the_truncate_is_lost`,
+mutation-proven — under the old order it returns pkid 1025 against the original
+1. Its control, `..._when_the_truncate_lands`, passes both before and after, so
+the window is the cause rather than restore-replays-in-general. The oracle
+asserts IDENTITY, not silence: nothing, a bare PUBREL, or the same message under
+its ORIGINAL id with DUP are all legal recoveries; a different id is not.
+
+**Compatibility: patch-level, no break.** No API, wire, storage-schema or config
+change — the durable format is untouched and the ordering is node-local, so
+there is no version-skew or rollback implication under ADR 0039. The only
+client-visible difference is that a crash in this window now yields a spurious
+PUBREL (spec-legal, MQTT-4.3.3) where it previously yielded a duplicate PUBLISH
+(a `QoS` 2 violation).
+
+Still unclosed, and tracked in #533: the quorum-replicated backend is
+unexercised, as is the clearance-FAILURE boundary — a different state, whose
+orphan-record tolerance `pub_comp` documents separately.

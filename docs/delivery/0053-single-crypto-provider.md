@@ -26,6 +26,7 @@ tasks:
   - id: 0053-T5
     title: FIPS-mode evaluation (aws-lc-rs fips feature — the ADR 0002 certified-builds line) and rcgen 0.13→0.14 Issuer migration
     status: planned
+    issue: 548
 ---
 
 # 0053 — Single crypto provider: delivery
@@ -36,13 +37,13 @@ in by the OTLP chain); it now ships exactly one — the actively maintained one 
 ring is banned from returning.
 
 <!-- status-table:0053 -->
-| Task | Status | When | Evidence / notes |
-|------|--------|------|------------------|
-| 0053-T1 | ✅ done | 2026-08-04 | "PR #69; zero call-site changes; cargo +1.88.0 check --workspace green; mqtt-auth 120/120, mqttd auth 8/8" |
-| 0053-T2 | ✅ done | 2026-08-04 | "cargo tree -i ring → nothing compiled; quinn-proto feature graph shows only aws-lc; full sweep green: mqtt-auth 120, mqtt-cluster 229 (swim_auth golden HMAC vector = wire bytes unchanged), mqtt-net, mqttd tls/reload_tls/ws/quic/peer_identity/auth/protocol_violations" |
-| 0053-T3 | ✅ done | 2026-08-04 | "signed_gossip tests green: ECDSA P-256/P-384 + Ed25519 round-trips, a_crl_not_signed_by_the_cluster_ca_is_rejected_at_load, a_cert_not_chaining_to_the_ca_is_rejected — both call sites exercise the new dispatch; x509-parser verify feature dropped from mqtt-auth" |
-| 0053-T4 | ✅ done | 2026-08-04 | "cargo deny check → advisories/bans/licenses/sources all ok; ban verified to trip unscoped (lockfile records disabled optionals) and pass wrapper-scoped; amendment notes added at each ADR's affected passage" |
-| 0053-T5 | ⬜ planned | — |  |
+| Task | Status | Issue | When | Evidence / notes |
+|------|--------|-------|------|------------------|
+| 0053-T1 | ✅ done | — | 2026-08-04 | "PR #69; zero call-site changes; cargo +1.88.0 check --workspace green; mqtt-auth 120/120, mqttd auth 8/8" |
+| 0053-T2 | ✅ done | — | 2026-08-04 | "cargo tree -i ring → nothing compiled; quinn-proto feature graph shows only aws-lc; full sweep green: mqtt-auth 120, mqtt-cluster 229 (swim_auth golden HMAC vector = wire bytes unchanged), mqtt-net, mqttd tls/reload_tls/ws/quic/peer_identity/auth/protocol_violations" |
+| 0053-T3 | ✅ done | — | 2026-08-04 | "signed_gossip tests green: ECDSA P-256/P-384 + Ed25519 round-trips, a_crl_not_signed_by_the_cluster_ca_is_rejected_at_load, a_cert_not_chaining_to_the_ca_is_rejected — both call sites exercise the new dispatch; x509-parser verify feature dropped from mqtt-auth" |
+| 0053-T4 | ✅ done | — | 2026-08-04 | "cargo deny check → advisories/bans/licenses/sources all ok; ban verified to trip unscoped (lockfile records disabled optionals) and pass wrapper-scoped; amendment notes added at each ADR's affected passage" |
+| 0053-T5 | ⬜ planned | [#548](https://github.com/mbilling/fss-mqtt-broker/issues/548) | — |  |
 <!-- /status-table:0053 -->
 
 ## Notes

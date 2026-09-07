@@ -62,15 +62,15 @@ tasks. Each carries a stable id used by commits, tests, and the dashboard.
 ## Progress
 
 <!-- status-table:0011 -->
-| Task | Status | When | Evidence / notes |
-|------|--------|------|------------------|
-| 0011-T1 | ✅ done | 2026-06-17 | mqttd/src/aliases.rs (InboundAliases/OutboundAliases); resolved at edge in conn.rs |
-| 0011-T2 | ✅ done | 2026-06-17 | InboundAliases::resolve; v5_inbound_topic_alias_resolves_to_full_topic |
-| 0011-T3 | ✅ done | 2026-06-17 | topic_alias_zero_closes_connection / topic_alias_above_maximum_closes_connection / unmapped_topic_alias_reference_closes_connection |
-| 0011-T4 | ✅ done | 2026-06-17 | OutboundAliases::apply; v5_outbound_topic_alias_assigned_then_referenced; outbound_stops_assigning_when_full_but_keeps_existing |
-| 0011-T5 | ✅ done | 2026-06-17 | aliases owned by connection task in conn.rs; InboundAliases::new(0) for non-v5 (inbound_with_zero_max_rejects_any_alias) |
-| 0011-T6 | ✅ done | 2026-06-24 | "conn::WireLimits.topic_alias_max (was a hardcoded const), set once from MQTTD_TOPIC_ALIAS_MAX via main::wire_limits_from_env; negotiate_v5_properties advertises it." |
-| 0011-T7 | ✅ done | 2026-06-24 | "handle_publish sends DISCONNECT 0x94 (reason::TOPIC_ALIAS_INVALID) then closes on an out-of-range/unmapped alias, instead of a bare close. Test v5_invalid_topic_alias_disconnects_0x94." |
+| Task | Status | Issue | When | Evidence / notes |
+|------|--------|-------|------|------------------|
+| 0011-T1 | ✅ done | — | 2026-06-17 | mqttd/src/aliases.rs (InboundAliases/OutboundAliases); resolved at edge in conn.rs |
+| 0011-T2 | ✅ done | — | 2026-06-17 | InboundAliases::resolve; v5_inbound_topic_alias_resolves_to_full_topic |
+| 0011-T3 | ✅ done | — | 2026-06-17 | topic_alias_zero_closes_connection / topic_alias_above_maximum_closes_connection / unmapped_topic_alias_reference_closes_connection |
+| 0011-T4 | ✅ done | — | 2026-06-17 | OutboundAliases::apply; v5_outbound_topic_alias_assigned_then_referenced; outbound_stops_assigning_when_full_but_keeps_existing |
+| 0011-T5 | ✅ done | — | 2026-06-17 | aliases owned by connection task in conn.rs; InboundAliases::new(0) for non-v5 (inbound_with_zero_max_rejects_any_alias) |
+| 0011-T6 | ✅ done | — | 2026-06-24 | "conn::WireLimits.topic_alias_max (was a hardcoded const), set once from MQTTD_TOPIC_ALIAS_MAX via main::wire_limits_from_env; negotiate_v5_properties advertises it." |
+| 0011-T7 | ✅ done | — | 2026-06-24 | "handle_publish sends DISCONNECT 0x94 (reason::TOPIC_ALIAS_INVALID) then closes on an out-of-range/unmapped alias, instead of a bare close. Test v5_invalid_topic_alias_disconnects_0x94." |
 <!-- /status-table:0011 -->
 
 **Documented limits still in force:** the server's advertised Topic Alias Maximum is the

@@ -73,17 +73,17 @@ Each carries a stable id used by commits, tests, and the dashboard.
 ## Progress
 
 <!-- status-table:0017 -->
-| Task | Status | When | Evidence / notes |
-|------|--------|------|------------------|
-| 0017-T1 | ✅ done | 2026-06-19 | logged.rs maps ReplError::{NotOwner,NoQuorum} => StorageError::Unavailable |
-| 0017-T2 | ✅ done | 2026-06-19 | recover_session / recover_until_ready; recovery_wait_does_not_block_the_hub_loop |
-| 0017-T3 | ✅ done | 2026-06-19 | transient_lease_does_not_downgrade_a_persistent_attach; permanently_unavailable_store_rejects_rather_than_downgrades |
-| 0017-T4 | ✅ done | 2026-06-19 | conn.rs CONNACK_SERVER_UNAVAILABLE (0x03 -> 0x88) on Ok(AttachOutcome::Unavailable) |
-| 0017-T5 | ✅ done | 2026-06-19 | connecting HashMap conn_id guard; overlapping_connects_are_last_writer_wins |
-| 0017-T6 | ✅ done | 2026-06-19 | recover_until_ready warms pending; a_queued_message_is_replayed_to_the_client_after_takeover |
-| 0017-T7 | ✅ done | 2026-06-19 | recover_clean / SessionRecovery::Cleaned; a_clean_session_client_connects_promptly_on_the_group_owner |
-| 0017-T8 | ✅ done | 2026-06-19 | a_persistent_client_resumes_its_session_on_the_new_owner_after_takeover |
-| 0017-T9 | 💤 deferred | — | ATTACH_RECOVERY_TIMEOUT/BACKOFF are constants for now; ADR defers promoting them to config until an operator need appears |
+| Task | Status | Issue | When | Evidence / notes |
+|------|--------|-------|------|------------------|
+| 0017-T1 | ✅ done | — | 2026-06-19 | logged.rs maps ReplError::{NotOwner,NoQuorum} => StorageError::Unavailable |
+| 0017-T2 | ✅ done | — | 2026-06-19 | recover_session / recover_until_ready; recovery_wait_does_not_block_the_hub_loop |
+| 0017-T3 | ✅ done | — | 2026-06-19 | transient_lease_does_not_downgrade_a_persistent_attach; permanently_unavailable_store_rejects_rather_than_downgrades |
+| 0017-T4 | ✅ done | — | 2026-06-19 | conn.rs CONNACK_SERVER_UNAVAILABLE (0x03 -> 0x88) on Ok(AttachOutcome::Unavailable) |
+| 0017-T5 | ✅ done | — | 2026-06-19 | connecting HashMap conn_id guard; overlapping_connects_are_last_writer_wins |
+| 0017-T6 | ✅ done | — | 2026-06-19 | recover_until_ready warms pending; a_queued_message_is_replayed_to_the_client_after_takeover |
+| 0017-T7 | ✅ done | — | 2026-06-19 | recover_clean / SessionRecovery::Cleaned; a_clean_session_client_connects_promptly_on_the_group_owner |
+| 0017-T8 | ✅ done | — | 2026-06-19 | a_persistent_client_resumes_its_session_on_the_new_owner_after_takeover |
+| 0017-T9 | 💤 deferred | — | — | ATTACH_RECOVERY_TIMEOUT/BACKOFF are constants for now; ADR defers promoting them to config until an operator need appears |
 <!-- /status-table:0017 -->
 
 ## Changelog

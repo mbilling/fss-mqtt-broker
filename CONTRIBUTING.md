@@ -4,6 +4,24 @@ Thanks for considering it. This document is what a contributor actually needs:
 how to build and test, what the review bar is, and the two conventions here that
 are unusual enough to trip you up if nobody says so.
 
+## Getting a toolchain
+
+Any Rust install works — if you already have `cargo`, skip this. `rustup` reads
+`rust-toolchain.toml` on its own and will fetch the pinned toolchain the first
+time you build.
+
+If you use [mise](https://mise.jdx.dev), the repo's `mise.toml` makes it one
+command:
+
+```sh
+mise trust && mise install
+```
+
+That config deliberately names **no version**. It only tells mise to read
+`rust-toolchain.toml`, so the pin lives in exactly one file and bumping it moves
+everything. `mise ls --current` prints `rust-toolchain.toml` as the source, which
+is how you check the two have not drifted apart.
+
 ## Build and test
 
 ```sh
@@ -22,11 +40,16 @@ Minimum supported Rust is **1.88** (**1.89** for the `mqttd-operator` crate).
 a requirement on you — it is simply what `cargo` will use in this repo unless you
 override it.
 
+`cargo test --all-features` additionally needs a CMake and Go toolchain, which
+the FIPS crypto backend builds from source; without them that one command fails
+to build while everything above still passes. CI covers it.
+
 A few checks are cheap locally and worth running if you touched what they cover:
 
 ```sh
-python3 scripts/gen-status.py --check     # delivery dashboard is current
-python3 scripts/check-readme-facts.py     # README's counts/crate table match the tree
+python3 scripts/gen-status.py --check       # delivery dashboard is current
+python3 scripts/check-issue-alignment.py    # every open delivery task names an open issue
+python3 scripts/check-readme-facts.py       # README's counts/crate table match the tree
 ./scripts/quickstart-smoke.sh             # the README's own quickstarts still work
 ./scripts/interop/run.sh                  # mosquitto + paho conformance
 ```

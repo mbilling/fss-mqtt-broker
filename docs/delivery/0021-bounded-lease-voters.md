@@ -74,17 +74,17 @@ tasks. Each carries a stable id used by commits, tests, and the dashboard.
 ## Progress
 
 <!-- status-table:0021 -->
-| Task | Status | When | Evidence / notes |
-|------|--------|------|------------------|
-| 0021-T1 | ✅ done | 2026-06-25 | "main.rs lease_voters() parses MQTTD_LEASE_VOTERS (default 5; 0 or unparseable is a startup error), threaded through build_durable_node into MembershipReconciler::new(.., voter_cap)." |
-| 0021-T2 | ✅ done | 2026-06-25 | "run_driver already computes the admitted (ADR 0028) alive set and passes the RaftView (now carrying voters AND nodes) to decide(); the cap reshapes that set into bounded voters." |
-| 0021-T3 | ✅ done | 2026-06-25 | "lease_membership::target_voters (deterministic fn of cap/eligible/current); tests a_live_voter_is_never_demoted_just_because_a_node_joins, a_dead_voter_is_replaced_by_the_lowest_id_learner." |
-| 0021-T4 | ✅ done | 2026-06-25 | "decide adds every eligible member not yet in the group as a learner (add_as_learner = eligible - nodes); test a_high_id_join_becomes_a_learner_without_changing_voters." |
-| 0021-T5 | ✅ done | 2026-06-25 | "MembershipAction::Reconcile{target_voters, add_as_learner} (ReplaceAllVoters retain=true promotes fills, demotes removed voters to learners) + ::Drop (RemoveNodes departed); apply_action skips a no-op voter change." |
-| 0021-T6 | ✅ done | 2026-06-25 | "Initialize path unchanged; reconciler_bootstraps_then_grows_the_group (live) + a_bounded_voter_cluster_* (grows founder→3 voters capped at N)." |
-| 0021-T7 | ✅ done | 2026-06-25 | "lease_membership::tests — more_than_n_members_yield_exactly_n_voters, a_dead_voter_is_replaced_by_the_lowest_id_learner, a_high_id_join_becomes_a_learner_without_changing_voters, an_all_voters_cluster_shrinks_to_the_cap, n_larger_than_the_cluster_makes_every_member_a_voter, n_equals_one_keeps_a_single_voter, a_zero_cap_is_clamped_to_a_single_voter, a_departed_learner_is_dropped, a_steady_bounded_group_is_a_noop (16 policy tests)." |
-| 0021-T8 | ✅ done | 2026-06-25 | "durable_sessions::a_bounded_voter_cluster_keeps_a_learner_owned_session_through_failures — 5 nodes cap 3 form exactly 3 voters; a learner-owned session is durable and survives a non-voter then a voter failure (learner promoted to voter live). Stable across 3 runs (~4.7s)." |
-| 0021-T9 | ✅ done | 2026-06-25 | "passes_openraft_conformance_suite_in_memory + _persistent still green — the change is in the reconciler policy, not the LeaseStore." |
+| Task | Status | Issue | When | Evidence / notes |
+|------|--------|-------|------|------------------|
+| 0021-T1 | ✅ done | — | 2026-06-25 | "main.rs lease_voters() parses MQTTD_LEASE_VOTERS (default 5; 0 or unparseable is a startup error), threaded through build_durable_node into MembershipReconciler::new(.., voter_cap)." |
+| 0021-T2 | ✅ done | — | 2026-06-25 | "run_driver already computes the admitted (ADR 0028) alive set and passes the RaftView (now carrying voters AND nodes) to decide(); the cap reshapes that set into bounded voters." |
+| 0021-T3 | ✅ done | — | 2026-06-25 | "lease_membership::target_voters (deterministic fn of cap/eligible/current); tests a_live_voter_is_never_demoted_just_because_a_node_joins, a_dead_voter_is_replaced_by_the_lowest_id_learner." |
+| 0021-T4 | ✅ done | — | 2026-06-25 | "decide adds every eligible member not yet in the group as a learner (add_as_learner = eligible - nodes); test a_high_id_join_becomes_a_learner_without_changing_voters." |
+| 0021-T5 | ✅ done | — | 2026-06-25 | "MembershipAction::Reconcile{target_voters, add_as_learner} (ReplaceAllVoters retain=true promotes fills, demotes removed voters to learners) + ::Drop (RemoveNodes departed); apply_action skips a no-op voter change." |
+| 0021-T6 | ✅ done | — | 2026-06-25 | "Initialize path unchanged; reconciler_bootstraps_then_grows_the_group (live) + a_bounded_voter_cluster_* (grows founder→3 voters capped at N)." |
+| 0021-T7 | ✅ done | — | 2026-06-25 | "lease_membership::tests — more_than_n_members_yield_exactly_n_voters, a_dead_voter_is_replaced_by_the_lowest_id_learner, a_high_id_join_becomes_a_learner_without_changing_voters, an_all_voters_cluster_shrinks_to_the_cap, n_larger_than_the_cluster_makes_every_member_a_voter, n_equals_one_keeps_a_single_voter, a_zero_cap_is_clamped_to_a_single_voter, a_departed_learner_is_dropped, a_steady_bounded_group_is_a_noop (16 policy tests)." |
+| 0021-T8 | ✅ done | — | 2026-06-25 | "durable_sessions::a_bounded_voter_cluster_keeps_a_learner_owned_session_through_failures — 5 nodes cap 3 form exactly 3 voters; a learner-owned session is durable and survives a non-voter then a voter failure (learner promoted to voter live). Stable across 3 runs (~4.7s)." |
+| 0021-T9 | ✅ done | — | 2026-06-25 | "passes_openraft_conformance_suite_in_memory + _persistent still green — the change is in the reconciler policy, not the LeaseStore." |
 <!-- /status-table:0021 -->
 
 ## Changelog

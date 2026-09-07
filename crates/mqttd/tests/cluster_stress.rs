@@ -3383,3 +3383,272 @@ async fn seeded_fault_schedules_hold_the_catalog_post_quiesce() {
         eprintln!("cluster_stress: seed {seed} held the catalog");
     }
 }
+
+/// Readiness for a cluster ABOVE the voter cap (ADR 0021).
+///
+/// [`wait_cluster_ready`] waits for `voter_count() == nodes.len()`, which can
+/// never hold past the cap — 5 here — so it hangs on any fleet larger than that.
+/// Membership must still reach every node; the voter set is expected to stop
+/// growing, which is the whole point of ADR 0021 and of ADR 0073's claim that
+/// ownership spreads wider than the quorum.
+async fn wait_fleet_ready(nodes: &[&StressNode], voter_cap: usize) {
+    let expected = nodes.len();
+    let want_voters = expected.min(voter_cap);
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        let members = nodes
+            .iter()
+            .all(|n| n.placement.read().unwrap().member_count() == expected);
+        let voters = nodes.iter().all(|n| {
+            n.plane
+                .as_ref()
+                .is_some_and(|p| p.voter_count() == want_voters)
+        });
+        if members && voters {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "fleet of {expected} never converged: {}",
+            cluster_view(nodes)
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+}
+
+/// ADR 0073 T4.1 (issue #565) — the fleet-size migration soak, in-tree.
+///
+/// Grow 3 → 6 → 9 and shrink back to 6, publishing acked facts at every size,
+/// then require every one of them to survive. This is the CHEAP place to find
+/// the #390 class of grow/shrink defect: that one was caught by a soak like this
+/// (deterministically red under full-suite load) rather than by a paid run, and
+/// the T4 staging exists so the next one costs CI minutes instead of cluster
+/// money.
+///
+/// What it covers that the 1→3 tests do not:
+///
+/// - **Ownership beyond the voter cap.** At 6 and 9 nodes the voter set stays at
+///   5 (ADR 0021) while ownership spreads over every member (ADR 0073). Sessions
+///   therefore land on owners that are NOT voters, and their acked history has to
+///   migrate to them.
+/// - **Repeated migration.** Each session's owner is recomputed at 3, 6, 9 and 6
+///   again, so a payload acked at size 3 may move three times before it is read.
+///   A single grow cannot show a hand-off that only fails the second time.
+/// - **A graceful shrink under load**, with the drain required to converge.
+///
+/// The invariant is the one every paid run will be judged on: ZERO ACKED LOSS.
+/// An ack is a cluster-wide promise, and resizing does not get to break it.
+#[allow(clippy::too_many_lines)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_fleet_scale_grow_and_shrink_soak_loses_no_acked_fact() {
+    const VOTER_CAP: usize = 5;
+    const SUBS: usize = 8;
+
+    if std::env::var("MQTTD_STRESS_LOG").is_ok() {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .try_init();
+    }
+
+    let disk = tempfile::tempdir().expect("tempdir");
+    let dir = |n: &str| {
+        let d = disk.path().join(n);
+        std::fs::create_dir_all(&d).expect("node dir");
+        d
+    };
+
+    // --- size 3 ---
+    let mut nodes = vec![start_stress_node("fs-0", vec![], &dir("fs-0")).await];
+    let seed_addr = nodes[0].swim_addr.clone();
+    for i in 1..3 {
+        let id = format!("fs-{i}");
+        nodes.push(start_stress_node(&id, vec![seed_addr.clone()], &dir(&id)).await);
+    }
+    let refs: Vec<&StressNode> = nodes.iter().collect();
+    wait_fleet_ready(&refs, VOTER_CAP).await;
+
+    // Durable subscribers, offline: their sessions are the things that must
+    // migrate as the ring is recomputed under them.
+    let subs: Vec<(String, String)> = (0..SUBS)
+        .map(|i| (format!("fs-sub-{i}"), format!("fs/topic/{i}")))
+        .collect();
+    for (id, topic) in &subs {
+        establish_offline_subscriber(&refs, id, topic).await;
+    }
+
+    // Every acked payload, per subscriber — the ledger the final assertion reads.
+    let mut owed: Vec<Vec<Vec<u8>>> = vec![Vec::new(); SUBS];
+    // Each session's owner at each size, so the test can prove it actually
+    // exercised migration rather than passing because nothing moved.
+    let mut owner_history: Vec<Vec<NodeId>> = vec![Vec::new(); SUBS];
+
+    // --- publish at 3, grow to 6, publish, grow to 9, publish, shrink, publish ---
+    for stage in ["at3", "at6", "at9", "at6b"] {
+        // Grow or shrink INTO this stage.
+        match stage {
+            "at6" | "at9" => {
+                let from = nodes.len();
+                for i in from..from + 3 {
+                    let id = format!("fs-{i}");
+                    nodes.push(start_stress_node(&id, vec![seed_addr.clone()], &dir(&id)).await);
+                }
+                let refs: Vec<&StressNode> = nodes.iter().collect();
+                wait_fleet_ready(&refs, VOTER_CAP).await;
+            }
+            "at6b" => {
+                // Graceful shrink 9 -> 6: drain each departing node to its
+                // post-departure replica sets, and only then let it die. A drain
+                // that will not converge is a failure here, not a shrug: this is
+                // the operator-visible contract (ADR 0043 P3).
+                for _ in 0..3 {
+                    let victim = nodes.len() - 1;
+                    let id = nodes[victim].node_id.clone();
+                    let drain = nodes[victim]
+                        .plane
+                        .as_ref()
+                        .expect("plane alive")
+                        .decommission_drain(id.clone());
+                    assert!(
+                        tokio::time::timeout(Duration::from_secs(90), drain.run())
+                            .await
+                            .is_ok(),
+                        "decommission drain of {} never converged",
+                        id.0
+                    );
+                    nodes[victim].kill().await;
+                    nodes.pop();
+                }
+                let refs: Vec<&StressNode> = nodes.iter().collect();
+                wait_fleet_ready(&refs, VOTER_CAP).await;
+            }
+            _ => {}
+        }
+
+        let refs: Vec<&StressNode> = nodes.iter().collect();
+        for (i, (sub_id, _)) in subs.iter().enumerate() {
+            owner_history[i].push(nodes[0].placement.read().unwrap().owner(sub_id));
+        }
+        for (i, (_, topic)) in subs.iter().enumerate() {
+            let payload = format!("{stage}-{i}").into_bytes();
+            // Publish through the FIRST node every time: the publisher does not
+            // know or care where the session now lives, which is the routing the
+            // resize has to keep honest.
+            publish_until_acked(
+                &refs,
+                nodes[0].client_addr,
+                &format!("fs-pub-{stage}-{i}"),
+                topic,
+                &payload,
+            )
+            .await;
+            owed[i].push(payload);
+        }
+    }
+
+    // ANTI-VACUITY. If no session ever changed owner, the resizes moved nothing
+    // and the loss invariant below was never put under any pressure — the test
+    // would pass while proving nothing. HRW placement makes some movement
+    // overwhelmingly likely at these sizes, but "likely" is not "asserted".
+    let moved: usize = owner_history
+        .iter()
+        .filter(|h| h.iter().collect::<BTreeSet<_>>().len() > 1)
+        .count();
+    assert!(
+        moved > 0,
+        "no session changed owner across 3->6->9->6, so nothing migrated and this \
+         test exercised no hand-off at all. Owner history: {owner_history:?}"
+    );
+    assert_eq!(nodes.len(), 6, "the shrink must have left six nodes alive");
+    let on_joiner = owner_history
+        .iter()
+        .filter(|h| {
+            h.last()
+                .is_some_and(|o| !["fs-0", "fs-1", "fs-2"].contains(&o.0.as_str()))
+        })
+        .count();
+    // ADR 0073's actual claim, and the reason this test grows past the voter cap:
+    // ownership spreads over every ADMITTED MEMBER, not just the voters. At nine
+    // nodes the voter set is five, so a session owned by a joiner is being served
+    // by a node that never votes — and its acked history had to migrate there.
+    // HRW is deterministic over fixed node and session ids, so this is a stable
+    // property of this fixture, not a coin flip.
+    assert!(
+        on_joiner > 0,
+        "no session ended up owned by a node that joined after size 3, so ownership \
+         never spread beyond the founding members and ADR 0073's claim went \
+         untested here. Owner history: {owner_history:?}"
+    );
+    eprintln!(
+        "cluster_stress: fleet soak 3->6->9->6 — {moved}/{SUBS} sessions changed owner, \
+         {on_joiner}/{SUBS} finally owned by a JOINER, {} acked facts owed",
+        owed.iter().map(Vec::len).sum::<usize>()
+    );
+
+    // --- the oracle: every acked fact, on whatever node now owns its session ---
+    let refs: Vec<&StressNode> = nodes.iter().collect();
+    for (i, (sub_id, _)) in subs.iter().enumerate() {
+        let owner = nodes[0].placement.read().unwrap().owner(sub_id);
+        let owner_addr = refs
+            .iter()
+            .find(|n| n.node_id == owner)
+            .unwrap_or_else(|| {
+                panic!(
+                    "session {sub_id} is owned by {} which is not alive: {}",
+                    owner.0,
+                    cluster_view(&refs)
+                )
+            })
+            .client_addr;
+
+        let deadline = Instant::now() + Duration::from_secs(90);
+        let (mut sub, present) = loop {
+            if let Some(ok) = common::Client::connect_v311_within(
+                owner_addr,
+                sub_id,
+                false,
+                Duration::from_secs(10),
+            )
+            .await
+            {
+                break ok;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{sub_id} could not resume on its owner after the resizes: {}",
+                cluster_view(&refs)
+            );
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        };
+        assert!(
+            present,
+            "recovery honesty: {sub_id} must be present on its post-resize owner"
+        );
+
+        let mut got: BTreeSet<Vec<u8>> = BTreeSet::new();
+        let drain_deadline = Instant::now() + Duration::from_secs(30);
+        while got.len() < owed[i].len() && Instant::now() < drain_deadline {
+            match sub.recv_bounded(Duration::from_secs(2)).await {
+                common::Recv::Packet(Packet::Publish(p)) => {
+                    if let Some(pkid) = p.pkid {
+                        sub.send(&Packet::PubAck(pkid.into())).await;
+                    }
+                    got.insert(p.payload.to_vec());
+                }
+                common::Recv::Packet(_) | common::Recv::Quiet => {}
+                common::Recv::Closed => break,
+            }
+        }
+        for payload in &owed[i] {
+            assert!(
+                got.contains(payload),
+                "ACKED FACT LOST across 3->6->9->6 (#565): {sub_id} was owed {:?} and \
+                 never got it back. Acked at one size, read at another — an ack is a \
+                 cluster-wide promise that resizing does not get to break. Got: {:?}",
+                String::from_utf8_lossy(payload),
+                got.iter()
+                    .map(|p| String::from_utf8_lossy(p).into_owned())
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+}

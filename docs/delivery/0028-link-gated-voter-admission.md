@@ -40,11 +40,11 @@ link readiness.
 ## Progress
 
 <!-- status-table:0028 -->
-| Task | Status | When | Evidence / notes |
-|------|--------|------|------------------|
-| 0028-T1 | ✅ done | 2026-06-24 | "MeshRaftNetwork::is_connected exposes the peer registry; durable_node::admit_desired filters placement members to local OR current-voter OR connected, wired into run_driver. Unit tests admit_desired_admits_local_and_reachable_members_only, _keeps_a_current_voter_through_a_link_blip, _drops_a_member_evicted_from_placement. Full durable_sessions suite (7/7) still forms green." |
-| 0028-T2 | ✅ done | 2026-06-24 | "Rebuilt durable demo under the loadgen: lease term settled at 8 within ~90s of bring-up and stayed flat for 20+ min (formation watch 8 min + sustained watch 15 min), zero restarts. Before the gate the same setup churned term 7 -> 71 over ~8 min (68 elections on one node) before settling. Formation churn eliminated." |
-| 0028-T3 | ✅ done | 2026-06-24 | "Formation proven clean (T2), so durable was made the default for the broker and demo — see ADR 0029 (docs/delivery/0029-durable-by-default.md)." |
+| Task | Status | Issue | When | Evidence / notes |
+|------|--------|-------|------|------------------|
+| 0028-T1 | ✅ done | — | 2026-06-24 | "MeshRaftNetwork::is_connected exposes the peer registry; durable_node::admit_desired filters placement members to local OR current-voter OR connected, wired into run_driver. Unit tests admit_desired_admits_local_and_reachable_members_only, _keeps_a_current_voter_through_a_link_blip, _drops_a_member_evicted_from_placement. Full durable_sessions suite (7/7) still forms green." |
+| 0028-T2 | ✅ done | — | 2026-06-24 | "Rebuilt durable demo under the loadgen: lease term settled at 8 within ~90s of bring-up and stayed flat for 20+ min (formation watch 8 min + sustained watch 15 min), zero restarts. Before the gate the same setup churned term 7 -> 71 over ~8 min (68 elections on one node) before settling. Formation churn eliminated." |
+| 0028-T3 | ✅ done | — | 2026-06-24 | "Formation proven clean (T2), so durable was made the default for the broker and demo — see ADR 0029 (docs/delivery/0029-durable-by-default.md)." |
 <!-- /status-table:0028 -->
 
 ## Changelog
