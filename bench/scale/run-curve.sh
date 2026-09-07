@@ -147,7 +147,12 @@ LANE_D_DRAIN_SECS="${LANE_D_DRAIN_SECS_OVERRIDE:-$LANE_D_DRAIN_SECS}"
 #  * the ROUND-TRIP floor: emqtt-bench's TCP publish is SYNCHRONOUS per client
 #    (emqtt:publish/4 returns on the PUBACK; `-F` only sets emqtt's max_inflight,
 #    which a one-at-a-time loop never fills), so a client can never exceed
-#    1/RTT. Measured 2026-08-25 at 10 nodes with 3000 publishers: 50/s per
+#    1/RTT. NOTE (#534 audit): this floor is a QoS 1 / lane B observation — QoS 0
+#    has no ack and no such floor, so it cannot explain a QoS 0 lane. At QoS 2 the
+#    callback fires on the PUBREC, NOT the PUBCOMP (emqtt 1.15.1
+#    `ack_inflight(?PUBREC_PACKET…)`), so the ceiling there is also ~1/RTT rather
+#    than half of it. Details and citations: docs/benchmarks/DRIVER-AUDIT.md.
+#    Measured 2026-08-25 at 10 nodes with 3000 publishers: 50/s per
 #    client (150k) on time, 100/s per client (300k) capped at ~80/s with 99% of
 #    publishes late and every CPU idle — a ~12ms PUBACK round trip under load.
 #    That one mechanism is every "wall" this rig ever hit: 3000 x ~1/12ms is
@@ -260,7 +265,12 @@ LANE_B_REF_RUNG="${LANE_B_REF_RUNG:-50000}"
 # Seconds between the publishers starting and the latency baseline scrape: the
 # ramp, excluded from the measured window (see the scrape in lane_b_rung).
 LANE_B_SETTLE="${LANE_B_SETTLE:-15}"
-BENCH_IMG="emqx/emqtt-bench:0.6.3"
+# Pinned BY DIGEST, not by tag (issue #534): a tag is mutable, so two campaigns
+# "on 0.6.3" were not provably the same binary. This digest is the OCI index for
+# 0.6.3 as of 2026-09-07; its linux/amd64 manifest is
+# sha256:2e459112715ed2272c5…. Semantics audited in docs/benchmarks/DRIVER-AUDIT.md
+# — read that before believing anything about what a rung measured.
+BENCH_IMG="emqx/emqtt-bench:0.6.3@sha256:ae7f2d56cd49b14824c835140c808b093c5e3f2defb3a29b34b17560feb456cd"
 # Erlang VM flags for every bench container, passed as ERL_FLAGS (read by
 # erlexec — a refused value fails at startup with "bad scheduler busy wait
 # threshold", and the preflight below turns that into a die instead of a
