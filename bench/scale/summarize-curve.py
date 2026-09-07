@@ -156,6 +156,26 @@ def driver_rate(log: Path, counter: str) -> tuple[int, float]:
     return points[-1][1], (c1 - c0) / max(t1 - t0, 1)
 
 
+def driver_span(log: Path, counter: str) -> float:
+    """Seconds the container was actually publishing, from its own progress lines.
+
+    The eight counts (#534) are LIFETIME totals — the driver logs are cumulative
+    and the broker deltas run before -> after — so the "offered" figure has to be
+    over the same span. Multiplying the offered RATE by the measurement window
+    instead compares a 15-second number against a 40-second one and renders a
+    healthy rung as having sent 2.4x what was asked. Measured on the first real
+    run of this table (2026-09-07), which is what it was for.
+    """
+    if not log.exists():
+        return 0.0
+    last = 0.0
+    for line in log.read_text(errors="replace").splitlines():
+        m = re.search(rf"^(?:(\d+)m)?(\d+)s {counter} total=", line)
+        if m:
+            last = max(last, int(m.group(1) or 0) * 60 + int(m.group(2)))
+    return last
+
+
 def _histogram_of(prom: Path) -> tuple[dict[float, int], int]:
     """One scrape's cumulative buckets and count."""
     buckets: dict[float, int] = {}
@@ -639,6 +659,16 @@ def self_test() -> None:
                                        sent=30_000, recv=30_000, late=0))
         if not r["pass"] or r["flags"]:
             failures.append(f"a clean rung was rejected: {r['flags']}")
+        # A rung that met its offer exactly must ACCOUNT for it exactly. `offered`
+        # has to be taken over the publishers' own run span, not the measurement
+        # window: the first real run of this table (2026-09-07) rendered a healthy
+        # rung as 2.4x over-sent because a 15s window was compared against 40s of
+        # cumulative driver counters.
+        if r["counts"]["offered"] != r["counts"]["sent"]:
+            failures.append(
+                f"a rung that met its offer did not balance: offered "
+                f"{r['counts']['offered']} vs sent {r['counts']['sent']}"
+            )
 
         # ── the remaining acceptance cases (#534) ────────────────────────────
         # "Local test fixtures expose under-offer, duplicate delivery, invalid
@@ -1003,7 +1033,10 @@ def lane_e_rung(rdir: Path) -> dict:
     #   pending              what was still owed at the deadline
     qos = meta.get("qos", "0")
     sub_qos = meta.get("sub_qos", qos)
-    window = float(meta.get("window_secs", 0) or 0)
+    # The span every count below is taken over: how long the PUBLISHERS actually
+    # ran, read from their own logs rather than from the configured window, which
+    # covers only the middle of it. See `driver_span`.
+    span = max((driver_span(log, "pub") for log in rdir.glob("pub-*.log")), default=0.0)
     recv_by_qos = broker_delta(rdir, "before", "after", "mqttd_publish_received_total", "qos")
     deliv_by_qos = broker_delta(rdir, "before", "after", "mqttd_publish_delivered_total", "qos")
     dropped_by_reason = broker_delta(rdir, "before", "after", "mqttd_publish_dropped_total", "reason")
@@ -1060,7 +1093,7 @@ def lane_e_rung(rdir: Path) -> dict:
 
     pending = max(0.0, sent - settled) if drained != "yes" else 0.0
     counts = {
-        "offered": offered * window,
+        "offered": offered * span,
         "sent": sent,
         "broker_received": broker_recv,
         "protocol_completed": completed,
@@ -1361,6 +1394,12 @@ def main() -> None:
                         "\nDropped by reason: "
                         + ", ".join(f"{k or 'unlabelled'} {v:,.0f}" for k, v in sorted(reasons.items()))
                     )
+                print(
+                    "\n> Counts are LIFETIME totals over the publishers' own run span, not "
+                    "over the measurement window — the driver logs are cumulative and the "
+                    "broker deltas are before->after, so `offered` is the offered rate across "
+                    "that same span. The rate columns above are the steady window; these are not."
+                )
                 print(
                     "\n> `completed` is n/a at QoS 0 (nothing to acknowledge) and at QoS 2 "
                     "(the driver counts at PUBREC, and the broker exports no PUBCOMP counter). "
