@@ -73,7 +73,21 @@ full)
 	;;
 esac
 
-[ -n "${HCLOUD_TOKEN:-}" ] || die "HCLOUD_TOKEN is not set (Read & Write token from the dedicated Hetzner project)"
+# The cloud the rig runs on: hcloud (default, the published curve's platform)
+# or upcloud. Each cloud has its own terraform directory; everything downstream
+# (inventory JSON, bootstrap, lanes, collector) is provider-agnostic.
+CLOUD="${CLOUD:-hcloud}"
+case "$CLOUD" in
+hcloud)
+	[ -n "${HCLOUD_TOKEN:-}" ] || die "HCLOUD_TOKEN is not set (Read & Write token from the dedicated Hetzner project)"
+	;;
+upcloud)
+	[ -n "${UPCLOUD_TOKEN:-}" ] || die "UPCLOUD_TOKEN is not set (a Bearer API token; CLOUD=upcloud)"
+	;;
+*)
+	die "unknown CLOUD=$CLOUD (supported: hcloud, upcloud)"
+	;;
+esac
 # The binary under test is a disclosure item, never a default: terraform's
 # mqttd_version fallback was stale within a week (1.0.0 while the published
 # campaigns ran 1.0.5/1.0.6), and on 2026-08-25 two 15-host formations were
@@ -139,6 +153,7 @@ if [ -n "${MQTTD_URL:-}" ]; then
 fi
 
 TFDIR="$SCALE_DIR/terraform"
+[ "$CLOUD" = hcloud ] || TFDIR="$SCALE_DIR/terraform-$CLOUD"
 CURRENT_SIZE=""
 
 # Publish the run's current phase to the observe stack (no-op when OBSERVE=0).

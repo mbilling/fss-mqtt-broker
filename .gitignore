@@ -37,8 +37,11 @@ mqttd-pki/
 # keys, inventories, raw results) and terraform's local state — cloud state and
 # secrets never enter git.
 bench/scale/.runs/
-bench/scale/terraform/.terraform/
-bench/scale/terraform/.terraform.lock.hcl
+# Every terraform dir, not just the first one: these were path-locked to
+# `terraform/`, so adding a sibling provider dir (terraform-upcloud) silently
+# offered its 31 MB vendored provider binary and lock file to the next commit.
+bench/scale/terraform*/.terraform/
+bench/scale/terraform*/.terraform.lock.hcl
 *.tfstate
 *.tfstate.*
 *.tfvars
