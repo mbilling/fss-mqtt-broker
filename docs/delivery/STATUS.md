@@ -53,7 +53,7 @@
 | [0043](../adr/0043-elastic-cluster-resize.md) | Elastic cluster resize (grow, shrink, replace) | Accepted | [7/7 done](0043-elastic-cluster-resize.md) | — |
 | [0044](../adr/0044-release-readiness-assurance.md) | Release readiness: out-of-process cluster harness and continuous assurance | Accepted | [10/11 done](0044-release-readiness-assurance.md) | 1 open |
 | [0045](../adr/0045-release-engineering-and-distribution.md) | Release engineering and distribution (signed, reproducible, SBOM-attested) | Accepted | [6/6 done](0045-release-engineering-and-distribution.md) | — |
-| [0046](../adr/0046-file-based-configuration.md) | File-based configuration (layered over env, hot-reloadable, GitOps-friendly) | Accepted | [5/6 done](0046-file-based-configuration.md) | 1 open |
+| [0046](../adr/0046-file-based-configuration.md) | File-based configuration (layered over env, hot-reloadable, GitOps-friendly) | Accepted | [6/6 done](0046-file-based-configuration.md) | — |
 | [0047](../adr/0047-kubernetes-deployment.md) | Kubernetes deployment (Helm chart, StatefulSet, safe scale-down) | Accepted | [13/13 done](0047-kubernetes-deployment.md) | — |
 | [0048](../adr/0048-comparative-benchmarking.md) | Comparative performance benchmarking (published, reproducible, honest) | Accepted | [4/5 done](0048-comparative-benchmarking.md) | 1 open |
 | [0049](../adr/0049-voter-eligible-durable-ownership.md) | Durable ownership must be lease-eligible, and a degraded durable plane must be visible | Accepted | [3/3 done](0049-voter-eligible-durable-ownership.md) | — |
@@ -148,10 +148,6 @@
 **0044 — Release readiness: out-of-process cluster harness and continuous assurance**
 
 - `0044-P9` ⬜ planned ([#543](https://github.com/mbilling/fss-mqtt-broker/issues/543)): Nightly performance tolerance gate — compare the criterion suites against the recorded baseline and FAIL beyond a stated tolerance, instead of printing numbers for a human to read
-
-**0046 — File-based configuration (layered over env, hot-reloadable, GitOps-friendly)**
-
-- `0046-T6` 🚧 in-progress ([#544](https://github.com/mbilling/fss-mqtt-broker/issues/544)): Reject unknown or malformed CLI invocations before dispatch, configuration, listeners, storage or process signals; preserve documented commands and list their options in help — "The original task description was stale: #169 had already added help/version and dash-prefixed unknown-flag rejection. Remaining gaps were positional arguments, unscoped value options, duplicate options, conflicting commands, and help/version bypassing validation. No new CLI dependency, wire format or storage format."
 
 **0048 — Comparative performance benchmarking (published, reproducible, honest)**
 
