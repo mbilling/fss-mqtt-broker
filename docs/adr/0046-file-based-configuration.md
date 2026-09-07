@@ -56,9 +56,19 @@ is logged at startup (secrets redacted) so what-is-actually-running is never a g
 ### 3. A validating schema, checkable before deploy
 
 The config has a **strict schema** (unknown keys rejected, types and ranges checked), and a
-`mqttd --check-config <path>` subcommand validates a file and exits — no broker started, no
+`mqttd --check-config --config <path>` subcommand validates a file and exits — no broker started, no
 ports bound. GitOps pipelines run it in CI; operators run it before a rollout. A malformed
 file is a clear, located error, not a boot-time surprise.
+
+The CLI validates the entire invocation before command dispatch, config loading,
+listeners, storage, stdin or signals. Unknown flags, stray positional arguments,
+missing option values, repeated options and conflicting commands exit **2** with
+an error and a pointer to `--help`. Help/version do not mask invalid arguments.
+Value options are scoped: `--url` belongs to `--probe`; `--pid`/`--timeout` to
+`--decommission` or `--backup`; `--config` to startup, config checking, probing or
+backup. The optional hash username/probe path immediately follows its command.
+This tightens previously ignored inputs; no-argument startup and documented valid
+commands remain supported. See #544 and delivery task 0046-T6.
 
 ### 4. Hot reload, riding the existing validate-before-swap path
 

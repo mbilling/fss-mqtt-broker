@@ -44,6 +44,108 @@ async fn wait_until_listening(addr: SocketAddr) {
     panic!("the mqttd binary never started listening on {addr}");
 }
 
+/// Run a CLI invocation with unusable config and an unopened data path. A
+/// regression that boots instead of exiting is killed by the bounded wait.
+fn cli_exit_before_startup(args: &[&str]) -> (std::process::ExitStatus, String, String) {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("must-not-be-created");
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_mqttd"));
+    for (key, _) in std::env::vars() {
+        if key.starts_with("MQTTD_") {
+            cmd.env_remove(key);
+        }
+    }
+    let child = cmd
+        .args(args)
+        .env("MQTTD_CONFIG", dir.path().join("missing.toml"))
+        .env("MQTTD_DATA_DIR", &data)
+        .env(
+            "MQTTD_PLAINTEXT_BIND",
+            listener.local_addr().unwrap().to_string(),
+        )
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut guard = ChildGuard(child);
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = guard.0.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "CLI invocation started a broker or hung: {args:?}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+    guard
+        .0
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut stdout)
+        .unwrap();
+    guard
+        .0
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    assert!(!data.exists(), "CLI invocation touched storage: {args:?}");
+    (status, stdout, stderr)
+}
+
+#[test]
+fn malformed_cli_exits_two_before_config_or_storage_startup() {
+    for args in [
+        vec!["start"],
+        vec!["--check-confg"],
+        vec!["--check-config", "stray"],
+        vec!["--pid", "123"],
+        vec!["--url", "127.0.0.1:1"],
+        vec!["--config", "--version"],
+        vec!["--help", "--unknown"],
+        vec!["--version", "--unknown"],
+        vec!["--check-config", "--hash-password"],
+        vec!["--probe", "readyz"],
+        vec!["--hash-password", "alice", "stray"],
+    ] {
+        let (status, stdout, stderr) = cli_exit_before_startup(&args);
+        assert_eq!(status.code(), Some(2), "{args:?}: {stdout}\n{stderr}");
+        assert!(
+            stderr.contains("mqttd:") && stderr.contains("mqttd --help"),
+            "{args:?}: {stderr}"
+        );
+        assert!(
+            !stderr.contains("missing.toml"),
+            "argument errors must precede config loading: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn help_and_version_still_exit_successfully_without_loading_config() {
+    for arg in ["--help", "-h", "--version", "-V"] {
+        let (status, stdout, stderr) = cli_exit_before_startup(&[arg]);
+        assert!(status.success(), "{arg}: {stderr}");
+        assert!(
+            stdout.contains(concat!("mqttd ", env!("CARGO_PKG_VERSION"))),
+            "{stdout}"
+        );
+        if matches!(arg, "--help" | "-h") {
+            for option in ["--config", "--url", "--pid", "--timeout"] {
+                assert!(stdout.contains(option), "help omitted {option}: {stdout}");
+            }
+        }
+    }
+}
+
 /// Issue #240: durable-on (the default) with no `MQTTD_DATA_DIR` is a hard startup
 /// error — quorum-of-RAM loses acked messages on a correlated restart, and a warning
 /// log is not a substitute for refusing the configuration. The refusal must name

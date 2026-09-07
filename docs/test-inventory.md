@@ -1278,11 +1278,13 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `store_watch::tests::the_store_skew_report_is_edge_triggered_with_hysteresis`
 - `store_watch::tests::the_watcher_drives_brownout_on_watermark_transitions`
 
-## `crates/mqttd/src/main.rs` — 16 test(s)
+## `crates/mqttd/src/main.rs` — 18 test(s)
 
 - `tests::a_non_durable_node_resolves_no_write_floor`
 - `tests::a_vanished_peer_is_retried_immediately_not_paused`
 - `tests::changing_the_identity_source_requires_a_restart`
+- `tests::cli_shape_accepts_documented_invocations`
+- `tests::cli_shape_rejects_ignored_arguments_and_conflicting_commands`
 - `tests::every_accept_error_still_leaves_the_listener_accepting`
 - `tests::every_flag_the_code_compares_is_in_the_known_set`
 - `tests::fd_exhaustion_pauses_so_the_listener_can_recover_instead_of_spinning`
@@ -1338,11 +1340,13 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `a_restored_node_restarts_with_its_own_unchanged_environment`
 - `sigusr2_on_a_node_with_no_backup_dir_is_a_no_op_not_a_death`
 
-## `crates/mqttd/tests/binary_smoke.rs` — 9 test(s)
+## `crates/mqttd/tests/binary_smoke.rs` — 11 test(s)
 
 - `a_graceful_stop_closes_the_audit_chain`
 - `binary_serves_a_plaintext_pubsub_roundtrip`
 - `durable_on_with_no_data_dir_refuses_to_start`
+- `help_and_version_still_exit_successfully_without_loading_config`
+- `malformed_cli_exits_two_before_config_or_storage_startup`
 - `max_connections_cap_refuses_at_accept_and_recovers`
 - `per_ip_cap_refuses_a_second_connection_from_the_same_address`
 - `repeated_auth_failures_penalize_the_source_address_then_decay`

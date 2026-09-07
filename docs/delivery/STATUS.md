@@ -53,7 +53,7 @@
 | [0043](../adr/0043-elastic-cluster-resize.md) | Elastic cluster resize (grow, shrink, replace) | Accepted | [7/7 done](0043-elastic-cluster-resize.md) | — |
 | [0044](../adr/0044-release-readiness-assurance.md) | Release readiness: out-of-process cluster harness and continuous assurance | Accepted | [10/11 done](0044-release-readiness-assurance.md) | 1 open |
 | [0045](../adr/0045-release-engineering-and-distribution.md) | Release engineering and distribution (signed, reproducible, SBOM-attested) | Accepted | [6/6 done](0045-release-engineering-and-distribution.md) | — |
-| [0046](../adr/0046-file-based-configuration.md) | File-based configuration (layered over env, hot-reloadable, GitOps-friendly) | Accepted | [5/6 done](0046-file-based-configuration.md) | 1 open |
+| [0046](../adr/0046-file-based-configuration.md) | File-based configuration (layered over env, hot-reloadable, GitOps-friendly) | Accepted | [6/6 done](0046-file-based-configuration.md) | — |
 | [0047](../adr/0047-kubernetes-deployment.md) | Kubernetes deployment (Helm chart, StatefulSet, safe scale-down) | Accepted | [13/13 done](0047-kubernetes-deployment.md) | — |
 | [0048](../adr/0048-comparative-benchmarking.md) | Comparative performance benchmarking (published, reproducible, honest) | Accepted | [4/5 done](0048-comparative-benchmarking.md) | 1 open |
 | [0049](../adr/0049-voter-eligible-durable-ownership.md) | Durable ownership must be lease-eligible, and a degraded durable plane must be visible | Accepted | [3/3 done](0049-voter-eligible-durable-ownership.md) | — |
@@ -84,7 +84,7 @@
 | [0074](../adr/0074-detached-ack-truncate.md) | # 0074. The subscriber-ack truncate leaves the hub loop's critical path | Accepted | [2/3 done](0074-detached-ack-truncate.md) | 1 open |
 | [0075](../adr/0075-pipelined-durable-appends.md) | # 0075. Pipelined durable appends — the window stops paying the round trip per message | Accepted | [1/1 done](0075-pipelined-durable-appends.md) | — |
 | [0076](../adr/0076-self-measuring-sharded-store.md) | # 0076. The self-measuring sharded store — the volume's capacity becomes the broker's business | Accepted | [3/3 done](0076-self-measuring-sharded-store.md) | — |
-| [0077](../adr/0077-workload-targeted-performance.md) | # 0077. Workload-targeted performance — a shape is not a result without its tail | Proposed | [5/9 done](0077-workload-targeted-performance.md) | 4 open |
+| [0077](../adr/0077-workload-targeted-performance.md) | # 0077. Workload-targeted performance — a shape is not a result without its tail | Proposed | [6/10 done](0077-workload-targeted-performance.md) | 4 open |
 
 ## Open and deferred work
 
@@ -148,10 +148,6 @@
 **0044 — Release readiness: out-of-process cluster harness and continuous assurance**
 
 - `0044-P9` ⬜ planned ([#543](https://github.com/mbilling/fss-mqtt-broker/issues/543)): Nightly performance tolerance gate — compare the criterion suites against the recorded baseline and FAIL beyond a stated tolerance, instead of printing numbers for a human to read
-
-**0046 — File-based configuration (layered over env, hot-reloadable, GitOps-friendly)**
-
-- `0046-T6` ⬜ planned ([#544](https://github.com/mbilling/fss-mqtt-broker/issues/544)): Unrecognized CLI arguments are an error, not silence — mqttd accepts only --check-config and --decommission and IGNORES everything else, so a typo (`--check-confg`) or an unsupported flag (`--version`) starts a real broker instead of failing; refuse unknown args at startup and print the accepted set (2026-08-07 amendment)
 
 **0048 — Comparative performance benchmarking (published, reproducible, honest)**
 
