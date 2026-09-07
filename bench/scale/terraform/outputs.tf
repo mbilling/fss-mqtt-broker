@@ -1,5 +1,5 @@
 # The inventory every bench/scale script consumes:
-#   terraform output -json inventory > ../.runs/<stamp>/inventory-<N>.json
+#   tofu output -json inventory > ../.runs/<stamp>/inventory-<N>.json
 
 output "inventory" {
   description = "Hosts of this cluster size, with the fixed private addresses the harness drives."

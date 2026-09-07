@@ -37,7 +37,7 @@ rscp() { # rscp <src...> <public-ip>:<dst>  (or <public-ip>:<src> <dst>)
 	scp -q "${SSH_OPTS[@]}" -o UserKnownHostsFile="$RUN/known_hosts" "$@"
 }
 
-# Inventory accessors — the JSON written by `terraform output -json inventory`.
+# Inventory accessors — the JSON written by `tofu output -json inventory`.
 inv() { jq -r "$1" "$INVENTORY"; }
 broker_count() { inv '.brokers | length'; }
 broker_pub_ip() { inv ".brokers[$1].public_ip"; }

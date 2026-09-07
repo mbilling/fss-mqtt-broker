@@ -879,7 +879,7 @@ path; after any run, verify zero servers remain. CLOUD=upcloud selects UpCloud a
 UPCLOUD_TOKEN instead; read bench/scale/terraform-upcloud/README.md for different
 storage, CPU budgets and recovery limits. Never mix providers in a published curve.
 """
-requires = ["terraform", "jq", "ssh"]
+requires = ["tofu", "jq", "ssh"]
 duration = "~30m smoke, ~4-5h full"
 caution = "Creates PAID servers on CLOUD (default hcloud). Ctrl-C tears down; kill -9 does not. Recover with the SAME CLOUD selection."
 
@@ -905,7 +905,7 @@ bench/scale/workloads/README.md for the levers per workload and the two traps
 (a QoS 1 number can measure the harness, not the broker; broadcast fan-out cannot
 scale linearly with node count).
 """
-requires = ["terraform", "jq", "ssh"]
+requires = ["tofu", "jq", "ssh"]
 duration = "~40m per workload curve (sizes 1, 3, 5)"
 caution = "Creates PAID cloud servers on CLOUD (default hcloud). Needs MQTTD_VERSION set — the binary under test is a disclosure item, never a default."
 
@@ -956,7 +956,7 @@ group = "Benchmark"
 name = "Destroy any leftover scale-curve cloud resources"
 script = "bench/scale/teardown.sh"
 about = """
-The leak sweeper for bench/scale: terraform destroy from local state, then an audit of
+The leak sweeper for bench/scale: tofu destroy from local state, then an audit of
 everything labeled purpose=mqttd-bench-scale (add --force to delete what the audit
 finds; needs the hcloud CLI). Run it after a killed run, a dead laptop, or before
 reading the invoice. With CLOUD=upcloud, only UpCloud's local state is destroyed:
@@ -964,7 +964,7 @@ there is no account-wide audit or --force sweep, and missing state fails explici
 Always preserve the run's CLOUD selection and verify remaining resources in that
 provider's console; a successful state-backed destroy cannot rule out orphans.
 """
-requires = ["terraform"]
+requires = ["tofu"]
 duration = "~2m"
 
 [[task]]
@@ -1058,8 +1058,8 @@ id = "scale-upcloud-quota-tests"
 group = "Benchmark"
 name = "Offline UpCloud HCL quota regression tests"
 script = "bench/scale/test-upcloud-quota.py"
-about = "Run with python3 and OpenTofu (or Terraform). Evaluates the real quota preconditions using only terraform_data in an isolated directory. No cloud provider or credentials."
-requires = ["python3"]
+about = "Run with python3 and OpenTofu (tofu required; no Terraform fallback). Evaluates the real quota preconditions using only terraform_data in an isolated directory. No cloud provider or credentials."
+requires = ["python3", "tofu"]
 hidden = true
 
 [[task]]

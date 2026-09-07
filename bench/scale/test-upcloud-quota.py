@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Exercise real HCL quota preconditions offline using only terraform_data.
 
-Requires OpenTofu (or Terraform); no UpCloud provider, state or credentials.
+Requires OpenTofu; no UpCloud provider, state or credentials.
 """
 import os
 from pathlib import Path
@@ -16,9 +16,9 @@ MODULE = Path(__file__).resolve().parent / "terraform-upcloud"
 class QuotaTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.tf = shutil.which("tofu") or shutil.which("terraform")
+        cls.tf = shutil.which("tofu")
         if not cls.tf:
-            raise RuntimeError("Install OpenTofu or Terraform to run the quota tests")
+            raise RuntimeError("OpenTofu (tofu) is required; Terraform is not supported")
         cls.temp = tempfile.TemporaryDirectory()
         cls.addClassCleanup(cls.temp.cleanup)
         cls.root = Path(cls.temp.name)

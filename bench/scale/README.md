@@ -27,17 +27,22 @@ The prerequisites and pricing below describe the default Hetzner platform.
    in the project's console inventory. (Because no project key is attached to
    the servers, Hetzner emails a root password per server — ignore it; the
    cloud-init key is already in place.)
-4. Laptop tools: `terraform` ≥ 1.7 (or OpenTofu), `jq`, and — on macOS —
+4. Laptop tools: **OpenTofu (`tofu`) ≥ 1.7**, `jq`, and — on macOS —
    `openssl@3` (`brew install openssl@3`; the system LibreSSL cannot mint the
    cluster PKI and `deploy/systemd/gen-certs.sh` refuses it loudly). The
    `hcloud` CLI is optional but lets `teardown.sh` audit by label.
+   Provisioning, teardown (including the sweeper), and quota tests require `tofu`;
+   there is no Terraform fallback, even if Terraform is installed. No Terraform
+   Cloud/Enterprise features are used. Existing `terraform*/` directories,
+   `.tf` files, `terraform_data` resources and `terraform.tfstate` names remain
+   unchanged: these are OpenTofu-compatible syntax/state, not CLI dependencies.
 5. Sanity-check current CCX23/CCX33 pricing and availability in `fsn1`
    (fallbacks: `nbg1`, `hel1` via the `location` variable).
 6. **Dedicated-core limit.** A fresh project's default cap (~16 dedicated
    cores) fits `smoke` (1×CCX23 + 1×CCX33 = 12) but NOT the full curve —
    5×CCX23 + 2×CCX33 = **36 cores** at the 5-node point. Before `full`,
    request a limit increase in the console (Limits → dedicated vCPUs, ≥40);
-   a run that trips the cap fails at `terraform apply` with
+   a run that trips the cap fails at `tofu apply` with
    `dedicated core limit exceeded` and tears itself down, costing cents.
 
 ## Cost
@@ -143,7 +148,7 @@ driver shortfall read as a broker limit.
 
 | step | what | knobs (full profile) |
 |---|---|---|
-| provision | terraform apply, cloud-init (checksum-verified release binary), private-net mesh gate, founder-first bring-up + arm, full-membership gate | one clean+reboot retry per host |
+| provision | tofu apply, cloud-init (checksum-verified release binary), private-net mesh gate, founder-first bring-up + arm, full-membership gate | one clean+reboot retry per host |
 | barrier probes | `device_barrier_floor` + `store_append_floor` on EVERY broker's data-dir volume — gates Curve 1 | 150 ops |
 | lane A `sat` | durable QoS1 closed loop, spread ownership — the headline row (+ qos2 and clean-session arms inside) | 48 pubs × window 8, 48 subs, 3 reps × 60 s |
 | lane A `lat` | uncontended ack RTT | N pubs × window 1, 3 reps |
@@ -161,7 +166,7 @@ it proves the rig end to end for cents and its numbers are never published.
 
 ## What runs where
 
-- **This machine:** Terraform; PKI minting (`deploy/systemd/gen-certs.sh` — the
+- **This machine:** OpenTofu; PKI minting (`deploy/systemd/gen-certs.sh` — the
   CA keys never leave); orchestration over SSH; result collection.
 - **Broker hosts (CCX23):** the pinned, signed release binary, checksum-verified
   by cloud-init, under the shipped `deploy/systemd/mqttd.service` plus a
