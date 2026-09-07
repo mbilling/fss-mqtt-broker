@@ -2,7 +2,7 @@
 # Standalone teardown / leak sweeper. Normal runs destroy themselves; this is
 # for a dead laptop, a lost state file, or paranoia before reading the invoice.
 #
-#   ./teardown.sh           # terraform destroy from local state, then AUDIT by label
+#   ./teardown.sh           # tofu destroy from local state, then AUDIT by label
 #   ./teardown.sh --force   # also DELETE whatever the label audit finds (needs hcloud CLI)
 #
 # Everything this rig creates carries the label purpose=mqttd-bench-scale, and
@@ -17,14 +17,13 @@ select_scale_cloud
 FORCE=0
 [ "${1:-}" = --force ] && FORCE=1
 
-TF=$(command -v terraform || command -v tofu || true)
+TF=$(command -v tofu) || die "OpenTofu (tofu) is required; Terraform is not supported"
 
 if [ "$CLOUD" = upcloud ]; then
 	# No hcloud commands here: a provider mismatch could delete an unrelated
 	# Hetzner benchmark while leaving every UpCloud server billing.
 	[ "$FORCE" = 0 ] || die "CLOUD=upcloud does not support --force; use state-backed teardown or inspect the UpCloud console"
 	require_scale_token
-	[ -n "$TF" ] || die "terraform (or tofu) not installed"
 	[ -f "$TFDIR/terraform.tfstate" ] || die "UpCloud state missing; inspect servers, storage, networks and server groups in the UpCloud console (do not use the Hetzner sweeper)"
 	(cd "$TFDIR" && "$TF" init -input=false && "$TF" destroy -auto-approve -input=false -var node_count=1) ||
 		die "UpCloud destroy failed; preserve state and inspect the UpCloud console before retrying"
@@ -32,10 +31,10 @@ if [ "$CLOUD" = upcloud ]; then
 	exit 0
 fi
 
-if [ -n "$TF" ] && [ -f "$TFDIR/terraform.tfstate" ]; then
-	say "terraform destroy from local state"
+if [ -f "$TFDIR/terraform.tfstate" ]; then
+	say "OpenTofu destroy from local state"
 	(cd "$TFDIR" && "$TF" destroy -auto-approve -var node_count=1) ||
-		warn "terraform destroy failed — continuing to the label audit"
+		warn "OpenTofu destroy failed — continuing to the label audit"
 fi
 
 if ! command -v hcloud >/dev/null; then

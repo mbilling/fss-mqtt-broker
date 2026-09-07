@@ -18,12 +18,13 @@ class CloudTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.rig = self.root / "bench/scale"
         self.rig.mkdir(parents=True)
-        for name in ("lib.sh", "cloud.sh", "run.sh", "teardown.sh", "run-curve.sh"):
+        for name in ("lib.sh", "cloud.sh", "run.sh", "teardown.sh", "run-curve.sh", "test-upcloud-quota.py"):
             shutil.copy2(SCALE / name, self.rig / name)
         for name in ("terraform", "terraform-upcloud"):
             (self.rig / name).mkdir()
         bin_dir = self.root / "bin"
         bin_dir.mkdir()
+        self.bin_dir = bin_dir
         self.log = self.root / "calls.jsonl"
         stub = '''#!/usr/bin/env python3
 import json, os, sys
@@ -58,6 +59,7 @@ sys.exit(77 if "apply" in sys.argv or os.path.basename(sys.argv[0]) in ("hcloud"
         self.assertNotEqual(result.returncode, 0)
         calls = self.calls()
         self.assertEqual([c[2][0] for c in calls], ["init", "apply", "destroy"])
+        self.assertTrue(all(c[0] == "tofu" for c in calls), calls)
         self.assertTrue(all(c[1] == str(self.rig / "terraform-upcloud") for c in calls))
         self.assertNotIn("broker_server_type=cpx32", calls[1][2])
         self.assertNotIn("driver_server_type=cpx42", calls[1][2])
@@ -67,6 +69,7 @@ sys.exit(77 if "apply" in sys.argv or os.path.basename(sys.argv[0]) in ("hcloud"
         self.run_script("run.sh", "smoke", HCLOUD_TOKEN="dummy")
         calls = self.calls()
         self.assertEqual(len(calls), 3)
+        self.assertTrue(all(c[0] == "tofu" for c in calls), calls)
         self.assertTrue(all(c[1] == str(self.rig / "terraform") for c in calls))
         self.assertIn("broker_server_type=cpx32", calls[1][2])
         self.assertIn("driver_server_type=cpx42", calls[1][2])
@@ -97,7 +100,40 @@ sys.exit(77 if "apply" in sys.argv or os.path.basename(sys.argv[0]) in ("hcloud"
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("No account-wide leak audit", result.stderr)
         self.assertEqual([c[2][0] for c in self.calls()], ["init", "destroy"])
+        self.assertTrue(all(c[0] == "tofu" for c in self.calls()), self.calls())
         self.assertTrue(all(c[1] == str(self.rig / "terraform-upcloud") for c in self.calls()))
+
+    def test_hcloud_teardown_never_selects_terraform(self):
+        (self.rig / "terraform/terraform.tfstate").write_text("{}")
+        result = self.run_script("teardown.sh", HCLOUD_TOKEN="dummy")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.calls()
+        self.assertEqual(calls[0], ["tofu", str(self.rig / "terraform"),
+                                   ["destroy", "-auto-approve", "-var", "node_count=1"]])
+        self.assertTrue(all(c[0] == "hcloud" for c in calls[1:]), calls)
+
+    def test_missing_tofu_fails_even_when_terraform_exists(self):
+        # Hermetic PATH: removing the stub must not reveal the host's real tofu.
+        (self.bin_dir / "tofu").unlink()
+        for name in ("bash", "dirname", "git", "sed", "python3"):
+            target = shutil.which(name)
+            self.assertIsNotNone(target, name)
+            (self.bin_dir / name).symlink_to(target)
+        self.env["PATH"] = str(self.bin_dir)
+        for cloud in ("hcloud", "upcloud"):
+            for script, args in (("run.sh", ("smoke",)), ("teardown.sh", ())):
+                with self.subTest(cloud=cloud, script=script):
+                    result = self.run_script(script, *args, CLOUD=cloud,
+                                             HCLOUD_TOKEN="dummy", UPCLOUD_TOKEN="dummy")
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("OpenTofu (tofu) is required", result.stderr)
+                    self.assertEqual(self.calls(), [])
+        result = subprocess.run([str(self.bin_dir / "python3"),
+                                 str(self.rig / "test-upcloud-quota.py")],
+                                env=self.env, capture_output=True, text=True, timeout=15)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("OpenTofu (tofu) is required", result.stderr)
+        self.assertEqual(self.calls(), [])
 
     def test_upcloud_missing_state_and_force_fail_closed(self):
         for args, expected in (((), "state missing"), (("--force",), "does not support --force")):

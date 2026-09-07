@@ -107,9 +107,8 @@ LATEST_TAG=$(git -C "$SCALE_DIR" describe --tags --abbrev=0 2>/dev/null | sed 's
 if [ -n "${MQTTD_URL:-}" ] && [ -z "${MQTTD_SHA256:-}" ]; then
 	die "MQTTD_URL is set but MQTTD_SHA256 is not. An arbitrary URL publishes no .sha256 beside it, so the broker would be installed unverified. Compute it (sha256sum <binary>) and pass MQTTD_SHA256."
 fi
-command -v terraform >/dev/null || command -v tofu >/dev/null || die "terraform (or tofu) not installed"
+TF=$(command -v tofu) || die "OpenTofu (tofu) is required; Terraform is not supported"
 command -v jq >/dev/null || die "jq not installed"
-TF=$(command -v terraform || command -v tofu)
 
 STAMP=$(date -u +%Y%m%dT%H%M%SZ)
 RUN="${RUN_DIR:-$SCALE_DIR/.runs/$STAMP}"
@@ -176,7 +175,7 @@ teardown() {
 	say "tearing down (trap; exit code was $rc)"
 	if ! (cd "$TFDIR" && "$TF" destroy -auto-approve \
 		-var node_count="${CURRENT_SIZE:-1}" -var run_label="$STAMP" >>"$RUN/teardown.log" 2>&1); then
-		warn "terraform destroy FAILED — recover with: $TEARDOWN_CMD (see the provider's README recovery limits)"
+		warn "OpenTofu destroy FAILED — recover with: $TEARDOWN_CMD (see the provider's README recovery limits)"
 		exit 1
 	fi
 	say "all cloud resources destroyed"
@@ -186,7 +185,7 @@ trap teardown EXIT INT TERM
 
 (cd "$TFDIR" && "$TF" init -input=false >"$RUN/tf-init.log" 2>&1) || {
 	cat "$RUN/tf-init.log" >&2
-	die "terraform init failed"
+	die "OpenTofu init failed"
 }
 
 # The durable_bench driver is built from BENCH_GIT_REF. Its default was "main",
@@ -232,7 +231,7 @@ for N in "${SIZES[@]}"; do
 		${BROKER_NIC_SPREAD:+-var broker_nic_spread="$BROKER_NIC_SPREAD"} \
 		>"$RUN/tf-apply-$N.log" 2>&1) || {
 		tail -30 "$RUN/tf-apply-$N.log" >&2
-		die "terraform apply failed for size $N"
+		die "OpenTofu apply failed for size $N"
 	}
 	INVENTORY="$RUN/inventory-$N.json"
 	(cd "$TFDIR" && "$TF" output -json inventory) >"$INVENTORY"
@@ -384,7 +383,7 @@ for N in "${SIZES[@]}"; do
 	(cd "$TFDIR" && "$TF" destroy -auto-approve \
 		-var node_count="$N" -var run_label="$STAMP" >"$RUN/tf-destroy-$N.log" 2>&1) || {
 		tail -20 "$RUN/tf-destroy-$N.log" >&2
-		die "terraform destroy failed for size $N — recover with $TEARDOWN_CMD before re-running"
+		die "OpenTofu destroy failed for size $N — recover with $TEARDOWN_CMD before re-running"
 	}
 	touch "$RUN/done-$N"
 done

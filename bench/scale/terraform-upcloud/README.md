@@ -1,6 +1,7 @@
 # UpCloud scale rig
 
-Select this module with `CLOUD=upcloud`. The default remains Hetzner; results
+Select this module with `CLOUD=upcloud`. Install OpenTofu (`tofu`) ≥ 1.7;
+Terraform is not used as a fallback. The default remains Hetzner; results
 from the two platforms must not be combined into one scaling curve. UpCloud's
 `maxiops` disks are network-replicated, not the local NVMe required by ADR 0048.
 The inventory records provider, storage tier, plans and vCPU counts. Matching
@@ -63,7 +64,7 @@ never interpret an empty local state as proof of zero account-wide charges.
 
 ```sh
 python3 bench/scale/test-cloud.py
-python3 bench/scale/test-upcloud-quota.py  # requires tofu or terraform
+python3 bench/scale/test-upcloud-quota.py  # requires tofu
 # Provider download only; no cloud resources:
 tofu -chdir=bench/scale/terraform-upcloud init -backend=false
 tofu -chdir=bench/scale/terraform-upcloud fmt -check -recursive
