@@ -757,6 +757,18 @@ duration = "~2s"
 hidden = true
 
 [[task]]
+id = "check-issue-alignment"
+group = "Internal"
+name = "Check delivery tasks and GitHub issues agree"
+script = "scripts/check-issue-alignment.py"
+# Reads the repo's delivery frontmatter and asks GitHub about the issues it names.
+needs_checkout = true
+about = "Fails when an open delivery task names a closed issue, or a done task's issue is still open."
+requires = ["python3", "gh"]
+duration = "~2s"
+hidden = true
+
+[[task]]
 id = "check-readme-facts"
 group = "Internal"
 name = "Check the README's derivable facts"

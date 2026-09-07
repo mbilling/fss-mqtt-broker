@@ -625,6 +625,9 @@ async fn the_listener_survives_fd_exhaustion_and_accepts_again() {
     const SOCKETS: usize = 400;
 
     let addr: SocketAddr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+    let logs = tempfile::NamedTempFile::new().expect("broker log file");
+    let log_path = logs.path().to_path_buf();
+    let log_sink = logs.reopen().expect("broker log handle");
     let mut cmd = Command::new("/bin/sh");
     cmd.arg("-c")
         .arg(format!("ulimit -n {FD_LIMIT}; exec \"$0\""))
@@ -640,8 +643,9 @@ async fn the_listener_survives_fd_exhaustion_and_accepts_again() {
         .env("MQTTD_ALLOW_ANONYMOUS", "1")
         .env("MQTTD_ALLOW_EPHEMERAL_DURABILITY", "1")
         .env("RUST_LOG", "warn")
-        // The accept-failure warning lands on STDOUT with the tracing subscriber.
-        .stdout(Stdio::piped())
+        // STDOUT to a FILE, not a pipe: the accept-failure warning is the observable
+        // this test waits on, and a pipe cannot be read until the child ends.
+        .stdout(Stdio::from(log_sink))
         .stderr(Stdio::null())
         .spawn()
         .expect("failed to spawn the mqttd binary");
@@ -665,8 +669,29 @@ async fn the_listener_survives_fd_exhaustion_and_accepts_again() {
             _ => break,
         }
     }
-    // Give the broker time to hit the wall and log it.
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    // Wait for the WALL ITSELF, not for a duration: the squeeze is only on once
+    // the broker has actually failed an accept, and if it never does then nothing
+    // below proves anything about surviving one. A bounded poll says which of
+    // those happened; a sleep would have let a silent no-op read as a pass.
+    let squeeze_deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let squeezed = loop {
+        if std::fs::read_to_string(&log_path)
+            .unwrap_or_default()
+            .contains("listener accept failed")
+        {
+            break true;
+        }
+        if std::time::Instant::now() >= squeeze_deadline {
+            break false;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert!(
+        squeezed,
+        "the squeeze never forced an accept error in 20s, so this test proves nothing \
+         about surviving one — raise SOCKETS or lower FD_LIMIT. Log: {}",
+        std::fs::read_to_string(&log_path).unwrap_or_default()
+    );
 
     // Release. The broker's own descriptors come back as its connection tasks end.
     drop(held);
@@ -686,20 +711,8 @@ async fn the_listener_survives_fd_exhaustion_and_accepts_again() {
     }
 
     let _ = guard.0.kill();
-    let mut logs = String::new();
-    guard
-        .0
-        .stdout
-        .take()
-        .expect("stdout piped")
-        .read_to_string(&mut logs)
-        .unwrap();
+    let logs = std::fs::read_to_string(&log_path).unwrap_or_default();
 
-    assert!(
-        logs.contains("listener accept failed"),
-        "the squeeze never forced an accept error, so this test proves nothing about \
-         surviving one — raise SOCKETS or lower FD_LIMIT. Logs were: {logs}"
-    );
     assert!(
         recovered,
         "the listener never accepted again after an accept error (#504): the broker \

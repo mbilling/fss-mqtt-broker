@@ -909,7 +909,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 362 test(s)
+## `crates/mqttd/src/lib.rs` — 366 test(s)
 
 - `admission::tests::the_global_cap_refuses_at_the_bound_and_recovers`
 - `admission::tests::the_penalty_box_refuses_after_the_threshold`
@@ -965,6 +965,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `conn::tests::a_client_cannot_size_the_outbound_alias_table_by_asking_for_more`
 - `conn::tests::a_client_disconnect_is_still_reported_as_graceful`
 - `conn::tests::a_denied_qos0_publish_stays_a_silent_drop_in_both_versions`
+- `conn::tests::a_failed_connack_still_detaches_the_attached_session`
 - `conn::tests::a_keepalive_expiry_detaches_ungracefully_so_the_will_fires`
 - `conn::tests::a_protocol_violation_close_detaches_ungracefully_so_the_will_fires`
 - `conn::tests::a_qos2_publish_whose_durable_fan_out_failed_stays_held_unacked_and_is_re_attempted`
@@ -1056,6 +1057,8 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::a_co_subscribed_filter_releases_the_ack_while_a_moved_durable_copy_is_lost`
 - `hub::tests::a_committed_clear_back_fills_as_a_tombstone_and_fences`
 - `hub::tests::a_committed_retained_publish_fans_out_with_its_token`
+- `hub::tests::a_completed_qos2_delivery_does_not_replay_when_the_truncate_is_lost`
+- `hub::tests::a_completed_qos2_delivery_does_not_replay_when_the_truncate_lands`
 - `hub::tests::a_congested_relaxed_forward_is_answered_at_append_completion`
 - `hub::tests::a_congested_relaxed_publish_waits_for_its_append`
 - `hub::tests::a_crashed_hub_releases_the_store_so_the_node_can_restart`
@@ -1095,6 +1098,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::a_missed_retained_fan_out_is_healed_by_periodic_anti_entropy`
 - `hub::tests::a_moved_lease_owner_nacks_a_routed_commit`
 - `hub::tests::a_nacked_handoff_re_routes_once_placement_catches_up`
+- `hub::tests::a_parked_qos2_truncate_does_not_stall_unrelated_sessions` — `#[ignore]`d
 - `hub::tests::a_peer_that_missed_the_last_fanout_converges_from_a_restarted_owners_snapshot`
 - `hub::tests::a_peers_refusal_refuses_the_publisher_instead_of_dropping_the_gate`
 - `hub::tests::a_proto_6_peer_is_answered_with_the_boolean_and_a_proto_7_peer_with_the_verdict`
@@ -1248,7 +1252,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `memory_watch::tests::a_status_without_vm_rss_yields_none_not_zero`
 - `memory_watch::tests::an_unreadable_rss_stops_the_watcher_instead_of_reporting_zero`
 - `memory_watch::tests::nearing_the_watermark_shortens_the_poll`
-- `memory_watch::tests::the_real_sampler_reports_a_plausible_rss_on_linux` — only when `cfg(target_os = "linux")`
+- `memory_watch::tests::the_real_sampler_reports_a_plausible_rss_on_linux`
 - `memory_watch::tests::the_watcher_drives_brownout_on_watermark_transitions`
 - `memory_watch::tests::vm_rss_is_parsed_in_bytes_from_the_right_line`
 - `memory_watch::tests::without_a_watermark_nothing_is_ever_browned_out`
@@ -1274,11 +1278,14 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `store_watch::tests::the_store_skew_report_is_edge_triggered_with_hysteresis`
 - `store_watch::tests::the_watcher_drives_brownout_on_watermark_transitions`
 
-## `crates/mqttd/src/main.rs` — 13 test(s)
+## `crates/mqttd/src/main.rs` — 16 test(s)
 
 - `tests::a_non_durable_node_resolves_no_write_floor`
+- `tests::a_vanished_peer_is_retried_immediately_not_paused`
 - `tests::changing_the_identity_source_requires_a_restart`
+- `tests::every_accept_error_still_leaves_the_listener_accepting`
 - `tests::every_flag_the_code_compares_is_in_the_known_set`
+- `tests::fd_exhaustion_pauses_so_the_listener_can_recover_instead_of_spinning`
 - `tests::positive_cap_rejects_zero_and_converts`
 - `tests::queue_limits_read_overflow_policy_from_config`
 - `tests::requires_restart_masks_the_live_swappable_fields`
@@ -1331,7 +1338,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `a_restored_node_restarts_with_its_own_unchanged_environment`
 - `sigusr2_on_a_node_with_no_backup_dir_is_a_no_op_not_a_death`
 
-## `crates/mqttd/tests/binary_smoke.rs` — 8 test(s)
+## `crates/mqttd/tests/binary_smoke.rs` — 9 test(s)
 
 - `a_graceful_stop_closes_the_audit_chain`
 - `binary_serves_a_plaintext_pubsub_roundtrip`
@@ -1341,6 +1348,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `repeated_auth_failures_penalize_the_source_address_then_decay`
 - `the_audit_export_ships_a_verifiable_chain`
 - `the_ephemeral_opt_in_boots_and_still_warns`
+- `the_listener_survives_fd_exhaustion_and_accepts_again`
 
 ## `crates/mqttd/tests/brownout_ack.rs` — 5 test(s)
 
@@ -1391,11 +1399,12 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 
 - `a_soak_under_sustained_load_shows_no_drift` — `#[ignore]`d
 
-## `crates/mqttd/tests/cluster_stress.rs` — 11 test(s)
+## `crates/mqttd/tests/cluster_stress.rs` — 12 test(s)
 
 - `a_browned_out_session_owner_refuses_the_publisher_rather_than_owing_a_lost_message`
 - `a_cross_node_shared_subscriber_is_never_bypassed_by_an_ack`
 - `a_decommissioned_nodes_departure_loses_nothing`
+- `a_fleet_scale_grow_and_shrink_soak_loses_no_acked_fact`
 - `a_full_cluster_stop_start_recovers_every_acked_fact`
 - `a_v5_publisher_on_a_healthy_node_is_told_0x97_when_the_session_owning_peer_refuses`
 - `cost_reduction_five_to_three_via_two_decommissions`
