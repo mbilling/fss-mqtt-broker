@@ -372,6 +372,12 @@ LANE_E_PUBS_PER_SITE="${LANE_E_PUBS_PER_SITE:-1200}"
 # tenancy. Six puts each consumer at 5,000, inside the band worth advertising.
 LANE_E_SUBS_PER_SITE="${LANE_E_SUBS_PER_SITE:-6}"
 LANE_E_QOS="${LANE_E_QOS:-0}"
+# The SUBSCRIBER's requested QoS, separately (#534, acceptance 2). #405 records
+# that the old durable_bench QoS 2 rows isolated INBOUND cost — publisher at
+# QoS 2, subscriber at QoS 1 — and so never measured the outbound exactly-once
+# path at all. Defaulting to LANE_E_QOS makes the both-ends arm the normal case
+# and keeps the asymmetric one available deliberately rather than by oversight.
+LANE_E_SUB_QOS="${LANE_E_SUB_QOS:-$LANE_E_QOS}"
 LANE_E_PAYLOAD="${LANE_E_PAYLOAD:-200}"
 # A site's publishers are split over this many containers. One container per
 # site would ask a single emqtt-bench worker for the whole 30,000 msg/s; the
@@ -404,6 +410,45 @@ LANE_E_MIN_INTERVAL="${LANE_E_MIN_INTERVAL:-5}"
 # does — it exists so a rung can be run without it deliberately, not by accident.
 LANE_E_DRAIN_POLL="${LANE_E_DRAIN_POLL:-5}"
 LANE_E_FLAT_POLLS="${LANE_E_FLAT_POLLS:-3}"
+# THE WARMED BASELINE (#534, acceptance 5). LANE_E_SETTLE is a fixed sleep, and a
+# fixed sleep is a guess: if the population has not finished connecting when it
+# expires, the rung baselines its histograms mid-ramp and measures a cluster that
+# is still filling up. At 8 sites that is 9,648 clients arriving at
+# LANE_E_CONNECT_RATE — the settle is checked against the broker's own connection
+# count now, not assumed, and a rung that never reaches its population is recorded
+# as unsettled rather than quietly measured.
+LANE_E_SETTLE_BUDGET="${LANE_E_SETTLE_BUDGET:-180}"
+# THE RESET AND THE CONTROL (#534, acceptance 6). The floor is not 0: the brokers
+# carry their own health-check and metrics-scrape connections, and a cluster of N
+# nodes holds peer links. What must be gone is the previous rung's THOUSANDS.
+LANE_E_RESET_FLOOR="${LANE_E_RESET_FLOOR:-32}"
+LANE_E_RESET_BUDGET="${LANE_E_RESET_BUDGET:-120}"
+# After the ladder, re-run its BOTTOM rung as a CONTROL. A ladder is a sequence of
+# trials on one cluster, and every later rung is confounded by every earlier one:
+# if the broker degraded, or never recovered from a rung that overloaded it, the
+# ladder reports that as capacity running out at a site count. The control is the
+# cheapest possible discriminator — the rung that already passed, run again at the
+# end. If it no longer passes, the trial is INCONCLUSIVE and no site count in it
+# is a capacity finding. T4's own delivery notes ask for exactly this: "carry a
+# control rung common to every run so a bad cluster draw is visible rather than
+# silent".
+LANE_E_CONTROL="${LANE_E_CONTROL:-1}"
+# MEASURED OFFER CEILINGS (#534, acceptance 4), enforced by lane_e_shape above.
+# 20,000/container is what the 0077-T7 probe HELD exactly (2026-08-28); the
+# ~27,000 in the container-count comment is the most ever observed, not a rate
+# anything sustained, and using an observed maximum as a budget is how a rig
+# under-offers. 10,000/consumer is T7's measured per-$share-member rate at both
+# QoS 0 and QoS 1. Raise either only with a calibration that measured it — which
+# LANE_E_CALIBRATE below does, on the actual driver, before the ladder is paid for.
+LANE_E_MAX_CONTAINER_RATE="${LANE_E_MAX_CONTAINER_RATE:-20000}"
+LANE_E_MAX_SUB_RATE="${LANE_E_MAX_SUB_RATE:-10000}"
+# Before the ladder, prove ONE publisher container can actually offer the rate a
+# rung will ask of it, on this run's real driver hardware. The ceilings above are
+# from a different campaign on different machines; this checks them against the
+# metal that is about to be billed, and it costs one container for
+# LANE_E_CALIBRATE_SECS rather than a whole ladder of wrong answers.
+LANE_E_CALIBRATE="${LANE_E_CALIBRATE:-1}"
+LANE_E_CALIBRATE_SECS="${LANE_E_CALIBRATE_SECS:-20}"
 # A rung PASSES only if its p99 stays under this many ms. The point of a tenancy
 # ladder is the site count at which latency leaves the band, not the count at
 # which the broker finally refuses traffic — those are far apart, and only the
@@ -712,7 +757,13 @@ lane_e_shape() {
 		die "LANE_E_DRAIN_SECS must be a non-negative integer (got '$LANE_E_DRAIN_SECS')"
 	[ "$LANE_E_DRAIN_SECS" -eq 0 ] || [ "$LANE_E_DRAIN_SECS" -ge $((LANE_E_FLAT_POLLS * LANE_E_DRAIN_POLL)) ] ||
 		die "lane E: LANE_E_DRAIN_SECS=$LANE_E_DRAIN_SECS cannot fit $LANE_E_FLAT_POLLS polls of ${LANE_E_DRAIN_POLL}s, so the drain could never observe a flat run and every rung would report UNRESOLVED"
-	case "$LANE_E_QOS" in 0 | 1) ;; *) die "LANE_E_QOS must be 0 or 1, got '$LANE_E_QOS'" ;; esac
+	case "$LANE_E_QOS" in 0 | 1 | 2) ;; *) die "LANE_E_QOS must be 0, 1 or 2, got '$LANE_E_QOS'" ;; esac
+	case "$LANE_E_SUB_QOS" in 0 | 1 | 2) ;; *) die "LANE_E_SUB_QOS must be 0, 1 or 2, got '$LANE_E_SUB_QOS'" ;; esac
+	# A subscriber cannot be granted MORE than the publisher sent: asking for it
+	# would silently measure the publisher's QoS while the run directory claims
+	# the subscriber's. The reverse (sub < pub) is the deliberate asymmetric arm.
+	[ "$LANE_E_SUB_QOS" -le "$LANE_E_QOS" ] ||
+		die "lane E: LANE_E_SUB_QOS=$LANE_E_SUB_QOS exceeds LANE_E_QOS=$LANE_E_QOS — a delivery can never have a higher QoS than its publish, so this arm would measure QoS $LANE_E_QOS while labelling itself QoS $LANE_E_SUB_QOS"
 	[ "${#LANE_E_SITES[@]}" -gt 0 ] || die "LANE_E_SITES is empty — nothing to run"
 
 	# The per-publisher timer. Whole milliseconds, exactly as lane B: a floored
@@ -736,6 +787,17 @@ lane_e_shape() {
 	local subs_per_c=$((LANE_E_SUBS_PER_SITE / LANE_E_SUB_CONTAINERS_PER_SITE))
 	local per_c_rate=$((LANE_E_SITE_RATE / LANE_E_PUB_CONTAINERS_PER_SITE))
 	local per_sub_rate=$((LANE_E_SITE_RATE / LANE_E_SUBS_PER_SITE))
+	# The offer ceilings (#534, acceptance 4). Both of these existed only as prose
+	# — "the most any container on this rig has been measured to sustain is
+	# ~27,000", "our measured per-subscriber QoS 0 rate of 10,806 msg/s" — where
+	# nothing enforced them and a knob change could silently cross either. A
+	# crossed ceiling does not fail loudly; it under-offers, and the ladder then
+	# reports a DRIVER limit as the broker's capacity. That is the single most
+	# expensive failure mode this rig has.
+	[ "$per_c_rate" -le "$LANE_E_MAX_CONTAINER_RATE" ] ||
+		die "lane E: $per_c_rate msg/s per publisher container exceeds the measured ceiling LANE_E_MAX_CONTAINER_RATE=$LANE_E_MAX_CONTAINER_RATE. Raise LANE_E_PUB_CONTAINERS_PER_SITE so each container carries less, or raise the ceiling only with a calibration run that measured it"
+	[ "$per_sub_rate" -le "$LANE_E_MAX_SUB_RATE" ] ||
+		die "lane E: $per_sub_rate msg/s per consumer exceeds the measured ceiling LANE_E_MAX_SUB_RATE=$LANE_E_MAX_SUB_RATE (0077-T7 measured ~10,000/s per \$share member at BOTH QoS levels). Raise LANE_E_SUBS_PER_SITE — a consumer that cannot drain makes the rung look like a broker limit"
 
 	{
 		echo "brokers=$N drivers=$D"
@@ -818,6 +880,47 @@ if [[ "$LANES" == *[BC]* ]] && [ -n "$BENCH_ERL_FLAGS" ]; then
 		die "BENCH_ERL_FLAGS='$BENCH_ERL_FLAGS' is refused by the Erlang VM in $BENCH_IMG: $(printf '%s\n' "$probe" | head -1)"
 	say "BENCH_ERL_FLAGS accepted by $BENCH_IMG on driver 0: $BENCH_ERL_FLAGS"
 fi
+
+# ── 0a. PROVENANCE — what, exactly, produced these numbers (#534, acceptance 1)
+#
+# The driver was pinned by digest, and nothing else was. A campaign is a claim
+# about a BROKER BINARY measured by a HARNESS, and neither was recorded: two runs
+# "on the same harness" were no more provably identical than the two runs "on
+# 0.6.3" that motivated pinning the image in the first place.
+#
+# Written BEFORE any lane, so a run that dies half way still says what it was.
+mkdir -p "$OUT/env"
+{
+	echo "harness_rev=$(git -C "$SCALE_DIR" rev-parse HEAD 2>/dev/null || echo unknown)"
+	# A dirty tree is the normal case while developing the rig and a disqualifier
+	# for a published number. Recording it is the difference between the two.
+	if git -C "$SCALE_DIR" diff --quiet HEAD 2>/dev/null; then
+		echo "harness_dirty=no"
+	else
+		echo "harness_dirty=YES — this run does not correspond to any commit"
+	fi
+	echo "harness_describe=$(git -C "$SCALE_DIR" describe --tags --always --dirty 2>/dev/null || echo unknown)"
+	echo "driver_image=$BENCH_IMG"
+	echo "mqttd_version=${MQTTD_VERSION:-unset}"
+	echo "mqttd_url=${MQTTD_URL:-}"
+	echo "mqttd_sha256_expected=${MQTTD_SHA256:-}"
+	echo "run_stamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+	echo "profile=$([ "${SMOKE:-0}" = 1 ] && echo smoke || { [ "${STANDARD:-0}" = 1 ] && echo standard || echo full; })"
+	echo "lanes=$LANES"
+} >"$OUT/env/provenance.txt"
+# The hash of the binary that is ACTUALLY RUNNING, read off each broker rather
+# than taken from what we asked to be installed. `swap-binary.sh` verifies at
+# install time; this records what survived, which is the thing the numbers came
+# from. The digest the driver image resolved to is read the same way.
+for ((i = 0; i < N; i++)); do
+	echo "broker${i}_mqttd_sha256=$(rssh "$(broker_pub_ip "$i")" \
+		"sha256sum \$(command -v mqttd || echo /usr/local/bin/mqttd) 2>/dev/null | cut -d' ' -f1" 2>/dev/null || echo unknown)" \
+		>>"$OUT/env/provenance.txt"
+done
+echo "driver0_image_digest=$(rssh "$(driver_pub_ip 0)" \
+	"docker image inspect --format '{{index .RepoDigests 0}}' $BENCH_IMG 2>/dev/null" 2>/dev/null || echo unknown)" \
+	>>"$OUT/env/provenance.txt"
+say "provenance recorded -> $OUT/env/provenance.txt"
 
 # ── 0. preflight snapshot ────────────────────────────────────────────────────
 say "[$N nodes] preflight: readyz + statusz per broker"
@@ -1463,8 +1566,8 @@ if [[ "$LANES" != *E* ]]; then
 	say "[$N nodes] LANES=$LANES — skipping lane E"
 else
 say "[$N nodes] lane E: site ladder ${LANE_E_SITES[*]} x $LANE_E_SITE_RATE msg/s"
-lane_e_rung() { # lane_e_rung <sites> [repeat-index]
-	local sites="$1" rep="${2:-1}"
+lane_e_rung() { # lane_e_rung <sites> [repeat-index] [is-control]
+	local sites="$1" rep="${2:-1}" is_control="${3:-no}"
 	# A REPEATED rung gets its own directory. Running the same site count twice in
 	# one provisioning is how the rig's own noise floor is measured — without a
 	# distinct name the second pass silently overwrote the first and the
@@ -1494,6 +1597,19 @@ lane_e_rung() { # lane_e_rung <sites> [repeat-index]
 	# that node.
 	site_hosts() { # site_hosts <site> <container-index>
 		if [ "$LANE_E_PIN_SITES" = 1 ]; then echo "${HOSTS[$1 % N]}"; else rotated_hosts "$2"; fi
+	}
+	# Connections the BROKERS currently hold, summed across the cluster. Read live
+	# rather than from a snapshot, because the question is "has the population
+	# arrived yet" and the answer has to be able to change while we wait.
+	lane_e_conns_total() {
+		local i tot=0 v
+		for ((i = 0; i < N; i++)); do
+			v=$(rssh "$(broker_pub_ip "$i")" \
+				"curl -s http://localhost:8080/metrics | awk '/^mqttd_connections_active[ {]/{s += \$2} END{print s + 0}'" 2>/dev/null || echo 0)
+			case "$v" in '' | *[!0-9]*) v=0 ;; esac
+			tot=$((tot + v))
+		done
+		echo "$tot"
 	}
 	# Sum `recv` across every consumer container, from the same REST scrape the
 	# rung already uses for its histograms. Deliberately identical to lane D's
@@ -1538,7 +1654,7 @@ lane_e_rung() { # lane_e_rung <sites> [repeat-index]
 			# these tenants rather than one big shared subscription: a publish for
 			# site 3 is selected among site 3's consumers only.
 			filter="\$share/site$s/site/$s/#"
-			subs[sdi]+="$DOCKER_RUN --name sub-s$s-$j $BENCH_IMG sub -h $hosts -p $port -c $subs_per_c -R $LANE_E_CONNECT_RATE -t '$filter' -q $LANE_E_QOS $active --payload-hdrs ts --prometheus --restapi $((port_base + portn[sdi])) >/dev/null"$'\n'
+			subs[sdi]+="$DOCKER_RUN --name sub-s$s-$j $BENCH_IMG sub -h $hosts -p $port -c $subs_per_c -R $LANE_E_CONNECT_RATE -t '$filter' -q $LANE_E_SUB_QOS $active --payload-hdrs ts --prometheus --restapi $((port_base + portn[sdi])) >/dev/null"$'\n'
 			scrape[sdi]+="printf '\\n@@@ sub-s$s-$j\\n'; curl -s http://localhost:$((port_base + portn[sdi]))/metrics"$'\n'
 			stop[sdi]+="printf '\\n@@@ sub-s$s-$j\\n'; docker logs sub-s$s-$j 2>&1"$'\n'
 			subdump[sdi]+="printf '\\n@@@ sub-s$s-$j\\n'; docker logs sub-s$s-$j 2>&1"$'\n'
@@ -1562,6 +1678,26 @@ lane_e_rung() { # lane_e_rung <sites> [repeat-index]
 	done
 	local -a pids
 	local pd
+	# ── the broker must be demonstrably RESET before this rung (#534, acc. 6) ──
+	# Rungs share one cluster, so a rung inherits whatever the previous one left
+	# behind. A capacity trial that starts on a broker still holding the last
+	# rung's connections is measuring residual overload, and the ladder would
+	# read that as the NEXT site count failing. Bounded, and recorded either way:
+	# a rung that starts un-reset is not silently comparable to one that did.
+	local reset=no reset_waited=0 reset_conns=0
+	while :; do
+		reset_conns=$(lane_e_conns_total)
+		if [ "$reset_conns" -le "$LANE_E_RESET_FLOOR" ]; then
+			reset=yes
+			break
+		fi
+		[ "$reset_waited" -lt "$LANE_E_RESET_BUDGET" ] || {
+			warn "lane E: rung $sites starting with $reset_conns connections still on the cluster (floor $LANE_E_RESET_FLOOR) after ${reset_waited}s — this rung inherits the previous one's residue and will be flagged UNRESET"
+			break
+		}
+		sleep "$LANE_E_DRAIN_POLL"
+		reset_waited=$((reset_waited + LANE_E_DRAIN_POLL))
+	done
 	snapshot_metrics "$rdir" before
 	pids=()
 	for ((di = 0; di < D; di++)); do driver_batch "$di" "${subs[di]}" & pids+=($!); done
@@ -1575,6 +1711,25 @@ lane_e_rung() { # lane_e_rung <sites> [repeat-index]
 	# are cumulative over the container's life, so a single end-of-rung scrape
 	# bakes the connect ramp into the published tail.
 	sleep "$LANE_E_SETTLE"
+	# ── the measurement window opens here, and only on a SETTLED population ───
+	# Everything below the baseline scrape is the rung; everything above it is
+	# ramp. Baselining before the clients have all arrived puts the connect ramp
+	# inside the published tail and measures a cluster still filling up.
+	local expect_conns settled=no settled_conns=0 settle_waited=0
+	expect_conns=$((sites * (LANE_E_PUBS_PER_SITE + LANE_E_SUBS_PER_SITE)))
+	while :; do
+		settled_conns=$(lane_e_conns_total)
+		if [ "$settled_conns" -ge "$expect_conns" ]; then
+			settled=yes
+			break
+		fi
+		[ "$settle_waited" -lt "$LANE_E_SETTLE_BUDGET" ] || {
+			warn "lane E: rung $sites settled at $settled_conns/$expect_conns connections after ${LANE_E_SETTLE}s + ${settle_waited}s — measuring an incomplete population, rung will be flagged UNSETTLED"
+			break
+		}
+		sleep "$LANE_E_DRAIN_POLL"
+		settle_waited=$((settle_waited + LANE_E_DRAIN_POLL))
+	done
 	pids=()
 	for ((di = 0; di < D; di++)); do driver_batch "$di" "${scrape[di]}" >"$rdir/.batch/base-$di" 2>/dev/null & pids+=($!); done
 	for pd in "${pids[@]}"; do wait "$pd" || true; done
@@ -1652,9 +1807,68 @@ lane_e_rung() { # lane_e_rung <sites> [repeat-index]
 	rm -rf "$rdir/.batch"
 	stop_cpu_sampling
 	snapshot_metrics "$rdir" after
-	echo "sites=$sites offered=$((sites * LANE_E_SITE_RATE)) publishers=$((sites * LANE_E_PUBS_PER_SITE)) consumers=$((sites * LANE_E_SUBS_PER_SITE)) per_consumer=$((LANE_E_SITE_RATE / LANE_E_SUBS_PER_SITE)) p99_budget_ms=$LANE_E_P99_BUDGET_MS drained=$drained drain_secs=$drain_secs drain_deadline_s=$LANE_E_DRAIN_SECS" >"$rdir/rung.txt"
+	echo "sites=$sites offered=$((sites * LANE_E_SITE_RATE)) publishers=$((sites * LANE_E_PUBS_PER_SITE)) consumers=$((sites * LANE_E_SUBS_PER_SITE)) per_consumer=$((LANE_E_SITE_RATE / LANE_E_SUBS_PER_SITE)) p99_budget_ms=$LANE_E_P99_BUDGET_MS qos=$LANE_E_QOS sub_qos=$LANE_E_SUB_QOS window_secs=$LANE_E_SECS settle_s=$((LANE_E_SETTLE + settle_waited)) settled=$settled settled_conns=$settled_conns expected_conns=$expect_conns drained=$drained drain_secs=$drain_secs drain_deadline_s=$LANE_E_DRAIN_SECS control=$is_control reset=$reset reset_conns=$reset_conns" >"$rdir/rung.txt"
 	say "  lane E: $sites site(s) done ($((sites * LANE_E_SITE_RATE)) msg/s offered)"
 }
+# ── the calibration probe (#534, acceptance 4) ───────────────────────────────
+#
+# "Validate achievable per-driver/per-container offer ... at the maximum intended
+# rung." Not from an inventory field, and not from a comment recording what some
+# other campaign saw: one container, on THIS run's driver, asked for exactly the
+# rate a rung will ask of it, measured by the driver's own `pub_overrun`.
+#
+# It runs against the cluster on a throwaway topic, so it measures the real path
+# (TCP, the broker accepting) rather than a loopback. Cheap: one container for
+# LANE_E_CALIBRATE_SECS, against a ladder that costs minutes per rung.
+lane_e_calibrate() {
+	[ "$LANE_E_CALIBRATE" = 1 ] || return 0
+	local per_pub_rate interval pubs_per_c per_c_rate hosts out achieved late
+	per_pub_rate=$((LANE_E_SITE_RATE / LANE_E_PUBS_PER_SITE))
+	interval=$((1000 / per_pub_rate))
+	pubs_per_c=$((LANE_E_PUBS_PER_SITE / LANE_E_PUB_CONTAINERS_PER_SITE))
+	per_c_rate=$((LANE_E_SITE_RATE / LANE_E_PUB_CONTAINERS_PER_SITE))
+	hosts=$(brokers_csv '.private_ip')
+	say "[$N nodes] lane E: calibrating one publisher container at $per_c_rate msg/s ($pubs_per_c clients, -I ${interval}ms) for ${LANE_E_CALIBRATE_SECS}s"
+	mkdir -p "$OUT/laneE"
+	out=$(rssh "$(driver_pub_ip 0)" "
+		set -e
+		docker rm -f cal-pub >/dev/null 2>&1 || true
+		$DOCKER_RUN --name cal-pub $BENCH_IMG pub -h $hosts -p 1883 -c $pubs_per_c -R $LANE_E_CONNECT_RATE \
+			-t 'calibrate/%i' -q $LANE_E_QOS -s $LANE_E_PAYLOAD -A true -I $interval --payload-hdrs ts >/dev/null
+		sleep $((LANE_E_CALIBRATE_SECS + 5))
+		docker logs cal-pub 2>&1
+		docker rm -f cal-pub >/dev/null 2>&1 || true
+	" 2>/dev/null) || {
+		warn "lane E: calibration probe could not run; the ceilings stay as configured and UNVERIFIED on this hardware"
+		echo "status=probe-failed" >"$OUT/laneE/calibration.txt"
+		return 0
+	}
+	printf '%s\n' "$out" >"$OUT/laneE/calibration.log"
+	# Same double-count correction the summarizer applies: `pub` is incremented
+	# twice at QoS 0 and once above it, `pub_succ` the mirror image.
+	achieved=$(printf '%s\n' "$out" | awk '
+		/ pub total=/    {p = $NF; sub(/rate=/, "", p); sub(/\/sec/, "", p)}
+		/ pub_succ total=/ {q = $NF; sub(/rate=/, "", q); sub(/\/sec/, "", q)}
+		END {printf "%d", (p + q) / 2}')
+	late=$(printf '%s\n' "$out" | awk '/ pub_overrun total=/ {t = $3; sub(/total=/, "", t)} END {printf "%d", t + 0}')
+	{
+		echo "asked_per_container=$per_c_rate"
+		echo "achieved_per_container=$achieved"
+		echo "late_publishes=$late"
+		echo "clients=$pubs_per_c interval_ms=$interval qos=$LANE_E_QOS secs=$LANE_E_CALIBRATE_SECS"
+		echo "ceiling_configured=$LANE_E_MAX_CONTAINER_RATE"
+	} >"$OUT/laneE/calibration.txt"
+	say "  lane E calibration: asked $per_c_rate/s, achieved $achieved/s, $late late publishes"
+	# A container that cannot offer the rate ON ITS OWN, with no other container
+	# competing and no ladder above it, will not offer it once the driver is full.
+	# Refusing here costs one container; discovering it from a curve costs the run
+	# AND produces a broker limit that was really this.
+	[ "$achieved" -ge $((per_c_rate * 97 / 100)) ] ||
+		die "lane E: calibration achieved $achieved msg/s of the $per_c_rate msg/s a rung will ask of ONE container, alone on the driver. Every rung would under-offer and the ladder would report a driver limit as broker capacity. Lower LANE_E_MAX_CONTAINER_RATE / raise LANE_E_PUB_CONTAINERS_PER_SITE, or use bigger drivers"
+	[ "$late" -eq 0 ] ||
+		warn "lane E: calibration met its rate but missed $late publish deadlines — the driver is at its edge before the ladder has started"
+}
+
 # BOTTOM RUNG FIRST — the opposite of lane B, deliberately. Lane B's top rung is
 # the one that decides whether the rig can offer the load at all. Lane E is
 # looking for the site count at which latency leaves its budget, and that answer
@@ -1666,6 +1880,7 @@ lane_e_rung() { # lane_e_rung <sites> [repeat-index]
 # identical hardware carried 210,217 and 148,080 msg/s for the same binary at
 # the same shape — a ~40% spread, wider than most effects this rig is used to
 # detect, and invisible while every rung ran once.
+lane_e_calibrate
 declare -a e_seen=()
 for e_sites in "${LANE_E_SITES[@]}"; do
 	e_rep=1
@@ -1675,6 +1890,19 @@ for e_sites in "${LANE_E_SITES[@]}"; do
 	e_seen+=("$e_sites")
 	lane_e_rung "$e_sites" "$e_rep"
 done
+# The control repeats the BOTTOM rung — the lowest load the ladder offered, and
+# so the one most likely to pass on a healthy cluster and most damning when it
+# does not. Skipped for a single-rung ladder, where it would be the only rung
+# twice and could discriminate nothing.
+if [ "$LANE_E_CONTROL" = 1 ] && [ "${#LANE_E_SITES[@]}" -gt 1 ]; then
+	e_control="${LANE_E_SITES[0]}"
+	e_rep=1
+	for e_prev in ${e_seen[@]+"${e_seen[@]}"}; do
+		[ "$e_prev" = "$e_control" ] && e_rep=$((e_rep + 1))
+	done
+	say "[$N nodes] lane E: CONTROL — repeating the $e_control-site rung to test whether the cluster still does what it did before the ladder"
+	lane_e_rung "$e_control" "$e_rep" yes
+fi
 fi # LANES *E*
 
 # ── 5. host facts for the disclosure block ───────────────────────────────────
