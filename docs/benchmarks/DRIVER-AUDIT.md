@@ -50,20 +50,26 @@ loop runs flat out.
 40 ms after completion would achieve a different rate than one scheduling against
 a 40 ms deadline"). It schedules against a deadline.
 
-## 2. `pub_overrun` is a first-class under-offer signal, and the rig ignores it
+## 2. `pub_overrun` is a first-class under-offer signal — used by lane B, missing from lane E
 
 That same branch increments **`pub_overrun`** on every missed deadline
 (`COUNTER_NAMES`, `emqtt_bench.erl:215-233`), exported to Prometheus when
 `--prometheus` is passed — which every lane already passes.
 
-The rig does not read it. `summarize-curve.py` INFERS under-offer by comparing a
-rate parsed out of container log lines against the requested rate
-(`DRIVER_OK = 0.97`), and `snapshot_metrics` scrapes the **brokers'** `/metrics`
-only, never the drivers'. So the rig reconstructs, with a threshold, a fact the
-driver already reports exactly.
+An earlier draft of this audit said "the rig does not read it". **That was wrong
+and is corrected here:** `lane_b_rung` has read it since it was written, as
+`late_rate`, and flags `PUBLISHERS LATE` past `LATE_OK = 0.05`.
 
-Wiring `pub_overrun` in is the cheapest validity win available: a non-zero value
-on a rung means the driver could not keep up, whatever the log-derived rate says.
+The accurate finding is narrower and more useful: **`lane_e_rung` did not**, and
+lane E is the SCADA tenancy ladder — the lane whose runs the scaling review took
+apart. It judged a rung on an offered-rate average (`DRIVER_OK = 0.97`) and
+nothing else, so a rung could **meet its offer on average while a third of its
+publishes ran late**, and still be reported as a passing site count. The average
+cannot see that; only the counter can.
+
+Fixed in this change: lane E now reads `pub_overrun`, flags `PUBLISHERS LATE`,
+and — because a flag nobody acts on is decoration — includes it in the rung's
+`pass` verdict alongside offer, delivery and latency budget.
 
 ## 3. At QoS 2 the driver returns on PUBREC — NOT on PUBCOMP
 
@@ -104,6 +110,47 @@ PUBCOMP, so `-F` (max inflight) governs the *whole* handshake, not just its firs
 half, and `emqtt_bench.erl:711` warns the publish call "hangs if emqtt inflight
 is full".
 
+## 3b. Retransmission is OFF by default, and a stalled publish never returns
+
+`emqtt-bench`'s `--retry-interval` defaults to **0**, documented as "no resend"
+(`emqtt_bench.erl:191-195`), and it is passed straight through to `emqtt`.
+`emqtt` starts its retry timer only `when Interval > 0`
+(`do_ensure_retry_timer`), so at the rig's defaults **nothing is ever
+retransmitted**. `publish_via` also passes `infinity` as the inflight expiry, so
+the entry never times out and the callback never fires with an error.
+
+Consequence for measurement: at QoS 1/2, a publish whose ack is lost **blocks
+that publisher client forever**. It is not retried, not failed, not counted —
+the client simply stops offering. `pub_fail` stays zero. The only counter that
+moves is `pub_overrun`, which is finding 2's argument restated from the other
+end: under loss the offered rate becomes fiction, and the overrun counter is the
+only thing that says so.
+
+When a run *does* set `--retry-interval`, retransmits carry `dup = true`
+correctly (`retry_send` sets `Msg#mqtt_msg{dup = true}`), and a QoS 2 retransmit
+in the release phase re-sends PUBREL rather than the PUBLISH.
+
+## 3c. The SUBSCRIBER side at QoS 2 *is* a sound unique-delivery oracle
+
+The asymmetry matters, because the two ends are not equally trustworthy:
+
+| Side | Counter | Fires at | Sound oracle for? |
+|---|---|---|---|
+| publisher, QoS 1 | `pub` | PUBACK | completion — yes |
+| publisher, QoS 2 | `pub` | **PUBREC** | completion — **no**, handshake unfinished |
+| subscriber, QoS 1 | `recv` | on delivery | delivery, but duplicates are spec-legal |
+| subscriber, QoS 2 | `recv` | **PUBREL**, deduplicated | **unique delivery — yes** |
+
+For inbound QoS 2, `emqtt` stores the PUBLISH in an `awaiting_rel` map and
+answers PUBREC *without delivering*; delivery happens on PUBREL, via
+`maps:take`, which removes the entry and so cannot deliver twice
+(`publish_qos2/3`, `process_pubrel/3`). `emqtt_bench` counts `recv` on that
+delivery.
+
+So a both-ends QoS 2 lane can count unique deliveries honestly from the
+subscriber, while completion must come from the broker. That is the shape any
+QoS 2 accounting should take.
+
 ## 4. Stable message identities already exist — no new driver needed
 
 `emqtt_bench.erl:886-905` substitutes into a payload template:
@@ -126,5 +173,7 @@ identities seen — not on the publisher.
   duplicate detection, drain deadlines) is still open.
 - The subscriber-side accounting, per-driver achievable offer, and the
   reset/control-rung requirements remain unaddressed — see #534.
-- `pub_overrun` is described from source; it has not been observed on a real run,
-  and the harness does not yet scrape it.
+- `pub_overrun` is described from source and is now read by lane E as well as
+  lane B, with self-test fixtures; it has not been observed on a real run.
+- Lane E remains QoS 0/1 only. Nothing here enables QoS 2 there, and it should
+  stay that way until the both-ends behavioural validation exists.

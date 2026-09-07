@@ -411,11 +411,94 @@ def self_test() -> None:
                 if qos == 0 and abs(r_pub - 2 * rate) > 1:
                     failures.append(f"QoS {qos} @ {rate}/s: expected raw pub to be 2x, got {r_pub}")
 
+    # ── #534: the validity rules, on synthesized rungs ───────────────────────
+    #
+    # Each case is a rung that MUST NOT be reported as a usable measurement.
+    # They are cheap to get wrong in the direction that flatters the broker,
+    # which is why they are pinned here rather than left to a reviewer's eye.
+    def lane_e_fixture(td: Path, name: str, *, offered: int, sent: int,
+                       recv: int, late: int, secs: int = 70) -> Path:
+        """A lane E rung directory whose driver logs say exactly this."""
+        d = td / name
+        d.mkdir(parents=True)
+        (d / "rung.txt").write_text(
+            f"sites=4 offered={offered} per_consumer=100 p99_budget_ms=1000\n"
+        )
+        def counter_log(path: Path, counters: dict[str, int]) -> None:
+            lines = []
+            for s in range(secs + 1):
+                stamp = f"{s // 60}m{s % 60}s" if s >= 60 else f"{s}s"
+                for cname, rate in counters.items():
+                    lines.append(f"{stamp} {cname} total={rate * s} rate={rate}/sec")
+            path.write_text("\n".join(lines) + "\n")
+        # `pub` and `pub_succ` are halved by the double-count correction, so a
+        # rung that really sent N/s writes N to each.
+        counter_log(d / "pub-0.log", {"pub": sent, "pub_succ": sent, "pub_overrun": late})
+        counter_log(d / "sub-0.log", {"recv": recv})
+        # A latency histogram, or every rung reads p99 "—" and fails the budget
+        # for want of data rather than for being slow. Two scrapes because the
+        # summarizer subtracts the first from the last to get the measured
+        # window; all mass in the <=10ms bucket, comfortably inside the budget.
+        for scrape, total in (("before", 0), ("after", 1000)):
+            (d / f"sub-0-{scrape}.prom").write_text(
+                "\n".join(
+                    [f'e2e_latency_bucket{{le="{le}"}} {total}' for le in ("10.0", "100.0", "+Inf")]
+                    + [f"e2e_latency_count {total}"]
+                )
+                + "\n"
+            )
+        return d
+
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+
+        # 1. UNDER-OFFER: the drivers never reached the rate the rung claims.
+        r = lane_e_rung(lane_e_fixture(root, "sites-4-under", offered=30_000,
+                                       sent=20_000, recv=20_000, late=0))
+        if r["pass"] or not any("OFFER NOT MET" in f for f in r["flags"]):
+            failures.append(f"under-offer rung was not rejected: {r['flags']}")
+
+        # 2. LATE PUBLISHERS while MEETING the offer on average. This is the one
+        #    a rate check cannot see: the average is fine, but a third of the
+        #    publishes missed their own schedule, so the rung measures the
+        #    drivers. Lane B has flagged this since it was written; lane E did
+        #    not until #534, and lane E is the SCADA ladder.
+        r = lane_e_rung(lane_e_fixture(root, "sites-4-late", offered=30_000,
+                                       sent=30_000, recv=30_000, late=10_000))
+        if r["pass"] or not any("PUBLISHERS LATE" in f for f in r["flags"]):
+            failures.append(
+                f"rung with 33% late publishes was accepted: flags={r['flags']}"
+            )
+
+        # 3. LOSS: delivered materially less than published.
+        r = lane_e_rung(lane_e_fixture(root, "sites-4-loss", offered=30_000,
+                                       sent=30_000, recv=15_000, late=0))
+        if r["pass"] or not any("LOSS" in f for f in r["flags"]):
+            failures.append(f"lossy rung was not rejected: {r['flags']}")
+
+        # 4. The CONTROL: a clean rung must still pass, or the rules above are
+        #    just a way of never reporting anything.
+        r = lane_e_rung(lane_e_fixture(root, "sites-4-clean", offered=30_000,
+                                       sent=30_000, recv=30_000, late=0))
+        if not r["pass"] or r["flags"]:
+            failures.append(f"a clean rung was rejected: {r['flags']}")
+
+        # 5. A rung still in flight is INCOMPLETE, never a failed one.
+        d = root / "sites-4-live"
+        d.mkdir()
+        r = lane_e_rung(d)
+        if not r.get("incomplete") or r["pass"]:
+            failures.append(f"an in-flight rung was not reported as incomplete: {r}")
+
     if failures:
         for f in failures:
             print(f"FAIL {f}", file=sys.stderr)
         sys.exit(1)
-    print("summarize-curve self-test: publish double-count correction OK (6 cases)")
+    print(
+        "summarize-curve self-test: publish double-count correction OK (6 cases); "
+        "lane E validity OK (5 rungs — under-offer, late publishers, loss, a clean "
+        "control that must still pass, and an in-flight rung)"
+    )
 
 
 def p99_ms(label: str) -> float:
@@ -479,12 +562,22 @@ def lane_e_rung(rdir: Path) -> dict:
 
     sent_rate = recv_rate = 0.0
     sent = recv = 0.0
+    late_rate = 0.0
     for log in rdir.glob("pub-*.log"):
         # Same emqtt-bench double-count correction as lane B — see lane_b_rung.
         t_pub, r_pub = driver_rate(log, "pub")
         t_succ, r_succ = driver_rate(log, "pub_succ")
         sent += (t_pub + t_succ) // 2
         sent_rate += (r_pub + r_succ) / 2
+        # #534: lane B has flagged late publishers since it was written; this
+        # lane never did, and this is the lane whose runs the scaling review
+        # took apart. `pub_overrun` is the driver saying, itself, that it could
+        # not keep its own schedule — a direct signal where OFFER NOT MET is an
+        # inference from a rate against a 0.97 threshold. A rung can even MEET
+        # its offer on average while a third of its publishes ran late, and only
+        # this counter says so.
+        _, late = driver_rate(log, "pub_overrun")
+        late_rate += late
     for log in rdir.glob("sub-*.log"):
         t, r = driver_rate(log, "recv")
         recv += t
@@ -496,6 +589,12 @@ def lane_e_rung(rdir: Path) -> dict:
     offer_met = offered and sent_rate >= DRIVER_OK * offered
     if offered and not offer_met:
         flags.append(f"OFFER NOT MET ({sent_rate / offered * 100:.0f}% of offer)")
+    late_share = late_rate / sent_rate if sent_rate else 0.0
+    if late_share > LATE_OK:
+        flags.append(
+            f"PUBLISHERS LATE ({late_share * 100:.0f}% of publishes behind schedule — "
+            "the drivers could not hold the offered rate, so this rung measures them)"
+        )
     delivered = sent > 0 and recv >= KNEE_OK * sent
     if not delivered and sent > 0:
         flags.append(f"LOSS (delivered {recv / sent * 100:.1f}% of what was published)")
@@ -509,13 +608,19 @@ def lane_e_rung(rdir: Path) -> dict:
         "sent_rate": sent_rate,
         "recv_rate": recv_rate,
         "per_consumer": float(meta.get("per_consumer", 0)),
+        "late_share": late_share,
         "p50": bucket_pct(buckets, count, 0.50),
         "p99": p99,
         "budget_ms": budget,
-        # A rung PASSES only on all three: the drivers offered the load, the
-        # broker delivered it, and it stayed inside the latency budget. Any one
-        # of those failing makes the site count above it meaningless.
-        "pass": bool(offer_met and delivered and within),
+        # A rung PASSES only on all FOUR: the drivers offered the load, they held
+        # its schedule, the broker delivered it, and it stayed inside the latency
+        # budget. Any one failing makes the site count above it meaningless.
+        #
+        # `late_share` joined this in #534. Without it a rung where the drivers
+        # fell behind could still PASS on a rate average, and the ladder would
+        # report a broker limit that was really a generator limit — the exact
+        # class of claim the scaling review rejected.
+        "pass": bool(offer_met and delivered and within and late_share <= LATE_OK),
         "flags": flags,
     }
 
