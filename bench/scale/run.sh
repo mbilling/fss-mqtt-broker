@@ -360,6 +360,16 @@ for N in "${SIZES[@]}"; do
 	fi
 
 	phase teardown "$N nodes"
+	# KEEP_INFRA is documented at the top of this file as skipping the destroy,
+	# and it guarded only the EXIT trap — so a `KEEP_INFRA=1` run still lost its
+	# cluster here, between sizes, and any follow-up command aimed at the kept
+	# inventory found nothing. That is also what makes swap-binary.sh possible:
+	# an A/B on one provisioning needs the cluster to outlive the first arm.
+	if [ "${KEEP_INFRA:-0}" = 1 ]; then
+		say "KEEP_INFRA=1 — NOT destroying size $N; the cluster stays up for the next arm"
+		touch "$RUN/done-$N"
+		continue
+	fi
 	say "destroying size $N before the next point (fresh clusters only)"
 	(cd "$TFDIR" && "$TF" destroy -auto-approve \
 		-var node_count="$N" -var run_label="$STAMP" >"$RUN/tf-destroy-$N.log" 2>&1) || {
