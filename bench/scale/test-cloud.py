@@ -54,6 +54,52 @@ sys.exit(77 if "apply" in sys.argv or os.path.basename(sys.argv[0]) in ("hcloud"
     def calls(self):
         return [json.loads(line) for line in self.log.read_text().splitlines()] if self.log.exists() else []
 
+    def test_all_shapes_fail_before_any_cloud_call(self):
+        for sizes, env, diagnostic in (
+            (("10",), {"DRIVER_COUNT": "4"}, "spreads unevenly"),
+            (("1", "10"), {"DRIVER_COUNT": "4"}, "spreads unevenly"),
+            (("1", "2"), {}, "sizes must be"),
+            (("1",), {"DRIVER_COUNT": "2.5"}, "DRIVER_COUNT"),
+            (("1",), {"DRIVER_COUNT": "0"}, "DRIVER_COUNT"),
+            (("1",), {"DRIVER_TYPE": "unknown"}, "unknown CPU count"),
+            (("1",), {"TF_CLI_ARGS_apply": "-var driver_count=4"}, "opaque variable"),
+        ):
+            with self.subTest(sizes=sizes, env=env):
+                result = self.run_script("run.sh", "full", *sizes, HCLOUD_TOKEN="dummy", **env)
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn(diagnostic, result.stderr)
+                self.assertEqual(self.calls(), [])
+
+    def test_offline_matrix_positive_controls_need_no_token_or_cloud(self):
+        for args, env in (
+            (("smoke",), {}),
+            (("standard",), {}),
+            (("full", "1", "3", "5"), {}),
+            (("standard", "10"), {"DRIVER_COUNT": "4", "LANE_B_PUB_CONTAINERS": "3",
+                                    "LANE_B_SUB_CONTAINERS": "5"}),
+            (("smoke",), {"CLOUD": "upcloud"}),
+            (("smoke",), {"DRIVER_TYPE": "custom", "DRIVER_VCPUS": "8"}),
+        ):
+            with self.subTest(args=args, env=env):
+                result = self.run_script("run.sh", *args, PREFLIGHT_ONLY="1", **env)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("no cloud calls made", result.stderr)
+                self.assertEqual(self.calls(), [])
+
+    def test_variable_file_shape_overrides_fail_closed(self):
+        path = self.rig / "terraform/terraform.tfvars.json"
+        path.write_text('{"driver_count":4}')
+        result = self.run_script("run.sh", "standard", HCLOUD_TOKEN="dummy")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("overrides workload shape", result.stderr)
+        self.assertEqual(self.calls(), [])
+
+    def test_tf_var_driver_count_is_validated_not_silently_ignored(self):
+        result = self.run_script("run.sh", "standard", HCLOUD_TOKEN="dummy", TF_VAR_driver_count="4")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("spreads unevenly", result.stderr)
+        self.assertEqual(self.calls(), [])
+
     def test_upcloud_smoke_defaults_and_trap(self):
         result = self.run_script("run.sh", "smoke", CLOUD="upcloud", UPCLOUD_TOKEN="dummy")
         self.assertNotEqual(result.returncode, 0)
