@@ -28,9 +28,16 @@ set -euo pipefail
 . "$SCALE_DIR/cloud.sh"
 select_scale_cloud
 
+# A lower-level shape-only flag must never accidentally provision through this wrapper.
+for flag in "${PREFLIGHT_ONLY:-0}" "${SHAPE_ONLY:-0}"; do
+	case "$flag" in 0 | 1) ;; *) die "PREFLIGHT_ONLY and SHAPE_ONLY must be 0 or 1" ;; esac
+done
+if [ "${SHAPE_ONLY:-0}" = 1 ]; then export PREFLIGHT_ONLY=1; fi
+
 MODE="${1:-}"
 case "$MODE" in
 smoke)
+	[ "$#" -eq 1 ] || die "smoke has a fixed size and accepts no size arguments"
 	SIZES=(1)
 	export SMOKE=1
 	# One driver: smoke proves the pipeline, not the 50k load. And SHARED-vCPU

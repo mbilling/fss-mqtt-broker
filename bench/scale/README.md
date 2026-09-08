@@ -116,7 +116,8 @@ whose numbers are published, if you want the measured path provably untouched. C
 
 **Checking a shape without paying.** `run.sh` now validates **every requested
 size before any OpenTofu init/apply or cloud-mutating teardown trap** (#593).
-For a standalone offline check (no token or OpenTofu needed):
+For a standalone offline check (no token or OpenTofu needed; `SHAPE_ONLY=1`
+is also accepted by the orchestrator and cannot provision):
 
 ```sh
 PREFLIGHT_ONLY=1 ./run.sh full 1 3 5

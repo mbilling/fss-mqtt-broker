@@ -122,6 +122,18 @@ with_cpu_sampling "$CPU_DIR" driver
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("coverage is incomplete", result.stderr)
 
+    def test_shape_only_alias_and_malformed_modes_cannot_provision(self):
+        result = self.run_script("run.sh", "smoke", SHAPE_ONLY="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for args, env in (
+            (("smoke", "3"), {}),
+            (("smoke",), {"PREFLIGHT_ONLY": "true"}),
+            (("smoke",), {"SHAPE_ONLY": "true"}),
+        ):
+            result = self.run_script("run.sh", *args, HCLOUD_TOKEN="dummy", **env)
+            self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(self.calls(), [])
+
     def test_all_shapes_fail_before_any_cloud_call(self):
         for sizes, env, diagnostic in (
             (("10",), {"DRIVER_COUNT": "4"}, "spreads unevenly"),
