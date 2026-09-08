@@ -225,6 +225,15 @@ pub trait ReplicatedLog: Send + Sync + std::fmt::Debug {
     /// idempotent and tolerant of stale / already-truncated offsets.
     async fn truncate(&self, key: &Self::Key, up_to: Offset) -> Result<(), ReplError>;
 
+    /// Commit a prefix retirement at full durability (write quorum for a cluster).
+    /// Used before `QoS` 2 ID clearance; the lazy `truncate` contract is insufficient.
+    /// The default fails closed for backends that have not implemented this contract.
+    async fn truncate_durable(&self, _key: &Self::Key, _up_to: Offset) -> Result<(), ReplError> {
+        Err(ReplError::Backend(
+            "durable truncation is unsupported".into(),
+        ))
+    }
+
     /// Remove `key`'s log entirely.
     async fn remove(&self, key: &Self::Key) -> Result<(), ReplError>;
 
@@ -272,6 +281,10 @@ impl<L: ReplicatedLog + ?Sized> ReplicatedLog for std::sync::Arc<L> {
 
     async fn truncate(&self, key: &Self::Key, up_to: Offset) -> Result<(), ReplError> {
         (**self).truncate(key, up_to).await
+    }
+
+    async fn truncate_durable(&self, key: &Self::Key, up_to: Offset) -> Result<(), ReplError> {
+        (**self).truncate_durable(key, up_to).await
     }
 
     async fn remove(&self, key: &Self::Key) -> Result<(), ReplError> {
@@ -419,6 +432,10 @@ impl ReplicatedLog for InMemoryReplicatedLog {
                 (Some(front), Some(back)) => Some((front.offset, back.offset)),
                 _ => None,
             }))
+    }
+
+    async fn truncate_durable(&self, key: &String, up_to: Offset) -> Result<(), ReplError> {
+        self.truncate(key, up_to).await
     }
 
     async fn truncate(&self, key: &String, up_to: Offset) -> Result<(), ReplError> {

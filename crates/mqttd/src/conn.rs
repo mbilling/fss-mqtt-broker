@@ -2865,6 +2865,13 @@ mod tests {
         ) -> Result<(), mqtt_storage::StorageError> {
             self.inner.ack(client, up_to).await
         }
+        async fn ack_durable(
+            &self,
+            client: &mqtt_core::ClientId,
+            up_to: mqtt_storage::Offset,
+        ) -> Result<(), mqtt_storage::StorageError> {
+            self.inner.ack_durable(client, up_to).await
+        }
         async fn record_received(
             &self,
             client: &mqtt_core::ClientId,

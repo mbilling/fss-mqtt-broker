@@ -1925,6 +1925,40 @@ impl<T: ReplicaTransport + Clone + 'static> ReplicatedLog for ClusterLog<T> {
         }))
     }
 
+    async fn truncate_durable(&self, key: &String, up_to: Offset) -> Result<(), ReplError> {
+        // Do not clamp and claim success for a prefix beyond known committed data.
+        // A lazy QoS 1 truncate may already have changed the local watermark, but
+        // that is NOT a quorum certificate: still replicate this operation on retry.
+        {
+            let state = self.state.lock().await;
+            if state.get(key).is_none_or(|ks| up_to > ks.committed) {
+                return Err(ReplError::Backend(
+                    "durable truncate exceeds the committed watermark".into(),
+                ));
+            }
+        }
+        let op = ReplOp::Truncate {
+            key: key.clone(),
+            up_to,
+        };
+        let mut acks = usize::from(self.local_ack(self.lease.epoch, &op).await);
+        for follower in &self.followers {
+            acks += usize::from(
+                self.transport
+                    .deliver(follower, self.lease.epoch, &op)
+                    .await,
+            );
+        }
+        if acks < self.quorum {
+            return Err(ReplError::NoQuorum);
+        }
+        if let Some(ks) = self.state.lock().await.get_mut(key) {
+            ks.entries.retain(|offset, _| *offset > up_to);
+            ks.truncated = ks.truncated.max(up_to);
+        }
+        Ok(())
+    }
+
     async fn truncate(&self, key: &String, up_to: Offset) -> Result<(), ReplError> {
         let mut state = self.state.lock().await;
         let mut op = None;

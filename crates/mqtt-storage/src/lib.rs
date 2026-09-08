@@ -422,6 +422,16 @@ pub trait SessionStore: Send + Sync + std::fmt::Debug {
     /// not-yet-truncated messages after a failover is spec-legal for `QoS` 1.
     async fn ack(&self, client: &ClientId, up_to: Offset) -> Result<(), StorageError>;
 
+    /// Retire a prefix at the backend's full durability contract before clearing a
+    /// `QoS` 2 outbound ID. Unlike `ack`, success must survive an owner loss; a quorum
+    /// backend must commit the truncate to a write quorum. Unsupported backends fail
+    /// closed rather than silently substituting the `QoS` 1 best-effort operation.
+    async fn ack_durable(&self, _client: &ClientId, _up_to: Offset) -> Result<(), StorageError> {
+        Err(StorageError::Backend(
+            "durable queue retirement is unsupported".into(),
+        ))
+    }
+
     /// Record a sighting of an inbound QoS-2 PUBLISH with `packet_id`, and report what
     /// the exactly-once dedup window already knew about it.
     ///
@@ -882,6 +892,10 @@ impl SessionStore for MemorySessionStore {
             .get(client)
             .map(|e| e.received_qos2.iter().copied().collect())
             .unwrap_or_default())
+    }
+
+    async fn ack_durable(&self, client: &ClientId, up_to: Offset) -> Result<(), StorageError> {
+        self.ack(client, up_to).await
     }
 
     async fn record_outbound(

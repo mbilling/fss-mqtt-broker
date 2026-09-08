@@ -1217,7 +1217,7 @@ impl Hub {
             }
             inf.block_remaining = inf.block_remaining.saturating_sub(1);
             let id = inf.next_pkid;
-            if !inf.pending.contains_key(&id) {
+            if !inf.pending.contains_key(&id) && !inf.orphaned_qos2.contains_key(&id) {
                 return Some(id);
             }
         }

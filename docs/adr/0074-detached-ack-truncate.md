@@ -66,6 +66,14 @@ off-loop; the publisher/subscriber ack paths never wait on it.**
    > correctness property, and it is why an off-loop flush cannot serve this path.
    > Decision 1's removability argument does not transfer, resting as it does on
    > "a duplicate at QoS 1 is spec-legal".
+   >
+   > **#577 amendment:** order alone is insufficient. QoS 2 now uses explicit
+   > quorum-durable retirement, not the local-first/lazy `ack` contract. A
+   > completed ID stays reserved until a successful prefix covers its offset
+   > and ID clearance succeeds. Failed writes are retried by the sweep. A QoS 1
+   > ACK that removes a prefix blocker may also await outstanding QoS 2 cleanup;
+   > the pure QoS 1 path stays detached. This buys correctness, not isolation:
+   > on-loop QoS 2 waits and the #575/#405 stalled-store work remain. See ADR 0057.
 3. **Bounds, stated:** the flusher's map holds at most one offset per session;
    per-session disk lag is bounded by the flush cadence (milliseconds at the
    measured truncate latency), and entries above the flushed watermark are

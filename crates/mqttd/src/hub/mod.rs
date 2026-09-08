@@ -68,6 +68,7 @@ mod forwarding;
 use forwarding::{ForwardKind, ForwardObligation, InterestIndex, PendingPublish};
 mod delivery;
 mod lanes;
+mod qos2;
 #[allow(clippy::wildcard_imports)] // an intra-hub module split (#258): the five
 // siblings share one type/state vocabulary by design, and enumerating it would
 // re-couple every future hub change to six import lists. Scoped to these files.
@@ -637,6 +638,9 @@ enum OutState {
     AwaitingPubRec,
     /// `QoS` 2: PUBREL sent, waiting for PUBCOMP.
     AwaitingPubComp,
+    /// PUBCOMP received, but durable queue/ID retirement is still owed (#577).
+    /// Retained in `pending` to prevent packet-ID reuse and bound deferred cleanup.
+    CompletedQos2,
     /// `QoS` 2 with a durable offset, staged (issue #242 finding A): the packet id
     /// is allocated (this entry pins it and reserves Receive-Maximum quota) but the
     /// PUBLISH has NOT been sent — its ADR 0057 outbound-id record is being written
@@ -754,6 +758,12 @@ struct Inflight {
     /// Ids left in the current durable reservation before the next block must be reserved.
     block_remaining: u16,
     pending: BTreeMap<u16, PendingOut>,
+    /// Released durable IDs with no message in the replay window. Keep them reserved
+    /// until PUBCOMP proves their queue entry absent and clearance succeeds (#577).
+    orphaned_qos2: BTreeMap<u16, Offset>,
+    /// Orphans eligible for cleanup (PUBCOMP received, or never released).
+    /// Failed reads/writes must retry without requiring another client packet.
+    orphaned_qos2_cleanup: BTreeSet<u16>,
     /// The client's MQTT 5.0 Receive Maximum: the most `QoS` > 0 publishes we may
     /// have unacked to it at once (ADR 0012).
     receive_maximum: u16,
@@ -798,6 +808,8 @@ impl Default for Inflight {
             next_pkid: 0,
             block_remaining: 0,
             pending: BTreeMap::new(),
+            orphaned_qos2: BTreeMap::new(),
+            orphaned_qos2_cleanup: BTreeSet::new(),
             receive_maximum: RECEIVE_MAXIMUM_DEFAULT,
             backlog: BacklogQueue::default(),
             outstanding: BTreeSet::new(),
@@ -813,7 +825,7 @@ impl Default for Inflight {
 impl Inflight {
     /// Whether the `QoS` > 0 in-flight quota is exhausted (ADR 0012).
     fn quota_full(&self) -> bool {
-        self.pending.len() >= self.receive_maximum as usize
+        self.pending.len() + self.orphaned_qos2.len() >= self.receive_maximum as usize
     }
 
     /// Raise the truncation ceiling to cover `offset` without owing a delivery for it —
@@ -835,15 +847,25 @@ impl Inflight {
         self.outstanding.remove(&offset);
     }
 
-    /// Advance the durable truncation point to the contiguous acked prefix, returning it
-    /// only if it actually moved (so a redundant `ack` never reaches the store).
-    fn advance_ack(&mut self) -> Option<Offset> {
+    /// Contiguous prefix no longer owed to the subscriber. This is eligibility for
+    /// truncation, not evidence that any durable write has already succeeded.
+    fn safe_ack(&self) -> Offset {
         let safe = match self.outstanding.iter().next() {
             // Everything strictly below the oldest still-owed message is settled.
             Some(oldest) => oldest.saturating_sub(1),
-            // Nothing owed: the whole log is settled.
+            // Nothing owed: the whole observed log is settled.
             None => self.high_water,
         };
+        // Unmatched durable IDs may point beyond the replay window, not to
+        // retired messages. Later live completions must not truncate over them.
+        self.orphaned_qos2
+            .values()
+            .min()
+            .map_or(safe, |oldest| safe.min(oldest.saturating_sub(1)))
+    }
+
+    fn advance_ack(&mut self) -> Option<Offset> {
+        let safe = self.safe_ack();
         (safe > self.acked_through).then(|| {
             self.acked_through = safe;
             safe
@@ -2058,6 +2080,9 @@ pub struct Hub {
     /// loop, so a subscriber ack never waits a truncate round-trip. `None`
     /// until [`run`](Self::run) spawns the flusher.
     truncate_tx: Option<mpsc::UnboundedSender<(ClientId, Offset)>>,
+    /// Sessions with PUBCOMP received but queue/ID retirement still owed. Only these
+    /// sessions are retried by the sweep, not a scan of the entire session table.
+    qos2_cleanup: HashSet<ClientId>,
     /// Peer verdict aggregates for forwards whose fan-out submitted lane jobs
     /// (issue #242): `(origin, seq)` → what is still owed before the verdict can be
     /// answered. Entries drain via [`HubCommand::AppendDone`].
@@ -2179,6 +2204,7 @@ impl Hub {
                 append_lanes: HashMap::new(),
                 owned_tasks: tokio::task::JoinSet::new(),
                 truncate_tx: None,
+                qos2_cleanup: HashSet::new(),
                 remote_append_pending: HashMap::new(),
                 node_id,
                 online: HashMap::new(),
@@ -2418,6 +2444,7 @@ impl Hub {
                 _ = sweep.tick() => {
                     let started = Instant::now();
                     self.sweep_expired_sessions().await;
+                    self.retry_qos2_cleanup().await;
                     self.refresh_gauges().await;
                     self.refresh_ownership_domain();
                     // Retransmit an unanswered retained handoff (T8 — same seq, the
@@ -2640,7 +2667,7 @@ impl Hub {
             HubCommand::PkidBlockReserved { client, result } => {
                 self.pkid_block_reserved(&client, result);
             }
-            HubCommand::PubAck { client, pkid } => self.pub_ack(&client, pkid),
+            HubCommand::PubAck { client, pkid } => self.pub_ack(&client, pkid).await,
             HubCommand::PubRec { client, pkid } => self.pub_rec(&client, pkid).await,
             HubCommand::PubComp { client, pkid } => self.pub_comp(&client, pkid).await,
             HubCommand::Detach {
@@ -3352,6 +3379,24 @@ impl Hub {
             reply,
         } = pending;
 
+        // A failed identity-table read must never become fresh PUBLISH replay.
+        // Refuse before admitting/replacing the connection or emitting CONNACK.
+        let mut restored = BTreeMap::new();
+        if !clean_start {
+            match self.store.outbound(&client).await {
+                Ok(entries) => {
+                    for entry in entries {
+                        restored.insert(entry.offset, (entry.packet_id, entry.pubrec_seen));
+                    }
+                }
+                Err(error) => {
+                    warn!(client = %client.0, %error, "cannot recover outbound QoS2 identities");
+                    let _ = reply.send(AttachOutcome::Unavailable);
+                    return;
+                }
+            }
+        }
+
         // Session quota (ADR 0041 T4): refuse only a NEW session — a resume
         // (session_present) or an attach for a locally-known client id (takeover,
         // clean-start replacement) is never refused for quota. A full broker keeps
@@ -3598,7 +3643,9 @@ impl Hub {
                         &p.message.app,
                         &self.matching_sub_ids(&client, &p.message.topic),
                     ),
-                    OutState::AwaitingPubComp => Packet::PubRel((*pkid).into()),
+                    OutState::AwaitingPubComp | OutState::CompletedQos2 => {
+                        Packet::PubRel((*pkid).into())
+                    }
                 };
                 let _ = outbound.send(packet);
             }
@@ -3610,13 +3657,13 @@ impl Hub {
         // in the in-memory table and were resumed above — `resumed_offsets` keeps the
         // replay away from them, so the map only acts when memory is gone, which is
         // exactly the restart this table exists for.
-        let mut restored: std::collections::BTreeMap<Offset, (u16, bool)> =
-            std::collections::BTreeMap::new();
-        if !clean_start {
-            if let Ok(entries) = self.store.outbound(&client).await {
-                for e in entries {
-                    restored.insert(e.offset, (e.packet_id, e.pubrec_seen));
-                }
+        // The snapshot was read before admitting the connection. Reserve every
+        // restored ID before replay can allocate one, including IDs beyond its
+        // bounded window. Matching entries below move to `pending` instead.
+        for (&offset, &(pkid, _)) in &restored {
+            let inf = self.inflight.entry(client.clone()).or_default();
+            if !inf.pending.contains_key(&pkid) {
+                inf.orphaned_qos2.insert(pkid, offset);
             }
         }
 
@@ -3656,11 +3703,21 @@ impl Hub {
                     // PUBREL — the subscriber has the message; re-publishing it is the
                     // #130 duplicate this table exists to prevent.
                     if let Some((pkid, pubrec_seen)) = restored.remove(&qm.offset) {
+                        let inf = self.inflight.entry(client.clone()).or_default();
+                        inf.orphaned_qos2.remove(&pkid);
+                        inf.orphaned_qos2_cleanup.remove(&pkid);
                         let state = if pubrec_seen {
                             OutState::AwaitingPubComp
                         } else {
                             OutState::AwaitingPubRec
                         };
+                        // Restored handshakes still owe their queued delivery. Without
+                        // this, replay's prefix truncate can delete an earlier unacked
+                        // restored message while completing a later one (#577).
+                        self.inflight
+                            .entry(client.clone())
+                            .or_default()
+                            .track(qm.offset);
                         self.inflight
                             .entry(client.clone())
                             .or_default()
@@ -3746,21 +3803,24 @@ impl Hub {
                 }
             }
 
-            // Table entries whose message is no longer in the queue — an earlier clear
-            // failed and its truncation went through anyway (ADR 0057's tolerated
-            // failure). Released phase: send the spurious PUBREL the tolerance priced
-            // in; the subscriber's PUBCOMP (MQTT-4.3.3) clears the entry, because
-            // pub_comp clears unconditionally. Unreleased phase: the PUBLISH cannot be
-            // reconstructed AND the message left the log, which means it was let go of —
-            // clear the id rather than carry it forever.
+            // IDs not matched in this replay window are only POSSIBLE orphans.
+            // Released phase resumes PUBREL; PUBCOMP makes cleanup eligible.
+            // Unreleased phase can attempt cleanup immediately. Both paths must
+            // prove durable prefix retirement, not infer absence from this window.
             for (offset, (pkid, pubrec_seen)) in restored {
+                self.inflight
+                    .entry(client.clone())
+                    .or_default()
+                    .orphaned_qos2
+                    .insert(pkid, offset);
                 if pubrec_seen {
                     debug!(client = %client.0, pkid, offset,
                            "orphaned outbound QoS2 id in released phase; sending PUBREL");
                     let _ = outbound.send(Packet::PubRel(pkid.into()));
-                } else if let Err(e) = self.store.clear_outbound(&client, pkid).await {
-                    warn!(client = %client.0, pkid, error = %e,
-                          "orphaned outbound QoS2 id could not be cleared");
+                } else {
+                    // Absence from a limited replay window is not proof of absence
+                    // from storage. Check this exact offset before retiring its ID.
+                    self.clear_orphaned_qos2(&client, pkid, offset).await;
                 }
             }
         }
@@ -4086,10 +4146,13 @@ impl Hub {
 
     /// PUBACK: completes a `QoS` 1 delivery, freeing a quota slot (ADR 0012) and
     /// releasing the message's durable log entry (#124).
-    fn pub_ack(&mut self, client: &ClientId, pkid: u16) {
+    async fn pub_ack(&mut self, client: &ClientId, pkid: u16) {
         let completed = self.complete_pending(client, pkid, OutState::AwaitingPubAck);
         if completed {
             self.truncate_acked(client);
+            if self.qos2_cleanup.contains(client) {
+                self.retire_completed_qos2(client).await;
+            }
             self.drain_backlog(client);
         }
     }
@@ -4138,27 +4201,21 @@ impl Hub {
     /// steps must stay ORDERED against each other, which an off-loop flush cannot
     /// promise.
     ///
-    /// Returns `false` only when a truncate was attempted and FAILED — the caller
-    /// uses that to keep the outbound id record alive, because an id retired over a
-    /// delivery still in the log is the one combination that replays as a duplicate
-    /// (issue #533). "Nothing to truncate" is `true`: there is no entry to outlive.
-    #[must_use]
-    async fn truncate_acked_now(&mut self, client: &ClientId) -> bool {
-        let Some(up_to) = self
-            .inflight
-            .get_mut(client)
-            .and_then(Inflight::advance_ack)
-        else {
-            return true;
-        };
-        if let Err(e) = self.store.ack(client, up_to).await {
-            // Not fatal: the entries stay in the log and are replayed on the next resume.
-            // A duplicate at QoS 1 is spec-legal; losing one would not be.
-            debug!(client = %client.0, up_to, error = %e,
-                   "failed to truncate the acknowledged session log");
-            return false;
+    /// Returns only a DURABLY acknowledged prefix, never the submission hint used by
+    /// the detached `QoS` 1 flusher. Repeating an idempotent truncate is necessary when
+    /// an earlier attempt failed, or when the detached flusher has not committed yet.
+    async fn truncate_acked_now(&mut self, client: &ClientId) -> Option<Offset> {
+        let up_to = self.inflight.get(client)?.safe_ack();
+        if up_to == 0 {
+            return None;
         }
-        true
+        if let Err(e) = self.store.ack_durable(client, up_to).await {
+            debug!(client = %client.0, up_to, error = %e,
+                   "failed to truncate the acknowledged session log; QoS2 IDs remain reserved");
+            return None;
+        }
+        self.inflight.get_mut(client)?.acked_through = up_to;
+        Some(up_to)
     }
 
     /// PUBREC: advances a `QoS` 2 delivery to the release phase (send PUBREL).
@@ -4202,64 +4259,31 @@ impl Hub {
     /// PUBCOMP: completes a `QoS` 2 delivery, freeing a quota slot (ADR 0012) and
     /// releasing the message's durable log entry (#124).
     async fn pub_comp(&mut self, client: &ClientId, pkid: u16) {
-        // An id still in `AwaitingIdRecord` was never sent (issue #242 finding A):
-        // a PUBCOMP for it can only be a confused or malicious client, and clearing
-        // the durable record below would race the lane's in-flight `record_outbound`
-        // for the very same id. Ignore it; the entry's own completion owns cleanup.
-        if self
-            .inflight
-            .get(client)
-            .and_then(|inf| inf.pending.get(&pkid))
-            .is_some_and(|p| p.state == OutState::AwaitingIdRecord)
-        {
-            return;
-        }
-        let completed = self.complete_pending(client, pkid, OutState::AwaitingPubComp);
-        // ORDER IS THE CORRECTNESS PROPERTY HERE (issue #533): the durable id record
-        // must OUTLIVE the queued delivery, never the other way round.
-        //
-        // This used to clear the id first and truncate second, which left one crash
-        // window with no recovery: the entry still in the log, its id record gone, and
-        // a restore with nothing left to suppress the replay — so a subscriber that had
-        // already answered PUBCOMP was re-sent the message as a FRESH publish, dup=false,
-        // under a new packet id it could not dedup against. A duplicate at QoS 2.
-        //
-        // Truncating first inverts that. A crash between the two now leaves an id
-        // record whose message has left the log, which is a state the design already
-        // prices in and `finish_attach` already handles: released phase sends the
-        // spurious PUBREL, the subscriber answers PUBCOMP (MQTT-4.3.3), and the clear
-        // below — unconditional for exactly this reason — finally retires it. A
-        // tolerated extra PUBREL in place of an unrecoverable duplicate.
-        let truncated = if completed {
-            self.truncate_acked_now(client).await
-        } else {
-            // Nothing completed here, so there is no log entry for the id to outlive.
-            // This is the ORPHAN-RELEASE path the unconditional clear below exists for.
-            true
-        };
-        // ADR 0057: release the durable id UNCONDITIONALLY of `completed`, not only when
-        // an in-memory entry completed. A PUBCOMP with no pending entry is how an
-        // ORPHANED table entry (a clear that failed earlier, tolerated by design) finally
-        // releases: the restore sent its spurious PUBREL, the subscriber answered
-        // (MQTT-4.3.3), and this is the retry the tolerance was counting on. Clearing an
-        // id the store does not hold is a no-op. A failure here is logged, and the same
-        // cycle retries it.
-        //
-        // Skipped only when the truncate itself FAILED: the entry is then still in the
-        // log, and retiring its id would manufacture the very state above.
-        if truncated {
-            if let Err(e) = self.store.clear_outbound(client, pkid).await {
-                warn!(client = %client.0, pkid, error = %e,
-                      "outbound QoS2 id clear failed; a restore may send one spurious PUBREL");
+        if let Some(inf) = self.inflight.get_mut(client) {
+            if let Some(pending) = inf.pending.get_mut(&pkid) {
+                match pending.state {
+                    OutState::AwaitingPubComp | OutState::CompletedQos2 => {
+                        pending.state = OutState::CompletedQos2;
+                        if let Some(offset) = pending.offset {
+                            inf.release(offset);
+                        }
+                        self.qos2_cleanup.insert(client.clone());
+                        self.retire_completed_qos2(client).await;
+                        self.drain_backlog(client);
+                    }
+                    // Includes an ID record still in its lane (#242): no PUBCOMP
+                    // can release an ID whose PUBLISH/PUBREL was never sent.
+                    _ => {}
+                }
+                return;
             }
-        } else {
-            warn!(client = %client.0, pkid,
-                  "keeping the outbound QoS2 id: its truncate failed, so the delivery is \
-                   still in the log and retiring the id now would replay it as a duplicate");
+            if let Some(offset) = inf.orphaned_qos2.get(&pkid).copied() {
+                self.clear_orphaned_qos2(client, pkid, offset).await;
+                self.drain_backlog(client);
+            }
         }
-        if completed {
-            self.drain_backlog(client);
-        }
+        // Unknown packet IDs are not proof of a durable orphan. Only the restore
+        // path can classify one, after reading its durable ID/phase (#577).
     }
 
     /// The node's session count for the quota (ADR 0041 T4): every online session
@@ -6203,6 +6227,7 @@ async fn recover_once(
 
 #[cfg(test)]
 mod tests {
+    mod qos2_retirement;
     /// A committed retained snapshot entry with no application properties — the
     /// common test shape (props-bearing cases build the struct directly).
     fn snap(topic: &str, payload: &[u8], epoch: u64, offset: u64) -> RetainedWireEntry {
@@ -6545,6 +6570,14 @@ mod tests {
             up_to: mqtt_storage::Offset,
         ) -> Result<(), mqtt_storage::StorageError> {
             self.inner.ack(client, up_to).await
+        }
+
+        async fn ack_durable(
+            &self,
+            client: &ClientId,
+            up_to: mqtt_storage::Offset,
+        ) -> Result<(), mqtt_storage::StorageError> {
+            self.inner.ack_durable(client, up_to).await
         }
 
         async fn record_received(
@@ -8595,7 +8628,8 @@ mod tests {
 
     /// `PeerDead` drops the link and interest unconditionally; a stale
     /// `PeerDisconnected` from the old link must not kill a replacement link.
-    #[tokio::test]
+    // Keep periodic gossip from interleaving with the exact link-event sequence.
+    #[tokio::test(start_paused = true)]
     async fn peer_dead_drops_routing_and_stale_peer_disconnect_is_ignored() {
         let tx = start_hub();
         let mut p1 = connect_peer(&tx, "n", 1);
@@ -14119,6 +14153,17 @@ mod tests {
             self.inner.ack(client, up_to).await
         }
 
+        async fn ack_durable(
+            &self,
+            client: &ClientId,
+            up_to: u64,
+        ) -> Result<(), mqtt_storage::StorageError> {
+            if !self.owns(client) {
+                return Err(mqtt_storage::StorageError::NotOwner);
+            }
+            self.inner.ack_durable(client, up_to).await
+        }
+
         async fn record_received(
             &self,
             client: &ClientId,
@@ -15432,7 +15477,8 @@ mod tests {
 
     /// Local interest changes (subscribe / unsubscribe / clean-session detach)
     /// are gossiped to every connected peer as fresh snapshots.
-    #[tokio::test]
+    // Assert event-driven snapshots, not wall-clock reconciliation duplicates.
+    #[tokio::test(start_paused = true)]
     async fn interest_snapshots_follow_subscription_changes() {
         let tx = start_hub();
         let mut p = connect_peer(&tx, "n", 1);
@@ -15671,7 +15717,10 @@ mod tests {
     /// order so ordering tests can assert what the store actually observed.
     #[derive(Debug)]
     struct ParkingStore {
-        inner: MemorySessionStore,
+        inner: std::sync::Arc<dyn mqtt_storage::SessionStore>,
+        ack_failures: std::sync::Mutex<std::collections::VecDeque<mqtt_storage::StorageError>>,
+        clear_failures: std::sync::Mutex<std::collections::VecDeque<mqtt_storage::StorageError>>,
+        outbound_failures: std::sync::Mutex<std::collections::VecDeque<mqtt_storage::StorageError>>,
         /// client id → release gate: an enqueue for a client present here awaits `true`.
         gates:
             std::sync::Mutex<std::collections::HashMap<String, tokio::sync::watch::Receiver<bool>>>,
@@ -15698,8 +15747,17 @@ mod tests {
 
     impl ParkingStore {
         fn new() -> std::sync::Arc<Self> {
+            Self::with_store(std::sync::Arc::new(MemorySessionStore::new()))
+        }
+
+        fn with_store(
+            inner: std::sync::Arc<dyn mqtt_storage::SessionStore>,
+        ) -> std::sync::Arc<Self> {
             std::sync::Arc::new(Self {
-                inner: MemorySessionStore::new(),
+                inner,
+                ack_failures: std::sync::Mutex::new(std::collections::VecDeque::new()),
+                clear_failures: std::sync::Mutex::new(std::collections::VecDeque::new()),
+                outbound_failures: std::sync::Mutex::new(std::collections::VecDeque::new()),
                 gates: std::sync::Mutex::new(std::collections::HashMap::new()),
                 ops: std::sync::Mutex::new(Vec::new()),
                 slow_first: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -15879,8 +15937,25 @@ mod tests {
             up_to: mqtt_storage::Offset,
         ) -> Result<(), mqtt_storage::StorageError> {
             Self::await_gate(&self.ack_gates, client).await;
+            if let Some(error) = self.ack_failures.lock().unwrap().pop_front() {
+                self.log("ack-failed", format!("{} {up_to}", client.0));
+                return Err(error);
+            }
             self.log("ack", format!("{} {up_to}", client.0));
             self.inner.ack(client, up_to).await
+        }
+        async fn ack_durable(
+            &self,
+            client: &ClientId,
+            up_to: mqtt_storage::Offset,
+        ) -> Result<(), mqtt_storage::StorageError> {
+            Self::await_gate(&self.ack_gates, client).await;
+            if let Some(error) = self.ack_failures.lock().unwrap().pop_front() {
+                self.log("ack-failed", format!("{} {up_to}", client.0));
+                return Err(error);
+            }
+            self.log("ack", format!("{} {up_to}", client.0));
+            self.inner.ack_durable(client, up_to).await
         }
         async fn record_received(
             &self,
@@ -15946,6 +16021,10 @@ mod tests {
             client: &ClientId,
             packet_id: u16,
         ) -> Result<(), mqtt_storage::StorageError> {
+            if let Some(error) = self.clear_failures.lock().unwrap().pop_front() {
+                self.log("clear-failed", format!("{} {packet_id}", client.0));
+                return Err(error);
+            }
             let out = self.inner.clear_outbound(client, packet_id).await;
             if out.is_ok() {
                 self.log("clear", format!("{} {packet_id}", client.0));
@@ -15956,6 +16035,9 @@ mod tests {
             &self,
             client: &ClientId,
         ) -> Result<Vec<mqtt_storage::OutboundInflight>, mqtt_storage::StorageError> {
+            if let Some(error) = self.outbound_failures.lock().unwrap().pop_front() {
+                return Err(error);
+            }
             self.inner.outbound(client).await
         }
         async fn next_packet_id(
