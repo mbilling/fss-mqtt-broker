@@ -20,6 +20,8 @@
 #
 # Teardown is trapped on EXIT/INT/TERM — Ctrl-C destroys the paid servers.
 # KEEP_INFRA=1 skips that for debugging and says so loudly.
+# PREFLIGHT_ONLY=1 checks every requested size offline (no token/tofu required).
+# DRIVER_VCPUS supplies the CPU count for an unrecognized custom driver plan.
 
 set -euo pipefail
 . "$(dirname "$0")/lib.sh"
@@ -36,10 +38,10 @@ smoke)
 	# and smoke's job (terraform, cloud-init, PKI, lanes, teardown) does not
 	# need dedicated cores — only the published measurement runs do, and those
 	# require the limit increase the README describes anyway. Overridable.
-	DRIVER_COUNT="${DRIVER_COUNT:-1}"
+	DRIVER_COUNT="${DRIVER_COUNT:-${TF_VAR_driver_count:-1}}"
 	if [ "$CLOUD" = hcloud ]; then
 		BROKER_TYPE="${BROKER_TYPE:-cpx32}"
-		DRIVER_TYPE="${DRIVER_TYPE:-cpx42}"
+		DRIVER_TYPE="${DRIVER_TYPE:-${TF_VAR_driver_server_type:-cpx42}}"
 	fi
 	# UpCloud uses its own module defaults; never pass Hetzner plan names.
 	;;

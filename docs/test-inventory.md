@@ -1454,13 +1454,19 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 
 - `a_configured_poll_cadence_drives_the_disk_axis_in_both_directions`
 
-## `crates/mqttd/tests/durable_bench.rs` — 5 test(s)
+## `crates/mqttd/tests/durable_bench.rs` — 11 test(s)
 
 - `degraded_group_does_not_delay_other_groups` — `#[ignore]`d
 - `device_barrier_floor` — `#[ignore]`d
 - `durable_path_floor` — `#[ignore]`d
+- `measurement_window_excludes_preflight_and_warmup`
 - `multi_host_preflight` — `#[ignore]`d
 - `store_append_floor` — `#[ignore]`d
+- `subscriber::tests::qos0_and_qos1_keep_their_own_acknowledgement_rules`
+- `subscriber::tests::qos2_duplicates_do_not_count_twice_and_completed_ids_can_be_reused`
+- `subscriber::tests::real_broker_qos0_control`
+- `subscriber::tests::real_broker_qos1_control`
+- `subscriber::tests::real_broker_qos2_subscriber_completes_and_retires_the_outbound_id`
 
 ## `crates/mqttd/tests/durable_sessions.rs` — 13 test(s)
 

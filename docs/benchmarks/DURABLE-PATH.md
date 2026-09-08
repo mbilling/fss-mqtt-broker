@@ -97,12 +97,32 @@ Subscribers are real, online and draining: `MQTTD_BENCH_SUBS` sessions, one topi
 each, acking every delivery. Their client ids are chosen with the broker's **own**
 placement hash so every session is HRW-owned by node 0 — which is what makes
 "publish via the owner" and "publish via a non-owner" separable arms rather than an
-uninterpretable average. Subscriptions are granted at QoS 1 in every arm, so the
-QoS 2 arm measures the *inbound* exactly-once path (dedup record, PUBREC/PUBREL/
-PUBCOMP, outbound-id record) with the delivery side held constant.
+uninterpretable average.
+
+**Historical scope:** the published tables below, and the 2026-09-08 cloud
+candidate, subscribed at QoS 1 in every arm. Their QoS 2 rows measure the
+*inbound* exactly-once path with QoS 1 delivery, **not** outbound QoS 2 retirement
+or the repair in #577. They must not be reclassified retroactively.
+
+**Harness correction (#594):** subscribers now request the arm's QoS, reject a
+negotiated downgrade, and complete PUBLISH/PUBREC/PUBREL/PUBCOMP for QoS 2.
+Accounting counts once at PUBREL, repeats PUBCOMP for duplicate PUBREL, and
+allows packet-ID reuse after completion. New `RESULT` records disclose
+`publisher_qos`, `subscriber_qos` and `subscriber_accounting=qos2-on-pubrel-v1`.
+The latency remains **publisher acknowledgement RTT**, not subscriber delivery
+latency. Local TCP/Hub/store regressions cover QoS 0/1/2, outbound-ID retirement
+and duplicate protocol packets; no replacement cloud measurements are claimed.
 
 Warm-up (5 s) is discarded **by timestamp** — a sample counts only if its ack landed
-inside the measurement window.
+inside the measurement window. Each arm/repetition now emits
+`MEASUREMENT_WINDOW` JSON with its run tag and Unix-millisecond warm-up/start/end
+bounds (#595). Lane A's external CPU streams remain active for the **whole
+driver command**, including readiness and every arm, and stop/reap on return or
+failure. Their UTC markers permit correlation with these windows (verify host
+clock alignment); preflight/idle samples must be excluded. The earlier fixed
+sampling duration could expire before measurement and does not support a CPU
+bottleneck claim. Sampler or driver failure now fails the lane rather than merely
+warning and continuing.
 
 ### A run judges itself
 

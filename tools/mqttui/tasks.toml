@@ -1057,6 +1057,14 @@ about = "Shared provider directory and token selection for run.sh and teardown.s
 hidden = true
 
 [[task]]
+id = "scale-cpu"
+group = "Benchmark"
+name = "Driver-lifetime CPU sampling (sourced, not executed)"
+script = "bench/scale/cpu.sh"
+about = "Keeps lane A sampling alive through readiness and every arm, then stops/reaps SSH streams. Emits UTC alignment markers; failures invalidate the arm."
+hidden = true
+
+[[task]]
 id = "scale-cloud-tests"
 group = "Benchmark"
 name = "Offline provider selection and recovery regression tests"
