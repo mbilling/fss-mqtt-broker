@@ -69,6 +69,8 @@
 
 mod common;
 mod proc_common;
+#[path = "durable_bench/subscriber.rs"]
+mod subscriber;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -1001,22 +1003,30 @@ async fn run_publisher(
 /// count: a durable ack the subscriber never sees would be a correctness bug, and
 /// the acked-facts oracle in `cluster_proc.rs` owns that judgement — here it is
 /// simply reported).
-async fn drainer(mut c: common::Client, stop: Instant) -> usize {
-    let mut got = 0usize;
+async fn drainer(mut c: common::Client, stop: Instant, expected_qos: QoS) -> usize {
+    let mut state = subscriber::DrainState::default();
     loop {
         let left = stop.saturating_duration_since(Instant::now());
         if left.is_zero() {
-            return got;
+            return state.delivered;
         }
         match c.recv_bounded(left.min(Duration::from_millis(500))).await {
-            common::Recv::Packet(Packet::Publish(p)) => {
-                got += 1;
-                if let Some(pkid) = p.pkid {
-                    c.puback(pkid).await;
+            common::Recv::Packet(packet) => {
+                if let Packet::Publish(p) = &packet {
+                    assert_eq!(p.qos, expected_qos, "unexpected subscriber delivery QoS");
+                }
+                if let Some(reply) = state.receive(&packet) {
+                    c.send(&reply).await;
                 }
             }
-            common::Recv::Packet(_) | common::Recv::Quiet => {}
-            common::Recv::Closed => return got,
+            common::Recv::Quiet => {}
+            common::Recv::Closed => {
+                assert!(
+                    Instant::now() >= stop,
+                    "benchmark subscriber closed before its drain deadline"
+                );
+                return state.delivered;
+            }
         }
     }
 }
@@ -1035,6 +1045,16 @@ struct Arm {
     /// `true` = publishers attach to the node that owns the subscriber sessions;
     /// `false` = to a different node, so the publish crosses the ADR 0005 relay.
     via_owner: bool,
+}
+
+impl Arm {
+    async fn subscribe(
+        &self,
+        client: &mut common::Client,
+        filter: &str,
+    ) -> mqtt_codec::packet::SubAck {
+        client.subscribe(1, filter, self.qos).await
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1161,6 +1181,36 @@ fn ms(d: Duration) -> f64 {
     d.as_secs_f64() * 1000.0
 }
 
+/// Wall-clock bounds for correlating external CPU streams with the monotonic window.
+fn measurement_window(
+    tag: &str,
+    arm: &str,
+    unix_ms: u128,
+    warmup: Duration,
+    measure: Duration,
+) -> serde_json::Value {
+    serde_json::json!({
+        "run": tag, "arm": arm,
+        "warmup_start_unix_ms": unix_ms,
+        "measurement_start_unix_ms": unix_ms + warmup.as_millis(),
+        "measurement_end_unix_ms": unix_ms + warmup.as_millis() + measure.as_millis(),
+    })
+}
+
+#[test]
+fn measurement_window_excludes_preflight_and_warmup() {
+    let window = measurement_window(
+        "test-r2",
+        "qos2",
+        1000,
+        Duration::from_millis(10),
+        Duration::from_millis(20),
+    );
+    assert_eq!(window["run"], "test-r2");
+    assert_eq!(window["measurement_start_unix_ms"], 1010);
+    assert_eq!(window["measurement_end_unix_ms"], 1030);
+}
+
 /// Run one arm once: establish subscribers, warm interest, saturate, judge.
 #[allow(clippy::too_many_lines)] // one straight-line experiment; splitting it hides the shape
 #[allow(clippy::cast_precision_loss)]
@@ -1258,8 +1308,13 @@ async fn run_arm(cl: &mut Cluster, cfg: &Cfg, arm: &Arm, tag: &str) -> RunStats 
                 } else {
                     topics[i].clone()
                 };
-                let ack = c.subscribe(1, &filter, QoS::AtLeastOnce).await;
+                let ack = arm.subscribe(&mut c, &filter).await;
                 if ack.return_codes.iter().all(|rc| *rc != 0x80) {
+                    assert!(
+                        ack.return_codes.iter().all(|rc| *rc == arm.qos as u8),
+                        "benchmark subscriber QoS was downgraded: {:?}",
+                        ack.return_codes
+                    );
                     subs.push(c);
                     break;
                 }
@@ -1389,10 +1444,22 @@ async fn run_arm(cl: &mut Cluster, cfg: &Cfg, arm: &Arm, tag: &str) -> RunStats 
     let started = Instant::now();
     let measure_from = started + cfg.warmup;
     let stop = measure_from + cfg.measure;
+    let unix_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("wall clock after epoch")
+        .as_millis();
+    println!(
+        "MEASUREMENT_WINDOW {}",
+        measurement_window(tag, arm.label, unix_ms, cfg.warmup, cfg.measure)
+    );
 
     let mut drains = Vec::new();
     for c in subs {
-        drains.push(tokio::spawn(drainer(c, stop + Duration::from_secs(2))));
+        drains.push(tokio::spawn(drainer(
+            c,
+            stop + Duration::from_secs(2),
+            arm.qos,
+        )));
     }
     let mut pubs = Vec::new();
     for k in 0..cfg.publishers {
@@ -1428,7 +1495,7 @@ async fn run_arm(cl: &mut Cluster, cfg: &Cfg, arm: &Arm, tag: &str) -> RunStats 
     }
     let mut delivered = 0usize;
     for h in drains {
-        delivered += h.await.unwrap_or(0);
+        delivered += h.await.expect("subscriber drainer task");
     }
 
     let after: Vec<Scrape> = {
@@ -1689,6 +1756,9 @@ async fn durable_path_floor() {
                     "spread": cfg.spread,
                     "tier": cfg.tier.as_deref().unwrap_or("quorum"),
                     "shared": cfg.shared,
+                    "publisher_qos": arm.qos as u8,
+                    "subscriber_qos": arm.qos as u8,
+                    "subscriber_accounting": "qos2-on-pubrel-v1",
                     "external": cl.external,
                     "publishers": cfg.publishers,
                     "window": cfg.window,
@@ -2034,7 +2104,7 @@ async fn degraded_group_does_not_delay_other_groups() {
     let experiment_end = Instant::now() + phase * 4 + Duration::from_secs(120);
     let mut drains = Vec::new();
     for c in subs {
-        drains.push(tokio::spawn(drainer(c, experiment_end)));
+        drains.push(tokio::spawn(drainer(c, experiment_end, QoS::AtLeastOnce)));
     }
 
     let mut phases: Vec<(&str, PhaseResult)> = Vec::new();

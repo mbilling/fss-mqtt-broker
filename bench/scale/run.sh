@@ -20,15 +20,24 @@
 #
 # Teardown is trapped on EXIT/INT/TERM — Ctrl-C destroys the paid servers.
 # KEEP_INFRA=1 skips that for debugging and says so loudly.
+# PREFLIGHT_ONLY=1 checks every requested size offline (no token/tofu required).
+# DRIVER_VCPUS supplies the CPU count for an unrecognized custom driver plan.
 
 set -euo pipefail
 . "$(dirname "$0")/lib.sh"
 . "$SCALE_DIR/cloud.sh"
 select_scale_cloud
 
+# A lower-level shape-only flag must never accidentally provision through this wrapper.
+for flag in "${PREFLIGHT_ONLY:-0}" "${SHAPE_ONLY:-0}"; do
+	case "$flag" in 0 | 1) ;; *) die "PREFLIGHT_ONLY and SHAPE_ONLY must be 0 or 1" ;; esac
+done
+if [ "${SHAPE_ONLY:-0}" = 1 ]; then export PREFLIGHT_ONLY=1; fi
+
 MODE="${1:-}"
 case "$MODE" in
 smoke)
+	[ "$#" -eq 1 ] || die "smoke has a fixed size and accepts no size arguments"
 	SIZES=(1)
 	export SMOKE=1
 	# One driver: smoke proves the pipeline, not the 50k load. And SHARED-vCPU
@@ -36,10 +45,10 @@ smoke)
 	# and smoke's job (terraform, cloud-init, PKI, lanes, teardown) does not
 	# need dedicated cores — only the published measurement runs do, and those
 	# require the limit increase the README describes anyway. Overridable.
-	DRIVER_COUNT="${DRIVER_COUNT:-1}"
+	DRIVER_COUNT="${DRIVER_COUNT:-${TF_VAR_driver_count:-1}}"
 	if [ "$CLOUD" = hcloud ]; then
 		BROKER_TYPE="${BROKER_TYPE:-cpx32}"
-		DRIVER_TYPE="${DRIVER_TYPE:-cpx42}"
+		DRIVER_TYPE="${DRIVER_TYPE:-${TF_VAR_driver_server_type:-cpx42}}"
 	fi
 	# UpCloud uses its own module defaults; never pass Hetzner plan names.
 	;;
@@ -78,7 +87,8 @@ full)
 	;;
 esac
 
-require_scale_token
+# The offline mode validates the whole requested matrix without cloud credentials.
+if [ "${PREFLIGHT_ONLY:-0}" != 1 ]; then require_scale_token; fi
 # The UpCloud cloud-init template does not implement this Hetzner tuning arm.
 # Refuse explicitly before provisioning rather than silently measuring a no-op.
 if [ "$CLOUD" = upcloud ] && [ -n "${BROKER_NIC_SPREAD:-}" ]; then
@@ -90,7 +100,7 @@ fi
 # burned diagnosing a six-releases-old broker (issue #426). Name it every time;
 # it lands in the run's env dumps.
 LATEST_TAG=$(git -C "$SCALE_DIR" describe --tags --abbrev=0 2>/dev/null | sed 's/^v//' || true)
-[ -n "${MQTTD_VERSION:-}" ] || die "MQTTD_VERSION is not set — name the release under test explicitly (e.g. MQTTD_VERSION=${LATEST_TAG:-1.0.6}); terraform's default is not a choice"
+[ "${PREFLIGHT_ONLY:-0}" = 1 ] || [ -n "${MQTTD_VERSION:-}" ] || die "MQTTD_VERSION is not set — name the release under test explicitly (e.g. MQTTD_VERSION=${LATEST_TAG:-1.0.6}); terraform's default is not a choice"
 
 # MQTTD_URL measures a binary that has NOT shipped — a candidate, a pre-release, a
 # branch build. It exists because the rig could otherwise only ever measure
@@ -107,8 +117,11 @@ LATEST_TAG=$(git -C "$SCALE_DIR" describe --tags --abbrev=0 2>/dev/null | sed 's
 if [ -n "${MQTTD_URL:-}" ] && [ -z "${MQTTD_SHA256:-}" ]; then
 	die "MQTTD_URL is set but MQTTD_SHA256 is not. An arbitrary URL publishes no .sha256 beside it, so the broker would be installed unverified. Compute it (sha256sum <binary>) and pass MQTTD_SHA256."
 fi
-TF=$(command -v tofu) || die "OpenTofu (tofu) is required; Terraform is not supported"
+if [ "${PREFLIGHT_ONLY:-0}" != 1 ]; then
+	TF=$(command -v tofu) || die "OpenTofu (tofu) is required; Terraform is not supported"
+fi
 command -v jq >/dev/null || die "jq not installed"
+command -v python3 >/dev/null || die "python3 not installed"
 
 STAMP=$(date -u +%Y%m%dT%H%M%SZ)
 RUN="${RUN_DIR:-$SCALE_DIR/.runs/$STAMP}"
@@ -145,6 +158,64 @@ if [ -n "${MQTTD_URL:-}" ]; then
 		echo "one (bench/scale/README.md, ADR 0048)."
 	} >"$RUN/UNRELEASED-BINARY.txt"
 	warn "MQTTD_URL is set — this run measures an UNRELEASED binary; results are stamped $RUN/UNRELEASED-BINARY.txt and are NOT a published-curve point"
+fi
+
+# Validate ALL sizes before init/apply or installing a cloud-mutating EXIT trap.
+# Shape knobs are explicit -var arguments below, so validation and provisioning
+# cannot disagree through TF_VAR_* overrides. Refuse opaque shape overrides.
+export DRIVER_COUNT="${DRIVER_COUNT:-${TF_VAR_driver_count:-2}}"
+if [ "$CLOUD" = hcloud ]; then
+	export DRIVER_TYPE="${DRIVER_TYPE:-${TF_VAR_driver_server_type:-ccx33}}"
+else
+	export DRIVER_TYPE="${DRIVER_TYPE:-${TF_VAR_driver_server_type:-4xCPU-8GB}}"
+fi
+python3 - "$RUN" "$TFDIR" "$CLOUD" "${SIZES[@]}" <<'PY'
+import glob, json, os, pathlib, re, sys
+run, module, cloud, *sizes = sys.argv[1:]
+def refuse(message):
+    raise SystemExit('shape preflight: ' + message)
+for key in ('TF_CLI_ARGS', 'TF_CLI_ARGS_apply', 'TF_CLI_ARGS_plan'):
+    if re.search(r'(^|\s)-var(?:-file)?(?:=|\s)', os.getenv(key, '')):
+        refuse(f'{key} contains opaque variable overrides; use the named harness environment knobs')
+for pattern in ('terraform.tfvars', '*.auto.tfvars', 'terraform.tfvars.json', '*.auto.tfvars.json'):
+    for name in glob.glob(str(pathlib.Path(module) / pattern)):
+        text = pathlib.Path(name).read_text()
+        fields = ('node_count', 'driver_count', 'driver_server_type')
+        overrides = (any(field in json.loads(text) for field in fields) if name.endswith('.json')
+                     else any(re.search(r'(?m)^\s*' + field + r'\s*=', text) for field in fields))
+        if overrides:
+            refuse(f'{name} overrides workload shape; use run.sh sizes, DRIVER_COUNT and DRIVER_TYPE')
+if not sizes or any(s not in ('1','3','5','7','10') for s in sizes):
+    refuse('sizes must be 1, 3, 5, 7 or 10')
+count = os.environ['DRIVER_COUNT']
+if not re.fullmatch(r'[1-9][0-9]*', count) or int(count) > (8 if cloud == 'hcloud' else 12):
+    refuse('DRIVER_COUNT must be an integer within the provider limit')
+plan = os.environ['DRIVER_TYPE']
+cores = os.getenv('DRIVER_VCPUS')
+if cores is None:
+    if cloud == 'hcloud':
+        cores = dict(ccx13=2, ccx23=4, ccx33=8, ccx43=16, ccx53=32,
+                     cpx32=4, cpx42=8, cpx41=8, cpx51=16).get(plan)
+    else:
+        match = re.fullmatch(r'(?:[A-Z]+-)?([1-9][0-9]*)xCPU-[1-9][0-9]*GB', plan)
+        cores = match[1] if match else None
+if cores is None or not re.fullmatch(r'[1-9][0-9]*', str(cores)):
+    refuse(f'unknown CPU count for {plan}; supply DRIVER_VCPUS explicitly')
+for size in sizes:
+    inventory = {'brokers': [{} for _ in range(int(size))],
+                 'drivers': [{'vcpus': int(cores)} for _ in range(int(count))]}
+    pathlib.Path(run, f'shape-inventory-{size}.json').write_text(json.dumps(inventory))
+PY
+for N in "${SIZES[@]}"; do
+	SHAPE_ONLY=1 "$SCALE_DIR/run-curve.sh" "$RUN/preflight-$N" "$RUN/shape-inventory-$N.json" \
+		>"$RUN/shape-preflight-$N.log" 2>&1 || {
+		tail -25 "$RUN/shape-preflight-$N.log" >&2
+		die "invalid shape at size $N; no cloud resources touched"
+	}
+done
+if [ "${PREFLIGHT_ONLY:-0}" = 1 ]; then
+	say "all requested shapes valid; no cloud calls made"
+	exit 0
 fi
 
 CURRENT_SIZE=""

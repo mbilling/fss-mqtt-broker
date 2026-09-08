@@ -47,13 +47,22 @@ The prerequisites and pricing below describe the default Hetzner platform.
 
 ## Cost
 
-| run | servers | ≈ wall time | ≈ cost |
-|---|---|---|---|
-| `smoke` | 1×CCX23 + 1×CCX33 | 20–30 min | <€0.50 |
-| `standard` (10 only) | 10×CCX23 + 4×CCX33, one pass | 25–35 min | €1.50–2 |
-| `full` (1+3+5) | up to 5×CCX23 + 2×CCX33, one size at a time | 4–5 h | €1.50–2 |
-| `full` (1+3+5+7+10) | up to 10×CCX23 + 6×CCX33, one size at a time | 12–14 h | €33–40 |
-| forgotten 5-node stack | — | per day | ≈€8.50 |
+Reference hourly rates from Hetzner's pricing API on **2026-09-08**, `fsn1`,
+**excluding VAT**, including one public IPv4 per server. Re-check before spending;
+these replace stale campaign estimates, not a provider quote or spending cap.
+
+| run | servers | reference €/allocated hour, net |
+|---|---|---|
+| `smoke` | 1×CPX32 + 1×CPX42 (shared CPUs) | 0.17 |
+| `standard` default | 10×CCX23 + 2×CCX33 | 1.83 |
+| `standard`, four-driver recipe below | 10×CCX23 + 4×CCX33 | 2.28 |
+| `full` (1+3+5) | each size fresh, with 2×CCX33 | 0.58 / 0.86 / 1.14 |
+| large campaign, maximum formation | 10×CCX23 + 6×CCX33 | 2.72 |
+| forgotten 5-broker + 2-driver stack | per day | 27.32 |
+
+Provisioning, builds, retries and teardown are billed too. Account for hourly
+rounding per server and your account's VAT; a multi-stage run is not one hourly
+allocation. A partially completed campaign must report its actual coverage.
 
 **Which profile.** `standard` is the release **regression gate**: one 10-node
 cluster — the top of our range, where a regression shows first — measured
@@ -70,10 +79,11 @@ posture, no ladder tail). That makes it a gate, not a publishable curve point:
 numbers that go into `docs/benchmarks/SCALE-CURVE.md` come from `full`, which
 is also what a release touching the durable path should run.
 
-Budget **€10** and several standard runs plus the worst case are covered. The last line is why teardown is
-trapped on EXIT/INT/TERM, why `teardown.sh` exists separately, and why step 1
-says *dedicated project*: after any run, `hcloud server list` (or the console)
-must show zero servers.
+Set an explicit budget from current rates and keep a teardown contingency.
+EXIT/INT/TERM traps and `teardown.sh` are recovery mechanisms, not a provider-side
+billing cap. After a run, verify the dedicated project has no remaining paid
+servers, primary IPv4s, volumes, floating IPs or load balancers; empty local state
+alone is not proof that billing stopped.
 
 ## Running
 
@@ -82,7 +92,7 @@ cd bench/scale
 export HCLOUD_TOKEN=...
 export MQTTD_VERSION=1.0.6   # the release under test — required, recorded in the run
 ./run.sh smoke     # proves token → apply → PKI → bring-up → lanes → destroy
-./run.sh standard  # the release gate: one 10-node cluster, ~30 min, ~€2
+./run.sh standard  # the release gate: one 10-node cluster, two drivers by default
 ./run.sh full      # the curve; or ./run.sh full 3 5 for a subset
 python3 summarize-curve.py .runs/<stamp>/results   # markdown for the doc
 ```
@@ -104,13 +114,37 @@ continues unobserved with a warning. `OBSERVE=0` opts out — worth doing for a 
 whose numbers are published, if you want the measured path provably untouched. Ctrl-C is safe (trapped); `kill -9` is not — after one, run
 `./teardown.sh`.
 
-**Checking a shape without paying.** Lane B's populations must split exactly
+**Checking a shape without paying.** `run.sh` now validates **every requested
+size before any OpenTofu init/apply or cloud-mutating teardown trap** (#593).
+For a standalone offline check (no token or OpenTofu needed; `SHAPE_ONLY=1`
+is also accepted by the orchestrator and cannot provision):
+
+```sh
+PREFLIGHT_ONLY=1 ./run.sh full 1 3 5
+# Four eight-core drivers: 3 publisher + 5 subscriber containers each.
+# Keeps 12,000 publishers and 300 subscribers exactly balanced on ten brokers.
+DRIVER_COUNT=4 LANE_B_PUB_CONTAINERS=3 LANE_B_SUB_CONTAINERS=5 \
+  PREFLIGHT_ONLY=1 ./run.sh standard
+# Remove PREFLIGHT_ONLY only after checking the shape and approving a budget.
+```
+
+The old four-driver recipe with 5 publisher / 3 subscriber containers was
+invalid for ten brokers. Explicit overrides are not silently corrected.
+`TF_VAR_driver_count` and `TF_VAR_driver_server_type` are resolved before the
+check; named `DRIVER_COUNT`/`DRIVER_TYPE` knobs win and are passed explicitly to
+OpenTofu. Shape overrides in auto-loaded variable files or opaque `-var` CLI
+arguments are refused rather than validating a different shape from the one
+provisioned. For an unrecognized driver plan, specify `DRIVER_VCPUS`; do not
+invent capacity. The live inventory is still validated before measurement.
+
+Lane B's populations must split exactly
 over their containers (`drivers × LANE_B_PUB_CONTAINERS`, `drivers ×
 LANE_B_SUB_CONTAINERS`), each container's clients exactly over the brokers it
 spans, and every rung must need an integer `-I` of at least `LANE_B_MIN_INTERVAL` ms — `run-curve.sh` refuses
-anything else before its first ssh, so a wrong shape costs the provisioning
-minutes rather than lane A's hour (a floored split used to run fewer clients
-than the doc says; a floored timer used to offer a rate other than the label).
+anything else before its first ssh. The orchestrator invokes this same check
+before provisioning, so an invalid shape costs no server time (a floored split
+used to run fewer clients than the doc says; a floored timer used to offer a
+rate other than the label).
 Lane D is held to the same discipline and refused in the same place: its
 sessions must split exactly over their containers *and* over the brokers, its
 offered rate must need an integer `-I`, its session expiry must outlast the

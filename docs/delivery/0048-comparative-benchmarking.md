@@ -77,6 +77,19 @@ the pinned, dedicated, disclosed environment of phases 3–4.
 
 ## Changelog
 
+- **2026-09-08 (harness evidence repairs, #593–#595)** — the orchestrator
+  checks every requested shape before provisioning, documents the balanced
+  four-driver standard recipe and replaces stale cost promises with dated hourly
+  rates. Lane A subscribes at the arm's QoS, completes outbound QoS 2 and discloses
+  both directions in RESULT records; five protocol/TCP regressions exercise
+  duplicates, packet-ID reuse, QoS 0/1 controls and outbound retirement through
+  the actual drainer. CPU streams follow the whole driver lifetime and have
+  per-arm/repetition wall-clock measurement bounds; three stub-process tests
+  cover preflight/measurement coverage, driver failure and premature sampler
+  exit, including reaping. Historical inbound-only QoS 2 rows and stale CPU
+  samples are not retroactively upgraded. These are harness correctness repairs,
+  **not** new scaling measurements, #504 recovery acceptance, or #575 isolation.
+
 - **2026-08-14 (review round, before commit)** — adversarial verification of 0048-T5 found
   five honesty defects in the published artifact and they are corrected in place. (a) The
   headline arithmetic did not close: "~215-240 barriers/s / ~2 per message ~= ~30-120 msg/s"

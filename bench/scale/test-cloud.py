@@ -18,7 +18,7 @@ class CloudTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.rig = self.root / "bench/scale"
         self.rig.mkdir(parents=True)
-        for name in ("lib.sh", "cloud.sh", "run.sh", "teardown.sh", "run-curve.sh", "test-upcloud-quota.py"):
+        for name in ("lib.sh", "cloud.sh", "run.sh", "teardown.sh", "run-curve.sh", "cpu.sh", "test-upcloud-quota.py"):
             shutil.copy2(SCALE / name, self.rig / name)
         for name in ("terraform", "terraform-upcloud"):
             (self.rig / name).mkdir()
@@ -53,6 +53,132 @@ sys.exit(77 if "apply" in sys.argv or os.path.basename(sys.argv[0]) in ("hcloud"
 
     def calls(self):
         return [json.loads(line) for line in self.log.read_text().splitlines()] if self.log.exists() else []
+
+    def cpu_session(self, **extra):
+        # Phase handshakes, not a guessed sampling duration: the fake driver
+        # advances only after both streams observed preflight and measurement.
+        ssh = self.bin_dir / "ssh"
+        ssh.write_text('''#!/usr/bin/env python3
+import os, pathlib, time
+print("CPU_STREAM_START_UTC test", flush=True)
+while True:
+    phase = pathlib.Path(os.environ["CPU_PHASE"])
+    print("SAMPLE " + (phase.read_text() if phase.exists() else "preflight"), flush=True)
+    if os.getenv("FAIL_SAMPLER") == "1": break
+    time.sleep(0.01)
+''')
+        driver = self.bin_dir / "driver"
+        driver.write_text('''#!/usr/bin/env python3
+import os, pathlib, time
+root = pathlib.Path(os.environ["CPU_DIR"])
+for phase in ("preflight", "measurement"):
+    pathlib.Path(os.environ["CPU_PHASE"]).write_text(phase)
+    deadline = time.monotonic() + 5
+    while not all("SAMPLE " + phase in (root / name).read_text() for name in ("cpu-broker0.txt", "cpu-driver0.txt")):
+        if time.monotonic() >= deadline: raise SystemExit("sampler failed to follow driver phase")
+        time.sleep(0.01)
+    if os.getenv("FAIL_DRIVER") == "1": raise SystemExit(77)
+    if os.getenv("FAIL_SAMPLER") == "1":
+        def alive(pid):
+            try: os.kill(pid, 0)
+            except ProcessLookupError: return False
+            return True
+        pids = [int(line.split()[0]) for line in (root / "samplers.tsv").read_text().splitlines()]
+        while any(alive(pid) for pid in pids):
+            if time.monotonic() >= deadline: raise SystemExit("sampler did not exit")
+            time.sleep(0.01)
+        raise SystemExit(0)  # A successful driver must not hide dead samplers.
+''')
+        driver.chmod(0o755)
+        out = self.root / "cpu"
+        env = self.env | {"CPU_DIR": str(out), "CPU_PHASE": str(self.root / "phase"), **extra}
+        result = subprocess.run(["bash", "-c", '''
+source "$1/lib.sh"
+source "$1/cpu.sh"
+RUN="$2"; N=1; D=1
+broker_pub_ip() { echo broker; }
+driver_pub_ip() { echo driver; }
+with_cpu_sampling "$CPU_DIR" driver
+''', "test", str(self.rig), str(self.root)], env=env, capture_output=True, text=True, timeout=15)
+        for line in (out / "samplers.tsv").read_text().splitlines():
+            with self.assertRaises(ProcessLookupError, msg="sampler must be reaped"):
+                os.kill(int(line.split()[0]), 0)
+        return result, out
+
+    def test_cpu_streams_cover_the_driver_and_stop_without_a_timer_tail(self):
+        result, out = self.cpu_session()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for name in ("cpu-broker0.txt", "cpu-driver0.txt"):
+            text = (out / name).read_text()
+            self.assertIn("SAMPLE preflight", text)
+            self.assertIn("SAMPLE measurement", text)
+
+    def test_cpu_streams_are_reaped_when_the_driver_fails(self):
+        result, _ = self.cpu_session(FAIL_DRIVER="1")
+        self.assertEqual(result.returncode, 77, result.stderr)
+
+    def test_early_sampler_exit_is_not_success(self):
+        result, _ = self.cpu_session(FAIL_SAMPLER="1")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("coverage is incomplete", result.stderr)
+
+    def test_shape_only_alias_and_malformed_modes_cannot_provision(self):
+        result = self.run_script("run.sh", "smoke", SHAPE_ONLY="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for args, env in (
+            (("smoke", "3"), {}),
+            (("smoke",), {"PREFLIGHT_ONLY": "true"}),
+            (("smoke",), {"SHAPE_ONLY": "true"}),
+        ):
+            result = self.run_script("run.sh", *args, HCLOUD_TOKEN="dummy", **env)
+            self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(self.calls(), [])
+
+    def test_all_shapes_fail_before_any_cloud_call(self):
+        for sizes, env, diagnostic in (
+            (("10",), {"DRIVER_COUNT": "4"}, "spreads unevenly"),
+            (("1", "10"), {"DRIVER_COUNT": "4"}, "spreads unevenly"),
+            (("1", "2"), {}, "sizes must be"),
+            (("1",), {"DRIVER_COUNT": "2.5"}, "DRIVER_COUNT"),
+            (("1",), {"DRIVER_COUNT": "0"}, "DRIVER_COUNT"),
+            (("1",), {"DRIVER_TYPE": "unknown"}, "unknown CPU count"),
+            (("1",), {"TF_CLI_ARGS_apply": "-var driver_count=4"}, "opaque variable"),
+        ):
+            with self.subTest(sizes=sizes, env=env):
+                result = self.run_script("run.sh", "full", *sizes, HCLOUD_TOKEN="dummy", **env)
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn(diagnostic, result.stderr)
+                self.assertEqual(self.calls(), [])
+
+    def test_offline_matrix_positive_controls_need_no_token_or_cloud(self):
+        for args, env in (
+            (("smoke",), {}),
+            (("standard",), {}),
+            (("full", "1", "3", "5"), {}),
+            (("standard", "10"), {"DRIVER_COUNT": "4", "LANE_B_PUB_CONTAINERS": "3",
+                                    "LANE_B_SUB_CONTAINERS": "5"}),
+            (("smoke",), {"CLOUD": "upcloud"}),
+            (("smoke",), {"DRIVER_TYPE": "custom", "DRIVER_VCPUS": "8"}),
+        ):
+            with self.subTest(args=args, env=env):
+                result = self.run_script("run.sh", *args, PREFLIGHT_ONLY="1", **env)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("no cloud calls made", result.stderr)
+                self.assertEqual(self.calls(), [])
+
+    def test_variable_file_shape_overrides_fail_closed(self):
+        path = self.rig / "terraform/terraform.tfvars.json"
+        path.write_text('{"driver_count":4}')
+        result = self.run_script("run.sh", "standard", HCLOUD_TOKEN="dummy")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("overrides workload shape", result.stderr)
+        self.assertEqual(self.calls(), [])
+
+    def test_tf_var_driver_count_is_validated_not_silently_ignored(self):
+        result = self.run_script("run.sh", "standard", HCLOUD_TOKEN="dummy", TF_VAR_driver_count="4")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("spreads unevenly", result.stderr)
+        self.assertEqual(self.calls(), [])
 
     def test_upcloud_smoke_defaults_and_trap(self):
         result = self.run_script("run.sh", "smoke", CLOUD="upcloud", UPCLOUD_TOKEN="dummy")
