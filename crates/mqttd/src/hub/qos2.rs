@@ -52,10 +52,21 @@ impl Hub {
                 inf.pending.remove(&pkid);
             }
         }
+        let orphans: Vec<_> = self.inflight.get(client).map_or_else(Vec::new, |inf| {
+            inf.orphaned_qos2_cleanup
+                .iter()
+                .filter_map(|pkid| inf.orphaned_qos2.get(pkid).map(|offset| (*pkid, *offset)))
+                .collect()
+        });
+        for (pkid, offset) in orphans {
+            self.clear_orphaned_qos2(client, pkid, offset).await;
+        }
         if !self.inflight.get(client).is_some_and(|inf| {
-            inf.pending
-                .values()
-                .any(|p| p.state == OutState::CompletedQos2)
+            !inf.orphaned_qos2_cleanup.is_empty()
+                || inf
+                    .pending
+                    .values()
+                    .any(|p| p.state == OutState::CompletedQos2)
         }) {
             self.qos2_cleanup.remove(client);
         }
@@ -70,6 +81,10 @@ impl Hub {
         pkid: u16,
         offset: Offset,
     ) {
+        if let Some(inf) = self.inflight.get_mut(client) {
+            inf.orphaned_qos2_cleanup.insert(pkid);
+            self.qos2_cleanup.insert(client.clone());
+        }
         match self.store.pending(client, 0, 1).await {
             Ok(entries) if entries.first().is_none_or(|entry| entry.offset > offset) => {}
             Ok(_) => return,
@@ -90,6 +105,7 @@ impl Hub {
         }
         if let Some(inf) = self.inflight.get_mut(client) {
             inf.orphaned_qos2.remove(&pkid);
+            inf.orphaned_qos2_cleanup.remove(&pkid);
         }
     }
 }

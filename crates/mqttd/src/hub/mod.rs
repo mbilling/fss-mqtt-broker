@@ -761,6 +761,9 @@ struct Inflight {
     /// Released durable IDs with no message in the replay window. Keep them reserved
     /// until PUBCOMP proves their queue entry absent and clearance succeeds (#577).
     orphaned_qos2: BTreeMap<u16, Offset>,
+    /// Orphans eligible for cleanup (PUBCOMP received, or never released).
+    /// Failed reads/writes must retry without requiring another client packet.
+    orphaned_qos2_cleanup: BTreeSet<u16>,
     /// The client's MQTT 5.0 Receive Maximum: the most `QoS` > 0 publishes we may
     /// have unacked to it at once (ADR 0012).
     receive_maximum: u16,
@@ -806,6 +809,7 @@ impl Default for Inflight {
             block_remaining: 0,
             pending: BTreeMap::new(),
             orphaned_qos2: BTreeMap::new(),
+            orphaned_qos2_cleanup: BTreeSet::new(),
             receive_maximum: RECEIVE_MAXIMUM_DEFAULT,
             backlog: BacklogQueue::default(),
             outstanding: BTreeSet::new(),
@@ -846,12 +850,18 @@ impl Inflight {
     /// Contiguous prefix no longer owed to the subscriber. This is eligibility for
     /// truncation, not evidence that any durable write has already succeeded.
     fn safe_ack(&self) -> Offset {
-        match self.outstanding.iter().next() {
+        let safe = match self.outstanding.iter().next() {
             // Everything strictly below the oldest still-owed message is settled.
             Some(oldest) => oldest.saturating_sub(1),
-            // Nothing owed: the whole log is settled.
+            // Nothing owed: the whole observed log is settled.
             None => self.high_water,
-        }
+        };
+        // Unmatched durable IDs may point beyond the replay window, not to
+        // retired messages. Later live completions must not truncate over them.
+        self.orphaned_qos2
+            .values()
+            .min()
+            .map_or(safe, |oldest| safe.min(oldest.saturating_sub(1)))
     }
 
     fn advance_ack(&mut self) -> Option<Offset> {
@@ -3369,6 +3379,24 @@ impl Hub {
             reply,
         } = pending;
 
+        // A failed identity-table read must never become fresh PUBLISH replay.
+        // Refuse before admitting/replacing the connection or emitting CONNACK.
+        let mut restored = BTreeMap::new();
+        if !clean_start {
+            match self.store.outbound(&client).await {
+                Ok(entries) => {
+                    for entry in entries {
+                        restored.insert(entry.offset, (entry.packet_id, entry.pubrec_seen));
+                    }
+                }
+                Err(error) => {
+                    warn!(client = %client.0, %error, "cannot recover outbound QoS2 identities");
+                    let _ = reply.send(AttachOutcome::Unavailable);
+                    return;
+                }
+            }
+        }
+
         // Session quota (ADR 0041 T4): refuse only a NEW session — a resume
         // (session_present) or an attach for a locally-known client id (takeover,
         // clean-start replacement) is never refused for quota. A full broker keeps
@@ -3629,13 +3657,13 @@ impl Hub {
         // in the in-memory table and were resumed above — `resumed_offsets` keeps the
         // replay away from them, so the map only acts when memory is gone, which is
         // exactly the restart this table exists for.
-        let mut restored: std::collections::BTreeMap<Offset, (u16, bool)> =
-            std::collections::BTreeMap::new();
-        if !clean_start {
-            if let Ok(entries) = self.store.outbound(&client).await {
-                for e in entries {
-                    restored.insert(e.offset, (e.packet_id, e.pubrec_seen));
-                }
+        // The snapshot was read before admitting the connection. Reserve every
+        // restored ID before replay can allocate one, including IDs beyond its
+        // bounded window. Matching entries below move to `pending` instead.
+        for (&offset, &(pkid, _)) in &restored {
+            let inf = self.inflight.entry(client.clone()).or_default();
+            if !inf.pending.contains_key(&pkid) {
+                inf.orphaned_qos2.insert(pkid, offset);
             }
         }
 
@@ -3675,6 +3703,9 @@ impl Hub {
                     // PUBREL — the subscriber has the message; re-publishing it is the
                     // #130 duplicate this table exists to prevent.
                     if let Some((pkid, pubrec_seen)) = restored.remove(&qm.offset) {
+                        let inf = self.inflight.entry(client.clone()).or_default();
+                        inf.orphaned_qos2.remove(&pkid);
+                        inf.orphaned_qos2_cleanup.remove(&pkid);
                         let state = if pubrec_seen {
                             OutState::AwaitingPubComp
                         } else {
@@ -3772,13 +3803,10 @@ impl Hub {
                 }
             }
 
-            // Table entries whose message is no longer in the queue — an earlier clear
-            // failed and its truncation went through anyway (ADR 0057's tolerated
-            // failure). Released phase: send the spurious PUBREL the tolerance priced
-            // in; the subscriber's PUBCOMP (MQTT-4.3.3) clears the entry, because
-            // pub_comp clears unconditionally. Unreleased phase: the PUBLISH cannot be
-            // reconstructed AND the message left the log, which means it was let go of —
-            // clear the id rather than carry it forever.
+            // IDs not matched in this replay window are only POSSIBLE orphans.
+            // Released phase resumes PUBREL; PUBCOMP makes cleanup eligible.
+            // Unreleased phase can attempt cleanup immediately. Both paths must
+            // prove durable prefix retirement, not infer absence from this window.
             for (offset, (pkid, pubrec_seen)) in restored {
                 self.inflight
                     .entry(client.clone())
@@ -8600,7 +8628,8 @@ mod tests {
 
     /// `PeerDead` drops the link and interest unconditionally; a stale
     /// `PeerDisconnected` from the old link must not kill a replacement link.
-    #[tokio::test]
+    // Keep periodic gossip from interleaving with the exact link-event sequence.
+    #[tokio::test(start_paused = true)]
     async fn peer_dead_drops_routing_and_stale_peer_disconnect_is_ignored() {
         let tx = start_hub();
         let mut p1 = connect_peer(&tx, "n", 1);
@@ -15448,7 +15477,8 @@ mod tests {
 
     /// Local interest changes (subscribe / unsubscribe / clean-session detach)
     /// are gossiped to every connected peer as fresh snapshots.
-    #[tokio::test]
+    // Assert event-driven snapshots, not wall-clock reconciliation duplicates.
+    #[tokio::test(start_paused = true)]
     async fn interest_snapshots_follow_subscription_changes() {
         let tx = start_hub();
         let mut p = connect_peer(&tx, "n", 1);
@@ -15690,6 +15720,7 @@ mod tests {
         inner: std::sync::Arc<dyn mqtt_storage::SessionStore>,
         ack_failures: std::sync::Mutex<std::collections::VecDeque<mqtt_storage::StorageError>>,
         clear_failures: std::sync::Mutex<std::collections::VecDeque<mqtt_storage::StorageError>>,
+        outbound_failures: std::sync::Mutex<std::collections::VecDeque<mqtt_storage::StorageError>>,
         /// client id → release gate: an enqueue for a client present here awaits `true`.
         gates:
             std::sync::Mutex<std::collections::HashMap<String, tokio::sync::watch::Receiver<bool>>>,
@@ -15726,6 +15757,7 @@ mod tests {
                 inner,
                 ack_failures: std::sync::Mutex::new(std::collections::VecDeque::new()),
                 clear_failures: std::sync::Mutex::new(std::collections::VecDeque::new()),
+                outbound_failures: std::sync::Mutex::new(std::collections::VecDeque::new()),
                 gates: std::sync::Mutex::new(std::collections::HashMap::new()),
                 ops: std::sync::Mutex::new(Vec::new()),
                 slow_first: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -16003,6 +16035,9 @@ mod tests {
             &self,
             client: &ClientId,
         ) -> Result<Vec<mqtt_storage::OutboundInflight>, mqtt_storage::StorageError> {
+            if let Some(error) = self.outbound_failures.lock().unwrap().pop_front() {
+                return Err(error);
+            }
             self.inner.outbound(client).await
         }
         async fn next_packet_id(

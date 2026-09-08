@@ -47,7 +47,10 @@ use crate::{
 };
 use async_trait::async_trait;
 use mqtt_core::{ClientId, Message, QoS, Subscription};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
+use std::sync::{Arc, Mutex, Weak};
+
+type MetadataLocks = Mutex<HashMap<ClientId, Weak<tokio::sync::Mutex<()>>>>;
 
 impl From<ReplError> for StorageError {
     fn from(e: ReplError) -> Self {
@@ -80,6 +83,9 @@ impl From<ReplError> for StorageError {
 pub struct ReplicatedSessionStore<L: ReplicatedLog<Key = String>> {
     log: L,
     limits: QueueLimits,
+    /// Serialize snapshot read-modify-write across the hub, lanes and recovery.
+    /// Weak entries retain no session state; unrelated clients never await this lock.
+    metadata_locks: MetadataLocks,
     /// ADR 0072: when true, a message carrying the `mqttd-durability` user
     /// property selects its append's durability tier (the operator's
     /// `MQTTD_ALLOW_RELAXED_PUBLISH` opt-in). Off = every append is
@@ -93,6 +99,7 @@ impl<L: ReplicatedLog<Key = String>> ReplicatedSessionStore<L> {
         Self {
             log,
             limits: QueueLimits::default(),
+            metadata_locks: Mutex::default(),
             tier_selection: false,
         }
     }
@@ -110,8 +117,32 @@ impl<L: ReplicatedLog<Key = String>> ReplicatedSessionStore<L> {
         Self {
             log,
             limits,
+            metadata_locks: Mutex::default(),
             tier_selection: false,
         }
+    }
+
+    /// One lock per active client, not a global/striped I/O lock. Waiting futures
+    /// own strong references, so cancellation cannot create two locks for a key.
+    /// Bound stale weak entries while preserving every active/waiting key.
+    async fn lock_meta(&self, client: &ClientId) -> tokio::sync::OwnedMutexGuard<()> {
+        let lock = {
+            let mut locks = self
+                .metadata_locks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(lock) = locks.get(client).and_then(Weak::upgrade) {
+                lock
+            } else {
+                if locks.len() >= 1024 {
+                    locks.retain(|_, lock| lock.strong_count() > 0);
+                }
+                let lock = Arc::new(tokio::sync::Mutex::new(()));
+                locks.insert(client.clone(), Arc::downgrade(&lock));
+                lock
+            }
+        };
+        lock.lock_owned().await
     }
 
     fn queue_key(client: &ClientId) -> String {
@@ -150,9 +181,13 @@ impl<L: ReplicatedLog<Key = String>> ReplicatedSessionStore<L> {
     }
 }
 
+#[cfg(test)]
+mod metadata_concurrency;
+
 #[async_trait]
 impl<L: ReplicatedLog<Key = String>> SessionStore for ReplicatedSessionStore<L> {
     async fn ensure_session(&self, client: &ClientId) -> Result<bool, StorageError> {
+        let _guard = self.lock_meta(client).await;
         let qkey = Self::queue_key(client);
         // A session "exists" if a metadata snapshot or any queued message is present.
         let existed = self.load_meta(client).await?.is_some()
@@ -170,6 +205,7 @@ impl<L: ReplicatedLog<Key = String>> SessionStore for ReplicatedSessionStore<L> 
         client: &ClientId,
         owner: &str,
     ) -> Result<SessionClaim, StorageError> {
+        let _guard = self.lock_meta(client).await;
         // The owner lives in the metadata snapshot, so a claim replicates through the same
         // log as every other session write — the binding holds across restart and cross-node
         // takeover. Read-modify-write of the single meta record (ADR 0031).
@@ -208,6 +244,7 @@ impl<L: ReplicatedLog<Key = String>> SessionStore for ReplicatedSessionStore<L> 
         client: &ClientId,
         subscriptions: &[Subscription],
     ) -> Result<(), StorageError> {
+        let _guard = self.lock_meta(client).await;
         // Read-modify-write the snapshot so the dedup window and packet-id counter
         // survive a subscription change.
         let mut meta = self.load_meta(client).await?.unwrap_or_default();
@@ -377,6 +414,7 @@ impl<L: ReplicatedLog<Key = String>> SessionStore for ReplicatedSessionStore<L> 
         client: &ClientId,
         packet_id: u16,
     ) -> Result<InboundSighting, StorageError> {
+        let _guard = self.lock_meta(client).await;
         let mut meta = self.load_meta(client).await?.unwrap_or_default();
         let newly = meta.received_qos2.insert(packet_id);
         if newly {
@@ -397,6 +435,7 @@ impl<L: ReplicatedLog<Key = String>> SessionStore for ReplicatedSessionStore<L> 
     }
 
     async fn ack_received(&self, client: &ClientId, packet_id: u16) -> Result<(), StorageError> {
+        let _guard = self.lock_meta(client).await;
         if let Some(mut meta) = self.load_meta(client).await? {
             // Persist only when it changed, mirroring `advance_outbound`'s no-op guard.
             if meta.unacked_received_qos2.remove(&packet_id) {
@@ -407,6 +446,7 @@ impl<L: ReplicatedLog<Key = String>> SessionStore for ReplicatedSessionStore<L> 
     }
 
     async fn clear_received(&self, client: &ClientId, packet_id: u16) -> Result<(), StorageError> {
+        let _guard = self.lock_meta(client).await;
         if let Some(mut meta) = self.load_meta(client).await? {
             let held = meta.received_qos2.remove(&packet_id);
             let unacked = meta.unacked_received_qos2.remove(&packet_id);
@@ -431,6 +471,7 @@ impl<L: ReplicatedLog<Key = String>> SessionStore for ReplicatedSessionStore<L> 
         packet_id: u16,
         offset: u64,
     ) -> Result<(), StorageError> {
+        let _guard = self.lock_meta(client).await;
         let mut meta = self.load_meta(client).await?.unwrap_or_default();
         meta.outbound_qos2.insert(packet_id, (offset, false));
         // The durable write is what makes the id survivable; it gates the PUBLISH the
@@ -443,6 +484,7 @@ impl<L: ReplicatedLog<Key = String>> SessionStore for ReplicatedSessionStore<L> 
         client: &ClientId,
         packet_id: u16,
     ) -> Result<(), StorageError> {
+        let _guard = self.lock_meta(client).await;
         if let Some(mut meta) = self.load_meta(client).await? {
             if let Some(slot) = meta.outbound_qos2.get_mut(&packet_id) {
                 if !slot.1 {
@@ -455,6 +497,7 @@ impl<L: ReplicatedLog<Key = String>> SessionStore for ReplicatedSessionStore<L> 
     }
 
     async fn clear_outbound(&self, client: &ClientId, packet_id: u16) -> Result<(), StorageError> {
+        let _guard = self.lock_meta(client).await;
         if let Some(mut meta) = self.load_meta(client).await? {
             if meta.outbound_qos2.remove(&packet_id).is_some() {
                 self.store_meta(client, &meta).await?;
@@ -481,6 +524,7 @@ impl<L: ReplicatedLog<Key = String>> SessionStore for ReplicatedSessionStore<L> 
     }
 
     async fn next_packet_id(&self, client: &ClientId) -> Result<u16, StorageError> {
+        let _guard = self.lock_meta(client).await;
         let mut meta = self.load_meta(client).await?.unwrap_or_default();
         meta.last_packet_id = if meta.last_packet_id == u16::MAX {
             1
@@ -492,6 +536,7 @@ impl<L: ReplicatedLog<Key = String>> SessionStore for ReplicatedSessionStore<L> 
     }
 
     async fn remove(&self, client: &ClientId) -> Result<(), StorageError> {
+        let _guard = self.lock_meta(client).await;
         self.log.remove(&Self::queue_key(client)).await?;
         self.log.remove(&Self::meta_key(client)).await?;
         Ok(())
@@ -502,6 +547,7 @@ impl<L: ReplicatedLog<Key = String>> SessionStore for ReplicatedSessionStore<L> 
         client: &ClientId,
         deadline: Option<u64>,
     ) -> Result<(), StorageError> {
+        let _guard = self.lock_meta(client).await;
         // Read-modify-write the snapshot so subscriptions / dedup / packet-id survive.
         let mut meta = self.load_meta(client).await?.unwrap_or_default();
         meta.session_expiry_at = deadline;
@@ -562,6 +608,7 @@ impl<L: ReplicatedLog<Key = String>> SessionStore for ReplicatedSessionStore<L> 
     }
 
     async fn reserve_packet_ids(&self, client: &ClientId, count: u16) -> Result<u16, StorageError> {
+        let _guard = self.lock_meta(client).await;
         // Reserve only against an existing (persistent) session, so a clean session never
         // materialises durable metadata. One snapshot write advances the high-water by a
         // whole block (ADR 0007 T9).

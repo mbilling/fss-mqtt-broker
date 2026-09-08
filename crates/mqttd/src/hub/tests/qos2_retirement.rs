@@ -133,6 +133,33 @@ async fn a_failed_clear_reserves_the_id_and_retries_without_another_client_packe
 }
 
 #[tokio::test]
+async fn a_failed_orphan_clear_retries_without_another_pubcomp() {
+    let (mut hub, store, client) = fixture();
+    let offset = delivery(&mut hub, &client, 2, QoS::ExactlyOnce).await;
+    store.ack_durable(&client, offset).await.unwrap();
+    // The restored form after a successful truncate but failed ID clearance.
+    let inf = hub.inflight.get_mut(&client).unwrap();
+    inf.pending.clear();
+    inf.outstanding.clear();
+    inf.orphaned_qos2.insert(2, offset);
+    store
+        .clear_failures
+        .lock()
+        .unwrap()
+        .push_back(StorageError::NoQuorum);
+    hub.pub_comp(&client, 2).await;
+    assert_eq!(store.outbound(&client).await.unwrap().len(), 1);
+    assert!(hub.inflight[&client].orphaned_qos2.contains_key(&2));
+    hub.retry_qos2_cleanup().await;
+    assert!(
+        store.outbound(&client).await.unwrap().is_empty(),
+        "the subscriber owes no further packet after PUBCOMP"
+    );
+    assert!(hub.inflight[&client].orphaned_qos2.is_empty());
+    assert!(!hub.qos2_cleanup.contains(&client));
+}
+
+#[tokio::test]
 async fn restored_qos2_offsets_pin_the_prefix_until_each_handshake_completes() {
     let (mut hub, store, client) = fixture();
     delivery(&mut hub, &client, 1, QoS::ExactlyOnce).await;
@@ -169,6 +196,54 @@ async fn restored_qos2_offsets_pin_the_prefix_until_each_handshake_completes() {
         .unwrap();
     assert!(store.outbound(&client).await.unwrap().is_empty());
     assert!(store.pending(&client, 0, 10).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn an_id_outside_the_replay_window_pins_the_prefix() {
+    let (mut hub, store, client) = fixture();
+    let offset = delivery(&mut hub, &client, 1, QoS::ExactlyOnce).await;
+    store.record_outbound(&client, 1, offset).await.unwrap(); // still owes PUBLISH
+    let inf = hub.inflight.get_mut(&client).unwrap();
+    inf.pending.clear();
+    inf.outstanding.clear();
+    inf.orphaned_qos2.insert(1, offset); // unmatched in the bounded replay
+    delivery(&mut hub, &client, 2, QoS::ExactlyOnce).await;
+    hub.pub_comp(&client, 2).await;
+    assert_eq!(
+        store.pending(&client, 0, 10).await.unwrap().len(),
+        2,
+        "an unmatched ID may still own a queued message, not an orphan"
+    );
+    assert_eq!(store.outbound(&client).await.unwrap().len(), 2);
+    let inf = hub.inflight.get_mut(&client).unwrap();
+    inf.next_pkid = 0;
+    inf.block_remaining = 10;
+    assert_eq!(hub.alloc_pkid(&client), Some(3), "reserve both identities");
+}
+
+#[tokio::test]
+async fn a_failed_outbound_snapshot_refuses_attach_instead_of_republishing() {
+    let (mut hub, store, client) = fixture();
+    delivery(&mut hub, &client, 7, QoS::ExactlyOnce).await;
+    drop(hub);
+    store
+        .outbound_failures
+        .lock()
+        .unwrap()
+        .push_back(StorageError::NoQuorum);
+    let tx = start_hub_with_arc(store.clone());
+    let outcome = timeout(
+        Duration::from_secs(5),
+        attach_outcome(&tx, client.as_str(), 2),
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(outcome, AttachOutcome::Unavailable),
+        "an unreadable ID table is not an empty ID table: {outcome:?}"
+    );
+    assert_eq!(store.outbound(&client).await.unwrap()[0].packet_id, 7);
+    assert_eq!(store.pending(&client, 0, 10).await.unwrap().len(), 1);
 }
 
 #[tokio::test]

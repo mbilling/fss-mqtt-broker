@@ -37,7 +37,7 @@ and that state replicates with the session. The outbound equivalent does not exi
 - `advance_outbound(client, packet_id, phase)` — on PUBREC (phase → `AwaitingPubComp`),
   i.e. "PUBREL territory": the subscriber has the message; only the release handshake
   remains
-- `clear_outbound(client, packet_id)` — on PUBCOMP
+- `clear_outbound(client, packet_id)` — after PUBCOMP and durable queue retirement
 - `outbound(client) -> Vec<(packet_id, offset, phase)>` — read at session restore
 
 QoS 1 deliveries are **deliberately excluded**: a fresh-id `DUP` redelivery is what
@@ -141,6 +141,49 @@ client-visible difference is that a crash in this window now yields a spurious
 PUBREL (spec-legal, MQTT-4.3.3) where it previously yielded a duplicate PUBLISH
 (a `QoS` 2 violation).
 
-Still unclosed, and tracked in #533: the quorum-replicated backend is
-unexercised, as is the clearance-FAILURE boundary — a different state, whose
-orphan-record tolerance `pub_comp` documents separately.
+At that point the quorum-replicated backend and clearance-failure boundary
+remained unexercised. Those follow-ups moved to #577 (0057-T8), rather than
+being silently closed with #533.
+
+## Completion retirement amendment — #577
+
+Ordering alone is insufficient: a successful prefix no-op says nothing about
+retirement of a later completed delivery. The ID must remain reserved until a
+**successful durable prefix covers its own offset**, then its metadata clear
+succeeds. Failed writes never advance the durable watermark. Repeated PUBCOMP
+is not evidence that an unknown ID is an orphan.
+
+- `CompletedQos2` retains completed deliveries in the quota/ID reservation until
+  retirement. The sweep retries failed queue/ID writes without another client
+  packet; the subscriber owes nothing after PUBCOMP. Orphan clearance retries too.
+- `SessionStore::ack_durable` / `ReplicatedLog::truncate_durable` establish full
+  retirement durability. Clustered retirement requires a write quorum even if
+  a previous lazy truncate already changed local state. Local redb uses immediate
+  durability. Ordinary QoS 1 `ack` / `truncate` remain lazy.
+- Restore refuses an unreadable outbound-ID snapshot before admitting the
+  connection. All recovered IDs are reserved before replay allocation; matched
+  offsets pin the prefix, and unmatched IDs also pin it until resolved. Absence
+  from the bounded replay window is not proof of absence from storage. Orphan
+  clearance verifies prefix absence and establishes durable retirement first.
+- Session metadata read-modify-write operations are serialized per client within
+  the shared `ReplicatedSessionStore`. Otherwise clearance of one ID could erase
+  a concurrently recorded ID or phase. Weak lock entries are pruned; unrelated
+  clients do not share an async I/O lock. This is not a substitute for the log's
+  owner/epoch fencing, nor a cross-instance transaction mechanism.
+
+**Compatibility differs from the #533-only repair above:** no wire, disk-schema,
+config or state-path change, but these are stronger public backend contracts.
+Their defaults fail closed for implementations that do not support durable
+retirement. Custom stores/logs must implement or delegate them. Older binaries
+remain format-compatible but do not acquire these correctness guarantees merely
+by sharing a cluster; rollback reintroduces their completion hazards.
+
+Evidence is in `hub/tests/qos2_retirement*` (14 cases) and
+`mqtt-storage/src/logged/metadata_concurrency.rs` (two cases). Five deliberate
+mutations are caught: lazy quorum retirement, premature clearance, pre-write
+watermark advancement, completed-ID reuse, and missing restored-offset tracking.
+The quorum fixture uses production group routing, cluster logs and redb replicas
+with controlled transport/lease failures, not a real Raft/network HA experiment.
+The local fixture closes/reopens redb. This does not establish general replay
+pagination or stalled-store isolation: bounded replay can still require another
+reconnect; QoS 2 storage awaits remain on the hub loop (#575/#405).

@@ -773,13 +773,15 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::sink_records_through_a_trait_object`
 - `tests::tampering_with_any_field_changes_the_head`
 
-## `crates/mqtt-storage/src/lib.rs` — 87 test(s)
+## `crates/mqtt-storage/src/lib.rs` — 89 test(s)
 
 - `app_props::tests::converts_to_and_from_core_properties_losslessly`
 - `app_props::tests::encode_decode_roundtrips_and_fails_closed`
 - `data_dir::tests::creates_a_missing_directory`
 - `data_dir::tests::stamps_on_first_use_and_rejects_a_foreign_node`
 - `logged::export_order_tests::the_queue_is_read_before_the_metadata_that_covers_it`
+- `logged::metadata_concurrency::clearing_one_id_cannot_erase_a_concurrent_delivery_identity`
+- `logged::metadata_concurrency::metadata_lock_pruning_and_waiter_cancellation_preserve_exclusion`
 - `logged::tests::a_pre_0057_record_decodes_with_an_empty_outbound_window`
 - `logged::tests::ack_truncates_and_is_idempotent`
 - `logged::tests::an_unacked_inbound_qos2_id_survives_reopen_and_is_not_reported_as_a_duplicate`
@@ -909,7 +911,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 366 test(s)
+## `crates/mqttd/src/lib.rs` — 380 test(s)
 
 - `admission::tests::the_global_cap_refuses_at_the_bound_and_recovers`
 - `admission::tests::the_penalty_box_refuses_after_the_threshold`
@@ -1201,6 +1203,20 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::publisher_disconnect_mid_append_resolves_the_obligation_without_panic`
 - `hub::tests::publishes_forward_only_to_peers_with_matching_interest`
 - `hub::tests::qos0_is_not_subject_to_receive_maximum`
+- `hub::tests::qos2_retirement::a_failed_clear_reserves_the_id_and_retries_without_another_client_packet`
+- `hub::tests::qos2_retirement::a_failed_inline_truncate_retries_the_same_watermark`
+- `hub::tests::qos2_retirement::a_failed_orphan_clear_retries_without_another_pubcomp`
+- `hub::tests::qos2_retirement::a_failed_outbound_snapshot_refuses_attach_instead_of_republishing`
+- `hub::tests::qos2_retirement::a_later_qos2_completion_keeps_its_id_behind_an_outstanding_prefix`
+- `hub::tests::qos2_retirement::a_local_disk_restart_keeps_the_original_qos2_release_identity`
+- `hub::tests::qos2_retirement::a_qos1_ack_retires_later_completed_qos2_ids_only_after_the_prefix_is_safe`
+- `hub::tests::qos2_retirement::a_repeated_pubcomp_cannot_clear_an_id_after_failed_truncation`
+- `hub::tests::qos2_retirement::an_id_outside_the_replay_window_pins_the_prefix`
+- `hub::tests::qos2_retirement::an_unreleased_orphan_is_cleared_without_republishing`
+- `hub::tests::qos2_retirement::quorum::a_failed_clear_after_quorum_truncation_recovers_as_an_orphan`
+- `hub::tests::qos2_retirement::quorum::a_not_owner_truncate_keeps_the_id_for_the_successor`
+- `hub::tests::qos2_retirement::quorum::a_quorum_truncate_failure_keeps_the_id_through_owner_loss`
+- `hub::tests::qos2_retirement::restored_qos2_offsets_pin_the_prefix_until_each_handshake_completes`
 - `hub::tests::queued_message_expires_once_its_interval_elapses`
 - `hub::tests::queued_message_survives_while_its_interval_remains`
 - `hub::tests::quota_backlog_spills_to_store_on_persistent_detach`
