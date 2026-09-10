@@ -480,9 +480,11 @@ impl Hub {
                             );
                             return DurableOutcome::Ok;
                         }
-                        self.send_to_client(client, &tx, &message, retain, message_expiry, None);
-                        if let Some(m) = &self.metrics {
-                            m.publish_delivered(qos_num(qos));
+                        if self.send_to_client(client, &tx, &message, retain, message_expiry, None)
+                        {
+                            if let Some(m) = &self.metrics {
+                                m.publish_delivered(qos_num(qos));
+                            }
                         }
                         DurableOutcome::Ok
                     }
@@ -508,9 +510,10 @@ impl Hub {
                 let _ = self.submit_passthrough(client, &message, message_expiry, Some(conn_id));
                 return DurableOutcome::Ok;
             }
-            self.send_to_client(client, &tx, &message, retain, message_expiry, None);
-            if let Some(m) = &self.metrics {
-                m.publish_delivered(qos_num(qos));
+            if self.send_to_client(client, &tx, &message, retain, message_expiry, None) {
+                if let Some(m) = &self.metrics {
+                    m.publish_delivered(qos_num(qos));
+                }
             }
             return DurableOutcome::Ok;
         }
@@ -1066,6 +1069,10 @@ impl Hub {
     /// the packet reaches the wire. It is tracked as owed here, whether the message goes
     /// out now or waits in the flow-control backlog, and released when the subscriber
     /// acknowledges it.
+    ///
+    /// Returns whether a packet was queued on the connection (or parked in the
+    /// `QoS` > 0 backlog). `false` means the client is gone or a shed-legal `QoS` 0
+    /// was dropped — the caller must not count it `delivered`.
     pub(super) fn send_to_client(
         &mut self,
         client: &ClientId,
@@ -1074,8 +1081,18 @@ impl Hub {
         retain: bool,
         message_expiry: Option<u32>,
         offset: Option<Offset>,
-    ) {
+    ) -> bool {
         let limits = self.subscriber_limits;
+        // Issue #504: a closed outbound means the connection task has ended and
+        // a Detach is already queued. Checking BEFORE the `outbound-full` cap
+        // is load-bearing — a subscriber that fell behind then disconnected
+        // leaves `depth == MAX_OUTBOUND_QUEUE`, and the old order kept shedding
+        // into a cap that would never drain, never noticing the channel was
+        // closed, and never giving the `$share` turn to a live member.
+        if tx.is_closed() {
+            self.reap_closed_connection(client);
+            return false;
+        }
         // `QoS` 0 owes no acknowledgement, so a replayed one is settled the moment it is
         // handed to the channel — only `QoS` > 0 becomes owed.
         if let Some(offset) = offset.filter(|_| message.qos != QoS::AtMostOnce) {
@@ -1116,11 +1133,9 @@ impl Hub {
                     topic = %message.topic,
                     "outbound queue full: shedding QoS 0 for a subscriber that is not reading"
                 );
-                return;
+                return false;
             }
-            // Ignore send errors: a closed channel means the client is gone and a
-            // Detach is already in flight.
-            let _ = tx.send(publish_packet(
+            if !tx.send(publish_packet(
                 &message.topic,
                 message.payload.clone(),
                 QoS::AtMostOnce,
@@ -1130,8 +1145,11 @@ impl Hub {
                 message_expiry,
                 &message.app,
                 &self.matching_sub_ids(client, &message.topic),
-            ));
-            return;
+            )) {
+                self.reap_closed_connection(client);
+                return false;
+            }
+            return true;
         }
 
         // QoS > 0: respect the client's Receive Maximum (ADR 0012). If the quota is
@@ -1185,6 +1203,7 @@ impl Hub {
         } else {
             let _ = self.send_qos_publish(client, tx, message, retain, message_expiry, offset);
         }
+        true
     }
 
     /// Put one `QoS` > 0 message on the wire: allocate a packet id, register it in the
@@ -1236,11 +1255,15 @@ impl Hub {
         message_expiry: Option<u32>,
         offset: Option<Offset>,
     ) -> QosSend {
+        if tx.is_closed() {
+            self.reap_closed_connection(client);
+            return QosSend::Sent;
+        }
         // A `QoS` 0 parked in the backlog purely for wire order (issue #242
         // finding A — reachable only from the drain): no packet id, no pending
         // entry, no quota — it goes straight out in its FIFO slot.
         if message.qos == QoS::AtMostOnce {
-            let _ = tx.send(publish_packet(
+            if !tx.send(publish_packet(
                 &message.topic,
                 message.payload.clone(),
                 QoS::AtMostOnce,
@@ -1250,7 +1273,10 @@ impl Hub {
                 message_expiry,
                 &message.app,
                 &self.matching_sub_ids(client, &message.topic),
-            ));
+            )) {
+                self.reap_closed_connection(client);
+                return QosSend::Sent;
+            }
             if let Some(m) = &self.metrics {
                 m.publish_delivered(0);
             }
@@ -1382,6 +1408,13 @@ impl Hub {
             return;
         };
         loop {
+            // Issue #504: reap a closed outbound *before* popping, so a persistent
+            // session's backlog still spills via `flush_backlog_to_store` rather
+            // than losing the front entry to a send that never reached the wire.
+            if tx.is_closed() {
+                self.reap_closed_connection(client);
+                return;
+            }
             let inf = self.inflight.entry(client.clone()).or_default();
             // A staged outbound-id record halts the drain (issue #242 finding A):
             // its delivery owns the wire next; the record's completion sends it
@@ -1400,7 +1433,11 @@ impl Hub {
                 entry.message_expiry,
                 entry.offset,
             ) {
-                QosSend::Sent => {}
+                QosSend::Sent => {
+                    if !self.online.contains_key(client) {
+                        return;
+                    }
+                }
                 // Staged: the entry is consumed, but nothing further may pass the
                 // staged record. Deferred: the entry went back to the front;
                 // retrying in this same loop would spin against a store that just
