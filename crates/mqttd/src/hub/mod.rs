@@ -8080,13 +8080,14 @@ mod tests {
     /// cap and then vanished (Detach still queued behind leftover Publishes)
     /// must not keep stealing the group's turns.
     ///
-    /// Production shape: prefer-local, QoS 0, the dead member's channel sits at
+    /// Production shape: prefer-local, `QoS` 0, the dead member's channel sits at
     /// `MAX_OUTBOUND_QUEUE`. The old send path checked the cap BEFORE
     /// `is_closed()`, shed `outbound-full` forever, and never gave a live
     /// member the message. Mutation: restore that order, or skip the reap, and
     /// `live` receives nothing of the control traffic.
     #[tokio::test(start_paused = true)]
     async fn a_closed_outbound_at_the_qos0_cap_does_not_steal_shared_deliveries() {
+        const CONTROL: usize = 8;
         let metrics = std::sync::Arc::new(mqtt_observability::metrics::Metrics::new("t"));
         let (mut hub, tx) = Hub::with_config(
             NodeId("hub-test".into()),
@@ -8112,7 +8113,6 @@ mod tests {
         subscribe(&tx, "live", "$share/g/t");
         ping(&tx).await;
 
-        const CONTROL: usize = 8;
         for _ in 0..CONTROL {
             publish(&tx, "t", b"ctrl");
         }
@@ -8208,13 +8208,12 @@ mod tests {
             })
             .unwrap();
             ping(&tx).await;
-            loop {
-                match recv_packet(&mut observer).await {
-                    Some(Packet::Publish(_)) => return true,
-                    Some(_) => continue,
-                    None => return false,
+            while let Some(pkt) = recv_packet(&mut observer).await {
+                if matches!(pkt, Packet::Publish(_)) {
+                    return true;
                 }
             }
+            false
         }
 
         assert!(
