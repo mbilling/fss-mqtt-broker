@@ -1090,7 +1090,7 @@ impl Hub {
         // into a cap that would never drain, never noticing the channel was
         // closed, and never giving the `$share` turn to a live member.
         if tx.is_closed() {
-            self.reap_closed_connection(client);
+            self.reap_closed_connection(client, true);
             return false;
         }
         // `QoS` 0 owes no acknowledgement, so a replayed one is settled the moment it is
@@ -1146,7 +1146,7 @@ impl Hub {
                 &message.app,
                 &self.matching_sub_ids(client, &message.topic),
             )) {
-                self.reap_closed_connection(client);
+                self.reap_closed_connection(client, true);
                 return false;
             }
             return true;
@@ -1256,7 +1256,7 @@ impl Hub {
         offset: Option<Offset>,
     ) -> QosSend {
         if tx.is_closed() {
-            self.reap_closed_connection(client);
+            self.reap_closed_connection(client, true);
             return QosSend::Sent;
         }
         // A `QoS` 0 parked in the backlog purely for wire order (issue #242
@@ -1274,7 +1274,7 @@ impl Hub {
                 &message.app,
                 &self.matching_sub_ids(client, &message.topic),
             )) {
-                self.reap_closed_connection(client);
+                self.reap_closed_connection(client, true);
                 return QosSend::Sent;
             }
             if let Some(m) = &self.metrics {
@@ -1412,7 +1412,7 @@ impl Hub {
             // session's backlog still spills via `flush_backlog_to_store` rather
             // than losing the front entry to a send that never reached the wire.
             if tx.is_closed() {
-                self.reap_closed_connection(client);
+                self.reap_closed_connection(client, true);
                 return;
             }
             let inf = self.inflight.entry(client.clone()).or_default();

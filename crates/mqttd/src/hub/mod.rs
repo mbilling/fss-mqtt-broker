@@ -1806,6 +1806,16 @@ pub struct Hub {
     /// stale detach cannot fire a later connection's will, and so the *real*
     /// `Detach` — which is the only place that knows `graceful` — can still
     /// honour [MQTT-3.14.4-3] after the session has left `online`.
+    ///
+    /// Not swept, unlike [`pending_wills`](Self::pending_wills): a time-based
+    /// drain would have to guess `graceful`, and either firing or dropping the
+    /// will would violate [MQTT-3.14.4-3]. The map cannot leak in production —
+    /// `conn.rs` sends `Detach` on every exit after a successful attach
+    /// (including a failed CONNACK write), unbounded, adjacent to the
+    /// `connections_active` decrement. Each entry lives only until that
+    /// already-queued Detach is processed. Tests that drop the outbound without
+    /// Detach are the only path that leaves an entry; they send Detach
+    /// afterwards or drop the hub.
     parked_wills: HashMap<(ClientId, u64), Will>,
     /// Sweep-tick counter that paces the durable expiry reconcile (ADR 0009 §3).
     expiry_reconcile_tick: u32,
@@ -4629,7 +4639,14 @@ impl Hub {
     /// The will is parked rather than fired: only `Detach` knows `graceful`, and
     /// a clean DISCONNECT's Detach can sit in the same backlog. The later Detach
     /// applies or discards it.
-    fn reap_closed_connection(&mut self, client: &ClientId) {
+    ///
+    /// `gossip` is true on the single-client send path so a clean-start discard
+    /// announces immediately, matching detach. The sweep backstop passes false
+    /// and gossips **once** after the batch — `gossip_interest` is not
+    /// debounced, and N discards would otherwise rebuild `local_interest` plus
+    /// `shared_snapshot` (and clone both per peer) N times on the routing
+    /// thread.
+    fn reap_closed_connection(&mut self, client: &ClientId, gossip: bool) {
         let Some(online) = self.online.get(client) else {
             return;
         };
@@ -4654,7 +4671,9 @@ impl Hub {
         match self.session_expiry.get(client).copied() {
             None | Some(0) => {
                 self.discard_session(client);
-                self.gossip_interest();
+                if gossip {
+                    self.gossip_interest();
+                }
             }
             Some(SESSION_EXPIRY_NEVER) => {
                 self.flush_backlog_to_store(client);
@@ -4704,6 +4723,10 @@ impl Hub {
     /// Sweep-tick backstop for issue #504: reap every online session whose
     /// connection task has already ended, including publishers that no leftover
     /// publish will ever try to send to. Returns how many were reaped.
+    ///
+    /// One extra O(online) walk per tick, beside the three `refresh_gauges`
+    /// already makes over `inflight` (#526). This pass has to read
+    /// `tx.is_closed()` and mutate `online`, so it is not folded into those.
     fn reap_closed_outbounds(&mut self) -> usize {
         let dead: Vec<ClientId> = self
             .online
@@ -4713,9 +4736,12 @@ impl Hub {
             .collect();
         let n = dead.len();
         for client in dead {
-            self.reap_closed_connection(&client);
+            self.reap_closed_connection(&client, false);
         }
         if n > 0 {
+            // Once, not once per session: a 10k leftover (the #504 shape) must
+            // not rebuild interest snapshots 10k times on this tick.
+            self.gossip_interest();
             info!(
                 reaped = n,
                 "reaped sessions whose connections already ended (#504)"
@@ -4883,7 +4909,8 @@ impl Hub {
         // Issue #504: connections_active can hit 0 while sessions linger in
         // `online`, because Detach shares the unbounded hub queue with leftover
         // Publishes. The sweep runs even while that queue is deep (select is
-        // fair) and reaps any outbound that has already closed.
+        // fair) and reaps any outbound that has already closed. Fourth O(online)
+        // pass this tick; see `reap_closed_outbounds` / #526.
         let _ = self.reap_closed_outbounds();
 
         // Ring-change watch (ADR 0043 P2): any placement member-set change moves
