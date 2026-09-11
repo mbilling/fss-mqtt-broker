@@ -173,7 +173,7 @@ pub struct ProcNode {
     /// advertises (`MQTTD_PEER_ADVERTISE`).
     pub relay_addr: String,
     pub relay: RelayCtl,
-    pub _relay_abort: AbortHandle,
+    pub relay_abort: AbortHandle,
     /// When set, the process runs under an OS-enforced `RLIMIT_FSIZE` of this
     /// many 512-byte blocks (`sh -c 'ulimit -f N; exec …'` — unprivileged): a
     /// real filesystem bound. A write crossing it gets `SIGXFSZ` from the
@@ -188,6 +188,13 @@ pub struct ProcNode {
     /// default; the P3 rolling-upgrade test points it at a BASELINE build and
     /// back, one node at a time (ADR 0044 P3 / ADR 0039).
     pub binary: PathBuf,
+}
+
+impl Drop for ProcNode {
+    fn drop(&mut self) {
+        self.relay_abort.abort();
+        // The child is kill-on-drop, including setup failures before Proc owns us.
+    }
 }
 
 /// A fixed (test-only) gossip key so the mesh runs authenticated, as deployed.
@@ -277,6 +284,7 @@ impl ProcNode {
             None => tokio::process::Command::new(&self.binary),
         };
         let child = cmd
+            .kill_on_drop(true)
             .env("MQTTD_NODE_ID", &self.id)
             .env("MQTTD_PLAINTEXT_BIND", self.client_addr.to_string())
             .env("MQTTD_ALLOW_ANONYMOUS", "1")
@@ -578,7 +586,7 @@ pub async fn build_topology(seed: u64, root: &std::path::Path) -> Vec<ProcNode> 
             swim_seeds,
             relay_addr,
             relay,
-            _relay_abort: relay_abort,
+            relay_abort,
             file_size_limit_blocks: None,
             extra_env: Vec::new(),
             binary: PathBuf::from(env!("CARGO_BIN_EXE_mqttd")),
@@ -1251,7 +1259,13 @@ pub async fn wait_all_ready(nodes: &mut [ProcNode], seed: u64) {
         }
         if Instant::now() >= deadline {
             for n in nodes.iter() {
-                eprintln!("---- log tail of {} ----\n{}", n.id, log_tail(&n.log_path));
+                eprintln!(
+                    "---- {} readyz={:?} statusz={:?} ----\n{}",
+                    n.id,
+                    http_get(n.health_addr, "/readyz").await,
+                    http_get(n.health_addr, "/statusz").await,
+                    log_tail(&n.log_path)
+                );
             }
             panic!("seed {seed}: spawned cluster never became ready — every node is still RUNNING but did not converge (log tails above)");
         }

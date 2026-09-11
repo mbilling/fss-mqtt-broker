@@ -91,6 +91,26 @@ and the evidence.
 | 0062-T11 | ✅ done | — | 2026-08-15 | "CI FOUND THIS ON MAIN, as a flake: `the_cluster_id_is_read_fresh_for_every_export_not_snapshotted_at_startup` failed with `two runs, two files: [ONE file]`. The cause was not the test. The export name carries milliseconds and its own comment claimed that made two exports two files rather than `one silently overwriting the other` - but `std::fs::rename` REPLACES, so two exports of one node that started inside the SAME millisecond left one file: the older generation destroyed, with no error, no log line and no metric. Milliseconds made it rare, not impossible, and a CI runner over an in-memory store is fast enough to hit it. THE FIX WAITS FOR THE CLOCK rather than nudging the name: bumping only the filename would leave both headers carrying the same created_unix_ms, and select_generations REFUSES a directory holding two exports of one node with equal timestamps (`which one is newer is not decidable`) - trading a silent loss for a directory nothing can be restored from. Leaving the occupied millisecond makes the name AND the recorded moment genuinely distinct, bounded by NAME_WAIT_MAX_MS=1000 and then refused loudly. Plus a second, independent guard: the rename REFUSES if the name was claimed during the scan, naming both paths, leaving the .partial as this run evidence for the next run clean_stale_partials. TESTS, both mutation-proven INDEPENDENTLY because the two mechanisms mask each other: an_export_whose_name_is_taken_leaves_the_existing_file_intact occupies a 200ms BAND of names so the collision is certain on any machine (removing the name choice -> RED with the guard refusal quoted), and an_export_refuses_rather_than_replace_a_name_claimed_during_its_scan drives the residual race through a RetainedSource that claims the band WHILE it is read - the one point between name choice and rename a test can reach (removing the guard -> RED). A third, an_export_never_takes_a_name_another_export_already_owns, pins the naming rule where its input can be fixed. Deliberately NOT shipped: a `run it twice and count the files` test, which passes with the fix removed on a slower machine - that is exactly how this reached main." |
 <!-- /status-table:0062 -->
 
+## Maintenance: restart readiness and authority (#597, 2026-09-11)
+
+- Reproduced the single-node restored restart failure: health reported Ready
+  before the MQTT listener bound, so the subscriber's TCP connection was refused.
+  Startup readiness now waits for every configured client bind. A held credential
+  FIFO gives a deterministic process regression; removing the production gate
+  makes it fail. A unit control keeps liveness and the other readiness predicates
+  independent. Twelve post-fix restart controls passed without reconnect retries.
+- Restored files do not grant ownership. A disk-backed regression rejects reads
+  and appends under absent/stale authority, then recovers the surviving replicas'
+  newer data and acknowledged-prefix watermark under a legitimate new epoch.
+  This is a controlled lease/transport fixture, not a live Raft failover proof.
+- Standalone children are killed/reaped on drop; spawned cluster children are
+  kill-on-drop and their relay tasks are aborted even before a schedule owns the
+  topology. Two unwind regressions check cleanup. Failed formation now prints
+  readiness/status snapshots as well as node log tails.
+- The historical multi-node formation timeout is **not yet root-caused** by the
+  reproduced socket-bind race. Keep #597 open for that remaining investigation;
+  do not erase the failure or describe passing reruns as its repair.
+
 ## Why this shape
 
 Issue #249's two acceptable exits were "ship an online export + import with a documented

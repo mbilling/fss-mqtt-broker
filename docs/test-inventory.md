@@ -242,7 +242,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `two_bridge_instances_do_not_duplicate_forwarding`
 - `two_partitioned_instances_deliver_each_inbound_message_exactly_once`
 
-## `crates/mqtt-cluster/src/lib.rs` — 290 test(s)
+## `crates/mqtt-cluster/src/lib.rs` — 291 test(s)
 
 - `cluster_identity::tests::a_founder_mints_once_and_reloads_stably`
 - `cluster_identity::tests::a_joiner_adopts_once_and_persists`
@@ -305,6 +305,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `cluster_store::tests::recovery_below_quorum_fails_closed_with_noquorum`
 - `cluster_store::tests::recovery_of_a_truncated_key_continues_offsets_above_the_watermark`
 - `cluster_store::tests::recovery_refuses_a_quorum_of_hollow_replicas`
+- `cluster_store::tests::restart::returning_disk_copy_needs_current_authority_and_recovers_newer_history`
 - `cluster_store::tests::takeover_recommits_an_adopted_orphan_to_a_write_quorum`
 - `cluster_store::tests::takeover_recovers_a_keys_log_from_the_shared_replica_state`
 - `cluster_store::tests::the_ownership_gate_follows_the_committed_lease_in_both_directions`
@@ -911,7 +912,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 380 test(s)
+## `crates/mqttd/src/lib.rs` — 381 test(s)
 
 - `admission::tests::the_global_cap_refuses_at_the_bound_and_recovers`
 - `admission::tests::the_penalty_box_refuses_after_the_threshold`
@@ -1030,6 +1031,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `health::tests::readyz_gates_on_min_members`
 - `health::tests::rejoining_the_cluster_clears_the_quarantine`
 - `health::tests::serves_a_real_http_request_over_tcp`
+- `health::tests::startup_must_finish_before_readiness_but_does_not_override_other_gates`
 - `health::tests::statusz_reports_identity_members_brownout_and_proto`
 - `health::tests::statusz_reports_the_derived_write_floor_and_its_source`
 - `health::tests::statusz_reports_the_store_self_measurement`
@@ -1349,12 +1351,15 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 
 - `export_and_restore_wall_clock_at_stated_fixtures` — `#[ignore]`d
 
-## `crates/mqttd/tests/backup_restore.rs` — 4 test(s)
+## `crates/mqttd/tests/backup_restore.rs` — 7 test(s)
 
 - `a_live_cluster_export_restores_sessions_retained_and_acked_facts`
 - `a_restore_whose_format_stamp_does_not_match_refuses_and_the_node_does_not_start`
 - `a_restored_node_restarts_with_its_own_unchanged_environment`
+- `cleanup::partially_constructed_cluster_is_reaped_when_setup_panics`
+- `cleanup::standalone_is_reaped_when_setup_panics`
 - `sigusr2_on_a_node_with_no_backup_dir_is_a_no_op_not_a_death`
+- `startup::a_live_process_is_not_ready_while_client_startup_is_held`
 
 ## `crates/mqttd/tests/binary_smoke.rs` — 11 test(s)
 

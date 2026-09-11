@@ -80,6 +80,10 @@ tokio = { workspace = true, features = ["test-util"] }
 # Already in the tree via mqtt-cluster's dev-dependencies.
 tempfile = "3"
 
+[target.'cfg(unix)'.dev-dependencies]
+# A nonblocking FIFO holds startup at real credential loading for readiness tests.
+rustix = { version = "1", features = ["fs"] }
+
 [lints]
 workspace = true
 

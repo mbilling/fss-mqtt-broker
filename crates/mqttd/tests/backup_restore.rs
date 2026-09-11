@@ -20,8 +20,14 @@
 //! lie), **retained values with their properties**, and **acknowledged QoS-2 flows** (the
 //! dedup window's acked bit, issue #238 — the fact that is invisible unless you re-send).
 
+#[cfg(unix)]
+#[path = "backup_restore/cleanup.rs"]
+mod cleanup;
 mod common;
 mod proc_common;
+#[cfg(unix)]
+#[path = "backup_restore/startup.rs"]
+mod startup;
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -836,6 +842,10 @@ impl Standalone {
     }
 
     fn spawn(&mut self) {
+        assert!(
+            self.child.is_none(),
+            "stop the previous process before respawning"
+        );
         let log = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -892,6 +902,12 @@ impl Standalone {
             let _ = c.kill();
             let _ = c.wait();
         }
+    }
+}
+
+impl Drop for Standalone {
+    fn drop(&mut self) {
+        self.stop();
     }
 }
 
@@ -1045,7 +1061,12 @@ async fn a_restored_node_restarts_with_its_own_unchanged_environment() {
         Duration::from_secs(20),
     )
     .await
-    .expect("the restored subscriber reconnects after the restart");
+    .unwrap_or_else(|| {
+        panic!(
+            "the restored subscriber reconnects after the restart\n{}",
+            restored.log()
+        )
+    });
     assert!(
         present,
         "the restored session must still be there after an ordinary restart:\n{}",

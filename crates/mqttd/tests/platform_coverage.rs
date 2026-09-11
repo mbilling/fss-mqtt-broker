@@ -34,6 +34,12 @@ fn every_platform_gated_suite_compiled_on_this_runner() {
          Linux runner for the `test` job or port the suite."
     );
 
+    // backup_restore.rs has Unix-only FIFO and process-cleanup regressions.
+    assert!(
+        !in_ci || cfg!(unix),
+        "backup_restore.rs uses #[cfg(unix)] for startup/cleanup controls; this CI run must exercise them"
+    );
+
     // crates/mqttd/tests/decommission.rs — #![cfg(unix)]
     assert!(
         !in_ci || cfg!(unix),
@@ -55,6 +61,7 @@ fn the_mirrored_predicates_still_describe_the_suites() {
     for (file, pred) in [
         ("memory_watermark.rs", "#![cfg(target_os = \"linux\")]"),
         ("decommission.rs", "#![cfg(unix)]"),
+        ("backup_restore.rs", "#[cfg(unix)]"),
     ] {
         let src = std::fs::read_to_string(dir.join(file))
             .unwrap_or_else(|e| panic!("read tests/{file}: {e}"));
