@@ -1054,6 +1054,8 @@ async fn a_restored_node_restarts_with_its_own_unchanged_environment() {
     );
 
     // And the restored state survived the restart — the reason the boot had to succeed.
+    // Ready now includes the MQTT binds (#597). Keep one connection attempt:
+    // retrying a refused TCP connection would mask a regression in that gate.
     let (_sub, present) = common::Client::connect_v311_within(
         restored.client,
         sub_id,

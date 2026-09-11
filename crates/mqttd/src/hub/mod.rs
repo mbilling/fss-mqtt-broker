@@ -335,6 +335,19 @@ impl Outbound {
     pub fn bytes(&self) -> usize {
         self.bytes.load(Ordering::Relaxed)
     }
+
+    /// Whether the connection's reader half is gone (issue #504).
+    ///
+    /// A closed channel means the connection task has already ended and a
+    /// `Detach` is in flight — but `Detach` shares the hub's unbounded command
+    /// queue with every `Publish`, so under overload it can sit behind millions
+    /// of leftover frames. Callers that would otherwise keep treating this
+    /// client as live (shed `outbound-full`, steal a `$share` turn) must check
+    /// this first.
+    #[must_use]
+    pub fn is_closed(&self) -> bool {
+        self.tx.is_closed()
+    }
 }
 
 /// How many packets may sit unwritten for one client before `QoS 0` is shed.
@@ -1788,6 +1801,22 @@ pub struct Hub {
     /// longer owns the session would be worse than not delaying at all. Recorded
     /// in `docs/TEST-PLAN.md`'s policy register rather than left to be discovered.
     pending_wills: HashMap<ClientId, (Will, Instant)>,
+    /// Wills of connections already reaped because their outbound closed before
+    /// `Detach` was processed (issue #504). Keyed by `(client, conn_id)` so a
+    /// stale detach cannot fire a later connection's will, and so the *real*
+    /// `Detach` — which is the only place that knows `graceful` — can still
+    /// honour [MQTT-3.14.4-3] after the session has left `online`.
+    ///
+    /// Not swept, unlike [`pending_wills`](Self::pending_wills): a time-based
+    /// drain would have to guess `graceful`, and either firing or dropping the
+    /// will would violate [MQTT-3.14.4-3]. The map cannot leak in production —
+    /// `conn.rs` sends `Detach` on every exit after a successful attach
+    /// (including a failed CONNACK write), unbounded, adjacent to the
+    /// `connections_active` decrement. Each entry lives only until that
+    /// already-queued Detach is processed. Tests that drop the outbound without
+    /// Detach are the only path that leaves an entry; they send Detach
+    /// afterwards or drop the hub.
+    parked_wills: HashMap<(ClientId, u64), Will>,
     /// Sweep-tick counter that paces the durable expiry reconcile (ADR 0009 §3).
     expiry_reconcile_tick: u32,
     /// Sweep-tick counter driving the retained anti-entropy cadence (issue #87),
@@ -2209,6 +2238,7 @@ impl Hub {
                 node_id,
                 online: HashMap::new(),
                 pending_wills: HashMap::new(),
+                parked_wills: HashMap::new(),
                 session_expiry: HashMap::new(),
                 expiring: HashMap::new(),
                 expiry_reconcile_tick: 0,
@@ -4473,7 +4503,29 @@ impl Hub {
     ) {
         // Only act if this is still the current connection; a stale detach from a
         // connection that was already taken over must not disturb the new one.
+        // Issue #504: the connection may already have been reaped because its
+        // outbound closed while this Detach sat behind leftover Publishes — apply
+        // a parked will with the *real* graceful flag, then return.
         if self.online.get(client).map(|s| s.conn_id) != Some(conn_id) {
+            // A #504 reap may have already discarded a clean-start session; a
+            // persistent one is still here. Honour a DISCONNECT Session Expiry
+            // override against that remainder before the parked will, so delay
+            // is bounded by the revised lifetime [MQTT-3.14.2-2 / §3.1.3.2.2].
+            let still_here =
+                self.session_expiry.contains_key(client) || self.has_materialized_subs(client);
+            if still_here {
+                if let Some(secs) = session_expiry_override {
+                    if secs == 0 {
+                        self.session_expiry.remove(client);
+                    } else {
+                        self.session_expiry.insert(client.clone(), secs);
+                    }
+                }
+            }
+            self.apply_parked_will(client, conn_id, graceful).await;
+            if still_here && session_expiry_override.is_some() {
+                self.settle_detached_session(client).await;
+            }
             return;
         }
         let departed = self.online.remove(client);
@@ -4510,30 +4562,16 @@ impl Hub {
         // [MQTT-3.14.4-3]; DISCONNECT discards it [MQTT-3.14.4-3].
         if !graceful {
             if let Some(w) = departed.and_then(|o| o.will) {
-                // §3.1.3.2.2 (issue #299): publish when the delay elapses OR the
-                // session ends, whichever comes FIRST — so the hold is bounded by
-                // the session's own lifetime, and a session that expires at once
-                // (interval 0) publishes at once no matter what delay was asked
-                // for. Will Delay exists so a brief reconnect does not announce a
-                // death that did not happen; without the bound it could outlive
-                // the very session it describes.
-                let expiry = self.session_expiry.get(client).copied().unwrap_or(0);
-                let hold = w.delay_secs.min(expiry);
-                if hold == 0 {
-                    info!(client = %client.0, topic = %w.message.topic, "publishing will (ungraceful disconnect)");
-                    self.publish_will(&w.message).await;
-                } else {
-                    let due = Instant::now() + Duration::from_secs(u64::from(hold));
-                    info!(
-                        client = %client.0, topic = %w.message.topic, delay_s = hold,
-                        "holding will (will delay interval)"
-                    );
-                    self.pending_wills.insert(client.clone(), (w, due));
-                }
+                self.arm_or_publish_will(client, w).await;
             }
         }
         // Session retention (ADR 0009): expiry 0 discards now; u32::MAX keeps the
         // session indefinitely; a finite interval schedules expiry for the sweep.
+        self.settle_detached_session(client).await;
+    }
+
+    /// Apply ADR 0009 session retention after the connection has left `online`.
+    async fn settle_detached_session(&mut self, client: &ClientId) {
         match self.session_expiry.get(client).copied() {
             None | Some(0) => {
                 self.discard_session(client);
@@ -4556,6 +4594,160 @@ impl Hub {
                 info!(client = %client.0, expires_in_s = secs, "client detached (session expiring)");
             }
         }
+    }
+
+    /// Apply a will parked by [`reap_closed_connection`](Self::reap_closed_connection)
+    /// once the real `Detach` arrives with its graceful flag (issue #504).
+    async fn apply_parked_will(&mut self, client: &ClientId, conn_id: u64, graceful: bool) {
+        let Some(w) = self.parked_wills.remove(&(client.clone(), conn_id)) else {
+            return;
+        };
+        if graceful {
+            return;
+        }
+        self.arm_or_publish_will(client, w).await;
+    }
+
+    /// Publish a will now, or hold it for its delay, bounded by the session's
+    /// remaining lifetime (§3.1.3.2.2, issue #299): publish when the delay
+    /// elapses OR the session ends, whichever comes first.
+    async fn arm_or_publish_will(&mut self, client: &ClientId, w: Will) {
+        let expiry = self.session_expiry.get(client).copied().unwrap_or(0);
+        let hold = w.delay_secs.min(expiry);
+        if hold == 0 {
+            info!(client = %client.0, topic = %w.message.topic, "publishing will (ungraceful disconnect)");
+            self.publish_will(&w.message).await;
+        } else {
+            let due = Instant::now() + Duration::from_secs(u64::from(hold));
+            info!(
+                client = %client.0, topic = %w.message.topic, delay_s = hold,
+                "holding will (will delay interval)"
+            );
+            self.pending_wills.insert(client.clone(), (w, due));
+        }
+    }
+
+    /// A connection whose outbound reader is gone is no longer live, even if its
+    /// `Detach` is still queued behind leftover `Publish` commands (issue #504).
+    ///
+    /// The original overload leak: `connections_active` reached 0 (Detach was
+    /// *sent*) while `mqttd_sessions` stayed at thousands, because the hub was
+    /// still draining an unbounded publish backlog and every `$share` turn kept
+    /// selecting those dead members — shedding `outbound-full` into a cap that
+    /// would never drain, never noticing the channel was closed.
+    ///
+    /// The will is parked rather than fired: only `Detach` knows `graceful`, and
+    /// a clean DISCONNECT's Detach can sit in the same backlog. The later Detach
+    /// applies or discards it.
+    ///
+    /// `gossip` is true on the single-client send path so a clean-start discard
+    /// announces immediately, matching detach. The sweep backstop passes false
+    /// and gossips **once** after the batch — `gossip_interest` is not
+    /// debounced, and N discards would otherwise rebuild `local_interest` plus
+    /// `shared_snapshot` (and clone both per peer) N times on the routing
+    /// thread.
+    fn reap_closed_connection(&mut self, client: &ClientId, gossip: bool) {
+        let Some(online) = self.online.get(client) else {
+            return;
+        };
+        if !online.tx.is_closed() {
+            return;
+        }
+        let conn_id = online.conn_id;
+        debug!(
+            client = %client.0,
+            conn_id,
+            "reaping session whose connection already ended; Detach still queued (#504)"
+        );
+        let departed = self.online.remove(client);
+        self.shared.set_client_online(client, false);
+        if let Some(inf) = self.inflight.get_mut(client) {
+            inf.pending
+                .retain(|_, p| p.state != OutState::AwaitingIdRecord);
+        }
+        if let Some(w) = departed.and_then(|o| o.will) {
+            self.parked_wills.insert((client.clone(), conn_id), w);
+        }
+        match self.session_expiry.get(client).copied() {
+            None | Some(0) => {
+                self.discard_session(client);
+                if gossip {
+                    self.gossip_interest();
+                }
+            }
+            Some(SESSION_EXPIRY_NEVER) => {
+                self.flush_backlog_to_store(client);
+            }
+            Some(secs) => {
+                self.flush_backlog_to_store(client);
+                let deadline = self.clock.now_epoch_secs() + u64::from(secs);
+                self.expiring.insert(client.clone(), deadline);
+                // Reap is sync (the QoS 0 send path cannot await). The deadline is
+                // already in `expiring`, so the sweep still expires the session if
+                // this write lags. Same not-owner skip as `persist_detach_deadline`.
+                if self.durable_plane.is_some() && self.clustered() && !self.owns_session(client) {
+                    warn!(
+                        client = %client.0,
+                        deadline,
+                        "session expiry deadline NOT persisted: this node does not own the \
+                         session's group, so the group-routed write cannot land (ADR 0009 §3). \
+                         The new owner inherits no deadline until the client reconnects \
+                         (issue #284)"
+                    );
+                    if let Some(m) = &self.metrics {
+                        m.session_expiry_unpersisted("not-owner");
+                    }
+                } else {
+                    let store = self.store.clone();
+                    let client = client.clone();
+                    let metrics = self.metrics.clone();
+                    self.spawn_owned(async move {
+                        if let Err(e) = store.set_session_expiry(&client, Some(deadline)).await {
+                            warn!(
+                                client = %client.0,
+                                deadline,
+                                error = %e,
+                                "failed to persist the session expiry deadline (ADR 0009 §3); \
+                                 the session may outlive its stated interval if its owner changes"
+                            );
+                            if let Some(m) = metrics {
+                                m.session_expiry_unpersisted("error");
+                            }
+                        }
+                    });
+                }
+            }
+        }
+    }
+
+    /// Sweep-tick backstop for issue #504: reap every online session whose
+    /// connection task has already ended, including publishers that no leftover
+    /// publish will ever try to send to. Returns how many were reaped.
+    ///
+    /// One extra O(online) walk per tick, beside the three `refresh_gauges`
+    /// already makes over `inflight` (#526). This pass has to read
+    /// `tx.is_closed()` and mutate `online`, so it is not folded into those.
+    fn reap_closed_outbounds(&mut self) -> usize {
+        let dead: Vec<ClientId> = self
+            .online
+            .iter()
+            .filter(|(_, o)| o.tx.is_closed())
+            .map(|(c, _)| c.clone())
+            .collect();
+        let n = dead.len();
+        for client in dead {
+            self.reap_closed_connection(&client, false);
+        }
+        if n > 0 {
+            // Once, not once per session: a 10k leftover (the #504 shape) must
+            // not rebuild interest snapshots 10k times on this tick.
+            self.gossip_interest();
+            info!(
+                reaped = n,
+                "reaped sessions whose connections already ended (#504)"
+            );
+        }
+        n
     }
 
     /// Persist a detaching session's ABSOLUTE expiry deadline (ADR 0009 §3), or say — out
@@ -4713,6 +4905,13 @@ impl Hub {
             );
             self.publish_will(&will.message).await;
         }
+
+        // Issue #504: connections_active can hit 0 while sessions linger in
+        // `online`, because Detach shares the unbounded hub queue with leftover
+        // Publishes. The sweep runs even while that queue is deep (select is
+        // fair) and reaps any outbound that has already closed. Fourth O(online)
+        // pass this tick; see `reap_closed_outbounds` / #526.
+        let _ = self.reap_closed_outbounds();
 
         // Ring-change watch (ADR 0043 P2): any placement member-set change moves
         // group ownership (growth moves ~1/N of the groups onto the joiner), so it
@@ -6779,6 +6978,26 @@ mod tests {
         .unwrap();
     }
 
+    /// Flush the hub command queue: a reply-bearing Ping cannot be answered until
+    /// everything queued ahead of it has been handled.
+    async fn ping(tx: &HubTx) {
+        let (reply, wait) = oneshot::channel();
+        tx.send(HubCommand::Ping { reply }).unwrap();
+        timeout(Duration::from_secs(5), wait)
+            .await
+            .expect("the hub should answer a ping")
+            .expect("the hub should still be running");
+    }
+
+    fn gauge_value(metrics: &mqtt_observability::metrics::Metrics, name: &str) -> i64 {
+        let prefix = format!("{name} ");
+        metrics
+            .render()
+            .lines()
+            .find_map(|l| l.strip_prefix(&prefix)?.trim().parse().ok())
+            .unwrap_or(0)
+    }
+
     fn subscribe(tx: &HubTx, client: &str, filter: &str) {
         tx.send(HubCommand::Subscribe {
             client: ClientId(client.into()),
@@ -7881,6 +8100,156 @@ mod tests {
         assert!(
             !out.contains("no-shared-member"),
             "the silent-discard arm fired unexpectedly; got:\n{out}"
+        );
+    }
+
+    /// Issue #504 remaining symptom: a `$share` member that filled its outbound
+    /// cap and then vanished (Detach still queued behind leftover Publishes)
+    /// must not keep stealing the group's turns.
+    ///
+    /// Production shape: prefer-local, `QoS` 0, the dead member's channel sits at
+    /// `MAX_OUTBOUND_QUEUE`. The old send path checked the cap BEFORE
+    /// `is_closed()`, shed `outbound-full` forever, and never gave a live
+    /// member the message. Mutation: restore that order, or skip the reap, and
+    /// `live` receives nothing of the control traffic.
+    #[tokio::test(start_paused = true)]
+    async fn a_closed_outbound_at_the_qos0_cap_does_not_steal_shared_deliveries() {
+        const CONTROL: usize = 8;
+        let metrics = std::sync::Arc::new(mqtt_observability::metrics::Metrics::new("t"));
+        let (mut hub, tx) = Hub::with_config(
+            NodeId("hub-test".into()),
+            std::sync::Arc::new(MemorySessionStore::new()),
+        );
+        hub.set_shared_prefer_local(true);
+        hub.attach_metrics(metrics.clone());
+        tokio::spawn(hub.run());
+
+        let (dead_rx, _) = attach(&tx, "dead", 1, true).await;
+        subscribe(&tx, "dead", "$share/g/t");
+        ping(&tx).await;
+
+        // Fill the dead member's outbound to the QoS 0 cap without reading it —
+        // the overload shape: a consumer that stopped draining, then dropped.
+        for _ in 0..super::MAX_OUTBOUND_QUEUE {
+            publish(&tx, "t", b"fill");
+        }
+        ping(&tx).await;
+        drop(dead_rx);
+
+        let (mut live_rx, _) = attach(&tx, "live", 2, true).await;
+        subscribe(&tx, "live", "$share/g/t");
+        ping(&tx).await;
+
+        for _ in 0..CONTROL {
+            publish(&tx, "t", b"ctrl");
+        }
+        ping(&tx).await;
+
+        let mut got = 0usize;
+        while recv_packet(&mut live_rx).await.is_some() {
+            got += 1;
+        }
+        assert!(
+            got >= CONTROL - 1,
+            "the live member must take the control traffic once the dead \
+             outbound is closed; got {got} of {CONTROL} (one QoS 0 loss at \
+             the reap is legal). drops:\n{}",
+            metrics.render()
+        );
+        assert_eq!(
+            dropped_for(&metrics, "outbound-full"),
+            0,
+            "a closed outbound at the cap must be reaped, not shed into forever; got:\n{}",
+            metrics.render()
+        );
+    }
+
+    /// Issue #504 session leak: clean-start sessions whose connections have
+    /// ended must leave `online` without waiting for a Detach that is stuck
+    /// behind leftover Publishes. Publishers (no subscriptions, so no send
+    /// path) are reaped by the sweep.
+    #[tokio::test(start_paused = true)]
+    async fn a_closed_clean_start_session_is_reaped_without_waiting_for_detach() {
+        let metrics = std::sync::Arc::new(mqtt_observability::metrics::Metrics::new("t"));
+        let (mut hub, tx) = Hub::with_config(
+            NodeId("hub-test".into()),
+            std::sync::Arc::new(MemorySessionStore::new()),
+        );
+        hub.attach_metrics(metrics.clone());
+        tokio::spawn(hub.run());
+
+        let (rx, _) = attach(&tx, "pub", 1, true).await;
+        ping(&tx).await;
+        tokio::time::sleep(super::SESSION_SWEEP_INTERVAL * 2).await;
+        assert_eq!(
+            gauge_value(&metrics, "mqttd_sessions"),
+            1,
+            "the attached session must be visible before we drop it"
+        );
+
+        drop(rx);
+        // No Detach. Leftover publishes to an unrelated topic keep the hub busy
+        // the way the overload backlog did — they cannot themselves reap a
+        // publisher with no subscription.
+        for _ in 0..32 {
+            publish(&tx, "other", b"x");
+        }
+        ping(&tx).await;
+        tokio::time::sleep(super::SESSION_SWEEP_INTERVAL * 2).await;
+
+        assert_eq!(
+            gauge_value(&metrics, "mqttd_sessions"),
+            0,
+            "a clean-start session whose connection is gone must be reaped \
+             without a Detach; got:\n{}",
+            metrics.render()
+        );
+    }
+
+    /// Issue #504: reaping must not fire a will, because only the real Detach
+    /// knows whether the close was a graceful DISCONNECT. A parked will is
+    /// discarded on a graceful Detach and published on an ungraceful one.
+    #[tokio::test(start_paused = true)]
+    async fn a_reaped_session_still_honours_the_real_detach_graceful_flag_for_its_will() {
+        async fn run(graceful: bool) -> bool {
+            let tx = start_hub();
+            let (mut observer, _) = attach(&tx, "obs", 1, true).await;
+            subscribe(&tx, "obs", "will/t");
+            let will = Message {
+                topic: "will/t".into(),
+                payload: Bytes::from_static(b"w"),
+                qos: QoS::AtMostOnce,
+                retain: false,
+                app: AppProperties::default(),
+                expires_at: None,
+            };
+            let (rx, _) = attach_with_will(&tx, "c", 2, true, will).await;
+            ping(&tx).await;
+            drop(rx);
+            tokio::time::sleep(super::SESSION_SWEEP_INTERVAL * 2).await;
+            tx.send(HubCommand::Detach {
+                client: ClientId("c".into()),
+                conn_id: 2,
+                graceful,
+                session_expiry_override: None,
+            })
+            .unwrap();
+            ping(&tx).await;
+            while let Some(pkt) = recv_packet(&mut observer).await {
+                if matches!(pkt, Packet::Publish(_)) {
+                    return true;
+                }
+            }
+            false
+        }
+
+        assert!(
+            !run(true).await,
+            "a graceful DISCONNECT must discard the will even if the session was reaped first"
+        );
+        assert!(
+            run(false).await,
+            "an ungraceful close must still fire the will after a #504 reap"
         );
     }
 

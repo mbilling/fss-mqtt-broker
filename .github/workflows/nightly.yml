@@ -39,7 +39,7 @@ jobs:
       - name: Re-check the recorded histories independently
         run: cargo run -p history-check -- target/proc-histories/*.jsonl
       - name: Archive the checked histories
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: proc-histories
           path: target/proc-histories/
@@ -198,7 +198,7 @@ jobs:
         with:
           version: v3.16.3
       - name: Install kind
-        uses: helm/kind-action@ef37e7f390d99f746eb8b610417061a60e82a6cc # v1
+        uses: helm/kind-action@06c1ae10762d3b9c1644e7fe69596ae519e015a2 # v1.15.0
         with:
           install_only: true
       # ADR 0047 T5: stand up the chart as a real 3-node cluster in kind, prove it forms, drains
@@ -222,7 +222,7 @@ jobs:
           toolchain: stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: Install kind
-        uses: helm/kind-action@ef37e7f390d99f746eb8b610417061a60e82a6cc # v1
+        uses: helm/kind-action@06c1ae10762d3b9c1644e7fe69596ae519e015a2 # v1.15.0
         with:
           install_only: true
       # ADR 0055 T7: the runtime proof for the reconciler. Creates a cluster from
