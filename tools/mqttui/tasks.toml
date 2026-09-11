@@ -745,6 +745,18 @@ duration = "~1s"
 hidden = true
 
 [[task]]
+id = "gen-configuration"
+group = "Internal"
+name = "Regenerate the config reference"
+script = "scripts/gen-configuration.py"
+# Reads mqtt-config source and rewrites docs/CONFIGURATION.md.
+needs_checkout = true
+about = "Generates docs/CONFIGURATION.md from mqtt_config ENV_VARS; CI runs --check so the file cannot drift from the code."
+requires = ["python3"]
+duration = "~1s"
+hidden = true
+
+[[task]]
 id = "check-reason-codes"
 group = "Internal"
 name = "Check every emittable reason code has a test"
