@@ -186,4 +186,6 @@ The quorum fixture uses production group routing, cluster logs and redb replicas
 with controlled transport/lease failures, not a real Raft/network HA experiment.
 The local fixture closes/reopens redb. This does not establish general replay
 pagination or stalled-store isolation: bounded replay can still require another
-reconnect; QoS 2 storage awaits remain on the hub loop (#575/#405).
+reconnect; QoS 2 storage awaits remain on the hub loop (#575/#405). ADR 0076's
+amendments falsified default store sharding/linger; #403 is not a prerequisite
+for that isolation work.

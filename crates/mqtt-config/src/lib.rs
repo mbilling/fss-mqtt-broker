@@ -1660,6 +1660,9 @@ pub const ENV_VARS: &[&str] = &[
     "MQTTD_TLS_KEY",
     "MQTTD_TLS_CLIENT_CA",
     "MQTTD_TLS_CRL",
+    "MQTTD_TLS_SESSION_CACHE",
+    "MQTTD_TLS_ALLOW_TLS12",
+    "MQTTD_TLS_ALLOW_UNSAFE_TLS12_FEATURES",
     // security
     "MQTTD_ALLOW_ANONYMOUS",
     "MQTTD_MTLS_IDENTITY_SOURCE",
@@ -1734,6 +1737,9 @@ pub const ENV_VARS: &[&str] = &[
     "MQTTD_SHUTDOWN_GRACE",
     "MQTTD_READY_MIN_MEMBERS",
     "MQTTD_CONFIG_WATCH",
+    "MQTTD_CONFIG_UNKNOWN_KEYS",
+    // audit (ADR 0066 T3)
+    "MQTTD_AUDIT_SYSLOG",
     // backup (ADR 0062)
     "MQTTD_BACKUP_DIR",
     "MQTTD_BACKUP_EVERY",
@@ -2216,13 +2222,16 @@ mod tests {
             | "MQTTD_OIDC_ALLOW_HTTP"
             | "MQTTD_RESTORE_PARTIAL_ACCEPT_DATA_LOSS"
             | "MQTTD_ALLOW_EPHEMERAL_DURABILITY"
-            | "MQTTD_ALLOW_RELAXED_PUBLISH" => "1",
+            | "MQTTD_ALLOW_RELAXED_PUBLISH"
+            | "MQTTD_TLS_ALLOW_TLS12"
+            | "MQTTD_TLS_ALLOW_UNSAFE_TLS12_FEATURES" => "1",
             // Enums: any valid, non-default (default None) member.
             "MQTTD_SWIM_SIGNED" | "MQTTD_SWIM_REPLAY" => "require",
             "MQTTD_QUEUE_OVERFLOW" => "reject-newest",
             "MQTTD_MTLS_IDENTITY_SOURCE" => "san-dns",
             // Default is "members" (ADR 0073), so only the escape hatch *changes* it.
             "MQTTD_OWNERSHIP_DOMAIN" => "voters",
+            "MQTTD_CONFIG_UNKNOWN_KEYS" => "warn",
             // The default is the derived `majority` posture (#239), so only an
             // explicit integer *changes* it.
             "MQTTD_MIN_REPLICAS" => "2",
@@ -2260,7 +2269,8 @@ mod tests {
             | "MQTTD_CONFIG_WATCH"
             | "MQTTD_OIDC_JWKS_REFRESH"
             | "MQTTD_OIDC_MAX_STALE"
-            | "MQTTD_BACKUP_EVERY" => "7",
+            | "MQTTD_BACKUP_EVERY"
+            | "MQTTD_TLS_SESSION_CACHE" => "7",
             // The default is already 7 (backup.keep) / 300 (restore timeout), so "7" would
             // change nothing and the totality sweep would read as a missing mapping.
             "MQTTD_BACKUP_KEEP" | "MQTTD_RESTORE_TIMEOUT" => "3",
@@ -2378,8 +2388,11 @@ mod tests {
             // plus MQTTD_ALLOW_RELAXED_PUBLISH (ADR 0072),
             // plus MQTTD_OWNERSHIP_DOMAIN (ADR 0073),
             // plus MQTTD_SWIM_ADVERTISE (issue #396),
-            // plus MQTTD_SHARED_PREFER_LOCAL (ADR 0077 T4 follow-up).
-            89,
+            // plus MQTTD_SHARED_PREFER_LOCAL (ADR 0077 T4 follow-up),
+            // plus MQTTD_TLS_SESSION_CACHE / MQTTD_TLS_ALLOW_TLS12 /
+            // MQTTD_TLS_ALLOW_UNSAFE_TLS12_FEATURES / MQTTD_CONFIG_UNKNOWN_KEYS /
+            // MQTTD_AUDIT_SYSLOG (0070-T3: overlay already consumed them).
+            94,
             "the MQTTD_* surface changed — update ENV_VARS"
         );
         // Issue #239: MQTTD_MIN_REPLICAS was wired in `overlay_from` but never

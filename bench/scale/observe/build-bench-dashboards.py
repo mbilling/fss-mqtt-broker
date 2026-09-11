@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Derive the bench stack's dashboards from the demo ones, adding a phase strip.
+"""Derive the bench stack's dashboards from the production ones, adding a phase strip.
 
-The demo dashboards ship to users; `bench_run_phase` is pushed by bench/scale's
-run.sh and would sit permanently at "no data" there, so the strip cannot simply
-be added to the originals. Instead this writes a DERIVED copy for the bench
-stack, with a new uid/title so both can coexist in one Grafana.
+The production dashboards ship under `deploy/observability/grafana/`;
+`bench_run_phase` is pushed by bench/scale's run.sh and would sit permanently
+at "no data" there, so the strip cannot simply be added to the originals.
+Instead this writes a DERIVED copy for the bench stack, with a new uid/title
+so both can coexist in one Grafana.
 
 Why a strip on the broker overview at all: during provisioning and teardown there
 is legitimately nothing to scrape, and a blank panel is indistinguishable from a
@@ -12,14 +13,14 @@ dead collector. The strip makes the blank state say what it is. Whoever is
 watching the broker panels is exactly who needs that answer, which is why it is
 not enough to have it only on the dedicated run-status dashboard.
 
-Regenerate after changing demo/grafana/dashboards/*.json:
+Regenerate after changing deploy/observability/grafana/*.json:
     python3 bench/scale/observe/build-bench-dashboards.py
 """
 import json
 import pathlib
 
 ROOT = pathlib.Path(__file__).resolve().parents[3]
-SRC = ROOT / "demo/grafana/dashboards"
+SRC = ROOT / "deploy/observability/grafana"
 DST = pathlib.Path(__file__).resolve().parent / "dashboards"
 DS = {"type": "prometheus", "uid": "prometheus"}
 STRIP_H = 3  # rows of grid the strip occupies; everything else shifts down by it

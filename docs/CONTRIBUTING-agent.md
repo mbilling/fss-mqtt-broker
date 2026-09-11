@@ -1,6 +1,6 @@
 # Contributing as an agent (Claude Code sessions)
 
-The git workflow for AI-agent sessions working on this repository. Human contributors:
+**Verified against `v1.0.16` (2026-09-11).** The git workflow for AI-agent sessions working on this repository. Human contributors:
 most of this applies to you too, minus the sandbox constraints.
 
 ## Branch model

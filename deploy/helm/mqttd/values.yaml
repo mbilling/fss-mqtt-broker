@@ -312,6 +312,12 @@ metrics:
     enabled: false
     interval: 30s
     labels: {}
+  # Prometheus Operator alerting (ADR 0070 T4). Off by default so a cluster
+  # without the PrometheusRule CRD still installs. Expressions and runbooks:
+  # docs/OPERATIONS.md § Shipped alerting.
+  prometheusRule:
+    enabled: false
+    labels: {}
 
 # --- Pod placement / resources -------------------------------------------------------------
 resources: {}

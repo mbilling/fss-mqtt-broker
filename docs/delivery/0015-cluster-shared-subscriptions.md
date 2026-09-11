@@ -45,9 +45,10 @@ tasks:
     evidence: "SharedGroupsWire carries per-member liveness (client,qos,online); shared_snapshot tags each member from self.online; inbound gossip builds hub::RemoteSharedGroup with the bit; select_shared prefers any member online on its home node (local or gossiped-remote) and falls back to local-persistent then any-remote, so an offline-at-home remote member is no longer chosen over a live one. Test shared_selection_skips_an_offline_remote_member; round-robin + peer roundtrip still green."
   - id: 0015-T9
     title: "ADR prose matches shipped selection: document the locality preference (#511 default) and the indexed remote path (#481/#524) alongside the original global-round-robin description, and state the load-distribution consequence"
-    status: planned
+    status: in-progress
+    date: 2026-09-11
     issue: 574
-    notes: "Selection policy is operator-visible: with locality on, a consumer's share of a shared group follows its host node's share of publishers, not round-robin across the group — an operator sizing a $share fan-in from the current ADR text would predict even distribution and measure skew. MQTT leaves shared selection implementation-defined, so this is documentation accuracy, not a conformance defect; fairness/spillover itself is a separate option under #537 Phase 3. Raised by the 2026-09-06 scaling review.
+    evidence: "Dated As delivered notes on docs/adr/0010-shared-subscriptions.md and docs/adr/0015-cluster-shared-subscriptions.md (original Decision text kept). Operator consequence also in CLIENT-GUIDE.md Shared subscriptions and OPERATIONS.md shipped-alerting intro: with locality on, a consumer's share follows its host node's publisher share, not even group-wide round-robin. Fairness/spillover remains #537 Phase 3."
 ---
 
 # Delivery — ADR 0015: Cluster-wide shared subscriptions
@@ -86,7 +87,7 @@ flags as costs, not unbuilt mechanism.
 | 0015-T6 | ✅ done | — | 2026-06-17 | shared_subscription_delivers_once_cluster_wide (cluster_chaos.rs); v5_shared_subscription_round_robins_one_member_each |
 | 0015-T7 | ✅ done | — | 2026-06-24 | "PeerMessage::SharedDeliver gained message_expiry: Option<u32>; send_shared_to_peer carries the publisher's interval and the RemoteSharedDeliver handler applies it to deliver_to_client instead of None. Peer roundtrip covers the wire field." |
 | 0015-T8 | ✅ done | — | 2026-06-24 | "SharedGroupsWire carries per-member liveness (client,qos,online); shared_snapshot tags each member from self.online; inbound gossip builds hub::RemoteSharedGroup with the bit; select_shared prefers any member online on its home node (local or gossiped-remote) and falls back to local-persistent then any-remote, so an offline-at-home remote member is no longer chosen over a live one. Test shared_selection_skips_an_offline_remote_member; round-robin + peer roundtrip still green." |
-| 0015-T9 | ⬜ planned | [#574](https://github.com/mbilling/fss-mqtt-broker/issues/574) | — | "Selection policy is operator-visible: with locality on, a consumer's share of a shared group follows its host node's share of publishers, not round-robin across the group — an operator sizing a $share fan-in from the current ADR text would predict even distribution and measure skew. MQTT leaves shared selection implementation-defined, so this is documentation accuracy, not a conformance defect; fairness/spillover itself is a separate option under #537 Phase 3. Raised by the 2026-09-06 scaling review. |
+| 0015-T9 | 🚧 in-progress | [#574](https://github.com/mbilling/fss-mqtt-broker/issues/574) | 2026-09-11 | "Dated As delivered notes on docs/adr/0010-shared-subscriptions.md and docs/adr/0015-cluster-shared-subscriptions.md (original Decision text kept). Operator consequence also in CLIENT-GUIDE.md Shared subscriptions and OPERATIONS.md shipped-alerting intro: with locality on, a consumer's share follows its host node's publisher share, not even group-wide round-robin. Fairness/spillover remains #537 Phase 3." |
 <!-- /status-table:0015 -->
 
 ## Changelog
@@ -96,5 +97,10 @@ flags as costs, not unbuilt mechanism.
   cleanly separated ordinary vs. shared delivery paths removing the double-delivery (T3),
   one-named-recipient `SharedDeliver` apply (T4), and the single-node-preserving selection
   policy (T5) — proven exactly-once cluster-wide in `cluster_chaos.rs` (T6). Cross-node
-  message-expiry (T7) and liveness-aware selection (T8) recorded as deferred trade-offs.
+  message-expiry (T7) and liveness-aware selection (T8) shipped 2026-06-24 (see those
+  tasks' evidence); the ADR Consequences costs that still name them as limits are
+  amended by the 2026-06-24 as-delivered note, not rewritten.
+- **2026-09-11** — T9: ADR 0010/0015 as-delivered notes for locality-preferring
+  selection (default since #511) and `remote_by_filter` (#481/#524), with the
+  operator load-distribution consequence. Issue #574.
 </content>

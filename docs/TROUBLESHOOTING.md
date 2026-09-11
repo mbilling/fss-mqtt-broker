@@ -1,6 +1,6 @@
 # Troubleshooting
 
-The failures a first deployment actually hits, and how to read them. Terms in *italics*
+**Verified against `v1.0.16` (2026-09-11).** The failures a first deployment actually hits, and how to read them. Terms in *italics*
 are in the [glossary](GLOSSARY.md).
 
 ## Clients cannot connect over TLS

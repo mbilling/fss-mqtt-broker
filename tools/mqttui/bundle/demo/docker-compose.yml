@@ -193,7 +193,7 @@ services:
       GF_USERS_DEFAULT_THEME: dark
     volumes:
       - ./grafana/provisioning:/etc/grafana/provisioning:ro
-      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - ../deploy/observability/grafana:/var/lib/grafana/dashboards:ro
     ports: ["3000:3000"]
     depends_on: [prometheus]
 

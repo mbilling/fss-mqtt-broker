@@ -111,6 +111,18 @@ delivery per node that has a member**, not one cluster-wide.
   so `RemoteSharedDeliver` resolves them locally on the target node — `SharedMemberWire` and
   `WireAppProps` stay unchanged.
 
+**As delivered (2026-09-11, issue #574 / 0015-T9).** The Decision text above is
+the original round-robin design and is not rewritten. Shipped selection is
+**locality-preferring** (`MQTTD_SHARED_PREFER_LOCAL`, default **on** since
+#511): when the publishing node has any online group member, the cursor rotates
+among that local online prefix only. Remote members are reached through the
+`remote_by_filter` index (#481 / #524) when this node hosts none. Cluster-wide
+single delivery remains [ADR 0015](0015-cluster-shared-subscriptions.md).
+**Operator consequence:** a consumer's share of a `$share` group follows its
+*host node's* share of publishers, not even round-robin across the group.
+MQTT leaves member selection implementation-defined; fairness/spillover is a
+separate option under #537 Phase 3, not a spec defect.
+
 ## Alternatives considered
 
 - **Fold shared groups into `SubscriptionTable`.** Rejected: round-robin cursor state

@@ -1,6 +1,6 @@
 # Bridge deployment topologies
 
-How to run the boundary bridge ([ADR 0025](adr/0025-boundary-bridge.md)) as a
+**Verified against `v1.0.16` (2026-09-11).** How to run the boundary bridge ([ADR 0025](adr/0025-boundary-bridge.md)) as a
 single instance or as an HA pair, and what each one does and does not buy you.
 
 The bridge is an ordinary **MQTT client of both sides** — not a broker plugin and
@@ -273,7 +273,7 @@ rate(fss_bridge_dropped_total{reason="spool-full"}[5m])   # actual message loss
 ```
 
 The Grafana dashboard at
-[`../demo/grafana/dashboards/mqttd-bridge.json`](../demo/grafana/dashboards/mqttd-bridge.json)
+[`../deploy/observability/grafana/mqttd-bridge.json`](../deploy/observability/grafana/mqttd-bridge.json)
 has panels for all three.
 
 ---

@@ -89,6 +89,24 @@ single-node behaviour is unchanged.
   its home node (which then queues it) even when a local member is online — an
   acceptable, spec-permitted selection quality trade-off.
 
+**As delivered (2026-09-11, issue #574 / 0015-T9).** The Decision text above
+still describes originator-selects over the *whole* group; that is the accepted
+design and is not rewritten. Shipped selection is **locality-preferring**
+(default on since #511) with an indexed remote path (`remote_by_filter`,
+#481/#524). When locality is on, the cursor's rotation domain is the local
+online prefix; remotes are consulted only when this node has no online member.
+**Load-distribution consequence for operators:** a worker's share follows the
+publisher share of the node it is connected to, not even group-wide
+round-robin. Size `$share` fan-in for that skew. Fairness/spillover remains
+#537 Phase 3.
+
+**As delivered (2026-06-24, 0015-T7 / 0015-T8).** The Consequences costs
+"SharedDeliver carries no message-expiry" and "remote member liveness is not
+known" were the deferred trade-offs at acceptance. Both shipped: expiry rides
+`PeerMessage::SharedDeliver`, and `SharedGroupsWire` carries per-member
+liveness so the selector skips an offline-at-home remote when a live member
+exists.
+
 ## Alternatives considered
 
 - **Designated owner node per group** (route all of a group's traffic through one node

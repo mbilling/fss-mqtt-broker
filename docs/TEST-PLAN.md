@@ -1,6 +1,6 @@
 # End-to-end test plan
 
-Status: living document. Tracks the integration-test strategy and the
+**Verified against `v1.0.16` (2026-09-11).** Status: living document. Tracks the integration-test strategy and the
 sunshine/darksky scenario catalog the suite is working toward.
 
 ## Where we are

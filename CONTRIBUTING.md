@@ -2,7 +2,9 @@
 
 Thanks for considering it. This document is what a contributor actually needs:
 how to build and test, what the review bar is, and the two conventions here that
-are unusual enough to trip you up if nobody says so.
+are unusual enough to trip you up if nobody says so. The binary and hub map is
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md); the stakeholder index is
+[docs/README.md](docs/README.md).
 
 ## Getting a toolchain
 

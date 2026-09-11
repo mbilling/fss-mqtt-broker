@@ -1,6 +1,16 @@
 # Migrating onto mqttd
 
-**Dated 2026-08-15.** Two halves, and you need both:
+**Dated 2026-08-15.** Per-source entry points (jump here, then come back for
+the dual-run cutover):
+
+| Source | Start |
+|---|---|
+| Mosquitto | [Mosquitto → mqttd](#mosquitto--mqttd) |
+| EMQX | [EMQX → mqttd](#emqx--mqttd) |
+| HiveMQ | [HiveMQ → mqttd](#hivemq--mqttd) |
+| Dual-run cutover (every source) | [The dual-run cutover](#the-dual-run-cutover) |
+
+Two halves, and you need both:
 
 1. **Convert the configuration.** [`scripts/migrate/`](../scripts/migrate/) has a
    converter per source broker. Each one translates what maps and marks everything

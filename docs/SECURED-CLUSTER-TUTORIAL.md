@@ -1,6 +1,6 @@
 # A secured three-node cluster, without Kubernetes
 
-This is the end-to-end walkthrough for the broker's headline feature — clustering —
+**Verified against `v1.0.16` (2026-09-11).** This is the end-to-end walkthrough for the broker's headline feature — clustering —
 outside Kubernetes. You start from a checkout and end with **three brokers on one
 host** forming one cluster with:
 

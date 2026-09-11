@@ -1,6 +1,6 @@
 # Sizing a node — the operational unknowns
 
-**Who this is for:** an operator putting mqttd on a machine with a known memory and
+**Verified against `v1.0.16` (2026-09-11).** **Who this is for:** an operator putting mqttd on a machine with a known memory and
 disk budget, deciding which limits to set before exposing it to real load.
 
 **The honest headline:** mqttd's defaults are *safe against attackers but not against

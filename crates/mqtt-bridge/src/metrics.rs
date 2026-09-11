@@ -30,7 +30,7 @@
 //! query layer — `rate(fss_bridge_forwarded_total[5m])` — because Prometheus computes them
 //! correctly across scrapes, restarts (counter resets) and multiple bridge replicas, none
 //! of which an in-process window can do. Monotonic counters are the right primitive to
-//! export; the dashboard in `demo/grafana/dashboards/mqttd-bridge.json` supplies the
+//! export; the dashboard in `deploy/observability/grafana/mqttd-bridge.json` supplies the
 //! windows.
 //!
 //! # Cardinality

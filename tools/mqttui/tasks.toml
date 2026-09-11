@@ -745,6 +745,18 @@ duration = "~1s"
 hidden = true
 
 [[task]]
+id = "gen-configuration"
+group = "Internal"
+name = "Regenerate the config reference"
+script = "scripts/gen-configuration.py"
+# Reads mqtt-config source and rewrites docs/CONFIGURATION.md.
+needs_checkout = true
+about = "Generates docs/CONFIGURATION.md from mqtt_config ENV_VARS; CI runs --check so the file cannot drift from the code."
+requires = ["python3"]
+duration = "~1s"
+hidden = true
+
+[[task]]
 id = "check-reason-codes"
 group = "Internal"
 name = "Check every emittable reason code has a test"
@@ -823,7 +835,7 @@ name = "Regenerate the bridge Grafana dashboard"
 script = "scripts/gen-bridge-dashboard.py"
 # Writes a dashboard into the repo's own observability assets.
 needs_checkout = true
-about = "Emits demo/grafana/dashboards/mqttd-bridge.json from the metric definitions."
+about = "Emits deploy/observability/grafana/mqttd-bridge.json from the metric definitions."
 requires = ["python3"]
 duration = "~1s"
 hidden = true
@@ -1117,18 +1129,18 @@ duration = "runs alongside a bench/scale run"
 id = "scale-observe-dashboards"
 group = "Benchmark"
 hidden = true
-name = "Regenerate the bench copies of the demo Grafana dashboards"
+name = "Regenerate the bench copies of the production Grafana dashboards"
 script = "bench/scale/observe/build-bench-dashboards.py"
 about = """
 Derives bench/scale/observe/dashboards/*-bench.json from
-demo/grafana/dashboards/*.json, adding the run-phase strip across the top.
+deploy/observability/grafana/*.json, adding the run-phase strip across the top.
 
-The demo dashboards ship to users, where `bench_run_phase` — pushed by
+The production dashboards ship to operators, where `bench_run_phase` — pushed by
 bench/scale's run.sh — would sit permanently at "no data", so the strip cannot
 be added to them directly. These derived copies carry it and get their own
 uid/title so both sets coexist in one Grafana.
 
-Run after changing a demo dashboard; the output is committed, so a diff after
+Run after changing a production dashboard; the output is committed, so a diff after
 running means the copies had drifted.
 """
 requires = ["python3"]
