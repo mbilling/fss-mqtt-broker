@@ -20,6 +20,8 @@
 //! lie), **retained values with their properties**, and **acknowledged QoS-2 flows** (the
 //! dedup window's acked bit, issue #238 — the fact that is invisible unless you re-send).
 
+#[path = "backup_restore/artifacts.rs"]
+mod artifacts;
 #[cfg(unix)]
 #[path = "backup_restore/cleanup.rs"]
 mod cleanup;
@@ -176,8 +178,14 @@ async fn retained_snapshot(addr: std::net::SocketAddr, id: &str, filter: &str) -
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_live_cluster_export_restores_sessions_retained_and_acked_facts() {
     let _serial = SERIAL.lock().await;
-    let seed = 249u64;
-    let root = tempfile::tempdir().expect("test root");
+    let seed = std::env::var("MQTTD_TEST_RESTORE_SEED").map_or(249, |v| {
+        v.parse::<u64>().expect("integer restore test seed")
+    });
+    let root = artifacts::Artifacts::new();
+    eprintln!(
+        "restore test seed={seed}, artifacts={}",
+        root.path().display()
+    );
     let backups = root.path().join("backups");
     std::fs::create_dir_all(&backups).unwrap();
 
