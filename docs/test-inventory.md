@@ -911,7 +911,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 380 test(s)
+## `crates/mqttd/src/lib.rs` — 383 test(s)
 
 - `admission::tests::the_global_cap_refuses_at_the_bound_and_recovers`
 - `admission::tests::the_penalty_box_refuses_after_the_threshold`
@@ -1056,6 +1056,8 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::a_clean_start_member_leaving_does_not_silently_discard`
 - `hub::tests::a_cleared_retained_topic_is_not_resurrected_after_a_restart`
 - `hub::tests::a_cleared_topic_stays_cleared_for_a_peer_that_missed_the_clear`
+- `hub::tests::a_closed_clean_start_session_is_reaped_without_waiting_for_detach`
+- `hub::tests::a_closed_outbound_at_the_qos0_cap_does_not_steal_shared_deliveries`
 - `hub::tests::a_co_subscribed_filter_releases_the_ack_while_a_moved_durable_copy_is_lost`
 - `hub::tests::a_committed_clear_back_fills_as_a_tombstone_and_fences`
 - `hub::tests::a_committed_retained_publish_fans_out_with_its_token`
@@ -1112,6 +1114,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::a_qos1_delivery_records_no_outbound_id`
 - `hub::tests::a_qos1_send_does_not_overtake_a_pending_qos2_record_to_the_same_client`
 - `hub::tests::a_qos2_packet_reaches_the_wire_only_after_its_outbound_id_is_durable`
+- `hub::tests::a_reaped_session_still_honours_the_real_detach_graceful_flag_for_its_will`
 - `hub::tests::a_reconnect_mid_record_never_sends_to_the_new_connection`
 - `hub::tests::a_recreated_topic_leaves_the_discharge_clock`
 - `hub::tests::a_refused_durable_recovery_is_counted`

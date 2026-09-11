@@ -787,16 +787,17 @@ impl Hub {
         }
         if send {
             if let Some(tx) = self.online.get(&job.client).map(|s| s.tx.clone()) {
-                self.send_to_client(
+                if self.send_to_client(
                     &job.client,
                     &tx,
                     &job.message,
                     job.retain,
                     job.message_expiry,
                     offset,
-                );
-                if let Some(m) = &self.metrics {
-                    m.publish_delivered(qos_num(job.message.qos));
+                ) {
+                    if let Some(m) = &self.metrics {
+                        m.publish_delivered(qos_num(job.message.qos));
+                    }
                 }
             }
         }
