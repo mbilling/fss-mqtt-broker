@@ -1049,7 +1049,7 @@ async fn a_restored_node_restarts_with_its_own_unchanged_environment() {
     // retried.
     let deadline = Instant::now() + Duration::from_secs(30);
     let present = loop {
-        match common::Client::connect_v311_within(
+        if let Some((_sub, present)) = common::Client::connect_v311_within(
             restored.client,
             sub_id,
             false,
@@ -1057,18 +1057,16 @@ async fn a_restored_node_restarts_with_its_own_unchanged_environment() {
         )
         .await
         {
-            Some((_sub, present)) => break present,
-            None => {
-                assert!(
-                    Instant::now() < deadline,
-                    "the restored subscriber never got a CONNACK after the restart \
-                     (/readyz was already true; a refused MQTT connect is retried, a \
-                     missing session is not):\n{}",
-                    log_notables(&restored.log_path, 40)
-                );
-                tokio::time::sleep(Duration::from_millis(200)).await;
-            }
+            break present;
         }
+        assert!(
+            Instant::now() < deadline,
+            "the restored subscriber never got a CONNACK after the restart \
+             (/readyz was already true; a refused MQTT connect is retried, a \
+             missing session is not):\n{}",
+            log_notables(&restored.log_path, 40)
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
     };
     assert!(
         present,
