@@ -1,6 +1,6 @@
 # The review panel
 
-A repeatable way to find out what this project looks like to someone who did not
+**Verified against `v1.0.16` (2026-09-11).** A repeatable way to find out what this project looks like to someone who did not
 build it.
 
 Five independent reviewers, each given a concrete identity and a real decision to

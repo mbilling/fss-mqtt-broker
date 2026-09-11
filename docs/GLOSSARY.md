@@ -1,6 +1,6 @@
 # Glossary
 
-The vocabulary the rest of the documentation assumes. Two halves: **MQTT** terms any
+**Verified against `v1.0.16` (2026-09-11).** The vocabulary the rest of the documentation assumes. Two halves: **MQTT** terms any
 broker uses, and **mqttd** terms specific to this one's clustering and security model.
 
 ## MQTT protocol

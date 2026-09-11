@@ -7,7 +7,8 @@ boilerplate is where copy-paste drift lives. The panel *intent* is the source
 here; the JSON is output.
 
 Run: python3 scripts/gen-bridge-dashboard.py
-Then: demo/grafana/dashboards/mqttd-bridge.json is rewritten in place.
+Then: deploy/observability/grafana/mqttd-bridge.json is rewritten in place.
+The experimental demo stack mounts that directory (production is the source).
 """
 
 from __future__ import annotations
@@ -15,7 +16,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-OUT = Path(__file__).resolve().parent.parent / "demo/grafana/dashboards/mqttd-bridge.json"
+OUT = Path(__file__).resolve().parent.parent / "deploy/observability/grafana/mqttd-bridge.json"
 DS = {"type": "prometheus", "uid": "prometheus"}
 
 # The instance selector is applied to every query, matching the broker dashboard.

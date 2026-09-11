@@ -18,7 +18,21 @@ Run the broker first; the claims about it can wait. The two-minute single node
 below needs only Docker, and the five-idea primer right after it defines every
 MQTT term the rest of this file leans on. Terms of art beyond those five — the
 clustering and security vocabulary — are defined at first use or in the
-[glossary](docs/GLOSSARY.md).
+[glossary](docs/GLOSSARY.md). Every stakeholder document is indexed in
+[`docs/README.md`](docs/README.md).
+
+**Where next depends on who you are:**
+
+- **evaluate it** — [EVALUATION.md](docs/EVALUATION.md), then
+  [`docs/COMPARISON.md`](docs/COMPARISON.md) (dated 2026-08-19)
+- **run it** — this page's two-minute start, then the
+  [secured three-node tutorial](docs/SECURED-CLUSTER-TUTORIAL.md) or
+  [Kubernetes](docs/KUBERNETES.md)
+- **build against it** — [CLIENT-GUIDE.md](docs/CLIENT-GUIDE.md)
+- **secure and audit it** — [THREAT-MODEL.md](docs/THREAT-MODEL.md),
+  [HARDENING.md](docs/HARDENING.md)
+- **contribute** — [ARCHITECTURE.md](docs/ARCHITECTURE.md),
+  [CONTRIBUTING.md](CONTRIBUTING.md), [TEST-PLAN.md](docs/TEST-PLAN.md)
 
 ### Try it in two minutes
 
@@ -108,6 +122,7 @@ dashboard** — operations are signals and files, on purpose
 [**Limitations**](#limitations) · [Install](#install) ·
 [Secured quickstart](#single-node-secured-tls-13--mtls--acl) ·
 [Configuration](#configuration) · [Kubernetes](#on-kubernetes-helm) ·
+[Documentation index](docs/README.md) ·
 [Performance](#performance) · [Contributing](#contributing)
 
 ## Where it stands
@@ -500,7 +515,7 @@ query layer — `rate(fss_bridge_forwarded_total[5m])` — because Prometheus co
 them correctly across counter resets and multiple bridge replicas, which an
 in-process window cannot. A ready-made Grafana dashboard with those windows,
 connection state, spool depth and loss panels is at
-[`demo/grafana/dashboards/mqttd-bridge.json`](demo/grafana/dashboards/mqttd-bridge.json).
+[`deploy/observability/grafana/mqttd-bridge.json`](deploy/observability/grafana/mqttd-bridge.json).
 
 **Running it.** The bridge ships as its own signed binary and its own hardened
 image — a separate process from the broker, as its own security rationale
@@ -1204,92 +1219,30 @@ redacted).
   `…_FILE`, the gossip key via `MQTTD_SWIM_KEY_FILE`), mounted from a Secret. The only raw secret
   a value can hold is the inline `MQTTD_SWIM_KEY`; prefer `MQTTD_SWIM_KEY_FILE`.
 
-The tables below are the authoritative reference for every `MQTTD_*` variable (and its TOML key).
+The authoritative `MQTTD_*` / TOML reference is **generated** from the
+config code and CI-checked the same way as the delivery dashboard
+([`docs/CONFIGURATION.md`](docs/CONFIGURATION.md), ADR 0070 T3). This page keeps
+the layering, the pre-flight tools, and the operator procedures below — not a
+second transcribed list that can drift.
 
-### Identity & client listeners
-| Variable | Purpose |
-|---|---|
-| `MQTTD_NODE_ID` | This node's id (default `node-local`) |
-| `MQTTD_MAX_QUEUED_MESSAGES` | Per-session offline-queue cap (default `100000`). Bounds **disk** — the durable queue — not the in-memory backlog below |
-| `MQTTD_MAX_BACKLOG_MESSAGES` | Messages one online subscriber's in-memory **flow-control backlog** holds before drop-oldest evicts (ADR 0012, 0041-T10; default `10000` = the former hard-coded `MAX_BACKLOG`; range `1..=10000000`, **`0` is refused** — the backlog must be bounded, so there is no "unbounded" setting). Bounds **RAM**, per online subscriber, per node — never disk. Worst case unset: `10 000 x (MQTTD_MAX_PACKET_SIZE + 256)` ≈ **10 GiB** at the 1 MiB default. Read at startup only (a reload reports `limits` as requires-restart) |
-| `MQTTD_MAX_BACKLOG_BYTES` | The same backlog's **byte** bound, with exact accounting (issue #241; unset = **off**, i.e. exactly the pre-#241 behaviour; if set, at least `4096`). A message counts as `256 + topic + payload + forwarded MQTT 5 application-property bytes` — not payload-only (topics and user properties are publisher-controlled) and not the encoded packet (that is version- and subscriber-dependent). Worst case when set: `MQTTD_MAX_BACKLOG_BYTES + 2 x (MQTTD_MAX_PACKET_SIZE + 256)` — one entry may exceed the whole cap and is kept so delivery still progresses, plus one already-admitted re-parked entry. Drop-oldest at the bound **sheds already-acked messages without telling the publisher** (`mqttd_publish_dropped_total{reason="backlog-overflow"}`; the WARN names the bound); a value below `MQTTD_MAX_PACKET_SIZE` makes that routine and is warned at startup. Bounds **RAM**, never disk. Startup only |
-| `MQTTD_MAX_OUTBOUND_BYTES` | Accounted bytes that may sit unwritten in one client's **outbound socket channel** before `QoS` 0 is shed (issue #241; unset = off, minimum `4096`). The fixed 10 000-**packet** cap applies either way, and only the at-most-once class is shed — control packets and `QoS` 1/2 always flow (`mqttd_publish_dropped_total{reason="outbound-full"}`). Worst case unset: `10 000 x MQTTD_MAX_PACKET_SIZE`. Bounds **RAM**. Startup only |
-| `MQTTD_MAX_INFLIGHT_MESSAGES` | Ceiling on the **effective outbound** Receive Maximum (issue #241): the broker keeps at most `min(client Receive Maximum, this)` unacked `QoS` > 0 publishes per subscriber. Unset = the client's own value verbatim, i.e. **65 535** for every v3.1.1 client and any v5 client that sends no property — worst case `65 535 x MQTTD_MAX_PACKET_SIZE`. Range `1..=65535`. A pure **gate** on the wire window: it drops nothing itself, and the surplus waits in the backlog instead. **But that is not the same as loss-free** — the backlog is drop-oldest, so holding messages back into it can make `backlog-overflow` shedding of already-acked messages *more* likely, not less. Lower this to bound RAM and to slow a subscriber that legitimately keeps thousands in flight; pair it with a backlog bound sized for the lag you expect, and watch `publish_dropped{reason="backlog-overflow"}` rather than assuming zero. Distinct from `MQTTD_RECEIVE_MAXIMUM`, which is the **inbound** grant advertised to publishers. Bounds **RAM**. Startup only |
-| `MQTTD_QUEUE_OVERFLOW` | `drop-oldest` (default) or `reject-newest` |
-| `MQTTD_TOPIC_ALIAS_MAX` | Topic Alias Maximum advertised to v5 clients (ADR 0011; default `16`, `0` disables) |
-| `MQTTD_RECEIVE_MAXIMUM` | Receive Maximum advertised to v5 clients (ADR 0012; default `256`). Exceeding it → DISCONNECT `0x93` |
-| `MQTTD_MAX_CONNECTIONS` | Global concurrent-connection cap (ADR 0041). An over-cap connection is closed **at accept, before any TLS work**; a freed slot is immediately reusable. Unset = uncapped |
-| `MQTTD_MAX_CONNECTIONS_PER_IP` | Concurrent-connection cap per source IP (ADR 0041), enforced the same way. The accounting table is bounded by live connections. Unset = uncapped |
-| `MQTTD_AUTH_PENALTY_THRESHOLD` | Auth-failure penalty box (ADR 0041): after this many failed authentications from one **source address**, its connections are closed at accept — before any Argon2 work — until the strikes decay. Keys on the address, never the username. Unset = disabled |
-| `MQTTD_AUTH_PENALTY_DECAY_SECS` | How long one auth-failure strike takes to decay (default `60`; needs `…_THRESHOLD`) |
-| `MQTTD_MAX_SUBSCRIPTIONS_PER_CLIENT` | Subscription quota (ADR 0041): a SUBSCRIBE filter beyond it is denied `0x97 Quota exceeded` (v5) / `0x80` (v3.1.1) in its SUBACK slot; in-cap filters in the same packet are granted, and re-subscribing a held filter never consumes quota. Unset = uncapped |
-| `MQTTD_MAX_PUBLISH_RATE` | Per-connection inbound publish rate (messages/second, ADR 0041). An over-rate publisher is slowed by **pausing its socket read** (TCP backpressure) — nothing is dropped, nothing is disconnected. Unset = unlimited |
-| `MQTTD_MAX_RETAINED_MESSAGES` | Retained-topic cap (ADR 0041). A retained publish creating a **new** topic beyond it is refused (`0x97` v5; v3.1.1 is delivered live but not retained, counted); overwriting or clearing an existing topic always works — the cap stops growth, never maintenance. Unset = uncapped |
-| `MQTTD_MAX_SESSIONS` | Session cap (ADR 0041). A CONNECT creating a **new** session beyond it is refused (`0x97` v5, Server-unavailable v3.1.1); resuming an existing session is never refused — a full broker keeps serving its fleet and refuses only strangers. Unset = uncapped |
-| `MQTTD_MAX_PACKET_SIZE` | Inbound packet ceiling in bytes (default 1 MiB, floor 1 KiB), advertised to v5 clients as the MQTT 5 **Maximum Packet Size** — the transport cap and the advertised contract cannot drift apart. Outbound, a message larger than the *client's* advertised maximum is dropped for that subscriber only, per spec |
-| `MQTTD_STORE_MAX_BYTES` | Disk watermark over the node's on-disk stores, total bytes (ADR 0041; needs `MQTTD_DATA_DIR`). Above it the broker **browns out**: writes that *grow* durable state (new retained topics, new sessions, offline enqueues) are refused with the quota behaviors, while subscriber acks, reads, deletes, expiry and resumes continue — a publisher's `QoS` ≥ 1 ack is refused, not granted (v5 `0x97`, v3.1.1 no ack + close, cross-node as a peer-bus verdict — an answered refusal; re-sending is the application's decision) — read-mostly, never the disk-full cliff; dropping back under restores writes. Session metadata (SUBSCRIBEs, the `QoS` 2 dedup window, detach spills) is exempt and still grows slowly, and a browned-out node keeps applying peers' committed appends into `replicas.redb` for groups it merely follows — set the mark with headroom (see SIZING). Scanned every `MQTTD_WATERMARK_POLL` seconds, so the total can overshoot the mark by one interval's growth. The mark is **aggregate** over the four stores: per-store sizes are always exported as the `store_bytes{store}` gauge, and the broker WARNs once, naming the store, when any single store passes 70% of the mark. Unset = no watermark |
-| `MQTTD_MEMORY_MAX_BYTES` | **Memory watermark** over this process's RSS, bytes (ADR 0041 T8). Above it the broker **browns out** exactly as the disk watermark does — growth writes refused; subscriber acks, reads, deletes, expiry and resumes continue, while a publisher's `QoS` ≥ 1 ack is refused, not granted — and dropping back under restores growth. Brownout is active while **either** axis is over; `brownout{axis="memory"}` and `process_resident_bytes` say which. A **watermark, not a ceiling**: nothing here stops RSS rising — the mark is sampled, so RSS can overshoot it by `MQTTD_WATERMARK_POLL x the allocation rate` (plus the allocation in flight). Set it to 75-85% of `resources.limits.memory` and keep that container/cgroup limit as the hard bound (the Helm chart ships none — set it yourself). Needs `/proc` (Linux); elsewhere the broker logs at WARN that it is not enforcing, rather than pretending. Unset = off |
-| `MQTTD_WATERMARK_POLL` | How often **both** watermark watchers (disk, memory) sample their axis, seconds (`[limits] watermark_poll_secs`, ADR 0041 T14). Default 10; range **1-300** — outside it is a startup error. Within 10% of a mark the watchers re-check every `poll / 10` with a 1 s floor, which also bounds how long a *cleared* brownout takes to lift. This is the detection-lag knob: overshoot above a mark is bounded by `poll x growth rate`, so lower it to pay for a tighter bound. Read at startup only (a reload reports `limits` as requires-restart) |
-| `MQTTD_AUTH_TIMEOUT` | Per-round enhanced-auth reply timeout, seconds (ADR 0013; default `10`) |
-| `MQTTD_DURABLE_SESSIONS` | Durable, consensus-backed replicated session store (ADR 0006/0007) — **on by default** (ADR 0029); set `0`/`false`/`off`/`no` for the lightweight in-memory store (an explicit choice: it needs no ephemeral opt-in). A node with no `MQTTD_SWIM_SEEDS` founds the lease group. On with no `MQTTD_DATA_DIR` → **REFUSED at startup** (issue #240) unless `MQTTD_ALLOW_EPHEMERAL_DURABILITY` is set |
-| `MQTTD_DATA_DIR` | Directory for on-disk persistence (ADR 0018). With durable on (default) the lease group + replicated log are on-disk, surviving a full-cluster restart (recommended for production); **unset with durable on → REFUSED at startup** (issue #240) unless the ephemeral opt-in below is set. With durable off, unset is plain in-memory |
-| `MQTTD_ALLOW_EPHEMERAL_DURABILITY` | **Dev/tests only** (issue #240): any non-empty value (presence = on) permits durable-on with **no** data dir — replicated state in MEMORY only, so a correlated quorum restart loses acked messages. Without it that combination refuses to start (and fails `--check-config` and a live reload), naming both remedies. Loudly `EPHEMERAL durability`-warned on every start while active |
-| `MQTTD_BACKUP_DIR` | Where **online backups** are written (ADR 0062, issue #249). An export is taken from the LIVE node — nothing stops, no second store handle is opened — and is written `0600`, fsynced, then renamed. Must be on a volume **separate** from `MQTTD_DATA_DIR` (`--check-config` refuses otherwise: exports there grow the volume the disk watermark protects while being counted by nothing); `--check-config` validates the setting, not the volume, so a missing or unwritable directory fails at the first run instead. **Neither the Helm chart nor the systemd unit mounts one by default** — [OPERATIONS](docs/OPERATIONS.md#backup-and-disaster-recovery) has the opt-in for each. **A per-node export is not a cluster snapshot**: a cluster backup is the set of every node's export, and a restore from an incomplete set is refused, naming what is missing. Unset = no backups |
-| `MQTTD_BACKUP_EVERY` | Seconds between scheduled exports (default `0` = on demand only, via `mqttd --backup` / `SIGUSR2` — which is a logged no-op, never a kill, on a node with no backup dir). This is the RPO's cadence term: `RPO ≤ every + W`, where `W` is the export's own window width, recorded in every file's trailer as `finished_unix_ms − started_unix_ms` and on `/statusz` as `backup.window_ms` (`mqttd_backup_duration_ms` is the whole run's wall clock — an upper bound on `W`). Alert on the age of `mqttd_backup_last_success_timestamp_seconds` (with its `> 0` guard) or the RPO is fiction |
-| `MQTTD_BACKUP_KEEP` | Exports kept **per node id** before the oldest is deleted (default `7`), so a directory shared by several nodes cannot have one node's rotation delete another's. Several generations in one restore directory are fine: a restore reads the **newest export of each node** and logs the rest as superseded |
-| `MQTTD_RESTORE_FROM` | A backup **file or directory** to import at startup, before any client listener binds (ADR 0062). Only into a **fresh** node — no store files in the data dir, or the node refuses. The whole set is verified first (format stamp, sha-256, one generation per node, a single `cluster_id`, coverage); each node then imports the sessions it owns and skips the rest, so put every node's export in one directory and set `MQTTD_READY_MIN_MEMBERS` to the node count so the import waits for the assembled ring. `/readyz` is NotReady with reason `restore-in-progress` while it runs; any failure exits non-zero. **Leave it set afterwards**: a completed restore writes a `restored-from` stamp, and a later start reads it, reports the setting INERT and boots normally on the data it already holds (a *different* source is refused — that would be a merge) |
-| `MQTTD_RESTORE_TIMEOUT` | Seconds a restore waits for the durable plane to become ready before giving up (default `300`) |
-| `MQTTD_RESTORE_PARTIAL_ACCEPT_DATA_LOSS` | **Forfeits data — read [OPERATIONS](docs/OPERATIONS.md#backup-and-disaster-recovery) before setting it.** `1`/`true`/`on`/`yes` (nothing else, so a stray value cannot license a lossy restore; default off) lets a restore proceed from a set that does **not** cover the cluster, instead of refusing. It exists for the one disaster where a node's data *and* its export are both permanently gone, which would otherwise make the surviving nodes' backups unrestorable too. Every missing node and forfeited session is named at startup, in `/statusz`'s `restore.detail` (`PARTIAL (data forfeited): …`), and permanently in the `restored-from` stamp |
-| `MQTTD_LEASE_VOTERS` | Bounded lease-consensus [voter](docs/GLOSSARY.md#mqttd-clustering-and-durability) set `N` (ADR 0021; default `5`, recommend odd). At most `N` members vote on lease ownership; every other member joins as a learner that still receives the lease log and can own/serve sessions — so consensus cost stays fixed (quorum `⌊N/2⌋+1`) as the cluster grows. `1` = no fault tolerance, `3` tolerates one voter loss, `5` two |
-| `MQTTD_MIN_REPLICAS` | Min-replicas write floor (issues #167/#239; default `majority`). Replica sets shrink with membership — `min(R, alive)` — so without a floor a shrinking cluster silently trades the configured durability for availability, down to quorum-of-1. A group below the floor **refuses** durable writes instead (QoS≥1 acks withheld so sources redeliver, retained mutations queue; reads, QoS 0, acked-driven truncation and removal keep serving, but QoS 2 in-flight bookkeeping does not). `majority` derives the floor from the members this node knows about — the quorum-committed durable roster (authoritative), falling back to the largest membership it has ever observed only before a roster exists, bounded below by `MQTTD_READY_MIN_MEMBERS` — capped at R: **no floor at all** while it has never known a peer (single-node stays fully operational) and **2** in a 3-node cluster, which the write quorum already needs. An integer sets an absolute floor; `1` disables it and accepts single-copy acks. Above R = rejected at startup (and by `--check-config`) |
-| `MQTTD_FAILURE_DOMAIN` | This node's own failure-domain label (ADR 0016 T5), e.g. `rack-a`. Advertised over the authenticated SWIM gossip so the topology **self-assembles** — the bounded voter set spreads across racks/zones (losing a whole domain can't take quorum) with each node setting only its own label. The preferred mechanism. Unset → this node is unlabelled unless a peer/static map supplies one. If the cluster-bus cert **attests** a label (ADR 0016 T6), the cert wins: this value must match it (or peers reject this node's gossip) and may be omitted |
-| `MQTTD_FAILURE_DOMAINS` | Static failure-domain topology (ADR 0016 T4): `node-id=domain` pairs (e.g. `n1=rack-a,n2=rack-a,n3=rack-b`). A cluster-uniform seed/fallback; per-node gossip labels (`MQTTD_FAILURE_DOMAIN`) override it. Unset → no static spread (id-ordered selection unless labels are gossiped) |
-| `MQTTD_TLS_BIND` | TLS 1.3 client listener, e.g. `0.0.0.0:8883` (needs `…_CERT`/`…_KEY`) |
-| `MQTTD_TLS_CERT` / `MQTTD_TLS_KEY` | Server certificate chain + key (PEM) |
-| `MQTTD_TLS_CLIENT_CA` | Require client certs (mTLS); identity = certificate CN (see `MQTTD_MTLS_IDENTITY_SOURCE`) |
-| `MQTTD_MTLS_IDENTITY_SOURCE` | Which field of a verified client certificate *is* the identity (ADR 0004 T11): `cn` (default), `san-dns`, `san-uri`, `san-email`. **No fallback and no ordering luck** — if the chosen field is absent, or the cert carries two of them, the connection is refused rather than silently identified as something else. A subject containing `+` or `#` is always refused, and `/` is refused for every source but `san-uri` (a URI identity keeps its slashes, and the ACL engine in turn refuses to substitute a `/`-bearing subject into `%i`) — so an identity can never smuggle topic structure into a pattern. Client listeners only (the cluster bus has its own identity rules, ADR 0016 T6); changing it is a restart-level edit, reported as such by a reload |
-| `MQTTD_TLS_CRL` | Certificate revocation list (PEM; needs `…_CLIENT_CA`). A client whose cert is listed is refused at the TLS handshake **and its live session is evicted on reload** (ADR 0002/0040); re-read on `SIGHUP`, so a published CRL applies with no restart |
-| `MQTTD_WSS_BIND` | MQTT-over-WebSocket **over TLS** (`wss://`), e.g. `0.0.0.0:8884` (ADR 0035; reuses `…_CERT`/`…_KEY`/`…_CLIENT_CA` — same TLS 1.3 + mTLS + hot reload as the TLS listener) |
-| `MQTTD_WS_BIND` | **Insecure** plaintext MQTT-over-WebSocket (`ws://`) — for browsers in local/dev only (ADR 0035) |
-| `MQTTD_QUIC_BIND` | MQTT-over-QUIC (UDP), e.g. `0.0.0.0:8885` (ADR 0036; reuses `…_CERT`/`…_KEY`/`…_CLIENT_CA`). QUIC mandates TLS 1.3 (no plaintext mode); **multi-stream** (one session across many streams, no head-of-line blocking); **non-standard** (EMQX-style), identity = leaf CN, no 0-RTT for CONNECT |
-| `MQTTD_PLAINTEXT_BIND` | **Insecure** plaintext TCP client listener |
+A short operator summary (full text, defaults, and every knob live in the
+generated reference):
 
-### Client authentication & authorization
-| Variable | Purpose |
+| Need | Where |
 |---|---|
-| `MQTTD_ALLOW_ANONYMOUS` | **Insecure**: permit clients with no credentials |
-| `MQTTD_PASSWORD_FILE` | Argon2id `username:phc-hash` password file. Generate lines with `mqttd --hash-password <user>` (below) — `mosquitto_passwd` hashes are a different format and are not accepted |
-| `MQTTD_JWT_HS256_SECRET_FILE` / `MQTTD_JWT_RS256_PEM` | Static JWT verification key, **by file** (ADR 0046 T5): the HS256 shared secret and the RS256 public key are both read from a path, so the key is mounted from a Secret, never inlined. A trailing newline in the HS256 file is trimmed |
-| `MQTTD_JWT_ISSUER` / `MQTTD_JWT_AUDIENCE` | Optional JWT `iss`/`aud` constraints (static-key mode) |
-| `MQTTD_OIDC_ISSUER` | **OIDC-mode token auth** (ADR 0050): the broker discovers the issuer's JWKS and follows key rotation live (no restart). Requires `MQTTD_OIDC_AUDIENCE`. Mutually exclusive with `MQTTD_JWT_*`. Asymmetric-only (RS256/ES256; a public JWKS never feeds an HMAC verify). Tokens ride in the CONNECT **password** field (EMQX convention). Proven against a real Keycloak, forced key rotation included (nightly `oidc` job) |
-| `MQTTD_OIDC_AUDIENCE` | Required `aud` in OIDC mode (not optional — a token minted for another audience must be refused) |
-| `MQTTD_OIDC_JWKS_REFRESH` / `MQTTD_OIDC_MAX_STALE` | JWKS background-refresh interval (s, default 300) and the last-known-good staleness window (s, default 86400) after which token auth **fails closed** on a persistent IdP outage |
-| `MQTTD_OIDC_GROUPS_CLAIM` / `MQTTD_OIDC_ALLOW_HTTP` | Claim to read groups from (default `groups`); and a loud INSECURE override permitting an `http://` issuer (tests only) |
-| `MQTTD_ACL_FILE` | TOML topic-ACL policy (deny by default) |
-| `MQTTD_HTTP_AUTH_URL` | **Remote HTTP auth hook** (ADR 0004 T16): the broker POSTs `{client_id, username, password, method}` and reads the **HTTP status** as the verdict — `200` allow (an optional `{"groups":[…]}` body enriches the identity), `401`/`403` deny, **anything else — a 5xx, a timeout, an unreachable host — DENIES**. One hook reaches LDAP / OAuth2 / a bespoke user table without a broker integration per backend. Must be `https` unless `MQTTD_HTTP_AUTH_ALLOW_HTTP` is set (the password crosses this link). Tried after the local password file, so a user in both is answered without a round trip |
-| `MQTTD_HTTP_AUTH_TIMEOUT` | Per-request timeout, seconds (default 5). The broker applies **no** timeout of its own around an authenticator, so this is the only bound on how long a CONNECT waits — and it expires **closed** |
-| `MQTTD_HTTP_AUTH_CACHE_SECS` / `MQTTD_HTTP_AUTH_CACHE_MAX` | Cache **accepted** credentials for N seconds (default `0` = off), up to this many entries (default 10 000, bounded because the cache sits on an attacker-reachable path). Rejections are **never** cached: a fixed password takes effect at once, and caching denials would turn a hook blip into a lasting outage. Keys are a hash of the credential, never the credential |
-| `MQTTD_CONFIG` | Path to the TOML config file (ADR 0046); `--config <path>` overrides it. Unset = defaults + this env overlay |
-| `MQTTD_CONFIG_WATCH` | Opt-in filesystem auto-reload (ADR 0033): poll interval in **seconds**. When the config file **or** a referenced policy file changes on disk, reload the whole config via the same validate-before-swap routine as `SIGHUP` (no restart) — the Kubernetes ConfigMap case. Unset/`0` = disabled (signal-only default) |
+| Bind, TLS, mTLS, plaintext | `MQTTD_TLS_*`, `MQTTD_PLAINTEXT_BIND`, `MQTTD_WS_BIND` / `MQTTD_WSS_BIND`, `MQTTD_QUIC_BIND` |
+| Auth / ACL | `MQTTD_ALLOW_ANONYMOUS`, `MQTTD_PASSWORD_FILE`, `MQTTD_JWT_*`, `MQTTD_OIDC_*`, `MQTTD_ACL_FILE` |
+| Durability | `MQTTD_DATA_DIR` (required when durable-on), `MQTTD_DURABLE_SESSIONS`, `MQTTD_ALLOW_EPHEMERAL_DURABILITY` |
+| Caps, watermarks, brownout | `MQTTD_MAX_*`, `MQTTD_STORE_MAX_BYTES`, `MQTTD_MEMORY_MAX_BYTES` — [SIZING.md](docs/SIZING.md) |
+| Cluster / gossip / peer bus | `MQTTD_PEER_*`, `MQTTD_SWIM_*`, `MQTTD_LEASE_VOTERS`, `MQTTD_MIN_REPLICAS` |
+| Shared-sub locality | `MQTTD_SHARED_PREFER_LOCAL` — **default on** since #511; a consumer's share follows its *host node's* publisher share ([CLIENT-GUIDE](docs/CLIENT-GUIDE.md#shared-subscriptions)) |
+| Health / metrics | `MQTTD_HEALTH_BIND`, `MQTTD_METRICS_BIND`, `MQTTD_OTLP_*` (procedures in the sections below) |
+| Backup / restore | `MQTTD_BACKUP_*`, `MQTTD_RESTORE_*` — [OPERATIONS](docs/OPERATIONS.md#backup-and-disaster-recovery) |
 
-### Cluster transport & membership
-| Variable | Purpose |
-|---|---|
-| `MQTTD_PEER_BIND` | Inter-node peer listener, e.g. `0.0.0.0:7001` |
-| `MQTTD_PEER_TLS_CA` / `…_CERT` / `…_KEY` | Cluster-bus mTLS material (set all three). A leaf whose SANs include `URI:urn:fss:failure-domain:<label>` has its failure domain **CA-attested** (ADR 0016 T6): the label is authoritative on the gossip plane (a contradicting self-claim is rejected) and can replace `MQTTD_FAILURE_DOMAIN` entirely — relabel by reissuing the cert |
-| `MQTTD_PEER_TLS_CRL` | Cluster-bus CRL (PEM, **signed by the cluster CA**; needs the three above). Signed gossip from a revoked cert is dropped (ADR 0022 T7), fresh peer handshakes are refused in both directions, and **established peer links are torn down on reload** (ADR 0040); expired/not-yet-valid certs are rejected regardless. Hot-reloads via `SIGHUP`/`MQTTD_CONFIG_WATCH`, so publishing a CRL evicts a compromised node with no restart |
-| `MQTTD_PEERS` | Comma-separated static peer addresses (alternative to gossip) |
-| `MQTTD_SWIM_BIND` | SWIM gossip UDP bind (needs `MQTTD_PEER_BIND`) |
-| `MQTTD_SWIM_SEEDS` | Comma-separated gossip addresses of existing members |
-| `MQTTD_SWIM_KEY` | 64-hex-char cluster gossip key, **inline** (`openssl rand -hex 32`). A raw secret |
-| `MQTTD_SWIM_KEY_FILE` | Path to a file holding the 64-hex gossip key (ADR 0046 T5): the secret-by-reference form, mountable from a Secret so it stays out of the config file. Mutually exclusive with the inline `MQTTD_SWIM_KEY` |
-| `MQTTD_SHARED_PREFER_LOCAL` | Prefer a **local** `$share` member when one is online (presence = on; default **off** = round-robin over every online member). Shared selection is round-robin across the whole group, so a group spread over N nodes picks a remote member roughly (N−1)/N of the time and each of those publishes crosses the cluster bus. Locality preference removes those hops — worth ~1.5–2× latency headroom on the ADR 0077 lane E tenancy ladder — at the cost of *fairness*: round-robin gives every member an equal share wherever publishers connect, while local-first ties a member's load to the publishers co-located with it. Rotation still applies among local members, so fairness is preserved within a node and given up only across nodes. A group with no local member falls back to remote and is never dropped. Turn it on when group members are present on every node and throughput matters more than even distribution. It does **not** restore linear cluster scaling — measured, the ceiling is not forwarding |
-| `MQTTD_REFOUND_GUARD` | Refuse to serve after re-founding a cluster beside a live one — **on by default**; set `0`/`false`/`off`/`no` only to re-bootstrap deliberately beside a cluster you are abandoning. A node whose data dir was lost mints a second identity and would otherwise serve clients an empty store; it now latches NotReady once it hears the other cluster's gossip (a genuine first bootstrap hears none, so it is unaffected) |
-| `MQTTD_HEALTH_BIND` | HTTP health-probe bind, e.g. `0.0.0.0:8080` — serves `GET /livez`, `/readyz` & `/metrics` (Prometheus) |
-| `MQTTD_READY_MIN_MEMBERS` | Smallest mesh size `/readyz` accepts (default 1) |
-| `MQTTD_METRICS_BIND` | Optional separate bind for `GET /metrics`, to isolate the scrape from the health probes (internal/ops network only) |
-| `MQTTD_OTLP_ENDPOINT` | OTLP/HTTP base URL of an OpenTelemetry Collector, e.g. `http://collector:4318` — when set, metrics are also pushed via OTLP (`/v1/metrics` appended) |
-| `MQTTD_OTLP_INTERVAL` | OTLP push interval in seconds (default `10`) |
+`MQTTD_CONFIG` selects the TOML file (not in the overlay table; it is how the
+file is found). Experimental store pins `MQTTD_STORE_SHARDS` / `MQTTD_STORE_LINGER`
+are documented in CONFIGURATION.md — they are **not** a QoS 2 prerequisite
+(ADR 0076 measured both slower than the defaults).
 
 ### Health probes
 
@@ -1413,7 +1366,9 @@ under load (ADR [0026](docs/adr/0026-lease-timing-durable-storage.md) /
 
 ### On Kubernetes (Helm)
 
-A Helm chart under [`deploy/helm/mqttd`](deploy/helm/mqttd) runs the broker as a **StatefulSet**
+The Kubernetes user's primary document is [`docs/KUBERNETES.md`](docs/KUBERNETES.md)
+(chart READMEs, values, `MqttdCluster` CRD). A Helm chart under
+[`deploy/helm/mqttd`](deploy/helm/mqttd) runs the broker as a **StatefulSet**
 that encodes the operational contract (ADR 0047), so the safe path is the default.
 Day-2 procedures — cert/key rotation, scaling, PVC lifecycle, founder recovery, and
 **online backup + restore** (`mqttd --backup` on every node; a per-node export is not a

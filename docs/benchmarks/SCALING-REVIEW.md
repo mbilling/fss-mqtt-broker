@@ -2,6 +2,34 @@
 
 Scope: source at `a2e5f32`, including the v1.0.16 broker; static review, not a new benchmark or correctness proof. Focus: connections, subscriptions, publishing and cross-node scaling for QoS 0/1/2.
 
+## Repository sync — 2026-09-11 (issue #537 Phase 0)
+
+This review remains a snapshot at `a2e5f32`. It is **not** re-run at current
+`main` (`f786abe` when this note was written). Phase 0 documentation only:
+
+- **ADR 0073 footer** now matches delivery: T3 done; T4.0–T4.5 staged; T4.1
+  in-progress (deterministic soak, not fleet-scale seeded faults). Quota raise
+  stays withdrawn for durable lane A (T4.4); SCALE-CURVE.md's ~100 vCPU line is
+  the published lane B driver-fleet ceiling.
+- **ADR 0076 amendments** remain the store contract: K=1 default, linger off.
+  #403 is not a QoS 2 / #405 prerequisite. ADR 0075's "sharding then multiplies"
+  sentence is amended.
+- **#579 merged** (`fd5f3cc`, 2026-09-07): #533 repair (later extended by
+  #591/#592 durable QoS 2 retirement / #577), partial #504 CONNACK/session
+  cleanup, this review, 0073 footer, T4.1 deterministic soak. The 2026-09-07
+  issue body that listed #579 as pending is stale.
+- **#598** squash-merged as `d130fdc`: closed-outbound reap / gossip batch —
+  **part of** #504, not the overload→idle→repeated-control acceptance.
+- Dependabot #583–#587 merged. #578/#580 (tofu/UpCloud tooling). #596
+  (harness validity, not scaling evidence).
+- **Still open (not claimed done):** Phase 1–4 engineering; paid cloud;
+  #536 contract approval; #504 remaining recovery; #575 / 0074-T3
+  (`a_parked_qos2_truncate_does_not_stall_unrelated_sessions` still
+  `#[ignore]`); #405 isolation; #482 profiling.
+
+ADR maintenance called out below (0073 footer vs delivery) is addressed by
+the 0073 Delivery section on this date.
+
 ## Verdict
 
 **Near-linear aggregate publishing capacity is a reasonable target for partitionable workloads, but is not established for all three QoS levels.** The ownership architecture supports it; the routing executor, subscription distribution and QoS 2 execution still impose constraints.
@@ -60,7 +88,10 @@ only, where the question is 'how bad, in the field' rather than 'is it isolated'
 | **0072:** selectable durability | Preserve the distinction between MQTT QoS and storage durability. A relaxed/local-tier improvement is not evidence that quorum-durable QoS 1/2 scales. Persistent recipients and delivered QoS determine which queue appends are owed. |
 | **0076, 0077:** measured storage tuning and workload evidence | Keep the falsifications: more redb files and linger were measured slower, so neither should become a blanket scaling fix. Apply the replication, latency and harness-validity rules before publishing architectural conclusions. |
 
-ADR maintenance: 0073's Delivery footer still says T3 is planned and T4 needs a quota raise, unlike its updated delivery plan. Reconcile proposal text, amendments and shipped behavior before using ADR prose as the implementation contract.
+ADR maintenance: 0073's Delivery footer was reconciled 2026-09-11 against
+the delivery plan (T3 done; T4 staged; T4.1 in-progress). The review text
+at `a2e5f32` that called the footer stale is kept above as the finding;
+the files now agree.
 
 Claude: "Confirmed. `docs/adr/0073-scale-out-durable-ownership.md:200-202` still
 reads 'T3 ... and T4 ... remain planned — T4 gated on the ...', which contradicts

@@ -239,6 +239,52 @@ def main() -> int:
                         "pre-1.0 reshape window is closed (ADR 0039 in force)"
                     )
 
+    # --- ADR 0070 T8: docs/README.md is a complete, stamped index --------------
+    # Every top-level docs/*.md must appear as a markdown link in docs/README.md
+    # (the orphan class dies). Stakeholder docs carry the version-stamp
+    # convention THREAT-MODEL/HARDENING established; generated files stamp
+    # themselves with the GENERATED header.
+    docs_index = ROOT / "docs" / "README.md"
+    if not docs_index.exists():
+        problems.append("docs/README.md is missing — ADR 0070 T1/T8")
+    else:
+        index_text = docs_index.read_text(encoding="utf-8")
+        top_level = sorted(
+            p for p in (ROOT / "docs").glob("*.md") if p.is_file()
+        )
+        for doc in top_level:
+            if doc.name == "README.md":
+                continue
+            name = doc.name
+            if f"]({name})" not in index_text and f"](./{name})" not in index_text:
+                problems.append(
+                    f"docs/{name} is not listed in docs/README.md — "
+                    "an unlisted doc is the orphan class ADR 0070 closes"
+                )
+        if not re.search(
+            r"\|\s*Document\s*\|\s*Stakeholder\s*\|\s*One line\s*\|",
+            index_text,
+            re.I,
+        ):
+            problems.append(
+                "docs/README.md is missing the Document / Stakeholder / One line table"
+            )
+
+        stamp = re.compile(
+            r"(\*\*Verified against|\*\*Dated |\*\*Generated against|<!-- GENERATED)",
+        )
+        skip_stamp = {"README.md"}  # the index itself; it links the stamped set
+        for doc in top_level:
+            if doc.name in skip_stamp:
+                continue
+            head = "\n".join(doc.read_text(encoding="utf-8").splitlines()[:12])
+            if not stamp.search(head):
+                problems.append(
+                    f"docs/{doc.name} has no version stamp in its header "
+                    "(**Verified against**, **Dated**, **Generated against**, "
+                    "or a GENERATED banner) — ADR 0070 T8"
+                )
+
     if problems:
         fail(problems)
 

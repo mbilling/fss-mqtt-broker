@@ -25,8 +25,30 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 CATALOGUE = ROOT / "crates" / "mqtt-codec" / "src" / "reason.rs"
+CLIENT_GUIDE = ROOT / "docs" / "CLIENT-GUIDE.md"
 SRC_GLOBS = ("crates/*/src/*.rs", "crates/*/src/**/*.rs")
 TEST_GLOBS = ("crates/*/tests/*.rs", "crates/*/tests/**/*.rs")
+REASON_BEGIN = "<!-- reason-codes:begin -->"
+REASON_END = "<!-- reason-codes:end -->"
+
+# One line per emittable failure code, sourced from the production call sites the
+# emission scan already found. A new emittable code without an entry here fails
+# the run — CLIENT-GUIDE cannot silently omit a code the broker can send.
+WHEN_EMITTED: dict[int, str] = {
+    0x80: "SUBACK failure slot, or a codec value the broker maps as unspecified error.",
+    0x81: "Malformed packet at decode (CONNACK/DISCONNECT depending on when it is caught).",
+    0x82: "Protocol violation (illegal packet for the current state).",
+    0x84: "Mapped in `conn.rs::codec_reason` for totality; unreachable on the wire (CONNECT with an unsupported protocol level closes silently per [MQTT-3.14.0-1]).",
+    0x87: "Authentication or ACL denial (CONNACK, PUBACK/PUBREC, DISCONNECT on revocation sweep).",
+    0x8B: "Graceful drain of live v5 sessions (ADR 0019 / `SIGTERM`).",
+    0x8C: "Enhanced-authentication method the broker does not accept.",
+    0x8F: "SUBSCRIBE/UNSUBSCRIBE filter the broker rejects (including a malformed `$share/...`).",
+    0x93: "Client exceeded the server's advertised Receive Maximum (inbound QoS > 0 in flight).",
+    0x94: "Topic alias out of range or used before it was bound (ADR 0011).",
+    0x95: "Inbound packet larger than the advertised Maximum Packet Size.",
+    0x97: "A quota or brownout refusal (sessions, subscriptions, retained growth, durable-append floor).",
+    0x9C: "This node no longer owns the persistent session; reconnect and land on the owner (issue #284).",
+}
 
 # Codes production can place on the wire but which no test currently provokes,
 # each with the reason. An entry here is a claim that must stay true — it is not
@@ -224,14 +246,69 @@ def self_check() -> list[str]:
     return problems
 
 
+def catalogue_markdown(emits: dict[int, list[str]], asserted: set[int], by_value: dict[int, str]) -> str:
+    """The CLIENT-GUIDE table held to the gated emission list."""
+    rows = [
+        "| Code | Name | When mqttd emits it | Tests |",
+        "|------|------|---------------------|-------|",
+    ]
+    for value in sorted(emits):
+        name = by_value.get(value, "?")
+        when = WHEN_EMITTED.get(value)
+        if when is None:
+            raise SystemExit(
+                f"emittable {value:#04x} {name} has no WHEN_EMITTED line — "
+                "CLIENT-GUIDE cannot invent one; add it next to the emission site."
+            )
+        if value in EXEMPT:
+            status = "exempt (see `scripts/check-reason-codes.py`)"
+        elif value in asserted:
+            status = "provoked in integration tests"
+        else:
+            status = "unprovoked"
+        rows.append(f"| `{value:#04x}` | `{name}` | {when} | {status} |")
+    return "\n".join(rows) + "\n"
+
+
+def refresh_client_guide(table: str, check: bool) -> list[str]:
+    """Keep the marked catalogue in CLIENT-GUIDE.md in lock-step with the scan."""
+    problems: list[str] = []
+    if not CLIENT_GUIDE.exists():
+        problems.append(f"{CLIENT_GUIDE.relative_to(ROOT)} is missing")
+        return problems
+    text = CLIENT_GUIDE.read_text(encoding="utf-8")
+    if REASON_BEGIN not in text or REASON_END not in text:
+        problems.append(
+            f"{CLIENT_GUIDE.relative_to(ROOT)} needs {REASON_BEGIN} … {REASON_END} "
+            "around the emitted-reason-code table"
+        )
+        return problems
+    before, rest = text.split(REASON_BEGIN, 1)
+    _, after = rest.split(REASON_END, 1)
+    new = before + REASON_BEGIN + "\n\n" + table + "\n" + REASON_END + after
+    if new != text:
+        if check:
+            problems.append(
+                "docs/CLIENT-GUIDE.md reason-code catalogue is stale — "
+                "the emission list moved; re-run scripts/check-reason-codes.py "
+                "(it rewrites the marked table unless --check)"
+            )
+        else:
+            CLIENT_GUIDE.write_text(new, encoding="utf-8")
+    return problems
+
+
 def main() -> int:
     names = catalogue()
     by_value = {v: n for n, v in names.items()}
     emits, asserted = scan()
+    check = "--check" in sys.argv
 
     problems = self_check()
     gaps = {v: w for v, w in emits.items() if v not in asserted and v not in EXEMPT}
     stale = sorted(v for v in EXEMPT if v in asserted)
+    missing_when = sorted(v for v in emits if v not in WHEN_EMITTED)
+    extra_when = sorted(v for v in WHEN_EMITTED if v not in emits)
 
     print(
         f"Reason-code audit: {len(names)} defined, {len(emits)} emittable (>= 0x80), "
@@ -239,6 +316,25 @@ def main() -> int:
     )
     for value, why in sorted(EXEMPT.items()):
         print(f"  exempt {value:#04x} {by_value.get(value, '?')}: {why}")
+
+    if missing_when:
+        problems.append(
+            "WHEN_EMITTED is missing emittable codes: "
+            + ", ".join(f"{v:#04x}" for v in missing_when)
+        )
+    if extra_when:
+        problems.append(
+            "WHEN_EMITTED lists codes the broker no longer emits: "
+            + ", ".join(f"{v:#04x}" for v in extra_when)
+        )
+
+    try:
+        table = catalogue_markdown(emits, asserted, by_value)
+    except SystemExit as e:
+        problems.append(str(e))
+        table = ""
+    if table:
+        problems.extend(refresh_client_guide(table, check=check))
 
     if problems:
         print("\nFAIL: the checker's own invariants broke:")

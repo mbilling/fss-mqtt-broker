@@ -1,0 +1,226 @@
+{{- if .Values.metrics.prometheusRule.enabled }}
+# Shipped alerting (ADR 0070 T4). Expressions match docs/OPERATIONS.md
+# "Shipped alerting"; each alert's runbook section is the operator contract.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "mqttd.fullname" . }}
+  labels:
+    {{- include "mqttd.labels" . | nindent 4 }}
+    {{- with .Values.metrics.prometheusRule.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  groups:
+    - name: mqttd.operator
+      rules:
+        - alert: MqttdSplitBrain
+          expr: count(count by (cluster_id) (mqttd_cluster_info == 1)) > 1
+          labels:
+            severity: page
+          annotations:
+            summary: More than one cluster_id is live in the scrape set.
+            runbook: docs/OPERATIONS.md#alert-split-brain
+        - alert: MqttdUnexpectedFounding
+          expr: increase(mqttd_foundings_total[1h]) > 0
+          labels:
+            severity: page
+          annotations:
+            summary: A node founded a cluster after day one.
+            runbook: docs/OPERATIONS.md#alert-unexpected-founding
+        - alert: MqttdForeignGossip
+          expr: rate(mqttd_gossip_rejected_total{reason="cluster-mismatch"}[5m]) > 0
+          labels:
+            severity: warn
+          annotations:
+            summary: Gossip from a different cluster_id is arriving.
+            runbook: docs/OPERATIONS.md#alert-foreign-gossip-arriving
+        - alert: MqttdNodeQuarantined
+          expr: mqttd_refound_quarantine == 1
+          labels:
+            severity: page
+          annotations:
+            summary: This node re-founded beside a live cluster and took itself out of rotation.
+            runbook: docs/OPERATIONS.md#alert-node-self-quarantined
+        - alert: MqttdBrownout
+          expr: mqttd_brownout == 1
+          labels:
+            severity: page
+          annotations:
+            summary: A brownout axis is refusing growth writes.
+            runbook: docs/OPERATIONS.md#alert-brownout
+        - alert: MqttdStoreBytesWarn
+          expr: sum(mqttd_store_bytes) / mqttd_store_max_bytes > 0.8 and mqttd_store_max_bytes > 0
+          labels:
+            severity: warn
+          annotations:
+            summary: Aggregate store bytes are above 80% of the disk watermark.
+            runbook: docs/OPERATIONS.md#alert-brownout
+        - alert: MqttdPerStoreBytesWarn
+          expr: max by (store) (mqttd_store_bytes) / scalar(mqttd_store_max_bytes) > 0.6 and on() mqttd_store_max_bytes > 0
+          labels:
+            severity: warn
+          annotations:
+            summary: One store is above 60% of the aggregate disk watermark.
+            runbook: docs/OPERATIONS.md#alert-brownout
+        - alert: MqttdBackupStale
+          # OPERATIONS: 2 × MQTTD_BACKUP_EVERY. 7200s assumes the 3600s example cadence;
+          # retune the comparison if the schedule is different. The `> 0` guard is mandatory.
+          expr: time() - mqttd_backup_last_success_timestamp_seconds > 7200 and mqttd_backup_last_success_timestamp_seconds > 0
+          labels:
+            severity: page
+          annotations:
+            summary: No successful online backup in two schedule periods (default 2h).
+            runbook: docs/OPERATIONS.md#alert-backup-stale-rpo-breached
+        - alert: MqttdRestoreImporting
+          expr: mqttd_restore_state == 1
+          for: 15m
+          labels:
+            severity: page
+          annotations:
+            summary: A node has been importing a restore longer than the expected RTO window.
+            runbook: docs/OPERATIONS.md#alert-restore-stuck-or-failed
+        - alert: MqttdRestoreFailed
+          expr: mqttd_restore_state == 3
+          labels:
+            severity: page
+          annotations:
+            summary: Restore was refused or failed; the process exits non-zero.
+            runbook: docs/OPERATIONS.md#alert-restore-stuck-or-failed
+        - alert: MqttdMemoryPressure
+          expr: mqttd_process_resident_bytes / mqttd_memory_max_bytes > 0.9 and mqttd_memory_max_bytes > 0
+          for: 5m
+          labels:
+            severity: warn
+          annotations:
+            summary: RSS is above 90% of the memory watermark (last warning before memory brownout).
+            runbook: docs/OPERATIONS.md#alert-memory-pressure-short-of-brownout
+        - alert: MqttdPublishersRefused
+          expr: rate(mqttd_quota_rejections_total{reason="brownout-publish"}[5m]) > 0
+          labels:
+            severity: page
+          annotations:
+            summary: QoS ≥ 1 publishes are being refused under brownout.
+            runbook: docs/OPERATIONS.md#alert-publishers-being-refused
+        - alert: MqttdStuckDrain
+          expr: mqttd_decommission_state == 1 and deriv(mqttd_decommission_pending[10m]) >= 0
+          for: 10m
+          labels:
+            severity: page
+          annotations:
+            summary: Decommission is in progress and pending is not decreasing.
+            runbook: docs/OPERATIONS.md#alert-stuck-drain
+        - alert: MqttdReplicationLag
+          expr: mqttd_replica_groups_tracked - mqttd_replica_groups_current > 0
+          for: 10m
+          labels:
+            severity: warn
+          annotations:
+            summary: Replica groups are not catch-up-current.
+            runbook: docs/OPERATIONS.md#alert-replication-lag
+        - alert: MqttdQuorumThinning
+          expr: mqttd_voters < 3
+          labels:
+            severity: page
+          annotations:
+            summary: Fewer than 3 lease voters (with lease_voters=5, one more loss risks durable writes).
+            runbook: docs/OPERATIONS.md#alert-quorum-thinning
+        - alert: MqttdDurableWritesRefused
+          expr: mqttd_replication_min_actual < mqttd_replication_write_floor
+          labels:
+            severity: page
+          annotations:
+            summary: A group is below the min-replicas write floor; durable writes are refused.
+            runbook: docs/OPERATIONS.md#alert-durable-writes-refused-under-replicated
+        - alert: MqttdUnderReplicated
+          expr: mqttd_replication_min_actual < mqttd_replication_desired
+          labels:
+            severity: warn
+          annotations:
+            summary: A group holds fewer copies than the configured replication factor.
+            runbook: docs/OPERATIONS.md#alert-durable-writes-refused-under-replicated
+        - alert: MqttdSessionsRehoming
+          expr: rate(mqttd_session_rehomes_total{reason="stale-owner"}[5m]) > 0
+          labels:
+            severity: warn
+          annotations:
+            summary: Live persistent sessions are being closed so clients relocate to the owner.
+            runbook: docs/OPERATIONS.md#alert-sessions-rehoming
+        - alert: MqttdSessionsMisplaced
+          expr: mqttd_misplaced_sessions > 0
+          for: 2m
+          labels:
+            severity: page
+          annotations:
+            summary: Persistent sessions are hosted off-owner and cannot be rehomed.
+            runbook: docs/OPERATIONS.md#alert-sessions-stuck-misplaced
+        - alert: MqttdSessionsUnrelocatable
+          expr: rate(mqttd_session_rehomes_total{reason="unrelocatable"}[5m]) > 0
+          labels:
+            severity: page
+          annotations:
+            summary: Rehome is impossible because the owner's peer-link address is unknown.
+            runbook: docs/OPERATIONS.md#alert-sessions-stuck-misplaced
+        - alert: MqttdRehomeDeferred
+          expr: rate(mqttd_session_rehomes_total{reason="deferred"}[5m]) > 0
+          for: 5m
+          labels:
+            severity: warn
+          annotations:
+            summary: Rehome closes are paced (32/node/s); the drain is not keeping up.
+            runbook: docs/OPERATIONS.md#alert-rehome-closes-being-deferred
+        - alert: MqttdProlongedRotation
+          expr: mqttd_swim_keys_accepted > 1
+          for: 1h
+          labels:
+            severity: warn
+          annotations:
+            summary: A SWIM key rotation window has been open for more than an hour.
+            runbook: docs/OPERATIONS.md#alert-prolonged-rotation-window
+        - alert: MqttdConfigDivergence
+          expr: count(count by (checksum) (mqttd_config_info == 1)) > 1
+          for: 15m
+          labels:
+            severity: warn
+          annotations:
+            summary: Nodes disagree on the effective config checksum.
+            runbook: docs/OPERATIONS.md#alert-config-divergence
+        - alert: MqttdDegradedDurablePlane
+          expr: deriv(mqttd_lease_quorum_ack_ms[15m]) > 0
+          for: 15m
+          labels:
+            severity: warn
+          annotations:
+            summary: Lease quorum ack time is growing (fsync-bound consensus).
+            runbook: docs/OPERATIONS.md#alert-degraded-durable-plane
+        - alert: MqttdHubLoopHeld
+          expr: histogram_quantile(0.99, rate(mqttd_hub_dispatch_seconds_bucket[5m])) > 0.1
+          for: 5m
+          labels:
+            severity: page
+          annotations:
+            summary: Hub dispatch p99 is above 100ms — the single-threaded loop is held.
+            runbook: docs/OPERATIONS.md#alert-hub-loop-held
+        - alert: MqttdBacklogOverflow
+          expr: increase(mqttd_publish_dropped_total{reason="backlog-overflow"}[5m]) > 0
+          labels:
+            severity: warn
+          annotations:
+            summary: Already-acked messages are being shed from an online subscriber backlog.
+            runbook: docs/OPERATIONS.md#alert-acked-messages-being-shed-for-a-slow-subscriber
+        - alert: MqttdAppendLaneSaturating
+          expr: deriv(mqttd_append_lane_jobs[10m]) > 0
+          for: 10m
+          labels:
+            severity: warn
+          annotations:
+            summary: A session's append lane queue is growing.
+            runbook: docs/OPERATIONS.md#alert-append-lane-saturating
+        - alert: MqttdAppendBacklogFull
+          expr: rate(mqttd_publish_dropped_total{reason="append-backlog-full"}[5m]) > 0
+          labels:
+            severity: page
+          annotations:
+            summary: New publishes are withheld because the append lane is at cap.
+            runbook: docs/OPERATIONS.md#alert-append-lane-saturating
+{{- end }}

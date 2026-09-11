@@ -1,6 +1,6 @@
 # Operations — day-2 procedures (Kubernetes-first)
 
-The Helm chart (`deploy/helm/mqttd`, [ADR 0047](adr/0047-kubernetes-deployment.md))
+**Verified against `v1.0.16` (2026-09-11).** The Helm chart (`deploy/helm/mqttd`, [ADR 0047](adr/0047-kubernetes-deployment.md))
 encodes the deployment contracts: StatefulSet with per-pod volumes, decommission-drain
 on scale-down, one-at-a-time rolls, a PodDisruptionBudget, and `--check-config` before
 serving. This page is the rest: the procedures an operator runs *after* day 1. Signals
@@ -789,34 +789,184 @@ as a `seq` gap).
 
 ## Monitoring for the operator (and humans)
 
-The signals the future controller will reconcile on — equally useful today as alert
-rules ([ADR 0054](adr/0054-operator-facing-state-surface.md); Grafana panels ship in
-the demo dashboard's "Operator signals" row):
+The signals the future controller will reconcile on
+([ADR 0054](adr/0054-operator-facing-state-surface.md)). This page is the
+**runbook**: each row has a matching heading, and the Helm chart ships the same
+expressions as a `PrometheusRule` (`metrics.prometheusRule.enabled`, default
+off because the CRD is not on every cluster). Production Grafana dashboards
+live in [`deploy/observability/grafana/`](../deploy/observability/grafana/) —
+not only inside the experimental `demo/` stack.
 
-| Condition | Rule | Action |
+**Shared subscriptions, load distribution.** With `MQTTD_SHARED_PREFER_LOCAL`
+(default **on** since #511) a `$share` group's traffic is answered by an online
+member on the *publishing* node when one exists. A consumer's share therefore
+follows its host node's share of publishers, not even round-robin across the
+group. Size the worker pool for that skew; fairness/spillover is #537 Phase 3,
+not a spec defect ([CLIENT-GUIDE](CLIENT-GUIDE.md#shared-subscriptions),
+ADR 0010/0015 as-delivered notes).
+
+## Shipped alerting
+
+Index of every rule the chart installs. The table is the catalogue; the
+sections below are the operator contract. `curl <pod>:8080/statusz` remains
+the human-readable superset.
+
+| Condition | Rule | Runbook |
 |---|---|---|
-| **Split brain** | `count(count by (cluster_id) (mqttd_cluster_info == 1)) > 1` across the fleet | Fence the new founder (see split-brain detection above) |
-| **Unexpected founding** | `increase(mqttd_foundings_total[1h]) > 0` after day one | Same — a node founded a second cluster |
-| **Foreign gossip arriving** | `rate(mqttd_gossip_rejected_total{reason="cluster-mismatch"}[5m]) > 0` | Contained, but find and fix the re-founded node |
-| **Node self-quarantined** | `mqttd_refound_quarantine == 1` | This node re-founded beside a live cluster and took itself out of rotation; it never recovers on its own — wipe and rejoin it (see the founder rule) |
-| **Brownout** | `mqttd_brownout == 1` (page); `sum(mqttd_store_bytes) / mqttd_store_max_bytes > 0.8 and mqttd_store_max_bytes > 0` (warn); `max by (store) (mqttd_store_bytes) / scalar(mqttd_store_max_bytes) > 0.6 and on() mqttd_store_max_bytes > 0` (warn) | Expand the PVC / raise the watermark / prune retained. The per-store rule finds which store is eating the budget — the mark is **aggregate on purpose** (`replicas`/`lease` grow from peers' committed appends and from consensus, with no client write to refuse), and the broker itself warns once, naming the store, above 70% of the mark. **Every watermark ratio here needs its guard clause:** an unset mark is exported as a literal `0`, so a bare divide is `+Inf` and fires on the default configuration, and a per-store numerator carries a `store` label the mark does not, so it needs `scalar()` or it matches nothing and never fires. Timing: a transition is seen within `MQTTD_WATERMARK_POLL` seconds (default 10) and within `max(1s, poll/10)` once inside 10% of the mark — which is also how long a *cleared* brownout takes to lift, i.e. how long the publish refusals outlive the pressure |
-| **Backup stale (RPO breached)** | `time() - mqttd_backup_last_success_timestamp_seconds > 2 * <every_secs> and mqttd_backup_last_success_timestamp_seconds > 0` (page) | No successful export in two schedule periods. The `> 0` guard is mandatory — an unconfigured backup exports a literal `0`. Check `mqttd_backup_runs_total{outcome="error"}` and the node's log: an INCOMPLETE session scan fails the run on purpose (a file missing sessions is worse than none), so the usual cause is a group that could not be read (no quorum) at export time |
-| **Restore stuck or failed** | `mqttd_restore_state == 1` for longer than the expected RTO, or `== 3` (page) | `1` = importing (the node is `NotReady` and its client port is closed, by design); `3` = the restore was refused or failed and the process exited non-zero. `/statusz`'s `restore.detail` and the log carry the reason — a format stamp from another build, a digest mismatch, an uncovered session set, two clusters or two generations in one directory, or a data dir that is not fresh. `2` means completed, and reads `2` on **every later boot too**, because the `restored-from` stamp makes the setting inert; `restore.detail` then says `this boot imported nothing`. A detail beginning `PARTIAL (data forfeited)` means the set was incomplete and imported anyway under `MQTTD_RESTORE_PARTIAL_ACCEPT_DATA_LOSS` — the forfeited nodes and sessions are named there and in the stamp |
-| **Memory pressure short of brownout** | `mqttd_process_resident_bytes / mqttd_memory_max_bytes > 0.9 and mqttd_memory_max_bytes > 0` for 5m (warn) | The last warning before the memory axis browns out. The **container/cgroup limit is the ceiling**, not this watermark: check one is actually set (the Helm chart ships `resources: {}`) and that the watermark is 75-85% of it — the gap is the overshoot allowance (`poll x allocation rate`), see [SIZING](SIZING.md) |
-| **Publishers being refused** | `rate(mqttd_quota_rejections_total{reason="brownout-publish"}[5m]) > 0` (the Prometheus label is `reason`; the OTel attribute is `kind`) | `QoS` ≥ 1 publish availability is degraded, not silently lost: above the watermark a publish needing a durable append is refused (v5 `0x97`, v3.1.1 no ack + close — cross-node too, as a peer-bus verdict; an older link mid-rolling-upgrade degrades to a withheld ack + close). Re-delivery is the publishing application's decision — a v5 reason ≥ `0x80` completes the packet-id lifecycle, and only a `CleanSession=0` v3.1.1 publisher resends on reconnect. Expand the PVC / raise the watermark / prune retained / let subscribers drain. `mqttd_brownout{axis}` plus `store_bytes` vs `store_max_bytes` and `process_resident_bytes` vs `memory_max_bytes` say which axis; `/statusz` gives the onset timestamp |
-| **Stuck drain** | `mqttd_decommission_state == 1` and `mqttd_decommission_pending` not decreasing for 10m | Inspect the drain logs; the grace deadline will fall back to crash semantics |
-| **Replication lag** | `mqttd_replica_groups_tracked - mqttd_replica_groups_current > 0` sustained | Node not catch-up-current; takeover from it would be degraded |
-| **Quorum thinning** | `mqttd_voters < 3` (with `lease_voters = 5`) | One more loss risks durable writes; restore nodes |
-| **Durable writes refused (under-replicated)** | `mqttd_replication_min_actual < mqttd_replication_write_floor` (page); `mqttd_replication_min_actual < mqttd_replication_desired` (warn) | **Page**: a group is below the min-replicas write floor, so durable writes are being REFUSED — QoS≥1 publishers get no ack, redeliver, and are disconnected; retained mutations queue; reads, QoS 0, acked-driven truncation and removal keep serving, but QoS 2 in-flight bookkeeping does not. Corroborate with `mqttd_durable_append_failures_total{reason="unavailable"}` climbing. **Warn**: a group merely holds fewer copies than R. Either way: restore the missing members ([TROUBLESHOOTING](TROUBLESHOOTING.md)). Do **not** lower `durable.min_replicas` to silence it unless you are consciously accepting single-copy acks. Non-durable clusters (`durable.enabled = false`) report a floor of 1, so this rule cannot fire there |
-| **Sessions rehoming** | `rate(mqttd_session_rehomes_total{reason="stale-owner"}[5m]) > 0` (the Prometheus label is `reason`; the OTel attribute is `kind`) | A node found itself hosting a live persistent session for a placement group it does not own and closed the connection so the client relocates to the owner (issue #284). Expected **in ones after a node roll** — each is one immediate client reconnect, and the alternative was an undeliverable session until the client's keepalive fired. A *sustained* rate means group ownership is churning, or client traffic is being opened before the lease topology has converged onto the voter set — check `mqttd_voters`, `mqttd_lease_epoch` and the *Replication lag* row. **Each close also publishes that client's Last Will**, so suppress device-offline alerting while this counter climbs |
-| **Sessions stuck misplaced** | `mqttd_misplaced_sessions > 0` for 2m, or `rate(mqttd_session_rehomes_total{reason="unrelocatable"}[5m]) > 0` | A live persistent session is hosted on a node that does not own its group and **cannot be rehomed**, because the owner's peer-link address is unknown to that node — so ADR 0005's degrade-don't-refuse keeps serving it locally rather than closing it into a reconnect loop. Those sessions **are undeliverable**: every publish toward them is refused and the publisher's ack withheld (`not the owning node for this group` in the hosting node's logs). This is a peer-mesh/gossip problem, not a session problem — check `mqttd_peer_links` against `mqttd_cluster_members` and the peer-link TLS rows |
-| **Rehome closes being deferred** | `rate(mqttd_session_rehomes_total{reason="deferred"}[5m]) > 0` for 5m | More sessions want rehoming than the per-tick close cap (32/node/s) allows, so the drain is paced (issue #284). The counter increments **once per session per deferral episode**, so its increase is the size of the backlog, not the number of ticks it took to drain. Expected for a few seconds after a scale-out or scale-in, where ~1/N of groups change owner at once — the cap is also the LWT-storm cap. Sustained means ownership is churning faster than the drain: check the *Sessions rehoming* row's causes |
-| **Prolonged rotation window** | `mqttd_swim_keys_accepted > 1` for > 1h | A rotation phase was never closed (see key rotation above) |
-| **Config divergence** | `count(count by (checksum) (mqttd_config_info == 1)) > 1` for > 15m | A config roll did not converge; check the stuck pod |
-| **Degraded durable plane** | `mqttd_lease_quorum_ack_ms` growing (ADR 0049) | fsync-bound consensus; check disks before sessions are refused |
-| **Hub loop held** | `histogram_quantile(0.99, rate(mqttd_hub_dispatch_seconds_bucket[5m])) > 0.1` sustained 5m (page) | Something is blocking the single-threaded hub loop again — every client on the node queues behind it (the head-of-line failure issue #242 removed; the `command` label says which class). Since ADR 0061 the publish path's durable appends, outbound-id records, and packet-id reservations all run off-loop, so a **publish-class tail means an inline await regressed** (the one documented exception: the backlog-overflow eviction truncate — no longer "reachable only past a 10 000-entry backlog" since issue #241, because a low `MQTTD_MAX_BACKLOG_BYTES` makes it fire on ordinary traffic, roughly one on-loop store ack per publish to that subscriber; if you see this tail, check that knob against `MQTTD_MAX_PACKET_SIZE` before hunting a regression. Routing that truncate through the session's append lane is the ADR 0061 residual that removes it); an **ack-class tail** is the documented residual — `truncate_acked`, QoS 2 phase advances (`advance_outbound`), and `clear_outbound` still run on-loop against a degraded store; an **attach-class tail** means replay reads/truncates are degraded — check `mqttd_durable_append_latency_seconds` and the durable-plane rows above |
-| **Acked messages being shed for a slow subscriber** | `increase(mqttd_publish_dropped_total{reason="backlog-overflow"}[5m]) > 0` (warn), alongside `mqttd_backlog_bytes` | A subscriber is not keeping up and the broker is truncating **already-acked** messages out of its in-memory flow-control backlog — the publisher was told nothing (issue #241, ADR 0041 T10). The WARN line names which bound fired (`bound="messages"`, `"bytes"`, or `"messages+bytes"` when one arrival tripped both), how many entries went (`dropped`), and the configured caps. Non-zero right after you set `MQTTD_MAX_BACKLOG_BYTES` means the cap is tighter than the subscriber's lag: raise it, or bound memory with `MQTTD_MAX_INFLIGHT_MESSAGES`, which gates the wire window rather than shedding — but note it does NOT remove this risk: the surplus it holds back waits in this same drop-oldest backlog, so a tight in-flight ceiling with a tight backlog bound sheds MORE, not less. `mqttd_backlog_bytes_max` (sampled on the session sweep) is the number to size the cap against — it is the LARGEST single session's backlog, which is what a per-subscriber cap must cover; `mqttd_backlog_bytes` sums every session and is the node's total RAM in backlogs, not a per-subscriber number, and a rising value with a flat counter is the warning *before* shedding starts. `queue-overflow` is a different arm — the DURABLE offline queue — and does not move with this one |
-| **Append lane saturating** | `mqttd_append_lane_jobs` growing sustained (warn); `rate(mqttd_publish_dropped_total{reason="append-backlog-full"}[5m]) > 0` (page) | A session's placement group is not keeping up (degraded follower set: each append or QoS 2 outbound-id record is bounded by the 5s replication RPC timeout, FIFO per session — 256 queued jobs max per session, then the NEWEST publish is withheld so its publisher retries; a detach spill past the cap+headroom sheds into this same counter). Only that group's sessions are affected — connects, subscribes and other groups' publishes keep flowing (issue #242). The degraded-group signals are per-session ones: this gauge/counter pair, `rate(mqttd_publish_dropped_total{reason="outbound-id-write-failed"}[5m])` (a QoS 2 outbound-id record write failed; the delivery is re-queued and retried on the next drain), and end-to-end QoS 2 delivery latency to that group's subscribers — NOT hub dispatch tails, which stay flat by design. Find the degraded group's followers: `mqttd_replica_groups_tracked - mqttd_replica_groups_current`, `mqttd_durable_append_failures_total`, and the *Durable writes refused* row |
+| **Split brain** | `count(count by (cluster_id) (mqttd_cluster_info == 1)) > 1` across the fleet | [runbook](#alert-split-brain) |
+| **Unexpected founding** | `increase(mqttd_foundings_total[1h]) > 0` after day one | [runbook](#alert-unexpected-founding) |
+| **Foreign gossip arriving** | `rate(mqttd_gossip_rejected_total{reason="cluster-mismatch"}[5m]) > 0` | [runbook](#alert-foreign-gossip-arriving) |
+| **Node self-quarantined** | `mqttd_refound_quarantine == 1` | [runbook](#alert-node-self-quarantined) |
+| **Brownout** | `mqttd_brownout == 1` (page); `sum(mqttd_store_bytes) / mqttd_store_max_bytes > 0.8 and mqttd_store_max_bytes > 0` (warn); `max by (store) (mqttd_store_bytes) / scalar(mqttd_store_max_bytes) > 0.6 and on() mqttd_store_max_bytes > 0` (warn) | [runbook](#alert-brownout) |
+| **Backup stale (RPO breached)** | `time() - mqttd_backup_last_success_timestamp_seconds > 2 * <every_secs> and mqttd_backup_last_success_timestamp_seconds > 0` (page) | [runbook](#alert-backup-stale-rpo-breached) |
+| **Restore stuck or failed** | `mqttd_restore_state == 1` for longer than the expected RTO, or `== 3` (page) | [runbook](#alert-restore-stuck-or-failed) |
+| **Memory pressure short of brownout** | `mqttd_process_resident_bytes / mqttd_memory_max_bytes > 0.9 and mqttd_memory_max_bytes > 0` for 5m (warn) | [runbook](#alert-memory-pressure-short-of-brownout) |
+| **Publishers being refused** | `rate(mqttd_quota_rejections_total{reason="brownout-publish"}[5m]) > 0` (the Prometheus label is `reason`; the OTel attribute is `kind`) | [runbook](#alert-publishers-being-refused) |
+| **Stuck drain** | `mqttd_decommission_state == 1` and `mqttd_decommission_pending` not decreasing for 10m | [runbook](#alert-stuck-drain) |
+| **Replication lag** | `mqttd_replica_groups_tracked - mqttd_replica_groups_current > 0` sustained | [runbook](#alert-replication-lag) |
+| **Quorum thinning** | `mqttd_voters < 3` (with `lease_voters = 5`) | [runbook](#alert-quorum-thinning) |
+| **Durable writes refused (under-replicated)** | `mqttd_replication_min_actual < mqttd_replication_write_floor` (page); `mqttd_replication_min_actual < mqttd_replication_desired` (warn) | [runbook](#alert-durable-writes-refused-under-replicated) |
+| **Sessions rehoming** | `rate(mqttd_session_rehomes_total{reason="stale-owner"}[5m]) > 0` (the Prometheus label is `reason`; the OTel attribute is `kind`) | [runbook](#alert-sessions-rehoming) |
+| **Sessions stuck misplaced** | `mqttd_misplaced_sessions > 0` for 2m, or `rate(mqttd_session_rehomes_total{reason="unrelocatable"}[5m]) > 0` | [runbook](#alert-sessions-stuck-misplaced) |
+| **Rehome closes being deferred** | `rate(mqttd_session_rehomes_total{reason="deferred"}[5m]) > 0` for 5m | [runbook](#alert-rehome-closes-being-deferred) |
+| **Prolonged rotation window** | `mqttd_swim_keys_accepted > 1` for > 1h | [runbook](#alert-prolonged-rotation-window) |
+| **Config divergence** | `count(count by (checksum) (mqttd_config_info == 1)) > 1` for > 15m | [runbook](#alert-config-divergence) |
+| **Degraded durable plane** | `mqttd_lease_quorum_ack_ms` growing (ADR 0049) | [runbook](#alert-degraded-durable-plane) |
+| **Hub loop held** | `histogram_quantile(0.99, rate(mqttd_hub_dispatch_seconds_bucket[5m])) > 0.1` sustained 5m (page) | [runbook](#alert-hub-loop-held) |
+| **Acked messages being shed for a slow subscriber** | `increase(mqttd_publish_dropped_total{reason="backlog-overflow"}[5m]) > 0` (warn), alongside `mqttd_backlog_bytes` | [runbook](#alert-acked-messages-being-shed-for-a-slow-subscriber) |
+| **Append lane saturating** | `mqttd_append_lane_jobs` growing sustained (warn); `rate(mqttd_publish_dropped_total{reason="append-backlog-full"}[5m]) > 0` (page) | [runbook](#alert-append-lane-saturating) |
+
+### Alert: Split brain
+
+**Rule:** `count(count by (cluster_id) (mqttd_cluster_info == 1)) > 1` across the fleet — also in the chart `PrometheusRule` (`deploy/helm/mqttd/templates/prometheusrule.yaml`) when `metrics.prometheusRule.enabled` is true.
+
+**When it fires / what to do:** Fence the new founder (see split-brain detection above)
+
+### Alert: Unexpected founding
+
+**Rule:** `increase(mqttd_foundings_total[1h]) > 0` after day one — also in the chart `PrometheusRule` (`deploy/helm/mqttd/templates/prometheusrule.yaml`) when `metrics.prometheusRule.enabled` is true.
+
+**When it fires / what to do:** Same — a node founded a second cluster
+
+### Alert: Foreign gossip arriving
+
+**Rule:** `rate(mqttd_gossip_rejected_total{reason="cluster-mismatch"}[5m]) > 0` — also in the chart `PrometheusRule` (`deploy/helm/mqttd/templates/prometheusrule.yaml`) when `metrics.prometheusRule.enabled` is true.
+
+**When it fires / what to do:** Contained, but find and fix the re-founded node
+
+### Alert: Node self-quarantined
+
+**Rule:** `mqttd_refound_quarantine == 1` — also in the chart `PrometheusRule` (`deploy/helm/mqttd/templates/prometheusrule.yaml`) when `metrics.prometheusRule.enabled` is true.
+
+**When it fires / what to do:** This node re-founded beside a live cluster and took itself out of rotation; it never recovers on its own — wipe and rejoin it (see the founder rule)
+
+### Alert: Brownout
+
+**Rule:** `mqttd_brownout == 1` (page); `sum(mqttd_store_bytes) / mqttd_store_max_bytes > 0.8 and mqttd_store_max_bytes > 0` (warn); `max by (store) (mqttd_store_bytes) / scalar(mqttd_store_max_bytes) > 0.6 and on() mqttd_store_max_bytes > 0` (warn) — also in the chart `PrometheusRule` (`deploy/helm/mqttd/templates/prometheusrule.yaml`) when `metrics.prometheusRule.enabled` is true.
+
+**When it fires / what to do:** Expand the PVC / raise the watermark / prune retained. The per-store rule finds which store is eating the budget — the mark is **aggregate on purpose** (`replicas`/`lease` grow from peers' committed appends and from consensus, with no client write to refuse), and the broker itself warns once, naming the store, above 70% of the mark. **Every watermark ratio here needs its guard clause:** an unset mark is exported as a literal `0`, so a bare divide is `+Inf` and fires on the default configuration, and a per-store numerator carries a `store` label the mark does not, so it needs `scalar()` or it matches nothing and never fires. Timing: a transition is seen within `MQTTD_WATERMARK_POLL` seconds (default 10) and within `max(1s, poll/10)` once inside 10% of the mark — which is also how long a *cleared* brownout takes to lift, i.e. how long the publish refusals outlive the pressure
+
+### Alert: Backup stale (RPO breached)
+
+**Rule:** `time() - mqttd_backup_last_success_timestamp_seconds > 2 * <every_secs> and mqttd_backup_last_success_timestamp_seconds > 0` (page) — also in the chart `PrometheusRule` (`deploy/helm/mqttd/templates/prometheusrule.yaml`) when `metrics.prometheusRule.enabled` is true.
+
+**When it fires / what to do:** No successful export in two schedule periods. The `> 0` guard is mandatory — an unconfigured backup exports a literal `0`. Check `mqttd_backup_runs_total{outcome="error"}` and the node's log: an INCOMPLETE session scan fails the run on purpose (a file missing sessions is worse than none), so the usual cause is a group that could not be read (no quorum) at export time
+
+### Alert: Restore stuck or failed
+
+**Rule:** `mqttd_restore_state == 1` for longer than the expected RTO, or `== 3` (page) — also in the chart `PrometheusRule` (`deploy/helm/mqttd/templates/prometheusrule.yaml`) when `metrics.prometheusRule.enabled` is true.
+
+**When it fires / what to do:** `1` = importing (the node is `NotReady` and its client port is closed, by design); `3` = the restore was refused or failed and the process exited non-zero. `/statusz`'s `restore.detail` and the log carry the reason — a format stamp from another build, a digest mismatch, an uncovered session set, two clusters or two generations in one directory, or a data dir that is not fresh. `2` means completed, and reads `2` on **every later boot too**, because the `restored-from` stamp makes the setting inert; `restore.detail` then says `this boot imported nothing`. A detail beginning `PARTIAL (data forfeited)` means the set was incomplete and imported anyway under `MQTTD_RESTORE_PARTIAL_ACCEPT_DATA_LOSS` — the forfeited nodes and sessions are named there and in the stamp
+
+### Alert: Memory pressure short of brownout
+
+**Rule:** `mqttd_process_resident_bytes / mqttd_memory_max_bytes > 0.9 and mqttd_memory_max_bytes > 0` for 5m (warn) — also in the chart `PrometheusRule` (`deploy/helm/mqttd/templates/prometheusrule.yaml`) when `metrics.prometheusRule.enabled` is true.
+
+**When it fires / what to do:** The last warning before the memory axis browns out. The **container/cgroup limit is the ceiling**, not this watermark: check one is actually set (the Helm chart ships `resources: {}`) and that the watermark is 75-85% of it — the gap is the overshoot allowance (`poll x allocation rate`), see [SIZING](SIZING.md)
+
+### Alert: Publishers being refused
+
+**Rule:** `rate(mqttd_quota_rejections_total{reason="brownout-publish"}[5m]) > 0` (the Prometheus label is `reason`; the OTel attribute is `kind`) — also in the chart `PrometheusRule` (`deploy/helm/mqttd/templates/prometheusrule.yaml`) when `metrics.prometheusRule.enabled` is true.
+
+**When it fires / what to do:** `QoS` ≥ 1 publish availability is degraded, not silently lost: above the watermark a publish needing a durable append is refused (v5 `0x97`, v3.1.1 no ack + close — cross-node too, as a peer-bus verdict; an older link mid-rolling-upgrade degrades to a withheld ack + close). Re-delivery is the publishing application's decision — a v5 reason ≥ `0x80` completes the packet-id lifecycle, and only a `CleanSession=0` v3.1.1 publisher resends on reconnect. Expand the PVC / raise the watermark / prune retained / let subscribers drain. `mqttd_brownout{axis}` plus `store_bytes` vs `store_max_bytes` and `process_resident_bytes` vs `memory_max_bytes` say which axis; `/statusz` gives the onset timestamp
+
+### Alert: Stuck drain
+
+**Rule:** `mqttd_decommission_state == 1` and `mqttd_decommission_pending` not decreasing for 10m — also in the chart `PrometheusRule` (`deploy/helm/mqttd/templates/prometheusrule.yaml`) when `metrics.prometheusRule.enabled` is true.
+
+**When it fires / what to do:** Inspect the drain logs; the grace deadline will fall back to crash semantics
+
+### Alert: Replication lag
+
+**Rule:** `mqttd_replica_groups_tracked - mqttd_replica_groups_current > 0` sustained — also in the chart `PrometheusRule` (`deploy/helm/mqttd/templates/prometheusrule.yaml`) when `metrics.prometheusRule.enabled` is true.
+
+**When it fires / what to do:** Node not catch-up-current; takeover from it would be degraded
+
+### Alert: Quorum thinning
+
+**Rule:** `mqttd_voters < 3` (with `lease_voters = 5`) — also in the chart `PrometheusRule` (`deploy/helm/mqttd/templates/prometheusrule.yaml`) when `metrics.prometheusRule.enabled` is true.
+
+**When it fires / what to do:** One more loss risks durable writes; restore nodes
+
+### Alert: Durable writes refused (under-replicated)
+
+**Rule:** `mqttd_replication_min_actual < mqttd_replication_write_floor` (page); `mqttd_replication_min_actual < mqttd_replication_desired` (warn) — also in the chart `PrometheusRule` (`deploy/helm/mqttd/templates/prometheusrule.yaml`) when `metrics.prometheusRule.enabled` is true.
+
+**When it fires / what to do:** **Page**: a group is below the min-replicas write floor, so durable writes are being REFUSED — QoS≥1 publishers get no ack, redeliver, and are disconnected; retained mutations queue; reads, QoS 0, acked-driven truncation and removal keep serving, but QoS 2 in-flight bookkeeping does not. Corroborate with `mqttd_durable_append_failures_total{reason="unavailable"}` climbing. **Warn**: a group merely holds fewer copies than R. Either way: restore the missing members ([TROUBLESHOOTING](TROUBLESHOOTING.md)). Do **not** lower `durable.min_replicas` to silence it unless you are consciously accepting single-copy acks. Non-durable clusters (`durable.enabled = false`) report a floor of 1, so this rule cannot fire there
+
+### Alert: Sessions rehoming
+
+**Rule:** `rate(mqttd_session_rehomes_total{reason="stale-owner"}[5m]) > 0` (the Prometheus label is `reason`; the OTel attribute is `kind`) — also in the chart `PrometheusRule` (`deploy/helm/mqttd/templates/prometheusrule.yaml`) when `metrics.prometheusRule.enabled` is true.
+
+**When it fires / what to do:** A node found itself hosting a live persistent session for a placement group it does not own and closed the connection so the client relocates to the owner (issue #284). Expected **in ones after a node roll** — each is one immediate client reconnect, and the alternative was an undeliverable session until the client's keepalive fired. A *sustained* rate means group ownership is churning, or client traffic is being opened before the lease topology has converged onto the voter set — check `mqttd_voters`, `mqttd_lease_epoch` and the *Replication lag* row. **Each close also publishes that client's Last Will**, so suppress device-offline alerting while this counter climbs
+
+### Alert: Sessions stuck misplaced
+
+**Rule:** `mqttd_misplaced_sessions > 0` for 2m, or `rate(mqttd_session_rehomes_total{reason="unrelocatable"}[5m]) > 0` — also in the chart `PrometheusRule` (`deploy/helm/mqttd/templates/prometheusrule.yaml`) when `metrics.prometheusRule.enabled` is true.
+
+**When it fires / what to do:** A live persistent session is hosted on a node that does not own its group and **cannot be rehomed**, because the owner's peer-link address is unknown to that node — so ADR 0005's degrade-don't-refuse keeps serving it locally rather than closing it into a reconnect loop. Those sessions **are undeliverable**: every publish toward them is refused and the publisher's ack withheld (`not the owning node for this group` in the hosting node's logs). This is a peer-mesh/gossip problem, not a session problem — check `mqttd_peer_links` against `mqttd_cluster_members` and the peer-link TLS rows
+
+### Alert: Rehome closes being deferred
+
+**Rule:** `rate(mqttd_session_rehomes_total{reason="deferred"}[5m]) > 0` for 5m — also in the chart `PrometheusRule` (`deploy/helm/mqttd/templates/prometheusrule.yaml`) when `metrics.prometheusRule.enabled` is true.
+
+**When it fires / what to do:** More sessions want rehoming than the per-tick close cap (32/node/s) allows, so the drain is paced (issue #284). The counter increments **once per session per deferral episode**, so its increase is the size of the backlog, not the number of ticks it took to drain. Expected for a few seconds after a scale-out or scale-in, where ~1/N of groups change owner at once — the cap is also the LWT-storm cap. Sustained means ownership is churning faster than the drain: check the *Sessions rehoming* row's causes
+
+### Alert: Prolonged rotation window
+
+**Rule:** `mqttd_swim_keys_accepted > 1` for > 1h — also in the chart `PrometheusRule` (`deploy/helm/mqttd/templates/prometheusrule.yaml`) when `metrics.prometheusRule.enabled` is true.
+
+**When it fires / what to do:** A rotation phase was never closed (see key rotation above)
+
+### Alert: Config divergence
+
+**Rule:** `count(count by (checksum) (mqttd_config_info == 1)) > 1` for > 15m — also in the chart `PrometheusRule` (`deploy/helm/mqttd/templates/prometheusrule.yaml`) when `metrics.prometheusRule.enabled` is true.
+
+**When it fires / what to do:** A config roll did not converge; check the stuck pod
+
+### Alert: Degraded durable plane
+
+**Rule:** `mqttd_lease_quorum_ack_ms` growing (ADR 0049) — also in the chart `PrometheusRule` (`deploy/helm/mqttd/templates/prometheusrule.yaml`) when `metrics.prometheusRule.enabled` is true.
+
+**When it fires / what to do:** fsync-bound consensus; check disks before sessions are refused
+
+### Alert: Hub loop held
+
+**Rule:** `histogram_quantile(0.99, rate(mqttd_hub_dispatch_seconds_bucket[5m])) > 0.1` sustained 5m (page) — also in the chart `PrometheusRule` (`deploy/helm/mqttd/templates/prometheusrule.yaml`) when `metrics.prometheusRule.enabled` is true.
+
+**When it fires / what to do:** Something is blocking the single-threaded hub loop again — every client on the node queues behind it (the head-of-line failure issue #242 removed; the `command` label says which class). Since ADR 0061 the publish path's durable appends, outbound-id records, and packet-id reservations all run off-loop, so a **publish-class tail means an inline await regressed** (the one documented exception: the backlog-overflow eviction truncate — no longer "reachable only past a 10 000-entry backlog" since issue #241, because a low `MQTTD_MAX_BACKLOG_BYTES` makes it fire on ordinary traffic, roughly one on-loop store ack per publish to that subscriber; if you see this tail, check that knob against `MQTTD_MAX_PACKET_SIZE` before hunting a regression. Routing that truncate through the session's append lane is the ADR 0061 residual that removes it); an **ack-class tail** is the documented residual — `truncate_acked`, QoS 2 phase advances (`advance_outbound`), and `clear_outbound` still run on-loop against a degraded store; an **attach-class tail** means replay reads/truncates are degraded — check `mqttd_durable_append_latency_seconds` and the durable-plane rows above
+
+### Alert: Acked messages being shed for a slow subscriber
+
+**Rule:** `increase(mqttd_publish_dropped_total{reason="backlog-overflow"}[5m]) > 0` (warn), alongside `mqttd_backlog_bytes` — also in the chart `PrometheusRule` (`deploy/helm/mqttd/templates/prometheusrule.yaml`) when `metrics.prometheusRule.enabled` is true.
+
+**When it fires / what to do:** A subscriber is not keeping up and the broker is truncating **already-acked** messages out of its in-memory flow-control backlog — the publisher was told nothing (issue #241, ADR 0041 T10). The WARN line names which bound fired (`bound="messages"`, `"bytes"`, or `"messages+bytes"` when one arrival tripped both), how many entries went (`dropped`), and the configured caps. Non-zero right after you set `MQTTD_MAX_BACKLOG_BYTES` means the cap is tighter than the subscriber's lag: raise it, or bound memory with `MQTTD_MAX_INFLIGHT_MESSAGES`, which gates the wire window rather than shedding — but note it does NOT remove this risk: the surplus it holds back waits in this same drop-oldest backlog, so a tight in-flight ceiling with a tight backlog bound sheds MORE, not less. `mqttd_backlog_bytes_max` (sampled on the session sweep) is the number to size the cap against — it is the LARGEST single session's backlog, which is what a per-subscriber cap must cover; `mqttd_backlog_bytes` sums every session and is the node's total RAM in backlogs, not a per-subscriber number, and a rising value with a flat counter is the warning *before* shedding starts. `queue-overflow` is a different arm — the DURABLE offline queue — and does not move with this one
+
+### Alert: Append lane saturating
+
+**Rule:** `mqttd_append_lane_jobs` growing sustained (warn); `rate(mqttd_publish_dropped_total{reason="append-backlog-full"}[5m]) > 0` (page) — also in the chart `PrometheusRule` (`deploy/helm/mqttd/templates/prometheusrule.yaml`) when `metrics.prometheusRule.enabled` is true.
+
+**When it fires / what to do:** A session's placement group is not keeping up (degraded follower set: each append or QoS 2 outbound-id record is bounded by the 5s replication RPC timeout, FIFO per session — 256 queued jobs max per session, then the NEWEST publish is withheld so its publisher retries; a detach spill past the cap+headroom sheds into this same counter). Only that group's sessions are affected — connects, subscribes and other groups' publishes keep flowing (issue #242). The degraded-group signals are per-session ones: this gauge/counter pair, `rate(mqttd_publish_dropped_total{reason="outbound-id-write-failed"}[5m])` (a QoS 2 outbound-id record write failed; the delivery is re-queued and retried on the next drain), and end-to-end QoS 2 delivery latency to that group's subscribers — NOT hub dispatch tails, which stay flat by design. Find the degraded group's followers: `mqttd_replica_groups_tracked - mqttd_replica_groups_current`, `mqttd_durable_append_failures_total`, and the *Durable writes refused* row
 
 `curl <pod>:8080/statusz` is the human-readable superset of all of it.
 

@@ -1,9 +1,9 @@
 # Two dashboard providers for the bench stack.
 #
-# The demo dashboards are reused as-is; the rig-only one lives in its own
-# directory because it CANNOT be dropped into demo/grafana/dashboards: the demo
-# stack ships to users, and bench_run_phase is pushed by run.sh, so the panel
-# would sit permanently at "no data" there.
+# The production dashboards are reused as-is; the rig-only one lives in its own
+# directory because it CANNOT be dropped into deploy/observability/grafana: those
+# dashboards ship to operators, and bench_run_phase is pushed by run.sh, so the
+# panel would sit permanently at "no data" there.
 #
 # It also cannot be bind-mounted as a single file into the demo directory —
 # that directory is mounted read-only, and Docker cannot create a mountpoint

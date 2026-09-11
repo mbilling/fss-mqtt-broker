@@ -110,7 +110,9 @@ holding the store) is upheld by construction.
 - Measured (same machine, same 48×8×48 shape, release): **4,119 →
   26,115 msg/s (6.3×), saturated p50 85 → 14.5 ms**, appends running at
   ~113 ops per barrier on a ~230-barriers/s volume — the store is finally
-  the limiter again, the base that issue #403's sharding then multiplies.
+  the limiter again. **As delivered (2026-09-11, issue #537 Phase 0):** issue
+  #403's sharding hypothesis was falsified (ADR 0076 amendments); K=1 remains
+  the default. That multiply is **not** a QoS 2 prerequisite.
 - The publisher-visible contract is unchanged: an ack still means the
   message is durable per its tier; a refusal still means retry. What
   changes is only that a window's messages wait **concurrently**.

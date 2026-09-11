@@ -1,6 +1,6 @@
 # External consumers: the integration blueprint
 
-How to get messages out of mqttd and into the rest of your stack — Kafka, a
+**Verified against `v1.0.16` (2026-09-11).** How to get messages out of mqttd and into the rest of your stack — Kafka, a
 webhook, a database, anything — without a rule engine, and what the broker
 does and does not promise while you do it ([ADR 0063](adr/0063-external-consumer-integration.md)).
 
@@ -12,7 +12,8 @@ three broker features that are already load-bearing elsewhere:
 
 - **cluster-wide shared subscriptions** ([ADR 0010](adr/0010-shared-subscriptions.md),
   [ADR 0015](adr/0015-cluster-shared-subscriptions.md)) — a `$share` group is
-  delivered each message **once, cluster-wide**, round-robin across members;
+  delivered each message **once, cluster-wide** (locality-preferring selection
+  by default — see [CLIENT-GUIDE.md](CLIENT-GUIDE.md#shared-subscriptions));
 - **durable persistent sessions** ([ADR 0029](adr/0029-durable-by-default.md)) —
   a QoS 1 message for a disconnected persistent member is **queued,
   quorum-replicated**, and replayed on reconnect;
@@ -33,7 +34,7 @@ so this document cannot silently rot.
    │  mqttd cluster                       │
    │   ┌────────┐  ┌────────┐  ┌────────┐ │      each message delivered ONCE,
    │   │ node-0 │  │ node-1 │  │ node-2 │ │      cluster-wide (ADR 0015),
-   │   └────────┘  └────────┘  └────────┘ │      round-robin across the group
+   │   └────────┘  └────────┘  └────────┘ │      one member of the $share group
    └────────┬────────────────────┬────────┘
             │                    │
             │   subscribe  "$share/sink/telemetry/#"   qos 1

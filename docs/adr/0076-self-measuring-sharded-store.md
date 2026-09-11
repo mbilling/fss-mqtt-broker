@@ -24,6 +24,11 @@ goes stale, and today an operator needs our bench rig to learn any of this.
 
 ## Decision
 
+> **Read the 2026-08-24 amendments before treating §2–§3 as the shipped
+> contract.** Measurement falsified default sharding (K=1) and linger (off).
+> Those slices survive only as experimental operator pins. Issue #403 is
+> **not** a prerequisite for QoS 2 work (#405 / #537 Phase 0).
+
 Three slices, measurement before adaptation, layout committed rather than
 flapping (issue #403):
 
@@ -54,12 +59,14 @@ flapping (issue #403):
 
 ## Consequences
 
-- The ceiling multiplies: the measured device does ~3.7× more barriers at
-  8 streams, on top of ADR 0075's ~113 ops/barrier batching.
+- The device probe in Context still shows ~3.7× more barriers at 8 streams.
+  **That is not the shipped broker default:** K=1 (2026-08-24 amendment). The
+  multiply is experimental-pin evidence, not production capacity.
 - Ops get the volume's truth from the broker itself — boot-time and live —
   instead of from a paid bench run.
 - A layout change (K) is a schema-versioned, operator-initiated act with an
-  advisor pointing at it; upgrades never reshard implicitly.
+  advisor pointing at it; upgrades never reshard implicitly. Default K does
+  not change at runtime.
 
 ## Alternatives considered
 

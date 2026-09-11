@@ -153,6 +153,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Status dashboard is up to date
         run: python3 scripts/gen-status.py --check
+      # ADR 0070 T3: the config reference is generated from mqtt_config the way
+      # STATUS.md is generated from delivery front-matter — an MQTTD_* knob that
+      # is not in CONFIGURATION.md is a CI failure, not a README drift.
+      - name: CONFIGURATION.md matches the config code
+        run: python3 scripts/gen-configuration.py --check
       # The delivery record must reflect the issue tracker, not run beside it:
       # gen-status enforces that every OPEN task names an issue (no network), and
       # this enforces that the issue agrees — open task/closed issue, or a done
@@ -171,7 +176,7 @@ jobs:
       # nobody has ever seen it send. Twelve of thirteen were unaudited before
       # this ran; the script explains any exemption it is carrying.
       - name: Every emittable reason code has a test that provokes it
-        run: python3 scripts/check-reason-codes.py
+        run: python3 scripts/check-reason-codes.py --check
       # Issue #260: a test that returns early instead of asserting, and a wall-clock sleep that
       # is not a bounded poll, are the two ways this suite silently stops testing — and neither
       # shows up in a `cargo test` result. Both are build failures now.

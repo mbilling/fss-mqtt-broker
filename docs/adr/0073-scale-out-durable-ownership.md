@@ -66,7 +66,7 @@ list is long and structural — recorded here so the trade is auditable:
 The control/data split gets the same scaling WITHOUT any of this: one lease
 group, one membership plane, no domains, no stairs, no re-sharding.
 
-## Decision (proposed)
+## Decision
 
 **Make every admitted member a servable durable owner; keep the bounded voter
 set as the control plane that grants and arbitrates leases.** Concretely:
@@ -194,23 +194,21 @@ again automatically.
 
 ## Delivery
 
-[docs/delivery/0073-scale-out-durable-ownership.md](../delivery/0073-scale-out-durable-ownership.md):
-T1 (the capability-gated domain + learner readiness + the end-to-end
-falsifier) and T2 (the mixed-version conservatism, unit-tested edge by edge)
-shipped together with this ADR's acceptance. T3 (grow/shrink migration soak)
-is **done** — completed 2026-08-23 with the #390 grow hand-off fix and its
-deterministic falsifier.
+[docs/delivery/0073-scale-out-durable-ownership.md](../delivery/0073-scale-out-durable-ownership.md)
+is the status source of truth (reconciled 2026-09-11, issue #537 Phase 0):
 
-T4 is decomposed into the cost-ordered stages **T4.0–T4.5**, all planned: rig
-plumbing (both ownership arms on ONE provisioning, because ADR 0077-T4 measured
-~40% variance between separately provisioned clusters running the same binary),
-then an in-tree fleet-size migration soak, a ~€0.50 smoke, small paid runs, the
-measured 7/10-node slope with its SCALE-CURVE.md/COMPARISON.md publication, and
-an hours-scale soak/node-kill/partition tail last.
-
-The earlier "T4 gated on the Hetzner quota raise" note is **withdrawn**: that
-applied to full-ladder shapes. The durable lane's shape is 10+1 = 11 servers /
-44 vCPU, inside the existing project limits with no console raise (T4.4).
+- **T1 / T2** shipped with this ADR's acceptance (2026-08-22).
+- **T3** is **done** (2026-08-23) — #390 grow hand-off fix and its
+  deterministic falsifier. The fleet-size soak still rides T4.
+- **T4.0–T4.5** are cost-ordered stages, **not** all planned as a block:
+  T4.0 / T4.2–T4.5 remain planned; **T4.1 is in-progress** (deterministic
+  3→6→9→6 soak landed 2026-09-07; the seeded fault schedule still cannot
+  reach fleet scale).
+- The earlier "T4 gated on the Hetzner quota raise" note stays **withdrawn**:
+  that applied to full-ladder (lane B) shapes. The durable lane's shape is
+  10+1 = 11 servers / 44 vCPU, inside existing project limits (T4.4).
+  `docs/benchmarks/SCALE-CURVE.md`'s "~100 vCPU requested" line is the
+  **lane B driver-fleet** ceiling from the v1.0.5 published run, not T4.4.
 
 T5 (planned) records the decision on the alternative this ADR does not take:
 independent regional/tenant cells with bounded cross-cell bridging, rather than

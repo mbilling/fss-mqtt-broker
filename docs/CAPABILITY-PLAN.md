@@ -1,5 +1,14 @@
 # MQTT Broker — Capability Plan (v0.1)
 
+**Verified against `v1.0.16` (2026-09-11).** This was the founding mission
+document. It is **retired as a living plan** (ADR 0070 T7): principles below
+still hold; live per-task status is the
+[delivery dashboard](delivery/STATUS.md). Protocol and security capabilities
+listed here shipped via that dashboard — do not treat unchecked bullets as
+remaining work. Horizontal-scale *measurement and correctness gates* live on
+issue [#537](https://github.com/mbilling/fss-mqtt-broker/issues/537), not here.
+Linear scale is a target, not a published result.
+
 **Codename:** TBD (working name: `mqttd`)
 **Mission:** The most cyber-secure MQTT broker available, built cluster-native for
 linear horizontal scalability, with a 100% open feature set. Revenue comes from
@@ -47,9 +56,8 @@ support, SLAs, certified builds, and managed hosting — never from gated featur
 - Request/Response pattern (response topic, correlation data)
 - Server-side disconnect with reason code
 - Enhanced authentication (AUTH packet, SASL-style challenge/response)
-- Subscription identifiers — codec + an honest CONNACK advertisement only (`0x29 = 0`,
-  with a SUBSCRIBE that uses one refused per §3.2.2.3.12); **delivery is not implemented**
-  and is tracked as its own issue
+- Subscription identifiers — advertised and delivered (issue #266). The v0.1
+  note that CONNACK said `0x29 = 0` is historical.
 - Will delay interval
 
 ---
@@ -147,6 +155,9 @@ WebSocket listener, an admin API).
 This roadmap is no longer tracked here. Live, per-decision build status is the
 [**delivery dashboard**](delivery/STATUS.md), derived from the delivery docs under
 [`docs/delivery/`](delivery/); the decisions themselves are in [`docs/adr/`](adr/).
+Scaling correctness and measurement gates before QoS 0/1/2 optimization are
+issue [#537](https://github.com/mbilling/fss-mqtt-broker/issues/537) — Phase 1–4
+engineering is not claimed done by retiring this page.
 
 ---
 

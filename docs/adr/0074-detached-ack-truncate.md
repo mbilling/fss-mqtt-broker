@@ -74,6 +74,9 @@ off-loop; the publisher/subscriber ack paths never wait on it.**
    > ACK that removes a prefix blocker may also await outstanding QoS 2 cleanup;
    > the pure QoS 1 path stays detached. This buys correctness, not isolation:
    > on-loop QoS 2 waits and the #575/#405 stalled-store work remain. See ADR 0057.
+   > **#537 Phase 0:** ADR 0076 measured K>1 sharding and linger slower than
+   > the defaults; do not treat #403's original adaptive-store proposal as a
+   > prerequisite for that isolation work.
 3. **Bounds, stated:** the flusher's map holds at most one offset per session;
    per-session disk lag is bounded by the flush cadence (milliseconds at the
    measured truncate latency), and entries above the flushed watermark are

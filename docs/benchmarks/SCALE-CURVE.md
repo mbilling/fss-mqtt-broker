@@ -28,8 +28,12 @@ bury**: the first honest measurement of the `relaxed` tier found it broken
   merged across drivers — coarse, but incapable of flattering.
 - **Driver fleet per size:** sizes 1 and 3 ran with **three** drivers, size 5
   with two — the account's ~40-dedicated-vCPU ceiling refuses 5×CCX23 +
-  3×CCX33. A quota raise to ~100 vCPU is requested; until then every lane B
-  driver-limited flag is reproduced below rather than hidden.
+  3×CCX33. A quota raise to ~100 vCPU is requested **for this lane B
+  driver-fleet shape**; until then every lane B driver-limited flag is
+  reproduced below rather than hidden. That request is **not** the durable
+  lane A 7/10-node slope in ADR 0073 T4.4 (10+1 = 11 servers / 44 vCPU,
+  inside existing limits — the "T4 gated on a quota raise" note is
+  withdrawn there).
 - **Absolute durable numbers move with the disk draw** (multi-tenant NVMe):
   this run drew slower volumes than v1.0.4's (floors 1,941–2,395 vs
   2,051–2,521 barriers/s, and ~2× the append latency), so its absolute rates
