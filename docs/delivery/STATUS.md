@@ -22,7 +22,7 @@
 | [0012](../adr/0012-flow-control.md) | MQTT 5.0 flow control (Receive Maximum) | Accepted | [6/6 done](0012-flow-control.md) | — |
 | [0013](../adr/0013-enhanced-authentication.md) | MQTT 5.0 enhanced authentication (AUTH exchange) | Accepted | [8/9 done](0013-enhanced-authentication.md) | 1 deferred |
 | [0014](../adr/0014-cross-node-retained.md) | Cross-node retained-message replication | Accepted | [10/10 done](0014-cross-node-retained.md) | — |
-| [0015](../adr/0015-cluster-shared-subscriptions.md) | Cluster-wide shared subscriptions | Accepted | [8/9 done](0015-cluster-shared-subscriptions.md) | 1 open |
+| [0015](../adr/0015-cluster-shared-subscriptions.md) | Cluster-wide shared subscriptions | Accepted | [9/9 done](0015-cluster-shared-subscriptions.md) | — |
 | [0016](../adr/0016-swim-membership-stability.md) | SWIM membership stability (dead-node fencing + false-positive resistance) | Accepted | [7/7 done](0016-swim-membership-stability.md) | — |
 | [0017](../adr/0017-durable-attach-readiness.md) | Durable attach waits for an authoritative session, never downgrades | Accepted | [8/9 done](0017-durable-attach-readiness.md) | 1 deferred |
 | [0018](../adr/0018-on-disk-persistence.md) | On-disk persistence for durable state | Accepted | [8/8 done](0018-on-disk-persistence.md) | — |
@@ -77,7 +77,7 @@
 | [0067](../adr/0067-compliance-framework-mappings.md) | Compliance framework mappings: IEC 62443, EU CRA, SOC 2 / ISO 27001 | Accepted | [4/4 done](0067-compliance-framework-mappings.md) | — |
 | [0068](../adr/0068-fips-cryptographic-option.md) | A FIPS 140-3 cryptographic option | Accepted | [4/4 done](0068-fips-cryptographic-option.md) | — |
 | [0069](../adr/0069-scorecard-remediation.md) | Scorecard remediation: a solution per check, honestly bounded | Accepted | [7/7 done](0069-scorecard-remediation.md) | — |
-| [0070](../adr/0070-stakeholder-documentation.md) | Usage documentation is owned by stakeholders, not by features | Proposed | [0/8 done](0070-stakeholder-documentation.md) | 8 open |
+| [0070](../adr/0070-stakeholder-documentation.md) | Usage documentation is owned by stakeholders, not by features | Proposed | [8/8 done](0070-stakeholder-documentation.md) | — |
 | [0071](../adr/0071-owner-side-group-commit.md) | # 0071. Owner-side group commit: one durable-write serializer per node | Accepted | [3/3 done](0071-owner-side-group-commit.md) | — |
 | [0072](../adr/0072-per-message-durability-selection.md) | # 0072. Per-message durability selection: the `mqttd-durability` user property | Accepted | [1/2 done](0072-per-message-durability-selection.md) | 1 open |
 | [0073](../adr/0073-scale-out-durable-ownership.md) | # 0073. Scale-out durable ownership: the voter set is a control plane, not the data path | Accepted | [3/10 done](0073-scale-out-durable-ownership.md) | 7 open |
@@ -108,10 +108,6 @@
 **0013 — MQTT 5.0 enhanced authentication (AUTH exchange)**
 
 - `0013-T8` 💤 deferred: Server-initiated re-auth (server sends AUTH 0x19 to demand re-authentication) — ADR section 4 explicitly defers this — needs a trigger mechanism and interacts with the select-loop outbound path; only client-initiated re-auth is implemented (no server-side AUTH 0x19 send exists in conn.rs).
-
-**0015 — Cluster-wide shared subscriptions**
-
-- `0015-T9` 🚧 in-progress ([#574](https://github.com/mbilling/fss-mqtt-broker/issues/574)): "ADR prose matches shipped selection: document the locality preference (#511 default) and the indexed remote path (#481/#524) alongside the original global-round-robin description, and state the load-distribution consequence" — "Dated As delivered notes on docs/adr/0010-shared-subscriptions.md and docs/adr/0015-cluster-shared-subscriptions.md (original Decision text kept). Operator consequence also in CLIENT-GUIDE.md Shared subscriptions and OPERATIONS.md shipped-alerting intro: with locality on, a consumer's share follows its host node's publisher share, not even group-wide round-robin. Fairness/spillover remains #537 Phase 3."
 
 **0017 — Durable attach waits for an authoritative session, never downgrades**
 
@@ -179,17 +175,6 @@
 
 - `0065-T5` ⬜ planned ([#553](https://github.com/mbilling/fss-mqtt-broker/issues/553)): "OSS-Fuzz onboarding for the six fuzz targets; CodeQL beside clippy in CI" — "HALF DONE (2026-08-19, delivered as 0069-T2): CodeQL for Rust runs on every PR, main push, and a weekly cron (.github/workflows/codeql.yml), findings in code scanning. REMAINING: OSS-Fuzz onboarding — an application PR to google/oss-fuzz (project.yaml + build.sh wrapping the six cargo-fuzz targets) plus a maintainer contact email; an external act with upstream review, not a repo commit."
 - `0065-T6` ⬜ planned ([#554](https://github.com/mbilling/fss-mqtt-broker/issues/554)): "Funded third-party security audit, findings published in-repo with their fixes" — "Sequenced last deliberately: an audit of the 1.0 line after the freeze (ADR 0058) audits the surface enterprises will actually run. Precondition now met (v1.0.0 shipped 2026-08-19); the remaining act is the maintainer's funding/commissioning decision (OSTIF-style), with the audit surface documents ready: THREAT-MODEL, HARDENING, AUDIT-SCHEMA, crypto-policy, the compliance mappings."
-
-**0070 — Usage documentation is owned by stakeholders, not by features**
-
-- `0070-T1` 🚧 in-progress ([#555](https://github.com/mbilling/fss-mqtt-broker/issues/555)): "docs/README.md index (every doc, its stakeholder, one line) + the README persona fork; orphans routed" — "docs/README.md lists every top-level docs/*.md with Document/Stakeholder/One line. README Start here forks evaluate/run/build/secure/contribute and routes HARDENING, THREAT-MODEL, TEST-PLAN from the front door. CI: check-readme-facts.py T8 index gate."
-- `0070-T2` 🚧 in-progress ([#556](https://github.com/mbilling/fss-mqtt-broker/issues/556)): "CLIENT-GUIDE.md: session/expiry semantics, the emitted reason-code catalogue (held to the CI-gated list), flow-control and refusal behaviour, worked client examples" — "docs/CLIENT-GUIDE.md: ADR 0009 session/expiry, ADR 0012 flow-control, refusals, mosquitto+paho examples. Emitted >=0x80 table is between reason-codes markers and rewritten by scripts/check-reason-codes.py; CI runs that script with --check."
-- `0070-T3` 🚧 in-progress ([#557](https://github.com/mbilling/fss-mqtt-broker/issues/557)): "Generated CONFIGURATION.md from the config code, CI-checked like STATUS.md; README's env list reduces to a routed summary" — "scripts/gen-configuration.py writes docs/CONFIGURATION.md from mqtt-config ENV_VARS+overlay+field rustdoc; CI gen-configuration.py --check. README Configuration tables replaced by a routed summary pointing at that file. Overlay vars that already worked were added to ENV_VARS (count 89->94) so the generator cannot omit them."
-- `0070-T4` 🚧 in-progress ([#558](https://github.com/mbilling/fss-mqtt-broker/issues/558)): "Shipped alerting: PrometheusRule in the chart + production dashboards + a runbook section per alert" — "deploy/helm/mqttd/templates/prometheusrule.yaml (metrics.prometheusRule.enabled, default false). Production dashboards in deploy/observability/grafana/. OPERATIONS.md shipped-alerting index plus a ### Alert: heading per rule whose GitHub anchor matches the PrometheusRule runbook fragment."
-- `0070-T5` 🚧 in-progress ([#559](https://github.com/mbilling/fss-mqtt-broker/issues/559)): "Kubernetes surface: helm chart READMEs, values reference, MqttdCluster CRD reference" — "docs/KUBERNETES.md routes to deploy/helm/mqttd/README.md (values) and deploy/helm/mqttd-operator/README.md (MqttdCluster CRD spec/status). README Kubernetes section points at KUBERNETES.md."
-- `0070-T6` 🚧 in-progress ([#560](https://github.com/mbilling/fss-mqtt-broker/issues/560)): "ARCHITECTURE.md for contributors (the main.rs module-doc map and hub seams, promoted to prose)" — "docs/ARCHITECTURE.md: crate map, lib.rs modules, ADR 0064 hub seams, CONTRIBUTING.md pointer."
-- `0070-T7` 🚧 in-progress ([#561](https://github.com/mbilling/fss-mqtt-broker/issues/561)): "EVALUATION.md one-pager; MIGRATION.md gains per-source entry points; CAPABILITY-PLAN refreshed or retired" — "docs/EVALUATION.md one-pager. MIGRATION.md per-source jump table (Mosquitto/EMQX/HiveMQ + dual-run). CAPABILITY-PLAN.md retired as a living plan; live status is delivery/STATUS.md, scaling gates on #537."
-- `0070-T8` 🚧 in-progress ([#562](https://github.com/mbilling/fss-mqtt-broker/issues/562)): "The index gate: docs/README.md completeness check joins check-readme-facts.py; version stamps on every stakeholder doc" — "scripts/check-readme-facts.py: every docs/*.md except the index must appear as ](name) in docs/README.md, the Document/Stakeholder/One line table must exist, and each file header must carry Verified against / Dated / Generated against / GENERATED."
 
 **0072 — # 0072. Per-message durability selection: the `mqttd-durability` user property**
 
