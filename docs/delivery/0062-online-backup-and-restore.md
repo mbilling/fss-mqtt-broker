@@ -111,6 +111,38 @@ and the evidence.
   reproduced socket-bind race. Keep #597 open for that remaining investigation;
   do not erase the failure or describe passing reruns as its repair.
 
+## Root cause of the historical formation failure (#597, 2026-09-11)
+
+The remaining #597 failure — `a_live_cluster_export_restores…`'s fresh target
+cluster panicking with "spawned cluster never became ready — every node is still
+RUNNING but did not converge" — is a **test-harness deadline mismatch, not a
+broker defect**. Evidence and reasoning:
+
+- The failure appeared only in full-workspace parallel runs (1 of 2 historical
+  runs) and never in 12+ idle sequential reproductions or 10 varied-seed
+  formation probes on the same commit.
+- The historical log tails showed normal formation progress (peer links, Raft
+  votes, no error, no panic) with all three nodes RUNNING — exactly the state of
+  a restore still importing.
+- A cluster restore keeps `/readyz` NotReady BY DESIGN (ADR 0062) until its
+  import finishes, and its production budget is `restore_timeout_secs` —
+  **default 300s**. The harness's `wait_all_ready` abandoned at **60s**. Under
+  loaded runners, lease convergence plus the sequential import legitimately
+  crossed 60s, and the wait mislabeled a healthy mid-restore cluster as
+  "never converged".
+
+Fix: the convergence wait is now **restore-aware and state-based**. While any
+node's `/readyz` reports `restore-in-progress` (observable evidence, not a
+guess), the budget extends to the documented 300s window plus one ordinary
+formation budget (360s total). A restore that FAILS exits the process non-zero
+and is reported immediately by the exited-node check; a restore stuck past its
+own production budget fails with full readyz/statusz/log diagnostics naming the
+restore state. No blanket retries, no hidden failure, no broker change.
+Unit-tested via `convergence_budget`; `ProcNode::restore_in_progress` reads the
+same operator surface an orchestrator would. Failed runs retain their whole
+temporary directory (`MQTTD_TEST_KEEP_RESTORE=1` keeps it unconditionally),
+replacing the lost post-mortem evidence from the first occurrence.
+
 ## Why this shape
 
 Issue #249's two acceptable exits were "ship an online export + import with a documented

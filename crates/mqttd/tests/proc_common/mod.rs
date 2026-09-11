@@ -415,6 +415,18 @@ impl ProcNode {
         Some((ready, members, lease))
     }
 
+    /// Whether this node reports a restore importing on `/readyz` (ADR 0062):
+    /// the one documented state in which `NotReady` is expected for up to
+    /// `restore_timeout_secs` (default 300s). A cluster restore legitimately
+    /// waits for the durable plane and imports for minutes — a convergence wait
+    /// that ignores this mislabels a healthy mid-restore node as "never
+    /// converged" (#597).
+    pub async fn restore_in_progress(&self) -> bool {
+        http_get(self.health_addr, "/readyz")
+            .await
+            .is_some_and(|body| body.contains("\"restore\":{\"in_progress\":true"))
+    }
+
     /// This node's `/statusz` replication view (issue #167/#239):
     /// `(placement members, min_actual, write_floor, floor_is_derived)`, or `None`
     /// while unreachable/unparseable. Same naive field scan as `readyz` — the shape
@@ -1228,15 +1240,30 @@ pub async fn retained_seen(addr: SocketAddr, client_id: &str, topic: &str) -> Op
     }
 }
 
+/// Convergence budget for an ordinary formation: nodes form in seconds; a
+/// minute covers loaded CI runners many times over.
+#[must_use]
+pub fn convergence_budget(restoring_seen: bool) -> Duration {
+    if restoring_seen {
+        // ADR 0062's documented restore window (`restore_timeout_secs`, default
+        // 300s) plus one ordinary formation budget. While a node is provably
+        // mid-restore, NotReady is the DESIGNED state, not a stall (#597).
+        Duration::from_secs(300 + 60)
+    } else {
+        Duration::from_secs(60)
+    }
+}
+
 /// Bring-up on the operator's signal: every spawned node's `/readyz` reports
 /// full membership and a ready lease group.
 pub async fn wait_all_ready(nodes: &mut [ProcNode], seed: u64) {
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let started = Instant::now();
+    let mut restoring_seen = false;
     loop {
         // A node that is not RUNNING will never become ready. Say which one and
-        // why, now — rather than burning the full 60s to report a generic
-        // timeout whose real cause (a startup `AddrInUse`) was legible only to
-        // someone who read three log tails to the bottom.
+        // why, now — rather than burning the budget to report a generic timeout
+        // whose real cause (a startup `AddrInUse`, a failed restore) was legible
+        // only to someone who read three log tails to the bottom.
         for n in nodes.iter_mut() {
             if let Some(status) = n.exited() {
                 let tail = log_tail(&n.log_path);
@@ -1253,11 +1280,18 @@ pub async fn wait_all_ready(nodes: &mut [ProcNode], seed: u64) {
                 }
                 None => all = false,
             }
+            // State-based patience: a mid-restore node is NotReady BY DESIGN
+            // (ADR 0062) while its import runs against the settled ring. Extend
+            // the budget only on that observable evidence; a restore that FAILS
+            // exits the process and the exited-check above reports it at once.
+            if n.restore_in_progress().await {
+                restoring_seen = true;
+            }
         }
         if all {
             return;
         }
-        if Instant::now() >= deadline {
+        if started.elapsed() >= convergence_budget(restoring_seen) {
             for n in nodes.iter() {
                 eprintln!(
                     "---- {} readyz={:?} statusz={:?} ----\n{}",
@@ -1267,7 +1301,18 @@ pub async fn wait_all_ready(nodes: &mut [ProcNode], seed: u64) {
                     log_tail(&n.log_path)
                 );
             }
-            panic!("seed {seed}: spawned cluster never became ready — every node is still RUNNING but did not converge (log tails above)");
+            panic!(
+                "seed {seed}: spawned cluster never became ready — every node is still RUNNING \
+                 but did not converge within {}s{} (full readyz/statusz/log tails above)",
+                convergence_budget(restoring_seen).as_secs(),
+                if restoring_seen {
+                    " — restore-in-progress was observed, so the extended ADR 0062 window \
+                     applied; a restore still running past its own budget is the defect to \
+                     read from the statusz blocks"
+                } else {
+                    ""
+                }
+            );
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
