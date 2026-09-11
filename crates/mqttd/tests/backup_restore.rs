@@ -95,6 +95,21 @@ fn restore_lines(nodes: &[ProcNode]) -> String {
         .join("\n")
 }
 
+/// The #597 contract: the extended budget applies only on OBSERVED
+/// restore-in-progress evidence, and matches ADR 0062's production window.
+#[test]
+fn the_extended_budget_follows_observed_restore_state() {
+    assert_eq!(
+        proc_common::convergence_budget(false),
+        Duration::from_secs(60)
+    );
+    assert_eq!(
+        proc_common::convergence_budget(true),
+        Duration::from_secs(360)
+    );
+    assert!(proc_common::convergence_budget(true) > proc_common::convergence_budget(false));
+}
+
 /// Wait for one node's `/readyz` to report ready (the operator's own signal).
 async fn wait_ready(node: &ProcNode, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;

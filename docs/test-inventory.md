@@ -1354,7 +1354,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 
 - `export_and_restore_wall_clock_at_stated_fixtures` — `#[ignore]`d
 
-## `crates/mqttd/tests/backup_restore.rs` — 7 test(s)
+## `crates/mqttd/tests/backup_restore.rs` — 8 test(s)
 
 - `a_live_cluster_export_restores_sessions_retained_and_acked_facts`
 - `a_restore_whose_format_stamp_does_not_match_refuses_and_the_node_does_not_start`
@@ -1363,6 +1363,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `cleanup::standalone_is_reaped_when_setup_panics`
 - `sigusr2_on_a_node_with_no_backup_dir_is_a_no_op_not_a_death`
 - `startup::a_live_process_is_not_ready_while_client_startup_is_held`
+- `the_extended_budget_follows_observed_restore_state`
 
 ## `crates/mqttd/tests/binary_smoke.rs` — 11 test(s)
 

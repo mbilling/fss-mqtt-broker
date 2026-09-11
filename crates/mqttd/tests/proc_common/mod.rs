@@ -1440,17 +1440,3 @@ pub async fn oracle_acked_facts(proc: &mut Proc) {
         }
     }
 }
-
-#[cfg(test)]
-mod convergence_tests {
-    use super::{convergence_budget, Duration};
-
-    /// The #597 contract: the extended budget applies only on OBSERVED
-    /// restore-in-progress evidence, and matches ADR 0062's production window.
-    #[test]
-    fn the_extended_budget_follows_observed_restore_state() {
-        assert_eq!(convergence_budget(false), Duration::from_secs(60));
-        assert_eq!(convergence_budget(true), Duration::from_secs(360));
-        assert!(convergence_budget(true) > convergence_budget(false));
-    }
-}
