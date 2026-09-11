@@ -658,7 +658,10 @@ A restore rebuilds **data** into a **fresh** cluster. It never merges into a ser
    port is bound until the import finishes; `/statusz` carries a `restore` block, and
    `mqttd_restore_state` is `1` while it runs, `2` on success, `3` on failure. Any failure
    exits the process non-zero: a broker never starts on a half-imported store.
-5. Check `mqttd_restore_state == 2` on every node, then let clients reconnect.
+5. Check `mqttd_restore_state == 2` **and HTTP 200 from `/readyz`** on every node,
+   then let clients reconnect. Import completion alone is not readiness:
+   `/readyz` and `/statusz` expose `startup_complete`, which stays false until all
+   configured client listeners have bound (#597).
 
 **Leave `MQTTD_RESTORE_FROM` in place afterwards.** A completed restore writes a
 `restored-from` stamp (a JSON record of the source, the instant, the files, the set digest
@@ -666,6 +669,14 @@ and anything forfeited) into the data dir, and the node's next ordinary start â€
 reschedule, an OOM kill, a rolling upgrade â€” reads it, reports
 `backup.restore_from is INERT this boot`, and starts normally on the data it already holds.
 Pointing an already-restored node at a *different* source is refused: that would be a merge.
+
+**A normal rejoin is not a backup import.** Keep the surviving disk state, but do
+not assume that its former ownership is still valid. If ownership moved while the
+node was down, current committed leases and replica epoch fences govern access;
+legitimate ownership requires recovery against the current replica history before
+serving. An old epoch is not authority, but it is not a reason to wipe committed
+data. The import stamp grants permission to reopen the volume, not to reclaim
+sessions from their current owner.
 
 **Several generations in one directory are fine.** `keep` defaults to 7, so the directory
 you copied off the volume normally holds several exports per node. The restore selects the

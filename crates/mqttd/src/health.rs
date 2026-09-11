@@ -90,6 +90,8 @@ pub struct HealthState {
     placement: Option<Arc<RwLock<Placement>>>,
     durable: Option<DurablePlane>,
     min_members: usize,
+    /// Startup wiring has finished, including binding every configured client listener.
+    startup_complete: Arc<std::sync::atomic::AtomicBool>,
     /// Set on graceful shutdown (ADR 0019): `/readyz` reports not-ready while draining
     /// so orchestrators stop routing new traffic, but `/livez` stays up so we are not
     /// killed mid-drain.
@@ -149,9 +151,11 @@ impl std::fmt::Debug for HealthState {
 }
 
 /// A readiness snapshot, serialized into the `/readyz` JSON body.
+#[allow(clippy::struct_excessive_bools)] // independent readiness predicates, not mutually exclusive states
 struct Report {
     live: bool,
     ready: bool,
+    startup_complete: bool,
     members: Option<usize>,
     lease_group_ready: Option<bool>,
     /// `(pending hand-offs, rounds, complete)` when a decommission drain is
@@ -176,8 +180,8 @@ impl Report {
         use std::fmt::Write;
         let status = if self.ready { "ok" } else { "unavailable" };
         let mut s = format!(
-            "{{\"status\":\"{status}\",\"live\":{},\"ready\":{}",
-            self.live, self.ready
+            "{{\"status\":\"{status}\",\"live\":{},\"ready\":{},\"startup_complete\":{}",
+            self.live, self.ready, self.startup_complete
         );
         if let Some(m) = self.members {
             let _ = write!(s, ",\"members\":{m}");
@@ -222,6 +226,7 @@ impl HealthState {
             placement,
             durable,
             min_members,
+            startup_complete: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             decommission: Arc::new(OnceLock::new()),
             metrics: None,
@@ -236,6 +241,15 @@ impl HealthState {
             config: None,
             keys: None,
         }
+    }
+
+    /// Hold readiness until the caller finishes startup. Production installs a false
+    /// flag before starting health and sets it only after all client listeners bind.
+    /// Liveness and the other readiness gates remain independent.
+    #[must_use]
+    pub fn with_startup_complete(mut self, flag: Arc<std::sync::atomic::AtomicBool>) -> Self {
+        self.startup_complete = flag;
+        self
     }
 
     /// Enable `GET /statusz` (ADR 0054): the structured operator-facing state body.
@@ -406,7 +420,11 @@ impl HealthState {
             .backup
             .as_ref()
             .is_some_and(|b| b.restore_in_progress());
-        let ready = !restoring
+        let startup_complete = self
+            .startup_complete
+            .load(std::sync::atomic::Ordering::Acquire);
+        let ready = startup_complete
+            && !restoring
             && !refound_quarantined
             && !draining
             && live
@@ -430,6 +448,7 @@ impl HealthState {
         Report {
             live,
             ready,
+            startup_complete,
             members,
             lease_group_ready,
             decommission,
@@ -471,13 +490,14 @@ impl HealthState {
         let (node_id, cluster) = self.identity.as_ref()?;
         let report = self.readiness().await;
         let mut s = format!(
-            "{{\"node_id\":\"{}\",\"version\":\"{}\",\"crypto\":\"{}\",\"founder\":{},\"ready\":{},\"live\":{}",
+            "{{\"node_id\":\"{}\",\"version\":\"{}\",\"crypto\":\"{}\",\"founder\":{},\"ready\":{},\"live\":{},\"startup_complete\":{}",
             json_escape(node_id),
             env!("CARGO_PKG_VERSION"),
             mqtt_net::tls::crypto_module(),
             cluster.founder(),
             report.ready,
             report.live,
+            report.startup_complete,
         );
         // The cluster identity (ADR 0054 T2): absent until known (a joiner before
         // its first authenticated contact). The operator's split-brain check is
@@ -908,6 +928,25 @@ mod tests {
         drop(rx);
         let dead = HealthState::new(tx, None, None, 1);
         assert_eq!(super::route(&dead, "/livez").await.0, 503);
+    }
+
+    #[tokio::test]
+    async fn startup_must_finish_before_readiness_but_does_not_override_other_gates() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let complete = Arc::new(AtomicBool::new(false));
+        let state = HealthState::new(spawn_live_hub(), Some(placement(1)), None, 1)
+            .with_startup_complete(complete.clone());
+        assert_eq!(super::route(&state, "/livez").await.0, 200);
+        let (code, body, _) = super::route(&state, "/readyz").await;
+        assert_eq!(code, 503, "a live hub is not yet a bound MQTT listener");
+        assert!(body.contains("\"startup_complete\":false"));
+        complete.store(true, Ordering::Release);
+        assert_eq!(super::route(&state, "/readyz").await.0, 200);
+        state.draining_handle().store(true, Ordering::Release);
+        assert_eq!(super::route(&state, "/readyz").await.0, 503);
+        let below_floor = HealthState::new(spawn_live_hub(), Some(placement(1)), None, 2)
+            .with_startup_complete(complete);
+        assert_eq!(super::route(&below_floor, "/readyz").await.0, 503);
     }
 
     #[tokio::test]

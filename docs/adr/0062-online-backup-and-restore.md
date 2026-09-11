@@ -336,6 +336,28 @@ Identity is the **source path string**, deliberately not the file list: a backup
 keeps receiving exports, so comparing file lists would fail on the next boot and recreate
 the crash loop.
 
+### 8. Restart readiness is not restored ownership (#597, 2026-09-11)
+
+A completed import stamp permits reopening the data directory; it grants **no
+ownership**. A returning node must follow current placement and committed leases.
+A stale placement view is insufficient when the lease belongs elsewhere, and
+replicas fence an old epoch. If ownership is legitimately granted again, recovery
+reconciles and re-commits the surviving history, including newer truncation
+watermarks, before serving. An epoch change invalidates authority, not all older
+committed data: do not wipe a returning node merely because ownership moved.
+The disk-backed `cluster_store::tests::restart` regression exercises these cases
+with controlled leases and replica transport, not a real Raft/network failover.
+
+Nor does a recovered lease group or completed import imply that MQTT startup has
+finished. The reproduced #597 single-node restart race reported Ready before the
+client socket existed. Production now holds a separate `startup_complete` gate
+false until **every configured client listener has bound successfully**; both
+`/readyz` and `/statusz` expose it. Liveness remains independent, and completing
+startup does not bypass membership, lease, restore or drain gates. The FIFO-held
+startup process test makes this ordering deterministic without sleeping past the
+race. This startup gate does not promise session-specific catch-up or diagnose
+every multi-node formation timeout.
+
 ## Consequences
 
 ### What ships

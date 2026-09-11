@@ -20,8 +20,14 @@
 //! lie), **retained values with their properties**, and **acknowledged QoS-2 flows** (the
 //! dedup window's acked bit, issue #238 — the fact that is invisible unless you re-send).
 
+#[cfg(unix)]
+#[path = "backup_restore/cleanup.rs"]
+mod cleanup;
 mod common;
 mod proc_common;
+#[cfg(unix)]
+#[path = "backup_restore/startup.rs"]
+mod startup;
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -836,6 +842,10 @@ impl Standalone {
     }
 
     fn spawn(&mut self) {
+        assert!(
+            self.child.is_none(),
+            "stop the previous process before respawning"
+        );
         let log = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -892,6 +902,12 @@ impl Standalone {
             let _ = c.kill();
             let _ = c.wait();
         }
+    }
+}
+
+impl Drop for Standalone {
+    fn drop(&mut self) {
+        self.stop();
     }
 }
 
@@ -1038,36 +1054,21 @@ async fn a_restored_node_restarts_with_its_own_unchanged_environment() {
     );
 
     // And the restored state survived the restart — the reason the boot had to succeed.
-    //
-    // `/readyz` can go true on this INERT boot before the MQTT listener binds:
-    // restore_disposition already cleared `restore_from` and stamped restore
-    // completed, so `restore_in_progress` never holds the gate, and Ready is
-    // hub-live + lease-group only. `connect_v311_within` returns `None` on the
-    // first refused TCP connect (it does not retry). Poll until a CONNACK
-    // arrives; a successful CONNACK with `session_present=false` is a real
-    // failure (the restored session was discarded), not a race, so it is not
-    // retried.
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let present = loop {
-        if let Some((_sub, present)) = common::Client::connect_v311_within(
-            restored.client,
-            sub_id,
-            false,
-            Duration::from_secs(8),
+    // Ready now includes the MQTT binds (#597). Keep one connection attempt:
+    // retrying a refused TCP connection would mask a regression in that gate.
+    let (_sub, present) = common::Client::connect_v311_within(
+        restored.client,
+        sub_id,
+        false,
+        Duration::from_secs(20),
+    )
+    .await
+    .unwrap_or_else(|| {
+        panic!(
+            "the restored subscriber reconnects after the restart\n{}",
+            restored.log()
         )
-        .await
-        {
-            break present;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the restored subscriber never got a CONNACK after the restart \
-             (/readyz was already true; a refused MQTT connect is retried, a \
-             missing session is not):\n{}",
-            log_notables(&restored.log_path, 40)
-        );
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    };
+    });
     assert!(
         present,
         "the restored session must still be there after an ordinary restart:\n{}",

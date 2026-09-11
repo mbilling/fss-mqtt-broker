@@ -689,6 +689,8 @@ impl<S: LeaseSource, T: ReplicaTransport + Clone + 'static> ReplicatedLog for Gr
 
 #[cfg(test)]
 mod tests {
+    mod restart;
+
     use super::{GroupRoutedLog, LeaseSource};
     use crate::cluster_log::{ReplOp, ReplicaState};
     use crate::lease::Epoch;

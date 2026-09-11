@@ -636,6 +636,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // /livez (hub responsive) and /readyz (mesh + durable-store ready). Keep a plane
     // handle to stop openraft cleanly on shutdown.
     let plane_for_shutdown = durable_plane.clone();
+    let startup_complete = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let (draining, decommission_slot) = start_health(
         &config,
         &hub_tx,
@@ -649,6 +650,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &config_stamp,
         &swim_key_fps,
         &backup_status,
+        &startup_complete,
         // Arm the guard only for a cluster node that has not opted out.
         (cluster_configured && config.cluster.refound_guard).then(|| foreign_cluster_seen.clone()),
         cluster_configured.then(|| swim_isolated.clone()),
@@ -986,6 +988,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &connections,
     )
     .await?;
+    // A restored lease group can be ready before startup reaches the MQTT binds.
+    // Do not route clients here until every configured listener actually exists.
+    startup_complete.store(true, std::sync::atomic::Ordering::Release);
 
     // Share the (now fully-configured) reloader between the SIGHUP handler and the optional
     // filesystem watcher; both drive the same validate-before-swap routine.
@@ -2228,6 +2233,7 @@ async fn start_health(
     config_stamp: &Arc<mqttd::reload::ConfigStamp>,
     swim_key_fps: &Arc<std::sync::OnceLock<Vec<String>>>,
     backup_status: &Arc<mqttd::backup::BackupStatus>,
+    startup_complete: &Arc<std::sync::atomic::AtomicBool>,
     refound_evidence: Option<Arc<std::sync::atomic::AtomicBool>>,
     swim_isolated: Option<Arc<std::sync::atomic::AtomicBool>>,
     store_probe: Arc<mqttd::store_probe::ProbeSlot>,
@@ -2260,6 +2266,7 @@ async fn start_health(
         min_members,
     )
     .with_metrics(metrics)
+    .with_startup_complete(startup_complete.clone())
     // /statusz (ADR 0054): the structured operator-facing state body; the cluster
     // identity fills its founder flag and (once known) cluster_id.
     .with_status(
