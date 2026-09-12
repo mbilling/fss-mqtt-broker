@@ -18,6 +18,8 @@ client_id = "fss-bridge-demo"
 [spool]
 dir = "/data"          # disk-backed spool survives a bridge restart
 max_messages = 10000
+# max_bytes = 0        # unset / 0 = unbounded (count bound only). Set a budget
+                       # so 10 000 × large payloads cannot grow without limit.
 
 [[upstreams]]
 name = "partner"

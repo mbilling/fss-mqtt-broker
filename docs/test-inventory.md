@@ -163,7 +163,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `token::tests::wrong_audience_is_rejected_when_audience_is_configured`
 - `token::tests::wrong_issuer_is_rejected_when_issuer_is_configured`
 
-## `crates/mqtt-bridge/src/lib.rs` — 51 test(s)
+## `crates/mqtt-bridge/src/lib.rs` — 62 test(s)
 
 - `client::tests::bridge_subscriptions_set_no_local_and_retain_as_published`
 - `config::tests::a_both_rule_with_a_remap_is_rejected`
@@ -177,6 +177,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `config::tests::an_out_of_range_qos_is_rejected`
 - `config::tests::both_password_sources_are_rejected`
 - `config::tests::duplicate_upstream_names_are_rejected`
+- `config::tests::spool_max_bytes_parses_and_defaults_to_unbounded`
 - `config::tests::the_demo_config_parses`
 - `config::tests::valid_filters_pass_and_malformed_ones_fail`
 - `engine::default_id_tests::a_fleet_of_pod_names_generates_no_duplicates`
@@ -210,10 +211,20 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `spool::tests::a_disk_spool_enforces_the_cap`
 - `spool::tests::a_disk_spool_survives_a_reopen_and_replays`
 - `spool::tests::a_foreign_schema_version_fails_closed`
+- `spool::tests::a_message_larger_than_the_byte_budget_does_not_empty_the_spool`
+- `spool::tests::a_v1_disk_record_round_trips_under_the_byte_bound`
+- `spool::tests::an_undecodable_record_is_drained_evicted_and_never_accounted`
 - `spool::tests::an_unstamped_pre_gate_spool_is_adopted_with_its_messages`
+- `spool::tests::both_bounds_together_the_first_reached_wins`
 - `spool::tests::encode_decode_round_trips_the_retain_flag`
 - `spool::tests::in_memory_spool_is_bounded_drop_oldest_and_replays_in_order`
+- `spool::tests::message_bytes_counts_topic_payload_and_user_properties`
+- `spool::tests::refuse_at_the_byte_bound_keeps_accepted_messages`
+- `spool::tests::the_byte_bound_triggers_independently_of_the_count_bound`
+- `spool::tests::the_byte_counter_equals_a_recomputed_sum_after_every_mutation`
 - `spool::tests::the_codec_round_trips_a_message_with_user_properties`
+- `spool::tests::the_count_bound_still_bites_when_it_is_the_tighter_one`
+- `spool::tests::the_default_byte_bound_is_off_so_behaviour_matches_today`
 - `spool::tests::the_migration_registry_covers_the_contract_range`
 - `spool::tests::the_refuse_policy_keeps_what_it_accepted_and_rejects_the_newcomer`
 

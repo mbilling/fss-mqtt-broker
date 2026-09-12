@@ -311,8 +311,20 @@ Three things to know:
 
 The spool is **fsync-durable** on commit (ADR 0060 T3), and a QoS ≥ 1 rule **refuses to start**
 without a durable spool — set `[spool].dir`, or `[spool].allow_ephemeral_spool = true` to accept
-loss on restart (ADR 0060 T4). A spool-full drop is **audited** (topic + reason), not just
-counted (T5), so a lost auditable crossing leaves a trail.
+loss on restart (ADR 0060 T4). A spool-full drop is **audited** (topic + reason + bound + sizes),
+not just counted (T5 / ADR 0041 T7), so a lost auditable crossing leaves a trail. The count
+bound (`spool.max_messages`, default 10 000) and the byte bound (`spool.max_bytes`, default
+unset / 0 = off) join: first reached wins, with the same overflow policy. A message larger
+than the entire byte budget is dropped or refused on its own — the spool is not emptied
+trying to make room.
+
+**Reopen cost of the byte bound.** The running byte total is rebuilt by decoding
+every record on open (runtime state — the on-disk layout is unchanged), so
+reopening a FULL spool reads and decodes its entire accounted content before the
+bridge serves anything: at the motivating size, 10 000 × 1 MiB payloads is
+~10 GiB of decode on restart. That is the price of exact accounting without a
+schema bump; size `[spool].dir`'s volume and your restart window knowing the
+reopen scales with resident bytes, not just the message count.
 
 **The acknowledgement is no longer sent on arrival.** The bridge used to PUBACK a `QoS`≥1
 message the moment it read it — before doing anything durable with it — so the source dropped

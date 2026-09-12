@@ -108,6 +108,10 @@ def parse_rustdoc_by_var(src: str) -> dict[str, str]:
             current.append(line[7:].strip())
             continue
         if current:
+            # Attributes (`#[serde(...)]`) sit between rustdoc and the field;
+            # skip them so the docs still attach.
+            if not line.strip() or line.strip().startswith("#["):
+                continue
             para = " ".join(p for p in current if p)
             is_field = bool(re.match(r"\s+pub [a-z0-9_]+(?:\s*:|\()", line))
             if is_field:
@@ -260,7 +264,18 @@ def main() -> int:
         )
         return 1
 
-    text = render(env_vars, parse_toml_keys(src), parse_rustdoc_by_var(src))
+    docs = parse_rustdoc_by_var(src)
+    # Bridge knobs live in mqtt-bridge, not mqtt-config (ADR 0025). Their rustdoc
+    # still names MQTTD_* so the generated page describes them instead of the
+    # generic "experimental / ADR 0076" fallback used for un-documented side channels.
+    docs.update(
+        parse_rustdoc_by_var(
+            (ROOT / "crates" / "mqtt-bridge" / "src" / "config.rs").read_text(
+                encoding="utf-8"
+            )
+        )
+    )
+    text = render(env_vars, parse_toml_keys(src), docs)
     if check:
         if not OUT.exists() or OUT.read_text(encoding="utf-8") != text:
             print(

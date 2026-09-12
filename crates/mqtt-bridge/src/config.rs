@@ -65,9 +65,19 @@ pub struct Spool {
     /// does not survive a bridge restart.
     #[serde(default)]
     pub dir: Option<String>,
-    /// Per-side spool cap in messages (drop-oldest past it). Default 10000.
+    /// Per-side spool cap in messages. Default 10000. Env
+    /// `MQTTD_BRIDGE_SPOOL_MAX_MESSAGES` overlays the TOML key (file then env,
+    /// ADR 0046).
     #[serde(default = "default_spool_max")]
     pub max_messages: usize,
+    /// Per-side spool cap in accounted bytes (ADR 0041 T7 / issue #540). Env
+    /// `MQTTD_BRIDGE_SPOOL_MAX_BYTES`. `0` (the default, and the value of an
+    /// unset key) means **unbounded**: the count bound stays the only active
+    /// bound, so an existing deployment that sets nothing does not silently
+    /// shrink. Both bounds are enforced when this is set — first reached wins
+    /// — with the same [`crate::spool::Overflow`] policy as the count bound.
+    #[serde(default)]
+    pub max_bytes: u64,
     /// Permit running a QoS≥1 rule with no durable spool (ADR 0060 T4). Default `false`: a
     /// QoS≥1 rule without a durable `dir` is refused, because the source's ack is meant to be
     /// gated on durability and an in-memory spool loses acked messages on any restart. Set
@@ -82,6 +92,7 @@ impl Default for Spool {
             dir: None,
             max_messages: default_spool_max(),
             allow_ephemeral_spool: false,
+            max_bytes: 0,
         }
     }
 }
@@ -425,6 +436,47 @@ mod tests {
         assert_eq!(cfg.local.url, "127.0.0.1:1883");
         assert_eq!(cfg.hop_count_limit, 8, "default hop limit");
         assert!(cfg.upstreams.is_empty());
+        assert_eq!(cfg.spool.max_messages, 10_000, "default count bound");
+        assert_eq!(
+            cfg.spool.max_bytes, 0,
+            "unset max_bytes is unbounded — the count bound stays the only active bound"
+        );
+    }
+
+    #[test]
+    fn spool_max_bytes_parses_and_defaults_to_unbounded() {
+        // ADR 0041 T7: 0 / omitted = off. A positive value is the byte budget.
+        let omitted = BridgeConfig::parse_toml(
+            r#"
+            [local]
+            url = "127.0.0.1:1883"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(omitted.spool.max_bytes, 0);
+
+        let explicit_off = BridgeConfig::parse_toml(
+            r#"
+            [local]
+            url = "127.0.0.1:1883"
+            [spool]
+            max_bytes = 0
+            "#,
+        )
+        .unwrap();
+        assert_eq!(explicit_off.spool.max_bytes, 0);
+
+        let set = BridgeConfig::parse_toml(
+            r#"
+            [local]
+            url = "127.0.0.1:1883"
+            [spool]
+            max_bytes = 1048576
+            "#,
+        )
+        .unwrap();
+        assert_eq!(set.spool.max_bytes, 1_048_576);
+        assert_eq!(set.spool.max_messages, 10_000, "count default is unchanged");
     }
 
     #[test]

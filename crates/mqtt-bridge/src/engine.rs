@@ -308,9 +308,18 @@ fn spawn_router(
 }
 
 /// Build a side's spool: disk-backed under `spool.dir` when configured (so it survives a
-/// bridge restart), else in-memory — both bounded to `spool.max_messages` (§7).
+/// bridge restart), else in-memory — bounded to `spool.max_messages` and, when set,
+/// `spool.max_bytes` (§7, ADR 0041 T7).
 fn build_spool(cfg: &BridgeConfig, side: Side) -> Arc<Spool> {
     let cap = cfg.spool.max_messages;
+    let max_bytes = cfg.spool.max_bytes;
+    let label = match side {
+        Side::Local => "local".to_string(),
+        Side::Upstream(i) => cfg
+            .upstreams
+            .get(i)
+            .map_or_else(|| format!("upstream-{i}"), |u| u.name.clone()),
+    };
     // ADR 0060 T5: a QoS≥1 rule refuses at the cap (everything spooled was already acked to the
     // source, so shedding it loses a message the source believes was delivered); a QoS-0-only
     // bridge drops the oldest, since QoS 0 promises nothing and a stalled crossing is worse.
@@ -318,6 +327,13 @@ fn build_spool(cfg: &BridgeConfig, side: Side) -> Arc<Spool> {
         Overflow::Refuse
     } else {
         Overflow::DropOldest
+    };
+    let finish = |s: Spool| {
+        Arc::new(
+            s.with_overflow(overflow)
+                .with_max_bytes(max_bytes)
+                .with_label(label.clone()),
+        )
     };
     match &cfg.spool.dir {
         Some(dir) => {
@@ -327,7 +343,7 @@ fn build_spool(cfg: &BridgeConfig, side: Side) -> Arc<Spool> {
             };
             let path = std::path::Path::new(dir).join(file);
             match Spool::on_disk(&path, cap) {
-                Ok(s) => Arc::new(s.with_overflow(overflow)),
+                Ok(s) => finish(s),
                 Err(e) => {
                     // ADR 0060 T4: never silently fall back to a non-durable spool when a
                     // QoS≥1 rule needs one — that loses acked messages on restart. Refuse to
@@ -342,11 +358,11 @@ fn build_spool(cfg: &BridgeConfig, side: Side) -> Arc<Spool> {
                         std::process::exit(1);
                     }
                     warn!(?side, error = %e, "disk spool unavailable; using an in-memory spool");
-                    Arc::new(Spool::in_memory(cap).with_overflow(overflow))
+                    finish(Spool::in_memory(cap))
                 }
             }
         }
-        None => Arc::new(Spool::in_memory(cap).with_overflow(overflow)),
+        None => finish(Spool::in_memory(cap)),
     }
 }
 
