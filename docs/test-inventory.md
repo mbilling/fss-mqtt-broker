@@ -912,7 +912,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 384 test(s)
+## `crates/mqttd/src/lib.rs` — 385 test(s)
 
 - `admission::tests::the_global_cap_refuses_at_the_bound_and_recovers`
 - `admission::tests::the_penalty_box_refuses_after_the_threshold`
@@ -1198,6 +1198,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::ordinary_and_shared_subscriptions_are_independent`
 - `hub::tests::outbound_packet_ids_resume_past_the_durable_high_water`
 - `hub::tests::overlapping_connects_are_last_writer_wins`
+- `hub::tests::overload_then_idle_recovers_to_baseline_without_a_restart`
 - `hub::tests::peer_dead_drops_routing_and_stale_peer_disconnect_is_ignored`
 - `hub::tests::periodic_anti_entropy_says_nothing_when_there_is_nothing_retained`
 - `hub::tests::permanently_unavailable_store_rejects_rather_than_downgrades`
