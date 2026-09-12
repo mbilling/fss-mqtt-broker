@@ -77,6 +77,13 @@ off-loop; the publisher/subscriber ack paths never wait on it.**
    > **#537 Phase 0:** ADR 0076 measured K>1 sharding and linger slower than
    > the defaults; do not treat #403's original adaptive-store proposal as a
    > prerequisite for that isolation work.
+   >
+   > **#575 (0074-T3):** the ordered waits themselves now run on the session's
+   > append lane, not on `Hub::dispatch`. Prefix-then-clear and packet-ID
+   > lifetime are unchanged — this is isolation, not detaching or pipelining.
+   > `a_parked_qos2_truncate_does_not_stall_unrelated_sessions` is the
+   > falsifier. The rest of #405 (PUBREC/PUBREL pipelining, write fusion) is
+   > out of scope here.
 3. **Bounds, stated:** the flusher's map holds at most one offset per session;
    per-session disk lag is bounded by the flush cadence (milliseconds at the
    measured truncate latency), and entries above the flushed watermark are
@@ -133,10 +140,9 @@ T1 the watermark flusher + detached QoS 1 path (+ parked-store and coalescing
 tests, replay honesty covered by the existing truncation-prefix suites);
 T2 the measured A/B (`durable_bench`, and the next curve run's durable rows).
 
-T3 (planned) is Decision 2's missing falsifier: this ADR states that QoS 2
-completion keeps the inline truncate and that no QoS 2 window is widened, but
-nothing currently FAILS if that stops being true. It pins the cost the decision
-accepts — a stalled QoS 2 store must not stall unrelated sessions — with an
-assertion that does not depend on scheduler timing. Note that the `hub_dispatch`
-histogram cannot serve as that oracle: its timer starts after the command is
-dequeued, so time spent waiting in the channel is invisible to it.
+T3 is Decision 2's isolation falsifier: a stalled QoS 2 store must not stall
+unrelated sessions. The `hub_dispatch` histogram cannot serve as that oracle:
+its timer starts after the command is dequeued. The working assertion is a
+reply-bearing unrelated command that completes while the stall is still held.
+As of #575 those waits run on the per-session lane (ordered, not detached);
+full QoS 2 pipelining remains #405.

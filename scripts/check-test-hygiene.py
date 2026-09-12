@@ -2324,19 +2324,6 @@ def check_inventory(only: str | None) -> list[str]:
 # a follow-up issue; what it is not is quietly allowlisted, which is how a manifest becomes a
 # lie. `--write-inventory` cannot add entries here: growth is a hand-written, reviewed line.
 IGNORE_ALLOWLIST: dict[str, tuple[str, str | None]] = {
-    # NOT a cost exclusion like the rest of this table: this one is RED, and is
-    # meant to be. It reproduces a shipped defect (ADR 0074 Decision 2 keeps the
-    # QoS 2 completion awaits on the hub loop, so a stalled QoS 2 store stalls
-    # every other session on the node), and it turns green when #405 isolates
-    # those waits — at which point it comes out of here rather than staying as a
-    # permanent exemption. `None` because no tier runs it: naming one would be
-    # the misleading half, exactly as the backup_bench note below records.
-    "crates/mqttd/src/lib.rs::hub::tests::a_parked_qos2_truncate_does_not_stall_unrelated_sessions": (
-        "a RED reproduction of the QoS 2 hub-blocking defect (#575): it fails on purpose "
-        "against today's inline completion path, and is un-ignored by the #405 isolation "
-        "work, never by weakening the assertion",
-        None,
-    ),
     "crates/mqttd/tests/cluster_upgrade.rs::a_rolling_upgrade_and_rollback_lose_no_acked_fact": (
         "builds a second broker binary (minutes), which the per-PR profile cannot afford",
         "nightly",
