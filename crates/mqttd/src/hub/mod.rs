@@ -5795,20 +5795,37 @@ impl Hub {
             .count();
         m.set_sessions(self.online.len() + offline_persistent);
         m.set_subscriptions(self.subs.values().map(ClientSubs::len).sum());
-        m.set_inflight_messages(self.inflight.values().map(|i| i.pending.len()).sum());
+        // ONE pass over `inflight` for all three figures (issue #526). It used to be
+        // three — `pending.len()` summed, `backlog.bytes()` summed, `backlog.bytes()`
+        // maxed — over the same map, which holds an entry per ATTACHED CLIENT and is
+        // therefore the largest thing this tick touches. That ran on the single hub
+        // task once a second, so every publish behind it waited out three walks of a
+        // map that reaches 50,000+ entries on a loaded node. The comment below already
+        // claimed "both, from one pass"; it was two passes, and a third beside them.
+        //
+        // Per-entry work is O(1) — `backlog.bytes()` is a stored field, not a walk —
+        // so folding is a straight 3x cut with nothing to keep in sync. The sums are
+        // deliberately NOT maintained incrementally: `pending.len()` changes on every
+        // QoS>0 publish and every ack, so a running total would move work onto the
+        // hot path to save it on the tick, and a drifting gauge is worse than a
+        // recomputed one.
+        let mut pending = 0usize;
+        let mut backlog_sum = 0usize;
+        let mut backlog_max = 0usize;
+        for i in self.inflight.values() {
+            pending += i.pending.len();
+            let b = i.backlog.bytes();
+            backlog_sum += b;
+            backlog_max = backlog_max.max(b);
+        }
+        m.set_inflight_messages(pending);
         // Flow-control backlog bytes across sessions (issue #241): so an operator can SEE
-        // the number before choosing a byte cap, and watch it after.
-        // Both, from one pass: the SUM answers "how much RAM is in backlogs on this node",
-        // while the MAX is what a PER-SUBSCRIBER cap must be sized against (issue #241 review
-        // — the docs pointed operators at the sum for a per-subscriber decision).
-        m.set_backlog_bytes(self.inflight.values().map(|i| i.backlog.bytes()).sum());
-        m.set_backlog_bytes_max(
-            self.inflight
-                .values()
-                .map(|i| i.backlog.bytes())
-                .max()
-                .unwrap_or(0),
-        );
+        // the number before choosing a byte cap, and watch it after. The SUM answers
+        // "how much RAM is in backlogs on this node"; the MAX is what a PER-SUBSCRIBER
+        // cap must be sized against (issue #241 review — the docs pointed operators at
+        // the sum for a per-subscriber decision).
+        m.set_backlog_bytes(backlog_sum);
+        m.set_backlog_bytes_max(backlog_max);
         // Append-lane saturation (issue #242): sustained growth here is the warning
         // BEFORE `publish_dropped{reason="append-backlog-full"}` starts firing.
         m.set_append_lane_jobs(self.append_lanes.values().map(|l| l.outstanding).sum());
