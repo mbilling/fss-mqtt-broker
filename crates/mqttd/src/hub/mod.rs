@@ -6497,8 +6497,9 @@ mod tests {
     use mqtt_storage::app_props::AppProps;
     use mqtt_storage::repl::InMemoryReplicatedLog;
     use mqtt_storage::{MemorySessionStore, OverflowPolicy, QueueLimits, SessionStore};
+    use std::collections::HashSet;
     use std::sync::{Arc, RwLock};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
     use tokio::sync::{mpsc, oneshot};
     use tokio::time::timeout;
 
@@ -8306,6 +8307,168 @@ mod tests {
             run(false).await,
             "an ungraceful close must still fire the will after a #504 reap"
         );
+    }
+
+    /// Every message in a round is labelled `{tag}:{seq}`; the oracle counts each
+    /// label once across the whole shared group. Bounded by `deadline` — a phase
+    /// that cannot finish inside it has failed, not "not recovered yet".
+    async fn drain_shared(
+        rxs: &mut [mpsc::UnboundedReceiver<Box<Packet>>],
+        want: usize,
+        deadline: Instant,
+    ) -> HashSet<String> {
+        let mut seen = HashSet::new();
+        while seen.len() < want {
+            assert!(Instant::now() < deadline, "drain missed its deadline");
+            for rx in rxs.iter_mut() {
+                if let Some(Packet::Publish(p)) = recv_packet(rx).await {
+                    seen.insert(String::from_utf8_lossy(&p.payload).into_owned());
+                }
+            }
+        }
+        seen
+    }
+
+    fn gauge(v: usize) -> i64 {
+        i64::try_from(v).unwrap()
+    }
+
+    /// Issue #504's FULL acceptance, one hub, no restart: baseline delivery ->
+    /// demonstrably reached overload (shedding OBSERVED, not just load offered)
+    /// -> idle/drain -> the same low-load control. What each phase pins:
+    ///
+    /// * baseline vs control are the SAME assertions on the SAME shape, so
+    ///   "recovered" means "identical to before", not "seems fine";
+    /// * admission: the control phase's fresh attaches complete (the incident's
+    ///   frozen `connections_total` analogue);
+    /// * no leak: after the drain the session gauge returns to zero WITHOUT any
+    ///   Detach having been processed — the 10,855 orphan clean-start sessions
+    ///   are the regression this must never reproduce;
+    /// * unique delivery: every control message is received exactly once across
+    ///   the shared group (a stale dead member in the rotation would shed its
+    ///   share and break the count);
+    /// * the drop counter is FROZEN after the drain: baseline load must shed
+    ///   nothing. Residual share prefixes would show up here first.
+    ///
+    /// The latency leg is honestly limited: a paused-clock hub cannot measure
+    /// wall-clock tail latency, so both rounds must complete within the same
+    /// bounded receive deadline — equal treatment, not a latency claim. Real
+    /// latency attribution stays with the measured curve (#482, #536).
+    #[allow(clippy::too_many_lines)] // one straight-line acceptance; splitting hides the phase shape
+    #[tokio::test(start_paused = true)]
+    async fn overload_then_idle_recovers_to_baseline_without_a_restart() {
+        const GROUP: usize = 4;
+        const DEAD: usize = 4;
+        const BASELINE: usize = 200;
+        const PHASE_DEADLINE: Duration = Duration::from_secs(10);
+        const FLOOD_CAP: usize = 8 * MAX_OUTBOUND_QUEUE + 40_000;
+
+        let metrics = std::sync::Arc::new(mqtt_observability::metrics::Metrics::new("t"));
+        let (mut hub, tx) = Hub::with_config(
+            NodeId("hub-test".into()),
+            std::sync::Arc::new(MemorySessionStore::new()),
+        );
+        hub.set_shared_prefer_local(true);
+        hub.attach_metrics(metrics.clone());
+        tokio::spawn(hub.run());
+
+        let unique_payload = |tag: &str, seq: usize| -> &'static [u8] {
+            Box::leak(format!("{tag}:{seq}").into_bytes().into_boxed_slice())
+        };
+
+        // ---- baseline: the shape every later phase is judged against ----
+        let mut live = Vec::new();
+        for i in 0..GROUP {
+            let (rx, _) = attach(&tx, &format!("base-{i}"), 100 + i as u64, true).await;
+            subscribe(&tx, &format!("base-{i}"), "$share/acc/t");
+            live.push(rx);
+        }
+        ping(&tx).await;
+        for seq in 0..BASELINE {
+            publish(&tx, "t", unique_payload("base", seq));
+        }
+        let baseline = drain_shared(&mut live, BASELINE, Instant::now() + PHASE_DEADLINE).await;
+        assert_eq!(
+            baseline.len(),
+            BASELINE,
+            "baseline: every message exactly once across the group"
+        );
+        let drops_after_baseline = dropped_for(&metrics, "outbound-full");
+        assert_eq!(drops_after_baseline, 0, "baseline load sheds nothing");
+
+        // ---- overload, demonstrated by observed shedding (not offered load) ----
+        let mut dead = Vec::new();
+        for i in 0..DEAD {
+            let (rx, _) = attach(&tx, &format!("dead-{i}"), 200 + i as u64, true).await;
+            subscribe(&tx, &format!("dead-{i}"), "$share/acc/t");
+            dead.push(rx);
+        }
+        ping(&tx).await;
+        let mut flooded = 0usize;
+        while dropped_for(&metrics, "outbound-full") == 0 {
+            assert!(
+                flooded < FLOOD_CAP,
+                "flooded {flooded} messages without a single outbound-full shed: \
+                 the overload was never reached, so the rest of this test would \
+                 prove nothing"
+            );
+            for seq in 0..1_000 {
+                publish(&tx, "t", unique_payload("flood", flooded + seq));
+            }
+            flooded += 1_000;
+            ping(&tx).await;
+        }
+        // Gauges refresh on the sweep tick, not per attach — drive one sweep
+        // before reading them (the #598 tests establish this pattern).
+        tokio::time::sleep(super::SESSION_SWEEP_INTERVAL * 2).await;
+        ping(&tx).await;
+        assert_eq!(
+            gauge_value(&metrics, "mqttd_sessions"),
+            gauge(GROUP + DEAD),
+            "overload: every consumer is still attached while the queues shed"
+        );
+
+        // ---- idle/drain: the load vanishes the way the incident's did ----
+        drop(dead);
+        drop(live);
+        ping(&tx).await;
+        tokio::time::sleep(super::SESSION_SWEEP_INTERVAL * 2).await;
+        ping(&tx).await;
+        let drops_after_drain = dropped_for(&metrics, "outbound-full");
+        assert_eq!(
+            gauge_value(&metrics, "mqttd_sessions"),
+            0,
+            "clean-start sessions must be gone after the drain with NO Detach \
+             processed — the orphaned-session leak is the bug being guarded"
+        );
+        assert_eq!(gauge_value(&metrics, "mqttd_connections_active"), 0);
+
+        // ---- the same low-load control, same shape, NO restart ----
+        let mut fresh = Vec::new();
+        for i in 0..GROUP {
+            let (rx, _) = attach(&tx, &format!("ctl-{i}"), 300 + i as u64, true).await;
+            subscribe(&tx, &format!("ctl-{i}"), "$share/acc/t");
+            fresh.push(rx);
+        }
+        ping(&tx).await;
+        for seq in 0..BASELINE {
+            publish(&tx, "t", unique_payload("ctl", seq));
+        }
+        let control = drain_shared(&mut fresh, BASELINE, Instant::now() + PHASE_DEADLINE).await;
+        assert_eq!(
+            control.len(),
+            BASELINE,
+            "control: admission AND unique delivery must match the baseline exactly"
+        );
+        assert_eq!(
+            dropped_for(&metrics, "outbound-full"),
+            drops_after_drain,
+            "baseline load after recovery must shed NOTHING: a residual dead \
+             member in the share rotation would shed its turn here"
+        );
+        tokio::time::sleep(super::SESSION_SWEEP_INTERVAL * 2).await;
+        ping(&tx).await;
+        assert_eq!(gauge_value(&metrics, "mqttd_sessions"), gauge(GROUP));
     }
 
     /// Issue #490: two groups on the SAME filter keep independent rotations.
