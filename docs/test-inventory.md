@@ -685,7 +685,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::the_whole_env_surface_overlays_without_collision`
 - `tests::warn_mode_boots_a_newer_config_and_reports_the_ignored_keys`
 
-## `crates/mqtt-core/src/lib.rs` — 51 test(s)
+## `crates/mqtt-core/src/lib.rs` — 52 test(s)
 
 - `retry::tests::delays_ramp_within_jitter_bounds_and_cap`
 - `retry::tests::reset_returns_to_base`
@@ -694,6 +694,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `secrets::tests::trims_trailing_newline_variants`
 - `shared::tests::distinct_groups_are_reported_separately`
 - `shared::tests::for_each_matching_visits_the_same_groups_without_cloning`
+- `shared::tests::inserting_reports_whether_it_added_and_the_reverse_index_follows`
 - `shared::tests::matching_reports_group_members_in_order_with_qos`
 - `shared::tests::non_matching_topic_yields_nothing`
 - `shared::tests::parse_accepts_wellformed_and_rejects_malformed`

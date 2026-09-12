@@ -121,35 +121,48 @@ impl GroupMembers {
     }
 
     /// Move the member at `i` across the online boundary, keeping the partition.
-    fn set_at(&mut self, i: usize, online: bool) {
+    ///
+    /// Returns where that member ENDED UP. A swap moves it, and every caller then
+    /// needs its new index — returning it is what lets them avoid a second
+    /// `position` scan of the group (issue #525).
+    fn set_at(&mut self, i: usize, online: bool) -> usize {
         let is_online = i < self.online;
         if is_online == online {
-            return;
+            return i;
         }
         if online {
             // Offline -> online: swap it to the first offline slot, which then
             // becomes the last online one.
             self.all.swap(i, self.online);
+            let now = self.online;
             self.online += 1;
+            now
         } else {
             // Online -> offline: swap it with the last online slot and shrink.
             self.online -= 1;
             self.all.swap(i, self.online);
+            self.online
         }
     }
 
     /// Add `client` at `max_qos`, or update the granted `QoS` if already a member.
     /// Re-subscribing never changes a member's liveness.
-    fn insert(&mut self, client: ClientId, max_qos: QoS, online: bool) {
+    ///
+    /// Returns whether this ADDED a member. `subscribe` needs that to decide
+    /// whether to record the membership in the reverse index, and used to answer
+    /// it with its own `position` scan immediately before calling here — two
+    /// walks of the group per SUBSCRIBE (issue #525).
+    fn insert(&mut self, client: ClientId, max_qos: QoS, online: bool) -> bool {
         if let Some(i) = self.position(&client) {
             self.all[i].1 = max_qos;
             self.set_at(i, online);
-            return;
+            return false;
         }
         self.all.push((client, max_qos));
         if online {
             self.set_at(self.all.len() - 1, true);
         }
+        true
     }
 
     /// Drop `client`. Returns whether it was a member.
@@ -159,10 +172,9 @@ impl GroupMembers {
         };
         // Leave the partition intact: take it offline first, so the hole is
         // always in the offline region and `swap_remove` cannot move an online
-        // member across the boundary.
-        self.set_at(i, false);
-        let last = self.all.len() - 1;
-        let i = self.position(client).unwrap_or(last);
+        // member across the boundary. `set_at` reports where the member landed,
+        // so this no longer rescans the group to find it again (issue #525).
+        let i = self.set_at(i, false);
         self.all.swap_remove(i);
         true
     }
@@ -239,8 +251,7 @@ impl SharedSubscriptionTable {
         };
         let key = FilterKey::from(filter);
         let members = by_group.entry(group.to_string()).or_default();
-        let fresh = members.position(&client).is_none();
-        members.insert(client.clone(), max_qos, online);
+        let fresh = members.insert(client.clone(), max_qos, online);
         #[cfg(debug_assertions)]
         members.assert_partitioned();
         if fresh {
@@ -610,6 +621,37 @@ mod tests {
         t.unsubscribe(&cid("d"), "g", "sport/#");
         let (online, total, _) = members(&t).unwrap();
         assert_eq!((online, total), (0, 2));
+    }
+
+    /// `insert` reports whether it ADDED, and `subscribe` records the reverse-index
+    /// membership only when it did. A wrong answer either loses the entry — so a
+    /// later attach cannot find the group to flip liveness in — or duplicates it.
+    ///
+    /// This is the contract that let `subscribe` drop its own `position` scan
+    /// (issue #525); before, the two answers were computed by two separate walks
+    /// of the group, so they could not disagree.
+    #[test]
+    fn inserting_reports_whether_it_added_and_the_reverse_index_follows() {
+        let mut t = SharedSubscriptionTable::new();
+        t.subscribe(cid("a"), "g", "sport/#", QoS::AtMostOnce, true);
+        // Re-subscribing is an UPDATE: same member, new QoS, no second entry.
+        t.subscribe(cid("a"), "g", "sport/#", QoS::AtLeastOnce, true);
+        let (_, _, m) = t.matching_refs("sport/tennis").next().unwrap();
+        assert_eq!(m.len(), 1, "one member, not two");
+        assert_eq!(m.online_count(), 1);
+        assert_eq!(
+            m[0].1,
+            QoS::AtLeastOnce,
+            "the granted QoS was updated in place"
+        );
+
+        // If the re-subscribe had been recorded as fresh, the reverse index would
+        // hold the membership twice and this removal would leave one behind.
+        t.remove_client(&cid("a"));
+        assert!(
+            t.matching_refs("sport/tennis").next().is_none(),
+            "the group is gone, so no duplicate membership survived"
+        );
     }
 
     /// Selection rotates over the ONLINE members only: an offline member never
