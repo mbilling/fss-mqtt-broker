@@ -59,12 +59,7 @@ async fn assert_released_restore(
         "never a fresh PUBLISH: {resumed:?}"
     );
     pub_comp(&tx, client.as_str(), pkid);
-    let (reply, done) = oneshot::channel();
-    tx.send(HubCommand::Ping { reply }).unwrap();
-    timeout(Duration::from_secs(5), done)
-        .await
-        .unwrap()
-        .unwrap();
+    wait_qos2_store_empty(store.as_ref(), client.as_str()).await;
     assert!(
         store.outbound(client).await.unwrap().is_empty(),
         "the original ID retires after recovery"
@@ -188,12 +183,7 @@ async fn restored_qos2_offsets_pin_the_prefix_until_each_handshake_completes() {
     );
     assert_eq!(store.outbound(&client).await.unwrap().len(), 2);
     pub_comp(&tx, client.as_str(), 1);
-    let (reply, done) = oneshot::channel();
-    tx.send(HubCommand::Ping { reply }).unwrap();
-    timeout(Duration::from_secs(5), done)
-        .await
-        .unwrap()
-        .unwrap();
+    wait_qos2_store_empty(store.as_ref(), client.as_str()).await;
     assert!(store.outbound(&client).await.unwrap().is_empty());
     assert!(store.pending(&client, 0, 10).await.unwrap().is_empty());
 }
@@ -256,12 +246,7 @@ async fn an_unreleased_orphan_is_cleared_without_republishing() {
     let tx = start_hub_with_arc(store.clone());
     let (mut rx, present) = attach(&tx, client.as_str(), 2, false).await;
     assert!(present);
-    let (reply, done) = oneshot::channel();
-    tx.send(HubCommand::Ping { reply }).unwrap();
-    timeout(Duration::from_secs(5), done)
-        .await
-        .unwrap()
-        .unwrap();
+    wait_qos2_store_empty(store.as_ref(), client.as_str()).await;
     assert!(store.outbound(&client).await.unwrap().is_empty());
     assert!(
         rx.try_recv().is_err(),

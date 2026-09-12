@@ -74,6 +74,7 @@ mod qos2;
 // re-couple every future hub change to six import lists. Scoped to these files.
 use lanes::*;
 pub use lanes::{AppendJob, AppendThen, LaneJob, LaneOutcome, LaneWork};
+pub use qos2::{Qos2LaneOp, Qos2OpOutcome};
 mod policy;
 pub use policy::BrownoutAxis;
 mod retained;
@@ -679,8 +680,9 @@ struct PendingOut {
 }
 
 /// Extra lane-channel slots beyond [`LANE_QUEUE_CAP`] reserved for CONTROL jobs —
-/// a lane-serialized discard ([`LaneJob::Discard`]/[`LaneJob::Remove`]) or the
-/// detach spill ([`LaneWork::Spill`]) (issue #242 finding C). Delivery jobs are
+/// a lane-serialized discard ([`LaneJob::Discard`]/[`LaneJob::Remove`]), the
+/// detach spill ([`LaneWork::Spill`]) (issue #242 finding C), or a `QoS` 2
+/// outbound store wait ([`LaneJob::Qos2Op`], issue #575). Delivery jobs are
 /// capped by `outstanding` before touching the channel, so a saturated lane still
 /// admits the control job whose whole purpose is to serialize behind that
 /// saturation; only a pile-up beyond this headroom falls back to the loud,
@@ -1035,6 +1037,15 @@ pub enum HubCommand {
         job: Box<AppendJob>,
         /// What the store did.
         outcome: LaneOutcome,
+    },
+    /// Internal: a session lane finished one outbound `QoS` 2 store wait
+    /// (issue #575 / #405 isolation slice). The on-loop apply owns PUBREL,
+    /// packet-ID retirement, and stale-epoch rejection. Not sent by connections.
+    Qos2OpDone {
+        /// The session the op belonged to.
+        client: ClientId,
+        /// What the store did.
+        outcome: Qos2OpOutcome,
     },
     /// Internal: the off-loop packet-id block reservation finished (ADR 0007 T9 /
     /// issue #242 finding A) — bank the base and drain the deliveries deferred on
@@ -1558,7 +1569,10 @@ impl HubCommand {
             Self::Publish { .. } | Self::AppendDone { .. } | Self::PkidBlockReserved { .. } => {
                 "publish"
             }
-            Self::PubAck { .. } | Self::PubRec { .. } | Self::PubComp { .. } => "ack",
+            Self::PubAck { .. }
+            | Self::PubRec { .. }
+            | Self::PubComp { .. }
+            | Self::Qos2OpDone { .. } => "ack",
             Self::Subscribe { .. } | Self::Unsubscribe { .. } => "subscribe",
             Self::SetQuotas(_)
             | Self::SetBrownout { .. }
@@ -2112,6 +2126,14 @@ pub struct Hub {
     /// Sessions with PUBCOMP received but queue/ID retirement still owed. Only these
     /// sessions are retried by the sweep, not a scan of the entire session table.
     qos2_cleanup: HashSet<ClientId>,
+    /// A `QoS` 2 `advance_outbound` is in the session lane for this `(client, pkid)`.
+    qos2_advance_inflight: HashSet<(ClientId, u16)>,
+    /// PUBCOMP arrived while that pkid's PUBREC advance was still in the lane.
+    qos2_held_pubcomp: HashSet<(ClientId, u16)>,
+    /// At most one retirement job is in the lane per session; completion resubmits.
+    qos2_retire_inflight: HashSet<ClientId>,
+    /// Bumped on session discard so a late lane completion cannot mutate a new session.
+    qos2_epoch: HashMap<ClientId, u64>,
     /// Peer verdict aggregates for forwards whose fan-out submitted lane jobs
     /// (issue #242): `(origin, seq)` → what is still owed before the verdict can be
     /// answered. Entries drain via [`HubCommand::AppendDone`].
@@ -2234,6 +2256,10 @@ impl Hub {
                 owned_tasks: tokio::task::JoinSet::new(),
                 truncate_tx: None,
                 qos2_cleanup: HashSet::new(),
+                qos2_advance_inflight: HashSet::new(),
+                qos2_held_pubcomp: HashSet::new(),
+                qos2_retire_inflight: HashSet::new(),
+                qos2_epoch: HashMap::new(),
                 remote_append_pending: HashMap::new(),
                 node_id,
                 online: HashMap::new(),
@@ -2474,7 +2500,7 @@ impl Hub {
                 _ = sweep.tick() => {
                     let started = Instant::now();
                     self.sweep_expired_sessions().await;
-                    self.retry_qos2_cleanup().await;
+                    self.submit_pending_qos2_cleanup();
                     self.refresh_gauges().await;
                     self.refresh_ownership_domain();
                     // Retransmit an unanswered retained handoff (T8 — same seq, the
@@ -2694,12 +2720,15 @@ impl Hub {
             HubCommand::AppendDone { job, outcome } => {
                 self.append_done(*job, outcome);
             }
+            HubCommand::Qos2OpDone { client, outcome } => {
+                self.qos2_op_done(&client, outcome);
+            }
             HubCommand::PkidBlockReserved { client, result } => {
                 self.pkid_block_reserved(&client, result);
             }
-            HubCommand::PubAck { client, pkid } => self.pub_ack(&client, pkid).await,
-            HubCommand::PubRec { client, pkid } => self.pub_rec(&client, pkid).await,
-            HubCommand::PubComp { client, pkid } => self.pub_comp(&client, pkid).await,
+            HubCommand::PubAck { client, pkid } => self.dispatch_pub_ack(&client, pkid),
+            HubCommand::PubRec { client, pkid } => self.dispatch_pub_rec(&client, pkid),
+            HubCommand::PubComp { client, pkid } => self.dispatch_pub_comp(&client, pkid),
             HubCommand::Detach {
                 client,
                 conn_id,
@@ -3850,9 +3879,12 @@ impl Hub {
                 } else {
                     // Absence from a limited replay window is not proof of absence
                     // from storage. Check this exact offset before retiring its ID.
-                    self.clear_orphaned_qos2(&client, pkid, offset).await;
+                    // The store waits run on the session lane (#575) so attach of
+                    // an unrelated session is not parked behind this proof.
+                    self.queue_unreleased_qos2_orphan(&client, pkid, offset);
                 }
             }
+            self.submit_qos2_retire(&client);
         }
     }
 
@@ -4176,6 +4208,10 @@ impl Hub {
 
     /// PUBACK: completes a `QoS` 1 delivery, freeing a quota slot (ADR 0012) and
     /// releasing the message's durable log entry (#124).
+    ///
+    /// Inline path for fixtures that drive `Hub` without an actor. The running
+    /// loop uses [`Self::dispatch_pub_ack`].
+    #[cfg(test)]
     async fn pub_ack(&mut self, client: &ClientId, pkid: u16) {
         let completed = self.complete_pending(client, pkid, OutState::AwaitingPubAck);
         if completed {
@@ -4234,6 +4270,7 @@ impl Hub {
     /// Returns only a DURABLY acknowledged prefix, never the submission hint used by
     /// the detached `QoS` 1 flusher. Repeating an idempotent truncate is necessary when
     /// an earlier attempt failed, or when the detached flusher has not committed yet.
+    #[cfg(test)]
     async fn truncate_acked_now(&mut self, client: &ClientId) -> Option<Offset> {
         let up_to = self.inflight.get(client)?.safe_ack();
         if up_to == 0 {
@@ -4249,6 +4286,12 @@ impl Hub {
     }
 
     /// PUBREC: advances a `QoS` 2 delivery to the release phase (send PUBREL).
+    ///
+    /// Inline path for fixtures that drive `Hub` without an actor. The running
+    /// loop uses [`Self::dispatch_pub_rec`]. Kept as the in-process twin of
+    /// [`Self::pub_comp`] so a future fixture can drive PUBREC without the loop.
+    #[cfg(test)]
+    #[allow(dead_code)]
     async fn pub_rec(&mut self, client: &ClientId, pkid: u16) {
         // Is this a durable-tracked delivery? (Only `QoS` 2 with an offset was recorded.)
         let durable = self
@@ -4269,25 +4312,15 @@ impl Hub {
                 return;
             }
         }
-        let advanced =
-            self.inflight
-                .get_mut(client)
-                .is_some_and(|inf| match inf.pending.get_mut(&pkid) {
-                    Some(p) if p.state == OutState::AwaitingPubRec => {
-                        p.state = OutState::AwaitingPubComp;
-                        true
-                    }
-                    _ => false,
-                });
-        if advanced {
-            if let Some(sess) = self.online.get(client) {
-                let _ = sess.tx.send(Packet::PubRel(pkid.into()));
-            }
-        }
+        self.send_pubrel_after_advance(client, pkid);
     }
 
     /// PUBCOMP: completes a `QoS` 2 delivery, freeing a quota slot (ADR 0012) and
     /// releasing the message's durable log entry (#124).
+    ///
+    /// Inline path for fixtures that drive `Hub` without an actor. The running
+    /// loop uses [`Self::dispatch_pub_comp`].
+    #[cfg(test)]
     async fn pub_comp(&mut self, client: &ClientId, pkid: u16) {
         if let Some(inf) = self.inflight.get_mut(client) {
             if let Some(pending) = inf.pending.get_mut(&pkid) {
@@ -4877,6 +4910,7 @@ impl Hub {
         self.session_expiry.remove(client);
         self.expiring.remove(client);
         self.retained_windows.remove(client);
+        self.forget_qos2_isolation(client);
     }
 
     /// Discard every session whose MQTT 5.0 Session Expiry Interval has elapsed
@@ -6976,6 +7010,27 @@ mod tests {
             session_expiry_override: None,
         })
         .unwrap();
+    }
+
+    /// Wait until this session's durable outbound IDs and queued deliveries are
+    /// gone. After #575, PUBCOMP returns as soon as retirement is *submitted* to
+    /// the session lane, so a Ping or an unrelated attach is no longer a barrier
+    /// for those writes.
+    async fn wait_qos2_store_empty(store: &dyn mqtt_storage::SessionStore, client: &str) {
+        let c = ClientId(client.into());
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let outbound = store.outbound(&c).await.unwrap();
+            let pending = store.pending(&c, 0, 32).await.unwrap();
+            if outbound.is_empty() && pending.is_empty() {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "QoS 2 retirement did not land; outbound={outbound:?} pending={pending:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 
     /// Flush the hub command queue: a reply-bearing Ping cannot be answered until
@@ -11224,8 +11279,7 @@ mod tests {
         assert!(inflight[0].pubrec_seen, "phase advanced durably at PUBREC");
 
         pub_comp(&tx, "c", pkid);
-        // Round-trip through the hub loop so the reads below are ordered after it.
-        attach_full(&tx, "sync-probe", 9, true, 0, 8).await;
+        wait_qos2_store_empty(store.as_ref(), "c").await;
         assert!(
             store.outbound(&c).await.unwrap().is_empty(),
             "PUBCOMP releases the durable id"
@@ -11375,7 +11429,7 @@ mod tests {
         );
 
         pub_comp(&tx2, "c", pkid);
-        attach_full(&tx2, "sync-probe", 9, true, 0, 8).await;
+        wait_qos2_store_empty(store.as_ref(), "c").await;
         let c = ClientId("c".into());
         assert!(store.outbound(&c).await.unwrap().is_empty(), "id released");
         assert!(
@@ -11450,7 +11504,7 @@ mod tests {
         assert!(matches!(&spurious, Packet::PubRel(k) if k.pkid == 55));
 
         pub_comp(&tx, "c", 55);
-        attach_full(&tx, "sync-probe", 9, true, 0, 8).await;
+        wait_qos2_store_empty(store.as_ref(), "c").await;
         assert!(
             store.outbound(&c).await.unwrap().is_empty(),
             "the PUBCOMP cleared the orphan even though no pending entry completed"
@@ -16112,6 +16166,10 @@ mod tests {
         /// quorum truncate, parking the DETACHED flusher rather than the hub loop.
         ack_gates:
             std::sync::Mutex<std::collections::HashMap<String, tokio::sync::watch::Receiver<bool>>>,
+        /// Signaled once when an `ack`/`ack_durable` for `client` actually enters
+        /// its park — the #575 oracle synchronizes on this, not on a sleep.
+        ack_entered:
+            std::sync::Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<()>>>,
     }
 
     impl ParkingStore {
@@ -16134,6 +16192,7 @@ mod tests {
                 reserve_gates: std::sync::Mutex::new(std::collections::HashMap::new()),
                 reject_next: std::sync::Mutex::new(std::collections::HashMap::new()),
                 ack_gates: std::sync::Mutex::new(std::collections::HashMap::new()),
+                ack_entered: std::sync::Mutex::new(std::collections::HashMap::new()),
             })
         }
 
@@ -16175,6 +16234,14 @@ mod tests {
             tx
         }
 
+        /// Completes when `client`'s next parked `ack`/`ack_durable` enters the
+        /// stall (the store call is waiting on the gate, not merely queued).
+        fn on_ack_entered(&self, client: &str) -> tokio::sync::oneshot::Receiver<()> {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            self.ack_entered.lock().unwrap().insert(client.into(), tx);
+            rx
+        }
+
         /// Answer `client`'s next `n` enqueues with `Rejected` (the session queue
         /// cap under reject-newest, ADR 0001 §6).
         fn reject_next_enqueue(&self, client: &str, n: usize) {
@@ -16188,8 +16255,28 @@ mod tests {
             >,
             client: &ClientId,
         ) {
+            Self::await_gate_entered(map, client, None).await;
+        }
+
+        /// As [`Self::await_gate`], signaling `entered` once the stall is held.
+        async fn await_gate_entered(
+            map: &std::sync::Mutex<
+                std::collections::HashMap<String, tokio::sync::watch::Receiver<bool>>,
+            >,
+            client: &ClientId,
+            entered: Option<
+                &std::sync::Mutex<
+                    std::collections::HashMap<String, tokio::sync::oneshot::Sender<()>>,
+                >,
+            >,
+        ) {
             let gate = map.lock().unwrap().get(client.as_str()).cloned();
             if let Some(mut rx) = gate {
+                if let Some(entered) = entered {
+                    if let Some(tx) = entered.lock().unwrap().remove(client.as_str()) {
+                        let _ = tx.send(());
+                    }
+                }
                 while !*rx.borrow() {
                     if rx.changed().await.is_err() {
                         break; // sender dropped: released
@@ -16305,7 +16392,7 @@ mod tests {
             client: &ClientId,
             up_to: mqtt_storage::Offset,
         ) -> Result<(), mqtt_storage::StorageError> {
-            Self::await_gate(&self.ack_gates, client).await;
+            Self::await_gate_entered(&self.ack_gates, client, Some(&self.ack_entered)).await;
             if let Some(error) = self.ack_failures.lock().unwrap().pop_front() {
                 self.log("ack-failed", format!("{} {up_to}", client.0));
                 return Err(error);
@@ -16318,7 +16405,7 @@ mod tests {
             client: &ClientId,
             up_to: mqtt_storage::Offset,
         ) -> Result<(), mqtt_storage::StorageError> {
-            Self::await_gate(&self.ack_gates, client).await;
+            Self::await_gate_entered(&self.ack_gates, client, Some(&self.ack_entered)).await;
             if let Some(error) = self.ack_failures.lock().unwrap().pop_front() {
                 self.log("ack-failed", format!("{} {up_to}", client.0));
                 return Err(error);
@@ -16925,24 +17012,29 @@ mod tests {
                 .unwrap(),
         );
 
-        // Complete the handshake with the truncate parked: `clear_outbound` lands,
-        // `ack` does not. That IS the crash window, held open.
+        // Complete the handshake with the truncate parked: #577 inverts the
+        // writes so `ack_durable` runs first and `clear_outbound` waits behind
+        // it. Parking ack holds the prefix in the log with the ID still present
+        // — the crash window, held open. Isolation (#575) moved that wait off
+        // the hub loop, so "unrelated attach times out" is no longer the
+        // observable; entering the store stall is.
         let _release = store.park_ack("s533");
+        let entered = store.on_ack_entered("s533");
         pub_rec(&hub1, "s533", pkid);
         pub_comp(&hub1, "s533", pkid);
-
-        // Confirm we are INSIDE the window rather than assuming it: the completion
-        // path is now parked in the truncate, which (per #575) blocks the whole hub
-        // loop, so an unrelated attach cannot finish. That is the observable.
-        assert!(
-            timeout(
-                Duration::from_millis(500),
-                attach(&hub1, "probe533", 9, true)
-            )
+        timeout(Duration::from_secs(2), entered)
             .await
-            .is_err(),
-            "the hub was not parked in the truncate, so this test never opened the \
-             crash window it exists to close; ops: {:?}",
+            .expect(
+                "the QoS 2 truncate must enter its stall so this test opens \
+                     the crash window it exists to close",
+            )
+            .expect("ack-entered sender dropped");
+        assert!(
+            !store
+                .ops()
+                .iter()
+                .any(|(op, d)| op == "ack" && d.starts_with("s533 ")),
+            "the truncate landed, so this is not the lost-truncate window: {:?}",
             store.ops()
         );
 
@@ -17007,14 +17099,10 @@ mod tests {
     /// a reply that must ARRIVE while the stall is held — no timing threshold, and
     /// nothing a scheduler can flatter.
     ///
-    /// IGNORED, and red on purpose: `pub_comp` awaits `store.clear_outbound` and
-    /// then `truncate_acked_now` -> `store.ack` INSIDE `Hub::dispatch`, so a
-    /// stalled `QoS` 2 store stalls every other session on the node. That is
-    /// today's shipped behaviour and this test is its reproduction. Un-ignore it
-    /// with the outbound-isolation work in #405; do not "fix" it by detaching the
-    /// writes, which #533 must settle first.
+    /// GREEN: outbound `QoS` 2 store waits run on the session's append lane
+    /// (issue #575 / #405 isolation slice). Writes stay ordered — durable prefix
+    /// then ID clearance (#577) — and are not fire-and-forget (#533).
     #[tokio::test]
-    #[ignore = "reproduction for #575: QoS 2 completion blocks the hub loop (ADR 0074 Decision 2); un-ignore with #405"]
     async fn a_parked_qos2_truncate_does_not_stall_unrelated_sessions() {
         let store = ParkingStore::new();
         let tx = start_hub_with_arc(store.clone());
@@ -17031,10 +17119,15 @@ mod tests {
         );
         pub_rec(&tx, "q2", pkid);
 
-        // Park the truncate, THEN complete: the PUBCOMP handler runs into the gate
-        // and holds the loop there.
+        // Park the truncate, THEN complete: synchronize on the store op entering
+        // its stall (not a sleep), then enqueue an unrelated reply-bearing command.
         let release = store.park_ack("q2");
+        let entered = store.on_ack_entered("q2");
         pub_comp(&tx, "q2", pkid);
+        timeout(Duration::from_secs(2), entered)
+            .await
+            .expect("the QoS 2 truncate must enter its stall")
+            .expect("ack-entered sender dropped");
 
         // The whole assertion: an unrelated session's attach must be answered
         // while "q2"'s truncate is still parked. Attach carries its own reply

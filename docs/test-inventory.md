@@ -1104,7 +1104,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::a_missed_retained_fan_out_is_healed_by_periodic_anti_entropy`
 - `hub::tests::a_moved_lease_owner_nacks_a_routed_commit`
 - `hub::tests::a_nacked_handoff_re_routes_once_placement_catches_up`
-- `hub::tests::a_parked_qos2_truncate_does_not_stall_unrelated_sessions` — `#[ignore]`d
+- `hub::tests::a_parked_qos2_truncate_does_not_stall_unrelated_sessions`
 - `hub::tests::a_peer_that_missed_the_last_fanout_converges_from_a_restarted_owners_snapshot`
 - `hub::tests::a_peers_refusal_refuses_the_publisher_instead_of_dropping_the_gate`
 - `hub::tests::a_proto_6_peer_is_answered_with_the_boolean_and_a_proto_7_peer_with_the_verdict`

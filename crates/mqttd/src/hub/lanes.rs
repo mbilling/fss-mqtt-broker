@@ -13,6 +13,7 @@
 //! Workers spawn via `Hub::spawn_owned` into the hub's owned `JoinSet` — a task
 //! holding the store past node stop keeps redb's exclusive lock (ADR 0061 §8).
 
+use super::qos2::exec_qos2_lane_op;
 #[allow(clippy::wildcard_imports)] // an intra-hub module split (#258): the five
 // siblings share one type/state vocabulary by design, and enumerating it would
 // re-couple every future hub change to six import lists. Scoped to these files.
@@ -140,6 +141,17 @@ pub enum LaneJob {
     Remove {
         /// The discarded session.
         client: ClientId,
+    },
+    /// Outbound `QoS` 2 store wait (#575): `advance_outbound` or ordered
+    /// prefix-then-ID retirement, serialized behind this session's admitted
+    /// appends/records so a PUBCOMP cannot race an in-flight `record_outbound`.
+    /// A control job — admitted into [`LANE_CONTROL_HEADROOM`] so cleanup is
+    /// not dropped at the delivery cap. Posts [`HubCommand::Qos2OpDone`].
+    Qos2Op {
+        /// The subscriber session the op belongs to (the lane key).
+        client: ClientId,
+        /// Frozen store work.
+        op: Qos2LaneOp,
     },
 }
 
@@ -409,6 +421,10 @@ async fn run_barrier_job(
                 job: Box::new(AppendJob::discard_mark(client)),
                 outcome: LaneOutcome::Passed,
             });
+        }
+        LaneJob::Qos2Op { client, op } => {
+            let outcome = exec_qos2_lane_op(store, &client, op).await;
+            let _ = self_tx.send(HubCommand::Qos2OpDone { client, outcome });
         }
         LaneJob::Deliver(_) => unreachable!("Deliver jobs are handled by the worker"),
     }
