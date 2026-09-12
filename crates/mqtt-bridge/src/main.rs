@@ -56,6 +56,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         cfg.instance = n;
     }
+    // Spool bounds overlay the TOML the same way instance/total do (ADR 0046:
+    // file then env). Unset / unparseable leaves the file (or the default).
+    if let Some(n) = std::env::var("MQTTD_BRIDGE_SPOOL_MAX_MESSAGES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+    {
+        cfg.spool.max_messages = n;
+    }
+    if let Some(n) = std::env::var("MQTTD_BRIDGE_SPOOL_MAX_BYTES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+    {
+        cfg.spool.max_bytes = n;
+    }
     cfg.validate()?; // re-check instance < total after the env override
     info!(
         upstreams = cfg.upstreams.len(),

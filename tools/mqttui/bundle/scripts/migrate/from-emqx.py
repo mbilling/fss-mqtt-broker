@@ -2904,6 +2904,7 @@ def render_bridge(conv: Conversion) -> str:
         "# encrypt it at rest.",
         'dir = "/var/lib/mqtt-bridge"   # TODO(migrate): set a real, encrypted volume',
         "max_messages = 10000",
+        "# max_bytes = 0  # unset / 0 = unbounded; set a budget so large payloads cannot fill the count",
         "",
     ]
     for up in conv.bridges:

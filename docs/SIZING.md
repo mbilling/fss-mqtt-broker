@@ -401,7 +401,6 @@ Printed here so nobody discovers it in production:
 |---|---|---|
 | Total process RSS **hard cap** | Watermark + brownout (`MQTTD_MEMORY_MAX_BYTES`, above), overshooting by up to `MQTTD_WATERMARK_POLL x allocation rate`; the container/cgroup limit is the ceiling. No in-process ceiling **by design** — allocation denial needs `unsafe` the workspace forbids, EMQX-style connection kills would not bound the dominant term, and both destroy standing state | — by design |
 | Offline queue **bytes** | Message count only (`MQTTD_MAX_QUEUED_MESSAGES`) | 0041-T6 |
-| Bridge-spool **bytes** | Message count only (default 10 000) | 0041-T7 |
 | Per-store disk share | Aggregate watermark, plus a WARN naming any store over 70% of it and the `store_bytes{store}` gauge; no per-store *refusal* — and `replicas`/`lease` have no client write to refuse | 0041-T9 |
 | Per-connection **write** buffering: the outbound channel's **packet** count | Still the hard-coded 10 000 packets (its *bytes* are `MQTTD_MAX_OUTBOUND_BYTES` since issue #241) | 0041-T10 |
 | Refusing a **publisher** instead of shedding acked entries at the backlog byte bound | Nothing — the bound sheds, and the publisher is not told | 0041-T15 |

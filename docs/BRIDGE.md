@@ -311,8 +311,12 @@ Three things to know:
 
 The spool is **fsync-durable** on commit (ADR 0060 T3), and a QoS ≥ 1 rule **refuses to start**
 without a durable spool — set `[spool].dir`, or `[spool].allow_ephemeral_spool = true` to accept
-loss on restart (ADR 0060 T4). A spool-full drop is **audited** (topic + reason), not just
-counted (T5), so a lost auditable crossing leaves a trail.
+loss on restart (ADR 0060 T4). A spool-full drop is **audited** (topic + reason + bound + sizes),
+not just counted (T5 / ADR 0041 T7), so a lost auditable crossing leaves a trail. The count
+bound (`spool.max_messages`, default 10 000) and the byte bound (`spool.max_bytes`, default
+unset / 0 = off) join: first reached wins, with the same overflow policy. A message larger
+than the entire byte budget is dropped or refused on its own — the spool is not emptied
+trying to make room.
 
 **The acknowledgement is no longer sent on arrival.** The bridge used to PUBACK a `QoS`≥1
 message the moment it read it — before doing anything durable with it — so the source dropped

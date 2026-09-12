@@ -409,6 +409,7 @@ bridge:
     # spool either — Mosquitto/EMQX/HiveMQ all rely on volume encryption.)
     dir = "/var/lib/mqtt-bridge"
     max_messages = 10000
+    # max_bytes = 0        # unset / 0 = unbounded (count bound only)
 
     # Deny-by-default: nothing crosses until a rule says so.
     # [[upstreams]]
