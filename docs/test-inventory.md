@@ -163,7 +163,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `token::tests::wrong_audience_is_rejected_when_audience_is_configured`
 - `token::tests::wrong_issuer_is_rejected_when_issuer_is_configured`
 
-## `crates/mqtt-bridge/src/lib.rs` — 61 test(s)
+## `crates/mqtt-bridge/src/lib.rs` — 62 test(s)
 
 - `client::tests::bridge_subscriptions_set_no_local_and_retain_as_published`
 - `config::tests::a_both_rule_with_a_remap_is_rejected`
@@ -213,6 +213,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `spool::tests::a_foreign_schema_version_fails_closed`
 - `spool::tests::a_message_larger_than_the_byte_budget_does_not_empty_the_spool`
 - `spool::tests::a_v1_disk_record_round_trips_under_the_byte_bound`
+- `spool::tests::an_undecodable_record_is_drained_evicted_and_never_accounted`
 - `spool::tests::an_unstamped_pre_gate_spool_is_adopted_with_its_messages`
 - `spool::tests::both_bounds_together_the_first_reached_wins`
 - `spool::tests::encode_decode_round_trips_the_retain_flag`

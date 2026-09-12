@@ -234,18 +234,19 @@ impl Spool {
                     let mut bytes = 0usize;
                     for entry in t.iter().map_err(backend)? {
                         let (_, v) = entry.map_err(backend)?;
-                        match decode(v.value()) {
+                        if let Some(m) = decode(v.value()) {
+                            bytes += message_bytes(&m);
+                        } else {
                             // The accounted-byte invariant (see `drain`): only
                             // decodable residents contribute. An undecodable
                             // record still occupies a count slot until it is
                             // drained or evicted — surface it, do not hide it.
-                            Some(m) => bytes += message_bytes(&m),
-                            None => warn!(
+                            warn!(
                                 "spool reopen found an UNDECODABLE record \
                                  (corruption or a foreign layout): it consumes a \
                                  count slot and no accounted bytes, and a drain \
                                  or eviction will remove it"
-                            ),
+                            );
                         }
                     }
                     (next, bytes)
@@ -956,18 +957,6 @@ mod tests {
     ///   consistent.
     #[test]
     fn an_undecodable_record_is_drained_evicted_and_never_accounted() {
-        fn inject_garbage(spool: &Spool) {
-            let Inner::Disk { db, .. } = &*spool.inner.lock().unwrap() else {
-                panic!("this test drives the disk-backed variant");
-            };
-            let mut wtx = db.begin_write().unwrap();
-            {
-                let mut t = wtx.open_table(SPOOL).unwrap();
-                t.insert(9_999, &[0xffu8; 8][..]).unwrap(); // undecodable: u32 length overruns
-            }
-            wtx.commit().unwrap();
-        }
-
         // --- reopen: the corrupt record is seen, warned, and not accounted ---
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("s.redb");
@@ -1052,10 +1041,10 @@ mod tests {
     /// read — written straight into the table so no encode step can make it valid.
     fn inject_garbage_db(path: &std::path::Path) {
         let db = Database::open(path).unwrap();
-        let mut wtx = db.begin_write().unwrap();
+        let wtx = db.begin_write().unwrap();
         {
             let mut t = wtx.open_table(SPOOL).unwrap();
-            let last = t.last().unwrap().map(|(k, _)| k.value()).unwrap_or(0);
+            let last = t.last().unwrap().map_or(0, |(k, _)| k.value());
             t.insert(last + 1, &[0xffu8; 8][..]).unwrap(); // u32 length 0xffffffff overruns
         }
         wtx.commit().unwrap();
