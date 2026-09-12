@@ -23,7 +23,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use redb::{Database, Durability, ReadableTable, ReadableTableMetadata, TableDefinition};
-use tracing::info;
+use tracing::{info, warn};
 
 /// One spooled message (already transformed by the forwarding policy).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -234,8 +234,18 @@ impl Spool {
                     let mut bytes = 0usize;
                     for entry in t.iter().map_err(backend)? {
                         let (_, v) = entry.map_err(backend)?;
-                        if let Some(m) = decode(v.value()) {
-                            bytes += message_bytes(&m);
+                        match decode(v.value()) {
+                            // The accounted-byte invariant (see `drain`): only
+                            // decodable residents contribute. An undecodable
+                            // record still occupies a count slot until it is
+                            // drained or evicted — surface it, do not hide it.
+                            Some(m) => bytes += message_bytes(&m),
+                            None => warn!(
+                                "spool reopen found an UNDECODABLE record \
+                                 (corruption or a foreign layout): it consumes a \
+                                 count slot and no accounted bytes, and a drain \
+                                 or eviction will remove it"
+                            ),
                         }
                     }
                     (next, bytes)
@@ -423,6 +433,16 @@ impl Spool {
                     let shed_bytes = message_bytes(&m);
                     *spool_bytes = spool_bytes.saturating_sub(shed_bytes);
                     self.log_drop(&m, shed_bytes, len.saturating_sub(1), *spool_bytes, bound);
+                } else {
+                    // Corruption, not an accounted record: the total never
+                    // included it (see the invariant on `drain`), so removing it
+                    // correctly changes no bytes — but the operator must see it.
+                    warn!(
+                        key,
+                        "spool evicted an UNDECODABLE record (corruption or a \
+                         foreign layout); it consumed a count slot and no \
+                         accounted bytes"
+                    );
                 }
                 t.remove(key).map_err(backend)?;
                 self.dropped.fetch_add(1, Ordering::Relaxed);
@@ -518,22 +538,29 @@ impl Spool {
             }
             Inner::Disk { db, bytes, .. } => {
                 let mut out = Vec::new();
+                let mut undecodable = 0usize;
                 let mut wtx = db.begin_write().map_err(backend)?;
                 wtx.set_durability(Durability::Immediate); // fsync the removal (ADR 0060 T3)
                 {
                     let mut t = wtx.open_table(SPOOL).map_err(backend)?;
+                    // EVERY key is removed — an undecodable record must not linger:
+                    // before this fix it stayed in the table forever (occupying a
+                    // count slot, never replayed) while the byte total was zeroed,
+                    // so the spool could grow past `max_bytes` without limit. The
+                    // accounted-byte invariant is "bytes() = Σ accounted bytes of
+                    // DECODABLE residents": a corrupt record contributes no
+                    // accounted bytes anywhere (open, evict, drain), so zeroing
+                    // the total over an emptied table stays exact.
                     let keys: Vec<u64> = t
                         .iter()
                         .map_err(backend)?
                         .filter_map(Result::ok)
                         .map(|(k, v)| {
-                            let m = decode(v.value());
-                            (k.value(), m)
-                        })
-                        .filter_map(|(k, m)| m.map(|m| (k, m)))
-                        .map(|(k, m)| {
-                            out.push(m);
-                            k
+                            match decode(v.value()) {
+                                Some(m) => out.push(m),
+                                None => undecodable += 1,
+                            }
+                            k.value()
                         })
                         .collect();
                     for k in keys {
@@ -541,6 +568,14 @@ impl Spool {
                     }
                 }
                 wtx.commit().map_err(backend)?;
+                if undecodable > 0 {
+                    warn!(
+                        records = undecodable,
+                        "spool drain removed UNDECODABLE records (corruption or a \
+                         foreign layout): they were never replayable and consumed \
+                         count slots; the byte total never accounted them"
+                    );
+                }
                 *bytes = 0;
                 Ok(out)
             }
@@ -602,7 +637,10 @@ impl Spool {
     }
 
     /// The total recomputed from the resident entries — the independent witness
-    /// the exactness test compares [`bytes`](Self::bytes) against.
+    /// the exactness test compares [`bytes`](Self::bytes) against. Same invariant
+    /// as the running total (see `drain`): Σ accounted bytes of DECODABLE
+    /// residents; undecodable records contribute to neither side, so the two
+    /// agree exactly when the invariant holds.
     #[cfg(test)]
     fn recomputed_bytes(&self) -> Result<usize, SpoolError> {
         let inner = self
@@ -904,6 +942,133 @@ mod tests {
             s.recomputed_bytes().unwrap(),
             "counter drifted after {step}"
         );
+    }
+
+    /// The corruption contract the byte bound made visible (review round on #605):
+    /// a record that does not decode is a count-slot occupant with NO accounted
+    /// bytes, at every site that touches the table:
+    /// * reopen sums only decodable residents, and the running total still equals
+    ///   the recomputed witness;
+    /// * drain removes EVERY key — before the fix an undecodable record stayed in
+    ///   the table forever (never replayed, never removed) while the total was
+    ///   zeroed, so the spool could grow past `max_bytes` without limit;
+    /// * eviction terminates past an undecodable OLDEST and leaves the spool
+    ///   consistent.
+    #[test]
+    fn an_undecodable_record_is_drained_evicted_and_never_accounted() {
+        fn inject_garbage(spool: &Spool) {
+            let Inner::Disk { db, .. } = &*spool.inner.lock().unwrap() else {
+                panic!("this test drives the disk-backed variant");
+            };
+            let mut wtx = db.begin_write().unwrap();
+            {
+                let mut t = wtx.open_table(SPOOL).unwrap();
+                t.insert(9_999, &[0xffu8; 8][..]).unwrap(); // undecodable: u32 length overruns
+            }
+            wtx.commit().unwrap();
+        }
+
+        // --- reopen: the corrupt record is seen, warned, and not accounted ---
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.redb");
+        {
+            let s = Spool::on_disk(&path, 8).unwrap();
+            s.push(&sample("kept")).unwrap();
+        }
+        inject_garbage_db(&path); // a record the CURRENT decode cannot read
+        {
+            let s = Spool::on_disk(&path, 8).unwrap();
+            assert_eq!(
+                s.len().unwrap(),
+                2,
+                "the corrupt record occupies a count slot"
+            );
+            assert_eq!(
+                s.bytes().unwrap(),
+                s.recomputed_bytes().unwrap(),
+                "the running total and the witness must agree over a corrupt resident"
+            );
+            assert_eq!(
+                s.bytes().unwrap(),
+                message_bytes(&sample("kept")),
+                "only the decodable resident is accounted"
+            );
+
+            // --- drain removes EVERY key, including the corrupt one ---
+            let drained = s.drain().unwrap();
+            assert_eq!(drained.len(), 1, "only the decodable record is replayed");
+            assert_eq!(s.len().unwrap(), 0, "the corrupt record must not linger");
+            assert_eq!(s.bytes().unwrap(), 0);
+            assert_eq!(s.bytes().unwrap(), s.recomputed_bytes().unwrap());
+        }
+        {
+            let s = Spool::on_disk(&path, 8).unwrap();
+            assert_eq!(
+                s.len().unwrap(),
+                0,
+                "drain emptied the table across a reopen"
+            );
+        }
+
+        // --- eviction terminates past an undecodable OLDEST ---
+        let dir2 = tempfile::tempdir().unwrap();
+        let path2 = dir2.path().join("e.redb");
+        {
+            let s = Spool::on_disk(&path2, 8).unwrap();
+            s.push(&sample("kept")).unwrap();
+        }
+        inject_garbage_db(&path2);
+        // One resident (326 accounted) + a budget that fits only ONE more record:
+        // every push under DropOldest MUST evict, and the corrupt record sits at
+        // the OLDEST key — the evictor must get past it (it frees no accounted
+        // bytes) without looping forever.
+        let budget = (message_bytes(&sample("kept")) + 100) as u64;
+        {
+            let s = Spool::on_disk(&path2, 8)
+                .unwrap()
+                .with_max_bytes(budget)
+                .with_overflow(Overflow::DropOldest);
+            for i in 0..3 {
+                s.push(&sample(&format!("after-{i}"))).unwrap();
+            }
+            assert_eq!(s.bytes().unwrap(), s.recomputed_bytes().unwrap());
+            assert!(
+                s.len().unwrap() <= 2,
+                "the byte budget must still bound the spool past a corrupt resident"
+            );
+        }
+        {
+            // The corrupt record was evicted too: a fresh reopen sees one
+            // decodable resident and nothing undecodable left to warn about.
+            let s = Spool::on_disk(&path2, 8).unwrap();
+            assert_eq!(s.len().unwrap(), 1);
+            assert_eq!(s.bytes().unwrap(), s.recomputed_bytes().unwrap());
+            assert_eq!(s.drain().unwrap().len(), 1);
+            assert_eq!(s.len().unwrap(), 0);
+        }
+    }
+
+    /// A valid record and, at a HIGHER key, a raw record the current decode cannot
+    /// read — written straight into the table so no encode step can make it valid.
+    fn inject_garbage_db(path: &std::path::Path) {
+        let db = Database::open(path).unwrap();
+        let mut wtx = db.begin_write().unwrap();
+        {
+            let mut t = wtx.open_table(SPOOL).unwrap();
+            let last = t.last().unwrap().map(|(k, _)| k.value()).unwrap_or(0);
+            t.insert(last + 1, &[0xffu8; 8][..]).unwrap(); // u32 length 0xffffffff overruns
+        }
+        wtx.commit().unwrap();
+    }
+
+    fn sample(id: &str) -> SpooledMessage {
+        SpooledMessage {
+            topic: format!("t/{id}"),
+            payload: vec![b'x'; 64],
+            qos: 1,
+            retain: false,
+            user_properties: Vec::new(),
+        }
     }
 
     fn for_each_backend(cap: usize, max_bytes: u64, overflow: Overflow, f: impl Fn(&Spool)) {

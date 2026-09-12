@@ -318,6 +318,14 @@ unset / 0 = off) join: first reached wins, with the same overflow policy. A mess
 than the entire byte budget is dropped or refused on its own — the spool is not emptied
 trying to make room.
 
+**Reopen cost of the byte bound.** The running byte total is rebuilt by decoding
+every record on open (runtime state — the on-disk layout is unchanged), so
+reopening a FULL spool reads and decodes its entire accounted content before the
+bridge serves anything: at the motivating size, 10 000 × 1 MiB payloads is
+~10 GiB of decode on restart. That is the price of exact accounting without a
+schema bump; size `[spool].dir`'s volume and your restart window knowing the
+reopen scales with resident bytes, not just the message count.
+
 **The acknowledgement is no longer sent on arrival.** The bridge used to PUBACK a `QoS`≥1
 message the moment it read it — before doing anything durable with it — so the source dropped
 its copy while the bridge might still lose it. Now the engine acknowledges only after the
