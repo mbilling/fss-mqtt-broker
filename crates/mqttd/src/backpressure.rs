@@ -313,7 +313,17 @@ impl BacklogQueue {
 /// and not the payload alone or the encoded packet.
 #[must_use]
 pub fn message_bytes(m: &Message) -> usize {
-    ENTRY_OVERHEAD + m.topic.len() + m.payload.len() + m.app.accounted_bytes()
+    message_parts_bytes(&m.topic, m.payload.len(), &m.app)
+}
+
+/// The same budget before constructing a per-recipient `Message` (#482).
+/// Shared admission must use exactly the send path's accounting, including properties.
+pub(crate) fn message_parts_bytes(
+    topic: &str,
+    payload_len: usize,
+    app: &mqtt_core::AppProperties,
+) -> usize {
+    ENTRY_OVERHEAD + topic.len() + payload_len + app.accounted_bytes()
 }
 
 /// A queued packet's accounted size, by the same definition — so what the outbound
