@@ -123,6 +123,13 @@ single delivery remains [ADR 0015](0015-cluster-shared-subscriptions.md).
 MQTT leaves member selection implementation-defined; fairness/spillover is a
 separate option under #537 Phase 3, not a spec defect.
 
+**QoS 0 pressure admission (2026-09-13, #482).** A known-full local outbound
+can now be bypassed before enqueue in favour of another online member of the
+same group. Local room is checked against the packet and byte limits; remote
+capacity remains unknown. No post-send retry or QoS 1/2 policy change. See
+[ADR 0015's pressure-admission note](0015-cluster-shared-subscriptions.md) for the
+exact boundary and remaining downstream-scaling work.
+
 ## Alternatives considered
 
 - **Fold shared groups into `SubscriptionTable`.** Rejected: round-robin cursor state

@@ -573,7 +573,18 @@ impl Hub {
         let answerable = gate.is_some();
         let append_gate = gate.map_or(AppendGate::None, AppendGate::Pending);
         let mut all_durable = DurableOutcome::Ok;
-        for plan in self.plan_shared(topic) {
+        let qos0_bytes = (qos == QoS::AtMostOnce).then(|| {
+            self.subscriber_limits.max_outbound_bytes.map_or(0, |_| {
+                crate::backpressure::message_parts_bytes(topic, payload.len(), app)
+            })
+        });
+        for mut plan in self.plan_shared(topic) {
+            if let Some(bytes) = qos0_bytes {
+                // At COMMIT time: a preceding matching group may have consumed
+                // this member's last slot since all groups were planned. Never
+                // retry a send; change the target only BEFORE any enqueue.
+                self.replan_qos0_shared(topic, &mut plan, bytes);
+            }
             // COMMIT the plan: advance the cursor exactly as `select_shared` would
             // have — including when no member was choosable (the rotation was spent).
             // Update in place. `HashMap::insert` keeps the OLD key and drops the
@@ -1001,6 +1012,126 @@ impl Hub {
             .map(|i| candidates[i].clone())
     }
 
+    /// Keep the O(1) local-online selection when it has room; only a known-full
+    /// local `QoS` 0 target enters the pressure path. Closed targets still take the
+    /// existing send/reap path (#504). No `QoS` 1/2 obligations or wire retries change.
+    fn replan_qos0_shared(&self, topic: &str, plan: &mut SharedPlan, bytes: usize) {
+        let Some(chosen) = &plan.chosen else { return };
+        if chosen.node.is_some() {
+            return; // Remote capacity is unknown: this is not a distributed credit scheme.
+        }
+        let Some(online) = self.online.get(&chosen.client) else {
+            return;
+        };
+        if online.tx.is_closed() || self.qos0_outbound_has_room(&online.tx, bytes) {
+            return;
+        }
+        let existing = self.shared_cursor.get(&plan.key_hash);
+        let (key, start) = if let Some(key) = &plan.key_if_new {
+            (key, 0)
+        } else {
+            let Some((key, cursor)) = existing else {
+                return;
+            };
+            (key, *cursor)
+        };
+        // Use the OLD cursor, not plan.next_cursor: the local fast path reduces
+        // next_cursor modulo local membership. That would reset every fallback
+        // to the first remote and strand the other remote members under pressure.
+        if let Some((chosen, next)) = self.qos0_shared_alternative(topic, key, start, bytes) {
+            plan.chosen = Some(chosen);
+            plan.next_cursor = next;
+        }
+        // No alternative: keep the original target and its ONE counted shed.
+    }
+
+    fn qos0_outbound_has_room(&self, tx: &Outbound, bytes: usize) -> bool {
+        tx.depth() < MAX_OUTBOUND_QUEUE
+            && self
+                .subscriber_limits
+                .max_outbound_bytes
+                .is_none_or(|cap| tx.bytes().saturating_add(bytes) <= cap)
+    }
+
+    /// A bounded scan of this group's members, paid only on known pressure.
+    /// Borrow candidates and clone just the chosen member, as in `plan_shared`.
+    /// Remote liveness is only a hint; require a usable link, but do not claim
+    /// knowledge of its consumer's capacity and do not replay ambiguous sends.
+    fn qos0_shared_alternative(
+        &self,
+        topic: &str,
+        key: &SharedKey,
+        start: usize,
+        bytes: usize,
+    ) -> Option<(SharedCandidate, usize)> {
+        let mut candidates = Vec::new();
+        let mut local_online = 0;
+        if let Some((_, _, members)) = self
+            .shared
+            .matching_refs(topic)
+            .find(|(group, filter, _)| *group == key.0 && *filter == key.1)
+        {
+            local_online = members.online_count();
+            for (client, qos) in members.iter() {
+                candidates.push(SharedCandidateRef {
+                    node: None,
+                    client,
+                    qos: *qos,
+                    online: self.online.get(client).is_some_and(|s| {
+                        !s.tx.is_closed() && self.qos0_outbound_has_room(&s.tx, bytes)
+                    }),
+                });
+            }
+        }
+        if self.shared_prefer_local {
+            if let Some(selected) = self
+                .choose_shared_index(&candidates, start)
+                .filter(|&i| candidates[i].online)
+            {
+                // A ready local outranks every remote. Preserve #524's important
+                // property even under pressure: do NOT scan remote member lists
+                // merely because this local group's first pick was full.
+                return Some((
+                    candidates[selected].to_owned_candidate(),
+                    (selected + 1) % local_online.max(1),
+                ));
+            }
+        }
+        if let Some(locations) = self.remote_by_filter.get(key.1.as_str()) {
+            for (node, idx) in locations {
+                let Some(group) = self.remote_shared.get(node).and_then(|g| g.get(*idx)) else {
+                    continue;
+                };
+                if group.group != key.0 {
+                    continue;
+                }
+                let linked = self.peers.get(node).is_some_and(|p| !p.tx.is_closed());
+                for (client, qos, online) in &group.members {
+                    candidates.push(SharedCandidateRef {
+                        node: Some(node),
+                        client,
+                        qos: *qos,
+                        online: linked && *online,
+                    });
+                }
+            }
+        }
+        let selected = self.choose_shared_index(&candidates, start)?;
+        let chosen = &candidates[selected];
+        if !chosen.online {
+            return None; // Do not turn full-online shedding into offline queueing.
+        }
+        let rotation = if self.shared_prefer_local && chosen.node.is_none() {
+            local_online
+        } else {
+            candidates.len()
+        };
+        Some((
+            chosen.to_owned_candidate(),
+            (selected + 1) % rotation.max(1),
+        ))
+    }
+
     /// The selection policy itself, by index, over either representation (issue
     /// #376): one policy, two candidate shapes (owned for the cold reselect path,
     /// borrowed for the per-publish plan), zero drift.
@@ -1117,10 +1248,13 @@ impl Hub {
             // packet ceiling is ~10 GiB, i.e. a count is not a memory budget. The
             // gate covers ONLY this shed-legal class; control packets and QoS 1/2
             // still flow past a full channel, exactly as before.
-            let over_bytes = limits
+            let bytes = limits
                 .max_outbound_bytes
-                .is_some_and(|c| tx.bytes() + message_bytes(message) > c);
-            if tx.depth() >= MAX_OUTBOUND_QUEUE || over_bytes {
+                .map_or(0, |_| message_bytes(message));
+            if !self.qos0_outbound_has_room(tx, bytes) {
+                let over_bytes = limits
+                    .max_outbound_bytes
+                    .is_some_and(|c| tx.bytes().saturating_add(bytes) > c);
                 if let Some(m) = &self.metrics {
                     m.publish_dropped("outbound-full");
                 }

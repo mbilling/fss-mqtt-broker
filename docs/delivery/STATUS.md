@@ -22,7 +22,7 @@
 | [0012](../adr/0012-flow-control.md) | MQTT 5.0 flow control (Receive Maximum) | Accepted | [6/6 done](0012-flow-control.md) | — |
 | [0013](../adr/0013-enhanced-authentication.md) | MQTT 5.0 enhanced authentication (AUTH exchange) | Accepted | [8/9 done](0013-enhanced-authentication.md) | 1 deferred |
 | [0014](../adr/0014-cross-node-retained.md) | Cross-node retained-message replication | Accepted | [10/10 done](0014-cross-node-retained.md) | — |
-| [0015](../adr/0015-cluster-shared-subscriptions.md) | Cluster-wide shared subscriptions | Accepted | [9/9 done](0015-cluster-shared-subscriptions.md) | — |
+| [0015](../adr/0015-cluster-shared-subscriptions.md) | Cluster-wide shared subscriptions | Accepted | [9/10 done](0015-cluster-shared-subscriptions.md) | 1 open |
 | [0016](../adr/0016-swim-membership-stability.md) | SWIM membership stability (dead-node fencing + false-positive resistance) | Accepted | [7/7 done](0016-swim-membership-stability.md) | — |
 | [0017](../adr/0017-durable-attach-readiness.md) | Durable attach waits for an authoritative session, never downgrades | Accepted | [8/9 done](0017-durable-attach-readiness.md) | 1 deferred |
 | [0018](../adr/0018-on-disk-persistence.md) | On-disk persistence for durable state | Accepted | [8/8 done](0018-on-disk-persistence.md) | — |
@@ -108,6 +108,10 @@
 **0013 — MQTT 5.0 enhanced authentication (AUTH exchange)**
 
 - `0013-T8` 💤 deferred: Server-initiated re-auth (server sends AUTH 0x19 to demand re-authentication) — ADR section 4 explicitly defers this — needs a trigger mechanism and interacts with the select-loop outbound path; only client-initiated re-auth is implemented (no server-side AUTH 0x19 send exists in conn.rs).
+
+**0015 — Cluster-wide shared subscriptions**
+
+- `0015-T10` 🚧 in-progress ([#482](https://github.com/mbilling/fss-mqtt-broker/issues/482)): "QoS 0 shared-worker capacity: avoid known-full local targets and establish proportional downstream delivery" — "Local admission slice: hub/delivery.rs reselects before enqueue within the same group/filter when the selected local QoS 0 outbound lacks packet/byte headroom. Seven shared_capacity regressions cover count/bytes/properties, locality escape and remote rotation, all-full/recovery, overlapping groups, group/link isolation, QoS 1 and ordinary controls. Four mutations caught. shared_capacity microbenchmark waits for metered channel receipts; docs/benchmarks/SHARED-CAPACITY.md records measured overhead and limitations. Remote capacity credits, bridge live-queue bounds, synchronized lane-E measurements and actual downstream scaling remain open; no cloud capacity claim."
 
 **0017 — Durable attach waits for an authoritative session, never downgrades**
 
