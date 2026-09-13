@@ -3,6 +3,30 @@
 **Verified against `v1.0.16` (2026-09-11).** The git workflow for AI-agent sessions working on this repository. Human contributors:
 most of this applies to you too, minus the sandbox constraints.
 
+## Claiming work
+
+- **`in-progress` on an issue means someone already holds it.** A human or another
+  agent session is working on it right now. Do not start on it, do not open a PR
+  against it, and do not assume a quiet issue is free just because no PR references
+  it yet — the label goes on *before* the branch exists, which is the whole point.
+- **Claim what you take, before you take it.** Add `in-progress` as the first action
+  of the task, not when you open the PR. The gap between "I picked this" and "a PR
+  appeared" is exactly where two sessions duplicate each other, and neither can see
+  the other's branch, scratch directory, or plan.
+- **Drop the label if you stop without landing it.** An abandoned claim is worse than
+  no claim: it parks the issue indefinitely for everyone else. If you hand work back
+  unfinished, remove `in-progress` and say on the issue what you did and where you
+  stopped.
+- **Leaving it on through review is correct.** The claim ends when the issue closes or
+  when you give it up — not when the PR opens. A PR under review is still held.
+- **Partial fixes keep the issue open, and keep the label only if you are continuing.**
+  If you land some of an issue and stop, say which part remains, then unclaim. #525 is
+  the worked example: the double-scans went, the constant-time index did not, and the
+  issue stays open for it.
+
+This is the only cross-session signal that exists. Sessions share a repository, not a
+memory — the label is how a claim becomes visible to someone you will never talk to.
+
 ## Branch model
 
 - **`main` is the integration branch.** Never push to it directly — all work lands via
