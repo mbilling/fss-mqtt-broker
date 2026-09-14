@@ -1,0 +1,14 @@
+0.002	subscriber broker0 holds 1 groups
+0.002	publisher broker0 connected
+0.002	subscribed 1 directed pairs (local mode)
+0.022	pilot delivered on every pair after 1 rounds
+0.043	pilot-end delivered on every pair
+0.055	scraped pre broker0 (26061 bytes)
+0.175	published 100 per pair
+0.175	burst-end delivered on every pair
+0.178	scraped post broker0 (26152 bytes)
+0.375	sent DISCONNECT on 2 connections
+status	complete
+count	100
+nodes	1
+nonce	6aa86be08f103b5706

@@ -1,0 +1,1 @@
+sites=1 offered=— publishers=3 consumers=3 qos=0 sub_qos=0 window=aligned cpu_window=missing settled=yes drained=yes control=no source=local-proof

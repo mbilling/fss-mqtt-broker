@@ -270,11 +270,18 @@ with the matching env file beside it. It is a diagnostic campaign, not a
 published curve — do not copy its one-off numbers into
 `docs/benchmarks/SCALE-CURVE.md`.
 
-Before reading capacity vs N from an Option B arm: confirm the crossing gate
-(`mqttd_publish_forwarded_total` / `mqttd_publish_received_total`) using complete,
-supported broker snapshots without detected counter resets. Lazily absent samples
-can mean zero, but missing/failed scrapes cannot. `python3 extract-lane-e.py
-<run>/results` reports invalid input with a nonzero exit. Rates, crossing, hub
+Before reading capacity vs N from an Option B arm, pass the crossing gate:
+`laneE/forward-canary.txt` says `status=pass` and `python3 extract-lane-e.py
+--crossing-gate 0.5 <run>/results` exits 0. mqttd exports no forwarded family
+until a broker first forwards, so an absent series is only a zero under a
+certificate — **structural** at N=1 (no peer links) or **canary** at N≥2 (the
+size's forwarding positive control re-derived by `forward-canary.py`'s ledger,
+with every later snapshot still above its floors, in the same process). The gate
+also judges each broker's own crossing, not only the aggregate. `python3
+forward-canary.py local-proof --mqttd <bin> --nodes N` proves that chain on N local
+processes before a paid run: canary, a certified zero-crossing rung, and a restart the
+extractor refuses. Uncertified,
+truncated or reset scrapes are INVALID with a nonzero exit. Rates, crossing, hub
 dispatch and CPU idle come from the rung's aligned steady window: brokers and
 consumers are scraped by one batch at each edge, each host stamps its own scrape
 (`window.tsv`), and the CPU samplers run for exactly that window. Rungs recorded

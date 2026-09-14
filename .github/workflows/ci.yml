@@ -198,6 +198,15 @@ jobs:
       # way of never reporting anything.
       - name: The scale summarizer corrects the publish double-count and enforces lane E validity
         run: python3 bench/scale/summarize-curve.py --self-test
+      # Lane E's crossing is ~0% by prediction, and mqttd omits the forwarded family until a
+      # broker's first forward, so a zero is only a measurement with a positive control behind
+      # it (#482). The canary's ledger on real mqttd captures and its raw MQTT client against
+      # loopback fakes; then the extractor that certifies every rung from that ledger — the
+      # same two self-tests run.sh demands before it provisions anything.
+      - name: The Lane E forwarding positive control re-derives its ledger from real captures
+        run: python3 bench/scale/forward-canary.py --self-test
+      - name: The Lane E extractor certifies a zero crossing only under a structural or canary certificate
+        run: python3 bench/scale/extract-lane-e.py --self-test
       - name: Scale provider selection and recovery (offline)
         run: python3 bench/scale/test-cloud.py
 

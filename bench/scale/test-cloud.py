@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 """Offline provider selection/recovery tests: all cloud CLIs are stubs."""
+import contextlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
+import signal
 import subprocess
 import tempfile
+import time
 import unittest
 
 SCALE = Path(__file__).resolve().parent
@@ -18,8 +22,10 @@ class CloudTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.rig = self.root / "bench/scale"
         self.rig.mkdir(parents=True)
-        for name in ("lib.sh", "cloud.sh", "run.sh", "teardown.sh", "run-curve.sh", "cpu.sh", "test-upcloud-quota.py", "482-smoke.sh", "482-constant-driver-N5-N7-optionB.env", "extract-lane-e.py"):
+        for name in ("lib.sh", "cloud.sh", "run.sh", "teardown.sh", "run-curve.sh", "cpu.sh", "test-upcloud-quota.py", "482-smoke.sh", "482-constant-driver-N5-N7-optionB.env", "extract-lane-e.py", "forward-canary.py"):
             shutil.copy2(SCALE / name, self.rig / name)
+        # The real mqttd captures the ledgers and the extractor are tested against.
+        shutil.copytree(SCALE / "testdata", self.rig / "testdata")
         for name in ("terraform", "terraform-upcloud"):
             (self.rig / name).mkdir()
         bin_dir = self.root / "bin"
@@ -53,7 +59,7 @@ sys.exit(77 if "apply" in sys.argv or os.path.basename(sys.argv[0]) in ("hcloud"
     def run_script(self, name, *args, **env):
         return subprocess.run(
             ["bash", str(self.rig / name), *args], env=self.env | env,
-            capture_output=True, text=True, timeout=15,
+            capture_output=True, text=True, timeout=60,
         )
 
     def calls(self):
@@ -298,7 +304,7 @@ with_cpu_sampling "$CPU_DIR" driver
             env=self.env | {"HCLOUD_TOKEN": "dummy", "SSH_KEY": str(key),
                             "MQTTD_URL": "https://example.invalid/pinned-main", "MQTTD_SHA256": "a" * 64,
                             "BENCH_GIT_REF": "29e43854fd699fa910cf383db273dee191f47d87"},
-            capture_output=True, text=True, timeout=15,
+            capture_output=True, text=True, timeout=60,
         )
         # The apply stub deliberately fails, then the EXIT trap destroys.
         self.assertNotEqual(result.returncode, 0)
@@ -365,82 +371,484 @@ with_cpu_sampling "$CPU_DIR" driver
         self.assertIn("site affinity: ON", shape)
         self.assertNotIn("prefer-local", shape)
 
-    def test_lane_e_brokers_consumers_and_cpu_share_one_window(self):
-        # Every remote command really runs, locally, against fake curl/docker/
-        # mpstat; `sleep` returns at once. The log records what each host was
-        # asked to do and when, so the ORDER of the rung is what is asserted.
-        fake = self.bin_dir
-        (fake / "ssh").write_text('''#!/usr/bin/env python3
-import json, os, sys, time
+    # ── Lane E end to end, against fakes that behave like the fleet ──────────
+    # Every remote command really runs, locally, against fake curl/docker/
+    # mpstat/systemctl; `sleep` returns at once. The log records what each host
+    # was asked to do and when, so the ORDER of a size is what is asserted.
+    FAKE_SSH = r'''#!/usr/bin/env python3
+import json, os, pathlib, subprocess, sys, time
 args = sys.argv[1:]
 i = next(k for k, a in enumerate(args) if a.startswith("root@"))
 host, cmd = args[i][5:], " ".join(args[i + 1:])
 if cmd == "bash -s":
     cmd = sys.stdin.read()
-with open(os.environ["CALL_LOG"], "a") as f:
-    f.write(json.dumps({"t": time.time_ns(), "host": host, "cmd": cmd}) + "\\n")
+start = time.time_ns()
+state = pathlib.Path(os.environ["FAKE_STATE"])
 os.environ["FAKE_HOST"] = host
-os.execvp("bash", ["bash", "-c", cmd])
-''')
-        tools = {
-            "sleep": '''#!/usr/bin/env python3
-import json, os, sys, time
+def log(**extra):
+    with open(os.environ["CALL_LOG"], "a") as f:
+        f.write(json.dumps({"t": start, "host": host, "cmd": cmd, **extra}) + "\n")
+if "python3 - run" in cmd:
+    # The canary arrives on stdin and answers with its '@@@' stream: replay a
+    # real capture instead of dialling brokers that do not exist.
+    sys.stdin.read()
+    (state / "canary").touch()
+    sys.stdout.write(pathlib.Path(os.environ["FAKE_CANARY_STREAM"]).read_text())
+    log(end=time.time_ns())
+    sys.exit(int(os.environ.get("FAKE_CANARY_RC", "0")))
+if "mqttd_connections_active[ {]" in cmd:
+    (state / "rung").touch()  # a rung's reset wait: everything after it is the rung's
+if "mpstat" in cmd:
+    # A sampler must BE the process cpu.sh kills, exactly as `exec ssh` is.
+    log()
+    os.execvp("bash", ["bash", "-c", cmd])
+if "WINDOW_STAMP_MS" in cmd:
+    with open(state / f"window-{host}", "ab") as f:
+        f.write(b"x")
+        edge = f.tell()
+    if os.environ.get("FAKE_WINDOW_FAILS") == f"{host}:{edge}":
+        sys.stderr.write(f"ssh: connect to host {host} port 22: Connection timed out\n")
+        log(end=time.time_ns(), failed=True)
+        sys.exit(255)
+    # Long enough that scrapes taken one after another could never overlap.
+    time.sleep(0.3)
+rc = subprocess.run(["bash", "-c", cmd]).returncode
+log(end=time.time_ns())
+sys.exit(rc)
+'''
+    FAKE_TOOLS = {
+        "sleep": r'''#!/usr/bin/env python3
+import json, os, pathlib, signal, sys, time
 with open(os.environ["CALL_LOG"], "a") as f:
-    f.write(json.dumps({"t": time.time_ns(), "sleep": sys.argv[1]}) + "\\n")
+    f.write(json.dumps({"t": time.time_ns(), "sleep": sys.argv[1]}) + "\n")
+blocked = pathlib.Path(os.environ["FAKE_STATE"]) / "blocked"
+if sys.argv[1] == os.environ.get("FAKE_BLOCK_SLEEP") and not blocked.exists():
+    # Behave like coreutils sleep under Ctrl-C: die of the signal.
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
+    blocked.touch()
+    time.sleep(120)
 ''',
-            "mpstat": '''#!/usr/bin/env python3
+        "mpstat": r'''#!/usr/bin/env python3
 import json, os, signal, sys, time
 def stop(*_):
     with open(os.environ["CALL_LOG"], "a") as f:
-        f.write(json.dumps({"t": time.time_ns(), "host": os.environ["FAKE_HOST"], "cpu": "stop"}) + "\\n")
+        f.write(json.dumps({"t": time.time_ns(), "host": os.environ["FAKE_HOST"], "cpu": "stop"}) + "\n")
     sys.exit(0)
 signal.signal(signal.SIGTERM, stop)
-# `mpstat -P ALL <interval> <count>` is a timer that ends on its own.
-count = int(sys.argv[4]) if len(sys.argv) > 4 else None
-while count is None or count > 0:
+dies = os.environ.get("FAKE_MPSTAT_DIES") == os.environ["FAKE_HOST"]
+while True:
     print(time.strftime("%H:%M:%S", time.gmtime()) + "  all  0 0 0 0 0 0 0 0 0 50.00", flush=True)
-    count = None if count is None else count - 1
+    if dies:
+        sys.exit(0)
     time.sleep(0.05)
 ''',
-            "curl": '''#!/usr/bin/env python3
-import os, sys
+        "curl": r'''#!/usr/bin/env python3
+import os, pathlib, sys
 url = sys.argv[-1]
-state = os.path.join(os.environ["FAKE_STATE"], "pubs")
+state = pathlib.Path(os.environ["FAKE_STATE"])
+host = os.environ.get("FAKE_HOST", "")
 if url.endswith(":8080/metrics"):
-    print("mqttd_connections_active %d" % (10**6 if os.path.exists(state) else 0))
-    print("mqttd_publish_received_total 100")
+    # A live broker: every scrape sees its counters advance, a labelled family
+    # exists only once it has a sample, and the exposition ends in '# EOF'.
+    with open(state / f"scrapes-{host}", "ab") as f:
+        f.write(b"x")
+        n = f.tell()
+    if (state / "canary").exists() and host == os.environ.get("FAKE_LOSE_CONTROL"):
+        # Restarted since the control: serve the real first scrape of a respawned
+        # mqttd — a whole exposition ending in '# EOF', with no publish family at all.
+        sys.stdout.write(pathlib.Path(os.environ["FAKE_RESTART_SCRAPE"]).read_text())
+        sys.exit(0)
+    cut = False
+    if (state / "canary").exists() and host == os.environ.get("FAKE_CUT_SCRAPES"):
+        cut = True  # every scrape since the control ends mid-body
+    if (state / "rung").exists() and host == os.environ.get("FAKE_LOSE_THEN_CUT") and "-m" in sys.argv:
+        with open(state / f"lose-cut-{host}", "ab") as f:
+            f.write(b"x")
+            first = f.tell() == 1
+        if first:
+            sys.stdout.write(pathlib.Path(os.environ["FAKE_RESTART_SCRAPE"]).read_text())
+            sys.exit(0)
+        cut = True
+    conns = 10**6 if (state / "pubs").exists() else 0
+    lingering = 3 if (state / "canary").exists() and host == os.environ.get("FAKE_LINGER") else 0
+    out = [
+        "# HELP mqttd_connections_active Currently open client connections.",
+        "# TYPE mqttd_connections_active gauge",
+        f"mqttd_connections_active {conns}",
+        "# TYPE mqttd_publish_received counter",
+        f'mqttd_publish_received_total{{qos="0"}} {10**7 + 1000 * n}',
+        "# TYPE mqttd_publish_delivered counter",
+        f'mqttd_publish_delivered_total{{qos="0"}} {10**7 + 1000 * n}',
+    ]
+    if (state / "canary").exists():
+        out += ["# TYPE mqttd_publish_forwarded counter",
+                f'mqttd_publish_forwarded_total{{reason="shared-remote"}} {10**6 + n}']
+    out += [
+        "# TYPE mqttd_sessions gauge", f"mqttd_sessions {lingering}",
+        "# TYPE mqttd_subscriptions gauge", "mqttd_subscriptions 0",
+        "# TYPE mqttd_peer_links gauge", f"mqttd_peer_links {int(os.environ['FAKE_BROKERS']) - 1}",
+        "# EOF",
+    ]
+    if cut:
+        out = out[: len(out) // 2]
+    print("\n".join(out))
+elif url.endswith("/readyz"):
+    print('{"ready":true}')
 elif "/metrics" in url:
     print("recv 100")
 ''',
-            "docker": '''#!/usr/bin/env python3
-import os, sys
-state = os.path.join(os.environ["FAKE_STATE"], "pubs")
+        "docker": r'''#!/usr/bin/env python3
+import os, pathlib, sys
+state = pathlib.Path(os.environ["FAKE_STATE"]) / "pubs"
 a = sys.argv[1:]
-if a[:1] == ["run"] and "pub" in a:
-    open(state, "w").close()
-if a[:1] == ["rm"] and any(x.startswith("pub-") for x in a):
-    if os.path.exists(state): os.unlink(state)
+if a[:1] == ["run"] and any(x.startswith("pub-") for x in a):
+    state.touch()
+if a[:1] == ["rm"] and any(x.startswith("pub-") for x in a) and state.exists():
+    state.unlink()
+if a[:2] == ["logs", "cal-pub"]:
+    print("1s pub total=300000 rate=15000/sec")
+    print("1s pub_succ total=300000 rate=15000/sec")
+    print("1s pub_overrun total=0 rate=0/sec")
 ''',
-        }
-        for name, body in tools.items():
-            (fake / name).write_text(body)
-            (fake / name).chmod(0o755)
-        (self.root / "state").mkdir()
-        inventory = self.root / "inventory.json"
-        inventory.write_text(json.dumps({
-            "brokers": [{"public_ip": f"broker-{i}", "private_ip": f"10.0.0.{i + 1}"} for i in range(2)],
+        "systemctl": r'''#!/usr/bin/env python3
+import os, sys
+if sys.argv[1:] == ["show", "-p", "MainPID", "--value", "mqttd"]:
+    host = os.environ.get("FAKE_HOST", "")
+    fails = os.environ.get("FAKE_MAINPID_FAILS", "")  # "<host>:<times>"
+    if fails.startswith(host + ":"):
+        with open(os.path.join(os.environ["FAKE_STATE"], "mainpid-" + host), "ab") as f:
+            f.write(b"x")
+            n = f.tell()
+        if n <= int(fails.rsplit(":", 1)[1]):
+            sys.stderr.write(f"ssh: connect to host {host} port 22: Connection timed out\n")
+            sys.exit(255)
+    respawned = host == os.environ.get("FAKE_RESPAWN") and os.path.exists(os.path.join(os.environ["FAKE_STATE"], "rung"))
+    print((5000 if respawned else 4000) + int(host.rsplit("-", 1)[1]) if host.startswith("broker-") else 0)
+''',
+    }
+    CANARY_CHUNK = re.compile(r"metrics-(pre|post)-broker\d+\.prom|clients\.tsv|timeline\.tsv")
+
+    def canary_fixture(self):
+        """A real mqttd forward-canary capture that passes the rig's own verify.
+
+        The canary module's N=2 capture is preferred; any other passing N>=2
+        capture under testdata is accepted, and the fleet is sized to match it.
+        """
+        root = self.rig / "testdata"
+        found = []
+        for timeline in sorted(root.rglob("timeline.tsv")):
+            d = timeline.parent
+            fields = dict(line.split("\t", 1) for line in timeline.read_text().splitlines() if "\t" in line)
+            if fields.get("status") != "complete" or not {"nodes", "count"} <= set(fields):
+                continue
+            nodes, count = int(fields["nodes"]), int(fields["count"])
+            if nodes < 2:
+                continue
+            verdict = subprocess.run(
+                ["python3", str(self.rig / "forward-canary.py"), "verify", str(d), "--nodes", str(nodes), "--count", str(count)],
+                capture_output=True, text=True, timeout=30)
+            if verdict.returncode == 0:
+                preferred = d.relative_to(root).parts[0] == "forward-canary"
+                found.append((not preferred, nodes != 2, str(d), nodes, count))
+        self.assertTrue(found, "no passing real N>=2 forward-canary capture under bench/scale/testdata")
+        _, _, d, nodes, count = sorted(found)[0]
+        return Path(d), nodes, count
+
+    def lane_e_fleet(self, mutate=None, local=False, **env):
+        """Install the fakes; return (env, nodes, count) for a fleet matching the capture.
+
+        local=True replays the real N=1 capture (a local pair, status=pass-local)."""
+        for name, body in {"ssh": self.FAKE_SSH, **self.FAKE_TOOLS}.items():
+            (self.bin_dir / name).write_text(body)
+            (self.bin_dir / name).chmod(0o755)
+        if local:
+            fixture, nodes, count = self.rig / "testdata/forward-canary/n1", 1, 100
+        else:
+            fixture, nodes, count = self.canary_fixture()
+        chunks = {p.name: p.read_text().rstrip("\n") + "\n"
+                  for p in sorted(fixture.iterdir()) if self.CANARY_CHUNK.fullmatch(p.name)}
+        if mutate:
+            mutate(chunks)
+        stream = self.root / "canary-stream.txt"
+        stream.write_text("".join(f"\n@@@ {name}\n{text}" for name, text in chunks.items()))
+        state = self.root / "state"
+        state.mkdir()
+        self.inventory = self.root / "inventory.json"
+        self.inventory.write_text(json.dumps({
+            "brokers": [{"public_ip": f"broker-{i}", "private_ip": f"10.0.0.{i + 1}"} for i in range(nodes)],
             "drivers": [{"public_ip": "driver-0", "vcpus": 8}],
         }))
+        base = {"LANES": "E", "LANE_E_SITES_OVERRIDE": "1", "LANE_E_CONTROL": "0", "LANE_E_CALIBRATE": "0",
+                "LANE_E_FORWARD_CANARY_COUNT": str(count), "FAKE_STATE": str(state),
+                "FAKE_BROKERS": str(nodes), "FAKE_CANARY_STREAM": str(stream),
+                "FAKE_RESTART_SCRAPE": str(self.rig / "testdata/lane-e/local-proof-n3/restart/metrics-restart-broker2.prom")}
+        return self.env | base | env, nodes, count
+
+    def run_lane_e(self, env):
         out = self.root / "e2e"
-        result = subprocess.run(
-            ["bash", str(self.rig / "run-curve.sh"), str(out), str(inventory)],
-            env=self.env | {"LANES": "E", "LANE_E_SITES_OVERRIDE": "1", "LANE_E_CONTROL": "0",
-                            "LANE_E_CALIBRATE": "0", "FAKE_STATE": str(self.root / "state")},
-            capture_output=True, text=True, timeout=120,
-        )
+        result = subprocess.run(["bash", str(self.rig / "run-curve.sh"), str(out), str(self.inventory)],
+                                env=env, capture_output=True, text=True, timeout=180)
+        return result, out
+
+    def events(self):
+        return sorted((json.loads(line) for line in self.log.read_text().splitlines()), key=lambda e: e["t"])
+
+    def test_lane_e_forward_canary_precedes_calibration_and_every_rung(self):
+        env, nodes, count = self.lane_e_fleet(LANE_E_SITES_OVERRIDE="1 2", LANE_E_CONTROL="1", LANE_E_CALIBRATE="1")
+        result, out = self.run_lane_e(env)
         self.assertEqual(result.returncode, 0, result.stderr[-3000:])
-        events = [json.loads(line) for line in self.log.read_text().splitlines()]
-        events.sort(key=lambda e: e["t"])
+        events = self.events()
+        canary = [e for e in events if "python3 - run" in e.get("cmd", "")]
+        self.assertEqual(len(canary), 1, "one control per size")
+        self.assertEqual(canary[0]["host"], "driver-0")
+        for i in range(nodes):
+            self.assertIn(f"--broker 10.0.0.{i + 1}:1883:8080", canary[0]["cmd"])
+        self.assertIn(f"--count {count} --timeout 90", canary[0]["cmd"])
+        calibration = [e["t"] for e in events if "--name cal-pub" in e.get("cmd", "")]
+        rungs = [e["t"] for e in events if "--name sub-s0-0" in e.get("cmd", "") and "docker run" in e["cmd"]]
+        self.assertTrue(calibration, "calibration ran")
+        self.assertEqual(len(rungs), 3, "sites-1, sites-2 and the control each started consumers")
+        self.assertLess(canary[0]["end"], min(calibration), "the control precedes calibration")
+        self.assertLess(max(calibration), min(rungs), "and therefore every rung")
+        laneE = out / f"results/nodes={nodes}/laneE"
+        verdict = (laneE / "forward-canary.txt").read_text()
+        self.assertTrue(verdict.startswith(f"status=pass nodes={nodes} count={count}"), verdict)
+        self.assertIn("residue_status=clean", verdict)
+        for i in range(nodes):
+            self.assertEqual((laneE / f"forward-canary/mainpid-broker{i}.txt").read_text().strip(), str(4000 + i))
+            self.assertTrue((laneE / f"forward-canary/metrics-post-broker{i}.prom").is_file())
+        for rung in ("sites-1", "sites-2", "sites-1-rep2"):
+            self.assertTrue((laneE / rung / "rung.txt").is_file(), rung)
+        self.assertIn("forward canary: ON", (laneE / "shape.txt").read_text())
+
+    def test_lane_e_failed_forward_canary_starts_no_load(self):
+        def break_ledger(chunks):
+            # One forward short on one broker: the canary still says "complete".
+            post = chunks["metrics-post-broker0.prom"]
+            value = re.search(r'(?m)^mqttd_publish_forwarded_total\{reason="shared-remote"\} (\S+)$', post)
+            chunks["metrics-post-broker0.prom"] = post.replace(
+                value.group(0), value.group(0).rsplit(" ", 1)[0] + f" {float(value.group(1)) - 1:g}")
+        env, nodes, _ = self.lane_e_fleet(mutate=break_ledger, LANE_E_CALIBRATE="1")
+        result, out = self.run_lane_e(env)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("forwarding positive control FAILED", result.stderr)
+        for e in self.events():
+            for name in ("--name sub-", "--name pub-", "--name cal-pub"):
+                self.assertNotIn(name, e.get("cmd", ""), "no load after a failed control")
+        laneE = out / f"results/nodes={nodes}/laneE"
+        self.assertTrue((laneE / "forward-canary.txt").read_text().startswith("status=fail"))
+        for name in ("clients.tsv", "timeline.tsv", "metrics-pre-broker0.prom", "metrics-post-broker0.prom",
+                     "run.stdout", "run.stderr", "mainpid-broker0.txt"):
+            self.assertTrue((laneE / "forward-canary" / name).is_file(), name)
+        self.assertFalse(list(laneE.glob("sites-*")), "no rung directory")
+
+    def rung_snapshots(self, events, host):
+        """A broker's snapshot_broker scrapes taken inside a rung (after its reset wait began)."""
+        rung = min(e["t"] for e in events if "mqttd_connections_active[ {]" in e.get("cmd", ""))
+        return [e for e in events if e.get("host") == host and e["t"] > rung
+                and e.get("cmd") == "curl -s -m 10 http://localhost:8080/metrics"]
+
+    def test_lane_e_transient_mainpid_failure_is_retried(self):
+        # Mutation named: the old one-shot `rssh ... || true` left this broker's
+        # mainpid file empty, and every rung of the size was then uncertifiable.
+        env, nodes, _ = self.lane_e_fleet(FAKE_MAINPID_FAILS="broker-1:1")
+        result, out = self.run_lane_e(env)
+        self.assertEqual(result.returncode, 0, result.stderr[-3000:])
+        laneE = out / f"results/nodes={nodes}/laneE"
+        for i in range(nodes):
+            self.assertEqual((laneE / f"forward-canary/mainpid-broker{i}.txt").read_text().strip(), str(4000 + i))
+        asks = [e for e in self.events() if e.get("host") == "broker-1" and "MainPID" in e.get("cmd", "")]
+        self.assertGreaterEqual(len(asks), 2, "the failed read was retried")
+        self.assertTrue((laneE / "sites-1/rung.txt").is_file())
+
+    def test_lane_e_unreadable_mainpid_starts_no_load(self):
+        env, nodes, _ = self.lane_e_fleet(FAKE_MAINPID_FAILS="broker-1:99", LANE_E_CALIBRATE="1")
+        result, out = self.run_lane_e(env)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("could not read the MainPID of: broker1 (4 tries)", result.stderr)
+        for e in self.events():
+            for name in ("--name sub-", "--name pub-", "--name cal-pub"):
+                self.assertNotIn(name, e.get("cmd", ""), "no load without a bound control")
+        laneE = out / f"results/nodes={nodes}/laneE"
+        self.assertFalse(list(laneE.glob("sites-*")), "no rung directory")
+        self.assertIn("mainpid=unreadable broker1", (laneE / "forward-canary.txt").read_text())
+
+    def test_lane_e_canary_verdict_needs_both_the_exit_code_and_the_status_line(self):
+        # Two independent checks on `forward-canary.py verify`: a zero exit with the
+        # wrong verdict line, and a pass line with a non-zero exit, must each stop the size.
+        real = (self.rig / "forward-canary.py").read_text()
+        for line, rc in (("status=pass nodes=9 count=100", 0), ("status=pass-local nodes={nodes} count=100", 0),
+                         ("status=pass nodes={nodes} count=100", 1)):
+            with self.subTest(line=line, rc=rc):
+                for leftover in (self.root / "state", self.root / "e2e"):
+                    shutil.rmtree(leftover, ignore_errors=True)
+                with contextlib.suppress(FileNotFoundError):
+                    self.log.unlink()
+                (self.rig / "forward-canary.py").write_text(real)
+                env, nodes, _ = self.lane_e_fleet()
+                (self.rig / "forward-canary.py").write_text(
+                    "import sys\nprint(%r)\nsys.exit(%d)\n" % (line.format(nodes=nodes), rc))
+                result, out = self.run_lane_e(env)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(f"forwarding positive control FAILED at N={nodes}", result.stderr)
+                for e in self.events():
+                    self.assertNotIn("--name sub-", e.get("cmd", ""), "no load after a refused verdict")
+        (self.rig / "forward-canary.py").write_text(real)
+
+    def test_lane_e_rung_dies_when_a_broker_lost_the_control(self):
+        # Mutation named: judging "complete" by the received family as well as
+        # '# EOF' reads this real restarted-broker scrape as incomplete, warns, and
+        # starts the rung's containers.
+        env, nodes, _ = self.lane_e_fleet(FAKE_LOSE_CONTROL="broker-1")
+        result, out = self.run_lane_e(env)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("broker1 no longer exposes the forwarding positive control", result.stderr)
+        self.assertNotIn("still incomplete", result.stderr)
+        events = self.events()
+        for e in events:
+            self.assertNotIn("--name sub-", e.get("cmd", ""), "no consumer started")
+            self.assertNotIn("--name pub-", e.get("cmd", ""), "no publisher started")
+        self.assertEqual(len(self.rung_snapshots(events, "broker-1")), 4, "one before-scrape and three retries")
+        retries = [e for e in events if e.get("sleep") == "2" and e["t"] > self.rung_snapshots(events, "broker-1")[0]["t"]]
+        self.assertGreaterEqual(len(retries), 3, "the retries are spaced")
+        before = (out / f"results/nodes={nodes}/laneE/sites-1/metrics-before-broker1.prom").read_text()
+        self.assertEqual(before, (self.rig / "testdata/lane-e/local-proof-n3/restart/metrics-restart-broker2.prom").read_text())
+        self.assertNotIn("mqttd_publish_received_total", before)
+
+    def test_lane_e_rung_guard_keeps_a_loss_that_later_scrapes_cannot_read(self):
+        # Mutation named: keeping only the last try's state turns this complete
+        # scrape without the series into "still incomplete", and the rung runs.
+        env, nodes, _ = self.lane_e_fleet(FAKE_LOSE_THEN_CUT="broker-1")
+        result, out = self.run_lane_e(env)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("broker1 no longer exposes the forwarding positive control", result.stderr)
+        self.assertNotIn("still incomplete", result.stderr)
+        for e in self.events():
+            self.assertNotIn("--name sub-", e.get("cmd", ""), "no consumer started")
+        rdir = out / f"results/nodes={nodes}/laneE/sites-1"
+        restart = (self.rig / "testdata/lane-e/local-proof-n3/restart/metrics-restart-broker2.prom").read_text()
+        self.assertEqual((rdir / "metrics-before-broker1.prom").read_text(), restart, "the scrape that proved the loss is kept")
+        self.assertFalse(list(rdir.glob(".guard-lost-*")))
+
+    def test_lane_e_rung_guard_only_warns_on_an_incomplete_scrape(self):
+        # Mutation named: `die` for the incomplete branch stops a healthy ladder here.
+        env, nodes, _ = self.lane_e_fleet(FAKE_CUT_SCRAPES="broker-1")
+        result, out = self.run_lane_e(env)
+        self.assertEqual(result.returncode, 0, result.stderr[-3000:])
+        self.assertIn("broker1's before-scrape for rung 1 is still incomplete after 3 retries — the rung runs", result.stderr)
+        events = self.events()
+        self.assertTrue(any("--name sub-" in e.get("cmd", "") for e in events), "the rung's consumers started")
+        self.assertGreaterEqual(len(self.rung_snapshots(events, "broker-1")), 4, "one before-scrape and three retries")
+        rdir = out / f"results/nodes={nodes}/laneE/sites-1"
+        self.assertTrue((rdir / "rung.txt").is_file())
+        # Lifetime snapshots are retried while incomplete, then kept as they are.
+        after = [e for e in events if e.get("host") == "broker-1" and e.get("cmd") == "curl -s -m 10 http://localhost:8080/metrics"
+                 and e["t"] > max(x["t"] for x in events if "--name sub-" in x.get("cmd", ""))]
+        self.assertGreaterEqual(len(after), 3)
+
+    def test_lane_e_rung_dies_when_a_broker_was_respawned_since_the_control(self):
+        # The series is still there (the new process forwarded again); only the PID tells.
+        env, nodes, _ = self.lane_e_fleet(FAKE_RESPAWN="broker-1")
+        result, out = self.run_lane_e(env)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("broker1's mqttd is MainPID 5001 before rung 1, not 4001", result.stderr)
+        for e in self.events():
+            self.assertNotIn("--name sub-", e.get("cmd", ""), "no consumer started")
+            self.assertNotIn("--name pub-", e.get("cmd", ""), "no publisher started")
+
+    def test_lane_e_single_broker_canary_is_the_local_pass_and_has_no_guard(self):
+        # Mutations named: demanding status=pass at N=1 kills every single-broker run
+        # at the control; dropping the N>1 condition on the guard kills it at the rung.
+        env, nodes, count = self.lane_e_fleet(local=True)
+        self.assertEqual(nodes, 1)
+        result, out = self.run_lane_e(env)
+        self.assertEqual(result.returncode, 0, result.stderr[-3000:])
+        laneE = out / "results/nodes=1/laneE"
+        verdict = (laneE / "forward-canary.txt").read_text()
+        self.assertTrue(verdict.startswith(f"status=pass-local nodes=1 count={count}"), verdict)
+        self.assertEqual((laneE / "forward-canary/mainpid-broker0.txt").read_text().strip(), "4000")
+        self.assertIn("forward canary: ON (local)", (laneE / "shape.txt").read_text())
+        events = self.events()
+        rung = min(e["t"] for e in events if "mqttd_connections_active[ {]" in e.get("cmd", ""))
+        starts = min(e["t"] for e in events if "--name sub-" in e.get("cmd", ""))
+        guard = [e for e in events if rung < e["t"] < starts and "MainPID" in e.get("cmd", "")]
+        self.assertEqual(guard, [], "no rung guard at N=1")
+        self.assertTrue((laneE / "sites-1/rung.txt").is_file())
+
+    def test_lane_e_lingering_canary_residue_is_recorded_and_warned(self):
+        env, nodes, _ = self.lane_e_fleet(FAKE_LINGER="broker-1")
+        result, out = self.run_lane_e(env)
+        self.assertEqual(result.returncode, 0, result.stderr[-3000:])
+        verdict = (out / f"results/nodes={nodes}/laneE/forward-canary.txt").read_text()
+        self.assertTrue(verdict.startswith(f"status=pass nodes={nodes} "), verdict)
+        self.assertIn("residue_status=lingering", verdict)
+        self.assertIn("residue_waited_s=60", verdict)
+        self.assertRegex(verdict, r"(?m)^residue_elapsed_s=\d+$")
+        self.assertIn("residue_broker1=connections_active:0/0,sessions:3/0,subscriptions:0/0", verdict)
+        self.assertIn("residue_broker0=connections_active:0/0,sessions:0/0,subscriptions:0/0", verdict)
+        self.assertIn("still reports more connections/sessions/subscriptions than before the canary", result.stderr)
+
+    def test_lane_e_sigint_during_window_stops_the_run(self):
+        env, nodes, _ = self.lane_e_fleet(LANE_E_SITES_OVERRIDE="1 2", FAKE_BLOCK_SLEEP="60")
+        out = self.root / "e2e"
+        proc = subprocess.Popen(["bash", str(self.rig / "run-curve.sh"), str(out), str(self.inventory)],
+                                env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                start_new_session=True)
+        try:
+            blocked = Path(env["FAKE_STATE"]) / "blocked"
+            deadline = time.monotonic() + 120
+            while not blocked.exists():
+                self.assertIsNone(proc.poll(), "run ended before its window")
+                self.assertLess(time.monotonic(), deadline, "window never opened")
+                time.sleep(0.05)
+            os.killpg(proc.pid, signal.SIGINT)  # what Ctrl-C delivers: the whole foreground group
+            _, stderr = proc.communicate(timeout=60)
+            # Before the finally's SIGKILL, which would reap a sampler the harness left behind.
+            samplers = Path(out / f"results/nodes={nodes}/laneE/sites-1/cpu/samplers.tsv").read_text().splitlines()
+            def alive(pid):
+                try:
+                    os.kill(pid, 0)
+                except ProcessLookupError:
+                    return False
+                return True
+            pids = [int(line.split()[0]) for line in samplers]
+            deadline = time.monotonic() + 5  # an exited sampler may await its reaper briefly
+            while any(alive(pid) for pid in pids) and time.monotonic() < deadline:
+                time.sleep(0.05)
+            self.assertFalse([pid for pid in pids if alive(pid)], "sampler must be stopped by the harness")
+        finally:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(proc.pid, signal.SIGKILL)
+        self.assertNotEqual(proc.returncode, 0, stderr[-3000:])
+        self.assertIn("rung 1 interrupted", stderr)
+        self.assertNotIn("CPU samplers failed to start", stderr)
+        self.assertNotIn("partial CPU coverage", stderr)
+        self.assertEqual(sum(1 for e in self.events() if e.get("sleep") == "60"), 1, "the window is not re-run")
+        laneE = out / f"results/nodes={nodes}/laneE"
+        self.assertFalse((laneE / "sites-2").exists(), "the ladder stops")
+
+    def test_lane_e_degraded_window_is_recorded_and_says_why(self):
+        # Mutation named: without the `.batch/window-ran` marker (or with every
+        # sampler failure treated as a start failure) this rung is re-measured as
+        # cpu_window=missing — two open and two close batches.
+        env, nodes, _ = self.lane_e_fleet(FAKE_MPSTAT_DIES="broker-1", FAKE_WINDOW_FAILS="broker-0:2")
+        result, out = self.run_lane_e(env)
+        self.assertEqual(result.returncode, 0, result.stderr[-3000:])
+        rdir = out / f"results/nodes={nodes}/laneE/sites-1"
+        self.assertIn("cpu_window=incomplete", (rdir / "rung.txt").read_text())
+        self.assertIn("continues", result.stderr)
+        windows = [e for e in self.events() if "WINDOW_STAMP_MS" in e.get("cmd", "")]
+        self.assertEqual(len(windows), 2 * (nodes + 1), "the window ran once")
+        self.assertIn("close broker0: ssh: connect to host broker-0", (rdir / "window-ssh.log").read_text())
+        self.assertIn("window close scrape on broker0 never started", result.stderr)
+        self.assertIn("window close scrape of broker0 is incomplete", result.stderr)
+        self.assertNotIn("open broker", (rdir / "window-ssh.log").read_text())
+
+    def test_lane_e_brokers_consumers_and_cpu_share_one_window(self):
+        env, nodes, _ = self.lane_e_fleet()
+        result, out = self.run_lane_e(env)
+        self.assertEqual(result.returncode, 0, result.stderr[-3000:])
+        events = self.events()
 
         def when(pred, what, last=False):
             hits = [e["t"] for e in events if pred(e)]
@@ -448,48 +856,124 @@ if a[:1] == ["rm"] and any(x.startswith("pub-") for x in a):
             return hits[-1] if last else hits[0]
 
         cmd = lambda e: e.get("cmd", "")  # noqa: E731
+        brokers = {f"broker-{i}" for i in range(nodes)}
         pubs_up = when(lambda e: " pub -h " in cmd(e), "publishers started")
         settle = when(lambda e: e.get("sleep") == "20", "settle sleep")
         cpu_up = when(lambda e: "mpstat" in cmd(e), "samplers started", last=True)
-        opened = [e for e in events if "WINDOW_STAMP_MS" in cmd(e)]
-        self.assertEqual({e["host"] for e in opened}, {"broker-0", "broker-1", "driver-0"})
         window = when(lambda e: e.get("sleep") == "60", "window sleep")
-        first_open = min(e["t"] for e in opened)
-        last_open = max(e["t"] for e in opened if e["t"] < window)
-        first_close = min(e["t"] for e in opened if e["t"] > window)
+        scrapes = [e for e in events if "WINDOW_STAMP_MS" in cmd(e)]
+        opens = [e for e in scrapes if e["t"] < window]
+        closes = [e for e in scrapes if e["t"] > window]
+        self.assertEqual(len(opens) + len(closes), len(scrapes))
+        self.assertEqual({e["host"] for e in opens}, brokers | {"driver-0"}, "one open scrape per host")
+        self.assertEqual({e["host"] for e in closes}, brokers | {"driver-0"}, "one close scrape per host")
+        self.assertEqual(len(opens), nodes + 1)
+        self.assertEqual(len(closes), nodes + 1)
+        # The edges are one parallel batch each: every broker scrape and every
+        # consumer scrape of an edge is in flight at the same instant, and the
+        # window sleeps only after the whole open batch has come back.
+        for edge in (opens, closes):
+            self.assertLess(max(e["t"] for e in edge), min(e["end"] for e in edge), "scrapes overlap")
+        self.assertLess(max(e["end"] for e in opens), window)
+        for e in opens:
+            if e["host"] in brokers:
+                self.assertIn("WINDOW_MAINPID", cmd(e))
+                self.assertIn("curl -s -m 10 http://localhost:8080/metrics", cmd(e))
         cpu_down = [e for e in events if e.get("cpu") == "stop"]
-        self.assertEqual(len(cpu_down), 3, "every host's sampler is stopped by the window, not a timer")
+        self.assertEqual(len(cpu_down), nodes + 1, "every host's sampler is stopped by the window, not a timer")
         stop_logs = when(lambda e: "docker logs pub-" in cmd(e), "steady logs dumped")
-        before = [e["t"] for e in events if cmd(e) == "curl -s http://localhost:8080/metrics"]
+        before = [e["t"] for i in range(nodes) for e in self.rung_snapshots(events, f"broker-{i}")]
+        canary = when(lambda e: "python3 - run" in cmd(e), "forwarding control ran")
+        self.assertLess(canary, min(before), "the control's floors predate every rung snapshot")
+        self.assertEqual(len(before), 3 * nodes, "before, drain and after, once per broker")
         self.assertLess(pubs_up, settle)
         self.assertLess(settle, cpu_up)
-        self.assertLess(cpu_up, first_open, "samplers cover the whole window")
-        self.assertLess(last_open, window)
-        self.assertEqual(sum(1 for e in opened if e["t"] < window), 3, "one open scrape per host, one batch")
-        self.assertEqual(sum(1 for e in opened if e["t"] > window), 3, "one close scrape per host, one batch")
-        self.assertLess(max(e["t"] for e in opened), min(e["t"] for e in cpu_down))
+        self.assertLess(cpu_up, min(e["t"] for e in opens), "samplers cover the whole window")
+        self.assertLess(max(e["end"] for e in scrapes), min(e["t"] for e in cpu_down))
         self.assertLess(max(e["t"] for e in cpu_down), stop_logs)
         self.assertTrue(any(t < pubs_up for t in before), "lifetime before snapshot kept")
-        self.assertTrue(any(t > first_close for t in before), "lifetime after snapshot kept")
+        self.assertTrue(any(t > min(e["t"] for e in closes) for t in before), "lifetime after snapshot kept")
 
-        rdir = out / "results/nodes=2/laneE/sites-1"
-        for label in ("window-open", "window-close", "before", "after"):
-            for i in range(2):
+        rdir = out / f"results/nodes={nodes}/laneE/sites-1"
+        for label in ("window-open", "window-close", "before", "drain", "after"):
+            for i in range(nodes):
                 text = (rdir / f"metrics-{label}-broker{i}.prom").read_text()
-                self.assertIn("mqttd_publish_received_total 100", text)
-                self.assertNotIn("WINDOW_STAMP_MS", text)
-        self.assertNotIn("WINDOW_STAMP_MS", (rdir / "sub-s0-0-base.prom").read_text())
-        self.assertNotIn("WINDOW_STAMP_MS", (rdir / "sub-s0-0.prom").read_text())
-        rows = [r.split("\t") for r in (rdir / "window.tsv").read_text().splitlines()[1:]]
-        self.assertEqual(sorted((r[0], r[1]) for r in rows), sorted(
-            (h, p) for h in ("broker0", "broker1", "driver0") for p in ("open", "close")))
-        for host, phase, start, end in rows:
-            self.assertTrue(start.isdigit() and end.isdigit() and int(start) <= int(end), (host, phase))
+                self.assertTrue(text.rstrip().endswith("# EOF"), (label, i))
+                self.assertIn('mqttd_publish_forwarded_total{reason="shared-remote"}', text)
+                self.assertNotIn("WINDOW_", text)
+        self.assertNotIn("WINDOW_", (rdir / "sub-s0-0-base.prom").read_text())
+        self.assertNotIn("WINDOW_", (rdir / "sub-s0-0.prom").read_text())
+        lines = (rdir / "window.tsv").read_text().splitlines()
+        self.assertEqual(lines[0].split("\t"), ["host", "phase", "start_ms", "end_ms", "main_pid"])
+        rows = {(r[0], r[1]): r[2:] for r in (line.split("\t") for line in lines[1:])}
+        hosts = [f"broker{i}" for i in range(nodes)] + ["driver0"]
+        self.assertEqual(set(rows), {(h, p) for h in hosts for p in ("open", "close")})
+        for host in hosts:
+            for phase in ("open", "close"):
+                start, end, _ = rows[host, phase]
+                self.assertTrue(start.isdigit() and end.isdigit() and int(start) <= int(end), (host, phase))
+            self.assertGreater(int(rows[host, "close"][0]), int(rows[host, "open"][1]), host)
+            want = str(4000 + int(host[len("broker"):])) if host.startswith("broker") else ""
+            self.assertEqual((rows[host, "open"][2], rows[host, "close"][2]), (want, want), host)
+        self.assertFalse((rdir / "window-ssh.log").exists(), "a clean window logs no ssh errors")
         rung = (rdir / "rung.txt").read_text()
         self.assertIn("window=aligned", rung)
         self.assertIn("cpu_window=aligned", rung)
-        for host in ("broker0", "broker1", "driver0"):
+        for host in hosts:
             self.assertIn("CPU_STREAM_START_UTC", (rdir / f"cpu/cpu-{host}.txt").read_text())
+        # The extractor certifies this rung from what the harness left behind.
+        extracted = subprocess.run(["python3", str(self.rig / "extract-lane-e.py"), str(out)],
+                                   env=self.env, capture_output=True, text=True, timeout=60)
+        self.assertEqual(extracted.returncode, 0, extracted.stderr + extracted.stdout)
+        header, row = extracted.stdout.splitlines()[:2]
+        starts = [m.start() for m in re.finditer(r"\S+", header)] + [None]
+        report = {header[a:b].strip(): row[a:b].strip() for a, b in zip(starts, starts[1:])}
+        self.assertEqual((report["nodes"], report["sites"]), (str(nodes), "1"), extracted.stdout)
+        self.assertEqual(report["window"], "aligned", extracted.stdout)
+        self.assertEqual(report["cert"], "canary", extracted.stdout)
+
+    def test_lane_e_forward_canary_knobs_refused_before_any_ssh(self):
+        inventory = self.root / "inventory.json"
+        inventory.write_text(json.dumps({"brokers": [{}] * 5, "drivers": [{"vcpus": 8}] * 5}))
+        for env, diagnostic in (
+            ({"LANE_E_FORWARD_CANARY": "2"}, "LANE_E_FORWARD_CANARY must be 0 or 1"),
+            ({"LANE_E_FORWARD_CANARY_COUNT": "0"}, "LANE_E_FORWARD_CANARY_COUNT must be a positive integer"),
+            ({"LANE_E_FORWARD_CANARY_TIMEOUT": "90s"}, "LANE_E_FORWARD_CANARY_TIMEOUT must be a positive integer"),
+        ):
+            with self.subTest(env=env):
+                result = self.run_script("run-curve.sh", str(self.root / "bad"), str(inventory),
+                                         LANES="E", SHAPE_ONLY="1", LANE_E_SITES_OVERRIDE="1", **env)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(diagnostic, result.stderr)
+                self.assertEqual(self.calls(), [])
+        for brokers, env, expect in (
+            (5, {}, "forward canary: ON — before calibration, 100 QoS 0 msgs over each of 20 directed broker pairs"),
+            (5, {"LANE_E_FORWARD_CANARY": "0"}, "forward canary: OFF"),
+            (1, {"LANE_E_FORWARD_CANARY_COUNT": "7"}, "forward canary: ON (local) — 7 QoS 0 msgs over one local pair (timeout 90s)"),
+        ):
+            with self.subTest(brokers=brokers, env=env):
+                inventory.write_text(json.dumps({"brokers": [{}] * brokers, "drivers": [{"vcpus": 8}] * 5}))
+                out = self.root / "shape-canary"
+                shutil.rmtree(out, ignore_errors=True)
+                result = self.run_script("run-curve.sh", str(out), str(inventory), LANES="E", SHAPE_ONLY="1",
+                                         LANE_E_SITES_OVERRIDE="1", **env)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn(expect, (out / f"results/nodes={brokers}/laneE/shape.txt").read_text())
+                self.assertEqual(self.calls(), [])
+
+    def test_broken_local_checks_stop_run_before_any_cloud_call(self):
+        for name in ("forward-canary.py", "extract-lane-e.py"):
+            with self.subTest(name=name):
+                original = (SCALE / name).read_text()
+                (self.rig / name).write_text("import sys\nsys.exit(1 if '--self-test' in sys.argv else 0)\n")
+                try:
+                    for env in ({"PREFLIGHT_ONLY": "1"}, {"HCLOUD_TOKEN": "dummy"}):
+                        result = self.run_script("run.sh", "smoke", **env)
+                        self.assertNotEqual(result.returncode, 0)
+                        self.assertIn(f"{name} --self-test failed", result.stderr)
+                        self.assertEqual(self.calls(), [])
+                finally:
+                    (self.rig / name).write_text(original)
 
     def test_missing_tofu_fails_even_when_terraform_exists(self):
         # Hermetic PATH: removing the stub must not reveal the host's real tofu.
