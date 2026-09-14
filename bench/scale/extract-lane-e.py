@@ -9,12 +9,16 @@ Reads broker Prometheus snapshots under results/nodes=*/laneE/sites-*/.
 Does not sum emqtt-bench pub rate= log lines.
 
 Crossing = Δ mqttd_publish_forwarded_total / Δ mqttd_publish_received_total.
-A missing forwarded family with large received is 0 forwards (Prometheus omits
-zero series) — the 2026-09-14 N=7 Option B scrape shape (#482).
+Lazily absent forwarded samples mean zero only in complete, validated snapshots
+that declare the counter. Missing scrapes, unsupported counters and resets are
+INVALID, never zero crossing. Totals include ramp/drain, not steady throughput.
 """
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
+import math
 import re
 import sys
 import tempfile
@@ -30,16 +34,23 @@ IDLE_LINE = re.compile(r"\ball\b")
 def parse_prom(path: Path) -> dict[tuple[str, str], float]:
     """Exact name+labels → value. Prefix matches are refused (received vs received_total)."""
     out: dict[tuple[str, str], float] = {}
-    if not path.exists():
-        return out
+    if not path.is_file() or not path.stat().st_size:
+        raise ValueError(f"missing/empty scrape: {path}")
     for line in path.read_text(errors="replace").splitlines():
         if not line or line.startswith("#"):
             continue
         m = PROM_LINE.match(line)
         if not m:
-            continue
+            raise ValueError(f"malformed scrape sample in {path}: {line}")
         key = (m.group("name"), m.group("labels") or "")
-        out[key] = out.get(key, 0.0) + float(m.group("v"))
+        if key in out:
+            raise ValueError(f"duplicate scrape sample in {path}: {key}")
+        value = float(m.group("v"))
+        if not math.isfinite(value):
+            raise ValueError(f"non-finite scrape sample in {path}: {key}")
+        out[key] = value
+    if not out:
+        raise ValueError(f"scrape has no samples: {path}")
     return out
 
 
@@ -59,12 +70,45 @@ def by_label(parsed: dict[tuple[str, str], float], name: str, label: str) -> dic
     return out
 
 
-def load_snap(rdir: Path, label: str) -> dict[tuple[str, str], float]:
-    merged: dict[tuple[str, str], float] = {}
-    for path in sorted(rdir.glob(f"metrics-{label}-broker*.prom")):
-        for k, v in parse_prom(path).items():
+def load_snap(rdir: Path, label: str) -> dict[str, dict]:
+    nodes = next((int(p.split("=", 1)[1]) for p in rdir.parts if p.startswith("nodes=")), None)
+    if not nodes:
+        raise ValueError(f"expected nodes=N in results path: {rdir}")
+    expected = {f"metrics-{label}-broker{i}.prom" for i in range(nodes)}
+    actual = {p.name for p in rdir.glob(f"metrics-{label}-broker*.prom")}
+    if actual != expected:
+        raise ValueError(f"incomplete {label} broker coverage: expected {sorted(expected)}, got {sorted(actual)}")
+    snapshots = {}
+    for name in sorted(expected):
+        path = rdir / name
+        parsed = parse_prom(path)
+        text = path.read_text()
+        for family in ("mqttd_publish_received", "mqttd_publish_forwarded"):
+            if not any(n == family + "_total" for n, _ in parsed) and not re.search(
+                rf"(?m)^# TYPE {family} counter\s*$", text
+            ):
+                raise ValueError(f"unsupported/missing {family} counter: {path}")
+        snapshots[name.split("broker", 1)[1]] = parsed
+    return snapshots
+
+
+def merge_snap(snapshots: dict[str, dict]) -> dict:
+    merged = {}
+    for parsed in snapshots.values():
+        for k, v in parsed.items():
             merged[k] = merged.get(k, 0.0) + v
     return merged
+
+
+def validate_deltas(before: dict[str, dict], after: dict[str, dict]) -> None:
+    for broker, start in before.items():
+        end = after[broker]
+        for key, value in start.items():
+            name, _ = key
+            if name.endswith(("_total", "_count", "_sum")) and end.get(key, 0) < value:
+                raise ValueError(f"counter reset/disappeared on broker {broker}: {key}")
+            if name == "process_start_time_seconds" and end.get(key) != value:
+                raise ValueError(f"process changed on broker {broker}")
 
 
 def delta(a: dict[tuple[str, str], float], b: dict[tuple[str, str], float], name: str) -> float:
@@ -103,14 +147,20 @@ def mean_idle(rdir: Path, role: str) -> str:
 
 
 def extract_rung(rdir: Path) -> dict:
-    before, after = load_snap(rdir, "before"), load_snap(rdir, "after")
-    drain = load_snap(rdir, "drain")
-    end = drain or after
+    starts, ends = load_snap(rdir, "before"), load_snap(rdir, "after")
+    validate_deltas(starts, ends)
+    before, after = merge_snap(starts), merge_snap(ends)
+    end = after
+    if list(rdir.glob("metrics-drain-broker*.prom")):
+        drains = load_snap(rdir, "drain")
+        validate_deltas(starts, drains)
+        validate_deltas(drains, ends)
+        end = merge_snap(drains)
     received = delta(before, after, "mqttd_publish_received_total")
     forwarded = delta(before, after, "mqttd_publish_forwarded_total")
-    if forwarded < 0:
-        forwarded = 0.0
-    crossing = (forwarded / received) if received else None
+    if received <= 0:
+        raise ValueError("no positive received delta; crossing is unknown")
+    crossing = forwarded / received
     hub_sum = by_label(after, "mqttd_hub_dispatch_seconds_sum", "command")
     hub_sum_b = by_label(before, "mqttd_hub_dispatch_seconds_sum", "command")
     hub_n = by_label(after, "mqttd_hub_dispatch_seconds_count", "command")
@@ -144,8 +194,9 @@ def extract_rung(rdir: Path) -> dict:
         "received": received,
         "forwarded": forwarded,
         "crossing": crossing,
-        "forwarded_series_absent": sum_family(after, "mqttd_publish_forwarded_total") == 0
-        and sum_family(before, "mqttd_publish_forwarded_total") == 0,
+        "forwarded_series_absent": not any(
+            n == "mqttd_publish_forwarded_total" for n, _ in set(before) | set(after)
+        ),
         "hub_us": hub_us,
         "inflight": inflight,
         "sessions": sessions,
@@ -199,20 +250,71 @@ def print_report(rungs: list[dict]) -> None:
 
 
 class ExtractTests(unittest.TestCase):
+    def test_incomplete_reset_and_unsupported_scrapes_are_invalid(self):
+        for defect in ("missing", "empty", "reset", "unsupported", "partial-drain", "malformed", "duplicate", "nonfinite"):
+            with self.subTest(defect=defect), tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                rdir = root / "nodes=2/laneE/sites-1"
+                rdir.mkdir(parents=True)
+                for node in range(2):
+                    for label, recv, fwd in (("before", 100, 100), ("after", 1000, 300)):
+                        (rdir / f"metrics-{label}-broker{node}.prom").write_text(
+                            f"mqttd_publish_received_total {recv}\nmqttd_publish_forwarded_total {fwd}\n"
+                        )
+                bad = rdir / "metrics-after-broker1.prom"
+                if defect == "missing":
+                    bad.unlink()
+                elif defect == "empty":
+                    bad.write_text("")
+                elif defect == "reset":
+                    # Aggregate forwards still rise; only per-node validation sees it.
+                    bad.write_text("mqttd_publish_received_total 1000\nmqttd_publish_forwarded_total 50\n")
+                elif defect == "unsupported":
+                    bad.write_text("mqttd_publish_received_total 1000\n")
+                elif defect == "partial-drain":
+                    (rdir / "metrics-drain-broker0.prom").write_text(bad.read_text())
+                elif defect == "malformed":
+                    bad.write_text("HTTP scrape failed\n")
+                elif defect == "duplicate":
+                    bad.write_text(bad.read_text() + "mqttd_publish_forwarded_total 300\n")
+                else:
+                    bad.write_text("mqttd_publish_received_total 1e999\nmqttd_publish_forwarded_total 300\n")
+                with self.assertRaises(ValueError):
+                    extract_rung(rdir)
+                stderr, stdout = io.StringIO(), io.StringIO()
+                with contextlib.redirect_stderr(stderr), contextlib.redirect_stdout(stdout):
+                    self.assertEqual(main([str(root)]), 1)
+                self.assertIn("INVALID", stderr.getvalue())
+                self.assertNotIn("0.00%", stdout.getvalue())
+
+    def test_explicit_zero_is_not_an_absent_series(self):
+        with tempfile.TemporaryDirectory() as td:
+            rdir = Path(td) / "nodes=1/laneE/sites-1"
+            rdir.mkdir(parents=True)
+            for label, recv in (("before", 0), ("after", 100)):
+                (rdir / f"metrics-{label}-broker0.prom").write_text(
+                    f"mqttd_publish_received_total {recv}\nmqttd_publish_forwarded_total 0\n"
+                )
+            result = extract_rung(rdir)
+            self.assertEqual(result["crossing"], 0)
+            self.assertFalse(result["forwarded_series_absent"])
+
     def test_absent_forwarded_with_received_is_zero_crossing(self):
         with tempfile.TemporaryDirectory() as td:
-            rdir = Path(td) / "results/nodes=7/laneE/sites-10"
+            rdir = Path(td) / "results/nodes=1/laneE/sites-10"
             rdir.mkdir(parents=True)
             (rdir / "rung.txt").write_text(
                 "sites=10 offered=300000 settled=yes drained=yes\n"
             )
             (rdir / "metrics-before-broker0.prom").write_text(
+                '# TYPE mqttd_publish_forwarded counter\n'
                 'mqttd_publish_received_total{qos="0"} 100\n'
                 'mqttd_hub_dispatch_seconds_sum{command="publish"} 0.001\n'
                 'mqttd_hub_dispatch_seconds_count{command="publish"} 100\n'
                 "mqttd_sessions 0\n"
             )
             (rdir / "metrics-after-broker0.prom").write_text(
+                '# TYPE mqttd_publish_forwarded counter\n'
                 'mqttd_publish_received_total{qos="0"} 30100\n'
                 'mqttd_hub_dispatch_seconds_sum{command="publish"} 0.0013\n'
                 'mqttd_hub_dispatch_seconds_count{command="publish"} 200\n'
@@ -234,14 +336,16 @@ class ExtractTests(unittest.TestCase):
 
     def test_does_not_prefix_match_received_gauge(self):
         with tempfile.TemporaryDirectory() as td:
-            rdir = Path(td) / "r"
-            rdir.mkdir()
+            rdir = Path(td) / "nodes=1/laneE/sites-1"
+            rdir.mkdir(parents=True)
             (rdir / "metrics-before-broker0.prom").write_text(
                 "mqttd_publish_received 999999\n"
+                '# TYPE mqttd_publish_forwarded counter\n'
                 'mqttd_publish_received_total{qos="0"} 1\n'
             )
             (rdir / "metrics-after-broker0.prom").write_text(
                 "mqttd_publish_received 999999\n"
+                '# TYPE mqttd_publish_forwarded counter\n'
                 'mqttd_publish_received_total{qos="0"} 11\n'
             )
             r = extract_rung(rdir)
@@ -259,12 +363,19 @@ def main(argv: list[str]) -> int:
         return 0 if result.wasSuccessful() else 1
     if args.results is None:
         parser.error("results path required (or --self-test)")
-    rungs = [extract_rung(p) for p in find_rungs(args.results)]
-    if not rungs:
+    paths = find_rungs(args.results)
+    if not paths:
         print(f"no laneE sites-* under {args.results}", file=sys.stderr)
         return 2
+    rungs, invalid = [], False
+    for path in paths:
+        try:
+            rungs.append(extract_rung(path))
+        except (ValueError, OSError) as exc:
+            print(f"INVALID {path}: {exc}", file=sys.stderr)
+            invalid = True
     print_report(rungs)
-    return 0
+    return 1 if invalid else 0
 
 
 if __name__ == "__main__":

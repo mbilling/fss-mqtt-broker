@@ -29,7 +29,6 @@ SSH_OPTS=(-o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -o ServerAliv
 TOFU_SSH_PUBKEY_ARGS=()
 if [ -n "${SSH_KEY:-}" ]; then
 	[ -f "$SSH_KEY" ] || die "SSH_KEY=$SSH_KEY does not exist"
-	[ -f "${SSH_KEY}.pub" ] || die "SSH_KEY.pub=${SSH_KEY}.pub does not exist (tofu apply and destroy both read ssh_public_key_path)"
 	SSH_OPTS+=(-i "$SSH_KEY" -o IdentitiesOnly=yes)
 	TOFU_SSH_PUBKEY_ARGS=(-var "ssh_public_key_path=${SSH_KEY}.pub")
 fi

@@ -28,9 +28,10 @@ node has a local shared member, so predicted crossing is
 
 The shape text used to claim round-robin ⇒ `(N-1)/N` remote whenever sites were
 unpinned. That is stale. The **metric** is authoritative:
-`mqttd_publish_forwarded_total / mqttd_publish_received_total`. Prometheus
-often omits zero series — absent `publish_forwarded_*` with large `publish_received`
-means 0 forwards, not “metric missing, abort blindly”.
+`mqttd_publish_forwarded_total / mqttd_publish_received_total`. Lazily absent
+forwarded samples mean zero only after all expected broker scrapes are complete,
+valid, and declare/support this counter. Missing files, unsupported metrics and
+per-broker counter resets make crossing **UNKNOWN/INVALID**, not zero.
 
 Do **not** set `MQTTD_SHARED_PREFER_LOCAL=0`. That would be a different experiment.
 
@@ -62,7 +63,9 @@ never ran. Do not spend another fleet hour until this list is green.
       unobserved. Set `OBSERVE=1` only where Grafana/Alloy live; `OBSERVE=0`
       only for a purity publish.
 - [ ] Confirm Hetzner project empty before start; label-audit to 0 after
-      (`./teardown.sh`, `--force` only in the dedicated project).
+      (`./teardown.sh`, `--force` only in the dedicated project). A missing public
+      key must not prevent Hetzner's explicitly requested label recovery after
+      state-backed destroy fails; provisioning still refuses a missing `.pub`.
 
 ### Binary / Option B pin
 
@@ -75,13 +78,19 @@ never ran. Do not spend another fleet hour until this list is green.
 ### Validity gates (abort the compare if any fail)
 
 - [ ] **Crossing ≈ 0%** both arms via `mqttd_publish_forwarded_total` /
-      `mqttd_publish_received_total` (absent forwarded series + large received
-      ⇒ 0). N=7 scrapes on 2026-09-14 had no `publish_forwarded_*` while
-      `publish_received` was large — treat as 0; the gate passed.
+      `mqttd_publish_received_total`, with complete validated per-broker snapshots
+      and no detected resets. The reported absent N=7 forwarded samples alone do
+      **not** establish this gate; revalidate the original raw captures.
 - [ ] Calibration + settled + drained; drivers not pinned at the top rung.
 - [ ] Trust **broker/drain totals**, not summed emqtt-bench `pub … rate=` log
       lines across containers (that over-reports). `extract-lane-e.py` uses
-      broker snapshots.
+      broker snapshots, but their totals include ramp/drain, not just steady work.
+- [ ] **Aligned windows before a capacity claim.** Main currently snapshots broker
+      `before` counters before startup, starts a fixed-duration CPU sampler before
+      settle, and baselines subscribers after a possibly extended settle. Repair
+      and test that alignment through a separate harness PR before a paid capacity
+      campaign. This diagnostic extractor does not repair those windows or certify
+      concurrent publisher/consumer headroom.
 
 ### Diagnosis extracts we still need on both arms
 
@@ -122,9 +131,11 @@ cd bench/scale
 set -a && . ./482-constant-driver-N5-N7-optionB.env && set +a
 # Prefer MQTTD_URL+SHA256 for current main; pin BENCH_GIT_REF to one commit.
 
-# 1. Prove apply→destroy with this SSH_KEY (smoke, shared-vCPU, cents).
-#    Then confirm the dedicated project is empty.
-./run.sh smoke
+# 1. Prove apply→destroy with this SSH_KEY and binary pin on a SMALL shape.
+#    This helper overrides the sourced fleet/ladder: one CPX32 + one CPX42,
+#    one site at 1,000/s. It uses a fresh run dir, OBSERVE=0, KEEP_INFRA=0.
+#    Check current prices/budget; then confirm the dedicated project is empty.
+bash ./482-smoke.sh
 
 # 2. Real pair. N=7 first (already path-proven 2026-09-14) then N=5.
 #    KEEP_INFRA is unset/0 — tear down between sizes.
@@ -143,7 +154,7 @@ Per size, per rung (`results/nodes=$N/laneE/sites-*`):
 | offered | `rung.txt` (`offered=`) |
 | broker received | Δ `mqttd_publish_received_total` before→after (or drain) |
 | drain recv | subscriber `.drain` totals; must match broker received within the usual slack |
-| crossing | Δ `mqttd_publish_forwarded_total` / Δ `mqttd_publish_received_total`; missing forwarded family = 0 |
+| crossing | Δ forwarded / Δ received, only with complete supported snapshots and no detected resets; otherwise INVALID |
 | hub dispatch | Δ `mqttd_hub_dispatch_seconds_{sum,count}` **by `command`** |
 | peer in-flight / drops | `mqttd_peer_forwards_in_flight` at drain/after; `mqttd_publish_dropped_total` by reason |
 | sessions after drain | `mqttd_sessions` / `mqttd_connections_active` at drain/after |
@@ -162,13 +173,19 @@ python3 extract-lane-e.py .runs/<stamp>/results
   harness. Same as every other lane E validity rule.
 - **N=7 climbs, N=5 missing**: path-prove only. That is the 2026-09-14 state.
   Incomplete A/B; no membership-cost claim.
-- **Both arms complete, crossing ≈ 0%, drivers idle, per-node delivered flat
-  in N**: the constant-driver control does **not** support “membership costs
-  per-node throughput” at these sizes. Close or retitle accordingly.
-- **Both arms complete, crossing ≈ 0%, drivers idle, per-node delivered still
-  falls with N**: then profile whatever the busy fraction and off-CPU samples
-  implicate — which may not be the hub. That is a new measurement, not a
-  reuse of the old 3.4× reading.
+- **Both arms sustain the same total offer within the latency/validity gates**:
+  this is a matched-total-load regression comparison, not a capacity estimate.
+  At 300k/s, average per-node delivered work is necessarily 60k/s at N=5 and
+  about 42.9k/s at N=7. That fall is arithmetic, not evidence of membership cost.
+- **Both pass the top rung without a knee**: report lower bounds only. Neither
+  closing the membership-cost claim nor asserting a capacity ratio is justified.
+- **Seven nodes receives less than five at the same valid total offer**: a real
+  regression candidate; investigate placement, hot-core/driver load, forwarding,
+  latency and recovery before attributing it to membership.
+- **Membership-cost/capacity investigation**: additionally compare equal per-node
+  useful work and measure sustainable SLO-compliant knees with independently
+  adequate endpoints, aligned windows, controls and repeats. The same finite
+  total-offer ladder does not by itself perform either experiment.
 
 Do not sum emqtt-bench `pub … rate=` lines across containers and treat the
 sum as offered or sent.
@@ -200,8 +217,9 @@ non-default key.
 - N=7 Lane E **completed cleanly**: every rung settled+drained through 300k
   msg/s offered; broker `publish_received` matched drain recv; hub dispatch
   mean ~5–8 µs; drivers still ~65–70% idle at the top; no knee.
-- `mqttd_publish_forwarded_*` absent from scrapes while `publish_received`
-  was large → 0 forwards; crossing gate passed.
+- `mqttd_publish_forwarded_*` was reported absent while `publish_received`
+  was large. The original zero-crossing interpretation is **not certified**:
+  complete raw scrape coverage and counter support must be revalidated.
 - Destroy between sizes **failed** (`ssh_public_key_path` defaulted to a
   missing `~/.ssh/id_ed25519.pub`). Left 12 servers billing until manual
   recover. **N=5 never ran.** A/B incomplete.

@@ -30,7 +30,6 @@ The prerequisites and pricing below describe the default Hetzner platform.
    in the project's console inventory. (Because no project key is attached to
    the servers, Hetzner emails a root password per server — ignore it; the
    cloud-init key is already in place.)
-}
 4. Laptop tools: **OpenTofu (`tofu`) ≥ 1.7**, `jq`, and — on macOS —
    `openssl@3` (`brew install openssl@3`; the system LibreSSL cannot mint the
    cluster PKI and `deploy/systemd/gen-certs.sh` refuses it loudly). The
@@ -119,7 +118,6 @@ remote orchestrator without Docker. If the local stack cannot start the run
 continues unobserved with a warning. `OBSERVE=0` opts out — worth doing for a run
 whose numbers are published, if you want the measured path provably untouched. Ctrl-C is safe (trapped); `kill -9` is not — after one, run
 `./teardown.sh`.
-}
 
 **Checking a shape without paying.** `run.sh` now validates **every requested
 size before any OpenTofu init/apply or cloud-mutating teardown trap** (#593).
@@ -273,9 +271,13 @@ published curve — do not copy its one-off numbers into
 `docs/benchmarks/SCALE-CURVE.md`.
 
 Before reading capacity vs N from an Option B arm: confirm the crossing gate
-(`mqttd_publish_forwarded_total` / `mqttd_publish_received_total`; absent
-forwarded series + large received ⇒ 0) and that observe attached where Grafana
-lives. `python3 extract-lane-e.py <run>/results` prints that extract.
+(`mqttd_publish_forwarded_total` / `mqttd_publish_received_total`) using complete,
+supported broker snapshots without detected counter resets. Lazily absent samples
+can mean zero, but missing/failed scrapes cannot. `python3 extract-lane-e.py
+<run>/results` reports invalid input with a nonzero exit. Its totals include
+ramp/drain; it does not repair Lane E's existing measurement-window mismatch.
+The card separates matched-total-load comparisons from capacity knees and provides
+`bash ./482-smoke.sh` to prove teardown without inheriting the full campaign shape.
 
 ## Honesty notes
 

@@ -466,9 +466,10 @@ LANE_E_MAX_CONTAINERS_PER_DRIVER="${LANE_E_MAX_CONTAINERS_PER_DRIVER:-$(inv '[.d
 # SITE AFFINITY. Off by default: every container spans every broker
 # (rotated_hosts). That is the Option B / unpinned posture. Cluster shared-sub
 # selection is prefer-local (default on since #511), not global round-robin:
-# predicted crossing is (N − min(C, N))/N, so with LANE_E_SUBS_PER_SITE ≥ N it
-# is ≈ 0%. Gate on mqttd_publish_forwarded_total / mqttd_publish_received_total
-# (Prometheus omits zero series: absent forwarded + large received ⇒ 0). The
+# with one subscriber container/site, balanced ingress and spare local capacity,
+# predicted crossing is (N − min(C, N))/N. Multiple containers have overlapping
+# rotated host lists, so total C alone does not establish coverage. Gate on mqttd_publish_forwarded_total / mqttd_publish_received_total
+# (validate complete scrapes/counter support before interpreting absent samples). The
 # old (N-1)/N round-robin prediction is stale while prefer-local is on.
 #
 # With LANE_E_PIN_SITES=1 a site's publishers AND consumers connect only to
@@ -808,15 +809,18 @@ lane_e_shape() {
 		else
 			echo "site affinity: off — every container spans all $N brokers (rotated_hosts)."
 			echo "               Cluster default is prefer-local (#511), not global round-robin."
-			if [ "$LANE_E_SUBS_PER_SITE" -ge "$N" ]; then
+			if [ "$LANE_E_SUB_CONTAINERS_PER_SITE" -ne 1 ]; then
+				echo "               Multiple subscriber containers: verify actual broker coverage; total subscribers alone is insufficient."
+			elif [ "$LANE_E_SUBS_PER_SITE" -ge "$N" ]; then
 				echo "               LANE_E_SUBS_PER_SITE=$LANE_E_SUBS_PER_SITE ≥ N=$N, so every node has a"
 				echo "               local shared member → predicted crossing ≈ 0%."
 			else
 				echo "               LANE_E_SUBS_PER_SITE=$LANE_E_SUBS_PER_SITE < N=$N → predicted crossing ≈ $((N - LANE_E_SUBS_PER_SITE))/$N"
 				echo "               under prefer-local (uncovered publishers forward)."
 			fi
+			echo "               Predictions assume balanced ingress and spare local capacity; pressure fallback may forward."
 			echo "               Gate on mqttd_publish_forwarded_total / mqttd_publish_received_total"
-			echo "               (Prometheus omits zero series: absent forwarded + large received ⇒ 0)."
+			echo "               Validate every broker scrape and counter support; missing/reset data is UNKNOWN, not zero."
 			echo "               Do not treat round-robin (N-1)/N as the prediction while prefer-local is on."
 		fi
 		echo

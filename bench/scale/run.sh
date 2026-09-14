@@ -26,6 +26,11 @@
 set -euo pipefail
 . "$(dirname "$0")/lib.sh"
 . "$SCALE_DIR/cloud.sh"
+# Provisioning requires the public key. Keep this out of lib.sh: emergency
+# teardown must still reach the provider's label audit if this file is lost.
+if [ -n "${SSH_KEY:-}" ]; then
+	[ -f "${SSH_KEY}.pub" ] || die "SSH_KEY.pub=${SSH_KEY}.pub does not exist (required for provisioning)"
+fi
 select_scale_cloud
 
 # A lower-level shape-only flag must never accidentally provision through this wrapper.
