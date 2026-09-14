@@ -1008,6 +1008,22 @@ requires = ["python3"]
 duration = "~1s"
 
 [[task]]
+id = "scale-extract-lane-e"
+group = "Benchmark"
+name = "Extract Lane E crossing, hub dispatch and idle hints from a run"
+script = "bench/scale/extract-lane-e.py"
+about = """
+Walks results/nodes=*/laneE/sites-*/ and prints broker-side crossing
+(mqttd_publish_forwarded_total / mqttd_publish_received_total; absent forwarded
+series + large received ⇒ 0), hub_dispatch mean µs by command, peer in-flight,
+drops, sessions after drain, and mpstat idle hints. Trusts broker snapshots, not
+summed emqtt-bench pub rate= lines. Used by the #482 Option B card.
+Takes a run dir or a results/ tree: `extract-lane-e.py bench/scale/.runs/<stamp>/results`.
+"""
+requires = ["python3"]
+duration = "~1s"
+
+[[task]]
 id = "scale-bootstrap"
 group = "Benchmark"
 name = "Bootstrap one scale-curve cluster (internal step of scale-curve)"
