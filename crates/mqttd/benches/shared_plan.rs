@@ -133,7 +133,12 @@ fn hub_with_subscribers(
         for i in 0..subs {
             let client = ClientId(Arc::from(format!("sub{i}").as_str()));
             let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Box<Packet>>();
-            drain.spawn(async move { while out_rx.recv().await.is_some() {} });
+            let (outbound, meter) = Outbound::new(out_tx);
+            drain.spawn(async move {
+                while let Some(packet) = out_rx.recv().await {
+                    meter.drained(&packet);
+                }
+            });
             let (reply_tx, reply_rx) = oneshot::channel();
             tx.send(HubCommand::Attach {
                 client: client.clone(),
@@ -143,7 +148,7 @@ fn hub_with_subscribers(
                 session_expiry: 0,
                 receive_maximum: u16::MAX,
                 will: None,
-                outbound: Outbound::new(out_tx).0,
+                outbound,
                 reply: reply_tx,
             })
             .expect("hub alive");

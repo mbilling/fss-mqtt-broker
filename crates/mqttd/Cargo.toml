@@ -90,3 +90,7 @@ workspace = true
 [[bench]]
 name = "shared_plan"
 harness = false
+
+[[bench]]
+name = "shared_capacity"
+harness = false

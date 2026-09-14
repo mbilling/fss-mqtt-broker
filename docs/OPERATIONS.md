@@ -814,7 +814,12 @@ member on the *publishing* node when one exists. A consumer's share therefore
 follows its host node's share of publishers, not even round-robin across the
 group. Size the worker pool for that skew; fairness/spillover is #537 Phase 3,
 not a spec defect ([CLIENT-GUIDE](CLIENT-GUIDE.md#shared-subscriptions),
-ADR 0010/0015 as-delivered notes).
+ADR 0010/0015 as-delivered notes). For source QoS 0, a known-full local outbound
+can now be bypassed before enqueue (#482), using the same packet/byte bounds as
+the send path. If no alternative exists it still sheds and counts `outbound-full`.
+This is not downstream credit: remote capacity is unknown, and bridge live queues
+are not covered by the disconnected-spool cap. Track subscriber/downstream receipts,
+not enqueue/forward-attempt counters; [evidence and limits](benchmarks/SHARED-CAPACITY.md).
 
 ## Shipped alerting
 

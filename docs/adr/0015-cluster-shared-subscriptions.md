@@ -100,6 +100,24 @@ publisher share of the node it is connected to, not even group-wide
 round-robin. Size `$share` fan-in for that skew. Fairness/spillover remains
 #537 Phase 3.
 
+**QoS 0 pressure admission (2026-09-13, #482 / 0015-T10).** Before enqueue,
+a locally selected member whose outbound cannot fit this QoS 0 message is
+replaced, when possible, by an online member of the **same group and filter**.
+Local headroom uses the send path's packet and accounted-byte limits (including
+application properties); each matching group's commit rechecks after preceding
+groups have enqueued. Locality still prefers a local member with room; otherwise
+an online remote member with a usable peer link can be chosen. The cursor advances
+past the alternative, including across remote members. With no alternative, the
+original send path records one `outbound-full` drop. No retry occurs after a send,
+and QoS 1/2 selection and durability obligations are unchanged.
+
+The normal local-online path stays O(1) in group size; pressure triggers a bounded
+member scan. This is **not remote capacity credit or downstream flow control**:
+remote capacity is unknown, a forwarded QoS 0 message can still be dropped at its
+destination, and the bridge's live queues are not bounded by its disconnected spool.
+Proportional downstream delivery remains the open acceptance target in #482; the
+local tests and channel-receipt microbenchmark do not establish it.
+
 **As delivered (2026-06-24, 0015-T7 / 0015-T8).** The Consequences costs
 "SharedDeliver carries no message-expiry" and "remote member liveness is not
 known" were the deferred trade-offs at acceptance. Both shipped: expiry rides
