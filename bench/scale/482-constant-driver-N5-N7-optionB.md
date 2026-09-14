@@ -84,13 +84,18 @@ never ran. Do not spend another fleet hour until this list is green.
 - [ ] Calibration + settled + drained; drivers not pinned at the top rung.
 - [ ] Trust **broker/drain totals**, not summed emqtt-bench `pub … rate=` log
       lines across containers (that over-reports). `extract-lane-e.py` uses
-      broker snapshots, but their totals include ramp/drain, not just steady work.
-- [ ] **Aligned windows before a capacity claim.** Main currently snapshots broker
-      `before` counters before startup, starts a fixed-duration CPU sampler before
-      settle, and baselines subscribers after a possibly extended settle. Repair
-      and test that alignment through a separate harness PR before a paid capacity
-      campaign. This diagnostic extractor does not repair those windows or certify
-      concurrent publisher/consumer headroom.
+      broker snapshots; `before`/`after` totals include ramp/drain and are for
+      delivery accounting only.
+- [x] **Aligned windows before a capacity claim.** Each rung now scrapes every
+      broker's `/metrics` and every consumer's histogram in ONE parallel batch at
+      both edges of the steady window (`metrics-window-{open,close}-broker*.prom`,
+      `sub-*-base.prom` / `sub-*.prom`), and each host stamps its own scrape into
+      `window.tsv`. The CPU samplers are bounded by that window (`cpu.sh`), not
+      by a SETTLE+SECS timer, and the extractor keeps only each host's mpstat rows
+      between its own stamps. `rung.txt` carries `window=aligned` and
+      `cpu_window=aligned|incomplete|missing`. A rung without these files reports
+      `UNALIGNED`; a partial window is INVALID, never a lifetime fallback. This
+      still does not certify concurrent publisher/consumer headroom.
 
 ### Diagnosis extracts we still need on both arms
 
@@ -152,13 +157,13 @@ Per size, per rung (`results/nodes=$N/laneE/sites-*`):
 | check | source |
 |---|---|
 | offered | `rung.txt` (`offered=`) |
-| broker received | Δ `mqttd_publish_received_total` before→after (or drain) |
+| broker received | Δ `mqttd_publish_received_total` window-open→window-close (rate); before→after for lifetime delivery accounting |
 | drain recv | subscriber `.drain` totals; must match broker received within the usual slack |
-| crossing | Δ forwarded / Δ received, only with complete supported snapshots and no detected resets; otherwise INVALID |
-| hub dispatch | Δ `mqttd_hub_dispatch_seconds_{sum,count}` **by `command`** |
+| crossing | Δ forwarded / Δ received over the aligned window, only with complete supported snapshots and no detected resets; otherwise INVALID |
+| hub dispatch | Δ `mqttd_hub_dispatch_seconds_{sum,count}` **by `command`** over the aligned window |
 | peer in-flight / drops | `mqttd_peer_forwards_in_flight` at drain/after; `mqttd_publish_dropped_total` by reason |
 | sessions after drain | `mqttd_sessions` / `mqttd_connections_active` at drain/after |
-| driver idle | `cpu/cpu-driver*.txt` (`mpstat` `%idle` on `all`) |
+| broker / driver idle | `cpu/cpu-{broker,driver}*.txt` (`mpstat` `%idle` on `all`), rows inside that host's `window.tsv` stamps |
 | settled + drained | `rung.txt` |
 
 ```sh

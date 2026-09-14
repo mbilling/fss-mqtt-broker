@@ -1018,7 +1018,8 @@ Walks results/nodes=*/laneE/sites-*/ and prints broker-side crossing
 µs by command, peer in-flight, drops, sessions after drain, and mpstat idle hints.
 Rejects incomplete/unsupported scrapes and detected per-broker counter resets.
 Absent samples mean zero only in validated snapshots declaring the counter.
-Whole-rung totals are not aligned steady throughput or capacity evidence.
+Rates, crossing, hub dispatch and idle come from the rung's aligned steady window
+(window.tsv + metrics-window-*); rungs without one read UNALIGNED.
 No cloud calls. Used by the #482 Option B card; --self-test runs offline controls.
 Takes a run dir or a results/ tree: `extract-lane-e.py bench/scale/.runs/<stamp>/results`.
 """

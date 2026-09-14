@@ -274,8 +274,11 @@ Before reading capacity vs N from an Option B arm: confirm the crossing gate
 (`mqttd_publish_forwarded_total` / `mqttd_publish_received_total`) using complete,
 supported broker snapshots without detected counter resets. Lazily absent samples
 can mean zero, but missing/failed scrapes cannot. `python3 extract-lane-e.py
-<run>/results` reports invalid input with a nonzero exit. Its totals include
-ramp/drain; it does not repair Lane E's existing measurement-window mismatch.
+<run>/results` reports invalid input with a nonzero exit. Rates, crossing, hub
+dispatch and CPU idle come from the rung's aligned steady window: brokers and
+consumers are scraped by one batch at each edge, each host stamps its own scrape
+(`window.tsv`), and the CPU samplers run for exactly that window. Rungs recorded
+before the window existed read `UNALIGNED` and must not back a capacity claim.
 The card separates matched-total-load comparisons from capacity knees and provides
 `bash ./482-smoke.sh` to prove teardown without inheriting the full campaign shape.
 

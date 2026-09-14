@@ -1709,7 +1709,6 @@ lane_e_rung() { # lane_e_rung <sites> [repeat-index] [is-control]
 	pids=()
 	for ((di = 0; di < D; di++)); do driver_batch "$di" "${pubs[di]}" & pids+=($!); done
 	for pd in "${pids[@]}"; do wait "$pd" || die "lane E: starting publisher containers failed (rung $sites sites)"; done
-	start_cpu_sampling "$rdir/cpu" $((LANE_E_SETTLE + LANE_E_SECS))
 	# Baseline the histograms AFTER the ramp, exactly as lane B does: the counters
 	# are cumulative over the container's life, so a single end-of-rung scrape
 	# bakes the connect ramp into the published tail.
@@ -1733,15 +1732,79 @@ lane_e_rung() { # lane_e_rung <sites> [repeat-index] [is-control]
 		sleep "$LANE_E_DRAIN_POLL"
 		settle_waited=$((settle_waited + LANE_E_DRAIN_POLL))
 	done
-	pids=()
-	for ((di = 0; di < D; di++)); do driver_batch "$di" "${scrape[di]}" >"$rdir/.batch/base-$di" 2>/dev/null & pids+=($!); done
-	for pd in "${pids[@]}"; do wait "$pd" || true; done
-	for ((di = 0; di < D; di++)); do batch_split "$rdir" "-base.prom" "$rdir/.batch/base-$di"; done
-	sleep "$LANE_E_SECS"
-	pids=()
-	for ((di = 0; di < D; di++)); do driver_batch "$di" "${scrape[di]}" >"$rdir/.batch/final-$di" 2>/dev/null & pids+=($!); done
-	for pd in "${pids[@]}"; do wait "$pd" || true; done
-	for ((di = 0; di < D; di++)); do batch_split "$rdir" ".prom" "$rdir/.batch/final-$di"; done
+	# ── ONE window for every side of the rung ────────────────────────────────
+	# The consumer histograms were always baselined here, but the broker counters
+	# were read before the consumers even started and after the drain, and the CPU
+	# sampler ran for a fixed SETTLE+SECS from before the settle wait — so a broker
+	# rate, a crossing ratio or an idle figure carried the ramp, the drain and
+	# whatever an extended settle pushed out of the sampler's range. Now brokers
+	# and consumers are scraped by the same parallel batch at both edges, and the
+	# samplers are bounded by the window itself (cpu.sh) instead of a timer.
+	#
+	# Each host stamps its own scrape with its OWN clock, which is the clock its
+	# mpstat stream prints: the extractor keeps a host's CPU samples that fall
+	# between its two scrapes without trusting the operator's clock to agree with
+	# a fleet's. `before`/`after`/`drain` stay: delivery accounting compares
+	# lifetime totals with the drivers' lifetime counts, which is correct for them.
+	# shellcheck disable=SC2016 # expanded by the REMOTE shell, per host
+	local stamp='printf "WINDOW_STAMP_MS %s\n" "$(date +%s%3N)"'
+	lane_e_window_scrape() { # lane_e_window_scrape <open|close>
+		local phase="$1" i q
+		local -a wp=()
+		for ((i = 0; i < N; i++)); do
+			rssh "$(broker_pub_ip "$i")" "$stamp; curl -s http://localhost:8080/metrics; $stamp" \
+				>"$rdir/.batch/$phase-broker$i" 2>/dev/null &
+			wp+=($!)
+		done
+		for ((q = 0; q < D; q++)); do
+			driver_batch "$q" "$stamp"$'\n'"${scrape[q]}""printf '\\n'; $stamp" \
+				>"$rdir/.batch/$phase-driver$q" 2>/dev/null &
+			wp+=($!)
+		done
+		# Named pids only: inside with_cpu_sampling a bare `wait` would also wait
+		# for the samplers, which run until this function returns.
+		for q in "${wp[@]}"; do wait "$q" || true; done
+	}
+	lane_e_window() {
+		lane_e_window_scrape open
+		sleep "$LANE_E_SECS"
+		lane_e_window_scrape close
+		: >"$rdir/.batch/window-ran"
+	}
+	local cpu_window=aligned i phase
+	if ! with_cpu_sampling "$rdir/cpu" lane_e_window; then
+		if [ -f "$rdir/.batch/window-ran" ]; then
+			cpu_window=incomplete
+		else
+			# The samplers never came up, so the window never ran. Measure it anyway:
+			# the rung's traffic is already flowing and its broker/consumer evidence
+			# does not depend on mpstat.
+			warn "lane E: CPU samplers failed to start for rung $sites — measuring the window without CPU coverage"
+			cpu_window=missing
+			lane_e_window
+		fi
+	fi
+	for ((i = 0; i < N; i++)); do
+		grep -v '^WINDOW_STAMP_MS ' "$rdir/.batch/open-broker$i" >"$rdir/metrics-window-open-broker$i.prom" || true
+		grep -v '^WINDOW_STAMP_MS ' "$rdir/.batch/close-broker$i" >"$rdir/metrics-window-close-broker$i.prom" || true
+	done
+	for ((di = 0; di < D; di++)); do
+		grep -v '^WINDOW_STAMP_MS ' "$rdir/.batch/open-driver$di" >"$rdir/.batch/base-$di" || true
+		grep -v '^WINDOW_STAMP_MS ' "$rdir/.batch/close-driver$di" >"$rdir/.batch/final-$di" || true
+		batch_split "$rdir" "-base.prom" "$rdir/.batch/base-$di"
+		batch_split "$rdir" ".prom" "$rdir/.batch/final-$di"
+	done
+	{
+		printf 'host\tphase\tstart_ms\tend_ms\n'
+		for phase in open close; do
+			for ((i = 0; i < N; i++)); do
+				awk -v h="broker$i" -v p="$phase" '/^WINDOW_STAMP_MS /{s[++n] = $2} END{printf "%s\t%s\t%s\t%s\n", h, p, s[1], s[n]}' "$rdir/.batch/$phase-broker$i"
+			done
+			for ((di = 0; di < D; di++)); do
+				awk -v h="driver$di" -v p="$phase" '/^WINDOW_STAMP_MS /{s[++n] = $2} END{printf "%s\t%s\t%s\t%s\n", h, p, s[1], s[n]}' "$rdir/.batch/$phase-driver$di"
+			done
+		done
+	} >"$rdir/window.tsv"
 	# The steady-window artifacts are complete at this point. Everything below is
 	# the DRAIN (#534), and it deliberately writes to new filenames: `driver_rate`
 	# measures over the last STEADY_WINDOW seconds of a series, so letting the
@@ -1808,9 +1871,8 @@ lane_e_rung() { # lane_e_rung <sites> [repeat-index] [is-control]
 		for pd in "${pids[@]}"; do wait "$pd" || true; done
 	fi
 	rm -rf "$rdir/.batch"
-	stop_cpu_sampling
 	snapshot_metrics "$rdir" after
-	echo "sites=$sites offered=$((sites * LANE_E_SITE_RATE)) publishers=$((sites * LANE_E_PUBS_PER_SITE)) consumers=$((sites * LANE_E_SUBS_PER_SITE)) per_consumer=$((LANE_E_SITE_RATE / LANE_E_SUBS_PER_SITE)) p99_budget_ms=$LANE_E_P99_BUDGET_MS qos=$LANE_E_QOS sub_qos=$LANE_E_SUB_QOS window_secs=$LANE_E_SECS settle_s=$((LANE_E_SETTLE + settle_waited)) settled=$settled settled_conns=$settled_conns expected_conns=$expect_conns drained=$drained drain_secs=$drain_secs drain_deadline_s=$LANE_E_DRAIN_SECS control=$is_control reset=$reset reset_conns=$reset_conns" >"$rdir/rung.txt"
+	echo "sites=$sites offered=$((sites * LANE_E_SITE_RATE)) publishers=$((sites * LANE_E_PUBS_PER_SITE)) consumers=$((sites * LANE_E_SUBS_PER_SITE)) per_consumer=$((LANE_E_SITE_RATE / LANE_E_SUBS_PER_SITE)) p99_budget_ms=$LANE_E_P99_BUDGET_MS qos=$LANE_E_QOS sub_qos=$LANE_E_SUB_QOS window_secs=$LANE_E_SECS window=aligned cpu_window=$cpu_window settle_s=$((LANE_E_SETTLE + settle_waited)) settled=$settled settled_conns=$settled_conns expected_conns=$expect_conns drained=$drained drain_secs=$drain_secs drain_deadline_s=$LANE_E_DRAIN_SECS control=$is_control reset=$reset reset_conns=$reset_conns" >"$rdir/rung.txt"
 	say "  lane E: $sites site(s) done ($((sites * LANE_E_SITE_RATE)) msg/s offered)"
 }
 # ── the calibration probe (#534, acceptance 4) ───────────────────────────────

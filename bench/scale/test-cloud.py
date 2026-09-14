@@ -365,6 +365,132 @@ with_cpu_sampling "$CPU_DIR" driver
         self.assertIn("site affinity: ON", shape)
         self.assertNotIn("prefer-local", shape)
 
+    def test_lane_e_brokers_consumers_and_cpu_share_one_window(self):
+        # Every remote command really runs, locally, against fake curl/docker/
+        # mpstat; `sleep` returns at once. The log records what each host was
+        # asked to do and when, so the ORDER of the rung is what is asserted.
+        fake = self.bin_dir
+        (fake / "ssh").write_text('''#!/usr/bin/env python3
+import json, os, sys, time
+args = sys.argv[1:]
+i = next(k for k, a in enumerate(args) if a.startswith("root@"))
+host, cmd = args[i][5:], " ".join(args[i + 1:])
+if cmd == "bash -s":
+    cmd = sys.stdin.read()
+with open(os.environ["CALL_LOG"], "a") as f:
+    f.write(json.dumps({"t": time.time_ns(), "host": host, "cmd": cmd}) + "\\n")
+os.environ["FAKE_HOST"] = host
+os.execvp("bash", ["bash", "-c", cmd])
+''')
+        tools = {
+            "sleep": '''#!/usr/bin/env python3
+import json, os, sys, time
+with open(os.environ["CALL_LOG"], "a") as f:
+    f.write(json.dumps({"t": time.time_ns(), "sleep": sys.argv[1]}) + "\\n")
+''',
+            "mpstat": '''#!/usr/bin/env python3
+import json, os, signal, sys, time
+def stop(*_):
+    with open(os.environ["CALL_LOG"], "a") as f:
+        f.write(json.dumps({"t": time.time_ns(), "host": os.environ["FAKE_HOST"], "cpu": "stop"}) + "\\n")
+    sys.exit(0)
+signal.signal(signal.SIGTERM, stop)
+# `mpstat -P ALL <interval> <count>` is a timer that ends on its own.
+count = int(sys.argv[4]) if len(sys.argv) > 4 else None
+while count is None or count > 0:
+    print(time.strftime("%H:%M:%S", time.gmtime()) + "  all  0 0 0 0 0 0 0 0 0 50.00", flush=True)
+    count = None if count is None else count - 1
+    time.sleep(0.05)
+''',
+            "curl": '''#!/usr/bin/env python3
+import os, sys
+url = sys.argv[-1]
+state = os.path.join(os.environ["FAKE_STATE"], "pubs")
+if url.endswith(":8080/metrics"):
+    print("mqttd_connections_active %d" % (10**6 if os.path.exists(state) else 0))
+    print("mqttd_publish_received_total 100")
+elif "/metrics" in url:
+    print("recv 100")
+''',
+            "docker": '''#!/usr/bin/env python3
+import os, sys
+state = os.path.join(os.environ["FAKE_STATE"], "pubs")
+a = sys.argv[1:]
+if a[:1] == ["run"] and "pub" in a:
+    open(state, "w").close()
+if a[:1] == ["rm"] and any(x.startswith("pub-") for x in a):
+    if os.path.exists(state): os.unlink(state)
+''',
+        }
+        for name, body in tools.items():
+            (fake / name).write_text(body)
+            (fake / name).chmod(0o755)
+        (self.root / "state").mkdir()
+        inventory = self.root / "inventory.json"
+        inventory.write_text(json.dumps({
+            "brokers": [{"public_ip": f"broker-{i}", "private_ip": f"10.0.0.{i + 1}"} for i in range(2)],
+            "drivers": [{"public_ip": "driver-0", "vcpus": 8}],
+        }))
+        out = self.root / "e2e"
+        result = subprocess.run(
+            ["bash", str(self.rig / "run-curve.sh"), str(out), str(inventory)],
+            env=self.env | {"LANES": "E", "LANE_E_SITES_OVERRIDE": "1", "LANE_E_CONTROL": "0",
+                            "LANE_E_CALIBRATE": "0", "FAKE_STATE": str(self.root / "state")},
+            capture_output=True, text=True, timeout=120,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr[-3000:])
+        events = [json.loads(line) for line in self.log.read_text().splitlines()]
+        events.sort(key=lambda e: e["t"])
+
+        def when(pred, what, last=False):
+            hits = [e["t"] for e in events if pred(e)]
+            self.assertTrue(hits, what)
+            return hits[-1] if last else hits[0]
+
+        cmd = lambda e: e.get("cmd", "")  # noqa: E731
+        pubs_up = when(lambda e: " pub -h " in cmd(e), "publishers started")
+        settle = when(lambda e: e.get("sleep") == "20", "settle sleep")
+        cpu_up = when(lambda e: "mpstat" in cmd(e), "samplers started", last=True)
+        opened = [e for e in events if "WINDOW_STAMP_MS" in cmd(e)]
+        self.assertEqual({e["host"] for e in opened}, {"broker-0", "broker-1", "driver-0"})
+        window = when(lambda e: e.get("sleep") == "60", "window sleep")
+        first_open = min(e["t"] for e in opened)
+        last_open = max(e["t"] for e in opened if e["t"] < window)
+        first_close = min(e["t"] for e in opened if e["t"] > window)
+        cpu_down = [e for e in events if e.get("cpu") == "stop"]
+        self.assertEqual(len(cpu_down), 3, "every host's sampler is stopped by the window, not a timer")
+        stop_logs = when(lambda e: "docker logs pub-" in cmd(e), "steady logs dumped")
+        before = [e["t"] for e in events if cmd(e) == "curl -s http://localhost:8080/metrics"]
+        self.assertLess(pubs_up, settle)
+        self.assertLess(settle, cpu_up)
+        self.assertLess(cpu_up, first_open, "samplers cover the whole window")
+        self.assertLess(last_open, window)
+        self.assertEqual(sum(1 for e in opened if e["t"] < window), 3, "one open scrape per host, one batch")
+        self.assertEqual(sum(1 for e in opened if e["t"] > window), 3, "one close scrape per host, one batch")
+        self.assertLess(max(e["t"] for e in opened), min(e["t"] for e in cpu_down))
+        self.assertLess(max(e["t"] for e in cpu_down), stop_logs)
+        self.assertTrue(any(t < pubs_up for t in before), "lifetime before snapshot kept")
+        self.assertTrue(any(t > first_close for t in before), "lifetime after snapshot kept")
+
+        rdir = out / "results/nodes=2/laneE/sites-1"
+        for label in ("window-open", "window-close", "before", "after"):
+            for i in range(2):
+                text = (rdir / f"metrics-{label}-broker{i}.prom").read_text()
+                self.assertIn("mqttd_publish_received_total 100", text)
+                self.assertNotIn("WINDOW_STAMP_MS", text)
+        self.assertNotIn("WINDOW_STAMP_MS", (rdir / "sub-s0-0-base.prom").read_text())
+        self.assertNotIn("WINDOW_STAMP_MS", (rdir / "sub-s0-0.prom").read_text())
+        rows = [r.split("\t") for r in (rdir / "window.tsv").read_text().splitlines()[1:]]
+        self.assertEqual(sorted((r[0], r[1]) for r in rows), sorted(
+            (h, p) for h in ("broker0", "broker1", "driver0") for p in ("open", "close")))
+        for host, phase, start, end in rows:
+            self.assertTrue(start.isdigit() and end.isdigit() and int(start) <= int(end), (host, phase))
+        rung = (rdir / "rung.txt").read_text()
+        self.assertIn("window=aligned", rung)
+        self.assertIn("cpu_window=aligned", rung)
+        for host in ("broker0", "broker1", "driver0"):
+            self.assertIn("CPU_STREAM_START_UTC", (rdir / f"cpu/cpu-{host}.txt").read_text())
+
     def test_missing_tofu_fails_even_when_terraform_exists(self):
         # Hermetic PATH: removing the stub must not reveal the host's real tofu.
         (self.bin_dir / "tofu").unlink()
