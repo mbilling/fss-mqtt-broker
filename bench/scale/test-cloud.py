@@ -238,6 +238,68 @@ with_cpu_sampling "$CPU_DIR" driver
                                    ["destroy", "-auto-approve", "-var", "node_count=1"]])
         self.assertTrue(all(c[0] == "hcloud" for c in calls[1:]), calls)
 
+    def test_non_default_ssh_key_is_passed_on_apply_and_every_destroy(self):
+        key = self.root / "hetzner"
+        key.write_text("private")
+        key.with_suffix(".pub").write_text("ssh-ed25519 AAAA test")
+        pub = f"ssh_public_key_path={key}.pub"
+        self.run_script("run.sh", "smoke", HCLOUD_TOKEN="dummy", SSH_KEY=str(key))
+        calls = self.calls()
+        self.assertEqual([c[2][0] for c in calls], ["init", "apply", "destroy"])
+        self.assertIn(pub, calls[1][2], calls[1])
+        self.assertIn(pub, calls[2][2], calls[2])
+        self.log.write_text("")
+        (self.rig / "terraform/terraform.tfstate").write_text("{}")
+        result = self.run_script("teardown.sh", HCLOUD_TOKEN="dummy", SSH_KEY=str(key))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        destroy = self.calls()[0][2]
+        self.assertIn(pub, destroy, destroy)
+
+    def test_ssh_key_without_pub_fails_before_tofu(self):
+        key = self.root / "hetzner"
+        key.write_text("private")
+        result = self.run_script("run.sh", "smoke", HCLOUD_TOKEN="dummy", SSH_KEY=str(key))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("SSH_KEY.pub", result.stderr)
+        self.assertEqual(self.calls(), [])
+        result = self.run_script("teardown.sh", HCLOUD_TOKEN="dummy", SSH_KEY=str(key))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("SSH_KEY.pub", result.stderr)
+        self.assertEqual(self.calls(), [])
+
+    def test_lane_e_unpinned_shape_describes_prefer_local_not_round_robin(self):
+        inventory = self.root / "inventory.json"
+        inventory.write_text(json.dumps({
+            "brokers": [{}] * 7,
+            "drivers": [{"vcpus": 8}] * 5,
+        }))
+        out = self.root / "shape"
+        for subs, expect in (("7", "predicted crossing ≈ 0%"), ("5", "predicted crossing ≈ 2/7")):
+            with self.subTest(subs=subs):
+                result = self.run_script(
+                    "run-curve.sh", str(out), str(inventory),
+                    LANES="E", SHAPE_ONLY="1", LANE_E_PIN_SITES="0",
+                    LANE_E_SUBS_PER_SITE=subs, LANE_E_SITES_OVERRIDE="1",
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                shape = (out / "results/nodes=7/laneE/shape.txt").read_text()
+                self.assertNotIn("round-robin $share selection roughly (N-1)/N", shape)
+                self.assertIn("prefer-local", shape)
+                self.assertIn(expect, shape)
+                self.assertIn("mqttd_publish_forwarded_total", shape)
+
+    def test_lane_e_pinned_shape_wording_unchanged(self):
+        inventory = self.root / "inventory.json"
+        inventory.write_text(json.dumps({"brokers": [{}], "drivers": [{"vcpus": 8}, {"vcpus": 8}]}))
+        result = self.run_script(
+            "run-curve.sh", str(self.root / "shape-pin"), str(inventory),
+            LANES="E", SHAPE_ONLY="1", LANE_E_PIN_SITES="1", LANE_E_SITES_OVERRIDE="1",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        shape = (self.root / "shape-pin/results/nodes=1/laneE/shape.txt").read_text()
+        self.assertIn("site affinity: ON", shape)
+        self.assertNotIn("prefer-local", shape)
+
     def test_missing_tofu_fails_even_when_terraform_exists(self):
         # Hermetic PATH: removing the stub must not reveal the host's real tofu.
         (self.bin_dir / "tofu").unlink()

@@ -463,24 +463,17 @@ LANE_E_P99_BUDGET_MS="${LANE_E_P99_BUDGET_MS:-1000}"
 # failure mode this rig has (every wrong answer in the 2026-08 campaign was the
 # harness). Refused in the shape check, where it costs nothing.
 LANE_E_MAX_CONTAINERS_PER_DRIVER="${LANE_E_MAX_CONTAINERS_PER_DRIVER:-$(inv '[.drivers[] | (.vcpus // 8)] | min')}"
-# SITE AFFINITY. Off by default, which is how T3/T4 were measured: every
-# container spans every broker (rotated_hosts), inherited from lane B where one
-# shared workload SHOULD be spread. For a tenancy lane that inheritance is
-# actively wrong. A site is semantically independent — site 3's publishes only
-# ever reach site 3's consumers — so the workload is partitionable; spreading
-# each site over all N brokers converts it into an all-to-all one.
-#
-# The cost is not incidental. `Hub::choose_shared_index` picks a $share member
-# ROUND-ROBIN over every online candidate with no locality preference, so with a
-# group spread across N nodes roughly (N-1)/N of publishes select a REMOTE
-# member and cross the network. That is the suspected mechanism behind T4's
-# `sites = N + 2`: each added node brought a hub thread (+1 site) but also
-# forwarding work for every existing node (hence not +3).
+# SITE AFFINITY. Off by default: every container spans every broker
+# (rotated_hosts). That is the Option B / unpinned posture. Cluster shared-sub
+# selection is prefer-local (default on since #511), not global round-robin:
+# predicted crossing is (N − min(C, N))/N, so with LANE_E_SUBS_PER_SITE ≥ N it
+# is ≈ 0%. Gate on mqttd_publish_forwarded_total / mqttd_publish_received_total
+# (Prometheus omits zero series: absent forwarded + large received ⇒ 0). The
+# old (N-1)/N round-robin prediction is stale while prefer-local is on.
 #
 # With LANE_E_PIN_SITES=1 a site's publishers AND consumers connect only to
 # broker (site mod N). Cross-node forwarding for that site's traffic goes to
-# zero, and if forwarding is the ceiling capacity should become ~3N rather than
-# N+2. Falsifiable either way, which is the point.
+# zero by placement, independent of selection policy.
 LANE_E_PIN_SITES="${LANE_E_PIN_SITES:-0}"
 
 # ── helpers ──────────────────────────────────────────────────────────────────
@@ -813,9 +806,18 @@ lane_e_shape() {
 			echo "               ceil(sites/$N) sites; that per-broker figure is what to compare against"
 			echo "               the N=1 knee, NOT the cluster total."
 		else
-			echo "site affinity: off — every container spans all $N brokers (rotated_hosts). With"
-			echo "               round-robin \$share selection roughly (N-1)/N of publishes pick a"
-			echo "               REMOTE member and cross the network."
+			echo "site affinity: off — every container spans all $N brokers (rotated_hosts)."
+			echo "               Cluster default is prefer-local (#511), not global round-robin."
+			if [ "$LANE_E_SUBS_PER_SITE" -ge "$N" ]; then
+				echo "               LANE_E_SUBS_PER_SITE=$LANE_E_SUBS_PER_SITE ≥ N=$N, so every node has a"
+				echo "               local shared member → predicted crossing ≈ 0%."
+			else
+				echo "               LANE_E_SUBS_PER_SITE=$LANE_E_SUBS_PER_SITE < N=$N → predicted crossing ≈ $((N - LANE_E_SUBS_PER_SITE))/$N"
+				echo "               under prefer-local (uncovered publishers forward)."
+			fi
+			echo "               Gate on mqttd_publish_forwarded_total / mqttd_publish_received_total"
+			echo "               (Prometheus omits zero series: absent forwarded + large received ⇒ 0)."
+			echo "               Do not treat round-robin (N-1)/N as the prediction while prefer-local is on."
 		fi
 		echo
 		if [ "$LANE_E_PIN_SITES" = 1 ]; then

@@ -17,7 +17,8 @@ core counts do not establish matching CPU guarantees or driver headroom.
   core counts are added to `quota.tf` from the provider catalog.
 - Defaults: `de-fra1`, four-vCPU/eight-GB brokers and drivers, 100-GB maxiops boot
   disks, two drivers (one for smoke). These are not Hetzner smoke plan names.
-- Set `SSH_KEY` for a non-default key; narrow `TF_VAR_admin_cidr` to an IPv4
+- Set `SSH_KEY` for a non-default key; destroy needs `${SSH_KEY}.pub` present
+  (same path apply used). Narrow `TF_VAR_admin_cidr` to an IPv4
   admin CIDR where practical. Public inbound allows SSH/ICMP and explicitly
   drops everything else. UpCloud's firewall does not filter private SDN.
 - `BROKER_NIC_SPREAD` is unsupported and rejected before provisioning.

@@ -5,6 +5,10 @@
 #   ./teardown.sh           # tofu destroy from local state, then AUDIT by label
 #   ./teardown.sh --force   # also DELETE whatever the label audit finds (needs hcloud CLI)
 #
+# Non-default SSH_KEY is passed through to tofu destroy as ${SSH_KEY}.pub (the
+# same path apply used). That file must exist: OpenTofu reads ssh_public_key_path
+# while tearing down.
+#
 # Everything this rig creates carries the label purpose=mqttd-bench-scale, and
 # the README tells the operator to use a DEDICATED Hetzner project — so a forced
 # sweep can never touch anything that is not ours.
@@ -25,7 +29,7 @@ if [ "$CLOUD" = upcloud ]; then
 	[ "$FORCE" = 0 ] || die "CLOUD=upcloud does not support --force; use state-backed teardown or inspect the UpCloud console"
 	require_scale_token
 	[ -f "$TFDIR/terraform.tfstate" ] || die "UpCloud state missing; inspect servers, storage, networks and server groups in the UpCloud console (do not use the Hetzner sweeper)"
-	(cd "$TFDIR" && "$TF" init -input=false && "$TF" destroy -auto-approve -input=false -var node_count=1) ||
+	(cd "$TFDIR" && "$TF" init -input=false && "$TF" destroy -auto-approve -input=false -var node_count=1 "${TOFU_SSH_PUBKEY_ARGS[@]}") ||
 		die "UpCloud destroy failed; preserve state and inspect the UpCloud console before retrying"
 	say "UpCloud resources tracked in this state destroyed. No account-wide leak audit was performed; verify orphaned resources in the UpCloud console."
 	exit 0
@@ -33,7 +37,7 @@ fi
 
 if [ -f "$TFDIR/terraform.tfstate" ]; then
 	say "OpenTofu destroy from local state"
-	(cd "$TFDIR" && "$TF" destroy -auto-approve -var node_count=1) ||
+	(cd "$TFDIR" && "$TF" destroy -auto-approve -var node_count=1 "${TOFU_SSH_PUBKEY_ARGS[@]}") ||
 		warn "OpenTofu destroy failed — continuing to the label audit"
 fi
 

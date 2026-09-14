@@ -245,7 +245,8 @@ teardown() {
 	fi
 	say "tearing down (trap; exit code was $rc)"
 	if ! (cd "$TFDIR" && "$TF" destroy -auto-approve \
-		-var node_count="${CURRENT_SIZE:-1}" -var run_label="$STAMP" >>"$RUN/teardown.log" 2>&1); then
+		-var node_count="${CURRENT_SIZE:-1}" -var run_label="$STAMP" \
+		"${TOFU_SSH_PUBKEY_ARGS[@]}" >>"$RUN/teardown.log" 2>&1); then
 		warn "OpenTofu destroy FAILED — recover with: $TEARDOWN_CMD (see the provider's README recovery limits)"
 		exit 1
 	fi
@@ -295,7 +296,7 @@ for N in "${SIZES[@]}"; do
 		${MQTTD_URL:+-var mqttd_url="$MQTTD_URL"} \
 		${MQTTD_SHA256:+-var mqttd_sha256="$MQTTD_SHA256"} \
 		${BENCH_GIT_REF:+-var bench_git_ref="$BENCH_GIT_REF"} \
-		${SSH_KEY:+-var ssh_public_key_path="${SSH_KEY}.pub"} \
+		"${TOFU_SSH_PUBKEY_ARGS[@]}" \
 		${DRIVER_COUNT:+-var driver_count="$DRIVER_COUNT"} \
 		${BROKER_TYPE:+-var broker_server_type="$BROKER_TYPE"} \
 		${DRIVER_TYPE:+-var driver_server_type="$DRIVER_TYPE"} \
@@ -452,7 +453,8 @@ for N in "${SIZES[@]}"; do
 	fi
 	say "destroying size $N before the next point (fresh clusters only)"
 	(cd "$TFDIR" && "$TF" destroy -auto-approve \
-		-var node_count="$N" -var run_label="$STAMP" >"$RUN/tf-destroy-$N.log" 2>&1) || {
+		-var node_count="$N" -var run_label="$STAMP" \
+		"${TOFU_SSH_PUBKEY_ARGS[@]}" >"$RUN/tf-destroy-$N.log" 2>&1) || {
 		tail -20 "$RUN/tf-destroy-$N.log" >&2
 		die "OpenTofu destroy failed for size $N — recover with $TEARDOWN_CMD before re-running"
 	}
