@@ -6478,6 +6478,7 @@ async fn recover_once(
 #[cfg(test)]
 mod tests {
     mod qos2_retirement;
+    mod shared_capacity;
     /// A committed retained snapshot entry with no application properties — the
     /// common test shape (props-bearing cases build the struct directly).
     fn snap(topic: &str, payload: &[u8], epoch: u64, offset: u64) -> RetainedWireEntry {

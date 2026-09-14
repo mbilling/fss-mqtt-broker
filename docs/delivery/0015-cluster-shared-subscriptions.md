@@ -49,6 +49,12 @@ tasks:
     date: 2026-09-11
     issue: 574
     evidence: "Dated As delivered notes on docs/adr/0010-shared-subscriptions.md and docs/adr/0015-cluster-shared-subscriptions.md (original Decision text kept). Operator consequence also in CLIENT-GUIDE.md Shared subscriptions and OPERATIONS.md shipped-alerting intro: with locality on, a consumer's share follows its host node's publisher share, not even group-wide round-robin. Fairness/spillover remains #537 Phase 3."
+  - id: 0015-T10
+    title: "QoS 0 shared-worker capacity: avoid known-full local targets and establish proportional downstream delivery"
+    status: in-progress
+    date: 2026-09-13
+    issue: 482
+    evidence: "Local admission slice: hub/delivery.rs reselects before enqueue within the same group/filter when the selected local QoS 0 outbound lacks packet/byte headroom. Seven shared_capacity regressions cover count/bytes/properties, locality escape and remote rotation, all-full/recovery, overlapping groups, group/link isolation, QoS 1 and ordinary controls. Four mutations caught. shared_capacity microbenchmark waits for metered channel receipts; docs/benchmarks/SHARED-CAPACITY.md records measured overhead and limitations. Remote capacity credits, bridge live-queue bounds, synchronized lane-E measurements and actual downstream scaling remain open; no cloud capacity claim."
 ---
 
 # Delivery — ADR 0015: Cluster-wide shared subscriptions
@@ -88,6 +94,7 @@ flags as costs, not unbuilt mechanism.
 | 0015-T7 | ✅ done | — | 2026-06-24 | "PeerMessage::SharedDeliver gained message_expiry: Option<u32>; send_shared_to_peer carries the publisher's interval and the RemoteSharedDeliver handler applies it to deliver_to_client instead of None. Peer roundtrip covers the wire field." |
 | 0015-T8 | ✅ done | — | 2026-06-24 | "SharedGroupsWire carries per-member liveness (client,qos,online); shared_snapshot tags each member from self.online; inbound gossip builds hub::RemoteSharedGroup with the bit; select_shared prefers any member online on its home node (local or gossiped-remote) and falls back to local-persistent then any-remote, so an offline-at-home remote member is no longer chosen over a live one. Test shared_selection_skips_an_offline_remote_member; round-robin + peer roundtrip still green." |
 | 0015-T9 | ✅ done | [#574](https://github.com/mbilling/fss-mqtt-broker/issues/574) | 2026-09-11 | "Dated As delivered notes on docs/adr/0010-shared-subscriptions.md and docs/adr/0015-cluster-shared-subscriptions.md (original Decision text kept). Operator consequence also in CLIENT-GUIDE.md Shared subscriptions and OPERATIONS.md shipped-alerting intro: with locality on, a consumer's share follows its host node's publisher share, not even group-wide round-robin. Fairness/spillover remains #537 Phase 3." |
+| 0015-T10 | 🚧 in-progress | [#482](https://github.com/mbilling/fss-mqtt-broker/issues/482) | 2026-09-13 | "Local admission slice: hub/delivery.rs reselects before enqueue within the same group/filter when the selected local QoS 0 outbound lacks packet/byte headroom. Seven shared_capacity regressions cover count/bytes/properties, locality escape and remote rotation, all-full/recovery, overlapping groups, group/link isolation, QoS 1 and ordinary controls. Four mutations caught. shared_capacity microbenchmark waits for metered channel receipts; docs/benchmarks/SHARED-CAPACITY.md records measured overhead and limitations. Remote capacity credits, bridge live-queue bounds, synchronized lane-E measurements and actual downstream scaling remain open; no cloud capacity claim." |
 <!-- /status-table:0015 -->
 
 ## Changelog

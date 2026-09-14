@@ -110,6 +110,13 @@ share of publishers, not even round-robin across the group. MQTT leaves
 selection implementation-defined; fairness/spillover is a separate option
 (#537 Phase 3), not a spec defect.
 
+**QoS 0 exception under pressure (#482):** a selected local member whose outbound
+cannot fit the message is bypassed before enqueue if another online member of the
+same group can be selected. Locals with room remain preferred; remote capacity is
+unknown. No alternative means a counted QoS 0 drop, not unlimited buffering or a
+retry after an ambiguous send. This does not yet make the group an end-to-end
+capacity-aware bridge pool; see [the measured scope](benchmarks/SHARED-CAPACITY.md).
+
 ## Emitted reason codes (failure, `>= 0x80`)
 
 This table is the CI-gated catalogue. Success codes (`< 0x80`) and codes the

@@ -924,7 +924,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 385 test(s)
+## `crates/mqttd/src/lib.rs` — 392 test(s)
 
 - `admission::tests::the_global_cap_refuses_at_the_bound_and_recovers`
 - `admission::tests::the_penalty_box_refuses_after_the_threshold`
@@ -1251,6 +1251,13 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::session_expiry_finite_retains_then_expires`
 - `hub::tests::session_expiry_reconnect_cancels_expiry`
 - `hub::tests::session_expiry_zero_discards_at_disconnect`
+- `hub::tests::shared_capacity::controls::qos0_shared_capacity_includes_application_properties`
+- `hub::tests::shared_capacity::controls::qos0_shared_does_not_escape_into_another_group_or_a_down_link`
+- `hub::tests::shared_capacity::controls::qos0_shared_rechecks_capacity_between_matching_groups`
+- `hub::tests::shared_capacity::controls::qos1_shared_rotation_and_qos0_ordinary_shedding_are_unchanged`
+- `hub::tests::shared_capacity::qos0_shared_all_full_drops_once_and_a_drained_member_rejoins`
+- `hub::tests::shared_capacity::qos0_shared_pressure_can_escape_locality_and_rotates_remote_members`
+- `hub::tests::shared_capacity::qos0_shared_uses_spare_local_capacity_at_both_outbound_bounds`
 - `hub::tests::shared_delivery_prefers_online_over_offline_member`
 - `hub::tests::shared_message_queues_for_offline_persistent_member`
 - `hub::tests::shared_selection_order_is_stable_across_two_peers`
