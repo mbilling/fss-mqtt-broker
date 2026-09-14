@@ -19,11 +19,18 @@ die() {
 # ssh/scp with a per-run known_hosts file: fresh servers mean fresh host keys,
 # and polluting the operator's global known_hosts with short-lived IPs helps no one.
 # SSH_KEY=<path to private key> selects a non-default identity (e.g. ~/.ssh/hetzner);
-# run.sh derives the uploaded public key from it as ${SSH_KEY}.pub.
+# the uploaded public key is ${SSH_KEY}.pub. OpenTofu evaluates
+# file(pathexpand(var.ssh_public_key_path)) on destroy as well as apply, so every
+# tofu destroy / teardown must pass the same -var apply used. When SSH_KEY is
+# set and destroy omits it, OpenTofu falls back to ~/.ssh/id_ed25519.pub and
+# fails if that file is missing — leaving paid servers up (#482, 2026-09-14).
 SSH_OPTS=(-o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -o ServerAliveInterval=15)
+# shellcheck disable=SC2034 # consumed by run.sh / teardown.sh tofu apply+destroy
+TOFU_SSH_PUBKEY_ARGS=()
 if [ -n "${SSH_KEY:-}" ]; then
 	[ -f "$SSH_KEY" ] || die "SSH_KEY=$SSH_KEY does not exist"
 	SSH_OPTS+=(-i "$SSH_KEY" -o IdentitiesOnly=yes)
+	TOFU_SSH_PUBKEY_ARGS=(-var "ssh_public_key_path=${SSH_KEY}.pub")
 fi
 rssh() { # rssh <public-ip> <command...>
 	local ip="$1"

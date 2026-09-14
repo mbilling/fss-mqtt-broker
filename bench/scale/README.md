@@ -23,6 +23,9 @@ The prerequisites and pricing below describe the default Hetzner platform.
 3. **An SSH keypair.** The default is `~/.ssh/id_ed25519`; for any other key
    (say `~/.ssh/hetzner`), `export SSH_KEY=~/.ssh/hetzner` — the rig injects
    `${SSH_KEY}.pub` into every host via cloud-init and dials with that identity.
+   Destroy needs that `.pub` file present on the operator host: OpenTofu reads
+   `ssh_public_key_path` on teardown, not only on apply. A non-default `SSH_KEY`
+   is passed through on destroy (between sizes, EXIT trap, and `teardown.sh`).
    The key is never registered with the hcloud API, so it may freely also exist
    in the project's console inventory. (Because no project key is attached to
    the servers, Hetzner emails a root password per server — ignore it; the
@@ -109,7 +112,9 @@ an Alloy scraper on driver-1 that reads every broker's `/metrics` over the priva
 network every 2s and reverse-tunnels it to the laptop (`observe.sh`). Nothing runs
 on the broker hosts, and the scrape is a plain HTTP GET: the expensive gauges (the
 per-session sums for subscriptions, inflight and backlog bytes) are recomputed on
-the hub's own sweep tick, not per scrape. If the local stack cannot start the run
+the hub's own sweep tick, not per scrape. **Attach on the machine that already
+runs Grafana/Alloy** — typically the laptop with the observe compose stack, not a
+remote orchestrator without Docker. If the local stack cannot start the run
 continues unobserved with a warning. `OBSERVE=0` opts out — worth doing for a run
 whose numbers are published, if you want the measured path provably untouched. Ctrl-C is safe (trapped); `kill -9` is not — after one, run
 `./teardown.sh`.
@@ -255,6 +260,24 @@ unattributable.
 Lane definitions, the ladder, and every validity rule live in `run-curve.sh`
 and are documented in `docs/benchmarks/SCALE-CURVE.md` — the method is fixed
 before the first paid run.
+
+## Constant-driver Option B (#482)
+
+The unpinned, constant-driver A/B card (N∈{5,7}, D=5, `LANE_E_PIN_SITES=0`,
+`LANE_E_SUBS_PER_SITE=7` so predicted crossing ≈ 0% under prefer-local) lives at
+[`482-constant-driver-N5-N7-optionB.md`](482-constant-driver-N5-N7-optionB.md)
+with the matching env file beside it. It is a diagnostic campaign, not a
+published curve — do not copy its one-off numbers into
+`docs/benchmarks/SCALE-CURVE.md`.
+
+Before reading capacity vs N from an Option B arm: confirm the crossing gate
+(`mqttd_publish_forwarded_total` / `mqttd_publish_received_total`) using complete,
+supported broker snapshots without detected counter resets. Lazily absent samples
+can mean zero, but missing/failed scrapes cannot. `python3 extract-lane-e.py
+<run>/results` reports invalid input with a nonzero exit. Its totals include
+ramp/drain; it does not repair Lane E's existing measurement-window mismatch.
+The card separates matched-total-load comparisons from capacity knees and provides
+`bash ./482-smoke.sh` to prove teardown without inheriting the full campaign shape.
 
 ## Honesty notes
 

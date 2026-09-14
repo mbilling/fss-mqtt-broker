@@ -18,7 +18,7 @@ class CloudTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.rig = self.root / "bench/scale"
         self.rig.mkdir(parents=True)
-        for name in ("lib.sh", "cloud.sh", "run.sh", "teardown.sh", "run-curve.sh", "cpu.sh", "test-upcloud-quota.py"):
+        for name in ("lib.sh", "cloud.sh", "run.sh", "teardown.sh", "run-curve.sh", "cpu.sh", "test-upcloud-quota.py", "482-smoke.sh", "482-constant-driver-N5-N7-optionB.env", "extract-lane-e.py"):
             shutil.copy2(SCALE / name, self.rig / name)
         for name in ("terraform", "terraform-upcloud"):
             (self.rig / name).mkdir()
@@ -30,6 +30,11 @@ class CloudTests(unittest.TestCase):
 import json, os, sys
 with open(os.environ["CALL_LOG"], "a") as f:
     f.write(json.dumps([os.path.basename(sys.argv[0]), os.getcwd(), sys.argv[1:]]) + "\\n")
+# Optional failed state destroy plus a real (stubbed) label-recovery path.
+if "destroy" in sys.argv and os.getenv("FAIL_DESTROY") == "1": sys.exit(77)
+if os.path.basename(sys.argv[0]) == "hcloud" and os.getenv("LEAK_SERVER") == "1":
+    if sys.argv[1:3] == ["server", "list"]: print("123 leaked-server")
+    sys.exit(0)
 # Stop before output/bootstrap, but let the EXIT trap exercise destroy.
 sys.exit(77 if "apply" in sys.argv or os.path.basename(sys.argv[0]) in ("hcloud", "ssh") else 0)
 '''
@@ -237,6 +242,128 @@ with_cpu_sampling "$CPU_DIR" driver
         self.assertEqual(calls[0], ["tofu", str(self.rig / "terraform"),
                                    ["destroy", "-auto-approve", "-var", "node_count=1"]])
         self.assertTrue(all(c[0] == "hcloud" for c in calls[1:]), calls)
+
+    def test_non_default_ssh_key_is_passed_on_apply_and_every_destroy(self):
+        key = self.root / "hetzner"
+        key.write_text("private")
+        key.with_suffix(".pub").write_text("ssh-ed25519 AAAA test")
+        pub = f"ssh_public_key_path={key}.pub"
+        self.run_script("run.sh", "smoke", HCLOUD_TOKEN="dummy", SSH_KEY=str(key))
+        calls = self.calls()
+        self.assertEqual([c[2][0] for c in calls], ["init", "apply", "destroy"])
+        self.assertIn(pub, calls[1][2], calls[1])
+        self.assertIn(pub, calls[2][2], calls[2])
+        self.log.write_text("")
+        (self.rig / "terraform/terraform.tfstate").write_text("{}")
+        result = self.run_script("teardown.sh", HCLOUD_TOKEN="dummy", SSH_KEY=str(key))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        destroy = self.calls()[0][2]
+        self.assertIn(pub, destroy, destroy)
+
+    def test_ssh_key_without_pub_fails_before_tofu(self):
+        key = self.root / "hetzner"
+        key.write_text("private")
+        result = self.run_script("run.sh", "smoke", HCLOUD_TOKEN="dummy", SSH_KEY=str(key))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("SSH_KEY.pub", result.stderr)
+        self.assertEqual(self.calls(), [])
+
+    def test_missing_pub_does_not_block_force_recovery_after_failed_destroy(self):
+        key = self.root / "hetzner"
+        key.write_text("private")
+        (self.rig / "terraform/terraform.tfstate").write_text("{}")
+        result = self.run_script("teardown.sh", "--force", HCLOUD_TOKEN="dummy",
+                                 SSH_KEY=str(key), FAIL_DESTROY="1", LEAK_SERVER="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("destroy failed", result.stderr)
+        calls = self.calls()
+        self.assertEqual(calls[0][0], "tofu")
+        self.assertIn(f"ssh_public_key_path={key}.pub", calls[0][2])
+        self.assertTrue(any(c[0] == "hcloud" and c[2] == ["server", "delete", "123"] for c in calls), calls)
+
+    def test_extractor_controls_run_in_ci(self):
+        result = subprocess.run(["python3", str(self.rig / "extract-lane-e.py"), "--self-test"],
+                                env=self.env, capture_output=True, text=True, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("test_incomplete_reset_and_unsupported_scrapes_are_invalid", result.stderr)
+
+    def test_campaign_smoke_does_not_inherit_full_fleet_or_ladder(self):
+        key = self.root / "campaign-key"
+        key.write_text("private")
+        key.with_suffix(".pub").write_text("ssh-ed25519 AAAA test")
+        result = subprocess.run(
+            ["bash", "-c", 'source "$1"; exec bash "$2"', "smoke-test",
+             str(self.rig / "482-constant-driver-N5-N7-optionB.env"),
+             str(self.rig / "482-smoke.sh")],
+            env=self.env | {"HCLOUD_TOKEN": "dummy", "SSH_KEY": str(key),
+                            "MQTTD_URL": "https://example.invalid/pinned-main", "MQTTD_SHA256": "a" * 64,
+                            "BENCH_GIT_REF": "29e43854fd699fa910cf383db273dee191f47d87"},
+            capture_output=True, text=True, timeout=15,
+        )
+        # The apply stub deliberately fails, then the EXIT trap destroys.
+        self.assertNotEqual(result.returncode, 0)
+        calls = self.calls()
+        self.assertEqual([c[2][0] for c in calls], ["init", "apply", "destroy"])
+        args = calls[1][2]
+        for value in ("driver_count=1", "broker_server_type=cpx32", "driver_server_type=cpx42",
+                      f"ssh_public_key_path={key}.pub", "mqttd_url=https://example.invalid/pinned-main",
+                      "mqttd_sha256=" + "a" * 64,
+                      "bench_git_ref=29e43854fd699fa910cf383db273dee191f47d87"):
+            self.assertIn(value, args)
+        self.assertIn(f"ssh_public_key_path={key}.pub", calls[2][2])
+        shapes = list((self.rig / ".runs").glob("*/preflight-1/results/nodes=1/laneE/shape.txt"))
+        self.assertEqual(len(shapes), 1)
+        shape = shapes[0].read_text()
+        self.assertIn("brokers=1 drivers=1", shape)
+        self.assertIn("= 1000 msg/s", shape)
+        self.assertNotIn("300000", shape)
+        self.assertEqual(len([line for line in shape.splitlines() if line.rstrip().endswith("| ok")]), 1)
+
+    def test_lane_e_unpinned_shape_describes_prefer_local_not_round_robin(self):
+        inventory = self.root / "inventory.json"
+        inventory.write_text(json.dumps({
+            "brokers": [{}] * 7,
+            "drivers": [{"vcpus": 8}] * 5,
+        }))
+        out = self.root / "shape"
+        for subs, expect in (("7", "predicted crossing ≈ 0%"), ("5", "predicted crossing ≈ 2/7")):
+            with self.subTest(subs=subs):
+                result = self.run_script(
+                    "run-curve.sh", str(out), str(inventory),
+                    LANES="E", SHAPE_ONLY="1", LANE_E_PIN_SITES="0",
+                    LANE_E_SUBS_PER_SITE=subs, LANE_E_SITES_OVERRIDE="1",
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                shape = (out / "results/nodes=7/laneE/shape.txt").read_text()
+                self.assertNotIn("round-robin $share selection roughly (N-1)/N", shape)
+                self.assertIn("prefer-local", shape)
+                self.assertIn(expect, shape)
+                self.assertIn("mqttd_publish_forwarded_total", shape)
+
+    def test_multiple_subscriber_containers_do_not_imply_full_local_coverage(self):
+        inventory = self.root / "inventory.json"
+        inventory.write_text(json.dumps({"brokers": [{}] * 5, "drivers": [{"vcpus": 8}] * 5}))
+        out = self.root / "multi-sub-shape"
+        result = self.run_script("run-curve.sh", str(out), str(inventory), LANES="E", SHAPE_ONLY="1",
+                                 LANE_E_PIN_SITES="0", LANE_E_SUBS_PER_SITE="6",
+                                 LANE_E_SUB_CONTAINERS_PER_SITE="3", LANE_E_SITES_OVERRIDE="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        shape = (out / "results/nodes=5/laneE/shape.txt").read_text()
+        self.assertIn("verify actual broker coverage", shape)
+        self.assertNotIn("predicted crossing ≈ 0%", shape)
+        self.assertEqual(self.calls(), [])
+
+    def test_lane_e_pinned_shape_wording_unchanged(self):
+        inventory = self.root / "inventory.json"
+        inventory.write_text(json.dumps({"brokers": [{}], "drivers": [{"vcpus": 8}, {"vcpus": 8}]}))
+        result = self.run_script(
+            "run-curve.sh", str(self.root / "shape-pin"), str(inventory),
+            LANES="E", SHAPE_ONLY="1", LANE_E_PIN_SITES="1", LANE_E_SITES_OVERRIDE="1",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        shape = (self.root / "shape-pin/results/nodes=1/laneE/shape.txt").read_text()
+        self.assertIn("site affinity: ON", shape)
+        self.assertNotIn("prefer-local", shape)
 
     def test_missing_tofu_fails_even_when_terraform_exists(self):
         # Hermetic PATH: removing the stub must not reveal the host's real tofu.

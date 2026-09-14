@@ -1008,6 +1008,24 @@ requires = ["python3"]
 duration = "~1s"
 
 [[task]]
+id = "scale-extract-lane-e"
+group = "Benchmark"
+name = "Extract Lane E crossing, hub dispatch and idle hints from a run"
+script = "bench/scale/extract-lane-e.py"
+about = """
+Walks results/nodes=*/laneE/sites-*/ and prints broker-side crossing
+(mqttd_publish_forwarded_total / mqttd_publish_received_total), hub_dispatch mean
+µs by command, peer in-flight, drops, sessions after drain, and mpstat idle hints.
+Rejects incomplete/unsupported scrapes and detected per-broker counter resets.
+Absent samples mean zero only in validated snapshots declaring the counter.
+Whole-rung totals are not aligned steady throughput or capacity evidence.
+No cloud calls. Used by the #482 Option B card; --self-test runs offline controls.
+Takes a run dir or a results/ tree: `extract-lane-e.py bench/scale/.runs/<stamp>/results`.
+"""
+requires = ["python3"]
+duration = "~1s"
+
+[[task]]
 id = "scale-bootstrap"
 group = "Benchmark"
 name = "Bootstrap one scale-curve cluster (internal step of scale-curve)"
@@ -1075,6 +1093,15 @@ name = "Driver-lifetime CPU sampling (sourced, not executed)"
 script = "bench/scale/cpu.sh"
 about = "Keeps lane A sampling alive through readiness and every arm, then stops/reaps SSH streams. Emits UTC alignment markers; failures invalidate the arm."
 hidden = true
+
+[[task]]
+id = "scale-option-b-smoke"
+group = "Benchmark"
+name = "Prove Option B teardown with a small Hetzner smoke (PAID)"
+script = "bench/scale/482-smoke.sh"
+about = "Overrides the campaign fleet and ladder: one CPX32 broker, one CPX42 driver, one 1000/s site, a fresh run directory. Preserves the key/binary pin. PREFLIGHT_ONLY=1 validates offline without cloud calls."
+requires = ["tofu", "jq", "ssh", "python3"]
+caution = "Provisions PAID Hetzner hosts unless PREFLIGHT_ONLY=1. Confirm budget; verify the project is empty after teardown."
 
 [[task]]
 id = "scale-cloud-tests"

@@ -62,7 +62,7 @@ variable "storage_size_gb" {
 }
 
 variable "ssh_public_key_path" {
-  description = "Path to the SSH public key, delivered through the server's login block (never registered as an account-level key)."
+  description = "Path to the SSH public key, delivered through the server's login block (never registered as an account-level key). Destroy evaluates file(pathexpand(...)) too — pass the same path apply used (run.sh / teardown.sh do this when SSH_KEY is set)."
   type        = string
   default     = "~/.ssh/id_ed25519.pub"
 }
