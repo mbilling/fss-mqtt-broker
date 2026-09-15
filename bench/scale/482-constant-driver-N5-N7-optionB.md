@@ -48,39 +48,45 @@ audit to 0 after.
 ## Missing before we run again
 
 The 2026-09-14 operator pass completed **N=7 only**. Destroy then failed; N=5
-never ran. Do not spend another fleet hour until this list is green.
+never ran. The 2026-09-15 pair (below) ran with this list green except where an
+item says otherwise.
 
 ### Ops / harness
 
-- [ ] **Fix/prove destroy with `SSH_KEY`.** OpenTofu evaluates
+- [x] **Fix/prove destroy with `SSH_KEY`.** OpenTofu evaluates
       `file(pathexpand(var.ssh_public_key_path))` on destroy. Apply already
       passed `${SSH_KEY}.pub` when set; destroy (between sizes, EXIT trap,
       `teardown.sh`) used to omit it and fall back to `~/.ssh/id_ed25519.pub`.
       If that file is missing, destroy fails and servers keep billing. Prove
       teardown **before** chaining 7+5: `SSH_KEY` set, `.pub` present, one
       apply→destroy (smoke is enough). Then confirm the project is empty.
-- [ ] **Observe on the Mac/laptop**, not a remote orchestrator without Docker.
+      *2026-09-15: proved end to end with the default key (N=1 smoke, the
+      between-size destroy and the final destroy, each audited to zero); the
+      non-default `SSH_KEY` path is covered by `test-cloud.py` only.*
+- [x] **Observe on the Mac/laptop**, not a remote orchestrator without Docker.
       `observe.sh attach` starts the compose stack on *this* machine
       (Grafana :3000 + Alloy). The 2026-09-14 operator host had no Docker; the
       laptop already had the stack. Attach fails and the run continues
       unobserved. Set `OBSERVE=1` only where Grafana/Alloy live; `OBSERVE=0`
-      only for a purity publish.
-- [ ] Confirm Hetzner project empty before start; label-audit to 0 after
+      only for a purity publish. *2026-09-15: a fresh laptop also lacked the
+      compose stack's external `observe_prom-data` volume, so N=7 attached late
+      by hand; `observe.sh attach` now creates it.*
+- [x] Confirm Hetzner project empty before start; label-audit to 0 after
       (`./teardown.sh`, `--force` only in the dedicated project). A missing public
       key must not prevent Hetzner's explicitly requested label recovery after
       state-backed destroy fails; provisioning still refuses a missing `.pub`.
 
 ### Binary / Option B pin
 
-- [ ] Prefer a **pinned current main** candidate (`MQTTD_URL` + `MQTTD_SHA256`,
+- [x] Prefer a **pinned current main** candidate (`MQTTD_URL` + `MQTTD_SHA256`,
       `BENCH_GIT_REF` one commit for both arms) including at least
       #598 / #612 / #526 / #540 — not only `v1.0.16`. The env file still
       defaults to 1.0.16 so a rerun is explicit about the override.
-- [ ] Same SHA + `DRIVER_COUNT=5` + this Option B env on **both** arms.
+- [x] Same SHA + `DRIVER_COUNT=5` + this Option B env on **both** arms.
 
 ### Validity gates (abort the compare if any fail)
 
-- [ ] **Crossing gate, both arms.** Pass means BOTH of:
+- [x] **Crossing gate, both arms.** Pass means BOTH of:
       1. `results/nodes=$N/laneE/forward-canary.txt` starts `status=pass nodes=$N` (the
          forwarding positive control `run-curve.sh` runs before calibration and
          any rung; a failed control stops the size with its evidence kept);
@@ -110,7 +116,10 @@ never ran. Do not spend another fleet hour until this list is green.
       crossing. (That day's N=1 smoke is certifiable only structurally, which
       says nothing about an N≥2 arm.)
 - [ ] Calibration + settled + drained; drivers not pinned at the top rung.
-- [ ] Trust **broker/drain totals**, not summed emqtt-bench `pub … rate=` log
+      *2026-09-15: calibration, settle and drain held on every rung and no driver
+      was CPU-pinned, but two rungs flag PUBLISHERS LATE (see below), so this
+      item is not green for those rungs.*
+- [x] Trust **broker/drain totals**, not summed emqtt-bench `pub … rate=` log
       lines across containers (that over-reports). `extract-lane-e.py` uses
       broker snapshots; `before`/`after` totals include ramp/drain and are for
       delivery accounting only.
@@ -127,11 +136,11 @@ never ran. Do not spend another fleet hour until this list is green.
 
 ### Diagnosis extracts we still need on both arms
 
-- [ ] `mqttd_hub_dispatch_seconds_{sum,count}` **by `command`**
+- [x] `mqttd_hub_dispatch_seconds_{sum,count}` **by `command`**
       (`publish` / `cluster` / `sweep` / …) per rung — mean µs =
       Δsum/Δcount.
-- [ ] Peer in-flight peaks / drop reasons / sessions after drain.
-- [ ] Side-by-side N=5 vs N=7 table at matched site rungs (offered, received,
+- [x] Peer in-flight peaks / drop reasons / sessions after drain.
+- [x] Side-by-side N=5 vs N=7 table at matched site rungs (offered, received,
       delivered, crossing %, per-node delivered, broker idle, hub publish µs,
       driver idle) **before** claiming membership cost.
 
@@ -251,6 +260,71 @@ sum as offered or sent.
 Post the side-by-side table (or the reason the compare aborted) on #482. Do
 not close the issue from this card. The 2026-09-14 pre-rerun checklist is
 already on the issue; keep this file in sync if the checklist moves.
+
+## 2026-09-15 pair (N=7 then N=5) — diagnostic, not a curve point
+
+Unreleased candidate: `main` 5761b1e built for x86_64 musl (zig cc as the C
+compiler, so not byte-identical to a CI build), sha256
+`0f517c94758cff41e820c72c34f221f0033097acfe10aa4eafda3d2c604e96de`, fetched from
+the `bench-candidate-5761b1e` prerelease. Harness 5a1ad0f, clean tree, both
+arms. Option B env as above, D=5 CCX33, CCX23 brokers, `fsn1`, OBSERVE=1 from the
+operator laptop. Raw results: `.runs/20260914T233336Z` (untracked).
+
+**Gates.** The forwarding control passed on both arms (`status=pass`: 600
+shared-remote forwards per broker at N=7, 400 at N=5, exact; residue gone in 2 s).
+`extract-lane-e.py --crossing-gate 0.5` exits 0: `GATE nodes=7 PASS 6 rungs,
+cert=canary` and `GATE nodes=5 PASS 6 rungs, cert=canary`, max broker crossing
+**0.00%** on every rung of both arms. Every rung settled, drained, dropped
+nothing and left no peer in-flight frames; broker delivered equals broker
+received over every rung's lifetime, and the consumers' post-drain receipts match
+it exactly except 6 messages at N=5 10 sites (the summarizer's dup column). Calibration met 15 000/s with no late publishes on
+both arms.
+
+| N | sites | offered/s | window recv/s | per node/s | crossing | p99 | broker idle mean / busiest host | driver idle mean / busiest host | hub publish µs | hub cluster µs | verdict |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| 7 | 1 | 30 000 | 29 999 | 4 286 | 0.00% | ≤1 ms | 93 / 82% | 95 / 74% | 8.3 | 13.2 | pass |
+| 5 | 1 | 30 000 | 30 000 | 6 000 | 0.00% | ≤1 ms | 88 / 79% | 97 / 85% | 6.8 | 14.5 | pass |
+| 7 | 2 | 60 000 | 60 000 | 8 571 | 0.00% | ≤1 ms | 88 / 75% | 93 / 75% | 7.9 | 15.9 | pass |
+| 5 | 2 | 60 000 | 59 999 | 12 000 | 0.00% | ≤1 ms | 84 / 65% | 96 / 88% | 8.0 | 14.2 | pass |
+| 7 | 4 | 120 000 | 120 000 | 17 143 | 0.00% | ≤1 ms | n/a¹ | n/a¹ | 5.8 | 20.9 | pass |
+| 5 | 4 | 120 000 | 119 999 | 24 000 | 0.00% | ≤1 ms | 74 / 70% | 89 / 82% | 5.3 | 15.5 | pass |
+| 7 | 8 | 240 000 | 240 080 | 34 297 | 0.00% | ≤25 ms | 67 / 56% | 76 / 62% | 5.1 | 44.9 | PUBLISHERS LATE (6%) |
+| 5 | 8 | 240 000 | 240 004 | 48 001 | 0.00% | ≤50 ms | 53 / 42% | 72 / 58% | 6.7 | 29.2 | pass |
+| 7 | 10 | 300 000 | 300 065 | 42 866 | 0.00% | ≤25 ms | 60 / 56% | 70 / 60% | 5.4 | 63.9 | pass |
+| 5 | 10 | 300 000 | 299 719 | 59 944 | 0.00% | ≤500 ms | 44 / 27% | 67 / 58% | 7.7 | 52.5 | PUBLISHERS LATE (8%) |
+| 7 | 1 (control) | 30 000 | 30 000 | 4 286 | 0.00% | ≤1 ms | 93 / 84% | 95 / 74% | 7.6 | 12.7 | pass |
+| 5 | 1 (control) | 30 000 | 30 000 | 6 000 | 0.00% | ≤1 ms | 94 / 85% | 95 / 76% | 7.3 | 12.0 | pass |
+
+¹ The N=7 4-site rung lost its CPU samplers: two of twelve sampler ssh
+connections from the laptop got `Network is unreachable` at window open
+(`cpu_window=missing`); broker, consumer and crossing evidence is unaffected.
+
+**Reading, under "How to read outcomes".**
+
+- Crossing gate: passed. This is a certified Option B pair, which the
+  2026-09-14 run was not.
+- Seven nodes do **not** receive less than five at any total offer where both
+  rungs are valid (1, 2, 4 sites, and both controls): both deliver the offer.
+  No regression candidate.
+- The matched-total-load per-node fall (6 000 → 4 286 at 1 site, 59 944 →
+  42 866 at 10) is the arithmetic the card warns about, not membership cost.
+- Neither arm has a valid top-rung pair. N=5 at 300 000/s is flagged
+  PUBLISHERS LATE with p99 ≤500 ms while its busiest broker was 27% idle (22%
+  lowest second) and its busiest driver 58% idle; N=7 at 240 000/s is flagged
+  with p99 ≤25 ms and a later, heavier rung that passed. emqtt-bench's late
+  counter cannot separate driver scheduling from TCP backpressure, so neither
+  flag is attributed to the brokers. The N=5 latency rise at 10 sites is
+  consistent with approaching a per-node limit near 60 000/s on CCX23, and that
+  is a hypothesis, not a measurement.
+- N=7 at 300 000/s passes with ≥56% idle on every broker: a lower bound, not a
+  capacity.
+- The mean `cluster` hub dispatch grows with load on both arms and is higher at
+  N=7 at the top two rungs (44.9 / 63.9 µs vs 29.2 / 52.5 µs); `publish`
+  stays at 5–8 µs on both. That is an input for #613, not a membership-cost
+  result.
+
+The membership-cost claim stays open. Settling it still needs equal per-node
+useful work, SLO knees with independently adequate endpoints, and repeats.
 
 ## 2026-09-14 path-prove (N=7 only) — not a curve point
 
