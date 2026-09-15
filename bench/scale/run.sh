@@ -218,6 +218,19 @@ for N in "${SIZES[@]}"; do
 		die "invalid shape at size $N; no cloud resources touched"
 	}
 done
+# Lane E's crossing is certified by a forwarding positive control and a ledger
+# that re-derives it from the scrapes, twice: once before any rung is paid for,
+# and again by the extractor (#482). Both carry offline tests against real mqttd
+# scrapes, run here on the laptop — after the shapes, which are cheaper and fail
+# more often, and before anything is provisioned or PREFLIGHT_ONLY calls the run
+# ready. A local interpreter or ledger bug otherwise surfaces as a FAILED control
+# on a billed cluster, or worse, as a rung certified by a broken check.
+for self_test in forward-canary extract-lane-e; do
+	python3 "$SCALE_DIR/$self_test.py" --self-test >"$RUN/self-test-$self_test.log" 2>&1 || {
+		tail -25 "$RUN/self-test-$self_test.log" >&2
+		die "$self_test.py --self-test failed (log: $RUN/self-test-$self_test.log) — fix the local check before paying for a cluster; no cloud resources touched"
+	}
+done
 if [ "${PREFLIGHT_ONLY:-0}" = 1 ]; then
 	say "all requested shapes valid; no cloud calls made"
 	exit 0

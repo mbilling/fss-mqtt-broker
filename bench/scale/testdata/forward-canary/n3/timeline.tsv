@@ -1,0 +1,22 @@
+0.005	subscriber broker0 holds 2 groups
+0.007	subscriber broker1 holds 2 groups
+0.009	subscriber broker2 holds 2 groups
+0.009	publisher broker0 connected
+0.017	publisher broker1 connected
+0.018	publisher broker2 connected
+0.018	subscribed 6 directed pairs
+0.038	pilot delivered on every pair after 1 rounds
+0.059	pilot-end delivered on every pair
+0.094	scraped pre broker0 (26498 bytes)
+0.097	scraped pre broker1 (26501 bytes)
+0.100	scraped pre broker2 (26490 bytes)
+0.240	published 100 per pair
+0.240	burst-end delivered on every pair
+0.242	scraped post broker0 (26629 bytes)
+0.245	scraped post broker1 (26611 bytes)
+0.247	scraped post broker2 (26615 bytes)
+0.842	sent DISCONNECT on 6 connections
+status	complete
+count	100
+nodes	3
+nonce	6aa86be708e59a3e5c

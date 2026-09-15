@@ -50,6 +50,12 @@ attach)
 		mkdir -p "$OBS_DIR/alloy"
 		cp "$OBS_DIR/alloy/config.alloy.idle" "$OBS_DIR/alloy/config.alloy"
 	fi
+	# The TSDB volume is `external` in the compose file so no `down -v` of this
+	# stack can take the history with it, which also means compose will not create
+	# it: a fresh operator machine failed attach on exactly that (2026-09-15, #482).
+	docker volume inspect observe_prom-data >/dev/null 2>&1 ||
+		docker volume create observe_prom-data >/dev/null ||
+		die "could not create the observe_prom-data docker volume"
 	say "observe: starting local Grafana(:3000) + Prometheus(:9090)"
 	(cd "$OBS_DIR" && docker compose up -d --quiet-pull 2>/dev/null || docker compose up -d)
 

@@ -1016,14 +1016,43 @@ about = """
 Walks results/nodes=*/laneE/sites-*/ and prints broker-side crossing
 (mqttd_publish_forwarded_total / mqttd_publish_received_total), hub_dispatch mean
 µs by command, peer in-flight, drops, sessions after drain, and mpstat idle hints.
-Rejects incomplete/unsupported scrapes and detected per-broker counter resets.
-Absent samples mean zero only in validated snapshots declaring the counter.
-Whole-rung totals are not aligned steady throughput or capacity evidence.
-No cloud calls. Used by the #482 Option B card; --self-test runs offline controls.
+Rejects truncated (no '# EOF') or malformed scrapes and per-broker counter resets.
+A declared-but-empty forwarded family is never read as zero: every rung needs a
+crossing certificate — structural (N=1, no peer links) or canary (the size's
+forward-canary ledger re-derived, each broker still at its floors, same MainPID) —
+or it is INVALID. Rates, crossing, hub dispatch and idle come from the rung's
+aligned steady window (window.tsv + metrics-window-*); rungs without one read
+UNALIGNED. `--crossing-gate 0.5` prints GATE lines per size and exits 1 on FAIL.
+No cloud calls. Used by the #482 Option B card; --self-test runs on real captures.
 Takes a run dir or a results/ tree: `extract-lane-e.py bench/scale/.runs/<stamp>/results`.
 """
 requires = ["python3"]
 duration = "~1s"
+
+[[task]]
+id = "scale-forward-canary"
+group = "Benchmark"
+name = "Lane E forwarding positive control (shipped to a driver by run-curve.sh)"
+script = "bench/scale/forward-canary.py"
+# Harness plumbing like lib.sh and cpu.sh: `run` needs a live cluster's private broker
+# addresses and is started by run-curve.sh; `verify`, `--self-test` and `local-proof`
+# each need arguments, so there is nothing to launch bare.
+hidden = true
+about = """
+A healthy prefer-local ladder crosses ~0%, and mqttd omits the forwarded counter until a
+broker's first forward — so a zero is indistinguishable from a missing counter or a
+restarted broker (#482). Before calibration, run-curve.sh pipes this file to a driver
+(`python3 - run`): every ordered broker pair gets a $share group whose only member sits
+on the other broker, K QoS 0 messages each, scraped before and after. `verify` re-derives
+the exact ledger; extract-lane-e.py imports `ledger()` and holds every later snapshot to
+each broker's post-canary floors. `--self-test` is offline, on real captures in
+bench/scale/testdata/forward-canary/. `local-proof --mqttd <bin> --nodes 7` runs, against
+real local brokers, the canary, a zero-crossing rung written in run-curve.sh's layout that
+`extract-lane-e.py --crossing-gate 0.5` must certify, and a SIGKILL restart the extractor
+must refuse; `--capture DIR` keeps that results tree.
+"""
+requires = ["python3"]
+duration = "~9s self-test; ~12s local-proof at 7 nodes"
 
 [[task]]
 id = "scale-bootstrap"

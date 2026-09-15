@@ -450,6 +450,26 @@ LANE_E_MAX_SUB_RATE="${LANE_E_MAX_SUB_RATE:-10000}"
 # LANE_E_CALIBRATE_SECS rather than a whole ladder of wrong answers.
 LANE_E_CALIBRATE="${LANE_E_CALIBRATE:-1}"
 LANE_E_CALIBRATE_SECS="${LANE_E_CALIBRATE_SECS:-20}"
+# THE FORWARDING POSITIVE CONTROL (#482 Option B). An unpinned ladder with a
+# local $share member on every node predicts ~0% crossing under prefer-local, and
+# mqttd exports a labelled counter family only after its first sample — so on a
+# HEALTHY run mqttd_publish_forwarded_total never appears at all. Absent is then
+# indistinguishable from a cluster that cannot forward, a broker that dropped the
+# counter, or a restart that wiped it, and "0% crossing" would be certified by
+# the silence of the thing it measures. So before calibration, once per size, a
+# raw-socket canary (forward-canary.py, run on driver 0) pushes COUNT QoS 0
+# messages over every directed broker pair through a $share group whose only
+# member is remote, verifies the ledger exactly (received, delivered and
+# shared-remote forwards all equal COUNT x (N-1) per broker, no drops, full peer
+# mesh), and leaves every broker holding a non-zero forwarded series. Each rung's
+# snapshots must still carry at least that floor from the same process; the
+# extractor refuses to certify crossing otherwise. A failed control stops the
+# size before anything else is paid for. At N=1 it runs one local pair and
+# certifies nothing about forwarding (there are no peers to forward to).
+# LANE_E_FORWARD_CANARY=0 skips it, and then no N>1 crossing can be certified.
+LANE_E_FORWARD_CANARY="${LANE_E_FORWARD_CANARY:-1}"
+LANE_E_FORWARD_CANARY_COUNT="${LANE_E_FORWARD_CANARY_COUNT:-100}"
+LANE_E_FORWARD_CANARY_TIMEOUT="${LANE_E_FORWARD_CANARY_TIMEOUT:-90}"
 # A rung PASSES only if its p99 stays under this many ms. The point of a tenancy
 # ladder is the site count at which latency leaves the band, not the count at
 # which the broker finally refuses traffic — those are far apart, and only the
@@ -509,13 +529,34 @@ rss_snapshot() { # rss_snapshot <dir> <label>
 	done
 }
 
+snapshot_broker() { # snapshot_broker <dir> <label> <broker-index>
+	rssh "$(broker_pub_ip "$3")" "curl -s -m 10 http://localhost:8080/metrics" \
+		>"$1/metrics-$2-broker$3.prom" || true
+}
 snapshot_metrics() { # snapshot_metrics <dir> <label>
 	local dir="$1" label="$2" i
 	mkdir -p "$dir"
+	for ((i = 0; i < N; i++)); do snapshot_broker "$dir" "$label" "$i"; done
+}
+# For a lifetime snapshot a later scrape is as good as the first, and the
+# extractor refuses a rung whose snapshot is missing: retry an incomplete one.
+snapshot_metrics_complete() { # snapshot_metrics_complete <dir> <label>
+	local dir="$1" label="$2" i try
+	mkdir -p "$dir"
 	for ((i = 0; i < N; i++)); do
-		rssh "$(broker_pub_ip "$i")" "curl -s http://localhost:8080/metrics" \
-			>"$dir/metrics-$label-broker$i.prom" || true
+		for try in 1 2 3; do
+			snapshot_broker "$dir" "$label" "$i"
+			prom_complete "$dir/metrics-$label-broker$i.prom" && break
+			[ "$try" -eq 3 ] || sleep 2
+		done
 	done
+}
+# A scrape is COMPLETE only if mqttd finished writing it: every exposition ends
+# with '# EOF', so a cut connection or a curl timeout is distinguishable from a
+# broker that simply has no such series. Trailing blank lines are the batch
+# stream's framing, not the broker's.
+prom_complete() { # prom_complete <file>
+	[ -s "$1" ] && [ "$(grep -v '^[[:space:]]*$' "$1" | tail -n 1)" = "# EOF" ]
 }
 
 start_cpu_sampling() { # start_cpu_sampling <dir> <secs> — background mpstat on every host
@@ -760,6 +801,13 @@ lane_e_shape() {
 	[ "$LANE_E_SUB_QOS" -le "$LANE_E_QOS" ] ||
 		die "lane E: LANE_E_SUB_QOS=$LANE_E_SUB_QOS exceeds LANE_E_QOS=$LANE_E_QOS — a delivery can never have a higher QoS than its publish, so this arm would measure QoS $LANE_E_QOS while labelling itself QoS $LANE_E_SUB_QOS"
 	[ "${#LANE_E_SITES[@]}" -gt 0 ] || die "LANE_E_SITES is empty — nothing to run"
+	# Refused here, not at the canary: a typo reaching the cluster would either
+	# skip the control silently or fail it after provisioning.
+	case "$LANE_E_FORWARD_CANARY" in 0 | 1) ;; *) die "LANE_E_FORWARD_CANARY must be 0 or 1, got '$LANE_E_FORWARD_CANARY'" ;; esac
+	positive_int LANE_E_FORWARD_CANARY_COUNT "$LANE_E_FORWARD_CANARY_COUNT"
+	positive_int LANE_E_FORWARD_CANARY_TIMEOUT "$LANE_E_FORWARD_CANARY_TIMEOUT"
+	[ "$LANE_E_FORWARD_CANARY" = 0 ] || [ -f "$SCALE_DIR/forward-canary.py" ] ||
+		die "lane E: LANE_E_FORWARD_CANARY=1 but $SCALE_DIR/forward-canary.py is missing — without the control no N>1 crossing can be certified"
 
 	# The per-publisher timer. Whole milliseconds, exactly as lane B: a floored
 	# -I offers a rate other than the label, and the label is what gets published.
@@ -822,6 +870,24 @@ lane_e_shape() {
 			echo "               Gate on mqttd_publish_forwarded_total / mqttd_publish_received_total"
 			echo "               Validate every broker scrape and counter support; missing/reset data is UNKNOWN, not zero."
 			echo "               Do not treat round-robin (N-1)/N as the prediction while prefer-local is on."
+		fi
+		if [ "$LANE_E_FORWARD_CANARY" = 1 ] && [ "$N" -gt 1 ]; then
+			echo "forward canary: ON — before calibration, $LANE_E_FORWARD_CANARY_COUNT QoS 0 msgs over each of $((N * (N - 1))) directed broker pairs"
+			echo "               (timeout ${LANE_E_FORWARD_CANARY_TIMEOUT}s) must forward exactly, or the size stops. Every rung must"
+			echo "               still carry each broker's mqttd_publish_forwarded_total{reason=\"shared-remote\"}"
+			echo "               floor from the same process; otherwise its crossing is INVALID, not 0%."
+		elif [ "$LANE_E_FORWARD_CANARY" = 1 ]; then
+			echo "forward canary: ON (local) — $LANE_E_FORWARD_CANARY_COUNT QoS 0 msgs over one local pair (timeout ${LANE_E_FORWARD_CANARY_TIMEOUT}s);"
+			echo "               N=1 has no peers, so crossing is structural and the control proves delivery only."
+		else
+			echo "forward canary: OFF (LANE_E_FORWARD_CANARY=0) — crossing CANNOT be certified at N>1;"
+			echo "               an absent forwarded series is unknown, not zero."
+		fi
+		# Declared here so a ladder cut short can be told from one that was shorter.
+		if [ "$LANE_E_CONTROL" = 1 ] && [ "${#LANE_E_SITES[@]}" -gt 1 ]; then
+			echo "control rung: ON — the ${LANE_E_SITES[0]}-site rung repeats after the ladder"
+		else
+			echo "control rung: OFF"
 		fi
 		echo
 		if [ "$LANE_E_PIN_SITES" = 1 ]; then
@@ -1658,7 +1724,7 @@ lane_e_rung() { # lane_e_rung <sites> [repeat-index] [is-control]
 			# site 3 is selected among site 3's consumers only.
 			filter="\$share/site$s/site/$s/#"
 			subs[sdi]+="$DOCKER_RUN --name sub-s$s-$j $BENCH_IMG sub -h $hosts -p $port -c $subs_per_c -R $LANE_E_CONNECT_RATE -t '$filter' -q $LANE_E_SUB_QOS $active --payload-hdrs ts --prometheus --restapi $((port_base + portn[sdi])) >/dev/null"$'\n'
-			scrape[sdi]+="printf '\\n@@@ sub-s$s-$j\\n'; curl -s http://localhost:$((port_base + portn[sdi]))/metrics"$'\n'
+			scrape[sdi]+="printf '\\n@@@ sub-s$s-$j\\n'; curl -s -m 10 http://localhost:$((port_base + portn[sdi]))/metrics"$'\n'
 			stop[sdi]+="printf '\\n@@@ sub-s$s-$j\\n'; docker logs sub-s$s-$j 2>&1"$'\n'
 			subdump[sdi]+="printf '\\n@@@ sub-s$s-$j\\n'; docker logs sub-s$s-$j 2>&1"$'\n'
 			names[sdi]+=" sub-s$s-$j"
@@ -1702,6 +1768,65 @@ lane_e_rung() { # lane_e_rung <sites> [repeat-index] [is-control]
 		reset_waited=$((reset_waited + LANE_E_DRAIN_POLL))
 	done
 	snapshot_metrics "$rdir" before
+	# ── the positive control must still be visible before this rung is paid for ──
+	# The canary left every broker holding a forwarded{shared-remote} series, and a
+	# series is never removed while the process lives. A COMPLETE scrape without it
+	# therefore means the broker restarted (or stopped exporting the counter) since
+	# the control, and this rung's crossing — ~0% by prediction — could not be told
+	# apart from a cluster that stopped forwarding. Refuse before any container
+	# starts. "Complete" is the trailing '# EOF' and nothing more: a restarted
+	# broker that has not been published to yet serves a whole exposition with NO
+	# publish families at all, and that is exactly the scrape this guard is for.
+	# An INCOMPLETE scrape proves nothing either way: retry, then let the rung run
+	# and the extractor mark it INVALID for its missing snapshot. A complete scrape
+	# that showed the series gone is not undone by a later incomplete one: it is
+	# kept as the evidence and the rung is refused.
+	# The series alone misses a restarted broker that has forwarded again since,
+	# so the MainPID the control recorded is compared as well.
+	if [ "$N" -gt 1 ] && [ "$LANE_E_FORWARD_CANARY" = 1 ]; then
+		local guard_try ok before_prom i lost_copy guard_pid canary_pid
+		for ((i = 0; i < N; i++)); do
+			before_prom="$rdir/metrics-before-broker$i.prom"
+			lost_copy="$rdir/.guard-lost-broker$i.prom"
+			rm -f "$lost_copy"
+			ok=no
+			for guard_try in 1 2 3 4; do
+				if prom_complete "$before_prom"; then
+					if grep -qF 'mqttd_publish_forwarded_total{reason="shared-remote"}' "$before_prom"; then
+						ok=yes
+						break
+					fi
+					ok=lost
+					cp "$before_prom" "$lost_copy"
+				else
+					ok=incomplete
+				fi
+				[ "$guard_try" -le 3 ] || break
+				sleep 2
+				snapshot_broker "$rdir" before "$i"
+			done
+			if [ "$ok" = incomplete ] && [ -f "$lost_copy" ]; then
+				mv -f "$lost_copy" "$before_prom"
+				ok=lost
+			fi
+			rm -f "$lost_copy"
+			case "$ok" in
+			lost)
+				die "lane E: broker$i no longer exposes the forwarding positive control (no mqttd_publish_forwarded_total{reason=\"shared-remote\"} in a complete scrape before rung $sites, after 3 retries) — it restarted or lost the counter since forward-canary; evidence in $before_prom. No container was started for this rung (#482)"
+				;;
+			incomplete)
+				warn "lane E: broker$i's before-scrape for rung $sites is still incomplete after 3 retries — the rung runs, and the extractor will mark it INVALID"
+				;;
+			esac
+			canary_pid=$(cat "$OUT/laneE/forward-canary/mainpid-broker$i.txt" 2>/dev/null || true)
+			guard_pid=$(rssh "$(broker_pub_ip "$i")" "systemctl show -p MainPID --value mqttd" 2>/dev/null || true)
+			if [[ ! "$guard_pid" =~ ^[1-9][0-9]*$ ]]; then
+				warn "lane E: could not read broker$i's MainPID before rung $sites — the rung runs, and the extractor checks the window's MainPID against the control"
+			elif [ "$guard_pid" != "$canary_pid" ]; then
+				die "lane E: broker$i's mqttd is MainPID $guard_pid before rung $sites, not $canary_pid, the process that passed forward-canary — it restarted since the control, so its floors no longer hold. No container was started for this rung (#482)"
+			fi
+		done
+	fi
 	pids=()
 	for ((di = 0; di < D; di++)); do driver_batch "$di" "${subs[di]}" & pids+=($!); done
 	for pd in "${pids[@]}"; do wait "$pd" || die "lane E: starting consumer containers failed (rung $sites sites)"; done
@@ -1709,7 +1834,6 @@ lane_e_rung() { # lane_e_rung <sites> [repeat-index] [is-control]
 	pids=()
 	for ((di = 0; di < D; di++)); do driver_batch "$di" "${pubs[di]}" & pids+=($!); done
 	for pd in "${pids[@]}"; do wait "$pd" || die "lane E: starting publisher containers failed (rung $sites sites)"; done
-	start_cpu_sampling "$rdir/cpu" $((LANE_E_SETTLE + LANE_E_SECS))
 	# Baseline the histograms AFTER the ramp, exactly as lane B does: the counters
 	# are cumulative over the container's life, so a single end-of-rung scrape
 	# bakes the connect ramp into the published tail.
@@ -1733,15 +1857,127 @@ lane_e_rung() { # lane_e_rung <sites> [repeat-index] [is-control]
 		sleep "$LANE_E_DRAIN_POLL"
 		settle_waited=$((settle_waited + LANE_E_DRAIN_POLL))
 	done
-	pids=()
-	for ((di = 0; di < D; di++)); do driver_batch "$di" "${scrape[di]}" >"$rdir/.batch/base-$di" 2>/dev/null & pids+=($!); done
-	for pd in "${pids[@]}"; do wait "$pd" || true; done
-	for ((di = 0; di < D; di++)); do batch_split "$rdir" "-base.prom" "$rdir/.batch/base-$di"; done
-	sleep "$LANE_E_SECS"
-	pids=()
-	for ((di = 0; di < D; di++)); do driver_batch "$di" "${scrape[di]}" >"$rdir/.batch/final-$di" 2>/dev/null & pids+=($!); done
-	for pd in "${pids[@]}"; do wait "$pd" || true; done
-	for ((di = 0; di < D; di++)); do batch_split "$rdir" ".prom" "$rdir/.batch/final-$di"; done
+	# ── ONE window for every side of the rung ────────────────────────────────
+	# The consumer histograms were always baselined here, but the broker counters
+	# were read before the consumers even started and after the drain, and the CPU
+	# sampler ran for a fixed SETTLE+SECS from before the settle wait — so a broker
+	# rate, a crossing ratio or an idle figure carried the ramp, the drain and
+	# whatever an extended settle pushed out of the sampler's range. Now brokers
+	# and consumers are scraped by the same parallel batch at both edges, and the
+	# samplers are bounded by the window itself (cpu.sh) instead of a timer.
+	#
+	# Each host stamps its own scrape with its OWN clock, which is the clock its
+	# mpstat stream prints: the extractor keeps a host's CPU samples that fall
+	# between its two scrapes without trusting the operator's clock to agree with
+	# a fleet's. `before`/`after`/`drain` stay: delivery accounting compares
+	# lifetime totals with the drivers' lifetime counts, which is correct for them.
+	# shellcheck disable=SC2016 # expanded by the REMOTE shell, per host
+	local stamp='printf "WINDOW_STAMP_MS %s\n" "$(date +%s%3N)"'
+	# The broker's MainPID rides the same ssh as its window scrape, so the
+	# extractor can prove the process that answered at each edge is the one that
+	# passed forward-canary (#482) — a restart would reset every counter the
+	# crossing floor is read from, and mqttd exports no process start time.
+	# shellcheck disable=SC2016 # expanded by the REMOTE shell, per host
+	local mainpid='printf "WINDOW_MAINPID %s\n" "$(systemctl show -p MainPID --value mqttd)"'
+	lane_e_window_scrape() { # lane_e_window_scrape <open|close>
+		local phase="$1" i q host
+		local -a wp=()
+		for ((i = 0; i < N; i++)); do
+			rssh "$(broker_pub_ip "$i")" "$mainpid; $stamp; curl -s -m 10 http://localhost:8080/metrics; $stamp" \
+				>"$rdir/.batch/$phase-broker$i" 2>"$rdir/.batch/$phase-broker$i.err" &
+			wp+=($!)
+		done
+		for ((q = 0; q < D; q++)); do
+			driver_batch "$q" "$stamp"$'\n'"${scrape[q]}""printf '\\n'; $stamp" \
+				>"$rdir/.batch/$phase-driver$q" 2>"$rdir/.batch/$phase-driver$q.err" &
+			wp+=($!)
+		done
+		# Named pids only: inside with_cpu_sampling a bare `wait` would also wait
+		# for the samplers, which run until this function returns.
+		for q in "${wp[@]}"; do wait "$q" || true; done
+		# A window edge that failed used to vanish into /dev/null and surface only
+		# as an INVALID rung with no cause. Kept per edge and host, after the batch,
+		# so concurrent scrapes cannot interleave their lines.
+		for host in $(for ((i = 0; i < N; i++)); do echo "broker$i"; done; for ((q = 0; q < D; q++)); do echo "driver$q"; done); do
+			[ -s "$rdir/.batch/$phase-$host.err" ] || continue
+			sed "s/^/$phase $host: /" "$rdir/.batch/$phase-$host.err" >>"$rdir/window-ssh.log"
+		done
+	}
+	lane_e_window() {
+		lane_e_window_scrape open
+		sleep "$LANE_E_SECS"
+		lane_e_window_scrape close
+		: >"$rdir/.batch/window-ran"
+	}
+	local cpu_window=aligned i phase cpu_rc=0
+	with_cpu_sampling "$rdir/cpu" lane_e_window || cpu_rc=$?
+	# A signal is the operator stopping the run, not a sampler failing. cpu.sh
+	# turns Ctrl-C into `exit 130` inside its subshell, and bash then carries on in
+	# this one — so without this the interrupted window was re-run as "samplers
+	# failed to start" and the ladder went on to its next rung.
+	if [ "$cpu_rc" -ge 128 ]; then
+		warn "lane E: rung $sites interrupted (exit $cpu_rc) — stopping the run; its containers are left for teardown"
+		exit "$cpu_rc"
+	fi
+	if [ "$cpu_rc" -ne 0 ]; then
+		if [ -f "$rdir/.batch/window-ran" ]; then
+			warn "lane E: a CPU sampler ended inside rung $sites's window ('before the driver' above means before the window closed) — the rung continues with partial CPU coverage, recorded cpu_window=incomplete"
+			cpu_window=incomplete
+		else
+			# The samplers never came up, so the window never ran. Measure it anyway:
+			# the rung's traffic is already flowing and its broker/consumer evidence
+			# does not depend on mpstat.
+			warn "lane E: CPU samplers failed to start for rung $sites — the FAIL above is cpu.sh giving up on its samplers, not the run: the rung continues and measures its window WITHOUT CPU coverage (cpu_window=missing; see $rdir/cpu/*.stderr)"
+			cpu_window=missing
+			lane_e_window
+		fi
+	fi
+	for ((i = 0; i < N; i++)); do
+		grep -v '^WINDOW_' "$rdir/.batch/open-broker$i" >"$rdir/metrics-window-open-broker$i.prom" || true
+		grep -v '^WINDOW_' "$rdir/.batch/close-broker$i" >"$rdir/metrics-window-close-broker$i.prom" || true
+	done
+	for ((di = 0; di < D; di++)); do
+		grep -v '^WINDOW_' "$rdir/.batch/open-driver$di" >"$rdir/.batch/base-$di" || true
+		grep -v '^WINDOW_' "$rdir/.batch/close-driver$di" >"$rdir/.batch/final-$di" || true
+		batch_split "$rdir" "-base.prom" "$rdir/.batch/base-$di"
+		batch_split "$rdir" ".prom" "$rdir/.batch/final-$di"
+	done
+	# One row per host and edge: the first and last stamp its own clock printed
+	# (an edge whose scrape never finished has no end stamp, rather than a start
+	# stamp standing in for one), and for a broker the MainPID that answered.
+	window_row() { # window_row <host> <phase> <batch-file>
+		[ -f "$3" ] || { printf '%s\t%s\t\t\t\n' "$1" "$2"; return 0; }
+		awk -v h="$1" -v p="$2" '
+			/^WINDOW_STAMP_MS / { s[++n] = $2 }
+			/^WINDOW_MAINPID / { pid = $2 }
+			END { printf "%s\t%s\t%s\t%s\t%s\n", h, p, s[1], (n >= 2 ? s[n] : ""), pid }' "$3"
+	}
+	{
+		printf 'host\tphase\tstart_ms\tend_ms\tmain_pid\n'
+		for phase in open close; do
+			for ((i = 0; i < N; i++)); do window_row "broker$i" "$phase" "$rdir/.batch/$phase-broker$i"; done
+			for ((di = 0; di < D; di++)); do window_row "driver$di" "$phase" "$rdir/.batch/$phase-driver$di"; done
+		done
+	} >"$rdir/window.tsv"
+	# Say which edge failed, and where, while the operator is still watching —
+	# the extractor will refuse the rung either way, but not say why at the time.
+	local w_host w_phase w_start w_end w_pid
+	# Read with a non-whitespace delimiter: tab is IFS whitespace, so a row with an
+	# empty end stamp would otherwise shift the MainPID into it.
+	while IFS='|' read -r w_host w_phase w_start w_end w_pid; do
+		case "$w_host" in host) continue ;; esac
+		if [ -z "$w_start" ]; then
+			warn "lane E: rung $sites window $w_phase scrape on $w_host never started (no start stamp) — see $rdir/window-ssh.log"
+		elif [ -z "$w_end" ]; then
+			warn "lane E: rung $sites window $w_phase scrape on $w_host never finished (no end stamp) — see $rdir/window-ssh.log"
+		fi
+		case "$w_host" in
+		broker*)
+			prom_complete "$rdir/metrics-window-$w_phase-$w_host.prom" ||
+				warn "lane E: rung $sites window $w_phase scrape of $w_host is incomplete (no '# EOF') — see $rdir/window-ssh.log"
+			;;
+		esac
+	done < <(tr '\t' '|' <"$rdir/window.tsv")
 	# The steady-window artifacts are complete at this point. Everything below is
 	# the DRAIN (#534), and it deliberately writes to new filenames: `driver_rate`
 	# measures over the last STEADY_WINDOW seconds of a series, so letting the
@@ -1794,7 +2030,7 @@ lane_e_rung() { # lane_e_rung <sites> [repeat-index] [is-control]
 		# Taken AT the deadline, with the consumers still connected: what the
 		# broker holds here is the difference between "pending" and "dropped",
 		# and the driver side cannot see it at all.
-		snapshot_metrics "$rdir" drain
+		snapshot_metrics_complete "$rdir" drain
 		pids=()
 		for ((di = 0; di < D; di++)); do driver_batch "$di" "${subdump[di]}" >"$rdir/.batch/drain-$di" 2>/dev/null & pids+=($!); done
 		for pd in "${pids[@]}"; do wait "$pd" || true; done
@@ -1808,10 +2044,129 @@ lane_e_rung() { # lane_e_rung <sites> [repeat-index] [is-control]
 		for pd in "${pids[@]}"; do wait "$pd" || true; done
 	fi
 	rm -rf "$rdir/.batch"
-	stop_cpu_sampling
-	snapshot_metrics "$rdir" after
-	echo "sites=$sites offered=$((sites * LANE_E_SITE_RATE)) publishers=$((sites * LANE_E_PUBS_PER_SITE)) consumers=$((sites * LANE_E_SUBS_PER_SITE)) per_consumer=$((LANE_E_SITE_RATE / LANE_E_SUBS_PER_SITE)) p99_budget_ms=$LANE_E_P99_BUDGET_MS qos=$LANE_E_QOS sub_qos=$LANE_E_SUB_QOS window_secs=$LANE_E_SECS settle_s=$((LANE_E_SETTLE + settle_waited)) settled=$settled settled_conns=$settled_conns expected_conns=$expect_conns drained=$drained drain_secs=$drain_secs drain_deadline_s=$LANE_E_DRAIN_SECS control=$is_control reset=$reset reset_conns=$reset_conns" >"$rdir/rung.txt"
+	snapshot_metrics_complete "$rdir" after
+	echo "sites=$sites offered=$((sites * LANE_E_SITE_RATE)) publishers=$((sites * LANE_E_PUBS_PER_SITE)) consumers=$((sites * LANE_E_SUBS_PER_SITE)) per_consumer=$((LANE_E_SITE_RATE / LANE_E_SUBS_PER_SITE)) p99_budget_ms=$LANE_E_P99_BUDGET_MS qos=$LANE_E_QOS sub_qos=$LANE_E_SUB_QOS window_secs=$LANE_E_SECS window=aligned cpu_window=$cpu_window settle_s=$((LANE_E_SETTLE + settle_waited)) settled=$settled settled_conns=$settled_conns expected_conns=$expect_conns drained=$drained drain_secs=$drain_secs drain_deadline_s=$LANE_E_DRAIN_SECS control=$is_control reset=$reset reset_conns=$reset_conns" >"$rdir/rung.txt"
 	say "  lane E: $sites site(s) done ($((sites * LANE_E_SITE_RATE)) msg/s offered)"
+}
+# ── the forwarding positive control (#482 Option B) ──────────────────────────
+#
+# See LANE_E_FORWARD_CANARY above for why. The canary is one Python file with no
+# dependencies, shipped over ssh stdin to driver 0 — which already reaches every
+# broker's MQTT and health ports on the private network — so there is nothing to
+# install and the code that ran is the code in this tree. Its stream holds every
+# scrape it took; the verdict is re-derived HERE from those files by the ledger,
+# never taken from the canary's own exit status, and the extractor re-derives it
+# again for every rung.
+lane_e_forward_canary() {
+	local cdir="$OUT/laneE/forward-canary" txt="$OUT/laneE/forward-canary.txt"
+	# Residue scrapes are the harness's, not the canary's: kept beside its
+	# evidence rather than inside it, so the ledger reads only what the canary wrote.
+	local rdir_res="$OUT/laneE/forward-canary-residue"
+	local i rc=0 verify_rc=0 status
+	mkdir -p "$OUT/laneE"
+	if [ "$LANE_E_FORWARD_CANARY" != 1 ]; then
+		echo "status=skipped nodes=$N" >"$txt"
+		warn "lane E: LANE_E_FORWARD_CANARY=0 — no forwarding positive control, so crossing at N=$N cannot be certified (an absent forwarded series is unknown, not zero)"
+		return 0
+	fi
+	rm -rf "$cdir" "$rdir_res"
+	mkdir -p "$cdir" "$rdir_res"
+	local -a brokers=()
+	for ((i = 0; i < N; i++)); do brokers+=(--broker "$(broker_priv_ip "$i"):1883:8080"); done
+	# The residue baseline is the harness's own scrape from BEFORE the canary
+	# connects: the canary's pre scrape already counts its own connections, so
+	# "back to pre" would pass with every canary session still attached.
+	for ((i = 0; i < N; i++)); do
+		rssh "$(broker_pub_ip "$i")" "curl -s -m 10 http://localhost:8080/metrics" \
+			>"$rdir_res/baseline-broker$i.prom" 2>>"$rdir_res/ssh.log" || true
+	done
+	say "[$N nodes] lane E: forwarding positive control — $LANE_E_FORWARD_CANARY_COUNT QoS 0 msgs per directed broker pair, from driver 0"
+	# `timeout` is a backstop for a wedged interpreter, not the budget: the canary
+	# enforces LANE_E_FORWARD_CANARY_TIMEOUT itself and still emits its evidence.
+	rssh "$(driver_pub_ip 0)" \
+		"timeout $((LANE_E_FORWARD_CANARY_TIMEOUT + 60)) python3 - run ${brokers[*]} --count $LANE_E_FORWARD_CANARY_COUNT --timeout $LANE_E_FORWARD_CANARY_TIMEOUT" \
+		<"$SCALE_DIR/forward-canary.py" >"$cdir/run.stdout" 2>>"$cdir/run.stderr" || rc=$?
+	batch_split "$cdir" "" "$cdir/run.stdout"
+	# The process that passed the control is the process every rung must still be
+	# talking to: a restart resets the counters the rungs' floors are read from.
+	# Read with retries and checked: every rung of this size is certified against
+	# these files, so one lost ssh here would void a whole paid ladder.
+	local try pid_bad=""
+	for ((i = 0; i < N; i++)); do
+		for ((try = 1; try <= 4; try++)); do
+			rssh "$(broker_pub_ip "$i")" "systemctl show -p MainPID --value mqttd" \
+				>"$cdir/mainpid-broker$i.txt" 2>>"$cdir/run.stderr" || true
+			[[ "$(<"$cdir/mainpid-broker$i.txt")" =~ ^[1-9][0-9]*$ ]] && break
+			[ "$try" -eq 4 ] || sleep 2
+		done
+		[[ "$(<"$cdir/mainpid-broker$i.txt")" =~ ^[1-9][0-9]*$ ]] || pid_bad+=" broker$i"
+	done
+	python3 "$SCALE_DIR/forward-canary.py" verify "$cdir" --nodes "$N" --count "$LANE_E_FORWARD_CANARY_COUNT" \
+		>"$txt" 2>>"$cdir/run.stderr" || verify_rc=$?
+	status=$(head -n 1 "$txt" 2>/dev/null || true)
+	sed 's/^/    /' "$txt" >&2
+	# Exit 0 is not enough on its own: the verdict must be THIS size's pass — a
+	# mesh pass at N>1, the local pass only at N=1 (the extractor wants the same).
+	local want_status=pass
+	[ "$N" -gt 1 ] || want_status=pass-local
+	case "$status" in
+	"status=$want_status nodes=$N "*) ;;
+	*) [ "$verify_rc" -ne 0 ] || verify_rc=1 ;;
+	esac
+	if [ "$rc" -ne 0 ] || [ "$verify_rc" -ne 0 ]; then
+		die "lane E: forwarding positive control FAILED at N=$N (canary exit $rc, ledger exit $verify_rc) — no calibration or rung was started, since a crossing measured on this cluster could not be told apart from broken forwarding. Evidence: $cdir and $txt (#482)"
+	fi
+	if [ -n "$pid_bad" ]; then
+		echo "mainpid=unreadable$pid_bad" >>"$txt"
+		die "lane E: forwarding positive control passed at N=$N, but could not read the MainPID of:$pid_bad (4 tries) — no calibration or rung was started, since the extractor cannot certify a rung against a control it cannot bind to a process. Evidence: $cdir/run.stderr (#482)"
+	fi
+	# Prove the canary left nothing behind before calibration measures a driver
+	# against this cluster: its clean sessions, $share groups and connections must
+	# be gone from every broker. These gauges refresh on the broker's 1 s sweep, so
+	# the first look waits for one. Bounded, and recorded either way.
+	local budget=60 waited=0 clean gauge residue_t0
+	residue_t0=$(date +%s)
+	local -a base now
+	gauge_values() { # gauge_values <prom> — connections_active sessions subscriptions, '-' when unknown
+		prom_complete "$1" || { echo "- - -"; return 0; }
+		awk 'BEGIN { split("mqttd_connections_active mqttd_sessions mqttd_subscriptions", g, " ") }
+			{ for (k = 1; k <= 3; k++) if ($1 == g[k]) { v[k] = $2; h[k] = 1 } }
+			END { for (k = 1; k <= 3; k++) printf "%s%s", (h[k] ? v[k] : "-"), (k < 3 ? " " : "\n") }' "$1"
+	}
+	while :; do
+		sleep 2
+		waited=$((waited + 2))
+		clean=yes
+		for ((i = 0; i < N; i++)); do
+			rssh "$(broker_pub_ip "$i")" "curl -s -m 10 http://localhost:8080/metrics" \
+				>"$rdir_res/after-broker$i.prom" 2>>"$rdir_res/ssh.log" || true
+			read -r -a base <<<"$(gauge_values "$rdir_res/baseline-broker$i.prom")"
+			read -r -a now <<<"$(gauge_values "$rdir_res/after-broker$i.prom")"
+			for ((gauge = 0; gauge < 3; gauge++)); do
+				# An unreadable gauge is not clean: '-' never compares as settled.
+				awk -v b="${base[gauge]}" -v n="${now[gauge]}" 'BEGIN { exit !(b != "-" && n != "-" && n + 0 <= b + 0) }' || clean=no
+			done
+		done
+		# Each pass also makes N scrapes of up to 10 s: bound the real time too.
+		{ [ "$clean" = no ] && [ "$waited" -lt "$budget" ] && [ $(($(date +%s) - residue_t0)) -lt "$budget" ]; } || break
+	done
+	{
+		echo "residue_status=$([ "$clean" = yes ] && echo clean || echo lingering)"
+		echo "residue_waited_s=$waited"
+		echo "residue_elapsed_s=$(($(date +%s) - residue_t0))"
+		echo "residue_budget_s=$budget"
+		for ((i = 0; i < N; i++)); do
+			read -r -a base <<<"$(gauge_values "$rdir_res/baseline-broker$i.prom")"
+			read -r -a now <<<"$(gauge_values "$rdir_res/after-broker$i.prom")"
+			# after/baseline per gauge
+			echo "residue_broker$i=connections_active:${now[0]}/${base[0]},sessions:${now[1]}/${base[1]},subscriptions:${now[2]}/${base[2]}"
+		done
+	} >>"$txt"
+	if [ "$clean" = yes ]; then
+		say "  lane E: forwarding positive control passed; its residue was gone after ${waited}s"
+	else
+		warn "lane E: forwarding positive control passed, but after ${budget}s a broker still reports more connections/sessions/subscriptions than before the canary (residue_* in $txt, scrapes in $rdir_res) — calibration and the first rung may inherit them"
+	fi
 }
 # ── the calibration probe (#534, acceptance 4) ───────────────────────────────
 #
@@ -1883,6 +2238,10 @@ lane_e_calibrate() {
 # identical hardware carried 210,217 and 148,080 msg/s for the same binary at
 # the same shape — a ~40% spread, wider than most effects this rig is used to
 # detect, and invisible while every rung ran once.
+# The forwarding control goes before all of it: calibration and every rung are
+# paid for only on a cluster proven to forward, and each broker's floor has to
+# predate every snapshot a rung takes.
+lane_e_forward_canary
 lane_e_calibrate
 declare -a e_seen=()
 for e_sites in "${LANE_E_SITES[@]}"; do
