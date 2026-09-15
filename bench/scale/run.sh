@@ -206,9 +206,17 @@ if cores is None:
         cores = match[1] if match else None
 if cores is None or not re.fullmatch(r'[1-9][0-9]*', str(cores)):
     refuse(f'unknown CPU count for {plan}; supply DRIVER_VCPUS explicitly')
+# The synthetic inventory must describe drivers the way the LIVE inventory will,
+# or the shape check proves a different budget than the paid run enforces. The
+# Hetzner module's inventory carries server_type and no vcpus (run-curve.sh looks
+# the budget up); UpCloud's carries vcpus. An explicit DRIVER_VCPUS stays vcpus.
+if cloud == 'hcloud' and os.getenv('DRIVER_VCPUS') is None:
+    driver = {'server_type': plan}
+else:
+    driver = {'vcpus': int(cores)}
 for size in sizes:
     inventory = {'brokers': [{} for _ in range(int(size))],
-                 'drivers': [{'vcpus': int(cores)} for _ in range(int(count))]}
+                 'drivers': [dict(driver) for _ in range(int(count))]}
     pathlib.Path(run, f'shape-inventory-{size}.json').write_text(json.dumps(inventory))
 PY
 for N in "${SIZES[@]}"; do
