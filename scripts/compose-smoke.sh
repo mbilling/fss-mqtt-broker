@@ -494,8 +494,16 @@ else
 fi
 
 echo
-echo "COMPOSE SMOKE OK — with MQTTD_IMAGE=$IMAGE"
-echo "NOT covered: compose.yaml's \${MQTTD_IMAGE:-ghcr.io/mbilling/fss-mqtt-broker:latest}"
-echo "default. The published :latest is v0.9.0, which predates both --hash-password and the"
-echo "--probe early exit, so bootstrap.sh and the healthcheck cannot work against it and this"
-echo "lane deliberately does not try. Issue #263."
+# Each mode names what it proved and points at the lane that covers the other half. The
+# default-image mode never sets IMAGE, and under `set -u` the old single summary line
+# aborted that lane AFTER every assertion had passed — hidden for as long as section 6's
+# port check failed first.
+if [[ "${MQTTD_SMOKE_DEFAULT_IMAGE:-0}" == 1 ]]; then
+  echo "COMPOSE SMOKE OK — with compose.yaml's own default image $DEFAULT_REF (issue #263)"
+  echo "NOT covered here: today's working tree; the override lane (MQTTD_IMAGE, or a build"
+  echo "from this checkout) proves the artifacts against current code."
+else
+  echo "COMPOSE SMOKE OK — with MQTTD_IMAGE=$IMAGE"
+  echo "NOT covered here: compose.yaml's pinned default tag as a reader pulls it; that is the"
+  echo "MQTTD_SMOKE_DEFAULT_IMAGE=1 lane (issue #263)."
+fi
