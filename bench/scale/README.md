@@ -16,8 +16,11 @@ The prerequisites and pricing below describe the default Hetzner platform.
 
 1. **A dedicated Hetzner Cloud project** (e.g. `mqttd-bench`). Dedicated so the
    label-scoped leak sweeper (`teardown.sh --force`) can never touch anything
-   that is not this rig's. The default 10-server limit fits (max 5 brokers + 3
-   drivers).
+   that is not this rig's. A new project's default limits (10 servers) are too
+   small for the scale-out sizes; this rig's project runs at **30 servers / 200
+   vCPUs** (raised 2026-09-15), which `terraform/quota.tf` enforces at plan time
+   (`server_quota`, `vcpu_quota`). The largest shape the rig can express, 10
+   brokers + 12 drivers, is 22 servers / 136 vCPUs on CCX23 + CCX33.
 2. **A Read & Write API token** for that project → `export HCLOUD_TOKEN=...` in
    the shell that runs the rig. Never committed, never a CI secret.
 3. **An SSH keypair.** The default is `~/.ssh/id_ed25519`; for any other key
@@ -175,9 +178,9 @@ checked *per rung* rather than once, because a shape can be valid at 1 site and
 impossible at 8 — and the binding constraint is usually the harness: sites are
 dealt round-robin to drivers at three one-vCPU containers each, so 16 sites
 needs 12 containers on the busiest of 5 drivers and is **refused**. Reaching 16
-needs `DRIVER_COUNT=8`, which `driver_count` permits (it caps at 8, and
+needs `DRIVER_COUNT=8`, which `driver_count` permits (it caps at 12, and
 `quota.tf` refuses any broker/driver combination that would exceed the project's
-vCPU quota part way through an apply). That bound belongs to the load
+server or vCPU quota part way through an apply). That bound belongs to the load
 generators, not the broker, and the shape check prints it rather than letting a
 driver shortfall read as a broker limit.
 

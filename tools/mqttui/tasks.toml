@@ -1144,9 +1144,9 @@ hidden = true
 [[task]]
 id = "scale-upcloud-quota-tests"
 group = "Benchmark"
-name = "Offline UpCloud HCL quota regression tests"
+name = "Offline Hetzner and UpCloud HCL quota regression tests"
 script = "bench/scale/test-upcloud-quota.py"
-about = "Run with python3 and OpenTofu (tofu required; no Terraform fallback). Evaluates the real quota preconditions using only terraform_data in an isolated directory. No cloud provider or credentials."
+about = "Run with python3 and OpenTofu (tofu required; no Terraform fallback). Evaluates both rigs' real quota preconditions (Hetzner servers + vCPUs, UpCloud cores + public IPs) using only terraform_data in an isolated directory. No cloud provider or credentials."
 requires = ["python3", "tofu"]
 hidden = true
 

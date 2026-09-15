@@ -14,15 +14,24 @@ variable "driver_count" {
   default     = 2
 
   validation {
-    condition     = var.driver_count >= 1 && var.driver_count <= 8
-    error_message = "driver_count must be between 1 and 8. Six CCX33s offer ~240k msg/s on lane B (the fan-out knee hunt at 7 nodes); eight is what lane E needs to reach 16 sites, since sites are dealt round-robin and each carries 3 one-vCPU containers, so the busiest driver holds ceil(sites/drivers)*3 <= 8. Eight is also the last count that fits the vCPU quota beside a 5-node cluster (5 x ccx23 + 8 x ccx33 = 84); quota.tf refuses the combinations that do not."
+    condition     = var.driver_count >= 1 && var.driver_count <= 12 && floor(var.driver_count) == var.driver_count
+    error_message = "driver_count must be an integer between 1 and 12. Six CCX33s offer ~240k msg/s on lane B (the fan-out knee hunt at 7 nodes); lane E deals sites round-robin at 3 one-vCPU containers each, so the busiest driver holds ceil(sites/drivers)*3 <= 8 and more drivers are what reach more sites. The cap was 8 while the project allowed 100 vCPUs; since 2026-09-15 it allows 30 servers / 200 vCPUs, and 10 x ccx23 + 12 x ccx33 = 136 vCPU on 22 servers fits both. quota.tf refuses the combinations that do not."
   }
 }
 
 variable "vcpu_quota" {
   description = "vCPUs the Hetzner project is allowed to run at once. Enforced by quota.tf BEFORE any server is created, because a quota rejection part way through an apply leaves the already-created servers running and billing with no teardown reached."
   type        = number
-  default     = 100
+  # Raised from 100 on 2026-09-15, when Hetzner lifted the dedicated project to
+  # 30 servers / 200 vCPUs. Keep this equal to the project's real limit: a value
+  # above it lets an apply fail half way, a value below it refuses runs that fit.
+  default     = 200
+}
+
+variable "server_quota" {
+  description = "Servers the Hetzner project may run at once (brokers + drivers). Enforced by quota.tf before any server is created, for the same reason as vcpu_quota: Hetzner rejects the server that crosses the limit part way through an apply, and the ones already made keep billing. 30 since 2026-09-15."
+  type        = number
+  default     = 30
 }
 
 variable "broker_nic_spread" {
