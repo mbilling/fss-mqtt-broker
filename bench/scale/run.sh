@@ -193,7 +193,7 @@ for pattern in ('terraform.tfvars', '*.auto.tfvars', 'terraform.tfvars.json', '*
 if not sizes or any(s not in ('1','3','5','7','10') for s in sizes):
     refuse('sizes must be 1, 3, 5, 7 or 10')
 count = os.environ['DRIVER_COUNT']
-if not re.fullmatch(r'[1-9][0-9]*', count) or int(count) > (8 if cloud == 'hcloud' else 12):
+if not re.fullmatch(r'[1-9][0-9]*', count) or int(count) > 12:
     refuse('DRIVER_COUNT must be an integer within the provider limit')
 plan = os.environ['DRIVER_TYPE']
 cores = os.getenv('DRIVER_VCPUS')

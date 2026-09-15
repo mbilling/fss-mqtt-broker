@@ -40,9 +40,10 @@ Do **not** set `MQTTD_SHARED_PREFER_LOCAL=0`. That would be a different experime
 
 ## Quota
 
-15 servers / 100 dedicated vCPUs: 7×CCX23 + 5×CCX33 = 7×4 + 5×8 = 68 vCPU at
-the larger size (N=5 is 5×4 + 5×8 = 60). Fits the 100-vCPU cap without shrinking
-the driver fleet. Confirm the dedicated Hetzner project is empty before start;
+30 servers / 200 dedicated vCPUs since 2026-09-15 (the 2026-09-15 pair ran
+under the earlier 15 servers / 100 vCPUs): 7×CCX23 + 5×CCX33 = 7×4 + 5×8 = 68
+vCPU on 12 servers at the larger size (N=5 is 5×4 + 5×8 = 60 on 10). Fits
+without shrinking the driver fleet, with room for the N=10 arm below. Confirm the dedicated Hetzner project is empty before start;
 audit to 0 after.
 
 ## Missing before we run again
@@ -247,9 +248,9 @@ sum as offered or sent.
 
 - Publishing this ladder into `SCALE-CURVE.md`.
 - 12/17-site rungs at D=5 (container budget).
-- N=10 at D=5 (15 servers: 10 brokers + 5 drivers; check the project server
-  cap — default 10 servers is too small; vCPU 10×4+5×8=80 would fit 100 if
-  the server limit is raised).
+- N=10 at D=5 for this card (15 servers, 10×4+5×8 = 80 vCPU). It now fits the
+  30-server / 200-vCPU project, but it is a separate paid arm with its own
+  canary and gate, not part of the completed 7/5 pair.
 - `LANE_E_PIN_SITES=1` (Option A / pinned). Different experiment.
 - Forcing `MQTTD_SHARED_PREFER_LOCAL=0`.
 - Hub sharding / reopening #447 from a path-prove.
