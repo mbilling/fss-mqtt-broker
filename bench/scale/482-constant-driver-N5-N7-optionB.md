@@ -266,8 +266,14 @@ already on the issue; keep this file in sync if the checklist moves.
 Unreleased candidate: `main` 5761b1e built for x86_64 musl (zig cc as the C
 compiler, so not byte-identical to a CI build), sha256
 `0f517c94758cff41e820c72c34f221f0033097acfe10aa4eafda3d2c604e96de`, fetched from
-the `bench-candidate-5761b1e` prerelease. Harness 5a1ad0f, clean tree, both
-arms. Option B env as above, D=5 CCX33, CCX23 brokers, `fsn1`, OBSERVE=1 from the
+the `bench-candidate-5761b1e` prerelease. That prerelease was removed once v1.0.17
+shipped the same source signed; the hash above is what identifies the binary, and
+rebuilding it means `scripts/release/build-repro.sh x86_64-unknown-linux-musl mqttd`
+at 5761b1e with `CC_MUSL` pointing at `zig cc -target x86_64-linux-musl
+-fno-sanitize=all` (zig 0.16.0). Harness 5a1ad0f as recorded in the run's
+`provenance.txt`, clean tree, both arms; that commit landed on `main` as 8424d22
+after a rebase, with an identical `bench/scale` tree
+(`4b571f82ff40607e0d7052156b2fa3f6d5867e9c`). Option B env as above, D=5 CCX33, CCX23 brokers, `fsn1`, OBSERVE=1 from the
 operator laptop. Raw results: `.runs/20260914T233336Z` (untracked).
 
 **Gates.** The forwarding control passed on both arms (`status=pass`: 600
