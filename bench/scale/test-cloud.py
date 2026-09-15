@@ -1006,6 +1006,47 @@ if sys.argv[1:] == ["show", "-p", "MainPID", "--value", "mqttd"]:
                 self.assertIn(expected, result.stderr)
                 self.assertEqual(self.calls(), [])
 
+    def test_lane_e_driver_budget_follows_the_live_hetzner_inventory(self):
+        # The live Hetzner inventory names server_type and omits vcpus. 8 x CCX43 at
+        # 28 sites is 12 containers on the busiest 16-vCPU driver: allowed. The
+        # same shape on 8-vCPU CCX33s, or with no type at all (legacy 8), is not.
+        inventory = self.root / "inventory.json"
+        for server_type, sites, success, refusal in (
+            ("ccx43", "28", True, None),
+            ("ccx33", "28", False, "12 containers on the busiest driver > 8"),
+            (None, "28", False, "12 containers on the busiest driver > 8"),
+            ("cpx32", "4", False, "12 containers on the busiest driver > 4"),
+        ):
+            with self.subTest(server_type=server_type, sites=sites):
+                driver = {"name": "bench-driver", "public_ip": "192.0.2.1", "private_ip": "10.99.1.21"}
+                if server_type:
+                    driver["server_type"] = server_type
+                brokers = [{"name": f"mqttd-{i}", "server_type": "ccx23"} for i in range(10)]
+                drivers = [dict(driver) for _ in range(8 if sites == "28" else 1)]
+                inventory.write_text(json.dumps({"brokers": brokers, "drivers": drivers}))
+                result = self.run_script("run-curve.sh", str(self.root / "budget"), str(inventory),
+                                         LANES="E", SHAPE_ONLY="1", LANE_E_SITES_OVERRIDE=sites,
+                                         LANE_E_SUBS_PER_SITE="10")
+                self.assertEqual(result.returncode == 0, success, result.stderr)
+                if refusal:
+                    self.assertIn(refusal, result.stderr)
+                self.assertEqual(self.calls(), [])
+
+    def test_preflight_shape_inventory_uses_the_live_driver_schema(self):
+        # run.sh's offline shape check must take the same budget path as the paid
+        # run: for Hetzner that is server_type, not a precomputed vcpus.
+        for extra, expected in (({}, {"server_type": "ccx43"}), ({"DRIVER_VCPUS": "12"}, {"vcpus": 12})):
+            with self.subTest(extra=extra):
+                run_dir = self.root / f"preflight-{len(extra)}"
+                result = self.run_script("run.sh", "full", "10", CLOUD="hcloud", PREFLIGHT_ONLY="1",
+                                         RUN_DIR=str(run_dir), DRIVER_COUNT="8", DRIVER_TYPE="ccx43",
+                                         LANES="E", LANE_E_SITES_OVERRIDE="28", LANE_E_SUBS_PER_SITE="10",
+                                         **extra)
+                shape_inventory = json.loads((run_dir / "shape-inventory-10.json").read_text())
+                self.assertEqual(shape_inventory["drivers"][0], expected)
+                self.assertEqual(result.returncode, 0, result.stderr[-2000:])
+                self.assertEqual(self.calls(), [])
+
     def test_lane_e_respects_inventory_cpu_budget(self):
         inventory = self.root / "inventory.json"
         for cores, success in ((None, True), (8, True), (4, False)):

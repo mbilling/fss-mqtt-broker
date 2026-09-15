@@ -476,13 +476,23 @@ LANE_E_FORWARD_CANARY_TIMEOUT="${LANE_E_FORWARD_CANARY_TIMEOUT:-90}"
 # first one is sellable.
 LANE_E_P99_BUDGET_MS="${LANE_E_P99_BUDGET_MS:-1000}"
 # Containers per driver is the HARNESS's ceiling and it is easy to cross by
-# accident, because it grows with the rung: each container is pinned to one vCPU
-# and legacy inventories describe 8-vCPU CCX33s. New provider inventories
-# report vcpus explicitly; use the smallest driver's budget. Crossing it just
+# accident, because it grows with the rung: each container is pinned to one vCPU.
+# The budget is the smallest driver's vCPUs: `vcpus` when the inventory reports it
+# (UpCloud, and run.sh's synthetic shape inventories when DRIVER_VCPUS is given),
+# otherwise the Hetzner `server_type` looked up below, and only then the legacy
+# 8-vCPU CCX33 assumption. The Hetzner inventory reports server_type and not
+# vcpus, and before the lookup existed a live 8 x CCX43 run (16 vCPU) was held to
+# 8 containers per driver while run.sh's preflight, which wrote vcpus, allowed 16:
+# the shape passed offline and was refused on the paid cluster (#482, 2026-09-15).
+# run.sh now writes server_type too, so preflight and the live run take this same
+# path. Keep the table in step with terraform/quota.tf. Crossing the budget just
 # quietly stops offering the labelled rate, which is the single most expensive
 # failure mode this rig has (every wrong answer in the 2026-08 campaign was the
 # harness). Refused in the shape check, where it costs nothing.
-LANE_E_MAX_CONTAINERS_PER_DRIVER="${LANE_E_MAX_CONTAINERS_PER_DRIVER:-$(inv '[.drivers[] | (.vcpus // 8)] | min')}"
+LANE_E_MAX_CONTAINERS_PER_DRIVER="${LANE_E_MAX_CONTAINERS_PER_DRIVER:-$(inv '
+	{"ccx13": 2, "ccx23": 4, "ccx33": 8, "ccx43": 16, "ccx53": 32,
+	 "cpx32": 4, "cpx42": 8, "cpx41": 8, "cpx51": 16} as $hcloud_vcpus
+	| [.drivers[] | (.vcpus // $hcloud_vcpus[.server_type // ""] // 8)] | min')}"
 # SITE AFFINITY. Off by default: every container spans every broker
 # (rotated_hosts). That is the Option B / unpinned posture. Cluster shared-sub
 # selection is prefer-local (default on since #511), not global round-robin:
