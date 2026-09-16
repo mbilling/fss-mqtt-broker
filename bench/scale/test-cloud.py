@@ -1034,7 +1034,7 @@ if "docker stats" in cmd:
 if "curl -s http://localhost:94" in cmd or "@@@" in cmd:
     # subscriber scrape batch: one chunk per named container
     import re
-    for name in re.findall(r"@@@ (\\S+)", cmd):
+    for name in re.findall(r"@@@ ([A-Za-z0-9_.-]+)", cmd):
         print("\\n@@@ %s" % name)
         print("recv 1000")
         print("connect_succ 600")
@@ -1043,7 +1043,7 @@ if "curl -s http://localhost:94" in cmd or "@@@" in cmd:
     sys.exit(0)
 if "docker logs" in cmd:
     import re
-    for name in re.findall(r"@@@ (\\S+)", cmd):
+    for name in re.findall(r"@@@ ([A-Za-z0-9_.-]+)", cmd):
         print("\\n@@@ %s" % name)
         print("pub total=100000 rate=15000/sec" if name.startswith("pub") else "recv total=100000 rate=15000/sec")
     sys.exit(0)
@@ -1147,6 +1147,76 @@ sys.exit(1 if "command -v docker" in cmd else 0)
         self.assertIn("no docker", result.stderr)
         self.assertNotIn("compare-broker", " ".join(str(c) for c in self.calls()),
                          "it must refuse before starting any broker")
+
+    def test_compare_keeps_a_window_whose_cpu_stream_ended_early(self):
+        # with_cpu_sampling reports failure when a stream ends before the wrapped
+        # command — which happens routinely a moment after a window closes. Taking
+        # that as "measure the window again" overwrote the rung's scrapes while
+        # the CPU files still described the first window, so the two halves of a
+        # rung described different minutes (2026-09-16). A window that ran is kept
+        # and flagged; only a window that never ran is measured again.
+        fake = self.bin_dir
+        (fake / "ssh").write_text('''#!/usr/bin/env python3
+import json, os, re, sys, time
+args = sys.argv[1:]
+i = next(k for k, a in enumerate(args) if a.startswith("root@"))
+host, cmd = args[i][5:], " ".join(args[i + 1:])
+if cmd == "bash -s":
+    cmd = sys.stdin.read()
+with open(os.environ["CALL_LOG"], "a") as f:
+    f.write(json.dumps({"t": time.time_ns(), "host": host, "cmd": cmd}) + "\\n")
+if "mpstat" in cmd:
+    # three samples, then gone: the stream ends before the window does
+    print("CPU_STREAM_START_UTC 2026-09-16T00:00:00Z", flush=True)
+    for _ in range(3):
+        print("00:00:01  all  1 0 1 0 0 0 0 0 0 98", flush=True)
+        time.sleep(0.05)
+    sys.exit(0)
+if "/dev/tcp/" in cmd or "docker" in cmd or "systemctl" in cmd:
+    if "docker stats" in cmd:
+        print("compare-broker 512MiB / 16GiB 42.00%")
+    if "docker logs" in cmd:
+        for name in re.findall(r"@@@ ([A-Za-z0-9_.-]+)", cmd):
+            print("\\n@@@ %s" % name)
+            print("pub total=100000 rate=15000/sec" if name.startswith("pub") else "recv total=100000 rate=15000/sec")
+    sys.exit(0)
+if "@@@" in cmd:
+    for name in re.findall(r"@@@ ([A-Za-z0-9_.-]+)", cmd):
+        print("\\n@@@ %s" % name)
+        print("recv 1000")
+        print("connect_succ 600")
+        print('e2e_latency_bucket{le="5"} 1000')
+        print('e2e_latency_bucket{le="+Inf"} 1000')
+    sys.exit(0)
+sys.exit(0)
+''')
+        (fake / "scp").write_text("#!/usr/bin/env python3\nimport sys\nsys.exit(0)\n")
+        (fake / "sleep").write_text("#!/usr/bin/env python3\nimport sys\n")
+        for t in ("ssh", "scp", "sleep"):
+            (fake / t).chmod(0o755)
+        inventory = self.root / "early-inv.json"
+        inventory.write_text(json.dumps({
+            "brokers": [{"public_ip": "broker-0", "private_ip": "10.99.1.11", "server_type": "ccx23"}],
+            "drivers": [{"public_ip": "driver-1", "private_ip": "10.99.1.21", "server_type": "ccx43"}],
+        }))
+        out = self.root / "early"
+        result = subprocess.run(
+            ["bash", str(self.rig / "compare-brokers.sh"), str(out), str(inventory)],
+            env=self.env | {"RUN": str(out), "COMPARE_BROKERS": "mqttd", "COMPARE_RATES": "30000",
+                            "COMPARE_CONTROL": "0", "COMPARE_SECS": "1", "COMPARE_SETTLE": "1",
+                            "COMPARE_DRAIN_SECS": "5", "COMPARE_DRAIN_POLL": "1", "COMPARE_FLAT_POLLS": "1"},
+            capture_output=True, text=True, timeout=180)
+        self.assertEqual(result.returncode, 0, result.stderr[-2000:])
+        rung = (out / "results/compare/1-mqttd/rung-30000/rung.txt").read_text()
+        self.assertIn("cpu_window=incomplete", rung)
+        self.assertIn("the window stands", result.stderr)
+        self.assertNotIn("never started", result.stderr)
+        # The window ran ONCE: exactly one baseline and one closing scrape batch.
+        # A re-measure would double both.
+        batches = [c for c in self.calls() if "sub-0-base" not in str(c) and "curl -s http://localhost:94" in c.get("cmd", "")]
+        base_like = [c for c in batches if "@@@ sub-" in c["cmd"]]
+        self.assertGreaterEqual(len(base_like), 2)
+        self.assertEqual((out / "results/compare/1-mqttd/rung-30000/sub-0.prom").exists(), True)
 
     def test_compare_refuses_a_ladder_that_outruns_the_drivers(self):
         inventory = self.root / "inventory.json"

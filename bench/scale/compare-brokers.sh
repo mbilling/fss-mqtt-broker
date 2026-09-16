@@ -311,14 +311,27 @@ rung() { # rung <broker> <arm-dir> <offered>
 		for ((di = 0; di < D; di++)); do driver_batch "$di" "${scrape[di]}" >"$rdir/.batch/final-$di" 2>/dev/null & pids+=($!); done
 		for p in "${pids[@]}"; do wait "$p" || true; done
 		for ((di = 0; di < D; di++)); do batch_split "$rdir" ".prom" "$rdir/.batch/final-$di"; done
+		: >"$rdir/.batch/window-ran"
 	}
+	# with_cpu_sampling reports a non-zero status when a sampler stream ended
+	# before the wrapped command did — which happens when the streams end a moment
+	# early, having covered the whole window. Re-running the window on that signal
+	# alone is worse than useless: the second window overwrites the rung's scrapes
+	# while the CPU files still describe the first, so throughput and CPU would
+	# describe different minutes. The marker says whether the window actually ran;
+	# only its absence justifies measuring again (lane E does the same).
 	local cpu_window=aligned
 	if ! with_cpu_sampling "$rdir/cpu" window; then
 		local rc=$?
 		[ "$rc" -lt 128 ] || exit "$rc"
-		cpu_window=missing
-		warn "compare: CPU samplers failed for $broker at $rate msg/s — the rung still measures its window"
-		window
+		if [ -f "$rdir/.batch/window-ran" ]; then
+			cpu_window=incomplete
+			warn "compare: a CPU stream ended early for $broker at $rate msg/s — the window stands, its CPU coverage may be partial"
+		else
+			cpu_window=missing
+			warn "compare: CPU samplers never started for $broker at $rate msg/s — measuring the window without CPU coverage"
+			window
+		fi
 	fi
 	rssh "$BROKER_IP" "docker stats --no-stream --format '{{.Name}} {{.MemUsage}} {{.CPUPerc}}' compare-broker" >"$rdir/mem-broker.txt" 2>/dev/null || true
 
