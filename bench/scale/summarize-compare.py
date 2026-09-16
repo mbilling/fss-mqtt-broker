@@ -428,7 +428,7 @@ def host_line(arms: list[dict]) -> str:
         bits = [first]
         if model:
             bits.append(model.group(1).strip())
-        if m:
+        if m and m.group(0) not in first:
             bits.append(f"server_type={m.group(1)}")
         return " — ".join(bits)
     return "UNRECORDED (no host.txt in any arm)"

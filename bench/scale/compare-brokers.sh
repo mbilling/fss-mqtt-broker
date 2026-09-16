@@ -76,7 +76,10 @@ COMPARE_PAYLOAD="${COMPARE_PAYLOAD:-200}"
 COMPARE_QOS="${COMPARE_QOS:-0}"
 COMPARE_SECS="${COMPARE_SECS:-60}"
 COMPARE_SETTLE="${COMPARE_SETTLE:-20}"
-COMPARE_SETTLE_BUDGET="${COMPARE_SETTLE_BUDGET:-180}"
+# 180 s was tight at 2400 connections in the 2026-09-16 rehearsal — one rung
+# went UNSETTLED with the host still accepting. Budget is a ceiling, not a
+# wait: the gate proceeds the moment the connections are up.
+COMPARE_SETTLE_BUDGET="${COMPARE_SETTLE_BUDGET:-300}"
 COMPARE_DRAIN_SECS="${COMPARE_DRAIN_SECS:-60}"
 COMPARE_DRAIN_POLL="${COMPARE_DRAIN_POLL:-5}"
 COMPARE_FLAT_POLLS="${COMPARE_FLAT_POLLS:-3}"
@@ -260,7 +263,12 @@ rung() { # rung <broker> <arm-dir> <offered>
 		subs[di]+="$DOCKER_RUN --name sub-$c $BENCH_IMG sub -h $BROKER_PRIV -p 1883 -c $COMPARE_PUBS_PER_CONTAINER -R $COMPARE_CONNECT_RATE -t 'bench/%i' -n $seq_base -q $COMPARE_QOS --payload-hdrs ts --prometheus --restapi $((9400 + c / D)) >/dev/null"$'\n'
 		pubs[di]+="$DOCKER_RUN --name pub-$c $BENCH_IMG pub -h $BROKER_PRIV -p 1883 -c $COMPARE_PUBS_PER_CONTAINER -R $COMPARE_CONNECT_RATE -t 'bench/%i' -n $seq_base -q $COMPARE_QOS -s $COMPARE_PAYLOAD -I $PUB_INTERVAL_MS --payload-hdrs ts >/dev/null"$'\n'
 		scrape[di]+="printf '\\n@@@ sub-$c\\n'; curl -s http://localhost:$((9400 + c / D))/metrics"$'\n'
+		# BOTH sides at window close. The subscriber log is where the steady-window
+		# receive rate comes from; taking only the post-drain dump (below) leaves
+		# the summarizer with totals but no rate, and every rung reads 0 recv/s
+		# (2026-09-16 rehearsal).
 		stop[di]+="printf '\\n@@@ pub-$c\\n'; docker logs pub-$c 2>&1"$'\n'
+		stop[di]+="printf '\\n@@@ sub-$c\\n'; docker logs sub-$c 2>&1"$'\n'
 		subdump[di]+="printf '\\n@@@ sub-$c\\n'; docker logs sub-$c 2>&1"$'\n'
 		subnames[di]+=" sub-$c"
 		pubnames[di]+=" pub-$c"

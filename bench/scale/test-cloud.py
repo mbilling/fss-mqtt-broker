@@ -1101,6 +1101,11 @@ with open(os.environ["CALL_LOG"], "a") as f:
         rung = (out / "results/compare/1-mqttd/rung-30000/rung.txt").read_text()
         self.assertIn("broker=mqttd offered=30000", rung)
         self.assertIn("drained=yes", rung)
+        # Both sides' logs at window close, or the summarizer has totals and no
+        # steady-window rate: every rung then reads 0 recv/s (2026-09-16).
+        rdir = out / "results/compare/1-mqttd/rung-30000"
+        for name in ("pub-0.log", "sub-0.log", "sub-0.drain", "sub-0-base.prom", "sub-0.prom"):
+            self.assertTrue((rdir / name).exists(), f"{name} missing from the rung")
         broker_txt = (out / "results/compare/3-mqttd-control/broker.txt").read_text()
         self.assertIn("control=yes", broker_txt)
         self.assertIn("image=ghcr.io/mbilling/fss-mqtt-broker@sha256:", broker_txt)
