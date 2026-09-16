@@ -1198,6 +1198,66 @@ sys.exit(1 if "command -v docker" in cmd else 0)
         self.assertNotIn("compare-broker", " ".join(str(c) for c in self.calls()),
                          "it must refuse before starting any broker")
 
+    def test_a_rung_sweeps_bench_containers_the_last_one_left_behind(self):
+        # A rung with fewer containers than the last leaves the surplus RUNNING,
+        # and a publisher that outlives its rung keeps publishing into the next
+        # one's window — offered load that rung never counts. On 2026-09-16 the
+        # leftovers from emqx's 240k rung hit hivemq's 30k rung; pub-0 and pub-1
+        # collided by name and killed the run, which was the lucky half. pub-2..15
+        # would have published into hivemq's numbers in silence.
+        inventory = self.root / "sweep-inv.json"
+        inventory.write_text(json.dumps({
+            "brokers": [{"public_ip": "broker-0", "private_ip": "10.99.1.11", "server_type": "ccx23"}],
+            "drivers": [{"public_ip": "driver-1", "private_ip": "10.99.1.21", "server_type": "ccx43"}],
+        }))
+        (self.bin_dir / "ssh").write_text('''#!/usr/bin/env python3
+import json, os, pathlib, sys
+args = sys.argv[1:]
+i = next(k for k, a in enumerate(args) if a.startswith("root@"))
+cmd = " ".join(args[i + 1:])
+if cmd == "bash -s":
+    cmd = sys.stdin.read()
+with open(os.environ["CALL_LOG"], "a") as f:
+    f.write(json.dumps({"cmd": cmd}) + "\\n")
+if "ip_local_reserved_ports" in cmd:
+    print("9400-9499")
+    sys.exit(0)
+# A driver that is still holding two containers from the rung before.
+state = pathlib.Path(os.environ["LEFTOVERS"])
+if "docker ps -a" in cmd:
+    names = state.read_text().split() if state.exists() else []
+    if "grep -cE" in cmd:
+        print(len(names))
+    else:
+        if "xargs -r docker rm -f" in cmd:
+            state.write_text("")   # the sweep removes them
+        for n in names:
+            print(n)
+    sys.exit(0)
+sys.exit(0)
+''')
+        (self.bin_dir / "ssh").chmod(0o755)
+        (self.bin_dir / "scp").write_text("#!/usr/bin/env python3\nimport sys\nsys.exit(0)\n")
+        (self.bin_dir / "scp").chmod(0o755)
+        (self.bin_dir / "sleep").write_text("#!/usr/bin/env python3\nimport sys\n")
+        (self.bin_dir / "sleep").chmod(0o755)
+        leftovers = self.root / "leftovers"
+        leftovers.write_text("pub-7 sub-7\n")
+        subprocess.run(
+            ["bash", str(self.rig / "compare-brokers.sh"), str(self.root / "cmp-sweep"), str(inventory)],
+            env=self.env | {"RUN": str(self.root / "cmp-sweep"), "COMPARE_BROKERS": "mqttd",
+                            "COMPARE_RATES": "30000", "COMPARE_CONTROL": "0", "COMPARE_SECS": "1",
+                            "COMPARE_SETTLE": "1", "COMPARE_DRAIN_SECS": "2", "COMPARE_DRAIN_POLL": "1",
+                            "COMPARE_FLAT_POLLS": "1", "LEFTOVERS": str(leftovers)},
+            capture_output=True, text=True, timeout=120)
+        calls = " ".join(str(c) for c in self.calls())
+        self.assertIn("xargs -r docker rm -f", calls, "the rung never swept the drivers")
+        # The sweep must happen BEFORE this rung's own containers are started.
+        order = [c["cmd"] for c in self.calls() if "cmd" in c]
+        swept = next(i for i, c in enumerate(order) if "xargs -r docker rm -f" in c)
+        started = next((i for i, c in enumerate(order) if "--name sub-0" in c), len(order))
+        self.assertLess(swept, started, "containers were started before the drivers were swept")
+
     def test_a_driver_that_does_not_reserve_the_metrics_ports_is_refused(self):
         # The drivers' ephemeral range covers the ports the bench containers bind
         # their metrics listeners on, so one of a driver's own outbound

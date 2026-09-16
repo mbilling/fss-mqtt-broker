@@ -274,10 +274,31 @@ reboot_broker_host() {
 }
 
 # ── one rung ─────────────────────────────────────────────────────────────────
+# Every bench container on every driver, gone. Not "the ones this rung will
+# name": a rung with FEWER containers than the last leaves the surplus running,
+# and a publisher that outlives its rung goes on publishing into the next one's
+# window — offered load the rung cannot see and does not report. The name
+# collision that exposed this (emqx 240k -> hivemq 30k, 2026-09-16) was the
+# lucky half of the bug; pub-2..15 would have run on in silence.
+sweep_bench_containers() {
+	local di pids=() p left
+	for ((di = 0; di < D; di++)); do
+		driver_batch "$di" "docker ps -a --format '{{.Names}}' | grep -E '^(pub|sub)-[0-9]+\$' | xargs -r docker rm -f >/dev/null 2>&1; true" >/dev/null 2>&1 &
+		pids+=($!)
+	done
+	for p in "${pids[@]}"; do wait "$p" || true; done
+	for ((di = 0; di < D; di++)); do
+		left=$(driver_batch "$di" "docker ps -a --format '{{.Names}}' | grep -cE '^(pub|sub)-[0-9]+\$' || true" 2>/dev/null | tr -cd '0-9')
+		[ "${left:-0}" -eq 0 ] ||
+			die "driver $di still has $left bench container(s) after a sweep — refusing to measure a rung whose load it cannot account for"
+	done
+}
+
 rung() { # rung <broker> <arm-dir> <offered>
 	local broker="$1" adir="$2" rate="$3"
 	local rdir="$adir/rung-$rate" containers=$((rate / PER_CONTAINER_RATE))
 	mkdir -p "$rdir/.batch" "$rdir/cpu"
+	sweep_bench_containers
 	local -a subs pubs scrape stop subnames pubnames subdump
 	local di c seq_base
 	for ((di = 0; di < D; di++)); do subs[di]="set -e"$'\n'; pubs[di]="set -e"$'\n'; scrape[di]=""; stop[di]=""; subnames[di]=""; pubnames[di]=""; subdump[di]=""; done
