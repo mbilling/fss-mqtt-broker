@@ -1142,6 +1142,36 @@ requires = ["python3", "jq"]
 hidden = true
 
 [[task]]
+id = "scale-compare-brokers"
+group = "Benchmark"
+name = "Single-node broker comparison on cloud hardware (mqttd, Mosquitto, EMQX, HiveMQ)"
+script = "bench/scale/compare-brokers.sh"
+about = """
+ADR 0048 T4's publishable comparison: one broker host and one driver fleet,
+every broker run on it in turn from pinned digests, laddered to its knee.
+Measurement is driver-side only (emqtt-bench counters and its own latency
+histogram) so no broker gets home-field advantage; the host reboots between
+arms and the first broker repeats as a control. Driven by `run.sh compare`,
+which provisions the fleet; COMPARE_SHAPE_ONLY=1 checks the ladder offline.
+"""
+requires = ["jq", "ssh"]
+hidden = true
+
+[[task]]
+id = "scale-summarize-compare"
+group = "Benchmark"
+name = "Summarize a cross-broker comparison into a knee table"
+script = "bench/scale/summarize-compare.py"
+about = """
+Reads a compare-brokers.sh results tree and prints the knee per broker (highest
+offered rate passing offer/delivery/p99/settled/drained), the per-rung detail,
+and the control verdict that says whether the sequence measured brokers or
+drift. Run with python3: `summarize-compare.py .runs/<stamp>/results`.
+"""
+requires = ["python3"]
+duration = "~1s"
+
+[[task]]
 id = "scale-upcloud-quota-tests"
 group = "Benchmark"
 name = "Offline Hetzner and UpCloud HCL quota regression tests"

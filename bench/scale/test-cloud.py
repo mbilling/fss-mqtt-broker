@@ -22,12 +22,13 @@ class CloudTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.rig = self.root / "bench/scale"
         self.rig.mkdir(parents=True)
-        for name in ("lib.sh", "cloud.sh", "run.sh", "teardown.sh", "run-curve.sh", "cpu.sh", "test-upcloud-quota.py", "482-smoke.sh", "482-constant-driver-N5-N7-optionB.env", "extract-lane-e.py", "forward-canary.py"):
+        for name in ("lib.sh", "cloud.sh", "run.sh", "teardown.sh", "run-curve.sh", "cpu.sh", "test-upcloud-quota.py", "482-smoke.sh", "482-constant-driver-N5-N7-optionB.env", "extract-lane-e.py", "compare-brokers.sh", "forward-canary.py"):
             shutil.copy2(SCALE / name, self.rig / name)
         # The real mqttd captures the ledgers and the extractor are tested against.
         shutil.copytree(SCALE / "testdata", self.rig / "testdata")
         for name in ("terraform", "terraform-upcloud"):
             (self.rig / name).mkdir()
+        shutil.copytree(SCALE / "compare", self.rig / "compare")
         bin_dir = self.root / "bin"
         bin_dir.mkdir()
         self.bin_dir = bin_dir
@@ -974,6 +975,138 @@ if sys.argv[1:] == ["show", "-p", "MainPID", "--value", "mqttd"]:
                         self.assertEqual(self.calls(), [])
                 finally:
                     (self.rig / name).write_text(original)
+
+    def test_compare_runs_every_broker_on_one_host_in_order(self):
+        # The comparison's value is that the hardware never changes, so the
+        # ordering is the thing to pin: each broker starts, ladders, stops, and
+        # the host reboots before the next one; the first broker repeats last as
+        # the control that says whether the sequence drifted.
+        fake = self.bin_dir
+        (fake / "ssh").write_text('''#!/usr/bin/env python3
+import json, os, sys, time
+args = sys.argv[1:]
+i = next(k for k, a in enumerate(args) if a.startswith("root@"))
+host, cmd = args[i][5:], " ".join(args[i + 1:])
+if cmd == "bash -s":
+    cmd = sys.stdin.read()
+with open(os.environ["CALL_LOG"], "a") as f:
+    f.write(json.dumps({"t": time.time_ns(), "host": host, "cmd": cmd}) + "\\n")
+state = os.environ["FAKE_STATE"]
+if "random/boot_id" in cmd:
+    boot = os.path.join(state, "boot")
+    print(open(boot).read().strip() if os.path.exists(boot) else "boot-0")
+    sys.exit(0)
+if cmd.strip() == "reboot":
+    boot = os.path.join(state, "boot")
+    n = int(open(boot).read().strip().split("-")[1]) + 1 if os.path.exists(boot) else 1
+    open(boot, "w").write("boot-%d" % n)
+    sys.exit(0)
+if "/dev/tcp/" in cmd:
+    sys.exit(0)
+if "docker stats" in cmd:
+    print("compare-broker 512MiB / 16GiB 42.00%")
+    sys.exit(0)
+if "curl -s http://localhost:94" in cmd or "@@@" in cmd:
+    # subscriber scrape batch: one chunk per named container
+    import re
+    for name in re.findall(r"@@@ (\\S+)", cmd):
+        print("\\n@@@ %s" % name)
+        print("recv 1000")
+        print("connect_succ 600")
+        print('e2e_latency_bucket{le="5"} 1000')
+        print('e2e_latency_bucket{le="+Inf"} 1000')
+    sys.exit(0)
+if "docker logs" in cmd:
+    import re
+    for name in re.findall(r"@@@ (\\S+)", cmd):
+        print("\\n@@@ %s" % name)
+        print("pub total=100000 rate=15000/sec" if name.startswith("pub") else "recv total=100000 rate=15000/sec")
+    sys.exit(0)
+if "mpstat" in cmd:
+    print("CPU_STREAM_START_UTC 2026-09-16T00:00:00Z", flush=True)
+    while True:
+        print("00:00:01  all  1 0 1 0 0 0 0 0 0 98", flush=True)
+        time.sleep(0.05)
+sys.exit(0)
+''')
+        (fake / "scp").write_text("#!/usr/bin/env python3\nimport sys\nsys.exit(0)\n")
+        for t in ("ssh", "scp"):
+            (fake / t).chmod(0o755)
+        (fake / "sleep").write_text('''#!/usr/bin/env python3
+import json, os, sys, time
+with open(os.environ["CALL_LOG"], "a") as f:
+    f.write(json.dumps({"t": time.time_ns(), "sleep": sys.argv[1]}) + "\\n")
+''')
+        (fake / "sleep").chmod(0o755)
+        (self.root / "cstate").mkdir()
+        inventory = self.root / "inventory.json"
+        inventory.write_text(json.dumps({
+            "brokers": [{"name": "mqttd-1", "public_ip": "broker-0", "private_ip": "10.99.1.11", "server_type": "ccx23"}],
+            "drivers": [{"name": f"bench-driver-{i}", "public_ip": f"driver-{i}", "private_ip": f"10.99.1.2{i}",
+                         "server_type": "ccx43"} for i in range(1, 3)],
+        }))
+        out = self.root / "cmp"
+        result = subprocess.run(
+            ["bash", str(self.rig / "compare-brokers.sh"), str(out), str(inventory)],
+            env=self.env | {"FAKE_STATE": str(self.root / "cstate"), "RUN": str(out),
+                            "COMPARE_BROKERS": "mqttd mosquitto", "COMPARE_RATES": "30000",
+                            "COMPARE_SECS": "1", "COMPARE_SETTLE": "1", "COMPARE_DRAIN_SECS": "5",
+                            "COMPARE_DRAIN_POLL": "1", "COMPARE_FLAT_POLLS": "1"},
+            capture_output=True, text=True, timeout=180)
+        self.assertEqual(result.returncode, 0, result.stderr[-3000:])
+        events = sorted((json.loads(l) for l in self.log.read_text().splitlines()), key=lambda e: e["t"])
+        cmd = lambda e: e.get("cmd", "")  # noqa: E731
+        starts = [e["t"] for e in events if "--name compare-broker" in cmd(e)]
+        images = [cmd(e) for e in events if "--name compare-broker" in cmd(e)]
+        reboots = [e["t"] for e in events if cmd(e).strip() == "reboot"]
+        subs = [e["t"] for e in events if " sub -h " in cmd(e)]
+        pubs = [e["t"] for e in events if " pub -h " in cmd(e)]
+        self.assertEqual(len(starts), 3, "two brokers plus the control arm")
+        self.assertIn("fss-mqtt-broker", images[0])
+        self.assertIn("eclipse-mosquitto", images[1])
+        self.assertIn("fss-mqtt-broker", images[2], "the control repeats the first broker")
+        self.assertEqual(len(reboots), 2, "the host reboots between arms, not after the last one")
+        for k in range(2):
+            self.assertLess(starts[k], reboots[k])
+            self.assertLess(reboots[k], starts[k + 1])
+        self.assertTrue(all(subs[k] < pubs[k] for k in range(min(len(subs), len(pubs)))),
+                        "subscribers connect before publishers")
+        arms = sorted(d.name for d in (out / "results/compare").iterdir() if d.is_dir())
+        self.assertEqual(arms, ["1-mqttd", "2-mosquitto", "3-mqttd-control"])
+        rung = (out / "results/compare/1-mqttd/rung-30000/rung.txt").read_text()
+        self.assertIn("broker=mqttd offered=30000", rung)
+        self.assertIn("drained=yes", rung)
+        broker_txt = (out / "results/compare/3-mqttd-control/broker.txt").read_text()
+        self.assertIn("control=yes", broker_txt)
+        self.assertIn("image=ghcr.io/mbilling/fss-mqtt-broker@sha256:", broker_txt)
+
+    def test_compare_refuses_a_ladder_that_outruns_the_drivers(self):
+        inventory = self.root / "inventory.json"
+        inventory.write_text(json.dumps({
+            "brokers": [{"public_ip": "b", "private_ip": "10.99.1.11", "server_type": "ccx23"}],
+            "drivers": [{"public_ip": "d", "private_ip": "10.99.1.21", "server_type": "ccx33"}],
+        }))
+        result = subprocess.run(
+            ["bash", str(self.rig / "compare-brokers.sh"), str(self.root / "cmp2"), str(inventory)],
+            env=self.env | {"COMPARE_SHAPE_ONLY": "1", "COMPARE_RATES": "30000 240000"},
+            capture_output=True, text=True, timeout=60)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("more containers per driver than 8", result.stderr)
+        self.assertEqual(self.calls(), [])
+
+    def test_compare_refuses_a_rate_that_is_not_a_whole_number_of_containers(self):
+        inventory = self.root / "inventory.json"
+        inventory.write_text(json.dumps({
+            "brokers": [{"public_ip": "b", "private_ip": "10.99.1.11", "server_type": "ccx23"}],
+            "drivers": [{"public_ip": "d", "private_ip": "10.99.1.21", "server_type": "ccx43"}],
+        }))
+        result = subprocess.run(
+            ["bash", str(self.rig / "compare-brokers.sh"), str(self.root / "cmp3"), str(inventory)],
+            env=self.env | {"COMPARE_SHAPE_ONLY": "1", "COMPARE_RATES": "31000"},
+            capture_output=True, text=True, timeout=60)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("not a multiple of 15000", result.stderr)
+        self.assertEqual(self.calls(), [])
 
     def test_missing_tofu_fails_even_when_terraform_exists(self):
         # Hermetic PATH: removing the stub must not reveal the host's real tofu.

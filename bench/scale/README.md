@@ -292,6 +292,33 @@ before the window existed read `UNALIGNED` and must not back a capacity claim.
 The card separates matched-total-load comparisons from capacity knees and provides
 `bash ./482-smoke.sh` to prove teardown without inheriting the full campaign shape.
 
+## Cross-broker comparison on cloud hardware (ADR 0048 T4)
+
+`./run.sh compare` provisions ONE broker host and a driver fleet, then runs every
+broker under test on that same host in turn — mqttd (the published image, durable
+sessions explicitly off), Mosquitto, EMQX and HiveMQ CE, each from a pinned digest
+with its config committed in [`compare/`](compare/). Each arm ladders
+`COMPARE_RATES` until its knee.
+
+Three things make it a comparison rather than four runs:
+
+- **One provisioning for every broker.** Two provisionings of nominally identical
+  hardware have measured 40% apart on this rig (ADR 0077 T4); across brokers that
+  spread would be indistinguishable from a broker difference.
+- **The host reboots between arms**, so page cache and socket state from the
+  previous broker's overload rungs do not follow the next one, and the first
+  broker repeats at the end as a control. `summarize-compare.py` voids the
+  sequence when the closing arm does not match the opening one.
+- **Driver-side measurement only.** Offered, sent, received and the p99 come from
+  emqtt-bench (EMQX's own tool) and its histogram of timestamped payloads; the
+  broker host contributes mpstat and `docker stats` and nothing else. mqttd's own
+  counters are deliberately unread — reading them here would be exactly the
+  home-field advantage ADR 0048 §3 refuses.
+
+`COMPARE_SHAPE_ONLY=1 ./compare-brokers.sh <dir> <inventory.json>` checks the
+ladder's container budget offline, and `run.sh compare`'s preflight runs it before
+any cloud call. Summarize with `python3 summarize-compare.py <run>/results`.
+
 ## Honesty notes
 
 - Raw results under `.runs/` are untracked scratch; the published record is
