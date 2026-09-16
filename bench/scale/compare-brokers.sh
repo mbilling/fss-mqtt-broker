@@ -186,10 +186,14 @@ start_broker() { # start_broker <broker> <arm-dir>
 		# Half of host RAM, stated in the record.
 		local half
 		half=$(rssh "$BROKER_IP" "awk '/MemTotal/{printf \"%d\", \$2/1024/2}' /proc/meminfo")
+		HEAP_NOTE="${half}m (half of host RAM)"
 		rscp "$SCALE_DIR/compare/hivemq.env" "root@$BROKER_IP:/opt/compare.env"
 		extra=(--env-file /opt/compare.env -e "HIVEMQ_HEAPSIZE=${half}m")
 		;;
 	esac
+	# The same fd ceiling the load containers get. The top rung opens ~19k client
+	# connections; a host whose docker daemon ships a smaller default would cap a
+	# broker there and the comparison would be measuring LimitNOFILE.
 	rssh "$BROKER_IP" "docker pull -q $image >/dev/null && $DOCKER_RUN --name compare-broker ${extra[*]} $image" >/dev/null
 	wait_for "$broker accepting MQTT on $BROKER_PRIV:1883" 180 \
 		rssh "$(driver_pub_ip 0)" "timeout 2 bash -c '</dev/tcp/$BROKER_PRIV/1883'"
@@ -202,6 +206,10 @@ start_broker() { # start_broker <broker> <arm-dir>
 		# the bytes that ran, not the bytes that were asked for.
 		echo "digest=$(rssh "$BROKER_IP" "docker image inspect --format '{{index .RepoDigests 0}}' $image" 2>/dev/null || echo unknown)"
 		echo "config_sha256=$(sha256sum "$SCALE_DIR/compare/$broker".* 2>/dev/null | awk '{print $1}' | head -1)"
+		# What the broker actually got, not what we asked for: a comparison where
+		# one broker ran out of file descriptors is measuring the ulimit.
+		echo "nofile=$(rssh "$BROKER_IP" "docker exec compare-broker sh -c 'ulimit -n' 2>/dev/null || echo unknown")"
+		echo "heap=${HEAP_NOTE:-n/a}"
 		echo "started_unix=$(date +%s)"
 	} >"$dir/broker.txt"
 	{
