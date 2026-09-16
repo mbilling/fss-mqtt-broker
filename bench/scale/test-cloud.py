@@ -1210,11 +1210,17 @@ if cmd == "bash -s":
 with open(os.environ["CALL_LOG"], "a") as f:
     f.write(json.dumps({"t": time.time_ns(), "host": host, "cmd": cmd}) + "\\n")
 if "mpstat" in cmd:
-    # three samples, then gone: the stream ends before the window does
+    # Three samples, then gone: the stream ends before the window does. The
+    # started/gone files make that an ordering, not a race — the fake sleep below
+    # will not return until every sampler that started has exited, so the window
+    # provably outlives its streams on any machine.
+    with open(os.environ["SAMPLERS_STARTED"], "a") as f:
+        f.write("x\\n")
     print("CPU_STREAM_START_UTC 2026-09-16T00:00:00Z", flush=True)
     for _ in range(3):
         print("00:00:01  all  1 0 1 0 0 0 0 0 0 98", flush=True)
-        time.sleep(0.05)
+    with open(os.environ["SAMPLERS_GONE"], "a") as f:
+        f.write("x\\n")
     sys.exit(0)
 if "/dev/tcp/" in cmd or "docker" in cmd or "systemctl" in cmd:
     if "docker stats" in cmd:
@@ -1235,7 +1241,17 @@ if "@@@" in cmd:
 sys.exit(0)
 ''')
         (fake / "scp").write_text("#!/usr/bin/env python3\nimport sys\nsys.exit(0)\n")
-        (fake / "sleep").write_text("#!/usr/bin/env python3\nimport sys\n")
+        # Instant, except that it holds until every started sampler is gone.
+        (fake / "sleep").write_text('''#!/usr/bin/env python3
+import os, pathlib, time
+started, gone = pathlib.Path(os.environ["SAMPLERS_STARTED"]), pathlib.Path(os.environ["SAMPLERS_GONE"])
+def lines(p):
+    try: return len(p.read_text().splitlines())
+    except OSError: return 0
+deadline = time.monotonic() + 30
+while lines(started) > lines(gone) and time.monotonic() < deadline:
+    time.sleep(0.01)
+''')
         for t in ("ssh", "scp", "sleep"):
             (fake / t).chmod(0o755)
         inventory = self.root / "early-inv.json"
@@ -1248,7 +1264,9 @@ sys.exit(0)
             ["bash", str(self.rig / "compare-brokers.sh"), str(out), str(inventory)],
             env=self.env | {"RUN": str(out), "COMPARE_BROKERS": "mqttd", "COMPARE_RATES": "30000",
                             "COMPARE_CONTROL": "0", "COMPARE_SECS": "1", "COMPARE_SETTLE": "1",
-                            "COMPARE_DRAIN_SECS": "5", "COMPARE_DRAIN_POLL": "1", "COMPARE_FLAT_POLLS": "1"},
+                            "COMPARE_DRAIN_SECS": "5", "COMPARE_DRAIN_POLL": "1", "COMPARE_FLAT_POLLS": "1",
+                            "SAMPLERS_STARTED": str(self.root / "samplers-started"),
+                            "SAMPLERS_GONE": str(self.root / "samplers-gone")},
             capture_output=True, text=True, timeout=180)
         self.assertEqual(result.returncode, 0, result.stderr[-2000:])
         rung = (out / "results/compare/1-mqttd/rung-30000/rung.txt").read_text()
