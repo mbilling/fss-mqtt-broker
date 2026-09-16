@@ -117,6 +117,31 @@ with_cpu_sampling "$CPU_DIR" driver
                 os.kill(int(line.split()[0]), 0)
         return result, out
 
+    def test_cpu_streams_survive_a_closed_stdin(self):
+        # The harness is normally started from a heredoc, so its stdin is already
+        # at EOF. A sampler that inherits it sees the EOF and exits a second after
+        # it starts, which is how a whole comparison run lost its CPU coverage
+        # (2026-09-16). The fake ssh here refuses to sample unless it was invoked
+        # with -n, so the stream only survives when the caller's stdin is out of
+        # the picture.
+        ssh = self.bin_dir / "ssh"
+        ssh.write_text('''#!/usr/bin/env python3
+import os, pathlib, sys, time
+if "-n" not in sys.argv:
+    sys.exit(0)  # a sampler that reads the caller's stdin dies at once
+print("CPU_STREAM_START_UTC test", flush=True)
+while True:
+    phase = pathlib.Path(os.environ["CPU_PHASE"])
+    print("SAMPLE " + (phase.read_text() if phase.exists() else "preflight"), flush=True)
+    time.sleep(0.01)
+''')
+        ssh.chmod(0o755)
+        result, out = self.cpu_session()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("ended before the driver", result.stderr)
+        for name in ("cpu-broker0.txt", "cpu-driver0.txt"):
+            self.assertIn("SAMPLE measurement", (out / name).read_text())
+
     def test_cpu_streams_cover_the_driver_and_stop_without_a_timer_tail(self):
         result, out = self.cpu_session()
         self.assertEqual(result.returncode, 0, result.stderr)

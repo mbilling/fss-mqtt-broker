@@ -34,7 +34,14 @@ with_cpu_sampling() (
 			# exec is essential: track/kill the SSH process, not an intermediate
 			# shell which could leave an orphaned SSH session/remote sampler.
 			(
-				exec ssh "${SSH_OPTS[@]}" -o UserKnownHostsFile="$RUN/known_hosts" "root@$ip" \
+				# -n: the sampler must not read the CALLER's stdin. Without it ssh
+				# inherits whatever the harness was started with, and a script run
+				# from a heredoc hands it an already-closed stdin: ssh sees EOF,
+				# tears the session down, and every stream dies a second after it
+				# starts ("CPU sampler ... ended before the driver" on every rung
+				# of the 2026-09-16 comparison). exec stays: the pid we track and
+				# kill must be the ssh itself, not an intermediate shell.
+				exec ssh -n "${SSH_OPTS[@]}" -o UserKnownHostsFile="$RUN/known_hosts" "root@$ip" \
 					'command -v mpstat >/dev/null || exit 127; printf "CPU_STREAM_START_UTC %s\n" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"; exec env LC_ALL=C TZ=UTC mpstat -P ALL 1'
 			) > "$file" 2> "$dir/cpu-$role$i.stderr" &
 			pids+=("$!")
