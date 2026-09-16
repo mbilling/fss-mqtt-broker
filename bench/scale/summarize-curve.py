@@ -213,6 +213,15 @@ def merged_histogram(proms: list[Path]) -> tuple[dict[float, int], int]:
     buckets: dict[float, int] = {}
     count = 0
     for prom in proms:
+        # A baseline is not a scrape. `sub-*.prom` also matches `sub-*-base.prom`,
+        # so every caller's glob hands this function each rung's baselines as if
+        # they were consumer scrapes; each one has no baseline of its own, so its
+        # ramp-period buckets were added back whole and half-undid the correction
+        # this function exists to make. Measured on the 2026-09-15 pair: the
+        # 720k rung read p99 <=2000ms with the baselines counted and <=1000ms
+        # without, which is the difference between failing and passing its budget.
+        if prom.name.endswith("-base.prom"):
+            continue
         after, after_count = _histogram_of(prom)
         base, base_count = _histogram_of(prom.with_name(f"{prom.stem}-base.prom"))
         for le, v in after.items():
@@ -548,17 +557,25 @@ def self_test() -> None:
         if settled is not None:
             counter_log(d / "sub-0.drain", {"recv": recv}, final=settled)
         # A latency histogram, or every rung reads p99 "—" and fails the budget
-        # for want of data rather than for being slow. Two scrapes because the
-        # summarizer subtracts the first from the last to get the measured
-        # window; all mass in the <=10ms bucket, comfortably inside the budget.
-        for scrape, total in (("before", 0), ("after", 1000)):
-            (d / f"sub-0-{scrape}.prom").write_text(
-                "\n".join(
-                    [f'e2e_latency_bucket{{le="{le}"}} {total}' for le in ("10.0", "100.0", "+Inf")]
-                    + [f"e2e_latency_count {total}"]
-                )
-                + "\n"
-            )
+        # for want of data rather than for being slow. The names are the ones the
+        # harness writes — `sub-<name>-base.prom` at window open, `sub-<name>.prom`
+        # at window close — because the callers glob `sub-*.prom`, which matches
+        # BOTH, and a fixture that invents its own names cannot catch what that
+        # glob does to the baseline (it did not: the ramp counts were added back
+        # as a scrape of their own for as long as this fixture used
+        # `sub-0-before.prom`). The ramp is slow (<=100ms) and the window is fast
+        # (<=10ms), so any rung that counts the baseline reads p99 <=100ms.
+        ramp, window = 1_000, 9_000
+        (d / "sub-0-base.prom").write_text(
+            "\n".join([f'e2e_latency_bucket{{le="10.0"}} 0',
+                       f'e2e_latency_bucket{{le="100.0"}} {ramp}',
+                       f'e2e_latency_bucket{{le="+Inf"}} {ramp}',
+                       f"e2e_latency_count {ramp}"]) + "\n")
+        (d / "sub-0.prom").write_text(
+            "\n".join([f'e2e_latency_bucket{{le="10.0"}} {window}',
+                       f'e2e_latency_bucket{{le="100.0"}} {ramp + window}',
+                       f'e2e_latency_bucket{{le="+Inf"}} {ramp + window}',
+                       f"e2e_latency_count {ramp + window}"]) + "\n")
         return d
 
     with tempfile.TemporaryDirectory() as td:
@@ -659,6 +676,16 @@ def self_test() -> None:
                                        sent=30_000, recv=30_000, late=0))
         if not r["pass"] or r["flags"]:
             failures.append(f"a clean rung was rejected: {r['flags']}")
+        # The percentiles describe the WINDOW, not the ramp. The fixture's ramp
+        # sits in <=100ms and its window in <=10ms, so p50/p99 must both read
+        # <=10ms: reading <=100ms means the baseline was counted as a scrape of
+        # its own, which is what `sub-*.prom` globbing the baselines did until
+        # merged_histogram skipped them (the 2026-09-15 720k rung read <=2000ms
+        # that way and <=1000ms once corrected — a failed budget turned into a
+        # passed one).
+        if (r["p99"], r["p50"]) != ("<=10ms", "<=10ms"):
+            failures.append(
+                f"window percentiles include the ramp: p50 {r['p50']} p99 {r['p99']} (expected <=10ms)")
         # A rung that met its offer exactly must ACCOUNT for it exactly. `offered`
         # has to be taken over the publishers' own run span, not the measurement
         # window: the first real run of this table (2026-09-07) rendered a healthy
