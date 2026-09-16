@@ -34,6 +34,12 @@ variable "server_quota" {
   default     = 30
 }
 
+variable "broker_docker" {
+  description = "Install Docker on the broker hosts. Off for measurement runs — the published curve's broker must run the shipped binary under the shipped unit, with nothing else on the host. `run.sh compare` turns it on, because the cross-broker comparison (ADR 0048 T4) runs every broker under test, mqttd included, as a container so they share one runtime."
+  type        = bool
+  default     = false
+}
+
 variable "broker_nic_spread" {
   description = "Spread network softirq across every broker core (RPS, plus ethtool -L when the NIC supports it). Default false so the published curve keeps the untuned kernel it was measured on. ADR 0077 / issue #505: lane E measured ONE core per broker carrying all softirq and saturating at ~96% while the other three idled at 61-78% and mqttd itself held only ~11-20% of that core — this is the knob that tests whether that single queue is the ceiling."
   type        = bool

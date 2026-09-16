@@ -1080,6 +1080,49 @@ with open(os.environ["CALL_LOG"], "a") as f:
         self.assertIn("control=yes", broker_txt)
         self.assertIn("image=ghcr.io/mbilling/fss-mqtt-broker@sha256:", broker_txt)
 
+    def test_compare_mode_provisions_a_broker_host_that_can_run_containers(self):
+        # The arms run every broker as a container ON THE BROKER HOST, which a
+        # measurement host does not have a runtime for. The apply must ask for
+        # one, and the lane must refuse a host without it rather than discovering
+        # it mid-arm on a billing fleet.
+        key = self.root / "id"
+        key.write_text("private")
+        (self.root / "id.pub").write_text("ssh-ed25519 AAAA test\n")
+        result = subprocess.run(
+            ["bash", str(self.rig / "run.sh"), "compare"],
+            env=self.env | {"HCLOUD_TOKEN": "dummy", "CLOUD": "hcloud", "SSH_KEY": str(key),
+                            "MQTTD_VERSION": "1.0.17", "RUN_DIR": str(self.root / "cmprun")},
+            capture_output=True, text=True, timeout=60)
+        self.assertNotEqual(result.returncode, 0)  # the apply stub fails by design
+        apply = next(c for c in self.calls() if c[2][0] == "apply")
+        self.assertIn("broker_docker=true", apply[2])
+        self.assertIn("node_count=1", apply[2])
+
+        inventory = self.root / "inv-nodocker.json"
+        inventory.write_text(json.dumps({
+            "brokers": [{"public_ip": "broker-0", "private_ip": "10.99.1.11", "server_type": "ccx23"}],
+            "drivers": [{"public_ip": "driver-1", "private_ip": "10.99.1.21", "server_type": "ccx43"}],
+        }))
+        (self.bin_dir / "ssh").write_text('''#!/usr/bin/env python3
+import json, os, sys, time
+args = sys.argv[1:]
+i = next(k for k, a in enumerate(args) if a.startswith("root@"))
+cmd = " ".join(args[i + 1:])
+with open(os.environ["CALL_LOG"], "a") as f:
+    f.write(json.dumps([os.path.basename(sys.argv[0]), os.getcwd(), [cmd]]) + "\n")
+sys.exit(1 if "command -v docker" in cmd else 0)
+''')
+        (self.bin_dir / "ssh").chmod(0o755)
+        result = subprocess.run(
+            ["bash", str(self.rig / "compare-brokers.sh"), str(self.root / "cmp4"), str(inventory)],
+            env=self.env | {"RUN": str(self.root / "cmp4"), "COMPARE_BROKERS": "mqttd",
+                            "COMPARE_RATES": "30000"},
+            capture_output=True, text=True, timeout=60)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("no docker", result.stderr)
+        self.assertNotIn("compare-broker", " ".join(str(c) for c in self.calls()),
+                         "it must refuse before starting any broker")
+
     def test_compare_refuses_a_ladder_that_outruns_the_drivers(self):
         inventory = self.root / "inventory.json"
         inventory.write_text(json.dumps({

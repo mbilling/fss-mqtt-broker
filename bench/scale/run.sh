@@ -356,6 +356,7 @@ for N in "${SIZES[@]}"; do
 		${BROKER_TYPE:+-var broker_server_type="$BROKER_TYPE"} \
 		${DRIVER_TYPE:+-var driver_server_type="$DRIVER_TYPE"} \
 		${BROKER_NIC_SPREAD:+-var broker_nic_spread="$BROKER_NIC_SPREAD"} \
+		${COMPARE:+-var broker_docker=true} \
 		>"$RUN/tf-apply-$N.log" 2>&1) || {
 		tail -30 "$RUN/tf-apply-$N.log" >&2
 		die "OpenTofu apply failed for size $N"

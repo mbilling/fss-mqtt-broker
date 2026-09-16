@@ -159,6 +159,13 @@ batch_split() { awk -v dir="$1" -v sfx="$2" '/^@@@ /{if(f)close(f); f=dir "/" $2
 # the CPU with every arm — including its own, which runs as a container so all
 # four brokers share one runtime.
 prepare_host() {
+	# Fail here, not three minutes into the first arm. The broker host only has a
+	# container runtime when it was provisioned for this lane (broker_docker,
+	# which `run.sh compare` sets); a measurement host deliberately has nothing
+	# but the shipped binary, and the first arm's `docker run` would otherwise die
+	# as "command not found" with a fleet already billing (2026-09-16).
+	rssh "$BROKER_IP" "command -v docker >/dev/null" ||
+		die "the broker host has no docker — provision this fleet with run.sh compare (it sets broker_docker=true); a plain measurement host cannot run the comparison arms"
 	rssh "$BROKER_IP" "systemctl disable --now mqttd >/dev/null 2>&1 || true; docker rm -f compare-broker >/dev/null 2>&1 || true"
 }
 
