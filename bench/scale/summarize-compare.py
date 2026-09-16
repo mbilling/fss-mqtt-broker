@@ -521,16 +521,39 @@ def pct(value: float | None) -> str:
 
 
 def workload_line(arm: dict) -> str:
-    """The workload every rung of this arm ran, from the first rung's rung.txt."""
-    for r in arm["rungs"]:
-        meta = r.get("meta") or {}
-        if meta:
-            return (
-                f"publishers={meta.get('publishers', '?')} subscribers={meta.get('subscribers', '?')} "
-                f"payload={meta.get('payload', '?')}B qos={meta.get('qos', '?')} "
-                f"window={meta.get('window_secs', '?')}s settle={meta.get('settle_s', '?')}s"
-            )
-    return "no completed rung"
+    """The workload this arm ran.
+
+    Client counts scale WITH the rung — a 15k rung runs 600 publishers and a
+    150k rung runs 6000 — so quoting the first rung's figure as the arm's would
+    understate every rung above it by up to 10x. Anything that genuinely varies
+    is printed as a range; payload, QoS and window length really are constant.
+    """
+    metas = [r.get("meta") or {} for r in arm["rungs"]]
+    metas = [m for m in metas if m]
+    if not metas:
+        return "no completed rung"
+
+    def span(key: str, unit: str = "") -> str:
+        seen = []
+        for m in metas:
+            v = m.get(key)
+            if v is None:
+                continue
+            try:
+                seen.append(int(v))
+            except ValueError:
+                return f"{key}={v}{unit}"
+        if not seen:
+            return f"{key}=?{unit}"
+        lo, hi = min(seen), max(seen)
+        return f"{key}={lo}{unit}" if lo == hi else f"{key}={lo}..{hi}{unit}"
+
+    first = metas[0]
+    return (
+        f"{span('publishers')} {span('subscribers')} "
+        f"payload={first.get('payload', '?')}B qos={first.get('qos', '?')} "
+        f"window={first.get('window_secs', '?')}s {span('settle_s', 's')}"
+    )
 
 
 def render_header(root: Path, arms: list[dict]) -> list[str]:
