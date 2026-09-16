@@ -164,6 +164,29 @@ batch_split() { awk -v dir="$1" -v sfx="$2" '/^@@@ /{if(f)close(f); f=dir "/" $2
 # The host's own mqttd, installed by cloud-init, would compete for the port and
 # the CPU with every arm — including its own, which runs as a container so all
 # four brokers share one runtime.
+# <spec> — does an ip_local_reserved_ports spec cover the bench REST range?
+ports_reserved() {
+	awk -v s="$1" 'BEGIN {
+		n = split(s, a, ",")
+		for (i = 1; i <= n; i++) {
+			if (split(a[i], b, "-") == 2) { l = b[1] + 0; h = b[2] + 0 } else { l = a[i] + 0; h = l }
+			if (l <= 9400 && 9400 <= h) lo = 1
+			if (l <= 9499 && 9499 <= h) hi = 1
+		}
+		exit !(lo && hi)
+	}'
+}
+
+check_driver_ports() {
+	local di ip reserved
+	for ((di = 0; di < D; di++)); do
+		ip=$(driver_pub_ip "$di")
+		reserved=$(rssh "$ip" "cat /proc/sys/net/ipv4/ip_local_reserved_ports 2>/dev/null" | tr -d '[:space:]')
+		ports_reserved "$reserved" ||
+			die "driver $di ($ip) does not reserve 9400-9499 (ip_local_reserved_ports='$reserved'). A driver's own outbound connections can then take the port a bench container is about to bind its metrics listener on; that container reports nothing, and the rung reads as a broker refusing thousands of clients when the broker was never involved (2026-09-16). Re-provision with the current terraform/files/sysctl-driver.conf, or: sysctl -w net.ipv4.ip_local_reserved_ports=9400-9499"
+	done
+}
+
 prepare_host() {
 	# Fail here, not three minutes into the first arm. The broker host only has a
 	# container runtime when it was provisioned for this lane (broker_docker,
@@ -173,6 +196,7 @@ prepare_host() {
 	rssh "$BROKER_IP" "command -v docker >/dev/null" ||
 		die "the broker host has no docker — provision this fleet with run.sh compare (it sets broker_docker=true); a plain measurement host cannot run the comparison arms"
 	rssh "$BROKER_IP" "systemctl disable --now mqttd >/dev/null 2>&1 || true; docker rm -f compare-broker >/dev/null 2>&1 || true"
+	check_driver_ports
 }
 
 start_broker() { # start_broker <broker> <arm-dir>
@@ -292,17 +316,27 @@ rung() { # rung <broker> <arm-dir> <offered>
 	# `connect_succ` across every container of the rung, polled until it reaches
 	# the population or the budget runs out. A rung that opens its window early
 	# says so in rung.txt rather than being quietly comparable to one that did not.
-	local expect=$((2 * rate / COMPARE_RATE_PER_PUB)) settled=no settled_conns=0 waited=0
+	local expect=$((2 * rate / COMPARE_RATE_PER_PUB)) settled=no settled_conns=0 waited=0 reported=0
 	while :; do
 		pids=()
 		for ((di = 0; di < D; di++)); do driver_batch "$di" "${scrape[di]}" >"$rdir/.batch/settle-$di" 2>/dev/null & pids+=($!); done
 		for p in "${pids[@]}"; do wait "$p" || true; done
 		settled_conns=$(cat "$rdir"/.batch/settle-* 2>/dev/null | awk '/^connect_succ /{s += $2} END{print s + 0}')
+		# How many containers ANSWERED, not just how many clients they counted. A
+		# container whose REST listener never bound reports nothing, and its whole
+		# population then reads as clients the broker refused — a harness fault
+		# wearing a broker's verdict (2026-09-16). Counted here so it can be told
+		# apart downstream instead of being blamed on the broker.
+		reported=$(cat "$rdir"/.batch/settle-* 2>/dev/null | grep -c '^connect_succ ')
 		# Publisher containers expose no REST endpoint, so the scrape sees the
 		# subscriber half; half the population is the whole of what it can see.
 		if [ "$settled_conns" -ge $((expect / 2)) ]; then settled=yes; break; fi
 		[ "$waited" -lt "$COMPARE_SETTLE_BUDGET" ] || {
-			warn "compare: $broker at $rate msg/s opened its window with $settled_conns/$((expect / 2)) subscriber connections after ${waited}s — rung flagged UNSETTLED"
+			if [ "$reported" -lt "$containers" ]; then
+				warn "compare: only $reported of $containers subscriber containers answered the scrape for $broker at $rate msg/s — the rung is an INSTRUMENT failure, not a broker verdict (check ip_local_reserved_ports on the drivers)"
+			else
+				warn "compare: $broker at $rate msg/s opened its window with $settled_conns/$((expect / 2)) subscriber connections after ${waited}s — rung flagged UNSETTLED"
+			fi
 			break
 		}
 		sleep "$COMPARE_DRAIN_POLL"
@@ -396,7 +430,7 @@ rung() { # rung <broker> <arm-dir> <offered>
 	for ((di = 0; di < D; di++)); do [ -n "${subnames[di]}" ] && driver_batch "$di" "docker rm -f${subnames[di]} >/dev/null 2>&1" >/dev/null 2>&1 & pids+=($!); done
 	for p in "${pids[@]}"; do wait "$p" || true; done
 	rm -rf "$rdir/.batch"
-	echo "broker=$broker offered=$rate publishers=$((rate / COMPARE_RATE_PER_PUB)) subscribers=$((rate / COMPARE_RATE_PER_PUB)) payload=$COMPARE_PAYLOAD qos=$COMPARE_QOS window_secs=$COMPARE_SECS settle_s=$((COMPARE_SETTLE + waited)) settled=$settled settled_conns=$settled_conns expected_conns=$((expect / 2)) drained=$drained drain_secs=$elapsed drain_eps=$drain_eps containers=$((2 * containers)) cpu_window=$cpu_window" >"$rdir/rung.txt"
+	echo "broker=$broker offered=$rate publishers=$((rate / COMPARE_RATE_PER_PUB)) subscribers=$((rate / COMPARE_RATE_PER_PUB)) payload=$COMPARE_PAYLOAD qos=$COMPARE_QOS window_secs=$COMPARE_SECS settle_s=$((COMPARE_SETTLE + waited)) settled=$settled settled_conns=$settled_conns expected_conns=$((expect / 2)) scraped_containers=$reported drained=$drained drain_secs=$elapsed drain_eps=$drain_eps containers=$((2 * containers)) cpu_window=$cpu_window" >"$rdir/rung.txt"
 	say "  $broker: $rate msg/s offered — window done (drained=$drained)"
 }
 

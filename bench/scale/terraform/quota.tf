@@ -29,9 +29,9 @@ locals {
     cpx51 = 16
   }
 
-  broker_vcpus = lookup(local.vcpus_by_server_type, var.broker_server_type, 32)
-  driver_vcpus = lookup(local.vcpus_by_server_type, var.driver_server_type, 32)
-  total_vcpus  = var.node_count * local.broker_vcpus + var.driver_count * local.driver_vcpus
+  broker_vcpus  = lookup(local.vcpus_by_server_type, var.broker_server_type, 32)
+  driver_vcpus  = lookup(local.vcpus_by_server_type, var.driver_server_type, 32)
+  total_vcpus   = var.node_count * local.broker_vcpus + var.driver_count * local.driver_vcpus
   total_servers = var.node_count + var.driver_count
 }
 

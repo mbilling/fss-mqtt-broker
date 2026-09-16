@@ -1055,6 +1055,9 @@ if cmd == "bash -s":
     cmd = sys.stdin.read()
 with open(os.environ["CALL_LOG"], "a") as f:
     f.write(json.dumps({"t": time.time_ns(), "host": host, "cmd": cmd}) + "\\n")
+if "ip_local_reserved_ports" in cmd:
+    print(os.environ.get("FAKE_RESERVED_PORTS", "9400-9499"))
+    sys.exit(0)
 state = os.environ["FAKE_STATE"]
 if "random/boot_id" in cmd:
     boot = os.path.join(state, "boot")
@@ -1178,7 +1181,10 @@ args = sys.argv[1:]
 i = next(k for k, a in enumerate(args) if a.startswith("root@"))
 cmd = " ".join(args[i + 1:])
 with open(os.environ["CALL_LOG"], "a") as f:
-    f.write(json.dumps([os.path.basename(sys.argv[0]), os.getcwd(), [cmd]]) + "\n")
+    f.write(json.dumps([os.path.basename(sys.argv[0]), os.getcwd(), [cmd]]) + "\\n")
+if "ip_local_reserved_ports" in cmd:
+    print("9400-9499")
+    sys.exit(0)
 sys.exit(1 if "command -v docker" in cmd else 0)
 ''')
         (self.bin_dir / "ssh").chmod(0o755)
@@ -1192,6 +1198,50 @@ sys.exit(1 if "command -v docker" in cmd else 0)
         self.assertNotIn("compare-broker", " ".join(str(c) for c in self.calls()),
                          "it must refuse before starting any broker")
 
+    def test_a_driver_that_does_not_reserve_the_metrics_ports_is_refused(self):
+        # The drivers' ephemeral range covers the ports the bench containers bind
+        # their metrics listeners on, so one of a driver's own outbound
+        # connections can take a listener's port first. emqtt-bench then exits
+        # with eaddrinuse, that container reports NO metrics, and the settle gate
+        # counts its whole population as clients the BROKER refused — on
+        # 2026-09-16 that capped mqttd at 150k msg/s with the broker uninvolved.
+        # It is random, so each broker would be capped at a different rung: an
+        # unfair comparison with nothing visible to say so. Refuse instead.
+        inventory = self.root / "reserve-inv.json"
+        inventory.write_text(json.dumps({
+            "brokers": [{"public_ip": "broker-0", "private_ip": "10.99.1.11", "server_type": "ccx23"}],
+            "drivers": [{"public_ip": "driver-1", "private_ip": "10.99.1.21", "server_type": "ccx43"}],
+        }))
+        (self.bin_dir / "ssh").write_text('''#!/usr/bin/env python3
+import json, os, sys
+args = sys.argv[1:]
+i = next(k for k, a in enumerate(args) if a.startswith("root@"))
+cmd = " ".join(args[i + 1:])
+with open(os.environ["CALL_LOG"], "a") as f:
+    f.write(json.dumps({"cmd": cmd}) + "\\n")
+if "ip_local_reserved_ports" in cmd:
+    print(os.environ.get("FAKE_RESERVED_PORTS", ""))
+sys.exit(0)
+''')
+        (self.bin_dir / "ssh").chmod(0o755)
+        run = lambda reserved: subprocess.run(  # noqa: E731
+            ["bash", str(self.rig / "compare-brokers.sh"), str(self.root / f"cmp-res-{reserved or 'none'}"),
+             str(inventory)],
+            env=self.env | {"RUN": str(self.root / f"cmp-res-{reserved or 'none'}"),
+                            "COMPARE_BROKERS": "mqttd", "COMPARE_RATES": "30000",
+                            "FAKE_RESERVED_PORTS": reserved},
+            capture_output=True, text=True, timeout=60)
+        result = run("")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("does not reserve 9400-9499", result.stderr)
+        # The cleanup `docker rm -f compare-broker` is not a start; the run is.
+        self.assertNotIn("--name compare-broker", " ".join(str(c) for c in self.calls()),
+                         "it must refuse before starting any broker")
+        # A range that only half covers it is still a refusal.
+        self.assertIn("does not reserve", run("9400-9450").stderr)
+        # And the provisioned value passes, or the guard would block every run.
+        self.assertNotIn("does not reserve", run("9400-9499").stderr)
+
     def _drain_run(self, step: int, out_name: str):
         """One compare rung whose receive counter grows by `step` per poll."""
         fake = self.bin_dir
@@ -1204,6 +1254,9 @@ if cmd == "bash -s":
     cmd = sys.stdin.read()
 with open(os.environ["CALL_LOG"], "a") as f:
     f.write(json.dumps({"t": time.time_ns(), "host": host, "cmd": cmd}) + "\\n")
+if "ip_local_reserved_ports" in cmd:
+    print(os.environ.get("FAKE_RESERVED_PORTS", "9400-9499"))
+    sys.exit(0)
 if "mpstat" in cmd:
     print("CPU_STREAM_START_UTC 2026-09-16T00:00:00Z", flush=True)
     sys.exit(0)
@@ -1284,6 +1337,9 @@ if cmd == "bash -s":
     cmd = sys.stdin.read()
 with open(os.environ["CALL_LOG"], "a") as f:
     f.write(json.dumps({"t": time.time_ns(), "host": host, "cmd": cmd}) + "\\n")
+if "ip_local_reserved_ports" in cmd:
+    print(os.environ.get("FAKE_RESERVED_PORTS", "9400-9499"))
+    sys.exit(0)
 if "mpstat" in cmd:
     # Three samples, then gone: the stream ends before the window does. The
     # started/gone files make that an ordering, not a race — the fake sleep below

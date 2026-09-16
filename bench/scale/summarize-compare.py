@@ -327,6 +327,21 @@ def rung_stats(rdir: Path, budget: float) -> dict:
     # both are gates rather than notes: an unsettled rung measured a broker still
     # filling up, and an undrained one cannot tell pending traffic from loss, so
     # neither can support a knee no matter how good its numbers look.
+    # A container that never answered the scrape took its whole population out of
+    # the settle count, so the rung LOOKS like a broker that refused clients. It
+    # is an instrument failure and says nothing about the broker; it is reported
+    # as one, ahead of the settle verdict it would otherwise masquerade as.
+    scraped, expected_containers = meta.get("scraped_containers"), meta.get("containers")
+    if scraped is not None and expected_containers is not None:
+        try:
+            short = int(expected_containers) // 2 - int(scraped)
+        except ValueError:
+            short = 0
+        if short > 0:
+            flags.append(
+                f"INSTRUMENT INCOMPLETE ({short} subscriber container(s) reported no metrics; "
+                "this rung measures the harness, not the broker)"
+            )
     if meta.get("settled") != "yes":
         flags.append("UNSETTLED (the window opened before every client had connected)")
     if meta.get("drained") != "yes":
@@ -980,6 +995,22 @@ def self_test() -> None:
             check(midnight["mean"] is not None and not midnight["windowed"],
                   f"a window with no samples inside it reported nothing: {midnight}")
 
+        # 15c. A container that never answered the scrape subtracts its whole
+        #      population from the settle count, so the rung reads as a broker
+        #      refusing clients. On 2026-09-16 that was an ephemeral port taking
+        #      a listener's port on the DRIVER; the broker was never involved.
+        #      It must be reported as the instrument failing, not as a verdict.
+        inst = a1 / "rung-100000"
+        text_rung = (inst / "rung.txt").read_text()
+        (inst / "rung.txt").write_text(text_rung.replace("containers=8", "scraped_containers=3 containers=8"))
+        bad = rung_stats(inst, 1000.0)
+        check(not bad["pass"] and any("INSTRUMENT INCOMPLETE" in f for f in bad["flags"]),
+              f"a rung with a silent container was judged as a broker result: {bad['flags']}")
+        (inst / "rung.txt").write_text(text_rung.replace("containers=8", "scraped_containers=4 containers=8"))
+        good = rung_stats(inst, 1000.0)
+        check(good["pass"], f"a fully instrumented rung was flagged anyway: {good['flags']}")
+        (inst / "rung.txt").write_text(text_rung)
+
         # 16. The report renders, and carries the verdicts the tables promise.
         text = render(root, 1000.0)
         for needle in ("## Knee per broker", "SEQUENCE VOID", "## What this is not", "ccx23", "driver0"):
@@ -991,7 +1022,7 @@ def self_test() -> None:
             print(f"FAIL {f}", file=sys.stderr)
         sys.exit(1)
     print(
-        "summarize-compare self-test: 17 checks OK (run order from the arm index; the knee is "
+        "summarize-compare self-test: 18 checks OK (run order from the arm index; the knee is "
         "the highest PASSING rung; two brokers with different ladders get different knees; "
         "each of the four gates fails on its own — under-delivery, offer not met, p99 budget "
         "(and the same rung passing a wider budget), unsettled, undrained; the first failing "
@@ -1000,7 +1031,8 @@ def self_test() -> None:
         "a control whose knee moved and one delivering 12% less at the same knee both void the "
         "sequence; a tail that arrived during the drain is not loss; the CPU idle and memory "
         "cells read the right columns; the CPU mean covers the window and not the settle and "
-        "drain around it, falling back marked when it cannot; the report renders)"
+        "drain around it, falling back marked when it cannot; a container that answered no "
+        "scrape is an instrument failure and not a broker verdict; the report renders)"
     )
 
 

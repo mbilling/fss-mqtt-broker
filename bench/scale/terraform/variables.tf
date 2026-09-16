@@ -25,7 +25,7 @@ variable "vcpu_quota" {
   # Raised from 100 on 2026-09-15, when Hetzner lifted the dedicated project to
   # 30 servers / 200 vCPUs. Keep this equal to the project's real limit: a value
   # above it lets an apply fail half way, a value below it refuses runs that fit.
-  default     = 200
+  default = 200
 }
 
 variable "server_quota" {
