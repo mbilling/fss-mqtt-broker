@@ -314,7 +314,13 @@ rung() { # rung <broker> <arm-dir> <offered>
 		for ((di = 0; di < D; di++)); do driver_batch "$di" "${scrape[di]}" >"$rdir/.batch/base-$di" 2>/dev/null & pids+=($!); done
 		for p in "${pids[@]}"; do wait "$p" || true; done
 		for ((di = 0; di < D; di++)); do batch_split "$rdir" "-base.prom" "$rdir/.batch/base-$di"; done
+		# Stamped on the BROKER's own clock, between the scrapes: the CPU mean has
+		# to describe the same seconds the throughput does. Averaging a whole rung
+		# stream instead folds in settle and drain, and folds in MORE of them for a
+		# broker that drains slowly — which reads as the slow broker using less CPU.
+		rssh "$(broker_pub_ip 0)" 'date -u +%H:%M:%S' >"$rdir/window-open.utc" 2>/dev/null || true
 		sleep "$COMPARE_SECS"
+		rssh "$(broker_pub_ip 0)" 'date -u +%H:%M:%S' >"$rdir/window-close.utc" 2>/dev/null || true
 		pids=()
 		for ((di = 0; di < D; di++)); do driver_batch "$di" "${scrape[di]}" >"$rdir/.batch/final-$di" 2>/dev/null & pids+=($!); done
 		for p in "${pids[@]}"; do wait "$p" || true; done

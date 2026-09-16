@@ -154,6 +154,45 @@ while True:
         result, _ = self.cpu_session(FAIL_DRIVER="1")
         self.assertEqual(result.returncode, 77, result.stderr)
 
+    def test_a_wrapped_command_cannot_disarm_the_sampler_kill(self):
+        # bash locals are dynamically scoped: the WRAPPED command sees them. The
+        # comparison lane's window function opened its driver scrapes with
+        # `pids=()` and emptied the array cpu.sh kills its samplers from, so every
+        # sampler outlived its rung, kept appending to a finished rung's CPU file,
+        # and only died when its host rebooted — while the harness blamed the
+        # sampler ("ended before the driver") on every rung (2026-09-16 rehearsal).
+        ssh = self.bin_dir / "ssh"
+        ssh.write_text('''#!/usr/bin/env python3
+import time
+print("CPU_STREAM_START_UTC test", flush=True)
+while True:
+    print("SAMPLE", flush=True)
+    time.sleep(0.05)
+''')
+        ssh.chmod(0o755)
+        out = self.root / "clobber"
+        result = subprocess.run(["bash", "-c", '''
+source "$1/lib.sh"
+source "$1/cpu.sh"
+RUN="$2"; N=1; D=1
+broker_pub_ip() { echo broker; }
+driver_pub_ip() { echo driver; }
+# A caller that uses the most obvious name in the world for its own parallel batch.
+work() { pids=(); sleep 0.2 & pids+=($!); for p in "${pids[@]}"; do wait "$p"; done; }
+with_cpu_sampling "$3" work
+''', "test", str(self.rig), str(self.root), str(out)],
+            env=self.env | {"CPU_PHASE": str(self.root / "phase")},
+            capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("ended before the driver", result.stderr)
+        for line in (out / "samplers.tsv").read_text().splitlines():
+            with self.assertRaises(ProcessLookupError, msg="a clobbered array must not strand the sampler"):
+                os.kill(int(line.split()[0]), 0)
+        # And the stream is really finished, not merely unwatched.
+        sizes = [(out / n).stat().st_size for n in ("cpu-broker0.txt", "cpu-driver0.txt")]
+        time.sleep(0.5)
+        self.assertEqual(sizes, [(out / n).stat().st_size for n in ("cpu-broker0.txt", "cpu-driver0.txt")])
+
     def test_early_sampler_exit_is_not_success(self):
         result, _ = self.cpu_session(FAIL_SAMPLER="1")
         self.assertNotEqual(result.returncode, 0)

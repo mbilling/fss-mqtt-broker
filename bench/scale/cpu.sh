@@ -2,13 +2,19 @@
 # Source after lib.sh. Lane A samplers follow the actual driver lifetime (#595),
 # not a guessed duration that can expire during readiness/setup or between arms.
 with_cpu_sampling() (
+	# __cpu_ names, not pids/files: bash locals are dynamically scoped, so the
+	# WRAPPED command sees them. The comparison lane's window function opened its
+	# driver scrapes with `pids=()`, which emptied this array before stop_streams
+	# could use it — every sampler survived its rung, kept appending to a finished
+	# rung's CPU file, and only died when its host rebooted, while the harness
+	# reported "ended before the driver" on every rung (2026-09-16 rehearsal).
 	local dir="$1" rc=0 sampling_rc=0 i ip role
 	shift
-	local -a pids=() files=()
+	local -a __cpu_pids=() __cpu_files=()
 	mkdir -p "$dir"
 	stop_streams() {
 		local pid failed=0
-		for pid in "${pids[@]}"; do
+		for pid in "${__cpu_pids[@]}"; do
 			if kill -0 "$pid" 2>/dev/null; then
 				kill "$pid" 2>/dev/null || true
 				wait "$pid" 2>/dev/null || true
@@ -18,7 +24,7 @@ with_cpu_sampling() (
 				failed=1
 			fi
 		done
-		pids=()
+		__cpu_pids=()
 		return "$failed"
 	}
 	trap 'stop_streams || true' EXIT
@@ -44,15 +50,15 @@ with_cpu_sampling() (
 				exec ssh -n "${SSH_OPTS[@]}" -o UserKnownHostsFile="$RUN/known_hosts" "root@$ip" \
 					'command -v mpstat >/dev/null || exit 127; printf "CPU_STREAM_START_UTC %s\n" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"; exec env LC_ALL=C TZ=UTC mpstat -P ALL 1'
 			) > "$file" 2> "$dir/cpu-$role$i.stderr" &
-			pids+=("$!")
-			files+=("$file")
+			__cpu_pids+=("$!")
+			__cpu_files+=("$file")
 			printf '%s\t%s\n' "$!" "$role$i" >> "$dir/samplers.tsv"
 		done
 	done
 	# Every stream must be established before the driver starts. The stream's
 	# UTC marker and the driver's MEASUREMENT_WINDOW JSON permit alignment;
 	# do not average idle/preflight samples into the measurement window.
-	for file in "${files[@]}"; do
+	for file in "${__cpu_files[@]}"; do
 		wait_for "CPU stream $file" 30 grep -q '^CPU_STREAM_START_UTC ' "$file" || exit 1
 	done
 	if "$@"; then rc=0; else rc=$?; fi

@@ -103,13 +103,42 @@ def load_kv(path: Path) -> dict[str, str]:
     return out
 
 
-def idle_rows(path: Path) -> list[float]:
+def _secs(stamp: str) -> int | None:
+    """HH:MM:SS -> seconds since midnight UTC."""
+    m = re.match(r"^(\d{2}):(\d{2}):(\d{2})$", stamp.strip())
+    if not m:
+        return None
+    h, mi, se = (int(x) for x in m.groups())
+    return h * 3600 + mi * 60 + se
+
+
+def window_bounds(rdir: Path) -> tuple[int, int] | None:
+    """The rung's measured window, stamped on the broker's own clock.
+
+    Returns None for a rung recorded before the lane stamped its window; those
+    fall back to the whole stream and the report says so.
+    """
+    try:
+        open_s = _secs((rdir / "window-open.utc").read_text())
+        close_s = _secs((rdir / "window-close.utc").read_text())
+    except OSError:
+        return None
+    if open_s is None or close_s is None:
+        return None
+    if close_s < open_s:  # the window crossed midnight
+        close_s += 86400
+    return open_s, close_s
+
+
+def idle_rows(path: Path, bounds: tuple[int, int] | None = None) -> list[float]:
     """%idle of every `all` row in one mpstat stream, or its Average: rows.
 
-    Adapted from extract-lane-e.py's `mpstat_rows`, minus the window alignment:
-    a compare rung's stream is started and stopped by the rung itself, so the
-    whole stream IS the rung. The per-CPU rows are skipped because a mean over
-    them hides a single pinned core behind idle ones.
+    Adapted from extract-lane-e.py's `mpstat_rows`. With `bounds`, only rows
+    inside the rung's measured window count: a rung's stream also covers settle
+    and drain, and a broker that drains slowly collects more near-idle rows than
+    a fast one, which would read as the slow broker using less CPU. Per-CPU rows
+    are skipped because a mean over them hides a single pinned core behind idle
+    ones.
     """
     rows: list[float] = []
     averages: list[float] = []
@@ -123,8 +152,19 @@ def idle_rows(path: Path) -> list[float]:
         if MPSTAT_AVERAGE.match(line):
             averages.append(idle)
         elif MPSTAT_ALL.match(line):
+            if bounds is not None:
+                at = _secs(line.split()[0])
+                if at is None:
+                    continue
+                lo, hi = bounds
+                if at < lo:  # the stream may have crossed midnight before the window did
+                    at += 86400
+                if not lo <= at <= hi:
+                    continue
             rows.append(idle)
-    return rows or averages
+    # An Average: line describes the whole stream, so it cannot answer a windowed
+    # question; only an unwindowed call may fall back to it.
+    return rows or ([] if bounds is not None else averages)
 
 
 def cpu_idle(rdir: Path, role: str) -> dict:
@@ -136,8 +176,16 @@ def cpu_idle(rdir: Path, role: str) -> dict:
     """
     means: list[float] = []
     lows: list[float] = []
+    bounds = window_bounds(rdir) if role == "broker" else None
     for path in sorted((rdir / "cpu").glob(f"cpu-{role}*.txt")):
-        rows = idle_rows(path)
+        rows = idle_rows(path, bounds)
+        if not rows and bounds is not None:
+            # Stamped, but no sample landed inside the window: report the stream
+            # rather than nothing, and mark it, because an unmarked whole-stream
+            # mean is the bias this alignment exists to remove.
+            rows = idle_rows(path)
+            if rows:
+                bounds = None
         if not rows:
             continue
         means.append(sum(rows) / len(rows))
@@ -146,13 +194,16 @@ def cpu_idle(rdir: Path, role: str) -> dict:
         "mean": sum(means) / len(means) if means else None,
         "min_1s": min(lows) if lows else None,
         "hosts": len(means),
+        "windowed": bounds is not None,
     }
 
 
 def format_idle(s: dict) -> str:
     if s["mean"] is None:
         return "—"
-    return f"{s['mean']:.0f}/{s['min_1s']:.0f}%"
+    # A star is not decoration: it says the mean covers the rung, not the window.
+    star = "" if s.get("windowed", True) else "*"
+    return f"{s['mean']:.0f}/{s['min_1s']:.0f}%{star}"
 
 
 def container_mem(rdir: Path) -> str:
@@ -898,6 +949,33 @@ def self_test() -> None:
               f"the knee rung's CPU idle is not mean/min of its stream: {k1['cpu']}")
         check(k1["mem"] == "812.4MiB", f"the memory cell is not the container's usage: {k1['mem']}")
 
+        # 15b. A rung's stream also covers settle and drain. The CPU mean must
+        #      describe the WINDOW, or a broker that drains slowly banks extra
+        #      near-idle rows and reads as the one using less CPU — the bias runs
+        #      in favour of the loser, so it cannot be dismissed as noise.
+        with tempfile.TemporaryDirectory() as td:
+            rdir = Path(td)
+            (rdir / "cpu").mkdir()
+            # Busy inside 10:00:04..10:00:06, near-idle either side.
+            _write_cpu(rdir / "cpu" / "cpu-broker0.txt", [95.0, 95.0, 95.0, 20.0, 20.0, 20.0, 95.0, 95.0])
+            unwindowed = cpu_idle(rdir, "broker")
+            check(not unwindowed["windowed"] and unwindowed["mean"] > 60.0,
+                  f"an unstamped rung claimed a windowed mean: {unwindowed}")
+            check(format_idle(unwindowed).endswith("*"),
+                  f"a whole-stream mean is not marked as one: {format_idle(unwindowed)}")
+            (rdir / "window-open.utc").write_text("10:00:04\n")
+            (rdir / "window-close.utc").write_text("10:00:06\n")
+            windowed = cpu_idle(rdir, "broker")
+            check(windowed["windowed"] and abs(windowed["mean"] - 20.0) < 0.01,
+                  f"the window stamps did not select the window's rows: {windowed}")
+            check(not format_idle(windowed).endswith("*"), "a windowed mean was marked as a whole-stream one")
+            # A window whose stamps land outside the stream falls back, marked.
+            (rdir / "window-open.utc").write_text("23:59:58\n")
+            (rdir / "window-close.utc").write_text("00:00:02\n")
+            midnight = cpu_idle(rdir, "broker")
+            check(midnight["mean"] is not None and not midnight["windowed"],
+                  f"a window with no samples inside it reported nothing: {midnight}")
+
         # 16. The report renders, and carries the verdicts the tables promise.
         text = render(root, 1000.0)
         for needle in ("## Knee per broker", "SEQUENCE VOID", "## What this is not", "ccx23", "driver0"):
@@ -909,7 +987,7 @@ def self_test() -> None:
             print(f"FAIL {f}", file=sys.stderr)
         sys.exit(1)
     print(
-        "summarize-compare self-test: 16 checks OK (run order from the arm index; the knee is "
+        "summarize-compare self-test: 17 checks OK (run order from the arm index; the knee is "
         "the highest PASSING rung; two brokers with different ladders get different knees; "
         "each of the four gates fails on its own — under-delivery, offer not met, p99 budget "
         "(and the same rung passing a wider budget), unsettled, undrained; the first failing "
@@ -917,7 +995,8 @@ def self_test() -> None:
         "publishers are reported with both shares and gate nothing; a matching control passes; "
         "a control whose knee moved and one delivering 12% less at the same knee both void the "
         "sequence; a tail that arrived during the drain is not loss; the CPU idle and memory "
-        "cells read the right columns; the report renders)"
+        "cells read the right columns; the CPU mean covers the window and not the settle and "
+        "drain around it, falling back marked when it cannot; the report renders)"
     )
 
 
