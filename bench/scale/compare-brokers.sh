@@ -80,7 +80,10 @@ COMPARE_SETTLE="${COMPARE_SETTLE:-20}"
 # went UNSETTLED with the host still accepting. Budget is a ceiling, not a
 # wait: the gate proceeds the moment the connections are up.
 COMPARE_SETTLE_BUDGET="${COMPARE_SETTLE_BUDGET:-300}"
-COMPARE_DRAIN_SECS="${COMPARE_DRAIN_SECS:-60}"
+# A budget, not a wait: the loop leaves the moment the backlog stops being
+# material. 60 s was too short for the tail a few thousand subscribers leave
+# behind, so it expired on every rung above 30k (2026-09-16).
+COMPARE_DRAIN_SECS="${COMPARE_DRAIN_SECS:-300}"
 COMPARE_DRAIN_POLL="${COMPARE_DRAIN_POLL:-5}"
 COMPARE_FLAT_POLLS="${COMPARE_FLAT_POLLS:-3}"
 COMPARE_CONNECT_RATE="${COMPARE_CONNECT_RATE:-500}"
@@ -357,6 +360,16 @@ rung() { # rung <broker> <arm-dir> <offered>
 	# Publishers stop; consumers stay up to take whatever the broker still owes,
 	# so a shortfall reads as loss instead of "we stopped watching too early".
 	local drained=no elapsed=0 flat=0 prev=-1 cur t0
+	# Converged means the backlog stopped being MATERIAL, not that the counter
+	# froze. With thousands of subscriber connections a trickle never quite stops,
+	# so demanding cur <= prev demanded absolute zero — and no broker reached it:
+	# on 2026-09-16 every rung above 30k reported UNRESOLVED while its own ledger
+	# showed nothing lost (lifetime delivered 102.5% of sent at 60k). The
+	# threshold is a fixed share of what the rung OFFERED, so it scales with the
+	# rung and is identical for every broker; a broker genuinely backlogged by
+	# millions still drains far above it and still fails.
+	local drain_eps=$((rate / 1000 * COMPARE_DRAIN_POLL)) # 0.1% of the offered rate
+	[ "$drain_eps" -gt 0 ] || drain_eps=1
 	pids=()
 	for ((di = 0; di < D; di++)); do [ -n "${pubnames[di]}" ] && driver_batch "$di" "docker rm -f${pubnames[di]} >/dev/null 2>&1" >/dev/null 2>&1 & pids+=($!); done
 	for p in "${pids[@]}"; do wait "$p" || true; done
@@ -368,12 +381,12 @@ rung() { # rung <broker> <arm-dir> <offered>
 		for ((di = 0; di < D; di++)); do driver_batch "$di" "${scrape[di]}" >"$rdir/.batch/poll-$di" 2>/dev/null & pids+=($!); done
 		for p in "${pids[@]}"; do wait "$p" || true; done
 		cur=$(cat "$rdir"/.batch/poll-* 2>/dev/null | awk '/^recv /{s += $2} END{print s + 0}')
-		if [ "$cur" -gt 0 ] && [ "$cur" -le "$prev" ]; then
+		if [ "$cur" -gt 0 ] && [ "$prev" -ge 0 ] && [ $((cur - prev)) -le "$drain_eps" ]; then
 			flat=$((flat + 1))
 			[ "$flat" -lt "$COMPARE_FLAT_POLLS" ] || { drained=yes; break; }
 		else flat=0; fi
 		prev=$cur
-		[ "$elapsed" -lt "$COMPARE_DRAIN_SECS" ] || { warn "compare: drain budget elapsed with the backlog moving ($broker, $rate) — rung reports UNRESOLVED"; break; }
+		[ "$elapsed" -lt "$COMPARE_DRAIN_SECS" ] || { warn "compare: drain budget elapsed with more than $drain_eps msg/poll still arriving ($broker, $rate) — rung reports UNRESOLVED"; break; }
 	done
 	pids=()
 	for ((di = 0; di < D; di++)); do driver_batch "$di" "${subdump[di]}" >"$rdir/.batch/drain-$di" 2>/dev/null & pids+=($!); done
@@ -383,7 +396,7 @@ rung() { # rung <broker> <arm-dir> <offered>
 	for ((di = 0; di < D; di++)); do [ -n "${subnames[di]}" ] && driver_batch "$di" "docker rm -f${subnames[di]} >/dev/null 2>&1" >/dev/null 2>&1 & pids+=($!); done
 	for p in "${pids[@]}"; do wait "$p" || true; done
 	rm -rf "$rdir/.batch"
-	echo "broker=$broker offered=$rate publishers=$((rate / COMPARE_RATE_PER_PUB)) subscribers=$((rate / COMPARE_RATE_PER_PUB)) payload=$COMPARE_PAYLOAD qos=$COMPARE_QOS window_secs=$COMPARE_SECS settle_s=$((COMPARE_SETTLE + waited)) settled=$settled settled_conns=$settled_conns expected_conns=$((expect / 2)) drained=$drained drain_secs=$elapsed containers=$((2 * containers)) cpu_window=$cpu_window" >"$rdir/rung.txt"
+	echo "broker=$broker offered=$rate publishers=$((rate / COMPARE_RATE_PER_PUB)) subscribers=$((rate / COMPARE_RATE_PER_PUB)) payload=$COMPARE_PAYLOAD qos=$COMPARE_QOS window_secs=$COMPARE_SECS settle_s=$((COMPARE_SETTLE + waited)) settled=$settled settled_conns=$settled_conns expected_conns=$((expect / 2)) drained=$drained drain_secs=$elapsed drain_eps=$drain_eps containers=$((2 * containers)) cpu_window=$cpu_window" >"$rdir/rung.txt"
 	say "  $broker: $rate msg/s offered — window done (drained=$drained)"
 }
 

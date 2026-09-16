@@ -639,6 +639,10 @@ def render_caveats() -> list[str]:
         "  share — and it is EMQX's own tool, not ours.",
         "- **Latency figures are histogram bucket UPPER BOUNDS**, differenced against a baseline",
         "  scraped once the rung settled, so they describe the measured window and not the ramp.",
+        "- **\"Drained\" means the backlog stopped being material, not that it reached zero.** After",
+        "  the publishers are removed the rung waits until arrivals fall below 0.1% of the offered",
+        "  rate and stay there, which is what makes the delivered ledger trustworthy; a rung whose",
+        "  backlog was still moving when the budget expired is failed rather than reported.",
     ]
 
 

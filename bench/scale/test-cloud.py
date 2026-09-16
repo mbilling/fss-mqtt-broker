@@ -1192,6 +1192,81 @@ sys.exit(1 if "command -v docker" in cmd else 0)
         self.assertNotIn("compare-broker", " ".join(str(c) for c in self.calls()),
                          "it must refuse before starting any broker")
 
+    def _drain_run(self, step: int, out_name: str):
+        """One compare rung whose receive counter grows by `step` per poll."""
+        fake = self.bin_dir
+        (fake / "ssh").write_text('''#!/usr/bin/env python3
+import json, os, pathlib, re, sys, time
+args = sys.argv[1:]
+i = next(k for k, a in enumerate(args) if a.startswith("root@"))
+host, cmd = args[i][5:], " ".join(args[i + 1:])
+if cmd == "bash -s":
+    cmd = sys.stdin.read()
+with open(os.environ["CALL_LOG"], "a") as f:
+    f.write(json.dumps({"t": time.time_ns(), "host": host, "cmd": cmd}) + "\\n")
+if "mpstat" in cmd:
+    print("CPU_STREAM_START_UTC 2026-09-16T00:00:00Z", flush=True)
+    sys.exit(0)
+if "@@@" in cmd and "docker logs" not in cmd:
+    # Every scrape moves the counter on by one step, so the drain sees a
+    # constant arrival RATE — the thing the convergence test judges.
+    c = pathlib.Path(os.environ["DRAIN_COUNTER"])
+    n = int(c.read_text()) if c.exists() else 0
+    c.write_text(str(n + 1))
+    step = int(os.environ["DRAIN_STEP"])
+    for name in re.findall(r"@@@ ([A-Za-z0-9_.-]+)", cmd):
+        print("\\n@@@ %s" % name)
+        print("recv %d" % (1000000 + n * step))
+        print("connect_succ 600")
+        print('e2e_latency_bucket{le="5"} 1000')
+        print('e2e_latency_bucket{le="+Inf"} 1000')
+    sys.exit(0)
+if "docker" in cmd or "systemctl" in cmd or "/dev/tcp/" in cmd:
+    if "docker stats" in cmd:
+        print("compare-broker 512MiB / 16GiB 42.00%")
+    if "docker logs" in cmd:
+        for name in re.findall(r"@@@ ([A-Za-z0-9_.-]+)", cmd):
+            print("\\n@@@ %s" % name)
+            print("pub total=100000 rate=15000/sec" if name.startswith("pub") else "recv total=100000 rate=15000/sec")
+    sys.exit(0)
+sys.exit(0)
+''')
+        (fake / "scp").write_text("#!/usr/bin/env python3\nimport sys\nsys.exit(0)\n")
+        (fake / "sleep").write_text("#!/usr/bin/env python3\nimport sys\n")
+        for t in ("ssh", "scp", "sleep"):
+            (fake / t).chmod(0o755)
+        inventory = self.root / f"{out_name}-inv.json"
+        inventory.write_text(json.dumps({
+            "brokers": [{"public_ip": "broker-0", "private_ip": "10.99.1.11", "server_type": "ccx23"}],
+            "drivers": [{"public_ip": "driver-1", "private_ip": "10.99.1.21", "server_type": "ccx43"}],
+        }))
+        out = self.root / out_name
+        result = subprocess.run(
+            ["bash", str(self.rig / "compare-brokers.sh"), str(out), str(inventory)],
+            env=self.env | {"RUN": str(out), "COMPARE_BROKERS": "mqttd", "COMPARE_RATES": "30000",
+                            "COMPARE_CONTROL": "0", "COMPARE_SECS": "1", "COMPARE_SETTLE": "1",
+                            "COMPARE_DRAIN_SECS": "8", "COMPARE_DRAIN_POLL": "1", "COMPARE_FLAT_POLLS": "2",
+                            "DRAIN_STEP": str(step), "DRAIN_COUNTER": str(self.root / f"{out_name}-counter")},
+            capture_output=True, text=True, timeout=180)
+        self.assertEqual(result.returncode, 0, result.stderr[-2000:])
+        return (out / "results/compare/1-mqttd/rung-30000/rung.txt").read_text(), result
+
+    def test_a_trickle_is_drained_and_a_backlog_is_not(self):
+        # Convergence is about the backlog ceasing to MATTER, not a counter going
+        # perfectly still. Demanding stillness demanded absolute zero: with a few
+        # thousand subscribers something always arrives, so on 2026-09-16 every
+        # rung above 30k reported UNRESOLVED while its own ledger showed nothing
+        # lost (lifetime delivered 102.5% of sent at 60k) — which would have
+        # published a knee of 30k for every broker in the field.
+        # At 30000 offered and a 1 s poll the threshold is 30 messages per poll.
+        rung, _ = self._drain_run(5, "trickle")
+        self.assertIn("drained=yes", rung)
+        self.assertIn("drain_eps=30", rung)
+        # And a real backlog still fails, which is the half that has to keep working.
+        rung, result = self._drain_run(5000, "backlog")
+        self.assertIn("drained=no", rung)
+        self.assertIn("still arriving", result.stderr)
+
     def test_compare_keeps_a_window_whose_cpu_stream_ended_early(self):
         # with_cpu_sampling reports failure when a stream ends before the wrapped
         # command — which happens routinely a moment after a window closes. Taking
