@@ -476,7 +476,7 @@ LANE_E_CALIBRATE_SECS="${LANE_E_CALIBRATE_SECS:-20}"
 # indistinguishable from a cluster that cannot forward, a broker that dropped the
 # counter, or a restart that wiped it, and "0% crossing" would be certified by
 # the silence of the thing it measures. So before calibration, once per size, a
-# raw-socket canary (forward-canary.py, run on driver 0) pushes COUNT QoS 0
+# raw-socket canary (forward-canary.py, run on driver 0) pushes COUNT LANE_E_QOS
 # messages over every directed broker pair through a $share group whose only
 # member is remote, verifies the ledger exactly (received, delivered and
 # shared-remote forwards all equal COUNT x (N-1) per broker, no drops, full peer
@@ -840,6 +840,12 @@ lane_e_shape() {
 	positive_int LANE_E_FORWARD_CANARY_TIMEOUT "$LANE_E_FORWARD_CANARY_TIMEOUT"
 	[ "$LANE_E_FORWARD_CANARY" = 0 ] || [ -f "$SCALE_DIR/forward-canary.py" ] ||
 		die "lane E: LANE_E_FORWARD_CANARY=1 but $SCALE_DIR/forward-canary.py is missing — without the control no N>1 crossing can be certified"
+	# The control certifies the path the rung measures, so it has to SPEAK that
+	# path. It does QoS 0 and QoS 1; exactly-once needs the PUBREC/PUBREL/PUBCOMP
+	# handshake, which it does not implement. Refused here rather than as an
+	# argparse error on a driver after the fleet is up.
+	[ "$LANE_E_FORWARD_CANARY" = 0 ] || [ "$LANE_E_QOS" != 2 ] ||
+		die "lane E: the forwarding canary speaks QoS 0 and 1, not 2 — a QoS 2 rung would be certified by a control running a different delivery path. Set LANE_E_FORWARD_CANARY=0 to run uncertified (crossing becomes INVALID at N>1), or keep LANE_E_QOS at 0 or 1"
 
 	# The per-publisher timer. Whole milliseconds, exactly as lane B: a floored
 	# -I offers a rate other than the label, and the label is what gets published.
@@ -2150,7 +2156,7 @@ lane_e_forward_canary() {
 	# `timeout` is a backstop for a wedged interpreter, not the budget: the canary
 	# enforces LANE_E_FORWARD_CANARY_TIMEOUT itself and still emits its evidence.
 	rssh "$(driver_pub_ip 0)" \
-		"timeout $((LANE_E_FORWARD_CANARY_TIMEOUT + 60)) python3 - run ${brokers[*]} --count $LANE_E_FORWARD_CANARY_COUNT --timeout $LANE_E_FORWARD_CANARY_TIMEOUT" \
+		"timeout $((LANE_E_FORWARD_CANARY_TIMEOUT + 60)) python3 - run ${brokers[*]} --count $LANE_E_FORWARD_CANARY_COUNT --timeout $LANE_E_FORWARD_CANARY_TIMEOUT --qos $LANE_E_QOS" \
 		<"$SCALE_DIR/forward-canary.py" >"$cdir/run.stdout" 2>>"$cdir/run.stderr" || rc=$?
 	batch_split "$cdir" "" "$cdir/run.stdout"
 	# The process that passed the control is the process every rung must still be
