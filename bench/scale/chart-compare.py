@@ -323,6 +323,15 @@ def render_timeline(arm: dict, rate: int) -> str:
             f'<text x="{x1 - 4}" y="{y_off - 6:.1f}" font-size="10" fill="#64748b" text-anchor="end">'
             "offered</text>"
         )
+    else:
+        # A broker that never came close to its offer would otherwise be drawn
+        # filling its own axis, looking comfortable: the axis tops out at what it
+        # managed, and the line it was asked for is off the chart. Say so.
+        out.append(
+            f'<text x="{x1 - 8}" y="{y0 + 18}" font-size="11" fill="#b91c1c" text-anchor="end">'
+            f"offered {rate:,}/s is above this axis — peak delivered was "
+            f"{thr_max / rate * 100:.0f}% of it</text>"
+        )
 
     d = " ".join(f"{'M' if i == 0 else 'L'}{sx(t):.1f},{sy_thr(v):.1f}" for i, (t, v) in enumerate(thr))
     out.append(f'<path d="{d}" fill="none" stroke="#2563eb" stroke-width="2"/>')
