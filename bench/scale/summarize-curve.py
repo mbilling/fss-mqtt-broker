@@ -532,7 +532,12 @@ def self_test() -> None:
                     lines.append(f'mqttd_publish_received_total{{qos="{q}"}} {v * mul}')
                 for q, v in broker.get("deliv", {}).items():
                     lines.append(f'mqttd_publish_delivered_total{{qos="{q}"}} {v * mul}')
-                lines.append(f'mqttd_publish_dropped_total{{reason="pending-cap"}} {broker.get("dropped", 0) * mul}')
+                # `dropped` takes an int (one anonymous reason, as the older cases
+                # pass it) or a {reason: count} map, because at QoS 1 WHICH reason
+                # moved is the whole point: a fixed broker table is not shedding.
+                drops = broker.get("dropped", 0)
+                for reason, v in (drops if isinstance(drops, dict) else {"pending-cap": drops}).items():
+                    lines.append(f'mqttd_publish_dropped_total{{reason="{reason}"}} {v * mul}')
                 lines.append(f"mqttd_sessions {broker.get('sessions', 0) * mul}")
                 lines.append(f"mqttd_connections_active {broker.get('conns', 0) * mul}")
                 (d / f"metrics-{snap}-broker0.prom").write_text("\n".join(lines) + "\n")
@@ -714,6 +719,40 @@ def self_test() -> None:
             failures.append(f"duplicate delivery at QoS 0 was not flagged: {r['flags']}")
         if r["counts"]["duplicate"] <= 0:
             failures.append(f"duplicate count was not reported: {r['counts']}")
+
+        # 6b. REDELIVERY at QoS 1 is reported, never gated. At-least-once may
+        #     legitimately put a message on the wire twice, so the QoS 0 defect
+        #     check is correctly skipped — but skipping it left the QoS 1 arm with
+        #     no signal at all, and a rung delivering 10% more than the
+        #     application saw read as perfectly clean.
+        r = lane_e_rung(lane_e_fixture(
+            root, "sites-4-redeliv", offered=30_000, sent=30_000, recv=30_000, late=0,
+            drained="yes", settled=30_000 * 70, qos="1", sub_qos="1",
+            broker={"recv": {"1": 30_000 * 70}, "deliv": {"1": 33_000 * 70}, "sessions": 100, "conns": 100}))
+        if not any("REDELIVERY at QoS 1" in f for f in r["flags"]):
+            failures.append(f"redelivery at QoS 1 was not reported: {r['flags']}")
+        if not r["pass"]:
+            failures.append(f"legal at-least-once redelivery gated a rung: {r['flags']}")
+
+        # 6c. A BROKER BOUND is not load shedding. `dropped` is summed for the
+        #     accounting table, so a rung that hit PENDING_PUBLISH_CAP looked
+        #     exactly like one that shed under pressure — and at QoS 1 that cap is
+        #     the bound lane E's own shape check predicts.
+        r = lane_e_rung(lane_e_fixture(
+            root, "sites-4-cap", offered=30_000, sent=30_000, recv=30_000, late=0,
+            drained="yes", settled=30_000 * 70, qos="1", sub_qos="1",
+            broker={"recv": {"1": 30_000 * 70}, "deliv": {"1": 30_000 * 70},
+                    "dropped": {"pending-cap": 4_096}, "sessions": 100, "conns": 100}))
+        if not any("BROKER BOUND REACHED" in f and "pending-cap" in f for f in r["flags"]):
+            failures.append(f"a rung that reached PENDING_PUBLISH_CAP was not flagged: {r['flags']}")
+        # and ordinary shedding must NOT be dressed up as a fixed bound
+        r = lane_e_rung(lane_e_fixture(
+            root, "sites-4-shed", offered=30_000, sent=30_000, recv=30_000, late=0,
+            drained="yes", settled=30_000 * 70, qos="1", sub_qos="1",
+            broker={"recv": {"1": 30_000 * 70}, "deliv": {"1": 30_000 * 70},
+                    "dropped": {"outbound-full": 4_096}, "sessions": 100, "conns": 100}))
+        if any("BROKER BOUND REACHED" in f for f in r["flags"]):
+            failures.append(f"load shedding was reported as a fixed broker bound: {r['flags']}")
 
         # 7. INVALID QoS DOWNGRADE. The subscriber asked for QoS 2; every
         #    delivery went out labelled QoS 1. The rung is measuring a different
@@ -1105,6 +1144,29 @@ def lane_e_rung(rdir: Path) -> dict:
         flags.append(
             f"DUPLICATE DELIVERY at QoS 0 ({duplicate:,.0f} more delivered than received; "
             "at-most-once must not redeliver)"
+        )
+    elif duplicate > TOLERANCE * broker_deliv and qos in ("1", "2"):
+        # At least-once MAY redeliver, so this is not the defect it is at QoS 0
+        # and it does not gate. Reporting it anyway is the point: the QoS 0 arm
+        # had a check here and the QoS 1 arm used to have NOTHING, so a rung that
+        # put 30% more on the wire than the application saw read as clean.
+        flags.append(
+            f"REDELIVERY at QoS {qos} ({duplicate:,.0f} more delivered than received, "
+            f"{duplicate / broker_deliv * 100:.1f}% — legal at least-once, reported not gated)"
+        )
+
+    # BROKER BOUND REACHED. `dropped` is summed for the accounting table, so a
+    # rung that hit one of the broker's own fixed tables is otherwise indistinguishable
+    # from one that shed under load. These two reasons are not load: they are the
+    # broker saying a bound was reached, and at QoS >= 1 `pending-cap` is the one
+    # lane E's shape check predicts (PENDING_PUBLISH_CAP, hub/mod.rs).
+    bounds = {r: v for r, v in dropped_by_reason.items()
+              if r in ("pending-cap", "backlog-overflow") and v > 0}
+    if bounds:
+        flags.append(
+            "BROKER BOUND REACHED ("
+            + ", ".join(f"{r} {v:,.0f}" for r, v in sorted(bounds.items()))
+            + ") — a fixed internal table, not load shedding; this rung is not a capacity figure"
         )
 
     # QoS DOWNGRADE. `mqttd_publish_delivered_total` is labelled by QoS, so the

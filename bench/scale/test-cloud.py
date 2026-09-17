@@ -411,6 +411,73 @@ with_cpu_sampling "$3" work
                 self.assertIn(expect, shape)
                 self.assertIn("mqttd_publish_forwarded_total", shape)
 
+    def test_lane_e_at_qos1_refuses_a_timer_faster_than_the_ack(self):
+        # emqtt-bench publishes synchronously per client (-F defaults to 1), so a
+        # QoS >= 1 publisher can never beat 1/PUBACK-RTT however small -I is. A
+        # rung whose timer is faster than the ack does not fail: it UNDER-OFFERS,
+        # and this ladder would then publish the driver's limit as the broker's
+        # capacity. QoS 0 waits for nothing, so the same shape must stay legal.
+        inventory = self.root / "rtt-inv.json"
+        inventory.write_text(json.dumps({"brokers": [{}] * 3, "drivers": [{"vcpus": 8}] * 5}))
+        out = self.root / "rtt-shape"
+        # 1200 publishers over 30000 msg/s is 25 msg/s each => -I 40ms, which
+        # clears a 12ms ack with margin.
+        ok = self.run_script("run-curve.sh", str(out), str(inventory), LANES="E",
+                             SHAPE_ONLY="1", LANE_E_QOS="1", LANE_E_SITES_OVERRIDE="1")
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        # 240 publishers over 30000 is 125 msg/s each => -I 8ms, inside the ack.
+        bad = self.run_script("run-curve.sh", str(out), str(inventory), LANES="E",
+                              SHAPE_ONLY="1", LANE_E_QOS="1", LANE_E_PUBS_PER_SITE="240",
+                              LANE_E_SITES_OVERRIDE="1")
+        self.assertNotEqual(bad.returncode, 0)
+        self.assertIn("PUBACK round trip", bad.stderr)
+        # The same shape at QoS 0 is fine — nothing waits for an ack there.
+        qos0 = self.run_script("run-curve.sh", str(out), str(inventory), LANES="E",
+                               SHAPE_ONLY="1", LANE_E_QOS="0", LANE_E_PUBS_PER_SITE="240",
+                               LANE_E_SITES_OVERRIDE="1")
+        self.assertEqual(qos0.returncode, 0, qos0.stderr)
+
+    def test_lane_e_at_qos1_predicts_the_pending_publish_cap(self):
+        # PENDING_PUBLISH_CAP (4096) bounds publishes whose ack is gated on
+        # durability. QoS 0 has not entered that table since #492, so this binds
+        # at QoS >= 1 only. It is the BROKER's bound, so the rung is still run —
+        # but reaching it unannounced would look like a capacity ceiling.
+        inventory = self.root / "cap-inv.json"
+        inventory.write_text(json.dumps({"brokers": [{}] * 3, "drivers": [{"vcpus": 8}] * 12}))
+        out = self.root / "cap-shape"
+        # 3 brokers, 1200 publishers/site: 12 sites is 14400 publishers => 4800
+        # per broker, over the cap. 4 sites is 1600 per broker, under it.
+        hot = self.run_script("run-curve.sh", str(out), str(inventory), LANES="E", SHAPE_ONLY="1",
+                              LANE_E_QOS="1", LANE_E_SITES_OVERRIDE="4 12")
+        self.assertEqual(hot.returncode, 0, hot.stderr)
+        shape = (out / "results/nodes=3/laneE/shape.txt").read_text()
+        self.assertIn("PENDING_PUBLISH_CAP=4096", shape)
+        self.assertIn("12-site rung", shape, f"the cap was predicted at the wrong rung:\n{shape}")
+        self.assertIn("pending-cap", shape)
+        # QoS 0 never reaches that table, so it must not be warned about.
+        cold = self.run_script("run-curve.sh", str(out), str(inventory), LANES="E", SHAPE_ONLY="1",
+                               LANE_E_QOS="0", LANE_E_SITES_OVERRIDE="4 12")
+        self.assertEqual(cold.returncode, 0, cold.stderr)
+        self.assertNotIn("PENDING_PUBLISH_CAP",
+                         (out / "results/nodes=3/laneE/shape.txt").read_text())
+
+    def test_lane_e_pins_the_mqtt_protocol_version(self):
+        # v5 is the only version where the broker enforces Receive Maximum on
+        # QoS 1 (DISCONNECT 0x93). emqtt-bench 0.6.3 defaults to 5 today, so
+        # pinning changes nothing now and stops a bench upgrade from silently
+        # moving a QoS 1 rung onto a path with no flow control.
+        inventory = self.root / "proto-inv.json"
+        inventory.write_text(json.dumps({"brokers": [{}] * 3, "drivers": [{"vcpus": 8}] * 5}))
+        out = self.root / "proto-shape"
+        bad = self.run_script("run-curve.sh", str(out), str(inventory), LANES="E",
+                              SHAPE_ONLY="1", LANE_E_PROTO="6", LANE_E_SITES_OVERRIDE="1")
+        self.assertNotEqual(bad.returncode, 0)
+        self.assertIn("LANE_E_PROTO must be 3, 4 or 5", bad.stderr)
+        # and the flag actually reaches both container kinds
+        src = (self.rig / "run-curve.sh").read_text()
+        self.assertIn("sub -h $hosts -p $port -V $LANE_E_PROTO", src)
+        self.assertIn("pub -h $hosts -p $port -V $LANE_E_PROTO", src)
+
     def test_multiple_subscriber_containers_do_not_imply_full_local_coverage(self):
         inventory = self.root / "inventory.json"
         inventory.write_text(json.dumps({"brokers": [{}] * 5, "drivers": [{"vcpus": 8}] * 5}))

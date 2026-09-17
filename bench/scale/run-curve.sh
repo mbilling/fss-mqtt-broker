@@ -373,6 +373,25 @@ LANE_E_PUBS_PER_SITE="${LANE_E_PUBS_PER_SITE:-1200}"
 # tenancy. Six puts each consumer at 5,000, inside the band worth advertising.
 LANE_E_SUBS_PER_SITE="${LANE_E_SUBS_PER_SITE:-6}"
 LANE_E_QOS="${LANE_E_QOS:-0}"
+# Pinned, not inherited. emqtt-bench 0.6.3 defaults to -V 5 today, and v5 is the
+# only version where the broker ENFORCES Receive Maximum on QoS 1 (conn.rs:
+# `is_v5 && *qos2_inflight >= receive_maximum` => DISCONNECT 0x93). Leaving the
+# version to the image means a bench upgrade could silently move a QoS 1 rung
+# onto a path with no flow control and call the difference a broker change.
+LANE_E_PROTO="${LANE_E_PROTO:-5}"
+# The PUBACK round trip a QoS >= 1 publisher must fit inside its own timer.
+# emqtt-bench publishes SYNCHRONOUSLY per client — `-F` defaults to 1, so a
+# client holds at most one unacked publish and can never exceed 1/RTT however
+# small -I is. At QoS 0 nothing waits and this does not apply. 12ms is what the
+# 2026-08-25 pass measured under load; the shape demands 2x that as margin,
+# because a rung that cannot offer its label reports the DRIVER as the broker.
+LANE_E_ACK_RTT_MS="${LANE_E_ACK_RTT_MS:-12}"
+# The broker's own bound on publishes whose ack is gated on durability
+# (hub/mod.rs PENDING_PUBLISH_CAP). QoS 0 never enters that table since #492, so
+# this binds at QoS >= 1 only. Not a refusal: it is a real broker property a
+# capacity lane may want to reach. It is PREDICTED here so it is never reached
+# unannounced, and the rung that reaches it is flagged from the counter.
+LANE_E_PENDING_PUBLISH_CAP="${LANE_E_PENDING_PUBLISH_CAP:-4096}"
 # The SUBSCRIBER's requested QoS, separately (#534, acceptance 2). #405 records
 # that the old durable_bench QoS 2 rows isolated INBOUND cost — publisher at
 # QoS 2, subscriber at QoS 1 — and so never measured the outbound exactly-once
@@ -804,6 +823,9 @@ lane_e_shape() {
 	[ "$LANE_E_DRAIN_SECS" -eq 0 ] || [ "$LANE_E_DRAIN_SECS" -ge $((LANE_E_FLAT_POLLS * LANE_E_DRAIN_POLL)) ] ||
 		die "lane E: LANE_E_DRAIN_SECS=$LANE_E_DRAIN_SECS cannot fit $LANE_E_FLAT_POLLS polls of ${LANE_E_DRAIN_POLL}s, so the drain could never observe a flat run and every rung would report UNRESOLVED"
 	case "$LANE_E_QOS" in 0 | 1 | 2) ;; *) die "LANE_E_QOS must be 0, 1 or 2, got '$LANE_E_QOS'" ;; esac
+	case "$LANE_E_PROTO" in 3 | 4 | 5) ;; *) die "LANE_E_PROTO must be 3, 4 or 5 (emqtt-bench -V), got '$LANE_E_PROTO'" ;; esac
+	positive_int LANE_E_ACK_RTT_MS "$LANE_E_ACK_RTT_MS"
+	positive_int LANE_E_PENDING_PUBLISH_CAP "$LANE_E_PENDING_PUBLISH_CAP"
 	case "$LANE_E_SUB_QOS" in 0 | 1 | 2) ;; *) die "LANE_E_SUB_QOS must be 0, 1 or 2, got '$LANE_E_SUB_QOS'" ;; esac
 	# A subscriber cannot be granted MORE than the publisher sent: asking for it
 	# would silently measure the publisher's QoS while the run directory claims
@@ -830,6 +852,17 @@ lane_e_shape() {
 	interval=$((1000 / per_pub_rate))
 	[ "$interval" -ge "$LANE_E_MIN_INTERVAL" ] ||
 		die "lane E: -I ${interval}ms is below LANE_E_MIN_INTERVAL=$LANE_E_MIN_INTERVAL — the drivers collapse below it (#421)"
+	# The ack-RTT floor. At QoS 0 a publisher never waits, so -I alone sets the
+	# rate. At QoS >= 1 emqtt-bench's publish is synchronous per client (-F
+	# defaults to 1: one unacked publish at a time), so the achievable rate is
+	# min(1/-I, 1/RTT) and a rung whose timer is faster than the broker's PUBACK
+	# simply under-offers — which this ladder would then read as the BROKER's
+	# capacity. Refused at shape time, before provisioning, like every other
+	# offer ceiling here.
+	if [ "$LANE_E_QOS" -ge 1 ]; then
+		[ "$interval" -ge $((2 * LANE_E_ACK_RTT_MS)) ] ||
+			die "lane E at QoS $LANE_E_QOS: -I ${interval}ms leaves no margin over a ${LANE_E_ACK_RTT_MS}ms PUBACK round trip (emqtt-bench holds one unacked publish per client, so a publisher cannot beat 1/RTT). Each publisher would offer at most $((1000 / LANE_E_ACK_RTT_MS)) msg/s against the ${per_pub_rate} msg/s on its label. Lower LANE_E_PUBS_PER_SITE's per-publisher rate, or set LANE_E_ACK_RTT_MS from a calibration run that measured a faster ack"
+	fi
 
 	# Each site's populations must split exactly over that site's own containers.
 	[ $((LANE_E_PUBS_PER_SITE % LANE_E_PUB_CONTAINERS_PER_SITE)) -eq 0 ] ||
@@ -908,8 +941,19 @@ lane_e_shape() {
 	} >"$OUT/laneE/shape.txt"
 
 	local sites cps total_c per_driver verdict worst=0
+	local cap_rung=0 cap_inflight=0
 	for sites in "${LANE_E_SITES[@]}"; do
 		positive_int "lane E rung" "$sites"
+		# Concurrent gated publishes per broker. emqtt-bench holds ONE unacked
+		# publish per client (-F 1), and publishers are spread over the brokers by
+		# rotated host lists, so the table on each broker sees its share of them.
+		if [ "$LANE_E_QOS" -ge 1 ] && [ "$cap_rung" -eq 0 ]; then
+			local inflight=$(((sites * LANE_E_PUBS_PER_SITE + N - 1) / N))
+			if [ "$inflight" -gt "$LANE_E_PENDING_PUBLISH_CAP" ]; then
+				cap_rung="$sites"
+				cap_inflight="$inflight"
+			fi
+		fi
 		cps=$((LANE_E_PUB_CONTAINERS_PER_SITE + LANE_E_SUB_CONTAINERS_PER_SITE))
 		total_c=$((sites * cps))
 		# Sites are dealt round-robin to drivers, so the busiest driver carries
@@ -936,6 +980,18 @@ lane_e_shape() {
 	if [ "$worst" = 1 ]; then
 		sed 's/^/    /' "$OUT/laneE/shape.txt" >&2
 		die "lane E: a rung needs more containers per driver than $LANE_E_MAX_CONTAINERS_PER_DRIVER (one vCPU each; budget from inventory or explicit override). Raise DRIVER_COUNT, shorten LANE_E_SITES, or lower LANE_E_PUB_CONTAINERS_PER_SITE — a driver that cannot offer the rate makes the rung look like a broker limit"
+	fi
+	if [ "$cap_rung" -ne 0 ]; then
+		{
+			echo ""
+			echo "  QoS $LANE_E_QOS: from the ${cap_rung}-site rung each broker carries ~$cap_inflight publishes"
+			echo "  whose ack is gated on durability, against PENDING_PUBLISH_CAP=$LANE_E_PENDING_PUBLISH_CAP."
+			echo "  At the cap the OLDEST pending publish is evicted with its ack withheld, so the"
+			echo "  publisher retries: throughput falls and mqttd_publish_dropped_total{reason=\"pending-cap\"}"
+			echo "  moves. That is the broker's bound, not the driver's — the rung is still run, and any"
+			echo "  rung whose counter moves is flagged PENDING-CAP rather than read as capacity."
+		} >>"$OUT/laneE/shape.txt"
+		warn "lane E: the ${cap_rung}-site rung is predicted to reach PENDING_PUBLISH_CAP (~$cap_inflight per broker vs $LANE_E_PENDING_PUBLISH_CAP) — see laneE/shape.txt"
 	fi
 	say "[$N nodes] lane E shape (kept as laneE/shape.txt):"
 	sed 's/^/    /' "$OUT/laneE/shape.txt" >&2
@@ -1733,7 +1789,7 @@ lane_e_rung() { # lane_e_rung <sites> [repeat-index] [is-control]
 			# these tenants rather than one big shared subscription: a publish for
 			# site 3 is selected among site 3's consumers only.
 			filter="\$share/site$s/site/$s/#"
-			subs[sdi]+="$DOCKER_RUN --name sub-s$s-$j $BENCH_IMG sub -h $hosts -p $port -c $subs_per_c -R $LANE_E_CONNECT_RATE -t '$filter' -q $LANE_E_SUB_QOS $active --payload-hdrs ts --prometheus --restapi $((port_base + portn[sdi])) >/dev/null"$'\n'
+			subs[sdi]+="$DOCKER_RUN --name sub-s$s-$j $BENCH_IMG sub -h $hosts -p $port -V $LANE_E_PROTO -c $subs_per_c -R $LANE_E_CONNECT_RATE -t '$filter' -q $LANE_E_SUB_QOS $active --payload-hdrs ts --prometheus --restapi $((port_base + portn[sdi])) >/dev/null"$'\n'
 			scrape[sdi]+="printf '\\n@@@ sub-s$s-$j\\n'; curl -s -m 10 http://localhost:$((port_base + portn[sdi]))/metrics"$'\n'
 			stop[sdi]+="printf '\\n@@@ sub-s$s-$j\\n'; docker logs sub-s$s-$j 2>&1"$'\n'
 			subdump[sdi]+="printf '\\n@@@ sub-s$s-$j\\n'; docker logs sub-s$s-$j 2>&1"$'\n'
@@ -1749,7 +1805,7 @@ lane_e_rung() { # lane_e_rung <sites> [repeat-index] [is-control]
 			# it — the same reason lane B does it (ADR 0048 §2: the topic count must
 			# not change with fleet shape).
 			seq_base=$((j * pubs_per_c))
-			pubs[sdi]+="$DOCKER_RUN --name pub-s$s-$j $BENCH_IMG pub -h $hosts -p $port -c $pubs_per_c -R $LANE_E_CONNECT_RATE -t 'site/$s/%i' -q $LANE_E_QOS -s $LANE_E_PAYLOAD $active -n $seq_base -I $interval --payload-hdrs ts >/dev/null"$'\n'
+			pubs[sdi]+="$DOCKER_RUN --name pub-s$s-$j $BENCH_IMG pub -h $hosts -p $port -V $LANE_E_PROTO -c $pubs_per_c -R $LANE_E_CONNECT_RATE -t 'site/$s/%i' -q $LANE_E_QOS -s $LANE_E_PAYLOAD $active -n $seq_base -I $interval --payload-hdrs ts >/dev/null"$'\n'
 			stop[sdi]+="printf '\\n@@@ pub-s$s-$j\\n'; docker logs pub-s$s-$j 2>&1"$'\n'
 			names[sdi]+=" pub-s$s-$j"
 			pubnames[sdi]+=" pub-s$s-$j"
