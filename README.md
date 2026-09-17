@@ -195,8 +195,25 @@ declared void instead of published. **No broker here is tuned**, including
 ours; each runs a documented reasonable minimum, and a vendor tuning their own
 would likely beat its figure.
 
-**Every setting for every broker, the gates, the per-rung tables and the
-limits are in
+**Latency is a distribution, not a number.** At 45 000 msg/s — Mosquitto's and
+EMQX's knee, inside mqttd's — mqttd delivers 97.8% of messages within 10 ms,
+Mosquitto 30.6%, EMQX 14.9%, and HiveMQ 0.4% with only 61% inside a second. The
+dashed line is mqttd's control arm, run last: two lines lying on each other are
+the reproducibility claim, drawn rather than asserted.
+
+![Latency distribution at 45,000 msg/s offered](docs/benchmarks/img/latency-45000.svg)
+
+**Overloaded, the four behave differently, and that is a choice, not a ranking.**
+Driven at 150 000 msg/s, mqttd queues — memory to 3.8 GiB — then drains at
+**1.6× the offered rate** once publishers stop and gives 95% of the memory back.
+Mosquitto never accepts the load (38% of offer) so it has nothing to flush and
+stays under 1 GiB. EMQX keeps 76% of its peak memory after the backlog is gone.
+HiveMQ carried 5.8 GiB into the rung, reached 12 GiB, and its JVM terminated —
+which is HiveMQ's own configured behaviour (`-XX:+CrashOnOutOfMemoryError`), and
+it happened on two separate fleets.
+
+**Every setting for every broker, the gates, the per-rung tables, the charts and
+the limits are in
 [docs/benchmarks/SINGLE-NODE-COMPARISON.md](docs/benchmarks/SINGLE-NODE-COMPARISON.md)**
 — published so the numbers can be attacked, not just read. One node, QoS 0,
 plaintext: it says nothing about clustered, durable or TLS throughput.

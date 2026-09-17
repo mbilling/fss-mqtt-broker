@@ -64,6 +64,67 @@ gate for different reasons.
   fails first is the tail. Past the knee it queues rather than sheds — RSS
   133 MiB → 2.3 GiB at 150 000 msg/s — and the delivered ledger stays whole.
 
+## The pictures
+
+**Latency is a distribution, not a number.** At 45 000 msg/s — Mosquitto's and
+EMQX's knee, comfortably inside mqttd's — the four separate hard:
+
+![Latency distribution at 45,000 msg/s](img/latency-45000.svg)
+
+| share delivered within | 1 ms | 10 ms | 25 ms | 100 ms | 1 s |
+|---|---|---|---|---|---|
+| mqttd | 39.9% | **97.8%** | 100% | 100% | 100% |
+| Mosquitto | 0.1% | 30.6% | 57.8% | 99.7% | 100% |
+| EMQX | 0.1% | 14.9% | 40.6% | 82.8% | 100% |
+| HiveMQ CE | 0.0% | 0.4% | 2.3% | 25.4% | **61.1%** |
+
+At 30 000 msg/s, where every broker passes, they are far closer — mqttd 96.7%
+within 1 ms, EMQX 75.9%, Mosquitto 59.5%, HiveMQ 12.2%
+([chart](img/latency-30000.svg)). The curves separate as load approaches each
+broker's knee, which is the useful thing a single p99 hides. The control arm is
+drawn as a dashed line of the same colour: two lines lying on each other is the
+reproducibility claim, visible.
+
+**Overload has a shape.** Driving each broker at 150 000 msg/s — past every
+knee here — and watching delivered rate against the broker's own memory until
+the backlog clears:
+
+| | mqttd | Mosquitto | EMQX | HiveMQ CE |
+|---|---|---|---|---|
+| | [chart](img/timeline-mqttd-150k.svg) | [chart](img/timeline-mosquitto-150k.svg) | [chart](img/timeline-emqx-150k.svg) | [chart](img/timeline-hivemq-150k.svg) |
+| memory at rung start | 9 MiB | 1 MiB | 666 MiB | 5 788 MiB |
+| peak | 3 781 MiB | 991 MiB | 3 568 MiB | 12 012 MiB |
+| after the drain | 190 MiB | 17 MiB | 2 714 MiB | process gone |
+| **memory returned** | **95%** | **98%** | **24%** | — |
+| burst when publishers stop | **yes, 1.6× offered** | none | none | — |
+
+![mqttd at 150,000 msg/s](img/timeline-mqttd-150k.svg)
+
+mqttd delivers *below* the offered rate for the whole window while memory
+climbs to 3.8 GiB, then the publishers stop and it drains at **239 000 msg/s**,
+1.6× what was offered, giving 95% of the memory back. It queued, and then it
+flushed.
+
+![Mosquitto at 150,000 msg/s](img/timeline-mosquitto-150k.svg)
+
+Mosquitto shows no burst at all, because it never accepted the load to begin
+with: a flat ~40 000 msg/s, 38% of what was offered, with memory sawtoothing
+between 750 MiB and 990 MiB. Nothing was banked, so nothing flushes. Both
+behaviours are defensible engineering; they are simply different answers to
+being overloaded, and a buyer should pick the one their system wants.
+
+EMQX keeps 76% of its peak memory after the backlog has gone — 2.7 GiB of the
+3.6 GiB it took — where mqttd and Mosquitto return nearly all of theirs.
+
+![HiveMQ CE at 150,000 msg/s](img/timeline-hivemq-150k.svg)
+
+HiveMQ's chart has no delivery line because **not one client connected**: it
+carried 5.8 GiB out of the previous rung, took 12 GiB during this rung's
+connection attempts, and its JVM terminated. Note that crashing is HiveMQ's own
+choice — its image ships `-XX:+CrashOnOutOfMemoryError` in `JAVA_OPTS`, so the
+JVM is configured by the vendor to fail fast rather than limp. What the chart
+shows is that it reached that condition, twice, on two different fleets.
+
 ## The control: is the sequence readable at all?
 
 Four brokers ran in sequence on one host with a reboot between arms, so the
@@ -215,11 +276,28 @@ this lane with a different `HIVEMQ_HEAPSIZE` should say so beside the number.
   [`bench/scale/summarize-compare.py`](../../bench/scale/summarize-compare.py),
   run as `bench/scale/run.sh compare`.
 
+## A second run, on a different fleet
+
+The charts above come from a shorter run on 2026-09-17 (rungs 75 000 and
+150 000 only, same five arms, freshly provisioned hosts). It is not a repeat of
+the ladder, but it does corroborate the parts it touches:
+
+- **mqttd's knee reproduced at 75 000 msg/s** on hardware provisioned
+  separately, with its own control arm passing at 0.1% drift.
+- **HiveMQ's heap death reproduced**, from a different rung (75 000 → 150 000
+  rather than 45 000 → 60 000), with the same `java.lang.OutOfMemoryError:
+  Java heap space`.
+- Mosquitto, EMQX and HiveMQ all failed 75 000 msg/s here, consistent with the
+  knees of 45 000, 45 000 and 30 000 measured on the full ladder.
+
 ## Limits of this record
 
-- **One run.** No repeats, so these are single measurements with a control,
-  not a distribution. The control's 0.1% drift bounds host drift within the
-  run; it says nothing about run-to-run variance.
+- **One full ladder.** The eight-rung ladder ran once, with a control, so those
+  are single measurements rather than a distribution; the 2026-09-17 run repeats
+  only two of its rungs. The control's 0.1% drift bounds host drift within a
+  run; it says nothing about run-to-run variance, and memory in particular
+  moved ~20% between the two mqttd arms of one run (44.7 vs 55.5 MiB at
+  30 000 msg/s).
 - **One instance type.** CCX23 only. How each broker uses a larger host is a
   separate question this lane was built to answer and has not yet run.
 - **Versions are pinned to what was tested**, and newer lines exist:

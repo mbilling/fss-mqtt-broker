@@ -269,13 +269,18 @@ def render_timeline(arm: dict, rate: int) -> str:
         sys.exit(f"arm {arm['index']} ({arm['broker']}) has no rung at {rate:,} msg/s")
     thr = throughput_series(rung["dir"])
     mem = memory_series(rung["dir"])
-    if not thr:
-        sys.exit(f"{rung['dir']} has no per-second subscriber series to plot")
+    if not thr and not mem:
+        sys.exit(f"{rung['dir']} has neither a subscriber series nor a memory series to plot")
+    # A rung where no client ever connected still has a story, and it is the
+    # broker's own memory: HiveMQ carried 5.8 GiB out of the previous rung, took
+    # 12 GiB during this one's connect attempts, and its JVM terminated. Refusing
+    # to draw that because the delivered rate is flat zero would hide the finding.
+    thr_only_zero = not thr
 
-    t_lo = min(t for t, _ in thr + (mem or [(thr[0][0], 0)]))
-    t_hi = max(t for t, _ in thr + (mem or [(thr[-1][0], 0)]))
+    stamps = [t for t, _ in thr] + [t for t, _ in mem]
+    t_lo, t_hi = min(stamps), max(stamps)
     span = max(t_hi - t_lo, 1)
-    thr_max = max(v for _, v in thr) or 1
+    thr_max = max((v for _, v in thr), default=0.0) or 1
     mem_max = max((v for _, v in mem), default=0) or 1
     x0, y0, x1, y1 = PAD_L, PAD_T, W - PAD_R, H - PAD_B
 
@@ -296,10 +301,11 @@ def render_timeline(arm: dict, rate: int) -> str:
     for frac in (0, 0.25, 0.5, 0.75, 1.0):
         y = y1 - frac * (y1 - y0)
         out.append(f'<line x1="{x0}" y1="{y:.1f}" x2="{x1}" y2="{y:.1f}" stroke="#e2e8f0"/>')
-        out.append(
-            f'<text x="{x0 - 8}" y="{y + 4:.1f}" font-size="11" fill="#2563eb" text-anchor="end">'
-            f"{thr_max * frac / 1000:.0f}k</text>"
-        )
+        if not thr_only_zero:
+            out.append(
+                f'<text x="{x0 - 8}" y="{y + 4:.1f}" font-size="11" fill="#2563eb" text-anchor="end">'
+                f"{thr_max * frac / 1000:.0f}k</text>"
+            )
         if mem:
             out.append(
                 f'<text x="{x1 + 8}" y="{y + 4:.1f}" font-size="11" fill="#7c3aed">'
@@ -333,12 +339,19 @@ def render_timeline(arm: dict, rate: int) -> str:
             f"{thr_max / rate * 100:.0f}% of it</text>"
         )
 
-    d = " ".join(f"{'M' if i == 0 else 'L'}{sx(t):.1f},{sy_thr(v):.1f}" for i, (t, v) in enumerate(thr))
-    out.append(f'<path d="{d}" fill="none" stroke="#2563eb" stroke-width="2"/>')
+    if thr:
+        d = " ".join(f"{'M' if i == 0 else 'L'}{sx(t):.1f},{sy_thr(v):.1f}" for i, (t, v) in enumerate(thr))
+        out.append(f'<path d="{d}" fill="none" stroke="#2563eb" stroke-width="2"/>')
+    else:
+        out.append(
+            f'<text x="{(x0 + x1) / 2:.0f}" y="{y0 + 0.78 * (y1 - y0):.0f}" font-size="13" fill="#b91c1c" '
+            f'text-anchor="middle">not one client connected at {rate:,} msg/s — nothing was delivered '
+            "to plot</text>"
+        )
     if mem:
         dm = " ".join(f"{'M' if i == 0 else 'L'}{sx(t):.1f},{sy_mem(v):.1f}" for i, (t, v) in enumerate(mem))
         out.append(f'<path d="{dm}" fill="none" stroke="#7c3aed" stroke-width="2" stroke-dasharray="6 3"/>')
-    entries = [("delivered msg/s (left)", "#2563eb")]
+    entries = [] if thr_only_zero else [("delivered msg/s (left)", "#2563eb")]
     entries.append(("broker RSS (right)", "#7c3aed") if mem else ("broker RSS — not sampled in this run", FALLBACK))
     out += legend(entries, H - 18)
     out.append("</svg>")
