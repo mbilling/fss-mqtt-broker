@@ -216,35 +216,51 @@ def memory_series(rung_dir: Path) -> list[tuple[int, float]]:
 def throughput_series(rung_dir: Path) -> list[tuple[int, float]]:
     """(seconds-of-day, delivered msg/s) summed across subscriber containers.
 
-    emqtt-bench stamps each line with elapsed-since-its-own-start, and containers
-    do not start together, so each container's series is anchored by the driver's
-    wall clock captured with the drain dump: the last line's elapsed time IS the
-    dump moment, and every earlier line counts back from it. Without that anchor
-    the containers float by an unknown offset and a drain burst smears into a
-    gentle slope.
+    emqtt-bench stamps each line with elapsed-since-its-own-start and containers
+    do not start together, so every container needs an anchor. The one that
+    works is the WINDOW CLOSE: `sub-N.log` is dumped at that instant while
+    traffic is still flowing, so its last line is that moment, and
+    `window-close.utc` is stamped on the broker's own clock — the same clock the
+    memory series uses, which removes host-to-host skew from the chart entirely.
+
+    The obvious anchor — the drain dump's clock — is wrong, and quietly: a
+    container's log ENDS when its traffic stops, not when we read it. At 150k
+    msg/s the log ran out 96 s before the dump, so anchoring on the dump shifted
+    the whole curve that far right and drew a broker still delivering 100k msg/s
+    long after its queue had emptied.
     """
+    close = None
+    try:
+        close = _secs((rung_dir / "window-close.utc").read_text())
+    except OSError:
+        close = None
     per_second: dict[int, float] = {}
     for drain in sorted(rung_dir.glob("sub-*.drain")):
-        di = drain.name.split("-")[1].split(".")[0]
-        clock = rung_dir / f"dumpclock-{di}.drain"
-        anchor = None
-        for candidate in (clock, *sorted(rung_dir.glob("dumpclock-*.drain"))):
-            if candidate.is_file():
-                anchor = _secs(candidate.read_text().strip().splitlines()[-1] if candidate.read_text().strip() else "")
-                if anchor is not None:
-                    break
-        rows = []
-        for line in drain.read_text(errors="replace").splitlines():
-            m = ELAPSED.match(line.strip())
-            if m:
-                rows.append((int(m.group(1) or 0) * 60 + int(m.group(2)), float(m.group(4))))
-        if not rows or anchor is None:
+        idx = drain.name[len("sub-"):-len(".drain")]
+        rows = _elapsed_rows(drain)
+        if not rows:
             continue
-        last_elapsed = rows[-1][0]
+        anchor = None
+        window_log = rung_dir / f"sub-{idx}.log"
+        if close is not None and window_log.is_file():
+            live = _elapsed_rows(window_log)
+            if live:
+                anchor = close - live[-1][0]  # this container's start, on the broker's clock
+        if anchor is None:
+            continue
         for elapsed, rate in rows:
-            at = anchor - (last_elapsed - elapsed)
+            at = anchor + elapsed
             per_second[at] = per_second.get(at, 0.0) + rate
     return sorted(per_second.items())
+
+
+def _elapsed_rows(path: Path) -> list[tuple[int, float]]:
+    rows = []
+    for line in path.read_text(errors="replace").splitlines():
+        m = ELAPSED.match(line.strip())
+        if m:
+            rows.append((int(m.group(1) or 0) * 60 + int(m.group(2)), float(m.group(4))))
+    return rows
 
 
 def render_timeline(arm: dict, rate: int) -> str:
@@ -361,17 +377,22 @@ def self_test() -> None:
         mem = memory_series(rdir)
         check(mem == [(1, 100.0), (2, 200.0)], f"memory series misparsed: {mem}")
 
-        # Throughput: two containers, one started 30s before the other, both
-        # anchored by the driver's dump clock — their rates must land on the SAME
-        # seconds, or a burst smears.
-        (rdir / "dumpclock-0.drain").write_text("00:02:00\n")
+        # Two containers started 90 s apart, anchored by the window close. Their
+        # rates must land on the SAME seconds, or a drain burst smears.
+        (rdir / "window-close.utc").write_text("00:02:00\n")
+        (rdir / "sub-0.log").write_text("1m58s recv total=1 rate=1.0/sec\n")   # started at 00:00:02
+        (rdir / "sub-1.log").write_text("28s recv total=1 rate=1.0/sec\n")     # started at 00:01:32
         (rdir / "sub-0.drain").write_text("1m58s recv total=1 rate=100.0/sec\n1m59s recv total=2 rate=200.0/sec\n")
         (rdir / "sub-1.drain").write_text("28s recv total=1 rate=10.0/sec\n29s recv total=2 rate=20.0/sec\n")
         thr = dict(throughput_series(rdir))
-        # 00:02:00 is second 120 of the day; each container's last line IS the
-        # dump moment, so both land on 119 and 120 despite starting 90s apart.
-        check(thr.get(119) == 110.0 and thr.get(120) == 220.0,
+        check(thr.get(120) == 110.0 and thr.get(121) == 220.0,
               f"containers with different start times were not aligned: {thr}")
+        # And a log that ran out BEFORE the drain dump must not stretch the curve:
+        # the series ends where the traffic ended, not where the dump happened.
+        (rdir / "sub-1.drain").write_text(
+            "28s recv total=1 rate=10.0/sec\n29s recv total=2 rate=20.0/sec\n30s recv total=2 rate=0.0/sec\n")
+        check(max(dict(throughput_series(rdir))) == 122,
+              "the curve was stretched past the last line the containers logged")
 
         svg = render_latency(
             [{"broker": "mqttd", "index": 1,
@@ -390,9 +411,9 @@ def self_test() -> None:
             print(f"FAIL {f}", file=sys.stderr)
         sys.exit(1)
     print(
-        "chart-compare self-test: 9 checks OK (the CDF reads its buckets and reaches 1.0; the "
+        "chart-compare self-test: 10 checks OK (the CDF reads its buckets and reaches 1.0; the "
         "ramp baseline is subtracted; memory parses bytes to MiB and survives a bad line; "
-        "containers with different start times align on one clock; both SVGs render with their "
+        "containers with different start times align on the window-close clock and the curve stops where the traffic did; both SVGs render with their "
         "legends)"
     )
 
