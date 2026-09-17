@@ -1172,6 +1172,23 @@ requires = ["python3"]
 duration = "~1s"
 
 [[task]]
+id = "scale-chart-compare"
+group = "Benchmark"
+name = "Chart a cross-broker comparison (latency distribution, rate vs memory)"
+script = "bench/scale/chart-compare.py"
+about = """
+Renders the two pictures the knee table cannot: `--latency RATE` draws what
+share of messages each broker delivered within X ms, from the same
+baseline-differenced histogram the p99 column reads, and `--timeline BROKER
+--rate RATE` draws one rung's delivered rate against the broker's own memory
+until the backlog drained — the difference between a broker that queues and
+one that sheds. Output is dependency-free SVG for docs/benchmarks/img/:
+`chart-compare.py .runs/<stamp>/results --latency 45000 --out chart.svg`.
+"""
+requires = ["python3"]
+duration = "~1s"
+
+[[task]]
 id = "scale-upcloud-quota-tests"
 group = "Benchmark"
 name = "Offline Hetzner and UpCloud HCL quota regression tests"
