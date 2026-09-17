@@ -35,7 +35,7 @@ achieved.
   bump, patches for the three most recent minor lines ([SUPPORT.md](../SUPPORT.md)).
 - **Checkable claims:** every capability maps to a task with evidence on the
   [delivery dashboard](delivery/STATUS.md). What is missing is listed in the
-  README [Limitations](../README.md#limitations).
+  GUIDE [Limitations](../GUIDE.md#limitations).
 
 ## Next pages, by question
 
