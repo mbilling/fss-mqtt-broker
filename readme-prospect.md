@@ -237,7 +237,7 @@ Other published measurements (dev-grade, single host, never capacity): [DURABLE-
 
 ## Feature Comparison Matrix
 
-✅ open build · 💰 **paid edition only** · ⚠️ partial · ✖ absent · n/v not verified. Sources and notes: [COMPARISON.md](docs/COMPARISON.md).
+✅ open build · 💰 **paid edition only** · ⚠️ partial · ✖ absent · n/v not verified. Sources and notes: [COMPARISON.md](docs/COMPARISON.md) (dated 2026-08-19).
 
 | Feature | mqttd | Mosquitto 2.x | EMQX 6.x | HiveMQ CE | VerneMQ 2.1 | NanoMQ 0.25 |
 |---|---|---|---|---|---|---|
@@ -421,7 +421,24 @@ Memory watermark at 75–85% of the container limit; the container limit is the 
 - consensus for control (epochs, ownership), small replica sets for data
 - refuse at the edge: reason code or backpressure, never a silent drop
 - bridge is a separate process and failure domain
-- 77 ADRs: [`docs/adr/`](docs/adr/) · tour: [ARCHITECTURE.md](docs/ARCHITECTURE.md) · [THREAT-MODEL.md](docs/THREAT-MODEL.md)
+- decisions: [`docs/adr/`](docs/adr/) (77 ADRs, per-task status) · tour: [ARCHITECTURE.md](docs/ARCHITECTURE.md) · [THREAT-MODEL.md](docs/THREAT-MODEL.md)
+
+**Workspace layout**
+
+| crate | owns |
+|---|---|
+| `mqtt-codec` | MQTT 3.1.1 + 5.0 wire codec; fuzzed |
+| `mqtt-core` | sessions, subscription tables, topic matching, ACL relations |
+| `mqtt-net` | listeners (TCP/TLS/WebSocket/QUIC), the one audited TLS module |
+| `mqtt-auth` | `Authenticator` / `Authorizer` traits; mTLS-CN, Argon2id, JWT, OIDC, ACL |
+| `mqtt-storage` | `SessionStore` / `RetainedStore`, replicated log, redb |
+| `mqtt-cluster` | SWIM, gossip auth, HRW placement, peer wire, durable plane |
+| `mqtt-observability` | Prometheus/OTLP metrics, hash-chained audit |
+| `mqtt-config` | typed config, secure defaults |
+| `mqtt-bridge` | zone-crossing bridge: spool, QoS 1 replay |
+| `mqttd` | the broker binary: hub, connections, peer mesh |
+| `mqttd-operator` | Kubernetes operator for `MqttdCluster` |
+| `history-check` | independent checker of recorded client-visible histories |
 
 ---
 
@@ -487,7 +504,7 @@ Tracked on the [delivery dashboard](docs/delivery/STATUS.md).
 ```sh
 cargo build && cargo test && cargo clippy --all-targets && cargo deny check
 ./scripts/interop/run.sh     # foreign-client conformance
-mqttui --list                # every runnable script
+mqttui --list                # There are 65 runnable scripts here: demos, smokes, migrations, benches
 ```
 
 ---
