@@ -1198,6 +1198,75 @@ sys.exit(1 if "command -v docker" in cmd else 0)
         self.assertNotIn("compare-broker", " ".join(str(c) for c in self.calls()),
                          "it must refuse before starting any broker")
 
+    def test_a_rung_samples_broker_memory_and_anchors_the_drain_dump(self):
+        # A chart of "memory until everything drained" needs memory as a SERIES;
+        # one docker-stats sample inside the window (all the lane used to keep)
+        # cannot show a queue building and then emptying. And emqtt-bench stamps
+        # its per-second lines with elapsed-since-container-start, so without a
+        # wall clock from the driver each container's series floats by an unknown
+        # offset — 54 s between containers in one 2026-09-16 rung.
+        inventory = self.root / "mem-inv.json"
+        inventory.write_text(json.dumps({
+            "brokers": [{"public_ip": "broker-0", "private_ip": "10.99.1.11", "server_type": "ccx23"}],
+            "drivers": [{"public_ip": "driver-1", "private_ip": "10.99.1.21", "server_type": "ccx43"}],
+        }))
+        (self.bin_dir / "ssh").write_text('''#!/usr/bin/env python3
+import json, os, sys, time
+args = sys.argv[1:]
+i = next(k for k, a in enumerate(args) if a.startswith("root@"))
+cmd = " ".join(args[i + 1:])
+if cmd == "bash -s":
+    cmd = sys.stdin.read()
+with open(os.environ["CALL_LOG"], "a") as f:
+    f.write(json.dumps({"cmd": cmd}) + "\\n")
+if "ip_local_reserved_ports" in cmd:
+    print("9400-9499")
+    sys.exit(0)
+if "memory.current" in cmd:
+    print("MEM_STREAM_START_UTC 2026-09-17T00:00:00Z", flush=True)
+    for i in range(3):
+        print("00:00:%02d %d" % (i, 100000000 + i * 5000000), flush=True)
+        time.sleep(0.05)
+    while True:
+        time.sleep(0.05)
+if "date -u" in cmd:
+    print("\\n@@@ dumpclock-0")
+    print("00:01:30")
+if "@@@" in cmd:
+    import re
+    for name in re.findall(r"@@@ ([A-Za-z0-9_.-]+)", cmd):
+        if name.startswith("dumpclock"):
+            continue
+        print("\\n@@@ %s" % name)
+        print("recv 1000")
+        print("connect_succ 600")
+        print('e2e_latency_bucket{le="5"} 1000')
+        print('e2e_latency_bucket{le="+Inf"} 1000')
+sys.exit(0)
+''')
+        (self.bin_dir / "ssh").chmod(0o755)
+        for t in ("scp", "sleep"):
+            (self.bin_dir / t).write_text("#!/usr/bin/env python3\nimport sys\n")
+            (self.bin_dir / t).chmod(0o755)
+        out = self.root / "cmp-mem"
+        subprocess.run(
+            ["bash", str(self.rig / "compare-brokers.sh"), str(out), str(inventory)],
+            env=self.env | {"RUN": str(out), "COMPARE_BROKERS": "mqttd", "COMPARE_RATES": "30000",
+                            "COMPARE_CONTROL": "0", "COMPARE_SECS": "1", "COMPARE_SETTLE": "1",
+                            "COMPARE_DRAIN_SECS": "2", "COMPARE_DRAIN_POLL": "1",
+                            "COMPARE_FLAT_POLLS": "1"},
+            capture_output=True, text=True, timeout=120)
+        series = (out / "results/compare/1-mqttd/rung-30000/mem-broker.series").read_text()
+        self.assertIn("MEM_STREAM_START_UTC", series, "the memory stream left no start mark")
+        self.assertGreaterEqual(len([l for l in series.splitlines() if l.startswith("00:00:")]), 2,
+                                f"memory was sampled once, not streamed: {series!r}")
+        # The drain dump must carry the driver's wall clock, or the per-container
+        # series cannot be placed on the memory series' timeline.
+        self.assertIn("dumpclock", " ".join(str(c) for c in self.calls()))
+        # And the stream is stopped with the rung, never left running into the next.
+        self.assertFalse(any("memory.current" in c.get("cmd", "") for c in self.calls()[-3:]),
+                         "the memory stream was still being started at the end of the rung")
+
     def test_a_rung_sweeps_bench_containers_the_last_one_left_behind(self):
         # A rung with fewer containers than the last leaves the surplus RUNNING,
         # and a publisher that outlives its rung keeps publishing into the next

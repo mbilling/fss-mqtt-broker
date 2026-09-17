@@ -187,6 +187,38 @@ check_driver_ports() {
 	done
 }
 
+# The broker container's RSS, once per second, stamped on the broker's own clock
+# so it lines up with the window marks and the CPU stream. A cgroup file read is
+# nearly free; `docker stats` would bill the daemon a query per second on the very
+# host under measurement, which is load the chart would then be drawing.
+MEM_STREAM_PID=""
+start_mem_stream() { # start_mem_stream <rung-dir>
+	local rdir="$1"
+	: >"$rdir/mem-broker.series"
+	(
+		exec ssh -n "${SSH_OPTS[@]}" -o UserKnownHostsFile="$RUN/known_hosts" "root@$BROKER_IP" '
+			cid=$(docker inspect -f "{{.Id}}" compare-broker 2>/dev/null) || exit 3
+			cg=""
+			for p in "/sys/fs/cgroup/system.slice/docker-$cid.scope/memory.current" \
+				"/sys/fs/cgroup/docker/$cid/memory.current" \
+				"/sys/fs/cgroup/memory/docker/$cid/memory.usage_in_bytes"; do
+				[ -r "$p" ] && cg="$p" && break
+			done
+			[ -n "$cg" ] || exit 4
+			printf "MEM_STREAM_START_UTC %s\n" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+			while :; do printf "%s %s\n" "$(date -u +%H:%M:%S)" "$(cat "$cg" 2>/dev/null || echo 0)"; sleep 1; done
+		'
+	) >"$rdir/mem-broker.series" 2>"$rdir/mem-broker.stderr" &
+	MEM_STREAM_PID=$!
+}
+
+stop_mem_stream() {
+	[ -n "$MEM_STREAM_PID" ] || return 0
+	kill "$MEM_STREAM_PID" 2>/dev/null || true
+	wait "$MEM_STREAM_PID" 2>/dev/null || true
+	MEM_STREAM_PID=""
+}
+
 prepare_host() {
 	# Fail here, not three minutes into the first arm. The broker host only has a
 	# container runtime when it was provisioned for this lane (broker_docker,
@@ -299,6 +331,7 @@ rung() { # rung <broker> <arm-dir> <offered>
 	local rdir="$adir/rung-$rate" containers=$((rate / PER_CONTAINER_RATE))
 	mkdir -p "$rdir/.batch" "$rdir/cpu"
 	sweep_bench_containers
+	start_mem_stream "$rdir"
 	local -a subs pubs scrape stop subnames pubnames subdump
 	local di c seq_base
 	for ((di = 0; di < D; di++)); do subs[di]="set -e"$'\n'; pubs[di]="set -e"$'\n'; scrape[di]=""; stop[di]=""; subnames[di]=""; pubnames[di]=""; subdump[di]=""; done
@@ -444,9 +477,10 @@ rung() { # rung <broker> <arm-dir> <offered>
 		[ "$elapsed" -lt "$COMPARE_DRAIN_SECS" ] || { warn "compare: drain budget elapsed with more than $drain_eps msg/poll still arriving ($broker, $rate) — rung reports UNRESOLVED"; break; }
 	done
 	pids=()
-	for ((di = 0; di < D; di++)); do driver_batch "$di" "${subdump[di]}" >"$rdir/.batch/drain-$di" 2>/dev/null & pids+=($!); done
+	for ((di = 0; di < D; di++)); do driver_batch "$di" "printf '\n@@@ dumpclock-$di\n'; date -u +%H:%M:%S; ${subdump[di]}" >"$rdir/.batch/drain-$di" 2>/dev/null & pids+=($!); done
 	for p in "${pids[@]}"; do wait "$p" || true; done
 	for ((di = 0; di < D; di++)); do batch_split "$rdir" ".drain" "$rdir/.batch/drain-$di"; done
+	stop_mem_stream
 	pids=()
 	for ((di = 0; di < D; di++)); do [ -n "${subnames[di]}" ] && driver_batch "$di" "docker rm -f${subnames[di]} >/dev/null 2>&1" >/dev/null 2>&1 & pids+=($!); done
 	for p in "${pids[@]}"; do wait "$p" || true; done

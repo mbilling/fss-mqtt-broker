@@ -277,6 +277,7 @@ def rung_stats(rdir: Path, budget: float) -> dict:
         # offered=0 with no histogram, which every gate below then reports as a
         # failure — a live rung looking like a broken broker.
         return {
+            "dir": rdir,
             "offered": dir_offered,
             "sent_rate": 0.0,
             "recv_rate": 0.0,
@@ -348,6 +349,7 @@ def rung_stats(rdir: Path, budget: float) -> dict:
         flags.append("NOT DRAINED (the drain deadline expired with traffic still moving)")
 
     return {
+        "dir": rdir,
         "offered": offered,
         "sent_rate": d["sent_rate"],
         "recv_rate": d["recv_rate"],
