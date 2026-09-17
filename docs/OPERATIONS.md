@@ -5,7 +5,7 @@ encodes the deployment contracts: StatefulSet with per-pod volumes, decommission
 on scale-down, one-at-a-time rolls, a PodDisruptionBudget, and `--check-config` before
 serving. This page is the rest: the procedures an operator runs *after* day 1. Signals
 and files are the control surface — there is deliberately no admin API
-([README](../README.md#principles)).
+([GUIDE](../GUIDE.md#principles)).
 
 ## Certificate / ACL / CRL rotation — automatic
 

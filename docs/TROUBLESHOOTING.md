@@ -12,7 +12,7 @@ timeout — something that looks like a network problem.
   connect, and the failure surfaces as a transport error, not a policy one. Check your
   fleet's TLS version support. If some devices genuinely cannot do 1.3, opt into the
   hardened TLS 1.2 mode per listener (`MQTTD_TLS_ALLOW_TLS12`) — it stays off by default so
-  the advertised posture holds. See [Limitations](../README.md#limitations).
+  the advertised posture holds. See [Limitations](../GUIDE.md#limitations).
 
 ## A client with a certificate is rejected (mTLS)
 

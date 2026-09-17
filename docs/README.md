@@ -6,9 +6,10 @@ is listed here with its stakeholder and one line. An unlisted file fails CI
 progress live under [`adr/`](adr/) and [`delivery/`](delivery/) — they are the
 *source* these pages distill, never the thing an external reader is sent to.
 
-The front door is the repository [README](../README.md). Its "Start here" forks
-by persona: *evaluate it · run it · build against it · secure and audit it ·
-contribute*.
+The front door is the repository [README](../README.md): numbers first, quick
+start, features, then links. The long-form [GUIDE](../GUIDE.md) keeps the
+"Start here" persona fork: *evaluate it · run it · build against it · secure and
+audit it · contribute*.
 
 ## Stakeholder documents
 
