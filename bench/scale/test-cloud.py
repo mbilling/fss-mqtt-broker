@@ -22,12 +22,13 @@ class CloudTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.rig = self.root / "bench/scale"
         self.rig.mkdir(parents=True)
-        for name in ("lib.sh", "cloud.sh", "run.sh", "teardown.sh", "run-curve.sh", "cpu.sh", "test-upcloud-quota.py", "482-smoke.sh", "482-constant-driver-N5-N7-optionB.env", "extract-lane-e.py", "forward-canary.py"):
+        for name in ("lib.sh", "cloud.sh", "run.sh", "teardown.sh", "run-curve.sh", "cpu.sh", "test-upcloud-quota.py", "482-smoke.sh", "482-constant-driver-N5-N7-optionB.env", "extract-lane-e.py", "compare-brokers.sh", "forward-canary.py"):
             shutil.copy2(SCALE / name, self.rig / name)
         # The real mqttd captures the ledgers and the extractor are tested against.
         shutil.copytree(SCALE / "testdata", self.rig / "testdata")
         for name in ("terraform", "terraform-upcloud"):
             (self.rig / name).mkdir()
+        shutil.copytree(SCALE / "compare", self.rig / "compare")
         bin_dir = self.root / "bin"
         bin_dir.mkdir()
         self.bin_dir = bin_dir
@@ -116,6 +117,31 @@ with_cpu_sampling "$CPU_DIR" driver
                 os.kill(int(line.split()[0]), 0)
         return result, out
 
+    def test_cpu_streams_survive_a_closed_stdin(self):
+        # The harness is normally started from a heredoc, so its stdin is already
+        # at EOF. A sampler that inherits it sees the EOF and exits a second after
+        # it starts, which is how a whole comparison run lost its CPU coverage
+        # (2026-09-16). The fake ssh here refuses to sample unless it was invoked
+        # with -n, so the stream only survives when the caller's stdin is out of
+        # the picture.
+        ssh = self.bin_dir / "ssh"
+        ssh.write_text('''#!/usr/bin/env python3
+import os, pathlib, sys, time
+if "-n" not in sys.argv:
+    sys.exit(0)  # a sampler that reads the caller's stdin dies at once
+print("CPU_STREAM_START_UTC test", flush=True)
+while True:
+    phase = pathlib.Path(os.environ["CPU_PHASE"])
+    print("SAMPLE " + (phase.read_text() if phase.exists() else "preflight"), flush=True)
+    time.sleep(0.01)
+''')
+        ssh.chmod(0o755)
+        result, out = self.cpu_session()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("ended before the driver", result.stderr)
+        for name in ("cpu-broker0.txt", "cpu-driver0.txt"):
+            self.assertIn("SAMPLE measurement", (out / name).read_text())
+
     def test_cpu_streams_cover_the_driver_and_stop_without_a_timer_tail(self):
         result, out = self.cpu_session()
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -127,6 +153,45 @@ with_cpu_sampling "$CPU_DIR" driver
     def test_cpu_streams_are_reaped_when_the_driver_fails(self):
         result, _ = self.cpu_session(FAIL_DRIVER="1")
         self.assertEqual(result.returncode, 77, result.stderr)
+
+    def test_a_wrapped_command_cannot_disarm_the_sampler_kill(self):
+        # bash locals are dynamically scoped: the WRAPPED command sees them. The
+        # comparison lane's window function opened its driver scrapes with
+        # `pids=()` and emptied the array cpu.sh kills its samplers from, so every
+        # sampler outlived its rung, kept appending to a finished rung's CPU file,
+        # and only died when its host rebooted — while the harness blamed the
+        # sampler ("ended before the driver") on every rung (2026-09-16 rehearsal).
+        ssh = self.bin_dir / "ssh"
+        ssh.write_text('''#!/usr/bin/env python3
+import time
+print("CPU_STREAM_START_UTC test", flush=True)
+while True:
+    print("SAMPLE", flush=True)
+    time.sleep(0.05)
+''')
+        ssh.chmod(0o755)
+        out = self.root / "clobber"
+        result = subprocess.run(["bash", "-c", '''
+source "$1/lib.sh"
+source "$1/cpu.sh"
+RUN="$2"; N=1; D=1
+broker_pub_ip() { echo broker; }
+driver_pub_ip() { echo driver; }
+# A caller that uses the most obvious name in the world for its own parallel batch.
+work() { pids=(); sleep 0.2 & pids+=($!); for p in "${pids[@]}"; do wait "$p"; done; }
+with_cpu_sampling "$3" work
+''', "test", str(self.rig), str(self.root), str(out)],
+            env=self.env | {"CPU_PHASE": str(self.root / "phase")},
+            capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("ended before the driver", result.stderr)
+        for line in (out / "samplers.tsv").read_text().splitlines():
+            with self.assertRaises(ProcessLookupError, msg="a clobbered array must not strand the sampler"):
+                os.kill(int(line.split()[0]), 0)
+        # And the stream is really finished, not merely unwatched.
+        sizes = [(out / n).stat().st_size for n in ("cpu-broker0.txt", "cpu-driver0.txt")]
+        time.sleep(0.5)
+        self.assertEqual(sizes, [(out / n).stat().st_size for n in ("cpu-broker0.txt", "cpu-driver0.txt")])
 
     def test_early_sampler_exit_is_not_success(self):
         result, _ = self.cpu_session(FAIL_SAMPLER="1")
@@ -974,6 +1039,534 @@ if sys.argv[1:] == ["show", "-p", "MainPID", "--value", "mqttd"]:
                         self.assertEqual(self.calls(), [])
                 finally:
                     (self.rig / name).write_text(original)
+
+    def test_compare_runs_every_broker_on_one_host_in_order(self):
+        # The comparison's value is that the hardware never changes, so the
+        # ordering is the thing to pin: each broker starts, ladders, stops, and
+        # the host reboots before the next one; the first broker repeats last as
+        # the control that says whether the sequence drifted.
+        fake = self.bin_dir
+        (fake / "ssh").write_text('''#!/usr/bin/env python3
+import json, os, sys, time
+args = sys.argv[1:]
+i = next(k for k, a in enumerate(args) if a.startswith("root@"))
+host, cmd = args[i][5:], " ".join(args[i + 1:])
+if cmd == "bash -s":
+    cmd = sys.stdin.read()
+with open(os.environ["CALL_LOG"], "a") as f:
+    f.write(json.dumps({"t": time.time_ns(), "host": host, "cmd": cmd}) + "\\n")
+if "ip_local_reserved_ports" in cmd:
+    print(os.environ.get("FAKE_RESERVED_PORTS", "9400-9499"))
+    sys.exit(0)
+state = os.environ["FAKE_STATE"]
+if "random/boot_id" in cmd:
+    boot = os.path.join(state, "boot")
+    print(open(boot).read().strip() if os.path.exists(boot) else "boot-0")
+    sys.exit(0)
+if cmd.strip() == "reboot":
+    boot = os.path.join(state, "boot")
+    n = int(open(boot).read().strip().split("-")[1]) + 1 if os.path.exists(boot) else 1
+    open(boot, "w").write("boot-%d" % n)
+    sys.exit(0)
+if "/dev/tcp/" in cmd:
+    sys.exit(0)
+if "docker stats" in cmd:
+    print("compare-broker 512MiB / 16GiB 42.00%")
+    sys.exit(0)
+if "curl -s http://localhost:94" in cmd or "@@@" in cmd:
+    # subscriber scrape batch: one chunk per named container
+    import re
+    for name in re.findall(r"@@@ ([A-Za-z0-9_.-]+)", cmd):
+        print("\\n@@@ %s" % name)
+        print("recv 1000")
+        print("connect_succ 600")
+        print('e2e_latency_bucket{le="5"} 1000')
+        print('e2e_latency_bucket{le="+Inf"} 1000')
+    sys.exit(0)
+if "docker logs" in cmd:
+    import re
+    for name in re.findall(r"@@@ ([A-Za-z0-9_.-]+)", cmd):
+        print("\\n@@@ %s" % name)
+        print("pub total=100000 rate=15000/sec" if name.startswith("pub") else "recv total=100000 rate=15000/sec")
+    sys.exit(0)
+if "mpstat" in cmd:
+    print("CPU_STREAM_START_UTC 2026-09-16T00:00:00Z", flush=True)
+    while True:
+        print("00:00:01  all  1 0 1 0 0 0 0 0 0 98", flush=True)
+        time.sleep(0.05)
+sys.exit(0)
+''')
+        (fake / "scp").write_text("#!/usr/bin/env python3\nimport sys\nsys.exit(0)\n")
+        for t in ("ssh", "scp"):
+            (fake / t).chmod(0o755)
+        (fake / "sleep").write_text('''#!/usr/bin/env python3
+import json, os, sys, time
+with open(os.environ["CALL_LOG"], "a") as f:
+    f.write(json.dumps({"t": time.time_ns(), "sleep": sys.argv[1]}) + "\\n")
+''')
+        (fake / "sleep").chmod(0o755)
+        (self.root / "cstate").mkdir()
+        inventory = self.root / "inventory.json"
+        inventory.write_text(json.dumps({
+            "brokers": [{"name": "mqttd-1", "public_ip": "broker-0", "private_ip": "10.99.1.11", "server_type": "ccx23"}],
+            "drivers": [{"name": f"bench-driver-{i}", "public_ip": f"driver-{i}", "private_ip": f"10.99.1.2{i}",
+                         "server_type": "ccx43"} for i in range(1, 3)],
+        }))
+        out = self.root / "cmp"
+        result = subprocess.run(
+            ["bash", str(self.rig / "compare-brokers.sh"), str(out), str(inventory)],
+            env=self.env | {"FAKE_STATE": str(self.root / "cstate"), "RUN": str(out),
+                            "COMPARE_BROKERS": "mqttd mosquitto", "COMPARE_RATES": "30000",
+                            "COMPARE_SECS": "1", "COMPARE_SETTLE": "1", "COMPARE_DRAIN_SECS": "5",
+                            "COMPARE_DRAIN_POLL": "1", "COMPARE_FLAT_POLLS": "1"},
+            capture_output=True, text=True, timeout=180)
+        self.assertEqual(result.returncode, 0, result.stderr[-3000:])
+        events = sorted((json.loads(l) for l in self.log.read_text().splitlines()), key=lambda e: e["t"])
+        cmd = lambda e: e.get("cmd", "")  # noqa: E731
+        starts = [e["t"] for e in events if "--name compare-broker" in cmd(e)]
+        images = [cmd(e) for e in events if "--name compare-broker" in cmd(e)]
+        reboots = [e["t"] for e in events if cmd(e).strip() == "reboot"]
+        subs = [e["t"] for e in events if " sub -h " in cmd(e)]
+        pubs = [e["t"] for e in events if " pub -h " in cmd(e)]
+        self.assertEqual(len(starts), 3, "two brokers plus the control arm")
+        self.assertIn("fss-mqtt-broker", images[0])
+        self.assertIn("eclipse-mosquitto", images[1])
+        self.assertIn("fss-mqtt-broker", images[2], "the control repeats the first broker")
+        self.assertEqual(len(reboots), 2, "the host reboots between arms, not after the last one")
+        for k in range(2):
+            self.assertLess(starts[k], reboots[k])
+            self.assertLess(reboots[k], starts[k + 1])
+        self.assertTrue(all(subs[k] < pubs[k] for k in range(min(len(subs), len(pubs)))),
+                        "subscribers connect before publishers")
+        arms = sorted(d.name for d in (out / "results/compare").iterdir() if d.is_dir())
+        self.assertEqual(arms, ["1-mqttd", "2-mosquitto", "3-mqttd-control"])
+        rung = (out / "results/compare/1-mqttd/rung-30000/rung.txt").read_text()
+        self.assertIn("broker=mqttd offered=30000", rung)
+        self.assertIn("drained=yes", rung)
+        # Both sides' logs at window close, or the summarizer has totals and no
+        # steady-window rate: every rung then reads 0 recv/s (2026-09-16).
+        rdir = out / "results/compare/1-mqttd/rung-30000"
+        for name in ("pub-0.log", "sub-0.log", "sub-0.drain", "sub-0-base.prom", "sub-0.prom"):
+            self.assertTrue((rdir / name).exists(), f"{name} missing from the rung")
+        broker_txt = (out / "results/compare/3-mqttd-control/broker.txt").read_text()
+        self.assertIn("control=yes", broker_txt)
+        self.assertIn("image=ghcr.io/mbilling/fss-mqtt-broker@sha256:", broker_txt)
+
+    def test_compare_mode_provisions_a_broker_host_that_can_run_containers(self):
+        # The arms run every broker as a container ON THE BROKER HOST, which a
+        # measurement host does not have a runtime for. The apply must ask for
+        # one, and the lane must refuse a host without it rather than discovering
+        # it mid-arm on a billing fleet.
+        key = self.root / "id"
+        key.write_text("private")
+        (self.root / "id.pub").write_text("ssh-ed25519 AAAA test\n")
+        result = subprocess.run(
+            ["bash", str(self.rig / "run.sh"), "compare"],
+            env=self.env | {"HCLOUD_TOKEN": "dummy", "CLOUD": "hcloud", "SSH_KEY": str(key),
+                            "MQTTD_VERSION": "1.0.17", "RUN_DIR": str(self.root / "cmprun")},
+            capture_output=True, text=True, timeout=60)
+        self.assertNotEqual(result.returncode, 0)  # the apply stub fails by design
+        apply = next(c for c in self.calls() if c[2][0] == "apply")
+        self.assertIn("broker_docker=true", apply[2])
+        self.assertIn("node_count=1", apply[2])
+
+        inventory = self.root / "inv-nodocker.json"
+        inventory.write_text(json.dumps({
+            "brokers": [{"public_ip": "broker-0", "private_ip": "10.99.1.11", "server_type": "ccx23"}],
+            "drivers": [{"public_ip": "driver-1", "private_ip": "10.99.1.21", "server_type": "ccx43"}],
+        }))
+        (self.bin_dir / "ssh").write_text('''#!/usr/bin/env python3
+import json, os, sys, time
+args = sys.argv[1:]
+i = next(k for k, a in enumerate(args) if a.startswith("root@"))
+cmd = " ".join(args[i + 1:])
+with open(os.environ["CALL_LOG"], "a") as f:
+    f.write(json.dumps([os.path.basename(sys.argv[0]), os.getcwd(), [cmd]]) + "\\n")
+if "ip_local_reserved_ports" in cmd:
+    print("9400-9499")
+    sys.exit(0)
+sys.exit(1 if "command -v docker" in cmd else 0)
+''')
+        (self.bin_dir / "ssh").chmod(0o755)
+        result = subprocess.run(
+            ["bash", str(self.rig / "compare-brokers.sh"), str(self.root / "cmp4"), str(inventory)],
+            env=self.env | {"RUN": str(self.root / "cmp4"), "COMPARE_BROKERS": "mqttd",
+                            "COMPARE_RATES": "30000"},
+            capture_output=True, text=True, timeout=60)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("no docker", result.stderr)
+        self.assertNotIn("compare-broker", " ".join(str(c) for c in self.calls()),
+                         "it must refuse before starting any broker")
+
+    def test_a_rung_samples_broker_memory_and_anchors_the_drain_dump(self):
+        # A chart of "memory until everything drained" needs memory as a SERIES;
+        # one docker-stats sample inside the window (all the lane used to keep)
+        # cannot show a queue building and then emptying. And emqtt-bench stamps
+        # its per-second lines with elapsed-since-container-start, so without a
+        # wall clock from the driver each container's series floats by an unknown
+        # offset — 54 s between containers in one 2026-09-16 rung.
+        inventory = self.root / "mem-inv.json"
+        inventory.write_text(json.dumps({
+            "brokers": [{"public_ip": "broker-0", "private_ip": "10.99.1.11", "server_type": "ccx23"}],
+            "drivers": [{"public_ip": "driver-1", "private_ip": "10.99.1.21", "server_type": "ccx43"}],
+        }))
+        (self.bin_dir / "ssh").write_text('''#!/usr/bin/env python3
+import json, os, sys, time
+args = sys.argv[1:]
+i = next(k for k, a in enumerate(args) if a.startswith("root@"))
+cmd = " ".join(args[i + 1:])
+if cmd == "bash -s":
+    cmd = sys.stdin.read()
+with open(os.environ["CALL_LOG"], "a") as f:
+    f.write(json.dumps({"cmd": cmd}) + "\\n")
+if "ip_local_reserved_ports" in cmd:
+    print("9400-9499")
+    sys.exit(0)
+if "memory.current" in cmd:
+    print("MEM_STREAM_START_UTC 2026-09-17T00:00:00Z", flush=True)
+    for i in range(3):
+        print("00:00:%02d %d" % (i, 100000000 + i * 5000000), flush=True)
+        time.sleep(0.05)
+    while True:
+        time.sleep(0.05)
+if "date -u" in cmd:
+    print("\\n@@@ dumpclock-0")
+    print("00:01:30")
+if "@@@" in cmd:
+    import re
+    for name in re.findall(r"@@@ ([A-Za-z0-9_.-]+)", cmd):
+        if name.startswith("dumpclock"):
+            continue
+        print("\\n@@@ %s" % name)
+        print("recv 1000")
+        print("connect_succ 600")
+        print('e2e_latency_bucket{le="5"} 1000')
+        print('e2e_latency_bucket{le="+Inf"} 1000')
+sys.exit(0)
+''')
+        (self.bin_dir / "ssh").chmod(0o755)
+        for t in ("scp", "sleep"):
+            (self.bin_dir / t).write_text("#!/usr/bin/env python3\nimport sys\n")
+            (self.bin_dir / t).chmod(0o755)
+        out = self.root / "cmp-mem"
+        subprocess.run(
+            ["bash", str(self.rig / "compare-brokers.sh"), str(out), str(inventory)],
+            env=self.env | {"RUN": str(out), "COMPARE_BROKERS": "mqttd", "COMPARE_RATES": "30000",
+                            "COMPARE_CONTROL": "0", "COMPARE_SECS": "1", "COMPARE_SETTLE": "1",
+                            "COMPARE_DRAIN_SECS": "2", "COMPARE_DRAIN_POLL": "1",
+                            "COMPARE_FLAT_POLLS": "1"},
+            capture_output=True, text=True, timeout=120)
+        series = (out / "results/compare/1-mqttd/rung-30000/mem-broker.series").read_text()
+        self.assertIn("MEM_STREAM_START_UTC", series, "the memory stream left no start mark")
+        self.assertGreaterEqual(len([l for l in series.splitlines() if l.startswith("00:00:")]), 2,
+                                f"memory was sampled once, not streamed: {series!r}")
+        # The drain dump must carry the driver's wall clock, or the per-container
+        # series cannot be placed on the memory series' timeline.
+        self.assertIn("dumpclock", " ".join(str(c) for c in self.calls()))
+        # And the stream is stopped with the rung, never left running into the next.
+        self.assertFalse(any("memory.current" in c.get("cmd", "") for c in self.calls()[-3:]),
+                         "the memory stream was still being started at the end of the rung")
+
+    def test_a_rung_sweeps_bench_containers_the_last_one_left_behind(self):
+        # A rung with fewer containers than the last leaves the surplus RUNNING,
+        # and a publisher that outlives its rung keeps publishing into the next
+        # one's window — offered load that rung never counts. On 2026-09-16 the
+        # leftovers from emqx's 240k rung hit hivemq's 30k rung; pub-0 and pub-1
+        # collided by name and killed the run, which was the lucky half. pub-2..15
+        # would have published into hivemq's numbers in silence.
+        inventory = self.root / "sweep-inv.json"
+        inventory.write_text(json.dumps({
+            "brokers": [{"public_ip": "broker-0", "private_ip": "10.99.1.11", "server_type": "ccx23"}],
+            "drivers": [{"public_ip": "driver-1", "private_ip": "10.99.1.21", "server_type": "ccx43"}],
+        }))
+        (self.bin_dir / "ssh").write_text('''#!/usr/bin/env python3
+import json, os, pathlib, sys
+args = sys.argv[1:]
+i = next(k for k, a in enumerate(args) if a.startswith("root@"))
+cmd = " ".join(args[i + 1:])
+if cmd == "bash -s":
+    cmd = sys.stdin.read()
+with open(os.environ["CALL_LOG"], "a") as f:
+    f.write(json.dumps({"cmd": cmd}) + "\\n")
+if "ip_local_reserved_ports" in cmd:
+    print("9400-9499")
+    sys.exit(0)
+# A driver that is still holding two containers from the rung before.
+state = pathlib.Path(os.environ["LEFTOVERS"])
+if "docker ps -a" in cmd:
+    names = state.read_text().split() if state.exists() else []
+    if "grep -cE" in cmd:
+        print(len(names))
+    else:
+        if "xargs -r docker rm -f" in cmd:
+            state.write_text("")   # the sweep removes them
+        for n in names:
+            print(n)
+    sys.exit(0)
+sys.exit(0)
+''')
+        (self.bin_dir / "ssh").chmod(0o755)
+        (self.bin_dir / "scp").write_text("#!/usr/bin/env python3\nimport sys\nsys.exit(0)\n")
+        (self.bin_dir / "scp").chmod(0o755)
+        (self.bin_dir / "sleep").write_text("#!/usr/bin/env python3\nimport sys\n")
+        (self.bin_dir / "sleep").chmod(0o755)
+        leftovers = self.root / "leftovers"
+        leftovers.write_text("pub-7 sub-7\n")
+        subprocess.run(
+            ["bash", str(self.rig / "compare-brokers.sh"), str(self.root / "cmp-sweep"), str(inventory)],
+            env=self.env | {"RUN": str(self.root / "cmp-sweep"), "COMPARE_BROKERS": "mqttd",
+                            "COMPARE_RATES": "30000", "COMPARE_CONTROL": "0", "COMPARE_SECS": "1",
+                            "COMPARE_SETTLE": "1", "COMPARE_DRAIN_SECS": "2", "COMPARE_DRAIN_POLL": "1",
+                            "COMPARE_FLAT_POLLS": "1", "LEFTOVERS": str(leftovers)},
+            capture_output=True, text=True, timeout=120)
+        calls = " ".join(str(c) for c in self.calls())
+        self.assertIn("xargs -r docker rm -f", calls, "the rung never swept the drivers")
+        # The sweep must happen BEFORE this rung's own containers are started.
+        order = [c["cmd"] for c in self.calls() if "cmd" in c]
+        swept = next(i for i, c in enumerate(order) if "xargs -r docker rm -f" in c)
+        started = next((i for i, c in enumerate(order) if "--name sub-0" in c), len(order))
+        self.assertLess(swept, started, "containers were started before the drivers were swept")
+
+    def test_a_driver_that_does_not_reserve_the_metrics_ports_is_refused(self):
+        # The drivers' ephemeral range covers the ports the bench containers bind
+        # their metrics listeners on, so one of a driver's own outbound
+        # connections can take a listener's port first. emqtt-bench then exits
+        # with eaddrinuse, that container reports NO metrics, and the settle gate
+        # counts its whole population as clients the BROKER refused — on
+        # 2026-09-16 that capped mqttd at 150k msg/s with the broker uninvolved.
+        # It is random, so each broker would be capped at a different rung: an
+        # unfair comparison with nothing visible to say so. Refuse instead.
+        inventory = self.root / "reserve-inv.json"
+        inventory.write_text(json.dumps({
+            "brokers": [{"public_ip": "broker-0", "private_ip": "10.99.1.11", "server_type": "ccx23"}],
+            "drivers": [{"public_ip": "driver-1", "private_ip": "10.99.1.21", "server_type": "ccx43"}],
+        }))
+        (self.bin_dir / "ssh").write_text('''#!/usr/bin/env python3
+import json, os, sys
+args = sys.argv[1:]
+i = next(k for k, a in enumerate(args) if a.startswith("root@"))
+cmd = " ".join(args[i + 1:])
+with open(os.environ["CALL_LOG"], "a") as f:
+    f.write(json.dumps({"cmd": cmd}) + "\\n")
+if "ip_local_reserved_ports" in cmd:
+    print(os.environ.get("FAKE_RESERVED_PORTS", ""))
+sys.exit(0)
+''')
+        (self.bin_dir / "ssh").chmod(0o755)
+        run = lambda reserved: subprocess.run(  # noqa: E731
+            ["bash", str(self.rig / "compare-brokers.sh"), str(self.root / f"cmp-res-{reserved or 'none'}"),
+             str(inventory)],
+            env=self.env | {"RUN": str(self.root / f"cmp-res-{reserved or 'none'}"),
+                            "COMPARE_BROKERS": "mqttd", "COMPARE_RATES": "30000",
+                            "FAKE_RESERVED_PORTS": reserved},
+            capture_output=True, text=True, timeout=60)
+        result = run("")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("does not reserve 9400-9499", result.stderr)
+        # The cleanup `docker rm -f compare-broker` is not a start; the run is.
+        self.assertNotIn("--name compare-broker", " ".join(str(c) for c in self.calls()),
+                         "it must refuse before starting any broker")
+        # A range that only half covers it is still a refusal.
+        self.assertIn("does not reserve", run("9400-9450").stderr)
+        # And the provisioned value passes, or the guard would block every run.
+        self.assertNotIn("does not reserve", run("9400-9499").stderr)
+
+    def _drain_run(self, step: int, out_name: str):
+        """One compare rung whose receive counter grows by `step` per poll."""
+        fake = self.bin_dir
+        (fake / "ssh").write_text('''#!/usr/bin/env python3
+import json, os, pathlib, re, sys, time
+args = sys.argv[1:]
+i = next(k for k, a in enumerate(args) if a.startswith("root@"))
+host, cmd = args[i][5:], " ".join(args[i + 1:])
+if cmd == "bash -s":
+    cmd = sys.stdin.read()
+with open(os.environ["CALL_LOG"], "a") as f:
+    f.write(json.dumps({"t": time.time_ns(), "host": host, "cmd": cmd}) + "\\n")
+if "ip_local_reserved_ports" in cmd:
+    print(os.environ.get("FAKE_RESERVED_PORTS", "9400-9499"))
+    sys.exit(0)
+if "mpstat" in cmd:
+    print("CPU_STREAM_START_UTC 2026-09-16T00:00:00Z", flush=True)
+    sys.exit(0)
+if "@@@" in cmd and "docker logs" not in cmd:
+    # Every scrape moves the counter on by one step, so the drain sees a
+    # constant arrival RATE — the thing the convergence test judges.
+    c = pathlib.Path(os.environ["DRAIN_COUNTER"])
+    n = int(c.read_text()) if c.exists() else 0
+    c.write_text(str(n + 1))
+    step = int(os.environ["DRAIN_STEP"])
+    for name in re.findall(r"@@@ ([A-Za-z0-9_.-]+)", cmd):
+        print("\\n@@@ %s" % name)
+        print("recv %d" % (1000000 + n * step))
+        print("connect_succ 600")
+        print('e2e_latency_bucket{le="5"} 1000')
+        print('e2e_latency_bucket{le="+Inf"} 1000')
+    sys.exit(0)
+if "docker" in cmd or "systemctl" in cmd or "/dev/tcp/" in cmd:
+    if "docker stats" in cmd:
+        print("compare-broker 512MiB / 16GiB 42.00%")
+    if "docker logs" in cmd:
+        for name in re.findall(r"@@@ ([A-Za-z0-9_.-]+)", cmd):
+            print("\\n@@@ %s" % name)
+            print("pub total=100000 rate=15000/sec" if name.startswith("pub") else "recv total=100000 rate=15000/sec")
+    sys.exit(0)
+sys.exit(0)
+''')
+        (fake / "scp").write_text("#!/usr/bin/env python3\nimport sys\nsys.exit(0)\n")
+        (fake / "sleep").write_text("#!/usr/bin/env python3\nimport sys\n")
+        for t in ("ssh", "scp", "sleep"):
+            (fake / t).chmod(0o755)
+        inventory = self.root / f"{out_name}-inv.json"
+        inventory.write_text(json.dumps({
+            "brokers": [{"public_ip": "broker-0", "private_ip": "10.99.1.11", "server_type": "ccx23"}],
+            "drivers": [{"public_ip": "driver-1", "private_ip": "10.99.1.21", "server_type": "ccx43"}],
+        }))
+        out = self.root / out_name
+        result = subprocess.run(
+            ["bash", str(self.rig / "compare-brokers.sh"), str(out), str(inventory)],
+            env=self.env | {"RUN": str(out), "COMPARE_BROKERS": "mqttd", "COMPARE_RATES": "30000",
+                            "COMPARE_CONTROL": "0", "COMPARE_SECS": "1", "COMPARE_SETTLE": "1",
+                            "COMPARE_DRAIN_SECS": "8", "COMPARE_DRAIN_POLL": "1", "COMPARE_FLAT_POLLS": "2",
+                            "DRAIN_STEP": str(step), "DRAIN_COUNTER": str(self.root / f"{out_name}-counter")},
+            capture_output=True, text=True, timeout=180)
+        self.assertEqual(result.returncode, 0, result.stderr[-2000:])
+        return (out / "results/compare/1-mqttd/rung-30000/rung.txt").read_text(), result
+
+    def test_a_trickle_is_drained_and_a_backlog_is_not(self):
+        # Convergence is about the backlog ceasing to MATTER, not a counter going
+        # perfectly still. Demanding stillness demanded absolute zero: with a few
+        # thousand subscribers something always arrives, so on 2026-09-16 every
+        # rung above 30k reported UNRESOLVED while its own ledger showed nothing
+        # lost (lifetime delivered 102.5% of sent at 60k) — which would have
+        # published a knee of 30k for every broker in the field.
+        # At 30000 offered and a 1 s poll the threshold is 30 messages per poll.
+        rung, _ = self._drain_run(5, "trickle")
+        self.assertIn("drained=yes", rung)
+        self.assertIn("drain_eps=30", rung)
+        # And a real backlog still fails, which is the half that has to keep working.
+        rung, result = self._drain_run(5000, "backlog")
+        self.assertIn("drained=no", rung)
+        self.assertIn("still arriving", result.stderr)
+
+    def test_compare_keeps_a_window_whose_cpu_stream_ended_early(self):
+        # with_cpu_sampling reports failure when a stream ends before the wrapped
+        # command — which happens routinely a moment after a window closes. Taking
+        # that as "measure the window again" overwrote the rung's scrapes while
+        # the CPU files still described the first window, so the two halves of a
+        # rung described different minutes (2026-09-16). A window that ran is kept
+        # and flagged; only a window that never ran is measured again.
+        fake = self.bin_dir
+        (fake / "ssh").write_text('''#!/usr/bin/env python3
+import json, os, re, sys, time
+args = sys.argv[1:]
+i = next(k for k, a in enumerate(args) if a.startswith("root@"))
+host, cmd = args[i][5:], " ".join(args[i + 1:])
+if cmd == "bash -s":
+    cmd = sys.stdin.read()
+with open(os.environ["CALL_LOG"], "a") as f:
+    f.write(json.dumps({"t": time.time_ns(), "host": host, "cmd": cmd}) + "\\n")
+if "ip_local_reserved_ports" in cmd:
+    print(os.environ.get("FAKE_RESERVED_PORTS", "9400-9499"))
+    sys.exit(0)
+if "mpstat" in cmd:
+    # Three samples, then gone: the stream ends before the window does. The
+    # started/gone files make that an ordering, not a race — the fake sleep below
+    # will not return until every sampler that started has exited, so the window
+    # provably outlives its streams on any machine.
+    with open(os.environ["SAMPLERS_STARTED"], "a") as f:
+        f.write("x\\n")
+    print("CPU_STREAM_START_UTC 2026-09-16T00:00:00Z", flush=True)
+    for _ in range(3):
+        print("00:00:01  all  1 0 1 0 0 0 0 0 0 98", flush=True)
+    with open(os.environ["SAMPLERS_GONE"], "a") as f:
+        f.write("x\\n")
+    sys.exit(0)
+if "/dev/tcp/" in cmd or "docker" in cmd or "systemctl" in cmd:
+    if "docker stats" in cmd:
+        print("compare-broker 512MiB / 16GiB 42.00%")
+    if "docker logs" in cmd:
+        for name in re.findall(r"@@@ ([A-Za-z0-9_.-]+)", cmd):
+            print("\\n@@@ %s" % name)
+            print("pub total=100000 rate=15000/sec" if name.startswith("pub") else "recv total=100000 rate=15000/sec")
+    sys.exit(0)
+if "@@@" in cmd:
+    for name in re.findall(r"@@@ ([A-Za-z0-9_.-]+)", cmd):
+        print("\\n@@@ %s" % name)
+        print("recv 1000")
+        print("connect_succ 600")
+        print('e2e_latency_bucket{le="5"} 1000')
+        print('e2e_latency_bucket{le="+Inf"} 1000')
+    sys.exit(0)
+sys.exit(0)
+''')
+        (fake / "scp").write_text("#!/usr/bin/env python3\nimport sys\nsys.exit(0)\n")
+        # Instant, except that it holds until every started sampler is gone.
+        (fake / "sleep").write_text('''#!/usr/bin/env python3
+import os, pathlib, time
+started, gone = pathlib.Path(os.environ["SAMPLERS_STARTED"]), pathlib.Path(os.environ["SAMPLERS_GONE"])
+def lines(p):
+    try: return len(p.read_text().splitlines())
+    except OSError: return 0
+deadline = time.monotonic() + 30
+while lines(started) > lines(gone) and time.monotonic() < deadline:
+    time.sleep(0.01)
+''')
+        for t in ("ssh", "scp", "sleep"):
+            (fake / t).chmod(0o755)
+        inventory = self.root / "early-inv.json"
+        inventory.write_text(json.dumps({
+            "brokers": [{"public_ip": "broker-0", "private_ip": "10.99.1.11", "server_type": "ccx23"}],
+            "drivers": [{"public_ip": "driver-1", "private_ip": "10.99.1.21", "server_type": "ccx43"}],
+        }))
+        out = self.root / "early"
+        result = subprocess.run(
+            ["bash", str(self.rig / "compare-brokers.sh"), str(out), str(inventory)],
+            env=self.env | {"RUN": str(out), "COMPARE_BROKERS": "mqttd", "COMPARE_RATES": "30000",
+                            "COMPARE_CONTROL": "0", "COMPARE_SECS": "1", "COMPARE_SETTLE": "1",
+                            "COMPARE_DRAIN_SECS": "5", "COMPARE_DRAIN_POLL": "1", "COMPARE_FLAT_POLLS": "1",
+                            "SAMPLERS_STARTED": str(self.root / "samplers-started"),
+                            "SAMPLERS_GONE": str(self.root / "samplers-gone")},
+            capture_output=True, text=True, timeout=180)
+        self.assertEqual(result.returncode, 0, result.stderr[-2000:])
+        rung = (out / "results/compare/1-mqttd/rung-30000/rung.txt").read_text()
+        self.assertIn("cpu_window=incomplete", rung)
+        self.assertIn("the window stands", result.stderr)
+        self.assertNotIn("never started", result.stderr)
+        # The window ran ONCE: exactly one baseline and one closing scrape batch.
+        # A re-measure would double both.
+        batches = [c for c in self.calls() if "sub-0-base" not in str(c) and "curl -s http://localhost:94" in c.get("cmd", "")]
+        base_like = [c for c in batches if "@@@ sub-" in c["cmd"]]
+        self.assertGreaterEqual(len(base_like), 2)
+        self.assertEqual((out / "results/compare/1-mqttd/rung-30000/sub-0.prom").exists(), True)
+
+    def test_compare_refuses_a_ladder_that_outruns_the_drivers(self):
+        inventory = self.root / "inventory.json"
+        inventory.write_text(json.dumps({
+            "brokers": [{"public_ip": "b", "private_ip": "10.99.1.11", "server_type": "ccx23"}],
+            "drivers": [{"public_ip": "d", "private_ip": "10.99.1.21", "server_type": "ccx33"}],
+        }))
+        result = subprocess.run(
+            ["bash", str(self.rig / "compare-brokers.sh"), str(self.root / "cmp2"), str(inventory)],
+            env=self.env | {"COMPARE_SHAPE_ONLY": "1", "COMPARE_RATES": "30000 240000"},
+            capture_output=True, text=True, timeout=60)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("more containers per driver than 8", result.stderr)
+        self.assertEqual(self.calls(), [])
+
+    def test_compare_refuses_a_rate_that_is_not_a_whole_number_of_containers(self):
+        inventory = self.root / "inventory.json"
+        inventory.write_text(json.dumps({
+            "brokers": [{"public_ip": "b", "private_ip": "10.99.1.11", "server_type": "ccx23"}],
+            "drivers": [{"public_ip": "d", "private_ip": "10.99.1.21", "server_type": "ccx43"}],
+        }))
+        result = subprocess.run(
+            ["bash", str(self.rig / "compare-brokers.sh"), str(self.root / "cmp3"), str(inventory)],
+            env=self.env | {"COMPARE_SHAPE_ONLY": "1", "COMPARE_RATES": "31000"},
+            capture_output=True, text=True, timeout=60)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("not a multiple of 15000", result.stderr)
+        self.assertEqual(self.calls(), [])
 
     def test_missing_tofu_fails_even_when_terraform_exists(self):
         # Hermetic PATH: removing the stub must not reveal the host's real tofu.

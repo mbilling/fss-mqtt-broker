@@ -6,8 +6,10 @@ compatibility promise is **in force** from this tag: adjacent-release version sk
 migrations shipped with every schema bump, patches for the three most recent minor
 lines) · **Mosquitto** 2.0.22 / 2.1.2 (cells note where the lines
 differ) · **EMQX** 6.2.2 (documentation cells; the benchmark ran 5.8.6, the last
-Apache-licensed line — its results are **not yet published in-tree**, and issue #244
-tracks the publishable multi-host run) · **NanoMQ** 0.25.5 ·
+Apache-licensed line — its single-node results **are now published in-tree**, on
+cloud hardware with a control arm, in
+[`docs/benchmarks/SINGLE-NODE-COMPARISON.md`](benchmarks/SINGLE-NODE-COMPARISON.md);
+issue #244 tracks the remaining multi-host run) · **NanoMQ** 0.25.5 ·
 **VerneMQ** 2.1.1.
 
 This document obeys [ADR 0048](adr/0048-comparative-benchmarking.md)'s honesty rules,

@@ -25,13 +25,19 @@ variable "vcpu_quota" {
   # Raised from 100 on 2026-09-15, when Hetzner lifted the dedicated project to
   # 30 servers / 200 vCPUs. Keep this equal to the project's real limit: a value
   # above it lets an apply fail half way, a value below it refuses runs that fit.
-  default     = 200
+  default = 200
 }
 
 variable "server_quota" {
   description = "Servers the Hetzner project may run at once (brokers + drivers). Enforced by quota.tf before any server is created, for the same reason as vcpu_quota: Hetzner rejects the server that crosses the limit part way through an apply, and the ones already made keep billing. 30 since 2026-09-15."
   type        = number
   default     = 30
+}
+
+variable "broker_docker" {
+  description = "Install Docker on the broker hosts. Off for measurement runs — the published curve's broker must run the shipped binary under the shipped unit, with nothing else on the host. `run.sh compare` turns it on, because the cross-broker comparison (ADR 0048 T4) runs every broker under test, mqttd included, as a container so they share one runtime."
+  type        = bool
+  default     = false
 }
 
 variable "broker_nic_spread" {

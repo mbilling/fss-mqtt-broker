@@ -23,6 +23,13 @@ packages:
   - chrony
   - sysstat
   - ethtool
+%{ if docker ~}
+  # ADR 0048 T4's comparison runs every broker under test as a container on this
+  # host — mqttd included, so no broker gets a different runtime. Off by default:
+  # a measurement run's broker host carries the shipped binary under the shipped
+  # unit and nothing else.
+  - docker.io
+%{ endif ~}
 
 users:
   - name: mqttd
@@ -44,6 +51,9 @@ write_files:
       ${indent(6, sysctl_conf)}
 
 runcmd:
+%{ if docker ~}
+  - systemctl enable --now docker
+%{ endif ~}
   # Belt and braces for the expired-password trap above, in case the platform's
   # own config wins the merge: mark the password changed today and lock it.
   - chage -d now root && passwd -l root

@@ -86,8 +86,26 @@ full)
 	shift || true
 	if [ $# -gt 0 ]; then SIZES=("$@"); else SIZES=(1 3 5); fi
 	;;
+compare)
+	# ADR 0048 T4: the cross-broker comparison the compose harness in bench/
+	# cannot make, because publishable numbers need the driver off the broker's
+	# host. ONE broker host, one driver fleet, every broker run on it in turn
+	# (compare-brokers.sh); no cluster, no lanes, no mqttd-only metrics.
+	[ "$#" -eq 1 ] || die "compare takes no size arguments — it measures a single broker host"
+	SIZES=(1)
+	export COMPARE=1
+	# Three drivers, not two: at the top of the default ladder two 16-vCPU
+	# drivers would carry a container on every core, and a driver at 100%
+	# container density is the shape that makes a driver limit read as a broker
+	# limit. Three keeps the busiest driver near 70%.
+	DRIVER_COUNT="${DRIVER_COUNT:-3}"
+	if [ "$CLOUD" = hcloud ]; then
+		BROKER_TYPE="${BROKER_TYPE:-ccx23}"
+		DRIVER_TYPE="${DRIVER_TYPE:-ccx43}"
+	fi
+	;;
 *)
-	echo "usage: $0 smoke | standard [sizes...] | full [sizes...]" >&2
+	echo "usage: $0 smoke | standard [sizes...] | full [sizes...] | compare" >&2
 	exit 2
 	;;
 esac
@@ -220,6 +238,17 @@ for size in sizes:
     pathlib.Path(run, f'shape-inventory-{size}.json').write_text(json.dumps(inventory))
 PY
 for N in "${SIZES[@]}"; do
+	if [ "${COMPARE:-0}" = 1 ]; then
+		# The comparison ladder has its own budget arithmetic (one publisher AND
+		# one subscriber container per slice of the rate); the lane shapes do not
+		# apply to it.
+		COMPARE_SHAPE_ONLY=1 "$SCALE_DIR/compare-brokers.sh" "$RUN/preflight-$N" "$RUN/shape-inventory-$N.json" \
+			>"$RUN/shape-preflight-$N.log" 2>&1 || {
+			tail -25 "$RUN/shape-preflight-$N.log" >&2
+			die "invalid comparison shape; no cloud resources touched"
+		}
+		continue
+	fi
 	SHAPE_ONLY=1 "$SCALE_DIR/run-curve.sh" "$RUN/preflight-$N" "$RUN/shape-inventory-$N.json" \
 		>"$RUN/shape-preflight-$N.log" 2>&1 || {
 		tail -25 "$RUN/shape-preflight-$N.log" >&2
@@ -327,6 +356,7 @@ for N in "${SIZES[@]}"; do
 		${BROKER_TYPE:+-var broker_server_type="$BROKER_TYPE"} \
 		${DRIVER_TYPE:+-var driver_server_type="$DRIVER_TYPE"} \
 		${BROKER_NIC_SPREAD:+-var broker_nic_spread="$BROKER_NIC_SPREAD"} \
+		${COMPARE:+-var broker_docker=true} \
 		>"$RUN/tf-apply-$N.log" 2>&1) || {
 		tail -30 "$RUN/tf-apply-$N.log" >&2
 		die "OpenTofu apply failed for size $N"
@@ -434,6 +464,14 @@ for N in "${SIZES[@]}"; do
 		;;
 	esac
 
+	if [ "${COMPARE:-0}" = 1 ]; then
+		# No cluster to bootstrap and no lanes to run: every broker under test,
+		# mqttd included, runs as a container on this host in turn.
+		phase running "broker comparison"
+		"$SCALE_DIR/compare-brokers.sh" "$RUN" "$INVENTORY"
+		phase collecting "broker comparison"
+		"$SCALE_DIR/collect.sh" "$RUN" "$INVENTORY" || true
+	else
 	phase bootstrapping "$N nodes"
 	"$SCALE_DIR/bootstrap-cluster.sh" "$RUN" "$INVENTORY" durable
 	# Live Grafana on the laptop, fed by an Alloy scraper on driver-1 through a
@@ -464,6 +502,7 @@ for N in "${SIZES[@]}"; do
 	"$SCALE_DIR/collect.sh" "$RUN" "$INVENTORY"
 	if [ "${OBSERVE:-1}" = 1 ]; then
 		"$SCALE_DIR/observe.sh" detach || true
+	fi
 	fi
 
 	phase teardown "$N nodes"

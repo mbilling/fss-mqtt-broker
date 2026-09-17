@@ -1,0 +1,36 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 460" width="900" height="460" font-family="system-ui,-apple-system,Segoe UI,Roboto,sans-serif" role="img" aria-label="hivemq at 75,000 msg/s offered — delivered rate and broker memory">
+<rect width="900" height="460" fill="#ffffff"/>
+<text x="70" y="26" font-size="16" font-weight="600" fill="#0f172a">hivemq at 75,000 msg/s offered — delivered rate and broker memory</text>
+<text x="70" y="44" font-size="12" fill="#475569">from the rung's start until the backlog drained; memory is the container's cgroup RSS</text>
+<rect x="70" y="54" width="752" height="320" fill="none" stroke="#cbd5e1"/>
+<line x1="70" y1="374.0" x2="822" y2="374.0" stroke="#e2e8f0"/>
+<text x="62" y="378.0" font-size="11" fill="#2563eb" text-anchor="end">0k</text>
+<text x="830" y="378.0" font-size="11" fill="#7c3aed">0M</text>
+<line x1="70" y1="294.0" x2="822" y2="294.0" stroke="#e2e8f0"/>
+<text x="62" y="298.0" font-size="11" fill="#2563eb" text-anchor="end">3k</text>
+<text x="830" y="298.0" font-size="11" fill="#7c3aed">1448M</text>
+<line x1="70" y1="214.0" x2="822" y2="214.0" stroke="#e2e8f0"/>
+<text x="62" y="218.0" font-size="11" fill="#2563eb" text-anchor="end">6k</text>
+<text x="830" y="218.0" font-size="11" fill="#7c3aed">2896M</text>
+<line x1="70" y1="134.0" x2="822" y2="134.0" stroke="#e2e8f0"/>
+<text x="62" y="138.0" font-size="11" fill="#2563eb" text-anchor="end">9k</text>
+<text x="830" y="138.0" font-size="11" fill="#7c3aed">4343M</text>
+<line x1="70" y1="54.0" x2="822" y2="54.0" stroke="#e2e8f0"/>
+<text x="62" y="58.0" font-size="11" fill="#2563eb" text-anchor="end">12k</text>
+<text x="830" y="58.0" font-size="11" fill="#7c3aed">5791M</text>
+<text x="70.0" y="392" font-size="11" fill="#475569" text-anchor="middle">0s</text>
+<text x="164.8" y="392" font-size="11" fill="#475569" text-anchor="middle">15s</text>
+<text x="259.6" y="392" font-size="11" fill="#475569" text-anchor="middle">30s</text>
+<text x="354.4" y="392" font-size="11" fill="#475569" text-anchor="middle">45s</text>
+<text x="449.2" y="392" font-size="11" fill="#475569" text-anchor="middle">60s</text>
+<text x="543.9" y="392" font-size="11" fill="#475569" text-anchor="middle">75s</text>
+<text x="638.7" y="392" font-size="11" fill="#475569" text-anchor="middle">90s</text>
+<text x="733.5" y="392" font-size="11" fill="#475569" text-anchor="middle">105s</text>
+<text x="814" y="72" font-size="11" fill="#b91c1c" text-anchor="end">offered 75,000/s is above this axis — peak delivered was 16% of it</text>
+<path d="M348.1,353.9 L354.4,236.8 L360.7,216.1 L367.0,206.2 L373.3,164.5 L379.6,106.0 L386.0,191.5 L392.3,187.5 L398.6,167.6 L404.9,124.8 L411.2,54.0 L417.6,85.6 L423.9,166.5 L430.2,92.9 L436.5,101.6 L442.8,75.2 L449.2,101.7 L455.5,132.9 L461.8,123.7 L468.1,129.7 L474.4,150.4 L480.8,181.0 L487.1,159.7 L493.4,211.1 L499.7,188.8 L506.0,182.6 L512.4,173.9 L518.7,182.6 L525.0,205.5 L531.3,212.2 L537.6,253.7 L543.9,316.5 L550.3,320.5 L556.6,281.9 L562.9,261.7 L569.2,261.7 L575.5,226.2 L581.9,243.4 L588.2,213.9 L594.5,256.1 L600.8,276.4 L607.1,280.4 L613.5,289.8 L619.8,293.4 L626.1,369.2 L645.1,373.1 L651.4,368.4" fill="none" stroke="#2563eb" stroke-width="2"/>
+<path d="M70.0,363.1 L76.3,360.5 L82.6,356.0 L89.0,354.9 L95.3,354.9 L101.6,354.8 L107.9,355.5 L114.2,354.9 L120.6,353.4 L126.9,349.7 L133.2,342.1 L139.5,325.7 L145.8,321.3 L152.2,302.4 L158.5,287.2 L164.8,283.6 L171.1,275.6 L177.4,259.6 L183.7,245.6 L190.1,230.9 L196.4,211.9 L202.7,204.7 L209.0,197.0 L215.3,178.0 L221.7,177.2 L228.0,176.7 L240.6,165.0 L246.9,164.2 L253.3,164.1 L259.6,155.6 L265.9,153.7 L272.2,148.6 L278.5,142.8 L284.9,142.0 L291.2,137.4 L297.5,130.7 L303.8,124.4 L310.1,113.4 L316.5,107.2 L322.8,101.9 L329.1,115.6 L335.4,114.8 L341.7,114.7 L348.1,113.3 L354.4,112.2 L360.7,110.9 L367.0,108.5 L373.3,102.5 L379.6,96.3 L386.0,90.9 L392.3,107.5 L398.6,105.1 L404.9,98.8 L411.2,93.7 L417.6,88.8 L423.9,97.3 L430.2,91.6 L436.5,86.7 L442.8,81.7 L449.2,84.0 L455.5,78.6 L461.8,73.4 L468.1,68.3 L474.4,64.5 L480.8,59.6 L487.1,55.3 L493.4,54.3 L499.7,54.6 L506.0,54.2 L512.4,54.0 L518.7,55.5 L525.0,55.4 L531.3,55.3 L537.6,55.1 L543.9,54.9 L550.3,54.9 L556.6,54.9 L562.9,54.8 L569.2,54.8 L575.5,54.6 L581.9,54.2 L588.2,54.1 L594.5,54.9 L600.8,54.8 L607.1,54.8 L613.5,54.7 L619.8,54.1 L626.1,54.1 L632.4,54.8 L638.7,54.2 L645.1,54.2 L651.4,55.0 L657.7,54.5 L664.0,54.4 L670.3,54.9 L676.7,54.4 L683.0,54.4 L689.3,55.0 L695.6,54.9 L701.9,54.9 L708.3,54.9 L714.6,54.8 L720.9,54.8 L727.2,54.8 L733.5,54.5 L739.8,54.5 L746.2,55.0 L752.5,55.0 L758.8,55.0 L765.1,55.0 L771.4,55.0 L777.8,55.0 L784.1,55.0 L790.4,54.6 L796.7,54.6 L803.0,54.8 L809.4,54.5 L815.7,54.5 L822.0,54.8" fill="none" stroke="#7c3aed" stroke-width="2" stroke-dasharray="6 3"/>
+<rect x="70" y="434" width="18" height="3" fill="#2563eb"/>
+<text x="94" y="440" font-size="11" fill="#334155">delivered msg/s (left)</text>
+<rect x="258" y="434" width="18" height="3" fill="#7c3aed"/>
+<text x="282" y="440" font-size="11" fill="#334155">broker RSS (right)</text>
+</svg>

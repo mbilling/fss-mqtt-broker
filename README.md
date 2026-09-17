@@ -164,6 +164,60 @@ See [`docs/adr/`](docs/adr/) for the decisions and the
 [**delivery dashboard**](docs/delivery/STATUS.md) — the authoritative, live
 record of exactly what is built (77 ADRs, per-task status).
 
+## How fast is one node, next to the others
+
+**One Hetzner CCX23 (4 dedicated vCPU), all four brokers run on the same
+host in sequence, 2026-09-16.** The knee is the highest rate that still met
+**p99 ≤ 1 s** with ≥99% delivered, 1:1 QoS 0 publish/subscribe:
+
+| broker | knee | p99 at knee | CPU idle at knee | RSS at knee |
+|---|---|---|---|---|
+| **mqttd 1.0.17** | **75 000 msg/s** | ≤500 ms | 30% | 133 MiB |
+| Mosquitto 2.0.20 | 45 000 msg/s | ≤100 ms | 70% | **18 MiB** |
+| EMQX 5.8.6 | 45 000 msg/s | ≤500 ms | 2% | 434 MiB |
+| HiveMQ CE 2024.3 | 30 000 msg/s | ≤100 ms | 5% | 927 MiB |
+
+**Where mqttd loses:** Mosquitto holds its knee in **7× less memory**, and
+both Mosquitto and HiveMQ keep a **tighter tail at their own knees** (≤100 ms)
+than mqttd does at its (≤500 ms). The single claim here is the highest rate on
+this host at this service level. The ladder steps in 15 000 msg/s, so every
+knee is bracketed by its next rung, ours included.
+
+**The fairness choices that matter most**, all arguable and all published:
+the load generator is **EMQX's own `emqtt-bench`**, not ours; measurement is
+**driver-side only**, because the four brokers' internal counters are not
+comparable; **mqttd's durable-by-default is switched OFF** so every broker is
+in-memory alike ([ADR 0048](docs/adr/0048-comparative-benchmarking.md) §4
+forbids buying "fast" by quietly disabling a guarantee); and **mqttd ran
+twice — first and last** — as a control, reproducing its own knee to 0.1%
+after four reboots and three other brokers, or the run would have been
+declared void instead of published. **No broker here is tuned**, including
+ours; each runs a documented reasonable minimum, and a vendor tuning their own
+would likely beat its figure.
+
+**Latency is a distribution, not a number.** At 45 000 msg/s — Mosquitto's and
+EMQX's knee, inside mqttd's — mqttd delivers 97.8% of messages within 10 ms,
+Mosquitto 30.6%, EMQX 14.9%, and HiveMQ 0.4% with only 61% inside a second. The
+dashed line is mqttd's control arm, run last: two lines lying on each other are
+the reproducibility claim, drawn rather than asserted.
+
+![Latency distribution at 45,000 msg/s offered](docs/benchmarks/img/latency-45000.svg)
+
+**Overloaded, the four behave differently, and that is a choice, not a ranking.**
+Driven at 150 000 msg/s, mqttd queues — memory to 3.8 GiB — then drains at
+**1.6× the offered rate** once publishers stop and gives 95% of the memory back.
+Mosquitto never accepts the load (38% of offer) so it has nothing to flush and
+stays under 1 GiB. EMQX keeps 76% of its peak memory after the backlog is gone.
+HiveMQ carried 5.8 GiB into the rung, reached 12 GiB, and its JVM terminated —
+which is HiveMQ's own configured behaviour (`-XX:+CrashOnOutOfMemoryError`), and
+it happened on two separate fleets.
+
+**Every setting for every broker, the gates, the per-rung tables, the charts and
+the limits are in
+[docs/benchmarks/SINGLE-NODE-COMPARISON.md](docs/benchmarks/SINGLE-NODE-COMPARISON.md)**
+— published so the numbers can be attacked, not just read. One node, QoS 0,
+plaintext: it says nothing about clustered, durable or TLS throughput.
+
 ## The runnable map: mqttui
 
 **`mqttui`** is the map of everything runnable in this repository — the demo
@@ -1421,7 +1475,7 @@ Validate a rendered config without a cluster: `mqttd --check-config --config <fi
 
 ### Running the demo, migrations and test scripts
 
-There are 62 runnable scripts here — the demo stack, the Mosquitto/EMQX/HiveMQ converters
+There are 65 runnable scripts here — the demo stack, the Mosquitto/EMQX/HiveMQ converters
 and the dual-run cutover smoke, the smoke and conformance suites, the Kubernetes end-to-end
 runs, the benchmark harness and the multi-host scale-curve rig. `mqttui` is the
 one place they are listed, explained and started ([ADR 0056](docs/adr/0056-mqttui.md), and

@@ -1,0 +1,41 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 460" width="900" height="460" font-family="system-ui,-apple-system,Segoe UI,Roboto,sans-serif" role="img" aria-label="Latency distribution at 75,000 msg/s offered">
+<rect width="900" height="460" fill="#ffffff"/>
+<text x="70" y="26" font-size="16" font-weight="600" fill="#0f172a">Latency distribution at 75,000 msg/s offered</text>
+<text x="70" y="44" font-size="12" fill="#475569">share of messages delivered within X — driver-side, histogram bucket bounds, measured window only</text>
+<rect x="70" y="54" width="752" height="342" fill="none" stroke="#cbd5e1"/>
+<line x1="70.0" y1="54" x2="70.0" y2="396" stroke="#e2e8f0"/>
+<text x="70.0" y="414" font-size="11" fill="#475569" text-anchor="middle">1 ms</text>
+<line x1="238.0" y1="54" x2="238.0" y2="396" stroke="#e2e8f0"/>
+<text x="238.0" y="414" font-size="11" fill="#475569" text-anchor="middle">10 ms</text>
+<line x1="405.9" y1="54" x2="405.9" y2="396" stroke="#e2e8f0"/>
+<text x="405.9" y="414" font-size="11" fill="#475569" text-anchor="middle">100 ms</text>
+<line x1="573.9" y1="54" x2="573.9" y2="396" stroke="#e2e8f0"/>
+<text x="573.9" y="414" font-size="11" fill="#475569" text-anchor="middle">1 s</text>
+<line x1="741.9" y1="54" x2="741.9" y2="396" stroke="#e2e8f0"/>
+<text x="741.9" y="414" font-size="11" fill="#475569" text-anchor="middle">10 s</text>
+<line x1="822.0" y1="54" x2="822.0" y2="396" stroke="#e2e8f0"/>
+<text x="822.0" y="414" font-size="11" fill="#475569" text-anchor="middle">30 s</text>
+<line x1="70" y1="396.0" x2="822" y2="396.0" stroke="#e2e8f0"/>
+<text x="62" y="400.0" font-size="11" fill="#475569" text-anchor="end">0%</text>
+<line x1="70" y1="225.0" x2="822" y2="225.0" stroke="#e2e8f0"/>
+<text x="62" y="229.0" font-size="11" fill="#475569" text-anchor="end">50%</text>
+<line x1="70" y1="88.2" x2="822" y2="88.2" stroke="#e2e8f0"/>
+<text x="62" y="92.2" font-size="11" fill="#475569" text-anchor="end">90%</text>
+<line x1="70" y1="57.4" x2="822" y2="57.4" stroke="#e2e8f0"/>
+<text x="62" y="61.4" font-size="11" fill="#475569" text-anchor="end">99%</text>
+<line x1="70" y1="54.0" x2="822" y2="54.0" stroke="#e2e8f0"/>
+<text x="62" y="58.0" font-size="11" fill="#475569" text-anchor="end">100%</text>
+<path d="M187.4,396.0 L187.4,395.9 L238.0,395.9 L238.0,381.3 L304.8,381.3 L304.8,322.0 L355.4,322.0 L355.4,208.9 L405.9,208.9 L405.9,106.2 L523.3,106.2 L523.3,57.2 L573.9,57.2 L573.9,54.8 L624.5,54.8 L624.5,54.2 L654.0,54.2 L654.0,54.1 L675.0,54.1 L675.0,54.1 L691.3,54.1 L691.3,54.1 L720.9,54.1 L720.9,54.0 L741.9,54.0 L741.9,54.0 L771.4,54.0 L771.4,54.0 L792.4,54.0 L792.4,54.0 L808.7,54.0 L808.7,54.0 L822.0,54.0 L822.0,54.0" fill="none" stroke="#2563eb" stroke-width="2"/>
+<path d="M720.9,396.0 L720.9,349.8 L741.9,349.8 L741.9,292.0 L771.4,292.0 L771.4,231.9 L792.4,231.9 L792.4,133.4 L808.7,133.4 L808.7,75.9 L822.0,75.9 L822.0,54.9" fill="none" stroke="#059669" stroke-width="2"/>
+<path d="M720.9,396.0 L720.9,395.7 L741.9,395.7 L741.9,384.3 L771.4,384.3 L771.4,315.7 L792.4,315.7 L792.4,244.2 L808.7,244.2 L808.7,169.1 L822.0,169.1 L822.0,95.2" fill="none" stroke="#d97706" stroke-width="2"/>
+<path d="M187.4,396.0 L187.4,395.9 L238.0,395.9 L238.0,378.1 L304.8,378.1 L304.8,315.9 L355.4,315.9 L355.4,204.3 L405.9,204.3 L405.9,110.9 L523.3,110.9 L523.3,58.2 L573.9,58.2 L573.9,55.2 L624.5,55.2 L624.5,54.4 L654.0,54.4 L654.0,54.2 L675.0,54.2 L675.0,54.1 L691.3,54.1 L691.3,54.1 L720.9,54.1 L720.9,54.1 L741.9,54.1 L741.9,54.0 L771.4,54.0 L771.4,54.0 L792.4,54.0 L792.4,54.0 L808.7,54.0 L808.7,54.0 L822.0,54.0 L822.0,54.0" fill="none" stroke="#2563eb" stroke-width="2"/>
+<rect x="70" y="434" width="18" height="3" fill="#2563eb"/>
+<text x="94" y="440" font-size="11" fill="#334155">mqttd (pass)</text>
+<rect x="188" y="434" width="18" height="3" fill="#059669"/>
+<text x="212" y="440" font-size="11" fill="#334155">mosquitto (failed this rung)</text>
+<rect x="418" y="434" width="18" height="3" fill="#d97706"/>
+<text x="442" y="440" font-size="11" fill="#334155">emqx (failed this rung)</text>
+<rect x="613" y="434" width="18" height="3" fill="#2563eb"/>
+<text x="637" y="440" font-size="11" fill="#334155">mqttd (pass)</text>
+<text x="70" y="434" font-size="11" fill="#64748b">each step is a histogram bucket bound: the curve can only overstate latency, never flatter it</text>
+</svg>
