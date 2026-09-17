@@ -13,6 +13,12 @@
 > broker available, with quorum-replicated durable sessions **on by default**,
 > and a 100% open, Apache-2.0 feature set — clustering, security and
 > observability included.
+>
+> **Measured, not asserted:** on one 4-vCPU cloud host, a single mqttd node holds
+> **75,000 msg/s** at p99 ≤ 1 s — **1.7× Mosquitto and EMQX, 2.5× HiveMQ CE** —
+> with **97.8% of messages delivered within 10 ms** at the rate where the others
+> hit their knee. Same host, same load tool (EMQX's own), control arm reproduced
+> to 0.1%. [The numbers](#by-the-numbers) · [the method](#benchmarks).
 
 *(GHCR does not publish a pull-count badge; the image badge above links to the package page.)*
 
@@ -20,11 +26,62 @@
 
 ## Why mqttd
 
+- **The fastest single node in the published comparison.** 75,000 msg/s at p99 ≤ 1 s against 45,000 for Mosquitto and EMQX and 30,000 for HiveMQ CE, on the same host, with 30% CPU still idle at the knee — and under 2× overload it queues, then drains at 1.6× the offered rate and hands 95% of the memory back.
 - **Durable by default.** Every persistent session is quorum-replicated. An acked QoS 1/2 message survives the loss of the node that accepted it — queued *or in flight* — and a group too thin to keep that promise **refuses** the write rather than acking on one copy.
 - **Revocation reaches live state.** Reload the policy and a revoked certificate, removed user, or tightened grant **evicts the already-connected client** — not at its next reconnect, now. No compared broker documents this.
 - **Secure by default, loudly.** TLS 1.3, mTLS/OIDC identity, deny-by-default ACLs, tamper-evident audit. Every insecure mode is opt-in and logs `INSECURE:` on every start.
 - **Clustering is not a paid feature.** One Apache-2.0 codebase, signed reproducible binaries, SBOM and SLSA provenance. EMQX gates production clustering behind BSL; VerneMQ's production binaries are EULA-paid; HiveMQ CE is single-node.
 - **Claims you can check.** Every capability maps to a task with evidence on the [delivery dashboard](docs/delivery/STATUS.md); benchmarks print their losing cells; what is missing is listed in [Limitations](README.md#limitations), not left to be discovered.
+
+---
+
+## By the numbers
+
+Every figure below is published in-tree with its method, hardware, versions, and the cells
+mqttd loses. Cross-broker numbers: [SINGLE-NODE-COMPARISON.md](docs/benchmarks/SINGLE-NODE-COMPARISON.md)
+(run 2026-09-16, Hetzner CCX23, 4 dedicated vCPU / 16 GB, one host, brokers in sequence).
+Cluster numbers: [SCALE-CURVE.md](docs/benchmarks/SCALE-CURVE.md) (one dedicated host and NVMe disk per broker).
+
+**Single-node knee** — the highest offered rate that still met p99 ≤ 1 s with ≥ 99% delivered (1:1 QoS 0, 200 B, untuned documented minimum config for every broker):
+
+| broker | knee | p99 at knee | CPU idle at knee | RSS at knee |
+|---|---|---|---|---|
+| **mqttd 1.0.17** | **75,000 msg/s** | ≤ 500 ms | **30%** | 133 MiB |
+| Mosquitto 2.0.20 | 45,000 msg/s | ≤ 100 ms | 70% (single-threaded: one core of four) | **18 MiB** |
+| EMQX 5.8.6 | 45,000 msg/s | ≤ 500 ms | 2% | 434 MiB |
+| HiveMQ CE 2024.3 | 30,000 msg/s | ≤ 100 ms | 5% | 927 MiB |
+
+**Latency is a distribution.** At 45,000 msg/s, the rate where Mosquitto and EMQX reach their knee, the share of messages delivered within:
+
+| | 1 ms | 10 ms | 25 ms | 100 ms | 1 s |
+|---|---|---|---|---|---|
+| **mqttd** | **39.9%** | **97.8%** | **100%** | 100% | 100% |
+| Mosquitto | 0.1% | 30.6% | 57.8% | 99.7% | 100% |
+| EMQX | 0.1% | 14.9% | 40.6% | 82.8% | 100% |
+| HiveMQ CE | 0.0% | 0.4% | 2.3% | 25.4% | 61.1% |
+
+![Latency distribution at 45,000 msg/s offered — mqttd's dashed control arm lies on its solid first arm](docs/benchmarks/img/latency-45000.svg)
+
+**Overload at 150,000 msg/s** (2× past mqttd's knee, 3–5× past the others'):
+
+| | mqttd | Mosquitto | EMQX | HiveMQ CE |
+|---|---|---|---|---|
+| behaviour | queues, then **drains at 239,000 msg/s** (1.6× offered) | accepts 38% of offer, flat | queues | **JVM dies** (`OutOfMemory`) |
+| peak memory | 3.8 GiB | 991 MiB | 3.6 GiB | 12 GiB |
+| memory returned after drain | **95%** | **98%** | 24% | — |
+| delivered ledger | whole | partial | whole | 0 clients connected |
+
+**Cluster scale-out, durable QoS 1** (acked only after fsync + quorum replication; 48 publishers × window 8, 256 B):
+
+| nodes | acked msg/s | p99 saturating | p99 uncontended |
+|---|---|---|---|
+| 1 | 8,503 | 90 ms | 1.01 ms |
+| 3 | 8,647 | 82 ms | 1.81 ms |
+| 5 | **13,893** (1.63× one node) | **56 ms** | 1.69 ms |
+
+**More published points:** non-durable `$share` fan-out floor **~18.6k → ~53.9k → ~81.4k msg/s** at 1 → 3 → 5 nodes (driver-limited, so floors); **50,000 idle connections at a flat 19.3–19.7 KiB each** at every cluster size; codec encodes a 256 B PUBLISH in **~270 ns** and decodes it in **~190 ns**, with a per-PR regression floor.
+
+**Where mqttd loses, on the same pages:** Mosquitto holds its knee in **7× less memory**; Mosquitto and HiveMQ keep a **tighter tail at their own knees** (≤ 100 ms vs mqttd's ≤ 500 ms); EMQX is the quietest at 15,000 msg/s (≤ 1 ms p99, matched by mqttd); the durable path costs **~28 ms p50** per message on dev hardware against ~0.03 ms to a clean session; 3 nodes ≈ 1 node on the durable curve (the quorum tax); and there are **no production users yet**.
 
 ---
 
@@ -113,90 +170,146 @@ signed release artifacts.
 
 ## Benchmarks
 
-**Honesty rules first** ([ADR 0048](docs/adr/0048-comparative-benchmarking.md)): versions pinned,
-hardware and config disclosed, results dated, losing dimensions printed as prominently
-as winning ones, and nothing single-host is ever published as a cluster number.
+**Honesty rules first** ([ADR 0048](docs/adr/0048-comparative-benchmarking.md)): versions
+pinned, hardware and config disclosed, results dated, losing dimensions printed as prominently
+as winning ones, a control arm that voids the run if it drifts, and nothing single-host is ever
+published as a cluster number.
 
-### Cross-broker results: not yet published
+### Cross-broker: the single-node knee
 
-The [harness](bench/README.md) runs **mqttd, Mosquitto 2.0.20, EMQX 5.8.6, VerneMQ 2.1.1
-and NanoMQ 0.25.5** under identical, disclosed postures, driven by
-[emqtt-bench 0.6.3](https://github.com/emqx/emqtt-bench) — deliberately EMQX's own load
-tool, so no home-field driver flatters us. **No cross-broker numbers are printed here**
-because the publishable multi-host run has not happened yet
-(tracked: [#545](https://github.com/mbilling/fss-mqtt-broker/issues/545)). The table
-below is the shape of the result that will land, with the harness scenario each row comes from.
+**Dated 2026-09-17, run 2026-09-16** — [SINGLE-NODE-COMPARISON.md](docs/benchmarks/SINGLE-NODE-COMPARISON.md).
+One Hetzner CCX23 (4 dedicated vCPU, AMD EPYC-Milan, 16 GB), all four brokers on the same host
+one after another with a reboot between arms, driven by three oversized CCX43 (16 vCPU) hosts
+running EMQX's own [emqtt-bench 0.6.3](https://github.com/emqx/emqtt-bench).
 
-| Scenario (`bench/run.sh`) | mqttd | Mosquitto 2.0.20 | EMQX 5.8.6 | VerneMQ 2.1.1 | NanoMQ 0.25.5 |
-|---|---|---|---|---|---|
-| `conn` — connect rate, RSS per idle connection | *pending* | *pending* | *pending* | *pending* | *pending* |
-| `pubsub-qos0` — msg/s, p50/p99/p999 | *pending* | *pending* | *pending* | *pending* | *pending* |
-| `pubsub-qos1` | *pending* | *pending* | *pending* | *pending* | *pending* |
-| `pubsub-qos2` | *pending* | *pending* | *pending* | *pending* | *pending* |
-| `tls-conn` — connect rate under mTLS | *pending* | *pending* | *pending* | *pending* | *pending* |
-| `tls-pubsub-qos1` — the security cost, shown | *pending* | *pending* | *pending* | *pending* | *pending* |
+| broker | version (image digest pinned) | **knee** | p99 at knee | CPU idle at knee (mean / min) | RSS at knee | first failing rung |
+|---|---|---|---|---|---|---|
+| **mqttd** | 1.0.17 (the published image, not a special build) | **75,000 msg/s** | ≤ 500 ms | 30% / 21% | 133 MiB | 90,000 — p99 ≤ 7.5 s |
+| Mosquitto | 2.0.20 | 45,000 msg/s | ≤ 100 ms | 70% / 57% | **18 MiB** | 60,000 — p99 ≤ 10 s |
+| EMQX | 5.8.6 (last Apache-2.0 line) | 45,000 msg/s | ≤ 500 ms | 2% / 0% | 434 MiB | 60,000 — p99 ≤ 25 s |
+| HiveMQ CE | 2024.3 | 30,000 msg/s | ≤ 100 ms | 5% / 3% | 927 MiB | 45,000 — p99 ≤ 5 s |
 
-HiveMQ CE is not in the set: ADR 0048 compares self-hostable, like-for-like brokers and
-HiveMQ CE has no clustering to compare against.
+The ladder steps in 15,000 msg/s, so every knee is bracketed by its next rung (mqttd's true
+knee is between 75,000 and 90,000; a finer ladder would move every row). **The control
+passed:** mqttd ran first and last, and arm 5 reproduced arm 1's knee with 0.1% delivery
+drift after four reboots and three other brokers. A second, shorter run on a separately
+provisioned fleet on 2026-09-17 reproduced mqttd's 75,000 knee and HiveMQ's heap death.
 
-### What is published: mqttd against itself, on real hardware
+**What limited each broker:** Mosquitto is core-bound (single-threaded, one to one and a half
+of four cores ever used); EMQX is CPU-bound (2% idle at its knee); HiveMQ CE is memory-bound and
+does not degrade, it dies (52.6% of messages undelivered one rung past its knee, then
+`OutOfMemory: Java heap space` with the vendor-shipped `-XX:+CrashOnOutOfMemoryError`);
+**mqttd is the only one not CPU-limited at its knee** — what fails first is the tail.
 
-The **scaling curve** ([SCALE-CURVE.md](docs/benchmarks/SCALE-CURVE.md), verified against
-`v1.0.5`, 2026-08-24): the same workload against fresh 1-, 3- and 5-node clusters, one
-dedicated host and one local NVMe disk per broker.
+```text
+single-node knee, msg/s at p99 ≤ 1 s (same host, same driver, untuned)
+mqttd      1.0.17   ██████████████████████████████████████████████████  75,000
+Mosquitto  2.0.20   ██████████████████████████████                      45,000
+EMQX       5.8.6    ██████████████████████████████                      45,000
+HiveMQ CE  2024.3   ████████████████████                                30,000
+```
+
+**Latency distribution, all four brokers at 45,000 msg/s** (chart above in
+[By the numbers](#by-the-numbers); the 30,000 and 75,000 charts are
+[here](docs/benchmarks/img/latency-30000.svg) and [here](docs/benchmarks/img/latency-75000.svg)).
+At 30,000 msg/s, where every broker passes, they are far closer: mqttd 96.7% within 1 ms,
+EMQX 75.9%, Mosquitto 59.5%, HiveMQ 12.2%. The curves separate as load approaches each broker's
+knee, which is what a single p99 hides.
+
+**Overload has a shape.** Driven at 150,000 msg/s until the backlog cleared:
+
+| | mqttd | Mosquitto | EMQX | HiveMQ CE |
+|---|---|---|---|---|
+| memory at rung start | 9 MiB | 1 MiB | 666 MiB | 5,788 MiB |
+| peak | 3,781 MiB | 991 MiB | 3,568 MiB | 12,012 MiB |
+| after the drain | 190 MiB | 17 MiB | 2,714 MiB | process gone |
+| **memory returned** | **95%** | **98%** | 24% | — |
+| burst when publishers stop | **yes, 239,000 msg/s (1.6× offered)** | none (never accepted the load: ~40,000 msg/s flat) | none | — |
+| chart | [timeline](docs/benchmarks/img/timeline-mqttd-150k.svg) | [timeline](docs/benchmarks/img/timeline-mosquitto-150k.svg) | [timeline](docs/benchmarks/img/timeline-emqx-150k.svg) | [timeline](docs/benchmarks/img/timeline-hivemq-150k.svg) |
+
+![mqttd at 150,000 msg/s: delivered rate against broker memory, then the drain burst](docs/benchmarks/img/timeline-mqttd-150k.svg)
+
+mqttd banks the excess and flushes it; Mosquitto sheds at the door and stays under 1 GiB. Both
+are defensible answers to overload, and a buyer should pick the one their system wants.
+
+### mqttd against itself: the cluster scaling curve
+
+[SCALE-CURVE.md](docs/benchmarks/SCALE-CURVE.md), verified against `v1.0.5` (2026-08-24): the
+same workload against fresh 1-, 3- and 5-node clusters, one Hetzner CCX23 and one local NVMe
+disk per broker, released cosign-signed binary, shipped systemd unit.
 
 **Curve 1 — durable QoS 1, acked only after fsync + quorum replication** (48 closed-loop
 publishers × window 8, 48 durable subscribers, 256 B, 60 s windows, median of 3):
 
-| nodes | acked msg/s (saturating) | p99 (saturating) | p99 (uncontended) |
-|---|---|---|---|
-| 1 | 8,503 | 90 ms | 1.01 ms |
-| 3 | 8,647 | 82 ms | 1.81 ms |
-| 5 | **13,893** | 56 ms | 1.69 ms |
+| nodes | acked msg/s (saturating) | p99 (saturating) | p99 (uncontended) | × slowest disk's barrier rate |
+|---|---|---|---|---|
+| 1 | 8,503 | 90 ms | 1.01 ms | 3.9× |
+| 3 | 8,647 | 82 ms | 1.81 ms | 4.4× |
+| 5 | **13,893** | **56 ms** | 1.69 ms | 7.2× |
 
 ```text
 durable QoS 1, acked msg/s
 1 node  ████████████████████░░░░░░░░░░░░░   8.5k
 3 nodes ████████████████████░░░░░░░░░░░░░   8.6k   (quorum tax fully absorbed)
-5 nodes █████████████████████████████████  13.9k   (1.63× one node)
+5 nodes █████████████████████████████████  13.9k   (1.63× one node; p99 improves 90 → 56 ms)
 ```
 
+Durable throughput runs at 3.9–7.2× the disk's own barrier rate, so it is decoupled from the
+fsync floor. Same shape for QoS 2 (2,970 → 2,124 → 3,009 msg/s) and clean sessions
+(32.1k → 89.4k → 109.6k msg/s, nothing durable to write). Weakening the ack to single-copy
+(`local` tier) buys nothing on datacenter NVMe: 8,734 vs 8,503 at one node.
+
 **Curve 2 — non-durable `$share` fan-out** (600 publishers → 300 subscribers in one shared
-group): delivered plateau **~18.6k → ~53.9k → ~81.4k msg/s** at 1 → 3 → 5 nodes; every rung
-above 50k offered was **driver-limited**, so these are floors, not capacities.
+group, QoS 1): delivered plateau **~18.6k → ~53.9k → ~81.4k msg/s** at 1 → 3 → 5 nodes.
+Every rung above 50k offered was **driver-limited**, so these are floors, not capacities.
 
 **Connections:** 50,000 idle connections cost a flat **19.3–19.7 KiB each** at every cluster size.
 
-Two more published measurements, both labelled dev-grade single-host and never to be quoted
-as capacity: the [durable path](docs/benchmarks/DURABLE-PATH.md) (a durable QoS 1 publish
-costs ~28 ms p50 against ~0.03 ms to a clean session — the price of the guarantee) and the
+**Two more published measurements**, both labelled dev-grade single-host and never to be quoted
+as capacity: the [durable path](docs/benchmarks/DURABLE-PATH.md) (a durable QoS 1 publish costs
+~28 ms p50 against ~0.03 ms to a clean session — the price of the guarantee, pinned by that
+host's per-volume flush rate of ~215–240/s) and the
 [hot-path micro-baselines](docs/benchmarks/BASELINE.md) (256 B PUBLISH encodes in ~270 ns,
 decodes in ~190 ns; a per-PR regression floor fails the build on a gross slowdown).
 
 ### Methodology
 
-| | Cross-broker harness | Scaling curve |
+| | Single-node comparison | Cluster scaling curve |
 |---|---|---|
-| Script | [`bench/run.sh`](bench/run.sh), [`bench/summarize.py`](bench/summarize.py) | [`bench/scale/run.sh`](bench/scale/run.sh), [`summarize-curve.py`](bench/scale/summarize-curve.py) |
-| Hardware | dedicated host, driver separated from broker (required for publication) | Hetzner CCX23 per broker (4 dedicated vCPU, 16 GB, local NVMe), CCX33 drivers, `fsn1` |
-| Broker build | pinned images per broker, configs in [`bench/configs/`](bench/configs/) | released, cosign-signed, byte-reproducible `mqttd` binary, shipped systemd unit |
-| Load tool | emqtt-bench 0.6.3 | emqtt-bench 0.6.3 (fan-out), `durable_bench` harness (durable lane, exact per-message RTTs) |
-| Payload / QoS | 256 B; QoS 0, 1, 2; 5k connections; 60 s per scenario | 256 B; QoS 1 durable and QoS 2; QoS 1 `$share`; 50k idle connections |
-| Postures | plaintext+anonymous (competitors' out-of-the-box) **and** mTLS with client certs required, on every broker | durable plane on for the durable lane, off for fan-out; per-host disk barrier floors measured before every lane |
-| Fairness | mqttd runs with `MQTTD_DURABLE_SESSIONS=0` for like-for-like against brokers whose sessions are not quorum-replicated — disclosed, not hidden | a run judges itself: barrier probes gate the durable curve, driver-limited rungs are excluded from knee detection, counter mismatches are flagged |
+| Record | [SINGLE-NODE-COMPARISON.md](docs/benchmarks/SINGLE-NODE-COMPARISON.md) | [SCALE-CURVE.md](docs/benchmarks/SCALE-CURVE.md) |
+| Scripts | [`bench/scale/compare-brokers.sh`](bench/scale/compare-brokers.sh), [`summarize-compare.py`](bench/scale/summarize-compare.py), [`chart-compare.py`](bench/scale/chart-compare.py) | [`bench/scale/run.sh`](bench/scale/run.sh), [`summarize-curve.py`](bench/scale/summarize-curve.py) |
+| Hardware | one Hetzner CCX23 broker host (4 dedicated vCPU, 16 GB), three CCX43 (16 vCPU) drivers | one CCX23 + local NVMe per broker, CCX33 drivers, `fsn1` |
+| Versions | mqttd 1.0.17, Mosquitto 2.0.20, EMQX 5.8.6, HiveMQ CE 2024.3 — image digests and config SHA-256 recorded per arm | released, cosign-signed, byte-reproducible `mqttd` `v1.0.5` |
+| Config | each broker's documented reasonable minimum, committed verbatim in [`bench/scale/compare/`](bench/scale/compare/); **nobody tuned**, including mqttd; HiveMQ heap set to half the host's RAM | shipped systemd unit + disclosed env template; cluster PKI from `deploy/systemd/gen-certs.sh` |
+| Load tool | emqtt-bench 0.6.3 (EMQX's own); measurement driver-side only, no broker counters | emqtt-bench 0.6.3 for fan-out; `durable_bench` harness with exact per-message ack RTTs for the durable lane |
+| Workload | 1:1 QoS 0 pub/sub per topic, 200 B, 25 msg/s per publisher; ladder 15k → 150k msg/s; 60 s window per rung; rung passes only at ≥ 99% delivered, ≥ 95% of offer, p99 ≤ 1 s, settled and drained | 256 B; durable QoS 1 and QoS 2; QoS 1 `$share`; 50k idle connections; 3 reps |
+| Posture | plaintext, anonymous, in-memory sessions — **mqttd's durable-by-default switched OFF** (`MQTTD_DURABLE_SESSIONS=0`) for like-for-like, disclosed | durable plane on for the durable lane, off for fan-out; per-host disk barrier floor measured before every lane |
+| Self-check | mqttd run first and last as a control; > 5% drift or a moved knee voids the run | barrier probes gate the durable curve; driver-limited rungs excluded from knee detection; counter mismatches flagged |
+| Cost to reproduce | ~€5 of cloud time, ~2.5 h | `./run.sh smoke` ~20 min under €0.50; full 1+3+5 a few euros |
 
-Reproduce: `cd bench && ./run.sh smoke` (minutes, one machine) or
-`cd bench/scale && ./run.sh smoke` (about 20 minutes, under €0.50 on Hetzner; the full 1+3+5
-curve is a few euros). Every step is in the two READMEs.
+```sh
+cd bench/scale && export HCLOUD_TOKEN=…
+COMPARE_BROKERS="mqttd mosquitto emqx hivemq" \
+COMPARE_RATES="15000 30000 45000 60000 75000 90000 120000 150000" \
+BROKER_TYPE=ccx23 DRIVER_TYPE=ccx43 DRIVER_COUNT=3 ./run.sh compare
+python3 summarize-compare.py .runs/<stamp>/results
+```
+
+Latency is reported as emqtt-bench histogram **bucket upper bounds** ("p99 ≤ X ms"): coarse,
+but incapable of flattering, and the same instrument for every broker. If a configuration
+misrepresents a broker, open an issue and the lane is re-run with a dated changelog line.
 
 ### Where competitors win
 
+- **Memory:** Mosquitto holds its knee in **18 MiB, 7× less than mqttd's 133 MiB**, and 4 MiB at 15,000 msg/s. If memory is the budget, it wins outright.
+- **Tail at their own knee:** Mosquitto and HiveMQ CE stay ≤ 100 ms at their knees; mqttd's knee is higher, not quieter (≤ 500 ms).
+- **Quiet at low load:** EMQX is ≤ 1 ms p99 at 15,000 msg/s, matched by mqttd; Mosquitto is ≤ 5 ms.
 - **Footprint:** NanoMQ (sub-MB binary claims, ~4.6 MB image) and Mosquitto (a few-MB C daemon) beat everyone; mqttd's distroless image is ~14 MB.
 - **Maturity and track record:** Mosquitto since ~2010, EMQX at enormous fleet scale, VerneMQ a decade in production. **mqttd has signed releases but no production users yet.**
 - **Hard memory cap:** Mosquitto has one; mqttd has a sampled watermark and brownout, and the container limit is the real bound.
 - **Feature surface:** EMQX's dashboard, SQL rule engine and MQTT-SN/CoAP gateways have no equivalent here.
-- **Scale-out is not yet linear, and is not claimed to be:** 3 nodes ≈ 1 node on the durable path (the quorum tax), and durable ownership capacity scales with the voter set (default 5), not the node count. The measurement-then-optimisation plan is [#537](https://github.com/mbilling/fss-mqtt-broker/issues/537).
-- **Provisioning variance:** two identical cloud clusters running the same binary differed by ~40% in one campaign. Cross-version numbers carry that confound; read ratios within a run, not absolute cells across runs.
+- **Scale-out is not yet linear, and is not claimed to be:** 3 nodes ≈ 1 node on the durable path (the quorum tax), and durable ownership capacity scales with the voter set (default 5), not the node count. The plan is [#537](https://github.com/mbilling/fss-mqtt-broker/issues/537).
+- **What the comparison does not cover:** one instance type, one full ladder, QoS 0 only, plaintext, no persistence, no cluster, no TLS. A broker fast here may be slow where a guarantee is real; the clustered and TLS postures are separate lanes. Newer Mosquitto (2.0.22 / 2.1.2) and EMQX (6.x, BSL) lines exist and were not measured.
 
 ---
 
@@ -206,7 +319,7 @@ Legend: ✅ in the open build · 💰 **paid edition only** · ⚠️ partial (s
 Competitor cells come from vendor documentation researched 2026-07-29 → 2026-08-03 and are
 re-verified each release; corrections welcome.
 
-| Feature | mqttd | Mosquitto 2.x | EMQX 6.x | HiveMQ CE | VerneMQ 2.1 | NanoMQ 0.25 |
+| Feature | mqttd | Mosquitto 2.x | EMQX 6.x | HiveMQ CE 2024.3 | VerneMQ 2.1 | NanoMQ 0.25 |
 |---|---|---|---|---|---|---|
 | MQTT 3.1.1 + 5.0 | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | QoS 0/1/2, retained, LWT | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
@@ -439,7 +552,7 @@ The full index, one line per document and stakeholder, is [**docs/README.md**](d
 Open work is tracked as tasks under their ADRs on the [delivery dashboard](docs/delivery/STATUS.md);
 the items below are the ones an evaluator is most likely to ask about.
 
-- **Published cross-broker benchmarks** on dedicated hardware, re-run per release ([#545](https://github.com/mbilling/fss-mqtt-broker/issues/545)).
+- **Cross-broker benchmarks beyond one node:** the single-node knee is published; still owed are the multi-host cluster comparison ([#244](https://github.com/mbilling/fss-mqtt-broker/issues/244)), larger instance types, the TLS/auth posture, and the per-release re-run ([#545](https://github.com/mbilling/fss-mqtt-broker/issues/545)).
 - **Horizontal scale, measured then optimised** — the ordered plan is [#537](https://github.com/mbilling/fss-mqtt-broker/issues/537): scale-out durable ownership beyond the voter set (ADR 0073), workload-shaped arms including burst and per-tenant capacity (ADR 0077), and QoS 0 shared-worker capacity ([#482](https://github.com/mbilling/fss-mqtt-broker/issues/482)).
 - **Auth fast-follows:** SCRAM, OCSP, PSK cipher suites for constrained devices, server-initiated re-authentication.
 - **Migration from NanoMQ** ([#546](https://github.com/mbilling/fss-mqtt-broker/issues/546)); an assessable bridge demo with a second security zone ([#547](https://github.com/mbilling/fss-mqtt-broker/issues/547)).
@@ -471,7 +584,7 @@ lines and fix timelines: [SUPPORT.md](SUPPORT.md).
 - **Release notes:** [GitHub Releases](https://github.com/mbilling/fss-mqtt-broker/releases) (canonical; [CHANGELOG.md](CHANGELOG.md) explains why).
 - **Support lifecycle:** the three most recent minor lines receive security and correctness patches; adjacent-release skew is the supported upgrade path ([SUPPORT.md](SUPPORT.md)).
 - **Commercial support:** the project's model reserves paid offerings for support, SLAs and certified builds — never for features. No commercial offering is published in this repository yet; open an issue to start the conversation.
-- **Status:** `v1.0.17` is released, signed and verifiable. There are **no production users yet**; that is stated here rather than discovered.
+- **Status:** `v1.0.17` is released, signed and verifiable, and is the exact image measured in the [single-node comparison](docs/benchmarks/SINGLE-NODE-COMPARISON.md). There are **no production users yet**; that is stated here rather than discovered.
 
 ---
 
