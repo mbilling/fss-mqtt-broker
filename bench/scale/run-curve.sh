@@ -1965,14 +1965,35 @@ lane_e_rung() { # lane_e_rung <sites> [repeat-index] [is-control]
 	local offer_total=$((sites * LANE_E_SITE_RATE))
 	local band=$((offer_total * LANE_E_STEADY_PCT / 100))
 	if [ "$settled" = yes ]; then
-		local prev_recv cur_recv flat=0 waited=0 rate delta
+		# Divide by the time that ACTUALLY passed, never by the poll interval.
+		# `lane_e_recv_total` is an ssh fan-out over every driver and takes the
+		# better part of a second, so `delta / LANE_E_DRAIN_POLL` reads high by
+		# whatever the scrape cost — 13% on the first attempt (67,986 against a
+		# 60,000 offer on a rung that was in fact holding it exactly), which put
+		# every rung permanently outside the band and called a healthy broker
+		# "still repaying".
+		# MILLISECONDS, not seconds. `date +%s` rounds a 5.7s poll to 5 or 6,
+		# which is a 10% error on the rate — wider than the band itself, so the
+		# gate would flap in and out for reasons that have nothing to do with the
+		# broker. The window stamps already use %s%3N for the same reason.
+		# The budget counts MILLISECONDS too. Accumulating `elapsed_ms / 1000`
+		# adds nothing at all when a poll takes under a second, so the budget
+		# never expires and the gate spins forever — which is exactly what a
+		# faked, instant `sleep` produces, and it hung the test suite.
+		local prev_recv cur_recv flat=0 waited=0 waited_ms=0 rate delta prev_ms cur_ms elapsed_ms
 		prev_recv=$(lane_e_recv_total)
+		prev_ms=$(date +%s%3N)
 		while :; do
 			sleep "$LANE_E_DRAIN_POLL"
-			waited=$((waited + LANE_E_DRAIN_POLL))
 			cur_recv=$(lane_e_recv_total)
-			rate=$(((cur_recv - prev_recv) / LANE_E_DRAIN_POLL))
+			cur_ms=$(date +%s%3N)
+			elapsed_ms=$((cur_ms - prev_ms))
+			[ "$elapsed_ms" -gt 0 ] || elapsed_ms=1
+			waited_ms=$((waited_ms + elapsed_ms))
+			waited=$((waited_ms / 1000))
+			rate=$(((cur_recv - prev_recv) * 1000 / elapsed_ms))
 			prev_recv="$cur_recv"
+			prev_ms="$cur_ms"
 			delta=$((rate - offer_total))
 			[ "$delta" -ge 0 ] || delta=$((-delta))
 			if [ "$delta" -le "$band" ]; then
@@ -1986,7 +2007,7 @@ lane_e_rung() { # lane_e_rung <sites> [repeat-index] [is-control]
 				flat=0
 				[ "$rate" -ge "$offer_total" ] && steady_reason=repaying || steady_reason=behind
 			fi
-			[ "$waited" -lt "$LANE_E_STEADY_BUDGET" ] || {
+			[ "$waited_ms" -lt $((LANE_E_STEADY_BUDGET * 1000)) ] || {
 				steady_s="$waited"
 				warn "lane E: rung $sites never reached steady state — delivery was still $steady_reason after ${waited}s (last ${rate} msg/s against an offer of ${offer_total}). The rung is measured and flagged NOT STEADY: at this offer the broker either cannot keep up, or is still repaying what the ramp owed"
 				break

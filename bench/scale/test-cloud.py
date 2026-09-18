@@ -508,7 +508,7 @@ with_cpu_sampling "$3" work
     # mpstat/systemctl; `sleep` returns at once. The log records what each host
     # was asked to do and when, so the ORDER of a size is what is asserted.
     FAKE_SSH = r'''#!/usr/bin/env python3
-import json, os, pathlib, subprocess, sys, time
+import json, os, pathlib, re, subprocess, sys, time
 args = sys.argv[1:]
 i = next(k for k, a in enumerate(args) if a.startswith("root@"))
 host, cmd = args[i][5:], " ".join(args[i + 1:])
@@ -530,6 +530,37 @@ if "python3 - run" in cmd:
     sys.exit(int(os.environ.get("FAKE_CANARY_RC", "0")))
 if "mqttd_connections_active[ {]" in cmd:
     (state / "rung").touch()  # a rung's reset wait: everything after it is the rung's
+    # A settled population, when the test asks for one. Without this the settle
+    # gate never passes and everything downstream of it — the steady-state gate
+    # above all — is skipped, which is exactly why nothing caught the gate
+    # dividing by the wrong interval (2026-09-18).
+    # Full only once the publishers are up: the RESET gate before a rung needs to
+    # see the cluster drained to its floor, and the settle gate after it needs to
+    # see the whole population. Keying on the publishers gives both honestly.
+    if os.environ.get("FAKE_CONNS") and (state / "pubs").exists():
+        print(os.environ["FAKE_CONNS"])
+        log()
+        sys.exit(0)
+if " pub -h " in cmd:
+    (state / "pubs").touch()
+if "curl -s -m 10 http://localhost:94" in cmd and os.environ.get("FAKE_RECV_RATE"):
+    # A consumer scrape that COSTS TIME, like the real ssh fan-out does, and a
+    # counter that advances at the offered rate in wall-clock terms. A gate that
+    # divides the counter delta by its nominal poll interval instead of the time
+    # that actually passed reads high by the scrape's own cost, and then no rung
+    # can ever fall inside the steady band.
+    time.sleep(float(os.environ.get("FAKE_SCRAPE_SECS", "0.4")))
+    rate = int(os.environ["FAKE_RECV_RATE"])
+    t0 = state / "recv-t0"
+    if not t0.exists():
+        t0.write_text(repr(time.time()))
+    elapsed = time.time() - float(t0.read_text())
+    for name in re.findall(r"@@@ (\S+)", cmd):
+        print("\n@@@ %s" % name)
+        print("recv %d" % int(rate * elapsed))
+        print("connect_succ 600")
+    log()
+    sys.exit(0)
 if "mpstat" in cmd:
     # A sampler must BE the process cpu.sh kills, exactly as `exec ssh` is.
     log()
@@ -710,7 +741,12 @@ if sys.argv[1:] == ["show", "-p", "MainPID", "--value", "mqttd"]:
             "brokers": [{"public_ip": f"broker-{i}", "private_ip": f"10.0.0.{i + 1}"} for i in range(nodes)],
             "drivers": [{"public_ip": "driver-0", "vcpus": 8}],
         }))
+        # A short steady-state budget by default: these fakes report no delivery
+        # at all, so the gate correctly waits out its whole budget, and at the
+        # production 180s that is three minutes per rung of pure test time. Tests
+        # that exercise the gate set their own.
         base = {"LANES": "E", "LANE_E_SITES_OVERRIDE": "1", "LANE_E_CONTROL": "0", "LANE_E_CALIBRATE": "0",
+                "LANE_E_STEADY_BUDGET": "5",
                 "LANE_E_FORWARD_CANARY_COUNT": str(count), "FAKE_STATE": str(state),
                 "FAKE_BROKERS": str(nodes), "FAKE_CANARY_STREAM": str(stream),
                 "FAKE_RESTART_SCRAPE": str(self.rig / "testdata/lane-e/local-proof-n3/restart/metrics-restart-broker2.prom")}
@@ -975,6 +1011,32 @@ if sys.argv[1:] == ["show", "-p", "MainPID", "--value", "mqttd"]:
         self.assertIn("window close scrape on broker0 never started", result.stderr)
         self.assertIn("window close scrape of broker0 is incomplete", result.stderr)
         self.assertNotIn("open broker", (rdir / "window-ssh.log").read_text())
+
+    def test_the_steady_gate_measures_elapsed_time_not_the_poll_interval(self):
+        # The gate polls a counter over an ssh fan-out that takes the better part
+        # of a second. Dividing the delta by the NOMINAL poll interval therefore
+        # reads high by whatever the scrape cost — 13% on the first paid attempt,
+        # where a broker holding 60,000 msg/s exactly was measured at 67,986 and
+        # called "still repaying" for the full budget. Every rung would fail.
+        #
+        # Here the fake delivers at exactly the offered rate in wall-clock terms
+        # and charges 0.4s per scrape against a 1s poll, so a gate that assumes
+        # the interval is 40% high and can never settle inside a 5% band.
+        env, nodes, _ = self.lane_e_fleet(
+            LANE_E_SITES_OVERRIDE="1", LANE_E_SUBS_PER_SITE="6",
+            LANE_E_DRAIN_POLL="1", LANE_E_STEADY_POLLS="3", LANE_E_STEADY_BUDGET="30",
+            FAKE_RECV_RATE="30000", FAKE_SCRAPE_SECS="0.4",
+            # Each broker reports the whole population: the settle gate is not what
+            # this test is about, and it must not be the thing that makes it flaky.
+            FAKE_CONNS=str(1 * (1200 + 6)),
+        )
+        result, out = self.run_lane_e(env)
+        self.assertEqual(result.returncode, 0, result.stderr[-3000:])
+        rung = (out / f"results/nodes={nodes}/laneE/sites-1/rung.txt").read_text()
+        self.assertIn("settled=yes", rung, "the settle gate never passed, so the steady gate never ran")
+        self.assertIn("steady=yes", rung,
+                      f"a broker delivering exactly its offer was not called steady:\n{rung}")
+        self.assertNotIn("steady_reason=repaying", rung)
 
     def test_lane_e_brokers_consumers_and_cpu_share_one_window(self):
         env, nodes, _ = self.lane_e_fleet()
