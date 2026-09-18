@@ -542,6 +542,8 @@ LANE_E_MAX_CONTAINERS_PER_DRIVER="${LANE_E_MAX_CONTAINERS_PER_DRIVER:-$(inv '
 # broker (site mod N). Cross-node forwarding for that site's traffic goes to
 # zero by placement, independent of selection policy.
 LANE_E_PIN_SITES="${LANE_E_PIN_SITES:-0}"
+LANE_E_PLACEMENT="${LANE_E_PLACEMENT:-site}"
+case "$LANE_E_PLACEMENT" in site|container) ;; *) die "LANE_E_PLACEMENT must be site or container" ;; esac
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 brokers_csv() { # brokers_csv <suffix-jq> — comma list over brokers
@@ -986,6 +988,7 @@ lane_e_shape() {
 		# Sites are dealt round-robin to drivers, so the busiest driver carries
 		# ceil(sites/D) sites' worth of containers.
 		per_driver=$(((sites + D - 1) / D * cps))
+        [ "$LANE_E_PLACEMENT" != container ] || per_driver=$(((sites * cps + D - 1) / D))
 		if [ "$per_driver" -gt "$LANE_E_MAX_CONTAINERS_PER_DRIVER" ]; then
 			verdict="REFUSED: $per_driver containers on the busiest driver > $LANE_E_MAX_CONTAINERS_PER_DRIVER"
 			worst=1
@@ -1047,6 +1050,22 @@ if [[ "$LANES" == *[BC]* ]] && [ -n "$BENCH_ERL_FLAGS" ]; then
 	say "BENCH_ERL_FLAGS accepted by $BENCH_IMG on driver 0: $BENCH_ERL_FLAGS"
 fi
 
+# The audit image is transported directly, never pushed to a registry.
+if [ -n "${QOS1_DRIVER_ARCHIVE:-}" ]; then
+    [ "$LANES" = E ] && [ "$LANE_E_QOS" = 1 ] || die "audit driver requires LANES=E and QoS 1"
+    [ -f "$QOS1_DRIVER_ARCHIVE" ] || die "missing audit driver archive"
+    audit_archive_sha=$(sha256sum "$QOS1_DRIVER_ARCHIVE" | cut -d' ' -f1)
+    audit_image_id=$(docker image inspect --format '{{.Id}}' fss-qos1-audit:local)
+    for ((di = 0; di < D; di++)); do
+        rscp "$QOS1_DRIVER_ARCHIVE" "root@$(driver_pub_ip "$di"):/tmp/qos1-driver.tar.gz"
+        rssh "$(driver_pub_ip "$di")" "echo '$audit_archive_sha  /tmp/qos1-driver.tar.gz' | sha256sum -c - >/dev/null && docker load -i /tmp/qos1-driver.tar.gz >/dev/null"
+        actual_id=$(rssh "$(driver_pub_ip "$di")" "docker image inspect --format '{{.Id}}' fss-qos1-audit:local")
+        [ "$actual_id" = "$audit_image_id" ] || die "audit image mismatch on driver$di"
+    done
+    BENCH_IMG=fss-qos1-audit:local
+    DOCKER_RUN+=" -e QOS1_AUDIT=1"
+fi
+
 # ── 0a. PROVENANCE — what, exactly, produced these numbers (#534, acceptance 1)
 #
 # The driver was pinned by digest, and nothing else was. A campaign is a claim
@@ -1067,6 +1086,7 @@ mkdir -p "$OUT/env"
 	fi
 	echo "harness_describe=$(git -C "$SCALE_DIR" describe --tags --always --dirty 2>/dev/null || echo unknown)"
 	echo "driver_image=$BENCH_IMG"
+	echo "audit_archive_sha256=${audit_archive_sha:-none} audit_image_id=${audit_image_id:-none}"
 	echo "mqttd_version=${MQTTD_VERSION:-unset}"
 	echo "mqttd_url=${MQTTD_URL:-}"
 	echo "mqttd_sha256_expected=${MQTTD_SHA256:-}"
@@ -1767,8 +1787,8 @@ lane_e_rung() { # lane_e_rung <sites> [repeat-index] [is-control]
 		local i tot=0 v
 		for ((i = 0; i < N; i++)); do
 			v=$(rssh "$(broker_pub_ip "$i")" \
-				"curl -s http://localhost:8080/metrics | awk '/^mqttd_connections_active[ {]/{s += \$2} END{print s + 0}'" 2>/dev/null || echo 0)
-			case "$v" in '' | *[!0-9]*) v=0 ;; esac
+				"set -o pipefail; curl -fsS -m 10 http://localhost:8080/metrics | awk '/^mqttd_connections_active[ {]/{s += \$2; seen=1} END{if (!seen) exit 1; print s + 0}'" 2>/dev/null) || return 1
+			case "$v" in '' | *[!0-9]*) return 1 ;; esac
 			tot=$((tot + v))
 		done
 		echo "$tot"
@@ -1782,18 +1802,22 @@ lane_e_rung() { # lane_e_rung <sites> [repeat-index] [is-control]
 		local q
 		local -a rp=()
 		for ((q = 0; q < D; q++)); do
-			driver_batch "$q" "${scrape[q]}" >"$rdir/.batch/poll-$q" 2>/dev/null &
+			driver_batch "$q" "set -e"$'\n'"${scrape[q]}" >"$rdir/.batch/poll-$q" 2>/dev/null &
 			rp+=($!)
 		done
-		for q in ${rp[@]+"${rp[@]}"}; do wait "$q" || true; done
-		cat "$rdir"/.batch/poll-* 2>/dev/null | awk '/^recv /{s += $2} END{print s + 0}'
+        for q in ${rp[@]+"${rp[@]}"}; do wait "$q" || return 1; done
+        mkdir -p "$rdir/.poll"
+        rm -f "$rdir/.poll"/*.prom
+        for ((q = 0; q < D; q++)); do batch_split "$rdir/.poll" ".prom" "$rdir/.batch/poll-$q"; done
+        python3 "$SCALE_DIR/lane-e-evidence.py" poll "$rdir" "$LANE_E_SITE_RATE"
 	}
 	local di s j sdi hosts filter seq_base cidx
-	local -a subs pubs scrape stop names portn pubnames subnames subdump
+	local -a subs pubs scrape stop names portn pubnames subnames subdump pubscrape pause ledger terminal
 	for ((di = 0; di < D; di++)); do
 		subs[di]="set -e"$'\n'
 		pubs[di]="set -e"$'\n'
 		scrape[di]=""
+		pubscrape[di]=""; pause[di]=""; ledger[di]=""; terminal[di]=""
 		stop[di]=""
 		names[di]=""
 		# The drain stops the PUBLISHERS and leaves the consumers running, so the
@@ -1804,12 +1828,14 @@ lane_e_rung() { # lane_e_rung <sites> [repeat-index] [is-control]
 		subdump[di]=""
 		portn[di]=0
 	done
+	: >"$rdir/endpoints.tsv"
 	# Sites are dealt round-robin to drivers. A site is a UNIT: its publishers and
 	# its consumers live on the same driver, so a rung never measures a site whose
 	# two halves were competing for different hardware.
 	for ((s = 0; s < sites; s++)); do
 		sdi=$((s % D))
 		for ((j = 0; j < LANE_E_SUB_CONTAINERS_PER_SITE; j++)); do
+			[ "$LANE_E_PLACEMENT" != container ] || sdi=$(((s * (LANE_E_SUB_CONTAINERS_PER_SITE + LANE_E_PUB_CONTAINERS_PER_SITE) + j) % D))
 			cidx=$((s * LANE_E_SUB_CONTAINERS_PER_SITE + j))
 			hosts=$(site_hosts "$s" "$cidx")
 			# Each site has its OWN $share group. One group per site is what makes
@@ -1817,14 +1843,18 @@ lane_e_rung() { # lane_e_rung <sites> [repeat-index] [is-control]
 			# site 3 is selected among site 3's consumers only.
 			filter="\$share/site$s/site/$s/#"
 			subs[sdi]+="$DOCKER_RUN --name sub-s$s-$j $BENCH_IMG sub -h $hosts -p $port -V $LANE_E_PROTO -c $subs_per_c -R $LANE_E_CONNECT_RATE -t '$filter' -q $LANE_E_SUB_QOS $active --payload-hdrs ts --prometheus --restapi $((port_base + portn[sdi])) >/dev/null"$'\n'
-			scrape[sdi]+="printf '\\n@@@ sub-s$s-$j\\n'; curl -s -m 10 http://localhost:$((port_base + portn[sdi]))/metrics"$'\n'
+			scrape[sdi]+="printf '\\n@@@ sub-s$s-$j\\n'; curl -fsS -m 10 http://localhost:$((port_base + portn[sdi]))/metrics"$'\n'
 			stop[sdi]+="printf '\\n@@@ sub-s$s-$j\\n'; docker logs sub-s$s-$j 2>&1"$'\n'
 			subdump[sdi]+="printf '\\n@@@ sub-s$s-$j\\n'; docker logs sub-s$s-$j 2>&1"$'\n'
 			names[sdi]+=" sub-s$s-$j"
 			subnames[sdi]+=" sub-s$s-$j"
+            printf '%s\t%s\t%s\t%s\t%s\n' "sub-s$s-$j" "$sdi" "$s" sub "$subs_per_c" >>"$rdir/endpoints.tsv"
+            ledger[sdi]+="printf '\\n@@@ sub-s$s-$j\\n'; curl -fsS -m 30 http://localhost:$((port_base + portn[sdi]))/audit/ledger"$'\n'
+            terminal[sdi]+="printf '\\n@@@ sub-s$s-$j\\n'; curl -fsS -m 10 http://localhost:$((port_base + portn[sdi]))/metrics"$'\n'
 			portn[sdi]=$((portn[sdi] + 1))
 		done
 		for ((j = 0; j < LANE_E_PUB_CONTAINERS_PER_SITE; j++)); do
+			[ "$LANE_E_PLACEMENT" != container ] || sdi=$(((s * (LANE_E_SUB_CONTAINERS_PER_SITE + LANE_E_PUB_CONTAINERS_PER_SITE) + LANE_E_SUB_CONTAINERS_PER_SITE + j) % D))
 			cidx=$((s * LANE_E_PUB_CONTAINERS_PER_SITE + j))
 			hosts=$(site_hosts "$s" "$cidx")
 			# `-n` offsets the topic numbering per container so a site's topic set is
@@ -1832,7 +1862,15 @@ lane_e_rung() { # lane_e_rung <sites> [repeat-index] [is-control]
 			# it — the same reason lane B does it (ADR 0048 §2: the topic count must
 			# not change with fleet shape).
 			seq_base=$((j * pubs_per_c))
-			pubs[sdi]+="$DOCKER_RUN --name pub-s$s-$j $BENCH_IMG pub -h $hosts -p $port -V $LANE_E_PROTO -c $pubs_per_c -R $LANE_E_CONNECT_RATE -t 'site/$s/%i' -q $LANE_E_QOS -s $LANE_E_PAYLOAD $active -n $seq_base -I $interval --payload-hdrs ts >/dev/null"$'\n'
+            local e_headers=ts
+            [ -z "${QOS1_DRIVER_ARCHIVE:-}" ] || e_headers=ts,cnt64
+			pubs[sdi]+="$DOCKER_RUN --name pub-s$s-$j $BENCH_IMG pub -h $hosts -p $port -V $LANE_E_PROTO -c $pubs_per_c -R $LANE_E_CONNECT_RATE -t 'site/$s/%i' -q $LANE_E_QOS -s $LANE_E_PAYLOAD $active -n $seq_base -I $interval --payload-hdrs $e_headers --keep-connected true --prometheus --restapi $((port_base + portn[sdi])) >/dev/null"$'\n'
+            printf '%s\t%s\t%s\t%s\t%s\n' "pub-s$s-$j" "$sdi" "$s" pub "$pubs_per_c" >>"$rdir/endpoints.tsv"
+            pubscrape[sdi]+="printf '\\n@@@ pub-s$s-$j\\n'; curl -fsS -m 10 http://localhost:$((port_base + portn[sdi]))/metrics"$'\n'
+            pause[sdi]+="curl -fsS -m 10 -X POST http://localhost:$((port_base + portn[sdi]))/audit/pause >/dev/null"$'\n'
+            ledger[sdi]+="printf '\\n@@@ pub-s$s-$j\\n'; curl -fsS -m 30 http://localhost:$((port_base + portn[sdi]))/audit/ledger"$'\n'
+            terminal[sdi]+="printf '\\n@@@ pub-s$s-$j\\n'; curl -fsS -m 10 http://localhost:$((port_base + portn[sdi]))/metrics"$'\n'
+            portn[sdi]=$((portn[sdi] + 1))
 			stop[sdi]+="printf '\\n@@@ pub-s$s-$j\\n'; docker logs pub-s$s-$j 2>&1"$'\n'
 			names[sdi]+=" pub-s$s-$j"
 			pubnames[sdi]+=" pub-s$s-$j"
@@ -1840,6 +1878,16 @@ lane_e_rung() { # lane_e_rung <sites> [repeat-index] [is-control]
 	done
 	local -a pids
 	local pd
+    python3 - "$rdir" "$N" "$D" "$LANE_E_SECS" "$LANE_E_PAYLOAD" <<'MANIFEST'
+import json,sys
+from pathlib import Path
+p=Path(sys.argv[1]); eps=[]
+for row in (p/'endpoints.tsv').read_text().splitlines():
+ n,d,s,r,c=row.split('\t');eps.append(dict(name=n,driver=int(d),site=s,role=r,clients=int(c)))
+(p/'manifest.json').write_text(json.dumps(dict(nodes=int(sys.argv[2]),drivers=int(sys.argv[3]),window_secs=int(sys.argv[4]),payload_bytes=int(sys.argv[5])+16,telemetry_required=True,endpoints=eps),indent=2))
+MANIFEST
+    { declare -p subs pubs scrape pubscrape pause terminal ledger; } >"$rdir/commands.sh"
+
 	# ── the broker must be demonstrably RESET before this rung (#534, acc. 6) ──
 	# Rungs share one cluster, so a rung inherits whatever the previous one left
 	# behind. A capacity trial that starts on a broker still holding the last
@@ -1848,7 +1896,7 @@ lane_e_rung() { # lane_e_rung <sites> [repeat-index] [is-control]
 	# a rung that starts un-reset is not silently comparable to one that did.
 	local reset=no reset_waited=0 reset_conns=0
 	while :; do
-		reset_conns=$(lane_e_conns_total)
+		reset_conns=$(lane_e_conns_total) || die "incomplete reset connection poll"
 		if [ "$reset_conns" -le "$LANE_E_RESET_FLOOR" ]; then
 			reset=yes
 			break
@@ -1938,7 +1986,7 @@ lane_e_rung() { # lane_e_rung <sites> [repeat-index] [is-control]
 	local expect_conns settled=no settled_conns=0 settle_waited=0
 	expect_conns=$((sites * (LANE_E_PUBS_PER_SITE + LANE_E_SUBS_PER_SITE)))
 	while :; do
-		settled_conns=$(lane_e_conns_total)
+		settled_conns=$(lane_e_conns_total) || die "incomplete settle connection poll"
 		if [ "$settled_conns" -ge "$expect_conns" ]; then
 			settled=yes
 			break
@@ -1981,11 +2029,11 @@ lane_e_rung() { # lane_e_rung <sites> [repeat-index] [is-control]
 		# never expires and the gate spins forever — which is exactly what a
 		# faked, instant `sleep` produces, and it hung the test suite.
 		local prev_recv cur_recv flat=0 waited=0 waited_ms=0 rate delta prev_ms cur_ms elapsed_ms
-		prev_recv=$(lane_e_recv_total)
+		prev_recv=$(lane_e_recv_total) || die "incomplete steady poll"
 		prev_ms=$(date +%s%3N)
 		while :; do
 			sleep "$LANE_E_DRAIN_POLL"
-			cur_recv=$(lane_e_recv_total)
+			cur_recv=$(lane_e_recv_total) || die "incomplete steady poll"
 			cur_ms=$(date +%s%3N)
 			elapsed_ms=$((cur_ms - prev_ms))
 			[ "$elapsed_ms" -gt 0 ] || elapsed_ms=1
@@ -1996,7 +2044,7 @@ lane_e_rung() { # lane_e_rung <sites> [repeat-index] [is-control]
 			prev_ms="$cur_ms"
 			delta=$((rate - offer_total))
 			[ "$delta" -ge 0 ] || delta=$((-delta))
-			if [ "$delta" -le "$band" ]; then
+			if [ "$delta" -le "$band" ] && [ "$(cat "$rdir/poll-steady")" = yes ]; then
 				flat=$((flat + 1))
 				if [ "$flat" -ge "$LANE_E_STEADY_POLLS" ]; then
 					steady=yes
@@ -2047,7 +2095,7 @@ lane_e_rung() { # lane_e_rung <sites> [repeat-index] [is-control]
 			wp+=($!)
 		done
 		for ((q = 0; q < D; q++)); do
-			driver_batch "$q" "$stamp"$'\n'"${scrape[q]}""printf '\\n'; $stamp" \
+			driver_batch "$q" "$stamp"$'\n'"${scrape[q]}${pubscrape[q]}""printf '\\n'; $stamp" \
 				>"$rdir/.batch/$phase-driver$q" 2>"$rdir/.batch/$phase-driver$q.err" &
 			wp+=($!)
 		done
@@ -2064,7 +2112,16 @@ lane_e_rung() { # lane_e_rung <sites> [repeat-index] [is-control]
 	}
 	lane_e_window() {
 		lane_e_window_scrape open
-		sleep "$LANE_E_SECS"
+        if [ -z "${QOS1_DRIVER_ARCHIVE:-}" ]; then
+            sleep "$LANE_E_SECS"
+        else
+        local sample=0 begin=$SECONDS
+        while [ "$((SECONDS - begin))" -lt "$LANE_E_SECS" ]; do
+            sleep 5
+            sample=$((sample + 1))
+            lane_e_window_scrape "sample-$sample"
+        done
+        fi
 		lane_e_window_scrape close
 		: >"$rdir/.batch/window-ran"
 	}
@@ -2142,6 +2199,30 @@ lane_e_rung() { # lane_e_rung <sites> [repeat-index] [is-control]
 	# measures over the last STEADY_WINDOW seconds of a series, so letting the
 	# consumers' `.log` run on into a draining tail would drag every reported rate
 	# down and make the rung look slower than it ran.
+    if [ -n "${QOS1_DRIVER_ARCHIVE:-}" ]; then
+        for ((di=0; di<D; di++)); do driver_batch "$di" "set -e"$'\n'"${pause[di]}"; done
+        local pause_deadline=$((SECONDS + 60)) all_paused=no
+        while [ "$SECONDS" -lt "$pause_deadline" ]; do
+            for ((di=0; di<D; di++)); do
+                driver_batch "$di" "set -e"$'\n'"${pubscrape[di]}" >"$rdir/.batch/paused-$di" || die "publisher terminal scrape failed"
+                batch_split "$rdir" "-terminal.prom" "$rdir/.batch/paused-$di"
+            done
+            if python3 - "$rdir" <<'PAUSED'
+import json,sys,importlib.util
+from pathlib import Path
+p=Path(sys.argv[1])
+# Shell invokes script from scale dir in production; avoid assumptions below via scalar parser.
+for ep in json.loads((p/'manifest.json').read_text())['endpoints']:
+ if ep['role']!='pub':continue
+ vals={r.split()[0]:float(r.split()[1]) for r in (p/(ep['name']+'-terminal.prom')).read_text().splitlines() if r and not r.startswith('#') and len(r.split())==2}
+ if vals.get('audit_paused_workers')!=ep['clients'] or vals.get('audit_sent')!=vals.get('audit_acked'):sys.exit(1)
+PAUSED
+            then all_paused=yes; break; fi
+            sleep 1
+        done
+        [ "$all_paused" = yes ] || die "publishers did not pause with every PUBACK completed"
+    fi
+
 	pids=()
 	for ((di = 0; di < D; di++)); do driver_batch "$di" "${stop[di]}" >"$rdir/.batch/stop-$di" 2>/dev/null & pids+=($!); done
 	for pd in "${pids[@]}"; do wait "$pd" || true; done
@@ -2151,14 +2232,14 @@ lane_e_rung() { # lane_e_rung <sites> [repeat-index] [is-control]
 		# Publishers only. The consumers stay up and keep acknowledging whatever
 		# the broker still owes this rung.
 		pids=()
-		for ((di = 0; di < D; di++)); do [ -n "${pubnames[di]}" ] && driver_batch "$di" "docker rm -f${pubnames[di]} >/dev/null 2>&1" >/dev/null 2>&1 & pids+=($!); done
+		for ((di = 0; di < D; di++)); do [ -z "${QOS1_DRIVER_ARCHIVE:-}" ] && [ -n "${pubnames[di]}" ] && driver_batch "$di" "docker rm -f${pubnames[di]} >/dev/null 2>&1" >/dev/null 2>&1 & pids+=($!); done
 		for pd in "${pids[@]}"; do wait "$pd" || true; done
 		echo -e "elapsed_s\trecv_total" >"$rdir/drain.tsv"
 		t0=$(date +%s)
 		while :; do
 			sleep "$LANE_E_DRAIN_POLL"
 			elapsed=$(($(date +%s) - t0))
-			cur=$(lane_e_recv_total)
+			cur=$(lane_e_recv_total) || die "incomplete drain poll"
 			printf '%s\t%s\n' "$elapsed" "$cur" >>"$rdir/drain.tsv"
 			# LANE_E_FLAT_POLLS consecutive non-increasing polls, not one: a single
 			# flat poll can land inside a scrape gap and end the drain early, which
@@ -2166,7 +2247,7 @@ lane_e_rung() { # lane_e_rung <sites> [repeat-index] [is-control]
 			# guards a poll that failed on every driver and summed to zero — that
 			# must read as NOT drained, so a broken poll reports UNRESOLVED rather
 			# than a clean drain.
-			if [ "$cur" -gt 0 ] && [ "$cur" -le "$prev" ]; then
+			if [ "$cur" -gt 0 ] && [ "$cur" -eq "$prev" ]; then
 				flat=$((flat + 1))
 				if [ "$flat" -ge "$LANE_E_FLAT_POLLS" ]; then
 					drained=yes
@@ -2184,7 +2265,7 @@ lane_e_rung() { # lane_e_rung <sites> [repeat-index] [is-control]
 		# Discount the flat polls: the backlog was already gone when the first of
 		# them was taken, so counting them would inflate every drain by a fixed
 		# LANE_E_FLAT_POLLS * LANE_E_DRAIN_POLL. Same correction as lane D.
-		drain_secs=$((elapsed - LANE_E_DRAIN_POLL * flat))
+		drain_secs=$elapsed
 		[ "$drain_secs" -ge 0 ] || drain_secs=0
 		# Taken AT the deadline, with the consumers still connected: what the
 		# broker holds here is the difference between "pending" and "dropped",
@@ -2194,6 +2275,16 @@ lane_e_rung() { # lane_e_rung <sites> [repeat-index] [is-control]
 		for ((di = 0; di < D; di++)); do driver_batch "$di" "${subdump[di]}" >"$rdir/.batch/drain-$di" 2>/dev/null & pids+=($!); done
 		for pd in "${pids[@]}"; do wait "$pd" || true; done
 		for ((di = 0; di < D; di++)); do batch_split "$rdir" ".drain" "$rdir/.batch/drain-$di"; done
+        if [ -n "${QOS1_DRIVER_ARCHIVE:-}" ]; then
+            for ((di=0; di<D; di++)); do
+                driver_batch "$di" "set -e"$'\n'"${terminal[di]}" >"$rdir/.batch/terminal-$di" || die "terminal scrape failed"
+                batch_split "$rdir" "-terminal.prom" "$rdir/.batch/terminal-$di"
+                driver_batch "$di" "set -e"$'\n'"${ledger[di]}" >"$rdir/.batch/ledger-$di" || die "ledger capture failed"
+                batch_split "$rdir" ".ledger" "$rdir/.batch/ledger-$di"
+                [ -z "${pubnames[di]}" ] || driver_batch "$di" "docker rm -f${pubnames[di]} >/dev/null"
+            done
+        fi
+
 		pids=()
 		for ((di = 0; di < D; di++)); do [ -n "${subnames[di]}" ] && driver_batch "$di" "docker rm -f${subnames[di]} >/dev/null 2>&1" >/dev/null 2>&1 & pids+=($!); done
 		for pd in "${pids[@]}"; do wait "$pd" || true; done
@@ -2202,7 +2293,7 @@ lane_e_rung() { # lane_e_rung <sites> [repeat-index] [is-control]
 		for ((di = 0; di < D; di++)); do [ -n "${names[di]}" ] && driver_batch "$di" "docker rm -f${names[di]} >/dev/null 2>&1" >/dev/null 2>&1 & pids+=($!); done
 		for pd in "${pids[@]}"; do wait "$pd" || true; done
 	fi
-	rm -rf "$rdir/.batch"
+	# Retain window samples and scrape stderr for replay.
 	snapshot_metrics_complete "$rdir" after
 	echo "sites=$sites offered=$((sites * LANE_E_SITE_RATE)) publishers=$((sites * LANE_E_PUBS_PER_SITE)) consumers=$((sites * LANE_E_SUBS_PER_SITE)) per_consumer=$((LANE_E_SITE_RATE / LANE_E_SUBS_PER_SITE)) p99_budget_ms=$LANE_E_P99_BUDGET_MS qos=$LANE_E_QOS sub_qos=$LANE_E_SUB_QOS window_secs=$LANE_E_SECS window=aligned cpu_window=$cpu_window settle_s=$((LANE_E_SETTLE + settle_waited)) settled=$settled settled_conns=$settled_conns expected_conns=$expect_conns steady=$steady steady_s=$steady_s steady_reason=$steady_reason drained=$drained drain_secs=$drain_secs drain_deadline_s=$LANE_E_DRAIN_SECS control=$is_control reset=$reset reset_conns=$reset_conns" >"$rdir/rung.txt"
 	say "  lane E: $sites site(s) done ($((sites * LANE_E_SITE_RATE)) msg/s offered)"
@@ -2339,6 +2430,7 @@ lane_e_forward_canary() {
 # LANE_E_CALIBRATE_SECS, against a ladder that costs minutes per rung.
 lane_e_calibrate() {
 	[ "$LANE_E_CALIBRATE" = 1 ] || return 0
+	[ -z "${QOS1_DRIVER_ARCHIVE:-}" ] || { say "audit mode: first rung is full-workload calibration; isolated publisher probe skipped"; return 0; }
 	local per_pub_rate interval pubs_per_c per_c_rate hosts out achieved late
 	per_pub_rate=$((LANE_E_SITE_RATE / LANE_E_PUBS_PER_SITE))
 	interval=$((1000 / per_pub_rate))
@@ -2409,7 +2501,12 @@ for e_sites in "${LANE_E_SITES[@]}"; do
 		[ "$e_prev" = "$e_sites" ] && e_rep=$((e_rep + 1))
 	done
 	e_seen+=("$e_sites")
+    e_normal_secs=$LANE_E_SECS
+    if [ "${#e_seen[@]}" -eq "${#LANE_E_SITES[@]}" ] && [ -n "${LANE_E_HOLD_LAST_SECS:-}" ]; then
+        LANE_E_SECS=$LANE_E_HOLD_LAST_SECS
+    fi
 	lane_e_rung "$e_sites" "$e_rep"
+    LANE_E_SECS=$e_normal_secs
 done
 # The control repeats the BOTTOM rung — the lowest load the ladder offered, and
 # so the one most likely to pass on a healthy cluster and most damning when it

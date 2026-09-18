@@ -22,7 +22,7 @@ class CloudTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.rig = self.root / "bench/scale"
         self.rig.mkdir(parents=True)
-        for name in ("lib.sh", "cloud.sh", "run.sh", "teardown.sh", "run-curve.sh", "cpu.sh", "test-upcloud-quota.py", "482-smoke.sh", "482-constant-driver-N5-N7-optionB.env", "extract-lane-e.py", "compare-brokers.sh", "forward-canary.py"):
+        for name in ("lib.sh", "cloud.sh", "run.sh", "teardown.sh", "run-curve.sh", "cpu.sh", "test-upcloud-quota.py", "482-smoke.sh", "482-constant-driver-N5-N7-optionB.env", "extract-lane-e.py", "lane-e-evidence.py", "compare-brokers.sh", "forward-canary.py"):
             shutil.copy2(SCALE / name, self.rig / name)
         # The real mqttd captures the ledgers and the extractor are tested against.
         shutil.copytree(SCALE / "testdata", self.rig / "testdata")
@@ -491,6 +491,17 @@ with_cpu_sampling "$3" work
         self.assertNotIn("predicted crossing ≈ 0%", shape)
         self.assertEqual(self.calls(), [])
 
+    def test_lane_e_container_placement_spreads_one_site(self):
+        inventory = self.root / "placement-inventory.json"
+        inventory.write_text(json.dumps({"brokers": [{}], "drivers": [{"vcpus": 1}] * 3}))
+        args = ("run-curve.sh", str(self.root / "placement"), str(inventory))
+        common = dict(LANES="E", SHAPE_ONLY="1", LANE_E_SITES_OVERRIDE="1",
+                      LANE_E_MAX_CONTAINERS_PER_DRIVER="1")
+        self.assertNotEqual(self.run_script(*args, LANE_E_PLACEMENT="site", **common).returncode, 0)
+        result = self.run_script(*args, LANE_E_PLACEMENT="container", **common)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.calls(), [])
+
     def test_lane_e_pinned_shape_wording_unchanged(self):
         inventory = self.root / "inventory.json"
         inventory.write_text(json.dumps({"brokers": [{}], "drivers": [{"vcpus": 8}, {"vcpus": 8}]}))
@@ -543,7 +554,7 @@ if "mqttd_connections_active[ {]" in cmd:
         sys.exit(0)
 if " pub -h " in cmd:
     (state / "pubs").touch()
-if "curl -s -m 10 http://localhost:94" in cmd and os.environ.get("FAKE_RECV_RATE"):
+if re.search(r"curl -(?:s|fsS) -m 10 http://localhost:94", cmd) and os.environ.get("FAKE_RECV_RATE"):
     # A consumer scrape that COSTS TIME, like the real ssh fan-out does, and a
     # counter that advances at the offered rate in wall-clock terms. A gate that
     # divides the counter delta by its nominal poll interval instead of the time
@@ -555,7 +566,7 @@ if "curl -s -m 10 http://localhost:94" in cmd and os.environ.get("FAKE_RECV_RATE
     if not t0.exists():
         t0.write_text(repr(time.time()))
     elapsed = time.time() - float(t0.read_text())
-    for name in re.findall(r"@@@ (\S+)", cmd):
+    for name in re.findall(r"@@@ ([A-Za-z0-9_-]+)", cmd):
         print("\n@@@ %s" % name)
         print("recv %d" % int(rate * elapsed))
         print("connect_succ 600")

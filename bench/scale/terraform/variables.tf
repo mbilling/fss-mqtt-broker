@@ -127,3 +127,9 @@ variable "run_label" {
   type        = string
   default     = "manual"
 }
+
+variable "build_bench" {
+  type = bool
+  default = true
+  description = "Build lane A driver; disable for lane E-only campaigns."
+}
