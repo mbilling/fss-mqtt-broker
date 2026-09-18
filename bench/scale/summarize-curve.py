@@ -720,6 +720,37 @@ def self_test() -> None:
         if r["counts"]["duplicate"] <= 0:
             failures.append(f"duplicate count was not reported: {r['counts']}")
 
+        # 5b. NOT STEADY is a capacity verdict. Lane E gated "everyone connected"
+        #     and "everything drained" and nothing between, so the window could
+        #     open while the broker was still repaying what the ramp owed — at
+        #     N=3/4 sites on 2026-09-18 that was 372,025 messages, and the rung's
+        #     p99 (<=7500ms) was the age of traffic published before the window.
+        #     A rung that never settles around its own offer is not a measurement
+        #     of that rung, whichever side of the band it sat on.
+        for reason, expect in (("behind", "never caught up"), ("repaying", "still repaying")):
+            d = root / ("sites-4-notsteady-" + reason)
+            lane_e_fixture(d.parent, d.name, offered=30_000, sent=30_000, recv=30_000, late=0,
+                           drained="yes", settled=30_000 * 70)
+            txt = (d / "rung.txt").read_text()
+            (d / "rung.txt").write_text(txt.rstrip() + " steady=no steady_reason=%s steady_s=180\n" % reason)
+            r = lane_e_rung(d)
+            if r["pass"]:
+                failures.append("a rung that never reached steady state passed: %s" % r["flags"])
+            if not any("NOT STEADY" in f and expect in f for f in r["flags"]):
+                failures.append("NOT STEADY (%s) was not explained: %s" % (reason, r["flags"]))
+        # and a rung that DID settle carries the evidence, which is what a reader
+        # needs to believe the latency beside it.
+        d = root / "sites-4-steady"
+        lane_e_fixture(d.parent, d.name, offered=30_000, sent=30_000, recv=30_000, late=0,
+                       drained="yes", settled=30_000 * 70)
+        txt = (d / "rung.txt").read_text()
+        (d / "rung.txt").write_text(txt.rstrip() + " steady=yes steady_reason=none steady_s=25\n")
+        r = lane_e_rung(d)
+        if not r["pass"]:
+            failures.append("a steady rung was failed: %s" % r["flags"])
+        if (r.get("steady"), r.get("steady_s")) != ("yes", "25"):
+            failures.append("the catch-up evidence did not reach the report: %s" % r)
+
         # 6a. WHOSE fault is a late publisher? At QoS 0 the driver's timer slipped.
         #     At QoS >= 1 emqtt-bench holds one unacked message at a time, so the
         #     publisher is late exactly when the BROKER's ack misses the interval —
@@ -1059,6 +1090,20 @@ def lane_e_rung(rdir: Path) -> dict:
     sub_qos = meta.get("sub_qos", qos)
 
     flags = []
+    # NOT STEADY is a capacity verdict, not a hygiene note. A rung whose delivery
+    # never settled inside a band around its own offer is one where the broker
+    # either could not keep up or was still repaying what the ramp owed — and in
+    # neither case is the window a measurement of the rung (2026-09-18).
+    steady = meta.get("steady", "")
+    if steady == "no":
+        why = {"behind": "delivery never caught up with the offer",
+               "repaying": "delivery was still repaying a backlog"}.get(
+            meta.get("steady_reason", ""), "delivery never settled around the offer")
+        flags.append(
+            f"NOT STEADY ({why} within the gate's budget — at this offer the window measures "
+            "the broker catching up, not the rung)"
+        )
+
     offer_met = offered and sent_rate >= DRIVER_OK * offered
     if offered and not offer_met:
         flags.append(f"OFFER NOT MET ({sent_rate / offered * 100:.0f}% of offer)")
@@ -1082,6 +1127,23 @@ def lane_e_rung(rdir: Path) -> dict:
         flags.append(
             f"PUBLISHERS LATE ({late_share * 100:.0f}% of publishes behind schedule — {why})"
         )
+    # WINDOW CONTAMINATED. Delivering MORE than was offered during the window is
+    # not capacity: the surplus was published before the window opened and
+    # arrives carrying its full age, which lands in this rung's tail.
+    #
+    # This is a backstop for GROSS leakage, and it would not have caught the case
+    # that motivated it: at 4 sites on 2026-09-18 the surplus was 210,264
+    # messages repaid in six seconds, which is only 1.4% spread across a 61s
+    # window — under any sane tolerance. No aggregate test sees a short burst in
+    # a long window. What prevents that case is the steady-state gate, which
+    # refuses to OPEN the window until delivery sits inside a band around the
+    # offer; `steady=yes steady_s=N` in rung.txt is the evidence that it did.
+    if offered and recv_rate > (1 + TOLERANCE) * offered:
+        flags.append(
+            f"WINDOW CONTAMINATED (delivered {recv_rate / offered * 100:.0f}% of the offer — the "
+            "surplus was published before the window and carries its age into this rung's latency)"
+        )
+
     # PENDING IS NOT LOSS (#534, acceptance 7). A shortfall means one of three
     # things — the broker dropped it, the broker still holds it, or it was in
     # flight — and only the first is a finding about the broker. Before the drain
@@ -1269,6 +1331,11 @@ def lane_e_rung(rdir: Path) -> dict:
         "late_share": late_share,
         "settled": settled,
         "drained": drained,
+        # The steady-state gate's own record: whether the window was allowed to
+        # open on a caught-up broker, and how long that took. Published beside
+        # the latency because it is what makes the latency the rung's.
+        "steady": steady,
+        "steady_s": meta.get("steady_s", ""),
         "qos": qos,
         "sub_qos": sub_qos,
         "counts": counts,
@@ -1302,6 +1369,9 @@ def lane_e_rung(rdir: Path) -> dict:
             and late_share <= LATE_OK
             and settled_ok
             and reset_ok
+            # A window opened on a broker that never caught up is not a rung this
+            # ladder may claim, however good the numbers inside it look.
+            and steady != "no"
             and (qos != "2" or completed is not None)
         ),
         "flags": flags,
@@ -1467,17 +1537,27 @@ def main() -> None:
                 continue
             print(f"### {n} node(s)\n")
             repeated = len({r["sites"] for r in rungs}) < len(rungs)
-            head = "| sites | offered msg/s | delivered/s | per consumer | p99 | verdict |"
+            # `caught up in` is evidence, not decoration: it is the seconds the
+            # broker needed to reach steady state at this offer before the window
+            # was allowed to open, so a reader can see that the latency beside it
+            # describes the rung rather than a backlog being repaid into it.
+            head = "| sites | offered msg/s | delivered/s | per consumer | caught up in | p99 | verdict |"
             if repeated:
-                head = "| sites | run | offered msg/s | delivered/s | per consumer | p99 | verdict |"
+                head = "| sites | run | offered msg/s | delivered/s | per consumer | caught up in | p99 | verdict |"
             print(head)
-            print("|---|---|---|---|---|---|" + ("---|" if repeated else ""))
+            print("|---|---|---|---|---|---|---|" + ("---|" if repeated else ""))
             for r in rungs:
                 verdict = "pass" if r["pass"] else "; ".join(r["flags"]) or "fail"
                 run_col = f" {r.get('rep', 1)} |" if repeated else ""
+                if r.get("steady") == "yes":
+                    caught = f"{r.get('steady_s', '?')}s"
+                elif r.get("steady") == "no":
+                    caught = "NEVER"
+                else:
+                    caught = "—"  # a run directory from before the gate existed
                 print(
                     f"| {r['sites']} |{run_col} {r['offered']:,.0f} | {r['recv_rate']:,.0f} | "
-                    f"{r['per_consumer']:,.0f} | {r['p99']} | {verdict} |"
+                    f"{r['per_consumer']:,.0f} | {caught} | {r['p99']} | {verdict} |"
                 )
             # ── message accounting (#534, acceptance 3) ──────────────────
             # One row per rung, so a shortfall can be attributed instead of

@@ -392,6 +392,23 @@ LANE_E_ACK_RTT_MS="${LANE_E_ACK_RTT_MS:-12}"
 # capacity lane may want to reach. It is PREDICTED here so it is never reached
 # unannounced, and the rung that reaches it is flagged from the counter.
 LANE_E_PENDING_PUBLISH_CAP="${LANE_E_PENDING_PUBLISH_CAP:-4096}"
+# THE STEADY-STATE GATE (2026-09-18). Lane E gated that every client had
+# CONNECTED and that everything had DRAINED, and nothing in between: the window
+# could open while the broker was still repaying a backlog built during the
+# ramp. Measured at N=3, 4 sites: the window opened on 372,025 outstanding
+# messages, repaid them in its first six seconds, and the rung's p99 became
+# <=7500ms — the age of traffic published BEFORE the window. After catch-up the
+# same broker held the full 120,000 msg/s for 55 seconds.
+#
+# Steady means delivery sits INSIDE a band around the offer, not merely above
+# it: below the band the broker is falling behind, above it the broker is
+# repaying, and a window opened during either measures something other than the
+# rung. The gate is also the capacity test — a rung that cannot reach steady
+# state within its budget is past the broker's capacity, which is a cleaner
+# knee than a percentile taken on a contaminated window.
+LANE_E_STEADY_PCT="${LANE_E_STEADY_PCT:-5}"
+LANE_E_STEADY_POLLS="${LANE_E_STEADY_POLLS:-3}"
+LANE_E_STEADY_BUDGET="${LANE_E_STEADY_BUDGET:-180}"
 # The SUBSCRIBER's requested QoS, separately (#534, acceptance 2). #405 records
 # that the old durable_bench QoS 2 rows isolated INBOUND cost — publisher at
 # QoS 2, subscriber at QoS 1 — and so never measured the outbound exactly-once
@@ -826,6 +843,10 @@ lane_e_shape() {
 	case "$LANE_E_PROTO" in 3 | 4 | 5) ;; *) die "LANE_E_PROTO must be 3, 4 or 5 (emqtt-bench -V), got '$LANE_E_PROTO'" ;; esac
 	positive_int LANE_E_ACK_RTT_MS "$LANE_E_ACK_RTT_MS"
 	positive_int LANE_E_PENDING_PUBLISH_CAP "$LANE_E_PENDING_PUBLISH_CAP"
+	positive_int LANE_E_STEADY_PCT "$LANE_E_STEADY_PCT"
+	positive_int LANE_E_STEADY_POLLS "$LANE_E_STEADY_POLLS"
+	positive_int LANE_E_STEADY_BUDGET "$LANE_E_STEADY_BUDGET"
+	[ "$LANE_E_STEADY_PCT" -lt 100 ] || die "LANE_E_STEADY_PCT must be under 100 (got $LANE_E_STEADY_PCT) — a band that wide accepts any rate as steady"
 	case "$LANE_E_SUB_QOS" in 0 | 1 | 2) ;; *) die "LANE_E_SUB_QOS must be 0, 1 or 2, got '$LANE_E_SUB_QOS'" ;; esac
 	# A subscriber cannot be granted MORE than the publisher sent: asking for it
 	# would silently measure the publisher's QoS while the run directory claims
@@ -1929,6 +1950,51 @@ lane_e_rung() { # lane_e_rung <sites> [repeat-index] [is-control]
 		sleep "$LANE_E_DRAIN_POLL"
 		settle_waited=$((settle_waited + LANE_E_DRAIN_POLL))
 	done
+	# ── the steady-state gate: is the broker KEEPING UP at this offer? ───────
+	# Connected is not the same as caught up. The publishers have been running
+	# through the whole connect ramp, so by the time the population is complete
+	# the broker may owe a backlog — and a window opened on top of it measures
+	# the repayment, not the rung (2026-09-18: 372,025 messages owed at 4 sites,
+	# a p99 of <=7500ms that belonged to the ramp, and a broker that then held
+	# the full offer for 55s).
+	#
+	# Steady is a BAND, not a floor: below it the broker is falling behind, above
+	# it the broker is repaying what it owes. Only inside the band is the rung
+	# the thing being measured.
+	local steady=no steady_s=0 steady_reason=none
+	local offer_total=$((sites * LANE_E_SITE_RATE))
+	local band=$((offer_total * LANE_E_STEADY_PCT / 100))
+	if [ "$settled" = yes ]; then
+		local prev_recv cur_recv flat=0 waited=0 rate delta
+		prev_recv=$(lane_e_recv_total)
+		while :; do
+			sleep "$LANE_E_DRAIN_POLL"
+			waited=$((waited + LANE_E_DRAIN_POLL))
+			cur_recv=$(lane_e_recv_total)
+			rate=$(((cur_recv - prev_recv) / LANE_E_DRAIN_POLL))
+			prev_recv="$cur_recv"
+			delta=$((rate - offer_total))
+			[ "$delta" -ge 0 ] || delta=$((-delta))
+			if [ "$delta" -le "$band" ]; then
+				flat=$((flat + 1))
+				if [ "$flat" -ge "$LANE_E_STEADY_POLLS" ]; then
+					steady=yes
+					steady_s="$waited"
+					break
+				fi
+			else
+				flat=0
+				[ "$rate" -ge "$offer_total" ] && steady_reason=repaying || steady_reason=behind
+			fi
+			[ "$waited" -lt "$LANE_E_STEADY_BUDGET" ] || {
+				steady_s="$waited"
+				warn "lane E: rung $sites never reached steady state — delivery was still $steady_reason after ${waited}s (last ${rate} msg/s against an offer of ${offer_total}). The rung is measured and flagged NOT STEADY: at this offer the broker either cannot keep up, or is still repaying what the ramp owed"
+				break
+			}
+		done
+		[ "$steady" != yes ] || say "  [$N nodes] lane E: rung $sites reached steady state after ${steady_s}s (delivery within ${LANE_E_STEADY_PCT}% of ${offer_total} msg/s for $LANE_E_STEADY_POLLS polls)"
+	fi
+
 	# ── ONE window for every side of the rung ────────────────────────────────
 	# The consumer histograms were always baselined here, but the broker counters
 	# were read before the consumers even started and after the drain, and the CPU
@@ -2117,7 +2183,7 @@ lane_e_rung() { # lane_e_rung <sites> [repeat-index] [is-control]
 	fi
 	rm -rf "$rdir/.batch"
 	snapshot_metrics_complete "$rdir" after
-	echo "sites=$sites offered=$((sites * LANE_E_SITE_RATE)) publishers=$((sites * LANE_E_PUBS_PER_SITE)) consumers=$((sites * LANE_E_SUBS_PER_SITE)) per_consumer=$((LANE_E_SITE_RATE / LANE_E_SUBS_PER_SITE)) p99_budget_ms=$LANE_E_P99_BUDGET_MS qos=$LANE_E_QOS sub_qos=$LANE_E_SUB_QOS window_secs=$LANE_E_SECS window=aligned cpu_window=$cpu_window settle_s=$((LANE_E_SETTLE + settle_waited)) settled=$settled settled_conns=$settled_conns expected_conns=$expect_conns drained=$drained drain_secs=$drain_secs drain_deadline_s=$LANE_E_DRAIN_SECS control=$is_control reset=$reset reset_conns=$reset_conns" >"$rdir/rung.txt"
+	echo "sites=$sites offered=$((sites * LANE_E_SITE_RATE)) publishers=$((sites * LANE_E_PUBS_PER_SITE)) consumers=$((sites * LANE_E_SUBS_PER_SITE)) per_consumer=$((LANE_E_SITE_RATE / LANE_E_SUBS_PER_SITE)) p99_budget_ms=$LANE_E_P99_BUDGET_MS qos=$LANE_E_QOS sub_qos=$LANE_E_SUB_QOS window_secs=$LANE_E_SECS window=aligned cpu_window=$cpu_window settle_s=$((LANE_E_SETTLE + settle_waited)) settled=$settled settled_conns=$settled_conns expected_conns=$expect_conns steady=$steady steady_s=$steady_s steady_reason=$steady_reason drained=$drained drain_secs=$drain_secs drain_deadline_s=$LANE_E_DRAIN_SECS control=$is_control reset=$reset reset_conns=$reset_conns" >"$rdir/rung.txt"
 	say "  lane E: $sites site(s) done ($((sites * LANE_E_SITE_RATE)) msg/s offered)"
 }
 # ── the forwarding positive control (#482 Option B) ──────────────────────────
