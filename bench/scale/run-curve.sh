@@ -1802,7 +1802,7 @@ lane_e_rung() { # lane_e_rung <sites> [repeat-index] [is-control]
 		local q
 		local -a rp=()
 		for ((q = 0; q < D; q++)); do
-			driver_batch "$q" "set -e"$'\n'"${scrape[q]}" >"$rdir/.batch/poll-$q" 2>/dev/null &
+			driver_batch "$q" "set -e"$'\n'"${pollscrape[q]}" >"$rdir/.batch/poll-$q" 2>/dev/null &
 			rp+=($!)
 		done
         for q in ${rp[@]+"${rp[@]}"}; do wait "$q" || return 1; done
@@ -1812,11 +1812,12 @@ lane_e_rung() { # lane_e_rung <sites> [repeat-index] [is-control]
         python3 "$SCALE_DIR/lane-e-evidence.py" poll "$rdir" "$LANE_E_SITE_RATE"
 	}
 	local di s j sdi hosts filter seq_base cidx
-	local -a subs pubs scrape stop names portn pubnames subnames subdump pubscrape pause ledger terminal
+	local -a subs pubs scrape stop names portn pubnames subnames subdump pubscrape pause ledger terminal pollscrape
 	for ((di = 0; di < D; di++)); do
 		subs[di]="set -e"$'\n'
 		pubs[di]="set -e"$'\n'
 		scrape[di]=""
+        pollscrape[di]=""
 		pubscrape[di]=""; pause[di]=""; ledger[di]=""; terminal[di]=""
 		stop[di]=""
 		names[di]=""
@@ -1844,6 +1845,11 @@ lane_e_rung() { # lane_e_rung <sites> [repeat-index] [is-control]
 			filter="\$share/site$s/site/$s/#"
 			subs[sdi]+="$DOCKER_RUN --name sub-s$s-$j $BENCH_IMG sub -h $hosts -p $port -V $LANE_E_PROTO -c $subs_per_c -R $LANE_E_CONNECT_RATE -t '$filter' -q $LANE_E_SUB_QOS $active --payload-hdrs ts --prometheus --restapi $((port_base + portn[sdi])) >/dev/null"$'\n'
 			scrape[sdi]+="printf '\\n@@@ sub-s$s-$j\\n'; curl -fsS -m 10 http://localhost:$((port_base + portn[sdi]))/metrics"$'\n'
+            if [ -n "${QOS1_DRIVER_ARCHIVE:-}" ]; then
+                pollscrape[sdi]+="printf '\\n@@@ sub-s$s-$j\\n'; printf '# POLL_STAMP_MS %s\\n' \"\$(date +%s%3N)\"; curl -fsS -m 10 http://localhost:$((port_base + portn[sdi]))/metrics; printf '\\n# POLL_STAMP_MS %s\\n' \"\$(date +%s%3N)\""$'\n'
+            else
+                pollscrape[sdi]+="printf '\\n@@@ sub-s$s-$j\\n'; curl -fsS -m 10 http://localhost:$((port_base + portn[sdi]))/metrics"$'\n'
+            fi
 			stop[sdi]+="printf '\\n@@@ sub-s$s-$j\\n'; docker logs sub-s$s-$j 2>&1"$'\n'
 			subdump[sdi]+="printf '\\n@@@ sub-s$s-$j\\n'; docker logs sub-s$s-$j 2>&1"$'\n'
 			names[sdi]+=" sub-s$s-$j"
@@ -1878,15 +1884,15 @@ lane_e_rung() { # lane_e_rung <sites> [repeat-index] [is-control]
 	done
 	local -a pids
 	local pd
-    python3 - "$rdir" "$N" "$D" "$LANE_E_SECS" "$LANE_E_PAYLOAD" <<'MANIFEST'
+    python3 - "$rdir" "$N" "$D" "$LANE_E_SECS" "$LANE_E_PAYLOAD" "${QOS1_DRIVER_ARCHIVE:-}" <<'MANIFEST'
 import json,sys
 from pathlib import Path
 p=Path(sys.argv[1]); eps=[]
 for row in (p/'endpoints.tsv').read_text().splitlines():
  n,d,s,r,c=row.split('\t');eps.append(dict(name=n,driver=int(d),site=s,role=r,clients=int(c)))
-(p/'manifest.json').write_text(json.dumps(dict(nodes=int(sys.argv[2]),drivers=int(sys.argv[3]),window_secs=int(sys.argv[4]),payload_bytes=int(sys.argv[5])+16,telemetry_required=True,endpoints=eps),indent=2))
+(p/'manifest.json').write_text(json.dumps(dict(nodes=int(sys.argv[2]),drivers=int(sys.argv[3]),window_secs=int(sys.argv[4]),payload_bytes=int(sys.argv[5])+16,telemetry_required=True,poll_timestamps=bool(sys.argv[6]),endpoints=eps),indent=2))
 MANIFEST
-    { declare -p subs pubs scrape pubscrape pause terminal ledger; } >"$rdir/commands.sh"
+    { declare -p subs pubs scrape pollscrape pubscrape pause terminal ledger; } >"$rdir/commands.sh"
 
 	# ── the broker must be demonstrably RESET before this rung (#534, acc. 6) ──
 	# Rungs share one cluster, so a rung inherits whatever the previous one left
@@ -1975,6 +1981,27 @@ MANIFEST
 	pids=()
 	for ((di = 0; di < D; di++)); do driver_batch "$di" "${pubs[di]}" & pids+=($!); done
 	for pd in "${pids[@]}"; do wait "$pd" || die "lane E: starting publisher containers failed (rung $sites sites)"; done
+    if [ -n "${QOS1_DRIVER_ARCHIVE:-}" ]; then
+        pids=()
+        for ((di = 0; di < D; di++)); do
+            [ -n "${names[di]}" ] || continue
+            driver_batch "$di" "docker inspect --format '{{.Name}} {{.Image}} {{.State.Running}} {{.State.StartedAt}}'${names[di]}" >"$rdir/driver$di-images.txt" & pids+=($!)
+        done
+        for pd in "${pids[@]}"; do wait "$pd" || die "lane E: container provenance capture failed"; done
+        python3 - "$rdir" "$audit_image_id" <<'IMAGES'
+import json,sys
+from pathlib import Path
+p=Path(sys.argv[1]); expected={e['name']:e['driver'] for e in json.loads((p/'manifest.json').read_text())['endpoints']}; seen=set()
+for f in p.glob('driver*-images.txt'):
+ driver=int(f.name.removeprefix('driver').removesuffix('-images.txt'))
+ for line in f.read_text().splitlines():
+  name,image,running,started=line.split();name=name.removeprefix('/')
+  if name in seen or expected.get(name)!=driver or image!=sys.argv[2] or running!='true':
+   raise SystemExit('invalid container identity/image/state: '+line)
+  seen.add(name)
+if seen!=set(expected):raise SystemExit('missing container provenance')
+IMAGES
+    fi
 	# Baseline the histograms AFTER the ramp, exactly as lane B does: the counters
 	# are cumulative over the container's life, so a single end-of-rung scrape
 	# bakes the connect ramp into the published tail.
@@ -2057,7 +2084,7 @@ MANIFEST
 			fi
 			[ "$waited_ms" -lt $((LANE_E_STEADY_BUDGET * 1000)) ] || {
 				steady_s="$waited"
-				warn "lane E: rung $sites never reached steady state — delivery was still $steady_reason after ${waited}s (last ${rate} msg/s against an offer of ${offer_total}). The rung is measured and flagged NOT STEADY: at this offer the broker either cannot keep up, or is still repaying what the ramp owed"
+				warn "lane E: rung $sites never reached steady state — delivery was still $steady_reason after ${waited}s (last ${rate} msg/s against an offer of ${offer_total}). The rung is measured and flagged NOT STEADY: delivery did not establish a stable per-site rate; publisher pacing, scrape timing and broker service require separate diagnosis"
 				break
 			}
 		done

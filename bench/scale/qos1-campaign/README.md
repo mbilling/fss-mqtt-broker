@@ -64,3 +64,13 @@ Use `report.py RUN... --output DIR` for a fail-closed per-rung report and
 repetition qualification. It refuses a cross-size scaling claim when sizes or
 repetitions are missing. The JSON retains exact ledgers and rates; a qualified
 operating point is still a lower bound unless a valid higher load fails.
+
+The September 18 confirmation result is recorded in
+[the harness review](../../../astra/20260918T162211Z-qos1-harness-confirmation.md).
+It did not qualify a cloud capacity point. The revised local integration can
+exercise three FSS processes and a cross-node shared group with
+`../qos1-driver/test-local.py --mqttd /path/to/pinned/mqttd`.
+`ledger-report.py RUN` independently reconciles completed lifetime ledgers even
+when timing evidence prevents a throughput claim. The final audited steady gate
+uses per-endpoint remote timestamp bounds; historical manifests retain their
+original polling semantics and are not silently upgraded.

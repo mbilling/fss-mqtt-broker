@@ -77,6 +77,47 @@ class Evidence(unittest.TestCase):
             ]
             (p / f"{name}.ledger").write_text("".join(rows) + "# EOF\n")
 
+    def timed_sample(self, start, end, count):
+        manifest = json.loads((self.p / "manifest.json").read_text())
+        manifest["poll_timestamps"] = True
+        (self.p / "manifest.json").write_text(json.dumps(manifest))
+        (self.p / ".poll").mkdir(exist_ok=True)
+        for name in self.subs:
+            (self.p / ".poll" / (name + ".prom")).write_text(
+                f"# POLL_STAMP_MS {start}\nrecv {count}\n# EOF\n# POLL_STAMP_MS {end}\n"
+            )
+        E.poll(self.p, 10)
+        return (self.p / "poll-steady").read_text()
+
+    def test_poll_uses_remote_endpoint_time_not_local_fanout(self):
+        self.assertEqual(self.timed_sample(100000, 100010, 0), "no")
+        # Both calls occur immediately locally, but remote samples are 10s apart.
+        self.assertEqual(self.timed_sample(110000, 110010, 50), "yes")
+
+    def test_poll_uncertainty_cannot_pass_at_correct_midpoint_rate(self):
+        self.timed_sample(100000, 102000, 0)
+        self.assertEqual(self.timed_sample(110000, 112000, 50), "no")
+
+    def test_poll_rejects_missing_endpoint_stamps_and_clock_reset(self):
+        self.timed_sample(100000, 100010, 0)
+        with self.assertRaises(ValueError):
+            self.timed_sample(99000, 99010, 50)
+        path = self.p / ".poll" / (self.subs[0] + ".prom")
+        path.write_text("recv 50\n# EOF\n")
+        with self.assertRaises(ValueError):
+            E.poll(self.p, 10)
+
+    def test_acked_ledger_counter_mismatch(self):
+        path = self.p / (self.pub + ".ledger")
+        txt = path.read_text()
+        lines = txt.splitlines()
+        fields = lines[1].split("\t")
+        fields[3] = "601"
+        lines[1] = "\t".join(fields)
+        path.write_text("\n".join(lines) + "\n")
+        with self.assertRaisesRegex(ValueError, "ledger/counter mismatch"):
+            E.validate(self.p)
+
     def test_valid(self):
         r = E.validate(self.p)
         self.assertEqual(r["counts"]["unique_delivered"], 600)

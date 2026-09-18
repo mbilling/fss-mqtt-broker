@@ -8,6 +8,13 @@ start() ->
     case enabled() of
         false -> ok;
         true ->
+            %% VM-wide collectors can suspend/survey thousands of client
+            %% processes. Keep only workload metrics on the measurement path;
+            %% host CPU is sampled independently by mpstat.
+            Keep = [prometheus_boolean, prometheus_counter, prometheus_gauge,
+                    prometheus_histogram, prometheus_quantile_summary, prometheus_summary],
+            [prometheus_registry:deregister_collector(C)
+             || C <- prometheus_registry:collectors(default), not lists:member(C, Keep)],
             ets:new(qos1_ledger, [named_table, public, set, {write_concurrency, true}]),
             persistent_term:put(qos1_paused, false),
             [prometheus_counter:declare([{name,N},{help,atom_to_list(N)}]) || N <- [audit_sent,audit_acked,audit_received]],

@@ -22,7 +22,7 @@ class CloudTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.rig = self.root / "bench/scale"
         self.rig.mkdir(parents=True)
-        for name in ("lib.sh", "cloud.sh", "run.sh", "teardown.sh", "run-curve.sh", "cpu.sh", "test-upcloud-quota.py", "482-smoke.sh", "482-constant-driver-N5-N7-optionB.env", "extract-lane-e.py", "lane-e-evidence.py", "compare-brokers.sh", "forward-canary.py"):
+        for name in ("lib.sh", "cloud.sh", "collect.sh", "run.sh", "teardown.sh", "run-curve.sh", "cpu.sh", "test-upcloud-quota.py", "482-smoke.sh", "482-constant-driver-N5-N7-optionB.env", "extract-lane-e.py", "lane-e-evidence.py", "compare-brokers.sh", "forward-canary.py"):
             shutil.copy2(SCALE / name, self.rig / name)
         # The real mqttd captures the ledgers and the extractor are tested against.
         shutil.copytree(SCALE / "testdata", self.rig / "testdata")
@@ -56,6 +56,28 @@ sys.exit(77 if "apply" in sys.argv or os.path.basename(sys.argv[0]) in ("hcloud"
             "MQTTD_VERSION": "test", "OBSERVE": "0",
             "RUN_DIR": str(self.root / "run"),
         }
+
+    def test_failure_capture_retries_and_preserves_unavailable_status(self):
+        inventory = self.root / "inventory.json"
+        inventory.write_text(json.dumps({"brokers": [], "drivers": [{"public_ip": "good"}, {"public_ip": "bad"}]}))
+        (self.bin_dir / "ssh").write_text("""#!/usr/bin/env python3
+import pathlib,os,sys
+host=next(v for v in sys.argv if v.startswith('root@'))
+p=pathlib.Path(os.environ['HOME'])/host
+n=int(p.read_text())+1 if p.exists() else 1
+p.write_text(str(n))
+print('attempt',n,host)
+if host=='root@bad' or n==1:raise SystemExit(255)
+print('kernel and container evidence')
+""")
+        out = self.root / "capture"
+        result = self.run_script("collect.sh", str(out), str(inventory))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        hosts = out / "results/nodes=0/hosts"
+        self.assertIn("success attempt=2", (hosts / "driver0-logs.log.status").read_text())
+        self.assertIn("unavailable", (hosts / "driver1-logs.log.status").read_text())
+        self.assertIn("kernel and container", (hosts / "driver0-logs.log").read_text())
+        self.assertEqual(len(list(hosts.glob("driver1-logs.log.attempt*"))), 3)
 
     def run_script(self, name, *args, **env):
         return subprocess.run(

@@ -715,7 +715,7 @@ def self_test() -> None:
         #     p99 (<=7500ms) was the age of traffic published before the window.
         #     A rung that never settles around its own offer is not a measurement
         #     of that rung, whichever side of the band it sat on.
-        for reason, expect in (("behind", "never caught up"), ("repaying", "still repaying")):
+        for reason, expect in (("behind", "below offer"), ("repaying", "above offer")):
             d = root / ("sites-4-notsteady-" + reason)
             lane_e_fixture(d.parent, d.name, offered=30_000, sent=30_000, recv=30_000, late=0,
                            drained="yes", settled=30_000 * 70)
@@ -1084,18 +1084,13 @@ def lane_e_rung(rdir: Path) -> dict:
     if evidence_error: flags.append("INVALID EVIDENCE (" + evidence_error + ")")
     if evidence and evidence.get("telemetry") and not evidence["telemetry"]["queues_bounded"]:
         flags.append("QUEUE GROWTH OR BACKLOG BUDGET EXCEEDED")
-    # NOT STEADY is a capacity verdict, not a hygiene note. A rung whose delivery
-    # never settled inside a band around its own offer is one where the broker
-    # either could not keep up or was still repaying what the ramp owed — and in
-    # neither case is the window a measurement of the rung (2026-09-18).
+    # A failed gate excludes a capacity point; it does not identify the cause.
     steady = meta.get("steady", "")
     if steady == "no":
-        why = {"behind": "delivery never caught up with the offer",
-               "repaying": "delivery was still repaying a backlog"}.get(
-            meta.get("steady_reason", ""), "delivery never settled around the offer")
+        direction = {"behind": "below offer", "repaying": "above offer"}.get(meta.get("steady_reason"), "unclassified")
         flags.append(
-            f"NOT STEADY ({why} within the gate's budget — at this offer the window measures "
-            "the broker catching up, not the rung)"
+            f"NOT STEADY (last aggregate sample {direction}; per-site delivery did not remain within the offer band; "
+            "publisher pacing, scrape timing and broker service are not isolated)"
         )
 
     offer_met = offered and sent_rate >= DRIVER_OK * offered

@@ -22,7 +22,14 @@ for root in a.runs:
     for n, d in c.sizes(results):
         for rung in sorted((d / "laneE").glob("sites-*")):
             r = c.lane_e_rung(rung)
-            r.update(nodes=n, path=str(rung))
+            r.update(
+                nodes=n,
+                path=str(rung),
+                calibration_only=(root / "driver-transition").exists(),
+            )
+            r["measurements_valid"] = not any(
+                f.startswith(("INVALID EVIDENCE", "INCOMPLETE")) for f in r["flags"]
+            )
             rows.append(r)
 a.output.mkdir(parents=True, exist_ok=True)
 (a.output / "rungs.json").write_text(json.dumps(rows, indent=2))
@@ -34,10 +41,32 @@ lines = [
     "| nodes | sites | repetition | requested/s | emitted/s | received/s | late % | p99 upper bound | result |",
     "|---|---|---|---|---|---|---|---|---|",
 ]
+if any(r.get("calibration_only") for r in rows):
+    lines[4:4] = [
+        "**Calibration only:** the driver image changed during this provisioning. Image installation also perturbed the active rung. These observations cannot be combined into a capacity curve; consult driver-transition and per-rung driver-images.json.",
+        "",
+    ]
 for r in rows:
     verdict = "PASS" if r["pass"] else "; ".join(r["flags"]) or "FAIL"
+    valid = r["measurements_valid"]
+    if not valid:
+        verdict = "; ".join(
+            f
+            for f in r["flags"]
+            if f.startswith(("INVALID EVIDENCE", "INCOMPLETE", "NOT STEADY"))
+        )
+    measurements = (
+        f"{r['sent_rate']:.1f} | {r['recv_rate']:.1f} | {100 * r.get('late_share', 0):.3f} | {r['p99']}"
+        if valid
+        else "unvalidated | unvalidated | unvalidated | unvalidated"
+    )
+    offer_label = (
+        f"{r['offered']:.0f}"
+        if not any(f.startswith("INCOMPLETE") for f in r["flags"])
+        else "unknown"
+    )
     lines.append(
-        f"| {r['nodes']} | {r['sites']} | {r['rep']}{' control' if r.get('control') else ''} | {r['offered']:.0f} | {r['sent_rate']:.1f} | {r['recv_rate']:.1f} | {100 * r.get('late_share', 0):.3f} | {r['p99']} | {verdict} |"
+        f"| {r['nodes']} | {r['sites']} | {r['rep']}{' control' if r.get('control') else ''} | {offer_label} | {measurements} | {verdict} |"
     )
 lines += [
     "",
@@ -56,6 +85,7 @@ for n in sorted({r["nodes"] for r in rows}):
         lower = [r for r in rs if r["offered"] <= offer]
         if (
             len(reps) >= 3
+            and not any(r.get("calibration_only") for r in rs)
             and all(r["pass"] for r in lower)
             and controls
             and all(r["pass"] for r in controls)

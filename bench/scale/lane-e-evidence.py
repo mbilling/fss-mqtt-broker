@@ -325,6 +325,7 @@ def validate(rdir):
     # Terminal counters must describe exactly the same traffic as the ledgers.
     for role, paths, kind, total in [
         ("pub", pubpaths, "audit_sent", st),
+        ("pub", pubpaths, "audit_acked", at),
         ("sub", subpaths, "recv", rt),
     ]:
         observed = sum(
@@ -362,8 +363,71 @@ def validate(rdir):
     }
 
 
+def timed_poll(rdir, manifest, offer):
+    """Bound each endpoint's rate by its own remote scrape timestamps.
+
+    SSH fan-out completion time is not an endpoint sample time. Summing rate
+    bounds also avoids assuming subscriber containers scrape simultaneously.
+    """
+    endpoints = {}
+    totals = {}
+    for ep in manifest["endpoints"]:
+        if ep["role"] != "sub":
+            continue
+        path = rdir / ".poll" / f"{ep['name']}.prom"
+        raw = path.read_text()
+        stamps = re.findall(r"^# POLL_STAMP_MS (\d+)$", raw, re.MULTILINE)
+        if len(stamps) != 2:
+            raise ValueError(f"missing poll timestamps for {ep['name']}")
+        start, end = map(int, stamps)
+        if end < start or "# EOF" not in raw:
+            raise ValueError("invalid/truncated timed poll")
+        count = value(metric_text(raw, ep["name"]), "recv")
+        endpoints[ep["name"]] = {
+            "start": start,
+            "end": end,
+            "count": count,
+            "site": ep["site"],
+        }
+        totals[ep["site"]] = totals.get(ep["site"], 0) + count
+    state = rdir / "poll-state.json"
+    bounds = {}
+    good = False
+    if state.exists():
+        previous = json.loads(state.read_text())["endpoints"]
+        if set(previous) != set(endpoints):
+            raise ValueError("poll population changed")
+        for name, v in endpoints.items():
+            old = previous[name]
+            shortest = (v["start"] - old["end"]) / 1000
+            longest = (v["end"] - old["start"]) / 1000
+            count = v["count"] - old["count"]
+            if shortest <= 0 or count < 0 or old["site"] != v["site"]:
+                raise ValueError("poll clock/counter/population reset")
+            lo, hi = bounds.get(v["site"], (0, 0))
+            bounds[v["site"]] = (lo + count / longest, hi + count / shortest)
+        good = bool(bounds) and all(
+            lo >= offer * 0.95 and hi <= offer * 1.05 for lo, hi in bounds.values()
+        )
+    row = {
+        "at": time.monotonic(),
+        "endpoints": endpoints,
+        "totals": totals,
+        "rate_bounds": bounds,
+        "rates": {s: (lo + hi) / 2 for s, (lo, hi) in bounds.items()},
+        "steady": good,
+    }
+    state.write_text(json.dumps(row))
+    (rdir / "poll-steady").write_text("yes" if good else "no")
+    with (rdir / "poll-history.jsonl").open("a") as f:
+        f.write(json.dumps(row) + "\n")
+    print(int(sum(totals.values())))
+
+
 def poll(rdir, offer):
     manifest = json.loads((rdir / "manifest.json").read_text())
+    if manifest.get("poll_timestamps"):
+        return timed_poll(rdir, manifest, offer)
     totals = {}
     # batch_split output is replaced on each poll; every expected endpoint is required.
     for ep in manifest["endpoints"]:
