@@ -720,6 +720,23 @@ def self_test() -> None:
         if r["counts"]["duplicate"] <= 0:
             failures.append(f"duplicate count was not reported: {r['counts']}")
 
+        # 6a. WHOSE fault is a late publisher? At QoS 0 the driver's timer slipped.
+        #     At QoS >= 1 emqtt-bench holds one unacked message at a time, so the
+        #     publisher is late exactly when the BROKER's ack misses the interval —
+        #     measured at N=3 on 2026-09-18, where 24-91% of publishes ran late
+        #     while the drivers still had 47-73% idle CPU. Blaming the driver there
+        #     sends the reader to the wrong component.
+        for level, expect, forbid in (("0", "the drivers could not hold", "BROKER"),
+                                      ("1", "BROKER's ack", "the drivers could not hold")):
+            r = lane_e_rung(lane_e_fixture(
+                root, "sites-4-late-q%s" % level, offered=30_000, sent=30_000, recv=30_000,
+                late=9_000, drained="yes", settled=30_000 * 70, qos=level, sub_qos=level))
+            late = [f for f in r["flags"] if "PUBLISHERS LATE" in f]
+            if not late:
+                failures.append("a late-publisher rung at QoS %s was not flagged: %s" % (level, r["flags"]))
+            elif expect not in late[0] or forbid in late[0]:
+                failures.append("QoS %s lateness blamed the wrong component: %s" % (level, late[0]))
+
         # 6b. REDELIVERY at QoS 1 is reported, never gated. At-least-once may
         #     legitimately put a message on the wire twice, so the QoS 0 defect
         #     check is correctly skipped — but skipping it left the QoS 1 arm with
@@ -1035,15 +1052,35 @@ def lane_e_rung(rdir: Path) -> dict:
     buckets, count = merged_histogram(sorted(rdir.glob("sub-*.prom")))
     p99 = bucket_pct(buckets, count, 0.99)
 
+    # Read BEFORE the flags: at QoS >= 1 the late-publisher flag has to name the
+    # broker rather than the driver, so the level is needed while the flags are
+    # being built, not only where the accounting table is rendered.
+    qos = meta.get("qos", "0")
+    sub_qos = meta.get("sub_qos", qos)
+
     flags = []
     offer_met = offered and sent_rate >= DRIVER_OK * offered
     if offered and not offer_met:
         flags.append(f"OFFER NOT MET ({sent_rate / offered * 100:.0f}% of offer)")
     late_share = late_rate / sent_rate if sent_rate else 0.0
     if late_share > LATE_OK:
+        # WHOSE fault lateness is depends on the QoS, and saying "the drivers" at
+        # QoS >= 1 blames the wrong component. emqtt-bench publishes one unacked
+        # message at a time, so a publisher falls behind its timer whenever the
+        # BROKER's ack takes longer than the interval — measured at N=3 on
+        # 2026-09-18, where 24% to 91% of publishes ran late while the drivers
+        # still had 47-73% idle CPU. At QoS 0 nothing waits for the broker, and
+        # lateness really is the driver's timer slipping.
+        if qos == "0":
+            why = "the drivers could not hold the offered rate, so this rung measures them"
+        else:
+            why = (
+                "at QoS %s a publisher holds one unacked message at a time, so this is the "
+                "BROKER's ack arriving after the publisher's interval — check the driver idle "
+                "figures before reading it as a driver limit" % qos
+            )
         flags.append(
-            f"PUBLISHERS LATE ({late_share * 100:.0f}% of publishes behind schedule — "
-            "the drivers could not hold the offered rate, so this rung measures them)"
+            f"PUBLISHERS LATE ({late_share * 100:.0f}% of publishes behind schedule — {why})"
         )
     # PENDING IS NOT LOSS (#534, acceptance 7). A shortfall means one of three
     # things — the broker dropped it, the broker still holds it, or it was in
@@ -1097,8 +1134,6 @@ def lane_e_rung(rdir: Path) -> dict:
     #   duplicate            what arrived more than once   broker delivered - unique
     #   dropped              what the broker refused       broker, by reason
     #   pending              what was still owed at the deadline
-    qos = meta.get("qos", "0")
-    sub_qos = meta.get("sub_qos", qos)
     # The span every count below is taken over: how long the PUBLISHERS actually
     # ran, read from their own logs rather than from the configured window, which
     # covers only the middle of it. See `driver_span`.

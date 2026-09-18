@@ -921,12 +921,12 @@ lane_e_shape() {
 			echo "               Do not treat round-robin (N-1)/N as the prediction while prefer-local is on."
 		fi
 		if [ "$LANE_E_FORWARD_CANARY" = 1 ] && [ "$N" -gt 1 ]; then
-			echo "forward canary: ON — before calibration, $LANE_E_FORWARD_CANARY_COUNT QoS 0 msgs over each of $((N * (N - 1))) directed broker pairs"
+			echo "forward canary: ON — before calibration, $LANE_E_FORWARD_CANARY_COUNT QoS $LANE_E_QOS msgs over each of $((N * (N - 1))) directed broker pairs"
 			echo "               (timeout ${LANE_E_FORWARD_CANARY_TIMEOUT}s) must forward exactly, or the size stops. Every rung must"
 			echo "               still carry each broker's mqttd_publish_forwarded_total{reason=\"shared-remote\"}"
 			echo "               floor from the same process; otherwise its crossing is INVALID, not 0%."
 		elif [ "$LANE_E_FORWARD_CANARY" = 1 ]; then
-			echo "forward canary: ON (local) — $LANE_E_FORWARD_CANARY_COUNT QoS 0 msgs over one local pair (timeout ${LANE_E_FORWARD_CANARY_TIMEOUT}s);"
+			echo "forward canary: ON (local) — $LANE_E_FORWARD_CANARY_COUNT QoS $LANE_E_QOS msgs over one local pair (timeout ${LANE_E_FORWARD_CANARY_TIMEOUT}s);"
 			echo "               N=1 has no peers, so crossing is structural and the control proves delivery only."
 		else
 			echo "forward canary: OFF (LANE_E_FORWARD_CANARY=0) — crossing CANNOT be certified at N>1;"
@@ -2152,7 +2152,7 @@ lane_e_forward_canary() {
 		rssh "$(broker_pub_ip "$i")" "curl -s -m 10 http://localhost:8080/metrics" \
 			>"$rdir_res/baseline-broker$i.prom" 2>>"$rdir_res/ssh.log" || true
 	done
-	say "[$N nodes] lane E: forwarding positive control — $LANE_E_FORWARD_CANARY_COUNT QoS 0 msgs per directed broker pair, from driver 0"
+	say "[$N nodes] lane E: forwarding positive control — $LANE_E_FORWARD_CANARY_COUNT QoS $LANE_E_QOS msgs per directed broker pair, from driver 0"
 	# `timeout` is a backstop for a wedged interpreter, not the budget: the canary
 	# enforces LANE_E_FORWARD_CANARY_TIMEOUT itself and still emits its evidence.
 	rssh "$(driver_pub_ip 0)" \
