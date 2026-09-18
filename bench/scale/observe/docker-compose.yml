@@ -51,11 +51,16 @@ services:
       - /etc/alloy/config.alloy
     volumes:
       - ./alloy:/etc/alloy:ro
-    # host.docker.internal is how the container reaches the ssh tunnel the rig
-    # opens on the operator's own loopback; on Linux it needs the explicit
-    # host-gateway mapping that Docker Desktop provides implicitly.
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
+    # HOST NETWORKING, not host.docker.internal. The rig's ssh tunnel listens on
+    # the operator's loopback, and a bridged container cannot get there: on this
+    # machine a container on the compose network TIMED OUT against both
+    # 172.17.0.1 and 172.18.0.1 while the host itself got HTTP 200 from the same
+    # port — packets dropped, not refused, i.e. a host firewall rule nobody
+    # should have to edit to run a benchmark. With host networking Alloy reaches
+    # the tunnel, Prometheus and the Pushgateway on 127.0.0.1, all three of which
+    # are already published there. Measured 2026-09-18: before this, `up` for
+    # every broker target was 0 and no mqttd_* series ever reached Prometheus.
+    network_mode: host
     depends_on:
       - prometheus
       - pushgateway

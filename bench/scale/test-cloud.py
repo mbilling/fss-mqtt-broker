@@ -411,6 +411,73 @@ with_cpu_sampling "$3" work
                 self.assertIn(expect, shape)
                 self.assertIn("mqttd_publish_forwarded_total", shape)
 
+    def test_lane_e_at_qos1_refuses_a_timer_faster_than_the_ack(self):
+        # emqtt-bench publishes synchronously per client (-F defaults to 1), so a
+        # QoS >= 1 publisher can never beat 1/PUBACK-RTT however small -I is. A
+        # rung whose timer is faster than the ack does not fail: it UNDER-OFFERS,
+        # and this ladder would then publish the driver's limit as the broker's
+        # capacity. QoS 0 waits for nothing, so the same shape must stay legal.
+        inventory = self.root / "rtt-inv.json"
+        inventory.write_text(json.dumps({"brokers": [{}] * 3, "drivers": [{"vcpus": 8}] * 5}))
+        out = self.root / "rtt-shape"
+        # 1200 publishers over 30000 msg/s is 25 msg/s each => -I 40ms, which
+        # clears a 12ms ack with margin.
+        ok = self.run_script("run-curve.sh", str(out), str(inventory), LANES="E",
+                             SHAPE_ONLY="1", LANE_E_QOS="1", LANE_E_SITES_OVERRIDE="1")
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        # 240 publishers over 30000 is 125 msg/s each => -I 8ms, inside the ack.
+        bad = self.run_script("run-curve.sh", str(out), str(inventory), LANES="E",
+                              SHAPE_ONLY="1", LANE_E_QOS="1", LANE_E_PUBS_PER_SITE="240",
+                              LANE_E_SITES_OVERRIDE="1")
+        self.assertNotEqual(bad.returncode, 0)
+        self.assertIn("PUBACK round trip", bad.stderr)
+        # The same shape at QoS 0 is fine — nothing waits for an ack there.
+        qos0 = self.run_script("run-curve.sh", str(out), str(inventory), LANES="E",
+                               SHAPE_ONLY="1", LANE_E_QOS="0", LANE_E_PUBS_PER_SITE="240",
+                               LANE_E_SITES_OVERRIDE="1")
+        self.assertEqual(qos0.returncode, 0, qos0.stderr)
+
+    def test_lane_e_at_qos1_predicts_the_pending_publish_cap(self):
+        # PENDING_PUBLISH_CAP (4096) bounds publishes whose ack is gated on
+        # durability. QoS 0 has not entered that table since #492, so this binds
+        # at QoS >= 1 only. It is the BROKER's bound, so the rung is still run —
+        # but reaching it unannounced would look like a capacity ceiling.
+        inventory = self.root / "cap-inv.json"
+        inventory.write_text(json.dumps({"brokers": [{}] * 3, "drivers": [{"vcpus": 8}] * 12}))
+        out = self.root / "cap-shape"
+        # 3 brokers, 1200 publishers/site: 12 sites is 14400 publishers => 4800
+        # per broker, over the cap. 4 sites is 1600 per broker, under it.
+        hot = self.run_script("run-curve.sh", str(out), str(inventory), LANES="E", SHAPE_ONLY="1",
+                              LANE_E_QOS="1", LANE_E_SITES_OVERRIDE="4 12")
+        self.assertEqual(hot.returncode, 0, hot.stderr)
+        shape = (out / "results/nodes=3/laneE/shape.txt").read_text()
+        self.assertIn("PENDING_PUBLISH_CAP=4096", shape)
+        self.assertIn("12-site rung", shape, f"the cap was predicted at the wrong rung:\n{shape}")
+        self.assertIn("pending-cap", shape)
+        # QoS 0 never reaches that table, so it must not be warned about.
+        cold = self.run_script("run-curve.sh", str(out), str(inventory), LANES="E", SHAPE_ONLY="1",
+                               LANE_E_QOS="0", LANE_E_SITES_OVERRIDE="4 12")
+        self.assertEqual(cold.returncode, 0, cold.stderr)
+        self.assertNotIn("PENDING_PUBLISH_CAP",
+                         (out / "results/nodes=3/laneE/shape.txt").read_text())
+
+    def test_lane_e_pins_the_mqtt_protocol_version(self):
+        # v5 is the only version where the broker enforces Receive Maximum on
+        # QoS 1 (DISCONNECT 0x93). emqtt-bench 0.6.3 defaults to 5 today, so
+        # pinning changes nothing now and stops a bench upgrade from silently
+        # moving a QoS 1 rung onto a path with no flow control.
+        inventory = self.root / "proto-inv.json"
+        inventory.write_text(json.dumps({"brokers": [{}] * 3, "drivers": [{"vcpus": 8}] * 5}))
+        out = self.root / "proto-shape"
+        bad = self.run_script("run-curve.sh", str(out), str(inventory), LANES="E",
+                              SHAPE_ONLY="1", LANE_E_PROTO="6", LANE_E_SITES_OVERRIDE="1")
+        self.assertNotEqual(bad.returncode, 0)
+        self.assertIn("LANE_E_PROTO must be 3, 4 or 5", bad.stderr)
+        # and the flag actually reaches both container kinds
+        src = (self.rig / "run-curve.sh").read_text()
+        self.assertIn("sub -h $hosts -p $port -V $LANE_E_PROTO", src)
+        self.assertIn("pub -h $hosts -p $port -V $LANE_E_PROTO", src)
+
     def test_multiple_subscriber_containers_do_not_imply_full_local_coverage(self):
         inventory = self.root / "inventory.json"
         inventory.write_text(json.dumps({"brokers": [{}] * 5, "drivers": [{"vcpus": 8}] * 5}))
@@ -441,7 +508,7 @@ with_cpu_sampling "$3" work
     # mpstat/systemctl; `sleep` returns at once. The log records what each host
     # was asked to do and when, so the ORDER of a size is what is asserted.
     FAKE_SSH = r'''#!/usr/bin/env python3
-import json, os, pathlib, subprocess, sys, time
+import json, os, pathlib, re, subprocess, sys, time
 args = sys.argv[1:]
 i = next(k for k, a in enumerate(args) if a.startswith("root@"))
 host, cmd = args[i][5:], " ".join(args[i + 1:])
@@ -463,6 +530,37 @@ if "python3 - run" in cmd:
     sys.exit(int(os.environ.get("FAKE_CANARY_RC", "0")))
 if "mqttd_connections_active[ {]" in cmd:
     (state / "rung").touch()  # a rung's reset wait: everything after it is the rung's
+    # A settled population, when the test asks for one. Without this the settle
+    # gate never passes and everything downstream of it — the steady-state gate
+    # above all — is skipped, which is exactly why nothing caught the gate
+    # dividing by the wrong interval (2026-09-18).
+    # Full only once the publishers are up: the RESET gate before a rung needs to
+    # see the cluster drained to its floor, and the settle gate after it needs to
+    # see the whole population. Keying on the publishers gives both honestly.
+    if os.environ.get("FAKE_CONNS") and (state / "pubs").exists():
+        print(os.environ["FAKE_CONNS"])
+        log()
+        sys.exit(0)
+if " pub -h " in cmd:
+    (state / "pubs").touch()
+if "curl -s -m 10 http://localhost:94" in cmd and os.environ.get("FAKE_RECV_RATE"):
+    # A consumer scrape that COSTS TIME, like the real ssh fan-out does, and a
+    # counter that advances at the offered rate in wall-clock terms. A gate that
+    # divides the counter delta by its nominal poll interval instead of the time
+    # that actually passed reads high by the scrape's own cost, and then no rung
+    # can ever fall inside the steady band.
+    time.sleep(float(os.environ.get("FAKE_SCRAPE_SECS", "0.4")))
+    rate = int(os.environ["FAKE_RECV_RATE"])
+    t0 = state / "recv-t0"
+    if not t0.exists():
+        t0.write_text(repr(time.time()))
+    elapsed = time.time() - float(t0.read_text())
+    for name in re.findall(r"@@@ (\S+)", cmd):
+        print("\n@@@ %s" % name)
+        print("recv %d" % int(rate * elapsed))
+        print("connect_succ 600")
+    log()
+    sys.exit(0)
 if "mpstat" in cmd:
     # A sampler must BE the process cpu.sh kills, exactly as `exec ssh` is.
     log()
@@ -643,7 +741,12 @@ if sys.argv[1:] == ["show", "-p", "MainPID", "--value", "mqttd"]:
             "brokers": [{"public_ip": f"broker-{i}", "private_ip": f"10.0.0.{i + 1}"} for i in range(nodes)],
             "drivers": [{"public_ip": "driver-0", "vcpus": 8}],
         }))
+        # A short steady-state budget by default: these fakes report no delivery
+        # at all, so the gate correctly waits out its whole budget, and at the
+        # production 180s that is three minutes per rung of pure test time. Tests
+        # that exercise the gate set their own.
         base = {"LANES": "E", "LANE_E_SITES_OVERRIDE": "1", "LANE_E_CONTROL": "0", "LANE_E_CALIBRATE": "0",
+                "LANE_E_STEADY_BUDGET": "5",
                 "LANE_E_FORWARD_CANARY_COUNT": str(count), "FAKE_STATE": str(state),
                 "FAKE_BROKERS": str(nodes), "FAKE_CANARY_STREAM": str(stream),
                 "FAKE_RESTART_SCRAPE": str(self.rig / "testdata/lane-e/local-proof-n3/restart/metrics-restart-broker2.prom")}
@@ -908,6 +1011,32 @@ if sys.argv[1:] == ["show", "-p", "MainPID", "--value", "mqttd"]:
         self.assertIn("window close scrape on broker0 never started", result.stderr)
         self.assertIn("window close scrape of broker0 is incomplete", result.stderr)
         self.assertNotIn("open broker", (rdir / "window-ssh.log").read_text())
+
+    def test_the_steady_gate_measures_elapsed_time_not_the_poll_interval(self):
+        # The gate polls a counter over an ssh fan-out that takes the better part
+        # of a second. Dividing the delta by the NOMINAL poll interval therefore
+        # reads high by whatever the scrape cost — 13% on the first paid attempt,
+        # where a broker holding 60,000 msg/s exactly was measured at 67,986 and
+        # called "still repaying" for the full budget. Every rung would fail.
+        #
+        # Here the fake delivers at exactly the offered rate in wall-clock terms
+        # and charges 0.4s per scrape against a 1s poll, so a gate that assumes
+        # the interval is 40% high and can never settle inside a 5% band.
+        env, nodes, _ = self.lane_e_fleet(
+            LANE_E_SITES_OVERRIDE="1", LANE_E_SUBS_PER_SITE="6",
+            LANE_E_DRAIN_POLL="1", LANE_E_STEADY_POLLS="3", LANE_E_STEADY_BUDGET="30",
+            FAKE_RECV_RATE="30000", FAKE_SCRAPE_SECS="0.4",
+            # Each broker reports the whole population: the settle gate is not what
+            # this test is about, and it must not be the thing that makes it flaky.
+            FAKE_CONNS=str(1 * (1200 + 6)),
+        )
+        result, out = self.run_lane_e(env)
+        self.assertEqual(result.returncode, 0, result.stderr[-3000:])
+        rung = (out / f"results/nodes={nodes}/laneE/sites-1/rung.txt").read_text()
+        self.assertIn("settled=yes", rung, "the settle gate never passed, so the steady gate never ran")
+        self.assertIn("steady=yes", rung,
+                      f"a broker delivering exactly its offer was not called steady:\n{rung}")
+        self.assertNotIn("steady_reason=repaying", rung)
 
     def test_lane_e_brokers_consumers_and_cpu_share_one_window(self):
         env, nodes, _ = self.lane_e_fleet()

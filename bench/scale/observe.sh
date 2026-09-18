@@ -93,7 +93,7 @@ attach)
 		i=0
 		while IFS=$'\t' read -r node_id; do
 			echo "prometheus.scrape \"broker_$i\" {"
-			echo "  targets         = [{ __address__ = \"host.docker.internal:8096\", instance = \"$node_id\" }]"
+			echo "  targets         = [{ __address__ = \"127.0.0.1:8096\", instance = \"$node_id\" }]"
 			echo "  metrics_path    = \"/$node_id.prom\""
 			echo '  scrape_interval = "2s"'
 			echo '  scrape_timeout  = "2s"'
@@ -102,7 +102,7 @@ attach)
 			i=$((i + 1))
 		done < <(jq -r '.brokers[].node_id' "$INVENTORY")
 		echo 'prometheus.scrape "bench_phase" {'
-		echo '  targets         = [{ __address__ = "pushgateway:9091" }]'
+		echo '  targets         = [{ __address__ = "127.0.0.1:9091" }]'
 		echo '  scrape_interval = "5s"'
 		# Alloy's default scrape_timeout (10s) is refused against a 5s interval.
 		echo '  scrape_timeout  = "3s"'
@@ -110,7 +110,7 @@ attach)
 		echo '  forward_to      = [prometheus.remote_write.local.receiver]'
 		echo '}'
 		echo 'prometheus.remote_write "local" {'
-		echo '  endpoint { url = "http://prometheus:9090/api/v1/write" }'
+		echo '  endpoint { url = "http://127.0.0.1:9090/api/v1/write" }'
 		echo '}'
 	} >"$ALLOY_CFG"
 	cp "$ALLOY_CFG" "$RUN/alloy-config.alloy"
