@@ -74,3 +74,38 @@ exercise three FSS processes and a cross-node shared group with
 when timing evidence prevents a throughput claim. The final audited steady gate
 uses per-endpoint remote timestamp bounds; historical manifests retain their
 original polling semantics and are not silently upgraded.
+
+## Driver calibration on one fleet
+
+`calibrate.env` holds per-site client counts, pacing, payload, subscriber count,
+and broker cluster fixed. Its 120k steps compare two, four, and six publisher
+containers per site in both directions. Two subscriber containers per site and
+container placement spread the actual workload over the five drivers. Every
+container-count shape is checked before provisioning. The manifest records the
+allocation, and reports mark the whole run as calibration rather than pooling
+unlike repetitions into a capacity point.
+
+After cloud authorization, use the existing wrapper with
+`QOS1_PROFILE=/absolute/path/to/calibrate.env` and the verified driver archive.
+The wrapper still provisions only three brokers and destroys that fleet on exit.
+Do not proceed to node-count scaling until a fixed allocation passes repeated
+calibration at the intended per-driver workload.
+
+For a no-cloud stress check, `../qos1-driver/calibrate-local.py --mqttd BINARY
+--output NEW_DIRECTORY --containers 6 --publisher-brokers 2 --seconds 300`
+creates isolated local FSS processes, fixes broker placement, waits for the full
+client population, retains periodic metrics and terminal ledgers, and removes
+only its own processes/containers. This checks the load generator and collection
+path, not independent-host scaling or cloud capacity.
+
+`calibration-report.py RUN/analysis` evaluates the prepared cloud calibration:
+it requires two passing repeats at each of two allocations, <=3% receive-rate
+spread within each allocation and between their medians, a passing closing
+control, one cluster/image/subscriber policy, and no incomplete rung. It selects
+the larger allocation for headroom. It exits nonzero when calibration is not
+established; that result must stop a staged scaling campaign.
+
+`../qos1-driver/summarize-local.py LOCAL_RUN` recomputes every retained interval.
+Its stricter continuity check requires emission, PUBACK and receive rates within
+3% of request, lateness <=5%, p99 <=1000ms, and scrape uncertainty <=2% in every
+interval. Passing a whole-window average alone does not satisfy this check.

@@ -25,8 +25,17 @@ for root in a.runs:
             r.update(
                 nodes=n,
                 path=str(rung),
-                calibration_only=(root / "driver-transition").exists(),
+                image_transition=(root / "driver-transition").exists(),
+                calibration_only=(root / "driver-transition").exists()
+                or (d / "laneE/driver-calibration.txt").exists(),
             )
+            manifest_path = rung / "manifest.json"
+            manifest = (
+                json.loads(manifest_path.read_text()) if manifest_path.exists() else {}
+            )
+            r["pub_containers_per_site"] = manifest.get("pub_containers_per_site")
+            r["sub_containers_per_site"] = manifest.get("sub_containers_per_site")
+            r["placement"] = manifest.get("placement")
             r["measurements_valid"] = not any(
                 f.startswith(("INVALID EVIDENCE", "INCOMPLETE")) for f in r["flags"]
             )
@@ -38,12 +47,12 @@ lines = [
     "",
     "Scope: clean-session, local/shared MQTT5 delivery. This is not a persistent-session durability curve.",
     "",
-    "| nodes | sites | repetition | requested/s | emitted/s | received/s | late % | p99 upper bound | result |",
-    "|---|---|---|---|---|---|---|---|---|",
+    "| nodes | sites | repetition | pub/sub containers per site | requested/s | emitted/s | received/s | late % | p99 upper bound | result |",
+    "|---|---|---|---|---|---|---|---|---|---|",
 ]
 if any(r.get("calibration_only") for r in rows):
     lines[4:4] = [
-        "**Calibration only:** the driver image changed during this provisioning. Image installation also perturbed the active rung. These observations cannot be combined into a capacity curve; consult driver-transition and per-rung driver-images.json.",
+        "**Calibration only:** driver image or container allocation changed during this provisioning. These observations cannot be pooled into a capacity curve; consult driver-transition, driver-calibration.txt and per-rung manifests.",
         "",
     ]
 for r in rows:
@@ -66,7 +75,7 @@ for r in rows:
         else "unknown"
     )
     lines.append(
-        f"| {r['nodes']} | {r['sites']} | {r['rep']}{' control' if r.get('control') else ''} | {offer_label} | {measurements} | {verdict} |"
+        f"| {r['nodes']} | {r['sites']} | {r['rep']}{' control' if r.get('control') else ''} | {r.get('pub_containers_per_site') or '?'}/{r.get('sub_containers_per_site') or '?'} | {offer_label} | {measurements} | {verdict} |"
     )
 lines += [
     "",

@@ -1029,6 +1029,20 @@ lane_e_shape() {
 if [[ "$LANES" == *E* ]]; then
 	mkdir -p "$OUT/laneE"
 	lane_e_shape
+    if [ -n "${LANE_E_PUB_CONTAINER_STEPS:-}" ]; then
+        read -r -a E_PUB_STEPS <<<"$LANE_E_PUB_CONTAINER_STEPS"
+        [ "${#E_PUB_STEPS[@]}" -eq "${#LANE_E_SITES[@]}" ] || die "publisher-container steps must match site ladder length"
+        cp "$OUT/laneE/shape.txt" "$OUT/laneE/shape-default.txt"
+        e_default_pub_cells=$LANE_E_PUB_CONTAINERS_PER_SITE
+        for e_step in "${!E_PUB_STEPS[@]}"; do
+            LANE_E_PUB_CONTAINERS_PER_SITE=${E_PUB_STEPS[e_step]}
+            lane_e_shape
+            cp "$OUT/laneE/shape.txt" "$OUT/laneE/shape-step-$e_step.txt"
+        done
+        LANE_E_PUB_CONTAINERS_PER_SITE=$e_default_pub_cells
+        cp "$OUT/laneE/shape-default.txt" "$OUT/laneE/shape.txt"
+        printf '%s\n' "$LANE_E_PUB_CONTAINER_STEPS" >"$OUT/laneE/driver-calibration.txt"
+    fi
 fi
 
 if [ "${SHAPE_ONLY:-0}" = 1 ]; then
@@ -1750,6 +1764,7 @@ else
 say "[$N nodes] lane E: site ladder ${LANE_E_SITES[*]} x $LANE_E_SITE_RATE msg/s"
 lane_e_rung() { # lane_e_rung <sites> [repeat-index] [is-control]
 	local sites="$1" rep="${2:-1}" is_control="${3:-no}"
+    local LANE_E_PUB_CONTAINERS_PER_SITE="${4:-$LANE_E_PUB_CONTAINERS_PER_SITE}"
 	# A REPEATED rung gets its own directory. Running the same site count twice in
 	# one provisioning is how the rig's own noise floor is measured — without a
 	# distinct name the second pass silently overwrote the first and the
@@ -1884,13 +1899,13 @@ lane_e_rung() { # lane_e_rung <sites> [repeat-index] [is-control]
 	done
 	local -a pids
 	local pd
-    python3 - "$rdir" "$N" "$D" "$LANE_E_SECS" "$LANE_E_PAYLOAD" "${QOS1_DRIVER_ARCHIVE:-}" <<'MANIFEST'
+    python3 - "$rdir" "$N" "$D" "$LANE_E_SECS" "$LANE_E_PAYLOAD" "${QOS1_DRIVER_ARCHIVE:-}" "$LANE_E_PUB_CONTAINERS_PER_SITE" "$LANE_E_SUB_CONTAINERS_PER_SITE" "$LANE_E_PLACEMENT" <<'MANIFEST'
 import json,sys
 from pathlib import Path
 p=Path(sys.argv[1]); eps=[]
 for row in (p/'endpoints.tsv').read_text().splitlines():
  n,d,s,r,c=row.split('\t');eps.append(dict(name=n,driver=int(d),site=s,role=r,clients=int(c)))
-(p/'manifest.json').write_text(json.dumps(dict(nodes=int(sys.argv[2]),drivers=int(sys.argv[3]),window_secs=int(sys.argv[4]),payload_bytes=int(sys.argv[5])+16,telemetry_required=True,poll_timestamps=bool(sys.argv[6]),endpoints=eps),indent=2))
+(p/'manifest.json').write_text(json.dumps(dict(nodes=int(sys.argv[2]),drivers=int(sys.argv[3]),window_secs=int(sys.argv[4]),payload_bytes=int(sys.argv[5])+16,telemetry_required=True,poll_timestamps=bool(sys.argv[6]),pub_containers_per_site=int(sys.argv[7]),sub_containers_per_site=int(sys.argv[8]),placement=sys.argv[9],endpoints=eps),indent=2))
 MANIFEST
     { declare -p subs pubs scrape pollscrape pubscrape pause terminal ledger; } >"$rdir/commands.sh"
 
@@ -2071,7 +2086,9 @@ IMAGES
 			prev_ms="$cur_ms"
 			delta=$((rate - offer_total))
 			[ "$delta" -ge 0 ] || delta=$((-delta))
-			if [ "$delta" -le "$band" ] && [ "$(cat "$rdir/poll-steady")" = yes ]; then
+			# Audited per-endpoint bounds already cover the complete site offer.
+            # An SSH completion-time aggregate must not veto those bounds.
+            if [ "$(cat "$rdir/poll-steady")" = yes ] && { [ -n "${QOS1_DRIVER_ARCHIVE:-}" ] || [ "$delta" -le "$band" ]; }; then
 				flat=$((flat + 1))
 				if [ "$flat" -ge "$LANE_E_STEADY_POLLS" ]; then
 					steady=yes
@@ -2532,7 +2549,7 @@ for e_sites in "${LANE_E_SITES[@]}"; do
     if [ "${#e_seen[@]}" -eq "${#LANE_E_SITES[@]}" ] && [ -n "${LANE_E_HOLD_LAST_SECS:-}" ]; then
         LANE_E_SECS=$LANE_E_HOLD_LAST_SECS
     fi
-	lane_e_rung "$e_sites" "$e_rep"
+	lane_e_rung "$e_sites" "$e_rep" no "${E_PUB_STEPS[${#e_seen[@]}-1]:-$LANE_E_PUB_CONTAINERS_PER_SITE}"
     LANE_E_SECS=$e_normal_secs
 done
 # The control repeats the BOTTOM rung — the lowest load the ladder offered, and
@@ -2546,7 +2563,7 @@ if [ "$LANE_E_CONTROL" = 1 ] && [ "${#LANE_E_SITES[@]}" -gt 1 ]; then
 		[ "$e_prev" = "$e_control" ] && e_rep=$((e_rep + 1))
 	done
 	say "[$N nodes] lane E: CONTROL — repeating the $e_control-site rung to test whether the cluster still does what it did before the ladder"
-	lane_e_rung "$e_control" "$e_rep" yes
+	lane_e_rung "$e_control" "$e_rep" yes "${E_PUB_STEPS[0]:-$LANE_E_PUB_CONTAINERS_PER_SITE}"
 fi
 fi # LANES *E*
 

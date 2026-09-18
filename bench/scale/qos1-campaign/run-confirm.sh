@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
-. "$here/confirm.env"
+profile=${QOS1_PROFILE:-$here/confirm.env}
+. "$profile"
 : "${QOS1_DRIVER_ARCHIVE:?build qos1-driver/build.sh first and export QOS1_DRIVER_ARCHIVE}"
 export RUN_DIR="${RUN_DIR:-$HOME/.cache/fss-qos1-proof/$(date -u +%Y%m%dT%H%M%SZ)}"
 mkdir -p "$RUN_DIR"
-cp "$here/confirm.env" "$RUN_DIR/confirm.env"
+cp "$profile" "$RUN_DIR/profile.env"
 sha256sum "$QOS1_DRIVER_ARCHIVE" > "$RUN_DIR/driver-archive.sha256"
 # Snapshot all harness changes, including files outside git, before provisioning.
 tar -czf "$RUN_DIR/harness-source.tar.gz" --exclude=.runs --exclude=.terraform --exclude=__pycache__ --exclude='*.tfstate*' --exclude='*.tfvars*' -C "$here/.." .

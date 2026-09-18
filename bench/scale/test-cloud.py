@@ -524,6 +524,24 @@ with_cpu_sampling "$3" work
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.calls(), [])
 
+    def test_calibration_checks_every_container_shape_before_cloud(self):
+        inventory = self.root / "cal-inventory.json"
+        inventory.write_text(json.dumps({"brokers": [{}] * 3, "drivers": [{"vcpus": 8}] * 5}))
+        common = dict(LANES="E", SHAPE_ONLY="1", LANE_E_SITES_OVERRIDE="1 4 4",
+                      LANE_E_PUBS_PER_SITE="3000", LANE_E_SUBS_PER_SITE="10",
+                      LANE_E_SUB_CONTAINERS_PER_SITE="2", LANE_E_PLACEMENT="container")
+        for steps, good in [("2 4 6", True), ("2 4", False), ("2 4 7", False), ("2 4 0", False)]:
+            with self.subTest(steps=steps):
+                out = self.root / ("cal-" + steps.replace(" ", "-"))
+                result = self.run_script("run-curve.sh", str(out), str(inventory),
+                                         LANE_E_PUB_CONTAINER_STEPS=steps, **common)
+                self.assertEqual(result.returncode == 0, good, result.stderr)
+                if good:
+                    lane = out / "results/nodes=3/laneE"
+                    self.assertEqual(len(list(lane.glob("shape-step-*.txt"))), 3)
+                    self.assertEqual((lane / "driver-calibration.txt").read_text().strip(), steps)
+        self.assertEqual(self.calls(), [])
+
     def test_lane_e_pinned_shape_wording_unchanged(self):
         inventory = self.root / "inventory.json"
         inventory.write_text(json.dumps({"brokers": [{}], "drivers": [{"vcpus": 8}, {"vcpus": 8}]}))
