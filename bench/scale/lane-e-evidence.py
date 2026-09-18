@@ -77,7 +77,7 @@ def ledger(paths, kind):
     for path in paths:
         if not path.is_file():
             raise ValueError(f"missing ledger {path.name}")
-        lines = path.read_text().splitlines()
+        lines = path.read_text().rstrip().splitlines()
         if not lines or lines[-1] != "# EOF":
             raise ValueError(f"truncated ledger {path.name}")
         seen = set()

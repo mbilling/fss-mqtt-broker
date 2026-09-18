@@ -83,6 +83,11 @@ class Evidence(unittest.TestCase):
         self.assertEqual(r["sent_rate"], 10)
         self.assertTrue(S.lane_e_rung(self.p)["pass"])
 
+    def test_ledger_framing_blank_lines(self):
+        for path in self.p.glob("*.ledger"):
+            path.write_text(path.read_text() + "\n\n")
+        self.assertEqual(E.validate(self.p)["counts"]["unique_delivered"], 600)
+
     def test_missing_each_artifact(self):
         for f in list(self.p.iterdir()):
             if f.name == "rung.txt":
