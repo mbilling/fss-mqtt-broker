@@ -167,7 +167,7 @@ impl Hub {
 
     /// The retained authority commit obligation resolved (ADR 0042 T9, exhibit ⑦).
     pub(super) fn pending_retained_done(&mut self, id: u64) {
-        if let Some(p) = self.pending_publishes.get_mut(&id) {
+        if let Some(p) = self.pending_publishes.get_mut(id) {
             p.awaiting_retained = false;
         }
         self.try_complete_pending(id);
@@ -669,7 +669,7 @@ impl Hub {
         // exhibit ⑦) — the obligation rides the mutation through re-queues and the
         // handoff hold, however long the commit takes.
         if let Some(id) = gate {
-            if let Some(p) = self.pending_publishes.get_mut(&id) {
+            if let Some(p) = self.pending_publishes.get_mut(id) {
                 p.awaiting_retained = true;
             }
         }
@@ -716,7 +716,7 @@ impl Hub {
             // listener binds, and holding the answer for a settle that no publish will
             // trigger would stall the restore for nothing.
             let id = self.register_pending(done, &topic, &payload, qos, true, message_expiry, &app);
-            if let Some(p) = self.pending_publishes.get_mut(&id) {
+            if let Some(p) = self.pending_publishes.get_mut(id) {
                 p.local_done = true;
                 p.awaiting_settle = false;
             }

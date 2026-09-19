@@ -1997,7 +1997,7 @@ pub struct Hub {
     /// (ADR 0042 T9): keyed by a monotonic id, ordered so the cap drops the
     /// oldest. Entries resolve via forward acks, the retained commit, and the
     /// local fan-out; the sweep tick retransmits and re-routes.
-    pending_publishes: BTreeMap<u64, PendingPublish>,
+    pending_publishes: forwarding::PendingTable,
     /// Monotonic pending-publish id source.
     publish_ids: u64,
     /// Per-node monotonic forward sequence (ADR 0042 T9, exhibit ⑤).
@@ -2186,12 +2186,33 @@ const RETAINED_CHUNK_BYTES: usize = 4 * 1024 * 1024;
 /// last-value device state, typically small and infrequent.
 const RETAINED_QUEUE_CAP: usize = 1024;
 
-/// The bound on publishes whose acknowledgement awaits cluster-wide durability
-/// (ADR 0042 T9). Publisher inflight windows (`receive_maximum`) bound this
-/// naturally; the cap is a backstop against a partition outlasting every window.
-/// At the cap the **oldest** pending publish is dropped loudly — its ack is
-/// withheld, so the publisher retries (never an ack for an unowned message).
-const PENDING_PUBLISH_CAP: usize = 4096;
+/// The ENTRY bound on publishes whose acknowledgement awaits cluster-wide
+/// durability (ADR 0042 T9). At either bound the **oldest** pending publish is
+/// dropped loudly — its ack is withheld, so the publisher retries (never an ack
+/// for an unowned message).
+///
+/// It was 4096, on the reasoning that "publisher inflight windows bound this
+/// naturally" and the cap is only a backstop against a partition. That holds for
+/// a few publishers with deep windows and fails for many with shallow ones: every
+/// connected `QoS` 1 publisher may legitimately hold ONE unacknowledged publish,
+/// so a broker with more than 4096 of them crossed the cap with nothing wrong
+/// anywhere. Measured on a healthy 3-node cluster (issue #633): 6,000 publishers
+/// per broker evicted 3,446 acks, 8,000 evicted 11,701.
+///
+/// 65,536 is 16x, and it is a count bound only. Memory is bounded separately by
+/// [`PENDING_PUBLISH_MAX_BYTES`], because each entry keeps its payload for
+/// retransmission: 65,536 entries is ~28 MiB of 200-byte telemetry and ~4 GiB of
+/// 64 KiB messages, and a bound that depends on what clients choose to send is
+/// not a bound.
+const PENDING_PUBLISH_CAP: usize = 65_536;
+
+/// The BYTE bound on the same table (see [`forwarding::PendingTable`]), under the
+/// same overflow policy. 64 MiB holds the full 65,536 entries of telemetry-sized
+/// messages with room to spare, and caps what a partition can pin when payloads
+/// are large — at 64 KiB each it admits ~1,000 entries, not 65,536. One publish
+/// larger than the whole bound is still admitted into an EMPTY table, so an
+/// oversized message is answerable rather than refused forever.
+const PENDING_PUBLISH_MAX_BYTES: usize = 64 * 1024 * 1024;
 
 /// The first peer-bus proto that can carry a forward VERDICT rather than a bool
 /// ([`PeerMessage::PublishVerdict`], [`PeerMessage::SharedDeliverAcked`] — 0041-T12,
@@ -2301,7 +2322,7 @@ impl Hub {
                 retained_handoff_seq: 0,
                 retained_handoff_seen: HashMap::new(),
                 retained_handoff_pending: HashMap::new(),
-                pending_publishes: BTreeMap::new(),
+                pending_publishes: forwarding::PendingTable::default(),
                 publish_ids: 0,
                 forward_seq: 0,
                 forward_index: HashMap::new(),
@@ -5829,6 +5850,7 @@ impl Hub {
         // Append-lane saturation (issue #242): sustained growth here is the warning
         // BEFORE `publish_dropped{reason="append-backlog-full"}` starts firing.
         m.set_append_lane_jobs(self.append_lanes.values().map(|l| l.outstanding).sum());
+        m.set_pending_publishes(self.pending_publishes.len(), self.pending_publishes.bytes());
         if let Ok(n) = self.retained.count().await {
             m.set_retained_messages(n);
         }
@@ -5924,7 +5946,7 @@ impl Hub {
     /// Release the publisher's acknowledgement iff every cluster-wide durability
     /// obligation has resolved (ADR 0042 T9).
     fn try_complete_pending(&mut self, id: u64) {
-        let complete = self.pending_publishes.get(&id).is_some_and(|p| {
+        let complete = self.pending_publishes.get(id).is_some_and(|p| {
             p.local_done
                 // ADR 0072: relaxed acks at submit; obligations still run.
                 // Issue #399 carves two exceptions, both congestion valves:
@@ -5948,7 +5970,7 @@ impl Hub {
                         && p.reroute_grace.unwrap_or(0) == 0))
         });
         if complete {
-            if let Some(p) = self.pending_publishes.remove(&id) {
+            if let Some(p) = self.pending_publishes.remove(id) {
                 debug!(publish = id, topic = %p.topic, "pending publish complete; ack released");
                 let _ = p.done.send(PublishOutcome::Accepted);
             }
@@ -6070,7 +6092,7 @@ impl Hub {
         // immediately — the same rebalance a refusal triggers.
         let mut dead_seqs: Vec<u64> = Vec::new();
         let mut dead_shared: Vec<(u64, ForwardObligation)> = Vec::new();
-        for (id, p) in &mut self.pending_publishes {
+        for (id, p) in self.pending_publishes.iter_mut() {
             let seqs: Vec<u64> = p
                 .awaiting
                 .iter()

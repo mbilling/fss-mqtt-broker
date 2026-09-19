@@ -924,7 +924,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 392 test(s)
+## `crates/mqttd/src/lib.rs` — 398 test(s)
 
 - `admission::tests::the_global_cap_refuses_at_the_bound_and_recovers`
 - `admission::tests::the_penalty_box_refuses_after_the_threshold`
@@ -1063,6 +1063,12 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::forwarding::interest_index_tests::interest_index_matches_the_linear_scan_it_replaced`
 - `hub::forwarding::interest_index_tests::nodes_sharing_a_filter_are_independent`
 - `hub::forwarding::interest_index_tests::re_announcing_replaces_the_previous_snapshot`
+- `hub::forwarding::pending_bounds::an_oversized_publish_is_admitted_alone`
+- `hub::forwarding::pending_bounds::sweep_cost_at_a_full_table` — `#[ignore]`d
+- `hub::forwarding::pending_bounds::the_byte_bound_evicts_until_the_newcomer_fits`
+- `hub::forwarding::pending_bounds::the_byte_total_follows_every_mutation`
+- `hub::forwarding::pending_bounds::the_entry_cap_evicts_only_the_oldest`
+- `hub::forwarding::pending_bounds::the_sweep_retransmits_only_overdue_forwards`
 - `hub::tests::a_brownout_refusal_delivers_to_nobody_even_when_a_subscriber_owed_no_durability`
 - `hub::tests::a_brownout_refusal_is_counted_as_a_quota_rejection_not_a_drop`
 - `hub::tests::a_brownout_refused_will_does_not_overtake_an_inflight_qos1_append`
