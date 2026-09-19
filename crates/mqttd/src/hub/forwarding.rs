@@ -1310,8 +1310,15 @@ mod pending_bounds {
             };
             // Young entries: the walk alone, nothing retransmitted.
             let young = time_sweep(&mut hub, 0);
-            // Overdue entries: one retransmit per outstanding forward.
-            std::thread::sleep(crate::hub::SESSION_SWEEP_INTERVAL);
+            // Overdue entries: one retransmit per outstanding forward. Back-dated
+            // rather than slept for — the measurement is of the sweep, not of the
+            // clock, and a real wait would put a second per iteration into it.
+            let aged = Instant::now()
+                .checked_sub(crate::hub::SESSION_SWEEP_INTERVAL)
+                .expect("the clock is past one sweep interval");
+            for (_, p) in hub.pending_publishes.iter_mut() {
+                p.created_at = aged;
+            }
             let overdue = time_sweep(&mut hub, entries);
             println!("sweep over {entries} entries: {young:?} young, {overdue:?} all overdue");
         }
