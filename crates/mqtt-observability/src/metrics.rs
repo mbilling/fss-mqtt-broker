@@ -138,6 +138,8 @@ struct OtelInstruments {
     deliver_latency: OtelHistogram<f64>,
     hub_dispatch: OtelHistogram<f64>,
     append_lane_jobs: OtelGauge<i64>,
+    pending_publishes: OtelGauge<i64>,
+    pending_publish_bytes: OtelGauge<i64>,
     sessions: OtelGauge<i64>,
     subscriptions: OtelGauge<i64>,
     retained_messages: OtelGauge<i64>,
@@ -213,6 +215,8 @@ impl OtelInstruments {
             deliver_latency: meter.f64_histogram("deliver_latency_seconds").build(),
             hub_dispatch: meter.f64_histogram("hub_dispatch_seconds").build(),
             append_lane_jobs: meter.i64_gauge("append_lane_jobs").build(),
+            pending_publishes: meter.i64_gauge("pending_publishes").build(),
+            pending_publish_bytes: meter.i64_gauge("pending_publish_bytes").build(),
             sessions: meter.i64_gauge("sessions").build(),
             subscriptions: meter.i64_gauge("subscriptions").build(),
             retained_messages: meter.i64_gauge("retained_messages").build(),
@@ -305,6 +309,8 @@ pub struct Metrics {
     deliver_latency_seconds: Histogram,
     hub_dispatch_seconds: Family<CommandLabel, Histogram>,
     append_lane_jobs: Gauge,
+    pending_publishes: Gauge,
+    pending_publish_bytes: Gauge,
     sessions: Gauge,
     subscriptions: Gauge,
     retained_messages: Gauge,
@@ -536,6 +542,20 @@ impl Metrics {
              sessions (issue #242); sustained growth means a placement group's \
              followers are not keeping up — the warning before \
              publish_dropped{reason=\"append-backlog-full\"} fires",
+        );
+        let pending_publishes = register_gauge(
+            &mut registry,
+            "pending_publishes",
+            "Publishes whose acknowledgement is still gated on durability (ADR 0042 T9). \
+             Bounded by an entry cap and a byte cap; at either the OLDEST is evicted with \
+             its ack withheld — the warning before publish_dropped{reason=\"pending-cap\"} \
+             fires (issue #633)",
+        );
+        let pending_publish_bytes = register_gauge(
+            &mut registry,
+            "pending_publish_bytes",
+            "Bytes charged to the pending-publish table (entry + topic + payload, kept for \
+             retransmission); the byte half of the same bound (issue #633)",
         );
 
         let sessions = register_gauge(
@@ -1007,6 +1027,8 @@ impl Metrics {
             deliver_latency_seconds,
             hub_dispatch_seconds,
             append_lane_jobs,
+            pending_publishes,
+            pending_publish_bytes,
             sessions,
             subscriptions,
             retained_messages,
@@ -1243,6 +1265,22 @@ impl Metrics {
     pub fn set_append_lane_jobs(&self, n: usize) {
         self.append_lane_jobs.set(clamp_gauge(n));
         self.otel.append_lane_jobs.record(clamp_gauge(n), &[]);
+    }
+
+    /// The pending-publish table's depth and charged bytes (issue #633). Both
+    /// halves of one bound: the OLDEST entry is evicted, ack withheld, when either
+    /// is reached — so these are the warning before
+    /// `publish_dropped{reason="pending-cap"}` moves, which used to be the first
+    /// an operator heard of it.
+    pub fn set_pending_publishes(&self, entries: usize, bytes: usize) {
+        self.pending_publishes.set(clamp_gauge(entries));
+        self.otel
+            .pending_publishes
+            .record(clamp_gauge(entries), &[]);
+        self.pending_publish_bytes.set(clamp_gauge(bytes));
+        self.otel
+            .pending_publish_bytes
+            .record(clamp_gauge(bytes), &[]);
     }
 
     /// Set the current session count (snapshot of an in-memory map; ADR 0020).
@@ -2135,6 +2173,10 @@ mod tests {
             "{out}"
         );
         assert!(out.contains("mqttd_append_lane_jobs 3"), "{out}");
+        m.set_pending_publishes(7, 4096);
+        let out = m.render();
+        assert!(out.contains("mqttd_pending_publishes 7"), "{out}");
+        assert!(out.contains("mqttd_pending_publish_bytes 4096"), "{out}");
         assert!(
             out.contains("mqttd_publish_dropped_total{reason=\"append-backlog-full\"} 1"),
             "{out}"
