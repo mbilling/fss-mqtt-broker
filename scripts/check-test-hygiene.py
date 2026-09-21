@@ -2346,6 +2346,13 @@ IGNORE_ALLOWLIST: dict[str, tuple[str, str | None]] = {
         "macro-measurement: tens of thousands of fsync'd writes, minutes long",
         None,
     ),
+    "crates/mqttd/src/lib.rs::hub::forwarding::pending_bounds::sweep_cost_at_a_full_table": (
+        "timing measurement, and only meaningful in --release: it is what sized the "
+        "65,536-entry pending bound (issue #633), not a pass/fail of behaviour. The "
+        "behaviour it guards — that the sweep retransmits only OVERDUE forwards — is "
+        "asserted by `the_sweep_retransmits_only_overdue_forwards`, which every tier runs",
+        None,
+    ),
     "crates/mqttd/tests/durable_bench.rs::durable_path_floor": (
         "macro-benchmark: minutes long, and only meaningful in --release",
         None,

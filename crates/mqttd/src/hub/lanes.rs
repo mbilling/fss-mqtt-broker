@@ -710,7 +710,7 @@ impl Hub {
         // with obligations not yet registered (ACK-AFTER-DURABLE, #124).
         match then {
             AppendThen::Gate(id) => {
-                if let Some(p) = self.pending_publishes.get_mut(&id) {
+                if let Some(p) = self.pending_publishes.get_mut(id) {
                     p.appends_outstanding += 1;
                     // The relaxed congestion valve (issue #399): a deep lane
                     // downgrades THIS publish's relaxed completion to the
@@ -819,7 +819,7 @@ impl Hub {
         }
         match job.then {
             AppendThen::Gate(id) => {
-                if let Some(p) = self.pending_publishes.get_mut(&id) {
+                if let Some(p) = self.pending_publishes.get_mut(id) {
                     p.appends_outstanding = p.appends_outstanding.saturating_sub(1);
                     if offset.is_some() {
                         // Event-driven successor of the old durable-writes snapshot

@@ -316,6 +316,18 @@ in the ack/attach/control classes, ADR 0061), and `mqttd_hub_dispatch_seconds` /
 `mqttd_append_lane_jobs` are the observables (see
 [OPERATIONS](OPERATIONS.md#monitoring-for-the-operator-and-humans)).
 
+**How many publishes may be waiting for their ack** (issue #633): every QoS 1/2
+publish whose acknowledgement is gated on durability or on a peer's answer sits in
+one per-broker table until it resolves. Its depth is *offered QoS ≥ 1 rate × ack
+latency* — 40,000 msg/s at 50 ms is 2,000 entries — so it is a property of load, not a
+sign of trouble. The table is bounded twice: **65,536 entries** and **64 MiB** of
+charged bytes (216 bytes of bookkeeping plus the topic and payload, per entry). At
+either bound the OLDEST entry is evicted with its ack withheld — the publisher retries —
+and `mqttd_publish_dropped_total{reason="pending-cap"}` counts it. Watch
+`mqttd_pending_publishes` and `mqttd_pending_publish_bytes` instead of waiting for that
+counter: a table that keeps growing at a steady offered rate means ack latency is
+growing, which is the thing to go and find. QoS 0 never enters the table.
+
 **Measured, not just claimed** (issue #244) — on **five broker processes sharing one
 8-core host**, which is the dominant caveat and is why the numbers are ratios rather than
 capacities: with two of five nodes' peer bus degraded so that one placement group's appends

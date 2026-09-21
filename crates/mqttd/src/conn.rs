@@ -2036,7 +2036,7 @@ async fn handle_publish<W: AsyncWrite + Unpin>(
     //
     // At QoS 0 there is NO channel, deliberately. The hub gates on
     // `done.is_some()`, not on QoS, so a `Some` here would register the publish in
-    // `pending_publishes` — a table bounded by `PENDING_PUBLISH_CAP` (4096) and
+    // `pending_publishes` — a table bounded by `PENDING_PUBLISH_CAP` (4096 then; #633) and
     // documented for "publishes whose acknowledgement is gated on cluster-wide
     // durability" (ADR 0042 T9). A QoS 0 publish has no acknowledgement to gate,
     // and at the cap the oldest entry is evicted with its ack withheld "so the
