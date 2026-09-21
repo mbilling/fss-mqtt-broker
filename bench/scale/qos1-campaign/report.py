@@ -36,6 +36,8 @@ for root in a.runs:
             r["pub_containers_per_site"] = manifest.get("pub_containers_per_site")
             r["sub_containers_per_site"] = manifest.get("sub_containers_per_site")
             r["placement"] = manifest.get("placement")
+            r["placement_version"] = manifest.get("placement_version")
+            r["subscriber_placement"] = sorted((ep["name"], ep["driver"]) for ep in manifest.get("endpoints", []) if ep["role"] == "sub")
             r["measurements_valid"] = not any(
                 f.startswith(("INVALID EVIDENCE", "INCOMPLETE")) for f in r["flags"]
             )
@@ -58,6 +60,8 @@ if any(r.get("calibration_only") for r in rows):
 for r in rows:
     verdict = "PASS" if r["pass"] else "; ".join(r["flags"]) or "FAIL"
     valid = r["measurements_valid"]
+    clock = ((r.get("evidence") or {}).get("clock") or {})
+    latency = (r["p99"] + f" + {clock['latency_uncertainty_ms']:.3f}ms clock/quantization bound") if clock else r["p99"] + " (clock accuracy unverified)"
     if not valid:
         verdict = "; ".join(
             f
@@ -65,7 +69,7 @@ for r in rows:
             if f.startswith(("INVALID EVIDENCE", "INCOMPLETE", "NOT STEADY"))
         )
     measurements = (
-        f"{r['sent_rate']:.1f} | {r['recv_rate']:.1f} | {100 * r.get('late_share', 0):.3f} | {r['p99']}"
+        f"{r['sent_rate']:.1f} | {r['recv_rate']:.1f} | {100 * r.get('late_share', 0):.3f} | {latency}"
         if valid
         else "unvalidated | unvalidated | unvalidated | unvalidated"
     )

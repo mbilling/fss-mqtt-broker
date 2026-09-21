@@ -57,4 +57,8 @@ replace(
     '    [ {"/metrics", emqtt_bench_http_metrics, []}',
     '    [ {"/audit/[...]", qos1_audit, []}\n    , {"/metrics", emqtt_bench_http_metrics, []}',
 )
+replace(
+    "   histogram_observe(Prometheus, e2e_latency, E2ELatency),",
+    "   case qos1_audit:latency(E2ELatency) of true -> histogram_observe(Prometheus, e2e_latency, E2ELatency); false -> ok end,",
+)
 p.write_text(s)

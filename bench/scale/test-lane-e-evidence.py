@@ -94,6 +94,55 @@ class Evidence(unittest.TestCase):
         # Both calls occur immediately locally, but remote samples are 10s apart.
         self.assertEqual(self.timed_sample(110000, 110010, 50), "yes")
 
+    def test_negative_latency_is_a_resolution_floor_and_is_reported_not_fatal(self):
+        """A negative sample means the delivery beat the clocks' disagreement
+        (~2 ms here), which a local route genuinely can. It cannot corrupt a
+        capacity claim: the sample is excluded from the histogram, and dropping
+        the FASTEST samples only moves a percentile up, so the reported p99 is an
+        upper bound. Two paid runs died on this — one negative in 609,241, then
+        40,160 in 1,687,670 (2.38%) — both measuring correctly."""
+        manifest = {"negative_latency_counter": True}
+        one = E.metric_text("audit_negative_latency 1\nrecv 609241\n", "skew")
+        self.assertAlmostEqual(E.check_negative(one, manifest, "sub"), 1 / 609241)
+
+        many = E.metric_text("audit_negative_latency 40160\nrecv 1687670\n", "skew")
+        self.assertAlmostEqual(E.check_negative(many, manifest, "sub"), 40160 / 1687670)
+
+        none = E.metric_text("audit_negative_latency 0\nrecv 10\n", "skew")
+        self.assertEqual(E.check_negative(none, manifest, "sub"), 0.0)
+
+        # Negatives with nothing received cannot be expressed as a share at all.
+        with self.assertRaisesRegex(ValueError, "against no receipts"):
+            E.check_negative(E.metric_text("audit_negative_latency 1\nrecv 0\n", "skew"), manifest, "sub")
+        # An image too old to carry the counter hides them: still refused.
+        with self.assertRaisesRegex(ValueError, "missing metric"):
+            E.check_negative({}, manifest, "old image")
+        # Not asked for at all: nothing to report.
+        self.assertEqual(E.check_negative({}, {}, "qos0"), 0.0)
+
+    def test_endpoint_window_rejects_slow_scrapes(self):
+        self.assertAlmostEqual(E.endpoint_seconds([100000, 100020], [160000, 160020]), 60)
+        with self.assertRaisesRegex(ValueError, "uncertainty"):
+            E.endpoint_seconds([100000, 102304], [160000, 162411])
+        with self.assertRaisesRegex(ValueError, "uncertainty"):
+            E.endpoint_seconds([100000, 100200], [105000, 105200])
+
+    def test_individual_endpoint_windows_override_slow_host_batch(self):
+        m = json.loads((self.p / "manifest.json").read_text())
+        m["endpoint_timestamps"] = True
+        (self.p / "manifest.json").write_text(json.dumps(m))
+        w = self.p / "window.tsv"
+        w.write_text(w.read_text().replace("driver0\topen\t100000\t100010", "driver0\topen\t100000\t102500"))
+        for name in [self.pub] + self.subs:
+            for suffix, at in [("-base", 100000), ("", 160000)]:
+                p = self.p / f"{name}{suffix}.prom"
+                p.write_text(f"# ENDPOINT_STAMP_MS {at}\n" + p.read_text() + f"# ENDPOINT_STAMP_MS {at+10}\n")
+        self.assertAlmostEqual(E.validate(self.p)["sent_rate"], 10)
+        p = self.p / f"{self.pub}.prom"
+        p.write_text(p.read_text().replace("160010", "162611"))
+        with self.assertRaisesRegex(ValueError, "uncertainty"):
+            E.validate(self.p)
+
     def test_poll_uncertainty_cannot_pass_at_correct_midpoint_rate(self):
         self.timed_sample(100000, 102000, 0)
         self.assertEqual(self.timed_sample(110000, 112000, 50), "no")

@@ -22,7 +22,11 @@ class CloudTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.rig = self.root / "bench/scale"
         self.rig.mkdir(parents=True)
-        for name in ("lib.sh", "cloud.sh", "collect.sh", "run.sh", "teardown.sh", "run-curve.sh", "cpu.sh", "test-upcloud-quota.py", "482-smoke.sh", "482-constant-driver-N5-N7-optionB.env", "extract-lane-e.py", "lane-e-evidence.py", "compare-brokers.sh", "forward-canary.py"):
+        for name in ("lib.sh", "cloud.sh", "collect.sh", "run.sh", "teardown.sh", "run-curve.sh", "cpu.sh", "test-upcloud-quota.py", "482-smoke.sh", "482-constant-driver-N5-N7-optionB.env", "extract-lane-e.py", "lane-e-evidence.py", "compare-brokers.sh", "forward-canary.py",
+                     # budgets.py gates the lane E preflight and reads its numbers
+                     # out of these, so the rig needs all of them or every lane E
+                     # test dies on the gate rather than on what it is testing.
+                     "budgets.py", "clock-check.py", "clock-sync.sh"):
             shutil.copy2(SCALE / name, self.rig / name)
         # The real mqttd captures the ledgers and the extractor are tested against.
         shutil.copytree(SCALE / "testdata", self.rig / "testdata")
@@ -467,15 +471,31 @@ with_cpu_sampling "$3" work
         inventory = self.root / "cap-inv.json"
         inventory.write_text(json.dumps({"brokers": [{}] * 3, "drivers": [{"vcpus": 8}] * 12}))
         out = self.root / "cap-shape"
-        # 3 brokers, 1200 publishers/site: 12 sites is 14400 publishers => 4800
-        # per broker, over the cap. 4 sites is 1600 per broker, under it.
+        # The head count is the BINDING bound, and the occupancy estimate is the
+        # healthy-regime figure printed beside it. They are coupled: as the table
+        # fills, acks slow, which fills it further, so a saturating rung drives
+        # latency to the publish interval and every publisher holds a slot.
+        # Measured 2026-09-20 at 7 sites over 5 brokers — occupancy at the 12ms
+        # RTT floor said 504, and broker3 evicted 104 publishes against the 4,096
+        # cap, withholding 104 acks so the rung could not settle its pause.
         hot = self.run_script("run-curve.sh", str(out), str(inventory), LANES="E", SHAPE_ONLY="1",
                               LANE_E_QOS="1", LANE_E_SITES_OVERRIDE="4 12")
         self.assertEqual(hot.returncode, 0, hot.stderr)
         shape = (out / "results/nodes=3/laneE/shape.txt").read_text()
         self.assertIn("PENDING_PUBLISH_CAP=4096", shape)
         self.assertIn("12-site rung", shape, f"the cap was predicted at the wrong rung:\n{shape}")
-        self.assertIn("pending-cap", shape)
+        self.assertIn("ONE PER PUBLISHER", shape)
+        # 12 sites x 1200 publishers over 3 brokers = 4,800 each, over the cap.
+        self.assertIn("~4800 publishes", shape)
+        # The healthy-regime figure is stated too, so both bounds are visible:
+        # 360,000/s over 3 brokers x 12ms = 1,440.
+        self.assertIn("~1440", shape)
+        # 4 sites is 1,600 per broker: under the cap, and silent.
+        quiet = self.run_script("run-curve.sh", str(out), str(inventory), LANES="E", SHAPE_ONLY="1",
+                                LANE_E_QOS="1", LANE_E_SITES_OVERRIDE="4")
+        self.assertEqual(quiet.returncode, 0, quiet.stderr)
+        self.assertNotIn("PENDING_PUBLISH_CAP",
+                         (out / "results/nodes=3/laneE/shape.txt").read_text())
         # QoS 0 never reaches that table, so it must not be warned about.
         cold = self.run_script("run-curve.sh", str(out), str(inventory), LANES="E", SHAPE_ONLY="1",
                                LANE_E_QOS="0", LANE_E_SITES_OVERRIDE="4 12")
@@ -540,6 +560,27 @@ with_cpu_sampling "$3" work
                     lane = out / "results/nodes=3/laneE"
                     self.assertEqual(len(list(lane.glob("shape-step-*.txt"))), 3)
                     self.assertEqual((lane / "driver-calibration.txt").read_text().strip(), steps)
+        self.assertEqual(self.calls(), [])
+
+    def test_lane_e_shape_predicts_the_driver_connection_ceiling(self):
+        """18,060 clients over 5 drivers never settled on 2026-09-18; 12,040 did.
+        The shape check must say so before a fleet is paid for — and stay quiet
+        for the same population spread over enough drivers."""
+        common = dict(LANES="E", SHAPE_ONLY="1", LANE_E_QOS="1", LANE_E_SUB_QOS="1",
+                      LANE_E_PUBS_PER_SITE="3000", LANE_E_SUBS_PER_SITE="10",
+                      LANE_E_SITE_RATE="30000", LANE_E_SITES_OVERRIDE="4 6",
+                      LANE_E_PENDING_PUBLISH_CAP="65536")
+        for drivers, warned in [(5, True), (8, False)]:
+            with self.subTest(drivers=drivers):
+                inventory = self.root / f"conn-inventory-{drivers}.json"
+                inventory.write_text(json.dumps({"brokers": [{}] * 3, "drivers": [{"vcpus": 8}] * drivers}))
+                out = self.root / f"conn-{drivers}"
+                result = self.run_script("run-curve.sh", str(out), str(inventory), **common)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                shape = (out / "results/nodes=3/laneE/shape.txt").read_text()
+                self.assertEqual("LANE_E_CLIENTS_PER_DRIVER_PROVEN" in shape, warned, shape)
+                if warned:  # 6 sites x 3,010 clients / 5 drivers = 3,612
+                    self.assertIn("6-site rung each driver must establish ~3612 clients", shape)
         self.assertEqual(self.calls(), [])
 
     def test_lane_e_pinned_shape_wording_unchanged(self):
@@ -675,7 +716,10 @@ if url.endswith(":8080/metrics"):
     cut = False
     if (state / "canary").exists() and host == os.environ.get("FAKE_CUT_SCRAPES"):
         cut = True  # every scrape since the control ends mid-body
-    if (state / "rung").exists() and host == os.environ.get("FAKE_LOSE_THEN_CUT") and "-m" in sys.argv:
+    if (state / "rung").exists() and host == os.environ.get("FAKE_LOSE_THEN_CUT") and "-m" in sys.argv and "-fsS" not in sys.argv:
+        # Snapshots are `curl -s -m 10`; the connection poll is `curl -fsS -m 10`
+        # since it learned to fail closed. Only a SNAPSHOT may consume the one
+        # complete-but-seriesless scrape, or the guard never sees it.
         with open(state / f"lose-cut-{host}", "ab") as f:
             f.write(b"x")
             first = f.tell() == 1
@@ -798,6 +842,12 @@ if sys.argv[1:] == ["show", "-p", "MainPID", "--value", "mqttd"]:
         # that exercise the gate set their own.
         base = {"LANES": "E", "LANE_E_SITES_OVERRIDE": "1", "LANE_E_CONTROL": "0", "LANE_E_CALIBRATE": "0",
                 "LANE_E_STEADY_BUDGET": "5",
+                # These fleets talk to a FAKE ssh that returns instantly, so the
+                # ssh bound budgets.py parses out of the real lib.sh does not
+                # describe this transport — and a 5s steady budget really does fit
+                # three of these polls. Declared, not bypassed: the gate still
+                # runs, against the cost this rig actually pays.
+                "BUDGET_SCRAPE_SECS": "0.05",
                 "LANE_E_FORWARD_CANARY_COUNT": str(count), "FAKE_STATE": str(state),
                 "FAKE_BROKERS": str(nodes), "FAKE_CANARY_STREAM": str(stream),
                 "FAKE_RESTART_SCRAPE": str(self.rig / "testdata/lane-e/local-proof-n3/restart/metrics-restart-broker2.prom")}

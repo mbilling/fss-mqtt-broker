@@ -24,7 +24,13 @@ die() {
 # tofu destroy / teardown must pass the same -var apply used. When SSH_KEY is
 # set and destroy omits it, OpenTofu falls back to ~/.ssh/id_ed25519.pub and
 # fails if that file is missing — leaving paid servers up (#482, 2026-09-14).
-SSH_OPTS=(-o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -o ServerAliveInterval=15)
+# ServerAliveCountMax is set EXPLICITLY: without it OpenSSH's default of 3 gave a
+# dead peer 15x3 = 45s to be noticed — three times the `curl -m 10` that hop is
+# supposed to contain, inside polling loops whose whole budget is 60s. One hung
+# hop could therefore eat a rung's entire drain deadline and report UNRESOLVED.
+# 5x2 = 10s matches the remote timeout, so a scrape now costs at most what it
+# declares. See budgets.py, which reads these three numbers from this line.
+SSH_OPTS=(-o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=2)
 # shellcheck disable=SC2034 # consumed by run.sh / teardown.sh tofu apply+destroy
 TOFU_SSH_PUBKEY_ARGS=()
 if [ -n "${SSH_KEY:-}" ]; then

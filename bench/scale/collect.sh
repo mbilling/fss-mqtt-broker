@@ -35,6 +35,9 @@ collect_one() {
 driver_command=$(cat <<'COMMAND'
 date -u
 uptime
+chronyc -n tracking
+chronyc -n sources -v
+journalctl -u chrony --since '-30 minutes' --no-pager
 free -h
 df -h
 journalctl -k --since '-30 minutes' --no-pager

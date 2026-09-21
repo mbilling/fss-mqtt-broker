@@ -37,6 +37,7 @@ from pathlib import Path
 
 TOLERANCE = 0.02  # counter cross-check band
 DRIVER_OK = 0.97  # a rung counts only if the offered rate was actually reached
+CORE_SAT_SHARE = 0.5  # share of in-window samples a driver core may spend >=95% busy
 LATE_OK = 0.05  # share of publishes behind their own schedule before a rung is flagged
 KNEE_OK = 0.99  # delivered/sent ratio a sustained rung must reach
 # How far the closing CONTROL rung may drift from the same rung at the start of
@@ -382,9 +383,11 @@ def lane_b_rung(rdir: Path, offered: int) -> dict:
         # delivered every message it was sent. Totals have no window to
         # misalign.
         "sustained": (not offer_not_met) and sent > 0 and recv >= KNEE_OK * sent,
+        "negative_share": negative_share,
         "p50": bucket_pct(buckets, count, 0.50),
         "p99": bucket_pct(buckets, count, 0.99),
         "p999": bucket_pct(buckets, count, 0.999),
+        "driver_core": core_sat,
         "flags": flags,
     }
 
@@ -978,6 +981,13 @@ def lane_e_ladder(rungs: list[dict]) -> dict:
     }
 
 
+def load_lane_e_extractor():
+    spec = importlib.util.spec_from_file_location("lane_e_extract", Path(__file__).with_name("extract-lane-e.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def lane_e_rung(rdir: Path) -> dict:
     """One site-ladder rung. Same counters as lane B, keyed by tenant count.
 
@@ -1153,9 +1163,10 @@ def lane_e_rung(rdir: Path) -> dict:
                 "predates the drain deadline, so pending traffic here is indistinguishable "
                 "from dropped)"
             )
-    within = p99_ms(p99) <= budget
+    clock_margin = ((evidence or {}).get("clock") or {}).get("latency_uncertainty_ms", 0)
+    within = p99_ms(p99) + clock_margin <= budget
     if not within:
-        flags.append(f"OVER P99 BUDGET ({p99} > {budget:g}ms)")
+        flags.append(f"OVER P99 BUDGET ({p99} + {clock_margin:g}ms clock uncertainty > {budget:g}ms)")
 
     # ── the eight counts (#534, acceptance 3) ────────────────────────────────
     #
@@ -1274,6 +1285,41 @@ def lane_e_rung(rdir: Path) -> dict:
         "dropped_by_reason": dropped_by_reason,
     }
 
+    # DRIVER CORE SATURATED. Each publisher container runs ONE Erlang scheduler, so
+    # its ceiling is one core — and mpstat's `all` row averages that core away
+    # (a pinned core on an 8-vCPU driver reads "87% idle"). Measured 2026-09-19:
+    # driver7 core 1 was >=95% busy in 95% of a 60,000 msg/s rung's samples while
+    # the host mean sat near idle. A rung whose generator had no headroom measures
+    # the generator, so it cannot be a capacity point whatever else it shows.
+    core_sat = None
+    core_ok = True
+    if (rdir / "cpu").is_dir():
+        extractor = load_lane_e_extractor()
+        try:
+            cpu_edges = extractor.load_window(rdir, int(rdir.parent.parent.name.split("=")[1])) if (rdir / "window.tsv").exists() else None
+        except (ValueError, KeyError, IndexError, OSError):
+            cpu_edges = None
+        core_sat = extractor.core_saturation(rdir, "driver", cpu_edges)
+        if core_sat and core_sat["share"] >= CORE_SAT_SHARE:
+            core_ok = False
+            flags.append(
+                f"DRIVER CORE SATURATED ({core_sat['host']} core {core_sat['core']} was >=95% busy in "
+                f"{core_sat['share'] * 100:.0f}% of {core_sat['samples']} in-window samples — the load "
+                "generator had no headroom; this rung measures the driver, not the broker)"
+            )
+
+    # LATENCY FLOOR. Deliveries faster than the clocks' disagreement land negative
+    # and are excluded from the histogram, so the p99 below is an UPPER BOUND on
+    # the true p99 — it cannot flatter the broker. Reported, never gated: two paid
+    # runs died refusing a rung that was measuring correctly (2026-09-19).
+    negative_share = (evidence or {}).get("negative_share", 0.0)
+    if negative_share > 0.001:
+        flags.append(
+            f"LATENCY FLOOR ({negative_share:.2%} of deliveries were faster than the "
+            "cross-host clocks can resolve, so they are excluded from the histogram — "
+            "the p99 here is an upper bound, not a point estimate)"
+        )
+
     # ── the population must have ARRIVED, and the cluster must have been CLEAN ─
     settled_ok = meta.get("settled", "yes") != "no"
     if not settled_ok:
@@ -1337,6 +1383,7 @@ def lane_e_rung(rdir: Path) -> dict:
             and late_share <= LATE_OK
             and settled_ok
             and reset_ok
+            and core_ok
             # A window opened on a broker that never caught up is not a rung this
             # ladder may claim, however good the numbers inside it look.
             and steady != "no"

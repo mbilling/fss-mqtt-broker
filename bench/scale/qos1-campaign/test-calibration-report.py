@@ -18,6 +18,8 @@ class Calibration(unittest.TestCase):
             dict(
                 nodes=3,
                 placement="container",
+                placement_version=2,
+                subscriber_placement=[["sub-s0-0", 0], ["sub-s0-1", 1]],
                 sub_containers_per_site=2,
                 qos="1",
                 sub_qos="1",
@@ -72,6 +74,14 @@ class Calibration(unittest.TestCase):
 
     def test_mixed_nodes_cannot_qualify(self):
         self.rows[0]["nodes"] = 5
+        self.check_report(False)
+
+    def test_changing_subscriber_hosts_cannot_qualify(self):
+        self.rows[0]["subscriber_placement"] = [["sub-s0-0", 6], ["sub-s0-1", 7]]
+        self.check_report(False)
+
+    def test_missing_subscriber_map_cannot_qualify(self):
+        del self.rows[0]["subscriber_placement"]
         self.check_report(False)
 
     def test_incomplete_rung_cannot_qualify(self):

@@ -57,6 +57,7 @@ comparable = (
                 r.get("sub_containers_per_site"),
                 r.get("qos"),
                 r.get("sub_qos"),
+                r.get("placement_version"),
             )
             for r in rows
         }
@@ -68,6 +69,10 @@ comparable = (
     and len({str(Path(r["path"]).parent) for r in rows}) == 1
     and not any(r.get("image_transition") for r in rows)
 )
+# Compare the actual subscriber-to-host map at the target load, not just the
+# policy name. Older placement moved subscribers when publishers were resized.
+target = [r for r in complete if r["offered"] == load and not r.get("control")]
+comparable = comparable and bool(target) and all(r.get("subscriber_placement") for r in target) and len({json.dumps(r["subscriber_placement"], sort_keys=True) for r in target}) == 1
 result = {
     "scope": "driver calibration at this cluster/load only; not a node-scaling result",
     "requested_rate": load,

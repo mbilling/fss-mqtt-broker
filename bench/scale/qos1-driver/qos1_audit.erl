@@ -1,7 +1,7 @@
 %% Measurement extension for the pinned emqtt-bench 0.6.3 image.
 %% A bitmap per topic and subscriber process reconciles a shared group offline.
 -module(qos1_audit).
--export([start/0, enabled/0, paused/0, stopped/0, record/3, ack/1, init/2]).
+-export([start/0, enabled/0, paused/0, stopped/0, record/3, ack/1, latency/1, init/2]).
 enabled() -> persistent_term:get(qos1_enabled, false).
 start() ->
     persistent_term:put(qos1_enabled, os:getenv("QOS1_AUDIT") =:= "1"),
@@ -15,6 +15,8 @@ start() ->
                     prometheus_histogram, prometheus_quantile_summary, prometheus_summary],
             [prometheus_registry:deregister_collector(C)
              || C <- prometheus_registry:collectors(default), not lists:member(C, Keep)],
+            prometheus_counter:declare([{name,audit_negative_latency},{help,"Negative cross-host latency observations"}]),
+            prometheus_counter:inc(audit_negative_latency, 0),
             ets:new(qos1_ledger, [named_table, public, set, {write_concurrency, true}]),
             persistent_term:put(qos1_paused, false),
             [prometheus_counter:declare([{name,N},{help,atom_to_list(N)}]) || N <- [audit_sent,audit_acked,audit_received]],
@@ -37,6 +39,13 @@ record(Kind, Topic, <<_:64, Seq:64, _/binary>>) ->
         true -> error(sequence_out_of_range)
     end;
 record(_, _, _) -> case enabled() of true -> error(missing_sequence_header); false -> ok end.
+%% Negative samples must remain visible even when positive samples dominate
+%% the sum. Do not clamp them into the fastest histogram bucket.
+latency(Value) ->
+    case enabled() andalso Value < 0 of
+        true -> prometheus_counter:inc(audit_negative_latency), false;
+        false -> true
+    end.
 ack(Start) ->
     case enabled() of true -> prometheus_histogram:observe(puback_latency,
         (erlang:monotonic_time(microsecond) - Start) / 1000); false -> ok end.

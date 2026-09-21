@@ -41,6 +41,7 @@ with zipfile.ZipFile(p/'original.escript') as src,zipfile.ZipFile(buf,'w',zipfil
 (p/'emqtt_bench').write_bytes(prefix+buf.getvalue())
 PY
 printf 'FROM %s\nCOPY --chmod=755 emqtt_bench /emqtt_bench/escript/emqtt_bench\n' "$base" > "$out/Dockerfile"
-docker build -q -t fss-qos1-audit:local "$out"
-docker save fss-qos1-audit:local | gzip > "$out/driver.tar.gz"
+image=${QOS1_DRIVER_IMAGE:-fss-qos1-audit:local}
+docker build -q -t "$image" "$out"
+docker save "$image" | gzip > "$out/driver.tar.gz"
 sha256sum "$out/driver.tar.gz" "$out/emqtt_bench" > "$out/SHA256SUMS"

@@ -1,0 +1,14 @@
+Reference ID    : B473E9E4 (2a01:4f8:1c0c:40c6:6f75:7461:7469:6d65)
+Stratum         : 3
+Ref time (UTC)  : Sat Sep 19 14:24:39 2026
+System time     : 0.000000001 seconds fast of NTP time
+Last offset     : +0.000017243 seconds
+RMS offset      : 0.000318654 seconds
+Frequency       : 5.038 ppm fast
+Residual freq   : +0.003 ppm
+Skew            : 0.253 ppm
+Root delay      : 0.010805474 seconds
+Root dispersion : 0.001366702 seconds
+Update interval : 64.3 seconds
+Leap status     : Normal
+Captured epoch : 1789828004.144981787

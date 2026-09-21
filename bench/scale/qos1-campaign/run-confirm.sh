@@ -11,7 +11,10 @@ sha256sum "$QOS1_DRIVER_ARCHIVE" > "$RUN_DIR/driver-archive.sha256"
 # Snapshot all harness changes, including files outside git, before provisioning.
 tar -czf "$RUN_DIR/harness-source.tar.gz" --exclude=.runs --exclude=.terraform --exclude=__pycache__ --exclude='*.tfstate*' --exclude='*.tfvars*' -C "$here/.." .
 set +e
-"$here/../run.sh" full 3 2>&1 | tee "$RUN_DIR/run.log"
+# Sizes come from the profile (QOS1_SIZES) so a 5-node run is a profile, not an
+# edit to this wrapper. Default 3: the size the campaign calibrated on.
+read -r -a qos1_sizes <<<"${QOS1_SIZES:-3}"
+"$here/../run.sh" full "${qos1_sizes[@]}" 2>&1 | tee "$RUN_DIR/run.log"
 rc=${PIPESTATUS[0]}
 set -e
 python3 "$here/report.py" "$RUN_DIR" --output "$RUN_DIR/analysis"

@@ -20,6 +20,7 @@ sp = importlib.util.spec_from_file_location(
 e = importlib.util.module_from_spec(sp)
 sp.loader.exec_module(e)
 parser = argparse.ArgumentParser()
+parser.add_argument("--image", default="fss-qos1-audit:local")
 parser.add_argument(
     "--mqttd",
     type=Path,
@@ -103,7 +104,7 @@ try:
                 "QOS1_AUDIT=1",
                 "-e",
                 "ERL_FLAGS=+S 1:1",
-                "fss-qos1-audit:local",
+                args.image,
                 "sub",
                 "-h",
                 "127.0.0.1",
@@ -136,7 +137,7 @@ try:
             "QOS1_AUDIT=1",
             "-e",
             "ERL_FLAGS=+S 1:1",
-            "fss-qos1-audit:local",
+            args.image,
             "pub",
             "-h",
             "127.0.0.1",
