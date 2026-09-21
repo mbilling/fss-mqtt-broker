@@ -110,12 +110,27 @@ def connect_packet(client_id: str, keepalive: int) -> bytes:
     return packet(0x10, _utf8("MQTT") + b"\x04\x02" + struct.pack("!H", keepalive) + _utf8(client_id))
 
 
-def subscribe_packet(packet_id: int, topic_filter: str) -> bytes:
-    return packet(0x82, struct.pack("!H", packet_id) + _utf8(topic_filter) + b"\x00")
+def subscribe_packet(packet_id: int, topic_filter: str, qos: int = 0) -> bytes:
+    return packet(0x82, struct.pack("!H", packet_id) + _utf8(topic_filter) + bytes([qos]))
 
 
-def publish_packet(topic: str, payload: bytes) -> bytes:
-    return packet(0x30, _utf8(topic) + payload)
+def publish_packet(topic: str, payload: bytes, qos: int = 0, packet_id: int = 0) -> bytes:
+    """A PUBLISH at `qos`. At QoS >= 1 the packet id sits between topic and payload."""
+    if qos == 0:
+        return packet(0x30, _utf8(topic) + payload)
+    return packet(0x30 | (qos << 1), _utf8(topic) + struct.pack("!H", packet_id) + payload)
+
+
+def puback_packet(packet_id: int) -> bytes:
+    return packet(0x40, struct.pack("!H", packet_id))
+
+
+def publish_id(first: int, body: bytes) -> Optional[int]:
+    """The packet id of an inbound PUBLISH, or None at QoS 0."""
+    if not (first >> 1) & 3:
+        return None
+    topic_len = struct.unpack("!H", body[:2])[0]
+    return struct.unpack("!H", body[2 + topic_len:4 + topic_len])[0]
 
 
 def decode_packet(buf: bytes) -> Optional[Tuple[int, bytes, int]]:
@@ -230,10 +245,10 @@ class Conn:
         self.sock.settimeout(timeout)
         self.sock.sendall(data)
 
-    def subscribe(self, filters: Sequence[str], timeout: float) -> None:
+    def subscribe(self, filters: Sequence[str], timeout: float, qos: int = 0) -> None:
         deadline = time.monotonic() + timeout
         for packet_id, topic_filter in enumerate(filters, 1):
-            self.send(subscribe_packet(packet_id, topic_filter), max(0.1, deadline - time.monotonic()))
+            self.send(subscribe_packet(packet_id, topic_filter, qos), max(0.1, deadline - time.monotonic()))
             while True:
                 got = self.reader.read(deadline=deadline)
                 assert got is not None
@@ -249,6 +264,12 @@ class Conn:
                     raise ProtocolError("SUBACK for packet id %d, expected %d" % (acked, packet_id))
                 if body[2] > 2:
                     raise ProtocolError("SUBACK refused %s with return code 0x%02x" % (topic_filter, body[2]))
+                # A downgrade is not a refusal, and it is the one answer that would
+                # let this control certify a different QoS than the rung it guards.
+                if body[2] != qos:
+                    raise ProtocolError(
+                        "SUBACK granted QoS %d for %s, asked for %d — the control would certify a "
+                        "different path than the rung" % (body[2], topic_filter, qos))
                 break
 
     def disconnect(self) -> None:
@@ -264,19 +285,31 @@ class Conn:
 class Member(threading.Thread):
     """Reads one subscriber connection and records every payload by topic."""
 
-    def __init__(self, conn: Conn, label: str) -> None:
+    def __init__(self, conn: Conn, label: str, qos: int = 0) -> None:
         threading.Thread.__init__(self, name="member-" + label, daemon=True)
         self.conn = conn
         self.label = label
+        self.qos = qos
         self.stop = threading.Event()
         self.error = None  # type: Optional[str]
         self._lock = threading.Lock()
         self._seen = {}  # type: Dict[str, List[str]]
+        self._acked = 0
 
     def _record(self, first: int, body: bytes) -> None:
         topic, payload = parse_publish(first, body)
         with self._lock:
             self._seen.setdefault(topic, []).append(payload.decode("ascii", "replace"))
+        # ACKNOWLEDGE, or the ledger is not a ledger. An unacked QoS 1 delivery
+        # stays in the broker's outbound inflight window and is REDELIVERED on
+        # timeout, so `delivered_delta` would climb past the K*(N-1) this control
+        # asserts — the canary would fail on its own silence rather than on any
+        # forwarding defect.
+        if self.qos >= 1:
+            pid = publish_id(first, body)
+            if pid is not None:
+                with contextlib.suppress(OSError):
+                    self.conn.send(puback_packet(pid), 5.0)
 
     def run(self) -> None:
         try:
@@ -288,9 +321,17 @@ class Member(threading.Thread):
                     return
                 if got[0] >> 4 == 3:
                     self._record(*got)
+                elif got[0] >> 4 == 4:  # PUBACK for something this connection published
+                    with self._lock:
+                        self._acked += 1
         except Exception as exc:  # noqa: BLE001 - reported through .error, never swallowed
             if not self.stop.is_set():
                 self.error = _describe(exc)
+
+    def acked(self) -> int:
+        """PUBACKs this connection has seen (publishers only)."""
+        with self._lock:
+            return self._acked
 
     def payloads(self, topic: str) -> List[str]:
         with self._lock:
@@ -372,7 +413,8 @@ def split_stream(text: str) -> List[Tuple[str, str]]:
     return out
 
 
-def run(brokers: Sequence[Tuple[str, int, int]], count: int, timeout: float, stream: io.RawIOBase) -> int:
+def run(brokers: Sequence[Tuple[str, int, int]], count: int, timeout: float, stream: io.RawIOBase,
+        qos: int = 0) -> int:
     nodes = len(brokers)
     local = nodes == 1
     pairs = [(0, 0)] if local else [(i, j) for i in range(nodes) for j in range(nodes) if i != j]
@@ -385,6 +427,10 @@ def run(brokers: Sequence[Tuple[str, int, int]], count: int, timeout: float, str
     events = []  # type: List[str]
     members = {}  # type: Dict[int, Member]
     publishers = {}  # type: Dict[int, Conn]
+    # Declared beside the other connection tables, not where it is filled: the
+    # teardown below reads it, and a failure during SUBSCRIBE would otherwise
+    # raise NameError there and bury the error that actually happened.
+    pub_readers = {}  # type: Dict[int, Member]
     status = "error"
 
     def note(text: str) -> None:
@@ -453,10 +499,10 @@ def run(brokers: Sequence[Tuple[str, int, int]], count: int, timeout: float, str
                 conn = Conn.open(host, mqtt_port, "fsscanary-s%d-%s" % (j, nonce), keepalive, budget(10.0, "subscribing"))
             except (OSError, EOFError, ProtocolError) as exc:
                 raise CanaryError("subscriber connect to broker%d (%s:%d) failed: %s" % (j, host, mqtt_port, _describe(exc))) from None
-            member = Member(conn, "broker%d" % j)
+            member = Member(conn, "broker%d" % j, qos)
             members[j] = member  # registered before SUBACKs so a failure still disconnects it
             try:
-                conn.subscribe(filters, budget(10.0, "subscribing"))
+                conn.subscribe(filters, budget(10.0, "subscribing"), qos)
             except (OSError, EOFError, ProtocolError) as exc:
                 raise CanaryError("subscribe on broker%d (%s:%d) failed: %s" % (j, host, mqtt_port, _describe(exc))) from None
             member.start()
@@ -470,9 +516,34 @@ def run(brokers: Sequence[Tuple[str, int, int]], count: int, timeout: float, str
             note("publisher broker%d connected" % i)
         note("subscribed %d directed pairs%s" % (len(pairs), " (local mode)" if local else ""))
 
-        def publish(i: int, data: bytes, what: str) -> None:
+        # At QoS >= 1 the broker answers every publish with a PUBACK on the
+        # publisher's own socket, and nothing here reads it: the buffer fills and
+        # the control stalls on a write it cannot explain. A reader per publisher
+        # drains them AND counts them, which turns the silence into a check —
+        # every message this control published was acknowledged before the post
+        # scrape is taken.
+        published = {}  # type: Dict[int, int]
+        next_pid = {}  # type: Dict[int, int]
+        if qos >= 1:
+            for i in sorted(publishers):
+                reader = Member(publishers[i], "pub-broker%d" % i)
+                pub_readers[i] = reader
+                reader.start()
+
+        def pids(i: int, n: int) -> List[int]:
+            out = []
+            for _ in range(n):
+                nxt = next_pid.get(i, 0) % 65535 + 1
+                next_pid[i] = nxt
+                out.append(nxt)
+            return out
+
+        def publish(i: int, packets: Sequence[bytes], what: str) -> None:
+            if not packets:
+                return
+            published[i] = published.get(i, 0) + len(packets)
             try:
-                publishers[i].send(data, budget(10.0, what))
+                publishers[i].send(b"".join(packets), budget(10.0, what))
             except OSError as exc:
                 raise CanaryError("publish %s on broker%d failed: %s" % (what, i, _describe(exc))) from None
 
@@ -489,11 +560,15 @@ def run(brokers: Sequence[Tuple[str, int, int]], count: int, timeout: float, str
                     note("pair %s: no pilot delivered after %d rounds" % (pair_name(pair), rounds))
                 raise CanaryError("interest never propagated: %d of %d pairs dark after %d pilot rounds" % (len(dark), len(pairs), rounds))
             for i in sorted({i for i, _ in dark}):
-                publish(i, b"".join(publish_packet(topic(i, j), b"pilot-%d" % rounds) for ii, j in dark if ii == i), "pilot")
+                tgt = [j for ii, j in dark if ii == i]
+                publish(i, [publish_packet(topic(i, j), b"pilot-%d" % rounds, qos, pid)
+                            for j, pid in zip(tgt, pids(i, len(tgt)))], "pilot")
             rounds += 1
         note("pilot delivered on every pair after %d rounds" % rounds)
         for i in sorted(publishers):
-            publish(i, b"".join(publish_packet(topic(i, j), b"pilot-end") for ii, j in pairs if ii == i), "pilot-end")
+            tgt = [j for ii, j in pairs if ii == i]
+            publish(i, [publish_packet(topic(i, j), b"pilot-end", qos, pid)
+                        for j, pid in zip(tgt, pids(i, len(tgt)))], "pilot-end")
         missing = wait_all(lambda p: p == "pilot-end", "pilot-end")
         if missing:
             for pair in missing:
@@ -507,7 +582,9 @@ def run(brokers: Sequence[Tuple[str, int, int]], count: int, timeout: float, str
         for s in range(count):
             payload = b"burst-end" if s == count - 1 else b"burst-%d" % s
             for i in sorted(publishers):
-                publish(i, b"".join(publish_packet(topic(i, j), payload) for ii, j in pairs if ii == i), "burst")
+                tgt = [j for ii, j in pairs if ii == i]
+                publish(i, [publish_packet(topic(i, j), payload, qos, pid)
+                            for j, pid in zip(tgt, pids(i, len(tgt)))], "burst")
             time.sleep(0.001)
         note("published %d per pair" % count)
         missing = wait_all(lambda p: p == "burst-end", "burst-end")
@@ -516,6 +593,24 @@ def run(brokers: Sequence[Tuple[str, int, int]], count: int, timeout: float, str
                 note("pair %s: burst-end not delivered (burst_seen=%d burst_distinct=%d)" % ((pair_name(pair),) + burst_count(pair)))
             raise CanaryError("burst-end not delivered on %d of %d pairs" % (len(missing), len(pairs)))
         note("burst-end delivered on every pair")
+        if qos >= 1:
+            want = sum(published.values())
+            until = min(deadline, time.monotonic() + 30.0)
+            while True:
+                have = sum(r.acked() for r in pub_readers.values())
+                if have >= want or time.monotonic() >= until:
+                    break
+                time.sleep(0.02)
+            check_members()
+            if have < want:
+                for i in sorted(pub_readers):
+                    note("broker%d: %d of %d publishes acknowledged"
+                         % (i, pub_readers[i].acked(), published.get(i, 0)))
+                raise CanaryError(
+                    "the brokers acknowledged %d of %d QoS %d publishes — an unacked publish is one "
+                    "the broker has not taken responsibility for, so the ledger below would count "
+                    "deliveries of messages that may still be redelivered" % (have, want, qos))
+            note("every one of %d QoS %d publishes acknowledged" % (want, qos))
         scrape_all("post")
         status = "complete"
     except (Exception, Stopped, KeyboardInterrupt) as exc:
@@ -524,6 +619,12 @@ def run(brokers: Sequence[Tuple[str, int, int]], count: int, timeout: float, str
         closed = 0
         for member in members.values():
             member.stop.set()
+        for i in sorted(pub_readers):
+            # Stop the reader before its socket closes under it, or a drained
+            # publisher reports a teardown race as a canary failure.
+            pub_readers[i].stop.set()
+            if pub_readers[i].is_alive():
+                pub_readers[i].join(2.0)
         for i in sorted(publishers):
             publishers[i].disconnect()
             closed += 1
@@ -1236,6 +1337,9 @@ class FakeCluster:
         import http.server
 
         self.nodes, self.propagation, self.lose = nodes, propagation, lose
+        self.member_acks = 0  # PUBACKs the fake's subscribers sent back (QoS 1 only)
+        self.grant_override = None  # type: Optional[int]
+        self.out_pid = 0
         self.truncate = dict(truncate or {})
         self.routed = []  # type: List[Tuple[int, str, bytes]]
         self.lock = threading.Lock()
@@ -1330,9 +1434,20 @@ class FakeCluster:
                     share_topic = body[4:4 + topic_len].decode().split("/", 2)[2]
                     with self.lock:
                         self.subs.append((b, share_topic, sock, time.monotonic()))
-                    sock.sendall(b"\x90\x03" + body[:2] + b"\x00")
+                    # Grant what was requested, as a broker does — the canary now
+                    # refuses a downgrade, because a downgraded control would
+                    # certify a different delivery path than the rung it guards.
+                    granted = body[-1] if self.grant_override is None else self.grant_override
+                    sock.sendall(b"\x90\x03" + body[:2] + bytes([granted]))
                 elif kind == 3:
-                    self._route(b, *parse_publish(first, body))
+                    pid = publish_id(first, body)
+                    if pid is not None:
+                        with contextlib.suppress(OSError):
+                            sock.sendall(puback_packet(pid))
+                    self._route(b, *parse_publish(first, body), qos=(first >> 1) & 3)
+                elif kind == 4:
+                    with self.lock:
+                        self.member_acks += 1
                 elif kind == 14:
                     with self.lock:
                         self.disconnects += 1
@@ -1344,7 +1459,7 @@ class FakeCluster:
                 self.subs = [s for s in self.subs if s[2] is not sock]
             sock.close()
 
-    def _route(self, b: int, topic: str, payload: bytes) -> None:
+    def _route(self, b: int, topic: str, payload: bytes, qos: int = 0) -> None:
         with self.lock:
             self.received[b] += 1
             self.routed.append((b, topic, payload))
@@ -1359,7 +1474,8 @@ class FakeCluster:
             if self.lose == (b, member[0], payload):
                 return
             with contextlib.suppress(OSError):
-                member[2].sendall(publish_packet(topic, payload))
+                self.out_pid += 1
+                member[2].sendall(publish_packet(topic, payload, qos, self.out_pid % 65535 + 1))
 
     def settle(self, disconnects: int) -> None:
         """Wait (bounded) for the DISCONNECTs a finished run already sent to be read."""
@@ -1385,11 +1501,12 @@ def _script_source() -> bytes:
     return Path(__file__).resolve().read_bytes()
 
 
-def _run_via_stdin(specs: Sequence[str], count: int, timeout: float) -> Tuple[int, List[Tuple[str, str]], str]:
+def _run_via_stdin(specs: Sequence[str], count: int, timeout: float,
+                   qos: int = 0) -> Tuple[int, List[Tuple[str, str]], str]:
     argv = [sys.executable, "-", "run"]
     for spec in specs:
         argv += ["--broker", spec]
-    argv += ["--count", str(count), "--timeout", str(timeout)]
+    argv += ["--count", str(count), "--timeout", str(timeout), "--qos", str(qos)]
     proc = subprocess.run(argv, input=_script_source(), stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout + 30)
     return proc.returncode, split_stream(proc.stdout.decode()), proc.stderr.decode()
 
@@ -1707,6 +1824,60 @@ class RunTests(unittest.TestCase):
         for topic, payloads in bursts.items():
             self.assertEqual(payloads, [b"burst-%d" % s for s in range(19)] + [b"burst-end"], topic)
 
+    def test_qos1_framing_carries_a_packet_id_and_qos0_is_unchanged(self) -> None:
+        # QoS 0 framing must be byte-identical: the QoS 0 arm of lane E is already
+        # published, and a control that changed shape would recertify it.
+        self.assertEqual(publish_packet("a/b", b"xy"), b"\x30\x07\x00\x03a/bxy")
+        self.assertEqual(publish_packet("a/b", b"xy", 0, 9), b"\x30\x07\x00\x03a/bxy")
+        # At QoS 1 the header carries the level and the id sits after the topic.
+        self.assertEqual(publish_packet("a/b", b"xy", 1, 9), b"\x32\x09\x00\x03a/b\x00\x09xy")
+        self.assertEqual(puback_packet(9), b"\x40\x02\x00\x09")
+        self.assertEqual(subscribe_packet(7, "$share/g/t", 1), b"\x82\x0f\x00\x07\x00\x0a$share/g/t\x01")
+        # and the id round-trips out of an inbound PUBLISH, which is what the
+        # member must echo — a wrong id acks someone else's message.
+        first, body, _ = decode_packet(publish_packet("a/b", b"xy", 1, 9))
+        self.assertEqual(publish_id(first, body), 9)
+        self.assertEqual(parse_publish(first, body), ("a/b", b"xy"))
+        first0, body0, _ = decode_packet(publish_packet("a/b", b"xy"))
+        self.assertIsNone(publish_id(first0, body0))
+
+    def test_a_granted_downgrade_is_refused(self) -> None:
+        # A broker answering a QoS 1 SUBSCRIBE with QoS 0 is not refusing: it is
+        # silently handing the control a different delivery path than the rung it
+        # is supposed to certify. That must stop the canary, not pass it.
+        fake = FakeCluster(1)
+        try:
+            host, port, _ = parse_broker(fake.specs()[0])
+            conn = Conn.open(host, port, "downgrade-probe", 30, 5.0)
+            try:
+                fake.grant_override = 0
+                with self.assertRaises(ProtocolError) as caught:
+                    conn.subscribe(["$share/g/t"], 5.0, 1)
+                self.assertIn("granted QoS 0", str(caught.exception))
+            finally:
+                conn.disconnect()
+        finally:
+            fake.close()
+
+    def test_mesh_run_at_qos1_acks_every_publish_and_passes_the_ledger(self) -> None:
+        # The whole point of the QoS 1 port: the ledger is only a ledger if every
+        # delivery was acknowledged. An unacked QoS 1 delivery is redelivered, so
+        # `delivered_delta` would climb past K*(N-1) for a reason that has nothing
+        # to do with forwarding — the canary would fail on its own silence.
+        fake = FakeCluster(3)
+        try:
+            rc, chunks, stderr = _run_via_stdin(fake.specs(), 20, 20, qos=1)
+            fake.settle(6)
+        finally:
+            fake.close()
+        self.assertEqual((rc, stderr), (0, ""))
+        d = self.capture(chunks)
+        self.assertEqual(ledger(d, 3, 20)["status"], "pass")
+        timeline = (d / "timeline.tsv").read_text()
+        self.assertIn("QoS 1 publishes acknowledged", timeline)
+        # every delivery the fake made was acknowledged by a member
+        self.assertGreater(fake.member_acks, 0, "members never acknowledged a QoS 1 delivery")
+
     def test_a_truncated_scrape_is_retried_and_never_kept(self) -> None:
         fake = FakeCluster(2, propagation=0.1, truncate={1: 1})
         try:
@@ -1812,6 +1983,10 @@ def main(argv: Sequence[str]) -> int:
     run_p.add_argument("--broker", action="append", required=True, help="HOST:MQTT_PORT:HEALTH_PORT, in broker-index order")
     run_p.add_argument("--count", type=_positive_int, default=100)
     run_p.add_argument("--timeout", type=_positive_float, default=90.0)
+    # The control must certify the SAME delivery path the rung measures. At QoS 1
+    # that path acks, and an unacked delivery is redelivered — which would break
+    # the exact K*(N-1) ledger for a reason that has nothing to do with forwarding.
+    run_p.add_argument("--qos", type=int, choices=(0, 1), default=0)
     verify_p = sub.add_parser("verify", help="re-derive the ledger from a canary directory")
     verify_p.add_argument("dir")
     verify_p.add_argument("--nodes", type=_positive_int, required=True)
@@ -1835,7 +2010,7 @@ def main(argv: Sequence[str]) -> int:
             brokers = [parse_broker(spec) for spec in args.broker]
         except ValueError as exc:
             parser.error(str(exc))
-        return run(brokers, args.count, args.timeout, sys.stdout.buffer)
+        return run(brokers, args.count, args.timeout, sys.stdout.buffer, args.qos)
     if args.cmd == "verify":
         return verify(args.dir, args.nodes, args.count)
     if args.cmd == "local-proof":

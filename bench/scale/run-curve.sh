@@ -373,6 +373,42 @@ LANE_E_PUBS_PER_SITE="${LANE_E_PUBS_PER_SITE:-1200}"
 # tenancy. Six puts each consumer at 5,000, inside the band worth advertising.
 LANE_E_SUBS_PER_SITE="${LANE_E_SUBS_PER_SITE:-6}"
 LANE_E_QOS="${LANE_E_QOS:-0}"
+# Pinned, not inherited. emqtt-bench 0.6.3 defaults to -V 5 today, and v5 is the
+# only version where the broker ENFORCES Receive Maximum on QoS 1 (conn.rs:
+# `is_v5 && *qos2_inflight >= receive_maximum` => DISCONNECT 0x93). Leaving the
+# version to the image means a bench upgrade could silently move a QoS 1 rung
+# onto a path with no flow control and call the difference a broker change.
+LANE_E_PROTO="${LANE_E_PROTO:-5}"
+# The PUBACK round trip a QoS >= 1 publisher must fit inside its own timer.
+# emqtt-bench publishes SYNCHRONOUSLY per client — `-F` defaults to 1, so a
+# client holds at most one unacked publish and can never exceed 1/RTT however
+# small -I is. At QoS 0 nothing waits and this does not apply. 12ms is what the
+# 2026-08-25 pass measured under load; the shape demands 2x that as margin,
+# because a rung that cannot offer its label reports the DRIVER as the broker.
+LANE_E_ACK_RTT_MS="${LANE_E_ACK_RTT_MS:-12}"
+# The broker's own bound on publishes whose ack is gated on durability
+# (hub/mod.rs PENDING_PUBLISH_CAP). QoS 0 never enters that table since #492, so
+# this binds at QoS >= 1 only. Not a refusal: it is a real broker property a
+# capacity lane may want to reach. It is PREDICTED here so it is never reached
+# unannounced, and the rung that reaches it is flagged from the counter.
+LANE_E_PENDING_PUBLISH_CAP="${LANE_E_PENDING_PUBLISH_CAP:-4096}"
+# THE STEADY-STATE GATE (2026-09-18). Lane E gated that every client had
+# CONNECTED and that everything had DRAINED, and nothing in between: the window
+# could open while the broker was still repaying a backlog built during the
+# ramp. Measured at N=3, 4 sites: the window opened on 372,025 outstanding
+# messages, repaid them in its first six seconds, and the rung's p99 became
+# <=7500ms — the age of traffic published BEFORE the window. After catch-up the
+# same broker held the full 120,000 msg/s for 55 seconds.
+#
+# Steady means delivery sits INSIDE a band around the offer, not merely above
+# it: below the band the broker is falling behind, above it the broker is
+# repaying, and a window opened during either measures something other than the
+# rung. The gate is also the capacity test — a rung that cannot reach steady
+# state within its budget is past the broker's capacity, which is a cleaner
+# knee than a percentile taken on a contaminated window.
+LANE_E_STEADY_PCT="${LANE_E_STEADY_PCT:-5}"
+LANE_E_STEADY_POLLS="${LANE_E_STEADY_POLLS:-3}"
+LANE_E_STEADY_BUDGET="${LANE_E_STEADY_BUDGET:-180}"
 # The SUBSCRIBER's requested QoS, separately (#534, acceptance 2). #405 records
 # that the old durable_bench QoS 2 rows isolated INBOUND cost — publisher at
 # QoS 2, subscriber at QoS 1 — and so never measured the outbound exactly-once
@@ -457,7 +493,7 @@ LANE_E_CALIBRATE_SECS="${LANE_E_CALIBRATE_SECS:-20}"
 # indistinguishable from a cluster that cannot forward, a broker that dropped the
 # counter, or a restart that wiped it, and "0% crossing" would be certified by
 # the silence of the thing it measures. So before calibration, once per size, a
-# raw-socket canary (forward-canary.py, run on driver 0) pushes COUNT QoS 0
+# raw-socket canary (forward-canary.py, run on driver 0) pushes COUNT LANE_E_QOS
 # messages over every directed broker pair through a $share group whose only
 # member is remote, verifies the ledger exactly (received, delivered and
 # shared-remote forwards all equal COUNT x (N-1) per broker, no drops, full peer
@@ -804,6 +840,13 @@ lane_e_shape() {
 	[ "$LANE_E_DRAIN_SECS" -eq 0 ] || [ "$LANE_E_DRAIN_SECS" -ge $((LANE_E_FLAT_POLLS * LANE_E_DRAIN_POLL)) ] ||
 		die "lane E: LANE_E_DRAIN_SECS=$LANE_E_DRAIN_SECS cannot fit $LANE_E_FLAT_POLLS polls of ${LANE_E_DRAIN_POLL}s, so the drain could never observe a flat run and every rung would report UNRESOLVED"
 	case "$LANE_E_QOS" in 0 | 1 | 2) ;; *) die "LANE_E_QOS must be 0, 1 or 2, got '$LANE_E_QOS'" ;; esac
+	case "$LANE_E_PROTO" in 3 | 4 | 5) ;; *) die "LANE_E_PROTO must be 3, 4 or 5 (emqtt-bench -V), got '$LANE_E_PROTO'" ;; esac
+	positive_int LANE_E_ACK_RTT_MS "$LANE_E_ACK_RTT_MS"
+	positive_int LANE_E_PENDING_PUBLISH_CAP "$LANE_E_PENDING_PUBLISH_CAP"
+	positive_int LANE_E_STEADY_PCT "$LANE_E_STEADY_PCT"
+	positive_int LANE_E_STEADY_POLLS "$LANE_E_STEADY_POLLS"
+	positive_int LANE_E_STEADY_BUDGET "$LANE_E_STEADY_BUDGET"
+	[ "$LANE_E_STEADY_PCT" -lt 100 ] || die "LANE_E_STEADY_PCT must be under 100 (got $LANE_E_STEADY_PCT) — a band that wide accepts any rate as steady"
 	case "$LANE_E_SUB_QOS" in 0 | 1 | 2) ;; *) die "LANE_E_SUB_QOS must be 0, 1 or 2, got '$LANE_E_SUB_QOS'" ;; esac
 	# A subscriber cannot be granted MORE than the publisher sent: asking for it
 	# would silently measure the publisher's QoS while the run directory claims
@@ -818,6 +861,12 @@ lane_e_shape() {
 	positive_int LANE_E_FORWARD_CANARY_TIMEOUT "$LANE_E_FORWARD_CANARY_TIMEOUT"
 	[ "$LANE_E_FORWARD_CANARY" = 0 ] || [ -f "$SCALE_DIR/forward-canary.py" ] ||
 		die "lane E: LANE_E_FORWARD_CANARY=1 but $SCALE_DIR/forward-canary.py is missing — without the control no N>1 crossing can be certified"
+	# The control certifies the path the rung measures, so it has to SPEAK that
+	# path. It does QoS 0 and QoS 1; exactly-once needs the PUBREC/PUBREL/PUBCOMP
+	# handshake, which it does not implement. Refused here rather than as an
+	# argparse error on a driver after the fleet is up.
+	[ "$LANE_E_FORWARD_CANARY" = 0 ] || [ "$LANE_E_QOS" != 2 ] ||
+		die "lane E: the forwarding canary speaks QoS 0 and 1, not 2 — a QoS 2 rung would be certified by a control running a different delivery path. Set LANE_E_FORWARD_CANARY=0 to run uncertified (crossing becomes INVALID at N>1), or keep LANE_E_QOS at 0 or 1"
 
 	# The per-publisher timer. Whole milliseconds, exactly as lane B: a floored
 	# -I offers a rate other than the label, and the label is what gets published.
@@ -830,6 +879,17 @@ lane_e_shape() {
 	interval=$((1000 / per_pub_rate))
 	[ "$interval" -ge "$LANE_E_MIN_INTERVAL" ] ||
 		die "lane E: -I ${interval}ms is below LANE_E_MIN_INTERVAL=$LANE_E_MIN_INTERVAL — the drivers collapse below it (#421)"
+	# The ack-RTT floor. At QoS 0 a publisher never waits, so -I alone sets the
+	# rate. At QoS >= 1 emqtt-bench's publish is synchronous per client (-F
+	# defaults to 1: one unacked publish at a time), so the achievable rate is
+	# min(1/-I, 1/RTT) and a rung whose timer is faster than the broker's PUBACK
+	# simply under-offers — which this ladder would then read as the BROKER's
+	# capacity. Refused at shape time, before provisioning, like every other
+	# offer ceiling here.
+	if [ "$LANE_E_QOS" -ge 1 ]; then
+		[ "$interval" -ge $((2 * LANE_E_ACK_RTT_MS)) ] ||
+			die "lane E at QoS $LANE_E_QOS: -I ${interval}ms leaves no margin over a ${LANE_E_ACK_RTT_MS}ms PUBACK round trip (emqtt-bench holds one unacked publish per client, so a publisher cannot beat 1/RTT). Each publisher would offer at most $((1000 / LANE_E_ACK_RTT_MS)) msg/s against the ${per_pub_rate} msg/s on its label. Lower LANE_E_PUBS_PER_SITE's per-publisher rate, or set LANE_E_ACK_RTT_MS from a calibration run that measured a faster ack"
+	fi
 
 	# Each site's populations must split exactly over that site's own containers.
 	[ $((LANE_E_PUBS_PER_SITE % LANE_E_PUB_CONTAINERS_PER_SITE)) -eq 0 ] ||
@@ -882,12 +942,12 @@ lane_e_shape() {
 			echo "               Do not treat round-robin (N-1)/N as the prediction while prefer-local is on."
 		fi
 		if [ "$LANE_E_FORWARD_CANARY" = 1 ] && [ "$N" -gt 1 ]; then
-			echo "forward canary: ON — before calibration, $LANE_E_FORWARD_CANARY_COUNT QoS 0 msgs over each of $((N * (N - 1))) directed broker pairs"
+			echo "forward canary: ON — before calibration, $LANE_E_FORWARD_CANARY_COUNT QoS $LANE_E_QOS msgs over each of $((N * (N - 1))) directed broker pairs"
 			echo "               (timeout ${LANE_E_FORWARD_CANARY_TIMEOUT}s) must forward exactly, or the size stops. Every rung must"
 			echo "               still carry each broker's mqttd_publish_forwarded_total{reason=\"shared-remote\"}"
 			echo "               floor from the same process; otherwise its crossing is INVALID, not 0%."
 		elif [ "$LANE_E_FORWARD_CANARY" = 1 ]; then
-			echo "forward canary: ON (local) — $LANE_E_FORWARD_CANARY_COUNT QoS 0 msgs over one local pair (timeout ${LANE_E_FORWARD_CANARY_TIMEOUT}s);"
+			echo "forward canary: ON (local) — $LANE_E_FORWARD_CANARY_COUNT QoS $LANE_E_QOS msgs over one local pair (timeout ${LANE_E_FORWARD_CANARY_TIMEOUT}s);"
 			echo "               N=1 has no peers, so crossing is structural and the control proves delivery only."
 		else
 			echo "forward canary: OFF (LANE_E_FORWARD_CANARY=0) — crossing CANNOT be certified at N>1;"
@@ -908,8 +968,19 @@ lane_e_shape() {
 	} >"$OUT/laneE/shape.txt"
 
 	local sites cps total_c per_driver verdict worst=0
+	local cap_rung=0 cap_inflight=0
 	for sites in "${LANE_E_SITES[@]}"; do
 		positive_int "lane E rung" "$sites"
+		# Concurrent gated publishes per broker. emqtt-bench holds ONE unacked
+		# publish per client (-F 1), and publishers are spread over the brokers by
+		# rotated host lists, so the table on each broker sees its share of them.
+		if [ "$LANE_E_QOS" -ge 1 ] && [ "$cap_rung" -eq 0 ]; then
+			local inflight=$(((sites * LANE_E_PUBS_PER_SITE + N - 1) / N))
+			if [ "$inflight" -gt "$LANE_E_PENDING_PUBLISH_CAP" ]; then
+				cap_rung="$sites"
+				cap_inflight="$inflight"
+			fi
+		fi
 		cps=$((LANE_E_PUB_CONTAINERS_PER_SITE + LANE_E_SUB_CONTAINERS_PER_SITE))
 		total_c=$((sites * cps))
 		# Sites are dealt round-robin to drivers, so the busiest driver carries
@@ -936,6 +1007,18 @@ lane_e_shape() {
 	if [ "$worst" = 1 ]; then
 		sed 's/^/    /' "$OUT/laneE/shape.txt" >&2
 		die "lane E: a rung needs more containers per driver than $LANE_E_MAX_CONTAINERS_PER_DRIVER (one vCPU each; budget from inventory or explicit override). Raise DRIVER_COUNT, shorten LANE_E_SITES, or lower LANE_E_PUB_CONTAINERS_PER_SITE — a driver that cannot offer the rate makes the rung look like a broker limit"
+	fi
+	if [ "$cap_rung" -ne 0 ]; then
+		{
+			echo ""
+			echo "  QoS $LANE_E_QOS: from the ${cap_rung}-site rung each broker carries ~$cap_inflight publishes"
+			echo "  whose ack is gated on durability, against PENDING_PUBLISH_CAP=$LANE_E_PENDING_PUBLISH_CAP."
+			echo "  At the cap the OLDEST pending publish is evicted with its ack withheld, so the"
+			echo "  publisher retries: throughput falls and mqttd_publish_dropped_total{reason=\"pending-cap\"}"
+			echo "  moves. That is the broker's bound, not the driver's — the rung is still run, and any"
+			echo "  rung whose counter moves is flagged PENDING-CAP rather than read as capacity."
+		} >>"$OUT/laneE/shape.txt"
+		warn "lane E: the ${cap_rung}-site rung is predicted to reach PENDING_PUBLISH_CAP (~$cap_inflight per broker vs $LANE_E_PENDING_PUBLISH_CAP) — see laneE/shape.txt"
 	fi
 	say "[$N nodes] lane E shape (kept as laneE/shape.txt):"
 	sed 's/^/    /' "$OUT/laneE/shape.txt" >&2
@@ -1733,7 +1816,7 @@ lane_e_rung() { # lane_e_rung <sites> [repeat-index] [is-control]
 			# these tenants rather than one big shared subscription: a publish for
 			# site 3 is selected among site 3's consumers only.
 			filter="\$share/site$s/site/$s/#"
-			subs[sdi]+="$DOCKER_RUN --name sub-s$s-$j $BENCH_IMG sub -h $hosts -p $port -c $subs_per_c -R $LANE_E_CONNECT_RATE -t '$filter' -q $LANE_E_SUB_QOS $active --payload-hdrs ts --prometheus --restapi $((port_base + portn[sdi])) >/dev/null"$'\n'
+			subs[sdi]+="$DOCKER_RUN --name sub-s$s-$j $BENCH_IMG sub -h $hosts -p $port -V $LANE_E_PROTO -c $subs_per_c -R $LANE_E_CONNECT_RATE -t '$filter' -q $LANE_E_SUB_QOS $active --payload-hdrs ts --prometheus --restapi $((port_base + portn[sdi])) >/dev/null"$'\n'
 			scrape[sdi]+="printf '\\n@@@ sub-s$s-$j\\n'; curl -s -m 10 http://localhost:$((port_base + portn[sdi]))/metrics"$'\n'
 			stop[sdi]+="printf '\\n@@@ sub-s$s-$j\\n'; docker logs sub-s$s-$j 2>&1"$'\n'
 			subdump[sdi]+="printf '\\n@@@ sub-s$s-$j\\n'; docker logs sub-s$s-$j 2>&1"$'\n'
@@ -1749,7 +1832,7 @@ lane_e_rung() { # lane_e_rung <sites> [repeat-index] [is-control]
 			# it — the same reason lane B does it (ADR 0048 §2: the topic count must
 			# not change with fleet shape).
 			seq_base=$((j * pubs_per_c))
-			pubs[sdi]+="$DOCKER_RUN --name pub-s$s-$j $BENCH_IMG pub -h $hosts -p $port -c $pubs_per_c -R $LANE_E_CONNECT_RATE -t 'site/$s/%i' -q $LANE_E_QOS -s $LANE_E_PAYLOAD $active -n $seq_base -I $interval --payload-hdrs ts >/dev/null"$'\n'
+			pubs[sdi]+="$DOCKER_RUN --name pub-s$s-$j $BENCH_IMG pub -h $hosts -p $port -V $LANE_E_PROTO -c $pubs_per_c -R $LANE_E_CONNECT_RATE -t 'site/$s/%i' -q $LANE_E_QOS -s $LANE_E_PAYLOAD $active -n $seq_base -I $interval --payload-hdrs ts >/dev/null"$'\n'
 			stop[sdi]+="printf '\\n@@@ pub-s$s-$j\\n'; docker logs pub-s$s-$j 2>&1"$'\n'
 			names[sdi]+=" pub-s$s-$j"
 			pubnames[sdi]+=" pub-s$s-$j"
@@ -1867,6 +1950,72 @@ lane_e_rung() { # lane_e_rung <sites> [repeat-index] [is-control]
 		sleep "$LANE_E_DRAIN_POLL"
 		settle_waited=$((settle_waited + LANE_E_DRAIN_POLL))
 	done
+	# ── the steady-state gate: is the broker KEEPING UP at this offer? ───────
+	# Connected is not the same as caught up. The publishers have been running
+	# through the whole connect ramp, so by the time the population is complete
+	# the broker may owe a backlog — and a window opened on top of it measures
+	# the repayment, not the rung (2026-09-18: 372,025 messages owed at 4 sites,
+	# a p99 of <=7500ms that belonged to the ramp, and a broker that then held
+	# the full offer for 55s).
+	#
+	# Steady is a BAND, not a floor: below it the broker is falling behind, above
+	# it the broker is repaying what it owes. Only inside the band is the rung
+	# the thing being measured.
+	local steady=no steady_s=0 steady_reason=none
+	local offer_total=$((sites * LANE_E_SITE_RATE))
+	local band=$((offer_total * LANE_E_STEADY_PCT / 100))
+	if [ "$settled" = yes ]; then
+		# Divide by the time that ACTUALLY passed, never by the poll interval.
+		# `lane_e_recv_total` is an ssh fan-out over every driver and takes the
+		# better part of a second, so `delta / LANE_E_DRAIN_POLL` reads high by
+		# whatever the scrape cost — 13% on the first attempt (67,986 against a
+		# 60,000 offer on a rung that was in fact holding it exactly), which put
+		# every rung permanently outside the band and called a healthy broker
+		# "still repaying".
+		# MILLISECONDS, not seconds. `date +%s` rounds a 5.7s poll to 5 or 6,
+		# which is a 10% error on the rate — wider than the band itself, so the
+		# gate would flap in and out for reasons that have nothing to do with the
+		# broker. The window stamps already use %s%3N for the same reason.
+		# The budget counts MILLISECONDS too. Accumulating `elapsed_ms / 1000`
+		# adds nothing at all when a poll takes under a second, so the budget
+		# never expires and the gate spins forever — which is exactly what a
+		# faked, instant `sleep` produces, and it hung the test suite.
+		local prev_recv cur_recv flat=0 waited=0 waited_ms=0 rate delta prev_ms cur_ms elapsed_ms
+		prev_recv=$(lane_e_recv_total)
+		prev_ms=$(date +%s%3N)
+		while :; do
+			sleep "$LANE_E_DRAIN_POLL"
+			cur_recv=$(lane_e_recv_total)
+			cur_ms=$(date +%s%3N)
+			elapsed_ms=$((cur_ms - prev_ms))
+			[ "$elapsed_ms" -gt 0 ] || elapsed_ms=1
+			waited_ms=$((waited_ms + elapsed_ms))
+			waited=$((waited_ms / 1000))
+			rate=$(((cur_recv - prev_recv) * 1000 / elapsed_ms))
+			prev_recv="$cur_recv"
+			prev_ms="$cur_ms"
+			delta=$((rate - offer_total))
+			[ "$delta" -ge 0 ] || delta=$((-delta))
+			if [ "$delta" -le "$band" ]; then
+				flat=$((flat + 1))
+				if [ "$flat" -ge "$LANE_E_STEADY_POLLS" ]; then
+					steady=yes
+					steady_s="$waited"
+					break
+				fi
+			else
+				flat=0
+				[ "$rate" -ge "$offer_total" ] && steady_reason=repaying || steady_reason=behind
+			fi
+			[ "$waited_ms" -lt $((LANE_E_STEADY_BUDGET * 1000)) ] || {
+				steady_s="$waited"
+				warn "lane E: rung $sites never reached steady state — delivery was still $steady_reason after ${waited}s (last ${rate} msg/s against an offer of ${offer_total}). The rung is measured and flagged NOT STEADY: at this offer the broker either cannot keep up, or is still repaying what the ramp owed"
+				break
+			}
+		done
+		[ "$steady" != yes ] || say "  [$N nodes] lane E: rung $sites reached steady state after ${steady_s}s (delivery within ${LANE_E_STEADY_PCT}% of ${offer_total} msg/s for $LANE_E_STEADY_POLLS polls)"
+	fi
+
 	# ── ONE window for every side of the rung ────────────────────────────────
 	# The consumer histograms were always baselined here, but the broker counters
 	# were read before the consumers even started and after the drain, and the CPU
@@ -2055,7 +2204,7 @@ lane_e_rung() { # lane_e_rung <sites> [repeat-index] [is-control]
 	fi
 	rm -rf "$rdir/.batch"
 	snapshot_metrics_complete "$rdir" after
-	echo "sites=$sites offered=$((sites * LANE_E_SITE_RATE)) publishers=$((sites * LANE_E_PUBS_PER_SITE)) consumers=$((sites * LANE_E_SUBS_PER_SITE)) per_consumer=$((LANE_E_SITE_RATE / LANE_E_SUBS_PER_SITE)) p99_budget_ms=$LANE_E_P99_BUDGET_MS qos=$LANE_E_QOS sub_qos=$LANE_E_SUB_QOS window_secs=$LANE_E_SECS window=aligned cpu_window=$cpu_window settle_s=$((LANE_E_SETTLE + settle_waited)) settled=$settled settled_conns=$settled_conns expected_conns=$expect_conns drained=$drained drain_secs=$drain_secs drain_deadline_s=$LANE_E_DRAIN_SECS control=$is_control reset=$reset reset_conns=$reset_conns" >"$rdir/rung.txt"
+	echo "sites=$sites offered=$((sites * LANE_E_SITE_RATE)) publishers=$((sites * LANE_E_PUBS_PER_SITE)) consumers=$((sites * LANE_E_SUBS_PER_SITE)) per_consumer=$((LANE_E_SITE_RATE / LANE_E_SUBS_PER_SITE)) p99_budget_ms=$LANE_E_P99_BUDGET_MS qos=$LANE_E_QOS sub_qos=$LANE_E_SUB_QOS window_secs=$LANE_E_SECS window=aligned cpu_window=$cpu_window settle_s=$((LANE_E_SETTLE + settle_waited)) settled=$settled settled_conns=$settled_conns expected_conns=$expect_conns steady=$steady steady_s=$steady_s steady_reason=$steady_reason drained=$drained drain_secs=$drain_secs drain_deadline_s=$LANE_E_DRAIN_SECS control=$is_control reset=$reset reset_conns=$reset_conns" >"$rdir/rung.txt"
 	say "  lane E: $sites site(s) done ($((sites * LANE_E_SITE_RATE)) msg/s offered)"
 }
 # ── the forwarding positive control (#482 Option B) ──────────────────────────
@@ -2090,11 +2239,11 @@ lane_e_forward_canary() {
 		rssh "$(broker_pub_ip "$i")" "curl -s -m 10 http://localhost:8080/metrics" \
 			>"$rdir_res/baseline-broker$i.prom" 2>>"$rdir_res/ssh.log" || true
 	done
-	say "[$N nodes] lane E: forwarding positive control — $LANE_E_FORWARD_CANARY_COUNT QoS 0 msgs per directed broker pair, from driver 0"
+	say "[$N nodes] lane E: forwarding positive control — $LANE_E_FORWARD_CANARY_COUNT QoS $LANE_E_QOS msgs per directed broker pair, from driver 0"
 	# `timeout` is a backstop for a wedged interpreter, not the budget: the canary
 	# enforces LANE_E_FORWARD_CANARY_TIMEOUT itself and still emits its evidence.
 	rssh "$(driver_pub_ip 0)" \
-		"timeout $((LANE_E_FORWARD_CANARY_TIMEOUT + 60)) python3 - run ${brokers[*]} --count $LANE_E_FORWARD_CANARY_COUNT --timeout $LANE_E_FORWARD_CANARY_TIMEOUT" \
+		"timeout $((LANE_E_FORWARD_CANARY_TIMEOUT + 60)) python3 - run ${brokers[*]} --count $LANE_E_FORWARD_CANARY_COUNT --timeout $LANE_E_FORWARD_CANARY_TIMEOUT --qos $LANE_E_QOS" \
 		<"$SCALE_DIR/forward-canary.py" >"$cdir/run.stdout" 2>>"$cdir/run.stderr" || rc=$?
 	batch_split "$cdir" "" "$cdir/run.stdout"
 	# The process that passed the control is the process every rung must still be
