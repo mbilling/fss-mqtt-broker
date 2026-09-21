@@ -1111,6 +1111,30 @@ if [[ "$LANES" == *E* ]]; then
 	if [ -s "$OUT/laneE/budgets-violations.txt" ]; then
 		sed 's/^/    /' "$OUT/laneE/budgets-violations.txt" >&2
 	fi
+    # A knee search needs finer rungs than a SITE (30,000 msg/s at the campaign's
+    # 3,000 publishers x 10 msg/s). Shortening the interval cannot help: the rate
+    # must divide evenly and the interval is integer milliseconds, so 10 msg/s
+    # steps to 20. Stepping the PUBLISHER COUNT at fixed pacing gives any
+    # granularity the cap allows — 200 publishers/site is 10,000 msg/s at 5 sites
+    # — and keeps per-publisher pacing identical to every other rung, which is
+    # what makes the numbers comparable across the campaign.
+    if [ -n "${LANE_E_PUBS_STEPS:-}" ]; then
+        read -r -a E_PUBS_STEPS <<<"$LANE_E_PUBS_STEPS"
+        [ "${#E_PUBS_STEPS[@]}" -eq "${#LANE_E_SITES[@]}" ] || die "lane E: LANE_E_PUBS_STEPS must have one entry per rung (${#E_PUBS_STEPS[@]} vs ${#LANE_E_SITES[@]})"
+        e_pubs_default=$LANE_E_PUBS_PER_SITE
+        e_rate_default=$LANE_E_SITE_RATE
+        e_per_pub=$((LANE_E_SITE_RATE / LANE_E_PUBS_PER_SITE))
+        for e_step in "${!E_PUBS_STEPS[@]}"; do
+            positive_int "LANE_E_PUBS_STEPS[$e_step]" "${E_PUBS_STEPS[e_step]}"
+            LANE_E_PUBS_PER_SITE=${E_PUBS_STEPS[e_step]}
+            LANE_E_SITE_RATE=$((LANE_E_PUBS_PER_SITE * e_per_pub))
+            lane_e_shape
+            cp "$OUT/laneE/shape.txt" "$OUT/laneE/shape-pubs-$e_step.txt"
+        done
+        LANE_E_PUBS_PER_SITE=$e_pubs_default
+        LANE_E_SITE_RATE=$e_rate_default
+        printf '%s\n' "$LANE_E_PUBS_STEPS" >"$OUT/laneE/pubs-steps.txt"
+    fi
     if [ -n "${LANE_E_PUB_CONTAINER_STEPS:-}" ]; then
         read -r -a E_PUB_STEPS <<<"$LANE_E_PUB_CONTAINER_STEPS"
         [ "${#E_PUB_STEPS[@]}" -eq "${#LANE_E_SITES[@]}" ] || die "publisher-container steps must match site ladder length"
@@ -2651,7 +2675,15 @@ for e_sites in "${LANE_E_SITES[@]}"; do
     if [ "${#e_seen[@]}" -eq "${#LANE_E_SITES[@]}" ] && [ -n "${LANE_E_HOLD_LAST_SECS:-}" ]; then
         LANE_E_SECS=$LANE_E_HOLD_LAST_SECS
     fi
+    e_pubs_keep=$LANE_E_PUBS_PER_SITE
+    e_rate_keep=$LANE_E_SITE_RATE
+    if [ -n "${LANE_E_PUBS_STEPS:-}" ]; then
+        LANE_E_PUBS_PER_SITE=${E_PUBS_STEPS[${#e_seen[@]}-1]}
+        LANE_E_SITE_RATE=$((LANE_E_PUBS_PER_SITE * (e_rate_keep / e_pubs_keep)))
+    fi
 	lane_e_rung "$e_sites" "$e_rep" no "${E_PUB_STEPS[${#e_seen[@]}-1]:-$LANE_E_PUB_CONTAINERS_PER_SITE}"
+    LANE_E_PUBS_PER_SITE=$e_pubs_keep
+    LANE_E_SITE_RATE=$e_rate_keep
     LANE_E_SECS=$e_normal_secs
 done
 # The control repeats the BOTTOM rung — the lowest load the ladder offered, and
@@ -2665,6 +2697,12 @@ if [ "$LANE_E_CONTROL" = 1 ] && [ "${#LANE_E_SITES[@]}" -gt 1 ]; then
 		[ "$e_prev" = "$e_control" ] && e_rep=$((e_rep + 1))
 	done
 	say "[$N nodes] lane E: CONTROL — repeating the $e_control-site rung to test whether the cluster still does what it did before the ladder"
+    if [ -n "${LANE_E_PUBS_STEPS:-}" ]; then
+        e_pubs_keep=$LANE_E_PUBS_PER_SITE
+        e_rate_keep=$LANE_E_SITE_RATE
+        LANE_E_PUBS_PER_SITE=${E_PUBS_STEPS[0]}
+        LANE_E_SITE_RATE=$((LANE_E_PUBS_PER_SITE * (e_rate_keep / e_pubs_keep)))
+    fi
 	lane_e_rung "$e_control" "$e_rep" yes "${E_PUB_STEPS[0]:-$LANE_E_PUB_CONTAINERS_PER_SITE}"
 fi
 fi # LANES *E*

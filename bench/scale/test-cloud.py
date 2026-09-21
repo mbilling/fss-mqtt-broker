@@ -503,6 +503,38 @@ with_cpu_sampling "$3" work
         self.assertNotIn("PENDING_PUBLISH_CAP",
                          (out / "results/nodes=3/laneE/shape.txt").read_text())
 
+    def test_lane_e_steps_the_publisher_count_for_a_fine_knee_search(self):
+        """A SITE is 30,000 msg/s, far too coarse to place a knee, and the
+        interval cannot help: rates must divide evenly into integer milliseconds,
+        so 10 msg/s steps straight to 20. Stepping publishers at fixed pacing
+        gives 10,000 msg/s rungs — 200 publishers/site over 5 sites."""
+        inventory = self.root / "pubs-inv.json"
+        inventory.write_text(json.dumps({"brokers": [{}] * 5, "drivers": [{"vcpus": 16}] * 11}))
+        out = self.root / "pubs-steps"
+        common = dict(LANES="E", SHAPE_ONLY="1", LANE_E_QOS="1", LANE_E_SUB_QOS="1",
+                      LANE_E_PUBS_PER_SITE="4000", LANE_E_SITE_RATE="40000",
+                      LANE_E_SUBS_PER_SITE="10", LANE_E_PLACEMENT="container",
+                      LANE_E_PUB_CONTAINERS_PER_SITE="4", LANE_E_SUB_CONTAINERS_PER_SITE="2",
+                      LANE_E_SITES_OVERRIDE="5 5 5")
+        r = self.run_script("run-curve.sh", str(out), str(inventory),
+                            LANE_E_PUBS_STEPS="3600 3800 4000", **common)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        lane = out / "results/nodes=5/laneE"
+        self.assertEqual(len(list(lane.glob("shape-pubs-*.txt"))), 3)
+        # Pacing is IDENTICAL across the rungs — only the population changes.
+        for step, (pubs, offered) in enumerate([(3600, 180000), (3800, 190000), (4000, 200000)]):
+            shape = (lane / f"shape-pubs-{step}.txt").read_text()
+            self.assertIn(f"site = {pubs} publishers x 10 msg/s", shape)
+            self.assertIn(f"{offered}", shape)
+        self.assertEqual((lane / "pubs-steps.txt").read_text().strip(), "3600 3800 4000")
+
+        # One entry per rung, or the ladder and the steps have drifted apart.
+        bad = self.run_script("run-curve.sh", str(self.root / "pubs-bad"), str(inventory),
+                              LANE_E_PUBS_STEPS="3600 3800", **common)
+        self.assertNotEqual(bad.returncode, 0)
+        self.assertIn("one entry per rung", bad.stderr)
+        self.assertEqual(self.calls(), [])
+
     def test_lane_e_pins_the_mqtt_protocol_version(self):
         # v5 is the only version where the broker enforces Receive Maximum on
         # QoS 1 (DISCONNECT 0x93). emqtt-bench 0.6.3 defaults to 5 today, so

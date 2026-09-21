@@ -77,6 +77,23 @@ HiveMQ CE  2024.3   ████████████████████
 5 nodes █████████████████████████████████  13.9k         p99 56 ms   1.63× one node
 ```
 
+**Cluster scale-out, QoS 1 shared subscriptions** (clean sessions, at-least-once
+both ways — no durable session, so this is the routing path, not the fsync one):
+
+```text
+3 nodes ██████████████████████░░░░░░░░░░░  120k msg/s   p99 ≤ 5 ms   40.0k/node
+5 nodes █████████████████████████████████  180k         p99 ≤ 5 ms   36.0k/node
+```
+
+Three repetitions plus a passing control at each size, delivery matching offer to
+within 2 msg/s, 144M message identities reconciled with zero lost. **Both are
+floors, not knees** — broker cores idled at both, and the load generator was the
+busiest thing in the fleet. 3 → 5 nodes is 90% of linear. One honest caveat
+worth more than the numbers: the same 180k passed three times on one fleet and
+**failed on another** (6.6% late) on identical configuration — cloud hosts are
+not interchangeable. Full method, every rung, and the failed run:
+[QOS1-SCALE-CURVE.md](docs/benchmarks/QOS1-SCALE-CURVE.md).
+
 | more published points | |
 |---|---|
 | `$share` fan-out floor, 1 → 3 → 5 nodes | ~18.6k → ~53.9k → ~81.4k msg/s (driver-limited) |
