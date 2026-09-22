@@ -81,9 +81,16 @@ HiveMQ CE  2024.3   ████████████████████
 both ways — no durable session, so this is the routing path, not the fsync one):
 
 ```text
-3 nodes ██████████████████████░░░░░░░░░░░  120k msg/s   p99 ≤ 5 ms   40.0k/node
-5 nodes █████████████████████████████████  180k         p99 ≤ 5 ms   36.0k/node
+3 nodes ██████████████████████░░░░░░░░░░░  120k msg/s   25.9 MB/s   p99 ≤ 5 ms   40.0k/node
+5 nodes █████████████████████████████████  180k         38.9 MB/s   p99 ≤ 5 ms   36.0k/node
 ```
+
+MB/s is application payload (216 B/message). **The constraint is CPU per message,
+not bytes** — measured: holding 60,000 msg/s and growing the payload to 8 KiB
+reached **492 MB/s** (1,576 Mbit/s per node) with the hot core at 50%, a 38×
+increase in bytes for 13 points of CPU. So **small messages are the expensive
+case** — size a cluster on messages per second, not megabytes. 492 MB/s is a
+floor; nothing was saturated there.
 
 Three repetitions plus a passing control at each size, delivery matching offer to
 within 2 msg/s, 144M message identities reconciled with zero lost. 3 → 5 nodes is

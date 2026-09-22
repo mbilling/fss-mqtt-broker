@@ -1135,6 +1135,22 @@ if [[ "$LANES" == *E* ]]; then
         LANE_E_SITE_RATE=$e_rate_default
         printf '%s\n' "$LANE_E_PUBS_STEPS" >"$OUT/laneE/pubs-steps.txt"
     fi
+    # The message-rate knee is per-message CPU; the PAYLOAD knee is bytes. They are
+    # different limits and a rung can only find one at a time, so the payload
+    # steps hold the message rate fixed and grow the message instead.
+    if [ -n "${LANE_E_PAYLOAD_STEPS:-}" ]; then
+        read -r -a E_PAYLOAD_STEPS <<<"$LANE_E_PAYLOAD_STEPS"
+        [ "${#E_PAYLOAD_STEPS[@]}" -eq "${#LANE_E_SITES[@]}" ] || die "lane E: LANE_E_PAYLOAD_STEPS must have one entry per rung (${#E_PAYLOAD_STEPS[@]} vs ${#LANE_E_SITES[@]})"
+        e_payload_default=$LANE_E_PAYLOAD
+        for e_step in "${!E_PAYLOAD_STEPS[@]}"; do
+            positive_int "LANE_E_PAYLOAD_STEPS[$e_step]" "${E_PAYLOAD_STEPS[e_step]}"
+            LANE_E_PAYLOAD=${E_PAYLOAD_STEPS[e_step]}
+            lane_e_shape
+            cp "$OUT/laneE/shape.txt" "$OUT/laneE/shape-payload-$e_step.txt"
+        done
+        LANE_E_PAYLOAD=$e_payload_default
+        printf '%s\n' "$LANE_E_PAYLOAD_STEPS" >"$OUT/laneE/payload-steps.txt"
+    fi
     if [ -n "${LANE_E_PUB_CONTAINER_STEPS:-}" ]; then
         read -r -a E_PUB_STEPS <<<"$LANE_E_PUB_CONTAINER_STEPS"
         [ "${#E_PUB_STEPS[@]}" -eq "${#LANE_E_SITES[@]}" ] || die "publisher-container steps must match site ladder length"
@@ -2382,7 +2398,15 @@ p=Path(sys.argv[1])
 for ep in json.loads((p/'manifest.json').read_text())['endpoints']:
  if ep['role']!='pub':continue
  vals={r.split()[0]:float(r.split()[1]) for r in (p/(ep['name']+'-terminal.prom')).read_text().splitlines() if r and not r.startswith('#') and len(r.split())==2}
- if vals.get('audit_paused_workers')!=ep['clients'] or vals.get('audit_sent')!=vals.get('audit_acked'):sys.exit(1)
+ # Against what CONNECTED, not what was asked for: a client that never
+ # established has no publish to complete, so demanding it pause is demanding
+ # the impossible. The settle gate already flags an incomplete population as
+ # UNSETTLED, which is what disqualifies the rung as a capacity figure —
+ # killing the whole RUN here instead loses the rungs that were fine.
+ # Measured 2026-09-22: one container had 27 connect failures of 750, so 723
+ # connected and 723 paused, and a five-rung payload sweep died on rung one.
+ live=vals.get('connect_succ',ep['clients'])
+ if vals.get('audit_paused_workers')!=live or vals.get('audit_sent')!=vals.get('audit_acked'):sys.exit(1)
 PAUSED
             then all_paused=yes; break; fi
             sleep 1
@@ -2675,6 +2699,8 @@ for e_sites in "${LANE_E_SITES[@]}"; do
     if [ "${#e_seen[@]}" -eq "${#LANE_E_SITES[@]}" ] && [ -n "${LANE_E_HOLD_LAST_SECS:-}" ]; then
         LANE_E_SECS=$LANE_E_HOLD_LAST_SECS
     fi
+    e_payload_keep=$LANE_E_PAYLOAD
+    [ -z "${LANE_E_PAYLOAD_STEPS:-}" ] || LANE_E_PAYLOAD=${E_PAYLOAD_STEPS[${#e_seen[@]}-1]}
     e_pubs_keep=$LANE_E_PUBS_PER_SITE
     e_rate_keep=$LANE_E_SITE_RATE
     if [ -n "${LANE_E_PUBS_STEPS:-}" ]; then
@@ -2684,6 +2710,7 @@ for e_sites in "${LANE_E_SITES[@]}"; do
 	lane_e_rung "$e_sites" "$e_rep" no "${E_PUB_STEPS[${#e_seen[@]}-1]:-$LANE_E_PUB_CONTAINERS_PER_SITE}"
     LANE_E_PUBS_PER_SITE=$e_pubs_keep
     LANE_E_SITE_RATE=$e_rate_keep
+    LANE_E_PAYLOAD=$e_payload_keep
     LANE_E_SECS=$e_normal_secs
 done
 # The control repeats the BOTTOM rung — the lowest load the ladder offered, and
@@ -2697,6 +2724,7 @@ if [ "$LANE_E_CONTROL" = 1 ] && [ "${#LANE_E_SITES[@]}" -gt 1 ]; then
 		[ "$e_prev" = "$e_control" ] && e_rep=$((e_rep + 1))
 	done
 	say "[$N nodes] lane E: CONTROL — repeating the $e_control-site rung to test whether the cluster still does what it did before the ladder"
+    [ -z "${LANE_E_PAYLOAD_STEPS:-}" ] || LANE_E_PAYLOAD=${E_PAYLOAD_STEPS[0]}
     if [ -n "${LANE_E_PUBS_STEPS:-}" ]; then
         e_pubs_keep=$LANE_E_PUBS_PER_SITE
         e_rate_keep=$LANE_E_SITE_RATE

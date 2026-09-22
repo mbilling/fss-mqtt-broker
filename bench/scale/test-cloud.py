@@ -535,6 +535,36 @@ with_cpu_sampling "$3" work
         self.assertIn("one entry per rung", bad.stderr)
         self.assertEqual(self.calls(), [])
 
+    def test_lane_e_steps_the_payload_for_a_byte_throughput_knee(self):
+        """The message-rate knee is per-message CPU; the payload knee is bytes.
+        A rung can only find one at a time, so these steps hold the rate fixed
+        and grow the message. 60,000 msg/s at 200 B is 12 MB/s; at 8 KiB it is
+        492 MB/s of payload, which is a link question rather than a CPU one."""
+        inventory = self.root / "payload-inv.json"
+        inventory.write_text(json.dumps({"brokers": [{}] * 5, "drivers": [{"vcpus": 16}] * 11}))
+        out = self.root / "payload-steps"
+        common = dict(LANES="E", SHAPE_ONLY="1", LANE_E_QOS="1", LANE_E_SUB_QOS="1",
+                      LANE_E_PUBS_PER_SITE="3000", LANE_E_SUBS_PER_SITE="10",
+                      LANE_E_PLACEMENT="container", LANE_E_PUB_CONTAINERS_PER_SITE="4",
+                      LANE_E_SUB_CONTAINERS_PER_SITE="2", LANE_E_SITES_OVERRIDE="2 2 2 2")
+        r = self.run_script("run-curve.sh", str(out), str(inventory),
+                            LANE_E_PAYLOAD_STEPS="200 1024 4096 8192", **common)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        lane = out / "results/nodes=5/laneE"
+        self.assertEqual(len(list(lane.glob("shape-payload-*.txt"))), 4)
+        # The message rate is IDENTICAL across the rungs — only the size changes.
+        for step, size in enumerate([200, 1024, 4096, 8192]):
+            shape = (lane / f"shape-payload-{step}.txt").read_text()
+            self.assertIn(f"x {size}B qos 1", shape)
+            self.assertIn("3000 publishers x 10 msg/s", shape)
+        self.assertEqual((lane / "payload-steps.txt").read_text().strip(), "200 1024 4096 8192")
+
+        bad = self.run_script("run-curve.sh", str(self.root / "payload-bad"), str(inventory),
+                              LANE_E_PAYLOAD_STEPS="200 1024", **common)
+        self.assertNotEqual(bad.returncode, 0)
+        self.assertIn("one entry per rung", bad.stderr)
+        self.assertEqual(self.calls(), [])
+
     def test_lane_e_pins_the_mqtt_protocol_version(self):
         # v5 is the only version where the broker enforces Receive Maximum on
         # QoS 1 (DISCONNECT 0x93). emqtt-bench 0.6.3 defaults to 5 today, so

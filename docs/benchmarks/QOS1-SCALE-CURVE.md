@@ -35,10 +35,19 @@ is the limit**, and 180,000 msg/s at 5 nodes is at it, not below it. See
 
 ## The curve
 
-| nodes | qualified load | per node | repetitions | median received | range | late | p99 upper bound |
-|---:|---:|---:|---:|---:|---|---:|---|
-| 3 | **120,000 msg/s** | 40,000 | 3 + control | 120,000.4/s | 119,999.2 – 120,001.7 | 0.001 % | ≤ 5 ms ± 5.2 ms clock |
-| 5 | **180,000 msg/s** | 36,000 | 3 + control | 180,001.3/s | 179,999.8 – 180,001.6 | 0.001 % | ≤ 5 ms ± 6.5 ms clock |
+| nodes | qualified load | payload throughput | per node | repetitions | median received | late | p99 upper bound |
+|---:|---:|---:|---:|---:|---:|---:|---|
+| 3 | **120,000 msg/s** | **25.9 MB/s** | 40,000/s · 8.64 MB/s | 3 + control | 120,000.4/s | 0.001 % | ≤ 5 ms ± 5.2 ms clock |
+| 5 | **180,000 msg/s** | **38.9 MB/s** | 36,000/s · 7.78 MB/s | 3 + control | 180,001.3/s | 0.001 % | ≤ 5 ms ± 6.5 ms clock |
+
+Throughput is application payload: 216 bytes per message (a 200-byte body plus
+16 bytes of timestamp and sequence the audit driver appends so every identity can
+be reconciled). On the wire each publish is ~237 bytes once the topic and MQTT 5
+framing are counted, so ingress is 28.4 and 42.7 MB/s — 228 and 341 Mbit/s — and
+roughly doubles again as each message is delivered to its shared-group member.
+
+**The constraint is CPU per message, not bytes** — measured, not assumed. See
+[Payload size is nearly free](#payload-size-is-nearly-free).
 
 **Scaling 3 → 5 nodes is 1.5× the load on 1.67× the nodes — 90 % of linear.**
 The missing 10 % is the broker, and it is explained below: per-node capacity
@@ -90,6 +99,38 @@ merely adequate on one draw is not adequate on the next.
 
 Read the curve accordingly: these are loads mqttd **has carried under audit**,
 not loads it will carry on every machine you rent.
+
+## Payload size is nearly free
+
+Holding the message rate at 60,000/s and growing the message instead, on the same
+5-node cluster (2026-09-22). Every rung passed, including the largest:
+
+| payload | per message | payload throughput | per node, in + out | busiest broker core | driver | p99 |
+|---:|---:|---:|---:|---:|---:|---|
+| 200 B | 216 B | 13.0 MB/s | 41 Mbit/s | 37.3 % | 30.3 % | ≤ 1 ms |
+| 1 KiB | 1,040 B | 62.4 MB/s | 200 Mbit/s | 43.3 % | 38.6 % | ≤ 1 ms |
+| 2 KiB | 2,064 B | 123.8 MB/s | 396 Mbit/s | 51.6 % | 38.7 % | ≤ 1 ms |
+| 4 KiB | 4,112 B | 246.7 MB/s | 790 Mbit/s | 53.3 % | 29.7 % | ≤ 1 ms |
+| **8 KiB** | 8,208 B | **492.5 MB/s** | **1,576 Mbit/s** | **50.2 %** | 34.2 % | ≤ 5 ms |
+| 200 B (control) | 216 B | 13.0 MB/s | 41 Mbit/s | 44.5 % | 31.9 % | ≤ 1 ms |
+
+**A 38× increase in bytes cost 13 points of CPU**, and the hot core did not trend
+upward at all past 2 KiB — 53.3 % at 4 KiB, 50.2 % at 8 KiB. Per-message cost
+dominates so completely that payload size is close to free.
+
+Two things this settles, and one it does not:
+
+- **mqttd's QoS 1 ceiling is a message rate, not a bandwidth.** At 200 B, five
+  nodes carry 180,000 msg/s = 38.9 MB/s and one core is saturated. At 8 KiB the
+  same cluster carries **at least 492 MB/s** at a third of the message rate with
+  that core half idle.
+- **Small messages are the expensive case.** A fleet-telemetry workload of
+  200-byte readings is far harder on this broker than a firmware-blob workload
+  moving twelve times the bytes. Size a cluster on messages per second, not on
+  megabytes per second.
+- **492 MB/s is a floor, not a knee.** Nothing was saturated at 8 KiB — not the
+  core, not the drivers, not the network, which carried 1,576 Mbit/s per node
+  without complaint. Where the byte ceiling actually is remains unmeasured.
 
 ## The limit is one core
 
