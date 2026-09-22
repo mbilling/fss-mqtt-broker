@@ -7,11 +7,10 @@ tenant site. Measured by `bench/scale/run.sh`, certified by
 `bench/scale/lane-e-evidence.py`, reported by
 `bench/scale/qos1-campaign/report.py`.
 
-**Corrected 2026-09-22.** An earlier revision of this document called both
-numbers floors and said broker cores were nowhere near saturated. That was
-wrong, and the correction is the most useful thing here: **a single broker core
-is the limit**, and 180,000 msg/s at 5 nodes is at it, not below it. See
-[The limit is one core](#the-limit-is-one-core).
+**Corrected twice, 2026-09-22.** These numbers are what the *rig* carried. The
+limit is one core of the broker host saturating on **network interrupt
+handling** — mqttd's own hot path had ~2× headroom at the knee. See
+[The limit is one core — and it is the kernel's, not mqttd's](#the-limit-is-one-core--and-it-is-the-kernels-not-mqttds).
 
 ## Read this first
 
@@ -50,9 +49,9 @@ roughly doubles again as each message is delivered to its shared-group member.
 [Payload size is nearly free](#payload-size-is-nearly-free).
 
 **Scaling 3 → 5 nodes is 1.5× the load on 1.67× the nodes — 90 % of linear.**
-The missing 10 % is the broker, and it is explained below: per-node capacity
-*falls* as the cluster grows, because cross-node delivery lands on the same
-single core that is already the ceiling.
+Per-node capacity *falls* as the cluster grows, because cross-node delivery means
+more packets per message and they land on the one core already saturating on
+interrupt handling.
 
 Delivery matched offer to within 2 msg/s at every rung of both runs.
 **53,607,265** and **90,825,125** unique message identities were reconciled,
@@ -132,40 +131,61 @@ Two things this settles, and one it does not:
   core, not the drivers, not the network, which carried 1,576 Mbit/s per node
   without complaint. Where the byte ceiling actually is remains unmeasured.
 
-## The limit is one core
+## The limit is one core — and it is the kernel's, not mqttd's
 
-mqttd's QoS 1 hot path is single-threaded per node. On a 4-vCPU broker one core
-runs 20–30 points busier than the other three, and its occupancy tracks the load
-that node carries:
+**Corrected twice.** The first revision said broker cores idled. The second said
+one core was saturated and inferred mqttd's QoS 1 hot path was single-threaded.
+Both were wrong, and this is what the evidence actually shows.
 
-| nodes | per node | busiest broker core | other three | rung |
-|---:|---:|---:|---|---|
-| 3 | 10,000/s | 33 % | — | PASS |
-| 3 | 20,000/s | 66 % | — | PASS |
-| 3 | **40,000/s** | **87 %** | — | PASS |
-| 5 | **36,000/s** | **91 %** | 52–59 % | PASS (2026-09-20 14:57 fleet) |
-| 5 | 36,000/s | **99 %** | 61–67 % | FAIL — 5.3 % late |
-| 5 | 40,800/s | 98 % | 63–68 % | FAIL — 8.5 % late |
+One core does saturate. On a 4-vCPU broker at 180,000 msg/s it runs 91–99 % busy
+while the other three sit at 52–68 %. But the breakdown says what it is doing:
 
-Two things follow, and they matter more than either headline number.
+| | core 0 | core 1 | core 2 | core 3 |
+|---|---:|---:|---:|---:|
+| user | 26.0 % | 36.3 % | 22.6 % | 24.0 % |
+| system | 38.3 % | 7.8 % | 35.5 % | 36.4 % |
+| **softirq** | 0.5 % | **54.6 %** | 8.9 % | 0.3 % |
+| idle | 35.3 % | **1.2 %** | 33.0 % | 39.3 % |
 
-**The knee at 5 nodes is ~180,000 msg/s, and it is marginal.** The one
-provisioning that passed had that core at 91 %; two others reached 98–99 % on
-identical configuration and failed on publisher lateness. A ceiling sitting at
-91 % of one core is a ceiling you can cross by renting a slightly slower host.
+**That core is doing network packet processing**, not broker work. And mqttd's own
+hub loop — the single-threaded routing task, measured by the broker's
+`mqttd_hub_dispatch_seconds_sum` rather than by sampling CPU — is nowhere near
+its limit:
 
-**Per-node capacity FALLS as the cluster grows.** 3 nodes carry 40,000/s each
-with the hot core at 87 %; 5 nodes carry 36,000/s each and the same core is
-busier. Clustering does not divide the work evenly — a publish delivered to a
-subscriber on another node costs the hot core extra, and that cost lands on the
-resource that is already the constraint. This is why the curve is 90 % of linear
-rather than linear, and it predicts that 7 and 10 nodes will fall further behind.
+| rung | hub loop occupancy |
+|---|---|
+| 3 nodes, 120,000/s | **0.42** of one core |
+| 5 nodes, 180,000/s (passing fleet) | **0.46** |
+| 5 nodes, 180,000/s (failing fleet) | **0.53** |
+| 5 nodes, 204,000/s | **0.57** |
 
-**Throughput and schedule-keeping fail separately.** At 204,000 msg/s offered,
-the cluster *delivered* 204,006/s — the messages moved. What failed was pacing:
-8.5 % of publishes missed their own schedule because acknowledgements slowed as
-the core saturated. A broker can be moving your traffic and still be past the
-point where it acknowledges it on time.
+This agrees with [#611](https://github.com/mbilling/fss-mqtt-broker/pull/611),
+which measured the hub loop at 0.50 of a core while a 5-node cluster carried
+510,368 msg/s of QoS 0. The hub thread is not the per-node ceiling here either.
+
+**The payload sweep proves the mechanism.** Holding 60,000 msg/s and growing the
+message 38×, softirq does not move — 28.6 %, 24.4 %, 33.9 %, 32.3 %, 32.7 %
+across 13 → 492 MB/s. Per-packet kernel work, not per-byte.
+
+### What this means for the numbers above
+
+- **180,000 msg/s at 5 nodes is a ceiling for THIS RIG, and a floor for mqttd.**
+  The broker had roughly 2× headroom in its own hot path when the host's
+  interrupt handling ran out.
+- **The fix is host tuning, not a broker change** — spreading NIC interrupts
+  across cores (RSS/RPS) rather than letting one absorb them. Until that is done,
+  this curve measures the benchmark host's network stack as much as the broker.
+- **It also explains the fleet-to-fleet variance.** A ceiling set by one core's
+  interrupt handling is exactly the kind that moves when you draw a different
+  machine — which is why the same 180,000 passed on one provisioning at 91 % and
+  failed on two others at 98–99 %.
+- **Per-node capacity still falls with cluster size** (40,000/node at 3 nodes
+  against 36,000/node at 5), and the mechanism is the same: cross-node delivery
+  means more packets per message, landing on the same saturated core.
+
+**Where mqttd's own QoS 1 ceiling actually is remains unmeasured.** It is above
+180,000 msg/s at 5 nodes, and finding it needs brokers whose interrupt handling
+is spread across their cores.
 
 ## Where this stops
 

@@ -85,24 +85,23 @@ both ways — no durable session, so this is the routing path, not the fsync one
 5 nodes █████████████████████████████████  180k         38.9 MB/s   p99 ≤ 5 ms   36.0k/node
 ```
 
-MB/s is application payload (216 B/message). **The constraint is CPU per message,
-not bytes** — measured: holding 60,000 msg/s and growing the payload to 8 KiB
-reached **492 MB/s** (1,576 Mbit/s per node) with the hot core at 50%, a 38×
-increase in bytes for 13 points of CPU. So **small messages are the expensive
-case** — size a cluster on messages per second, not megabytes. 492 MB/s is a
-floor; nothing was saturated there.
+MB/s is application payload (216 B/message). **The constraint is packets, not
+bytes** — measured: holding 60,000 msg/s and growing the payload to 8 KiB reached
+**492 MB/s** (1,576 Mbit/s per node) while softirq stayed flat at 24–34% across
+the whole 38× increase. So **small messages are the expensive case** — size a
+cluster on messages per second, not megabytes. 492 MB/s is a floor; nothing was
+saturated there.
 
 Three repetitions plus a passing control at each size, delivery matching offer to
-within 2 msg/s, 144M message identities reconciled with zero lost. 3 → 5 nodes is
-90% of linear — and **the limit is a single broker core**: mqttd's QoS 1 hot path
-is single-threaded per node, so one core runs 20–30 points busier than the other
-three and saturates first (87% at 3 nodes, 91–99% at 5). Two consequences we
-publish because they change how you'd size a cluster: **per-node capacity falls
-as the cluster grows** (cross-node delivery lands on the core that is already the
-constraint), and at 5 nodes 180k is *at* that ceiling, not below it — the same
-load passed on one fleet at 91% and **failed on two others** at 98–99%. Full
-method, every rung, the per-core numbers and the failed runs:
-[QOS1-SCALE-CURVE.md](docs/benchmarks/QOS1-SCALE-CURVE.md).
+within 2 msg/s, 144M message identities reconciled with zero lost. **These are
+what the rig carried, and the rig ran out first**: one core of each broker host
+saturates on *network interrupt handling* (54.6% softirq, 1.2% idle, while its
+three siblings sit 33–39% idle), and mqttd's own hub loop was at **0.46 of a
+core** — roughly 2× headroom — measured by the broker's own dispatch metric
+rather than by sampling CPU. So 180k at 5 nodes is a floor for mqttd and a
+ceiling for these hosts; the fix is spreading NIC interrupts across cores, not a
+broker change. Full method, the per-core breakdown, and two earlier revisions of
+this claim that were wrong: [QOS1-SCALE-CURVE.md](docs/benchmarks/QOS1-SCALE-CURVE.md).
 
 | more published points | |
 |---|---|
