@@ -86,12 +86,15 @@ both ways — no durable session, so this is the routing path, not the fsync one
 ```
 
 Three repetitions plus a passing control at each size, delivery matching offer to
-within 2 msg/s, 144M message identities reconciled with zero lost. **Both are
-floors, not knees** — broker cores idled at both, and the load generator was the
-busiest thing in the fleet. 3 → 5 nodes is 90% of linear. One honest caveat
-worth more than the numbers: the same 180k passed three times on one fleet and
-**failed on another** (6.6% late) on identical configuration — cloud hosts are
-not interchangeable. Full method, every rung, and the failed run:
+within 2 msg/s, 144M message identities reconciled with zero lost. 3 → 5 nodes is
+90% of linear — and **the limit is a single broker core**: mqttd's QoS 1 hot path
+is single-threaded per node, so one core runs 20–30 points busier than the other
+three and saturates first (87% at 3 nodes, 91–99% at 5). Two consequences we
+publish because they change how you'd size a cluster: **per-node capacity falls
+as the cluster grows** (cross-node delivery lands on the core that is already the
+constraint), and at 5 nodes 180k is *at* that ceiling, not below it — the same
+load passed on one fleet at 91% and **failed on two others** at 98–99%. Full
+method, every rung, the per-core numbers and the failed runs:
 [QOS1-SCALE-CURVE.md](docs/benchmarks/QOS1-SCALE-CURVE.md).
 
 | more published points | |

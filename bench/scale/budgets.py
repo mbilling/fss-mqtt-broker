@@ -292,7 +292,11 @@ def clock_tree(b: Budgets) -> Node:
     polls the internet on chrony's own schedule, up to 1024 s. Each limit must
     cover two consecutive polls — one missed sample is not a lost clock."""
     host_poll = 2 ** 4  # clock-sync.sh pins the fleet to `maxpoll 4`
-    return Node("clock freshness", children=[
+    converge = Node("clock convergence wait", budget=b.get("QOS1_CLOCK_CONVERGE_BUDGET"),
+                    why="root dispersion must fall inside the error budget before the run", children=[
+        Node("re-check", budget=b.get("QOS1_CLOCK_CONVERGE_POLL")),
+    ])
+    return Node("clock freshness", children=[converge,
         Node("fleet host max age", budget=120.0, why="clock-check.py `max_age_s`", children=[
             Node("upstream poll", repeat=2, budget=host_poll, why="chrony maxpoll 4"),
         ]),

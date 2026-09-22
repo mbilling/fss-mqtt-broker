@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 # Sourced by run-curve.sh. Only operates on the disposable benchmark fleet.
 QOS1_CLOCK_MAX_ERROR_MS=${QOS1_CLOCK_MAX_ERROR_MS:-5}
+# How long the fleet may take to bring its error bound inside the budget, and how
+# often to re-check. Root dispersion falls over the first few poll intervals.
+QOS1_CLOCK_CONVERGE_BUDGET=${QOS1_CLOCK_CONVERGE_BUDGET:-300}
+QOS1_CLOCK_CONVERGE_POLL=${QOS1_CLOCK_CONVERGE_POLL:-15}
 
 qos1_clock_hosts() {
     local i
@@ -54,5 +58,20 @@ log tracking measurements statistics
     local failed=0
     for pid in "${pids[@]}"; do wait "$pid" || failed=1; done
     [ "$failed" = 0 ] || die "benchmark NTP synchronization failed; see clock setup logs"
-    qos1_clock_capture "$OUT/clock-preflight" || die "clock accuracy outside declared budget"
+    # `chronyc waitsync` returns when the OFFSET is small, but the gate judges the
+    # error BOUND — offset plus the hop to the reference plus root dispersion —
+    # and dispersion starts high, shrinking as chrony accumulates measurements.
+    # Measured 2026-09-21: every one of 17 hosts had a sub-microsecond offset and
+    # a Normal leap status, and driver4 still bounded at 5.493ms because its
+    # dispersion was 4.518ms, ten times a converged fleet's. Nothing was wrong
+    # with the clocks; the capture was simply too early. So wait for the bound the
+    # gate uses rather than a proxy for it, and say so when it took time.
+    local waited=0
+    until qos1_clock_capture "$OUT/clock-preflight"; do
+        [ "$waited" -lt "$QOS1_CLOCK_CONVERGE_BUDGET" ] ||
+            die "clock accuracy outside declared budget after ${waited}s of convergence — see $OUT/clock-preflight"
+        sleep "$QOS1_CLOCK_CONVERGE_POLL"
+        waited=$((waited + QOS1_CLOCK_CONVERGE_POLL))
+    done
+    [ "$waited" -eq 0 ] || say "lane E: fleet clocks converged after ${waited}s"
 }

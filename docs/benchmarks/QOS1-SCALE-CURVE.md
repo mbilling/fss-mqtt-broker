@@ -7,10 +7,11 @@ tenant site. Measured by `bench/scale/run.sh`, certified by
 `bench/scale/lane-e-evidence.py`, reported by
 `bench/scale/qos1-campaign/report.py`.
 
-This is not a knee. **Both numbers are floors** — the highest load each size was
-*offered*, not the highest it can carry. Broker cores were nowhere near saturated
-at either. What a knee needs, and why we have not published one, is in
-[Where this stops](#where-this-stops).
+**Corrected 2026-09-22.** An earlier revision of this document called both
+numbers floors and said broker cores were nowhere near saturated. That was
+wrong, and the correction is the most useful thing here: **a single broker core
+is the limit**, and 180,000 msg/s at 5 nodes is at it, not below it. See
+[The limit is one core](#the-limit-is-one-core).
 
 ## Read this first
 
@@ -40,9 +41,9 @@ at either. What a knee needs, and why we have not published one, is in
 | 5 | **180,000 msg/s** | 36,000 | 3 + control | 180,001.3/s | 179,999.8 – 180,001.6 | 0.001 % | ≤ 5 ms ± 6.5 ms clock |
 
 **Scaling 3 → 5 nodes is 1.5× the load on 1.67× the nodes — 90 % of linear.**
-Whether the missing 10 % is the broker or the load generator is unresolved: at
-180,000 msg/s every broker core sampled below saturation while a driver core was
-the busiest thing in the fleet.
+The missing 10 % is the broker, and it is explained below: per-node capacity
+*falls* as the cluster grows, because cross-node delivery lands on the same
+single core that is already the ceiling.
 
 Delivery matched offer to within 2 msg/s at every rung of both runs.
 **53,607,265** and **90,825,125** unique message identities were reconciled,
@@ -90,6 +91,41 @@ merely adequate on one draw is not adequate on the next.
 Read the curve accordingly: these are loads mqttd **has carried under audit**,
 not loads it will carry on every machine you rent.
 
+## The limit is one core
+
+mqttd's QoS 1 hot path is single-threaded per node. On a 4-vCPU broker one core
+runs 20–30 points busier than the other three, and its occupancy tracks the load
+that node carries:
+
+| nodes | per node | busiest broker core | other three | rung |
+|---:|---:|---:|---|---|
+| 3 | 10,000/s | 33 % | — | PASS |
+| 3 | 20,000/s | 66 % | — | PASS |
+| 3 | **40,000/s** | **87 %** | — | PASS |
+| 5 | **36,000/s** | **91 %** | 52–59 % | PASS (2026-09-20 14:57 fleet) |
+| 5 | 36,000/s | **99 %** | 61–67 % | FAIL — 5.3 % late |
+| 5 | 40,800/s | 98 % | 63–68 % | FAIL — 8.5 % late |
+
+Two things follow, and they matter more than either headline number.
+
+**The knee at 5 nodes is ~180,000 msg/s, and it is marginal.** The one
+provisioning that passed had that core at 91 %; two others reached 98–99 % on
+identical configuration and failed on publisher lateness. A ceiling sitting at
+91 % of one core is a ceiling you can cross by renting a slightly slower host.
+
+**Per-node capacity FALLS as the cluster grows.** 3 nodes carry 40,000/s each
+with the hot core at 87 %; 5 nodes carry 36,000/s each and the same core is
+busier. Clustering does not divide the work evenly — a publish delivered to a
+subscriber on another node costs the hot core extra, and that cost lands on the
+resource that is already the constraint. This is why the curve is 90 % of linear
+rather than linear, and it predicts that 7 and 10 nodes will fall further behind.
+
+**Throughput and schedule-keeping fail separately.** At 204,000 msg/s offered,
+the cluster *delivered* 204,006/s — the messages moved. What failed was pacing:
+8.5 % of publishes missed their own schedule because acknowledgements slowed as
+the core saturated. A broker can be moving your traffic and still be past the
+point where it acknowledges it on time.
+
 ## Where this stops
 
 Neither figure is a knee, and we have not published one. Three things stand in
@@ -105,10 +141,9 @@ the way, all of them ours rather than the broker's:
    withheld 104 acks, exactly as predicted. Issue
    [#633](https://github.com/mbilling/fss-mqtt-broker/issues/633) raises the
    bound; the curve cannot pass 204,800 msg/s at 5 nodes until it ships.
-2. **Driver capacity.** Each publisher container runs one Erlang scheduler, so
-   its ceiling is one core. The provider quota (200 vCPU) minus brokers leaves
-   about 11 16-vCPU drivers at 5 nodes, and driver cores — not broker cores —
-   were the busiest thing in the fleet at 180,000 msg/s.
+2. **Driver capacity** is no longer the binding constraint, but it is close
+   enough to confuse a reading: driver cores ran 45–52 % mean while the broker's
+   hot core ran 91–99 %. An earlier revision of this document had that backwards.
 3. **Sizes 7 and 10 are unmeasured.** A two-point curve constrains a line; it
    does not establish one.
 
