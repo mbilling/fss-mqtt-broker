@@ -45,6 +45,16 @@ journalctl -u ssh -u docker --since '-30 minutes' --no-pager
 docker ps -a
 for c in $(docker ps -aq); do
     docker inspect --format '{{.Name}} {{json .State}} {{.Image}}' "$c"
+    # BOTH ends, not just the tail. emqtt-bench prints the reason a client could
+    # not connect ("client(N): connect error - ...") during the connect ramp, in
+    # the first seconds; at ~2 progress lines a second a 50-line tail covers only
+    # the last 25 of a six-minute rung, so the one line that explains a failure
+    # scrolls off. Measured 2026-09-22: one container reported connect_fail=27 of
+    # 750, no broker logged a refusal, and the reason was unrecoverable because
+    # the capture had already discarded it.
+    echo "--- head of $c"
+    docker logs "$c" 2>&1 | head -80
+    echo "--- tail of $c"
     docker logs --tail 50 "$c" 2>&1
 done
 cat /var/log/cloud-init-output.log

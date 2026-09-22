@@ -2486,6 +2486,26 @@ PAUSED
 	fi
 	# Retain window samples and scrape stderr for replay.
 	snapshot_metrics_complete "$rdir" after
+    # Connect failures, summed over the publisher containers. A settle shortfall
+    # says the population was incomplete; this says whether the clients TRIED and
+    # were refused, which is the difference between a slow ramp and a real fault.
+    lane_e_connect_fail=$(python3 - "$rdir" <<'CONNFAIL'
+import json,re,sys
+from pathlib import Path
+p=Path(sys.argv[1]); total=0
+try:
+    eps=json.loads((p/'manifest.json').read_text())['endpoints']
+except (OSError, ValueError):
+    print(0); raise SystemExit
+for ep in eps:
+    f=p/(ep['name']+'-terminal.prom')
+    if not f.is_file(): continue
+    m=re.search(r'^connect_fail (\S+)$', f.read_text(), re.M)
+    if m: total+=int(float(m.group(1)))
+print(total)
+CONNFAIL
+)
+	echo "connect_fail=${lane_e_connect_fail:-0}" >>"$rdir/rung.txt"
 	echo "sites=$sites offered=$((sites * LANE_E_SITE_RATE)) publishers=$((sites * LANE_E_PUBS_PER_SITE)) consumers=$((sites * LANE_E_SUBS_PER_SITE)) per_consumer=$((LANE_E_SITE_RATE / LANE_E_SUBS_PER_SITE)) p99_budget_ms=$LANE_E_P99_BUDGET_MS qos=$LANE_E_QOS sub_qos=$LANE_E_SUB_QOS window_secs=$LANE_E_SECS window=aligned cpu_window=$cpu_window settle_s=$((LANE_E_SETTLE + settle_waited)) settled=$settled settled_conns=$settled_conns expected_conns=$expect_conns steady=$steady steady_s=$steady_s steady_reason=$steady_reason drained=$drained drain_secs=$drain_secs drain_deadline_s=$LANE_E_DRAIN_SECS control=$is_control reset=$reset reset_conns=$reset_conns" >"$rdir/rung.txt"
     if [ -n "${QOS1_DRIVER_ARCHIVE:-}" ]; then
         qos1_clock_capture "$rdir/clock/final" || die "clock health failed after drain"
