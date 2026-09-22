@@ -1276,3 +1276,232 @@ The script prints that recipe when it finishes.
 """
 requires = ["jq", "ssh"]
 duration = "instant"
+
+[[task]]
+id = "scale-budgets"
+group = "Benchmark"
+name = "Check the harness time budgets are self-consistent"
+script = "bench/scale/budgets.py"
+about = """
+Every phase budget as ONE tree — a parent must cover its children, sequential
+children sum, parallel children take the max. The numbers are parsed from
+run-curve.sh, lib.sh and clock-check.py rather than restated, so the tree cannot
+drift from the harness. Source a campaign profile first and it describes the run
+you are about to launch. Found an ssh dead-peer path of 45s inside loops
+budgeted at 60s, and drain deadlines too short for the flat run they wait for.
+"""
+requires = ["python3"]
+
+[[task]]
+id = "qos1-campaign-run"
+group = "Benchmark"
+name = "Run a QoS 1 lane E campaign with automatic teardown"
+script = "bench/scale/qos1-campaign/run-confirm.sh"
+about = """
+Provisions from QOS1_PROFILE, snapshots the harness source into the run
+directory, runs the ladder, writes the report and evidence hashes, and tears the
+fleet down on any exit path. PAID: it creates cloud servers. Preflight first
+with PREFLIGHT_ONLY=1.
+"""
+requires = ["bash", "python3"]
+
+[[task]]
+id = "qos1-campaign-report"
+group = "Benchmark"
+name = "Recompute a QoS 1 campaign report from its raw captures"
+script = "bench/scale/qos1-campaign/report.py"
+about = """
+Reads a run directory and re-derives every rung's verdict from the raw
+scrapes, ledgers and clock reports — nothing is trusted from the run itself.
+States the scaling qualification: three passing repetitions at a load, a passing
+closing control, and no failing repetition at or below it.
+"""
+requires = ["python3"]
+
+[[task]]
+id = "qos1-driver-build"
+group = "Benchmark"
+name = "Build the pinned, audited emqtt-bench driver image"
+script = "bench/scale/qos1-driver/build.sh"
+about = """
+emqtt-bench 0.6.3 at a pinned commit plus the QoS 1 audit extension: per-topic
+sequence bitmaps for sends, PUBACK completions and shared-group receipts, and a
+negative-latency counter. The image hash is recorded in every run that uses it,
+because a capacity number measured by an unpinned generator is not reproducible.
+"""
+requires = ["docker", "git", "python3", "curl"]
+
+[[task]]
+id = "scale-clock-check"
+group = "Benchmark"
+name = "Validate retained chrony tracking reports"
+script = "bench/scale/clock-check.py"
+about = """
+Invoked by the harness at every capture. Gates on the FLEET-RELATIVE error —
+the reference's own path to its upstream cancels between hosts — and treats
+staleness as a liveness bound, since chrony already prices it into root
+dispersion.
+"""
+requires = ["python3"]
+hidden = true
+
+[[task]]
+id = "scale-clock-sync"
+group = "Benchmark"
+name = "Discipline the benchmark fleet's clocks"
+script = "bench/scale/clock-sync.sh"
+about = """
+Sourced by run-curve.sh, not run directly. Points every host at the first
+broker over the private network and waits for the error bound to come inside
+budget before any rung runs.
+"""
+requires = ["bash"]
+hidden = true
+
+[[task]]
+id = "scale-lane-e-evidence"
+group = "Benchmark"
+name = "Certify one lane E rung's evidence"
+script = "bench/scale/lane-e-evidence.py"
+about = """
+Invoked by the extractor. Reconciles exact message identities, aligned counter
+windows, histogram consistency and clock validity; a rung that cannot be
+certified is INVALID rather than silently weaker.
+"""
+requires = ["python3"]
+hidden = true
+
+[[task]]
+id = "qos1-campaign-calibration-report"
+group = "Benchmark"
+name = "Report a driver-calibration provisioning"
+script = "bench/scale/qos1-campaign/calibration-report.py"
+about = """
+Separates calibration from capacity: a provisioning whose container allocation
+varied cannot be pooled into a curve.
+"""
+requires = ["python3"]
+hidden = true
+
+[[task]]
+id = "qos1-campaign-ledger-report"
+group = "Benchmark"
+name = "Reconcile a run's identity ledgers"
+script = "bench/scale/qos1-campaign/ledger-report.py"
+about = """
+Unions shared-group receipts across consumers and separates loss, duplicates,
+unexpected identities and unacknowledged sends.
+"""
+requires = ["python3"]
+hidden = true
+
+[[task]]
+id = "qos1-campaign-prepare-matrix"
+group = "Benchmark"
+name = "Generate and validate campaign configurations offline"
+script = "bench/scale/qos1-campaign/prepare-matrix.py"
+about = """
+Checks every rung's shape before a fleet is paid for.
+"""
+requires = ["python3"]
+hidden = true
+
+[[task]]
+id = "qos1-driver-calibrate-local"
+group = "Benchmark"
+name = "Calibrate driver parallelism against local brokers"
+script = "bench/scale/qos1-driver/calibrate-local.py"
+about = """
+Finds a usable container allocation without cloud spend.
+"""
+requires = ["python3"]
+hidden = true
+
+[[task]]
+id = "qos1-driver-summarize-local"
+group = "Benchmark"
+name = "Recompute a local calibration's intervals"
+script = "bench/scale/qos1-driver/summarize-local.py"
+about = """
+Rejects unstable rate, excessive lateness, latency or scrape uncertainty.
+"""
+requires = ["python3"]
+hidden = true
+
+[[task]]
+id = "qos1-driver-patch"
+group = "Benchmark"
+name = "Apply the QoS 1 audit patch to emqtt-bench"
+script = "bench/scale/qos1-driver/patch.py"
+about = """
+Build plumbing for qos1-driver/build.sh.
+"""
+requires = ["python3"]
+hidden = true
+
+[[task]]
+id = "scale-test-budgets"
+group = "Benchmark"
+name = "Test the budget tree"
+script = "bench/scale/test-budgets.py"
+about = """
+Unit tests.
+"""
+requires = ["python3"]
+hidden = true
+
+[[task]]
+id = "scale-test-clock-check"
+group = "Benchmark"
+name = "Test the clock validator"
+script = "bench/scale/test-clock-check.py"
+about = """
+Unit tests.
+"""
+requires = ["python3"]
+hidden = true
+
+[[task]]
+id = "scale-test-clock-corpus"
+group = "Benchmark"
+name = "Replay the archived clock captures"
+script = "bench/scale/test-clock-corpus.py"
+about = """
+Every capture that has ever killed a paid run must pass the current gate, and
+each must still exhibit the defect it was collected for.
+"""
+requires = ["python3"]
+hidden = true
+
+[[task]]
+id = "scale-test-lane-e-evidence"
+group = "Benchmark"
+name = "Test the evidence certifier"
+script = "bench/scale/test-lane-e-evidence.py"
+about = """
+Unit tests.
+"""
+requires = ["python3"]
+hidden = true
+
+[[task]]
+id = "qos1-campaign-test-calibration-report"
+group = "Benchmark"
+name = "Test the calibration report"
+script = "bench/scale/qos1-campaign/test-calibration-report.py"
+about = """
+Unit tests.
+"""
+requires = ["python3"]
+hidden = true
+
+[[task]]
+id = "qos1-driver-test-local"
+group = "Benchmark"
+name = "Test the local driver harness"
+script = "bench/scale/qos1-driver/test-local.py"
+about = """
+Unit tests.
+"""
+requires = ["python3"]
+hidden = true
