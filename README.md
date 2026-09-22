@@ -98,10 +98,11 @@ what the rig carried, and the rig ran out first**: one core of each broker host
 saturates on *network interrupt handling* (54.6% softirq, 1.2% idle, while its
 three siblings sit 33–39% idle), and mqttd's own hub loop was at **0.46 of a
 core** — roughly 2× headroom — measured by the broker's own dispatch metric
-rather than by sampling CPU. So 180k at 5 nodes is a floor for mqttd and a
-ceiling for these hosts; the fix is spreading NIC interrupts across cores, not a
-broker change. Full method, the per-core breakdown, and two earlier revisions of
-this claim that were wrong: [QOS1-SCALE-CURVE.md](docs/benchmarks/QOS1-SCALE-CURVE.md).
+rather than by sampling CPU. Spreading that softirq is a settled dead end for capacity
+(#505/#507: +1.9%, noise); the cause is **cross-node forwarding**, which is why
+`shared_prefer_local` is the default (#508/#511, +42% at N=5). Full method, the
+per-core breakdown, and two earlier revisions of this claim that were wrong:
+[QOS1-SCALE-CURVE.md](docs/benchmarks/QOS1-SCALE-CURVE.md).
 
 | more published points | |
 |---|---|

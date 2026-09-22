@@ -167,25 +167,38 @@ which measured the hub loop at 0.50 of a core while a 5-node cluster carried
 message 38×, softirq does not move — 28.6 %, 24.4 %, 33.9 %, 32.3 %, 32.7 %
 across 13 → 492 MB/s. Per-packet kernel work, not per-byte.
 
-### What this means for the numbers above
+### Spreading that softirq does NOT raise capacity — already tested
 
-- **180,000 msg/s at 5 nodes is a ceiling for THIS RIG, and a floor for mqttd.**
-  The broker had roughly 2× headroom in its own hot path when the host's
-  interrupt handling ran out.
-- **The fix is host tuning, not a broker change** — spreading NIC interrupts
-  across cores (RSS/RPS) rather than letting one absorb them. Until that is done,
-  this curve measures the benchmark host's network stack as much as the broker.
-- **It also explains the fleet-to-fleet variance.** A ceiling set by one core's
-  interrupt handling is exactly the kind that moves when you draw a different
-  machine — which is why the same 180,000 passed on one provisioning at 91 % and
-  failed on two others at 98–99 %.
-- **Per-node capacity still falls with cluster size** (40,000/node at 3 nodes
-  against 36,000/node at 5), and the mechanism is the same: cross-node delivery
-  means more packets per message, landing on the same saturated core.
+The obvious prescription is to spread the interrupt work across the idle cores.
+It has been tried, on the identical ladder with one variable changed
+([#505](https://github.com/mbilling/fss-mqtt-broker/issues/505),
+[#507](https://github.com/mbilling/fss-mqtt-broker/pull/507)), and the answer is
+settled in both directions:
 
-**Where mqttd's own QoS 1 ceiling actually is remains unmeasured.** It is above
-180,000 msg/s at 5 nodes, and finding it needs brokers whose interrupt handling
-is spread across their cores.
+- **The diagnosis held.** RPS moved the hot core 92.9 % → 85.3 %, halved peak
+  softirq, and doubled mqttd's user time on that core.
+- **The prescription failed.** Peak throughput moved 360,828 → 367,780 msg/s —
+  **+1.9 %, noise**. `broker_nic_spread` therefore ships default-off as a
+  *latency* lever, explicitly documented as not a capacity one.
+
+So the saturated core is a symptom, not the cause. Spreading the work
+redistributes it; it does not reduce it.
+
+**The cause is cross-node forwarding**, settled in
+[#508](https://github.com/mbilling/fss-mqtt-broker/issues/508): on the same
+binary, hardware and ladder, preferring a local shared-group member took 5 nodes
+from 360,000 to **510,000 msg/s, +42 %** — which is why
+[#511](https://github.com/mbilling/fss-mqtt-broker/pull/511) made
+`shared_prefer_local` the default, and why these QoS 1 runs already had it on.
+
+The QoS 1 numbers here are consistent with that reading. Per-node capacity falls
+as the cluster grows — 40,000/node at 3 nodes against 36,000/node at 5 — because
+a larger cluster forwards more, each forward costs packets, and those packets land
+on the core already carrying the interrupt load. The softirq core is where the
+cost *appears*; cross-node delivery is what *creates* it.
+
+**Where mqttd's own QoS 1 ceiling is remains unmeasured**, and raising it is a
+routing question rather than a kernel-tuning one.
 
 ## Where this stops
 
