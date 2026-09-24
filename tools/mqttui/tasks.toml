@@ -1122,6 +1122,30 @@ requires = ["python3", "tofu"]
 hidden = true
 
 [[task]]
+id = "scale-membership-counters"
+group = "Benchmark"
+name = "Perf counters around one receipt-checked shared_membership TCP window"
+script = "bench/scale/run-membership-counters.py"
+about = """
+Local only. Wraps a prebuilt shared_membership bench binary in `perf stat` for one
+paced TCP window (--binary, --out, --case required) and writes cycles/instructions
+per receipt, the manifest, diff and sources into a fresh directory. Multiplexed or
+missing counters and an under-offered window are errors, not results. Synthetic
+peers; not a capacity result. See docs/benchmarks/GROUPED-SHARED-INDEX.md.
+"""
+requires = ["python3", "perf", "git"]
+hidden = true
+
+[[task]]
+id = "scale-membership-counters-tests"
+group = "Benchmark"
+name = "Offline counter-validity tests for the membership perf runner"
+script = "bench/scale/test-membership-counters.py"
+about = "Checks that incomplete, multiplexed or non-finite perf counters are rejected. No perf, broker or network. Run with python3."
+requires = ["python3"]
+hidden = true
+
+[[task]]
 id = "scale-observe"
 group = "Benchmark"
 name = "Live Grafana for a scale-curve run (laptop + forward tunnel)"

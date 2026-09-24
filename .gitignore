@@ -48,3 +48,6 @@ bench/scale/terraform*/.terraform.lock.hcl
 
 # Generated per run by observe.sh into the compose mount (see config.alloy.idle).
 bench/scale/observe/alloy/config.alloy
+
+# Operator scratch: session write-ups and notes. Never part of the build.
+astra/
