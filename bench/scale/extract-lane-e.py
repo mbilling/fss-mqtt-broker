@@ -258,6 +258,52 @@ def windowed_idle(path: Path, lo_s: float, hi_s: float) -> list[float]:
     return [idle for t, idle in rows if t is not None and t - 1 >= lo_s and t + 1 <= hi_s]
 
 
+MPSTAT_CORE = re.compile(r"^(\d\d):(\d\d):(\d\d)\s+(\d+)\s")
+CORE_BUSY_PCT = 95.0  # a core this busy has no headroom left for the scheduler pinned to it
+
+
+def core_saturation(rdir: Path, role: str, window: dict | None) -> dict | None:
+    """The worst single core on any `role` host, inside the measurement window.
+
+    The `all` row is a mean over every core, so one emqtt-bench scheduler pinned
+    at 100% on an 8-vCPU driver reads as "87% idle" — and that scheduler is then
+    the rung's real rate limit while the host looks unloaded. This reports, per
+    host and core, the SHARE of in-window samples in which that core was at least
+    CORE_BUSY_PCT busy, and returns the worst. A per-core row carries the same
+    timestamp as the `all` row printed just above it, so each is placed by that
+    row's already-resolved epoch second (midnight rollover and all).
+    """
+    worst = None
+    for path in sorted((rdir / "cpu").glob(f"cpu-{role}*.txt")):
+        host = path.stem.split("-", 1)[1]
+        if not (HOST.match(host) and host.startswith(role)):
+            continue
+        edges = None if window is None else window["hosts"].get(host)
+        if window is not None and edges is None:
+            continue
+        times = [t for t, _ in mpstat_rows(path)[0]]
+        k = -1
+        busy: dict[int, list[float]] = {}
+        for line in path.read_text(errors="replace").splitlines():
+            if MPSTAT_ALL.match(line):
+                k += 1
+                continue
+            m = MPSTAT_CORE.match(line)
+            if not m or not 0 <= k < len(times):
+                continue
+            t = times[k]
+            if edges is not None and (t is None or t - 1 < edges["open"][1] / 1000 or t + 1 > edges["close"][0] / 1000):
+                continue
+            with contextlib.suppress(ValueError):
+                busy.setdefault(int(m.group(4)), []).append(100.0 - float(line.split()[-1]))
+        for core, samples in busy.items():
+            share = sum(b >= CORE_BUSY_PCT for b in samples) / len(samples)
+            mean = sum(samples) / len(samples)
+            if worst is None or (share, mean) > (worst["share"], worst["mean_busy"]):
+                worst = {"host": host, "core": core, "share": share, "samples": len(samples), "mean_busy": mean}
+    return worst
+
+
 def host_sort_key(host: str) -> tuple[str, int]:
     m = HOST.match(host)
     return (m.group(1), int(m.group(2))) if m else (host, -1)
@@ -1412,6 +1458,34 @@ class MpstatTests(unittest.TestCase):
             path.write_text("\n".join(lines) + "\n")
             # 00:00:01 .. 00:00:10 after midnight only.
             self.assertEqual(windowed_idle(path, base + 10, base + 21), [50.0] * 10)
+
+    def test_one_pinned_core_is_found_behind_an_idle_host_mean(self):
+        """One scheduler pinned on an 8-core driver: the `all` row says 87% idle,
+        and that is exactly the reading the per-core measure exists to see past.
+        Samples outside the window must not count either way."""
+        with tempfile.TemporaryDirectory() as td:
+            rdir = Path(td)
+            (rdir / "cpu").mkdir()
+            base = int(datetime(2026, 9, 19, 2, 0, 0, tzinfo=timezone.utc).timestamp())
+            lines = ["CPU_STREAM_START_UTC 2026-09-19T02:00:00Z"]
+            for t in range(base + 1, base + 41):
+                stamp = f"{datetime.fromtimestamp(t, timezone.utc):%H:%M:%S}"
+                pinned = base + 10 < t <= base + 30  # busy only inside the window
+                lines.append(f"{stamp}  all  0 0 0 0 0 0 0 0 0 {87.5 if pinned else 100.0}")
+                for core in range(8):
+                    idle = 0.0 if pinned and core == 3 else 100.0
+                    lines.append(f"{stamp}    {core}  0 0 0 0 0 0 0 0 0 {idle}")
+            (rdir / "cpu" / "cpu-driver0.txt").write_text("\n".join(lines) + "\n")
+            (rdir / "cpu" / "cpu-broker0.txt").write_text("\n".join(lines) + "\n")
+            edge = lambda t: (t * 1000, t * 1000)
+            window = {"hosts": {"driver0": {"open": edge(base + 12), "close": edge(base + 28)}}}
+            worst = core_saturation(rdir, "driver", window)
+            self.assertEqual((worst["host"], worst["core"], worst["share"]), ("driver0", 3, 1.0))
+            self.assertEqual(worst["samples"], 15)  # t-1 >= open and t+1 <= close
+            # The whole stream, ramp included: 20 pinned seconds of 40.
+            self.assertEqual(core_saturation(rdir, "driver", None)["share"], 0.5)
+            # A host with no usable window row is skipped, never guessed at.
+            self.assertIsNone(core_saturation(rdir, "broker", window))
 
 
 def main(argv: list[str]) -> int:

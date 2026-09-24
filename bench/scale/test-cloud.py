@@ -22,7 +22,11 @@ class CloudTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.rig = self.root / "bench/scale"
         self.rig.mkdir(parents=True)
-        for name in ("lib.sh", "cloud.sh", "run.sh", "teardown.sh", "run-curve.sh", "cpu.sh", "test-upcloud-quota.py", "482-smoke.sh", "482-constant-driver-N5-N7-optionB.env", "extract-lane-e.py", "compare-brokers.sh", "forward-canary.py"):
+        for name in ("lib.sh", "cloud.sh", "collect.sh", "run.sh", "teardown.sh", "run-curve.sh", "cpu.sh", "test-upcloud-quota.py", "482-smoke.sh", "482-constant-driver-N5-N7-optionB.env", "extract-lane-e.py", "lane-e-evidence.py", "compare-brokers.sh", "forward-canary.py",
+                     # budgets.py gates the lane E preflight and reads its numbers
+                     # out of these, so the rig needs all of them or every lane E
+                     # test dies on the gate rather than on what it is testing.
+                     "budgets.py", "clock-check.py", "clock-sync.sh"):
             shutil.copy2(SCALE / name, self.rig / name)
         # The real mqttd captures the ledgers and the extractor are tested against.
         shutil.copytree(SCALE / "testdata", self.rig / "testdata")
@@ -56,6 +60,28 @@ sys.exit(77 if "apply" in sys.argv or os.path.basename(sys.argv[0]) in ("hcloud"
             "MQTTD_VERSION": "test", "OBSERVE": "0",
             "RUN_DIR": str(self.root / "run"),
         }
+
+    def test_failure_capture_retries_and_preserves_unavailable_status(self):
+        inventory = self.root / "inventory.json"
+        inventory.write_text(json.dumps({"brokers": [], "drivers": [{"public_ip": "good"}, {"public_ip": "bad"}]}))
+        (self.bin_dir / "ssh").write_text("""#!/usr/bin/env python3
+import pathlib,os,sys
+host=next(v for v in sys.argv if v.startswith('root@'))
+p=pathlib.Path(os.environ['HOME'])/host
+n=int(p.read_text())+1 if p.exists() else 1
+p.write_text(str(n))
+print('attempt',n,host)
+if host=='root@bad' or n==1:raise SystemExit(255)
+print('kernel and container evidence')
+""")
+        out = self.root / "capture"
+        result = self.run_script("collect.sh", str(out), str(inventory))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        hosts = out / "results/nodes=0/hosts"
+        self.assertIn("success attempt=2", (hosts / "driver0-logs.log.status").read_text())
+        self.assertIn("unavailable", (hosts / "driver1-logs.log.status").read_text())
+        self.assertIn("kernel and container", (hosts / "driver0-logs.log").read_text())
+        self.assertEqual(len(list(hosts.glob("driver1-logs.log.attempt*"))), 3)
 
     def run_script(self, name, *args, **env):
         return subprocess.run(
@@ -445,21 +471,131 @@ with_cpu_sampling "$3" work
         inventory = self.root / "cap-inv.json"
         inventory.write_text(json.dumps({"brokers": [{}] * 3, "drivers": [{"vcpus": 8}] * 12}))
         out = self.root / "cap-shape"
-        # 3 brokers, 1200 publishers/site: 12 sites is 14400 publishers => 4800
-        # per broker, over the cap. 4 sites is 1600 per broker, under it.
+        # The head count is the BINDING bound, and the occupancy estimate is the
+        # healthy-regime figure printed beside it. They are coupled: as the table
+        # fills, acks slow, which fills it further, so a saturating rung drives
+        # latency to the publish interval and every publisher holds a slot.
+        # Measured 2026-09-20 at 7 sites over 5 brokers — occupancy at the 12ms
+        # RTT floor said 504, and broker3 evicted 104 publishes against the 4,096
+        # cap, withholding 104 acks so the rung could not settle its pause.
         hot = self.run_script("run-curve.sh", str(out), str(inventory), LANES="E", SHAPE_ONLY="1",
                               LANE_E_QOS="1", LANE_E_SITES_OVERRIDE="4 12")
         self.assertEqual(hot.returncode, 0, hot.stderr)
         shape = (out / "results/nodes=3/laneE/shape.txt").read_text()
         self.assertIn("PENDING_PUBLISH_CAP=4096", shape)
         self.assertIn("12-site rung", shape, f"the cap was predicted at the wrong rung:\n{shape}")
-        self.assertIn("pending-cap", shape)
+        self.assertIn("ONE PER PUBLISHER", shape)
+        # 12 sites x 1200 publishers over 3 brokers = 4,800 each, over the cap.
+        self.assertIn("~4800 publishes", shape)
+        # The healthy-regime figure is stated too, so both bounds are visible:
+        # 360,000/s over 3 brokers x 12ms = 1,440.
+        self.assertIn("~1440", shape)
+        # 4 sites is 1,600 per broker: under the cap, and silent.
+        quiet = self.run_script("run-curve.sh", str(out), str(inventory), LANES="E", SHAPE_ONLY="1",
+                                LANE_E_QOS="1", LANE_E_SITES_OVERRIDE="4")
+        self.assertEqual(quiet.returncode, 0, quiet.stderr)
+        self.assertNotIn("PENDING_PUBLISH_CAP",
+                         (out / "results/nodes=3/laneE/shape.txt").read_text())
         # QoS 0 never reaches that table, so it must not be warned about.
         cold = self.run_script("run-curve.sh", str(out), str(inventory), LANES="E", SHAPE_ONLY="1",
                                LANE_E_QOS="0", LANE_E_SITES_OVERRIDE="4 12")
         self.assertEqual(cold.returncode, 0, cold.stderr)
         self.assertNotIn("PENDING_PUBLISH_CAP",
                          (out / "results/nodes=3/laneE/shape.txt").read_text())
+
+    def test_lane_e_steps_the_publisher_count_for_a_fine_knee_search(self):
+        """A SITE is 30,000 msg/s, far too coarse to place a knee, and the
+        interval cannot help: rates must divide evenly into integer milliseconds,
+        so 10 msg/s steps straight to 20. Stepping publishers at fixed pacing
+        gives 10,000 msg/s rungs — 200 publishers/site over 5 sites."""
+        inventory = self.root / "pubs-inv.json"
+        inventory.write_text(json.dumps({"brokers": [{}] * 5, "drivers": [{"vcpus": 16}] * 11}))
+        out = self.root / "pubs-steps"
+        common = dict(LANES="E", SHAPE_ONLY="1", LANE_E_QOS="1", LANE_E_SUB_QOS="1",
+                      LANE_E_PUBS_PER_SITE="4000", LANE_E_SITE_RATE="40000",
+                      LANE_E_SUBS_PER_SITE="10", LANE_E_PLACEMENT="container",
+                      LANE_E_PUB_CONTAINERS_PER_SITE="4", LANE_E_SUB_CONTAINERS_PER_SITE="2",
+                      LANE_E_SITES_OVERRIDE="5 5 5")
+        r = self.run_script("run-curve.sh", str(out), str(inventory),
+                            LANE_E_PUBS_STEPS="3600 3800 4000", **common)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        lane = out / "results/nodes=5/laneE"
+        self.assertEqual(len(list(lane.glob("shape-pubs-*.txt"))), 3)
+        # Pacing is IDENTICAL across the rungs — only the population changes.
+        for step, (pubs, offered) in enumerate([(3600, 180000), (3800, 190000), (4000, 200000)]):
+            shape = (lane / f"shape-pubs-{step}.txt").read_text()
+            self.assertIn(f"site = {pubs} publishers x 10 msg/s", shape)
+            self.assertIn(f"{offered}", shape)
+        self.assertEqual((lane / "pubs-steps.txt").read_text().strip(), "3600 3800 4000")
+
+        # One entry per rung, or the ladder and the steps have drifted apart.
+        bad = self.run_script("run-curve.sh", str(self.root / "pubs-bad"), str(inventory),
+                              LANE_E_PUBS_STEPS="3600 3800", **common)
+        self.assertNotEqual(bad.returncode, 0)
+        self.assertIn("one entry per rung", bad.stderr)
+        self.assertEqual(self.calls(), [])
+
+    def test_lane_e_steps_the_payload_for_a_byte_throughput_knee(self):
+        """The message-rate knee is per-message CPU; the payload knee is bytes.
+        A rung can only find one at a time, so these steps hold the rate fixed
+        and grow the message. 60,000 msg/s at 200 B is 12 MB/s; at 8 KiB it is
+        492 MB/s of payload, which is a link question rather than a CPU one."""
+        inventory = self.root / "payload-inv.json"
+        inventory.write_text(json.dumps({"brokers": [{}] * 5, "drivers": [{"vcpus": 16}] * 11}))
+        out = self.root / "payload-steps"
+        common = dict(LANES="E", SHAPE_ONLY="1", LANE_E_QOS="1", LANE_E_SUB_QOS="1",
+                      LANE_E_PUBS_PER_SITE="3000", LANE_E_SUBS_PER_SITE="10",
+                      LANE_E_PLACEMENT="container", LANE_E_PUB_CONTAINERS_PER_SITE="4",
+                      LANE_E_SUB_CONTAINERS_PER_SITE="2", LANE_E_SITES_OVERRIDE="2 2 2 2")
+        r = self.run_script("run-curve.sh", str(out), str(inventory),
+                            LANE_E_PAYLOAD_STEPS="200 1024 4096 8192", **common)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        lane = out / "results/nodes=5/laneE"
+        self.assertEqual(len(list(lane.glob("shape-payload-*.txt"))), 4)
+        # The message rate is IDENTICAL across the rungs — only the size changes.
+        for step, size in enumerate([200, 1024, 4096, 8192]):
+            shape = (lane / f"shape-payload-{step}.txt").read_text()
+            self.assertIn(f"x {size}B qos 1", shape)
+            self.assertIn("3000 publishers x 10 msg/s", shape)
+        self.assertEqual((lane / "payload-steps.txt").read_text().strip(), "200 1024 4096 8192")
+
+        bad = self.run_script("run-curve.sh", str(self.root / "payload-bad"), str(inventory),
+                              LANE_E_PAYLOAD_STEPS="200 1024", **common)
+        self.assertNotEqual(bad.returncode, 0)
+        self.assertIn("one entry per rung", bad.stderr)
+        self.assertEqual(self.calls(), [])
+
+    def test_lane_e_refuses_subscribers_that_cannot_cover_every_broker(self):
+        """Each subscriber container round-robins its OWN clients over
+        rotated_hosts(container), so C containers of K clients cover C+K-1 of N
+        brokers — not C*K. At 7 nodes, 10 consumers in 2 containers covered six
+        of seven; the seventh had no local shared member and 14.3% of publishes
+        forwarded, which reads as a capacity loss and is not one (2026-09-23)."""
+        inventory = self.root / "cover-inv.json"
+        inventory.write_text(json.dumps({"brokers": [{}] * 7, "drivers": [{"vcpus": 8}] * 12}))
+        common = dict(LANES="E", SHAPE_ONLY="1", LANE_E_QOS="1",
+                      LANE_E_SITES_OVERRIDE="1", LANE_E_PLACEMENT="container",
+                      LANE_E_SUB_CONTAINERS_PER_SITE="2")
+        bad = self.run_script("run-curve.sh", str(self.root / "cover-bad"), str(inventory),
+                              LANE_E_SUBS_PER_SITE="10", **common)
+        self.assertNotEqual(bad.returncode, 0)
+        self.assertIn("cover only 6 of 7 brokers", bad.stderr)
+        self.assertIn("LANE_E_SUBS_PER_SITE=14", bad.stderr, "the message must name the fix")
+
+        # 2 containers x 7 clients: each spans the cluster.
+        out = self.root / "cover-ok"
+        good = self.run_script("run-curve.sh", str(out), str(inventory),
+                               LANE_E_SUBS_PER_SITE="14", **common)
+        self.assertEqual(good.returncode, 0, good.stderr)
+        self.assertIn("cover all 7 brokers", (out / "results/nodes=7/laneE/shape.txt").read_text())
+
+        # And the DEFAULT now scales with N, so the trap cannot be re-entered by
+        # simply not setting it: 2 containers at 7 nodes defaults to 14.
+        auto = self.root / "cover-auto"
+        r = self.run_script("run-curve.sh", str(auto), str(inventory), **common)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("$share group of 14", (auto / "results/nodes=7/laneE/shape.txt").read_text())
+        self.assertEqual(self.calls(), [])
 
     def test_lane_e_pins_the_mqtt_protocol_version(self):
         # v5 is the only version where the broker enforces Receive Maximum on
@@ -479,16 +615,78 @@ with_cpu_sampling "$3" work
         self.assertIn("pub -h $hosts -p $port -V $LANE_E_PROTO", src)
 
     def test_multiple_subscriber_containers_do_not_imply_full_local_coverage(self):
+        """6 consumers in 3 containers is 2 each, and each container round-robins
+        its own 2 over rotated_hosts(container): {0,1} u {1,2} u {2,3} leaves
+        broker 4 of 5 with no local shared member. The shape used to WARN and let
+        it run; since 2026-09-24 it refuses, because the warning was read past
+        for a whole campaign and the resulting 14.3% crossing at 7 nodes was
+        misread as a scaling law."""
         inventory = self.root / "inventory.json"
         inventory.write_text(json.dumps({"brokers": [{}] * 5, "drivers": [{"vcpus": 8}] * 5}))
         out = self.root / "multi-sub-shape"
         result = self.run_script("run-curve.sh", str(out), str(inventory), LANES="E", SHAPE_ONLY="1",
                                  LANE_E_PIN_SITES="0", LANE_E_SUBS_PER_SITE="6",
                                  LANE_E_SUB_CONTAINERS_PER_SITE="3", LANE_E_SITES_OVERRIDE="1")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("cover only 4 of 5 brokers", result.stderr)
+        self.assertIn("LANE_E_SUBS_PER_SITE=15", result.stderr, "the message must name the fix")
+        # Deliberate affinity is still allowed: PIN_SITES says the crossing is
+        # the point of the measurement, not an accident of the allocation.
+        pinned = self.run_script("run-curve.sh", str(self.root / "multi-sub-pinned"), str(inventory),
+                                 LANES="E", SHAPE_ONLY="1", LANE_E_PIN_SITES="1",
+                                 LANE_E_SUBS_PER_SITE="6", LANE_E_SUB_CONTAINERS_PER_SITE="3",
+                                 LANE_E_SITES_OVERRIDE="1")
+        self.assertEqual(pinned.returncode, 0, pinned.stderr)
+        self.assertEqual(self.calls(), [])
+
+    def test_lane_e_container_placement_spreads_one_site(self):
+        inventory = self.root / "placement-inventory.json"
+        inventory.write_text(json.dumps({"brokers": [{}], "drivers": [{"vcpus": 1}] * 3}))
+        args = ("run-curve.sh", str(self.root / "placement"), str(inventory))
+        common = dict(LANES="E", SHAPE_ONLY="1", LANE_E_SITES_OVERRIDE="1",
+                      LANE_E_MAX_CONTAINERS_PER_DRIVER="1")
+        self.assertNotEqual(self.run_script(*args, LANE_E_PLACEMENT="site", **common).returncode, 0)
+        result = self.run_script(*args, LANE_E_PLACEMENT="container", **common)
         self.assertEqual(result.returncode, 0, result.stderr)
-        shape = (out / "results/nodes=5/laneE/shape.txt").read_text()
-        self.assertIn("verify actual broker coverage", shape)
-        self.assertNotIn("predicted crossing ≈ 0%", shape)
+        self.assertEqual(self.calls(), [])
+
+    def test_calibration_checks_every_container_shape_before_cloud(self):
+        inventory = self.root / "cal-inventory.json"
+        inventory.write_text(json.dumps({"brokers": [{}] * 3, "drivers": [{"vcpus": 8}] * 5}))
+        common = dict(LANES="E", SHAPE_ONLY="1", LANE_E_SITES_OVERRIDE="1 4 4",
+                      LANE_E_PUBS_PER_SITE="3000", LANE_E_SUBS_PER_SITE="10",
+                      LANE_E_SUB_CONTAINERS_PER_SITE="2", LANE_E_PLACEMENT="container")
+        for steps, good in [("2 4 6", True), ("2 4", False), ("2 4 7", False), ("2 4 0", False)]:
+            with self.subTest(steps=steps):
+                out = self.root / ("cal-" + steps.replace(" ", "-"))
+                result = self.run_script("run-curve.sh", str(out), str(inventory),
+                                         LANE_E_PUB_CONTAINER_STEPS=steps, **common)
+                self.assertEqual(result.returncode == 0, good, result.stderr)
+                if good:
+                    lane = out / "results/nodes=3/laneE"
+                    self.assertEqual(len(list(lane.glob("shape-step-*.txt"))), 3)
+                    self.assertEqual((lane / "driver-calibration.txt").read_text().strip(), steps)
+        self.assertEqual(self.calls(), [])
+
+    def test_lane_e_shape_predicts_the_driver_connection_ceiling(self):
+        """18,060 clients over 5 drivers never settled on 2026-09-18; 12,040 did.
+        The shape check must say so before a fleet is paid for — and stay quiet
+        for the same population spread over enough drivers."""
+        common = dict(LANES="E", SHAPE_ONLY="1", LANE_E_QOS="1", LANE_E_SUB_QOS="1",
+                      LANE_E_PUBS_PER_SITE="3000", LANE_E_SUBS_PER_SITE="10",
+                      LANE_E_SITE_RATE="30000", LANE_E_SITES_OVERRIDE="4 6",
+                      LANE_E_PENDING_PUBLISH_CAP="65536")
+        for drivers, warned in [(5, True), (8, False)]:
+            with self.subTest(drivers=drivers):
+                inventory = self.root / f"conn-inventory-{drivers}.json"
+                inventory.write_text(json.dumps({"brokers": [{}] * 3, "drivers": [{"vcpus": 8}] * drivers}))
+                out = self.root / f"conn-{drivers}"
+                result = self.run_script("run-curve.sh", str(out), str(inventory), **common)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                shape = (out / "results/nodes=3/laneE/shape.txt").read_text()
+                self.assertEqual("LANE_E_CLIENTS_PER_DRIVER_PROVEN" in shape, warned, shape)
+                if warned:  # 6 sites x 3,010 clients / 5 drivers = 3,612
+                    self.assertIn("6-site rung each driver must establish ~3612 clients", shape)
         self.assertEqual(self.calls(), [])
 
     def test_lane_e_pinned_shape_wording_unchanged(self):
@@ -543,7 +741,7 @@ if "mqttd_connections_active[ {]" in cmd:
         sys.exit(0)
 if " pub -h " in cmd:
     (state / "pubs").touch()
-if "curl -s -m 10 http://localhost:94" in cmd and os.environ.get("FAKE_RECV_RATE"):
+if re.search(r"curl -(?:s|fsS) -m 10 http://localhost:94", cmd) and os.environ.get("FAKE_RECV_RATE"):
     # A consumer scrape that COSTS TIME, like the real ssh fan-out does, and a
     # counter that advances at the offered rate in wall-clock terms. A gate that
     # divides the counter delta by its nominal poll interval instead of the time
@@ -555,7 +753,7 @@ if "curl -s -m 10 http://localhost:94" in cmd and os.environ.get("FAKE_RECV_RATE
     if not t0.exists():
         t0.write_text(repr(time.time()))
     elapsed = time.time() - float(t0.read_text())
-    for name in re.findall(r"@@@ (\S+)", cmd):
+    for name in re.findall(r"@@@ ([A-Za-z0-9_-]+)", cmd):
         print("\n@@@ %s" % name)
         print("recv %d" % int(rate * elapsed))
         print("connect_succ 600")
@@ -624,7 +822,10 @@ if url.endswith(":8080/metrics"):
     cut = False
     if (state / "canary").exists() and host == os.environ.get("FAKE_CUT_SCRAPES"):
         cut = True  # every scrape since the control ends mid-body
-    if (state / "rung").exists() and host == os.environ.get("FAKE_LOSE_THEN_CUT") and "-m" in sys.argv:
+    if (state / "rung").exists() and host == os.environ.get("FAKE_LOSE_THEN_CUT") and "-m" in sys.argv and "-fsS" not in sys.argv:
+        # Snapshots are `curl -s -m 10`; the connection poll is `curl -fsS -m 10`
+        # since it learned to fail closed. Only a SNAPSHOT may consume the one
+        # complete-but-seriesless scrape, or the guard never sees it.
         with open(state / f"lose-cut-{host}", "ab") as f:
             f.write(b"x")
             first = f.tell() == 1
@@ -747,6 +948,12 @@ if sys.argv[1:] == ["show", "-p", "MainPID", "--value", "mqttd"]:
         # that exercise the gate set their own.
         base = {"LANES": "E", "LANE_E_SITES_OVERRIDE": "1", "LANE_E_CONTROL": "0", "LANE_E_CALIBRATE": "0",
                 "LANE_E_STEADY_BUDGET": "5",
+                # These fleets talk to a FAKE ssh that returns instantly, so the
+                # ssh bound budgets.py parses out of the real lib.sh does not
+                # describe this transport — and a 5s steady budget really does fit
+                # three of these polls. Declared, not bypassed: the gate still
+                # runs, against the cost this rig actually pays.
+                "BUDGET_SCRAPE_SECS": "0.05",
                 "LANE_E_FORWARD_CANARY_COUNT": str(count), "FAKE_STATE": str(state),
                 "FAKE_BROKERS": str(nodes), "FAKE_CANARY_STREAM": str(stream),
                 "FAKE_RESTART_SCRAPE": str(self.rig / "testdata/lane-e/local-proof-n3/restart/metrics-restart-broker2.prom")}

@@ -77,6 +77,33 @@ HiveMQ CE  2024.3   ████████████████████
 5 nodes █████████████████████████████████  13.9k         p99 56 ms   1.63× one node
 ```
 
+**Cluster scale-out, QoS 1 shared subscriptions** (clean sessions, at-least-once
+both ways — no durable session, so this is the routing path, not the fsync one):
+
+```text
+3 nodes ██████████████████████░░░░░░░░░░░  120k msg/s   25.9 MB/s   p99 ≤ 5 ms   40.0k/node
+5 nodes █████████████████████████████████  180k         38.9 MB/s   p99 ≤ 5 ms   36.0k/node
+```
+
+MB/s is application payload (216 B/message). **The constraint is packets, not
+bytes** — measured: holding 60,000 msg/s and growing the payload to 8 KiB reached
+**492 MB/s** (1,576 Mbit/s per node) while softirq stayed flat at 24–34% across
+the whole 38× increase. So **small messages are the expensive case** — size a
+cluster on messages per second, not megabytes. 492 MB/s is a floor; nothing was
+saturated there.
+
+Three repetitions plus a passing control at each size, delivery matching offer to
+within 2 msg/s, 144M message identities reconciled with zero lost. **These are
+what the rig carried, and the rig ran out first**: one core of each broker host
+saturates on *network interrupt handling* (54.6% softirq, 1.2% idle, while its
+three siblings sit 33–39% idle), and mqttd's own hub loop was at **0.46 of a
+core** — roughly 2× headroom — measured by the broker's own dispatch metric
+rather than by sampling CPU. Spreading that softirq is a settled dead end for capacity
+(#505/#507: +1.9%, noise); the cause is **cross-node forwarding**, which is why
+`shared_prefer_local` is the default (#508/#511, +42% at N=5). Full method, the
+per-core breakdown, and two earlier revisions of this claim that were wrong:
+[QOS1-SCALE-CURVE.md](docs/benchmarks/QOS1-SCALE-CURVE.md).
+
 | more published points | |
 |---|---|
 | `$share` fan-out floor, 1 → 3 → 5 nodes | ~18.6k → ~53.9k → ~81.4k msg/s (driver-limited) |
@@ -506,7 +533,7 @@ Tracked on the [delivery dashboard](docs/delivery/STATUS.md).
 ```sh
 cargo build && cargo test && cargo clippy --all-targets && cargo deny check
 ./scripts/interop/run.sh     # foreign-client conformance
-mqttui --list                # There are 65 runnable scripts here: demos, smokes, migrations, benches
+mqttui --list                # There are 84 runnable scripts here: demos, smokes, migrations, benches
 ```
 
 ---

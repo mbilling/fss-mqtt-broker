@@ -1,0 +1,87 @@
+{
+  "healthy-under-120k": {
+    "hosts": [
+      "broker0",
+      "broker1",
+      "broker2",
+      "driver0",
+      "driver1",
+      "driver2",
+      "driver3",
+      "driver4",
+      "driver5",
+      "driver6",
+      "driver7"
+    ],
+    "phase": "results/nodes=3/laneE/sites-4/clock/preflight",
+    "run": "calibrate-d8-20260919T163522Z"
+  },
+  "host-below-reference-root-delay": {
+    "hosts": [
+      "broker0",
+      "broker1",
+      "broker2",
+      "driver0",
+      "driver1",
+      "driver2",
+      "driver3",
+      "driver4",
+      "driver5",
+      "driver6",
+      "driver7"
+    ],
+    "phase": "results/nodes=3/laneE/sites-4/clock/open",
+    "run": "calibrate-d8-20260919T163522Z"
+  },
+  "host-stale-under-load": {
+    "hosts": [
+      "broker0",
+      "broker1",
+      "broker2",
+      "driver0",
+      "driver1",
+      "driver2",
+      "driver3",
+      "driver4",
+      "driver5",
+      "driver6",
+      "driver7"
+    ],
+    "phase": "results/nodes=3/laneE/sites-1/clock/final",
+    "run": "calibrate-d8-20260919T152645Z"
+  },
+  "reference-between-upstream-polls": {
+    "hosts": [
+      "broker0",
+      "broker1",
+      "broker2",
+      "driver0",
+      "driver1",
+      "driver2",
+      "driver3",
+      "driver4",
+      "driver5",
+      "driver6",
+      "driver7"
+    ],
+    "phase": "results/nodes=3/laneE/sites-1/clock/sample-2",
+    "run": "calibrate-d8-20260919T140651Z"
+  },
+  "shared-upstream-path": {
+    "hosts": [
+      "broker0",
+      "broker1",
+      "broker2",
+      "driver0",
+      "driver1",
+      "driver2",
+      "driver3",
+      "driver4",
+      "driver5",
+      "driver6",
+      "driver7"
+    ],
+    "phase": "results/nodes=3/clock-preflight",
+    "run": "calibrate-d8-20260919T134958Z"
+  }
+}

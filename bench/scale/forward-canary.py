@@ -636,7 +636,10 @@ def run(brokers: Sequence[Tuple[str, int, int]], count: int, timeout: float, str
     for pair in pairs:
         rows.append("broker%d\tbroker%d\t%d\t%d" % (pair + burst_count(pair)))
     emitter.emit("clients.tsv", "\n".join(rows) + "\n")
-    trailer = ["status\t%s" % status, "count\t%d" % count, "nodes\t%d" % nodes, "nonce\t%s" % nonce]
+    # `qos` is recorded because the ledger's strictness depends on it: at-least-once
+    # permits a redelivery, exactly-once and at-most-once do not.
+    trailer = ["status\t%s" % status, "count\t%d" % count, "nodes\t%d" % nodes,
+               "nonce\t%s" % nonce, "qos\t%d" % qos]
     emitter.emit("timeline.tsv", "\n".join(events + trailer) + "\n")
     return 0 if status == "complete" else 3
 
@@ -718,7 +721,7 @@ def _read_timeline(path: Path) -> Dict[str, str]:
     keys = {}  # type: Dict[str, str]
     for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
         head, _, rest = line.partition("\t")
-        if head in ("status", "count", "nodes", "nonce"):
+        if head in ("status", "count", "nodes", "nonce", "qos"):
             keys[head] = rest.strip()
     return keys
 
@@ -735,9 +738,14 @@ def ledger_report(directory: object, nodes: int, count: int) -> Tuple[str, Dict[
         return "fail", floors, lines, ["canary directory %s is missing" % d]
     local = nodes == 1
     per = count if local else count * (nodes - 1)
+    qos = 0  # fixtures written before the trailer carried it are QoS 0 runs
 
     try:
         keys = _read_timeline(d / "timeline.tsv")
+        try:
+            qos = int(keys.get("qos", "0"))
+        except ValueError:
+            errors.append("timeline.tsv qos=%s is not an integer" % keys.get("qos"))
         if keys.get("status") != "complete":
             errors.append("timeline.tsv status=%s, want complete" % keys.get("status", "absent"))
         if keys.get("nodes") != str(nodes):
@@ -772,8 +780,15 @@ def ledger_report(directory: object, nodes: int, count: int) -> Tuple[str, Dict[
                 errors.append("clients.tsv repeats pair %s" % name)
             got_pairs.add(pair)
             seen_n, distinct_n = int(cols[2]), int(cols[3])
-            if seen_n != count or distinct_n != count:
+            # DISTINCT identities are the claim — every message arrived, none was
+            # invented — and they must be exact at any QoS. Total SIGHTINGS may
+            # exceed them at QoS >= 1, where a retransmission is legal: measured
+            # 2026-09-20 at N=5, one publish from broker1 was sent twice and its
+            # fan-out made every pair read 101/100. The run was refused for it.
+            if distinct_n != count or seen_n < count or (seen_n != count and qos < 1):
                 errors.append("pair %s member saw burst_seen=%d burst_distinct=%d, want %d" % (name, seen_n, distinct_n, count))
+            elif seen_n > count:
+                lines.append("pair %s saw %d duplicate(s) (QoS %d permits retransmission)" % (name, seen_n - count, qos))
         for pair in want_pairs:
             if pair not in got_pairs:
                 errors.append("clients.tsv is missing pair broker%d->broker%d" % pair)
@@ -806,6 +821,12 @@ def ledger_report(directory: object, nodes: int, count: int) -> Tuple[str, Dict[
         # Absent in a validated, EOF-terminated scrape means the lazy family has no child yet: zero.
         deltas = [
             ("received_delta", post.family(RECEIVED) - pre.family(RECEIVED), per),
+            # At QoS >= 1 this is a FLOOR, not an equality. The members acknowledge
+            # precisely so the broker's outbound window does not redeliver, but the
+            # ack and the redelivery timer race, and at-least-once makes the extra
+            # copy LEGAL. A duplicate does not disprove forwarding; a shortfall
+            # does. Measured 2026-09-20 at N=5: broker4 delivered 401 of a wanted
+            # 400 and the run was refused before a single rung was measured.
             ("delivered_delta", post.family(DELIVERED) - pre.family(DELIVERED), per),
             ("dropped_delta", post.family(DROPPED) - pre.family(DROPPED), 0),
             ("subscriber_remote_delta", (or_post or 0.0) - (or_pre or 0.0), 0),
@@ -814,6 +835,14 @@ def ledger_report(directory: object, nodes: int, count: int) -> Tuple[str, Dict[
         if not local and sr_post is None:
             errors.append('broker%d: %s{reason="shared-remote"} absent after the canary' % (i, FORWARDED))
         for key, got, want in deltas:
+            if key == "delivered_delta" and qos >= 1:
+                if got < want:
+                    errors.append("broker%d: %s=%s, want at least %d (QoS %d)" % (i, key, _num(got), want, qos))
+                elif got > want:
+                    # Reported, never fatal: the duplicate count is evidence about
+                    # the run, and hiding it would be as wrong as failing on it.
+                    lines.append("broker%d redelivered %d (QoS %d permits it)" % (i, int(got - want), qos))
+                continue
             if got != want:
                 errors.append("broker%d: %s=%s, want %d" % (i, key, _num(got), want))
         # The burst ran between these two scrapes: the mesh must be whole at both ends.
@@ -1858,6 +1887,43 @@ class RunTests(unittest.TestCase):
                 conn.disconnect()
         finally:
             fake.close()
+
+    def test_a_qos1_redelivery_is_reported_not_failed(self) -> None:
+        """2026-09-20, N=5: broker4 delivered 401 against a wanted 400 and the
+        whole run was refused before a rung ran. The members ack precisely to
+        stop the outbound window redelivering, but the ack races the redelivery
+        timer and at-least-once makes the extra copy legal. A shortfall is still
+        fatal — that would be lost forwarding."""
+        fake = FakeCluster(2)
+        try:
+            rc, chunks, stderr = _run_via_stdin(fake.specs(), 20, 20, qos=1)
+            fake.settle(6)
+        finally:
+            fake.close()
+        self.assertEqual((rc, stderr), (0, ""))
+        d = self.capture(chunks)
+        status, _, lines, errors = ledger_report(d, 2, 20)
+        self.assertEqual(errors, [])
+        self.assertEqual(status, "pass")
+        if True:
+            def bump(path: Path, by: int) -> None:
+                text = path.read_text(encoding="utf-8")
+                for line in text.splitlines():
+                    if line.startswith(DELIVERED) and not line.startswith("#"):
+                        name, _, value = line.rpartition(" ")
+                        text = text.replace(line, "%s %d" % (name, int(float(value)) + by), 1)
+                        break
+                path.write_text(text, encoding="utf-8")
+
+            post = d / "metrics-post-broker1.prom"
+            bump(post, 1)
+            status, _, lines, errors = ledger_report(d, 2, 20)
+            self.assertEqual(errors, [], "a duplicate must not fail the control")
+            self.assertTrue(any("redelivered 1" in l for l in lines), lines)
+
+            bump(post, -3)  # now two SHORT of the floor
+            _, _, _, errors = ledger_report(d, 2, 20)
+            self.assertTrue(any("want at least" in e for e in errors), errors)
 
     def test_mesh_run_at_qos1_acks_every_publish_and_passes_the_ledger(self) -> None:
         # The whole point of the QoS 1 port: the ledger is only a ledger if every

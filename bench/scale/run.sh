@@ -211,8 +211,15 @@ for pattern in ('terraform.tfvars', '*.auto.tfvars', 'terraform.tfvars.json', '*
 if not sizes or any(s not in ('1','3','5','7','10') for s in sizes):
     refuse('sizes must be 1, 3, 5, 7 or 10')
 count = os.environ['DRIVER_COUNT']
-if not re.fullmatch(r'[1-9][0-9]*', count) or int(count) > 12:
-    refuse('DRIVER_COUNT must be an integer within the provider limit')
+# 20, not 12: the project's quota was raised to 30 servers / 200 vCPUs on
+# 2026-09-15, and 10 CCX23 brokers + 20 CCX33 drivers is exactly that — 30
+# servers, 200 vCPUs. The old cap predated the raise and refused shapes the
+# project can now afford: a 7-node run at 9 sites needs 18 drivers to keep the
+# proven 3-containers-per-driver density, and was refused at 172 vCPUs.
+# terraform/quota.tf remains the real gate, enforced at plan time against the
+# ACTUAL server types, so this is a fast sanity bound rather than the authority.
+if not re.fullmatch(r'[1-9][0-9]*', count) or int(count) > 20:
+    refuse('DRIVER_COUNT must be an integer <= 20 (the 30-server / 200-vCPU project quota; terraform/quota.tf enforces the real bound per server type)')
 plan = os.environ['DRIVER_TYPE']
 cores = os.getenv('DRIVER_VCPUS')
 if cores is None:
