@@ -565,6 +565,38 @@ with_cpu_sampling "$3" work
         self.assertIn("one entry per rung", bad.stderr)
         self.assertEqual(self.calls(), [])
 
+    def test_lane_e_refuses_subscribers_that_cannot_cover_every_broker(self):
+        """Each subscriber container round-robins its OWN clients over
+        rotated_hosts(container), so C containers of K clients cover C+K-1 of N
+        brokers — not C*K. At 7 nodes, 10 consumers in 2 containers covered six
+        of seven; the seventh had no local shared member and 14.3% of publishes
+        forwarded, which reads as a capacity loss and is not one (2026-09-23)."""
+        inventory = self.root / "cover-inv.json"
+        inventory.write_text(json.dumps({"brokers": [{}] * 7, "drivers": [{"vcpus": 8}] * 12}))
+        common = dict(LANES="E", SHAPE_ONLY="1", LANE_E_QOS="1",
+                      LANE_E_SITES_OVERRIDE="1", LANE_E_PLACEMENT="container",
+                      LANE_E_SUB_CONTAINERS_PER_SITE="2")
+        bad = self.run_script("run-curve.sh", str(self.root / "cover-bad"), str(inventory),
+                              LANE_E_SUBS_PER_SITE="10", **common)
+        self.assertNotEqual(bad.returncode, 0)
+        self.assertIn("cover only 6 of 7 brokers", bad.stderr)
+        self.assertIn("LANE_E_SUBS_PER_SITE=14", bad.stderr, "the message must name the fix")
+
+        # 2 containers x 7 clients: each spans the cluster.
+        out = self.root / "cover-ok"
+        good = self.run_script("run-curve.sh", str(out), str(inventory),
+                               LANE_E_SUBS_PER_SITE="14", **common)
+        self.assertEqual(good.returncode, 0, good.stderr)
+        self.assertIn("cover all 7 brokers", (out / "results/nodes=7/laneE/shape.txt").read_text())
+
+        # And the DEFAULT now scales with N, so the trap cannot be re-entered by
+        # simply not setting it: 2 containers at 7 nodes defaults to 14.
+        auto = self.root / "cover-auto"
+        r = self.run_script("run-curve.sh", str(auto), str(inventory), **common)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("$share group of 14", (auto / "results/nodes=7/laneE/shape.txt").read_text())
+        self.assertEqual(self.calls(), [])
+
     def test_lane_e_pins_the_mqtt_protocol_version(self):
         # v5 is the only version where the broker enforces Receive Maximum on
         # QoS 1 (DISCONNECT 0x93). emqtt-bench 0.6.3 defaults to 5 today, so
@@ -583,16 +615,28 @@ with_cpu_sampling "$3" work
         self.assertIn("pub -h $hosts -p $port -V $LANE_E_PROTO", src)
 
     def test_multiple_subscriber_containers_do_not_imply_full_local_coverage(self):
+        """6 consumers in 3 containers is 2 each, and each container round-robins
+        its own 2 over rotated_hosts(container): {0,1} u {1,2} u {2,3} leaves
+        broker 4 of 5 with no local shared member. The shape used to WARN and let
+        it run; since 2026-09-24 it refuses, because the warning was read past
+        for a whole campaign and the resulting 14.3% crossing at 7 nodes was
+        misread as a scaling law."""
         inventory = self.root / "inventory.json"
         inventory.write_text(json.dumps({"brokers": [{}] * 5, "drivers": [{"vcpus": 8}] * 5}))
         out = self.root / "multi-sub-shape"
         result = self.run_script("run-curve.sh", str(out), str(inventory), LANES="E", SHAPE_ONLY="1",
                                  LANE_E_PIN_SITES="0", LANE_E_SUBS_PER_SITE="6",
                                  LANE_E_SUB_CONTAINERS_PER_SITE="3", LANE_E_SITES_OVERRIDE="1")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        shape = (out / "results/nodes=5/laneE/shape.txt").read_text()
-        self.assertIn("verify actual broker coverage", shape)
-        self.assertNotIn("predicted crossing ≈ 0%", shape)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("cover only 4 of 5 brokers", result.stderr)
+        self.assertIn("LANE_E_SUBS_PER_SITE=15", result.stderr, "the message must name the fix")
+        # Deliberate affinity is still allowed: PIN_SITES says the crossing is
+        # the point of the measurement, not an accident of the allocation.
+        pinned = self.run_script("run-curve.sh", str(self.root / "multi-sub-pinned"), str(inventory),
+                                 LANES="E", SHAPE_ONLY="1", LANE_E_PIN_SITES="1",
+                                 LANE_E_SUBS_PER_SITE="6", LANE_E_SUB_CONTAINERS_PER_SITE="3",
+                                 LANE_E_SITES_OVERRIDE="1")
+        self.assertEqual(pinned.returncode, 0, pinned.stderr)
         self.assertEqual(self.calls(), [])
 
     def test_lane_e_container_placement_spreads_one_site(self):

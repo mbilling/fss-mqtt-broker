@@ -14,8 +14,8 @@ variable "driver_count" {
   default     = 2
 
   validation {
-    condition     = var.driver_count >= 1 && var.driver_count <= 12 && floor(var.driver_count) == var.driver_count
-    error_message = "driver_count must be an integer between 1 and 12. Six CCX33s offer ~240k msg/s on lane B (the fan-out knee hunt at 7 nodes); lane E deals sites round-robin at 3 one-vCPU containers each, so the busiest driver holds ceil(sites/drivers)*3 <= 8 and more drivers are what reach more sites. The cap was 8 while the project allowed 100 vCPUs; since 2026-09-15 it allows 30 servers / 200 vCPUs, and 10 x ccx23 + 12 x ccx33 = 136 vCPU on 22 servers fits both. quota.tf refuses the combinations that do not."
+    condition     = var.driver_count >= 1 && var.driver_count <= 20 && floor(var.driver_count) == var.driver_count
+    error_message = "driver_count must be an integer between 1 and 20. Six CCX33s offer ~240k msg/s on lane B (the fan-out knee hunt at 7 nodes); lane E deals sites round-robin at 3 one-vCPU containers each, so the busiest driver holds ceil(sites/drivers)*3 <= 8 and more drivers are what reach more sites. The cap was 8 while the project allowed 100 vCPUs, then 12; since 2026-09-15 the project allows 30 servers / 200 vCPUs, and 10 x ccx23 + 20 x ccx33 = 200 vCPU on 30 servers is exactly that. 12 was a shape that fits rather than the largest one: it refused a 7-node run at 9 sites, which needs 18 drivers to hold the proven 3 containers per driver and costs 172 vCPU on 25 servers. quota.tf remains the authority and refuses the combinations that do not fit."
   }
 }
 

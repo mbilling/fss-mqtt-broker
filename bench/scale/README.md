@@ -20,7 +20,8 @@ The prerequisites and pricing below describe the default Hetzner platform.
    small for the scale-out sizes; this rig's project runs at **30 servers / 200
    vCPUs** (raised 2026-09-15), which `terraform/quota.tf` enforces at plan time
    (`server_quota`, `vcpu_quota`). The largest shape the rig can express, 10
-   brokers + 12 drivers, is 22 servers / 136 vCPUs on CCX23 + CCX33.
+   brokers + 20 drivers, is 30 servers / 200 vCPUs on CCX23 + CCX33 — exactly the
+   quota, which `quota.tf` rejects anything beyond.
 2. **A Read & Write API token** for that project → `export HCLOUD_TOKEN=...` in
    the shell that runs the rig. Never committed, never a CI secret.
 3. **An SSH keypair.** The default is `~/.ssh/id_ed25519`; for any other key

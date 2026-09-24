@@ -375,7 +375,8 @@ LANE_E_PUBS_PER_SITE="${LANE_E_PUBS_PER_SITE:-1200}"
 # per site puts each at 15,000 msg/s — past everything we have sustained — and
 # the FIRST rung would have failed for a reason that has nothing to do with
 # tenancy. Six puts each consumer at 5,000, inside the band worth advertising.
-LANE_E_SUBS_PER_SITE="${LANE_E_SUBS_PER_SITE:-6}"
+# LANE_E_SUBS_PER_SITE is derived from N and the container count; both are
+# known only further down, so the default is set there.
 LANE_E_QOS="${LANE_E_QOS:-0}"
 # Pinned, not inherited. emqtt-bench 0.6.3 defaults to -V 5 today, and v5 is the
 # only version where the broker ENFORCES Receive Maximum on QoS 1 (conn.rs:
@@ -429,6 +430,21 @@ LANE_E_PAYLOAD="${LANE_E_PAYLOAD:-200}"
 # comfortably inside the 20,000/container the T7 probe held exactly.
 LANE_E_PUB_CONTAINERS_PER_SITE="${LANE_E_PUB_CONTAINERS_PER_SITE:-2}"
 LANE_E_SUB_CONTAINERS_PER_SITE="${LANE_E_SUB_CONTAINERS_PER_SITE:-1}"
+# Consumers per site. The default is a FUNCTION OF THE CLUSTER SIZE, because a
+# fixed count silently stops covering every broker as N grows: each subscriber
+# container round-robins its OWN clients over `rotated_hosts <container-index>`,
+# so a container of K clients covers K brokers starting at its own rotation, and
+# C containers cover C+K-1 of N. At 7 nodes, 10 consumers in 2 containers covered
+# six brokers of seven — the seventh had no local shared member, 14.3% of
+# publishes forwarded under prefer-local, and per-message CPU rose 40% (measured
+# 2026-09-23; it was misread as a scaling law until the crossing counter was
+# checked). C x N gives every container the whole cluster; `max` keeps the
+# historical 10 for the sizes already published.
+lane_e_default_subs() {
+    local want=$((LANE_E_SUB_CONTAINERS_PER_SITE * N))
+    [ "$want" -ge 10 ] && echo "$want" || echo 10
+}
+LANE_E_SUBS_PER_SITE="${LANE_E_SUBS_PER_SITE:-$(lane_e_default_subs)}"
 LANE_E_CONNECT_RATE="${LANE_E_CONNECT_RATE:-500}"
 LANE_E_SETTLE="${LANE_E_SETTLE:-20}"
 LANE_E_MIN_INTERVAL="${LANE_E_MIN_INTERVAL:-5}"
@@ -945,7 +961,20 @@ lane_e_shape() {
 			echo "site affinity: off — every container spans all $N brokers (rotated_hosts)."
 			echo "               Cluster default is prefer-local (#511), not global round-robin."
 			if [ "$LANE_E_SUB_CONTAINERS_PER_SITE" -ne 1 ]; then
-				echo "               Multiple subscriber containers: verify actual broker coverage; total subscribers alone is insufficient."
+				# Coverage is computed, not asserted. Container c holds K clients
+				# and dials rotated_hosts(c), so it covers brokers c..c+K-1 mod N;
+				# the union over C containers is what decides whether any broker
+				# is left without a local shared member.
+				local e_k=$((LANE_E_SUBS_PER_SITE / LANE_E_SUB_CONTAINERS_PER_SITE))
+				local e_cov
+				e_cov=$(python3 -c "
+import sys
+N,C,K=int(sys.argv[1]),int(sys.argv[2]),int(sys.argv[3])
+print(len({(c+i)%N for c in range(C) for i in range(K)}))" "$N" "$LANE_E_SUB_CONTAINERS_PER_SITE" "$e_k")
+				if [ "$e_cov" -lt "$N" ]; then
+					die "lane E: $LANE_E_SUBS_PER_SITE consumers in $LANE_E_SUB_CONTAINERS_PER_SITE containers cover only $e_cov of $N brokers. Each container round-robins its own $e_k clients over rotated_hosts(container), so $((N - e_cov)) broker(s) would hold no local shared member and ~$(( (N - e_cov) * 100 / N ))% of publishes would forward under prefer-local — which reads as a capacity loss and is not one. Set LANE_E_SUBS_PER_SITE=$((LANE_E_SUB_CONTAINERS_PER_SITE * N)) (every container spans the cluster), or LANE_E_PIN_SITES=1 to measure affinity deliberately."
+				fi
+				echo "               $LANE_E_SUB_CONTAINERS_PER_SITE subscriber containers x $e_k clients cover all $N brokers → predicted crossing ≈ 0%."
 			elif [ "$LANE_E_SUBS_PER_SITE" -ge "$N" ]; then
 				echo "               LANE_E_SUBS_PER_SITE=$LANE_E_SUBS_PER_SITE ≥ N=$N, so every node has a"
 				echo "               local shared member → predicted crossing ≈ 0%."
