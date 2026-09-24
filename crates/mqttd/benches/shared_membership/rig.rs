@@ -259,14 +259,40 @@ impl Rig {
                 .unwrap();
         }
         rig.barrier().await;
-        for peer in &rig.peers {
-            let frames = peer.request().await.unwrap();
-            assert!(frames
-                .iter()
-                .any(|f| matches!(f, PeerMessage::Interest { .. })));
-            assert_control_only(&frames);
+        // The INTEREST snapshot is what proves the link registered — but only
+        // once the hub is willing to gossip one. `peer_connected` sends it under
+        // `if self.interest_authoritative`, and a CLUSTERED hub holds that false
+        // until a complete scan lands over a WHOLE mesh (0043-P4 exhibit 2).
+        // With a placement full of alive peers that cannot happen until every
+        // `PeerConnected` has been dispatched AND a later sweep-tick scan lands,
+        // which is seconds away. So on the clustered path this proof belongs
+        // after the settle loop, and `gated` runs it there; asserting it here
+        // demanded a frame the hub was still correctly suppressing.
+        //
+        // The QoS 0 path has `placement: None`, so `mesh_whole()` is trivially
+        // true, the boot scan settles it in milliseconds, and the proof is
+        // meaningful right here — which is why the QoS 0 arms never caught this.
+        if !clustered {
+            rig.verify_peer_registration().await;
         }
         rig
+    }
+
+    /// Every connected peer received this node's INTEREST snapshot, and nothing
+    /// but control traffic. A shape whose `PeerConnected` silently failed to
+    /// register would otherwise measure an arm it is not labelled as.
+    #[allow(dead_code)]
+    pub async fn verify_peer_registration(&self) {
+        for peer in &self.peers {
+            let frames = peer.request().await.unwrap();
+            assert!(
+                frames
+                    .iter()
+                    .any(|f| matches!(f, PeerMessage::Interest { .. })),
+                "a connected peer never received the interest snapshot, so this                  arm's links are not proven registered"
+            );
+            assert_control_only(&frames);
+        }
     }
 
     async fn attach(&mut self, drain: &Runtime, i: usize) {
@@ -349,6 +375,14 @@ impl Rig {
         tokio::time::timeout(SETTLE_DEADLINE, rig.await_settled())
             .await
             .expect("routing view never settled; a gated burst would time the HOLD path");
+        // Settled means the hub has gossiped, so the registration proof that
+        // `setup_with` deliberately skipped on this path is now available.
+        tokio::time::timeout(SETTLE_DEADLINE, async {
+            rig.barrier().await;
+            rig.verify_peer_registration().await;
+        })
+        .await
+        .expect("peer registration deadline");
         rig
     }
 
