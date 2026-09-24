@@ -79,6 +79,15 @@ mod policy;
 pub use policy::BrownoutAxis;
 mod retained;
 use retained::{retained_value_id, RetainedMutation, RetainedWindow};
+/// Cached mesh-wholeness answers and their staleness rule (issue #613 item 1.1).
+mod mesh;
+/// Test-only work counters (issue #613) — the proof that removed per-publish
+/// work stays removed.
+#[cfg(test)]
+mod probe;
+/// The pure ack-honesty rules a gated publish passes through (issue #613 items
+/// 2.1 and 2.4).
+mod settle;
 
 /// Maximum number of queued messages replayed to a reconnecting session at once.
 const REPLAY_LIMIT: usize = 10_000;
@@ -142,6 +151,17 @@ const RETAINED_ANTIENTROPY_EVERY: u32 = 30;
 /// it runs at a coarse cadence rather than every second.
 const EXPIRY_RECONCILE_EVERY: u32 = 30;
 
+/// How many sweep ticks a hub may suppress its interest gossip before the
+/// liveness backstop forces it authoritative (issue #613 item 2.6).
+///
+/// Distinct from [`EXPIRY_RECONCILE_EVERY`], which it used to borrow: that is
+/// "how often is re-enumerating the store worth it", this is "how long may this
+/// node's live clients stay invisible to the cluster before we stop waiting for
+/// a scan that is never going to complete". A healthy boot scan lands in
+/// milliseconds and is retried on each of the first eight ticks, so ten seconds
+/// is generous; thirty was a coincidence of numbers.
+const INTEREST_AUTHORITATIVE_BACKSTOP_TICKS: u32 = 10;
+
 /// How long a fresh subscription's retained-delivery window stays open (issue #219).
 ///
 /// A retained update is delivered live by its landing node's interest-forward, which
@@ -185,6 +205,9 @@ type SharedKey = (String, String);
 
 /// A shared group keyed for selection, with its global candidate list (ADR 0015).
 type SharedMatch = (SharedKey, Vec<SharedCandidate>);
+/// Within one filter, group name → locations in sorted node/member-source order.
+/// Grouping at rebuild time lets a local decision skip all peers of that group.
+type RemoteGroupsByName = BTreeMap<String, Vec<(NodeId, usize)>>;
 
 /// One candidate recipient for a shared group's single cluster-wide delivery: a
 /// local member (`node` = `None`) or a member on a peer (ADR 0015).
@@ -535,6 +558,11 @@ pub enum PublishRefusal {
     /// A retained publish would have created a NEW retained topic beyond the cap
     /// (ADR 0041 T4): nothing was delivered or retained.
     RetainedQuota,
+    /// The pending-publish table is at [`PENDING_PUBLISH_CAP`] and no entry is
+    /// old enough to evict, so the ARRIVING publish was refused before any side
+    /// effect. Nothing was stored anywhere — the strongest form of the claim
+    /// `Refused` makes (issue #613 item 2.4).
+    PendingCap,
 }
 
 impl PublishRefusal {
@@ -544,7 +572,9 @@ impl PublishRefusal {
     #[must_use]
     pub fn v5_reason(self) -> u8 {
         match self {
-            Self::Brownout | Self::RetainedQuota => mqtt_codec::reason::QUOTA_EXCEEDED,
+            Self::Brownout | Self::RetainedQuota | Self::PendingCap => {
+                mqtt_codec::reason::QUOTA_EXCEEDED
+            }
         }
     }
 
@@ -552,8 +582,11 @@ impl PublishRefusal {
     #[must_use]
     pub fn v311(self) -> Refusal311 {
         match self {
-            Self::Brownout => Refusal311::CloseNoAck,
             Self::RetainedQuota => Refusal311::PlainAck,
+            // `PendingCap` shares Brownout's answer on purpose: the broker could
+            // not take the message at all, so a PUBACK would be a lie
+            // (issue #613 item 2.4).
+            Self::Brownout | Self::PendingCap => Refusal311::CloseNoAck,
         }
     }
 
@@ -563,6 +596,7 @@ impl PublishRefusal {
         match self {
             Self::Brownout => "brownout",
             Self::RetainedQuota => "retained-quota",
+            Self::PendingCap => "pending-cap",
         }
     }
 
@@ -577,6 +611,7 @@ impl PublishRefusal {
         match self {
             Self::Brownout => 1,
             Self::RetainedQuota => 2,
+            Self::PendingCap => 3,
         }
     }
 
@@ -589,6 +624,7 @@ impl PublishRefusal {
         match code {
             1 => Some(Self::Brownout),
             2 => Some(Self::RetainedQuota),
+            3 => Some(Self::PendingCap),
             _ => None,
         }
     }
@@ -1871,13 +1907,12 @@ pub struct Hub {
     /// filter matched: a node that merely KNEW about 4 peers lost half its
     /// publish dispatch (`crates/mqttd/benches/shared_plan.rs`).
     remote_shared_index: FilterIndex,
-    /// Filter → the peers announcing it, each with its index into that peer's
-    /// `remote_shared` vector. Built in sorted node order, which is what makes
-    /// the candidate list stable per publish WITHOUT the per-publish sort the
-    /// `BTreeMap` collect used to provide — the round-robin cursor indexes into
-    /// that list, so an order that varied between publishes would make selection
-    /// arbitrary.
-    remote_by_filter: HashMap<FilterKey, Vec<(NodeId, usize)>>,
+    /// Filter → group name → locations in peers' `remote_shared` vectors.
+    /// Group identity is resolved at membership rate, so a locally decided group
+    /// is skipped once, not once per announcing peer (#613). Each group's locations
+    /// retain sorted node order and within-node source order: hot selection, cold
+    /// reselection and admission fallback must agree on the same cursor positions.
+    remote_by_filter: HashMap<FilterKey, RemoteGroupsByName>,
     /// Per-group round-robin cursor for cluster-wide shared selection (ADR 0015).
     /// Round-robin cursors, keyed by `shared_cursor_hash(group, filter)` with the
     /// owned key kept beside the value for collision checking (issue #490).
@@ -1896,6 +1931,11 @@ pub struct Hub {
     allow_relaxed_publish: bool,
     /// `MQTTD_SHARED_PREFER_LOCAL`: prefer a local member in shared selection.
     shared_prefer_local: bool,
+    /// `MQTTD_SHARED_LOCAL_BIAS`: how often the local preference fires, per mille
+    /// 0..=1000 (issue #613 item 3.4). Consulted only INSIDE the existing
+    /// `shared_prefer_local` guards, so the boolean stays the outer gate and 1000
+    /// — the constructor's value — is bit-identical to today.
+    shared_local_bias_permille: u16,
     /// ADR 0073: the cluster-wide scale-out ownership capability. `Some((flag,
     /// enabled))` on a cluster node: `enabled` is the operator's
     /// `durable.ownership_domain = "members"` choice; `flag` is the shared verdict
@@ -2080,6 +2120,16 @@ pub struct Hub {
     /// (filter -> nodes) so a publish resolves its forward targets in one trie
     /// walk instead of scanning every peer's filter set. See [`InterestIndex`].
     interest: InterestIndex,
+    /// Scratch for the per-publish interested-node set (issue #613 item 1.4).
+    /// Owned by the Hub so `forward_to_peers` reuses one allocation instead of
+    /// building two hash sets and a `String` per interested node on every
+    /// message. Taken and restored inside that function; its contents are
+    /// meaningful only for the duration of one call.
+    interest_scratch: Vec<ClientId>,
+    /// Cached mesh-wholeness answers (issue #613 item 1.1). Stamped with the
+    /// placement view they were computed on, so a membership change this hub has
+    /// not observed yet reads conservatively rather than wrongly.
+    mesh: mesh::MeshCache,
     /// Live session-placement ring (ADR 0005). `None` outside a cluster. Read at
     /// persistent CONNECT to identify the session's owner.
     placement: Option<Arc<RwLock<Placement>>>,
@@ -2151,6 +2201,11 @@ pub struct Hub {
     /// (ADR 0041 §6), so this is never swapped mid-flight. `Default` is exactly the
     /// former hard-coded behaviour.
     subscriber_limits: SubscriberLimits,
+    /// Test-only work counters (issue #613): the proof that removed per-publish
+    /// work stays removed. `Arc` because [`run`](Self::run) consumes the hub by
+    /// value, so a test takes its handle through [`probe`](Self::probe) first.
+    #[cfg(test)]
+    probe: std::sync::Arc<probe::HubProbe>,
 }
 
 /// The bounded `{reason}` label for a durable-append failure (ADR 0020-T6).
@@ -2192,6 +2247,21 @@ const RETAINED_QUEUE_CAP: usize = 1024;
 /// At the cap the **oldest** pending publish is dropped loudly — its ack is
 /// withheld, so the publisher retries (never an ack for an unowned message).
 const PENDING_PUBLISH_CAP: usize = 4096;
+
+/// How old the OLDEST pending publish must be before the cap evicts it rather
+/// than refusing the arriving publish (issue #613 item 2.4).
+///
+/// Derived: 4 x [`EXPIRY_RECONCILE_EVERY`] (30 ticks) x [`SESSION_SWEEP_INTERVAL`]
+/// (1 s/tick) = 120 s, i.e. four full reconcile cadences, so no takeover window
+/// still legitimately in progress can be mistaken for a leak.
+///
+/// CAVEAT, recorded rather than hidden: nothing in the tree states how long a
+/// pending publish may LEGITIMATELY live. [`REROUTE_GRACE_TICKS`] is 8 (8 s), and
+/// the settle hold is bounded only by `routing_unsettled()` going false, which
+/// has no stated upper bound at all. If a real partition can hold it true for
+/// longer than this, the backstop evicts LIVE publishes and withholds their acks
+/// — the very defect item 2.4 removes, reintroduced on a timer.
+const PENDING_PUBLISH_MAX_AGE: Duration = Duration::from_secs(120);
 
 /// The first peer-bus proto that can carry a forward VERDICT rather than a bool
 /// ([`PeerMessage::PublishVerdict`], [`PeerMessage::SharedDeliverAcked`] — 0041-T12,
@@ -2281,6 +2351,11 @@ impl Hub {
                 durable_plane: None,
                 allow_relaxed_publish: false,
                 shared_prefer_local: false,
+                // 1000, not 0: `shared_prefer_local` already defaults to false,
+                // so the bias is unconsulted until something turns prefer-local
+                // on — and at 1000 every existing `set_shared_prefer_local(true)`
+                // call site keeps today's behaviour with no edit (issue #613).
+                shared_local_bias_permille: 1000,
                 ownership_domain: None,
                 known_peer_protos: HashMap::new(),
                 retained: Arc::new(MemoryRetainedStore::new()),
@@ -2326,10 +2401,14 @@ impl Hub {
                 ownership_epoch_seen: None,
                 peers: HashMap::new(),
                 interest: InterestIndex::default(),
+                interest_scratch: Vec::new(),
+                mesh: mesh::MeshCache::default(),
                 placement,
                 metrics: None,
                 clock: crate::clock::system_clock(),
                 subscriber_limits: SubscriberLimits::default(),
+                #[cfg(test)]
+                probe: std::sync::Arc::default(),
             },
             tx,
         )
@@ -2352,6 +2431,35 @@ impl Hub {
         self.shared_prefer_local = on;
     }
 
+    /// How often the local `$share` preference fires, PER MILLE (0..=1000) —
+    /// `MQTTD_SHARED_LOCAL_BIAS` (issue #613 item 3.4).
+    ///
+    /// The unit is load-bearing: per mille, `u16`, not a percent and not an
+    /// `f64`. `mqtt_config::Cluster` derives `Eq`, so an `f64` field could not
+    /// live there, and an integer keeps the per-message test exact. A consumer
+    /// written against a 0..=100 percent would silently deliver one tenth of the
+    /// configured locality, and no config test would catch it — the config tests
+    /// never see the hub.
+    ///
+    /// The `.min(1000)` is belt and braces only: `mqtt-config` refuses an
+    /// out-of-range value at startup, so this clamp cannot fire from the real
+    /// config path. It exists so a test or bench poking a raw number cannot make
+    /// the field lie.
+    pub fn set_shared_local_bias_permille(&mut self, permille: u16) {
+        self.shared_local_bias_permille = permille.min(1000);
+    }
+
+    /// The EFFECTIVE local bias: 0 when `shared_prefer_local` is off, otherwise
+    /// the configured per mille. `delivery.rs` reads only this, so
+    /// `MQTTD_SHARED_PREFER_LOCAL=0` folds in as bias 0 in exactly one place.
+    pub(super) fn shared_local_bias_permille(&self) -> u16 {
+        if self.shared_prefer_local {
+            self.shared_local_bias_permille
+        } else {
+            0
+        }
+    }
+
     /// Rebuild the derived remote-shared match index from `remote_shared`.
     ///
     /// Called on every change to a peer's shared interest and on peer death —
@@ -2361,12 +2469,12 @@ impl Hub {
     /// the right trade against an incremental update that could silently diverge
     /// from the source of truth.
     ///
-    /// Nodes are visited in sorted order so each filter's peer list is stable —
+    /// Nodes are visited in sorted order so each group's peer list is stable —
     /// the property the per-publish `BTreeMap` collect used to buy, now paid for
     /// once per membership change instead of once per message.
     fn rebuild_remote_shared_index(&mut self) {
         let mut index = FilterIndex::new();
-        let mut by_filter: HashMap<FilterKey, Vec<(NodeId, usize)>> = HashMap::new();
+        let mut by_filter: HashMap<FilterKey, RemoteGroupsByName> = HashMap::new();
         let mut nodes: Vec<&NodeId> = self.remote_shared.keys().collect();
         nodes.sort();
         for node in nodes {
@@ -2374,15 +2482,17 @@ impl Hub {
                 continue;
             };
             for (idx, g) in groups.iter().enumerate() {
-                match by_filter.entry(FilterKey::from(g.filter.as_str())) {
+                let by_group = match by_filter.entry(FilterKey::from(g.filter.as_str())) {
                     std::collections::hash_map::Entry::Vacant(v) => {
                         index.insert(v.key());
-                        v.insert(vec![(node.clone(), idx)]);
+                        v.insert(BTreeMap::new())
                     }
-                    std::collections::hash_map::Entry::Occupied(mut o) => {
-                        o.get_mut().push((node.clone(), idx));
-                    }
-                }
+                    std::collections::hash_map::Entry::Occupied(o) => o.into_mut(),
+                };
+                by_group
+                    .entry(g.group.clone())
+                    .or_default()
+                    .push((node.clone(), idx));
             }
         }
         self.remote_shared_index = index;
@@ -2477,6 +2587,16 @@ impl Hub {
         self.truncate_tx = Some(truncate_tx);
         self.owned_tasks
             .spawn(run_truncate_flusher(self.store.clone(), truncate_rx));
+        // Warm the mesh cache BEFORE the boot scan (issue #613 item 1.1). The
+        // cache is unstamped until its first recompute and answers `false` —
+        // conservatively — for any hub that has a placement, and `inherit_sessions`
+        // gates `interest_authoritative` on `mesh_whole()`. Without this, a
+        // restarted node whose placement shows only itself (the whole mesh, by
+        // definition) would suppress its interest snapshot until the first sweep
+        // tick, for no reason the live predicate agrees with. There are no links
+        // yet, so this is a single `peers_all` pair over the starting view — the
+        // same answer `mesh_whole()` would have computed inline before the cache.
+        self.recompute_mesh();
         // The boot window's FIRST inherited-session scan runs immediately, not a
         // sweep tick later: on a fresh or restarted node it completes in
         // milliseconds and releases any publish acks gated on it (ADR 0042 T9).
@@ -2636,9 +2756,33 @@ impl Hub {
                 // A gated publish registers a pending entry FIRST (ADR 0042 T9), so
                 // the fan-out can attach its cluster-wide obligations: acked peer
                 // forwards (exhibit ⑤) and the retained authority commit (exhibit ⑦).
-                let gate = done.map(|done| {
-                    self.register_pending(done, &topic, &payload, qos, retain, message_expiry, &app)
-                });
+                // `None` from `register_pending` is a REFUSAL taken at the cap:
+                // the publisher has already been answered and NOTHING has been
+                // stored, so the entire publish is abandoned here. The fan-out,
+                // the peer forwards and the retained commit must not run, or the
+                // refusal's claim "nothing was stored, retry" becomes false and
+                // the retry duplicates (issue #613; the rule `refuse_pending`
+                // enforces). `gate = None` keeps meaning "QoS 0 / no publisher
+                // waiting" and NOTHING else — mapping a refusal onto it would
+                // publish the message while telling the publisher it was not
+                // stored. The early `return` is load-bearing.
+                let gate = match done {
+                    Some(done) => {
+                        let Some(id) = self.register_pending(
+                            done,
+                            &topic,
+                            &payload,
+                            qos,
+                            retain,
+                            message_expiry,
+                            &app,
+                        ) else {
+                            return;
+                        };
+                        Some(id)
+                    }
+                    None => None,
+                };
                 // ADR 0072: the publisher may weaken ITS OWN ack per message via
                 // `mqttd-durability` — only under the operator's opt-in. `relaxed`
                 // releases the ack at local_done (everything still runs); `local`
@@ -2957,13 +3101,23 @@ impl Hub {
                 // is — 0043-P4 exhibit ②): its link now counts toward
                 // `mesh_settled`, and a scan can settle held publishes against
                 // its (possibly new) interest.
+                let mut synced_now = false;
                 if let Some(peer) = self.peers.get_mut(&node) {
                     if !peer.interest_synced {
                         peer.interest_synced = true;
+                        synced_now = true;
                         if !self.pending_publishes.is_empty() {
                             self.takeover_reconcile_ticks = self.takeover_reconcile_ticks.max(2);
                         }
                     }
+                }
+                // Mesh transition 4 of 5 (issue #613 item 1.1): the ONLY place
+                // `interest_synced` turns on, so the only place `mesh_settled`
+                // can improve without a link event. Recomputed outside the
+                // `get_mut` borrow, and only on the flip — a repeat snapshot from
+                // an already-synced peer changes nothing.
+                if synced_now {
+                    self.recompute_mesh();
                 }
                 self.interest.replace(node, filters);
             }
@@ -3197,7 +3351,7 @@ impl Hub {
                 return DurableOutcome::Refused(r);
             }
         }
-        let (mut durable, _matched) = self
+        let (mut durable, matched) = self
             .deliver(
                 topic,
                 payload,
@@ -3221,7 +3375,36 @@ impl Hub {
         // subscriber, and a failed enqueue for the chosen member must withhold the
         // publisher's ack exactly as an ordinary subscriber's would — otherwise the
         // publisher is told a message survived that was never recorded.
-        durable = durable.and(self.deliver_shared(topic, payload, qos, message_expiry, app, gate));
+        // `shared_placed` is the second half of item 2.1's evidence: whether any
+        // shared group actually PUT this message somewhere (a local member or a
+        // peer member), as opposed to merely matching. Bound here so the seam's
+        // signature is real; its consumer is item 2.1's `pending_fan_out_reached`
+        // call, which Zone HUB adds beside it.
+        let (shared_durable, shared_placed) =
+            self.deliver_shared(topic, payload, qos, message_expiry, app, gate);
+        durable = durable.and(shared_durable);
+        // Issue #613 item 2.1. The settle window's claim on this publish's ACK is
+        // decided HERE, against what the fan-out actually found, instead of at
+        // `register_pending` before it ran. `register_pending` could only ask "is
+        // the view settling?", so every gated publish in a takeover window held
+        // its ack — including the ones that landed on a local subscriber and were
+        // never in any doubt. The honesty claim is unchanged: a fan-out that
+        // reached NOBODY while the view is admittedly incomplete still holds,
+        // which is the case the gate exists for.
+        //
+        // Note what this does NOT do: it does not touch `awaiting_settle`. That
+        // flag is WORK-SET MEMBERSHIP — the settle pass's re-delivery to sessions
+        // the takeover scan materialises later, and its re-route to peers that
+        // advertise interest later — and it is owed by every publish that landed
+        // on an unsettled view, whether or not that publish also reached somebody.
+        // Shrinking that set would drop deliveries with no compile error and no
+        // failing test (CORRECTION 1). Only the ACK moves, and only one way:
+        // `pending_fan_out_reached` can clear the hold, nothing re-arms it.
+        if let Some(id) = gate {
+            if !settle::awaits_settle(matched, shared_placed, self.routing_unsettled()) {
+                self.pending_fan_out_reached(id);
+            }
+        }
         self.forward_to_peers(topic, payload, qos, retain, message_expiry, app, gate);
         // Durable retained (ADR 0037): after the live fan-out — which stays undelayed —
         // route the retained mutation to its topic's group lease-owner for the
@@ -4992,6 +5175,24 @@ impl Hub {
                         epoch,
                         "committed ownership moved; eager migration window armed (issue #294)"
                     );
+                    // Issue #613 item 2.3 proposed TWO ticks here instead of
+                    // eight, on the reasoning that an epoch-only move is small.
+                    // NOT APPLIED, and the reason is worth keeping: this window
+                    // must outlive the REHOME PIPELINE it arms, not just the
+                    // scan. `rehome_misplaced_sessions` needs
+                    // `MISPLACED_GRACE_TICKS` (2) of continuous observation
+                    // before it closes the moved session, `release_moved_sessions`
+                    // can only take the session AFTER that close (it skips
+                    // anything still `online`), and it runs from a completed
+                    // scan — so the routing is released at tick ~3-4 at the
+                    // earliest. A 2-tick window has already drained by then, and
+                    // a publish landing in the gap finds a zero-match fan-out on
+                    // a routing view that now calls itself SETTLED: acked, with
+                    // nothing stored anywhere and no successor claiming it. That
+                    // is issue #294's bug verbatim, and it is what
+                    // `no_publish_toward_a_rehomed_session_is_ever_acked_while_this_node_routes_it`
+                    // and `an_online_session_whose_group_moved_is_closed_so_it_relocates`
+                    // both catch at 2 and pass at 8.
                     self.takeover_reconcile_ticks = self.takeover_reconcile_ticks.max(8);
                 }
                 self.sweep_epoch_seen = Some(epoch);
@@ -5013,7 +5214,13 @@ impl Hub {
         // anyway (the same lost quorum withholds those acks).
         if !self.interest_authoritative {
             self.interest_suppressed_ticks += 1;
-            if self.interest_suppressed_ticks >= EXPIRY_RECONCILE_EVERY {
+            // Issue #613 item 2.6: its OWN constant. Borrowing the session-scan
+            // cadence here was a coincidence of numbers, not a shared meaning —
+            // one is "how often is it worth re-enumerating the store", the other
+            // is "how long may this node's live clients stay invisible to the
+            // cluster before we give up on the scan". Tying them meant tuning
+            // either one silently moved the other.
+            if self.interest_suppressed_ticks >= INTEREST_AUTHORITATIVE_BACKSTOP_TICKS {
                 warn!(
                     ticks = self.interest_suppressed_ticks,
                     "interest gossip forced authoritative: the boot session scan never \
@@ -5028,13 +5235,83 @@ impl Hub {
         // to it by a takeover: their persisted expiry deadlines (ADR 0009 §3) AND their
         // routing subscriptions (ADR 0042 T9, exhibit ⑥). Eagerly for a few ticks after
         // a peer death (the takeover window), else on the slow reconcile cadence.
+        // Mesh transition 5 of 5 (issue #613 item 1.1). Recomputed here, right
+        // after the placement watch above has re-read membership and BEFORE
+        // anything this tick asks the question — `run`'s `sweep_pending_forwards`
+        // resolves settle gates against it. This is also the unconditional
+        // backstop for the transitions nothing observes: SWIM adds or evicts a
+        // member on another thread with no link event here at all. Deliberately
+        // OUTSIDE the `if let Some(placement)` block above — a hub with no
+        // placement would otherwise never recompute, and an unstamped cache
+        // answers conservatively forever. Between ticks, `mesh_fingerprint` is
+        // what keeps that window answering conservatively rather than wrongly.
+        self.recompute_mesh();
         self.expiry_reconcile_tick = self.expiry_reconcile_tick.wrapping_add(1);
         if self.takeover_reconcile_ticks > 0 {
             self.takeover_reconcile_ticks -= 1;
             self.spawn_inherited_session_scan();
-        } else if self.expiry_reconcile_tick % EXPIRY_RECONCILE_EVERY == 0 {
+        } else if (self.durable_plane.is_some() || self.routing_unsettled())
+            && self.expiry_reconcile_tick % EXPIRY_RECONCILE_EVERY == 0
+        {
+            // The `routing_unsettled()` half is the LIVENESS condition item 2.2
+            // must not drop (issue #613 item 2.2 follow-up). `last_scan_complete`
+            // is written in exactly one place — `inherit_sessions`, i.e. when a
+            // scan LANDS — and it is a term of `routing_unsettled()`. It is
+            // seeded `false`. So on a clustered node whose boot scan lands
+            // incomplete (a store enumeration that errored, a quorum read that
+            // timed out), the ONLY thing that can ever set it true is another
+            // scan. Gating the periodic arm on the durable plane alone removed
+            // the retry, and a non-durable cluster would then hold every
+            // zero-match gated publish's PUBACK for the life of the process.
+            // The interest-authoritative backstop does not cover this: it
+            // clears its own term, not this one.
+            //
+            // Cost is unchanged in the healthy case, which is the case item 2.2
+            // was about: a settled non-durable node reads `routing_unsettled()`
+            // false — now one cached bool plus four field reads, since item 1.1 —
+            // and still never pays for `all_sessions()`.
+            // Issue #613 item 2.2. The PERIODIC scan exists to inherit sessions a
+            // takeover handed this node — which can only happen when session data
+            // is shared, i.e. under a durable plane. Without one, the store is
+            // local and its contents cannot have been "inherited" from anywhere,
+            // so every 30th tick paid for a full `all_sessions()` enumeration
+            // (through the durable store, with first-touch group recovery) that
+            // could not possibly find something new. `rehome_misplaced_sessions`
+            // already takes exactly this gate, for exactly this reason.
+            //
+            // The BOOT scan stays unconditional: it is what a restarted
+            // single-node broker reloads its own persisted sessions' expiry
+            // deadlines and subscriptions from, and it is what releases the acks
+            // gated on it (ADR 0042 T9). So does the takeover-window arm above —
+            // arming it at all already means something moved.
             self.spawn_inherited_session_scan();
         }
+
+        // Drive the settle pass from the SWEEP, not from a scan completion
+        // (issue #613 item 2.2 follow-up).
+        //
+        // `settle_pending_publishes` used to have exactly one caller: the tail
+        // of `inherit_sessions`, i.e. it ran only when an inherited-session scan
+        // LANDED. That was survivable while the periodic arm above was
+        // unconditional — every 30th tick spawned a scan, so a held ack was
+        // never held for more than ~30 s. Item 2.2 gated that arm on
+        // `durable_plane.is_some()`, which on a CLUSTERED, NON-DURABLE node
+        // (lanes B/C of the scale rig, and any cluster running clean sessions)
+        // left the settle pass with no periodic driver at all: once
+        // `takeover_reconcile_ticks` drains to 0 and no membership or ownership
+        // change re-arms it, nothing calls it again. A zero-match gated publish
+        // that arrived while the view was unsettled keeps `ack_awaits_settle`
+        // set and its PUBACK is never sent — a permanently hung publisher, not
+        // a slow one.
+        //
+        // The settle pass is the right thing to drive from the clock anyway: it
+        // asks "is the window over yet, and can anything retire now?", which is
+        // a question about elapsed state, not about a scan's result. It no-ops
+        // when nothing is held, and during a takeover window the scan arm above
+        // already drives it at this exact cadence — so this changes the held
+        // case from "never" to "once per tick" and changes the idle case not at
+        // all.
+        self.settle_pending_publishes();
 
         // Retained anti-entropy (issue #87): re-offer our digest to every peer on a
         // slow cadence. A commit fans out ONE unacked frame; before this, a frame
@@ -5091,6 +5368,10 @@ impl Hub {
         if self.inherited_scan_inflight {
             return;
         }
+        #[cfg(test)]
+        self.probe
+            .scans_started
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.inherited_scan_inflight = true;
         let store = self.store.clone();
         let tx = self.self_tx.clone();
@@ -5655,7 +5936,7 @@ impl Hub {
     /// partitioned owner never received). Withholding under partition is the
     /// same CP posture the durable attach path already takes.
     fn mesh_whole(&self) -> bool {
-        self.peers_all(|_| true)
+        self.mesh.whole(self.mesh_fingerprint())
     }
 
     /// Whether this node's ROUTING VIEW is still settling (ADR 0042 T9 /
@@ -5682,7 +5963,45 @@ impl Hub {
     /// cannot tell "it routes nothing" from "it has not finished recovering
     /// what it routes", and no gated ack may conclude "nobody is owed this".
     fn mesh_settled(&self) -> bool {
-        self.peers_all(|p| p.interest_synced)
+        self.mesh.settled(self.mesh_fingerprint())
+    }
+
+    /// The cheap stamp a cached mesh answer carries (issue #613 item 1.1): the
+    /// placement's member COUNT and its committed ownership EPOCH, both O(1)
+    /// reads under the same lock [`peers_all`](Self::peers_all) already takes —
+    /// no `Vec`, no `NodeId` clone. `None` when there is no placement at all,
+    /// where `peers_all` is vacuously true and nothing can invalidate it.
+    ///
+    /// Membership is written by SWIM on another thread, so a member can join
+    /// between two recomputes. This stamp is what stops the cache from answering
+    /// "whole" for a mesh that just grew a member with no link — the one
+    /// direction a settle cache may never be wrong in.
+    fn mesh_fingerprint(&self) -> mesh::MeshFingerprint {
+        let placement = self.placement.as_ref()?;
+        let p = placement
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Some((p.member_count(), p.ownership_epoch()))
+    }
+
+    /// Recompute the cached mesh answers (issue #613 item 1.1) from
+    /// [`peers_all`](Self::peers_all), which stays the single definition of which
+    /// members count. Called at the five transitions that can change the answer:
+    /// [`peer_connected`](Self::peer_connected),
+    /// [`peer_disconnected`](Self::peer_disconnected),
+    /// [`peer_dead`](Self::peer_dead), the `RemoteInterest` arm where a peer's
+    /// `interest_synced` flips, and the sweep tick.
+    ///
+    /// The fingerprint is read FIRST, deliberately. A membership change racing
+    /// between the two reads then stamps the OLD fingerprint onto the NEW answer,
+    /// which the next read rejects as stale and answers conservatively. Reading it
+    /// LAST would stamp the new fingerprint onto an old answer — a cache that
+    /// looks fresh while claiming a mesh is whole that is not.
+    fn recompute_mesh(&mut self) {
+        let fp = self.mesh_fingerprint();
+        let whole = self.peers_all(|_| true);
+        let settled = self.peers_all(|p| p.interest_synced);
+        self.mesh.store(fp, whole, settled);
     }
 
     /// The single definition of "every membership-alive peer's link satisfies
@@ -5693,19 +6012,24 @@ impl Hub {
     /// would silently disagree about the mesh they are judging. No placement ⇒
     /// standalone ⇒ trivially true.
     fn peers_all(&self, pred: impl Fn(&Peer) -> bool) -> bool {
+        #[cfg(test)]
+        self.probe
+            .peers_all_evals
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let Some(placement) = &self.placement else {
             return true;
         };
-        let members: Vec<NodeId> = {
-            let p = placement
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            p.members()
-        };
-        members
-            .iter()
-            .filter(|m| **m != self.node_id)
-            .all(|m| self.peers.get(m).is_some_and(&pred))
+        let p = placement
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Issue #613 item 1.2: `Placement::members()` returns `Vec<NodeId>` and
+        // `NodeId` is `pub String`, so the old shape allocated one `String` per
+        // member per call only to compare and drop it. `all_members` BORROWS them.
+        // The read lock is now held across the walk, which is the scope
+        // `members()` was copying them out of in the first place; the predicate
+        // touches only `self.peers` and `self.node_id` and takes no other lock —
+        // the lock discipline `all_members`'s rustdoc demands.
+        p.all_members(|m| *m == self.node_id || self.peers.get(m).is_some_and(&pred))
     }
 
     /// Whether this node is part of a cluster: peer networking is CONFIGURED
@@ -5879,6 +6203,49 @@ impl Hub {
             let (current, tracked) = plane.caught_up_summary();
             m.set_replica_groups(current, tracked);
         }
+        // Issue #613 item 2.5. `routing_unsettled()` is one boolean over five
+        // terms, and an operator watching a cluster that will not settle has had
+        // no way to see WHICH term holds it — these are internal gates with no
+        // packet to point at, and "acks are being withheld" looked identical
+        // whether the cause was a takeover window, a stalled session scan, a
+        // suppressed interest snapshot or a peer link that never came back.
+        //
+        // Reported as five 0/1 gauges, ONE PER TERM — the shape
+        // `Metrics::set_routing_unsettled`'s table fixes. The two scan terms stay
+        // apart (`scan` = a scan is running, `scan-incomplete` = the last one
+        // skipped keys) because they are different operator conditions: one
+        // clears itself, the other says the store would not answer.
+        //
+        // All five read 0 on a standalone broker, which is exactly what
+        // `clustered()` already means inside `routing_unsettled`. Every one is
+        // written on every refresh, including the false ones — a series that
+        // stops being written keeps its last value and reads as the opposite of
+        // the truth.
+        let clustered = self.clustered();
+        m.set_routing_unsettled("takeover", clustered && self.takeover_reconcile_ticks > 0);
+        m.set_routing_unsettled("scan", clustered && self.inherited_scan_inflight);
+        m.set_routing_unsettled("scan-incomplete", clustered && !self.last_scan_complete);
+        m.set_routing_unsettled("interest", clustered && !self.interest_authoritative);
+        m.set_routing_unsettled("mesh", clustered && !self.mesh_settled());
+        // The pending-publish ledger, whose admission rule item 2.4 changes and
+        // whose hold rule item 2.1 changes. The TOTAL says how close the cap is;
+        // the awaiting-settle SUBSET says how much of it is held by an unsettled
+        // routing view rather than by a slow durable plane. Without the split the
+        // two conditions are one number, and they want different responses.
+        // ONE walk feeds both figures, which is the only place the invariant
+        // `awaiting_settle <= total` is statable. O(pending), once a second,
+        // bounded by `PENDING_PUBLISH_CAP`.
+        let awaiting_settle = self
+            .pending_publishes
+            .values()
+            .filter(|p| p.awaiting_settle)
+            .count();
+        m.set_pending_publishes(self.pending_publishes.len(), awaiting_settle);
+        // Issue #613 item 3.5: the hub is ONE task, so the depth of its inbound
+        // queue is its saturation, full stop. It is also the input `Hub::pressure`
+        // quantises (item 3.2), so an operator can see the number a shared
+        // selection was actually decided on rather than inferring it.
+        m.set_hub_queue_depth(self.rx.len());
     }
 
     /// Persist the current subscription set for a client if its session is durable.
@@ -5924,7 +6291,23 @@ impl Hub {
     /// Release the publisher's acknowledgement iff every cluster-wide durability
     /// obligation has resolved (ADR 0042 T9).
     fn try_complete_pending(&mut self, id: u64) {
-        let complete = self.pending_publishes.get(&id).is_some_and(|p| {
+        // Issue #613 item 2.1. This used to be ONE decision: every obligation
+        // resolved => release the ack AND remove the entry. `awaiting_settle` sat
+        // inside it, which is why holding an ack for the settle window also kept
+        // the entry alive for the window's re-delivery and re-route — and why
+        // releasing the ack early would have DELETED that replay obligation, with
+        // no compile error and no failing test to say so.
+        //
+        // It is now two decisions over the same facts:
+        //   * the ACK releases when every obligation has resolved and the settle
+        //     window is not holding it (`ack_awaits_settle`, cleared by `publish`
+        //     only against fan-out evidence);
+        //   * the ENTRY is retired when every obligation has resolved and the
+        //     settle window has no further claim on it (`awaiting_settle`, cleared
+        //     only by `settle_pending_publishes` at window close).
+        // An entry between the two is ANSWERED BUT ALIVE: `done` is `None`, so
+        // nothing that later drops it can be read as a withhold.
+        let obligations_done = self.pending_publishes.get(&id).is_some_and(|p| {
             p.local_done
                 // ADR 0072: relaxed acks at submit; obligations still run.
                 // Issue #399 carves two exceptions, both congestion valves:
@@ -5939,19 +6322,34 @@ impl Hub {
                 && ((p.relaxed
                     && !p.congested
                     && p.awaiting.is_empty()
-                    && !p.awaiting_settle
                     && p.reroute_grace.unwrap_or(0) == 0)
                     || (p.appends_outstanding == 0
                         && !p.awaiting_retained
-                        && !p.awaiting_settle
                         && p.awaiting.is_empty()
                         && p.reroute_grace.unwrap_or(0) == 0))
         });
-        if complete {
-            if let Some(p) = self.pending_publishes.remove(&id) {
+        if !obligations_done {
+            return;
+        }
+        // `reroute_grace` stays in `obligations_done` deliberately: an unanswered
+        // forward whose target died is doubt about the EVIDENCE, not about the
+        // routing view, and item 2.1 does not widen into it.
+        if let Some(p) = self.pending_publishes.get_mut(&id) {
+            if !p.ack_awaits_settle && p.answer(PublishOutcome::Accepted) {
                 debug!(publish = id, topic = %p.topic, "pending publish complete; ack released");
-                let _ = p.done.send(PublishOutcome::Accepted);
             }
+        }
+        // Retire the entry only when the settle window is done with it. The ack has
+        // necessarily been released by now when this is reached (`ack_awaits_settle`
+        // implies `awaiting_settle`), so this removal never drops an unsent sender
+        // and the withhold-by-drop rule is untouched at the one non-withholding
+        // removal in the hub.
+        if self
+            .pending_publishes
+            .get(&id)
+            .is_some_and(|p| !p.awaiting_settle)
+        {
+            self.pending_publishes.remove(&id);
         }
     }
 
@@ -6026,6 +6424,11 @@ impl Hub {
         if !self.pending_publishes.is_empty() {
             self.takeover_reconcile_ticks = self.takeover_reconcile_ticks.max(2);
         }
+        // Mesh transition 1 of 5 (issue #613 item 1.1). A new link can only make
+        // the mesh MORE whole, but it enters with `interest_synced = false`, so
+        // SETTLED can move either way — recompute both rather than reason about
+        // the direction at each site.
+        self.recompute_mesh();
     }
 
     fn peer_disconnected(&mut self, node: &NodeId, conn_id: u64) {
@@ -6048,6 +6451,9 @@ impl Hub {
             plane.fail(node);
         }
         self.drop_retained_handoff_state(node);
+        // Mesh transition 2 of 5 (issue #613 item 1.1): a membership-alive peer
+        // just lost its link, so the mesh is no longer whole.
+        self.recompute_mesh();
     }
 
     /// Drop all routing state for a node the failure detector confirmed dead.
@@ -6106,6 +6512,10 @@ impl Hub {
         if had_link || had_interest {
             info!(peer = %node.0, "peer declared dead; routing state dropped");
         }
+        // Mesh transition 3 of 5 (issue #613 item 1.1). A confirmed death removes
+        // the peer from BOTH sides of the question — its link and, once SWIM
+        // evicts it, its membership — so the answer can move in either direction.
+        self.recompute_mesh();
         if let Some(plane) = &self.durable_plane {
             plane.fail(node);
         }
@@ -6477,7 +6887,12 @@ async fn recover_once(
 
 #[cfg(test)]
 mod tests {
+    mod admission_cap;
     mod qos2_retirement;
+    mod remote_group_index;
+    mod scaling_locality;
+    mod scaling_mesh;
+    mod settle_gate;
     mod shared_capacity;
     /// A committed retained snapshot entry with no application properties — the
     /// common test shape (props-bearing cases build the struct directly).

@@ -34,6 +34,12 @@ fn every_platform_gated_suite_compiled_on_this_runner() {
          Linux runner for the `test` job or port the suite."
     );
 
+    // shared_membership.rs has a Linux-only perf control acknowledgement test.
+    assert!(
+        !in_ci || cfg!(target_os = "linux"),
+        "shared_membership.rs uses #[cfg(target_os = \"linux\")] for perf control; CI must exercise it"
+    );
+
     // backup_restore.rs has Unix-only FIFO and process-cleanup regressions.
     assert!(
         !in_ci || cfg!(unix),
@@ -62,6 +68,7 @@ fn the_mirrored_predicates_still_describe_the_suites() {
         ("memory_watermark.rs", "#![cfg(target_os = \"linux\")]"),
         ("decommission.rs", "#![cfg(unix)]"),
         ("backup_restore.rs", "#[cfg(unix)]"),
+        ("shared_membership.rs", "#[cfg(target_os = \"linux\")]"),
     ] {
         let src = std::fs::read_to_string(dir.join(file))
             .unwrap_or_else(|e| panic!("read tests/{file}: {e}"));

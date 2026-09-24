@@ -96,16 +96,49 @@ impl SubscriptionTable {
         self.index.for_each_matching(topic, cb);
     }
 
+    /// Visit every client whose filters match `topic`, **without allocating** a
+    /// set and without cloning a single id.
+    ///
+    /// **The callback may fire more than once for the same client** — once per
+    /// matching filter that client holds, since `a/#` and `a/b` both match `a/b`.
+    /// De-duplication is the caller's, deliberately: the hub's per-publish
+    /// populations here are single-digit (the peer nodes in the interest index,
+    /// the members of one shared group), where a small `Vec` plus a linear
+    /// `contains` beats building a `HashSet` and bumping a `ClientId`
+    /// (`Arc<str>`) refcount per match on every message. A caller that wants the
+    /// de-duplicated set as *data* wants
+    /// [`matching_clients`](Self::matching_clients), which is exactly this walk
+    /// plus that set (issue #613 item 1.4).
+    ///
+    /// Yields borrows: nothing is cloned unless the caller clones it. Already
+    /// guarded for the empty population by
+    /// [`FilterIndex::for_each_matching`](crate::filter_index::FilterIndex::for_each_matching),
+    /// so a node with no remote interest pays nothing here.
+    pub fn for_each_matching_client<'a>(&'a self, topic: &str, mut cb: impl FnMut(&'a ClientId)) {
+        // Name the field before the walk borrows `self`: two disjoint shared
+        // borrows, spelled out. Capturing `self` whole inside the closure while
+        // `self.index` is also borrowed is the shape borrowck is most likely to
+        // reject, and it would reject it for no reason.
+        let by_filter = &self.by_filter;
+        self.for_each_matching_filter(topic, |filter| {
+            if let Some(clients) = by_filter.get(filter) {
+                for client in clients {
+                    cb(client);
+                }
+            }
+        });
+    }
+
     /// Return the de-duplicated set of clients whose filters match `topic`.
     ///
-    /// A client subscribed via several overlapping filters appears once.
+    /// A client subscribed via several overlapping filters appears once. The walk
+    /// is [`for_each_matching_client`](Self::for_each_matching_client); this is
+    /// that walk plus the set, so the two can never answer differently.
     #[must_use]
     pub fn matching_clients(&self, topic: &str) -> HashSet<ClientId> {
         let mut out = HashSet::new();
-        self.for_each_matching_filter(topic, |filter| {
-            if let Some(clients) = self.by_filter.get(filter) {
-                out.extend(clients.iter().cloned());
-            }
+        self.for_each_matching_client(topic, |client| {
+            out.insert(client.clone());
         });
         out
     }
@@ -378,7 +411,52 @@ mod tests {
                 }
             }
             assert_eq!(got, want, "trie and reference disagree on topic {topic:?}");
+
+            // Issue #613 item 1.4: the borrowing walk answers the same set on
+            // every corpus topic. `matching_clients` IS that walk plus the set,
+            // so this can only fail if someone gives one of them its own walk.
+            let mut walked: Vec<ClientId> = Vec::new();
+            table.for_each_matching_client(topic, |c| walked.push(c.clone()));
+            assert_eq!(
+                walked.into_iter().collect::<HashSet<ClientId>>(),
+                want,
+                "for_each_matching_client disagrees with the reference on topic {topic:?}"
+            );
         }
+    }
+
+    /// Issue #613 item 1.4's contract, asserted rather than assumed: the walk
+    /// fires ONCE PER MATCHING FILTER, so a client holding two filters that both
+    /// match is visited twice. A caller that needs the set must de-duplicate.
+    ///
+    /// This is the half of the contract a new caller is most likely to get wrong,
+    /// and it is invisible in the corpus test above, which compares sets.
+    #[test]
+    fn the_matching_walk_visits_a_client_once_per_matching_filter() {
+        let mut t = SubscriptionTable::new();
+        t.subscribe(cid("x"), "a/#".into());
+        t.subscribe(cid("x"), "a/b".into());
+        t.subscribe(cid("y"), "a/b".into());
+
+        let mut visits: Vec<String> = Vec::new();
+        t.for_each_matching_client("a/b", |c| visits.push(c.to_string()));
+        visits.sort();
+        assert_eq!(
+            visits,
+            vec!["x".to_string(), "x".to_string(), "y".to_string()],
+            "x holds two filters matching a/b and must be visited for each"
+        );
+
+        // The de-duplicated view is the same population, once each.
+        assert_eq!(
+            t.matching_clients("a/b"),
+            HashSet::from([cid("x"), cid("y")])
+        );
+
+        // A topic only one filter matches visits that client exactly once.
+        let mut once = 0_usize;
+        t.for_each_matching_client("a/c", |_| once += 1);
+        assert_eq!(once, 1, "only a/# matches a/c");
     }
 
     /// A filter torn down to its last subscriber and back: removal must actually

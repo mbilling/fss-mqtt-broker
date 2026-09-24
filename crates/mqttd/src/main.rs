@@ -2446,6 +2446,13 @@ fn wire_hub(
     // ADR 0072: per-message durability tiers, only under the operator's opt-in.
     hub.set_allow_relaxed_publish(config.durable.allow_relaxed_publish);
     hub.set_shared_prefer_local(config.cluster.shared_prefer_local);
+    // Issue #613 item 3.4: the locality DIAL, not the switch. `effective_...` folds
+    // MQTTD_SHARED_PREFER_LOCAL=0 in as bias 0, so the hub holds one number and the
+    // two knobs cannot disagree. `wire_hub` is the single place all three
+    // hub-construction arms pass through, which is exactly why a knob wired here
+    // cannot be inert on one deployment shape (issue #241, see this function's own
+    // doc comment).
+    hub.set_shared_local_bias_permille(config.cluster.effective_shared_local_bias_permille());
     Ok(())
 }
 

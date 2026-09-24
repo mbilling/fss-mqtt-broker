@@ -515,8 +515,19 @@ impl Placement {
         out
     }
 
+    /// The eligible set as the `hrw` primitives want it: an owned slice source.
+    ///
+    /// Routed through [`members`](Self::members) so this type has ONE definition of
+    /// the eligible set (issue #613 item 1.2b). This was a second *verbatim* copy
+    /// of `members`'s old body, which is precisely the fork the single-definition
+    /// invariant forbids: someone changing "which members count" would have had to
+    /// remember two sites, with nothing to remind them.
+    ///
+    /// Deliberately still owned, and this is not an oversight: `hrw::replica_set`
+    /// takes `&[NodeId]`, and the results are memoised by [`ReplicaSetMemo`], so
+    /// this is a per-topology-change cost, not a per-message one.
     fn nodes(&self) -> Vec<NodeId> {
-        self.eligible.iter().cloned().collect()
+        self.members()
     }
 
     /// Replace the current lease voter set (ADR 0049). Called each reconcile tick
@@ -890,9 +901,100 @@ impl Placement {
 
     /// The current eligible member set (this node plus non-`Dead` peers), in
     /// deterministic order — e.g. for the lease group to track desired voters.
+    ///
+    /// Stays a `Vec`: three callers need the owned ids to outlive the read guard
+    /// (`durable_node.rs`'s committed-lease push, `cluster_store.rs`, and the
+    /// hub's sweep, which builds a `BTreeSet` from them). Callers that only VISIT
+    /// each member should use [`for_each_member`](Self::for_each_member) or
+    /// [`all_members`](Self::all_members), which clone nothing (issue #613 item
+    /// 1.2).
+    /// Written in terms of [`for_each_member`](Self::for_each_member) on purpose:
+    /// `eligible` is traversed in exactly ONE place in this type, so a future
+    /// change to *which members count* (decommissioning, learners, suspect
+    /// handling) lands on the owned and the borrowed view at once and they cannot
+    /// drift. That single-definition property is the invariant item 1.2 is
+    /// allowed to touch nothing else about.
     #[must_use]
     pub fn members(&self) -> Vec<NodeId> {
-        self.eligible.iter().cloned().collect()
+        #[cfg(test)]
+        members_probe::record();
+        let mut out = Vec::with_capacity(self.eligible.len());
+        self.for_each_member(|id| out.push(id.clone()));
+        out
+    }
+
+    /// Visit every eligible member, borrowing each id — no clone, no `Vec`.
+    ///
+    /// Iteration order is [`members`](Self::members)'s, so a caller converted
+    /// from one to the other sees the same sequence (issue #613 item 1.2).
+    pub fn for_each_member(&self, mut f: impl FnMut(&NodeId)) {
+        for m in &self.eligible {
+            f(m);
+        }
+    }
+
+    /// Whether `pred` holds for EVERY eligible member, short-circuiting on the
+    /// first `false`. Borrows each id: no clone, no `Vec` (issue #613 item 1.2).
+    ///
+    /// Iteration order is [`members`](Self::members)'s. Vacuously `true` for an
+    /// empty set, which cannot occur — the local node is always eligible.
+    ///
+    /// **Lock discipline.** `pred` runs while the caller's read guard on this
+    /// `Placement` is held (that is the point: nothing is copied out first). A
+    /// predicate that takes the same lock again — anything reaching back into
+    /// `Placement` through the same `RwLock` — DEADLOCKS. Keep predicates to data
+    /// the caller already owns.
+    #[must_use]
+    pub fn all_members(&self, mut pred: impl FnMut(&NodeId) -> bool) -> bool {
+        self.eligible.iter().all(&mut pred)
+    }
+}
+
+/// Test-only call counter for [`Placement::members`] — the proof instrument for
+/// issue #613 item 1.2.
+///
+/// Item 1.2's claim is that a caller that only *visits* the eligible set stops
+/// paying `members`'s `Vec` plus one `String` clone per member. The honest way to
+/// prove that without a counting global allocator (the workspace sets
+/// `unsafe_code = "forbid"`, and `impl GlobalAlloc` needs `unsafe impl`) is to
+/// count the CALLS to the allocating entry point: a correct
+/// [`for_each_member`](Placement::for_each_member) records nothing, while an
+/// implementation quietly written as `for id in self.members()` — which compiles
+/// and is behaviourally identical, and is the exact regression this exists to
+/// catch — records one.
+///
+/// `thread_local`, not a global `AtomicUsize`: libtest runs `#[test]`s in
+/// parallel threads, and a shared counter would make every assertion here depend
+/// on which other test happened to be running. Per-thread, the count is
+/// deterministic.
+///
+/// **Scope, stated plainly.** `#[cfg(test)]` is active only while *this crate's*
+/// own test target is built, so only `mqtt-cluster`'s unit tests can read this.
+/// A `mqttd` hub test cannot: it links the ordinary, probe-free build. Proving
+/// that the hub's converted call sites no longer reach `members` needs a probe on
+/// the hub side (`mqttd`'s `hub/probe.rs`), not this one.
+#[cfg(test)]
+pub(crate) mod members_probe {
+    use std::cell::Cell;
+
+    thread_local! {
+        static CALLS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// Record one call to [`super::Placement::members`].
+    pub(crate) fn record() {
+        CALLS.with(|c| c.set(c.get() + 1));
+    }
+
+    /// Calls recorded on this thread since the last [`reset`].
+    pub(crate) fn calls() -> usize {
+        CALLS.with(Cell::get)
+    }
+
+    /// Zero the counter. Call at the top of any test that asserts on [`calls`] —
+    /// the fixture helpers allocate rings of their own.
+    pub(crate) fn reset() {
+        CALLS.with(|c| c.set(0));
     }
 }
 
@@ -1904,5 +2006,96 @@ mod tests {
         assert_memo_matches_hrw(&p, "original after the clone diverged");
         p.observe(&node("e"), MemberState::Alive, "e:7000", None);
         assert_memo_matches_hrw(&p, "original after its own join");
+    }
+
+    // --- issue #613 item 1.2: one definition of the eligible set ---
+
+    /// The borrowed views answer EXACTLY what the owned one does, across churn.
+    ///
+    /// `members` is written in terms of `for_each_member`, so this cannot fail
+    /// today — that is the point. It is the standing proof that the three views
+    /// stayed one traversal: an "optimisation" that gives `for_each_member` its
+    /// own walk of `eligible` breaks this the moment the two walks disagree about
+    /// which members count, which is the failure the single-definition invariant
+    /// exists to make impossible.
+    #[test]
+    fn for_each_member_is_the_same_set_as_members() {
+        let mut p = ring("a", &["b", "c", "d"]);
+
+        let check = |p: &Placement, step: &str| {
+            let owned = p.members();
+            let mut visited = Vec::new();
+            p.for_each_member(|id| visited.push(id.clone()));
+            assert_eq!(visited, owned, "for_each_member disagreed at {step}");
+
+            // `all_members` short-circuits; it must still answer what the full
+            // walk answers. The predicate is false on the THIRD member, so a
+            // broken short-circuit that stops early answers `true` and is caught.
+            let third = owned.get(2).cloned();
+            let pred = |id: &NodeId| Some(id) != third.as_ref();
+            assert_eq!(
+                p.all_members(pred),
+                owned.iter().all(pred),
+                "all_members disagreed at {step}"
+            );
+            assert!(
+                p.all_members(|_| true),
+                "every member satisfies a true predicate at {step}"
+            );
+            assert_eq!(owned.len(), p.member_count(), "member_count at {step}");
+        };
+
+        check(&p, "initial");
+        p.observe(&node("e"), MemberState::Alive, "e:7000", None);
+        check(&p, "after a join");
+        // Suspect is still eligible; Dead is not.
+        p.observe(&node("c"), MemberState::Suspect, "c:7000", None);
+        check(&p, "after a suspicion");
+        p.observe(&node("c"), MemberState::Dead, "c:7000", None);
+        check(&p, "after a death");
+        p.observe(&node("c"), MemberState::Alive, "c:7000", None);
+        check(&p, "after a re-join");
+    }
+
+    /// Issue #613 item 1.2's actual claim, proved the only way this crate can
+    /// prove it: `for_each_member` and `all_members` never reach the ALLOCATING
+    /// entry point, while `members` does.
+    ///
+    /// This is the guard against the wrong implementation, not against a wrong
+    /// answer — `for_each_member` written as `for id in self.members()` compiles,
+    /// passes every behavioural test above, and buys nothing. Only the call count
+    /// tells the two apart. See [`super::members_probe`] for why this is a call
+    /// counter rather than an allocation counter, and for what it cannot see.
+    #[test]
+    fn visiting_the_member_set_never_calls_the_allocating_one() {
+        use super::members_probe;
+        let p = ring("a", &["b", "c", "d"]);
+
+        members_probe::reset();
+        let mut visited = 0_usize;
+        p.for_each_member(|id| {
+            std::hint::black_box(id);
+            visited += 1;
+        });
+        assert_eq!(visited, 4, "self plus three peers");
+        assert_eq!(
+            members_probe::calls(),
+            0,
+            "for_each_member must borrow the set, not build an owned copy of it"
+        );
+
+        members_probe::reset();
+        assert!(p.all_members(|id| !id.0.is_empty()));
+        assert_eq!(
+            members_probe::calls(),
+            0,
+            "all_members must borrow the set, not build an owned copy of it"
+        );
+
+        // The probe is not vacuous: the owning call is still counted, so a
+        // counter that had simply stopped recording would fail here.
+        members_probe::reset();
+        std::hint::black_box(p.members());
+        assert_eq!(members_probe::calls(), 1);
     }
 }
