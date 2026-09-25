@@ -1,0 +1,4 @@
+status=pass nodes=3 count=100
+broker0 forwarded_post=204 received_post=204 shared_remote_delta=200 received_delta=200 delivered_delta=200 dropped_delta=0 subscriber_remote_delta=0 peer_links=2
+broker1 forwarded_post=204 received_post=204 shared_remote_delta=200 received_delta=200 delivered_delta=200 dropped_delta=0 subscriber_remote_delta=0 peer_links=2
+broker2 forwarded_post=204 received_post=204 shared_remote_delta=200 received_delta=200 delivered_delta=200 dropped_delta=0 subscriber_remote_delta=0 peer_links=2

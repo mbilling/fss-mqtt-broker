@@ -86,8 +86,26 @@ full)
 	shift || true
 	if [ $# -gt 0 ]; then SIZES=("$@"); else SIZES=(1 3 5); fi
 	;;
+compare)
+	# ADR 0048 T4: the cross-broker comparison the compose harness in bench/
+	# cannot make, because publishable numbers need the driver off the broker's
+	# host. ONE broker host, one driver fleet, every broker run on it in turn
+	# (compare-brokers.sh); no cluster, no lanes, no mqttd-only metrics.
+	[ "$#" -eq 1 ] || die "compare takes no size arguments — it measures a single broker host"
+	SIZES=(1)
+	export COMPARE=1
+	# Three drivers, not two: at the top of the default ladder two 16-vCPU
+	# drivers would carry a container on every core, and a driver at 100%
+	# container density is the shape that makes a driver limit read as a broker
+	# limit. Three keeps the busiest driver near 70%.
+	DRIVER_COUNT="${DRIVER_COUNT:-3}"
+	if [ "$CLOUD" = hcloud ]; then
+		BROKER_TYPE="${BROKER_TYPE:-ccx23}"
+		DRIVER_TYPE="${DRIVER_TYPE:-ccx43}"
+	fi
+	;;
 *)
-	echo "usage: $0 smoke | standard [sizes...] | full [sizes...]" >&2
+	echo "usage: $0 smoke | standard [sizes...] | full [sizes...] | compare" >&2
 	exit 2
 	;;
 esac
@@ -193,8 +211,15 @@ for pattern in ('terraform.tfvars', '*.auto.tfvars', 'terraform.tfvars.json', '*
 if not sizes or any(s not in ('1','3','5','7','10') for s in sizes):
     refuse('sizes must be 1, 3, 5, 7 or 10')
 count = os.environ['DRIVER_COUNT']
-if not re.fullmatch(r'[1-9][0-9]*', count) or int(count) > (8 if cloud == 'hcloud' else 12):
-    refuse('DRIVER_COUNT must be an integer within the provider limit')
+# 20, not 12: the project's quota was raised to 30 servers / 200 vCPUs on
+# 2026-09-15, and 10 CCX23 brokers + 20 CCX33 drivers is exactly that — 30
+# servers, 200 vCPUs. The old cap predated the raise and refused shapes the
+# project can now afford: a 7-node run at 9 sites needs 18 drivers to keep the
+# proven 3-containers-per-driver density, and was refused at 172 vCPUs.
+# terraform/quota.tf remains the real gate, enforced at plan time against the
+# ACTUAL server types, so this is a fast sanity bound rather than the authority.
+if not re.fullmatch(r'[1-9][0-9]*', count) or int(count) > 20:
+    refuse('DRIVER_COUNT must be an integer <= 20 (the 30-server / 200-vCPU project quota; terraform/quota.tf enforces the real bound per server type)')
 plan = os.environ['DRIVER_TYPE']
 cores = os.getenv('DRIVER_VCPUS')
 if cores is None:
@@ -206,16 +231,48 @@ if cores is None:
         cores = match[1] if match else None
 if cores is None or not re.fullmatch(r'[1-9][0-9]*', str(cores)):
     refuse(f'unknown CPU count for {plan}; supply DRIVER_VCPUS explicitly')
+# The synthetic inventory must describe drivers the way the LIVE inventory will,
+# or the shape check proves a different budget than the paid run enforces. The
+# Hetzner module's inventory carries server_type and no vcpus (run-curve.sh looks
+# the budget up); UpCloud's carries vcpus. An explicit DRIVER_VCPUS stays vcpus.
+if cloud == 'hcloud' and os.getenv('DRIVER_VCPUS') is None:
+    driver = {'server_type': plan}
+else:
+    driver = {'vcpus': int(cores)}
 for size in sizes:
     inventory = {'brokers': [{} for _ in range(int(size))],
-                 'drivers': [{'vcpus': int(cores)} for _ in range(int(count))]}
+                 'drivers': [dict(driver) for _ in range(int(count))]}
     pathlib.Path(run, f'shape-inventory-{size}.json').write_text(json.dumps(inventory))
 PY
 for N in "${SIZES[@]}"; do
+	if [ "${COMPARE:-0}" = 1 ]; then
+		# The comparison ladder has its own budget arithmetic (one publisher AND
+		# one subscriber container per slice of the rate); the lane shapes do not
+		# apply to it.
+		COMPARE_SHAPE_ONLY=1 "$SCALE_DIR/compare-brokers.sh" "$RUN/preflight-$N" "$RUN/shape-inventory-$N.json" \
+			>"$RUN/shape-preflight-$N.log" 2>&1 || {
+			tail -25 "$RUN/shape-preflight-$N.log" >&2
+			die "invalid comparison shape; no cloud resources touched"
+		}
+		continue
+	fi
 	SHAPE_ONLY=1 "$SCALE_DIR/run-curve.sh" "$RUN/preflight-$N" "$RUN/shape-inventory-$N.json" \
 		>"$RUN/shape-preflight-$N.log" 2>&1 || {
 		tail -25 "$RUN/shape-preflight-$N.log" >&2
 		die "invalid shape at size $N; no cloud resources touched"
+	}
+done
+# Lane E's crossing is certified by a forwarding positive control and a ledger
+# that re-derives it from the scrapes, twice: once before any rung is paid for,
+# and again by the extractor (#482). Both carry offline tests against real mqttd
+# scrapes, run here on the laptop — after the shapes, which are cheaper and fail
+# more often, and before anything is provisioned or PREFLIGHT_ONLY calls the run
+# ready. A local interpreter or ledger bug otherwise surfaces as a FAILED control
+# on a billed cluster, or worse, as a rung certified by a broken check.
+for self_test in forward-canary extract-lane-e; do
+	python3 "$SCALE_DIR/$self_test.py" --self-test >"$RUN/self-test-$self_test.log" 2>&1 || {
+		tail -25 "$RUN/self-test-$self_test.log" >&2
+		die "$self_test.py --self-test failed (log: $RUN/self-test-$self_test.log) — fix the local check before paying for a cluster; no cloud resources touched"
 	}
 done
 if [ "${PREFLIGHT_ONLY:-0}" = 1 ]; then
@@ -306,6 +363,7 @@ for N in "${SIZES[@]}"; do
 		${BROKER_TYPE:+-var broker_server_type="$BROKER_TYPE"} \
 		${DRIVER_TYPE:+-var driver_server_type="$DRIVER_TYPE"} \
 		${BROKER_NIC_SPREAD:+-var broker_nic_spread="$BROKER_NIC_SPREAD"} \
+		${COMPARE:+-var broker_docker=true} \
 		>"$RUN/tf-apply-$N.log" 2>&1) || {
 		tail -30 "$RUN/tf-apply-$N.log" >&2
 		die "OpenTofu apply failed for size $N"
@@ -413,6 +471,14 @@ for N in "${SIZES[@]}"; do
 		;;
 	esac
 
+	if [ "${COMPARE:-0}" = 1 ]; then
+		# No cluster to bootstrap and no lanes to run: every broker under test,
+		# mqttd included, runs as a container on this host in turn.
+		phase running "broker comparison"
+		"$SCALE_DIR/compare-brokers.sh" "$RUN" "$INVENTORY"
+		phase collecting "broker comparison"
+		"$SCALE_DIR/collect.sh" "$RUN" "$INVENTORY" || true
+	else
 	phase bootstrapping "$N nodes"
 	"$SCALE_DIR/bootstrap-cluster.sh" "$RUN" "$INVENTORY" durable
 	# Live Grafana on the laptop, fed by an Alloy scraper on driver-1 through a
@@ -443,6 +509,7 @@ for N in "${SIZES[@]}"; do
 	"$SCALE_DIR/collect.sh" "$RUN" "$INVENTORY"
 	if [ "${OBSERVE:-1}" = 1 ]; then
 		"$SCALE_DIR/observe.sh" detach || true
+	fi
 	fi
 
 	phase teardown "$N nodes"

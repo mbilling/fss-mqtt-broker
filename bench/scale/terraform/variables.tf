@@ -14,15 +14,30 @@ variable "driver_count" {
   default     = 2
 
   validation {
-    condition     = var.driver_count >= 1 && var.driver_count <= 8
-    error_message = "driver_count must be between 1 and 8. Six CCX33s offer ~240k msg/s on lane B (the fan-out knee hunt at 7 nodes); eight is what lane E needs to reach 16 sites, since sites are dealt round-robin and each carries 3 one-vCPU containers, so the busiest driver holds ceil(sites/drivers)*3 <= 8. Eight is also the last count that fits the vCPU quota beside a 5-node cluster (5 x ccx23 + 8 x ccx33 = 84); quota.tf refuses the combinations that do not."
+    condition     = var.driver_count >= 1 && var.driver_count <= 20 && floor(var.driver_count) == var.driver_count
+    error_message = "driver_count must be an integer between 1 and 20. Six CCX33s offer ~240k msg/s on lane B (the fan-out knee hunt at 7 nodes); lane E deals sites round-robin at 3 one-vCPU containers each, so the busiest driver holds ceil(sites/drivers)*3 <= 8 and more drivers are what reach more sites. The cap was 8 while the project allowed 100 vCPUs, then 12; since 2026-09-15 the project allows 30 servers / 200 vCPUs, and 10 x ccx23 + 20 x ccx33 = 200 vCPU on 30 servers is exactly that. 12 was a shape that fits rather than the largest one: it refused a 7-node run at 9 sites, which needs 18 drivers to hold the proven 3 containers per driver and costs 172 vCPU on 25 servers. quota.tf remains the authority and refuses the combinations that do not fit."
   }
 }
 
 variable "vcpu_quota" {
   description = "vCPUs the Hetzner project is allowed to run at once. Enforced by quota.tf BEFORE any server is created, because a quota rejection part way through an apply leaves the already-created servers running and billing with no teardown reached."
   type        = number
-  default     = 100
+  # Raised from 100 on 2026-09-15, when Hetzner lifted the dedicated project to
+  # 30 servers / 200 vCPUs. Keep this equal to the project's real limit: a value
+  # above it lets an apply fail half way, a value below it refuses runs that fit.
+  default = 200
+}
+
+variable "server_quota" {
+  description = "Servers the Hetzner project may run at once (brokers + drivers). Enforced by quota.tf before any server is created, for the same reason as vcpu_quota: Hetzner rejects the server that crosses the limit part way through an apply, and the ones already made keep billing. 30 since 2026-09-15."
+  type        = number
+  default     = 30
+}
+
+variable "broker_docker" {
+  description = "Install Docker on the broker hosts. Off for measurement runs — the published curve's broker must run the shipped binary under the shipped unit, with nothing else on the host. `run.sh compare` turns it on, because the cross-broker comparison (ADR 0048 T4) runs every broker under test, mqttd included, as a container so they share one runtime."
+  type        = bool
+  default     = false
 }
 
 variable "broker_nic_spread" {
@@ -111,4 +126,10 @@ variable "run_label" {
   description = "Label stamped on every resource of this run; the teardown sweeper deletes by `purpose`, this narrows a sweep to one run when debugging."
   type        = string
   default     = "manual"
+}
+
+variable "build_bench" {
+  type = bool
+  default = true
+  description = "Build lane A driver; disable for lane E-only campaigns."
 }

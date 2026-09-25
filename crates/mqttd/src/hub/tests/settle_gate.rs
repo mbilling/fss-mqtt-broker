@@ -364,7 +364,7 @@ async fn a_zero_match_publish_still_holds_its_ack_on_an_unsettled_view() {
          at all"
     );
     assert!(
-        !fix.hub.pending_publishes.contains_key(&id),
+        !fix.hub.pending_publishes.contains_key(id),
         "with both holds clear and no obligation outstanding the entry retires"
     );
 }
@@ -421,7 +421,7 @@ async fn an_early_acked_publish_still_replays_to_a_session_the_scan_materialises
 
     // Half two: CORRECTION 1. The entry survives its own acknowledgement,
     // because the settle pass still owes this publish a re-delivery.
-    let p = fix.hub.pending_publishes.get(&id).expect(
+    let p = fix.hub.pending_publishes.get(id).expect(
         "the ledger entry must OUTLIVE its ack: releasing the ack must \
                  not remove the publish from settle_pending_publishes's work \
                  set, or every delivery to a session materialised during this \
@@ -465,7 +465,7 @@ async fn an_early_acked_publish_still_replays_to_a_session_the_scan_materialises
     fix.hub.takeover_reconcile_ticks = 0;
     fix.scan_lands(&["inherited"], true).await;
     assert!(
-        !fix.hub.pending_publishes.contains_key(&id),
+        !fix.hub.pending_publishes.contains_key(id),
         "at window close an answered entry with no outstanding obligation retires"
     );
 }
@@ -525,7 +525,7 @@ async fn an_early_acked_publish_still_re_routes_to_a_peer_that_advertises_intere
     let entry = fix
         .hub
         .pending_publishes
-        .get(&id)
+        .get(id)
         .expect("the entry must still be here to be re-routed at all (#613 CORRECTION 1)");
     assert_eq!(
         entry.awaiting.len(),
@@ -731,7 +731,7 @@ async fn a_held_ack_retires_on_the_sweep_when_the_window_closes_without_a_scan()
          node with no durable plane (#613 item 2.2 follow-up)"
     );
     assert!(
-        !fix.hub.pending_publishes.contains_key(&id),
+        !fix.hub.pending_publishes.contains_key(id),
         "both holds clear and no obligation outstanding: the entry retires"
     );
 }
@@ -816,5 +816,89 @@ async fn a_settled_node_with_no_durable_plane_still_skips_the_periodic_scan() {
         "item 2.2's saving was given back: a SETTLED node with no durable plane \
          paid for a periodic `all_sessions()` enumeration that cannot find \
          anything it does not already hold"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The retire step can never withhold (found by the merge with main, 3571682).
+//
+// Item 2.1 split one settle flag into two, and `try_complete_pending` retired an
+// entry as soon as `awaiting_settle` was false, trusting that `ack_awaits_settle`
+// could only be true when `awaiting_settle` was too. The retained RESTORE path
+// cleared `awaiting_settle` alone, so every restore on an unsettled clustered
+// node retired its entry with the ack still held: the sender was dropped unsent
+// and `a_live_cluster_export_restores_sessions_retained_and_acked_facts` failed
+// deterministically with "never answered by the hub".
+// ---------------------------------------------------------------------------
+
+/// Register one gated publish directly, as the restore path does — no fan-out,
+/// so `publish()` never gets to clear the ack hold on evidence.
+fn register_direct(fix: &mut Fix, topic: &str) -> (u64, oneshot::Receiver<PublishOutcome>) {
+    let (done, rx) = oneshot::channel();
+    let id = fix.hub.register_pending(
+        done,
+        topic,
+        &Bytes::from_static(b"restored"),
+        QoS::AtLeastOnce,
+        true,
+        None,
+        &AppProperties::default(),
+    );
+    (id, rx)
+}
+
+/// The structural guard: an entry whose ack is still held is never retired,
+/// whatever cleared its replay flag. It stays visible instead — in the ledger,
+/// and to the cap — rather than vanishing as a silent withhold.
+///
+/// Fails without `&& p.ack_released()` in `try_complete_pending`'s retire step:
+/// the entry is removed and the publisher's receiver reads `Closed`.
+#[tokio::test]
+async fn an_entry_whose_ack_is_still_held_is_never_retired() {
+    let mut fix = clustered_fixture();
+    assert!(
+        fix.hub.routing_unsettled(),
+        "fixture: the ack hold must engage"
+    );
+    let (id, mut rx) = register_direct(&mut fix, "restore/guard");
+    {
+        let p = fix.hub.pending_publishes.get_mut(id).unwrap();
+        assert!(p.ack_awaits_settle, "fixture: registered while unsettled");
+        p.local_done = true;
+        // The defect's exact shape: ONE flag cleared, by hand.
+        p.awaiting_settle = false;
+    }
+    fix.hub.try_complete_pending(id);
+    assert!(
+        fix.hub.pending_publishes.get(id).is_some(),
+        "an entry was retired with its ack still held"
+    );
+    assert!(
+        held(&mut rx),
+        "the publisher's sender was dropped unsent: a SILENT withhold"
+    );
+}
+
+/// The restore's own sequence, through the method that clears both holds: its
+/// answer must arrive, on an unsettled node, without waiting for a settle that
+/// no publish will ever trigger.
+///
+/// Fails if `leave_settle_window` ever clears only one flag: the guard above
+/// keeps the entry, and the receiver stays `Empty` instead of `Accepted`.
+#[tokio::test]
+async fn leaving_the_settle_window_answers_a_restore_shaped_entry() {
+    let mut fix = clustered_fixture();
+    assert!(fix.hub.routing_unsettled());
+    let (id, mut rx) = register_direct(&mut fix, "restore/answer");
+    {
+        let p = fix.hub.pending_publishes.get_mut(id).unwrap();
+        p.local_done = true;
+        p.leave_settle_window();
+    }
+    fix.hub.try_complete_pending(id);
+    assert_eq!(rx.try_recv(), Ok(PublishOutcome::Accepted));
+    assert!(
+        fix.hub.pending_publishes.get(id).is_none(),
+        "answered, and nothing left to settle: the entry retires"
     );
 }

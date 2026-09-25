@@ -1,0 +1,14 @@
+Reference ID    : B9F8BD0A (185.248.189.10)
+Stratum         : 2
+Ref time (UTC)  : Sat Sep 19 15:42:54 2026
+System time     : 0.000323588 seconds fast of NTP time
+Last offset     : +0.000159384 seconds
+RMS offset      : 0.000262482 seconds
+Frequency       : 5.296 ppm fast
+Residual freq   : +0.027 ppm
+Skew            : 0.796 ppm
+Root delay      : 0.010361833 seconds
+Root dispersion : 0.000274481 seconds
+Update interval : 64.1 seconds
+Leap status     : Normal
+Captured epoch : 1789832576.230866698

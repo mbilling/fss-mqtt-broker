@@ -46,6 +46,119 @@ thread_local! {
     pub(super) static PEER_FANOUT_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+/// What one pending publish costs against [`PENDING_PUBLISH_MAX_BYTES`]: the
+/// fixed entry plus the two buffers it keeps alive for retransmission.
+///
+/// `payload` is a refcounted [`Bytes`], usually shared with the delivery path, so
+/// this can charge for memory the entry does not exclusively own. That is the
+/// intended direction of the error: the bound exists to cap what a partition can
+/// pin, and a pending entry is precisely what keeps the payload from being freed.
+fn pending_cost(topic: &str, payload: &Bytes) -> usize {
+    std::mem::size_of::<PendingPublish>() + topic.len() + payload.len()
+}
+
+/// The pending-publish table: an id-ordered map that knows its own byte total.
+///
+/// It is a type rather than a `BTreeMap` field plus a counter because the bound is
+/// only a bound if the two agree, and they are touched from five places — one
+/// insert, one eviction, three removals across two files. Here every mutation goes
+/// through a method that moves both together, and nothing outside can reach the
+/// map to insert or remove behind the counter's back.
+#[derive(Debug, Default)]
+pub(super) struct PendingTable {
+    entries: BTreeMap<u64, PendingPublish>,
+    bytes: usize,
+}
+
+impl PendingTable {
+    pub(super) fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub(super) fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Bytes charged for everything currently held (see [`pending_cost`]).
+    pub(super) fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    pub(super) fn get(&self, id: u64) -> Option<&PendingPublish> {
+        self.entries.get(&id)
+    }
+
+    pub(super) fn get_mut(&mut self, id: u64) -> Option<&mut PendingPublish> {
+        self.entries.get_mut(&id)
+    }
+
+    /// Test-only reads; production code goes through `get`/`iter`.
+    #[cfg(test)]
+    pub(super) fn contains_key(&self, id: u64) -> bool {
+        self.entries.contains_key(&id)
+    }
+
+    #[cfg(test)]
+    pub(super) fn keys(&self) -> impl Iterator<Item = &u64> {
+        self.entries.keys()
+    }
+
+    pub(super) fn values(&self) -> impl Iterator<Item = &PendingPublish> {
+        self.entries.values()
+    }
+
+    pub(super) fn iter(&self) -> impl Iterator<Item = (&u64, &PendingPublish)> {
+        self.entries.iter()
+    }
+
+    pub(super) fn iter_mut(&mut self) -> impl Iterator<Item = (&u64, &mut PendingPublish)> {
+        self.entries.iter_mut()
+    }
+
+    /// Whether admitting an entry of `cost` bytes would breach either bound.
+    ///
+    /// An EMPTY table always admits: one publish larger than the whole byte bound
+    /// must still be answerable, or a single oversized message would be refused
+    /// forever with nothing to evict to make room for it.
+    pub(super) fn is_full_for(&self, cost: usize) -> bool {
+        !self.entries.is_empty()
+            && (self.entries.len() >= PENDING_PUBLISH_CAP
+                || self.bytes.saturating_add(cost) > PENDING_PUBLISH_MAX_BYTES)
+    }
+
+    pub(super) fn insert(&mut self, id: u64, mut entry: PendingPublish) {
+        entry.cost = u32::try_from(pending_cost(&entry.topic, &entry.payload)).unwrap_or(u32::MAX);
+        self.bytes += entry.cost as usize;
+        if let Some(replaced) = self.entries.insert(id, entry) {
+            // Ids are monotonic, so this is unreachable — but if it ever happened
+            // the replaced entry's charge must leave with it.
+            self.bytes -= replaced.cost as usize;
+        }
+    }
+
+    pub(super) fn remove(&mut self, id: u64) -> Option<PendingPublish> {
+        let entry = self.entries.remove(&id)?;
+        self.bytes -= entry.cost as usize;
+        Some(entry)
+    }
+
+    /// Evict the OLDEST entry (the lowest id): the overflow policy of both bounds.
+    pub(super) fn pop_first(&mut self) -> Option<(u64, PendingPublish)> {
+        let (id, entry) = self.entries.pop_first()?;
+        self.bytes -= entry.cost as usize;
+        Some((id, entry))
+    }
+}
+
+/// `table[&id]`, for the tests and assertions that read an entry they know is
+/// there. Panics like `BTreeMap`'s own index on a missing id.
+impl std::ops::Index<&u64> for PendingTable {
+    type Output = PendingPublish;
+    fn index(&self, id: &u64) -> &PendingPublish {
+        &self.entries[id]
+    }
+}
+
 #[allow(clippy::struct_excessive_bools)]
 /// A `QoS` 1 publish whose acknowledgement is gated on **cluster-wide** durability
 /// (ADR 0042 T9): the local fan-out's durable appends (synchronous), the retained
@@ -54,6 +167,16 @@ thread_local! {
 /// a terminal failure drops the entry, withholding the ack (the publisher retries).
 #[derive(Debug)]
 pub(super) struct PendingPublish {
+    /// What [`PendingTable::insert`] charged this entry against the byte bound.
+    /// Written once, by the table, and handed back on removal — so the table's
+    /// byte total is a sum of what it actually charged and cannot drift from the
+    /// entries it holds, whatever later happens to `topic` or `payload`.
+    ///
+    /// `u32`, not `usize`: it fits the padding the entry already had, where a
+    /// `usize` grew every entry by 8 bytes. An MQTT packet is at most 268,435,455
+    /// bytes, so topic + payload + the struct cannot reach `u32::MAX`; the
+    /// conversion saturates rather than trusting that.
+    cost: u32,
     /// Releases the publisher's acknowledgement. `Some` = the publisher is still
     /// waiting, and dropping the entry WITHHOLDS (the sender side of fail-closed).
     /// `None` = it has already been answered and this entry survives only for the
@@ -180,10 +303,26 @@ impl PendingPublish {
     }
 
     /// Whether the publisher has already been answered. A `true` here is the one
-    /// thing that makes dropping this entry harmless — and, for the cap
-    /// (item 2.4), makes it the right entry to evict.
+    /// thing that makes dropping this entry harmless, and what the cap uses to
+    /// count an evicted entry as `pending-cap-replay` rather than a withhold.
     pub(super) fn ack_released(&self) -> bool {
         self.done.is_none()
+    }
+
+    /// Take this publish out of the settle window: it owes the window no replay
+    /// AND its ack no longer waits on it (issue #613 item 2.1).
+    ///
+    /// The ONLY way to clear either settle flag. Item 2.1 split one flag into two
+    /// — `awaiting_settle` (the replay work set) and `ack_awaits_settle` (the ack
+    /// hold) — and `try_complete_pending` retires an entry once `awaiting_settle`
+    /// is false. A site that cleared only that one, as the retained RESTORE path
+    /// did, retired the entry with its ack still held: the sender was dropped
+    /// unsent, which is a silent withhold, and every restore on an unsettled
+    /// clustered node failed with "never answered by the hub". One method that
+    /// clears both makes that split unrepresentable at a call site.
+    pub(super) fn leave_settle_window(&mut self) {
+        self.awaiting_settle = false;
+        self.ack_awaits_settle = false;
     }
 }
 
@@ -236,7 +375,7 @@ impl Hub {
     /// told `0x97`. That is the same class as today's `Failed` → withhold, but with a
     /// reason it can act on (0041-T11, issue #238).
     pub(super) fn redeliver_pending(&mut self, id: u64) -> DurableOutcome {
-        let Some(p) = self.pending_publishes.get(&id) else {
+        let Some(p) = self.pending_publishes.get(id) else {
             return DurableOutcome::Ok;
         };
         let (topic, payload, qos, expiry, app, since) = (
@@ -325,15 +464,11 @@ impl Hub {
                 self.send_acked_forward(id, &node);
             }
             if window_over {
-                if let Some(p) = self.pending_publishes.get_mut(&id) {
-                    // BOTH: the window closing ends the replay obligation and,
-                    // for a publish whose fan-out never produced evidence, the ack
-                    // hold it has been waiting out (issue #613 item 2.1). Clearing
-                    // only one would either strand the entry or strand its
-                    // publisher — a zero-evidence publish would never be acked at
-                    // all.
-                    p.awaiting_settle = false;
-                    p.ack_awaits_settle = false;
+                if let Some(p) = self.pending_publishes.get_mut(id) {
+                    // The window closing ends the replay obligation and, for a
+                    // publish whose fan-out never produced evidence, the ack hold
+                    // it has been waiting out (issue #613 item 2.1).
+                    p.leave_settle_window();
                 }
             }
             self.try_complete_pending(id);
@@ -469,7 +604,7 @@ impl Hub {
     /// targets after a takeover (the dead owner's successor materializes the
     /// inherited sessions and re-advertises their filters).
     pub(super) fn reroute_candidates(&self, id: u64) -> Vec<NodeId> {
-        let Some(p) = self.pending_publishes.get(&id) else {
+        let Some(p) = self.pending_publishes.get(id) else {
             return Vec::new();
         };
         // Off the message path (takeover re-route), but the same one-walk shape:
@@ -510,7 +645,7 @@ impl Hub {
         self.forward_seq += 1;
         let seq = self.forward_seq;
         let node = obligation.node.clone();
-        let Some(p) = self.pending_publishes.get_mut(&id) else {
+        let Some(p) = self.pending_publishes.get_mut(id) else {
             return;
         };
         let frame = forward_frame(p, seq, &obligation);
@@ -533,96 +668,19 @@ impl Hub {
         }
     }
 
-    /// The cap verdict for an ARRIVING gated publish (issue #613 item 2.4), plus
-    /// the id of the victim when the verdict is
-    /// [`EvictReplayOnly`](settle::Admission::EvictReplayOnly).
-    ///
-    /// **`&self`, deliberately, and this is the structural half of
-    /// [`refuse_pending`](Self::refuse_pending)'s contract.** `Refused` makes the
-    /// positive claim "nothing of this publish was stored anywhere, so retry".
-    /// Here that is true BY CONSTRUCTION rather than by comment: this function
-    /// cannot mutate the hub — no append, no forward, no retained commit, not even
-    /// an id burned from `publish_ids` — and `register_pending` calls it as its
-    /// first statement. A future change that stores before admitting would need
-    /// `&mut self` and would not compile into this function, so the lie breaks the
-    /// build (and `refusing_an_arrival_stores_nothing_anywhere`) rather than
-    /// reaching a publisher.
-    ///
-    /// Both scans below are O(`PENDING_PUBLISH_CAP`) and are paid ONLY when the
-    /// ledger is already full — under the cap this returns on the first line.
-    fn pending_admission(&self) -> (settle::Admission, Option<u64>) {
-        let len = self.pending_publishes.len();
-        if len < PENDING_PUBLISH_CAP {
-            return (settle::Admission::Admit, None);
-        }
-        // The LOWEST id whose publisher has already been answered: an entry alive
-        // only for the settle window's replay (issue #613 item 2.1). Lowest, i.e.
-        // oldest, so the replay records retire in arrival order like a ring.
-        let victim = self
-            .pending_publishes
-            .iter()
-            .find(|(_, p)| p.ack_released())
-            .map(|(id, _)| *id);
-        // Ids increase monotonically and `pending_publishes` is a `BTreeMap`, so
-        // its first entry is the OLDEST — the one `pop_first` used to take
-        // unconditionally. `first_key_value` is the non-destructive peek the age
-        // check needs.
-        let now = Instant::now();
-        let oldest_age = self
-            .pending_publishes
-            .first_key_value()
-            .map(|(_, p)| now.saturating_duration_since(p.created_at));
-        let admission = settle::admit_pending(
-            len,
-            PENDING_PUBLISH_CAP,
-            victim.is_some(),
-            oldest_age,
-            PENDING_PUBLISH_MAX_AGE,
-        );
-        (admission, victim)
-    }
-
     /// Register a `QoS` 1 publish whose acknowledgement is gated on cluster-wide
-    /// durability (ADR 0042 T9).
+    /// durability (ADR 0042 T9). At either bound the OLDEST entry is dropped
+    /// loudly — its ack withheld, so its publisher retries.
     ///
-    /// `None` is a REFUSAL taken at the cap (issue #613 item 2.4): `done` has
-    /// ALREADY been answered `Refused(PendingCap)`, and the caller must abandon
-    /// the whole publish — no fan-out, no peer forward, no retained commit — or
-    /// the refusal's claim "nothing was stored, retry" becomes false and the
-    /// retry duplicates on every subscriber that received the first copy. That
-    /// abandonment is what makes the refusal sayable, and it is the same
-    /// plan-then-commit discipline the brownout refusal follows and the same rule
-    /// [`refuse_pending`](Self::refuse_pending) enforces downstream (issue #238).
-    ///
-    /// **Why refuse the ARRIVING publish rather than evict the oldest.** The old
-    /// eviction answered a cap overrun by withholding the ack of a publish that
-    /// had already fanned out and may already be STORED — a publisher left hanging
-    /// for a message the cluster kept, whose retry then duplicates it on every
-    /// subscriber that got the first copy. It also punished the wrong publisher:
-    /// the victim was whoever published FIRST, not whoever is overrunning the
-    /// table. Refusing the arrival costs the overrunning publisher a `0x97` it can
-    /// act on immediately (v3.1.1: a close, per [`Refusal311::CloseNoAck`]), and
-    /// costs every already-registered publisher nothing at all.
-    ///
-    /// **The order of victims is the whole policy**, and it is decided by
-    /// [`settle::admit_pending`]:
-    /// 1. an entry whose publisher was ALREADY answered and which survives only
-    ///    for the settle window's replay (issue #613 item 2.1) — evicting it
-    ///    withholds nothing and refuses nobody, so it is always taken first;
-    /// 2. otherwise the oldest entry, but only past [`PENDING_PUBLISH_MAX_AGE`],
-    ///    where it is a leak rather than a publisher still waiting — the liveness
-    ///    backstop, kept so one stuck obligation cannot wedge the node shut;
-    /// 3. otherwise the arrival is refused.
-    ///
-    /// All three are counted apart — `publish_dropped{reason="pending-cap-replay"}`,
-    /// `{reason="pending-cap"}` and `{reason="pending-cap-admission"}` — so a leak
-    /// can never hide inside an overload number.
-    ///
-    /// Note the interaction with item 2.1, which is why (1) exists at all: an
-    /// early-acked publish keeps its ledger slot until the settle window closes,
-    /// so during a long window the ledger fills with records nobody is waiting on.
-    /// Without (1), item 2.1's longer lifetimes would translate directly into
-    /// refused live publishers — 2.1 would have made 2.4 strictly worse.
+    /// Issue #613 item 2.4 once proposed refusing the ARRIVING publish instead.
+    /// It was withdrawn when this merged with the byte-bounded table: for a
+    /// v3.1.1 publisher a refusal is a connection CLOSE (there is no reason
+    /// byte), which is a reconnect storm where eviction leaves an ack pending on
+    /// a live connection; at a 65,536-entry bound eviction is already rare; and
+    /// preferring already-answered victims would have put an O(table) scan on
+    /// exactly the overload path. What survives of it is honesty: an evicted
+    /// entry that item 2.1 had already answered is counted as
+    /// `pending-cap-replay`, never as a withheld ack.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn register_pending(
         &mut self,
@@ -633,81 +691,50 @@ impl Hub {
         retain: bool,
         message_expiry: Option<u32>,
         app: &AppProperties,
-    ) -> Option<u64> {
-        // FIRST statement of the function, before a single field is touched. That
-        // placement is the contract, not a style choice — see
-        // [`pending_admission`](Self::pending_admission).
-        let (admission, replay_victim) = self.pending_admission();
-        match admission {
-            settle::Admission::Admit => {}
-            settle::Admission::EvictReplayOnly => {
-                // The preferred victim: already ANSWERED, alive only for the
-                // settle window's replay (issue #613 items 2.1 x 2.4). No
-                // publisher loses an answer and nothing is withheld. What IS lost
-                // is the re-delivery to a session materialised during the window,
-                // so it is said out loud and counted on its own rather than
-                // disappearing into the withhold number.
-                if let Some(victim) = replay_victim {
-                    if let Some(old) = self.pending_publishes.remove(&victim) {
-                        warn!(
-                            publish = victim,
-                            topic = %old.topic,
-                            cap = PENDING_PUBLISH_CAP,
-                            "pending-publish cap: evicted an already-ACKNOWLEDGED entry held \
-                             only for the settle window's replay; no publisher lost an answer, \
-                             but a session materialised during this window will not receive it \
-                             (issue #613 item 2.1 x 2.4)"
-                        );
-                        self.forward_index.retain(|_, pid| *pid != victim);
-                        if let Some(m) = &self.metrics {
-                            m.publish_dropped("pending-cap-replay");
-                        }
-                    }
-                }
-            }
-            settle::Admission::EvictOldest => {
-                // The LIVENESS BACKSTOP, not the overload path: the oldest entry
-                // is older than PENDING_PUBLISH_MAX_AGE, i.e. stuck rather than
-                // merely queued. Its ack is WITHHELD — never refused, because it
-                // may already be stored — exactly as the old unconditional
-                // eviction did, and it keeps its own counter so a leak can never
-                // hide inside an overload number.
-                if let Some((old_id, old)) = self.pending_publishes.pop_first() {
-                    warn!(
-                        topic = %old.topic,
-                        cap = PENDING_PUBLISH_CAP,
-                        age_secs = Instant::now()
-                            .saturating_duration_since(old.created_at)
-                            .as_secs(),
-                        "pending-publish cap: evicted an ABANDONED unacknowledged publish \
-                         (older than PENDING_PUBLISH_MAX_AGE; ack withheld, its publisher \
-                         retries — this is the liveness backstop, not the overload path, \
-                         ADR 0042 T9)"
-                    );
-                    self.forward_index.retain(|_, pid| *pid != old_id);
-                    if let Some(m) = &self.metrics {
-                        m.publish_dropped("pending-cap");
-                    }
-                }
-            }
-            settle::Admission::Refuse => {
-                // Every slot is held by a YOUNG entry whose publisher is still
-                // waiting. Refuse the ARRIVAL: it is the one publish of which
-                // nothing is stored anywhere, so `Refused`'s positive claim
-                // "nothing was stored, retry" is exactly true — and nothing below
-                // this point has run, which is what makes that structural.
+    ) -> u64 {
+        // Evict until the newcomer fits BOTH bounds (3571682). A loop, not an
+        // `if`: under the byte bound one large publish can need several small
+        // ones gone, and stopping after one eviction would admit it over the
+        // bound anyway.
+        let cost = pending_cost(topic, payload);
+        while self.pending_publishes.is_full_for(cost) {
+            let Some((old_id, old)) = self.pending_publishes.pop_first() else {
+                break;
+            };
+            self.forward_index.retain(|_, pid| *pid != old_id);
+            // Issue #613 item 2.1 makes a second kind of entry possible: one
+            // already ANSWERED and kept only for the settle window's replay. The
+            // oldest-first policy is unchanged, but dropping such an entry
+            // withholds nothing — its sender was consumed by the answer — so it
+            // must not be reported, or counted, as a withheld ack. What it does
+            // lose is the re-delivery to a session materialised during the
+            // window, which is said out loud rather than hidden in the other
+            // number.
+            if old.ack_released() {
                 warn!(
-                    topic = %topic,
+                    publish = old_id,
+                    topic = %old.topic,
                     cap = PENDING_PUBLISH_CAP,
-                    "pending-publish cap: REFUSED the arriving publish. Nothing was stored \
-                     for it, so the publisher is told (0x97 / close) and can retry; the \
-                     publishes already registered keep their acks (issue #613 item 2.4)"
+                    max_bytes = PENDING_PUBLISH_MAX_BYTES,
+                    "pending-publish bound: dropped the OLDEST entry, which was already \
+                     ACKNOWLEDGED and held only for the settle window's replay; no \
+                     publisher lost an answer, but a session materialised during this \
+                     window will not receive it (issue #613 item 2.1)"
                 );
                 if let Some(m) = &self.metrics {
-                    m.publish_dropped("pending-cap-admission");
+                    m.publish_dropped("pending-cap-replay");
                 }
-                let _ = done.send(PublishOutcome::Refused(PublishRefusal::PendingCap));
-                return None;
+                continue;
+            }
+            warn!(
+                topic = %old.topic,
+                cap = PENDING_PUBLISH_CAP,
+                max_bytes = PENDING_PUBLISH_MAX_BYTES,
+                "pending-publish bound: dropped the OLDEST unacknowledged publish \
+                 (ack withheld; its publisher retries — ADR 0042 T9)"
+            );
+            if let Some(m) = &self.metrics {
+                m.publish_dropped("pending-cap");
             }
         }
         self.publish_ids += 1;
@@ -715,6 +742,7 @@ impl Hub {
         self.pending_publishes.insert(
             id,
             PendingPublish {
+                cost: 0, // charged by `PendingTable::insert`
                 done: Some(done),
                 topic: topic.to_string(),
                 payload: payload.clone(),
@@ -746,13 +774,13 @@ impl Hub {
                 congested: false,
             },
         );
-        Some(id)
+        id
     }
 
     /// Mark a pending publish RELAXED (ADR 0072): its ack releases at
     /// `local_done` instead of waiting for the durability obligations.
     pub(super) fn pending_mark_relaxed(&mut self, id: u64) {
-        if let Some(p) = self.pending_publishes.get_mut(&id) {
+        if let Some(p) = self.pending_publishes.get_mut(id) {
             p.relaxed = true;
         }
     }
@@ -773,14 +801,14 @@ impl Hub {
     /// no reason to stop owing either. Only the window closing clears that
     /// (issue #613, CORRECTION 1).
     pub(super) fn pending_fan_out_reached(&mut self, id: u64) {
-        if let Some(p) = self.pending_publishes.get_mut(&id) {
+        if let Some(p) = self.pending_publishes.get_mut(id) {
             p.ack_awaits_settle = false;
         }
     }
 
     /// The local fan-out obligation resolved OK (durable appends included).
     pub(super) fn pending_local_done(&mut self, id: u64) {
-        if let Some(p) = self.pending_publishes.get_mut(&id) {
+        if let Some(p) = self.pending_publishes.get_mut(id) {
             p.local_done = true;
         }
         self.try_complete_pending(id);
@@ -798,7 +826,7 @@ impl Hub {
     /// Drop a pending publish, WITHHOLDING its acknowledgement (the sender side
     /// of fail-closed: the publisher's connection sees no ack and retries).
     pub(super) fn drop_pending(&mut self, id: u64) {
-        if let Some(p) = self.pending_publishes.remove(&id) {
+        if let Some(p) = self.pending_publishes.remove(id) {
             self.forward_index.retain(|_, pid| *pid != id);
             // Issue #613 item 2.1: this entry may have been answered already and
             // be alive only for the settle window's replay. Dropping it then
@@ -859,7 +887,7 @@ impl Hub {
     pub(super) fn refuse_pending(&mut self, id: u64, r: PublishRefusal) {
         // `mut` because the answer now moves through `PendingPublish::answer`,
         // which TAKES the sender so it can be at most once (issue #613 item 2.1).
-        let Some(mut p) = self.pending_publishes.remove(&id) else {
+        let Some(mut p) = self.pending_publishes.remove(id) else {
             return;
         };
         self.forward_index.retain(|_, pid| *pid != id);
@@ -943,7 +971,7 @@ impl Hub {
         let Some(id) = self.forward_index.remove(&seq) else {
             return; // stale answer (entry dropped or already resolved)
         };
-        let Some(p) = self.pending_publishes.get_mut(&id) else {
+        let Some(p) = self.pending_publishes.get_mut(id) else {
             return;
         };
         if p.awaiting.get(&seq).map(|o| &o.node) != Some(node) {
@@ -1002,19 +1030,36 @@ impl Hub {
     // Retransmit, downgrade, re-route, grace: one linear sweep pass per pending —
     // splitting it would scatter the obligation lifecycle.
     pub(super) fn sweep_pending_forwards(&mut self) {
-        let ids: Vec<u64> = self.pending_publishes.keys().copied().collect();
-        for id in ids {
-            // Retransmit outstanding forwards over live links.
+        // One pass picks out the entries with work to do, so a deep table of
+        // young, healthy publishes costs a walk and nothing else. Work is either
+        // an OVERDUE forward — outstanding for at least one sweep interval; a
+        // forward sent milliseconds before the tick is not late, and re-sending it
+        // made the sweep's cost and its duplicate traffic proportional to the
+        // table's DEPTH, offered to the peers exactly when they were already
+        // behind (issue #633) — or a re-route grace that must count this tick.
+        let now = Instant::now();
+        let ids: Vec<(u64, bool)> = self
+            .pending_publishes
+            .iter()
+            .filter_map(|(id, p)| {
+                let overdue = !p.awaiting.is_empty()
+                    && now.duration_since(p.created_at) >= super::SESSION_SWEEP_INTERVAL;
+                (overdue || p.reroute_grace.is_some()).then_some((*id, overdue))
+            })
+            .collect();
+        for (id, overdue) in ids {
+            // Retransmit overdue forwards over live links.
             let outstanding: Vec<(u64, ForwardObligation)> = self
                 .pending_publishes
-                .get(&id)
+                .get(id)
+                .filter(|_| overdue)
                 .map(|p| p.awaiting.iter().map(|(s, o)| (*s, o.clone())).collect())
                 .unwrap_or_default();
             for (seq, obligation) in &outstanding {
                 let Some(peer) = self.peers.get(&obligation.node) else {
                     continue; // link down (not dead): wait for it to return
                 };
-                let Some(p) = self.pending_publishes.get(&id) else {
+                let Some(p) = self.pending_publishes.get(id) else {
                     continue;
                 };
                 // The SAME frame the original forward sent (only the seq is the
@@ -1026,7 +1071,7 @@ impl Hub {
                 let _ = peer.tx.send(forward_frame(p, *seq, obligation));
             }
             // Re-route after a target death (grace engaged by peer_dead).
-            let Some(p) = self.pending_publishes.get(&id) else {
+            let Some(p) = self.pending_publishes.get(id) else {
                 continue;
             };
             let Some(grace) = p.reroute_grace else {
@@ -1039,7 +1084,7 @@ impl Hub {
                     targets = candidates.len(),
                     "re-routing acked forward"
                 );
-                if let Some(p) = self.pending_publishes.get_mut(&id) {
+                if let Some(p) = self.pending_publishes.get_mut(id) {
                     p.reroute_grace = None;
                 }
                 for node in candidates {
@@ -1078,11 +1123,11 @@ impl Hub {
                         continue;
                     }
                 }
-                if let Some(p) = self.pending_publishes.get_mut(&id) {
+                if let Some(p) = self.pending_publishes.get_mut(id) {
                     p.reroute_grace = None;
                 }
             } else if awaiting_empty {
-                if let Some(p) = self.pending_publishes.get_mut(&id) {
+                if let Some(p) = self.pending_publishes.get_mut(id) {
                     p.reroute_grace = Some(grace - 1);
                 }
             }
@@ -1488,7 +1533,7 @@ mod footprint {
              bound is sized on this: at {actual} bytes, N entries now cost \
              {} KiB of fixed overhead alone. Either shrink the struct or re-derive \
              the bound deliberately — do not just raise this number.",
-            4096 * actual / 1024
+            PENDING_PUBLISH_CAP * actual / 1024
         );
     }
 
@@ -1589,7 +1634,7 @@ mod zone_fwd_proofs {
         PEER_FANOUT_VISITS.with(|c| c.set(0));
     }
 
-    fn register(hub: &mut Hub, topic: &str) -> (Option<u64>, oneshot::Receiver<PublishOutcome>) {
+    fn register(hub: &mut Hub, topic: &str) -> (u64, oneshot::Receiver<PublishOutcome>) {
         let (tx, rx) = oneshot::channel();
         let id = hub.register_pending(
             tx,
@@ -1727,7 +1772,6 @@ mod zone_fwd_proofs {
 
         // The gated QoS >= 1 non-broadcast return.
         let (id, _rx) = register(&mut h, "t/3");
-        let id = id.expect("an empty ledger admits");
         fan_out(&mut h, "t/3", QoS::AtLeastOnce, false, Some(id));
         assert!(
             std::ptr::eq(h.interest_scratch.as_ptr(), ptr),
@@ -1760,7 +1804,6 @@ mod zone_fwd_proofs {
             "the rig must actually be unsettled, or this test passes vacuously"
         );
         let (id, rx) = register(&mut h, "t/x");
-        let id = id.expect("an empty ledger admits");
         {
             let p = &h.pending_publishes[&id];
             assert!(
@@ -1800,7 +1843,6 @@ mod zone_fwd_proofs {
         let mut h = hub();
         h.set_cluster_configured();
         let (id, _rx) = register(&mut h, "t/x");
-        let id = id.expect("an empty ledger admits");
         h.pending_fan_out_reached(id);
         h.pending_fan_out_reached(id);
         h.pending_fan_out_reached(id + 9_999);
@@ -1818,10 +1860,9 @@ mod zone_fwd_proofs {
         h.set_cluster_configured();
         assert!(h.routing_unsettled());
         let (id, mut rx) = register(&mut h, "t/x");
-        let id = id.expect("an empty ledger admits");
         h.pending_local_done(id);
         assert!(
-            h.pending_publishes.contains_key(&id),
+            h.pending_publishes.contains_key(id),
             "a held publish is not completed while the window is open"
         );
         assert!(
@@ -1836,7 +1877,7 @@ mod zone_fwd_proofs {
         h.settle_pending_publishes();
 
         assert!(
-            !h.pending_publishes.contains_key(&id),
+            !h.pending_publishes.contains_key(id),
             "the entry must retire once the window has no further claim on it"
         );
         assert!(
@@ -1857,10 +1898,9 @@ mod zone_fwd_proofs {
         for withhold in [false, true] {
             let mut h = hub();
             let (id, mut rx) = register(&mut h, "t/x");
-            let id = id.expect("an empty ledger admits");
             assert!(h
                 .pending_publishes
-                .get_mut(&id)
+                .get_mut(id)
                 .expect("just registered")
                 .answer(PublishOutcome::Accepted));
             assert!(h.pending_publishes[&id].ack_released());
@@ -1872,7 +1912,7 @@ mod zone_fwd_proofs {
                 h.refuse_pending(id, PublishRefusal::Brownout);
             }
 
-            assert!(!h.pending_publishes.contains_key(&id));
+            assert!(!h.pending_publishes.contains_key(id));
             assert!(
                 matches!(rx.try_recv(), Err(oneshot::error::TryRecvError::Closed)),
                 "the publisher was answered a SECOND time (withhold={withhold})"
@@ -1886,8 +1926,7 @@ mod zone_fwd_proofs {
     fn the_answer_is_at_most_once() {
         let mut h = hub();
         let (id, mut rx) = register(&mut h, "t/x");
-        let id = id.expect("an empty ledger admits");
-        let p = h.pending_publishes.get_mut(&id).expect("just registered");
+        let p = h.pending_publishes.get_mut(id).expect("just registered");
         assert!(!p.ack_released());
         assert!(p.answer(PublishOutcome::Accepted), "the first answer lands");
         assert!(p.ack_released());
@@ -1902,194 +1941,302 @@ mod zone_fwd_proofs {
         ));
     }
 
-    // ---- item 2.4: the cap punishing the wrong publisher -------------------
+    // ---- item 2.4, as merged: honest accounting of an answered victim ------
 
-    /// Fill the ledger to the cap with young, unanswered entries, keeping every
-    /// receiver alive.
-    fn fill_to_cap(hub: &mut Hub) -> Vec<oneshot::Receiver<PublishOutcome>> {
-        let mut rxs = Vec::with_capacity(PENDING_PUBLISH_CAP);
-        for i in 0..PENDING_PUBLISH_CAP {
-            let (id, rx) = register(hub, &format!("fill/{i}"));
-            assert!(id.is_some(), "the fill loop must be admitted");
-            rxs.push(rx);
+    /// What survives of item 2.4 after merging the byte-bounded table
+    /// (3571682). The eviction POLICY is main's — oldest first — and is proven
+    /// in `pending_bounds`. What 2.4 still contributes is the COUNT: item 2.1
+    /// makes an entry possible that was already answered and survives only for
+    /// the settle window's replay. Evicting it withholds nothing, so it must be
+    /// counted `pending-cap-replay`, never `pending-cap`; the unanswered entry
+    /// evicted next is the control and must still count, and withhold, as before.
+    ///
+    /// Fails without the `ack_released()` branch in `register_pending`: the
+    /// first eviction lands in `pending-cap` and `replay` reads 0.
+    #[test]
+    fn an_already_answered_victim_is_not_counted_as_a_withheld_ack() {
+        let metrics = Arc::new(mqtt_observability::metrics::Metrics::new("fwd-proofs"));
+        let mut h = hub();
+        h.attach_metrics(metrics.clone());
+        let count = |reason: &str| -> u64 {
+            let series = format!("mqttd_publish_dropped_total{{reason=\"{reason}\"}} ");
+            metrics
+                .render()
+                .lines()
+                .find_map(|l| l.strip_prefix(&series))
+                .map_or(0, |v| v.trim().parse().unwrap())
+        };
+
+        // The oldest entry: answered early, as item 2.1 answers it, and still in
+        // the settle window's work set.
+        let (answered, mut answered_rx) = register(&mut h, "t/0");
+        {
+            let p = h.pending_publishes.get_mut(answered).unwrap();
+            p.awaiting_settle = true;
+            assert!(p.answer(PublishOutcome::Accepted), "fixture: first answer");
+        }
+        // The second-oldest: a publisher still waiting.
+        let (waiting, mut waiting_rx) = register(&mut h, "t/1");
+        for i in 2..PENDING_PUBLISH_CAP {
+            let _ = register(&mut h, &format!("t/{i}"));
+        }
+        assert_eq!(h.pending_publishes.len(), PENDING_PUBLISH_CAP);
+
+        // One arrival past the cap evicts the oldest: the answered one.
+        let _ = register(&mut h, "t/over-1");
+        assert!(
+            h.pending_publishes.get(answered).is_none(),
+            "oldest evicted"
+        );
+        assert_eq!(
+            answered_rx.try_recv(),
+            Ok(PublishOutcome::Accepted),
+            "its publisher already had its answer; nothing was withheld"
+        );
+        assert_eq!(count("pending-cap-replay"), 1);
+        assert_eq!(
+            count("pending-cap"),
+            0,
+            "an answered entry was reported as a WITHHELD ack"
+        );
+
+        // The control: the next arrival evicts an entry whose publisher is still
+        // waiting. That is a real withhold and counts as one.
+        let _ = register(&mut h, "t/over-2");
+        assert!(h.pending_publishes.get(waiting).is_none());
+        assert!(matches!(
+            waiting_rx.try_recv(),
+            Err(oneshot::error::TryRecvError::Closed)
+        ));
+        assert_eq!(count("pending-cap"), 1);
+        assert_eq!(count("pending-cap-replay"), 1);
+    }
+}
+
+#[cfg(test)]
+mod pending_bounds {
+    use super::*;
+    use crate::hub::Hub;
+    use mqtt_storage::MemorySessionStore;
+    use std::sync::Arc;
+
+    fn hub() -> Hub {
+        let metrics = Arc::new(mqtt_observability::metrics::Metrics::new("pending"));
+        let (mut hub, _tx) = Hub::with_config(
+            NodeId("pending".into()),
+            Arc::new(MemorySessionStore::new()),
+        );
+        hub.attach_metrics(metrics);
+        hub
+    }
+
+    /// Register one `QoS` 1 publish; the receiver tells whether its ack was withheld.
+    fn register(
+        hub: &mut Hub,
+        topic: &str,
+        payload: &Bytes,
+    ) -> (u64, oneshot::Receiver<PublishOutcome>) {
+        let (done, wait) = oneshot::channel();
+        let id = hub.register_pending(
+            done,
+            topic,
+            payload,
+            QoS::AtLeastOnce,
+            false,
+            None,
+            &AppProperties::default(),
+        );
+        (id, wait)
+    }
+
+    fn withheld(wait: &mut oneshot::Receiver<PublishOutcome>) -> bool {
+        matches!(wait.try_recv(), Err(oneshot::error::TryRecvError::Closed))
+    }
+
+    /// The byte total is the sum of what was charged, through every way out.
+    #[test]
+    fn the_byte_total_follows_every_mutation() {
+        let mut hub = hub();
+        let small = Bytes::from(vec![0u8; 100]);
+        let large = Bytes::from(vec![0u8; 10_000]);
+        let (a, _wa) = register(&mut hub, "t/a", &small);
+        let (_b, _wb) = register(&mut hub, "t/bb", &large);
+        let (_c, _wc) = register(&mut hub, "t/c", &small);
+        let expect = pending_cost("t/a", &small)
+            + pending_cost("t/bb", &large)
+            + pending_cost("t/c", &small);
+        assert_eq!(hub.pending_publishes.bytes(), expect);
+
+        hub.pending_publishes.remove(a);
+        assert_eq!(
+            hub.pending_publishes.bytes(),
+            expect - pending_cost("t/a", &small)
+        );
+        hub.pending_publishes.pop_first();
+        assert_eq!(hub.pending_publishes.bytes(), pending_cost("t/c", &small));
+        hub.pending_publishes.pop_first();
+        assert_eq!(hub.pending_publishes.bytes(), 0);
+        assert!(hub.pending_publishes.is_empty());
+    }
+
+    /// The entry bound: the publish past the cap evicts exactly the oldest, and
+    /// everything below the cap is left alone — the 4096 default evicted
+    /// publishers that were merely numerous (issue #633).
+    #[test]
+    fn the_entry_cap_evicts_only_the_oldest() {
+        let mut hub = hub();
+        let payload = Bytes::from_static(b"x");
+        let (first, mut first_wait) = register(&mut hub, "t", &payload);
+        let mut waits = Vec::with_capacity(PENDING_PUBLISH_CAP);
+        for _ in 1..PENDING_PUBLISH_CAP {
+            waits.push(register(&mut hub, "t", &payload).1);
         }
         assert_eq!(hub.pending_publishes.len(), PENDING_PUBLISH_CAP);
-        rxs
+        assert!(!withheld(&mut first_wait), "nothing is evicted AT the cap");
+
+        let (_new, _w) = register(&mut hub, "t", &payload);
+        assert_eq!(hub.pending_publishes.len(), PENDING_PUBLISH_CAP);
+        assert!(
+            withheld(&mut first_wait),
+            "the oldest publish's ack is withheld"
+        );
+        assert!(hub.pending_publishes.get(first).is_none());
+        assert!(!waits.iter_mut().any(withheld));
     }
 
-    /// ITEM 2.4. At the cap with every entry young, the ARRIVING publish is
-    /// refused — the oldest, which may already be durably stored, keeps its ack.
-    ///
-    /// The old policy evicted the oldest and withheld its ack: a publisher left
-    /// hanging for a message the cluster kept, whose retry then duplicates it on
-    /// every subscriber that got the first copy, and it punished whoever
-    /// published FIRST rather than whoever is overrunning the table.
+    /// The byte bound: large payloads reach it long before the entry cap, and one
+    /// newcomer may need SEVERAL older entries gone.
     #[test]
-    fn at_the_cap_the_arriving_publish_is_refused_not_the_oldest_evicted() {
-        let mut h = hub();
-        let mut rxs = fill_to_cap(&mut h);
-        let first_id = *h
-            .pending_publishes
-            .keys()
-            .next()
-            .expect("the ledger is full");
+    fn the_byte_bound_evicts_until_the_newcomer_fits() {
+        let mut hub = hub();
+        let mib = Bytes::from(vec![0u8; 1024 * 1024]);
+        let mut waits = Vec::new();
+        while !hub.pending_publishes.is_full_for(pending_cost("t", &mib)) {
+            waits.push(register(&mut hub, "t", &mib).1);
+        }
+        assert!(hub.pending_publishes.len() < 64, "well under the entry cap");
+        assert!(hub.pending_publishes.bytes() <= PENDING_PUBLISH_MAX_BYTES);
 
-        let (id, mut rx) = register(&mut h, "arriving");
-        assert!(id.is_none(), "the arrival must be refused, not admitted");
-        assert!(
-            matches!(
-                rx.try_recv(),
-                Ok(PublishOutcome::Refused(PublishRefusal::PendingCap))
-            ),
-            "the refused publisher must be TOLD, with a reason it can act on"
-        );
-        assert!(
-            h.pending_publishes.contains_key(&first_id),
-            "the oldest entry was evicted anyway"
-        );
-        assert!(
-            matches!(rxs[0].try_recv(), Err(oneshot::error::TryRecvError::Empty)),
-            "the oldest publisher's ack was withheld by an arrival it had \
-             nothing to do with"
-        );
-        assert_eq!(
-            h.pending_publishes.len(),
-            PENDING_PUBLISH_CAP,
-            "the ledger must stay bounded"
-        );
+        // Four times the size of what it displaces: one eviction is not enough.
+        let big = Bytes::from(vec![0u8; 4 * 1024 * 1024]);
+        let before = hub.pending_publishes.len();
+        let (id, mut wait) = register(&mut hub, "t", &big);
+        assert!(hub.pending_publishes.bytes() <= PENDING_PUBLISH_MAX_BYTES);
+        let evicted = before + 1 - hub.pending_publishes.len();
+        assert!(evicted >= 4, "evicted {evicted}");
+        let gone: Vec<bool> = waits.iter_mut().map(withheld).collect();
+        assert_eq!(gone.iter().filter(|g| **g).count(), evicted);
+        assert!(gone.iter().take(evicted).all(|g| *g), "oldest first");
+        assert!(hub.pending_publishes.get(id).is_some() && !withheld(&mut wait));
     }
 
-    /// The STRUCTURAL half of `refuse_pending`'s contract: `Refused` claims
-    /// "nothing of this publish was stored anywhere, so retry". The refusal is
-    /// taken in `pending_admission`, which is `&self` and runs as
-    /// `register_pending`'s first statement, so no id is burned, no entry is
-    /// inserted, and no index is touched.
-    ///
-    /// If someone later stores something before admitting, THIS test fails
-    /// rather than a publisher being lied to.
+    /// A publish larger than the whole byte bound is still admitted into an empty
+    /// table — refusing it would refuse it forever, with nothing left to evict.
     #[test]
-    fn refusing_an_arrival_stores_nothing_anywhere() {
-        let mut h = hub();
-        let _rxs = fill_to_cap(&mut h);
-        let before_ids: Vec<u64> = h.pending_publishes.keys().copied().collect();
-        let before_publish_ids = h.publish_ids;
-        let before_forward_index = h.forward_index.len();
-
-        let (id, _rx) = register(&mut h, "arriving");
-        assert!(id.is_none());
-
-        assert_eq!(
-            h.publish_ids, before_publish_ids,
-            "a refused publish burned an id, so something about it EXISTED"
-        );
-        assert_eq!(
-            h.pending_publishes.keys().copied().collect::<Vec<_>>(),
-            before_ids,
-            "a refused publish changed the ledger"
-        );
-        assert_eq!(h.forward_index.len(), before_forward_index);
+    fn an_oversized_publish_is_admitted_alone() {
+        let mut hub = hub();
+        let small = Bytes::from_static(b"x");
+        let (_s, mut small_wait) = register(&mut hub, "t", &small);
+        let huge = Bytes::from(vec![0u8; PENDING_PUBLISH_MAX_BYTES + 1]);
+        let (id, mut wait) = register(&mut hub, "t", &huge);
+        assert!(withheld(&mut small_wait));
+        assert_eq!(hub.pending_publishes.len(), 1);
+        assert!(hub.pending_publishes.get(id).is_some() && !withheld(&mut wait));
     }
 
-    /// ITEMS 2.1 x 2.4. Item 2.1 makes entries outlive their acks, so during a
-    /// long takeover window the ledger fills with records nobody is waiting on.
-    /// Without this ordering, 2.1's longer lifetimes would translate directly
-    /// into refused LIVE publishers — 2.1 would have made 2.4 strictly worse.
-    ///
-    /// An already-answered entry is the victim: evicting it withholds nothing
-    /// and refuses nobody.
+    /// The sweep retransmits what is OVERDUE, not what is merely outstanding: a
+    /// forward younger than one sweep interval is left alone, and the same forward
+    /// is re-sent once it has waited that long (issue #633).
     #[test]
-    fn at_the_cap_an_already_acked_replay_entry_is_evicted_before_refusing() {
-        let mut h = hub();
-        let mut rxs = fill_to_cap(&mut h);
-        // Answer one entry in the middle, leaving it alive for the replay.
-        let ids: Vec<u64> = h.pending_publishes.keys().copied().collect();
-        let victim = ids[17];
-        assert!(h
-            .pending_publishes
-            .get_mut(&victim)
-            .expect("in the ledger")
-            .answer(PublishOutcome::Accepted));
+    fn the_sweep_retransmits_only_overdue_forwards() {
+        let mut hub = hub();
+        let peer = NodeId("peer".into());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (ctl, _ctl_rx) = mpsc::unbounded_channel();
+        hub.peer_connected(
+            peer.clone(),
+            1,
+            tx,
+            ctl,
+            None,
+            mqtt_cluster::peer::PROTO_MAX,
+            Arc::default(),
+        );
+        let (id, _wait) = register(&mut hub, "t", &Bytes::from_static(b"x"));
+        hub.send_acked_forward(id, &peer);
+        while rx.try_recv().is_ok() {}
 
-        let (id, mut rx) = register(&mut h, "arriving");
+        hub.sweep_pending_forwards();
         assert!(
-            id.is_some(),
-            "a slot was held by an entry nobody is waiting on; the arrival must \
-             not pay for it"
+            rx.try_recv().is_err(),
+            "a young forward is not retransmitted"
         );
-        assert!(
-            matches!(rx.try_recv(), Err(oneshot::error::TryRecvError::Empty)),
-            "the arriving publisher must not be refused"
-        );
-        assert!(
-            !h.pending_publishes.contains_key(&victim),
-            "the already-answered entry must be the one evicted"
-        );
-        assert_eq!(h.pending_publishes.len(), PENDING_PUBLISH_CAP);
-        for (i, rx) in rxs.iter_mut().enumerate() {
-            if i == 17 {
-                continue;
-            }
-            assert!(
-                matches!(rx.try_recv(), Err(oneshot::error::TryRecvError::Empty)),
-                "an unanswered publisher at index {i} lost its ack"
+
+        let aged = Instant::now()
+            .checked_sub(crate::hub::SESSION_SWEEP_INTERVAL)
+            .expect("the clock is past one sweep interval");
+        hub.pending_publishes.get_mut(id).unwrap().created_at = aged;
+        hub.sweep_pending_forwards();
+        assert!(rx.try_recv().is_ok(), "an overdue forward is retransmitted");
+        assert!(rx.try_recv().is_err(), "exactly once per sweep");
+    }
+
+    /// The once-a-second sweep walks the whole table on the hub thread, so its
+    /// cost at a FULL table is what the higher cap buys at worst. A measurement,
+    /// not an assertion — run it in release:
+    /// `cargo test -p mqttd --release --lib -- --ignored sweep_cost --nocapture`
+    #[test]
+    #[ignore = "timing measurement; run in release with --nocapture"]
+    fn sweep_cost_at_a_full_table() {
+        for entries in [4096, PENDING_PUBLISH_CAP] {
+            let mut hub = hub();
+            let peer = NodeId("peer".into());
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            let (ctl, _ctl_rx) = mpsc::unbounded_channel();
+            hub.peer_connected(
+                peer.clone(),
+                1,
+                tx,
+                ctl,
+                None,
+                mqtt_cluster::peer::PROTO_MAX,
+                Arc::default(),
             );
-        }
-    }
-
-    /// The liveness backstop must survive the policy change: one stuck
-    /// obligation cannot be allowed to wedge the ledger shut forever, so past
-    /// `PENDING_PUBLISH_MAX_AGE` the oldest entry is evicted (ack WITHHELD,
-    /// never refused — it may already be stored) and the arrival admitted.
-    ///
-    /// Paused tokio time IS the clock `created_at` is read against
-    /// (`hub::Instant` is `tokio::time::Instant`), so this is deterministic.
-    #[tokio::test(start_paused = true)]
-    async fn the_cap_still_evicts_an_abandoned_entry() {
-        let mut h = hub();
-        let mut rxs = fill_to_cap(&mut h);
-        let oldest = *h
-            .pending_publishes
-            .keys()
-            .next()
-            .expect("the ledger is full");
-
-        tokio::time::advance(PENDING_PUBLISH_MAX_AGE + Duration::from_secs(1)).await;
-
-        let (id, mut rx) = register(&mut h, "arriving");
-        assert!(id.is_some(), "the backstop must admit the arrival");
-        assert!(
-            matches!(rx.try_recv(), Err(oneshot::error::TryRecvError::Empty)),
-            "the arrival must not be refused once the backstop fires"
-        );
-        assert!(
-            !h.pending_publishes.contains_key(&oldest),
-            "the abandoned oldest entry must be evicted"
-        );
-        assert!(
-            matches!(rxs[0].try_recv(), Err(oneshot::error::TryRecvError::Closed)),
-            "the evicted entry's ack is WITHHELD (sender dropped), never refused \
-             — it may already be stored"
-        );
-        assert_eq!(h.pending_publishes.len(), PENDING_PUBLISH_CAP);
-    }
-
-    /// Below the cap nothing is scanned and nothing is evicted — the common
-    /// path stays a plain insert.
-    #[test]
-    fn below_the_cap_every_publish_is_admitted() {
-        let mut h = hub();
-        let mut rxs = Vec::new();
-        for i in 0..64 {
-            let (id, rx) = register(&mut h, &format!("t/{i}"));
-            assert!(id.is_some());
-            rxs.push(rx);
-        }
-        assert_eq!(h.pending_publishes.len(), 64);
-        for rx in &mut rxs {
-            assert!(matches!(
-                rx.try_recv(),
-                Err(oneshot::error::TryRecvError::Empty)
-            ));
+            let payload = Bytes::from(vec![0u8; 216]);
+            let mut waits = Vec::with_capacity(entries);
+            for _ in 0..entries {
+                let (id, wait) = register(&mut hub, "fleet/site/1/telemetry", &payload);
+                hub.send_acked_forward(id, &peer);
+                waits.push(wait);
+            }
+            while rx.try_recv().is_ok() {}
+            let mut time_sweep = |hub: &mut Hub, expect: usize| {
+                let mut best = Duration::MAX;
+                for _ in 0..10 {
+                    let t = Instant::now();
+                    hub.sweep_pending_forwards();
+                    best = best.min(t.elapsed());
+                    let mut frames = 0;
+                    while rx.try_recv().is_ok() {
+                        frames += 1;
+                    }
+                    assert_eq!(frames, expect);
+                }
+                best
+            };
+            // Young entries: the walk alone, nothing retransmitted.
+            let young = time_sweep(&mut hub, 0);
+            // Overdue entries: one retransmit per outstanding forward. Back-dated
+            // rather than slept for — the measurement is of the sweep, not of the
+            // clock, and a real wait would put a second per iteration into it.
+            let aged = Instant::now()
+                .checked_sub(crate::hub::SESSION_SWEEP_INTERVAL)
+                .expect("the clock is past one sweep interval");
+            for (_, p) in hub.pending_publishes.iter_mut() {
+                p.created_at = aged;
+            }
+            let overdue = time_sweep(&mut hub, entries);
+            println!("sweep over {entries} entries: {young:?} young, {overdue:?} all overdue");
         }
     }
 }

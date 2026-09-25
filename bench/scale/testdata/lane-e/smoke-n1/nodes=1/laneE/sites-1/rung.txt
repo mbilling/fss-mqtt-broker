@@ -1,0 +1,1 @@
+sites=1 offered=1000 publishers=100 consumers=7 per_consumer=142 p99_budget_ms=1000 qos=0 sub_qos=0 window_secs=15 window=aligned cpu_window=aligned settle_s=20 settled=yes settled_conns=107 expected_conns=107 drained=no drain_secs=7 drain_deadline_s=15 control=no reset=yes reset_conns=0

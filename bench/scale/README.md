@@ -16,8 +16,12 @@ The prerequisites and pricing below describe the default Hetzner platform.
 
 1. **A dedicated Hetzner Cloud project** (e.g. `mqttd-bench`). Dedicated so the
    label-scoped leak sweeper (`teardown.sh --force`) can never touch anything
-   that is not this rig's. The default 10-server limit fits (max 5 brokers + 3
-   drivers).
+   that is not this rig's. A new project's default limits (10 servers) are too
+   small for the scale-out sizes; this rig's project runs at **30 servers / 200
+   vCPUs** (raised 2026-09-15), which `terraform/quota.tf` enforces at plan time
+   (`server_quota`, `vcpu_quota`). The largest shape the rig can express, 10
+   brokers + 20 drivers, is 30 servers / 200 vCPUs on CCX23 + CCX33 — exactly the
+   quota, which `quota.tf` rejects anything beyond.
 2. **A Read & Write API token** for that project → `export HCLOUD_TOKEN=...` in
    the shell that runs the rig. Never committed, never a CI secret.
 3. **An SSH keypair.** The default is `~/.ssh/id_ed25519`; for any other key
@@ -175,9 +179,9 @@ checked *per rung* rather than once, because a shape can be valid at 1 site and
 impossible at 8 — and the binding constraint is usually the harness: sites are
 dealt round-robin to drivers at three one-vCPU containers each, so 16 sites
 needs 12 containers on the busiest of 5 drivers and is **refused**. Reaching 16
-needs `DRIVER_COUNT=8`, which `driver_count` permits (it caps at 8, and
+needs `DRIVER_COUNT=8`, which `driver_count` permits (it caps at 12, and
 `quota.tf` refuses any broker/driver combination that would exceed the project's
-vCPU quota part way through an apply). That bound belongs to the load
+server or vCPU quota part way through an apply). That bound belongs to the load
 generators, not the broker, and the shape check prints it rather than letting a
 driver shortfall read as a broker limit.
 
@@ -270,19 +274,56 @@ with the matching env file beside it. It is a diagnostic campaign, not a
 published curve — do not copy its one-off numbers into
 `docs/benchmarks/SCALE-CURVE.md`.
 
-Before reading capacity vs N from an Option B arm: confirm the crossing gate
-(`mqttd_publish_forwarded_total` / `mqttd_publish_received_total`) using complete,
-supported broker snapshots without detected counter resets. Lazily absent samples
-can mean zero, but missing/failed scrapes cannot. `python3 extract-lane-e.py
-<run>/results` reports invalid input with a nonzero exit. Its totals include
-ramp/drain; it does not repair Lane E's existing measurement-window mismatch.
-It also prints per-broker ingress and crossing, and `rx_skew` (busiest broker's
-Δ received over the mean) with `eff_nodes = N / rx_skew`. Under shared
-prefer-local, delivery work follows the publisher's broker and nothing sheds on
-hub saturation, so `eff_nodes` is a ceiling on how many brokers a rung can use:
-read it before attributing a flat N=5→7 to the broker.
+Before reading capacity vs N from an Option B arm, pass the crossing gate:
+`laneE/forward-canary.txt` says `status=pass` and `python3 extract-lane-e.py
+--crossing-gate 0.5 <run>/results` exits 0. mqttd exports no forwarded family
+until a broker first forwards, so an absent series is only a zero under a
+certificate — **structural** at N=1 (no peer links) or **canary** at N≥2 (the
+size's forwarding positive control re-derived by `forward-canary.py`'s ledger,
+with every later snapshot still above its floors, in the same process). The gate
+also judges each broker's own crossing, not only the aggregate. `python3
+forward-canary.py local-proof --mqttd <bin> --nodes N` proves that chain on N local
+processes before a paid run: canary, a certified zero-crossing rung, and a restart the
+extractor refuses. Uncertified,
+truncated or reset scrapes are INVALID with a nonzero exit. Rates, crossing, hub
+dispatch and CPU idle come from the rung's aligned steady window: brokers and
+consumers are scraped by one batch at each edge, each host stamps its own scrape
+(`window.tsv`), and the CPU samplers run for exactly that window. Rungs recorded
+before the window existed read `UNALIGNED` and must not back a capacity claim.
+The extractor also prints `rx_skew` (the busiest broker's windowed Δ received over
+the mean broker's) and `eff_nodes = N / rx_skew`. Under shared prefer-local,
+delivery work follows the publisher's broker and nothing sheds on hub saturation,
+so `eff_nodes` is a ceiling on how many brokers a rung can use: read it before
+attributing a flat N=5→7 to the broker (#613).
 The card separates matched-total-load comparisons from capacity knees and provides
 `bash ./482-smoke.sh` to prove teardown without inheriting the full campaign shape.
+
+## Cross-broker comparison on cloud hardware (ADR 0048 T4)
+
+`./run.sh compare` provisions ONE broker host and a driver fleet, then runs every
+broker under test on that same host in turn — mqttd (the published image, durable
+sessions explicitly off), Mosquitto, EMQX and HiveMQ CE, each from a pinned digest
+with its config committed in [`compare/`](compare/). Each arm ladders
+`COMPARE_RATES` until its knee.
+
+Three things make it a comparison rather than four runs:
+
+- **One provisioning for every broker.** Two provisionings of nominally identical
+  hardware have measured 40% apart on this rig (ADR 0077 T4); across brokers that
+  spread would be indistinguishable from a broker difference.
+- **The host reboots between arms**, so page cache and socket state from the
+  previous broker's overload rungs do not follow the next one, and the first
+  broker repeats at the end as a control. `summarize-compare.py` voids the
+  sequence when the closing arm does not match the opening one.
+- **Driver-side measurement only.** Offered, sent, received and the p99 come from
+  emqtt-bench (EMQX's own tool) and its histogram of timestamped payloads; the
+  broker host contributes mpstat and `docker stats` and nothing else. mqttd's own
+  counters are deliberately unread — reading them here would be exactly the
+  home-field advantage ADR 0048 §3 refuses.
+
+`COMPARE_SHAPE_ONLY=1 ./compare-brokers.sh <dir> <inventory.json>` checks the
+ladder's container budget offline, and `run.sh compare`'s preflight runs it before
+any cloud call. Summarize with `python3 summarize-compare.py <run>/results`.
 
 ## Honesty notes
 

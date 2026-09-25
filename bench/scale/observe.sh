@@ -50,6 +50,12 @@ attach)
 		mkdir -p "$OBS_DIR/alloy"
 		cp "$OBS_DIR/alloy/config.alloy.idle" "$OBS_DIR/alloy/config.alloy"
 	fi
+	# The TSDB volume is `external` in the compose file so no `down -v` of this
+	# stack can take the history with it, which also means compose will not create
+	# it: a fresh operator machine failed attach on exactly that (2026-09-15, #482).
+	docker volume inspect observe_prom-data >/dev/null 2>&1 ||
+		docker volume create observe_prom-data >/dev/null ||
+		die "could not create the observe_prom-data docker volume"
 	say "observe: starting local Grafana(:3000) + Prometheus(:9090)"
 	(cd "$OBS_DIR" && docker compose up -d --quiet-pull 2>/dev/null || docker compose up -d)
 
@@ -87,7 +93,7 @@ attach)
 		i=0
 		while IFS=$'\t' read -r node_id; do
 			echo "prometheus.scrape \"broker_$i\" {"
-			echo "  targets         = [{ __address__ = \"host.docker.internal:8096\", instance = \"$node_id\" }]"
+			echo "  targets         = [{ __address__ = \"127.0.0.1:8096\", instance = \"$node_id\" }]"
 			echo "  metrics_path    = \"/$node_id.prom\""
 			echo '  scrape_interval = "2s"'
 			echo '  scrape_timeout  = "2s"'
@@ -96,7 +102,7 @@ attach)
 			i=$((i + 1))
 		done < <(jq -r '.brokers[].node_id' "$INVENTORY")
 		echo 'prometheus.scrape "bench_phase" {'
-		echo '  targets         = [{ __address__ = "pushgateway:9091" }]'
+		echo '  targets         = [{ __address__ = "127.0.0.1:9091" }]'
 		echo '  scrape_interval = "5s"'
 		# Alloy's default scrape_timeout (10s) is refused against a 5s interval.
 		echo '  scrape_timeout  = "3s"'
@@ -104,7 +110,7 @@ attach)
 		echo '  forward_to      = [prometheus.remote_write.local.receiver]'
 		echo '}'
 		echo 'prometheus.remote_write "local" {'
-		echo '  endpoint { url = "http://prometheus:9090/api/v1/write" }'
+		echo '  endpoint { url = "http://127.0.0.1:9090/api/v1/write" }'
 		echo '}'
 	} >"$ALLOY_CFG"
 	cp "$ALLOY_CFG" "$RUN/alloy-config.alloy"

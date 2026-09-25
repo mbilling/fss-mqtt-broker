@@ -1,0 +1,383 @@
+# HELP mqttd_connections_active Currently open client connections.
+# TYPE mqttd_connections_active gauge
+mqttd_connections_active 2
+# HELP mqttd_connections Client connections accepted, by protocol version.
+# TYPE mqttd_connections counter
+mqttd_connections_total{protocol="3.1.1"} 4
+# HELP mqttd_accepts TCP connections accepted, by listener (before TLS/CONNECT).
+# TYPE mqttd_accepts counter
+mqttd_accepts_total{listener="plaintext"} 4
+# HELP mqttd_publish_received PUBLISH packets received from clients, by QoS.
+# TYPE mqttd_publish_received counter
+mqttd_publish_received_total{qos="0"} 204
+# HELP mqttd_publish_delivered PUBLISH packets delivered to subscribers, by QoS.
+# TYPE mqttd_publish_delivered counter
+mqttd_publish_delivered_total{qos="0"} 204
+# HELP mqttd_publish_forwarded Publishes handed to a peer link rather than delivered locally, by reason (shared-remote, subscriber-remote).
+# TYPE mqttd_publish_forwarded counter
+mqttd_publish_forwarded_total{reason="shared-remote"} 204
+# HELP mqttd_deliver_latency_seconds Publish-to-deliver latency (the hub's ON-LOOP fan-out: plan, lane submissions, peer forwards — the durable appends themselves run off-loop since issue #242 and are timed by durable_append_latency_seconds).
+# TYPE mqttd_deliver_latency_seconds histogram
+mqttd_deliver_latency_seconds_sum 0.004841748000000001
+mqttd_deliver_latency_seconds_count 204
+mqttd_deliver_latency_seconds_bucket{le="0.0001"} 204
+mqttd_deliver_latency_seconds_bucket{le="0.0002"} 204
+mqttd_deliver_latency_seconds_bucket{le="0.0004"} 204
+mqttd_deliver_latency_seconds_bucket{le="0.0008"} 204
+mqttd_deliver_latency_seconds_bucket{le="0.0016"} 204
+mqttd_deliver_latency_seconds_bucket{le="0.0032"} 204
+mqttd_deliver_latency_seconds_bucket{le="0.0064"} 204
+mqttd_deliver_latency_seconds_bucket{le="0.0128"} 204
+mqttd_deliver_latency_seconds_bucket{le="0.0256"} 204
+mqttd_deliver_latency_seconds_bucket{le="0.0512"} 204
+mqttd_deliver_latency_seconds_bucket{le="0.1024"} 204
+mqttd_deliver_latency_seconds_bucket{le="0.2048"} 204
+mqttd_deliver_latency_seconds_bucket{le="0.4096"} 204
+mqttd_deliver_latency_seconds_bucket{le="0.8192"} 204
+mqttd_deliver_latency_seconds_bucket{le="1.6384"} 204
+mqttd_deliver_latency_seconds_bucket{le="3.2768"} 204
+mqttd_deliver_latency_seconds_bucket{le="+Inf"} 204
+# HELP mqttd_hub_dispatch_seconds Time the single-threaded hub loop spent inside one command dispatch, by coarse command class (issue #242). Every client on the node queues behind a long dispatch, so a sustained p99 above ~100ms means something is blocking the loop again — see docs/OPERATIONS.md.
+# TYPE mqttd_hub_dispatch_seconds histogram
+mqttd_hub_dispatch_seconds_sum{command="cluster"} 0.004021579999999999
+mqttd_hub_dispatch_seconds_count{command="cluster"} 258
+mqttd_hub_dispatch_seconds_bucket{le="0.0001",command="cluster"} 258
+mqttd_hub_dispatch_seconds_bucket{le="0.0002",command="cluster"} 258
+mqttd_hub_dispatch_seconds_bucket{le="0.0004",command="cluster"} 258
+mqttd_hub_dispatch_seconds_bucket{le="0.0008",command="cluster"} 258
+mqttd_hub_dispatch_seconds_bucket{le="0.0016",command="cluster"} 258
+mqttd_hub_dispatch_seconds_bucket{le="0.0032",command="cluster"} 258
+mqttd_hub_dispatch_seconds_bucket{le="0.0064",command="cluster"} 258
+mqttd_hub_dispatch_seconds_bucket{le="0.0128",command="cluster"} 258
+mqttd_hub_dispatch_seconds_bucket{le="0.0256",command="cluster"} 258
+mqttd_hub_dispatch_seconds_bucket{le="0.0512",command="cluster"} 258
+mqttd_hub_dispatch_seconds_bucket{le="0.1024",command="cluster"} 258
+mqttd_hub_dispatch_seconds_bucket{le="0.2048",command="cluster"} 258
+mqttd_hub_dispatch_seconds_bucket{le="0.4096",command="cluster"} 258
+mqttd_hub_dispatch_seconds_bucket{le="0.8192",command="cluster"} 258
+mqttd_hub_dispatch_seconds_bucket{le="1.6384",command="cluster"} 258
+mqttd_hub_dispatch_seconds_bucket{le="3.2768",command="cluster"} 258
+mqttd_hub_dispatch_seconds_bucket{le="6.5536",command="cluster"} 258
+mqttd_hub_dispatch_seconds_bucket{le="13.1072",command="cluster"} 258
+mqttd_hub_dispatch_seconds_bucket{le="+Inf",command="cluster"} 258
+mqttd_hub_dispatch_seconds_sum{command="control"} 0.000239322
+mqttd_hub_dispatch_seconds_count{command="control"} 17
+mqttd_hub_dispatch_seconds_bucket{le="0.0001",command="control"} 16
+mqttd_hub_dispatch_seconds_bucket{le="0.0002",command="control"} 17
+mqttd_hub_dispatch_seconds_bucket{le="0.0004",command="control"} 17
+mqttd_hub_dispatch_seconds_bucket{le="0.0008",command="control"} 17
+mqttd_hub_dispatch_seconds_bucket{le="0.0016",command="control"} 17
+mqttd_hub_dispatch_seconds_bucket{le="0.0032",command="control"} 17
+mqttd_hub_dispatch_seconds_bucket{le="0.0064",command="control"} 17
+mqttd_hub_dispatch_seconds_bucket{le="0.0128",command="control"} 17
+mqttd_hub_dispatch_seconds_bucket{le="0.0256",command="control"} 17
+mqttd_hub_dispatch_seconds_bucket{le="0.0512",command="control"} 17
+mqttd_hub_dispatch_seconds_bucket{le="0.1024",command="control"} 17
+mqttd_hub_dispatch_seconds_bucket{le="0.2048",command="control"} 17
+mqttd_hub_dispatch_seconds_bucket{le="0.4096",command="control"} 17
+mqttd_hub_dispatch_seconds_bucket{le="0.8192",command="control"} 17
+mqttd_hub_dispatch_seconds_bucket{le="1.6384",command="control"} 17
+mqttd_hub_dispatch_seconds_bucket{le="3.2768",command="control"} 17
+mqttd_hub_dispatch_seconds_bucket{le="6.5536",command="control"} 17
+mqttd_hub_dispatch_seconds_bucket{le="13.1072",command="control"} 17
+mqttd_hub_dispatch_seconds_bucket{le="+Inf",command="control"} 17
+mqttd_hub_dispatch_seconds_sum{command="subscribe"} 0.000074326
+mqttd_hub_dispatch_seconds_count{command="subscribe"} 3
+mqttd_hub_dispatch_seconds_bucket{le="0.0001",command="subscribe"} 3
+mqttd_hub_dispatch_seconds_bucket{le="0.0002",command="subscribe"} 3
+mqttd_hub_dispatch_seconds_bucket{le="0.0004",command="subscribe"} 3
+mqttd_hub_dispatch_seconds_bucket{le="0.0008",command="subscribe"} 3
+mqttd_hub_dispatch_seconds_bucket{le="0.0016",command="subscribe"} 3
+mqttd_hub_dispatch_seconds_bucket{le="0.0032",command="subscribe"} 3
+mqttd_hub_dispatch_seconds_bucket{le="0.0064",command="subscribe"} 3
+mqttd_hub_dispatch_seconds_bucket{le="0.0128",command="subscribe"} 3
+mqttd_hub_dispatch_seconds_bucket{le="0.0256",command="subscribe"} 3
+mqttd_hub_dispatch_seconds_bucket{le="0.0512",command="subscribe"} 3
+mqttd_hub_dispatch_seconds_bucket{le="0.1024",command="subscribe"} 3
+mqttd_hub_dispatch_seconds_bucket{le="0.2048",command="subscribe"} 3
+mqttd_hub_dispatch_seconds_bucket{le="0.4096",command="subscribe"} 3
+mqttd_hub_dispatch_seconds_bucket{le="0.8192",command="subscribe"} 3
+mqttd_hub_dispatch_seconds_bucket{le="1.6384",command="subscribe"} 3
+mqttd_hub_dispatch_seconds_bucket{le="3.2768",command="subscribe"} 3
+mqttd_hub_dispatch_seconds_bucket{le="6.5536",command="subscribe"} 3
+mqttd_hub_dispatch_seconds_bucket{le="13.1072",command="subscribe"} 3
+mqttd_hub_dispatch_seconds_bucket{le="+Inf",command="subscribe"} 3
+mqttd_hub_dispatch_seconds_sum{command="publish"} 0.005859304000000001
+mqttd_hub_dispatch_seconds_count{command="publish"} 204
+mqttd_hub_dispatch_seconds_bucket{le="0.0001",command="publish"} 204
+mqttd_hub_dispatch_seconds_bucket{le="0.0002",command="publish"} 204
+mqttd_hub_dispatch_seconds_bucket{le="0.0004",command="publish"} 204
+mqttd_hub_dispatch_seconds_bucket{le="0.0008",command="publish"} 204
+mqttd_hub_dispatch_seconds_bucket{le="0.0016",command="publish"} 204
+mqttd_hub_dispatch_seconds_bucket{le="0.0032",command="publish"} 204
+mqttd_hub_dispatch_seconds_bucket{le="0.0064",command="publish"} 204
+mqttd_hub_dispatch_seconds_bucket{le="0.0128",command="publish"} 204
+mqttd_hub_dispatch_seconds_bucket{le="0.0256",command="publish"} 204
+mqttd_hub_dispatch_seconds_bucket{le="0.0512",command="publish"} 204
+mqttd_hub_dispatch_seconds_bucket{le="0.1024",command="publish"} 204
+mqttd_hub_dispatch_seconds_bucket{le="0.2048",command="publish"} 204
+mqttd_hub_dispatch_seconds_bucket{le="0.4096",command="publish"} 204
+mqttd_hub_dispatch_seconds_bucket{le="0.8192",command="publish"} 204
+mqttd_hub_dispatch_seconds_bucket{le="1.6384",command="publish"} 204
+mqttd_hub_dispatch_seconds_bucket{le="3.2768",command="publish"} 204
+mqttd_hub_dispatch_seconds_bucket{le="6.5536",command="publish"} 204
+mqttd_hub_dispatch_seconds_bucket{le="13.1072",command="publish"} 204
+mqttd_hub_dispatch_seconds_bucket{le="+Inf",command="publish"} 204
+mqttd_hub_dispatch_seconds_sum{command="attach"} 0.00012603
+mqttd_hub_dispatch_seconds_count{command="attach"} 8
+mqttd_hub_dispatch_seconds_bucket{le="0.0001",command="attach"} 8
+mqttd_hub_dispatch_seconds_bucket{le="0.0002",command="attach"} 8
+mqttd_hub_dispatch_seconds_bucket{le="0.0004",command="attach"} 8
+mqttd_hub_dispatch_seconds_bucket{le="0.0008",command="attach"} 8
+mqttd_hub_dispatch_seconds_bucket{le="0.0016",command="attach"} 8
+mqttd_hub_dispatch_seconds_bucket{le="0.0032",command="attach"} 8
+mqttd_hub_dispatch_seconds_bucket{le="0.0064",command="attach"} 8
+mqttd_hub_dispatch_seconds_bucket{le="0.0128",command="attach"} 8
+mqttd_hub_dispatch_seconds_bucket{le="0.0256",command="attach"} 8
+mqttd_hub_dispatch_seconds_bucket{le="0.0512",command="attach"} 8
+mqttd_hub_dispatch_seconds_bucket{le="0.1024",command="attach"} 8
+mqttd_hub_dispatch_seconds_bucket{le="0.2048",command="attach"} 8
+mqttd_hub_dispatch_seconds_bucket{le="0.4096",command="attach"} 8
+mqttd_hub_dispatch_seconds_bucket{le="0.8192",command="attach"} 8
+mqttd_hub_dispatch_seconds_bucket{le="1.6384",command="attach"} 8
+mqttd_hub_dispatch_seconds_bucket{le="3.2768",command="attach"} 8
+mqttd_hub_dispatch_seconds_bucket{le="6.5536",command="attach"} 8
+mqttd_hub_dispatch_seconds_bucket{le="13.1072",command="attach"} 8
+mqttd_hub_dispatch_seconds_bucket{le="+Inf",command="attach"} 8
+mqttd_hub_dispatch_seconds_sum{command="sweep"} 0.012017665
+mqttd_hub_dispatch_seconds_count{command="sweep"} 7
+mqttd_hub_dispatch_seconds_bucket{le="0.0001",command="sweep"} 0
+mqttd_hub_dispatch_seconds_bucket{le="0.0002",command="sweep"} 0
+mqttd_hub_dispatch_seconds_bucket{le="0.0004",command="sweep"} 0
+mqttd_hub_dispatch_seconds_bucket{le="0.0008",command="sweep"} 1
+mqttd_hub_dispatch_seconds_bucket{le="0.0016",command="sweep"} 5
+mqttd_hub_dispatch_seconds_bucket{le="0.0032",command="sweep"} 7
+mqttd_hub_dispatch_seconds_bucket{le="0.0064",command="sweep"} 7
+mqttd_hub_dispatch_seconds_bucket{le="0.0128",command="sweep"} 7
+mqttd_hub_dispatch_seconds_bucket{le="0.0256",command="sweep"} 7
+mqttd_hub_dispatch_seconds_bucket{le="0.0512",command="sweep"} 7
+mqttd_hub_dispatch_seconds_bucket{le="0.1024",command="sweep"} 7
+mqttd_hub_dispatch_seconds_bucket{le="0.2048",command="sweep"} 7
+mqttd_hub_dispatch_seconds_bucket{le="0.4096",command="sweep"} 7
+mqttd_hub_dispatch_seconds_bucket{le="0.8192",command="sweep"} 7
+mqttd_hub_dispatch_seconds_bucket{le="1.6384",command="sweep"} 7
+mqttd_hub_dispatch_seconds_bucket{le="3.2768",command="sweep"} 7
+mqttd_hub_dispatch_seconds_bucket{le="6.5536",command="sweep"} 7
+mqttd_hub_dispatch_seconds_bucket{le="13.1072",command="sweep"} 7
+mqttd_hub_dispatch_seconds_bucket{le="+Inf",command="sweep"} 7
+# HELP mqttd_append_lane_jobs Durable-append lane jobs admitted and not yet completed, summed over sessions (issue #242); sustained growth means a placement group's followers are not keeping up — the warning before publish_dropped{reason="append-backlog-full"} fires.
+# TYPE mqttd_append_lane_jobs gauge
+mqttd_append_lane_jobs 0
+# HELP mqttd_sessions Known client sessions (connected or retained).
+# TYPE mqttd_sessions gauge
+mqttd_sessions 0
+# HELP mqttd_subscriptions Active topic-filter subscriptions across all sessions.
+# TYPE mqttd_subscriptions gauge
+mqttd_subscriptions 0
+# HELP mqttd_retained_messages Retained messages held by the broker.
+# TYPE mqttd_retained_messages gauge
+mqttd_retained_messages 0
+# HELP mqttd_inflight_messages Unacknowledged QoS>0 messages outstanding to clients.
+# TYPE mqttd_inflight_messages gauge
+mqttd_inflight_messages 0
+# HELP mqttd_backlog_bytes Accounted bytes held in flow-control backlogs across sessions (sampled on the session sweep, not live).
+# TYPE mqttd_backlog_bytes gauge
+mqttd_backlog_bytes 0
+# HELP mqttd_backlog_bytes_max Accounted bytes held by the LARGEST single session's flow-control backlog (sampled on the session sweep, not live) — the number to size a PER-SUBSCRIBER cap against, since backlog_bytes sums every session.
+# TYPE mqttd_backlog_bytes_max gauge
+mqttd_backlog_bytes_max 0
+# HELP mqttd_cluster_members Cluster members eligible for placement (this node plus non-dead peers).
+# TYPE mqttd_cluster_members gauge
+mqttd_cluster_members 3
+# HELP mqttd_peer_links Currently connected inter-node peer links.
+# TYPE mqttd_peer_links gauge
+mqttd_peer_links 2
+# HELP mqttd_peer_forwards_in_flight Frames queued on inter-node peer links, not yet written to the wire.
+# TYPE mqttd_peer_forwards_in_flight gauge
+mqttd_peer_forwards_in_flight 0
+# HELP mqttd_replication_desired Configured replication factor R for durable placement groups.
+# TYPE mqttd_replication_desired gauge
+mqttd_replication_desired 3
+# HELP mqttd_replication_min_actual Smallest replica-set size any placement group currently has — the worst-case durability; below replication_desired means at least one group is under-replicated (issue #167).
+# TYPE mqttd_replication_min_actual gauge
+mqttd_replication_min_actual 3
+# HELP mqttd_replication_write_floor Smallest replica set a durable append may commit on (issue #239); replication_min_actual < replication_write_floor means durable writes are being REFUSED — QoS>=1 publishers get no ack and redeliver, retained mutations queue.
+# TYPE mqttd_replication_write_floor gauge
+mqttd_replication_write_floor 2
+# HELP mqttd_retained_tombstones Retained tombstone fences currently held awaiting cluster-wide convergence (issue #229); sustained growth means an absent durable member or chronic divergence.
+# TYPE mqttd_retained_tombstones gauge
+mqttd_retained_tombstones 0
+# HELP mqttd_misplaced_sessions Live persistent sessions hosted on a node that does NOT own their placement group (issue #284). Non-zero for longer than a convergence window means sessions that cannot be rehomed (the owner's peer address is unknown) — those sessions are undeliverable and their publishers are withheld.
+# TYPE mqttd_misplaced_sessions gauge
+mqttd_misplaced_sessions 0
+# HELP mqttd_members Cluster members by SWIM state (alive/suspect/dead).
+# TYPE mqttd_members gauge
+mqttd_members{state="dead"} 0
+mqttd_members{state="suspect"} 0
+mqttd_members{state="alive"} 3
+# HELP mqttd_lease_leader 1 if this node is the leader of its lease group, else 0.
+# TYPE mqttd_lease_leader gauge
+mqttd_lease_leader 1
+# HELP mqttd_lease_epoch Current lease-group consensus term (epoch).
+# TYPE mqttd_lease_epoch gauge
+mqttd_lease_epoch 1
+# HELP mqttd_durable_append_latency_seconds Durable (quorum) append latency.
+# TYPE mqttd_durable_append_latency_seconds histogram
+mqttd_durable_append_latency_seconds_sum 0.0
+mqttd_durable_append_latency_seconds_count 0
+mqttd_durable_append_latency_seconds_bucket{le="0.0001"} 0
+mqttd_durable_append_latency_seconds_bucket{le="0.0002"} 0
+mqttd_durable_append_latency_seconds_bucket{le="0.0004"} 0
+mqttd_durable_append_latency_seconds_bucket{le="0.0008"} 0
+mqttd_durable_append_latency_seconds_bucket{le="0.0016"} 0
+mqttd_durable_append_latency_seconds_bucket{le="0.0032"} 0
+mqttd_durable_append_latency_seconds_bucket{le="0.0064"} 0
+mqttd_durable_append_latency_seconds_bucket{le="0.0128"} 0
+mqttd_durable_append_latency_seconds_bucket{le="0.0256"} 0
+mqttd_durable_append_latency_seconds_bucket{le="0.0512"} 0
+mqttd_durable_append_latency_seconds_bucket{le="0.1024"} 0
+mqttd_durable_append_latency_seconds_bucket{le="0.2048"} 0
+mqttd_durable_append_latency_seconds_bucket{le="0.4096"} 0
+mqttd_durable_append_latency_seconds_bucket{le="0.8192"} 0
+mqttd_durable_append_latency_seconds_bucket{le="1.6384"} 0
+mqttd_durable_append_latency_seconds_bucket{le="3.2768"} 0
+mqttd_durable_append_latency_seconds_bucket{le="+Inf"} 0
+# HELP mqttd_http_auth_latency_seconds HTTP authentication hook round-trip latency (ADR 0004 T16). This sits on the CONNECT path, so its tail is connection-setup latency.
+# TYPE mqttd_http_auth_latency_seconds histogram
+mqttd_http_auth_latency_seconds_sum 0.0
+mqttd_http_auth_latency_seconds_count 0
+mqttd_http_auth_latency_seconds_bucket{le="0.0001"} 0
+mqttd_http_auth_latency_seconds_bucket{le="0.0002"} 0
+mqttd_http_auth_latency_seconds_bucket{le="0.0004"} 0
+mqttd_http_auth_latency_seconds_bucket{le="0.0008"} 0
+mqttd_http_auth_latency_seconds_bucket{le="0.0016"} 0
+mqttd_http_auth_latency_seconds_bucket{le="0.0032"} 0
+mqttd_http_auth_latency_seconds_bucket{le="0.0064"} 0
+mqttd_http_auth_latency_seconds_bucket{le="0.0128"} 0
+mqttd_http_auth_latency_seconds_bucket{le="0.0256"} 0
+mqttd_http_auth_latency_seconds_bucket{le="0.0512"} 0
+mqttd_http_auth_latency_seconds_bucket{le="0.1024"} 0
+mqttd_http_auth_latency_seconds_bucket{le="0.2048"} 0
+mqttd_http_auth_latency_seconds_bucket{le="0.4096"} 0
+mqttd_http_auth_latency_seconds_bucket{le="0.8192"} 0
+mqttd_http_auth_latency_seconds_bucket{le="1.6384"} 0
+mqttd_http_auth_latency_seconds_bucket{le="3.2768"} 0
+mqttd_http_auth_latency_seconds_bucket{le="+Inf"} 0
+# HELP mqttd_lease_quorum_ack_ms Milliseconds since the lease-group leader last had a quorum ack (0 when not leader).
+# TYPE mqttd_lease_quorum_ack_ms gauge
+mqttd_lease_quorum_ack_ms 0
+# HELP mqttd_store_bytes On-disk size of each redb store in bytes (ADR 0041 T5), by store (sessions, retained, replicas, lease).
+# TYPE mqttd_store_bytes gauge
+mqttd_store_bytes{store="lease"} 1589248
+mqttd_store_bytes{store="replicas"} 1589248
+mqttd_store_bytes{store="retained"} 1589248
+mqttd_store_bytes{store="sessions"} 0
+# HELP mqttd_quic_path_migrations QUIC connection path migrations observed (client address changed; same connection and session kept).
+# TYPE mqttd_quic_path_migrations counter
+mqttd_quic_path_migrations_total 0
+# HELP mqttd_retained_apply_failed Committed retained updates the local store REFUSED to write. Non-zero means this node is missing retained values its peers hold; the topic is repaired by the next commit or the periodic digest, but a persistent rate means the store is unhealthy and this node serves stale retained state.
+# TYPE mqttd_retained_apply_failed counter
+mqttd_retained_apply_failed_total 0
+# HELP mqttd_retained_divergence Retained-message divergences detected between peers (same topic, different value — ADR 0037 P1); should stay at zero once single-owner retained lands.
+# TYPE mqttd_retained_divergence counter
+mqttd_retained_divergence_total 0
+# HELP mqttd_retained_queue_dropped Retained mutations dropped because the queue-until-heal bound was hit (ADR 0037 §5): the oldest queued mutation discarded, loudly — non-zero means a partition outlasted the queue's capacity.
+# TYPE mqttd_retained_queue_dropped counter
+mqttd_retained_queue_dropped_total 0
+# HELP mqttd_audit_export_dropped Audit records the SIEM exporter shed because its bounded queue was full (ADR 0066 T3): the chain itself is intact at the source, and the export's seq gap makes the shed detectable downstream — non-zero means the export endpoint is slower than the audit rate.
+# TYPE mqttd_audit_export_dropped counter
+mqttd_audit_export_dropped_total 0
+# HELP mqttd_publish_tier Gated publishes by publisher-selected durability tier (ADR 0072): quorum (the default full ack-after-quorum), local (ack after the owner's fsync), relaxed (ack at accept+submit). Non-default tiers require the operator's MQTTD_ALLOW_RELAXED_PUBLISH opt-in.
+# TYPE mqttd_publish_tier counter
+mqttd_publish_tier_total{tier="quorum"} 204
+# HELP mqttd_durable_writer_batches Fsync'd batches the node-wide durable-write serializer committed (ADR 0071): each batch is one Durability::Immediate transaction covering owner appends and follower replica applies that arrived while the previous fsync ran.
+# TYPE mqttd_durable_writer_batches counter
+mqttd_durable_writer_batches_total 12
+# HELP mqttd_durable_writer_ops Durable ops applied across all serializer batches (ADR 0071); divided by durable_writer_batches this is the mean group-commit batch size — 1.0 at rest, rising under load as coalescing pays.
+# TYPE mqttd_durable_writer_ops counter
+mqttd_durable_writer_ops_total 12
+# HELP mqttd_durable_writer_max_batch Largest single group-commit batch since boot (ADR 0071).
+# TYPE mqttd_durable_writer_max_batch gauge
+mqttd_durable_writer_max_batch 1
+# HELP mqttd_durable_writer_commit_micros Cumulative microseconds the durable-write serializer spent committing batches (ADR 0076): divided by durable_writer_batches over the same window this is the LIVE mean commit (barrier) latency — the passive volume-health signal, measured from real traffic.
+# TYPE mqttd_durable_writer_commit_micros counter
+mqttd_durable_writer_commit_micros_total 2515
+# HELP mqttd_store_barrier_floor Boot-probed single-writer barrier rate (fsync round trips per second) of the data-dir volume (ADR 0076): the denominator every durable throughput figure should be read against; 0 until probed.
+# TYPE mqttd_store_barrier_floor gauge
+mqttd_store_barrier_floor 134901
+# HELP mqttd_store_barrier_floor_4stream Boot-probed AGGREGATE barrier rate across 4 concurrent writers on separate files (ADR 0076): how much parallel-stream headroom the volume has beyond one fsync stream — the sharding signal; 0 until probed.
+# TYPE mqttd_store_barrier_floor_4stream gauge
+mqttd_store_barrier_floor_4stream 39000
+# HELP mqttd_store_shards How many files the replica store spans (ADR 0076 T2): committed at first boot from this volume's measured barrier knee and fixed for the life of the data dir; 1 for a single-file store.
+# TYPE mqttd_store_shards gauge
+mqttd_store_shards 1
+# HELP mqttd_store_reshard_advice The shard count this volume's measurements now suggest (ADR 0076 T2), when it differs from the committed one — an ADVISORY for the operator, never an automatic migration; 0 when the committed layout still fits.
+# TYPE mqttd_store_reshard_advice gauge
+mqttd_store_reshard_advice 0
+# HELP mqttd_store_max_bytes The configured disk high-water mark in bytes (MQTTD_STORE_MAX_BYTES); 0 = no watermark configured.
+# TYPE mqttd_store_max_bytes gauge
+mqttd_store_max_bytes 0
+# HELP mqttd_process_resident_bytes Resident set size of the broker process in bytes (ADR 0041 T8).
+# TYPE mqttd_process_resident_bytes gauge
+mqttd_process_resident_bytes 19697664
+# HELP mqttd_memory_max_bytes The configured memory high-water mark in bytes (MQTTD_MEMORY_MAX_BYTES); 0 = no watermark configured.
+# TYPE mqttd_memory_max_bytes gauge
+mqttd_memory_max_bytes 0
+# HELP mqttd_decommission_state Decommission drain state (ADR 0043/0054): 0 = none, 1 = draining, 2 = complete.
+# TYPE mqttd_decommission_state gauge
+mqttd_decommission_state 0
+# HELP mqttd_decommission_pending Hand-offs still pending in an active decommission drain.
+# TYPE mqttd_decommission_pending gauge
+mqttd_decommission_pending 0
+# HELP mqttd_voters Current lease-group voter count (ADR 0049/0054).
+# TYPE mqttd_voters gauge
+mqttd_voters 3
+# HELP mqttd_replica_groups_current Replicated groups this node tracks that list it as caught up (ADR 0054); tracked minus current is this node's replication lag in groups.
+# TYPE mqttd_replica_groups_current gauge
+mqttd_replica_groups_current 256
+# HELP mqttd_replica_groups_tracked Replicated groups this node tracks a caught-up set for (ADR 0054).
+# TYPE mqttd_replica_groups_tracked gauge
+mqttd_replica_groups_tracked 256
+# HELP mqttd_cluster_info The cluster identity this node belongs to (ADR 0054 T2), as a build_info-style label; two distinct values across a fleet = split brain.
+# TYPE mqttd_cluster_info gauge
+mqttd_cluster_info{cluster_id="0a2ebd1b7d8ef48d32d661d9e6d3e83e"} 1
+# HELP mqttd_founder 1 if this node founded the cluster (started seedless), else 0.
+# TYPE mqttd_founder gauge
+mqttd_founder 1
+# HELP mqttd_refound_quarantine 1 if this node re-founded a cluster beside a live one and has taken ITSELF out of rotation (it will not become ready again without the documented wipe-and-rejoin), else 0.
+# TYPE mqttd_refound_quarantine gauge
+mqttd_refound_quarantine 0
+# HELP mqttd_backup_last_success_timestamp_seconds Unix time the newest SUCCESSFUL export started (ADR 0062); 0 = no backup has ever succeeded in this process. Its age bounds the RPO.
+# TYPE mqttd_backup_last_success_timestamp_seconds gauge
+mqttd_backup_last_success_timestamp_seconds 0
+# HELP mqttd_backup_duration_ms Wall-clock milliseconds the last export took. An UPPER BOUND on the consistency window, not the window itself — the window is the span the records were actually read over, exported separately (ADR 0062).
+# TYPE mqttd_backup_duration_ms gauge
+mqttd_backup_duration_ms 0
+# HELP mqttd_restore_state Restore-from-backup state (ADR 0062): 0 none, 1 in progress (the node is NotReady and has bound no client listener), 2 completed, 3 failed.
+# TYPE mqttd_restore_state gauge
+mqttd_restore_state 0
+# HELP mqttd_foundings Cluster-identity foundings by this process; anything beyond the very first boot of a brand-new cluster indicates a split-brain founding.
+# TYPE mqttd_foundings counter
+mqttd_foundings_total 1
+# HELP mqttd_config_info Checksum of the loaded config file (ADR 0054 T3), build_info-style; after a config roll every node must report the same value.
+# TYPE mqttd_config_info gauge
+mqttd_config_info{checksum="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"} 1
+# HELP mqttd_swim_keys_accepted SWIM gossip keys currently accepted (ADR 0054 T3): 1 steady, 2 = a rotation window is open.
+# TYPE mqttd_swim_keys_accepted gauge
+mqttd_swim_keys_accepted 1
+# HELP mqttd_swim_isolated 1 while this node's own SWIM probes go unanswered past the isolation threshold (issue #368): its membership view is unconfirmed and peers are likely evicting it — a one-way network failure looks exactly like this and like nothing else.
+# TYPE mqttd_swim_isolated gauge
+mqttd_swim_isolated 0
+# HELP mqttd_peer_proto_min Oldest peer-bus protocol version this build speaks (ADR 0038).
+# TYPE mqttd_peer_proto_min gauge
+mqttd_peer_proto_min 6
+# HELP mqttd_peer_proto_max Newest peer-bus protocol version this build speaks (ADR 0038).
+# TYPE mqttd_peer_proto_max gauge
+mqttd_peer_proto_max 8
+# HELP mqttd_build_info Build information.
+# TYPE mqttd_build_info gauge
+mqttd_build_info{version="1.0.16"} 1
+# HELP mqttd_crypto_module_info The crypto module this binary runs (ADR 0068): aws-lc-rs, or the FIPS-validated module in a fips build — so an auditor verifies the RUNNING binary, not the artifact's name.
+# TYPE mqttd_crypto_module_info gauge
+mqttd_crypto_module_info{module="aws-lc-rs"} 1
+# EOF

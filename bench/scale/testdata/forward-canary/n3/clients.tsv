@@ -1,0 +1,7 @@
+origin	member	burst_seen	burst_distinct
+broker0	broker1	100	100
+broker0	broker2	100	100
+broker1	broker0	100	100
+broker1	broker2	100	100
+broker2	broker0	100	100
+broker2	broker1	100	100

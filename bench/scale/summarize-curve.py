@@ -28,6 +28,7 @@ Honesty mechanics, enforced here rather than remembered:
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import re
 import statistics
@@ -36,6 +37,7 @@ from pathlib import Path
 
 TOLERANCE = 0.02  # counter cross-check band
 DRIVER_OK = 0.97  # a rung counts only if the offered rate was actually reached
+CORE_SAT_SHARE = 0.5  # share of in-window samples a driver core may spend >=95% busy
 LATE_OK = 0.05  # share of publishes behind their own schedule before a rung is flagged
 KNEE_OK = 0.99  # delivered/sent ratio a sustained rung must reach
 # How far the closing CONTROL rung may drift from the same rung at the start of
@@ -118,42 +120,29 @@ def probe_floor(size_dir: Path, n: int) -> list[str] | None:
 # ── lane B parsing ───────────────────────────────────────────────────────────
 
 
-def driver_rate(log: Path, counter: str) -> tuple[int, float]:
-    """(final total, achieved rate) from emqtt-bench progress lines.
+def driver_rate(log: Path, counter: str, window_secs: float = STEADY_WINDOW) -> tuple[int, float]:
+    """Diagnostic log rate; all counters use the same clock, including sparse ones.
 
-    Two things this has to get right, both of which it once got wrong and both
-    of which manufactured a broker limit that did not exist:
-
-    1. **The timestamp format changes at one minute.** emqtt-bench prints `59s`
-       and then `1m0s`. A `^(\\d+)s` pattern silently stops matching at the
-       minute mark, so every rung was read from its first 59 seconds only.
-    2. **Those first seconds are the RAMP**, not the measurement. Publishers
-       start staggered behind the subscribers, so a rate averaged from the
-       start understates the steady state — and understates it by more at
-       higher rungs, which is exactly the shape of a knee. The reported
-       "~140k plateau with idle CPU everywhere" was this artifact: recomputed
-       over the steady window the same run sustained 199k at the 200k rung and
-       220k at the 300k rung, with received tracking sent to within 0.5%.
-
-    So: parse `[Nm]Ns`, and measure over the LAST [`STEADY_WINDOW`] seconds of
-    the series — the part of the rung that is actually the rung.
+    New QoS1 runs use aligned REST snapshots for verdicts, not this fallback.
     """
-    if not log.exists():
-        return 0, 0.0
-    points = []
+    if not log.exists(): return 0, 0.0
+    series = {}; end = 0
     for line in log.read_text(errors="replace").splitlines():
-        m = re.search(rf"^(?:(\d+)m)?(\d+)s {counter} total=(\d+) rate=", line)
+        m = re.match(r"^(?:(\d+)m)?(\d+)s (\w+) total=(\d+) rate=", line)
         if m:
-            secs = int(m.group(1) or 0) * 60 + int(m.group(2))
-            points.append((secs, int(m.group(3))))
-    if len(points) < 2:
-        return (points[0][1], 0.0) if points else (0, 0.0)
-    end = points[-1][0]
-    window = [p for p in points if p[0] >= max(end - STEADY_WINDOW, points[0][0])]
-    if len(window) < 2:
-        window = points
-    (t0, c0), (t1, c1) = window[0], window[-1]
-    return points[-1][1], (c1 - c0) / max(t1 - t0, 1)
+            t = int(m[1] or 0) * 60 + int(m[2]); end = max(end, t)
+            series.setdefault(m[3], []).append((t, int(m[4])))
+    points = series.get(counter, [])
+    if not points: return 0, 0.0
+    start = max(0, end - window_secs)
+    def at(t): return next((v for ts, v in reversed(points) if ts <= t), 0)
+    return points[-1][1], (at(end) - at(start)) / max(end - start, 1)
+
+
+def qos1_evidence(rdir: Path) -> dict:
+    spec = importlib.util.spec_from_file_location("lane_e_evidence", Path(__file__).with_name("lane-e-evidence.py"))
+    module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
+    return module.validate(rdir)
 
 
 def driver_span(log: Path, counter: str) -> float:
@@ -213,6 +202,15 @@ def merged_histogram(proms: list[Path]) -> tuple[dict[float, int], int]:
     buckets: dict[float, int] = {}
     count = 0
     for prom in proms:
+        # A baseline is not a scrape. `sub-*.prom` also matches `sub-*-base.prom`,
+        # so every caller's glob hands this function each rung's baselines as if
+        # they were consumer scrapes; each one has no baseline of its own, so its
+        # ramp-period buckets were added back whole and half-undid the correction
+        # this function exists to make. Measured on the 2026-09-15 pair: the
+        # 720k rung read p99 <=2000ms with the baselines counted and <=1000ms
+        # without, which is the difference between failing and passing its budget.
+        if prom.name.endswith("-base.prom"):
+            continue
         after, after_count = _histogram_of(prom)
         base, base_count = _histogram_of(prom.with_name(f"{prom.stem}-base.prom"))
         for le, v in after.items():
@@ -385,9 +383,11 @@ def lane_b_rung(rdir: Path, offered: int) -> dict:
         # delivered every message it was sent. Totals have no window to
         # misalign.
         "sustained": (not offer_not_met) and sent > 0 and recv >= KNEE_OK * sent,
+        "negative_share": negative_share,
         "p50": bucket_pct(buckets, count, 0.50),
         "p99": bucket_pct(buckets, count, 0.99),
         "p999": bucket_pct(buckets, count, 0.999),
+        "driver_core": core_sat,
         "flags": flags,
     }
 
@@ -523,7 +523,12 @@ def self_test() -> None:
                     lines.append(f'mqttd_publish_received_total{{qos="{q}"}} {v * mul}')
                 for q, v in broker.get("deliv", {}).items():
                     lines.append(f'mqttd_publish_delivered_total{{qos="{q}"}} {v * mul}')
-                lines.append(f'mqttd_publish_dropped_total{{reason="pending-cap"}} {broker.get("dropped", 0) * mul}')
+                # `dropped` takes an int (one anonymous reason, as the older cases
+                # pass it) or a {reason: count} map, because at QoS 1 WHICH reason
+                # moved is the whole point: a fixed broker table is not shedding.
+                drops = broker.get("dropped", 0)
+                for reason, v in (drops if isinstance(drops, dict) else {"pending-cap": drops}).items():
+                    lines.append(f'mqttd_publish_dropped_total{{reason="{reason}"}} {v * mul}')
                 lines.append(f"mqttd_sessions {broker.get('sessions', 0) * mul}")
                 lines.append(f"mqttd_connections_active {broker.get('conns', 0) * mul}")
                 (d / f"metrics-{snap}-broker0.prom").write_text("\n".join(lines) + "\n")
@@ -548,17 +553,25 @@ def self_test() -> None:
         if settled is not None:
             counter_log(d / "sub-0.drain", {"recv": recv}, final=settled)
         # A latency histogram, or every rung reads p99 "—" and fails the budget
-        # for want of data rather than for being slow. Two scrapes because the
-        # summarizer subtracts the first from the last to get the measured
-        # window; all mass in the <=10ms bucket, comfortably inside the budget.
-        for scrape, total in (("before", 0), ("after", 1000)):
-            (d / f"sub-0-{scrape}.prom").write_text(
-                "\n".join(
-                    [f'e2e_latency_bucket{{le="{le}"}} {total}' for le in ("10.0", "100.0", "+Inf")]
-                    + [f"e2e_latency_count {total}"]
-                )
-                + "\n"
-            )
+        # for want of data rather than for being slow. The names are the ones the
+        # harness writes — `sub-<name>-base.prom` at window open, `sub-<name>.prom`
+        # at window close — because the callers glob `sub-*.prom`, which matches
+        # BOTH, and a fixture that invents its own names cannot catch what that
+        # glob does to the baseline (it did not: the ramp counts were added back
+        # as a scrape of their own for as long as this fixture used
+        # `sub-0-before.prom`). The ramp is slow (<=100ms) and the window is fast
+        # (<=10ms), so any rung that counts the baseline reads p99 <=100ms.
+        ramp, window = 1_000, 9_000
+        (d / "sub-0-base.prom").write_text(
+            "\n".join([f'e2e_latency_bucket{{le="10.0"}} 0',
+                       f'e2e_latency_bucket{{le="100.0"}} {ramp}',
+                       f'e2e_latency_bucket{{le="+Inf"}} {ramp}',
+                       f"e2e_latency_count {ramp}"]) + "\n")
+        (d / "sub-0.prom").write_text(
+            "\n".join([f'e2e_latency_bucket{{le="10.0"}} {window}',
+                       f'e2e_latency_bucket{{le="100.0"}} {ramp + window}',
+                       f'e2e_latency_bucket{{le="+Inf"}} {ramp + window}',
+                       f"e2e_latency_count {ramp + window}"]) + "\n")
         return d
 
     with tempfile.TemporaryDirectory() as td:
@@ -627,7 +640,7 @@ def self_test() -> None:
         # unresolved in prose: "still-pending" is one of the eight counts #534
         # asks for, and a table that renders it as 0 is the same lie the LOSS
         # flag used to tell, told quietly.
-        if r["counts"]["pending"] != r["counts"]["sent"] - r["counts"]["uniquely_delivered"]:
+        if r["counts"]["pending"] != r["counts"]["sent"] - r["counts"]["aggregate_delivered"]:
             failures.append(f"pending was not counted at the drain deadline: {r['counts']}")
         # ... and a rung that DID drain owes nothing, so its pending is zero.
         rd = lane_e_rung(lane_e_fixture(
@@ -659,6 +672,16 @@ def self_test() -> None:
                                        sent=30_000, recv=30_000, late=0))
         if not r["pass"] or r["flags"]:
             failures.append(f"a clean rung was rejected: {r['flags']}")
+        # The percentiles describe the WINDOW, not the ramp. The fixture's ramp
+        # sits in <=100ms and its window in <=10ms, so p50/p99 must both read
+        # <=10ms: reading <=100ms means the baseline was counted as a scrape of
+        # its own, which is what `sub-*.prom` globbing the baselines did until
+        # merged_histogram skipped them (the 2026-09-15 720k rung read <=2000ms
+        # that way and <=1000ms once corrected — a failed budget turned into a
+        # passed one).
+        if (r["p99"], r["p50"]) != ("<=10ms", "<=10ms"):
+            failures.append(
+                f"window percentiles include the ramp: p50 {r['p50']} p99 {r['p99']} (expected <=10ms)")
         # A rung that met its offer exactly must ACCOUNT for it exactly. `offered`
         # has to be taken over the publishers' own run span, not the measurement
         # window: the first real run of this table (2026-09-07) rendered a healthy
@@ -685,8 +708,85 @@ def self_test() -> None:
             broker={"recv": {"0": 30_000 * 70}, "deliv": {"0": 33_000 * 70}, "sessions": 100, "conns": 100}))
         if not any("DUPLICATE DELIVERY" in f for f in r["flags"]):
             failures.append(f"duplicate delivery at QoS 0 was not flagged: {r['flags']}")
-        if r["counts"]["duplicate"] <= 0:
-            failures.append(f"duplicate count was not reported: {r['counts']}")
+        if r["counts"]["duplicate"] is not None:
+            failures.append(f"unverified duplicate count was reported: {r['counts']}")
+
+        # 5b. NOT STEADY is a capacity verdict. Lane E gated "everyone connected"
+        #     and "everything drained" and nothing between, so the window could
+        #     open while the broker was still repaying what the ramp owed — at
+        #     N=3/4 sites on 2026-09-18 that was 372,025 messages, and the rung's
+        #     p99 (<=7500ms) was the age of traffic published before the window.
+        #     A rung that never settles around its own offer is not a measurement
+        #     of that rung, whichever side of the band it sat on.
+        for reason, expect in (("behind", "below offer"), ("repaying", "above offer")):
+            d = root / ("sites-4-notsteady-" + reason)
+            lane_e_fixture(d.parent, d.name, offered=30_000, sent=30_000, recv=30_000, late=0,
+                           drained="yes", settled=30_000 * 70)
+            txt = (d / "rung.txt").read_text()
+            (d / "rung.txt").write_text(txt.rstrip() + " steady=no steady_reason=%s steady_s=180\n" % reason)
+            r = lane_e_rung(d)
+            if r["pass"]:
+                failures.append("a rung that never reached steady state passed: %s" % r["flags"])
+            if not any("NOT STEADY" in f and expect in f for f in r["flags"]):
+                failures.append("NOT STEADY (%s) was not explained: %s" % (reason, r["flags"]))
+        # and a rung that DID settle carries the evidence, which is what a reader
+        # needs to believe the latency beside it.
+        d = root / "sites-4-steady"
+        lane_e_fixture(d.parent, d.name, offered=30_000, sent=30_000, recv=30_000, late=0,
+                       drained="yes", settled=30_000 * 70)
+        txt = (d / "rung.txt").read_text()
+        (d / "rung.txt").write_text(txt.rstrip() + " steady=yes steady_reason=none steady_s=25\n")
+        r = lane_e_rung(d)
+        if not r["pass"]:
+            failures.append("a steady rung was failed: %s" % r["flags"])
+        if (r.get("steady"), r.get("steady_s")) != ("yes", "25"):
+            failures.append("the catch-up evidence did not reach the report: %s" % r)
+
+        # Lateness alone must not assign a cause at either QoS.
+        for level, expect, forbid in (("0", "not isolated", "BROKER's ack"),
+                                      ("1", "not isolated", "BROKER's ack")):
+            r = lane_e_rung(lane_e_fixture(
+                root, "sites-4-late-q%s" % level, offered=30_000, sent=30_000, recv=30_000,
+                late=9_000, drained="yes", settled=30_000 * 70, qos=level, sub_qos=level))
+            late = [f for f in r["flags"] if "PUBLISHERS LATE" in f]
+            if not late:
+                failures.append("a late-publisher rung at QoS %s was not flagged: %s" % (level, r["flags"]))
+            elif expect not in late[0] or forbid in late[0]:
+                failures.append("QoS %s lateness blamed the wrong component: %s" % (level, late[0]))
+
+        # 6b. REDELIVERY at QoS 1 is reported, never gated. At-least-once may
+        #     legitimately put a message on the wire twice, so the QoS 0 defect
+        #     check is correctly skipped — but skipping it left the QoS 1 arm with
+        #     no signal at all, and a rung delivering 10% more than the
+        #     application saw read as perfectly clean.
+        r = lane_e_rung(lane_e_fixture(
+            root, "sites-4-redeliv", offered=30_000, sent=30_000, recv=30_000, late=0,
+            drained="yes", settled=30_000 * 70, qos="1", sub_qos="1",
+            broker={"recv": {"1": 30_000 * 70}, "deliv": {"1": 33_000 * 70}, "sessions": 100, "conns": 100}))
+        if not any("REDELIVERY at QoS 1" in f for f in r["flags"]):
+            failures.append(f"redelivery at QoS 1 was not reported: {r['flags']}")
+        if r["pass"]:
+            failures.append("legacy QoS1 evidence without a ledger passed")
+
+        # 6c. A BROKER BOUND is not load shedding. `dropped` is summed for the
+        #     accounting table, so a rung that hit PENDING_PUBLISH_CAP looked
+        #     exactly like one that shed under pressure — and at QoS 1 that cap is
+        #     the bound lane E's own shape check predicts.
+        r = lane_e_rung(lane_e_fixture(
+            root, "sites-4-cap", offered=30_000, sent=30_000, recv=30_000, late=0,
+            drained="yes", settled=30_000 * 70, qos="1", sub_qos="1",
+            broker={"recv": {"1": 30_000 * 70}, "deliv": {"1": 30_000 * 70},
+                    "dropped": {"pending-cap": 4_096}, "sessions": 100, "conns": 100}))
+        if not any("BROKER BOUND REACHED" in f and "pending-cap" in f for f in r["flags"]):
+            failures.append(f"a rung that reached PENDING_PUBLISH_CAP was not flagged: {r['flags']}")
+        # and ordinary shedding must NOT be dressed up as a fixed bound
+        r = lane_e_rung(lane_e_fixture(
+            root, "sites-4-shed", offered=30_000, sent=30_000, recv=30_000, late=0,
+            drained="yes", settled=30_000 * 70, qos="1", sub_qos="1",
+            broker={"recv": {"1": 30_000 * 70}, "deliv": {"1": 30_000 * 70},
+                    "dropped": {"outbound-full": 4_096}, "sessions": 100, "conns": 100}))
+        if any("BROKER BOUND REACHED" in f for f in r["flags"]):
+            failures.append(f"load shedding was reported as a fixed broker bound: {r['flags']}")
 
         # 7. INVALID QoS DOWNGRADE. The subscriber asked for QoS 2; every
         #    delivery went out labelled QoS 1. The rung is measuring a different
@@ -718,8 +818,8 @@ def self_test() -> None:
             root, "sites-4-qos1", offered=30_000, sent=30_000, recv=30_000, late=0,
             drained="yes", settled=30_000 * 70, qos=1, sub_qos=1,
             broker={"recv": {"1": 30_000 * 70}, "deliv": {"1": 30_000 * 70}, "sessions": 100, "conns": 100}))
-        if not r["pass"] or r["counts"]["protocol_completed"] != r["counts"]["sent"]:
-            failures.append(f"a clean QoS 1 rung did not report completion: {r['flags']} {r['counts']}")
+        if r["pass"] or r["counts"]["protocol_completed"] != r["counts"]["sent"]:
+            failures.append(f"legacy QoS 1 completion or fail-closed behavior incorrect: {r['flags']} {r['counts']}")
 
         # 10. UNSETTLED: the measurement window opened before the clients
         #     arrived, so the rung measures a cluster still filling up.
@@ -881,6 +981,13 @@ def lane_e_ladder(rungs: list[dict]) -> dict:
     }
 
 
+def load_lane_e_extractor():
+    spec = importlib.util.spec_from_file_location("lane_e_extract", Path(__file__).with_name("extract-lane-e.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def lane_e_rung(rdir: Path) -> dict:
     """One site-ladder rung. Same counters as lane B, keyed by tenant count.
 
@@ -934,8 +1041,8 @@ def lane_e_rung(rdir: Path) -> dict:
     late_rate = 0.0
     for log in rdir.glob("pub-*.log"):
         # Same emqtt-bench double-count correction as lane B — see lane_b_rung.
-        t_pub, r_pub = driver_rate(log, "pub")
-        t_succ, r_succ = driver_rate(log, "pub_succ")
+        t_pub, r_pub = driver_rate(log, "pub", float(meta.get("window_secs", 60)))
+        t_succ, r_succ = driver_rate(log, "pub_succ", float(meta.get("window_secs", 60)))
         sent += (t_pub + t_succ) // 2
         sent_rate += (r_pub + r_succ) / 2
         # #534: lane B has flagged late publishers since it was written; this
@@ -945,10 +1052,10 @@ def lane_e_rung(rdir: Path) -> dict:
         # inference from a rate against a 0.97 threshold. A rung can even MEET
         # its offer on average while a third of its publishes ran late, and only
         # this counter says so.
-        _, late = driver_rate(log, "pub_overrun")
+        _, late = driver_rate(log, "pub_overrun", float(meta.get("window_secs", 60)))
         late_rate += late
     for log in rdir.glob("sub-*.log"):
-        t, r = driver_rate(log, "recv")
+        t, r = driver_rate(log, "recv", float(meta.get("window_secs", 60)))
         recv += t
         recv_rate += r
     # #534: the delivery question and the rate question need DIFFERENT reads of
@@ -965,20 +1072,63 @@ def lane_e_rung(rdir: Path) -> dict:
     # a plain substitution because `recv` is CUMULATIVE and read twice — the later
     # read can only be larger, so max is a no-op on any real pair and a floor
     # under a drain dump that came back partial.
-    settled = max(recv, sum(driver_rate(log, "recv")[0] for log in rdir.glob("sub-*.drain")))
+    settled = max(recv, sum(driver_rate(log, "recv", float(meta.get("window_secs", 60)))[0] for log in rdir.glob("sub-*.drain")))
     buckets, count = merged_histogram(sorted(rdir.glob("sub-*.prom")))
+    evidence = None; evidence_error = None
+    if meta.get("qos", "0") == "1":
+        try:
+            evidence = qos1_evidence(rdir)
+            sent_rate = evidence["sent_rate"]; recv_rate = evidence["recv_rate"]
+            late_rate = evidence["late_share"] * sent_rate
+            sent = evidence["counts"]["sent"]; settled = evidence["counts"]["aggregate_delivered"]
+            buckets = evidence["buckets"]; count = evidence["histogram_count"]
+        except (ValueError, OSError, KeyError, IndexError) as exc:
+            evidence_error = str(exc)
     p99 = bucket_pct(buckets, count, 0.99)
 
+    # Protocol metadata determines validation and accounting semantics.
+    qos = meta.get("qos", "0")
+    sub_qos = meta.get("sub_qos", qos)
+
     flags = []
+    if evidence_error: flags.append("INVALID EVIDENCE (" + evidence_error + ")")
+    if evidence and evidence.get("telemetry") and not evidence["telemetry"]["queues_bounded"]:
+        flags.append("QUEUE GROWTH OR BACKLOG BUDGET EXCEEDED")
+    # A failed gate excludes a capacity point; it does not identify the cause.
+    steady = meta.get("steady", "")
+    if steady == "no":
+        direction = {"behind": "below offer", "repaying": "above offer"}.get(meta.get("steady_reason"), "unclassified")
+        flags.append(
+            f"NOT STEADY (last aggregate sample {direction}; per-site delivery did not remain within the offer band; "
+            "publisher pacing, scrape timing and broker service are not isolated)"
+        )
+
     offer_met = offered and sent_rate >= DRIVER_OK * offered
     if offered and not offer_met:
         flags.append(f"OFFER NOT MET ({sent_rate / offered * 100:.0f}% of offer)")
     late_share = late_rate / sent_rate if sent_rate else 0.0
     if late_share > LATE_OK:
+        why = "end-to-end publisher timing; scheduling, network and broker service are not isolated"
         flags.append(
-            f"PUBLISHERS LATE ({late_share * 100:.0f}% of publishes behind schedule — "
-            "the drivers could not hold the offered rate, so this rung measures them)"
+            f"PUBLISHERS LATE ({late_share * 100:.0f}% of publishes behind schedule — {why})"
         )
+    # WINDOW CONTAMINATED. Delivering MORE than was offered during the window is
+    # not capacity: the surplus was published before the window opened and
+    # arrives carrying its full age, which lands in this rung's tail.
+    #
+    # This is a backstop for GROSS leakage, and it would not have caught the case
+    # that motivated it: at 4 sites on 2026-09-18 the surplus was 210,264
+    # messages repaid in six seconds, which is only 1.4% spread across a 61s
+    # window — under any sane tolerance. No aggregate test sees a short burst in
+    # a long window. What prevents that case is the steady-state gate, which
+    # refuses to OPEN the window until delivery sits inside a band around the
+    # offer; `steady=yes steady_s=N` in rung.txt is the evidence that it did.
+    if offered and recv_rate > (1 + TOLERANCE) * offered:
+        flags.append(
+            f"WINDOW CONTAMINATED (delivered {recv_rate / offered * 100:.0f}% of the offer — the "
+            "surplus was published before the window and carries its age into this rung's latency)"
+        )
+
     # PENDING IS NOT LOSS (#534, acceptance 7). A shortfall means one of three
     # things — the broker dropped it, the broker still holds it, or it was in
     # flight — and only the first is a finding about the broker. Before the drain
@@ -1013,9 +1163,10 @@ def lane_e_rung(rdir: Path) -> dict:
                 "predates the drain deadline, so pending traffic here is indistinguishable "
                 "from dropped)"
             )
-    within = p99_ms(p99) <= budget
+    clock_margin = ((evidence or {}).get("clock") or {}).get("latency_uncertainty_ms", 0)
+    within = p99_ms(p99) + clock_margin <= budget
     if not within:
-        flags.append(f"OVER P99 BUDGET ({p99} > {budget:g}ms)")
+        flags.append(f"OVER P99 BUDGET ({p99} + {clock_margin:g}ms clock uncertainty > {budget:g}ms)")
 
     # ── the eight counts (#534, acceptance 3) ────────────────────────────────
     #
@@ -1027,12 +1178,10 @@ def lane_e_rung(rdir: Path) -> dict:
     #   sent                 what the drivers got away     driver pub counters
     #   broker_received      what the cluster ACCEPTED     broker, by QoS
     #   protocol_completed   what finished its handshake   see below
-    #   uniquely_delivered   what a consumer actually got  driver recv, post-drain
-    #   duplicate            what arrived more than once   broker delivered - unique
+    #   uniquely_delivered   exact identities across the whole shared group
+    #   duplicate            aggregate receipts minus unique receipt identities
     #   dropped              what the broker refused       broker, by reason
     #   pending              what was still owed at the deadline
-    qos = meta.get("qos", "0")
-    sub_qos = meta.get("sub_qos", qos)
     # The span every count below is taken over: how long the PUBLISHERS actually
     # ran, read from their own logs rather than from the configured window, which
     # covers only the middle of it. See `driver_span`.
@@ -1068,16 +1217,36 @@ def lane_e_rung(rdir: Path) -> dict:
             "so nothing on either side can certify the exactly-once handshake finished)"
         )
 
-    # DUPLICATE DELIVERY. The broker's delivered counter is what it PUT ON THE
-    # WIRE; the consumer's `recv` is what an application saw. At QoS 2 `emqtt`
-    # stores an inbound PUBLISH in `awaiting_rel` and delivers on PUBREL via
-    # `maps:take`, which cannot deliver twice — so any excess is redelivery the
-    # client correctly suppressed, and it is visible only as this difference.
+    # Legacy aggregate counter differences cannot identify duplicates. Only
+    # the group-wide identity ledger below can report unique receipt/redelivery.
     duplicate = max(0.0, broker_deliv - settled) if broker_deliv else 0.0
     if duplicate > TOLERANCE * broker_deliv and qos == "0":
         flags.append(
             f"DUPLICATE DELIVERY at QoS 0 ({duplicate:,.0f} more delivered than received; "
             "at-most-once must not redeliver)"
+        )
+    elif duplicate > TOLERANCE * broker_deliv and qos in ("1", "2"):
+        # At least-once MAY redeliver, so this is not the defect it is at QoS 0
+        # and it does not gate. Reporting it anyway is the point: the QoS 0 arm
+        # had a check here and the QoS 1 arm used to have NOTHING, so a rung that
+        # put 30% more on the wire than the application saw read as clean.
+        flags.append(
+            f"REDELIVERY at QoS {qos} ({duplicate:,.0f} more delivered than received, "
+            f"{duplicate / broker_deliv * 100:.1f}% — legal at least-once, reported not gated)"
+        )
+
+    # BROKER BOUND REACHED. `dropped` is summed for the accounting table, so a
+    # rung that hit one of the broker's own fixed tables is otherwise indistinguishable
+    # from one that shed under load. These two reasons are not load: they are the
+    # broker saying a bound was reached, and at QoS >= 1 `pending-cap` is the one
+    # lane E's shape check predicts (PENDING_PUBLISH_CAP, hub/mod.rs).
+    bounds = {r: v for r, v in dropped_by_reason.items()
+              if r in ("pending-cap", "backlog-overflow") and v > 0}
+    if bounds:
+        flags.append(
+            "BROKER BOUND REACHED ("
+            + ", ".join(f"{r} {v:,.0f}" for r, v in sorted(bounds.items()))
+            + ") — a fixed internal table, not load shedding; this rung is not a capacity figure"
         )
 
     # QoS DOWNGRADE. `mqttd_publish_delivered_total` is labelled by QoS, so the
@@ -1085,7 +1254,7 @@ def lane_e_rung(rdir: Path) -> dict:
     # the rung asked for. A rung that requested QoS 2 and was granted 1 measures
     # a different protocol than its directory name claims.
     granted = max((int(q) for q, v in deliv_by_qos.items() if q.isdigit() and v > 0), default=None)
-    if granted is not None and sub_qos.isdigit() and granted < int(sub_qos):
+    if any(int(q) < min(int(qos), int(sub_qos)) for q,v in deliv_by_qos.items() if q.isdigit() and v > 0):
         flags.append(
             f"QOS DOWNGRADE (subscriber asked for QoS {sub_qos}, deliveries went out at "
             f"QoS {granted} — this rung measures QoS {granted})"
@@ -1097,29 +1266,59 @@ def lane_e_rung(rdir: Path) -> dict:
         "sent": sent,
         "broker_received": broker_recv,
         "protocol_completed": completed,
-        "uniquely_delivered": settled,
-        "duplicate": duplicate,
+        "uniquely_delivered": evidence["counts"]["unique_delivered"] if evidence else None,
+        "aggregate_delivered": settled,
+        "duplicate": evidence["counts"]["duplicates"] if evidence else None,
         "dropped": dropped,
         "pending": pending,
     }
 
-    # ── final state at the drain deadline (#534, acceptance 7) ───────────────
-    # "Record queue depth, bytes/age where available and final connection/session
-    # state." Sessions and connections are exported and recorded here. Queue
-    # DEPTH and message AGE are NOT: the broker exports no such gauge — there is
-    # no `mqttd_backlog_bytes` metric despite the name appearing in comments, and
-    # nothing counts what is queued inside a session. "Where available" resolves
-    # to "not available", and saying so is the point; approximating it would put
-    # a number where a gap is.
+    # Broker gauges expose partial queue evidence; oldest message age is absent.
     final_state = {
         "sessions": broker_at(rdir, "drain", "mqttd_sessions") or broker_at(rdir, "after", "mqttd_sessions"),
         "connections": broker_at(rdir, "drain", "mqttd_connections_active")
         or broker_at(rdir, "after", "mqttd_connections_active"),
         "queue_depth": None,
-        "queue_bytes": None,
+        "queue_bytes": broker_at(rdir, "drain", "mqttd_backlog_bytes"),
+        "outbound_inflight": broker_at(rdir, "drain", "mqttd_inflight_messages"),
         "oldest_age_s": None,
         "dropped_by_reason": dropped_by_reason,
     }
+
+    # DRIVER CORE SATURATED. Each publisher container runs ONE Erlang scheduler, so
+    # its ceiling is one core — and mpstat's `all` row averages that core away
+    # (a pinned core on an 8-vCPU driver reads "87% idle"). Measured 2026-09-19:
+    # driver7 core 1 was >=95% busy in 95% of a 60,000 msg/s rung's samples while
+    # the host mean sat near idle. A rung whose generator had no headroom measures
+    # the generator, so it cannot be a capacity point whatever else it shows.
+    core_sat = None
+    core_ok = True
+    if (rdir / "cpu").is_dir():
+        extractor = load_lane_e_extractor()
+        try:
+            cpu_edges = extractor.load_window(rdir, int(rdir.parent.parent.name.split("=")[1])) if (rdir / "window.tsv").exists() else None
+        except (ValueError, KeyError, IndexError, OSError):
+            cpu_edges = None
+        core_sat = extractor.core_saturation(rdir, "driver", cpu_edges)
+        if core_sat and core_sat["share"] >= CORE_SAT_SHARE:
+            core_ok = False
+            flags.append(
+                f"DRIVER CORE SATURATED ({core_sat['host']} core {core_sat['core']} was >=95% busy in "
+                f"{core_sat['share'] * 100:.0f}% of {core_sat['samples']} in-window samples — the load "
+                "generator had no headroom; this rung measures the driver, not the broker)"
+            )
+
+    # LATENCY FLOOR. Deliveries faster than the clocks' disagreement land negative
+    # and are excluded from the histogram, so the p99 below is an UPPER BOUND on
+    # the true p99 — it cannot flatter the broker. Reported, never gated: two paid
+    # runs died refusing a rung that was measuring correctly (2026-09-19).
+    negative_share = (evidence or {}).get("negative_share", 0.0)
+    if negative_share > 0.001:
+        flags.append(
+            f"LATENCY FLOOR ({negative_share:.2%} of deliveries were faster than the "
+            "cross-host clocks can resolve, so they are excluded from the histogram — "
+            "the p99 here is an upper bound, not a point estimate)"
+        )
 
     # ── the population must have ARRIVED, and the cluster must have been CLEAN ─
     settled_ok = meta.get("settled", "yes") != "no"
@@ -1143,8 +1342,14 @@ def lane_e_rung(rdir: Path) -> dict:
         "recv_rate": recv_rate,
         "per_consumer": float(meta.get("per_consumer", 0)),
         "late_share": late_share,
+        "evidence": evidence,
         "settled": settled,
         "drained": drained,
+        # The steady-state gate's own record: whether the window was allowed to
+        # open on a caught-up broker, and how long that took. Published beside
+        # the latency because it is what makes the latency the rung's.
+        "steady": steady,
+        "steady_s": meta.get("steady_s", ""),
         "qos": qos,
         "sub_qos": sub_qos,
         "counts": counts,
@@ -1178,7 +1383,17 @@ def lane_e_rung(rdir: Path) -> dict:
             and late_share <= LATE_OK
             and settled_ok
             and reset_ok
+            and core_ok
+            # A window opened on a broker that never caught up is not a rung this
+            # ladder may claim, however good the numbers inside it look.
+            and steady != "no"
             and (qos != "2" or completed is not None)
+            and not bounds and dropped == 0
+            and not any(int(q) < min(int(qos), int(sub_qos)) for q,v in deliv_by_qos.items() if q.isdigit() and v > 0)
+            and (qos != "1" or (evidence is not None and drained == "yes" and steady == "yes"
+                 and (not evidence.get("telemetry") or evidence["telemetry"]["queues_bounded"])
+                 and recv_rate >= DRIVER_OK * offered
+                 and all(rate >= DRIVER_OK * offered / sites for rate in evidence["site_rates"].values())))
         ),
         "flags": flags,
     }
@@ -1343,17 +1558,27 @@ def main() -> None:
                 continue
             print(f"### {n} node(s)\n")
             repeated = len({r["sites"] for r in rungs}) < len(rungs)
-            head = "| sites | offered msg/s | delivered/s | per consumer | p99 | verdict |"
+            # `caught up in` is evidence, not decoration: it is the seconds the
+            # broker needed to reach steady state at this offer before the window
+            # was allowed to open, so a reader can see that the latency beside it
+            # describes the rung rather than a backlog being repaid into it.
+            head = "| sites | offered msg/s | delivered/s | per consumer | caught up in | p99 | verdict |"
             if repeated:
-                head = "| sites | run | offered msg/s | delivered/s | per consumer | p99 | verdict |"
+                head = "| sites | run | offered msg/s | delivered/s | per consumer | caught up in | p99 | verdict |"
             print(head)
-            print("|---|---|---|---|---|---|" + ("---|" if repeated else ""))
+            print("|---|---|---|---|---|---|---|" + ("---|" if repeated else ""))
             for r in rungs:
                 verdict = "pass" if r["pass"] else "; ".join(r["flags"]) or "fail"
                 run_col = f" {r.get('rep', 1)} |" if repeated else ""
+                if r.get("steady") == "yes":
+                    caught = f"{r.get('steady_s', '?')}s"
+                elif r.get("steady") == "no":
+                    caught = "NEVER"
+                else:
+                    caught = "—"  # a run directory from before the gate existed
                 print(
                     f"| {r['sites']} |{run_col} {r['offered']:,.0f} | {r['recv_rate']:,.0f} | "
-                    f"{r['per_consumer']:,.0f} | {r['p99']} | {verdict} |"
+                    f"{r['per_consumer']:,.0f} | {caught} | {r['p99']} | {verdict} |"
                 )
             # ── message accounting (#534, acceptance 3) ──────────────────
             # One row per rung, so a shortfall can be attributed instead of
@@ -1403,9 +1628,8 @@ def main() -> None:
                 print(
                     "\n> `completed` is n/a at QoS 0 (nothing to acknowledge) and at QoS 2 "
                     "(the driver counts at PUBREC, and the broker exports no PUBCOMP counter). "
-                    "**Queue depth, queued bytes and message age are not in this table because "
-                    "the broker exports no such metric** — #534 asks for them \"where "
-                    "available\", and they are not."
+                    "Unique delivery and duplicates are n/a without an identity ledger. "
+                    "Available backlog bytes and outbound inflight gauges are retained in final_state; oldest age is unavailable."
                 )
 
             v = lane_e_ladder(rungs)
@@ -1439,7 +1663,7 @@ def main() -> None:
                     f"{best['sites'] / n:.1f} sites per node."
                 )
             elif not v["passed_any"] and not inconclusive:
-                print("\n**No rung passed.** The ladder starts above this cluster's capacity.")
+                print("\n**No rung passed.** Inspect evidence validity and load generation before attributing a broker limit.")
             # A ladder whose TOP rung passed has not found a ceiling; saying so
             # is the difference between a measurement and an advertisement.
             done_rungs = [r for r in rungs if not r.get("incomplete")]

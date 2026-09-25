@@ -15,7 +15,7 @@ one hand-maintained catalogue for exactly that reason (see
 | What changed in a release, and the signed artifacts | [GitHub Releases](https://github.com/mbilling/fss-mqtt-broker/releases) |
 | Whether a capability is built, and the evidence for it | [delivery dashboard](docs/delivery/STATUS.md) — per-task status, generated and CI-checked |
 | Why something was designed the way it is | [`docs/adr/`](docs/adr/) |
-| What is *not* built yet | [Limitations](README.md#limitations) |
+| What is *not* built yet | [Limitations](GUIDE.md#limitations) |
 | Upgrade and version-skew rules | [ADR 0039](docs/adr/0039-versioning-and-upgrade-policy.md) |
 
 ## Versioning

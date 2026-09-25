@@ -1016,14 +1016,43 @@ about = """
 Walks results/nodes=*/laneE/sites-*/ and prints broker-side crossing
 (mqttd_publish_forwarded_total / mqttd_publish_received_total), hub_dispatch mean
 µs by command, peer in-flight, drops, sessions after drain, and mpstat idle hints.
-Rejects incomplete/unsupported scrapes and detected per-broker counter resets.
-Absent samples mean zero only in validated snapshots declaring the counter.
-Whole-rung totals are not aligned steady throughput or capacity evidence.
-No cloud calls. Used by the #482 Option B card; --self-test runs offline controls.
+Rejects truncated (no '# EOF') or malformed scrapes and per-broker counter resets.
+A declared-but-empty forwarded family is never read as zero: every rung needs a
+crossing certificate — structural (N=1, no peer links) or canary (the size's
+forward-canary ledger re-derived, each broker still at its floors, same MainPID) —
+or it is INVALID. Rates, crossing, hub dispatch and idle come from the rung's
+aligned steady window (window.tsv + metrics-window-*); rungs without one read
+UNALIGNED. `--crossing-gate 0.5` prints GATE lines per size and exits 1 on FAIL.
+No cloud calls. Used by the #482 Option B card; --self-test runs on real captures.
 Takes a run dir or a results/ tree: `extract-lane-e.py bench/scale/.runs/<stamp>/results`.
 """
 requires = ["python3"]
 duration = "~1s"
+
+[[task]]
+id = "scale-forward-canary"
+group = "Benchmark"
+name = "Lane E forwarding positive control (shipped to a driver by run-curve.sh)"
+script = "bench/scale/forward-canary.py"
+# Harness plumbing like lib.sh and cpu.sh: `run` needs a live cluster's private broker
+# addresses and is started by run-curve.sh; `verify`, `--self-test` and `local-proof`
+# each need arguments, so there is nothing to launch bare.
+hidden = true
+about = """
+A healthy prefer-local ladder crosses ~0%, and mqttd omits the forwarded counter until a
+broker's first forward — so a zero is indistinguishable from a missing counter or a
+restarted broker (#482). Before calibration, run-curve.sh pipes this file to a driver
+(`python3 - run`): every ordered broker pair gets a $share group whose only member sits
+on the other broker, K QoS 0 messages each, scraped before and after. `verify` re-derives
+the exact ledger; extract-lane-e.py imports `ledger()` and holds every later snapshot to
+each broker's post-canary floors. `--self-test` is offline, on real captures in
+bench/scale/testdata/forward-canary/. `local-proof --mqttd <bin> --nodes 7` runs, against
+real local brokers, the canary, a zero-crossing rung written in run-curve.sh's layout that
+`extract-lane-e.py --crossing-gate 0.5` must certify, and a SIGKILL restart the extractor
+must refuse; `--capture DIR` keeps that results tree.
+"""
+requires = ["python3"]
+duration = "~9s self-test; ~12s local-proof at 7 nodes"
 
 [[task]]
 id = "scale-bootstrap"
@@ -1113,11 +1142,58 @@ requires = ["python3", "jq"]
 hidden = true
 
 [[task]]
+id = "scale-compare-brokers"
+group = "Benchmark"
+name = "Single-node broker comparison on cloud hardware (mqttd, Mosquitto, EMQX, HiveMQ)"
+script = "bench/scale/compare-brokers.sh"
+about = """
+ADR 0048 T4's publishable comparison: one broker host and one driver fleet,
+every broker run on it in turn from pinned digests, laddered to its knee.
+Measurement is driver-side only (emqtt-bench counters and its own latency
+histogram) so no broker gets home-field advantage; the host reboots between
+arms and the first broker repeats as a control. Driven by `run.sh compare`,
+which provisions the fleet; COMPARE_SHAPE_ONLY=1 checks the ladder offline.
+"""
+requires = ["jq", "ssh"]
+hidden = true
+
+[[task]]
+id = "scale-summarize-compare"
+group = "Benchmark"
+name = "Summarize a cross-broker comparison into a knee table"
+script = "bench/scale/summarize-compare.py"
+about = """
+Reads a compare-brokers.sh results tree and prints the knee per broker (highest
+offered rate passing offer/delivery/p99/settled/drained), the per-rung detail,
+and the control verdict that says whether the sequence measured brokers or
+drift. Run with python3: `summarize-compare.py .runs/<stamp>/results`.
+"""
+requires = ["python3"]
+duration = "~1s"
+
+[[task]]
+id = "scale-chart-compare"
+group = "Benchmark"
+name = "Chart a cross-broker comparison (latency distribution, rate vs memory)"
+script = "bench/scale/chart-compare.py"
+about = """
+Renders the two pictures the knee table cannot: `--latency RATE` draws what
+share of messages each broker delivered within X ms, from the same
+baseline-differenced histogram the p99 column reads, and `--timeline BROKER
+--rate RATE` draws one rung's delivered rate against the broker's own memory
+until the backlog drained — the difference between a broker that queues and
+one that sheds. Output is dependency-free SVG for docs/benchmarks/img/:
+`chart-compare.py .runs/<stamp>/results --latency 45000 --out chart.svg`.
+"""
+requires = ["python3"]
+duration = "~1s"
+
+[[task]]
 id = "scale-upcloud-quota-tests"
 group = "Benchmark"
-name = "Offline UpCloud HCL quota regression tests"
+name = "Offline Hetzner and UpCloud HCL quota regression tests"
 script = "bench/scale/test-upcloud-quota.py"
-about = "Run with python3 and OpenTofu (tofu required; no Terraform fallback). Evaluates the real quota preconditions using only terraform_data in an isolated directory. No cloud provider or credentials."
+about = "Run with python3 and OpenTofu (tofu required; no Terraform fallback). Evaluates both rigs' real quota preconditions (Hetzner servers + vCPUs, UpCloud cores + public IPs) using only terraform_data in an isolated directory. No cloud provider or credentials."
 requires = ["python3", "tofu"]
 hidden = true
 
@@ -1224,3 +1300,232 @@ The script prints that recipe when it finishes.
 """
 requires = ["jq", "ssh"]
 duration = "instant"
+
+[[task]]
+id = "scale-budgets"
+group = "Benchmark"
+name = "Check the harness time budgets are self-consistent"
+script = "bench/scale/budgets.py"
+about = """
+Every phase budget as ONE tree — a parent must cover its children, sequential
+children sum, parallel children take the max. The numbers are parsed from
+run-curve.sh, lib.sh and clock-check.py rather than restated, so the tree cannot
+drift from the harness. Source a campaign profile first and it describes the run
+you are about to launch. Found an ssh dead-peer path of 45s inside loops
+budgeted at 60s, and drain deadlines too short for the flat run they wait for.
+"""
+requires = ["python3"]
+
+[[task]]
+id = "qos1-campaign-run"
+group = "Benchmark"
+name = "Run a QoS 1 lane E campaign with automatic teardown"
+script = "bench/scale/qos1-campaign/run-confirm.sh"
+about = """
+Provisions from QOS1_PROFILE, snapshots the harness source into the run
+directory, runs the ladder, writes the report and evidence hashes, and tears the
+fleet down on any exit path. PAID: it creates cloud servers. Preflight first
+with PREFLIGHT_ONLY=1.
+"""
+requires = ["bash", "python3"]
+
+[[task]]
+id = "qos1-campaign-report"
+group = "Benchmark"
+name = "Recompute a QoS 1 campaign report from its raw captures"
+script = "bench/scale/qos1-campaign/report.py"
+about = """
+Reads a run directory and re-derives every rung's verdict from the raw
+scrapes, ledgers and clock reports — nothing is trusted from the run itself.
+States the scaling qualification: three passing repetitions at a load, a passing
+closing control, and no failing repetition at or below it.
+"""
+requires = ["python3"]
+
+[[task]]
+id = "qos1-driver-build"
+group = "Benchmark"
+name = "Build the pinned, audited emqtt-bench driver image"
+script = "bench/scale/qos1-driver/build.sh"
+about = """
+emqtt-bench 0.6.3 at a pinned commit plus the QoS 1 audit extension: per-topic
+sequence bitmaps for sends, PUBACK completions and shared-group receipts, and a
+negative-latency counter. The image hash is recorded in every run that uses it,
+because a capacity number measured by an unpinned generator is not reproducible.
+"""
+requires = ["docker", "git", "python3", "curl"]
+
+[[task]]
+id = "scale-clock-check"
+group = "Benchmark"
+name = "Validate retained chrony tracking reports"
+script = "bench/scale/clock-check.py"
+about = """
+Invoked by the harness at every capture. Gates on the FLEET-RELATIVE error —
+the reference's own path to its upstream cancels between hosts — and treats
+staleness as a liveness bound, since chrony already prices it into root
+dispersion.
+"""
+requires = ["python3"]
+hidden = true
+
+[[task]]
+id = "scale-clock-sync"
+group = "Benchmark"
+name = "Discipline the benchmark fleet's clocks"
+script = "bench/scale/clock-sync.sh"
+about = """
+Sourced by run-curve.sh, not run directly. Points every host at the first
+broker over the private network and waits for the error bound to come inside
+budget before any rung runs.
+"""
+requires = ["bash"]
+hidden = true
+
+[[task]]
+id = "scale-lane-e-evidence"
+group = "Benchmark"
+name = "Certify one lane E rung's evidence"
+script = "bench/scale/lane-e-evidence.py"
+about = """
+Invoked by the extractor. Reconciles exact message identities, aligned counter
+windows, histogram consistency and clock validity; a rung that cannot be
+certified is INVALID rather than silently weaker.
+"""
+requires = ["python3"]
+hidden = true
+
+[[task]]
+id = "qos1-campaign-calibration-report"
+group = "Benchmark"
+name = "Report a driver-calibration provisioning"
+script = "bench/scale/qos1-campaign/calibration-report.py"
+about = """
+Separates calibration from capacity: a provisioning whose container allocation
+varied cannot be pooled into a curve.
+"""
+requires = ["python3"]
+hidden = true
+
+[[task]]
+id = "qos1-campaign-ledger-report"
+group = "Benchmark"
+name = "Reconcile a run's identity ledgers"
+script = "bench/scale/qos1-campaign/ledger-report.py"
+about = """
+Unions shared-group receipts across consumers and separates loss, duplicates,
+unexpected identities and unacknowledged sends.
+"""
+requires = ["python3"]
+hidden = true
+
+[[task]]
+id = "qos1-campaign-prepare-matrix"
+group = "Benchmark"
+name = "Generate and validate campaign configurations offline"
+script = "bench/scale/qos1-campaign/prepare-matrix.py"
+about = """
+Checks every rung's shape before a fleet is paid for.
+"""
+requires = ["python3"]
+hidden = true
+
+[[task]]
+id = "qos1-driver-calibrate-local"
+group = "Benchmark"
+name = "Calibrate driver parallelism against local brokers"
+script = "bench/scale/qos1-driver/calibrate-local.py"
+about = """
+Finds a usable container allocation without cloud spend.
+"""
+requires = ["python3"]
+hidden = true
+
+[[task]]
+id = "qos1-driver-summarize-local"
+group = "Benchmark"
+name = "Recompute a local calibration's intervals"
+script = "bench/scale/qos1-driver/summarize-local.py"
+about = """
+Rejects unstable rate, excessive lateness, latency or scrape uncertainty.
+"""
+requires = ["python3"]
+hidden = true
+
+[[task]]
+id = "qos1-driver-patch"
+group = "Benchmark"
+name = "Apply the QoS 1 audit patch to emqtt-bench"
+script = "bench/scale/qos1-driver/patch.py"
+about = """
+Build plumbing for qos1-driver/build.sh.
+"""
+requires = ["python3"]
+hidden = true
+
+[[task]]
+id = "scale-test-budgets"
+group = "Benchmark"
+name = "Test the budget tree"
+script = "bench/scale/test-budgets.py"
+about = """
+Unit tests.
+"""
+requires = ["python3"]
+hidden = true
+
+[[task]]
+id = "scale-test-clock-check"
+group = "Benchmark"
+name = "Test the clock validator"
+script = "bench/scale/test-clock-check.py"
+about = """
+Unit tests.
+"""
+requires = ["python3"]
+hidden = true
+
+[[task]]
+id = "scale-test-clock-corpus"
+group = "Benchmark"
+name = "Replay the archived clock captures"
+script = "bench/scale/test-clock-corpus.py"
+about = """
+Every capture that has ever killed a paid run must pass the current gate, and
+each must still exhibit the defect it was collected for.
+"""
+requires = ["python3"]
+hidden = true
+
+[[task]]
+id = "scale-test-lane-e-evidence"
+group = "Benchmark"
+name = "Test the evidence certifier"
+script = "bench/scale/test-lane-e-evidence.py"
+about = """
+Unit tests.
+"""
+requires = ["python3"]
+hidden = true
+
+[[task]]
+id = "qos1-campaign-test-calibration-report"
+group = "Benchmark"
+name = "Test the calibration report"
+script = "bench/scale/qos1-campaign/test-calibration-report.py"
+about = """
+Unit tests.
+"""
+requires = ["python3"]
+hidden = true
+
+[[task]]
+id = "qos1-driver-test-local"
+group = "Benchmark"
+name = "Test the local driver harness"
+script = "bench/scale/qos1-driver/test-local.py"
+about = """
+Unit tests.
+"""
+requires = ["python3"]
+hidden = true

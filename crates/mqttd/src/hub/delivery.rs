@@ -850,7 +850,7 @@ impl Hub {
         };
         let mut last = last;
         loop {
-            let Some(p) = self.pending_publishes.get(&id) else {
+            let Some(p) = self.pending_publishes.get(id) else {
                 return; // already resolved (cap eviction, an earlier terminal answer)
             };
             let (topic, payload, qos, message_expiry, app) = (

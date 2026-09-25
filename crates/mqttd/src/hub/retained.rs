@@ -167,7 +167,7 @@ impl Hub {
 
     /// The retained authority commit obligation resolved (ADR 0042 T9, exhibit ⑦).
     pub(super) fn pending_retained_done(&mut self, id: u64) {
-        if let Some(p) = self.pending_publishes.get_mut(&id) {
+        if let Some(p) = self.pending_publishes.get_mut(id) {
             p.awaiting_retained = false;
         }
         self.try_complete_pending(id);
@@ -669,7 +669,7 @@ impl Hub {
         // exhibit ⑦) — the obligation rides the mutation through re-queues and the
         // handoff hold, however long the commit takes.
         if let Some(id) = gate {
-            if let Some(p) = self.pending_publishes.get_mut(&id) {
+            if let Some(p) = self.pending_publishes.get_mut(id) {
                 p.awaiting_retained = true;
             }
         }
@@ -715,25 +715,13 @@ impl Hub {
             // takeover window to wait for (`awaiting_settle`) — a restore runs before any
             // listener binds, and holding the answer for a settle that no publish will
             // trigger would stall the restore for nothing.
-            // At the pending cap the restore is REFUSED (its completion already
-            // answered) rather than silently proceeding ungated — a restore that
-            // reports a value it did not store is the same defect as a false ack
-            // (issue #613 item 2.4).
-            let Some(id) =
-                self.register_pending(done, &topic, &payload, qos, true, message_expiry, &app)
-            else {
-                return;
-            };
-            if let Some(p) = self.pending_publishes.get_mut(&id) {
+            let id = self.register_pending(done, &topic, &payload, qos, true, message_expiry, &app);
+            if let Some(p) = self.pending_publishes.get_mut(id) {
                 p.local_done = true;
-                p.awaiting_settle = false;
-                // Both holds, for the reason the comment above gives: a restore has
-                // no fan-out to complete and no takeover window to wait out, so
-                // neither the replay obligation nor the ack gate applies to it
-                // (issue #613 item 2.1). Without this the restore's answer is held
-                // forever — no publish triggers a settle pass, so nothing would
-                // ever clear the ack gate.
-                p.ack_awaits_settle = false;
+                // BOTH settle holds, through the one method that clears them
+                // together: clearing only `awaiting_settle` retires the entry
+                // with its ack still held — a silent withhold (issue #613).
+                p.leave_settle_window();
             }
             self.route_retained_commit(
                 &topic,

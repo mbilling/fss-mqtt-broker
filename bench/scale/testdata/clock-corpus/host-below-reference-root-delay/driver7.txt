@@ -1,0 +1,14 @@
+Reference ID    : 0A63010B (10.99.1.11)
+Stratum         : 4
+Ref time (UTC)  : Sat Sep 19 16:55:55 2026
+System time     : 0.000004406 seconds fast of NTP time
+Last offset     : +0.000004392 seconds
+RMS offset      : 0.000075426 seconds
+Frequency       : 27.938 ppm fast
+Residual freq   : -0.004 ppm
+Skew            : 1.050 ppm
+Root delay      : 0.007906411 seconds
+Root dispersion : 0.000574472 seconds
+Update interval : 161.5 seconds
+Leap status     : Normal
+Captured epoch : 1789836961.282016982

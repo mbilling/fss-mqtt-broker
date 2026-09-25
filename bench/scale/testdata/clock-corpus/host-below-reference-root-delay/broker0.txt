@@ -1,0 +1,14 @@
+Reference ID    : 904C8B08 (144.76.139.8)
+Stratum         : 3
+Ref time (UTC)  : Sat Sep 19 16:55:23 2026
+System time     : 0.000124701 seconds slow of NTP time
+Last offset     : -0.000150691 seconds
+RMS offset      : 0.000702463 seconds
+Frequency       : 10.572 ppm slow
+Residual freq   : -0.047 ppm
+Skew            : 0.184 ppm
+Root delay      : 0.008344115 seconds
+Root dispersion : 0.000133324 seconds
+Update interval : 323.4 seconds
+Leap status     : Normal
+Captured epoch : 1789836961.293030236

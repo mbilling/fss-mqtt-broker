@@ -558,11 +558,6 @@ pub enum PublishRefusal {
     /// A retained publish would have created a NEW retained topic beyond the cap
     /// (ADR 0041 T4): nothing was delivered or retained.
     RetainedQuota,
-    /// The pending-publish table is at [`PENDING_PUBLISH_CAP`] and no entry is
-    /// old enough to evict, so the ARRIVING publish was refused before any side
-    /// effect. Nothing was stored anywhere — the strongest form of the claim
-    /// `Refused` makes (issue #613 item 2.4).
-    PendingCap,
 }
 
 impl PublishRefusal {
@@ -572,9 +567,7 @@ impl PublishRefusal {
     #[must_use]
     pub fn v5_reason(self) -> u8 {
         match self {
-            Self::Brownout | Self::RetainedQuota | Self::PendingCap => {
-                mqtt_codec::reason::QUOTA_EXCEEDED
-            }
+            Self::Brownout | Self::RetainedQuota => mqtt_codec::reason::QUOTA_EXCEEDED,
         }
     }
 
@@ -582,11 +575,8 @@ impl PublishRefusal {
     #[must_use]
     pub fn v311(self) -> Refusal311 {
         match self {
+            Self::Brownout => Refusal311::CloseNoAck,
             Self::RetainedQuota => Refusal311::PlainAck,
-            // `PendingCap` shares Brownout's answer on purpose: the broker could
-            // not take the message at all, so a PUBACK would be a lie
-            // (issue #613 item 2.4).
-            Self::Brownout | Self::PendingCap => Refusal311::CloseNoAck,
         }
     }
 
@@ -596,7 +586,6 @@ impl PublishRefusal {
         match self {
             Self::Brownout => "brownout",
             Self::RetainedQuota => "retained-quota",
-            Self::PendingCap => "pending-cap",
         }
     }
 
@@ -611,7 +600,6 @@ impl PublishRefusal {
         match self {
             Self::Brownout => 1,
             Self::RetainedQuota => 2,
-            Self::PendingCap => 3,
         }
     }
 
@@ -624,7 +612,6 @@ impl PublishRefusal {
         match code {
             1 => Some(Self::Brownout),
             2 => Some(Self::RetainedQuota),
-            3 => Some(Self::PendingCap),
             _ => None,
         }
     }
@@ -2037,7 +2024,7 @@ pub struct Hub {
     /// (ADR 0042 T9): keyed by a monotonic id, ordered so the cap drops the
     /// oldest. Entries resolve via forward acks, the retained commit, and the
     /// local fan-out; the sweep tick retransmits and re-routes.
-    pending_publishes: BTreeMap<u64, PendingPublish>,
+    pending_publishes: forwarding::PendingTable,
     /// Monotonic pending-publish id source.
     publish_ids: u64,
     /// Per-node monotonic forward sequence (ADR 0042 T9, exhibit ⑤).
@@ -2241,27 +2228,33 @@ const RETAINED_CHUNK_BYTES: usize = 4 * 1024 * 1024;
 /// last-value device state, typically small and infrequent.
 const RETAINED_QUEUE_CAP: usize = 1024;
 
-/// The bound on publishes whose acknowledgement awaits cluster-wide durability
-/// (ADR 0042 T9). Publisher inflight windows (`receive_maximum`) bound this
-/// naturally; the cap is a backstop against a partition outlasting every window.
-/// At the cap the **oldest** pending publish is dropped loudly — its ack is
-/// withheld, so the publisher retries (never an ack for an unowned message).
-const PENDING_PUBLISH_CAP: usize = 4096;
+/// The ENTRY bound on publishes whose acknowledgement awaits cluster-wide
+/// durability (ADR 0042 T9). At either bound the **oldest** pending publish is
+/// dropped loudly — its ack is withheld, so the publisher retries (never an ack
+/// for an unowned message).
+///
+/// It was 4096, on the reasoning that "publisher inflight windows bound this
+/// naturally" and the cap is only a backstop against a partition. That holds for
+/// a few publishers with deep windows and fails for many with shallow ones: every
+/// connected `QoS` 1 publisher may legitimately hold ONE unacknowledged publish,
+/// so a broker with more than 4096 of them crossed the cap with nothing wrong
+/// anywhere. Measured on a healthy 3-node cluster (issue #633): 6,000 publishers
+/// per broker evicted 3,446 acks, 8,000 evicted 11,701.
+///
+/// 65,536 is 16x, and it is a count bound only. Memory is bounded separately by
+/// [`PENDING_PUBLISH_MAX_BYTES`], because each entry keeps its payload for
+/// retransmission: 65,536 entries is ~28 MiB of 200-byte telemetry and ~4 GiB of
+/// 64 KiB messages, and a bound that depends on what clients choose to send is
+/// not a bound.
+const PENDING_PUBLISH_CAP: usize = 65_536;
 
-/// How old the OLDEST pending publish must be before the cap evicts it rather
-/// than refusing the arriving publish (issue #613 item 2.4).
-///
-/// Derived: 4 x [`EXPIRY_RECONCILE_EVERY`] (30 ticks) x [`SESSION_SWEEP_INTERVAL`]
-/// (1 s/tick) = 120 s, i.e. four full reconcile cadences, so no takeover window
-/// still legitimately in progress can be mistaken for a leak.
-///
-/// CAVEAT, recorded rather than hidden: nothing in the tree states how long a
-/// pending publish may LEGITIMATELY live. [`REROUTE_GRACE_TICKS`] is 8 (8 s), and
-/// the settle hold is bounded only by `routing_unsettled()` going false, which
-/// has no stated upper bound at all. If a real partition can hold it true for
-/// longer than this, the backstop evicts LIVE publishes and withholds their acks
-/// — the very defect item 2.4 removes, reintroduced on a timer.
-const PENDING_PUBLISH_MAX_AGE: Duration = Duration::from_secs(120);
+/// The BYTE bound on the same table (see [`forwarding::PendingTable`]), under the
+/// same overflow policy. 64 MiB holds the full 65,536 entries of telemetry-sized
+/// messages with room to spare, and caps what a partition can pin when payloads
+/// are large — at 64 KiB each it admits ~1,000 entries, not 65,536. One publish
+/// larger than the whole bound is still admitted into an EMPTY table, so an
+/// oversized message is answerable rather than refused forever.
+const PENDING_PUBLISH_MAX_BYTES: usize = 64 * 1024 * 1024;
 
 /// The first peer-bus proto that can carry a forward VERDICT rather than a bool
 /// ([`PeerMessage::PublishVerdict`], [`PeerMessage::SharedDeliverAcked`] — 0041-T12,
@@ -2376,7 +2369,7 @@ impl Hub {
                 retained_handoff_seq: 0,
                 retained_handoff_seen: HashMap::new(),
                 retained_handoff_pending: HashMap::new(),
-                pending_publishes: BTreeMap::new(),
+                pending_publishes: forwarding::PendingTable::default(),
                 publish_ids: 0,
                 forward_seq: 0,
                 forward_index: HashMap::new(),
@@ -2756,33 +2749,9 @@ impl Hub {
                 // A gated publish registers a pending entry FIRST (ADR 0042 T9), so
                 // the fan-out can attach its cluster-wide obligations: acked peer
                 // forwards (exhibit ⑤) and the retained authority commit (exhibit ⑦).
-                // `None` from `register_pending` is a REFUSAL taken at the cap:
-                // the publisher has already been answered and NOTHING has been
-                // stored, so the entire publish is abandoned here. The fan-out,
-                // the peer forwards and the retained commit must not run, or the
-                // refusal's claim "nothing was stored, retry" becomes false and
-                // the retry duplicates (issue #613; the rule `refuse_pending`
-                // enforces). `gate = None` keeps meaning "QoS 0 / no publisher
-                // waiting" and NOTHING else — mapping a refusal onto it would
-                // publish the message while telling the publisher it was not
-                // stored. The early `return` is load-bearing.
-                let gate = match done {
-                    Some(done) => {
-                        let Some(id) = self.register_pending(
-                            done,
-                            &topic,
-                            &payload,
-                            qos,
-                            retain,
-                            message_expiry,
-                            &app,
-                        ) else {
-                            return;
-                        };
-                        Some(id)
-                    }
-                    None => None,
-                };
+                let gate = done.map(|done| {
+                    self.register_pending(done, &topic, &payload, qos, retain, message_expiry, &app)
+                });
                 // ADR 0072: the publisher may weaken ITS OWN ack per message via
                 // `mqttd-durability` — only under the operator's opt-in. `relaxed`
                 // releases the ack at local_done (everything still runs); `local`
@@ -6153,6 +6122,7 @@ impl Hub {
         // Append-lane saturation (issue #242): sustained growth here is the warning
         // BEFORE `publish_dropped{reason="append-backlog-full"}` starts firing.
         m.set_append_lane_jobs(self.append_lanes.values().map(|l| l.outstanding).sum());
+        m.set_pending_publishes(self.pending_publishes.len(), self.pending_publishes.bytes());
         if let Ok(n) = self.retained.count().await {
             m.set_retained_messages(n);
         }
@@ -6227,24 +6197,20 @@ impl Hub {
         m.set_routing_unsettled("scan-incomplete", clustered && !self.last_scan_complete);
         m.set_routing_unsettled("interest", clustered && !self.interest_authoritative);
         m.set_routing_unsettled("mesh", clustered && !self.mesh_settled());
-        // The pending-publish ledger, whose admission rule item 2.4 changes and
-        // whose hold rule item 2.1 changes. The TOTAL says how close the cap is;
-        // the awaiting-settle SUBSET says how much of it is held by an unsettled
-        // routing view rather than by a slow durable plane. Without the split the
-        // two conditions are one number, and they want different responses.
-        // ONE walk feeds both figures, which is the only place the invariant
-        // `awaiting_settle <= total` is statable. O(pending), once a second,
-        // bounded by `PENDING_PUBLISH_CAP`.
+        // The settle window's share of the pending ledger (issue #613 items
+        // 2.1/2.5). The total and its bytes are published above from the table
+        // itself; this subset says how much of it is waiting on an unsettled
+        // routing view rather than on a slow durable plane — two conditions that
+        // are one number without the split, and want different responses.
+        // O(pending), once a second.
         let awaiting_settle = self
             .pending_publishes
             .values()
             .filter(|p| p.awaiting_settle)
             .count();
-        m.set_pending_publishes(self.pending_publishes.len(), awaiting_settle);
+        m.set_pending_publishes_awaiting_settle(awaiting_settle);
         // Issue #613 item 3.5: the hub is ONE task, so the depth of its inbound
-        // queue is its saturation, full stop. It is also the input `Hub::pressure`
-        // quantises (item 3.2), so an operator can see the number a shared
-        // selection was actually decided on rather than inferring it.
+        // queue is its saturation, full stop.
         m.set_hub_queue_depth(self.rx.len());
     }
 
@@ -6307,7 +6273,7 @@ impl Hub {
         //     only by `settle_pending_publishes` at window close).
         // An entry between the two is ANSWERED BUT ALIVE: `done` is `None`, so
         // nothing that later drops it can be read as a withhold.
-        let obligations_done = self.pending_publishes.get(&id).is_some_and(|p| {
+        let obligations_done = self.pending_publishes.get(id).is_some_and(|p| {
             p.local_done
                 // ADR 0072: relaxed acks at submit; obligations still run.
                 // Issue #399 carves two exceptions, both congestion valves:
@@ -6334,22 +6300,27 @@ impl Hub {
         // `reroute_grace` stays in `obligations_done` deliberately: an unanswered
         // forward whose target died is doubt about the EVIDENCE, not about the
         // routing view, and item 2.1 does not widen into it.
-        if let Some(p) = self.pending_publishes.get_mut(&id) {
+        if let Some(p) = self.pending_publishes.get_mut(id) {
             if !p.ack_awaits_settle && p.answer(PublishOutcome::Accepted) {
                 debug!(publish = id, topic = %p.topic, "pending publish complete; ack released");
             }
         }
-        // Retire the entry only when the settle window is done with it. The ack has
-        // necessarily been released by now when this is reached (`ack_awaits_settle`
-        // implies `awaiting_settle`), so this removal never drops an unsent sender
-        // and the withhold-by-drop rule is untouched at the one non-withholding
-        // removal in the hub.
+        // Retire the entry only when the settle window is done with it AND its
+        // publisher has been answered. The second condition is structural, not a
+        // courtesy: this is the one removal in the hub that must never withhold,
+        // and it used to rely on "`ack_awaits_settle` implies `awaiting_settle`" —
+        // an invariant the retained restore path broke by clearing only one flag,
+        // turning every restore on an unsettled node into a silently dropped
+        // sender. An entry that somehow still holds its ack now STAYS: visible in
+        // `pending_publishes`, and evicted and counted by the cap if it never
+        // clears, rather than vanishing. `leave_settle_window` keeps that case
+        // unreachable.
         if self
             .pending_publishes
-            .get(&id)
-            .is_some_and(|p| !p.awaiting_settle)
+            .get(id)
+            .is_some_and(|p| !p.awaiting_settle && p.ack_released())
         {
-            self.pending_publishes.remove(&id);
+            self.pending_publishes.remove(id);
         }
     }
 
@@ -6476,7 +6447,7 @@ impl Hub {
         // immediately — the same rebalance a refusal triggers.
         let mut dead_seqs: Vec<u64> = Vec::new();
         let mut dead_shared: Vec<(u64, ForwardObligation)> = Vec::new();
-        for (id, p) in &mut self.pending_publishes {
+        for (id, p) in self.pending_publishes.iter_mut() {
             let seqs: Vec<u64> = p
                 .awaiting
                 .iter()
@@ -6887,7 +6858,7 @@ async fn recover_once(
 
 #[cfg(test)]
 mod tests {
-    mod admission_cap;
+    mod pending_gauges;
     mod qos2_retirement;
     mod remote_group_index;
     mod scaling_locality;

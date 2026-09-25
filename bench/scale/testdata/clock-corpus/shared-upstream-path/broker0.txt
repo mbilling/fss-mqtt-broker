@@ -1,0 +1,14 @@
+Reference ID    : CEB0FCAB (2a06:a880:4:5071::123)
+Stratum         : 3
+Ref time (UTC)  : Sat Sep 19 14:03:35 2026
+System time     : 0.000000000 seconds fast of NTP time
+Last offset     : +0.000052554 seconds
+RMS offset      : 0.000511815 seconds
+Frequency       : 6.715 ppm fast
+Residual freq   : +0.002 ppm
+Skew            : 0.125 ppm
+Root delay      : 0.007308611 seconds
+Root dispersion : 0.000358505 seconds
+Update interval : 64.6 seconds
+Leap status     : Normal
+Captured epoch : 1789826652.483774531

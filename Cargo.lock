@@ -1210,9 +1210,11 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "300e883d756b2e4ec94e02791f39b04b522276138852cfc41d9fb7e904106099"
 dependencies = [
  "cfg-if",
+ "js-sys",
  "libc",
  "r-efi 6.0.0",
  "rand_core 0.10.1",
+ "wasm-bindgen",
 ]
 
 [[package]]
@@ -1288,7 +1290,7 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
 name = "history-check"
-version = "1.0.16"
+version = "1.0.17"
 dependencies = [
  "serde",
  "serde_json",
@@ -1748,9 +1750,9 @@ dependencies = [
 
 [[package]]
 name = "jsonwebtoken"
-version = "11.0.0"
+version = "11.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "881733cbc631fc9e472e24447ce32a64bedf2da498d6d8570b08edc87de71f65"
+checksum = "e75fe14a82d81e5f5af639997db37d8b96045938a7ac6ab18cdbe1c7467e05e1"
 dependencies = [
  "aws-lc-rs",
  "base64 0.22.1",
@@ -1986,7 +1988,7 @@ dependencies = [
 
 [[package]]
 name = "mqtt-auth"
-version = "1.0.16"
+version = "1.0.17"
 dependencies = [
  "argon2",
  "async-trait",
@@ -2004,7 +2006,7 @@ dependencies = [
 
 [[package]]
 name = "mqtt-bridge"
-version = "1.0.16"
+version = "1.0.17"
 dependencies = [
  "bytes",
  "criterion",
@@ -2028,7 +2030,7 @@ dependencies = [
 
 [[package]]
 name = "mqtt-cluster"
-version = "1.0.16"
+version = "1.0.17"
 dependencies = [
  "async-trait",
  "aws-lc-rs",
@@ -2048,7 +2050,7 @@ dependencies = [
 
 [[package]]
 name = "mqtt-codec"
-version = "1.0.16"
+version = "1.0.17"
 dependencies = [
  "bytes",
  "criterion",
@@ -2057,7 +2059,7 @@ dependencies = [
 
 [[package]]
 name = "mqtt-config"
-version = "1.0.16"
+version = "1.0.17"
 dependencies = [
  "serde",
  "serde_ignored",
@@ -2067,7 +2069,7 @@ dependencies = [
 
 [[package]]
 name = "mqtt-core"
-version = "1.0.16"
+version = "1.0.17"
 dependencies = [
  "bytes",
  "mqtt-codec",
@@ -2076,7 +2078,7 @@ dependencies = [
 
 [[package]]
 name = "mqtt-net"
-version = "1.0.16"
+version = "1.0.17"
 dependencies = [
  "bytes",
  "futures-util",
@@ -2093,7 +2095,7 @@ dependencies = [
 
 [[package]]
 name = "mqtt-observability"
-version = "1.0.16"
+version = "1.0.17"
 dependencies = [
  "aws-lc-rs",
  "opentelemetry",
@@ -2107,7 +2109,7 @@ dependencies = [
 
 [[package]]
 name = "mqtt-storage"
-version = "1.0.16"
+version = "1.0.17"
 dependencies = [
  "async-trait",
  "bytes",
@@ -2122,7 +2124,7 @@ dependencies = [
 
 [[package]]
 name = "mqttd"
-version = "1.0.16"
+version = "1.0.17"
 dependencies = [
  "argon2",
  "async-trait",
@@ -2158,7 +2160,7 @@ dependencies = [
 
 [[package]]
 name = "mqttd-operator"
-version = "1.0.16"
+version = "1.0.17"
 dependencies = [
  "aws-lc-rs",
  "futures-util",
@@ -2719,9 +2721,9 @@ dependencies = [
 
 [[package]]
 name = "quinn"
-version = "0.11.11"
+version = "0.11.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0c1a41e437b6bbd489372cd4971de128e85c855f56c57f283d20ff016cf7c0a8"
+checksum = "4051e23e9185c255a7e33ef59cdbca87a22d359052eecd22fc6b901fb37d9d11"
 dependencies = [
  "bytes",
  "cfg_aliases",
@@ -2739,15 +2741,16 @@ dependencies = [
 
 [[package]]
 name = "quinn-proto"
-version = "0.11.15"
+version = "0.11.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4fcb935c5bec503c2f0e306bdd3e58bb9029dcb14fa8d9ac76e3a5256ac0763e"
+checksum = "a9746dbde176634f4f2f1faf2404e30a31b2bc1e9cafb5329c95d8177a18c9fc"
 dependencies = [
  "aws-lc-rs",
  "bytes",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "lru-slab",
- "rand 0.9.4",
+ "rand 0.10.2",
+ "rand_pcg",
  "ring",
  "rustc-hash",
  "rustls",
@@ -2877,6 +2880,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "63b8176103e19a2643978565ca18b50549f6101881c443590420e4dc998a3c69"
 
 [[package]]
+name = "rand_pcg"
+version = "0.10.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "caa0f4137e1c0a72f4c651489402276c8e8e1cf081f3b0ba156d2cbeef09e86a"
+dependencies = [
+ "rand_core 0.10.1",
+]
+
+[[package]]
 name = "rayon"
 version = "1.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2988,11 +3000,11 @@ dependencies = [
 
 [[package]]
 name = "reqwest"
-version = "0.13.4"
+version = "0.13.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "219c5811de6525e5416c7d5d53bb656d3afdbc6c5af816e0802bcfa42dbdc1c3"
+checksum = "16a1cfa75cc186dd73d5818e510e042e40927bccc9c236b061cea97e1eb08029"
 dependencies = [
- "base64 0.22.1",
+ "base64 0.23.1",
  "bytes",
  "futures-channel",
  "futures-core",
@@ -3111,9 +3123,9 @@ dependencies = [
 
 [[package]]
 name = "rustix"
-version = "1.1.4"
+version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b6fe4565b9518b83ef4f91bb47ce29620ca828bd32cb7e408f0062e9930ba190"
+checksum = "891efababe418670775f199f0d233d84843c227a0949a883ce15b37c78d6629d"
 dependencies = [
  "bitflags 2.11.1",
  "errno",
@@ -3124,9 +3136,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.43"
+version = "0.23.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0283386ce02abc0151e1761d08802dfe86c173b0b494af5cbc086574e453da06"
+checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
 dependencies = [
  "aws-lc-rs",
  "log",
@@ -3188,9 +3200,9 @@ checksum = "f87165f0995f63a9fbeea62b64d10b4d9d8e78ec6d7d51fb2125fda7bb36788f"
 
 [[package]]
 name = "rustls-webpki"
-version = "0.103.13"
+version = "0.103.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "61c429a8649f110dddef65e2a5ad240f747e85f7758a6bccc7e5777bd33f756e"
+checksum = "f3c3cf1d8b1e7d4927e2d154c3fcb02979afb9939629c62cd9048d4f07b60ac2"
 dependencies = [
  "aws-lc-rs",
  "ring",
@@ -3784,9 +3796,9 @@ dependencies = [
 
 [[package]]
 name = "toml"
-version = "1.1.5+spec-1.1.0"
+version = "1.1.6+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "12c0ba9680044b4ce98d391a62094047eada0d64860b80166c39f4a6b5640785"
+checksum = "920602543f0911ab71da12c50d59701da54c196d1a2bf5cb4b75667f137a406a"
 dependencies = [
  "indexmap",
  "serde_core",

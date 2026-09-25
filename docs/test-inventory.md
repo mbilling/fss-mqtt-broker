@@ -929,7 +929,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 452 test(s)
+## `crates/mqttd/src/lib.rs` — 449 test(s)
 
 - `admission::tests::the_global_cap_refuses_at_the_bound_and_recovers`
 - `admission::tests::the_penalty_box_refuses_after_the_threshold`
@@ -1072,32 +1072,30 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::forwarding::interest_index_tests::nodes_sharing_a_filter_are_independent`
 - `hub::forwarding::interest_index_tests::re_announcing_replaces_the_previous_snapshot`
 - `hub::forwarding::interest_index_tests::resolving_the_same_interest_twice_mints_no_new_ids`
+- `hub::forwarding::pending_bounds::an_oversized_publish_is_admitted_alone`
+- `hub::forwarding::pending_bounds::sweep_cost_at_a_full_table` — `#[ignore]`d
+- `hub::forwarding::pending_bounds::the_byte_bound_evicts_until_the_newcomer_fits`
+- `hub::forwarding::pending_bounds::the_byte_total_follows_every_mutation`
+- `hub::forwarding::pending_bounds::the_entry_cap_evicts_only_the_oldest`
+- `hub::forwarding::pending_bounds::the_sweep_retransmits_only_overdue_forwards`
 - `hub::forwarding::zone_fwd_proofs::a_qos0_publish_nobody_wants_does_not_walk_the_peer_map`
 - `hub::forwarding::zone_fwd_proofs::an_already_acknowledged_entry_is_never_refused_or_withheld`
-- `hub::forwarding::zone_fwd_proofs::at_the_cap_an_already_acked_replay_entry_is_evicted_before_refusing`
-- `hub::forwarding::zone_fwd_proofs::at_the_cap_the_arriving_publish_is_refused_not_the_oldest_evicted`
-- `hub::forwarding::zone_fwd_proofs::below_the_cap_every_publish_is_admitted`
+- `hub::forwarding::zone_fwd_proofs::an_already_answered_victim_is_not_counted_as_a_withheld_ack`
 - `hub::forwarding::zone_fwd_proofs::closing_the_window_clears_both_holds_and_acks`
 - `hub::forwarding::zone_fwd_proofs::every_exit_from_the_fan_out_restores_the_buffer`
-- `hub::forwarding::zone_fwd_proofs::refusing_an_arrival_stores_nothing_anywhere`
 - `hub::forwarding::zone_fwd_proofs::releasing_the_ack_hold_does_not_shrink_the_settle_work_set`
 - `hub::forwarding::zone_fwd_proofs::the_ack_hold_clear_is_one_way_and_narrow`
 - `hub::forwarding::zone_fwd_proofs::the_answer_is_at_most_once`
-- `hub::forwarding::zone_fwd_proofs::the_cap_still_evicts_an_abandoned_entry`
 - `hub::forwarding::zone_fwd_proofs::the_early_return_does_not_change_who_receives_a_publish`
 - `hub::forwarding::zone_fwd_proofs::the_early_return_never_swallows_a_retained_broadcast`
 - `hub::forwarding::zone_fwd_proofs::the_interest_buffer_is_reused_across_publishes`
 - `hub::mesh::tests::a_moved_membership_invalidates_a_positive_answer`
 - `hub::mesh::tests::an_unstamped_cache_is_never_whole_on_a_cluster`
 - `hub::mesh::tests::standalone_reads_true_from_an_untouched_cache`
-- `hub::settle::tests::a_full_ledger_of_young_entries_refuses_the_arrival`
-- `hub::settle::tests::a_full_ledger_prefers_an_already_acked_victim`
 - `hub::settle::tests::a_matched_fan_out_never_waits_for_settle`
 - `hub::settle::tests::a_settled_view_never_holds`
 - `hub::settle::tests::a_shared_placement_is_evidence`
-- `hub::settle::tests::a_stuck_oldest_entry_is_still_evicted`
 - `hub::settle::tests::a_zero_match_fan_out_on_an_unsettled_view_still_holds`
-- `hub::settle::tests::below_the_cap_always_admits`
 - `hub::tests::a_brownout_refusal_delivers_to_nobody_even_when_a_subscriber_owed_no_durability`
 - `hub::tests::a_brownout_refusal_is_counted_as_a_quota_rejection_not_a_drop`
 - `hub::tests::a_brownout_refused_will_does_not_overtake_an_inflight_qos1_append`
@@ -1198,10 +1196,6 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::a_value_only_digest_difference_triggers_a_pull`
 - `hub::tests::a_will_is_still_delivered_live_under_brownout_and_counted_as_a_drop`
 - `hub::tests::a_windowed_commit_reaches_an_offline_durable_subscriber_on_resume`
-- `hub::tests::admission_cap::a_publish_refused_at_the_cap_is_not_delivered_forwarded_or_retained`
-- `hub::tests::admission_cap::at_the_cap_the_new_publish_is_refused_and_the_oldest_is_still_pending`
-- `hub::tests::admission_cap::the_admission_refusal_and_the_age_backstop_are_counted_apart`
-- `hub::tests::admission_cap::the_pending_publish_gauges_report_the_ledger_depth`
 - `hub::tests::an_expired_retained_value_is_not_replayed_and_is_reaped`
 - `hub::tests::an_inflight_ceiling_caps_the_clients_own_receive_maximum`
 - `hub::tests::an_online_persistent_subscriber_receives_the_wire_send_only_after_the_append_resolves`
@@ -1251,6 +1245,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::overlapping_connects_are_last_writer_wins`
 - `hub::tests::overload_then_idle_recovers_to_baseline_without_a_restart`
 - `hub::tests::peer_dead_drops_routing_and_stale_peer_disconnect_is_ignored`
+- `hub::tests::pending_gauges::the_pending_publish_gauges_report_the_ledger_depth`
 - `hub::tests::periodic_anti_entropy_says_nothing_when_there_is_nothing_retained`
 - `hub::tests::permanently_unavailable_store_rejects_rather_than_downgrades`
 - `hub::tests::prefer_local_keeps_shared_delivery_off_the_cluster_bus`
@@ -1312,8 +1307,10 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::settle_gate::a_zero_match_publish_still_holds_its_ack_on_an_unsettled_view`
 - `hub::tests::settle_gate::an_early_acked_publish_still_re_routes_to_a_peer_that_advertises_interest_later`
 - `hub::tests::settle_gate::an_early_acked_publish_still_replays_to_a_session_the_scan_materialises`
+- `hub::tests::settle_gate::an_entry_whose_ack_is_still_held_is_never_retired`
 - `hub::tests::settle_gate::an_incomplete_scan_is_retried_on_a_node_with_no_durable_plane`
 - `hub::tests::settle_gate::an_unsettled_view_releases_the_ack_of_a_publish_that_reached_a_subscriber`
+- `hub::tests::settle_gate::leaving_the_settle_window_answers_a_restore_shaped_entry`
 - `hub::tests::settle_gate::no_periodic_inherited_scan_runs_without_a_durable_plane`
 - `hub::tests::settle_gate::the_interest_authoritative_backstop_fires_on_its_own_constant`
 - `hub::tests::shared_capacity::controls::qos0_shared_capacity_includes_application_properties`

@@ -1,4 +1,4 @@
-# The project's vCPU quota, enforced BEFORE anything is created.
+# The project's vCPU and server quotas, enforced BEFORE anything is created.
 #
 # node_count and driver_count are validated independently, which was safe only
 # while driver_count was capped at 6: the worst combination the old bounds could
@@ -8,6 +8,11 @@
 # the ones it already made running and billing, with no teardown having been
 # reached. That failure has happened on this rig for other reasons and is
 # expensive; a precondition turns it into a plan-time error instead.
+#
+# The server count is the second limit with the same failure mode. It was never
+# the binding one at 10 servers (the rig's own bounds kept every run under it by
+# size), but with 30 servers / 200 vCPUs (2026-09-15) and a 12-driver cap either
+# limit can be the one a large shape crosses first, so both are checked.
 locals {
   # Dedicated- and shared-vCPU counts for the types this rig is run with. An
   # unlisted type falls back to the largest we know about, so a type we forgot
@@ -18,13 +23,16 @@ locals {
     ccx33 = 8
     ccx43 = 16
     ccx53 = 32
+    cpx32 = 4
+    cpx42 = 8
     cpx41 = 8
     cpx51 = 16
   }
 
-  broker_vcpus = lookup(local.vcpus_by_server_type, var.broker_server_type, 32)
-  driver_vcpus = lookup(local.vcpus_by_server_type, var.driver_server_type, 32)
-  total_vcpus  = var.node_count * local.broker_vcpus + var.driver_count * local.driver_vcpus
+  broker_vcpus  = lookup(local.vcpus_by_server_type, var.broker_server_type, 32)
+  driver_vcpus  = lookup(local.vcpus_by_server_type, var.driver_server_type, 32)
+  total_vcpus   = var.node_count * local.broker_vcpus + var.driver_count * local.driver_vcpus
+  total_servers = var.node_count + var.driver_count
 }
 
 resource "terraform_data" "quota_guard" {
@@ -39,6 +47,14 @@ resource "terraform_data" "quota_guard" {
         "${var.driver_count * local.driver_vcpus}) but the project quota is ${var.vcpu_quota}. ",
         "Lower node_count or driver_count, use a smaller server type, or raise vcpu_quota if ",
         "Hetzner has actually raised the project's limit."
+      ])
+    }
+    precondition {
+      condition = local.total_servers <= var.server_quota
+      error_message = join("", [
+        "this run needs ${local.total_servers} servers (${var.node_count} brokers + ${var.driver_count} ",
+        "drivers) but the project server quota is ${var.server_quota}. Lower node_count or ",
+        "driver_count, or raise server_quota if Hetzner has actually raised the project's limit."
       ])
     }
   }

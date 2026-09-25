@@ -132,14 +132,6 @@ impl Hub {
             match r {
                 PublishRefusal::Brownout => m.quota_rejected("brownout-publish"),
                 PublishRefusal::RetainedQuota => m.quota_rejected("retained"),
-                // Exhaustiveness, and the site any FUTURE caller would use.
-                // `register_pending` does NOT route its admission refusal here:
-                // issue #613 item 2.4 counts `publish_dropped{reason=
-                // "pending-cap-admission"}` at the refusal site instead. The two
-                // readings disagree (see this method's own rustdoc: a refusal the
-                // publisher is TOLD about is not a loss), and that tension is
-                // deliberately visible in two places rather than hidden in one.
-                PublishRefusal::PendingCap => m.quota_rejected("pending-cap"),
             }
         }
     }

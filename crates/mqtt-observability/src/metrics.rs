@@ -148,10 +148,11 @@ struct OtelInstruments {
     hub_fanout_peer_visits: OtelCounter<u64>,
     hub_queue_depth: OtelGauge<i64>,
     routing_unsettled: OtelGauge<i64>,
-    pending_publishes: OtelGauge<i64>,
     pending_publishes_awaiting_settle: OtelGauge<i64>,
     shared_selected: OtelCounter<u64>,
     append_lane_jobs: OtelGauge<i64>,
+    pending_publishes: OtelGauge<i64>,
+    pending_publish_bytes: OtelGauge<i64>,
     sessions: OtelGauge<i64>,
     subscriptions: OtelGauge<i64>,
     retained_messages: OtelGauge<i64>,
@@ -230,12 +231,13 @@ impl OtelInstruments {
             hub_fanout_peer_visits: meter.u64_counter("hub_fanout_peer_visits").build(),
             hub_queue_depth: meter.i64_gauge("hub_queue_depth").build(),
             routing_unsettled: meter.i64_gauge("routing_unsettled").build(),
-            pending_publishes: meter.i64_gauge("pending_publishes").build(),
             pending_publishes_awaiting_settle: meter
                 .i64_gauge("pending_publishes_awaiting_settle")
                 .build(),
             shared_selected: meter.u64_counter("shared_selected").build(),
             append_lane_jobs: meter.i64_gauge("append_lane_jobs").build(),
+            pending_publishes: meter.i64_gauge("pending_publishes").build(),
+            pending_publish_bytes: meter.i64_gauge("pending_publish_bytes").build(),
             sessions: meter.i64_gauge("sessions").build(),
             subscriptions: meter.i64_gauge("subscriptions").build(),
             retained_messages: meter.i64_gauge("retained_messages").build(),
@@ -338,12 +340,13 @@ pub struct Metrics {
     /// Issue #613 item 2.5: one series per term of `routing_unsettled()`, all of
     /// them emitted every scrape so a disappearing series is never read as 0.
     routing_unsettled: Family<ReasonLabel, Gauge>,
-    pending_publishes: Gauge,
     pending_publishes_awaiting_settle: Gauge,
     /// Issue #613 item 3.5: shared selections by locality, incremented exactly
     /// once per DELIVERED message.
     shared_selected_total: Family<LocalityLabel, Counter>,
     append_lane_jobs: Gauge,
+    pending_publishes: Gauge,
+    pending_publish_bytes: Gauge,
     sessions: Gauge,
     subscriptions: Gauge,
     retained_messages: Gauge,
@@ -542,7 +545,7 @@ impl Metrics {
         let publish_dropped_total = register_family(
             &mut registry,
             "publish_dropped",
-            "Messages dropped, by reason (no-subscriber, queue-overflow, backlog-overflow, outbound-full, outbound-id-write-failed, pending-cap, pending-cap-admission, pending-cap-replay, settle-replay, settle-replay-refused, append-backlog-full, brownout, too-large, retained-replay-client-offline, retained-replay-read-failed)",
+            "Messages dropped, by reason (no-subscriber, queue-overflow, backlog-overflow, outbound-full, outbound-id-write-failed, pending-cap, pending-cap-replay, settle-replay, settle-replay-refused, append-backlog-full, brownout, too-large, retained-replay-client-offline, retained-replay-read-failed)",
         );
 
         // Issue #480: the fraction of publishes that cross a node boundary, which
@@ -605,13 +608,6 @@ impl Metrics {
              scrape, so an absent series means the broker is not reporting rather \
              than that the term is false",
         );
-        let pending_publishes = register_gauge(
-            &mut registry,
-            "pending_publishes",
-            "Publishes whose acknowledgement is gated on cluster-wide durability \
-             and not yet resolved (ADR 0042 T9). Approaching PENDING_PUBLISH_CAP \
-             means the cap is about to start refusing or evicting",
-        );
         let pending_publishes_awaiting_settle = register_gauge(
             &mut registry,
             "pending_publishes_awaiting_settle",
@@ -634,6 +630,20 @@ impl Metrics {
              sessions (issue #242); sustained growth means a placement group's \
              followers are not keeping up — the warning before \
              publish_dropped{reason=\"append-backlog-full\"} fires",
+        );
+        let pending_publishes = register_gauge(
+            &mut registry,
+            "pending_publishes",
+            "Publishes whose acknowledgement is still gated on durability (ADR 0042 T9). \
+             Bounded by an entry cap and a byte cap; at either the OLDEST is evicted with \
+             its ack withheld — the warning before publish_dropped{reason=\"pending-cap\"} \
+             fires (issue #633)",
+        );
+        let pending_publish_bytes = register_gauge(
+            &mut registry,
+            "pending_publish_bytes",
+            "Bytes charged to the pending-publish table (entry + topic + payload, kept for \
+             retransmission); the byte half of the same bound (issue #633)",
         );
 
         let sessions = register_gauge(
@@ -1108,10 +1118,11 @@ impl Metrics {
             hub_fanout_peer_visits_total,
             hub_queue_depth,
             routing_unsettled,
-            pending_publishes,
             pending_publishes_awaiting_settle,
             shared_selected_total,
             append_lane_jobs,
+            pending_publishes,
+            pending_publish_bytes,
             sessions,
             subscriptions,
             retained_messages,
@@ -1275,9 +1286,8 @@ impl Metrics {
     /// | `queue-overflow` | the durable session queue hit its cap (ADR 0001 §6) |
     /// | `backlog-overflow` | the flow-control backlog hit one of its configured bounds — `MQTTD_MAX_BACKLOG_MESSAGES` or `MQTTD_MAX_BACKLOG_BYTES` (ADR 0012, 0041-T10, issue #241). Already-acked entries are truncated and the publisher is NOT told; the WARN line names which bound fired (`bound="messages"`, `"bytes"`, or `"messages+bytes"` when one arrival tripped both) and how many entries went. A byte bound below `MQTTD_MAX_PACKET_SIZE` makes this routine |
     /// | `outbound-full` | a `QoS` 0 shed for a subscriber that stopped reading (#123) — at the fixed 10 000-packet cap or at `MQTTD_MAX_OUTBOUND_BYTES`; the WARN line names which |
-    /// | `pending-cap` | the pending-publish table hit `PENDING_PUBLISH_CAP` and the OLDEST entry exceeded `PENDING_PUBLISH_MAX_AGE`, so it was evicted and its publisher's ack withheld (ADR 0042 T9, issue #613 item 2.4). A non-zero rate here means entries are LEAKING, not that the broker is busy — the busy case is `pending-cap-admission` |
-    /// | `pending-cap-admission` | the table was at the cap with every entry still young, so the ARRIVING publish was refused before any side effect (issue #613 item 2.4). The publisher IS told (v5 `0x97`, v3.1.1 close) and nothing was stored, so this is back-pressure, not loss — see `quota_rejections_total{reason="pending-cap"}` for the same event counted the other way, and the tension noted at `Hub::count_refusal` |
-    /// | `pending-cap-replay` | the table was at the cap and the victim was an already-ACKNOWLEDGED entry surviving only for the settle window's replay (issue #613 items 2.1 x 2.4). No publisher lost an answer; what was lost is a re-delivery to a session materialised during the window |
+    /// | `pending-cap` | the pending-publish table was at `PENDING_PUBLISH_CAP` or `PENDING_PUBLISH_MAX_BYTES`, so its OLDEST entry was evicted while that publisher was still waiting: its ack is withheld and it retries (ADR 0042 T9, bounds from 3571682) |
+    /// | `pending-cap-replay` | the same eviction, but the oldest entry had ALREADY been acknowledged and survived only for the settle window's replay (issue #613 item 2.1). No publisher lost an answer; a session materialised during that window will not receive the message |
     /// | `settle-replay` | a settle-window replay was abandoned for a publish whose ack had already been released against real fan-out evidence (issue #613 item 2.1). Nothing is withheld — the publisher keeps its truthful `Accepted` — but a session materialised during the window will not receive that message |
     /// | `settle-replay-refused` | as `settle-replay`, but the replay ended in a REFUSAL (a brownout entered during the window). Nothing is claimed to the publisher, which was already answered |
     /// | `append-backlog-full` | a session's durable-append lane hit `LANE_QUEUE_CAP` (issue #242): the NEWEST job was rejected at submit (reject-newest keeps the lane FIFO). An answerable publish is WITHHELD (fail closed, the publisher retries); an unanswerable one is a genuine drop. Watch `append_lane_jobs` for the pre-drop warning |
@@ -1405,26 +1415,16 @@ impl Metrics {
         );
     }
 
-    /// Set the pending-publish ledger's depth and the settle-held subset of it
-    /// (issue #613 items 2.1/2.5).
-    ///
-    /// ONE method taking BOTH figures, because both come from ONE walk of the
-    /// table and the invariant `awaiting_settle <= total` is only statable where
-    /// they are set together. Two methods invited two walks and could not express
-    /// it.
-    pub fn set_pending_publishes(&self, total: usize, awaiting_settle: usize) {
-        debug_assert!(
-            awaiting_settle <= total,
-            "awaiting_settle ({awaiting_settle}) exceeds total ({total}): the two \
-             figures did not come from the same walk"
-        );
-        self.pending_publishes.set(clamp_gauge(total));
-        self.pending_publishes_awaiting_settle
-            .set(clamp_gauge(awaiting_settle));
-        self.otel.pending_publishes.record(clamp_gauge(total), &[]);
+    /// Set how many pending publishes the settle window is still HOLDING the ack
+    /// of (issue #613 items 2.1/2.5) — the subset of `pending_publishes` that is
+    /// waiting on the routing view rather than on durability. Read beside
+    /// `pending_publishes`: a persistently high ratio is a view that is not
+    /// converging, not load.
+    pub fn set_pending_publishes_awaiting_settle(&self, n: usize) {
+        self.pending_publishes_awaiting_settle.set(clamp_gauge(n));
         self.otel
             .pending_publishes_awaiting_settle
-            .record(clamp_gauge(awaiting_settle), &[]);
+            .record(clamp_gauge(n), &[]);
     }
 
     /// A shared-subscription delivery was placed on a `local` or a `remote`
@@ -1455,6 +1455,22 @@ impl Metrics {
     pub fn set_append_lane_jobs(&self, n: usize) {
         self.append_lane_jobs.set(clamp_gauge(n));
         self.otel.append_lane_jobs.record(clamp_gauge(n), &[]);
+    }
+
+    /// The pending-publish table's depth and charged bytes (issue #633). Both
+    /// halves of one bound: the OLDEST entry is evicted, ack withheld, when either
+    /// is reached — so these are the warning before
+    /// `publish_dropped{reason="pending-cap"}` moves, which used to be the first
+    /// an operator heard of it.
+    pub fn set_pending_publishes(&self, entries: usize, bytes: usize) {
+        self.pending_publishes.set(clamp_gauge(entries));
+        self.otel
+            .pending_publishes
+            .record(clamp_gauge(entries), &[]);
+        self.pending_publish_bytes.set(clamp_gauge(bytes));
+        self.otel
+            .pending_publish_bytes
+            .record(clamp_gauge(bytes), &[]);
     }
 
     /// Set the current session count (snapshot of an in-memory map; ADR 0020).
@@ -1904,7 +1920,6 @@ impl Metrics {
     /// | `retained` | a retained publish creating a NEW topic beyond the cap (T4) |
     /// | `sessions` | a CONNECT creating a NEW session beyond `max_sessions` (T5) |
     /// | `brownout` | a CONNECT creating a NEW session above a watermark (T5) |
-    /// | `pending-cap` | a publish refused because the pending-publish table was at `PENDING_PUBLISH_CAP` with no evictable entry (issue #613 item 2.4). The same event is ALSO counted as `publish_dropped{reason="pending-cap-admission"}`; the two readings disagree about whether an answered refusal is a loss, and the disagreement is deliberately visible rather than hidden |
     /// | `brownout-publish` | a `QoS` >= 1 publish whose durable enqueue was refused above a watermark. The publisher is TOLD (v5 `0x97`, v3.1.1 no ack + close), so it is an ANSWERED refusal rather than a silent loss — which is why it is not `publish_dropped` (ADR 0041 T5/T11, issue #238). Whether the message is re-sent is not the broker's to promise: a v5 reason >= 0x80 COMPLETES the packet-id lifecycle, so re-delivery is an application decision, and a v3.1.1 publisher resends only if it used `CleanSession=0`. Counts ATTEMPTS, so a resending publisher increments it once per attempt |
     pub fn quota_rejected(&self, kind: &str) {
         self.quota_rejections_total
@@ -2367,6 +2382,10 @@ mod tests {
             "{out}"
         );
         assert!(out.contains("mqttd_append_lane_jobs 3"), "{out}");
+        m.set_pending_publishes(7, 4096);
+        let out = m.render();
+        assert!(out.contains("mqttd_pending_publishes 7"), "{out}");
+        assert!(out.contains("mqttd_pending_publish_bytes 4096"), "{out}");
         assert!(
             out.contains("mqttd_publish_dropped_total{reason=\"append-backlog-full\"} 1"),
             "{out}"
@@ -2392,11 +2411,12 @@ mod tests {
         ] {
             m.set_routing_unsettled(reason, on);
         }
-        m.set_pending_publishes(40, 3);
+        m.set_pending_publishes(40, 4096);
+        m.set_pending_publishes_awaiting_settle(3);
         m.shared_selected("local");
         m.shared_selected("local");
         m.shared_selected("remote");
-        m.publish_dropped("pending-cap-admission");
+        m.publish_dropped("pending-cap-replay");
         let out = m.render();
 
         // The O(N) term is its OWN family: two fan-outs observed, seven links walked.
@@ -2456,7 +2476,7 @@ mod tests {
         // The admission refusal is a DISTINCT reason from the eviction backstop:
         // one is answered, the other loses a message whose publisher still waits.
         assert!(
-            out.contains("mqttd_publish_dropped_total{reason=\"pending-cap-admission\"} 1"),
+            out.contains("mqttd_publish_dropped_total{reason=\"pending-cap-replay\"} 1"),
             "{out}"
         );
     }

@@ -328,9 +328,22 @@ pass "no container logs INSECURE, and each of the three signs its gossip per-nod
 # the host's actual sockets. The socket half is only meaningful if 1883 was free before
 # this run — otherwise it would be testing somebody else's broker — so it is skipped
 # loudly in that case rather than quietly dropped.
+#
+# `compose port`'s EXIT CODE cannot be the verdict. The image declares `EXPOSE 1883`
+# (documentation, not a binding), and for an exposed-but-unpublished port compose exits 0
+# and prints a zero host port — `:0` from compose v2, `invalid IP:0` from v5 — so the old
+# exit-code test failed this lane every night on a deployment that publishes nothing. A
+# port is published only when compose names a NONZERO host port; section 9 checks that the
+# same probe does see the overlay's real 127.0.0.1:1883 binding, so it cannot pass by
+# never matching.
+published_host_port() { # published_host_port <compose-fn> <svc> <container-port>
+  local out
+  out="$("$1" port "$2" "$3" 2>/dev/null || true)"
+  [[ "$out" =~ :([1-9][0-9]*)$ ]] && echo "${BASH_REMATCH[1]}"
+}
 for svc in mqttd-1 mqttd-2 mqttd-3; do
-  if compose port "$svc" 1883 >/dev/null 2>&1; then
-    fail "compose publishes container port 1883 for $svc — the default must not"
+  if host_port="$(published_host_port compose "$svc" 1883)"; then
+    fail "compose publishes container port 1883 for $svc on host port $host_port — the default must not"
   fi
 done
 if (( HOST_1883_BUSY )); then
@@ -456,6 +469,16 @@ else
   done
   (( ok )) || { compose_plain logs --tail 40; \
     fail "the plaintext overlay did not accept a cleartext client on 127.0.0.1:1883"; }
+  # The positive control for section 6's probe: the overlay really publishes 1883 (as 1883,
+  # 1884 and 1885), so the probe must report those host ports. A probe that never matched
+  # would otherwise make section 6 pass on any deployment.
+  for pair in mqttd-1:1883 mqttd-2:1884 mqttd-3:1885; do
+    svc="${pair%%:*}" want="${pair##*:}"
+    got="$(published_host_port compose_plain "$svc" 1883)" \
+      || fail "the port probe does not see the overlay's published 1883 for $svc — section 6 proves nothing"
+    [[ "$got" == "$want" ]] \
+      || fail "the port probe reports host port $got for $svc under the overlay, expected $want"
+  done
   # PER SERVICE, like section 5: over the combined log a single noisy broker satisfies the
   # pattern, and the claim being checked is that EVERY broker labels its own listener.
   # Captured, not piped: `grep -q` exits at the first match and closes the pipe, so
@@ -471,8 +494,16 @@ else
 fi
 
 echo
-echo "COMPOSE SMOKE OK — with MQTTD_IMAGE=$IMAGE"
-echo "NOT covered: compose.yaml's \${MQTTD_IMAGE:-ghcr.io/mbilling/fss-mqtt-broker:latest}"
-echo "default. The published :latest is v0.9.0, which predates both --hash-password and the"
-echo "--probe early exit, so bootstrap.sh and the healthcheck cannot work against it and this"
-echo "lane deliberately does not try. Issue #263."
+# Each mode names what it proved and points at the lane that covers the other half. The
+# default-image mode never sets IMAGE, and under `set -u` the old single summary line
+# aborted that lane AFTER every assertion had passed — hidden for as long as section 6's
+# port check failed first.
+if [[ "${MQTTD_SMOKE_DEFAULT_IMAGE:-0}" == 1 ]]; then
+  echo "COMPOSE SMOKE OK — with compose.yaml's own default image $DEFAULT_REF (issue #263)"
+  echo "NOT covered here: today's working tree; the override lane (MQTTD_IMAGE, or a build"
+  echo "from this checkout) proves the artifacts against current code."
+else
+  echo "COMPOSE SMOKE OK — with MQTTD_IMAGE=$IMAGE"
+  echo "NOT covered here: compose.yaml's pinned default tag as a reader pulls it; that is the"
+  echo "MQTTD_SMOKE_DEFAULT_IMAGE=1 lane (issue #263)."
+fi
