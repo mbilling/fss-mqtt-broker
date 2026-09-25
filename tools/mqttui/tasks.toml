@@ -1321,6 +1321,24 @@ requires = ["jq", "ssh"]
 duration = "instant"
 
 [[task]]
+id = "scale-replace-node"
+group = "Benchmark"
+hidden = true
+name = "Swap one bad host of a live bench provisioning for a fresh one, in place"
+script = "bench/scale/replace-node.sh"
+about = """
+tofu apply -replace for one driver or broker, with the exact variables run.sh
+recorded, so nothing else is rebuilt. Private IPs are fixed per index, so only
+the public IP and host key change; both are refreshed in the provisioning and
+arm inventories. Waits for ssh, cloud-init and a clean private mesh, and gives a
+driver the arm's client certificates. A broker is left unconfigured: its cluster
+must be re-formed. lane E calls it through LANE_E_SWAP_HOOK when a driver's
+hottest core is pinned in softirq (2026-09-25: one driver of eighteen).
+"""
+requires = ["tofu", "jq", "ssh"]
+caution = "Destroys and re-creates a PAID Hetzner server."
+
+[[task]]
 id = "scale-per-node-knee"
 group = "Benchmark"
 name = "N=7 vs N=5 per-node knee on one provisioning (PAID, #482/#613)"

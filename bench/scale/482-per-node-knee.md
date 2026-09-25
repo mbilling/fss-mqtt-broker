@@ -122,13 +122,50 @@ rung takes a fraction of its worst-case budget. Expect about 3 h of fleet time f
 the three arms plus provisioning, 6 h worst case — 75–150 server-hours on 25
 servers. Check current prices before starting.
 
-## Known risk
+## Bad hosts — swapped, not paid for
 
-`budgets.py` reports a MEASUREMENT RISK on every lane E rung: one worst-case edge
-scrape (a 10 s timeout) exceeds the window-bracket tolerance (2% × 2 × 60 s =
-2.4 s). That is a timeout budget, not a prediction — the 2026-09-15 pair lost no
-rung to it. Read `bracket_ms` on arm 1's first rung; if it is voided on the
-bracket, stop the campaign rather than paying for the rest.
+A fresh provisioning can draw a host that is broken for this workload. On
+2026-09-25 one driver of eighteen (`bench-driver-9`) held a core at 98–100%
+softirq under the one-site load its peers carried at < 20% on their hottest
+core; its scrape took ~7.5 s (voiding every rung it loaded on the window
+bracket) and its site under-offered by ~29%. The harness now handles this
+without destroying the provisioning:
+
+- **Before the ladder**, `lane_e_driver_gate` bursts every driver at a rung's
+  per-container rate, all at once, and samples every host with `mpstat -P ALL`.
+  A driver whose hottest core averages ≥ `LANE_E_DRIVER_SOFTIRQ_MAX` (80) %soft,
+  or that offers < 97% of the rate, is swapped and gated again once.
+- **After every rung**, the rung's own CPU samples get the same test. A rung that
+  loaded a pinned driver is moved to `laneE/voided-sites-…` (outside the
+  extractor's `sites-*` pattern, with `VOIDED.txt`), the driver is swapped, and
+  the rung runs again once.
+- **Swapping** is `replace-node.sh`: `tofu apply -replace` for that one server
+  with the exact variables `run.sh` recorded (`tf-apply-args-<N>.sh`). Private
+  IPs are fixed per index, so only the public IP and host key change; a driver
+  gets the arm's client certificates and is ready for the next rung. Every swap
+  is logged in the arm's `REPLACED.txt`.
+- **A broker** is judged against its peers in the same burst (pinned while the
+  median broker's hottest core is under half the threshold — softirq rising on
+  every broker is the broker working). It is never swapped under a running arm:
+  that would change the hardware the arm measures. The gate names it in
+  `bad-brokers.txt` and stops the arm; `482-per-node-knee.sh` swaps it and
+  re-forms that arm once (`<arm>-r2`) before any rung.
+
+The window-edge bracket risk `budgets.py` reports is otherwise real only on a
+bad host: healthy brokers scraped in 13–19 ms and healthy drivers in ≤ 1.5 s at
+every rung measured.
+
+## 2026-09-25 attempts — no knee yet
+
+1. **Canary failed, correctly.** The founder's re-arm restart set off a
+   membership storm; two brokers held mqttd-4 DEAD from 19:07:22 to 19:07:53 and
+   the forwarding control scraped in between. Forwarding itself was exact (600
+   shared-remote forwards per broker). Fixed: lane E waits for a full, stable
+   mesh first (`await_full_mesh`); the next attempt needed ~50 s of it.
+2. **Stopped on the bracket rule.** Mesh and canary passed; 1 and 7 sites were
+   clean (30 000 and 210 000 /s received, crossing 0.00%, `rx_skew` 1.00,
+   brackets 45 / 66 ms). From 10 sites every rung was voided by the one pinned
+   driver above. Evidence: `.runs/knee-20260925T203528Z/1-n7/`.
 
 ## Read on every arm
 

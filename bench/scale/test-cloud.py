@@ -61,6 +61,10 @@ sys.exit(77 if "apply" in sys.argv or os.path.basename(sys.argv[0]) in ("hcloud"
             # lane E waits for a stable full mesh before its control; the fakes
             # report one from the first scrape, so do not sleep between rounds.
             "MESH_POLL_SECS": "0",
+            # The driver gate and the swap hook need real hosts to burst and a
+            # tofu to replace them with; test-resize.py drives both against
+            # scripted hosts. Here they would only fail on the fakes' silence.
+            "LANE_E_DRIVER_GATE": "0", "LANE_E_SWAP_HOOK": "",
             "RUN_DIR": str(self.root / "run"),
         }
 

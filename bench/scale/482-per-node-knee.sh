@@ -11,6 +11,10 @@
 # Arm 3  back to KNEE_FULL on the same hosts, KNEE_LADDER_CLOSE: the drift
 #        control. (482-knee-smoke.sh runs the same three arms at 3 / 1 / 3.)
 #
+# A pinned driver is swapped for a fresh server in place (replace-node.sh) and
+# the rung it spoiled runs again; a pinned broker is swapped before its arm
+# measures anything, and that arm re-forms once.
+#
 # Every arm is a fresh cluster (new PKI, empty stores, founder-first) with its
 # own forwarding canary and calibration, so each is certified exactly as a
 # run.sh size is. Only the hardware is shared — which is the point: two
@@ -78,8 +82,31 @@ trap finish EXIT INT TERM
 
 # run.sh's per-size tail (run-curve, collect, observe) for an arm that
 # resize-cluster.sh + bootstrap-cluster.sh brought up instead of run.sh.
-resized_arm() { # resized_arm <size> <arm-dir> <ladder>
-	local n="$1" dir="$2" ladder="$3"
+# A pinned DRIVER is swapped in place by run-curve.sh itself (LANE_E_SWAP_HOOK,
+# replace-node.sh): drivers hold no cluster state. A pinned BROKER cannot be,
+# because it is a member of the formed cluster — so the driver gate stops the arm
+# and names it in bad-brokers.txt, and this script swaps it and re-forms THAT arm
+# once, at the same size, on the otherwise same hosts.
+export LANE_E_SWAP_HOOK="${LANE_E_SWAP_HOOK-$SCALE_DIR/replace-node.sh}"
+
+# swap_bad_brokers <failed-arm-dir> <size>: 0 when the arm failed on named bad
+# brokers and they have been replaced; 1 when the failure was anything else.
+swap_bad_brokers() {
+	local marker="$1/results/nodes=$2/laneE/bad-brokers.txt" b
+	[ -s "$marker" ] || return 1
+	"$SCALE_DIR/collect.sh" "$1" "$1/inventory-$2.json" || true
+	while read -r b; do
+		[ -n "$b" ] || continue
+		# Called from a condition, where errexit is off: fail loudly by hand.
+		"$SCALE_DIR/replace-node.sh" "$FULL_INV" broker "$b" "driver gate: pinned softirq core, outlier among brokers ($(basename "$1"))" ||
+			die "could not replace broker $b — see the tf-replace log beside $FULL_INV"
+	done <"$marker"
+}
+
+# run.sh's per-size tail (run-curve, collect, observe) for an arm that
+# resize-cluster.sh + bootstrap-cluster.sh brought up instead of run.sh.
+resized_arm() { # resized_arm <size> <arm-dir> <ladder> [retry]
+	local n="$1" dir="$2" ladder="$3" retry="${4:-0}" rc=0
 	say "════ arm $(basename "$dir"): $n nodes on the same hosts ════"
 	ARM_DIR="$dir" ARM_INV="$dir/inventory-$n.json"
 	"$SCALE_DIR/resize-cluster.sh" "$FULL_INV" "$n" "$dir"
@@ -87,7 +114,15 @@ resized_arm() { # resized_arm <size> <arm-dir> <ladder>
 	if [ "${OBSERVE:-1}" = 1 ]; then
 		"$SCALE_DIR/observe.sh" attach "$dir" "$dir/inventory-$n.json" || warn "observe attach failed — continuing unobserved"
 	fi
-	LANE_E_SITES_OVERRIDE="$ladder" "$SCALE_DIR/run-curve.sh" "$dir" "$dir/inventory-$n.json"
+	LANE_E_SITES_OVERRIDE="$ladder" "$SCALE_DIR/run-curve.sh" "$dir" "$dir/inventory-$n.json" || rc=$?
+	if [ "$rc" -ne 0 ]; then
+		if [ "$retry" = 0 ] && swap_bad_brokers "$dir" "$n"; then
+			resized_arm "$n" "$dir-r2" "$ladder" 1
+			return
+		fi
+		return "$rc"
+	fi
+	LAST_ARM="$(basename "$dir")"
 	"$SCALE_DIR/collect.sh" "$dir" "$dir/inventory-$n.json"
 	if [ "${OBSERVE:-1}" = 1 ]; then
 		"$SCALE_DIR/observe.sh" detach || true
@@ -97,15 +132,24 @@ resized_arm() { # resized_arm <size> <arm-dir> <ladder>
 A1="1-n$KNEE_FULL" A2="2-n$KNEE_SMALL" A3="3-n$KNEE_FULL-close"
 ARM_DIR="$CAMPAIGN/$A1" ARM_INV="$CAMPAIGN/$A1/inventory-$KNEE_FULL.json"
 say "════ arm $A1: provision $KNEE_FULL brokers + ${DRIVER_COUNT:-?} drivers, ladder: $KNEE_LADDER_FULL ════"
+rc=0
 KEEP_INFRA=1 RUN_DIR="$ARM_DIR" LANE_E_SITES_OVERRIDE="$KNEE_LADDER_FULL" \
-	"$SCALE_DIR/run.sh" full "$KNEE_FULL"
+	"$SCALE_DIR/run.sh" full "$KNEE_FULL" || rc=$?
 FULL_INV="$ARM_INV"
 [ -f "$FULL_INV" ] || die "arm $A1 left no inventory at $FULL_INV"
+OPEN_ARM="$A1"
+if [ "$rc" -ne 0 ]; then
+	swap_bad_brokers "$CAMPAIGN/$A1" "$KNEE_FULL" || exit "$rc"
+	resized_arm "$KNEE_FULL" "$CAMPAIGN/$A1-r2" "$KNEE_LADDER_FULL" 1
+	OPEN_ARM="$LAST_ARM"
+fi
 
 resized_arm "$KNEE_SMALL" "$CAMPAIGN/$A2" "$KNEE_LADDER_SMALL"
+SMALL_ARM="$LAST_ARM"
 resized_arm "$KNEE_FULL" "$CAMPAIGN/$A3" "$KNEE_LADDER_CLOSE"
+CLOSE_ARM="$LAST_ARM"
 
 say "all three arms complete — gate each before reading any number:"
-for arm in "$A1" "$A2" "$A3"; do
+for arm in "$OPEN_ARM" "$SMALL_ARM" "$CLOSE_ARM"; do
 	echo "  python3 extract-lane-e.py --crossing-gate 0.5 $CAMPAIGN/$arm/results" >&2
 done
