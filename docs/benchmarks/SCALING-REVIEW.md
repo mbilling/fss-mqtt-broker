@@ -1,5 +1,9 @@
 # Broker scaling review
 
+For the prioritized QoS 0 investigation brief at `4cf6503`, see
+[QoS 0 scaling investigation plan (#613)](QOS0-SCALING-PLAN.md).
+This older review retains its original scope and evidence below.
+
 Scope: source at `a2e5f32`, including the v1.0.16 broker; static review, not a new benchmark or correctness proof. Focus: connections, subscriptions, publishing and cross-node scaling for QoS 0/1/2.
 
 ## Repository sync — 2026-09-11 (issue #537 Phase 0)

@@ -335,6 +335,43 @@ pub struct Cluster {
     /// nothing, while paying the fairness cost. Structural partition ownership,
     /// not this knob, is what that case needs.
     pub shared_prefer_local: bool,
+    /// How often the local `$share` preference actually fires, PER MILLE
+    /// (`MQTTD_SHARED_LOCAL_BIAS`, default `1000` = always, i.e. today's
+    /// behaviour bit for bit) — issue #613 item 3.4.
+    ///
+    /// The unit is load-bearing: per mille, `u16`. Not a percent (a consumer
+    /// written against 0..=100 would silently deliver one tenth of the configured
+    /// locality, and no config test would catch it — the config tests never see
+    /// the hub) and not an `f64` (`Cluster` derives `Eq`).
+    ///
+    /// `shared_prefer_local` stays the OUTER gate: this is consulted only inside
+    /// it, which is why turning the boolean off still folds to bias 0 through
+    /// [`effective_shared_local_bias_permille`](Cluster::effective_shared_local_bias_permille).
+    ///
+    /// It exists because the locality preference is not a binary good: at 1000 a
+    /// group spread over N nodes gives up cross-node fairness entirely, and the
+    /// only alternative the boolean offers is giving up the throughput entirely.
+    /// A bias lets a deployment buy most of the bus saving while keeping some
+    /// rotation across nodes.
+    pub shared_local_bias_permille: u16,
+}
+
+impl Cluster {
+    /// The bias the hub should actually be given: 0 when `shared_prefer_local` is
+    /// off, otherwise the configured per mille (issue #613 item 3.4).
+    ///
+    /// `main.rs` must pass THIS, never the raw field. With the raw field,
+    /// `MQTTD_SHARED_PREFER_LOCAL=0` stops folding to bias 0 in the config layer
+    /// and the off switch silently depends on a hub-side guard that a later
+    /// simplification could remove.
+    #[must_use]
+    pub fn effective_shared_local_bias_permille(&self) -> u16 {
+        if self.shared_prefer_local {
+            self.shared_local_bias_permille.min(1000)
+        } else {
+            0
+        }
+    }
 }
 
 impl Default for Cluster {
@@ -352,6 +389,10 @@ impl Default for Cluster {
             // deployment already has. Locality preference trades that fairness for
             // throughput and must be asked for.
             shared_prefer_local: true,
+            // 1000 = the preference always fires, which is exactly what
+            // `shared_prefer_local: true` meant before this knob existed
+            // (issue #613 item 3.4).
+            shared_local_bias_permille: 1000,
         }
     }
 }
@@ -1245,6 +1286,31 @@ impl Config {
                 "0" | "false" | "off" | "no"
             );
         });
+        // The first FRACTION on the MQTTD_* surface. Parsed as 0.0..=1.0 because that
+        // is what an operator writes, stored as per mille because that is what the hub
+        // can compare without a float on the selection hot path (issue #613 item 3.4).
+        //
+        // Out of range is REFUSED, not clamped, and for one reason: this knob moves
+        // where messages go. An operator who writes "50" meaning 50% would silently get
+        // 5% of the locality they asked for, and a clamped 5.0 would be indistinguishable
+        // in the logs from a correct 1.0 — the same argument MQTTD_OWNERSHIP_DOMAIN and
+        // the byte caps already make by refusing rather than defaulting. NaN and inf fall
+        // out of the range test rather than needing their own arm.
+        on!("MQTTD_SHARED_LOCAL_BIAS", v, {
+            let f: f64 = num("MQTTD_SHARED_LOCAL_BIAS", &v)?;
+            if !(0.0..=1.0).contains(&f) {
+                return Err(ConfigError::Invalid(format!(
+                    "MQTTD_SHARED_LOCAL_BIAS must be a fraction in 0.0..=1.0, got {v:?} \
+                     (1.0 = prefer a local $share member whenever one is online, \
+                     0.0 = plain global round-robin over every online member)"
+                )));
+            }
+            // In 0.0..=1.0 by the guard above, so the product is in 0.0..=1000.0 and the
+            // cast is exact after rounding; the fraction is quantised to per mille.
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let permille = (f * 1000.0).round() as u16;
+            self.cluster.shared_local_bias_permille = permille;
+        });
         on!("MQTTD_OWNERSHIP_DOMAIN", v, {
             self.durable.ownership_domain = match v.as_str() {
                 "members" => OwnershipDomain::Members,
@@ -1533,6 +1599,20 @@ impl Config {
                 }
             }
         }
+        // The TOML path sets the stored per-mille field directly and so never reaches
+        // the env parser's range guard (issue #613 item 3.4). Check it here, where
+        // `--check-config`, startup and the reload precheck all pass: anything above
+        // 1000 is not "more local than local", it is a typo — most likely a percentage
+        // written into a per-mille field. Refused, never clamped: a clamped 5000 is
+        // indistinguishable from a deliberate 1000.
+        let bias = self.cluster.shared_local_bias_permille;
+        if bias > 1000 {
+            return Err(ConfigError::Invalid(format!(
+                "cluster.shared_local_bias_permille must be 0..=1000 per mille \
+                 (MQTTD_SHARED_LOCAL_BIAS takes the same value as a 0.0..=1.0 \
+                 fraction), got {bias}"
+            )));
+        }
         // Which certificate field is the principal is not a setting to get wrong quietly:
         // an unrecognised value must not degrade to the CN default, or a SAN-keyed ACL
         // would silently start matching against a CA-chosen Common Name (ADR 0004 T11).
@@ -1706,6 +1786,7 @@ pub const ENV_VARS: &[&str] = &[
     "MQTTD_ALLOW_EPHEMERAL_DURABILITY",
     "MQTTD_ALLOW_RELAXED_PUBLISH",
     "MQTTD_SHARED_PREFER_LOCAL",
+    "MQTTD_SHARED_LOCAL_BIAS",
     "MQTTD_OWNERSHIP_DOMAIN",
     // limits
     "MQTTD_MAX_CONNECTIONS",
@@ -2140,6 +2221,80 @@ mod tests {
         assert!(!c.cluster.refound_guard);
     }
 
+    /// Issue #613: `MQTTD_SHARED_LOCAL_BIAS` turns `MQTTD_SHARED_PREFER_LOCAL`'s on/off
+    /// into a fraction. It is the first fraction on the MQTTD_* surface, so this pins
+    /// the three decisions that make it safe: the default is EXACTLY today's behaviour,
+    /// it is stored as integer per mille (no float on the selection hot path, and
+    /// `Cluster`/`Config` keep `Eq`), and an out-of-range value is REFUSED rather than
+    /// clamped — a knob that moves where messages go must not accept "50" meaning 50%
+    /// and quietly deliver 5%.
+    #[test]
+    fn the_shared_local_bias_is_a_fraction_stored_as_permille() {
+        assert_eq!(
+            Config::default().cluster.shared_local_bias_permille,
+            1000,
+            "the default must reproduce prefer-local exactly, or this is a silent \
+             distribution change on upgrade"
+        );
+        for (v, want) in [
+            ("1.0", 1000),
+            ("1", 1000),
+            ("0.5", 500),
+            ("0.125", 125),
+            ("0", 0),
+        ] {
+            let mut c = Config::default();
+            c.overlay_from(getter(&[("MQTTD_SHARED_LOCAL_BIAS", v)]))
+                .unwrap_or_else(|e| panic!("MQTTD_SHARED_LOCAL_BIAS={v:?}: {e}"));
+            assert_eq!(c.cluster.shared_local_bias_permille, want, "bias={v:?}");
+        }
+        // Refused, not clamped — including the two floats that are neither in nor out
+        // of range by comparison (NaN, inf), which the range test rejects for free.
+        for bad in ["1.5", "-0.1", "50", "half", "nan", "inf"] {
+            let mut c = Config::default();
+            let err = c
+                .overlay_from(getter(&[("MQTTD_SHARED_LOCAL_BIAS", bad)]))
+                .expect_err("an out-of-range bias must stop startup");
+            assert!(
+                err.to_string().contains("MQTTD_SHARED_LOCAL_BIAS"),
+                "{bad:?}: the error must name the variable: {err}"
+            );
+            assert_eq!(
+                c.cluster.shared_local_bias_permille, 1000,
+                "{bad:?}: a refused value must not have been half-applied"
+            );
+        }
+        // The TOML path sets the stored per-mille field directly, so `validate()` is
+        // what keeps a file from smuggling in a value the env parser would refuse.
+        let flag = "\n[durable]\nallow_ephemeral = true\n";
+        let c = Config::from_toml(&format!(
+            "[cluster]\nshared_local_bias_permille = 250{flag}"
+        ))
+        .expect("an in-range per-mille value is valid from a file");
+        assert_eq!(c.cluster.shared_local_bias_permille, 250);
+        let err = Config::from_toml(&format!(
+            "[cluster]\nshared_local_bias_permille = 5000{flag}"
+        ))
+        .expect_err("out of range must be refused, not clamped");
+        assert!(
+            err.to_string().contains("shared_local_bias_permille"),
+            "the error must name the field: {err}"
+        );
+        // The older boolean folds in: prefer-local off IS bias 0, so the hub consults
+        // one number and the two knobs can never disagree.
+        let mut c = Config::default();
+        assert_eq!(c.cluster.effective_shared_local_bias_permille(), 1000);
+        c.cluster.shared_prefer_local = false;
+        assert_eq!(
+            c.cluster.effective_shared_local_bias_permille(),
+            0,
+            "MQTTD_SHARED_PREFER_LOCAL=0 must fold in as bias 0"
+        );
+        c.cluster.shared_prefer_local = true;
+        c.cluster.shared_local_bias_permille = 0;
+        assert_eq!(c.cluster.effective_shared_local_bias_permille(), 0);
+    }
+
     #[test]
     fn comma_lists_and_the_domain_map_parse() {
         let mut c = Config::default();
@@ -2217,6 +2372,9 @@ mod tests {
         match var {
             // Data-safe defaults are ON, so only a falsey value *changes* them.
             "MQTTD_DURABLE_SESSIONS" | "MQTTD_REFOUND_GUARD" | "MQTTD_SHARED_PREFER_LOCAL" => "off",
+            // A fraction whose default is 1.0 (= today's behaviour), so only a SMALLER
+            // fraction moves the config. Quantised to per mille on the way in: 0.5 -> 500.
+            "MQTTD_SHARED_LOCAL_BIAS" => "0.5",
             // Presence flips these on (default off).
             "MQTTD_ALLOW_ANONYMOUS"
             | "MQTTD_OIDC_ALLOW_HTTP"
@@ -2391,8 +2549,10 @@ mod tests {
             // plus MQTTD_SHARED_PREFER_LOCAL (ADR 0077 T4 follow-up),
             // plus MQTTD_TLS_SESSION_CACHE / MQTTD_TLS_ALLOW_TLS12 /
             // MQTTD_TLS_ALLOW_UNSAFE_TLS12_FEATURES / MQTTD_CONFIG_UNKNOWN_KEYS /
-            // MQTTD_AUDIT_SYSLOG (0070-T3: overlay already consumed them).
-            94,
+            // MQTTD_AUDIT_SYSLOG (0070-T3: overlay already consumed them),
+            // plus MQTTD_SHARED_LOCAL_BIAS (issue #613 item 3.4: the locality dial
+            // that turns MQTTD_SHARED_PREFER_LOCAL's on/off into a fraction).
+            95,
             "the MQTTD_* surface changed — update ENV_VARS"
         );
         // Issue #239: MQTTD_MIN_REPLICAS was wired in `overlay_from` but never

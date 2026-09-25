@@ -94,3 +94,7 @@ harness = false
 [[bench]]
 name = "shared_capacity"
 harness = false
+
+[[bench]]
+name = "shared_membership"
+harness = false

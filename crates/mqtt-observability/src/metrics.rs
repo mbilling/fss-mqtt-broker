@@ -72,6 +72,13 @@ struct CommandLabel {
     command: String,
 }
 
+/// `{locality}` label for `mqttd_shared_selected_total` (issue #613 item 3.5) —
+/// exactly two values: `local`, `remote`.
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct LocalityLabel {
+    locality: String,
+}
+
 /// `{state}` label — the bounded SWIM member states: `alive`, `suspect`, `dead`.
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 struct StateLabel {
@@ -137,6 +144,12 @@ struct OtelInstruments {
     publish_forwarded: OtelCounter<u64>,
     deliver_latency: OtelHistogram<f64>,
     hub_dispatch: OtelHistogram<f64>,
+    hub_fanout: OtelHistogram<f64>,
+    hub_fanout_peer_visits: OtelCounter<u64>,
+    hub_queue_depth: OtelGauge<i64>,
+    routing_unsettled: OtelGauge<i64>,
+    pending_publishes_awaiting_settle: OtelGauge<i64>,
+    shared_selected: OtelCounter<u64>,
     append_lane_jobs: OtelGauge<i64>,
     pending_publishes: OtelGauge<i64>,
     pending_publish_bytes: OtelGauge<i64>,
@@ -214,6 +227,14 @@ impl OtelInstruments {
             publish_forwarded: meter.u64_counter("publish_forwarded").build(),
             deliver_latency: meter.f64_histogram("deliver_latency_seconds").build(),
             hub_dispatch: meter.f64_histogram("hub_dispatch_seconds").build(),
+            hub_fanout: meter.f64_histogram("hub_fanout_seconds").build(),
+            hub_fanout_peer_visits: meter.u64_counter("hub_fanout_peer_visits").build(),
+            hub_queue_depth: meter.i64_gauge("hub_queue_depth").build(),
+            routing_unsettled: meter.i64_gauge("routing_unsettled").build(),
+            pending_publishes_awaiting_settle: meter
+                .i64_gauge("pending_publishes_awaiting_settle")
+                .build(),
+            shared_selected: meter.u64_counter("shared_selected").build(),
             append_lane_jobs: meter.i64_gauge("append_lane_jobs").build(),
             pending_publishes: meter.i64_gauge("pending_publishes").build(),
             pending_publish_bytes: meter.i64_gauge("pending_publish_bytes").build(),
@@ -308,6 +329,21 @@ pub struct Metrics {
     publish_forwarded_total: Family<ReasonLabel, Counter>,
     deliver_latency_seconds: Histogram,
     hub_dispatch_seconds: Family<CommandLabel, Histogram>,
+    /// Issue #613 item 1.6: the peer fan-out's own time and the number of peer
+    /// links it visited, split out of `hub_dispatch_seconds` so "a fan-out walked
+    /// zero links" and "no fan-outs happened" are different readings.
+    hub_fanout_seconds: Histogram,
+    hub_fanout_peer_visits_total: Counter,
+    /// Issue #613 item 3.5: the hub's inbound queue depth. The hub is a single
+    /// task, so this is its saturation, full stop.
+    hub_queue_depth: Gauge,
+    /// Issue #613 item 2.5: one series per term of `routing_unsettled()`, all of
+    /// them emitted every scrape so a disappearing series is never read as 0.
+    routing_unsettled: Family<ReasonLabel, Gauge>,
+    pending_publishes_awaiting_settle: Gauge,
+    /// Issue #613 item 3.5: shared selections by locality, incremented exactly
+    /// once per DELIVERED message.
+    shared_selected_total: Family<LocalityLabel, Counter>,
     append_lane_jobs: Gauge,
     pending_publishes: Gauge,
     pending_publish_bytes: Gauge,
@@ -509,7 +545,7 @@ impl Metrics {
         let publish_dropped_total = register_family(
             &mut registry,
             "publish_dropped",
-            "Messages dropped, by reason (no-subscriber, queue-overflow, backlog-overflow, outbound-full, outbound-id-write-failed, pending-cap, append-backlog-full, brownout, too-large, retained-replay-client-offline, retained-replay-read-failed)",
+            "Messages dropped, by reason (no-subscriber, queue-overflow, backlog-overflow, outbound-full, outbound-id-write-failed, pending-cap, pending-cap-replay, settle-replay, settle-replay-refused, append-backlog-full, brownout, too-large, retained-replay-client-offline, retained-replay-read-failed)",
         );
 
         // Issue #480: the fraction of publishes that cross a node boundary, which
@@ -535,6 +571,58 @@ impl Metrics {
              a long dispatch, so a sustained p99 above ~100ms means something is \
              blocking the loop again — see docs/OPERATIONS.md",
         );
+        // MICRO buckets, not the 100µs-start ones every other latency histogram in
+        // this file uses (issue #613 item 1.6). Those measure a round trip; this
+        // measures a per-message CPU term of single-digit microseconds at N=7. With
+        // a 100µs first bucket every observation would land in bucket one both
+        // before and after the fan-out gets cheaper, and the series could not show
+        // the one thing it exists to show.
+        let hub_fanout_seconds = register_micro_latency_histogram(
+            &mut registry,
+            "hub_fanout_seconds",
+            "Time one publish's PEER fan-out spent on the hub loop (issue #613 item \
+             1.6), split out of hub_dispatch_seconds so the O(peers) term can be \
+             read on its own. A fan-out that visited no links still observes here, \
+             with zero peer visits",
+        );
+        let hub_fanout_peer_visits_total = register_counter(
+            &mut registry,
+            "hub_fanout_peer_visits",
+            "Peer links visited by the publish fan-out, summed (issue #613 item \
+             1.6). Divided by hub_fanout_seconds_count it is the average number of \
+             links one publish walks — the quantity items 1.3 and 1.4 reduce",
+        );
+        let hub_queue_depth = register_gauge(
+            &mut registry,
+            "hub_queue_depth",
+            "Commands queued for the single-threaded hub loop (issue #613 item \
+             3.5). The hub is one task, so this IS the statement \"work is arriving \
+             faster than it is retired\"",
+        );
+        let routing_unsettled = register_gauge_family(
+            &mut registry,
+            "routing_unsettled",
+            "Whether this node's ROUTING VIEW is still settling, 1 or 0, by which \
+             term is holding it (issue #613 item 2.5): takeover, scan, \
+             scan-incomplete, interest, mesh. Every series is emitted on every \
+             scrape, so an absent series means the broker is not reporting rather \
+             than that the term is false",
+        );
+        let pending_publishes_awaiting_settle = register_gauge(
+            &mut registry,
+            "pending_publishes_awaiting_settle",
+            "The subset of pending_publishes still held by the settle window \
+             (issue #613 item 2.1). Always <= pending_publishes; a persistently \
+             high ratio is a routing view that is not converging, not load",
+        );
+        let shared_selected_total = register_family(
+            &mut registry,
+            "shared_selected",
+            "Shared-subscription selections by locality (local, remote) — issue \
+             #613 item 3.5. Exactly one increment per DELIVERED message, so \
+             local+remote can never exceed messages delivered",
+        );
+
         let append_lane_jobs = register_gauge(
             &mut registry,
             "append_lane_jobs",
@@ -1026,6 +1114,12 @@ impl Metrics {
             publish_forwarded_total,
             deliver_latency_seconds,
             hub_dispatch_seconds,
+            hub_fanout_seconds,
+            hub_fanout_peer_visits_total,
+            hub_queue_depth,
+            routing_unsettled,
+            pending_publishes_awaiting_settle,
+            shared_selected_total,
             append_lane_jobs,
             pending_publishes,
             pending_publish_bytes,
@@ -1192,7 +1286,10 @@ impl Metrics {
     /// | `queue-overflow` | the durable session queue hit its cap (ADR 0001 §6) |
     /// | `backlog-overflow` | the flow-control backlog hit one of its configured bounds — `MQTTD_MAX_BACKLOG_MESSAGES` or `MQTTD_MAX_BACKLOG_BYTES` (ADR 0012, 0041-T10, issue #241). Already-acked entries are truncated and the publisher is NOT told; the WARN line names which bound fired (`bound="messages"`, `"bytes"`, or `"messages+bytes"` when one arrival tripped both) and how many entries went. A byte bound below `MQTTD_MAX_PACKET_SIZE` makes this routine |
     /// | `outbound-full` | a `QoS` 0 shed for a subscriber that stopped reading (#123) — at the fixed 10 000-packet cap or at `MQTTD_MAX_OUTBOUND_BYTES`; the WARN line names which |
-    /// | `pending-cap` | the pending-publish table hit `PENDING_PUBLISH_CAP`, so the oldest unacknowledged publish was dropped and its publisher's ack withheld (ADR 0042 T9) |
+    /// | `pending-cap` | the pending-publish table was at `PENDING_PUBLISH_CAP` or `PENDING_PUBLISH_MAX_BYTES`, so its OLDEST entry was evicted while that publisher was still waiting: its ack is withheld and it retries (ADR 0042 T9, bounds from 3571682) |
+    /// | `pending-cap-replay` | the same eviction, but the oldest entry had ALREADY been acknowledged and survived only for the settle window's replay (issue #613 item 2.1). No publisher lost an answer; a session materialised during that window will not receive the message |
+    /// | `settle-replay` | a settle-window replay was abandoned for a publish whose ack had already been released against real fan-out evidence (issue #613 item 2.1). Nothing is withheld — the publisher keeps its truthful `Accepted` — but a session materialised during the window will not receive that message |
+    /// | `settle-replay-refused` | as `settle-replay`, but the replay ended in a REFUSAL (a brownout entered during the window). Nothing is claimed to the publisher, which was already answered |
     /// | `append-backlog-full` | a session's durable-append lane hit `LANE_QUEUE_CAP` (issue #242): the NEWEST job was rejected at submit (reject-newest keeps the lane FIFO). An answerable publish is WITHHELD (fail closed, the publisher retries); an unanswerable one is a genuine drop. Watch `append_lane_jobs` for the pre-drop warning |
     /// | `brownout` | a durable copy lost above the watermark that NOBODY was told about: a `QoS` 0 offline enqueue (nothing was owed), or an UNGATED publish with no publisher to answer — a Will, a retained-window back-fill — whose live delivery still happens. A `QoS` >= 1 refusal a publisher IS told about is `quota_rejections_total{reason="brownout-publish"}` instead, because it was answered rather than lost (issue #238) |
     /// | `too-large` | the encoded packet exceeded that subscriber's Maximum Packet Size |
@@ -1256,6 +1353,99 @@ impl Metrics {
         self.otel
             .hub_dispatch
             .record(seconds, &[KeyValue::new("command", command.to_string())]);
+    }
+
+    /// Observe one publish's PEER fan-out: the time it spent on the hub loop and
+    /// how many peer links it actually visited (issue #613 item 1.6).
+    ///
+    /// Split out of [`observe_hub_dispatch`](Self::observe_hub_dispatch) rather
+    /// than folded into it, because the O(peers) term is what items 1.3 and 1.4
+    /// remove and a dispatch histogram cannot separate it from the rest of the
+    /// publish. `peer_visits` is the number of peer-link iterations actually
+    /// executed — **0 when the fan-out early-returns**, which is a real
+    /// observation and must still be recorded.
+    ///
+    /// The caller takes its `Instant` pair INSIDE its own `Some(metrics)` guard,
+    /// so a metrics-less hub (benches, most unit tests) pays nothing. And it calls
+    /// this ABOVE any early return: below it, `hub_fanout_seconds_count` stops
+    /// advancing and the reading silently changes from "a fan-out walked zero
+    /// links" to "no fan-outs happened" — identical in a dashboard, opposite in
+    /// meaning.
+    pub fn observe_hub_fanout(&self, seconds: f64, peer_visits: usize) {
+        self.hub_fanout_seconds.observe(seconds);
+        let visits = u64::try_from(peer_visits).unwrap_or(u64::MAX);
+        self.hub_fanout_peer_visits_total.inc_by(visits);
+        self.otel.hub_fanout.record(seconds, &[]);
+        self.otel.hub_fanout_peer_visits.add(visits, &[]);
+    }
+
+    /// Set the depth of the hub's inbound command queue (issue #613 item 3.5).
+    ///
+    /// Fed from one `rx.len()` read per sweep tick: reading it twice would export
+    /// a number the broker never acted on.
+    pub fn set_hub_queue_depth(&self, n: usize) {
+        self.hub_queue_depth.set(clamp_gauge(n));
+        self.otel.hub_queue_depth.record(clamp_gauge(n), &[]);
+    }
+
+    /// Set one term of `routing_unsettled()` (issue #613 item 2.5). `reason` is a
+    /// bounded set of exactly five values, one per term of that predicate:
+    ///
+    /// | reason | term |
+    /// |---|---|
+    /// | `takeover` | `takeover_reconcile_ticks > 0` |
+    /// | `scan` | `inherited_scan_inflight` |
+    /// | `scan-incomplete` | `!last_scan_complete` |
+    /// | `interest` | `!interest_authoritative` |
+    /// | `mesh` | `!mesh_settled()` |
+    ///
+    /// The caller sets ALL FIVE on every refresh, including the false ones. A
+    /// series that stops being written keeps its last value in the registry, and
+    /// an operator reading a stale 1 — or an absent series as a 0 — learns the
+    /// opposite of the truth.
+    pub fn set_routing_unsettled(&self, reason: &str, on: bool) {
+        self.routing_unsettled
+            .get_or_create(&ReasonLabel {
+                reason: reason.to_string(),
+            })
+            .set(i64::from(on));
+        self.otel.routing_unsettled.record(
+            i64::from(on),
+            &[KeyValue::new("reason", reason.to_string())],
+        );
+    }
+
+    /// Set how many pending publishes the settle window is still HOLDING the ack
+    /// of (issue #613 items 2.1/2.5) — the subset of `pending_publishes` that is
+    /// waiting on the routing view rather than on durability. Read beside
+    /// `pending_publishes`: a persistently high ratio is a view that is not
+    /// converging, not load.
+    pub fn set_pending_publishes_awaiting_settle(&self, n: usize) {
+        self.pending_publishes_awaiting_settle.set(clamp_gauge(n));
+        self.otel
+            .pending_publishes_awaiting_settle
+            .record(clamp_gauge(n), &[]);
+    }
+
+    /// A shared-subscription delivery was placed on a `local` or a `remote`
+    /// member (issue #613 item 3.5). Exactly two label values.
+    ///
+    /// Incremented ONCE per DELIVERED message, at the commit sites — never at a
+    /// plan site. `plan_shared` is also peeked, under brownout, by
+    /// `shared_plan_owes_durable`, so counting there would count refused and
+    /// merely-peeked publishes; and a second increment on a re-selection would
+    /// make `local + remote` exceed messages delivered, contradicting the
+    /// "exactly one member per group" invariant this counter is supposed to
+    /// corroborate.
+    pub fn shared_selected(&self, locality: &str) {
+        self.shared_selected_total
+            .get_or_create(&LocalityLabel {
+                locality: locality.to_string(),
+            })
+            .inc();
+        self.otel
+            .shared_selected
+            .add(1, &[KeyValue::new("locality", locality.to_string())]);
     }
 
     /// Set the current count of admitted-but-uncompleted durable-append lane jobs,
@@ -2025,6 +2215,25 @@ fn register_latency_histogram(
     h
 }
 
+/// Register a MICROSECOND-scale latency histogram (exponential buckets ~1µs..0.5s)
+/// under `name`/`help` (issue #613 item 1.6).
+///
+/// Every other latency histogram here starts at 100µs because it measures a round
+/// trip — an fsync, an HTTP hook, a quorum append. A per-message CPU term does not:
+/// the cross-node fan-out costs single-digit microseconds per peer, so with a 100µs
+/// first bucket every observation would land in bucket one both before and after a
+/// change to it, and the series would be structurally unable to show the difference
+/// it exists to show.
+fn register_micro_latency_histogram(
+    registry: &mut Registry,
+    name: &'static str,
+    help: &'static str,
+) -> Histogram {
+    let h = Histogram::new(exponential_buckets(1e-6, 2.0, 20));
+    registry.register(name, help, h.clone());
+    h
+}
+
 /// Register a labelled latency histogram family with WIDE exponential buckets
 /// (~100µs..13s), so a dispatch parked on a full replication RPC timeout (5s,
 /// `mqtt-cluster/src/repl_net.rs`) is on-scale rather than clamped into the top
@@ -2179,6 +2388,95 @@ mod tests {
         assert!(out.contains("mqttd_pending_publish_bytes 4096"), "{out}");
         assert!(
             out.contains("mqttd_publish_dropped_total{reason=\"append-backlog-full\"} 1"),
+            "{out}"
+        );
+    }
+
+    /// Issue #613: the scaling work's observables. Their NAMES and label keys are the
+    /// contract that the hub/forwarding/delivery call sites and every wave proof-test
+    /// read back, so a rename or a dropped record fails HERE rather than in a
+    /// dashboard months later.
+    #[test]
+    fn scaling_metrics_render_with_their_documented_names() {
+        let m = Metrics::new("t");
+        m.observe_hub_fanout(4e-6, 7);
+        m.observe_hub_fanout(1e-6, 0);
+        m.set_hub_queue_depth(12);
+        for (reason, on) in [
+            ("takeover", true),
+            ("scan", false),
+            ("scan-incomplete", false),
+            ("interest", false),
+            ("mesh", false),
+        ] {
+            m.set_routing_unsettled(reason, on);
+        }
+        m.set_pending_publishes(40, 4096);
+        m.set_pending_publishes_awaiting_settle(3);
+        m.shared_selected("local");
+        m.shared_selected("local");
+        m.shared_selected("remote");
+        m.publish_dropped("pending-cap-replay");
+        let out = m.render();
+
+        // The O(N) term is its OWN family: two fan-outs observed, seven links walked.
+        assert!(
+            out.contains("mqttd_hub_fanout_seconds_count 2"),
+            "fan-out span not observed:\n{out}"
+        );
+        assert!(
+            out.contains("mqttd_hub_fanout_peer_visits_total 7"),
+            "peer visits not summed:\n{out}"
+        );
+        // ...and hub_dispatch_seconds is untouched, so the MqttdHubLoopHeld page
+        // (an unselectored rate() over the whole family) keeps meaning what its
+        // rule says. An empty family renders nothing at all here.
+        assert!(
+            !out.contains("mqttd_hub_dispatch_seconds"),
+            "the fan-out split leaked into the dispatch family:\n{out}"
+        );
+        // The two observations must land in DIFFERENT buckets. With the 100µs-start
+        // buckets of the other latency histograms both would sit in bucket one,
+        // every bucket line would read 2, and this series could never show a
+        // per-message microsecond term getting cheaper.
+        assert!(
+            out.lines()
+                .filter(|l| l.starts_with("mqttd_hub_fanout_seconds_bucket"))
+                .any(|l| l.ends_with(" 1")),
+            "micro buckets missing — the O(N) term is unresolvable:\n{out}"
+        );
+        assert!(out.contains("mqttd_hub_queue_depth 12"), "{out}");
+        // Every term is published, including the false ones — a gauge only ever set
+        // to 1 never comes back down.
+        assert!(
+            out.contains("mqttd_routing_unsettled{reason=\"takeover\"} 1"),
+            "{out}"
+        );
+        assert!(
+            out.contains("mqttd_routing_unsettled{reason=\"scan-incomplete\"} 0"),
+            "{out}"
+        );
+        assert!(
+            out.contains("mqttd_routing_unsettled{reason=\"mesh\"} 0"),
+            "{out}"
+        );
+        assert!(out.contains("mqttd_pending_publishes 40"), "{out}");
+        assert!(
+            out.contains("mqttd_pending_publishes_awaiting_settle 3"),
+            "{out}"
+        );
+        assert!(
+            out.contains("mqttd_shared_selected_total{locality=\"local\"} 2"),
+            "{out}"
+        );
+        assert!(
+            out.contains("mqttd_shared_selected_total{locality=\"remote\"} 1"),
+            "{out}"
+        );
+        // The admission refusal is a DISTINCT reason from the eviction backstop:
+        // one is answered, the other loses a message whose publisher still waits.
+        assert!(
+            out.contains("mqttd_publish_dropped_total{reason=\"pending-cap-replay\"} 1"),
             "{out}"
         );
     }

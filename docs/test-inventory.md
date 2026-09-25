@@ -253,7 +253,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `two_bridge_instances_do_not_duplicate_forwarding`
 - `two_partitioned_instances_deliver_each_inbound_message_exactly_once`
 
-## `crates/mqtt-cluster/src/lib.rs` — 291 test(s)
+## `crates/mqtt-cluster/src/lib.rs` — 293 test(s)
 
 - `cluster_identity::tests::a_founder_mints_once_and_reloads_stably`
 - `cluster_identity::tests::a_joiner_adopts_once_and_persists`
@@ -429,6 +429,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `placement::tests::clients_in_a_group_share_owner_and_replica_set`
 - `placement::tests::domains_reports_local_and_gossip_learned_labels`
 - `placement::tests::empty_voters_falls_back_to_eligible`
+- `placement::tests::for_each_member_is_the_same_set_as_members`
 - `placement::tests::group_of_is_deterministic_and_in_range`
 - `placement::tests::group_queries_are_consistent`
 - `placement::tests::owner_route_is_none_until_the_owner_address_is_known`
@@ -447,6 +448,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `placement::tests::the_memoized_replica_set_equals_the_direct_hrw_computation`
 - `placement::tests::the_ownership_version_moves_only_on_a_real_committed_change`
 - `placement::tests::this_node_is_never_removed`
+- `placement::tests::visiting_the_member_set_never_calls_the_allocating_one`
 - `placement::tests::voter_restricted_owner_is_always_a_voter`
 - `raft_mesh::tests::two_nodes_elect_and_replicate_over_the_wire`
 - `repl_net::tests::catch_up_requests_reach_the_owner_link`
@@ -649,7 +651,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 
 - `publish_codec_round_trip_clears_the_floor`
 
-## `crates/mqtt-config/src/lib.rs` — 33 test(s)
+## `crates/mqtt-config/src/lib.rs` — 34 test(s)
 
 - `tests::a_backup_dir_inside_the_data_dir_is_a_config_error`
 - `tests::a_bad_enum_value_is_rejected`
@@ -680,12 +682,13 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::the_new_per_subscriber_bounds_are_refused_out_of_range`
 - `tests::the_refound_guard_defaults_on_and_env_can_disable_it`
 - `tests::the_refusal_lists_all_unknown_keys`
+- `tests::the_shared_local_bias_is_a_fraction_stored_as_permille`
 - `tests::the_watermark_poll_is_bounded_between_one_second_and_five_minutes`
 - `tests::the_watermark_poll_overlays_from_the_environment`
 - `tests::the_whole_env_surface_overlays_without_collision`
 - `tests::warn_mode_boots_a_newer_config_and_reports_the_ignored_keys`
 
-## `crates/mqtt-core/src/lib.rs` — 52 test(s)
+## `crates/mqtt-core/src/lib.rs` — 53 test(s)
 
 - `retry::tests::delays_ramp_within_jitter_bounds_and_cap`
 - `retry::tests::reset_returns_to_base`
@@ -716,6 +719,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `subscriptions::tests::resubscribe_is_idempotent_and_filters_are_distinct`
 - `subscriptions::tests::routes_to_matching_subscribers_only`
 - `subscriptions::tests::shared_prefix_pruning_keeps_the_survivor_routable`
+- `subscriptions::tests::the_matching_walk_visits_a_client_once_per_matching_filter`
 - `subscriptions::tests::trie_matches_exactly_what_the_linear_reference_matches`
 - `subscriptions::tests::unsubscribe_and_remove_client`
 - `tests::covers_dollar_root_does_not_cover_plain_wildcard_request`
@@ -768,7 +772,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tls::tls12_hardening_tests::the_tls12_suites_are_exactly_the_allowlist`
 - `tls::tls12_hardening_tests::tls12_session_tickets_are_off`
 
-## `crates/mqtt-observability/src/lib.rs` — 15 test(s)
+## `crates/mqtt-observability/src/lib.rs` — 16 test(s)
 
 - `audit_export::tests::a_full_queue_sheds_and_counts_instead_of_blocking`
 - `audit_export::tests::frames_reach_a_tcp_listener_and_flush_waits`
@@ -778,6 +782,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `metrics::tests::no_unbounded_label_keys_are_used`
 - `metrics::tests::otlp_export_posts_to_the_endpoint`
 - `metrics::tests::render_produces_valid_openmetrics_exposition`
+- `metrics::tests::scaling_metrics_render_with_their_documented_names`
 - `tests::a_restart_is_a_new_chain_not_a_truncation`
 - `tests::audit_log_hash_chains_recorded_events`
 - `tests::chain_advances_and_is_order_sensitive`
@@ -924,7 +929,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 398 test(s)
+## `crates/mqttd/src/lib.rs` — 449 test(s)
 
 - `admission::tests::the_global_cap_refuses_at_the_bound_and_recovers`
 - `admission::tests::the_penalty_box_refuses_after_the_threshold`
@@ -1061,14 +1066,36 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::forwarding::footprint::a_pending_publish_stays_small`
 - `hub::forwarding::interest_index_tests::a_node_with_no_filters_still_has_an_interest_entry`
 - `hub::forwarding::interest_index_tests::interest_index_matches_the_linear_scan_it_replaced`
+- `hub::forwarding::interest_index_tests::matching_into_agrees_with_nodes_matching`
+- `hub::forwarding::interest_index_tests::matching_into_clears_the_caller_buffer`
+- `hub::forwarding::interest_index_tests::matching_into_collapses_a_node_on_overlapping_filters`
 - `hub::forwarding::interest_index_tests::nodes_sharing_a_filter_are_independent`
 - `hub::forwarding::interest_index_tests::re_announcing_replaces_the_previous_snapshot`
+- `hub::forwarding::interest_index_tests::resolving_the_same_interest_twice_mints_no_new_ids`
 - `hub::forwarding::pending_bounds::an_oversized_publish_is_admitted_alone`
 - `hub::forwarding::pending_bounds::sweep_cost_at_a_full_table` — `#[ignore]`d
 - `hub::forwarding::pending_bounds::the_byte_bound_evicts_until_the_newcomer_fits`
 - `hub::forwarding::pending_bounds::the_byte_total_follows_every_mutation`
 - `hub::forwarding::pending_bounds::the_entry_cap_evicts_only_the_oldest`
 - `hub::forwarding::pending_bounds::the_sweep_retransmits_only_overdue_forwards`
+- `hub::forwarding::zone_fwd_proofs::a_qos0_publish_nobody_wants_does_not_walk_the_peer_map`
+- `hub::forwarding::zone_fwd_proofs::an_already_acknowledged_entry_is_never_refused_or_withheld`
+- `hub::forwarding::zone_fwd_proofs::an_already_answered_victim_is_not_counted_as_a_withheld_ack`
+- `hub::forwarding::zone_fwd_proofs::closing_the_window_clears_both_holds_and_acks`
+- `hub::forwarding::zone_fwd_proofs::every_exit_from_the_fan_out_restores_the_buffer`
+- `hub::forwarding::zone_fwd_proofs::releasing_the_ack_hold_does_not_shrink_the_settle_work_set`
+- `hub::forwarding::zone_fwd_proofs::the_ack_hold_clear_is_one_way_and_narrow`
+- `hub::forwarding::zone_fwd_proofs::the_answer_is_at_most_once`
+- `hub::forwarding::zone_fwd_proofs::the_early_return_does_not_change_who_receives_a_publish`
+- `hub::forwarding::zone_fwd_proofs::the_early_return_never_swallows_a_retained_broadcast`
+- `hub::forwarding::zone_fwd_proofs::the_interest_buffer_is_reused_across_publishes`
+- `hub::mesh::tests::a_moved_membership_invalidates_a_positive_answer`
+- `hub::mesh::tests::an_unstamped_cache_is_never_whole_on_a_cluster`
+- `hub::mesh::tests::standalone_reads_true_from_an_untouched_cache`
+- `hub::settle::tests::a_matched_fan_out_never_waits_for_settle`
+- `hub::settle::tests::a_settled_view_never_holds`
+- `hub::settle::tests::a_shared_placement_is_evidence`
+- `hub::settle::tests::a_zero_match_fan_out_on_an_unsettled_view_still_holds`
 - `hub::tests::a_brownout_refusal_delivers_to_nobody_even_when_a_subscriber_owed_no_durability`
 - `hub::tests::a_brownout_refusal_is_counted_as_a_quota_rejection_not_a_drop`
 - `hub::tests::a_brownout_refused_will_does_not_overtake_an_inflight_qos1_append`
@@ -1218,6 +1245,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::overlapping_connects_are_last_writer_wins`
 - `hub::tests::overload_then_idle_recovers_to_baseline_without_a_restart`
 - `hub::tests::peer_dead_drops_routing_and_stale_peer_disconnect_is_ignored`
+- `hub::tests::pending_gauges::the_pending_publish_gauges_report_the_ledger_depth`
 - `hub::tests::periodic_anti_entropy_says_nothing_when_there_is_nothing_retained`
 - `hub::tests::permanently_unavailable_store_rejects_rather_than_downgrades`
 - `hub::tests::prefer_local_keeps_shared_delivery_off_the_cluster_bus`
@@ -1248,15 +1276,43 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::receive_maximum_holds_excess_until_acked`
 - `hub::tests::received_retained_snapshot_replays_on_subscribe`
 - `hub::tests::recovery_wait_does_not_block_the_hub_loop`
+- `hub::tests::remote_group_index::remote_group_index_keeps_hot_and_cold_candidate_order_and_qos`
+- `hub::tests::remote_group_index::remote_group_index_rebuilds_on_replacement_disconnect_and_death`
+- `hub::tests::remote_group_index::remote_group_index_skips_only_the_exact_local_group_and_filter`
 - `hub::tests::replay_is_bounded_and_resumes_on_next_connect`
 - `hub::tests::replayed_message_forwards_remaining_expiry_interval`
 - `hub::tests::retain_as_published_preserves_the_retain_flag_only_for_rap_subscribers`
 - `hub::tests::retain_handling_controls_the_replay_at_subscribe`
 - `hub::tests::retained_digest_is_offered_and_a_request_pulls_the_snapshot`
 - `hub::tests::retained_snapshot_does_not_overwrite_existing`
+- `hub::tests::scaling_locality::a_fractional_bias_delivers_the_exact_specified_local_schedule`
+- `hub::tests::scaling_locality::bias_0_reproduces_prefer_local_off`
+- `hub::tests::scaling_locality::bias_1000_reproduces_todays_prefer_local`
+- `hub::tests::scaling_locality::exactly_one_member_receives_each_message_at_every_bias`
+- `hub::tests::scaling_locality::the_locality_counter_is_moved_at_commit_and_never_at_peek`
+- `hub::tests::scaling_locality::the_locality_counter_moves_exactly_once_per_placed_message`
+- `hub::tests::scaling_locality::the_peek_and_the_commit_choose_the_same_member_however_loaded_the_hub_is`
+- `hub::tests::scaling_mesh::a_fan_out_that_walks_no_peers_still_reports_itself`
+- `hub::tests::scaling_mesh::a_qos0_publish_with_no_remote_interest_never_touches_the_peer_map`
+- `hub::tests::scaling_mesh::a_settled_gated_publish_does_not_re_enumerate_cluster_members`
+- `hub::tests::scaling_mesh::a_settled_peer_forward_does_not_re_enumerate_cluster_members`
+- `hub::tests::scaling_mesh::membership_enumeration_borrows_the_member_set_under_the_read_lock`
+- `hub::tests::scaling_mesh::shared_planning_takes_no_scratch_when_no_peer_announced_a_group`
+- `hub::tests::scaling_mesh::the_interest_buffer_is_allocated_once_for_every_publish_that_follows`
 - `hub::tests::session_expiry_finite_retains_then_expires`
 - `hub::tests::session_expiry_reconnect_cancels_expiry`
 - `hub::tests::session_expiry_zero_discards_at_disconnect`
+- `hub::tests::settle_gate::a_held_ack_retires_on_the_sweep_when_the_window_closes_without_a_scan`
+- `hub::tests::settle_gate::a_settled_node_with_no_durable_plane_still_skips_the_periodic_scan`
+- `hub::tests::settle_gate::a_zero_match_publish_still_holds_its_ack_on_an_unsettled_view`
+- `hub::tests::settle_gate::an_early_acked_publish_still_re_routes_to_a_peer_that_advertises_interest_later`
+- `hub::tests::settle_gate::an_early_acked_publish_still_replays_to_a_session_the_scan_materialises`
+- `hub::tests::settle_gate::an_entry_whose_ack_is_still_held_is_never_retired`
+- `hub::tests::settle_gate::an_incomplete_scan_is_retried_on_a_node_with_no_durable_plane`
+- `hub::tests::settle_gate::an_unsettled_view_releases_the_ack_of_a_publish_that_reached_a_subscriber`
+- `hub::tests::settle_gate::leaving_the_settle_window_answers_a_restore_shaped_entry`
+- `hub::tests::settle_gate::no_periodic_inherited_scan_runs_without_a_durable_plane`
+- `hub::tests::settle_gate::the_interest_authoritative_backstop_fires_on_its_own_constant`
 - `hub::tests::shared_capacity::controls::qos0_shared_capacity_includes_application_properties`
 - `hub::tests::shared_capacity::controls::qos0_shared_does_not_escape_into_another_group_or_a_down_link`
 - `hub::tests::shared_capacity::controls::qos0_shared_rechecks_capacity_between_matching_groups`
@@ -1686,6 +1742,15 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd/tests/roll_cost.rs` — 1 test(s)
 
 - `a_rolled_node_disconnects_only_its_own_clients`
+
+## `crates/mqttd/tests/shared_membership.rs` — 6 test(s)
+
+- `membership_cpu_accounting_handles_parentheses_and_excludes_child_time`
+- `membership_fixture_delivers_exactly_once_across_all_arms`
+- `membership_peer_oracle_rejects_forwarding_even_with_local_receipts`
+- `membership_perf_ack_requires_complete_confirmation`
+- `membership_receipt_oracle_rejects_loss_duplicates_and_stale_bursts`
+- `membership_tcp_fixture_receives_all_data_before_each_socket_fence`
 
 ## `crates/mqttd/tests/swim_routing.rs` — 3 test(s)
 

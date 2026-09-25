@@ -290,6 +290,11 @@ dispatch and CPU idle come from the rung's aligned steady window: brokers and
 consumers are scraped by one batch at each edge, each host stamps its own scrape
 (`window.tsv`), and the CPU samplers run for exactly that window. Rungs recorded
 before the window existed read `UNALIGNED` and must not back a capacity claim.
+The extractor also prints `rx_skew` (the busiest broker's windowed Δ received over
+the mean broker's) and `eff_nodes = N / rx_skew`. Under shared prefer-local,
+delivery work follows the publisher's broker and nothing sheds on hub saturation,
+so `eff_nodes` is a ceiling on how many brokers a rung can use: read it before
+attributing a flat N=5→7 to the broker (#613).
 The card separates matched-total-load comparisons from capacity knees and provides
 `bash ./482-smoke.sh` to prove teardown without inheriting the full campaign shape.
 

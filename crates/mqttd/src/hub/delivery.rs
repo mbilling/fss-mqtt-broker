@@ -120,7 +120,109 @@ pub(super) struct DeliveryTerms {
     pub retain_as_published: bool,
 }
 
+/// The denominator the shared-locality bias is measured in
+/// (`MQTTD_SHARED_LOCAL_BIAS`, issue #613 item 3.4).
+///
+/// 1000 because the knob's unit is PER MILLE: `Hub::shared_local_bias_permille`
+/// returns 0..=1000, so the denominator is the knob's own unit and 250 means
+/// exactly 250 messages in every 1000, with no rounding to explain to an operator.
+///
+/// The bias is a fraction OF MESSAGES, so it needs a per-message phase that does
+/// not depend on how many members a group has — and the stored cursor, reduced
+/// modulo the candidate count, is the constant 0 for a one-member group. So the
+/// cursor is stored widened to `members * SHARED_BIAS_DEN`. Two congruences make
+/// that free and exact:
+///
+/// * `(c + 1) mod (m * D) ≡ (c + 1) (mod m)` for every `D >= 1`, and every reader
+///   already reduces the stored cursor by its own candidate count (`plan_shared`,
+///   `select_shared`, `choose_shared_index`, `select_online`), so NO rotation
+///   changes — today's stored value is this value reduced;
+/// * `D | m * D`, so `(c + 1) mod (m * D) ≡ (c + 1) (mod D)`: the low digits carry
+///   the bias phase unbroken even when one group alternates between the local fast
+///   path (modulus `L * D`) and the global one (modulus `n * D`).
+const SHARED_BIAS_DEN: usize = 1000;
+
 impl Hub {
+    /// Whether THIS message takes the local-preference path, for a group whose
+    /// cursor stands at `cursor` (issue #613 item 3.4).
+    ///
+    /// Deterministic, with no RNG and no clock: a script predicting the broker and
+    /// the broker itself must agree message for message, and the cursor is a value
+    /// both can compute. It is also what keeps `shared_plan_owes_durable`'s pure
+    /// PEEK and `deliver_shared`'s COMMIT choosing the same member — they run on
+    /// the same dispatch and read the same stored cursor, so this answers the same
+    /// for both. Anything here that read state OTHER tasks write (an inbound queue
+    /// depth, a clock) would break that agreement and let a refusal fire after the
+    /// retained mutation and the live fan-out had already run.
+    ///
+    /// * bias `1000` — the default, and what `MQTTD_SHARED_PREFER_LOCAL=1` means
+    ///   today — short-circuits the window test and answers TRUE for every cursor,
+    ///   i.e. byte-for-byte today's behaviour.
+    /// * bias `0`, which is also how `MQTTD_SHARED_PREFER_LOCAL=0` folds in
+    ///   (`Hub::shared_local_bias_permille` returns 0 when the boolean is off),
+    ///   answers FALSE for every cursor, so the local fast path is never taken and
+    ///   every selection is the global rotation — today's prefer-local-off
+    ///   behaviour, unchanged.
+    /// * in between, `cursor % 1000 < permille` is true for `permille` of every
+    ///   1000 consecutive messages of that group, so its local share is
+    ///   `permille/1000`. The complement falls through to the SAME global rotation
+    ///   the knob-off path uses, so nothing becomes selectable that was not
+    ///   selectable before.
+    ///
+    /// It decides WHOSE TURN it is, never whether a message is delivered — the
+    /// justification [`shared_cursor_hash`] carries above.
+    fn prefer_local_now(&self, cursor: usize) -> bool {
+        let permille = usize::from(self.shared_local_bias_permille());
+        if permille == 0 {
+            return false;
+        }
+        permille >= SHARED_BIAS_DEN || cursor % SHARED_BIAS_DEN < permille
+    }
+
+    /// THE ONE DEFINITION of the value a shared group's cursor is stored at
+    /// (issue #613 item 3.4). Every writer goes through it — `plan_shared`'s local
+    /// fast path and its global path, `select_shared`'s cold re-selection, and both
+    /// returns of `shared_alternative_under_pressure` — so the four cannot drift
+    /// into storing cursors of different shapes, which would make the bias phase
+    /// meaningless with no test able to see it.
+    ///
+    /// `next` is the raw successor the site computed (`raw + 1`, or `selected + 1`
+    /// on the pressure path, which is where that path already advanced to today);
+    /// `count` is that site's own candidate count.
+    ///
+    /// The width is the whole content of this function:
+    ///
+    /// * With the bias at its two DEGENERATE settings — 1000 (the default, and what
+    ///   `MQTTD_SHARED_PREFER_LOCAL=1` has always meant) and 0 (the knob off) —
+    ///   `prefer_local_now` ignores the cursor's low digits entirely, so there is no
+    ///   phase to preserve and the stored value is `next % count`: byte-for-byte
+    ///   today's cursor, at every one of the four sites. That is deliberate and
+    ///   load-bearing. The congruence `(c + 1) mod (m * D) ≡ (c + 1) (mod m)` is
+    ///   only as strong as "the reader reduces by the SAME `m` the writer used", and
+    ///   a group whose membership changes between two publishes breaks that: a
+    ///   one-member group stores 0 today and would store 1 widened, and the next
+    ///   publish — with two members — would read 1 and rotate to the other member.
+    ///   Legal (the cursor is a fairness hint, never a correctness input) but it is
+    ///   an observable rotation change, and paying it on every deployment for a
+    ///   feature nobody enabled is not a trade worth making.
+    /// * With a FRACTIONAL bias the phase is the feature, so the cursor is widened
+    ///   to `count * SHARED_BIAS_DEN`. `SHARED_BIAS_DEN` divides that modulus, so
+    ///   `(stored) % SHARED_BIAS_DEN == next % SHARED_BIAS_DEN`: the low digits
+    ///   advance by exactly one per message of this group and survive a group
+    ///   alternating between the local fast path (modulus `L * D`) and the global
+    ///   one (modulus `n * D`). The operator who set the knob accepts the same
+    ///   membership-change rotation shift described above, which is the cost of
+    ///   having a per-message phase at all.
+    fn next_stored_cursor(&self, next: usize, count: usize) -> usize {
+        let permille = usize::from(self.shared_local_bias_permille());
+        let den = if permille == 0 || permille >= SHARED_BIAS_DEN {
+            1
+        } else {
+            SHARED_BIAS_DEN
+        };
+        next % count.saturating_mul(den).max(1)
+    }
+
     /// The Subscription Identifiers a delivery of `topic` to `client` must carry
     /// ([MQTT-3.3.4-3..5], issue #266): the ids of EVERY subscription of this
     /// client whose filter matches, in one packet (order insignificant, duplicates
@@ -561,6 +663,17 @@ impl Hub {
     /// and no longer reachable. `QoS` 0 deliveries and proto-6 peers keep today's
     /// fire-and-forget `SharedDeliver`: nothing is owed, or the link cannot carry the
     /// answer (a documented rolling-upgrade skew residual).
+    ///
+    /// Returns `(durable, placed)`. `placed` is true iff at least one matching group
+    /// selected a member for this message (issue #613 item 2.1). It is the second
+    /// half of the evidence `publish` needs before it releases an ack early:
+    /// `matched` counts ORDINARY subscribers only, so a publish that reached nobody
+    /// through `deliver` but was taken by a shared group is NOT a zero-reach fan-out
+    /// and must not be held against the routing view. `chosen.is_some()` is exactly
+    /// as strong as today's ack evidence and no stronger: a local member's storage
+    /// is gated by `append_gate`, and a `QoS` >= 1 member on a verdict-capable peer
+    /// becomes a `ForwardObligation` the publisher's ack already waits on. The
+    /// proto-6 remote case is the documented skew residual, unchanged either way.
     pub(super) fn deliver_shared(
         &mut self,
         topic: &str,
@@ -569,10 +682,13 @@ impl Hub {
         message_expiry: Option<u32>,
         app: &AppProperties,
         gate: Option<u64>,
-    ) -> DurableOutcome {
+    ) -> (DurableOutcome, bool) {
         let answerable = gate.is_some();
         let append_gate = gate.map_or(AppendGate::None, AppendGate::Pending);
         let mut all_durable = DurableOutcome::Ok;
+        // Issue #613 item 2.1. See the return site for the full semantics; the one
+        // rule is that this may only be set where a member was actually SELECTED.
+        let mut placed = false;
         let qos0_bytes = (qos == QoS::AtMostOnce).then(|| {
             self.subscriber_limits.max_outbound_bytes.map_or(0, |_| {
                 crate::backpressure::message_parts_bytes(topic, payload.len(), app)
@@ -624,8 +740,24 @@ impl Hub {
                 continue;
             };
             let delivered_qos = min_qos(qos, chosen.qos);
+            // Item 2.1: this group PLACED the message with a member. Set here, after
+            // the `let Some(chosen) = plan.chosen else { ... continue; }` arm above
+            // has already skipped every group that reached nobody, so the flag can
+            // only be true where a member was actually selected.
+            placed = true;
             match chosen.node {
                 None => {
+                    // Item 3.5, counted where the target is COMMITTED. NOT in
+                    // `plan_shared`: `shared_plan_owes_durable` (hub/policy.rs) also
+                    // calls that as a pure peek under brownout, so counting there
+                    // would count messages that were never selected at all — and the
+                    // peek exists precisely because it consumes no turn. This arm and
+                    // the `Some(node)` one below are the two arms of one `match` on
+                    // one `chosen`, so exactly one of them runs per PLACED message:
+                    // double counting is excluded by construction, not by argument.
+                    if let Some(m) = &self.metrics {
+                        m.shared_selected("local");
+                    }
                     all_durable = all_durable.and(self.deliver_to_client(
                         &chosen.client,
                         topic,
@@ -638,6 +770,11 @@ impl Hub {
                     ));
                 }
                 Some(node) => {
+                    // Item 3.5's other arm — see the `None` arm above for why this
+                    // is counted at commit and why the two can never both run.
+                    if let Some(m) = &self.metrics {
+                        m.shared_selected("remote");
+                    }
                     let answerable_remote = answerable
                         && qos_num(delivered_qos) >= 1
                         && self.peer_proto(&node) >= PROTO_FORWARD_VERDICT;
@@ -675,7 +812,17 @@ impl Hub {
                 }
             }
         }
-        all_durable
+        // The second element is `shared_placed` (issue #613 item 2.1): true iff at
+        // least one iteration above reached a `Some(chosen)` and attempted a
+        // delivery or a forward for it. It must be FALSE for the
+        // `None => { publish_dropped("no-shared-member"); continue; }` arm — a
+        // group that MATCHED but placed nothing is not evidence — and TRUE for
+        // every `chosen.node` arm (local `deliver_to_client`, remote
+        // `register_forward`, remote fire-and-forget `send_shared_to_peer`)
+        // REGARDLESS of the `DurableOutcome`: a failed append is a withheld ack on
+        // its own terms, not an absence of evidence. Widening it to "a shared group
+        // matched the topic" turns item 2.1 into a false-ack bug.
+        (all_durable, placed)
     }
 
     /// Re-select within a shared group after the chosen member's node refused
@@ -821,27 +968,88 @@ impl Hub {
         let by_filter = &self.remote_by_filter;
         let remote = &self.remote_shared;
         index.for_each_matching(topic, |filter| {
-            let Some(locations) = by_filter.get(filter) else {
+            let Some(by_group) = by_filter.get(filter) else {
                 return;
             };
-            for (node, idx) in locations {
-                let Some(g) = remote.get(node).and_then(|groups| groups.get(*idx)) else {
-                    continue;
-                };
-                let entry = by_key
-                    .entry((g.group.clone(), g.filter.clone()))
-                    .or_default();
-                for (client, qos, online) in &g.members {
-                    entry.push(SharedCandidate {
-                        node: Some(node.clone()),
-                        client: client.clone(),
-                        qos: *qos,
-                        online: *online,
-                    });
+            for (group, locations) in by_group {
+                for (node, idx) in locations {
+                    let Some(g) = remote.get(node).and_then(|groups| groups.get(*idx)) else {
+                        continue;
+                    };
+                    let entry = by_key
+                        .entry((group.clone(), filter.to_string()))
+                        .or_default();
+                    for (client, qos, online) in &g.members {
+                        entry.push(SharedCandidate {
+                            node: Some(node.clone()),
+                            client: client.clone(),
+                            qos: *qos,
+                            online: *online,
+                        });
+                    }
                 }
             }
         });
         by_key.into_iter().collect()
+    }
+
+    /// The CONSTANT-TIME PATH of [`plan_shared`](Self::plan_shared), extracted so
+    /// the caller stays inside its line budget: `Some` when this group is answered
+    /// by a local online member and no peer can outrank it, `None` when the caller
+    /// must fall through and build the full candidate list.
+    ///
+    /// With locality on (the default since #511) a group that has ANY online member
+    /// on this node is answered by that member, and which local member takes the
+    /// turn is an index into the group's online prefix — so the whole decision is
+    /// one lookup, independent of how many members the group has. That is the
+    /// property that lets one `$share` group serve both a six-member fan-in tenant
+    /// and a broadcast group of tens of thousands. Building a candidate per member
+    /// to then discard all but one was linear in group size and cost ~42ns per
+    /// member per publish.
+    ///
+    /// Since issue #613 item 3.4 the locality preference is a per-message window
+    /// over this group's cursor rather than a bare knob read, so the cursor must be
+    /// read BEFORE the fast path can be taken. A group with no online local member
+    /// never had a fast path and still pays nothing: the `online_count` test gates
+    /// the hash exactly as before.
+    fn plan_local_fast(
+        &self,
+        group: &str,
+        filter: &str,
+        members: &mqtt_core::shared::GroupMembers,
+    ) -> Option<SharedPlan> {
+        if members.online_count() == 0 {
+            return None;
+        }
+        let key_hash = shared_cursor_hash(group, filter);
+        let existing = self
+            .shared_cursor
+            .get(&key_hash)
+            .filter(|(k, _)| k.0.as_str() == group && k.1.as_str() == filter);
+        let cursor = existing.map_or(0, |(_, c)| *c);
+        if !self.prefer_local_now(cursor) {
+            return None;
+        }
+        let chosen = members
+            .select_online(cursor)
+            .map(|(client, qos)| SharedCandidate {
+                node: None,
+                client: client.clone(),
+                qos: *qos,
+                online: true,
+            });
+        Some(SharedPlan {
+            key_hash,
+            key_if_new: existing
+                .is_none()
+                .then(|| (group.to_string(), filter.to_string())),
+            // Rotation is over the ONLINE members, so an offline member never
+            // consumes a turn. Site 1 of 4 on the one stored-cursor definition
+            // (item 3.4); `select_online` reduces the start it is given, so a
+            // widened value indexes identically.
+            next_cursor: self.next_stored_cursor(cursor.wrapping_add(1), members.online_count()),
+            chosen,
+        })
     }
 
     /// Plan every shared selection for one publish WITHOUT touching hub state and
@@ -859,7 +1067,26 @@ impl Hub {
         let mut plans: Vec<SharedPlan> = Vec::new();
         // Groups already decided by the constant-time path below, so the peer
         // pass does not resurrect them as candidates.
-        let mut decided: std::collections::HashSet<(&str, &str)> = std::collections::HashSet::new();
+        //
+        // A `Vec`, not a `HashSet` (issue #613 item 1.5): every real shape puts one
+        // or two entries in here, and answering "is this pair present" by comparing
+        // two `&str` pairs is cheaper than hashing them.
+        let mut decided: Vec<(&str, &str)> = Vec::new();
+        // The peer pass can only resurrect a group that some PEER announced. When no
+        // peer has announced a shared group at all — every single-node deployment,
+        // and every cluster whose shared groups are local — the pass below returns
+        // before it ever reads `decided`, so filling it is pure waste: one
+        // allocation per publish to answer a question nobody asks. `remote_by_filter`
+        // is the exact table that pass reads (`by_filter.get(filter)` returns `None`
+        // for every filter when it is empty, and the closure returns immediately),
+        // so this cannot fork the definition of "which groups exist elsewhere".
+        let track_decided = !self.remote_by_filter.is_empty();
+        #[cfg(test)]
+        if track_decided {
+            self.probe
+                .shared_plan_scratch_uses
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         for (group, filter, members) in self.shared.matching_refs(topic) {
             // CONSTANT-TIME PATH. With locality on (the default since #511) a
             // group that has ANY online member on this node is answered by that
@@ -870,32 +1097,11 @@ impl Hub {
             // six-member fan-in tenant and a broadcast group of tens of
             // thousands. Building a candidate per member to then discard all but
             // one was linear in group size and cost ~42ns per member per publish.
-            if self.shared_prefer_local && members.online_count() > 0 {
-                let key_hash = shared_cursor_hash(group, filter);
-                let existing = self
-                    .shared_cursor
-                    .get(&key_hash)
-                    .filter(|(k, _)| k.0.as_str() == group && k.1.as_str() == filter);
-                let cursor = existing.map_or(0, |(_, c)| *c);
-                let chosen = members
-                    .select_online(cursor)
-                    .map(|(client, qos)| SharedCandidate {
-                        node: None,
-                        client: client.clone(),
-                        qos: *qos,
-                        online: true,
-                    });
-                plans.push(SharedPlan {
-                    key_hash,
-                    key_if_new: existing
-                        .is_none()
-                        .then(|| (group.to_string(), filter.to_string())),
-                    // Rotation is over the ONLINE members, so an offline member
-                    // never consumes a turn.
-                    next_cursor: cursor.wrapping_add(1) % members.online_count().max(1),
-                    chosen,
-                });
-                decided.insert((group, filter));
+            if let Some(plan) = self.plan_local_fast(group, filter, members) {
+                plans.push(plan);
+                if track_decided {
+                    decided.push((group, filter));
+                }
                 continue;
             }
             let entry = by_key.entry((group, filter)).or_default();
@@ -918,26 +1124,32 @@ impl Hub {
         let by_filter = &self.remote_by_filter;
         let remote = &self.remote_shared;
         index.for_each_matching(topic, |filter| {
-            let Some(locations) = by_filter.get(filter) else {
+            let Some(by_group) = by_filter.get(filter) else {
                 return;
             };
-            for (node, idx) in locations {
-                let Some(g) = remote.get(node).and_then(|groups| groups.get(*idx)) else {
-                    continue;
-                };
-                if decided.contains(&(g.group.as_str(), g.filter.as_str())) {
+            for (group, locations) in by_group {
+                // Exact group/filter identity, BEFORE resolving any peer location.
+                // A local winner may skip this group, never another group sharing
+                // its filter or another matching filter sharing its group name.
+                if decided
+                    .iter()
+                    .any(|&(g, f)| g == group.as_str() && f == filter.as_ref())
+                {
                     continue;
                 }
-                let entry = by_key
-                    .entry((g.group.as_str(), g.filter.as_str()))
-                    .or_default();
-                for (client, qos, online) in &g.members {
-                    entry.push(SharedCandidateRef {
-                        node: Some(node),
-                        client,
-                        qos: *qos,
-                        online: *online,
-                    });
+                for (node, idx) in locations {
+                    let Some(g) = remote.get(node).and_then(|groups| groups.get(*idx)) else {
+                        continue;
+                    };
+                    let entry = by_key.entry((group.as_str(), filter.as_ref())).or_default();
+                    for (client, qos, online) in &g.members {
+                        entry.push(SharedCandidateRef {
+                            node: Some(node),
+                            client,
+                            qos: *qos,
+                            online: *online,
+                        });
+                    }
                 }
             }
         });
@@ -955,9 +1167,14 @@ impl Hub {
                         .shared_cursor
                         .get(&key_hash)
                         .filter(|(k, _)| k.0.as_str() == group && k.1.as_str() == filter);
-                    let start = existing.map_or(0, |(_, c)| *c) % n;
+                    // `raw` is the stored cursor at full width; `start` is the same
+                    // value reduced for this candidate list. The bias window reads
+                    // `raw` so the phase advances by one per message of this group
+                    // no matter which branch served it.
+                    let raw = existing.map_or(0, |(_, c)| *c);
+                    let start = raw % n;
                     let chosen = self
-                        .choose_shared_index(&cands, start)
+                        .choose_shared_index(&cands, start, self.prefer_local_now(raw))
                         .map(|i| cands[i].to_owned_candidate());
                     SharedPlan {
                         key_hash,
@@ -965,7 +1182,11 @@ impl Hub {
                         key_if_new: existing
                             .is_none()
                             .then(|| (group.to_string(), filter.to_string())),
-                        next_cursor: (start + 1) % n,
+                        // Site 2 of 4 on the one stored-cursor definition (item
+                        // 3.4). `raw ≡ start (mod n)`, so this is today's
+                        // `(start + 1) % n` at the degenerate biases and the same
+                        // value widened at a fractional one.
+                        next_cursor: self.next_stored_cursor(raw.wrapping_add(1), n),
                         chosen,
                     }
                 }),
@@ -989,15 +1210,19 @@ impl Hub {
         // owned key, so it pays the hash here rather than carrying one — this runs
         // once per refusal, not once per publish.
         let key_hash = shared_cursor_hash(&key.0, &key.1);
-        let start = self
+        let raw = self
             .shared_cursor
             .get(&key_hash)
             .filter(|(k, _)| k == key)
-            .map_or(0, |(_, c)| *c)
-            % n;
-        self.shared_cursor
-            .insert(key_hash, (key.clone(), (start + 1) % n));
-        self.choose_shared(candidates, start)
+            .map_or(0, |(_, c)| *c);
+        let start = raw % n;
+        // Site 3 of 4 on the one stored-cursor definition (item 3.4): the cold
+        // re-selection path must store the same SHAPE as the hot path, or a refusal
+        // would silently move the group off its bias phase and the two would
+        // disagree about whose turn it is.
+        let next = self.next_stored_cursor(raw.wrapping_add(1), n);
+        self.shared_cursor.insert(key_hash, (key.clone(), next));
+        self.choose_shared(candidates, start, self.prefer_local_now(raw))
     }
 
     /// The selection rule itself, shared by [`select_shared`](Self::select_shared) and
@@ -1007,8 +1232,9 @@ impl Hub {
         &self,
         candidates: &[SharedCandidate],
         start: usize,
+        prefer_local: bool,
     ) -> Option<SharedCandidate> {
-        self.choose_shared_index(candidates, start)
+        self.choose_shared_index(candidates, start, prefer_local)
             .map(|i| candidates[i].clone())
     }
 
@@ -1064,6 +1290,13 @@ impl Hub {
         start: usize,
         bytes: usize,
     ) -> Option<(SharedCandidate, usize)> {
+        // ONE locality decision for this message (issue #613 item 3.4), used by the
+        // local-first block, the final choice and the rotation modulus below.
+        // Computing it three times would risk the modulus describing a branch that
+        // did not run. `start` is the RAW stored cursor — the caller deliberately
+        // passes the old cursor, not `plan.next_cursor` — so it is the right phase
+        // input for the bias window.
+        let prefer_local = self.prefer_local_now(start);
         let mut candidates = Vec::new();
         let mut local_online = 0;
         if let Some((_, _, members)) = self
@@ -1083,9 +1316,9 @@ impl Hub {
                 });
             }
         }
-        if self.shared_prefer_local {
+        if prefer_local {
             if let Some(selected) = self
-                .choose_shared_index(&candidates, start)
+                .choose_shared_index(&candidates, start, prefer_local)
                 .filter(|&i| candidates[i].online)
             {
                 // A ready local outranks every remote. Preserve #524's important
@@ -1093,18 +1326,23 @@ impl Hub {
                 // merely because this local group's first pick was full.
                 return Some((
                     candidates[selected].to_owned_candidate(),
-                    (selected + 1) % local_online.max(1),
+                    // Site 4a of 4 on the one stored-cursor definition (item 3.4).
+                    // Without it this path would store a value below the candidate
+                    // count and flatten the bias phase of every group that ever hit
+                    // local pressure.
+                    self.next_stored_cursor(selected + 1, local_online),
                 ));
             }
         }
-        if let Some(locations) = self.remote_by_filter.get(key.1.as_str()) {
+        if let Some(locations) = self
+            .remote_by_filter
+            .get(key.1.as_str())
+            .and_then(|groups| groups.get(key.0.as_str()))
+        {
             for (node, idx) in locations {
                 let Some(group) = self.remote_shared.get(node).and_then(|g| g.get(*idx)) else {
                     continue;
                 };
-                if group.group != key.0 {
-                    continue;
-                }
                 let linked = self.peers.get(node).is_some_and(|p| !p.tx.is_closed());
                 for (client, qos, online) in &group.members {
                     candidates.push(SharedCandidateRef {
@@ -1116,29 +1354,39 @@ impl Hub {
                 }
             }
         }
-        let selected = self.choose_shared_index(&candidates, start)?;
+        let selected = self.choose_shared_index(&candidates, start, prefer_local)?;
         let chosen = &candidates[selected];
         if !chosen.online {
             return None; // Do not turn full-online shedding into offline queueing.
         }
-        let rotation = if self.shared_prefer_local && chosen.node.is_none() {
+        let rotation = if prefer_local && chosen.node.is_none() {
             local_online
         } else {
             candidates.len()
         };
         Some((
             chosen.to_owned_candidate(),
-            (selected + 1) % rotation.max(1),
+            // Site 4b of 4 on the one stored-cursor definition (item 3.4).
+            self.next_stored_cursor(selected + 1, rotation),
         ))
     }
 
     /// The selection policy itself, by index, over either representation (issue
     /// #376): one policy, two candidate shapes (owned for the cold reselect path,
     /// borrowed for the per-publish plan), zero drift.
+    ///
+    /// `prefer_local` is the CALLER's decision for this one message (issue #613
+    /// item 3.4), not a read of the knob: it folds `MQTTD_SHARED_PREFER_LOCAL` and
+    /// the `MQTTD_SHARED_LOCAL_BIAS` window over this group's cursor into one bool,
+    /// computed once per group per message by [`Hub::prefer_local_now`]. False takes
+    /// the local-only branch out of play and selection degrades to
+    /// `rotated().find(online)` — plain global round-robin — which is exactly the
+    /// knob-off behaviour. Every fallback below is untouched either way.
     fn choose_shared_index<T: SharedSelectable>(
         &self,
         candidates: &[T],
         start: usize,
+        prefer_local: bool,
     ) -> Option<usize> {
         let n = candidates.len();
         let rotated = || (0..n).map(move |i| (start + i) % n);
@@ -1152,7 +1400,7 @@ impl Hub {
         // fairness is preserved locally and given up only ACROSS nodes, which is exactly
         // the trade the knob names. Selection remains deterministic and every existing
         // fallback below is untouched: a group with no local member behaves as before.
-        let immediate = if self.shared_prefer_local {
+        let immediate = if prefer_local {
             // Rotate WITHIN the local members, not across the whole list.
             //
             // Locals occupy positions [0, L) and remotes [L, n) — `plan_shared`

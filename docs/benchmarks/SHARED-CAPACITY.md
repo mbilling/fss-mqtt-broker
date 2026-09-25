@@ -97,6 +97,13 @@ subscriber latency SLOs, or evidence that four workers give four times the throu
 
 ## Remaining work before a scaling claim
 
+Broker investigation proceeds independently of bridge changes: see the
+[#613 investigation plan](QOS0-SCALING-PLAN.md) and its first
+[receipt-gated membership probe](MEMBERSHIP-PROBE.md). Neither pilot is TCP scaling
+acceptance evidence. A subsequent [group-first remote index](GROUPED-SHARED-INDEX.md)
+reduces measured hot-thread instruction work without changing admission policy;
+it also does not close the scaling target.
+
 1. Bound/observe the bridge's connected-path queues and expose downstream pressure.
    `spool.max_bytes` bounds the disconnected spool, not the engine's live channels.
 2. Define remote admission/credit semantics if remote spare capacity must be used

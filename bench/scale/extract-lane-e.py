@@ -13,6 +13,15 @@ Crossing = Δ mqttd_publish_forwarded_total (all reasons) / Δ
 mqttd_publish_received_total, for the cluster AND for each broker on its own: an
 aggregate near zero can hide one broker forwarding a large share of its traffic.
 
+Ingress skew (#613) = the busiest broker's Δ received over the mean broker's.
+With shared prefer-local, delivery work follows the PUBLISHER's broker, and the
+only spillover is a full subscriber socket, never a saturated hub. So once the
+busiest broker saturates, the cluster delivers capacity × N / skew, and
+`eff_nodes = N / rx_skew` is the most brokers' worth of work the rung can use.
+Five driver pools over seven brokers at skew 1.4 is five nodes: a flat 5→7 with
+no broker defect. It equals WORK skew only while crossing stays near zero on
+every broker, which is why it sits beside max_broker.
+
 A zero is only a measurement if forwarding was observable (#482). mqttd's
 prometheus-client omits a labelled family that has no children — no HELP, no
 TYPE, no sample — so on a healthy prefer-local run the forwarded family never
@@ -521,6 +530,19 @@ def load_canary(lane: Path, nodes: int) -> dict | None:
     return {"status": want, "count": int(count), "floors": floors, "mainpid": mainpid}
 
 
+def ingress_skew(per_broker: list[dict]) -> tuple[float | None, float | None]:
+    """`(rx_skew, eff_nodes)`: busiest broker's Δ received over the mean, and
+    N / that. A CEILING on useful scale-out under prefer-local, not a
+    saturation measurement — a rung whose busiest broker has headroom is not
+    limited by it yet. `(None, None)` when nothing was received."""
+    rx = [p["received"] for p in per_broker]
+    mean = sum(rx) / len(rx) if rx else 0.0
+    if mean <= 0:
+        return None, None
+    skew = max(rx) / mean
+    return skew, len(rx) / skew
+
+
 def certify(nodes: int, snaps: dict[str, dict[int, dict]], window: dict | None, canary: dict | None) -> str:
     errors: list[str] = []
     if nodes == 1:
@@ -650,6 +672,7 @@ def extract_rung(rdir: Path, canaries: dict | None = None) -> dict:
         bracket_ms = window["max_bracket_ms"]
         bracket_wide = bracket_ms > BRACKET_SHARE * window_s * 1000
     worst = max((p for p in per_broker if p["crossing"] is not None), key=lambda p: p["crossing"])
+    rx_skew, eff_nodes = ingress_skew(per_broker)
 
     before, after = merge_snap(lo), merge_snap(hi)
     lifetime_start = merge_snap(snaps["before"])
@@ -686,6 +709,8 @@ def extract_rung(rdir: Path, canaries: dict | None = None) -> dict:
         "crossing": forwarded / received,
         "max_crossing": worst["crossing"],
         "max_crossing_broker": worst["broker"],
+        "rx_skew": rx_skew,
+        "eff_nodes": eff_nodes,
         "idle_brokers": [p["broker"] for p in per_broker if p["crossing"] is None],
         "per_broker": per_broker,
         "cert": cert,
@@ -741,7 +766,7 @@ def report_rows(rungs: list[dict]) -> list[list[str]]:
     num = lambda v: "—" if v is None else f"{v:.0f}"  # noqa: E731
     rows = [[
         "nodes", "sites", "rep", "control", "offered", "window", "window_s", "bracket_ms", "recv/s", "deliv/s",
-        "deliv/s/node", "win_recv", "life_recv", "life_deliv", "fwd", "crossing", "max_broker", "cert",
+        "deliv/s/node", "win_recv", "life_recv", "life_deliv", "fwd", "crossing", "max_broker", "rx_skew", "eff_nodes", "cert",
         "hub_dispatch_mean", "peer_inflight", "sessions", "broker_idle", "driver_idle", "cpu_window", "settled",
         "drained", "win_drops", "life_drops",
     ]]
@@ -756,7 +781,10 @@ def report_rows(rungs: list[dict]) -> list[list[str]]:
             "—" if r["bracket_ms"] is None else f"{r['bracket_ms']}" + ("!" if r["bracket_wide"] else ""),
             num(r["recv_rate"]), num(r["deliv_rate"]), num(r["per_node_deliv"]),
             f"{r['received']:.0f}", f"{r['lifetime_received']:.0f}", f"{r['lifetime_delivered']:.0f}",
-            f"{r['forwarded']:.0f}", f"{r['crossing'] * 100:.2f}%", worst, r["cert"], format_hub(r),
+            f"{r['forwarded']:.0f}", f"{r['crossing'] * 100:.2f}%", worst,
+            "—" if r["rx_skew"] is None else f"{r['rx_skew']:.2f}",
+            "—" if r["eff_nodes"] is None else f"{r['eff_nodes']:.1f}",
+            r["cert"], format_hub(r),
             f"{r['inflight']:.0f}", f"{r['sessions']:.0f}", format_idle(r["broker_idle"]), format_idle(r["driver_idle"]),
             r["cpu_window"], r["settled"], r["drained"], format_drops(r["drops"]), format_drops(r["lifetime_drops"]),
         ])
@@ -770,6 +798,7 @@ def print_report(rungs: list[dict]) -> None:
         print("  ".join(cell.ljust(w) for cell, w in zip(row, widths)).rstrip())
     print(
         "# crossing = Σ forwarded (all reasons) / Σ received over the window; max_broker = the highest single broker's own ratio\n"
+        "# rx_skew = busiest broker's received / the mean broker's; eff_nodes = nodes / rx_skew, the prefer-local ceiling on usable brokers\n"
         "# cert: structural = nodes=1 with no peer links; canary = the size's forwarding positive control re-derived and still in force;\n"
         "#   canary-unbound = floors held but no window.tsv MainPID ties the rung to the process that passed (not certified)\n"
         "# win_* = steady window; life_* = before -> drain (or after), for the drain-vs-broker delivery check\n"
@@ -1195,6 +1224,19 @@ class WindowTests(unittest.TestCase):
             (rdir / "cpu" / f"cpu-{host}.txt").write_text("\n".join(lines) + "\n")
         return rdir
 
+    def test_ingress_skew_reads_the_busiest_brokers_window(self):
+        # End to end through a CERTIFIED rung: RECV is 600k/400k/300k inside the
+        # window, so broker0 is 600k over a 433,333 mean — and the rung can use
+        # at most ~2.2 of its 3 brokers under prefer-local (#613).
+        with tempfile.TemporaryDirectory() as td:
+            r = extract_rung(self.synthetic_rung(Path(td)))
+            mean = sum(self.RECV.values()) / 3
+            self.assertAlmostEqual(r["rx_skew"], 600_000 / mean)
+            self.assertAlmostEqual(r["eff_nodes"], 3 * mean / 600_000)
+            header, row = report_rows([r])
+            self.assertEqual(row[header.index("rx_skew")], f"{600_000 / mean:.2f}")
+            self.assertEqual(row[header.index("eff_nodes")], f"{3 * mean / 600_000:.1f}")
+
     def test_aligned_rung_reads_each_hosts_window_not_the_lifetime(self):
         with tempfile.TemporaryDirectory() as td:
             r = extract_rung(self.synthetic_rung(Path(td)))
@@ -1447,6 +1489,36 @@ class WindowTests(unittest.TestCase):
             self.assertEqual(rc, 1)
             self.assertIn("sites-1 UNALIGNED; sites-1 cert=canary-unbound", stdout)
 
+class SkewTests(unittest.TestCase):
+    """Ingress skew (#613): under prefer-local the busiest broker bounds the rung."""
+
+    @staticmethod
+    def brokers(rx: list[float]) -> list[dict]:
+        return [{"broker": b, "received": v} for b, v in enumerate(rx)]
+
+    def test_an_even_split_uses_every_broker(self):
+        skew, eff = ingress_skew(self.brokers([60_000] * 5))
+        self.assertAlmostEqual(skew, 1.0)
+        self.assertAlmostEqual(eff, 5.0)
+
+    def test_five_pools_over_seven_brokers_cap_below_seven(self):
+        # Five equal publisher pools over seven brokers, two taking a double
+        # share: the merged total looks healthy, the busiest broker says the
+        # rung can use at most 4.5 brokers' worth of prefer-local work.
+        skew, eff = ingress_skew(self.brokers([v * 30_000 for v in (2, 2, 1, 1, 1, 1, 1)]))
+        self.assertAlmostEqual(skew, 2 / (9 / 7))
+        self.assertAlmostEqual(eff, 4.5)
+
+    def test_the_busiest_broker_is_found_whatever_its_index(self):
+        skew, eff = ingress_skew(self.brokers([10, 10, 40]))
+        self.assertAlmostEqual(skew, 2.0)
+        self.assertAlmostEqual(eff, 1.5)
+
+    def test_no_ingress_is_unknown_not_one(self):
+        self.assertEqual(ingress_skew(self.brokers([0, 0, 0])), (None, None))
+        self.assertEqual(ingress_skew([]), (None, None))
+
+
 class MpstatTests(unittest.TestCase):
     def test_mpstat_rows_across_midnight_stay_in_order(self):
         with tempfile.TemporaryDirectory() as td:
@@ -1499,7 +1571,7 @@ def main(argv: list[str]) -> int:
     if args.self_test:
         loader = unittest.defaultTestLoader
         suite = unittest.TestSuite(
-            loader.loadTestsFromTestCase(case) for case in (ScrapeTests, CertificationTests, WindowTests, MpstatTests)
+            loader.loadTestsFromTestCase(case) for case in (ScrapeTests, CertificationTests, WindowTests, SkewTests, MpstatTests)
         )
         result = unittest.TextTestRunner(verbosity=2).run(suite)
         return 0 if result.wasSuccessful() else 1

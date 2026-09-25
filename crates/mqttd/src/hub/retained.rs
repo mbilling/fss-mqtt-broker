@@ -718,7 +718,10 @@ impl Hub {
             let id = self.register_pending(done, &topic, &payload, qos, true, message_expiry, &app);
             if let Some(p) = self.pending_publishes.get_mut(id) {
                 p.local_done = true;
-                p.awaiting_settle = false;
+                // BOTH settle holds, through the one method that clears them
+                // together: clearing only `awaiting_settle` retires the entry
+                // with its ack still held — a silent withhold (issue #613).
+                p.leave_settle_window();
             }
             self.route_retained_commit(
                 &topic,
