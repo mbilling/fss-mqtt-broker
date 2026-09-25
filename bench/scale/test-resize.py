@@ -91,6 +91,18 @@ class Rig(unittest.TestCase):
                               capture_output=True, env=self.env | (env or {}))
 
 
+class ExecutableTests(unittest.TestCase):
+    def test_every_script_the_rig_executes_directly_is_executable(self):
+        # run.sh exports LANE_E_SWAP_HOOK=replace-node.sh and run-curve.sh runs it
+        # as a program; on 2026-09-25 it was committed 0644 and the paid launch
+        # died in preflight. The other tests here call scripts through bash, so
+        # nothing else would notice.
+        for name in ("replace-node.sh", "resize-cluster.sh", "482-per-node-knee.sh", "482-knee-smoke.sh",
+                     "bootstrap-cluster.sh", "run-curve.sh", "run.sh", "collect.sh", "teardown.sh"):
+            with self.subTest(script=name):
+                self.assertTrue(os.access(SCALE / name, os.X_OK), f"{name} is not executable")
+
+
 class ResizeTests(Rig):
     def resize(self, size, new_run, inv=None, env=None):
         return self.run_script(self.rig / "resize-cluster.sh", inv or self.full, size, new_run, env=env)
