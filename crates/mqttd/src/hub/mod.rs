@@ -12970,6 +12970,73 @@ mod tests {
         }
     }
 
+    /// Play the retained OWNER on `peer` until `want` DISTINCT mutations have
+    /// arrived, acking each one as a real owner does.
+    ///
+    /// A repeated seq is the sender's retransmission of a handoff it has not yet
+    /// seen acked: `retry_retained_handoff` re-sends the unanswered handoff under
+    /// the SAME seq on every sweep tick (ADR 0037 T8, keep-until-ack), and the owner
+    /// dedups it and re-acks. Recording it again was a TEST bug: whenever a sweep
+    /// tick fell between a handoff and its ack, the old loop read `v1` twice and
+    /// failed "queue order held" — ~7% of isolated runs, more under a loaded
+    /// `cargo test`, identically on `main`.
+    ///
+    /// With `hold_first_ack`, the first new mutation's ack is withheld across two
+    /// sweep intervals (paused clock only), which forces that retransmission to
+    /// happen. Returns the mutations in arrival order and how many retransmissions
+    /// were seen.
+    async fn own_retained_handoffs(
+        tx: &HubTx,
+        peer: &mut mpsc::UnboundedReceiver<PeerMessage>,
+        topic: &str,
+        want: usize,
+        hold_first_ack: bool,
+    ) -> (Vec<Vec<u8>>, usize) {
+        let mut got: Vec<(u64, Vec<u8>)> = Vec::new();
+        let mut retransmissions = 0;
+        let mut hold = hold_first_ack;
+        while got.len() < want {
+            match recv_peer(peer).await {
+                Some(PeerMessage::RetainedCommit {
+                    topic: t,
+                    payload,
+                    seq,
+                    ..
+                }) => {
+                    assert_eq!(t, topic);
+                    let nth = if let Some(i) = got.iter().position(|(s, _)| *s == seq) {
+                        assert_eq!(
+                            got[i].1, payload,
+                            "a repeated seq must be a retransmission of the SAME mutation"
+                        );
+                        retransmissions += 1;
+                        i + 1
+                    } else {
+                        got.push((seq, payload));
+                        got.len()
+                    };
+                    if std::mem::take(&mut hold) {
+                        tokio::time::advance(super::SESSION_SWEEP_INTERVAL * 2).await;
+                        continue;
+                    }
+                    // Acknowledge the commit so the sender releases the next one.
+                    tx.send(HubCommand::RemoteRetainedCommitAck {
+                        node: NodeId("n".into()),
+                        seq,
+                        token: Some((1, nth as u64)),
+                    })
+                    .unwrap();
+                }
+                Some(PeerMessage::Interest { .. } | PeerMessage::RetainedDigest { .. }) => {}
+                other => panic!("unexpected peer frame {other:?}"),
+            }
+        }
+        (
+            got.into_iter().map(|(_, payload)| payload).collect(),
+            retransmissions,
+        )
+    }
+
     /// ADR 0037 §5: a retained mutation whose group owner is unreachable **queues**
     /// (never silently dropped); when the owner's link comes up the queue drains to
     /// it in publish order.
@@ -13016,33 +13083,72 @@ mod tests {
         // handoff at a time: each next mutation flows only after the previous one's
         // commit-gated ack (T8 keep-until-ack pacing).
         let mut peer = connect_peer(&tx, "n", 1);
-        let mut got = Vec::new();
-        while got.len() < 2 {
-            match recv_peer(&mut peer).await {
-                Some(PeerMessage::RetainedCommit {
-                    topic: t,
-                    payload,
-                    seq,
-                    ..
-                }) => {
-                    assert_eq!(t, topic);
-                    got.push(payload);
-                    // Acknowledge the commit so the sender releases the next one.
-                    tx.send(HubCommand::RemoteRetainedCommitAck {
-                        node: NodeId("n".into()),
-                        seq,
-                        token: Some((1, got.len() as u64)),
-                    })
-                    .unwrap();
-                }
-                Some(PeerMessage::Interest { .. } | PeerMessage::RetainedDigest { .. }) => {}
-                other => panic!("unexpected peer frame {other:?}"),
-            }
-        }
+        let (got, _) = own_retained_handoffs(&tx, &mut peer, &topic, 2, false).await;
         assert_eq!(
             got,
             vec![b"v1".to_vec(), b"v2".to_vec()],
             "queue order held"
+        );
+    }
+
+    /// The race the owner above must survive, FORCED: a sweep tick lands while
+    /// `v1`'s handoff is unanswered, so the owner receives `v1` twice under one seq
+    /// before it acks. Order must still read `v1, v2`, and the duplicate must be
+    /// a retransmission of the same mutation rather than a second one.
+    ///
+    /// Fails if the owner simulation records a repeated seq as a new mutation:
+    /// `[v1, v1]` — exactly the intermittent failure of the test above, made
+    /// deterministic with a paused clock.
+    #[tokio::test(start_paused = true)]
+    async fn a_handoff_retransmitted_before_its_ack_is_not_a_second_mutation() {
+        let (tx, durable, placement) = start_hub_with_durable_retained(&["n"]);
+        let topic = {
+            let p = placement.read().unwrap();
+            (0..100_000)
+                .map(|i| format!("dev/{i}/state"))
+                .find(|t| p.owner(t) == NodeId("n".into()))
+                .expect("some topic is owned by the peer")
+        };
+
+        // The owner is NOT linked: both mutations queue (nothing to observe yet).
+        tx.send(HubCommand::Publish {
+            topic: topic.clone(),
+            payload: Bytes::from_static(b"v1"),
+            qos: QoS::AtMostOnce,
+            retain: true,
+            message_expiry: None,
+            app: AppProperties::default(),
+            done: None,
+            v5: false,
+            publisher: None,
+        })
+        .unwrap();
+        tx.send(HubCommand::Publish {
+            topic: topic.clone(),
+            payload: Bytes::from_static(b"v2"),
+            qos: QoS::AtMostOnce,
+            retain: true,
+            message_expiry: None,
+            app: AppProperties::default(),
+            done: None,
+            v5: false,
+            publisher: None,
+        })
+        .unwrap();
+        // No local durable write for a foreign topic while queued.
+        assert!(durable.get(&topic).await.unwrap().is_none());
+
+        let mut peer = connect_peer(&tx, "n", 1);
+        let (got, retransmissions) = own_retained_handoffs(&tx, &mut peer, &topic, 2, true).await;
+        assert_eq!(
+            got,
+            vec![b"v1".to_vec(), b"v2".to_vec()],
+            "queue order held across a retransmitted handoff"
+        );
+        assert!(
+            retransmissions >= 1,
+            "fixture invariant: withholding the ack across a sweep must provoke a \
+             retransmission, or this test is not exercising the race"
         );
     }
 

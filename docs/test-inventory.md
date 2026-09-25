@@ -929,7 +929,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 449 test(s)
+## `crates/mqttd/src/lib.rs` — 450 test(s)
 
 - `admission::tests::the_global_cap_refuses_at_the_bound_and_recovers`
 - `admission::tests::the_penalty_box_refuses_after_the_threshold`
@@ -1137,6 +1137,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::a_full_append_lane_withholds_the_publisher_and_reorders_nothing`
 - `hub::tests::a_group_with_no_committed_lease_is_never_rehomed`
 - `hub::tests::a_handoff_is_retransmitted_until_the_owner_acks`
+- `hub::tests::a_handoff_retransmitted_before_its_ack_is_not_a_second_mutation`
 - `hub::tests::a_large_retained_set_is_chunked_under_the_frame_budget`
 - `hub::tests::a_live_qos1_delivery_to_a_clean_session_writes_nothing`
 - `hub::tests::a_live_qos1_delivery_to_a_persistent_subscriber_is_durable_until_acked`
