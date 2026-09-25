@@ -253,11 +253,13 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `two_bridge_instances_do_not_duplicate_forwarding`
 - `two_partitioned_instances_deliver_each_inbound_message_exactly_once`
 
-## `crates/mqtt-cluster/src/lib.rs` — 293 test(s)
+## `crates/mqtt-cluster/src/lib.rs` — 296 test(s)
 
 - `cluster_identity::tests::a_founder_mints_once_and_reloads_stably`
 - `cluster_identity::tests::a_joiner_adopts_once_and_persists`
 - `cluster_identity::tests::two_foundings_yield_distinct_ids`
+- `cluster_log::tests::a_catch_up_back_fill_never_plants_a_dipping_tag`
+- `cluster_log::tests::a_dropped_same_epoch_tail_still_bounds_the_next_seq`
 - `cluster_log::tests::a_durable_session_log_survives_a_full_restart_via_persisted_replicas`
 - `cluster_log::tests::a_failed_pipelined_append_fails_the_staged_tail_and_leaves_no_hole`
 - `cluster_log::tests::a_foreign_replica_schema_version_fails_closed`
@@ -275,6 +277,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `cluster_log::tests::append_commits_at_quorum_without_waiting_on_a_wedged_replica`
 - `cluster_log::tests::append_is_quorum_durable_and_assigns_offsets`
 - `cluster_log::tests::append_survives_single_replica_loss`
+- `cluster_log::tests::appends_acked_after_a_same_epoch_rebuild_survive_the_next_recovery`
 - `cluster_log::tests::apply_batch_applies_in_order_with_a_trailing_truncate`
 - `cluster_log::tests::apply_batch_fences_stale_ops_in_slice_order`
 - `cluster_log::tests::apply_batch_of_one_equals_apply`

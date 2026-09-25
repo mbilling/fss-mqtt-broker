@@ -85,8 +85,8 @@ mod mesh;
 /// work stays removed.
 #[cfg(test)]
 mod probe;
-/// The pure ack-honesty rules a gated publish passes through (issue #613 items
-/// 2.1 and 2.4).
+/// The pure settle-gate ack rule a gated publish passes through (issue #613
+/// item 2.1).
 mod settle;
 
 /// Maximum number of queued messages replayed to a reconnecting session at once.

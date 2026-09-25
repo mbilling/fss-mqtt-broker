@@ -24,7 +24,9 @@
 //!   without standing up the consensus group; the openraft-backed source is wired in
 //!   at step 4f.
 
-use crate::cluster_log::{merge_replica_logs, ClusterLog, ReplicaState, ReplicaTransport};
+use crate::cluster_log::{
+    merge_replica_logs_tagged, ClusterLog, EpochEntry, ReplicaState, ReplicaTransport,
+};
 use crate::lease::{Epoch, OwnershipLease};
 use crate::lease_raft::{GroupId, RaftNodeId};
 use crate::lease_store::LeaseStore;
@@ -361,7 +363,7 @@ impl<S: LeaseSource, T: ReplicaTransport + Clone + 'static> GroupRoutedLog<S, T>
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .contains(key);
         if recover {
-            let (recovered, floor) = self.recover_key(key, &replica_set).await?;
+            let (recovered, floor, reads_high) = self.recover_key(key, &replica_set).await?;
             // Re-commit the recovered base to a write quorum at the new epoch
             // BEFORE serving or appending (ADR 0042 T6, exhibit ②): a merge can
             // adopt a single-replica orphan, and building on it un-replicated lets
@@ -370,8 +372,16 @@ impl<S: LeaseSource, T: ReplicaTransport + Clone + 'static> GroupRoutedLog<S, T>
             // floor keeps the offset space above every read replica's durable
             // truncation watermark (the exhibit's second face: an empty merge
             // must not restart a truncated queue's offsets at 1).
-            entry.log.recommit_key(key, &recovered).await?;
-            entry.log.seed_key(key, recovered, floor).await;
+            let recovered = entry.log.recommit_tagged(key, &recovered).await?;
+            // Continue above every seq this epoch has already used for the key, in
+            // ANY read — including a tail the merge dropped (#634). Under a new
+            // epoch nothing qualifies and the counter continues from the re-commit
+            // as before; under the same epoch (a replica-set rebuild) this is what
+            // keeps the next append from being stamped below tags already on disk.
+            let seq_floor = reads_high
+                .filter(|(e, _)| *e == epoch)
+                .map_or(0, |(_, s)| s);
+            entry.log.seed_key(key, recovered, floor, seq_floor).await;
             entry
                 .recovered
                 .lock()
@@ -393,7 +403,7 @@ impl<S: LeaseSource, T: ReplicaTransport + Clone + 'static> GroupRoutedLog<S, T>
         &self,
         key: &str,
         replica_set: &[NodeId],
-    ) -> Result<(Vec<LogEntry>, Offset), ReplError> {
+    ) -> Result<(Vec<EpochEntry>, Offset, Option<(Epoch, u64)>), ReplError> {
         let quorum = replica_set.len() / 2 + 1;
         let enough = |reads: &[crate::cluster_log::ReplicaRead]| {
             reads.len() >= quorum && reads.iter().any(|r| r.complete)
@@ -460,7 +470,11 @@ impl<S: LeaseSource, T: ReplicaTransport + Clone + 'static> GroupRoutedLog<S, T>
         // applies it to the entries; the caller also needs it to keep the key's
         // offset space above it (ADR 0042 T6).
         let floor = reads.iter().map(|r| r.watermark).max().unwrap_or(0);
-        Ok((merge_replica_logs(&reads), floor))
+        Ok((
+            merge_replica_logs_tagged(&reads),
+            floor,
+            highest_tag(&reads),
+        ))
     }
 
     /// The issue #390 fallback of [`recover_key`](Self::recover_key): the full-roster
@@ -478,7 +492,7 @@ impl<S: LeaseSource, T: ReplicaTransport + Clone + 'static> GroupRoutedLog<S, T>
         key: &str,
         replica_set: &[NodeId],
         mut reads: Vec<crate::cluster_log::ReplicaRead>,
-    ) -> Result<(Vec<LogEntry>, Offset), ReplError> {
+    ) -> Result<(Vec<EpochEntry>, Offset, Option<(Epoch, u64)>), ReplError> {
         let Some((known, unknown)) = self
             .placement
             .read()
@@ -515,7 +529,7 @@ impl<S: LeaseSource, T: ReplicaTransport + Clone + 'static> GroupRoutedLog<S, T>
             return Err(ReplError::NoQuorum);
         }
         let floor = reads.iter().map(|r| r.watermark).max().unwrap_or(0);
-        let merged = merge_replica_logs(&reads);
+        let merged = merge_replica_logs_tagged(&reads);
         // Union gap check: the merge stops at a gap; anything any read holds above
         // the served prefix would then be silently truncated. After a full sweep
         // that is genuine loss — refuse.
@@ -535,8 +549,19 @@ impl<S: LeaseSource, T: ReplicaTransport + Clone + 'static> GroupRoutedLog<S, T>
              replica set was all-hollow; history recovered read-only from former \
              holders and will re-commit at this owner's epoch"
         );
-        Ok((merged, floor))
+        let high = highest_tag(&reads);
+        Ok((merged, floor, high))
     }
+}
+
+/// The highest `(epoch, seq)` held by ANY read entry, dropped tails included — the
+/// floor a same-epoch recovery's next append must clear (issue #634).
+fn highest_tag(reads: &[crate::cluster_log::ReplicaRead]) -> Option<(Epoch, u64)> {
+    reads
+        .iter()
+        .flat_map(|r| r.entries.iter())
+        .map(|e| (e.epoch, e.seq))
+        .max()
 }
 
 #[async_trait]
@@ -557,8 +582,11 @@ impl<S: LeaseSource, T: ReplicaTransport + Clone + 'static> crate::durable_plane
                 return;
             }
         };
-        let entries = log.committed_entries(key).await;
-        if let Err(e) = log.recommit_key(key, &entries).await {
+        // At each entry's existing tag (#634): a lower same-epoch re-tag would be
+        // dropped as stale where the entry exists and would plant a dip where it
+        // does not — the back-filled copy's own log would then cut at the dip.
+        let entries = log.committed_entries_tagged(key).await;
+        if let Err(e) = log.recommit_tagged(key, &entries).await {
             tracing::debug!(key, error = ?e, "catch-up: re-commit fell short of quorum; requester will retry");
             return;
         }
