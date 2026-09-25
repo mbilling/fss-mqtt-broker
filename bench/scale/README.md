@@ -276,6 +276,11 @@ supported broker snapshots without detected counter resets. Lazily absent sample
 can mean zero, but missing/failed scrapes cannot. `python3 extract-lane-e.py
 <run>/results` reports invalid input with a nonzero exit. Its totals include
 ramp/drain; it does not repair Lane E's existing measurement-window mismatch.
+It also prints per-broker ingress and crossing, and `rx_skew` (busiest broker's
+Δ received over the mean) with `eff_nodes = N / rx_skew`. Under shared
+prefer-local, delivery work follows the publisher's broker and nothing sheds on
+hub saturation, so `eff_nodes` is a ceiling on how many brokers a rung can use:
+read it before attributing a flat N=5→7 to the broker.
 The card separates matched-total-load comparisons from capacity knees and provides
 `bash ./482-smoke.sh` to prove teardown without inheriting the full campaign shape.
 

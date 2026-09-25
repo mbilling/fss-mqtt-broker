@@ -12,6 +12,15 @@ Crossing = Δ mqttd_publish_forwarded_total / Δ mqttd_publish_received_total.
 Lazily absent forwarded samples mean zero only in complete, validated snapshots
 that declare the counter. Missing scrapes, unsupported counters and resets are
 INVALID, never zero crossing. Totals include ramp/drain, not steady throughput.
+
+Ingress skew = busiest broker's Δ received / mean broker Δ received (#613).
+With shared prefer-local, delivery work follows the PUBLISHER's broker, and the
+only spillover is a full subscriber socket, never a saturated hub. So once the
+busiest broker saturates, the cluster delivers capacity × N / skew: the
+`eff_nodes = N / skew` column is how many brokers' worth of work the rung could
+ever use. N=7 at skew 1.4 is five nodes — a flat 5→7 with no broker defect.
+Per-broker crossing is printed beside it: ingress skew only equals WORK skew
+while forwarding stays near zero on every broker, not merely on average.
 """
 from __future__ import annotations
 
@@ -161,6 +170,7 @@ def extract_rung(rdir: Path) -> dict:
     if received <= 0:
         raise ValueError("no positive received delta; crossing is unknown")
     crossing = forwarded / received
+    per_node = per_broker(starts, ends)
     hub_sum = by_label(after, "mqttd_hub_dispatch_seconds_sum", "command")
     hub_sum_b = by_label(before, "mqttd_hub_dispatch_seconds_sum", "command")
     hub_n = by_label(after, "mqttd_hub_dispatch_seconds_count", "command")
@@ -205,7 +215,44 @@ def extract_rung(rdir: Path) -> dict:
         "driver_idle": mean_idle(rdir, "driver"),
         "settled": meta.get("settled", "—"),
         "drained": meta.get("drained", "—"),
+        "per_node": per_node,
+        **skew(per_node),
     }
+
+
+def per_broker(starts: dict[str, dict], ends: dict[str, dict]) -> dict[str, dict]:
+    """Δ received and Δ forwarded for EACH broker, before any merge.
+
+    The merged totals answer "how much did the cluster take"; they cannot say
+    which broker took it, and under prefer-local that is the question.
+    """
+    # `load_snap` keys brokers by the tail of the file name ("0.prom"); strip it
+    # here rather than change a key other callers already rely on.
+    def index(key: str) -> str:
+        return key.removesuffix(".prom")
+
+    out = {}
+    for broker in sorted(starts, key=lambda k: int(index(k))):
+        rx = delta(starts[broker], ends[broker], "mqttd_publish_received_total")
+        fx = delta(starts[broker], ends[broker], "mqttd_publish_forwarded_total")
+        out[index(broker)] = {"received": rx, "forwarded": fx, "crossing": fx / rx if rx > 0 else None}
+    return out
+
+
+def skew(per_node: dict[str, dict]) -> dict:
+    """Busiest-over-mean ingress, and the broker count that implies.
+
+    `eff_nodes` is N / skew: the number of brokers' worth of work the rung can
+    use once its busiest broker saturates. It is a CEILING on useful scale-out
+    under prefer-local, not a measurement of saturation — a rung whose busiest
+    broker still has headroom is not limited by it yet.
+    """
+    rx = [n["received"] for n in per_node.values()]
+    mean = sum(rx) / len(rx) if rx else 0.0
+    if mean <= 0:
+        return {"rx_skew": None, "eff_nodes": None}
+    s = max(rx) / mean
+    return {"rx_skew": s, "eff_nodes": len(rx) / s}
 
 
 def find_rungs(root: Path) -> list[Path]:
@@ -231,7 +278,8 @@ def format_hub(r: dict) -> str:
 def print_report(rungs: list[dict]) -> None:
     print(
         "nodes  sites  offered  received  forwarded  crossing  "
-        "hub_dispatch_mean  peer_inflight  sessions  broker_idle  driver_idle  settled  drained"
+        "hub_dispatch_mean  peer_inflight  sessions  broker_idle  driver_idle  settled  drained  "
+        "rx_skew  eff_nodes"
     )
     for r in rungs:
         nodes = "—"
@@ -245,8 +293,25 @@ def print_report(rungs: list[dict]) -> None:
             f"{nodes:>5}  {str(r['sites']):>5}  {str(r['offered']):>7}  "
             f"{r['received']:.0f}  {r['forwarded']:.0f}  {format_crossing(r):<28}  "
             f"{format_hub(r):<40}  {r['inflight']:.0f}  {r['sessions']:.0f}  "
-            f"{r['broker_idle']:>11}  {r['driver_idle']:>11}  {r['settled']}  {r['drained']}{drops}"
+            f"{r['broker_idle']:>11}  {r['driver_idle']:>11}  {r['settled']}  {r['drained']}  "
+            f"{format_skew(r)}{drops}"
         )
+        print("       per-broker " + format_per_node(r))
+
+
+def format_skew(r: dict) -> str:
+    if r["rx_skew"] is None:
+        return "—  —"
+    return f"{r['rx_skew']:.2f}  {r['eff_nodes']:.1f}"
+
+
+def format_per_node(r: dict) -> str:
+    """`b<i>=<Δreceived>/<crossing%>` per broker, in broker order."""
+    cells = []
+    for broker, n in r["per_node"].items():
+        x = "—" if n["crossing"] is None else f"{n['crossing'] * 100:.1f}%"
+        cells.append(f"b{broker}={n['received']:.0f}/{x}")
+    return " ".join(cells)
 
 
 class ExtractTests(unittest.TestCase):
@@ -352,13 +417,72 @@ class ExtractTests(unittest.TestCase):
             self.assertEqual(r["received"], 10)
 
 
+class SkewTests(unittest.TestCase):
+    """Ingress skew (#613 candidate 3): the busiest broker bounds prefer-local."""
+
+    @staticmethod
+    def _rung(root: Path, nodes: int, per_node_rx: list[int], per_node_fx: list[int] | None = None) -> Path:
+        rdir = root / f"nodes={nodes}/laneE/sites-10"
+        rdir.mkdir(parents=True)
+        fx = per_node_fx or [0] * nodes
+        for i in range(nodes):
+            (rdir / f"metrics-before-broker{i}.prom").write_text(
+                "mqttd_publish_received_total 0\nmqttd_publish_forwarded_total 0\n"
+            )
+            (rdir / f"metrics-after-broker{i}.prom").write_text(
+                f"mqttd_publish_received_total {per_node_rx[i]}\n"
+                f"mqttd_publish_forwarded_total {fx[i]}\n"
+            )
+        return rdir
+
+    def test_an_even_split_uses_every_broker(self):
+        with tempfile.TemporaryDirectory() as td:
+            r = extract_rung(self._rung(Path(td), 5, [60_000] * 5))
+            self.assertAlmostEqual(r["rx_skew"], 1.0)
+            self.assertAlmostEqual(r["eff_nodes"], 5.0)
+
+    def test_five_drivers_over_seven_brokers_cap_below_seven(self):
+        # The shape that voided the old ladders: five equal publisher pools
+        # landing on seven brokers, two of which take a double share. The
+        # merged total looks healthy; the busiest broker says the rung can use
+        # at most 4.5 brokers' worth of prefer-local work.
+        with tempfile.TemporaryDirectory() as td:
+            rx = [2, 2, 1, 1, 1, 1, 1]
+            r = extract_rung(self._rung(Path(td), 7, [v * 30_000 for v in rx]))
+            self.assertAlmostEqual(r["rx_skew"], 2 / (9 / 7))
+            self.assertAlmostEqual(r["eff_nodes"], 4.5)
+            self.assertLess(r["eff_nodes"], 5.0)
+
+    def test_crossing_is_judged_per_broker_not_on_the_aggregate(self):
+        # 1% crossing overall hides one broker forwarding a fifth of its
+        # ingress. Ingress skew equals WORK skew only when every broker is
+        # near zero, so the per-broker figure is the one that decides it.
+        with tempfile.TemporaryDirectory() as td:
+            r = extract_rung(self._rung(Path(td), 5, [100_000] * 5, [0, 0, 0, 0, 5_000]))
+            self.assertAlmostEqual(r["crossing"], 0.01)
+            self.assertAlmostEqual(r["per_node"]["4"]["crossing"], 0.05)
+            self.assertEqual(r["per_node"]["0"]["crossing"], 0.0)
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                print_report([r])
+            self.assertIn("b4=100000/5.0%", out.getvalue())
+
+    def test_the_busiest_broker_is_found_whatever_its_index(self):
+        with tempfile.TemporaryDirectory() as td:
+            r = extract_rung(self._rung(Path(td), 3, [10, 10, 40]))
+            self.assertAlmostEqual(r["rx_skew"], 2.0)
+            self.assertAlmostEqual(r["eff_nodes"], 1.5)
+
+
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n", 1)[0])
     parser.add_argument("results", nargs="?", type=Path, help="run dir or results/ tree")
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args(argv)
     if args.self_test:
-        suite = unittest.defaultTestLoader.loadTestsFromTestCase(ExtractTests)
+        suite = unittest.TestSuite(
+            unittest.defaultTestLoader.loadTestsFromTestCase(case) for case in (ExtractTests, SkewTests)
+        )
         result = unittest.TextTestRunner(verbosity=2).run(suite)
         return 0 if result.wasSuccessful() else 1
     if args.results is None:

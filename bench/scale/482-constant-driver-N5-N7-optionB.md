@@ -101,6 +101,12 @@ never ran. Do not spend another fleet hour until this list is green.
 - [ ] Side-by-side N=5 vs N=7 table at matched site rungs (offered, received,
       delivered, crossing %, per-node delivered, broker idle, hub publish µs,
       driver idle) **before** claiming membership cost.
+- [ ] `rx_skew` / `eff_nodes` on both arms (#613). Five driver pools divide
+      evenly over five brokers and not over seven; under prefer-local that alone
+      caps N=7 near N=5. A flat 5→7 with `eff_nodes` ≈ 5 at N=7 is a placement
+      result, not a broker one. The local gated A/B
+      (`docs/benchmarks/MEMBERSHIP-GATED-AB.md`) already bounds the O(peers)
+      per-message term at ~4% for 5→7.
 
 ## Offline preflight
 
@@ -155,6 +161,8 @@ Per size, per rung (`results/nodes=$N/laneE/sites-*`):
 | broker received | Δ `mqttd_publish_received_total` before→after (or drain) |
 | drain recv | subscriber `.drain` totals; must match broker received within the usual slack |
 | crossing | Δ forwarded / Δ received, only with complete supported snapshots and no detected resets; otherwise INVALID |
+| per-broker ingress / crossing | Δ received and Δ forwarded **per broker** (`extract-lane-e.py` per-broker line); ≈0% crossing on EVERY broker, not only on average |
+| ingress skew | `rx_skew` = busiest broker Δ received / mean; `eff_nodes` = N / `rx_skew` — the prefer-local ceiling on usable brokers |
 | hub dispatch | Δ `mqttd_hub_dispatch_seconds_{sum,count}` **by `command`** |
 | peer in-flight / drops | `mqttd_peer_forwards_in_flight` at drain/after; `mqttd_publish_dropped_total` by reason |
 | sessions after drain | `mqttd_sessions` / `mqttd_connections_active` at drain/after |
