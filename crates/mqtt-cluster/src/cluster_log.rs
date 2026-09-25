@@ -1126,6 +1126,18 @@ impl<T: ReplicaTransport + ?Sized> ReplicaTransport for std::sync::Arc<T> {
 struct KeyState {
     /// Leader's copy (may hold an uncommitted pipelined tail above `committed`).
     entries: BTreeMap<Offset, Vec<u8>>,
+    /// The `seq` each held entry was written or re-committed under at THIS log's
+    /// epoch (issue #634), maintained beside `entries` at every insert and removal.
+    ///
+    /// A same-epoch re-delivery — the replica-set rebuild's re-commit, the ADR 0043
+    /// catch-up back-fill, the decommission hand-off — must re-send an entry at the
+    /// tag it already carries, never lower. A replica treats a same-offset write at
+    /// a lower `(epoch, seq)` as a stale attempt and drops it while still acking it
+    /// (`is_stale_attempt`), so a lower re-tag silently does nothing on replicas that
+    /// hold the entry and plants a DIPPING tag on replicas that did not — and the
+    /// recovery merge cuts a copy at its first dip as "a deposed owner's orphan
+    /// tail". That is how acked `QoS` 1 publishes were lost in #634.
+    tags: BTreeMap<Offset, u64>,
     /// Highest quorum-durable offset. Reads never expose beyond this.
     committed: Offset,
     /// Entries with offset `<= truncated` have been dropped.
@@ -1365,6 +1377,7 @@ impl<T: ReplicaTransport> ClusterLog<T> {
                 // The re-commit convention (ADR 0042 T7): recovered entries were
                 // re-delivered with seqs 1..=n, so appends continue above them.
                 ks.seq += 1;
+                ks.tags.insert(entry.offset, ks.seq);
             }
             ks.truncated = lowest.map_or(0, |l| l.saturating_sub(1));
             ks.assigned = ks.committed;
@@ -1407,8 +1420,14 @@ impl<T: ReplicaTransport> ClusterLog<T> {
     /// acked write at or below some replica's durable truncation watermark — and
     /// any later recovery reading that replica silently drops those offsets. The
     /// key's offset space is monotonic across owners, truncation included.
-    pub async fn seed_key(&self, key: &str, entries: Vec<LogEntry>, floor: Offset) {
-        if entries.is_empty() && floor == 0 {
+    pub async fn seed_key(
+        &self,
+        key: &str,
+        entries: Vec<EpochEntry>,
+        floor: Offset,
+        seq_floor: u64,
+    ) {
+        if entries.is_empty() && floor == 0 && seq_floor == 0 {
             return;
         }
         let mut state = self.state.lock().await;
@@ -1421,10 +1440,17 @@ impl<T: ReplicaTransport> ClusterLog<T> {
             lowest = Some(lowest.map_or(entry.offset, |l| l.min(entry.offset)));
             ks.committed = ks.committed.max(entry.offset);
             ks.entries.insert(entry.offset, entry.record);
-            // The re-commit convention (ADR 0042 T7): recovered entries were
-            // re-delivered with seqs 1..=n, so appends continue above them.
-            ks.seq += 1;
+            // Each entry keeps the tag `recommit_tagged` re-delivered it under, so a
+            // later catch-up re-sends it at that tag rather than a lower one (#634).
+            ks.tags.insert(entry.offset, entry.seq);
+            ks.seq = ks.seq.max(entry.seq);
         }
+        // Continue ABOVE every seq this epoch has already used for the key — including
+        // ones only a replica still holds (#634). Counting the recovered entries was
+        // right only when recovery ran at a NEW epoch, where any seq outranks the old
+        // tags; a replica-set rebuild recovers at the SAME epoch, and counting from `n`
+        // stamped the next appends below the tags already on disk.
+        ks.seq = ks.seq.max(seq_floor);
         // Recovered entries all sit above `floor` (the merge dropped anything at
         // or below it), so both watermarks are at least `floor`.
         ks.committed = ks.committed.max(floor);
@@ -1450,6 +1476,61 @@ impl<T: ReplicaTransport> ClusterLog<T> {
             .collect()
     }
 
+    /// The tag every entry of a re-delivered base carries at THIS epoch (issue
+    /// #634) — one rule for the rebuild's re-commit, the catch-up back-fill and the
+    /// decommission hand-off, so none of them can disagree.
+    ///
+    /// An entry already tagged at this epoch keeps its seq; everything else (an
+    /// older epoch's copy, or an entry whose tag is unknown) takes the next seq in
+    /// offset order, which is the ADR 0042 T7 takeover convention unchanged. Either
+    /// way the result is strictly increasing along offsets, raising a seq only where
+    /// it must — so the re-delivered copy is exactly as ordered as the one it
+    /// replaces, never dips, and never outranks a later in-flight append the way
+    /// re-tagging ABOVE the counter would.
+    #[must_use]
+    pub fn retag(&self, entries: &[EpochEntry]) -> Vec<EpochEntry> {
+        let mut prev = 0u64;
+        entries
+            .iter()
+            .map(|e| {
+                let seq = if e.epoch == self.lease.epoch {
+                    e.seq.max(prev + 1)
+                } else {
+                    prev + 1
+                };
+                prev = seq;
+                EpochEntry {
+                    epoch: self.lease.epoch,
+                    seq,
+                    offset: e.offset,
+                    record: e.record.clone(),
+                }
+            })
+            .collect()
+    }
+
+    /// [`committed_entries`](Self::committed_entries) with each entry's tag at this
+    /// epoch (issue #634) — what a same-epoch re-delivery must re-send. An entry with
+    /// no recorded tag reads as epoch 0, which `recommit_tagged` numbers in order.
+    pub async fn committed_entries_tagged(&self, key: &str) -> Vec<EpochEntry> {
+        let state = self.state.lock().await;
+        let Some(ks) = state.get(key) else {
+            return Vec::new();
+        };
+        ks.entries
+            .range(..=ks.committed)
+            .map(|(offset, record)| {
+                let seq = ks.tags.get(offset).copied();
+                EpochEntry {
+                    epoch: seq.map_or(0, |_| self.lease.epoch),
+                    seq: seq.unwrap_or(0),
+                    offset: *offset,
+                    record: record.clone(),
+                }
+            })
+            .collect()
+    }
+
     /// The owner's truncation low-water for `key` (`0` if untracked) — a catch-up
     /// re-commit fans this to the replicas too (ADR 0043 P1): a back-filled copy
     /// whose history starts above 1 is only gap-free once its watermark says the
@@ -1464,34 +1545,26 @@ impl<T: ReplicaTransport> ClusterLog<T> {
 
     /// Re-commit `key`'s committed log to ONE node (ADR 0043 P3): the
     /// decommission hand-off. Every committed entry is re-delivered to `target`
-    /// re-tagged at this owner's epoch with seqs `1..=n` in offset order (the
-    /// recommit convention, ADR 0042 T7 — a target already holding an offset at
-    /// a higher `(epoch, seq)` keeps its version), followed by the truncation
+    /// at [`retag`](Self::retag)'s tag — the tag it already carries at this epoch,
+    /// or the next seq in offset order under a new one (issue #634; a target
+    /// already holding an offset at a higher `(epoch, seq)` keeps its version),
+    /// followed by the truncation
     /// floor so an acked-away prefix reads as truncated, not missing. Additive
     /// and best-effort: no quorum gate — the requesting drain verifies by
     /// reading the target back, and re-asks while its content falls short.
     pub async fn recommit_key_to(&self, key: &str, target: &NodeId) {
-        let (entries, floor) = {
-            let state = self.state.lock().await;
-            match state.get(key) {
-                Some(ks) => (
-                    ks.entries
-                        .range(..=ks.committed)
-                        .map(|(offset, record)| LogEntry {
-                            offset: *offset,
-                            record: record.clone(),
-                        })
-                        .collect::<Vec<_>>(),
-                    ks.truncated,
-                ),
-                None => return,
-            }
-        };
-        for (i, entry) in entries.iter().enumerate() {
+        let floor = self.committed_floor(key).await;
+        let entries = self.retag(&self.committed_entries_tagged(key).await);
+        if entries.is_empty() && floor == 0 {
+            return;
+        }
+        // Each entry at the tag it already carries (#634), so the target's copy can
+        // never dip below the owner's and the other replicas'.
+        for entry in &entries {
             let op = ReplOp::Append {
                 key: key.to_string(),
                 offset: entry.offset,
-                seq: u64::try_from(i).unwrap_or(u64::MAX).saturating_add(1),
+                seq: entry.seq,
                 record: entry.record.clone(),
             };
             let _ = self.transport.deliver(target, self.lease.epoch, &op).await;
@@ -1530,6 +1603,47 @@ impl<T: ReplicaTransport + Clone + 'static> ClusterLog<T> {
     /// # Errors
     /// [`ReplError::NoQuorum`] if any recovered entry cannot reach the quorum.
     pub async fn recommit_key(&self, key: &str, entries: &[LogEntry]) -> Result<(), ReplError> {
+        let untagged: Vec<EpochEntry> = entries
+            .iter()
+            .map(|e| EpochEntry {
+                epoch: 0,
+                seq: 0,
+                offset: e.offset,
+                record: e.record.clone(),
+            })
+            .collect();
+        self.recommit_tagged(key, &untagged).await.map(|_| ())
+    }
+
+    /// [`recommit_key`](Self::recommit_key) over a TAGGED base (issue #634): each
+    /// entry is re-delivered at [`retag`](Self::retag)'s tag, and the entries as
+    /// re-delivered are returned so the caller seeds the log with the tags the
+    /// replicas now hold. The owner's own counter and per-entry tags move up to
+    /// match whatever was sent, success or not: a delivery that reached some
+    /// replica before quorum failed has still been stored there.
+    ///
+    /// # Errors
+    /// [`ReplError::NoQuorum`] as for [`recommit_key`](Self::recommit_key).
+    pub async fn recommit_tagged(
+        &self,
+        key: &str,
+        entries: &[EpochEntry],
+    ) -> Result<Vec<EpochEntry>, ReplError> {
+        let entries = self.retag(entries);
+        let result = self.recommit_retagged(key, &entries).await;
+        if let Some(ks) = self.state.lock().await.get_mut(key) {
+            for e in &entries {
+                if ks.entries.contains_key(&e.offset) {
+                    let tag = ks.tags.entry(e.offset).or_insert(e.seq);
+                    *tag = (*tag).max(e.seq);
+                }
+                ks.seq = ks.seq.max(e.seq);
+            }
+        }
+        result.map(|()| entries)
+    }
+
+    async fn recommit_retagged(&self, key: &str, entries: &[EpochEntry]) -> Result<(), ReplError> {
         if entries.is_empty() {
             // #168: an empty recovered log is NOT a licence to serve without fencing.
             // Re-committing entries is what advances the followers' group fences to this
@@ -1576,14 +1690,14 @@ impl<T: ReplicaTransport + Clone + 'static> ClusterLog<T> {
         // Fan every (entry, follower) delivery out concurrently — recovery-time,
         // one wave — and count per-entry acks, the owner's copy included (durable,
         // ADR 0042 T8: each self-ack counts only once the entry is applied to the
-        // node's own replica copy). Each entry is re-tagged at THIS owner's epoch
-        // with seqs 1..=n in offset order (ADR 0042 T7): the re-committed base
-        // supersedes every older copy of those offsets, and `seed_key` continues
-        // the seq counter above n.
-        let recommit_op = |i: usize, entry: &LogEntry| ReplOp::Append {
+        // node's own replica copy). Each entry goes out at the tag `retag` chose:
+        // under a NEW epoch that is seqs 1..=n (ADR 0042 T7), superseding every
+        // older copy; under the SAME epoch it is the tag the entry already carries,
+        // so the delivery is a pure re-apply (#634).
+        let recommit_op = |_: usize, entry: &EpochEntry| ReplOp::Append {
             key: key.to_string(),
             offset: entry.offset,
-            seq: u64::try_from(i).unwrap_or(u64::MAX).saturating_add(1),
+            seq: entry.seq,
             record: entry.record.clone(),
         };
         let mut acks: Vec<usize> = Vec::with_capacity(entries.len());
@@ -1678,6 +1792,19 @@ pub struct ReplicaRead {
 /// one).
 #[must_use]
 pub fn merge_replica_logs(reads: &[ReplicaRead]) -> Vec<LogEntry> {
+    merge_replica_logs_tagged(reads)
+        .into_iter()
+        .map(|e| LogEntry {
+            offset: e.offset,
+            record: e.record,
+        })
+        .collect()
+}
+
+/// [`merge_replica_logs`] keeping each surviving entry's `(epoch, seq)` — the tag a
+/// same-epoch re-commit must re-send it under (issue #634).
+#[must_use]
+pub fn merge_replica_logs_tagged(reads: &[ReplicaRead]) -> Vec<EpochEntry> {
     let low_water = reads.iter().map(|r| r.watermark).max().unwrap_or(0);
     let mut by_offset: BTreeMap<Offset, (Epoch, u64, Vec<u8>)> = BTreeMap::new();
     for r in reads {
@@ -1709,7 +1836,12 @@ pub fn merge_replica_logs(reads: &[ReplicaRead]) -> Vec<LogEntry> {
         }
         expected = Some(offset + 1);
         high = Some((epoch, seq));
-        out.push(LogEntry { offset, record });
+        out.push(EpochEntry {
+            epoch,
+            seq,
+            offset,
+            record,
+        });
     }
     out
 }
@@ -1770,6 +1902,7 @@ impl<T: ReplicaTransport + Clone + 'static> ReplicatedLog for ClusterLog<T> {
             // reuses this offset after a failure supersedes the failed attempt
             // everywhere.
             ks.seq += 1;
+            ks.tags.insert(offset, ks.seq);
             let op = ReplOp::Append {
                 key: key.clone(),
                 offset,
@@ -1857,6 +1990,7 @@ impl<T: ReplicaTransport + Clone + 'static> ReplicatedLog for ClusterLog<T> {
                     if ks.abort_floor.is_some_and(|floor| offset >= floor) {
                         // An earlier offset failed under us: tail-fail.
                         ks.entries.remove(&offset);
+                        ks.tags.remove(&offset);
                         Self::pipeline_resolved(ks);
                         notify.notify_waiters();
                         return Err(ReplError::NoQuorum);
@@ -1875,6 +2009,7 @@ impl<T: ReplicaTransport + Clone + 'static> ReplicatedLog for ClusterLog<T> {
                             .collect();
                         for o in doomed {
                             ks.entries.remove(&o);
+                            ks.tags.remove(&o);
                         }
                         Self::pipeline_resolved(ks);
                         notify.notify_waiters();
@@ -1954,6 +2089,7 @@ impl<T: ReplicaTransport + Clone + 'static> ReplicatedLog for ClusterLog<T> {
         }
         if let Some(ks) = self.state.lock().await.get_mut(key) {
             ks.entries.retain(|offset, _| *offset > up_to);
+            ks.tags.retain(|offset, _| *offset > up_to);
             ks.truncated = ks.truncated.max(up_to);
         }
         Ok(())
@@ -1966,6 +2102,7 @@ impl<T: ReplicaTransport + Clone + 'static> ReplicatedLog for ClusterLog<T> {
             // Never truncate past the commit watermark.
             let up = up_to.min(ks.committed);
             ks.entries.retain(|o, _| *o > up);
+            ks.tags.retain(|o, _| *o > up);
             ks.truncated = ks.truncated.max(up);
             op = Some(ReplOp::Truncate {
                 key: key.clone(),
@@ -2026,8 +2163,8 @@ mod tests {
     }
 
     use super::{
-        merge_replica_logs, shard_file_name, shard_of_group, ClusterLog, ReplOp, ReplicaRead,
-        ReplicaState, ReplicaTransport, R_LEGACY_FILE,
+        merge_replica_logs, merge_replica_logs_tagged, shard_file_name, shard_of_group, ClusterLog,
+        ReplOp, ReplicaRead, ReplicaState, ReplicaTransport, R_LEGACY_FILE,
     };
     use crate::lease::{Epoch, OwnershipLease};
     use crate::placement::group_of_key;
@@ -2578,6 +2715,26 @@ mod tests {
                 .unwrap_or_default()
         }
 
+        /// A replica's recovery read for `key`, exactly as `read_replica` builds it.
+        fn read(&self, node: &NodeId, key: &str) -> ReplicaRead {
+            let replicas = self.replicas.lock().unwrap();
+            let r = replicas.get(node).expect("known replica");
+            ReplicaRead {
+                watermark: r.watermark(key),
+                complete: r.complete(key),
+                entries: r.epoch_entries(key),
+            }
+        }
+
+        /// Deliver `op` at `epoch` straight to one replica — to plant state.
+        fn plant(&self, node: &NodeId, epoch: Epoch, op: &ReplOp) -> bool {
+            self.replicas
+                .lock()
+                .unwrap()
+                .get_mut(node)
+                .is_some_and(|r| r.apply(epoch, op))
+        }
+
         /// The fence a replica currently holds for `key`'s group (#168 tests).
         fn fence(&self, node: &NodeId, key: &str) -> Epoch {
             self.replicas
@@ -2880,6 +3037,181 @@ mod tests {
         log.recommit_key(&k, &base).await.unwrap();
         assert_eq!(sim.entries(&followers[0], &k), vec![1, 2]);
         assert!(sim.entries(&followers[1], &k).is_empty());
+        sim.assert_fencing_held();
+    }
+
+    // ---------------------------------------------------------------------
+    // Issue #634: acked appends lost after a SAME-EPOCH rebuild.
+    //
+    // `cluster_store` rebuilds a group's log when its replica set changes under
+    // an unchanged lease (ADR 0043 P1). The rebuilt instance re-commits the
+    // recovered base and seeds its write counter. Both used to assume a NEW
+    // epoch: the re-commit re-tagged the base `1..=n`, and the seed continued
+    // from the entry COUNT. Under the same epoch a replica drops a lower re-tag
+    // as a stale attempt while acking it, so the stored tags stayed at their
+    // original seqs — which exceed `n` whenever an acked prefix was truncated —
+    // and the next appends were stamped BELOW them. The recovery merge later
+    // cut those genuinely committed, acked appends as a "deposed owner's orphan
+    // tail". Reproduced out of process by `cluster_proc::
+    // a_disk_bound_crash_mid_write_loses_no_acked_fact` (~35% of runs).
+    // ---------------------------------------------------------------------
+
+    /// The rebuild path as `cluster_store::log_for_key` runs it, over the sim.
+    async fn rebuild_same_epoch(
+        sim: &Arc<SimCluster>,
+        followers: &[NodeId],
+        epoch: Epoch,
+        k: &str,
+    ) -> ClusterLog<Arc<SimCluster>> {
+        let rebuilt = ClusterLog::new(
+            n("a"),
+            OwnershipLease {
+                holder: n("a"),
+                epoch,
+            },
+            &[n("a"), n("b"), n("c")],
+            sim.clone(),
+        );
+        let reads: Vec<ReplicaRead> = followers.iter().map(|f| sim.read(f, k)).collect();
+        let floor = reads.iter().map(|r| r.watermark).max().unwrap_or(0);
+        let high = reads
+            .iter()
+            .flat_map(|r| r.entries.iter())
+            .map(|e| (e.epoch, e.seq))
+            .max();
+        let recommitted = rebuilt
+            .recommit_tagged(k, &merge_replica_logs_tagged(&reads))
+            .await
+            .unwrap();
+        let seq_floor = high.filter(|(e, _)| *e == epoch).map_or(0, |(_, s)| s);
+        rebuilt.seed_key(k, recommitted, floor, seq_floor).await;
+        rebuilt
+    }
+
+    fn merged_offsets(sim: &SimCluster, followers: &[NodeId], k: &str) -> Vec<u64> {
+        let reads: Vec<ReplicaRead> = followers.iter().map(|f| sim.read(f, k)).collect();
+        merge_replica_logs(&reads)
+            .iter()
+            .map(|e| e.offset)
+            .collect()
+    }
+
+    /// The #634 scenario itself: appends acked after a same-epoch rebuild survive
+    /// the next recovery.
+    ///
+    /// Fails if the re-commit goes back to re-tagging a same-epoch base `1..=n`:
+    /// the replicas keep `(171, 4..6)`, the counter seeds at 3, the two new appends
+    /// land at `(171, 4)` and `(171, 5)` on offsets 7 and 8, and the merge stops at
+    /// offset 7 — two committed, acknowledged messages gone.
+    #[tokio::test]
+    async fn appends_acked_after_a_same_epoch_rebuild_survive_the_next_recovery() {
+        let (log, sim, followers) = group(171);
+        let k = "q/c".to_string();
+        for i in 1..=6 {
+            log.append(&k, format!("m{i}").into_bytes()).await.unwrap();
+        }
+        // The acked prefix is truncated: live offsets 4..6 carry seqs 4..6, so the
+        // entry COUNT (3) now lags the stored tags — the precondition for #634.
+        log.truncate_durable(&k, 3).await.unwrap();
+
+        let rebuilt = rebuild_same_epoch(&sim, &followers, 171, &k).await;
+        assert_eq!(rebuilt.append(&k, b"m7".to_vec()).await.unwrap(), 7);
+        assert_eq!(rebuilt.append(&k, b"m8".to_vec()).await.unwrap(), 8);
+
+        assert_eq!(
+            merged_offsets(&sim, &followers, &k),
+            vec![4, 5, 6, 7, 8],
+            "appends acked after a same-epoch rebuild were cut by the merge's \
+             tag-regression rule (#634)"
+        );
+        sim.assert_fencing_held();
+    }
+
+    /// The seq floor: a same-epoch tail the merge DROPS (beyond a gap) still bounds
+    /// the next appends from below, or the replica holding it keeps its orphan and
+    /// a later merge serves the orphan's bytes as if they were committed.
+    ///
+    /// Fails without `seq_floor` in `seed_key`: the append at offset 8 carries
+    /// `(171, 8)`, replica c drops it as a stale attempt against its planted
+    /// `(171, 12)`, and a recovery reading c serves `orphan` at offset 8.
+    #[tokio::test]
+    async fn a_dropped_same_epoch_tail_still_bounds_the_next_seq() {
+        let (log, sim, followers) = group(171);
+        let k = "q/c".to_string();
+        for i in 1..=6 {
+            log.append(&k, format!("m{i}").into_bytes()).await.unwrap();
+        }
+        log.truncate_durable(&k, 3).await.unwrap();
+        // An uncommitted attempt at offset 8 on c alone, above a hole at 7: the
+        // merge stops at the gap, so this tail is DROPPED from the recovered base.
+        assert!(sim.plant(
+            &followers[1],
+            171,
+            &ReplOp::Append {
+                key: k.clone(),
+                offset: 8,
+                seq: 12,
+                record: b"orphan".to_vec(),
+            }
+        ));
+
+        let rebuilt = rebuild_same_epoch(&sim, &followers, 171, &k).await;
+        assert_eq!(rebuilt.append(&k, b"m7".to_vec()).await.unwrap(), 7);
+        assert_eq!(rebuilt.append(&k, b"m8".to_vec()).await.unwrap(), 8);
+
+        for f in &followers {
+            let got = merge_replica_logs(&[sim.read(f, &k)]);
+            let at8 = got.iter().find(|e| e.offset == 8).map(|e| e.record.clone());
+            assert_eq!(
+                at8.as_deref(),
+                Some(&b"m8"[..]),
+                "replica {} still serves a dropped same-epoch orphan at offset 8 (#634)",
+                f.0
+            );
+        }
+    }
+
+    /// Catch-up re-sends each entry at the tag it already carries, so a back-filled
+    /// replica's own copy never dips — and a recovery reading only that replica
+    /// still serves the whole log.
+    ///
+    /// Fails if the back-fill goes back to `1..=n`: c keeps offset 4 at `(171, 4)`
+    /// and receives 5 and 6 at `(171, 2)` and `(171, 3)`, and a merge of c's copy
+    /// stops at offset 5.
+    #[tokio::test]
+    async fn a_catch_up_back_fill_never_plants_a_dipping_tag() {
+        let (log, sim, followers) = group(171);
+        let k = "q/c".to_string();
+        for i in 1..=4 {
+            log.append(&k, format!("m{i}").into_bytes()).await.unwrap();
+        }
+        sim.down(&followers[1]); // c misses 5 and 6
+        for i in 5..=6 {
+            log.append(&k, format!("m{i}").into_bytes()).await.unwrap();
+        }
+        log.truncate_durable(&k, 3).await.unwrap();
+        sim.up(&followers[1]);
+
+        // The ADR 0043 catch-up, exactly as `catch_up_key` drives it.
+        let entries = log.committed_entries_tagged(&k).await;
+        log.recommit_tagged(&k, &entries).await.unwrap();
+
+        let tags: Vec<(u64, u64)> = sim
+            .read(&followers[1], &k)
+            .entries
+            .iter()
+            .map(|e| (e.offset, e.seq))
+            .collect();
+        assert!(
+            tags.windows(2).all(|w| w[1].1 > w[0].1),
+            "the back-filled replica's tags dip along its offsets: {tags:?} (#634)"
+        );
+        let served: Vec<u64> = merge_replica_logs(&[sim.read(&followers[1], &k)])
+            .iter()
+            .map(|e| e.offset)
+            .filter(|o| *o > 3)
+            .collect();
+        assert_eq!(served, vec![4, 5, 6]);
         sim.assert_fencing_held();
     }
 
