@@ -528,6 +528,11 @@ LANE_E_CALIBRATE_SECS="${LANE_E_CALIBRATE_SECS:-20}"
 LANE_E_FORWARD_CANARY="${LANE_E_FORWARD_CANARY:-1}"
 LANE_E_FORWARD_CANARY_COUNT="${LANE_E_FORWARD_CANARY_COUNT:-100}"
 LANE_E_FORWARD_CANARY_TIMEOUT="${LANE_E_FORWARD_CANARY_TIMEOUT:-90}"
+# The control demands a full mesh, so it waits for one first: every broker at
+# N members and N-1 peer links on LANE_E_MESH_STABLE_POLLS consecutive rounds
+# (5s apart), within LANE_E_MESH_SETTLE_BUDGET seconds (lib.sh await_full_mesh).
+LANE_E_MESH_SETTLE_BUDGET="${LANE_E_MESH_SETTLE_BUDGET:-180}"
+LANE_E_MESH_STABLE_POLLS="${LANE_E_MESH_STABLE_POLLS:-3}"
 # A rung PASSES only if its p99 stays under this many ms. The point of a tenancy
 # ladder is the site count at which latency leaves the band, not the count at
 # which the broker finally refuses traffic — those are far apart, and only the
@@ -2564,6 +2569,12 @@ lane_e_forward_canary() {
 	fi
 	rm -rf "$cdir" "$rdir_res"
 	mkdir -p "$cdir" "$rdir_res"
+	if [ "$N" -gt 1 ]; then
+		say "[$N nodes] lane E: waiting for a full, stable mesh ($((N - 1)) peer links and $N members on every broker, $LANE_E_MESH_STABLE_POLLS rounds running) before the control"
+		await_full_mesh "$LANE_E_MESH_SETTLE_BUDGET" "$LANE_E_MESH_STABLE_POLLS" "$OUT/laneE/mesh-settle.txt" ||
+			die "lane E: the mesh did not settle within ${LANE_E_MESH_SETTLE_BUDGET}s at N=$N — the forwarding control would fail on a missing link, not on forwarding. Evidence: $OUT/laneE/mesh-settle.txt"
+		say "[$N nodes] lane E: mesh settled ($(tail -n 1 "$OUT/laneE/mesh-settle.txt" | cut -d' ' -f1))"
+	fi
 	local -a brokers=()
 	for ((i = 0; i < N; i++)); do brokers+=(--broker "$(broker_priv_ip "$i"):1883:8080"); done
 	# The residue baseline is the harness's own scrape from BEFORE the canary

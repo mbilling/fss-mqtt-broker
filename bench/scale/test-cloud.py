@@ -58,6 +58,9 @@ sys.exit(77 if "apply" in sys.argv or os.path.basename(sys.argv[0]) in ("hcloud"
             "PATH": f"{bin_dir}:{os.environ['PATH']}",
             "HOME": str(self.root), "CALL_LOG": str(self.log),
             "MQTTD_VERSION": "test", "OBSERVE": "0",
+            # lane E waits for a stable full mesh before its control; the fakes
+            # report one from the first scrape, so do not sleep between rounds.
+            "MESH_POLL_SECS": "0",
             "RUN_DIR": str(self.root / "run"),
         }
 
@@ -851,6 +854,7 @@ if url.endswith(":8080/metrics"):
         "# TYPE mqttd_sessions gauge", f"mqttd_sessions {lingering}",
         "# TYPE mqttd_subscriptions gauge", "mqttd_subscriptions 0",
         "# TYPE mqttd_peer_links gauge", f"mqttd_peer_links {int(os.environ['FAKE_BROKERS']) - 1}",
+        "# TYPE mqttd_cluster_members gauge", f"mqttd_cluster_members {os.environ['FAKE_BROKERS']}",
         "# EOF",
     ]
     if cut:

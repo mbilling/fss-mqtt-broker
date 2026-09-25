@@ -277,6 +277,8 @@ def lane_e_tree(b: Budgets) -> Node:
     ])
 
     return Node("lane E (one size)", mode="seq", children=[
+        Node("mesh settle", budget=b.get("LANE_E_MESH_SETTLE_BUDGET"),
+             why="every broker at N members and N-1 links before the control"),
         Node("forward canary", budget=b.get("LANE_E_FORWARD_CANARY_TIMEOUT"),
              why="100 QoS 1 messages over each directed broker pair"),
         Node("ladder", children=[rung]),

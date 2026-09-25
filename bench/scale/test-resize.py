@@ -241,5 +241,74 @@ class CampaignTests(Rig):
         self.assertEqual(self.calls(), [])
 
 
+# A broker's /metrics, scripted per host: MESH_PLAN maps a host to the
+# (links, members) it reports on successive scrapes; the last entry repeats.
+MESH_STUB = '''#!/usr/bin/env python3
+import json, os, sys
+host = sys.argv[-2].split("@")[-1]
+plan = json.load(open(os.environ["MESH_PLAN"]))[host]
+counter = os.path.join(os.environ["MESH_STATE"], host)
+n = int(open(counter).read()) if os.path.exists(counter) else 0
+open(counter, "w").write(str(n + 1))
+links, members = plan[min(n, len(plan) - 1)]
+if links is None:
+    sys.exit(255)
+print(f"# TYPE mqttd_peer_links gauge\\nmqttd_peer_links {links}\\nmqttd_cluster_members {members}")
+'''
+
+
+class MeshSettleTests(Rig):
+    def setUp(self):
+        super().setUp()
+        (self.bin / "ssh").write_text(MESH_STUB)
+        self.inv = self.root / "inv3.json"
+        self.inv.write_text(json.dumps(inventory(brokers=3, drivers=1)))
+        self.state = self.root / "state"
+        self.state.mkdir()
+        self.evidence = self.root / "mesh.txt"
+
+    def settle(self, plan, budget=30, stable=3):
+        (self.root / "plan.json").write_text(json.dumps(
+            {f"198.51.100.{i + 1}": steps for i, steps in enumerate(plan)}))
+        script = (f". {self.rig}/lib.sh; INVENTORY={self.inv}; RUN={self.provision}; "
+                  f"await_full_mesh {budget} {stable} {self.evidence}")
+        return subprocess.run(["bash", "-c", script], text=True, capture_output=True,
+                              env=self.env | {"MESH_PLAN": str(self.root / "plan.json"),
+                                              "MESH_STATE": str(self.state), "MESH_POLL_SECS": "0"})
+
+    def rounds(self):
+        return self.evidence.read_text().splitlines()
+
+    def test_a_healthy_mesh_passes_after_the_stable_rounds(self):
+        r = self.settle([[[2, 3]]] * 3)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(len(self.rounds()), 3)
+        self.assertIn("broker0=2/3 broker1=2/3 broker2=2/3", self.rounds()[-1])
+
+    def test_the_2026_09_25_shape_waits_for_the_missing_link(self):
+        # Two brokers each one link short (the pair that had not re-greeted after
+        # the founder's re-arm restart), healing on the fourth scrape.
+        short = [[1, 2]] * 3 + [[2, 3]]
+        r = self.settle([[[2, 3]], short, short])
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(len(self.rounds()), 6, "3 unsettled rounds, then 3 stable ones")
+        self.assertIn("broker1=1/2", self.rounds()[0])
+
+    def test_a_flap_restarts_the_stable_count(self):
+        flap = [[2, 3], [2, 3], [1, 3], [2, 3]]
+        r = self.settle([[[2, 3]], flap, [[2, 3]]])
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(len(self.rounds()), 6)
+
+    def test_an_unreachable_or_unsettled_mesh_runs_out_of_budget(self):
+        for plan in ([[[2, 3]], [[1, 2]], [[2, 3]]], [[[2, 3]], [[None, None]], [[2, 3]]]):
+            with self.subTest(plan=plan):
+                for f in self.state.iterdir():
+                    f.unlink()
+                r = self.settle(plan, budget=0)
+                self.assertEqual(r.returncode, 1)
+                self.assertTrue(self.rounds(), "every round is evidence, even the failing one")
+
+
 if __name__ == "__main__":
     unittest.main()

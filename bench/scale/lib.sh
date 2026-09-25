@@ -80,6 +80,37 @@ wait_ready() {
 		rssh "$(broker_pub_ip "$1")" "curl -sf http://localhost:8080/readyz"
 }
 
+# await_full_mesh <budget-secs> <stable-polls> <evidence-file>: poll every
+# broker until ALL report mqttd_cluster_members = N and mqttd_peer_links = N-1,
+# on <stable-polls> consecutive rounds MESH_POLL_SECS (default 5) apart. /readyz is majority-only, so a
+# cluster bootstrap-cluster.sh calls READY can still be rebuilding links after
+# the founder's re-arm restart: on 2026-09-25 (N=7) the storm it set off left
+# one link missing ~35s after READY, and the forwarding control rightly failed
+# the size. Every round is appended to <evidence-file>; returns 1 when the
+# budget runs out rather than dying, so the caller names the consequence.
+await_full_mesh() {
+	local budget="$1" want_stable="$2" evidence="$3"
+	local n start stable=0 i ok row links members
+	n=$(broker_count)
+	start=$(date +%s)
+	: >"$evidence"
+	while :; do
+		ok=1 row=""
+		for ((i = 0; i < n; i++)); do
+			read -r links members < <(rssh "$(broker_pub_ip "$i")" "curl -s -m 10 http://localhost:8080/metrics" 2>/dev/null |
+				awk '$1 == "mqttd_peer_links" { l = $2 } $1 == "mqttd_cluster_members" { m = $2 }
+					END { printf "%s %s\n", (l == "" ? "-" : l), (m == "" ? "-" : m) }') || true
+			row+=" broker$i=${links:--}/${members:--}"
+			[ "${links:-}" = "$((n - 1))" ] && [ "${members:-}" = "$n" ] || ok=0
+		done
+		echo "t=$(($(date +%s) - start))s links/members:$row" >>"$evidence"
+		if [ "$ok" = 1 ]; then stable=$((stable + 1)); else stable=0; fi
+		[ "$stable" -ge "$want_stable" ] && return 0
+		[ $(($(date +%s) - start)) -lt "$budget" ] || return 1
+		sleep "${MESH_POLL_SECS:-5}"
+	done
+}
+
 # every_broker <command-template>: run over all broker indices sequentially.
 every_broker() { # every_broker fn — calls fn <index>
 	local fn="$1" i n
