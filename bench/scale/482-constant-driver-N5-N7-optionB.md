@@ -144,12 +144,13 @@ item says otherwise.
 - [x] Side-by-side N=5 vs N=7 table at matched site rungs (offered, received,
       delivered, crossing %, per-node delivered, broker idle, hub publish µs,
       driver idle) **before** claiming membership cost.
-- [ ] `rx_skew` / `eff_nodes` on both arms (#613). Five driver pools divide
-      evenly over five brokers and not over seven; under prefer-local that alone
-      caps N=7 near N=5. A flat 5→7 with `eff_nodes` ≈ 5 at N=7 is a placement
-      result, not a broker one. The local gated A/B
-      (`docs/benchmarks/MEMBERSHIP-GATED-AB.md`) already bounds the O(peers)
-      per-message term at ~4% for 5→7.
+- [ ] `rx_skew` / `eff_nodes` on both arms (#613). *The placement prediction
+      this item was added for is refuted:* every container spreads its clients
+      over every broker (`rotated_hosts`), so this shape computes to `rx_skew` ≤
+      1.0033 (`eff_nodes` ≈ 7) at N=7. Keep the columns as a check on real
+      runs. The local gated A/B (`docs/benchmarks/MEMBERSHIP-GATED-AB.md`)
+      bounds the O(peers) per-message term at ~4% for 5→7. The knee this pair
+      could not measure is [`482-per-node-knee.md`](482-per-node-knee.md)'s job.
 
 ## Offline preflight
 

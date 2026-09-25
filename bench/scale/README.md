@@ -298,6 +298,16 @@ attributing a flat N=5→7 to the broker (#613).
 The card separates matched-total-load comparisons from capacity knees and provides
 `bash ./482-smoke.sh` to prove teardown without inheriting the full campaign shape.
 
+### Per-node knee on one provisioning
+
+[`482-per-node-knee.md`](482-per-node-knee.md) is the follow-up that measures
+capacity knees rather than a matched total load, and runs both sizes on ONE
+provisioning: `resize-cluster.sh` stops every broker, clears its store and writes a
+prefix inventory, so `bootstrap-cluster.sh` can start a fresh smaller cluster on
+the same hosts and driver fleet. `482-per-node-knee.sh` sequences 7 → 5 → 7 with a
+trapped teardown; `482-knee-smoke.sh` proves it at 3 → 1 → 3 on small hosts;
+`test-resize.py` covers both offline.
+
 ## Cross-broker comparison on cloud hardware (ADR 0048 T4)
 
 `./run.sh compare` provisions ONE broker host and a driver fleet, then runs every

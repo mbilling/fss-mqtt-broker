@@ -1302,6 +1302,58 @@ requires = ["jq", "ssh"]
 duration = "instant"
 
 [[task]]
+id = "scale-resize-cluster"
+group = "Benchmark"
+hidden = true
+name = "Re-form a live bench provisioning at a smaller size (size A/B on one provisioning)"
+script = "bench/scale/resize-cluster.sh"
+about = """
+Stops mqttd on every broker of an already-provisioned cluster, clears each data
+dir, and writes an inventory holding the first N brokers and every driver, so
+bootstrap-cluster.sh can start a fresh N-node cluster on the SAME hardware.
+
+swap-binary.sh made binary A/Bs one-provisioning comparisons; sizes stayed
+separate provisionings, which differ by ~40% on identical hardware (ADR 0077 T4)
+— wider than any per-node efficiency question. Always pass the FULL inventory;
+growing back is the same call with the full size. Stamps RESIZED.txt.
+"""
+requires = ["jq", "ssh"]
+duration = "instant"
+
+[[task]]
+id = "scale-per-node-knee"
+group = "Benchmark"
+name = "N=7 vs N=5 per-node knee on one provisioning (PAID, #482/#613)"
+script = "bench/scale/482-per-node-knee.sh"
+about = """
+Source 482-per-node-knee.env first. Provisions 7 brokers and 18 drivers once, runs
+the 7-node ladder, re-forms the same hosts as 5 nodes for the 5-node ladder, then
+returns to 7 for a closing drift control. Each arm gets its own forwarding canary
+and calibration; the ladders are matched in per-node offer. Teardown is trapped
+on every exit. PREFLIGHT_ONLY=1 checks all three arms offline.
+"""
+requires = ["tofu", "jq", "ssh", "python3"]
+caution = "Provisions 25 PAID Hetzner servers unless PREFLIGHT_ONLY=1. Run 482-knee-smoke.sh first; confirm budget; verify the project is empty after teardown."
+
+[[task]]
+id = "scale-per-node-knee-smoke"
+group = "Benchmark"
+name = "Prove the one-provisioning size A/B on a small Hetzner shape (PAID)"
+script = "bench/scale/482-knee-smoke.sh"
+about = "The knee campaign at 3 / 1 / 3 brokers on shared-vCPU hosts with one driver and a 1000/s site: every resize, bootstrap on a used host and trapped teardown, minutes instead of hours. Inherits the caller's binary pin. PREFLIGHT_ONLY=1 validates offline."
+requires = ["tofu", "jq", "ssh", "python3"]
+caution = "Provisions PAID Hetzner hosts unless PREFLIGHT_ONLY=1. Verify the project is empty after teardown."
+
+[[task]]
+id = "scale-resize-tests"
+group = "Benchmark"
+name = "Offline tests for the one-provisioning size A/B"
+script = "bench/scale/test-resize.py"
+about = "Stubbed ssh and rig steps: resize keeps a prefix and stops every broker, refuses what it cannot honour, fails closed; the campaign shares one provisioning and destroys it on every exit. Invoked by CI with python3."
+requires = ["python3", "jq"]
+hidden = true
+
+[[task]]
 id = "scale-budgets"
 group = "Benchmark"
 name = "Check the harness time budgets are self-consistent"
