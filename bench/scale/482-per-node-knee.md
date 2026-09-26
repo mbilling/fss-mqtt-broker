@@ -167,6 +167,60 @@ every rung measured.
    brackets 45 / 66 ms). From 10 sites every rung was voided by the one pinned
    driver above. Evidence: `.runs/knee-20260925T203528Z/1-n7/`.
 
+## 2026-09-26 result — per-node capacity holds from 5 to 7; no knee inside either ladder
+
+Run `.runs/knee-20260925T235258Z` (untracked). Candidate `bench-candidate-0a08187`,
+sha256 `66dd3e62…f32f`; 7 × CCX23 + 18 × CCX33, one provisioning, arms 7 → 5 → 7.
+No host was swapped (driver gate passed on every arm; no rung pinned a driver).
+
+**Gates.** `extract-lane-e.py --crossing-gate 0.5`: `GATE nodes=7 PASS 11 rungs`,
+`GATE nodes=5 PASS 11 rungs`, closing `GATE nodes=7 PASS 3 rungs`, all
+`cert=canary`, max broker crossing 0.00%. Every rung settled and drained; zero
+drops; zero peer in-flight; `rx_skew` 1.00–1.01 on every rung; busiest driver
+≥ 68% idle; brackets 71–129 ms.
+
+**Drift.** Closing 14-site rung 419 977/s vs opening 419 996 and 420 160/s
+(≤ 0.04%); hub publish 7.8 µs vs 7.9 / 7.8 µs; busiest broker idle 25% vs
+23 / 24%. The 1-site controls deliver 30 000/s everywhere; their publish µs
+(8.5–9.6) is low-load noise. The comparison stands.
+
+| per node | N=5 rung | p99 | N=7 rung | p99 |
+|---|---|---|---|---|
+| 42k | 7 sites, 210 000/s | ≤ 5 ms | 10 sites, 300 000/s (42.9k) | ≤ 5 ms |
+| 48k / 47k | 8, 240 000 | ≤ 5 ms | 11, 330 000 | ≤ 5 ms |
+| 54k / 56k | 9, 270 000 | ≤ 25 ms | 13, 390 000 | ≤ 500 ms |
+| 60k | 10 ×2, 300 000 | ≤ 500 ms | 14 ×2, 420 000 | ≤ 500 ms |
+| 66k / 64k | 11, 330 000 | ≤ 500 ms | 15, 450 000 | ≤ 500 ms |
+| 72k / 73k | 12, 360 000 | ≤ 1000 ms | 17, 510 000 | ≤ 1000 ms |
+| 78k / 77k | 13, 390 000 | ≤ 1000 ms | 18, 540 000 | ≤ 1000 ms |
+
+Every rung of both ladders passes. By the declared rules there is **no knee**, so
+`E` is not computed: the floors are `C₅ ≥ 390 000/s` (78 000 per node) and
+`C₇ ≥ 540 000/s` (77 142 per node). What the matched rungs do show is the
+per-node cost: the same p99 bucket at every matched rate from 60k/node up, and
+mean hub publish busy per broker **lower** at N=7 (0.475 / 0.557 / 0.586 of a
+core at 60 / 73 / 77k per node) than at N=5 (0.556 / 0.590 / 0.676 at 60 / 72 /
+78k). Two more brokers cost nothing measurable per node on this workload.
+
+**The mean `cluster` dispatch rise is not load.** At 0% crossing `cluster`
+dispatches run at < 1 per second per broker; their mean µs is a handful of
+gossip calls, and their busy fraction is 0.000.
+
+**Where the per-node limit is forming — same hosts, both sizes.** Ingress is equal
+on every broker (60.0k each at 60k/node), yet brokers 0 and 3 spend ~14 µs per
+publish against ~5 µs on the others, holding ~0.85 of a core in the hub; broker 2
+joins them at 77–78k/node. Those are exactly the brokers whose CPU 1 — the core
+taking the NIC softirq (58–71%) — sits at 0–3% idle, while the other brokers'
+CPU 1 keeps 20–41%. The hub's dispatch timer counts wall time, so preemption by
+interrupt work reads as dispatch cost. This is the host-interrupt ceiling already
+documented for QoS 1 (`docs/benchmarks/QOS1-SCALE-CURVE.md`), appearing per host,
+independent of N; spreading the softirq is a settled dead end (#505/#507/#508).
+
+**Next, if a knee is wanted:** extend both ladders past 78k/node on one
+provisioning (N=7 needs 19+ sites and a driver per site); expect the first failing
+rung on the brokers whose interrupt core saturates, at the same per-node rate at
+both sizes.
+
 ## Read on every arm
 
 Beyond the gate: `hub_dispatch` mean µs **and** count by command, the hottest
