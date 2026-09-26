@@ -219,8 +219,10 @@ def poll_tries(b: Budgets) -> Node:
     attempts, 2 s apart, before the poll counts as failed — so a steady poll
     costs up to that many scrapes, not one. The drain polls once."""
     tries = int(b.get("LANE_E_POLL_TRIES"))
-    return Node(f"delivery poll (up to {tries} tries)", repeat=tries,
-                children=[scrape(b), Node("retry sleep 2", budget=2)])
+    children = [Node("attempt", repeat=tries, children=[scrape(b)])]
+    if tries > 1:
+        children.append(Node("sleep 2 between attempts", repeat=tries - 1, budget=2))
+    return Node(f"delivery poll (up to {tries} tries)", children=children)
 
 
 def lane_e_tree(b: Budgets) -> Node:

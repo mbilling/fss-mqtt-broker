@@ -65,6 +65,9 @@ sys.exit(77 if "apply" in sys.argv or os.path.basename(sys.argv[0]) in ("hcloud"
             # tofu to replace them with; test-resize.py drives both against
             # scripted hosts. Here they would only fail on the fakes' silence.
             "LANE_E_DRIVER_GATE": "0", "LANE_E_SWAP_HOOK": "",
+            # The fakes' scrapes never fail, and their tight declared budgets are
+            # sized for one attempt; test-resize.py covers the retry itself.
+            "LANE_E_POLL_TRIES": "1",
             "RUN_DIR": str(self.root / "run"),
         }
 
