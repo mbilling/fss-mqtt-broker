@@ -705,6 +705,20 @@ open("{self.root}/hook.log", "a").write(" ".join(sys.argv[1:]) + "\\n")
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("no LANE_E_SWAP_HOOK", r.stderr)
 
+    def test_a_gate_failing_on_every_driver_swaps_nothing(self):
+        r = self.gate([[10, 3]] * 4, [[40, 5]] * 3, achieved={0: 0, 1: 0, 2: 0, 3: 0})
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("failed on EVERY driver", r.stderr)
+        self.assertFalse((self.root / "hook.log").exists(), "no healthy host is rebuilt")
+
+    def test_audit_mode_skips_the_stock_image_burst(self):
+        (self.root / "gate-plan.json").write_text("{}")
+        body = "say() { :; }; warn() { :; }; mkdir -p \"$OUT/laneE\"; lane_e_driver_gate"
+        r = self.harness(body, env={"QOS1_DRIVER_ARCHIVE": "/x/driver.tar.gz", "LANE_E_DRIVER_GATE": "1",
+                                    "LANE_E_SWAP_HOOK": ""})
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual((self.root / "out/laneE/driver-gate.txt").read_text().strip(), "status=skipped-audit-mode")
+
     def test_an_outlier_broker_is_named_and_stops_the_arm(self):
         r = self.gate([[10, 3]] * 4, [[20, 5], [95, 5], [25, 5]])
         self.assertNotEqual(r.returncode, 0)

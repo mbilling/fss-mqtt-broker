@@ -2838,6 +2838,16 @@ lane_e_swap_drivers() {
 # swapped driver is gated again once; a second failure stops the size.
 lane_e_driver_gate() {
 	[ "$LANE_E_DRIVER_GATE" = 1 ] || { echo "status=skipped" >"$OUT/laneE/driver-gate.txt"; return 0; }
+	# The burst uses the stock emqtt-bench image, whose QoS 1 publisher crashes —
+	# which is why the QoS 1 audit lane ships its own driver (QOS1_DRIVER_ARCHIVE).
+	# On 2026-09-26 every one of 20 drivers "offered 0" and the gate began swapping
+	# healthy hosts. In audit mode the burst is skipped, as calibration already
+	# is; the per-rung pinned-driver check still runs on each rung's own samples.
+	if [ -n "${QOS1_DRIVER_ARCHIVE:-}" ]; then
+		echo "status=skipped-audit-mode" >"$OUT/laneE/driver-gate.txt"
+		say "[$N nodes] lane E: audit mode — driver gate burst skipped (the stock image cannot burst QoS 1); per-rung pinned-driver checks still apply"
+		return 0
+	fi
 	local gdir="$OUT/laneE/driver-gate" per_pub_rate interval pubs_per_c per_c_rate hosts attempt d
 	local -a targets bad
 	per_pub_rate=$((LANE_E_SITE_RATE / LANE_E_PUBS_PER_SITE))
@@ -2911,6 +2921,11 @@ lane_e_driver_gate() {
 			[ -z "$why" ] || bad+=("$d:$why")
 		done
 		[ "${#bad[@]}" -gt 0 ] || { say "[$N nodes] lane E: driver gate passed"; return 0; }
+		# Every driver failing the same burst is the gate failing, not the fleet:
+		# swapping them all would rebuild every host and prove nothing.
+		if [ "$attempt" = 1 ] && [ "${#bad[@]}" -eq "${#targets[@]}" ] && [ "${#targets[@]}" -gt 1 ]; then
+			die "lane E: driver gate failed on EVERY driver (${bad[*]}) — that is the burst failing, not ${#targets[@]} bad hosts; nothing swapped. Evidence: $gdir"
+		fi
 		[ -n "$LANE_E_SWAP_HOOK" ] ||
 			die "lane E: driver gate failed (${bad[*]}) and no LANE_E_SWAP_HOOK can replace them — every rung those drivers carry would measure the driver. Evidence: $OUT/laneE/driver-gate.txt"
 		[ "$attempt" = 1 ] ||
