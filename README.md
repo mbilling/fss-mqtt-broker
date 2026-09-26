@@ -13,7 +13,11 @@
 >
 > **75,000 msg/s** on one 4-vCPU node at p99 ≤ 1 s — **1.7× Mosquitto and EMQX, 2.5× HiveMQ CE**, same host, EMQX's own load tool. [Numbers ↓](#by-the-numbers)
 >
-> **Linear scale-out:** ~114,000 msg/s **per 4-vCPU node, flat from 3 to 10 nodes** — **1.14M msg/s on 10 nodes, 40 vCPU in total** (QoS 0 shared subscriptions). [Scale-out ↓](#cluster-scale-out-qos-0-shared-subscriptions)
+> **Linear scale-out, 3 → 10 nodes:**
+> - **QoS 0:** ~114,000 msg/s **per 4-vCPU node** — **1.14M msg/s on 10 nodes, 40 vCPU in total**.
+> - **QoS 1:** ~39,000 msg/s per node — **390,000 msg/s on 10 nodes**.
+>
+> Both use shared subscriptions. [Scale-out ↓](#cluster-scale-out-qos-0-shared-subscriptions)
 
 ---
 
@@ -22,7 +26,7 @@
 | | mqttd | the others |
 |---|---|---|
 | **Single-node throughput** | 75k msg/s at p99 ≤ 1 s, 30% CPU idle | 45k / 45k / 30k (Mosquitto / EMQX / HiveMQ CE) |
-| **Cluster scale-out** | ~114k msg/s per 4-vCPU node, flat 3 → 10 nodes; ~1M msg/s on **40 vCPU** | vendor-published ~1M msg/s runs: HiveMQ on 40 nodes, EMQX on 1,472 cores ([different workloads ↓](#against-published-cluster-benchmarks)) |
+| **Cluster scale-out** | flat per node from 3 → 10 nodes: ~114k msg/s QoS 0 and ~39k QoS 1 per 4-vCPU node; ~1M msg/s QoS 0 on **40 vCPU** | vendor-published ~1M msg/s runs: HiveMQ on 40 nodes, EMQX on 1,472 cores ([different workloads ↓](#against-published-cluster-benchmarks)) |
 | **Durable sessions** | quorum-replicated, **default**; acked QoS 1/2 survives node loss, even in flight | Mosquitto/NanoMQ single-node · VerneMQ loses queues on node death · EMQX opt-in |
 | **Revocation** | policy reload **evicts live sessions** | not documented by any compared broker |
 | **Secure by default** | TLS 1.3, mTLS/OIDC, deny-by-default ACL, hash-chained audit; insecure = opt-in + `INSECURE:` log | varies; NanoMQ and Mosquitto < 2.0 allow anonymous by default |
@@ -87,7 +91,7 @@ carries the same load at every size:
 10 nodes █████████████████████████████████  1,140k         114k/node   highest passing rung (see below)
 ```
 
-![Scale-out: msg/s at the knee vs nodes](docs/benchmarks/img/scale-out-qos0.svg)
+![QoS 0 scale-out: msg/s at the knee vs nodes](docs/benchmarks/img/scale-out-qos0.svg)
 
 **Per-node capacity is flat from 3 to 10 nodes.** 5, 7 and 10 nodes all pass
 ~114k msg/s per node and fail at 120k. 3 nodes passes 120k, which is one ladder
@@ -139,6 +143,13 @@ both ways — no durable session, so this is the routing path, not the fsync one
 - **Certification:** 2 of 3 repetitions are certified at 7 nodes and 1 of 3 at 10.
   The rest were invalid on the load driver's own endpoint scrapes, while every
   broker received the full offer.
+
+![QoS 1 scale-out: msg/s vs nodes](docs/benchmarks/img/scale-out-qos1.svg)
+
+7 nodes carries 270k and fails at 300k (42.9k/node) on late publishers. At QoS 1
+that means slow acks from the brokers; every load generator was still ≥ 66% idle.
+10 nodes carried 390k (39k/node) without reaching its knee. Details and every
+rung: [QOS1-SCALE-CURVE.md](docs/benchmarks/QOS1-SCALE-CURVE.md#7-and-10-nodes--one-provisioning-2026-09-26).
 
 
 MB/s is application payload (216 B/message). **The constraint is packets, not
