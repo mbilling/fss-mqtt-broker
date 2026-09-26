@@ -705,6 +705,20 @@ open("{self.root}/hook.log", "a").write(" ".join(sys.argv[1:]) + "\\n")
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("no LANE_E_SWAP_HOOK", r.stderr)
 
+    def test_a_gate_failing_on_every_driver_swaps_nothing(self):
+        r = self.gate([[10, 3]] * 4, [[40, 5]] * 3, achieved={0: 0, 1: 0, 2: 0, 3: 0})
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("failed on EVERY driver", r.stderr)
+        self.assertFalse((self.root / "hook.log").exists(), "no healthy host is rebuilt")
+
+    def test_audit_mode_skips_the_stock_image_burst(self):
+        (self.root / "gate-plan.json").write_text("{}")
+        body = "say() { :; }; warn() { :; }; mkdir -p \"$OUT/laneE\"; lane_e_driver_gate"
+        r = self.harness(body, env={"QOS1_DRIVER_ARCHIVE": "/x/driver.tar.gz", "LANE_E_DRIVER_GATE": "1",
+                                    "LANE_E_SWAP_HOOK": ""})
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual((self.root / "out/laneE/driver-gate.txt").read_text().strip(), "status=skipped-audit-mode")
+
     def test_an_outlier_broker_is_named_and_stops_the_arm(self):
         r = self.gate([[10, 3]] * 4, [[20, 5], [95, 5], [25, 5]])
         self.assertNotEqual(r.returncode, 0)
@@ -767,6 +781,23 @@ printf '%s\\n' {" ".join(repr(v) for v in verdicts)} >"$OUT/verdicts"
         self.assertIn("KNEE", r.stderr)
         self.assertEqual((self.root / "out/laneE/ladder-verdicts.txt").read_text().splitlines(),
                          ["sites-1 pass", "sites-10 fail: p99", "sites-11 fail: p99"])
+
+    def test_invalid_evidence_neither_counts_nor_resets(self):
+        # The 2026-09-26 QoS 1 shape: 13 x3 at 39k/node, two repetitions INVALID
+        # EVIDENCE with every broker receiving the offer. That is not a knee.
+        r = self.ladder("1 12 13 13 13 14", ["pass", "fail: INVALID EVIDENCE (endpoint scrape window uncertainty exceeds 2%)",
+                                              "pass", "fail: INVALID EVIDENCE (x)", "fail: INVALID EVIDENCE (y)", "pass"], 2)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.ran(), ["1 1", "12 1", "13 1", "13 2", "13 3", "14 1"], "the probe still runs")
+        self.assertFalse((self.root / "out/laneE/ladder-stop.txt").exists())
+
+    def test_a_real_fail_beside_invalid_evidence_still_counts(self):
+        (self.root / "out").mkdir(exist_ok=True)
+        r = self.ladder("1 9 10 11", ["pass", "fail: PUBLISHERS LATE (7%)",
+                                      "fail: INVALID EVIDENCE (x); PUBLISHERS LATE (9%)", "x"], 2)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.ran(), ["1 1", "9 1", "10 1"])
+        self.assertIn("skipped=sites-11", (self.root / "out/laneE/ladder-stop.txt").read_text())
 
     def test_off_by_default_climbs_everything(self):
         r = self.ladder("1 10 11", ["fail: a", "fail: b", "fail: c"], 0)

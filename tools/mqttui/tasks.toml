@@ -1378,9 +1378,9 @@ hidden = true
 id = "scale-chart-scale-out"
 group = "Benchmark"
 hidden = true
-name = "Regenerate the README's QoS 0 scale-out chart"
+name = "Regenerate the README's QoS 0 and QoS 1 scale-out charts"
 script = "bench/scale/chart-scale-out.py"
-about = "Draws docs/benchmarks/img/scale-out-qos0.svg from the knees recorded in bench/scale/knee-3-5-7-10.md, marking each point certified, floor or uncertified. The output is committed; a diff after running means the chart and the card disagree."
+about = "Draws docs/benchmarks/img/scale-out-qos0.svg and scale-out-qos1.svg from the points recorded in bench/scale/knee-3-5-7-10.md and docs/benchmarks/QOS1-SCALE-CURVE.md, marking each point certified, partial, floor or uncertified and the first failing rung above it. The output is committed; a diff after running means a chart and its source document disagree."
 requires = ["python3"]
 duration = "instant"
 

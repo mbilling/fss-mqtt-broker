@@ -38,6 +38,15 @@ handling** — mqttd's own hot path had ~2× headroom at the knee. See
 |---:|---:|---:|---:|---:|---:|---:|---|
 | 3 | **120,000 msg/s** | **25.9 MB/s** | 40,000/s · 8.64 MB/s | 3 + control | 120,000.4/s | 0.001 % | ≤ 5 ms ± 5.2 ms clock |
 | 5 | **180,000 msg/s** | **38.9 MB/s** | 36,000/s · 7.78 MB/s | 3 + control | 180,001.3/s | 0.001 % | ≤ 5 ms ± 6.5 ms clock |
+| 7 | **270,000 msg/s** | **58.3 MB/s** | 38,571/s · 8.33 MB/s | 2 certified of 3 + control | 269,995/s (broker) | — | ≤ 500 ms |
+| 10 | **390,000 msg/s** | **84.2 MB/s** | 39,000/s · 8.42 MB/s | 1 certified of 3 + control | 390,002/s (broker) | — | ≤ 500 ms |
+
+The 7- and 10-node rows are a **different campaign** (2026-09-26, one provisioning;
+see [7 and 10 nodes](#7-and-10-nodes--one-provisioning-2026-09-26)), with 20
+consumers per site rather than 10, and they are qualified less strictly: the
+repetitions not certified were INVALID on driver-side endpoint evidence while
+every broker received the full offer. 7 nodes has a measured knee just above:
+300,000/s failed on late publishers.
 
 Throughput is application payload: 216 bytes per message (a 200-byte body plus
 16 bytes of timestamp and sequence the audit driver appends so every identity can
@@ -49,9 +58,12 @@ roughly doubles again as each message is delivered to its shared-group member.
 [Payload size is nearly free](#payload-size-is-nearly-free).
 
 **Scaling 3 → 5 nodes is 1.5× the load on 1.67× the nodes — 90 % of linear.**
-Per-node capacity *falls* as the cluster grows, because cross-node delivery means
-more packets per message and they land on the one core already saturating on
-interrupt handling.
+Between those two runs per-node capacity fell. The explanation offered at the
+time: cross-node delivery means more packets per message, and they land on the
+one core already saturating on interrupt handling. **The fall does not continue:**
+7 and 10 nodes, with every broker holding a local member and 0.00% crossing,
+carry ~39k/node, back between the 3- and 5-node points
+([below](#7-and-10-nodes--one-provisioning-2026-09-26)).
 
 Delivery matched offer to within 2 msg/s at every rung of both runs.
 **53,607,265** and **90,825,125** unique message identities were reconciled,
@@ -202,8 +214,9 @@ routing question rather than a kernel-tuning one.
 
 ## Where this stops
 
-Neither figure is a knee, and we have not published one. Three things stand in
-the way, all of them ours rather than the broker's:
+The 3- and 5-node figures are not knees. The 7-node campaign found one, between
+38.6k and 42.9k msg/s per node (below). As of 2026-09-26, the three limits the
+first campaign named:
 
 1. **The pending-publish cap.** Each in-flight QoS 1 publish holds an entry in a
    per-broker table capped at 4,096 in `v1.0.17`. Since emqtt-bench holds one
@@ -215,11 +228,69 @@ the way, all of them ours rather than the broker's:
    withheld 104 acks, exactly as predicted. Issue
    [#633](https://github.com/mbilling/fss-mqtt-broker/issues/633) raises the
    bound; the curve cannot pass 204,800 msg/s at 5 nodes until it ships.
+   **Shipped** (65,536 entries, bounded by bytes): the 10-node point carried
+   39,000 publishers' worth of 390,000 msg/s with no eviction.
 2. **Driver capacity** is no longer the binding constraint, but it is close
    enough to confuse a reading: driver cores ran 45–52 % mean while the broker's
    hot core ran 91–99 %. An earlier revision of this document had that backwards.
-3. **Sizes 7 and 10 are unmeasured.** A two-point curve constrains a line; it
-   does not establish one.
+3. **Sizes 7 and 10 are measured** — below.
+
+## 7 and 10 nodes — one provisioning (2026-09-26)
+
+**Per-node QoS 1 capacity holds at 7 and 10 nodes**: ~39k msg/s per node, against
+40k at 3 and 36k at 5. **7 nodes has a knee**, between 38.6k and 42.9k per node.
+
+**Setup:**
+- **Order:** arms 10 → 7 → 10 on 10 × CCX23 + 20 × CCX33, re-formed per size by
+  `resize-cluster.sh`, through `482-per-node-knee.sh`
+  (`bench/scale/qos1-campaign/curve-n7-n10.env`).
+- **Binary:** `main` 0a08187, pinned by sha256. That is v1.0.18's broker minus
+  the #647 retransmit-timing fix.
+- **Driver:** the same audited driver as above (`67bb4194…`).
+- **Site shape:** the same as above, **except 20 consumers per site in 2
+  containers**. With 10, the containers would cover only 6 of 10 brokers (6 of 7)
+  and ~40% of publishes would cross; with 20 every broker holds 2 local members.
+  Each container still receives 15,000/s.
+- **Drivers:** all 20 at both sizes.
+- **Gates:** crossing certified 0.00% on every broker of every rung of all three
+  arms (`GATE … PASS`, `cert=canary`).
+- **Drift:** the closing 10-node arm matched the opening one at 12 sites within
+  0.001% (360,002 vs 360,004/s), with busiest-broker idle 28% vs 29%.
+
+| nodes | sites | per node | broker received/s | busiest broker idle | verdict |
+|---|---|---|---|---|---|
+| 10 | 10 | 30.0k | 299,996 | 38% | pass, p99 ≤ 5 ms |
+| 10 | 12 | 36.0k | 360,004 | 29% | INVALID EVIDENCE |
+| 10 | 13 | 39.0k | 390,020 | 25% | **pass**, p99 ≤ 500 ms |
+| 10 | 13 rep 2–3 | 39.0k | 390,002 · 390,002 | 25% | INVALID EVIDENCE ×2 |
+| 7 | 8 | 34.3k | 240,002 | 33% | pass, p99 ≤ 5 ms |
+| 7 | 9 | 38.6k | 270,002 | 26% | **pass**, p99 ≤ 500 ms |
+| 7 | 9 rep 2 | 38.6k | 269,955 | 26% | INVALID EVIDENCE |
+| 7 | 9 rep 3 | 38.6k | 269,995 | 25% | **pass**, p99 ≤ 500 ms |
+| 7 | 10 | 42.9k | 300,002 | 23% | **FAIL — publishers late (7%)** |
+
+**The INVALID EVIDENCE rungs are the driver's measurement, not the broker's.**
+- **What happened:** the audited driver's endpoint scrapes landed outside the
+  window's 2% uncertainty bound, so the summarizer refuses to certify
+  subscriber-side delivery from them.
+- **What the brokers saw:** every broker's own counter shows the full offer
+  received, with 0.00% crossing.
+- **Not load:** the flag also appears at 6 sites on 7 nodes (low load), so it is
+  intermittent rather than load-driven, and deserves its own fix.
+- **So what this table can claim:** 7 nodes at 38.6k/node has 2 of 3 repetitions
+  certified; 10 nodes at 39k/node has 1 of 3. Neither meets this document's
+  "3 + control" bar, and both are reported as such.
+
+**The 7-node knee is the broker's.**
+- At QoS 1 a late publisher is a slow acknowledgement, not a busy driver: every
+  driver was ≥ 66% idle on that rung.
+- The broker's busiest core was 15% idle at its lowest second.
+- 300,000/s at 7 nodes (42.9k/node) fails; 270,000/s (38.6k/node) passes.
+
+**10 nodes has no knee here.** Its 42k/node probe was skipped by the ladder's
+early stop, which counted the two INVALID EVIDENCE repetitions as failures. That
+counting is now fixed: evidence-only failures neither count toward the stop nor
+reset it.
 
 ## The workload
 
@@ -279,6 +350,24 @@ bench/scale/qos1-campaign/run-confirm.sh
 
 python3 bench/scale/qos1-campaign/report.py RUN --output RUN/analysis
 ```
+
+The 7- and 10-node points run as arms of one provisioning through the knee
+campaign, with the same audited driver (build it with
+`bench/scale/qos1-driver/build.sh <dir>`; the published points used the archive
+with sha256 `67bb4194…`):
+
+```sh
+cd bench/scale
+set -a && . qos1-campaign/curve-n7-n10.env && set +a
+export QOS1_DRIVER_ARCHIVE=/absolute/path/to/driver.tar.gz
+export MQTTD_VERSION=1.0.18      # or MQTTD_URL=... MQTTD_SHA256=... BENCH_GIT_REF=<commit>
+PREFLIGHT_ONLY=1 ./482-per-node-knee.sh   # offline
+./482-per-node-knee.sh                    # PAID: 10 -> 7 -> 10 on 30 servers
+python3 extract-lane-e.py --crossing-gate 0.5 .runs/knee-<stamp>/<arm>/results
+python3 summarize-curve.py .runs/knee-<stamp>/<arm>/results
+```
+
+The run behind the 7- and 10-node rows is `knee-20260926T151513Z`.
 
 Raw captures, per-rung metrics, ledgers, clock reports and `evidence.sha256` are
 retained per run outside the worktree. The run directories behind this document
