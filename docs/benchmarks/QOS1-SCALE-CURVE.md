@@ -351,6 +351,24 @@ bench/scale/qos1-campaign/run-confirm.sh
 python3 bench/scale/qos1-campaign/report.py RUN --output RUN/analysis
 ```
 
+The 7- and 10-node points run as arms of one provisioning through the knee
+campaign, with the same audited driver (build it with
+`bench/scale/qos1-driver/build.sh <dir>`; the published points used the archive
+with sha256 `67bb4194…`):
+
+```sh
+cd bench/scale
+set -a && . qos1-campaign/curve-n7-n10.env && set +a
+export QOS1_DRIVER_ARCHIVE=/absolute/path/to/driver.tar.gz
+export MQTTD_VERSION=1.0.18      # or MQTTD_URL=... MQTTD_SHA256=... BENCH_GIT_REF=<commit>
+PREFLIGHT_ONLY=1 ./482-per-node-knee.sh   # offline
+./482-per-node-knee.sh                    # PAID: 10 -> 7 -> 10 on 30 servers
+python3 extract-lane-e.py --crossing-gate 0.5 .runs/knee-<stamp>/<arm>/results
+python3 summarize-curve.py .runs/knee-<stamp>/<arm>/results
+```
+
+The run behind the 7- and 10-node rows is `knee-20260926T151513Z`.
+
 Raw captures, per-rung metrics, ledgers, clock reports and `evidence.sha256` are
 retained per run outside the worktree. The run directories behind this document
 are `curve-n3-20260921T061627Z` (3 nodes) and `curve-n5-d12-20260920T145744Z`

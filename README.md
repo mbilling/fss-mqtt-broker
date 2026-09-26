@@ -111,6 +111,9 @@ Read strictly, by the rules fixed before the run:
   full offer but never held the per-site band. Its strictly certified figure is
   900k.
 
+Method, the rules fixed before the run, and the commands to reproduce it:
+[knee-3-5-7-10.md](bench/scale/knee-3-5-7-10.md#reproduce).
+
 The earlier "5 → 7 nodes plateaus" reading came from a benchmark gap: one of 7
 brokers had no local subscriber, so 14% of publishes crossed the cluster. It
 does not reproduce under a controlled harness.
@@ -149,7 +152,8 @@ both ways — no durable session, so this is the routing path, not the fsync one
 7 nodes carries 270k and fails at 300k (42.9k/node) on late publishers. At QoS 1
 that means slow acks from the brokers; every load generator was still ≥ 66% idle.
 10 nodes carried 390k (39k/node) without reaching its knee. Details and every
-rung: [QOS1-SCALE-CURVE.md](docs/benchmarks/QOS1-SCALE-CURVE.md#7-and-10-nodes--one-provisioning-2026-09-26).
+rung: [QOS1-SCALE-CURVE.md](docs/benchmarks/QOS1-SCALE-CURVE.md#7-and-10-nodes--one-provisioning-2026-09-26);
+reproduce: [QOS1-SCALE-CURVE.md § Reproduction](docs/benchmarks/QOS1-SCALE-CURVE.md#reproduction).
 
 
 MB/s is application payload (216 B/message). **The constraint is packets, not
