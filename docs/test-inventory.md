@@ -932,7 +932,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 450 test(s)
+## `crates/mqttd/src/lib.rs` — 451 test(s)
 
 - `admission::tests::the_global_cap_refuses_at_the_bound_and_recovers`
 - `admission::tests::the_penalty_box_refuses_after_the_threshold`
@@ -1075,6 +1075,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::forwarding::interest_index_tests::nodes_sharing_a_filter_are_independent`
 - `hub::forwarding::interest_index_tests::re_announcing_replaces_the_previous_snapshot`
 - `hub::forwarding::interest_index_tests::resolving_the_same_interest_twice_mints_no_new_ids`
+- `hub::forwarding::pending_bounds::a_re_routed_forward_on_an_old_publish_is_not_retransmitted_before_it_is_due`
 - `hub::forwarding::pending_bounds::an_oversized_publish_is_admitted_alone`
 - `hub::forwarding::pending_bounds::sweep_cost_at_a_full_table` — `#[ignore]`d
 - `hub::forwarding::pending_bounds::the_byte_bound_evicts_until_the_newcomer_fits`
