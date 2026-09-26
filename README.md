@@ -15,7 +15,7 @@
 >
 > **Linear scale-out, 3 → 10 nodes:**
 > - **QoS 0:** ~114,000 msg/s **per 4-vCPU node** — **1.14M msg/s on 10 nodes, 40 vCPU in total**.
-> - **QoS 1:** ~39,000 msg/s per node — **390,000 msg/s on 10 nodes**.
+> - **QoS 1:** ~39,000–42,000 msg/s per node — **390,000–420,000 msg/s on 10 nodes**.
 >
 > Both use shared subscriptions. [Scale-out ↓](#cluster-scale-out-qos-0-shared-subscriptions)
 
@@ -135,7 +135,7 @@ both ways — no durable session, so this is the routing path, not the fsync one
 3 nodes  ██████████░░░░░░░░░░░░░░░░░░░░░░░  120k msg/s   25.9 MB/s   p99 ≤ 5 ms     40.0k/node
 5 nodes  ███████████████░░░░░░░░░░░░░░░░░░  180k         38.9 MB/s   p99 ≤ 5 ms     36.0k/node
 7 nodes  ███████████████████████░░░░░░░░░░  270k         58.3 MB/s   p99 ≤ 500 ms   38.6k/node   knee: 300k fails
-10 nodes █████████████████████████████████  390k         84.2 MB/s   p99 ≤ 500 ms   39.0k/node   no knee reached
+10 nodes █████████████████████████████████  390k         84.2 MB/s   p99 ≤ 500 ms   39.0k/node   knee: 420k passes, 450k fails
 ```
 
 **Per-node QoS 1 capacity holds out to 10 nodes.**
@@ -151,7 +151,10 @@ both ways — no durable session, so this is the routing path, not the fsync one
 
 7 nodes carries 270k and fails at 300k (42.9k/node) on late publishers. At QoS 1
 that means slow acks from the brokers; every load generator was still ≥ 66% idle.
-10 nodes carried 390k (39k/node) without reaching its knee. Details and every
+10 nodes carried 420k (42k/node) with no failure signal and fails at 450k
+(45k/node) on late publishers, so its knee is at or just above 7 nodes'. The 420k
+rungs are not certified: the load driver's metrics endpoint renders too slowly
+under that load for the 60 s window's evidence check. Details and every
 rung: [QOS1-SCALE-CURVE.md](docs/benchmarks/QOS1-SCALE-CURVE.md#7-and-10-nodes--one-provisioning-2026-09-26);
 reproduce: [QOS1-SCALE-CURVE.md § Reproduction](docs/benchmarks/QOS1-SCALE-CURVE.md#reproduction).
 
