@@ -1341,17 +1341,20 @@ caution = "Destroys and re-creates a PAID Hetzner server."
 [[task]]
 id = "scale-per-node-knee"
 group = "Benchmark"
-name = "N=7 vs N=5 per-node knee on one provisioning (PAID, #482/#613)"
+name = "Per-node knee across cluster sizes on one provisioning (PAID, #482/#613)"
 script = "bench/scale/482-per-node-knee.sh"
 about = """
-Source 482-per-node-knee.env first. Provisions 7 brokers and 18 drivers once, runs
-the 7-node ladder, re-forms the same hosts as 5 nodes for the 5-node ladder, then
-returns to 7 for a closing drift control. Each arm gets its own forwarding canary
-and calibration; the ladders are matched in per-node offer. Teardown is trapped
-on every exit. PREFLIGHT_ONLY=1 checks all three arms offline.
+Source a knee env first (knee-3-5-7-10.env, or 482-per-node-knee.env for the
+7 -> 5 -> 7 pair). KNEE_ARMS lists the arms as <brokers>:<drivers>:<ladder>: the
+first is provisioned once, every later arm re-forms a prefix of the same hosts
+and drivers, and the last repeats the first as a drift control. Each arm gets its
+own mesh wait, forwarding canary, driver gate and calibration; a bad driver is
+swapped in place and its rung rerun; ladders can stop at their knee
+(LANE_E_STOP_AFTER_FAILS). Teardown is trapped on every exit. PREFLIGHT_ONLY=1
+checks every arm offline.
 """
 requires = ["tofu", "jq", "ssh", "python3"]
-caution = "Provisions 25 PAID Hetzner servers unless PREFLIGHT_ONLY=1. Run 482-knee-smoke.sh first; confirm budget; verify the project is empty after teardown."
+caution = "Provisions up to 30 PAID Hetzner servers unless PREFLIGHT_ONLY=1. Run 482-knee-smoke.sh first; confirm budget; verify the project is empty after teardown."
 
 [[task]]
 id = "scale-per-node-knee-smoke"

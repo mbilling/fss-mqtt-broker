@@ -16,7 +16,7 @@ SCALE = Path(__file__).resolve().parent
 STUB = '''#!/usr/bin/env python3
 import json, os, sys
 argv = [os.path.basename(sys.argv[0])] + sys.argv[1:]
-env = {k: os.environ.get(k, "") for k in ("LANE_E_SITES_OVERRIDE", "KEEP_INFRA", "RUN_DIR", "PREFLIGHT_ONLY")}
+env = {k: os.environ.get(k, "") for k in ("LANE_E_SITES_OVERRIDE", "KEEP_INFRA", "RUN_DIR", "PREFLIGHT_ONLY", "DRIVER_COUNT")}
 with open(os.environ["CALL_LOG"], "a") as f:
     f.write(json.dumps({"argv": argv, "env": env}) + "\\n")
 fail_on = os.environ.get("FAIL_ON")
@@ -130,6 +130,20 @@ class ResizeTests(Rig):
         self.assertIn("left_out=mqttd-6,mqttd-7", stamp)
         self.assertEqual((out / "known_hosts").read_text(), (self.provision / "known_hosts").read_text())
 
+    def test_a_driver_prefix_scales_the_fleet_with_the_brokers(self):
+        r = self.run_script(self.rig / "resize-cluster.sh", self.full, 3, self.root / "arm3", 6)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        got = json.loads((self.root / "arm3/inventory-3.json").read_text())
+        self.assertEqual(got["drivers"], inventory()["drivers"][:6])
+        self.assertEqual(len(got["brokers"]), 3)
+        self.assertIn("drivers=6 of 10", (self.root / "arm3/RESIZED.txt").read_text())
+        hosts = {c["argv"][-2] for c in self.calls()}
+        self.assertFalse(any(h.startswith("root@203.0.113.") for h in hosts), "drivers are never touched")
+        for bad, msg in (("11", "exceeds the 10 drivers"), ("0", "positive integer")):
+            with self.subTest(drivers=bad):
+                r = self.run_script(self.rig / "resize-cluster.sh", self.full, 3, self.root / f"x{bad}", bad)
+                self.assertIn(msg, r.stderr)
+
     def test_the_full_size_is_the_way_back(self):
         r = self.resize(7, self.root / "arm3")
         self.assertEqual(r.returncode, 0, r.stderr)
@@ -197,6 +211,10 @@ class CampaignTests(Rig):
     def campaign(self, env=None):
         return self.run_script(self.rig / "482-per-node-knee.sh", env=env)
 
+    def ladders(self):
+        """The ladders of the env's KNEE_ARMS, in arm order."""
+        return [a.strip().split(":", 2)[2] for a in self.env["KNEE_ARMS"].split(";") if a.strip()]
+
     def steps(self):
         return [c["argv"][0] for c in self.calls()]
 
@@ -206,8 +224,7 @@ class CampaignTests(Rig):
         calls = self.calls()
         self.assertEqual([c["argv"] for c in calls], [["run.sh", "full", "7"], ["run.sh", "full", "5"],
                                                      ["run.sh", "full", "7"]])
-        self.assertEqual([c["env"]["LANE_E_SITES_OVERRIDE"] for c in calls],
-                         [self.env["KNEE_LADDER_FULL"], self.env["KNEE_LADDER_SMALL"], self.env["KNEE_LADDER_CLOSE"]])
+        self.assertEqual([c["env"]["LANE_E_SITES_OVERRIDE"] for c in calls], self.ladders())
         self.assertEqual(len({c["env"]["RUN_DIR"] for c in calls}), 3, "each preflight needs its own scratch dir")
         self.assertNotIn("teardown.sh", self.steps())
 
@@ -224,17 +241,38 @@ class CampaignTests(Rig):
         first = calls[0]
         self.assertEqual(first["argv"], ["run.sh", "full", "7"])
         self.assertEqual(first["env"]["KEEP_INFRA"], "1")
-        self.assertEqual(first["env"]["LANE_E_SITES_OVERRIDE"], self.env["KNEE_LADDER_FULL"])
+        self.assertEqual(first["env"]["LANE_E_SITES_OVERRIDE"], self.ladders()[0])
         full = Path(first["env"]["RUN_DIR"]) / "inventory-7.json"
         resizes = [c["argv"] for c in calls if c["argv"][0] == "resize-cluster.sh"]
         # Both resizes start from the provisioning's own inventory, never a prefix.
-        self.assertEqual([(a[1], a[2]) for a in resizes], [(str(full), "5"), (str(full), "7")])
+        self.assertEqual([(a[1], a[2], a[4]) for a in resizes], [(str(full), "5", "18"), (str(full), "7", "18")])
         ladders = [c["env"]["LANE_E_SITES_OVERRIDE"] for c in calls if c["argv"][0] == "run-curve.sh"]
-        self.assertEqual(ladders, [self.env["KNEE_LADDER_SMALL"], self.env["KNEE_LADDER_CLOSE"]])
+        self.assertEqual(ladders, self.ladders()[1:])
         boots = [c["argv"] for c in calls if c["argv"][0] == "bootstrap-cluster.sh"]
         self.assertEqual([b[-1] for b in boots], ["durable", "durable"], "same mode run.sh gives arm 1")
         self.assertTrue(boots[0][2].endswith("2-n5/inventory-5.json"))
-        self.assertTrue(boots[1][2].endswith("3-n7-close/inventory-7.json"))
+        self.assertTrue(boots[1][2].endswith("3-n7/inventory-7.json"))
+
+    def test_a_four_size_curve_scales_the_driver_fleet_with_each_arm(self):
+        arms = "10:20:1 10 20; 7:14:1 7 14; 5:10:1 5 10; 3:6:1 3 6; 10:20:1 20"
+        r = self.campaign(env={"KNEE_ARMS": arms, "DRIVER_COUNT": "20"})
+        self.assertEqual(r.returncode, 0, r.stderr)
+        calls = self.calls()
+        self.assertEqual(calls[0]["argv"], ["run.sh", "full", "10"])
+        resizes = [(c["argv"][2], c["argv"][4], Path(c["argv"][3]).name) for c in calls
+                   if c["argv"][0] == "resize-cluster.sh"]
+        self.assertEqual(resizes, [("7", "14", "2-n7"), ("5", "10", "3-n5"), ("3", "6", "4-n3"),
+                                   ("10", "20", "5-n10")])
+        self.assertEqual([c["env"]["LANE_E_SITES_OVERRIDE"] for c in calls if c["argv"][0] == "run-curve.sh"],
+                         ["1 7 14", "1 5 10", "1 3 6", "1 20"])
+        for arm in ("1-n10", "2-n7", "3-n5", "4-n3", "5-n10"):
+            self.assertIn(f"{arm}/results", r.stderr)
+
+    def test_preflight_checks_each_arm_with_its_own_drivers(self):
+        r = self.campaign(env={"PREFLIGHT_ONLY": "1", "KNEE_ARMS": "10:20:1 20; 3:6:1 6", "DRIVER_COUNT": "20"})
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual([(c["argv"][2], c["env"].get("DRIVER_COUNT")) for c in self.calls()],
+                         [("10", "20"), ("3", "6")])
 
     def test_a_failed_arm_keeps_its_evidence_and_still_destroys(self):
         r = self.campaign(env={"FAIL_ON": "run-curve.sh"})
@@ -268,16 +306,16 @@ class CampaignTests(Rig):
         self.assertEqual(swap[1:4], [str(full), "broker", "2"])
         resizes = [c["argv"] for c in calls if c["argv"][0] == "resize-cluster.sh"]
         self.assertEqual([(a[2], Path(a[3]).name) for a in resizes],
-                         [("7", "1-n7-r2"), ("5", "2-n5"), ("7", "3-n7-close")])
+                         [("7", "1-n7-r2"), ("5", "2-n5"), ("7", "3-n7")])
         ladders = [c["env"]["LANE_E_SITES_OVERRIDE"] for c in calls if c["argv"][0] == "run-curve.sh"]
-        self.assertEqual(ladders[0], self.env["KNEE_LADDER_FULL"], "the re-formed arm runs the opening ladder")
+        self.assertEqual(ladders[0], self.ladders()[0], "the re-formed arm runs the opening ladder")
         self.assertIn("1-n7-r2/results", r.stderr, "the summary gates the arm that actually measured")
 
     def test_a_bad_broker_in_a_resized_arm_is_swapped_once(self):
         r = self.campaign(env={"MARK_BAD_BROKER": "2-n5"})
         self.assertEqual(r.returncode, 0, r.stderr)
         resizes = [Path(c["argv"][3]).name for c in self.calls() if c["argv"][0] == "resize-cluster.sh"]
-        self.assertEqual(resizes, ["2-n5", "2-n5-r2", "3-n7-close"])
+        self.assertEqual(resizes, ["2-n5", "2-n5-r2", "3-n7"])
         self.assertEqual(self.steps().count("replace-node.sh"), 1)
 
     def test_a_failed_broker_swap_still_destroys(self):
@@ -295,7 +333,12 @@ class CampaignTests(Rig):
         for env, message in (({"KEEP_INFRA": "1"}, "do not set KEEP_INFRA"),
                              ({"RUN_DIR": "/x"}, "do not set RUN_DIR"),
                              ({"LANES": "AE"}, "LANES must be E"),
-                             ({"KNEE_SMALL": "7"}, "must be below KNEE_FULL")):
+                             ({"KNEE_ARMS": "7:18:1 7"}, "at least two arms"),
+                             ({"KNEE_ARMS": "7:18:1 7; 10:18:1 10"}, "more than the 7 the first arm provisions"),
+                             ({"KNEE_ARMS": "7:18:1 7; 5:20:1 5"}, "more than the 18 the first arm provisions"),
+                             ({"KNEE_ARMS": "7:18:1 7; 5:x:1 5"}, "is not <brokers>:<drivers>:<ladder>"),
+                             ({"KNEE_ARMS": "7:18:1 7; 5:10:"}, "is not <brokers>:<drivers>:<ladder>"),
+                             ({"DRIVER_COUNT": "10"}, "must equal the first arm's drivers (18)")):
             with self.subTest(env=env):
                 r = self.campaign(env=env)
                 self.assertNotEqual(r.returncode, 0)
@@ -672,6 +715,64 @@ open("{self.root}/hook.log", "a").write(" ".join(sys.argv[1:]) + "\\n")
         r = self.gate([[10, 3]] * 4, [[85, 5], [90, 5], [88, 5]])
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertFalse((self.root / "out/laneE/bad-brokers.txt").exists())
+
+
+class KneeStopTests(Rig):
+    """run-curve.sh's ladder loop, extracted verbatim, with the rung and its
+    verdict stubbed: the rung records itself, the verdict comes from a script."""
+
+    def ladder(self, sites, verdicts, stop_after):
+        src = (self.rig / "run-curve.sh").read_text()
+        start = src.index("declare -a e_seen=()")
+        end = src.index("\ndone\n", src.index("for e_sites in", start)) + len("\ndone\n")
+        loop = src[start:end]
+        body = f'''
+say() {{ echo "$*" >&2; }}
+LANE_E_SITES=({sites})
+lane_e_rung_checked() {{ local d="$OUT/laneE/sites-$1"; [ "$2" -gt 1 ] && d="$d-rep$2"; mkdir -p "$d"; echo "$1 $2" >>"$OUT/ran"; }}
+lane_e_rung_verdict() {{ v=$(sed -n "$(wc -l <"$OUT/ran")p" "$OUT/verdicts"); echo "$v"; }}
+mkdir -p "$OUT/laneE"
+printf '%s\\n' {" ".join(repr(v) for v in verdicts)} >"$OUT/verdicts"
+{loop}
+'''
+        return subprocess.run(["bash", "-c", body], text=True, capture_output=True, cwd=self.root,
+                              env=self.env | {"OUT": str(self.root / "out"), "N": "7",
+                                              "LANE_E_STOP_AFTER_FAILS": str(stop_after),
+                                              "LANE_E_SECS": "60", "LANE_E_PAYLOAD": "200",
+                                              "LANE_E_PUBS_PER_SITE": "1200", "LANE_E_SITE_RATE": "30000",
+                                              "LANE_E_PUB_CONTAINERS_PER_SITE": "2"})
+
+    def ran(self):
+        return (self.root / "out/ran").read_text().split("\n")[:-1]
+
+    def test_two_failing_rungs_stop_the_ladder_and_name_what_was_skipped(self):
+        r = self.ladder("1 14 14 17 18 20 21", ["pass", "pass", "pass", "fail: p99", "pass", "fail: p99",
+                                                "fail: OFFER NOT MET"], 2)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        # One failing rung between passes resets the count: 17 fails, 18 passes.
+        self.assertEqual(self.ran(), ["1 1", "14 1", "14 2", "17 1", "18 1", "20 1", "21 1"])
+        self.assertFalse((self.root / "out/laneE/ladder-stop.txt").exists(), "the ladder ended on its own")
+        r = self.ladder("1 14 14 17 18 20 21", ["pass", "pass", "pass", "fail: p99", "fail: p99", "pass", "pass"], 2)
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_the_skipped_names_match_what_the_gate_derives(self):
+        (self.root / "out").mkdir(exist_ok=True)
+        r = self.ladder("1 10 11 11 12 13", ["pass", "fail: p99", "fail: p99", "x", "x", "x"], 2)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.ran(), ["1 1", "10 1", "11 1"])
+        stop = (self.root / "out/laneE/ladder-stop.txt").read_text()
+        self.assertIn("stopped_after=sites-11 consecutive_fails=2 threshold=2", stop)
+        # 11 already ran once, so the skipped repeat is -rep2, as shape.txt counts it.
+        self.assertIn("skipped=sites-11-rep2 sites-12 sites-13", stop)
+        self.assertIn("KNEE", r.stderr)
+        self.assertEqual((self.root / "out/laneE/ladder-verdicts.txt").read_text().splitlines(),
+                         ["sites-1 pass", "sites-10 fail: p99", "sites-11 fail: p99"])
+
+    def test_off_by_default_climbs_everything(self):
+        r = self.ladder("1 10 11", ["fail: a", "fail: b", "fail: c"], 0)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.ran(), ["1 1", "10 1", "11 1"])
+        self.assertFalse((self.root / "out/laneE/ladder-verdicts.txt").exists())
 
 
 if __name__ == "__main__":

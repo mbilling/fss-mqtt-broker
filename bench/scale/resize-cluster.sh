@@ -2,7 +2,7 @@
 # Re-form a LIVE provisioning at a smaller (or its full) broker count, so two
 # cluster SIZES can be compared on the SAME hardware.
 #
-#   ./resize-cluster.sh <full-inventory.json> <size> <new-run-dir>
+#   ./resize-cluster.sh <full-inventory.json> <size> <new-run-dir> [drivers]
 #
 # WHY THIS EXISTS. swap-binary.sh made a binary A/B a one-provisioning
 # comparison, and said what it could not do: "anything that varies the cluster
@@ -37,7 +37,7 @@
 set -euo pipefail
 . "$(dirname "$0")/lib.sh"
 
-usage="usage: resize-cluster.sh <full-inventory.json> <size> <new-run-dir>"
+usage="usage: resize-cluster.sh <full-inventory.json> <size> <new-run-dir> [drivers]"
 INVENTORY="${1:?$usage}"
 SIZE="${2:?$usage}"
 NEW_RUN="${3:?$usage}"
@@ -57,6 +57,16 @@ case "$SIZE" in
 '' | *[!0-9]* | 0*) die "size must be a positive integer, got '$SIZE'" ;;
 esac
 [ "$SIZE" -le "$FULL" ] || die "size $SIZE exceeds the $FULL brokers this provisioning has"
+# [drivers] keeps a PREFIX of the driver fleet too. A scaling curve across sizes
+# holds drivers proportional to brokers (2N), so that at a matched per-node rate
+# every driver carries the same load whatever N is — with one fixed fleet, the
+# largest size would load its drivers hardest. Default: every driver.
+FULL_DRIVERS=$(driver_count)
+DRIVERS="${4:-$FULL_DRIVERS}"
+case "$DRIVERS" in
+'' | *[!0-9]* | 0*) die "drivers must be a positive integer, got '$DRIVERS'" ;;
+esac
+[ "$DRIVERS" -le "$FULL_DRIVERS" ] || die "drivers $DRIVERS exceeds the $FULL_DRIVERS drivers this provisioning has"
 # A resized inventory is a PREFIX: resizing it again would silently shrink the
 # provisioning the next arm believes it has. Refuse, and name the full one.
 if [ "$(inv '.resized_from // empty')" != "" ]; then
@@ -95,8 +105,8 @@ done
 mkdir -p "$NEW_RUN"
 # The new run starts from the hosts' known keys rather than accepting them again.
 [ ! -f "$RUN/known_hosts" ] || cp "$RUN/known_hosts" "$NEW_RUN/known_hosts"
-jq --argjson n "$SIZE" --argjson full "$FULL" --arg from "$INVENTORY" \
-	'.brokers |= .[:$n] | .node_count = $n | .resized_from = $full | .resized_inventory = $from' \
+jq --argjson n "$SIZE" --argjson full "$FULL" --argjson d "$DRIVERS" --arg from "$INVENTORY" \
+	'.brokers |= .[:$n] | .drivers |= .[:$d] | .node_count = $n | .resized_from = $full | .resized_inventory = $from' \
 	"$INVENTORY" >"$NEW_RUN/inventory-$SIZE.json"
 
 # Stamped like SWAPPED-BINARY.txt: the arm's hardware history is part of its result.
@@ -107,6 +117,7 @@ jq --argjson n "$SIZE" --argjson full "$FULL" --arg from "$INVENTORY" \
 	echo "full_inventory=$INVENTORY"
 	echo "kept=$(jq -r '[.brokers[].node_id] | join(",")' "$NEW_RUN/inventory-$SIZE.json")"
 	echo "left_out=$(jq -r --argjson n "$SIZE" '[.brokers[$n:][].node_id] | join(",")' "$INVENTORY")"
+	echo "drivers=$DRIVERS of $FULL_DRIVERS"
 } >"$NEW_RUN/RESIZED.txt"
 
 say "every broker is STOPPED with an empty store; $((FULL - SIZE)) left out"

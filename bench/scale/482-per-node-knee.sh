@@ -1,15 +1,20 @@
 #!/usr/bin/env bash
-# #482 / #613: N=7 vs N=5 per-node knee on ONE provisioning — the A/B/A.
+# Per-node knee across cluster sizes on ONE provisioning (#482 / #613).
 #
-#   set -a && . ./482-per-node-knee.env && set +a
-#   PREFLIGHT_ONLY=1 ./482-per-node-knee.sh    # offline: all three arms' shapes
-#   ./482-per-node-knee.sh                     # PAID: provisions 7 + drivers once
+#   set -a && . ./knee-3-5-7-10.env && set +a     # or 482-per-node-knee.env
+#   PREFLIGHT_ONLY=1 ./482-per-node-knee.sh       # offline: every arm's shape
+#   ./482-per-node-knee.sh                        # PAID: provisions the first arm once
 #
-# Arm 1  run.sh provisions KNEE_FULL brokers (7) and runs KNEE_LADDER_FULL.
-# Arm 2  resize-cluster.sh re-forms the SAME hosts as KNEE_SMALL nodes (5; the
-#        rest left stopped), bootstrap-cluster.sh starts them, KNEE_LADDER_SMALL.
-# Arm 3  back to KNEE_FULL on the same hosts, KNEE_LADDER_CLOSE: the drift
-#        control. (482-knee-smoke.sh runs the same three arms at 3 / 1 / 3.)
+# KNEE_ARMS is a ';'-separated list of arms, each `<brokers>:<drivers>:<ladder>`:
+#
+#   KNEE_ARMS="10:20:1 10 20 30; 7:14:1 7 14 21; 10:20:1 20"
+#
+# The FIRST arm is provisioned by run.sh at its size, with DRIVER_COUNT drivers
+# (which must equal its <drivers>), and is the provisioning every later arm
+# re-forms: resize-cluster.sh keeps the first <brokers> brokers and the first
+# <drivers> drivers, bootstrap-cluster.sh starts a fresh cluster on them. The
+# last arm repeating the first arm's size is the drift control. Arm k runs in
+# <campaign>/<k>-n<brokers>. (482-knee-smoke.sh runs 3 / 1 / 3 on small hosts.)
 #
 # A pinned driver is swapped for a fresh server in place (replace-node.sh) and
 # the rung it spoiled runs again; a pinned broker is swapped before its arm
@@ -27,27 +32,40 @@
 set -euo pipefail
 . "$(dirname "$0")/lib.sh"
 
-: "${KNEE_FULL:?source 482-per-node-knee.env first}"
-: "${KNEE_SMALL:?source 482-per-node-knee.env first}"
-: "${KNEE_LADDER_FULL:?source 482-per-node-knee.env first}"
-: "${KNEE_LADDER_SMALL:?source 482-per-node-knee.env first}"
-: "${KNEE_LADDER_CLOSE:?source 482-per-node-knee.env first}"
-[ "$KNEE_SMALL" -lt "$KNEE_FULL" ] || die "KNEE_SMALL ($KNEE_SMALL) must be below KNEE_FULL ($KNEE_FULL)"
+: "${KNEE_ARMS:?source a knee env first (KNEE_ARMS=<brokers>:<drivers>:<ladder>;...)}"
+# Parse once, refuse early: a malformed arm must not surface after provisioning.
+ARM_N=() ARM_D=() ARM_L=()
+IFS=';' read -r -a _arms <<<"$KNEE_ARMS"
+for _a in "${_arms[@]}"; do
+	_a="$(echo "$_a" | sed 's/^ *//; s/ *$//')"
+	[ -n "$_a" ] || continue
+	IFS=':' read -r _n _d _l <<<"$_a"
+	[[ "$_n" =~ ^[1-9][0-9]*$ && "$_d" =~ ^[1-9][0-9]*$ && -n "${_l// /}" ]] ||
+		die "KNEE_ARMS: '$_a' is not <brokers>:<drivers>:<ladder>"
+	ARM_N+=("$_n") ARM_D+=("$_d") ARM_L+=("$_l")
+done
+[ "${#ARM_N[@]}" -ge 2 ] || die "KNEE_ARMS needs at least two arms (a comparison), got ${#ARM_N[@]}"
+for ((k = 1; k < ${#ARM_N[@]}; k++)); do
+	[ "${ARM_N[$k]}" -le "${ARM_N[0]}" ] || die "arm $((k + 1)) has ${ARM_N[$k]} brokers, more than the ${ARM_N[0]} the first arm provisions"
+	[ "${ARM_D[$k]}" -le "${ARM_D[0]}" ] || die "arm $((k + 1)) has ${ARM_D[$k]} drivers, more than the ${ARM_D[0]} the first arm provisions"
+done
+[ "${DRIVER_COUNT:-}" = "${ARM_D[0]}" ] ||
+	die "DRIVER_COUNT=${DRIVER_COUNT:-unset} must equal the first arm's drivers (${ARM_D[0]}): it is what gets provisioned"
 [ "${LANES:-}" = E ] || die "LANES must be E for this campaign (got '${LANES:-}')"
 [ "${KEEP_INFRA:-0}" = 0 ] || die "do not set KEEP_INFRA — this script manages the cluster's lifetime itself"
 [ -z "${RUN_DIR:-}" ] || die "do not set RUN_DIR — each arm gets its own run dir under one campaign dir"
 
 if [ "${PREFLIGHT_ONLY:-0}" = 1 ]; then
-	# run.sh's preflight writes into a scratch run dir; the three calls must not
-	# share one or the second would read as a resume of the first.
+	# run.sh's preflight writes into a scratch run dir; the calls must not share
+	# one or the second would read as a resume of the first. Each arm is checked
+	# with ITS driver count, which is what its ladder will be dealt over.
 	pre="$(mktemp -d "${TMPDIR:-/tmp}/knee-preflight.XXXXXX")"
-	for arm in "$KNEE_FULL:$KNEE_LADDER_FULL" "$KNEE_SMALL:$KNEE_LADDER_SMALL" "$KNEE_FULL:$KNEE_LADDER_CLOSE"; do
-		n="${arm%%:*}" ladder="${arm#*:}"
-		say "preflight: $n nodes, ladder: $ladder"
-		RUN_DIR="$pre/$n-$(echo "$ladder" | tr ' ' '_')" LANE_E_SITES_OVERRIDE="$ladder" \
-			"$SCALE_DIR/run.sh" full "$n"
+	for ((k = 0; k < ${#ARM_N[@]}; k++)); do
+		say "preflight: arm $((k + 1)) — ${ARM_N[$k]} nodes, ${ARM_D[$k]} drivers, ladder: ${ARM_L[$k]}"
+		RUN_DIR="$pre/$((k + 1))-n${ARM_N[$k]}" DRIVER_COUNT="${ARM_D[$k]}" LANE_E_SITES_OVERRIDE="${ARM_L[$k]}" \
+			"$SCALE_DIR/run.sh" full "${ARM_N[$k]}"
 	done
-	say "all three arms' shapes valid; no cloud calls made (scratch: $pre)"
+	say "all ${#ARM_N[@]} arms' shapes valid; no cloud calls made (scratch: $pre)"
 	exit 0
 fi
 
@@ -105,11 +123,11 @@ swap_bad_brokers() {
 
 # run.sh's per-size tail (run-curve, collect, observe) for an arm that
 # resize-cluster.sh + bootstrap-cluster.sh brought up instead of run.sh.
-resized_arm() { # resized_arm <size> <arm-dir> <ladder> [retry]
-	local n="$1" dir="$2" ladder="$3" retry="${4:-0}" rc=0
-	say "════ arm $(basename "$dir"): $n nodes on the same hosts ════"
+resized_arm() { # resized_arm <size> <drivers> <arm-dir> <ladder> [retry]
+	local n="$1" d="$2" dir="$3" ladder="$4" retry="${5:-0}" rc=0
+	say "════ arm $(basename "$dir"): $n nodes, $d drivers, on the same hosts — ladder: $ladder ════"
 	ARM_DIR="$dir" ARM_INV="$dir/inventory-$n.json"
-	"$SCALE_DIR/resize-cluster.sh" "$FULL_INV" "$n" "$dir"
+	"$SCALE_DIR/resize-cluster.sh" "$FULL_INV" "$n" "$dir" "$d"
 	"$SCALE_DIR/bootstrap-cluster.sh" "$dir" "$dir/inventory-$n.json" durable
 	if [ "${OBSERVE:-1}" = 1 ]; then
 		"$SCALE_DIR/observe.sh" attach "$dir" "$dir/inventory-$n.json" || warn "observe attach failed — continuing unobserved"
@@ -117,7 +135,7 @@ resized_arm() { # resized_arm <size> <arm-dir> <ladder> [retry]
 	LANE_E_SITES_OVERRIDE="$ladder" "$SCALE_DIR/run-curve.sh" "$dir" "$dir/inventory-$n.json" || rc=$?
 	if [ "$rc" -ne 0 ]; then
 		if [ "$retry" = 0 ] && swap_bad_brokers "$dir" "$n"; then
-			resized_arm "$n" "$dir-r2" "$ladder" 1
+			resized_arm "$n" "$d" "$dir-r2" "$ladder" 1
 			return
 		fi
 		return "$rc"
@@ -129,27 +147,27 @@ resized_arm() { # resized_arm <size> <arm-dir> <ladder> [retry]
 	fi
 }
 
-A1="1-n$KNEE_FULL" A2="2-n$KNEE_SMALL" A3="3-n$KNEE_FULL-close"
-ARM_DIR="$CAMPAIGN/$A1" ARM_INV="$CAMPAIGN/$A1/inventory-$KNEE_FULL.json"
-say "════ arm $A1: provision $KNEE_FULL brokers + ${DRIVER_COUNT:-?} drivers, ladder: $KNEE_LADDER_FULL ════"
+A1="1-n${ARM_N[0]}"
+ARM_DIR="$CAMPAIGN/$A1" ARM_INV="$CAMPAIGN/$A1/inventory-${ARM_N[0]}.json"
+say "════ arm $A1: provision ${ARM_N[0]} brokers + ${ARM_D[0]} drivers, ladder: ${ARM_L[0]} ════"
 rc=0
-KEEP_INFRA=1 RUN_DIR="$ARM_DIR" LANE_E_SITES_OVERRIDE="$KNEE_LADDER_FULL" \
-	"$SCALE_DIR/run.sh" full "$KNEE_FULL" || rc=$?
+KEEP_INFRA=1 RUN_DIR="$ARM_DIR" LANE_E_SITES_OVERRIDE="${ARM_L[0]}" \
+	"$SCALE_DIR/run.sh" full "${ARM_N[0]}" || rc=$?
 FULL_INV="$ARM_INV"
 [ -f "$FULL_INV" ] || die "arm $A1 left no inventory at $FULL_INV"
-OPEN_ARM="$A1"
+DONE_ARMS=("$A1")
 if [ "$rc" -ne 0 ]; then
-	swap_bad_brokers "$CAMPAIGN/$A1" "$KNEE_FULL" || exit "$rc"
-	resized_arm "$KNEE_FULL" "$CAMPAIGN/$A1-r2" "$KNEE_LADDER_FULL" 1
-	OPEN_ARM="$LAST_ARM"
+	swap_bad_brokers "$CAMPAIGN/$A1" "${ARM_N[0]}" || exit "$rc"
+	resized_arm "${ARM_N[0]}" "${ARM_D[0]}" "$CAMPAIGN/$A1-r2" "${ARM_L[0]}" 1
+	DONE_ARMS=("$LAST_ARM")
 fi
 
-resized_arm "$KNEE_SMALL" "$CAMPAIGN/$A2" "$KNEE_LADDER_SMALL"
-SMALL_ARM="$LAST_ARM"
-resized_arm "$KNEE_FULL" "$CAMPAIGN/$A3" "$KNEE_LADDER_CLOSE"
-CLOSE_ARM="$LAST_ARM"
+for ((k = 1; k < ${#ARM_N[@]}; k++)); do
+	resized_arm "${ARM_N[$k]}" "${ARM_D[$k]}" "$CAMPAIGN/$((k + 1))-n${ARM_N[$k]}" "${ARM_L[$k]}"
+	DONE_ARMS+=("$LAST_ARM")
+done
 
-say "all three arms complete — gate each before reading any number:"
-for arm in "$OPEN_ARM" "$SMALL_ARM" "$CLOSE_ARM"; do
+say "all ${#ARM_N[@]} arms complete — gate each before reading any number:"
+for arm in "${DONE_ARMS[@]}"; do
 	echo "  python3 extract-lane-e.py --crossing-gate 0.5 $CAMPAIGN/$arm/results" >&2
 done

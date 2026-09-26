@@ -549,6 +549,13 @@ LANE_E_DRIVER_SOFTIRQ_MAX="${LANE_E_DRIVER_SOFTIRQ_MAX:-80}"
 LANE_E_DRIVER_GATE="${LANE_E_DRIVER_GATE:-1}"
 LANE_E_DRIVER_GATE_SECS="${LANE_E_DRIVER_GATE_SECS:-20}"
 LANE_E_SWAP_HOOK="${LANE_E_SWAP_HOOK:-}"
+# Stop a ladder at its knee: after LANE_E_STOP_AFTER_FAILS consecutive ladder
+# rungs FAIL (summarize-curve.py's own verdict, read the moment each rung ends),
+# skip the rest of the ladder and go straight to the control. The rungs above a
+# knee confirm what the failing ones already showed, at full fleet cost. The
+# skipped rungs are written to laneE/ladder-stop.txt, which is the only list of
+# absences the crossing gate accepts. 0 (the default) climbs the whole ladder.
+LANE_E_STOP_AFTER_FAILS="${LANE_E_STOP_AFTER_FAILS:-0}"
 # A rung PASSES only if its p99 stays under this many ms. The point of a tenancy
 # ladder is the site count at which latency leaves the band, not the count at
 # which the broker finally refuses traffic — those are far apart, and only the
@@ -914,6 +921,7 @@ lane_e_shape() {
 	positive_int LANE_E_FORWARD_CANARY_COUNT "$LANE_E_FORWARD_CANARY_COUNT"
 	positive_int LANE_E_FORWARD_CANARY_TIMEOUT "$LANE_E_FORWARD_CANARY_TIMEOUT"
 	positive_int LANE_E_DRIVER_SOFTIRQ_MAX "$LANE_E_DRIVER_SOFTIRQ_MAX"
+	[[ "$LANE_E_STOP_AFTER_FAILS" =~ ^[0-9]+$ ]] || die "LANE_E_STOP_AFTER_FAILS must be a non-negative integer, got '$LANE_E_STOP_AFTER_FAILS'"
 	[ "$LANE_E_DRIVER_SOFTIRQ_MAX" -le 100 ] || die "LANE_E_DRIVER_SOFTIRQ_MAX is a percentage, got $LANE_E_DRIVER_SOFTIRQ_MAX"
 	positive_int LANE_E_DRIVER_GATE_SECS "$LANE_E_DRIVER_GATE_SECS"
 	case "$LANE_E_DRIVER_GATE" in 0 | 1) ;; *) die "LANE_E_DRIVER_GATE must be 0 or 1, got '$LANE_E_DRIVER_GATE'" ;; esac
@@ -2885,6 +2893,20 @@ lane_e_driver_gate() {
 	done
 }
 
+# lane_e_rung_verdict <rung dir>: "pass", or "fail: <flags>" — the summarizer's
+# own judgement of the rung, so the harness and the published table cannot
+# disagree about where the knee is.
+lane_e_rung_verdict() {
+	python3 - "$1" "$SCALE_DIR/summarize-curve.py" <<'PY' 2>/dev/null || echo "fail: verdict unavailable"
+import importlib.util, pathlib, sys
+spec = importlib.util.spec_from_file_location("summarize_curve", sys.argv[2])
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+r = m.lane_e_rung(pathlib.Path(sys.argv[1]))
+print("pass" if r["pass"] else "fail: " + "; ".join(r["flags"]))
+PY
+}
+
 # lane_e_rung_checked: lane_e_rung, then the same judgement on the rung's own
 # CPU samples. A rung that loaded a pinned driver is moved aside (voided-*,
 # outside every sites-* glob, with the reason) and, when drivers can be
@@ -2958,6 +2980,31 @@ for e_sites in "${LANE_E_SITES[@]}"; do
     LANE_E_SITE_RATE=$e_rate_keep
     LANE_E_PAYLOAD=$e_payload_keep
     LANE_E_SECS=$e_normal_secs
+	if [ "$LANE_E_STOP_AFTER_FAILS" -gt 0 ]; then
+		e_rdir="$OUT/laneE/sites-$e_sites"
+		[ "$e_rep" -gt 1 ] && e_rdir="$e_rdir-rep$e_rep"
+		e_verdict=$(lane_e_rung_verdict "$e_rdir")
+		echo "$(basename "$e_rdir") $e_verdict" >>"$OUT/laneE/ladder-verdicts.txt"
+		if [ "$e_verdict" = pass ]; then e_fails=0; else e_fails=$((${e_fails:-0} + 1)); fi
+		if [ "$e_fails" -ge "$LANE_E_STOP_AFTER_FAILS" ] && [ "${#e_seen[@]}" -lt "${#LANE_E_SITES[@]}" ]; then
+			# Name every rung the ladder would still have run, exactly as the
+			# gate derives them from shape.txt (repeats counted in order).
+			e_skipped=()
+			e_seen_tmp=("${e_seen[@]}")
+			for e_rest in "${LANE_E_SITES[@]:${#e_seen[@]}}"; do
+				e_r=1
+				for e_prev in "${e_seen_tmp[@]}"; do [ "$e_prev" = "$e_rest" ] && e_r=$((e_r + 1)); done
+				e_seen_tmp+=("$e_rest")
+				if [ "$e_r" = 1 ]; then e_skipped+=("sites-$e_rest"); else e_skipped+=("sites-$e_rest-rep$e_r"); fi
+			done
+			{
+				echo "stopped_after=$(basename "$e_rdir") consecutive_fails=$e_fails threshold=$LANE_E_STOP_AFTER_FAILS"
+				echo "skipped=${e_skipped[*]}"
+			} >"$OUT/laneE/ladder-stop.txt"
+			say "[$N nodes] lane E: KNEE — $e_fails consecutive failing rungs (last: $(basename "$e_rdir"): $e_verdict); skipping ${e_skipped[*]}"
+			break
+		fi
+	fi
 done
 # The control repeats the BOTTOM rung — the lowest load the ladder offered, and
 # so the one most likely to pass on a healthy cluster and most damning when it
