@@ -158,7 +158,10 @@ Packet-size enforcement is compared in the Protocol table above.
 
 Neither is in the benchmark set (ADR 0048 compares self-hostable, like-for-like brokers),
 but they are the names most evaluations start from, so their shape belongs here. Claims
-below are limited to each vendor's own published positioning; no benchmark numbers.
+below are limited to each vendor's own published positioning. Their **published cluster
+benchmark figures** (HiveMQ's 1M msg/s on 40 nodes; EMQX's 1M msg/s on 23 × 64 cores) are
+quoted — **not reproduced**, with every workload difference beside them — in the README's
+[Against published cluster benchmarks](../README.md#against-published-cluster-benchmarks).
 
 - **HiveMQ** is an enterprise MQTT platform: full MQTT 5, mature tooling, and clustering —
   in the **commercial** edition. The Apache-2.0 HiveMQ Community Edition is single-node
@@ -189,8 +192,10 @@ below are limited to each vendor's own published positioning; no benchmark numbe
 - **Performance:** no cross-broker numbers are printed here, deliberately. The
   [benchmark harness](../bench/) runs all five brokers under disclosed postures;
   cross-broker numbers appear in [docs/benchmarks/](benchmarks/) only from dedicated,
-  documented hardware (ADR 0048's dev-grade/publishable line), and none are published
-  yet. What **is** published, both about mqttd alone and both labelled with their
+  documented hardware (ADR 0048's dev-grade/publishable line): the single-node
+  comparison is [SINGLE-NODE-COMPARISON.md](benchmarks/SINGLE-NODE-COMPARISON.md), and the
+  QoS 0 scale-out curve (3 → 10 nodes, one provisioning) is
+  [knee-3-5-7-10.md](../bench/scale/knee-3-5-7-10.md). Also published, both about mqttd alone and both labelled with their
   limits: our micro-baselines in [BASELINE.md](benchmarks/BASELINE.md), and the
   end-to-end **durable-path** measurement in
   [DURABLE-PATH.md](benchmarks/DURABLE-PATH.md) — acked QoS 1/2 throughput and latency
