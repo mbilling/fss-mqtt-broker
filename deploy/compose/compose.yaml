@@ -40,12 +40,15 @@ name: mqttd
 # ─── Every broker shares this, and differs only in identity/seeds ──────────────────
 x-broker: &broker
   # PINNED, deliberately — never `:latest` (issue #263: a floating tag is exactly how the
-  # artifacts and the image drifted apart). This is the oldest release whose binary has
-  # every flag this file and bootstrap.sh use (`--probe`, `--hash-password`); the per-PR
-  # gate scripts/check-deploy-image-pin.sh enforces both properties, and the nightly
+  # artifacts and the image drifted apart). The pinned release's binary must have every
+  # flag this file and bootstrap.sh use (`--probe`, `--hash-password`) AND read every
+  # MQTTD_* variable set below: an older binary ignores an unknown variable silently, and
+  # 1.0.0 without MQTTD_SWIM_ADVERTISE kept a stopped peer as a member forever, so the
+  # armed founder below never left rotation (issue #645). The per-PR
+  # gate scripts/check-deploy-image-pin.sh enforces all three properties, and the nightly
   # default-image lane runs this file against the tag as published. When you change the
   # pin here, change bootstrap.sh's to match (the gate holds them together).
-  image: ${MQTTD_IMAGE:-ghcr.io/mbilling/fss-mqtt-broker:1.0.0}
+  image: ${MQTTD_IMAGE:-ghcr.io/mbilling/fss-mqtt-broker:1.0.17}
   restart: unless-stopped
   # The image is distroless and already runs as uid 65532; this is belt-and-braces
   # for hosts whose daemon is configured otherwise.

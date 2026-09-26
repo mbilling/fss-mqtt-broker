@@ -431,9 +431,17 @@ done
 pass "the founder re-ups ARMED (seeds + readiness floor 2) and is still ready — it sees 3"
 
 compose stop mqttd-2 mqttd-3 >/dev/null 2>&1 || fail "could not stop mqttd-2/mqttd-3"
+# 120 s is ~3.5x the slowest drop the passing nightlies recorded (34 s; most drop in
+# under 1 s, the rest in 22-34 s). A broker that has not dropped by then is not slow:
+# issue #645's never dropped at all.
 deadline=$((SECONDS + 120))
 while probe1 /readyz; do
-  (( SECONDS < deadline )) || { compose logs --tail 40 mqttd-1; \
+  # On failure, the membership transitions are the evidence: a stopped peer never logged
+  # "peer dead" is one mqttd-1 still counts (issue #645). The raw tail alone is openraft's
+  # unreachable-follower noise from the lease leader, which says nothing about the floor.
+  (( SECONDS < deadline )) || { compose logs --tail 40 mqttd-1
+    echo "  mqttd-1 membership transitions:"
+    compose logs --no-color mqttd-1 2>&1 | grep -F 'membership:' | tail -20 | sed 's/^/    /'
     fail "mqttd-1 still reports READY alone — the armed floor of 2 is not enforced"; }
   sleep 3
 done

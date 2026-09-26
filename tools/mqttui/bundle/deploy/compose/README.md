@@ -14,13 +14,16 @@ later `up`s reuse the same PKI. Each node's key lands in its **own** volume, and
 private key in one that no broker mounts.
 
 > **Which image this runs**: the default is **pinned** to
-> `ghcr.io/mbilling/fss-mqtt-broker:0.9.1` (the v0.9.1 release) — the oldest release whose binary has every
-> flag these artifacts use — never a floating `:latest` (issue #263 was that float
-> drifting behind the artifacts: v0.9.0 predates `mqttd --hash-password` and `--probe`,
-> so the healthcheck could not pass and `./bootstrap.sh` wrote log lines into
-> `secrets/mqttd-passwd`). Two gates hold the pin honest: a per-PR check that every flag
-> used here exists in the binary at the pinned tag, and a nightly lane that runs this
-> exact file against the published default with no override. To run a different broker:
+> `ghcr.io/mbilling/fss-mqtt-broker:1.0.17` (the v1.0.17 release) — a release whose binary has every
+> flag these artifacts use and reads every `MQTTD_*` variable they set — never a floating
+> `:latest` (issue #263 was that float drifting behind the artifacts: v0.9.0 predates
+> `mqttd --hash-password` and `--probe`, so the healthcheck could not pass and
+> `./bootstrap.sh` wrote log lines into `secrets/mqttd-passwd`; issue #645 was a pin left
+> at 1.0.0 behind `MQTTD_SWIM_ADVERTISE`, which that release silently ignores — a stopped
+> peer then stayed a member and the armed founder below never left rotation). Two gates
+> hold the pin honest: a per-PR check that every flag and broker variable used here
+> exists in the binary at the pinned tag, and a nightly lane that runs this exact file
+> against the published default with no override. To run a different broker:
 > `MQTTD_IMAGE=<your-tag> docker compose up -d` (export the same `MQTTD_IMAGE` before
 > `./bootstrap.sh`, which uses it for hashing). If you are on **v0.9.0** — say, a
 > mirrored copy — its containers never go healthy here; upgrade the image, don't patch

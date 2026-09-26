@@ -16,7 +16,7 @@ type: application
 # scripts/check-deploy-image-pin.sh gates that it equals the compose pin (one
 # tag for the whole repo) and stays an exact X.Y.Z — never a floating name.
 version: 0.1.0
-appVersion: "1.0.0"
+appVersion: "1.0.17"
 home: https://github.com/mbilling/fss-mqtt-broker
 sources:
   - https://github.com/mbilling/fss-mqtt-broker
