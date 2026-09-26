@@ -236,6 +236,19 @@ pub(super) struct PendingPublish {
     /// When the publish first fanned out — the cutoff for re-delivery (only
     /// clients attached or materialized AFTER this can have missed it).
     pub(super) created_at: Instant,
+    /// When this publish's most recent forward obligation was registered (and its
+    /// frame first sent), as milliseconds after `created_at` — what the sweep's
+    /// "overdue" is measured from (issue #644). A `u32` offset, not an `Instant`,
+    /// so it fits the entry's size budget; it saturates after 49 days.
+    ///
+    /// Not `created_at` itself: a takeover re-route registers a NEW obligation on a
+    /// publish that may be many sweeps old, and judging that obligation by the
+    /// publish's age retransmitted it on the very next sweep — milliseconds after
+    /// the first copy, before any answer could exist. The receiver applies every
+    /// copy (no dedup at `QoS` 1), so each premature retransmit became a second
+    /// durable enqueue and a second `DUP = 0` delivery of the same message to the
+    /// subscriber [MQTT-4.4.0-1].
+    pub(super) forwarded_after_ms: u32,
     /// Engaged when a forward target died: counts down sweep ticks with no
     /// re-routable remote interest before the obligation is considered moot
     /// (see [`REROUTE_GRACE_TICKS`]).
@@ -661,6 +674,9 @@ impl Hub {
             });
         }
         p.awaiting.insert(seq, obligation);
+        // The overdue clock restarts at every registration (issue #644).
+        p.forwarded_after_ms =
+            u32::try_from(p.created_at.elapsed().as_millis()).unwrap_or(u32::MAX);
         self.forward_index.insert(seq, id);
         debug!(publish = id, seq, target = %node.0, "forward obligation recorded");
         if let Some(peer) = self.peers.get(&node) {
@@ -757,6 +773,7 @@ impl Hub {
                 local_done: false,
                 appends_outstanding: 0,
                 created_at: Instant::now(),
+                forwarded_after_ms: 0,
                 reroute_grace: None,
                 // During a takeover window the routing table may not yet hold the
                 // sessions this node (or a successor) inherited — hold the ack
@@ -1042,8 +1059,13 @@ impl Hub {
             .pending_publishes
             .iter()
             .filter_map(|(id, p)| {
+                // Measured from the LAST forward sent, not from the publish's
+                // creation: a re-route on an old publish is not overdue the moment
+                // it is sent (issue #644).
+                let last_forward =
+                    p.created_at + Duration::from_millis(u64::from(p.forwarded_after_ms));
                 let overdue = !p.awaiting.is_empty()
-                    && now.duration_since(p.created_at) >= super::SESSION_SWEEP_INTERVAL;
+                    && now.duration_since(last_forward) >= super::SESSION_SWEEP_INTERVAL;
                 (overdue || p.reroute_grace.is_some()).then_some((*id, overdue))
             })
             .collect();
@@ -2178,6 +2200,63 @@ mod pending_bounds {
         hub.pending_publishes.get_mut(id).unwrap().created_at = aged;
         hub.sweep_pending_forwards();
         assert!(rx.try_recv().is_ok(), "an overdue forward is retransmitted");
+        assert!(rx.try_recv().is_err(), "exactly once per sweep");
+    }
+
+    /// Issue #644: a forward is overdue by the time since it was SENT, not since its
+    /// publish was created. A takeover re-route registers a fresh obligation on a
+    /// publish that is already several sweeps old; judged by `created_at`, the very
+    /// next sweep re-sent it milliseconds after the first copy — and the receiver,
+    /// which applies every copy, enqueued the message twice, so the subscriber got
+    /// it twice with `DUP = 0`. (The nightly `cluster_proc` seed 2: a re-route and
+    /// a back-to-back sweep tick 6 ms apart.)
+    #[test]
+    fn a_re_routed_forward_on_an_old_publish_is_not_retransmitted_before_it_is_due() {
+        let mut hub = hub();
+        let peer = NodeId("peer".into());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (ctl, _ctl_rx) = mpsc::unbounded_channel();
+        hub.peer_connected(
+            peer.clone(),
+            1,
+            tx,
+            ctl,
+            None,
+            mqtt_cluster::peer::PROTO_MAX,
+            Arc::default(),
+        );
+        let (id, _wait) = register(&mut hub, "t", &Bytes::from_static(b"x"));
+        // The publish has been pending for several sweeps (its first target died,
+        // and its obligation was dropped with it).
+        let back_date = |hub: &mut Hub, by: Duration| {
+            let p = hub.pending_publishes.get_mut(id).unwrap();
+            p.created_at = p
+                .created_at
+                .checked_sub(by)
+                .expect("the clock is past the back-dated instant");
+        };
+        back_date(&mut hub, crate::hub::SESSION_SWEEP_INTERVAL * 8);
+
+        // The re-route: a NEW obligation, sent now.
+        hub.send_acked_forward(id, &peer);
+        assert!(rx.try_recv().is_ok(), "the re-routed forward is sent");
+        assert!(rx.try_recv().is_err());
+
+        hub.sweep_pending_forwards();
+        assert!(
+            rx.try_recv().is_err(),
+            "a forward sent milliseconds ago is not overdue, however old its publish \
+             is: retransmitting it now puts a second copy on the receiver, which \
+             applies both — a duplicate delivery with DUP = 0 (#644)"
+        );
+
+        // Once it has ITSELF waited a sweep interval unanswered, it is retransmitted.
+        back_date(&mut hub, crate::hub::SESSION_SWEEP_INTERVAL);
+        hub.sweep_pending_forwards();
+        assert!(
+            rx.try_recv().is_ok(),
+            "an overdue re-route is retransmitted"
+        );
         assert!(rx.try_recv().is_err(), "exactly once per sweep");
     }
 
