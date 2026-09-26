@@ -15,11 +15,18 @@
 #   2. THE FLAG LIST IS CLOSED. Every `--flag` these artifacts hand to an mqttd
 #      invocation must be in REQUIRED_FLAGS below, so a new flag added to the artifacts
 #      without extending this gate fails here rather than shipping unchecked.
-#   3. THE TAG HAS THE FLAGS. If the pinned tag exists in this clone, each flag must
-#      appear in `git show TAG:crates/mqttd/src/main.rs` — the binary at that release
-#      parses it. If the tag is NOT yet released, the pin must be forward-looking
+#   3. THE TAG HAS THE FLAGS — AND THE VARIABLES. If the pinned tag exists in this
+#      clone, each flag must appear in `git show TAG:crates/mqttd/src/main.rs` — the
+#      binary at that release parses it — and every MQTTD_* variable compose.yaml sets
+#      on a BROKER service must be a variable that tag's binary reads. Issue #645: the
+#      compose file gained MQTTD_SWIM_ADVERTISE (#396, first released in v1.0.5) while
+#      the pin stayed at 1.0.0, which ignores an unknown variable SILENTLY. The v1.0.0
+#      nodes therefore gossiped their 0.0.0.0 bind, and v1.0.0 still answered its own
+#      probe of a peer recorded there (the #394 reflection) — so a stopped peer stayed a
+#      member forever, and the armed founder never dropped its readiness floor. Checking
+#      only CLI flags could not see any of that. If the tag is NOT yet released, the pin must be forward-looking
 #      (strictly newer than every existing v* tag, so a stale pin cannot hide as
-#      "pending") and the flags must exist in the WORKING TREE's main.rs (so releasing
+#      "pending") and the flags and variables must exist in the WORKING TREE (so releasing
 #      HEAD satisfies the pin) — printed as a loud notice, because the nightly
 #      default-image lane stays in loud-skip until the tag is published.
 #
@@ -31,6 +38,7 @@ cd "$(dirname "$0")/.."
 COMPOSE=deploy/compose/compose.yaml
 BOOTSTRAP=deploy/compose/bootstrap.sh
 MAIN_RS=crates/mqttd/src/main.rs
+CONFIG_RS=crates/mqtt-config/src/lib.rs
 
 # The mqttd flags the compose artifacts pass to the default image. Extend this list in
 # the same change that adds a flag to the artifacts — check (2) makes forgetting loud.
@@ -77,7 +85,25 @@ for f in $used_flags; do
 done
 ok "every artifact flag is on the checked list ($(echo "$used_flags" | tr '\n' ' '))"
 
-# ── 3. the tag's binary parses every flag ────────────────────────────────────────────
+# ── 3. the tag's binary parses every flag and reads every variable ───────────────────
+# The MQTTD_* keys set on a broker service: the shared env anchor above `services:` and
+# each mqttd-N's own block. The `init` one-shot is skipped — it runs the certgen image,
+# not mqttd, so its variables (MQTTD_NODES) are init.sh's, not the broker's. A key is
+# "read by the binary" when its quoted name appears in the config crate (where the
+# MQTTD_* overlay lives) or in main.rs (the few read before config loads).
+broker_env="$(awk '
+  /^[^[:space:]#]/ { top = $1; svc = "" }
+  top == "services:" && /^  [A-Za-z0-9_-]+:/ { svc = $1; sub(/:$/, "", svc) }
+  /^[[:space:]]+MQTTD_[A-Z0-9_]+:/ && svc != "init" { k = $1; sub(/:$/, "", k); print k }
+' "$COMPOSE" | sort -u)"
+[[ -n "$broker_env" ]] || fail "found no MQTTD_* broker variables in $COMPOSE — the extraction is broken"
+missing_env() { # <config-source> <main-source> — print each broker variable neither mentions
+  local k
+  for k in $broker_env; do
+    grep -q -- "\"$k\"" <<<"$1" || grep -q -- "\"$k\"" <<<"$2" || echo "$k"
+  done
+}
+
 if git rev-parse -q --verify "refs/tags/$GIT_TAG" >/dev/null; then
   # Read the file once, then grep the variable: `git show | grep -q` under
   # pipefail fails on a MATCH near the top of a large file — grep's early exit
@@ -89,6 +115,10 @@ if git rev-parse -q --verify "refs/tags/$GIT_TAG" >/dev/null; then
       || fail "the pinned tag $GIT_TAG does not parse '$f' ($MAIN_RS at that tag) — the artifacts would break against their own default image"
   done
   ok "released: $GIT_TAG parses every checked flag"
+  miss="$(missing_env "$(git show "$GIT_TAG:$CONFIG_RS")" "$tag_main_rs")"
+  [[ -z "$miss" ]] \
+    || fail "the pinned tag $GIT_TAG does not read $(paste -sd, <<<"$miss") — $COMPOSE sets it on a broker, and that release ignores an unknown variable silently, so the deployment would run WITHOUT it (issue #645)"
+  ok "released: $GIT_TAG reads every broker variable $COMPOSE sets ($(wc -l <<<"$broker_env") checked)"
 else
   newest="$(git tag --list 'v[0-9]*' | sort -V | tail -1)"
   if [[ -n "$newest" ]]; then
@@ -100,6 +130,9 @@ else
     grep -q -- "\"$f\"" "$MAIN_RS" \
       || fail "'$f' is not parsed by the working tree's $MAIN_RS — releasing HEAD cannot satisfy the pin"
   done
+  miss="$(missing_env "$(cat "$CONFIG_RS")" "$(cat "$MAIN_RS")")"
+  [[ -z "$miss" ]] \
+    || fail "the working tree does not read $(paste -sd, <<<"$miss") — $COMPOSE sets it on a broker, so releasing HEAD cannot satisfy the pin"
   echo "NOTICE — the pinned tag $GIT_TAG is not released yet: the pin is forward-looking and"
   echo "         HEAD parses every checked flag, so pushing the $GIT_TAG release tag makes it"
   echo "         real. Until then the nightly default-image compose lane skips loudly."
