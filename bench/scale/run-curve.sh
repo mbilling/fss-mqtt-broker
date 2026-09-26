@@ -528,6 +528,37 @@ LANE_E_CALIBRATE_SECS="${LANE_E_CALIBRATE_SECS:-20}"
 LANE_E_FORWARD_CANARY="${LANE_E_FORWARD_CANARY:-1}"
 LANE_E_FORWARD_CANARY_COUNT="${LANE_E_FORWARD_CANARY_COUNT:-100}"
 LANE_E_FORWARD_CANARY_TIMEOUT="${LANE_E_FORWARD_CANARY_TIMEOUT:-90}"
+# The control demands a full mesh, so it waits for one first: every broker at
+# N members and N-1 peer links on LANE_E_MESH_STABLE_POLLS consecutive rounds
+# (5s apart), within LANE_E_MESH_SETTLE_BUDGET seconds (lib.sh await_full_mesh).
+LANE_E_MESH_SETTLE_BUDGET="${LANE_E_MESH_SETTLE_BUDGET:-180}"
+LANE_E_MESH_STABLE_POLLS="${LANE_E_MESH_STABLE_POLLS:-3}"
+# A load generator is judged by its HOTTEST core, not its average: on
+# 2026-09-25 one driver of eighteen held a core at 98-100% softirq under a load
+# its peers carried at <20%, while its average still read 49% idle. Such a
+# driver cannot offer its site and cannot answer its scrape inside the window
+# bracket. A driver whose hottest core averages at least
+# LANE_E_DRIVER_SOFTIRQ_MAX %soft over a burst or a rung is BAD. Before the
+# ladder every driver runs one publisher container at a rung's per-container
+# rate for LANE_E_DRIVER_GATE_SECS, all at once (LANE_E_DRIVER_GATE=0 skips).
+# With LANE_E_SWAP_HOOK set (run.sh points it at replace-node.sh), a bad driver
+# is swapped for a fresh server in place — before the ladder, or after a rung,
+# which is then set aside as voided and run again once. Without a hook a bad
+# driver is recorded, never silently kept.
+LANE_E_DRIVER_SOFTIRQ_MAX="${LANE_E_DRIVER_SOFTIRQ_MAX:-80}"
+LANE_E_DRIVER_GATE="${LANE_E_DRIVER_GATE:-1}"
+LANE_E_DRIVER_GATE_SECS="${LANE_E_DRIVER_GATE_SECS:-20}"
+LANE_E_SWAP_HOOK="${LANE_E_SWAP_HOOK:-}"
+# Stop a ladder at its knee: after LANE_E_STOP_AFTER_FAILS consecutive ladder
+# rungs FAIL (summarize-curve.py's own verdict, read the moment each rung ends),
+# skip the rest of the ladder and go straight to the control. The rungs above a
+# knee confirm what the failing ones already showed, at full fleet cost. The
+# skipped rungs are written to laneE/ladder-stop.txt, which is the only list of
+# absences the crossing gate accepts. 0 (the default) climbs the whole ladder.
+LANE_E_STOP_AFTER_FAILS="${LANE_E_STOP_AFTER_FAILS:-0}"
+# Attempts per driver for each steady-gate delivery poll (lane_e_recv_total);
+# the drain polls once and tolerates a failed poll instead.
+LANE_E_POLL_TRIES="${LANE_E_POLL_TRIES:-3}"
 # A rung PASSES only if its p99 stays under this many ms. The point of a tenancy
 # ladder is the site count at which latency leaves the band, not the count at
 # which the broker finally refuses traffic — those are far apart, and only the
@@ -892,6 +923,14 @@ lane_e_shape() {
 	case "$LANE_E_FORWARD_CANARY" in 0 | 1) ;; *) die "LANE_E_FORWARD_CANARY must be 0 or 1, got '$LANE_E_FORWARD_CANARY'" ;; esac
 	positive_int LANE_E_FORWARD_CANARY_COUNT "$LANE_E_FORWARD_CANARY_COUNT"
 	positive_int LANE_E_FORWARD_CANARY_TIMEOUT "$LANE_E_FORWARD_CANARY_TIMEOUT"
+	positive_int LANE_E_DRIVER_SOFTIRQ_MAX "$LANE_E_DRIVER_SOFTIRQ_MAX"
+	positive_int LANE_E_POLL_TRIES "$LANE_E_POLL_TRIES"
+	[[ "$LANE_E_STOP_AFTER_FAILS" =~ ^[0-9]+$ ]] || die "LANE_E_STOP_AFTER_FAILS must be a non-negative integer, got '$LANE_E_STOP_AFTER_FAILS'"
+	[ "$LANE_E_DRIVER_SOFTIRQ_MAX" -le 100 ] || die "LANE_E_DRIVER_SOFTIRQ_MAX is a percentage, got $LANE_E_DRIVER_SOFTIRQ_MAX"
+	positive_int LANE_E_DRIVER_GATE_SECS "$LANE_E_DRIVER_GATE_SECS"
+	case "$LANE_E_DRIVER_GATE" in 0 | 1) ;; *) die "LANE_E_DRIVER_GATE must be 0 or 1, got '$LANE_E_DRIVER_GATE'" ;; esac
+	[ -z "$LANE_E_SWAP_HOOK" ] || [ -x "${LANE_E_SWAP_HOOK%% *}" ] ||
+		die "LANE_E_SWAP_HOOK=$LANE_E_SWAP_HOOK is not executable"
 	[ "$LANE_E_FORWARD_CANARY" = 0 ] || [ -f "$SCALE_DIR/forward-canary.py" ] ||
 		die "lane E: LANE_E_FORWARD_CANARY=1 but $SCALE_DIR/forward-canary.py is missing — without the control no N>1 crossing can be certified"
 	# The control certifies the path the rung measures, so it has to SPEAK that
@@ -1966,11 +2005,25 @@ lane_e_rung() { # lane_e_rung <sites> [repeat-index] [is-control]
 	# `recv_total`, which has polled a drain on real hardware since it was
 	# written — this lane needs the same question answered, and a second read
 	# path (parsing `docker logs`) would be a second thing to get wrong.
-	lane_e_recv_total() {
-		local q
+	lane_e_recv_total() { # lane_e_recv_total [tries]
+		local q tries="${1:-$LANE_E_POLL_TRIES}"
 		local -a rp=()
+		# Each driver gets <tries> attempts, 2 s apart, before the poll counts as
+		# failed: one ssh hop or one `curl -m 10` timing out on one of twenty
+		# drivers ended a 30-server campaign on 2026-09-26 while that driver's
+		# consumer was receiving a steady 30 000/s. stderr is kept. The steady
+		# gate, which stops the size on a failed poll, retries; the drain, which
+		# records a failed poll and keeps going, polls once (its budget is sized
+		# for one scrape per poll — budgets.py).
 		for ((q = 0; q < D; q++)); do
-			driver_batch "$q" "set -e"$'\n'"${pollscrape[q]}" >"$rdir/.batch/poll-$q" 2>/dev/null &
+			(
+				for ((try = 1; try <= tries; try++)); do
+					driver_batch "$q" "set -e"$'\n'"${pollscrape[q]}" >"$rdir/.batch/poll-$q" 2>>"$rdir/.batch/poll-$q.err" && exit 0
+					echo "attempt $try failed at $(date -u +%H:%M:%S)" >>"$rdir/.batch/poll-$q.err"
+					[ "$try" -lt "$tries" ] && sleep 2
+				done
+				exit 1
+			) &
 			rp+=($!)
 		done
         for q in ${rp[@]+"${rp[@]}"}; do wait "$q" || return 1; done
@@ -2459,7 +2512,19 @@ PAUSED
 		while :; do
 			sleep "$LANE_E_DRAIN_POLL"
 			elapsed=$(($(date +%s) - t0))
-			cur=$(lane_e_recv_total) || die "incomplete drain poll"
+			# A poll that still fails after its retries is recorded and cannot count
+			# as flat: the drain keeps polling to its deadline and, if it never
+			# converges, the rung reads UNRESOLVED. It does not end the campaign.
+			if ! cur=$(lane_e_recv_total 1); then
+				printf '%s\tpoll-failed\n' "$elapsed" >>"$rdir/drain.tsv"
+				warn "lane E: a drain poll failed on some driver (see $rdir/.batch/poll-*.err) — recorded, not counted as flat"
+				prev=-1 flat=0
+				[ "$elapsed" -lt "$LANE_E_DRAIN_SECS" ] || {
+					warn "lane E: drain budget ${LANE_E_DRAIN_SECS}s elapsed without a clean poll — rung $sites reports UNRESOLVED"
+					break
+				}
+				continue
+			fi
 			printf '%s\t%s\n' "$elapsed" "$cur" >>"$rdir/drain.tsv"
 			# LANE_E_FLAT_POLLS consecutive non-increasing polls, not one: a single
 			# flat poll can land inside a scrape gap and end the drain early, which
@@ -2564,6 +2629,12 @@ lane_e_forward_canary() {
 	fi
 	rm -rf "$cdir" "$rdir_res"
 	mkdir -p "$cdir" "$rdir_res"
+	if [ "$N" -gt 1 ]; then
+		say "[$N nodes] lane E: waiting for a full, stable mesh ($((N - 1)) peer links and $N members on every broker, $LANE_E_MESH_STABLE_POLLS rounds running) before the control"
+		await_full_mesh "$LANE_E_MESH_SETTLE_BUDGET" "$LANE_E_MESH_STABLE_POLLS" "$OUT/laneE/mesh-settle.txt" ||
+			die "lane E: the mesh did not settle within ${LANE_E_MESH_SETTLE_BUDGET}s at N=$N — the forwarding control would fail on a missing link, not on forwarding. Evidence: $OUT/laneE/mesh-settle.txt"
+		say "[$N nodes] lane E: mesh settled ($(tail -n 1 "$OUT/laneE/mesh-settle.txt" | cut -d' ' -f1))"
+	fi
 	local -a brokers=()
 	for ((i = 0; i < N; i++)); do brokers+=(--broker "$(broker_priv_ip "$i"):1883:8080"); done
 	# The residue baseline is the harness's own scrape from BEFORE the canary
@@ -2721,6 +2792,183 @@ lane_e_calibrate() {
 		warn "lane E: calibration met its rate but missed $late publish deadlines — the driver is at its edge before the ladder has started"
 }
 
+# hottest_soft <mpstat -P ALL file>: "<cpu> <mean %soft>" of the CPU whose
+# %soft averaged highest, the column found from mpstat's own header. Prints
+# nothing for a file without per-CPU rows.
+hottest_soft() {
+	awk '
+		/%soft/ { for (i = 1; i <= NF; i++) if ($i == "%soft") col = i; for (i = 1; i <= NF; i++) if ($i == "CPU") cpu = i; next }
+		col && $cpu ~ /^[0-9]+$/ { s[$cpu] += $col; n[$cpu]++ }
+		END { m = -1; for (c in s) { v = s[c] / n[c]; if (v > m) { m = v; best = c } } if (m >= 0) printf "cpu%s %.0f\n", best, m }
+	' "$1" 2>/dev/null
+}
+
+# lane_e_pinned_drivers <dir with cpu-driver<i>.txt>: indices of drivers whose
+# hottest core averaged at least LANE_E_DRIVER_SOFTIRQ_MAX %soft.
+lane_e_pinned_drivers() {
+	local f i hot
+	for f in "$1"/cpu-driver*.txt; do
+		[ -f "$f" ] || continue
+		i="${f##*cpu-driver}"
+		i="${i%.txt}"
+		hot=$(hottest_soft "$f")
+		[ -n "$hot" ] || continue
+		[ "${hot##* }" -ge "$LANE_E_DRIVER_SOFTIRQ_MAX" ] && echo "$i"
+	done
+	return 0
+}
+
+# lane_e_swap_drivers <why> <index...>: replace each driver in place through
+# LANE_E_SWAP_HOOK. The inventory file is rewritten by the hook, and every
+# helper reads it afresh, so the next rung talks to the new host.
+lane_e_swap_drivers() {
+	local why="$1" d
+	shift
+	for d in "$@"; do
+		say "[$N nodes] lane E: swapping driver $d — $why"
+		$LANE_E_SWAP_HOOK "$INVENTORY" driver "$d" "$why" ||
+			die "lane E: could not replace driver $d ($why) — see REPLACED.txt and the tf-replace log beside the provisioning inventory"
+	done
+}
+
+# The driver gate: every driver bursts one publisher container at a rung's
+# per-container rate, all at once, while mpstat -P ALL samples it. A driver
+# that is pinned or cannot offer the rate is swapped (or the size stops, when
+# there is no hook) BEFORE calibration and before any rung is paid for. A
+# swapped driver is gated again once; a second failure stops the size.
+lane_e_driver_gate() {
+	[ "$LANE_E_DRIVER_GATE" = 1 ] || { echo "status=skipped" >"$OUT/laneE/driver-gate.txt"; return 0; }
+	local gdir="$OUT/laneE/driver-gate" per_pub_rate interval pubs_per_c per_c_rate hosts attempt d
+	local -a targets bad
+	per_pub_rate=$((LANE_E_SITE_RATE / LANE_E_PUBS_PER_SITE))
+	interval=$((1000 / per_pub_rate))
+	pubs_per_c=$((LANE_E_PUBS_PER_SITE / LANE_E_PUB_CONTAINERS_PER_SITE))
+	per_c_rate=$((LANE_E_SITE_RATE / LANE_E_PUB_CONTAINERS_PER_SITE))
+	hosts=$(brokers_csv '.private_ip')
+	mkdir -p "$gdir"
+	: >"$OUT/laneE/driver-gate.txt"
+	targets=()
+	for ((d = 0; d < D; d++)); do targets+=("$d"); done
+	for attempt in 1 2; do
+		say "[$N nodes] lane E: driver gate (attempt $attempt) — ${#targets[@]} driver(s) each burst $per_c_rate msg/s for ${LANE_E_DRIVER_GATE_SECS}s; bad = hottest core >= ${LANE_E_DRIVER_SOFTIRQ_MAX}% softirq or < 97% of the rate"
+		for d in "${targets[@]}"; do
+			rssh "$(driver_pub_ip "$d")" "
+				docker rm -f gate-pub >/dev/null 2>&1 || true
+				$DOCKER_RUN --name gate-pub $BENCH_IMG pub -h $hosts -p 1883 -c $pubs_per_c -R $LANE_E_CONNECT_RATE \
+					-t 'gate/$d/%i' -q $LANE_E_QOS -s $LANE_E_PAYLOAD -A true -I $interval >/dev/null
+				sleep 5
+				mpstat -P ALL 1 $LANE_E_DRIVER_GATE_SECS >/tmp/gate-mpstat.txt
+				docker logs gate-pub 2>&1 | tail -5 >/tmp/gate-pub.log
+				docker rm -f gate-pub >/dev/null 2>&1 || true
+				cat /tmp/gate-mpstat.txt
+				echo '--- pub'
+				cat /tmp/gate-pub.log
+			" >"$gdir/driver$d-a$attempt.txt" 2>"$gdir/driver$d-a$attempt.stderr" &
+		done
+		# The brokers take the whole burst, so they are judged by the same window —
+		# but against EACH OTHER: high softirq under load on every broker is the
+		# broker working; one broker far above its peers is a bad host draw.
+		local b
+		for ((b = 0; b < N; b++)); do
+			rssh "$(broker_pub_ip "$b")" "sleep 5; mpstat -P ALL 1 $LANE_E_DRIVER_GATE_SECS" \
+				>"$gdir/cpu-broker$b-a$attempt.txt" 2>"$gdir/broker$b-a$attempt.stderr" &
+		done
+		wait
+		local -a hots=() bad_brokers=()
+		local med
+		for ((b = 0; b < N; b++)); do
+			hot=$(hottest_soft "$gdir/cpu-broker$b-a$attempt.txt")
+			hots+=("${hot##* }")
+			echo "attempt=$attempt broker=$b hottest=${hot:-none}" >>"$OUT/laneE/driver-gate.txt"
+		done
+		med=$(printf '%s\n' "${hots[@]}" | grep -E '^[0-9]+$' | sort -n | awk '{v[NR] = $1} END {print (NR ? v[int((NR + 1) / 2)] : 0)}')
+		for ((b = 0; b < N; b++)); do
+			[[ "${hots[$b]}" =~ ^[0-9]+$ ]] || continue
+			if [ "${hots[$b]}" -ge "$LANE_E_DRIVER_SOFTIRQ_MAX" ] && [ $((med * 2)) -lt "$LANE_E_DRIVER_SOFTIRQ_MAX" ]; then
+				bad_brokers+=("$b")
+			fi
+		done
+		if [ "${#bad_brokers[@]}" -gt 0 ]; then
+			printf '%s\n' "${bad_brokers[@]}" >"$OUT/laneE/bad-brokers.txt"
+			die "lane E: broker(s) ${bad_brokers[*]} pinned a core at >= ${LANE_E_DRIVER_SOFTIRQ_MAX}% softirq while the median broker's hottest core was ${med}% — a bad host draw. A broker cannot be swapped under a formed cluster; bad-brokers.txt names them so the campaign can replace them and re-form this arm. Evidence: $gdir"
+		fi
+		bad=()
+		for d in "${targets[@]}"; do
+			local f="$gdir/driver$d-a$attempt.txt" hot achieved why=""
+			sed '/^--- pub$/,$d' "$f" >"$gdir/cpu-driver$d.txt"
+			hot=$(hottest_soft "$gdir/cpu-driver$d.txt")
+			achieved=$(awk '/^--- pub$/ {p = 1} p && / pub total=/ {r = $NF; sub(/rate=/, "", r); sub(/\/sec/, "", r)} p && / pub_succ total=/ {q = $NF; sub(/rate=/, "", q); sub(/\/sec/, "", q)} END {printf "%d", (r + q) / 2}' "$f")
+			if [ -z "$hot" ]; then
+				why="no CPU samples"
+			elif [ "${hot##* }" -ge "$LANE_E_DRIVER_SOFTIRQ_MAX" ]; then
+				why="${hot%% *} at ${hot##* }% softirq"
+			elif [ "${achieved:-0}" -lt $((per_c_rate * 97 / 100)) ]; then
+				why="offered ${achieved:-0} of $per_c_rate msg/s"
+			fi
+			local verdict=ok
+			[ -z "$why" ] || verdict="bad ($why)"
+			echo "attempt=$attempt driver=$d hottest=${hot:-none} achieved=${achieved:-0} asked=$per_c_rate verdict=$verdict" >>"$OUT/laneE/driver-gate.txt"
+			[ -z "$why" ] || bad+=("$d:$why")
+		done
+		[ "${#bad[@]}" -gt 0 ] || { say "[$N nodes] lane E: driver gate passed"; return 0; }
+		[ -n "$LANE_E_SWAP_HOOK" ] ||
+			die "lane E: driver gate failed (${bad[*]}) and no LANE_E_SWAP_HOOK can replace them — every rung those drivers carry would measure the driver. Evidence: $OUT/laneE/driver-gate.txt"
+		[ "$attempt" = 1 ] ||
+			die "lane E: driver gate failed again after replacing (${bad[*]}). Evidence: $OUT/laneE/driver-gate.txt"
+		targets=()
+		for d in "${bad[@]}"; do
+			lane_e_swap_drivers "driver gate: ${d#*:}" "${d%%:*}"
+			targets+=("${d%%:*}")
+		done
+	done
+}
+
+# lane_e_rung_verdict <rung dir>: "pass", or "fail: <flags>" — the summarizer's
+# own judgement of the rung, so the harness and the published table cannot
+# disagree about where the knee is.
+lane_e_rung_verdict() {
+	python3 - "$1" "$SCALE_DIR/summarize-curve.py" <<'PY' 2>/dev/null || echo "fail: verdict unavailable"
+import importlib.util, pathlib, sys
+spec = importlib.util.spec_from_file_location("summarize_curve", sys.argv[2])
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+r = m.lane_e_rung(pathlib.Path(sys.argv[1]))
+print("pass" if r["pass"] else "fail: " + "; ".join(r["flags"]))
+PY
+}
+
+# lane_e_rung_checked: lane_e_rung, then the same judgement on the rung's own
+# CPU samples. A rung that loaded a pinned driver is moved aside (voided-*,
+# outside every sites-* glob, with the reason) and, when drivers can be
+# swapped, run again once on the fresh hosts.
+lane_e_rung_checked() {
+	local sites="$1" rep="${2:-1}" rdir bad voided
+	lane_e_rung "$@"
+	rdir="$OUT/laneE/sites-$sites"
+	[ "$rep" -gt 1 ] && rdir="$OUT/laneE/sites-$sites-rep$rep"
+	bad=$(lane_e_pinned_drivers "$rdir/cpu" | tr '\n' ' ')
+	bad="${bad% }"
+	[ -n "$bad" ] || return 0
+	if [ -z "$LANE_E_SWAP_HOOK" ]; then
+		warn "[$N nodes] lane E: rung $(basename "$rdir") ran on pinned driver(s) $bad (hottest core >= ${LANE_E_DRIVER_SOFTIRQ_MAX}% softirq) and no hook can swap them — recorded in pinned-drivers.txt"
+		echo "$bad" >"$rdir/pinned-drivers.txt"
+		return 0
+	fi
+	voided="$OUT/laneE/voided-$(basename "$rdir")-$(date -u +%Y%m%dT%H%M%SZ)"
+	mv "$rdir" "$voided"
+	echo "pinned drivers: $bad (hottest core >= ${LANE_E_DRIVER_SOFTIRQ_MAX}% softirq); replaced and the rung run again" >"$voided/VOIDED.txt"
+	warn "[$N nodes] lane E: rung $(basename "$rdir") VOIDED — pinned driver(s) $bad; evidence kept at $voided"
+	# shellcheck disable=SC2086 # indices, one per word
+	lane_e_swap_drivers "rung $(basename "$rdir"): hottest core >= ${LANE_E_DRIVER_SOFTIRQ_MAX}% softirq" $bad
+	lane_e_rung "$@"
+	bad=$(lane_e_pinned_drivers "$rdir/cpu" | tr '\n' ' ')
+	bad="${bad% }"
+	if [ -n "$bad" ]; then
+		warn "[$N nodes] lane E: rung $(basename "$rdir") ran on pinned driver(s) $bad AGAIN after a swap — recorded, not retried"
+		echo "$bad" >"$rdir/pinned-drivers.txt"
+	fi
+}
+
 # BOTTOM RUNG FIRST — the opposite of lane B, deliberately. Lane B's top rung is
 # the one that decides whether the rig can offer the load at all. Lane E is
 # looking for the site count at which latency leaves its budget, and that answer
@@ -2736,6 +2984,7 @@ lane_e_calibrate() {
 # paid for only on a cluster proven to forward, and each broker's floor has to
 # predate every snapshot a rung takes.
 lane_e_forward_canary
+lane_e_driver_gate
 lane_e_calibrate
 declare -a e_seen=()
 for e_sites in "${LANE_E_SITES[@]}"; do
@@ -2756,11 +3005,36 @@ for e_sites in "${LANE_E_SITES[@]}"; do
         LANE_E_PUBS_PER_SITE=${E_PUBS_STEPS[${#e_seen[@]}-1]}
         LANE_E_SITE_RATE=$((LANE_E_PUBS_PER_SITE * (e_rate_keep / e_pubs_keep)))
     fi
-	lane_e_rung "$e_sites" "$e_rep" no "${E_PUB_STEPS[${#e_seen[@]}-1]:-$LANE_E_PUB_CONTAINERS_PER_SITE}"
+	lane_e_rung_checked "$e_sites" "$e_rep" no "${E_PUB_STEPS[${#e_seen[@]}-1]:-$LANE_E_PUB_CONTAINERS_PER_SITE}"
     LANE_E_PUBS_PER_SITE=$e_pubs_keep
     LANE_E_SITE_RATE=$e_rate_keep
     LANE_E_PAYLOAD=$e_payload_keep
     LANE_E_SECS=$e_normal_secs
+	if [ "$LANE_E_STOP_AFTER_FAILS" -gt 0 ]; then
+		e_rdir="$OUT/laneE/sites-$e_sites"
+		[ "$e_rep" -gt 1 ] && e_rdir="$e_rdir-rep$e_rep"
+		e_verdict=$(lane_e_rung_verdict "$e_rdir")
+		echo "$(basename "$e_rdir") $e_verdict" >>"$OUT/laneE/ladder-verdicts.txt"
+		if [ "$e_verdict" = pass ]; then e_fails=0; else e_fails=$((${e_fails:-0} + 1)); fi
+		if [ "$e_fails" -ge "$LANE_E_STOP_AFTER_FAILS" ] && [ "${#e_seen[@]}" -lt "${#LANE_E_SITES[@]}" ]; then
+			# Name every rung the ladder would still have run, exactly as the
+			# gate derives them from shape.txt (repeats counted in order).
+			e_skipped=()
+			e_seen_tmp=("${e_seen[@]}")
+			for e_rest in "${LANE_E_SITES[@]:${#e_seen[@]}}"; do
+				e_r=1
+				for e_prev in "${e_seen_tmp[@]}"; do [ "$e_prev" = "$e_rest" ] && e_r=$((e_r + 1)); done
+				e_seen_tmp+=("$e_rest")
+				if [ "$e_r" = 1 ]; then e_skipped+=("sites-$e_rest"); else e_skipped+=("sites-$e_rest-rep$e_r"); fi
+			done
+			{
+				echo "stopped_after=$(basename "$e_rdir") consecutive_fails=$e_fails threshold=$LANE_E_STOP_AFTER_FAILS"
+				echo "skipped=${e_skipped[*]}"
+			} >"$OUT/laneE/ladder-stop.txt"
+			say "[$N nodes] lane E: KNEE — $e_fails consecutive failing rungs (last: $(basename "$e_rdir"): $e_verdict); skipping ${e_skipped[*]}"
+			break
+		fi
+	fi
 done
 # The control repeats the BOTTOM rung — the lowest load the ladder offered, and
 # so the one most likely to pass on a healthy cluster and most damning when it
@@ -2780,7 +3054,7 @@ if [ "$LANE_E_CONTROL" = 1 ] && [ "${#LANE_E_SITES[@]}" -gt 1 ]; then
         LANE_E_PUBS_PER_SITE=${E_PUBS_STEPS[0]}
         LANE_E_SITE_RATE=$((LANE_E_PUBS_PER_SITE * (e_rate_keep / e_pubs_keep)))
     fi
-	lane_e_rung "$e_control" "$e_rep" yes "${E_PUB_STEPS[0]:-$LANE_E_PUB_CONTAINERS_PER_SITE}"
+	lane_e_rung_checked "$e_control" "$e_rep" yes "${E_PUB_STEPS[0]:-$LANE_E_PUB_CONTAINERS_PER_SITE}"
 fi
 fi # LANES *E*
 

@@ -209,6 +209,8 @@ jobs:
         run: python3 bench/scale/extract-lane-e.py --self-test
       - name: Scale provider selection and recovery (offline)
         run: python3 bench/scale/test-cloud.py
+      - name: Size A/B on one provisioning — resize and the knee campaign (offline)
+        run: python3 bench/scale/test-resize.py
 
   interop:
     name: foreign-client interop (mosquitto + paho)

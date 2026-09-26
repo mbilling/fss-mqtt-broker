@@ -214,6 +214,17 @@ def scrape(b: Budgets, remote_timeout: float = 10) -> Node:
     ])
 
 
+def poll_tries(b: Budgets) -> Node:
+    """lane_e_recv_total in the steady gate: each driver gets LANE_E_POLL_TRIES
+    attempts, 2 s apart, before the poll counts as failed — so a steady poll
+    costs up to that many scrapes, not one. The drain polls once."""
+    tries = int(b.get("LANE_E_POLL_TRIES"))
+    children = [Node("attempt", repeat=tries, children=[scrape(b)])]
+    if tries > 1:
+        children.append(Node("sleep 2 between attempts", repeat=tries - 1, budget=2))
+    return Node(f"delivery poll (up to {tries} tries)", children=children)
+
+
 def lane_e_tree(b: Budgets) -> Node:
     """Lane E as it actually runs: one canary, then the ladder of rungs."""
     drain_poll = b.get("LANE_E_DRAIN_POLL")
@@ -235,7 +246,7 @@ def lane_e_tree(b: Budgets) -> Node:
 
     steady = Node("steady gate", budget=b.get("LANE_E_STEADY_BUDGET"),
                   why="delivery must sit inside the offer band before measuring", children=[
-        Node("in-band poll", repeat=int(steady_polls), children=[scrape(b)]),
+        Node("in-band poll", repeat=int(steady_polls), children=[poll_tries(b)]),
     ])
 
     # The edge scrapes BRACKET the window rather than fitting inside it, so the
@@ -277,6 +288,10 @@ def lane_e_tree(b: Budgets) -> Node:
     ])
 
     return Node("lane E (one size)", mode="seq", children=[
+        Node("mesh settle", budget=b.get("LANE_E_MESH_SETTLE_BUDGET"),
+             why="every broker at N members and N-1 links before the control"),
+        Node("driver gate", budget=b.get("LANE_E_DRIVER_GATE_SECS") + 30,
+             why="every driver bursts at once; +30 s for start-up and log collection. A swap adds replace-node.sh's own waits"),
         Node("forward canary", budget=b.get("LANE_E_FORWARD_CANARY_TIMEOUT"),
              why="100 QoS 1 messages over each directed broker pair"),
         Node("ladder", children=[rung]),

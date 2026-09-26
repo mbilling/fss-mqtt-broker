@@ -352,18 +352,22 @@ for N in "${SIZES[@]}"; do
 	say "════ cluster size $N ════"
 
 	phase provisioning "$N brokers"
-	(cd "$TFDIR" && "$TF" apply -auto-approve -input=false \
-		-var node_count="$N" -var run_label="$STAMP" \
-		${MQTTD_VERSION:+-var mqttd_version="$MQTTD_VERSION"} \
-		${MQTTD_URL:+-var mqttd_url="$MQTTD_URL"} \
-		${MQTTD_SHA256:+-var mqttd_sha256="$MQTTD_SHA256"} \
-		${BENCH_GIT_REF:+-var bench_git_ref="$BENCH_GIT_REF"} \
-		"${TOFU_SSH_PUBKEY_ARGS[@]}" \
-		${DRIVER_COUNT:+-var driver_count="$DRIVER_COUNT"} \
-		${BROKER_TYPE:+-var broker_server_type="$BROKER_TYPE"} \
-		${DRIVER_TYPE:+-var driver_server_type="$DRIVER_TYPE"} \
-		${BROKER_NIC_SPREAD:+-var broker_nic_spread="$BROKER_NIC_SPREAD"} \
-		${COMPARE:+-var broker_docker=true} \
+	# One array, recorded beside the run: replace-node.sh swaps a single bad host
+	# with EXACTLY these variables. Any difference (a run_label, a binary pin)
+	# would make that apply rebuild every server instead of one.
+	TF_APPLY_ARGS=(-var node_count="$N" -var run_label="$STAMP")
+	[ -z "${MQTTD_VERSION:-}" ] || TF_APPLY_ARGS+=(-var mqttd_version="$MQTTD_VERSION")
+	[ -z "${MQTTD_URL:-}" ] || TF_APPLY_ARGS+=(-var mqttd_url="$MQTTD_URL")
+	[ -z "${MQTTD_SHA256:-}" ] || TF_APPLY_ARGS+=(-var mqttd_sha256="$MQTTD_SHA256")
+	[ -z "${BENCH_GIT_REF:-}" ] || TF_APPLY_ARGS+=(-var bench_git_ref="$BENCH_GIT_REF")
+	TF_APPLY_ARGS+=(${TOFU_SSH_PUBKEY_ARGS[@]+"${TOFU_SSH_PUBKEY_ARGS[@]}"})
+	[ -z "${DRIVER_COUNT:-}" ] || TF_APPLY_ARGS+=(-var driver_count="$DRIVER_COUNT")
+	[ -z "${BROKER_TYPE:-}" ] || TF_APPLY_ARGS+=(-var broker_server_type="$BROKER_TYPE")
+	[ -z "${DRIVER_TYPE:-}" ] || TF_APPLY_ARGS+=(-var driver_server_type="$DRIVER_TYPE")
+	[ -z "${BROKER_NIC_SPREAD:-}" ] || TF_APPLY_ARGS+=(-var broker_nic_spread="$BROKER_NIC_SPREAD")
+	[ -z "${COMPARE:-}" ] || TF_APPLY_ARGS+=(-var broker_docker=true)
+	declare -p TF_APPLY_ARGS >"$RUN/tf-apply-args-$N.sh"
+	(cd "$TFDIR" && "$TF" apply -auto-approve -input=false "${TF_APPLY_ARGS[@]}" \
 		>"$RUN/tf-apply-$N.log" 2>&1) || {
 		tail -30 "$RUN/tf-apply-$N.log" >&2
 		die "OpenTofu apply failed for size $N"
@@ -504,6 +508,10 @@ for N in "${SIZES[@]}"; do
 		"$SCALE_DIR/observe.sh" attach "$RUN" "$INVENTORY" || warn "observe attach failed — continuing unobserved"
 	fi
 	phase running "$N nodes"
+	# A pinned load generator is swapped for a fresh server in place rather than
+	# costing the whole provisioning (replace-node.sh). Set LANE_E_SWAP_HOOK= to
+	# refuse swaps; the harness then records bad drivers instead.
+	if [ "$CLOUD" = hcloud ]; then export LANE_E_SWAP_HOOK="${LANE_E_SWAP_HOOK-$SCALE_DIR/replace-node.sh}"; fi
 	"$SCALE_DIR/run-curve.sh" "$RUN" "$INVENTORY"
 	phase collecting "$N nodes"
 	"$SCALE_DIR/collect.sh" "$RUN" "$INVENTORY"

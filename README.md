@@ -12,6 +12,8 @@
 > MQTT 3.1.1 + 5.0 · Rust · durable sessions quorum-replicated **by default** · Apache-2.0, everything.
 >
 > **75,000 msg/s** on one 4-vCPU node at p99 ≤ 1 s — **1.7× Mosquitto and EMQX, 2.5× HiveMQ CE**, same host, EMQX's own load tool. [Numbers ↓](#by-the-numbers)
+>
+> **Linear scale-out:** ~114,000 msg/s **per 4-vCPU node, flat from 3 to 10 nodes** — **1.14M msg/s on 10 nodes, 40 vCPU in total** (QoS 0 shared subscriptions). [Scale-out ↓](#cluster-scale-out-qos-0-shared-subscriptions)
 
 ---
 
@@ -20,6 +22,7 @@
 | | mqttd | the others |
 |---|---|---|
 | **Single-node throughput** | 75k msg/s at p99 ≤ 1 s, 30% CPU idle | 45k / 45k / 30k (Mosquitto / EMQX / HiveMQ CE) |
+| **Cluster scale-out** | ~114k msg/s per 4-vCPU node, flat 3 → 10 nodes; ~1M msg/s on **40 vCPU** | vendor-published ~1M msg/s runs: HiveMQ on 40 nodes, EMQX on 1,472 cores ([different workloads ↓](#against-published-cluster-benchmarks)) |
 | **Durable sessions** | quorum-replicated, **default**; acked QoS 1/2 survives node loss, even in flight | Mosquitto/NanoMQ single-node · VerneMQ loses queues on node death · EMQX opt-in |
 | **Revocation** | policy reload **evicts live sessions** | not documented by any compared broker |
 | **Secure by default** | TLS 1.3, mTLS/OIDC, deny-by-default ACL, hash-chained audit; insecure = opt-in + `INSECURE:` log | varies; NanoMQ and Mosquitto < 2.0 allow anonymous by default |
@@ -30,7 +33,7 @@
 
 ## By the numbers
 
-Sources: [SINGLE-NODE-COMPARISON.md](docs/benchmarks/SINGLE-NODE-COMPARISON.md) (2026-09-16, one Hetzner CCX23, 4 vCPU / 16 GB, brokers in sequence, untuned) · [SCALE-CURVE.md](docs/benchmarks/SCALE-CURVE.md) (one host + NVMe per broker).
+Sources: [SINGLE-NODE-COMPARISON.md](docs/benchmarks/SINGLE-NODE-COMPARISON.md) (2026-09-16, one Hetzner CCX23, 4 vCPU / 16 GB, brokers in sequence, untuned) · [knee-3-5-7-10.md](bench/scale/knee-3-5-7-10.md) (2026-09-26, QoS 0 scale-out, 3 → 10 nodes on one provisioning) · [SCALE-CURVE.md](docs/benchmarks/SCALE-CURVE.md) (one host + NVMe per broker).
 
 **Single-node knee** — highest rate at p99 ≤ 1 s and ≥ 99% delivered (1:1 QoS 0, 200 B):
 
@@ -69,6 +72,47 @@ HiveMQ CE  2024.3   ████████████████████
 
 ![mqttd at 150,000 msg/s](docs/benchmarks/img/timeline-mqttd-150k.svg)
 
+### Cluster scale-out, QoS 0 shared subscriptions
+
+The highest rate each cluster size carries at p99 ≤ 1 s with every message
+delivered (1:1 via `$share`, 200 B, 10 consumers per site). All four sizes ran on
+**one provisioning**, the same hosts re-formed 10 → 7 → 5 → 3 → 10. Each size had
+2 load generators per broker and ladders matched in per-node offer, so a driver
+carries the same load at every size:
+
+```text
+3 nodes  ██████████·······················  ≥ 360k msg/s  ≥ 120k/node   every rung passed — knee above
+5 nodes  ████████████████·················    570k         114k/node
+7 nodes  ███████████████████████··········    810k         116k/node
+10 nodes █████████████████████████████████  1,140k         114k/node   highest passing rung (see below)
+```
+
+![Scale-out: msg/s at the knee vs nodes](docs/benchmarks/img/scale-out-qos0.svg)
+
+**Per-node capacity is flat from 3 to 10 nodes.** 5, 7 and 10 nodes all pass
+~114k msg/s per node and fail at 120k. 3 nodes passes 120k, which is one ladder
+step (6–10k/node) above the others and inside the run's declared ±0.1 resolution.
+Crossing was 0.00% on every broker of every rung, and ingress stayed balanced
+(busiest broker ≤ 1.01× the mean). A closing 10-node arm on the same hosts matched
+the opening one within 0.002%.
+
+Read strictly, by the rules fixed before the run:
+- **3 nodes' figure is a floor.** Its whole ladder passed.
+- **10 nodes is uncertified.** Near saturation, one busy broker stopped answering
+  membership probes and was declared dead by its peers for ~30 s, at 108k/node on
+  10 nodes and at 120k/node on 7. The run's own mesh gate therefore fails the
+  10-node arm. No message was lost (0 dropped, 0 pending), but this is a real
+  membership flap under load and is tracked as a limitation.
+- The 10-node ladder also had one NOT STEADY rung at 96k/node, which received the
+  full offer but never held the per-site band. Its strictly certified figure is
+  900k.
+
+The earlier "5 → 7 nodes plateaus" reading came from a benchmark gap: one of 7
+brokers had no local subscriber, so 14% of publishes crossed the cluster. It
+does not reproduce under a controlled harness.
+
+### Durable and QoS 1 scale-out
+
 **Cluster scale-out, durable QoS 1** (ack after fsync + quorum):
 
 ```text
@@ -104,9 +148,50 @@ rather than by sampling CPU. Spreading that softirq is a settled dead end for ca
 per-core breakdown, and two earlier revisions of this claim that were wrong:
 [QOS1-SCALE-CURVE.md](docs/benchmarks/QOS1-SCALE-CURVE.md).
 
+### Against published cluster benchmarks
+
+HiveMQ and EMQX publish large-cluster results around 1M msg/s. **We have not
+reproduced these.** The table puts their published figures next to ours, with
+every difference that matters shown alongside:
+
+| | **mqttd** (ours, 2026-09-26) | HiveMQ 4.11 (2023) | EMQX 5.0 (2022) | EMQX 4.3 (2021) | HiveMQ 4.18 (2023) |
+|---|---|---|---|---|---|
+| throughput | **1.14M** QoS 0 (810k certified at 7 nodes) | 1M QoS 1 PUBLISH/s peak | > 1M QoS 1 in and out | 505k QoS 0, 1:1 | 270k QoS 1 |
+| cluster | **10 × 4 vCPU = 40 vCPU** | 40 nodes (AWS; instance type not published) | 23 × `c6g.metal` = 1,472 cores | 5 × 32 cores = 160 cores | 3 × `m6a.8xlarge` = 96 vCPU |
+| per core | **~28,500 msg/s** | — | ~680 in | ~3,200 | ~2,800 |
+| connections | ~45k | 200M | 100M | 10M | 20k |
+| payload · pattern | 200 B · 1:1 `$share` | 16 B · 20M pubs → 180M subs | 256 B · 1:1 wildcard | 50 B · 1:1 | not published |
+| CPU at that rate | busiest broker 11–19% idle | 75–80% | 97% | 56–68% | not published |
+
+**What the differences mean.** The two ~1M headline runs carried **2,000–4,000×
+more connections** than ours (EMQX 4.3: ~220×), and connection count dominates
+their resource use: HiveMQ reports about 13 KB of heap per connection, and EMQX
+uses 90% of RAM at 100M connections. HiveMQ's runs and EMQX 5.0's are QoS 1;
+ours is QoS 0. So the per-core row is **not a like-for-like ratio**. It is a statement about the hardware each system needs to
+carry a message at the connection counts shown.
+
+The closest comparison is HiveMQ 4.18, with 20k clients and QoS 1. mqttd's own
+QoS 1 figure is 180k msg/s on 5 × 4 vCPU (above): **~9,000 msg/s per vCPU against
+HiveMQ's ~2,800**. Its payload is not published.
+
+What the table does not show, and where the others lead:
+- **connection scale:** 100–200M connections is a regime we have not measured
+- **track record:** mqttd has no production users yet
+
+What it does show:
+- **an open cluster:** mqttd's clustering is free and Apache-2.0. HiveMQ
+  clustering is commercial, and EMQX 5.x/6.x clustering is BSL.
+- **durability by default:** sessions are quorum-replicated without any extra
+  configuration.
+
+Sources: [HiveMQ 200M connections](https://www.hivemq.com/whitepaper/achieving-200-mil-concurrent-connections-with-hivemq/) ·
+[HiveMQ 4.18 throughput](https://www.hivemq.com/blog/hivemq-4-18-delivers-higher-mqtt-throughput/) ·
+[EMQX 5.0 100M connections](https://www.emqx.com/en/blog/reaching-100m-mqtt-connections-with-emqx-5-0) ·
+[EMQX 4.3 10M connections](https://www.emqx.com/en/resources/emqx-v-4-3-0-ten-million-connections-performance-test-report).
+
 | more published points | |
 |---|---|
-| `$share` fan-out floor, 1 → 3 → 5 nodes | ~18.6k → ~53.9k → ~81.4k msg/s (driver-limited) |
+| `$share` fan-out floor, 1 → 3 → 5 nodes (v1.0.5, driver-limited; superseded by the scale-out curve above) | ~18.6k → ~53.9k → ~81.4k msg/s |
 | 50,000 idle connections | 19.3–19.7 KiB each, flat across cluster sizes |
 | durable QoS 1 vs clean session, same publish | ~28 ms vs ~0.03 ms p50 (dev host) |
 | codec, 256 B PUBLISH | encode ~270 ns · decode ~190 ns · per-PR regression gate |
@@ -115,6 +200,7 @@ per-core breakdown, and two earlier revisions of this claim that were wrong:
 - Mosquitto: **7× less memory** at its knee; tighter tail (≤ 100 ms) at its own knee, as does HiveMQ
 - EMQX: quietest at 15k msg/s (≤ 1 ms p99; mqttd matches)
 - 3 nodes ≈ 1 node on the durable path
+- near saturation a busy broker can be declared dead by its peers for ~30 s (membership flap, seen at 108–120k msg/s per node; no loss at 0% crossing)
 - **No production users yet**
 - full list: [GUIDE.md § Limitations](GUIDE.md#limitations)
 
@@ -245,6 +331,15 @@ More charts: [latency 30k](docs/benchmarks/img/latency-30000.svg) · [latency 75
 | QoS 2 msg/s | 2,970 | 2,124 | 3,009 |
 | clean sessions msg/s | 32.1k | 89.4k | 109.6k |
 
+**QoS 0 scale-out (3 → 10 nodes), method:**
+[knee-3-5-7-10.md](bench/scale/knee-3-5-7-10.md)
+- **Hardware:** one provisioning (10 × CCX23 brokers, 20 × CCX33 drivers), re-formed per
+  size by `resize-cluster.sh`; drivers are 2 per broker.
+- **Safeguards per size:** a mesh-settle wait, a forwarding positive control, a driver
+  health gate with in-place swap of a bad host, and a closing drift control.
+- **Ladders:** matched per node and stopped two failing rungs past the knee.
+- **Candidate:** the unreleased `main` 0a08187, pinned by sha256.
+
 Other published measurements (dev-grade, single host, never capacity): [DURABLE-PATH.md](docs/benchmarks/DURABLE-PATH.md) · [BASELINE.md](docs/benchmarks/BASELINE.md) · [BACKUP-RESTORE.md](docs/benchmarks/BACKUP-RESTORE.md).
 
 ### Where competitors win
@@ -258,8 +353,9 @@ Other published measurements (dev-grade, single host, never capacity): [DURABLE-
 | Track record | all of them | mqttd: **no production users** |
 | Hard memory cap | Mosquitto | mqttd: watermark + brownout only |
 | Feature surface | EMQX | dashboard, SQL rules, MQTT-SN/CoAP |
-| Linear scale-out | nobody yet | 3 ≈ 1 node durable; plan [#537](https://github.com/mbilling/fss-mqtt-broker/issues/537) |
-| Not covered | — | one instance type, QoS 0, plaintext, no TLS, no cluster; newer Mosquitto 2.1 / EMQX 6.x unmeasured |
+| Linear scale-out, durable path | nobody yet | QoS 0 is flat 3 → 10 nodes; durable QoS 1 still 3 ≈ 1 node; plan [#537](https://github.com/mbilling/fss-mqtt-broker/issues/537) |
+| Connection scale | HiveMQ, EMQX | published 200M / 100M connections; mqttd measured to 50k |
+| Not covered | — | single-node comparison: one instance type, QoS 0, plaintext, no TLS, no cluster; newer Mosquitto 2.1 / EMQX 6.x unmeasured; vendor cluster figures published, not reproduced |
 
 ---
 
@@ -533,7 +629,7 @@ Tracked on the [delivery dashboard](docs/delivery/STATUS.md).
 ```sh
 cargo build && cargo test && cargo clippy --all-targets && cargo deny check
 ./scripts/interop/run.sh     # foreign-client conformance
-mqttui --list                # There are 86 runnable scripts here: demos, smokes, migrations, benches
+mqttui --list                # There are 92 runnable scripts here: demos, smokes, migrations, benches
 ```
 
 ---

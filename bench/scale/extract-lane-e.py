@@ -837,6 +837,17 @@ def declared_rungs(lane: Path) -> list[str] | None:
     return names
 
 
+def stopped_rungs(lane: Path) -> list[str]:
+    """Rungs laneE/ladder-stop.txt says the harness skipped past a knee."""
+    stop = lane / "ladder-stop.txt"
+    if not stop.is_file():
+        return []
+    for line in stop.read_text(errors="replace").splitlines():
+        if line.startswith("skipped="):
+            return line.split("=", 1)[1].split()
+    return []
+
+
 def gate_lines(root: Path, outcomes: list[tuple[Path, dict | None]], pct: float) -> list[tuple[bool, str]]:
     sizes: dict[int, list[tuple[Path, dict | None]]] = {}
     lanes: dict[int, Path] = {}
@@ -854,9 +865,14 @@ def gate_lines(root: Path, outcomes: list[tuple[Path, dict | None]], pct: float)
         if not rungs:
             reasons.append("no sites-* rungs")
         declared = declared_rungs(lanes[n]) if n in lanes else None
+        skipped: list[str] = []
         if declared is not None:
             present = {path.name for path, _ in rungs}
-            missing = [name for name in declared if name not in present]
+            # A ladder stopped at its knee (run-curve.sh LANE_E_STOP_AFTER_FAILS)
+            # names what it skipped and why; exactly those may be absent. Any
+            # other missing rung is still a ladder cut short.
+            skipped = stopped_rungs(lanes[n]) if n in lanes else []
+            missing = [name for name in declared if name not in present and name not in skipped]
             if missing:
                 reasons.append(f"{', '.join(missing)} declared in shape.txt but not run")
         worst = 0.0
@@ -885,7 +901,8 @@ def gate_lines(root: Path, outcomes: list[tuple[Path, dict | None]], pct: float)
             out.append((False, f"GATE nodes={n} FAIL " + "; ".join(reasons)))
         else:
             certs = ",".join(sorted({r["cert"] for _, r in rungs if r}))
-            out.append((True, f"GATE nodes={n} PASS {len(rungs)} rungs, cert={certs}, max broker crossing {worst:.2f}% <= {pct:g}%"))
+            stopped = f", ladder stopped at its knee ({len(skipped)} skipped)" if skipped else ""
+            out.append((True, f"GATE nodes={n} PASS {len(rungs)} rungs, cert={certs}, max broker crossing {worst:.2f}% <= {pct:g}%{stopped}"))
     return out
 
 
@@ -1452,6 +1469,16 @@ class WindowTests(unittest.TestCase):
             rc, stdout, _ = run_main(["--crossing-gate", "0.5", str(Path(td))])
             self.assertEqual(rc, 1)
             self.assertIn("GATE nodes=1 FAIL sites-2, sites-1-rep2 declared in shape.txt but not run", stdout)
+            # A knee stop names exactly what it skipped; only those may be absent.
+            (lane / "ladder-stop.txt").write_text("stopped_after=sites-1 consecutive_fails=1\nskipped=sites-2\n")
+            rc, stdout, _ = run_main(["--crossing-gate", "0.5", str(Path(td))])
+            self.assertEqual(rc, 1)
+            self.assertIn("GATE nodes=1 FAIL sites-1-rep2 declared in shape.txt but not run", stdout)
+            (lane / "ladder-stop.txt").write_text("skipped=sites-2 sites-1-rep2\n")
+            rc, stdout, _ = run_main(["--crossing-gate", "0.5", str(Path(td))])
+            self.assertEqual(rc, 0, stdout)
+            self.assertIn("ladder stopped at its knee (2 skipped)", stdout)
+            (lane / "ladder-stop.txt").unlink()
             (lane / "shape.txt").write_text(shape.format(control="OFF").replace("      2 |", "   nope |"))
             rc, stdout, _ = run_main(["--crossing-gate", "0.5", str(Path(td))])
             self.assertEqual(rc, 0, stdout)
