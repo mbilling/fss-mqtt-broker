@@ -775,5 +775,80 @@ printf '%s\\n' {" ".join(repr(v) for v in verdicts)} >"$OUT/verdicts"
         self.assertFalse((self.root / "out/laneE/ladder-verdicts.txt").exists())
 
 
+class DeliveryPollTests(Rig):
+    """lane_e_recv_total and the drain loop, extracted verbatim from run-curve.sh,
+    against drivers whose scrape fails a scripted number of times."""
+
+    def recv_total_src(self):
+        src = (self.rig / "run-curve.sh").read_text()
+        start = src.index("\tlane_e_recv_total() {")
+        return src[start:src.index("\n\t}\n", start) + 4]
+
+    def drain_src(self):
+        src = (self.rig / "run-curve.sh").read_text()
+        # Lane D has an identical-looking drain loop earlier in the file: take the
+        # one that polls through lane_e_recv_total.
+        start = src.rindex('\t\tt0=$(date +%s)\n\t\twhile :; do', 0, src.index("lane_e_recv_total 1"))
+        end = "\n\t\tdone\n"
+        return src[start:src.index(end, start) + len(end)]
+
+    def poll(self, body, fails, extra_env=None):
+        stub = self.root / "stub"
+        stub.mkdir(exist_ok=True)
+        (stub / "lane-e-evidence.py").write_text(
+            "import sys, pathlib\n"
+            "print(sum(int(p.read_text() or 0) for p in pathlib.Path(sys.argv[2], '.poll').glob('*.prom')))\n")
+        script = f'''
+set -uo pipefail
+SCALE_DIR={stub}; rdir={self.root}/rung; D=3; LANE_E_SITE_RATE=30000; LANE_E_POLL_TRIES=3
+rm -rf "$rdir"; mkdir -p "$rdir/.batch"
+pollscrape=(a b c)
+say() {{ :; }}; warn() {{ echo "WARN $*" >&2; }}; die() {{ echo "DIE $*" >&2; exit 9; }}
+driver_batch() {{   # fails FAILS[q] times for driver q, then prints its count
+	local n; n=$(( $(cat "$rdir/.n$1" 2>/dev/null || echo 0) + 1 )); echo $n >"$rdir/.n$1"
+	local f=({" ".join(str(x) for x in fails)})
+	[ "$n" -le "${{f[$1]}}" ] && {{ echo "ssh: connect timed out" >&2; return 255; }}
+	echo "@@@ d$1"; echo 100
+}}
+batch_split() {{ awk '/^@@@/ {{next}} {{print}}' "$3" >"$1/$(basename "$3").prom"; }}
+{self.recv_total_src()}
+{body}
+'''
+        return subprocess.run(["bash", "-c", script], text=True, capture_output=True, cwd=self.root,
+                              env=self.env | (extra_env or {}))
+
+    def test_a_transient_scrape_failure_is_retried(self):
+        r = self.poll('lane_e_recv_total || echo FAILED', [0, 2, 0])
+        self.assertEqual(r.stdout.strip(), "300", r.stderr)
+        err = (self.root / "rung/.batch/poll-1.err").read_text()
+        self.assertIn("connect timed out", err, "the cause is kept, not discarded")
+        self.assertEqual(err.count("failed at"), 2)
+
+    def test_a_driver_that_never_answers_fails_the_poll(self):
+        r = self.poll('lane_e_recv_total || echo FAILED', [0, 9, 0])
+        self.assertIn("FAILED", r.stdout)
+        r2 = self.poll('lane_e_recv_total 1 || echo FAILED', [0, 1, 0])
+        self.assertIn("FAILED", r2.stdout, "one try means one try")
+
+    def test_a_failed_drain_poll_is_recorded_and_the_drain_goes_on(self):
+        # Driver 1 fails the first two drain polls, then the backlog is flat.
+        body = '''
+LANE_E_DRAIN_POLL=0; LANE_E_DRAIN_SECS=60; LANE_E_FLAT_POLLS=3; sites=10
+drained=no prev=-1 flat=0 elapsed=0
+echo -e "elapsed_s\\trecv_total" >"$rdir/drain.tsv"
+''' + self.drain_src() + '''
+echo "drained=$drained"
+'''
+        r = self.poll(body, [0, 2, 0])
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn("DIE", r.stderr)
+        self.assertIn("drained=yes", r.stdout)
+        rows = (self.root / "rung/drain.tsv").read_text().splitlines()[1:]
+        self.assertEqual([row.split("\t")[1] for row in rows],
+                         ["poll-failed", "poll-failed", "300", "300", "300", "300"],
+                         "the first good poll is the baseline; three flat ones after it drain")
+        self.assertIn("recorded, not counted as flat", r.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -214,6 +214,15 @@ def scrape(b: Budgets, remote_timeout: float = 10) -> Node:
     ])
 
 
+def poll_tries(b: Budgets) -> Node:
+    """lane_e_recv_total in the steady gate: each driver gets LANE_E_POLL_TRIES
+    attempts, 2 s apart, before the poll counts as failed — so a steady poll
+    costs up to that many scrapes, not one. The drain polls once."""
+    tries = int(b.get("LANE_E_POLL_TRIES"))
+    return Node(f"delivery poll (up to {tries} tries)", repeat=tries,
+                children=[scrape(b), Node("retry sleep 2", budget=2)])
+
+
 def lane_e_tree(b: Budgets) -> Node:
     """Lane E as it actually runs: one canary, then the ladder of rungs."""
     drain_poll = b.get("LANE_E_DRAIN_POLL")
@@ -235,7 +244,7 @@ def lane_e_tree(b: Budgets) -> Node:
 
     steady = Node("steady gate", budget=b.get("LANE_E_STEADY_BUDGET"),
                   why="delivery must sit inside the offer band before measuring", children=[
-        Node("in-band poll", repeat=int(steady_polls), children=[scrape(b)]),
+        Node("in-band poll", repeat=int(steady_polls), children=[poll_tries(b)]),
     ])
 
     # The edge scrapes BRACKET the window rather than fitting inside it, so the

@@ -556,6 +556,9 @@ LANE_E_SWAP_HOOK="${LANE_E_SWAP_HOOK:-}"
 # skipped rungs are written to laneE/ladder-stop.txt, which is the only list of
 # absences the crossing gate accepts. 0 (the default) climbs the whole ladder.
 LANE_E_STOP_AFTER_FAILS="${LANE_E_STOP_AFTER_FAILS:-0}"
+# Attempts per driver for each steady-gate delivery poll (lane_e_recv_total);
+# the drain polls once and tolerates a failed poll instead.
+LANE_E_POLL_TRIES="${LANE_E_POLL_TRIES:-3}"
 # A rung PASSES only if its p99 stays under this many ms. The point of a tenancy
 # ladder is the site count at which latency leaves the band, not the count at
 # which the broker finally refuses traffic — those are far apart, and only the
@@ -921,6 +924,7 @@ lane_e_shape() {
 	positive_int LANE_E_FORWARD_CANARY_COUNT "$LANE_E_FORWARD_CANARY_COUNT"
 	positive_int LANE_E_FORWARD_CANARY_TIMEOUT "$LANE_E_FORWARD_CANARY_TIMEOUT"
 	positive_int LANE_E_DRIVER_SOFTIRQ_MAX "$LANE_E_DRIVER_SOFTIRQ_MAX"
+	positive_int LANE_E_POLL_TRIES "$LANE_E_POLL_TRIES"
 	[[ "$LANE_E_STOP_AFTER_FAILS" =~ ^[0-9]+$ ]] || die "LANE_E_STOP_AFTER_FAILS must be a non-negative integer, got '$LANE_E_STOP_AFTER_FAILS'"
 	[ "$LANE_E_DRIVER_SOFTIRQ_MAX" -le 100 ] || die "LANE_E_DRIVER_SOFTIRQ_MAX is a percentage, got $LANE_E_DRIVER_SOFTIRQ_MAX"
 	positive_int LANE_E_DRIVER_GATE_SECS "$LANE_E_DRIVER_GATE_SECS"
@@ -2001,11 +2005,25 @@ lane_e_rung() { # lane_e_rung <sites> [repeat-index] [is-control]
 	# `recv_total`, which has polled a drain on real hardware since it was
 	# written — this lane needs the same question answered, and a second read
 	# path (parsing `docker logs`) would be a second thing to get wrong.
-	lane_e_recv_total() {
-		local q
+	lane_e_recv_total() { # lane_e_recv_total [tries]
+		local q tries="${1:-$LANE_E_POLL_TRIES}"
 		local -a rp=()
+		# Each driver gets <tries> attempts, 2 s apart, before the poll counts as
+		# failed: one ssh hop or one `curl -m 10` timing out on one of twenty
+		# drivers ended a 30-server campaign on 2026-09-26 while that driver's
+		# consumer was receiving a steady 30 000/s. stderr is kept. The steady
+		# gate, which stops the size on a failed poll, retries; the drain, which
+		# records a failed poll and keeps going, polls once (its budget is sized
+		# for one scrape per poll — budgets.py).
 		for ((q = 0; q < D; q++)); do
-			driver_batch "$q" "set -e"$'\n'"${pollscrape[q]}" >"$rdir/.batch/poll-$q" 2>/dev/null &
+			(
+				for ((try = 1; try <= tries; try++)); do
+					driver_batch "$q" "set -e"$'\n'"${pollscrape[q]}" >"$rdir/.batch/poll-$q" 2>>"$rdir/.batch/poll-$q.err" && exit 0
+					echo "attempt $try failed at $(date -u +%H:%M:%S)" >>"$rdir/.batch/poll-$q.err"
+					[ "$try" -lt "$tries" ] && sleep 2
+				done
+				exit 1
+			) &
 			rp+=($!)
 		done
         for q in ${rp[@]+"${rp[@]}"}; do wait "$q" || return 1; done
@@ -2494,7 +2512,19 @@ PAUSED
 		while :; do
 			sleep "$LANE_E_DRAIN_POLL"
 			elapsed=$(($(date +%s) - t0))
-			cur=$(lane_e_recv_total) || die "incomplete drain poll"
+			# A poll that still fails after its retries is recorded and cannot count
+			# as flat: the drain keeps polling to its deadline and, if it never
+			# converges, the rung reads UNRESOLVED. It does not end the campaign.
+			if ! cur=$(lane_e_recv_total 1); then
+				printf '%s\tpoll-failed\n' "$elapsed" >>"$rdir/drain.tsv"
+				warn "lane E: a drain poll failed on some driver (see $rdir/.batch/poll-*.err) — recorded, not counted as flat"
+				prev=-1 flat=0
+				[ "$elapsed" -lt "$LANE_E_DRAIN_SECS" ] || {
+					warn "lane E: drain budget ${LANE_E_DRAIN_SECS}s elapsed without a clean poll — rung $sites reports UNRESOLVED"
+					break
+				}
+				continue
+			fi
 			printf '%s\t%s\n' "$elapsed" "$cur" >>"$rdir/drain.tsv"
 			# LANE_E_FLAT_POLLS consecutive non-increasing polls, not one: a single
 			# flat poll can land inside a scrape gap and end the drain early, which
