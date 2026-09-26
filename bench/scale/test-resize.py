@@ -782,6 +782,23 @@ printf '%s\\n' {" ".join(repr(v) for v in verdicts)} >"$OUT/verdicts"
         self.assertEqual((self.root / "out/laneE/ladder-verdicts.txt").read_text().splitlines(),
                          ["sites-1 pass", "sites-10 fail: p99", "sites-11 fail: p99"])
 
+    def test_invalid_evidence_neither_counts_nor_resets(self):
+        # The 2026-09-26 QoS 1 shape: 13 x3 at 39k/node, two repetitions INVALID
+        # EVIDENCE with every broker receiving the offer. That is not a knee.
+        r = self.ladder("1 12 13 13 13 14", ["pass", "fail: INVALID EVIDENCE (endpoint scrape window uncertainty exceeds 2%)",
+                                              "pass", "fail: INVALID EVIDENCE (x)", "fail: INVALID EVIDENCE (y)", "pass"], 2)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.ran(), ["1 1", "12 1", "13 1", "13 2", "13 3", "14 1"], "the probe still runs")
+        self.assertFalse((self.root / "out/laneE/ladder-stop.txt").exists())
+
+    def test_a_real_fail_beside_invalid_evidence_still_counts(self):
+        (self.root / "out").mkdir(exist_ok=True)
+        r = self.ladder("1 9 10 11", ["pass", "fail: PUBLISHERS LATE (7%)",
+                                      "fail: INVALID EVIDENCE (x); PUBLISHERS LATE (9%)", "x"], 2)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.ran(), ["1 1", "9 1", "10 1"])
+        self.assertIn("skipped=sites-11", (self.root / "out/laneE/ladder-stop.txt").read_text())
+
     def test_off_by_default_climbs_everything(self):
         r = self.ladder("1 10 11", ["fail: a", "fail: b", "fail: c"], 0)
         self.assertEqual(r.returncode, 0, r.stderr)

@@ -125,9 +125,21 @@ does not reproduce under a controlled harness.
 both ways — no durable session, so this is the routing path, not the fsync one):
 
 ```text
-3 nodes ██████████████████████░░░░░░░░░░░  120k msg/s   25.9 MB/s   p99 ≤ 5 ms   40.0k/node
-5 nodes █████████████████████████████████  180k         38.9 MB/s   p99 ≤ 5 ms   36.0k/node
+3 nodes  ██████████░░░░░░░░░░░░░░░░░░░░░░░  120k msg/s   25.9 MB/s   p99 ≤ 5 ms     40.0k/node
+5 nodes  ███████████████░░░░░░░░░░░░░░░░░░  180k         38.9 MB/s   p99 ≤ 5 ms     36.0k/node
+7 nodes  ███████████████████████░░░░░░░░░░  270k         58.3 MB/s   p99 ≤ 500 ms   38.6k/node   knee: 300k fails
+10 nodes █████████████████████████████████  390k         84.2 MB/s   p99 ≤ 500 ms   39.0k/node   no knee reached
 ```
+
+**Per-node QoS 1 capacity holds out to 10 nodes.**
+- **3 and 5 nodes:** separate provisionings.
+- **7 and 10 nodes:** one provisioning on 2026-09-26, with 20 consumers per site so
+  every broker holds a local member. Crossing was 0.00% throughout, and a closing
+  10-node arm matched the opening one within 0.001%.
+- **Certification:** 2 of 3 repetitions are certified at 7 nodes and 1 of 3 at 10.
+  The rest were invalid on the load driver's own endpoint scrapes, while every
+  broker received the full offer.
+
 
 MB/s is application payload (216 B/message). **The constraint is packets, not
 bytes** — measured: holding 60,000 msg/s and growing the payload to 8 KiB reached
@@ -171,8 +183,8 @@ ours is QoS 0. So the per-core row is **not a like-for-like ratio**. It is a sta
 carry a message at the connection counts shown.
 
 The closest comparison is HiveMQ 4.18, with 20k clients and QoS 1. mqttd's own
-QoS 1 figure is 180k msg/s on 5 × 4 vCPU (above): **~9,000 msg/s per vCPU against
-HiveMQ's ~2,800**. Its payload is not published.
+QoS 1 figures (above) are 180k msg/s on 5 × 4 vCPU and 390k on 10 × 4 vCPU: **~9,000–9,750
+msg/s per vCPU against HiveMQ's ~2,800**. Its payload is not published.
 
 What the table does not show, and where the others lead:
 - **connection scale:** 100–200M connections is a regime we have not measured

@@ -3030,7 +3030,21 @@ for e_sites in "${LANE_E_SITES[@]}"; do
 		[ "$e_rep" -gt 1 ] && e_rdir="$e_rdir-rep$e_rep"
 		e_verdict=$(lane_e_rung_verdict "$e_rdir")
 		echo "$(basename "$e_rdir") $e_verdict" >>"$OUT/laneE/ladder-verdicts.txt"
-		if [ "$e_verdict" = pass ]; then e_fails=0; else e_fails=$((${e_fails:-0} + 1)); fi
+		# A rung whose ONLY flags are INVALID EVIDENCE says nothing about the knee
+		# either way — its measurement is unusable, not failed — so it neither
+		# counts toward the stop nor resets the count. On 2026-09-26 two such rungs
+		# at 39k/node (QoS 1, 10 nodes; every broker received the full offer)
+		# stopped a ladder that had not reached its knee.
+		e_flags="${e_verdict#fail: }"
+		e_neutral=yes
+		IFS=';' read -r -a e_flag_list <<<"$e_flags"
+		for e_flag in "${e_flag_list[@]}"; do
+			e_flag="${e_flag# }"
+			case "$e_flag" in "INVALID EVIDENCE"*) ;; *) e_neutral=no ;; esac
+		done
+		if [ "$e_verdict" = pass ]; then e_fails=0
+		elif [ "$e_neutral" = yes ]; then :
+		else e_fails=$((${e_fails:-0} + 1)); fi
 		if [ "$e_fails" -ge "$LANE_E_STOP_AFTER_FAILS" ] && [ "${#e_seen[@]}" -lt "${#LANE_E_SITES[@]}" ]; then
 			# Name every rung the ladder would still have run, exactly as the
 			# gate derives them from shape.txt (repeats counted in order).
