@@ -75,7 +75,9 @@ different reasons.
 ## The pictures
 
 **Latency is a distribution, not a number.** At 45 000 msg/s — Mosquitto's and
-EMQX's knee, comfortably inside mqttd's — the four separate hard:
+EMQX's knee, comfortably inside mqttd's — the four separate hard. The shading is
+the p99 band a curve earns where it crosses the p99 line: GREEN ≤ 1 s, YELLOW
+≤ 5 s, RED above.
 
 ![Latency distribution at 45,000 msg/s](img/latency-45000.svg)
 
@@ -334,7 +336,14 @@ export COMPARE_RATES="15000 30000 45000 60000 75000 90000 120000 150000"
 export BROKER_TYPE=ccx23 DRIVER_TYPE=ccx43 DRIVER_COUNT=3
 bench/scale/run.sh compare
 python3 bench/scale/summarize-compare.py .runs/<stamp>/results
+python3 bench/scale/chart-compare.py .runs/<stamp>/results --latency 45000 --out docs/benchmarks/img/latency-45000.svg
+python3 bench/scale/chart-compare.py .runs/<stamp>/results --timeline mqttd --rate 150000 --out docs/benchmarks/img/timeline-mqttd-150k.svg
 ```
+
+The raw runs behind the charts above were not retained. Each chart's series was
+recovered from the chart first drawn from them, and is committed beside it
+(`img/data/*.json`, provenance inside), so the charts redraw from the tree:
+`python3 bench/scale/chart-compare.py --data docs/benchmarks/img/data/latency-45000.json --out docs/benchmarks/img/latency-45000.svg`.
 
 The run costs roughly €5 of cloud time and about 2.5 hours. Corrections are
 welcome: if a configuration here misrepresents a broker, open an issue and

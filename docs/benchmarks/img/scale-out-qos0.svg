@@ -1,58 +1,59 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 460" width="900" height="460" font-family="system-ui,-apple-system,Segoe UI,Roboto,sans-serif" role="img" aria-label="QoS 0 scale-out: msg/s at the knee vs nodes — $share 1:1, 200 B, 4-vCPU nodes">
-<rect width="900" height="460" fill="#ffffff"/>
-<text x="90" y="26" font-size="16" font-weight="600" fill="#0f172a">QoS 0 scale-out: msg/s at the knee vs nodes — $share 1:1, 200 B, 4-vCPU nodes</text>
-<text x="90" y="44" font-size="12" fill="#475569">one provisioning (10 × CCX23 + 20 × CCX33), drivers 2 per broker, ladders matched per node; knee = GREEN: p99 ≤ 1 s, zero loss, 0% crossing</text>
-<rect x="90" y="60" width="750" height="320" fill="none" stroke="#cbd5e1"/>
-<line x1="90" y1="380.0" x2="840" y2="380.0" stroke="#e2e8f0"/>
-<text x="82" y="384.0" font-size="11" fill="#475569" text-anchor="end">0.0M</text>
-<line x1="90" y1="330.8" x2="840" y2="330.8" stroke="#e2e8f0"/>
-<text x="82" y="334.8" font-size="11" fill="#475569" text-anchor="end">0.2M</text>
-<line x1="90" y1="281.5" x2="840" y2="281.5" stroke="#e2e8f0"/>
-<text x="82" y="285.5" font-size="11" fill="#475569" text-anchor="end">0.4M</text>
-<line x1="90" y1="232.3" x2="840" y2="232.3" stroke="#e2e8f0"/>
-<text x="82" y="236.3" font-size="11" fill="#475569" text-anchor="end">0.6M</text>
-<line x1="90" y1="183.1" x2="840" y2="183.1" stroke="#e2e8f0"/>
-<text x="82" y="187.1" font-size="11" fill="#475569" text-anchor="end">0.8M</text>
-<line x1="90" y1="133.8" x2="840" y2="133.8" stroke="#e2e8f0"/>
-<text x="82" y="137.8" font-size="11" fill="#475569" text-anchor="end">1.0M</text>
-<line x1="90" y1="84.6" x2="840" y2="84.6" stroke="#e2e8f0"/>
-<text x="82" y="88.6" font-size="11" fill="#475569" text-anchor="end">1.2M</text>
-<line x1="158.2" y1="60" x2="158.2" y2="380" stroke="#f1f5f9"/>
-<text x="158.2" y="398" font-size="11" fill="#475569" text-anchor="middle">1</text>
-<line x1="294.5" y1="60" x2="294.5" y2="380" stroke="#f1f5f9"/>
-<text x="294.5" y="398" font-size="11" fill="#475569" text-anchor="middle">3</text>
-<line x1="430.9" y1="60" x2="430.9" y2="380" stroke="#f1f5f9"/>
-<text x="430.9" y="398" font-size="11" fill="#475569" text-anchor="middle">5</text>
-<line x1="567.3" y1="60" x2="567.3" y2="380" stroke="#f1f5f9"/>
-<text x="567.3" y="398" font-size="11" fill="#475569" text-anchor="middle">7</text>
-<line x1="771.8" y1="60" x2="771.8" y2="380" stroke="#f1f5f9"/>
-<text x="771.8" y="398" font-size="11" fill="#475569" text-anchor="middle">10</text>
-<text x="465.0" y="418" font-size="12" fill="#334155" text-anchor="middle">brokers</text>
-<line x1="90.0" y1="380.0" x2="840.0" y2="71.3" stroke="#94a3b8" stroke-dasharray="6 5"/>
-<text x="696.8" y="152.3" font-size="11" fill="#64748b" text-anchor="end">linear: 114k msg/s × nodes</text>
-<line x1="294.5" y1="283.4" x2="294.5" y2="253.4" stroke="#d97706" stroke-width="2"/>
-<path d="M289.5,259.4 L294.5,249.4 L299.5,259.4" fill="none" stroke="#d97706" stroke-width="2"/>
-<circle cx="294.5" cy="291.4" r="7" fill="#ffffff" stroke="#d97706" stroke-width="2.5"/>
-<text x="308.5" y="295.4" font-size="12" fill="#0f172a" text-anchor="start">≥ 360k — every rung GREEN</text>
-<line x1="430.9" y1="239.7" x2="430.9" y2="232.3" stroke="#a16207" stroke-width="1.5" stroke-dasharray="3 3"/>
-<path d="M430.9,226.3 L436.9,232.3 L430.9,238.3 L424.9,232.3 Z" fill="#facc15" stroke="#a16207" stroke-width="2"/>
-<circle cx="430.9" cy="239.7" r="7" fill="#2563eb" stroke="#2563eb" stroke-width="2.5"/>
-<text x="444.9" y="243.7" font-size="12" fill="#0f172a" text-anchor="start">570k — 114k/node</text>
-<line x1="567.3" y1="180.6" x2="567.3" y2="173.2" stroke="#a16207" stroke-width="1.5" stroke-dasharray="3 3"/>
-<path d="M567.3,167.2 L573.3,173.2 L567.3,179.2 L561.3,173.2 Z" fill="#facc15" stroke="#a16207" stroke-width="2"/>
-<circle cx="567.3" cy="180.6" r="7" fill="#2563eb" stroke="#2563eb" stroke-width="2.5"/>
-<text x="581.3" y="184.6" font-size="12" fill="#0f172a" text-anchor="start">810k — 116k/node</text>
-<line x1="771.8" y1="99.4" x2="771.8" y2="84.6" stroke="#a16207" stroke-width="1.5" stroke-dasharray="3 3"/>
-<path d="M771.8,78.6 L777.8,84.6 L771.8,90.6 L765.8,84.6 Z" fill="#facc15" stroke="#a16207" stroke-width="2"/>
-<circle cx="771.8" cy="99.4" r="7" fill="#64748b" stroke="#64748b" stroke-width="2.5"/>
-<text x="757.8" y="103.4" font-size="12" fill="#0f172a" text-anchor="end">1.14M — 114k/node; gate failed (membership flap)</text>
-<circle cx="104" cy="74" r="5" fill="#2563eb" stroke="#2563eb" stroke-width="2"/>
-<text x="116" y="78" font-size="11" fill="#334155">certified</text>
-<circle cx="104" cy="92" r="5" fill="#ffffff" stroke="#d97706" stroke-width="2"/>
-<text x="116" y="96" font-size="11" fill="#334155">floor: never reached its knee</text>
-<circle cx="104" cy="110" r="5" fill="#64748b" stroke="#64748b" stroke-width="2"/>
-<text x="116" y="114" font-size="11" fill="#334155">uncertified: highest GREEN rung, own gate failed</text>
-<path d="M104.0,123.0 L109.0,128.0 L104.0,133.0 L99.0,128.0 Z" fill="#facc15" stroke="#a16207" stroke-width="2"/>
-<text x="116" y="132" font-size="11" fill="#334155">YELLOW above — carried, no loss, p99 ≤ 5 s</text>
-<text x="90" y="446" font-size="11" fill="#64748b">source: bench/scale/knee-3-5-7-10.md, run 2026-09-26 · mqttd main 0a08187 · emqtt-bench 0.6.3 · Hetzner fsn1</text>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 572" width="960" height="572" role="img" aria-labelledby="t d">
+<title id="t">QoS 0 scale-out: 1.14M msg/s certified on 10 nodes</title><desc id="d">Columns per cluster size: green is the certified knee (p99 ≤ 1 s, zero loss); a yellow cap is the next rung carried with zero loss at p99 ≤ 5 s; a dashed cap is a rung not carried. 3 nodes 360k; 5 nodes 570k, next rung 600k yellow; 7 nodes 810k, next rung 840k yellow; 10 nodes 1.14M, next rung 1.2M yellow</desc>
+<style>text{font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;font-kerning:normal}.num{font-variant-numeric:tabular-nums}.f-surface{fill:#fcfcfb}.k-surface{stroke:#fcfcfb}.f-border{fill:#e1e0d9}.k-border{stroke:#e1e0d9}.f-ink{fill:#0b0b0b}.k-ink{stroke:#0b0b0b}.f-ink2{fill:#52514e}.k-ink2{stroke:#52514e}.f-muted{fill:#898781}.k-muted{stroke:#898781}.f-grid{fill:#eceae4}.k-grid{stroke:#eceae4}.f-axis{fill:#c3c2b7}.k-axis{stroke:#c3c2b7}.f-good{fill:#0ca30c}.k-good{stroke:#0ca30c}.f-warn{fill:#fab219}.k-warn{stroke:#fab219}.f-crit{fill:#d03b3b}.k-crit{stroke:#d03b3b}.f-ghost{fill:#898781}.k-ghost{stroke:#898781}.f-s1{fill:#2a78d6}.k-s1{stroke:#2a78d6}.f-s2{fill:#eb6834}.k-s2{stroke:#eb6834}.f-s3{fill:#1baf7a}.k-s3{stroke:#1baf7a}.f-s4{fill:#4a3aa7}.k-s4{stroke:#4a3aa7}@media (prefers-color-scheme:dark){.f-surface{fill:#1a1a19}.k-surface{stroke:#1a1a19}.f-border{fill:#2c2c2a}.k-border{stroke:#2c2c2a}.f-ink{fill:#ffffff}.k-ink{stroke:#ffffff}.f-ink2{fill:#c3c2b7}.k-ink2{stroke:#c3c2b7}.f-muted{fill:#898781}.k-muted{stroke:#898781}.f-grid{fill:#262624}.k-grid{stroke:#262624}.f-axis{fill:#383835}.k-axis{stroke:#383835}.f-good{fill:#0ca30c}.k-good{stroke:#0ca30c}.f-warn{fill:#fab219}.k-warn{stroke:#fab219}.f-crit{fill:#d03b3b}.k-crit{stroke:#d03b3b}.f-ghost{fill:#6f6e69}.k-ghost{stroke:#6f6e69}.f-s1{fill:#3987e5}.k-s1{stroke:#3987e5}.f-s2{fill:#d95926}.k-s2{stroke:#d95926}.f-s3{fill:#199e70}.k-s3{stroke:#199e70}.f-s4{fill:#9085e9}.k-s4{stroke:#9085e9}}</style>
+<rect x="0.5" y="0.5" width="959" height="571" rx="14" class="f-surface k-border"/>
+<text x="32" y="42" font-size="20" font-weight="650" class="f-ink">QoS 0 scale-out: 1.14M msg/s certified on 10 nodes</text>
+<text x="32" y="64" font-size="13" class="f-ink2">$share 1:1, 200 B · 4-vCPU nodes, one provisioning, ladders matched per node · 0% crossing</text>
+<rect x="32.0" y="89.0" width="12" height="12" rx="3" class="f-good"/>
+<text x="51.0" y="100.0" font-size="12" text-anchor="start" class="f-ink2">GREEN certified · p99 ≤ 1 s, zero loss</text>
+<rect x="316.2" y="89.0" width="12" height="12" rx="3" class="f-warn"/>
+<text x="335.2" y="100.0" font-size="12" text-anchor="start" class="f-ink2">YELLOW · carried at p99 ≤ 5 s, zero loss</text>
+<line x1="613.2" y1="96.0" x2="631.2" y2="96.0" class="k-muted" stroke-width="2" stroke-dasharray="4 3"/>
+<text x="639.2" y="100.0" font-size="12" text-anchor="start" class="f-ink2">linear: 114k msg/s × nodes</text>
+<line x1="96.0" y1="462.0" x2="912.0" y2="462.0" class="k-axis" stroke-width="1"/>
+<text x="84.0" y="466.0" font-size="12" text-anchor="end" class="f-muted num">0</text>
+<line x1="96.0" y1="416.0" x2="912.0" y2="416.0" class="k-grid" stroke-width="1"/>
+<text x="84.0" y="420.0" font-size="12" text-anchor="end" class="f-muted num">200k</text>
+<line x1="96.0" y1="370.0" x2="912.0" y2="370.0" class="k-grid" stroke-width="1"/>
+<text x="84.0" y="374.0" font-size="12" text-anchor="end" class="f-muted num">400k</text>
+<line x1="96.0" y1="324.0" x2="912.0" y2="324.0" class="k-grid" stroke-width="1"/>
+<text x="84.0" y="328.0" font-size="12" text-anchor="end" class="f-muted num">600k</text>
+<line x1="96.0" y1="278.0" x2="912.0" y2="278.0" class="k-grid" stroke-width="1"/>
+<text x="84.0" y="282.0" font-size="12" text-anchor="end" class="f-muted num">800k</text>
+<line x1="96.0" y1="232.0" x2="912.0" y2="232.0" class="k-grid" stroke-width="1"/>
+<text x="84.0" y="236.0" font-size="12" text-anchor="end" class="f-muted num">1M</text>
+<line x1="96.0" y1="186.0" x2="912.0" y2="186.0" class="k-grid" stroke-width="1"/>
+<text x="84.0" y="190.0" font-size="12" text-anchor="end" class="f-muted num">1.2M</text>
+<line x1="96.0" y1="140.0" x2="912.0" y2="140.0" class="k-grid" stroke-width="1"/>
+<text x="84.0" y="144.0" font-size="12" text-anchor="end" class="f-muted num">1.4M</text>
+<text x="84.0" y="126.0" font-size="11" text-anchor="end" class="f-muted">msg/s</text>
+<line x1="96.0" y1="462.0" x2="912.0" y2="168.3" class="k-muted" stroke-width="1.25" stroke-dasharray="5 5"/>
+<path d="M302.6,462.0 V383.2 Q302.6,379.2 306.6,379.2 H322.6 Q326.6,379.2 326.6,383.2 V462.0 Z" class="f-good"/>
+<path d="M314.6,371.2 V345.2 M308.6,352.2 L314.6,344.2 L320.6,352.2" fill="none" class="k-good" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+<text x="314.6" y="331.2" font-size="16" font-weight="650" text-anchor="middle" class="f-ink">≥ 360k</text>
+<text x="314.6" y="486.0" font-size="13" font-weight="600" text-anchor="middle" class="f-ink">3 nodes</text>
+<text x="314.6" y="504.0" font-size="12" text-anchor="middle" class="f-ink2 num">120.0k / node</text>
+<text x="314.6" y="521.0" font-size="11" text-anchor="middle" class="f-muted">floor — knee above</text>
+<path d="M448.3,328.9 V328.0 Q448.3,324.0 452.3,324.0 H468.3 Q472.3,324.0 472.3,328.0 V328.9 Z" class="f-warn"/>
+<rect x="448.3" y="330.9" width="24.0" height="131.1" class="f-good"/>
+<text x="460.3" y="294.0" font-size="16" font-weight="650" text-anchor="middle" class="f-ink">570k</text>
+<text x="460.3" y="312.0" font-size="11" text-anchor="middle" class="f-ink2">600k YELLOW</text>
+<text x="460.3" y="486.0" font-size="13" font-weight="600" text-anchor="middle" class="f-ink">5 nodes</text>
+<text x="460.3" y="504.0" font-size="12" text-anchor="middle" class="f-ink2 num">114.0k / node</text>
+<text x="460.3" y="521.0" font-size="11" text-anchor="middle" class="f-muted">certified</text>
+<path d="M594.0,273.7 V272.8 Q594.0,268.8 598.0,268.8 H614.0 Q618.0,268.8 618.0,272.8 V273.7 Z" class="f-warn"/>
+<rect x="594.0" y="275.7" width="24.0" height="186.3" class="f-good"/>
+<text x="606.0" y="238.8" font-size="16" font-weight="650" text-anchor="middle" class="f-ink">810k</text>
+<text x="606.0" y="256.8" font-size="11" text-anchor="middle" class="f-ink2">840k YELLOW</text>
+<text x="606.0" y="486.0" font-size="13" font-weight="600" text-anchor="middle" class="f-ink">7 nodes</text>
+<text x="606.0" y="504.0" font-size="12" text-anchor="middle" class="f-ink2 num">115.7k / node</text>
+<text x="606.0" y="521.0" font-size="11" text-anchor="middle" class="f-muted">certified</text>
+<path d="M812.6,197.8 V190.0 Q812.6,186.0 816.6,186.0 H832.6 Q836.6,186.0 836.6,190.0 V197.8 Z" class="f-warn"/>
+<rect x="812.6" y="199.8" width="24.0" height="262.2" class="f-good"/>
+<text x="824.6" y="156.0" font-size="16" font-weight="650" text-anchor="middle" class="f-ink">1.14M</text>
+<text x="824.6" y="174.0" font-size="11" text-anchor="middle" class="f-ink2">1.2M YELLOW</text>
+<text x="824.6" y="486.0" font-size="13" font-weight="600" text-anchor="middle" class="f-ink">10 nodes</text>
+<text x="824.6" y="504.0" font-size="12" text-anchor="middle" class="f-ink2 num">114.0k / node</text>
+<text x="824.6" y="521.0" font-size="11" text-anchor="middle" class="f-muted">mesh gate failed</text>
+<text x="32.0" y="554.0" font-size="11" text-anchor="start" class="f-muted">source: bench/scale/knee-3-5-7-10.md · run 2026-09-26 · mqttd main 0a08187 · emqtt-bench 0.6.3 · Hetzner fsn1</text>
 </svg>

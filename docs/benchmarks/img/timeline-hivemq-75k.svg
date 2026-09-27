@@ -1,36 +1,41 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 460" width="900" height="460" font-family="system-ui,-apple-system,Segoe UI,Roboto,sans-serif" role="img" aria-label="hivemq at 75,000 msg/s offered — delivered rate and broker memory">
-<rect width="900" height="460" fill="#ffffff"/>
-<text x="70" y="26" font-size="16" font-weight="600" fill="#0f172a">hivemq at 75,000 msg/s offered — delivered rate and broker memory</text>
-<text x="70" y="44" font-size="12" fill="#475569">from the rung's start until the backlog drained; memory is the container's cgroup RSS</text>
-<rect x="70" y="54" width="752" height="320" fill="none" stroke="#cbd5e1"/>
-<line x1="70" y1="374.0" x2="822" y2="374.0" stroke="#e2e8f0"/>
-<text x="62" y="378.0" font-size="11" fill="#2563eb" text-anchor="end">0k</text>
-<text x="830" y="378.0" font-size="11" fill="#7c3aed">0M</text>
-<line x1="70" y1="294.0" x2="822" y2="294.0" stroke="#e2e8f0"/>
-<text x="62" y="298.0" font-size="11" fill="#2563eb" text-anchor="end">3k</text>
-<text x="830" y="298.0" font-size="11" fill="#7c3aed">1448M</text>
-<line x1="70" y1="214.0" x2="822" y2="214.0" stroke="#e2e8f0"/>
-<text x="62" y="218.0" font-size="11" fill="#2563eb" text-anchor="end">6k</text>
-<text x="830" y="218.0" font-size="11" fill="#7c3aed">2896M</text>
-<line x1="70" y1="134.0" x2="822" y2="134.0" stroke="#e2e8f0"/>
-<text x="62" y="138.0" font-size="11" fill="#2563eb" text-anchor="end">9k</text>
-<text x="830" y="138.0" font-size="11" fill="#7c3aed">4343M</text>
-<line x1="70" y1="54.0" x2="822" y2="54.0" stroke="#e2e8f0"/>
-<text x="62" y="58.0" font-size="11" fill="#2563eb" text-anchor="end">12k</text>
-<text x="830" y="58.0" font-size="11" fill="#7c3aed">5791M</text>
-<text x="70.0" y="392" font-size="11" fill="#475569" text-anchor="middle">0s</text>
-<text x="164.8" y="392" font-size="11" fill="#475569" text-anchor="middle">15s</text>
-<text x="259.6" y="392" font-size="11" fill="#475569" text-anchor="middle">30s</text>
-<text x="354.4" y="392" font-size="11" fill="#475569" text-anchor="middle">45s</text>
-<text x="449.2" y="392" font-size="11" fill="#475569" text-anchor="middle">60s</text>
-<text x="543.9" y="392" font-size="11" fill="#475569" text-anchor="middle">75s</text>
-<text x="638.7" y="392" font-size="11" fill="#475569" text-anchor="middle">90s</text>
-<text x="733.5" y="392" font-size="11" fill="#475569" text-anchor="middle">105s</text>
-<text x="814" y="72" font-size="11" fill="#b91c1c" text-anchor="end">offered 75,000/s is above this axis — peak delivered was 16% of it</text>
-<path d="M348.1,353.9 L354.4,236.8 L360.7,216.1 L367.0,206.2 L373.3,164.5 L379.6,106.0 L386.0,191.5 L392.3,187.5 L398.6,167.6 L404.9,124.8 L411.2,54.0 L417.6,85.6 L423.9,166.5 L430.2,92.9 L436.5,101.6 L442.8,75.2 L449.2,101.7 L455.5,132.9 L461.8,123.7 L468.1,129.7 L474.4,150.4 L480.8,181.0 L487.1,159.7 L493.4,211.1 L499.7,188.8 L506.0,182.6 L512.4,173.9 L518.7,182.6 L525.0,205.5 L531.3,212.2 L537.6,253.7 L543.9,316.5 L550.3,320.5 L556.6,281.9 L562.9,261.7 L569.2,261.7 L575.5,226.2 L581.9,243.4 L588.2,213.9 L594.5,256.1 L600.8,276.4 L607.1,280.4 L613.5,289.8 L619.8,293.4 L626.1,369.2 L645.1,373.1 L651.4,368.4" fill="none" stroke="#2563eb" stroke-width="2"/>
-<path d="M70.0,363.1 L76.3,360.5 L82.6,356.0 L89.0,354.9 L95.3,354.9 L101.6,354.8 L107.9,355.5 L114.2,354.9 L120.6,353.4 L126.9,349.7 L133.2,342.1 L139.5,325.7 L145.8,321.3 L152.2,302.4 L158.5,287.2 L164.8,283.6 L171.1,275.6 L177.4,259.6 L183.7,245.6 L190.1,230.9 L196.4,211.9 L202.7,204.7 L209.0,197.0 L215.3,178.0 L221.7,177.2 L228.0,176.7 L240.6,165.0 L246.9,164.2 L253.3,164.1 L259.6,155.6 L265.9,153.7 L272.2,148.6 L278.5,142.8 L284.9,142.0 L291.2,137.4 L297.5,130.7 L303.8,124.4 L310.1,113.4 L316.5,107.2 L322.8,101.9 L329.1,115.6 L335.4,114.8 L341.7,114.7 L348.1,113.3 L354.4,112.2 L360.7,110.9 L367.0,108.5 L373.3,102.5 L379.6,96.3 L386.0,90.9 L392.3,107.5 L398.6,105.1 L404.9,98.8 L411.2,93.7 L417.6,88.8 L423.9,97.3 L430.2,91.6 L436.5,86.7 L442.8,81.7 L449.2,84.0 L455.5,78.6 L461.8,73.4 L468.1,68.3 L474.4,64.5 L480.8,59.6 L487.1,55.3 L493.4,54.3 L499.7,54.6 L506.0,54.2 L512.4,54.0 L518.7,55.5 L525.0,55.4 L531.3,55.3 L537.6,55.1 L543.9,54.9 L550.3,54.9 L556.6,54.9 L562.9,54.8 L569.2,54.8 L575.5,54.6 L581.9,54.2 L588.2,54.1 L594.5,54.9 L600.8,54.8 L607.1,54.8 L613.5,54.7 L619.8,54.1 L626.1,54.1 L632.4,54.8 L638.7,54.2 L645.1,54.2 L651.4,55.0 L657.7,54.5 L664.0,54.4 L670.3,54.9 L676.7,54.4 L683.0,54.4 L689.3,55.0 L695.6,54.9 L701.9,54.9 L708.3,54.9 L714.6,54.8 L720.9,54.8 L727.2,54.8 L733.5,54.5 L739.8,54.5 L746.2,55.0 L752.5,55.0 L758.8,55.0 L765.1,55.0 L771.4,55.0 L777.8,55.0 L784.1,55.0 L790.4,54.6 L796.7,54.6 L803.0,54.8 L809.4,54.5 L815.7,54.5 L822.0,54.8" fill="none" stroke="#7c3aed" stroke-width="2" stroke-dasharray="6 3"/>
-<rect x="70" y="434" width="18" height="3" fill="#2563eb"/>
-<text x="94" y="440" font-size="11" fill="#334155">delivered msg/s (left)</text>
-<rect x="258" y="434" width="18" height="3" fill="#7c3aed"/>
-<text x="282" y="440" font-size="11" fill="#334155">broker RSS (right)</text>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 600" width="960" height="600" role="img" aria-labelledby="t d">
+<title id="t">HiveMQ CE under 75,000 msg/s offered</title><desc id="d">HiveMQ CE: delivered rate and broker memory over one rung, from start until the backlog drained. offered 75k/s · peak delivered 12k/s · peak memory 5.7 GiB, 5.6 GiB at the end</desc>
+<style>text{font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;font-kerning:normal}.num{font-variant-numeric:tabular-nums}.f-surface{fill:#fcfcfb}.k-surface{stroke:#fcfcfb}.f-border{fill:#e1e0d9}.k-border{stroke:#e1e0d9}.f-ink{fill:#0b0b0b}.k-ink{stroke:#0b0b0b}.f-ink2{fill:#52514e}.k-ink2{stroke:#52514e}.f-muted{fill:#898781}.k-muted{stroke:#898781}.f-grid{fill:#eceae4}.k-grid{stroke:#eceae4}.f-axis{fill:#c3c2b7}.k-axis{stroke:#c3c2b7}.f-good{fill:#0ca30c}.k-good{stroke:#0ca30c}.f-warn{fill:#fab219}.k-warn{stroke:#fab219}.f-crit{fill:#d03b3b}.k-crit{stroke:#d03b3b}.f-ghost{fill:#898781}.k-ghost{stroke:#898781}.f-s1{fill:#2a78d6}.k-s1{stroke:#2a78d6}.f-s2{fill:#eb6834}.k-s2{stroke:#eb6834}.f-s3{fill:#1baf7a}.k-s3{stroke:#1baf7a}.f-s4{fill:#4a3aa7}.k-s4{stroke:#4a3aa7}@media (prefers-color-scheme:dark){.f-surface{fill:#1a1a19}.k-surface{stroke:#1a1a19}.f-border{fill:#2c2c2a}.k-border{stroke:#2c2c2a}.f-ink{fill:#ffffff}.k-ink{stroke:#ffffff}.f-ink2{fill:#c3c2b7}.k-ink2{stroke:#c3c2b7}.f-muted{fill:#898781}.k-muted{stroke:#898781}.f-grid{fill:#262624}.k-grid{stroke:#262624}.f-axis{fill:#383835}.k-axis{stroke:#383835}.f-good{fill:#0ca30c}.k-good{stroke:#0ca30c}.f-warn{fill:#fab219}.k-warn{stroke:#fab219}.f-crit{fill:#d03b3b}.k-crit{stroke:#d03b3b}.f-ghost{fill:#6f6e69}.k-ghost{stroke:#6f6e69}.f-s1{fill:#3987e5}.k-s1{stroke:#3987e5}.f-s2{fill:#d95926}.k-s2{stroke:#d95926}.f-s3{fill:#199e70}.k-s3{stroke:#199e70}.f-s4{fill:#9085e9}.k-s4{stroke:#9085e9}}</style>
+<rect x="0.5" y="0.5" width="959" height="599" rx="14" class="f-surface k-border"/>
+<text x="32" y="42" font-size="20" font-weight="650" class="f-ink">HiveMQ CE under 75,000 msg/s offered</text>
+<text x="32" y="64" font-size="13" class="f-ink2">offered 75k/s · peak delivered 12k/s · peak memory 5.7 GiB, 5.6 GiB at the end</text>
+<text x="96.0" y="118.0" font-size="13" font-weight="600" text-anchor="start" class="f-ink">Delivered msg/s</text>
+<line x1="96.0" y1="312.0" x2="920.0" y2="312.0" class="k-axis" stroke-width="1"/>
+<text x="86.0" y="316.0" font-size="12" text-anchor="end" class="f-muted num">0</text>
+<line x1="96.0" y1="222.0" x2="920.0" y2="222.0" class="k-grid" stroke-width="1"/>
+<text x="86.0" y="226.0" font-size="12" text-anchor="end" class="f-muted num">50k</text>
+<line x1="96.0" y1="132.0" x2="920.0" y2="132.0" class="k-grid" stroke-width="1"/>
+<text x="86.0" y="136.0" font-size="12" text-anchor="end" class="f-muted num">100k</text>
+<line x1="96.0" y1="177.0" x2="920.0" y2="177.0" class="k-ink2" stroke-width="1" stroke-dasharray="5 4"/>
+<text x="920.0" y="171.0" font-size="11" font-weight="600" text-anchor="end" class="f-ink2 k-surface" stroke-width="4" paint-order="stroke" stroke-linejoin="round">offered 75k/s</text>
+<path d="M400.7,310.6 L407.6,302.7 L414.5,301.3 L421.4,300.7 L428.4,297.9 L435.3,293.9 L442.2,299.7 L449.1,299.4 L456.1,298.1 L463.0,295.2 L469.9,290.4 L476.8,292.5 L483.8,298.0 L490.7,293.0 L497.6,293.6 L504.5,291.8 L511.5,293.6 L518.4,295.7 L525.3,295.1 L532.2,295.5 L539.2,296.9 L546.1,299.0 L553.0,297.5 L559.9,301.0 L566.9,299.5 L573.8,299.1 L580.7,298.5 L587.6,299.1 L594.6,300.6 L601.5,301.1 L608.4,303.9 L615.3,308.1 L622.3,308.4 L629.2,305.8 L636.1,304.4 L643.0,304.4 L649.9,302.0 L656.9,303.2 L663.8,301.2 L670.7,304.0 L677.6,305.4 L684.6,305.7 L691.5,306.3 L698.4,306.6 L705.3,311.7 L726.1,311.9 L733.0,311.6 L733.0,312.0 L400.7,312.0 Z" class="f-s4" fill-opacity="0.10"/>
+<path d="M400.7,310.6 L407.6,302.7 L414.5,301.3 L421.4,300.7 L428.4,297.9 L435.3,293.9 L442.2,299.7 L449.1,299.4 L456.1,298.1 L463.0,295.2 L469.9,290.4 L476.8,292.5 L483.8,298.0 L490.7,293.0 L497.6,293.6 L504.5,291.8 L511.5,293.6 L518.4,295.7 L525.3,295.1 L532.2,295.5 L539.2,296.9 L546.1,299.0 L553.0,297.5 L559.9,301.0 L566.9,299.5 L573.8,299.1 L580.7,298.5 L587.6,299.1 L594.6,300.6 L601.5,301.1 L608.4,303.9 L615.3,308.1 L622.3,308.4 L629.2,305.8 L636.1,304.4 L643.0,304.4 L649.9,302.0 L656.9,303.2 L663.8,301.2 L670.7,304.0 L677.6,305.4 L684.6,305.7 L691.5,306.3 L698.4,306.6 L705.3,311.7 L726.1,311.9 L733.0,311.6" fill="none" class="k-s4" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+<circle cx="469.9" cy="290.4" r="4.5" class="f-s4 k-surface" stroke-width="2"/>
+<text x="479.9" y="294.4" font-size="12" font-weight="650" text-anchor="start" class="f-ink k-surface" stroke-width="4" paint-order="stroke" stroke-linejoin="round">peak 12k</text>
+<text x="96.0" y="354.0" font-size="13" font-weight="600" text-anchor="start" class="f-ink">Broker memory (container RSS)</text>
+<line x1="96.0" y1="500.0" x2="920.0" y2="500.0" class="k-axis" stroke-width="1"/>
+<text x="86.0" y="504.0" font-size="12" text-anchor="end" class="f-muted num">0</text>
+<line x1="96.0" y1="434.0" x2="920.0" y2="434.0" class="k-grid" stroke-width="1"/>
+<text x="86.0" y="438.0" font-size="12" text-anchor="end" class="f-muted num">4.0 GiB</text>
+<line x1="96.0" y1="368.0" x2="920.0" y2="368.0" class="k-grid" stroke-width="1"/>
+<text x="86.0" y="372.0" font-size="12" text-anchor="end" class="f-muted num">8.0 GiB</text>
+<path d="M96.0,496.8 L102.9,496.1 L109.8,494.8 L116.8,494.4 L123.7,494.4 L130.6,494.4 L137.5,494.6 L144.5,494.4 L151.4,494.0 L158.3,492.9 L165.2,490.7 L172.2,485.9 L179.1,484.6 L186.0,479.1 L192.9,474.7 L199.9,473.6 L206.8,471.3 L213.7,466.6 L220.6,462.6 L227.6,458.3 L234.5,452.7 L241.4,450.6 L248.3,448.4 L255.3,442.8 L262.2,442.6 L269.1,442.5 L283.0,439.1 L289.9,438.8 L296.8,438.8 L303.7,436.3 L310.7,435.8 L317.6,434.3 L324.5,432.6 L331.4,432.3 L338.4,431.0 L345.3,429.1 L352.2,427.2 L359.1,424.0 L366.1,422.2 L373.0,420.7 L379.9,424.7 L386.8,424.4 L393.7,424.4 L400.7,424.0 L407.6,423.7 L414.5,423.3 L421.4,422.6 L428.4,420.8 L435.3,419.0 L442.2,417.4 L449.1,422.3 L456.1,421.6 L463.0,419.8 L469.9,418.3 L476.8,416.8 L483.8,419.3 L490.7,417.7 L497.6,416.2 L504.5,414.8 L511.5,415.4 L518.4,413.9 L525.3,412.3 L532.2,410.9 L539.2,409.7 L546.1,408.3 L553.0,407.1 L559.9,406.8 L566.9,406.9 L573.8,406.7 L580.7,406.7 L587.6,407.1 L594.6,407.1 L601.5,407.1 L608.4,407.0 L615.3,407.0 L622.3,407.0 L629.2,407.0 L636.1,406.9 L643.0,406.9 L649.9,406.9 L656.9,406.7 L663.8,406.7 L670.7,407.0 L677.6,406.9 L684.6,406.9 L691.5,406.9 L698.4,406.7 L705.3,406.7 L712.3,406.9 L719.2,406.7 L726.1,406.7 L733.0,407.0 L740.0,406.8 L746.9,406.8 L753.8,407.0 L760.7,406.8 L767.7,406.8 L774.6,407.0 L781.5,407.0 L788.4,407.0 L795.4,407.0 L802.3,406.9 L809.2,406.9 L816.1,406.9 L823.1,406.8 L830.0,406.8 L836.9,407.0 L843.8,407.0 L850.8,407.0 L857.7,407.0 L864.6,407.0 L871.5,407.0 L878.5,407.0 L885.4,406.9 L892.3,406.9 L899.2,406.9 L906.2,406.8 L913.1,406.8 L920.0,406.9 L920.0,500.0 L96.0,500.0 Z" class="f-s4" fill-opacity="0.10"/>
+<path d="M96.0,496.8 L102.9,496.1 L109.8,494.8 L116.8,494.4 L123.7,494.4 L130.6,494.4 L137.5,494.6 L144.5,494.4 L151.4,494.0 L158.3,492.9 L165.2,490.7 L172.2,485.9 L179.1,484.6 L186.0,479.1 L192.9,474.7 L199.9,473.6 L206.8,471.3 L213.7,466.6 L220.6,462.6 L227.6,458.3 L234.5,452.7 L241.4,450.6 L248.3,448.4 L255.3,442.8 L262.2,442.6 L269.1,442.5 L283.0,439.1 L289.9,438.8 L296.8,438.8 L303.7,436.3 L310.7,435.8 L317.6,434.3 L324.5,432.6 L331.4,432.3 L338.4,431.0 L345.3,429.1 L352.2,427.2 L359.1,424.0 L366.1,422.2 L373.0,420.7 L379.9,424.7 L386.8,424.4 L393.7,424.4 L400.7,424.0 L407.6,423.7 L414.5,423.3 L421.4,422.6 L428.4,420.8 L435.3,419.0 L442.2,417.4 L449.1,422.3 L456.1,421.6 L463.0,419.8 L469.9,418.3 L476.8,416.8 L483.8,419.3 L490.7,417.7 L497.6,416.2 L504.5,414.8 L511.5,415.4 L518.4,413.9 L525.3,412.3 L532.2,410.9 L539.2,409.7 L546.1,408.3 L553.0,407.1 L559.9,406.8 L566.9,406.9 L573.8,406.7 L580.7,406.7 L587.6,407.1 L594.6,407.1 L601.5,407.1 L608.4,407.0 L615.3,407.0 L622.3,407.0 L629.2,407.0 L636.1,406.9 L643.0,406.9 L649.9,406.9 L656.9,406.7 L663.8,406.7 L670.7,407.0 L677.6,406.9 L684.6,406.9 L691.5,406.9 L698.4,406.7 L705.3,406.7 L712.3,406.9 L719.2,406.7 L726.1,406.7 L733.0,407.0 L740.0,406.8 L746.9,406.8 L753.8,407.0 L760.7,406.8 L767.7,406.8 L774.6,407.0 L781.5,407.0 L788.4,407.0 L795.4,407.0 L802.3,406.9 L809.2,406.9 L816.1,406.9 L823.1,406.8 L830.0,406.8 L836.9,407.0 L843.8,407.0 L850.8,407.0 L857.7,407.0 L864.6,407.0 L871.5,407.0 L878.5,407.0 L885.4,406.9 L892.3,406.9 L899.2,406.9 L906.2,406.8 L913.1,406.8 L920.0,406.9" fill="none" class="k-s4" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+<circle cx="580.7" cy="406.7" r="4.5" class="f-s4 k-surface" stroke-width="2"/>
+<text x="590.7" y="410.7" font-size="12" font-weight="650" text-anchor="start" class="f-ink k-surface" stroke-width="4" paint-order="stroke" stroke-linejoin="round">peak 5.7 GiB</text>
+<text x="96.0" y="522.0" font-size="12" text-anchor="middle" class="f-muted num">0s</text>
+<text x="199.9" y="522.0" font-size="12" text-anchor="middle" class="f-muted num">15s</text>
+<text x="303.7" y="522.0" font-size="12" text-anchor="middle" class="f-muted num">30s</text>
+<text x="407.6" y="522.0" font-size="12" text-anchor="middle" class="f-muted num">45s</text>
+<text x="511.5" y="522.0" font-size="12" text-anchor="middle" class="f-muted num">60s</text>
+<text x="615.3" y="522.0" font-size="12" text-anchor="middle" class="f-muted num">75s</text>
+<text x="719.2" y="522.0" font-size="12" text-anchor="middle" class="f-muted num">90s</text>
+<text x="823.1" y="522.0" font-size="12" text-anchor="middle" class="f-muted num">105s</text>
+<text x="32.0" y="564.0" font-size="11" text-anchor="start" class="f-muted">data recovered from the chart rendered from the raw runs, which were not retained</text>
+<text x="32.0" y="582.0" font-size="11" text-anchor="start" class="f-muted">source: docs/benchmarks/SINGLE-NODE-COMPARISON.md · one Hetzner CCX23 · delivered rate driver-side, memory from the broker's cgroup</text>
 </svg>
