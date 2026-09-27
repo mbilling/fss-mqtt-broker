@@ -820,6 +820,30 @@ printf '%s\\n' {" ".join(repr(v) for v in verdicts)} >"$OUT/verdicts"
         self.assertFalse((self.root / "out/laneE/ladder-verdicts.txt").exists())
 
 
+class DurableSubArgsTests(Rig):
+    """lane_e_durable_sub_args, extracted verbatim from run-curve.sh (#568)."""
+
+    def args(self, expiry, rdir, site, cont):
+        src = (self.rig / "run-curve.sh").read_text()
+        start = src.index("lane_e_durable_sub_args() {")
+        fn = src[start:src.index("\n}\n", start) + 3]
+        r = subprocess.run(["bash", "-c", fn + f'printf "[%s]" "$(lane_e_durable_sub_args {rdir} {site} {cont})"'],
+                           text=True, capture_output=True, env=self.env | {"LANE_E_SESSION_EXPIRY": str(expiry)})
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return r.stdout
+
+    def test_clean_sessions_add_nothing(self):
+        # 0 is the default and every existing campaign: its command lines must not change.
+        self.assertEqual(self.args(0, "/o/laneE/sites-4", 2, 1), "[]")
+
+    def test_durable_consumers_are_persistent_and_unique_per_rung(self):
+        a = self.args(30, "/o/laneE/sites-4", 2, 1)
+        self.assertEqual(a, "[ -C false -x 30 --prefix esites-4-s2-1]")
+        # A repeat of the same site count must not resume the first run's sessions.
+        self.assertNotEqual(a, self.args(30, "/o/laneE/sites-4-rep2", 2, 1))
+        self.assertNotEqual(a, self.args(30, "/o/laneE/sites-4", 2, 0))
+
+
 class DeliveryPollTests(Rig):
     """lane_e_recv_total and the drain loop, extracted verbatim from run-curve.sh,
     against drivers whose scrape fails a scripted number of times."""

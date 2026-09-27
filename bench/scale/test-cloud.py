@@ -473,6 +473,33 @@ with_cpu_sampling "$3" work
                                LANE_E_SITES_OVERRIDE="1")
         self.assertEqual(qos0.returncode, 0, qos0.stderr)
 
+    def test_lane_e_durable_consumers_refuse_every_silent_fallback(self):
+        # #568: persistent consumers are the only thing that puts lane E on the
+        # durable path. Each way a run could carry the label and still measure
+        # the routing path is refused before anything is provisioned.
+        inventory = self.root / "dur-inv.json"
+        inventory.write_text(json.dumps({"brokers": [{}] * 3, "drivers": [{"vcpus": 8}] * 5}))
+        out = self.root / "dur-shape"
+        base = dict(LANES="E", SHAPE_ONLY="1", LANE_E_SITES_OVERRIDE="1", LANE_E_QOS="1")
+        ok = self.run_script("run-curve.sh", str(out), str(inventory), LANE_E_SESSION_EXPIRY="30", **base)
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        self.assertIn("consumers: DURABLE", (out / "results/nodes=3/laneE/shape.txt").read_text())
+        clean = self.run_script("run-curve.sh", str(out), str(inventory), **base)
+        self.assertEqual(clean.returncode, 0, clean.stderr)
+        self.assertIn("consumers: clean sessions", (out / "results/nodes=3/laneE/shape.txt").read_text())
+        for env, diagnostic in (
+            ({"LANE_E_SUB_QOS": "0"}, "QoS 0 subscription is never written durably"),
+            ({"LANE_E_QOS": "0", "LANE_E_SUB_QOS": "1"}, "QoS 0"),  # the sub>pub guard refuses first
+            ({"LANE_E_PROTO": "4"}, "LANE_E_PROTO=5"),
+            ({"LANE_E_SESSION_EXPIRY": "120"}, "LANE_E_RESET_BUDGET"),
+            ({"LANE_E_SESSION_EXPIRY": "x"}, "non-negative integer"),
+        ):
+            with self.subTest(env=env):
+                bad = self.run_script("run-curve.sh", str(out), str(inventory),
+                                      **(base | {"LANE_E_SESSION_EXPIRY": "30"} | env))
+                self.assertNotEqual(bad.returncode, 0, bad.stdout)
+                self.assertIn(diagnostic, bad.stderr)
+
     def test_lane_e_at_qos1_predicts_the_pending_publish_cap(self):
         # PENDING_PUBLISH_CAP (4096) bounds publishes whose ack is gated on
         # durability. QoS 0 has not entered that table since #492, so this binds

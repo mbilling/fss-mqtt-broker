@@ -308,6 +308,50 @@ def broker_delta(rdir: Path, a: str, b: str, metric: str, label: str | None = No
     return out
 
 
+def durable_writer(rdir: Path, window_secs: float) -> list[dict]:
+    """Per broker, what the durable writer did in the measured window (#568).
+
+    The steady window's own broker snapshots (window-open -> window-close), so
+    nothing of the settle or the drain is averaged in. The question these
+    answer is whether durable throughput FOLLOWS THE DISK:
+
+      appends_s   durable appends the hub issued (one per persistent subscriber
+                  owed a message) — the durable work this node was asked for
+      commits_s   writer group commits, each one device barrier
+      ops_commit  mean group-commit depth (ops per barrier)
+      busy        share of the window the writer spent inside commits: near 1.0
+                  the node is disk-bound; well below 1.0 at a knee, the limit is
+                  upstream of the disk — the hot path
+      commit_ms   mean commit time
+      floor       the broker's own boot probe of its volume, single-writer
+                  barriers/s (store_probe.rs) — the disk it drew
+    """
+    out = []
+    for open_ in sorted(rdir.glob("metrics-window-open-broker*.prom")):
+        close = rdir / open_.name.replace("window-open", "window-close", 1)
+        if not close.exists():
+            continue
+
+        def d(metric: str) -> float:
+            return sum(_prom_value(close, metric).values()) - sum(_prom_value(open_, metric).values())
+
+        batches = d("mqttd_durable_writer_batches_total")
+        ops = d("mqttd_durable_writer_ops_total")
+        micros = d("mqttd_durable_writer_commit_micros_total")
+        secs = max(window_secs, 1e-9)
+        out.append({
+            "broker": open_.name[len("metrics-window-open-"):-len(".prom")],
+            "appends_s": d("mqttd_durable_append_latency_seconds_count") / secs,
+            "commits_s": batches / secs,
+            "ops_commit": ops / batches if batches else 0.0,
+            "busy": micros / (secs * 1e6),
+            "commit_ms": micros / batches / 1000 if batches else 0.0,
+            "floor": sum(_prom_value(close, "mqttd_store_barrier_floor").values()),
+            "floor4": sum(_prom_value(close, "mqttd_store_barrier_floor_4stream").values()),
+        })
+    return out
+
+
 def broker_at(rdir: Path, snap: str, metric: str) -> float:
     """One gauge's value across the cluster at one snapshot — final state, not a delta."""
     return sum(sum(_prom_value(f, metric).values()) for f in rdir.glob(f"metrics-{snap}-broker*.prom"))
@@ -513,7 +557,7 @@ def self_test() -> None:
                        qos: int = 0, sub_qos: int | None = None,
                        settled_state: str = "yes", reset_state: str = "yes",
                        control: bool = False, broker: dict | None = None,
-                       window_le: float = 10.0) -> Path:
+                       window_le: float = 10.0, writer: list[dict] | None = None) -> Path:
         """A lane E rung directory whose driver logs say exactly this.
 
         `window_le` is the bucket the whole measured window lands in, so a case
@@ -534,8 +578,21 @@ def self_test() -> None:
             f"qos={qos} sub_qos={sub_qos if sub_qos is not None else qos} window_secs=60 "
             f"settled={settled_state} settled_conns={9 if settled_state == 'no' else 100} "
             f"expected_conns=100 reset={reset_state} reset_conns={900 if reset_state == 'no' else 4} "
-            f"control={'yes' if control else 'no'}\n"
+            f"control={'yes' if control else 'no'}"
+            + (" durable=yes session_expiry=30" if writer is not None else "") + "\n"
         )
+        # A durable rung's writer, per broker, as the window-open/close snapshots
+        # record it: {appends, batches, ops, micros, floor} over the 60 s window.
+        for i, w in enumerate(writer or []):
+            for snap, mul in (("window-open", 0), ("window-close", 1)):
+                (d / f"metrics-{snap}-broker{i}.prom").write_text("\n".join([
+                    f"mqttd_durable_append_latency_seconds_count {w['appends'] * mul}",
+                    f"mqttd_durable_writer_batches_total {w['batches'] * mul}",
+                    f"mqttd_durable_writer_ops_total {w['ops'] * mul}",
+                    f"mqttd_durable_writer_commit_micros_total {w['micros'] * mul}",
+                    f"mqttd_store_barrier_floor {w['floor']}",
+                    f"mqttd_store_barrier_floor_4stream {w['floor'] * 2}",
+                ]) + "\n")
         # Broker-side counters, when a case is about what the CLUSTER saw rather
         # than what a driver did. Absent for the older cases, which is also the
         # shape of a run directory recorded before this accounting existed.
@@ -748,6 +805,35 @@ def self_test() -> None:
         if not r["failed"]:
             failures.append(f"a broker drop was not reported as FAILED loss: {r['flags']}")
 
+        # 4b. DURABLE CONSUMERS (#568). A rung labelled durable with no durable
+        #     append in its window measured the routing path: NOT CARRIED, never
+        #     a durable capacity figure. One that did append is carried, and its
+        #     writer figures are exact window deltas.
+        r = lane_e_rung(lane_e_fixture(root, "sites-4-dur-none", offered=30_000, sent=30_000,
+                                       recv=30_000, late=0, writer=[]))
+        if r["carried"] or not any(f.startswith("NOT DURABLE") for f in r["flags"]):
+            failures.append(f"a durable-labelled rung with no durable append was carried: {r['flags']}")
+        busy_w = {"appends": 30_000 * 60, "batches": 60 * 900, "ops": 60 * 900 * 40,
+                  "micros": 60 * 1_000_000 * 0.9, "floor": 900}
+        idle_w = {"appends": 30_000 * 60, "batches": 60 * 300, "ops": 60 * 300 * 40,
+                  "micros": 60 * 1_000_000 * 0.2, "floor": 2700}
+        r = lane_e_rung(lane_e_fixture(root, "sites-4-dur", offered=30_000, sent=30_000,
+                                       recv=30_000, late=0, writer=[busy_w, idle_w]))
+        w = {x["broker"]: x for x in r["writer"]}
+        if not r["carried"] or any(f.startswith("NOT DURABLE") for f in r["flags"]):
+            failures.append(f"a durable rung that appended was not carried: {r['flags']}")
+        elif (round(w["broker0"]["commits_s"]) != 900 or round(w["broker0"]["ops_commit"]) != 40
+              or abs(w["broker0"]["busy"] - 0.9) > 1e-9 or round(w["broker1"]["appends_s"]) != 30_000
+              or w["broker1"]["floor"] != 2700):
+            failures.append(f"durable writer window deltas are wrong: {w}")
+        text = render_durable_writer([r])
+        if "DISK-BOUND: a writer is saturated" not in text or "900 / 1,800" not in text:
+            failures.append(f"a 90%-busy writer was not reported disk-bound:\n{text}")
+        idle = lane_e_rung(lane_e_fixture(root, "sites-4-dur-idle", offered=30_000, sent=30_000,
+                                          recv=30_000, late=0, writer=[idle_w, idle_w]))
+        if "NOT DISK-BOUND" not in render_durable_writer([idle]):
+            failures.append("writers 20% busy at the top carried rung were not reported as a hot-path limit")
+
         # ── the remaining acceptance cases (#534) ────────────────────────────
         # "Local test fixtures expose under-offer, duplicate delivery, invalid
         # QoS downgrade, stale backlog and failed controls as invalid
@@ -945,7 +1031,10 @@ def self_test() -> None:
         sys.exit(1)
     print(
         "summarize-curve self-test: publish double-count correction OK (6 cases); "
-        "lane E validity OK (22 rungs + 6 ladders — p99 graded GREEN/YELLOW/RED and never "
+        "lane E validity OK (26 rungs + 6 ladders — a durable-labelled rung with no durable "
+        "append NOT CARRIED, writer window deltas exact, a saturated writer reported disk-bound and "
+        "idle writers at the top rung reported as a hot-path limit, "
+        "p99 graded GREEN/YELLOW/RED and never "
         "failed, late publishers NOT CARRIED, one lost message or a broker drop FAILED, a "
         "YELLOW figure reported above the certified GREEN one, under-offer, late publishers, "
         "loss on a pre-drain directory, a backlog that DRAINED and must pass, an "
@@ -1465,8 +1554,20 @@ def lane_e_rung(rdir: Path) -> dict:
             f"LOSS (the broker dropped {dropped:,.0f} message(s): "
             + ", ".join(f"{r} {v:,.0f}" for r, v in sorted(dropped_by_reason.items()) if v > 0) + ")"
         )
+    # NOT DURABLE (#568). A rung that asked for persistent consumers and shows no
+    # durable append in its window measured the routing path under a durable
+    # label — the exact confusion that made every earlier QoS 1 run a routing
+    # curve. It is not a clean measurement of what it claims, so it is not carried.
+    durable = meta.get("durable", "no") == "yes"
+    writer = durable_writer(rdir, float(meta.get("window_secs", 60))) if durable else []
+    if durable and not any(w["appends_s"] > 0 for w in writer):
+        flags.append(
+            "NOT DURABLE (persistent consumers requested, but no durable append in the window"
+            + ("" if writer else " — no window snapshots to prove it")
+            + "; this rung measured the routing path)"
+        )
     failed = any(f.startswith("LOSS") for f in flags)
-    carried = not failed and _lane_e_carried(
+    carried = not failed and not any(f.startswith("NOT DURABLE") for f in flags) and _lane_e_carried(
         offer_met, delivered, late_share, settled_ok, reset_ok, core_ok, steady, qos, sub_qos,
         completed, bounds, dropped, deliv_by_qos, evidence, drained, recv_rate, offered, sites)
     return {
@@ -1518,6 +1619,8 @@ def lane_e_rung(rdir: Path) -> dict:
         "carried": carried,
         "failed": failed,
         "band": band,
+        "durable": durable,
+        "writer": writer,
         "pass": carried and band == "green",
         "flags": flags,
     }
@@ -1544,6 +1647,53 @@ def _lane_e_carried(offer_met, delivered, late_share, settled_ok, reset_ok, core
                  and recv_rate >= DRIVER_OK * offered
                  and all(rate >= DRIVER_OK * offered / sites for rate in evidence["site_rates"].values())))
     )
+
+
+def render_durable_writer(rungs: list[dict]) -> str:
+    """Does durable throughput follow the disk? (#568)
+
+    One row per rung for the cluster, then — at the highest CARRIED rung, where
+    the question is decided — one row per broker: the disk it drew beside what
+    its writer did. A node whose writer is near-saturated is disk-bound, and
+    across nodes the delivered rate should then track the barrier floor. A knee
+    with the writers mostly idle says the limit is upstream of the disk.
+    """
+    def rng(vals: list[float], fmt: str) -> str:
+        if not vals:
+            return "—"
+        lo, hi = min(vals), max(vals)
+        return format(lo, fmt) if lo == hi else f"{lo:{fmt}}–{hi:{fmt}}"
+
+    out = ["\nDurable writer — does throughput follow the disk? (steady window, per broker):\n",
+           "| sites | run | verdict | delivered/s | durable appends/s | busiest writer busy | commits/s | ops/commit | commit ms | barrier floor/s |",
+           "|---|---|---|---|---|---|---|---|---|---|"]
+    for r in rungs:
+        w = r.get("writer") or []
+        if not r.get("durable"):
+            continue
+        out.append(
+            f"| {r['sites']} | {r.get('rep', 1)}{' (control)' if r.get('control') else ''} | {rung_verdict(r).split(';')[0][:40]} | "
+            f"{r.get('recv_rate', 0):,.0f} | {sum(x['appends_s'] for x in w):,.0f} | "
+            f"{(max((x['busy'] for x in w), default=0) * 100):.0f}% | {rng([x['commits_s'] for x in w], ',.0f')} | "
+            f"{rng([x['ops_commit'] for x in w], '.1f')} | {rng([x['commit_ms'] for x in w], '.2f')} | "
+            f"{rng([x['floor'] for x in w], ',.0f')} |")
+    top = max((r for r in rungs if r.get("durable") and r.get("carried") and r.get("writer")),
+              key=lambda r: r["sites"], default=None)
+    if top:
+        out += [f"\nPer broker at the highest carried rung ({top['sites']} sites, {rung_verdict(top).split(';')[0]}):\n",
+                "| broker | barrier floor/s (1 / 4 streams) | durable appends/s | commits/s | ops/commit | writer busy |",
+                "|---|---|---|---|---|---|"]
+        ws = sorted(top["writer"], key=lambda x: x["floor"])
+        for x in ws:
+            out.append(f"| {x['broker']} | {x['floor']:,.0f} / {x['floor4']:,.0f} | {x['appends_s']:,.0f} | "
+                       f"{x['commits_s']:,.0f} | {x['ops_commit']:.1f} | {x['busy'] * 100:.0f}% |")
+        busy = max(x["busy"] for x in ws)
+        verdict = ("DISK-BOUND: a writer is saturated; throughput should track the barrier floor across nodes"
+                   if busy >= 0.8 else
+                   "NOT DISK-BOUND: every writer has headroom at the top carried rung — the limit is upstream "
+                   "of the disk (hub, lanes, replication), i.e. the hot path")
+        out.append(f"\n> {verdict} (busiest writer {busy * 100:.0f}% busy; threshold 80%).")
+    return "\n".join(out)
 
 
 def main() -> None:
@@ -1784,6 +1934,9 @@ def main() -> None:
                     "Unique delivery and duplicates are n/a without an identity ledger. "
                     "Available backlog bytes and outbound inflight gauges are retained in final_state; oldest age is unavailable."
                 )
+
+            if any(r.get("durable") for r in rungs):
+                print(render_durable_writer(rungs))
 
             v = lane_e_ladder(rungs)
             by_count, flaky, inconclusive = v["by_count"], v["flaky"], v["inconclusive"]
