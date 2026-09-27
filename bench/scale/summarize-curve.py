@@ -39,7 +39,16 @@ TOLERANCE = 0.02  # counter cross-check band
 DRIVER_OK = 0.97  # a rung counts only if the offered rate was actually reached
 CORE_SAT_SHARE = 0.5  # share of in-window samples a driver core may spend >=95% busy
 LATE_OK = 0.05  # share of publishes behind their own schedule before a rung is flagged
-KNEE_OK = 0.99  # delivered/sent ratio a sustained rung must reach
+# Zero loss: a rung that drained and still owes a single message FAILED. Loss is
+# the only thing a rung can fail on; latency is graded (GREEN_MS / YELLOW_MS).
+KNEE_OK = 1.0  # delivered/sent ratio a carried rung must reach
+# p99 bands, fixed across every lane and broker so a band means one thing:
+#   green  p99 <= GREEN_MS   certified — the headline knee is the highest green rung
+#   yellow p99 <= YELLOW_MS  carried, but slower than the certified line
+#   red    anything above    carried without loss, outside both bands
+# A band is a grade, never a failure: a rung only fails by losing messages.
+GREEN_MS = 1000.0
+YELLOW_MS = 5000.0
 # How far the closing CONTROL rung may drift from the same rung at the start of
 # the ladder before the whole trial is inconclusive. Deliberately tight: within
 # ONE provisioning this rig is repeatable to <0.2% (0077-T4, PR #489, each rung
@@ -369,6 +378,15 @@ def lane_b_rung(rdir: Path, offered: int) -> dict:
         )
     if sent and broker_recv and abs(broker_recv - sent) / sent > TOLERANCE:
         flags.append(f"counter mismatch: broker received {broker_recv:.0f} vs driver sent {sent:.0f}")
+    # Lane B has no drain: its publishers and consumers stop together, so a
+    # shortfall is in-flight tail or loss and this lane cannot say which. Under
+    # the zero-loss rule that is UNRESOLVED — never FAILED, never carried.
+    if sent > 0 and recv < KNEE_OK * sent:
+        flags.append(
+            f"UNRESOLVED ({(sent - recv) / sent * 100:.2f}% short at teardown; lane B has no drain, "
+            "so pending and lost are indistinguishable)"
+        )
+    p99 = bucket_pct(buckets, count, 0.99)
     return {
         "offered": offered,
         "sent_rate": sent_rate,
@@ -385,7 +403,8 @@ def lane_b_rung(rdir: Path, offered: int) -> dict:
         "sustained": (not offer_not_met) and sent > 0 and recv >= KNEE_OK * sent,
         "negative_share": negative_share,
         "p50": bucket_pct(buckets, count, 0.50),
-        "p99": bucket_pct(buckets, count, 0.99),
+        "p99": p99,
+        "band": latency_band(p99),
         "p999": bucket_pct(buckets, count, 0.999),
         "driver_core": core_sat,
         "flags": flags,
@@ -493,8 +512,12 @@ def self_test() -> None:
                        drained: str | None = None, settled: int | None = None,
                        qos: int = 0, sub_qos: int | None = None,
                        settled_state: str = "yes", reset_state: str = "yes",
-                       control: bool = False, broker: dict | None = None) -> Path:
+                       control: bool = False, broker: dict | None = None,
+                       window_le: float = 10.0) -> Path:
         """A lane E rung directory whose driver logs say exactly this.
+
+        `window_le` is the bucket the whole measured window lands in, so a case
+        can put a rung's p99 in any latency band.
 
         `drained` and `settled` describe the DRAIN (#534): `drained` is what the
         harness recorded in rung.txt ("yes" converged, "no" hit the deadline,
@@ -567,11 +590,16 @@ def self_test() -> None:
                        f'e2e_latency_bucket{{le="100.0"}} {ramp}',
                        f'e2e_latency_bucket{{le="+Inf"}} {ramp}',
                        f"e2e_latency_count {ramp}"]) + "\n")
+        if window_le <= 10.0:
+            win = [f'e2e_latency_bucket{{le="10.0"}} {window}',
+                   f'e2e_latency_bucket{{le="100.0"}} {ramp + window}']
+        else:
+            win = [f'e2e_latency_bucket{{le="10.0"}} 0',
+                   f'e2e_latency_bucket{{le="100.0"}} {ramp}',
+                   f'e2e_latency_bucket{{le="{window_le}"}} {ramp + window}']
         (d / "sub-0.prom").write_text(
-            "\n".join([f'e2e_latency_bucket{{le="10.0"}} {window}',
-                       f'e2e_latency_bucket{{le="100.0"}} {ramp + window}',
-                       f'e2e_latency_bucket{{le="+Inf"}} {ramp + window}',
-                       f"e2e_latency_count {ramp + window}"]) + "\n")
+            "\n".join(win + [f'e2e_latency_bucket{{le="+Inf"}} {ramp + window}',
+                             f"e2e_latency_count {ramp + window}"]) + "\n")
         return d
 
     with tempfile.TemporaryDirectory() as td:
@@ -692,6 +720,33 @@ def self_test() -> None:
                 f"a rung that met its offer did not balance: offered "
                 f"{r['counts']['offered']} vs sent {r['counts']['sent']}"
             )
+
+        # 4a. LATENCY IS A BAND, NOT A FAILURE. The same clean rung at p99 <=2s
+        #     is carried YELLOW, at <=10s carried RED — neither fails, neither
+        #     certifies. Loss after a drain is the only FAILED.
+        for le, band in ((1000.0, "green"), (2000.0, "yellow"), (5000.0, "yellow"), (10000.0, "red")):
+            r = lane_e_rung(lane_e_fixture(root, f"sites-4-band-{le:g}", offered=30_000,
+                                           sent=30_000, recv=30_000, late=0, window_le=le))
+            if r["band"] != band or not r["carried"] or r["failed"] or r["pass"] != (band == "green"):
+                failures.append(f"a clean rung at p99 <={le:g}ms was not carried {band}: "
+                                f"band={r['band']} carried={r['carried']} failed={r['failed']} pass={r['pass']}")
+            if not rung_verdict(r).startswith(band.upper()):
+                failures.append(f"p99 <={le:g}ms rendered as {rung_verdict(r)!r}, not {band.upper()}")
+        r = lane_e_rung(lane_e_fixture(root, "sites-4-band-late", offered=30_000,
+                                       sent=30_000, recv=30_000, late=10_000, window_le=2000.0))
+        if r["failed"] or r["carried"] or not rung_verdict(r).startswith("NOT CARRIED"):
+            failures.append(f"late publishers must be NOT CARRIED, not FAILED: {rung_verdict(r)}")
+        r = lane_e_rung(lane_e_fixture(root, "sites-4-band-loss", offered=30_000,
+                                       sent=30_000, recv=20_000, late=0, window_le=500.0,
+                                       drained="yes", settled=30_000 * 70 - 1))
+        if not r["failed"] or r["carried"] or not rung_verdict(r).startswith("FAILED"):
+            failures.append(f"ONE message lost after a drain must FAIL even at p99 <=500ms: {rung_verdict(r)}")
+        r = lane_e_rung(lane_e_fixture(root, "sites-4-band-drop", offered=30_000,
+                                       sent=30_000, recv=30_000, late=0, drained="yes", settled=30_000 * 70,
+                                       broker={"recv": {"0": 30_000 * 70}, "deliv": {"0": 30_000 * 70},
+                                               "dropped": {"shed": 5}, "sessions": 100, "conns": 100}))
+        if not r["failed"]:
+            failures.append(f"a broker drop was not reported as FAILED loss: {r['flags']}")
 
         # ── the remaining acceptance cases (#534) ────────────────────────────
         # "Local test fixtures expose under-offer, duplicate delivery, invalid
@@ -860,6 +915,23 @@ def self_test() -> None:
         if not v["claim"] or v["claim"]["sites"] != 4 or v["inconclusive"]:
             failures.append(f"a healthy ladder with a matching control claimed nothing: {v}")
 
+        # 12a. The YELLOW figure is reported ABOVE the certified one and never
+        #      replaces it; a lossy rung between them blocks nothing green below.
+        def banded(sites, band, *, control=False, failed=False):
+            return {"sites": sites, "rep": 2 if control else 1, "pass": band == "green" and not failed,
+                    "carried": not failed, "failed": failed, "band": band,
+                    "flags": ["LOSS"] if failed else [], "recv_rate": 30_000.0, "offered": 30_000.0,
+                    "budget_ms": 1000.0, "p99": "<=1000ms", "control": control, "unresolved": False}
+        v = lane_e_ladder([banded(2, "green"), banded(4, "green"), banded(6, "yellow"),
+                           banded(8, "red"), banded(2, "green", control=True)])
+        if (v["claim"] or {}).get("sites") != 4 or (v["yellow_claim"] or {}).get("sites") != 6:
+            failures.append(f"green 4 / yellow 6 / red 8 claimed {v['claim']} and {v['yellow_claim']}")
+        v = lane_e_ladder([banded(2, "green"), banded(4, "yellow", failed=True), banded(6, "yellow"),
+                           banded(2, "green", control=True)])
+        if v["failed"] != [4] or (v["claim"] or {}).get("sites") != 2 or v["yellow_claim"]:
+            failures.append(f"a lossy rung was not FAILED, moved the green claim, or let a YELLOW "
+                            f"claim stand above it: {v['failed']} {v['claim']} {v['yellow_claim']}")
+
         # 5. A rung still in flight is INCOMPLETE, never a failed one.
         d = root / "sites-4-live"
         d.mkdir()
@@ -873,7 +945,9 @@ def self_test() -> None:
         sys.exit(1)
     print(
         "summarize-curve self-test: publish double-count correction OK (6 cases); "
-        "lane E validity OK (15 rungs + 4 ladders — under-offer, late publishers, "
+        "lane E validity OK (22 rungs + 6 ladders — p99 graded GREEN/YELLOW/RED and never "
+        "failed, late publishers NOT CARRIED, one lost message or a broker drop FAILED, a "
+        "YELLOW figure reported above the certified GREEN one, under-offer, late publishers, "
         "loss on a pre-drain directory, a backlog that DRAINED and must pass, an "
         "expired drain deadline that must read UNRESOLVED rather than loss, real "
         "loss after a converged drain, duplicate delivery at QoS 0, a QoS 2 "
@@ -896,6 +970,36 @@ def p99_ms(label: str) -> float:
     return float(label.lstrip("<=").rstrip("ms"))
 
 
+def latency_band(p99: str, margin_ms: float = 0.0, green_ms: float = GREEN_MS) -> str:
+    """'green', 'yellow' or 'red' for a bucket_pct label plus its clock uncertainty.
+
+    `green_ms` is the certified line (a budget knob may tighten or widen it); the
+    yellow line never falls below it. '—' and '>N' are past every finite bucket,
+    so they grade red — never green by default.
+    """
+    ms = p99_ms(p99) + margin_ms
+    if ms <= green_ms:
+        return "green"
+    return "yellow" if ms <= max(YELLOW_MS, green_ms) else "red"
+
+
+def rung_verdict(r: dict) -> str:
+    """One rung's verdict in the words every table and the harness use.
+
+      FAILED: <flags>        messages were lost — the only failure
+      GREEN|YELLOW|RED       carried in full; p99 band (GREEN is certified)
+      NOT CARRIED: <flags>   no loss, but the rung is not a clean measurement of
+                             its offered rate (offer, schedule, steadiness, evidence)
+    Notes that do not gate ride after a carried band as "; <flag>".
+    """
+    flags = "; ".join(r["flags"])
+    if r.get("failed"):
+        return "FAILED: " + flags
+    if r.get("carried", r["pass"]):
+        return r.get("band", "green").upper() + (f"; {flags}" if flags else "")
+    return "NOT CARRIED: " + (flags or f"p99 {r.get('p99', '?')}")
+
+
 def lane_e_ladder(rungs: list[dict]) -> dict:
     """Whether a lane E ladder establishes a site count, and why not when it doesn't.
 
@@ -906,13 +1010,13 @@ def lane_e_ladder(rungs: list[dict]) -> dict:
       flaky         a site count that passed once and failed on a repeat
       unresolved    a rung whose drain deadline expired with traffic outstanding
       inconclusive  the closing CONTROL disagrees with the ladder's own start
-      claim         the highest site count every run of which passed, or None
+      claim         the highest site count every run of which passed (GREEN), or None
+      yellow_claim  the same rule for "carried at p99 <= YELLOW_MS" — the latency
+                    reported around the knee, never the certified figure
     """
     by_count: dict[int, list[dict]] = {}
     for r in rungs:
         by_count.setdefault(r["sites"], []).append(r)
-    flaky = sorted(c for c, rs in by_count.items() if any(x["pass"] for x in rs) and not all(x["pass"] for x in rs))
-    passed = [rs[0] for c, rs in by_count.items() if all(x["pass"] for x in rs)]
     unresolved = sorted(c for c, rs in by_count.items() if any(x.get("unresolved") for x in rs))
 
     # ── the CONTROL rung (#534, acceptance 6) ───────────────────────────────
@@ -931,7 +1035,7 @@ def lane_e_ladder(rungs: list[dict]) -> dict:
         if not ctl["pass"]:
             inconclusive = (
                 f"the closing control at {ctl['sites']} site(s) did not pass "
-                f"({'; '.join(ctl['flags']) or 'no reason recorded'})"
+                f"({'; '.join(ctl['flags']) or 'p99 ' + ctl.get('p99', '?') + ' is ' + ctl.get('band', '?')})"
             )
         else:
             base = [r for r in rungs if r["sites"] == ctl["sites"] and not r.get("control")]
@@ -949,27 +1053,39 @@ def lane_e_ladder(rungs: list[dict]) -> dict:
             "from residual overload accumulated across the ladder (set LANE_E_CONTROL=1)"
         )
 
-    claim = None if inconclusive else (max(passed, key=lambda r: r["sites"]) if passed else None)
-    # A capacity claim above an inconsistent rung is not supportable: the cluster
-    # demonstrably failed at a LOWER count, so a higher one cannot be its
-    # capacity. An UNRESOLVED rung below it blocks the claim for the weaker but
-    # sufficient reason that the ladder has a hole there.
-    blocked_by = ""
-    if claim and any(c < claim["sites"] for c in unresolved):
-        blocked_by = (
-            f"{', '.join(str(c) for c in unresolved if c < claim['sites'])} site(s) below it went "
-            "UNRESOLVED, so the ladder has a hole under the number. Repeat those rungs with a "
-            "longer drain."
-        )
-    elif claim and any(c <= claim["sites"] for c in flaky):
-        blocked_by = (
-            f"{', '.join(str(c) for c in flaky if c <= claim['sites'])} did not pass consistently "
-            "below it — a cluster that fails at a lower count has not established a higher one. "
-            "Repeat the rungs until the spread is inside the budget, or widen the budget to "
-            "something the spread fits."
-        )
-    if blocked_by:
-        claim = None
+    lost = sorted(c for c, rs in by_count.items() if any(x.get("failed") for x in rs))
+
+    def claim_for(ok) -> tuple[dict | None, list[int], str, bool]:
+        flaky = sorted(c for c, rs in by_count.items() if any(ok(x) for x in rs) and not all(ok(x) for x in rs))
+        passed = [rs[0] for c, rs in by_count.items() if all(ok(x) for x in rs)]
+        claim = None if inconclusive else (max(passed, key=lambda r: r["sites"]) if passed else None)
+        # A capacity claim above an inconsistent rung is not supportable: the cluster
+        # demonstrably failed at a LOWER count, so a higher one cannot be its
+        # capacity. An UNRESOLVED rung below it blocks the claim for the weaker but
+        # sufficient reason that the ladder has a hole there.
+        blocked_by = ""
+        if claim and any(c < claim["sites"] for c in lost):
+            blocked_by = (
+                f"{', '.join(str(c) for c in lost if c < claim['sites'])} site(s) below it LOST messages, "
+                "and a cluster that loses traffic at a lower load has not shown it carries a higher one."
+            )
+        elif claim and any(c < claim["sites"] for c in unresolved):
+            blocked_by = (
+                f"{', '.join(str(c) for c in unresolved if c < claim['sites'])} site(s) below it went "
+                "UNRESOLVED, so the ladder has a hole under the number. Repeat those rungs with a "
+                "longer drain."
+            )
+        elif claim and any(c <= claim["sites"] for c in flaky):
+            blocked_by = (
+                f"{', '.join(str(c) for c in flaky if c <= claim['sites'])} did not pass consistently "
+                "below it — a cluster that fails at a lower count has not established a higher one. "
+                "Repeat the rungs until the spread is inside the band."
+            )
+        return (None if blocked_by else claim), flaky, blocked_by, bool(passed)
+
+    claim, flaky, blocked_by, passed_any = claim_for(lambda r: r["pass"])
+    yellow_claim, _, yellow_blocked_by, _ = claim_for(
+        lambda r: r.get("carried", r["pass"]) and r.get("band", "green") in ("green", "yellow"))
     return {
         "by_count": by_count,
         "flaky": flaky,
@@ -977,7 +1093,10 @@ def lane_e_ladder(rungs: list[dict]) -> dict:
         "inconclusive": inconclusive,
         "blocked_by": blocked_by,
         "claim": claim,
-        "passed_any": bool(passed),
+        "yellow_claim": yellow_claim,
+        "yellow_blocked_by": yellow_blocked_by,
+        "failed": lost,
+        "passed_any": passed_any,
     }
 
 
@@ -1006,7 +1125,7 @@ def lane_e_rung(rdir: Path) -> dict:
         # rung.txt is the LAST thing the lane writes, so its absence means the
         # rung is still in flight (or died). Without this, a rung being watched
         # live reads as offered=0 and p99="—", which the budget check below then
-        # reports as OVER BUDGET — a running rung looking like a failed one.
+        # grades RED and NOT CARRIED — a running rung looking like a slow one.
         return {
             # `sites-<n>` or `sites-<n>-rep<k>`: the count is the SECOND token, not
             # the last one, since a repeated rung carries a suffix.
@@ -1028,6 +1147,9 @@ def lane_e_rung(rdir: Path) -> dict:
             "budget_ms": 0.0,
             "pass": False,
             "incomplete": True,
+            "carried": False,
+            "failed": False,
+            "band": "red",
             "flags": ["INCOMPLETE (no rung.txt — still running, or the rung died)"],
         }
     sites = int(meta.get("sites", rdir.name.split("-")[1]))
@@ -1159,14 +1281,15 @@ def lane_e_rung(rdir: Path) -> dict:
             )
         else:
             flags.append(
-                f"LOSS ({short:.1f}% of what was published never arrived; run directory "
+                f"UNCONFIRMED LOSS ({short:.1f}% of what was published never arrived; run directory "
                 "predates the drain deadline, so pending traffic here is indistinguishable "
                 "from dropped)"
             )
+    # Latency is a BAND, not a gate: green certifies, yellow and red are carried
+    # rungs graded slower. The clock uncertainty is added before grading, so a
+    # rung is never graded greener than the clocks can support.
     clock_margin = ((evidence or {}).get("clock") or {}).get("latency_uncertainty_ms", 0)
-    within = p99_ms(p99) + clock_margin <= budget
-    if not within:
-        flags.append(f"OVER P99 BUDGET ({p99} + {clock_margin:g}ms clock uncertainty > {budget:g}ms)")
+    band = latency_band(p99, clock_margin, budget)
 
     # ── the eight counts (#534, acceptance 3) ────────────────────────────────
     #
@@ -1334,6 +1457,18 @@ def lane_e_rung(rdir: Path) -> dict:
             f"UNRESET ({meta.get('reset_conns', '?')} connections from the previous rung were "
             "still on the cluster when this one started — it measures residual load too)"
         )
+
+    # FAILED means LOST, and nothing else does. A broker drop is loss whatever
+    # its reason — a bound reached is still a message the application never got.
+    if dropped > 0 and not any(f.startswith("LOSS") for f in flags):
+        flags.append(
+            f"LOSS (the broker dropped {dropped:,.0f} message(s): "
+            + ", ".join(f"{r} {v:,.0f}" for r, v in sorted(dropped_by_reason.items()) if v > 0) + ")"
+        )
+    failed = any(f.startswith("LOSS") for f in flags)
+    carried = not failed and _lane_e_carried(
+        offer_met, delivered, late_share, settled_ok, reset_ok, core_ok, steady, qos, sub_qos,
+        completed, bounds, dropped, deliv_by_qos, evidence, drained, recv_rate, offered, sites)
     return {
         "sites": sites,
         "rep": rep,
@@ -1362,9 +1497,13 @@ def lane_e_rung(rdir: Path) -> dict:
         "p50": bucket_pct(buckets, count, 0.50),
         "p99": p99,
         "budget_ms": budget,
-        # A rung PASSES only on all FOUR: the drivers offered the load, they held
-        # its schedule, the broker delivered it, and it stayed inside the latency
-        # budget. Any one failing makes the site count above it meaningless.
+        # Three verdicts, kept apart because they answer different questions:
+        #   failed   the broker LOST messages — the only way a rung fails
+        #   carried  every gate below held except latency: the load was offered,
+        #            on schedule, measured cleanly, and delivered in full
+        #   band     green / yellow / red p99 (latency_band)
+        # `pass` is carried AND green: the certified rung the headline knee uses.
+        # A carried yellow or red rung is reported with its latency, not failed.
         #
         # `late_share` joined this in #534. Without it a rung where the drivers
         # fell behind could still PASS on a rate average, and the ladder would
@@ -1376,10 +1515,20 @@ def lane_e_rung(rdir: Path) -> dict:
         # of this site count at all — and neither shows up in a rate or a p99.
         # `completed is not None or qos == "0"` keeps a QoS 2 rung from passing
         # while its handshake completion is uncertifiable.
-        "pass": bool(
+        "carried": carried,
+        "failed": failed,
+        "band": band,
+        "pass": carried and band == "green",
+        "flags": flags,
+    }
+
+
+def _lane_e_carried(offer_met, delivered, late_share, settled_ok, reset_ok, core_ok, steady,
+                    qos, sub_qos, completed, bounds, dropped, deliv_by_qos, evidence, drained,
+                    recv_rate, offered, sites) -> bool:
+    return bool(
             offer_met
             and delivered
-            and within
             and late_share <= LATE_OK
             and settled_ok
             and reset_ok
@@ -1394,9 +1543,7 @@ def lane_e_rung(rdir: Path) -> dict:
                  and (not evidence.get("telemetry") or evidence["telemetry"]["queues_bounded"])
                  and recv_rate >= DRIVER_OK * offered
                  and all(rate >= DRIVER_OK * offered / sites for rate in evidence["site_rates"].values())))
-        ),
-        "flags": flags,
-    }
+    )
 
 
 def main() -> None:
@@ -1510,22 +1657,28 @@ def main() -> None:
             if r is None:
                 cells.append("—")
                 continue
-            cell = f"recv {r['recv_rate']:.0f}/s, p99 {r['p99']}"
+            cell = f"recv {r['recv_rate']:.0f}/s, p99 {r['p99']} {r['band'].upper()}"
             if r["flags"]:
                 cell += " ⚠ " + "; ".join(r["flags"])
             cells.append(cell)
         print(f"| {offer} | " + " | ".join(cells) + " |")
-    print("\nknee (highest sustained rung; rungs whose offer was not met excluded):\n")
+    print("\nknee (highest sustained GREEN rung — certified; the highest YELLOW one beside it; "
+          "rungs whose offer was not met, or that ended short, excluded):\n")
     knee_x, knee_y = [], []
     for n, _ in found:
         sustained = [r for r in c2[n] if r["sustained"]]
-        if sustained:
-            k = max(sustained, key=lambda r: r["offered"])
-            print(f"- {n} node(s): {k['offered']} msg/s offered (recv {k['recv_rate']:.0f}/s, p99 {k['p99']})")
+        green = [r for r in sustained if r["band"] == "green"]
+        yellow = [r for r in sustained if r["band"] in ("green", "yellow")]
+        if green:
+            k = max(green, key=lambda r: r["offered"])
+            print(f"- {n} node(s): {k['offered']} msg/s offered (recv {k['recv_rate']:.0f}/s, p99 {k['p99']}, GREEN)")
             knee_x.append(n)
             knee_y.append(k["recv_rate"])
         else:
-            print(f"- {n} node(s): NO sustained rung")
+            print(f"- {n} node(s): NO sustained GREEN rung")
+        if yellow and (not green or max(r["offered"] for r in yellow) > max(r["offered"] for r in green)):
+            y = max(yellow, key=lambda r: r["offered"])
+            print(f"  - YELLOW: {y['offered']} msg/s offered (recv {y['recv_rate']:.0f}/s, p99 {y['p99']}) — not certified")
     if len(knee_x) > 1:
         print()
         print(xychart("$share sustained throughput vs nodes", knee_x, knee_y, "msg/s at knee"))
@@ -1568,7 +1721,7 @@ def main() -> None:
             print(head)
             print("|---|---|---|---|---|---|---|" + ("---|" if repeated else ""))
             for r in rungs:
-                verdict = "pass" if r["pass"] else "; ".join(r["flags"]) or "fail"
+                verdict = rung_verdict(r)
                 run_col = f" {r.get('rep', 1)} |" if repeated else ""
                 if r.get("steady") == "yes":
                     caught = f"{r.get('steady_s', '?')}s"
@@ -1643,7 +1796,7 @@ def main() -> None:
             if flaky:
                 print(
                     f"\n> **{', '.join(str(c) for c in flaky)} site(s): PASSED ON ONE RUN AND FAILED ON ANOTHER.** "
-                    "The spread at that count crosses the budget, so no capacity is "
+                    "The spread at that count crosses the green band, so no capacity is "
                     "established there and nothing above it can be claimed."
                 )
             if v["unresolved"]:
@@ -1655,15 +1808,31 @@ def main() -> None:
                 )
             if v["blocked_by"]:
                 print(f"\n**No capacity is claimed.** {v['blocked_by']}")
+            if v["failed"]:
+                print(
+                    f"\n> **{', '.join(str(c) for c in v['failed'])} site(s): FAILED — messages were lost.** "
+                    "Loss is the only failure; see the LOSS flag for how much and where."
+                )
             if v["claim"]:
                 best = v["claim"]
                 print(
-                    f"\n**{best['sites']} site(s) per {n}-node cluster** at p99 "
-                    f"<= {best['budget_ms']:g}ms — {best['offered']:,.0f} msg/s, "
+                    f"\n**{best['sites']} site(s) per {n}-node cluster, certified (GREEN)** at p99 "
+                    f"{best['p99']} (green <= {best['budget_ms']:g}ms) — {best['offered']:,.0f} msg/s, "
                     f"{best['sites'] / n:.1f} sites per node."
                 )
             elif not v["passed_any"] and not inconclusive:
-                print("\n**No rung passed.** Inspect evidence validity and load generation before attributing a broker limit.")
+                print("\n**No rung certified GREEN.** Inspect evidence validity and load generation before attributing a broker limit.")
+            # The latency around the knee: the highest rung carried in full at
+            # p99 <= YELLOW_MS. Reported beside the certified figure, never as it.
+            yc = v["yellow_claim"]
+            if yc and (not v["claim"] or yc["sites"] > v["claim"]["sites"]):
+                print(
+                    f"\n**{yc['sites']} site(s) carried in YELLOW** (p99 {yc['p99']}, <= {YELLOW_MS:g}ms, "
+                    f"no loss) — {yc['offered']:,.0f} msg/s, {yc['sites'] / n:.1f} sites per node. "
+                    "Not certified; for workloads that accept that latency."
+                )
+            elif v["yellow_blocked_by"] and not v["blocked_by"]:
+                print(f"\n> No YELLOW figure above the certified one: {v['yellow_blocked_by']}")
             # A ladder whose TOP rung passed has not found a ceiling; saying so
             # is the difference between a measurement and an advertisement.
             done_rungs = [r for r in rungs if not r.get("incomplete")]

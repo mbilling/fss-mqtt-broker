@@ -10,13 +10,15 @@ each curve's `source`; they are written here rather than re-read from `.runs/`
 against those documents line by line.
 
 Every point says what kind of number it is, because they are not all the same:
-  certified   — passed with every repetition the rule asks for
-  partial     — passed, but not every repetition is certified (the others were
+  certified   — GREEN (p99 <= 1 s, zero loss) with every repetition the rule asks for
+  partial     — GREEN, but not every repetition is certified (the others were
                 INVALID on driver-side evidence while the brokers received it all)
   floor       — the highest rung measured; the knee lies above it
-  uncertified — highest passing rung of an arm whose own gate failed
-A red cross marks the first rung that FAILED above a point: the knee lies
-between the two.
+  uncertified — highest GREEN rung of an arm whose own gate failed
+Above a point, the next rung is marked by what it was (ADR 0048, 2026-09-27):
+a yellow diamond is YELLOW — carried, no loss, p99 <= 5 s — and a grey cross is
+NOT CARRIED (e.g. publishers late: backpressure, no loss). A rung that LOST
+messages would be a red cross. The certified knee lies below the marker.
 """
 import sys
 from pathlib import Path
@@ -29,16 +31,16 @@ CURVES = {
         "file": "scale-out-qos0.svg",
         "title": "QoS 0 scale-out: msg/s at the knee vs nodes — $share 1:1, 200 B, 4-vCPU nodes",
         "subtitle": "one provisioning (10 × CCX23 + 20 × CCX33), drivers 2 per broker, ladders matched per node; "
-                    "knee = p99 ≤ 1 s, all delivered, 0% crossing",
+                    "knee = GREEN: p99 ≤ 1 s, zero loss, 0% crossing",
         "source": "source: bench/scale/knee-3-5-7-10.md, run 2026-09-26 · mqttd main 0a08187 · emqtt-bench 0.6.3 · Hetzner fsn1",
         "y_max": 1_300_000, "y_step": 200_000,
         "per_node": 114_000,
-        # (nodes, msg/s, kind, label, first failing rung above or None) — knee-3-5-7-10.md
+        # (nodes, msg/s, kind, label, (next rung above, its verdict) or None) — knee-3-5-7-10.md
         "points": [
-            (3, 360_000, "floor", "≥ 360k — every rung passed", None),
-            (5, 570_000, "certified", "570k — 114k/node", 600_000),
-            (7, 810_000, "certified", "810k — 116k/node", 840_000),
-            (10, 1_140_000, "uncertified", "1.14M — 114k/node; gate failed (membership flap)", 1_200_000),
+            (3, 360_000, "floor", "≥ 360k — every rung GREEN", None),
+            (5, 570_000, "certified", "570k — 114k/node", (600_000, "yellow")),
+            (7, 810_000, "certified", "810k — 116k/node", (840_000, "yellow")),
+            (10, 1_140_000, "uncertified", "1.14M — 114k/node; gate failed (membership flap)", (1_200_000, "yellow")),
         ],
     },
     "qos1": {
@@ -53,9 +55,9 @@ CURVES = {
         "points": [
             (3, 120_000, "certified", "120k — 40.0k/node (3 + control)", None),
             (5, 180_000, "certified", "180k — 36.0k/node (3 + control)", None),
-            (7, 270_000, "partial", "270k — 38.6k/node (2 of 3 certified)", 300_000),
-            # 2026-09-27 knee run: 420k (42k/node) x2 with no failure signal, 450k fails
-            (10, 390_000, "partial", "390k — 39.0k/node (1 of 3); 450k fails", 450_000),
+            (7, 270_000, "partial", "270k — 38.6k/node (2 of 3 certified)", (300_000, "not carried")),
+            # 2026-09-27 knee run: 420k (42k/node) x2 with no failure signal, 450k publishers late
+            (10, 390_000, "partial", "390k — 39.0k/node (1 of 3); 450k not carried", (450_000, "not carried")),
         ],
     },
 }
@@ -67,11 +69,26 @@ X_MAX = 11
 COLORS = {"certified": "#2563eb", "partial": "#0891b2", "floor": "#d97706", "uncertified": "#64748b"}
 LEGEND = {
     "certified": "certified",
-    "partial": "passed; not every repetition certified",
+    "partial": "GREEN; not every repetition certified",
     "floor": "floor: never reached its knee",
-    "uncertified": "uncertified: highest passing rung, own gate failed",
+    "uncertified": "uncertified: highest GREEN rung, own gate failed",
 }
-FAIL = "#dc2626"
+# The rung above a point, by verdict: what it WAS, never just "failed".
+ABOVE = {
+    "yellow": ("#a16207", "YELLOW above — carried, no loss, p99 ≤ 5 s"),
+    "not carried": ("#475569", "not carried above (publishers late) — no loss"),
+    "failed": ("#dc2626", "FAILED above — messages lost"),
+}
+
+
+def above_mark(verdict: str, cx: float, cy: float, r: float = 5) -> str:
+    """A diamond for a carried YELLOW rung, a cross for one NOT CARRIED or FAILED."""
+    col = ABOVE[verdict][0]
+    if verdict == "yellow":
+        return (f'<path d="M{cx:.1f},{cy - r - 1:.1f} L{cx + r + 1:.1f},{cy:.1f} L{cx:.1f},{cy + r + 1:.1f} '
+                f'L{cx - r - 1:.1f},{cy:.1f} Z" fill="#facc15" stroke="{col}" stroke-width="2"/>')
+    return (f'<path d="M{cx - r:.1f},{cy - r:.1f} L{cx + r:.1f},{cy + r:.1f} M{cx - r:.1f},{cy + r:.1f} '
+            f'L{cx + r:.1f},{cy - r:.1f}" stroke="{col}" stroke-width="2.5"/>')
 
 
 def draw(c: dict) -> str:
@@ -109,17 +126,21 @@ def draw(c: dict) -> str:
     o.append(f'<text x="{x(8.9):.1f}" y="{y(pn * 8.9) + 22:.1f}" font-size="11" fill="#64748b" '
              f'text-anchor="end">linear: {pn / 1000:.0f}k msg/s × nodes</text>')
     kinds = []
-    for n, v, kind, label, fail in c["points"]:
+    aboves = []
+    for n, v, kind, label, above in c["points"]:
         kinds.append(kind)
         cx, cy = x(n), y(v)
         stroke = COLORS[kind]
         fill = "#ffffff" if kind == "floor" else stroke
-        if fail:
+        fail = above[0] if above else None
+        if above:
+            verdict = above[1]
+            aboves.append(verdict)
+            col = ABOVE[verdict][0]
             fy = y(fail)
-            o.append(f'<line x1="{cx:.1f}" y1="{cy:.1f}" x2="{cx:.1f}" y2="{fy:.1f}" stroke="{FAIL}" '
+            o.append(f'<line x1="{cx:.1f}" y1="{cy:.1f}" x2="{cx:.1f}" y2="{fy:.1f}" stroke="{col}" '
                      'stroke-width="1.5" stroke-dasharray="3 3"/>')
-            o.append(f'<path d="M{cx - 5:.1f},{fy - 5:.1f} L{cx + 5:.1f},{fy + 5:.1f} M{cx - 5:.1f},{fy + 5:.1f} '
-                     f'L{cx + 5:.1f},{fy - 5:.1f}" stroke="{FAIL}" stroke-width="2.5"/>')
+            o.append(above_mark(verdict, cx, fy))
         if kind == "floor" or (kind == "partial" and not fail and n == 10):
             o.append(f'<line x1="{cx:.1f}" y1="{cy - 8:.1f}" x2="{cx:.1f}" y2="{cy - 38:.1f}" stroke="{stroke}" stroke-width="2"/>')
             o.append(f'<path d="M{cx - 5:.1f},{cy - 32:.1f} L{cx:.1f},{cy - 42:.1f} L{cx + 5:.1f},{cy - 32:.1f}" '
@@ -134,10 +155,10 @@ def draw(c: dict) -> str:
         fill = "#ffffff" if kind == "floor" else COLORS[kind]
         o.append(f'<circle cx="{lx}" cy="{yy - 4}" r="5" fill="{fill}" stroke="{COLORS[kind]}" stroke-width="2"/>')
         o.append(f'<text x="{lx + 12}" y="{yy}" font-size="11" fill="#334155">{LEGEND[kind]}</text>')
-    if any(p[4] for p in c["points"]):
-        yy = ly + len(rows) * 18
-        o.append(f'<path d="M{lx - 4},{yy - 8} L{lx + 4},{yy} M{lx - 4},{yy} L{lx + 4},{yy - 8}" stroke="{FAIL}" stroke-width="2.5"/>')
-        o.append(f'<text x="{lx + 12}" y="{yy}" font-size="11" fill="#334155">first failing rung — the knee lies between</text>')
+    for i, verdict in enumerate(dict.fromkeys(aboves)):
+        yy = ly + (len(rows) + i) * 18
+        o.append(above_mark(verdict, lx, yy - 4, 4))
+        o.append(f'<text x="{lx + 12}" y="{yy}" font-size="11" fill="#334155">{ABOVE[verdict][1]}</text>')
     o.append(f'<text x="{L}" y="{H - 14}" font-size="11" fill="#64748b">{c["source"]}</text>')
     o.append("</svg>")
     return "\n".join(o) + "\n"

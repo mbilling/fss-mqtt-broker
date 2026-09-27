@@ -32,19 +32,19 @@
 <text x="308.5" y="307.2" font-size="12" fill="#0f172a" text-anchor="start">120k — 40.0k/node (3 + control)</text>
 <circle cx="430.9" cy="264.8" r="7" fill="#2563eb" stroke="#2563eb" stroke-width="2.5"/>
 <text x="444.9" y="268.8" font-size="12" fill="#0f172a" text-anchor="start">180k — 36.0k/node (3 + control)</text>
-<line x1="567.3" y1="207.2" x2="567.3" y2="188.0" stroke="#dc2626" stroke-width="1.5" stroke-dasharray="3 3"/>
-<path d="M562.3,183.0 L572.3,193.0 M562.3,193.0 L572.3,183.0" stroke="#dc2626" stroke-width="2.5"/>
+<line x1="567.3" y1="207.2" x2="567.3" y2="188.0" stroke="#475569" stroke-width="1.5" stroke-dasharray="3 3"/>
+<path d="M562.3,183.0 L572.3,193.0 M562.3,193.0 L572.3,183.0" stroke="#475569" stroke-width="2.5"/>
 <circle cx="567.3" cy="207.2" r="7" fill="#0891b2" stroke="#0891b2" stroke-width="2.5"/>
 <text x="581.3" y="211.2" font-size="12" fill="#0f172a" text-anchor="start">270k — 38.6k/node (2 of 3 certified)</text>
-<line x1="771.8" y1="130.4" x2="771.8" y2="92.0" stroke="#dc2626" stroke-width="1.5" stroke-dasharray="3 3"/>
-<path d="M766.8,87.0 L776.8,97.0 M766.8,97.0 L776.8,87.0" stroke="#dc2626" stroke-width="2.5"/>
+<line x1="771.8" y1="130.4" x2="771.8" y2="92.0" stroke="#475569" stroke-width="1.5" stroke-dasharray="3 3"/>
+<path d="M766.8,87.0 L776.8,97.0 M766.8,97.0 L776.8,87.0" stroke="#475569" stroke-width="2.5"/>
 <circle cx="771.8" cy="130.4" r="7" fill="#0891b2" stroke="#0891b2" stroke-width="2.5"/>
-<text x="757.8" y="134.4" font-size="12" fill="#0f172a" text-anchor="end">390k — 39.0k/node (1 of 3); 450k fails</text>
+<text x="757.8" y="134.4" font-size="12" fill="#0f172a" text-anchor="end">390k — 39.0k/node (1 of 3); 450k not carried</text>
 <circle cx="104" cy="74" r="5" fill="#2563eb" stroke="#2563eb" stroke-width="2"/>
 <text x="116" y="78" font-size="11" fill="#334155">certified</text>
 <circle cx="104" cy="92" r="5" fill="#0891b2" stroke="#0891b2" stroke-width="2"/>
-<text x="116" y="96" font-size="11" fill="#334155">passed; not every repetition certified</text>
-<path d="M100,106 L108,114 M100,114 L108,106" stroke="#dc2626" stroke-width="2.5"/>
-<text x="116" y="114" font-size="11" fill="#334155">first failing rung — the knee lies between</text>
+<text x="116" y="96" font-size="11" fill="#334155">GREEN; not every repetition certified</text>
+<path d="M100.0,106.0 L108.0,114.0 M100.0,114.0 L108.0,106.0" stroke="#475569" stroke-width="2.5"/>
+<text x="116" y="114" font-size="11" fill="#334155">not carried above (publishers late) — no loss</text>
 <text x="90" y="446" font-size="11" fill="#64748b">source: docs/benchmarks/QOS1-SCALE-CURVE.md · audited emqtt-bench 0.6.3 (67bb4194…) · Hetzner fsn1</text>
 </svg>

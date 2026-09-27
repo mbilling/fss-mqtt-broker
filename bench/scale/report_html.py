@@ -286,7 +286,7 @@ if (ld.length) app.appendChild($(`<section>
 // ── scale-out by tenant ─────────────────────────────────────────────────────
 // The only ladder here whose rung is a POPULATION rather than a rate: each step
 // adds whole sites, publishers/rate/consumers together. So the interesting cell
-// is not the biggest number but the last one still inside its latency budget.
+// is not the biggest number but the last GREEN one — and the YELLOW one above it.
 const le = [];
 for (const r of RUNS) for (const n of Object.keys(r.sizes).sort((a,b)=>a-b)) {
   const e = r.sizes[n].laneE; if (e && e.length) le.push([r.version,n,e]);
@@ -296,28 +296,27 @@ if (le.length) app.appendChild($(`<section>
   ${le.map(([v,n,e])=>{
     const passed = e.filter(x=>x.pass);
     const best = passed.length ? passed[passed.length-1] : null;
-    const moved = e.filter(x=>x.offered && x.recv_rate >= 0.99*x.offered);
-    const movedBest = moved.length ? moved[moved.length-1] : null;
+    const yellow = e.filter(x=>x.carried && (x.band==='green' || x.band==='yellow'));
+    const yellowBest = yellow.length ? yellow[yellow.length-1] : null;
     return `<div class="panel"><table>
       <caption>${v} · ${n} node${n>1?'s':''}</caption>
       <thead><tr><th>sites</th><th>offered msg/s</th><th>delivered/s</th><th>per consumer</th><th>p99</th><th>verdict</th></tr></thead>
       <tbody>${e.map(x=>{
-        const cls = x.pass ? 'ok-l' : 'bad-l';
-        const why = x.pass ? 'pass' : (x.flags||[]).join('; ') || 'fail';
+        const cls = x.pass ? 'ok-l' : (x.failed || x.band==='red' ? 'bad-l' : 'warn-l');
+        const why = x.verdict || (x.pass ? 'GREEN' : (x.flags||[]).join('; '));
         return `<tr><td class="num">${x.sites}</td><td class="num">${fmt(x.offered)}</td>
           <td class="num">${fmt(x.recv_rate)}</td><td class="num">${fmt(x.per_consumer)}</td>
           <td class="num">${x.p99}</td><td class="${cls}">${why}</td></tr>`;}).join('')}</tbody>
     </table>
     ${best ? `<div class="call"><strong>${best.sites} site${best.sites>1?'s':''} per ${n}-node cluster</strong>
-      at p99 &le; ${best.budget_ms}ms — ${fmt(best.offered)} msg/s.
-      ${movedBest && movedBest.sites > best.sites
-        ? `The broker still <em>moves</em> ${movedBest.sites} sites' worth (${fmt(movedBest.recv_rate)}/s,
-           ${(movedBest.recv_rate/movedBest.offered*100).toFixed(1)}% of offer) — it just does not do it inside the
-           budget. Throughput capacity and latency capacity are different numbers on this shape, and which one
-           you buy changes the fleet size for a large estate by the ratio ${movedBest.sites}:${best.sites}.`
+      GREEN (certified) at p99 &le; ${best.budget_ms}ms — ${fmt(best.offered)} msg/s.
+      ${yellowBest && yellowBest.sites > best.sites
+        ? `It carries ${yellowBest.sites} sites YELLOW (${fmt(yellowBest.recv_rate)}/s, p99 ${yellowBest.p99}, nothing
+           lost) — not certified, for workloads that accept that latency. Which band you buy changes the fleet size
+           for a large estate by the ratio ${yellowBest.sites}:${best.sites}.`
         : ''}</div>`
-      : `<div class="call warn"><strong>No rung stayed inside the budget.</strong> The ladder starts above what this
-         cluster carries at the stated p99.</div>`}
+      : `<div class="call warn"><strong>No rung was GREEN.</strong> The ladder starts above what this
+         cluster carries at the stated p99${yellowBest ? `; ${yellowBest.sites} sites are carried YELLOW (p99 ${yellowBest.p99})` : ''}.</div>`}
     ${e.length && e[e.length-1].pass
       ? `<div class="call warn"><strong>This is a floor, not a ceiling.</strong> The top rung passed, so
          ${e[e.length-1].sites} sites is where the ladder stopped, not where the cluster did.</div>` : ''}

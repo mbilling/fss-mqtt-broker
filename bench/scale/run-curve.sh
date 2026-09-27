@@ -549,9 +549,11 @@ LANE_E_DRIVER_SOFTIRQ_MAX="${LANE_E_DRIVER_SOFTIRQ_MAX:-80}"
 LANE_E_DRIVER_GATE="${LANE_E_DRIVER_GATE:-1}"
 LANE_E_DRIVER_GATE_SECS="${LANE_E_DRIVER_GATE_SECS:-20}"
 LANE_E_SWAP_HOOK="${LANE_E_SWAP_HOOK:-}"
-# Stop a ladder at its knee: after LANE_E_STOP_AFTER_FAILS consecutive ladder
-# rungs FAIL (summarize-curve.py's own verdict, read the moment each rung ends),
-# skip the rest of the ladder and go straight to the control. The rungs above a
+# Stop a ladder past its knee: after LANE_E_STOP_AFTER_FAILS consecutive ladder
+# rungs that are RED, FAILED (lost messages) or NOT CARRIED (summarize-curve.py's
+# own verdict, read the moment each rung ends), skip the rest of the ladder and go
+# straight to the control. GREEN and YELLOW rungs keep it climbing: the latency
+# around the knee is what the ladder reports, so it must measure the yellow band. The rungs above a
 # knee confirm what the failing ones already showed, at full fleet cost. The
 # skipped rungs are written to laneE/ladder-stop.txt, which is the only list of
 # absences the crossing gate accepts. 0 (the default) climbs the whole ladder.
@@ -559,10 +561,10 @@ LANE_E_STOP_AFTER_FAILS="${LANE_E_STOP_AFTER_FAILS:-0}"
 # Attempts per driver for each steady-gate delivery poll (lane_e_recv_total);
 # the drain polls once and tolerates a failed poll instead.
 LANE_E_POLL_TRIES="${LANE_E_POLL_TRIES:-3}"
-# A rung PASSES only if its p99 stays under this many ms. The point of a tenancy
-# ladder is the site count at which latency leaves the band, not the count at
-# which the broker finally refuses traffic — those are far apart, and only the
-# first one is sellable.
+# The GREEN line: a carried rung certifies only if its p99 stays under this many
+# ms. Above it a rung is graded YELLOW (<= 5000 ms) or RED, never failed — only
+# lost messages fail a rung. The ladder reports where latency leaves each band,
+# not only the count at which the broker finally refuses traffic.
 LANE_E_P99_BUDGET_MS="${LANE_E_P99_BUDGET_MS:-1000}"
 # Containers per driver is the HARNESS's ceiling and it is easy to cross by
 # accident, because it grows with the rung: each container is pinned to one vCPU.
@@ -990,7 +992,7 @@ lane_e_shape() {
 		echo "       -> \$share group of $LANE_E_SUBS_PER_SITE on site/<s>/# = $per_sub_rate msg/s per consumer"
 		echo "per_publisher_interval_ms=$interval"
 		echo "containers per site: $LANE_E_PUB_CONTAINERS_PER_SITE pub ($pubs_per_c clients, $per_c_rate msg/s each) + $LANE_E_SUB_CONTAINERS_PER_SITE sub ($subs_per_c clients)"
-		echo "p99 budget: ${LANE_E_P99_BUDGET_MS}ms (a rung above it is reported as OVER BUDGET, not as a failure)"
+		echo "p99 bands: GREEN <= ${LANE_E_P99_BUDGET_MS}ms (certified), YELLOW <= 5000ms, RED above — graded, never failed; only loss fails a rung"
 		if [ "$LANE_E_PIN_SITES" = 1 ]; then
 			echo "site affinity: ON — each site's publishers AND consumers dial ONLY broker (site mod $N),"
 			echo "               so its traffic never crosses a node. The busiest broker carries"
@@ -2938,17 +2940,18 @@ lane_e_driver_gate() {
 	done
 }
 
-# lane_e_rung_verdict <rung dir>: "pass", or "fail: <flags>" — the summarizer's
-# own judgement of the rung, so the harness and the published table cannot
-# disagree about where the knee is.
+# lane_e_rung_verdict <rung dir>: summarize-curve.py's rung_verdict — GREEN,
+# YELLOW or RED (carried; p99 band, "; <notes>" may follow), "FAILED: <flags>"
+# (loss) or "NOT CARRIED: <flags>" — the summarizer's own judgement of the rung,
+# so the harness and the published table cannot disagree about where the knee is.
 lane_e_rung_verdict() {
-	python3 - "$1" "$SCALE_DIR/summarize-curve.py" <<'PY' 2>/dev/null || echo "fail: verdict unavailable"
+	python3 - "$1" "$SCALE_DIR/summarize-curve.py" <<'PY' 2>/dev/null || echo "NOT CARRIED: verdict unavailable"
 import importlib.util, pathlib, sys
 spec = importlib.util.spec_from_file_location("summarize_curve", sys.argv[2])
 m = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(m)
 r = m.lane_e_rung(pathlib.Path(sys.argv[1]))
-print("pass" if r["pass"] else "fail: " + "; ".join(r["flags"]))
+print(m.rung_verdict(r))
 PY
 }
 
@@ -3030,19 +3033,20 @@ for e_sites in "${LANE_E_SITES[@]}"; do
 		[ "$e_rep" -gt 1 ] && e_rdir="$e_rdir-rep$e_rep"
 		e_verdict=$(lane_e_rung_verdict "$e_rdir")
 		echo "$(basename "$e_rdir") $e_verdict" >>"$OUT/laneE/ladder-verdicts.txt"
-		# A rung whose ONLY flags are INVALID EVIDENCE says nothing about the knee
-		# either way — its measurement is unusable, not failed — so it neither
-		# counts toward the stop nor resets the count. On 2026-09-26 two such rungs
-		# at 39k/node (QoS 1, 10 nodes; every broker received the full offer)
+		# A NOT CARRIED rung whose ONLY flags are INVALID EVIDENCE says nothing about
+		# the knee either way — its measurement is unusable, not failed — so it
+		# neither counts toward the stop nor resets the count. On 2026-09-26 two such
+		# rungs at 39k/node (QoS 1, 10 nodes; every broker received the full offer)
 		# stopped a ladder that had not reached its knee.
-		e_flags="${e_verdict#fail: }"
+		e_flags="${e_verdict#NOT CARRIED: }"
 		e_neutral=yes
+		[ "$e_flags" = "$e_verdict" ] && e_neutral=no
 		IFS=';' read -r -a e_flag_list <<<"$e_flags"
 		for e_flag in "${e_flag_list[@]}"; do
 			e_flag="${e_flag# }"
 			case "$e_flag" in "INVALID EVIDENCE"*) ;; *) e_neutral=no ;; esac
 		done
-		if [ "$e_verdict" = pass ]; then e_fails=0
+		if [[ "$e_verdict" == GREEN* || "$e_verdict" == YELLOW* ]]; then e_fails=0
 		elif [ "$e_neutral" = yes ]; then :
 		else e_fails=$((${e_fails:-0} + 1)); fi
 		if [ "$e_fails" -ge "$LANE_E_STOP_AFTER_FAILS" ] && [ "${#e_seen[@]}" -lt "${#LANE_E_SITES[@]}" ]; then
@@ -3060,7 +3064,7 @@ for e_sites in "${LANE_E_SITES[@]}"; do
 				echo "stopped_after=$(basename "$e_rdir") consecutive_fails=$e_fails threshold=$LANE_E_STOP_AFTER_FAILS"
 				echo "skipped=${e_skipped[*]}"
 			} >"$OUT/laneE/ladder-stop.txt"
-			say "[$N nodes] lane E: KNEE — $e_fails consecutive failing rungs (last: $(basename "$e_rdir"): $e_verdict); skipping ${e_skipped[*]}"
+			say "[$N nodes] lane E: KNEE — $e_fails consecutive rungs RED, FAILED or NOT CARRIED (last: $(basename "$e_rdir"): $e_verdict); skipping ${e_skipped[*]}"
 			break
 		fi
 	fi
