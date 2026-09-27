@@ -111,3 +111,40 @@ established; that result must stop a staged scaling campaign.
 Its stricter continuity check requires emission, PUBACK and receive rates within
 3% of request, lateness <=5%, p99 <=1000ms, and scrape uncertainty <=2% in every
 interval. Passing a whole-window average alone does not satisfy this check.
+
+## Durable QoS 1 scale-out (#568)
+
+Every QoS 1 run above used **clean** consumers. mqttd writes durably only for a
+persistent subscriber session, so those runs measured the routing path, even on
+durable-bootstrapped clusters: `mqttd_durable_append_latency_seconds_count`
+stayed 0 on every rung. `LANE_E_SESSION_EXPIRY=<s>` makes lane E's consumers
+persistent (`clean_start=false`, MQTT 5 session expiry, per-rung client ids),
+and the reset gate then also waits for the previous rung's sessions to expire.
+
+The question: **does durable throughput follow the disk?** Each broker probes
+its own volume at boot (`mqttd_store_barrier_floor`), and `summarize-curve.py`
+prints, per rung and per broker, over the steady window: durable appends/s,
+group commits/s, ops per commit, commit time, and how busy the writer was.
+
+- **Disk-bound:** at the knee the writer is saturated (≥ 80% busy), and the
+  per-node rate tracks each node's barrier floor.
+- **Hot-path-bound:** the writers have headroom at the knee, so the limit is
+  upstream of the disk: hub, lanes or replication.
+
+A rung that asks for persistent consumers and shows no durable append in its
+window is flagged **NOT DURABLE** and is not carried.
+
+```sh
+cd bench/scale
+export MQTTD_VERSION=1.0.18 QOS1_DRIVER_ARCHIVE=<audited driver, sha256 67bb4194...>
+# 1. Calibration — 3 nodes, coarse ladder, 11 servers:
+set -a && . qos1-campaign/durable-calibrate-n3.env && set +a
+PREFLIGHT_ONLY=1 ./482-per-node-knee.sh      # offline
+./482-per-node-knee.sh                       # PAID
+python3 summarize-curve.py .runs/knee-<stamp>/1-n3/results
+# 2. Campaign — 10 -> 7 -> 5 -> 3 -> 10 on one provisioning, ladder set around
+#    the calibration's knee (the env refuses to load without KNEE_ARMS):
+export KNEE_ARMS="10:20:1 ...; 7:14:1 ...; 5:10:1 ...; 3:6:1 ...; 10:20:1 <knee>"
+set -a && . qos1-campaign/durable-3-5-7-10.env && set +a
+PREFLIGHT_ONLY=1 ./482-per-node-knee.sh && ./482-per-node-knee.sh
+```

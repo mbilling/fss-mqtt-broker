@@ -482,6 +482,17 @@ LANE_E_SETTLE_BUDGET="${LANE_E_SETTLE_BUDGET:-180}"
 # nodes holds peer links. What must be gone is the previous rung's THOUSANDS.
 LANE_E_RESET_FLOOR="${LANE_E_RESET_FLOOR:-32}"
 LANE_E_RESET_BUDGET="${LANE_E_RESET_BUDGET:-120}"
+# DURABLE SUBSCRIBERS (#568). 0 (the default) keeps lane E's consumers CLEAN
+# sessions: the cluster may be bootstrapped durable, but mqttd writes durably
+# only for a PERSISTENT subscriber session (hub/delivery.rs `owes_durable`), so
+# every QoS 1 knee run before this measured the routing path — its
+# mqttd_durable_append_latency_seconds_count stayed 0 on every rung. N > 0
+# connects every consumer with clean_start=false and an MQTT 5 session expiry
+# of N seconds, under a per-rung client-id prefix so a rung never resumes the
+# previous rung's sessions; the reset gate then also waits for those sessions
+# to expire. Keep N short: it is how long a finished rung's sessions (and any
+# queue they still hold) survive on the cluster.
+LANE_E_SESSION_EXPIRY="${LANE_E_SESSION_EXPIRY:-0}"
 # After the ladder, re-run its BOTTOM rung as a CONTROL. A ladder is a sequence of
 # trials on one cluster, and every later rung is confounded by every earlier one:
 # if the broker degraded, or never recovered from a rung that overloaded it, the
@@ -928,6 +939,19 @@ lane_e_shape() {
 	positive_int LANE_E_DRIVER_SOFTIRQ_MAX "$LANE_E_DRIVER_SOFTIRQ_MAX"
 	positive_int LANE_E_POLL_TRIES "$LANE_E_POLL_TRIES"
 	[[ "$LANE_E_STOP_AFTER_FAILS" =~ ^[0-9]+$ ]] || die "LANE_E_STOP_AFTER_FAILS must be a non-negative integer, got '$LANE_E_STOP_AFTER_FAILS'"
+	[[ "$LANE_E_SESSION_EXPIRY" =~ ^[0-9]+$ ]] || die "LANE_E_SESSION_EXPIRY must be a non-negative integer (seconds; 0 = clean sessions), got '$LANE_E_SESSION_EXPIRY'"
+	if [ "$LANE_E_SESSION_EXPIRY" -gt 0 ]; then
+		# A durable lane that silently measures something else is the failure
+		# this knob exists to end, so every way it could is refused up front.
+		[ "$LANE_E_SUB_QOS" -ge 1 ] 2>/dev/null ||
+			die "LANE_E_SESSION_EXPIRY=$LANE_E_SESSION_EXPIRY with LANE_E_SUB_QOS=$LANE_E_SUB_QOS: a QoS 0 subscription is never written durably — use 1 or 2"
+		[ "$LANE_E_QOS" -ge 1 ] 2>/dev/null ||
+			die "LANE_E_SESSION_EXPIRY=$LANE_E_SESSION_EXPIRY with LANE_E_QOS=$LANE_E_QOS: a QoS 0 publish is delivered at QoS 0 and never written durably — use 1 or 2"
+		[ "$LANE_E_PROTO" = 5 ] ||
+			die "LANE_E_SESSION_EXPIRY needs LANE_E_PROTO=5: the session expiry interval is an MQTT 5 property"
+		[ "$LANE_E_SESSION_EXPIRY" -lt "$LANE_E_RESET_BUDGET" ] ||
+			die "LANE_E_SESSION_EXPIRY=${LANE_E_SESSION_EXPIRY}s is not below LANE_E_RESET_BUDGET=${LANE_E_RESET_BUDGET}s: the reset gate could never see the previous rung's sessions expire, and every rung would start UNRESET"
+	fi
 	[ "$LANE_E_DRIVER_SOFTIRQ_MAX" -le 100 ] || die "LANE_E_DRIVER_SOFTIRQ_MAX is a percentage, got $LANE_E_DRIVER_SOFTIRQ_MAX"
 	positive_int LANE_E_DRIVER_GATE_SECS "$LANE_E_DRIVER_GATE_SECS"
 	case "$LANE_E_DRIVER_GATE" in 0 | 1) ;; *) die "LANE_E_DRIVER_GATE must be 0 or 1, got '$LANE_E_DRIVER_GATE'" ;; esac
@@ -993,6 +1017,11 @@ lane_e_shape() {
 		echo "per_publisher_interval_ms=$interval"
 		echo "containers per site: $LANE_E_PUB_CONTAINERS_PER_SITE pub ($pubs_per_c clients, $per_c_rate msg/s each) + $LANE_E_SUB_CONTAINERS_PER_SITE sub ($subs_per_c clients)"
 		echo "p99 bands: GREEN <= ${LANE_E_P99_BUDGET_MS}ms (certified), YELLOW <= 5000ms, RED above — graded, never failed; only loss fails a rung"
+		if [ "$LANE_E_SESSION_EXPIRY" -gt 0 ]; then
+			echo "consumers: DURABLE — clean_start=false, session expiry ${LANE_E_SESSION_EXPIRY}s, per-rung client ids; every ack waits for fsync + quorum"
+		else
+			echo "consumers: clean sessions — the durable plane is not on this path"
+		fi
 		if [ "$LANE_E_PIN_SITES" = 1 ]; then
 			echo "site affinity: ON — each site's publishers AND consumers dial ONLY broker (site mod $N),"
 			echo "               so its traffic never crosses a node. The busiest broker carries"
@@ -1992,6 +2021,16 @@ lane_e_rung() { # lane_e_rung <sites> [repeat-index] [is-control]
 	# Connections the BROKERS currently hold, summed across the cluster. Read live
 	# rather than from a snapshot, because the question is "has the population
 	# arrived yet" and the answer has to be able to change while we wait.
+	lane_e_sessions_total() {
+		local i tot=0 v
+		for ((i = 0; i < N; i++)); do
+			v=$(rssh "$(broker_pub_ip "$i")" \
+				"set -o pipefail; curl -fsS -m 10 http://localhost:8080/metrics | awk '/^mqttd_sessions[ {]/{s += \$2; seen=1} END{if (!seen) exit 1; print s + 0}'" 2>/dev/null) || return 1
+			case "$v" in '' | *[!0-9]*) return 1 ;; esac
+			tot=$((tot + v))
+		done
+		echo "$tot"
+	}
 	lane_e_conns_total() {
 		local i tot=0 v
 		for ((i = 0; i < N; i++)); do
@@ -2075,7 +2114,7 @@ lane_e_rung() { # lane_e_rung <sites> [repeat-index] [is-control]
 			# these tenants rather than one big shared subscription: a publish for
 			# site 3 is selected among site 3's consumers only.
 			filter="\$share/site$s/site/$s/#"
-			subs[sdi]+="$DOCKER_RUN --name sub-s$s-$j $BENCH_IMG sub -h $hosts -p $port -V $LANE_E_PROTO -c $subs_per_c -R $LANE_E_CONNECT_RATE -t '$filter' -q $LANE_E_SUB_QOS $active --payload-hdrs ts --prometheus --restapi $((port_base + portn[sdi])) >/dev/null"$'\n'
+			subs[sdi]+="$DOCKER_RUN --name sub-s$s-$j $BENCH_IMG sub -h $hosts -p $port -V $LANE_E_PROTO -c $subs_per_c -R $LANE_E_CONNECT_RATE -t '$filter' -q $LANE_E_SUB_QOS $active$(lane_e_durable_sub_args "$rdir" "$s" "$j") --payload-hdrs ts --prometheus --restapi $((port_base + portn[sdi])) >/dev/null"$'\n'
             scrape[sdi]+="$(lane_e_endpoint_scrape "sub-s$s-$j" "$((port_base + portn[sdi]))")"$'\n'
             if [ -n "${QOS1_DRIVER_ARCHIVE:-}" ]; then
                 pollscrape[sdi]+="printf '\\n@@@ sub-s$s-$j\\n'; printf '# POLL_STAMP_MS %s\\n' \"\$(date +%s%3N)\"; curl -fsS -m 10 http://localhost:$((port_base + portn[sdi]))/metrics; printf '\\n# POLL_STAMP_MS %s\\n' \"\$(date +%s%3N)\""$'\n'
@@ -2135,15 +2174,22 @@ MANIFEST
 	# rung's connections is measuring residual overload, and the ladder would
 	# read that as the NEXT site count failing. Bounded, and recorded either way:
 	# a rung that starts un-reset is not silently comparable to one that did.
-	local reset=no reset_waited=0 reset_conns=0
+	# Durable consumers leave their SESSIONS behind for LANE_E_SESSION_EXPIRY
+	# after disconnecting, each possibly still holding queued messages that the
+	# broker keeps writing and truncating, so they are residue exactly as
+	# connections are and the gate waits for them too.
+	local reset=no reset_waited=0 reset_conns=0 reset_sessions=0
 	while :; do
 		reset_conns=$(lane_e_conns_total) || die "incomplete reset connection poll"
-		if [ "$reset_conns" -le "$LANE_E_RESET_FLOOR" ]; then
+		if [ "$LANE_E_SESSION_EXPIRY" -gt 0 ]; then
+			reset_sessions=$(lane_e_sessions_total) || die "incomplete reset session poll"
+		fi
+		if [ "$reset_conns" -le "$LANE_E_RESET_FLOOR" ] && [ "$reset_sessions" -le "$LANE_E_RESET_FLOOR" ]; then
 			reset=yes
 			break
 		fi
 		[ "$reset_waited" -lt "$LANE_E_RESET_BUDGET" ] || {
-			warn "lane E: rung $sites starting with $reset_conns connections still on the cluster (floor $LANE_E_RESET_FLOOR) after ${reset_waited}s — this rung inherits the previous one's residue and will be flagged UNRESET"
+			warn "lane E: rung $sites starting with $reset_conns connections and $reset_sessions durable sessions still on the cluster (floor $LANE_E_RESET_FLOOR) after ${reset_waited}s — this rung inherits the previous one's residue and will be flagged UNRESET"
 			break
 		}
 		sleep "$LANE_E_DRAIN_POLL"
@@ -2602,7 +2648,7 @@ print(total)
 CONNFAIL
 )
 	echo "connect_fail=${lane_e_connect_fail:-0}" >>"$rdir/rung.txt"
-	echo "sites=$sites offered=$((sites * LANE_E_SITE_RATE)) publishers=$((sites * LANE_E_PUBS_PER_SITE)) consumers=$((sites * LANE_E_SUBS_PER_SITE)) per_consumer=$((LANE_E_SITE_RATE / LANE_E_SUBS_PER_SITE)) p99_budget_ms=$LANE_E_P99_BUDGET_MS qos=$LANE_E_QOS sub_qos=$LANE_E_SUB_QOS window_secs=$LANE_E_SECS window=aligned cpu_window=$cpu_window settle_s=$((LANE_E_SETTLE + settle_waited)) settled=$settled settled_conns=$settled_conns expected_conns=$expect_conns steady=$steady steady_s=$steady_s steady_reason=$steady_reason drained=$drained drain_secs=$drain_secs drain_deadline_s=$LANE_E_DRAIN_SECS control=$is_control reset=$reset reset_conns=$reset_conns" >"$rdir/rung.txt"
+	echo "sites=$sites offered=$((sites * LANE_E_SITE_RATE)) publishers=$((sites * LANE_E_PUBS_PER_SITE)) consumers=$((sites * LANE_E_SUBS_PER_SITE)) per_consumer=$((LANE_E_SITE_RATE / LANE_E_SUBS_PER_SITE)) p99_budget_ms=$LANE_E_P99_BUDGET_MS qos=$LANE_E_QOS sub_qos=$LANE_E_SUB_QOS window_secs=$LANE_E_SECS window=aligned cpu_window=$cpu_window settle_s=$((LANE_E_SETTLE + settle_waited)) settled=$settled settled_conns=$settled_conns expected_conns=$expect_conns steady=$steady steady_s=$steady_s steady_reason=$steady_reason drained=$drained drain_secs=$drain_secs drain_deadline_s=$LANE_E_DRAIN_SECS control=$is_control reset=$reset reset_conns=$reset_conns reset_sessions=$reset_sessions session_expiry=$LANE_E_SESSION_EXPIRY durable=$([ "$LANE_E_SESSION_EXPIRY" -gt 0 ] && echo yes || echo no)" >"$rdir/rung.txt"
     if [ -n "${QOS1_DRIVER_ARCHIVE:-}" ]; then
         qos1_clock_capture "$rdir/clock/final" || die "clock health failed after drain"
     fi
@@ -2938,6 +2984,18 @@ lane_e_driver_gate() {
 			targets+=("${d%%:*}")
 		done
 	done
+}
+
+# lane_e_durable_sub_args <rung dir> <site> <container>: the extra emqtt-bench
+# `sub` flags that make a lane E consumer a PERSISTENT session, or nothing when
+# LANE_E_SESSION_EXPIRY is 0. The client-id prefix carries the rung's directory
+# name (sites-N[-repM]), unique within an arm, so a rung can never resume the
+# sessions — and the queues — of the one before it: every container here runs
+# under --network host, and emqtt-bench's default prefix is the HOST name, the
+# same on every rung. Leading space included, so the caller appends it bare.
+lane_e_durable_sub_args() {
+	[ "${LANE_E_SESSION_EXPIRY:-0}" -gt 0 ] || return 0
+	printf ' -C false -x %s --prefix e%s-s%s-%s' "$LANE_E_SESSION_EXPIRY" "$(basename "$1")" "$2" "$3"
 }
 
 # lane_e_rung_verdict <rung dir>: summarize-curve.py's rung_verdict — GREEN,
