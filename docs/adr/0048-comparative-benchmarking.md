@@ -214,3 +214,41 @@ which measures a single non-durable node.
 Also as delivered: `scripts/check-readme-facts.py`'s tracked-citation guard widened from
 `docs/COMPARISON.md` alone to the README and every `docs/benchmarks/*.md`, so a published
 number whose method or harness is not reachable in the repository fails the build.
+
+### Amendment (2026-09-27): a rung fails only on loss; p99 is graded GREEN / YELLOW / RED
+
+Until now a rung whose p99 exceeded 1 s was *failed*, which made a lossless,
+slower rung read like a broken broker, and hid the latency a user who can
+accept more than 1 s would actually get. The verdict is split in three, and
+every lane (single-node comparison, lane B, lane E) applies the same thresholds
+from `bench/scale/summarize-curve.py`:
+
+- **FAILED — messages were lost.** A shortfall after a drain that converged, or
+  any broker drop, at any QoS: **zero loss**, QoS 0 included (it was ≥ 99%
+  delivered). A shortfall the rig cannot confirm — the drain deadline expired,
+  or the lane has no drain (lane B) — is UNRESOLVED, not FAILED. Nothing else
+  fails a rung.
+- **NOT CARRIED — no loss, but not a clean measurement of the offered rate.**
+  Offer not met, publishers late, not steady, unsettled, invalid evidence and
+  the other measurement gates. At QoS 1 a late publisher is a slow ack, i.e.
+  backpressure: the rate was not carried, but nothing was lost.
+- **Carried, graded by p99** (histogram bucket upper bound plus clock
+  uncertainty):
+
+  | band | p99 | meaning |
+  |---|---|---|
+  | **GREEN** | ≤ 1 000 ms | **certified** — the headline knee is the highest green rung |
+  | **YELLOW** | ≤ 5 000 ms | carried without loss, slower than the certified line |
+  | **RED** | > 5 000 ms | carried without loss, outside both bands |
+
+Each ladder reports its **certified (GREEN) knee** and, beside it, the highest
+rung carried at **YELLOW** — the latency around the knee — and never presents
+the yellow figure as the certified one. A claim above a rung that lost messages
+is blocked. The automatic ladder stop (`LANE_E_STOP_AFTER_FAILS`) climbs through
+YELLOW and counts RED, FAILED and NOT CARRIED rungs.
+
+Results published before this amendment keep their numbers. Their "OVER P99"
+rungs are regraded where the raw runs survive (the 2026-09-26 QoS 0 scale-out:
+the 120k/node rungs are YELLOW at p99 ≤ 2 s with zero loss). The 2026-09-16
+single-node knees were qualified at ≥ 99% delivered and their raw runs are not
+retained, so zero loss is **not re-checked** for them; the record says so.

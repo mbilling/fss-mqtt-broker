@@ -31,6 +31,14 @@ handling** — mqttd's own hot path had ~2× headroom at the knee. See
   cluster was reset, delivery reached steady state before the window opened,
   the backlog drained afterwards, and the ledger closed on exact message
   identities. Any one failing voids the rung.
+- **Since 2026-09-27 only loss fails a rung**
+  ([ADR 0048](../adr/0048-comparative-benchmarking.md#amendment-2026-09-27-a-rung-fails-only-on-loss-p99-is-graded-green--yellow--red)).
+  A rung that lost nothing but missed a gate above — late publishers, invalid
+  evidence — is **NOT CARRIED**; a carried rung is graded by p99, **GREEN** ≤ 1 s
+  (certified), **YELLOW** ≤ 5 s, **RED** above. **No QoS 1 rung in this document
+  lost a message or left GREEN:** every knee here is backpressure (late
+  publishers, i.e. slow acks), never latency. Rungs recorded as FAIL before the
+  amendment are relabelled NOT CARRIED below.
 
 ## The curve
 
@@ -46,7 +54,7 @@ see [7 and 10 nodes](#7-and-10-nodes--one-provisioning-2026-09-26)), with 20
 consumers per site rather than 10, and they are qualified less strictly: the
 repetitions not certified were INVALID on driver-side endpoint evidence while
 every broker received the full offer. 7 nodes has a measured knee just above:
-300,000/s failed on late publishers.
+300,000/s was not carried: publishers ran late (p99 ≤ 500 ms, nothing lost).
 
 Throughput is application payload: 216 bytes per message (a 200-byte body plus
 16 bytes of timestamp and sequence the audit driver appends so every identity can
@@ -93,14 +101,14 @@ it is the warm-up rung and it is not as clean as its repeats.
 
 ## The caveat that matters most
 
-**180,000 msg/s at 5 nodes passed three times on one provisioning and FAILED on
-another** — same release, same workload, same container density, different
+**180,000 msg/s at 5 nodes passed three times on one provisioning and was NOT
+CARRIED on another** — same release, same workload, same container density, different
 physical machines:
 
 | provisioning | late | p99 | verdict |
 |---|---:|---|---|
 | 2026-09-20 14:57 UTC | 0.001 – 0.741 % | ≤ 5 ms | PASS ×3 |
-| 2026-09-20 15:48 UTC | **6.572 %** | ≤ 500 ms | **FAIL** — publishers late |
+| 2026-09-20 15:48 UTC | **6.572 %** | ≤ 500 ms | **NOT CARRIED** — publishers late |
 
 The difference was the load generator, not the broker. On the failing fleet the
 busiest driver core ran **78 % mean busy and spent 11.5 % of the window above
@@ -267,7 +275,7 @@ first campaign named:
 | 7 | 9 | 38.6k | 270,002 | 26% | **pass**, p99 ≤ 500 ms |
 | 7 | 9 rep 2 | 38.6k | 269,955 | 26% | INVALID EVIDENCE |
 | 7 | 9 rep 3 | 38.6k | 269,995 | 25% | **pass**, p99 ≤ 500 ms |
-| 7 | 10 | 42.9k | 300,002 | 23% | **FAIL — publishers late (7%)** |
+| 7 | 10 | 42.9k | 300,002 | 23% | **NOT CARRIED — publishers late (7%)**, p99 ≤ 500 ms, no loss |
 
 **The INVALID EVIDENCE rungs are the driver's measurement, not the broker's.**
 - **What happened:** the audited driver's endpoint scrapes landed outside the
@@ -285,7 +293,7 @@ first campaign named:
 - At QoS 1 a late publisher is a slow acknowledgement, not a busy driver: every
   driver was ≥ 66% idle on that rung.
 - The broker's busiest core was 15% idle at its lowest second.
-- 300,000/s at 7 nodes (42.9k/node) fails; 270,000/s (38.6k/node) passes.
+- 300,000/s at 7 nodes (42.9k/node) is not carried; 270,000/s (38.6k/node) passes.
 
 **10 nodes has no knee here.** Its 42k/node probe was skipped by the ladder's
 early stop, which counted the two INVALID EVIDENCE repetitions as failures. That
@@ -296,7 +304,7 @@ reset it. The knee was found the next day (below).
 
 **The 10-node QoS 1 knee lies between 42k and 45k msg/s per node**, which is
 420,000–450,000 msg/s for the cluster. That is at or just above 7 nodes' knee
-(38.6k pass, 42.9k fail): per-node QoS 1 capacity does not fall from 7 to 10.
+(38.6k pass, 42.9k not carried): per-node QoS 1 capacity does not fall from 7 to 10.
 
 **Setup:**
 - One 10-node provisioning on **the released v1.0.18**, with the site shape,
@@ -319,10 +327,13 @@ reset it. The knee was found the next day (below).
 | **42k** | 14 ×2 | 420,004 · 420,039 | 24–25% | 51–54% | INVALID EVIDENCE only — **no failure signal** |
 | **45k** | 15 ×2 | 450,075 · 449,966 | 22% | 51–54% | **PUBLISHERS LATE** (8%, 6%) + INVALID EVIDENCE |
 
-**The failure is the broker's.**
+**Latency around the knee is GREEN.** Regraded with the 2026-09-27 bands, every
+rung of this run — 42k and 45k/node included — has p99 ≤ 500 ms and lost nothing.
+
+**The limit is the broker's, and it is backpressure, not latency.**
 - At QoS 1 a late publisher is a slow acknowledgement, and every driver was
-  ≥ 51% idle.
-- The ladder stopped on these two failing repetitions and skipped 48k and 51k.
+  ≥ 51% idle. The 45k rungs are NOT CARRIED, not failed.
+- The ladder stopped on these two repetitions and skipped 48k and 51k.
 
 **Not certified.** In this run every rung from 36k/node up carried the INVALID
 EVIDENCE flag, so no high rung is certified, even though the brokers received

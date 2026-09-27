@@ -53,7 +53,9 @@ Four rules, each a response to a specific failure above.
 1. **No throughput figure is published without its p99 beside it.** The report is
    generated (`bench/scale/report.py`), not assembled, so this cannot be forgotten
    in the writing. A rung whose offered rate was not met keeps its flag rather than
-   being dropped.
+   being dropped. *(2026-09-27, ADR 0048 amendment:)* the p99 carries its band —
+   GREEN ≤ 1 s (certified), YELLOW ≤ 5 s, RED above — and a slow rung is graded,
+   never failed; only lost messages fail a rung. The ≤7,500 ms rung above is RED.
 
 2. **A difference is not a finding until it is replicated.** Lane A runs three reps;
    nothing else does. Until a lane replicates, its differences are reported as

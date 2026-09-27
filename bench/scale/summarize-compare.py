@@ -17,10 +17,11 @@ comparison of their instrumentation. The drivers are the only instrument all
 four arms share, so the drivers are the only instrument used.
 
 Honesty mechanics, enforced here rather than remembered:
-  - The same four gates as the cluster ladders (offer met, delivered, p99
-    budget, settled+drained), at the same thresholds, imported from
-    summarize-curve.py rather than re-typed — a second copy of DRIVER_OK is a
-    second thing to forget to update.
+  - The same verdicts as the cluster ladders, at the same thresholds, imported
+    from summarize-curve.py rather than re-typed — a second copy of DRIVER_OK is
+    a second thing to forget to update. A rung FAILS only on loss after a drain;
+    offer met and settled+drained decide whether it was CARRIED; p99 grades a
+    carried rung GREEN (certified, <= --p99-budget-ms) / YELLOW (<= 5 s) / RED.
   - Late publishers (`pub_overrun`) are REPORTED, never gated. On this rig the
     windowed figure is noisy: it has read 7% on a rung whose lifetime share was
     0.8%. Both are printed so a reader can see the disagreement instead of
@@ -70,8 +71,11 @@ driver_rate = _CURVE.driver_rate
 merged_histogram = _CURVE.merged_histogram
 bucket_pct = _CURVE.bucket_pct
 p99_ms = _CURVE.p99_ms
+latency_band = _CURVE.latency_band
+rung_verdict = _CURVE.rung_verdict
+YELLOW_MS = _CURVE.YELLOW_MS  # 5000 — the carried-but-not-certified line
 DRIVER_OK = _CURVE.DRIVER_OK  # 0.97 — a rung counts only if the offer was reached
-KNEE_OK = _CURVE.KNEE_OK  # 0.99 — delivered/sent a passing rung must reach
+KNEE_OK = _CURVE.KNEE_OK  # 1.0 — zero loss: delivered/sent a carried rung must reach
 LATE_OK = _CURVE.LATE_OK  # 0.05 — reported here, deliberately not gated on
 CONTROL_OK = _CURVE.CONTROL_OK  # 0.05 — drift the closing control may show
 
@@ -288,6 +292,9 @@ def rung_stats(rdir: Path, budget: float) -> dict:
             "cpu": {"mean": None, "min_1s": None, "hosts": 0},
             "mem": "—",
             "pass": False,
+            "carried": False,
+            "failed": False,
+            "band": "red",
             "incomplete": True,
             "flags": ["INCOMPLETE (no rung.txt — still running, or the rung died)"],
         }
@@ -321,9 +328,14 @@ def rung_stats(rdir: Path, budget: float) -> dict:
     if not d["sent"]:
         flags.append("NO TRAFFIC (the publishers logged nothing)")
     elif delivered < KNEE_OK:
-        flags.append(f"UNDER-DELIVERED ({(1 - delivered) * 100:.1f}% of what was published never arrived)")
-    if p99_ms(p99) > budget:
-        flags.append(f"OVER P99 BUDGET ({p99} > {budget:g}ms)")
+        # Only a rung that DRAINED can call a shortfall loss; one that did not is
+        # already NOT DRAINED below, and its shortfall may still be in flight.
+        if meta.get("drained") == "yes":
+            flags.append(f"LOSS ({(1 - delivered) * 100:.2f}% of what was published never arrived after the drain)")
+        else:
+            flags.append(f"UNDER-DELIVERED ({(1 - delivered) * 100:.2f}% not yet arrived when the drain gave up)")
+    # Latency grades a rung; it never fails one.
+    band = latency_band(p99, 0.0, budget)
     # settled/drained are the runner's own statements about the rung's edges, and
     # both are gates rather than notes: an unsettled rung measured a broker still
     # filling up, and an undrained one cannot tell pending traffic from loss, so
@@ -365,7 +377,10 @@ def rung_stats(rdir: Path, budget: float) -> dict:
         "driver_cpu": driver_cpu,
         "mem": container_mem(rdir),
         "meta": meta,
-        "pass": not flags,
+        "failed": any(f.startswith("LOSS") for f in flags),
+        "carried": not flags,
+        "band": band,
+        "pass": not flags and band == "green",
         "incomplete": False,
         "flags": flags,
     }
@@ -429,7 +444,18 @@ def knee(rungs: list[dict]) -> dict | None:
     return max(passed, key=lambda r: r["offered"]) if passed else None
 
 
+def yellow_knee(rungs: list[dict]) -> dict | None:
+    """The highest rate carried in full at p99 <= YELLOW_MS — the latency the
+    broker offers past its certified knee. Blocked by any lower rung that LOST
+    messages: loss at a lower rate means a higher one is not established."""
+    lost = [r["offered"] for r in rungs if r.get("failed")]
+    ok = [r for r in rungs if r.get("carried") and r.get("band") in ("green", "yellow")
+          and not any(o < r["offered"] for o in lost)]
+    return max(ok, key=lambda r: r["offered"]) if ok else None
+
+
 def first_failure(rungs: list[dict]) -> dict | None:
+    """The lowest rate that did not certify GREEN — lost, not carried, or slower."""
     failed = [r for r in rungs if not r["pass"]]
     return min(failed, key=lambda r: r["offered"]) if failed else None
 
@@ -588,15 +614,16 @@ def render_knees(arms: list[dict]) -> list[str]:
         "",
         "## Knee per broker",
         "",
-        "| arm | broker | knee offered | delivered/s | p99 | broker CPU idle (mean/min 1 s) | container mem | first failing rate |",
-        "|---|---|---|---|---|---|---|---|",
+        "| arm | broker | knee offered (GREEN) | delivered/s | p99 | broker CPU idle (mean/min 1 s) | container mem | YELLOW (≤5 s) | first rate not GREEN |",
+        "|---|---|---|---|---|---|---|---|---|",
     ]
     for arm in arms:
         k = knee(arm["rungs"])
+        y = yellow_knee(arm["rungs"])
         f = first_failure(arm["rungs"])
         label = arm["broker"] + (" (control)" if arm["control"] else "")
         if k is None:
-            cells = ["NONE — no rung passed", "—", "—", "—", "—"]
+            cells = ["NONE — no rung certified GREEN", "—", "—", "—", "—"]
         else:
             cells = [
                 f"{k['offered']:,.0f}/s",
@@ -605,8 +632,10 @@ def render_knees(arms: list[dict]) -> list[str]:
                 format_idle(k["cpu"]),
                 k["mem"],
             ]
+        cells.append("—" if y is None or (k and y["offered"] <= k["offered"])
+                     else f"{y['offered']:,.0f}/s, p99 {y['p99']}")
         fail = "none — the ladder stopped before this broker did" if f is None else (
-            f"{f['offered']:,.0f}/s — " + "; ".join(f["flags"])
+            f"{f['offered']:,.0f}/s — {rung_verdict(f)}"
         )
         out.append(f"| {arm['index']} | {label} | " + " | ".join(cells) + f" | {fail} |")
     return out
@@ -624,7 +653,7 @@ def render_rungs(arm: dict) -> list[str]:
         "|---|---|---|---|---|---|---|---|---|",
     ]
     for r in arm["rungs"]:
-        verdict = "pass" if r["pass"] else "; ".join(r["flags"])
+        verdict = rung_verdict(r)
         out.append(
             f"| {r['offered']:,.0f} | {num(r['sent_rate'])} | {num(r['recv_rate'])} | "
             f"{pct(r['delivered'])} | {r['p99']} | {pct(r['late_window'])} / {pct(r['late_lifetime'])} | "
@@ -898,10 +927,11 @@ def self_test() -> None:
         check(k2 is not None and k2["offered"] == 100_000, f"arm 2 knee: {k2 and k2['offered']}")
         check(k1["offered"] > k2["offered"], "two brokers with different ladders produced the same knee")
 
-        # 4. Under-delivery is a failure, and is named as one.
+        # 4. Loss after a drain is THE failure, and is named as one.
         r = next(r for r in by_index[1]["rungs"] if r["offered"] == 300_000)
-        check(not r["pass"] and any("UNDER-DELIVERED" in f for f in r["flags"]),
-              f"a rung that lost 10% of its traffic was accepted: {r['flags']}")
+        check(not r["pass"] and r["failed"] and any(f.startswith("LOSS") for f in r["flags"])
+              and rung_verdict(r).startswith("FAILED"),
+              f"a rung that lost 10% of its traffic was not FAILED: {r['flags']}")
 
         # 5. An offer the drivers never reached is a failure of the RUNG, not a
         #    finding about the broker — and it must not be silently rounded up.
@@ -909,12 +939,19 @@ def self_test() -> None:
         check(not r["pass"] and any("OFFER NOT MET" in f for f in r["flags"]),
               f"a rung at 90% of its offer was accepted: {r['flags']}")
 
-        # 6. The p99 budget gates, and the budget is the CLI's, not a constant.
+        # 6. p99 GRADES, never fails: <=5000ms against a 1000ms green line is a
+        #    carried YELLOW rung, not certified and not failed; the green line is
+        #    the CLI's, not a constant.
         r = next(r for r in by_index[2]["rungs"] if r["offered"] == 300_000)
-        check(not r["pass"] and any("OVER P99 BUDGET" in f for f in r["flags"]),
-              f"a rung at p99 <=5000ms passed a 1000ms budget: {r['flags']}")
+        check(not r["pass"] and r["carried"] and not r["failed"] and r["band"] == "yellow"
+              and rung_verdict(r) == "YELLOW",
+              f"a lossless rung at p99 <=5000ms was not carried YELLOW: {r['band']} {r['flags']}")
+        y2 = yellow_knee(by_index[2]["rungs"])
+        check(y2 is not None and y2["offered"] == 300_000, f"arm 2 YELLOW knee: {y2 and y2['offered']}")
+        check(yellow_knee(by_index[1]["rungs"])["offered"] == 200_000,
+              "a YELLOW knee was reported above a rung that LOST messages")
         relaxed = rung_stats(by_index[2]["dir"] / "rung-300000", 10_000.0)
-        check(relaxed["pass"], f"the same rung failed a 10s budget it fits inside: {relaxed['flags']}")
+        check(relaxed["pass"], f"the same rung was not GREEN under a 10s green line: {relaxed['flags']}")
 
         # 7. settled=no and drained=no each fail on their own, whatever the
         #    throughput looked like.
@@ -1049,8 +1086,9 @@ def self_test() -> None:
     print(
         "summarize-compare self-test: 18 checks OK (run order from the arm index; the knee is "
         "the highest PASSING rung; two brokers with different ladders get different knees; "
-        "each of the four gates fails on its own — under-delivery, offer not met, p99 budget "
-        "(and the same rung passing a wider budget), unsettled, undrained; the first failing "
+        "loss after a drain is FAILED and nothing else is; p99 grades a lossless rung YELLOW "
+        "(and GREEN under a wider line) and a YELLOW knee stops below loss; offer not met, "
+        "unsettled and undrained each keep a rung from being carried; the first failing "
         "rate is the lowest one; the histogram baseline is subtracted and not added back; late "
         "publishers are reported with both shares and gate nothing; a matching control passes; "
         "a control whose knee moved and one delivering 12% less at the same knee both void the "

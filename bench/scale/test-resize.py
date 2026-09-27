@@ -760,18 +760,32 @@ printf '%s\\n' {" ".join(repr(v) for v in verdicts)} >"$OUT/verdicts"
         return (self.root / "out/ran").read_text().split("\n")[:-1]
 
     def test_two_failing_rungs_stop_the_ladder_and_name_what_was_skipped(self):
-        r = self.ladder("1 14 14 17 18 20 21", ["pass", "pass", "pass", "fail: p99", "pass", "fail: p99",
-                                                "fail: OFFER NOT MET"], 2)
+        r = self.ladder("1 14 14 17 18 20 21", ["GREEN", "GREEN", "GREEN", "RED", "GREEN", "RED",
+                                                "NOT CARRIED: OFFER NOT MET"], 2)
         self.assertEqual(r.returncode, 0, r.stderr)
         # One failing rung between passes resets the count: 17 fails, 18 passes.
         self.assertEqual(self.ran(), ["1 1", "14 1", "14 2", "17 1", "18 1", "20 1", "21 1"])
         self.assertFalse((self.root / "out/laneE/ladder-stop.txt").exists(), "the ladder ended on its own")
-        r = self.ladder("1 14 14 17 18 20 21", ["pass", "pass", "pass", "fail: p99", "fail: p99", "pass", "pass"], 2)
+        r = self.ladder("1 14 14 17 18 20 21", ["GREEN", "GREEN", "GREEN", "RED", "RED", "GREEN", "GREEN"], 2)
         self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_yellow_climbs_and_loss_counts(self):
+        # The latency around the knee is the point, so YELLOW rungs (carried,
+        # p99 <= 5 s) keep the ladder climbing and reset the count; a FAILED rung
+        # (lost messages) counts like RED.
+        r = self.ladder("1 10 11 12 13 14", ["GREEN", "YELLOW", "RED", "YELLOW; LATENCY FLOOR (x)",
+                                             "FAILED: LOSS (0.01% ...)", "RED"], 2)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.ran(), ["1 1", "10 1", "11 1", "12 1", "13 1", "14 1"])
+        self.assertFalse((self.root / "out/laneE/ladder-stop.txt").exists(), "the ladder ended on its own")
+        shutil.rmtree(self.root / "out")
+        r = self.ladder("1 10 11 12", ["GREEN", "YELLOW", "FAILED: LOSS (x)", "RED"], 1)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("stopped_after=sites-11 consecutive_fails=1", (self.root / "out/laneE/ladder-stop.txt").read_text())
 
     def test_the_skipped_names_match_what_the_gate_derives(self):
         (self.root / "out").mkdir(exist_ok=True)
-        r = self.ladder("1 10 11 11 12 13", ["pass", "fail: p99", "fail: p99", "x", "x", "x"], 2)
+        r = self.ladder("1 10 11 11 12 13", ["GREEN", "RED", "RED", "x", "x", "x"], 2)
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(self.ran(), ["1 1", "10 1", "11 1"])
         stop = (self.root / "out/laneE/ladder-stop.txt").read_text()
@@ -780,27 +794,27 @@ printf '%s\\n' {" ".join(repr(v) for v in verdicts)} >"$OUT/verdicts"
         self.assertIn("skipped=sites-11-rep2 sites-12 sites-13", stop)
         self.assertIn("KNEE", r.stderr)
         self.assertEqual((self.root / "out/laneE/ladder-verdicts.txt").read_text().splitlines(),
-                         ["sites-1 pass", "sites-10 fail: p99", "sites-11 fail: p99"])
+                         ["sites-1 GREEN", "sites-10 RED", "sites-11 RED"])
 
     def test_invalid_evidence_neither_counts_nor_resets(self):
         # The 2026-09-26 QoS 1 shape: 13 x3 at 39k/node, two repetitions INVALID
         # EVIDENCE with every broker receiving the offer. That is not a knee.
-        r = self.ladder("1 12 13 13 13 14", ["pass", "fail: INVALID EVIDENCE (endpoint scrape window uncertainty exceeds 2%)",
-                                              "pass", "fail: INVALID EVIDENCE (x)", "fail: INVALID EVIDENCE (y)", "pass"], 2)
+        r = self.ladder("1 12 13 13 13 14", ["GREEN", "NOT CARRIED: INVALID EVIDENCE (endpoint scrape window uncertainty exceeds 2%)",
+                                              "GREEN", "NOT CARRIED: INVALID EVIDENCE (x)", "NOT CARRIED: INVALID EVIDENCE (y)", "GREEN"], 2)
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(self.ran(), ["1 1", "12 1", "13 1", "13 2", "13 3", "14 1"], "the probe still runs")
         self.assertFalse((self.root / "out/laneE/ladder-stop.txt").exists())
 
     def test_a_real_fail_beside_invalid_evidence_still_counts(self):
         (self.root / "out").mkdir(exist_ok=True)
-        r = self.ladder("1 9 10 11", ["pass", "fail: PUBLISHERS LATE (7%)",
-                                      "fail: INVALID EVIDENCE (x); PUBLISHERS LATE (9%)", "x"], 2)
+        r = self.ladder("1 9 10 11", ["GREEN", "NOT CARRIED: PUBLISHERS LATE (7%)",
+                                      "NOT CARRIED: INVALID EVIDENCE (x); PUBLISHERS LATE (9%)", "x"], 2)
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(self.ran(), ["1 1", "9 1", "10 1"])
         self.assertIn("skipped=sites-11", (self.root / "out/laneE/ladder-stop.txt").read_text())
 
     def test_off_by_default_climbs_everything(self):
-        r = self.ladder("1 10 11", ["fail: a", "fail: b", "fail: c"], 0)
+        r = self.ladder("1 10 11", ["FAILED: LOSS (a)", "RED", "NOT CARRIED: c"], 0)
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(self.ran(), ["1 1", "10 1", "11 1"])
         self.assertFalse((self.root / "out/laneE/ladder-verdicts.txt").exists())

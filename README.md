@@ -14,7 +14,7 @@
 > **75,000 msg/s** on one 4-vCPU node at p99 ≤ 1 s — **1.7× Mosquitto and EMQX, 2.5× HiveMQ CE**, same host, EMQX's own load tool. [Numbers ↓](#by-the-numbers)
 >
 > **Linear scale-out, 3 → 10 nodes:**
-> - **QoS 0:** ~114,000 msg/s **per 4-vCPU node** — **1.14M msg/s on 10 nodes, 40 vCPU in total**.
+> - **QoS 0:** ~114,000 msg/s **per 4-vCPU node** — **1.14M msg/s on 10 nodes, 40 vCPU in total**; 1.2M at p99 ≤ 2 s, no loss.
 > - **QoS 1:** ~39,000–42,000 msg/s per node — **390,000–420,000 msg/s on 10 nodes**.
 >
 > Both use shared subscriptions. [Scale-out ↓](#cluster-scale-out-qos-0-shared-subscriptions)
@@ -37,9 +37,11 @@
 
 ## By the numbers
 
+**How a rung is judged** ([ADR 0048](docs/adr/0048-comparative-benchmarking.md#amendment-2026-09-27-a-rung-fails-only-on-loss-p99-is-graded-green--yellow--red)): a rung **fails only if it loses messages**. A lossless rung is graded by p99 — **GREEN ≤ 1 s (certified)**, **YELLOW ≤ 5 s**, **RED** above. Every knee below is the highest GREEN rung; the YELLOW figure beside it is the latency around the knee, for workloads that can take it.
+
 Sources: [SINGLE-NODE-COMPARISON.md](docs/benchmarks/SINGLE-NODE-COMPARISON.md) (2026-09-16, one Hetzner CCX23, 4 vCPU / 16 GB, brokers in sequence, untuned) · [knee-3-5-7-10.md](bench/scale/knee-3-5-7-10.md) (2026-09-26, QoS 0 scale-out, 3 → 10 nodes on one provisioning) · [SCALE-CURVE.md](docs/benchmarks/SCALE-CURVE.md) (one host + NVMe per broker).
 
-**Single-node knee** — highest rate at p99 ≤ 1 s and ≥ 99% delivered (1:1 QoS 0, 200 B):
+**Single-node knee** — highest GREEN rate, p99 ≤ 1 s (1:1 QoS 0, 200 B). Qualified at ≥ 99% delivered before the zero-loss rule; the raw runs are not retained, so zero loss is not re-checked:
 
 ```text
 mqttd      1.0.17   ██████████████████████████████████████████████████  75,000 msg/s
@@ -78,23 +80,23 @@ HiveMQ CE  2024.3   ████████████████████
 
 ### Cluster scale-out, QoS 0 shared subscriptions
 
-The highest rate each cluster size carries at p99 ≤ 1 s with every message
-delivered (1:1 via `$share`, 200 B, 10 consumers per site). All four sizes ran on
+The highest rate each cluster size carries GREEN — p99 ≤ 1 s, zero loss —
+and the YELLOW rung above it (1:1 via `$share`, 200 B, 10 consumers per site). All four sizes ran on
 **one provisioning**, the same hosts re-formed 10 → 7 → 5 → 3 → 10. Each size had
 2 load generators per broker and ladders matched in per-node offer, so a driver
 carries the same load at every size:
 
 ```text
-3 nodes  ██████████·······················  ≥ 360k msg/s  ≥ 120k/node   every rung passed — knee above
-5 nodes  ████████████████·················    570k         114k/node
-7 nodes  ███████████████████████··········    810k         116k/node
-10 nodes █████████████████████████████████  1,140k         114k/node   highest passing rung (see below)
+3 nodes  ██████████·······················  ≥ 360k msg/s  ≥ 120k/node   every rung GREEN — knee above
+5 nodes  ████████████████·················    570k         114k/node     YELLOW 600k   (p99 ≤ 2 s)
+7 nodes  ███████████████████████··········    810k         116k/node     YELLOW 840k   (p99 ≤ 2 s)
+10 nodes █████████████████████████████████  1,140k         114k/node     YELLOW 1,200k (p99 ≤ 2 s)   highest GREEN rung (see below)
 ```
 
 ![QoS 0 scale-out: msg/s at the knee vs nodes](docs/benchmarks/img/scale-out-qos0.svg)
 
-**Per-node capacity is flat from 3 to 10 nodes.** 5, 7 and 10 nodes all pass
-~114k msg/s per node and fail at 120k. 3 nodes passes 120k, which is one ladder
+**Per-node capacity is flat from 3 to 10 nodes.** 5, 7 and 10 nodes are all GREEN
+at ~114k msg/s per node and YELLOW at 120k (p99 ≤ 2 s, nothing lost). 3 nodes is GREEN at 120k, which is one ladder
 step (6–10k/node) above the others and inside the run's declared ±0.1 resolution.
 Crossing was 0.00% on every broker of every rung, and ingress stayed balanced
 (busiest broker ≤ 1.01× the mean). A closing 10-node arm on the same hosts matched
@@ -134,8 +136,8 @@ both ways — no durable session, so this is the routing path, not the fsync one
 ```text
 3 nodes  ██████████░░░░░░░░░░░░░░░░░░░░░░░  120k msg/s   25.9 MB/s   p99 ≤ 5 ms     40.0k/node
 5 nodes  ███████████████░░░░░░░░░░░░░░░░░░  180k         38.9 MB/s   p99 ≤ 5 ms     36.0k/node
-7 nodes  ███████████████████████░░░░░░░░░░  270k         58.3 MB/s   p99 ≤ 500 ms   38.6k/node   knee: 300k fails
-10 nodes █████████████████████████████████  390k         84.2 MB/s   p99 ≤ 500 ms   39.0k/node   knee: 420k passes, 450k fails
+7 nodes  ███████████████████████░░░░░░░░░░  270k         58.3 MB/s   p99 ≤ 500 ms   38.6k/node   knee: 300k not carried
+10 nodes █████████████████████████████████  390k         84.2 MB/s   p99 ≤ 500 ms   39.0k/node   knee: 420k–450k
 ```
 
 **Per-node QoS 1 capacity holds out to 10 nodes.**
@@ -149,11 +151,12 @@ both ways — no durable session, so this is the routing path, not the fsync one
 
 ![QoS 1 scale-out: msg/s vs nodes](docs/benchmarks/img/scale-out-qos1.svg)
 
-7 nodes carries 270k and fails at 300k (42.9k/node) on late publishers. At QoS 1
-that means slow acks from the brokers; every load generator was still ≥ 66% idle.
-10 nodes carried 420k (42k/node) with no failure signal and fails at 450k
-(45k/node) on late publishers, so its knee is at or just above 7 nodes'. The 420k
-rungs are not certified: the load driver's metrics endpoint renders too slowly
+Latency is not what limits QoS 1: every rung here is GREEN, p99 ≤ 500 ms, and
+nothing was lost. The knee is backpressure. 7 nodes carries 270k and does not carry
+300k (42.9k/node) because publishers ran late. At QoS 1 that means slow acks from
+the brokers; every load generator was still ≥ 66% idle. 10 nodes showed nothing
+wrong at 420k (42k/node), and publishers ran late at 450k (45k/node), so its knee is
+at or just above 7 nodes'. The 420k rungs are not certified: the load driver's metrics endpoint renders too slowly
 under that load for the 60 s window's evidence check. Details and every
 rung: [QOS1-SCALE-CURVE.md](docs/benchmarks/QOS1-SCALE-CURVE.md#7-and-10-nodes--one-provisioning-2026-09-26);
 reproduce: [QOS1-SCALE-CURVE.md § Reproduction](docs/benchmarks/QOS1-SCALE-CURVE.md#reproduction).
@@ -322,7 +325,7 @@ Rules ([ADR 0048](docs/adr/0048-comparative-benchmarking.md)): pinned versions �
 | Versions | mqttd 1.0.17 (published image) · Mosquitto 2.0.20 · EMQX 5.8.6 · HiveMQ CE 2024.3 — digests + config SHA-256 per arm |
 | Tool | emqtt-bench 0.6.3 (EMQX's); driver-side measurement only |
 | Workload | 1:1 QoS 0, 200 B, 25 msg/s per publisher; ladder 15k → 150k msg/s; 60 s per rung |
-| Rung passes | ≥ 99% delivered · ≥ 95% of offer · p99 ≤ 1 s · settled · drained |
+| Rung verdict | **FAILED** only on loss · carried = ≥ 95% of offer, settled, drained · p99 **GREEN ≤ 1 s** (certified) / **YELLOW ≤ 5 s** / **RED** · this run predates the zero-loss rule and passed rungs at ≥ 99% delivered |
 | Config | documented minimum per broker, [committed verbatim](bench/scale/compare/); **nobody tuned**; HiveMQ heap = ½ host RAM |
 | Posture | plaintext, anonymous, in-memory; **mqttd durable OFF** (`MQTTD_DURABLE_SESSIONS=0`), disclosed |
 | Control | mqttd run first and last → same knee, 0.1% drift; > 5% would void the run |
@@ -659,7 +662,7 @@ Tracked on the [delivery dashboard](docs/delivery/STATUS.md).
 ```sh
 cargo build && cargo test && cargo clippy --all-targets && cargo deny check
 ./scripts/interop/run.sh     # foreign-client conformance
-mqttui --list                # There are 92 runnable scripts here: demos, smokes, migrations, benches
+mqttui --list                # There are 93 runnable scripts here: demos, smokes, migrations, benches
 ```
 
 ---

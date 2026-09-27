@@ -45,55 +45,11 @@ def _load_summarize():
 
 _S = _load_summarize()
 
-# One colour per broker, stable across every chart so a reader who has seen one
-# figure can read the next without consulting its legend again.
-COLOURS = {
-    "mqttd": "#2563eb",
-    "mosquitto": "#059669",
-    "emqx": "#d97706",
-    "hivemq": "#dc2626",
-}
-FALLBACK = "#64748b"
+sys.path.insert(0, str(SCALE_DIR))
+import chart_style as cs  # noqa: E402
 
-W, H = 900, 460
-PAD_L, PAD_R, PAD_T, PAD_B = 70, 78, 54, 86
-
-
-def colour(broker: str) -> str:
-    return COLOURS.get(broker.split("-")[0].lower(), FALLBACK)
-
-
-def esc(text: str) -> str:
-    return (
-        str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-    )
-
-
-def svg_open(title: str, subtitle: str) -> list[str]:
-    return [
-        f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {W} {H}" width="{W}" height="{H}" '
-        f'font-family="system-ui,-apple-system,Segoe UI,Roboto,sans-serif" role="img" '
-        f'aria-label="{esc(title)}">',
-        f'<rect width="{W}" height="{H}" fill="#ffffff"/>',
-        f'<text x="{PAD_L}" y="26" font-size="16" font-weight="600" fill="#0f172a">{esc(title)}</text>',
-        f'<text x="{PAD_L}" y="44" font-size="12" fill="#475569">{esc(subtitle)}</text>',
-    ]
-
-
-def frame() -> list[str]:
-    x0, y0, x1, y1 = PAD_L, PAD_T, W - PAD_R, H - PAD_B
-    return [
-        f'<rect x="{x0}" y="{y0}" width="{x1 - x0}" height="{y1 - y0}" fill="none" stroke="#cbd5e1"/>',
-    ]
-
-
-def legend(entries: list[tuple[str, str]], y: int) -> list[str]:
-    out, x = [], PAD_L
-    for label, col in entries:
-        out.append(f'<rect x="{x}" y="{y - 8}" width="18" height="3" fill="{col}"/>')
-        out.append(f'<text x="{x + 24}" y="{y - 2}" font-size="11" fill="#334155">{esc(label)}</text>')
-        x += 34 + 7 * len(label)
-    return out
+W = 960
+LEGEND_W = 250  # the right-hand key: identity, p99 and band per broker
 
 
 # ── latency distribution ─────────────────────────────────────────────────────
@@ -113,22 +69,38 @@ def cdf_points(rung_dir: Path) -> list[tuple[float, float]]:
     return [(le, min(count / total, 1.0)) for le, count in sorted(buckets.items()) if le != float("inf")]
 
 
-def render_latency(arms: list[dict], rate: int) -> str:
+def latency_series(arms: list[dict], rate: int) -> list[dict]:
+    """[{broker, control, cdf: [[ms, frac], ...]}] for every arm with a rung at RATE."""
+    out = []
+    for arm in sorted(arms, key=lambda a: a["index"]):
+        for rung in arm["rungs"]:
+            if rung["offered"] == rate:
+                pts = cdf_points(rung["dir"])
+                if pts:
+                    out.append({"broker": arm["broker"], "control": bool(arm.get("control")),
+                                "cdf": [list(p) for p in pts]})
+    return out
+
+
+def p99_of(cdf: list) -> float:
+    """The first bucket bound holding 99% — the same upper bound the p99 column prints."""
+    return next((ms for ms, frac in cdf if frac >= 0.99), float("inf"))
+
+
+def render_latency(series: list[dict], rate: int, note: str = "") -> str:
+    """Share delivered within X, per broker, over the GREEN / YELLOW / RED latency zones.
+
+    The zones are the p99 bands of ADR 0048: where a curve crosses the p99 line
+    is the band that rung earns. A step curve, because a bucket says "at most
+    this", never "exactly" — the curve can only overstate latency.
+    """
     import math
 
-    series = []
-    for arm in arms:
-        for rung in arm["rungs"]:
-            if rung["offered"] != rate:
-                continue
-            pts = cdf_points(rung["dir"])
-            if pts:
-                series.append((arm["broker"], arm["index"], pts, rung, arm.get("control", False)))
     if not series:
         sys.exit(f"no rung at {rate:,} msg/s carries a latency histogram")
-
+    H = 560
+    x0, x1, y0, y1 = 80, W - LEGEND_W - 36, 132, H - 104
     lo, hi = 1.0, 30000.0
-    x0, y0, x1, y1 = PAD_L, PAD_T, W - PAD_R, H - PAD_B
 
     def sx(ms: float) -> float:
         ms = min(max(ms, lo), hi)
@@ -137,50 +109,82 @@ def render_latency(arms: list[dict], rate: int) -> str:
     def sy(frac: float) -> float:
         return y1 - frac * (y1 - y0)
 
-    out = svg_open(
-        f"Latency distribution at {rate:,} msg/s offered",
-        "share of messages delivered within X — driver-side, histogram bucket bounds, "
-        "measured window only",
-    )
-    out += frame()
-    for ms in (1, 10, 100, 1000, 10000, 30000):
-        x = sx(ms)
-        out.append(f'<line x1="{x:.1f}" y1="{y0}" x2="{x:.1f}" y2="{y1}" stroke="#e2e8f0"/>')
-        label = f"{ms} ms" if ms < 1000 else f"{ms // 1000} s"
-        out.append(
-            f'<text x="{x:.1f}" y="{y1 + 18}" font-size="11" fill="#475569" text-anchor="middle">{label}</text>'
-        )
-    for pct in (0, 50, 90, 99):
-        y = sy(pct / 100)
-        out.append(f'<line x1="{x0}" y1="{y:.1f}" x2="{x1}" y2="{y:.1f}" stroke="#e2e8f0"/>')
-        out.append(
-            f'<text x="{x0 - 8}" y="{y + 4:.1f}" font-size="11" fill="#475569" text-anchor="end">{pct}%</text>'
-        )
+    main = [s for s in series if not s["control"]]
+    fastest = min(main, key=lambda s: p99_of(s["cdf"]))
+    o = cs.open_svg(
+        W, H, f"Latency at {rate:,} msg/s offered, one 4-vCPU node",
+        "share of messages delivered within X · shaded by the p99 band it would earn · "
+        "histogram bucket bounds, never flattering",
+        "; ".join(f"{cs.name(s['broker'])}{' control' if s['control'] else ''}: p99 ≤ "
+                  f"{_ms_label(p99_of(s['cdf']))}" for s in series))
 
-    entries = []
-    for broker, _idx, pts, rung, is_control in sorted(series, key=lambda s: s[1]):
-        col = colour(broker)
-        # A step curve, because a bucket says "at most this", never "exactly".
-        d = []
-        prev = 0.0
-        for ms, frac in pts:
-            d.append(f"{'M' if not d else 'L'}{sx(ms):.1f},{sy(prev):.1f}")
-            d.append(f"L{sx(ms):.1f},{sy(frac):.1f}")
+    # Zones first, under everything: a wash, never a block.
+    for a, b, band in ((lo, 1000, "green"), (1000, 5000, "yellow"), (5000, hi, "red")):
+        role = cs.BAND_SLOT[band]
+        o.append(f'<rect x="{sx(a):.1f}" y="{y0}" width="{sx(b) - sx(a):.1f}" height="{y1 - y0}" '
+                 f'class="f-{role}" fill-opacity="{0.14 if band == "yellow" else 0.08}"/>')
+        o.append(f'<rect x="{sx(a) + 8:.1f}" y="{y0 - 22:.1f}" width="9" height="9" rx="2" class="f-{role}"/>')
+        o.append(cs.text(sx(a) + 22, y0 - 13, {"green": "GREEN · p99 ≤ 1 s, certified", "yellow": "YELLOW",
+                                               "red": "RED"}[band], size=11, role="ink2", weight=600))
+    for pct in (0, 25, 50, 75, 100):
+        o.append(cs.hline(x0, x1, sy(pct / 100), "axis" if pct == 0 else "grid"))
+        o.append(cs.text(x0 - 10, sy(pct / 100) + 4, f"{pct}%", size=12, role="muted", anchor="end", num=True))
+    for ms in (1, 10, 100, 1000, 10000, 30000):
+        o.append(cs.text(sx(ms), y1 + 22, _ms_label(ms), size=12, role="muted", anchor="middle"))
+    o.append(cs.hline(x0, x1, sy(0.99), "ink2", 1, "2 3"))
+    o.append(cs.text(x0 + 6, sy(0.99) + 16, "p99", size=11, role="ink2", weight=600, halo=True))
+
+    # Curves, controls first so the arm they check sits on top.
+    for s in sorted(series, key=lambda s: not s["control"]):
+        role = cs.slot(s["broker"])
+        d, prev = [f"M{sx(lo):.1f},{sy(0):.1f}"], 0.0
+        for ms, frac in s["cdf"]:
+            d.append(f"L{sx(ms):.1f},{sy(prev):.1f} L{sx(ms):.1f},{sy(frac):.1f}")
             prev = frac
-        # The control arm is drawn, not hidden: two lines of the same colour that
-        # sit on each other are the reproducibility claim, visible.
-        dash = ' stroke-dasharray="5 4"' if is_control else ""
-        out.append(f'<path d="{" ".join(d)}" fill="none" stroke="{col}" stroke-width="2"{dash}/>')
-        verdict = "pass" if rung["pass"] else "failed"
-        label = f"{broker} (control)" if is_control else f"{broker} ({verdict})"
-        entries.append((label, col))
-    out += legend(entries, H - 14)
-    out.append(
-        f'<text x="{x0}" y="{y1 + 40}" font-size="11" fill="#64748b">'
-        "each step is a histogram bucket bound: the curve can only overstate latency, never flatter it</text>"
-    )
-    out.append("</svg>")
-    return "\n".join(out)
+        d.append(f"L{sx(hi):.1f},{sy(prev):.1f}")
+        dash = ' stroke-dasharray="5 4" stroke-opacity="0.75"' if s["control"] else ""
+        o.append(f'<path d="{" ".join(d)}" fill="none" class="k-{role}" stroke-width="2" '
+                 f'stroke-linejoin="round"{dash}/>')
+    # The p99 crossing of each arm: a dot with a surface ring, where its band is decided.
+    for s in main:
+        p = p99_of(s["cdf"])
+        if p != float("inf"):
+            o.append(f'<circle cx="{sx(p):.1f}" cy="{sy(0.99):.1f}" r="5.5" class="f-{cs.slot(s["broker"])} '
+                     'k-surface" stroke-width="2"/>')
+
+    # The key: identity, p99 and band, one row per broker — every value readable
+    # without hovering, and identity never carried by colour alone.
+    kx, ky = W - LEGEND_W - 4, y0 + 6
+    o.append(cs.text(kx, ky - 16, "p99 at this rate", size=11, role="muted", weight=600))
+    for s in series:
+        p = p99_of(s["cdf"])
+        band = cs.band_of(p)
+        role = cs.slot(s["broker"])
+        kind = "dash" if s["control"] else "line"
+        o += cs.swatch(kx, ky + 12, role, cs.name(s["broker"]) + (" · control" if s["control"] else ""), kind=kind)
+        o.append(cs.text(kx + 26, ky + 30, f"≤ {_ms_label(p)}" if p != float("inf") else "> 30 s",
+                         size=13, role="ink", weight=650, num=True))
+        o.append(f'<rect x="{kx + 104:.1f}" y="{ky + 19:.1f}" width="9" height="9" rx="2" '
+                 f'class="f-{cs.BAND_SLOT[band]}"/>')
+        o.append(cs.text(kx + 118, ky + 28, cs.BAND_LABEL[band], size=11, role="ink2", weight=600))
+        ky += 50
+    foot = (f"{cs.name(fastest['broker'])} reaches 99% first. "
+            "Band shown is the p99 zone only; FAILED means lost messages, judged from the ledger, not from latency.")
+    o.append(cs.text(x0, H - 50, foot, size=11, role="ink2"))
+    if note:
+        o.append(cs.text(x0, H - 32, note, size=11, role="muted"))
+    o.append(cs.text(x0, H - 14, "source: docs/benchmarks/SINGLE-NODE-COMPARISON.md · one Hetzner CCX23, "
+                     "brokers in sequence · emqtt-bench 0.6.3", size=11, role="muted"))
+    o.append("</svg>")
+    return "\n".join(o) + "\n"
+
+
+def _ms_label(ms: float) -> str:
+    if ms == float("inf"):
+        return "> 30 s"
+    if ms < 1000:
+        return f"{ms:g} ms"
+    return f"{ms / 1000:g} s"
 
 
 # ── one rung's timeline: delivered rate + broker memory ──────────────────────
@@ -263,7 +267,8 @@ def _elapsed_rows(path: Path) -> list[tuple[int, float]]:
     return rows
 
 
-def render_timeline(arm: dict, rate: int) -> str:
+def timeline_data(arm: dict, rate: int) -> dict:
+    """{broker, rate, span_s, delivered: [[s, msg/s]], memory_mib: [[s, MiB]]} for one rung."""
     rung = next((r for r in arm["rungs"] if r["offered"] == rate), None)
     if rung is None:
         sys.exit(f"arm {arm['index']} ({arm['broker']}) has no rung at {rate:,} msg/s")
@@ -271,91 +276,105 @@ def render_timeline(arm: dict, rate: int) -> str:
     mem = memory_series(rung["dir"])
     if not thr and not mem:
         sys.exit(f"{rung['dir']} has neither a subscriber series nor a memory series to plot")
-    # A rung where no client ever connected still has a story, and it is the
-    # broker's own memory: HiveMQ carried 5.8 GiB out of the previous rung, took
-    # 12 GiB during this one's connect attempts, and its JVM terminated. Refusing
-    # to draw that because the delivered rate is flat zero would hide the finding.
-    thr_only_zero = not thr
-
     stamps = [t for t, _ in thr] + [t for t, _ in mem]
-    t_lo, t_hi = min(stamps), max(stamps)
-    span = max(t_hi - t_lo, 1)
-    thr_max = max((v for _, v in thr), default=0.0) or 1
-    mem_max = max((v for _, v in mem), default=0) or 1
-    x0, y0, x1, y1 = PAD_L, PAD_T, W - PAD_R, H - PAD_B
+    t_lo = min(stamps)
+    return {"broker": arm["broker"], "rate": rate, "span_s": max(max(stamps) - t_lo, 1),
+            "delivered": [[t - t_lo, v] for t, v in thr], "memory_mib": [[t - t_lo, v] for t, v in mem]}
 
-    def sx(t: int) -> float:
-        return x0 + (t - t_lo) / span * (x1 - x0)
 
-    def sy_thr(v: float) -> float:
-        return y1 - v / thr_max * (y1 - y0)
+def render_timeline(data: dict, note: str = "") -> str:
+    """Two panels on ONE time axis: delivered msg/s above, broker memory below.
 
-    def sy_mem(v: float) -> float:
-        return y1 - v / mem_max * (y1 - y0)
+    Two measures, two scales, so two panels — never one plot with two y-axes,
+    whose alignment would invent a correlation. The shared x-axis is what lets
+    "memory climbs while delivery falls behind, then both unwind" be read.
+    A broker that absorbed a backlog shows a burst above the offered line once
+    the publishers stop and a memory curve that climbs and falls; one that shed
+    shows neither. A rung where no client connected still has a story — the
+    broker's memory — and is drawn rather than refused.
+    """
+    broker, rate, span = data["broker"], data["rate"], max(float(data["span_s"]), 1.0)
+    thr, mem = data["delivered"], data["memory_mib"]
+    role = cs.slot(broker)
+    H = 600
+    x0, x1 = 96, W - 40
+    a0, a1 = 132, 312  # delivered panel
+    b0, b1 = 368, 500  # memory panel
 
-    out = svg_open(
-        f"{arm['broker']} at {rate:,} msg/s offered — delivered rate and broker memory",
-        "from the rung's start until the backlog drained; memory is the container's cgroup RSS",
-    )
-    out += frame()
-    for frac in (0, 0.25, 0.5, 0.75, 1.0):
-        y = y1 - frac * (y1 - y0)
-        out.append(f'<line x1="{x0}" y1="{y:.1f}" x2="{x1}" y2="{y:.1f}" stroke="#e2e8f0"/>')
-        if not thr_only_zero:
-            out.append(
-                f'<text x="{x0 - 8}" y="{y + 4:.1f}" font-size="11" fill="#2563eb" text-anchor="end">'
-                f"{thr_max * frac / 1000:.0f}k</text>"
-            )
-        if mem:
-            out.append(
-                f'<text x="{x1 + 8}" y="{y + 4:.1f}" font-size="11" fill="#7c3aed">'
-                f"{mem_max * frac:.0f}M</text>"
-            )
-    for sec in range(0, span + 1, max(15, (span // 8 + 14) // 15 * 15)):
-        x = sx(t_lo + sec)
-        out.append(
-            f'<text x="{x:.1f}" y="{y1 + 18}" font-size="11" fill="#475569" text-anchor="middle">{sec}s</text>'
-        )
+    def sx(t: float) -> float:
+        return x0 + t / span * (x1 - x0)
 
-    # The offered rate, so "above the line" is visible as what it is: a backlog
-    # leaving faster than it arrived.
-    y_off = sy_thr(rate)
-    if y0 <= y_off <= y1:
-        out.append(
-            f'<line x1="{x0}" y1="{y_off:.1f}" x2="{x1}" y2="{y_off:.1f}" stroke="#94a3b8" '
-            'stroke-dasharray="4 4"/>'
-        )
-        out.append(
-            f'<text x="{x1 - 4}" y="{y_off - 6:.1f}" font-size="10" fill="#64748b" text-anchor="end">'
-            "offered</text>"
-        )
-    else:
-        # A broker that never came close to its offer would otherwise be drawn
-        # filling its own axis, looking comfortable: the axis tops out at what it
-        # managed, and the line it was asked for is off the chart. Say so.
-        out.append(
-            f'<text x="{x1 - 8}" y="{y0 + 18}" font-size="11" fill="#b91c1c" text-anchor="end">'
-            f"offered {rate:,}/s is above this axis — peak delivered was "
-            f"{thr_max / rate * 100:.0f}% of it</text>"
-        )
-
+    peak = max((v for _, v in thr), default=0.0)
+    mem_peak = max((v for _, v in mem), default=0.0)
+    thr_top = _nice(max(peak, rate) * 1.08)
+    # Round the memory axis in the unit it is printed in, or its top reads "4.9 GiB".
+    mem_top = (_nice(mem_peak * 1.08 / 1024) * 1024 if mem_peak >= 1024 else _nice(max(mem_peak, 1.0) * 1.08))
+    facts = [f"offered {cs.compact(rate)}/s"]
     if thr:
-        d = " ".join(f"{'M' if i == 0 else 'L'}{sx(t):.1f},{sy_thr(v):.1f}" for i, (t, v) in enumerate(thr))
-        out.append(f'<path d="{d}" fill="none" stroke="#2563eb" stroke-width="2"/>')
-    else:
-        out.append(
-            f'<text x="{(x0 + x1) / 2:.0f}" y="{y0 + 0.78 * (y1 - y0):.0f}" font-size="13" fill="#b91c1c" '
-            f'text-anchor="middle">not one client connected at {rate:,} msg/s — nothing was delivered '
-            "to plot</text>"
-        )
+        facts.append(f"peak delivered {cs.compact(peak)}/s")
     if mem:
-        dm = " ".join(f"{'M' if i == 0 else 'L'}{sx(t):.1f},{sy_mem(v):.1f}" for i, (t, v) in enumerate(mem))
-        out.append(f'<path d="{dm}" fill="none" stroke="#7c3aed" stroke-width="2" stroke-dasharray="6 3"/>')
-    entries = [] if thr_only_zero else [("delivered msg/s (left)", "#2563eb")]
-    entries.append(("broker RSS (right)", "#7c3aed") if mem else ("broker RSS — not sampled in this run", FALLBACK))
-    out += legend(entries, H - 18)
-    out.append("</svg>")
-    return "\n".join(out)
+        facts.append(f"peak memory {_mib(mem_peak)}, {_mib(mem[-1][1])} at the end")
+    o = cs.open_svg(W, H, f"{cs.name(broker)} under {rate:,} msg/s offered",
+                    " · ".join(facts), f"{cs.name(broker)}: delivered rate and broker memory over one rung, "
+                    "from start until the backlog drained. " + " · ".join(facts))
+
+    def panel(top: float, bottom: float, vmax: float, fmt, title: str, pts: list, ref: float | None):
+        def sy(v: float) -> float:
+            return bottom - v / vmax * (bottom - top)
+        out = [cs.text(x0, top - 14, title, size=13, role="ink", weight=600)]
+        for frac in (0, 0.5, 1.0):
+            out.append(cs.hline(x0, x1, sy(vmax * frac), "axis" if frac == 0 else "grid"))
+            out.append(cs.text(x0 - 10, sy(vmax * frac) + 4, fmt(vmax * frac), size=12, role="muted",
+                               anchor="end", num=True))
+        if ref is not None:
+            out.append(cs.hline(x0, x1, sy(ref), "ink2", 1, "5 4"))
+            out.append(cs.text(x1, sy(ref) - 6, f"offered {cs.compact(ref)}/s", size=11, role="ink2",
+                               anchor="end", weight=600, halo=True))
+        if pts:
+            line = " ".join(f"{'M' if i == 0 else 'L'}{sx(t):.1f},{sy(v):.1f}" for i, (t, v) in enumerate(pts))
+            area = line + f" L{sx(pts[-1][0]):.1f},{sy(0):.1f} L{sx(pts[0][0]):.1f},{sy(0):.1f} Z"
+            out.append(f'<path d="{area}" class="f-{role}" fill-opacity="0.10"/>')
+            out.append(f'<path d="{line}" fill="none" class="k-{role}" stroke-width="2" '
+                       'stroke-linejoin="round" stroke-linecap="round"/>')
+            t_pk, v_pk = max(pts, key=lambda p: p[1])
+            out.append(f'<circle cx="{sx(t_pk):.1f}" cy="{sy(v_pk):.1f}" r="4.5" class="f-{role} k-surface" '
+                       'stroke-width="2"/>')
+            anchor = "end" if sx(t_pk) > x1 - 140 else "start"
+            dx = -10 if anchor == "end" else 10
+            out.append(cs.text(sx(t_pk) + dx, sy(v_pk) + 4, "peak " + fmt(v_pk), size=12, role="ink",
+                               anchor=anchor, weight=650, halo=True))
+        return out
+
+    o += panel(a0, a1, thr_top, lambda v: cs.compact(v) if v else "0", "Delivered msg/s", thr, rate)
+    if not thr:
+        o.append(cs.text((x0 + x1) / 2, (a0 + a1) / 2 + 6, f"not one client connected at {rate:,} msg/s — "
+                         "nothing was delivered", size=14, role="ink", anchor="middle", weight=600))
+    o += panel(b0, b1, mem_top, lambda v: _mib(v) if v else "0", "Broker memory (container RSS)", mem, None)
+    if not mem:
+        o.append(cs.text((x0 + x1) / 2, (b0 + b1) / 2 + 6, "memory not sampled in this run", size=13,
+                         role="muted", anchor="middle"))
+    step = max(15, (int(span) // 8 + 14) // 15 * 15)
+    for sec in range(0, int(span) + 1, step):
+        o.append(cs.text(sx(sec), b1 + 22, f"{sec}s", size=12, role="muted", anchor="middle", num=True))
+    if note:
+        o.append(cs.text(32, H - 36, note, size=11, role="muted"))
+    o.append(cs.text(32, H - 18, "source: docs/benchmarks/SINGLE-NODE-COMPARISON.md · one Hetzner CCX23 · "
+                     "delivered rate driver-side, memory from the broker's cgroup", size=11, role="muted"))
+    o.append("</svg>")
+    return "\n".join(o) + "\n"
+
+
+def _nice(v: float) -> float:
+    """The next 'round' axis top at or above v: 1, 2, 2.5 or 5 times a power of ten."""
+    import math
+    if v <= 0:
+        return 1.0
+    e = 10 ** math.floor(math.log10(v))
+    return next(m * e for m in (1, 1.5, 2, 2.5, 3, 4, 5, 6, 8, 10) if m * e >= v)
+
+
+def _mib(v: float) -> str:
+    return f"{v / 1024:.1f} GiB" if v >= 1024 else f"{v:.0f} MiB"
 
 
 def self_test() -> None:
@@ -416,27 +435,37 @@ def self_test() -> None:
         check(max(dict(throughput_series(rdir))) == 122,
               "the curve was stretched past the last line the containers logged")
 
-        svg = render_latency(
-            [{"broker": "mqttd", "index": 1,
-              "rungs": [{"offered": 30000, "dir": rdir, "pass": True}]}], 30000)
+        arms = [{"broker": "mqttd", "index": 1, "rungs": [{"offered": 30000, "dir": rdir, "pass": True}]}]
+        svg = render_latency(latency_series(arms, 30000), 30000)
         check(svg.startswith("<svg") and svg.rstrip().endswith("</svg>"), "latency SVG is malformed")
         check("mqttd" in svg, "latency SVG lost its legend")
+        # The bands are drawn, and the p99 key names the band the curve earns.
+        check("GREEN · p99 ≤ 1 s" in svg and "YELLOW" in svg and "RED" in svg, "latency SVG lost its bands")
+        check(p99_of([[1, 0.5], [10, 0.99], [100, 1.0]]) == 10 and cs.band_of(2000) == "yellow"
+              and cs.band_of(5000) == "yellow" and cs.band_of(7500) == "red",
+              "p99 or band lines moved away from ADR 0048's 1 s / 5 s")
+        # The chart is theme-aware: one file, light and dark.
+        check("prefers-color-scheme:dark" in svg, "latency SVG has no dark theme")
 
-        svg2 = render_timeline(
+        svg2 = render_timeline(timeline_data(
             {"broker": "mqttd", "index": 1,
-             "rungs": [{"offered": 30000, "dir": rdir, "pass": True}]}, 30000)
+             "rungs": [{"offered": 30000, "dir": rdir, "pass": True}]}, 30000))
         check(svg2.startswith("<svg") and svg2.rstrip().endswith("</svg>"), "timeline SVG is malformed")
-        check("broker RSS (right)" in svg2, "timeline SVG dropped the memory axis it has data for")
+        check("Broker memory" in svg2 and "not sampled" not in svg2,
+              "timeline SVG dropped the memory panel it has data for")
+        # Two panels, never two y-scales on one plot.
+        check("(left)" not in svg2 and "(right)" not in svg2, "timeline SVG is a dual-axis chart again")
 
     if failures:
         for f in failures:
             print(f"FAIL {f}", file=sys.stderr)
         sys.exit(1)
     print(
-        "chart-compare self-test: 10 checks OK (the CDF reads its buckets and reaches 1.0; the "
+        "chart-compare self-test: 14 checks OK (the CDF reads its buckets and reaches 1.0; the "
         "ramp baseline is subtracted; memory parses bytes to MiB and survives a bad line; "
         "containers with different start times align on the window-close clock and the curve stops where the traffic did; both SVGs render with their "
-        "legends)"
+        "legends, the latency one with its GREEN / YELLOW / RED zones at 1 s and 5 s, both theme-aware, and the "
+        "timeline as two panels rather than two y-axes)"
     )
 
 
@@ -447,18 +476,31 @@ def main() -> None:
     ap.add_argument("--timeline", metavar="BROKER", help="one broker's rate+memory timeline")
     ap.add_argument("--rate", type=int, help="offered rate for --timeline")
     ap.add_argument("--out", type=Path, required=False, help="write the SVG here (default: stdout)")
-    ap.add_argument("--budget", type=float, default=1000.0, help="p99 budget in ms used for pass/fail labels")
+    ap.add_argument("--budget", type=float, default=1000.0, help="p99 GREEN line in ms used to load the arms")
+    ap.add_argument("--data", type=Path, help="render from a recovered data file (docs/benchmarks/img/data/*.json)")
     ap.add_argument("--self-test", action="store_true")
     args = ap.parse_args()
 
     if args.self_test:
         self_test()
         return
+    if args.data:
+        import json
+        d = json.loads(args.data.read_text())
+        note = "data recovered from the chart rendered from the raw runs, which were not retained"
+        svg = (render_latency(d["series"], d["rate"], note) if d["kind"] == "latency"
+               else render_timeline(d, note))
+        if args.out:
+            args.out.write_text(svg)
+            print(f"wrote {args.out} ({len(svg):,} bytes)")
+        else:
+            print(svg)
+        return
     if not args.results:
-        ap.error("a results directory is required")
+        ap.error("a results directory, or --data, is required")
     arms = _S.load_arms(args.results, args.budget)
     if args.latency:
-        svg = render_latency(arms, args.latency)
+        svg = render_latency(latency_series(arms, args.latency), args.latency)
     elif args.timeline:
         if not args.rate:
             ap.error("--timeline needs --rate")
@@ -467,7 +509,7 @@ def main() -> None:
             arm = next((a for a in arms if a["broker"] == args.timeline), None)
         if arm is None:
             sys.exit(f"no arm for broker {args.timeline!r}")
-        svg = render_timeline(arm, args.rate)
+        svg = render_timeline(timeline_data(arm, args.rate))
     else:
         ap.error("choose --latency or --timeline")
     if args.out:

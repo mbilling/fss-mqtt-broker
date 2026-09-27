@@ -961,6 +961,18 @@ requires = ["python3"]
 duration = "~2s"
 
 [[task]]
+id = "scale-chart-style"
+group = "Benchmark"
+name = "(module) shared visual system for the benchmark charts"
+script = "bench/scale/chart_style.py"
+hidden = true
+about = """
+Imported by bench/scale/chart-scale-out.py and bench/scale/chart-compare.py, never run
+directly: the light/dark colour tokens, the GREEN / YELLOW / RED latency-band colours and
+the text and mark helpers every README chart is drawn with.
+"""
+
+[[task]]
 id = "scale-report-html"
 group = "Benchmark"
 name = "(module) page rendering for scale-report"

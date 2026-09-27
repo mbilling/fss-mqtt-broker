@@ -9,69 +9,75 @@ each curve's `source`; they are written here rather than re-read from `.runs/`
 (untracked scratch), so the charts can be regenerated from the tree and checked
 against those documents line by line.
 
-Every point says what kind of number it is, because they are not all the same:
-  certified   — passed with every repetition the rule asks for
-  partial     — passed, but not every repetition is certified (the others were
-                INVALID on driver-side evidence while the brokers received it all)
+One column per cluster size, in the latency bands of ADR 0048 (2026-09-27):
+  GREEN segment   the certified knee — p99 <= 1 s, zero loss
+  YELLOW cap      the rung above it, carried with zero loss at p99 <= 5 s
+  dashed cap      the rung above it was NOT CARRIED (e.g. publishers late —
+                  backpressure; nothing lost)
+Under each size, what kind of number the green figure is:
+  certified   — every repetition the rule asks for
+  partial     — not every repetition certified (the others were INVALID on
+                driver-side evidence while the brokers received it all)
   floor       — the highest rung measured; the knee lies above it
-  uncertified — highest passing rung of an arm whose own gate failed
-A red cross marks the first rung that FAILED above a point: the knee lies
-between the two.
+  uncertified — the arm's own gate failed
 """
 import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import chart_style as cs  # noqa: E402
+
 ROOT = Path(__file__).resolve().parents[2]
 IMG = ROOT / "docs/benchmarks/img"
+
+NOTE = {
+    "certified": "certified",
+    "partial": "{reps} certified",
+    "floor": "floor — knee above",
+    "uncertified": "mesh gate failed",
+}
 
 CURVES = {
     "qos0": {
         "file": "scale-out-qos0.svg",
-        "title": "QoS 0 scale-out: msg/s at the knee vs nodes — $share 1:1, 200 B, 4-vCPU nodes",
-        "subtitle": "one provisioning (10 × CCX23 + 20 × CCX33), drivers 2 per broker, ladders matched per node; "
-                    "knee = p99 ≤ 1 s, all delivered, 0% crossing",
-        "source": "source: bench/scale/knee-3-5-7-10.md, run 2026-09-26 · mqttd main 0a08187 · emqtt-bench 0.6.3 · Hetzner fsn1",
-        "y_max": 1_300_000, "y_step": 200_000,
+        "title": "QoS 0 scale-out: 1.14M msg/s certified on 10 nodes",
+        "subtitle": "$share 1:1, 200 B · 4-vCPU nodes, one provisioning, ladders matched per node · "
+                    "0% crossing",
+        "source": "bench/scale/knee-3-5-7-10.md · run 2026-09-26 · mqttd main 0a08187 · emqtt-bench 0.6.3 · Hetzner fsn1",
+        "y_max": 1_400_000, "y_step": 200_000,
         "per_node": 114_000,
-        # (nodes, msg/s, kind, label, first failing rung above or None) — knee-3-5-7-10.md
+        # (nodes, green msg/s, kind, reps, (next rung, its verdict) or None) — knee-3-5-7-10.md
         "points": [
-            (3, 360_000, "floor", "≥ 360k — every rung passed", None),
-            (5, 570_000, "certified", "570k — 114k/node", 600_000),
-            (7, 810_000, "certified", "810k — 116k/node", 840_000),
-            (10, 1_140_000, "uncertified", "1.14M — 114k/node; gate failed (membership flap)", 1_200_000),
+            (3, 360_000, "floor", "", None),
+            (5, 570_000, "certified", "", (600_000, "yellow")),
+            (7, 810_000, "certified", "", (840_000, "yellow")),
+            (10, 1_140_000, "uncertified", "", (1_200_000, "yellow")),
         ],
     },
     "qos1": {
         "file": "scale-out-qos1.svg",
-        "title": "QoS 1 scale-out: msg/s vs nodes — $share 1:1, QoS 1 both ways, 200 B, 4-vCPU nodes",
-        "subtitle": "3, 5: separate provisionings, v1.0.17 · 7, 10: one provisioning, main 0a08187, 20 consumers/site · "
-                    "10-node ✕: v1.0.18 · 0% crossing",
-        "source": "source: docs/benchmarks/QOS1-SCALE-CURVE.md · audited emqtt-bench 0.6.3 (67bb4194…) · Hetzner fsn1",
+        "title": "QoS 1 scale-out: 390k msg/s on 10 nodes, every rung GREEN",
+        "subtitle": "$share 1:1, QoS 1 both ways, 200 B · 4-vCPU nodes · the knee is backpressure "
+                    "(slow acks), never latency",
+        "source": "docs/benchmarks/QOS1-SCALE-CURVE.md · 3, 5: v1.0.17 · 7, 10: main 0a08187, 10-node knee v1.0.18 · Hetzner fsn1",
         "y_max": 500_000, "y_step": 100_000,
         "per_node": 39_000,
         # QOS1-SCALE-CURVE.md, "The curve" and "7 and 10 nodes — one provisioning"
         "points": [
-            (3, 120_000, "certified", "120k — 40.0k/node (3 + control)", None),
-            (5, 180_000, "certified", "180k — 36.0k/node (3 + control)", None),
-            (7, 270_000, "partial", "270k — 38.6k/node (2 of 3 certified)", 300_000),
-            # 2026-09-27 knee run: 420k (42k/node) x2 with no failure signal, 450k fails
-            (10, 390_000, "partial", "390k — 39.0k/node (1 of 3); 450k fails", 450_000),
+            (3, 120_000, "certified", "", None),
+            (5, 180_000, "certified", "", None),
+            (7, 270_000, "partial", "2 of 3", (300_000, "not carried")),
+            # 2026-09-27 knee run: 420k (42k/node) x2 with no failure signal, 450k publishers late
+            (10, 390_000, "partial", "1 of 3", (450_000, "not carried")),
         ],
     },
 }
 
-W, H = 900, 460
-L, R, T, B = 90, 60, 60, 80
+W, H = 960, 572
+L, R, T, B = 96, 48, 140, 110
 PW, PH = W - L - R, H - T - B
-X_MAX = 11
-COLORS = {"certified": "#2563eb", "partial": "#0891b2", "floor": "#d97706", "uncertified": "#64748b"}
-LEGEND = {
-    "certified": "certified",
-    "partial": "passed; not every repetition certified",
-    "floor": "floor: never reached its knee",
-    "uncertified": "uncertified: highest passing rung, own gate failed",
-}
-FAIL = "#dc2626"
+X_MAX = 11.2
+COL_W = 24
 
 
 def draw(c: dict) -> str:
@@ -83,62 +89,79 @@ def draw(c: dict) -> str:
     def y(v: float) -> float:
         return T + PH - v / y_max * PH
 
-    def fmt(v: float) -> str:
-        return f"{v / 1e6:.1f}M" if y_max >= 1_000_000 else f"{v / 1e3:.0f}k"
+    o = cs.open_svg(W, H, c["title"], c["subtitle"],
+                    "Columns per cluster size: green is the certified knee (p99 ≤ 1 s, zero loss); "
+                    "a yellow cap is the next rung carried with zero loss at p99 ≤ 5 s; a dashed cap "
+                    "is a rung not carried. " + "; ".join(
+                        f"{n} nodes {cs.compact(v)}" + (f", next rung {cs.compact(a[0])} {a[1]}" if a else "")
+                        for n, v, _, _, a in c["points"]))
 
-    o = [
-        f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {W} {H}" width="{W}" height="{H}" '
-        'font-family="system-ui,-apple-system,Segoe UI,Roboto,sans-serif" role="img" '
-        f'aria-label="{c["title"]}">',
-        f'<rect width="{W}" height="{H}" fill="#ffffff"/>',
-        f'<text x="{L}" y="26" font-size="16" font-weight="600" fill="#0f172a">{c["title"]}</text>',
-        f'<text x="{L}" y="44" font-size="12" fill="#475569">{c["subtitle"]}</text>',
-        f'<rect x="{L}" y="{T}" width="{PW}" height="{PH}" fill="none" stroke="#cbd5e1"/>',
-    ]
+    # Legend: only the keys this chart uses.
+    verdicts = {a[1] for *_, a in c["points"] if a}
+    keys = [("good", "GREEN certified · p99 ≤ 1 s, zero loss", "box")]
+    if "yellow" in verdicts:
+        keys.append(("warn", "YELLOW · carried at p99 ≤ 5 s, zero loss", "box"))
+    if "not carried" in verdicts:
+        keys.append(("ghost", "not carried · slow acks, zero loss", "ghost"))
+    keys.append(("muted", f"linear: {c['per_node'] / 1000:.0f}k msg/s × nodes", "dash"))
+    lx = 32
+    for role, label, kind in keys:
+        o += cs.swatch(lx, 100, role, label, kind=kind)
+        lx += cs.legend_width(label, kind)
+
+    # Grid and y-axis: hairline, solid, recessive.
     for v in range(0, y_max + 1, c["y_step"]):
-        o.append(f'<line x1="{L}" y1="{y(v):.1f}" x2="{L + PW}" y2="{y(v):.1f}" stroke="#e2e8f0"/>')
-        o.append(f'<text x="{L - 8}" y="{y(v) + 4:.1f}" font-size="11" fill="#475569" text-anchor="end">{fmt(v)}</text>')
-    for n in (1, 3, 5, 7, 10):
-        o.append(f'<line x1="{x(n):.1f}" y1="{T}" x2="{x(n):.1f}" y2="{T + PH}" stroke="#f1f5f9"/>')
-        o.append(f'<text x="{x(n):.1f}" y="{T + PH + 18}" font-size="11" fill="#475569" text-anchor="middle">{n}</text>')
-    o.append(f'<text x="{L + PW / 2}" y="{T + PH + 38}" font-size="12" fill="#334155" text-anchor="middle">brokers</text>')
+        o.append(cs.hline(L, L + PW, y(v), "axis" if v == 0 else "grid"))
+        o.append(cs.text(L - 12, y(v) + 4, cs.compact(v) if v else "0", size=12, role="muted",
+                         anchor="end", num=True))
+    o.append(cs.text(L - 12, T - 14, "msg/s", size=11, role="muted", anchor="end"))
+
+    # Linear scaling reference: a projection, so it is the one dashed line.
     pn = c["per_node"]
-    o.append(f'<line x1="{x(0):.1f}" y1="{y(0):.1f}" x2="{x(X_MAX):.1f}" y2="{y(pn * X_MAX):.1f}" '
-             'stroke="#94a3b8" stroke-dasharray="6 5"/>')
-    # Below the line between the 7- and 10-node points, clear of both labels.
-    o.append(f'<text x="{x(8.9):.1f}" y="{y(pn * 8.9) + 22:.1f}" font-size="11" fill="#64748b" '
-             f'text-anchor="end">linear: {pn / 1000:.0f}k msg/s × nodes</text>')
-    kinds = []
-    for n, v, kind, label, fail in c["points"]:
-        kinds.append(kind)
-        cx, cy = x(n), y(v)
-        stroke = COLORS[kind]
-        fill = "#ffffff" if kind == "floor" else stroke
-        if fail:
-            fy = y(fail)
-            o.append(f'<line x1="{cx:.1f}" y1="{cy:.1f}" x2="{cx:.1f}" y2="{fy:.1f}" stroke="{FAIL}" '
-                     'stroke-width="1.5" stroke-dasharray="3 3"/>')
-            o.append(f'<path d="M{cx - 5:.1f},{fy - 5:.1f} L{cx + 5:.1f},{fy + 5:.1f} M{cx - 5:.1f},{fy + 5:.1f} '
-                     f'L{cx + 5:.1f},{fy - 5:.1f}" stroke="{FAIL}" stroke-width="2.5"/>')
-        if kind == "floor" or (kind == "partial" and not fail and n == 10):
-            o.append(f'<line x1="{cx:.1f}" y1="{cy - 8:.1f}" x2="{cx:.1f}" y2="{cy - 38:.1f}" stroke="{stroke}" stroke-width="2"/>')
-            o.append(f'<path d="M{cx - 5:.1f},{cy - 32:.1f} L{cx:.1f},{cy - 42:.1f} L{cx + 5:.1f},{cy - 32:.1f}" '
-                     f'fill="none" stroke="{stroke}" stroke-width="2"/>')
-        o.append(f'<circle cx="{cx:.1f}" cy="{cy:.1f}" r="7" fill="{fill}" stroke="{stroke}" stroke-width="2.5"/>')
-        anchor, dx = ("end", -14) if n == 10 else ("start", 14)
-        o.append(f'<text x="{cx + dx:.1f}" y="{cy + 4:.1f}" font-size="12" fill="#0f172a" text-anchor="{anchor}">{label}</text>')
-    lx, ly = L + 14, T + 18
-    rows = [k for k in COLORS if k in kinds]
-    for i, kind in enumerate(rows):
-        yy = ly + i * 18
-        fill = "#ffffff" if kind == "floor" else COLORS[kind]
-        o.append(f'<circle cx="{lx}" cy="{yy - 4}" r="5" fill="{fill}" stroke="{COLORS[kind]}" stroke-width="2"/>')
-        o.append(f'<text x="{lx + 12}" y="{yy}" font-size="11" fill="#334155">{LEGEND[kind]}</text>')
-    if any(p[4] for p in c["points"]):
-        yy = ly + len(rows) * 18
-        o.append(f'<path d="M{lx - 4},{yy - 8} L{lx + 4},{yy} M{lx - 4},{yy} L{lx + 4},{yy - 8}" stroke="{FAIL}" stroke-width="2.5"/>')
-        o.append(f'<text x="{lx + 12}" y="{yy}" font-size="11" fill="#334155">first failing rung — the knee lies between</text>')
-    o.append(f'<text x="{L}" y="{H - 14}" font-size="11" fill="#64748b">{c["source"]}</text>')
+    xe = min(X_MAX, y_max / pn)
+    o.append(f'<line x1="{x(0):.1f}" y1="{y(0):.1f}" x2="{x(xe):.1f}" y2="{y(pn * xe):.1f}" '
+             'class="k-muted" stroke-width="1.25" stroke-dasharray="5 5"/>')
+
+    for n, v, kind, reps, above in c["points"]:
+        cx = x(n) - COL_W / 2
+        top = y(v)
+        if above:
+            nxt, verdict = above
+            yt = y(nxt)
+            if verdict == "yellow":
+                # 2px surface gap between the green body and its yellow cap.
+                o.append(cs.column(cx, yt, top - 2, COL_W, "warn"))
+            else:
+                o.append(f'<rect x="{cx + 0.75:.1f}" y="{yt + 0.75:.1f}" width="{COL_W - 1.5:.1f}" '
+                         f'height="{max(top - 2 - yt - 1.5, 1):.1f}" rx="4" fill="none" class="k-ghost" '
+                         'stroke-width="1.5" stroke-dasharray="3 2"/>')
+        o.append(cs.column(cx, top, y(0), COL_W, "good", round_top=not above))
+        if kind == "floor":
+            # The knee lies above: an arrow off the top of the column.
+            ax = x(n)
+            o.append(f'<path d="M{ax:.1f},{top - 8:.1f} V{top - 34:.1f} M{ax - 6:.1f},{top - 27:.1f} '
+                     f'L{ax:.1f},{top - 35:.1f} L{ax + 6:.1f},{top - 27:.1f}" fill="none" class="k-good" '
+                     'stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>')
+
+        # Labels above the column: the certified figure, then what sits above it.
+        head = y(above[0]) if above else top - (36 if kind == "floor" else 0)
+        big = ("≥ " if kind == "floor" else "") + cs.compact(v)
+        if above:
+            nxt, verdict = above
+            sub = (f"{cs.compact(nxt)} YELLOW" if verdict == "yellow" else f"{cs.compact(nxt)} not carried")
+            o.append(cs.text(x(n), head - 30, big, size=16, role="ink", anchor="middle", weight=650))
+            o.append(cs.text(x(n), head - 12, sub, size=11, role="ink2", anchor="middle"))
+        else:
+            o.append(cs.text(x(n), head - 12, big, size=16, role="ink", anchor="middle", weight=650))
+
+        # Under the axis: size, per-node rate, and what kind of number it is.
+        o.append(cs.text(x(n), y(0) + 24, f"{n} nodes", size=13, role="ink", anchor="middle", weight=600))
+        o.append(cs.text(x(n), y(0) + 42, f"{v / n / 1000:.1f}k / node", size=12, role="ink2",
+                         anchor="middle", num=True))
+        o.append(cs.text(x(n), y(0) + 59, NOTE[kind].format(reps=reps), size=11, role="muted",
+                         anchor="middle"))
+
+    o.append(cs.text(32, H - 18, "source: " + c["source"], size=11, role="muted"))
     o.append("</svg>")
     return "\n".join(o) + "\n"
 
