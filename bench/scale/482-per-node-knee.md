@@ -33,9 +33,11 @@ consumers in 2 containers). What that pair lacked:
 
 `E = (C₇ / 7) / (C₅ / 5)`, where `C_N` is the highest total offered rate (msg/s)
 at which the N-node arm passes that rung **and every rung below it**. A rung
-passes when it is settled, drained, p99 ≤ 1000 ms (`LANE_E_P99_BUDGET_MS`), not
-PUBLISHERS LATE, no driver pinned, and the crossing gate certifies it (every
-broker ≤ 0.5%).
+passes (is GREEN) when it is settled, drained, p99 ≤ 1000 ms (`LANE_E_P99_BUDGET_MS`),
+not PUBLISHERS LATE, no driver pinned, nothing lost, and the crossing gate certifies
+it (every broker ≤ 0.5%). Since 2026-09-27 a lossless rung above 1000 ms is graded
+YELLOW (≤ 5000 ms) or RED rather than failed, and only loss fails a rung
+([ADR 0048](../../docs/adr/0048-comparative-benchmarking.md#amendment-2026-09-27-a-rung-fails-only-on-loss-p99-is-graded-green--yellow--red)).
 
 Example: N=5 knees at 10 sites and N=7 at 14 sites →
 `E = (420 000 / 7) / (300 000 / 5) = 60 000 / 60 000 = 1.00`.
@@ -217,8 +219,8 @@ documented for QoS 1 (`docs/benchmarks/QOS1-SCALE-CURVE.md`), appearing per host
 independent of N; spreading the softirq is a settled dead end (#505/#507/#508).
 
 **Next, if a knee is wanted:** extend both ladders past 78k/node on one
-provisioning (N=7 needs 19+ sites and a driver per site); expect the first failing
-rung on the brokers whose interrupt core saturates, at the same per-node rate at
+provisioning (N=7 needs 19+ sites and a driver per site); expect the first
+non-GREEN rung on the brokers whose interrupt core saturates, at the same per-node rate at
 both sizes.
 
 ## Read on every arm

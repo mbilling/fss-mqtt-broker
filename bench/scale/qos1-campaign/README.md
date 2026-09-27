@@ -14,7 +14,9 @@ provisioning. The wrapper always requests `full 3`; destruction remains trapped
 by run.sh. Raw evidence is written outside the worktree from the start.
 
 Predeclared acceptance: actual emission and per-site receipt at least 97% of
-offer, late publications at most 5%, p99 histogram upper bound at most 1000ms,
+offer, late publications at most 5%, p99 histogram upper bound at most 1000ms for
+a GREEN (certified) rung — since 2026-09-27 a lossless rung above it is graded
+YELLOW (<= 5000ms) or RED and reported, not failed (ADR 0048 amendment) —
 complete endpoints and stable processes, settled population, steady per-site
 receive rates before opening, successful pause/PUBACK completion, no drops or
 QoS downgrade, and an exact group-wide sent/acked/received identity ledger.

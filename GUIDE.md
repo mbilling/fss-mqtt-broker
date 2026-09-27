@@ -172,7 +172,10 @@ record of exactly what is built (77 ADRs, per-task status).
 
 **One Hetzner CCX23 (4 dedicated vCPU), all four brokers run on the same
 host in sequence, 2026-09-16.** The knee is the highest rate that still met
-**p99 ≤ 1 s** with ≥99% delivered, 1:1 QoS 0 publish/subscribe:
+**p99 ≤ 1 s** with ≥99% delivered, 1:1 QoS 0 publish/subscribe — the GREEN
+(certified) band. Since 2026-09-27 a rung fails only on loss, and a lossless
+rung above 1 s is graded YELLOW (≤ 5 s) or RED instead
+([ADR 0048](docs/adr/0048-comparative-benchmarking.md#amendment-2026-09-27-a-rung-fails-only-on-loss-p99-is-graded-green--yellow--red)):
 
 | broker | knee | p99 at knee | CPU idle at knee | RSS at knee |
 |---|---|---|---|---|

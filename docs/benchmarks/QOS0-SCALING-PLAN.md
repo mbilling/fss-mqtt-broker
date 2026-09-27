@@ -279,7 +279,8 @@ Every patch needs the failing mechanism test plus the same end-to-end comparison
 Before confirmatory capacity runs, declare the N range and these proposed gates:
 
 - `C(N)` is the greatest **sustained unique subscriber-received rate** within a
-  fixed p99 ≤1 second SLO, with no unexplained missing or duplicate IDs below
+  fixed p99 ≤1 second SLO (the GREEN band; the highest YELLOW rate, p99 ≤5 s and
+  no loss, is reported beside it — ADR 0048, 2026-09-27), with no unexplained missing or duplicate IDs below
   capacity and stable queues/memory. Sequence-cohort reconciliation after drain
   diagnoses loss; late drain receipts do not increase steady throughput or erase
   SLO violations. Quantized histogram buckets must resolve the SLO boundary.

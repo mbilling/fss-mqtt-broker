@@ -11,16 +11,24 @@ The question it answers: **at what offered rate does a single node stop
 meeting a p99 ≤ 1 s service level**, for each broker, on hardware nobody's
 laptop can flatter.
 
+> **Graded since 2026-09-27**
+> ([ADR 0048](../adr/0048-comparative-benchmarking.md#amendment-2026-09-27-a-rung-fails-only-on-loss-p99-is-graded-green--yellow--red)).
+> A rung now fails only on loss; a lossless rung is **GREEN** at p99 ≤ 1 s
+> (certified — the knees below), **YELLOW** at ≤ 5 s, **RED** above. This run
+> predates the change: its knees were qualified at ≥ 99% delivered, and its raw
+> runs were not retained, so **zero loss is not re-checked** for them. The
+> right-hand column is regraded from the latencies recorded here.
+
 ## The result
 
-| broker | version | **knee** | p99 at knee | broker CPU idle at knee | container RSS at knee | first failing rung |
+| broker | version | **knee** (GREEN) | p99 at knee | broker CPU idle at knee | container RSS at knee | next rung, graded |
 |---|---|---|---|---|---|---|
-| **mqttd** | 1.0.17 | **75 000 msg/s** | ≤500 ms | 30% mean / 21% min | 133 MiB | 90 000 — p99 ≤7.5 s |
-| **Mosquitto** | 2.0.20 | **45 000 msg/s** | ≤100 ms | 70% / 57% | **18 MiB** | 60 000 — p99 ≤10 s |
-| **EMQX** | 5.8.6 | **45 000 msg/s** | ≤500 ms | 2% / 0% | 434 MiB | 60 000 — p99 ≤25 s |
-| **HiveMQ CE** | 2024.3 | **30 000 msg/s** | ≤100 ms | 5% / 3% | 927 MiB | 45 000 — p99 ≤5 s |
+| **mqttd** | 1.0.17 | **75 000 msg/s** | ≤500 ms | 30% mean / 21% min | 133 MiB | 90 000 — **RED**, p99 ≤7.5 s, ledger whole |
+| **Mosquitto** | 2.0.20 | **45 000 msg/s** | ≤100 ms | 70% / 57% | **18 MiB** | 60 000 — **RED**, p99 ≤10 s |
+| **EMQX** | 5.8.6 | **45 000 msg/s** | ≤500 ms | 2% / 0% | 434 MiB | 60 000 — **RED**, p99 ≤25 s |
+| **HiveMQ CE** | 2024.3 | **30 000 msg/s** | ≤100 ms | 5% / 3% | 927 MiB | 45 000 — **YELLOW** if lossless, p99 ≤5 s; loss not recorded |
 
-**The knee is the highest rung that passed every gate**, and the ladder
+**The knee is the highest rung that passed every gate — the highest GREEN one**, and the ladder
 steps in 15 000 msg/s, so each figure is bracketed by its neighbour: mqttd's
 true knee is between 75 000 and 90 000, Mosquitto's and EMQX's between
 45 000 and 60 000, HiveMQ's between 30 000 and 45 000. A finer ladder would
@@ -41,8 +49,8 @@ put mqttd at 60 000 and Mosquitto at 30 000.
 
 ## What actually limited each broker
 
-The CPU column is the interesting one, because all four failed the same
-gate for different reasons.
+The CPU column is the interesting one, because all four left GREEN for
+different reasons.
 
 - **Mosquitto is core-bound, not CPU-bound.** Its *mean* idle never fell
   below 61% at any rung up to 150 000 msg/s, and its busiest single second
@@ -267,9 +275,11 @@ this lane with a different `HIVEMQ_HEAPSIZE` should say so beside the number.
 - **Per rung**: subscribers connect first; the window opens only once every
   client has connected; 60-second measurement window; publishers are then
   removed and the rung drains before its ledger is read.
-- **A rung passes** only if it delivered ≥99% of what was published, met
-  ≥95% of its offered rate, kept p99 ≤ 1 s, settled before the window, and
-  drained after it. Any one failure fails the rung.
+- **A rung passed** (in this run) only if it delivered ≥99% of what was
+  published, met ≥95% of its offered rate, kept p99 ≤ 1 s, settled before the
+  window, and drained after it. Since 2026-09-27 the harness applies zero loss
+  (FAILED), the offer and edge gates (NOT CARRIED) and the GREEN / YELLOW / RED
+  p99 bands instead; a re-run would be judged that way.
 - **Arms**: mqttd, Mosquitto, EMQX, HiveMQ CE, then mqttd again as the
   control, with a host reboot between arms.
 - **Harness**: `bench/scale/compare-brokers.sh`, rendered by

@@ -123,8 +123,8 @@ def collect(run: Path) -> dict:
                 "logs": (lambda m: m.group(1) if m else None)(re.search(r"from (\d+/\d+) container logs", txt)),
             }
         # lane E: the tenancy ladder. Each rung is a SITE count, so unlike lane B
-        # the x-axis is tenants rather than an offered rate — and a rung passes
-        # only if it also stayed inside its p99 budget.
+        # the x-axis is tenants rather than an offered rate — and each rung carries
+        # its verdict: GREEN/YELLOW/RED p99 band, FAILED (loss) or NOT CARRIED.
         laneE = size_dir / "laneE"
         if laneE.is_dir():
             e_rungs = []
@@ -133,6 +133,7 @@ def collect(run: Path) -> dict:
                     r = SC.lane_e_rung(rdir)
                 except Exception as exc:  # a partial rung must not sink the report
                     r = {"sites": int(rdir.name.split("-")[1]), "flags": [f"unparsed: {exc}"], "pass": False}
+                r["verdict"] = SC.rung_verdict(r)
                 if not r.get("incomplete"):
                     e_rungs.append(r)
             if e_rungs:
