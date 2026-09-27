@@ -44,17 +44,18 @@ CURVES = {
     "qos1": {
         "file": "scale-out-qos1.svg",
         "title": "QoS 1 scale-out: msg/s vs nodes — $share 1:1, QoS 1 both ways, 200 B, 4-vCPU nodes",
-        "subtitle": "3 and 5 nodes: separate provisionings, v1.0.17 · 7 and 10 nodes: one provisioning, main 0a08187, "
-                    "20 consumers per site · p99 ≤ 1 s, 0% crossing",
+        "subtitle": "3, 5: separate provisionings, v1.0.17 · 7, 10: one provisioning, main 0a08187, 20 consumers/site · "
+                    "10-node ✕: v1.0.18 · 0% crossing",
         "source": "source: docs/benchmarks/QOS1-SCALE-CURVE.md · audited emqtt-bench 0.6.3 (67bb4194…) · Hetzner fsn1",
-        "y_max": 450_000, "y_step": 100_000,
+        "y_max": 500_000, "y_step": 100_000,
         "per_node": 39_000,
         # QOS1-SCALE-CURVE.md, "The curve" and "7 and 10 nodes — one provisioning"
         "points": [
             (3, 120_000, "certified", "120k — 40.0k/node (3 + control)", None),
             (5, 180_000, "certified", "180k — 36.0k/node (3 + control)", None),
             (7, 270_000, "partial", "270k — 38.6k/node (2 of 3 certified)", 300_000),
-            (10, 390_000, "partial", "390k — 39.0k/node (1 of 3); knee not reached", None),
+            # 2026-09-27 knee run: 420k (42k/node) x2 with no failure signal, 450k fails
+            (10, 390_000, "partial", "390k — 39.0k/node (1 of 3); 450k fails", 450_000),
         ],
     },
 }

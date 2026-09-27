@@ -39,7 +39,7 @@ handling** — mqttd's own hot path had ~2× headroom at the knee. See
 | 3 | **120,000 msg/s** | **25.9 MB/s** | 40,000/s · 8.64 MB/s | 3 + control | 120,000.4/s | 0.001 % | ≤ 5 ms ± 5.2 ms clock |
 | 5 | **180,000 msg/s** | **38.9 MB/s** | 36,000/s · 7.78 MB/s | 3 + control | 180,001.3/s | 0.001 % | ≤ 5 ms ± 6.5 ms clock |
 | 7 | **270,000 msg/s** | **58.3 MB/s** | 38,571/s · 8.33 MB/s | 2 certified of 3 + control | 269,995/s (broker) | — | ≤ 500 ms |
-| 10 | **390,000 msg/s** | **84.2 MB/s** | 39,000/s · 8.42 MB/s | 1 certified of 3 + control | 390,002/s (broker) | — | ≤ 500 ms |
+| 10 | **390,000 msg/s** | **84.2 MB/s** | 39,000/s · 8.42 MB/s | 1 certified of 3 + control | 390,002/s (broker) | — | ≤ 500 ms; knee 42k–45k/node (2026-09-27) |
 
 The 7- and 10-node rows are a **different campaign** (2026-09-26, one provisioning;
 see [7 and 10 nodes](#7-and-10-nodes--one-provisioning-2026-09-26)), with 20
@@ -290,7 +290,52 @@ first campaign named:
 **10 nodes has no knee here.** Its 42k/node probe was skipped by the ladder's
 early stop, which counted the two INVALID EVIDENCE repetitions as failures. That
 counting is now fixed: evidence-only failures neither count toward the stop nor
-reset it.
+reset it. The knee was found the next day (below).
+
+### The 10-node knee (2026-09-27)
+
+**The 10-node QoS 1 knee lies between 42k and 45k msg/s per node**, which is
+420,000–450,000 msg/s for the cluster. That is at or just above 7 nodes' knee
+(38.6k pass, 42.9k fail): per-node QoS 1 capacity does not fall from 7 to 10.
+
+**Setup:**
+- One 10-node provisioning on **the released v1.0.18**, with the site shape,
+  audited driver and 20 drivers of the 7/10 campaign
+  (`bench/scale/qos1-campaign/knee-n10.env`).
+- A closing arm on the same hosts.
+- The fixed knee stop.
+
+**Checks:**
+- **Gates:** `GATE nodes=10 PASS` on both arms, crossing 0.00% on every broker
+  of every rung.
+- **Drift:** the closing 39k/node rung matched the opening one (389,999 vs
+  389,996/s, busiest broker 26% idle in both).
+- **Delivery:** zero drops and zero peer in-flight on every rung.
+
+| per node | sites | broker received/s | busiest broker idle | busiest driver idle | verdict |
+|---|---|---|---|---|---|
+| 36k | 12 | 360,006 | 28% | 61% | INVALID EVIDENCE only |
+| 39k | 13 | 389,996 | 26% | 62% | INVALID EVIDENCE only |
+| **42k** | 14 ×2 | 420,004 · 420,039 | 24–25% | 51–54% | INVALID EVIDENCE only — **no failure signal** |
+| **45k** | 15 ×2 | 450,075 · 449,966 | 22% | 51–54% | **PUBLISHERS LATE** (8%, 6%) + INVALID EVIDENCE |
+
+**The failure is the broker's.**
+- At QoS 1 a late publisher is a slow acknowledgement, and every driver was
+  ≥ 51% idle.
+- The ladder stopped on these two failing repetitions and skipped 48k and 51k.
+
+**Not certified.** In this run every rung from 36k/node up carried the INVALID
+EVIDENCE flag, so no high rung is certified, even though the brokers received
+the full offer every time.
+- **Cause:** the check allows the audited driver's `/metrics` scrapes at the
+  window's two edges a combined 2% of twice the window, which is 2.4 s at 60 s.
+- **What exceeds it:** under high load, emqtt-bench's Erlang Prometheus exporter,
+  with 750 clients per container, takes more than a second to render.
+- **This is a driver-side measurement limit, not broker behaviour.**
+- **Fix:** a longer QoS 1 window (`LANE_E_SECS=120` doubles the tolerance to
+  4.8 s) is the next change before this bracket can become a certified point.
+
+Run: `knee-20260926T213327Z` (untracked).
 
 ## The workload
 
