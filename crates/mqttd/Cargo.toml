@@ -20,6 +20,7 @@ reqwest = { workspace = true, features = ["json"] }
 async-trait = "0.1"
 serde = { workspace = true, features = ["derive"] }
 futures-util = { workspace = true }
+mimalloc = { workspace = true }
 serde_json.workspace = true
 mqtt-codec = { path = "../mqtt-codec", version = "1.0.0" }
 mqtt-core = { path = "../mqtt-core", version = "1.0.0" }

@@ -185,6 +185,14 @@
 //! and waits for a new export file to appear under the configured `[backup] dir`, so a cron job or
 //! a `kubectl exec` can take a backup on an image with no shell.
 
+/// The process allocator (ADR 0079). The shipped binary is static musl, whose
+/// `malloc` serializes concurrent allocation: with the tokio workers allocating
+/// beside it, the durable writer's commit cost 13.4 µs per op on musl against
+/// 3.9 µs on mimalloc (4 cores, the same commit). Binary only — the workspace's
+/// libraries leave the choice to whoever links them.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use mqtt_auth::basic::BasicAuthenticator;
 use mqtt_auth::{Authenticator, Authorizer};
 use mqtt_cluster::placement::{self, Placement, WriteFloor};
