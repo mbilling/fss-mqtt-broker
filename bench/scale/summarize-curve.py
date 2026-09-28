@@ -1160,6 +1160,14 @@ def self_test() -> None:
         for f in failures:
             print(f"FAIL {f}", file=sys.stderr)
         sys.exit(1)
+    # A knee arm's broker env is read from arm-env.txt beside results/, blank
+    # lines dropped; a run.sh run dir without one reports none.
+    with tempfile.TemporaryDirectory() as d:
+        arm = Path(d) / "2-n3"
+        (arm / "results").mkdir(parents=True)
+        assert arm_env(arm / "results") == [], "no arm-env.txt means no arm env"
+        (arm / "arm-env.txt").write_text("MQTTD_REPLICA_STORE=redb\n\n")
+        assert arm_env(arm / "results") == ["MQTTD_REPLICA_STORE=redb"]
     print(
         "summarize-curve self-test: publish double-count correction OK (6 cases); "
         "lane E validity OK (26 rungs + 6 ladders — a durable-labelled rung with no durable "
@@ -1876,6 +1884,16 @@ def render_durable_writer(rungs: list[dict]) -> str:
     return "\n".join(out)
 
 
+def arm_env(results: Path) -> list[str]:
+    """The per-arm broker env a knee campaign ran this arm with (arm-env.txt,
+    beside the arm's results/), so two arms on one provisioning that differ
+    only in configuration say which is which."""
+    f = results.parent / "arm-env.txt"
+    if not f.is_file():
+        return []
+    return [line.strip() for line in f.read_text().splitlines() if line.strip()]
+
+
 def main() -> None:
     if len(sys.argv) == 2 and sys.argv[1] == "--self-test":
         self_test()
@@ -1889,6 +1907,9 @@ def main() -> None:
 
     print("# Scale-curve summary (transcribe into docs/benchmarks/SCALE-CURVE.md)\n")
     print(f"sizes found: {[n for n, _ in found]}\n")
+    env = arm_env(root)
+    if env:
+        print(f"arm broker env (482-per-node-knee.sh): {', '.join(env)}\n")
 
     # barrier floors gate Curve 1
     print("## Per-host durability barrier floors (single writer, barriers/s)\n")

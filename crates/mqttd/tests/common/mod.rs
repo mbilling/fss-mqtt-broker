@@ -361,6 +361,7 @@ fn spawn_client_loop(
 #[must_use]
 pub fn permissive_policy(connect_timeout: Duration) -> Arc<ConnPolicy> {
     Arc::new(ConnPolicy {
+        anonymous: None,
         auth: mqttd::conn::auth_handle(Arc::new(mqtt_auth::basic::BasicAuthenticator {
             allow_anonymous: true,
         })),
@@ -1092,6 +1093,7 @@ pub mod enhanced {
         let mut secrets = std::collections::HashMap::new();
         secrets.insert(SUBJECT.to_string(), SECRET.to_vec());
         Arc::new(ConnPolicy {
+            anonymous: None,
             auth: mqttd::conn::auth_handle(Arc::new(mqtt_auth::basic::BasicAuthenticator {
                 allow_anonymous: true,
             })),

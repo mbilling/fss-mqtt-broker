@@ -2509,15 +2509,21 @@ impl<T: ReplicaTransport + Clone + 'static> ReplicatedLog for ClusterLog<T> {
         drop(state);
         // Local-first and lazy: propagate best-effort, do not gate on acks. The
         // node's own durable copy truncates too (ADR 0042 T8) — best-effort, since
-        // a failure only leaves a lower watermark (the safe direction).
+        // a failure only leaves a lower watermark (the safe direction). The
+        // followers are told concurrently: the caller (the hub's truncate
+        // flusher) holds one of a few slots for the whole call, so a sequential
+        // fan-out made every truncate cost the SUM of the round trips.
         if let Some(op) = op {
             let _ = self.local_ack(self.lease.epoch, &op).await;
+            let mut sends = tokio::task::JoinSet::new();
             for follower in &self.followers {
-                let _ = self
-                    .transport
-                    .deliver(follower, self.lease.epoch, &op)
-                    .await;
+                let transport = self.transport.clone();
+                let follower = follower.clone();
+                let op = op.clone();
+                let epoch = self.lease.epoch;
+                sends.spawn(async move { transport.deliver(&follower, epoch, &op).await });
             }
+            while sends.join_next().await.is_some() {}
         }
         Ok(())
     }

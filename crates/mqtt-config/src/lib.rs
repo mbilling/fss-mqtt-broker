@@ -107,6 +107,20 @@ pub struct Listeners {
     pub health_bind: Option<String>,
     /// Optional separate `/metrics` listener (`MQTTD_METRICS_BIND`), to isolate the scrape.
     pub metrics_bind: Option<String>,
+    /// Per-listener anonymous access (issue #669): each overrides
+    /// [`Security::allow_anonymous`] for its listener alone, and unset inherits it — so a
+    /// plaintext listener on a trusted segment can admit anonymous clients while the TLS
+    /// listener requires credentials. Env `MQTTD_<LISTENER>_ALLOW_ANONYMOUS` takes
+    /// `1/true/on/yes` or `0/false/off/no`. Restart-scoped, like the binds.
+    pub tls_allow_anonymous: Option<bool>,
+    /// See [`Listeners::tls_allow_anonymous`] (`MQTTD_PLAINTEXT_ALLOW_ANONYMOUS`).
+    pub plaintext_allow_anonymous: Option<bool>,
+    /// See [`Listeners::tls_allow_anonymous`] (`MQTTD_WS_ALLOW_ANONYMOUS`).
+    pub ws_allow_anonymous: Option<bool>,
+    /// See [`Listeners::tls_allow_anonymous`] (`MQTTD_WSS_ALLOW_ANONYMOUS`).
+    pub wss_allow_anonymous: Option<bool>,
+    /// See [`Listeners::tls_allow_anonymous`] (`MQTTD_QUIC_ALLOW_ANONYMOUS`).
+    pub quic_allow_anonymous: Option<bool>,
 }
 
 /// TLS material for the client listeners. Paths, never inlined key bytes (ADR 0046 T5).
@@ -158,6 +172,15 @@ pub struct Security {
     pub mtls_identity_source: Option<String>,
     /// Argon2id `username:phc-hash` password file (`MQTTD_PASSWORD_FILE`).
     pub password_file: Option<String>,
+    /// Require BOTH factors from a client that presents a verified certificate
+    /// (`MQTTD_REQUIRE_PASSWORD_WITH_CERTIFICATE`, issue #670): its CONNECT must also carry
+    /// a username equal to the certificate identity and a password that verifies for it.
+    /// Default `false`: the certificate alone admits the client and any wire credential is
+    /// ignored (ADR 0004). Needs `tls.client_ca` and a password verifier
+    /// (`password_file` or `http_auth`). Certificate-less clients are not affected — on a
+    /// TLS listener with a client CA the handshake already refuses them. Hot-reloadable; a
+    /// change applies to new CONNECTs — established sessions are not re-authenticated.
+    pub require_password_with_certificate: bool,
     /// Topic-ACL TOML policy file (`MQTTD_ACL_FILE`); without it authorization is not
     /// enforced and loudly logged.
     pub acl_file: Option<String>,
@@ -181,6 +204,7 @@ impl Default for Security {
             require_client_cert: true,
             mtls_identity_source: None,
             password_file: None,
+            require_password_with_certificate: false,
             acl_file: None,
             jwt: Jwt::default(),
             oidc: Oidc::default(),
@@ -1055,6 +1079,17 @@ impl Config {
             v.parse::<T>()
                 .map_err(|e| ConfigError::Invalid(format!("{key}: invalid value {v:?}: {e}")))
         }
+        // An explicit on/off for a security toggle: anything else is an error, never a
+        // guess in either direction.
+        fn on_off(key: &str, v: &str) -> Result<bool, ConfigError> {
+            match v.to_ascii_lowercase().as_str() {
+                "1" | "true" | "on" | "yes" => Ok(true),
+                "0" | "false" | "off" | "no" => Ok(false),
+                _ => Err(ConfigError::Invalid(format!(
+                    "{key}: invalid value {v:?}: expected 1/true/on/yes or 0/false/off/no"
+                ))),
+            }
+        }
         fn list(v: &str) -> Vec<String> {
             v.split(',')
                 .map(str::trim)
@@ -1110,6 +1145,22 @@ impl Config {
         on!("MQTTD_QUIC_BIND", v, {
             self.listeners.quic_bind = Some(v);
         });
+        on!("MQTTD_TLS_ALLOW_ANONYMOUS", v, {
+            self.listeners.tls_allow_anonymous = Some(on_off("MQTTD_TLS_ALLOW_ANONYMOUS", &v)?);
+        });
+        on!("MQTTD_PLAINTEXT_ALLOW_ANONYMOUS", v, {
+            self.listeners.plaintext_allow_anonymous =
+                Some(on_off("MQTTD_PLAINTEXT_ALLOW_ANONYMOUS", &v)?);
+        });
+        on!("MQTTD_WS_ALLOW_ANONYMOUS", v, {
+            self.listeners.ws_allow_anonymous = Some(on_off("MQTTD_WS_ALLOW_ANONYMOUS", &v)?);
+        });
+        on!("MQTTD_WSS_ALLOW_ANONYMOUS", v, {
+            self.listeners.wss_allow_anonymous = Some(on_off("MQTTD_WSS_ALLOW_ANONYMOUS", &v)?);
+        });
+        on!("MQTTD_QUIC_ALLOW_ANONYMOUS", v, {
+            self.listeners.quic_allow_anonymous = Some(on_off("MQTTD_QUIC_ALLOW_ANONYMOUS", &v)?);
+        });
         on!("MQTTD_HEALTH_BIND", v, {
             self.listeners.health_bind = Some(v);
         });
@@ -1150,6 +1201,12 @@ impl Config {
         });
         on!("MQTTD_PASSWORD_FILE", v, {
             self.security.password_file = Some(v);
+        });
+        on!("MQTTD_REQUIRE_PASSWORD_WITH_CERTIFICATE", v, {
+            self.security.require_password_with_certificate = !matches!(
+                v.to_ascii_lowercase().as_str(),
+                "0" | "false" | "off" | "no"
+            );
         });
         on!("MQTTD_ACL_FILE", v, {
             self.security.acl_file = Some(v);
@@ -1578,6 +1635,26 @@ impl Config {
                 "tls.crl requires tls.client_ca".to_string(),
             ));
         }
+        // Both factors (issue #670): a requirement that can never apply is refused rather
+        // than silently inert, like the CRL-without-CA rule above. Without a client CA no
+        // certificate is ever verified; without a password verifier no password could pass.
+        if self.security.require_password_with_certificate {
+            if self.tls.client_ca.is_none() {
+                return Err(ConfigError::Invalid(
+                    "security.require_password_with_certificate requires tls.client_ca: \
+                     without a client CA no certificate is verified, so there is none to \
+                     pair a password with"
+                        .to_string(),
+                ));
+            }
+            if self.security.password_file.is_none() && self.security.http_auth.url.is_none() {
+                return Err(ConfigError::Invalid(
+                    "security.require_password_with_certificate requires a password \
+                     verifier: security.password_file or security.http_auth.url"
+                        .to_string(),
+                ));
+            }
+        }
         if self.cluster.peer_tls.crl.is_some()
             && (self.cluster.peer_tls.ca.is_none()
                 || self.cluster.peer_tls.cert.is_none()
@@ -1662,6 +1739,30 @@ impl Config {
                     .to_string(),
             ));
         }
+        // OIDC beside a static JWT verifier: the auth chain stops at the first real verdict
+        // on a credential kind, so one would shadow the other — mutually exclusive (ADR
+        // 0050 §1, no silent fallback between key sources). Here rather than in the
+        // authenticator builder so the static `--check-config` refuses it too (issue #671).
+        if self.security.oidc.issuer.is_some()
+            && (self.security.jwt.hs256_secret_file.is_some()
+                || self.security.jwt.rs256_pem_file.is_some())
+        {
+            return Err(ConfigError::Invalid(
+                "security.oidc.issuer (MQTTD_OIDC_ISSUER) and security.jwt (MQTTD_JWT_*) are \
+                 mutually exclusive: configure one token verifier"
+                    .to_string(),
+            ));
+        }
+        // Membership gossips this node's peer-link address, so gossip without a peer
+        // listener has nothing to advertise. Refused here rather than at SWIM startup so
+        // `--check-config` and a reload catch it too (issue #671).
+        if self.cluster.swim.bind.is_some() && self.cluster.peer_bind.is_none() {
+            return Err(ConfigError::Invalid(
+                "cluster.swim.bind requires cluster.peer_bind (MQTTD_PEER_BIND): membership \
+                 gossips the peer-link address so other nodes can dial us"
+                    .to_string(),
+            ));
+        }
         // Ephemeral durability without the explicit opt-in (issue #240, ADR 0029
         // as-delivered): durable ON + no data_dir is quorum-of-RAM — refused rather
         // than warned. Checked last so a config broken in a more specific way is
@@ -1735,6 +1836,11 @@ pub const ENV_VARS: &[&str] = &[
     "MQTTD_QUIC_BIND",
     "MQTTD_HEALTH_BIND",
     "MQTTD_METRICS_BIND",
+    "MQTTD_TLS_ALLOW_ANONYMOUS",
+    "MQTTD_PLAINTEXT_ALLOW_ANONYMOUS",
+    "MQTTD_WS_ALLOW_ANONYMOUS",
+    "MQTTD_WSS_ALLOW_ANONYMOUS",
+    "MQTTD_QUIC_ALLOW_ANONYMOUS",
     // tls
     "MQTTD_TLS_CERT",
     "MQTTD_TLS_KEY",
@@ -1747,6 +1853,7 @@ pub const ENV_VARS: &[&str] = &[
     "MQTTD_ALLOW_ANONYMOUS",
     "MQTTD_MTLS_IDENTITY_SOURCE",
     "MQTTD_PASSWORD_FILE",
+    "MQTTD_REQUIRE_PASSWORD_WITH_CERTIFICATE",
     "MQTTD_ACL_FILE",
     "MQTTD_JWT_HS256_SECRET_FILE",
     "MQTTD_JWT_RS256_PEM",
@@ -2167,6 +2274,80 @@ mod tests {
         );
     }
 
+    /// Issue #670: requiring both factors is refused when it could never apply — no client
+    /// CA (no certificate is ever verified) or no password verifier (no password could
+    /// pass) — and accepted with either verifier.
+    #[test]
+    fn requiring_both_factors_needs_a_client_ca_and_a_password_verifier() {
+        let flag = "[durable]\nallow_ephemeral = true\n";
+        let invalid = |toml: &str| match Config::from_toml(&format!("{toml}{flag}")) {
+            Err(super::ConfigError::Invalid(m)) => m,
+            other => panic!("expected a validation error for:\n{toml}\ngot {other:?}"),
+        };
+        let m = invalid(
+            "[security]\nrequire_password_with_certificate = true\n\
+             password_file = \"/etc/mqttd/passwd\"\n",
+        );
+        assert!(m.contains("requires tls.client_ca"), "{m}");
+        let m = invalid(
+            "[tls]\nclient_ca = \"/etc/mqttd/ca.pem\"\n\
+             [security]\nrequire_password_with_certificate = true\n",
+        );
+        assert!(m.contains("requires a password verifier"), "{m}");
+        for verifier in [
+            "password_file = \"/etc/mqttd/passwd\"\n",
+            "[security.http_auth]\nurl = \"https://auth.example/mqtt\"\n",
+        ] {
+            let toml = format!(
+                "[tls]\nclient_ca = \"/etc/mqttd/ca.pem\"\n\
+                 [security]\nrequire_password_with_certificate = true\n{verifier}{flag}"
+            );
+            let c = Config::from_toml(&toml).unwrap_or_else(|e| panic!("{toml}: {e}"));
+            assert!(c.security.require_password_with_certificate);
+        }
+        // Off by default, and the env overlay's off-spellings keep it off.
+        assert!(!Config::default().security.require_password_with_certificate);
+        for (v, want) in [("1", true), ("true", true), ("0", false), ("off", false)] {
+            let mut c = Config::default();
+            c.overlay_from(getter(&[("MQTTD_REQUIRE_PASSWORD_WITH_CERTIFICATE", v)]))
+                .unwrap();
+            assert_eq!(c.security.require_password_with_certificate, want, "{v}");
+        }
+    }
+
+    /// Issue #669: each listener's anonymous override is tri-state — unset inherits
+    /// `security.allow_anonymous` — parses from TOML, and from the env only as an explicit
+    /// on/off (a typo in a security toggle is an error, not a guess).
+    #[test]
+    fn per_listener_anonymous_overrides_are_tri_state() {
+        let c = Config::default();
+        assert_eq!(
+            c.listeners.plaintext_allow_anonymous, None,
+            "unset = inherit"
+        );
+        let c = Config::from_toml(
+            "[listeners]\nplaintext_allow_anonymous = true\ntls_allow_anonymous = false\n\
+             [durable]\nallow_ephemeral = true\n",
+        )
+        .unwrap();
+        assert_eq!(c.listeners.plaintext_allow_anonymous, Some(true));
+        assert_eq!(c.listeners.tls_allow_anonymous, Some(false));
+        assert_eq!(c.listeners.ws_allow_anonymous, None);
+        for (v, want) in [("1", true), ("yes", true), ("off", false), ("FALSE", false)] {
+            let mut c = Config::default();
+            c.overlay_from(getter(&[("MQTTD_WSS_ALLOW_ANONYMOUS", v)]))
+                .unwrap();
+            assert_eq!(c.listeners.wss_allow_anonymous, Some(want), "{v}");
+        }
+        let err = Config::default()
+            .overlay_from(getter(&[("MQTTD_QUIC_ALLOW_ANONYMOUS", "maybe")]))
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("MQTTD_QUIC_ALLOW_ANONYMOUS"),
+            "{err}"
+        );
+    }
+
     #[test]
     fn per_var_boolean_conventions_are_honoured() {
         // MQTTD_ALLOW_ANONYMOUS: *any* value means "on" (the footgun a naive flatten hits).
@@ -2370,8 +2551,16 @@ mod tests {
     /// a parseable one; everything else takes an arbitrary non-empty string.
     fn distinct_value(var: &str) -> &'static str {
         match var {
-            // Data-safe defaults are ON, so only a falsey value *changes* them.
-            "MQTTD_DURABLE_SESSIONS" | "MQTTD_REFOUND_GUARD" | "MQTTD_SHARED_PREFER_LOCAL" => "off",
+            // Data-safe defaults are ON, so only a falsey value *changes* them; the per-listener
+            // anonymous overrides are tri-state (unset = inherit), so any explicit value does.
+            "MQTTD_DURABLE_SESSIONS"
+            | "MQTTD_REFOUND_GUARD"
+            | "MQTTD_SHARED_PREFER_LOCAL"
+            | "MQTTD_TLS_ALLOW_ANONYMOUS"
+            | "MQTTD_PLAINTEXT_ALLOW_ANONYMOUS"
+            | "MQTTD_WS_ALLOW_ANONYMOUS"
+            | "MQTTD_WSS_ALLOW_ANONYMOUS"
+            | "MQTTD_QUIC_ALLOW_ANONYMOUS" => "off",
             // A fraction whose default is 1.0 (= today's behaviour), so only a SMALLER
             // fraction moves the config. Quantised to per mille on the way in: 0.5 -> 500.
             "MQTTD_SHARED_LOCAL_BIAS" => "0.5",
@@ -2488,6 +2677,25 @@ mod tests {
         assert_eq!(c.security.mtls_identity_source.as_deref(), Some("san-uri"));
     }
 
+    /// Issue #671: gossip advertises the peer-link address, so a SWIM bind without a peer
+    /// bind is refused at validation — by startup, reload and `--check-config` alike —
+    /// rather than first at SWIM startup.
+    #[test]
+    fn a_swim_bind_requires_a_peer_bind() {
+        let flag = "\n[durable]\nallow_ephemeral = true\n";
+        let err = Config::from_toml(&format!("[cluster.swim]\nbind = \"127.0.0.1:7946\"{flag}"))
+            .unwrap_err();
+        match err {
+            super::ConfigError::Invalid(m) => assert!(m.contains("requires cluster.peer_bind")),
+            super::ConfigError::Parse(m) => panic!("wrong error kind: {m}"),
+        }
+        assert!(Config::from_toml(&format!(
+            "[cluster]\npeer_bind = \"127.0.0.1:7001\"\n\
+             [cluster.swim]\nbind = \"127.0.0.1:7946\"{flag}"
+        ))
+        .is_ok());
+    }
+
     #[test]
     fn the_gossip_key_is_inline_xor_by_reference() {
         // Either form alone validates; both together is rejected (ADR 0046 T5).
@@ -2551,8 +2759,10 @@ mod tests {
             // MQTTD_TLS_ALLOW_UNSAFE_TLS12_FEATURES / MQTTD_CONFIG_UNKNOWN_KEYS /
             // MQTTD_AUDIT_SYSLOG (0070-T3: overlay already consumed them),
             // plus MQTTD_SHARED_LOCAL_BIAS (issue #613 item 3.4: the locality dial
-            // that turns MQTTD_SHARED_PREFER_LOCAL's on/off into a fraction).
-            95,
+            // that turns MQTTD_SHARED_PREFER_LOCAL's on/off into a fraction),
+            // plus MQTTD_REQUIRE_PASSWORD_WITH_CERTIFICATE (issue #670),
+            // plus the five MQTTD_<LISTENER>_ALLOW_ANONYMOUS overrides (issue #669).
+            101,
             "the MQTTD_* surface changed — update ENV_VARS"
         );
         // Issue #239: MQTTD_MIN_REPLICAS was wired in `overlay_from` but never

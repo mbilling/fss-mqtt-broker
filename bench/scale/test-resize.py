@@ -16,7 +16,8 @@ SCALE = Path(__file__).resolve().parent
 STUB = '''#!/usr/bin/env python3
 import json, os, sys
 argv = [os.path.basename(sys.argv[0])] + sys.argv[1:]
-env = {k: os.environ.get(k, "") for k in ("LANE_E_SITES_OVERRIDE", "KEEP_INFRA", "RUN_DIR", "PREFLIGHT_ONLY", "DRIVER_COUNT")}
+env = {k: os.environ.get(k, "") for k in ("LANE_E_SITES_OVERRIDE", "KEEP_INFRA", "RUN_DIR", "PREFLIGHT_ONLY", "DRIVER_COUNT",
+                                    "EXTRA_BROKER_ENV")}
 with open(os.environ["CALL_LOG"], "a") as f:
     f.write(json.dumps({"argv": argv, "env": env}) + "\\n")
 fail_on = os.environ.get("FAIL_ON")
@@ -329,6 +330,32 @@ class CampaignTests(Rig):
         self.assertNotEqual(r.returncode, 0)
         self.assertEqual(self.steps(), ["run.sh", "teardown.sh"])
 
+    def test_each_arm_runs_with_its_own_broker_env(self):
+        """Two configurations on ONE provisioning (the ADR 0078 A/B): the arm's
+        env follows the global EXTRA_BROKER_ENV, so it wins, reaches the broker
+        env of exactly that arm, and is recorded beside the arm's results."""
+        arms = "7:18:1 7:MQTTD_REPLICA_STORE=redb; 7:18:1 7:MQTTD_REPLICA_STORE=log, MQTTD_STORE_SHARDS=2"
+        r = self.campaign(env={"KNEE_ARMS": arms, "EXTRA_BROKER_ENV": "MQTTD_X=1"})
+        self.assertEqual(r.returncode, 0, r.stderr)
+        calls = self.calls()
+        first = calls[0]
+        self.assertEqual(first["argv"][0], "run.sh")
+        self.assertEqual(first["env"]["EXTRA_BROKER_ENV"], "MQTTD_X=1\nMQTTD_REPLICA_STORE=redb")
+        boot = [c for c in calls if c["argv"][0] == "bootstrap-cluster.sh"]
+        self.assertEqual([b["env"]["EXTRA_BROKER_ENV"] for b in boot],
+                         ["MQTTD_X=1\nMQTTD_REPLICA_STORE=log\nMQTTD_STORE_SHARDS=2"])
+        arm1 = Path(first["env"]["RUN_DIR"])
+        self.assertEqual((arm1 / "arm-env.txt").read_text(), "MQTTD_X=1\nMQTTD_REPLICA_STORE=redb\n")
+        self.assertEqual((arm1.parent / "2-n7" / "arm-env.txt").read_text(),
+                         "MQTTD_X=1\nMQTTD_REPLICA_STORE=log\nMQTTD_STORE_SHARDS=2\n")
+
+    def test_an_arm_without_env_keeps_the_global_one(self):
+        r = self.campaign(env={"KNEE_ARMS": "7:18:1 7; 5:10:1 5", "EXTRA_BROKER_ENV": "MQTTD_X=1"})
+        self.assertEqual(r.returncode, 0, r.stderr)
+        envs = [c["env"]["EXTRA_BROKER_ENV"] for c in self.calls()
+                if c["argv"][0] in ("run.sh", "bootstrap-cluster.sh")]
+        self.assertEqual(envs, ["MQTTD_X=1", "MQTTD_X=1"])
+
     def test_refuses_to_be_told_how_to_manage_the_cluster(self):
         for env, message in (({"KEEP_INFRA": "1"}, "do not set KEEP_INFRA"),
                              ({"RUN_DIR": "/x"}, "do not set RUN_DIR"),
@@ -338,6 +365,8 @@ class CampaignTests(Rig):
                              ({"KNEE_ARMS": "7:18:1 7; 5:20:1 5"}, "more than the 18 the first arm provisions"),
                              ({"KNEE_ARMS": "7:18:1 7; 5:x:1 5"}, "is not <brokers>:<drivers>:<ladder>"),
                              ({"KNEE_ARMS": "7:18:1 7; 5:10:"}, "is not <brokers>:<drivers>:<ladder>"),
+                             ({"KNEE_ARMS": "7:18:1 7; 5:10:1 5:RUST_LOG=debug"}, "is not MQTTD_<NAME>=<value>"),
+                             ({"KNEE_ARMS": "7:18:1 7; 5:10:1 5:MQTTD_A=1 2"}, "is not MQTTD_<NAME>=<value>"),
                              ({"DRIVER_COUNT": "10"}, "must equal the first arm's drivers (18)")):
             with self.subTest(env=env):
                 r = self.campaign(env=env)

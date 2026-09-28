@@ -5,9 +5,16 @@
 #   PREFLIGHT_ONLY=1 ./482-per-node-knee.sh       # offline: every arm's shape
 #   ./482-per-node-knee.sh                        # PAID: provisions the first arm once
 #
-# KNEE_ARMS is a ';'-separated list of arms, each `<brokers>:<drivers>:<ladder>`:
+# KNEE_ARMS is a ';'-separated list of arms, each `<brokers>:<drivers>:<ladder>`,
+# optionally followed by `:<broker env>` — comma-separated KEY=VALUE lines added
+# to that arm's mqttd env after any global EXTRA_BROKER_ENV (so they win):
 #
 #   KNEE_ARMS="10:20:1 10 20 30; 7:14:1 7 14 21; 10:20:1 20"
+#   KNEE_ARMS="3:8:3 6 9:MQTTD_REPLICA_STORE=redb; 3:8:3 6 9:MQTTD_REPLICA_STORE=log"
+#
+# Every arm starts from empty stores, so a store-changing variable is safe to
+# vary per arm: that is how two configurations are compared on the SAME
+# hardware (two provisionings differ by ~40%; the disks alone by 3.5x).
 #
 # The FIRST arm is provisioned by run.sh at its size, with DRIVER_COUNT drivers
 # (which must equal its <drivers>), and is the provisioning every later arm
@@ -34,15 +41,25 @@ set -euo pipefail
 
 : "${KNEE_ARMS:?source a knee env first (KNEE_ARMS=<brokers>:<drivers>:<ladder>;...)}"
 # Parse once, refuse early: a malformed arm must not surface after provisioning.
-ARM_N=() ARM_D=() ARM_L=()
+ARM_N=() ARM_D=() ARM_L=() ARM_E=()
 IFS=';' read -r -a _arms <<<"$KNEE_ARMS"
 for _a in "${_arms[@]}"; do
 	_a="$(echo "$_a" | sed 's/^ *//; s/ *$//')"
 	[ -n "$_a" ] || continue
-	IFS=':' read -r _n _d _l <<<"$_a"
+	IFS=':' read -r _n _d _l _e <<<"$_a"
 	[[ "$_n" =~ ^[1-9][0-9]*$ && "$_d" =~ ^[1-9][0-9]*$ && -n "${_l// /}" ]] ||
-		die "KNEE_ARMS: '$_a' is not <brokers>:<drivers>:<ladder>"
-	ARM_N+=("$_n") ARM_D+=("$_d") ARM_L+=("$_l")
+		die "KNEE_ARMS: '$_a' is not <brokers>:<drivers>:<ladder>[:<broker env>]"
+	_env=""
+	if [ -n "${_e// /}" ]; then
+		IFS=',' read -r -a _kvs <<<"$_e"
+		for _kv in "${_kvs[@]}"; do
+			_kv="$(echo "$_kv" | sed 's/^ *//; s/ *$//')"
+			[[ "$_kv" =~ ^MQTTD_[A-Z0-9_]+=[^[:space:]]*$ ]] ||
+				die "KNEE_ARMS: '$_kv' in '$_a' is not MQTTD_<NAME>=<value>"
+			_env+="${_env:+$'\n'}$_kv"
+		done
+	fi
+	ARM_N+=("$_n") ARM_D+=("$_d") ARM_L+=("$_l") ARM_E+=("$_env")
 done
 [ "${#ARM_N[@]}" -ge 2 ] || die "KNEE_ARMS needs at least two arms (a comparison), got ${#ARM_N[@]}"
 for ((k = 1; k < ${#ARM_N[@]}; k++)); do
@@ -61,7 +78,7 @@ if [ "${PREFLIGHT_ONLY:-0}" = 1 ]; then
 	# with ITS driver count, which is what its ladder will be dealt over.
 	pre="$(mktemp -d "${TMPDIR:-/tmp}/knee-preflight.XXXXXX")"
 	for ((k = 0; k < ${#ARM_N[@]}; k++)); do
-		say "preflight: arm $((k + 1)) — ${ARM_N[$k]} nodes, ${ARM_D[$k]} drivers, ladder: ${ARM_L[$k]}"
+		say "preflight: arm $((k + 1)) — ${ARM_N[$k]} nodes, ${ARM_D[$k]} drivers, ladder: ${ARM_L[$k]}${ARM_E[$k]:+, env: ${ARM_E[$k]//$'\n'/ }}"
 		RUN_DIR="$pre/$((k + 1))-n${ARM_N[$k]}" DRIVER_COUNT="${ARM_D[$k]}" LANE_E_SITES_OVERRIDE="${ARM_L[$k]}" \
 			"$SCALE_DIR/run.sh" full "${ARM_N[$k]}"
 	done
@@ -121,21 +138,28 @@ swap_bad_brokers() {
 	done <"$marker"
 }
 
+# arm_env <k>: the broker env arm k runs with — the global EXTRA_BROKER_ENV,
+# then the arm's own lines, which therefore win.
+arm_env() {
+	printf '%s' "${EXTRA_BROKER_ENV:-}${EXTRA_BROKER_ENV:+${ARM_E[$1]:+$'\n'}}${ARM_E[$1]}"
+}
+
 # run.sh's per-size tail (run-curve, collect, observe) for an arm that
 # resize-cluster.sh + bootstrap-cluster.sh brought up instead of run.sh.
-resized_arm() { # resized_arm <size> <drivers> <arm-dir> <ladder> [retry]
-	local n="$1" d="$2" dir="$3" ladder="$4" retry="${5:-0}" rc=0
-	say "════ arm $(basename "$dir"): $n nodes, $d drivers, on the same hosts — ladder: $ladder ════"
+resized_arm() { # resized_arm <size> <drivers> <arm-dir> <ladder> <broker-env> [retry]
+	local n="$1" d="$2" dir="$3" ladder="$4" env="$5" retry="${6:-0}" rc=0
+	say "════ arm $(basename "$dir"): $n nodes, $d drivers, on the same hosts — ladder: $ladder${env:+ — broker env: ${env//$'\n'/ }} ════"
 	ARM_DIR="$dir" ARM_INV="$dir/inventory-$n.json"
 	"$SCALE_DIR/resize-cluster.sh" "$FULL_INV" "$n" "$dir" "$d"
-	"$SCALE_DIR/bootstrap-cluster.sh" "$dir" "$dir/inventory-$n.json" durable
+	mkdir -p "$dir" && printf '%s\n' "$env" >"$dir/arm-env.txt"
+	EXTRA_BROKER_ENV="$env" "$SCALE_DIR/bootstrap-cluster.sh" "$dir" "$dir/inventory-$n.json" durable
 	if [ "${OBSERVE:-1}" = 1 ]; then
 		"$SCALE_DIR/observe.sh" attach "$dir" "$dir/inventory-$n.json" || warn "observe attach failed — continuing unobserved"
 	fi
 	LANE_E_SITES_OVERRIDE="$ladder" "$SCALE_DIR/run-curve.sh" "$dir" "$dir/inventory-$n.json" || rc=$?
 	if [ "$rc" -ne 0 ]; then
 		if [ "$retry" = 0 ] && swap_bad_brokers "$dir" "$n"; then
-			resized_arm "$n" "$d" "$dir-r2" "$ladder" 1
+			resized_arm "$n" "$d" "$dir-r2" "$ladder" "$env" 1
 			return
 		fi
 		return "$rc"
@@ -151,19 +175,20 @@ A1="1-n${ARM_N[0]}"
 ARM_DIR="$CAMPAIGN/$A1" ARM_INV="$CAMPAIGN/$A1/inventory-${ARM_N[0]}.json"
 say "════ arm $A1: provision ${ARM_N[0]} brokers + ${ARM_D[0]} drivers, ladder: ${ARM_L[0]} ════"
 rc=0
-KEEP_INFRA=1 RUN_DIR="$ARM_DIR" LANE_E_SITES_OVERRIDE="${ARM_L[0]}" \
+mkdir -p "$ARM_DIR" && arm_env 0 >"$ARM_DIR/arm-env.txt" && echo >>"$ARM_DIR/arm-env.txt"
+KEEP_INFRA=1 RUN_DIR="$ARM_DIR" LANE_E_SITES_OVERRIDE="${ARM_L[0]}" EXTRA_BROKER_ENV="$(arm_env 0)" \
 	"$SCALE_DIR/run.sh" full "${ARM_N[0]}" || rc=$?
 FULL_INV="$ARM_INV"
 [ -f "$FULL_INV" ] || die "arm $A1 left no inventory at $FULL_INV"
 DONE_ARMS=("$A1")
 if [ "$rc" -ne 0 ]; then
 	swap_bad_brokers "$CAMPAIGN/$A1" "${ARM_N[0]}" || exit "$rc"
-	resized_arm "${ARM_N[0]}" "${ARM_D[0]}" "$CAMPAIGN/$A1-r2" "${ARM_L[0]}" 1
+	resized_arm "${ARM_N[0]}" "${ARM_D[0]}" "$CAMPAIGN/$A1-r2" "${ARM_L[0]}" "$(arm_env 0)" 1
 	DONE_ARMS=("$LAST_ARM")
 fi
 
 for ((k = 1; k < ${#ARM_N[@]}; k++)); do
-	resized_arm "${ARM_N[$k]}" "${ARM_D[$k]}" "$CAMPAIGN/$((k + 1))-n${ARM_N[$k]}" "${ARM_L[$k]}"
+	resized_arm "${ARM_N[$k]}" "${ARM_D[$k]}" "$CAMPAIGN/$((k + 1))-n${ARM_N[$k]}" "${ARM_L[$k]}" "$(arm_env "$k")"
 	DONE_ARMS+=("$LAST_ARM")
 done
 

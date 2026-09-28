@@ -148,6 +148,7 @@ async fn start_reloadable_tls_node(cert: PathBuf, key: PathBuf) -> (SocketAddr, 
             tokio::spawn(async move {
                 if let Ok(tls) = acceptor.accept(stream).await {
                     let policy = Arc::new(mqttd::conn::ConnPolicy {
+                        anonymous: None,
                         auth,
                         authz,
                         identity_source: mqtt_auth::mtls::IdentitySource::default(),
