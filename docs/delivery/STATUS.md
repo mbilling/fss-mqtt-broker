@@ -85,7 +85,7 @@
 | [0075](../adr/0075-pipelined-durable-appends.md) | # 0075. Pipelined durable appends — the window stops paying the round trip per message | Accepted | [1/1 done](0075-pipelined-durable-appends.md) | — |
 | [0076](../adr/0076-self-measuring-sharded-store.md) | # 0076. The self-measuring sharded store — the volume's capacity becomes the broker's business | Accepted | [3/3 done](0076-self-measuring-sharded-store.md) | — |
 | [0077](../adr/0077-workload-targeted-performance.md) | # 0077. Workload-targeted performance — a shape is not a result without its tail | Proposed | [6/10 done](0077-workload-targeted-performance.md) | 4 open |
-| [0078](../adr/0078-replica-segment-log.md) | # 0078. The replica store becomes an append-only segment log — the disk is the limit, not the B-tree | Accepted | [2/4 done](0078-replica-segment-log.md) | 2 open |
+| [0078](../adr/0078-replica-segment-log.md) | # 0078. The replica store becomes an append-only segment log — the disk is the limit, not the B-tree | Accepted | [3/4 done](0078-replica-segment-log.md) | 1 open |
 
 ## Open and deferred work
 
@@ -207,5 +207,4 @@
 
 **0078 — # 0078. The replica store becomes an append-only segment log — the disk is the limit, not the B-tree**
 
-- `0078-T3` 🚧 in-progress ([#661](https://github.com/mbilling/fss-mqtt-broker/issues/661)): "Space reclamation — segment drop and bounded compaction" — "In review. LogShard tracks where each live entry's record sits and per-segment live counts (decoded from the records it just wrote — the replay's own decoder); drops a dead PREFIX of segments; restates format, fences, caught-up sets and low-waters (a new LowWater record that deletes nothing) at every segment head; above 2x live bytes copies the oldest segment's live entries forward a bounded step per batch (1/4 segment, max 1 MiB) under the state lock. The import writes through the same path, so it restates heads too. Review fixes: a failed compaction append puts back the entries it took (no permanent pin); an entry tracked as live but absent from the state is untracked as dead; one call examines at most 4,096 queued entries; compaction starts with one non-active segment, not two. Tests: bounded growth when consumers keep up, a slow consumer compacted forward (not pinning the log), metadata outliving its segment — each equal to the redb reference after reopen; the three review fixes, each mutation-checked."
 - `0078-T4` ⬜ planned ([#662](https://github.com/mbilling/fss-mqtt-broker/issues/662)): "Evidence and the default flip — the calibration reads DISK-BOUND" — "Paid calibration re-run with MQTTD_REPLICA_STORE=log; the flip needs every criterion in ADR 0078 §6."
