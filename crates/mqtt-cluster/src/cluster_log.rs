@@ -216,6 +216,21 @@ fn delete_entry_range(
     Ok(())
 }
 
+/// Drop every entry of an offset-keyed map at or below `up_to`.
+///
+/// Truncation removes a PREFIX, so this pops from the front — O(dropped · log n).
+/// `retain` walked the whole map on every truncate, and the whole map is the
+/// key's live backlog: 15–17% of the durable writer's time at ~170 live entries
+/// per key (#568).
+fn drop_through<V>(map: &mut BTreeMap<Offset, V>, up_to: Offset) {
+    while let Some(first) = map.first_entry() {
+        if *first.key() > up_to {
+            break;
+        }
+        first.remove();
+    }
+}
+
 /// Decode `(key, offset)` from a replica entry key.
 fn r_decode_key(bytes: &[u8]) -> (String, Offset) {
     let len = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
@@ -241,6 +256,15 @@ fn r_decode_key(bytes: &[u8]) -> (String, Offset) {
 #[derive(Debug, Default)]
 pub struct ReplicaState {
     fences: Fences,
+    /// The fences as they stand ON DISK. A commit writes only the groups whose
+    /// fence moved past this, rather than every touched group's row on every
+    /// commit — the fence changes once per leadership term and was rewritten on
+    /// every batch (3.5–11% of commit time, #568). Kept apart from `fences`
+    /// because the in-memory fence may lead the disk: a batch of nothing but
+    /// superseded attempts advances `fences` without persisting, and comparing
+    /// against `fences` would then never write that epoch — after a restart the
+    /// replica would accept ops its pre-crash self had fenced (ADR 0042).
+    persisted_fences: Fences,
     logs: ReplicaLogs,
     /// Per-key truncation low-water (ADR 0018 phase 3b): the highest acked offset this
     /// replica knows was dropped. Propagated on recovery so a stale replica cannot
@@ -462,6 +486,8 @@ impl ReplicaState {
                 truncated,
                 caught_up,
             } = Self::load(db)?;
+            self.persisted_fences
+                .extend(fences.iter().map(|(g, e)| (*g, *e)));
             self.fences.extend(fences);
             self.logs.extend(logs);
             self.truncated.extend(truncated);
@@ -526,6 +552,20 @@ impl ReplicaState {
             truncated,
             caught_up,
         })
+    }
+
+    /// The subset of `advanced` that moves a fence past what is on disk — the
+    /// only fence rows a commit needs to write.
+    fn unpersisted(&self, advanced: &Fences) -> Fences {
+        advanced
+            .iter()
+            .filter(|(g, e)| {
+                self.persisted_fences
+                    .get(g)
+                    .is_none_or(|on_disk| on_disk < *e)
+            })
+            .map(|(g, e)| (*g, *e))
+            .collect()
     }
 
     /// Durably apply a batch of ops (with the per-group fences they advanced to) in
@@ -598,6 +638,30 @@ impl ReplicaState {
     }
 }
 
+/// Apply one key's (coalesced) truncate inside a commit: drop its entries through
+/// `up_to` and persist the monotonic truncation low-water (ADR 0018 phase 3b).
+/// The low-water compounds over this batch (`wm`) on top of the committed one
+/// (`watermarks`), so it never moves backwards on disk.
+fn flush_truncate<'k>(
+    entries: &mut redb::Table<'_, &[u8], &[u8]>,
+    trunc: &mut redb::Table<'_, &str, u64>,
+    wm: &mut BTreeMap<&'k str, Offset>,
+    watermarks: &BTreeMap<String, Offset>,
+    key: &'k str,
+    up_to: Offset,
+) -> Result<(), ReplError> {
+    delete_entry_range(entries, key, 0, up_to)?;
+    let base = wm
+        .get(key)
+        .copied()
+        .or_else(|| watermarks.get(key).copied())
+        .unwrap_or(0);
+    let new_wm = base.max(up_to);
+    trunc.insert(key, new_wm).map_err(rdb)?;
+    wm.insert(key, new_wm);
+    Ok(())
+}
+
 /// Commit one shard's share of a batch in a single fsync'd transaction.
 ///
 /// Takes no `ReplicaState`: every state read a commit needs (the per-key
@@ -622,6 +686,13 @@ fn commit_shard(db: &Database, plan: &ShardPlan) -> Result<(), ReplError> {
             // Running per-key truncation low-water across this batch, overlaying the
             // committed `self.truncated`, so successive truncates in one batch compound.
             let mut wm: BTreeMap<&str, Offset> = BTreeMap::new();
+            // Truncates are COALESCED per key (#568): a key's run of truncates in
+            // one batch becomes one range delete and one low-water write, at the
+            // highest `up_to` (truncation is a monotonic prefix drop, so the last
+            // of a run subsumes the rest). A pending truncate is flushed before any
+            // other op on its key, so the per-key op order — the only order these
+            // rows can observe, every row being keyed by its key — is unchanged.
+            let mut pending: BTreeMap<&str, Offset> = BTreeMap::new();
             for (epoch, op) in ops {
                 match op {
                     ReplOp::Append {
@@ -630,6 +701,16 @@ fn commit_shard(db: &Database, plan: &ShardPlan) -> Result<(), ReplError> {
                         seq,
                         record,
                     } => {
+                        if let Some(up_to) = pending.remove(key.as_str()) {
+                            flush_truncate(
+                                &mut entries,
+                                &mut trunc,
+                                &mut wm,
+                                watermarks,
+                                key,
+                                up_to,
+                            )?;
+                        }
                         entries
                             .insert(
                                 r_entry_key(key, *offset).as_slice(),
@@ -638,23 +719,21 @@ fn commit_shard(db: &Database, plan: &ShardPlan) -> Result<(), ReplError> {
                             .map_err(rdb)?;
                     }
                     ReplOp::Truncate { key, up_to } => {
-                        delete_entry_range(&mut entries, key, 0, *up_to)?;
-                        // Persist the monotonic per-key truncation low-water (phase 3b).
-                        let base = wm
-                            .get(key.as_str())
-                            .copied()
-                            .or_else(|| watermarks.get(key.as_str()).copied())
-                            .unwrap_or(0);
-                        let new_wm = base.max(*up_to);
-                        trunc.insert(key.as_str(), new_wm).map_err(rdb)?;
-                        wm.insert(key.as_str(), new_wm);
+                        let p = pending.entry(key.as_str()).or_insert(*up_to);
+                        *p = (*p).max(*up_to);
                     }
                     ReplOp::Remove { key } => {
+                        // A pending truncate is subsumed: Remove drops every entry
+                        // and the low-water row with it.
+                        pending.remove(key.as_str());
                         delete_entry_range(&mut entries, key, 0, Offset::MAX)?;
                         trunc.remove(key.as_str()).map_err(rdb)?;
                         wm.remove(key.as_str());
                     }
                 }
+            }
+            for (key, up_to) in std::mem::take(&mut pending) {
+                flush_truncate(&mut entries, &mut trunc, &mut wm, watermarks, key, up_to)?;
             }
         }
         txn.commit().map_err(rdb)?;
@@ -679,7 +758,7 @@ impl ReplicaState {
             }
             ReplOp::Truncate { key, up_to } => {
                 if let Some(log) = self.logs.get_mut(key) {
-                    log.retain(|o, _| o > up_to);
+                    drop_through(log, *up_to);
                 }
                 let wm = self.truncated.entry(key.clone()).or_default();
                 *wm = (*wm).max(*up_to);
@@ -725,11 +804,12 @@ impl ReplicaState {
             return true;
         }
         // Persist-before-mutate: a `true` ack means the op is on disk (ADR 0018 phase 3).
-        let advanced = Fences::from([(group, epoch)]);
-        if let Err(e) = self.persist_batch(&advanced, &[(epoch, op)]) {
+        let to_fence = self.unpersisted(&Fences::from([(group, epoch)]));
+        if let Err(e) = self.persist_batch(&to_fence, &[(epoch, op)]) {
             tracing::warn!(error = %e, "replica persist failed; not acking the replication op");
             return false;
         }
+        self.persisted_fences.extend(to_fence);
         self.fences.insert(group, epoch);
         self.apply_in_memory(epoch, op);
         true
@@ -791,10 +871,12 @@ impl ReplicaState {
             return accepted;
         }
         // One fsync for every accepted op in the batch (persist-before-mutate).
-        if let Err(e) = self.persist_batch(&advanced, &to_persist) {
+        let to_fence = self.unpersisted(&advanced);
+        if let Err(e) = self.persist_batch(&to_fence, &to_persist) {
             tracing::warn!(error = %e, "replica batch persist failed; not acking the batch");
             return vec![false; batch.len()];
         }
+        self.persisted_fences.extend(to_fence);
         self.fences.extend(advanced);
         for (i, ((epoch, op), ok)) in batch.iter().zip(&accepted).enumerate() {
             if *ok && !stale[i] {
@@ -864,7 +946,7 @@ impl ReplicaState {
                     accepted.push(true);
                 }
             }
-            plan.advanced = advanced.clone();
+            plan.advanced = this.unpersisted(&advanced);
             let db = this.dbs.get(shard).cloned();
             (accepted, superseded, advanced, plan, db)
         };
@@ -884,6 +966,10 @@ impl ReplicaState {
         }
         // ── phase 3: apply (locked) ─────────────────────────────────────────
         let mut this = lock();
+        if db.is_some() {
+            this.persisted_fences
+                .extend(plan.advanced.iter().map(|(g, e)| (*g, *e)));
+        }
         this.fences.extend(advanced);
         for (i, ((epoch, op), ok)) in batch.iter().zip(&accepted).enumerate() {
             if *ok && !superseded[i] {
@@ -2088,8 +2174,8 @@ impl<T: ReplicaTransport + Clone + 'static> ReplicatedLog for ClusterLog<T> {
             return Err(ReplError::NoQuorum);
         }
         if let Some(ks) = self.state.lock().await.get_mut(key) {
-            ks.entries.retain(|offset, _| *offset > up_to);
-            ks.tags.retain(|offset, _| *offset > up_to);
+            drop_through(&mut ks.entries, up_to);
+            drop_through(&mut ks.tags, up_to);
             ks.truncated = ks.truncated.max(up_to);
         }
         Ok(())
@@ -2101,8 +2187,8 @@ impl<T: ReplicaTransport + Clone + 'static> ReplicatedLog for ClusterLog<T> {
         if let Some(ks) = state.get_mut(key) {
             // Never truncate past the commit watermark.
             let up = up_to.min(ks.committed);
-            ks.entries.retain(|o, _| *o > up);
-            ks.tags.retain(|o, _| *o > up);
+            drop_through(&mut ks.entries, up);
+            drop_through(&mut ks.tags, up);
             ks.truncated = ks.truncated.max(up);
             op = Some(ReplOp::Truncate {
                 key: key.clone(),
@@ -2163,8 +2249,9 @@ mod tests {
     }
 
     use super::{
-        merge_replica_logs, merge_replica_logs_tagged, shard_file_name, shard_of_group, ClusterLog,
-        ReplOp, ReplicaRead, ReplicaState, ReplicaTransport, R_LEGACY_FILE,
+        drop_through, merge_replica_logs, merge_replica_logs_tagged, shard_file_name,
+        shard_of_group, ClusterLog, Fences, ReplOp, ReplicaRead, ReplicaState, ReplicaTransport,
+        R_LEGACY_FILE,
     };
     use crate::lease::{Epoch, OwnershipLease};
     use crate::placement::group_of_key;
@@ -2614,6 +2701,128 @@ mod tests {
             vec![3]
         );
         assert_eq!(r.watermark("q/c"), 2);
+    }
+
+    // --- #568: the writer's per-op work -------------------------------------
+
+    /// A fence row is written when the fence MOVES past what is on disk, and
+    /// only then — yet every fence that moved survives a reopen. Driven through
+    /// the unlocked shard writer, the production hot path.
+    #[test]
+    fn fences_persist_when_they_move_and_only_then() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let state = std::sync::Mutex::new(ReplicaState::open_sharded(dir.path(), 1).unwrap());
+            for (epoch, offset) in [(5, 1), (5, 2), (5, 3), (9, 4)] {
+                let out = ReplicaState::apply_batch_sharded(
+                    &state,
+                    0,
+                    &[(epoch, ap("q/c", offset, b"x"))],
+                );
+                assert_eq!(out, vec![true]);
+            }
+            let r = state.lock().unwrap();
+            assert_eq!(r.persisted_fences.get(&group_of_key("q/c")), Some(&9));
+            // Nothing left to write for an epoch the disk already holds.
+            assert!(r
+                .unpersisted(&Fences::from([(group_of_key("q/c"), 9)]))
+                .is_empty());
+            assert_eq!(
+                r.unpersisted(&Fences::from([(group_of_key("q/c"), 10)]))
+                    .len(),
+                1
+            );
+        }
+        let state = std::sync::Mutex::new(ReplicaState::open_sharded(dir.path(), 1).unwrap());
+        assert_eq!(
+            state.lock().unwrap().fence_for_key("q/c"),
+            9,
+            "the moved fence survived reopen"
+        );
+        assert_eq!(
+            ReplicaState::apply_batch_sharded(&state, 0, &[(8, ap("q/c", 5, b"stale"))]),
+            vec![false],
+            "and still fences an older epoch"
+        );
+    }
+
+    /// Truncates are coalesced per key inside a commit, and the result — in
+    /// memory and on disk — is exactly the ops applied one by one: per-key order
+    /// kept around interleaved appends, a lower (late) truncate never lowering
+    /// the committed low-water, and a Remove subsuming a pending truncate.
+    #[test]
+    fn coalesced_truncates_equal_the_ops_applied_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let tr = |key: &str, up_to| ReplOp::Truncate {
+            key: key.into(),
+            up_to,
+        };
+        let offsets = |r: &ReplicaState, key: &str| {
+            r.entries(key).iter().map(|e| e.offset).collect::<Vec<_>>()
+        };
+        {
+            let state = std::sync::Mutex::new(ReplicaState::open_sharded(dir.path(), 1).unwrap());
+            let mut setup: Vec<(Epoch, ReplOp)> =
+                (1..=5).map(|o| (3, ap("q/c", o, b"c"))).collect();
+            setup.extend((1..=4).map(|o| (3, ap("q/d", o, b"d"))));
+            setup.extend((1..=2).map(|o| (3, ap("q/r", o, b"r"))));
+            setup.push((3, tr("q/c", 3)));
+            setup.push((3, tr("q/d", 3)));
+            assert!(ReplicaState::apply_batch_sharded(&state, 0, &setup)
+                .iter()
+                .all(|ok| *ok));
+            let batch = vec![
+                (3, tr("q/c", 4)),
+                (3, tr("q/c", 2)), // a late, lower ack: the low-water must not move back
+                (3, ap("q/c", 6, b"c")),
+                (3, tr("q/c", 5)),
+                (3, ap("q/c", 7, b"c")),
+                (3, tr("q/d", 1)), // below the COMMITTED low-water of 3
+                (3, tr("q/r", 1)),
+                (3, ReplOp::Remove { key: "q/r".into() }),
+            ];
+            assert!(ReplicaState::apply_batch_sharded(&state, 0, &batch)
+                .iter()
+                .all(|ok| *ok));
+            let r = state.lock().unwrap();
+            assert_eq!(offsets(&r, "q/c"), vec![6, 7]);
+            assert_eq!(r.watermark("q/c"), 5);
+            assert_eq!(offsets(&r, "q/d"), vec![4]);
+            assert_eq!(r.watermark("q/d"), 3);
+            assert!(offsets(&r, "q/r").is_empty());
+            assert_eq!(r.watermark("q/r"), 0);
+        }
+        // The disk says exactly what memory said.
+        let r = ReplicaState::open_sharded(dir.path(), 1).unwrap();
+        assert_eq!(offsets(&r, "q/c"), vec![6, 7]);
+        assert_eq!(
+            r.watermark("q/c"),
+            5,
+            "coalesced low-water persisted at the run's highest up_to"
+        );
+        assert_eq!(offsets(&r, "q/d"), vec![4]);
+        assert_eq!(
+            r.watermark("q/d"),
+            3,
+            "a late lower truncate never lowers the persisted low-water"
+        );
+        assert!(
+            offsets(&r, "q/r").is_empty(),
+            "Remove subsumed the pending truncate"
+        );
+        assert_eq!(r.watermark("q/r"), 0);
+    }
+
+    #[test]
+    fn drop_through_removes_exactly_the_prefix() {
+        let mut m: BTreeMap<Offset, u8> = (1..=5).map(|o| (o, 0)).collect();
+        drop_through(&mut m, 0);
+        assert_eq!(m.keys().copied().collect::<Vec<_>>(), vec![1, 2, 3, 4, 5]);
+        drop_through(&mut m, 3);
+        assert_eq!(m.keys().copied().collect::<Vec<_>>(), vec![4, 5]);
+        drop_through(&mut m, Offset::MAX);
+        assert!(m.is_empty());
+        drop_through(&mut m, 7); // empty map: nothing to do
     }
 
     /// Fences are **per placement group**. Lease epochs are minted from ONE
