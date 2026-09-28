@@ -97,9 +97,25 @@ pub fn store_bytes(dir: &Path, file: &str) -> u64 {
     if single > 0 || file != "replicas.redb" {
         return single;
     }
-    (0..mqtt_cluster::cluster_log::R_MAX_SHARDS)
+    let shards: u64 = (0..mqtt_cluster::cluster_log::R_MAX_SHARDS)
         .map(|shard| one(dir.join(mqtt_cluster::cluster_log::shard_file_name(shard))))
-        .sum()
+        .sum();
+    // The segment-log replica store (ADR 0078): every segment of every shard.
+    shards + dir_bytes(&dir.join(mqtt_cluster::cluster_log::replica_log::LOG_DIR))
+}
+
+/// Bytes of every regular file under `dir`, recursively; 0 if it is absent.
+fn dir_bytes(dir: &Path) -> u64 {
+    std::fs::read_dir(dir).map_or(0, |entries| {
+        entries
+            .filter_map(Result::ok)
+            .map(|e| match e.file_type() {
+                Ok(t) if t.is_dir() => dir_bytes(&e.path()),
+                Ok(t) if t.is_file() => e.metadata().map_or(0, |m| m.len()),
+                _ => 0,
+            })
+            .sum()
+    })
 }
 
 /// The share of the aggregate mark one store may hold before it is named in a WARN.
@@ -327,6 +343,22 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("mqttd-watch-{}-{tag}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// A segment-log replica store (ADR 0078) is a directory of shards of
+    /// segments; the watch must count all of it, or it would stop protecting
+    /// the disk from its dominant store without any sign.
+    #[test]
+    fn a_segment_log_replica_store_is_counted_whole() {
+        let dir = temp_dir("replica-log");
+        let root = dir.join(mqtt_cluster::cluster_log::replica_log::LOG_DIR);
+        for (shard, bytes) in [(0, 300usize), (1, 700)] {
+            let d = root.join(format!("shard-{shard}"));
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("seg-00000000000000000001.log"), vec![1u8; bytes]).unwrap();
+        }
+        assert_eq!(store_bytes(&dir, "replicas.redb"), 1000);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// `scan` reports each store's size (absent files as zero) and the total.

@@ -1871,8 +1871,27 @@ async fn start_hub(
                 }
             }
         });
+        // ADR 0078: the replica store's engine. `redb` (the default) until the
+        // segment log's hardware evidence flips it; `log` imports an existing
+        // redb store once, and there is no way back from it.
+        let replica_store = match std::env::var("MQTTD_REPLICA_STORE") {
+            Ok(v) => v
+                .parse::<mqtt_cluster::cluster_log::StoreBackend>()
+                .unwrap_or_else(|e| {
+                    tracing::error!("MQTTD_REPLICA_STORE: {e}");
+                    std::process::exit(2);
+                }),
+            Err(_) => mqtt_cluster::cluster_log::StoreBackend::Redb,
+        };
+        if replica_store == mqtt_cluster::cluster_log::StoreBackend::Log {
+            tracing::warn!(
+                "MQTTD_REPLICA_STORE=log: the replica store is the append-only segment log \
+                 (ADR 0078). EXPERIMENTAL until its evidence is in; an existing redb store \
+                 is imported once and there is no conversion back"
+            );
+        }
         let (store, durable_retained, plane, driver) =
-            mqtt_cluster::durable_node::build_durable_node(
+            mqtt_cluster::durable_node::build_durable_node_on(
                 node_id.clone(),
                 placement.clone(),
                 founder,
@@ -1882,7 +1901,8 @@ async fn start_hub(
                 None, // no commit-latency fault injection in production (ADR 0026)
                 config.durable.allow_relaxed_publish, // ADR 0072 operator opt-in
                 ownership_domain_all.clone(),
-                store_shards, // ADR 0076 T2, fresh stores only
+                store_shards,  // ADR 0076 T2, fresh stores only
+                replica_store, // ADR 0078
             )
             .await;
         let (mut hub, hub_tx) = hub::Hub::with_config_and_placement(

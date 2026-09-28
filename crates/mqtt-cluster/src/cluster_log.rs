@@ -43,6 +43,43 @@ use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 
+pub mod replica_log;
+
+/// Which engine holds the replica store (ADR 0078): the redb tables, or the
+/// append-only segment log. Chosen by `MQTTD_REPLICA_STORE`; `Redb` until the
+/// log's evidence (ADR 0078 §6) flips the default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StoreBackend {
+    /// `replicas.redb` (or its shards): a copy-on-write B-tree per file.
+    #[default]
+    Redb,
+    /// `replicas-log/shard-<k>/`: an append-only segment log per shard.
+    Log,
+}
+
+impl std::str::FromStr for StoreBackend {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "redb" => Ok(Self::Redb),
+            "log" => Ok(Self::Log),
+            other => Err(format!(
+                "{other:?} is not a replica store: use `redb` or `log`"
+            )),
+        }
+    }
+}
+
+/// One shard of the replica store: a redb file, or a segment log. Cloned out
+/// of the state lock so its commit runs unlocked (ADR 0076 T2); a log is behind
+/// its own mutex only because the type must be shareable — each shard has ONE
+/// writer, so it is never contended.
+#[derive(Debug, Clone)]
+enum Shard {
+    Redb(Arc<Database>),
+    Log(Arc<std::sync::Mutex<crate::segment_log::SegmentLog>>),
+}
+
 /// One queued durable write for the node-wide writer task (ADR 0027 follower
 /// half, ADR 0071 owner half): the op at its epoch, plus a one-shot returning
 /// whether it was durably applied (accepted / not fenced).
@@ -165,6 +202,7 @@ fn r_decode_value(v: &[u8]) -> ((Epoch, u64), Vec<u8>) {
 type Fences = BTreeMap<GroupId, Epoch>;
 
 /// The state recovered from a persistent replica's tables.
+#[derive(Debug)]
 struct Loaded {
     fences: Fences,
     logs: ReplicaLogs,
@@ -282,7 +320,7 @@ pub struct ReplicaState {
     /// row, and the entry/trunc rows via [`group_of_key`]), so the K files
     /// partition the store with no row belonging to two of them. That is what
     /// makes the split pure-performance: per-shard FIFO is per-group FIFO.
-    dbs: Vec<Arc<Database>>,
+    dbs: Vec<Shard>,
 }
 
 /// Which shard owns `group` (ADR 0076 T2).
@@ -355,7 +393,7 @@ impl ReplicaState {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, ReplError> {
         let db = Self::open_one(path.as_ref(), None)?;
         let mut state = Self {
-            dbs: vec![Arc::new(db)],
+            dbs: vec![Shard::Redb(Arc::new(db))],
             ..Self::default()
         };
         state.load_all()?;
@@ -430,7 +468,7 @@ impl ReplicaState {
                 )));
             }
             let db = Self::open_one(&path, Some(k))?;
-            dbs.push(Arc::new(db));
+            dbs.push(Shard::Redb(Arc::new(db)));
         }
         let mut state = Self {
             dbs,
@@ -441,11 +479,118 @@ impl ReplicaState {
     }
 
     /// Whether `dir` holds no replica store yet — the one moment a fresh K may
-    /// be chosen (ADR 0076 T2). Cheap: two `exists` checks, no open.
+    /// be chosen (ADR 0076 T2). Cheap: `exists` checks, no open. A segment log
+    /// store (ADR 0078) counts as a store.
     #[must_use]
     pub fn is_fresh(dir: impl AsRef<Path>) -> bool {
         let dir = dir.as_ref();
+        Self::redb_is_fresh(dir) && !dir.join(replica_log::LOG_DIR).exists()
+    }
+
+    fn redb_is_fresh(dir: &Path) -> bool {
         !dir.join(R_LEGACY_FILE).exists() && !dir.join(shard_file_name(0)).exists()
+    }
+
+    /// Open the replica store under `dir` on `backend` (ADR 0078).
+    ///
+    /// - [`StoreBackend::Redb`]: exactly [`open_sharded`](Self::open_sharded).
+    ///   A data dir whose store is already a segment log is REFUSED — there is
+    ///   no path back from the log, and reading an empty redb beside it would
+    ///   silently present an empty replica.
+    /// - [`StoreBackend::Log`]: the segment log. A data dir that still holds a
+    ///   redb store is IMPORTED once — loaded, written to a staged log, flushed,
+    ///   renamed into place — and its redb files are then renamed
+    ///   `*.imported`, kept until an operator removes them. An import a crash
+    ///   interrupted is redone from the untouched redb files.
+    ///
+    /// # Errors
+    /// Whatever the chosen backend's open refuses, or an import failure.
+    pub fn open_store(
+        dir: impl AsRef<Path>,
+        shards: usize,
+        backend: StoreBackend,
+    ) -> Result<Self, ReplError> {
+        Self::open_store_with(
+            dir.as_ref(),
+            shards,
+            backend,
+            crate::segment_log::DEFAULT_SEGMENT_BYTES,
+        )
+    }
+
+    pub(crate) fn open_store_with(
+        dir: &Path,
+        shards: usize,
+        backend: StoreBackend,
+        segment_bytes: u64,
+    ) -> Result<Self, ReplError> {
+        let log_dir = dir.join(replica_log::LOG_DIR);
+        match backend {
+            StoreBackend::Redb => {
+                if log_dir.exists() {
+                    return Err(ReplError::Backend(format!(
+                        "{} holds a segment-log replica store (ADR 0078), but \
+                         MQTTD_REPLICA_STORE selects redb — set it to `log`. There is no \
+                         conversion back; restore the data dir from backup to return to redb",
+                        dir.display()
+                    )));
+                }
+                Self::open_sharded(dir, shards)
+            }
+            StoreBackend::Log => {
+                if !log_dir.exists() && !Self::redb_is_fresh(dir) {
+                    let old = Self::open_sharded(dir, shards)?;
+                    replica_log::import(dir, &old, segment_bytes)?;
+                    let k = old.shard_count();
+                    drop(old);
+                    tracing::warn!(
+                        dir = %dir.display(), shards = k,
+                        "replica store imported from redb into the segment log (ADR 0078); \
+                         the redb files are kept as *.imported until you remove them"
+                    );
+                }
+                if log_dir.exists() {
+                    Self::retire_redb_files(dir)?;
+                }
+                let opened = replica_log::open(dir, shards, segment_bytes)?;
+                let Loaded {
+                    fences,
+                    logs,
+                    truncated,
+                    caught_up,
+                } = opened.loaded;
+                Ok(Self {
+                    persisted_fences: fences.clone(),
+                    fences,
+                    logs,
+                    truncated,
+                    caught_up,
+                    dbs: opened
+                        .logs
+                        .into_iter()
+                        .map(|l| Shard::Log(Arc::new(std::sync::Mutex::new(l))))
+                        .collect(),
+                })
+            }
+        }
+    }
+
+    /// Rename every redb replica file beside a log store to `*.imported`: the
+    /// import finished (the log exists), so they are history, and leaving them
+    /// under their live names would make every tool that finds stores by name
+    /// (the disk watch, the restore guard, a downgrade) see two stores.
+    fn retire_redb_files(dir: &Path) -> Result<(), ReplError> {
+        let names = std::iter::once(R_LEGACY_FILE.to_string())
+            .chain((0..R_MAX_SHARDS).map(shard_file_name));
+        for name in names {
+            let from = dir.join(&name);
+            if from.exists() {
+                let to = dir.join(format!("{name}.imported"));
+                std::fs::rename(&from, &to)
+                    .map_err(|e| ReplError::Backend(format!("retiring {}: {e}", from.display())))?;
+            }
+        }
+        Ok(())
     }
 
     /// Open one shard file: lock-retry, schema gate, shard-count stamp, tables.
@@ -479,7 +624,10 @@ impl ReplicaState {
     /// Rebuild the in-memory cache from every shard. The shards partition the
     /// keyspace, so the merge is a disjoint union — no conflict resolution.
     fn load_all(&mut self) -> Result<(), ReplError> {
-        for db in &self.dbs.clone() {
+        for shard in &self.dbs.clone() {
+            let Shard::Redb(db) = shard else {
+                continue; // a log shard replayed at open (replica_log::open)
+            };
             let Loaded {
                 fences,
                 logs,
@@ -638,106 +786,231 @@ impl ReplicaState {
     }
 }
 
-/// Apply one key's (coalesced) truncate inside a commit: drop its entries through
-/// `up_to` and persist the monotonic truncation low-water (ADR 0018 phase 3b).
-/// The low-water compounds over this batch (`wm`) on top of the committed one
-/// (`watermarks`), so it never moves backwards on disk.
-fn flush_truncate<'k>(
-    entries: &mut redb::Table<'_, &[u8], &[u8]>,
-    trunc: &mut redb::Table<'_, &str, u64>,
-    wm: &mut BTreeMap<&'k str, Offset>,
-    watermarks: &BTreeMap<String, Offset>,
-    key: &'k str,
-    up_to: Offset,
-) -> Result<(), ReplError> {
-    delete_entry_range(entries, key, 0, up_to)?;
-    let base = wm
-        .get(key)
-        .copied()
-        .or_else(|| watermarks.get(key).copied())
-        .unwrap_or(0);
-    let new_wm = base.max(up_to);
-    trunc.insert(key, new_wm).map_err(rdb)?;
-    wm.insert(key, new_wm);
+/// Where a plan's effects land: one redb write transaction, or one log batch.
+/// [`drive_plan`] decides WHAT is written, in which order; a sink only knows
+/// HOW its engine writes it — so the two backends cannot drift in meaning.
+trait PlanSink<'k> {
+    fn fence(&mut self, group: GroupId, epoch: Epoch) -> Result<(), ReplError>;
+    fn append(
+        &mut self,
+        key: &'k str,
+        offset: Offset,
+        epoch: Epoch,
+        seq: u64,
+        record: &'k [u8],
+    ) -> Result<(), ReplError>;
+    /// Drop `key`'s entries through `up_to`; its low-water becomes `low_water`.
+    fn truncate(&mut self, key: &'k str, up_to: Offset, low_water: Offset)
+        -> Result<(), ReplError>;
+    fn remove(&mut self, key: &'k str) -> Result<(), ReplError>;
+}
+
+/// Turn a shard's plan into its ordered effects.
+///
+/// Fences first (only those that moved past the disk, #568), then the ops in
+/// batch order. Truncates are COALESCED per key: a key's run of truncates in
+/// one batch becomes one delete and one low-water write, at the highest
+/// `up_to` (truncation is a monotonic prefix drop, so the last of a run
+/// subsumes the rest). A pending truncate is flushed before any other op on
+/// its key, so per-key op order — the only order these rows can observe, every
+/// row being keyed by its key — is unchanged. The low-water compounds over the
+/// batch on top of the committed one (`plan.watermarks`), so it never moves
+/// backwards on disk (ADR 0018 phase 3b).
+fn drive_plan<'k>(plan: &'k ShardPlan<'k>, sink: &mut impl PlanSink<'k>) -> Result<(), ReplError> {
+    for (group, epoch) in &plan.advanced {
+        sink.fence(*group, *epoch)?;
+    }
+    let mut wm: BTreeMap<&str, Offset> = BTreeMap::new();
+    let mut pending: BTreeMap<&str, Offset> = BTreeMap::new();
+    let flush = |sink: &mut _, wm: &mut BTreeMap<&'k str, Offset>, key: &'k str, up_to: Offset| {
+        let base = wm
+            .get(key)
+            .copied()
+            .or_else(|| plan.watermarks.get(key).copied())
+            .unwrap_or(0);
+        let low_water = base.max(up_to);
+        PlanSink::truncate(sink, key, up_to, low_water)?;
+        wm.insert(key, low_water);
+        Ok::<(), ReplError>(())
+    };
+    for (epoch, op) in &plan.ops {
+        match op {
+            ReplOp::Append {
+                key,
+                offset,
+                seq,
+                record,
+            } => {
+                if let Some(up_to) = pending.remove(key.as_str()) {
+                    flush(sink, &mut wm, key, up_to)?;
+                }
+                sink.append(key, *offset, *epoch, *seq, record)?;
+            }
+            ReplOp::Truncate { key, up_to } => {
+                let p = pending.entry(key.as_str()).or_insert(*up_to);
+                *p = (*p).max(*up_to);
+            }
+            ReplOp::Remove { key } => {
+                // A pending truncate is subsumed: Remove drops every entry and
+                // the low-water with it.
+                pending.remove(key.as_str());
+                sink.remove(key)?;
+                wm.remove(key.as_str());
+            }
+        }
+    }
+    for (key, up_to) in std::mem::take(&mut pending) {
+        flush(sink, &mut wm, key, up_to)?;
+    }
     Ok(())
 }
 
-/// Commit one shard's share of a batch in a single fsync'd transaction.
+/// The redb sink: rows in the four tables of one write transaction.
+struct RedbSink<'t, 'txn> {
+    meta: &'t mut redb::Table<'txn, &'static str, u64>,
+    entries: &'t mut redb::Table<'txn, &'static [u8], &'static [u8]>,
+    trunc: &'t mut redb::Table<'txn, &'static str, u64>,
+}
+
+impl<'k> PlanSink<'k> for RedbSink<'_, '_> {
+    fn fence(&mut self, group: GroupId, epoch: Epoch) -> Result<(), ReplError> {
+        self.meta
+            .insert(format!("{R_FENCE_PREFIX}{group}").as_str(), epoch)
+            .map_err(rdb)?;
+        Ok(())
+    }
+    fn append(
+        &mut self,
+        key: &'k str,
+        offset: Offset,
+        epoch: Epoch,
+        seq: u64,
+        record: &'k [u8],
+    ) -> Result<(), ReplError> {
+        self.entries
+            .insert(
+                r_entry_key(key, offset).as_slice(),
+                r_entry_value(epoch, seq, record).as_slice(),
+            )
+            .map_err(rdb)?;
+        Ok(())
+    }
+    fn truncate(
+        &mut self,
+        key: &'k str,
+        up_to: Offset,
+        low_water: Offset,
+    ) -> Result<(), ReplError> {
+        delete_entry_range(self.entries, key, 0, up_to)?;
+        self.trunc.insert(key, low_water).map_err(rdb)?;
+        Ok(())
+    }
+    fn remove(&mut self, key: &'k str) -> Result<(), ReplError> {
+        delete_entry_range(self.entries, key, 0, Offset::MAX)?;
+        self.trunc.remove(key).map_err(rdb)?;
+        Ok(())
+    }
+}
+
+/// The log sink: the same effects as records, appended as one batch.
+#[derive(Default)]
+struct LogSink {
+    recs: Vec<(u8, Vec<u8>)>,
+}
+
+impl<'k> PlanSink<'k> for LogSink {
+    fn fence(&mut self, group: GroupId, epoch: Epoch) -> Result<(), ReplError> {
+        self.recs
+            .push(replica_log::Rec::Fence { group, epoch }.encode());
+        Ok(())
+    }
+    fn append(
+        &mut self,
+        key: &'k str,
+        offset: Offset,
+        epoch: Epoch,
+        seq: u64,
+        record: &'k [u8],
+    ) -> Result<(), ReplError> {
+        self.recs.push(
+            replica_log::Rec::Append {
+                key,
+                offset,
+                epoch,
+                seq,
+                record,
+            }
+            .encode(),
+        );
+        Ok(())
+    }
+    fn truncate(
+        &mut self,
+        key: &'k str,
+        up_to: Offset,
+        low_water: Offset,
+    ) -> Result<(), ReplError> {
+        self.recs.push(
+            replica_log::Rec::Truncate {
+                key,
+                up_to,
+                low_water,
+            }
+            .encode(),
+        );
+        Ok(())
+    }
+    fn remove(&mut self, key: &'k str) -> Result<(), ReplError> {
+        self.recs.push(replica_log::Rec::Remove { key }.encode());
+        Ok(())
+    }
+}
+
+fn log_append(
+    log: &std::sync::Mutex<crate::segment_log::SegmentLog>,
+    recs: &[(u8, Vec<u8>)],
+) -> Result<(), ReplError> {
+    let batch: Vec<(u8, &[u8])> = recs.iter().map(|(k, p)| (*k, p.as_slice())).collect();
+    log.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .append(&batch)
+        .map(|_| ())
+        .map_err(|e| ReplError::Backend(e.to_string()))
+}
+
+/// Commit one shard's share of a batch with ONE flush: a single redb
+/// `Durability::Immediate` transaction, or a single log batch.
 ///
 /// Takes no `ReplicaState`: every state read a commit needs (the per-key
 /// truncation low-water) is resolved into the plan while the caller holds the
 /// lock, so the commit — the expensive, blocking part — runs against nothing
-/// but this shard's own file. That is what lets K of them run at once.
-fn commit_shard(db: &Database, plan: &ShardPlan) -> Result<(), ReplError> {
-    {
-        let mut txn = db.begin_write().map_err(rdb)?;
-        let fences = &plan.advanced;
-        let ops = plan.ops.as_slice();
-        let watermarks = &plan.watermarks;
-        txn.set_durability(Durability::Immediate); // one fsync for the whole batch (ADR 0018/0027)
-        {
-            let mut meta = txn.open_table(R_META).map_err(rdb)?;
-            for (group, epoch) in fences {
-                meta.insert(format!("{R_FENCE_PREFIX}{group}").as_str(), *epoch)
-                    .map_err(rdb)?;
+/// but this shard's own store. That is what lets K of them run at once.
+fn commit_shard(shard: &Shard, plan: &ShardPlan) -> Result<(), ReplError> {
+    match shard {
+        Shard::Redb(db) => {
+            let mut txn = db.begin_write().map_err(rdb)?;
+            txn.set_durability(Durability::Immediate); // one fsync for the whole batch (ADR 0018/0027)
+            {
+                let mut meta = txn.open_table(R_META).map_err(rdb)?;
+                let mut entries = txn.open_table(R_ENTRIES).map_err(rdb)?;
+                let mut trunc = txn.open_table(R_TRUNC).map_err(rdb)?;
+                drive_plan(
+                    plan,
+                    &mut RedbSink {
+                        meta: &mut meta,
+                        entries: &mut entries,
+                        trunc: &mut trunc,
+                    },
+                )?;
             }
-            let mut entries = txn.open_table(R_ENTRIES).map_err(rdb)?;
-            let mut trunc = txn.open_table(R_TRUNC).map_err(rdb)?;
-            // Running per-key truncation low-water across this batch, overlaying the
-            // committed `self.truncated`, so successive truncates in one batch compound.
-            let mut wm: BTreeMap<&str, Offset> = BTreeMap::new();
-            // Truncates are COALESCED per key (#568): a key's run of truncates in
-            // one batch becomes one range delete and one low-water write, at the
-            // highest `up_to` (truncation is a monotonic prefix drop, so the last
-            // of a run subsumes the rest). A pending truncate is flushed before any
-            // other op on its key, so the per-key op order — the only order these
-            // rows can observe, every row being keyed by its key — is unchanged.
-            let mut pending: BTreeMap<&str, Offset> = BTreeMap::new();
-            for (epoch, op) in ops {
-                match op {
-                    ReplOp::Append {
-                        key,
-                        offset,
-                        seq,
-                        record,
-                    } => {
-                        if let Some(up_to) = pending.remove(key.as_str()) {
-                            flush_truncate(
-                                &mut entries,
-                                &mut trunc,
-                                &mut wm,
-                                watermarks,
-                                key,
-                                up_to,
-                            )?;
-                        }
-                        entries
-                            .insert(
-                                r_entry_key(key, *offset).as_slice(),
-                                r_entry_value(*epoch, *seq, record).as_slice(),
-                            )
-                            .map_err(rdb)?;
-                    }
-                    ReplOp::Truncate { key, up_to } => {
-                        let p = pending.entry(key.as_str()).or_insert(*up_to);
-                        *p = (*p).max(*up_to);
-                    }
-                    ReplOp::Remove { key } => {
-                        // A pending truncate is subsumed: Remove drops every entry
-                        // and the low-water row with it.
-                        pending.remove(key.as_str());
-                        delete_entry_range(&mut entries, key, 0, Offset::MAX)?;
-                        trunc.remove(key.as_str()).map_err(rdb)?;
-                        wm.remove(key.as_str());
-                    }
-                }
-            }
-            for (key, up_to) in std::mem::take(&mut pending) {
-                flush_truncate(&mut entries, &mut trunc, &mut wm, watermarks, key, up_to)?;
-            }
+            txn.commit().map_err(rdb)?;
+            Ok(())
         }
-        txn.commit().map_err(rdb)?;
-        Ok(())
+        Shard::Log(log) => {
+            let mut sink = LogSink::default();
+            drive_plan(plan, &mut sink)?;
+            log_append(log, &sink.recs)
+        }
     }
 }
 
@@ -1074,8 +1347,23 @@ impl ReplicaState {
             }
             let mut persisted: Vec<GroupId> = Vec::with_capacity(stamps.len());
             for (shard, stamps) in &by_shard {
-                let db = &self.dbs[*shard];
                 let persist = || -> Result<(), ReplError> {
+                    let db = match &self.dbs[*shard] {
+                        Shard::Redb(db) => db,
+                        Shard::Log(log) => {
+                            let recs: Vec<(u8, Vec<u8>)> = stamps
+                                .iter()
+                                .map(|(group, set)| {
+                                    replica_log::Rec::Caught {
+                                        group: *group,
+                                        members: set.iter().map(|n| n.0.clone()).collect(),
+                                    }
+                                    .encode()
+                                })
+                                .collect();
+                            return log_append(log, &recs);
+                        }
+                    };
                     let mut txn = db.begin_write().map_err(rdb)?;
                     txn.set_durability(Durability::Immediate);
                     {

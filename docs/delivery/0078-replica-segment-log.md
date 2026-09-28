@@ -11,9 +11,9 @@ tasks:
     evidence: "PR #663. crates/mqtt-cluster/src/segment_log.rs — preallocated segments of framed records (len, crc32c over kind+lsn+payload, kind, lsn, payload); a batch is one pwrite + one fdatasync; replay in LSN order stops at the first invalid record (CRC, LSN out of sequence, length out of bounds): a torn tail in the last segment, corruption (open fails) in any earlier one; recovery ZEROES the rest of the segment from the valid end so intact records of an unacked batch can never replay (the equal-size case an LSN check misses — mutation-checked: removing the zeroing fails two tests); a new segment is created, extended, flushed and its directory flushed before any record lands in it; an empty segment from a crashed roll is removed; drop_before deletes a prefix, never the active segment. CRC-32C in-house (check value 0xE3069283), no new dependency. 12 unit tests, incl. the zero-gap sector-reorder ghost (review finding). Standalone: T2 wires it into ReplicaState."
   - id: 0078-T2
     title: "ReplicaState on the segment log, behind MQTTD_REPLICA_STORE=redb|log"
-    status: planned
+    status: in-progress
     issue: 660
-    notes: "Default stays redb until T4's evidence. One-way import of an existing replicas.redb, kept and renamed."
+    notes: "In review. One commit path (drive_plan) feeds a redb sink or a log sink, so the engines cannot drift; log records mirror the redb rows (Truncate carries up_to AND low_water). A differential test drives the same changes through every apply path on both backends (1 and 4 shards) and requires identical state live and after reopen — mutation-checked. One-way import from redb (staged, renamed into place; redb files kept as *.imported; an interrupted import is redone); redb refuses a log-format data dir. MQTTD_REPLICA_STORE wired in main.rs (default redb); store_watch counts the log dir; the restore guard treats it as store files. Default stays redb until T4."
   - id: 0078-T3
     title: "Space reclamation — segment drop and bounded compaction"
     status: planned
@@ -35,7 +35,7 @@ frontmatter above · this file is the plan, progress log, and changelog.
 | Task | Status | Issue | When | Evidence / notes |
 |------|--------|-------|------|------------------|
 | 0078-T1 | ✅ done | [#659](https://github.com/mbilling/fss-mqtt-broker/issues/659) | 2026-09-28 | "PR #663. crates/mqtt-cluster/src/segment_log.rs — preallocated segments of framed records (len, crc32c over kind+lsn+payload, kind, lsn, payload); a batch is one pwrite + one fdatasync; replay in LSN order stops at the first invalid record (CRC, LSN out of sequence, length out of bounds): a torn tail in the last segment, corruption (open fails) in any earlier one; recovery ZEROES the rest of the segment from the valid end so intact records of an unacked batch can never replay (the equal-size case an LSN check misses — mutation-checked: removing the zeroing fails two tests); a new segment is created, extended, flushed and its directory flushed before any record lands in it; an empty segment from a crashed roll is removed; drop_before deletes a prefix, never the active segment. CRC-32C in-house (check value 0xE3069283), no new dependency. 12 unit tests, incl. the zero-gap sector-reorder ghost (review finding). Standalone: T2 wires it into ReplicaState." |
-| 0078-T2 | ⬜ planned | [#660](https://github.com/mbilling/fss-mqtt-broker/issues/660) | — | "Default stays redb until T4's evidence. One-way import of an existing replicas.redb, kept and renamed." |
+| 0078-T2 | 🚧 in-progress | [#660](https://github.com/mbilling/fss-mqtt-broker/issues/660) | — | "In review. One commit path (drive_plan) feeds a redb sink or a log sink, so the engines cannot drift; log records mirror the redb rows (Truncate carries up_to AND low_water). A differential test drives the same changes through every apply path on both backends (1 and 4 shards) and requires identical state live and after reopen — mutation-checked. One-way import from redb (staged, renamed into place; redb files kept as *.imported; an interrupted import is redone); redb refuses a log-format data dir. MQTTD_REPLICA_STORE wired in main.rs (default redb); store_watch counts the log dir; the restore guard treats it as store files. Default stays redb until T4." |
 | 0078-T3 | ⬜ planned | [#661](https://github.com/mbilling/fss-mqtt-broker/issues/661) | — | "Only a prefix of segments is ever dropped; metadata is re-emitted at each segment head." |
 | 0078-T4 | ⬜ planned | [#662](https://github.com/mbilling/fss-mqtt-broker/issues/662) | — | "Paid calibration re-run with MQTTD_REPLICA_STORE=log; the flip needs every criterion in ADR 0078 §6." |
 <!-- /status-table:0078 -->
@@ -58,3 +58,5 @@ frontmatter above · this file is the plan, progress log, and changelog.
   with torn-tail, ghost-record (bad-CRC and zero-gap), corruption,
   crashed-roll and prefix-drop tests.
 - 2026-09-28 — T1 done: PR #663 merged, issue #659 closed.
+- 2026-09-28 — T2 in review: ReplicaState on the segment log behind
+  `MQTTD_REPLICA_STORE`, with the redb import.
