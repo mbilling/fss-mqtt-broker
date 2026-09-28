@@ -74,6 +74,10 @@ client_ca = "/etc/mqttd/tls/client-ca.crt"
 allow_anonymous = false
 # Argon2id `username:phc-hash` password file (a secret — mount it).
 # password_file = "/etc/mqttd/passwd"
+# Require BOTH factors (issue #670): a client presenting a verified certificate must also send
+# username = its certificate identity and that user's password. Needs [tls] client_ca and a
+# password verifier (password_file or [security.http_auth]). Off = the certificate alone admits.
+# require_password_with_certificate = false
 # TOML topic-ACL policy (deny by default). Without it, authorization is NOT enforced (logged).
 acl_file = "/etc/mqttd/acl.toml"
 

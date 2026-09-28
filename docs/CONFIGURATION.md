@@ -6,7 +6,7 @@ Source of truth: `mqtt_config::ENV_VARS` and `Config::overlay_from` in `crates/m
 
 The annotated template is [`mqttd.example.toml`](mqttd.example.toml). Capacity arithmetic lives in [SIZING.md](SIZING.md); day-2 procedures in [OPERATIONS.md](OPERATIONS.md). This page is the inventory of knobs, not the runbook.
 
-Documented overlay variables: **95** in `ENV_VARS`, plus `MQTTD_CONFIG` (meta) and any experimental side-channel knobs below.
+Documented overlay variables: **96** in `ENV_VARS`, plus `MQTTD_CONFIG` (meta) and any experimental side-channel knobs below.
 
 ## Node identity
 
@@ -48,6 +48,7 @@ Documented overlay variables: **95** in `ENV_VARS`, plus `MQTTD_CONFIG` (meta) a
 | `MQTTD_ALLOW_ANONYMOUS` | `security.allow_anonymous` | Permit clients presenting no credentials (`MQTTD_ALLOW_ANONYMOUS`). Default `false`. |
 | `MQTTD_MTLS_IDENTITY_SOURCE` | `security.mtls_identity_source` | Which field of a verified client certificate is the identity (`MQTTD_MTLS_IDENTITY_SOURCE`, ADR 0004 T11): `"cn"` (default), `"san-dns"`, `"san-uri"`, or `"san-email"`. `None` means `"cn"`. Applies to client listeners only — the cluster bus binds peer node ids to the Common Name by definition (ADR 0004 T7). |
 | `MQTTD_PASSWORD_FILE` | `security.password_file` | Argon2id `username:phc-hash` password file (`MQTTD_PASSWORD_FILE`). |
+| `MQTTD_REQUIRE_PASSWORD_WITH_CERTIFICATE` | `security.require_password_with_certificate` | Require BOTH factors from a client that presents a verified certificate (`MQTTD_REQUIRE_PASSWORD_WITH_CERTIFICATE`, issue #670): its CONNECT must also carry a username equal to the certificate identity and a password that verifies for it. Default `false`: the certificate alone admits the client and any wire credential is ignored (ADR 0004). Needs `tls.client_ca` and a password verifier (`password_file` or `http_auth`). Certificate-less clients are not affected — on a TLS listener with a client CA the handshake already refuses them. Hot-reloadable; a change applies to new CONNECTs — established sessions are not re-authenticated. |
 | `MQTTD_ACL_FILE` | `security.acl_file` | Topic-ACL TOML policy file (`MQTTD_ACL_FILE`); without it authorization is not enforced and loudly logged. |
 | `MQTTD_JWT_HS256_SECRET_FILE` | `security.jwt.hs256_secret_file` | Path to a file holding the HS256 shared secret (`MQTTD_JWT_HS256_SECRET_FILE`, ADR 0046 T5): secret-by-reference, so the HMAC key is mounted from a Secret, never inlined. |
 | `MQTTD_JWT_RS256_PEM` | `security.jwt.rs256_pem_file` | RS256 public-key PEM (`MQTTD_JWT_RS256_PEM`). |
