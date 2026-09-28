@@ -6744,7 +6744,11 @@ async fn run_truncate_flusher(
     /// across sessions without turning the flusher into an unbounded spawner.
     const FLUSH_CONCURRENCY: usize = 8;
     let mut queue = FlushQueue::default();
-    let mut flushes: tokio::task::JoinSet<ClientId> = tokio::task::JoinSet::new();
+    let mut flushes: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
+    // Which session each flush serves, so a flush that PANICS still frees its
+    // session: `join_next` then yields no `ClientId`, only the task's id, and a
+    // session left marked in flight would never be flushed again.
+    let mut serving: HashMap<tokio::task::Id, ClientId> = HashMap::new();
     loop {
         // Wait for work: a new watermark, or a finished flush freeing a slot.
         tokio::select! {
@@ -6752,8 +6756,12 @@ async fn run_truncate_flusher(
                 let Some((client, up_to)) = msg else { break }; // hub gone
                 queue.mark(client, up_to);
             }
-            Some(done) = flushes.join_next(), if !flushes.is_empty() => {
-                if let Ok(client) = done {
+            Some(done) = flushes.join_next_with_id(), if !flushes.is_empty() => {
+                let id = match &done {
+                    Ok((id, ())) => *id,
+                    Err(e) => e.id(),
+                };
+                if let Some(client) = serving.remove(&id) {
                     queue.finished(client);
                 }
             }
@@ -6767,7 +6775,8 @@ async fn run_truncate_flusher(
                 break;
             };
             let store = store.clone();
-            flushes.spawn(async move {
+            let served = client.clone();
+            let handle = flushes.spawn(async move {
                 if let Err(e) = store.ack(&client, up_to).await {
                     // Not fatal: the entries stay in the log and are replayed on the
                     // next resume. A duplicate at QoS 1 is spec-legal; losing one
@@ -6775,13 +6784,17 @@ async fn run_truncate_flusher(
                     debug!(client = %client.0, up_to, error = %e,
                            "detached truncate of the acknowledged session log failed");
                 }
-                client
             });
+            serving.insert(handle.id(), served);
         }
     }
     // Hub dropped its sender: flush what remains, best-effort, then stop.
-    while let Some(done) = flushes.join_next().await {
-        if let Ok(client) = done {
+    while let Some(done) = flushes.join_next_with_id().await {
+        let id = match &done {
+            Ok((id, ())) => *id,
+            Err(e) => e.id(),
+        };
+        if let Some(client) = serving.remove(&id) {
             queue.finished(client);
         }
     }
@@ -16904,6 +16917,8 @@ mod tests {
         /// its park — the #575 oracle synchronizes on this, not on a sleep.
         ack_entered:
             std::sync::Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<()>>>,
+        /// How many upcoming `ack` calls PANIC — a flush task dying mid-call.
+        ack_panics: std::sync::Mutex<usize>,
     }
 
     impl ParkingStore {
@@ -16927,6 +16942,7 @@ mod tests {
                 reject_next: std::sync::Mutex::new(std::collections::HashMap::new()),
                 ack_gates: std::sync::Mutex::new(std::collections::HashMap::new()),
                 ack_entered: std::sync::Mutex::new(std::collections::HashMap::new()),
+                ack_panics: std::sync::Mutex::new(0),
             })
         }
 
@@ -17131,6 +17147,13 @@ mod tests {
                 self.log("ack-failed", format!("{} {up_to}", client.0));
                 return Err(error);
             }
+            let panic_now = {
+                let mut n = self.ack_panics.lock().unwrap();
+                let now = *n > 0;
+                *n = n.saturating_sub(1);
+                now
+            };
+            assert!(!panic_now, "injected ack panic");
             self.log("ack", format!("{} {up_to}", client.0));
             self.inner.ack(client, up_to).await
         }
@@ -18122,6 +18145,31 @@ mod tests {
                 .unwrap()
                 .unwrap(),
             PublishOutcome::Accepted
+        );
+    }
+
+    /// A truncate flush that PANICS frees its session (review of #673): the
+    /// flusher tracks which session each flush serves by task id, so the next
+    /// watermark for that session still reaches the store. Before, the session
+    /// stayed marked in flight forever and was never flushed again.
+    #[tokio::test]
+    async fn a_panicking_truncate_flush_does_not_strand_its_session() {
+        let store = ParkingStore::new();
+        *store.ack_panics.lock().unwrap() = 1;
+        let (tx, rx) = mpsc::unbounded_channel();
+        let flusher = tokio::spawn(super::run_truncate_flusher(store.clone(), rx));
+        tx.send((ClientId("c".into()), 1)).unwrap();
+        // The first flush runs and panics; wait until it has been reaped.
+        while *store.ack_panics.lock().unwrap() > 0 {
+            tokio::task::yield_now().await;
+        }
+        tx.send((ClientId("c".into()), 2)).unwrap();
+        drop(tx); // the shutdown path flushes whatever is still owed
+        flusher.await.unwrap();
+        assert!(
+            store.ops().iter().any(|(op, d)| op == "ack" && d == "c 2"),
+            "the session's next watermark reached the store: {:?}",
+            store.ops()
         );
     }
 

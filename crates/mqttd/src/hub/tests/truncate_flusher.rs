@@ -71,7 +71,11 @@ fn a_session_in_flight_rejoins_behind_the_waiting_ones() {
     assert_eq!(q.next(), None, "c1 must not start a second flush");
     q.finished(cid(1));
     q.finished(cid(2));
-    assert_eq!(q.next(), Some((cid(1), 2)), "c1 rejoined with its newer watermark");
+    assert_eq!(
+        q.next(),
+        Some((cid(1), 2)),
+        "c1 rejoined with its newer watermark"
+    );
     assert_eq!(q.next(), None);
 }
 

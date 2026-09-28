@@ -960,7 +960,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 456 test(s)
+## `crates/mqttd/src/lib.rs` — 457 test(s)
 
 - `admission::tests::the_global_cap_refuses_at_the_bound_and_recovers`
 - `admission::tests::the_penalty_box_refuses_after_the_threshold`
@@ -1182,6 +1182,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::a_missed_retained_fan_out_is_healed_by_periodic_anti_entropy`
 - `hub::tests::a_moved_lease_owner_nacks_a_routed_commit`
 - `hub::tests::a_nacked_handoff_re_routes_once_placement_catches_up`
+- `hub::tests::a_panicking_truncate_flush_does_not_strand_its_session`
 - `hub::tests::a_parked_qos2_truncate_does_not_stall_unrelated_sessions`
 - `hub::tests::a_peer_that_missed_the_last_fanout_converges_from_a_restarted_owners_snapshot`
 - `hub::tests::a_peers_refusal_refuses_the_publisher_instead_of_dropping_the_gate`
