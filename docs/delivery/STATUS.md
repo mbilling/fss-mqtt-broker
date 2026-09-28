@@ -85,7 +85,7 @@
 | [0075](../adr/0075-pipelined-durable-appends.md) | # 0075. Pipelined durable appends — the window stops paying the round trip per message | Accepted | [1/1 done](0075-pipelined-durable-appends.md) | — |
 | [0076](../adr/0076-self-measuring-sharded-store.md) | # 0076. The self-measuring sharded store — the volume's capacity becomes the broker's business | Accepted | [3/3 done](0076-self-measuring-sharded-store.md) | — |
 | [0077](../adr/0077-workload-targeted-performance.md) | # 0077. Workload-targeted performance — a shape is not a result without its tail | Proposed | [6/10 done](0077-workload-targeted-performance.md) | 4 open |
-| [0078](../adr/0078-replica-segment-log.md) | # 0078. The replica store becomes an append-only segment log — the disk is the limit, not the B-tree | Accepted | [1/4 done](0078-replica-segment-log.md) | 3 open |
+| [0078](../adr/0078-replica-segment-log.md) | # 0078. The replica store becomes an append-only segment log — the disk is the limit, not the B-tree | Accepted | [2/4 done](0078-replica-segment-log.md) | 2 open |
 
 ## Open and deferred work
 
@@ -207,6 +207,5 @@
 
 **0078 — # 0078. The replica store becomes an append-only segment log — the disk is the limit, not the B-tree**
 
-- `0078-T2` 🚧 in-progress ([#660](https://github.com/mbilling/fss-mqtt-broker/issues/660)): "ReplicaState on the segment log, behind MQTTD_REPLICA_STORE=redb|log" — "In review. One commit path (drive_plan) feeds a redb sink or a log sink, so the engines cannot drift; log records mirror the redb rows (Truncate carries up_to AND low_water). A differential test drives the same changes through every apply path on both backends (1 and 4 shards) and requires identical state live and after reopen — mutation-checked. One-way import from redb (staged, renamed into place; redb files kept as *.imported; an interrupted import is redone); redb refuses a log-format data dir. MQTTD_REPLICA_STORE wired in main.rs (default redb); store_watch counts the log dir; the restore guard treats it as store files. Default stays redb until T4."
 - `0078-T3` ⬜ planned ([#661](https://github.com/mbilling/fss-mqtt-broker/issues/661)): "Space reclamation — segment drop and bounded compaction" — "Only a prefix of segments is ever dropped; metadata is re-emitted at each segment head."
 - `0078-T4` ⬜ planned ([#662](https://github.com/mbilling/fss-mqtt-broker/issues/662)): "Evidence and the default flip — the calibration reads DISK-BOUND" — "Paid calibration re-run with MQTTD_REPLICA_STORE=log; the flip needs every criterion in ADR 0078 §6."
