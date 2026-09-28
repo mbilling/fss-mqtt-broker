@@ -253,7 +253,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `two_bridge_instances_do_not_duplicate_forwarding`
 - `two_partitioned_instances_deliver_each_inbound_message_exactly_once`
 
-## `crates/mqtt-cluster/src/lib.rs` — 299 test(s)
+## `crates/mqtt-cluster/src/lib.rs` — 310 test(s)
 
 - `cluster_identity::tests::a_founder_mints_once_and_reloads_stably`
 - `cluster_identity::tests::a_joiner_adopts_once_and_persists`
@@ -472,6 +472,17 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `replay::tests::reopening_resumes_above_the_last_reserved_block_never_reusing`
 - `replay::tests::reserves_one_block_per_block_of_numbers`
 - `replay::tests::strictly_increasing_sequences_are_all_fresh`
+- `segment_log::tests::a_batch_larger_than_a_segment_still_lands_whole`
+- `segment_log::tests::a_gap_between_segments_is_corruption`
+- `segment_log::tests::a_log_rolls_segments_and_replays_across_them_with_heads`
+- `segment_log::tests::a_torn_tail_is_discarded_and_the_log_resumes_there`
+- `segment_log::tests::an_empty_segment_from_a_crashed_roll_is_removed`
+- `segment_log::tests::batches_replay_in_order_across_a_reopen`
+- `segment_log::tests::corruption_before_the_tail_fails_the_open`
+- `segment_log::tests::crc32c_matches_the_standard_check_value`
+- `segment_log::tests::dropping_a_prefix_keeps_the_rest_replayable`
+- `segment_log::tests::intact_records_after_a_torn_one_never_come_back`
+- `segment_log::tests::reserved_kinds_and_oversized_payloads_are_refused_unwritten`
 - `swim::tests::a_changed_routing_address_is_surfaced_even_when_the_state_is_unchanged`
 - `swim::tests::a_dead_member_is_not_revived_by_stale_higher_incarnation_gossip`
 - `swim::tests::a_deaf_member_gets_a_certificate_carrying_regreet`
