@@ -330,6 +330,11 @@ def durable_writer(rdir: Path, window_secs: float) -> list[dict]:
       flush_share how much of a commit ONE device flush explains, (1000 / floor)
                   / commit_ms: near 1 the commit is the flush (disk-bound); near
                   0 the commit is per-op work (the hot path)
+      work_share  the share of each second the writer spends on per-op work:
+                  commits_s x (commit_ms - 1000 / floor) / 1000, the commit
+                  time minus one flush at the probed rate. Unlike `busy`, it IS
+                  a saturation signal: near 1 the writer has no time left for
+                  more ops (the hot path binds); well below, the store has room
       disk        iostat over the same window (disk_io), or None
       floor       the broker's own boot probe of its volume, single-writer
                   barriers/s (store_probe.rs) — the disk it drew
@@ -361,6 +366,8 @@ def durable_writer(rdir: Path, window_secs: float) -> list[dict]:
         w["ops_s"] = ops / secs
         w["ms_per_op"] = w["commit_ms"] / w["ops_commit"] if w["ops_commit"] else 0.0
         w["flush_share"] = (1000.0 / w["floor"]) / w["commit_ms"] if w["floor"] and w["commit_ms"] else 0.0
+        flush_ms = 1000.0 / w["floor"] if w["floor"] else 0.0
+        w["work_share"] = w["commits_s"] * max(w["commit_ms"] - flush_ms, 0.0) / 1000.0
         w["disk"] = disk_io(rdir, w["broker"])
     return out
 
@@ -919,8 +926,22 @@ def self_test() -> None:
         hot = lane_e_rung(lane_e_fixture(root, "sites-4-dur-hot", offered=30_000, sent=30_000,
                                          recv=30_000, late=0, writer=[slow, fast]))
         v = disk_verdict(hot["writer"])
-        if not v.startswith("NOT DISK-BOUND") or "within 0% across disks 1.9x apart" not in v:
+        # The busier writer is the faster disk's: 53 commits/s x (18.5 ms -
+        # 1000 / 2,783 = 0.36 ms of flush) = 961 ms of per-op work in every
+        # second — 96%, the writer has nothing left.
+        if (not v.startswith("WRITER-BOUND") or "within 0% across disks 1.9x apart" not in v
+                or "up to 96%" not in v):
             failures.append(f"per-op-bound commits on disks 1.9x apart were not called the hot path: {v}")
+        # A store with room: 50 commits/s of 1.0 ms, a 0.33 ms flush (floor
+        # 3,000/s) — one flush is 33% of a commit, per-op work 50 x 0.67 ms =
+        # 3% of each second. Neither binds: the limit is upstream.
+        idle_w = {"appends": 1_000 * 60, "batches": 50 * 60, "ops": 50 * 60 * 20,
+                  "micros": 50 * 60 * 1_000, "floor": 3000}
+        idle = lane_e_rung(lane_e_fixture(root, "sites-4-dur-idle", offered=1_000, sent=1_000,
+                                          recv=1_000, late=0, writer=[idle_w]))
+        v = disk_verdict(idle["writer"])
+        if not v.startswith("NOT STORE-BOUND") or "at most 3%" not in v:
+            failures.append(f"a store with room was not called NOT STORE-BOUND: {v}")
         # iostat over the window only: two whole-disk rows inside [open, close],
         # one before it, a partition and a loop device that must not be summed.
         d = hot_dir = root / "sites-4-dur-hot"
@@ -1143,7 +1164,8 @@ def self_test() -> None:
         "summarize-curve self-test: publish double-count correction OK (6 cases); "
         "lane E validity OK (26 rungs + 6 ladders — a durable-labelled rung with no durable "
         "append NOT CARRIED, writer window deltas exact, a commit the flush explains DISK-BOUND and the "
-        "calibration's per-op-bound commits on disks 1.9x apart NOT DISK-BOUND, iostat read over "
+        "calibration's per-op-bound commits on disks 1.9x apart WRITER-BOUND, a store with room "
+        "NOT STORE-BOUND, iostat read over "
         "the window on whole disks only, "
         "p99 graded GREEN/YELLOW/RED and never "
         "failed, late publishers NOT CARRIED, one lost message or a broker drop FAILED, a "
@@ -1762,23 +1784,29 @@ def _lane_e_carried(offer_met, delivered, late_share, settled_ok, reset_ok, core
 
 FLUSH_BOUND = 0.5  # a commit this much explained by one device flush is the disk's
 DISK_UTIL_BOUND = 80.0  # %util, iostat, over the window
+WRITER_BOUND = 0.5  # share of each second the writer spends on per-op work
 
 
 def disk_verdict(writer: list[dict]) -> str:
-    """DISK-BOUND or NOT DISK-BOUND at one rung, with the evidence in the line.
+    """Which resource binds the durable store at one rung, with the evidence.
 
-    Two measured signals, not the writer's busy share (a group-commit writer is
-    always ~100% busy; load shows up as batch depth):
-      flush_share  (1000 / barrier floor) / commit time — the share of a commit
-                   one device flush explains
-      %util        the disk's own utilisation, when iostat was captured
-    and one cross-check that needs no threshold: per-op commit cost the SAME on
-    disks whose barrier floors differ says the cost is not the disk's.
+    Three verdicts (ADR 0078 §6.1, as amended):
+      DISK-BOUND        one flush explains >= FLUSH_BOUND of a commit, or the
+                        disk is >= DISK_UTIL_BOUND busy (iostat)
+      WRITER-BOUND      the writer spends >= WRITER_BOUND of each second on
+                        per-op work (work_share): the hot path binds
+      NOT STORE-BOUND   neither: the store has room, so the limit at this rung
+                        is upstream of it (hub, network or driver)
+    `busy` is deliberately not a signal: a group-commit writer commits whatever
+    has arrived and reads ~100% busy at any load. One cross-check needs no
+    threshold: per-op commit cost the SAME on disks whose barrier floors differ
+    says the cost is not the disk's.
     """
     ws = [w for w in writer if w["commits_s"] > 0]
     if not ws:
         return "no durable commits in the window — nothing to judge"
     share = max(w["flush_share"] for w in ws)
+    work = max(w.get("work_share", 0.0) for w in ws)
     util = [w["disk"]["util_max"] for w in ws if w.get("disk")]
     floors = [w["floor"] for w in ws if w["floor"]]
     costs = [w["ms_per_op"] for w in ws if w["ms_per_op"]]
@@ -1791,9 +1819,13 @@ def disk_verdict(writer: list[dict]) -> str:
     if share >= FLUSH_BOUND or (util and max(util) >= DISK_UTIL_BOUND):
         return (f"DISK-BOUND: one flush explains up to {share * 100:.0f}% of a commit{util_txt}"
                 f"{same_cost} — durable throughput should track the barrier floor")
-    return (f"NOT DISK-BOUND: one flush explains at most {share * 100:.0f}% of a commit — the rest is "
-            f"per-op work{util_txt}{same_cost}; the limit is the hot path (commit preparation), "
-            "not the disk")
+    if work >= WRITER_BOUND:
+        return (f"WRITER-BOUND: the writer spends up to {work * 100:.0f}% of each second on per-op "
+                f"work, and one flush explains at most {share * 100:.0f}% of a commit{util_txt}"
+                f"{same_cost}; the limit is the hot path (commit preparation), not the disk")
+    return (f"NOT STORE-BOUND: the writer spends at most {work * 100:.0f}% of each second on per-op "
+            f"work and one flush explains at most {share * 100:.0f}% of a commit{util_txt}"
+            f"{same_cost}; the store has room — the limit at this rung is upstream of it")
 
 
 def render_durable_writer(rungs: list[dict]) -> str:
