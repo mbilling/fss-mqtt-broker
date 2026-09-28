@@ -366,14 +366,17 @@ fn open_shard(dir: &Path, segment_bytes: u64) -> Result<(SegmentLog, Replay), Re
 /// with a different shard count.
 pub(super) fn open(root: &Path, shards: usize, segment_bytes: u64) -> Result<Opened, ReplError> {
     let base = root.join(LOG_DIR);
-    // Snapshot BEFORE anything is created (as the redb path does): once shard 0
-    // exists, the store is committed and a missing shard is lost data.
-    let committed = shard_dir(root, 0).exists();
     std::fs::create_dir_all(&base)
         .map_err(|e| ReplError::Backend(format!("creating {}: {e}", base.display())))?;
     // Shard 0 is replayed once: its format stamp is where the committed shard
     // count lives, and that — never the argument — decides K (ADR 0076 T2).
     let (log0, replay0) = open_shard(&shard_dir(root, 0), segment_bytes)?;
+    // The store is COMMITTED once shard 0 carries its format stamp — not once
+    // its directory exists: opening a shard creates the directory and an empty
+    // segment before the stamp is written, so a crash in between leaves an
+    // unstamped shard 0 of a store that never existed. Only a stamped store
+    // treats a missing sibling shard as lost data.
+    let committed = replay0.format.is_some();
     let k = match replay0.format {
         Some((_, n)) => (n as usize).max(1),
         None if log0.next_lsn() == 1 => shards.clamp(1, R_MAX_SHARDS),
@@ -810,6 +813,24 @@ mod tests {
         let err =
             ReplicaState::open_store_with(dir.path(), 1, StoreBackend::Log, 4096).unwrap_err();
         assert!(err.to_string().contains("format 99"), "{err}");
+    }
+
+    /// A crash after shard 0's directory and empty segment were created, and
+    /// before its format stamp: that store never existed, and a multi-shard
+    /// reopen must create it whole — not refuse it as a store that lost shards.
+    #[test]
+    fn an_unstamped_shard_zero_is_a_fresh_store_not_a_lost_one() {
+        let dir = tempfile::tempdir().unwrap();
+        drop(SegmentLog::open(shard_dir(dir.path(), 0), 4096, |_, _, _| Ok(())).unwrap());
+        assert!(shard_dir(dir.path(), 0).exists());
+        let r = ReplicaState::open_store_with(dir.path(), 4, StoreBackend::Log, 4096).unwrap();
+        assert_eq!(r.shard_count(), 4);
+        drop(r);
+        // …and now it IS committed: a missing shard is lost data.
+        std::fs::remove_dir_all(shard_dir(dir.path(), 2)).unwrap();
+        let err =
+            ReplicaState::open_store_with(dir.path(), 4, StoreBackend::Log, 4096).unwrap_err();
+        assert!(err.to_string().contains("is missing"), "{err}");
     }
 
     #[test]

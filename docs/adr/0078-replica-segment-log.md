@@ -92,9 +92,12 @@ are low-volume or out of scope for the clustered durable path.
 - A segment is a sequence of **records**:
   `[len: u32][crc32c: u32][kind: u8][lsn: u64][payload]`. Kinds mirror the ops
   that exist today, plus the metadata the tables hold:
-  `Append{key, offset, epoch, seq, record}`, `Truncate{key, up_to}`,
+  `Append{key, offset, epoch, seq, record}`, `Truncate{key, up_to, low_water}`,
   `Remove{key}`, `Fence{group, epoch}`, `CaughtUp{group, members}`, and
-  `Checkpoint` (below).
+  `Checkpoint` (below). `Truncate` carries both bounds because they differ: a
+  late, lower ack deletes through its own `up_to` while the low-water stays at
+  the committed maximum, so a stale leftover between them must survive a
+  replay exactly as it survives in the table.
 - The record **is** the durable message plus its framing (17 bytes), key and
   three 8-byte fields — about 50–80 bytes for the `q/{client}` keys in use — not
   a 4 KiB page. For a 200-byte payload that is ~1.3× written per logical byte,

@@ -253,7 +253,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `two_bridge_instances_do_not_duplicate_forwarding`
 - `two_partitioned_instances_deliver_each_inbound_message_exactly_once`
 
-## `crates/mqtt-cluster/src/lib.rs` — 317 test(s)
+## `crates/mqtt-cluster/src/lib.rs` — 318 test(s)
 
 - `cluster_identity::tests::a_founder_mints_once_and_reloads_stably`
 - `cluster_identity::tests::a_joiner_adopts_once_and_persists`
@@ -262,6 +262,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `cluster_log::replica_log::tests::a_redb_store_is_imported_once_and_retired`
 - `cluster_log::replica_log::tests::a_torn_last_batch_reopens_to_the_state_before_it`
 - `cluster_log::replica_log::tests::an_interrupted_import_is_redone`
+- `cluster_log::replica_log::tests::an_unstamped_shard_zero_is_a_fresh_store_not_a_lost_one`
 - `cluster_log::replica_log::tests::records_round_trip`
 - `cluster_log::replica_log::tests::the_log_store_equals_the_redb_store_live_and_after_reopen`
 - `cluster_log::tests::a_catch_up_back_fill_never_plants_a_dipping_tag`
