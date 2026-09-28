@@ -15,7 +15,7 @@
 >
 > **Linear scale-out, 3 → 10 nodes:**
 > - **QoS 0:** ~114,000 msg/s **per 4-vCPU node** — **1.14M msg/s on 10 nodes, 40 vCPU in total**; 1.2M at p99 ≤ 2 s, no loss.
-> - **QoS 1:** ~39,000–42,000 msg/s per node — **390,000–420,000 msg/s on 10 nodes**.
+> - **QoS 1, clean sessions:** ~39,000–42,000 msg/s per node — **390,000–420,000 msg/s on 10 nodes**. Durable QoS 1 is a separate, lower curve ([↓](#durable-and-qos-1-scale-out)).
 >
 > Both use shared subscriptions. [Scale-out ↓](#cluster-scale-out-qos-0-shared-subscriptions)
 
@@ -26,7 +26,7 @@
 | | mqttd | the others |
 |---|---|---|
 | **Single-node throughput** | 75k msg/s at p99 ≤ 1 s, 30% CPU idle | 45k / 45k / 30k (Mosquitto / EMQX / HiveMQ CE) |
-| **Cluster scale-out** | flat per node from 3 → 10 nodes: ~114k msg/s QoS 0 and ~39k QoS 1 per 4-vCPU node; ~1M msg/s QoS 0 on **40 vCPU** | vendor-published ~1M msg/s runs: HiveMQ on 40 nodes, EMQX on 1,472 cores ([different workloads ↓](#against-published-cluster-benchmarks)) |
+| **Cluster scale-out** | flat per node from 3 → 10 nodes: ~114k msg/s QoS 0 and ~39k QoS 1 (clean sessions) per 4-vCPU node; ~1M msg/s QoS 0 on **40 vCPU** | vendor-published ~1M msg/s runs: HiveMQ on 40 nodes, EMQX on 1,472 cores ([different workloads ↓](#against-published-cluster-benchmarks)) |
 | **Durable sessions** | quorum-replicated, **default**; acked QoS 1/2 survives node loss, even in flight | Mosquitto/NanoMQ single-node · VerneMQ loses queues on node death · EMQX opt-in |
 | **Revocation** | policy reload **evicts live sessions** | not documented by any compared broker |
 | **Secure by default** | TLS 1.3, mTLS/OIDC, deny-by-default ACL, hash-chained audit; insecure = opt-in + `INSECURE:` log | varies; NanoMQ and Mosquitto < 2.0 allow anonymous by default |
