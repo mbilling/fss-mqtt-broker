@@ -166,7 +166,7 @@ measured on one host, limits printed beside every number
 
 See [`docs/adr/`](docs/adr/) for the decisions and the
 [**delivery dashboard**](docs/delivery/STATUS.md) — the authoritative, live
-record of exactly what is built (77 ADRs, per-task status).
+record of exactly what is built (78 ADRs, per-task status).
 
 ## How fast is one node, next to the others
 
