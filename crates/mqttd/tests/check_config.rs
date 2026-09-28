@@ -578,6 +578,43 @@ fn startup_cross_checks_are_made_by_the_static_gate() {
     );
 }
 
+/// SWIM startup's gossip prerequisites — rotation keys, signing, anti-replay — are made by
+/// `--preflight` too, without opening the anti-replay sequence store (review of #674).
+#[test]
+fn gossip_prerequisites_are_made_by_the_preflight() {
+    let dir = tempfile::tempdir().unwrap();
+    let swim = format!(
+        "{BASE}[cluster]\npeer_bind = \"127.0.0.1:7001\"\n\
+         [cluster.swim]\nbind = \"127.0.0.1:7946\"\n"
+    );
+    // Anti-replay with no gossip key at all.
+    let replay = format!("{swim}replay = \"require\"\n");
+    assert_passes(Gate::Static, dir.path(), &replay);
+    assert_refused(
+        Gate::Preflight,
+        dir.path(),
+        &replay,
+        "MQTTD_SWIM_REPLAY requires",
+    );
+    // Anti-replay over a keyed but UNSIGNED mesh (no cluster-bus TLS to sign with).
+    let key = "ab".repeat(32);
+    let unsigned = format!("{swim}key = \"{key}\"\nreplay = \"require\"\n");
+    assert_refused(
+        Gate::Preflight,
+        dir.path(),
+        &unsigned,
+        "requires cluster.swim.signed=require",
+    );
+    // Rotation keys with no primary key.
+    let rotation = format!("{swim}key_accept = [\"{key}\"]\n");
+    assert_refused(
+        Gate::Preflight,
+        dir.path(),
+        &rotation,
+        "swim.key_accept requires swim.key",
+    );
+}
+
 /// `--preflight` modifies `--check-config` and nothing else.
 #[test]
 fn preflight_without_check_config_is_a_usage_error_exit_2() {

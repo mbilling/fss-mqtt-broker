@@ -1504,7 +1504,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `a_v311_qos2_publisher_is_closed_without_a_pubrec_by_a_real_browned_out_broker`
 - `a_v5_publisher_is_told_0x97_when_brownout_refuses_the_durable_enqueue`
 
-## `crates/mqttd/tests/check_config.rs` — 16 test(s)
+## `crates/mqttd/tests/check_config.rs` — 17 test(s)
 
 - `a_bad_env_value_fails_check_config`
 - `a_complete_secured_config_passes_both_gates`
@@ -1518,6 +1518,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `check_config_rejects_a_min_replicas_floor_above_the_replication_factor`
 - `check_config_rejects_a_watermark_poll_outside_its_range`
 - `each_posture_validates_under_check_config`
+- `gossip_prerequisites_are_made_by_the_preflight`
 - `malformed_referenced_material_is_refused_by_the_preflight`
 - `preflight_without_check_config_is_a_usage_error_exit_2`
 - `startup_cross_checks_are_made_by_the_static_gate`

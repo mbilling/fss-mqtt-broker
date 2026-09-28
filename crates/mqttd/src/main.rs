@@ -2922,16 +2922,15 @@ enum ReplayMode {
     Require,
 }
 
-/// Layer anti-replay (ADR 0023) onto the signed `auth` when configured, returning the auth
-/// plus the per-node sequence allocator the driver uses to sequence outgoing datagrams.
-/// Anti-replay binds to the per-node signature, so it requires signed gossip; it persists a
-/// sequence counter, so it requires a data dir. A requested mode without them is a startup
-/// error. Defaults to `off` (opt-in).
-fn apply_anti_replay(
+/// The anti-replay posture's prerequisites (ADR 0023), without opening the sequence store:
+/// `None` when anti-replay is off, else the data dir its counter will live in. Split out so
+/// `--check-config --preflight` refuses the same combinations SWIM startup does (issue #671)
+/// without creating `gossip-seq` as a side effect of a dry check.
+fn replay_data_dir(
     config: &Config,
-    auth: Option<SwimAuth>,
+    has_key: bool,
     signed: SignedGossip,
-) -> Result<(Option<SwimAuth>, Option<swim_driver::SeqAlloc>), Box<dyn std::error::Error>> {
+) -> Result<Option<&str>, Box<dyn std::error::Error>> {
     let mode = match config.cluster.swim.replay.as_deref() {
         Some("require") => ReplayMode::Require,
         Some("off") | None => ReplayMode::Off,
@@ -2942,11 +2941,11 @@ fn apply_anti_replay(
         }
     };
     if mode == ReplayMode::Off {
-        return Ok((auth, None));
+        return Ok(None);
     }
-    let Some(auth) = auth else {
+    if !has_key {
         return Err("MQTTD_SWIM_REPLAY requires MQTTD_SWIM_KEY".into());
-    };
+    }
     if signed == SignedGossip::Off {
         return Err(
             "cluster.swim.replay requires cluster.swim.signed=require: anti-replay binds the \
@@ -2961,6 +2960,23 @@ fn apply_anti_replay(
                 .into(),
         );
     };
+    Ok(Some(dir))
+}
+
+/// Layer anti-replay (ADR 0023) onto the signed `auth` when configured, returning the auth
+/// plus the per-node sequence allocator the driver uses to sequence outgoing datagrams.
+/// Anti-replay binds to the per-node signature, so it requires signed gossip; it persists a
+/// sequence counter, so it requires a data dir. A requested mode without them is a startup
+/// error. Defaults to `off` (opt-in).
+fn apply_anti_replay(
+    config: &Config,
+    auth: Option<SwimAuth>,
+    signed: SignedGossip,
+) -> Result<(Option<SwimAuth>, Option<swim_driver::SeqAlloc>), Box<dyn std::error::Error>> {
+    let Some(dir) = replay_data_dir(config, auth.is_some(), signed)? else {
+        return Ok((auth, None));
+    };
+    let auth = auth.expect("replay_data_dir refuses anti-replay without a gossip key");
     let store = FileSeqStore::open(Path::new(dir).join("gossip-seq"))?;
     let alloc = mqtt_cluster::replay::SequenceAllocator::open(
         Box::new(store) as Box<dyn mqtt_cluster::replay::SeqStore>,
@@ -4410,7 +4426,9 @@ fn host_checks(config: &Config) -> Result<(), String> {
     authenticator_from_config(config, None, None).map_err(text)?;
     let peer_tls = peer_tls_from_config(config).map_err(text)?;
     if config.cluster.swim.bind.is_some() {
-        swim_auth_from_config(config, peer_tls.as_ref().map(|(tls, _)| tls)).map_err(text)?;
+        let (auth, signed) =
+            swim_auth_from_config(config, peer_tls.as_ref().map(|(tls, _)| tls)).map_err(text)?;
+        replay_data_dir(config, auth.is_some(), signed).map_err(text)?;
     }
     Ok(())
 }
