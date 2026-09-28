@@ -12,7 +12,7 @@ use crate::aliases::{InboundAliases, OutboundAliases};
 use crate::hub::{Admission, AttachOutcome, AuthMethod, HubCommand, Outbound, Will};
 use bytes::Bytes;
 use mqtt_auth::{
-    basic::BasicAuthenticator, mtls::IdentitySource, AllowAll, AuthSession, AuthStep,
+    basic::BasicAuthenticator, mtls::IdentitySource, AllowAll, AuthError, AuthSession, AuthStep,
     Authenticator, Authorizer, Credentials, EnhancedAuthenticator, Identity,
 };
 use mqtt_cluster::placement::Placement;
@@ -1128,7 +1128,8 @@ async fn authenticate_connect<W>(
 where
     W: AsyncWrite + Unpin,
 {
-    // mTLS identity outranks any wire credential (ADR 0004). Otherwise, when a token
+    // mTLS identity outranks any wire credential (ADR 0004) — unless both factors are
+    // required (below). Otherwise, when a token
     // verifier is configured, a JWT-shaped password is carried as a bearer token — the
     // ecosystem convention (EMQX/HiveMQ: the JWT rides in the password field), and the
     // only path by which a real client can reach the token/OIDC authenticators
@@ -1140,33 +1141,59 @@ where
         .as_deref()
         .filter(|_| policy.authenticator().handles_token())
         .and_then(jwt_password_str);
+    // Both factors (issue #670): with the policy on, a certificate verified AT THIS HOP no
+    // longer admits on its own — the CONNECT's username must BE the certificate identity
+    // (one principal, never a certificate for one and a password for another) and its
+    // password must verify for it. A proxied session (`via`) is exempt: its identity was
+    // vouched by the landing node, which enforced both factors where the certificate was
+    // actually presented — and a vouched password or anonymous principal has no
+    // certificate to pair with at all.
+    let both_factors = via.is_none() && policy.authenticator().requires_password_with_certificate();
     let creds = match (identity, token, &connect.username) {
-        (Some(id), _, _) => Credentials::ClientCert {
-            subject: &id.subject,
+        (Some(id), _, username) if both_factors => match (username, connect.password.as_deref()) {
+            (Some(username), Some(password)) if *username == id.subject => {
+                Some(Credentials::Password { username, password })
+            }
+            // No password, or a username naming someone else: refused below without
+            // consulting the verifier.
+            _ => None,
         },
-        (None, Some(jwt), _) => Credentials::Token(jwt),
-        (None, None, Some(username)) => Credentials::Password {
+        (Some(id), _, _) => Some(Credentials::ClientCert {
+            subject: &id.subject,
+        }),
+        (None, Some(jwt), _) => Some(Credentials::Token(jwt)),
+        (None, None, Some(username)) => Some(Credentials::Password {
             username,
             password: connect.password.as_deref().unwrap_or(&[]),
-        },
-        (None, None, None) => Credentials::Anonymous,
+        }),
+        (None, None, None) => Some(Credentials::Anonymous),
     };
-    let auth_method = match creds {
-        Credentials::ClientCert { .. } => AuthMethod::Certificate,
-        Credentials::Password { .. } => AuthMethod::Password,
-        Credentials::Token(_) => AuthMethod::Token,
-        Credentials::Anonymous => AuthMethod::Anonymous,
-    };
-    let method = match creds {
-        Credentials::ClientCert { .. } => "certificate",
-        Credentials::Password { .. } => "password",
-        Credentials::Token(_) => "token",
-        Credentials::Anonymous => "anonymous",
+    // A both-factors admission is recorded as a PASSWORD admission, so the reload sweep's
+    // user-removed probe covers it (ADR 0040 T2); the CRL sweep keys on the leaf serial,
+    // which is recorded regardless of method, so revoking the certificate still evicts.
+    let (auth_method, method) = match creds {
+        _ if both_factors => (AuthMethod::Password, "certificate+password"),
+        Some(Credentials::ClientCert { .. }) => (AuthMethod::Certificate, "certificate"),
+        Some(Credentials::Password { .. }) => (AuthMethod::Password, "password"),
+        Some(Credentials::Token(_)) => (AuthMethod::Token, "token"),
+        Some(Credentials::Anonymous) | None => (AuthMethod::Anonymous, "anonymous"),
     };
     // Awaited, not blocked on: an authenticator may be remote (HTTP hook, LDAP, token
     // introspection). Nothing here bounds how long it takes — an I/O-backed
     // implementation owns its own timeout, and must fail closed when it expires.
-    match policy.authenticator().authenticate(client, &creds).await {
+    let verdict = match &creds {
+        Some(creds) => policy.authenticator().authenticate(client, creds).await,
+        None => Err(AuthError::Rejected),
+    };
+    // The verifier must also name the certificate's principal: a remote hook answering
+    // for a different subject is a mismatch, not an admission.
+    let verdict = match (verdict, identity) {
+        (Ok(id), Some(cert)) if both_factors && id.subject != cert.subject => {
+            Err(AuthError::Rejected)
+        }
+        (verdict, _) => verdict,
+    };
+    match verdict {
         Ok(id) => {
             // For a relocated session, attribute it to the node that vouched (ADR
             // 0005); a direct client has no `via`.
@@ -1179,12 +1206,12 @@ where
             Ok(Some((id, auth_method)))
         }
         Err(e) => {
-            let code = if matches!(creds, Credentials::Password { .. }) {
+            let code = if both_factors || matches!(creds, Some(Credentials::Password { .. })) {
                 CONNACK_BAD_CREDENTIALS
             } else {
                 CONNACK_NOT_AUTHORIZED
             };
-            warn!(client = %client.0, error = %e, "CONNECT rejected: authentication failed");
+            warn!(client = %client.0, error = %e, method, "CONNECT rejected: authentication failed");
             count_connection_error(policy, "auth");
             // The subject is the client id, not a credential — never log secrets.
             policy.audit.record(
@@ -3661,6 +3688,64 @@ mod tests {
             "audit detail should attribute the relaying node, got: {}",
             auth.detail
         );
+    }
+
+    /// Both factors (issue #670) apply where the certificate was presented, not to a
+    /// relocated session: the owner serves an identity the landing node VOUCHED for, which
+    /// may be a password or anonymous principal with no certificate at all. The same
+    /// credential-less CONNECT is admitted when vouched (`via`) and refused when the
+    /// identity is a certificate verified at this hop.
+    #[tokio::test]
+    async fn both_factors_are_required_at_the_certificate_hop_not_of_a_vouched_session() {
+        for (via, admitted) in [(Some("node-a".to_string()), true), (None, false)] {
+            let chain =
+                mqtt_auth::chain::ChainAuthenticator::new(vec![Arc::new(BasicAuthenticator {
+                    allow_anonymous: true,
+                })])
+                .requiring_password_with_certificate(true);
+            let policy = Arc::new(ConnPolicy {
+                auth: auth_handle(Arc::new(chain)),
+                authz: authz_handle(Arc::new(mqtt_auth::AllowAll)),
+                identity_source: mqtt_auth::mtls::IdentitySource::default(),
+                audit: Arc::new(mqtt_observability::RecordingAuditSink::new()),
+                proxy: None,
+                node: None,
+                store: None,
+                connect_timeout: DEFAULT_CONNECT_TIMEOUT,
+                enhanced: None,
+                shutdown: None,
+                metrics: None,
+            });
+            let (client, owner_side) = tokio::io::duplex(4096);
+            let (owner_read, owner_write) = tokio::io::split(owner_side);
+            let (hub_tx, hub_rx) = mpsc::unbounded_channel();
+            let _seen = stub_hub(hub_rx);
+            tokio::spawn(super::serve_proxied(
+                owner_read,
+                owner_write,
+                None,
+                Some(mqtt_auth::Identity {
+                    subject: "device-7".to_string(),
+                    groups: Vec::new(),
+                }),
+                policy,
+                hub_tx,
+                bytes::BytesMut::new(),
+                via.clone(),
+            ));
+            let (client_read, client_write) = tokio::io::split(client);
+            let mut reader: Reader = FrameReader::new(client_read, V4);
+            let mut writer: Writer = FrameWriter::new(client_write, V4);
+            writer
+                .send(&connect_packet("device-7", true))
+                .await
+                .unwrap();
+            let Some(Packet::ConnAck(ack)) = recv(&mut reader).await else {
+                panic!("via={via:?}: expected a CONNACK");
+            };
+            // v3.1.1: 0 = accepted, 4 = bad user name or password.
+            assert_eq!(ack.code, if admitted { 0 } else { 4 }, "via={via:?}");
+        }
     }
 
     /// The decode-failure → reason-code mapping, pinned by kind rather than only

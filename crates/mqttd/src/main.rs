@@ -1663,7 +1663,17 @@ fn authenticator_from_config(
     if let Some(oidc) = oidc {
         members.push(oidc);
     }
-    Ok(Arc::new(mqtt_auth::chain::ChainAuthenticator::new(members)))
+    let both_factors = config.security.require_password_with_certificate;
+    if both_factors {
+        info!(
+            "certificate clients must ALSO present a password for the certificate identity \
+             (require_password_with_certificate)"
+        );
+    }
+    Ok(Arc::new(
+        mqtt_auth::chain::ChainAuthenticator::new(members)
+            .requiring_password_with_certificate(both_factors),
+    ))
 }
 
 /// OIDC-mode settings (ADR 0050), validated without touching the network: `None` when OIDC
@@ -3675,6 +3685,8 @@ fn requires_restart(old: &Config, new: &Config) -> Vec<&'static str> {
         let mut c = c.clone();
         c.security.allow_anonymous = false;
         c.security.password_file = None;
+        // Carried by the authenticator chain the reload rebuilds (issue #670).
+        c.security.require_password_with_certificate = false;
         c.security.acl_file = None;
         c.security.jwt = Jwt::default();
         c.limits.max_subscriptions_per_client = None;
@@ -5076,10 +5088,11 @@ mod tests {
         let mut live = base.clone();
         live.security.allow_anonymous = true;
         live.security.acl_file = Some("/etc/acl.toml".into());
+        live.security.require_password_with_certificate = true;
         live.limits.max_sessions = Some(1000);
         assert!(
             requires_restart(&base, &live).is_empty(),
-            "quotas / allow_anonymous / ACL path are live"
+            "quotas / allow_anonymous / ACL path / both-factors are live"
         );
 
         // Non-live edits DO require a restart, reported by section.

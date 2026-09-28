@@ -37,7 +37,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/history-check/src/main.rs` — 0 test(s)
 
 
-## `crates/mqtt-auth/src/lib.rs` — 123 test(s)
+## `crates/mqtt-auth/src/lib.rs` — 124 test(s)
 
 - `acl::tests::a_bad_client_id_does_not_disturb_rules_that_never_use_it`
 - `acl::tests::a_bare_percent_is_literal`
@@ -89,6 +89,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `chain::tests::first_abstains_second_accepts_yields_ok`
 - `chain::tests::first_backend_error_is_final_and_short_circuits`
 - `chain::tests::first_rejection_is_final_and_short_circuits`
+- `chain::tests::requiring_password_with_certificate_is_opt_in`
 - `enhanced::tests::correct_proof_succeeds`
 - `enhanced::tests::empty_subject_fails_immediately`
 - `enhanced::tests::method_name_is_advertised`
@@ -682,7 +683,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 
 - `publish_codec_round_trip_clears_the_floor`
 
-## `crates/mqtt-config/src/lib.rs` — 35 test(s)
+## `crates/mqtt-config/src/lib.rs` — 36 test(s)
 
 - `tests::a_backup_dir_inside_the_data_dir_is_a_config_error`
 - `tests::a_bad_enum_value_is_rejected`
@@ -709,6 +710,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::out_of_range_values_are_rejected`
 - `tests::ownership_domain_parses_both_values_and_refuses_others`
 - `tests::per_var_boolean_conventions_are_honoured`
+- `tests::requiring_both_factors_needs_a_client_ca_and_a_password_verifier`
 - `tests::the_env_surface_is_a_deduplicated_curated_list`
 - `tests::the_gossip_key_is_inline_xor_by_reference`
 - `tests::the_new_per_subscriber_bounds_are_refused_out_of_range`
@@ -961,7 +963,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 457 test(s)
+## `crates/mqttd/src/lib.rs` — 458 test(s)
 
 - `admission::tests::the_global_cap_refuses_at_the_bound_and_recovers`
 - `admission::tests::the_penalty_box_refuses_after_the_threshold`
@@ -1034,6 +1036,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `conn::tests::an_assigned_id_is_unique_across_nodes_not_just_within_one`
 - `conn::tests::an_eof_without_disconnect_detaches_ungracefully_so_the_will_fires`
 - `conn::tests::an_unclustered_assigned_id_needs_no_node_qualifier`
+- `conn::tests::both_factors_are_required_at_the_certificate_hop_not_of_a_vouched_session`
 - `conn::tests::codec_errors_map_to_the_right_disconnect_reason`
 - `conn::tests::connection_lifecycle_moves_the_metrics_counters`
 - `conn::tests::empty_client_id_with_clean_session_gets_auto_id`
@@ -1807,12 +1810,13 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `placement_converges_across_the_cluster`
 - `swim_discovery_establishes_routing_both_ways`
 
-## `crates/mqttd/tests/tls.rs` — 15 test(s)
+## `crates/mqttd/tests/tls.rs` — 16 test(s)
 
 - `a_crl_reload_evicts_the_live_session_of_a_revoked_cert`
 - `a_reconnecting_client_resumes_its_tls_session`
 - `a_san_configured_listener_derives_the_identity_from_the_san_not_the_cn`
 - `a_san_configured_listener_refuses_a_cn_only_certificate`
+- `both_factors_require_the_certificate_identitys_own_password`
 - `crl_rejects_a_revoked_client_certificate`
 - `mtls_common_name_identity_is_admitted_under_deny_anonymous`
 - `mtls_listener_rejects_clients_without_certificates`

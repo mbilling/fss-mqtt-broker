@@ -158,6 +158,15 @@ pub struct Security {
     pub mtls_identity_source: Option<String>,
     /// Argon2id `username:phc-hash` password file (`MQTTD_PASSWORD_FILE`).
     pub password_file: Option<String>,
+    /// Require BOTH factors from a client that presents a verified certificate
+    /// (`MQTTD_REQUIRE_PASSWORD_WITH_CERTIFICATE`, issue #670): its CONNECT must also carry
+    /// a username equal to the certificate identity and a password that verifies for it.
+    /// Default `false`: the certificate alone admits the client and any wire credential is
+    /// ignored (ADR 0004). Needs `tls.client_ca` and a password verifier
+    /// (`password_file` or `http_auth`). Certificate-less clients are not affected — on a
+    /// TLS listener with a client CA the handshake already refuses them. Hot-reloadable; a
+    /// change applies to new CONNECTs — established sessions are not re-authenticated.
+    pub require_password_with_certificate: bool,
     /// Topic-ACL TOML policy file (`MQTTD_ACL_FILE`); without it authorization is not
     /// enforced and loudly logged.
     pub acl_file: Option<String>,
@@ -181,6 +190,7 @@ impl Default for Security {
             require_client_cert: true,
             mtls_identity_source: None,
             password_file: None,
+            require_password_with_certificate: false,
             acl_file: None,
             jwt: Jwt::default(),
             oidc: Oidc::default(),
@@ -1151,6 +1161,12 @@ impl Config {
         on!("MQTTD_PASSWORD_FILE", v, {
             self.security.password_file = Some(v);
         });
+        on!("MQTTD_REQUIRE_PASSWORD_WITH_CERTIFICATE", v, {
+            self.security.require_password_with_certificate = !matches!(
+                v.to_ascii_lowercase().as_str(),
+                "0" | "false" | "off" | "no"
+            );
+        });
         on!("MQTTD_ACL_FILE", v, {
             self.security.acl_file = Some(v);
         });
@@ -1578,6 +1594,26 @@ impl Config {
                 "tls.crl requires tls.client_ca".to_string(),
             ));
         }
+        // Both factors (issue #670): a requirement that can never apply is refused rather
+        // than silently inert, like the CRL-without-CA rule above. Without a client CA no
+        // certificate is ever verified; without a password verifier no password could pass.
+        if self.security.require_password_with_certificate {
+            if self.tls.client_ca.is_none() {
+                return Err(ConfigError::Invalid(
+                    "security.require_password_with_certificate requires tls.client_ca: \
+                     without a client CA no certificate is verified, so there is none to \
+                     pair a password with"
+                        .to_string(),
+                ));
+            }
+            if self.security.password_file.is_none() && self.security.http_auth.url.is_none() {
+                return Err(ConfigError::Invalid(
+                    "security.require_password_with_certificate requires a password \
+                     verifier: security.password_file or security.http_auth.url"
+                        .to_string(),
+                ));
+            }
+        }
         if self.cluster.peer_tls.crl.is_some()
             && (self.cluster.peer_tls.ca.is_none()
                 || self.cluster.peer_tls.cert.is_none()
@@ -1771,6 +1807,7 @@ pub const ENV_VARS: &[&str] = &[
     "MQTTD_ALLOW_ANONYMOUS",
     "MQTTD_MTLS_IDENTITY_SOURCE",
     "MQTTD_PASSWORD_FILE",
+    "MQTTD_REQUIRE_PASSWORD_WITH_CERTIFICATE",
     "MQTTD_ACL_FILE",
     "MQTTD_JWT_HS256_SECRET_FILE",
     "MQTTD_JWT_RS256_PEM",
@@ -2191,6 +2228,47 @@ mod tests {
         );
     }
 
+    /// Issue #670: requiring both factors is refused when it could never apply — no client
+    /// CA (no certificate is ever verified) or no password verifier (no password could
+    /// pass) — and accepted with either verifier.
+    #[test]
+    fn requiring_both_factors_needs_a_client_ca_and_a_password_verifier() {
+        let flag = "[durable]\nallow_ephemeral = true\n";
+        let invalid = |toml: &str| match Config::from_toml(&format!("{toml}{flag}")) {
+            Err(super::ConfigError::Invalid(m)) => m,
+            other => panic!("expected a validation error for:\n{toml}\ngot {other:?}"),
+        };
+        let m = invalid(
+            "[security]\nrequire_password_with_certificate = true\n\
+             password_file = \"/etc/mqttd/passwd\"\n",
+        );
+        assert!(m.contains("requires tls.client_ca"), "{m}");
+        let m = invalid(
+            "[tls]\nclient_ca = \"/etc/mqttd/ca.pem\"\n\
+             [security]\nrequire_password_with_certificate = true\n",
+        );
+        assert!(m.contains("requires a password verifier"), "{m}");
+        for verifier in [
+            "password_file = \"/etc/mqttd/passwd\"\n",
+            "[security.http_auth]\nurl = \"https://auth.example/mqtt\"\n",
+        ] {
+            let toml = format!(
+                "[tls]\nclient_ca = \"/etc/mqttd/ca.pem\"\n\
+                 [security]\nrequire_password_with_certificate = true\n{verifier}{flag}"
+            );
+            let c = Config::from_toml(&toml).unwrap_or_else(|e| panic!("{toml}: {e}"));
+            assert!(c.security.require_password_with_certificate);
+        }
+        // Off by default, and the env overlay's off-spellings keep it off.
+        assert!(!Config::default().security.require_password_with_certificate);
+        for (v, want) in [("1", true), ("true", true), ("0", false), ("off", false)] {
+            let mut c = Config::default();
+            c.overlay_from(getter(&[("MQTTD_REQUIRE_PASSWORD_WITH_CERTIFICATE", v)]))
+                .unwrap();
+            assert_eq!(c.security.require_password_with_certificate, want, "{v}");
+        }
+    }
+
     #[test]
     fn per_var_boolean_conventions_are_honoured() {
         // MQTTD_ALLOW_ANONYMOUS: *any* value means "on" (the footgun a naive flatten hits).
@@ -2594,8 +2672,9 @@ mod tests {
             // MQTTD_TLS_ALLOW_UNSAFE_TLS12_FEATURES / MQTTD_CONFIG_UNKNOWN_KEYS /
             // MQTTD_AUDIT_SYSLOG (0070-T3: overlay already consumed them),
             // plus MQTTD_SHARED_LOCAL_BIAS (issue #613 item 3.4: the locality dial
-            // that turns MQTTD_SHARED_PREFER_LOCAL's on/off into a fraction).
-            95,
+            // that turns MQTTD_SHARED_PREFER_LOCAL's on/off into a fraction),
+            // plus MQTTD_REQUIRE_PASSWORD_WITH_CERTIFICATE (issue #670).
+            96,
             "the MQTTD_* surface changed — update ENV_VARS"
         );
         // Issue #239: MQTTD_MIN_REPLICAS was wired in `overlay_from` but never

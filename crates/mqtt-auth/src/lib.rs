@@ -111,6 +111,14 @@ pub trait Authenticator: Send + Sync {
         false
     }
 
+    /// Whether a client that presented a verified certificate must ALSO present a
+    /// password verifying for the same identity (issue #670). The CONNECT path consults
+    /// this to authenticate a certificate client's wire credentials instead of ignoring
+    /// them. Default `false`: the certificate alone admits (ADR 0004).
+    fn requires_password_with_certificate(&self) -> bool {
+        false
+    }
+
     /// Whether `subject`, previously admitted with **password** credentials, still
     /// exists in this authenticator's credential store (ADR 0040 T2). The identity
     /// sweep evicts a live password session whose user was removed by a reload.
