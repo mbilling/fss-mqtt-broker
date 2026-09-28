@@ -107,6 +107,20 @@ pub struct Listeners {
     pub health_bind: Option<String>,
     /// Optional separate `/metrics` listener (`MQTTD_METRICS_BIND`), to isolate the scrape.
     pub metrics_bind: Option<String>,
+    /// Per-listener anonymous access (issue #669): each overrides
+    /// [`Security::allow_anonymous`] for its listener alone, and unset inherits it — so a
+    /// plaintext listener on a trusted segment can admit anonymous clients while the TLS
+    /// listener requires credentials. Env `MQTTD_<LISTENER>_ALLOW_ANONYMOUS` takes
+    /// `1/true/on/yes` or `0/false/off/no`. Restart-scoped, like the binds.
+    pub tls_allow_anonymous: Option<bool>,
+    /// See [`Listeners::tls_allow_anonymous`] (`MQTTD_PLAINTEXT_ALLOW_ANONYMOUS`).
+    pub plaintext_allow_anonymous: Option<bool>,
+    /// See [`Listeners::tls_allow_anonymous`] (`MQTTD_WS_ALLOW_ANONYMOUS`).
+    pub ws_allow_anonymous: Option<bool>,
+    /// See [`Listeners::tls_allow_anonymous`] (`MQTTD_WSS_ALLOW_ANONYMOUS`).
+    pub wss_allow_anonymous: Option<bool>,
+    /// See [`Listeners::tls_allow_anonymous`] (`MQTTD_QUIC_ALLOW_ANONYMOUS`).
+    pub quic_allow_anonymous: Option<bool>,
 }
 
 /// TLS material for the client listeners. Paths, never inlined key bytes (ADR 0046 T5).
@@ -1065,6 +1079,17 @@ impl Config {
             v.parse::<T>()
                 .map_err(|e| ConfigError::Invalid(format!("{key}: invalid value {v:?}: {e}")))
         }
+        // An explicit on/off for a security toggle: anything else is an error, never a
+        // guess in either direction.
+        fn on_off(key: &str, v: &str) -> Result<bool, ConfigError> {
+            match v.to_ascii_lowercase().as_str() {
+                "1" | "true" | "on" | "yes" => Ok(true),
+                "0" | "false" | "off" | "no" => Ok(false),
+                _ => Err(ConfigError::Invalid(format!(
+                    "{key}: invalid value {v:?}: expected 1/true/on/yes or 0/false/off/no"
+                ))),
+            }
+        }
         fn list(v: &str) -> Vec<String> {
             v.split(',')
                 .map(str::trim)
@@ -1119,6 +1144,22 @@ impl Config {
         });
         on!("MQTTD_QUIC_BIND", v, {
             self.listeners.quic_bind = Some(v);
+        });
+        on!("MQTTD_TLS_ALLOW_ANONYMOUS", v, {
+            self.listeners.tls_allow_anonymous = Some(on_off("MQTTD_TLS_ALLOW_ANONYMOUS", &v)?);
+        });
+        on!("MQTTD_PLAINTEXT_ALLOW_ANONYMOUS", v, {
+            self.listeners.plaintext_allow_anonymous =
+                Some(on_off("MQTTD_PLAINTEXT_ALLOW_ANONYMOUS", &v)?);
+        });
+        on!("MQTTD_WS_ALLOW_ANONYMOUS", v, {
+            self.listeners.ws_allow_anonymous = Some(on_off("MQTTD_WS_ALLOW_ANONYMOUS", &v)?);
+        });
+        on!("MQTTD_WSS_ALLOW_ANONYMOUS", v, {
+            self.listeners.wss_allow_anonymous = Some(on_off("MQTTD_WSS_ALLOW_ANONYMOUS", &v)?);
+        });
+        on!("MQTTD_QUIC_ALLOW_ANONYMOUS", v, {
+            self.listeners.quic_allow_anonymous = Some(on_off("MQTTD_QUIC_ALLOW_ANONYMOUS", &v)?);
         });
         on!("MQTTD_HEALTH_BIND", v, {
             self.listeners.health_bind = Some(v);
@@ -1795,6 +1836,11 @@ pub const ENV_VARS: &[&str] = &[
     "MQTTD_QUIC_BIND",
     "MQTTD_HEALTH_BIND",
     "MQTTD_METRICS_BIND",
+    "MQTTD_TLS_ALLOW_ANONYMOUS",
+    "MQTTD_PLAINTEXT_ALLOW_ANONYMOUS",
+    "MQTTD_WS_ALLOW_ANONYMOUS",
+    "MQTTD_WSS_ALLOW_ANONYMOUS",
+    "MQTTD_QUIC_ALLOW_ANONYMOUS",
     // tls
     "MQTTD_TLS_CERT",
     "MQTTD_TLS_KEY",
@@ -2269,6 +2315,39 @@ mod tests {
         }
     }
 
+    /// Issue #669: each listener's anonymous override is tri-state — unset inherits
+    /// `security.allow_anonymous` — parses from TOML, and from the env only as an explicit
+    /// on/off (a typo in a security toggle is an error, not a guess).
+    #[test]
+    fn per_listener_anonymous_overrides_are_tri_state() {
+        let c = Config::default();
+        assert_eq!(
+            c.listeners.plaintext_allow_anonymous, None,
+            "unset = inherit"
+        );
+        let c = Config::from_toml(
+            "[listeners]\nplaintext_allow_anonymous = true\ntls_allow_anonymous = false\n\
+             [durable]\nallow_ephemeral = true\n",
+        )
+        .unwrap();
+        assert_eq!(c.listeners.plaintext_allow_anonymous, Some(true));
+        assert_eq!(c.listeners.tls_allow_anonymous, Some(false));
+        assert_eq!(c.listeners.ws_allow_anonymous, None);
+        for (v, want) in [("1", true), ("yes", true), ("off", false), ("FALSE", false)] {
+            let mut c = Config::default();
+            c.overlay_from(getter(&[("MQTTD_WSS_ALLOW_ANONYMOUS", v)]))
+                .unwrap();
+            assert_eq!(c.listeners.wss_allow_anonymous, Some(want), "{v}");
+        }
+        let err = Config::default()
+            .overlay_from(getter(&[("MQTTD_QUIC_ALLOW_ANONYMOUS", "maybe")]))
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("MQTTD_QUIC_ALLOW_ANONYMOUS"),
+            "{err}"
+        );
+    }
+
     #[test]
     fn per_var_boolean_conventions_are_honoured() {
         // MQTTD_ALLOW_ANONYMOUS: *any* value means "on" (the footgun a naive flatten hits).
@@ -2472,8 +2551,16 @@ mod tests {
     /// a parseable one; everything else takes an arbitrary non-empty string.
     fn distinct_value(var: &str) -> &'static str {
         match var {
-            // Data-safe defaults are ON, so only a falsey value *changes* them.
-            "MQTTD_DURABLE_SESSIONS" | "MQTTD_REFOUND_GUARD" | "MQTTD_SHARED_PREFER_LOCAL" => "off",
+            // Data-safe defaults are ON, so only a falsey value *changes* them; the per-listener
+            // anonymous overrides are tri-state (unset = inherit), so any explicit value does.
+            "MQTTD_DURABLE_SESSIONS"
+            | "MQTTD_REFOUND_GUARD"
+            | "MQTTD_SHARED_PREFER_LOCAL"
+            | "MQTTD_TLS_ALLOW_ANONYMOUS"
+            | "MQTTD_PLAINTEXT_ALLOW_ANONYMOUS"
+            | "MQTTD_WS_ALLOW_ANONYMOUS"
+            | "MQTTD_WSS_ALLOW_ANONYMOUS"
+            | "MQTTD_QUIC_ALLOW_ANONYMOUS" => "off",
             // A fraction whose default is 1.0 (= today's behaviour), so only a SMALLER
             // fraction moves the config. Quantised to per mille on the way in: 0.5 -> 500.
             "MQTTD_SHARED_LOCAL_BIAS" => "0.5",
@@ -2673,8 +2760,9 @@ mod tests {
             // MQTTD_AUDIT_SYSLOG (0070-T3: overlay already consumed them),
             // plus MQTTD_SHARED_LOCAL_BIAS (issue #613 item 3.4: the locality dial
             // that turns MQTTD_SHARED_PREFER_LOCAL's on/off into a fraction),
-            // plus MQTTD_REQUIRE_PASSWORD_WITH_CERTIFICATE (issue #670).
-            96,
+            // plus MQTTD_REQUIRE_PASSWORD_WITH_CERTIFICATE (issue #670),
+            // plus the five MQTTD_<LISTENER>_ALLOW_ANONYMOUS overrides (issue #669).
+            101,
             "the MQTTD_* surface changed — update ENV_VARS"
         );
         // Issue #239: MQTTD_MIN_REPLICAS was wired in `overlay_from` but never

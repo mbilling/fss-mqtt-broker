@@ -166,6 +166,7 @@ async fn start_reloadable_node(
             let identity = id_rx.recv().await;
             // Each connection clones the live `watch` receivers — a reload reaches them.
             let conn_policy = Arc::new(mqttd::conn::ConnPolicy {
+                anonymous: None,
                 auth: handles.auth.clone(),
                 authz: handles.authz.clone(),
                 identity_source: mqtt_auth::mtls::IdentitySource::default(),

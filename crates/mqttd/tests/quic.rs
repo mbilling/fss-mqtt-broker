@@ -32,6 +32,7 @@ const V4: ProtocolVersion = ProtocolVersion::V311;
 
 fn permissive_policy() -> Arc<ConnPolicy> {
     Arc::new(ConnPolicy {
+        anonymous: None,
         auth: auth_handle(Arc::new(mqtt_auth::basic::BasicAuthenticator {
             allow_anonymous: true,
         })),

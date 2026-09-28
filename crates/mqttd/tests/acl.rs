@@ -44,6 +44,7 @@ async fn start_acl_node(policy_toml: &str) -> (SocketAddr, mpsc::UnboundedSender
             let (stream, peer) = listener.accept().await.unwrap();
             let identity = id_rx.recv().await;
             let conn_policy = Arc::new(mqttd::conn::ConnPolicy {
+                anonymous: None,
                 auth: mqttd::conn::auth_handle(Arc::new(BasicAuthenticator {
                     allow_anonymous: false,
                 })),

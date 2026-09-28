@@ -104,6 +104,7 @@ async fn start_reloadable_node(pw_path: PathBuf) -> (SocketAddr, reload::Reloade
         loop {
             let (stream, peer) = listener.accept().await.unwrap();
             let conn_policy = Arc::new(mqttd::conn::ConnPolicy {
+                anonymous: None,
                 auth: handles.auth.clone(),
                 authz: handles.authz.clone(),
                 identity_source: mqtt_auth::mtls::IdentitySource::default(),

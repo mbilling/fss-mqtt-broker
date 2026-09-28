@@ -129,6 +129,7 @@ async fn start_tls_node(acceptor: TlsAcceptor) -> SocketAddr {
                         allow_anonymous: true,
                     });
                     let policy = Arc::new(mqttd::conn::ConnPolicy {
+                        anonymous: None,
                         auth: mqttd::conn::auth_handle(auth),
                         authz: mqttd::conn::authz_handle(Arc::new(mqtt_auth::AllowAll)),
                         identity_source: mqtt_auth::mtls::IdentitySource::default(),
@@ -527,6 +528,7 @@ async fn start_identity_node(
                         allow_anonymous: false,
                     });
                     let policy = Arc::new(mqttd::conn::ConnPolicy {
+                        anonymous: None,
                         auth: mqttd::conn::auth_handle(auth),
                         authz: mqttd::conn::authz_handle(authz),
                         identity_source: source,
@@ -754,6 +756,7 @@ async fn tls_without_client_cert_is_not_authorized_under_deny_anonymous() {
                         allow_anonymous: false,
                     });
                     let policy = Arc::new(mqttd::conn::ConnPolicy {
+                        anonymous: None,
                         auth: mqttd::conn::auth_handle(auth),
                         authz: mqttd::conn::authz_handle(Arc::new(mqtt_auth::AllowAll)),
                         identity_source: mqtt_auth::mtls::IdentitySource::default(),
@@ -1043,6 +1046,7 @@ async fn start_reloadable_mtls_node(
             tokio::spawn(async move {
                 if let Ok(tls) = acceptor.accept(stream).await {
                     let policy = Arc::new(mqttd::conn::ConnPolicy {
+                        anonymous: None,
                         auth,
                         authz,
                         identity_source: mqtt_auth::mtls::IdentitySource::default(),
@@ -1280,6 +1284,7 @@ async fn start_both_factors_node(pki: &Pki, password_line: &str, both_factors: b
                     ])
                     .requiring_password_with_certificate(both_factors);
                     let policy = Arc::new(mqttd::conn::ConnPolicy {
+                        anonymous: None,
                         auth: mqttd::conn::auth_handle(Arc::new(chain)),
                         authz: mqttd::conn::authz_handle(Arc::new(mqtt_auth::AllowAll)),
                         identity_source: source,
@@ -1300,14 +1305,12 @@ async fn start_both_factors_node(pki: &Pki, password_line: &str, both_factors: b
     addr
 }
 
-/// CONNECT with the given wire credentials; the CONNACK return code.
-async fn connack_code(
-    addr: SocketAddr,
-    connector: &TlsConnector,
+/// CONNECT with the given wire credentials over `stream`; the CONNACK return code.
+async fn connack_on<S: AsyncRead + AsyncWrite>(
+    stream: S,
     username: Option<&str>,
     password: Option<&str>,
 ) -> u8 {
-    let stream = tls_connect(addr, connector).await.unwrap();
     let (rh, wh) = tokio::io::split(stream);
     let mut reader = mqtt_net::FrameReader::new(rh, V4);
     let mut writer = mqtt_net::FrameWriter::new(wh, V4);
@@ -1317,7 +1320,7 @@ async fn connack_code(
             protocol: V4,
             clean_session: true,
             keep_alive: 30,
-            client_id: "both-factors".to_string(),
+            client_id: "credentials-probe".to_string(),
             last_will: None,
             username: username.map(ToString::to_string),
             password: password.map(|p| bytes::Bytes::copy_from_slice(p.as_bytes())),
@@ -1328,6 +1331,21 @@ async fn connack_code(
         Ok(Ok(Some(Packet::ConnAck(ack)))) => ack.code,
         other => panic!("expected a CONNACK, got {other:?}"),
     }
+}
+
+/// [`connack_on`] over TLS.
+async fn connack_code(
+    addr: SocketAddr,
+    connector: &TlsConnector,
+    username: Option<&str>,
+    password: Option<&str>,
+) -> u8 {
+    connack_on(
+        tls_connect(addr, connector).await.unwrap(),
+        username,
+        password,
+    )
+    .await
 }
 
 /// The issue's own table, measured on 1.0.17 with `client_ca` + `password_file`: a trusted
@@ -1398,4 +1416,139 @@ async fn both_factors_require_the_certificate_identitys_own_password() {
         ACCEPTED,
         "policy off: the certificate alone admits, as before"
     );
+}
+
+// --- per-listener anonymous access (issue #669) ------------------------------------
+
+/// Kills the spawned broker when the test ends, pass or fail.
+struct Broker(std::process::Child);
+
+impl Drop for Broker {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+/// The real binary with a password-authenticated TLS listener (no client CA — the case
+/// the issue is about: with a CA the handshake already refuses certificate-less clients)
+/// beside a plaintext listener, plus `env`. Returns once both listeners accept.
+async fn spawn_two_listener_broker(
+    pki: &Pki,
+    password_file: &Path,
+    env: &[(&str, &str)],
+) -> (Broker, SocketAddr, SocketAddr) {
+    let tls: SocketAddr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+    let plain: SocketAddr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_mqttd"));
+    for (k, _) in std::env::vars() {
+        if k.starts_with("MQTTD_") {
+            cmd.env_remove(k);
+        }
+    }
+    cmd.env("MQTTD_NODE_ID", "anon-per-listener")
+        .env("MQTTD_DURABLE_SESSIONS", "0")
+        .env("MQTTD_TLS_BIND", tls.to_string())
+        .env("MQTTD_TLS_CERT", &pki.cert)
+        .env("MQTTD_TLS_KEY", &pki.key)
+        .env("MQTTD_PLAINTEXT_BIND", plain.to_string())
+        .env("MQTTD_PASSWORD_FILE", password_file)
+        .env("RUST_LOG", "off")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let broker = Broker(cmd.spawn().unwrap());
+    for addr in [tls, plain] {
+        let mut up = false;
+        for _ in 0..300 {
+            if TcpStream::connect(addr).await.is_ok() {
+                up = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(up, "the broker never listened on {addr}");
+    }
+    (broker, tls, plain)
+}
+
+/// The issue's measurement, and its fix: `allow_anonymous` was one global flag, so opening
+/// the plaintext listener to anonymous clients also admitted them on the password TLS
+/// listener. Each listener now decides for itself; unset inherits the global.
+#[tokio::test]
+async fn anonymous_access_is_decided_per_listener() {
+    const ACCEPTED: u8 = 0;
+    const BAD_CREDENTIALS: u8 = 4;
+    const NOT_AUTHORIZED: u8 = 5;
+    let (pki, _ca) = mint_pki("anon-per-listener");
+    let connector = test_connector(&pki.ca, None);
+    let secret = format!("pw-{}", std::process::id());
+    let passwd = pki.cert.with_file_name("passwd");
+    std::fs::write(
+        &passwd,
+        format!(
+            "alice:{}\n",
+            mqtt_auth::password::hash_password(&secret).unwrap()
+        ),
+    )
+    .unwrap();
+
+    // The issue's deployment: global anonymous OFF, the plaintext listener opened.
+    let (broker, tls, plain) =
+        spawn_two_listener_broker(&pki, &passwd, &[("MQTTD_PLAINTEXT_ALLOW_ANONYMOUS", "1")]).await;
+    let plain_anon = connack_on(TcpStream::connect(plain).await.unwrap(), None, None).await;
+    assert_eq!(plain_anon, ACCEPTED, "plaintext, no credentials");
+    assert_eq!(
+        connack_code(tls, &connector, None, None).await,
+        NOT_AUTHORIZED,
+        "TLS, no credentials — the row that was ACCEPTED on 1.0.17"
+    );
+    assert_eq!(
+        connack_code(tls, &connector, Some("alice"), Some(secret.as_str())).await,
+        ACCEPTED,
+        "TLS, valid password"
+    );
+    assert_eq!(
+        connack_code(tls, &connector, Some("alice"), Some("wrong")).await,
+        BAD_CREDENTIALS,
+        "TLS, wrong password"
+    );
+    // A per-listener override opens only anonymous access: presented credentials are
+    // still verified on the open listener.
+    let plain_wrong = connack_on(
+        TcpStream::connect(plain).await.unwrap(),
+        Some("alice"),
+        Some("wrong"),
+    )
+    .await;
+    assert_eq!(plain_wrong, BAD_CREDENTIALS, "plaintext, wrong password");
+    drop(broker);
+
+    // The mirror image: global anonymous ON, the TLS listener closed to it.
+    let (_broker, tls, plain) = spawn_two_listener_broker(
+        &pki,
+        &passwd,
+        &[
+            ("MQTTD_ALLOW_ANONYMOUS", "1"),
+            ("MQTTD_TLS_ALLOW_ANONYMOUS", "0"),
+        ],
+    )
+    .await;
+    assert_eq!(
+        connack_code(tls, &connector, None, None).await,
+        NOT_AUTHORIZED,
+        "TLS closed to anonymous despite the global flag"
+    );
+    let plain_anon = connack_on(TcpStream::connect(plain).await.unwrap(), None, None).await;
+    assert_eq!(plain_anon, ACCEPTED, "plaintext inherits the global flag");
 }
