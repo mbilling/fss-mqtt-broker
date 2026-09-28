@@ -6727,6 +6727,15 @@ pub(crate) fn publish_packet(
 /// Truncates are monotonic and idempotent, so a flush racing a newer watermark
 /// (or the `QoS` 2 path's inline truncate) is harmless — the higher offset wins
 /// at the store, the lower one deletes nothing extra.
+///
+/// **Fair by construction.** Dirty sessions are served in the order they became
+/// dirty, and a session has at most one flush in flight; one that acks again
+/// while its flush runs rejoins the BACK of the queue when it finishes. Picking
+/// the next session from the map's iteration order instead let the sessions
+/// early in that (fixed) order win every free slot while they kept acking: the
+/// rest were never flushed, their logs grew to the queue cap, and every later
+/// append evicted an already-delivered entry as `queue-overflow` (the 0078 T4
+/// calibration, 2026-09-28).
 async fn run_truncate_flusher(
     store: Arc<dyn SessionStore>,
     mut rx: mpsc::UnboundedReceiver<(ClientId, Offset)>,
@@ -6734,28 +6743,27 @@ async fn run_truncate_flusher(
     /// Concurrent flushes in flight: enough to keep the truncate pipeline busy
     /// across sessions without turning the flusher into an unbounded spawner.
     const FLUSH_CONCURRENCY: usize = 8;
-    let mut latest: HashMap<ClientId, Offset> = HashMap::new();
-    let mut flushes: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
+    let mut queue = FlushQueue::default();
+    let mut flushes: tokio::task::JoinSet<ClientId> = tokio::task::JoinSet::new();
     loop {
         // Wait for work: a new watermark, or a finished flush freeing a slot.
         tokio::select! {
             msg = rx.recv() => {
                 let Some((client, up_to)) = msg else { break }; // hub gone
-                let slot = latest.entry(client).or_insert(up_to);
-                *slot = (*slot).max(up_to);
+                queue.mark(client, up_to);
             }
-            Some(_) = flushes.join_next(), if !flushes.is_empty() => {}
+            Some(done) = flushes.join_next(), if !flushes.is_empty() => {
+                if let Ok(client) = done {
+                    queue.finished(client);
+                }
+            }
         }
         // Opportunistically drain the channel so a burst coalesces before flushing.
         while let Ok((client, up_to)) = rx.try_recv() {
-            let slot = latest.entry(client).or_insert(up_to);
-            *slot = (*slot).max(up_to);
+            queue.mark(client, up_to);
         }
         while flushes.len() < FLUSH_CONCURRENCY {
-            let Some(client) = latest.keys().next().cloned() else {
-                break;
-            };
-            let Some(up_to) = latest.remove(&client) else {
+            let Some((client, up_to)) = queue.next() else {
                 break;
             };
             let store = store.clone();
@@ -6767,13 +6775,65 @@ async fn run_truncate_flusher(
                     debug!(client = %client.0, up_to, error = %e,
                            "detached truncate of the acknowledged session log failed");
                 }
+                client
             });
         }
     }
     // Hub dropped its sender: flush what remains, best-effort, then stop.
-    while flushes.join_next().await.is_some() {}
-    for (client, up_to) in latest {
+    while let Some(done) = flushes.join_next().await {
+        if let Ok(client) = done {
+            queue.finished(client);
+        }
+    }
+    while let Some((client, up_to)) = queue.next() {
         let _ = store.ack(&client, up_to).await;
+        queue.finished(client);
+    }
+}
+
+/// The truncate flusher's work queue: the newest watermark per dirty session,
+/// served first-dirty-first, at most one flush per session in flight.
+#[derive(Default)]
+struct FlushQueue {
+    /// Dirty sessions and the watermark each owes the store.
+    latest: HashMap<ClientId, Offset>,
+    /// Dirty sessions not in flight, in the order they became dirty.
+    order: VecDeque<ClientId>,
+    /// Sessions whose flush is running.
+    busy: HashSet<ClientId>,
+}
+
+impl FlushQueue {
+    /// Record `up_to` for `client`; a newly dirty, idle session joins the back.
+    fn mark(&mut self, client: ClientId, up_to: Offset) {
+        match self.latest.entry(client) {
+            std::collections::hash_map::Entry::Occupied(mut e) => {
+                let slot = e.get_mut();
+                *slot = (*slot).max(up_to);
+            }
+            std::collections::hash_map::Entry::Vacant(e) => {
+                if !self.busy.contains(e.key()) {
+                    self.order.push_back(e.key().clone());
+                }
+                e.insert(up_to);
+            }
+        }
+    }
+
+    /// The next session to flush and its watermark, now marked in flight.
+    fn next(&mut self) -> Option<(ClientId, Offset)> {
+        let client = self.order.pop_front()?;
+        let up_to = self.latest.remove(&client)?;
+        self.busy.insert(client.clone());
+        Some((client, up_to))
+    }
+
+    /// `client`'s flush finished; if it acked again meanwhile, it rejoins the back.
+    fn finished(&mut self, client: ClientId) {
+        self.busy.remove(&client);
+        if self.latest.contains_key(&client) {
+            self.order.push_back(client);
+        }
     }
 }
 
@@ -6865,6 +6925,7 @@ mod tests {
     mod scaling_mesh;
     mod settle_gate;
     mod shared_capacity;
+    mod truncate_flusher;
     /// A committed retained snapshot entry with no application properties — the
     /// common test shape (props-bearing cases build the struct directly).
     fn snap(topic: &str, payload: &[u8], epoch: u64, offset: u64) -> RetainedWireEntry {

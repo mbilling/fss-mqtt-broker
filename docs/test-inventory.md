@@ -960,7 +960,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 452 test(s)
+## `crates/mqttd/src/lib.rs` — 456 test(s)
 
 - `admission::tests::the_global_cap_refuses_at_the_bound_and_recovers`
 - `admission::tests::the_penalty_box_refuses_after_the_threshold`
@@ -1381,6 +1381,10 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::the_subscribe_replay_seeds_the_windows_ledger`
 - `hub::tests::the_windowed_apply_defers_to_a_live_copy_already_delivered`
 - `hub::tests::transient_lease_does_not_downgrade_a_persistent_attach`
+- `hub::tests::truncate_flusher::a_burst_flushes_once_at_its_highest_watermark`
+- `hub::tests::truncate_flusher::a_clean_session_leaves_the_queue`
+- `hub::tests::truncate_flusher::a_session_in_flight_rejoins_behind_the_waiting_ones`
+- `hub::tests::truncate_flusher::every_busy_session_is_flushed_in_turn`
 - `hub::tests::two_groups_on_one_filter_rotate_independently`
 - `hub::tests::two_publishes_to_one_offline_subscriber_append_in_arrival_order`
 - `hub::tests::without_no_local_a_publisher_receives_its_own_delivery`
