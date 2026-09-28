@@ -253,7 +253,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `two_bridge_instances_do_not_duplicate_forwarding`
 - `two_partitioned_instances_deliver_each_inbound_message_exactly_once`
 
-## `crates/mqtt-cluster/src/lib.rs` — 296 test(s)
+## `crates/mqtt-cluster/src/lib.rs` — 299 test(s)
 
 - `cluster_identity::tests::a_founder_mints_once_and_reloads_stably`
 - `cluster_identity::tests::a_joiner_adopts_once_and_persists`
@@ -283,7 +283,10 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `cluster_log::tests::apply_batch_of_one_equals_apply`
 - `cluster_log::tests::apply_batch_persists_a_whole_burst_in_one_commit`
 - `cluster_log::tests::caught_up_stamps_gate_currency_and_survive_reopen`
+- `cluster_log::tests::coalesced_truncates_equal_the_ops_applied_in_order`
 - `cluster_log::tests::completeness_is_gap_freedom_above_the_truncation_watermark`
+- `cluster_log::tests::drop_through_removes_exactly_the_prefix`
+- `cluster_log::tests::fences_persist_when_they_move_and_only_then`
 - `cluster_log::tests::live_range_reflects_committed_watermarks`
 - `cluster_log::tests::merge_does_not_resurrect_a_stale_replicas_truncated_prefix`
 - `cluster_log::tests::merge_resolves_a_same_offset_conflict_by_tag_not_read_order`
