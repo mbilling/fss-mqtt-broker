@@ -16919,6 +16919,16 @@ mod tests {
             std::sync::Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<()>>>,
         /// How many upcoming `ack` calls PANIC — a flush task dying mid-call.
         ack_panics: std::sync::Mutex<usize>,
+        /// client id → durability gates for its next pipelined appends (ADR 0075),
+        /// one per append in submission order: the append is stored at submit
+        /// (offset assigned in order), and its pending resolves when the test
+        /// fires the gate — in whatever order the test chooses.
+        pipelined: std::sync::Mutex<
+            std::collections::HashMap<
+                String,
+                std::collections::VecDeque<tokio::sync::oneshot::Receiver<()>>,
+            >,
+        >,
     }
 
     impl ParkingStore {
@@ -16943,7 +16953,17 @@ mod tests {
                 ack_gates: std::sync::Mutex::new(std::collections::HashMap::new()),
                 ack_entered: std::sync::Mutex::new(std::collections::HashMap::new()),
                 ack_panics: std::sync::Mutex::new(0),
+                pipelined: std::sync::Mutex::new(std::collections::HashMap::new()),
             })
+        }
+
+        /// Make `client`'s next `n` appends pipelined: each is stored at submit and
+        /// reports durable only when its returned gate fires (index = submission order).
+        fn pipeline(&self, client: &str, n: usize) -> Vec<tokio::sync::oneshot::Sender<()>> {
+            let (txs, rxs): (Vec<_>, std::collections::VecDeque<_>) =
+                (0..n).map(|_| tokio::sync::oneshot::channel()).unzip();
+            self.pipelined.lock().unwrap().insert(client.into(), rxs);
+            txs
         }
 
         /// Delay `client`'s FIRST enqueue by `delay`; later ones run at full speed.
@@ -17047,6 +17067,27 @@ mod tests {
 
     #[async_trait::async_trait]
     impl mqtt_storage::SessionStore for ParkingStore {
+        async fn submit_enqueue_with_expiry(
+            &self,
+            client: &ClientId,
+            message: &mqtt_core::Message,
+            expiry_at: Option<u64>,
+        ) -> mqtt_storage::PendingEnqueue {
+            let gate = self
+                .pipelined
+                .lock()
+                .unwrap()
+                .get_mut(client.as_str())
+                .and_then(std::collections::VecDeque::pop_front);
+            let result = self.enqueue_with_expiry(client, message, expiry_at).await;
+            match gate {
+                Some(gate) => mqtt_storage::PendingEnqueue::new(async move {
+                    let _ = gate.await;
+                    result
+                }),
+                None => mqtt_storage::PendingEnqueue::ready(result),
+            }
+        }
         async fn ensure_session(
             &self,
             client: &ClientId,
@@ -18171,6 +18212,109 @@ mod tests {
             "the session's next watermark reached the store: {:?}",
             store.ops()
         );
+    }
+
+    /// Pipelined appends (ADR 0075) are reported to the hub in SUBMISSION order,
+    /// whatever order their durability waits resolve in. A later offset's
+    /// `AppendDone` arriving first would put it on the wire first and — once it
+    /// was acked with nothing else owed — let the watermark truncate the earlier
+    /// offset before the hub had even tracked it: lost on a crash before its
+    /// delivery. The waits resolve in reverse here (3, 2, 1); the completions
+    /// must still arrive 1, 2, 3.
+    #[tokio::test]
+    async fn pipelined_completions_reach_the_hub_in_offset_order() {
+        let store = ParkingStore::new();
+        let gates = store.pipeline("c", 3);
+        let (self_tx, mut self_rx) = mpsc::unbounded_channel();
+        let (lane_tx, lane_rx) = mpsc::channel(8);
+        let worker = tokio::spawn(super::lanes::append_lane_worker(
+            store.clone(),
+            self_tx,
+            lane_rx,
+            None,
+            true,
+        ));
+        for i in 1..=3u8 {
+            let mut job = super::lanes::AppendJob::control(
+                ClientId("c".into()),
+                super::lanes::LaneWork::Append { expiry_at: None },
+            );
+            job.message.qos = QoS::AtLeastOnce;
+            job.message.payload = Bytes::from(vec![i]);
+            lane_tx
+                .send(super::lanes::LaneJob::Deliver(Box::new(job)))
+                .await
+                .unwrap();
+        }
+        // Every append is submitted (and stored) before any wait resolves.
+        tokio::task::yield_now().await;
+        for gate in gates.into_iter().rev() {
+            gate.send(()).unwrap();
+            tokio::task::yield_now().await;
+        }
+        let mut offsets = Vec::new();
+        while offsets.len() < 3 {
+            match self_rx.recv().await {
+                Some(HubCommand::AppendDone { outcome, .. }) => match outcome {
+                    super::lanes::LaneOutcome::Stored(o) => offsets.push(o),
+                    other => panic!("unexpected outcome {other:?}"),
+                },
+                Some(_) => {}
+                None => panic!("worker gone before three completions"),
+            }
+        }
+        assert_eq!(offsets, vec![1, 2, 3], "completions in offset order");
+        drop(lane_tx);
+        worker.await.unwrap();
+    }
+
+    /// An append whose store answers at once (no durability wait) must not
+    /// overtake an earlier one still waiting: it queues behind it.
+    #[tokio::test]
+    async fn an_already_durable_append_does_not_overtake_a_waiting_one() {
+        let store = ParkingStore::new();
+        let mut gates = store.pipeline("c", 1); // only the FIRST append waits
+        let (self_tx, mut self_rx) = mpsc::unbounded_channel();
+        let (lane_tx, lane_rx) = mpsc::channel(8);
+        let worker = tokio::spawn(super::lanes::append_lane_worker(
+            store.clone(),
+            self_tx,
+            lane_rx,
+            None,
+            true,
+        ));
+        for i in 1..=2u8 {
+            let mut job = super::lanes::AppendJob::control(
+                ClientId("c".into()),
+                super::lanes::LaneWork::Append { expiry_at: None },
+            );
+            job.message.qos = QoS::AtLeastOnce;
+            job.message.payload = Bytes::from(vec![i]);
+            lane_tx
+                .send(super::lanes::LaneJob::Deliver(Box::new(job)))
+                .await
+                .unwrap();
+        }
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        assert!(
+            self_rx.try_recv().is_err(),
+            "nothing may be reported while offset 1 is still waiting"
+        );
+        gates.remove(0).send(()).unwrap();
+        let mut offsets = Vec::new();
+        while offsets.len() < 2 {
+            if let Some(HubCommand::AppendDone {
+                outcome: super::lanes::LaneOutcome::Stored(o),
+                ..
+            }) = self_rx.recv().await
+            {
+                offsets.push(o);
+            }
+        }
+        assert_eq!(offsets, vec![1, 2]);
+        drop(lane_tx);
+        worker.await.unwrap();
     }
 
     /// Backpressure (issue #242): a saturated lane rejects the NEWEST job — the

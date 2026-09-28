@@ -964,7 +964,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 458 test(s)
+## `crates/mqttd/src/lib.rs` — 460 test(s)
 
 - `admission::tests::the_global_cap_refuses_at_the_bound_and_recovers`
 - `admission::tests::the_penalty_box_refuses_after_the_threshold`
@@ -1235,6 +1235,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::a_value_only_digest_difference_triggers_a_pull`
 - `hub::tests::a_will_is_still_delivered_live_under_brownout_and_counted_as_a_drop`
 - `hub::tests::a_windowed_commit_reaches_an_offline_durable_subscriber_on_resume`
+- `hub::tests::an_already_durable_append_does_not_overtake_a_waiting_one`
 - `hub::tests::an_expired_retained_value_is_not_replayed_and_is_reaped`
 - `hub::tests::an_inflight_ceiling_caps_the_clients_own_receive_maximum`
 - `hub::tests::an_online_persistent_subscriber_receives_the_wire_send_only_after_the_append_resolves`
@@ -1287,6 +1288,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::pending_gauges::the_pending_publish_gauges_report_the_ledger_depth`
 - `hub::tests::periodic_anti_entropy_says_nothing_when_there_is_nothing_retained`
 - `hub::tests::permanently_unavailable_store_rejects_rather_than_downgrades`
+- `hub::tests::pipelined_completions_reach_the_hub_in_offset_order`
 - `hub::tests::prefer_local_keeps_shared_delivery_off_the_cluster_bus`
 - `hub::tests::prefer_local_still_rotates_among_several_local_members`
 - `hub::tests::prefer_local_still_uses_a_remote_member_when_there_is_no_local_one`
@@ -1519,7 +1521,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `a_complete_secured_config_passes_both_gates`
 - `a_config_flag_without_a_value_is_a_usage_error_exit_2`
 - `a_missing_referenced_file_is_refused_by_the_preflight_only`
-- `a_password_file_without_read_permission_is_refused_by_the_preflight` — only when `cfg(unix)`
+- `a_password_file_without_read_permission_is_refused_by_the_preflight`
 - `a_valid_file_validates_and_reports_the_path`
 - `an_unknown_key_fails_with_a_located_error_and_exit_1`
 - `an_unparseable_bind_is_refused_naming_the_key`
