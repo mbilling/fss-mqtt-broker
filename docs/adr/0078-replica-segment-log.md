@@ -1,9 +1,9 @@
 # 0078. The replica store becomes an append-only segment log — the disk is the limit, not the B-tree
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-09-28
 - **Deciders:** project maintainers
-- **Delivery:** none yet — delivery tasks and their issues follow acceptance
+- **Delivery:** [docs/delivery/0078-replica-segment-log.md](../delivery/0078-replica-segment-log.md) — plan, progress, and changelog
 - **Related:** [ADR 0018](0018-on-disk-persistence.md) (redb; the deferred segmented WAL),
   [ADR 0027](0027-replica-group-commit.md) / [0071](0071-owner-side-group-commit.md) (group commit),
   [ADR 0075](0075-pipelined-durable-appends.md) (pipelined appends),
