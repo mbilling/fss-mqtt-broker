@@ -168,7 +168,7 @@ are low-volume or out of scope for the clustered durable path.
 On the calibration shape (`bench/scale/qos1-campaign/durable-calibrate-n3.env`,
 3 × CCX23, persistent consumers, iostat captured per PR #656):
 
-1. **The store is not the limit.** At the most loaded durable rung,
+1. **The writer's hot path is not the limit.** At the most loaded durable rung,
    `summarize-curve.py`'s verdict is DISK-BOUND or NOT STORE-BOUND — never
    WRITER-BOUND (amended 2026-09-28, below).
 2. **Throughput follows the disk where the disk binds.** On a DISK-BOUND rung,

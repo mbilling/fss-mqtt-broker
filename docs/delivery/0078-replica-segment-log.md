@@ -22,7 +22,7 @@ tasks:
     date: 2026-09-28
     evidence: "PR #667. LogShard tracks where each live entry's record sits and per-segment live counts (decoded from the records it just wrote — the replay's own decoder); drops a dead PREFIX of segments; restates format, fences, caught-up sets and low-waters (a new LowWater record that deletes nothing) at every segment head; above 2x live bytes copies the oldest segment's live entries forward a bounded step per batch (1/4 segment, max 1 MiB) under the state lock. The import writes through the same path, so it restates heads too. Review fixes: a failed compaction append puts back the entries it took (no permanent pin); an entry tracked as live but absent from the state is untracked as dead; one call examines at most 4,096 queued entries; compaction starts with one non-active segment, not two. Tests: bounded growth when consumers keep up, a slow consumer compacted forward (not pinning the log), metadata outliving its segment — each equal to the redb reference after reopen; the three review fixes, each mutation-checked."
   - id: 0078-T4
-    title: "Evidence and the default flip — the store is not the limit (§6)"
+    title: "Evidence and the default flip — the writer's hot path is not the limit (§6)"
     status: planned
     issue: 662
     notes: "First log-store calibration 2026-09-28: WRITER-BOUND (musl allocator) and failed on false queue-overflow drops (the truncate flusher). Re-run as a redb/log A/B on one provisioning after the fixes; the flip needs every criterion in ADR 0078 §6 (criterion 1 amended 2026-09-28)."
