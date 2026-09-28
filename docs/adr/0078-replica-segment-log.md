@@ -168,11 +168,12 @@ are low-volume or out of scope for the clustered durable path.
 On the calibration shape (`bench/scale/qos1-campaign/durable-calibrate-n3.env`,
 3 × CCX23, persistent consumers, iostat captured per PR #656):
 
-1. **The disk is the limit.** At the most loaded durable rung,
-   `summarize-curve.py`'s verdict is DISK-BOUND: one flush explains ≥ 50% of a
-   commit, or the disk is ≥ 80% utilised.
-2. **Throughput follows the disk.** Across the three brokers, durable appends per
-   second at that rung track each broker's barrier floor.
+1. **The writer's hot path is not the limit.** At the most loaded durable rung,
+   `summarize-curve.py`'s verdict is DISK-BOUND or NOT STORE-BOUND — never
+   WRITER-BOUND (amended 2026-09-28, below).
+2. **Throughput follows the disk where the disk binds.** On a DISK-BOUND rung,
+   durable appends per second across the three brokers track each broker's
+   barrier floor.
 3. **The knee moves.** The GREEN knee per node rises above the 2,000–6,000 msg/s
    bracket measured on redb.
 4. **Nothing is lost or reordered.** The existing durability and failover suites
@@ -180,6 +181,39 @@ On the calibration shape (`bench/scale/qos1-campaign/durable-calibrate-n3.env`,
    (torn tail) and kill the node between write and flush.
 5. **Recovery is bounded.** Replay time at open is measured and stated per GB of
    log.
+
+**Amendment, 2026-09-28 — criterion 1.** As first written, criterion 1 asked for
+DISK-BOUND alone: one flush explaining ≥ 50% of a commit, or the disk ≥ 80%
+utilised. Under group commit the first half cannot hold at saturation, whatever
+the store. Let
+
+- `c` = the writer's per-op work, in ms (encode, write, apply, reclaim);
+- `f` = one device flush, in ms (`1000 / F`, `F` the broker's barrier floor);
+- `B` = ops per commit (the batch depth).
+
+A commit takes `B × c + f`, so one flush explains `f / (B × c + f)` of it,
+which falls below 50% as soon as `B × c > f`, i.e. `B > f / c`. On the
+calibration's disks (`F` = 804 to 2,819/s, so `f` = 1.244 to 0.355 ms) and a
+log-store `c` of 0.0039 ms (ADR 0079's local measurement, musl + mimalloc),
+that is `B` ≥ 319 on the slowest disk (`1.244 / 0.0039 = 318.9`) and `B` ≥ 91 on
+the fastest (`0.355 / 0.0039 = 90.9`). Batches at the
+knee were 37 to 2,268 ops deep. The test would fail on any store that keeps up,
+because keeping up is what makes batches deep.
+
+The amended verdict asks the question the criterion was for — is the store the
+limit? — from one more measured quantity: the writer's **work share**, the
+share of each second it spends on per-op work, `commits/s × (C − f) / 1000`
+with `C` the mean commit in ms. Three verdicts:
+
+| verdict | condition | reading |
+|---|---|---|
+| DISK-BOUND | one flush ≥ 50% of a commit, or disk ≥ 80% utilised | the disk binds |
+| WRITER-BOUND | work share ≥ 50% | the hot path binds — not done |
+| NOT STORE-BOUND | neither | the store has room; the limit is upstream of it |
+
+Re-read under this verdict, both 2026-09-28 calibrations (redb, and the log
+store on the musl allocator) are WRITER-BOUND: work share up to 104% (commits
+overlap in the window).
 
 ## Consequences
 

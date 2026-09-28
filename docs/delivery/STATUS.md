@@ -208,7 +208,7 @@
 
 **0078 — # 0078. The replica store becomes an append-only segment log — the disk is the limit, not the B-tree**
 
-- `0078-T4` ⬜ planned ([#662](https://github.com/mbilling/fss-mqtt-broker/issues/662)): "Evidence and the default flip — the calibration reads DISK-BOUND" — "Paid calibration re-run with MQTTD_REPLICA_STORE=log; the flip needs every criterion in ADR 0078 §6."
+- `0078-T4` ⬜ planned ([#662](https://github.com/mbilling/fss-mqtt-broker/issues/662)): "Evidence and the default flip — the writer's hot path is not the limit (§6)" — "First log-store calibration 2026-09-28: WRITER-BOUND (musl allocator) and failed on false queue-overflow drops (the truncate flusher). Re-run as a redb/log A/B on one provisioning after the fixes; the flip needs every criterion in ADR 0078 §6 (criterion 1 amended 2026-09-28)."
 
 **0079 — # 0079. mqttd links mimalloc as its global allocator**
 
