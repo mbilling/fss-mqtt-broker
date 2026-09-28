@@ -77,7 +77,7 @@ impl std::str::FromStr for StoreBackend {
 #[derive(Debug, Clone)]
 enum Shard {
     Redb(Arc<Database>),
-    Log(Arc<std::sync::Mutex<crate::segment_log::SegmentLog>>),
+    Log(Arc<std::sync::Mutex<replica_log::LogShard>>),
 }
 
 /// One queued durable write for the node-wide writer task (ADR 0027 follower
@@ -967,15 +967,12 @@ impl<'k> PlanSink<'k> for LogSink {
 }
 
 fn log_append(
-    log: &std::sync::Mutex<crate::segment_log::SegmentLog>,
+    log: &std::sync::Mutex<replica_log::LogShard>,
     recs: &[(u8, Vec<u8>)],
 ) -> Result<(), ReplError> {
-    let batch: Vec<(u8, &[u8])> = recs.iter().map(|(k, p)| (*k, p.as_slice())).collect();
     log.lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .append(&batch)
-        .map(|_| ())
-        .map_err(|e| ReplError::Backend(e.to_string()))
+        .append(recs)
 }
 
 /// Commit one shard's share of a batch with ONE flush: a single redb
@@ -1249,7 +1246,33 @@ impl ReplicaState {
                 this.apply_in_memory(*epoch, op);
             }
         }
+        this.reclaim_shard(shard);
         accepted
+    }
+
+    /// Give a log shard's dead space back (ADR 0078 T3) — a no-op for redb.
+    ///
+    /// Called with the state lock held (it is `&self` of the locked state):
+    /// compaction re-appends live entries from THIS state, and a copy taken
+    /// outside the lock could resurrect an entry a concurrent truncate removed.
+    /// A failure is logged and left for the next batch — the batch that got
+    /// here is already durable and acked.
+    fn reclaim_shard(&self, shard: usize) {
+        let Some(Shard::Log(log)) = self.dbs.get(shard) else {
+            return;
+        };
+        let mut log = log
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let entry = |key: &str, offset: Offset| {
+            self.logs
+                .get(key)
+                .and_then(|l| l.get(&offset))
+                .map(|((epoch, seq), record)| (*epoch, *seq, record.as_slice()))
+        };
+        if let Err(e) = log.reclaim(entry) {
+            tracing::warn!(error = %e, shard, "replica log reclamation failed; retried after the next batch");
+        }
     }
 
     /// The truncation low-water for `key`: the highest acked offset this replica knows

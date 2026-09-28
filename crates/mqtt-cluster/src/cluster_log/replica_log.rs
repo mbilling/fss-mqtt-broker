@@ -17,6 +17,7 @@
 //! | `Remove{key}` | delete every entry of `key` and its `replica_trunc` row |
 //! | `Fence{group, epoch}` | `replica_meta["fence/<group>"] = epoch` |
 //! | `Caught{group, members}` | `replica_caught_up[group] = members` |
+//! | `LowWater{key, low_water}` | `replica_trunc[key] = low_water` alone — no delete |
 //!
 //! A `Truncate` carries both bounds because they differ: a late, lower ack
 //! deletes through its own `up_to` while the low-water stays at the committed
@@ -26,12 +27,13 @@
 use super::{drop_through, CaughtUp, Fences, Loaded, ReplicaLogs, ReplicaState, R_MAX_SHARDS};
 use crate::lease::Epoch;
 use crate::lease_raft::GroupId;
-use crate::segment_log::{LogError, SegmentLog};
+use crate::segment_log::{LogError, Lsn, SegmentLog, HEADER_BYTES};
 use crate::NodeId;
 use mqtt_storage::repl::ReplError;
 use mqtt_storage::Offset;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// The log store's directory under the data dir.
 pub const LOG_DIR: &str = "replicas-log";
@@ -46,6 +48,7 @@ const K_TRUNCATE: u8 = 3;
 const K_REMOVE: u8 = 4;
 const K_FENCE: u8 = 5;
 const K_CAUGHT: u8 = 6;
+const K_LOW_WATER: u8 = 7;
 
 /// Records per flush during an import: bounded, so a large store is not one
 /// giant buffer, and big enough that the import is not flush-bound.
@@ -114,6 +117,15 @@ pub enum Rec<'a> {
         /// The node ids.
         members: Vec<String>,
     },
+    /// A key's low-water, restated at a segment head (T3). Deletes nothing:
+    /// a stale leftover below the low-water must survive the restatement, as
+    /// it survives in the table.
+    LowWater {
+        /// The logical key.
+        key: &'a str,
+        /// Its low-water.
+        low_water: Offset,
+    },
 }
 
 fn put_str(b: &mut Vec<u8>, s: &[u8]) {
@@ -172,6 +184,11 @@ impl Rec<'_> {
                     put_str(&mut b, m.as_bytes());
                 }
                 K_CAUGHT
+            }
+            Rec::LowWater { key, low_water } => {
+                b.extend_from_slice(&low_water.to_be_bytes());
+                b.extend_from_slice(key.as_bytes());
+                K_LOW_WATER
             }
         };
         (kind, b)
@@ -259,6 +276,13 @@ pub fn decode(kind: u8, payload: &[u8]) -> Result<Rec<'_>, String> {
             }
             Rec::Caught { group, members }
         }
+        K_LOW_WATER => {
+            let low_water = r.u64()?;
+            Rec::LowWater {
+                key: Reader::utf8(r.rest())?,
+                low_water,
+            }
+        }
         other => return Err(format!("unknown record kind {other}")),
     };
     Ok(rec)
@@ -274,11 +298,37 @@ struct Replay {
     truncated: BTreeMap<String, Offset>,
     caught_up: CaughtUp,
     format: Option<(u32, u32)>,
+    /// Where each live entry's current Append record is: its LSN and size.
+    loc: Locations,
 }
 
+/// key -> offset -> (LSN or segment of the entry's current Append, record bytes).
+type Locations = BTreeMap<String, BTreeMap<Offset, (Lsn, u64)>>;
+
 impl Replay {
-    /// Apply one record with its redb row's exact meaning (module docs).
-    fn apply(&mut self, rec: Rec<'_>) {
+    /// Apply one record with its redb row's exact meaning (module docs),
+    /// and track where each live entry's record sits (T3).
+    fn apply(&mut self, lsn: Lsn, bytes: u64, rec: Rec<'_>) {
+        match &rec {
+            Rec::Append { key, offset, .. } => {
+                self.loc
+                    .entry((*key).to_string())
+                    .or_default()
+                    .insert(*offset, (lsn, bytes));
+            }
+            Rec::Truncate { key, up_to, .. } => {
+                if let Some(l) = self.loc.get_mut(*key) {
+                    drop_through(l, *up_to);
+                    if l.is_empty() {
+                        self.loc.remove(*key);
+                    }
+                }
+            }
+            Rec::Remove { key } => {
+                self.loc.remove(*key);
+            }
+            _ => {}
+        }
         match rec {
             Rec::Format { version, shards } => self.format = Some((version, shards)),
             Rec::Append {
@@ -321,16 +371,375 @@ impl Replay {
                     members.into_iter().map(NodeId).collect::<BTreeSet<_>>(),
                 );
             }
+            Rec::LowWater { key, low_water } => {
+                self.truncated.insert(key.to_string(), low_water);
+            }
         }
     }
 }
 
-/// An opened log store: one log per shard, and the state they replayed to.
+// ── one shard: the log, and what reclaiming its space needs (T3) ─────────────
+
+/// One shard of the log store: the log, where each live entry's current record
+/// sits, and a mirror of the shard's metadata.
+///
+/// **Reclamation (ADR 0078 T3).** A segment is dropped once it holds no live
+/// entry — and only as a PREFIX of the log, oldest first, so a Truncate or
+/// Remove record can never be dropped while an entry it suppresses survives in
+/// an older segment. Metadata (the format stamp, fences, caught-up sets and
+/// low-waters) is restated at the head of every new segment, so a dropped
+/// prefix never takes the only copy with it. When the log holds more than
+/// twice its live bytes, the oldest segment's live entries are re-appended and
+/// it is dropped too (see [`LogShard::reclaim`]).
+#[derive(Debug)]
+pub(super) struct LogShard {
+    log: SegmentLog,
+    shards: u32,
+    /// key -> offset -> (first LSN of the segment holding its record, bytes).
+    loc: BTreeMap<Arc<str>, BTreeMap<Offset, (Lsn, u64)>>,
+    /// Per segment (by first LSN): live entries and their bytes.
+    live: BTreeMap<Lsn, (u64, u64)>,
+    /// Per segment: every entry appended into it, in order — checked lazily
+    /// against `loc` (a truncated or moved entry is skipped), so compaction
+    /// finds a segment's live entries without scanning every key.
+    appended: BTreeMap<Lsn, VecDeque<(Arc<str>, Offset)>>,
+    fences: Fences,
+    caught: CaughtUp,
+    lows: BTreeMap<String, Offset>,
+}
+
+/// The most one reclaim call copies forward: a quarter of a segment, capped at
+/// 1 MiB — the copy runs under the replica state's lock, so its size is the
+/// stall a compaction step can add to one batch.
+const COMPACT_STEP_MAX: u64 = 1 << 20;
+
+/// The most queued entries one reclaim call examines. Skipping a dead entry
+/// is cheap but not free, and it happens under the same lock: a segment that
+/// is one live entry after thousands of acked ones must not turn one batch's
+/// reclaim into a scan of all of them.
+const COMPACT_EXAMINE_MAX: usize = 4096;
+
+impl LogShard {
+    fn new(log: SegmentLog, shards: u32) -> Self {
+        Self {
+            log,
+            shards,
+            loc: BTreeMap::new(),
+            live: BTreeMap::new(),
+            appended: BTreeMap::new(),
+            fences: Fences::new(),
+            caught: CaughtUp::new(),
+            lows: BTreeMap::new(),
+        }
+    }
+
+    /// Rebuild the bookkeeping from a replay: each entry's LSN becomes the
+    /// segment that holds it.
+    fn from_replay(log: SegmentLog, shards: u32, replay: &Replay) -> Self {
+        let firsts: Vec<Lsn> = log.segments().iter().map(|s| s.first).collect();
+        let seg_of = |lsn: Lsn| {
+            let i = firsts.partition_point(|f| *f <= lsn);
+            firsts[i.saturating_sub(1)]
+        };
+        let mut shard = Self::new(log, shards);
+        for (key, offsets) in &replay.loc {
+            let key: Arc<str> = Arc::from(key.as_str());
+            let m = shard.loc.entry(key.clone()).or_default();
+            for (offset, (lsn, bytes)) in offsets {
+                let seg = seg_of(*lsn);
+                m.insert(*offset, (seg, *bytes));
+                let l = shard.live.entry(seg).or_default();
+                l.0 += 1;
+                l.1 += bytes;
+                shard
+                    .appended
+                    .entry(seg)
+                    .or_default()
+                    .push_back((key.clone(), *offset));
+            }
+        }
+        shard.fences = replay.fences.clone();
+        shard.caught = replay.caught_up.clone();
+        shard.lows = replay.truncated.clone();
+        shard
+    }
+
+    /// The log's next LSN (1 on a fresh log).
+    pub(super) fn next_lsn(&self) -> Lsn {
+        self.log.next_lsn()
+    }
+
+    /// Bytes of valid records across every segment.
+    pub(super) fn bytes(&self) -> u64 {
+        self.log.bytes()
+    }
+
+    /// Bytes of live entries' records.
+    pub(super) fn live_bytes(&self) -> u64 {
+        self.live.values().map(|(_, b)| *b).sum()
+    }
+
+    /// Segments the log holds.
+    #[cfg(test)]
+    pub(super) fn segment_count(&self) -> usize {
+        self.log.segments().len()
+    }
+
+    /// Everything a new segment must restate, as records.
+    fn head(&self) -> Vec<(u8, Vec<u8>)> {
+        let mut head = vec![Rec::Format {
+            version: FORMAT_VERSION,
+            shards: self.shards,
+        }
+        .encode()];
+        for (group, epoch) in &self.fences {
+            head.push(
+                Rec::Fence {
+                    group: *group,
+                    epoch: *epoch,
+                }
+                .encode(),
+            );
+        }
+        for (group, set) in &self.caught {
+            head.push(
+                Rec::Caught {
+                    group: *group,
+                    members: set.iter().map(|n| n.0.clone()).collect(),
+                }
+                .encode(),
+            );
+        }
+        for (key, low_water) in &self.lows {
+            head.push(
+                Rec::LowWater {
+                    key,
+                    low_water: *low_water,
+                }
+                .encode(),
+            );
+        }
+        head
+    }
+
+    /// Append `recs` as one batch — one write, one flush — rolling first, with
+    /// a restated head, when the batch would overflow the active segment; then
+    /// track what was written.
+    ///
+    /// # Errors
+    /// An I/O failure: the batch is then NOT durable and must not be acked.
+    pub(super) fn append(&mut self, recs: &[(u8, Vec<u8>)]) -> Result<(), ReplError> {
+        if recs.is_empty() {
+            return Ok(());
+        }
+        let batch: Vec<(u8, &[u8])> = recs.iter().map(|(k, p)| (*k, p.as_slice())).collect();
+        if self.log.would_roll(SegmentLog::encoded_len(&batch)) {
+            let head = self.head();
+            let head: Vec<(u8, &[u8])> = head.iter().map(|(k, p)| (*k, p.as_slice())).collect();
+            self.log.roll(&head).map_err(|e| lg(&e))?;
+        }
+        self.log.append(&batch).map_err(|e| lg(&e))?;
+        let seg = self.log.segments().last().map_or(1, |s| s.first);
+        for (kind, payload) in recs {
+            // The records were just encoded by this build; decoding is the same
+            // code path a replay takes, so live and replayed tracking agree.
+            if let Ok(rec) = decode(*kind, payload) {
+                self.track(seg, (HEADER_BYTES + payload.len()) as u64, &rec);
+            }
+        }
+        Ok(())
+    }
+
+    fn untrack(&mut self, seg: Lsn, bytes: u64) {
+        if let Some(l) = self.live.get_mut(&seg) {
+            l.0 = l.0.saturating_sub(1);
+            l.1 = l.1.saturating_sub(bytes);
+        }
+    }
+
+    fn track(&mut self, seg: Lsn, bytes: u64, rec: &Rec<'_>) {
+        match rec {
+            Rec::Format { .. } => {}
+            Rec::Append { key, offset, .. } => {
+                let key: Arc<str> = match self.loc.get_key_value(*key) {
+                    Some((k, _)) => k.clone(),
+                    None => Arc::from(*key),
+                };
+                let old = self
+                    .loc
+                    .entry(key.clone())
+                    .or_default()
+                    .insert(*offset, (seg, bytes));
+                if let Some((old_seg, old_bytes)) = old {
+                    self.untrack(old_seg, old_bytes);
+                }
+                let l = self.live.entry(seg).or_default();
+                l.0 += 1;
+                l.1 += bytes;
+                self.appended
+                    .entry(seg)
+                    .or_default()
+                    .push_back((key, *offset));
+            }
+            Rec::Truncate {
+                key,
+                up_to,
+                low_water,
+            } => {
+                let mut dropped = Vec::new();
+                if let Some(m) = self.loc.get_mut(*key) {
+                    while let Some(first) = m.first_entry() {
+                        if *first.key() > *up_to {
+                            break;
+                        }
+                        dropped.push(first.remove());
+                    }
+                    if m.is_empty() {
+                        self.loc.remove(*key);
+                    }
+                }
+                for (seg, bytes) in dropped {
+                    self.untrack(seg, bytes);
+                }
+                self.lows.insert((*key).to_string(), *low_water);
+            }
+            Rec::Remove { key } => {
+                if let Some(m) = self.loc.remove(*key) {
+                    for (seg, bytes) in m.into_values() {
+                        self.untrack(seg, bytes);
+                    }
+                }
+                self.lows.remove(*key);
+            }
+            Rec::Fence { group, epoch } => {
+                self.fences.insert(*group, *epoch);
+            }
+            Rec::Caught { group, members } => {
+                self.caught
+                    .insert(*group, members.iter().cloned().map(NodeId).collect());
+            }
+            Rec::LowWater { key, low_water } => {
+                self.lows.insert((*key).to_string(), *low_water);
+            }
+        }
+    }
+
+    /// Give space back (ADR 0078 T3).
+    ///
+    /// 1. Drop the oldest segments while they hold no live entry — a prefix,
+    ///    never the active segment.
+    /// 2. While the log holds more than twice its live bytes, copy the oldest
+    ///    segment's live entries forward — their current values, from `entry`
+    ///    — a bounded STEP per call (a quarter of a segment, at most 1 MiB), and
+    ///    drop the segment once it is empty. Incremental because the oldest
+    ///    segment may be dense (a slow consumer's entries, compacted together)
+    ///    and, the prefix rule being what it is, nothing behind it can go
+    ///    before it does.
+    ///
+    /// Must run under the replica state's lock, with `entry` reading that
+    /// state: a copy taken outside it could re-append an entry a concurrent
+    /// truncate had just removed, and a replay would resurrect it.
+    ///
+    /// # Errors
+    /// An I/O failure; nothing acked is affected.
+    pub(super) fn reclaim<'s>(
+        &mut self,
+        entry: impl Fn(&str, Offset) -> Option<(Epoch, u64, &'s [u8])>,
+    ) -> Result<usize, ReplError> {
+        let mut dropped = self.drop_dead_prefix()?;
+        // One segment besides the active one is enough to compact: waiting for
+        // a third would let a 64 MiB-segment log sit well above the 2x bound.
+        if self.log.segments().len() < 2 || self.bytes() <= 2 * self.live_bytes() {
+            return Ok(dropped);
+        }
+        let oldest = self.log.segments()[0].first;
+        let step = (self.log.segment_bytes() / 4).clamp(1, COMPACT_STEP_MAX);
+        let mut copied = 0u64;
+        let mut examined = 0usize;
+        let mut recs = Vec::new();
+        // Live entries taken off the queue for this copy — put back if the
+        // append fails, or the segment would stay pinned with nothing queued to
+        // move it (until a reopen rebuilt the queue).
+        let mut taken: Vec<(Arc<str>, Offset)> = Vec::new();
+        let mut orphans: Vec<(Arc<str>, Offset)> = Vec::new();
+        while copied < step && examined < COMPACT_EXAMINE_MAX {
+            let Some((key, offset)) = self.appended.get_mut(&oldest).and_then(VecDeque::pop_front)
+            else {
+                break;
+            };
+            examined += 1;
+            // Still here? A truncated, removed or already-moved entry is skipped.
+            let here = self
+                .loc
+                .get(&key)
+                .and_then(|m| m.get(&offset))
+                .is_some_and(|(seg, _)| *seg == oldest);
+            if !here {
+                continue;
+            }
+            if let Some((epoch, seq, record)) = entry(&key, offset) {
+                let rec = Rec::Append {
+                    key: &key,
+                    offset,
+                    epoch,
+                    seq,
+                    record,
+                }
+                .encode();
+                copied += (HEADER_BYTES + rec.1.len()) as u64;
+                recs.push(rec);
+                taken.push((key, offset));
+            } else {
+                // Tracked as live here, absent from the state: nothing to copy,
+                // and nothing a replay needs — it is dead, so stop counting it
+                // rather than let it pin the segment forever.
+                orphans.push((key, offset));
+            }
+        }
+        for (key, offset) in orphans {
+            let gone = self.loc.get_mut(&key).and_then(|m| m.remove(&offset));
+            if self.loc.get(&key).is_some_and(BTreeMap::is_empty) {
+                self.loc.remove(&key);
+            }
+            if let Some((seg, bytes)) = gone {
+                self.untrack(seg, bytes);
+            }
+        }
+        if let Err(e) = self.append(&recs) {
+            if let Some(q) = self.appended.get_mut(&oldest) {
+                for item in taken.into_iter().rev() {
+                    q.push_front(item);
+                }
+            }
+            return Err(e);
+        }
+        dropped += self.drop_dead_prefix()?;
+        Ok(dropped)
+    }
+
+    fn drop_dead_prefix(&mut self) -> Result<usize, ReplError> {
+        let segs = self.log.segments();
+        let mut cut = None;
+        for w in segs.windows(2) {
+            if self.live.get(&w[0].first).is_some_and(|(n, _)| *n > 0) {
+                break;
+            }
+            cut = Some(w[1].first);
+        }
+        let Some(cut) = cut else { return Ok(0) };
+        let n = self.log.drop_before(cut).map_err(|e| lg(&e))?;
+        self.live.retain(|seg, _| *seg >= cut);
+        self.appended.retain(|seg, _| *seg >= cut);
+        Ok(n)
+    }
+}
+
+/// An opened log store: one shard per shard, and the state they replayed to.
 #[derive(Debug)]
 pub(super) struct Opened {
-    /// One log per shard, in shard order.
-    pub(super) logs: Vec<SegmentLog>,
-    /// The state the logs replay to.
+    /// One shard, in shard order.
+    pub(super) logs: Vec<LogShard>,
+    /// The state the shards replay to.
     pub(super) loaded: Loaded,
 }
 
@@ -342,7 +751,7 @@ fn open_shard(dir: &Path, segment_bytes: u64) -> Result<(SegmentLog, Replay), Re
             offset: lsn,
             detail: format!("record {lsn}: {detail}"),
         })?;
-        replay.apply(rec);
+        replay.apply(lsn, (HEADER_BYTES + payload.len()) as u64, rec);
         Ok(())
     })
     .map_err(|e| lg(&e))?;
@@ -387,6 +796,7 @@ pub(super) fn open(root: &Path, shards: usize, segment_bytes: u64) -> Result<Ope
             )))
         }
     };
+    let k32 = u32::try_from(k).unwrap_or(1);
     let mut loaded = Loaded {
         fences: Fences::new(),
         logs: ReplicaLogs::new(),
@@ -397,7 +807,7 @@ pub(super) fn open(root: &Path, shards: usize, segment_bytes: u64) -> Result<Ope
     let mut first_shard = Some((log0, replay0));
     for shard in 0..k {
         let dir = shard_dir(root, shard);
-        let (mut log, replay) = if let Some(opened) = first_shard.take() {
+        let (log, replay) = if let Some(opened) = first_shard.take() {
             opened
         } else {
             if committed && !dir.exists() {
@@ -410,6 +820,7 @@ pub(super) fn open(root: &Path, shards: usize, segment_bytes: u64) -> Result<Ope
             }
             open_shard(&dir, segment_bytes)?
         };
+        let mut log_shard = LogShard::from_replay(log, k32, &replay);
         match replay.format {
             Some((FORMAT_VERSION, n)) if n as usize == k => {}
             Some((FORMAT_VERSION, n)) => {
@@ -425,14 +836,13 @@ pub(super) fn open(root: &Path, shards: usize, segment_bytes: u64) -> Result<Ope
                     dir.display()
                 )))
             }
-            None if log.next_lsn() == 1 => {
+            None if log_shard.next_lsn() == 1 => {
                 // Fresh, or created and never stamped before a crash: stamp it.
-                let (kind, payload) = Rec::Format {
+                log_shard.append(&[Rec::Format {
                     version: FORMAT_VERSION,
-                    shards: u32::try_from(k).unwrap_or(1),
+                    shards: k32,
                 }
-                .encode();
-                log.append(&[(kind, &payload)]).map_err(|e| lg(&e))?;
+                .encode()])?;
             }
             None => {
                 return Err(ReplError::Backend(format!(
@@ -445,7 +855,7 @@ pub(super) fn open(root: &Path, shards: usize, segment_bytes: u64) -> Result<Ope
         loaded.logs.extend(replay.logs);
         loaded.truncated.extend(replay.truncated);
         loaded.caught_up.extend(replay.caught_up);
-        shard_logs.push(log);
+        shard_logs.push(log_shard);
     }
     Ok(Opened {
         logs: shard_logs,
@@ -461,7 +871,8 @@ pub(super) fn open(root: &Path, shards: usize, segment_bytes: u64) -> Result<Ope
 /// Written to a staging directory first: a crash mid-import leaves the staging
 /// directory — deleted and redone on the next open — and never a half-written
 /// `replicas-log`. The redb files are left untouched; the caller renames them
-/// once this returns.
+/// once this returns. Written through [`LogShard`], so an import large enough
+/// to roll segments restates its metadata at every head like any commit.
 ///
 /// # Errors
 /// I/O failures writing, flushing or renaming.
@@ -476,17 +887,19 @@ pub(super) fn import(
         std::fs::remove_dir_all(&staging).map_err(|e| io("clearing a stale staging dir", e))?;
     }
     let k = state.shard_count();
+    let k32 = u32::try_from(k).unwrap_or(1);
     let shard_of = |group: GroupId| super::shard_of_group(group, k);
     for shard in 0..k {
-        let (mut log, _) = SegmentLog::open(
+        let (log, _) = SegmentLog::open(
             staging.join(format!("shard-{shard}")),
             segment_bytes,
             |_, _, _| Ok(()),
         )
         .map_err(|e| lg(&e))?;
+        let mut out = LogShard::new(log, k32);
         let mut recs: Vec<(u8, Vec<u8>)> = vec![Rec::Format {
             version: FORMAT_VERSION,
-            shards: u32::try_from(k).unwrap_or(1),
+            shards: k32,
         }
         .encode()];
         for (group, epoch) in state.fences.iter().filter(|(g, _)| shard_of(**g) == shard) {
@@ -516,14 +929,12 @@ pub(super) fn import(
             if shard_of(crate::placement::group_of_key(key)) != shard {
                 continue;
             }
-            // The low-water first: it deletes nothing yet (no entry precedes it
-            // in this log) and sets the row; the entries then land exactly as
-            // the table held them, stale leftovers below the low-water included.
+            // The low-water alone — it deletes nothing — then the entries exactly
+            // as the table held them, stale leftovers below the low-water included.
             if let Some(lw) = state.truncated.get(key) {
                 recs.push(
-                    Rec::Truncate {
+                    Rec::LowWater {
                         key,
-                        up_to: *lw,
                         low_water: *lw,
                     }
                     .encode(),
@@ -541,11 +952,12 @@ pub(super) fn import(
                     .encode(),
                 );
                 if recs.len() >= IMPORT_CHUNK {
-                    flush(&mut log, &mut recs)?;
+                    out.append(&recs)?;
+                    recs.clear();
                 }
             }
         }
-        flush(&mut log, &mut recs)?;
+        out.append(&recs)?;
     }
     let target = root.join(LOG_DIR);
     std::fs::rename(&staging, &target)
@@ -554,13 +966,6 @@ pub(super) fn import(
     std::fs::File::open(root)
         .and_then(|d| d.sync_all())
         .map_err(|e| io("flushing the data dir", e))?;
-    Ok(())
-}
-
-fn flush(log: &mut SegmentLog, recs: &mut Vec<(u8, Vec<u8>)>) -> Result<(), ReplError> {
-    let batch: Vec<(u8, &[u8])> = recs.iter().map(|(k, p)| (*k, p.as_slice())).collect();
-    log.append(&batch).map_err(|e| lg(&e))?;
-    recs.clear();
     Ok(())
 }
 
@@ -795,6 +1200,301 @@ mod tests {
         std::fs::write(&seg, &torn).unwrap();
         let r = ReplicaState::open_store_with(dir.path(), 1, StoreBackend::Log, 1 << 20).unwrap();
         assert_eq!(snap(&r), before);
+    }
+
+    // --- T3: space reclamation ---------------------------------------------
+
+    fn log_stats(state: &std::sync::Mutex<ReplicaState>) -> (usize, u64, u64, Lsn) {
+        let r = state.lock().unwrap();
+        let super::super::Shard::Log(l) = &r.dbs[0] else {
+            panic!("a log store")
+        };
+        let l = l.lock().unwrap();
+        (
+            l.segment_count(),
+            l.bytes(),
+            l.live_bytes(),
+            l.log.segments()[0].first,
+        )
+    }
+
+    /// Consumers that keep up: each round appends to every key and acks what
+    /// the previous round appended. `slow` keys are never acked.
+    fn churn(state: &std::sync::Mutex<ReplicaState>, rounds: u64, keys: usize, slow: &[&str]) {
+        for round in 1..=rounds {
+            let mut b: Vec<(Epoch, ReplOp)> = Vec::new();
+            for k in 0..keys {
+                let key = format!("q/c{k}");
+                b.push((4, ap(&key, round, round, &[0x42; 200])));
+                if round > 1 {
+                    b.push((4, tr(&key, round - 1)));
+                }
+            }
+            for key in slow {
+                b.push((4, ap(key, round, round, &[0x17; 200])));
+            }
+            assert!(ReplicaState::apply_batch_sharded(state, 0, &b)
+                .iter()
+                .all(|ok| *ok));
+        }
+    }
+
+    fn reference(ops: impl Fn(&std::sync::Mutex<ReplicaState>)) -> Snapshot {
+        let dir = tempfile::tempdir().unwrap();
+        let state = std::sync::Mutex::new(
+            ReplicaState::open_store_with(dir.path(), 1, StoreBackend::Redb, 0).unwrap(),
+        );
+        ops(&state);
+        drop(state);
+        snap(&ReplicaState::open_store_with(dir.path(), 1, StoreBackend::Redb, 0).unwrap())
+    }
+
+    /// Consumers that keep up leave whole segments dead behind them: those are
+    /// dropped, so the log stays a few segments however much is written through
+    /// it — and what remains still replays to exactly the redb state.
+    #[test]
+    fn a_log_whose_consumers_keep_up_stays_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let seg = 16 << 10;
+        let ops = |s: &std::sync::Mutex<ReplicaState>| churn(s, 400, 8, &[]);
+        let state = std::sync::Mutex::new(
+            ReplicaState::open_store_with(dir.path(), 1, StoreBackend::Log, seg).unwrap(),
+        );
+        ops(&state);
+        let (segments, bytes, live, first) = log_stats(&state);
+        // 400 rounds x 8 keys x ~260 B is ~830 KiB written through a 16 KiB-segment log.
+        assert!(first > 1, "the log's first segments were dropped");
+        assert!(segments <= 4, "{segments} segments for {live} live bytes");
+        assert!(bytes <= 4 * seg, "{bytes} bytes held");
+        drop(state);
+        let reopened =
+            ReplicaState::open_store_with(dir.path(), 1, StoreBackend::Log, seg).unwrap();
+        assert_eq!(snap(&reopened), reference(ops));
+    }
+
+    /// A consumer that never acks pins its entries — and only those. Compaction
+    /// moves them forward so the segments they sat in can go; the log stays
+    /// bounded by the live data, and the slow consumer's entries survive every
+    /// move and a reopen.
+    #[test]
+    fn a_slow_consumer_is_compacted_forward_not_left_to_pin_the_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let seg = 16 << 10;
+        let ops = |s: &std::sync::Mutex<ReplicaState>| churn(s, 400, 8, &["q/slow"]);
+        let state = std::sync::Mutex::new(
+            ReplicaState::open_store_with(dir.path(), 1, StoreBackend::Log, seg).unwrap(),
+        );
+        ops(&state);
+        let (segments, bytes, live, first) = log_stats(&state);
+        // The slow key holds 400 x ~240 B = ~94 KiB live: about 6 segments' worth.
+        assert!(first > 1, "compaction let the first segments go");
+        assert!(
+            bytes <= 2 * live + 3 * seg,
+            "{bytes} bytes held for {live} live ({segments} segments)"
+        );
+        assert_eq!(state.lock().unwrap().entries("q/slow").len(), 400);
+        drop(state);
+        let reopened =
+            ReplicaState::open_store_with(dir.path(), 1, StoreBackend::Log, seg).unwrap();
+        assert_eq!(reopened.entries("q/slow").len(), 400);
+        assert_eq!(snap(&reopened), reference(ops));
+    }
+
+    /// Metadata written once, early — a fence, a caught-up stamp, a low-water —
+    /// lives on in every segment head, so dropping the segment it was written
+    /// in loses nothing.
+    #[test]
+    fn metadata_outlives_the_segment_it_was_written_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let seg = 16 << 10;
+        let ops = |s: &std::sync::Mutex<ReplicaState>| {
+            assert!(ReplicaState::apply_batch_sharded(
+                s,
+                0,
+                &[
+                    (9, ap("q/meta", 1, 1, b"m")),
+                    (9, ap("q/meta", 2, 2, b"m")),
+                    (9, tr("q/meta", 1))
+                ]
+            )
+            .iter()
+            .all(|ok| *ok));
+            s.lock().unwrap().mark_groups_current(&[(
+                crate::placement::group_of_key("q/meta"),
+                vec![crate::NodeId("n1".into())],
+            )]);
+            churn(s, 300, 8, &[]);
+        };
+        let state = std::sync::Mutex::new(
+            ReplicaState::open_store_with(dir.path(), 1, StoreBackend::Log, seg).unwrap(),
+        );
+        ops(&state);
+        let (_, _, _, first) = log_stats(&state);
+        drop(state);
+        let reopened =
+            ReplicaState::open_store_with(dir.path(), 1, StoreBackend::Log, seg).unwrap();
+        let expected = reference(ops);
+        assert_eq!(snap(&reopened), expected);
+        assert_eq!(reopened.fence_for_key("q/meta"), 9);
+        assert_eq!(reopened.watermark("q/meta"), 1);
+        assert!(reopened
+            .caught_up_set(crate::placement::group_of_key("q/meta"))
+            .is_some());
+        // Only meaningful if the segment holding them really was dropped: the
+        // entry at offset 2 is live, so it was compacted forward, not left.
+        assert!(first > 1, "the first segment was dropped");
+    }
+
+    fn with_shard<T>(
+        state: &std::sync::Mutex<ReplicaState>,
+        f: impl FnOnce(&mut LogShard) -> T,
+    ) -> T {
+        let r = state.lock().unwrap();
+        let super::super::Shard::Log(l) = &r.dbs[0] else {
+            panic!("a log store")
+        };
+        let mut l = l.lock().unwrap();
+        f(&mut l)
+    }
+
+    /// A slow consumer whose oldest segment needs compacting. Built through
+    /// `apply_batch`, which does not reclaim (only the shard writer's path
+    /// does), so the garbage is still there when the test calls `reclaim`.
+    fn pinned_log(dir: &Path, seg: u64) -> std::sync::Mutex<ReplicaState> {
+        let state = std::sync::Mutex::new(
+            ReplicaState::open_store_with(dir, 1, StoreBackend::Log, seg).unwrap(),
+        );
+        for round in 1..=60u64 {
+            let mut b: Vec<(Epoch, ReplOp)> = Vec::new();
+            for k in 0..8 {
+                let key = format!("q/c{k}");
+                b.push((4, ap(&key, round, round, &[0x42; 200])));
+                if round > 1 {
+                    b.push((4, tr(&key, round - 1)));
+                }
+            }
+            b.push((4, ap("q/slow", round, round, &[0x17; 200])));
+            assert!(state.lock().unwrap().apply_batch(&b).iter().all(|ok| *ok));
+        }
+        with_shard(&state, |l| {
+            assert!(
+                l.bytes() > 2 * l.live_bytes(),
+                "the fixture needs compacting"
+            );
+            assert!(l.segment_count() > 2);
+        });
+        state
+    }
+
+    /// A compaction whose append fails puts back what it took: the next
+    /// reclaim still finds the segment's live entries, moves them, and the
+    /// segment goes — the failure costs a retry, not a permanent pin.
+    #[test]
+    fn a_failed_compaction_append_is_retried_not_a_permanent_pin() {
+        let dir = tempfile::tempdir().unwrap();
+        let seg = 16 << 10;
+        let state = pinned_log(dir.path(), seg);
+        let oldest = with_shard(&state, |l| l.log.segments()[0].first);
+        let huge = vec![0u8; crate::segment_log::MAX_PAYLOAD + 1];
+        // An oversized record fails the append before anything is written.
+        let err = with_shard(&state, |l| l.reclaim(|_, _| Some((4, 1, huge.as_slice()))));
+        assert!(err.is_err());
+        let r = state.lock().unwrap();
+        let values: BTreeMap<(String, Offset), Vec<u8>> = r
+            .logs
+            .iter()
+            .flat_map(|(k, m)| {
+                m.iter()
+                    .map(move |(o, (_, v))| ((k.clone(), *o), v.clone()))
+            })
+            .collect();
+        drop(r);
+        for _ in 0..64 {
+            with_shard(&state, |l| {
+                l.reclaim(|k, o| {
+                    values
+                        .get(&(k.to_string(), o))
+                        .map(|v| (4, o, v.as_slice()))
+                })
+                .unwrap()
+            });
+        }
+        let first = with_shard(&state, |l| l.log.segments()[0].first);
+        assert!(
+            first > oldest,
+            "the pinned segment was compacted and dropped after the failure"
+        );
+    }
+
+    /// An entry tracked as live that the state no longer holds is dead, not a
+    /// reason to keep its segment forever.
+    #[test]
+    fn a_tracked_entry_the_state_lacks_does_not_wedge_reclamation() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = pinned_log(dir.path(), 16 << 10);
+        let oldest = with_shard(&state, |l| l.log.segments()[0].first);
+        for _ in 0..64 {
+            with_shard(&state, |l| l.reclaim(|_, _| None).unwrap());
+        }
+        let first = with_shard(&state, |l| l.log.segments()[0].first);
+        assert!(
+            first > oldest,
+            "the orphans were untracked and the segment dropped"
+        );
+    }
+
+    /// One reclaim call examines at most `COMPACT_EXAMINE_MAX` queued entries,
+    /// however many acked entries sit ahead of the live one.
+    #[test]
+    fn one_reclaim_examines_a_bounded_number_of_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = std::sync::Mutex::new(
+            ReplicaState::open_store_with(dir.path(), 1, StoreBackend::Log, 4 << 20).unwrap(),
+        );
+        // Built through `apply_batch`, which does not reclaim: the oldest
+        // segment ends up as thousands of acked entries and one live one, and
+        // the log far above twice its live bytes.
+        let n = COMPACT_EXAMINE_MAX as u64 * 2;
+        let apply = |b: &[(Epoch, ReplOp)]| {
+            assert!(state.lock().unwrap().apply_batch(b).iter().all(|ok| *ok));
+        };
+        apply(
+            &(1..=n)
+                .map(|o| (4, ap("q/many", o, o, b"x")))
+                .collect::<Vec<_>>(),
+        );
+        apply(&[(4, tr("q/many", n - 1))]);
+        let big = vec![0x33u8; 64 << 10];
+        apply(
+            &(1..=80)
+                .map(|o| (4, ap("q/big", o, o, &big)))
+                .collect::<Vec<_>>(),
+        );
+        apply(&[(4, tr("q/big", 79))]);
+        let queued = |state: &std::sync::Mutex<ReplicaState>| {
+            with_shard(state, |l| {
+                let oldest = l.log.segments()[0].first;
+                l.appended.get(&oldest).map_or(0, VecDeque::len)
+            })
+        };
+        with_shard(&state, |l| {
+            assert!(
+                l.segment_count() >= 2 && l.bytes() > 2 * l.live_bytes(),
+                "the fixture needs compacting"
+            );
+        });
+        let before = queued(&state);
+        assert!(
+            before > COMPACT_EXAMINE_MAX,
+            "the fixture queues more than one call's worth: {before}"
+        );
+        with_shard(&state, |l| l.reclaim(|_, _| None).unwrap());
+        let after = queued(&state);
+        assert!(
+            after > 0 && before - after <= COMPACT_EXAMINE_MAX,
+            "examined {} in one call",
+            before - after
+        );
     }
 
     #[test]

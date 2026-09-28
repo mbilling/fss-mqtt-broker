@@ -131,16 +131,27 @@ are low-volume or out of scope for the clustered durable path.
 ### 4. Space reclamation
 
 - Each segment keeps an in-memory count of its **live** Appends (not yet
-  truncated or removed). A segment whose count reaches zero, and which is older
-  than the last checkpoint, is deleted — the common case for a queue whose
-  consumers keep up: whole segments die as acks pass them.
-- When space amplification (log bytes / live bytes) passes a bound (proposed
-  2×), the writer **compacts the oldest segment**: it re-appends that segment's
-  still-live entries and a `Checkpoint` carrying current fences, low-waters and
-  caught-up sets, then deletes the segment. Cost is proportional to the live
-  data it moves, off the ack path but through the same writer, so order holds.
+  truncated or removed). The oldest segments are deleted while their count is
+  zero — only ever a **prefix** of the log, never the active segment, so a
+  `Truncate` or `Remove` record can never be deleted while an entry it
+  suppresses survives in an older segment. This is the common case for a queue
+  whose consumers keep up: whole segments die as acks pass them.
+- Metadata is **restated at the head of every new segment**: the format stamp,
+  the shard's fences and caught-up sets, and every key's low-water — the last
+  as a `LowWater{key, low_water}` record that sets the low-water and deletes
+  nothing (restating it as a `Truncate` would delete a stale leftover below
+  it). A dropped prefix therefore never takes the only copy of any metadata.
+- When space amplification (log bytes / live bytes) passes **2×**, the oldest
+  segment's still-live entries are re-appended — a bounded step per batch (a
+  quarter of a segment, at most 1 MiB) — and the segment is deleted once it is
+  empty. Incremental because the oldest segment may be dense (a slow consumer's
+  entries, compacted together) and, under the prefix rule, nothing behind it
+  can go before it does; the step bounds the stall, since the copy runs under
+  the replica state's lock. It must: a copy taken outside it could re-append an
+  entry a concurrent truncate had just removed, and a replay would resurrect it.
 - Bounded by design: a slow consumer pins only its own live entries, which are
-  in memory already; the log holds them once more on disk.
+  in memory already; the log holds them once more on disk, plus at most the
+  garbage the 2× bound allows.
 
 ### 5. Rollout
 
