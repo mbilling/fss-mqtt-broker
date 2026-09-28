@@ -1662,6 +1662,16 @@ impl Config {
                     .to_string(),
             ));
         }
+        // Membership gossips this node's peer-link address, so gossip without a peer
+        // listener has nothing to advertise. Refused here rather than at SWIM startup so
+        // `--check-config` and a reload catch it too (issue #671).
+        if self.cluster.swim.bind.is_some() && self.cluster.peer_bind.is_none() {
+            return Err(ConfigError::Invalid(
+                "cluster.swim.bind requires cluster.peer_bind (MQTTD_PEER_BIND): membership \
+                 gossips the peer-link address so other nodes can dial us"
+                    .to_string(),
+            ));
+        }
         // Ephemeral durability without the explicit opt-in (issue #240, ADR 0029
         // as-delivered): durable ON + no data_dir is quorum-of-RAM — refused rather
         // than warned. Checked last so a config broken in a more specific way is
@@ -2486,6 +2496,25 @@ mod tests {
         c.overlay_from(|k| (k == "MQTTD_MTLS_IDENTITY_SOURCE").then(|| "san-uri".to_string()))
             .unwrap();
         assert_eq!(c.security.mtls_identity_source.as_deref(), Some("san-uri"));
+    }
+
+    /// Issue #671: gossip advertises the peer-link address, so a SWIM bind without a peer
+    /// bind is refused at validation — by startup, reload and `--check-config` alike —
+    /// rather than first at SWIM startup.
+    #[test]
+    fn a_swim_bind_requires_a_peer_bind() {
+        let flag = "\n[durable]\nallow_ephemeral = true\n";
+        let err = Config::from_toml(&format!("[cluster.swim]\nbind = \"127.0.0.1:7946\"{flag}"))
+            .unwrap_err();
+        match err {
+            super::ConfigError::Invalid(m) => assert!(m.contains("requires cluster.peer_bind")),
+            super::ConfigError::Parse(m) => panic!("wrong error kind: {m}"),
+        }
+        assert!(Config::from_toml(&format!(
+            "[cluster]\npeer_bind = \"127.0.0.1:7001\"\n\
+             [cluster.swim]\nbind = \"127.0.0.1:7946\"{flag}"
+        ))
+        .is_ok());
     }
 
     #[test]

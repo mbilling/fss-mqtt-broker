@@ -109,7 +109,7 @@ From `hub/mod.rs`:
 | `SIGUSR1` / `mqttd --decommission` | ADR 0043 drain: hand off durable keys, then leave. Kubernetes `preStop`. |
 | `SIGUSR2` / `mqttd --backup` | ADR 0062 online export into `[backup] dir`. Handler is installed even with no dir configured (default SIGUSR2 would otherwise *kill* the process). |
 | `SIGHUP` / `MQTTD_CONFIG_WATCH` | Validate-before-swap reload (ADR 0032/0033). |
-| `--check-config` | Validate and exit; bind nothing. |
+| `--check-config` | Validate and exit; bind nothing. Runs startup's own pre-bind checks too: every bind resolved, every referenced file (TLS, password, ACL, JWT, gossip key) opened and parsed as the running user (issue #671). |
 
 ## Where to put a change
 

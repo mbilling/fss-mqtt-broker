@@ -5,6 +5,10 @@
 use std::io::Write as _;
 use std::process::Command;
 
+/// The CI-fatal environmental skip (issue #260) — just the macro, not the whole harness.
+#[path = "common/skip.rs"]
+mod skip;
+
 fn mqttd() -> Command {
     let mut c = Command::new(env!("CARGO_BIN_EXE_mqttd"));
     // A hermetic environment: strip any MQTTD_* the runner might carry so each case controls
@@ -246,5 +250,286 @@ fn a_config_flag_without_a_value_is_a_usage_error_exit_2() {
         out.status.code(),
         Some(2),
         "a malformed invocation should exit 2"
+    );
+}
+
+// ---------------------------------------------------------------------------------------
+// Issue #671: the gate refuses what startup refuses. Each case below booted a dead broker
+// behind a `config OK` before — the check stopped at `Config::load`, and binds, referenced
+// files and the startup-time cross-checks were first looked at by the broker itself.
+// ---------------------------------------------------------------------------------------
+
+/// A durable-off node: everything below adds to this so the failure is for its own reason.
+const BASE: &str = "[node]\nid = \"checked\"\n[durable]\nenabled = false\n";
+
+/// Run `--check-config` on `toml` written into `dir`; `(exit code, stdout, stderr)`.
+fn check(dir: &std::path::Path, toml: &str) -> (Option<i32>, String, String) {
+    let path = dir.join("mqttd.toml");
+    std::fs::write(&path, toml).unwrap();
+    let out = mqttd()
+        .arg("--check-config")
+        .arg("--config")
+        .arg(&path)
+        .output()
+        .unwrap();
+    (
+        out.status.code(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+/// Assert the check refuses `toml` with exit 1 and an error containing `needle`.
+fn assert_refused(dir: &std::path::Path, toml: &str, needle: &str) {
+    let (code, stdout, stderr) = check(dir, toml);
+    assert_eq!(
+        code,
+        Some(1),
+        "must be refused ({needle}); stdout={stdout} stderr={stderr}\n--- config ---\n{toml}"
+    );
+    assert!(!stdout.contains("config OK"), "stdout was: {stdout}");
+    assert!(stderr.contains("config INVALID"), "stderr was: {stderr}");
+    assert!(
+        stderr.contains(needle),
+        "the refusal must name {needle:?}; stderr was: {stderr}"
+    );
+}
+
+/// Assert the check passes `toml`.
+fn assert_passes(dir: &std::path::Path, toml: &str) {
+    let (code, stdout, stderr) = check(dir, toml);
+    assert_eq!(
+        code,
+        Some(0),
+        "must validate; stdout={stdout} stderr={stderr}\n--- config ---\n{toml}"
+    );
+    assert!(stdout.contains("config OK"), "stdout was: {stdout}");
+}
+
+/// Real throwaway PKI: `(ca, cert, key)` paths inside `dir`.
+fn mint_pki(dir: &std::path::Path) -> (String, String, String) {
+    let ca_key = rcgen::KeyPair::generate().unwrap();
+    let mut ca_params = rcgen::CertificateParams::new(Vec::new()).unwrap();
+    ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    let ca = rcgen::CertifiedIssuer::self_signed(ca_params, ca_key).unwrap();
+    let leaf_key = rcgen::KeyPair::generate().unwrap();
+    let leaf = rcgen::CertificateParams::new(vec!["127.0.0.1".into()])
+        .unwrap()
+        .signed_by(&leaf_key, &ca)
+        .unwrap();
+    let paths = ["ca.pem", "cert.pem", "key.pem"].map(|f| dir.join(f));
+    std::fs::write(&paths[0], ca.pem()).unwrap();
+    std::fs::write(&paths[1], leaf.pem()).unwrap();
+    std::fs::write(&paths[2], leaf_key.serialize_pem()).unwrap();
+    let [ca, cert, key] = paths.map(|p| p.display().to_string());
+    (ca, cert, key)
+}
+
+/// A real Argon2id `username:phc` line.
+fn password_line(user: &str, password: &str) -> String {
+    use argon2::password_hash::phc::Salt;
+    use argon2::{Argon2, PasswordHasher};
+    let salt = Salt::new(b"fixed-salt-bytes").unwrap();
+    let phc = Argon2::default()
+        .hash_password_with_salt(password.as_bytes(), &salt)
+        .unwrap();
+    format!("{user}:{phc}\n")
+}
+
+/// The issue's first case: an unparseable bind validated, then the broker exited at
+/// startup. Every bind is now resolved (nothing is bound), and the refusal names the key.
+#[test]
+fn an_unparseable_bind_is_refused_naming_the_key() {
+    let dir = tempfile::tempdir().unwrap();
+    for key in [
+        "tls_bind",
+        "plaintext_bind",
+        "ws_bind",
+        "wss_bind",
+        "health_bind",
+        "metrics_bind",
+    ] {
+        assert_refused(
+            dir.path(),
+            &format!("{BASE}[listeners]\n{key} = \"not-an-address\"\n"),
+            &format!("listeners.{key}"),
+        );
+    }
+    assert_refused(
+        dir.path(),
+        &format!("{BASE}[cluster]\npeer_bind = \"not-an-address\"\n"),
+        "cluster.peer_bind",
+    );
+    // QUIC binds a literal address: its own parse, its own message.
+    assert_refused(
+        dir.path(),
+        &format!(
+            "{BASE}[listeners]\nquic_bind = \"not-an-address\"\n\
+             [tls]\ncert = \"/nonexistent/c.pem\"\nkey = \"/nonexistent/k.pem\"\n"
+        ),
+        "MQTTD_QUIC_BIND",
+    );
+}
+
+/// Name resolution is what `bind` itself does, so a resolvable host name is not refused —
+/// the check must not be stricter than the broker.
+#[test]
+fn a_resolvable_bind_passes() {
+    let dir = tempfile::tempdir().unwrap();
+    assert_passes(
+        dir.path(),
+        &format!(
+            "{BASE}[listeners]\nplaintext_bind = \"localhost:1883\"\n\
+             health_bind = \"0.0.0.0:8080\"\n\
+             [security]\nallow_anonymous = true\n"
+        ),
+    );
+}
+
+/// The issue's second case: a referenced file the service account cannot read. A missing
+/// file is the portable form of it; the `0600 root:root` form follows on Unix.
+#[test]
+fn an_unreadable_referenced_file_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("absent").display().to_string();
+    for (section, key, needle) in [
+        ("security", "password_file", "MQTTD_PASSWORD_FILE"),
+        ("security", "acl_file", "MQTTD_ACL_FILE"),
+    ] {
+        assert_refused(
+            dir.path(),
+            &format!("{BASE}[{section}]\n{key} = \"{missing}\"\n"),
+            needle,
+        );
+    }
+    assert_refused(
+        dir.path(),
+        &format!(
+            "{BASE}[listeners]\ntls_bind = \"127.0.0.1:8883\"\n\
+             [tls]\ncert = \"{missing}\"\nkey = \"{missing}\"\n"
+        ),
+        "MQTTD_TLS_CERT",
+    );
+}
+
+/// The exact report: a password file the running user may not open. Skipped when the
+/// test runs as a user that can open it anyway (root ignores mode bits).
+#[cfg(unix)]
+#[test]
+fn a_password_file_without_read_permission_is_refused() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = tempfile::tempdir().unwrap();
+    let pw = dir.path().join("passwd");
+    std::fs::write(&pw, password_line("alice", "s3cret")).unwrap();
+    std::fs::set_permissions(&pw, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::File::open(&pw).is_ok() {
+        crate::skip_locally_or_fail_in_ci!(
+            "this user can open a mode-000 file (running as root?), so an unreadable file \
+             cannot be made here; run the suite as an unprivileged user"
+        );
+    }
+    assert_refused(
+        dir.path(),
+        &format!("{BASE}[security]\npassword_file = \"{}\"\n", pw.display()),
+        "MQTTD_PASSWORD_FILE",
+    );
+}
+
+/// Readable is not enough: the material is parsed exactly as a reload parses it.
+#[test]
+fn malformed_referenced_material_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let garbage = dir.path().join("garbage");
+    std::fs::write(&garbage, "this is not what the broker expects\n").unwrap();
+    let garbage = garbage.display().to_string();
+    for key in ["password_file", "acl_file"] {
+        let (code, stdout, stderr) = check(
+            dir.path(),
+            &format!("{BASE}[security]\n{key} = \"{garbage}\"\n"),
+        );
+        assert_eq!(
+            code,
+            Some(1),
+            "a malformed {key} must be refused; stdout={stdout} stderr={stderr}"
+        );
+    }
+    let (_, cert, key) = mint_pki(dir.path());
+    // A key where the certificate belongs, and a certificate where the key belongs.
+    for (c, k) in [(&garbage, &key), (&cert, &garbage), (&key, &cert)] {
+        let (code, stdout, stderr) = check(
+            dir.path(),
+            &format!(
+                "{BASE}[listeners]\ntls_bind = \"127.0.0.1:8883\"\n\
+                 [tls]\ncert = \"{c}\"\nkey = \"{k}\"\n"
+            ),
+        );
+        assert_eq!(
+            code,
+            Some(1),
+            "cert={c} key={k} must be refused; stdout={stdout} stderr={stderr}"
+        );
+    }
+}
+
+/// The positive control: a complete, correct secured config — TLS with client CA,
+/// password file, ACL — still validates, so the new checks carry no false refusals.
+#[test]
+fn a_complete_secured_config_passes() {
+    let dir = tempfile::tempdir().unwrap();
+    let (ca, cert, key) = mint_pki(dir.path());
+    let pw = dir.path().join("passwd");
+    std::fs::write(&pw, password_line("alice", "s3cret")).unwrap();
+    let acl = dir.path().join("acl.toml");
+    std::fs::write(
+        &acl,
+        "[[rules]]\nactions = [\"publish\", \"subscribe\"]\ntopics = [\"#\"]\n",
+    )
+    .unwrap();
+    assert_passes(
+        dir.path(),
+        &format!(
+            "{BASE}[listeners]\ntls_bind = \"127.0.0.1:8883\"\nwss_bind = \"127.0.0.1:8884\"\n\
+             quic_bind = \"127.0.0.1:14567\"\nhealth_bind = \"127.0.0.1:8080\"\n\
+             [tls]\ncert = \"{cert}\"\nkey = \"{key}\"\nclient_ca = \"{ca}\"\n\
+             [security]\npassword_file = \"{}\"\nacl_file = \"{}\"\n",
+            pw.display(),
+            acl.display()
+        ),
+    );
+}
+
+/// Cross-checks startup made after `Config::load` are made by the gate too.
+#[test]
+fn startup_cross_checks_are_made_by_the_gate() {
+    let dir = tempfile::tempdir().unwrap();
+    // TLS listener with no certificate.
+    assert_refused(
+        dir.path(),
+        &format!("{BASE}[listeners]\ntls_bind = \"127.0.0.1:8883\"\n"),
+        "require a TLS cert and key",
+    );
+    // Gossip with no peer listener to advertise.
+    assert_refused(
+        dir.path(),
+        &format!("{BASE}[cluster.swim]\nbind = \"127.0.0.1:7946\"\n"),
+        "cluster.swim.bind requires cluster.peer_bind",
+    );
+    // OIDC over plaintext http without the test override.
+    assert_refused(
+        dir.path(),
+        &format!("{BASE}[security.oidc]\nissuer = \"http://idp.example\"\naudience = \"mqtt\"\n"),
+        "MQTTD_OIDC_ISSUER must be https",
+    );
+    // OIDC beside a static JWT verifier.
+    let secret = dir.path().join("hs256");
+    std::fs::write(&secret, "0123456789abcdef0123456789abcdef").unwrap();
+    assert_refused(
+        dir.path(),
+        &format!(
+            "{BASE}[security.oidc]\nissuer = \"https://idp.example\"\naudience = \"mqtt\"\n\
+             [security.jwt]\nhs256_secret_file = \"{}\"\n",
+            secret.display()
+        ),
+        "mutually exclusive",
     );
 }
