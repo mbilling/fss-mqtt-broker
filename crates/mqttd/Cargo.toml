@@ -19,6 +19,7 @@ reqwest = { workspace = true, features = ["json"] }
 # where the I/O lives — mqtt-auth stays I/O-free.
 async-trait = "0.1"
 serde = { workspace = true, features = ["derive"] }
+futures-util = { workspace = true }
 serde_json.workspace = true
 mqtt-codec = { path = "../mqtt-codec", version = "1.0.0" }
 mqtt-core = { path = "../mqtt-core", version = "1.0.0" }
