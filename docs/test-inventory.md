@@ -1504,23 +1504,24 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `a_v311_qos2_publisher_is_closed_without_a_pubrec_by_a_real_browned_out_broker`
 - `a_v5_publisher_is_told_0x97_when_brownout_refuses_the_durable_enqueue`
 
-## `crates/mqttd/tests/check_config.rs` — 15 test(s)
+## `crates/mqttd/tests/check_config.rs` — 16 test(s)
 
 - `a_bad_env_value_fails_check_config`
-- `a_complete_secured_config_passes`
+- `a_complete_secured_config_passes_both_gates`
 - `a_config_flag_without_a_value_is_a_usage_error_exit_2`
-- `a_password_file_without_read_permission_is_refused` — only when `cfg(unix)`
-- `a_resolvable_bind_passes`
+- `a_missing_referenced_file_is_refused_by_the_preflight_only`
+- `a_password_file_without_read_permission_is_refused_by_the_preflight` — only when `cfg(unix)`
 - `a_valid_file_validates_and_reports_the_path`
 - `an_unknown_key_fails_with_a_located_error_and_exit_1`
 - `an_unparseable_bind_is_refused_naming_the_key`
-- `an_unreadable_referenced_file_is_refused`
 - `bare_defaults_are_refused_naming_both_remedies`
 - `check_config_rejects_a_min_replicas_floor_above_the_replication_factor`
 - `check_config_rejects_a_watermark_poll_outside_its_range`
 - `each_posture_validates_under_check_config`
-- `malformed_referenced_material_is_refused`
-- `startup_cross_checks_are_made_by_the_gate`
+- `malformed_referenced_material_is_refused_by_the_preflight`
+- `preflight_without_check_config_is_a_usage_error_exit_2`
+- `startup_cross_checks_are_made_by_the_static_gate`
+- `well_formed_binds_pass`
 
 ## `crates/mqttd/tests/cluster.rs` — 6 test(s)
 

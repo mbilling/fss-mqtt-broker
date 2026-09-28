@@ -1662,6 +1662,20 @@ impl Config {
                     .to_string(),
             ));
         }
+        // OIDC beside a static JWT verifier: the auth chain stops at the first real verdict
+        // on a credential kind, so one would shadow the other — mutually exclusive (ADR
+        // 0050 §1, no silent fallback between key sources). Here rather than in the
+        // authenticator builder so the static `--check-config` refuses it too (issue #671).
+        if self.security.oidc.issuer.is_some()
+            && (self.security.jwt.hs256_secret_file.is_some()
+                || self.security.jwt.rs256_pem_file.is_some())
+        {
+            return Err(ConfigError::Invalid(
+                "security.oidc.issuer (MQTTD_OIDC_ISSUER) and security.jwt (MQTTD_JWT_*) are \
+                 mutually exclusive: configure one token verifier"
+                    .to_string(),
+            ));
+        }
         // Membership gossips this node's peer-link address, so gossip without a peer
         // listener has nothing to advertise. Refused here rather than at SWIM startup so
         // `--check-config` and a reload catch it too (issue #671).

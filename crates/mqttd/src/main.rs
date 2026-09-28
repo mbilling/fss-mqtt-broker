@@ -1088,10 +1088,10 @@ fn tls_path_readable(var: &str, path: &str) -> Result<(), String> {
         .map_err(|e| format!("cannot read {var} ({path}): {e}"))
 }
 
-/// The client-TLS material the TLS and WSS listeners share: every path checked for
-/// readability by name, the TLS 1.2 posture resolved, and a builder the reloader re-runs.
-/// Resolved in one place so `--check-config` refuses exactly what listener startup would
-/// (issue #671).
+/// The client-TLS material the TLS and WSS listeners share: the paths, the TLS 1.2 posture,
+/// and a builder the reloader re-runs. Resolved in one place so `--check-config` refuses
+/// exactly what listener startup would (issue #671): [`ClientTls::from_config`] is pure
+/// config, [`ClientTls::check_readable`] and [`ClientTls::acceptor`] touch the files.
 #[derive(Clone)]
 struct ClientTls {
     cert: String,
@@ -1119,17 +1119,6 @@ impl ClientTls {
         };
         let client_ca = config.tls.client_ca.clone();
         let crl = config.tls.crl.clone();
-        // Named-variable readability check (see `tls_path_readable`): all four of these come
-        // from different lines of the operator's environment file, and rustls would report
-        // only the filename.
-        tls_path_readable("MQTTD_TLS_CERT", &cert)?;
-        tls_path_readable("MQTTD_TLS_KEY", &key)?;
-        if let Some(p) = &client_ca {
-            tls_path_readable("MQTTD_TLS_CLIENT_CA", p)?;
-        }
-        if let Some(p) = &crl {
-            tls_path_readable("MQTTD_TLS_CRL", p)?;
-        }
         // Resumption cache sized for the fleet (MQTTD_TLS_SESSION_CACHE; 0 disables) —
         // rustls' own 256-entry default is no resumption at all once more devices than
         // that reconnect, and battery-powered clients pay a full handshake every time.
@@ -1164,8 +1153,23 @@ impl ClientTls {
         }))
     }
 
+    /// Named-variable readability check (see `tls_path_readable`): all four of these come
+    /// from different lines of the operator's environment file, and rustls would report
+    /// only the filename.
+    fn check_readable(&self) -> Result<(), String> {
+        tls_path_readable("MQTTD_TLS_CERT", &self.cert)?;
+        tls_path_readable("MQTTD_TLS_KEY", &self.key)?;
+        if let Some(p) = &self.client_ca {
+            tls_path_readable("MQTTD_TLS_CLIENT_CA", p)?;
+        }
+        if let Some(p) = &self.crl {
+            tls_path_readable("MQTTD_TLS_CRL", p)?;
+        }
+        Ok(())
+    }
+
     /// Read and parse the material into an acceptor — at startup, on every reload, and in
-    /// `--check-config`.
+    /// `--check-config --preflight`.
     fn acceptor(&self) -> Result<TlsAcceptor, mqtt_net::NetError> {
         tls::server_acceptor_versions(
             Path::new(&self.cert),
@@ -1249,6 +1253,7 @@ async fn start_client_listeners(
                  legacy firmware that predates RFC 7627, and plan its retirement."
             );
         }
+        client_tls.check_readable()?;
         let acceptor = client_tls.acceptor()?;
         // Register the acceptor for SIGHUP reload (ADR 0032 T6): the closure re-reads the
         // same paths so a renewed cert/key/client-CA — and an updated CRL — is served on the
@@ -1645,20 +1650,8 @@ fn authenticator_from_config(
         )?));
     }
 
-    // The chain stops at the first real verdict on a credential kind, so a static JWT
-    // verifier ahead of OIDC would shadow it: the two are mutually exclusive (ADR 0050
-    // §1 — no silent fallback between key sources). Decided from the config rather than
-    // from `oidc`, so `--check-config` — which builds no OIDC authenticator — refuses it too.
-    if config.security.oidc.issuer.is_some()
-        && (config.security.jwt.hs256_secret_file.is_some()
-            || config.security.jwt.rs256_pem_file.is_some())
-    {
-        return Err(
-            "MQTTD_OIDC_ISSUER and MQTTD_JWT_* are mutually exclusive: configure one \
-             token verifier"
-                .into(),
-        );
-    }
+    // OIDC after any static JWT verifier: `Config::validate()` refuses configuring both
+    // (ADR 0050 §1), since the chain's first real verdict would let one shadow the other.
     if let Some(oidc) = oidc {
         members.push(oidc);
     }
@@ -3765,6 +3758,7 @@ fn load_config() -> Result<Config, Box<dyn std::error::Error>> {
 /// `--probe` path) do not start with `-`, so they are never mistaken for flags.
 const KNOWN_FLAGS: &[&str] = &[
     "--check-config",
+    "--preflight",
     "--config",
     "--hash-password",
     "--probe",
@@ -3797,6 +3791,7 @@ fn validate_cli(args: &[String]) -> Result<(), String> {
     }
     let mut mode = None;
     let mut options = std::collections::BTreeSet::new();
+    let mut preflight = false;
     let mut tokens = args.iter().map(String::as_str).peekable();
     while let Some(arg) = tokens.next() {
         match arg {
@@ -3809,6 +3804,12 @@ fn validate_cli(args: &[String]) -> Result<(), String> {
                     .filter(|value| !value.is_empty() && !value.starts_with('-'));
                 if value.is_none() {
                     return Err(format!("{arg} requires a value"));
+                }
+            }
+            // A modifier, not a command: `--check-config --preflight` (issue #671).
+            "--preflight" => {
+                if std::mem::replace(&mut preflight, true) {
+                    return Err("repeated option: --preflight".to_string());
                 }
             }
             "--check-config" | "--hash-password" | "--probe" | "--decommission" | "--backup"
@@ -3830,6 +3831,9 @@ fn validate_cli(args: &[String]) -> Result<(), String> {
         }
     }
     let mode = mode.unwrap_or("start");
+    if preflight && mode != "--check-config" {
+        return Err(format!("--preflight is not valid with {mode}"));
+    }
     for option in options {
         let allowed = match option {
             "--config" => matches!(mode, "start" | "--check-config" | "--probe" | "--backup"),
@@ -3868,6 +3872,9 @@ fn print_usage() {
            mqttd                     start the broker (configured by MQTTD_* env / --config)\n  \
            mqttd --config <path>     start with a TOML config file (env still overlays)\n  \
            mqttd --check-config      validate the effective config and exit (no ports bound)\n  \
+           mqttd --check-config --preflight\n  \
+                                     ...and this host: open every referenced file as the\n  \
+                                     current user, resolve every bind\n  \
            mqttd --hash-password [u] print an Argon2id password-file line and exit\n  \
            mqttd --probe [/readyz]   query the running broker's health endpoint and exit\n  \
            mqttd --decommission      drain and gracefully stop the running broker\n  \
@@ -4334,14 +4341,19 @@ fn check_config_inner() -> Result<Option<std::path::PathBuf>, CheckError> {
         Ok(c) => c,
         Err(error) => return Err(CheckError::Invalid { path, error }),
     };
-    // Everything startup would open, parse or resolve before binding (issue #671). The
-    // builders log as they go (INSECURE warnings, "loaded" lines); the gate's output is
-    // its one verdict line, so they run with logging silenced.
-    let preflight =
+    // Startup's own checks past `Config::load` (issue #671). The builders log as they go
+    // (INSECURE warnings, "loaded" lines); the gate's output is its one verdict line, so
+    // they run with logging silenced.
+    let preflight = std::env::args().any(|a| a == "--preflight");
+    let checked =
         tracing::subscriber::with_default(tracing::subscriber::NoSubscriber::default(), || {
-            preflight(&config)
+            static_checks(&config)?;
+            if preflight {
+                host_checks(&config)?;
+            }
+            Ok::<(), String>(())
         });
-    if let Err(message) = preflight {
+    if let Err(message) = checked {
         return Err(CheckError::Invalid {
             path,
             error: ConfigError::Invalid(message),
@@ -4350,22 +4362,37 @@ fn check_config_inner() -> Result<Option<std::path::PathBuf>, CheckError> {
     Ok(path)
 }
 
-/// What `--check-config` runs beyond `Config::load` (issue #671): every check startup makes
-/// before it binds, through the SAME functions, so the pre-rollout gate refuses what the
-/// broker would refuse to start with. Opens and parses every referenced file, as the
-/// service account running the check — that is the point: a `0600 root:root` password
-/// file passes a check run as root and fails the broker's own start.
-///
-/// Nothing is bound, spawned or fetched. Not covered, because only the running broker can
-/// answer them: whether a port is free, and the OIDC issuer's reachability (its settings
-/// are checked; the first JWKS fetch is not attempted).
-fn preflight(config: &Config) -> Result<(), String> {
+/// What `--check-config` runs beyond `Config::load` (issue #671): the checks startup makes
+/// before binding that need nothing from the host — through the SAME functions startup and
+/// the reload use, so the two cannot drift. Deliberately host-independent: the gate runs
+/// where configs are written (a deploy pipeline, the chart's CI) with none of the secrets or
+/// the network the broker will have, and must not refuse a config for their absence.
+fn static_checks(config: &Config) -> Result<(), String> {
     let text = |e: Box<dyn std::error::Error>| e.to_string();
     // Assembly-time checks that need constants the config layer does not know — the
     // min-replicas floor (issue #239) among them. The same gate a reload applies.
     runtime_precheck(config)?;
-    check_binds(config)?;
+    check_bind_syntax(config)?;
+    ClientTls::from_config(config).map_err(text)?;
+    QuicTls::from_config(config)?;
+    OidcSettings::from_config(config).map_err(text)?;
+    Ok(())
+}
+
+/// `--check-config --preflight` (issue #671): additionally, everything startup reads from
+/// THIS host before it binds — every bind resolved, every referenced file opened and parsed
+/// — as the user running the check. Run it as the broker's service account on the target
+/// host (an installer, an init container with the broker's mounts): a `0600 root:root`
+/// password file passes a check run as root and fails the broker's own start.
+///
+/// Nothing is bound, spawned or fetched. Not covered, because only the running broker can
+/// answer them: whether a port is free, and the OIDC issuer's reachability (its settings
+/// are checked; the first JWKS fetch is not attempted).
+fn host_checks(config: &Config) -> Result<(), String> {
+    let text = |e: Box<dyn std::error::Error>| e.to_string();
+    resolve_binds(config)?;
     if let Some(client_tls) = ClientTls::from_config(config).map_err(text)? {
+        client_tls.check_readable()?;
         client_tls.acceptor().map_err(|e| e.to_string())?;
     }
     if let Some(crl) = &config.tls.crl {
@@ -4379,7 +4406,6 @@ fn preflight(config: &Config) -> Result<(), String> {
         )
         .map_err(|e| e.to_string())?;
     }
-    OidcSettings::from_config(config).map_err(text)?;
     authorizer_from_config(config).map_err(text)?;
     authenticator_from_config(config, None, None).map_err(text)?;
     let peer_tls = peer_tls_from_config(config).map_err(text)?;
@@ -4389,45 +4415,74 @@ fn preflight(config: &Config) -> Result<(), String> {
     Ok(())
 }
 
-/// Every configured bind must be an address the broker could bind (issue #671). TCP
-/// listeners and the gossip socket resolve through `ToSocketAddrs`, as tokio's `bind`
-/// does (so `localhost:1883` is accepted); QUIC goes through the literal parse its
-/// startup uses. Resolution only — nothing is bound.
-fn check_binds(config: &Config) -> Result<(), String> {
-    use std::net::ToSocketAddrs as _;
+/// Every configured bind, with its config key and env var for the refusal.
+fn configured_binds(config: &Config) -> [(&'static str, Option<&String>); 8] {
     let l = &config.listeners;
-    let binds = [
-        ("listeners.tls_bind (MQTTD_TLS_BIND)", &l.tls_bind),
+    [
+        ("listeners.tls_bind (MQTTD_TLS_BIND)", l.tls_bind.as_ref()),
         (
             "listeners.plaintext_bind (MQTTD_PLAINTEXT_BIND)",
-            &l.plaintext_bind,
+            l.plaintext_bind.as_ref(),
         ),
-        ("listeners.ws_bind (MQTTD_WS_BIND)", &l.ws_bind),
-        ("listeners.wss_bind (MQTTD_WSS_BIND)", &l.wss_bind),
-        ("listeners.health_bind (MQTTD_HEALTH_BIND)", &l.health_bind),
+        ("listeners.ws_bind (MQTTD_WS_BIND)", l.ws_bind.as_ref()),
+        ("listeners.wss_bind (MQTTD_WSS_BIND)", l.wss_bind.as_ref()),
+        (
+            "listeners.health_bind (MQTTD_HEALTH_BIND)",
+            l.health_bind.as_ref(),
+        ),
         (
             "listeners.metrics_bind (MQTTD_METRICS_BIND)",
-            &l.metrics_bind,
+            l.metrics_bind.as_ref(),
         ),
         (
             "cluster.peer_bind (MQTTD_PEER_BIND)",
-            &config.cluster.peer_bind,
+            config.cluster.peer_bind.as_ref(),
         ),
         (
             "cluster.swim.bind (MQTTD_SWIM_BIND)",
-            &config.cluster.swim.bind,
+            config.cluster.swim.bind.as_ref(),
         ),
-    ];
-    for (name, bind) in binds {
+    ]
+}
+
+/// Every bind must have the shape `bind` accepts — a socket address, or `host:port` with a
+/// DNS-shaped host and a numeric port — checked WITHOUT resolving, so a host name that only
+/// resolves inside the target cluster still passes in CI (issue #671). QUIC's stricter
+/// literal-address parse is part of `QuicTls::from_config`.
+fn check_bind_syntax(config: &Config) -> Result<(), String> {
+    for (name, bind) in configured_binds(config) {
+        let Some(bind) = bind else { continue };
+        if bind.parse::<std::net::SocketAddr>().is_ok() {
+            continue;
+        }
+        let well_formed = bind.rsplit_once(':').is_some_and(|(host, port)| {
+            !host.is_empty()
+                && host
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_'))
+                && port.parse::<u16>().is_ok()
+        });
+        if !well_formed {
+            return Err(format!(
+                "{name} = {bind:?} is not a bindable address (expected host:port or ip:port)"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// `--preflight`: every bind resolves on this host through `ToSocketAddrs`, as tokio's
+/// `bind` does. Resolution only — nothing is bound.
+fn resolve_binds(config: &Config) -> Result<(), String> {
+    use std::net::ToSocketAddrs as _;
+    for (name, bind) in configured_binds(config) {
         let Some(bind) = bind else { continue };
         match bind.to_socket_addrs().map(|mut addrs| addrs.next()) {
             Ok(Some(_)) => {}
             Ok(None) => return Err(format!("{name} = {bind:?} resolves to no address")),
-            Err(e) => return Err(format!("{name} = {bind:?} is not a bindable address: {e}")),
+            Err(e) => return Err(format!("{name} = {bind:?} does not resolve here: {e}")),
         }
     }
-    // QUIC's literal-address parse is part of `QuicTls::from_config`, checked with its
-    // certificate material in `preflight`.
     Ok(())
 }
 
@@ -4798,6 +4853,8 @@ mod tests {
             vec!["--config", "broker.toml"],
             vec!["--check-config", "--config", "broker.toml"],
             vec!["--config", "broker.toml", "--check-config"],
+            vec!["--check-config", "--preflight"],
+            vec!["--preflight", "--config", "broker.toml", "--check-config"],
             vec!["--hash-password"],
             vec!["--hash-password", "alice"],
             vec!["--probe"],
@@ -4847,6 +4904,10 @@ mod tests {
             vec!["--check-config", "--decommission"],
             vec!["--backup", "--decommission"],
             vec!["--check-config", "--check-config"],
+            vec!["--preflight"],
+            vec!["--preflight", "--config", "broker.toml"],
+            vec!["--check-config", "--preflight", "--preflight"],
+            vec!["--probe", "--preflight"],
             vec!["--version", "--unknown"],
             vec!["--help", "--unknown"],
             vec!["--version", "--backup"],

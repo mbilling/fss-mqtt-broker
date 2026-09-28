@@ -207,7 +207,14 @@ def render(env_vars: list[str], toml_keys: dict[str, str], docs: dict[str, str])
         "`crates/mqtt-config/src/lib.rs`. Precedence is **defaults < TOML file < "
         "`MQTTD_*` env < CLI flags** (ADR 0046). Point at a file with `--config` or "
         "`MQTTD_CONFIG`; with neither, the config is defaults plus this overlay. "
-        "`mqttd --check-config` validates the effective config and binds nothing.",
+        "`mqttd --check-config` validates the effective config and binds nothing: the "
+        "schema plus every startup check that needs nothing from the host (bind syntax, TLS "
+        "and QUIC prerequisites, OIDC settings, cluster cross-checks), so it runs where "
+        "configs are written, without their secrets. `mqttd --check-config --preflight` "
+        "adds the host: every `*_bind` resolved, every referenced file (TLS cert/key/CA/CRL, "
+        "password, ACL, JWT secret, cluster TLS, gossip key) opened and parsed as the user "
+        "running it — so run it as the broker's service account. Neither can say whether a "
+        "port is free or an OIDC issuer is reachable.",
         "",
         "The annotated template is [`mqttd.example.toml`](mqttd.example.toml). "
         "Capacity arithmetic lives in [SIZING.md](SIZING.md); day-2 procedures in "
