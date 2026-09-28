@@ -122,14 +122,31 @@ persistent (`clean_start=false`, MQTT 5 session expiry, per-rung client ids),
 and the reset gate then also waits for the previous rung's sessions to expire.
 
 The question: **does durable throughput follow the disk?** Each broker probes
-its own volume at boot (`mqttd_store_barrier_floor`), and `summarize-curve.py`
-prints, per rung and per broker, over the steady window: durable appends/s,
-group commits/s, ops per commit, commit time, and how busy the writer was.
+its own volume at boot (`mqttd_store_barrier_floor`) and streams `iostat -x`
+for every rung (`cpu/io-brokerN.txt`, next to the CPU samples). Over the steady
+window, per rung and per broker, `summarize-curve.py` prints:
+- durable appends/s and writer ops/s
+- ops per commit, commit time, and commit time per op
+- the **flush share**: how much of a commit one device flush explains,
+  (1000 / floor) / commit ms
+- the disk's reads/s, writes/s, flushes/s, MB/s and %util
 
-- **Disk-bound:** at the knee the writer is saturated (≥ 80% busy), and the
-  per-node rate tracks each node's barrier floor.
-- **Hot-path-bound:** the writers have headroom at the knee, so the limit is
-  upstream of the disk: hub, lanes or replication.
+The verdict is taken at the most loaded durable rung:
+- **Disk-bound:** one flush explains ≥ 50% of a commit, or the disk is ≥ 80%
+  utilised. Throughput should then track each node's barrier floor.
+- **Hot path:** the commit is mostly per-op work. The cross-check is the per-op
+  cost staying the same on disks with different barrier floors.
+- The writer's busy share is **not** a signal. A group-commit writer is always
+  about 100% busy; load shows up as batch depth.
+
+The first calibration (2026-09-28, 3 nodes, v1.0.18) was **not disk-bound**:
+- **Where the knee fell:** 6k msg/s per node was already not carried. At
+  12k/node the writers ran about 30–33k ops/s per node.
+- **Why:** each commit took 10.7–18.5 ms, but one flush explains only 2–4% of
+  that. The per-op cost was 0.032 ms on all three brokers, although their disks
+  are 1.9× apart in flush rate.
+- **Other suspects ruled out:** the hub thread was ≤ 24% busy, and every core
+  kept 28–39% idle.
 
 A rung that asks for persistent consumers and shows no durable append in its
 window is flagged **NOT DURABLE** and is not carried.

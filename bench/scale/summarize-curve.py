@@ -28,6 +28,8 @@ Honesty mechanics, enforced here rather than remembered:
 
 from __future__ import annotations
 
+import contextlib
+import datetime
 import importlib.util
 import json
 import re
@@ -319,10 +321,16 @@ def durable_writer(rdir: Path, window_secs: float) -> list[dict]:
                   owed a message) — the durable work this node was asked for
       commits_s   writer group commits, each one device barrier
       ops_commit  mean group-commit depth (ops per barrier)
-      busy        share of the window the writer spent inside commits: near 1.0
-                  the node is disk-bound; well below 1.0 at a knee, the limit is
-                  upstream of the disk — the hot path
+      busy        commit time per window second. NOT a saturation signal: a
+                  group-commit writer commits whatever has arrived, so it reads
+                  ~100% busy at any load (and >100% where commits overlap) —
+                  load shows up as batch DEPTH, not as idle time
       commit_ms   mean commit time
+      ms_per_op   commit time per op — what the batch's own work costs
+      flush_share how much of a commit ONE device flush explains, (1000 / floor)
+                  / commit_ms: near 1 the commit is the flush (disk-bound); near
+                  0 the commit is per-op work (the hot path)
+      disk        iostat over the same window (disk_io), or None
       floor       the broker's own boot probe of its volume, single-writer
                   barriers/s (store_probe.rs) — the disk it drew
     """
@@ -349,6 +357,78 @@ def durable_writer(rdir: Path, window_secs: float) -> list[dict]:
             "floor": sum(_prom_value(close, "mqttd_store_barrier_floor").values()),
             "floor4": sum(_prom_value(close, "mqttd_store_barrier_floor_4stream").values()),
         })
+        w = out[-1]
+        w["ops_s"] = ops / secs
+        w["ms_per_op"] = w["commit_ms"] / w["ops_commit"] if w["ops_commit"] else 0.0
+        w["flush_share"] = (1000.0 / w["floor"]) / w["commit_ms"] if w["floor"] and w["commit_ms"] else 0.0
+        w["disk"] = disk_io(rdir, w["broker"])
+    return out
+
+
+IOSTAT_TIME = re.compile(r"^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:[+-]\d{2}:?\d{2}|Z)?\s*$")
+IOSTAT_DISK = re.compile(r"^(sd[a-z]+|vd[a-z]+|xvd[a-z]+|nvme\d+n\d+)$")  # whole disks, never dm/loop/partitions
+
+
+def window_edges(rdir: Path, host: str) -> tuple[float, float] | None:
+    """The measured window on `host`'s own clock: (open end, close start), epoch s."""
+    path = rdir / "window.tsv"
+    if not path.exists():
+        return None
+    edges: dict[str, tuple[int, int]] = {}
+    for line in path.read_text().splitlines()[1:]:
+        parts = line.split("\t")
+        if len(parts) >= 4 and parts[0] == host:
+            with contextlib.suppress(ValueError):
+                edges[parts[1]] = (int(parts[2]), int(parts[3]))
+    if "open" not in edges or "close" not in edges:
+        return None
+    return edges["open"][1] / 1000, edges["close"][0] / 1000
+
+
+def disk_io(rdir: Path, host: str) -> dict | None:
+    """Mean per-second disk activity on `host` over the measured window (#568).
+
+    From the broker's `iostat -t -d -x -m -y 1` stream (cpu.sh), summed over
+    whole disks per sample. A report is stamped when its second ENDS, so a row
+    counts only if [t-1, t] lies inside the window. Columns are read by header
+    name, never by position: sysstat versions add and move columns.
+    """
+    path = rdir / "cpu" / f"io-{host}.txt"
+    edges = window_edges(rdir, host)
+    if not path.exists() or edges is None:
+        return None
+    lo, hi = edges
+    samples: list[dict[str, float]] = []
+    t = None
+    cols: list[str] = []
+    cur: dict[str, float] | None = None
+    for line in path.read_text(errors="replace").splitlines():
+        m = IOSTAT_TIME.match(line.strip())
+        if m:
+            if cur is not None:
+                samples.append(cur)
+            stamp = datetime.datetime.fromisoformat(m.group(1)).replace(tzinfo=datetime.timezone.utc).timestamp()
+            t, cur = stamp, ({} if stamp - 1 >= lo and stamp <= hi else None)
+            continue
+        parts = line.split()
+        if parts and parts[0].startswith("Device"):
+            cols = parts
+            continue
+        if cur is None or not parts or not IOSTAT_DISK.match(parts[0]) or len(parts) != len(cols):
+            continue
+        for name, v in zip(cols[1:], parts[1:]):
+            with contextlib.suppress(ValueError):
+                val = float(v)
+                cur[name] = max(cur.get(name, 0.0), val) if name == "%util" else cur.get(name, 0.0) + val
+    if cur is not None:
+        samples.append(cur)
+    samples = [x for x in samples if x]
+    if not samples:
+        return None
+    keys = ("r/s", "rMB/s", "w/s", "wMB/s", "f/s", "aqu-sz", "%util")
+    out = {k: sum(x.get(k, 0.0) for x in samples) / len(samples) for k in keys}
+    out["util_max"] = max(x.get("%util", 0.0) for x in samples)
+    out["samples"] = len(samples)
     return out
 
 
@@ -813,26 +893,56 @@ def self_test() -> None:
                                        recv=30_000, late=0, writer=[]))
         if r["carried"] or not any(f.startswith("NOT DURABLE") for f in r["flags"]):
             failures.append(f"a durable-labelled rung with no durable append was carried: {r['flags']}")
-        busy_w = {"appends": 30_000 * 60, "batches": 60 * 900, "ops": 60 * 900 * 40,
-                  "micros": 60 * 1_000_000 * 0.9, "floor": 900}
-        idle_w = {"appends": 30_000 * 60, "batches": 60 * 300, "ops": 60 * 300 * 40,
-                  "micros": 60 * 1_000_000 * 0.2, "floor": 2700}
+        # The flush explains the commit: floor 900/s is a 1.11 ms flush, and the
+        # writer commits 900 times a second at 1.0 ms each — disk-bound.
+        flush_w = {"appends": 30_000 * 60, "batches": 60 * 900, "ops": 60 * 900 * 40,
+                   "micros": 60 * 1_000_000 * 0.9, "floor": 900}
         r = lane_e_rung(lane_e_fixture(root, "sites-4-dur", offered=30_000, sent=30_000,
-                                       recv=30_000, late=0, writer=[busy_w, idle_w]))
+                                       recv=30_000, late=0, writer=[flush_w, flush_w]))
         w = {x["broker"]: x for x in r["writer"]}
         if not r["carried"] or any(f.startswith("NOT DURABLE") for f in r["flags"]):
             failures.append(f"a durable rung that appended was not carried: {r['flags']}")
         elif (round(w["broker0"]["commits_s"]) != 900 or round(w["broker0"]["ops_commit"]) != 40
-              or abs(w["broker0"]["busy"] - 0.9) > 1e-9 or round(w["broker1"]["appends_s"]) != 30_000
-              or w["broker1"]["floor"] != 2700):
+              or round(w["broker0"]["commit_ms"], 6) != 1.0 or round(w["broker1"]["appends_s"]) != 30_000
+              or round(w["broker0"]["ms_per_op"], 6) != 0.025 or abs(w["broker0"]["flush_share"] - 1000 / 900) > 1e-9):
             failures.append(f"durable writer window deltas are wrong: {w}")
         text = render_durable_writer([r])
-        if "DISK-BOUND: a writer is saturated" not in text or "900 / 1,800" not in text:
-            failures.append(f"a 90%-busy writer was not reported disk-bound:\n{text}")
-        idle = lane_e_rung(lane_e_fixture(root, "sites-4-dur-idle", offered=30_000, sent=30_000,
-                                          recv=30_000, late=0, writer=[idle_w, idle_w]))
-        if "NOT DISK-BOUND" not in render_durable_writer([idle]):
-            failures.append("writers 20% busy at the top carried rung were not reported as a hot-path limit")
+        if "> DISK-BOUND" not in text or "900 / 1,800" not in text:
+            failures.append(f"a commit the flush explains was not reported disk-bound:\n{text}")
+        # The 2026-09-28 calibration's 6-site rung: disks 1.9x apart in flush rate,
+        # the same 0.032 ms per op on both, a commit 18.5 ms long of which one flush
+        # is ~4%. That is per-op work — the hot path — and must read so.
+        slow = {"appends": 10_587 * 60, "batches": 53 * 60, "ops": 53 * 60 * 573,
+                "micros": 53 * 60 * 18_500, "floor": 1492}
+        fast = {"appends": 11_478 * 60, "batches": 53 * 60, "ops": 53 * 60 * 573,
+                "micros": 53 * 60 * 18_500, "floor": 2783}
+        hot = lane_e_rung(lane_e_fixture(root, "sites-4-dur-hot", offered=30_000, sent=30_000,
+                                         recv=30_000, late=0, writer=[slow, fast]))
+        v = disk_verdict(hot["writer"])
+        if not v.startswith("NOT DISK-BOUND") or "within 0% across disks 1.9x apart" not in v:
+            failures.append(f"per-op-bound commits on disks 1.9x apart were not called the hot path: {v}")
+        # iostat over the window only: two whole-disk rows inside [open, close],
+        # one before it, a partition and a loop device that must not be summed.
+        d = hot_dir = root / "sites-4-dur-hot"
+        (d / "window.tsv").write_text("host\tphase\tstart_ms\tend_ms\tmain_pid\n"
+                                      "broker0\topen\t1790000000000\t1790000000010\t1\n"
+                                      "broker0\tclose\t1790000060000\t1790000060010\t1\n")
+        (d / "cpu").mkdir(exist_ok=True)
+        hdr = "Device r/s rMB/s w/s wMB/s f/s aqu-sz %util"
+
+        def iso(epoch: int) -> str:
+            return datetime.datetime.fromtimestamp(epoch, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S+0000")
+        def rep(ts, w_s, util):
+            return (f"{ts}\n{hdr}\nsda 1.00 0.10 {w_s} 12.00 50.00 0.50 {util}\n"
+                    "sda1 9.00 9.00 9999 999.00 9.00 9.00 99.0\nloop0 0 0 9999 0 0 0 99.0\n\n")
+        (d / "cpu" / "io-broker0.txt").write_text(
+            "IO_STREAM_START_UTC x\nLinux 6.8.0 (b0) \t09/28/26 \t_x86_64_\t(4 CPU)\n\n"
+            + rep(iso(1_790_000_000 - 5), 99999.00, 99.0)   # before the window
+            + rep(iso(1_790_000_000 + 15), 400.00, 20.0)    # inside
+            + rep(iso(1_790_000_000 + 25), 600.00, 40.0))   # inside
+        io = disk_io(hot_dir, "broker0")
+        if not io or io["samples"] != 2 or io["w/s"] != 500.0 or io["util_max"] != 40.0 or io["f/s"] != 50.0:
+            failures.append(f"iostat was not read over the window, whole disks only: {io}")
 
         # ── the remaining acceptance cases (#534) ────────────────────────────
         # "Local test fixtures expose under-offer, duplicate delivery, invalid
@@ -1032,8 +1142,9 @@ def self_test() -> None:
     print(
         "summarize-curve self-test: publish double-count correction OK (6 cases); "
         "lane E validity OK (26 rungs + 6 ladders — a durable-labelled rung with no durable "
-        "append NOT CARRIED, writer window deltas exact, a saturated writer reported disk-bound and "
-        "idle writers at the top rung reported as a hot-path limit, "
+        "append NOT CARRIED, writer window deltas exact, a commit the flush explains DISK-BOUND and the "
+        "calibration's per-op-bound commits on disks 1.9x apart NOT DISK-BOUND, iostat read over "
+        "the window on whole disks only, "
         "p99 graded GREEN/YELLOW/RED and never "
         "failed, late publishers NOT CARRIED, one lost message or a broker drop FAILED, a "
         "YELLOW figure reported above the certified GREEN one, under-offer, late publishers, "
@@ -1649,50 +1760,87 @@ def _lane_e_carried(offer_met, delivered, late_share, settled_ok, reset_ok, core
     )
 
 
+FLUSH_BOUND = 0.5  # a commit this much explained by one device flush is the disk's
+DISK_UTIL_BOUND = 80.0  # %util, iostat, over the window
+
+
+def disk_verdict(writer: list[dict]) -> str:
+    """DISK-BOUND or NOT DISK-BOUND at one rung, with the evidence in the line.
+
+    Two measured signals, not the writer's busy share (a group-commit writer is
+    always ~100% busy; load shows up as batch depth):
+      flush_share  (1000 / barrier floor) / commit time — the share of a commit
+                   one device flush explains
+      %util        the disk's own utilisation, when iostat was captured
+    and one cross-check that needs no threshold: per-op commit cost the SAME on
+    disks whose barrier floors differ says the cost is not the disk's.
+    """
+    ws = [w for w in writer if w["commits_s"] > 0]
+    if not ws:
+        return "no durable commits in the window — nothing to judge"
+    share = max(w["flush_share"] for w in ws)
+    util = [w["disk"]["util_max"] for w in ws if w.get("disk")]
+    floors = [w["floor"] for w in ws if w["floor"]]
+    costs = [w["ms_per_op"] for w in ws if w["ms_per_op"]]
+    same_cost = ""
+    if len(floors) > 1 and len(costs) > 1 and max(floors) >= 1.3 * min(floors):
+        spread = max(costs) / min(costs) - 1
+        same_cost = (f"; per-op commit cost within {spread * 100:.0f}% across disks "
+                     f"{max(floors) / min(floors):.1f}x apart in flush rate")
+    util_txt = f", disk util up to {max(util):.0f}%" if util else ", no iostat captured"
+    if share >= FLUSH_BOUND or (util and max(util) >= DISK_UTIL_BOUND):
+        return (f"DISK-BOUND: one flush explains up to {share * 100:.0f}% of a commit{util_txt}"
+                f"{same_cost} — durable throughput should track the barrier floor")
+    return (f"NOT DISK-BOUND: one flush explains at most {share * 100:.0f}% of a commit — the rest is "
+            f"per-op work{util_txt}{same_cost}; the limit is the hot path (commit preparation), "
+            "not the disk")
+
+
 def render_durable_writer(rungs: list[dict]) -> str:
     """Does durable throughput follow the disk? (#568)
 
-    One row per rung for the cluster, then — at the highest CARRIED rung, where
-    the question is decided — one row per broker: the disk it drew beside what
-    its writer did. A node whose writer is near-saturated is disk-bound, and
-    across nodes the delivered rate should then track the barrier floor. A knee
-    with the writers mostly idle says the limit is upstream of the disk.
+    One row per durable rung for the cluster; then, at the MOST LOADED durable
+    rung — where a limit shows, carried or not — one row per broker: the disk it
+    drew beside what its writer did, and the verdict (disk_verdict).
     """
     def rng(vals: list[float], fmt: str) -> str:
         if not vals:
             return "—"
         lo, hi = min(vals), max(vals)
-        return format(lo, fmt) if lo == hi else f"{lo:{fmt}}–{hi:{fmt}}"
+        return format(lo, fmt) if format(lo, fmt) == format(hi, fmt) else f"{lo:{fmt}}–{hi:{fmt}}"
 
     out = ["\nDurable writer — does throughput follow the disk? (steady window, per broker):\n",
-           "| sites | run | verdict | delivered/s | durable appends/s | busiest writer busy | commits/s | ops/commit | commit ms | barrier floor/s |",
-           "|---|---|---|---|---|---|---|---|---|---|"]
-    for r in rungs:
+           "| sites | run | verdict | delivered/s | durable appends/s | writer ops/s per node | ops/commit "
+           "| commit ms | ms/op | flush share | disk w/s | disk MB/s | barrier floor/s |",
+           "|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
+    durable = [r for r in rungs if r.get("durable")]
+    for r in durable:
         w = r.get("writer") or []
-        if not r.get("durable"):
-            continue
+        d = [x["disk"] for x in w if x.get("disk")]
         out.append(
-            f"| {r['sites']} | {r.get('rep', 1)}{' (control)' if r.get('control') else ''} | {rung_verdict(r).split(';')[0][:40]} | "
-            f"{r.get('recv_rate', 0):,.0f} | {sum(x['appends_s'] for x in w):,.0f} | "
-            f"{(max((x['busy'] for x in w), default=0) * 100):.0f}% | {rng([x['commits_s'] for x in w], ',.0f')} | "
+            f"| {r['sites']} | {r.get('rep', 1)}{' (control)' if r.get('control') else ''} | "
+            f"{rung_verdict(r).split(';')[0].split(' (')[0][:32]} | {r.get('recv_rate', 0):,.0f} | "
+            f"{sum(x['appends_s'] for x in w):,.0f} | {rng([x['ops_s'] for x in w], ',.0f')} | "
             f"{rng([x['ops_commit'] for x in w], '.1f')} | {rng([x['commit_ms'] for x in w], '.2f')} | "
+            f"{rng([x['ms_per_op'] for x in w], '.3f')} | {rng([x['flush_share'] for x in w], '.0%')} | "
+            f"{rng([x['w/s'] for x in d], ',.0f')} | {rng([x['wMB/s'] for x in d], ',.1f')} | "
             f"{rng([x['floor'] for x in w], ',.0f')} |")
-    top = max((r for r in rungs if r.get("durable") and r.get("carried") and r.get("writer")),
-              key=lambda r: r["sites"], default=None)
+    top = max((r for r in durable if r.get("writer")),
+              key=lambda r: sum(x["appends_s"] for x in r["writer"]), default=None)
     if top:
-        out += [f"\nPer broker at the highest carried rung ({top['sites']} sites, {rung_verdict(top).split(';')[0]}):\n",
-                "| broker | barrier floor/s (1 / 4 streams) | durable appends/s | commits/s | ops/commit | writer busy |",
-                "|---|---|---|---|---|---|"]
-        ws = sorted(top["writer"], key=lambda x: x["floor"])
-        for x in ws:
+        out += [f"\nPer broker at the most loaded durable rung ({top['sites']} sites, "
+                f"{rung_verdict(top).split(';')[0].split(' (')[0]}):\n",
+                "| broker | barrier floor/s (1 / 4 streams) | durable appends/s | writer ops/s | ops/commit "
+                "| commit ms | ms/op | flush share | disk r/s · w/s · f/s | disk MB/s r · w | disk util |",
+                "|---|---|---|---|---|---|---|---|---|---|---|"]
+        for x in sorted(top["writer"], key=lambda x: x["floor"]):
+            d = x.get("disk")
+            dio = (f"{d['r/s']:,.0f} · {d['w/s']:,.0f} · {d['f/s']:,.0f} | {d['rMB/s']:.1f} · {d['wMB/s']:.1f} | "
+                   f"{d['%util']:.0f}% (max {d['util_max']:.0f}%)") if d else "— | — | —"
             out.append(f"| {x['broker']} | {x['floor']:,.0f} / {x['floor4']:,.0f} | {x['appends_s']:,.0f} | "
-                       f"{x['commits_s']:,.0f} | {x['ops_commit']:.1f} | {x['busy'] * 100:.0f}% |")
-        busy = max(x["busy"] for x in ws)
-        verdict = ("DISK-BOUND: a writer is saturated; throughput should track the barrier floor across nodes"
-                   if busy >= 0.8 else
-                   "NOT DISK-BOUND: every writer has headroom at the top carried rung — the limit is upstream "
-                   "of the disk (hub, lanes, replication), i.e. the hot path")
-        out.append(f"\n> {verdict} (busiest writer {busy * 100:.0f}% busy; threshold 80%).")
+                       f"{x['ops_s']:,.0f} | {x['ops_commit']:.1f} | {x['commit_ms']:.2f} | {x['ms_per_op']:.3f} | "
+                       f"{x['flush_share']:.0%} | {dio} |")
+        out.append(f"\n> {disk_verdict(top['writer'])}")
     return "\n".join(out)
 
 
