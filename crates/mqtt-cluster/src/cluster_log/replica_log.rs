@@ -413,6 +413,12 @@ pub(super) struct LogShard {
 /// stall a compaction step can add to one batch.
 const COMPACT_STEP_MAX: u64 = 1 << 20;
 
+/// The most queued entries one reclaim call examines. Skipping a dead entry
+/// is cheap but not free, and it happens under the same lock: a segment that
+/// is one live entry after thousands of acked ones must not turn one batch's
+/// reclaim into a scan of all of them.
+const COMPACT_EXAMINE_MAX: usize = 4096;
+
 impl LogShard {
     fn new(log: SegmentLog, shards: u32) -> Self {
         Self {
@@ -641,18 +647,27 @@ impl LogShard {
         entry: impl Fn(&str, Offset) -> Option<(Epoch, u64, &'s [u8])>,
     ) -> Result<usize, ReplError> {
         let mut dropped = self.drop_dead_prefix()?;
-        if self.log.segments().len() <= 2 || self.bytes() <= 2 * self.live_bytes() {
+        // One segment besides the active one is enough to compact: waiting for
+        // a third would let a 64 MiB-segment log sit well above the 2x bound.
+        if self.log.segments().len() < 2 || self.bytes() <= 2 * self.live_bytes() {
             return Ok(dropped);
         }
         let oldest = self.log.segments()[0].first;
         let step = (self.log.segment_bytes() / 4).clamp(1, COMPACT_STEP_MAX);
         let mut copied = 0u64;
+        let mut examined = 0usize;
         let mut recs = Vec::new();
-        while copied < step {
+        // Live entries taken off the queue for this copy — put back if the
+        // append fails, or the segment would stay pinned with nothing queued to
+        // move it (until a reopen rebuilt the queue).
+        let mut taken: Vec<(Arc<str>, Offset)> = Vec::new();
+        let mut orphans: Vec<(Arc<str>, Offset)> = Vec::new();
+        while copied < step && examined < COMPACT_EXAMINE_MAX {
             let Some((key, offset)) = self.appended.get_mut(&oldest).and_then(VecDeque::pop_front)
             else {
                 break;
             };
+            examined += 1;
             // Still here? A truncated, removed or already-moved entry is skipped.
             let here = self
                 .loc
@@ -673,9 +688,31 @@ impl LogShard {
                 .encode();
                 copied += (HEADER_BYTES + rec.1.len()) as u64;
                 recs.push(rec);
+                taken.push((key, offset));
+            } else {
+                // Tracked as live here, absent from the state: nothing to copy,
+                // and nothing a replay needs — it is dead, so stop counting it
+                // rather than let it pin the segment forever.
+                orphans.push((key, offset));
             }
         }
-        self.append(&recs)?;
+        for (key, offset) in orphans {
+            let gone = self.loc.get_mut(&key).and_then(|m| m.remove(&offset));
+            if self.loc.get(&key).is_some_and(BTreeMap::is_empty) {
+                self.loc.remove(&key);
+            }
+            if let Some((seg, bytes)) = gone {
+                self.untrack(seg, bytes);
+            }
+        }
+        if let Err(e) = self.append(&recs) {
+            if let Some(q) = self.appended.get_mut(&oldest) {
+                for item in taken.into_iter().rev() {
+                    q.push_front(item);
+                }
+            }
+            return Err(e);
+        }
         dropped += self.drop_dead_prefix()?;
         Ok(dropped)
     }
@@ -1306,6 +1343,158 @@ mod tests {
         // Only meaningful if the segment holding them really was dropped: the
         // entry at offset 2 is live, so it was compacted forward, not left.
         assert!(first > 1, "the first segment was dropped");
+    }
+
+    fn with_shard<T>(
+        state: &std::sync::Mutex<ReplicaState>,
+        f: impl FnOnce(&mut LogShard) -> T,
+    ) -> T {
+        let r = state.lock().unwrap();
+        let super::super::Shard::Log(l) = &r.dbs[0] else {
+            panic!("a log store")
+        };
+        let mut l = l.lock().unwrap();
+        f(&mut l)
+    }
+
+    /// A slow consumer whose oldest segment needs compacting. Built through
+    /// `apply_batch`, which does not reclaim (only the shard writer's path
+    /// does), so the garbage is still there when the test calls `reclaim`.
+    fn pinned_log(dir: &Path, seg: u64) -> std::sync::Mutex<ReplicaState> {
+        let state = std::sync::Mutex::new(
+            ReplicaState::open_store_with(dir, 1, StoreBackend::Log, seg).unwrap(),
+        );
+        for round in 1..=60u64 {
+            let mut b: Vec<(Epoch, ReplOp)> = Vec::new();
+            for k in 0..8 {
+                let key = format!("q/c{k}");
+                b.push((4, ap(&key, round, round, &[0x42; 200])));
+                if round > 1 {
+                    b.push((4, tr(&key, round - 1)));
+                }
+            }
+            b.push((4, ap("q/slow", round, round, &[0x17; 200])));
+            assert!(state.lock().unwrap().apply_batch(&b).iter().all(|ok| *ok));
+        }
+        with_shard(&state, |l| {
+            assert!(
+                l.bytes() > 2 * l.live_bytes(),
+                "the fixture needs compacting"
+            );
+            assert!(l.segment_count() > 2);
+        });
+        state
+    }
+
+    /// A compaction whose append fails puts back what it took: the next
+    /// reclaim still finds the segment's live entries, moves them, and the
+    /// segment goes — the failure costs a retry, not a permanent pin.
+    #[test]
+    fn a_failed_compaction_append_is_retried_not_a_permanent_pin() {
+        let dir = tempfile::tempdir().unwrap();
+        let seg = 16 << 10;
+        let state = pinned_log(dir.path(), seg);
+        let oldest = with_shard(&state, |l| l.log.segments()[0].first);
+        let huge = vec![0u8; crate::segment_log::MAX_PAYLOAD + 1];
+        // An oversized record fails the append before anything is written.
+        let err = with_shard(&state, |l| l.reclaim(|_, _| Some((4, 1, huge.as_slice()))));
+        assert!(err.is_err());
+        let r = state.lock().unwrap();
+        let values: BTreeMap<(String, Offset), Vec<u8>> = r
+            .logs
+            .iter()
+            .flat_map(|(k, m)| {
+                m.iter()
+                    .map(move |(o, (_, v))| ((k.clone(), *o), v.clone()))
+            })
+            .collect();
+        drop(r);
+        for _ in 0..64 {
+            with_shard(&state, |l| {
+                l.reclaim(|k, o| {
+                    values
+                        .get(&(k.to_string(), o))
+                        .map(|v| (4, o, v.as_slice()))
+                })
+                .unwrap()
+            });
+        }
+        let first = with_shard(&state, |l| l.log.segments()[0].first);
+        assert!(
+            first > oldest,
+            "the pinned segment was compacted and dropped after the failure"
+        );
+    }
+
+    /// An entry tracked as live that the state no longer holds is dead, not a
+    /// reason to keep its segment forever.
+    #[test]
+    fn a_tracked_entry_the_state_lacks_does_not_wedge_reclamation() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = pinned_log(dir.path(), 16 << 10);
+        let oldest = with_shard(&state, |l| l.log.segments()[0].first);
+        for _ in 0..64 {
+            with_shard(&state, |l| l.reclaim(|_, _| None).unwrap());
+        }
+        let first = with_shard(&state, |l| l.log.segments()[0].first);
+        assert!(
+            first > oldest,
+            "the orphans were untracked and the segment dropped"
+        );
+    }
+
+    /// One reclaim call examines at most `COMPACT_EXAMINE_MAX` queued entries,
+    /// however many acked entries sit ahead of the live one.
+    #[test]
+    fn one_reclaim_examines_a_bounded_number_of_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = std::sync::Mutex::new(
+            ReplicaState::open_store_with(dir.path(), 1, StoreBackend::Log, 4 << 20).unwrap(),
+        );
+        // Built through `apply_batch`, which does not reclaim: the oldest
+        // segment ends up as thousands of acked entries and one live one, and
+        // the log far above twice its live bytes.
+        let n = COMPACT_EXAMINE_MAX as u64 * 2;
+        let apply = |b: &[(Epoch, ReplOp)]| {
+            assert!(state.lock().unwrap().apply_batch(b).iter().all(|ok| *ok));
+        };
+        apply(
+            &(1..=n)
+                .map(|o| (4, ap("q/many", o, o, b"x")))
+                .collect::<Vec<_>>(),
+        );
+        apply(&[(4, tr("q/many", n - 1))]);
+        let big = vec![0x33u8; 64 << 10];
+        apply(
+            &(1..=80)
+                .map(|o| (4, ap("q/big", o, o, &big)))
+                .collect::<Vec<_>>(),
+        );
+        apply(&[(4, tr("q/big", 79))]);
+        let queued = |state: &std::sync::Mutex<ReplicaState>| {
+            with_shard(state, |l| {
+                let oldest = l.log.segments()[0].first;
+                l.appended.get(&oldest).map_or(0, VecDeque::len)
+            })
+        };
+        with_shard(&state, |l| {
+            assert!(
+                l.segment_count() >= 2 && l.bytes() > 2 * l.live_bytes(),
+                "the fixture needs compacting"
+            );
+        });
+        let before = queued(&state);
+        assert!(
+            before > COMPACT_EXAMINE_MAX,
+            "the fixture queues more than one call's worth: {before}"
+        );
+        with_shard(&state, |l| l.reclaim(|_, _| None).unwrap());
+        let after = queued(&state);
+        assert!(
+            after > 0 && before - after <= COMPACT_EXAMINE_MAX,
+            "examined {} in one call",
+            before - after
+        );
     }
 
     #[test]
