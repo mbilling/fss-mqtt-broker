@@ -795,11 +795,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // client-CRL serials mirror the same MQTTD_TLS_CRL file the TLS verifier enforces
     // per handshake; parsing it is part of the same validate-before-swap reload.
     let client_crl_build = config.tls.crl.clone().map(|path| {
-        Box::new(move || {
-            let bytes = std::fs::read(&path).map_err(|e| format!("read client crl {path}: {e}"))?;
-            mqtt_auth::signed_gossip::RevocationList::from_bytes_unverified(&bytes)
-                .map_err(|e| format!("parse client crl {path}: {e}"))
-        }) as Box<dyn Fn() -> reload::ClientCrlBuildResult + Send + Sync>
+        Box::new(move || load_client_crl(&path))
+            as Box<dyn Fn() -> reload::ClientCrlBuildResult + Send + Sync>
     });
     reloader.attach_identity_sweep(hub_tx.clone(), client_crl_build);
     // ADR 0046 T4: whole-config hot reload. On SIGHUP / watch the reloader now re-loads the
@@ -1099,25 +1096,29 @@ fn tls_path_readable(var: &str, path: &str) -> Result<(), String> {
         .map_err(|e| format!("cannot read {var} ({path}): {e}"))
 }
 
-// One linear listener-wiring flow; splitting it would scatter the env-var reads.
-#[allow(clippy::too_many_lines)]
-async fn start_client_listeners(
-    config: &Config,
-    hub_tx: mpsc::UnboundedSender<hub::HubCommand>,
-    policy: Arc<conn::ConnPolicy>,
-    reloader: &mut reload::Reloader,
-    shutdown: &tokio_util::sync::CancellationToken,
-    connections: &tokio_util::task::TaskTracker,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let mut any = false;
-    // Connection admission caps (ADR 0041 T1), shared by every client listener.
-    let gate = admission_gate(config, policy.metrics.clone(), Some(policy.audit.clone()))?;
-    let tls_bind = config.listeners.tls_bind.clone();
-    let wss_bind = config.listeners.wss_bind.clone();
+/// The client-TLS material the TLS and WSS listeners share: the paths, the TLS 1.2 posture,
+/// and a builder the reloader re-runs. Resolved in one place so `--check-config` refuses
+/// exactly what listener startup would (issue #671): [`ClientTls::from_config`] is pure
+/// config, [`ClientTls::check_readable`] and [`ClientTls::acceptor`] touch the files.
+#[derive(Clone)]
+struct ClientTls {
+    cert: String,
+    key: String,
+    client_ca: Option<String>,
+    /// Optional certificate revocation list (ADR 0002 T8): a client whose cert is listed is
+    /// rejected at the TLS handshake. Re-read by every [`ClientTls::acceptor`] call, so a
+    /// freshly-published CRL takes effect on the next reload with no restart (ADR 0032 §5).
+    crl: Option<String>,
+    session_cache: usize,
+    tls12: tls::Tls12,
+}
 
-    // A single reloadable client-TLS acceptor, shared by the TLS and WSS listeners (ADR 0035
-    // WSS reuses the ADR 0002 TLS stack + the ADR 0032 reloadable acceptor — one TLS path).
-    let acceptor_rx = if tls_bind.is_some() || wss_bind.is_some() {
+impl ClientTls {
+    /// `None` when neither `tls_bind` nor `wss_bind` is configured.
+    fn from_config(config: &Config) -> Result<Option<Self>, Box<dyn std::error::Error>> {
+        if config.listeners.tls_bind.is_none() && config.listeners.wss_bind.is_none() {
+            return Ok(None);
+        }
         let (Some(cert), Some(key)) = (config.tls.cert.clone(), config.tls.key.clone()) else {
             return Err(
                 "tls_bind / wss_bind require a TLS cert and key (MQTTD_TLS_CERT / MQTTD_TLS_KEY)"
@@ -1125,21 +1126,7 @@ async fn start_client_listeners(
             );
         };
         let client_ca = config.tls.client_ca.clone();
-        // Optional certificate revocation list (ADR 0002 T8): a client whose cert is listed is
-        // rejected at the TLS handshake. Reloadable on SIGHUP via the same closure below, so a
-        // freshly-published CRL takes effect on the next handshake with no restart (ADR 0032 §5).
         let crl = config.tls.crl.clone();
-        // Named-variable readability check (see `tls_path_readable`): all four of these come
-        // from different lines of the operator's environment file, and rustls would report
-        // only the filename.
-        tls_path_readable("MQTTD_TLS_CERT", &cert)?;
-        tls_path_readable("MQTTD_TLS_KEY", &key)?;
-        if let Some(p) = &client_ca {
-            tls_path_readable("MQTTD_TLS_CLIENT_CA", p)?;
-        }
-        if let Some(p) = &crl {
-            tls_path_readable("MQTTD_TLS_CRL", p)?;
-        }
         // Resumption cache sized for the fleet (MQTTD_TLS_SESSION_CACHE; 0 disables) —
         // rustls' own 256-entry default is no resumption at all once more devices than
         // that reconnect, and battery-powered clients pay a full handshake every time.
@@ -1164,6 +1151,119 @@ async fn start_client_listeners(
             (true, false) => tls::Tls12::Hardened,
             (true, true) => tls::Tls12::UnsafeLegacyFeatures,
         };
+        Ok(Some(Self {
+            cert,
+            key,
+            client_ca,
+            crl,
+            session_cache,
+            tls12,
+        }))
+    }
+
+    /// Named-variable readability check (see `tls_path_readable`): all four of these come
+    /// from different lines of the operator's environment file, and rustls would report
+    /// only the filename.
+    fn check_readable(&self) -> Result<(), String> {
+        tls_path_readable("MQTTD_TLS_CERT", &self.cert)?;
+        tls_path_readable("MQTTD_TLS_KEY", &self.key)?;
+        if let Some(p) = &self.client_ca {
+            tls_path_readable("MQTTD_TLS_CLIENT_CA", p)?;
+        }
+        if let Some(p) = &self.crl {
+            tls_path_readable("MQTTD_TLS_CRL", p)?;
+        }
+        Ok(())
+    }
+
+    /// Read and parse the material into an acceptor — at startup, on every reload, and in
+    /// `--check-config --preflight`.
+    fn acceptor(&self) -> Result<TlsAcceptor, mqtt_net::NetError> {
+        tls::server_acceptor_versions(
+            Path::new(&self.cert),
+            Path::new(&self.key),
+            self.client_ca.as_deref().map(Path::new),
+            self.crl.as_deref().map(Path::new),
+            self.session_cache,
+            self.tls12,
+        )
+    }
+}
+
+/// The QUIC listener's address and certificate material: `None` without `quic_bind`. QUIC
+/// binds a UDP socket from a literal socket address (no name resolution), and mandates
+/// TLS 1.3 (no plaintext mode), so it reuses the TLS listener's cert, key and client CA —
+/// a `quic_bind` without them is refused.
+struct QuicTls {
+    udp: std::net::SocketAddr,
+    cert: String,
+    key: String,
+    client_ca: Option<String>,
+}
+
+impl QuicTls {
+    fn from_config(config: &Config) -> Result<Option<Self>, String> {
+        let Some(bind) = &config.listeners.quic_bind else {
+            return Ok(None);
+        };
+        let (Some(cert), Some(key)) = (config.tls.cert.clone(), config.tls.key.clone()) else {
+            return Err(
+                "quic_bind requires a TLS cert and key (MQTTD_TLS_CERT / MQTTD_TLS_KEY)".into(),
+            );
+        };
+        let udp = bind
+            .parse()
+            .map_err(|e| format!("MQTTD_QUIC_BIND is not a UDP socket address ({bind}): {e}"))?;
+        Ok(Some(Self {
+            udp,
+            cert,
+            key,
+            client_ca: config.tls.client_ca.clone(),
+        }))
+    }
+}
+
+/// The connection policy for one client listener (issue #669): the shared policy with that
+/// listener's anonymous-access override, loudly logged when it admits anonymous clients.
+fn listener_policy(
+    policy: &Arc<conn::ConnPolicy>,
+    listener: &str,
+    allow_anonymous: Option<bool>,
+) -> Arc<conn::ConnPolicy> {
+    match allow_anonymous {
+        Some(true) => warn!(
+            listener,
+            "INSECURE: anonymous MQTT clients are PERMITTED on this listener \
+             ({listener}_allow_anonymous)"
+        ),
+        Some(false) => info!(
+            listener,
+            "anonymous MQTT clients are refused on this listener ({listener}_allow_anonymous)"
+        ),
+        None => {}
+    }
+    policy.for_listener(allow_anonymous)
+}
+
+// One linear listener-wiring flow; splitting it would scatter the env-var reads.
+#[allow(clippy::too_many_lines)]
+async fn start_client_listeners(
+    config: &Config,
+    hub_tx: mpsc::UnboundedSender<hub::HubCommand>,
+    policy: Arc<conn::ConnPolicy>,
+    reloader: &mut reload::Reloader,
+    shutdown: &tokio_util::sync::CancellationToken,
+    connections: &tokio_util::task::TaskTracker,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut any = false;
+    // Connection admission caps (ADR 0041 T1), shared by every client listener.
+    let gate = admission_gate(config, policy.metrics.clone(), Some(policy.audit.clone()))?;
+    let tls_bind = config.listeners.tls_bind.clone();
+    let wss_bind = config.listeners.wss_bind.clone();
+
+    // A single reloadable client-TLS acceptor, shared by the TLS and WSS listeners (ADR 0035
+    // WSS reuses the ADR 0002 TLS stack + the ADR 0032 reloadable acceptor — one TLS path).
+    let acceptor_rx = if let Some(client_tls) = ClientTls::from_config(config)? {
         if config.tls.allow_tls12 {
             // The same register as the other posture reductions: impossible to miss in
             // the log, stated at every start, never silent. The README advertises
@@ -1183,27 +1283,13 @@ async fn start_client_listeners(
                  legacy firmware that predates RFC 7627, and plan its retirement."
             );
         }
-        let acceptor = tls::server_acceptor_versions(
-            Path::new(&cert),
-            Path::new(&key),
-            client_ca.as_deref().map(Path::new),
-            crl.as_deref().map(Path::new),
-            session_cache,
-            tls12,
-        )?;
+        client_tls.check_readable()?;
+        let acceptor = client_tls.acceptor()?;
         // Register the acceptor for SIGHUP reload (ADR 0032 T6): the closure re-reads the
         // same paths so a renewed cert/key/client-CA — and an updated CRL — is served on the
         // next handshake.
         Some(reloader.attach_tls(acceptor, move || {
-            tls::server_acceptor_versions(
-                Path::new(&cert),
-                Path::new(&key),
-                client_ca.as_deref().map(Path::new),
-                crl.as_deref().map(Path::new),
-                session_cache,
-                tls12,
-            )
-            .map_err(|e| e.to_string())
+            client_tls.acceptor().map_err(|e| e.to_string())
         }))
     } else {
         None
@@ -1219,7 +1305,7 @@ async fn start_client_listeners(
                 .clone()
                 .expect("acceptor built when tls_bind set"),
             hub_tx.clone(),
-            policy.clone(),
+            listener_policy(&policy, "tls", config.listeners.tls_allow_anonymous),
             shutdown.clone(),
             connections.clone(),
         ));
@@ -1235,7 +1321,7 @@ async fn start_client_listeners(
                 .clone()
                 .expect("acceptor built when wss_bind set"),
             hub_tx.clone(),
-            policy.clone(),
+            listener_policy(&policy, "wss", config.listeners.wss_allow_anonymous),
             shutdown.clone(),
             connections.clone(),
         ));
@@ -1249,7 +1335,11 @@ async fn start_client_listeners(
             gate.clone(),
             listener,
             hub_tx.clone(),
-            policy.clone(),
+            listener_policy(
+                &policy,
+                "plaintext",
+                config.listeners.plaintext_allow_anonymous,
+            ),
             shutdown.clone(),
             connections.clone(),
         ));
@@ -1263,36 +1353,26 @@ async fn start_client_listeners(
             gate.clone(),
             listener,
             hub_tx.clone(),
-            policy.clone(),
+            listener_policy(&policy, "ws", config.listeners.ws_allow_anonymous),
             shutdown.clone(),
             connections.clone(),
         ));
         any = true;
     }
-    if let Some(bind) = config.listeners.quic_bind.clone() {
-        // QUIC mandates TLS 1.3 (no plaintext mode); it reuses the same cert material as the
-        // TLS listener. The endpoint is built once (cert hot-reload is a follow-on, ADR 0036).
-        let (Some(cert), Some(key)) = (config.tls.cert.clone(), config.tls.key.clone()) else {
-            return Err(
-                "quic_bind requires a TLS cert and key (MQTTD_TLS_CERT / MQTTD_TLS_KEY)".into(),
-            );
-        };
-        let client_ca = config.tls.client_ca.clone();
-        let udp: std::net::SocketAddr = bind
-            .parse()
-            .map_err(|e| format!("MQTTD_QUIC_BIND is not a UDP socket address ({bind}): {e}"))?;
+    if let Some(quic) = QuicTls::from_config(config)? {
+        // The endpoint is built once (cert hot-reload is a follow-on, ADR 0036).
         let endpoint = mqtt_net::quic::server_endpoint(
-            udp,
-            Path::new(&cert),
-            Path::new(&key),
-            client_ca.as_deref().map(Path::new),
+            quic.udp,
+            Path::new(&quic.cert),
+            Path::new(&quic.key),
+            quic.client_ca.as_deref().map(Path::new),
         )?;
-        info!(%bind, "accepting MQTT clients over QUIC + TLS 1.3 (ADR 0036)");
+        info!(bind = %quic.udp, "accepting MQTT clients over QUIC + TLS 1.3 (ADR 0036)");
         tokio::spawn(serve_quic_clients(
             gate.clone(),
             endpoint,
             hub_tx.clone(),
-            policy.clone(),
+            listener_policy(&policy, "quic", config.listeners.quic_allow_anonymous),
             shutdown.clone(),
             connections.clone(),
         ));
@@ -1376,6 +1456,7 @@ fn client_policy(
         reload::Reloader::with_metrics(initial, audit.clone(), Some(metrics.clone()), build);
 
     let policy = Arc::new(conn::ConnPolicy {
+        anonymous: None,
         auth: handles.auth,
         authz: handles.authz,
         // Start-time, like the OIDC settings above: re-keying every ACL under live
@@ -1604,62 +1685,91 @@ fn authenticator_from_config(
         )?));
     }
 
+    // OIDC after any static JWT verifier: `Config::validate()` refuses configuring both
+    // (ADR 0050 §1), since the chain's first real verdict would let one shadow the other.
     if let Some(oidc) = oidc {
-        // The chain stops at the first real verdict on a credential kind, so a static JWT
-        // verifier ahead of OIDC would shadow it: the two are mutually exclusive (ADR 0050
-        // §1 — no silent fallback between key sources).
-        if config.security.jwt.hs256_secret_file.is_some()
-            || config.security.jwt.rs256_pem_file.is_some()
-        {
-            return Err(
-                "MQTTD_OIDC_ISSUER and MQTTD_JWT_* are mutually exclusive: configure one                  token verifier"
-                    .into(),
-            );
-        }
         members.push(oidc);
     }
-    Ok(Arc::new(mqtt_auth::chain::ChainAuthenticator::new(members)))
+    let both_factors = config.security.require_password_with_certificate;
+    if both_factors {
+        info!(
+            "certificate clients must ALSO present a password for the certificate identity \
+             (require_password_with_certificate)"
+        );
+    }
+    Ok(Arc::new(
+        mqtt_auth::chain::ChainAuthenticator::new(members)
+            .requiring_password_with_certificate(both_factors),
+    ))
+}
+
+/// OIDC-mode settings (ADR 0050), validated without touching the network: `None` when OIDC
+/// is not configured. Errors on a non-https issuer (without the loud test override) or a
+/// missing audience — fail closed at config time, and in `--check-config` (issue #671).
+struct OidcSettings {
+    config: mqtt_auth::oidc::OidcConfig,
+    issuer: String,
+    allow_http: bool,
+    refresh: Duration,
+}
+
+impl OidcSettings {
+    fn from_config(config: &Config) -> Result<Option<Self>, Box<dyn std::error::Error>> {
+        let Some(issuer) = config.security.oidc.issuer.clone() else {
+            return Ok(None);
+        };
+        let allow_http = config.security.oidc.allow_http;
+        if !issuer.starts_with("https://") {
+            if !allow_http {
+                return Err(format!(
+                    "MQTTD_OIDC_ISSUER must be https ({issuer}); MQTTD_OIDC_ALLOW_HTTP \
+                     overrides for tests only"
+                )
+                .into());
+            }
+            warn!(%issuer, "INSECURE: OIDC issuer over plaintext http (MQTTD_OIDC_ALLOW_HTTP) — testing use only");
+        }
+        let Some(audience) = config.security.oidc.audience.clone() else {
+            return Err(
+                "MQTTD_OIDC_AUDIENCE is required with MQTTD_OIDC_ISSUER (ADR 0050: \
+                 audience validation is not optional in OIDC mode)"
+                    .into(),
+            );
+        };
+        let mut oidc = mqtt_auth::oidc::OidcConfig::new(issuer.clone(), audience);
+        if let Some(s) = config.security.oidc.max_stale_secs {
+            oidc.max_stale = Duration::from_secs(s);
+        }
+        if let Some(c) = config.security.oidc.groups_claim.clone() {
+            oidc.groups_claim = c;
+        }
+        let refresh =
+            Duration::from_secs(config.security.oidc.jwks_refresh_secs.unwrap_or(300).max(5));
+        Ok(Some(Self {
+            config: oidc,
+            issuer,
+            allow_http,
+            refresh,
+        }))
+    }
 }
 
 /// Build the OIDC-mode authenticator (ADR 0050) and spawn its JWKS fetch loop, once per
-/// process. `None` when OIDC is not configured. Startup errors on a non-https issuer
-/// (without the loud test override) or a missing audience — fail closed at config time.
+/// process. `None` when OIDC is not configured.
 fn oidc_from_config(
     config: &Config,
     shutdown: tokio_util::sync::CancellationToken,
 ) -> Result<Option<Arc<mqtt_auth::oidc::OidcAuthenticator>>, Box<dyn std::error::Error>> {
-    let Some(issuer) = config.security.oidc.issuer.clone() else {
+    let Some(settings) = OidcSettings::from_config(config)? else {
         return Ok(None);
     };
-    let allow_http = config.security.oidc.allow_http;
-    if !issuer.starts_with("https://") {
-        if !allow_http {
-            return Err(format!(
-                "MQTTD_OIDC_ISSUER must be https ({issuer}); MQTTD_OIDC_ALLOW_HTTP overrides                  for tests only"
-            )
-            .into());
-        }
-        warn!(%issuer, "INSECURE: OIDC issuer over plaintext http (MQTTD_OIDC_ALLOW_HTTP) — testing use only");
-    }
-    let Some(audience) = config.security.oidc.audience.clone() else {
-        return Err("MQTTD_OIDC_AUDIENCE is required with MQTTD_OIDC_ISSUER (ADR 0050:                     audience validation is not optional in OIDC mode)"
-            .into());
-    };
-    let mut cfg = mqtt_auth::oidc::OidcConfig::new(issuer.clone(), audience);
-    if let Some(s) = config.security.oidc.max_stale_secs {
-        cfg.max_stale = Duration::from_secs(s);
-    }
-    if let Some(c) = config.security.oidc.groups_claim.clone() {
-        cfg.groups_claim = c;
-    }
-    let refresh = Duration::from_secs(config.security.oidc.jwks_refresh_secs.unwrap_or(300).max(5));
-    let (auth, hints) = mqtt_auth::oidc::OidcAuthenticator::new(cfg);
-    info!(%issuer, refresh_s = refresh.as_secs(), "OIDC token authentication enabled (ADR 0050); fail-closed until the first JWKS load");
+    let (auth, hints) = mqtt_auth::oidc::OidcAuthenticator::new(settings.config);
+    info!(issuer = %settings.issuer, refresh_s = settings.refresh.as_secs(), "OIDC token authentication enabled (ADR 0050); fail-closed until the first JWKS load");
     tokio::spawn(mqttd::oidc::run_fetch_loop(
         auth.clone(),
-        issuer,
-        allow_http,
-        refresh,
+        settings.issuer,
+        settings.allow_http,
+        settings.refresh,
         hints,
         shutdown,
     ));
@@ -2581,6 +2691,14 @@ fn peer_tls_from_config(
     }
 }
 
+/// Read + parse the client CRL's serials for the post-reload identity sweep (ADR 0040 T2) —
+/// the same `MQTTD_TLS_CRL` file the TLS verifier enforces per handshake.
+fn load_client_crl(path: &str) -> reload::ClientCrlBuildResult {
+    let bytes = std::fs::read(path).map_err(|e| format!("read client crl {path}: {e}"))?;
+    mqtt_auth::signed_gossip::RevocationList::from_bytes_unverified(&bytes)
+        .map_err(|e| format!("parse client crl {path}: {e}"))
+}
+
 /// Read + parse + CA-verify the cluster-bus CRL (ADR 0022 T7). Used at startup and by the
 /// reload closure, so a republished CRL takes effect without a restart.
 fn load_gossip_crl(
@@ -2653,6 +2771,76 @@ impl mqtt_cluster::swim_auth::GossipVerify for CaGossipVerifier {
             Err(_) => Err(OpenReject::Auth),
         }
     }
+}
+
+/// The gossip authentication `start_swim` wraps its datagrams in: the shared cluster key
+/// (inline or by file), any rotation keys, and per-node signatures layered on top when
+/// configured. Split out so `--check-config` reads the same key file and refuses the same
+/// combinations (issue #671).
+fn swim_auth_from_config(
+    config: &Config,
+    peer_tls: Option<&peer::PeerTls>,
+) -> Result<(Option<SwimAuth>, SignedGossip), Box<dyn std::error::Error>> {
+    // Gossip authentication (ADR 0003): keyed = membership claims require the
+    // cluster key; unkeyed is possible but loudly insecure. The key is either inline
+    // (`swim.key`) or read from a file (`swim.key_file`, ADR 0046 T5 secret-by-reference);
+    // `validate()` guarantees at most one is set.
+    let primary_key: Option<String> =
+        match (&config.cluster.swim.key, &config.cluster.swim.key_file) {
+            (Some(hex), _) => Some(hex.clone()),
+            (None, Some(path)) => {
+                // Named-variable readability check, same reason as `tls_path_readable`:
+                // a bare `Os { code: 2 }` here is indistinguishable from an unreadable
+                // password or ACL file, and the operator was just told to edit three
+                // secrets-by-path lines (issue #254 round 3).
+                tls_path_readable("MQTTD_SWIM_KEY_FILE", path)?;
+                Some(String::from_utf8_lossy(&mqtt_core::read_secret_file(path)?).to_string())
+            }
+            (None, None) => None,
+        };
+    let auth = if let Some(hex) = &primary_key {
+        let mut auth = SwimAuth::from_hex_key(hex)?;
+        // Additional keys accepted (but not used to seal) during a rotation window (ADR
+        // 0003): an old key still opens peers' datagrams while the cluster migrates to the
+        // new primary, so the gossip key rotates without downtime.
+        let mut rotation = 0;
+        for k in config
+            .cluster
+            .swim
+            .key_accept
+            .iter()
+            .filter(|k| !k.is_empty())
+        {
+            auth = auth.accept_also_hex(k)?;
+            rotation += 1;
+        }
+        if rotation > 0 {
+            info!(
+                rotation_keys = rotation,
+                "SWIM gossip accepts additional rotation keys (ADR 0003)"
+            );
+        }
+        Some(auth)
+    } else {
+        if !config.cluster.swim.key_accept.is_empty() {
+            return Err(
+                "swim.key_accept requires swim.key (MQTTD_SWIM_KEY): rotation keys are \
+                        accepted in addition to a primary key, not on their own"
+                    .into(),
+            );
+        }
+        warn!(
+            "INSECURE: SWIM gossip is UNAUTHENTICATED (no MQTTD_SWIM_KEY) — \
+             anyone reaching the gossip port can inject membership claims, \
+             including Dead claims that tear down routing"
+        );
+        None
+    };
+    // Layer per-node signatures (ADR 0022) on top of the shared-key MAC when configured;
+    // anti-replay sequencing (ADR 0023) goes on top of that in `start_swim`.
+    let signed = signed_gossip_from_config(config, peer_tls.is_some(), auth.is_some())?;
+    let auth = apply_signed_gossip(auth, peer_tls, signed)?;
+    Ok((auth, signed))
 }
 
 /// Signed-gossip posture (ADR 0022), from `MQTTD_SWIM_SIGNED`. A strict on/off choice: a
@@ -2779,16 +2967,15 @@ enum ReplayMode {
     Require,
 }
 
-/// Layer anti-replay (ADR 0023) onto the signed `auth` when configured, returning the auth
-/// plus the per-node sequence allocator the driver uses to sequence outgoing datagrams.
-/// Anti-replay binds to the per-node signature, so it requires signed gossip; it persists a
-/// sequence counter, so it requires a data dir. A requested mode without them is a startup
-/// error. Defaults to `off` (opt-in).
-fn apply_anti_replay(
+/// The anti-replay posture's prerequisites (ADR 0023), without opening the sequence store:
+/// `None` when anti-replay is off, else the data dir its counter will live in. Split out so
+/// `--check-config --preflight` refuses the same combinations SWIM startup does (issue #671)
+/// without creating `gossip-seq` as a side effect of a dry check.
+fn replay_data_dir(
     config: &Config,
-    auth: Option<SwimAuth>,
+    has_key: bool,
     signed: SignedGossip,
-) -> Result<(Option<SwimAuth>, Option<swim_driver::SeqAlloc>), Box<dyn std::error::Error>> {
+) -> Result<Option<&str>, Box<dyn std::error::Error>> {
     let mode = match config.cluster.swim.replay.as_deref() {
         Some("require") => ReplayMode::Require,
         Some("off") | None => ReplayMode::Off,
@@ -2799,11 +2986,11 @@ fn apply_anti_replay(
         }
     };
     if mode == ReplayMode::Off {
-        return Ok((auth, None));
+        return Ok(None);
     }
-    let Some(auth) = auth else {
+    if !has_key {
         return Err("MQTTD_SWIM_REPLAY requires MQTTD_SWIM_KEY".into());
-    };
+    }
     if signed == SignedGossip::Off {
         return Err(
             "cluster.swim.replay requires cluster.swim.signed=require: anti-replay binds the \
@@ -2818,6 +3005,23 @@ fn apply_anti_replay(
                 .into(),
         );
     };
+    Ok(Some(dir))
+}
+
+/// Layer anti-replay (ADR 0023) onto the signed `auth` when configured, returning the auth
+/// plus the per-node sequence allocator the driver uses to sequence outgoing datagrams.
+/// Anti-replay binds to the per-node signature, so it requires signed gossip; it persists a
+/// sequence counter, so it requires a data dir. A requested mode without them is a startup
+/// error. Defaults to `off` (opt-in).
+fn apply_anti_replay(
+    config: &Config,
+    auth: Option<SwimAuth>,
+    signed: SignedGossip,
+) -> Result<(Option<SwimAuth>, Option<swim_driver::SeqAlloc>), Box<dyn std::error::Error>> {
+    let Some(dir) = replay_data_dir(config, auth.is_some(), signed)? else {
+        return Ok((auth, None));
+    };
+    let auth = auth.expect("replay_data_dir refuses anti-replay without a gossip key");
     let store = FileSeqStore::open(Path::new(dir).join("gossip-seq"))?;
     let alloc = mqtt_cluster::replay::SequenceAllocator::open(
         Box::new(store) as Box<dyn mqtt_cluster::replay::SeqStore>,
@@ -2854,6 +3058,7 @@ async fn start_swim(
     let Some(bind) = config.cluster.swim.bind.clone() else {
         return Ok(());
     };
+    // `Config::validate()` already refuses this pairing; the guard unwraps the address.
     let Some(peer_addr) = peer_bind else {
         return Err(
             "swim.bind requires peer_bind (MQTTD_PEER_BIND): membership \
@@ -2866,65 +3071,7 @@ async fn start_swim(
     // the bound one — NAT, container port mapping, or a fronting relay (the
     // out-of-process harness fronts each peer listener with one).
     let peer_addr = config.cluster.peer_advertise.clone().unwrap_or(peer_addr);
-    // Gossip authentication (ADR 0003): keyed = membership claims require the
-    // cluster key; unkeyed is possible but loudly insecure. The key is either inline
-    // (`swim.key`) or read from a file (`swim.key_file`, ADR 0046 T5 secret-by-reference);
-    // `validate()` guarantees at most one is set.
-    let primary_key: Option<String> =
-        match (&config.cluster.swim.key, &config.cluster.swim.key_file) {
-            (Some(hex), _) => Some(hex.clone()),
-            (None, Some(path)) => {
-                // Named-variable readability check, same reason as `tls_path_readable`:
-                // a bare `Os { code: 2 }` here is indistinguishable from an unreadable
-                // password or ACL file, and the operator was just told to edit three
-                // secrets-by-path lines (issue #254 round 3).
-                tls_path_readable("MQTTD_SWIM_KEY_FILE", path)?;
-                Some(String::from_utf8_lossy(&mqtt_core::read_secret_file(path)?).to_string())
-            }
-            (None, None) => None,
-        };
-    let auth = if let Some(hex) = &primary_key {
-        let mut auth = SwimAuth::from_hex_key(hex)?;
-        // Additional keys accepted (but not used to seal) during a rotation window (ADR
-        // 0003): an old key still opens peers' datagrams while the cluster migrates to the
-        // new primary, so the gossip key rotates without downtime.
-        let mut rotation = 0;
-        for k in config
-            .cluster
-            .swim
-            .key_accept
-            .iter()
-            .filter(|k| !k.is_empty())
-        {
-            auth = auth.accept_also_hex(k)?;
-            rotation += 1;
-        }
-        if rotation > 0 {
-            info!(
-                rotation_keys = rotation,
-                "SWIM gossip accepts additional rotation keys (ADR 0003)"
-            );
-        }
-        Some(auth)
-    } else {
-        if !config.cluster.swim.key_accept.is_empty() {
-            return Err(
-                "swim.key_accept requires swim.key (MQTTD_SWIM_KEY): rotation keys are \
-                        accepted in addition to a primary key, not on their own"
-                    .into(),
-            );
-        }
-        warn!(
-            "INSECURE: SWIM gossip is UNAUTHENTICATED (no MQTTD_SWIM_KEY) — \
-             anyone reaching the gossip port can inject membership claims, \
-             including Dead claims that tear down routing"
-        );
-        None
-    };
-    // Layer per-node signatures (ADR 0022) then anti-replay sequencing (ADR 0023) on top of
-    // the shared-key MAC when configured.
-    let signed = signed_gossip_from_config(config, peer_tls.is_some(), auth.is_some())?;
-    let auth = apply_signed_gossip(auth, peer_tls, signed)?;
+    let (auth, signed) = swim_auth_from_config(config, peer_tls)?;
     let (auth, seq_alloc) = apply_anti_replay(config, auth, signed)?;
     // Hot rotation of the gossip signing identity (issue #269): the signer was a startup
     // snapshot — after a leaf rotation the node kept signing with the OLD key and
@@ -3565,6 +3712,8 @@ fn requires_restart(old: &Config, new: &Config) -> Vec<&'static str> {
         let mut c = c.clone();
         c.security.allow_anonymous = false;
         c.security.password_file = None;
+        // Carried by the authenticator chain the reload rebuilds (issue #670).
+        c.security.require_password_with_certificate = false;
         c.security.acl_file = None;
         c.security.jwt = Jwt::default();
         c.limits.max_subscriptions_per_client = None;
@@ -3672,6 +3821,7 @@ fn load_config() -> Result<Config, Box<dyn std::error::Error>> {
 /// `--probe` path) do not start with `-`, so they are never mistaken for flags.
 const KNOWN_FLAGS: &[&str] = &[
     "--check-config",
+    "--preflight",
     "--config",
     "--hash-password",
     "--probe",
@@ -3704,6 +3854,7 @@ fn validate_cli(args: &[String]) -> Result<(), String> {
     }
     let mut mode = None;
     let mut options = std::collections::BTreeSet::new();
+    let mut preflight = false;
     let mut tokens = args.iter().map(String::as_str).peekable();
     while let Some(arg) = tokens.next() {
         match arg {
@@ -3716,6 +3867,12 @@ fn validate_cli(args: &[String]) -> Result<(), String> {
                     .filter(|value| !value.is_empty() && !value.starts_with('-'));
                 if value.is_none() {
                     return Err(format!("{arg} requires a value"));
+                }
+            }
+            // A modifier, not a command: `--check-config --preflight` (issue #671).
+            "--preflight" => {
+                if std::mem::replace(&mut preflight, true) {
+                    return Err("repeated option: --preflight".to_string());
                 }
             }
             "--check-config" | "--hash-password" | "--probe" | "--decommission" | "--backup"
@@ -3737,6 +3894,9 @@ fn validate_cli(args: &[String]) -> Result<(), String> {
         }
     }
     let mode = mode.unwrap_or("start");
+    if preflight && mode != "--check-config" {
+        return Err(format!("--preflight is not valid with {mode}"));
+    }
     for option in options {
         let allowed = match option {
             "--config" => matches!(mode, "start" | "--check-config" | "--probe" | "--backup"),
@@ -3775,6 +3935,9 @@ fn print_usage() {
            mqttd                     start the broker (configured by MQTTD_* env / --config)\n  \
            mqttd --config <path>     start with a TOML config file (env still overlays)\n  \
            mqttd --check-config      validate the effective config and exit (no ports bound)\n  \
+           mqttd --check-config --preflight\n  \
+                                     ...and this host: open every referenced file as the\n  \
+                                     current user, resolve every bind\n  \
            mqttd --hash-password [u] print an Argon2id password-file line and exit\n  \
            mqttd --probe [/readyz]   query the running broker's health endpoint and exit\n  \
            mqttd --decommission      drain and gracefully stop the running broker\n  \
@@ -4241,16 +4404,151 @@ fn check_config_inner() -> Result<Option<std::path::PathBuf>, CheckError> {
         Ok(c) => c,
         Err(error) => return Err(CheckError::Invalid { path, error }),
     };
-    // Assembly-time checks that need constants the config layer does not know (issue
-    // #239): an unsatisfiable min-replicas floor is a bad config, and the pre-rollout
-    // gate is the right place to say so — not the first refused write of a live broker.
-    if let Err(message) = resolve_write_floor(&config) {
+    // Startup's own checks past `Config::load` (issue #671). The builders log as they go
+    // (INSECURE warnings, "loaded" lines); the gate's output is its one verdict line, so
+    // they run with logging silenced.
+    let preflight = std::env::args().any(|a| a == "--preflight");
+    let checked =
+        tracing::subscriber::with_default(tracing::subscriber::NoSubscriber::default(), || {
+            static_checks(&config)?;
+            if preflight {
+                host_checks(&config)?;
+            }
+            Ok::<(), String>(())
+        });
+    if let Err(message) = checked {
         return Err(CheckError::Invalid {
             path,
             error: ConfigError::Invalid(message),
         });
     }
     Ok(path)
+}
+
+/// What `--check-config` runs beyond `Config::load` (issue #671): the checks startup makes
+/// before binding that need nothing from the host — through the SAME functions startup and
+/// the reload use, so the two cannot drift. Deliberately host-independent: the gate runs
+/// where configs are written (a deploy pipeline, the chart's CI) with none of the secrets or
+/// the network the broker will have, and must not refuse a config for their absence.
+fn static_checks(config: &Config) -> Result<(), String> {
+    let text = |e: Box<dyn std::error::Error>| e.to_string();
+    // Assembly-time checks that need constants the config layer does not know — the
+    // min-replicas floor (issue #239) among them. The same gate a reload applies.
+    runtime_precheck(config)?;
+    check_bind_syntax(config)?;
+    ClientTls::from_config(config).map_err(text)?;
+    QuicTls::from_config(config)?;
+    OidcSettings::from_config(config).map_err(text)?;
+    Ok(())
+}
+
+/// `--check-config --preflight` (issue #671): additionally, everything startup reads from
+/// THIS host before it binds — every bind resolved, every referenced file opened and parsed
+/// — as the user running the check. Run it as the broker's service account on the target
+/// host (an installer, an init container with the broker's mounts): a `0600 root:root`
+/// password file passes a check run as root and fails the broker's own start.
+///
+/// Nothing is bound, spawned or fetched. Not covered, because only the running broker can
+/// answer them: whether a port is free, and the OIDC issuer's reachability (its settings
+/// are checked; the first JWKS fetch is not attempted).
+fn host_checks(config: &Config) -> Result<(), String> {
+    let text = |e: Box<dyn std::error::Error>| e.to_string();
+    resolve_binds(config)?;
+    if let Some(client_tls) = ClientTls::from_config(config).map_err(text)? {
+        client_tls.check_readable()?;
+        client_tls.acceptor().map_err(|e| e.to_string())?;
+    }
+    if let Some(crl) = &config.tls.crl {
+        load_client_crl(crl)?;
+    }
+    if let Some(quic) = QuicTls::from_config(config)? {
+        tls::server_acceptor(
+            Path::new(&quic.cert),
+            Path::new(&quic.key),
+            quic.client_ca.as_deref().map(Path::new),
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    authorizer_from_config(config).map_err(text)?;
+    authenticator_from_config(config, None, None).map_err(text)?;
+    let peer_tls = peer_tls_from_config(config).map_err(text)?;
+    if config.cluster.swim.bind.is_some() {
+        let (auth, signed) =
+            swim_auth_from_config(config, peer_tls.as_ref().map(|(tls, _)| tls)).map_err(text)?;
+        replay_data_dir(config, auth.is_some(), signed).map_err(text)?;
+    }
+    Ok(())
+}
+
+/// Every configured bind, with its config key and env var for the refusal.
+fn configured_binds(config: &Config) -> [(&'static str, Option<&String>); 8] {
+    let l = &config.listeners;
+    [
+        ("listeners.tls_bind (MQTTD_TLS_BIND)", l.tls_bind.as_ref()),
+        (
+            "listeners.plaintext_bind (MQTTD_PLAINTEXT_BIND)",
+            l.plaintext_bind.as_ref(),
+        ),
+        ("listeners.ws_bind (MQTTD_WS_BIND)", l.ws_bind.as_ref()),
+        ("listeners.wss_bind (MQTTD_WSS_BIND)", l.wss_bind.as_ref()),
+        (
+            "listeners.health_bind (MQTTD_HEALTH_BIND)",
+            l.health_bind.as_ref(),
+        ),
+        (
+            "listeners.metrics_bind (MQTTD_METRICS_BIND)",
+            l.metrics_bind.as_ref(),
+        ),
+        (
+            "cluster.peer_bind (MQTTD_PEER_BIND)",
+            config.cluster.peer_bind.as_ref(),
+        ),
+        (
+            "cluster.swim.bind (MQTTD_SWIM_BIND)",
+            config.cluster.swim.bind.as_ref(),
+        ),
+    ]
+}
+
+/// Every bind must have the shape `bind` accepts — a socket address, or `host:port` with a
+/// DNS-shaped host and a numeric port — checked WITHOUT resolving, so a host name that only
+/// resolves inside the target cluster still passes in CI (issue #671). QUIC's stricter
+/// literal-address parse is part of `QuicTls::from_config`.
+fn check_bind_syntax(config: &Config) -> Result<(), String> {
+    for (name, bind) in configured_binds(config) {
+        let Some(bind) = bind else { continue };
+        if bind.parse::<std::net::SocketAddr>().is_ok() {
+            continue;
+        }
+        let well_formed = bind.rsplit_once(':').is_some_and(|(host, port)| {
+            !host.is_empty()
+                && host
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_'))
+                && port.parse::<u16>().is_ok()
+        });
+        if !well_formed {
+            return Err(format!(
+                "{name} = {bind:?} is not a bindable address (expected host:port or ip:port)"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// `--preflight`: every bind resolves on this host through `ToSocketAddrs`, as tokio's
+/// `bind` does. Resolution only — nothing is bound.
+fn resolve_binds(config: &Config) -> Result<(), String> {
+    use std::net::ToSocketAddrs as _;
+    for (name, bind) in configured_binds(config) {
+        let Some(bind) = bind else { continue };
+        match bind.to_socket_addrs().map(|mut addrs| addrs.next()) {
+            Ok(Some(_)) => {}
+            Ok(None) => return Err(format!("{name} = {bind:?} resolves to no address")),
+            Err(e) => return Err(format!("{name} = {bind:?} does not resolve here: {e}")),
+        }
+    }
+    Ok(())
 }
 
 /// The config-file path from `--config <path>` / `--config=<path>` (highest precedence) or the
@@ -4620,6 +4918,8 @@ mod tests {
             vec!["--config", "broker.toml"],
             vec!["--check-config", "--config", "broker.toml"],
             vec!["--config", "broker.toml", "--check-config"],
+            vec!["--check-config", "--preflight"],
+            vec!["--preflight", "--config", "broker.toml", "--check-config"],
             vec!["--hash-password"],
             vec!["--hash-password", "alice"],
             vec!["--probe"],
@@ -4669,6 +4969,10 @@ mod tests {
             vec!["--check-config", "--decommission"],
             vec!["--backup", "--decommission"],
             vec!["--check-config", "--check-config"],
+            vec!["--preflight"],
+            vec!["--preflight", "--config", "broker.toml"],
+            vec!["--check-config", "--preflight", "--preflight"],
+            vec!["--probe", "--preflight"],
             vec!["--version", "--unknown"],
             vec!["--help", "--unknown"],
             vec!["--version", "--backup"],
@@ -4811,10 +5115,11 @@ mod tests {
         let mut live = base.clone();
         live.security.allow_anonymous = true;
         live.security.acl_file = Some("/etc/acl.toml".into());
+        live.security.require_password_with_certificate = true;
         live.limits.max_sessions = Some(1000);
         assert!(
             requires_restart(&base, &live).is_empty(),
-            "quotas / allow_anonymous / ACL path are live"
+            "quotas / allow_anonymous / ACL path / both-factors are live"
         );
 
         // Non-live edits DO require a restart, reported by section.

@@ -290,6 +290,7 @@ async fn start_proxy_node(
         DEFAULT_REPLICAS,
     )));
     let policy = Arc::new(ConnPolicy {
+        anonymous: None,
         auth: mqttd::conn::auth_handle(Arc::new(BasicAuthenticator {
             allow_anonymous: true,
         })),

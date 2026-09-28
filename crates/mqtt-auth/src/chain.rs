@@ -15,12 +15,16 @@ use std::sync::Arc;
 /// An ordered list of authenticators tried in sequence.
 pub struct ChainAuthenticator {
     members: Vec<Arc<dyn Authenticator>>,
+    /// See [`Authenticator::requires_password_with_certificate`]. Carried by the chain
+    /// because it is a policy over the whole credential set, not one member's verdict.
+    password_with_certificate: bool,
 }
 
 impl std::fmt::Debug for ChainAuthenticator {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ChainAuthenticator")
             .field("members", &self.members.len())
+            .field("password_with_certificate", &self.password_with_certificate)
             .finish()
     }
 }
@@ -29,7 +33,18 @@ impl ChainAuthenticator {
     /// Build a chain from an ordered list of authenticators.
     #[must_use]
     pub fn new(members: Vec<Arc<dyn Authenticator>>) -> Self {
-        Self { members }
+        Self {
+            members,
+            password_with_certificate: false,
+        }
+    }
+
+    /// Require a certificate client to also present a password for the same identity
+    /// (issue #670).
+    #[must_use]
+    pub fn requiring_password_with_certificate(mut self, required: bool) -> Self {
+        self.password_with_certificate = required;
+        self
     }
 }
 
@@ -67,6 +82,10 @@ impl Authenticator for ChainAuthenticator {
     /// to carry a JWT-shaped password as a bearer token (ADR 0050 §0).
     fn handles_token(&self) -> bool {
         self.members.iter().any(|m| m.handles_token())
+    }
+
+    fn requires_password_with_certificate(&self) -> bool {
+        self.password_with_certificate
     }
 }
 
@@ -122,6 +141,16 @@ mod tests {
         ) -> Result<Identity, AuthError> {
             panic!("chain must not consult members after a final verdict");
         }
+    }
+
+    /// The both-factors policy (issue #670) is off unless asked for, and the chain reports
+    /// exactly what it was built with — the CONNECT path's only signal.
+    #[test]
+    fn requiring_password_with_certificate_is_opt_in() {
+        assert!(!ChainAuthenticator::new(vec![accepts("a")]).requires_password_with_certificate());
+        assert!(ChainAuthenticator::new(vec![accepts("a")])
+            .requiring_password_with_certificate(true)
+            .requires_password_with_certificate());
     }
 
     #[tokio::test]

@@ -93,7 +93,7 @@ Single-node deployments: verify none of the cluster binds are set and skip to §
 
 | # | Lvl | Control | Knob / default | Verify |
 |---|-----|---------|----------------|--------|
-| H-7.1 | L1 | Config validated before rollout | `mqttd --check-config --config <file>` in the deploy pipeline | exit 0; CI/CD step exists |
+| H-7.1 | L1 | Config validated before rollout | `mqttd --check-config --config <file>` in the deploy pipeline; `--check-config --preflight` as the service account on the target host | exit 0; CI/CD step exists |
 | H-7.2 | L1 | Unknown config keys refuse (typo net) | `MQTTD_CONFIG_UNKNOWN_KEYS` unset (= refuse); `warn` only during a rollback/skew window | env/flag absent outside upgrade windows |
 | H-7.3 | L1 | Secrets by path, never inline | config discipline (schema enforces for keys) | `grep -iE 'key *= *"-----|password *= *"[^/]' <config>` returns nothing |
 | H-7.4 | L2 | Health/metrics ports on the ops network only, never internet-exposed | `MQTTD_HEALTH_BIND`, `MQTTD_METRICS_BIND` on internal interfaces | external scan: 200-serving `/statusz` unreachable from outside |

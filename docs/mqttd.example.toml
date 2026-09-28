@@ -42,6 +42,11 @@ health_bind = "0.0.0.0:8080"         # GET /livez, /readyz, /metrics
 # metrics_bind = "127.0.0.1:9090"    # optional separate /metrics bind (internal only)
 # plaintext_bind = "127.0.0.1:1883"  # INSECURE — local testing only
 # ws_bind = "127.0.0.1:8083"         # INSECURE plaintext WebSocket — local/dev only
+# Per-listener anonymous access (issue #669): overrides [security] allow_anonymous for that
+# listener only; unset inherits it. E.g. an open plaintext listener on a trusted segment
+# beside a TLS listener that requires credentials:
+# plaintext_allow_anonymous = true
+# tls_allow_anonymous = false        # also ws_ / wss_ / quic_allow_anonymous
 
 [tls]
 # Server certificate chain + private key (PEM paths). The key is a secret — mount it, don't
@@ -74,6 +79,10 @@ client_ca = "/etc/mqttd/tls/client-ca.crt"
 allow_anonymous = false
 # Argon2id `username:phc-hash` password file (a secret — mount it).
 # password_file = "/etc/mqttd/passwd"
+# Require BOTH factors (issue #670): a client presenting a verified certificate must also send
+# username = its certificate identity and that user's password. Needs [tls] client_ca and a
+# password verifier (password_file or [security.http_auth]). Off = the certificate alone admits.
+# require_password_with_certificate = false
 # TOML topic-ACL policy (deny by default). Without it, authorization is NOT enforced (logged).
 acl_file = "/etc/mqttd/acl.toml"
 

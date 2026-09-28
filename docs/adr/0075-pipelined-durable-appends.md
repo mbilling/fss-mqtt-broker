@@ -71,8 +71,12 @@ order.
    unaffected. The committed range stays gap-free by construction.
 4. **The lane pipelines appends only.** `append_lane_worker` keeps up to
    `LANE_PIPELINE_DEPTH` pending appends per session in flight (submitting
-   serially — submission order is offset order is delivery order), posting
-   `AppendDone` as each resolves. Every non-append lane job (QoS 2 outbound
+   serially — submission order is offset order is delivery order). Each
+   wait runs as its own task, and `AppendDone` is posted **in submission
+   order**, never as each wait happens to finish: a later offset posted
+   first would reach the wire first and let the ack watermark truncate an
+   earlier offset the hub had not yet tracked (amended 2026-09-28, #691).
+   Every non-append lane job (QoS 2 outbound
    records, spill, discard, remove) remains a **barrier**: the pipeline
    drains first, preserving ADR 0061's total order for them verbatim.
 5. **Trait surface, default-eager.** `ReplicatedLog::submit_tiered` and
