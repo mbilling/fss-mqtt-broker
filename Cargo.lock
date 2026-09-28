@@ -2149,6 +2149,7 @@ dependencies = [
  "aws-lc-rs",
  "bytes",
  "criterion",
+ "futures-util",
  "history-check",
  "jsonwebtoken",
  "mimalloc",
