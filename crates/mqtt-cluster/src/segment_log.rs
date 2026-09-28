@@ -251,7 +251,14 @@ impl SegmentLog {
                         detail,
                     });
                 }
-                // A torn tail: count what is being discarded, up to the zeros.
+            }
+            if last {
+                // Anything non-zero past the valid end of the last segment is a
+                // torn batch — whether the scan stopped on a bad record OR on a
+                // zero header. The second is the sector-reorder shape: a crash
+                // persisted a batch's later sectors and not its first, so the
+                // valid end reads as a clean end of log while intact, unacked
+                // records sit beyond it. Counting them makes the open zero them.
                 let end = bytes[valid..]
                     .iter()
                     .rposition(|b| *b != 0)
@@ -657,6 +664,36 @@ mod tests {
         assert_eq!(seen[1].2, payload(20, 64));
     }
 
+    /// The sector-reorder shape: a crash persisted a batch's LATER records and
+    /// not its first, which reads as all zeros. The valid end then looks like a
+    /// clean end of log — no bad record to stop on — while intact, unacked
+    /// records sit past a zero gap, on exactly the next LSNs once a shorter
+    /// append follows. They must be zeroed all the same.
+    #[test]
+    fn records_past_a_zeroed_first_record_never_come_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut log, _, _) = open(dir.path(), DEFAULT_SEGMENT_BYTES);
+        log.append(&[(1, &payload(1, 64))]).unwrap();
+        let end = log.segments()[0].bytes;
+        let ghosts: Vec<Vec<u8>> = (10..14).map(|i| payload(i, 64)).collect();
+        let refs: Vec<(u8, &[u8])> = ghosts.iter().map(|g| (1u8, g.as_slice())).collect();
+        log.append(&refs).unwrap(); // LSN 2..=5
+        let path = log.segments()[0].path.clone();
+        drop(log);
+        zero(&path, end, (HEADER_BYTES + 64) as u64); // record 2 never reached the disk
+        let (mut log, rec, seen) = open(dir.path(), DEFAULT_SEGMENT_BYTES);
+        assert_eq!(seen.len(), 1);
+        assert!(
+            rec.torn_bytes > 0,
+            "the records past the zero gap are torn, not absent"
+        );
+        log.append(&[(1, &payload(20, 64))]).unwrap(); // the new LSN 2
+        drop(log);
+        let (_, _, seen) = open(dir.path(), DEFAULT_SEGMENT_BYTES);
+        assert_eq!(seen.iter().map(|r| r.0).collect::<Vec<_>>(), vec![1, 2]);
+        assert_eq!(seen[1].2, payload(20, 64));
+    }
+
     #[test]
     fn corruption_before_the_tail_fails_the_open() {
         let dir = tempfile::tempdir().unwrap();
@@ -742,6 +779,14 @@ mod tests {
             Err(LogError::TooLarge(_))
         ));
         assert_eq!(log.next_lsn(), 1);
+    }
+
+    fn zero(path: &Path, at: u64, len: u64) {
+        use std::io::Write;
+        let mut f = OpenOptions::new().write(true).open(path).unwrap();
+        f.seek(SeekFrom::Start(at)).unwrap();
+        f.write_all(&vec![0u8; usize::try_from(len).unwrap()])
+            .unwrap();
     }
 
     fn corrupt(path: &Path, at: u64) {

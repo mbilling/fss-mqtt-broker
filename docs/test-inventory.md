@@ -253,7 +253,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `two_bridge_instances_do_not_duplicate_forwarding`
 - `two_partitioned_instances_deliver_each_inbound_message_exactly_once`
 
-## `crates/mqtt-cluster/src/lib.rs` — 310 test(s)
+## `crates/mqtt-cluster/src/lib.rs` — 311 test(s)
 
 - `cluster_identity::tests::a_founder_mints_once_and_reloads_stably`
 - `cluster_identity::tests::a_joiner_adopts_once_and_persists`
@@ -482,6 +482,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `segment_log::tests::crc32c_matches_the_standard_check_value`
 - `segment_log::tests::dropping_a_prefix_keeps_the_rest_replayable`
 - `segment_log::tests::intact_records_after_a_torn_one_never_come_back`
+- `segment_log::tests::records_past_a_zeroed_first_record_never_come_back`
 - `segment_log::tests::reserved_kinds_and_oversized_payloads_are_refused_unwritten`
 - `swim::tests::a_changed_routing_address_is_surfaced_even_when_the_state_is_unchanged`
 - `swim::tests::a_dead_member_is_not_revived_by_stale_higher_incarnation_gossip`
