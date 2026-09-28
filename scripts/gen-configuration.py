@@ -213,7 +213,9 @@ def render(env_vars: list[str], toml_keys: dict[str, str], docs: dict[str, str])
         "configs are written, without their secrets. `mqttd --check-config --preflight` "
         "adds the host: every `*_bind` resolved, every referenced file (TLS cert/key/CA/CRL, "
         "password, ACL, JWT secret, cluster TLS, gossip key) opened and parsed as the user "
-        "running it — so run it as the broker's service account. Neither can say whether a "
+        "running it, and SWIM's gossip prerequisites (rotation keys, signing, anti-replay's "
+        "key/signing/data dir) checked — so run it as the broker's service account. Neither "
+        "can say whether a "
         "port is free or an OIDC issuer is reachable.",
         "",
         "The annotated template is [`mqttd.example.toml`](mqttd.example.toml). "

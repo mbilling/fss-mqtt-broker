@@ -605,6 +605,16 @@ fn gossip_prerequisites_are_made_by_the_preflight() {
         &unsigned,
         "requires cluster.swim.signed=require",
     );
+    // Anti-replay over a keyed, SIGNED mesh (real cluster-bus PKI, so signing defaults on)
+    // but with no data dir for the persisted sequence counter — the last prerequisite.
+    let (ca, cert, tls_key) = mint_pki(dir.path());
+    let signed = format!(
+        "{BASE}[cluster]\npeer_bind = \"127.0.0.1:7001\"\n\
+         [cluster.peer_tls]\nca = \"{ca}\"\ncert = \"{cert}\"\nkey = \"{tls_key}\"\n\
+         [cluster.swim]\nbind = \"127.0.0.1:7946\"\nkey = \"{key}\"\nreplay = \"require\"\n"
+    );
+    assert_passes(Gate::Static, dir.path(), &signed);
+    assert_refused(Gate::Preflight, dir.path(), &signed, "requires a data dir");
     // Rotation keys with no primary key.
     let rotation = format!("{swim}key_accept = [\"{key}\"]\n");
     assert_refused(
