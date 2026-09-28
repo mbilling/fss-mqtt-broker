@@ -86,6 +86,7 @@
 | [0076](../adr/0076-self-measuring-sharded-store.md) | # 0076. The self-measuring sharded store — the volume's capacity becomes the broker's business | Accepted | [3/3 done](0076-self-measuring-sharded-store.md) | — |
 | [0077](../adr/0077-workload-targeted-performance.md) | # 0077. Workload-targeted performance — a shape is not a result without its tail | Proposed | [6/10 done](0077-workload-targeted-performance.md) | 4 open |
 | [0078](../adr/0078-replica-segment-log.md) | # 0078. The replica store becomes an append-only segment log — the disk is the limit, not the B-tree | Accepted | [3/4 done](0078-replica-segment-log.md) | 1 open |
+| [0079](../adr/0079-global-allocator.md) | # 0079. mqttd links mimalloc as its global allocator | Accepted | [0/2 done](0079-global-allocator.md) | 2 open |
 
 ## Open and deferred work
 
@@ -208,3 +209,8 @@
 **0078 — # 0078. The replica store becomes an append-only segment log — the disk is the limit, not the B-tree**
 
 - `0078-T4` ⬜ planned ([#662](https://github.com/mbilling/fss-mqtt-broker/issues/662)): "Evidence and the default flip — the calibration reads DISK-BOUND" — "Paid calibration re-run with MQTTD_REPLICA_STORE=log; the flip needs every criterion in ADR 0078 §6."
+
+**0079 — # 0079. mqttd links mimalloc as its global allocator**
+
+- `0079-T1` 🚧 in-progress ([#683](https://github.com/mbilling/fss-mqtt-broker/issues/683)): "mimalloc as mqttd's #[global_allocator]; the release build and cargo deny still pass"
+- `0079-T2` ⬜ planned ([#684](https://github.com/mbilling/fss-mqtt-broker/issues/684)): "Evidence — per-op commit cost and RSS on the shipped binary, on the calibration shape" — "Measured in the same paid run as ADR 0078 T4: the durable writer's ms/op against the musl-allocator run of 2026-09-28 (~0.024 ms/op), plus idle and post-burst RSS."

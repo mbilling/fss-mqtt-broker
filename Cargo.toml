@@ -49,6 +49,10 @@ missing_errors_doc = "allow"
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
 # async runtime
 tokio = { version = "1", features = ["full"] }
+# the broker binary's global allocator (ADR 0079): musl's malloc serializes
+# under the tokio workers' concurrent allocation. Default features only — Rust
+# allocations only, the C `malloc` (aws-lc) is left alone.
+mimalloc = "0.1"
 # error handling
 thiserror = "2"
 # bytes for zero-copy wire buffers
