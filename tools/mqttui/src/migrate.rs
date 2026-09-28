@@ -894,10 +894,11 @@ const PSK_KEYS: [&str; 2] = ["psk_file", "psk_hint"];
 
 /// Whether `address` is a `host:port` mqttd can bind, and if not, WHY.
 ///
-/// Every `*_bind` used to be emitted LIVE with no such check, and `mqttd --check-config` — the
-/// verification the generated header, `--help` and the docs all point at — accepts any string
-/// there, so the prescribed gate said `config OK` on addresses the broker then refuses at
-/// STARTUP. A Mosquitto UNIX-SOCKET listener (`listener 0 /tmp/mosq.sock`) also declares no TCP
+/// Every `*_bind` used to be emitted LIVE with no such check, and until issue #671
+/// `mqttd --check-config` — the verification the generated header, `--help` and the docs all
+/// point at — accepted any string there, so the prescribed gate said `config OK` on addresses
+/// the broker then refuses at STARTUP. The gate now rejects an address it cannot parse or
+/// resolve. A Mosquitto UNIX-SOCKET listener (`listener 0 /tmp/mosq.sock`) also declares no TCP
 /// endpoint at all, so a bind derived from it is a transport fabrication the provenance gate
 /// cannot see. Found 2026-08-15.
 fn bind_gap(address: &str) -> Option<String> {
@@ -939,7 +940,7 @@ fn bind_gap(address: &str) -> Option<String> {
     {
         return Some(format!(
             "`{port}` is not a TCP port number (1-65535), so `{address}` is not an address \
-             mqttd can bind — it passes --check-config and then fails at startup"
+             this converter will emit as a live bind"
         ));
     }
     if !host
@@ -1938,13 +1939,13 @@ pub fn render_acl(rules: &[Rule], todos: &[String], default: &str) -> String {
 
 /// A derived address the BROKER cannot bind, as an INERT candidate naming why.
 ///
-/// `mqttd --check-config` accepts any string in a `*_bind` and the broker then refuses to start,
-/// so the verification the docs point the operator at covered nothing here. See [`bind_gap`].
+/// Until issue #671, `--check-config` accepted any string in a `*_bind` and the broker
+/// then refused to start. The gate now rejects an address it cannot parse or resolve.
+/// See [`bind_gap`].
 fn defer_unbindable(conv: &mut Conversion, key: &str, first: usize, addr: &str, why: &str) {
     let decide = format!(
         "{} gives [listeners] {key} as '{addr}', and that is not an address mqttd can bind: \
-         {why}. `mqttd --check-config` ACCEPTS any string here and the broker then fails at \
-         STARTUP, so the line is emitted COMMENTED OUT rather than live: set an address the \
+         {why}. The line is emitted COMMENTED OUT rather than live: set an address the \
          broker can bind and uncomment it",
         conv.listeners[first].where_()
     );
@@ -2058,9 +2059,9 @@ pub fn render_listeners(conv: &mut Conversion) {
         // otherwise a `certfile` written before the first `listener` line would leave the
         // bind commented out while a real, addressed listener of the same transport was
         // demoted to "additional". `sort_by_key` is stable, so ties keep document order.
-        // An address mqttd cannot BIND is no better than one nobody derived: --check-config
-        // accepts any string here and the broker then refuses to start, so the shape is checked
-        // before the line goes out live.
+        // An address mqttd cannot BIND is no better than one nobody derived. Until issue #671
+        // --check-config accepted any string here; it now rejects one it cannot parse or
+        // resolve. The shape is still checked before the line goes out live.
         group.sort_by_key(|i| {
             let lst = &conv.listeners[*i];
             lst.address().is_none_or(|addr| bind_gap(&addr).is_some())

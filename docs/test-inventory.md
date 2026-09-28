@@ -1503,15 +1503,19 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `a_v311_qos2_publisher_is_closed_without_a_pubrec_by_a_real_browned_out_broker`
 - `a_v5_publisher_is_told_0x97_when_brownout_refuses_the_durable_enqueue`
 
-## `crates/mqttd/tests/check_config.rs` — 8 test(s)
+## `crates/mqttd/tests/check_config.rs` — 12 test(s)
 
 - `a_bad_env_value_fails_check_config`
 - `a_config_flag_without_a_value_is_a_usage_error_exit_2`
 - `a_valid_file_validates_and_reports_the_path`
 - `an_unknown_key_fails_with_a_located_error_and_exit_1`
 - `bare_defaults_are_refused_naming_both_remedies`
+- `check_config_accepts_a_resolvable_bind_address`
 - `check_config_rejects_a_min_replicas_floor_above_the_replication_factor`
 - `check_config_rejects_a_watermark_poll_outside_its_range`
+- `check_config_rejects_an_unparseable_bind_address`
+- `check_config_rejects_an_unreadable_or_unparsed_password_file`
+- `check_config_rejects_missing_or_unparsed_tls_material`
 - `each_posture_validates_under_check_config`
 
 ## `crates/mqttd/tests/cluster.rs` — 6 test(s)

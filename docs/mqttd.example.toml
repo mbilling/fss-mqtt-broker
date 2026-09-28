@@ -1,7 +1,9 @@
 # mqttd example configuration (ADR 0046)
 #
 # Load with:  mqttd --config /etc/mqttd/mqttd.toml   (or set MQTTD_CONFIG=<path>)
-# Validate:   mqttd --check-config --config /etc/mqttd/mqttd.toml   (binds nothing)
+# Validate:   mqttd --check-config --config /etc/mqttd/mqttd.toml
+#             Resolves bind addresses and opens referenced password, ACL, and TLS
+#             files. Binds no socket. Does not probe that a backup directory is writable.
 #
 # Precedence (least to most specific):  defaults < this file < MQTTD_* env vars < CLI flags.
 # Every setting here has a matching `MQTTD_*` environment variable (see the README) — the two

@@ -53,7 +53,7 @@ done
 ok "the converted config, ACL and bridge config all parse as TOML"
 
 # ── 3. THE assertion ADR 0051 §3 demands: the config passes --check-config ────────────
-"$MQTTD_BIN" --check-config --config "$WORK/mqttd.toml" >/dev/null 2>"$WORK/check.err" \
+python3 scripts/migrate/check_config_fixture.py "$MQTTD_BIN" "$WORK/mqttd.toml" >/dev/null 2>"$WORK/check.err" \
   || { echo "  FAIL — the broker REJECTED the converted config:";
        sed 's/^/         /' "$WORK/check.err"; exit 1; }
 ok "the converted config passes 'mqttd --check-config'"
@@ -156,7 +156,7 @@ python3 "$CONV" "$FIX/emqx-adversarial.conf" \
   --acl-file "$FIX/emqx-acl-6.2.2.conf" \
   --out-config "$WORK/adv.toml" --out-acl "$WORK/adv-acl.toml" >/dev/null 2>&1 \
   || fail "the converter failed on the adversarial fixture"
-"$MQTTD_BIN" --check-config --config "$WORK/adv.toml" >/dev/null 2>&1 \
+python3 scripts/migrate/check_config_fixture.py "$MQTTD_BIN" "$WORK/adv.toml" >/dev/null 2>&1 \
   || fail "the adversarial fixture's converted config does not pass --check-config"
 todo 'REGULAR EXPRESSION'    "$WORK/adv-acl.toml"   # {re, ...} username
 # The instruction handed to the operator must be TRUE: mqtt-auth's glob_match implements
@@ -193,7 +193,7 @@ python3 "$CONV" "$FIX/emqx-6.2.2-vendor-verbatim.conf" \
   --out-config "$WORK/vendor.toml" --out-acl "$WORK/vendor-acl.toml" \
   --out-bridge "$WORK/vendor-bridge.toml" >/dev/null 2>&1 \
   || fail "the converter failed on the VERBATIM vendor config"
-"$MQTTD_BIN" --check-config --config "$WORK/vendor.toml" >/dev/null 2>"$WORK/vendor.err" \
+python3 scripts/migrate/check_config_fixture.py "$MQTTD_BIN" "$WORK/vendor.toml" >/dev/null 2>"$WORK/vendor.err" \
   || { echo "  FAIL — the broker REJECTED the config built from the VERBATIM vendor file:";
        sed 's/^/         /' "$WORK/vendor.err"; exit 1; }
 # The stock file sets cacertfile on all three TLS listeners with verify = verify_none and
@@ -253,7 +253,7 @@ import sys, tomllib
 tomllib.load(open(sys.argv[1], "rb"))
 PYEOF
 done
-"$MQTTD_BIN" --check-config --config "$WORK/hostile.toml" >/dev/null 2>"$WORK/hostile.err" \
+python3 scripts/migrate/check_config_fixture.py "$MQTTD_BIN" "$WORK/hostile.toml" >/dev/null 2>"$WORK/hostile.err" \
   || { echo "  FAIL — the broker REJECTED the config built from hostile strings:";
        sed 's/^/         /' "$WORK/hostile.err"; exit 1; }
 # The escaped forms, exactly: a doubled backslash in a Windows path and in an identity,
@@ -298,7 +298,7 @@ python3 "$CONV" "$FIX/emqx-silent-drops.conf" \
   --out-config "$WORK/drops.toml" --out-acl "$WORK/drops-acl.toml" \
   --out-bridge "$WORK/drops-bridge.toml" >/dev/null 2>&1 \
   || fail "the converter failed on the silent-drops fixture"
-"$MQTTD_BIN" --check-config --config "$WORK/drops.toml" >/dev/null 2>&1 \
+python3 scripts/migrate/check_config_fixture.py "$MQTTD_BIN" "$WORK/drops.toml" >/dev/null 2>&1 \
   || fail "the silent-drops fixture's converted config does not pass --check-config"
 # (a) the SECOND TLS listener's settings, each named with its listener. Both listeners
 #     share identical cert material on purpose, which is what used to suppress every
@@ -374,7 +374,7 @@ python3 "$CONV" "$WORK/empty.conf" --out-config "$WORK/empty.toml" >/dev/null 2>
   || fail "an EMPTY config crashed the converter"
 grep -q 'TODO(migrate).*parsed to NOTHING' "$WORK/empty.toml" \
   || fail "an empty config was converted silently instead of reporting it"
-"$MQTTD_BIN" --check-config --config "$WORK/empty.toml" >/dev/null 2>&1 \
+python3 scripts/migrate/check_config_fixture.py "$MQTTD_BIN" "$WORK/empty.toml" >/dev/null 2>&1 \
   || fail "the empty-input config does not pass --check-config"
 if python3 "$CONV" "$WORK/does-not-exist.conf" >/dev/null 2>&1; then
   fail "an unreadable input should exit 1, not 0"
@@ -497,8 +497,8 @@ ok "a mapped claim is not also reported as unmappable, and an unmapped one is st
 
 # ── 11e. a bind mqttd cannot bind is not a bind ─────────────────────────────────────────
 #
-# `--check-config` accepts ANY string in a bind, so the verification the docs point at verified
-# nothing here: `:8085` (host omitted, which EMQX's own ip_port accepts) failed at STARTUP, and
+# Until issue #671, `--check-config` accepted ANY string in a bind. It now rejects an address
+# it cannot parse or resolve. `:8085` (host omitted, which EMQX's own ip_port accepts) failed at STARTUP, and
 # a non-scalar `bind` was `str()`-ed into the Python repr `"['0.0.0.0:1883']"` — a live value
 # that appears NOWHERE in the input, which the provenance invariant missed because for a
 # `*_bind` it compares only the port.
@@ -515,7 +515,7 @@ grep -qF 'not a single address but a list' "$WORK/binds.toml" \
   || fail "a non-scalar bind was reshaped instead of refused"
 grep -qF 'names NO host' "$WORK/binds.toml" \
   || fail "a host-less bind was not reported as unbindable"
-"$MQTTD_BIN" --check-config --config "$WORK/binds.toml" >/dev/null 2>&1 \
+python3 scripts/migrate/check_config_fixture.py "$MQTTD_BIN" "$WORK/binds.toml" >/dev/null 2>&1 \
   || fail "the broker rejected the config built from unbindable listener addresses"
 ok "an unbindable address comes out inert, and the reason names the input value"
 

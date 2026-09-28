@@ -413,6 +413,7 @@ source path, the instant, the file names, the set digest, and — if the restore
 
 ---
 
-Still stuck? `mqttd --check-config` validates the effective configuration without binding
-anything, and the [OPERATIONS.md](OPERATIONS.md) runbook covers day-2 procedures (cert and
-gossip-key rotation, decommissioning, split-brain checks).
+Still stuck? `mqttd --check-config` validates the effective configuration — schema, bind
+addresses, and referenced password, ACL, and TLS files — without binding anything, and the
+[OPERATIONS.md](OPERATIONS.md) runbook covers day-2 procedures (cert and gossip-key rotation,
+decommissioning, split-brain checks).

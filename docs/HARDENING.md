@@ -20,7 +20,9 @@ cost of an attacker who has already breached something.
 
 Config knobs are given in env form; each has a TOML equivalent (see
 [`mqttd.example.toml`](mqttd.example.toml)). `mqttd --check-config` validates a
-configuration before any port binds and is the pre-rollout gate for all of it.
+configuration — schema, bind addresses, and referenced password, ACL, and TLS
+files — before any port binds and is the pre-rollout gate. It does not probe
+that a backup directory is writable.
 
 ---
 

@@ -125,3 +125,12 @@ Order: T1 → T2 → T3/T4 (parallel) → T5.
   [`docs/mqttd.example.toml`](../mqttd.example.toml) that `--check-config` validates clean; the Dockerfile
   documents file + env + secret-by-path. All five tasks are done — file-based config is shipped end to
   end (schema → layering → check → hot reload → secrets/docs), so the ADR moves to **Accepted**.
+- **2026-09-28** — **`--check-config` widened (issue #671).** The T3 gate reported `config OK` for
+  a bind string that is not a socket address and for a referenced password, ACL, or TLS file the
+  process cannot open or parse. `check_config_inner` now resolves listener, peer, and gossip binds
+  (QUIC is parse-only, matching startup) and opens those files with the same loaders reload
+  already uses, still without binding a socket. `tests/check_config.rs` covers an unparseable bind,
+  a resolvable bind, an unreadable or malformed password file, and missing or unparsed TLS material.
+  Migration CI that runs the gate on generated configs with absent operator paths uses
+  `scripts/migrate/check_config_fixture.py` stand-ins for paths the config already sets. The gate
+  still does not probe `[backup] dir` writability (ADR 0062). ADR 0046 amended; no task status change.

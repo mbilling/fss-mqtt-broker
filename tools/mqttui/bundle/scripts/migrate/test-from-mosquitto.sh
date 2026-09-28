@@ -60,7 +60,7 @@ echo "  ok   — converted config parses as TOML"
 # wrong type, an unknown key or a bad enum value all parse fine and then fail the load).
 # The broker below is booted from env vars and the converted ACL only, so nothing else
 # here puts the converted CONFIG in front of the real binary.
-"$MQTTD_BIN" --check-config --config "$WORK/mqttd.toml" >/dev/null 2>"$WORK/check.err" \
+python3 scripts/migrate/check_config_fixture.py "$MQTTD_BIN" "$WORK/mqttd.toml" >/dev/null 2>"$WORK/check.err" \
   || { echo "  FAIL — the broker REJECTED the converted config:";
        sed 's/^/         /' "$WORK/check.err"; exit 1; }
 echo "  ok   — the converted config passes 'mqttd --check-config'"
@@ -99,7 +99,7 @@ import sys, tomllib
 tomllib.load(open(sys.argv[1], "rb"))
 PYEOF
 done
-"$MQTTD_BIN" --check-config --config "$WORK/hostile.toml" >/dev/null 2>"$WORK/hostile.err" \
+python3 scripts/migrate/check_config_fixture.py "$MQTTD_BIN" "$WORK/hostile.toml" >/dev/null 2>"$WORK/hostile.err" \
   || { echo "  FAIL — the broker REJECTED the config built from hostile strings:";
        sed 's/^/         /' "$WORK/hostile.err"; exit 1; }
 grep -q 'cert = "C:\\\\certs\\\\server.crt"' "$WORK/hostile.toml" \
@@ -166,7 +166,7 @@ CONF
 sed -i.bak "s|FLEETACL|$WORK/aclfile|" "$WORK/fleet.conf"
 python3 scripts/migrate/from-mosquitto.py "$WORK/fleet.conf" \
   --out-config "$WORK/fleet.toml" --out-acl "$WORK/fleet-acl.toml" >/dev/null
-"$MQTTD_BIN" --check-config --config "$WORK/fleet.toml" >/dev/null 2>"$WORK/fleet.err" \
+python3 scripts/migrate/check_config_fixture.py "$MQTTD_BIN" "$WORK/fleet.toml" >/dev/null 2>"$WORK/fleet.err" \
   || { echo "  FAIL — the broker REJECTED the fleet-shaped config:";
        sed 's/^/         /' "$WORK/fleet.err"; exit 1; }
 for needle in \
@@ -210,7 +210,7 @@ psk_hint pskid
 tls_version tlsv1.2
 CONF
 python3 scripts/migrate/from-mosquitto.py "$WORK/psk.conf" --out-config "$WORK/psk.toml" >/dev/null
-"$MQTTD_BIN" --check-config --config "$WORK/psk.toml" >/dev/null 2>&1 \
+python3 scripts/migrate/check_config_fixture.py "$MQTTD_BIN" "$WORK/psk.toml" >/dev/null 2>&1 \
   || { echo "  FAIL — the broker REJECTED the config built from a PSK listener"; exit 1; }
 if grep -qE '^(plaintext|ws)_bind = ' "$WORK/psk.toml"; then
   echo "  FAIL — a TLS-PSK listener became a LIVE PLAINTEXT bind (an encrypted transport downgraded to cleartext)"; exit 1
@@ -224,9 +224,9 @@ done
 echo "  ok   — a TLS-PSK listener is inert and named, never a plaintext bind"
 
 # ── an address the BROKER cannot bind ──────────────────────────────────────────────────
-# `mqttd --check-config` accepts ANY string in a bind (resolution happens at bind time), so the
-# verification this converter's header, --help and docs point the operator at verified NOTHING
-# about the one value the whole provenance restructuring is about. `listener 0 /tmp/mosq.sock`
+# Until issue #671, `mqttd --check-config` accepted ANY string in a bind (resolution happened
+# at bind time). It now rejects an address it cannot parse or resolve, and this converter
+# still refuses to emit one live. `listener 0 /tmp/mosq.sock`
 # (mosquitto.conf(5): "the port must be set to 0, and the unix socket path must be given")
 # declares no TCP endpoint at all, and produced a live `plaintext_bind = "/tmp/mosq.sock:0"`.
 printf 'persistence_location /v\nlistener 0 /tmp/mosq.sock\n' > "$WORK/sock.conf"
@@ -389,7 +389,7 @@ ciphers ECDHE-RSA-AES128-GCM-SHA256
 dhparamfile /etc/mosq/dh.pem
 CONF
 python3 scripts/migrate/from-mosquitto.py "$WORK/knobs.conf" --out-config "$WORK/knobs.toml" >/dev/null
-"$MQTTD_BIN" --check-config --config "$WORK/knobs.toml" >/dev/null 2>&1 \
+python3 scripts/migrate/check_config_fixture.py "$MQTTD_BIN" "$WORK/knobs.toml" >/dev/null 2>&1 \
   || { echo "  FAIL — the broker REJECTED the config built from a certificate-less TLS-knob listener"; exit 1; }
 grep -q '^plaintext_bind = "0.0.0.0:8883"' "$WORK/knobs.toml" \
   || { echo "  FAIL — the certificate-less listener lost its plaintext bind; it WAS plaintext and the output must say so"; exit 1; }
@@ -461,9 +461,10 @@ printf '%s' "$HELP" | grep -qF 'MEANING it misreads' \
   || { echo "  FAIL — --help does not disclose the semantic-misreading class the gate cannot catch"; exit 1; }
 echo "  ok   — --help claims exactly what this converter has"
 
-# THE assertion: the real broker accepts it. `mqttd --check-config` does NOT read the file
-# [security] acl_file names (verified: a policy with `default = "bogus"` still reports config OK),
-# so BOOTING the broker is the only check that the translated policy loads — and it is run on the
+# THE assertion: the real broker accepts the translated policy. `--check-config` now opens
+# `acl_file` (issue #671); the migration harness points that key at a readable stand-in,
+# because the path in the generated file is the operator's, not a file on this machine.
+# BOOTING the broker is still the check that THIS translated policy loads — and it is run on the
 # anonymous-scoped policy too, because `identities = ["anonymous"]` is a construct this converter
 # only started emitting on 2026-08-15.
 boot_on_acl() {  # $1 = acl file, $2 = what it proves

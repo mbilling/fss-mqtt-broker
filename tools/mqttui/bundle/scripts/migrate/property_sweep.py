@@ -52,13 +52,14 @@ must hold for *every* one of them:
      F and G make the whole fail-open CLASS detectable rather than re-findable — the class
      every serious finding of three review rounds belonged to.
 
-  H. EVERY LIVE BIND IS AN ADDRESS THE BROKER CAN BIND. `mqttd --check-config` accepts ANY
-     string in a `*_bind` and the broker then fails at STARTUP, so E could not see this at
-     all: `ws_bind = ":8085"`, `plaintext_bind = "10.0.0.1:abc"` and
-     `plaintext_bind = "/tmp/mosq.sock:0"` (a Mosquitto UNIX-socket listener, which declares
-     no TCP endpoint at all) each passed every invariant above and then refused to start.
-     H parses the host and the port of every live bind. It is the invariant that makes the
-     documented verification step cover the one value this whole file is about.
+  H. EVERY LIVE BIND IS AN ADDRESS THE BROKER CAN BIND. Until issue #671, `mqttd
+     --check-config` accepted ANY string in a `*_bind` and the broker then failed at
+     STARTUP, so E could not see this at all: `ws_bind = ":8085"`, `plaintext_bind =
+     "10.0.0.1:abc"` and `plaintext_bind = "/tmp/mosq.sock:0"` (a Mosquitto UNIX-socket
+     listener, which declares no TCP endpoint at all). The gate now rejects an address it
+     cannot parse or resolve, and H still refuses to let one out live — it judges the
+     output without a DNS lookup (missing port, empty host, non-numeric port, unix-socket
+     path).
 
 Plus a FUZZ pass (`--fuzz N`): each fixture is mutated mechanically — random lines deleted,
 the file truncated mid-structure, listener blocks permuted, enable flags flipped, transports
@@ -82,12 +83,15 @@ from __future__ import annotations
 import argparse
 import itertools
 import json
+import os
 import random
 import re
 import subprocess
 import sys
 import tempfile
 import tomllib
+
+import check_config_fixture
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -352,13 +356,12 @@ def check_class_f(text: str, label: str, source_text: str) -> tuple[list[str], l
 # ---------------------------------------------------------------------------
 # CLASS H — a live bind the broker cannot actually bind.
 #
-# `mqttd --check-config` accepts any string in a `*_bind` (it is a String in the config
-# struct; resolution happens at bind time), so invariant E — the verification every converter's
-# header, --help and docs/MIGRATION.md point the operator at — verifies NOTHING about the one
-# value the provenance restructuring exists for. An operator who runs the prescribed gate, sees
-# `config OK` and schedules the cutover finds out at the maintenance window. Deliberately
-# written from the OUTPUT alone, with no import from any converter: a check that shares its
-# definition with the thing it checks cannot catch a change to it. Found 2026-08-15.
+# Until issue #671, `mqttd --check-config` accepted any string in a `*_bind` (it was a String
+# in the config struct; resolution happened at bind time), so invariant E verified nothing
+# about the one value the provenance restructuring exists for. The gate now rejects an address
+# it cannot parse or resolve and does not bind the socket. H remains, written from the OUTPUT
+# alone with no import from any converter: a missing port, an empty host, a non-numeric port,
+# or a unix-socket path must still come out commented rather than live. Found 2026-08-15.
 # ---------------------------------------------------------------------------
 
 _HOST_OK = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-_:")
@@ -390,8 +393,8 @@ def check_class_h(text: str, label: str) -> list[str]:
             if why:
                 bad.append(
                     f"{label} emits `{m.group(1)} = {value}` LIVE, and that is NOT an address "
-                    f"mqttd can bind: {why}. `--check-config` accepts it and the broker then "
-                    "fails at STARTUP — an unbindable address must be emitted COMMENTED OUT "
+                    f"mqttd can bind: {why}. `--check-config` rejects an address it cannot "
+                    "parse or resolve — an unbindable address must be emitted COMMENTED OUT "
                     "with a TODO, like any other value the converter could not derive"
                 )
     return bad
@@ -1571,11 +1574,17 @@ def run_case(script: Path, case: Case, mqttd: Path | None, defaulted: list[str])
         if mqttd is not None:
             config = next((o for o in case.outputs if o.endswith("out.toml")), None)
             if config and (work / config).is_file():
+                # Issue #671: the gate opens referenced files. Fixture paths are the
+                # operator's and are not on this machine; stand-ins keep class E
+                # about the generated config (schema, binds), not those paths.
+                env = os.environ.copy()
+                env.update(check_config_fixture.standin_env(work / config))
                 check = subprocess.run(
                     [str(mqttd), "--check-config", "--config", str(work / config)],
                     capture_output=True,
                     text=True,
                     check=False,
+                    env=env,
                 )
                 if check.returncode != 0:
                     problems.append(

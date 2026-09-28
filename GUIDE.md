@@ -1257,7 +1257,10 @@ redacted).
   is caught up front, never silently ignored.
 - **Pre-flight check:** `mqttd --check-config [--config <path>]` validates the config the broker
   would boot with and exits **without binding any port** — the GitOps CI / pre-rollout gate.
-  Exit `0` = OK, `1` = a clear located error.
+  Beyond the schema, it parses or resolves every configured bind (listeners, plus the peer and
+  gossip binds) and opens the password file, ACL file, and `[tls]` cert, key, client CA, and
+  CRL when those paths are set (issue #671). It does not probe that a backup directory is
+  writable. Exit `0` = OK, `1` = a clear located error.
 - **Password hashing:** `mqttd --hash-password [<username>]` reads a password from **stdin** and
   prints the Argon2id line `MQTTD_PASSWORD_FILE` expects — with a username, the whole
   `username:hash` line; without one, the bare hash. The password goes on stdin, never in argv,

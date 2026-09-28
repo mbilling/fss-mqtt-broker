@@ -46,7 +46,7 @@ done
 ok "the converted config and ACL both parse as TOML"
 
 # ── 3. THE assertion ADR 0051 §3 demands: the config passes --check-config ────────────
-"$MQTTD_BIN" --check-config --config "$WORK/mqttd.toml" >/dev/null 2>"$WORK/check.err" \
+python3 scripts/migrate/check_config_fixture.py "$MQTTD_BIN" "$WORK/mqttd.toml" >/dev/null 2>"$WORK/check.err" \
   || { echo "  FAIL — the broker REJECTED the converted config:";
        sed 's/^/         /' "$WORK/check.err"; exit 1; }
 ok "the converted config passes 'mqttd --check-config'"
@@ -116,7 +116,7 @@ ok "no keystore password or password hash reached the output; both users get a r
 # ── 8. adversarial config: unknown elements, Enterprise constructs, posture traps ─────
 python3 "$CONV" "$FIX/hivemq-adversarial.xml" --out-config "$WORK/adv.toml" >/dev/null 2>&1 \
   || fail "the converter failed on the adversarial fixture"
-"$MQTTD_BIN" --check-config --config "$WORK/adv.toml" >/dev/null 2>&1 \
+python3 scripts/migrate/check_config_fixture.py "$MQTTD_BIN" "$WORK/adv.toml" >/dev/null 2>&1 \
   || fail "the adversarial fixture's converted config does not pass --check-config"
 todo 'invented-element/some-key'    "$WORK/adv.toml"  # unknown element, reported by PATH
 todo 'mqtt/no-such-thing/deeper'    "$WORK/adv.toml"  # nested unknown element, by PATH
@@ -165,7 +165,7 @@ ok "unknown elements, Enterprise constructs and the cert-optional trap are all r
 # accepts those clients with none.
 python3 "$CONV" "$FIX/hivemq-multi-tls.xml" --out-config "$WORK/multi.toml" >/dev/null 2>&1 \
   || fail "the converter failed on the multi-TLS fixture"
-"$MQTTD_BIN" --check-config --config "$WORK/multi.toml" >/dev/null 2>&1 \
+python3 scripts/migrate/check_config_fixture.py "$MQTTD_BIN" "$WORK/multi.toml" >/dev/null 2>&1 \
   || fail "the multi-TLS fixture's converted config does not pass --check-config"
 todo 'TLS listeners DISAGREE about client certificates' "$WORK/multi.toml"
 grep -q 'REQUIRED on tls-tcp-listener on 0.0.0.0:8883' "$WORK/multi.toml" \
@@ -201,7 +201,7 @@ import sys, tomllib
 tomllib.load(open(sys.argv[1], "rb"))
 PYEOF
 done
-"$MQTTD_BIN" --check-config --config "$WORK/hostile.toml" >/dev/null 2>&1 \
+python3 scripts/migrate/check_config_fixture.py "$MQTTD_BIN" "$WORK/hostile.toml" >/dev/null 2>&1 \
   || fail "the config built beside the hostile credentials does not pass --check-config"
 grep -q 'identities = \["CORP\\\\jdoe"\]' "$WORK/hostile-acl.toml" \
   || fail "the domain-qualified username was not TOML-escaped in identities"
@@ -268,7 +268,7 @@ cat > "$WORK/req-no-ts.xml" <<'XML'
 XML
 python3 "$CONV" "$WORK/req-no-ts.xml" --out-config "$WORK/reqnots.toml" >/dev/null 2>&1 \
   || fail "the converter failed on REQUIRED mTLS with no truststore"
-"$MQTTD_BIN" --check-config --config "$WORK/reqnots.toml" >/dev/null 2>&1 \
+python3 scripts/migrate/check_config_fixture.py "$MQTTD_BIN" "$WORK/reqnots.toml" >/dev/null 2>&1 \
   || fail "the REQUIRED-without-truststore config does not pass --check-config"
 grep -q 'client_ca = "/etc/mqttd/tls/client-ca.crt"' "$WORK/reqnots.toml" \
   || fail "a unanimous REQUIRED posture did not map to client_ca"
@@ -324,7 +324,7 @@ ok "a policy-less and an unreadable credentials file both report the gap in both
 python3 "$CONV" "$FIX/hivemq-2026.5-default-config.xml" \
   --out-config "$WORK/vdefault.toml" >/dev/null 2>&1 \
   || fail "the converter failed on the VERBATIM vendor default config.xml"
-"$MQTTD_BIN" --check-config --config "$WORK/vdefault.toml" >/dev/null 2>"$WORK/vdefault.err" \
+python3 scripts/migrate/check_config_fixture.py "$MQTTD_BIN" "$WORK/vdefault.toml" >/dev/null 2>"$WORK/vdefault.err" \
   || { echo "  FAIL — the broker REJECTED the VERBATIM vendor default config.xml's output:";
        sed 's/^/         /' "$WORK/vdefault.err"; exit 1; }
 todo 'every client was ANONYMOUS' "$WORK/vdefault.toml"
@@ -346,7 +346,7 @@ grep -qE '^\[tls\]' "$WORK/vdefault.toml" \
 python3 "$CONV" "$FIX/hivemq-2026.5-tls-client-auth.xml" \
   --out-config "$WORK/vtls.toml" >/dev/null 2>&1 \
   || fail "the converter failed on the VERBATIM vendor mTLS example"
-"$MQTTD_BIN" --check-config --config "$WORK/vtls.toml" >/dev/null 2>"$WORK/vtls.err" \
+python3 scripts/migrate/check_config_fixture.py "$MQTTD_BIN" "$WORK/vtls.toml" >/dev/null 2>"$WORK/vtls.err" \
   || { echo "  FAIL — the broker REJECTED the VERBATIM vendor mTLS example's output:";
        sed 's/^/         /' "$WORK/vtls.err"; exit 1; }
 grep -qE '^client_ca' "$WORK/vtls.toml" \
@@ -365,7 +365,7 @@ printf '<hivemq></hivemq>\n' > "$WORK/empty.xml"
 python3 "$CONV" "$WORK/empty.xml" --out-config "$WORK/empty.toml" >/dev/null 2>&1 \
   || fail "an EMPTY <hivemq> document crashed the converter"
 todo 'NO listener was found' "$WORK/empty.toml"
-"$MQTTD_BIN" --check-config --config "$WORK/empty.toml" >/dev/null 2>&1 \
+python3 scripts/migrate/check_config_fixture.py "$MQTTD_BIN" "$WORK/empty.toml" >/dev/null 2>&1 \
   || fail "the empty-document config does not pass --check-config"
 printf '<hivemq><listeners><tcp-listener><port>1883\n' > "$WORK/broken.xml"
 python3 "$CONV" "$WORK/broken.xml" --out-config "$WORK/broken.toml" >/dev/null 2>&1 \
@@ -425,9 +425,9 @@ boot_on_acl "$WORK/hostile-acl.toml" \
   "the ACL holding a backslash identity and a quoted topic filter"
 # ── a bind mqttd cannot bind, and an identity it cannot express ─────────────────────────
 #
-# `mqttd --check-config` accepts ANY string in a bind (resolution happens at bind time), so the
-# verification this converter's header, --help and docs/MIGRATION.md point the operator at
-# verified NOTHING about the one value the provenance restructuring is about: `<port>abc</port>`
+# Until issue #671, `mqttd --check-config` accepted ANY string in a bind. It now rejects an
+# address it cannot parse or resolve, and this converter still refuses to emit one live.
+# `<port>abc</port>`
 # produced a live `plaintext_bind = "10.0.0.1:abc"`, `config OK`, and then `invalid port value`
 # at startup — at the maintenance window. And a file-RBAC `<name>` containing a literal `*`
 # became an mqttd identity GLOB, which has no escape (crates/mqtt-auth/src/acl.rs), so the rule
@@ -456,7 +456,7 @@ if grep -q 'identities = \["alice\*bob"\]' "$WORK/star-acl.toml"; then
 fi
 grep -qF 'alice*bob' "$WORK/star-acl.toml" \
   || fail "the refused user name is not named anywhere in the ACL"
-"$MQTTD_BIN" --check-config --config "$WORK/badport.toml" >/dev/null 2>&1 \
+python3 scripts/migrate/check_config_fixture.py "$MQTTD_BIN" "$WORK/badport.toml" >/dev/null 2>&1 \
   || fail "the broker rejected the config built from an unbindable listener port"
 ok "an unbindable port and a glob-metacharacter user name are both refused and named"
 

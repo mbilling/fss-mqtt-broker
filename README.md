@@ -493,7 +493,7 @@ acl_file = "/etc/mqttd/acl.toml"             # deny by default
 ```
 
 ```sh
-mqttd --check-config --config mqttd.toml    # validate, binds nothing
+mqttd --check-config --config mqttd.toml    # schema, binds, referenced files; binds nothing
 kill -HUP "$(pidof mqttd)"                  # reload policy, TLS, quotas
 ```
 

@@ -115,3 +115,26 @@ and other raw secrets may also stay env-only, keeping them out of any file at al
 - **Absorbing ACL/auth policy into one mega-config:** simpler to explain, but couples the
   security policy's independent reload/review lifecycle to the broker's; keeping them
   separate files (referenced by path) is the safer factoring. Rejected.
+
+## Amendment (2026-09-28): `--check-config` catches unbootable binds and unreadable files (issue #671)
+
+Section 3's gate originally loaded the schema (`Config::load`) and the write-floor check, then
+exited. That reported `config OK` for two classes of file that then failed at startup: a bind
+string that is not a socket address (`tls_bind = "not-an-address"`, and the same for the other
+`*_bind` fields), and a referenced file the process cannot open or parse (`password_file` mode
+`0600` owned by another user, a missing TLS cert, a malformed ACL).
+
+The gate now fails those before any socket is bound, with exit 1 and a located error:
+
+- Every configured listener bind (`tls`, `plaintext`, `ws`, `wss`, `quic`, `health`, `metrics`)
+  and the peer and gossip binds, when set, are parsed or resolved the way startup binds them.
+  TCP and SWIM use `ToSocketAddrs` (an IP socket address, or a hostname that resolves). QUIC
+  parses with `SocketAddr` and refuses a hostname, matching `start_client_listeners`. Nothing
+  is bound. Port `0` remains a valid address; the gate does not reserve the port.
+- `password_file`, `acl_file`, and `[tls]` `cert` / `key` / `client_ca` / `crl`, when set, are
+  opened and parsed with the same loaders the validate-before-swap reload and the TLS acceptor
+  already use. A path the process cannot read fails here, under the same uid the check runs as.
+
+The gate still does not probe that `[backup] dir` is writable (ADR 0062). It does not open the
+JWT or gossip-key files, and it does not require a TLS certificate merely because `tls_bind` is
+set — startup still refuses that combination when it builds the listener.

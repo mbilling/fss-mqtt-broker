@@ -1042,11 +1042,12 @@ class Conversion:
 def bind_gap(address: str) -> str | None:
     """None when `address` is a `host:port` mqttd can bind; otherwise WHY it cannot.
 
-    Every `*_bind` used to be emitted LIVE with no check that the broker can bind it, and
-    `mqttd --check-config` — the verification this converter's own header, its `--help` and
-    docs/MIGRATION.md all point the operator at — accepts ANY string there. So the prescribed
-    gate said `config OK` on addresses the broker then refuses at STARTUP ("failed to lookup
-    address information"), which is the one value the whole provenance restructuring is about.
+    Every `*_bind` used to be emitted LIVE with no check that the broker can bind it.
+    Until issue #671, `mqttd --check-config` — the verification this converter's own header,
+    its `--help` and docs/MIGRATION.md all point the operator at — accepted ANY string there.
+    So the prescribed gate said `config OK` on addresses the broker then refuses at STARTUP
+    ("failed to lookup address information"), which is the one value the whole provenance
+    restructuring is about. The gate now rejects an address it cannot parse or resolve.
     The same check lives in from-mosquitto.py and from-hivemq.py — each converter is ONE
     self-contained stdlib-only file, as the TOML-escape helpers already are. Found 2026-08-15.
     """
@@ -1075,7 +1076,7 @@ def bind_gap(address: str) -> str | None:
     if not port.isdigit() or not 1 <= int(port) <= 65535:
         return (
             f"`{port}` is not a TCP port number (1-65535), so `{address}` is not an address "
-            "mqttd can bind — it passes --check-config and then fails at startup"
+            "this converter will emit as a live bind"
         )
     if any(
         c not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-_:"
@@ -1132,8 +1133,7 @@ def normalise_bind(value: object) -> tuple[str | None, str | None]:
     gap = bind_gap(v)
     if gap is not None:
         return None, (
-            f"`bind = {v}` is not an address mqttd can bind: {gap}. `mqttd --check-config` "
-            "ACCEPTS any string in a bind and the broker then fails at STARTUP, so it is not "
+            f"`bind = {v}` is not an address mqttd can bind: {gap}. The line is not "
             "emitted live"
         )
     return v, None

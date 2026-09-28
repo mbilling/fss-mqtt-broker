@@ -433,9 +433,10 @@ QOS_LIKE = {"ZERO", "ONE", "TWO", "ZERO_ONE", "ONE_TWO", "ZERO_TWO", "ALL"}
 def bind_gap(address: str) -> str | None:
     """None when `address` is a `host:port` mqttd can bind; otherwise WHY it cannot.
 
-    Every `*_bind` used to be emitted LIVE with no check that the broker can bind it, and
-    `mqttd --check-config` — the verification this converter's own header, its `--help` and
-    docs/MIGRATION.md all point the operator at — accepts ANY string there. A
+    Every `*_bind` used to be emitted LIVE with no check that the broker can bind it.
+    Until issue #671, `mqttd --check-config` — the verification this converter's own header,
+    its `--help` and docs/MIGRATION.md all point the operator at — accepted ANY string there.
+    The gate now rejects an address it cannot parse or resolve. A
     `<port>abc</port>` therefore produced a live `plaintext_bind = "10.0.0.1:abc"`, `config OK`,
     and then `Error { kind: InvalidInput, message: "invalid port value" }` at STARTUP — at the
     maintenance window, on the one value the whole provenance restructuring is about. The same
@@ -467,7 +468,7 @@ def bind_gap(address: str) -> str | None:
     if not port.isdigit() or not 1 <= int(port) <= 65535:
         return (
             f"`{port}` is not a TCP port number (1-65535), so `{address}` is not an address "
-            "mqttd can bind — it passes --check-config and then fails at startup"
+            "this converter will emit as a live bind"
         )
     if any(
         c not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-_:"
@@ -849,8 +850,7 @@ def build_listeners(conv: Conversion) -> list[str]:
                 toml_str(lst.address),
                 None,
                 decide=f"{lst.where} gives [listeners] {key} as {lst.address!r}, and that is "
-                f"not an address mqttd can bind: {unbindable}. `mqttd --check-config` ACCEPTS "
-                "any string here and the broker then fails at STARTUP, so the line is emitted "
+                f"not an address mqttd can bind: {unbindable}. The line is emitted "
                 "COMMENTED OUT rather than live: set an address the broker can bind and "
                 "uncomment it",
             )

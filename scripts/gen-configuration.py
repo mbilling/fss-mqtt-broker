@@ -207,7 +207,8 @@ def render(env_vars: list[str], toml_keys: dict[str, str], docs: dict[str, str])
         "`crates/mqtt-config/src/lib.rs`. Precedence is **defaults < TOML file < "
         "`MQTTD_*` env < CLI flags** (ADR 0046). Point at a file with `--config` or "
         "`MQTTD_CONFIG`; with neither, the config is defaults plus this overlay. "
-        "`mqttd --check-config` validates the effective config and binds nothing.",
+        "`mqttd --check-config` validates the effective config — schema, bind "
+        "addresses, and referenced password, ACL, and TLS files — and binds nothing.",
         "",
         "The annotated template is [`mqttd.example.toml`](mqttd.example.toml). "
         "Capacity arithmetic lives in [SIZING.md](SIZING.md); day-2 procedures in "

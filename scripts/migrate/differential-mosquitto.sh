@@ -94,7 +94,7 @@ mosquitto_passwd    -b "$WORK/mosq-passwd" admin    adminpw >/dev/null 2>&1
 python3 scripts/migrate/from-mosquitto.py "$WORK/mosquitto.conf" \
   --out-config "$WORK/mqttd.toml" --out-acl "$WORK/acl.toml" >/dev/null \
   || fail "the converter refused the source config"
-"$MQTTD_BIN" --check-config --config "$WORK/mqttd.toml" >/dev/null 2>&1 \
+python3 scripts/migrate/check_config_fixture.py "$MQTTD_BIN" "$WORK/mqttd.toml" >/dev/null 2>&1 \
   || fail "the converted config does not pass mqttd --check-config"
 
 # ── finish the draft, exactly as the draft itself instructs ───────────────────────────

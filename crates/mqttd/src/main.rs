@@ -16,8 +16,10 @@
 //! neither, config is defaults + the env overlay (fully backward compatible). Each
 //! `MQTTD_*` variable maps to exactly one config key (see `mqtt_config::ENV_VARS`).
 //! `mqttd --check-config` (ADR 0046 T3) validates the effective config and exits without
-//! binding any port — the GitOps/pre-rollout gate. `SIGHUP` (and the `MQTTD_CONFIG_WATCH`
-//! filesystem watcher) reload the whole config file through the ADR 0032 validate-before-swap
+//! binding any port — the GitOps/pre-rollout gate. It resolves configured bind addresses
+//! and opens the password, ACL, and TLS files startup and reload would load (issue #671).
+//! `SIGHUP` (and the `MQTTD_CONFIG_WATCH` filesystem watcher) reload the whole config file
+//! through the ADR 0032 validate-before-swap
 //! path (ADR 0046 T4): a bad edit is rejected and the running config kept; live-swappable
 //! settings (policy files, `allow_anonymous`, quotas) change without a restart; every other
 //! change is logged + audited as requires-restart.
@@ -3766,7 +3768,7 @@ fn print_usage() {
          USAGE:\n  \
            mqttd                     start the broker (configured by MQTTD_* env / --config)\n  \
            mqttd --config <path>     start with a TOML config file (env still overlays)\n  \
-           mqttd --check-config      validate the effective config and exit (no ports bound)\n  \
+           mqttd --check-config      validate binds and referenced files, then exit (no ports bound)\n  \
            mqttd --hash-password [u] print an Argon2id password-file line and exit\n  \
            mqttd --probe [/readyz]   query the running broker's health endpoint and exit\n  \
            mqttd --decommission      drain and gracefully stop the running broker\n  \
@@ -3787,9 +3789,11 @@ fn print_usage() {
 
 /// Validate the config the broker would boot with (file from `--config` / `MQTTD_CONFIG`,
 /// layered under the `MQTTD_*` env), then exit — **without binding any port or starting the
-/// hub** (ADR 0046 T3). For CI gates and pre-rollout operator checks: `mqttd --check-config`
-/// (optionally with `--config <path>`). Exit `0` + `config OK` on success; exit `1` + a clear,
-/// located error on failure; exit `2` if the invocation itself is malformed.
+/// hub** (ADR 0046 T3). The gate parses or resolves every configured bind and opens the
+/// password, ACL, and TLS files startup and a policy reload would read (issue #671). For CI
+/// gates and pre-rollout operator checks: `mqttd --check-config` (optionally with
+/// `--config <path>`). Exit `0` + `config OK` on success; exit `1` + a clear, located error
+/// on failure; exit `2` if the invocation itself is malformed.
 fn check_config() -> ! {
     match check_config_inner() {
         Ok(Some(path)) => {
@@ -4242,7 +4246,208 @@ fn check_config_inner() -> Result<Option<std::path::PathBuf>, CheckError> {
             error: ConfigError::Invalid(message),
         });
     }
+    // Issue #671: `Config::validate` does not parse bind strings and does not open the
+    // files startup and the validate-before-swap reload already open. A config that
+    // cannot boot must fail here, still without binding a socket.
+    if let Err(message) = check_config_boot_material(&config) {
+        return Err(CheckError::Invalid {
+            path,
+            error: ConfigError::Invalid(message),
+        });
+    }
     Ok(path)
+}
+
+/// Bind addresses and referenced policy/TLS material the broker would need at boot
+/// (issue #671). Parse or resolve only — this function does not bind a socket.
+fn check_config_boot_material(config: &Config) -> Result<(), String> {
+    check_bind_addresses(config)?;
+    check_referenced_material(config)
+}
+
+/// Every configured listener bind, plus the peer and gossip binds startup actually
+/// binds when they are set.
+///
+/// TCP listeners and the SWIM UDP socket go through `ToSocketAddrs` (`TcpListener::bind`
+/// / `UdpSocket::bind`), which parses an IP socket address or resolves a hostname.
+/// QUIC does not: `start_client_listeners` parses `quic_bind` with [`std::net::SocketAddr`]
+/// and refuses a hostname, so a hostname there must fail this gate too.
+fn check_bind_addresses(config: &Config) -> Result<(), String> {
+    let binds = [
+        (
+            "listeners.tls_bind",
+            "MQTTD_TLS_BIND",
+            config.listeners.tls_bind.as_deref(),
+            false,
+        ),
+        (
+            "listeners.plaintext_bind",
+            "MQTTD_PLAINTEXT_BIND",
+            config.listeners.plaintext_bind.as_deref(),
+            false,
+        ),
+        (
+            "listeners.ws_bind",
+            "MQTTD_WS_BIND",
+            config.listeners.ws_bind.as_deref(),
+            false,
+        ),
+        (
+            "listeners.wss_bind",
+            "MQTTD_WSS_BIND",
+            config.listeners.wss_bind.as_deref(),
+            false,
+        ),
+        (
+            "listeners.quic_bind",
+            "MQTTD_QUIC_BIND",
+            config.listeners.quic_bind.as_deref(),
+            true,
+        ),
+        (
+            "listeners.health_bind",
+            "MQTTD_HEALTH_BIND",
+            config.listeners.health_bind.as_deref(),
+            false,
+        ),
+        (
+            "listeners.metrics_bind",
+            "MQTTD_METRICS_BIND",
+            config.listeners.metrics_bind.as_deref(),
+            false,
+        ),
+        (
+            "cluster.peer_bind",
+            "MQTTD_PEER_BIND",
+            config.cluster.peer_bind.as_deref(),
+            false,
+        ),
+        (
+            "cluster.swim.bind",
+            "MQTTD_SWIM_BIND",
+            config.cluster.swim.bind.as_deref(),
+            false,
+        ),
+    ];
+    for (field, var, addr, quic) in binds {
+        if let Some(addr) = addr {
+            check_one_bind(field, var, addr, quic)?;
+        }
+    }
+    Ok(())
+}
+
+/// `quic` selects the QUIC parser (`SocketAddr::parse`). Every other bind is resolved
+/// the way `TcpListener::bind` / `UdpSocket::bind` resolve it, and nothing is bound.
+fn check_one_bind(field: &str, var: &str, addr: &str, quic: bool) -> Result<(), String> {
+    use std::net::ToSocketAddrs;
+    if quic {
+        return addr
+            .parse::<std::net::SocketAddr>()
+            .map(|_| ())
+            .map_err(|e| format!("{field} ({var}) is not a UDP socket address ({addr}): {e}"));
+    }
+    match addr.to_socket_addrs() {
+        Ok(mut addrs) => {
+            if addrs.next().is_some() {
+                Ok(())
+            } else {
+                Err(format!(
+                    "{field} ({var}) {addr:?} did not resolve to a socket address"
+                ))
+            }
+        }
+        Err(e) => Err(format!(
+            "{field} ({var}) {addr:?} is not a socket address: {e}"
+        )),
+    }
+}
+
+/// Open and parse the files a startup or a validate-before-swap reload would read.
+///
+/// Password and ACL use the same loaders as `authenticator_from_config` /
+/// `authorizer_from_config`. TLS cert, key, client CA, and CRL use the same acceptor
+/// builder as `start_client_listeners` and its SIGHUP rebuild when both cert and key
+/// are set; a path set on its own is still opened and parsed.
+fn check_referenced_material(config: &Config) -> Result<(), String> {
+    if let Some(path) = &config.security.password_file {
+        tls_path_readable("MQTTD_PASSWORD_FILE", path)?;
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| format!("cannot read MQTTD_PASSWORD_FILE ({path}): {e}"))?;
+        mqtt_auth::password::PasswordAuthenticator::from_file_contents(&text)
+            .map_err(|e| format!("MQTTD_PASSWORD_FILE ({path}): {e}"))?;
+    }
+    if let Some(path) = &config.security.acl_file {
+        tls_path_readable("MQTTD_ACL_FILE", path)?;
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| format!("cannot read MQTTD_ACL_FILE ({path}): {e}"))?;
+        mqtt_auth::acl::AclPolicy::from_toml_str(&text)
+            .map_err(|e| format!("MQTTD_ACL_FILE ({path}): {e}"))?;
+    }
+    check_tls_material(config)
+}
+
+fn check_tls_material(config: &Config) -> Result<(), String> {
+    let cert = config.tls.cert.as_deref();
+    let key = config.tls.key.as_deref();
+    let client_ca = config.tls.client_ca.as_deref();
+    let crl = config.tls.crl.as_deref();
+    if cert.is_none() && key.is_none() && client_ca.is_none() && crl.is_none() {
+        return Ok(());
+    }
+    // Cert and key together is the acceptor startup and the reload closure build.
+    if let (Some(cert), Some(key)) = (cert, key) {
+        tls_path_readable("MQTTD_TLS_CERT", cert)?;
+        tls_path_readable("MQTTD_TLS_KEY", key)?;
+        if let Some(path) = client_ca {
+            tls_path_readable("MQTTD_TLS_CLIENT_CA", path)?;
+        }
+        if let Some(path) = crl {
+            tls_path_readable("MQTTD_TLS_CRL", path)?;
+        }
+        let session_cache = config
+            .tls
+            .session_cache
+            .unwrap_or(tls::DEFAULT_SESSION_CACHE);
+        let tls12 = match (
+            config.tls.allow_tls12,
+            config.tls.allow_unsafe_tls12_features,
+        ) {
+            (false, _) => tls::Tls12::Off,
+            (true, false) => tls::Tls12::Hardened,
+            (true, true) => tls::Tls12::UnsafeLegacyFeatures,
+        };
+        return tls::server_acceptor_versions(
+            Path::new(cert),
+            Path::new(key),
+            client_ca.map(Path::new),
+            crl.map(Path::new),
+            session_cache,
+            tls12,
+        )
+        .map(|_| ())
+        .map_err(|e| format!("MQTTD_TLS_CERT ({cert}): {e}"));
+    }
+    if let Some(path) = cert {
+        tls_path_readable("MQTTD_TLS_CERT", path)?;
+        tls::first_cert_der(Path::new(path))
+            .map_err(|e| format!("MQTTD_TLS_CERT ({path}): {e}"))?;
+    }
+    if let Some(path) = key {
+        tls_path_readable("MQTTD_TLS_KEY", path)?;
+        tls::private_key_der(Path::new(path))
+            .map_err(|e| format!("MQTTD_TLS_KEY ({path}): {e}"))?;
+    }
+    if let Some(path) = client_ca {
+        tls_path_readable("MQTTD_TLS_CLIENT_CA", path)?;
+        tls::first_cert_der(Path::new(path))
+            .map_err(|e| format!("MQTTD_TLS_CLIENT_CA ({path}): {e}"))?;
+    }
+    if let Some(path) = crl {
+        tls_path_readable("MQTTD_TLS_CRL", path)?;
+        tls::first_crl_der(Path::new(path)).map_err(|e| format!("MQTTD_TLS_CRL ({path}): {e}"))?;
+    }
+    Ok(())
 }
 
 /// The config-file path from `--config <path>` / `--config=<path>` (highest precedence) or the

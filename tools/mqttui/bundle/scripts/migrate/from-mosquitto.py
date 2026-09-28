@@ -622,10 +622,11 @@ BIND_KEYS = {
 def bind_gap(address: str) -> str | None:
     """None when `address` is a `host:port` mqttd can bind; otherwise WHY it cannot.
 
-    Every `*_bind` used to be emitted LIVE with no check that the broker can bind it, and
-    `mqttd --check-config` — the verification this tool's own header, --help and docs point the
-    operator at — accepts any string there, so the prescribed gate said `config OK` on
-    addresses the broker then refuses at STARTUP ("failed to lookup address information"). Two
+    Every `*_bind` used to be emitted LIVE with no check that the broker can bind it.
+    Until issue #671, `mqttd --check-config` — the verification this tool's own header, --help
+    and docs point the operator at — accepted any string there, so the prescribed gate said
+    `config OK` on addresses the broker then refuses at STARTUP ("failed to lookup address
+    information"). The gate now rejects an address it cannot parse or resolve. Two
     of the three reproducers were also fabrications the provenance gate could not see: a
     Mosquitto UNIX-SOCKET listener (`listener 0 /tmp/mosq.sock` — mosquitto.conf(5): "the port
     must be set to 0, and the unix socket path must be given") declares NO TCP endpoint at all,
@@ -659,7 +660,7 @@ def bind_gap(address: str) -> str | None:
     if not port.isdigit() or not 1 <= int(port) <= 65535:
         return (
             f"`{port}` is not a TCP port number (1-65535), so `{address}` is not an address "
-            "mqttd can bind — it passes --check-config and then fails at startup"
+            "this converter will emit as a live bind"
         )
     if any(c not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-_:" for c in host):
         return (
@@ -2097,9 +2098,10 @@ def render_listeners(conv: Conversion) -> None:
         # otherwise a `certfile` written before the first `listener` line would leave the
         # bind commented out while a real, addressed listener of the same transport was
         # demoted to "additional".
-        # An address mqttd cannot BIND is no better than one nobody derived: --check-config
-        # accepts any string here and the broker then refuses to start, so the shape is checked
-        # before the line goes out live. A listener whose address is unbindable is sorted behind
+        # An address mqttd cannot BIND is no better than one nobody derived. Until issue #671
+        # --check-config accepted any string here; it now rejects one it cannot parse or
+        # resolve. The shape is still checked before the line goes out live. A listener whose
+        # address is unbindable is sorted behind
         # one whose is, exactly like a listener with no address at all.
         group.sort(key=lambda l: l.address is None or bind_gap(l.address) is not None)
         first = group[0]
@@ -2112,8 +2114,7 @@ def render_listeners(conv: Conversion) -> None:
                 toml_str(address),
                 None,
                 decide=f"{first.where} gives [listeners] {key} as {address!r}, and that is not "
-                f"an address mqttd can bind: {unbindable}. `mqttd --check-config` ACCEPTS any "
-                "string here and the broker then fails at STARTUP, so the line is emitted "
+                f"an address mqttd can bind: {unbindable}. The line is emitted "
                 "COMMENTED OUT rather than live: set an address the broker can bind and "
                 "uncomment it",
             )
