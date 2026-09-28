@@ -18,6 +18,7 @@ use super::qos2::exec_qos2_lane_op;
 // siblings share one type/state vocabulary by design, and enumerating it would
 // re-couple every future hub change to six import lists. Scoped to these files.
 use super::*;
+use futures_util::stream::{FuturesOrdered, StreamExt};
 
 /// The outcome an append lane reports back to the loop (issue #242 / ADR 0061).
 ///
@@ -317,7 +318,15 @@ pub(super) async fn append_lane_worker(
     // hub-owned task — so abort at shutdown drops them with it; the futures
     // hold no store handle (they capture the log's Arc'd watermark state and
     // the writer's completion), upholding the issue #242 teardown rule.
-    let mut inflight: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
+    //
+    // ORDERED: completions leave in submission order, which is offset order.
+    // The store never commits N+1 before N, but waits in a JoinSet run as
+    // separate tasks, and N+1's could post its AppendDone first (CI saw
+    // [1, 3, 2]). The hub would then send N+1 before N, and — once N+1 was
+    // acked with nothing else owed — truncate through N before N was even
+    // tracked, so a crash before N's delivery lost it. Waiting in order costs
+    // nothing: N+1 cannot resolve before N anyway.
+    let mut inflight: FuturesOrdered<Completion> = FuturesOrdered::new();
     loop {
         tokio::select! {
             job = rx.recv(), if inflight.len() < LANE_PIPELINE_DEPTH => {
@@ -347,12 +356,18 @@ pub(super) async fn append_lane_worker(
                                 }
                             }
                             let outcome = classify_enqueue(&job, result, metrics.as_ref());
-                            let _ = self_tx.send(HubCommand::AppendDone { job, outcome });
+                            let done = HubCommand::AppendDone { job, outcome };
+                            if inflight.is_empty() {
+                                let _ = self_tx.send(done);
+                            } else {
+                                // Earlier appends are still waiting: queue
+                                // behind them rather than overtake them.
+                                inflight.push_back(Box::pin(std::future::ready(done)));
+                            }
                             continue;
                         }
-                        let self_tx = self_tx.clone();
                         let metrics = metrics.clone();
-                        inflight.spawn(async move {
+                        inflight.push_back(Box::pin(async move {
                             let result = pending.await;
                             if durable {
                                 if let Some(m) = &metrics {
@@ -362,28 +377,43 @@ pub(super) async fn append_lane_worker(
                                 }
                             }
                             let outcome = classify_enqueue(&job, result, metrics.as_ref());
-                            let _ = self_tx.send(HubCommand::AppendDone { job, outcome });
-                        });
+                            HubCommand::AppendDone { job, outcome }
+                        }));
                     }
                     LaneJob::Deliver(job) => {
                         // BARRIER: every non-append job keeps ADR 0061's total
                         // order — the pipeline drains before it runs.
-                        while inflight.join_next().await.is_some() {}
+                        drain_in_order(&mut inflight, &self_tx).await;
                         let outcome = run_lane_job(&store, &job, metrics.as_ref(), durable).await;
                         let _ = self_tx.send(HubCommand::AppendDone { job, outcome });
                     }
                     other => {
-                        while inflight.join_next().await.is_some() {}
+                        drain_in_order(&mut inflight, &self_tx).await;
                         run_barrier_job(&store, &self_tx, other).await;
                     }
                 }
             }
-            Some(_) = inflight.join_next(), if !inflight.is_empty() => {}
+            Some(done) = inflight.next(), if !inflight.is_empty() => {
+                let _ = self_tx.send(done);
+            }
         }
     }
     // Channel closed: run the admitted pipeline to its real outcomes (fail
     // closed happens inside each wait; completions no-op if the hub is gone).
-    while inflight.join_next().await.is_some() {}
+    drain_in_order(&mut inflight, &self_tx).await;
+}
+
+/// One pipelined append's completion: the `AppendDone` to post once it resolves.
+type Completion = std::pin::Pin<Box<dyn std::future::Future<Output = HubCommand> + Send>>;
+
+/// Post every pipelined completion, in submission order, until none is left.
+async fn drain_in_order(
+    inflight: &mut FuturesOrdered<Completion>,
+    self_tx: &mpsc::UnboundedSender<HubCommand>,
+) {
+    while let Some(done) = inflight.next().await {
+        let _ = self_tx.send(done);
+    }
 }
 
 /// The lane's non-`Deliver` jobs, unchanged from the serial worker (ADR 0061):
