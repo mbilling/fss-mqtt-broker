@@ -231,7 +231,13 @@ impl std::fmt::Debug for ProxyContext {
 /// they may do ([`Authorizer`]), where security decisions are audited
 /// ([`AuditSink`], ADR 0004 step 4), and — when clustered — how to relocate a
 /// persistent session to its owner ([`ProxyContext`], ADR 0005).
+#[derive(Clone)]
 pub struct ConnPolicy {
+    /// This listener's anonymous-access override (issue #669): `Some` decides a
+    /// credential-less CONNECT for this listener alone, ahead of the authenticator chain's
+    /// global `allow_anonymous`; `None` defers to the chain. Only [`Credentials::Anonymous`]
+    /// consults it — every presented credential is still verified by the chain.
+    pub anonymous: Option<bool>,
     /// Authenticates the CONNECT credentials. Held behind a [`watch::Receiver`] so a
     /// SIGHUP reload (ADR 0032) can swap the authenticator under live connections; each
     /// CONNECT reads the **current** value ([`ConnPolicy::authenticator`]).
@@ -295,6 +301,20 @@ impl std::fmt::Debug for ConnPolicy {
 }
 
 impl ConnPolicy {
+    /// This policy as one listener sees it (issue #669): the same live authenticator and
+    /// authorizer handles — a reload still reaches it — with the listener's own anonymous
+    /// override. `None` leaves the chain's global `allow_anonymous` in charge.
+    #[must_use]
+    pub fn for_listener(self: &Arc<Self>, anonymous: Option<bool>) -> Arc<Self> {
+        if anonymous == self.anonymous {
+            return self.clone();
+        }
+        Arc::new(Self {
+            anonymous,
+            ..(**self).clone()
+        })
+    }
+
     /// The **current** authenticator — re-read on every CONNECT so a SIGHUP reload (ADR
     /// 0032) takes effect without restarting.
     #[must_use]
@@ -330,6 +350,7 @@ pub fn authz_handle(a: Arc<dyn Authorizer>) -> watch::Receiver<Arc<dyn Authorize
 pub async fn handle(stream: TcpStream, hub: mpsc::UnboundedSender<HubCommand>) {
     let peer = stream.peer_addr().ok();
     let policy = Arc::new(ConnPolicy {
+        anonymous: None,
         auth: auth_handle(Arc::new(BasicAuthenticator {
             allow_anonymous: true,
         })),
@@ -1181,9 +1202,17 @@ where
     // Awaited, not blocked on: an authenticator may be remote (HTTP hook, LDAP, token
     // introspection). Nothing here bounds how long it takes — an I/O-backed
     // implementation owns its own timeout, and must fail closed when it expires.
-    let verdict = match &creds {
-        Some(creds) => policy.authenticator().authenticate(client, creds).await,
-        None => Err(AuthError::Rejected),
+    let verdict = match (&creds, policy.anonymous) {
+        // This listener decides anonymous access for itself (issue #669), through the same
+        // authenticator the chain's baseline is — so an admitted anonymous principal is
+        // exactly the one the global setting would have produced.
+        (Some(anonymous @ Credentials::Anonymous), Some(allow_anonymous)) => {
+            BasicAuthenticator { allow_anonymous }
+                .authenticate(client, anonymous)
+                .await
+        }
+        (Some(creds), _) => policy.authenticator().authenticate(client, creds).await,
+        (None, _) => Err(AuthError::Rejected),
     };
     // The verifier must also name the certificate's principal: a remote hook answering
     // for a different subject is a mismatch, not an admission.
@@ -2766,6 +2795,7 @@ mod tests {
     /// gate (covered in tests/auth.rs, tests/acl.rs, and mqtt-auth's tests).
     fn permissive() -> Arc<ConnPolicy> {
         Arc::new(ConnPolicy {
+            anonymous: None,
             auth: auth_handle(Arc::new(BasicAuthenticator {
                 allow_anonymous: true,
             })),
@@ -2800,6 +2830,7 @@ mod tests {
         let (client, server) = tokio::io::duplex(4096);
         let (hub_tx, hub_rx) = mpsc::unbounded_channel();
         let policy = Arc::new(ConnPolicy {
+            anonymous: None,
             auth: auth_handle(Arc::new(BasicAuthenticator {
                 allow_anonymous: true,
             })),
@@ -3004,6 +3035,7 @@ mod tests {
         let (client, server) = tokio::io::duplex(4096);
         let (hub_tx, hub_rx) = mpsc::unbounded_channel();
         let policy = Arc::new(ConnPolicy {
+            anonymous: None,
             auth: auth_handle(Arc::new(BasicAuthenticator {
                 allow_anonymous: true,
             })),
@@ -3118,6 +3150,7 @@ mod tests {
         let (hub_tx, hub_rx) = mpsc::unbounded_channel();
         stub_hub(hub_rx);
         let policy = Arc::new(ConnPolicy {
+            anonymous: None,
             auth: auth_handle(Arc::new(BasicAuthenticator {
                 allow_anonymous: true,
             })),
@@ -3171,6 +3204,7 @@ mod tests {
         let (hub_tx, hub_rx) = mpsc::unbounded_channel();
         stub_hub(hub_rx);
         let policy = Arc::new(ConnPolicy {
+            anonymous: None,
             auth: auth_handle(Arc::new(BasicAuthenticator {
                 allow_anonymous: false,
             })),
@@ -3270,6 +3304,7 @@ mod tests {
         let mut secrets = std::collections::HashMap::new();
         secrets.insert("alice".to_string(), b"alice-secret".to_vec());
         let policy = Arc::new(ConnPolicy {
+            anonymous: None,
             auth: auth_handle(Arc::new(BasicAuthenticator {
                 allow_anonymous: true,
             })),
@@ -3497,6 +3532,7 @@ mod tests {
         let (client, server) = tokio::io::duplex(4096);
         let (hub_tx, mut hub_rx) = mpsc::unbounded_channel();
         let policy = Arc::new(ConnPolicy {
+            anonymous: None,
             auth: auth_handle(Arc::new(BasicAuthenticator {
                 allow_anonymous: true,
             })),
@@ -3631,6 +3667,7 @@ mod tests {
     async fn proxied_session_records_the_relaying_node_in_the_audit() {
         let audit = Arc::new(mqtt_observability::RecordingAuditSink::new());
         let policy = Arc::new(ConnPolicy {
+            anonymous: None,
             auth: auth_handle(Arc::new(BasicAuthenticator {
                 allow_anonymous: true,
             })),
@@ -3704,6 +3741,7 @@ mod tests {
                 })])
                 .requiring_password_with_certificate(true);
             let policy = Arc::new(ConnPolicy {
+                anonymous: None,
                 auth: auth_handle(Arc::new(chain)),
                 authz: authz_handle(Arc::new(mqtt_auth::AllowAll)),
                 identity_source: mqtt_auth::mtls::IdentitySource::default(),
@@ -4339,6 +4377,7 @@ mod tests {
         let (client, server) = tokio::io::duplex(4096);
         let (hub_tx, hub_rx) = mpsc::unbounded_channel();
         let policy = Arc::new(ConnPolicy {
+            anonymous: None,
             auth: auth_handle(Arc::new(BasicAuthenticator {
                 allow_anonymous: true,
             })),
@@ -4625,6 +4664,7 @@ mod tests {
         let (client, server) = tokio::io::duplex(4096);
         let (hub_tx, hub_rx) = mpsc::unbounded_channel();
         let policy = Arc::new(ConnPolicy {
+            anonymous: None,
             auth: auth_handle(Arc::new(BasicAuthenticator {
                 allow_anonymous: true,
             })),

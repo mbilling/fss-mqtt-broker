@@ -6,7 +6,7 @@ Source of truth: `mqtt_config::ENV_VARS` and `Config::overlay_from` in `crates/m
 
 The annotated template is [`mqttd.example.toml`](mqttd.example.toml). Capacity arithmetic lives in [SIZING.md](SIZING.md); day-2 procedures in [OPERATIONS.md](OPERATIONS.md). This page is the inventory of knobs, not the runbook.
 
-Documented overlay variables: **96** in `ENV_VARS`, plus `MQTTD_CONFIG` (meta) and any experimental side-channel knobs below.
+Documented overlay variables: **101** in `ENV_VARS`, plus `MQTTD_CONFIG` (meta) and any experimental side-channel knobs below.
 
 ## Node identity
 
@@ -28,6 +28,11 @@ Documented overlay variables: **96** in `ENV_VARS`, plus `MQTTD_CONFIG` (meta) a
 | `MQTTD_QUIC_BIND` | `listeners.quic_bind` | MQTT-over-QUIC (UDP) listener (`MQTTD_QUIC_BIND`). |
 | `MQTTD_HEALTH_BIND` | `listeners.health_bind` | HTTP health/probe listener (`MQTTD_HEALTH_BIND`): `/livez`, `/readyz`, `/metrics`. |
 | `MQTTD_METRICS_BIND` | `listeners.metrics_bind` | Optional separate `/metrics` listener (`MQTTD_METRICS_BIND`), to isolate the scrape. |
+| `MQTTD_TLS_ALLOW_ANONYMOUS` | `listeners.tls_allow_anonymous` | See the matching TOML key; description is the rustdoc on that field. |
+| `MQTTD_PLAINTEXT_ALLOW_ANONYMOUS` | `listeners.plaintext_allow_anonymous` | See `Listeners::tls_allow_anonymous` (`MQTTD_PLAINTEXT_ALLOW_ANONYMOUS`). |
+| `MQTTD_WS_ALLOW_ANONYMOUS` | `listeners.ws_allow_anonymous` | See `Listeners::tls_allow_anonymous` (`MQTTD_WS_ALLOW_ANONYMOUS`). |
+| `MQTTD_WSS_ALLOW_ANONYMOUS` | `listeners.wss_allow_anonymous` | See `Listeners::tls_allow_anonymous` (`MQTTD_WSS_ALLOW_ANONYMOUS`). |
+| `MQTTD_QUIC_ALLOW_ANONYMOUS` | `listeners.quic_allow_anonymous` | See `Listeners::tls_allow_anonymous` (`MQTTD_QUIC_ALLOW_ANONYMOUS`). |
 
 ## TLS (client listeners)
 

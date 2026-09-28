@@ -1223,6 +1223,28 @@ impl QuicTls {
     }
 }
 
+/// The connection policy for one client listener (issue #669): the shared policy with that
+/// listener's anonymous-access override, loudly logged when it admits anonymous clients.
+fn listener_policy(
+    policy: &Arc<conn::ConnPolicy>,
+    listener: &str,
+    allow_anonymous: Option<bool>,
+) -> Arc<conn::ConnPolicy> {
+    match allow_anonymous {
+        Some(true) => warn!(
+            listener,
+            "INSECURE: anonymous MQTT clients are PERMITTED on this listener \
+             ({listener}_allow_anonymous)"
+        ),
+        Some(false) => info!(
+            listener,
+            "anonymous MQTT clients are refused on this listener ({listener}_allow_anonymous)"
+        ),
+        None => {}
+    }
+    policy.for_listener(allow_anonymous)
+}
+
 // One linear listener-wiring flow; splitting it would scatter the env-var reads.
 #[allow(clippy::too_many_lines)]
 async fn start_client_listeners(
@@ -1283,7 +1305,7 @@ async fn start_client_listeners(
                 .clone()
                 .expect("acceptor built when tls_bind set"),
             hub_tx.clone(),
-            policy.clone(),
+            listener_policy(&policy, "tls", config.listeners.tls_allow_anonymous),
             shutdown.clone(),
             connections.clone(),
         ));
@@ -1299,7 +1321,7 @@ async fn start_client_listeners(
                 .clone()
                 .expect("acceptor built when wss_bind set"),
             hub_tx.clone(),
-            policy.clone(),
+            listener_policy(&policy, "wss", config.listeners.wss_allow_anonymous),
             shutdown.clone(),
             connections.clone(),
         ));
@@ -1313,7 +1335,11 @@ async fn start_client_listeners(
             gate.clone(),
             listener,
             hub_tx.clone(),
-            policy.clone(),
+            listener_policy(
+                &policy,
+                "plaintext",
+                config.listeners.plaintext_allow_anonymous,
+            ),
             shutdown.clone(),
             connections.clone(),
         ));
@@ -1327,7 +1353,7 @@ async fn start_client_listeners(
             gate.clone(),
             listener,
             hub_tx.clone(),
-            policy.clone(),
+            listener_policy(&policy, "ws", config.listeners.ws_allow_anonymous),
             shutdown.clone(),
             connections.clone(),
         ));
@@ -1346,7 +1372,7 @@ async fn start_client_listeners(
             gate.clone(),
             endpoint,
             hub_tx.clone(),
-            policy.clone(),
+            listener_policy(&policy, "quic", config.listeners.quic_allow_anonymous),
             shutdown.clone(),
             connections.clone(),
         ));
@@ -1430,6 +1456,7 @@ fn client_policy(
         reload::Reloader::with_metrics(initial, audit.clone(), Some(metrics.clone()), build);
 
     let policy = Arc::new(conn::ConnPolicy {
+        anonymous: None,
         auth: handles.auth,
         authz: handles.authz,
         // Start-time, like the OIDC settings above: re-keying every ACL under live

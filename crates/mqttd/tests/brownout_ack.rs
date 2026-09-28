@@ -54,6 +54,7 @@ async fn start_broker() -> Broker {
     tokio::spawn(hub.run());
 
     let policy = Arc::new(mqttd::conn::ConnPolicy {
+        anonymous: None,
         auth: mqttd::conn::auth_handle(Arc::new(mqtt_auth::basic::BasicAuthenticator {
             allow_anonymous: true,
         })),
