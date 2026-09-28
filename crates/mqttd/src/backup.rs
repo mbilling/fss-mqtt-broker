@@ -445,6 +445,10 @@ fn store_schema() -> BTreeMap<String, u32> {
             "lease.redb".to_string(),
             mqtt_cluster::lease_store::LEASE_SCHEMA_VERSION,
         ),
+        (
+            mqtt_cluster::cluster_log::replica_log::LOG_DIR.to_string(),
+            mqtt_cluster::cluster_log::replica_log::FORMAT_VERSION,
+        ),
     ])
 }
 
@@ -1939,6 +1943,10 @@ pub fn require_fresh_data_dir(dir: &Path) -> Result<(), String> {
             (0..mqtt_cluster::cluster_log::R_MAX_SHARDS)
                 .map(mqtt_cluster::cluster_log::shard_file_name),
         )
+        // …and so is a segment-log replica store (ADR 0078), a directory.
+        .chain(std::iter::once(
+            mqtt_cluster::cluster_log::replica_log::LOG_DIR.to_string(),
+        ))
         .filter(|f| dir.join(f).exists())
         .collect();
     found.sort();

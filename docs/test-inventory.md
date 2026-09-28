@@ -253,11 +253,17 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `two_bridge_instances_do_not_duplicate_forwarding`
 - `two_partitioned_instances_deliver_each_inbound_message_exactly_once`
 
-## `crates/mqtt-cluster/src/lib.rs` — 311 test(s)
+## `crates/mqtt-cluster/src/lib.rs` — 317 test(s)
 
 - `cluster_identity::tests::a_founder_mints_once_and_reloads_stably`
 - `cluster_identity::tests::a_joiner_adopts_once_and_persists`
 - `cluster_identity::tests::two_foundings_yield_distinct_ids`
+- `cluster_log::replica_log::tests::a_foreign_format_or_shard_count_fails_closed`
+- `cluster_log::replica_log::tests::a_redb_store_is_imported_once_and_retired`
+- `cluster_log::replica_log::tests::a_torn_last_batch_reopens_to_the_state_before_it`
+- `cluster_log::replica_log::tests::an_interrupted_import_is_redone`
+- `cluster_log::replica_log::tests::records_round_trip`
+- `cluster_log::replica_log::tests::the_log_store_equals_the_redb_store_live_and_after_reopen`
 - `cluster_log::tests::a_catch_up_back_fill_never_plants_a_dipping_tag`
 - `cluster_log::tests::a_dropped_same_epoch_tail_still_bounds_the_next_seq`
 - `cluster_log::tests::a_durable_session_log_survives_a_full_restart_via_persisted_replicas`
@@ -947,7 +953,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 451 test(s)
+## `crates/mqttd/src/lib.rs` — 452 test(s)
 
 - `admission::tests::the_global_cap_refuses_at_the_bound_and_recovers`
 - `admission::tests::the_penalty_box_refuses_after_the_threshold`
@@ -1395,6 +1401,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `store_probe::tests::sharding_pays_only_when_parallel_streams_are_nearly_independent`
 - `store_probe::tests::the_parallel_barrier_curve_covers_every_stream_count`
 - `store_watch::tests::a_recovered_watermark_lifts_the_brownout_at_the_accelerated_cadence`
+- `store_watch::tests::a_segment_log_replica_store_is_counted_whole`
 - `store_watch::tests::nearing_the_watermark_shortens_the_poll_so_overshoot_is_bounded`
 - `store_watch::tests::scan_reports_per_store_sizes_and_the_total`
 - `store_watch::tests::the_poll_policy_only_accelerates_near_the_mark`

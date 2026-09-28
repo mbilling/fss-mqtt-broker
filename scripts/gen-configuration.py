@@ -180,11 +180,19 @@ def render(env_vars: list[str], toml_keys: dict[str, str], docs: dict[str, str])
     for var, where, why in side_channel_knobs():
         if var in env_vars:
             continue
-        desc = docs.get(
-            var,
-            f"{why}. Source: `{where}`. Experimental; warned loudly when engaged "
-            "(ADR 0076: K>1 sharding and linger were measured slower and stay off by default).",
-        )
+        if var == "MQTTD_REPLICA_STORE":
+            desc = (
+                f"{why}. Source: `{where}`. `redb` (default) or `log` — the replica store's "
+                "engine (ADR 0078). `log` is the append-only segment log, EXPERIMENTAL until "
+                "its hardware evidence is in: it imports an existing redb store once (the redb "
+                "files are kept as `*.imported`) and there is no conversion back."
+            )
+        else:
+            desc = docs.get(
+                var,
+                f"{why}. Source: `{where}`. Experimental; warned loudly when engaged "
+                "(ADR 0076: K>1 sharding and linger were measured slower and stay off by default).",
+            )
         rows_by_section["experimental"].append((var, "—", desc))
 
     lines = [

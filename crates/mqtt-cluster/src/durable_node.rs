@@ -104,6 +104,47 @@ pub async fn build_durable_node(
     DurablePlane,
     tokio::task::JoinHandle<()>,
 ) {
+    build_durable_node_on(
+        node_id,
+        placement,
+        can_bootstrap,
+        voter_cap,
+        failure_domains,
+        data_dir,
+        commit_delay,
+        allow_relaxed_publish,
+        ownership_domain_all,
+        store_shards,
+        crate::cluster_log::StoreBackend::Redb,
+    )
+    .await
+}
+
+/// [`build_durable_node`] with the replica store's engine chosen explicitly
+/// (ADR 0078, `MQTTD_REPLICA_STORE`). Everything else is identical.
+///
+/// # Panics
+/// As [`build_durable_node`], and if the replica store cannot be opened on
+/// `replica_store` (a log-format data dir under `redb`, a failed import).
+#[allow(clippy::too_many_arguments)]
+pub async fn build_durable_node_on(
+    node_id: NodeId,
+    placement: Arc<RwLock<Placement>>,
+    can_bootstrap: bool,
+    voter_cap: usize,
+    failure_domains: &BTreeMap<NodeId, FailureDomain>,
+    data_dir: Option<&std::path::Path>,
+    commit_delay: Option<Arc<std::sync::atomic::AtomicU64>>,
+    allow_relaxed_publish: bool,
+    ownership_domain_all: Arc<std::sync::atomic::AtomicBool>,
+    store_shards: Option<usize>,
+    replica_store: crate::cluster_log::StoreBackend,
+) -> (
+    Arc<dyn SessionStore>,
+    Arc<dyn DurableRetained>,
+    DurablePlane,
+    tokio::task::JoinHandle<()>,
+) {
     let local = raft_id(&node_id);
 
     // --- lease consensus group + durable-plane endpoint ---
@@ -140,7 +181,7 @@ pub async fn build_durable_node(
     // created with, and only a FRESH store takes `store_shards` (the caller's
     // calibration) as its committed K.
     let replicas = Arc::new(Mutex::new(match data_dir {
-        Some(dir) => ReplicaState::open_sharded(dir, store_shards.unwrap_or(1))
+        Some(dir) => ReplicaState::open_store(dir, store_shards.unwrap_or(1), replica_store)
             .unwrap_or_else(|e| panic!("open the replica store: {e}")),
         None => ReplicaState::new(),
     }));
