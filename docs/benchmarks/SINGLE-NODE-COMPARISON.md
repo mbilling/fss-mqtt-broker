@@ -319,9 +319,10 @@ the ladder, but it does corroborate the parts it touches:
   here may be slow where a guarantee is real. TLS and authentication cost is
   a different posture (ADR 0048 §3) and is not free for anyone.
 - **HiveMQ's rungs above its knee measured a dead process**, not a degraded
-  one. Its 45 000 row is a genuine p99 failure; its 60 000 row is a genuine
-  52.6% delivery failure; the rows above that are only evidence that it did
-  not restart.
+  one. Its 45 000 row is outside the GREEN band on latency (p99 above 1 s) —
+  graded, not failed, under ADR 0048's 2026-09-27 amendment; its 60 000 row
+  is a genuine failure, 52.6% delivered; the rows above that are only
+  evidence that it did not restart.
 - Raw per-rung tables, CPU streams and container logs live in the run
   directory produced by the harness. That output is untracked scratch by
   design (see `bench/README.md`); the tracked artifacts a reader can check
