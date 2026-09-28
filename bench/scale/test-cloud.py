@@ -796,7 +796,7 @@ if re.search(r"curl -(?:s|fsS) -m 10 http://localhost:94", cmd) and os.environ.g
         print("connect_succ 600")
     log()
     sys.exit(0)
-if "mpstat" in cmd:
+if "mpstat" in cmd or "iostat" in cmd:
     # A sampler must BE the process cpu.sh kills, exactly as `exec ssh` is.
     log()
     os.execvp("bash", ["bash", "-c", cmd])
@@ -838,6 +838,22 @@ while True:
     print(time.strftime("%H:%M:%S", time.gmtime()) + "  all  0 0 0 0 0 0 0 0 0 50.00", flush=True)
     if dies:
         sys.exit(0)
+    time.sleep(0.05)
+''',
+        # The broker disk stream cpu.sh starts beside mpstat (#568): real
+        # `iostat -t -d -x -m -y 1` framing with ISO stamps, stopped by the same
+        # SIGTERM. It logs "io", not "cpu", so the CPU-stop accounting is unchanged.
+        "iostat": r'''#!/usr/bin/env python3
+import json, os, signal, sys, time
+def stop(*_):
+    with open(os.environ["CALL_LOG"], "a") as f:
+        f.write(json.dumps({"t": time.time_ns(), "host": os.environ["FAKE_HOST"], "io": "stop"}) + "\n")
+    sys.exit(0)
+signal.signal(signal.SIGTERM, stop)
+while True:
+    print(time.strftime("%Y-%m-%dT%H:%M:%S+0000", time.gmtime()), flush=True)
+    print("Device r/s rMB/s w/s wMB/s f/s aqu-sz %util", flush=True)
+    print("sda 0.00 0.00 100.00 1.00 50.00 0.10 5.00\n", flush=True)
     time.sleep(0.05)
 ''',
         "curl": r'''#!/usr/bin/env python3
@@ -1463,7 +1479,7 @@ if "docker logs" in cmd:
         print("\\n@@@ %s" % name)
         print("pub total=100000 rate=15000/sec" if name.startswith("pub") else "recv total=100000 rate=15000/sec")
     sys.exit(0)
-if "mpstat" in cmd:
+if "mpstat" in cmd or "iostat" in cmd:
     print("CPU_STREAM_START_UTC 2026-09-16T00:00:00Z", flush=True)
     while True:
         print("00:00:01  all  1 0 1 0 0 0 0 0 0 98", flush=True)
@@ -1760,7 +1776,7 @@ with open(os.environ["CALL_LOG"], "a") as f:
 if "ip_local_reserved_ports" in cmd:
     print(os.environ.get("FAKE_RESERVED_PORTS", "9400-9499"))
     sys.exit(0)
-if "mpstat" in cmd:
+if "mpstat" in cmd or "iostat" in cmd:
     print("CPU_STREAM_START_UTC 2026-09-16T00:00:00Z", flush=True)
     sys.exit(0)
 if "@@@" in cmd and "docker logs" not in cmd:
@@ -1843,7 +1859,7 @@ with open(os.environ["CALL_LOG"], "a") as f:
 if "ip_local_reserved_ports" in cmd:
     print(os.environ.get("FAKE_RESERVED_PORTS", "9400-9499"))
     sys.exit(0)
-if "mpstat" in cmd:
+if "mpstat" in cmd or "iostat" in cmd:
     # Three samples, then gone: the stream ends before the window does. The
     # started/gone files make that an ordering, not a race — the fake sleep below
     # will not return until every sampler that started has exited, so the window

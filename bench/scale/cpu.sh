@@ -53,13 +53,28 @@ with_cpu_sampling() (
 			__cpu_pids+=("$!")
 			__cpu_files+=("$file")
 			printf '%s\t%s\n' "$!" "$role$i" >> "$dir/samplers.tsv"
+			# Brokers also stream their DISK (#568): extended per-device stats every
+			# second — reads, writes and flushes per second, MB/s, request sizes,
+			# queue depth, %util — so a durable rung can say whether the disk was
+			# the limit rather than infer it. sysstat ships iostat with mpstat.
+			# ISO timestamps (S_TIME_FORMAT) keep the rows placeable on the same
+			# UTC clock as the window edges; -y drops the since-boot report.
+			if [ "$role" = broker ]; then
+				(
+					exec ssh -n "${SSH_OPTS[@]}" -o UserKnownHostsFile="$RUN/known_hosts" "root@$ip" \
+						'command -v iostat >/dev/null || exit 127; printf "IO_STREAM_START_UTC %s\n" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"; exec env LC_ALL=C TZ=UTC S_TIME_FORMAT=ISO iostat -t -d -x -m -y 1'
+				) > "$dir/io-$role$i.txt" 2> "$dir/io-$role$i.stderr" &
+				__cpu_pids+=("$!")
+				__cpu_files+=("$dir/io-$role$i.txt")
+				printf '%s\t%s\n' "$!" "io-$role$i" >> "$dir/samplers.tsv"
+			fi
 		done
 	done
 	# Every stream must be established before the driver starts. The stream's
 	# UTC marker and the driver's MEASUREMENT_WINDOW JSON permit alignment;
 	# do not average idle/preflight samples into the measurement window.
 	for file in "${__cpu_files[@]}"; do
-		wait_for "CPU stream $file" 30 grep -q '^CPU_STREAM_START_UTC ' "$file" || exit 1
+		wait_for "sampler stream $file" 30 grep -qE '^(CPU|IO)_STREAM_START_UTC ' "$file" || exit 1
 	done
 	if "$@"; then rc=0; else rc=$?; fi
 	stop_streams || sampling_rc=$?
