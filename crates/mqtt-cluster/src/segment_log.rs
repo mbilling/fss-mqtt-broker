@@ -333,6 +333,12 @@ impl SegmentLog {
         &self.segments
     }
 
+    /// The size a segment is created at.
+    #[must_use]
+    pub fn segment_bytes(&self) -> u64 {
+        self.segment_bytes
+    }
+
     /// Total bytes of valid records across every segment.
     #[must_use]
     pub fn bytes(&self) -> u64 {
