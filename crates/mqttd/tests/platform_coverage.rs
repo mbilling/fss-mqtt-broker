@@ -46,6 +46,13 @@ fn every_platform_gated_suite_compiled_on_this_runner() {
         "backup_restore.rs uses #[cfg(unix)] for startup/cleanup controls; this CI run must exercise them"
     );
 
+    // check_config.rs has a Unix-only unreadable-file regression (issue #671).
+    assert!(
+        !in_ci || cfg!(unix),
+        "check_config.rs uses #[cfg(unix)] for the mode-000 password file case; this CI run \
+         must exercise it"
+    );
+
     // crates/mqttd/tests/decommission.rs — #![cfg(unix)]
     assert!(
         !in_ci || cfg!(unix),
@@ -68,6 +75,7 @@ fn the_mirrored_predicates_still_describe_the_suites() {
         ("memory_watermark.rs", "#![cfg(target_os = \"linux\")]"),
         ("decommission.rs", "#![cfg(unix)]"),
         ("backup_restore.rs", "#[cfg(unix)]"),
+        ("check_config.rs", "#[cfg(unix)]"),
         ("shared_membership.rs", "#[cfg(target_os = \"linux\")]"),
     ] {
         let src = std::fs::read_to_string(dir.join(file))
