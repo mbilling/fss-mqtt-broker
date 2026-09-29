@@ -783,4 +783,12 @@ async fn the_authorization_dry_run_names_the_deciding_rule_of_the_live_policy() 
         .get(&alice, "/admin/v1/authz?user=x&action=delete&target=a")
         .await;
     assert_eq!((status, code(&body)), (400, "bad-request"));
+    // A structurally invalid filter is refused before the policy is asked.
+    let (status, body) = h
+        .get(
+            &alice,
+            "/admin/v1/authz?user=x&action=subscribe&target=a/%23/b",
+        )
+        .await;
+    assert_eq!((status, code(&body)), (400, "bad-request"));
 }
