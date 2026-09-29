@@ -29,9 +29,9 @@ pub type AdminAddr = Arc<dyn Fn(&str, &str) -> Option<String> + Send + Sync>;
 /// How this node reaches its peers' admin listeners.
 #[derive(Clone)]
 pub struct PeerAccess {
-    connector: TlsConnector,
-    admin_addr: AdminAddr,
-    timeout: Duration,
+    pub(super) connector: TlsConnector,
+    pub(super) admin_addr: AdminAddr,
+    pub(super) timeout: Duration,
 }
 
 impl std::fmt::Debug for PeerAccess {

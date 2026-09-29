@@ -91,6 +91,22 @@ const VERBS: &[Verb] = &[
         help: "operator: reload the config file, as SIGHUP does, and report the outcome",
     },
     Verb {
+        name: "kick",
+        method: "POST",
+        path: "/admin/v1/kick",
+        required: &["client"],
+        optional: &[],
+        help: "operator: disconnect a client (MQTT 5: 0x98); its session stays",
+    },
+    Verb {
+        name: "purge",
+        method: "POST",
+        path: "/admin/v1/purge",
+        required: &["client"],
+        optional: &[],
+        help: "operator: disconnect a client and delete its session and queue",
+    },
+    Verb {
         name: "authz",
         method: "GET",
         path: "/admin/v1/authz",

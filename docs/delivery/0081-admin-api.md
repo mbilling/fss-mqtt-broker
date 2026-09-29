@@ -35,7 +35,7 @@ tasks:
     notes: "First action. Reload runs the ADR 0032 routine; the file stays the only input."
   - id: 0081-T7
     title: "Actions: kick (DISCONNECT 0x98) and purge a session, forwarded to the client's node"
-    status: planned
+    status: in-progress
     issue: 716
     notes: "Audited on the node receiving the call and on the node acting."
   - id: 0081-T8
@@ -85,7 +85,7 @@ frontmatter above · this file is the plan, progress log, and changelog.
 | 0081-T4 | 🚧 in-progress | [#713](https://github.com/mbilling/fss-mqtt-broker/issues/713) | — | "Bounded responses only; reads of identifying data are audited." |
 | 0081-T5 | 🚧 in-progress | [#714](https://github.com/mbilling/fss-mqtt-broker/issues/714) | — | "Evaluates the loaded policy; changes nothing." |
 | 0081-T6 | 🚧 in-progress | [#715](https://github.com/mbilling/fss-mqtt-broker/issues/715) | — | "First action. Reload runs the ADR 0032 routine; the file stays the only input." |
-| 0081-T7 | ⬜ planned | [#716](https://github.com/mbilling/fss-mqtt-broker/issues/716) | — | "Audited on the node receiving the call and on the node acting." |
+| 0081-T7 | 🚧 in-progress | [#716](https://github.com/mbilling/fss-mqtt-broker/issues/716) | — | "Audited on the node receiving the call and on the node acting." |
 | 0081-T8 | ⬜ planned | [#717](https://github.com/mbilling/fss-mqtt-broker/issues/717) | — | "Not persisted; shown on /statusz." |
 | 0081-T9 | ⬜ planned | [#718](https://github.com/mbilling/fss-mqtt-broker/issues/718) | — |  |
 | 0081-T10 | ⬜ planned | [#719](https://github.com/mbilling/fss-mqtt-broker/issues/719) | — |  |

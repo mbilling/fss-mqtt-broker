@@ -3111,7 +3111,7 @@ impl Hub {
                 // prober timed out; that is fine.
                 let _ = reply.send(());
             }
-            HubCommand::Admin(request) => self.admin(request),
+            HubCommand::Admin(request) => self.admin(request).await,
             HubCommand::RemoteInterest { node, filters } => {
                 debug!(node = %node.0, filters = filters.len(), "remote interest updated");
                 // The peer's view is AUTHORITATIVE (it never gossips before it

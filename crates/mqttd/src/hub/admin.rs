@@ -1,20 +1,22 @@
-//! Admin API queries answered on the hub loop (ADR 0081 T4).
+//! Admin API queries and actions answered on the hub loop (ADR 0081 T4, T7).
 //!
 //! Each query takes one snapshot of hub state and replies with plain, serializable
-//! values, so the admin listener never holds a reference into the hub. They are
-//! read-only: nothing here changes a session.
+//! values, so the admin listener never holds a reference into the hub. Queries are
+//! read-only. The two actions — kick and purge — go through the same detach and discard
+//! paths a disconnect and a session expiry use, so they cannot leave a session half-gone.
 //!
 //! Cost: listing and ranking visit every session this node holds, on the hub loop, so
 //! a page costs O(sessions) — once per operator request, never per message. Every
 //! answer is bounded by its `limit` regardless of how many sessions match.
 
 use super::{AuthMethod, Hub, OutState, SubEntry};
-use mqtt_codec::ProtocolVersion;
+use mqtt_codec::{Disconnect, Packet, ProtocolVersion};
 use mqtt_core::ClientId;
 use serde::Serialize;
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BinaryHeap, HashSet};
 use tokio::sync::oneshot;
+use tracing::warn;
 
 /// Most rows one answer carries.
 pub const MAX_LIMIT: usize = 1000;
@@ -62,6 +64,31 @@ pub enum AdminRequest {
         /// The handle.
         reply: oneshot::Sender<std::sync::Arc<dyn mqtt_storage::RetainedStore>>,
     },
+    /// Disconnect a client (MQTT 5: DISCONNECT `0x98` Administrative action). Its session
+    /// stays, as for any server-initiated close, and so does its Will semantics.
+    Kick {
+        /// The client id.
+        client: String,
+        /// What happened.
+        reply: oneshot::Sender<ActionOutcome>,
+    },
+    /// Disconnect a client if connected, then delete its session: subscriptions,
+    /// in-flight state, queued messages and expiry bookkeeping, in memory and in the store.
+    Purge {
+        /// The client id.
+        client: String,
+        /// What happened.
+        reply: oneshot::Sender<ActionOutcome>,
+    },
+}
+
+/// What an admin action found and did.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+pub struct ActionOutcome {
+    /// A connection was attached, and was closed.
+    pub disconnected: bool,
+    /// A session was known to this node (for purge: and was deleted).
+    pub session_found: bool,
 }
 
 /// Which sessions a [`AdminRequest::Sessions`] page lists. Empty fields match all.
@@ -239,7 +266,7 @@ fn subscription_view(e: &SubEntry) -> SubscriptionView {
 impl Hub {
     /// Answer one admin request. A dropped reply channel (the caller timed out) is
     /// ignored.
-    pub(super) fn admin(&mut self, request: AdminRequest) {
+    pub(super) async fn admin(&mut self, request: AdminRequest) {
         match request {
             AdminRequest::Sessions {
                 filter,
@@ -265,7 +292,51 @@ impl Hub {
             AdminRequest::RetainedStore { reply } => {
                 let _ = reply.send(self.retained.clone());
             }
+            AdminRequest::Kick { client, reply } => {
+                let client = ClientId(client.into());
+                let session_found = self.admin_known_clients().any(|c| c == &client);
+                let disconnected = self.admin_disconnect(&client).await;
+                let _ = reply.send(ActionOutcome {
+                    disconnected,
+                    session_found,
+                });
+            }
+            AdminRequest::Purge { client, reply } => {
+                let client = ClientId(client.into());
+                let disconnected = self.admin_disconnect(&client).await;
+                let session_found = self.admin_known_clients().any(|c| c == &client);
+                // The store may hold a session this node has not materialized (a cold
+                // durable session): remove it regardless; `discard_session` does both.
+                self.discard_session(&client);
+                if session_found || disconnected {
+                    warn!(client = %client.0, "session purged by an admin action");
+                }
+                let _ = reply.send(ActionOutcome {
+                    disconnected,
+                    session_found: session_found || disconnected,
+                });
+            }
         }
+    }
+
+    /// Close `client`'s connection as an administrative action, the way a revocation
+    /// eviction does (`evict`): v5 is told why (`0x98`), v3.1.1 just loses the connection,
+    /// and the detach is not graceful, so a Will is published as for any server close.
+    /// Returns whether a connection was attached.
+    async fn admin_disconnect(&mut self, client: &ClientId) -> bool {
+        let Some(online) = self.online.get(client) else {
+            return false;
+        };
+        warn!(client = %client.0, "disconnecting a client by admin action");
+        if online.admission.protocol == ProtocolVersion::V5 {
+            let _ = online.tx.send(Packet::Disconnect(Disconnect {
+                reason: mqtt_codec::reason::ADMINISTRATIVE_ACTION,
+                properties: mqtt_codec::Properties::new(),
+            }));
+        }
+        let conn_id = online.conn_id;
+        self.detach(client, conn_id, false, None).await;
+        true
     }
 
     /// Every client id this node holds a session for: connected, persistent, or with

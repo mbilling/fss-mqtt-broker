@@ -139,6 +139,7 @@ production emissions, not the full MQTT 5 catalogue in `mqtt-codec`.
 | `0x94` | `TOPIC_ALIAS_INVALID` | Topic alias out of range or used before it was bound (ADR 0011). | provoked in integration tests |
 | `0x95` | `PACKET_TOO_LARGE` | Inbound packet larger than the advertised Maximum Packet Size. | provoked in integration tests |
 | `0x97` | `QUOTA_EXCEEDED` | A quota or brownout refusal (sessions, subscriptions, retained growth, durable-append floor). | provoked in integration tests |
+| `0x98` | `ADMINISTRATIVE_ACTION` | An operator disconnected the client through the admin API (`mqttd --admin kick` / `purge`, ADR 0081). | provoked in integration tests |
 | `0x9c` | `USE_ANOTHER_SERVER` | This node no longer owns the persistent session; reconnect and land on the owner (issue #284). | exempt (see `scripts/check-reason-codes.py`) |
 
 <!-- reason-codes:end -->
