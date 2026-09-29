@@ -3834,6 +3834,9 @@ fn requires_restart(old: &Config, new: &Config) -> Vec<&'static str> {
         c.limits.max_subscriptions_per_client = None;
         c.limits.max_retained_messages = None;
         c.limits.max_sessions = None;
+        // The admin role lists are read from the live config per request (ADR 0081 §1).
+        c.admin.viewers = Vec::new();
+        c.admin.operators = Vec::new();
         c
     };
     let (o, n) = (mask(old), mask(new));
@@ -3869,6 +3872,10 @@ fn requires_restart(old: &Config, new: &Config) -> Vec<&'static str> {
     // a changed [backup] section is staged, not live (ADR 0062).
     if o.backup != n.backup {
         changed.push("backup");
+    }
+    // The admin listener's bind and TLS material are bound at startup (ADR 0081).
+    if o.admin != n.admin {
+        changed.push("admin");
     }
     changed
 }
@@ -5256,9 +5263,11 @@ mod tests {
         live.security.acl_file = Some("/etc/acl.toml".into());
         live.security.require_password_with_certificate = true;
         live.limits.max_sessions = Some(1000);
+        live.admin.viewers = vec!["CN=oncall".into()];
+        live.admin.operators = vec!["CN=root".into()];
         assert!(
             requires_restart(&base, &live).is_empty(),
-            "quotas / allow_anonymous / ACL path / both-factors are live"
+            "quotas / allow_anonymous / ACL path / both-factors / admin roles are live"
         );
 
         // Non-live edits DO require a restart, reported by section.
@@ -5266,7 +5275,9 @@ mod tests {
         restart.listeners.tls_bind = Some("0.0.0.0:8883".into());
         restart.cluster.peer_bind = Some("127.0.0.1:7001".into());
         restart.durable.lease_voters = 7;
+        restart.admin.bind = Some("0.0.0.0:9443".into());
         let sections = requires_restart(&base, &restart);
+        assert!(sections.contains(&"admin"));
         assert!(sections.contains(&"listeners"));
         assert!(sections.contains(&"cluster"));
         assert!(sections.contains(&"durable"));

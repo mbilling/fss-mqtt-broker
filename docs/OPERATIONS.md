@@ -4,8 +4,10 @@
 encodes the deployment contracts: StatefulSet with per-pod volumes, decommission-drain
 on scale-down, one-at-a-time rolls, a PodDisruptionBudget, and `--check-config` before
 serving. This page is the rest: the procedures an operator runs *after* day 1. Signals
-and files are the control surface — there is deliberately no admin API
-([GUIDE](../GUIDE.md#principles)).
+and files are the control surface, and configuration is only ever changed through the file
+([GUIDE](../GUIDE.md#principles)). The optional, authenticated
+[admin API](#the-admin-api-adr-0081) answers questions about the running cluster and runs a
+short list of audited actions; it never writes configuration.
 
 ## Certificate / ACL / CRL rotation — automatic
 
@@ -796,9 +798,12 @@ operators = ["CN=sre-lead, O=example"]    # reads + actions
   subject is matched against `viewers` and `operators`: an entry is the whole subject
   (`CN=sre-lead, O=example`) or `CN=<name>` for any subject with that Common Name. A
   subject in neither list gets `403 forbidden`. The lists hot-reload with the rest of the
-  config; the listener's certificate, key and CA are restart-scoped. On a cluster node the
+  config; the listener's bind, certificate, key and CA are restart-scoped (a reload that
+  changes them logs `admin` among the requires-restart sections). On a cluster node the
   cluster CA is trusted too, and a node certificate that is in no list gets the `peer` role,
-  which can read only the node's own state (so any node can answer for the cluster).
+  which can read only the node's own state (so any node can answer for the cluster). Use a
+  dedicated admin CA for `client_ca`: if it is the cluster CA, every unlisted certificate it
+  issued is admitted as `peer` instead of refused.
 - **Audit.** Every request, reads included, is one `admin.request` record:
   `role=viewer GET /admin/v1/node -> 200`, with the certificate subject.
 - **Errors.** `{"error":{"code":"forbidden","message":"…"}}`; scripts match on `code`
