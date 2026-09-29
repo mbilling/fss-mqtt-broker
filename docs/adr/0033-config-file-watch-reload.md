@@ -132,3 +132,5 @@ watcher becomes the **only** reload mechanism — a bonus, not the motivation.
 - **An admin endpoint that pushes new config.** A new authenticated network surface (rejected
   already in ADR 0032 for the trigger) and a different model (push vs the file being the source
   of truth). Out of scope.
+
+  > **Revisited by [ADR 0081](0081-admin-api.md) (2026-09-29).** An authenticated admin API now exists for reads and a short, fixed list of audited actions. Pushing config stays rejected there (ADR 0081 §5): the file remains the only source, and the API's reload re-reads it.

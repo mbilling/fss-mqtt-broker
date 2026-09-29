@@ -417,7 +417,7 @@ Other published measurements (dev-grade, single host, never capacity): [DURABLE-
 | Online backup/restore | ✅ | ⚠️ | n/v | 💰 | n/v | n/v |
 | Bridge | ✅ | ✅ | ✅ | ✖ | ✅ | ✅ |
 | Rule engine | ✖ by design | ✖ | ✅ | ✖ | ✖ | ✅ |
-| Dashboard / admin API | ✖ by design | ✖ | ✅ | 💰 | ✅ | ✅ |
+| Dashboard / admin API | ⚠️ admin API + CLI, no dashboard | ✖ | ✅ | 💰 | ✅ | ✅ |
 | MQTT-SN / CoAP | ✖ | ✖ | ✅ | ✖ | ✖ | ✖ |
 | Signed reproducible builds + SBOM | ✅ | ✖ | n/v | n/v | ✖ | ✖ |
 | FIPS variant | ✅ | ✖ | n/v | 💰 | ✖ | ✖ |
@@ -630,7 +630,7 @@ Tracked on the [delivery dashboard](docs/delivery/STATUS.md).
 - **Security:** OSS-Fuzz ([#553](https://github.com/mbilling/fss-mqtt-broker/issues/553)); funded third-party audit ([#554](https://github.com/mbilling/fss-mqtt-broker/issues/554))
 - **Routing:** bloom subscription digests; MQTT 5 Server-Reference redirect
 - **Operator:** CRD promotion from `v1alpha1`
-- **Not planned, by decision:** dashboard, HTTP admin API, SQL rule engine, MQTT-SN/CoAP
+- **Not planned, by decision:** dashboard, writing config over the network, SQL rule engine, MQTT-SN/CoAP
 
 ---
 

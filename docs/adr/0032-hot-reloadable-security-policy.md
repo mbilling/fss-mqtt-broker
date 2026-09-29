@@ -126,6 +126,8 @@ follow-ons enabled *by* this mechanism, tracked but not bundled:
 - **An admin HTTP/control endpoint.** A new network surface that itself needs authentication
   and authorization to avoid becoming the weakest link — more attack surface than a signal.
   Rejected for the trigger; the health/metrics server stays read-only.
+
+  > **Revisited by [ADR 0081](0081-admin-api.md) (2026-09-29).** An authenticated admin API now exists for reads and a short, fixed list of audited actions. Its `POST /admin/v1/reload` runs this same validate-before-swap routine and takes no input; signals stay the default trigger, and the health/metrics server stays read-only and unauthenticated.
 - **`arc-swap::ArcSwap` instead of `watch`.** Slightly leaner reads, but a new dependency for
   no capability `watch` lacks here. Rejected on the minimal-supply-chain principle (ADR 0002);
   `watch` is already in tree.

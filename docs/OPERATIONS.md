@@ -793,6 +793,48 @@ names. The cost is the reason it is no longer the only path: stopping a node mea
 decommission drain, whose measured per-pod cost is issue #248's, and during it the cluster
 runs one replica short. Use it deliberately, not as routine DR.
 
+## Day 0, 1 and 2 from the command line
+
+Everything below runs from the `mqttd` binary itself, so it works in the distroless image
+(`kubectl exec <pod> -- mqttd …`). The `--admin` verbs need the [admin API](#the-admin-api-adr-0081).
+
+**Day 0: before the first boot**
+
+| Question | Command |
+|---|---|
+| Is the config valid? | `mqttd --check-config --config mqttd.toml` |
+| …and will it start on *this* host (files readable, binds free)? | `mqttd --check-config --preflight --config mqttd.toml` |
+| What will it actually run with (file + env + defaults)? | `mqttd --print-config --config mqttd.toml` (secrets fingerprinted) |
+| Are the certificates right (chain, key match, expiry, SANs)? | `mqttd --check-tls --config mqttd.toml` |
+| A password-file line | `mqttd --hash-password alice` |
+
+**Day 1: bring-up**
+
+| Question | Command |
+|---|---|
+| Is this node live and ready? | `mqttd --probe /readyz` |
+| Did every node join, on one cluster id, one version, one config? | `mqttd --admin cluster` (the `summary` block) |
+| Does every node see the same membership? | `mqttd --admin placement` |
+| Which certificate identity and role do I have? | `mqttd --admin whoami` |
+| Is the policy right for a device before it connects? | `mqttd --admin authz device-7 publish devices/device-7/temp` |
+| First backup | `mqttd --backup` |
+
+**Day 2: running it**
+
+| Question | Command |
+|---|---|
+| Which clients are here, from where? | `mqttd --admin clients [--prefix p] [--user u] [--source 10.1.]` |
+| Why is this session's queue growing? | `mqttd --admin session <client>`, `mqttd --admin backlog` |
+| Who receives this topic? | `mqttd --admin subscribers <topic>` |
+| Why is this client denied? | `mqttd --admin authz <user> <action> <target>` |
+| What retained data is there? | `mqttd --admin retained --prefix p` |
+| Is the running config the committed one? | `mqttd --admin config` (`file_checksum`) |
+| Did my config change take? | `mqttd --admin reload` (outcome, or 409 with the reason) |
+| Get a misbehaving client off | `mqttd --admin kick <client>`; delete its session: `purge` |
+| Stop new connections to a node (keep the current ones) | `mqttd --admin cordon` / `uncordon` |
+| More logging for 15 minutes | `mqttd --admin log-override 'mqttd::hub=debug' --ttl 900` |
+| Remove a node for good | `mqttd --decommission` |
+
 ## The admin API (ADR 0081)
 
 An authenticated HTTPS listener for questions `/statusz` cannot answer and for a short
