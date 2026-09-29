@@ -1258,6 +1258,11 @@ redacted).
 - **Pre-flight check:** `mqttd --check-config [--config <path>]` validates the config the broker
   would boot with and exits **without binding any port** — the GitOps CI / pre-rollout gate.
   Exit `0` = OK, `1` = a clear located error.
+- **Effective config:** `mqttd --print-config [--config <path>]` prints that same merged config
+  as TOML, with inline secrets replaced by `sha256:` fingerprints (ADR 0081 T11).
+- **TLS check:** `mqttd --check-tls [--config <path>]` checks every configured certificate, key,
+  CA bundle and CRL — key match, chain order, expiry (warns under 30 days), names — one line
+  per check, exit `1` on any failure (ADR 0081 T12).
 - **Password hashing:** `mqttd --hash-password [<username>]` reads a password from **stdin** and
   prints the Argon2id line `MQTTD_PASSWORD_FILE` expects — with a username, the whole
   `username:hash` line; without one, the bare hash. The password goes on stdin, never in argv,
