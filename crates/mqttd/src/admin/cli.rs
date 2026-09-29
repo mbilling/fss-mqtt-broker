@@ -422,6 +422,15 @@ pub async fn run(args: &[String]) -> i32 {
                 }
                 0
             } else {
+                // `--json` gets the whole answer, refusals included (a rejected reload
+                // carries its `outcome`); exit 1 still says it was refused.
+                if inv.json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&value).unwrap_or_default()
+                    );
+                    return 1;
+                }
                 let code = value
                     .pointer("/error/code")
                     .and_then(Value::as_str)
@@ -431,6 +440,9 @@ pub async fn run(args: &[String]) -> i32 {
                     .and_then(Value::as_str)
                     .unwrap_or("");
                 eprintln!("mqttd: {status} {code}: {message}");
+                if let Some(outcome) = value.get("outcome") {
+                    print!("{}", render(outcome));
+                }
                 1
             }
         }
