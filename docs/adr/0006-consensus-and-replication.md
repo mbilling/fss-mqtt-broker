@@ -5,6 +5,7 @@
 - **Deciders:** project maintainers
 - **Delivery:** [docs/delivery/0006-consensus-and-replication.md](../delivery/0006-consensus-and-replication.md) — plan, progress, and changelog
 - **Related:** [ADR 0001](0001-session-durability.md) §4, [ADR 0005](0005-session-affinity.md)
+- **Amended by:** [ADR 0080](0080-replication-factor.md) — the replication factor R stated here as 3 becomes cluster state: configurable, default 2 for new clusters, changeable live
 
 > This record states the decision only. How it is being built and how far along it is
 > live in the [delivery doc](../delivery/0006-consensus-and-replication.md).
