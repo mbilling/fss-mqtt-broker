@@ -177,6 +177,26 @@ pub fn serial_from_cert(der: &[u8]) -> Option<Vec<u8>> {
     Some(cert.raw_serial().to_vec())
 }
 
+/// The subject of a DER-encoded, already chain-verified X.509 leaf: the full
+/// distinguished name as `x509-parser` prints it (`CN=ops, O=example`), and its first
+/// Common Name. The admin API (ADR 0081) maps these to roles.
+///
+/// `None` if the certificate cannot be parsed.
+#[must_use]
+pub fn subject_from_cert(der: &[u8]) -> Option<(String, Option<String>)> {
+    let (rest, cert) = x509_parser::parse_x509_certificate(der).ok()?;
+    if !rest.is_empty() {
+        return None;
+    }
+    let subject = cert.subject();
+    let cn = subject
+        .iter_common_name()
+        .next()
+        .and_then(|a| a.as_str().ok())
+        .map(String::from);
+    Some((subject.to_string(), cn))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -45,6 +45,8 @@ pub struct Config {
     pub backup: Backup,
     /// Audit-trail export (ADR 0066 T3).
     pub audit: Audit,
+    /// The authenticated admin API (ADR 0081).
+    pub admin: Admin,
     /// The unknown key paths the last parse IGNORED under
     /// [`UnknownConfigKeys::Warn`] (issue #230) — carried here so the caller can
     /// log them loudly without a signature change. Never serialized; empty under
@@ -566,6 +568,35 @@ pub struct Audit {
     /// the audit rate — see docs/AUDIT-SCHEMA.md for the record format, the SIEM
     /// boundary invariant, and the verification procedure.
     pub syslog: Option<String>,
+}
+
+/// The authenticated admin API ([ADR 0081](../../../docs/adr/0081-admin-api.md)).
+///
+/// Off unless [`Admin::bind`] is set. It is never the health or metrics listener: it
+/// serves client and session detail, so it requires TLS with a client certificate, and a
+/// certificate is admitted only if its subject is listed in [`Admin::viewers`] or
+/// [`Admin::operators`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Admin {
+    /// Admin API listener (`MQTTD_ADMIN_BIND`), e.g. `0.0.0.0:9443`. Unset = no admin API.
+    /// Needs [`Admin::cert`], [`Admin::key`] and [`Admin::client_ca`].
+    pub bind: Option<String>,
+    /// Admin listener server certificate chain PEM (`MQTTD_ADMIN_CERT`).
+    pub cert: Option<String>,
+    /// Admin listener private key PEM (`MQTTD_ADMIN_KEY`).
+    pub key: Option<String>,
+    /// CA bundle PEM that issues admin client certificates (`MQTTD_ADMIN_CLIENT_CA`).
+    /// Every admin request presents a certificate it issued.
+    pub client_ca: Option<String>,
+    /// Certificate subjects granted the read-only `viewer` role (`MQTTD_ADMIN_VIEWERS`,
+    /// `;`-separated). An entry is either the full subject (`CN=ops,O=example`) or
+    /// `CN=<name>`, which matches any subject with that Common Name. Hot-reloadable.
+    pub viewers: Vec<String>,
+    /// Certificate subjects granted the `operator` role, which may also call the actions
+    /// (`MQTTD_ADMIN_OPERATORS`, `;`-separated, same syntax as [`Admin::viewers`]).
+    /// Hot-reloadable.
+    pub operators: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1104,6 +1135,14 @@ impl Config {
                 ))),
             }
         }
+        // Certificate subjects contain commas (`CN=a,O=b`), so subject lists split on `;`.
+        fn subject_list(v: &str) -> Vec<String> {
+            v.split(';')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+                .collect()
+        }
         fn list(v: &str) -> Vec<String> {
             v.split(',')
                 .map(str::trim)
@@ -1494,6 +1533,25 @@ impl Config {
         on!("MQTTD_AUDIT_SYSLOG", v, {
             self.audit.syslog = Some(v);
         });
+        // -- admin API (ADR 0081) --
+        on!("MQTTD_ADMIN_BIND", v, {
+            self.admin.bind = Some(v);
+        });
+        on!("MQTTD_ADMIN_CERT", v, {
+            self.admin.cert = Some(v);
+        });
+        on!("MQTTD_ADMIN_KEY", v, {
+            self.admin.key = Some(v);
+        });
+        on!("MQTTD_ADMIN_CLIENT_CA", v, {
+            self.admin.client_ca = Some(v);
+        });
+        on!("MQTTD_ADMIN_VIEWERS", v, {
+            self.admin.viewers = subject_list(&v);
+        });
+        on!("MQTTD_ADMIN_OPERATORS", v, {
+            self.admin.operators = subject_list(&v);
+        });
         on!("MQTTD_BACKUP_DIR", v, {
             self.backup.dir = Some(v);
         });
@@ -1796,6 +1854,7 @@ impl Config {
                     .to_string(),
             ));
         }
+        self.refuse_invalid_admin().map_err(ConfigError::Invalid)?;
         // Ephemeral durability without the explicit opt-in (issue #240, ADR 0029
         // as-delivered): durable ON + no data_dir is quorum-of-RAM — refused rather
         // than warned. Checked last so a config broken in a more specific way is
@@ -1841,6 +1900,49 @@ impl Config {
                         in-flight window could never put a QoS>0 message on the wire)"
                     .to_string(),
             );
+        }
+        Ok(())
+    }
+}
+
+impl Config {
+    /// The admin listener's shape (ADR 0081 §1): TLS material and at least one role are
+    /// required when it is on, and it never shares a bind with the unauthenticated health
+    /// or metrics listener.
+    fn refuse_invalid_admin(&self) -> Result<(), String> {
+        let admin = &self.admin;
+        let Some(bind) = &admin.bind else {
+            return Ok(());
+        };
+        for (field, value) in [
+            ("admin.cert (MQTTD_ADMIN_CERT)", &admin.cert),
+            ("admin.key (MQTTD_ADMIN_KEY)", &admin.key),
+            ("admin.client_ca (MQTTD_ADMIN_CLIENT_CA)", &admin.client_ca),
+        ] {
+            if value.is_none() {
+                return Err(format!(
+                    "admin.bind is set but {field} is not: the admin API is TLS with a \
+                     required client certificate, never plaintext"
+                ));
+            }
+        }
+        if admin.viewers.is_empty() && admin.operators.is_empty() {
+            return Err(
+                "admin.bind is set but neither admin.viewers nor admin.operators lists a \
+                 certificate subject: every request would be refused"
+                    .to_string(),
+            );
+        }
+        for other in [&self.listeners.health_bind, &self.listeners.metrics_bind]
+            .into_iter()
+            .flatten()
+        {
+            if other == bind {
+                return Err(format!(
+                    "admin.bind {bind} is also the health/metrics bind: the admin API needs \
+                     its own authenticated listener"
+                ));
+            }
         }
         Ok(())
     }
@@ -2027,6 +2129,13 @@ pub const ENV_VARS: &[&str] = &[
     "MQTTD_CONFIG_UNKNOWN_KEYS",
     // audit (ADR 0066 T3)
     "MQTTD_AUDIT_SYSLOG",
+    // admin API (ADR 0081)
+    "MQTTD_ADMIN_BIND",
+    "MQTTD_ADMIN_CERT",
+    "MQTTD_ADMIN_KEY",
+    "MQTTD_ADMIN_CLIENT_CA",
+    "MQTTD_ADMIN_VIEWERS",
+    "MQTTD_ADMIN_OPERATORS",
     // backup (ADR 0062)
     "MQTTD_BACKUP_DIR",
     "MQTTD_BACKUP_EVERY",
@@ -2957,9 +3066,10 @@ mod tests {
             // plus MQTTD_SHARED_LOCAL_BIAS (issue #613 item 3.4: the locality dial
             // that turns MQTTD_SHARED_PREFER_LOCAL's on/off into a fraction),
             // plus MQTTD_REQUIRE_PASSWORD_WITH_CERTIFICATE (issue #670),
-            // plus the five MQTTD_<LISTENER>_ALLOW_ANONYMOUS overrides (issue #669).
+            // plus the five MQTTD_<LISTENER>_ALLOW_ANONYMOUS overrides (issue #669),
             // plus MQTTD_REPLICAS (ADR 0080),
-            102,
+            // plus the six MQTTD_ADMIN_* variables (ADR 0081).
+            108,
             "the MQTTD_* surface changed — update ENV_VARS"
         );
         // Issue #239: MQTTD_MIN_REPLICAS was wired in `overlay_from` but never
@@ -3016,6 +3126,36 @@ mod tests {
     /// clustered ABOVE it is refused, because there the broker would deliver to
     /// local subscribers and silently drop the peer frame, which presents as a
     /// consistency bug rather than a limit.
+    /// ADR 0081 §1: the admin listener is TLS with a client certificate and at least one
+    /// role, on its own bind — each missing piece is refused, and off stays valid.
+    #[test]
+    fn the_admin_listener_needs_tls_a_role_and_its_own_bind() {
+        let mut c = Config::default();
+        c.node.data_dir = Some("/var/lib/mqttd".into());
+        assert!(c.validate().is_ok(), "no admin.bind = no admin API, valid");
+        c.admin.bind = Some("0.0.0.0:9443".into());
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("admin.cert"), "{err}");
+        c.admin.cert = Some("cert.pem".into());
+        c.admin.key = Some("key.pem".into());
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("admin.client_ca"), "{err}");
+        c.admin.client_ca = Some("ca.pem".into());
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("admin.viewers"), "{err}");
+        c.admin.operators = vec!["CN=root".into()];
+        assert!(c.validate().is_ok());
+        c.listeners.health_bind = Some("0.0.0.0:9443".into());
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("health/metrics bind"), "{err}");
+
+        // `;` separates subjects, because a subject contains commas.
+        let mut c = Config::default();
+        c.overlay_from(getter(&[("MQTTD_ADMIN_VIEWERS", "CN=a, O=x ; CN=b")]))
+            .unwrap();
+        assert_eq!(c.admin.viewers, vec!["CN=a, O=x", "CN=b"]);
+    }
+
     #[test]
     fn a_clustered_node_refuses_a_packet_size_it_cannot_forward() {
         const OVER: u64 = 32 * 1024 * 1024;

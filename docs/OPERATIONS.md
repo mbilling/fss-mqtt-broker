@@ -4,8 +4,10 @@
 encodes the deployment contracts: StatefulSet with per-pod volumes, decommission-drain
 on scale-down, one-at-a-time rolls, a PodDisruptionBudget, and `--check-config` before
 serving. This page is the rest: the procedures an operator runs *after* day 1. Signals
-and files are the control surface — there is deliberately no admin API
-([GUIDE](../GUIDE.md#principles)).
+and files are the control surface, and configuration is only ever changed through the file
+([GUIDE](../GUIDE.md#principles)). The optional, authenticated
+[admin API](#the-admin-api-adr-0081) answers questions about the running cluster and runs a
+short list of audited actions; it never writes configuration.
 
 ## Certificate / ACL / CRL rotation — automatic
 
@@ -790,6 +792,56 @@ snapshots; restore by recreating the StatefulSet over the restored PVs with the 
 names. The cost is the reason it is no longer the only path: stopping a node means a full
 decommission drain, whose measured per-pod cost is issue #248's, and during it the cluster
 runs one replica short. Use it deliberately, not as routine DR.
+
+## The admin API (ADR 0081)
+
+An authenticated HTTPS listener for questions `/statusz` cannot answer and for a short
+list of audited actions. It is **off unless `admin.bind` is set**, and it is never the
+health or metrics listener.
+
+```toml
+[admin]
+bind = "0.0.0.0:9443"
+cert = "/etc/mqttd/admin/server.pem"      # server certificate for this listener
+key = "/etc/mqttd/admin/server.key"
+client_ca = "/etc/mqttd/admin/ca.pem"     # issues admin client certificates
+viewers = ["CN=oncall"]                   # every read
+operators = ["CN=sre-lead, O=example"]    # reads + actions
+```
+
+- **Who may call.** Every request presents a client certificate from `client_ca`. Its
+  subject is matched against `viewers` and `operators`: an entry is the whole subject
+  (`CN=sre-lead, O=example`) or `CN=<name>` for any subject with that Common Name. A
+  subject in neither list gets `403 forbidden`. The lists hot-reload with the rest of the
+  config; the listener's bind, certificate, key and CA are restart-scoped (a reload that
+  changes them logs `admin` among the requires-restart sections). On a cluster node the
+  cluster CA is trusted too, and a node certificate that is in no list gets the `peer` role,
+  which can read only the node's own state (so any node can answer for the cluster). Use a
+  dedicated admin CA for `client_ca`: if it is the cluster CA, every unlisted certificate it
+  issued is admitted as `peer` instead of refused.
+- **Audit.** Every request, reads included, is one `admin.request` record:
+  `role=viewer GET /admin/v1/node -> 200`, with the certificate subject.
+- **Errors.** `{"error":{"code":"forbidden","message":"…"}}`; scripts match on `code`
+  (`forbidden`, `not-found`, `method-not-allowed`, `bad-request`, `too-large`, `timeout`).
+
+`mqttd --admin <verb>` is the client, in the same binary, so it works in the distroless
+image (`kubectl exec <pod> -- mqttd --admin node`):
+
+```sh
+export MQTTD_ADMIN_URL=https://mqttd-0.mqttd:9443
+export MQTTD_ADMIN_CA=/etc/mqttd/admin/ca.pem          # verifies the server
+export MQTTD_ADMIN_CLIENT_CERT=~/.mqttd/oncall.pem
+export MQTTD_ADMIN_CLIENT_KEY=~/.mqttd/oncall.key
+mqttd --admin whoami          # the subject and role the broker sees
+mqttd --admin node            # this node's state (the /statusz body)
+mqttd --admin node --json     # the raw JSON
+mqttd --admin help            # every verb
+```
+
+Each variable has a flag (`--url`, `--ca`, `--cert`, `--key`, `--server-name`). Without a
+URL, the CLI uses `admin.bind` from the local config, and without a CA, `admin.client_ca`.
+These variables configure the client, not the broker, so they are not in
+[CONFIGURATION.md](CONFIGURATION.md).
 
 ## Shipping the audit trail to a SIEM
 
