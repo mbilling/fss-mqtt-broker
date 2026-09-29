@@ -1931,6 +1931,11 @@ pub struct Hub {
     /// The durable driver reads it to widen ownership; the plane reads it for
     /// readiness; /statusz reports it.
     ownership_domain: Option<(Arc<std::sync::atomic::AtomicBool>, bool)>,
+    /// ADR 0080: whether every placement member can decode the lease group's
+    /// replication-factor commands (last-negotiated peer proto >=
+    /// [`mqtt_cluster::peer::PROTO_REPLICATION_FACTOR`]). Recomputed each sweep;
+    /// the only thing allowed to propose one of those commands reads it first.
+    replication_capable: Option<Arc<std::sync::atomic::AtomicBool>>,
     /// The last peer-bus proto each member NEGOTIATED, surviving link flaps
     /// (updated on link attach, removed only on confirmed death) — a transient
     /// redial must not flap the ownership domain and mass-migrate 256 groups
@@ -2357,6 +2362,7 @@ impl Hub {
                 // call site keeps today's behaviour with no edit (issue #613).
                 shared_local_bias_permille: 1000,
                 ownership_domain: None,
+                replication_capable: None,
                 known_peer_protos: HashMap::new(),
                 retained: Arc::new(MemoryRetainedStore::new()),
                 durable_retained: None,
@@ -2526,6 +2532,13 @@ impl Hub {
         self.ownership_domain = Some((flag, enabled));
     }
 
+    /// Wire the ADR 0080 replication-factor capability: `flag` is shared with
+    /// whatever proposes a replication-factor command, and set only while every
+    /// member speaks [`mqtt_cluster::peer::PROTO_REPLICATION_FACTOR`].
+    pub fn set_replication_capable(&mut self, flag: Arc<std::sync::atomic::AtomicBool>) {
+        self.replication_capable = Some(flag);
+    }
+
     pub fn attach_durable_plane(&mut self, plane: DurablePlane) {
         self.durable_plane = Some(plane);
     }
@@ -2623,6 +2636,7 @@ impl Hub {
                     self.submit_pending_qos2_cleanup();
                     self.refresh_gauges().await;
                     self.refresh_ownership_domain();
+                    self.refresh_replication_capable();
                     // Retransmit an unanswered retained handoff (T8 — same seq, the
                     // owner dedups), then retry queued retained mutations (ADR 0037
                     // §5): covers heals with no link event — a lease landing locally,
@@ -6069,21 +6083,8 @@ impl Hub {
         let Some((flag, enabled)) = &self.ownership_domain else {
             return;
         };
-        let all_capable = *enabled
-            && self.placement.as_ref().is_some_and(|p| {
-                let members: Vec<NodeId> = {
-                    let p = p.read().unwrap_or_else(std::sync::PoisonError::into_inner);
-                    p.members_snapshot()
-                        .into_iter()
-                        .map(|(id, _, _)| id)
-                        .collect()
-                };
-                members.iter().all(|id| {
-                    *id == self.node_id
-                        || self.known_peer_protos.get(id).copied().unwrap_or(0)
-                            >= mqtt_cluster::peer::PROTO_OWNERSHIP_DOMAIN
-                })
-            });
+        let all_capable =
+            *enabled && self.every_member_speaks(mqtt_cluster::peer::PROTO_OWNERSHIP_DOMAIN);
         let was = flag.swap(all_capable, std::sync::atomic::Ordering::Relaxed);
         if was != all_capable {
             if all_capable {
@@ -6096,6 +6097,46 @@ impl Hub {
                     "durable ownership domain RESTRICTED to the lease voters (ADR 0049 \
                      posture): a member lacks the scale-out capability (rolled-back \
                      binary, or a first handshake still pending)"
+                );
+            }
+        }
+    }
+
+    /// Whether every placement member last negotiated peer proto >= `proto` (this
+    /// node's own build trivially qualifies). An unknown proto — a member seen in
+    /// gossip whose first handshake has not completed, or a rolled-back binary —
+    /// reads as not capable.
+    fn every_member_speaks(&self, proto: u32) -> bool {
+        self.placement.as_ref().is_some_and(|p| {
+            let members: Vec<NodeId> = {
+                let p = p.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+                p.members_snapshot()
+                    .into_iter()
+                    .map(|(id, _, _)| id)
+                    .collect()
+            };
+            members.iter().all(|id| {
+                *id == self.node_id || self.known_peer_protos.get(id).copied().unwrap_or(0) >= proto
+            })
+        })
+    }
+
+    /// Recompute the ADR 0080 replication-factor capability, edge-logged.
+    fn refresh_replication_capable(&self) {
+        let Some(flag) = &self.replication_capable else {
+            return;
+        };
+        let capable = self.every_member_speaks(mqtt_cluster::peer::PROTO_REPLICATION_FACTOR);
+        if flag.swap(capable, std::sync::atomic::Ordering::Relaxed) != capable {
+            if capable {
+                info!(
+                    "every member can apply replication-factor changes (ADR 0080, peer \
+                     proto >= 9)"
+                );
+            } else {
+                warn!(
+                    "replication-factor changes held: a member cannot apply them (older \
+                     binary, or a first handshake still pending) (ADR 0080)"
                 );
             }
         }
@@ -19261,6 +19302,62 @@ mod tests {
             vec![b"m1".to_vec(), b"m2".to_vec(), b"m3-qos0".to_vec()],
             "admission order is wire order — the QoS 0 never overtakes a staged \
              QoS 2 (#242 finding A)"
+        );
+    }
+
+    /// ADR 0080: replication-factor commands may be proposed only while every
+    /// placement member can apply them. Unknown or older protos hold the flag down;
+    /// it follows the members both ways.
+    #[tokio::test]
+    async fn the_replication_capability_needs_every_member_at_proto_9() {
+        use mqtt_cluster::swim::MemberState;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let placement = Arc::new(RwLock::new(Placement::new(
+            NodeId("rf-local".into()),
+            mqtt_cluster::placement::DEFAULT_REPLICAS,
+        )));
+        placement.write().unwrap().observe(
+            &NodeId("rf-peer".into()),
+            MemberState::Alive,
+            "peer:7000",
+            None,
+        );
+        let (mut hub, _tx) = Hub::with_config_and_placement(
+            NodeId("rf-local".into()),
+            Arc::new(MemorySessionStore::new()),
+            Some(placement),
+        );
+        let flag = Arc::new(AtomicBool::new(false));
+        hub.set_replication_capable(flag.clone());
+        let peer = NodeId("rf-peer".into());
+
+        hub.refresh_replication_capable();
+        assert!(
+            !flag.load(Ordering::Relaxed),
+            "an unknown proto is not capable"
+        );
+
+        hub.known_peer_protos.insert(
+            peer.clone(),
+            mqtt_cluster::peer::PROTO_REPLICATION_FACTOR - 1,
+        );
+        hub.refresh_replication_capable();
+        assert!(
+            !flag.load(Ordering::Relaxed),
+            "a proto-8 member cannot apply them"
+        );
+
+        hub.known_peer_protos
+            .insert(peer.clone(), mqtt_cluster::peer::PROTO_REPLICATION_FACTOR);
+        hub.refresh_replication_capable();
+        assert!(flag.load(Ordering::Relaxed), "every member capable");
+
+        hub.known_peer_protos
+            .insert(peer, mqtt_cluster::peer::PROTO_REPLICATION_FACTOR - 1);
+        hub.refresh_replication_capable();
+        assert!(
+            !flag.load(Ordering::Relaxed),
+            "a rolled-back member drops it again"
         );
     }
 

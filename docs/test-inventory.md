@@ -254,7 +254,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `two_bridge_instances_do_not_duplicate_forwarding`
 - `two_partitioned_instances_deliver_each_inbound_message_exactly_once`
 
-## `crates/mqtt-cluster/src/lib.rs` — 327 test(s)
+## `crates/mqtt-cluster/src/lib.rs` — 334 test(s)
 
 - `cluster_identity::tests::a_founder_mints_once_and_reloads_stably`
 - `cluster_identity::tests::a_joiner_adopts_once_and_persists`
@@ -406,6 +406,8 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `lease_membership::tests::the_upgrade_shrink_is_also_domain_balanced`
 - `lease_membership::tests::vacancy_fill_spreads_across_failure_domains`
 - `lease_membership::tests::within_a_domain_ties_break_by_lowest_id`
+- `lease_raft::tests::a_recorded_factor_round_trips_and_is_not_misread_as_legacy`
+- `lease_raft::tests::a_replica_change_opens_from_the_factor_in_force_and_closes_on_its_target`
 - `lease_raft::tests::assign_many_applies_each_at_a_fresh_epoch`
 - `lease_raft::tests::assign_mints_a_lease_at_a_fresh_epoch`
 - `lease_raft::tests::epochs_are_globally_monotonic_across_groups`
@@ -414,11 +416,15 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `lease_raft::tests::openraft_wire_types_roundtrip_under_postcard`
 - `lease_raft::tests::reassign_bumps_the_epoch_monotonically`
 - `lease_raft::tests::replay_is_deterministic`
+- `lease_raft::tests::replication_commands_leave_the_lease_table_alone`
+- `lease_raft::tests::set_replicas_founds_the_factor_once`
 - `lease_raft::tests::unknown_group_has_no_lease`
+- `lease_raft::tests::unset_state_encodes_exactly_as_the_legacy_table`
 - `lease_store::tests::a_foreign_lease_schema_version_fails_closed`
 - `lease_store::tests::passes_openraft_conformance_suite_in_memory`
 - `lease_store::tests::passes_openraft_conformance_suite_persistent`
 - `lease_store::tests::the_migration_registry_covers_the_contract_range`
+- `lease_store::tests::the_replication_factor_survives_reopen_and_snapshot_install`
 - `lease_store::tests::vote_and_lease_survive_reopen`
 - `node_registry::tests::distinct_nodes_get_distinct_ids`
 - `node_registry::tests::raft_id_is_deterministic`
@@ -439,6 +445,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `placement::tests::a_declared_member_count_arms_the_write_floor_before_gossip_or_the_roster`
 - `placement::tests::a_joining_node_moves_only_a_minority`
 - `placement::tests::a_memo_hit_does_not_recompute_the_hrw_pass`
+- `placement::tests::a_new_replication_factor_reshapes_sets_and_keeps_owners`
 - `placement::tests::alive_and_suspect_are_eligible_dead_is_removed`
 - `placement::tests::alone_this_node_owns_everything`
 - `placement::tests::an_empty_durable_roster_is_not_a_membership_witness`
@@ -967,7 +974,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 468 test(s)
+## `crates/mqttd/src/lib.rs` — 469 test(s)
 
 - `admission::tests::the_global_cap_refuses_at_the_bound_and_recovers`
 - `admission::tests::the_penalty_box_refuses_after_the_threshold`
@@ -1394,6 +1401,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::the_ownership_domain_flag_needs_every_member_capable_and_the_operator_choice`
 - `hub::tests::the_raw_broadcast_no_longer_warms_caches_under_durable`
 - `hub::tests::the_rehome_scan_is_skipped_while_ownership_has_not_moved`
+- `hub::tests::the_replication_capability_needs_every_member_at_proto_9`
 - `hub::tests::the_retained_digest_is_order_independent_and_set_sensitive`
 - `hub::tests::the_retained_queue_bound_drops_the_oldest_loudly`
 - `hub::tests::the_snapshot_carries_tokens_and_tombstone_entries`

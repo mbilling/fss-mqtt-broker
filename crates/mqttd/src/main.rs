@@ -2033,6 +2033,9 @@ async fn start_hub(
         }
         // Keep a plane clone for the health endpoint's lease-group readiness signal.
         let plane_for_health = plane.clone();
+        // ADR 0080: set while every member can apply the lease group's
+        // replication-factor commands; read before proposing one (0080-T2).
+        hub.set_replication_capable(Arc::new(std::sync::atomic::AtomicBool::new(false)));
         hub.set_ownership_domain(
             ownership_domain_all,
             config.durable.ownership_domain == OwnershipDomain::Members,
