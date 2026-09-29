@@ -56,8 +56,10 @@ addresses and subscriptions are identifying data that must not be served there.
   anonymous access.
 - **Two roles, mapped from the client certificate's subject:** `[admin] viewers` and
   `[admin] operators` (lists of subject DNs). A certificate that matches neither list is
-  refused. `viewer` may call every `GET`; `operator` may also call the actions (§4). The
-  role lists hot-reload with the security policy (ADR 0032).
+  refused, except a node certificate from the cluster CA, which gets the read-only `peer`
+  role: it may read that node's own state and nothing else. `viewer` may call every `GET`;
+  `operator` may also call the actions (§4). The role lists hot-reload with the security
+  policy (ADR 0032).
 - **Every request is audited** to the existing audit log (`docs/AUDIT-SCHEMA.md`): who, the
   role, the endpoint, the target, and the outcome. Reads of client and session detail are
   audited too, because they reveal identifying data.
