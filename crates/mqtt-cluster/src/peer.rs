@@ -79,11 +79,22 @@ pub const PROTO_MIN: u32 = 6;
 /// any proto-7 member in the mesh (a rolled-back binary) reads as not-capable and
 /// the whole cluster holds ADR 0049's voter-bounded domain — one ownership rule in
 /// force at a time, degrading toward the conservative one.
-pub const PROTO_MAX: u32 = 8;
+///
+/// Proto 9 (ADR 0080) is another capability marker with no new frames: a build
+/// speaking 9 can decode the lease group's replication-factor commands
+/// (`LeaseRequest::SetReplicas` and the live-change pair). They ride existing
+/// `RaftRpc` payloads, which an older build would fail to apply, so they are
+/// proposed only once every member's link negotiated ≥ 9.
+pub const PROTO_MAX: u32 = 9;
 
 /// The peer-bus proto at which a build computes durable ownership over all admitted
 /// members (ADR 0073). Purely a capability marker — see [`PROTO_MAX`].
 pub const PROTO_OWNERSHIP_DOMAIN: u32 = 8;
+
+/// The peer-bus proto at which a build decodes the lease group's
+/// replication-factor commands (ADR 0080). Purely a capability marker — see
+/// [`PROTO_MAX`].
+pub const PROTO_REPLICATION_FACTOR: u32 = 9;
 
 /// Negotiate a link's protocol version from both sides' announced ranges
 /// (ADR 0038): the newest version both can speak, or `None` when the ranges are
@@ -901,7 +912,8 @@ mod tests {
     use super::{
         decode, encode, encode_legacy, negotiate_proto, ForwardVerdict, PeerCodecError,
         PeerMessage, ReplicaEntryWire, RetainedWireEntry, SharedGroupWire, SharedMemberWire,
-        WireAppProps, MAX_FRAME, PROTO_MAX, PROTO_MIN,
+        WireAppProps, MAX_FRAME, PROTO_MAX, PROTO_MIN, PROTO_OWNERSHIP_DOMAIN,
+        PROTO_REPLICATION_FACTOR,
     };
     use bytes::BytesMut;
 
@@ -1239,10 +1251,17 @@ mod tests {
         // A proto-7 peer (a pre-0073 build) negotiates 7 and keeps its verdict
         // frames; the capability marker only exists at 8.
         assert_eq!(negotiate_proto((PROTO_MIN, PROTO_MAX), (6, 7)), Some(7));
+        // A proto-8 peer (a pre-0080 build) negotiates 8: it keeps the scale-out
+        // capability, and is what holds the replication-factor commands back.
+        assert_eq!(
+            negotiate_proto((PROTO_MIN, PROTO_MAX), (6, PROTO_OWNERSHIP_DOMAIN)),
+            Some(PROTO_OWNERSHIP_DOMAIN),
+            "a pre-0080 build keeps the proto-8 scale-out capability (ADR 0073)"
+        );
         assert_eq!(
             negotiate_proto((PROTO_MIN, PROTO_MAX), (PROTO_MIN, PROTO_MAX)),
-            Some(8),
-            "this build must announce the proto-8 scale-out capability (ADR 0073)"
+            Some(PROTO_REPLICATION_FACTOR),
+            "this build must announce the proto-9 replication-factor capability (ADR 0080)"
         );
     }
 

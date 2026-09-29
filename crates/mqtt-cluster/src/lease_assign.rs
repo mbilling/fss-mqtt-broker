@@ -23,7 +23,54 @@ use crate::lease_raft::{GroupId, LeaseRequest, RaftNodeId};
 use crate::lease_store::LeaseStore;
 use crate::node_registry::raft_id;
 use crate::placement::{Placement, NUM_GROUPS};
-use std::sync::{Arc, RwLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant};
+
+/// How long a fresh cluster's leader holds its first lease assignment waiting for
+/// the replication-factor capability (ADR 0080 §2) before founding without one.
+/// The capability is recomputed on the hub's one-second sweep, so on a founder it
+/// arrives within a tick or two; the bound only matters when a member really
+/// cannot apply the command.
+pub const FOUNDING_WAIT: Duration = Duration::from_secs(10);
+
+/// Founding a cluster's replication factor (ADR 0080 §2): the configured value,
+/// and the flag saying every member can apply the command that records it.
+#[derive(Debug, Clone)]
+pub struct Founding {
+    replicas: u8,
+    capable: Arc<AtomicBool>,
+    wait: Duration,
+    held_since: Arc<Mutex<Option<Instant>>>,
+}
+
+impl Founding {
+    /// Found new clusters at `replicas`, once `capable` is set.
+    #[must_use]
+    pub fn new(replicas: u8, capable: Arc<AtomicBool>) -> Self {
+        Self::with_wait(replicas, capable, FOUNDING_WAIT)
+    }
+
+    /// [`new`](Self::new) with an explicit hold bound (tests).
+    #[must_use]
+    pub fn with_wait(replicas: u8, capable: Arc<AtomicBool>, wait: Duration) -> Self {
+        Self {
+            replicas,
+            capable,
+            wait,
+            held_since: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// Whether the first assignment has been held for the whole bound.
+    fn waited_out(&self) -> bool {
+        let mut since = self
+            .held_since
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        since.get_or_insert_with(Instant::now).elapsed() >= self.wait
+    }
+}
 
 /// Errors from applying lease assignments.
 #[derive(Debug, thiserror::Error)]
@@ -37,13 +84,65 @@ pub enum AssignError {
 #[derive(Debug, Clone)]
 pub struct LeaseAssigner {
     placement: Arc<RwLock<Placement>>,
+    founding: Option<Founding>,
 }
 
 impl LeaseAssigner {
     /// An assigner resolving group owners from `placement`.
     #[must_use]
     pub fn new(placement: Arc<RwLock<Placement>>) -> Self {
-        Self { placement }
+        Self {
+            placement,
+            founding: None,
+        }
+    }
+
+    /// Found a fresh cluster's replication factor before its first assignment
+    /// (ADR 0080 §2). Without it a fresh cluster runs at the legacy 3.
+    #[must_use]
+    pub fn with_founding(mut self, founding: Founding) -> Self {
+        self.founding = Some(founding);
+        self
+    }
+
+    /// The replication factor this node would found a cluster at, if founding.
+    #[must_use]
+    pub fn founding_replicas(&self) -> Option<u8> {
+        self.founding.as_ref().map(|f| f.replicas)
+    }
+
+    /// On a FRESH cluster — no lease ever minted, no factor recorded — commit the
+    /// configured factor before anything is assigned, so no durable write is ever
+    /// made under another one. Returns `false` while the first assignment must
+    /// still wait for the capability.
+    async fn found(&self, raft: &LeaseRaft, store: &LeaseStore) -> Result<bool, AssignError> {
+        let Some(founding) = &self.founding else {
+            return Ok(true);
+        };
+        if !store.replication().is_unset() || store.high_epoch() > 0 {
+            return Ok(true); // founded, or a pre-0080 cluster that keeps 3
+        }
+        if founding.capable.load(Ordering::Relaxed) {
+            raft.client_write(LeaseRequest::SetReplicas {
+                r: founding.replicas,
+            })
+            .await
+            .map_err(|e| AssignError::Raft(e.to_string()))?;
+            tracing::info!(
+                replicas = founding.replicas,
+                "founded the cluster's replication factor (ADR 0080)"
+            );
+            return Ok(true);
+        }
+        if founding.waited_out() {
+            tracing::warn!(
+                wanted = founding.replicas,
+                "founding WITHOUT a replication factor: a member cannot apply the command \
+                 (an older build?). This cluster runs at the legacy 3 (ADR 0080)"
+            );
+            return Ok(true);
+        }
+        Ok(false)
     }
 
     /// The `(group, desired-holder)` pairs whose committed lease holder differs from
@@ -86,6 +185,9 @@ impl LeaseAssigner {
         store: &LeaseStore,
     ) -> Result<usize, AssignError> {
         if !raft_view(raft).is_leader {
+            return Ok(0);
+        }
+        if !self.found(raft, store).await? {
             return Ok(0);
         }
         let assignments = self.pending(store);
@@ -202,6 +304,103 @@ mod tests {
             assert_eq!(store.current_lease(group).unwrap().holder, local);
         }
 
+        raft.shutdown().await.unwrap();
+    }
+
+    /// A single-node lease group, initialised and leading.
+    async fn leading(name: &str) -> (LeaseRaft, LeaseStore, Arc<RwLock<Placement>>) {
+        let node = nid(name);
+        let local = raft_id(&node);
+        let placement = Arc::new(RwLock::new(Placement::new(node, DEFAULT_REPLICAS)));
+        let store = LeaseStore::new();
+        let (ls, sm) = Adaptor::new(store.clone());
+        let raft: LeaseRaft = Raft::new(local, config(), MeshRaftNetwork::new(), ls, sm)
+            .await
+            .unwrap();
+        raft.initialize(BTreeMap::from([(local, BasicNode::default())]))
+            .await
+            .unwrap();
+        raft.wait(Some(Duration::from_secs(10)))
+            .state(ServerState::Leader, "leader")
+            .await
+            .unwrap();
+        (raft, store, placement)
+    }
+
+    /// ADR 0080 §2: a fresh cluster's leader records the configured factor BEFORE
+    /// its first assignment, so no lease — and so no durable write — exists under
+    /// another one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_fresh_cluster_is_founded_at_the_configured_factor_before_any_lease() {
+        use super::Founding;
+        use std::sync::atomic::AtomicBool;
+        let (raft, store, placement) = leading("found-node").await;
+        let capable = Arc::new(AtomicBool::new(true));
+        let assigner = LeaseAssigner::new(placement).with_founding(Founding::new(2, capable));
+        assert!(store.replication().is_unset());
+        let made = assigner.reconcile(&raft, &store).await.unwrap();
+        assert_eq!(made, usize::try_from(NUM_GROUPS).unwrap());
+        assert_eq!(store.replication().replicas, Some(2));
+        // The factor's entry precedes every lease: the first minted epoch is 1.
+        assert_eq!(store.high_epoch(), NUM_GROUPS);
+        raft.shutdown().await.unwrap();
+    }
+
+    /// Without the capability the first assignment is HELD for the bound, then the
+    /// cluster is founded without a factor (the legacy 3) rather than never serving.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_incapable_fresh_cluster_holds_then_founds_at_the_legacy_factor() {
+        use super::Founding;
+        use std::sync::atomic::AtomicBool;
+        let (raft, store, placement) = leading("hold-node").await;
+        let capable = Arc::new(AtomicBool::new(false));
+        let assigner = LeaseAssigner::new(placement).with_founding(Founding::with_wait(
+            2,
+            capable,
+            Duration::from_millis(300),
+        ));
+        assert_eq!(assigner.reconcile(&raft, &store).await.unwrap(), 0, "held");
+        assert_eq!(store.high_epoch(), 0);
+        // Poll the observable — the first assignment is no longer held — until the
+        // 300 ms bound expires, as the driver's reconcile tick would.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let made = loop {
+            let made = assigner.reconcile(&raft, &store).await.unwrap();
+            if made > 0 {
+                break made;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the hold never expired: an incapable fresh cluster would never serve"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        assert_eq!(made, usize::try_from(NUM_GROUPS).unwrap(), "no longer held");
+        assert!(store.replication().is_unset(), "runs at the legacy 3");
+        assert_eq!(store.replication().effective(), 3);
+        raft.shutdown().await.unwrap();
+    }
+
+    /// A cluster that already minted leases before ADR 0080 is never founded
+    /// behind its back: it keeps 3 until an operator changes it live.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_existing_cluster_is_not_founded() {
+        use super::Founding;
+        use std::sync::atomic::AtomicBool;
+        let (raft, store, placement) = leading("old-node").await;
+        // An upgraded cluster: its leases predate founding.
+        LeaseAssigner::new(placement.clone())
+            .reconcile(&raft, &store)
+            .await
+            .unwrap();
+        assert!(store.high_epoch() > 0);
+        let capable = Arc::new(AtomicBool::new(true));
+        let assigner = LeaseAssigner::new(placement).with_founding(Founding::new(2, capable));
+        assigner.reconcile(&raft, &store).await.unwrap();
+        assert!(
+            store.replication().is_unset(),
+            "no founding on an existing cluster"
+        );
         raft.shutdown().await.unwrap();
     }
 }

@@ -25,7 +25,10 @@
 // boxing it would fight the trait contract for no benefit.
 #![allow(clippy::result_large_err)]
 
-use crate::lease_raft::{GroupId, LeaseConfig, LeaseMap, LeaseRecord, LeaseResponse};
+use crate::lease_raft::{
+    decode_state, encode_state, GroupId, LeaseConfig, LeaseMap, LeaseRecord, LeaseResponse,
+    ReplicationRecord,
+};
 use openraft::{
     Entry, EntryPayload, LogId, LogState, RaftLogReader, RaftSnapshotBuilder, RaftStorage,
     Snapshot, SnapshotMeta, StorageError, StorageIOError, StoredMembership, Vote,
@@ -194,6 +197,19 @@ impl LeaseStore {
         self.lock().sm.get(group)
     }
 
+    /// The highest lease epoch ever minted in the applied state machine: 0 on a
+    /// cluster that has never assigned a lease (ADR 0080 founding reads it).
+    #[must_use]
+    pub fn high_epoch(&self) -> crate::lease::Epoch {
+        self.lock().sm.high_epoch()
+    }
+
+    /// The replication factor in the applied state machine (ADR 0080).
+    #[must_use]
+    pub fn replication(&self) -> ReplicationRecord {
+        self.lock().sm.replication()
+    }
+
     /// Durably apply a batch of mutations (one fsynced transaction), or a no-op when
     /// in-memory. Runs the blocking `redb` work off the async worker.
     async fn persist(&self, ops: Vec<WriteOp>) -> Result<(), StorageError<NodeId>> {
@@ -288,7 +304,7 @@ fn load(db: &Database) -> Result<Inner, PersistError> {
             inner.last_membership = de(&v)?;
         }
         if let Some(v) = get(K_SM)? {
-            inner.sm = de(&v)?;
+            inner.sm = decode_state(&v).map_err(pe)?;
         }
         if let Some(v) = get(K_SNAP_IDX)? {
             inner.snapshot_idx = de(&v)?;
@@ -305,6 +321,12 @@ fn load(db: &Database) -> Result<Inner, PersistError> {
 
 fn ser<T: serde::Serialize>(v: &T) -> Result<Vec<u8>, StorageError<NodeId>> {
     postcard::to_allocvec(v).map_err(|e| io(pe(e)))
+}
+
+/// The state machine's own encoding (ADR 0080): the legacy lease-table shape
+/// until a replication factor is recorded — see [`encode_state`].
+fn ser_sm(sm: &LeaseMap) -> Result<Vec<u8>, StorageError<NodeId>> {
+    encode_state(sm).map_err(|e| io(pe(e)))
 }
 
 impl RaftLogReader<LeaseConfig> for LeaseStore {
@@ -326,8 +348,8 @@ impl RaftSnapshotBuilder<LeaseConfig> for LeaseStore {
         // Prepare under the lock, persist, then commit the snapshot to the cache.
         let (data, meta, new_idx) = {
             let inner = self.lock();
-            let data = postcard::to_allocvec(&inner.sm)
-                .map_err(|e| StorageIOError::read_state_machine(&e))?;
+            let data =
+                encode_state(&inner.sm).map_err(|e| StorageIOError::read_state_machine(&e))?;
             let new_idx = inner.snapshot_idx + 1;
             let snapshot_id = format!("{}-{}", inner.last_applied.map_or(0, |l| l.index), new_idx);
             let meta = SnapshotMeta {
@@ -477,7 +499,7 @@ impl RaftStorage<LeaseConfig> for LeaseStore {
         };
 
         let mut ops = vec![
-            WriteOp::PutMeta(K_SM, ser(&sm)?),
+            WriteOp::PutMeta(K_SM, ser_sm(&sm)?),
             WriteOp::PutMeta(K_LAST_MEMBERSHIP, ser(&last_membership)?),
         ];
         if let Some(la) = last_applied {
@@ -517,11 +539,11 @@ impl RaftStorage<LeaseConfig> for LeaseStore {
             )
             .into());
         }
-        let sm: LeaseMap =
-            de(&data).map_err(|e| StorageIOError::read_snapshot(Some(meta.signature()), &e))?;
+        let sm: LeaseMap = decode_state(&data)
+            .map_err(|e| StorageIOError::read_snapshot(Some(meta.signature()), &pe(e)))?;
 
         let mut ops = vec![
-            WriteOp::PutMeta(K_SM, ser(&sm)?),
+            WriteOp::PutMeta(K_SM, ser_sm(&sm)?),
             WriteOp::PutMeta(K_LAST_MEMBERSHIP, ser(&meta.last_membership)?),
             WriteOp::PutMeta(K_SNAP_META, ser(meta)?),
             WriteOp::PutMeta(K_SNAP_DATA, data.clone()),
@@ -641,6 +663,45 @@ mod tests {
             .current_lease(group)
             .expect("the lease survived reopen");
         assert_eq!(lease.holder, 1);
+        Ok(())
+    }
+
+    /// ADR 0080: a committed replication factor is part of the applied state — it
+    /// survives the store being reopened and travels in a built snapshot to a
+    /// store that installs it.
+    #[tokio::test]
+    async fn the_replication_factor_survives_reopen_and_snapshot_install(
+    ) -> Result<(), StorageError<RaftNodeId>> {
+        use openraft::{
+            CommittedLeaderId, Entry, EntryPayload, LogId, RaftSnapshotBuilder, RaftStorage,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("replicas.redb");
+        {
+            let mut store = LeaseStore::open(&path)?;
+            let entry = Entry {
+                log_id: LogId::new(CommittedLeaderId::new(1, 1), 1),
+                payload: EntryPayload::Normal(LeaseRequest::SetReplicas { r: 2 }),
+            };
+            store.append_to_log([entry.clone()]).await?;
+            store.apply_to_state_machine(&[entry]).await?;
+            assert_eq!(store.replication().replicas, Some(2));
+        }
+        let mut store = LeaseStore::open(&path)?;
+        assert_eq!(store.replication().replicas, Some(2), "survived reopen");
+
+        let snapshot = store.build_snapshot().await?;
+        let mut other = LeaseStore::new();
+        assert!(other.replication().is_unset());
+        other
+            .install_snapshot(&snapshot.meta, snapshot.snapshot)
+            .await?;
+        assert_eq!(
+            other.replication().replicas,
+            Some(2),
+            "travelled in the snapshot"
+        );
         Ok(())
     }
 }

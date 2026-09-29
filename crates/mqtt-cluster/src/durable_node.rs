@@ -145,6 +145,50 @@ pub async fn build_durable_node_on(
     DurablePlane,
     tokio::task::JoinHandle<()>,
 ) {
+    build_durable_node_with(
+        node_id,
+        placement,
+        can_bootstrap,
+        voter_cap,
+        failure_domains,
+        data_dir,
+        commit_delay,
+        allow_relaxed_publish,
+        ownership_domain_all,
+        store_shards,
+        replica_store,
+        None,
+    )
+    .await
+}
+
+/// [`build_durable_node_on`] that also founds a fresh cluster's replication
+/// factor (ADR 0080 §2): with `founding`, the lease leader of a cluster that has
+/// never assigned a lease commits the configured factor first. `None` founds
+/// nothing, so the cluster runs at the legacy 3.
+///
+/// # Panics
+/// As [`build_durable_node_on`].
+#[allow(clippy::too_many_arguments)]
+pub async fn build_durable_node_with(
+    node_id: NodeId,
+    placement: Arc<RwLock<Placement>>,
+    can_bootstrap: bool,
+    voter_cap: usize,
+    failure_domains: &BTreeMap<NodeId, FailureDomain>,
+    data_dir: Option<&std::path::Path>,
+    commit_delay: Option<Arc<std::sync::atomic::AtomicU64>>,
+    allow_relaxed_publish: bool,
+    ownership_domain_all: Arc<std::sync::atomic::AtomicBool>,
+    store_shards: Option<usize>,
+    replica_store: crate::cluster_log::StoreBackend,
+    founding: Option<crate::lease_assign::Founding>,
+) -> (
+    Arc<dyn SessionStore>,
+    Arc<dyn DurableRetained>,
+    DurablePlane,
+    tokio::task::JoinHandle<()>,
+) {
     let local = raft_id(&node_id);
 
     // --- lease consensus group + durable-plane endpoint ---
@@ -242,7 +286,10 @@ pub async fn build_durable_node_on(
         lease_store,
         placement.clone(),
         MembershipReconciler::new(local, can_bootstrap, voter_cap),
-        LeaseAssigner::new(placement),
+        match founding {
+            Some(f) => LeaseAssigner::new(placement).with_founding(f),
+            None => LeaseAssigner::new(placement),
+        },
         domains,
         ownership_domain_all,
         CatchUp {
@@ -473,6 +520,9 @@ async fn run_driver(
     // A one-tick debounce: only act once the desired set is stable across a tick, so
     // a flapping member does not churn the voter set.
     let mut prev_desired: BTreeSet<RaftNodeId> = BTreeSet::new();
+    // ADR 0080: say once when this node's durable.replicas is not what the cluster
+    // it runs in committed (it joined, or restarted, into an existing cluster).
+    let mut replicas_mismatch_logged = false;
     // Catch-up sweep state: armed (with a budget) on boot and on every placement
     // membership change, run every few ticks until nothing is hollow or the budget
     // is spent. `prev_members` starts empty so the first tick always arms.
@@ -557,6 +607,47 @@ async fn run_driver(
                 .write()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .set_voters(voter_nodes);
+        }
+
+        // The replication factor the lease group committed (ADR 0080 §1): every
+        // node's replica sets follow the one agreed value, never a local constant.
+        // A cluster that never recorded one runs at the legacy 3. Pushed BEFORE the
+        // lease owners: a node acts as a group's owner only once its placement holds
+        // that lease, and a founded factor is committed before any lease is minted,
+        // so every lease placement shows comes with a factor at least that recent.
+        let replicas = lease_store.replication().effective();
+        if let Some(configured) = assigner.founding_replicas() {
+            if !replicas_mismatch_logged && lease_store.high_epoch() > 0 && configured != replicas {
+                replicas_mismatch_logged = true;
+                tracing::warn!(
+                    configured,
+                    cluster = replicas,
+                    "durable.replicas is not applied: this cluster runs at the replication \
+                     factor it committed when it was founded ({replicas}); a node's own \
+                     setting only founds a NEW cluster (ADR 0080)"
+                );
+            }
+        }
+        let adopted = {
+            let mut p = placement
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            p.set_replicas(usize::from(replicas))
+                .then(|| p.min_replicas_configured())
+        };
+        if let Some(floor) = adopted {
+            tracing::info!(
+                replicas,
+                "replication factor adopted from the lease group (ADR 0080)"
+            );
+            if let Some(floor) = floor.filter(|f| *f > usize::from(replicas)) {
+                tracing::warn!(
+                    floor,
+                    replicas,
+                    "durable.min_replicas exceeds the cluster's replication factor: every \
+                     durable write will be refused until one of them changes (ADR 0080)"
+                );
+            }
         }
 
         push_committed_lease_owners(&placement, &lease_store, &mut id_map);
@@ -690,7 +781,7 @@ fn push_committed_lease_owners(
 
 #[cfg(test)]
 mod tests {
-    use super::{admit_desired, build_durable_node};
+    use super::{admit_desired, build_durable_node, build_durable_node_with};
     use crate::lease_raft::RaftNodeId;
     use crate::placement::{Placement, DEFAULT_REPLICAS};
     use crate::NodeId;
@@ -904,6 +995,98 @@ mod tests {
         // "Database already open" lock, no double-init panic) and the node re-led.
         wait_writable(&store, &client, &msg).await;
 
+        driver.abort();
+        let _ = driver.await;
+        plane.raft().shutdown().await.unwrap();
+    }
+
+    /// Build one persistent solo node over `dir` that would found a cluster at
+    /// `replicas`, with the replication capability already raised (a lone founder
+    /// is trivially capable; in mqttd the hub's sweep raises it).
+    async fn founding_node(
+        node: &NodeId,
+        dir: &std::path::Path,
+        replicas: u8,
+    ) -> (
+        Arc<dyn SessionStore>,
+        Arc<RwLock<Placement>>,
+        crate::durable_plane::DurablePlane,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let placement = Arc::new(RwLock::new(Placement::new(node.clone(), DEFAULT_REPLICAS)));
+        let capable = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let (store, _retained, plane, driver) = build_durable_node_with(
+            node.clone(),
+            placement.clone(),
+            true,
+            5,
+            &BTreeMap::new(),
+            Some(dir),
+            None,
+            false,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            None,
+            crate::cluster_log::StoreBackend::Redb,
+            Some(crate::lease_assign::Founding::new(replicas, capable)),
+        )
+        .await;
+        (store, placement, plane, driver)
+    }
+
+    /// Wait until `placement` follows replication factor `want`.
+    async fn wait_replicas(placement: &Arc<RwLock<Placement>>, want: usize) {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while placement.read().unwrap().desired_replicas() != want {
+            assert!(
+                Instant::now() < deadline,
+                "placement never adopted replication factor {want}"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    /// ADR 0080 §2 on the real assembly: a fresh node founds its cluster at the
+    /// configured factor and adopts it; restarted over the same data dir with a
+    /// DIFFERENT setting, it keeps the founded one — the factor is cluster state,
+    /// and a node's own setting founds only a new cluster.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_founded_factor_is_adopted_and_outlives_a_different_setting() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = NodeId("durable-founder".to_string());
+        let client = ClientId("c".into());
+        let msg = Message::new(
+            "t".to_string(),
+            bytes::Bytes::from_static(b"durable"),
+            QoS::AtLeastOnce,
+            false,
+        );
+
+        let (store, placement, plane, driver) = founding_node(&node, dir.path(), 2).await;
+        wait_writable(&store, &client, &msg).await;
+        wait_replicas(&placement, 2).await;
+        driver.abort();
+        let _ = driver.await;
+        plane.raft().shutdown().await.unwrap();
+        drop(store);
+        drop(plane);
+
+        // Restart configured for 3: the cluster was founded at 2 and stays there.
+        let (store, placement, plane, driver) = founding_node(&node, dir.path(), 3).await;
+        wait_writable(&store, &client, &msg).await;
+        wait_replicas(&placement, 2).await;
+        // Hold the observation across several driver ticks: a restart's setting
+        // that overrode the committed factor would surface on one of them.
+        for _ in 0..15 {
+            assert_eq!(
+                placement.read().unwrap().desired_replicas(),
+                2,
+                "the founded factor must not be overridden by a restart's setting"
+            );
+            // SETTLE(founded-factor-holds): the claim is a negative — the restart's
+            // setting never replaces the committed factor — and no observable marks a
+            // driver tick, so it can only be held across ~1.5 s of ticks.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
         driver.abort();
         let _ = driver.await;
         plane.raft().shutdown().await.unwrap();
