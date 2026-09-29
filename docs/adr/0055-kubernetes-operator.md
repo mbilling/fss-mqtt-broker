@@ -132,6 +132,8 @@ broker suites' job; the operator e2e asserts orchestration, not message durabili
 - **Acting through a broker admin API.** Rejected long ago and stays rejected
   (ADR 0047: signal-driven ops, read-only health surface); every operator action is
   a Kubernetes-object action or an existing contract (signals, config, Secrets).
+
+  > **Revisited by [ADR 0081](0081-admin-api.md) (2026-09-29).** An authenticated admin API now exists for reads and a short, fixed list of audited actions. This operator is unchanged by it (ADR 0081 §5): it still acts through Kubernetes objects and reads `/statusz`.
 - **Waiting for 1.0 to avoid CRD churn.** The alpha group/version exists precisely
   for this; deferring forfeits operator experience during the period the project can
   still change cheaply.
