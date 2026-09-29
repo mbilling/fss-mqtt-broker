@@ -131,7 +131,7 @@ pub async fn route(state: &AdminState, caller: &Caller, role: Role, req: &Reques
         "/admin/v1/node" => ok(&state.local_status().await),
         "/admin/v1/cluster" => super::cluster::cluster(state).await,
         "/admin/v1/placement" => super::cluster::placement(state).await,
-        "/admin/v1/config" => super::config::config(state),
+        "/admin/v1/config" => super::config::config(state).await,
         "/admin/v1/reload" => super::config::reload(state).await,
         "/admin/v1/authz" => super::authz::check(state, req),
         "/admin/v1/clients" => super::sessions::clients(state, req).await,

@@ -402,6 +402,25 @@ impl Reloader {
         self.reload_with_outcome(trigger).applied
     }
 
+    /// The committed config and its stamp `(checksum, generation)`, read under the reload
+    /// lock: a reload stages its candidate in the shared cell before validating it, so a
+    /// reader that did not wait could see a config that is then rejected (ADR 0081 T6).
+    /// `None` without a config source.
+    pub fn committed_config(&self) -> Option<(mqtt_config::Config, (String, u64))> {
+        let _no_reload_in_flight = self
+            .in_progress
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let cs = self.config_source.as_ref()?;
+        let config = read_lock(&cs.live).clone();
+        let stamp = self
+            .config_stamp
+            .as_ref()
+            .map(|s| s.read())
+            .unwrap_or_default();
+        Some((config, stamp))
+    }
+
     /// [`reload`](Self::reload), reporting what happened: whether it applied, why not,
     /// and which config sections changed and which of those need a restart (ADR 0081 T6).
     #[allow(clippy::too_many_lines)]
@@ -1008,6 +1027,71 @@ mod tests {
                 allow_anonymous: true,
             }) as Arc<dyn Authenticator>,
         ))
+    }
+
+    /// ADR 0081 T6 (review): a reader of the committed config never sees a reload's staged
+    /// candidate. The build is held mid-reload; the shared cell already holds the
+    /// candidate, `committed_config` waits, and when the build then fails it returns the
+    /// config that stayed committed.
+    #[test]
+    fn committed_config_never_returns_a_rejected_candidate() {
+        use std::sync::mpsc;
+        let dir = std::env::temp_dir().join(format!("mqttd-committed-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("cfg.toml");
+        let base = "[durable]\nallow_ephemeral = true\n";
+        std::fs::write(&path, format!("[node]\nid = \"old\"\n{base}")).unwrap();
+        let live = Arc::new(RwLock::new(mqtt_config::Config::load(Some(&path)).unwrap()));
+
+        // The policy build: the first call (startup) passes; the next blocks until told
+        // whether to fail.
+        let (started_tx, started_rx) = mpsc::channel::<()>();
+        let (verdict_tx, verdict_rx) = mpsc::channel::<bool>();
+        let verdict_rx = std::sync::Mutex::new(verdict_rx);
+        let started_tx = std::sync::Mutex::new(started_tx);
+        let build = move || -> BuildResult {
+            started_tx.lock().unwrap().send(()).unwrap();
+            if verdict_rx.lock().unwrap().recv().unwrap() {
+                ok_auth_pair()
+            } else {
+                Err("policy rejected".into())
+            }
+        };
+        let (mut reloader, _h) = Reloader::new(ok_auth_pair().unwrap(), audit(), build);
+        reloader.attach_config_source(ConfigSource {
+            live: live.clone(),
+            path: Some(path.clone()),
+            precheck: Box::new(|_| Ok(())),
+            apply: Box::new(|_, _| Vec::new()),
+        });
+        let reloader = Arc::new(reloader);
+
+        std::fs::write(&path, format!("[node]\nid = \"candidate\"\n{base}")).unwrap();
+        let r = reloader.clone();
+        let reload = std::thread::spawn(move || r.reload_with_outcome("admin"));
+        started_rx.recv().unwrap();
+        assert_eq!(
+            read_lock(&live).node.id,
+            "candidate",
+            "the candidate is staged"
+        );
+
+        let r = reloader.clone();
+        let reader = std::thread::spawn(move || r.committed_config());
+        // SETTLE(committed-config-reader-blocks): the claim is an absence — the reader has
+        // NOT returned while the reload holds its lock — and an absence has no observable to
+        // poll; 50ms is ample for an unblocked read of an in-memory cell to finish.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(!reader.is_finished(), "the reader waits out the reload");
+
+        verdict_tx.send(false).unwrap();
+        assert!(!reload.join().unwrap().applied);
+        let (committed, _) = reader.join().unwrap().unwrap();
+        assert_eq!(
+            committed.node.id, "old",
+            "the rejected candidate was never visible"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// ADR 0081 T6: the outcome says what the reload did — the changed sections, which of
