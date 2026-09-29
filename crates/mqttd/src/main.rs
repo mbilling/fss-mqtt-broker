@@ -1841,7 +1841,7 @@ fn log_durability_mode(config: &Config, founder: bool, voter_cap: usize, failure
         MinReplicas::Majority => info!(
             floor = "majority",
             declared_members = config.runtime.ready_min_members,
-            replication_factor = placement::DEFAULT_REPLICAS,
+            replication_factor = config.durable.replicas,
             "min-replicas write floor: DERIVED (issues #167, #239) — a placement group \
              holding fewer than a majority of the members this node knows about, CAPPED \
              at the replication factor, REFUSES durable writes (QoS>=1 acks withheld, \
@@ -2008,8 +2008,31 @@ async fn start_hub(
                  is imported once and there is no conversion back"
             );
         }
+        // ADR 0080: set while every member can apply the lease group's
+        // replication-factor commands. The hub keeps it current; the lease leader
+        // reads it before founding a fresh cluster's factor.
+        let replication_capable = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        info!(
+            replicas = config.durable.replicas,
+            "replication factor: a NEW cluster this node founds keeps {} copies of each \
+             durable group; every node follows the cluster's committed factor, and a \
+             cluster founded before ADR 0080 runs at 3",
+            config.durable.replicas
+        );
+        if config.durable.replicas > 2 && config.durable.replicas.is_multiple_of(2) {
+            warn!(
+                replicas = config.durable.replicas,
+                "durable.replicas is even: {} copies need {} acks and still tolerate only {} \
+                 failure(s), the same as {} copies — a copy's storage and replication for no \
+                 added fault tolerance (ADR 0080 §2)",
+                config.durable.replicas,
+                config.durable.replicas / 2 + 1,
+                (config.durable.replicas - 1) / 2,
+                config.durable.replicas - 1
+            );
+        }
         let (store, durable_retained, plane, driver) =
-            mqtt_cluster::durable_node::build_durable_node_on(
+            mqtt_cluster::durable_node::build_durable_node_with(
                 node_id.clone(),
                 placement.clone(),
                 founder,
@@ -2021,6 +2044,10 @@ async fn start_hub(
                 ownership_domain_all.clone(),
                 store_shards,  // ADR 0076 T2, fresh stores only
                 replica_store, // ADR 0078
+                Some(mqtt_cluster::lease_assign::Founding::new(
+                    config.durable.replicas,
+                    replication_capable.clone(),
+                )),
             )
             .await;
         let (mut hub, hub_tx) = hub::Hub::with_config_and_placement(
@@ -2033,9 +2060,7 @@ async fn start_hub(
         }
         // Keep a plane clone for the health endpoint's lease-group readiness signal.
         let plane_for_health = plane.clone();
-        // ADR 0080: set while every member can apply the lease group's
-        // replication-factor commands; read before proposing one (0080-T2).
-        hub.set_replication_capable(Arc::new(std::sync::atomic::AtomicBool::new(false)));
+        hub.set_replication_capable(replication_capable);
         hub.set_ownership_domain(
             ownership_domain_all,
             config.durable.ownership_domain == OwnershipDomain::Members,
@@ -4615,11 +4640,14 @@ fn resolve_write_floor(config: &Config) -> Result<WriteFloor, String> {
     let floor = match config.durable.min_replicas {
         MinReplicas::Count(n) => {
             let n = n as usize;
-            if n > placement::DEFAULT_REPLICAS {
+            // ADR 0080: bounded by the configured factor (what a cluster this node
+            // founds runs at). A joined cluster's committed factor can differ; the
+            // durable driver warns when one it adopts sits below this floor.
+            let replicas = usize::from(config.durable.replicas);
+            if n > replicas {
                 return Err(format!(
                     "durable.min_replicas ({n}) exceeds the replication factor \
-                     ({}) — no group can ever satisfy that floor",
-                    placement::DEFAULT_REPLICAS
+                     (durable.replicas = {replicas}) — no group can ever satisfy that floor"
                 ));
             }
             WriteFloor::Fixed(n.max(1))

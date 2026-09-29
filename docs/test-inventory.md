@@ -254,7 +254,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `two_bridge_instances_do_not_duplicate_forwarding`
 - `two_partitioned_instances_deliver_each_inbound_message_exactly_once`
 
-## `crates/mqtt-cluster/src/lib.rs` — 334 test(s)
+## `crates/mqtt-cluster/src/lib.rs` — 338 test(s)
 
 - `cluster_identity::tests::a_founder_mints_once_and_reloads_stably`
 - `cluster_identity::tests::a_joiner_adopts_once_and_persists`
@@ -343,6 +343,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `decommission::tests::a_solo_drain_completes_immediately`
 - `decommission::tests::a_successor_with_divergent_content_is_not_sufficient`
 - `decommission::tests::the_drain_hands_off_and_verifies_a_held_key`
+- `durable_node::tests::a_founded_factor_is_adopted_and_outlives_a_different_setting`
 - `durable_node::tests::a_persistent_durable_node_restarts_from_its_data_dir`
 - `durable_node::tests::admit_desired_admits_local_and_reachable_members_only`
 - `durable_node::tests::admit_desired_drops_a_member_evicted_from_placement`
@@ -380,6 +381,9 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `lease::tests::overlapping_quorums_cannot_both_commit`
 - `lease::tests::quorum_is_a_majority`
 - `lease::tests::superseded_holder_is_fenced`
+- `lease_assign::tests::a_fresh_cluster_is_founded_at_the_configured_factor_before_any_lease`
+- `lease_assign::tests::an_existing_cluster_is_not_founded`
+- `lease_assign::tests::an_incapable_fresh_cluster_holds_then_founds_at_the_legacy_factor`
 - `lease_assign::tests::leader_assigns_every_group_to_its_owner`
 - `lease_assign::tests::pending_targets_the_hrw_owner_not_the_committed_lease`
 - `lease_group::tests::single_node_group_elects_and_commits_a_lease`
@@ -693,7 +697,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 
 - `publish_codec_round_trip_clears_the_floor`
 
-## `crates/mqtt-config/src/lib.rs` — 37 test(s)
+## `crates/mqtt-config/src/lib.rs` — 38 test(s)
 
 - `tests::a_backup_dir_inside_the_data_dir_is_a_config_error`
 - `tests::a_bad_enum_value_is_rejected`
@@ -727,6 +731,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::the_new_per_subscriber_bounds_are_refused_out_of_range`
 - `tests::the_refound_guard_defaults_on_and_env_can_disable_it`
 - `tests::the_refusal_lists_all_unknown_keys`
+- `tests::the_replication_factor_is_bounded_and_bounds_the_floor`
 - `tests::the_shared_local_bias_is_a_fraction_stored_as_permille`
 - `tests::the_watermark_poll_is_bounded_between_one_second_and_five_minutes`
 - `tests::the_watermark_poll_overlays_from_the_environment`
