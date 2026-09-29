@@ -17,6 +17,7 @@ pub mod conn;
 pub mod health;
 pub mod http_auth;
 pub mod hub;
+pub mod log_filter;
 pub mod memory_watch;
 pub mod oidc;
 pub mod peer;

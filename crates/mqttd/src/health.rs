@@ -139,6 +139,10 @@ pub struct HealthState {
     /// `store` block so the layout an operator is running is answerable from
     /// the node, not inferred from `ls`.
     store_shards: Option<usize>,
+    /// Cordon (ADR 0081 T8): set by the admin API. `/readyz` reports not-ready so
+    /// load balancers stop sending new clients, and `/statusz` says why; existing
+    /// sessions stay connected.
+    cordon: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl std::fmt::Debug for HealthState {
@@ -173,6 +177,8 @@ struct Report {
     /// because a node that is `NotReady` for a bounded, progressing reason must not look
     /// like one that is merely slow to start.
     restoring: bool,
+    /// Cordoned by an operator (ADR 0081 T8): not-ready on purpose, and staying so.
+    cordoned: bool,
 }
 
 impl Report {
@@ -203,6 +209,9 @@ impl Report {
         }
         if self.restoring {
             s.push_str(",\"restore\":{\"in_progress\":true,\"reason\":\"restore-in-progress\"}");
+        }
+        if self.cordoned {
+            s.push_str(",\"cordon\":{\"active\":true,\"reason\":\"cordoned-by-operator\"}");
         }
         s.push('}');
         s
@@ -235,6 +244,7 @@ impl HealthState {
             swim_isolated: None,
             store_probe: None,
             store_shards: None,
+            cordon: None,
             backup: None,
             brownout: None,
             stores: None,
@@ -279,6 +289,19 @@ impl HealthState {
     pub fn with_backup_status(mut self, status: Arc<crate::backup::BackupStatus>) -> Self {
         self.backup = Some(status);
         self
+    }
+
+    /// Report the admin API's cordon (ADR 0081 T8): not-ready while it is set.
+    #[must_use]
+    pub fn with_cordon(mut self, flag: Arc<std::sync::atomic::AtomicBool>) -> Self {
+        self.cordon = Some(flag);
+        self
+    }
+
+    fn cordoned(&self) -> bool {
+        self.cordon
+            .as_ref()
+            .is_some_and(|c| c.load(std::sync::atomic::Ordering::Acquire))
     }
 
     /// Serve Prometheus metrics on `GET /metrics` from this health server (ADR 0020).
@@ -423,9 +446,11 @@ impl HealthState {
         let startup_complete = self
             .startup_complete
             .load(std::sync::atomic::Ordering::Acquire);
+        let cordoned = self.cordoned();
         let ready = startup_complete
             && !restoring
             && !refound_quarantined
+            && !cordoned
             && !draining
             && live
             && members.is_none_or(|n| n >= self.min_members)
@@ -455,6 +480,7 @@ impl HealthState {
             voters,
             quorum_ack_age_ms,
             restoring,
+            cordoned,
         }
     }
 }
@@ -522,6 +548,24 @@ impl HealthState {
         if let Some(flag) = &self.swim_isolated {
             if flag.load(std::sync::atomic::Ordering::Relaxed) {
                 s.push_str(",\"swim_isolated\":true");
+            }
+        }
+        // Cordon (ADR 0081 T8): refusing new connections on an operator's say-so.
+        if self.cordoned() {
+            s.push_str(",\"cordon\":{\"active\":true}");
+        }
+        // A temporary log filter (ADR 0081 T9): what is overriding the configured one, and
+        // for how much longer.
+        if let Some(status) = crate::log_filter::global().map(crate::log_filter::LogFilter::status)
+        {
+            if let (Some(filter), Some(secs)) =
+                (status.override_filter, status.override_remaining_secs)
+            {
+                let _ = write!(
+                    s,
+                    ",\"log_filter\":{{\"override\":\"{}\",\"remaining_secs\":{secs}}}",
+                    json_escape(&filter)
+                );
             }
         }
         // The store's self-measurement (ADR 0076): the boot-probed barrier
@@ -947,6 +991,38 @@ mod tests {
         let below_floor = HealthState::new(spawn_live_hub(), Some(placement(1)), None, 2)
             .with_startup_complete(complete);
         assert_eq!(super::route(&below_floor, "/readyz").await.0, 503);
+    }
+
+    #[tokio::test]
+    async fn a_cordon_makes_readyz_not_ready_and_statusz_say_why() {
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cluster = Arc::new(
+            mqtt_cluster::cluster_identity::ClusterIdentity::load_or_mint(true, None).unwrap(),
+        );
+        let state = HealthState::new(spawn_live_hub(), Some(placement(1)), None, 1)
+            .with_status(
+                "node-a".into(),
+                cluster,
+                Arc::new(super::BrownoutStatus::default()),
+                Arc::new(crate::reload::ConfigStamp::default()),
+                Arc::new(std::sync::OnceLock::new()),
+                None,
+            )
+            .with_cordon(flag.clone());
+        assert_eq!(super::route(&state, "/readyz").await.0, 200);
+        flag.store(true, std::sync::atomic::Ordering::Release);
+        let (status, body, _) = super::route(&state, "/readyz").await;
+        assert_eq!(status, 503);
+        assert!(
+            body.contains("\"reason\":\"cordoned-by-operator\""),
+            "{body}"
+        );
+        // Still live: a cordoned node is not to be restarted.
+        assert_eq!(super::route(&state, "/livez").await.0, 200);
+        let (_, body, _) = super::route(&state, "/statusz").await;
+        assert!(body.contains("\"cordon\":{\"active\":true}"), "{body}");
+        flag.store(false, std::sync::atomic::Ordering::Release);
+        assert_eq!(super::route(&state, "/readyz").await.0, 200);
     }
 
     #[tokio::test]

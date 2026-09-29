@@ -117,7 +117,7 @@ logged; the same is not uniformly true elsewhere (e.g. NanoMQ defaults to
 | | mqttd | Mosquitto | EMQX 6.2 | NanoMQ | VerneMQ 2.1 |
 |---|---|---|---|---|---|
 | Metrics | Prometheus + OTLP push + k8s probes | `$SYS` topics | dashboard + Prometheus + `$SYS` | HTTP API + Prometheus endpoint + limited `$SYS` events | Prometheus + `vmq-admin` |
-| Dashboard / UI | ✖ **by design** — signal-driven ops, read-only health listener; a provisioned Grafana demo ships instead (ADR 0020 posture) | ✖ | ✅ | ✖ | ✖ (CLI + HTTP mgmt API) |
+| Dashboard / UI | ✖ **by design** — signal-driven ops, read-only health listener; a provisioned Grafana demo ships instead (ADR 0020 posture). An authenticated admin API + `mqttd --admin` CLI (ADR 0081) covers inspection and a few audited actions, with no UI and no config writes | ✖ | ✅ | ✖ | ✖ (CLI + HTTP mgmt API) |
 | HTTP management API | ✖ **by design** (same decision) | ⚠️ dynsec over MQTT topics | ✅ | ✅ | ✅ |
 | Rule engine | ✖ by design — a documented, CI-tested **external-consumer pattern** instead ([INTEGRATION.md](INTEGRATION.md), ADR 0063): `$share` consumer groups on durable session queues feed Kafka/webhooks at-least-once, deduped at the sink; transforms are code you run, not SQL the broker runs | ✖ | ✅ SQL | ✅ SQL (full build) | ✖ |
 | Bridging | ✅ standalone bridge, deny-by-default directional rules, hop-count loop prevention, spool (ADR 0025) | ✅ built-in (the reference implementation) | ✅ data-integration bridges | ✅ TCP/QUIC/AWS bridges | ✅ basic `vmq_bridge` |

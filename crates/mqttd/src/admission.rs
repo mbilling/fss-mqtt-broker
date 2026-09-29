@@ -49,6 +49,9 @@ pub struct PenaltyConfig {
 #[derive(Clone)]
 pub struct AdmissionGate {
     inner: Arc<Inner>,
+    /// Set while the node is cordoned (ADR 0081 T8): every new connection is refused at
+    /// accept; established ones are untouched. `None` = never cordoned.
+    cordon: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 struct Inner {
@@ -133,7 +136,16 @@ impl AdmissionGate {
                 metrics,
                 audit,
             }),
+            cordon: None,
         }
+    }
+
+    /// Refuse every new connection while `flag` is set (the admin API's cordon, ADR 0081
+    /// T8), counted as `admission_rejected{reason="cordon"}`.
+    #[must_use]
+    pub fn with_cordon(mut self, flag: Arc<std::sync::atomic::AtomicBool>) -> Self {
+        self.cordon = Some(flag);
+        self
     }
 
     /// A gate that admits everything — for setups and tests without caps.
@@ -148,6 +160,16 @@ impl AdmissionGate {
     /// any further work.
     #[must_use]
     pub fn try_admit(&self, ip: Option<IpAddr>) -> Option<AdmissionPermit> {
+        // A cordoned node takes no new connections at all, before any other check.
+        if self
+            .cordon
+            .as_ref()
+            .is_some_and(|c| c.load(std::sync::atomic::Ordering::Acquire))
+        {
+            debug!(?ip, "connection refused at accept: node is cordoned");
+            self.reject("cordon");
+            return None;
+        }
         let mut state = self.lock();
         // Penalty box first (T2): a penalized address must not even consume a
         // global slot's worth of consideration.
@@ -460,5 +482,26 @@ mod tests {
         assert!(gate.lock().per_ip.is_empty());
         drop(permits);
         assert_eq!(gate.lock().active, 0);
+    }
+
+    /// ADR 0081 T8: a cordoned gate refuses every new connection, capped or not, and
+    /// admits again once the cordon lifts. Connections admitted before it keep their
+    /// permits.
+    #[test]
+    fn a_cordon_refuses_new_connections_until_lifted() {
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let gate = AdmissionGate::unlimited().with_cordon(flag.clone());
+        let before = gate.try_admit(None).expect("not cordoned yet");
+        flag.store(true, std::sync::atomic::Ordering::Release);
+        assert!(gate.try_admit(None).is_none());
+        assert!(gate.try_admit(Some("10.0.0.1".parse().unwrap())).is_none());
+        assert_eq!(
+            gate.lock().active,
+            1,
+            "the earlier connection keeps its slot"
+        );
+        flag.store(false, std::sync::atomic::Ordering::Release);
+        assert!(gate.try_admit(None).is_some());
+        drop(before);
     }
 }
