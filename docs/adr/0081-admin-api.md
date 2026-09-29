@@ -83,7 +83,7 @@ addresses and subscriptions are identifying data that must not be served there.
   paged), one session in detail (subscriptions, inflight, queue depth and limits, will,
   expiry, owning node), the sessions matching a topic filter, the top N sessions by
   backlog, and retained messages by topic prefix (count, size, list).
-- **Authorization dry run:** `GET /admin/v1/authz/check?user=…&topic=…&action=pub|sub`
+- **Authorization dry run:** `GET /admin/v1/authz?user=…&action=publish|subscribe|connect&target=…`
   evaluates the **loaded** policy and returns the verdict and the rule that decided it. It
   changes nothing.
 - **Effective config:** `GET /admin/v1/config` returns the merged config (file, env,

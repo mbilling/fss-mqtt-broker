@@ -77,7 +77,7 @@
 //!
 //! Publish targets are concrete topics and use plain MQTT filter matching.
 
-use crate::{Action, Authorizer, Identity};
+use crate::{Action, Authorizer, CheckedAction, DecidingRule, Explanation, Identity};
 use mqtt_core::{ClientId, TopicName};
 use serde::Deserialize;
 
@@ -233,12 +233,25 @@ impl AclPolicy {
     /// principal and action, any deny hit refuses, else any allow hit
     /// permits, else the policy default applies.
     fn evaluate(&self, identity: &Identity, client_id: &str, action: Action, target: &str) -> bool {
-        let mut allow_hit = false;
-        for rule in &self.rules {
+        self.decide(identity, client_id, action, target).0
+    }
+
+    /// [`evaluate`](Self::evaluate), also reporting what decided. One implementation for
+    /// both, so the dry run (ADR 0081 T5) cannot disagree with enforcement; [`Decider`]
+    /// is `Copy` and allocation-free because the per-publish path discards it.
+    fn decide(
+        &self,
+        identity: &Identity,
+        client_id: &str,
+        action: Action,
+        target: &str,
+    ) -> (bool, Decider) {
+        let mut first_allow = None;
+        for (ri, rule) in self.rules.iter().enumerate() {
             if !rule.applies_to(action) || !rule.matches_principal(identity) {
                 continue;
             }
-            for pattern in &rule.topics {
+            for (pi, pattern) in rule.topics.iter().enumerate() {
                 // `%i`/`%c` substitution fails closed (ADR 0004): both values are
                 // untrusted — the subject is a certificate CN or SAN, the client id is
                 // chosen outright by the client — and substituting one that carries
@@ -247,7 +260,13 @@ impl AclPolicy {
                 // and a deny denies the action outright.
                 let Some(pattern) = substitute(pattern, &identity.subject, client_id) else {
                     if rule.effect == Effect::Deny {
-                        return false;
+                        return (
+                            false,
+                            Decider::UnsafeDeny {
+                                rule: ri,
+                                pattern: pi,
+                            },
+                        );
                     }
                     continue;
                 };
@@ -265,13 +284,29 @@ impl AclPolicy {
                 };
                 if hit {
                     match rule.effect {
-                        Effect::Deny => return false,
-                        Effect::Allow => allow_hit = true,
+                        Effect::Deny => {
+                            return (
+                                false,
+                                Decider::Hit {
+                                    rule: ri,
+                                    pattern: pi,
+                                },
+                            )
+                        }
+                        Effect::Allow => {
+                            first_allow.get_or_insert(Decider::Hit {
+                                rule: ri,
+                                pattern: pi,
+                            });
+                        }
                     }
                 }
             }
         }
-        allow_hit || self.default_allow
+        match first_allow {
+            Some(decider) => (true, decider),
+            None => (self.default_allow, Decider::Default),
+        }
     }
 
     /// Decide a connect against the `connect` rules (ADR 0031 option B). Connect enforcement is
@@ -280,16 +315,21 @@ impl AclPolicy {
     /// rule exists, the usual order applies among matching ones — a deny wins, else an allow
     /// permits, else the connect is refused (deny-by-default within the connect namespace).
     fn evaluate_connect(&self, identity: &Identity, client_id: &str) -> bool {
+        self.decide_connect(identity, client_id).0
+    }
+
+    /// [`evaluate_connect`](Self::evaluate_connect), also reporting what decided.
+    fn decide_connect(&self, identity: &Identity, client_id: &str) -> (bool, Decider) {
         // Enforcement is keyed on whether the *policy* declares any connect rule — not on
         // whether one matches this principal — so defining connect rules for known tenants
         // denies every identity that matches none (deny-by-default within the namespace).
         let has_connect_rules = self.rules.iter().any(|r| r.connect);
-        let mut allow_hit = false;
-        for rule in &self.rules {
+        let mut first_allow = None;
+        for (ri, rule) in self.rules.iter().enumerate() {
             if !rule.connect || !rule.matches_principal(identity) {
                 continue;
             }
-            for pattern in &rule.clients {
+            for (pi, pattern) in rule.clients.iter().enumerate() {
                 // `%i` substitution fails closed, as for topics: an unsubstitutable subject
                 // grants nothing on an allow and refuses outright on a deny. `%c` is not
                 // substituted here — matching the client id against itself always succeeds,
@@ -298,7 +338,13 @@ impl AclPolicy {
                     if safe_for_substitution(&identity.subject) {
                         pattern.replace("%i", &identity.subject)
                     } else if rule.effect == Effect::Deny {
-                        return false;
+                        return (
+                            false,
+                            Decider::UnsafeDeny {
+                                rule: ri,
+                                pattern: pi,
+                            },
+                        );
                     } else {
                         continue;
                     }
@@ -307,15 +353,137 @@ impl AclPolicy {
                 };
                 if glob_match(&pattern, client_id) {
                     match rule.effect {
-                        Effect::Deny => return false,
-                        Effect::Allow => allow_hit = true,
+                        Effect::Deny => {
+                            return (
+                                false,
+                                Decider::Hit {
+                                    rule: ri,
+                                    pattern: pi,
+                                },
+                            )
+                        }
+                        Effect::Allow => {
+                            first_allow.get_or_insert(Decider::Hit {
+                                rule: ri,
+                                pattern: pi,
+                            });
+                        }
                     }
                 }
             }
         }
         // No connect rules at all → unrestricted; otherwise require an allow hit.
-        allow_hit || !has_connect_rules
+        match first_allow {
+            Some(decider) => (true, decider),
+            None if !has_connect_rules => (true, Decider::NoConnectRules),
+            None => (false, Decider::Default),
+        }
     }
+
+    /// Turn a [`Decider`] into the dry run's [`Explanation`].
+    fn explanation(
+        &self,
+        allowed: bool,
+        decider: Decider,
+        identity: &Identity,
+        client_id: &str,
+        connect: bool,
+    ) -> Explanation {
+        let rule_ref = |ri: usize, pi: usize| {
+            let rule = &self.rules[ri];
+            let pattern = if connect {
+                rule.clients[pi].clone()
+            } else {
+                rule.topics[pi].clone()
+            };
+            let expanded = if connect {
+                if pattern.contains("%i") {
+                    safe_for_substitution(&identity.subject)
+                        .then(|| pattern.replace("%i", &identity.subject))
+                } else {
+                    Some(pattern.clone())
+                }
+            } else {
+                substitute(&pattern, &identity.subject, client_id)
+            };
+            DecidingRule {
+                index: ri,
+                effect: match rule.effect {
+                    Effect::Allow => "allow",
+                    Effect::Deny => "deny",
+                },
+                pattern,
+                expanded,
+            }
+        };
+        match decider {
+            Decider::Hit { rule, pattern } => {
+                let r = rule_ref(rule, pattern);
+                let reason = if allowed {
+                    format!(
+                        "rule {} allows it (pattern {:?}) and no deny rule matches",
+                        r.index, r.pattern
+                    )
+                } else {
+                    format!(
+                        "rule {} denies it (pattern {:?}); a deny wins",
+                        r.index, r.pattern
+                    )
+                };
+                Explanation {
+                    allowed,
+                    rule: Some(r),
+                    reason,
+                }
+            }
+            Decider::UnsafeDeny { rule, pattern } => {
+                let r = rule_ref(rule, pattern);
+                // Connect rules substitute only `%i` (`%c` is refused there at validation).
+                let placeholder = if connect { "%i" } else { "%i or %c" };
+                let reason = format!(
+                    "rule {} is a deny whose pattern {:?} names {placeholder}, and the value is \
+                     empty or contains /, + or #, so the deny applies outright (fail closed)",
+                    r.index, r.pattern
+                );
+                Explanation {
+                    allowed: false,
+                    rule: Some(r),
+                    reason,
+                }
+            }
+            Decider::Default => Explanation {
+                allowed,
+                rule: None,
+                reason: if connect {
+                    "the policy has connect rules and none allows this client id".to_string()
+                } else if allowed {
+                    "no rule matches; the policy default is allow".to_string()
+                } else {
+                    "no rule matches; the policy default is deny".to_string()
+                },
+            },
+            Decider::NoConnectRules => Explanation {
+                allowed: true,
+                rule: None,
+                reason: "the policy has no connect rules, so every client id is allowed"
+                    .to_string(),
+            },
+        }
+    }
+}
+
+/// What decided an evaluation. `Copy` and allocation-free: enforcement computes it on
+/// every publish and throws it away; only the dry run turns it into text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Decider {
+    /// Rule `rule`'s pattern number `pattern` matched.
+    Hit { rule: usize, pattern: usize },
+    /// Rule `rule` is a deny whose pattern could not be substituted safely.
+    UnsafeDeny { rule: usize, pattern: usize },
+    /// No rule matched: the policy default (or, for a connect, the connect default).
+    Default,
+    /// A connect, and the policy has no connect rules.
+    NoConnectRules,
 }
 
 /// Expand `%i` (identity subject) and `%c` (client id) in a pattern, or `None` if the
@@ -469,12 +637,34 @@ impl Authorizer for AclPolicy {
     fn authorize_connect(&self, identity: &Identity, client_id: &ClientId) -> bool {
         self.evaluate_connect(identity, &client_id.0)
     }
+    fn explain(
+        &self,
+        identity: &Identity,
+        client_id: &ClientId,
+        action: CheckedAction,
+        target: &str,
+    ) -> Explanation {
+        let (allowed, decider) = match action {
+            CheckedAction::Publish => self.decide(identity, &client_id.0, Action::Publish, target),
+            CheckedAction::Subscribe => {
+                self.decide(identity, &client_id.0, Action::Subscribe, target)
+            }
+            CheckedAction::Connect => self.decide_connect(identity, &client_id.0),
+        };
+        self.explanation(
+            allowed,
+            decider,
+            identity,
+            &client_id.0,
+            action == CheckedAction::Connect,
+        )
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{AclError, AclPolicy};
-    use crate::{Authorizer, Identity};
+    use crate::{Authorizer, CheckedAction, Explanation, Identity};
     use mqtt_core::ClientId;
 
     fn ident(subject: &str, groups: &[&str]) -> Identity {
@@ -509,6 +699,184 @@ mod tests {
 
     fn can_sub_as(p: &AclPolicy, id: &Identity, client: &str, filter: &str) -> bool {
         p.authorize_subscribe(id, &ClientId(client.into()), filter)
+    }
+
+    // ----- the dry run (ADR 0081 T5) -----
+
+    const EXPLAIN_POLICY: &str = r##"
+        [[rules]]
+        identities = ["device-*"]
+        actions = ["publish", "subscribe"]
+        topics = ["devices/%i/#", "shared/+/status"]
+
+        [[rules]]
+        identities = ["device-*"]
+        actions = ["publish"]
+        effect = "deny"
+        topics = ["devices/+/firmware"]
+
+        [[rules]]
+        groups = ["ops"]
+        actions = ["subscribe"]
+        topics = ["#"]
+
+        [[rules]]
+        identities = ["tenant-*"]
+        actions = ["connect"]
+        clients = ["%i-*"]
+    "##;
+
+    fn explain(
+        p: &AclPolicy,
+        id: &Identity,
+        client: &str,
+        action: CheckedAction,
+        target: &str,
+    ) -> Explanation {
+        p.explain(id, &ClientId(client.into()), action, target)
+    }
+
+    #[test]
+    fn explain_names_the_deciding_rule() {
+        let p = AclPolicy::from_toml_str(EXPLAIN_POLICY).unwrap();
+        let dev = ident("device-7", &[]);
+
+        let e = explain(
+            &p,
+            &dev,
+            ANY_CLIENT,
+            CheckedAction::Publish,
+            "devices/device-7/temp",
+        );
+        assert!(e.allowed);
+        let r = e.rule.unwrap();
+        assert_eq!((r.index, r.effect), (0, "allow"));
+        assert_eq!(r.pattern, "devices/%i/#");
+        assert_eq!(r.expanded.as_deref(), Some("devices/device-7/#"));
+
+        // A deny wins over the earlier allow, and is the rule reported.
+        let e = explain(
+            &p,
+            &dev,
+            ANY_CLIENT,
+            CheckedAction::Publish,
+            "devices/device-7/firmware",
+        );
+        assert!(!e.allowed);
+        assert_eq!(
+            e.rule.as_ref().map(|r| (r.index, r.effect)),
+            Some((1, "deny"))
+        );
+        assert!(e.reason.contains("deny wins"), "{}", e.reason);
+
+        // Nothing matches: the default decides and no rule is named.
+        let e = explain(&p, &dev, ANY_CLIENT, CheckedAction::Publish, "elsewhere");
+        assert!(!e.allowed && e.rule.is_none());
+        assert!(e.reason.contains("default is deny"), "{}", e.reason);
+
+        // A group grant.
+        let e = explain(
+            &p,
+            &ident("alice", &["ops"]),
+            ANY_CLIENT,
+            CheckedAction::Subscribe,
+            "a/#",
+        );
+        assert!(e.allowed);
+        assert_eq!(e.rule.map(|r| r.index), Some(2));
+    }
+
+    #[test]
+    fn explain_reports_connect_rules_and_their_absence() {
+        let p = AclPolicy::from_toml_str(EXPLAIN_POLICY).unwrap();
+        let t = ident("tenant-a", &[]);
+        let e = explain(&p, &t, "tenant-a-1", CheckedAction::Connect, "tenant-a-1");
+        assert!(e.allowed);
+        assert_eq!(
+            e.rule.map(|r| r.expanded),
+            Some(Some("tenant-a-*".to_string()))
+        );
+        let e = explain(&p, &t, "tenant-b-1", CheckedAction::Connect, "tenant-b-1");
+        assert!(!e.allowed && e.rule.is_none());
+        assert!(e.reason.contains("connect rules"), "{}", e.reason);
+
+        let open = AclPolicy::from_toml_str("[[rules]]\nactions = [\"publish\"]\ntopics = [\"#\"]")
+            .unwrap();
+        let e = explain(&open, &t, "anything", CheckedAction::Connect, "anything");
+        assert!(e.allowed);
+        assert!(e.reason.contains("no connect rules"), "{}", e.reason);
+    }
+
+    #[test]
+    fn an_unsafe_substitution_in_a_deny_is_explained_as_fail_closed() {
+        let p = AclPolicy::from_toml_str(
+            r#"
+            default = "allow"
+            [[rules]]
+            actions = ["publish"]
+            effect = "deny"
+            topics = ["private/%c/#"]
+            "#,
+        )
+        .unwrap();
+        let e = explain(
+            &p,
+            &ident("u", &[]),
+            "a/b",
+            CheckedAction::Publish,
+            "public/x",
+        );
+        assert!(!e.allowed);
+        let r = e.rule.unwrap();
+        assert_eq!((r.index, r.expanded), (0, None));
+        assert!(e.reason.contains("fail closed"), "{}", e.reason);
+    }
+
+    /// The dry run and enforcement are one evaluator; this pins that they cannot drift.
+    #[test]
+    fn explain_always_agrees_with_enforcement() {
+        let p = AclPolicy::from_toml_str(EXPLAIN_POLICY).unwrap();
+        let ids = [
+            ident("device-7", &[]),
+            ident("tenant-a", &[]),
+            ident("alice", &["ops"]),
+            ident("a/b", &[]),
+            ident("", &[]),
+        ];
+        let clients = ["c1", "tenant-a-1", "x/y", "device-7"];
+        let targets = [
+            "devices/device-7/temp",
+            "devices/device-7/firmware",
+            "devices/other/x",
+            "shared/a/status",
+            "#",
+            "devices/+/firmware",
+            "a/b/c",
+        ];
+        for id in &ids {
+            for c in clients {
+                let cid = ClientId(c.into());
+                for t in targets {
+                    if !t.contains(['+', '#']) {
+                        assert_eq!(
+                            explain(&p, id, c, CheckedAction::Publish, t).allowed,
+                            p.authorize_publish(id, &cid, &t.to_string()),
+                            "publish {id:?} {c} {t}"
+                        );
+                    }
+                    assert_eq!(
+                        explain(&p, id, c, CheckedAction::Subscribe, t).allowed,
+                        p.authorize_subscribe(id, &cid, t),
+                        "subscribe {id:?} {c} {t}"
+                    );
+                }
+                assert_eq!(
+                    explain(&p, id, c, CheckedAction::Connect, c).allowed,
+                    p.authorize_connect(id, &cid),
+                    "connect {id:?} {c}"
+                );
+            }
+        }
     }
 
     // ----- parse / validation failures -----

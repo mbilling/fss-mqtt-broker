@@ -718,6 +718,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     let audit_for_shutdown = policy.audit.clone();
     let audit_for_admin = policy.audit.clone();
+    let admin_authz = policy.authz.clone();
     let admin_sessions = mqttd::admin::sessions::SessionAccess {
         hub: hub_tx.clone(),
         store: store.clone(),
@@ -1045,6 +1046,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &live_config,
         audit_for_admin,
         admin_sessions,
+        admin_authz,
     )
     .await?;
 
@@ -2526,6 +2528,7 @@ async fn start_admin(
     live_config: &Arc<RwLock<Config>>,
     audit: Arc<dyn mqtt_observability::AuditSink>,
     sessions: mqttd::admin::sessions::SessionAccess,
+    authz: mqttd::admin::authz::LiveAuthorizer,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let admin = &config.admin;
     let Some(bind) = &admin.bind else {
@@ -2553,7 +2556,8 @@ async fn start_admin(
     let acceptor = tls::admin_acceptor(Path::new(cert), Path::new(key), &cas)?;
     let mut state =
         mqttd::admin::AdminState::new(node_id.0.clone(), health, live_config.clone(), audit)
-            .with_sessions(sessions);
+            .with_sessions(sessions)
+            .with_authorizer(authz);
     if let Some(ca) = cluster_ca {
         state = state.with_cluster_ca(tls::ChainCheck::new(ca)?);
     }

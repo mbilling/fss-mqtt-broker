@@ -891,6 +891,22 @@ URL, the CLI uses `admin.bind` from the local config, and without a CA, `admin.c
 These variables configure the client, not the broker, so they are not in
 [CONFIGURATION.md](CONFIGURATION.md).
 
+**Why is this client denied?** `authz` asks the live policy, the one the last reload
+published, and names the rule that decides. It changes nothing.
+
+```sh
+mqttd --admin authz device-7 publish devices/device-7/temp
+mqttd --admin authz bob subscribe 'secret/#' --groups ops,dev
+mqttd --admin authz tenant-a connect tenant-a-17           # connect rules: target = client id
+mqttd --admin authz device-7 publish fleet/c1/x --client c1  # what %c expands to
+```
+
+The answer is `allowed`, the deciding `rule` (its index in `[[rules]]`, from 0, its
+effect, the pattern as written and after `%i`/`%c` substitution) and a one-line `reason`:
+a deny that won, the allow that granted, or the policy default. Groups are taken as given,
+because at runtime they come from the authenticator. For `connect`, the session-owner
+guard (ADR 0031) still applies on top of the policy.
+
 ## Shipping the audit trail to a SIEM
 
 The audit chain (auth results, ACL denials, admin acts — hash-chained per boot)
