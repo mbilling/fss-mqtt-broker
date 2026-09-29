@@ -81,9 +81,52 @@ enum Shard {
 }
 
 /// One queued durable write for the node-wide writer task (ADR 0027 follower
-/// half, ADR 0071 owner half): the op at its epoch, plus a one-shot returning
-/// whether it was durably applied (accepted / not fenced).
-pub type DurableWrite = (Epoch, ReplOp, oneshot::Sender<bool>);
+/// half, ADR 0071 owner half): the op at its epoch, plus where to send whether
+/// it was durably applied (accepted / not fenced).
+pub type DurableWrite = (Epoch, ReplOp, WriteReply);
+
+/// Where the writer sends a [`DurableWrite`]'s verdict.
+#[derive(Debug)]
+pub enum WriteReply {
+    /// To a task awaiting it: the owner's local ack, and [`DurablePlane::handle`].
+    ///
+    /// [`DurablePlane::handle`]: crate::durable_plane::DurablePlane::handle
+    Oneshot(oneshot::Sender<bool>),
+    /// Straight onto the peer link a follower's `Replicate` arrived on, as its
+    /// `ReplicateAck`. No task waits in between: a task spawned per replicated op
+    /// to await a oneshot and forward the answer was a spawn plus three wake-ups
+    /// per op, on a path that carries every durable message twice per node.
+    Ack {
+        /// The link's control lane; dead if the link has since dropped, and then
+        /// the owner's RPC timeout is the designed recovery.
+        lane: mpsc::WeakUnboundedSender<crate::peer::PeerMessage>,
+        /// The `Replicate` being answered.
+        req_id: u64,
+    },
+}
+
+impl WriteReply {
+    /// Deliver the verdict. A receiver that has gone is not an error: the op's
+    /// durability is decided either way, and the requester times out.
+    pub fn send(self, accepted: bool) {
+        match self {
+            Self::Oneshot(tx) => {
+                let _ = tx.send(accepted);
+            }
+            Self::Ack { lane, req_id } => {
+                if let Some(lane) = lane.upgrade() {
+                    let _ = lane.send(crate::peer::PeerMessage::ReplicateAck { req_id, accepted });
+                }
+            }
+        }
+    }
+}
+
+impl From<oneshot::Sender<bool>> for WriteReply {
+    fn from(tx: oneshot::Sender<bool>) -> Self {
+        Self::Oneshot(tx)
+    }
+}
 
 /// A replication operation the lease-holder ships to a replica. Carried with the
 /// holder's [`Epoch`] so the replica can fence a stale holder.
@@ -1715,7 +1758,7 @@ impl<T: ReplicaTransport> ClusterLog<T> {
         match (&self.writer, &self.local_store) {
             (Some(writer), Some(_)) => {
                 let (tx, rx) = oneshot::channel();
-                if writer.send((epoch, op.clone(), tx)).is_err() {
+                if writer.send((epoch, op.clone(), tx.into())).is_err() {
                     // Writer gone (shutdown): fail closed, matching the
                     // follower path.
                     LocalAck::Done(false)
