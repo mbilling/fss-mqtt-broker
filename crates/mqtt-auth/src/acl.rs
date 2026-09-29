@@ -438,8 +438,10 @@ impl AclPolicy {
             }
             Decider::UnsafeDeny { rule, pattern } => {
                 let r = rule_ref(rule, pattern);
+                // Connect rules substitute only `%i` (`%c` is refused there at validation).
+                let placeholder = if connect { "%i" } else { "%i or %c" };
                 let reason = format!(
-                    "rule {} is a deny whose pattern {:?} names %i or %c, and the value is \
+                    "rule {} is a deny whose pattern {:?} names {placeholder}, and the value is \
                      empty or contains /, + or #, so the deny applies outright (fail closed)",
                     r.index, r.pattern
                 );
