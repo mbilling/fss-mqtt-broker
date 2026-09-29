@@ -30,7 +30,7 @@ tasks:
     notes: "Evaluates the loaded policy; changes nothing."
   - id: 0081-T6
     title: "Effective config (secrets fingerprinted, with a hash) and reload that returns its outcome"
-    status: planned
+    status: in-progress
     issue: 715
     notes: "First action. Reload runs the ADR 0032 routine; the file stays the only input."
   - id: 0081-T7
@@ -84,7 +84,7 @@ frontmatter above · this file is the plan, progress log, and changelog.
 | 0081-T3 | 🚧 in-progress | [#712](https://github.com/mbilling/fss-mqtt-broker/issues/712) | — | "Node to node over the admin listeners (ADR amendment 2026-09-29), not the peer bus; each row says whether that node replied, and why not." |
 | 0081-T4 | 🚧 in-progress | [#713](https://github.com/mbilling/fss-mqtt-broker/issues/713) | — | "Bounded responses only; reads of identifying data are audited." |
 | 0081-T5 | 🚧 in-progress | [#714](https://github.com/mbilling/fss-mqtt-broker/issues/714) | — | "Evaluates the loaded policy; changes nothing." |
-| 0081-T6 | ⬜ planned | [#715](https://github.com/mbilling/fss-mqtt-broker/issues/715) | — | "First action. Reload runs the ADR 0032 routine; the file stays the only input." |
+| 0081-T6 | 🚧 in-progress | [#715](https://github.com/mbilling/fss-mqtt-broker/issues/715) | — | "First action. Reload runs the ADR 0032 routine; the file stays the only input." |
 | 0081-T7 | ⬜ planned | [#716](https://github.com/mbilling/fss-mqtt-broker/issues/716) | — | "Audited on the node receiving the call and on the node acting." |
 | 0081-T8 | ⬜ planned | [#717](https://github.com/mbilling/fss-mqtt-broker/issues/717) | — | "Not persisted; shown on /statusz." |
 | 0081-T9 | ⬜ planned | [#718](https://github.com/mbilling/fss-mqtt-broker/issues/718) | — |  |

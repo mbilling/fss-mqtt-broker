@@ -838,7 +838,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             path: config_path()?,
             precheck: Box::new(runtime_precheck),
             apply: Box::new(move |old, new| {
-                apply_live_config(old, new, &hub_for_apply, &audit_for_apply);
+                apply_live_config(old, new, &hub_for_apply, &audit_for_apply)
             }),
         });
     }
@@ -1031,6 +1031,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // SIGHUP reloads the security policy (ACL + authenticator + TLS material) in place
     // (ADR 0032) — no restart, no dropped connections; a bad file keeps the running policy.
     spawn_reload_handler(reloader.clone());
+    let reloader_for_admin = reloader.clone();
 
     // Optional filesystem watcher (ADR 0033): MQTTD_CONFIG_WATCH=<seconds> auto-reloads when a
     // configured policy file changes on disk (the Kubernetes ConfigMap case), through the same
@@ -1047,6 +1048,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         audit_for_admin,
         admin_sessions,
         admin_authz,
+        mqttd::admin::config::ReloadAccess {
+            reloader: reloader_for_admin,
+            stamp: config_stamp.clone(),
+        },
     )
     .await?;
 
@@ -2521,6 +2526,7 @@ async fn start_health(
 /// Start the admin API listener (ADR 0081) when `admin.bind` is set; a no-op otherwise.
 /// Its TLS trusts the admin client CA and, on a cluster node, the cluster CA — the latter
 /// only so peers can read each other's state (the `peer` role).
+#[allow(clippy::too_many_arguments)] // a wiring seam: one call site, named handles
 async fn start_admin(
     config: &Config,
     node_id: &NodeId,
@@ -2529,6 +2535,7 @@ async fn start_admin(
     audit: Arc<dyn mqtt_observability::AuditSink>,
     sessions: mqttd::admin::sessions::SessionAccess,
     authz: mqttd::admin::authz::LiveAuthorizer,
+    reload: mqttd::admin::config::ReloadAccess,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let admin = &config.admin;
     let Some(bind) = &admin.bind else {
@@ -2546,7 +2553,8 @@ async fn start_admin(
     let mut state =
         mqttd::admin::AdminState::new(node_id.0.clone(), health, live_config.clone(), audit)
             .with_sessions(sessions)
-            .with_authorizer(authz);
+            .with_authorizer(authz)
+            .with_reload(reload);
     if let Some(ca) = cluster_ca {
         state = state.with_cluster_ca(tls::ChainCheck::new(ca)?);
     }
@@ -3905,7 +3913,7 @@ fn apply_live_config(
     new: &Config,
     hub: &mpsc::UnboundedSender<hub::HubCommand>,
     audit: &Arc<dyn AuditSink>,
-) {
+) -> Vec<String> {
     // Quotas are live: push the new set (idempotent when unchanged). precheck guaranteed they
     // build, so this does not error.
     if let Ok(quotas) = quotas_from_config(new) {
@@ -3925,6 +3933,7 @@ fn apply_live_config(
             &format!("requires-restart sections: {sections}"),
         );
     }
+    restart.into_iter().map(String::from).collect()
 }
 
 /// Resolve the config-file path (`--config <path>` / `--config=<path>`, else `MQTTD_CONFIG`)

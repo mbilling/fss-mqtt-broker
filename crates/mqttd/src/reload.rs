@@ -39,7 +39,39 @@ pub type BuildResult = Result<(Arc<dyn Authorizer>, Arc<dyn Authenticator>), Str
 pub type ConfigPrecheck = Box<dyn Fn(&mqtt_config::Config) -> Result<(), String> + Send + Sync>;
 
 /// A [`ConfigSource`] live-apply hook, called `(old, new)` on a committed reload (ADR 0046 T4).
-pub type ConfigApply = Box<dyn Fn(&mqtt_config::Config, &mqtt_config::Config) + Send + Sync>;
+/// Returns the changed sections that need a restart to take effect, for the
+/// [`ReloadOutcome`].
+pub type ConfigApply =
+    Box<dyn Fn(&mqtt_config::Config, &mqtt_config::Config) -> Vec<String> + Send + Sync>;
+
+/// What one reload did (ADR 0081 T6): the admin API returns it, so an operator learns
+/// whether the change took without reading the log.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct ReloadOutcome {
+    /// Why the reload ran (`signal`, `watch`, `admin`).
+    pub trigger: String,
+    /// Whether the new config and policy were swapped in.
+    pub applied: bool,
+    /// Why not, when not applied. The running config and policy are unchanged.
+    pub error: Option<String>,
+    /// The top-level config sections that differ from the previous config.
+    pub changed_sections: Vec<String>,
+    /// Of those, the ones that need a restart to take effect (staged, not live).
+    pub requires_restart: Vec<String>,
+}
+
+/// The top-level sections of `new` that differ from `old`, by their TOML names.
+fn changed_sections(old: &mqtt_config::Config, new: &mqtt_config::Config) -> Vec<String> {
+    let (Ok(serde_json::Value::Object(o)), Ok(serde_json::Value::Object(n))) =
+        (serde_json::to_value(old), serde_json::to_value(new))
+    else {
+        return Vec::new();
+    };
+    n.iter()
+        .filter(|(k, v)| o.get(*k) != Some(*v))
+        .map(|(k, _)| k.clone())
+        .collect()
+}
 
 /// What a TLS `build` closure returns: a freshly-built acceptor from the renewed
 /// cert/key/client-CA, or an error string (a missing/unparseable file) that aborts the swap.
@@ -202,6 +234,9 @@ pub struct Reloader {
     /// Set by [`attach_config_source`](Self::attach_config_source) (ADR 0046 T4): the whole
     /// config is re-loaded, validated, and swapped ahead of the policy rebuild.
     config_source: Option<ConfigSource>,
+    /// Serializes reloads: SIGHUP, the file watcher and the admin API can fire at once,
+    /// and the config swap / rollback must not interleave.
+    in_progress: std::sync::Mutex<()>,
 }
 
 impl std::fmt::Debug for Reloader {
@@ -251,6 +286,7 @@ impl Reloader {
                 gossip_signer: None,
                 gossip_signer_build: None,
                 config_source: None,
+                in_progress: std::sync::Mutex::new(()),
             },
             Handles {
                 authz,
@@ -362,8 +398,18 @@ impl Reloader {
     /// `trigger` records *why* the reload fired — `"signal"` for `SIGHUP`, `"watch"` for the
     /// filesystem watcher (ADR 0033) — carried into the audit event and the metric label so an
     /// operator can tell a manual reload from an auto-applied one.
-    #[allow(clippy::too_many_lines)]
     pub fn reload(&self, trigger: &str) -> bool {
+        self.reload_with_outcome(trigger).applied
+    }
+
+    /// [`reload`](Self::reload), reporting what happened: whether it applied, why not,
+    /// and which config sections changed and which of those need a restart (ADR 0081 T6).
+    #[allow(clippy::too_many_lines)]
+    pub fn reload_with_outcome(&self, trigger: &str) -> ReloadOutcome {
+        let _one_at_a_time = self
+            .in_progress
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // ADR 0046 T4: when a config source is attached, re-load + validate the whole config and
         // swap it into `live` *before* rebuilding the policy (which reads paths from `live`).
         // `committed` carries the (old, new) pair so any downstream build failure can roll back —
@@ -510,16 +556,22 @@ impl Reloader {
                 }
                 // ADR 0046 T4: the config swap is committed — push the live-swappable settings
                 // (quotas) to the hub and log every changed non-live section as requires-restart.
+                let mut outcome = ReloadOutcome {
+                    trigger: trigger.to_string(),
+                    applied: true,
+                    ..ReloadOutcome::default()
+                };
                 if let (Some(cs), Some((old, new))) = (&self.config_source, &committed) {
-                    (cs.apply)(old, new);
+                    outcome.requires_restart = (cs.apply)(old, new);
+                    outcome.changed_sections = changed_sections(old, new);
                 }
-                true
+                outcome
             }
         }
     }
 
     /// Record a rejected reload (audit + metric + log) and report it as not applied.
-    fn reject(&self, trigger: &str, error: &str) -> bool {
+    fn reject(&self, trigger: &str, error: &str) -> ReloadOutcome {
         warn!(trigger, %error, "security reload REJECTED — keeping the running policy");
         self.audit.record(
             "security.reload",
@@ -529,7 +581,12 @@ impl Reloader {
         if let Some(m) = &self.metrics {
             m.security_reload("rejected", trigger);
         }
-        false
+        ReloadOutcome {
+            trigger: trigger.to_string(),
+            applied: false,
+            error: Some(error.to_string()),
+            ..ReloadOutcome::default()
+        }
     }
 }
 
@@ -953,6 +1010,68 @@ mod tests {
         ))
     }
 
+    /// ADR 0081 T6: the outcome says what the reload did — the changed sections, which of
+    /// them the apply hook flagged as needing a restart, or the rejection and its reason.
+    #[test]
+    fn a_reload_reports_its_outcome() {
+        let dir = std::env::temp_dir().join(format!("mqttd-outcome-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("cfg.toml");
+        let base = "[durable]\nallow_ephemeral = true\n";
+        std::fs::write(&path, format!("[node]\nid = \"n1\"\n{base}")).unwrap();
+        let live = Arc::new(RwLock::new(mqtt_config::Config::default()));
+        let (mut reloader, _h) = Reloader::new(ok_auth_pair().unwrap(), audit(), ok_auth_pair);
+        reloader.attach_config_source(ConfigSource {
+            live: live.clone(),
+            path: Some(path.clone()),
+            precheck: Box::new(|_| Ok(())),
+            // Stands in for the binary's requires-restart classification.
+            apply: Box::new(|old, new| {
+                if old.node == new.node {
+                    Vec::new()
+                } else {
+                    vec!["node".to_string()]
+                }
+            }),
+        });
+        // First load: from defaults to the file.
+        let first = reloader.reload_with_outcome("admin");
+        assert!(first.applied && first.error.is_none(), "{first:?}");
+        assert_eq!(first.trigger, "admin");
+        assert!(
+            first.changed_sections.contains(&"node".to_string()),
+            "{first:?}"
+        );
+        assert_eq!(first.requires_restart, vec!["node".to_string()]);
+
+        // A live-swappable edit: changed, nothing to restart.
+        std::fs::write(
+            &path,
+            format!("[node]\nid = \"n1\"\n[limits]\nmax_sessions = 10\n{base}"),
+        )
+        .unwrap();
+        let live_edit = reloader.reload_with_outcome("admin");
+        assert!(live_edit.applied);
+        assert_eq!(live_edit.changed_sections, vec!["limits".to_string()]);
+        assert!(live_edit.requires_restart.is_empty());
+
+        // Nothing changed: applied, no sections.
+        let same = reloader.reload_with_outcome("admin");
+        assert!(same.applied && same.changed_sections.is_empty(), "{same:?}");
+
+        // A broken file: not applied, the reason reported, the running config kept.
+        std::fs::write(&path, "[node\n").unwrap();
+        let broken = reloader.reload_with_outcome("admin");
+        assert!(!broken.applied);
+        assert!(
+            broken.error.as_deref().unwrap().starts_with("config:"),
+            "{broken:?}"
+        );
+        assert!(broken.changed_sections.is_empty());
+        assert_eq!(read_lock(&live).limits.max_sessions, Some(10));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// ADR 0046 T4: a reload re-loads the whole config file and swaps it into the shared `live`
     /// cell (validate-before-swap), running the injected precheck + apply. An invalid config, a
     /// precheck failure, or a failed policy build all keep the running config unchanged.
@@ -979,7 +1098,10 @@ mod tests {
             live: live.clone(),
             path: Some(path.clone()),
             precheck: Box::new(|_| Ok(())),
-            apply: Box::new(move |_, _| applied_c.store(true, Ordering::SeqCst)),
+            apply: Box::new(move |_, _| {
+                applied_c.store(true, Ordering::SeqCst);
+                Vec::new()
+            }),
         });
         assert!(reloader.reload("signal"));
         assert_eq!(read_lock(&live).node.id, "first");
@@ -1017,7 +1139,7 @@ mod tests {
             live: live.clone(),
             path: Some(path.clone()),
             precheck: Box::new(|_| Err("precheck says no".into())),
-            apply: Box::new(|_, _| {}),
+            apply: Box::new(|_, _| Vec::new()),
         });
         assert!(!reloader.reload("signal"));
         assert_eq!(
@@ -1033,7 +1155,7 @@ mod tests {
             live: live.clone(),
             path: Some(path.clone()),
             precheck: Box::new(|_| Ok(())),
-            apply: Box::new(|_, _| {}),
+            apply: Box::new(|_, _| Vec::new()),
         });
         assert!(!reloader.reload("signal"));
         assert_eq!(
@@ -1067,7 +1189,7 @@ mod tests {
             live: live.clone(),
             path: Some(path.clone()),
             precheck: Box::new(|_| Ok(())),
-            apply: Box::new(|_, _| {}),
+            apply: Box::new(|_, _| Vec::new()),
         });
         assert!(
             reloader.reload("signal"),

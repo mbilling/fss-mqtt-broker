@@ -75,6 +75,22 @@ const VERBS: &[Verb] = &[
         help: "this node's membership, replication and lease view; do the others agree",
     },
     Verb {
+        name: "config",
+        method: "GET",
+        path: "/admin/v1/config",
+        required: &[],
+        optional: &[],
+        help: "the effective config (secrets fingerprinted) and the file checksum",
+    },
+    Verb {
+        name: "reload",
+        method: "POST",
+        path: "/admin/v1/reload",
+        required: &[],
+        optional: &[],
+        help: "operator: reload the config file, as SIGHUP does, and report the outcome",
+    },
+    Verb {
         name: "authz",
         method: "GET",
         path: "/admin/v1/authz",
