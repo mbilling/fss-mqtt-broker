@@ -405,6 +405,10 @@ impl SegmentLog {
     fn next_segment(&mut self, first: Lsn, bytes: u64) -> Result<File, LogError> {
         let spare = self.spare.take().map(std::thread::JoinHandle::join);
         let spare_path = self.dir.join(SPARE_NAME);
+        if let Some(Ok(Err(e))) = &spare {
+            // The inline zeroing below retries it and surfaces a real failure.
+            tracing::warn!(error = %e, "preparing the next segment in the background failed");
+        }
         if let Some(Ok(Ok(spare))) = spare {
             if spare.bytes == bytes {
                 let path = self.dir.join(segment_name(first));
