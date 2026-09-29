@@ -932,6 +932,22 @@ mqttd --admin purge dev-0042    # disconnect if connected, then delete the sessi
   it. A forwarded action is never forwarded again.
 - `404 not-found` means the owner holds no session or connection for that id.
 
+**Taking a node out of rotation without draining it.** `cordon` (operator role, this node
+only) refuses every new connection at accept and makes `/readyz` report not-ready, with
+`"cordon":{"active":true,"reason":"cordoned-by-operator"}`, so load balancers and
+Kubernetes Services stop sending new clients; `/livez` stays healthy, so nothing restarts
+it. Connected sessions are untouched. `uncordon` reverses it.
+
+```sh
+mqttd --admin cordon --url https://mqttd-2.mqttd:9443
+mqttd --admin cluster                 # the node shows ready: false
+mqttd --admin uncordon --url https://mqttd-2.mqttd:9443
+```
+
+It is not persisted: a restart comes back uncordoned. Refused connections count as
+`admission_rejected{reason="cordon"}`. To move the connected clients off too, follow with
+`kick`, or use `--decommission` to remove the node for good.
+
 **Why is this client denied?** `authz` asks the live policy, the one the last reload
 published, and names the rule that decides. It changes nothing.
 

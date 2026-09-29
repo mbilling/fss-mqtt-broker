@@ -111,6 +111,39 @@ pub async fn act(
     )
 }
 
+/// `POST /admin/v1/cordon` (`on`) / `POST /admin/v1/uncordon`: this node only. Cordoned,
+/// it refuses every new connection at accept and reports not-ready on `/readyz`, so load
+/// balancers stop routing to it; connected sessions stay. Not persisted: a restart
+/// clears it (ADR 0081 §4).
+pub fn cordon(state: &AdminState, on: bool) -> Answer {
+    let Some(flag) = state.cordon.as_ref() else {
+        return error(503, "unavailable", "cordon is not wired on this node");
+    };
+    let was = flag.swap(on, std::sync::atomic::Ordering::AcqRel);
+    if was != on {
+        tracing::warn!(
+            node = %state.node_id,
+            cordoned = on,
+            "{}",
+            if on {
+                "node CORDONED by an admin action: refusing new connections, reporting \
+                 not-ready; connected sessions stay"
+            } else {
+                "node uncordoned by an admin action: accepting new connections again"
+            }
+        );
+    }
+    (
+        200,
+        json!({
+            "node": state.node_id,
+            "cordoned": on,
+            "changed": was != on,
+        })
+        .to_string(),
+    )
+}
+
 /// Send the action to the owner's admin listener and relay its answer.
 async fn forward(
     state: &AdminState,

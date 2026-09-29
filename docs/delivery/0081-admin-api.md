@@ -41,12 +41,13 @@ tasks:
     evidence: "PR #733. GET /admin/v1/config serves the committed config (read under the reload lock) with secrets fingerprinted, the file checksum and generation; POST /admin/v1/reload (operator) runs the SIGHUP reload and returns applied, changed_sections and requires_restart, or 409 reload-rejected with the reason. Reloader::reload_with_outcome and a reload mutex; unit tests for the outcome and for never exposing a rejected candidate; mTLS integration test."
   - id: 0081-T7
     title: "Actions: kick (DISCONNECT 0x98) and purge a session, forwarded to the client's node"
-    status: in-progress
+    status: done
     issue: 716
-    notes: "Audited on the node receiving the call and on the node acting."
+    date: 2026-09-30
+    evidence: "PR #734. POST /admin/v1/kick (MQTT 5 DISCONNECT 0x98, session kept) and /admin/v1/purge (disconnect, then discard_session: subscriptions, in-flight, expiry, stored queue); a non-owner node forwards to the owner's admin listener under the peer role with forwarded_for, never re-forwarded, audited on both nodes. 0x98 provoked on a real socket (reason-code gate); two-broker forwarding test."
   - id: 0081-T8
     title: "Cordon / uncordon: refuse new connections and report not-ready without draining"
-    status: planned
+    status: in-progress
     issue: 717
     notes: "Not persisted; shown on /statusz."
   - id: 0081-T9
@@ -93,8 +94,8 @@ frontmatter above · this file is the plan, progress log, and changelog.
 | 0081-T4 | ✅ done | [#713](https://github.com/mbilling/fss-mqtt-broker/issues/713) | 2026-09-30 | "PR #731. /admin/v1/clients (filters, paging, total), /session (subscriptions, in flight, backlog, Will without payload, owner, offline queued count capped at 10 000), /subscribers (bounded page), /backlog, /retained (subtree via the match index, no payloads). HubCommand::Admin handled in hub/admin.rs; store I/O off the hub loop; Admission.source threaded from handle_stream. Three integration tests with real MQTT clients." |
 | 0081-T5 | ✅ done | [#714](https://github.com/mbilling/fss-mqtt-broker/issues/714) | 2026-09-30 | "PR #732. GET /admin/v1/authz: verdict, deciding rule (index, effect, pattern as written and expanded) and reason from the live authorizer; invalid filters and publish wildcards refused before the policy. mqtt-auth Authorizer::explain, with AclPolicy sharing one evaluator between enforcement and the dry run (allocation-free Decider); explain_always_agrees_with_enforcement grid test plus mTLS integration test." |
 | 0081-T6 | ✅ done | [#715](https://github.com/mbilling/fss-mqtt-broker/issues/715) | 2026-09-30 | "PR #733. GET /admin/v1/config serves the committed config (read under the reload lock) with secrets fingerprinted, the file checksum and generation; POST /admin/v1/reload (operator) runs the SIGHUP reload and returns applied, changed_sections and requires_restart, or 409 reload-rejected with the reason. Reloader::reload_with_outcome and a reload mutex; unit tests for the outcome and for never exposing a rejected candidate; mTLS integration test." |
-| 0081-T7 | 🚧 in-progress | [#716](https://github.com/mbilling/fss-mqtt-broker/issues/716) | — | "Audited on the node receiving the call and on the node acting." |
-| 0081-T8 | ⬜ planned | [#717](https://github.com/mbilling/fss-mqtt-broker/issues/717) | — | "Not persisted; shown on /statusz." |
+| 0081-T7 | ✅ done | [#716](https://github.com/mbilling/fss-mqtt-broker/issues/716) | 2026-09-30 | "PR #734. POST /admin/v1/kick (MQTT 5 DISCONNECT 0x98, session kept) and /admin/v1/purge (disconnect, then discard_session: subscriptions, in-flight, expiry, stored queue); a non-owner node forwards to the owner's admin listener under the peer role with forwarded_for, never re-forwarded, audited on both nodes. 0x98 provoked on a real socket (reason-code gate); two-broker forwarding test." |
+| 0081-T8 | 🚧 in-progress | [#717](https://github.com/mbilling/fss-mqtt-broker/issues/717) | — | "Not persisted; shown on /statusz." |
 | 0081-T9 | ⬜ planned | [#718](https://github.com/mbilling/fss-mqtt-broker/issues/718) | — |  |
 | 0081-T10 | ⬜ planned | [#719](https://github.com/mbilling/fss-mqtt-broker/issues/719) | — |  |
 | 0081-T11 | ✅ done | [#720](https://github.com/mbilling/fss-mqtt-broker/issues/720) | 2026-09-29 | "PR #728. mqttd --print-config prints the effective config (defaults < file < env) with secrets fingerprinted via Config::redacted (mqtt-config) and mqttd::config_view; unit tests pin that no secret field survives redaction and URL separators are preserved." |
