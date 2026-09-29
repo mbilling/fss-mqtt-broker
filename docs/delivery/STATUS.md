@@ -88,6 +88,7 @@
 | [0078](../adr/0078-replica-segment-log.md) | # 0078. The replica store becomes an append-only segment log — the disk is the limit, not the B-tree | Accepted | [3/4 done](0078-replica-segment-log.md) | 1 open |
 | [0079](../adr/0079-global-allocator.md) | # 0079. mqttd links mimalloc as its global allocator | Accepted | [1/2 done](0079-global-allocator.md) | 1 open |
 | [0080](../adr/0080-replication-factor.md) | # 0080. The replication factor is cluster state: configurable, default 2, changeable live | Accepted | [0/6 done](0080-replication-factor.md) | 6 open |
+| [0081](../adr/0081-admin-api.md) | # 0081. An authenticated admin API: reads cluster-wide, actions audited, config stays in the file | Proposed | [0/14 done](0081-admin-api.md) | 12 open, 2 deferred |
 
 ## Open and deferred work
 
@@ -219,3 +220,20 @@
 - `0080-T4` ⬜ planned ([#703](https://github.com/mbilling/fss-mqtt-broker/issues/703)): "Default replication factor 2 for new clusters" — "After T3. Existing clusters keep R=3."
 - `0080-T5` ⬜ planned ([#704](https://github.com/mbilling/fss-mqtt-broker/issues/704)): "Change R on a running cluster: joint phase, catch-up, switch, collect" — "Config reload or admin API proposes; refused below R' eligible nodes or while a change runs; progress on /statusz."
 - `0080-T6` ⬜ planned ([#705](https://github.com/mbilling/fss-mqtt-broker/issues/705)): "Evidence: R=2 against R=3 on the calibration shape (paid)" — "3 × CCX23, durable QoS 1, log store, one provisioning. Expected ~1.5x the durable ceiling at N=3."
+
+**0081 — # 0081. An authenticated admin API: reads cluster-wide, actions audited, config stays in the file**
+
+- `0081-T1` ⬜ planned ([#710](https://github.com/mbilling/fss-mqtt-broker/issues/710)): "Admin listener: [admin] bind, mTLS required, viewer/operator roles from the cert subject, every request audited, /admin/v1/node" — "Off by default. THREAT-MODEL.md and HARDENING.md entries ship with it."
+- `0081-T2` ⬜ planned ([#711](https://github.com/mbilling/fss-mqtt-broker/issues/711)): "mqttd --admin <verb>: CLI client for the admin API (table or --json)" — "Same binary, works in the distroless image; no logic beyond the endpoints."
+- `0081-T3` ⬜ planned ([#712](https://github.com/mbilling/fss-mqtt-broker/issues/712)): "Cluster view: /admin/v1/cluster and /placement answered by any node via peer-bus fan-out" — "Capability-gated on the next peer protocol version; each row says whether that node replied and how stale it is."
+- `0081-T4` ⬜ planned ([#713](https://github.com/mbilling/fss-mqtt-broker/issues/713)): "Clients and sessions: paged list and filters, session detail, sessions matching a topic, top-N backlog, retained by prefix" — "Bounded responses only; reads of identifying data are audited."
+- `0081-T5` ⬜ planned ([#714](https://github.com/mbilling/fss-mqtt-broker/issues/714)): "Authorization dry run: /admin/v1/authz/check returns the verdict and the deciding rule" — "Evaluates the loaded policy; changes nothing."
+- `0081-T6` ⬜ planned ([#715](https://github.com/mbilling/fss-mqtt-broker/issues/715)): "Effective config (secrets fingerprinted, with a hash) and reload that returns its outcome" — "First action. Reload runs the ADR 0032 routine; the file stays the only input."
+- `0081-T7` ⬜ planned ([#716](https://github.com/mbilling/fss-mqtt-broker/issues/716)): "Actions: kick (DISCONNECT 0x98) and purge a session, forwarded to the client's node" — "Audited on the node receiving the call and on the node acting."
+- `0081-T8` ⬜ planned ([#717](https://github.com/mbilling/fss-mqtt-broker/issues/717)): "Cordon / uncordon: refuse new connections and report not-ready without draining" — "Not persisted; shown on /statusz."
+- `0081-T9` ⬜ planned ([#718](https://github.com/mbilling/fss-mqtt-broker/issues/718)): "Log filter override with a TTL (at most one hour), shown on /statusz"
+- `0081-T10` ⬜ planned ([#719](https://github.com/mbilling/fss-mqtt-broker/issues/719)): "OPERATIONS.md: day 0/1/2 runbook using the admin CLI; notes on ADRs 0032/0033/0051 and COMPARISON.md"
+- `0081-T11` ⬜ planned ([#720](https://github.com/mbilling/fss-mqtt-broker/issues/720)): "mqttd --print-config: the effective config with secrets fingerprinted, offline" — "Day 0; independent of the listener and can be picked up at any time."
+- `0081-T12` ⬜ planned ([#721](https://github.com/mbilling/fss-mqtt-broker/issues/721)): "mqttd --check-tls: chain, key match, expiry and SANs for every configured listener" — "Day 0; independent of the listener and can be picked up at any time."
+- `0081-T13` 💤 deferred: "OIDC bearer tokens as a second admin authenticator on the same roles" — "After T1–T9 are in use."
+- `0081-T14` 💤 deferred: "Bulk retained-message deletion by prefix" — "Needs a demonstrated need and a dry-run design (ADR §5)."
