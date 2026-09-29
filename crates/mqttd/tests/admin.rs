@@ -243,9 +243,17 @@ async fn every_request_is_audited_with_subject_role_and_outcome() {
     let mallory = mint_leaf(&h.admin_ca, "mallory", None);
     h.get(&alice, "/admin/v1/node?x=a%20b").await;
     h.get(&mallory, "/admin/v1/node").await;
+    // A newline smuggled into the path must not split the one-line audit record.
+    let (status, _) = h.get(&alice, "/admin/v1/node%0Aforged%20line").await;
+    assert_eq!(status, 404);
 
     let records = h.audit.0.lock().unwrap().clone();
-    assert_eq!(records.len(), 2, "{records:?}");
+    assert_eq!(records.len(), 3, "{records:?}");
+    assert_eq!(
+        records[2].2,
+        "role=viewer GET /admin/v1/node%0Aforged%20line -> 404"
+    );
+    assert!(records.iter().all(|(_, _, d)| !d.contains('\n')));
     assert!(records.iter().all(|(kind, _, _)| kind == "admin.request"));
     assert_eq!(records[0].1.as_deref(), Some("CN=alice"));
     assert_eq!(
