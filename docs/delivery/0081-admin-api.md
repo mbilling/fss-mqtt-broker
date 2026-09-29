@@ -53,8 +53,10 @@ tasks:
     evidence: "PR #735. POST /admin/v1/cordon and /uncordon (operator, this node): the admission gate refuses new connections (admission_rejected reason cordon), /readyz reports not-ready with reason cordoned-by-operator, /livez stays up, /statusz shows it; not persisted. Unit tests for the gate and health, integration round trip."
   - id: 0081-T9
     title: "Log filter override with a TTL (at most one hour), shown on /statusz"
-    status: in-progress
+    status: done
     issue: 718
+    date: 2026-09-30
+    evidence: "PR #736. The tracing filter sits behind a reload layer (mqttd::log_filter); GET/POST /admin/v1/log-level and /log-level/reset: an override in RUST_LOG syntax for at most 3600 s, restored by a timer (a newer override supersedes the older timer); every override keeps audit=info and filters naming the audit target are refused; shown on /statusz. Paused-clock unit tests and an integration test."
   - id: 0081-T10
     title: "OPERATIONS.md: day 0/1/2 runbook using the admin CLI; notes on ADRs 0032/0033/0051 and COMPARISON.md"
     status: in-progress
@@ -97,7 +99,7 @@ frontmatter above · this file is the plan, progress log, and changelog.
 | 0081-T6 | ✅ done | [#715](https://github.com/mbilling/fss-mqtt-broker/issues/715) | 2026-09-30 | "PR #733. GET /admin/v1/config serves the committed config (read under the reload lock) with secrets fingerprinted, the file checksum and generation; POST /admin/v1/reload (operator) runs the SIGHUP reload and returns applied, changed_sections and requires_restart, or 409 reload-rejected with the reason. Reloader::reload_with_outcome and a reload mutex; unit tests for the outcome and for never exposing a rejected candidate; mTLS integration test." |
 | 0081-T7 | ✅ done | [#716](https://github.com/mbilling/fss-mqtt-broker/issues/716) | 2026-09-30 | "PR #734. POST /admin/v1/kick (MQTT 5 DISCONNECT 0x98, session kept) and /admin/v1/purge (disconnect, then discard_session: subscriptions, in-flight, expiry, stored queue); a non-owner node forwards to the owner's admin listener under the peer role with forwarded_for, never re-forwarded, audited on both nodes. 0x98 provoked on a real socket (reason-code gate); two-broker forwarding test." |
 | 0081-T8 | ✅ done | [#717](https://github.com/mbilling/fss-mqtt-broker/issues/717) | 2026-09-30 | "PR #735. POST /admin/v1/cordon and /uncordon (operator, this node): the admission gate refuses new connections (admission_rejected reason cordon), /readyz reports not-ready with reason cordoned-by-operator, /livez stays up, /statusz shows it; not persisted. Unit tests for the gate and health, integration round trip." |
-| 0081-T9 | 🚧 in-progress | [#718](https://github.com/mbilling/fss-mqtt-broker/issues/718) | — |  |
+| 0081-T9 | ✅ done | [#718](https://github.com/mbilling/fss-mqtt-broker/issues/718) | 2026-09-30 | "PR #736. The tracing filter sits behind a reload layer (mqttd::log_filter); GET/POST /admin/v1/log-level and /log-level/reset: an override in RUST_LOG syntax for at most 3600 s, restored by a timer (a newer override supersedes the older timer); every override keeps audit=info and filters naming the audit target are refused; shown on /statusz. Paused-clock unit tests and an integration test." |
 | 0081-T10 | 🚧 in-progress | [#719](https://github.com/mbilling/fss-mqtt-broker/issues/719) | — |  |
 | 0081-T11 | ✅ done | [#720](https://github.com/mbilling/fss-mqtt-broker/issues/720) | 2026-09-29 | "PR #728. mqttd --print-config prints the effective config (defaults < file < env) with secrets fingerprinted via Config::redacted (mqtt-config) and mqttd::config_view; unit tests pin that no secret field survives redaction and URL separators are preserved." |
 | 0081-T12 | ✅ done | [#721](https://github.com/mbilling/fss-mqtt-broker/issues/721) | 2026-09-29 | "PR #728. mqttd --check-tls (crates/mqttd/src/tls_check.rs) checks chain, key match, expiry (fail/warn under 30 days) and SANs for [tls] and [cluster.peer_tls]; rcgen-minted ok/expired/key-mismatch tests." |
