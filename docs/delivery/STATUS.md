@@ -88,7 +88,7 @@
 | [0078](../adr/0078-replica-segment-log.md) | # 0078. The replica store becomes an append-only segment log — the disk is the limit, not the B-tree | Accepted | [3/4 done](0078-replica-segment-log.md) | 1 open |
 | [0079](../adr/0079-global-allocator.md) | # 0079. mqttd links mimalloc as its global allocator | Accepted | [1/2 done](0079-global-allocator.md) | 1 open |
 | [0080](../adr/0080-replication-factor.md) | # 0080. The replication factor is cluster state: configurable, default 2, changeable live | Accepted | [2/6 done](0080-replication-factor.md) | 4 open |
-| [0081](../adr/0081-admin-api.md) | # 0081. An authenticated admin API: reads cluster-wide, actions audited, config stays in the file | Accepted | [8/14 done](0081-admin-api.md) | 4 open, 2 deferred |
+| [0081](../adr/0081-admin-api.md) | # 0081. An authenticated admin API: reads cluster-wide, actions audited, config stays in the file | Accepted | [9/14 done](0081-admin-api.md) | 3 open, 2 deferred |
 
 ## Open and deferred work
 
@@ -221,7 +221,6 @@
 
 **0081 — # 0081. An authenticated admin API: reads cluster-wide, actions audited, config stays in the file**
 
-- `0081-T7` 🚧 in-progress ([#716](https://github.com/mbilling/fss-mqtt-broker/issues/716)): "Actions: kick (DISCONNECT 0x98) and purge a session, forwarded to the client's node" — "Audited on the node receiving the call and on the node acting."
 - `0081-T8` 🚧 in-progress ([#717](https://github.com/mbilling/fss-mqtt-broker/issues/717)): "Cordon / uncordon: refuse new connections and report not-ready without draining" — "Not persisted; shown on /statusz."
 - `0081-T9` ⬜ planned ([#718](https://github.com/mbilling/fss-mqtt-broker/issues/718)): "Log filter override with a TTL (at most one hour), shown on /statusz"
 - `0081-T10` ⬜ planned ([#719](https://github.com/mbilling/fss-mqtt-broker/issues/719)): "OPERATIONS.md: day 0/1/2 runbook using the admin CLI; notes on ADRs 0032/0033/0051 and COMPARISON.md"
