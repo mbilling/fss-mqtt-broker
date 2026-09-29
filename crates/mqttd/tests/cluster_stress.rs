@@ -110,7 +110,7 @@ use std::net::SocketAddr;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
-use mqtt_cluster::durable_node::build_durable_node;
+use mqtt_cluster::durable_node::build_durable_node_with;
 use mqtt_cluster::invariants::{
     check_recovery_honesty, check_retained_convergence, AttachReport, DurableTruth,
     RetainedSnapshot, Violation,
@@ -302,12 +302,37 @@ async fn start_stress_node(
 /// [`start_stress_node`] with a failure-domain label (ADR 0016 T5): the zone is
 /// advertised over SWIM gossip exactly as `MQTTD_FAILURE_DOMAIN` does, so the
 /// 3→5 zone-spread test (ADR 0043 P4) exercises the live label plumbing.
-#[allow(clippy::too_many_lines)]
 async fn start_stress_node_in_zone(
     id: &str,
     swim_seeds: Vec<String>,
     data_dir: &std::path::Path,
     zone: Option<&str>,
+) -> StressNode {
+    start_stress_node_full(id, swim_seeds, data_dir, zone, common::founding()).await
+}
+
+/// A stress node founding a cluster at an explicit replication factor, whatever
+/// `MQTTD_REPLICAS` says — for tests whose claim is about one factor.
+async fn start_stress_node_at(
+    id: &str,
+    swim_seeds: Vec<String>,
+    data_dir: &std::path::Path,
+    replicas: u8,
+) -> StressNode {
+    let founding = mqtt_cluster::lease_assign::Founding::new(
+        replicas,
+        Arc::new(std::sync::atomic::AtomicBool::new(true)),
+    );
+    start_stress_node_full(id, swim_seeds, data_dir, None, founding).await
+}
+
+#[allow(clippy::too_many_lines)]
+async fn start_stress_node_full(
+    id: &str,
+    swim_seeds: Vec<String>,
+    data_dir: &std::path::Path,
+    zone: Option<&str>,
+    founding: mqtt_cluster::lease_assign::Founding,
 ) -> StressNode {
     let node_id = NodeId(id.to_string());
     let can_bootstrap = swim_seeds.is_empty();
@@ -316,7 +341,7 @@ async fn start_stress_node_in_zone(
             .with_local_domain(zone.map(str::to_string)),
     ));
 
-    let (store, durable_retained, plane, driver) = build_durable_node(
+    let (store, durable_retained, plane, driver) = build_durable_node_with(
         node_id.clone(),
         placement.clone(),
         can_bootstrap,
@@ -327,6 +352,8 @@ async fn start_stress_node_in_zone(
         false,
         Arc::new(std::sync::atomic::AtomicBool::new(false)),
         None,
+        common::replica_store(), // MQTTD_REPLICA_STORE (ADR 0078)
+        Some(founding),          // MQTTD_REPLICAS (ADR 0080) unless pinned
     )
     .await;
     // The hub's session-store seam, wrapped for write-error injection (T4):
@@ -1697,10 +1724,13 @@ async fn growing_one_node_to_three_back_fills_and_survives_the_founder() {
     let c = start_stress_node("gw-c", vec![a.swim_addr.clone()], &dir("c")).await;
     wait_cluster_ready(&[&a, &b, &c]).await;
 
-    // The P1 catch-up: BOTH joiners must hold the laptop-era history — the
-    // session's queue and metadata and the retained key — gap-free and stamped
-    // current behind the durable caught-up watermark. Only then is losing the
-    // founder survivable.
+    // The P1 catch-up: every joiner in a key's replica set must hold the
+    // laptop-era history — the session's queue and metadata and the retained key
+    // — gap-free and stamped current behind the durable caught-up watermark. Only
+    // then is losing the founder survivable. At R=3 on three nodes that is BOTH
+    // joiners for every key; at R=2 (ADR 0080) each key has one joiner beside the
+    // founder, or two without it — never none, since the founder alone is not a
+    // set of 2.
     {
         let keys = [
             format!("q/{sub_id}"),
@@ -1709,9 +1739,20 @@ async fn growing_one_node_to_three_back_fills_and_survives_the_founder() {
         ];
         let deadline = Instant::now() + Duration::from_secs(90);
         loop {
-            let caught_up = [&b, &c].iter().all(|n| {
-                let plane = n.plane.as_ref().expect("plane alive");
-                keys.iter().all(|k| plane.replica_caught_up(k))
+            let caught_up = keys.iter().all(|k| {
+                let set = a
+                    .placement
+                    .read()
+                    .unwrap()
+                    .group_replica_set(mqtt_cluster::placement::group_of_key(k));
+                let holders: Vec<_> = [&b, &c]
+                    .into_iter()
+                    .filter(|n| set.contains(&n.node_id))
+                    .collect();
+                !holders.is_empty()
+                    && holders
+                        .iter()
+                        .all(|n| n.plane.as_ref().expect("plane alive").replica_caught_up(k))
             });
             if caught_up {
                 break;
@@ -3364,11 +3405,15 @@ async fn a_cross_node_shared_subscriber_is_never_bypassed_by_an_ack() {
 /// voters across every given node.
 async fn wait_cluster_ready(nodes: &[&StressNode]) {
     let expected = nodes.len();
+    // ADR 0080: every node follows the factor the harness founded, so a run with
+    // MQTTD_REPLICAS=2 proves it ran at 2 instead of assuming it.
+    let replicas = usize::from(common::expected_replicas());
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
-        let members = nodes
-            .iter()
-            .all(|n| n.placement.read().unwrap().member_count() == expected);
+        let members = nodes.iter().all(|n| {
+            let p = n.placement.read().unwrap();
+            p.member_count() == expected && p.desired_replicas() == replicas
+        });
         let voters = nodes.iter().all(|n| {
             n.plane
                 .as_ref()
@@ -3377,7 +3422,10 @@ async fn wait_cluster_ready(nodes: &[&StressNode]) {
         if members && voters {
             return;
         }
-        assert!(Instant::now() < deadline, "cluster never became ready");
+        assert!(
+            Instant::now() < deadline,
+            "cluster never became ready ({expected} members, {replicas} replicas, all voting)"
+        );
         tokio::time::sleep(Duration::from_millis(300)).await;
     }
 }
@@ -3664,5 +3712,48 @@ async fn a_fleet_scale_grow_and_shrink_soak_loses_no_acked_fact() {
                     .collect::<Vec<_>>()
             );
         }
+    }
+}
+
+/// #727 (found validating ADR 0080 at R=2): a node's caught-up stamp must not
+/// outlive its membership of the group's replica set. A cluster founded at R=2
+/// on three nodes stamps every group while placement still runs at 3 — every
+/// node in every set — and then drops each node from a third of the sets. Once
+/// the catch-up sweep has run on the adopted factor, no node may hold a stamp for
+/// a group it is not a replica of: such a stamp let a node answer a recovery read
+/// "complete" for history it never received, and acked messages were lost.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn no_node_keeps_a_stamp_for_a_group_it_left() {
+    let disk = tempfile::tempdir().expect("tempdir");
+    let dir = |n: &str| {
+        let d = disk.path().join(n);
+        std::fs::create_dir_all(&d).expect("node dir");
+        d
+    };
+    let a = start_stress_node_at("st-a", vec![], &dir("a"), 2).await;
+    let b = start_stress_node_at("st-b", vec![a.swim_addr.clone()], &dir("b"), 2).await;
+    let c = start_stress_node_at("st-c", vec![a.swim_addr.clone()], &dir("c"), 2).await;
+    let nodes = [&a, &b, &c];
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let adopted = nodes
+            .iter()
+            .all(|n| n.placement.read().unwrap().desired_replicas() == 2);
+        let stale: Vec<(String, usize)> = nodes
+            .iter()
+            .map(|n| {
+                let plane = n.plane.as_ref().expect("plane alive");
+                (n.node_id.0.clone(), plane.stamps_outside_custody().len())
+            })
+            .filter(|(_, stale)| *stale > 0)
+            .collect();
+        if adopted && stale.is_empty() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "stamps outlive custody (node, groups stamped though outside the set): {stale:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
     }
 }

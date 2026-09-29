@@ -484,10 +484,13 @@ pub struct Durable {
     /// restarting in one, a different value here changes nothing (it is logged). A
     /// cluster founded before ADR 0080 runs at 3.
     ///
-    /// At 2 the write quorum is both copies: one slow or suspected replica pauses
-    /// durable writes for its groups until it recovers or is declared dead. At 3 a
-    /// single failure is tolerated without a pause. Even values above 2 cost a copy
-    /// without tolerating another failure (4 needs 3 acks, like 3 needs 2).
+    /// At 2 the write quorum is both copies, so a slow, suspected or dead node pauses
+    /// durable writes for every group it holds a copy of; at 3 only for the groups it
+    /// OWNS (a lost non-owner copy is ridden through). Either way the paused groups
+    /// wait out failover — failure detection, lease reassignment and recovery —
+    /// measured at about 15 s for a crash and about 20 s for an 8 s stall on three
+    /// nodes (ADR 0080 T3). R=2 pauses more groups, not for longer. Even values above
+    /// 2 cost a copy without tolerating another failure (4 needs 3 acks, like 3 needs 2).
     pub replicas: u8,
     /// Disk high-water byte cap for the durable store (`MQTTD_STORE_MAX_BYTES`, ADR 0041 T5).
     pub store_max_bytes: Option<u64>,

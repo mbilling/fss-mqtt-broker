@@ -34,7 +34,7 @@ use std::net::SocketAddr;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
-use mqtt_cluster::durable_node::build_durable_node;
+use mqtt_cluster::durable_node::build_durable_node_with;
 use mqtt_cluster::placement::{Placement, DEFAULT_REPLICAS};
 use mqtt_cluster::swim::{Config as SwimConfig, Swim};
 use mqtt_cluster::swim_auth::{SwimAuth, KEY_LEN};
@@ -131,7 +131,7 @@ async fn start_durable_node_capped(
         DEFAULT_REPLICAS,
     )));
 
-    let (store, durable_retained, plane, driver) = build_durable_node(
+    let (store, durable_retained, plane, driver) = build_durable_node_with(
         node_id.clone(),
         placement.clone(),
         can_bootstrap,
@@ -143,7 +143,9 @@ async fn start_durable_node_capped(
         // ADR 0073: the scale-out ownership flag, PRE-SET for the falsifier test
         // (the hub sweep that computes it in production has its own unit test).
         Arc::new(std::sync::atomic::AtomicBool::new(scale_out)),
-        None, // in-memory store: no shard layout to choose (ADR 0076 T2)
+        None,                     // in-memory store: no shard layout to choose (ADR 0076 T2)
+        common::replica_store(),  // MQTTD_REPLICA_STORE (ADR 0078)
+        Some(common::founding()), // MQTTD_REPLICAS (ADR 0080)
     )
     .await;
     let plane_observer = plane.clone();

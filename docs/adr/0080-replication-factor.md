@@ -134,13 +134,39 @@ nodes than R′, or if a change is already in progress; the refusal is logged an
 
 - New clusters store about a third less per node at N = 3 and should carry about 1.5× the
   durable rate; the comparison with HiveMQ uses equal copy counts.
-- New clusters trade write availability for that: one slow or suspected replica pauses
-  durable writes for its groups until it recovers or is declared dead. Operators who need
-  writes to continue through a single failure set `durable.replicas = 3`. The
-  documentation, the startup log and `/statusz` state which one a cluster runs.
+- New clusters trade write availability for that: a slow, suspected or dead node pauses
+  durable writes for every group it holds a copy of, where R = 3 pauses only the groups it
+  owns. How long the pause lasts is set by failover, not by R (measured below). The
+  documentation, the startup log and `/statusz` state which factor a cluster runs.
 - R is no longer a constant anywhere it is read (placement, the write floor, the startup
   log, the gauges); tests that assumed 3 name it explicitly.
 - The lease state machine gains a replication record and three commands, and the peer protocol a version (9).
+
+## Amendment, 2026-09-30 — the write pause, measured (T3)
+
+Context and Consequences above assumed R = 3 rides through a single failure without a
+pause and R = 2 pauses for "a few seconds". Measured on three `mqttd` processes
+(`crates/mqttd/tests/replication_pause.rs`): 48 durable sessions, one publisher per
+topic sending a `QoS` 1 message every 100 ms, one fault per fresh cluster on a non-founder
+node. The figure is, per topic, the longest gap between two successful acks from the fault
+on; a topic counts as paused when that gap is at least 1 s.
+
+| fault | R = 3 | R = 2 |
+|---|---|---|
+| crash (`SIGKILL`) | 30 / 48 paused, longest 14.9 s, median 14.9 s | 38 / 48 paused, longest 15.3 s, median 15.1 s |
+| stall (`SIGSTOP` 8 s, then `SIGCONT`) | 39 / 48 paused, longest 23.9 s, median 18.6 s | 39 / 48 paused, longest 22.3 s, median 21.3 s |
+
+So R = 3 also pauses: the groups the lost node OWNED wait out failover (failure detection,
+lease reassignment, recovery) whatever the factor, and R = 3 rides through only the loss of
+a non-owning copy. R = 2 pauses more groups (38 against 30 on a crash) for about as long.
+The trade is breadth, not length. Failover time itself, about 15 s, is a property of the
+cluster to shorten independently of this ADR.
+
+Validating R = 2 also found a durability defect that existed at any factor below the
+member count: a caught-up stamp outlived the node's membership of the group's replica set,
+so a node that re-entered a set could answer a recovery read "complete" for history it
+never received. It lost acknowledged messages once in about 30 runs (#727). Fixed with T3:
+a node clears its stamp when it leaves a set, and an adopted factor arms the catch-up sweep.
 
 ## Alternatives considered
 

@@ -55,6 +55,9 @@ caller changes this file and the gate fails until it is regenerated and re-read.
 | `crates/mqttd/tests/proc_common/mod.rs` | `pump` | `relay-slow-link-fault` | ? | helper, 5 call site(s) |
 | `crates/mqttd/tests/proc_common/mod.rs` | `kill_step` | `nemesis-kill-offset` | ? | helper, 2 call site(s) |
 | `crates/mqttd/tests/reload_acl.rs` | `an_offline_sessions_revoked_grant_does_not_replay_its_queue_on_resume` | `acl-detach-offline` | 100ms | in the test itself |
+| `crates/mqttd/tests/replication_pause.rs` | `measure` | `pause-warm` | WARM | helper, 5 call site(s) |
+| `crates/mqttd/tests/replication_pause.rs` | `measure` | `pause-suspend` | SUSPEND | helper, 5 call site(s) |
+| `crates/mqttd/tests/replication_pause.rs` | `measure` | `pause-after-crash` | OBSERVE | helper, 5 call site(s) |
 | `crates/mqttd/tests/v5_protocol.rs` | `v5_a_will_is_cancelled_by_a_reconnect_inside_the_delay` | `v5-will-delay-cancel-inside-window` | 400ms | in the test itself |
 | `crates/mqttd/tests/v5_protocol.rs` | `v5_session_expires_after_interval` | `v5-session-expiry-wire` | 4s | in the test itself |
 | `crates/mqttd/tests/v5_protocol.rs` | `v5_disconnect_session_expiry_overrides_the_connect_value` | `v5-disconnect-expiry-override` | 4s | in the test itself |

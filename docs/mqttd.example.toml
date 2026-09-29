@@ -174,8 +174,9 @@ lease_voters = 5
 # placement group, 2 to 7. It is cluster state — the founding node commits it through the lease
 # group and every node follows the committed value; on a node joining or restarting in an
 # existing cluster this changes nothing (a cluster founded before ADR 0080 runs at 3).
-# At 2 the write quorum is both copies, so one slow or suspected replica pauses durable writes
-# for its groups until it recovers or is declared dead; 3 rides through a single failure.
+# At 2 the write quorum is both copies, so a slow, suspected or dead node pauses durable writes
+# for every group it holds a copy of; at 3 only for the groups it owns. Paused groups wait out
+# failover either way (~15 s for a crash, ~20 s for an 8 s stall, measured on 3 nodes; ADR 0080).
 replicas = 3
 # Disk high-water cap over the on-disk stores, bytes (needs [node] data_dir). Above it the broker
 # browns out growth-writes while subscriber acks/deletes/resumes continue; a QoS>=1 publisher is
