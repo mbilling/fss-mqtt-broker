@@ -105,7 +105,7 @@ Delivered and validated before any default changes:
 ### 4. Phase 2: changing R on a running cluster
 
 An operator changes `durable.replicas` and reloads (or calls the admin API). The node
-proposes `SetReplicas`; the change then runs per group, using the ADR 0043 machinery:
+proposes `BeginReplicaChange { from: R, to: R′ }`; the change then runs per group, using the ADR 0043 machinery:
 
 1. **Joint phase.** The node proposes `BeginReplicaChange { from: R, to: R′ }`. Once it
    commits, every node holds `change = Some((R, R′))`, so for each group both the old set S
