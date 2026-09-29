@@ -479,7 +479,8 @@ pub struct Durable {
     /// Bounded lease-consensus voter set size (`MQTTD_LEASE_VOTERS`, ADR 0021). Default 5.
     pub lease_voters: u32,
     /// The replication factor a NEW cluster is founded with (`MQTTD_REPLICAS`, ADR 0080):
-    /// how many nodes keep a copy of each durable placement group, 2 to 7. It is
+    /// how many nodes keep a copy of each durable placement group, 2 to 7, default 2
+    /// (the copy count `HiveMQ` defaults to; ADR 0080 T4). It is
     /// cluster state, not a per-node setting: the node that founds the cluster
     /// commits it through the lease group before any group is assigned, and every
     /// node then uses the committed value. On a node joining an existing cluster, or
@@ -661,7 +662,7 @@ impl Default for Durable {
         Self {
             enabled: true,
             lease_voters: 5,
-            replicas: 3,
+            replicas: 2,
             store_max_bytes: None,
             min_replicas: MinReplicas::Majority,
             allow_ephemeral: false,
@@ -2370,7 +2371,7 @@ mod tests {
     #[test]
     fn the_replication_factor_is_bounded_and_bounds_the_floor() {
         let base = "[durable]\nallow_ephemeral = true\n";
-        assert_eq!(Config::from_toml(base).unwrap().durable.replicas, 3);
+        assert_eq!(Config::from_toml(base).unwrap().durable.replicas, 2);
         for r in 2..=7 {
             let c = Config::from_toml(&format!("{base}replicas = {r}\n"))
                 .unwrap_or_else(|e| panic!("replicas = {r} is valid: {e:?}"));
@@ -2897,8 +2898,7 @@ mod tests {
             "MQTTD_CONFIG_UNKNOWN_KEYS" => "warn",
             // The default is the derived `majority` posture (#239), so only an
             // explicit integer *changes* it.
-            // MQTTD_REPLICAS (ADR 0080): a valid factor that is not the default (3).
-            "MQTTD_MIN_REPLICAS" | "MQTTD_REPLICAS" => "2",
+            "MQTTD_MIN_REPLICAS" => "2",
             // Byte caps are refused below 4096 (a value under one message is a
             // configuration mistake, not a tight budget), so "7" would not validate.
             "MQTTD_MAX_BACKLOG_BYTES" | "MQTTD_MAX_OUTBOUND_BYTES" => "8192",
@@ -2938,7 +2938,8 @@ mod tests {
             | "MQTTD_ADMIN_PEER_PORT" => "7",
             // The default is already 7 (backup.keep) / 300 (restore timeout), so "7" would
             // change nothing and the totality sweep would read as a missing mapping.
-            "MQTTD_BACKUP_KEEP" | "MQTTD_RESTORE_TIMEOUT" => "3",
+            // MQTTD_REPLICAS (ADR 0080): a valid factor that is not the default (2).
+            "MQTTD_BACKUP_KEEP" | "MQTTD_RESTORE_TIMEOUT" | "MQTTD_REPLICAS" => "3",
             // Paths / addresses / lists / keys.
             _ => "x-sentinel",
         }
