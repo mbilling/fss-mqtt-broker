@@ -2547,6 +2547,17 @@ async fn start_admin(
         return Err("admin.bind needs admin.cert, admin.key and admin.client_ca".into());
     };
     let cluster_ca = config.cluster.peer_tls.ca.as_deref().map(Path::new);
+    let same_file = |a: &Path, b: &Path| match (a.canonicalize(), b.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    };
+    if cluster_ca.is_some_and(|ca| same_file(ca, Path::new(client_ca))) {
+        warn!(
+            "admin.client_ca is the cluster CA: every certificate it issued that is in no \
+             admin role list is admitted as the read-only peer role instead of refused. Use a \
+             dedicated admin CA (HARDENING H-7.7)"
+        );
+    }
     let mut cas = vec![Path::new(client_ca)];
     cas.extend(cluster_ca);
     let acceptor = tls::admin_acceptor(Path::new(cert), Path::new(key), &cas)?;

@@ -134,20 +134,22 @@ fn parse_request_line(line: &str) -> Result<(&str, &str), ReadError> {
 /// Split `/path?a=1&b=2` into the decoded path and decoded parameters.
 fn split_target(target: &str) -> Result<(String, Vec<(String, String)>), ReadError> {
     let (path, query) = target.split_once('?').unwrap_or((target, ""));
-    let path = percent_decode(path, false)?;
+    let path = percent_decode(path)?;
     let mut params = Vec::new();
     for pair in query.split('&').filter(|p| !p.is_empty()) {
         let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
-        params.push((percent_decode(k, true)?, percent_decode(v, true)?));
+        params.push((percent_decode(k)?, percent_decode(v)?));
     }
     Ok((path, params))
 }
 
-/// Decode `%XX` escapes (and `+` as space in a query component).
+/// Decode `%XX` escapes. A `+` stays a `+`, in the query too: form encoding's
+/// `+`-as-space would turn an unencoded `a/+/b` into `a/ /b` and let a wildcard past the
+/// checks that refuse one. Clients encode a space as `%20` (the CLI does).
 ///
 /// # Errors
 /// [`ReadError::Malformed`] for a bad escape or a result that is not UTF-8.
-pub fn percent_decode(s: &str, plus_is_space: bool) -> Result<String, ReadError> {
+pub fn percent_decode(s: &str) -> Result<String, ReadError> {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
@@ -158,10 +160,6 @@ pub fn percent_decode(s: &str, plus_is_space: bool) -> Result<String, ReadError>
                 let hex = std::str::from_utf8(hex).map_err(|_| ReadError::Malformed)?;
                 out.push(u8::from_str_radix(hex, 16).map_err(|_| ReadError::Malformed)?);
                 i += 3;
-            }
-            b'+' if plus_is_space => {
-                out.push(b' ');
-                i += 1;
             }
             b => {
                 out.push(b);
@@ -234,7 +232,8 @@ mod tests {
         assert_eq!(req.method, "GET");
         assert_eq!(req.path, "/admin/v1/clients");
         assert_eq!(req.param("user"), Some("a b"));
-        assert_eq!(req.param("prefix"), Some("x y"));
+        // `+` is literal: a topic wildcard must survive to the wildcard checks.
+        assert_eq!(req.param("prefix"), Some("x+y"));
         assert!(req.body.is_empty());
     }
 
@@ -275,7 +274,7 @@ mod tests {
     #[test]
     fn encode_and_decode_round_trip() {
         for s in ["a b", "sensors/+/temp", "#", "ü/ß", "x=y&z"] {
-            assert_eq!(percent_decode(&percent_encode(s), true).unwrap(), s);
+            assert_eq!(percent_decode(&percent_encode(s)).unwrap(), s);
         }
     }
 }

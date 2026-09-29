@@ -253,7 +253,15 @@ pub async fn retained(state: &AdminState, req: &Request) -> Answer {
         Ok(s) => s,
         Err(e) => return e,
     };
-    let all = match store.all().await {
+    // A prefix ending in `/` is a subtree: the store's match index answers `prefix#`
+    // without visiting every topic. Any other prefix is a string prefix and needs the
+    // full list. (Payloads are shared `Bytes` either way; nothing is copied.)
+    let listed = if prefix.ends_with('/') && !prefix.contains(['+', '#']) {
+        store.matching(&format!("{prefix}#")).await
+    } else {
+        store.all().await
+    };
+    let all = match listed {
         Ok(all) => all,
         Err(e) => return error(503, "unavailable", &format!("retained store: {e}")),
     };
