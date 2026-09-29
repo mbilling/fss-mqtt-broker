@@ -87,8 +87,38 @@ are low-volume or out of scope for the clustered durable path.
 ### 1. Format
 
 - A shard's log is a directory of **segments**, `seg-<first-lsn>.log`, each
-  preallocated (`fallocate`) to a fixed size (proposed 64 MiB) so a flush never
-  has to update file metadata.
+  **written full of zeros** and flushed before its first record, so a flush
+  never has to update file metadata.
+
+  *Amended 2026-09-29 (#693).* As first written this said "preallocated
+  (`fallocate`)", and T1 shipped `set_len` — a sparse file. Neither meets the
+  goal. On ext4 a record written into a hole needs a block allocation, and one
+  written into an `fallocate`d range needs its unwritten extent converted; both
+  are metadata, so each `fdatasync` also commits the journal. Measured on a
+  RAM-backed ext4 (`fdatasync` per batch of 250-byte records): sparse,
+  `fallocate` and a growing file all took 3 device writes per batch, a
+  pre-zeroed segment 2. Through `SegmentLog` itself, main against the branch,
+  512 MiB per run, three rounds each:
+
+  | records per batch | batches/s, sparse | batches/s, zeroed | p99, sparse | p99, zeroed |
+  |---|---|---|---|---|
+  | 16 | 5,232–10,988 | 23,211–24,178 | 0.83–2.38 ms | 0.30–0.31 ms |
+  | 512 | 1,829–1,877 | 2,575–2,642 | 0.71–0.91 ms | 0.60–0.68 ms |
+
+  At one record per batch the two are level within noise, since a 267-byte
+  record seldom starts a new block. The cost is writing each segment twice,
+  once as zeros; the tables above include it. To keep that off the ack path,
+  the next segment is zeroed on a background thread once the active one is half
+  full. The zeros go down in 1 MiB flushed pieces, so a commit never queues
+  behind a whole segment; one-shot zeroing had put 5–28 ms spikes into p99.9.
+  A roll is then a rename. Segments start at 1 MiB and double on each roll up
+  to the configured size (64 MiB): a small log costs a small file, and a node
+  under a tight per-file limit (the `RLIMIT_FSIZE` crash test, 8 MiB) comes up.
+  Recycling dead segments would skip the zero writes, but their stale tails are
+  non-zero, and the no-ghosts rule (§3) would have to zero them at every open.
+  Kernels from 6.17 offer `FALLOC_FL_WRITE_ZEROES`, written extents without
+  the writes, where the device can offload them; the loop device measured here
+  cannot, so it is untested and not used.
 - A segment is a sequence of **records**:
   `[len: u32][crc32c: u32][kind: u8][lsn: u64][payload]`. Kinds mirror the ops
   that exist today, plus the metadata the tables hold:
@@ -122,7 +152,8 @@ are low-volume or out of scope for the clustered durable path.
 - At open, replay every segment in LSN order into the in-memory state — what
   `load_all` does from the tables today. A record whose CRC fails, or a short
   record at the tail of the last segment, is a **torn tail**: the segment is
-  truncated there, since nothing past it was ever acked (acks follow the flush).
+  zeroed from there (by writing zeros, keeping the blocks allocated), since
+  nothing past it was ever acked (acks follow the flush).
 - A torn or corrupt record **before** the tail is not recoverable locally and
   fails the open with the store's offset, exactly as a corrupt redb file does
   today. The key is then recovered the way a lost replica is today: the new

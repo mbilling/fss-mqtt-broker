@@ -9,9 +9,20 @@
 //!
 //! ## Format
 //!
-//! A log is a directory of **segments**, `seg-<first-lsn>.log`, each extended to
-//! a fixed size when it is created, so its unwritten tail reads as zeros. A
-//! segment is a run of records:
+//! A log is a directory of **segments**, `seg-<first-lsn>.log`, each written
+//! full of zeros and flushed before its first record, so its unwritten tail
+//! reads as zeros. Zeros are WRITTEN, not reserved: a record then overwrites
+//! blocks that are already allocated and inside the file size, so its
+//! `fdatasync` flushes data alone. A sparse (`set_len`) or `fallocate`d
+//! segment makes every flush also commit the filesystem journal — for the
+//! block allocation or the unwritten-extent conversion — which measured (#693,
+//! ext4) as 3 device writes per batch against 2, and 2–4× the flush tail.
+//! Segments start at [`FIRST_SEGMENT_BYTES`] and double on each roll up to the
+//! configured size: a small log costs a small file, and a node under a tight
+//! per-file limit comes up before its first segment is anywhere near it. The
+//! next segment is zeroed on a background thread once the active one is half
+//! full, so a roll is a rename, not a 64 MiB write on the ack path. A segment
+//! is a run of records:
 //!
 //! ```text
 //! [len: u32 BE][crc32c: u32 BE][kind: u8][lsn: u64 BE][payload: len bytes]
@@ -35,9 +46,10 @@
 //!   LSN check alone would replay them. Replayed, a ghost append could overwrite
 //!   a newer entry. So recovery zeroes the rest of the segment from the valid
 //!   end, and flushes that, before anything is written again.
-//! - **Durable files.** A new segment is created, extended, flushed, and its
+//! - **Durable files.** A new segment is zeroed, flushed, named and its
 //!   directory flushed, before any record is written into it: an acked batch
-//!   can never live in a file whose own creation was not durable.
+//!   can never live in a file whose own creation was not durable. A segment
+//!   being prepared lives under a name the open ignores and removes.
 
 use std::fs::{File, OpenOptions};
 use std::io::Read;
@@ -53,8 +65,18 @@ pub const HEADER_BYTES: usize = 17;
 /// never make replay allocate or seek absurdly.
 pub const MAX_PAYLOAD: usize = 64 << 20;
 
-/// The default segment size (ADR 0078 §1).
+/// The default segment size (ADR 0078 §1): the size segments grow to.
 pub const DEFAULT_SEGMENT_BYTES: u64 = 64 << 20;
+
+/// The size of a log's first segment; each roll doubles it, up to the
+/// configured segment size.
+pub const FIRST_SEGMENT_BYTES: u64 = 1 << 20;
+
+/// The name a segment has while it is being zeroed, before a roll renames it.
+const SPARE_NAME: &str = "seg-spare.tmp";
+
+/// Zeros written per call when preparing a segment.
+const ZERO_CHUNK: usize = 1 << 20;
 
 /// Errors from the segment log.
 #[derive(Debug, thiserror::Error)]
@@ -193,8 +215,19 @@ pub struct SegmentLog {
     /// Every segment, oldest first; the last one is active.
     segments: Vec<SegmentInfo>,
     active: File,
+    /// The active segment's size: a batch that would pass it rolls.
+    active_bytes: u64,
     next_lsn: Lsn,
     buf: Vec<u8>,
+    /// The next segment, being zeroed on a background thread.
+    spare: Option<std::thread::JoinHandle<Result<Spare, LogError>>>,
+}
+
+/// A zeroed, flushed segment waiting under [`SPARE_NAME`] for a roll.
+#[derive(Debug)]
+struct Spare {
+    file: File,
+    bytes: u64,
 }
 
 impl SegmentLog {
@@ -212,6 +245,14 @@ impl SegmentLog {
         let dir = dir.as_ref().to_path_buf();
         std::fs::create_dir_all(&dir).map_err(io(format!("creating {}", dir.display())))?;
         let segment_bytes = segment_bytes.max(HEADER_BYTES as u64 * 4);
+        let first_bytes = FIRST_SEGMENT_BYTES.min(segment_bytes);
+        // A segment a crash left half-zeroed: never named, so never written.
+        match std::fs::remove_file(dir.join(SPARE_NAME)) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                return Err(io(format!("removing {SPARE_NAME}"))(e));
+            }
+            _ => {}
+        }
         let mut firsts: Vec<Lsn> = std::fs::read_dir(&dir)
             .map_err(io(format!("listing {}", dir.display())))?
             .filter_map(Result::ok)
@@ -282,24 +323,10 @@ impl SegmentLog {
         }
 
         let next_lsn = expected.unwrap_or(1);
-        let active = if let Some(seg) = segments.last() {
-            let f = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(&seg.path)
-                .map_err(io(format!("opening {}", seg.path.display())))?;
-            let len = f.metadata().map_err(io("stat"))?.len();
-            if recovery.torn_bytes > 0 || len < segment_bytes {
-                // Zero everything after the valid end — ghosts included — and
-                // make the segment full-size again; flush before any append.
-                f.set_len(seg.bytes).map_err(io("trimming a torn tail"))?;
-                f.set_len(len.max(segment_bytes))
-                    .map_err(io("re-extending a segment"))?;
-                f.sync_all().map_err(io("flushing a recovered segment"))?;
-            }
-            f
+        let (active, active_bytes) = if let Some(seg) = segments.last() {
+            reopen_active(seg, recovery.torn_bytes, first_bytes)?
         } else {
-            create_segment(&dir, next_lsn, segment_bytes)?
+            (create_segment(&dir, next_lsn, first_bytes)?, first_bytes)
         };
         if segments.is_empty() {
             segments.push(SegmentInfo {
@@ -314,8 +341,10 @@ impl SegmentLog {
                 segment_bytes,
                 segments,
                 active,
+                active_bytes,
                 next_lsn,
                 buf: Vec::new(),
+                spare: None,
             },
             recovery,
         ))
@@ -333,7 +362,8 @@ impl SegmentLog {
         &self.segments
     }
 
-    /// The size a segment is created at.
+    /// The size segments grow to (the first is smaller; see
+    /// [`FIRST_SEGMENT_BYTES`]).
     #[must_use]
     pub fn segment_bytes(&self) -> u64 {
         self.segment_bytes
@@ -358,7 +388,65 @@ impl SegmentLog {
     #[must_use]
     pub fn would_roll(&self, bytes: u64) -> bool {
         let used = self.segments.last().map_or(0, |s| s.bytes);
-        used > 0 && used + bytes > self.segment_bytes
+        used > 0 && used + bytes > self.active_bytes
+    }
+
+    /// The size the next segment is created at: double the active one, up to
+    /// the configured size.
+    fn next_bytes(&self) -> u64 {
+        self.active_bytes
+            .saturating_mul(2)
+            .min(self.segment_bytes)
+            .max(FIRST_SEGMENT_BYTES.min(self.segment_bytes))
+    }
+
+    /// The next segment: the spare if one of the right size was prepared,
+    /// else one zeroed here (which also surfaces a failed preparation's error).
+    fn next_segment(&mut self, first: Lsn, bytes: u64) -> Result<File, LogError> {
+        let spare = self.spare.take().map(std::thread::JoinHandle::join);
+        let spare_path = self.dir.join(SPARE_NAME);
+        if let Some(Ok(Err(e))) = &spare {
+            // The inline zeroing below retries it and surfaces a real failure.
+            tracing::warn!(error = %e, "preparing the next segment in the background failed");
+        }
+        if let Some(Ok(Ok(spare))) = spare {
+            if spare.bytes == bytes {
+                let path = self.dir.join(segment_name(first));
+                std::fs::rename(&spare_path, &path)
+                    .map_err(io(format!("naming {}", path.display())))?;
+                sync_dir(&self.dir)?;
+                return Ok(spare.file);
+            }
+        }
+        let _ = std::fs::remove_file(&spare_path);
+        create_segment(&self.dir, first, bytes)
+    }
+
+    /// Start zeroing the segment after the active one, if it is not already
+    /// being zeroed.
+    fn prepare_spare(&mut self) {
+        if self.spare.is_some() {
+            return;
+        }
+        let path = self.dir.join(SPARE_NAME);
+        let bytes = self.next_bytes();
+        // No thread (resource exhaustion) just means the roll zeroes inline.
+        self.spare = std::thread::Builder::new()
+            .name("segment-zero".into())
+            .spawn(move || {
+                let file = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .open(&path)
+                    .map_err(io(format!("creating {}", path.display())))?;
+                zero_fill(&file, 0, bytes, true)
+                    .and_then(|()| file.sync_all())
+                    .map_err(io(format!("zeroing {}", path.display())))?;
+                Ok(Spare { file, bytes })
+            })
+            .ok();
     }
 
     /// Start a new segment and write `head` as its first records, flushed.
@@ -369,7 +457,9 @@ impl SegmentLog {
     /// As [`append`](Self::append).
     pub fn roll(&mut self, head: &[(u8, &[u8])]) -> Result<Lsn, LogError> {
         let first = self.next_lsn;
-        self.active = create_segment(&self.dir, first, self.segment_bytes)?;
+        let bytes = self.next_bytes();
+        self.active = self.next_segment(first, bytes)?;
+        self.active_bytes = bytes;
         self.segments.push(SegmentInfo {
             first,
             bytes: 0,
@@ -427,7 +517,11 @@ impl SegmentLog {
             .sync_data()
             .map_err(io(format!("flushing {}", seg.path.display())))?;
         seg.bytes += self.buf.len() as u64;
+        let half_full = seg.bytes.saturating_mul(2) >= self.active_bytes;
         self.next_lsn = lsn;
+        if half_full {
+            self.prepare_spare();
+        }
         Ok(lsn - 1)
     }
 
@@ -455,6 +549,29 @@ impl SegmentLog {
     }
 }
 
+/// Reopen the last segment to append to, and its size. Everything after the
+/// valid end — ghosts included — is zeroed by writing zeros, so the blocks
+/// stay allocated; a segment shorter than a first one (a crash while it was
+/// being zeroed) is filled out. Both are flushed before any append. (A torn
+/// count from an empty last segment the open removed lands on this one's zero
+/// tail: harmless, and never past its end.)
+fn reopen_active(seg: &SegmentInfo, torn: u64, first_bytes: u64) -> Result<(File, u64), LogError> {
+    let f = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&seg.path)
+        .map_err(io(format!("opening {}", seg.path.display())))?;
+    let len = f.metadata().map_err(io("stat"))?.len();
+    let torn_end = (seg.bytes + torn).min(len);
+    let full = len.max(first_bytes);
+    if torn_end > seg.bytes || full > len {
+        zero_fill(&f, seg.bytes, torn_end.max(full), false)
+            .map_err(io(format!("zeroing {}", seg.path.display())))?;
+        f.sync_all().map_err(io("flushing a recovered segment"))?;
+    }
+    Ok((f, full))
+}
+
 fn create_segment(dir: &Path, first: Lsn, segment_bytes: u64) -> Result<File, LogError> {
     let path = dir.join(segment_name(first));
     let f = OpenOptions::new()
@@ -463,12 +580,37 @@ fn create_segment(dir: &Path, first: Lsn, segment_bytes: u64) -> Result<File, Lo
         .create_new(true)
         .open(&path)
         .map_err(io(format!("creating {}", path.display())))?;
-    f.set_len(segment_bytes)
-        .map_err(io(format!("extending {}", path.display())))?;
+    zero_fill(&f, 0, segment_bytes, false).map_err(io(format!("zeroing {}", path.display())))?;
     f.sync_all()
         .map_err(io(format!("flushing {}", path.display())))?;
     sync_dir(dir)?;
     Ok(f)
+}
+
+/// Write zeros over `[from, to)`: allocated, written blocks, unlike a hole.
+/// `trickle` flushes each chunk as it goes — for zeroing beside a live
+/// writer, whose next flush would otherwise queue behind the whole segment.
+fn zero_fill(f: &File, from: u64, to: u64, trickle: bool) -> std::io::Result<()> {
+    let zeros = vec![0u8; ZERO_CHUNK];
+    let mut at = from;
+    while at < to {
+        let n = usize::try_from(to - at).map_or(ZERO_CHUNK, |left| left.min(ZERO_CHUNK));
+        write_all_at(f, &zeros[..n], at)?;
+        if trickle {
+            f.sync_data()?;
+        }
+        at += n as u64;
+    }
+    Ok(())
+}
+
+impl Drop for SegmentLog {
+    fn drop(&mut self) {
+        // No zeroing may outlive the log: a reopen removes the spare's name.
+        if let Some(spare) = self.spare.take() {
+            let _ = spare.join();
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -785,6 +927,91 @@ mod tests {
             Err(LogError::TooLarge(_))
         ));
         assert_eq!(log.next_lsn(), 1);
+    }
+
+    /// Bytes of `path` backed by allocated blocks — below its length when the
+    /// file has holes (a `set_len` segment), not when it was zeroed.
+    #[cfg(unix)]
+    fn allocated(path: &Path) -> u64 {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(path).unwrap().blocks() * 512
+    }
+
+    fn len(path: &Path) -> u64 {
+        std::fs::metadata(path).unwrap().len()
+    }
+
+    /// #693: a segment is written full of zeros, not left a hole, so an append
+    /// overwrites allocated blocks and its flush commits no allocation. A torn
+    /// tail is zeroed the same way: recovery must not punch the hole back.
+    #[cfg(unix)]
+    #[test]
+    fn segments_are_zeroed_not_sparse_even_after_a_torn_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut log, _, _) = open(dir.path(), DEFAULT_SEGMENT_BYTES);
+        let path = log.segments()[0].path.clone();
+        assert_eq!(len(&path), FIRST_SEGMENT_BYTES);
+        assert!(
+            allocated(&path) >= FIRST_SEGMENT_BYTES,
+            "a hole at creation"
+        );
+        log.append(&[(1, &payload(1, 50))]).unwrap();
+        let end = log.segments()[0].bytes;
+        log.append(&[(1, &payload(2, 50))]).unwrap();
+        drop(log);
+        corrupt(&path, end + 5);
+        let (_, rec, _) = open(dir.path(), DEFAULT_SEGMENT_BYTES);
+        assert!(rec.torn_bytes > 0);
+        assert_eq!(len(&path), FIRST_SEGMENT_BYTES);
+        assert!(
+            allocated(&path) >= FIRST_SEGMENT_BYTES,
+            "a hole after recovery"
+        );
+    }
+
+    /// Segments start small and double on each roll up to the configured size;
+    /// every one is prepared ahead and named at the roll, never left behind.
+    #[test]
+    fn segments_double_from_the_first_size_up_to_the_configured_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let cap = 4 * FIRST_SEGMENT_BYTES;
+        let (mut log, _, _) = open(dir.path(), cap);
+        let p = payload(1, 64 << 10);
+        let mut want = Vec::new();
+        while log.segments().len() < 5 {
+            want.push(log.append(&[(1, &p)]).unwrap());
+        }
+        let sizes: Vec<u64> = log.segments().iter().map(|s| len(&s.path)).collect();
+        let mib = FIRST_SEGMENT_BYTES;
+        assert_eq!(sizes, vec![mib, 2 * mib, 4 * mib, 4 * mib, 4 * mib]);
+        drop(log);
+        assert!(
+            !dir.path().join(SPARE_NAME).exists() || len(&dir.path().join(SPARE_NAME)) == cap,
+            "a spare is only ever the next segment's size"
+        );
+        let (log, _, seen) = open(dir.path(), cap);
+        assert_eq!(seen.iter().map(|r| r.0).collect::<Vec<_>>(), want);
+        assert!(!dir.path().join(SPARE_NAME).exists(), "the open removes it");
+        assert_eq!(
+            len(&log.segments()[4].path),
+            cap,
+            "reopened at its own size"
+        );
+    }
+
+    /// A crash while the first segment was being zeroed leaves it short and
+    /// empty; the open fills it out rather than appending into a stub.
+    #[test]
+    fn a_first_segment_cut_short_while_zeroing_is_filled_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let stub = dir.path().join(segment_name(1));
+        File::create(&stub).unwrap().set_len(4096).unwrap();
+        std::fs::write(dir.path().join(SPARE_NAME), b"half").unwrap();
+        let (mut log, rec, seen) = open(dir.path(), DEFAULT_SEGMENT_BYTES);
+        assert_eq!((rec.records, seen.len()), (0, 0));
+        assert_eq!(len(&stub), FIRST_SEGMENT_BYTES);
+        assert!(!dir.path().join(SPARE_NAME).exists());
+        assert_eq!(log.append(&[(1, b"first")]).unwrap(), 1);
     }
 
     fn zero(path: &Path, at: u64, len: u64) {
