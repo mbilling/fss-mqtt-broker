@@ -59,9 +59,18 @@ A rolling restart that changes a per-node constant creates exactly that mixture.
 
 ### 1. R is cluster state, committed through the lease Raft
 
-- A new lease command, `LeaseRequest::SetReplicas { r }`, records R in the lease state
-  machine. Every node's `Placement` uses the **committed** value; a node's configured value
-  is only a proposal.
+- The lease state machine gains a replication record: `replicas: Option<u8>` (the
+  committed R) and `change: Option<(from, to)>` (a phase-2 change in progress). Three
+  commands write it:
+  - `LeaseRequest::SetReplicas { r }`: the founding value (phase 1). Accepted only while
+    `replicas` is unset.
+  - `LeaseRequest::BeginReplicaChange { from, to }`: opens the joint phase (§4). Accepted
+    only when `replicas == Some(from)` (or unset and `from == 3`) and no change is open.
+  - `LeaseRequest::CommitReplicaChange { to }`: closes it, setting `replicas = Some(to)` and
+    clearing `change`. Accepted only when the open change's `to` matches.
+- Every node's `Placement` uses the **committed** record: R from `replicas`, and while
+  `change` is set, both the old and the new replica set of every group. A node's configured
+  value is only a proposal.
 - **No committed value means R = 3.** Every cluster that exists today has none, so an
   upgrade changes nothing.
 - The command is **capability-gated** like ADR 0073's ownership flag: it is proposed only
@@ -98,8 +107,9 @@ Delivered and validated before any default changes:
 An operator changes `durable.replicas` and reloads (or calls the admin API). The node
 proposes `SetReplicas`; the change then runs per group, using the ADR 0043 machinery:
 
-1. **Joint phase.** The committed entry records both the old R and the new R′. For each
-   group the old set S and the new set S′ are both known. HRW makes the smaller set a
+1. **Joint phase.** The node proposes `BeginReplicaChange { from: R, to: R′ }`. Once it
+   commits, every node holds `change = Some((R, R′))`, so for each group both the old set S
+   and the new set S′ are known. HRW makes the smaller set a
    prefix of the larger (`owner_led_replica_set` truncates one fixed order), so S′ ⊂ S when
    shrinking and S ⊂ S′ when growing. While a group is in the joint phase, an append is
    durable only when it holds a quorum of S **and** a quorum of S′ (the Raft
@@ -109,9 +119,10 @@ proposes `SetReplicas`; the change then runs per group, using the ADR 0043 machi
    sweep. Shrinking, the kept members are checked gap-free against the dropped ones and
    filled from them if not: an entry acked at 2 of 3 may live only on the copy being
    dropped.
-3. **Switch.** When every group's S′ is stamped caught-up, the node that proposed the
-   change commits `SetReplicas { r: R′ }` alone; the joint phase ends and quorums use S′
-   only.
+3. **Switch.** When every group's S′ is stamped caught-up, the lease leader commits
+   `CommitReplicaChange { to: R′ }`; the joint phase ends and quorums use S′ only. The
+   leader, not the proposer, drives it, so a proposer that dies mid-change does not strand
+   the cluster in the joint phase.
 4. **Collect.** Nodes that left a group's set delete its entries (today nothing reclaims a
    dropped copy).
 
