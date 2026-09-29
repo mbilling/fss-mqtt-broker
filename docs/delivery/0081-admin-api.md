@@ -5,14 +5,14 @@ adr_status: Accepted
 tasks:
   - id: 0081-T1
     title: "Admin listener: [admin] bind, mTLS required, viewer/operator roles from the cert subject, every request audited, /admin/v1/node"
-    status: planned
+    status: in-progress
     issue: 710
-    notes: "Off by default. THREAT-MODEL.md and HARDENING.md entries ship with it."
+    notes: "PR #729."
   - id: 0081-T2
     title: "mqttd --admin <verb>: CLI client for the admin API (table or --json)"
-    status: planned
+    status: in-progress
     issue: 711
-    notes: "Same binary, works in the distroless image; no logic beyond the endpoints."
+    notes: "PR #729."
   - id: 0081-T3
     title: "Cluster view: /admin/v1/cluster and /placement answered by any node via peer-bus fan-out"
     status: planned
@@ -79,8 +79,8 @@ frontmatter above · this file is the plan, progress log, and changelog.
 <!-- status-table:0081 -->
 | Task | Status | Issue | When | Evidence / notes |
 |------|--------|-------|------|------------------|
-| 0081-T1 | ⬜ planned | [#710](https://github.com/mbilling/fss-mqtt-broker/issues/710) | — | "Off by default. THREAT-MODEL.md and HARDENING.md entries ship with it." |
-| 0081-T2 | ⬜ planned | [#711](https://github.com/mbilling/fss-mqtt-broker/issues/711) | — | "Same binary, works in the distroless image; no logic beyond the endpoints." |
+| 0081-T1 | 🚧 in-progress | [#710](https://github.com/mbilling/fss-mqtt-broker/issues/710) | — | "PR #729." |
+| 0081-T2 | 🚧 in-progress | [#711](https://github.com/mbilling/fss-mqtt-broker/issues/711) | — | "PR #729." |
 | 0081-T3 | ⬜ planned | [#712](https://github.com/mbilling/fss-mqtt-broker/issues/712) | — | "Capability-gated on the next peer protocol version; each row says whether that node replied and how stale it is." |
 | 0081-T4 | ⬜ planned | [#713](https://github.com/mbilling/fss-mqtt-broker/issues/713) | — | "Bounded responses only; reads of identifying data are audited." |
 | 0081-T5 | ⬜ planned | [#714](https://github.com/mbilling/fss-mqtt-broker/issues/714) | — | "Evaluates the loaded policy; changes nothing." |
@@ -124,3 +124,4 @@ the reads it depends on.
 
 - 2026-09-29: ADR proposed; tasks and issues filed.
 - 2026-09-29: ADR accepted.
+- 2026-09-29: T1, T2 in review (PR #729): the admin listener and the CLI client.

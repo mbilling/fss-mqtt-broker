@@ -221,8 +221,8 @@
 
 **0081 — # 0081. An authenticated admin API: reads cluster-wide, actions audited, config stays in the file**
 
-- `0081-T1` ⬜ planned ([#710](https://github.com/mbilling/fss-mqtt-broker/issues/710)): "Admin listener: [admin] bind, mTLS required, viewer/operator roles from the cert subject, every request audited, /admin/v1/node" — "Off by default. THREAT-MODEL.md and HARDENING.md entries ship with it."
-- `0081-T2` ⬜ planned ([#711](https://github.com/mbilling/fss-mqtt-broker/issues/711)): "mqttd --admin <verb>: CLI client for the admin API (table or --json)" — "Same binary, works in the distroless image; no logic beyond the endpoints."
+- `0081-T1` 🚧 in-progress ([#710](https://github.com/mbilling/fss-mqtt-broker/issues/710)): "Admin listener: [admin] bind, mTLS required, viewer/operator roles from the cert subject, every request audited, /admin/v1/node" — "PR #729."
+- `0081-T2` 🚧 in-progress ([#711](https://github.com/mbilling/fss-mqtt-broker/issues/711)): "mqttd --admin <verb>: CLI client for the admin API (table or --json)" — "PR #729."
 - `0081-T3` ⬜ planned ([#712](https://github.com/mbilling/fss-mqtt-broker/issues/712)): "Cluster view: /admin/v1/cluster and /placement answered by any node via peer-bus fan-out" — "Capability-gated on the next peer protocol version; each row says whether that node replied and how stale it is."
 - `0081-T4` ⬜ planned ([#713](https://github.com/mbilling/fss-mqtt-broker/issues/713)): "Clients and sessions: paged list and filters, session detail, sessions matching a topic, top-N backlog, retained by prefix" — "Bounded responses only; reads of identifying data are audited."
 - `0081-T5` ⬜ planned ([#714](https://github.com/mbilling/fss-mqtt-broker/issues/714)): "Authorization dry run: /admin/v1/authz/check returns the verdict and the deciding rule" — "Evaluates the loaded policy; changes nothing."
