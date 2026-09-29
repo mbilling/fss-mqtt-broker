@@ -451,6 +451,12 @@ impl Hub {
                 &AppProps::from(app).encode(),
             )
         });
+        // A gated publish remembers whom its fan-out reached, so a settle-window
+        // re-delivery never hands the same session a second copy (see
+        // `PendingPublish::reached`).
+        if let AppendGate::Pending(id) = gate {
+            self.pending_reached(*id, targets.iter().map(|(c, _, _)| c.clone()));
+        }
         let mut all_durable = DurableOutcome::Ok;
         for (c, granted, retain) in targets {
             if let Some(id) = window_id {
