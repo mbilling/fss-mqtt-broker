@@ -57,6 +57,15 @@ pub fn check(state: &AdminState, req: &Request) -> Answer {
             "a publish target is a topic name: no + or # wildcards",
         );
     }
+    // A filter the broker would refuse at SUBSCRIBE (`0x8F`) never reaches the policy;
+    // the dry run must not give it a verdict the broker never would.
+    if action == CheckedAction::Subscribe && !mqtt_core::valid_filter(target) {
+        return error(
+            400,
+            "bad-request",
+            "not a valid topic filter: the broker refuses it before authorization",
+        );
+    }
     let groups: Vec<String> = req
         .param("groups")
         .unwrap_or_default()
