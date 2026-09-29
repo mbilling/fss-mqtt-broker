@@ -211,8 +211,10 @@ pub struct Placement {
     /// lease map) *plus* an actual change of the voter set, which `ownership_epoch`
     /// deliberately ignores but which DOES move a replica set — a group with no committed
     /// lease falls back to the voter-restricted `hrw_owner`, and that owner leads its
-    /// set. The remaining inputs (`replicas`, `local`) are builder-only and cannot change
-    /// after construction. Private: this is an invalidation key, not an ownership signal —
+    /// set. It also takes a change of the replication factor (`replicas`, committed through
+    /// the lease group since ADR 0080, see [`Placement::set_replicas`]); `local` is
+    /// builder-only and cannot change. Private: this is an invalidation key, not an
+    /// ownership signal —
     /// a caller wanting the latter wants [`Placement::ownership_epoch`].
     ring_version: u64,
     /// See [`ReplicaSetMemo`]. Valid only while `ring_version` is unchanged.
@@ -413,6 +415,20 @@ impl Placement {
     #[must_use]
     pub fn write_floor_is_derived(&self) -> bool {
         matches!(self.floor, WriteFloor::Majority { .. })
+    }
+
+    /// Adopt the cluster's committed replication factor (ADR 0080 §1), clamped to
+    /// at least 1. A real change invalidates every memoised replica set; ownership
+    /// is untouched — which node leads a group does not depend on how many copies
+    /// it keeps — so `ownership_epoch` does not move. Returns whether it changed.
+    pub fn set_replicas(&mut self, replicas: usize) -> bool {
+        let replicas = replicas.max(1);
+        if replicas == self.replicas {
+            return false;
+        }
+        self.replicas = replicas;
+        self.ring_version += 1;
+        true
     }
 
     /// Push the durable raft membership roster (issue #229): `known` are the
@@ -2097,5 +2113,32 @@ mod tests {
         members_probe::reset();
         std::hint::black_box(p.members());
         assert_eq!(members_probe::calls(), 1);
+    }
+
+    /// ADR 0080: adopting a committed replication factor reshapes every group's
+    /// replica set at once (the memo is invalidated) and moves no owner.
+    #[test]
+    fn a_new_replication_factor_reshapes_sets_and_keeps_owners() {
+        use super::NUM_GROUPS;
+        use crate::swim::MemberState;
+        let local = NodeId("rf-a".into());
+        let mut p = Placement::new(local.clone(), 3);
+        for n in ["rf-b", "rf-c", "rf-d"] {
+            p.observe(&NodeId(n.into()), MemberState::Alive, "x:7000", None);
+        }
+        let owners: Vec<NodeId> = (0..NUM_GROUPS)
+            .map(|g| p.group_replica_set(g)[0].clone())
+            .collect();
+        assert!((0..NUM_GROUPS).all(|g| p.group_replica_set(g).len() == 3));
+        let epoch = p.ownership_epoch();
+        assert!(p.set_replicas(2));
+        assert!(!p.set_replicas(2), "an unchanged factor is not a change");
+        for (g, owner) in (0..NUM_GROUPS).zip(&owners) {
+            let set = p.group_replica_set(g);
+            assert_eq!(set.len(), 2, "group {g}");
+            assert_eq!(&set[0], owner, "group {g}'s owner stays");
+        }
+        assert_eq!(p.ownership_epoch(), epoch);
+        assert_eq!(p.desired_replicas(), 2);
     }
 }

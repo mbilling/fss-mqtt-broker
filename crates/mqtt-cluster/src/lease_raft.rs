@@ -58,6 +58,97 @@ pub enum LeaseRequest {
         /// The `(group, node)` assignments to apply, in order.
         assignments: Vec<(GroupId, RaftNodeId)>,
     },
+    // ── The replication factor (ADR 0080). Appended variants: a build that
+    // predates them cannot decode them, so they are proposed only once every
+    // member speaks `PROTO_REPLICATION_FACTOR`.
+    /// Found the cluster's replication factor. Applied only while none is
+    /// committed; a cluster that already has one changes it through
+    /// [`BeginReplicaChange`](Self::BeginReplicaChange).
+    SetReplicas {
+        /// The replication factor, in [`REPLICAS_MIN`]..=[`REPLICAS_MAX`].
+        r: u8,
+    },
+    /// Open the joint phase of a live replication-factor change (ADR 0080 §4):
+    /// until it is committed, a group's appends need a quorum of its `from` set and
+    /// of its `to` set. Applied only when `from` is the committed factor (3 when
+    /// none is) and no change is open.
+    BeginReplicaChange {
+        /// The factor in force.
+        from: u8,
+        /// The factor being moved to.
+        to: u8,
+    },
+    /// Close the open change: `to` becomes the committed factor. Applied only
+    /// when it names the open change's target.
+    CommitReplicaChange {
+        /// The factor the open change moves to.
+        to: u8,
+    },
+}
+
+/// The replication factor a cluster with no committed one runs at: every cluster
+/// that predates ADR 0080.
+pub const REPLICAS_LEGACY: u8 = 3;
+/// The smallest replication factor a cluster may run at.
+pub const REPLICAS_MIN: u8 = 2;
+/// The largest: seven copies already tolerate three failures.
+pub const REPLICAS_MAX: u8 = 7;
+
+/// The cluster's replication factor as the lease group agreed it (ADR 0080 §1).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplicationRecord {
+    /// The committed factor; `None` for a cluster that never set one.
+    pub replicas: Option<u8>,
+    /// A live change in progress, `(from, to)`: the joint phase.
+    pub change: Option<(u8, u8)>,
+}
+
+impl ReplicationRecord {
+    /// The factor in force: the committed one, else [`REPLICAS_LEGACY`].
+    #[must_use]
+    pub fn effective(&self) -> u8 {
+        self.replicas.unwrap_or(REPLICAS_LEGACY)
+    }
+
+    /// Whether nothing has ever been recorded — the state every pre-ADR-0080
+    /// cluster is in, which is persisted in the legacy shape.
+    #[must_use]
+    pub fn is_unset(&self) -> bool {
+        *self == Self::default()
+    }
+
+    fn valid(r: u8) -> bool {
+        (REPLICAS_MIN..=REPLICAS_MAX).contains(&r)
+    }
+
+    /// Apply one replication command. Deterministic, as every state-machine
+    /// transition must be: a command whose precondition does not hold is a no-op
+    /// on every replica alike, never an error.
+    fn apply(&mut self, req: &LeaseRequest) {
+        match *req {
+            LeaseRequest::SetReplicas { r } => {
+                if self.replicas.is_none() && self.change.is_none() && Self::valid(r) {
+                    self.replicas = Some(r);
+                }
+            }
+            LeaseRequest::BeginReplicaChange { from, to } => {
+                if self.change.is_none()
+                    && from == self.effective()
+                    && Self::valid(to)
+                    && to != from
+                {
+                    self.change = Some((from, to));
+                }
+            }
+            LeaseRequest::CommitReplicaChange { to } => {
+                if self.change.is_some_and(|(_, target)| target == to) {
+                    self.replicas = Some(to);
+                    self.change = None;
+                }
+            }
+            LeaseRequest::Assign { .. } | LeaseRequest::AssignMany { .. } => {}
+        }
+    }
 }
 
 /// The result of applying a [`LeaseRequest`]: the group's now-current lease.
@@ -84,10 +175,56 @@ pub struct LeaseRecord {
 ///
 /// Pure and deterministic: replaying the same committed [`LeaseRequest`]s on any
 /// replica yields the same table (the requirement for a Raft state machine).
+///
+/// Its serde shape is the pre-ADR-0080 one (`leases`, `next_epoch`); the
+/// replication record rides beside it only through [`encode_state`] /
+/// [`decode_state`], so a cluster that never sets a factor persists and ships
+/// byte-identical state to what an older build reads.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct LeaseMap {
     leases: BTreeMap<GroupId, LeaseRecord>,
     next_epoch: Epoch,
+    #[serde(skip)]
+    replication: ReplicationRecord,
+}
+
+/// Encode the whole state machine for persistence and snapshots (ADR 0080 §1).
+///
+/// While no replication factor was ever recorded this is exactly the legacy
+/// encoding of the lease table, so an older build in a rolling upgrade still
+/// decodes it. Once one is recorded — which the capability gate allows only when
+/// every member is new enough — it is the table followed by the record.
+///
+/// # Errors
+/// A postcard encoding failure.
+pub fn encode_state(map: &LeaseMap) -> Result<Vec<u8>, postcard::Error> {
+    if map.replication.is_unset() {
+        postcard::to_allocvec(map)
+    } else {
+        postcard::to_allocvec(&(map, &map.replication))
+    }
+}
+
+/// Decode what [`encode_state`] wrote, from either shape. Strict: each shape
+/// must consume the bytes exactly, and neither is a prefix-complete reading of
+/// the other (the extended one has bytes left over as legacy; the legacy one
+/// runs out as extended), so the two cannot be confused.
+///
+/// # Errors
+/// Bytes that are neither shape.
+pub fn decode_state(bytes: &[u8]) -> Result<LeaseMap, postcard::Error> {
+    if let Ok(((mut map, replication), rest)) =
+        postcard::take_from_bytes::<(LeaseMap, ReplicationRecord)>(bytes)
+    {
+        if rest.is_empty() {
+            map.replication = replication;
+            return Ok(map);
+        }
+    }
+    match postcard::take_from_bytes::<LeaseMap>(bytes)? {
+        (map, []) => Ok(map),
+        _ => Err(postcard::Error::DeserializeBadEncoding),
+    }
 }
 
 impl LeaseMap {
@@ -112,7 +249,19 @@ impl LeaseMap {
                 .iter()
                 .map(|(group, node)| self.assign_one(*group, *node))
                 .last(),
+            LeaseRequest::SetReplicas { .. }
+            | LeaseRequest::BeginReplicaChange { .. }
+            | LeaseRequest::CommitReplicaChange { .. } => {
+                self.replication.apply(req);
+                None
+            }
         }
+    }
+
+    /// The cluster's replication factor as committed (ADR 0080).
+    #[must_use]
+    pub fn replication(&self) -> ReplicationRecord {
+        self.replication
     }
 
     /// Assign one group to `node` at a fresh epoch, returning the minted lease.
@@ -164,7 +313,10 @@ openraft::declare_raft_types!(
 
 #[cfg(test)]
 mod tests {
-    use super::{LeaseConfig, LeaseMap, LeaseRequest, RaftNodeId};
+    use super::{
+        decode_state, encode_state, LeaseConfig, LeaseMap, LeaseRequest, RaftNodeId,
+        ReplicationRecord, REPLICAS_LEGACY,
+    };
 
     fn assign(group: u64, node: RaftNodeId) -> LeaseRequest {
         LeaseRequest::Assign { group, node }
@@ -293,6 +445,121 @@ mod tests {
         assert_eq!(back.get(1), m.get(1));
         assert_eq!(back.get(2), m.get(2));
         assert_eq!(back.high_epoch(), m.high_epoch());
+    }
+
+    /// ADR 0080: the founding command applies once, with a valid factor, and a
+    /// cluster that never ran it reads as the legacy 3.
+    #[test]
+    fn set_replicas_founds_the_factor_once() {
+        let mut m = LeaseMap::new();
+        assert_eq!(m.replication().effective(), REPLICAS_LEGACY);
+        assert!(m.replication().is_unset());
+        for bad in [0u8, 1, 8, 255] {
+            assert!(m.apply(&LeaseRequest::SetReplicas { r: bad }).is_none());
+            assert!(m.replication().is_unset(), "factor {bad} is outside 2..=7");
+        }
+        m.apply(&LeaseRequest::SetReplicas { r: 2 });
+        assert_eq!(m.replication().replicas, Some(2));
+        m.apply(&LeaseRequest::SetReplicas { r: 5 });
+        assert_eq!(
+            m.replication().effective(),
+            2,
+            "a founded factor changes only through the joint phase"
+        );
+    }
+
+    /// ADR 0080 §4: the live change opens only from the factor in force, cannot
+    /// stack, and closes only on its own target.
+    #[test]
+    fn a_replica_change_opens_from_the_factor_in_force_and_closes_on_its_target() {
+        let mut m = LeaseMap::new();
+        // Unset reads as 3, so a change must start from 3.
+        m.apply(&LeaseRequest::BeginReplicaChange { from: 2, to: 5 });
+        assert_eq!(
+            m.replication().change,
+            None,
+            "from must be the factor in force"
+        );
+        m.apply(&LeaseRequest::BeginReplicaChange { from: 3, to: 3 });
+        assert_eq!(
+            m.replication().change,
+            None,
+            "a change to itself is no change"
+        );
+        m.apply(&LeaseRequest::BeginReplicaChange { from: 3, to: 2 });
+        assert_eq!(m.replication().change, Some((3, 2)));
+        m.apply(&LeaseRequest::BeginReplicaChange { from: 3, to: 5 });
+        assert_eq!(m.replication().change, Some((3, 2)), "changes do not stack");
+        m.apply(&LeaseRequest::SetReplicas { r: 5 });
+        assert_eq!(
+            m.replication().replicas,
+            None,
+            "no founding during a change"
+        );
+        m.apply(&LeaseRequest::CommitReplicaChange { to: 5 });
+        assert_eq!(
+            m.replication().change,
+            Some((3, 2)),
+            "commit names the open target"
+        );
+        m.apply(&LeaseRequest::CommitReplicaChange { to: 2 });
+        assert_eq!(
+            m.replication(),
+            ReplicationRecord {
+                replicas: Some(2),
+                change: None
+            }
+        );
+    }
+
+    /// Replication commands mint no epoch and touch no lease.
+    #[test]
+    fn replication_commands_leave_the_lease_table_alone() {
+        let mut m = LeaseMap::new();
+        m.apply(&assign(1, 10));
+        m.apply(&LeaseRequest::SetReplicas { r: 2 });
+        m.apply(&LeaseRequest::BeginReplicaChange { from: 2, to: 3 });
+        m.apply(&LeaseRequest::CommitReplicaChange { to: 3 });
+        assert_eq!(m.high_epoch(), 1);
+        assert_eq!(m.get(1).unwrap().holder, 10);
+    }
+
+    /// The rolling-upgrade contract (ADR 0080 §1): while no factor is recorded the
+    /// state encodes byte for byte as the pre-ADR-0080 lease table, so an older
+    /// build reads what a newer one persisted or shipped; legacy bytes decode as
+    /// an unset factor.
+    #[test]
+    fn unset_state_encodes_exactly_as_the_legacy_table() {
+        let mut m = LeaseMap::new();
+        m.apply(&assign(1, 10));
+        m.apply(&assign(2, 20));
+        let legacy = postcard::to_allocvec(&m).unwrap();
+        assert_eq!(encode_state(&m).unwrap(), legacy);
+        let back = decode_state(&legacy).unwrap();
+        assert!(back.replication().is_unset());
+        assert_eq!(back.get(2), m.get(2));
+        assert_eq!(back.high_epoch(), 2);
+    }
+
+    /// Once a factor is recorded the extended encoding round-trips it — and an
+    /// older build's strict decode of the bare table refuses those bytes instead
+    /// of silently dropping the factor.
+    #[test]
+    fn a_recorded_factor_round_trips_and_is_not_misread_as_legacy() {
+        let mut m = LeaseMap::new();
+        m.apply(&assign(1, 10));
+        m.apply(&LeaseRequest::SetReplicas { r: 2 });
+        m.apply(&LeaseRequest::BeginReplicaChange { from: 2, to: 3 });
+        let bytes = encode_state(&m).unwrap();
+        let back = decode_state(&bytes).unwrap();
+        assert_eq!(back.replication(), m.replication());
+        assert_eq!(back.get(1), m.get(1));
+        let (_, rest) = postcard::take_from_bytes::<LeaseMap>(&bytes).unwrap();
+        assert!(
+            !rest.is_empty(),
+            "a legacy strict decoder sees trailing bytes and fails closed"
+        );
+        assert!(decode_state(&bytes[..bytes.len() - 1]).is_err());
     }
 
     /// The openraft types the store persists and the mesh ships round-trip

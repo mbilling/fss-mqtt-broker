@@ -561,6 +561,21 @@ async fn run_driver(
 
         push_committed_lease_owners(&placement, &lease_store, &mut id_map);
 
+        // The replication factor the lease group committed (ADR 0080 §1): every
+        // node's replica sets follow the one agreed value, never a local constant.
+        // A cluster that never recorded one runs at the legacy 3.
+        let replicas = lease_store.replication().effective();
+        if placement
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .set_replicas(usize::from(replicas))
+        {
+            tracing::info!(
+                replicas,
+                "replication factor adopted from the lease group (ADR 0080)"
+            );
+        }
+
         // The durable membership ROSTER (issue #229): every raft member — voters
         // and learners — named where the accumulated id map can, counted where it
         // cannot (a member this process has never observed still blocks the
