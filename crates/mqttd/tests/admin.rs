@@ -1182,3 +1182,48 @@ async fn cordon_stops_readiness_until_uncordoned_and_is_an_operator_action() {
     assert!(node.get("cordon").is_none(), "{node}");
     assert_eq!(node["ready"], true, "{node}");
 }
+
+/// The one process-wide reloadable filter this test binary uses (installed once).
+fn ensure_log_filter() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| mqttd::log_filter::init("warn"));
+}
+
+#[tokio::test]
+async fn a_log_override_is_an_operator_action_that_never_silences_audit() {
+    ensure_log_filter();
+    let b = start_broker_with_admin().await;
+    let root = mint_leaf(&b.admin.admin_ca, "root", None);
+    let alice = mint_leaf(&b.admin.admin_ca, "alice", None);
+
+    let (status, body) = view(&b, "/admin/v1/log-level").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["base"], "warn");
+
+    let (status, body) = post(&b.admin, &alice, "/admin/v1/log-level?filter=debug").await;
+    assert_eq!((status, code(&body)), (403, "forbidden"));
+
+    let (status, body) = post(&b.admin, &root, "/admin/v1/log-level?filter=audit%3Doff").await;
+    assert_eq!((status, code(&body)), (400, "bad-request"), "{body}");
+
+    let (status, body) = post(
+        &b.admin,
+        &root,
+        "/admin/v1/log-level?filter=mqttd%3A%3Ahub%3Ddebug&ttl=120",
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["override_filter"], "mqttd::hub=debug,audit=info");
+    assert!(body["override_remaining_secs"].as_u64().unwrap() <= 120);
+    let (_, node) = view(&b, "/admin/v1/node").await;
+    assert_eq!(
+        node["log_filter"]["override"], "mqttd::hub=debug,audit=info",
+        "{node}"
+    );
+
+    let (status, body) = post(&b.admin, &root, "/admin/v1/log-level/reset").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["override_filter"], Value::Null);
+    let (_, node) = view(&b, "/admin/v1/node").await;
+    assert!(node.get("log_filter").is_none(), "{node}");
+}

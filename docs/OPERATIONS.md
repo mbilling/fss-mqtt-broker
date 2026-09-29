@@ -948,6 +948,21 @@ It is not persisted: a restart comes back uncordoned. Refused connections count 
 `admission_rejected{reason="cordon"}`. To move the connected clients off too, follow with
 `kick`, or use `--decommission` to remove the node for good.
 
+**More logging for an incident, without a restart.** `log-override` (operator) replaces
+the tracing filter for a while, then the configured one (`RUST_LOG`, default `info`) comes
+back on its own:
+
+```sh
+mqttd --admin log-override 'mqttd::hub=debug' --ttl 900   # 15 minutes; at most 3600
+mqttd --admin log-level                                   # base, override, seconds left
+mqttd --admin log-reset                                   # restore now
+```
+
+The filter uses `RUST_LOG` syntax. Audit records always keep logging: every override
+carries `audit=info`, and a filter that names the `audit` target is refused. `/statusz`
+shows an active override (`log_filter.override`, `remaining_secs`), and a newer override
+replaces an older one along with its timer. It is not persisted.
+
 **Why is this client denied?** `authz` asks the live policy, the one the last reload
 published, and names the rule that decides. It changes nothing.
 

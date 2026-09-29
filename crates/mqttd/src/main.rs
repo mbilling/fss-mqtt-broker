@@ -243,11 +243,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(rest) = args.strip_prefix(&["--admin".to_string()]) {
         std::process::exit(mqttd::admin::cli::run(rest).await);
     }
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
-        )
-        .init();
+    // The filter is reloadable (ADR 0081 T9): the admin API can raise it for a while and it
+    // falls back to this one — `RUST_LOG`, or `info`.
+    mqttd::log_filter::init(
+        &std::env::var("RUST_LOG")
+            .ok()
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| "info".to_string()),
+    );
 
     // `--version` / `-V` and `--help` / `-h`: local, print-and-exit, before any subcommand
     // or config work (#169). `--version` in particular MUST exist — an operator typing it

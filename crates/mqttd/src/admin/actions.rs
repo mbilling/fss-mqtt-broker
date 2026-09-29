@@ -144,6 +144,70 @@ pub fn cordon(state: &AdminState, on: bool) -> Answer {
     )
 }
 
+/// `GET /admin/v1/log-level`: the configured filter and any override.
+pub(super) fn log_level() -> Answer {
+    match crate::log_filter::global() {
+        Some(f) => (200, json!(f.status()).to_string()),
+        None => error(
+            503,
+            "unavailable",
+            "the log filter is not reloadable in this process",
+        ),
+    }
+}
+
+/// `POST /admin/v1/log-level?filter=&ttl=`: replace the log filter for `ttl` seconds
+/// (default 600, at most 3600), then restore the configured one. The audit target always
+/// keeps logging.
+pub(super) fn set_log_level(req: &Request) -> Answer {
+    let Some(f) = crate::log_filter::global() else {
+        return error(
+            503,
+            "unavailable",
+            "the log filter is not reloadable in this process",
+        );
+    };
+    let Some(filter) = req.param("filter").filter(|v| !v.is_empty()) else {
+        return error(
+            400,
+            "bad-request",
+            "filter is required (e.g. mqttd::hub=debug)",
+        );
+    };
+    let ttl = match req.param("ttl") {
+        None => 600,
+        Some(v) => match v.parse::<u64>() {
+            Ok(n) if n > 0 => n,
+            _ => {
+                return error(
+                    400,
+                    "bad-request",
+                    "ttl must be a positive number of seconds",
+                )
+            }
+        },
+    };
+    match f.set(filter, std::time::Duration::from_secs(ttl)) {
+        Ok(_) => (200, json!(f.status()).to_string()),
+        Err(e) => error(400, "bad-request", &e),
+    }
+}
+
+/// `POST /admin/v1/log-level/reset`: restore the configured filter now.
+pub(super) fn reset_log_level() -> Answer {
+    let Some(f) = crate::log_filter::global() else {
+        return error(
+            503,
+            "unavailable",
+            "the log filter is not reloadable in this process",
+        );
+    };
+    match f.reset() {
+        Ok(()) => (200, json!(f.status()).to_string()),
+        Err(e) => error(503, "unavailable", &e),
+    }
+}
+
 /// Send the action to the owner's admin listener and relay its answer.
 async fn forward(
     state: &AdminState,

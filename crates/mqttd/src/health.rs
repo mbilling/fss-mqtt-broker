@@ -554,6 +554,20 @@ impl HealthState {
         if self.cordoned() {
             s.push_str(",\"cordon\":{\"active\":true}");
         }
+        // A temporary log filter (ADR 0081 T9): what is overriding the configured one, and
+        // for how much longer.
+        if let Some(status) = crate::log_filter::global().map(crate::log_filter::LogFilter::status)
+        {
+            if let (Some(filter), Some(secs)) =
+                (status.override_filter, status.override_remaining_secs)
+            {
+                let _ = write!(
+                    s,
+                    ",\"log_filter\":{{\"override\":\"{}\",\"remaining_secs\":{secs}}}",
+                    json_escape(&filter)
+                );
+            }
+        }
         // The store's self-measurement (ADR 0076): the boot-probed barrier
         // floor of the data-dir volume, and the durable writer's cumulative
         // group-commit shape. The floor is the number every durable-throughput
