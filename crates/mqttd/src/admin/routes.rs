@@ -61,6 +61,16 @@ const ENDPOINTS: &[Endpoint] = &[
     },
     Endpoint {
         method: "POST",
+        path: "/admin/v1/cordon",
+        min_role: Role::Operator,
+    },
+    Endpoint {
+        method: "POST",
+        path: "/admin/v1/uncordon",
+        min_role: Role::Operator,
+    },
+    Endpoint {
+        method: "POST",
         path: "/admin/v1/kick",
         min_role: Role::Operator,
     },
@@ -151,6 +161,8 @@ pub async fn route(state: &AdminState, caller: &Caller, role: Role, req: &Reques
         "/admin/v1/placement" => super::cluster::placement(state).await,
         "/admin/v1/config" => super::config::config(state),
         "/admin/v1/reload" => super::config::reload(state).await,
+        "/admin/v1/cordon" => super::actions::cordon(state, true),
+        "/admin/v1/uncordon" => super::actions::cordon(state, false),
         "/admin/v1/kick" => {
             super::actions::act(state, caller, role, req, super::actions::Action::Kick).await
         }

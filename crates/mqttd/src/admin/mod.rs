@@ -62,6 +62,8 @@ pub struct AdminState {
     authz: Option<authz::LiveAuthorizer>,
     /// The reloader and config stamp, for the config and reload endpoints (T6).
     reload: Option<Arc<config::ReloadAccess>>,
+    /// The cordon flag the admission gate and `/readyz` read (T8).
+    cordon: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl std::fmt::Debug for AdminState {
@@ -93,7 +95,15 @@ impl AdminState {
             sessions: None,
             authz: None,
             reload: None,
+            cordon: None,
         }
+    }
+
+    /// Serve cordon / uncordon over `flag`, the one the admission gate and health read.
+    #[must_use]
+    pub fn with_cordon(mut self, flag: Arc<std::sync::atomic::AtomicBool>) -> Self {
+        self.cordon = Some(flag);
+        self
     }
 
     /// Serve the effective config and the reload action.

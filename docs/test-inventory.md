@@ -985,7 +985,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 489 test(s)
+## `crates/mqttd/src/lib.rs` — 491 test(s)
 
 - `admin::cli::tests::answers_render_as_tables_and_lines`
 - `admin::cli::tests::invocations_are_validated_before_anything_runs`
@@ -999,6 +999,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `admin::http::tests::oversized_and_malformed_requests_are_refused`
 - `admin::roles::tests::operator_wins_and_cluster_certificates_are_peers`
 - `admin::roles::tests::subjects_map_to_roles`
+- `admission::tests::a_cordon_refuses_new_connections_until_lifted`
 - `admission::tests::the_global_cap_refuses_at_the_bound_and_recovers`
 - `admission::tests::the_penalty_box_refuses_after_the_threshold`
 - `admission::tests::the_penalty_decays_back_to_admission`
@@ -1108,6 +1109,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `conn::tests::v5_receive_maximum_is_advertised_and_forwarded`
 - `conn::tests::v5_subscribe_with_a_subscription_identifier_is_granted`
 - `conn::tests::wildcard_publish_topic_closes_connection`
+- `health::tests::a_cordon_makes_readyz_not_ready_and_statusz_say_why`
 - `health::tests::a_first_cold_start_is_ready_alone`
 - `health::tests::a_lone_single_node_is_healthy_without_durable`
 - `health::tests::a_node_alone_beside_a_foreign_cluster_quarantines_itself`
@@ -1510,7 +1512,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `narrow_allow_does_not_cover_broad_subscription`
 - `unauthorized_will_topic_is_refused_at_connect`
 
-## `crates/mqttd/tests/admin.rs` — 14 test(s)
+## `crates/mqttd/tests/admin.rs` — 15 test(s)
 
 - `a_certificate_from_another_ca_fails_the_handshake`
 - `a_session_shows_its_subscriptions_and_an_offline_one_its_queue`
@@ -1519,6 +1521,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `clients_are_listed_filtered_and_paged_with_their_connection_facts`
 - `cluster_certificates_get_the_peer_role`
 - `config_is_served_redacted_and_reload_is_an_operator_action_with_an_outcome`
+- `cordon_stops_readiness_until_uncordoned_and_is_an_operator_action`
 - `every_request_is_audited_with_subject_role_and_outcome`
 - `kick_disconnects_with_administrative_action_and_keeps_the_session`
 - `listed_subjects_get_their_role_and_everyone_else_is_refused`

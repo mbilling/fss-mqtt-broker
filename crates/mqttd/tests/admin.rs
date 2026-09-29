@@ -101,6 +101,8 @@ struct Harness {
     server_ca_pem: PathBuf,
     audit: Arc<Recorded>,
     config: Arc<RwLock<mqtt_config::Config>>,
+    /// The cordon flag, shared by the admin state and the node's health.
+    cordon: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// A running admin listener: `viewers`/`operators` are the role lists; `cluster_ca`, when
@@ -176,6 +178,7 @@ fn start_node(node: Node<'_>) -> Harness {
         tokio::spawn(hub.run());
         (tx, None)
     };
+    let cordon = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let health = HealthState::new(hub_tx, node.placement, None, 1).with_status(
         node.id.into(),
         Arc::new(
@@ -196,7 +199,13 @@ fn start_node(node: Node<'_>) -> Harness {
         c.admin.operators = node.operators.iter().map(|s| (*s).to_string()).collect();
     }
     let audit = Arc::new(Recorded::default());
-    let mut state = AdminState::new(node.id.into(), health, config.clone(), audit.clone());
+    let mut state = AdminState::new(
+        node.id.into(),
+        health.with_cordon(cordon.clone()),
+        config.clone(),
+        audit.clone(),
+    )
+    .with_cordon(cordon.clone());
     if let Some(ca) = node.cluster_ca {
         state = state.with_cluster_ca(mqtt_net::tls::ChainCheck::new(&ca.pem).unwrap());
     }
@@ -220,6 +229,7 @@ fn start_node(node: Node<'_>) -> Harness {
         server_ca_pem,
         audit,
         config,
+        cordon,
     }
 }
 
@@ -1116,4 +1126,36 @@ async fn an_action_on_another_nodes_session_is_forwarded_to_its_owner() {
     .await
     .unwrap();
     assert_eq!(status, 403);
+}
+
+#[tokio::test]
+async fn cordon_stops_readiness_until_uncordoned_and_is_an_operator_action() {
+    let b = start_broker_with_admin().await;
+    let root = mint_leaf(&b.admin.admin_ca, "root", None);
+    let alice = mint_leaf(&b.admin.admin_ca, "alice", None);
+
+    let (status, body) = post(&b.admin, &alice, "/admin/v1/cordon").await;
+    assert_eq!((status, code(&body)), (403, "forbidden"));
+
+    let (status, body) = post(&b.admin, &root, "/admin/v1/cordon").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        (body["cordoned"].clone(), body["changed"].clone()),
+        (Value::Bool(true), Value::Bool(true))
+    );
+    assert!(b.admin.cordon.load(std::sync::atomic::Ordering::Acquire));
+    let (_, node) = view(&b, "/admin/v1/node").await;
+    assert_eq!(node["cordon"]["active"], true, "{node}");
+    assert_eq!(node["ready"], false, "{node}");
+
+    // Idempotent: a second cordon changes nothing.
+    let (_, body) = post(&b.admin, &root, "/admin/v1/cordon").await;
+    assert_eq!(body["changed"], false);
+
+    let (status, body) = post(&b.admin, &root, "/admin/v1/uncordon").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["cordoned"], false);
+    let (_, node) = view(&b, "/admin/v1/node").await;
+    assert!(node.get("cordon").is_none(), "{node}");
+    assert_eq!(node["ready"], true, "{node}");
 }

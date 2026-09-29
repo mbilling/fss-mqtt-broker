@@ -91,6 +91,22 @@ const VERBS: &[Verb] = &[
         help: "operator: reload the config file, as SIGHUP does, and report the outcome",
     },
     Verb {
+        name: "cordon",
+        method: "POST",
+        path: "/admin/v1/cordon",
+        required: &[],
+        optional: &[],
+        help: "operator: refuse new connections and report not-ready (not persisted)",
+    },
+    Verb {
+        name: "uncordon",
+        method: "POST",
+        path: "/admin/v1/uncordon",
+        required: &[],
+        optional: &[],
+        help: "operator: accept new connections again",
+    },
+    Verb {
         name: "kick",
         method: "POST",
         path: "/admin/v1/kick",
