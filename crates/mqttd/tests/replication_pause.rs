@@ -185,8 +185,12 @@ async fn measure(replicas: u8, fault: Fault, seed: u64) {
     let entries = [nodes[0].client_addr, nodes[1].client_addr];
 
     for t in 0..TOPICS {
-        persistent_subscriber(entries[t % 2], &format!("rp-sub-{seed}-{t}"), &format!("rp/{t}"))
-            .await;
+        persistent_subscriber(
+            entries[t % 2],
+            &format!("rp-sub-{seed}-{t}"),
+            &format!("rp/{t}"),
+        )
+        .await;
     }
 
     let started = Instant::now();
