@@ -197,6 +197,13 @@ impl LeaseStore {
         self.lock().sm.get(group)
     }
 
+    /// The highest lease epoch ever minted in the applied state machine: 0 on a
+    /// cluster that has never assigned a lease (ADR 0080 founding reads it).
+    #[must_use]
+    pub fn high_epoch(&self) -> crate::lease::Epoch {
+        self.lock().sm.high_epoch()
+    }
+
     /// The replication factor in the applied state machine (ADR 0080).
     #[must_use]
     pub fn replication(&self) -> ReplicationRecord {

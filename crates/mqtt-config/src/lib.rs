@@ -476,6 +476,19 @@ pub struct Durable {
     pub enabled: bool,
     /// Bounded lease-consensus voter set size (`MQTTD_LEASE_VOTERS`, ADR 0021). Default 5.
     pub lease_voters: u32,
+    /// The replication factor a NEW cluster is founded with (`MQTTD_REPLICAS`, ADR 0080):
+    /// how many nodes keep a copy of each durable placement group, 2 to 7. It is
+    /// cluster state, not a per-node setting: the node that founds the cluster
+    /// commits it through the lease group before any group is assigned, and every
+    /// node then uses the committed value. On a node joining an existing cluster, or
+    /// restarting in one, a different value here changes nothing (it is logged). A
+    /// cluster founded before ADR 0080 runs at 3.
+    ///
+    /// At 2 the write quorum is both copies: one slow or suspected replica pauses
+    /// durable writes for its groups until it recovers or is declared dead. At 3 a
+    /// single failure is tolerated without a pause. Even values above 2 cost a copy
+    /// without tolerating another failure (4 needs 3 acks, like 3 needs 2).
+    pub replicas: u8,
     /// Disk high-water byte cap for the durable store (`MQTTD_STORE_MAX_BYTES`, ADR 0041 T5).
     pub store_max_bytes: Option<u64>,
     /// Min-replicas write floor (`MQTTD_MIN_REPLICAS`, issue #167; on by default
@@ -609,6 +622,7 @@ impl Default for Durable {
         Self {
             enabled: true,
             lease_voters: 5,
+            replicas: 3,
             store_max_bytes: None,
             min_replicas: MinReplicas::Majority,
             allow_ephemeral: false,
@@ -1316,6 +1330,9 @@ impl Config {
         on!("MQTTD_LEASE_VOTERS", v, {
             self.durable.lease_voters = num("MQTTD_LEASE_VOTERS", &v)?;
         });
+        on!("MQTTD_REPLICAS", v, {
+            self.durable.replicas = num("MQTTD_REPLICAS", &v)?;
+        });
         on!("MQTTD_STORE_MAX_BYTES", v, {
             self.durable.store_max_bytes = Some(num("MQTTD_STORE_MAX_BYTES", &v)?);
         });
@@ -1569,6 +1586,22 @@ impl Config {
             return Err(ConfigError::Invalid(
                 "durable.min_replicas must be >= 1 (1 = no floor) or \"majority\"".to_string(),
             ));
+        }
+        // ADR 0080: the replication factor a new cluster is founded with.
+        if self.durable.enabled && !(2..=7).contains(&self.durable.replicas) {
+            return Err(ConfigError::Invalid(format!(
+                "durable.replicas must be 2 to 7 (copies of each durable group), got {}",
+                self.durable.replicas
+            )));
+        }
+        if let MinReplicas::Count(n) = self.durable.min_replicas {
+            if self.durable.enabled && n > u32::from(self.durable.replicas) {
+                return Err(ConfigError::Invalid(format!(
+                    "durable.min_replicas ({n}) exceeds the replication factor \
+                     (durable.replicas = {}) — no group can ever satisfy that floor",
+                    self.durable.replicas
+                )));
+            }
         }
         // The watermark watchers' cadence (issue #243). Both ends are refusals of an
         // instruction that cannot have been meant: 0 would spin, and a mark sampled
@@ -1888,6 +1921,7 @@ pub const ENV_VARS: &[&str] = &[
     // durable
     "MQTTD_DURABLE_SESSIONS",
     "MQTTD_LEASE_VOTERS",
+    "MQTTD_REPLICAS",
     "MQTTD_MIN_REPLICAS",
     "MQTTD_STORE_MAX_BYTES",
     "MQTTD_ALLOW_EPHEMERAL_DURABILITY",
@@ -2085,6 +2119,44 @@ mod tests {
             "[runtime]\nshutdown_grace_secs = 0\n[durable]\nallow_ephemeral = true\n"
         )
         .is_ok());
+    }
+
+    /// ADR 0080: `durable.replicas` is the factor a new cluster is founded with —
+    /// 2 to 7 copies — and an absolute write floor above it could never be met.
+    #[test]
+    fn the_replication_factor_is_bounded_and_bounds_the_floor() {
+        let base = "[durable]\nallow_ephemeral = true\n";
+        assert_eq!(Config::from_toml(base).unwrap().durable.replicas, 3);
+        for r in 2..=7 {
+            let c = Config::from_toml(&format!("{base}replicas = {r}\n"))
+                .unwrap_or_else(|e| panic!("replicas = {r} is valid: {e:?}"));
+            assert_eq!(c.durable.replicas, r);
+        }
+        for bad in [0, 1, 8] {
+            assert!(
+                Config::from_toml(&format!("{base}replicas = {bad}\n")).is_err(),
+                "replicas = {bad} must be refused"
+            );
+        }
+        assert!(Config::from_toml(&format!("{base}replicas = 2\nmin_replicas = 3\n")).is_err());
+        assert!(Config::from_toml(&format!("{base}replicas = 2\nmin_replicas = 2\n")).is_ok());
+        assert!(Config::from_toml(&format!(
+            "{base}replicas = 2\nmin_replicas = \"majority\"\n"
+        ))
+        .is_ok());
+        // The env spelling (`MQTTD_REPLICAS`) overlays the file; overlay parses, and
+        // validation (what startup, --check-config and reload run) refuses a bad one.
+        let env = |v: &'static str| {
+            let mut c = Config::from_toml(base).unwrap();
+            c.overlay_from(|k| (k == "MQTTD_REPLICAS").then(|| v.to_string()))
+                .map(|()| c)
+        };
+        assert_eq!(env("2").unwrap().durable.replicas, 2);
+        assert!(env("two").is_err(), "a non-number is loud");
+        assert!(
+            env("9").unwrap().validate().is_err(),
+            "out of range is refused"
+        );
     }
 
     /// Issue #241 — the four per-subscriber in-memory bounds are refused out of range in
@@ -2581,7 +2653,8 @@ mod tests {
             "MQTTD_CONFIG_UNKNOWN_KEYS" => "warn",
             // The default is the derived `majority` posture (#239), so only an
             // explicit integer *changes* it.
-            "MQTTD_MIN_REPLICAS" => "2",
+            // MQTTD_REPLICAS (ADR 0080): a valid factor that is not the default (3).
+            "MQTTD_MIN_REPLICAS" | "MQTTD_REPLICAS" => "2",
             // Byte caps are refused below 4096 (a value under one message is a
             // configuration mistake, not a tight budget), so "7" would not validate.
             "MQTTD_MAX_BACKLOG_BYTES" | "MQTTD_MAX_OUTBOUND_BYTES" => "8192",
@@ -2762,7 +2835,8 @@ mod tests {
             // that turns MQTTD_SHARED_PREFER_LOCAL's on/off into a fraction),
             // plus MQTTD_REQUIRE_PASSWORD_WITH_CERTIFICATE (issue #670),
             // plus the five MQTTD_<LISTENER>_ALLOW_ANONYMOUS overrides (issue #669).
-            101,
+            // plus MQTTD_REPLICAS (ADR 0080),
+            102,
             "the MQTTD_* surface changed — update ENV_VARS"
         );
         // Issue #239: MQTTD_MIN_REPLICAS was wired in `overlay_from` but never

@@ -170,6 +170,13 @@ enabled = true
 # Bounded lease-consensus voter set size (default 5, recommend odd). Note: >=5 durable nodes on a
 # SINGLE host is fsync-bound (see the demo sizing note / ADR 0049).
 lease_voters = 5
+# The replication factor a NEW cluster is founded with (ADR 0080): copies of each durable
+# placement group, 2 to 7. It is cluster state — the founding node commits it through the lease
+# group and every node follows the committed value; on a node joining or restarting in an
+# existing cluster this changes nothing (a cluster founded before ADR 0080 runs at 3).
+# At 2 the write quorum is both copies, so one slow or suspected replica pauses durable writes
+# for its groups until it recovers or is declared dead; 3 rides through a single failure.
+replicas = 3
 # Disk high-water cap over the on-disk stores, bytes (needs [node] data_dir). Above it the broker
 # browns out growth-writes while subscriber acks/deletes/resumes continue; a QoS>=1 publisher is
 # REFUSED (v5 0x97 / v3.1.1 no ack + close; cross-node via a peer-bus verdict — mid-rolling-upgrade
@@ -206,7 +213,7 @@ min_replicas = "majority"
 #                   # an unconsented loss of the rest — see docs/TROUBLESHOOTING.md and
 #                   # docs/OPERATIONS.md "Scaling". A [durable] edit: restart, not SIGHUP)
 # min_replicas = 2  # an absolute floor on the replica-set SIZE, whatever the topology says (cannot
-#                   # exceed R = 3). It bounds the SET, not the acks: the write quorum is still
+#                   # exceed durable.replicas). It bounds the SET, not the acks: the quorum is
 #                   # len/2+1, so min_replicas = 3 over a 3-member set commits once 2 copies hold
 #                   # the record. The derived default above has no such gap (a set of 2 or 3 needs
 #                   # 2 acks and the floor is 2).

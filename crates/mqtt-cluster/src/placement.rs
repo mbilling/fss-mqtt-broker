@@ -394,6 +394,18 @@ impl Placement {
         }
     }
 
+    /// An explicitly configured absolute write floor (`durable.min_replicas = n`), or
+    /// `None` for a derived or absent one. The derived floor is capped at the
+    /// replication factor; an absolute one is not, so a factor adopted below it
+    /// refuses every write (ADR 0080 warns on exactly that).
+    #[must_use]
+    pub fn min_replicas_configured(&self) -> Option<usize> {
+        match self.floor {
+            WriteFloor::Fixed(n) => Some(n),
+            WriteFloor::Majority { .. } | WriteFloor::DurableOff => None,
+        }
+    }
+
     /// How the write floor in [`Self::min_replicas`] came to be, for `/statusz` (issue #239).
     ///
     /// Three-valued on purpose: a floor of `1` means something different in each case, and
