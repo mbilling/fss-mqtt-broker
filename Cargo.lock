@@ -2180,8 +2180,10 @@ dependencies = [
  "tokio-rustls",
  "tokio-tungstenite",
  "tokio-util",
+ "toml",
  "tracing",
  "tracing-subscriber",
+ "x509-parser",
 ]
 
 [[package]]
