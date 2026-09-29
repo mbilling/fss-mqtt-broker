@@ -60,6 +60,16 @@ const ENDPOINTS: &[Endpoint] = &[
         min_role: Role::Operator,
     },
     Endpoint {
+        method: "POST",
+        path: "/admin/v1/kick",
+        min_role: Role::Operator,
+    },
+    Endpoint {
+        method: "POST",
+        path: "/admin/v1/purge",
+        min_role: Role::Operator,
+    },
+    Endpoint {
         method: "GET",
         path: "/admin/v1/authz",
         min_role: Role::Viewer,
@@ -91,6 +101,9 @@ const ENDPOINTS: &[Endpoint] = &[
     },
 ];
 
+/// The actions a node may forward to a session's owner as the `peer` role.
+const FORWARDABLE: &[&str] = &["/admin/v1/kick", "/admin/v1/purge"];
+
 /// Route one authorized request.
 pub async fn route(state: &AdminState, caller: &Caller, role: Role, req: &Request) -> Answer {
     let mut path_known = false;
@@ -110,7 +123,12 @@ pub async fn route(state: &AdminState, caller: &Caller, role: Role, req: &Reques
             error(404, "not-found", "no such admin endpoint")
         };
     };
-    if role < endpoint.min_role {
+    // A node forwards an operator's action to the session's owner under its own
+    // certificate (T7): the `peer` role may call exactly these, and only as a forward.
+    let forwarded_action = role == Role::Peer
+        && FORWARDABLE.contains(&endpoint.path)
+        && req.param(super::actions::FORWARDED_FOR).is_some();
+    if role < endpoint.min_role && !forwarded_action {
         return error(
             403,
             "forbidden",
@@ -133,6 +151,12 @@ pub async fn route(state: &AdminState, caller: &Caller, role: Role, req: &Reques
         "/admin/v1/placement" => super::cluster::placement(state).await,
         "/admin/v1/config" => super::config::config(state).await,
         "/admin/v1/reload" => super::config::reload(state).await,
+        "/admin/v1/kick" => {
+            super::actions::act(state, caller, role, req, super::actions::Action::Kick).await
+        }
+        "/admin/v1/purge" => {
+            super::actions::act(state, caller, role, req, super::actions::Action::Purge).await
+        }
         "/admin/v1/authz" => super::authz::check(state, req),
         "/admin/v1/clients" => super::sessions::clients(state, req).await,
         "/admin/v1/session" => super::sessions::session(state, req).await,

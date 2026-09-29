@@ -97,6 +97,8 @@ fn mint_leaf(ca: &Ca, name: &str, org: Option<&str>) -> (PathBuf, PathBuf) {
 struct Harness {
     addr: String,
     admin_ca: Arc<Ca>,
+    /// The CA that issued this listener's server certificate.
+    server_ca_pem: PathBuf,
     audit: Arc<Recorded>,
     config: Arc<RwLock<mqtt_config::Config>>,
 }
@@ -151,6 +153,7 @@ struct Node<'a> {
 
 fn start_node(node: Node<'_>) -> Harness {
     let admin_ca = node.admin_ca;
+    let server_ca_pem = node.server_ca.unwrap_or(&admin_ca).pem.clone();
     let (server_cert, server_key) = mint_leaf(
         node.server_ca.unwrap_or(&admin_ca),
         &format!("{}-server", node.id),
@@ -214,6 +217,7 @@ fn start_node(node: Node<'_>) -> Harness {
     Harness {
         addr,
         admin_ca,
+        server_ca_pem,
         audit,
         config,
     }
@@ -224,7 +228,12 @@ impl Harness {
         Target {
             addr: self.addr.clone(),
             server_name: "127.0.0.1".into(),
-            connector: mqtt_net::tls::client_connector(&self.admin_ca.pem, cert, key).unwrap(),
+            connector: mqtt_net::tls::client_connector_multi(
+                &[&self.admin_ca.pem, &self.server_ca_pem],
+                cert,
+                key,
+            )
+            .unwrap(),
             timeout: Duration::from_secs(10),
         }
     }
@@ -529,8 +538,30 @@ struct Broker {
 }
 
 async fn start_broker_with_admin() -> Broker {
+    start_broker_as(BrokerSpec {
+        id: "b1",
+        admin_ca: Arc::new(mint_ca("admin")),
+        cluster: None,
+        placement: None,
+        peers: None,
+    })
+    .await
+}
+
+/// How to build one [`Broker`]: its node id, the admin CA its viewers and operators
+/// come from, and, for a cluster test, the cluster CA (which also issues its admin server
+/// certificate), its placement view and its access to peers.
+struct BrokerSpec<'a> {
+    id: &'a str,
+    admin_ca: Arc<Ca>,
+    cluster: Option<&'a Ca>,
+    placement: Option<Arc<RwLock<Placement>>>,
+    peers: Option<PeerAccess>,
+}
+
+async fn start_broker_as(spec: BrokerSpec<'_>) -> Broker {
     let store = Arc::new(MemorySessionStore::new());
-    let (hub, hub_tx) = Hub::with_config(NodeId("b1".into()), store.clone());
+    let (hub, hub_tx) = Hub::with_config(NodeId(spec.id.into()), store.clone());
     tokio::spawn(hub.run());
     let mqtt_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let mqtt = mqtt_listener.local_addr().unwrap();
@@ -542,20 +573,28 @@ async fn start_broker_with_admin() -> Broker {
         }
     });
     let admin = start_node(Node {
-        id: "b1",
+        id: spec.id,
         listener: TcpListener::bind("127.0.0.1:0").await.unwrap(),
-        admin_ca: Arc::new(mint_ca("admin")),
-        server_ca: None,
-        cluster_ca: None,
+        admin_ca: spec.admin_ca,
+        server_ca: spec.cluster,
+        cluster_ca: spec.cluster,
         viewers: &["CN=alice"],
-        operators: &[],
-        placement: None,
-        peers: None,
+        operators: &["CN=root"],
+        placement: spec.placement,
+        peers: spec.peers,
         hub: Some((hub_tx, store)),
         authz: None,
         reload: None,
     });
     Broker { mqtt, admin }
+}
+
+/// `POST path` as the holder of `who`; status and parsed body.
+async fn post(h: &Harness, who: &(PathBuf, PathBuf), path: &str) -> (u16, Value) {
+    let (status, body) = client::call(&h.target(&who.0, &who.1), "POST", path, Some(""))
+        .await
+        .unwrap();
+    (status, serde_json::from_str(&body).unwrap())
 }
 
 /// `GET path` as alice (a viewer); status and parsed body.
@@ -929,4 +968,175 @@ async fn config_is_served_redacted_and_reload_is_an_operator_action_with_an_outc
         .any(|(_, who, d)| who.as_deref() == Some("CN=root")
             && d == "role=operator POST /admin/v1/reload -> 200"));
     std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn kick_disconnects_with_administrative_action_and_keeps_the_session() {
+    let b = start_broker_with_admin().await;
+    let root = mint_leaf(&b.admin.admin_ca, "root", None);
+    let alice = mint_leaf(&b.admin.admin_ca, "alice", None);
+    let mut v5 = Client::connect_v5_ok(b.mqtt, "dev-5").await;
+    let (mut v3, _) = Client::connect_v311(b.mqtt, "dev-3", false).await;
+    v3.subscribe(1, "cmd/#", QoS::AtLeastOnce).await;
+    view_until(&b, "/admin/v1/clients", |v| v["matched"] == 2).await;
+
+    // A viewer may not act.
+    let (status, body) = post(&b.admin, &alice, "/admin/v1/kick?client=dev-5").await;
+    assert_eq!((status, code(&body)), (403, "forbidden"));
+
+    let (status, body) = post(&b.admin, &root, "/admin/v1/kick?client=dev-5").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["disconnected"], true);
+    // MQTT 5 is told why: 0x98 Administrative action.
+    v5.expect_disconnect(0x98).await;
+
+    // v3.1.1 has no server DISCONNECT: the connection just closes; the persistent
+    // session and its subscription stay.
+    let (status, _) = post(&b.admin, &root, "/admin/v1/kick?client=dev-3").await;
+    assert_eq!(status, 200);
+    v3.expect_closed().await;
+    let body = view_until(&b, "/admin/v1/session?client=dev-3", |v| {
+        v["connected"] == false
+    })
+    .await;
+    assert_eq!(body["subscriptions"], 1);
+
+    let (status, body) = post(&b.admin, &root, "/admin/v1/kick?client=nobody").await;
+    assert_eq!((status, code(&body)), (404, "not-found"));
+}
+
+#[tokio::test]
+async fn purge_deletes_an_offline_session_and_its_queue() {
+    let b = start_broker_with_admin().await;
+    let root = mint_leaf(&b.admin.admin_ca, "root", None);
+    let (mut keeper, _) = Client::connect_v311(b.mqtt, "keeper", false).await;
+    keeper.subscribe(1, "q/#", QoS::AtLeastOnce).await;
+    keeper.disconnect().await;
+    let mut publisher = Client::connect(b.mqtt, "pub").await;
+    publisher
+        .publish("q/1", b"x", QoS::AtLeastOnce, Some(1), vec![])
+        .await;
+    view_until(&b, "/admin/v1/session?client=keeper", |v| v["queued"] == 1).await;
+
+    let (status, body) = post(&b.admin, &root, "/admin/v1/purge?client=keeper").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["session_found"], true);
+    assert_eq!(body["disconnected"], false);
+
+    let (status, body) = view(&b, "/admin/v1/session?client=keeper").await;
+    assert_eq!((status, code(&body)), (404, "not-found"));
+    // The client reconnecting persistently finds no session: nothing was kept.
+    let (_, session_present) = Client::connect_v311(b.mqtt, "keeper", false).await;
+    assert!(!session_present, "a purged session must not come back");
+}
+
+#[tokio::test]
+async fn an_action_on_another_nodes_session_is_forwarded_to_its_owner() {
+    let admin_ca = Arc::new(mint_ca("admin"));
+    let cluster = mint_ca("cluster");
+    // The owner: a broker holding the session, with no placement of its own (it acts on
+    // what it holds).
+    let owner = start_broker_as(BrokerSpec {
+        id: "owner",
+        admin_ca: admin_ca.clone(),
+        cluster: Some(&cluster),
+        placement: None,
+        peers: None,
+    })
+    .await;
+    // The entry node: its placement says `owner` owns the client.
+    let mut placement = Placement::new(NodeId("entry".into()), DEFAULT_REPLICAS);
+    placement.observe(
+        &NodeId("owner".into()),
+        MemberState::Alive,
+        "owner.cluster:7000",
+        None,
+    );
+    let client_id = (0..1000)
+        .map(|i| format!("dev-{i}"))
+        .find(|c| placement.owner(c).0 == "owner")
+        .expect("some id hashes to the other node");
+    let (entry_cert, entry_key) = mint_leaf(&cluster, "entry", None);
+    let owner_admin = owner.admin.addr.clone();
+    let entry = start_broker_as(BrokerSpec {
+        id: "entry",
+        admin_ca: admin_ca.clone(),
+        cluster: Some(&cluster),
+        placement: Some(Arc::new(RwLock::new(placement))),
+        peers: Some(PeerAccess::new(
+            mqtt_net::tls::client_connector_multi(
+                &[&admin_ca.pem, &cluster.pem],
+                &entry_cert,
+                &entry_key,
+            )
+            .unwrap(),
+            Arc::new(move |_: &str, _: &str| Some(owner_admin.clone())),
+        )),
+    })
+    .await;
+
+    let mut device = Client::connect_v5_ok(owner.mqtt, &client_id).await;
+    view_until(&owner, "/admin/v1/clients", |v| v["matched"] == 1).await;
+
+    let root = mint_leaf(&admin_ca, "root", None);
+    let as_root = Target {
+        connector: mqtt_net::tls::client_connector_multi(
+            &[&admin_ca.pem, &cluster.pem],
+            &root.0,
+            &root.1,
+        )
+        .unwrap(),
+        ..entry.admin.target(&root.0, &root.1)
+    };
+    let (status, body) = client::call(
+        &as_root,
+        "POST",
+        &format!("/admin/v1/kick?client={client_id}"),
+        Some(""),
+    )
+    .await
+    .unwrap();
+    let body: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["node"], "owner");
+    assert_eq!(body["forwarded_to"], "owner");
+    assert_eq!(body["forwarded_for"], "CN=root");
+    device.expect_disconnect(0x98).await;
+
+    // Both nodes audited it: the entry as the operator's request, the owner as the
+    // peer's forward naming the operator.
+    let entry_log = entry.admin.audit.0.lock().unwrap().clone();
+    assert!(entry_log
+        .iter()
+        .any(|(_, who, d)| who.as_deref() == Some("CN=root")
+            && d.contains("role=operator POST /admin/v1/kick")));
+    let owner_log = owner.admin.audit.0.lock().unwrap().clone();
+    assert!(
+        owner_log
+            .iter()
+            .any(|(_, who, d)| who.as_deref() == Some("CN=entry")
+                && d.contains("role=peer POST /admin/v1/kick")
+                && d.contains("forwarded_for=CN%3Droot")),
+        "{owner_log:?}"
+    );
+
+    // A peer certificate without the forwarding marker cannot act on its own.
+    let as_peer = Target {
+        connector: mqtt_net::tls::client_connector_multi(
+            &[&admin_ca.pem, &cluster.pem],
+            &entry_cert,
+            &entry_key,
+        )
+        .unwrap(),
+        ..owner.admin.target(&entry_cert, &entry_key)
+    };
+    let (status, _) = client::call(
+        &as_peer,
+        "POST",
+        &format!("/admin/v1/purge?client={client_id}"),
+        Some(""),
+    )
+    .await
+    .unwrap();
+    assert_eq!(status, 403);
 }

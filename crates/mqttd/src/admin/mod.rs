@@ -16,6 +16,7 @@
 //! The configuration itself is never written through this API (ADR 0081 §5): the file
 //! stays the only source.
 
+pub mod actions;
 pub mod authz;
 pub mod cli;
 pub mod client;

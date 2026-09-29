@@ -1511,17 +1511,20 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `narrow_allow_does_not_cover_broad_subscription`
 - `unauthorized_will_topic_is_refused_at_connect`
 
-## `crates/mqttd/tests/admin.rs` — 11 test(s)
+## `crates/mqttd/tests/admin.rs` — 14 test(s)
 
 - `a_certificate_from_another_ca_fails_the_handshake`
 - `a_session_shows_its_subscriptions_and_an_offline_one_its_queue`
+- `an_action_on_another_nodes_session_is_forwarded_to_its_owner`
 - `any_node_answers_for_the_cluster_and_a_silent_node_is_listed_as_silent`
 - `clients_are_listed_filtered_and_paged_with_their_connection_facts`
 - `cluster_certificates_get_the_peer_role`
 - `config_is_served_redacted_and_reload_is_an_operator_action_with_an_outcome`
 - `every_request_is_audited_with_subject_role_and_outcome`
+- `kick_disconnects_with_administrative_action_and_keeps_the_session`
 - `listed_subjects_get_their_role_and_everyone_else_is_refused`
 - `node_reports_the_statusz_body_and_unknown_routes_have_stable_codes`
+- `purge_deletes_an_offline_session_and_its_queue`
 - `subscribers_backlog_and_retained_answer_the_day_two_questions`
 - `the_authorization_dry_run_names_the_deciding_rule_of_the_live_policy`
 

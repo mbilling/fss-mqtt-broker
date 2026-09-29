@@ -912,6 +912,26 @@ lists the changed sections that are staged but not live (listeners, TLS material
 cluster, …). Reloads are serialized: `SIGHUP`, the file watcher and the API never
 interleave. The request itself carries nothing: the file is the only input.
 
+**Removing a client.** Two operator actions, on one client id:
+
+```sh
+mqttd --admin kick dev-0042     # disconnect; the session (subscriptions, queue) stays
+mqttd --admin purge dev-0042    # disconnect if connected, then delete the session and its queue
+```
+
+- `kick` closes the connection as a revocation eviction does: an MQTT 5 client receives
+  `DISCONNECT` with reason `0x98` (Administrative action), a 3.1.1 client just loses the
+  connection. It is a server-side close, so the client's Will is published. A client that
+  reconnects is admitted again; to keep it out, change its credentials or ACL and reload.
+- `purge` deletes the session everywhere it is kept: subscriptions, in-flight state, the
+  queued messages and the durable copy. A persistent reconnect then starts clean
+  (`session_present = 0`).
+- Either can be run on any node. A session lives on its placement owner, so a node that
+  does not own it forwards the action to the owner's admin listener (under its cluster
+  certificate, carrying your subject), and the answer says `forwarded_to`. Both nodes audit
+  it. A forwarded action is never forwarded again.
+- `404 not-found` means the owner holds no session or connection for that id.
+
 **Why is this client denied?** `authz` asks the live policy, the one the last reload
 published, and names the rule that decides. It changes nothing.
 
