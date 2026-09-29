@@ -29,13 +29,34 @@ impl std::fmt::Debug for ReloadAccess {
     }
 }
 
-/// `GET /admin/v1/config`
-pub fn config(state: &AdminState) -> Answer {
-    let live = state
-        .live_config
-        .read()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .clone();
+/// `GET /admin/v1/config`: the committed config, never a reload's unvalidated candidate.
+pub async fn config(state: &AdminState) -> Answer {
+    let committed = match state.reload.as_ref() {
+        // Waits out a reload in flight (off the async workers), then reads config and
+        // stamp together.
+        Some(access) => {
+            let reloader = access.reloader.clone();
+            match tokio::task::spawn_blocking(move || reloader.committed_config()).await {
+                Ok(c) => c,
+                Err(e) => {
+                    return error(
+                        503,
+                        "unavailable",
+                        &format!("reading the config failed: {e}"),
+                    )
+                }
+            }
+        }
+        None => None,
+    };
+    let (live, (checksum, generation)) = committed.unwrap_or_else(|| {
+        let live = state
+            .live_config
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        (live, (String::new(), 0))
+    });
     let redacted = crate::config_view::redacted(&live);
     let body = match serde_json::to_value(&redacted) {
         Ok(v) => v,
@@ -47,11 +68,6 @@ pub fn config(state: &AdminState) -> Answer {
             )
         }
     };
-    let (checksum, generation) = state
-        .reload
-        .as_ref()
-        .map(|r| r.stamp.read())
-        .unwrap_or_default();
     (
         200,
         json!({
