@@ -37,7 +37,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/history-check/src/main.rs` — 0 test(s)
 
 
-## `crates/mqtt-auth/src/lib.rs` — 124 test(s)
+## `crates/mqtt-auth/src/lib.rs` — 128 test(s)
 
 - `acl::tests::a_bad_client_id_does_not_disturb_rules_that_never_use_it`
 - `acl::tests::a_bare_percent_is_literal`
@@ -47,6 +47,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `acl::tests::a_hostile_client_id_cannot_broaden_a_grant`
 - `acl::tests::a_substituted_value_is_never_rescanned_for_placeholders`
 - `acl::tests::allowed_narrow_subscribe_does_not_cover_broader_request`
+- `acl::tests::an_unsafe_substitution_in_a_deny_is_explained_as_fail_closed`
 - `acl::tests::an_unsubstitutable_client_id_makes_a_deny_refuse_outright`
 - `acl::tests::clients_is_rejected_on_a_topic_rule`
 - `acl::tests::connect_cannot_mix_with_topic_actions`
@@ -58,6 +59,9 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `acl::tests::empty_actions_are_rejected`
 - `acl::tests::empty_topics_are_rejected`
 - `acl::tests::everyone_rule_applies_to_any_subject`
+- `acl::tests::explain_always_agrees_with_enforcement`
+- `acl::tests::explain_names_the_deciding_rule`
+- `acl::tests::explain_reports_connect_rules_and_their_absence`
 - `acl::tests::explicit_default_allow_permits_everything_absent_rules`
 - `acl::tests::group_membership_matches`
 - `acl::tests::identities_or_groups_either_list_may_hit`
@@ -699,7 +703,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 
 - `publish_codec_round_trip_clears_the_floor`
 
-## `crates/mqtt-config/src/lib.rs` — 38 test(s)
+## `crates/mqtt-config/src/lib.rs` — 40 test(s)
 
 - `tests::a_backup_dir_inside_the_data_dir_is_a_config_error`
 - `tests::a_bad_enum_value_is_rejected`
@@ -727,7 +731,9 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::ownership_domain_parses_both_values_and_refuses_others`
 - `tests::per_listener_anonymous_overrides_are_tri_state`
 - `tests::per_var_boolean_conventions_are_honoured`
+- `tests::redacted_config_prints_no_secret`
 - `tests::requiring_both_factors_needs_a_client_ca_and_a_password_verifier`
+- `tests::the_admin_listener_needs_tls_a_role_and_its_own_bind`
 - `tests::the_env_surface_is_a_deduplicated_curated_list`
 - `tests::the_gossip_key_is_inline_xor_by_reference`
 - `tests::the_new_per_subscriber_bounds_are_refused_out_of_range`
@@ -981,8 +987,20 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 469 test(s)
+## `crates/mqttd/src/lib.rs` — 490 test(s)
 
+- `admin::cli::tests::answers_render_as_tables_and_lines`
+- `admin::cli::tests::invocations_are_validated_before_anything_runs`
+- `admin::client::tests::responses_split_into_status_and_body`
+- `admin::client::tests::urls_need_https_and_a_port`
+- `admin::cluster::tests::a_silent_node_is_a_row_with_its_reason_not_a_healthy_one`
+- `admin::cluster::tests::the_production_mapping_keeps_the_host_and_swaps_the_port`
+- `admin::http::tests::a_get_with_a_query_is_decoded`
+- `admin::http::tests::a_post_body_is_read_to_its_length`
+- `admin::http::tests::encode_and_decode_round_trip`
+- `admin::http::tests::oversized_and_malformed_requests_are_refused`
+- `admin::roles::tests::operator_wins_and_cluster_certificates_are_peers`
+- `admin::roles::tests::subjects_map_to_roles`
 - `admission::tests::the_global_cap_refuses_at_the_bound_and_recovers`
 - `admission::tests::the_penalty_box_refuses_after_the_threshold`
 - `admission::tests::the_penalty_decays_back_to_admission`
@@ -1030,6 +1048,8 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `cluster::tests::alive_without_routing_address_is_skipped`
 - `cluster::tests::larger_node_id_does_not_dial`
 - `cluster::tests::member_states_drive_the_gauge`
+- `config_view::tests::fingerprint_is_stable_and_hides_the_value`
+- `config_view::tests::the_printed_config_carries_no_inline_key`
 - `config_watch::tests::a_rejected_reload_is_retried_until_it_parses`
 - `config_watch::tests::a_settled_edit_applies_exactly_once`
 - `config_watch::tests::an_atomic_rename_is_detected`
@@ -1436,11 +1456,13 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `reload::tests::a_failed_reload_keeps_the_running_policy`
 - `reload::tests::a_reload_dispatches_the_identity_sweep_only_on_success`
 - `reload::tests::a_reload_into_ephemeral_durability_is_rejected_and_the_running_config_kept`
+- `reload::tests::a_reload_reports_its_outcome`
 - `reload::tests::a_reload_swaps_the_gossip_crl_into_the_live_slot`
 - `reload::tests::a_reload_swaps_the_gossip_signer_and_a_bad_build_rejects_everything`
 - `reload::tests::a_reload_swaps_the_peer_bus_tls_material`
 - `reload::tests::a_successful_reload_swaps_the_policy`
 - `reload::tests::checksum_is_sha256_lowercase_hex`
+- `reload::tests::committed_config_never_returns_a_rejected_candidate`
 - `reload::tests::reload_increments_the_metric_by_outcome`
 - `store_probe::tests::probes_a_volume_and_cleans_up`
 - `store_probe::tests::sharding_pays_only_when_parallel_streams_are_nearly_independent`
@@ -1452,6 +1474,11 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `store_watch::tests::the_poll_policy_only_accelerates_near_the_mark`
 - `store_watch::tests::the_store_skew_report_is_edge_triggered_with_hysteresis`
 - `store_watch::tests::the_watcher_drives_brownout_on_watermark_transitions`
+- `tls_check::tests::a_chain_in_the_wrong_order_fails`
+- `tls_check::tests::a_key_that_does_not_match_fails`
+- `tls_check::tests::expired_and_expiring_leaves_are_flagged`
+- `tls_check::tests::nothing_configured_is_a_single_ok_line`
+- `tls_check::tests::valid_material_passes_and_reports_names`
 
 ## `crates/mqttd/src/main.rs` — 18 test(s)
 
@@ -1485,6 +1512,23 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `identity_substitution_scopes_topics`
 - `narrow_allow_does_not_cover_broad_subscription`
 - `unauthorized_will_topic_is_refused_at_connect`
+
+## `crates/mqttd/tests/admin.rs` — 14 test(s)
+
+- `a_certificate_from_another_ca_fails_the_handshake`
+- `a_session_shows_its_subscriptions_and_an_offline_one_its_queue`
+- `an_action_on_another_nodes_session_is_forwarded_to_its_owner`
+- `any_node_answers_for_the_cluster_and_a_silent_node_is_listed_as_silent`
+- `clients_are_listed_filtered_and_paged_with_their_connection_facts`
+- `cluster_certificates_get_the_peer_role`
+- `config_is_served_redacted_and_reload_is_an_operator_action_with_an_outcome`
+- `every_request_is_audited_with_subject_role_and_outcome`
+- `kick_disconnects_with_administrative_action_and_keeps_the_session`
+- `listed_subjects_get_their_role_and_everyone_else_is_refused`
+- `node_reports_the_statusz_body_and_unknown_routes_have_stable_codes`
+- `purge_deletes_an_offline_session_and_its_queue`
+- `subscribers_backlog_and_retained_answer_the_day_two_questions`
+- `the_authorization_dry_run_names_the_deciding_rule_of_the_live_policy`
 
 ## `crates/mqttd/tests/audit.rs` — 4 test(s)
 

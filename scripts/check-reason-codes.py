@@ -47,6 +47,7 @@ WHEN_EMITTED: dict[int, str] = {
     0x94: "Topic alias out of range or used before it was bound (ADR 0011).",
     0x95: "Inbound packet larger than the advertised Maximum Packet Size.",
     0x97: "A quota or brownout refusal (sessions, subscriptions, retained growth, durable-append floor).",
+    0x98: "An operator disconnected the client through the admin API (`mqttd --admin kick` / `purge`, ADR 0081).",
     0x9C: "This node no longer owns the persistent session; reconnect and land on the owner (issue #284).",
 }
 

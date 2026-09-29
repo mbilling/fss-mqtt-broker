@@ -45,6 +45,8 @@ pub struct Config {
     pub backup: Backup,
     /// Audit-trail export (ADR 0066 T3).
     pub audit: Audit,
+    /// The authenticated admin API (ADR 0081).
+    pub admin: Admin,
     /// The unknown key paths the last parse IGNORED under
     /// [`UnknownConfigKeys::Warn`] (issue #230) — carried here so the caller can
     /// log them loudly without a signature change. Never serialized; empty under
@@ -569,6 +571,40 @@ pub struct Audit {
     /// the audit rate — see docs/AUDIT-SCHEMA.md for the record format, the SIEM
     /// boundary invariant, and the verification procedure.
     pub syslog: Option<String>,
+}
+
+/// The authenticated admin API ([ADR 0081](../../../docs/adr/0081-admin-api.md)).
+///
+/// Off unless [`Admin::bind`] is set. It is never the health or metrics listener: it
+/// serves client and session detail, so it requires TLS with a client certificate, and a
+/// certificate is admitted only if its subject is listed in [`Admin::viewers`] or
+/// [`Admin::operators`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Admin {
+    /// Admin API listener (`MQTTD_ADMIN_BIND`), e.g. `0.0.0.0:9443`. Unset = no admin API.
+    /// Needs [`Admin::cert`], [`Admin::key`] and [`Admin::client_ca`].
+    pub bind: Option<String>,
+    /// Admin listener server certificate chain PEM (`MQTTD_ADMIN_CERT`).
+    pub cert: Option<String>,
+    /// Admin listener private key PEM (`MQTTD_ADMIN_KEY`).
+    pub key: Option<String>,
+    /// CA bundle PEM that issues admin client certificates (`MQTTD_ADMIN_CLIENT_CA`).
+    /// Every admin request presents a certificate it issued.
+    pub client_ca: Option<String>,
+    /// Certificate subjects granted the read-only `viewer` role (`MQTTD_ADMIN_VIEWERS`,
+    /// `;`-separated). An entry is either the full subject (`CN=ops,O=example`) or
+    /// `CN=<name>`, which matches any subject with that Common Name. Hot-reloadable.
+    pub viewers: Vec<String>,
+    /// Certificate subjects granted the `operator` role, which may also call the actions
+    /// (`MQTTD_ADMIN_OPERATORS`, `;`-separated, same syntax as [`Admin::viewers`]).
+    /// Hot-reloadable.
+    pub operators: Vec<String>,
+    /// The port other nodes' admin listeners use (`MQTTD_ADMIN_PEER_PORT`), for the cluster
+    /// view (ADR 0081 §2): a node reaches a peer at the host of that peer's cluster-bus
+    /// address and this port. Unset = the port of [`Admin::bind`], the usual case when
+    /// every node runs the same config.
+    pub peer_port: Option<u16>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1107,6 +1143,14 @@ impl Config {
                 ))),
             }
         }
+        // Certificate subjects contain commas (`CN=a,O=b`), so subject lists split on `;`.
+        fn subject_list(v: &str) -> Vec<String> {
+            v.split(';')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+                .collect()
+        }
         fn list(v: &str) -> Vec<String> {
             v.split(',')
                 .map(str::trim)
@@ -1497,6 +1541,28 @@ impl Config {
         on!("MQTTD_AUDIT_SYSLOG", v, {
             self.audit.syslog = Some(v);
         });
+        // -- admin API (ADR 0081) --
+        on!("MQTTD_ADMIN_BIND", v, {
+            self.admin.bind = Some(v);
+        });
+        on!("MQTTD_ADMIN_CERT", v, {
+            self.admin.cert = Some(v);
+        });
+        on!("MQTTD_ADMIN_KEY", v, {
+            self.admin.key = Some(v);
+        });
+        on!("MQTTD_ADMIN_CLIENT_CA", v, {
+            self.admin.client_ca = Some(v);
+        });
+        on!("MQTTD_ADMIN_VIEWERS", v, {
+            self.admin.viewers = subject_list(&v);
+        });
+        on!("MQTTD_ADMIN_OPERATORS", v, {
+            self.admin.operators = subject_list(&v);
+        });
+        on!("MQTTD_ADMIN_PEER_PORT", v, {
+            self.admin.peer_port = Some(num("MQTTD_ADMIN_PEER_PORT", &v)?);
+        });
         on!("MQTTD_BACKUP_DIR", v, {
             self.backup.dir = Some(v);
         });
@@ -1799,6 +1865,7 @@ impl Config {
                     .to_string(),
             ));
         }
+        self.refuse_invalid_admin().map_err(ConfigError::Invalid)?;
         // Ephemeral durability without the explicit opt-in (issue #240, ADR 0029
         // as-delivered): durable ON + no data_dir is quorum-of-RAM — refused rather
         // than warned. Checked last so a config broken in a more specific way is
@@ -1847,6 +1914,114 @@ impl Config {
         }
         Ok(())
     }
+}
+
+impl Config {
+    /// The admin listener's shape (ADR 0081 §1): TLS material and at least one role are
+    /// required when it is on, and it never shares a bind with the unauthenticated health
+    /// or metrics listener.
+    fn refuse_invalid_admin(&self) -> Result<(), String> {
+        let admin = &self.admin;
+        let Some(bind) = &admin.bind else {
+            return Ok(());
+        };
+        for (field, value) in [
+            ("admin.cert (MQTTD_ADMIN_CERT)", &admin.cert),
+            ("admin.key (MQTTD_ADMIN_KEY)", &admin.key),
+            ("admin.client_ca (MQTTD_ADMIN_CLIENT_CA)", &admin.client_ca),
+        ] {
+            if value.is_none() {
+                return Err(format!(
+                    "admin.bind is set but {field} is not: the admin API is TLS with a \
+                     required client certificate, never plaintext"
+                ));
+            }
+        }
+        if admin.viewers.is_empty() && admin.operators.is_empty() {
+            return Err(
+                "admin.bind is set but neither admin.viewers nor admin.operators lists a \
+                 certificate subject: every request would be refused"
+                    .to_string(),
+            );
+        }
+        for other in [&self.listeners.health_bind, &self.listeners.metrics_bind]
+            .into_iter()
+            .flatten()
+        {
+            if other == bind {
+                return Err(format!(
+                    "admin.bind {bind} is also the health/metrics bind: the admin API needs \
+                     its own authenticated listener"
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Config {
+    /// A copy of this config that is safe to print or serve (ADR 0081): every value that can
+    /// carry secret material is replaced by `fingerprint(value)`, so two nodes can still be
+    /// compared ("same key?") without the key itself leaving the process.
+    ///
+    /// Key material normally lives in files (ADR 0046 T5) and paths are not secret, so this
+    /// covers the values that are inline:
+    /// - `cluster.swim.key` and every `cluster.swim.key_accept` entry (raw gossip keys);
+    /// - the credentials and query of every URL setting (`security.http_auth.url`,
+    ///   `security.oidc.issuer`, `observability.otlp_endpoint`): a `user:password@` part
+    ///   and a `?token=…` query are replaced; scheme, host and path stay readable.
+    ///
+    /// The hashing is the caller's (`mqttd` supplies a SHA-256 fingerprint), so this crate
+    /// takes no crypto dependency.
+    #[must_use]
+    pub fn redacted(&self, fingerprint: &dyn Fn(&str) -> String) -> Config {
+        let mut c = self.clone();
+        if let Some(key) = &mut c.cluster.swim.key {
+            *key = fingerprint(key);
+        }
+        for key in &mut c.cluster.swim.key_accept {
+            *key = fingerprint(key);
+        }
+        for url in [
+            &mut c.security.http_auth.url,
+            &mut c.security.oidc.issuer,
+            &mut c.observability.otlp_endpoint,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            *url = redact_url(url, fingerprint);
+        }
+        c
+    }
+}
+
+/// Replace the userinfo (`user:password@`) and the query/fragment of `url` with
+/// fingerprints, leaving scheme, host and path as they were. A value with neither is
+/// returned unchanged.
+fn redact_url(url: &str, fingerprint: &dyn Fn(&str) -> String) -> String {
+    let (scheme, rest) = match url.find("://") {
+        Some(i) => url.split_at(i + 3),
+        None => ("", url),
+    };
+    // Everything from the first `?` or `#` on is fingerprinted as one; the separator that
+    // was found is kept, so a fragment-only URL still reads as a fragment.
+    let (before_query, query) = match rest.find(['?', '#']) {
+        Some(i) => (&rest[..i], Some((&rest[i..=i], &rest[i + 1..]))),
+        None => (rest, None),
+    };
+    let authority_end = before_query.find('/').unwrap_or(before_query.len());
+    let (authority, path) = before_query.split_at(authority_end);
+    let authority = match authority.rfind('@') {
+        Some(i) => format!("{}@{}", fingerprint(&authority[..i]), &authority[i + 1..]),
+        None => authority.to_string(),
+    };
+    let mut out = format!("{scheme}{authority}{path}");
+    if let Some((separator, q)) = query {
+        out.push_str(separator);
+        out.push_str(&fingerprint(q));
+    }
+    out
 }
 
 /// The authoritative `MQTTD_*` environment surface — every variable
@@ -1965,6 +2140,14 @@ pub const ENV_VARS: &[&str] = &[
     "MQTTD_CONFIG_UNKNOWN_KEYS",
     // audit (ADR 0066 T3)
     "MQTTD_AUDIT_SYSLOG",
+    // admin API (ADR 0081)
+    "MQTTD_ADMIN_BIND",
+    "MQTTD_ADMIN_CERT",
+    "MQTTD_ADMIN_KEY",
+    "MQTTD_ADMIN_CLIENT_CA",
+    "MQTTD_ADMIN_VIEWERS",
+    "MQTTD_ADMIN_OPERATORS",
+    "MQTTD_ADMIN_PEER_PORT",
     // backup (ADR 0062)
     "MQTTD_BACKUP_DIR",
     "MQTTD_BACKUP_EVERY",
@@ -1977,6 +2160,64 @@ pub const ENV_VARS: &[&str] = &[
 #[cfg(test)]
 mod tests {
     use super::{Config, ENV_VARS};
+
+    /// ADR 0081 T11: a config with every inline secret set serializes with none of them —
+    /// only their fingerprints — while the non-secret parts of each URL stay readable.
+    #[test]
+    fn redacted_config_prints_no_secret() {
+        let mut c = Config::default();
+        c.cluster.swim.key = Some("a1".repeat(32));
+        c.cluster.swim.key_accept = vec!["b2".repeat(32), "c3".repeat(32)];
+        c.security.http_auth.url =
+            Some("https://hookuser:hookpass@auth.example:8443/check?token=hooktoken".into());
+        c.security.oidc.issuer = Some("https://idp.example/realms/r?secret=oidcsecret".into());
+        c.observability.otlp_endpoint = Some("http://otlpuser:otlppass@collector:4318".into());
+        let fp = |s: &str| format!("fp({})", s.len());
+        let out = toml::to_string(&c.redacted(&fp)).expect("serializes");
+        // The failure messages name a fixture by position, never by value: an assertion
+        // that echoed a fixture would itself be a secret written to the test log.
+        let fixtures = [
+            "a1a1",
+            "b2b2",
+            "c3c3",
+            "hookuser",
+            "hookpass",
+            "hooktoken",
+            "oidcsecret",
+            "otlpuser",
+            "otlppass",
+        ];
+        for (i, fixture) in fixtures.iter().enumerate() {
+            assert!(!out.contains(fixture), "fixture #{i} survived redaction");
+        }
+        for (i, readable) in [
+            "auth.example:8443/check",
+            "idp.example/realms/r",
+            "collector:4318",
+        ]
+        .iter()
+        .enumerate()
+        {
+            assert!(out.contains(readable), "readable part #{i} was lost");
+        }
+        // Values with nothing secret in them pass through untouched.
+        c.security.http_auth.url = Some("https://auth.example/check".into());
+        assert_eq!(
+            c.redacted(&fp).security.http_auth.url.as_deref(),
+            Some("https://auth.example/check")
+        );
+        // A fragment-only URL keeps its `#`: the separator that was found is re-emitted.
+        c.security.oidc.issuer = Some("https://idp.example/realms/r#frag".into());
+        assert_eq!(
+            c.redacted(&fp).security.oidc.issuer.as_deref(),
+            Some("https://idp.example/realms/r#fp(4)")
+        );
+        c.security.oidc.issuer = Some("https://idp.example/realms/r?q=1".into());
+        assert_eq!(
+            c.redacted(&fp).security.oidc.issuer.as_deref(),
+            Some("https://idp.example/realms/r?fp(3)")
+        );
+    }
 
     #[test]
     fn defaults_are_secure() {
@@ -2693,7 +2934,8 @@ mod tests {
             | "MQTTD_OIDC_JWKS_REFRESH"
             | "MQTTD_OIDC_MAX_STALE"
             | "MQTTD_BACKUP_EVERY"
-            | "MQTTD_TLS_SESSION_CACHE" => "7",
+            | "MQTTD_TLS_SESSION_CACHE"
+            | "MQTTD_ADMIN_PEER_PORT" => "7",
             // The default is already 7 (backup.keep) / 300 (restore timeout), so "7" would
             // change nothing and the totality sweep would read as a missing mapping.
             "MQTTD_BACKUP_KEEP" | "MQTTD_RESTORE_TIMEOUT" => "3",
@@ -2837,9 +3079,10 @@ mod tests {
             // plus MQTTD_SHARED_LOCAL_BIAS (issue #613 item 3.4: the locality dial
             // that turns MQTTD_SHARED_PREFER_LOCAL's on/off into a fraction),
             // plus MQTTD_REQUIRE_PASSWORD_WITH_CERTIFICATE (issue #670),
-            // plus the five MQTTD_<LISTENER>_ALLOW_ANONYMOUS overrides (issue #669).
+            // plus the five MQTTD_<LISTENER>_ALLOW_ANONYMOUS overrides (issue #669),
             // plus MQTTD_REPLICAS (ADR 0080),
-            102,
+            // plus the seven MQTTD_ADMIN_* variables (ADR 0081).
+            109,
             "the MQTTD_* surface changed — update ENV_VARS"
         );
         // Issue #239: MQTTD_MIN_REPLICAS was wired in `overlay_from` but never
@@ -2896,6 +3139,36 @@ mod tests {
     /// clustered ABOVE it is refused, because there the broker would deliver to
     /// local subscribers and silently drop the peer frame, which presents as a
     /// consistency bug rather than a limit.
+    /// ADR 0081 §1: the admin listener is TLS with a client certificate and at least one
+    /// role, on its own bind — each missing piece is refused, and off stays valid.
+    #[test]
+    fn the_admin_listener_needs_tls_a_role_and_its_own_bind() {
+        let mut c = Config::default();
+        c.node.data_dir = Some("/var/lib/mqttd".into());
+        assert!(c.validate().is_ok(), "no admin.bind = no admin API, valid");
+        c.admin.bind = Some("0.0.0.0:9443".into());
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("admin.cert"), "{err}");
+        c.admin.cert = Some("cert.pem".into());
+        c.admin.key = Some("key.pem".into());
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("admin.client_ca"), "{err}");
+        c.admin.client_ca = Some("ca.pem".into());
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("admin.viewers"), "{err}");
+        c.admin.operators = vec!["CN=root".into()];
+        assert!(c.validate().is_ok());
+        c.listeners.health_bind = Some("0.0.0.0:9443".into());
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("health/metrics bind"), "{err}");
+
+        // `;` separates subjects, because a subject contains commas.
+        let mut c = Config::default();
+        c.overlay_from(getter(&[("MQTTD_ADMIN_VIEWERS", "CN=a, O=x ; CN=b")]))
+            .unwrap();
+        assert_eq!(c.admin.viewers, vec!["CN=a, O=x", "CN=b"]);
+    }
+
     #[test]
     fn a_clustered_node_refuses_a_packet_size_it_cannot_forward() {
         const OVER: u64 = 32 * 1024 * 1024;

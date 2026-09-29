@@ -184,12 +184,30 @@ id, never a credential.
 
 ### Design posture
 
-There is **no HTTP admin API, no dashboard, no rule engine** — deliberate absences,
-each a rejected authenticated network surface (ADR 0033/0051). The admin surface is
-signals and files: SIGHUP reload, SIGUSR1 decommission, SIGUSR2 backup, SIGTERM
-drain. The HTTP surface is strictly read-only GET/HEAD (`/livez`, `/readyz`,
-`/statusz`, `/metrics`), hand-rolled, carrying no secret material, on an
-ops-network trust model (ADR 0020, 0054).
+There is **no dashboard and no rule engine**, and **configuration is never written
+over the network** (ADR 0033/0051, kept by ADR 0081 §5): the file stays the only source.
+The lifecycle surface is signals and files: SIGHUP reload, SIGUSR1 decommission, SIGUSR2
+backup, SIGTERM drain. The unauthenticated HTTP surface is strictly read-only GET/HEAD
+(`/livez`, `/readyz`, `/statusz`, `/metrics`), hand-rolled, carrying no secret material,
+on an ops-network trust model (ADR 0020, 0054).
+
+The **admin API** (ADR 0081) is a separate, **authenticated** listener, off unless
+`admin.bind` is set. It serves what `/statusz` must not (client and session detail) and a
+short, fixed list of audited actions:
+
+| Threat | Mitigation | Where |
+|---|---|---|
+| Spoofed admin caller | TLS 1.3 with a **required** client certificate from `admin.client_ca` (or the cluster CA); no plaintext mode, no anonymous access; resumption off, so every connection is fully verified | ADR 0081 §1; `mqtt-net/src/tls.rs` `admin_acceptor` |
+| Elevation (viewer → operator, cert → any role) | Roles only from the verified subject matched against the live `admin.viewers` / `admin.operators`; a subject in neither is refused; every endpoint declares its least role | ADR 0081 §1; `mqttd/src/admin/roles.rs`, `routes.rs` |
+| A node certificate used as an admin credential | A cluster-CA certificate in no list gets only the `peer` role (this node's own state), checked by re-verifying the chain against the cluster CA alone, not by subject | ADR 0081 §2; `ChainCheck` |
+| Repudiation / disclosure of identifying data | Every request, reads included, is audited (`admin.request`: subject, role, method, target, status) into the hash-chained log | ADR 0081 §1; `mqttd/src/admin/mod.rs` |
+| An admin reload as a config-injection path | `POST /admin/v1/reload` takes no input: it runs the same validate-before-swap reload as `SIGHUP` over the config file; operator role only; serialized with the other triggers; audited twice (`admin.request`, `security.reload trigger=admin`) | ADR 0081 §4/§5; `mqttd/src/admin/config.rs`, `reload.rs` |
+| Secrets through `GET /admin/v1/config` | Served from `Config::redacted`: gossip keys and URL credentials/queries become `sha256:` fingerprints; key material is in files (paths only) | ADR 0081 T6, T11; `mqttd/src/config_view.rs` |
+| A forged or replayed forwarded action | Only the `peer` role may forward, only to `kick`/`purge`, and only with the `forwarded_for` marker; `peer` is granted by re-verifying the chain against the cluster CA; the receiving node never forwards again; both nodes audit (the owner's record names the peer and the operator) | ADR 0081 §4; `mqttd/src/admin/actions.rs`, `routes.rs` |
+| Mistaken purge (data loss by operator error) | Operator role only; one client id per request (no wildcards, no bulk); audited; `kick` is the non-destructive option | ADR 0081 §4 |
+| Amplification through the cluster view | One viewer request fans out to one `/admin/v1/node` call per member, each with a 3 s deadline, all within the 30 s handler deadline; the `peer` role cannot itself fan out, so fan-out never recurses | ADR 0081 §2 amendment; `mqttd/src/admin/cluster.rs` |
+| Denial of service via the admin port | One request per connection, 10 s to send it, 16 KiB head / 64 KiB body caps, 32 concurrent connections, a 30 s handler deadline, paged lists | `mqttd/src/admin/http.rs`, `mod.rs` |
+| Admin detail on the ops network | Never on the health/metrics listener: `Config::validate` refuses an `admin.bind` equal to either | ADR 0081 §1; `mqtt-config` |
 
 | Threat | Mitigation | Where |
 |---|---|---|
@@ -201,8 +219,13 @@ ops-network trust model (ADR 0020, 0054).
 ### Accepted risks (control plane)
 
 - **The operator is trusted.** Signals-and-files means anyone with process/file
-  access is the operator; there is no in-broker RBAC for admin verbs. Host and
-  orchestrator access control is the boundary.
+  access is the operator; the only in-broker RBAC is the admin API's two roles. Host and
+  orchestrator access control is the boundary for everything else.
+- **Admin credentials are as strong as their CA.** Whoever can mint a certificate from
+  `admin.client_ca` with a listed subject holds that role; the admin listener's
+  certificate, key and CA are restart-scoped (the role lists hot-reload). An admitted
+  cluster node can read any node's state through the `peer` role, consistent with the
+  peer-bus trust model above.
 - **Metrics/health are unauthenticated by design** on the ops network; they carry
   no secrets, but topology and load are visible to anyone who can reach the port.
   (ADR 0020 §2.)

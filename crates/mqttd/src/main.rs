@@ -177,13 +177,19 @@
 //! destination configured the signal logs that fact and the broker keeps serving.
 //!
 //! Subcommands (each validates + exits, binding nothing): `--check-config [--config <path>]`
-//! (ADR 0046 T3) validates the effective config; **`--decommission [--pid <n>] [--timeout <secs>]`**
+//! (ADR 0046 T3) validates the effective config; `--print-config [--config <path>]` (ADR 0081
+//! T11) prints it as TOML with every secret fingerprinted; `--check-tls [--config <path>]`
+//! (ADR 0081 T12) checks every configured certificate, key, CA bundle and CRL — loads, key
+//! match, chain order, expiry, names — and exits non-zero on any failure;
+//! **`--decommission [--pid <n>] [--timeout <secs>]`**
 //! (ADR 0047 T4) sends `SIGUSR1` to the running broker (`--pid`, default 1 — the container
 //! entrypoint) to begin the decommission drain and **blocks until it exits**, so a Kubernetes
 //! `preStop` holds the pod open for the whole drain even though the distroless image has no shell.
 //! **`--backup [--pid <n>] [--timeout <secs>]`** (ADR 0062) sends `SIGUSR2` to the running broker
 //! and waits for a new export file to appear under the configured `[backup] dir`, so a cron job or
 //! a `kubectl exec` can take a backup on an image with no shell.
+//! **`--admin <verb> [args]`** (ADR 0081) calls a running broker's authenticated admin API
+//! over mTLS and prints the answer; `mqttd --admin help` lists the verbs.
 
 /// The process allocator (ADR 0079). The shipped binary is static musl, whose
 /// `malloc` serializes concurrent allocation: with the tokio workers allocating
@@ -231,6 +237,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // single provider compiled into the build this is belt-and-braces determinism — no
     // binary or test can silently resolve a different stack.
     let _ = tokio_rustls::rustls::crypto::aws_lc_rs::default_provider().install_default();
+    // `--admin <verb>` (ADR 0081 §3): a client of a running broker's admin API. First, so
+    // `--admin … --help` is the admin help, and before logging: its output is the answer.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(rest) = args.strip_prefix(&["--admin".to_string()]) {
+        std::process::exit(mqttd::admin::cli::run(rest).await);
+    }
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
@@ -258,6 +270,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // before any resource is acquired.
     if std::env::args().skip(1).any(|a| a == "--check-config") {
         check_config();
+    }
+    // ADR 0081 T11/T12: offline like `--check-config` — print the effective config with
+    // secrets fingerprinted, or check every configured TLS material set, and exit.
+    if std::env::args().skip(1).any(|a| a == "--print-config") {
+        print_config();
+    }
+    if std::env::args().skip(1).any(|a| a == "--check-tls") {
+        check_tls();
     }
 
     // `--hash-password [<username>]` prints an Argon2id password-file line and exits.
@@ -645,7 +665,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // handle to stop openraft cleanly on shutdown.
     let plane_for_shutdown = durable_plane.clone();
     let startup_complete = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let (draining, decommission_slot) = start_health(
+    let (draining, decommission_slot, health_state) = start_health(
         &config,
         &hub_tx,
         &placement,
@@ -697,6 +717,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         metrics.clone(),
     )?;
     let audit_for_shutdown = policy.audit.clone();
+    let audit_for_admin = policy.audit.clone();
+    let admin_authz = policy.authz.clone();
+    let admin_sessions = mqttd::admin::sessions::SessionAccess {
+        hub: hub_tx.clone(),
+        store: store.clone(),
+        placement: Some(placement_for_backup.clone()),
+    };
     reloader.attach_config_stamp(config_stamp.clone());
 
     // Fold the cluster-bus gossip CRL (ADR 0022 T7) into the same validate-before-swap
@@ -811,7 +838,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             path: config_path()?,
             precheck: Box::new(runtime_precheck),
             apply: Box::new(move |old, new| {
-                apply_live_config(old, new, &hub_for_apply, &audit_for_apply);
+                apply_live_config(old, new, &hub_for_apply, &audit_for_apply)
             }),
         });
     }
@@ -1004,11 +1031,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // SIGHUP reloads the security policy (ACL + authenticator + TLS material) in place
     // (ADR 0032) — no restart, no dropped connections; a bad file keeps the running policy.
     spawn_reload_handler(reloader.clone());
+    let reloader_for_admin = reloader.clone();
 
     // Optional filesystem watcher (ADR 0033): MQTTD_CONFIG_WATCH=<seconds> auto-reloads when a
     // configured policy file changes on disk (the Kubernetes ConfigMap case), through the same
     // fail-safe reload. Off by default — signal-driven reload stays the default.
     spawn_config_watcher(&config, reloader, &shutdown);
+
+    // The authenticated admin API (ADR 0081), when `admin.bind` is set. After the client
+    // listeners, like them: it reports a node that is actually serving.
+    start_admin(
+        &config,
+        &node_id,
+        health_state,
+        &live_config,
+        audit_for_admin,
+        admin_sessions,
+        admin_authz,
+        mqttd::admin::config::ReloadAccess {
+            reloader: reloader_for_admin,
+            stamp: config_stamp.clone(),
+        },
+    )
+    .await?;
 
     // Run until a shutdown signal, then drain gracefully (ADR 0019).
     graceful_shutdown(
@@ -2409,19 +2454,12 @@ async fn start_health(
     (
         Arc<std::sync::atomic::AtomicBool>,
         Arc<std::sync::OnceLock<Arc<mqtt_cluster::decommission::DrainStatus>>>,
+        mqttd::health::HealthState,
     ),
     Box<dyn std::error::Error>,
 > {
     let health_bind = config.listeners.health_bind.clone();
     let metrics_bind = config.listeners.metrics_bind.clone();
-    if health_bind.is_none() && metrics_bind.is_none() {
-        // Neither server: hand back standalone handles so the caller's shutdown
-        // path is uniform (nothing reads them).
-        return Ok((
-            Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            Arc::new(std::sync::OnceLock::new()),
-        ));
-    }
     // `validate()` guarantees ready_min_members ≥ 1.
     let min_members = config.runtime.ready_min_members;
     // One state serves both binds: health endpoints plus `/metrics` (ADR 0020).
@@ -2465,6 +2503,8 @@ async fn start_health(
         Some(flag) => state.with_swim_isolated(flag),
         None => state,
     };
+    // The state is built even with neither server bound: the admin API (ADR 0081)
+    // answers `/admin/v1/node` from it, and the caller's shutdown path reads its handles.
     let draining = state.draining_handle();
     let decommission = state.decommission_slot();
     if let Some(bind) = &health_bind {
@@ -2477,10 +2517,92 @@ async fn start_health(
         if Some(bind) != health_bind.as_ref() {
             let listener = TcpListener::bind(bind).await?;
             info!(%bind, "serving /metrics on a separate bind (ADR 0020)");
-            tokio::spawn(mqttd::health::serve(listener, state));
+            tokio::spawn(mqttd::health::serve(listener, state.clone()));
         }
     }
-    Ok((draining, decommission))
+    Ok((draining, decommission, state))
+}
+
+/// Start the admin API listener (ADR 0081) when `admin.bind` is set; a no-op otherwise.
+/// Its TLS trusts the admin client CA and, on a cluster node, the cluster CA — the latter
+/// only so peers can read each other's state (the `peer` role).
+#[allow(clippy::too_many_arguments)] // a wiring seam: one call site, named handles
+async fn start_admin(
+    config: &Config,
+    node_id: &NodeId,
+    health: mqttd::health::HealthState,
+    live_config: &Arc<RwLock<Config>>,
+    audit: Arc<dyn mqtt_observability::AuditSink>,
+    sessions: mqttd::admin::sessions::SessionAccess,
+    authz: mqttd::admin::authz::LiveAuthorizer,
+    reload: mqttd::admin::config::ReloadAccess,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let admin = &config.admin;
+    let Some(bind) = &admin.bind else {
+        return Ok(());
+    };
+    // `Config::validate` refuses a bind without these; this is the same refusal, typed.
+    let (Some(cert), Some(key), Some(client_ca)) = (&admin.cert, &admin.key, &admin.client_ca)
+    else {
+        return Err("admin.bind needs admin.cert, admin.key and admin.client_ca".into());
+    };
+    let cluster_ca = config.cluster.peer_tls.ca.as_deref().map(Path::new);
+    let same_file = |a: &Path, b: &Path| match (a.canonicalize(), b.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    };
+    if cluster_ca.is_some_and(|ca| same_file(ca, Path::new(client_ca))) {
+        warn!(
+            "admin.client_ca is the cluster CA: every certificate it issued that is in no \
+             admin role list is admitted as the read-only peer role instead of refused. Use a \
+             dedicated admin CA (HARDENING H-7.7)"
+        );
+    }
+    let mut cas = vec![Path::new(client_ca)];
+    cas.extend(cluster_ca);
+    let acceptor = tls::admin_acceptor(Path::new(cert), Path::new(key), &cas)?;
+    let mut state =
+        mqttd::admin::AdminState::new(node_id.0.clone(), health, live_config.clone(), audit)
+            .with_sessions(sessions)
+            .with_authorizer(authz)
+            .with_reload(reload);
+    if let Some(ca) = cluster_ca {
+        state = state.with_cluster_ca(tls::ChainCheck::new(ca)?);
+    }
+    // The cluster view (ADR 0081 §2): ask peers' admin listeners, presenting this node's
+    // cluster certificate (admitted there as the `peer` role), trusting whichever of the
+    // admin or cluster CA issued their server certificates.
+    let peer_tls = &config.cluster.peer_tls;
+    if let (Some(ca), Some(node_cert), Some(node_key)) =
+        (&peer_tls.ca, &peer_tls.cert, &peer_tls.key)
+    {
+        let port = match admin.peer_port {
+            Some(port) => port,
+            None => bind
+                .rsplit_once(':')
+                .and_then(|(_, p)| p.parse().ok())
+                .ok_or_else(|| format!("admin.bind {bind} has no port"))?,
+        };
+        let connector = tls::client_connector_multi(
+            &[Path::new(client_ca), Path::new(ca)],
+            Path::new(node_cert),
+            Path::new(node_key),
+        )?;
+        state = state.with_peers(mqttd::admin::cluster::PeerAccess::new(
+            connector,
+            mqttd::admin::cluster::PeerAccess::same_host(port),
+        ));
+    }
+    let listener = TcpListener::bind(bind).await?;
+    info!(
+        %bind,
+        viewers = admin.viewers.len(),
+        operators = admin.operators.len(),
+        peers = cluster_ca.is_some(),
+        "serving the admin API (mTLS; ADR 0081)"
+    );
+    tokio::spawn(mqttd::admin::serve(listener, acceptor, state));
+    Ok(())
 }
 
 fn queue_limits_from_config(config: &Config) -> Result<QueueLimits, Box<dyn std::error::Error>> {
@@ -3747,6 +3869,9 @@ fn requires_restart(old: &Config, new: &Config) -> Vec<&'static str> {
         c.limits.max_subscriptions_per_client = None;
         c.limits.max_retained_messages = None;
         c.limits.max_sessions = None;
+        // The admin role lists are read from the live config per request (ADR 0081 §1).
+        c.admin.viewers = Vec::new();
+        c.admin.operators = Vec::new();
         c
     };
     let (o, n) = (mask(old), mask(new));
@@ -3783,6 +3908,10 @@ fn requires_restart(old: &Config, new: &Config) -> Vec<&'static str> {
     if o.backup != n.backup {
         changed.push("backup");
     }
+    // The admin listener's bind and TLS material are bound at startup (ADR 0081).
+    if o.admin != n.admin {
+        changed.push("admin");
+    }
     changed
 }
 
@@ -3795,7 +3924,7 @@ fn apply_live_config(
     new: &Config,
     hub: &mpsc::UnboundedSender<hub::HubCommand>,
     audit: &Arc<dyn AuditSink>,
-) {
+) -> Vec<String> {
     // Quotas are live: push the new set (idempotent when unchanged). precheck guaranteed they
     // build, so this does not error.
     if let Ok(quotas) = quotas_from_config(new) {
@@ -3815,6 +3944,7 @@ fn apply_live_config(
             &format!("requires-restart sections: {sections}"),
         );
     }
+    restart.into_iter().map(String::from).collect()
 }
 
 /// Resolve the config-file path (`--config <path>` / `--config=<path>`, else `MQTTD_CONFIG`)
@@ -3850,6 +3980,8 @@ fn load_config() -> Result<Config, Box<dyn std::error::Error>> {
 const KNOWN_FLAGS: &[&str] = &[
     "--check-config",
     "--preflight",
+    "--print-config",
+    "--check-tls",
     "--config",
     "--hash-password",
     "--probe",
@@ -3876,6 +4008,10 @@ fn unknown_flags<I: IntoIterator<Item = String>>(args: I) -> Vec<String> {
 /// network or process signals are touched here. Values must follow their option;
 /// positional arguments are allowed only immediately after hash/probe commands.
 fn validate_cli(args: &[String]) -> Result<(), String> {
+    // `--admin <verb> …` (ADR 0081) owns everything after it; its own validator applies.
+    if let Some(rest) = args.strip_prefix(&["--admin".to_string()]) {
+        return mqttd::admin::cli::validate(rest);
+    }
     let unknown = unknown_flags(args.iter().cloned());
     if !unknown.is_empty() {
         return Err(format!("unrecognised argument(s): {}", unknown.join(", ")));
@@ -3903,8 +4039,8 @@ fn validate_cli(args: &[String]) -> Result<(), String> {
                     return Err("repeated option: --preflight".to_string());
                 }
             }
-            "--check-config" | "--hash-password" | "--probe" | "--decommission" | "--backup"
-            | "--version" | "-V" | "--help" | "-h" => {
+            "--check-config" | "--print-config" | "--check-tls" | "--hash-password" | "--probe"
+            | "--decommission" | "--backup" | "--version" | "-V" | "--help" | "-h" => {
                 if let Some(previous) = mode.replace(arg) {
                     return Err(format!("choose one command, not {previous} and {arg}"));
                 }
@@ -3927,7 +4063,15 @@ fn validate_cli(args: &[String]) -> Result<(), String> {
     }
     for option in options {
         let allowed = match option {
-            "--config" => matches!(mode, "start" | "--check-config" | "--probe" | "--backup"),
+            "--config" => matches!(
+                mode,
+                "start"
+                    | "--check-config"
+                    | "--print-config"
+                    | "--check-tls"
+                    | "--probe"
+                    | "--backup"
+            ),
             "--url" => mode == "--probe",
             "--pid" | "--timeout" => matches!(mode, "--decommission" | "--backup"),
             _ => unreachable!("only value options enter this set"),
@@ -3966,14 +4110,18 @@ fn print_usage() {
            mqttd --check-config --preflight\n  \
                                      ...and this host: open every referenced file as the\n  \
                                      current user, resolve every bind\n  \
+           mqttd --print-config      print the effective config (secrets fingerprinted)\n  \
+           mqttd --check-tls         check every configured certificate, key, CA and CRL\n  \
            mqttd --hash-password [u] print an Argon2id password-file line and exit\n  \
            mqttd --probe [/readyz]   query the running broker's health endpoint and exit\n  \
            mqttd --decommission      drain and gracefully stop the running broker\n  \
            mqttd --backup            take an online backup on the running broker and wait\n  \
+           mqttd --admin <verb>      call a running broker's admin API (mqttd --admin help)\n  \
            mqttd --version           print the version and exit\n  \
            mqttd --help              print this help and exit\n\n\
          OPTIONS:\n  \
-           --config <path>          config for startup, --check-config, --probe or --backup\n  \
+           --config <path>          config for startup, --check-config, --print-config,\n  \
+                                    --check-tls, --probe or --backup\n  \
            --url <host:port>        explicit endpoint for --probe\n  \
            --pid <n>                target process for --decommission or --backup\n  \
            --timeout <secs>         deadline for --decommission or --backup\n\n\
@@ -4014,6 +4162,71 @@ fn check_config() -> ! {
             std::process::exit(1);
         }
     }
+}
+
+/// Load the config the broker would boot with, for the offline commands that read it
+/// (ADR 0081 T11/T12). Exits `2` on a usage error and `1` on an invalid config, with the
+/// same messages as `--check-config`.
+fn load_config_or_exit() -> Config {
+    let path = match config_path() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::exit(2);
+        }
+    };
+    match Config::load(path.as_deref()) {
+        Ok(c) => c,
+        Err(error) => {
+            match path {
+                Some(p) => eprintln!("config INVALID ({}): {error}", p.display()),
+                None => eprintln!("config INVALID: {error}"),
+            }
+            std::process::exit(1);
+        }
+    }
+}
+
+/// `mqttd --print-config [--config <path>]` (ADR 0081 T11): print the effective config —
+/// defaults < file < `MQTTD_*` env, validated exactly as at boot — as TOML, with every
+/// secret replaced by its fingerprint, and exit. Binds nothing.
+fn print_config() -> ! {
+    let config = load_config_or_exit();
+    for key in &config.ignored_keys {
+        eprintln!("warning: config key IGNORED (runtime.config_unknown_keys = \"warn\"): {key}");
+    }
+    match mqttd::config_view::redacted_toml(&config) {
+        Ok(toml) => {
+            print!("{toml}");
+            std::process::exit(0);
+        }
+        Err(e) => {
+            eprintln!("error: cannot render the config: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// `mqttd --check-tls [--config <path>]` (ADR 0081 T12): check every TLS material set the
+/// config names — files load, key matches, chain order, validity window, names, CA
+/// bundle, CRL — one line per check, and exit `1` if any check failed.
+fn check_tls() -> ! {
+    let config = load_config_or_exit();
+    let findings = mqttd::tls_check::check_config(&config, std::time::SystemTime::now());
+    for f in &findings {
+        println!("{f}");
+    }
+    let count = |level| findings.iter().filter(|f| f.level == level).count();
+    let (failed, warned) = (
+        count(mqttd::tls_check::Level::Fail),
+        count(mqttd::tls_check::Level::Warn),
+    );
+    if failed > 0 {
+        println!("TLS check FAILED: {failed} failure(s), {warned} warning(s)");
+        std::process::exit(1);
+    }
+    println!("TLS check OK: {warned} warning(s)");
+    std::process::exit(0);
 }
 
 /// `mqttd --probe [/readyz|/livez] [--url <host:port>]`: ask this node's own health
@@ -4600,20 +4813,13 @@ fn config_path() -> Result<Option<std::path::PathBuf>, Box<dyn std::error::Error
         .map(std::path::PathBuf::from))
 }
 
-/// Log the effective configuration at startup (ADR 0046 T2) with secret material redacted: the
-/// inline gossip keys (`swim.key`, `swim.key_accept`) and the inline JWT HS256 secret never
-/// reach the logs. File *paths* are safe to log and are retained for operability.
+/// Log the effective configuration at startup (ADR 0046 T2) with secret material replaced by
+/// fingerprints: the inline gossip keys (`swim.key`, `swim.key_accept`) and URL credentials
+/// never reach the logs. File *paths* are safe to log and are retained for operability.
 fn log_effective_config(config: &Config) {
-    let mut redacted = config.clone();
-    if redacted.cluster.swim.key.is_some() {
-        redacted.cluster.swim.key = Some("<redacted>".to_string());
-    }
-    if !redacted.cluster.swim.key_accept.is_empty() {
-        let n = redacted.cluster.swim.key_accept.len();
-        redacted.cluster.swim.key_accept = vec![format!("<{n} key(s) redacted>")];
-    }
-    // Every other secret is now referenced by path (ADR 0046 T5) — paths are safe to log; only
-    // the inline gossip key(s) above are raw secrets. The HS256 secret is a file path.
+    // The same redaction `--print-config` and the admin API use (ADR 0081), so the log
+    // cannot show a secret they hide — URL credentials included.
+    let redacted = mqttd::config_view::redacted(config);
     info!(config = ?redacted, "effective configuration (ADR 0046; secrets redacted)");
 }
 
@@ -4957,6 +5163,9 @@ mod tests {
             vec!["--probe", "/livez", "--url", "127.0.0.1:8080"],
             vec!["--url", "127.0.0.1:8080", "--probe", "/readyz"],
             vec!["--probe", "--config", "broker.toml"],
+            vec!["--print-config"],
+            vec!["--print-config", "--config", "broker.toml"],
+            vec!["--config", "broker.toml", "--check-tls"],
             vec!["--decommission", "--pid", "123", "--timeout", "10"],
             vec![
                 "--backup",
@@ -4967,6 +5176,15 @@ mod tests {
                 "--timeout",
                 "10",
             ],
+            vec!["--admin", "node"],
+            vec![
+                "--admin",
+                "whoami",
+                "--json",
+                "--url",
+                "https://127.0.0.1:9443",
+            ],
+            vec!["--admin", "help"],
         ] {
             let values: Vec<_> = args.iter().map(ToString::to_string).collect();
             assert!(
@@ -5000,6 +5218,10 @@ mod tests {
             vec!["--check-config", "--decommission"],
             vec!["--backup", "--decommission"],
             vec!["--check-config", "--check-config"],
+            vec!["--print-config", "--check-tls"],
+            vec!["--print-config", "stray"],
+            vec!["--check-tls", "--pid", "123"],
+            vec!["--check-tls", "--preflight"],
             vec!["--preflight"],
             vec!["--preflight", "--config", "broker.toml"],
             vec!["--check-config", "--preflight", "--preflight"],
@@ -5009,6 +5231,13 @@ mod tests {
             vec!["--version", "--backup"],
             vec!["--help", "--version"],
             vec!["--help", "stray"],
+            vec!["--admin"],
+            vec!["--admin", "nope"],
+            vec!["--admin", "node", "stray"],
+            vec!["--admin", "node", "--pid", "1"],
+            // `--admin` is the command word: it must come first.
+            vec!["node", "--admin"],
+            vec!["--probe", "--admin", "node"],
         ] {
             let values: Vec<_> = args.iter().map(ToString::to_string).collect();
             assert!(
@@ -5148,9 +5377,11 @@ mod tests {
         live.security.acl_file = Some("/etc/acl.toml".into());
         live.security.require_password_with_certificate = true;
         live.limits.max_sessions = Some(1000);
+        live.admin.viewers = vec!["CN=oncall".into()];
+        live.admin.operators = vec!["CN=root".into()];
         assert!(
             requires_restart(&base, &live).is_empty(),
-            "quotas / allow_anonymous / ACL path / both-factors are live"
+            "quotas / allow_anonymous / ACL path / both-factors / admin roles are live"
         );
 
         // Non-live edits DO require a restart, reported by section.
@@ -5158,7 +5389,9 @@ mod tests {
         restart.listeners.tls_bind = Some("0.0.0.0:8883".into());
         restart.cluster.peer_bind = Some("127.0.0.1:7001".into());
         restart.durable.lease_voters = 7;
+        restart.admin.bind = Some("0.0.0.0:9443".into());
         let sections = requires_restart(&base, &restart);
+        assert!(sections.contains(&"admin"));
         assert!(sections.contains(&"listeners"));
         assert!(sections.contains(&"cluster"));
         assert!(sections.contains(&"durable"));

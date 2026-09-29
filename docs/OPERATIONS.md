@@ -4,8 +4,10 @@
 encodes the deployment contracts: StatefulSet with per-pod volumes, decommission-drain
 on scale-down, one-at-a-time rolls, a PodDisruptionBudget, and `--check-config` before
 serving. This page is the rest: the procedures an operator runs *after* day 1. Signals
-and files are the control surface — there is deliberately no admin API
-([GUIDE](../GUIDE.md#principles)).
+and files are the control surface, and configuration is only ever changed through the file
+([GUIDE](../GUIDE.md#principles)). The optional, authenticated
+[admin API](#the-admin-api-adr-0081) answers questions about the running cluster and runs a
+short list of audited actions; it never writes configuration.
 
 ## Certificate / ACL / CRL rotation — automatic
 
@@ -23,6 +25,21 @@ stops its flow).
 **Verify:** `mqttd_security_reloads_total{trigger="watch"}` increments; the reload is
 audit-logged. A malformed file is rejected and the running policy kept — fix the file
 and the watcher retries on the next poll.
+
+**Check the material before (and after) it lands:** `mqttd --check-tls [--config <path>]`
+reads every certificate, key, CA bundle and CRL the config names — `[tls]` and
+`[cluster.peer_tls]` — and prints one `[ ok ]` / `[warn]` / `[FAIL]` line per check: files
+load, the key matches its certificate, the chain file is in order (leaf first, each
+certificate issued by the next), each certificate's validity window (expired or not yet
+valid fails; under 30 days left warns), the leaf's CN and SANs, a non-empty CA bundle, and
+a CRL that parses and is not past its `nextUpdate`. It binds nothing and exits `1` on any
+failure, so it works as a CI gate, a cron job, or a `kubectl exec` on the distroless image.
+
+**See what the node actually runs:** `mqttd --print-config [--config <path>]` prints the
+effective config — defaults, file and `MQTTD_*` env merged and validated exactly as at
+boot — as TOML. Inline secrets (the gossip keys, credentials and query strings in URL
+settings) are replaced by `sha256:<16 hex>` fingerprints, the same truncation `/statusz`
+uses for key fingerprints, so two nodes can be compared without the secret being printed.
 
 **Trust note (audit #203):** because revocation sweeps live state, *write access to the
 mounted CRL file is the power to evict any mTLS client* — an attacker (or a bad
@@ -775,6 +792,161 @@ snapshots; restore by recreating the StatefulSet over the restored PVs with the 
 names. The cost is the reason it is no longer the only path: stopping a node means a full
 decommission drain, whose measured per-pod cost is issue #248's, and during it the cluster
 runs one replica short. Use it deliberately, not as routine DR.
+
+## The admin API (ADR 0081)
+
+An authenticated HTTPS listener for questions `/statusz` cannot answer and for a short
+list of audited actions. It is **off unless `admin.bind` is set**, and it is never the
+health or metrics listener.
+
+```toml
+[admin]
+bind = "0.0.0.0:9443"
+cert = "/etc/mqttd/admin/server.pem"      # server certificate for this listener
+key = "/etc/mqttd/admin/server.key"
+client_ca = "/etc/mqttd/admin/ca.pem"     # issues admin client certificates
+viewers = ["CN=oncall"]                   # every read
+operators = ["CN=sre-lead, O=example"]    # reads + actions
+```
+
+- **Who may call.** Every request presents a client certificate from `client_ca`. Its
+  subject is matched against `viewers` and `operators`: an entry is the whole subject
+  (`CN=sre-lead, O=example`) or `CN=<name>` for any subject with that Common Name. A
+  subject in neither list gets `403 forbidden`. The lists hot-reload with the rest of the
+  config; the listener's bind, certificate, key and CA are restart-scoped (a reload that
+  changes them logs `admin` among the requires-restart sections). On a cluster node the
+  cluster CA is trusted too, and a node certificate that is in no list gets the `peer` role,
+  which can read only the node's own state (so any node can answer for the cluster). Use a
+  dedicated admin CA for `client_ca`: if it is the cluster CA, every unlisted certificate it
+  issued is admitted as `peer` instead of refused.
+- **Audit.** Every request, reads included, is one `admin.request` record:
+  `role=viewer GET /admin/v1/node -> 200`, with the certificate subject.
+- **Errors.** `{"error":{"code":"forbidden","message":"…"}}`; scripts match on `code`
+  (`forbidden`, `not-found`, `method-not-allowed`, `bad-request`, `too-large`, `timeout`).
+
+`mqttd --admin <verb>` is the client, in the same binary, so it works in the distroless
+image (`kubectl exec <pod> -- mqttd --admin node`):
+
+```sh
+export MQTTD_ADMIN_URL=https://mqttd-0.mqttd:9443
+export MQTTD_ADMIN_CA=/etc/mqttd/admin/ca.pem          # verifies the server
+export MQTTD_ADMIN_CLIENT_CERT=~/.mqttd/oncall.pem
+export MQTTD_ADMIN_CLIENT_KEY=~/.mqttd/oncall.key
+mqttd --admin whoami          # the subject and role the broker sees
+mqttd --admin node            # this node's state (the /statusz body)
+mqttd --admin node --json     # the raw JSON
+mqttd --admin cluster         # every node, from any node
+mqttd --admin placement       # this node's membership view; do the others agree
+mqttd --admin help            # every verb
+```
+
+**The cluster view.** `mqttd --admin cluster` on any node returns one row per member:
+whether it replied (and if not, why), version, readiness, cluster id, member count, lease
+role and epoch, replica lag in groups, brownout, quarantine, SWIM isolation, decommission,
+config checksum and peer protocol. A summary says whether every replying node agrees on
+the cluster id (the split-brain check), version, config and membership. A node that
+does not answer is a row with `replied: false`, never a missing row.
+
+The answering node asks each peer's admin listener directly: at the host of the peer's
+cluster-bus address and `admin.peer_port` (default: the port of `admin.bind`), presenting
+its own cluster certificate. For that to work:
+
+- run the admin listener on **every** node, with the same port (or set `admin.peer_port`);
+- the node needs `[cluster.peer_tls]` (without cluster TLS its peers are listed as not
+  queryable);
+- each node's admin server certificate must chain to the admin client CA or the cluster
+  CA and name the node's cluster-bus host. The simplest way is to serve the admin listener
+  with the node's cluster certificate: `admin.cert = <peer_tls.cert>`,
+  `admin.key = <peer_tls.key>`.
+
+A node's cluster certificate, in no role list, is admitted as the `peer` role: it can read
+that node's own state, and nothing else.
+
+**Clients and sessions.** These answer from the node you ask (the sessions it holds, the
+retained messages it serves); `mqttd --admin cluster` lists every node's admin address.
+
+```sh
+mqttd --admin clients --prefix sensor-            # sessions by client id, 100 per page
+mqttd --admin clients --user alice                # connected as this principal
+mqttd --admin clients --source 10.1.              # connected from these addresses
+mqttd --admin clients --cursor sensor-0419        # the next page (next_cursor)
+mqttd --admin session sensor-0420                 # subscriptions, in flight, backlog, will, owner
+mqttd --admin subscribers plant/7/temp            # who here receives a publish to this topic
+mqttd --admin backlog --top 10                    # the sessions with the most messages waiting
+mqttd --admin retained --prefix plant/            # count and bytes, then topics (no payloads)
+```
+
+- `session` reports `owner_node` (where placement puts the session). For a disconnected
+  persistent session it also reports `queued` from the session store, counted up to 10 000
+  (`queued_capped: true` beyond that).
+- `--user` and `--source` match connected clients only; `--source` is a prefix of
+  `ip:port`, and a relocated session has no source (the address is the relaying node).
+- Payloads are never returned: not for retained messages, not for a Will (its size is).
+- Listing and ranking visit every session on the node, once per request, on the hub's
+  loop. That is milliseconds for tens of thousands of sessions; on a node with millions,
+  prefer `--prefix` and a small `--limit`.
+
+Each variable has a flag (`--url`, `--ca`, `--cert`, `--key`, `--server-name`). Without a
+URL, the CLI uses `admin.bind` from the local config, and without a CA, `admin.client_ca`.
+These variables configure the client, not the broker, so they are not in
+[CONFIGURATION.md](CONFIGURATION.md).
+
+**What is it running, and did my change take?** `config` shows the effective config
+(defaults < file < `MQTTD_*` env) with every secret value replaced by a `sha256:`
+fingerprint, plus `file_checksum`: the SHA-256 of the config file, the value to compare with
+the committed file. `reload` (operator role) runs the reload `SIGHUP` runs and says what
+happened:
+
+```sh
+mqttd --admin config --json | jq .file_checksum
+mqttd --admin reload
+#   applied           true
+#   changed_sections  limits, security
+#   requires_restart  -
+mqttd --admin reload          # after a bad edit: exit 1
+#   mqttd: 409 reload-rejected: config: TOML parse error at line 3 …
+```
+
+A rejected reload keeps the running config and policy, as `SIGHUP` does. `requires_restart`
+lists the changed sections that are staged but not live (listeners, TLS material, the
+cluster, …). Reloads are serialized: `SIGHUP`, the file watcher and the API never
+interleave. The request itself carries nothing: the file is the only input.
+
+**Removing a client.** Two operator actions, on one client id:
+
+```sh
+mqttd --admin kick dev-0042     # disconnect; the session (subscriptions, queue) stays
+mqttd --admin purge dev-0042    # disconnect if connected, then delete the session and its queue
+```
+
+- `kick` closes the connection as a revocation eviction does: an MQTT 5 client receives
+  `DISCONNECT` with reason `0x98` (Administrative action), a 3.1.1 client just loses the
+  connection. It is a server-side close, so the client's Will is published. A client that
+  reconnects is admitted again; to keep it out, change its credentials or ACL and reload.
+- `purge` deletes the session everywhere it is kept: subscriptions, in-flight state, the
+  queued messages and the durable copy. A persistent reconnect then starts clean
+  (`session_present = 0`).
+- Either can be run on any node. A session lives on its placement owner, so a node that
+  does not own it forwards the action to the owner's admin listener (under its cluster
+  certificate, carrying your subject), and the answer says `forwarded_to`. Both nodes audit
+  it. A forwarded action is never forwarded again.
+- `404 not-found` means the owner holds no session or connection for that id.
+
+**Why is this client denied?** `authz` asks the live policy, the one the last reload
+published, and names the rule that decides. It changes nothing.
+
+```sh
+mqttd --admin authz device-7 publish devices/device-7/temp
+mqttd --admin authz bob subscribe 'secret/#' --groups ops,dev
+mqttd --admin authz tenant-a connect tenant-a-17           # connect rules: target = client id
+mqttd --admin authz device-7 publish fleet/c1/x --client c1  # what %c expands to
+```
+
+The answer is `allowed`, the deciding `rule` (its index in `[[rules]]`, from 0, its
+effect, the pattern as written and after `%i`/`%c` substitution) and a one-line `reason`:
+a deny that won, the allow that granted, or the policy default. Groups are taken as given,
+because at runtime they come from the authenticator. For `connect`, the session-owner
+guard (ADR 0031) still applies on top of the policy.
 
 ## Shipping the audit trail to a SIEM
 

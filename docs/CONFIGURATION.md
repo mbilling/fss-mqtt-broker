@@ -6,7 +6,7 @@ Source of truth: `mqtt_config::ENV_VARS` and `Config::overlay_from` in `crates/m
 
 The annotated template is [`mqttd.example.toml`](mqttd.example.toml). Capacity arithmetic lives in [SIZING.md](SIZING.md); day-2 procedures in [OPERATIONS.md](OPERATIONS.md). This page is the inventory of knobs, not the runbook.
 
-Documented overlay variables: **102** in `ENV_VARS`, plus `MQTTD_CONFIG` (meta) and any experimental side-channel knobs below.
+Documented overlay variables: **109** in `ENV_VARS`, plus `MQTTD_CONFIG` (meta) and any experimental side-channel knobs below.
 
 ## Node identity
 
@@ -164,6 +164,18 @@ Documented overlay variables: **102** in `ENV_VARS`, plus `MQTTD_CONFIG` (meta) 
 | Variable | TOML key | Purpose |
 |---|---|---|
 | `MQTTD_AUDIT_SYSLOG` | `audit.syslog` | RFC 5424 syslog endpoint for the audit-chain export (`MQTTD_AUDIT_SYSLOG`), `host:port` over TCP. Unset = no export; the chain still lands in the broker log either way. The export sheds-and-counts when the endpoint is slower than the audit rate — see docs/AUDIT-SCHEMA.md for the record format, the SIEM boundary invariant, and the verification procedure. |
+
+## Admin API
+
+| Variable | TOML key | Purpose |
+|---|---|---|
+| `MQTTD_ADMIN_BIND` | `admin.bind` | Admin API listener (`MQTTD_ADMIN_BIND`), e.g. `0.0.0.0:9443`. Unset = no admin API. Needs `Admin::cert`, `Admin::key` and `Admin::client_ca`. |
+| `MQTTD_ADMIN_CERT` | `admin.cert` | Admin listener server certificate chain PEM (`MQTTD_ADMIN_CERT`). |
+| `MQTTD_ADMIN_KEY` | `admin.key` | Admin listener private key PEM (`MQTTD_ADMIN_KEY`). |
+| `MQTTD_ADMIN_CLIENT_CA` | `admin.client_ca` | CA bundle PEM that issues admin client certificates (`MQTTD_ADMIN_CLIENT_CA`). Every admin request presents a certificate it issued. |
+| `MQTTD_ADMIN_VIEWERS` | `admin.viewers` | Certificate subjects granted the read-only `viewer` role (`MQTTD_ADMIN_VIEWERS`, `;`-separated). An entry is either the full subject (`CN=ops,O=example`) or `CN=<name>`, which matches any subject with that Common Name. Hot-reloadable. |
+| `MQTTD_ADMIN_OPERATORS` | `admin.operators` | Certificate subjects granted the `operator` role, which may also call the actions (`MQTTD_ADMIN_OPERATORS`, `;`-separated, same syntax as `Admin::viewers`). Hot-reloadable. |
+| `MQTTD_ADMIN_PEER_PORT` | `admin.peer_port` | The port other nodes' admin listeners use (`MQTTD_ADMIN_PEER_PORT`), for the cluster view (ADR 0081 §2): a node reaches a peer at the host of that peer's cluster-bus address and this port. Unset = the port of `Admin::bind`, the usual case when every node runs the same config. |
 
 ## Meta (not a config field)
 

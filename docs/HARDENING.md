@@ -98,6 +98,8 @@ Single-node deployments: verify none of the cluster binds are set and skip to §
 | H-7.3 | L1 | Secrets by path, never inline | config discipline (schema enforces for keys) | `grep -iE 'key *= *"-----|password *= *"[^/]' <config>` returns nothing |
 | H-7.4 | L2 | Health/metrics ports on the ops network only, never internet-exposed | `MQTTD_HEALTH_BIND`, `MQTTD_METRICS_BIND` on internal interfaces | external scan: 200-serving `/statusz` unreachable from outside |
 | H-7.5 | L2 | systemd deployments use the shipped hardened unit | `deploy/systemd/mqttd.service` | `systemctl show mqttd -p ProtectSystem,NoNewPrivileges,User` → `strict`, `yes`, `mqttd` |
+| H-7.7 | L1 | The admin API, when on, is reachable only from operator networks and its CA issues admin certificates only | `MQTTD_ADMIN_BIND` on an internal interface; a dedicated `MQTTD_ADMIN_CLIENT_CA` (not the client-listener CA, and not the cluster CA — with the cluster CA every unlisted node certificate is admitted as `peer` instead of refused) | external scan: the admin port is unreachable from outside; `openssl x509 -in <admin CA> -noout -subject` names an admin-only CA |
+| H-7.8 | L2 | Admin roles are least-privilege | `MQTTD_ADMIN_OPERATORS` lists only the people/automation that act; everyone else in `MQTTD_ADMIN_VIEWERS` | `mqttd --admin whoami` for each issued certificate shows the intended role; operators list reviewed with access reviews |
 | H-7.6 | L2 | Containers run the shipped image (distroless, nonroot) pinned to a release tag | compose/chart defaults | image ref is `ghcr.io/mbilling/fss-mqtt-broker:<X.Y.Z>` — exact version, never `latest`; cosign verification per [RELEASING](../RELEASING.md) |
 
 ## 8. Audit and monitoring
@@ -107,6 +109,7 @@ Single-node deployments: verify none of the cluster binds are set and skip to §
 | H-8.1 | L1 | The audit chain reaches the SIEM | `MQTTD_AUDIT_SYSLOG` (RFC 5424/TCP, see [AUDIT-SCHEMA](AUDIT-SCHEMA.md)) or a log shipper carrying the `target: audit` lines | the SIEM shows `audit.genesis` at each boot; `scripts/audit-verify.py` over a captured stream exits 0 |
 | H-8.2 | L1 | The chain-boundary invariant is alerted on | SIEM rule | rule exists: a chain ending **without** `audit.shutdown`, or a genesis **not** preceded by one, raises an alert (crash or suppression) |
 | H-8.3 | L2 | Metrics scraped; refusal/drop counters dashboarded | `MQTTD_METRICS_BIND` or `MQTTD_OTLP_ENDPOINT` | dashboards show `publish_dropped_*`, gossip drop counters, brownout state |
+| H-8.5 | L2 | Admin actions are alerted on | SIEM rule over `admin.request` records | rule exists: any `role=operator` record with a non-`GET` target raises a notification |
 | H-8.4 | L2 | `/readyz` drives load-balancer membership | orchestrator wiring | draining/browned-out/quorumless nodes leave rotation automatically |
 
 ---

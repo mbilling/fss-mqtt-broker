@@ -494,6 +494,8 @@ acl_file = "/etc/mqttd/acl.toml"             # deny by default
 
 ```sh
 mqttd --check-config --config mqttd.toml    # validate, binds nothing
+mqttd --print-config --config mqttd.toml    # effective config, secrets fingerprinted
+mqttd --check-tls --config mqttd.toml       # certs, keys, CAs, CRLs: match, order, expiry
 kill -HUP "$(pidof mqttd)"                  # reload policy, TLS, quotas
 ```
 
@@ -578,7 +580,7 @@ Memory watermark at 75–85% of the container limit; the container limit is the 
 - consensus for control (epochs, ownership), small replica sets for data
 - refuse at the edge: reason code or backpressure, never a silent drop
 - bridge is a separate process and failure domain
-- decisions: [`docs/adr/`](docs/adr/) (80 ADRs, per-task status) · tour: [ARCHITECTURE.md](docs/ARCHITECTURE.md) · [THREAT-MODEL.md](docs/THREAT-MODEL.md)
+- decisions: [`docs/adr/`](docs/adr/) (81 ADRs, per-task status) · tour: [ARCHITECTURE.md](docs/ARCHITECTURE.md) · [THREAT-MODEL.md](docs/THREAT-MODEL.md)
 
 **Workspace layout**
 

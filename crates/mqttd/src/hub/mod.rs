@@ -64,6 +64,9 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::time::Instant;
 use tracing::{debug, info, warn};
 
+// Admin API queries and actions (ADR 0081): read-only snapshots of hub state, and
+// the operator actions, answered on the loop so they see one consistent state.
+pub mod admin;
 mod forwarding;
 use forwarding::{ForwardKind, ForwardObligation, InterestIndex, PendingPublish};
 mod delivery;
@@ -463,6 +466,11 @@ pub struct Admission {
     /// told why (DISCONNECT `0x87`); v3.1.1 has no server DISCONNECT, so it just
     /// gets the close.
     pub protocol: ProtocolVersion,
+    /// The client's source address as this node's listener saw it; `None` for a
+    /// relocated session (ADR 0005: the peer address is the relaying node, not the client)
+    /// and for transports without one. Reported and filtered on by the admin API
+    /// (ADR 0081 T4); never used for a policy decision.
+    pub source: Option<std::net::SocketAddr>,
 }
 
 /// The new policy a successful security reload published, handed to the hub for
@@ -1578,6 +1586,8 @@ pub enum HubCommand {
         /// Replied to with `()` when the loop reaches this command.
         reply: oneshot::Sender<()>,
     },
+    /// An admin API query or action (ADR 0081), answered from the loop.
+    Admin(admin::AdminRequest),
 }
 
 impl HubCommand {
@@ -3101,6 +3111,7 @@ impl Hub {
                 // prober timed out; that is fine.
                 let _ = reply.send(());
             }
+            HubCommand::Admin(request) => self.admin(request).await,
             HubCommand::RemoteInterest { node, filters } => {
                 debug!(node = %node.0, filters = filters.len(), "remote interest updated");
                 // The peer's view is AUTHORITATIVE (it never gossips before it
@@ -7123,6 +7134,7 @@ mod tests {
             method: AuthMethod::Password,
             cert_serial: None,
             protocol: ProtocolVersion::V311,
+            source: None,
         }
     }
 
@@ -8128,6 +8140,7 @@ mod tests {
                 method: AuthMethod::Certificate,
                 cert_serial: Some(vec![0x0a, 0x0b]),
                 protocol: ProtocolVersion::V5,
+                source: None,
             },
             conn_id: 2,
             clean_start: true,
@@ -8266,6 +8279,7 @@ mod tests {
             method: AuthMethod::Certificate,
             cert_serial: Some(vec![0x42]),
             protocol: ProtocolVersion::V311,
+            source: None,
         };
         let mut revoked_cert = attach_as("by-cert", cert_admission, 1).await;
         let mut removed_user = attach_as("by-user", admission("bob"), 2).await;
@@ -15708,6 +15722,7 @@ mod tests {
                 method: AuthMethod::Password,
                 cert_serial: None,
                 protocol: ProtocolVersion::V5,
+                source: None,
             },
             conn_id,
             clean_start: false,
