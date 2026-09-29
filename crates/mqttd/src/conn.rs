@@ -394,7 +394,7 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let auth_failed = std::sync::atomic::AtomicBool::new(false);
-    if let Err(e) = run(stream, cert, &policy, hub, &auth_failed).await {
+    if let Err(e) = run(stream, peer, cert, &policy, hub, &auth_failed).await {
         warn!(?peer, error = %e, "connection ended with error");
     }
     ConnOutcome {
@@ -404,6 +404,7 @@ where
 
 async fn run<S>(
     stream: S,
+    peer: Option<SocketAddr>,
     cert: Option<CertAdmission>,
     policy: &ConnPolicy,
     hub: mpsc::UnboundedSender<HubCommand>,
@@ -417,7 +418,18 @@ where
     let writer = FrameWriter::new(wh, ProtocolVersion::V311);
     // A directly-accepted client may be relocated to its placement owner; it has no
     // relaying node (`via = None`).
-    run_framed(reader, writer, cert, policy, hub, true, None, auth_failed).await
+    run_framed(
+        reader,
+        writer,
+        peer,
+        cert,
+        policy,
+        hub,
+        true,
+        None,
+        auth_failed,
+    )
+    .await
 }
 
 /// Serve an MQTT connection over already-framed halves. `allow_proxy` is `true`
@@ -589,6 +601,7 @@ async fn read_connect<R: AsyncRead + Unpin>(
 async fn run_framed<R, W>(
     mut reader: FrameReader<R>,
     mut writer: FrameWriter<W>,
+    peer: Option<SocketAddr>,
     cert: Option<CertAdmission>,
     policy: &ConnPolicy,
     hub: mpsc::UnboundedSender<HubCommand>,
@@ -695,6 +708,7 @@ where
                 method: auth_method,
                 cert_serial: cert.and_then(|c| c.serial),
                 protocol: connect.protocol,
+                source: peer,
             },
             conn_id,
             clean_start,
@@ -966,7 +980,20 @@ pub async fn serve_proxied<R, W>(
     // address is the RELAYING NODE (ADR 0005), which must never be penalized for
     // a client's bad credentials (ADR 0041 T2).
     let auth_failed = std::sync::atomic::AtomicBool::new(false);
-    if let Err(e) = run_framed(reader, writer, cert, &policy, hub, false, via, &auth_failed).await {
+    // `None`: the stream's peer is the relaying node, not the client (ADR 0005).
+    if let Err(e) = run_framed(
+        reader,
+        writer,
+        None,
+        cert,
+        &policy,
+        hub,
+        false,
+        via,
+        &auth_failed,
+    )
+    .await
+    {
         warn!(?peer, error = %e, "proxied session ended with error");
     }
 }

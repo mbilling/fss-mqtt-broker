@@ -7,7 +7,11 @@
 
 use mqtt_cluster::placement::{Placement, DEFAULT_REPLICAS};
 use mqtt_cluster::swim::MemberState;
+mod common;
+
+use common::Client;
 use mqtt_cluster::NodeId;
+use mqtt_codec::QoS;
 use mqtt_storage::MemorySessionStore;
 use mqttd::admin::client::{self, Target};
 use mqttd::admin::cluster::PeerAccess;
@@ -111,6 +115,7 @@ async fn start(viewers: &[&str], operators: &[&str], cluster_ca: Option<&Ca>) ->
         operators,
         placement: None,
         peers: None,
+        hub: None,
     })
 }
 
@@ -126,6 +131,12 @@ struct Node<'a> {
     operators: &'a [&'a str],
     placement: Option<Arc<RwLock<Placement>>>,
     peers: Option<PeerAccess>,
+    /// A running hub (and its store) to serve the session endpoints from; `None` spawns
+    /// a bare hub with no session endpoints.
+    hub: Option<(
+        tokio::sync::mpsc::UnboundedSender<mqttd::HubCommand>,
+        Arc<MemorySessionStore>,
+    )>,
 }
 
 fn start_node(node: Node<'_>) -> Harness {
@@ -139,9 +150,19 @@ fn start_node(node: Node<'_>) -> Harness {
     cas.extend(node.cluster_ca.map(|c| c.pem.as_path()));
     let acceptor = mqtt_net::tls::admin_acceptor(&server_cert, &server_key, &cas).unwrap();
 
-    let (hub, hub_tx) =
-        Hub::with_config(NodeId(node.id.into()), Arc::new(MemorySessionStore::new()));
-    tokio::spawn(hub.run());
+    let (hub_tx, sessions) = if let Some((tx, store)) = node.hub {
+        let access = mqttd::admin::sessions::SessionAccess {
+            hub: tx.clone(),
+            store,
+            placement: node.placement.clone(),
+        };
+        (tx, Some(access))
+    } else {
+        let (hub, tx) =
+            Hub::with_config(NodeId(node.id.into()), Arc::new(MemorySessionStore::new()));
+        tokio::spawn(hub.run());
+        (tx, None)
+    };
     let health = HealthState::new(hub_tx, node.placement, None, 1).with_status(
         node.id.into(),
         Arc::new(
@@ -163,6 +184,9 @@ fn start_node(node: Node<'_>) -> Harness {
     }
     if let Some(peers) = node.peers {
         state = state.with_peers(peers);
+    }
+    if let Some(access) = sessions {
+        state = state.with_sessions(access);
     }
     let addr = node.listener.local_addr().unwrap().to_string();
     tokio::spawn(mqttd::admin::serve(node.listener, acceptor, state));
@@ -410,6 +434,7 @@ async fn three_nodes() -> ThreeNodes {
             operators: &[],
             placement: Some(Arc::new(RwLock::new(placement))),
             peers: Some(peers),
+            hub: None,
         }));
     }
 
@@ -472,4 +497,194 @@ async fn any_node_answers_for_the_cluster_and_a_silent_node_is_listed_as_silent(
         .unwrap();
     let body: Value = serde_json::from_str(&body).unwrap();
     assert_eq!((status, code(&body)), (403, "forbidden"), "{body}");
+}
+
+/// A broker (hub + plaintext MQTT listener) with an admin listener serving its sessions.
+struct Broker {
+    mqtt: std::net::SocketAddr,
+    admin: Harness,
+}
+
+async fn start_broker_with_admin() -> Broker {
+    let store = Arc::new(MemorySessionStore::new());
+    let (hub, hub_tx) = Hub::with_config(NodeId("b1".into()), store.clone());
+    tokio::spawn(hub.run());
+    let mqtt_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mqtt = mqtt_listener.local_addr().unwrap();
+    let tx = hub_tx.clone();
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = mqtt_listener.accept().await.unwrap();
+            tokio::spawn(mqttd::conn::handle(stream, tx.clone()));
+        }
+    });
+    let admin = start_node(Node {
+        id: "b1",
+        listener: TcpListener::bind("127.0.0.1:0").await.unwrap(),
+        admin_ca: Arc::new(mint_ca("admin")),
+        server_ca: None,
+        cluster_ca: None,
+        viewers: &["CN=alice"],
+        operators: &[],
+        placement: None,
+        peers: None,
+        hub: Some((hub_tx, store)),
+    });
+    Broker { mqtt, admin }
+}
+
+/// `GET path` as alice (a viewer); status and parsed body.
+async fn view(b: &Broker, path: &str) -> (u16, Value) {
+    let alice = mint_leaf(&b.admin.admin_ca, "alice", None);
+    b.admin.get(&alice, path).await
+}
+
+/// Poll `path` until `ready(body)` holds, failing after 10 s.
+async fn view_until(b: &Broker, path: &str, ready: impl Fn(&Value) -> bool) -> Value {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let (status, body) = view(b, path).await;
+        assert_eq!(status, 200, "{body}");
+        if ready(&body) {
+            return body;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{path} never reached the expected state: {body}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test]
+async fn clients_are_listed_filtered_and_paged_with_their_connection_facts() {
+    let b = start_broker_with_admin().await;
+    let _s1 = Client::connect(b.mqtt, "sensor-1").await;
+    let _s2 = Client::connect_v5_ok(b.mqtt, "sensor-2").await;
+    let _app = Client::connect(b.mqtt, "app-1").await;
+
+    let body = view_until(&b, "/admin/v1/clients?prefix=sensor-", |v| {
+        v["matched"] == 2
+    })
+    .await;
+    let rows = body["sessions"].as_array().unwrap();
+    assert_eq!(rows[0]["client_id"], "sensor-1");
+    assert_eq!(rows[0]["connected"], true);
+    assert_eq!(rows[0]["protocol"], "3.1.1");
+    assert_eq!(rows[1]["protocol"], "5");
+    assert!(
+        rows[0]["source"]
+            .as_str()
+            .unwrap()
+            .starts_with("127.0.0.1:"),
+        "{body}"
+    );
+    assert_eq!(body["next_cursor"], Value::Null);
+
+    // Paging: one row per page, the cursor carries on, the total is stable.
+    let (_, page1) = view(&b, "/admin/v1/clients?limit=2").await;
+    assert_eq!(page1["matched"], 3);
+    let ids: Vec<_> = page1["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["client_id"].clone())
+        .collect();
+    assert_eq!(ids, ["app-1", "sensor-1"]);
+    let cursor = page1["next_cursor"].as_str().unwrap().to_string();
+    let (_, page2) = view(&b, &format!("/admin/v1/clients?limit=2&cursor={cursor}")).await;
+    assert_eq!(page2["sessions"][0]["client_id"], "sensor-2");
+    assert_eq!(page2["next_cursor"], Value::Null);
+
+    let (_, none) = view(&b, "/admin/v1/clients?source=10.").await;
+    assert_eq!(none["matched"], 0);
+    let (_, all) = view(&b, "/admin/v1/clients?source=127.0.0.1").await;
+    assert_eq!(all["matched"], 3);
+    let (status, bad) = view(&b, "/admin/v1/clients?limit=0").await;
+    assert_eq!((status, code(&bad)), (400, "bad-request"));
+}
+
+#[tokio::test]
+async fn a_session_shows_its_subscriptions_and_an_offline_one_its_queue() {
+    let b = start_broker_with_admin().await;
+    let mut sub = Client::connect(b.mqtt, "sub-1").await;
+    sub.subscribe(1, "a/+/temp", QoS::AtLeastOnce).await;
+    let (mut keeper, _) = Client::connect_v311(b.mqtt, "keeper", false).await;
+    keeper.subscribe(1, "q/#", QoS::AtLeastOnce).await;
+    keeper.disconnect().await;
+
+    let body = view_until(&b, "/admin/v1/session?client=sub-1", |v| {
+        v["subscriptions"] == 1
+    })
+    .await;
+    assert_eq!(body["subscription_list"][0]["filter"], "a/+/temp");
+    assert_eq!(body["subscription_list"][0]["qos"], 1);
+    assert_eq!(body["connected"], true);
+    assert_eq!(body["node"], "b1");
+
+    // A message for the disconnected persistent session waits in the store.
+    let mut publisher = Client::connect(b.mqtt, "pub-1").await;
+    publisher
+        .publish("q/1", b"x", QoS::AtLeastOnce, Some(7), vec![])
+        .await;
+    let body = view_until(&b, "/admin/v1/session?client=keeper", |v| v["queued"] == 1).await;
+    assert_eq!(body["connected"], false);
+    assert_eq!(body["persistent"], true);
+    assert_eq!(body["queued_capped"], false);
+
+    let (status, missing) = view(&b, "/admin/v1/session?client=nobody").await;
+    assert_eq!((status, code(&missing)), (404, "not-found"));
+}
+
+#[tokio::test]
+async fn subscribers_backlog_and_retained_answer_the_day_two_questions() {
+    let b = start_broker_with_admin().await;
+    let mut sub = Client::connect(b.mqtt, "slow").await;
+    sub.subscribe(1, "a/+/temp", QoS::AtLeastOnce).await;
+    let mut member = Client::connect(b.mqtt, "worker").await;
+    member.subscribe(1, "$share/g/a/#", QoS::AtMostOnce).await;
+
+    let body = view_until(&b, "/admin/v1/subscribers?topic=a/b/temp", |v| {
+        v["subscribers"].as_array().is_some_and(|a| a.len() == 2)
+    })
+    .await;
+    let rows = body["subscribers"].as_array().unwrap();
+    assert_eq!(rows[0]["client_id"], "slow");
+    assert_eq!(rows[0]["filter"], "a/+/temp");
+    assert_eq!(rows[1]["client_id"], "worker");
+    assert_eq!(rows[1]["shared_group"], "g");
+    let (_, one) = view(&b, "/admin/v1/subscribers?topic=a/b/temp&limit=1").await;
+    assert_eq!(one["subscribers"].as_array().unwrap().len(), 1);
+    assert_eq!(one["subscribers"][0]["client_id"], "slow");
+    assert_eq!(one["truncated"], true);
+    let (status, bad) = view(&b, "/admin/v1/subscribers?topic=a/%2B/temp").await;
+    assert_eq!((status, code(&bad)), (400, "bad-request"));
+    // An unencoded `+` is a `+`, not a space: still refused as a wildcard.
+    let (status, bad) = view(&b, "/admin/v1/subscribers?topic=a/+/temp").await;
+    assert_eq!((status, code(&bad)), (400, "bad-request"));
+
+    // `slow` never acknowledges: its QoS 1 deliveries stay in flight.
+    let mut publisher = Client::connect(b.mqtt, "pub").await;
+    for pkid in 1..=3 {
+        publisher
+            .publish("a/x/temp", b"t", QoS::AtLeastOnce, Some(pkid), vec![])
+            .await;
+    }
+    let body = view_until(&b, "/admin/v1/backlog?top=5", |v| {
+        v["sessions"][0]["inflight"] == 3
+    })
+    .await;
+    assert_eq!(body["sessions"][0]["client_id"], "slow");
+
+    // A fresh client: `publisher` still has three unread PUBACKs queued.
+    let mut retainer = Client::connect(b.mqtt, "retainer").await;
+    for topic in ["r/2", "r/1", "x/1"] {
+        retainer.publish_retained_acked(topic, b"hello", 9).await;
+    }
+    let body = view_until(&b, "/admin/v1/retained?prefix=r/", |v| v["count"] == 2).await;
+    assert_eq!(body["payload_bytes"], 10);
+    assert_eq!(body["retained"][0]["topic"], "r/1");
+    let (_, page) = view(&b, "/admin/v1/retained?prefix=r/&limit=1").await;
+    assert_eq!(page["retained"].as_array().unwrap().len(), 1);
+    assert_eq!(page["next_cursor"], "r/1");
 }

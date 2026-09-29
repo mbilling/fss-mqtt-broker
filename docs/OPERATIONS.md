@@ -862,6 +862,30 @@ its own cluster certificate. For that to work:
 A node's cluster certificate, in no role list, is admitted as the `peer` role: it can read
 that node's own state, and nothing else.
 
+**Clients and sessions.** These answer from the node you ask (the sessions it holds, the
+retained messages it serves); `mqttd --admin cluster` lists every node's admin address.
+
+```sh
+mqttd --admin clients --prefix sensor-            # sessions by client id, 100 per page
+mqttd --admin clients --user alice                # connected as this principal
+mqttd --admin clients --source 10.1.              # connected from these addresses
+mqttd --admin clients --cursor sensor-0419        # the next page (next_cursor)
+mqttd --admin session sensor-0420                 # subscriptions, in flight, backlog, will, owner
+mqttd --admin subscribers plant/7/temp            # who here receives a publish to this topic
+mqttd --admin backlog --top 10                    # the sessions with the most messages waiting
+mqttd --admin retained --prefix plant/            # count and bytes, then topics (no payloads)
+```
+
+- `session` reports `owner_node` (where placement puts the session). For a disconnected
+  persistent session it also reports `queued` from the session store, counted up to 10 000
+  (`queued_capped: true` beyond that).
+- `--user` and `--source` match connected clients only; `--source` is a prefix of
+  `ip:port`, and a relocated session has no source (the address is the relaying node).
+- Payloads are never returned: not for retained messages, not for a Will (its size is).
+- Listing and ranking visit every session on the node, once per request, on the hub's
+  loop. That is milliseconds for tens of thousands of sessions; on a node with millions,
+  prefer `--prefix` and a small `--limit`.
+
 Each variable has a flag (`--url`, `--ca`, `--cert`, `--key`, `--server-name`). Without a
 URL, the CLI uses `admin.bind` from the local config, and without a CA, `admin.client_ca`.
 These variables configure the client, not the broker, so they are not in
