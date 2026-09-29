@@ -653,7 +653,14 @@ async fn subscribers_backlog_and_retained_answer_the_day_two_questions() {
     assert_eq!(rows[0]["filter"], "a/+/temp");
     assert_eq!(rows[1]["client_id"], "worker");
     assert_eq!(rows[1]["shared_group"], "g");
+    let (_, one) = view(&b, "/admin/v1/subscribers?topic=a/b/temp&limit=1").await;
+    assert_eq!(one["subscribers"].as_array().unwrap().len(), 1);
+    assert_eq!(one["subscribers"][0]["client_id"], "slow");
+    assert_eq!(one["truncated"], true);
     let (status, bad) = view(&b, "/admin/v1/subscribers?topic=a/%2B/temp").await;
+    assert_eq!((status, code(&bad)), (400, "bad-request"));
+    // An unencoded `+` is a `+`, not a space: still refused as a wildcard.
+    let (status, bad) = view(&b, "/admin/v1/subscribers?topic=a/+/temp").await;
     assert_eq!((status, code(&bad)), (400, "bad-request"));
 
     // `slow` never acknowledges: its QoS 1 deliveries stay in flight.

@@ -157,8 +157,10 @@ pub struct SessionDetail {
     /// The summary fields.
     #[serde(flatten)]
     pub summary: SessionSummary,
-    /// Every subscription.
+    /// The subscriptions, at most [`MAX_LIMIT`] (`subscriptions` has the count).
     pub subscription_list: Vec<SubscriptionView>,
+    /// Whether the session holds more than [`MAX_LIMIT`] subscriptions.
+    pub subscription_list_truncated: bool,
     /// In-flight messages by acknowledgement state.
     pub inflight_states: BTreeMap<&'static str, usize>,
     /// The client's Receive Maximum.
@@ -397,8 +399,9 @@ impl Hub {
             subscription_list: self
                 .subs
                 .get(client)
-                .map(|s| s.iter().map(subscription_view).collect())
+                .map(|s| s.iter().take(MAX_LIMIT).map(subscription_view).collect())
                 .unwrap_or_default(),
+            subscription_list_truncated: self.subs.get(client).is_some_and(|s| s.len() > MAX_LIMIT),
             inflight_states: states,
             receive_maximum: inflight.map(|i| i.receive_maximum),
             will,
@@ -421,30 +424,40 @@ impl Hub {
                 }
             }
         }
-        let mut rows = Vec::new();
+        // The `limit + 1` smallest (client, filter) matches, in one pass over the
+        // candidates: a max-heap of borrowed keys keeps the work on the loop bounded by
+        // the page, not by how many subscribers a hot topic has.
+        let mut page: BinaryHeap<(&str, &str, u8, &ClientId)> =
+            BinaryHeap::with_capacity(limit + 2);
         for client in candidates {
             let Some(subs) = self.subs.get(client) else {
                 continue;
             };
             for e in subs.iter() {
-                let (group, filter) = split_shared(&e.filter);
+                let (_, filter) = split_shared(&e.filter);
                 if mqtt_core::topic_matches(filter, &topic) {
-                    rows.push(SubscriberView {
-                        client_id: client.0.to_string(),
-                        filter: e.filter.to_string(),
-                        qos: qos(e.qos),
-                        shared_group: group.map(String::from),
-                        connected: self.online.contains_key(client),
-                    });
+                    page.push((&client.0, &e.filter, qos(e.qos), client));
+                    if page.len() > limit + 1 {
+                        page.pop();
+                    }
                 }
             }
         }
-        rows.sort_by(|a, b| (&a.client_id, &a.filter).cmp(&(&b.client_id, &b.filter)));
+        let mut rows = page.into_sorted_vec();
         let truncated = rows.len() > limit;
         rows.truncate(limit);
         SubscriberList {
             topic,
-            subscribers: rows,
+            subscribers: rows
+                .into_iter()
+                .map(|(id, filter, granted, client)| SubscriberView {
+                    client_id: id.to_string(),
+                    filter: filter.to_string(),
+                    qos: granted,
+                    shared_group: split_shared(filter).0.map(String::from),
+                    connected: self.online.contains_key(client),
+                })
+                .collect(),
             truncated,
         }
     }
