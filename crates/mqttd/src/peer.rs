@@ -613,6 +613,23 @@ fn forward_inbound(
     reply_bulk: &mpsc::WeakUnboundedSender<PeerMessage>,
 ) {
     match msg {
+        // The replication data path, with no task per frame. It carries every
+        // durable message twice per node — a `Replicate` in and its ack out as a
+        // follower, the acks in as an owner — and a spawned task per frame (plus
+        // a oneshot and the wake-ups around it) was the largest scheduling cost a
+        // durable node paid. A `Replicate` goes straight to its shard's writer,
+        // which puts the `ReplicateAck` on the control lane when the batch
+        // commits; an ack just wakes the waiting append.
+        PeerMessage::Replicate { req_id, epoch, op } if plane.is_some() => {
+            if let Some(plane) = plane {
+                plane.submit_replicate(req_id, epoch, op, reply_ctl.clone());
+            }
+        }
+        PeerMessage::ReplicateAck { req_id, accepted } if plane.is_some() => {
+            if let Some(plane) = plane {
+                plane.complete_replicate_ack(req_id, accepted);
+            }
+        }
         // EVERY durable-plane frame routes DIRECTLY to the plane, bypassing the
         // hub command queue. Replies were first (ADR 0042 T9, exhibit ⑩): an
         // on-loop durable append awaits exactly these acks, which would sit

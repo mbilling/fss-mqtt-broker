@@ -500,6 +500,18 @@ with_cpu_sampling "$3" work
                 self.assertNotEqual(bad.returncode, 0, bad.stdout)
                 self.assertIn(diagnostic, bad.stderr)
 
+    def test_the_predicted_pending_cap_is_the_brokers(self):
+        # The preflight predicts the broker's bound, so its default must BE the
+        # broker's: #649 raised PENDING_PUBLISH_CAP to 65,536 and the harness kept
+        # predicting 4,096 for weeks, warning of a limit that no longer existed.
+        hub = (Path(__file__).resolve().parents[2] / "crates/mqttd/src/hub/mod.rs").read_text()
+        broker = re.search(r"const PENDING_PUBLISH_CAP: usize = ([0-9_]+);", hub)
+        self.assertIsNotNone(broker, "PENDING_PUBLISH_CAP moved; point this test at it")
+        rig = re.search(r'LANE_E_PENDING_PUBLISH_CAP="\$\{LANE_E_PENDING_PUBLISH_CAP:-([0-9]+)\}"',
+                        (Path(__file__).resolve().parent / "run-curve.sh").read_text())
+        self.assertIsNotNone(rig, "run-curve.sh's LANE_E_PENDING_PUBLISH_CAP default moved")
+        self.assertEqual(int(broker[1].replace("_", "")), int(rig[1]))
+
     def test_lane_e_at_qos1_predicts_the_pending_publish_cap(self):
         # PENDING_PUBLISH_CAP (4096) bounds publishes whose ack is gated on
         # durability. QoS 0 has not entered that table since #492, so this binds
@@ -515,8 +527,11 @@ with_cpu_sampling "$3" work
         # Measured 2026-09-20 at 7 sites over 5 brokers — occupancy at the 12ms
         # RTT floor said 504, and broker3 evicted 104 publishes against the 4,096
         # cap, withholding 104 acks so the rung could not settle its pause.
+        # The mechanism is exercised at the 4,096 cap it was measured against;
+        # the default follows the broker (test below).
         hot = self.run_script("run-curve.sh", str(out), str(inventory), LANES="E", SHAPE_ONLY="1",
-                              LANE_E_QOS="1", LANE_E_SITES_OVERRIDE="4 12")
+                              LANE_E_QOS="1", LANE_E_SITES_OVERRIDE="4 12",
+                              LANE_E_PENDING_PUBLISH_CAP="4096")
         self.assertEqual(hot.returncode, 0, hot.stderr)
         shape = (out / "results/nodes=3/laneE/shape.txt").read_text()
         self.assertIn("PENDING_PUBLISH_CAP=4096", shape)

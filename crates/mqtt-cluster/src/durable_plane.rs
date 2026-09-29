@@ -402,9 +402,39 @@ impl DurablePlane {
     /// Route an inbound durable-plane frame, returning the reply to send back over
     /// the same link (or `None` for replies, which terminate here, and for frames
     /// that are not part of this plane).
+    pub async fn handle(&self, frame: PeerMessage) -> Option<PeerMessage> {
+        self.handle_inner(frame).await
+    }
+
+    /// A follower's `Replicate`, answered without a task in between: the op goes
+    /// straight to the writer that owns its shard, and the writer puts the
+    /// `ReplicateAck` on `lane` once the batch holding it commits. Same verdict as
+    /// [`handle`](Self::handle); the link reader calls this from its own loop, so
+    /// ops also reach the writer in the order they arrived on the link.
+    pub fn submit_replicate(
+        &self,
+        req_id: u64,
+        epoch: crate::lease::Epoch,
+        op: crate::cluster_log::ReplOp,
+        lane: mpsc::WeakUnboundedSender<PeerMessage>,
+    ) {
+        let writer = self.writer_for_key(crate::cluster_log::op_key(&op));
+        let reply = crate::cluster_log::WriteReply::Ack { lane, req_id };
+        if let Err(mpsc::error::SendError((_, _, reply))) = writer.send((epoch, op, reply)) {
+            // Writer gone (shutdown): not durable, so not accepted.
+            reply.send(false);
+        }
+    }
+
+    /// An owner's `ReplicateAck`: wake the append waiting on it. Synchronous, so
+    /// the link reader completes it in place instead of spawning a task.
+    pub fn complete_replicate_ack(&self, req_id: u64, accepted: bool) {
+        self.transport.complete_ack(req_id, accepted);
+    }
+
     // One arm per wire variant — a flat dispatch table, not a refactor smell.
     #[allow(clippy::too_many_lines)]
-    pub async fn handle(&self, frame: PeerMessage) -> Option<PeerMessage> {
+    async fn handle_inner(&self, frame: PeerMessage) -> Option<PeerMessage> {
         match frame {
             // Consensus request → run it against our lease raft, reply with the result.
             PeerMessage::RaftRpc { req_id, payload } => Some(PeerMessage::RaftRpcReply {
@@ -428,7 +458,7 @@ impl DurablePlane {
                 // one file, one writer, one FIFO — the ordering the follower
                 // plane relies on is per key, and a key never changes shard.
                 let writer = self.writer_for_key(crate::cluster_log::op_key(&op));
-                let accepted = if writer.send((epoch, op, reply_tx)).is_ok() {
+                let accepted = if writer.send((epoch, op, reply_tx.into())).is_ok() {
                     reply_rx.await.unwrap_or(false)
                 } else {
                     false
@@ -647,7 +677,7 @@ fn spawn_replica_writer(
                 (mean_commit.mul_f64(0.75)) + commit.mul_f64(0.25)
             };
             for (reply, accepted) in replies.into_iter().zip(results) {
-                let _ = reply.send(accepted);
+                reply.send(accepted);
             }
         }
     });
@@ -1118,7 +1148,7 @@ mod tests {
                     seq: 1,
                     record: vec![i],
                 };
-                writer.send((1, op, tx)).expect("writer alive");
+                writer.send((1, op, tx.into())).expect("writer alive");
                 rx.await.unwrap_or(false)
             }));
         }
