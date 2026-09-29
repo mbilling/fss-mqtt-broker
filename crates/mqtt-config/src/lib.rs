@@ -1891,8 +1891,10 @@ fn redact_url(url: &str, fingerprint: &dyn Fn(&str) -> String) -> String {
         Some(i) => url.split_at(i + 3),
         None => ("", url),
     };
+    // Everything from the first `?` or `#` on is fingerprinted as one; the separator that
+    // was found is kept, so a fragment-only URL still reads as a fragment.
     let (before_query, query) = match rest.find(['?', '#']) {
-        Some(i) => (&rest[..i], Some(&rest[i + 1..])),
+        Some(i) => (&rest[..i], Some((&rest[i..=i], &rest[i + 1..]))),
         None => (rest, None),
     };
     let authority_end = before_query.find('/').unwrap_or(before_query.len());
@@ -1902,8 +1904,8 @@ fn redact_url(url: &str, fingerprint: &dyn Fn(&str) -> String) -> String {
         None => authority.to_string(),
     };
     let mut out = format!("{scheme}{authority}{path}");
-    if let Some(q) = query {
-        out.push('?');
+    if let Some((separator, q)) = query {
+        out.push_str(separator);
         out.push_str(&fingerprint(q));
     }
     out
@@ -2051,7 +2053,9 @@ mod tests {
         c.observability.otlp_endpoint = Some("http://otlpuser:otlppass@collector:4318".into());
         let fp = |s: &str| format!("fp({})", s.len());
         let out = toml::to_string(&c.redacted(&fp)).expect("serializes");
-        for secret in [
+        // The failure messages name a fixture by position, never by value: an assertion
+        // that echoed a fixture would itself be a secret written to the test log.
+        let fixtures = [
             "a1a1",
             "b2b2",
             "c3c3",
@@ -2061,21 +2065,36 @@ mod tests {
             "oidcsecret",
             "otlpuser",
             "otlppass",
-        ] {
-            assert!(!out.contains(secret), "{secret} leaked:\n{out}");
+        ];
+        for (i, fixture) in fixtures.iter().enumerate() {
+            assert!(!out.contains(fixture), "fixture #{i} survived redaction");
         }
-        for readable in [
+        for (i, readable) in [
             "auth.example:8443/check",
             "idp.example/realms/r",
             "collector:4318",
-        ] {
-            assert!(out.contains(readable), "{readable} lost:\n{out}");
+        ]
+        .iter()
+        .enumerate()
+        {
+            assert!(out.contains(readable), "readable part #{i} was lost");
         }
         // Values with nothing secret in them pass through untouched.
         c.security.http_auth.url = Some("https://auth.example/check".into());
         assert_eq!(
             c.redacted(&fp).security.http_auth.url.as_deref(),
             Some("https://auth.example/check")
+        );
+        // A fragment-only URL keeps its `#`: the separator that was found is re-emitted.
+        c.security.oidc.issuer = Some("https://idp.example/realms/r#frag".into());
+        assert_eq!(
+            c.redacted(&fp).security.oidc.issuer.as_deref(),
+            Some("https://idp.example/realms/r#fp(4)")
+        );
+        c.security.oidc.issuer = Some("https://idp.example/realms/r?q=1".into());
+        assert_eq!(
+            c.redacted(&fp).security.oidc.issuer.as_deref(),
+            Some("https://idp.example/realms/r?fp(3)")
         );
     }
 
