@@ -396,7 +396,10 @@ LANE_E_ACK_RTT_MS="${LANE_E_ACK_RTT_MS:-12}"
 # this binds at QoS >= 1 only. Not a refusal: it is a real broker property a
 # capacity lane may want to reach. It is PREDICTED here so it is never reached
 # unannounced, and the rung that reaches it is flagged from the counter.
-LANE_E_PENDING_PUBLISH_CAP="${LANE_E_PENDING_PUBLISH_CAP:-4096}"
+# Must equal hub/mod.rs PENDING_PUBLISH_CAP; test-cloud.py holds the two together
+# (it was left at 4096 after #649 raised the broker's cap to 65,536, so every
+# QoS 1 preflight predicted a bound the broker no longer had).
+LANE_E_PENDING_PUBLISH_CAP="${LANE_E_PENDING_PUBLISH_CAP:-65536}"
 # Clients one driver has been SEEN to connect and hold (see lane_e_shape).
 LANE_E_CLIENTS_PER_DRIVER_PROVEN="${LANE_E_CLIENTS_PER_DRIVER_PROVEN:-2500}"
 # THE STEADY-STATE GATE (2026-09-18). Lane E gated that every client had
