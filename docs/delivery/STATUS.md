@@ -88,7 +88,7 @@
 | [0078](../adr/0078-replica-segment-log.md) | # 0078. The replica store becomes an append-only segment log — the disk is the limit, not the B-tree | Accepted | [3/4 done](0078-replica-segment-log.md) | 1 open |
 | [0079](../adr/0079-global-allocator.md) | # 0079. mqttd links mimalloc as its global allocator | Accepted | [1/2 done](0079-global-allocator.md) | 1 open |
 | [0080](../adr/0080-replication-factor.md) | # 0080. The replication factor is cluster state: configurable, default 2, changeable live | Accepted | [2/6 done](0080-replication-factor.md) | 4 open |
-| [0081](../adr/0081-admin-api.md) | # 0081. An authenticated admin API: reads cluster-wide, actions audited, config stays in the file | Accepted | [0/14 done](0081-admin-api.md) | 12 open, 2 deferred |
+| [0081](../adr/0081-admin-api.md) | # 0081. An authenticated admin API: reads cluster-wide, actions audited, config stays in the file | Accepted | [2/14 done](0081-admin-api.md) | 10 open, 2 deferred |
 
 ## Open and deferred work
 
@@ -231,7 +231,5 @@
 - `0081-T8` ⬜ planned ([#717](https://github.com/mbilling/fss-mqtt-broker/issues/717)): "Cordon / uncordon: refuse new connections and report not-ready without draining" — "Not persisted; shown on /statusz."
 - `0081-T9` ⬜ planned ([#718](https://github.com/mbilling/fss-mqtt-broker/issues/718)): "Log filter override with a TTL (at most one hour), shown on /statusz"
 - `0081-T10` ⬜ planned ([#719](https://github.com/mbilling/fss-mqtt-broker/issues/719)): "OPERATIONS.md: day 0/1/2 runbook using the admin CLI; notes on ADRs 0032/0033/0051 and COMPARISON.md"
-- `0081-T11` ⬜ planned ([#720](https://github.com/mbilling/fss-mqtt-broker/issues/720)): "mqttd --print-config: the effective config with secrets fingerprinted, offline" — "Day 0; independent of the listener and can be picked up at any time."
-- `0081-T12` ⬜ planned ([#721](https://github.com/mbilling/fss-mqtt-broker/issues/721)): "mqttd --check-tls: chain, key match, expiry and SANs for every configured listener" — "Day 0; independent of the listener and can be picked up at any time."
 - `0081-T13` 💤 deferred: "OIDC bearer tokens as a second admin authenticator on the same roles" — "After T1–T9 are in use."
 - `0081-T14` 💤 deferred: "Bulk retained-message deletion by prefix" — "Needs a demonstrated need and a dry-run design (ADR §5)."
