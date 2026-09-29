@@ -1903,8 +1903,22 @@ async fn growth_migrates_moved_sessions_eagerly_and_acks_stay_honest() {
 
     // The subscriber resumes on the session's NEW owner (a joiner): the session
     // is present and EVERY acked payload — before and after the grow — replays.
-    let owner = a.placement.read().unwrap().owner(&sub_id);
-    assert_ne!(owner, a.node_id, "the picked session must have moved");
+    // The move is EVENTUAL: the group keeps its old lease until the lease leader
+    // reassigns it, Raft commits that, and the durable tick pushes it into A's
+    // placement (`owner` is the committed holder, HRW only without one). Wait for
+    // it rather than read one instant after the grow (issue #707).
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let owner = loop {
+        let owner = a.placement.read().unwrap().owner(&sub_id);
+        if owner != a.node_id {
+            break owner;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the picked session never moved off the founder after the grow"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
     let owner_addr = [&a, &b, &c]
         .iter()
         .find(|n| n.node_id == owner)
