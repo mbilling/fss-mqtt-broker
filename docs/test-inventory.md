@@ -985,7 +985,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 491 test(s)
+## `crates/mqttd/src/lib.rs` — 495 test(s)
 
 - `admin::cli::tests::answers_render_as_tables_and_lines`
 - `admin::cli::tests::invocations_are_validated_before_anything_runs`
@@ -1442,6 +1442,10 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::two_groups_on_one_filter_rotate_independently`
 - `hub::tests::two_publishes_to_one_offline_subscriber_append_in_arrival_order`
 - `hub::tests::without_no_local_a_publisher_receives_its_own_delivery`
+- `log_filter::tests::a_newer_override_is_not_ended_by_the_older_timer`
+- `log_filter::tests::an_override_applies_then_expires_back_to_the_base`
+- `log_filter::tests::audit_directives_are_recognized`
+- `log_filter::tests::bad_filters_and_the_audit_target_are_refused_and_ttl_is_capped`
 - `memory_watch::tests::a_similar_looking_line_is_not_mistaken_for_vm_rss`
 - `memory_watch::tests::a_status_without_vm_rss_yields_none_not_zero`
 - `memory_watch::tests::an_unreadable_rss_stops_the_watcher_instead_of_reporting_zero`
@@ -1512,9 +1516,10 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `narrow_allow_does_not_cover_broad_subscription`
 - `unauthorized_will_topic_is_refused_at_connect`
 
-## `crates/mqttd/tests/admin.rs` — 15 test(s)
+## `crates/mqttd/tests/admin.rs` — 16 test(s)
 
 - `a_certificate_from_another_ca_fails_the_handshake`
+- `a_log_override_is_an_operator_action_that_never_silences_audit`
 - `a_session_shows_its_subscriptions_and_an_offline_one_its_queue`
 - `an_action_on_another_nodes_session_is_forwarded_to_its_owner`
 - `any_node_answers_for_the_cluster_and_a_silent_node_is_listed_as_silent`

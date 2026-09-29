@@ -45,7 +45,7 @@ tasks:
     notes: "Not persisted; shown on /statusz."
   - id: 0081-T9
     title: "Log filter override with a TTL (at most one hour), shown on /statusz"
-    status: planned
+    status: in-progress
     issue: 718
   - id: 0081-T10
     title: "OPERATIONS.md: day 0/1/2 runbook using the admin CLI; notes on ADRs 0032/0033/0051 and COMPARISON.md"
@@ -87,7 +87,7 @@ frontmatter above · this file is the plan, progress log, and changelog.
 | 0081-T6 | 🚧 in-progress | [#715](https://github.com/mbilling/fss-mqtt-broker/issues/715) | — | "First action. Reload runs the ADR 0032 routine; the file stays the only input." |
 | 0081-T7 | 🚧 in-progress | [#716](https://github.com/mbilling/fss-mqtt-broker/issues/716) | — | "Audited on the node receiving the call and on the node acting." |
 | 0081-T8 | 🚧 in-progress | [#717](https://github.com/mbilling/fss-mqtt-broker/issues/717) | — | "Not persisted; shown on /statusz." |
-| 0081-T9 | ⬜ planned | [#718](https://github.com/mbilling/fss-mqtt-broker/issues/718) | — |  |
+| 0081-T9 | 🚧 in-progress | [#718](https://github.com/mbilling/fss-mqtt-broker/issues/718) | — |  |
 | 0081-T10 | ⬜ planned | [#719](https://github.com/mbilling/fss-mqtt-broker/issues/719) | — |  |
 | 0081-T11 | ⬜ planned | [#720](https://github.com/mbilling/fss-mqtt-broker/issues/720) | — | "Day 0; independent of the listener and can be picked up at any time." |
 | 0081-T12 | ⬜ planned | [#721](https://github.com/mbilling/fss-mqtt-broker/issues/721) | — | "Day 0; independent of the listener and can be picked up at any time." |
