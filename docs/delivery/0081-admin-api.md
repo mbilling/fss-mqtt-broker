@@ -1,7 +1,7 @@
 ---
 adr: "0081"
 title: "An authenticated admin API: reads cluster-wide, actions audited, config stays in the file"
-adr_status: Proposed
+adr_status: Accepted
 tasks:
   - id: 0081-T1
     title: "Admin listener: [admin] bind, mTLS required, viewer/operator roles from the cert subject, every request audited, /admin/v1/node"
@@ -123,3 +123,4 @@ the reads it depends on.
 ## Changelog
 
 - 2026-09-29: ADR proposed; tasks and issues filed.
+- 2026-09-29: ADR accepted.

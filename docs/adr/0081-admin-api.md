@@ -1,6 +1,6 @@
 # 0081. An authenticated admin API: reads cluster-wide, actions audited, config stays in the file
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-09-29
 - **Deciders:** project maintainers
 - **Delivery:** [docs/delivery/0081-admin-api.md](../delivery/0081-admin-api.md) — plan, progress, and changelog
