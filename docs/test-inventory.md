@@ -697,7 +697,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 
 - `publish_codec_round_trip_clears_the_floor`
 
-## `crates/mqtt-config/src/lib.rs` — 38 test(s)
+## `crates/mqtt-config/src/lib.rs` — 39 test(s)
 
 - `tests::a_backup_dir_inside_the_data_dir_is_a_config_error`
 - `tests::a_bad_enum_value_is_rejected`
@@ -725,6 +725,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::ownership_domain_parses_both_values_and_refuses_others`
 - `tests::per_listener_anonymous_overrides_are_tri_state`
 - `tests::per_var_boolean_conventions_are_honoured`
+- `tests::redacted_config_prints_no_secret`
 - `tests::requiring_both_factors_needs_a_client_ca_and_a_password_verifier`
 - `tests::the_env_surface_is_a_deduplicated_curated_list`
 - `tests::the_gossip_key_is_inline_xor_by_reference`
@@ -979,7 +980,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 469 test(s)
+## `crates/mqttd/src/lib.rs` — 476 test(s)
 
 - `admission::tests::the_global_cap_refuses_at_the_bound_and_recovers`
 - `admission::tests::the_penalty_box_refuses_after_the_threshold`
@@ -1028,6 +1029,8 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `cluster::tests::alive_without_routing_address_is_skipped`
 - `cluster::tests::larger_node_id_does_not_dial`
 - `cluster::tests::member_states_drive_the_gauge`
+- `config_view::tests::fingerprint_is_stable_and_hides_the_value`
+- `config_view::tests::the_printed_config_carries_no_inline_key`
 - `config_watch::tests::a_rejected_reload_is_retried_until_it_parses`
 - `config_watch::tests::a_settled_edit_applies_exactly_once`
 - `config_watch::tests::an_atomic_rename_is_detected`
@@ -1450,6 +1453,11 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `store_watch::tests::the_poll_policy_only_accelerates_near_the_mark`
 - `store_watch::tests::the_store_skew_report_is_edge_triggered_with_hysteresis`
 - `store_watch::tests::the_watcher_drives_brownout_on_watermark_transitions`
+- `tls_check::tests::a_chain_in_the_wrong_order_fails`
+- `tls_check::tests::a_key_that_does_not_match_fails`
+- `tls_check::tests::expired_and_expiring_leaves_are_flagged`
+- `tls_check::tests::nothing_configured_is_a_single_ok_line`
+- `tls_check::tests::valid_material_passes_and_reports_names`
 
 ## `crates/mqttd/src/main.rs` — 18 test(s)
 

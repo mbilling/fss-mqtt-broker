@@ -30,6 +30,11 @@ mqtt-storage = { path = "../mqtt-storage", version = "1.0.0" }
 mqtt-cluster = { path = "../mqtt-cluster", version = "1.0.0" }
 mqtt-observability = { path = "../mqtt-observability", version = "1.0.0" }
 mqtt-config = { path = "../mqtt-config", version = "1.0.0" }
+# `mqttd --print-config` renders the redacted config as TOML, and `--check-tls` reads
+# certificate validity, names and CRLs (ADR 0081 T11/T12). Both already in the tree via
+# mqtt-config and mqtt-auth — not new supply-chain crates.
+toml.workspace = true
+x509-parser = { workspace = true }
 
 tokio.workspace = true
 # CancellationToken + TaskTracker for graceful shutdown (ADR 0019)

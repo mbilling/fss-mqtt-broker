@@ -10,6 +10,7 @@ pub mod backpressure;
 pub mod backup;
 pub mod clock;
 pub mod cluster;
+pub mod config_view;
 pub mod config_watch;
 pub mod conn;
 pub mod health;
@@ -21,5 +22,6 @@ pub mod peer;
 pub mod reload;
 pub mod store_probe;
 pub mod store_watch;
+pub mod tls_check;
 
 pub use hub::{Hub, HubCommand};
