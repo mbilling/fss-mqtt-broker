@@ -120,7 +120,7 @@ fn partitioned_fixture() -> Fix {
 /// because an off-loop completion takes several polls to travel (the lane
 /// worker is woken, its store future resolves, then it sends), and returning on
 /// the first quiet round would be a race dressed up as a quiescence check.
-async fn quiesce(hub: &mut Hub) {
+pub(super) async fn quiesce(hub: &mut Hub) {
     const IDLE_ROUNDS: u32 = 8;
     let mut idle = 0;
     for _ in 0..256 {

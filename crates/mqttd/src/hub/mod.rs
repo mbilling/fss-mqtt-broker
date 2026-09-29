@@ -1463,8 +1463,8 @@ pub enum HubCommand {
     /// An **acknowledged** publish forward from a peer (ADR 0042 T9, exhibit ⑤;
     /// proto 3): local delivery only (never re-forwarded), answered with a
     /// durability-gated [`PeerMessage::PublishAck`] once the local fan-out —
-    /// including any durable offline enqueue — has completed. Duplicates
-    /// (retransmissions) are delivered again: legal at `QoS` 1.
+    /// including any durable offline enqueue — has completed. A retransmission
+    /// of a forward already applied is answered again, not re-applied (issue #648).
     RemotePublishAcked {
         /// The peer the forward arrived from (where the ack is sent).
         node: NodeId,
@@ -2027,7 +2027,8 @@ pub struct Hub {
     pending_publishes: forwarding::PendingTable,
     /// Monotonic pending-publish id source.
     publish_ids: u64,
-    /// Per-node monotonic forward sequence (ADR 0042 T9, exhibit ⑤).
+    /// Per-node monotonic forward sequence (ADR 0042 T9, exhibit ⑤). Starts at a
+    /// random point per process (issue #648, [`forwarding::initial_forward_seq`]).
     forward_seq: u64,
     /// Forward seq → pending publish id, for answer resolution.
     forward_index: HashMap<u64, u64>,
@@ -2175,6 +2176,11 @@ pub struct Hub {
     /// (issue #242): `(origin, seq)` → what is still owed before the verdict can be
     /// answered. Entries drain via [`HubCommand::AppendDone`].
     remote_append_pending: HashMap<(NodeId, u64), RemoteAppendGate>,
+    /// Receiver side of acked forwards (issue #648): per origin, the forwards
+    /// recently applied and the answer each got, so a retransmission is answered
+    /// again instead of applied again. Bounded per origin by
+    /// [`forwarding::FORWARD_WINDOW`]; an origin's window is dropped when it dies.
+    forward_windows: HashMap<NodeId, forwarding::ForwardWindow>,
     /// Prometheus metrics (ADR 0020), when enabled. Updated on the publish/deliver paths.
     metrics: Option<Arc<mqtt_observability::metrics::Metrics>>,
     /// Shared brownout state for the `/statusz` body (ADR 0054), flipped alongside
@@ -2324,6 +2330,7 @@ impl Hub {
                 qos2_retire_inflight: HashSet::new(),
                 qos2_epoch: HashMap::new(),
                 remote_append_pending: HashMap::new(),
+                forward_windows: HashMap::new(),
                 node_id,
                 online: HashMap::new(),
                 pending_wills: HashMap::new(),
@@ -2371,7 +2378,7 @@ impl Hub {
                 retained_handoff_pending: HashMap::new(),
                 pending_publishes: forwarding::PendingTable::default(),
                 publish_ids: 0,
-                forward_seq: 0,
+                forward_seq: forwarding::initial_forward_seq(),
                 forward_index: HashMap::new(),
                 durable_writes: 0,
                 inherited_scan_inflight: false,
@@ -2894,11 +2901,19 @@ impl Hub {
                 message_expiry,
                 app,
             } => {
+                // A retransmission of a forward already applied here is answered
+                // (again) or left to its in-flight append, never applied twice
+                // (issue #648).
+                if self.forward_is_repeat(
+                    &node,
+                    seq,
+                    forwarding::forward_fingerprint(None, &topic, &payload),
+                ) {
+                    return;
+                }
                 // An acked forward (ADR 0042 T9, exhibit ⑤): apply locally like
                 // RemotePublish, then answer with a durability-gated ack — sent only
-                // after the local fan-out, durable offline enqueues included. A
-                // retransmission is delivered again (duplicates are legal at QoS 1),
-                // so no receiver dedup state is needed.
+                // after the local fan-out, durable offline enqueues included.
                 //
                 // A fan-out that matched NOBODY while this node's routing view is
                 // still settling (mid-boot, a takeover/membership window, a moved
@@ -2970,6 +2985,14 @@ impl Hub {
                 message_expiry,
                 app,
             } => {
+                // A retransmission is answered, not delivered again (issue #648).
+                if self.forward_is_repeat(
+                    &node,
+                    seq,
+                    forwarding::forward_fingerprint(Some(client.as_str()), &topic, &payload),
+                ) {
+                    return;
+                }
                 // The answerable form of `RemoteSharedDeliver` (0041-T12, issue #238):
                 // the outcome is no longer discarded. A gated cross-node shared delivery
                 // is durability-gated on the OWNING node and answered, so the origin can
@@ -6433,6 +6456,9 @@ impl Hub {
     /// link's pump on whichever side still holds the socket open.
     fn peer_dead(&mut self, node: &NodeId) {
         let had_link = self.peers.remove(node).is_some();
+        // A dead origin retransmits nothing: its forwards died with it, and a
+        // successor sends under its own seqs (issue #648).
+        self.forward_windows.remove(node);
         self.known_peer_protos.remove(node);
         let had_interest = self.interest.remove(node);
         self.remote_shared.remove(node);
@@ -6931,6 +6957,7 @@ async fn recover_once(
 
 #[cfg(test)]
 mod tests {
+    mod forward_repeat;
     mod pending_gauges;
     mod qos2_retirement;
     mod remote_group_index;
