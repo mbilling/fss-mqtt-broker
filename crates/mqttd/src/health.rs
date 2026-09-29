@@ -485,7 +485,7 @@ impl HealthState {
     /// material is ever included.
     // A flat, section-by-section JSON assembly — long by field count, not complexity.
     #[allow(clippy::too_many_lines)]
-    async fn statusz(&self) -> Option<String> {
+    pub async fn statusz(&self) -> Option<String> {
         use std::fmt::Write;
         let (node_id, cluster) = self.identity.as_ref()?;
         let report = self.readiness().await;

@@ -92,6 +92,7 @@ the stream proves itself (the external-anchoring model; see the
 | `security.sweep` | identity | A live session terminated by a policy sweep (ADR 0040) |
 | `security.evict` | identity | A live session's grants tightened/evicted on reload |
 | `security.penalty` | source addr | Auth-failure penalty box engaged for a source (ADR 0041 T2) |
+| `admin.request` | certificate subject | An admin API request was answered (ADR 0081); `detail` is `role=<role> <METHOD> <target> -> <status>`, refusals included |
 
 ## Verification
 

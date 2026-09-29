@@ -365,6 +365,87 @@ pub fn server_config_versions(
     Ok(config)
 }
 
+/// Build the admin API acceptor ([ADR 0081](../../../docs/adr/0081-admin-api.md) §1): TLS
+/// 1.3, a client certificate **required**, trusted when it chains to a CA in any of
+/// `client_cas` (the admin client CA, plus the cluster CA so peers can query each other).
+/// Resumption is off: every admin connection is fully re-verified, and the listener's
+/// request rate is too low for a ticket cache to matter.
+///
+/// # Errors
+/// [`NetError::Tls`] if any file is missing or unparseable, the key does not match, or
+/// `client_cas` is empty.
+pub fn admin_acceptor(
+    cert_chain: &Path,
+    key: &Path,
+    client_cas: &[&Path],
+) -> Result<TlsAcceptor, NetError> {
+    let Some(first) = client_cas.first() else {
+        return Err(NetError::Tls(
+            "the admin listener needs a client CA bundle".to_string(),
+        ));
+    };
+    let mut roots = RootCertStore::empty();
+    for ca in client_cas {
+        for cert in load_certs(ca)? {
+            roots
+                .add(cert)
+                .map_err(|e| tls_err("CA certificate", ca, &e))?;
+        }
+    }
+    let verifier = WebPkiClientVerifier::builder_with_provider(Arc::new(roots), provider())
+        .build()
+        .map_err(|e| tls_err("client certificate verifier", first, &e))?;
+    let mut config = ServerConfig::builder_with_provider(provider())
+        .with_protocol_versions(TLS_VERSIONS)
+        .map_err(|e| tls_err("TLS server configuration", cert_chain, &e))?
+        .with_client_cert_verifier(verifier)
+        .with_single_cert(load_certs(cert_chain)?, load_key(key)?)
+        .map_err(|e| tls_err("server certificate/key", cert_chain, &e))?;
+    config.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
+    Ok(TlsAcceptor::from(Arc::new(config)))
+}
+
+/// Checks whether a client certificate chain was issued by one particular CA bundle.
+///
+/// The admin listener trusts two CAs at the handshake (ADR 0081); after it, this tells
+/// the two apart, so a certificate the cluster CA issued can be given the `peer` role
+/// without trusting a subject string alone.
+pub struct ChainCheck {
+    verifier: Arc<dyn rustls::server::danger::ClientCertVerifier>,
+}
+
+impl std::fmt::Debug for ChainCheck {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChainCheck").finish_non_exhaustive()
+    }
+}
+
+impl ChainCheck {
+    /// A check against the CA bundle at `ca`.
+    ///
+    /// # Errors
+    /// [`NetError::Tls`] if the bundle cannot be read or is empty.
+    pub fn new(ca: &Path) -> Result<Self, NetError> {
+        let verifier =
+            WebPkiClientVerifier::builder_with_provider(Arc::new(load_roots(ca)?), provider())
+                .build()
+                .map_err(|e| tls_err("client certificate verifier", ca, &e))?;
+        Ok(Self { verifier })
+    }
+
+    /// Whether `chain` (leaf first, as the handshake presented it) verifies against this
+    /// bundle now.
+    #[must_use]
+    pub fn verifies(&self, chain: &[CertificateDer<'_>]) -> bool {
+        let Some((leaf, intermediates)) = chain.split_first() else {
+            return false;
+        };
+        self.verifier
+            .verify_client_cert(leaf, intermediates, rustls::pki_types::UnixTime::now())
+            .is_ok()
+    }
+}
+
 /// Build a dialing-side connector for the cluster bus: verifies the remote
 /// against `ca` and presents `cert_chain`/`key` as our client identity (mTLS).
 ///

@@ -184,6 +184,8 @@
 //! **`--backup [--pid <n>] [--timeout <secs>]`** (ADR 0062) sends `SIGUSR2` to the running broker
 //! and waits for a new export file to appear under the configured `[backup] dir`, so a cron job or
 //! a `kubectl exec` can take a backup on an image with no shell.
+//! **`--admin <verb> [args]`** (ADR 0081) calls a running broker's authenticated admin API
+//! over mTLS and prints the answer; `mqttd --admin help` lists the verbs.
 
 /// The process allocator (ADR 0079). The shipped binary is static musl, whose
 /// `malloc` serializes concurrent allocation: with the tokio workers allocating
@@ -231,6 +233,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // single provider compiled into the build this is belt-and-braces determinism — no
     // binary or test can silently resolve a different stack.
     let _ = tokio_rustls::rustls::crypto::aws_lc_rs::default_provider().install_default();
+    // `--admin <verb>` (ADR 0081 §3): a client of a running broker's admin API. First, so
+    // `--admin … --help` is the admin help, and before logging: its output is the answer.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(rest) = args.strip_prefix(&["--admin".to_string()]) {
+        std::process::exit(mqttd::admin::cli::run(rest).await);
+    }
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
@@ -645,7 +653,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // handle to stop openraft cleanly on shutdown.
     let plane_for_shutdown = durable_plane.clone();
     let startup_complete = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let (draining, decommission_slot) = start_health(
+    let (draining, decommission_slot, health_state) = start_health(
         &config,
         &hub_tx,
         &placement,
@@ -697,6 +705,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         metrics.clone(),
     )?;
     let audit_for_shutdown = policy.audit.clone();
+    let audit_for_admin = policy.audit.clone();
     reloader.attach_config_stamp(config_stamp.clone());
 
     // Fold the cluster-bus gossip CRL (ADR 0022 T7) into the same validate-before-swap
@@ -1009,6 +1018,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // configured policy file changes on disk (the Kubernetes ConfigMap case), through the same
     // fail-safe reload. Off by default — signal-driven reload stays the default.
     spawn_config_watcher(&config, reloader, &shutdown);
+
+    // The authenticated admin API (ADR 0081), when `admin.bind` is set. After the client
+    // listeners, like them: it reports a node that is actually serving.
+    start_admin(
+        &config,
+        &node_id,
+        health_state,
+        &live_config,
+        audit_for_admin,
+    )
+    .await?;
 
     // Run until a shutdown signal, then drain gracefully (ADR 0019).
     graceful_shutdown(
@@ -2409,19 +2429,12 @@ async fn start_health(
     (
         Arc<std::sync::atomic::AtomicBool>,
         Arc<std::sync::OnceLock<Arc<mqtt_cluster::decommission::DrainStatus>>>,
+        mqttd::health::HealthState,
     ),
     Box<dyn std::error::Error>,
 > {
     let health_bind = config.listeners.health_bind.clone();
     let metrics_bind = config.listeners.metrics_bind.clone();
-    if health_bind.is_none() && metrics_bind.is_none() {
-        // Neither server: hand back standalone handles so the caller's shutdown
-        // path is uniform (nothing reads them).
-        return Ok((
-            Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            Arc::new(std::sync::OnceLock::new()),
-        ));
-    }
     // `validate()` guarantees ready_min_members ≥ 1.
     let min_members = config.runtime.ready_min_members;
     // One state serves both binds: health endpoints plus `/metrics` (ADR 0020).
@@ -2465,6 +2478,8 @@ async fn start_health(
         Some(flag) => state.with_swim_isolated(flag),
         None => state,
     };
+    // The state is built even with neither server bound: the admin API (ADR 0081)
+    // answers `/admin/v1/node` from it, and the caller's shutdown path reads its handles.
     let draining = state.draining_handle();
     let decommission = state.decommission_slot();
     if let Some(bind) = &health_bind {
@@ -2477,10 +2492,50 @@ async fn start_health(
         if Some(bind) != health_bind.as_ref() {
             let listener = TcpListener::bind(bind).await?;
             info!(%bind, "serving /metrics on a separate bind (ADR 0020)");
-            tokio::spawn(mqttd::health::serve(listener, state));
+            tokio::spawn(mqttd::health::serve(listener, state.clone()));
         }
     }
-    Ok((draining, decommission))
+    Ok((draining, decommission, state))
+}
+
+/// Start the admin API listener (ADR 0081) when `admin.bind` is set; a no-op otherwise.
+/// Its TLS trusts the admin client CA and, on a cluster node, the cluster CA — the latter
+/// only so peers can read each other's state (the `peer` role).
+async fn start_admin(
+    config: &Config,
+    node_id: &NodeId,
+    health: mqttd::health::HealthState,
+    live_config: &Arc<RwLock<Config>>,
+    audit: Arc<dyn mqtt_observability::AuditSink>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let admin = &config.admin;
+    let Some(bind) = &admin.bind else {
+        return Ok(());
+    };
+    // `Config::validate` refuses a bind without these; this is the same refusal, typed.
+    let (Some(cert), Some(key), Some(client_ca)) = (&admin.cert, &admin.key, &admin.client_ca)
+    else {
+        return Err("admin.bind needs admin.cert, admin.key and admin.client_ca".into());
+    };
+    let cluster_ca = config.cluster.peer_tls.ca.as_deref().map(Path::new);
+    let mut cas = vec![Path::new(client_ca)];
+    cas.extend(cluster_ca);
+    let acceptor = tls::admin_acceptor(Path::new(cert), Path::new(key), &cas)?;
+    let mut state =
+        mqttd::admin::AdminState::new(node_id.0.clone(), health, live_config.clone(), audit);
+    if let Some(ca) = cluster_ca {
+        state = state.with_cluster_ca(tls::ChainCheck::new(ca)?);
+    }
+    let listener = TcpListener::bind(bind).await?;
+    info!(
+        %bind,
+        viewers = admin.viewers.len(),
+        operators = admin.operators.len(),
+        peers = cluster_ca.is_some(),
+        "serving the admin API (mTLS; ADR 0081)"
+    );
+    tokio::spawn(mqttd::admin::serve(listener, acceptor, state));
+    Ok(())
 }
 
 fn queue_limits_from_config(config: &Config) -> Result<QueueLimits, Box<dyn std::error::Error>> {
@@ -3876,6 +3931,10 @@ fn unknown_flags<I: IntoIterator<Item = String>>(args: I) -> Vec<String> {
 /// network or process signals are touched here. Values must follow their option;
 /// positional arguments are allowed only immediately after hash/probe commands.
 fn validate_cli(args: &[String]) -> Result<(), String> {
+    // `--admin <verb> …` (ADR 0081) owns everything after it; its own validator applies.
+    if let Some(rest) = args.strip_prefix(&["--admin".to_string()]) {
+        return mqttd::admin::cli::validate(rest);
+    }
     let unknown = unknown_flags(args.iter().cloned());
     if !unknown.is_empty() {
         return Err(format!("unrecognised argument(s): {}", unknown.join(", ")));
@@ -3970,6 +4029,7 @@ fn print_usage() {
            mqttd --probe [/readyz]   query the running broker's health endpoint and exit\n  \
            mqttd --decommission      drain and gracefully stop the running broker\n  \
            mqttd --backup            take an online backup on the running broker and wait\n  \
+           mqttd --admin <verb>      call a running broker's admin API (mqttd --admin help)\n  \
            mqttd --version           print the version and exit\n  \
            mqttd --help              print this help and exit\n\n\
          OPTIONS:\n  \
@@ -4967,6 +5027,15 @@ mod tests {
                 "--timeout",
                 "10",
             ],
+            vec!["--admin", "node"],
+            vec![
+                "--admin",
+                "whoami",
+                "--json",
+                "--url",
+                "https://127.0.0.1:9443",
+            ],
+            vec!["--admin", "help"],
         ] {
             let values: Vec<_> = args.iter().map(ToString::to_string).collect();
             assert!(
@@ -5009,6 +5078,13 @@ mod tests {
             vec!["--version", "--backup"],
             vec!["--help", "--version"],
             vec!["--help", "stray"],
+            vec!["--admin"],
+            vec!["--admin", "nope"],
+            vec!["--admin", "node", "stray"],
+            vec!["--admin", "node", "--pid", "1"],
+            // `--admin` is the command word: it must come first.
+            vec!["node", "--admin"],
+            vec!["--probe", "--admin", "node"],
         ] {
             let values: Vec<_> = args.iter().map(ToString::to_string).collect();
             assert!(

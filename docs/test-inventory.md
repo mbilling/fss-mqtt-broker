@@ -697,7 +697,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 
 - `publish_codec_round_trip_clears_the_floor`
 
-## `crates/mqtt-config/src/lib.rs` — 38 test(s)
+## `crates/mqtt-config/src/lib.rs` — 39 test(s)
 
 - `tests::a_backup_dir_inside_the_data_dir_is_a_config_error`
 - `tests::a_bad_enum_value_is_rejected`
@@ -726,6 +726,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::per_listener_anonymous_overrides_are_tri_state`
 - `tests::per_var_boolean_conventions_are_honoured`
 - `tests::requiring_both_factors_needs_a_client_ca_and_a_password_verifier`
+- `tests::the_admin_listener_needs_tls_a_role_and_its_own_bind`
 - `tests::the_env_surface_is_a_deduplicated_curated_list`
 - `tests::the_gossip_key_is_inline_xor_by_reference`
 - `tests::the_new_per_subscriber_bounds_are_refused_out_of_range`
@@ -979,8 +980,18 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 469 test(s)
+## `crates/mqttd/src/lib.rs` — 479 test(s)
 
+- `admin::cli::tests::answers_render_as_tables_and_lines`
+- `admin::cli::tests::invocations_are_validated_before_anything_runs`
+- `admin::client::tests::responses_split_into_status_and_body`
+- `admin::client::tests::urls_need_https_and_a_port`
+- `admin::http::tests::a_get_with_a_query_is_decoded`
+- `admin::http::tests::a_post_body_is_read_to_its_length`
+- `admin::http::tests::encode_and_decode_round_trip`
+- `admin::http::tests::oversized_and_malformed_requests_are_refused`
+- `admin::roles::tests::operator_wins_and_cluster_certificates_are_peers`
+- `admin::roles::tests::subjects_map_to_roles`
 - `admission::tests::the_global_cap_refuses_at_the_bound_and_recovers`
 - `admission::tests::the_penalty_box_refuses_after_the_threshold`
 - `admission::tests::the_penalty_decays_back_to_admission`
@@ -1483,6 +1494,14 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `identity_substitution_scopes_topics`
 - `narrow_allow_does_not_cover_broad_subscription`
 - `unauthorized_will_topic_is_refused_at_connect`
+
+## `crates/mqttd/tests/admin.rs` — 5 test(s)
+
+- `a_certificate_from_another_ca_fails_the_handshake`
+- `cluster_certificates_get_the_peer_role`
+- `every_request_is_audited_with_subject_role_and_outcome`
+- `listed_subjects_get_their_role_and_everyone_else_is_refused`
+- `node_reports_the_statusz_body_and_unknown_routes_have_stable_codes`
 
 ## `crates/mqttd/tests/audit.rs` — 4 test(s)
 
