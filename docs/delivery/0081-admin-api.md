@@ -29,12 +29,13 @@ tasks:
     evidence: "PR #731. /admin/v1/clients (filters, paging, total), /session (subscriptions, in flight, backlog, Will without payload, owner, offline queued count capped at 10 000), /subscribers (bounded page), /backlog, /retained (subtree via the match index, no payloads). HubCommand::Admin handled in hub/admin.rs; store I/O off the hub loop; Admission.source threaded from handle_stream. Three integration tests with real MQTT clients."
   - id: 0081-T5
     title: "Authorization dry run: /admin/v1/authz/check returns the verdict and the deciding rule"
-    status: in-progress
+    status: done
     issue: 714
-    notes: "Evaluates the loaded policy; changes nothing."
+    date: 2026-09-30
+    evidence: "PR #732. GET /admin/v1/authz: verdict, deciding rule (index, effect, pattern as written and expanded) and reason from the live authorizer; invalid filters and publish wildcards refused before the policy. mqtt-auth Authorizer::explain, with AclPolicy sharing one evaluator between enforcement and the dry run (allocation-free Decider); explain_always_agrees_with_enforcement grid test plus mTLS integration test."
   - id: 0081-T6
     title: "Effective config (secrets fingerprinted, with a hash) and reload that returns its outcome"
-    status: planned
+    status: in-progress
     issue: 715
     notes: "First action. Reload runs the ADR 0032 routine; the file stays the only input."
   - id: 0081-T7
@@ -89,8 +90,8 @@ frontmatter above · this file is the plan, progress log, and changelog.
 | 0081-T2 | ✅ done | [#711](https://github.com/mbilling/fss-mqtt-broker/issues/711) | 2026-09-29 | "PR #729. mqttd --admin <verb> (crates/mqttd/src/admin/cli.rs, client.rs): table-driven verbs validated before anything runs, flags or MQTTD_ADMIN_* client variables with config fallbacks, table or --json output, exit 0/1/2. Smoke-tested against the real binary (whoami, node, 403 for an unlisted subject)." |
 | 0081-T3 | ✅ done | [#712](https://github.com/mbilling/fss-mqtt-broker/issues/712) | 2026-09-29 | "PR #730. GET /admin/v1/cluster and /admin/v1/placement answered by any node: its members from /statusz, each peer's admin listener asked in parallel (3 s) under the cluster certificate (peer role), silent nodes listed with the reason; summary agreement on cluster id, version, config and membership. Node-to-node over the admin listeners per the ADR's 2026-09-29 amendment. tests/admin.rs three-node test with a refused peer; peer role cannot fan out." |
 | 0081-T4 | ✅ done | [#713](https://github.com/mbilling/fss-mqtt-broker/issues/713) | 2026-09-30 | "PR #731. /admin/v1/clients (filters, paging, total), /session (subscriptions, in flight, backlog, Will without payload, owner, offline queued count capped at 10 000), /subscribers (bounded page), /backlog, /retained (subtree via the match index, no payloads). HubCommand::Admin handled in hub/admin.rs; store I/O off the hub loop; Admission.source threaded from handle_stream. Three integration tests with real MQTT clients." |
-| 0081-T5 | 🚧 in-progress | [#714](https://github.com/mbilling/fss-mqtt-broker/issues/714) | — | "Evaluates the loaded policy; changes nothing." |
-| 0081-T6 | ⬜ planned | [#715](https://github.com/mbilling/fss-mqtt-broker/issues/715) | — | "First action. Reload runs the ADR 0032 routine; the file stays the only input." |
+| 0081-T5 | ✅ done | [#714](https://github.com/mbilling/fss-mqtt-broker/issues/714) | 2026-09-30 | "PR #732. GET /admin/v1/authz: verdict, deciding rule (index, effect, pattern as written and expanded) and reason from the live authorizer; invalid filters and publish wildcards refused before the policy. mqtt-auth Authorizer::explain, with AclPolicy sharing one evaluator between enforcement and the dry run (allocation-free Decider); explain_always_agrees_with_enforcement grid test plus mTLS integration test." |
+| 0081-T6 | 🚧 in-progress | [#715](https://github.com/mbilling/fss-mqtt-broker/issues/715) | — | "First action. Reload runs the ADR 0032 routine; the file stays the only input." |
 | 0081-T7 | ⬜ planned | [#716](https://github.com/mbilling/fss-mqtt-broker/issues/716) | — | "Audited on the node receiving the call and on the node acting." |
 | 0081-T8 | ⬜ planned | [#717](https://github.com/mbilling/fss-mqtt-broker/issues/717) | — | "Not persisted; shown on /statusz." |
 | 0081-T9 | ⬜ planned | [#718](https://github.com/mbilling/fss-mqtt-broker/issues/718) | — |  |

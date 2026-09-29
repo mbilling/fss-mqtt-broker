@@ -20,6 +20,7 @@ pub mod authz;
 pub mod cli;
 pub mod client;
 pub mod cluster;
+pub mod config;
 pub mod http;
 pub mod roles;
 mod routes;
@@ -58,6 +59,8 @@ pub struct AdminState {
     sessions: Option<Arc<sessions::SessionAccess>>,
     /// The live authorizer, for the dry run (T5).
     authz: Option<authz::LiveAuthorizer>,
+    /// The reloader and config stamp, for the config and reload endpoints (T6).
+    reload: Option<Arc<config::ReloadAccess>>,
 }
 
 impl std::fmt::Debug for AdminState {
@@ -88,7 +91,15 @@ impl AdminState {
             peers: None,
             sessions: None,
             authz: None,
+            reload: None,
         }
+    }
+
+    /// Serve the effective config and the reload action.
+    #[must_use]
+    pub fn with_reload(mut self, access: config::ReloadAccess) -> Self {
+        self.reload = Some(Arc::new(access));
+        self
     }
 
     /// Serve the authorization dry run against the live policy.

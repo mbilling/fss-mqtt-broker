@@ -75,6 +75,22 @@ const VERBS: &[Verb] = &[
         help: "this node's membership, replication and lease view; do the others agree",
     },
     Verb {
+        name: "config",
+        method: "GET",
+        path: "/admin/v1/config",
+        required: &[],
+        optional: &[],
+        help: "the effective config (secrets fingerprinted) and the file checksum",
+    },
+    Verb {
+        name: "reload",
+        method: "POST",
+        path: "/admin/v1/reload",
+        required: &[],
+        optional: &[],
+        help: "operator: reload the config file, as SIGHUP does, and report the outcome",
+    },
+    Verb {
         name: "authz",
         method: "GET",
         path: "/admin/v1/authz",
@@ -374,6 +390,15 @@ pub async fn run(args: &[String]) -> i32 {
                 }
                 0
             } else {
+                // `--json` gets the whole answer, refusals included (a rejected reload
+                // carries its `outcome`); exit 1 still says it was refused.
+                if inv.json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&value).unwrap_or_default()
+                    );
+                    return 1;
+                }
                 let code = value
                     .pointer("/error/code")
                     .and_then(Value::as_str)
@@ -383,6 +408,9 @@ pub async fn run(args: &[String]) -> i32 {
                     .and_then(Value::as_str)
                     .unwrap_or("");
                 eprintln!("mqttd: {status} {code}: {message}");
+                if let Some(outcome) = value.get("outcome") {
+                    print!("{}", render(outcome));
+                }
                 1
             }
         }

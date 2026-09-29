@@ -117,6 +117,7 @@ async fn start(viewers: &[&str], operators: &[&str], cluster_ca: Option<&Ca>) ->
         peers: None,
         hub: None,
         authz: None,
+        reload: None,
     })
 }
 
@@ -140,6 +141,12 @@ struct Node<'a> {
     )>,
     /// The live authorizer for the dry run.
     authz: Option<mqttd::admin::authz::LiveAuthorizer>,
+    /// The reloader and config stamp for the config and reload endpoints, and the live
+    /// config cell they share with the admin state (as in the broker).
+    reload: Option<(
+        mqttd::admin::config::ReloadAccess,
+        Arc<RwLock<mqtt_config::Config>>,
+    )>,
 }
 
 fn start_node(node: Node<'_>) -> Harness {
@@ -176,10 +183,15 @@ fn start_node(node: Node<'_>) -> Harness {
         Arc::new(std::sync::OnceLock::new()),
         None,
     );
-    let mut config = mqtt_config::Config::default();
-    config.admin.viewers = node.viewers.iter().map(|s| (*s).to_string()).collect();
-    config.admin.operators = node.operators.iter().map(|s| (*s).to_string()).collect();
-    let config = Arc::new(RwLock::new(config));
+    let (reload, config) = match node.reload {
+        Some((access, live)) => (Some(access), live),
+        None => (None, Arc::new(RwLock::new(mqtt_config::Config::default()))),
+    };
+    {
+        let mut c = config.write().unwrap();
+        c.admin.viewers = node.viewers.iter().map(|s| (*s).to_string()).collect();
+        c.admin.operators = node.operators.iter().map(|s| (*s).to_string()).collect();
+    }
     let audit = Arc::new(Recorded::default());
     let mut state = AdminState::new(node.id.into(), health, config.clone(), audit.clone());
     if let Some(ca) = node.cluster_ca {
@@ -193,6 +205,9 @@ fn start_node(node: Node<'_>) -> Harness {
     }
     if let Some(live) = node.authz {
         state = state.with_authorizer(live);
+    }
+    if let Some(access) = reload {
+        state = state.with_reload(access);
     }
     let addr = node.listener.local_addr().unwrap().to_string();
     tokio::spawn(mqttd::admin::serve(node.listener, acceptor, state));
@@ -442,6 +457,7 @@ async fn three_nodes() -> ThreeNodes {
             peers: Some(peers),
             hub: None,
             authz: None,
+            reload: None,
         }));
     }
 
@@ -537,6 +553,7 @@ async fn start_broker_with_admin() -> Broker {
         peers: None,
         hub: Some((hub_tx, store)),
         authz: None,
+        reload: None,
     });
     Broker { mqtt, admin }
 }
@@ -728,6 +745,7 @@ async fn the_authorization_dry_run_names_the_deciding_rule_of_the_live_policy() 
         peers: None,
         hub: None,
         authz: Some(live),
+        reload: None,
     });
     let alice = mint_leaf(&h.admin_ca, "alice", None);
 
@@ -791,4 +809,124 @@ async fn the_authorization_dry_run_names_the_deciding_rule_of_the_live_policy() 
         )
         .await;
     assert_eq!((status, code(&body)), (400, "bad-request"));
+}
+
+/// A reloader over `path` into `live`, with an allow-all policy build — the config swap
+/// is what the reload tests are about.
+fn allow_all_reloader(
+    live: &Arc<RwLock<mqtt_config::Config>>,
+    path: &Path,
+    stamp: &Arc<mqttd::reload::ConfigStamp>,
+) -> Arc<mqttd::reload::Reloader> {
+    let policy = || {
+        (
+            Arc::new(mqtt_auth::AllowAll) as Arc<dyn mqtt_auth::Authorizer>,
+            Arc::new(mqtt_auth::basic::BasicAuthenticator {
+                allow_anonymous: true,
+            }) as Arc<dyn mqtt_auth::Authenticator>,
+        )
+    };
+    let (mut reloader, _handles) = mqttd::reload::Reloader::new(
+        policy(),
+        Arc::new(Recorded::default()),
+        move || Ok(policy()),
+    );
+    reloader.attach_config_stamp(stamp.clone());
+    reloader.attach_config_source(mqttd::reload::ConfigSource {
+        live: live.clone(),
+        path: Some(path.to_path_buf()),
+        precheck: Box::new(|_| Ok(())),
+        apply: Box::new(|_, _| Vec::new()),
+    });
+    Arc::new(reloader)
+}
+
+#[tokio::test]
+async fn config_is_served_redacted_and_reload_is_an_operator_action_with_an_outcome() {
+    let dir = temp_dir("reload");
+    let path = dir.join("mqttd.toml");
+    let file = |extra: &str| {
+        format!(
+            "[durable]\nallow_ephemeral = true\n[cluster.swim]\nkey = \"s3cret-gossip-key\"\n\
+             [admin]\nviewers = [\"CN=alice\"]\noperators = [\"CN=root\"]\n{extra}"
+        )
+    };
+    std::fs::write(&path, file("")).unwrap();
+    let loaded = mqtt_config::Config::load(Some(&path)).unwrap();
+    let live = Arc::new(RwLock::new(loaded));
+    let stamp = Arc::new(mqttd::reload::ConfigStamp::default());
+    stamp.record(&std::fs::read(&path).unwrap());
+    let reloader = allow_all_reloader(&live, &path, &stamp);
+
+    let admin_ca = Arc::new(mint_ca("admin"));
+    let h = start_node(Node {
+        id: "cfg-node",
+        listener: TcpListener::bind("127.0.0.1:0").await.unwrap(),
+        admin_ca: admin_ca.clone(),
+        server_ca: None,
+        cluster_ca: None,
+        viewers: &["CN=alice"],
+        operators: &["CN=root"],
+        placement: None,
+        peers: None,
+        hub: None,
+        authz: None,
+        reload: Some((
+            mqttd::admin::config::ReloadAccess { reloader, stamp },
+            live.clone(),
+        )),
+    });
+    let alice = mint_leaf(&admin_ca, "alice", None);
+    let root = mint_leaf(&admin_ca, "root", None);
+
+    let (status, body) = h.get(&alice, "/admin/v1/config").await;
+    assert_eq!(status, 200, "{body}");
+    let text = body.to_string();
+    assert!(
+        !text.contains("s3cret-gossip-key"),
+        "the gossip key leaked: {text}"
+    );
+    assert!(body["config"]["cluster"]["swim"]["key"]
+        .as_str()
+        .unwrap()
+        .starts_with("sha256:"));
+    assert_eq!(body["generation"], 1);
+    assert_eq!(body["file_checksum"].as_str().unwrap().len(), 64);
+
+    // Reload: an operator action. A viewer is refused before anything runs.
+    let post = |who: &(PathBuf, PathBuf)| {
+        let target = h.target(&who.0, &who.1);
+        async move {
+            let (status, body) = client::call(&target, "POST", "/admin/v1/reload", Some(""))
+                .await
+                .unwrap();
+            (status, serde_json::from_str::<Value>(&body).unwrap())
+        }
+    };
+    let (status, body) = post(&alice).await;
+    assert_eq!((status, code(&body)), (403, "forbidden"));
+
+    std::fs::write(&path, file("[limits]\nmax_sessions = 5\n")).unwrap();
+    let (status, body) = post(&root).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["applied"], true);
+    assert_eq!(body["trigger"], "admin");
+    assert_eq!(body["changed_sections"], serde_json::json!(["limits"]));
+
+    std::fs::write(&path, "[limits\n").unwrap();
+    let (status, body) = post(&root).await;
+    assert_eq!((status, code(&body)), (409, "reload-rejected"), "{body}");
+    assert_eq!(body["outcome"]["applied"], false);
+    assert_eq!(
+        live.read().unwrap().limits.max_sessions,
+        Some(5),
+        "the running config is kept"
+    );
+
+    let records = h.audit.0.lock().unwrap().clone();
+    assert!(records
+        .iter()
+        .any(|(_, who, d)| who.as_deref() == Some("CN=root")
+            && d == "role=operator POST /admin/v1/reload -> 200"));
+    std::fs::remove_dir_all(&dir).ok();
 }

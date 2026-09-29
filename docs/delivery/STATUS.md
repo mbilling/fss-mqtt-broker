@@ -88,7 +88,7 @@
 | [0078](../adr/0078-replica-segment-log.md) | # 0078. The replica store becomes an append-only segment log — the disk is the limit, not the B-tree | Accepted | [3/4 done](0078-replica-segment-log.md) | 1 open |
 | [0079](../adr/0079-global-allocator.md) | # 0079. mqttd links mimalloc as its global allocator | Accepted | [1/2 done](0079-global-allocator.md) | 1 open |
 | [0080](../adr/0080-replication-factor.md) | # 0080. The replication factor is cluster state: configurable, default 2, changeable live | Accepted | [2/6 done](0080-replication-factor.md) | 4 open |
-| [0081](../adr/0081-admin-api.md) | # 0081. An authenticated admin API: reads cluster-wide, actions audited, config stays in the file | Accepted | [6/14 done](0081-admin-api.md) | 6 open, 2 deferred |
+| [0081](../adr/0081-admin-api.md) | # 0081. An authenticated admin API: reads cluster-wide, actions audited, config stays in the file | Accepted | [7/14 done](0081-admin-api.md) | 5 open, 2 deferred |
 
 ## Open and deferred work
 
@@ -221,8 +221,7 @@
 
 **0081 — # 0081. An authenticated admin API: reads cluster-wide, actions audited, config stays in the file**
 
-- `0081-T5` 🚧 in-progress ([#714](https://github.com/mbilling/fss-mqtt-broker/issues/714)): "Authorization dry run: /admin/v1/authz/check returns the verdict and the deciding rule" — "Evaluates the loaded policy; changes nothing."
-- `0081-T6` ⬜ planned ([#715](https://github.com/mbilling/fss-mqtt-broker/issues/715)): "Effective config (secrets fingerprinted, with a hash) and reload that returns its outcome" — "First action. Reload runs the ADR 0032 routine; the file stays the only input."
+- `0081-T6` 🚧 in-progress ([#715](https://github.com/mbilling/fss-mqtt-broker/issues/715)): "Effective config (secrets fingerprinted, with a hash) and reload that returns its outcome" — "First action. Reload runs the ADR 0032 routine; the file stays the only input."
 - `0081-T7` ⬜ planned ([#716](https://github.com/mbilling/fss-mqtt-broker/issues/716)): "Actions: kick (DISCONNECT 0x98) and purge a session, forwarded to the client's node" — "Audited on the node receiving the call and on the node acting."
 - `0081-T8` ⬜ planned ([#717](https://github.com/mbilling/fss-mqtt-broker/issues/717)): "Cordon / uncordon: refuse new connections and report not-ready without draining" — "Not persisted; shown on /statusz."
 - `0081-T9` ⬜ planned ([#718](https://github.com/mbilling/fss-mqtt-broker/issues/718)): "Log filter override with a TTL (at most one hour), shown on /statusz"

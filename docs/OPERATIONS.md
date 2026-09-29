@@ -891,6 +891,27 @@ URL, the CLI uses `admin.bind` from the local config, and without a CA, `admin.c
 These variables configure the client, not the broker, so they are not in
 [CONFIGURATION.md](CONFIGURATION.md).
 
+**What is it running, and did my change take?** `config` shows the effective config
+(defaults < file < `MQTTD_*` env) with every secret value replaced by a `sha256:`
+fingerprint, plus `file_checksum`: the SHA-256 of the config file, the value to compare with
+the committed file. `reload` (operator role) runs the reload `SIGHUP` runs and says what
+happened:
+
+```sh
+mqttd --admin config --json | jq .file_checksum
+mqttd --admin reload
+#   applied           true
+#   changed_sections  limits, security
+#   requires_restart  -
+mqttd --admin reload          # after a bad edit: exit 1
+#   mqttd: 409 reload-rejected: config: TOML parse error at line 3 …
+```
+
+A rejected reload keeps the running config and policy, as `SIGHUP` does. `requires_restart`
+lists the changed sections that are staged but not live (listeners, TLS material, the
+cluster, …). Reloads are serialized: `SIGHUP`, the file watcher and the API never
+interleave. The request itself carries nothing: the file is the only input.
+
 **Why is this client denied?** `authz` asks the live policy, the one the last reload
 published, and names the rule that decides. It changes nothing.
 
