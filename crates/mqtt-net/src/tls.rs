@@ -468,6 +468,37 @@ pub fn client_connector(
     Ok(TlsConnector::from(Arc::new(config)))
 }
 
+/// [`client_connector`] trusting several CA bundles: the admin fan-out (ADR 0081 §2)
+/// verifies a peer's admin listener against the admin CA or the cluster CA, whichever
+/// issued its server certificate.
+///
+/// # Errors
+/// [`NetError::Tls`] on unreadable/unparseable PEM material, a key mismatch, or no CAs.
+pub fn client_connector_multi(
+    cas: &[&Path],
+    cert_chain: &Path,
+    key: &Path,
+) -> Result<TlsConnector, NetError> {
+    if cas.is_empty() {
+        return Err(NetError::Tls("a TLS client needs a CA bundle".to_string()));
+    }
+    let mut roots = RootCertStore::empty();
+    for ca in cas {
+        for cert in load_certs(ca)? {
+            roots
+                .add(cert)
+                .map_err(|e| tls_err("CA certificate", ca, &e))?;
+        }
+    }
+    let config = ClientConfig::builder_with_provider(provider())
+        .with_protocol_versions(TLS_VERSIONS)
+        .map_err(|e| tls_err("TLS client configuration", cert_chain, &e))?
+        .with_root_certificates(roots)
+        .with_client_auth_cert(load_certs(cert_chain)?, load_key(key)?)
+        .map_err(|e| tls_err("client certificate/key", cert_chain, &e))?;
+    Ok(TlsConnector::from(Arc::new(config)))
+}
+
 /// Parse the host part of `addr` (`host:port`, `[v6]:port`, or bare host) into
 /// the [`ServerName`] to verify a dialed peer's certificate against.
 ///

@@ -201,6 +201,7 @@ short, fixed list of audited actions:
 | Elevation (viewer → operator, cert → any role) | Roles only from the verified subject matched against the live `admin.viewers` / `admin.operators`; a subject in neither is refused; every endpoint declares its least role | ADR 0081 §1; `mqttd/src/admin/roles.rs`, `routes.rs` |
 | A node certificate used as an admin credential | A cluster-CA certificate in no list gets only the `peer` role (this node's own state), checked by re-verifying the chain against the cluster CA alone, not by subject | ADR 0081 §2; `ChainCheck` |
 | Repudiation / disclosure of identifying data | Every request, reads included, is audited (`admin.request`: subject, role, method, target, status) into the hash-chained log | ADR 0081 §1; `mqttd/src/admin/mod.rs` |
+| Amplification through the cluster view | One viewer request fans out to one `/admin/v1/node` call per member, each with a 3 s deadline, all within the 30 s handler deadline; the `peer` role cannot itself fan out, so fan-out never recurses | ADR 0081 §2 amendment; `mqttd/src/admin/cluster.rs` |
 | Denial of service via the admin port | One request per connection, 10 s to send it, 16 KiB head / 64 KiB body caps, 32 concurrent connections, a 30 s handler deadline, paged lists | `mqttd/src/admin/http.rs`, `mod.rs` |
 | Admin detail on the ops network | Never on the health/metrics listener: `Config::validate` refuses an `admin.bind` equal to either | ADR 0081 §1; `mqtt-config` |
 

@@ -14,10 +14,10 @@ tasks:
     issue: 711
     notes: "PR #729."
   - id: 0081-T3
-    title: "Cluster view: /admin/v1/cluster and /placement answered by any node via peer-bus fan-out"
+    title: "Cluster view: /admin/v1/cluster and /placement answered by any node via admin-listener fan-out"
     status: planned
     issue: 712
-    notes: "Capability-gated on the next peer protocol version; each row says whether that node replied and how stale it is."
+    notes: "Node to node over the admin listeners (ADR amendment 2026-09-29), not the peer bus; each row says whether that node replied, and why not."
   - id: 0081-T4
     title: "Clients and sessions: paged list and filters, session detail, sessions matching a topic, top-N backlog, retained by prefix"
     status: planned
@@ -81,7 +81,7 @@ frontmatter above · this file is the plan, progress log, and changelog.
 |------|--------|-------|------|------------------|
 | 0081-T1 | 🚧 in-progress | [#710](https://github.com/mbilling/fss-mqtt-broker/issues/710) | — | "PR #729." |
 | 0081-T2 | 🚧 in-progress | [#711](https://github.com/mbilling/fss-mqtt-broker/issues/711) | — | "PR #729." |
-| 0081-T3 | ⬜ planned | [#712](https://github.com/mbilling/fss-mqtt-broker/issues/712) | — | "Capability-gated on the next peer protocol version; each row says whether that node replied and how stale it is." |
+| 0081-T3 | ⬜ planned | [#712](https://github.com/mbilling/fss-mqtt-broker/issues/712) | — | "Node to node over the admin listeners (ADR amendment 2026-09-29), not the peer bus; each row says whether that node replied, and why not." |
 | 0081-T4 | ⬜ planned | [#713](https://github.com/mbilling/fss-mqtt-broker/issues/713) | — | "Bounded responses only; reads of identifying data are audited." |
 | 0081-T5 | ⬜ planned | [#714](https://github.com/mbilling/fss-mqtt-broker/issues/714) | — | "Evaluates the loaded policy; changes nothing." |
 | 0081-T6 | ⬜ planned | [#715](https://github.com/mbilling/fss-mqtt-broker/issues/715) | — | "First action. Reload runs the ADR 0032 routine; the file stays the only input." |

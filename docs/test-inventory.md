@@ -980,12 +980,14 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 479 test(s)
+## `crates/mqttd/src/lib.rs` — 481 test(s)
 
 - `admin::cli::tests::answers_render_as_tables_and_lines`
 - `admin::cli::tests::invocations_are_validated_before_anything_runs`
 - `admin::client::tests::responses_split_into_status_and_body`
 - `admin::client::tests::urls_need_https_and_a_port`
+- `admin::cluster::tests::a_silent_node_is_a_row_with_its_reason_not_a_healthy_one`
+- `admin::cluster::tests::the_production_mapping_keeps_the_host_and_swaps_the_port`
 - `admin::http::tests::a_get_with_a_query_is_decoded`
 - `admin::http::tests::a_post_body_is_read_to_its_length`
 - `admin::http::tests::encode_and_decode_round_trip`
@@ -1495,9 +1497,10 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `narrow_allow_does_not_cover_broad_subscription`
 - `unauthorized_will_topic_is_refused_at_connect`
 
-## `crates/mqttd/tests/admin.rs` — 5 test(s)
+## `crates/mqttd/tests/admin.rs` — 6 test(s)
 
 - `a_certificate_from_another_ca_fails_the_handshake`
+- `any_node_answers_for_the_cluster_and_a_silent_node_is_listed_as_silent`
 - `cluster_certificates_get_the_peer_role`
 - `every_request_is_audited_with_subject_role_and_outcome`
 - `listed_subjects_get_their_role_and_everyone_else_is_refused`

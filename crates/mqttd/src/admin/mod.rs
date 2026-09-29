@@ -18,6 +18,7 @@
 
 pub mod cli;
 pub mod client;
+pub mod cluster;
 pub mod http;
 pub mod roles;
 mod routes;
@@ -48,6 +49,9 @@ pub struct AdminState {
     /// Tells a certificate the cluster CA issued apart from an admin one, for
     /// [`Role::Peer`]. `None` when the node has no cluster TLS.
     cluster_ca: Option<Arc<mqtt_net::tls::ChainCheck>>,
+    /// How to reach the other nodes' admin listeners for the cluster view. `None` when
+    /// this node has no cluster TLS: its peers are then listed as not queryable.
+    peers: Option<Arc<cluster::PeerAccess>>,
 }
 
 impl std::fmt::Debug for AdminState {
@@ -75,6 +79,26 @@ impl AdminState {
             live_config,
             audit,
             cluster_ca: None,
+            peers: None,
+        }
+    }
+
+    /// Let this node answer for the cluster by asking its peers' admin listeners.
+    #[must_use]
+    pub fn with_peers(mut self, peers: cluster::PeerAccess) -> Self {
+        self.peers = Some(Arc::new(peers));
+        self
+    }
+
+    /// This node's own state: the `/statusz` body (ADR 0054), or its identity alone when
+    /// the status block is not wired.
+    async fn local_status(&self) -> serde_json::Value {
+        match self.health.statusz().await {
+            Some(s) => serde_json::from_str(&s).unwrap_or_else(|_| serde_json::json!({})),
+            None => serde_json::json!({
+                "node_id": self.node_id,
+                "version": env!("CARGO_PKG_VERSION"),
+            }),
         }
     }
 
