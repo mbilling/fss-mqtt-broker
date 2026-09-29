@@ -177,7 +177,11 @@
 //! destination configured the signal logs that fact and the broker keeps serving.
 //!
 //! Subcommands (each validates + exits, binding nothing): `--check-config [--config <path>]`
-//! (ADR 0046 T3) validates the effective config; **`--decommission [--pid <n>] [--timeout <secs>]`**
+//! (ADR 0046 T3) validates the effective config; `--print-config [--config <path>]` (ADR 0081
+//! T11) prints it as TOML with every secret fingerprinted; `--check-tls [--config <path>]`
+//! (ADR 0081 T12) checks every configured certificate, key, CA bundle and CRL — loads, key
+//! match, chain order, expiry, names — and exits non-zero on any failure;
+//! **`--decommission [--pid <n>] [--timeout <secs>]`**
 //! (ADR 0047 T4) sends `SIGUSR1` to the running broker (`--pid`, default 1 — the container
 //! entrypoint) to begin the decommission drain and **blocks until it exits**, so a Kubernetes
 //! `preStop` holds the pod open for the whole drain even though the distroless image has no shell.
@@ -266,6 +270,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // before any resource is acquired.
     if std::env::args().skip(1).any(|a| a == "--check-config") {
         check_config();
+    }
+    // ADR 0081 T11/T12: offline like `--check-config` — print the effective config with
+    // secrets fingerprinted, or check every configured TLS material set, and exit.
+    if std::env::args().skip(1).any(|a| a == "--print-config") {
+        print_config();
+    }
+    if std::env::args().skip(1).any(|a| a == "--check-tls") {
+        check_tls();
     }
 
     // `--hash-password [<username>]` prints an Argon2id password-file line and exits.
@@ -3947,6 +3959,8 @@ fn load_config() -> Result<Config, Box<dyn std::error::Error>> {
 const KNOWN_FLAGS: &[&str] = &[
     "--check-config",
     "--preflight",
+    "--print-config",
+    "--check-tls",
     "--config",
     "--hash-password",
     "--probe",
@@ -4004,8 +4018,8 @@ fn validate_cli(args: &[String]) -> Result<(), String> {
                     return Err("repeated option: --preflight".to_string());
                 }
             }
-            "--check-config" | "--hash-password" | "--probe" | "--decommission" | "--backup"
-            | "--version" | "-V" | "--help" | "-h" => {
+            "--check-config" | "--print-config" | "--check-tls" | "--hash-password" | "--probe"
+            | "--decommission" | "--backup" | "--version" | "-V" | "--help" | "-h" => {
                 if let Some(previous) = mode.replace(arg) {
                     return Err(format!("choose one command, not {previous} and {arg}"));
                 }
@@ -4028,7 +4042,15 @@ fn validate_cli(args: &[String]) -> Result<(), String> {
     }
     for option in options {
         let allowed = match option {
-            "--config" => matches!(mode, "start" | "--check-config" | "--probe" | "--backup"),
+            "--config" => matches!(
+                mode,
+                "start"
+                    | "--check-config"
+                    | "--print-config"
+                    | "--check-tls"
+                    | "--probe"
+                    | "--backup"
+            ),
             "--url" => mode == "--probe",
             "--pid" | "--timeout" => matches!(mode, "--decommission" | "--backup"),
             _ => unreachable!("only value options enter this set"),
@@ -4067,6 +4089,8 @@ fn print_usage() {
            mqttd --check-config --preflight\n  \
                                      ...and this host: open every referenced file as the\n  \
                                      current user, resolve every bind\n  \
+           mqttd --print-config      print the effective config (secrets fingerprinted)\n  \
+           mqttd --check-tls         check every configured certificate, key, CA and CRL\n  \
            mqttd --hash-password [u] print an Argon2id password-file line and exit\n  \
            mqttd --probe [/readyz]   query the running broker's health endpoint and exit\n  \
            mqttd --decommission      drain and gracefully stop the running broker\n  \
@@ -4075,7 +4099,8 @@ fn print_usage() {
            mqttd --version           print the version and exit\n  \
            mqttd --help              print this help and exit\n\n\
          OPTIONS:\n  \
-           --config <path>          config for startup, --check-config, --probe or --backup\n  \
+           --config <path>          config for startup, --check-config, --print-config,\n  \
+                                    --check-tls, --probe or --backup\n  \
            --url <host:port>        explicit endpoint for --probe\n  \
            --pid <n>                target process for --decommission or --backup\n  \
            --timeout <secs>         deadline for --decommission or --backup\n\n\
@@ -4116,6 +4141,71 @@ fn check_config() -> ! {
             std::process::exit(1);
         }
     }
+}
+
+/// Load the config the broker would boot with, for the offline commands that read it
+/// (ADR 0081 T11/T12). Exits `2` on a usage error and `1` on an invalid config, with the
+/// same messages as `--check-config`.
+fn load_config_or_exit() -> Config {
+    let path = match config_path() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::exit(2);
+        }
+    };
+    match Config::load(path.as_deref()) {
+        Ok(c) => c,
+        Err(error) => {
+            match path {
+                Some(p) => eprintln!("config INVALID ({}): {error}", p.display()),
+                None => eprintln!("config INVALID: {error}"),
+            }
+            std::process::exit(1);
+        }
+    }
+}
+
+/// `mqttd --print-config [--config <path>]` (ADR 0081 T11): print the effective config —
+/// defaults < file < `MQTTD_*` env, validated exactly as at boot — as TOML, with every
+/// secret replaced by its fingerprint, and exit. Binds nothing.
+fn print_config() -> ! {
+    let config = load_config_or_exit();
+    for key in &config.ignored_keys {
+        eprintln!("warning: config key IGNORED (runtime.config_unknown_keys = \"warn\"): {key}");
+    }
+    match mqttd::config_view::redacted_toml(&config) {
+        Ok(toml) => {
+            print!("{toml}");
+            std::process::exit(0);
+        }
+        Err(e) => {
+            eprintln!("error: cannot render the config: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// `mqttd --check-tls [--config <path>]` (ADR 0081 T12): check every TLS material set the
+/// config names — files load, key matches, chain order, validity window, names, CA
+/// bundle, CRL — one line per check, and exit `1` if any check failed.
+fn check_tls() -> ! {
+    let config = load_config_or_exit();
+    let findings = mqttd::tls_check::check_config(&config, std::time::SystemTime::now());
+    for f in &findings {
+        println!("{f}");
+    }
+    let count = |level| findings.iter().filter(|f| f.level == level).count();
+    let (failed, warned) = (
+        count(mqttd::tls_check::Level::Fail),
+        count(mqttd::tls_check::Level::Warn),
+    );
+    if failed > 0 {
+        println!("TLS check FAILED: {failed} failure(s), {warned} warning(s)");
+        std::process::exit(1);
+    }
+    println!("TLS check OK: {warned} warning(s)");
+    std::process::exit(0);
 }
 
 /// `mqttd --probe [/readyz|/livez] [--url <host:port>]`: ask this node's own health
@@ -4702,20 +4792,13 @@ fn config_path() -> Result<Option<std::path::PathBuf>, Box<dyn std::error::Error
         .map(std::path::PathBuf::from))
 }
 
-/// Log the effective configuration at startup (ADR 0046 T2) with secret material redacted: the
-/// inline gossip keys (`swim.key`, `swim.key_accept`) and the inline JWT HS256 secret never
-/// reach the logs. File *paths* are safe to log and are retained for operability.
+/// Log the effective configuration at startup (ADR 0046 T2) with secret material replaced by
+/// fingerprints: the inline gossip keys (`swim.key`, `swim.key_accept`) and URL credentials
+/// never reach the logs. File *paths* are safe to log and are retained for operability.
 fn log_effective_config(config: &Config) {
-    let mut redacted = config.clone();
-    if redacted.cluster.swim.key.is_some() {
-        redacted.cluster.swim.key = Some("<redacted>".to_string());
-    }
-    if !redacted.cluster.swim.key_accept.is_empty() {
-        let n = redacted.cluster.swim.key_accept.len();
-        redacted.cluster.swim.key_accept = vec![format!("<{n} key(s) redacted>")];
-    }
-    // Every other secret is now referenced by path (ADR 0046 T5) — paths are safe to log; only
-    // the inline gossip key(s) above are raw secrets. The HS256 secret is a file path.
+    // The same redaction `--print-config` and the admin API use (ADR 0081), so the log
+    // cannot show a secret they hide — URL credentials included.
+    let redacted = mqttd::config_view::redacted(config);
     info!(config = ?redacted, "effective configuration (ADR 0046; secrets redacted)");
 }
 
@@ -5059,6 +5142,9 @@ mod tests {
             vec!["--probe", "/livez", "--url", "127.0.0.1:8080"],
             vec!["--url", "127.0.0.1:8080", "--probe", "/readyz"],
             vec!["--probe", "--config", "broker.toml"],
+            vec!["--print-config"],
+            vec!["--print-config", "--config", "broker.toml"],
+            vec!["--config", "broker.toml", "--check-tls"],
             vec!["--decommission", "--pid", "123", "--timeout", "10"],
             vec![
                 "--backup",
@@ -5111,6 +5197,10 @@ mod tests {
             vec!["--check-config", "--decommission"],
             vec!["--backup", "--decommission"],
             vec!["--check-config", "--check-config"],
+            vec!["--print-config", "--check-tls"],
+            vec!["--print-config", "stray"],
+            vec!["--check-tls", "--pid", "123"],
+            vec!["--check-tls", "--preflight"],
             vec!["--preflight"],
             vec!["--preflight", "--config", "broker.toml"],
             vec!["--check-config", "--preflight", "--preflight"],

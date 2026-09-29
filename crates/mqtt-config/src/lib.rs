@@ -1956,6 +1956,71 @@ impl Config {
     }
 }
 
+impl Config {
+    /// A copy of this config that is safe to print or serve (ADR 0081): every value that can
+    /// carry secret material is replaced by `fingerprint(value)`, so two nodes can still be
+    /// compared ("same key?") without the key itself leaving the process.
+    ///
+    /// Key material normally lives in files (ADR 0046 T5) and paths are not secret, so this
+    /// covers the values that are inline:
+    /// - `cluster.swim.key` and every `cluster.swim.key_accept` entry (raw gossip keys);
+    /// - the credentials and query of every URL setting (`security.http_auth.url`,
+    ///   `security.oidc.issuer`, `observability.otlp_endpoint`): a `user:password@` part
+    ///   and a `?token=…` query are replaced; scheme, host and path stay readable.
+    ///
+    /// The hashing is the caller's (`mqttd` supplies a SHA-256 fingerprint), so this crate
+    /// takes no crypto dependency.
+    #[must_use]
+    pub fn redacted(&self, fingerprint: &dyn Fn(&str) -> String) -> Config {
+        let mut c = self.clone();
+        if let Some(key) = &mut c.cluster.swim.key {
+            *key = fingerprint(key);
+        }
+        for key in &mut c.cluster.swim.key_accept {
+            *key = fingerprint(key);
+        }
+        for url in [
+            &mut c.security.http_auth.url,
+            &mut c.security.oidc.issuer,
+            &mut c.observability.otlp_endpoint,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            *url = redact_url(url, fingerprint);
+        }
+        c
+    }
+}
+
+/// Replace the userinfo (`user:password@`) and the query/fragment of `url` with
+/// fingerprints, leaving scheme, host and path as they were. A value with neither is
+/// returned unchanged.
+fn redact_url(url: &str, fingerprint: &dyn Fn(&str) -> String) -> String {
+    let (scheme, rest) = match url.find("://") {
+        Some(i) => url.split_at(i + 3),
+        None => ("", url),
+    };
+    // Everything from the first `?` or `#` on is fingerprinted as one; the separator that
+    // was found is kept, so a fragment-only URL still reads as a fragment.
+    let (before_query, query) = match rest.find(['?', '#']) {
+        Some(i) => (&rest[..i], Some((&rest[i..=i], &rest[i + 1..]))),
+        None => (rest, None),
+    };
+    let authority_end = before_query.find('/').unwrap_or(before_query.len());
+    let (authority, path) = before_query.split_at(authority_end);
+    let authority = match authority.rfind('@') {
+        Some(i) => format!("{}@{}", fingerprint(&authority[..i]), &authority[i + 1..]),
+        None => authority.to_string(),
+    };
+    let mut out = format!("{scheme}{authority}{path}");
+    if let Some((separator, q)) = query {
+        out.push_str(separator);
+        out.push_str(&fingerprint(q));
+    }
+    out
+}
+
 /// The authoritative `MQTTD_*` environment surface — every variable
 /// [`Config::overlay_from`] consumes, in declaration order. This is the single list the
 /// binary's env↔config mapping is checked against (the bijection test below). Adding a config
@@ -2092,6 +2157,64 @@ pub const ENV_VARS: &[&str] = &[
 #[cfg(test)]
 mod tests {
     use super::{Config, ENV_VARS};
+
+    /// ADR 0081 T11: a config with every inline secret set serializes with none of them —
+    /// only their fingerprints — while the non-secret parts of each URL stay readable.
+    #[test]
+    fn redacted_config_prints_no_secret() {
+        let mut c = Config::default();
+        c.cluster.swim.key = Some("a1".repeat(32));
+        c.cluster.swim.key_accept = vec!["b2".repeat(32), "c3".repeat(32)];
+        c.security.http_auth.url =
+            Some("https://hookuser:hookpass@auth.example:8443/check?token=hooktoken".into());
+        c.security.oidc.issuer = Some("https://idp.example/realms/r?secret=oidcsecret".into());
+        c.observability.otlp_endpoint = Some("http://otlpuser:otlppass@collector:4318".into());
+        let fp = |s: &str| format!("fp({})", s.len());
+        let out = toml::to_string(&c.redacted(&fp)).expect("serializes");
+        // The failure messages name a fixture by position, never by value: an assertion
+        // that echoed a fixture would itself be a secret written to the test log.
+        let fixtures = [
+            "a1a1",
+            "b2b2",
+            "c3c3",
+            "hookuser",
+            "hookpass",
+            "hooktoken",
+            "oidcsecret",
+            "otlpuser",
+            "otlppass",
+        ];
+        for (i, fixture) in fixtures.iter().enumerate() {
+            assert!(!out.contains(fixture), "fixture #{i} survived redaction");
+        }
+        for (i, readable) in [
+            "auth.example:8443/check",
+            "idp.example/realms/r",
+            "collector:4318",
+        ]
+        .iter()
+        .enumerate()
+        {
+            assert!(out.contains(readable), "readable part #{i} was lost");
+        }
+        // Values with nothing secret in them pass through untouched.
+        c.security.http_auth.url = Some("https://auth.example/check".into());
+        assert_eq!(
+            c.redacted(&fp).security.http_auth.url.as_deref(),
+            Some("https://auth.example/check")
+        );
+        // A fragment-only URL keeps its `#`: the separator that was found is re-emitted.
+        c.security.oidc.issuer = Some("https://idp.example/realms/r#frag".into());
+        assert_eq!(
+            c.redacted(&fp).security.oidc.issuer.as_deref(),
+            Some("https://idp.example/realms/r#fp(4)")
+        );
+        c.security.oidc.issuer = Some("https://idp.example/realms/r?q=1".into());
+        assert_eq!(
+            c.redacted(&fp).security.oidc.issuer.as_deref(),
+            Some("https://idp.example/realms/r?fp(3)")
+        );
+    }
 
     #[test]
     fn defaults_are_secure() {

@@ -26,6 +26,21 @@ stops its flow).
 audit-logged. A malformed file is rejected and the running policy kept — fix the file
 and the watcher retries on the next poll.
 
+**Check the material before (and after) it lands:** `mqttd --check-tls [--config <path>]`
+reads every certificate, key, CA bundle and CRL the config names — `[tls]` and
+`[cluster.peer_tls]` — and prints one `[ ok ]` / `[warn]` / `[FAIL]` line per check: files
+load, the key matches its certificate, the chain file is in order (leaf first, each
+certificate issued by the next), each certificate's validity window (expired or not yet
+valid fails; under 30 days left warns), the leaf's CN and SANs, a non-empty CA bundle, and
+a CRL that parses and is not past its `nextUpdate`. It binds nothing and exits `1` on any
+failure, so it works as a CI gate, a cron job, or a `kubectl exec` on the distroless image.
+
+**See what the node actually runs:** `mqttd --print-config [--config <path>]` prints the
+effective config — defaults, file and `MQTTD_*` env merged and validated exactly as at
+boot — as TOML. Inline secrets (the gossip keys, credentials and query strings in URL
+settings) are replaced by `sha256:<16 hex>` fingerprints, the same truncation `/statusz`
+uses for key fingerprints, so two nodes can be compared without the secret being printed.
+
 **Trust note (audit #203):** because revocation sweeps live state, *write access to the
 mounted CRL file is the power to evict any mTLS client* — an attacker (or a bad
 automation) who can modify that file can force-disconnect healthy sessions
