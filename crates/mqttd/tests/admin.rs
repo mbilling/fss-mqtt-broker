@@ -116,6 +116,7 @@ async fn start(viewers: &[&str], operators: &[&str], cluster_ca: Option<&Ca>) ->
         placement: None,
         peers: None,
         hub: None,
+        authz: None,
     })
 }
 
@@ -137,6 +138,8 @@ struct Node<'a> {
         tokio::sync::mpsc::UnboundedSender<mqttd::HubCommand>,
         Arc<MemorySessionStore>,
     )>,
+    /// The live authorizer for the dry run.
+    authz: Option<mqttd::admin::authz::LiveAuthorizer>,
 }
 
 fn start_node(node: Node<'_>) -> Harness {
@@ -187,6 +190,9 @@ fn start_node(node: Node<'_>) -> Harness {
     }
     if let Some(access) = sessions {
         state = state.with_sessions(access);
+    }
+    if let Some(live) = node.authz {
+        state = state.with_authorizer(live);
     }
     let addr = node.listener.local_addr().unwrap().to_string();
     tokio::spawn(mqttd::admin::serve(node.listener, acceptor, state));
@@ -427,6 +433,7 @@ async fn three_nodes() -> ThreeNodes {
             placement: Some(Arc::new(RwLock::new(placement))),
             peers: Some(peers),
             hub: None,
+            authz: None,
         }));
     }
 
@@ -521,6 +528,7 @@ async fn start_broker_with_admin() -> Broker {
         placement: None,
         peers: None,
         hub: Some((hub_tx, store)),
+        authz: None,
     });
     Broker { mqtt, admin }
 }
@@ -672,4 +680,92 @@ async fn subscribers_backlog_and_retained_answer_the_day_two_questions() {
     let (_, page) = view(&b, "/admin/v1/retained?prefix=r/&limit=1").await;
     assert_eq!(page["retained"].as_array().unwrap().len(), 1);
     assert_eq!(page["next_cursor"], "r/1");
+}
+
+#[tokio::test]
+async fn the_authorization_dry_run_names_the_deciding_rule_of_the_live_policy() {
+    let policy = mqtt_auth::acl::AclPolicy::from_toml_str(
+        r#"
+        [[rules]]
+        identities = ["device-*"]
+        actions = ["publish"]
+        topics = ["devices/%i/#"]
+
+        [[rules]]
+        groups = ["ops"]
+        actions = ["subscribe"]
+        effect = "deny"
+        topics = ["secret/#"]
+        "#,
+    )
+    .unwrap();
+    let (tx, live) =
+        tokio::sync::watch::channel(Arc::new(policy) as Arc<dyn mqtt_auth::Authorizer>);
+    let h = start_node(Node {
+        id: "authz-node",
+        listener: TcpListener::bind("127.0.0.1:0").await.unwrap(),
+        admin_ca: Arc::new(mint_ca("admin")),
+        server_ca: None,
+        cluster_ca: None,
+        viewers: &["CN=alice"],
+        operators: &[],
+        placement: None,
+        peers: None,
+        hub: None,
+        authz: Some(live),
+    });
+    let alice = mint_leaf(&h.admin_ca, "alice", None);
+
+    let (status, body) = h
+        .get(
+            &alice,
+            "/admin/v1/authz?user=device-7&action=publish&target=devices/device-7/t",
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["allowed"], true);
+    assert_eq!(body["rule"]["index"], 0);
+    assert_eq!(body["rule"]["expanded"], "devices/device-7/#");
+
+    let (_, body) = h
+        .get(
+            &alice,
+            "/admin/v1/authz?user=device-7&action=publish&target=devices/device-8/t",
+        )
+        .await;
+    assert_eq!(body["allowed"], false);
+    assert_eq!(body["rule"], Value::Null);
+
+    let (_, body) = h
+        .get(
+            &alice,
+            "/admin/v1/authz?user=bob&groups=ops,dev&action=subscribe&target=secret/%2B",
+        )
+        .await;
+    assert_eq!(body["allowed"], false, "{body}");
+    assert_eq!(body["rule"]["effect"], "deny");
+    assert_eq!(body["groups"], serde_json::json!(["ops", "dev"]));
+
+    // The dry run reads the LIVE policy: a reload that swaps it applies to the next call.
+    tx.send(Arc::new(mqtt_auth::AllowAll)).unwrap();
+    let (_, body) = h
+        .get(
+            &alice,
+            "/admin/v1/authz?user=device-7&action=publish&target=devices/device-8/t",
+        )
+        .await;
+    assert_eq!(body["allowed"], true);
+    assert!(
+        body["reason"].as_str().unwrap().contains("no ACL policy"),
+        "{body}"
+    );
+
+    let (status, body) = h
+        .get(&alice, "/admin/v1/authz?user=x&action=publish&target=a/%23")
+        .await;
+    assert_eq!((status, code(&body)), (400, "bad-request"));
+    let (status, body) = h
+        .get(&alice, "/admin/v1/authz?user=x&action=delete&target=a")
+        .await;
+    assert_eq!((status, code(&body)), (400, "bad-request"));
 }

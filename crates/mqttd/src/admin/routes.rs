@@ -51,6 +51,11 @@ const ENDPOINTS: &[Endpoint] = &[
     },
     Endpoint {
         method: "GET",
+        path: "/admin/v1/authz",
+        min_role: Role::Viewer,
+    },
+    Endpoint {
+        method: "GET",
         path: "/admin/v1/clients",
         min_role: Role::Viewer,
     },
@@ -116,6 +121,7 @@ pub async fn route(state: &AdminState, caller: &Caller, role: Role, req: &Reques
         "/admin/v1/node" => ok(&state.local_status().await),
         "/admin/v1/cluster" => super::cluster::cluster(state).await,
         "/admin/v1/placement" => super::cluster::placement(state).await,
+        "/admin/v1/authz" => super::authz::check(state, req),
         "/admin/v1/clients" => super::sessions::clients(state, req).await,
         "/admin/v1/session" => super::sessions::session(state, req).await,
         "/admin/v1/subscribers" => super::sessions::subscribers(state, req).await,

@@ -16,6 +16,7 @@
 //! The configuration itself is never written through this API (ADR 0081 §5): the file
 //! stays the only source.
 
+pub mod authz;
 pub mod cli;
 pub mod client;
 pub mod cluster;
@@ -55,6 +56,8 @@ pub struct AdminState {
     peers: Option<Arc<cluster::PeerAccess>>,
     /// The hub and stores behind the client and session endpoints (T4).
     sessions: Option<Arc<sessions::SessionAccess>>,
+    /// The live authorizer, for the dry run (T5).
+    authz: Option<authz::LiveAuthorizer>,
 }
 
 impl std::fmt::Debug for AdminState {
@@ -84,7 +87,15 @@ impl AdminState {
             cluster_ca: None,
             peers: None,
             sessions: None,
+            authz: None,
         }
+    }
+
+    /// Serve the authorization dry run against the live policy.
+    #[must_use]
+    pub fn with_authorizer(mut self, live: authz::LiveAuthorizer) -> Self {
+        self.authz = Some(live);
+        self
     }
 
     /// Serve the client, session, subscriber, backlog and retained endpoints.

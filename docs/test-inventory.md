@@ -37,7 +37,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/history-check/src/main.rs` — 0 test(s)
 
 
-## `crates/mqtt-auth/src/lib.rs` — 124 test(s)
+## `crates/mqtt-auth/src/lib.rs` — 128 test(s)
 
 - `acl::tests::a_bad_client_id_does_not_disturb_rules_that_never_use_it`
 - `acl::tests::a_bare_percent_is_literal`
@@ -47,6 +47,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `acl::tests::a_hostile_client_id_cannot_broaden_a_grant`
 - `acl::tests::a_substituted_value_is_never_rescanned_for_placeholders`
 - `acl::tests::allowed_narrow_subscribe_does_not_cover_broader_request`
+- `acl::tests::an_unsafe_substitution_in_a_deny_is_explained_as_fail_closed`
 - `acl::tests::an_unsubstitutable_client_id_makes_a_deny_refuse_outright`
 - `acl::tests::clients_is_rejected_on_a_topic_rule`
 - `acl::tests::connect_cannot_mix_with_topic_actions`
@@ -58,6 +59,9 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `acl::tests::empty_actions_are_rejected`
 - `acl::tests::empty_topics_are_rejected`
 - `acl::tests::everyone_rule_applies_to_any_subject`
+- `acl::tests::explain_always_agrees_with_enforcement`
+- `acl::tests::explain_names_the_deciding_rule`
+- `acl::tests::explain_reports_connect_rules_and_their_absence`
 - `acl::tests::explicit_default_allow_permits_everything_absent_rules`
 - `acl::tests::group_membership_matches`
 - `acl::tests::identities_or_groups_either_list_may_hit`
@@ -1497,7 +1501,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `narrow_allow_does_not_cover_broad_subscription`
 - `unauthorized_will_topic_is_refused_at_connect`
 
-## `crates/mqttd/tests/admin.rs` — 9 test(s)
+## `crates/mqttd/tests/admin.rs` — 10 test(s)
 
 - `a_certificate_from_another_ca_fails_the_handshake`
 - `a_session_shows_its_subscriptions_and_an_offline_one_its_queue`
@@ -1508,6 +1512,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `listed_subjects_get_their_role_and_everyone_else_is_refused`
 - `node_reports_the_statusz_body_and_unknown_routes_have_stable_codes`
 - `subscribers_backlog_and_retained_answer_the_day_two_questions`
+- `the_authorization_dry_run_names_the_deciding_rule_of_the_live_policy`
 
 ## `crates/mqttd/tests/audit.rs` — 4 test(s)
 

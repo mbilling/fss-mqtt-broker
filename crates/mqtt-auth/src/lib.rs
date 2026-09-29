@@ -70,6 +70,42 @@ pub enum Action {
     Subscribe,
 }
 
+/// What an authorization dry run asks about (ADR 0081 T5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckedAction {
+    /// Publish to a concrete topic.
+    Publish,
+    /// Subscribe to a topic filter.
+    Subscribe,
+    /// Connect with a client id (the target is the client id).
+    Connect,
+}
+
+/// The rule that decided an [`Explanation`].
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct DecidingRule {
+    /// Its position in the policy file's `[[rules]]`, from 0 — the index validation
+    /// errors use.
+    pub index: usize,
+    /// `allow` or `deny`.
+    pub effect: &'static str,
+    /// The pattern that matched, as written in the policy.
+    pub pattern: String,
+    /// That pattern after `%i` / `%c` substitution (`None` when substitution failed).
+    pub expanded: Option<String>,
+}
+
+/// An authorization verdict and what decided it (ADR 0081 T5).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct Explanation {
+    /// Whether the action is permitted.
+    pub allowed: bool,
+    /// The rule that decided, when one did.
+    pub rule: Option<DecidingRule>,
+    /// Why, in one sentence.
+    pub reason: String,
+}
+
 /// Verifies client credentials and returns an [`Identity`].
 ///
 /// Implementations MUST be constant-time where they compare secrets and MUST NOT
@@ -162,6 +198,31 @@ pub trait Authorizer: Send + Sync {
         let _ = (identity, client_id);
         true
     }
+
+    /// The verdict for `action` on `target` (a topic, a filter, or for
+    /// [`CheckedAction::Connect`] the client id), and what decided it — the admin API's
+    /// dry run (ADR 0081 T5). It must agree with the `authorize_*` methods; the default
+    /// calls them and reports the verdict without a rule.
+    fn explain(
+        &self,
+        identity: &Identity,
+        client_id: &ClientId,
+        action: CheckedAction,
+        target: &str,
+    ) -> Explanation {
+        let allowed = match action {
+            CheckedAction::Publish => {
+                self.authorize_publish(identity, client_id, &target.to_string())
+            }
+            CheckedAction::Subscribe => self.authorize_subscribe(identity, client_id, target),
+            CheckedAction::Connect => self.authorize_connect(identity, client_id),
+        };
+        Explanation {
+            allowed,
+            rule: None,
+            reason: "this authorizer does not report which rule decided".to_string(),
+        }
+    }
 }
 
 /// Permits every action. Used only when no ACL policy is configured at all —
@@ -177,6 +238,15 @@ impl Authorizer for AllowAll {
     fn authorize_subscribe(&self, _id: &Identity, _client: &ClientId, _f: &str) -> bool {
         true
     }
+    fn explain(&self, _: &Identity, _: &ClientId, _: CheckedAction, _: &str) -> Explanation {
+        Explanation {
+            allowed: true,
+            rule: None,
+            reason: "no ACL policy is configured: authorization is not enforced and every \
+                     action is allowed"
+                .to_string(),
+        }
+    }
 }
 
 /// A default-deny authorizer used until a real policy is configured.
@@ -189,6 +259,21 @@ impl Authorizer for DenyAll {
     }
     fn authorize_subscribe(&self, _id: &Identity, _client: &ClientId, _f: &str) -> bool {
         false
+    }
+    fn explain(&self, i: &Identity, c: &ClientId, action: CheckedAction, t: &str) -> Explanation {
+        // Connect falls through to the trait default (permitted), exactly as
+        // `authorize_connect` does for this authorizer.
+        let allowed = action == CheckedAction::Connect;
+        let _ = (i, c, t);
+        Explanation {
+            allowed,
+            rule: None,
+            reason: if allowed {
+                "the deny-all authorizer does not restrict connects".to_string()
+            } else {
+                "the deny-all authorizer refuses every publish and subscribe".to_string()
+            },
+        }
     }
 }
 

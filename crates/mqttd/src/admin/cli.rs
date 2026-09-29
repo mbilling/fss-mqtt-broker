@@ -75,6 +75,14 @@ const VERBS: &[Verb] = &[
         help: "this node's membership, replication and lease view; do the others agree",
     },
     Verb {
+        name: "authz",
+        method: "GET",
+        path: "/admin/v1/authz",
+        required: &["user", "action", "target"],
+        optional: &["groups", "client"],
+        help: "dry run: may <user> publish|subscribe|connect <target>, and which rule decides",
+    },
+    Verb {
         name: "clients",
         method: "GET",
         path: "/admin/v1/clients",
