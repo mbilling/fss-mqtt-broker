@@ -88,7 +88,7 @@
 | [0078](../adr/0078-replica-segment-log.md) | # 0078. The replica store becomes an append-only segment log — the disk is the limit, not the B-tree | Accepted | [3/4 done](0078-replica-segment-log.md) | 1 open |
 | [0079](../adr/0079-global-allocator.md) | # 0079. mqttd links mimalloc as its global allocator | Accepted | [1/2 done](0079-global-allocator.md) | 1 open |
 | [0080](../adr/0080-replication-factor.md) | # 0080. The replication factor is cluster state: configurable, default 2, changeable live | Accepted | [2/6 done](0080-replication-factor.md) | 4 open |
-| [0081](../adr/0081-admin-api.md) | # 0081. An authenticated admin API: reads cluster-wide, actions audited, config stays in the file | Accepted | [2/14 done](0081-admin-api.md) | 10 open, 2 deferred |
+| [0081](../adr/0081-admin-api.md) | # 0081. An authenticated admin API: reads cluster-wide, actions audited, config stays in the file | Accepted | [5/14 done](0081-admin-api.md) | 7 open, 2 deferred |
 
 ## Open and deferred work
 
@@ -221,9 +221,6 @@
 
 **0081 — # 0081. An authenticated admin API: reads cluster-wide, actions audited, config stays in the file**
 
-- `0081-T1` 🚧 in-progress ([#710](https://github.com/mbilling/fss-mqtt-broker/issues/710)): "Admin listener: [admin] bind, mTLS required, viewer/operator roles from the cert subject, every request audited, /admin/v1/node" — "PR #729."
-- `0081-T2` 🚧 in-progress ([#711](https://github.com/mbilling/fss-mqtt-broker/issues/711)): "mqttd --admin <verb>: CLI client for the admin API (table or --json)" — "PR #729."
-- `0081-T3` 🚧 in-progress ([#712](https://github.com/mbilling/fss-mqtt-broker/issues/712)): "Cluster view: /admin/v1/cluster and /placement answered by any node via admin-listener fan-out" — "Node to node over the admin listeners (ADR amendment 2026-09-29), not the peer bus; each row says whether that node replied, and why not."
 - `0081-T4` 🚧 in-progress ([#713](https://github.com/mbilling/fss-mqtt-broker/issues/713)): "Clients and sessions: paged list and filters, session detail, sessions matching a topic, top-N backlog, retained by prefix" — "Bounded responses only; reads of identifying data are audited."
 - `0081-T5` 🚧 in-progress ([#714](https://github.com/mbilling/fss-mqtt-broker/issues/714)): "Authorization dry run: /admin/v1/authz/check returns the verdict and the deciding rule" — "Evaluates the loaded policy; changes nothing."
 - `0081-T6` ⬜ planned ([#715](https://github.com/mbilling/fss-mqtt-broker/issues/715)): "Effective config (secrets fingerprinted, with a hash) and reload that returns its outcome" — "First action. Reload runs the ADR 0032 routine; the file stays the only input."
