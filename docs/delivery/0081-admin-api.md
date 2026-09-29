@@ -53,14 +53,16 @@ tasks:
     issue: 719
   - id: 0081-T11
     title: "mqttd --print-config: the effective config with secrets fingerprinted, offline"
-    status: planned
+    status: done
     issue: 720
-    notes: "Day 0; independent of the listener and can be picked up at any time."
+    date: 2026-09-29
+    evidence: "PR #728. mqttd --print-config prints the effective config (defaults < file < env) with secrets fingerprinted via Config::redacted (mqtt-config) and mqttd::config_view; unit tests pin that no secret field survives redaction and URL separators are preserved."
   - id: 0081-T12
     title: "mqttd --check-tls: chain, key match, expiry and SANs for every configured listener"
-    status: planned
+    status: done
     issue: 721
-    notes: "Day 0; independent of the listener and can be picked up at any time."
+    date: 2026-09-29
+    evidence: "PR #728. mqttd --check-tls (crates/mqttd/src/tls_check.rs) checks chain, key match, expiry (fail/warn under 30 days) and SANs for [tls] and [cluster.peer_tls]; rcgen-minted ok/expired/key-mismatch tests."
   - id: 0081-T13
     title: "OIDC bearer tokens as a second admin authenticator on the same roles"
     status: deferred
@@ -89,8 +91,8 @@ frontmatter above · this file is the plan, progress log, and changelog.
 | 0081-T8 | 🚧 in-progress | [#717](https://github.com/mbilling/fss-mqtt-broker/issues/717) | — | "Not persisted; shown on /statusz." |
 | 0081-T9 | ⬜ planned | [#718](https://github.com/mbilling/fss-mqtt-broker/issues/718) | — |  |
 | 0081-T10 | ⬜ planned | [#719](https://github.com/mbilling/fss-mqtt-broker/issues/719) | — |  |
-| 0081-T11 | ⬜ planned | [#720](https://github.com/mbilling/fss-mqtt-broker/issues/720) | — | "Day 0; independent of the listener and can be picked up at any time." |
-| 0081-T12 | ⬜ planned | [#721](https://github.com/mbilling/fss-mqtt-broker/issues/721) | — | "Day 0; independent of the listener and can be picked up at any time." |
+| 0081-T11 | ✅ done | [#720](https://github.com/mbilling/fss-mqtt-broker/issues/720) | 2026-09-29 | "PR #728. mqttd --print-config prints the effective config (defaults < file < env) with secrets fingerprinted via Config::redacted (mqtt-config) and mqttd::config_view; unit tests pin that no secret field survives redaction and URL separators are preserved." |
+| 0081-T12 | ✅ done | [#721](https://github.com/mbilling/fss-mqtt-broker/issues/721) | 2026-09-29 | "PR #728. mqttd --check-tls (crates/mqttd/src/tls_check.rs) checks chain, key match, expiry (fail/warn under 30 days) and SANs for [tls] and [cluster.peer_tls]; rcgen-minted ok/expired/key-mismatch tests." |
 | 0081-T13 | 💤 deferred | — | — | "After T1–T9 are in use." |
 | 0081-T14 | 💤 deferred | — | — | "Needs a demonstrated need and a dry-run design (ADR §5)." |
 <!-- /status-table:0081 -->
@@ -125,4 +127,5 @@ the reads it depends on.
 - 2026-09-29: ADR proposed; tasks and issues filed.
 - 2026-09-29: ADR accepted.
 - 2026-09-29: T1, T2 in review (PR #729): the admin listener and the CLI client.
+- 2026-09-29: T11, T12 delivered (PR #728 merged).
 - 2026-09-29: T3 in review (PR #730): the cluster view; node-to-node over the admin listeners (ADR amendment).
