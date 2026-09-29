@@ -706,6 +706,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     let audit_for_shutdown = policy.audit.clone();
     let audit_for_admin = policy.audit.clone();
+    let admin_sessions = mqttd::admin::sessions::SessionAccess {
+        hub: hub_tx.clone(),
+        store: store.clone(),
+        placement: Some(placement_for_backup.clone()),
+    };
     reloader.attach_config_stamp(config_stamp.clone());
 
     // Fold the cluster-bus gossip CRL (ADR 0022 T7) into the same validate-before-swap
@@ -1027,6 +1032,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         health_state,
         &live_config,
         audit_for_admin,
+        admin_sessions,
     )
     .await?;
 
@@ -2507,6 +2513,7 @@ async fn start_admin(
     health: mqttd::health::HealthState,
     live_config: &Arc<RwLock<Config>>,
     audit: Arc<dyn mqtt_observability::AuditSink>,
+    sessions: mqttd::admin::sessions::SessionAccess,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let admin = &config.admin;
     let Some(bind) = &admin.bind else {
@@ -2522,7 +2529,8 @@ async fn start_admin(
     cas.extend(cluster_ca);
     let acceptor = tls::admin_acceptor(Path::new(cert), Path::new(key), &cas)?;
     let mut state =
-        mqttd::admin::AdminState::new(node_id.0.clone(), health, live_config.clone(), audit);
+        mqttd::admin::AdminState::new(node_id.0.clone(), health, live_config.clone(), audit)
+            .with_sessions(sessions);
     if let Some(ca) = cluster_ca {
         state = state.with_cluster_ca(tls::ChainCheck::new(ca)?);
     }

@@ -74,6 +74,46 @@ const VERBS: &[Verb] = &[
         optional: &[],
         help: "this node's membership, replication and lease view; do the others agree",
     },
+    Verb {
+        name: "clients",
+        method: "GET",
+        path: "/admin/v1/clients",
+        required: &[],
+        optional: &["prefix", "user", "source", "limit", "cursor"],
+        help: "sessions on this node, by client id (paged)",
+    },
+    Verb {
+        name: "session",
+        method: "GET",
+        path: "/admin/v1/session",
+        required: &["client"],
+        optional: &[],
+        help: "one session: subscriptions, in flight, backlog, will, owner",
+    },
+    Verb {
+        name: "subscribers",
+        method: "GET",
+        path: "/admin/v1/subscribers",
+        required: &["topic"],
+        optional: &["limit"],
+        help: "who on this node would receive a publish to <topic>",
+    },
+    Verb {
+        name: "backlog",
+        method: "GET",
+        path: "/admin/v1/backlog",
+        required: &[],
+        optional: &["top"],
+        help: "the sessions with the most messages waiting",
+    },
+    Verb {
+        name: "retained",
+        method: "GET",
+        path: "/admin/v1/retained",
+        required: &[],
+        optional: &["prefix", "limit", "cursor"],
+        help: "retained messages by topic prefix: count, bytes, list (paged)",
+    },
 ];
 
 /// Options that take a value and apply to every verb.

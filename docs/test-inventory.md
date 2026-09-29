@@ -1497,14 +1497,17 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `narrow_allow_does_not_cover_broad_subscription`
 - `unauthorized_will_topic_is_refused_at_connect`
 
-## `crates/mqttd/tests/admin.rs` — 6 test(s)
+## `crates/mqttd/tests/admin.rs` — 9 test(s)
 
 - `a_certificate_from_another_ca_fails_the_handshake`
+- `a_session_shows_its_subscriptions_and_an_offline_one_its_queue`
 - `any_node_answers_for_the_cluster_and_a_silent_node_is_listed_as_silent`
+- `clients_are_listed_filtered_and_paged_with_their_connection_facts`
 - `cluster_certificates_get_the_peer_role`
 - `every_request_is_audited_with_subject_role_and_outcome`
 - `listed_subjects_get_their_role_and_everyone_else_is_refused`
 - `node_reports_the_statusz_body_and_unknown_routes_have_stable_codes`
+- `subscribers_backlog_and_retained_answer_the_day_two_questions`
 
 ## `crates/mqttd/tests/audit.rs` — 4 test(s)
 

@@ -327,6 +327,7 @@ impl Rig {
                     method: AuthMethod::Password,
                     cert_serial: None,
                     protocol: ProtocolVersion::V311,
+                    source: None,
                 },
                 conn_id: 1,
                 clean_start: true,

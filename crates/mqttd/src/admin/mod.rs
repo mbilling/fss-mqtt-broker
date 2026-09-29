@@ -22,6 +22,7 @@ pub mod cluster;
 pub mod http;
 pub mod roles;
 mod routes;
+pub mod sessions;
 
 pub use roles::{Caller, Role};
 
@@ -52,6 +53,8 @@ pub struct AdminState {
     /// How to reach the other nodes' admin listeners for the cluster view. `None` when
     /// this node has no cluster TLS: its peers are then listed as not queryable.
     peers: Option<Arc<cluster::PeerAccess>>,
+    /// The hub and stores behind the client and session endpoints (T4).
+    sessions: Option<Arc<sessions::SessionAccess>>,
 }
 
 impl std::fmt::Debug for AdminState {
@@ -80,7 +83,15 @@ impl AdminState {
             audit,
             cluster_ca: None,
             peers: None,
+            sessions: None,
         }
+    }
+
+    /// Serve the client, session, subscriber, backlog and retained endpoints.
+    #[must_use]
+    pub fn with_sessions(mut self, access: sessions::SessionAccess) -> Self {
+        self.sessions = Some(Arc::new(access));
+        self
     }
 
     /// Let this node answer for the cluster by asking its peers' admin listeners.
