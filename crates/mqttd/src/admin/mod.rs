@@ -239,9 +239,12 @@ async fn handle(stream: TcpStream, acceptor: TlsAcceptor, state: AdminState) {
     }
 }
 
-/// `METHOD /path?query` for the audit record, re-encoded so the record is one line.
+/// `METHOD /path?query` for the audit record. The path and every query component are
+/// re-encoded after decoding, so a `%0A` in the request cannot split the record: the audit
+/// line stays one line whatever the client sent.
 fn audit_target(request: &http::Request) -> String {
-    let mut target = format!("{} {}", request.method, request.path);
+    let path: Vec<String> = request.path.split('/').map(http::percent_encode).collect();
+    let mut target = format!("{} {}", request.method, path.join("/"));
     for (i, (k, v)) in request.query.iter().enumerate() {
         target.push(if i == 0 { '?' } else { '&' });
         target.push_str(&http::percent_encode(k));

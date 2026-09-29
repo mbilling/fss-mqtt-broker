@@ -310,9 +310,17 @@ async fn every_request_is_audited_with_subject_role_and_outcome() {
     let mallory = mint_leaf(&h.admin_ca, "mallory", None);
     h.get(&alice, "/admin/v1/node?x=a%20b").await;
     h.get(&mallory, "/admin/v1/node").await;
+    // A newline smuggled into the path must not split the one-line audit record.
+    let (status, _) = h.get(&alice, "/admin/v1/node%0Aforged%20line").await;
+    assert_eq!(status, 404);
 
     let records = h.audit.0.lock().unwrap().clone();
-    assert_eq!(records.len(), 2, "{records:?}");
+    assert_eq!(records.len(), 3, "{records:?}");
+    assert_eq!(
+        records[2].2,
+        "role=viewer GET /admin/v1/node%0Aforged%20line -> 404"
+    );
+    assert!(records.iter().all(|(_, _, d)| !d.contains('\n')));
     assert!(records.iter().all(|(kind, _, _)| kind == "admin.request"));
     assert_eq!(records[0].1.as_deref(), Some("CN=alice"));
     assert_eq!(
@@ -653,7 +661,14 @@ async fn subscribers_backlog_and_retained_answer_the_day_two_questions() {
     assert_eq!(rows[0]["filter"], "a/+/temp");
     assert_eq!(rows[1]["client_id"], "worker");
     assert_eq!(rows[1]["shared_group"], "g");
+    let (_, one) = view(&b, "/admin/v1/subscribers?topic=a/b/temp&limit=1").await;
+    assert_eq!(one["subscribers"].as_array().unwrap().len(), 1);
+    assert_eq!(one["subscribers"][0]["client_id"], "slow");
+    assert_eq!(one["truncated"], true);
     let (status, bad) = view(&b, "/admin/v1/subscribers?topic=a/%2B/temp").await;
+    assert_eq!((status, code(&bad)), (400, "bad-request"));
+    // An unencoded `+` is a `+`, not a space: still refused as a wildcard.
+    let (status, bad) = view(&b, "/admin/v1/subscribers?topic=a/+/temp").await;
     assert_eq!((status, code(&bad)), (400, "bad-request"));
 
     // `slow` never acknowledges: its QoS 1 deliveries stay in flight.
