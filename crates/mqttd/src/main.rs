@@ -2019,6 +2019,18 @@ async fn start_hub(
              cluster founded before ADR 0080 runs at 3",
             config.durable.replicas
         );
+        if config.durable.replicas > 2 && config.durable.replicas.is_multiple_of(2) {
+            warn!(
+                replicas = config.durable.replicas,
+                "durable.replicas is even: {} copies need {} acks and still tolerate only {} \
+                 failure(s), the same as {} copies — a copy's storage and replication for no \
+                 added fault tolerance (ADR 0080 §2)",
+                config.durable.replicas,
+                config.durable.replicas / 2 + 1,
+                (config.durable.replicas - 1) / 2,
+                config.durable.replicas - 1
+            );
+        }
         let (store, durable_retained, plane, driver) =
             mqtt_cluster::durable_node::build_durable_node_with(
                 node_id.clone(),

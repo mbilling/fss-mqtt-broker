@@ -1074,12 +1074,19 @@ mod tests {
         let (store, placement, plane, driver) = founding_node(&node, dir.path(), 3).await;
         wait_writable(&store, &client, &msg).await;
         wait_replicas(&placement, 2).await;
-        tokio::time::sleep(Duration::from_millis(1500)).await;
-        assert_eq!(
-            placement.read().unwrap().desired_replicas(),
-            2,
-            "the founded factor must not be overridden by a restart's setting"
-        );
+        // Hold the observation across several driver ticks: a restart's setting
+        // that overrode the committed factor would surface on one of them.
+        for _ in 0..15 {
+            assert_eq!(
+                placement.read().unwrap().desired_replicas(),
+                2,
+                "the founded factor must not be overridden by a restart's setting"
+            );
+            // SETTLE(founded-factor-holds): the claim is a negative — the restart's
+            // setting never replaces the committed factor — and no observable marks a
+            // driver tick, so it can only be held across ~1.5 s of ticks.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
         driver.abort();
         let _ = driver.await;
         plane.raft().shutdown().await.unwrap();

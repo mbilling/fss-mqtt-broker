@@ -361,8 +361,20 @@ mod tests {
         ));
         assert_eq!(assigner.reconcile(&raft, &store).await.unwrap(), 0, "held");
         assert_eq!(store.high_epoch(), 0);
-        tokio::time::sleep(Duration::from_millis(400)).await;
-        let made = assigner.reconcile(&raft, &store).await.unwrap();
+        // Poll the observable — the first assignment is no longer held — until the
+        // 300 ms bound expires, as the driver's reconcile tick would.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let made = loop {
+            let made = assigner.reconcile(&raft, &store).await.unwrap();
+            if made > 0 {
+                break made;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the hold never expired: an incapable fresh cluster would never serve"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
         assert_eq!(made, usize::try_from(NUM_GROUPS).unwrap(), "no longer held");
         assert!(store.replication().is_unset(), "runs at the legacy 3");
         assert_eq!(store.replication().effective(), 3);
