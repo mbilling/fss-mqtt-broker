@@ -5,14 +5,16 @@ adr_status: Accepted
 tasks:
   - id: 0081-T1
     title: "Admin listener: [admin] bind, mTLS required, viewer/operator roles from the cert subject, every request audited, /admin/v1/node"
-    status: in-progress
+    status: done
     issue: 710
-    notes: "PR #729."
+    date: 2026-09-29
+    evidence: "PR #729. crates/mqttd/src/admin/ (mod, http, roles, routes); mqtt_net::tls::admin_acceptor + ChainCheck; [admin] config + MQTTD_ADMIN_* vars, validated, restart-scoped except the role lists. tests/admin.rs over real mTLS: roles from subjects, unlisted subject 403, foreign CA refused at the handshake, hot-reloaded role lists, cluster-CA peer role and an impostor, 404/405 codes, one single-line admin.request audit record per request. THREAT-MODEL, HARDENING H-7.7/H-7.8/H-8.5, AUDIT-SCHEMA and OPERATIONS.md updated."
   - id: 0081-T2
     title: "mqttd --admin <verb>: CLI client for the admin API (table or --json)"
-    status: in-progress
+    status: done
     issue: 711
-    notes: "PR #729."
+    date: 2026-09-29
+    evidence: "PR #729. mqttd --admin <verb> (crates/mqttd/src/admin/cli.rs, client.rs): table-driven verbs validated before anything runs, flags or MQTTD_ADMIN_* client variables with config fallbacks, table or --json output, exit 0/1/2. Smoke-tested against the real binary (whoami, node, 403 for an unlisted subject)."
   - id: 0081-T3
     title: "Cluster view: /admin/v1/cluster and /placement answered by any node via admin-listener fan-out"
     status: in-progress
@@ -81,8 +83,8 @@ frontmatter above · this file is the plan, progress log, and changelog.
 <!-- status-table:0081 -->
 | Task | Status | Issue | When | Evidence / notes |
 |------|--------|-------|------|------------------|
-| 0081-T1 | 🚧 in-progress | [#710](https://github.com/mbilling/fss-mqtt-broker/issues/710) | — | "PR #729." |
-| 0081-T2 | 🚧 in-progress | [#711](https://github.com/mbilling/fss-mqtt-broker/issues/711) | — | "PR #729." |
+| 0081-T1 | ✅ done | [#710](https://github.com/mbilling/fss-mqtt-broker/issues/710) | 2026-09-29 | "PR #729. crates/mqttd/src/admin/ (mod, http, roles, routes); mqtt_net::tls::admin_acceptor + ChainCheck; [admin] config + MQTTD_ADMIN_* vars, validated, restart-scoped except the role lists. tests/admin.rs over real mTLS: roles from subjects, unlisted subject 403, foreign CA refused at the handshake, hot-reloaded role lists, cluster-CA peer role and an impostor, 404/405 codes, one single-line admin.request audit record per request. THREAT-MODEL, HARDENING H-7.7/H-7.8/H-8.5, AUDIT-SCHEMA and OPERATIONS.md updated." |
+| 0081-T2 | ✅ done | [#711](https://github.com/mbilling/fss-mqtt-broker/issues/711) | 2026-09-29 | "PR #729. mqttd --admin <verb> (crates/mqttd/src/admin/cli.rs, client.rs): table-driven verbs validated before anything runs, flags or MQTTD_ADMIN_* client variables with config fallbacks, table or --json output, exit 0/1/2. Smoke-tested against the real binary (whoami, node, 403 for an unlisted subject)." |
 | 0081-T3 | 🚧 in-progress | [#712](https://github.com/mbilling/fss-mqtt-broker/issues/712) | — | "Node to node over the admin listeners (ADR amendment 2026-09-29), not the peer bus; each row says whether that node replied, and why not." |
 | 0081-T4 | 🚧 in-progress | [#713](https://github.com/mbilling/fss-mqtt-broker/issues/713) | — | "Bounded responses only; reads of identifying data are audited." |
 | 0081-T5 | ⬜ planned | [#714](https://github.com/mbilling/fss-mqtt-broker/issues/714) | — | "Evaluates the loaded policy; changes nothing." |
@@ -126,6 +128,6 @@ the reads it depends on.
 
 - 2026-09-29: ADR proposed; tasks and issues filed.
 - 2026-09-29: ADR accepted.
-- 2026-09-29: T1, T2 in review (PR #729): the admin listener and the CLI client.
+- 2026-09-29: T1, T2 delivered (PR #729 merged): the admin listener and the CLI client.
 - 2026-09-29: T11, T12 delivered (PR #728 merged).
 - 2026-09-29: T3 in review (PR #730): the cluster view; node-to-node over the admin listeners (ADR amendment).
