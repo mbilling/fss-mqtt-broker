@@ -2549,6 +2549,30 @@ async fn start_admin(
     if let Some(ca) = cluster_ca {
         state = state.with_cluster_ca(tls::ChainCheck::new(ca)?);
     }
+    // The cluster view (ADR 0081 §2): ask peers' admin listeners, presenting this node's
+    // cluster certificate (admitted there as the `peer` role), trusting whichever of the
+    // admin or cluster CA issued their server certificates.
+    let peer_tls = &config.cluster.peer_tls;
+    if let (Some(ca), Some(node_cert), Some(node_key)) =
+        (&peer_tls.ca, &peer_tls.cert, &peer_tls.key)
+    {
+        let port = match admin.peer_port {
+            Some(port) => port,
+            None => bind
+                .rsplit_once(':')
+                .and_then(|(_, p)| p.parse().ok())
+                .ok_or_else(|| format!("admin.bind {bind} has no port"))?,
+        };
+        let connector = tls::client_connector_multi(
+            &[Path::new(client_ca), Path::new(ca)],
+            Path::new(node_cert),
+            Path::new(node_key),
+        )?;
+        state = state.with_peers(mqttd::admin::cluster::PeerAccess::new(
+            connector,
+            mqttd::admin::cluster::PeerAccess::same_host(port),
+        ));
+    }
     let listener = TcpListener::bind(bind).await?;
     info!(
         %bind,

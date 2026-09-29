@@ -73,12 +73,12 @@ addresses and subscriptions are identifying data that must not be served there.
 - **Per node:** `GET /admin/v1/node` returns what `/statusz` does, plus the detail
   `/statusz` must never carry.
 - **Per cluster:** `GET /admin/v1/cluster` and `/admin/v1/placement` are answered by any
-  node. It sends the query to its peers over the authenticated peer bus and merges the
-  answers. Every node's row states whether it replied and how old its view is, so a
-  partitioned node shows up as missing rather than as healthy. The fan-out needs a new
-  peer message, so it is **capability-gated** on the next peer protocol version, like
-  ADR 0073's ownership flag. With an older peer present, the cluster view lists that peer
-  as "not queryable".
+  node. It asks every member's **admin listener** for `/admin/v1/node`, presenting its
+  cluster certificate (admitted there as the `peer` role, which can read only that
+  node's own state), and merges the answers. Every node's row states whether it replied,
+  and if not, why; a partitioned node shows up as silent rather than as healthy. A peer
+  without an admin listener, or a node without cluster TLS, is listed as "not
+  queryable". (Amended 2026-09-29: originally over the peer bus; see the amendment.)
 - **Clients and sessions:** list (filter by client id prefix, username, source address;
   paged), one session in detail (subscriptions, inflight, queue depth and limits, will,
   expiry, owning node), the sessions matching a topic filter, the top N sessions by
@@ -110,8 +110,9 @@ Operator role only:
 | `cordon` / `uncordon` | Stops accepting new connections and reports not-ready on `/readyz`; existing sessions stay connected. Not persisted, so a restart clears it. `/statusz` shows it. | Draining without decommissioning had no control. |
 | `log-level <filter> <ttl>` | Replaces the tracing filter until the TTL expires (at most one hour), then restores the configured one. `/statusz` shows the override. | The filter is fixed at startup today. |
 
-An action on a client connected to another node is **forwarded** over the peer bus with the
-caller's identity and audited on both nodes.
+An action on a client connected to another node is **forwarded** to that node's admin
+listener with the caller's identity and audited on both nodes. (Amended 2026-09-29:
+originally over the peer bus.)
 
 ### 5. What the API will not do
 
@@ -142,8 +143,8 @@ caller's identity and audited on both nodes.
   `docs/COMPARISON.md`) become partly out of date. On acceptance each gets a note
   pointing here: the reasons they gave still hold for pushing config, and this record keeps
   that rejection.
-- The peer protocol gains a query message and a forwarded-action message (one protocol
-  version, capability-gated).
+- The peer protocol is unchanged: node-to-node admin traffic uses the admin listeners
+  (amendment below).
 - Endpoint paths and JSON field names become a compatibility surface. They are `v1` and
   unstable until 1.0 (pre-1.0 policy); from 1.0 the ADR 0058 contract applies.
 
@@ -161,3 +162,29 @@ caller's identity and audited on both nodes.
   it needs no external service and matches how the cluster already authenticates peers.
 - **Per-node API only, with no fan-out.** Simpler, but the cluster view is the most
   requested read, and assembling it from outside needs a route to every pod.
+
+## Amendment (2026-09-29): node-to-node admin traffic uses the admin listeners
+
+§2 and §4 first sent the cluster query and forwarded actions over the peer bus, as new
+frames behind the next peer protocol version. While T3 was being built, ADR 0080 T1 was
+raising `PROTO_MAX` to 9 for the replication factor. Two unrelated features bumping the same
+per-link version would have to be sequenced against each other, and the admin plane would
+share a version gate, a codec and a failure domain with message delivery.
+
+Instead, each node reaches its peers' admin listeners over mTLS:
+
+- The admin listener trusts the cluster CA as well as the admin client CA. A certificate
+  the cluster CA issued that is in no role list gets the `peer` role, decided by
+  re-verifying the chain against the cluster CA alone, never by subject. `peer` can read
+  only the node's own state (`/admin/v1/node`, `/admin/v1/whoami`) and, from T7, receive
+  forwarded actions.
+- A node finds a peer's admin listener at the host of the peer's cluster-bus address and
+  `admin.peer_port` (`MQTTD_ADMIN_PEER_PORT`, default: the port of `admin.bind`).
+- It verifies the peer's admin server certificate against the admin client CA or the
+  cluster CA. The simplest setup serves each node's admin listener with the node's cluster
+  certificate, which already names the node and chains to the cluster CA.
+
+What this costs: every node that should appear in the cluster view needs its admin
+listener on, and a node answers for the cluster only if it has cluster TLS (its peers are
+otherwise listed as not queryable). What it avoids: a peer protocol bump, and any coupling
+between the admin plane and the data plane.

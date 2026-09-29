@@ -39,6 +39,16 @@ const ENDPOINTS: &[Endpoint] = &[
         path: "/admin/v1/node",
         min_role: Role::Peer,
     },
+    Endpoint {
+        method: "GET",
+        path: "/admin/v1/cluster",
+        min_role: Role::Viewer,
+    },
+    Endpoint {
+        method: "GET",
+        path: "/admin/v1/placement",
+        min_role: Role::Viewer,
+    },
 ];
 
 /// Route one authorized request.
@@ -78,19 +88,9 @@ pub async fn route(state: &AdminState, caller: &Caller, role: Role, req: &Reques
             "role": role.as_str(),
             "node_id": state.node_id,
         })),
-        "/admin/v1/node" => node(state).await,
+        "/admin/v1/node" => ok(&state.local_status().await),
+        "/admin/v1/cluster" => super::cluster::cluster(state).await,
+        "/admin/v1/placement" => super::cluster::placement(state).await,
         _ => error(404, "not-found", "no such admin endpoint"),
     }
-}
-
-/// This node's state: the `/statusz` body (ADR 0054).
-async fn node(state: &AdminState) -> Answer {
-    let body = match state.health.statusz().await {
-        Some(s) => serde_json::from_str(&s).unwrap_or_else(|_| json!({})),
-        None => json!({
-            "node_id": state.node_id,
-            "version": env!("CARGO_PKG_VERSION"),
-        }),
-    };
-    ok(&body)
 }

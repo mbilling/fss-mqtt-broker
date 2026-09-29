@@ -835,8 +835,32 @@ export MQTTD_ADMIN_CLIENT_KEY=~/.mqttd/oncall.key
 mqttd --admin whoami          # the subject and role the broker sees
 mqttd --admin node            # this node's state (the /statusz body)
 mqttd --admin node --json     # the raw JSON
+mqttd --admin cluster         # every node, from any node
+mqttd --admin placement       # this node's membership view; do the others agree
 mqttd --admin help            # every verb
 ```
+
+**The cluster view.** `mqttd --admin cluster` on any node returns one row per member:
+whether it replied (and if not, why), version, readiness, cluster id, member count, lease
+role and epoch, replica lag in groups, brownout, quarantine, SWIM isolation, decommission,
+config checksum and peer protocol. A summary says whether every replying node agrees on
+the cluster id (the split-brain check), version, config and membership. A node that
+does not answer is a row with `replied: false`, never a missing row.
+
+The answering node asks each peer's admin listener directly: at the host of the peer's
+cluster-bus address and `admin.peer_port` (default: the port of `admin.bind`), presenting
+its own cluster certificate. For that to work:
+
+- run the admin listener on **every** node, with the same port (or set `admin.peer_port`);
+- the node needs `[cluster.peer_tls]` (without cluster TLS its peers are listed as not
+  queryable);
+- each node's admin server certificate must chain to the admin client CA or the cluster
+  CA and name the node's cluster-bus host. The simplest way is to serve the admin listener
+  with the node's cluster certificate: `admin.cert = <peer_tls.cert>`,
+  `admin.key = <peer_tls.key>`.
+
+A node's cluster certificate, in no role list, is admitted as the `peer` role: it can read
+that node's own state, and nothing else.
 
 Each variable has a flag (`--url`, `--ca`, `--cert`, `--key`, `--server-name`). Without a
 URL, the CLI uses `admin.bind` from the local config, and without a CA, `admin.client_ca`.

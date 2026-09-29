@@ -58,6 +58,22 @@ const VERBS: &[Verb] = &[
         optional: &[],
         help: "this node's state (the /statusz body)",
     },
+    Verb {
+        name: "cluster",
+        method: "GET",
+        path: "/admin/v1/cluster",
+        required: &[],
+        optional: &[],
+        help: "every node's version, readiness, identity and lag, from any node",
+    },
+    Verb {
+        name: "placement",
+        method: "GET",
+        path: "/admin/v1/placement",
+        required: &[],
+        optional: &[],
+        help: "this node's membership, replication and lease view; do the others agree",
+    },
 ];
 
 /// Options that take a value and apply to every verb.

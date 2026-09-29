@@ -597,6 +597,11 @@ pub struct Admin {
     /// (`MQTTD_ADMIN_OPERATORS`, `;`-separated, same syntax as [`Admin::viewers`]).
     /// Hot-reloadable.
     pub operators: Vec<String>,
+    /// The port other nodes' admin listeners use (`MQTTD_ADMIN_PEER_PORT`), for the cluster
+    /// view (ADR 0081 §2): a node reaches a peer at the host of that peer's cluster-bus
+    /// address and this port. Unset = the port of [`Admin::bind`], the usual case when
+    /// every node runs the same config.
+    pub peer_port: Option<u16>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1552,6 +1557,9 @@ impl Config {
         on!("MQTTD_ADMIN_OPERATORS", v, {
             self.admin.operators = subject_list(&v);
         });
+        on!("MQTTD_ADMIN_PEER_PORT", v, {
+            self.admin.peer_port = Some(num("MQTTD_ADMIN_PEER_PORT", &v)?);
+        });
         on!("MQTTD_BACKUP_DIR", v, {
             self.backup.dir = Some(v);
         });
@@ -2136,6 +2144,7 @@ pub const ENV_VARS: &[&str] = &[
     "MQTTD_ADMIN_CLIENT_CA",
     "MQTTD_ADMIN_VIEWERS",
     "MQTTD_ADMIN_OPERATORS",
+    "MQTTD_ADMIN_PEER_PORT",
     // backup (ADR 0062)
     "MQTTD_BACKUP_DIR",
     "MQTTD_BACKUP_EVERY",
@@ -2922,7 +2931,8 @@ mod tests {
             | "MQTTD_OIDC_JWKS_REFRESH"
             | "MQTTD_OIDC_MAX_STALE"
             | "MQTTD_BACKUP_EVERY"
-            | "MQTTD_TLS_SESSION_CACHE" => "7",
+            | "MQTTD_TLS_SESSION_CACHE"
+            | "MQTTD_ADMIN_PEER_PORT" => "7",
             // The default is already 7 (backup.keep) / 300 (restore timeout), so "7" would
             // change nothing and the totality sweep would read as a missing mapping.
             "MQTTD_BACKUP_KEEP" | "MQTTD_RESTORE_TIMEOUT" => "3",
@@ -3068,8 +3078,8 @@ mod tests {
             // plus MQTTD_REQUIRE_PASSWORD_WITH_CERTIFICATE (issue #670),
             // plus the five MQTTD_<LISTENER>_ALLOW_ANONYMOUS overrides (issue #669),
             // plus MQTTD_REPLICAS (ADR 0080),
-            // plus the six MQTTD_ADMIN_* variables (ADR 0081).
-            108,
+            // plus the seven MQTTD_ADMIN_* variables (ADR 0081).
+            109,
             "the MQTTD_* surface changed — update ENV_VARS"
         );
         // Issue #239: MQTTD_MIN_REPLICAS was wired in `overlay_from` but never
