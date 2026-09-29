@@ -140,7 +140,7 @@ nodes than R′, or if a change is already in progress; the refusal is logged an
   documentation, the startup log and `/statusz` state which one a cluster runs.
 - R is no longer a constant anywhere it is read (placement, the write floor, the startup
   log, the gauges); tests that assumed 3 name it explicitly.
-- The lease state machine and the peer protocol gain a command and a version (9).
+- The lease state machine gains a replication record and three commands, and the peer protocol a version (9).
 
 ## Alternatives considered
 
