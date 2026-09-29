@@ -326,6 +326,53 @@ fn admit_desired(
         .collect()
 }
 
+/// What the catch-up sweep does with one group's caught-up stamp (ADR 0043 P1,
+/// ADR 0080). A pure function of this node, the group's replica set and the
+/// stored stamp, so the rule is testable on its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StampDecision {
+    /// Not a replica, and nothing to forget.
+    NotOurs,
+    /// Not a replica any more, but still stamped: CLEAR the stamp. From here
+    /// the group's writes stop reaching this node, so the stamp would outlive
+    /// the custody it certifies — and a later re-entry into the set (exact
+    /// equality) or a pure shrink from it would claim a history this node never
+    /// received. With R below the member count (R=2 on 3 nodes, R=3 on 5) nodes
+    /// leave and re-enter sets all the time; at R=3 on 3 nodes they never did.
+    Clear,
+    /// The stamp already matches the set.
+    Current,
+    /// A pure shrink of the cohort we were current with, and we never left it.
+    Shrink,
+    /// New members entered: full catch-up before stamping.
+    CatchUp,
+}
+
+fn stamp_decision(
+    node: &NodeId,
+    set: &[NodeId],
+    stored: Option<&BTreeSet<NodeId>>,
+) -> StampDecision {
+    let stamped = stored.filter(|s| !s.is_empty());
+    if !set.contains(node) {
+        return if stamped.is_some() {
+            StampDecision::Clear
+        } else {
+            StampDecision::NotOurs
+        };
+    }
+    match stamped {
+        Some(s) if s.len() == set.len() && set.iter().all(|n| s.contains(n)) => {
+            StampDecision::Current
+        }
+        // A pure shrink keeps custody — we were current with a cohort that
+        // contained every remaining member and, the stamp being cleared the moment
+        // we leave a set, have been in it ever since.
+        Some(s) if set.iter().all(|n| s.contains(n)) => StampDecision::Shrink,
+        _ => StampDecision::CatchUp,
+    }
+}
+
 /// The handles the **catch-up sweep** (ADR 0043 P1) runs over: this node's
 /// identity, the shared replication transport (to discover keys and ask owners to
 /// re-commit), its own follower copy (to judge hollowness and stamp the durable
@@ -386,23 +433,22 @@ impl CatchUp {
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 (p.group_replica_set(group), p.group_owner(group))
             };
-            if !set.contains(&self.node) {
-                continue; // not ours to hold
-            }
-            let shrink_of_known_cohort = {
+            let decision = {
                 let r = self.lock_replicas();
-                if r.group_current(group, &set) {
-                    continue; // stamp already current
-                }
-                // A pure shrink keeps custody: we were current with a cohort that
-                // contained every remaining member, so our copy's completeness
-                // story is unchanged — no unknown-history member entered.
-                r.caught_up_set(group)
-                    .is_some_and(|stored| set.iter().all(|n| stored.contains(n)))
+                stamp_decision(&self.node, &set, r.caught_up_set(group))
             };
-            if shrink_of_known_cohort {
-                stamps.push((group, set));
-                continue;
+            match decision {
+                StampDecision::NotOurs | StampDecision::Current => continue,
+                StampDecision::Clear => {
+                    // Custody lapsed: the group's writes no longer reach us.
+                    stamps.push((group, Vec::new()));
+                    continue;
+                }
+                StampDecision::Shrink => {
+                    stamps.push((group, set));
+                    continue;
+                }
+                StampDecision::CatchUp => {}
             }
             // Full catch-up: every other member must have answered discovery.
             if !set
@@ -527,6 +573,9 @@ async fn run_driver(
     // membership change, run every few ticks until nothing is hollow or the budget
     // is spent. `prev_members` starts empty so the first tick always arms.
     let mut prev_members: BTreeSet<RaftNodeId> = BTreeSet::new();
+    // An adopted replication factor reshapes every group's set without any
+    // membership event (ADR 0080), so it arms the sweep too.
+    let mut prev_replicas: u8 = 0;
     let mut sweeps_left: u32 = 0;
     let mut ticks_to_sweep: u32 = 0;
     // Static-seed overrides already warned about, so the mismatch is loud once per
@@ -723,8 +772,20 @@ async fn run_driver(
 
         // --- replica catch-up (ADR 0043 P1) ---
         let member_set: BTreeSet<RaftNodeId> = members.iter().copied().collect();
-        if member_set != prev_members {
+        // The factor PLACEMENT uses — what every set the sweep walks is computed
+        // from — not the lease store's: the reconcile above can commit a new one
+        // mid-tick, after this tick pushed the old one, and arming on the store's
+        // value would sweep sets still at the old factor and then never re-arm.
+        let adopted_replicas = u8::try_from(
+            placement
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .desired_replicas(),
+        )
+        .unwrap_or(u8::MAX);
+        if member_set != prev_members || adopted_replicas != prev_replicas {
             prev_members = member_set;
+            prev_replicas = adopted_replicas;
             sweeps_left = CATCH_UP_SWEEP_BUDGET;
             ticks_to_sweep = 0;
         }
@@ -781,7 +842,9 @@ fn push_committed_lease_owners(
 
 #[cfg(test)]
 mod tests {
-    use super::{admit_desired, build_durable_node, build_durable_node_with};
+    use super::{
+        admit_desired, build_durable_node, build_durable_node_with, stamp_decision, StampDecision,
+    };
     use crate::lease_raft::RaftNodeId;
     use crate::placement::{Placement, DEFAULT_REPLICAS};
     use crate::NodeId;
@@ -1090,5 +1153,65 @@ mod tests {
         driver.abort();
         let _ = driver.await;
         plane.raft().shutdown().await.unwrap();
+    }
+
+    fn ids(names: &[&str]) -> Vec<NodeId> {
+        names.iter().map(|n| NodeId((*n).to_string())).collect()
+    }
+
+    /// The rule behind the R=2 near-miss (ADR 0080 T3): a stamp must not outlive
+    /// the node's membership of the group's set. A node outside the set with a
+    /// stamp clears it; once cleared, re-entering needs a real catch-up — neither
+    /// exact equality nor a pure shrink can revive it.
+    #[test]
+    fn a_stamp_is_cleared_on_leaving_the_set_and_never_revived_by_reentry() {
+        let a = NodeId("a".into());
+        let formation: BTreeSet<NodeId> = ids(&["a", "b", "c"]).into_iter().collect();
+        // Formation at R=3, then R=2 puts `a` outside {c, b}: clear.
+        assert_eq!(
+            stamp_decision(&a, &ids(&["c", "b"]), Some(&formation)),
+            StampDecision::Clear
+        );
+        let cleared = BTreeSet::new();
+        // Re-entering {b, a} after c's death: the cleared stamp is no cohort to
+        // shrink from — a full catch-up, never a false "complete".
+        assert_eq!(
+            stamp_decision(&a, &ids(&["b", "a"]), Some(&cleared)),
+            StampDecision::CatchUp
+        );
+        // Nothing stamped and not ours: nothing to do.
+        assert_eq!(
+            stamp_decision(&a, &ids(&["c", "b"]), Some(&cleared)),
+            StampDecision::NotOurs
+        );
+        assert_eq!(
+            stamp_decision(&a, &ids(&["c", "b"]), None),
+            StampDecision::NotOurs
+        );
+    }
+
+    /// The pre-existing rules are unchanged while custody holds.
+    #[test]
+    fn current_and_pure_shrink_still_apply_while_the_node_stays_in_the_set() {
+        let a = NodeId("a".into());
+        let abc: BTreeSet<NodeId> = ids(&["a", "b", "c"]).into_iter().collect();
+        assert_eq!(
+            stamp_decision(&a, &ids(&["c", "a", "b"]), Some(&abc)),
+            StampDecision::Current
+        );
+        assert_eq!(
+            stamp_decision(&a, &ids(&["a", "b"]), Some(&abc)),
+            StampDecision::Shrink
+        );
+        let ab: BTreeSet<NodeId> = ids(&["a", "b"]).into_iter().collect();
+        assert_eq!(
+            stamp_decision(&a, &ids(&["a", "c"]), Some(&ab)),
+            StampDecision::CatchUp,
+            "a new member entered"
+        );
+        assert_eq!(
+            stamp_decision(&a, &ids(&["a", "b"]), None),
+            StampDecision::CatchUp
+        );
     }
 }
