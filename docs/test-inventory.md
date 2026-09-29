@@ -964,7 +964,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 460 test(s)
+## `crates/mqttd/src/lib.rs` — 468 test(s)
 
 - `admission::tests::the_global_cap_refuses_at_the_bound_and_recovers`
 - `admission::tests::the_penalty_box_refuses_after_the_threshold`
@@ -1114,6 +1114,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::forwarding::pending_bounds::the_byte_bound_evicts_until_the_newcomer_fits`
 - `hub::forwarding::pending_bounds::the_byte_total_follows_every_mutation`
 - `hub::forwarding::pending_bounds::the_entry_cap_evicts_only_the_oldest`
+- `hub::forwarding::pending_bounds::the_reached_record_is_charged_and_released_with_its_entry`
 - `hub::forwarding::pending_bounds::the_sweep_retransmits_only_overdue_forwards`
 - `hub::forwarding::zone_fwd_proofs::a_qos0_publish_nobody_wants_does_not_walk_the_peer_map`
 - `hub::forwarding::zone_fwd_proofs::an_already_acknowledged_entry_is_never_refused_or_withheld`
@@ -1266,6 +1267,11 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::eviction_disconnects_the_target_and_leaves_others_undisturbed`
 - `hub::tests::expired_queued_message_is_dropped_at_replay`
 - `hub::tests::flow_control_backlog_is_bounded_drop_oldest`
+- `hub::tests::forward_repeat::a_re_used_seq_with_new_content_is_applied_and_a_dead_origin_is_forgotten`
+- `hub::tests::forward_repeat::a_repeated_shared_delivery_is_re_answered_not_delivered_twice`
+- `hub::tests::forward_repeat::a_retransmission_after_the_answer_is_re_answered_not_stored_twice`
+- `hub::tests::forward_repeat::a_retransmission_during_the_append_is_dropped_and_answered_once`
+- `hub::tests::forward_repeat::the_forward_window_is_bounded`
 - `hub::tests::forwarded_publish_carries_message_expiry`
 - `hub::tests::forwarding_is_counted_and_local_delivery_is_not`
 - `hub::tests::gauge_refresh_snapshots_sessions_and_subscriptions`
@@ -1344,6 +1350,8 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::session_expiry_reconnect_cancels_expiry`
 - `hub::tests::session_expiry_zero_discards_at_disconnect`
 - `hub::tests::settle_gate::a_held_ack_retires_on_the_sweep_when_the_window_closes_without_a_scan`
+- `hub::tests::settle_gate::a_held_publish_is_re_delivered_to_a_materialised_session_once_not_per_pass`
+- `hub::tests::settle_gate::a_session_the_original_fan_out_reached_is_not_re_delivered_to`
 - `hub::tests::settle_gate::a_settled_node_with_no_durable_plane_still_skips_the_periodic_scan`
 - `hub::tests::settle_gate::a_zero_match_publish_still_holds_its_ack_on_an_unsettled_view`
 - `hub::tests::settle_gate::an_early_acked_publish_still_re_routes_to_a_peer_that_advertises_interest_later`

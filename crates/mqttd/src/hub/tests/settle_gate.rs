@@ -120,7 +120,7 @@ fn partitioned_fixture() -> Fix {
 /// because an off-loop completion takes several polls to travel (the lane
 /// worker is woken, its store future resolves, then it sends), and returning on
 /// the first quiet round would be a race dressed up as a quiescence check.
-async fn quiesce(hub: &mut Hub) {
+pub(super) async fn quiesce(hub: &mut Hub) {
     const IDLE_ROUNDS: u32 = 8;
     let mut idle = 0;
     for _ in 0..256 {
@@ -900,5 +900,94 @@ async fn leaving_the_settle_window_answers_a_restore_shaped_entry() {
     assert!(
         fix.hub.pending_publishes.get(id).is_none(),
         "answered, and nothing left to settle: the entry retires"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The settle pass hands each session at most ONE copy of a held publish.
+// ---------------------------------------------------------------------------
+
+/// **The re-delivery is once per session, not once per pass.** The settle pass
+/// runs on every sweep tick while the window is open (item 2.2 follow-up), and
+/// its target filter — "offline, or attached after the publish" — still admits
+/// a session an EARLIER pass already re-delivered to. Each pass therefore
+/// appended one more copy to the inherited session's durable queue, and every
+/// copy replays on resume as a first delivery with DUP = 0 [MQTT-4.4.0-1]:
+/// the nightly seed sweep's 416 `[redelivery-marked]` violations were ~25
+/// copies each of an 8-message burst held open behind a severed link.
+///
+/// Fails before the fix: the queue reads 1, 2, 3, 4 after the scan and each
+/// sweep that follows it.
+#[tokio::test]
+async fn a_held_publish_is_re_delivered_to_a_materialised_session_once_not_per_pass() {
+    let mut fix = clustered_fixture();
+    fix.subscriber("live", "settle/once", 1).await;
+    fix.store_only_session("inherited", "settle/once").await;
+    let mut ack = fix.publish_gated("settle/once").await;
+    let id = fix.only_pending();
+    assert_eq!(ack.try_recv(), Ok(PublishOutcome::Accepted));
+
+    // The scan materialises the session and the settle pass owes it the
+    // publish: exactly one copy (the CORRECTION-1 test above proves this half).
+    fix.scan_lands(&["inherited"], false).await;
+    assert_eq!(fix.queued("inherited").await.len(), 1);
+
+    // The window stays open: every later sweep runs the settle pass again.
+    for tick in 1..=3 {
+        sweep_once(&mut fix, false).await;
+        assert!(
+            fix.hub.pending_publishes.contains_key(id),
+            "fixture invariant: the entry must still be in the settle work set, \
+             or the pass has nothing to re-deliver and this asserts nothing"
+        );
+        let queued = fix.queued("inherited").await;
+        assert_eq!(
+            queued.len(),
+            1,
+            "sweep {tick} of an open settle window appended ANOTHER copy of a \
+             publish this session already holds; it replays as a new message \
+             with DUP = 0 [MQTT-4.4.0-1]. Queue: {queued:?}"
+        );
+    }
+}
+
+/// **A session the ORIGINAL fan-out reached is not re-delivered to at all.**
+/// An offline persistent session known before the publish gets its copy from
+/// the fan-out's enqueue. It then passes the re-delivery filter on every pass
+/// (it is offline), so before the fix the very first pass already doubled it —
+/// and a session that re-attaches during the window (attached after the
+/// publish) was sent the doubled copy live as well.
+///
+/// Fails before the fix: the queue reads 2 after the first pass.
+#[tokio::test]
+async fn a_session_the_original_fan_out_reached_is_not_re_delivered_to() {
+    let mut fix = clustered_fixture();
+    fix.store_only_session("known", "settle/known").await;
+    // Materialised BEFORE the publish, window left open.
+    fix.scan_lands(&["known"], false).await;
+    assert!(fix.hub.routing_unsettled());
+    assert!(
+        fix.hub.has_materialized_subs(&ClientId("known".into())),
+        "fixture invariant: the original fan-out must be able to reach the session"
+    );
+
+    let _ack = fix.publish_gated("settle/known").await;
+    let id = fix.only_pending();
+    assert_eq!(
+        fix.queued("known").await.len(),
+        1,
+        "fixture invariant: the original fan-out enqueued exactly one copy"
+    );
+    assert!(fix.hub.pending_publishes[&id].awaiting_settle);
+
+    fix.scan_lands(&["known"], false).await;
+    sweep_once(&mut fix, false).await;
+    let queued = fix.queued("known").await;
+    assert_eq!(
+        queued.len(),
+        1,
+        "the settle pass re-delivered to a session the ORIGINAL fan-out already \
+         enqueued to: it did not miss the publish, and the second copy replays \
+         with DUP = 0 [MQTT-4.4.0-1]. Queue: {queued:?}"
     );
 }

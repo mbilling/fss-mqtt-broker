@@ -440,9 +440,11 @@ pub enum PeerMessage {
     /// holds the publisher's `QoS` 1 acknowledgement until the receiver answers
     /// with [`PublishAck`](PeerMessage::PublishAck) — sent only once the
     /// receiver's local fan-out, **including any durable offline enqueue**, has
-    /// completed. Unanswered forwards are retransmitted (same `seq`); the
-    /// receiver does not dedup — a duplicate delivery is legal at `QoS` 1
-    /// (at-least-once), so retransmission needs no receiver state.
+    /// completed. Unanswered forwards are retransmitted (same `seq`); a receiver
+    /// recognises a repeat by `(sender, seq)` and answers it again instead of
+    /// applying it twice (issue #648) — a second copy in a subscriber's session
+    /// would replay as a new message with `DUP = 0` [MQTT-4.4.0-1]. An older
+    /// receiver applies every copy; the frame is unchanged either way.
     PublishAcked {
         /// Per-sender monotonic forward sequence (correlates the ack).
         seq: u64,
@@ -552,8 +554,8 @@ pub enum PeerMessage {
     /// delivered `QoS` is ≥ 1 and the link negotiated proto ≥ 7; otherwise nothing
     /// is owed (`QoS` 0) or the link cannot carry the answer, and today's
     /// fire-and-forget `SharedDeliver` still applies. Unanswered forwards are
-    /// retransmitted under the SAME `seq`; the receiver does not dedup — a duplicate
-    /// delivery is legal at `QoS` 1.
+    /// retransmitted under the SAME `seq`, which a receiver uses to answer a repeat
+    /// again instead of delivering it twice (issue #648).
     SharedDeliverAcked {
         /// Per-sender monotonic forward sequence (correlates the verdict).
         seq: u64,

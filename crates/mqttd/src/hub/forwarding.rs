@@ -142,6 +142,35 @@ impl PendingTable {
         Some(entry)
     }
 
+    /// Record that entry `id` has been handed to `clients` ([`PendingPublish::reached`]),
+    /// charging what the record costs against the byte bound like the rest of the
+    /// entry. A high fan-out held open by a long settle window is exactly what
+    /// this list can grow with, so it must not sit outside the bound: the next
+    /// insert evicts for it as it would for a larger payload.
+    pub(super) fn note_reached(
+        &mut self,
+        id: u64,
+        clients: impl ExactSizeIterator<Item = ClientId>,
+    ) {
+        let n = clients.len();
+        if n == 0 {
+            return;
+        }
+        let Some(entry) = self.entries.get_mut(&id) else {
+            return;
+        };
+        let mut charge = n * std::mem::size_of::<ClientId>();
+        if let Some(reached) = &mut entry.reached {
+            reached.extend(clients);
+        } else {
+            charge += std::mem::size_of::<Vec<ClientId>>();
+            entry.reached = Some(Box::new(clients.collect()));
+        }
+        let before = entry.cost;
+        entry.cost = u32::try_from(before as usize + charge).unwrap_or(u32::MAX);
+        self.bytes += (entry.cost - before) as usize;
+    }
+
     /// Evict the OLDEST entry (the lowest id): the overflow policy of both bounds.
     pub(super) fn pop_first(&mut self) -> Option<(u64, PendingPublish)> {
         let (id, entry) = self.entries.pop_first()?;
@@ -244,15 +273,39 @@ pub(super) struct PendingPublish {
     /// Not `created_at` itself: a takeover re-route registers a NEW obligation on a
     /// publish that may be many sweeps old, and judging that obligation by the
     /// publish's age retransmitted it on the very next sweep — milliseconds after
-    /// the first copy, before any answer could exist. The receiver applies every
-    /// copy (no dedup at `QoS` 1), so each premature retransmit became a second
-    /// durable enqueue and a second `DUP = 0` delivery of the same message to the
-    /// subscriber [MQTT-4.4.0-1].
+    /// the first copy, before any answer could exist. The receiver then applied
+    /// every copy, so each premature retransmit became a second durable enqueue
+    /// and a second `DUP = 0` delivery of the same message to the subscriber
+    /// [MQTT-4.4.0-1]. (A receiver now recognises the repeat — issue #648 — but a
+    /// retransmit that is not due is still traffic offered to a peer already
+    /// behind.)
     pub(super) forwarded_after_ms: u32,
     /// Engaged when a forward target died: counts down sweep ticks with no
     /// re-routable remote interest before the obligation is considered moot
     /// (see [`REROUTE_GRACE_TICKS`]).
     pub(super) reroute_grace: Option<u8>,
+    /// Every local recipient this publish has already been handed to — by its
+    /// original fan-out and by each settle-window re-delivery since — so
+    /// [`redeliver_pending`](Hub::redeliver_pending) never hands one session a
+    /// second copy. `None` = nobody yet.
+    ///
+    /// The re-delivery's target filter ("offline, or attached after the
+    /// publish") is a superset of "missed the original fan-out": an offline
+    /// persistent session the fan-out ENQUEUED to passes it, and so does a
+    /// session re-delivered to on an earlier pass. Since the settle pass runs on
+    /// every sweep tick (issue #613 item 2.2 follow-up), each pass appended one
+    /// more copy of every held publish to every such session's durable log —
+    /// one per second for as long as the window stayed open — and each copy
+    /// replays as a first delivery with `DUP = 0` [MQTT-4.4.0-1]. The nightly
+    /// seed sweep caught ~25 copies per message after a SIGKILL behind a
+    /// severed link.
+    ///
+    /// Boxed: 8 bytes on the entry, where a `Vec` (24) or a boxed slice (16)
+    /// would break the size budget `a_pending_publish_stays_small` holds it to.
+    /// Written once by the original fan-out and extended only by a re-delivery,
+    /// off the message path.
+    #[allow(clippy::box_collection)] // deliberate: the box is what keeps the entry small
+    pub(super) reached: Option<Box<Vec<ClientId>>>,
     /// Set when the publish arrived during a takeover window (an inherited-session
     /// scan pending or running). It is WORK-SET MEMBERSHIP, not an ack gate: it is
     /// what [`settle_pending_publishes`](Hub::settle_pending_publishes) filters on,
@@ -339,6 +392,107 @@ impl PendingPublish {
     }
 }
 
+/// How many of one origin's most recent acked forwards a receiver remembers, to
+/// recognise a retransmission (issue #648).
+///
+/// A retransmission is of a forward the sender still holds unanswered, sent again
+/// one sweep interval after the last copy; the window only has to reach back past
+/// the forwards that arrived from the same origin in between. It advances only as
+/// forwards ARRIVE, so a link outage does not age it: the copies the sender
+/// re-sends when the link returns meet the same window they left. At 16,384
+/// entries it spans several seconds of a heavily loaded origin, at roughly 40 bytes
+/// an entry — about 640 KiB per peer, bounded, and freed when the peer dies.
+/// A retransmission older than the window is applied again, as before.
+pub(super) const FORWARD_WINDOW: usize = 16_384;
+
+/// What a receiver remembers of one acked forward it applied (issue #648).
+#[derive(Debug, Clone, Copy)]
+pub(super) struct SeenForward {
+    /// [`forward_fingerprint`] of the frame, so a restarted origin re-using a seq
+    /// for a different message is never mistaken for a repeat.
+    pub(super) fingerprint: u64,
+    /// The answer sent, once there is one; `None` while its appends are in flight.
+    pub(super) verdict: Option<ForwardVerdict>,
+}
+
+/// One origin's recent acked forwards, oldest first, capped at [`FORWARD_WINDOW`].
+#[derive(Debug, Default)]
+pub(super) struct ForwardWindow {
+    seen: HashMap<u64, SeenForward>,
+    order: VecDeque<u64>,
+}
+
+impl ForwardWindow {
+    pub(super) fn seen(&self, seq: u64) -> Option<SeenForward> {
+        self.seen.get(&seq).copied()
+    }
+
+    /// Remember an applied forward (replacing a same-seq entry of a restarted
+    /// origin in place), forgetting the oldest beyond the cap.
+    pub(super) fn record(&mut self, seq: u64, fingerprint: u64) {
+        let fresh = SeenForward {
+            fingerprint,
+            verdict: None,
+        };
+        if self.seen.insert(seq, fresh).is_none() {
+            self.order.push_back(seq);
+            if self.order.len() > FORWARD_WINDOW {
+                if let Some(oldest) = self.order.pop_front() {
+                    self.seen.remove(&oldest);
+                }
+            }
+        }
+    }
+
+    /// Record the answer sent for `seq`, if it is still remembered.
+    pub(super) fn answered(&mut self, seq: u64, verdict: ForwardVerdict) {
+        if let Some(s) = self.seen.get_mut(&seq) {
+            s.verdict = Some(verdict);
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn len(&self) -> usize {
+        self.seen.len()
+    }
+}
+
+/// The identity of an acked forward's content (issue #648): what a
+/// retransmission — byte-identical by construction ([`forward_frame`]) — always
+/// shares with its original, and a different message almost never does. `client`
+/// is the named member of a shared delivery, `None` for a fan-out forward.
+pub(super) fn forward_fingerprint(client: Option<&str>, topic: &str, payload: &[u8]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    client.hash(&mut h);
+    topic.hash(&mut h);
+    payload.hash(&mut h);
+    h.finish()
+}
+
+/// Where this process's forward sequence starts (issue #648): a random point in a
+/// 47-bit space, so a restarted node does not re-issue the seqs its previous life
+/// used — which a receiver's [`ForwardWindow`] may still remember, and which that
+/// life's late answers may still carry. Below 2^47, a seq stays within the 7-byte
+/// varint postcard puts on the wire for the first ~4×10^14 forwards of a process's
+/// life, and the `u64` counter cannot wrap.
+///
+/// In-crate unit tests start at 0: they correlate answers by the literal seqs
+/// 1, 2, 3 of a fresh hub. Every spawned or in-process node the integration
+/// suites run takes the random start.
+pub(super) fn initial_forward_seq() -> u64 {
+    if cfg!(test) {
+        return 0;
+    }
+    let mut raw = [0u8; 8];
+    // A failed draw keeps today's start at 0; the window's fingerprint still
+    // keeps a re-issued seq with different content from being dropped.
+    match aws_lc_rs::rand::fill(&mut raw) {
+        Ok(()) => u64::from_le_bytes(raw) >> 17,
+        Err(_) => 0,
+    }
+}
+
 /// One outstanding cross-node obligation of a gated publish (ADR 0042 T9 exhibit ⑤;
 /// 0041-T12 for the shared kind): where it went, and which frame answers it.
 #[derive(Debug, Clone)]
@@ -379,7 +533,10 @@ impl Hub {
     /// clients attached after the publish. Clients online since BEFORE the
     /// publish already received it live; re-sending would duplicate (dups are
     /// legal at `QoS` 1, but a boot-window re-send to a steady subscriber is a
-    /// gratuitous one — observed as duplicate bridge forwards). Returns a non-`Ok`
+    /// gratuitous one — observed as duplicate bridge forwards). A session this
+    /// publish already reached — by the original fan-out or an earlier pass — is
+    /// skipped too ([`PendingPublish::reached`]): each such session gets at most one
+    /// copy, however many passes the window lasts. Returns a non-`Ok`
     /// [`DurableOutcome`] on a terminal durable-append failure (the caller withholds)
     /// or a stated-policy refusal.
     ///
@@ -399,16 +556,27 @@ impl Hub {
             p.app().clone(),
             p.created_at,
         );
+        // A session this publish already reached — the original fan-out's
+        // enqueue, or an earlier pass of this same re-delivery — did not miss
+        // it, and a second copy would reach it as a new message with DUP = 0
+        // [MQTT-4.4.0-1]. Only what nobody has handed it yet is owed here.
+        let reached: HashSet<&ClientId> = p.reached.iter().flat_map(|r| r.iter()).collect();
         let targets: Vec<(ClientId, QoS)> = self
             .table
             .matching_clients(&topic)
             .into_iter()
+            .filter(|c| !reached.contains(c))
             .filter(|c| self.online.get(c).is_none_or(|o| o.attached_at > since))
             .map(|c| {
                 let granted = self.granted_qos(&c, &topic);
                 (c, granted)
             })
             .collect();
+        drop(reached);
+        if targets.is_empty() {
+            return DurableOutcome::Ok;
+        }
+        self.pending_reached(id, targets.iter().map(|(c, _)| c.clone()));
         let mut all_durable = DurableOutcome::Ok;
         for (c, granted) in targets {
             all_durable = all_durable.and(self.deliver_to_client(
@@ -429,10 +597,23 @@ impl Hub {
         all_durable
     }
 
+    /// Record that pending publish `id` has been handed to `clients` (see
+    /// [`PendingPublish::reached`]). Recorded at SUBMIT, like the lane
+    /// obligations: a delivery whose append later fails drops the whole entry,
+    /// so there is no "recorded but not delivered" state to replay into.
+    pub(super) fn pending_reached(
+        &mut self,
+        id: u64,
+        clients: impl ExactSizeIterator<Item = ClientId>,
+    ) {
+        self.pending_publishes.note_reached(id, clients);
+    }
+
     /// The takeover window closed for this node (an inherited-session scan just
     /// landed): every held pending publish re-delivers **locally** against the
-    /// just-materialized subscriptions (duplicates are legal at `QoS` 1 — the
-    /// alternative was an ack into the void, exhibit ⑥), then re-checks remote
+    /// just-materialized subscriptions (each session at most once — see
+    /// [`redeliver_pending`](Self::redeliver_pending) — the alternative was an
+    /// ack into the void, exhibit ⑥), then re-checks remote
     /// interest via the sweep's re-route path before its ack can release.
     pub(super) fn settle_pending_publishes(&mut self) {
         let held: Vec<u64> = self
@@ -443,8 +624,9 @@ impl Hub {
             .collect();
         // The hold clears only when the whole takeover WINDOW is over: one scan
         // is not enough — the group leases reassign for seconds after the death,
-        // and a scan that ran before a lease landed saw nothing. Every scan in
-        // the window re-delivers (duplicates are legal); the last one releases.
+        // and a scan that ran before a lease landed saw nothing. Every pass in
+        // the window re-delivers to whoever it has not reached yet; the last one
+        // releases.
         // Never on a broken mesh (an unreachable-but-alive peer may hold
         // interest this node cannot see — T4 seed 4), and never on TIME alone
         // while the last scan still SKIPPED sessions (0043-P4 exhibit ②: a
@@ -775,6 +957,7 @@ impl Hub {
                 created_at: Instant::now(),
                 forwarded_after_ms: 0,
                 reroute_grace: None,
+                reached: None,
                 // During a takeover window the routing table may not yet hold the
                 // sessions this node (or a successor) inherited — hold the ack
                 // until the scan lands and the publish re-delivers (exhibit ⑥).
@@ -949,6 +1132,77 @@ impl Hub {
         p.answer(PublishOutcome::Refused(r));
     }
 
+    /// Whether an acked forward that just ARRIVED is a repeat of one this node has
+    /// already applied (issue #648) — in which case it has been dealt with here and
+    /// the caller must not apply it again.
+    ///
+    /// The sender retransmits an unanswered forward under the SAME seq on every
+    /// sweep once it is overdue, and that is legitimate: the answer can be late (a
+    /// durable append slower than one [`SESSION_SWEEP_INTERVAL`] under load),
+    /// cross the retransmission in flight, or be lost with the link. Applying every
+    /// copy appended the message to the subscriber's session log once per copy, and
+    /// replay then delivered each as a first delivery with `DUP = 0`
+    /// [MQTT-4.4.0-1]. A repeat is keyed on `(origin, seq)` — the identity the frame
+    /// already carries, so no wire change — and is:
+    ///
+    /// - **still being applied** (its lane appends have not landed): dropped, since
+    ///   the first copy's completion sends the answer — the `(origin, seq)` verdict
+    ///   aggregate is exactly the proof that it will. Checked against that
+    ///   aggregate directly, so it holds even after the window has forgotten the seq;
+    /// - **already answered**: answered AGAIN with the recorded verdict, never
+    ///   re-applied — the sender needs an answer to retire the obligation, and the
+    ///   first one is what it missed.
+    ///
+    /// `fingerprint` guards the one way the key could name two messages: an origin
+    /// that restarted and re-issued a seq. A build with this change starts its seq
+    /// space at a random point ([`initial_forward_seq`]) so that does not happen;
+    /// an OLDER origin (a rolling upgrade, ADR 0039) restarts at 1, and a seq whose
+    /// topic and payload differ from what the window remembers is a new message and
+    /// is applied. What remains is an older origin re-issuing a remembered seq with
+    /// the SAME topic and payload within the window — treated as the repeat it is
+    /// indistinguishable from.
+    pub(super) fn forward_is_repeat(&mut self, node: &NodeId, seq: u64, fingerprint: u64) -> bool {
+        let seen = self.forward_windows.get(node).and_then(|w| w.seen(seq));
+        match seen {
+            Some(seen) if seen.fingerprint == fingerprint => match seen.verdict {
+                Some(verdict) => {
+                    debug!(origin = %node.0, seq, "repeated forward re-answered, not re-applied");
+                    self.answer_forward(node, seq, verdict);
+                    return true;
+                }
+                None if self.forward_in_flight(node, seq) => {
+                    debug!(origin = %node.0, seq, "repeated forward still being applied; dropped");
+                    return true;
+                }
+                // Recorded, never answered, nothing in flight: no path leaves a
+                // forward in this state (the verdict is answered or aggregated in
+                // the same dispatch that applied it). Apply rather than go silent —
+                // a duplicate is recoverable, a forward nobody answers is not.
+                None => {}
+            },
+            // Forgotten by the window while its appends are still running.
+            None if self.forward_in_flight(node, seq) => return true,
+            // A new forward — or the same seq naming a DIFFERENT message, from an
+            // origin that restarted: applied.
+            Some(_) | None => {}
+        }
+        if let Some(window) = self.forward_windows.get_mut(node) {
+            window.record(seq, fingerprint);
+        } else {
+            let mut window = ForwardWindow::default();
+            window.record(seq, fingerprint);
+            self.forward_windows.insert(node.clone(), window);
+        }
+        false
+    }
+
+    /// Whether forward `(node, seq)` still has lane appends outstanding here — its
+    /// verdict aggregate exists, so its answer is still to come.
+    fn forward_in_flight(&self, node: &NodeId, seq: u64) -> bool {
+        self.remote_append_pending
+            .contains_key(&(node.clone(), seq))
+    }
+
     /// Answer one forward we RECEIVED, choosing the frame by the LINK's negotiated
     /// proto (0041-T12, issue #238).
     ///
@@ -958,7 +1212,14 @@ impl Hub {
     /// `PublishAck { ok: verdict == Stored }` — which is today's behaviour exactly, so a
     /// refusal reaches that origin as a withheld ack (the rolling-upgrade skew residual
     /// the docs must name).
-    pub(super) fn answer_forward(&self, node: &NodeId, seq: u64, verdict: ForwardVerdict) {
+    ///
+    /// The verdict is also recorded in the origin's [`ForwardWindow`] BEFORE the
+    /// link is consulted (issue #648): an answer lost with the link is exactly the
+    /// one whose retransmission must be re-answered rather than re-applied.
+    pub(super) fn answer_forward(&mut self, node: &NodeId, seq: u64, verdict: ForwardVerdict) {
+        if let Some(w) = self.forward_windows.get_mut(node) {
+            w.answered(seq, verdict);
+        }
         let Some(peer) = self.peers.get(node) else {
             return; // link gone: the sender's sweep will retransmit
         };
@@ -1084,8 +1345,9 @@ impl Hub {
                 let Some(p) = self.pending_publishes.get(id) else {
                     continue;
                 };
-                // The SAME frame the original forward sent (only the seq is the
-                // outstanding one, so the receiver dedups): built by the shared
+                // The SAME frame the original forward sent, under the outstanding
+                // seq — the key the receiver recognises a repeat by (issue #648)
+                // — and byte-identical, so its content fingerprint matches: built by the shared
                 // constructor so a retransmitted copy can never drift semantically
                 // from the first send — and, since 0041-T12, so a SHARED obligation
                 // retransmits `SharedDeliverAcked` rather than a fan-out
@@ -2099,6 +2361,38 @@ mod pending_bounds {
         hub.pending_publishes.pop_first();
         assert_eq!(hub.pending_publishes.bytes(), 0);
         assert!(hub.pending_publishes.is_empty());
+    }
+
+    /// The settle window's record of whom a publish reached is charged to the
+    /// byte bound and leaves with its entry: a high fan-out held open by a long
+    /// window must not grow outside the bound.
+    #[test]
+    fn the_reached_record_is_charged_and_released_with_its_entry() {
+        let mut hub = hub();
+        let payload = Bytes::from_static(b"x");
+        let (a, _wa) = register(&mut hub, "t/a", &payload);
+        let base = pending_cost("t/a", &payload);
+        let clients = |n: usize| (0..n).map(|i| ClientId(format!("c{i}").into()));
+
+        hub.pending_reached(a, clients(3));
+        let first = std::mem::size_of::<Vec<ClientId>>() + 3 * std::mem::size_of::<ClientId>();
+        assert_eq!(hub.pending_publishes.bytes(), base + first);
+        hub.pending_reached(a, clients(2));
+        assert_eq!(
+            hub.pending_publishes.bytes(),
+            base + first + 2 * std::mem::size_of::<ClientId>()
+        );
+        assert_eq!(
+            hub.pending_publishes[&a].reached.as_ref().map(|r| r.len()),
+            Some(5)
+        );
+
+        hub.pending_publishes.remove(a);
+        assert_eq!(
+            hub.pending_publishes.bytes(),
+            0,
+            "the charge leaves with the entry"
+        );
     }
 
     /// The entry bound: the publish past the cap evicts exactly the oldest, and
