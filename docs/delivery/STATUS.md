@@ -87,7 +87,7 @@
 | [0077](../adr/0077-workload-targeted-performance.md) | # 0077. Workload-targeted performance — a shape is not a result without its tail | Proposed | [6/10 done](0077-workload-targeted-performance.md) | 4 open |
 | [0078](../adr/0078-replica-segment-log.md) | # 0078. The replica store becomes an append-only segment log — the disk is the limit, not the B-tree | Accepted | [3/4 done](0078-replica-segment-log.md) | 1 open |
 | [0079](../adr/0079-global-allocator.md) | # 0079. mqttd links mimalloc as its global allocator | Accepted | [1/2 done](0079-global-allocator.md) | 1 open |
-| [0080](../adr/0080-replication-factor.md) | # 0080. The replication factor is cluster state: configurable, default 2, changeable live | Accepted | [1/6 done](0080-replication-factor.md) | 5 open |
+| [0080](../adr/0080-replication-factor.md) | # 0080. The replication factor is cluster state: configurable, default 2, changeable live | Accepted | [2/6 done](0080-replication-factor.md) | 4 open |
 
 ## Open and deferred work
 
@@ -213,7 +213,6 @@
 
 **0080 — # 0080. The replication factor is cluster state: configurable, default 2, changeable live**
 
-- `0080-T2` ⬜ planned ([#701](https://github.com/mbilling/fss-mqtt-broker/issues/701)): "durable.replicas / MQTTD_REPLICAS; the founder commits it before ready; min_replicas validated against the committed R" — "Default 3 until T4. Startup log, /statusz, CONFIGURATION.md and mqttd.example.toml stop hard-coding R=3."
 - `0080-T3` ⬜ planned ([#702](https://github.com/mbilling/fss-mqtt-broker/issues/702)): "R=2 validated: durability, crash, chaos and failover suites on both stores; the write pause measured" — "Measure how long durable writes to the affected groups stop when one of two replicas is killed, and when it is only suspended."
 - `0080-T4` ⬜ planned ([#703](https://github.com/mbilling/fss-mqtt-broker/issues/703)): "Default replication factor 2 for new clusters" — "After T3. Existing clusters keep R=3."
 - `0080-T5` ⬜ planned ([#704](https://github.com/mbilling/fss-mqtt-broker/issues/704)): "Change R on a running cluster: joint phase, catch-up, switch, collect" — "Config reload or admin API proposes; refused below R' eligible nodes or while a change runs; progress on /statusz."
