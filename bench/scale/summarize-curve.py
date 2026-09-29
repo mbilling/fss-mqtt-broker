@@ -1737,6 +1737,7 @@ def lane_e_rung(rdir: Path) -> dict:
         # broker lost traffic" from "the rig stopped watching too early".
         "unresolved": unresolved,
         "p50": bucket_pct(buckets, count, 0.50),
+        "p95": bucket_pct(buckets, count, 0.95),
         "p99": p99,
         "budget_ms": budget,
         # Three verdicts, kept apart because they answer different questions:
@@ -2066,11 +2067,14 @@ def main() -> None:
             # broker needed to reach steady state at this offer before the window
             # was allowed to open, so a reader can see that the latency beside it
             # describes the rung rather than a backlog being repaid into it.
-            head = "| sites | offered msg/s | delivered/s | per consumer | caught up in | p99 | verdict |"
+            # p50 and p95 beside the p99 that grades the rung: a vendor comparison
+            # quotes a median and a p95, and one percentile cannot be set against
+            # another. All three are the driver histogram's bucket upper bounds.
+            head = "| sites | offered msg/s | delivered/s | per consumer | caught up in | p50 | p95 | p99 | verdict |"
             if repeated:
-                head = "| sites | run | offered msg/s | delivered/s | per consumer | caught up in | p99 | verdict |"
+                head = "| sites | run | offered msg/s | delivered/s | per consumer | caught up in | p50 | p95 | p99 | verdict |"
             print(head)
-            print("|---|---|---|---|---|---|---|" + ("---|" if repeated else ""))
+            print("|---|---|---|---|---|---|---|---|---|" + ("---|" if repeated else ""))
             for r in rungs:
                 verdict = rung_verdict(r)
                 run_col = f" {r.get('rep', 1)} |" if repeated else ""
@@ -2082,7 +2086,7 @@ def main() -> None:
                     caught = "—"  # a run directory from before the gate existed
                 print(
                     f"| {r['sites']} |{run_col} {r['offered']:,.0f} | {r['recv_rate']:,.0f} | "
-                    f"{r['per_consumer']:,.0f} | {caught} | {r['p99']} | {verdict} |"
+                    f"{r['per_consumer']:,.0f} | {caught} | {r.get('p50', '—')} | {r.get('p95', '—')} | {r['p99']} | {verdict} |"
                 )
             # ── message accounting (#534, acceptance 3) ──────────────────
             # One row per rung, so a shortfall can be attributed instead of
