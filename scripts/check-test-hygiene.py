@@ -2324,6 +2324,30 @@ def check_inventory(only: str | None) -> list[str]:
 # a follow-up issue; what it is not is quietly allowlisted, which is how a manifest becomes a
 # lie. `--write-inventory` cannot add entries here: growth is a hand-written, reviewed line.
 IGNORE_ALLOWLIST: dict[str, tuple[str, str | None]] = {
+    "crates/mqttd/tests/replication_pause.rs::write_pause_two_replicas_suspend": (
+        "timed measurement (ADR 0080 T3): a fault held on one of three spawned brokers for "
+        "a fixed schedule, reporting how long durable writes pause; its figures are recorded "
+        "in the ADR 0080 amendment, and it asserts only that writes resume",
+        None,
+    ),
+    "crates/mqttd/tests/replication_pause.rs::write_pause_two_replicas_crash": (
+        "timed measurement (ADR 0080 T3): a fault held on one of three spawned brokers for "
+        "a fixed schedule, reporting how long durable writes pause; its figures are recorded "
+        "in the ADR 0080 amendment, and it asserts only that writes resume",
+        None,
+    ),
+    "crates/mqttd/tests/replication_pause.rs::write_pause_three_replicas_suspend": (
+        "timed measurement (ADR 0080 T3): a fault held on one of three spawned brokers for "
+        "a fixed schedule, reporting how long durable writes pause; its figures are recorded "
+        "in the ADR 0080 amendment, and it asserts only that writes resume",
+        None,
+    ),
+    "crates/mqttd/tests/replication_pause.rs::write_pause_three_replicas_crash": (
+        "timed measurement (ADR 0080 T3): a fault held on one of three spawned brokers for "
+        "a fixed schedule, reporting how long durable writes pause; its figures are recorded "
+        "in the ADR 0080 amendment, and it asserts only that writes resume",
+        None,
+    ),
     "crates/mqttd/tests/cluster_upgrade.rs::a_rolling_upgrade_and_rollback_lose_no_acked_fact": (
         "builds a second broker binary (minutes), which the per-PR profile cannot afford",
         "nightly",

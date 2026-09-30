@@ -337,24 +337,33 @@ async fn a_disk_bound_crash_mid_write_loses_no_acked_fact() {
     let disk = tempfile::tempdir().expect("tempdir");
     let mut nodes = build_topology(seed, disk.path()).await;
     // 16384 × 512B blocks = 8MB per file: roomy for formation, fatal under the
-    // blast (each 64KB enqueue lands on every replica's store — R=3 on 3 nodes).
+    // blast — each 64KB enqueue lands on every replica's store, so the blast
+    // targets a session whose replica set holds the bounded node (at R=3 on three
+    // nodes every set does; at R=2, ADR 0080, two in three do).
     nodes[2].file_size_limit_blocks = Some(16384);
+    let bounded_id = nodes[2].id.clone();
+    let all_ids: Vec<String> = nodes.iter().map(|n| n.id.clone()).collect();
     for n in &mut nodes {
         n.spawn();
     }
     wait_all_ready(&mut nodes, seed).await;
     let mut proc = proc_over(seed, nodes);
-    establish_subscribers(&mut proc, 1).await;
+    establish_subscribers(&mut proc, 4).await;
+    let target = (0..proc.subs.len())
+        .find(|&i| replica_set_holds(&proc.subs[i].id, &all_ids, &bounded_id))
+        .expect("some session's replica set holds the bounded node");
 
-    // Take the subscriber offline: every acked publish from here is a durable
+    // Take the subscribers offline: every acked publish from here is a durable
     // offline enqueue — quorum-replicated bytes on disk, nothing in a session.
-    proc.drain_subscriber(0).await;
-    if let Some(mut conn) = proc.subs[0].conn.take() {
-        conn.disconnect().await;
+    for i in 0..proc.subs.len() {
+        proc.drain_subscriber(i).await;
+        if let Some(mut conn) = proc.subs[i].conn.take() {
+            conn.disconnect().await;
+        }
     }
 
     // Blast through the UNBOUNDED nodes until the kernel kills the bounded one.
-    let topic = proc.subs[0].topic.clone();
+    let topic = proc.subs[target].topic.clone();
     let deadline = Instant::now() + Duration::from_secs(180);
     let mut publisher: Option<common::Client> = None;
     let mut i = 0u64;
@@ -1053,4 +1062,25 @@ fn spawned_node_ports_come_from_outside_the_ephemeral_range() {
             assert!(seen.insert(port), "port {port} handed out twice");
         }
     }
+}
+
+/// Whether `client`'s session group keeps a copy on `node`, over a cluster of
+/// `members` at the replication factor the spawned nodes run at
+/// (`MQTTD_REPLICAS`, else the config default — ADR 0080). The same HRW placement
+/// the brokers compute; a mismatch would make the blast miss the bounded node and
+/// the test fail loudly, never pass falsely.
+fn replica_set_holds(client: &str, members: &[String], node: &str) -> bool {
+    use mqtt_cluster::placement::Placement;
+    use mqtt_cluster::NodeId;
+    let replicas = usize::from(common::expected_replicas());
+    let mut p = Placement::new(NodeId(members[0].clone()), replicas);
+    for m in &members[1..] {
+        p.observe(
+            &NodeId(m.clone()),
+            mqtt_cluster::swim::MemberState::Alive,
+            "x:7000",
+            None,
+        );
+    }
+    p.replica_set(client).iter().any(|n| n.0 == node)
 }

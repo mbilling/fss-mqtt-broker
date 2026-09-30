@@ -258,7 +258,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `two_bridge_instances_do_not_duplicate_forwarding`
 - `two_partitioned_instances_deliver_each_inbound_message_exactly_once`
 
-## `crates/mqtt-cluster/src/lib.rs` — 338 test(s)
+## `crates/mqtt-cluster/src/lib.rs` — 340 test(s)
 
 - `cluster_identity::tests::a_founder_mints_once_and_reloads_stably`
 - `cluster_identity::tests::a_joiner_adopts_once_and_persists`
@@ -349,9 +349,11 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `decommission::tests::the_drain_hands_off_and_verifies_a_held_key`
 - `durable_node::tests::a_founded_factor_is_adopted_and_outlives_a_different_setting`
 - `durable_node::tests::a_persistent_durable_node_restarts_from_its_data_dir`
+- `durable_node::tests::a_stamp_is_cleared_on_leaving_the_set_and_never_revived_by_reentry`
 - `durable_node::tests::admit_desired_admits_local_and_reachable_members_only`
 - `durable_node::tests::admit_desired_drops_a_member_evicted_from_placement`
 - `durable_node::tests::admit_desired_keeps_a_current_voter_through_a_link_blip`
+- `durable_node::tests::current_and_pure_shrink_still_apply_while_the_node_stays_in_the_set`
 - `durable_node::tests::single_node_durable_store_bootstraps_and_serves`
 - `durable_plane::tests::a_learner_is_ready_under_the_scale_out_capability`
 - `durable_plane::tests::deliver_to_unregistered_peer_is_unreachable`
@@ -1641,7 +1643,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 
 - `a_soak_under_sustained_load_shows_no_drift` — `#[ignore]`d
 
-## `crates/mqttd/tests/cluster_stress.rs` — 12 test(s)
+## `crates/mqttd/tests/cluster_stress.rs` — 13 test(s)
 
 - `a_browned_out_session_owner_refuses_the_publisher_rather_than_owing_a_lost_message`
 - `a_cross_node_shared_subscriber_is_never_bypassed_by_an_ack`
@@ -1653,6 +1655,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `growing_one_node_to_three_back_fills_and_survives_the_founder`
 - `growing_three_to_five_zone_spread_survives_losing_two_originals`
 - `growth_migrates_moved_sessions_eagerly_and_acks_stay_honest`
+- `no_node_keeps_a_stamp_for_a_group_it_left`
 - `rolling_replacement_swaps_a_node_without_loss`
 - `seeded_fault_schedules_hold_the_catalog_post_quiesce`
 
@@ -1856,6 +1859,13 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 
 - `malformed_cert_reload_is_rejected_and_keeps_serving`
 - `renewed_cert_is_served_on_the_next_handshake`
+
+## `crates/mqttd/tests/replication_pause.rs` — 4 test(s)
+
+- `write_pause_three_replicas_crash` — `#[ignore]`d
+- `write_pause_three_replicas_suspend` — `#[ignore]`d
+- `write_pause_two_replicas_crash` — `#[ignore]`d
+- `write_pause_two_replicas_suspend` — `#[ignore]`d
 
 ## `crates/mqttd/tests/resource_limits.rs` — 1 test(s)
 

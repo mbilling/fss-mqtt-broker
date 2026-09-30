@@ -355,6 +355,32 @@ impl DurablePlane {
             .voter_ids()
     }
 
+    /// Groups this node holds a caught-up stamp for although the group's current
+    /// replica set excludes it — a stamp certifying custody the node no longer
+    /// has (#727). The catch-up sweep clears these; once it has run after a
+    /// membership or replication-factor change, a healthy node reports none.
+    #[must_use]
+    pub fn stamps_outside_custody(&self) -> Vec<crate::lease_raft::GroupId> {
+        let (local, sets): (NodeId, Vec<Vec<NodeId>>) = {
+            let p = self
+                .placement
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let sets = (0..crate::placement::NUM_GROUPS)
+                .map(|g| p.group_replica_set(g))
+                .collect();
+            (p.local().clone(), sets)
+        };
+        let r = self.lock_replicas();
+        (0..crate::placement::NUM_GROUPS)
+            .zip(sets)
+            .filter(|(g, set)| {
+                !set.contains(&local) && r.caught_up_set(*g).is_some_and(|s| !s.is_empty())
+            })
+            .map(|(g, _)| g)
+            .collect()
+    }
+
     /// Whether this node's replica copy of `key` is **caught up** (ADR 0043 P1):
     /// non-empty, gap-free, and stamped current for the key's group replica set —
     /// exactly the verdict its recovery reads answer with. Observability for the

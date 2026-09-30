@@ -1369,3 +1369,42 @@ impl mqtt_storage::SessionStore for FlakyStore {
         self.inner.all_sessions().await
     }
 }
+
+/// ADR 0080: how an in-process durable harness founds its cluster's replication
+/// factor — `MQTTD_REPLICAS` when set (so a whole suite can run at R=2), else the
+/// configuration's default, exactly as `mqttd` founds a new cluster. Every
+/// in-process node runs this build, so the capability is raised up front.
+///
+/// # Panics
+/// On an `MQTTD_REPLICAS` that is not a number.
+pub fn founding() -> mqtt_cluster::lease_assign::Founding {
+    mqtt_cluster::lease_assign::Founding::new(
+        expected_replicas(),
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+    )
+}
+
+/// The replication factor [`founding`] founds at, which every in-process node
+/// must then report — so a suite run with `MQTTD_REPLICAS=2` proves it ran at 2.
+///
+/// # Panics
+/// On an `MQTTD_REPLICAS` that is not a number.
+pub fn expected_replicas() -> u8 {
+    std::env::var("MQTTD_REPLICAS").map_or_else(
+        |_| mqtt_config::Durable::default().replicas,
+        |v| v.parse().expect("MQTTD_REPLICAS must be a number"),
+    )
+}
+
+/// The replica store an in-process durable harness opens: `MQTTD_REPLICA_STORE`
+/// (`redb` or `log`, ADR 0078), else redb — the same variable `mqttd` reads, so a
+/// suite runs on either engine without code changes.
+///
+/// # Panics
+/// On a value that names neither engine.
+pub fn replica_store() -> mqtt_cluster::cluster_log::StoreBackend {
+    std::env::var("MQTTD_REPLICA_STORE")
+        .map_or(mqtt_cluster::cluster_log::StoreBackend::Redb, |v| {
+            v.parse().expect("MQTTD_REPLICA_STORE must be redb or log")
+        })
+}

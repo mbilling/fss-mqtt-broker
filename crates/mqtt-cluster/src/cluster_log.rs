@@ -1381,11 +1381,12 @@ impl ReplicaState {
     /// current` is this node's replication lag in groups.
     #[must_use]
     pub fn caught_up_summary(&self, set_of: impl Fn(GroupId) -> Vec<NodeId>) -> (usize, usize) {
-        let tracked = self.caught_up.len();
-        let current = self
-            .caught_up
-            .keys()
-            .filter(|g| self.group_current(**g, &set_of(**g)))
+        // A cleared stamp (the empty set — this node left the group's set,
+        // ADR 0080) certifies nothing and is not lag.
+        let stamped = || self.caught_up.iter().filter(|(_, s)| !s.is_empty());
+        let tracked = stamped().count();
+        let current = stamped()
+            .filter(|(g, _)| self.group_current(**g, &set_of(**g)))
             .count();
         (current, tracked)
     }
@@ -1394,6 +1395,11 @@ impl ReplicaState {
     /// transaction (a boot sweep stamps every owned group at once). On a persist
     /// failure nothing is stamped in memory either — the watermark never claims
     /// more than the disk holds (a restart must resume, not fake, the catch-up).
+    ///
+    /// An EMPTY set clears the group's stamp: it matches no replica set and is no
+    /// cohort a pure shrink could start from (the sweep writes one when this node
+    /// leaves the group's set, ADR 0080) — the same record in both engines, so no
+    /// format change.
     pub fn mark_groups_current(&mut self, stamps: &[(GroupId, Vec<NodeId>)]) {
         if stamps.is_empty() {
             return;
