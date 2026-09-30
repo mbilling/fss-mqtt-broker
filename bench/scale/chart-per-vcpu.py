@@ -28,13 +28,11 @@ OUT = ROOT / "docs/benchmarks/img/per-vcpu.svg"
 CLASSES = [
     ("single-node-qos0", "Single node, QoS 0 · same 4-vCPU host, measured by us"),
     ("cluster-qos0", "Cluster, QoS 0"),
-    ("cluster-qos1", "Cluster, QoS 1 (not durable, or persistence not published)"),
-    ("cluster-durable-qos1", "Cluster, durable QoS 1 (ack after fsync + replication)"),
+    ("cluster-qos1", "Cluster, QoS 1, not durable"),
+    ("cluster-durable-qos1", "Cluster, durable QoS 1, 2 copies of every message"),
 ]
 # A class where a vendor publishes nothing comparable says so, rather than showing a lone bar.
-MISSING = {
-    "cluster-durable-qos1": "HiveMQ, EMQX: no durable, replicated QoS 1 throughput published",
-}
+MISSING: dict[str, str] = {}
 VCPU_IS = {"smt-thread": "vCPU = SMT thread", "core": "vCPU = whole core", "unknown": "SMT not published"}
 
 W = 880
