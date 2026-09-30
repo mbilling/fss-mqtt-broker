@@ -258,7 +258,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `two_bridge_instances_do_not_duplicate_forwarding`
 - `two_partitioned_instances_deliver_each_inbound_message_exactly_once`
 
-## `crates/mqtt-cluster/src/lib.rs` — 352 test(s)
+## `crates/mqtt-cluster/src/lib.rs` — 354 test(s)
 
 - `cluster_identity::tests::a_founder_mints_once_and_reloads_stably`
 - `cluster_identity::tests::a_joiner_adopts_once_and_persists`
@@ -333,6 +333,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `cluster_store::tests::a_lone_survivor_of_a_known_three_node_group_refuses_appends_by_default`
 - `cluster_store::tests::a_node_that_never_knew_a_cluster_acks_durable_writes_under_the_default_floor`
 - `cluster_store::tests::a_retained_set_commits_through_the_group_and_replicates`
+- `cluster_store::tests::a_roster_from_before_this_node_joined_cannot_certify_an_empty_history`
 - `cluster_store::tests::a_stale_epoch_retained_write_is_fenced_not_committed`
 - `cluster_store::tests::a_takeover_recovers_the_retained_value_and_its_token`
 - `cluster_store::tests::an_acked_append_survives_owner_restart_via_its_durable_self_copy`
@@ -352,6 +353,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `decommission::tests::a_solo_drain_completes_immediately`
 - `decommission::tests::a_successor_with_divergent_content_is_not_sufficient`
 - `decommission::tests::the_drain_hands_off_and_verifies_a_held_key`
+- `durable_node::tests::a_catch_up_stamp_waits_for_every_member_not_only_the_set`
 - `durable_node::tests::a_founded_factor_is_adopted_and_outlives_a_different_setting`
 - `durable_node::tests::a_persistent_durable_node_restarts_from_its_data_dir`
 - `durable_node::tests::a_stamp_is_cleared_on_leaving_the_set_and_never_revived_by_reentry`
