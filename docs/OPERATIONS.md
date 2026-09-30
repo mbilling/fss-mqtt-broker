@@ -968,10 +968,11 @@ mqttd --admin purge dev-0042    # disconnect if connected, then delete the sessi
 - `purge` deletes the session everywhere it is kept: subscriptions, in-flight state, the
   queued messages and the durable copy. A persistent reconnect then starts clean
   (`session_present = 0`).
-- Either can be run on any node. A session lives on its placement owner, so a node that
-  does not own it forwards the action to the owner's admin listener (under its cluster
-  certificate, carrying your subject), and the answer says `forwarded_to`. Both nodes audit
-  it. A forwarded action is never forwarded again.
+- Either can be run on any node. The node you ask acts if it holds the client; otherwise
+  it asks the session's placement owner, then every other node (under its cluster
+  certificate, carrying your subject), and the answer says `forwarded_to`. A clean session
+  stays on the node the client connected to, which is why the owner alone is not enough.
+  Both nodes audit it. A forwarded action is never forwarded again.
 - `404 not-found` means the owner holds no session or connection for that id.
 
 **Taking a node out of rotation without draining it.** `cordon` (operator role, this node

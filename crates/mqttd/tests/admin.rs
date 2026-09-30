@@ -570,6 +570,11 @@ struct BrokerSpec<'a> {
 }
 
 async fn start_broker_as(spec: BrokerSpec<'_>) -> Broker {
+    start_broker_on(spec, "127.0.0.1:0").await
+}
+
+/// [`start_broker_as`] with the admin listener on `admin_addr`.
+async fn start_broker_on(spec: BrokerSpec<'_>, admin_addr: &str) -> Broker {
     let store = Arc::new(MemorySessionStore::new());
     let (hub, hub_tx) = Hub::with_config(NodeId(spec.id.into()), store.clone());
     tokio::spawn(hub.run());
@@ -584,7 +589,7 @@ async fn start_broker_as(spec: BrokerSpec<'_>) -> Broker {
     });
     let admin = start_node(Node {
         id: spec.id,
-        listener: TcpListener::bind("127.0.0.1:0").await.unwrap(),
+        listener: TcpListener::bind(admin_addr).await.unwrap(),
         admin_ca: spec.admin_ca,
         server_ca: spec.cluster,
         cluster_ca: spec.cluster,
@@ -1226,4 +1231,110 @@ async fn a_log_override_is_an_operator_action_that_never_silences_audit() {
     assert_eq!(body["override_filter"], Value::Null);
     let (_, node) = view(&b, "/admin/v1/node").await;
     assert!(node.get("log_filter").is_none(), "{node}");
+}
+
+/// Found on the live cluster: a CLEAN session stays on the node the client connected to,
+/// not its placement owner. Kick must act where the client is: locally when asked there,
+/// and by asking the other members when asked on the owner, which holds nothing.
+#[tokio::test]
+async fn a_clean_session_is_kicked_where_it_is_not_where_placement_points() {
+    let admin_ca = Arc::new(mint_ca("admin"));
+    let cluster = mint_ca("cluster");
+    // Two admin listeners bound first, so each node's peer map can name the other.
+    let listen_a = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listen_b = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr_a = listen_a.local_addr().unwrap().to_string();
+    let addr_b = listen_b.local_addr().unwrap().to_string();
+    drop((listen_a, listen_b));
+    let peers = |me: &str| {
+        let (cert, key) = mint_leaf(&cluster, me, None);
+        let map: HashMap<String, String> = [
+            ("a".to_string(), addr_a.clone()),
+            ("b".to_string(), addr_b.clone()),
+        ]
+        .into();
+        PeerAccess::new(
+            mqtt_net::tls::client_connector_multi(&[&admin_ca.pem, &cluster.pem], &cert, &key)
+                .unwrap(),
+            Arc::new(move |node: &str, _: &str| map.get(node).cloned()),
+        )
+    };
+    let placement = |me: &str, other: &str| {
+        let mut p = Placement::new(NodeId(me.into()), DEFAULT_REPLICAS);
+        p.observe(
+            &NodeId(other.into()),
+            MemberState::Alive,
+            &format!("{other}.cluster:7000"),
+            None,
+        );
+        Arc::new(RwLock::new(p))
+    };
+    let a = start_broker_on(
+        BrokerSpec {
+            id: "a",
+            admin_ca: admin_ca.clone(),
+            cluster: Some(&cluster),
+            placement: Some(placement("a", "b")),
+            peers: Some(peers("a")),
+        },
+        &addr_a,
+    )
+    .await;
+    let b = start_broker_on(
+        BrokerSpec {
+            id: "b",
+            admin_ca: admin_ca.clone(),
+            cluster: Some(&cluster),
+            placement: Some(placement("b", "a")),
+            peers: Some(peers("b")),
+        },
+        &addr_b,
+    )
+    .await;
+    let owned_by_b = {
+        let p = placement("a", "b");
+        let p = p.read().unwrap();
+        (0..1000)
+            .map(|i| format!("dev-{i}"))
+            .find(|c| p.owner(c).0 == "b")
+            .unwrap()
+    };
+    let root = mint_leaf(&admin_ca, "root", None);
+
+    // Connected to `a` with a clean session: `a` holds it, although `b` owns the id.
+    let mut device = Client::connect_v5_ok(a.mqtt, &owned_by_b).await;
+    view_until(&a, "/admin/v1/clients", |v| v["matched"] == 1).await;
+    let (status, body) = post(
+        &a.admin,
+        &root,
+        &format!("/admin/v1/kick?client={owned_by_b}"),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["node"], "a", "acted where the client is: {body}");
+    assert!(body.get("forwarded_to").is_none(), "{body}");
+    device.expect_disconnect(0x98).await;
+
+    // Asked on the owner, which holds nothing: it finds the client on the other member.
+    let mut device = Client::connect_v5_ok(a.mqtt, &owned_by_b).await;
+    view_until(&a, "/admin/v1/clients", |v| {
+        v["sessions"][0]["connected"] == true
+    })
+    .await;
+    let (status, body) = post(
+        &b.admin,
+        &root,
+        &format!("/admin/v1/kick?client={owned_by_b}"),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["node"], "a", "{body}");
+    assert_eq!(body["forwarded_to"], "a", "{body}");
+    device.expect_disconnect(0x98).await;
+
+    // Nobody holds it: 404 naming every node asked.
+    let (status, body) = post(&b.admin, &root, "/admin/v1/kick?client=nobody").await;
+    assert_eq!((status, code(&body)), (404, "not-found"));
+    let message = body["error"]["message"].as_str().unwrap();
+    assert!(message.contains("asked: b, a"), "{message}");
 }
