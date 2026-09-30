@@ -258,7 +258,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `two_bridge_instances_do_not_duplicate_forwarding`
 - `two_partitioned_instances_deliver_each_inbound_message_exactly_once`
 
-## `crates/mqtt-cluster/src/lib.rs` — 340 test(s)
+## `crates/mqtt-cluster/src/lib.rs` — 352 test(s)
 
 - `cluster_identity::tests::a_founder_mints_once_and_reloads_stably`
 - `cluster_identity::tests::a_joiner_adopts_once_and_persists`
@@ -282,6 +282,8 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `cluster_log::tests::a_failed_pipelined_append_fails_the_staged_tail_and_leaves_no_hole`
 - `cluster_log::tests::a_foreign_replica_schema_version_fails_closed`
 - `cluster_log::tests::a_groups_fence_does_not_reject_another_groups_older_epoch`
+- `cluster_log::tests::a_joint_append_needs_a_quorum_of_the_new_set_too`
+- `cluster_log::tests::a_joint_recommit_and_fence_need_a_quorum_of_the_new_set_too`
 - `cluster_log::tests::a_key_lives_in_exactly_one_shard`
 - `cluster_log::tests::a_local_tier_append_returns_on_the_owners_durability_alone`
 - `cluster_log::tests::a_missing_shard_fails_the_open_closed`
@@ -312,12 +314,14 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `cluster_log::tests::merge_takes_the_contiguous_run_from_a_quorum`
 - `cluster_log::tests::merge_truncates_a_tail_whose_tag_regresses`
 - `cluster_log::tests::pipelined_appends_overlap_and_commit_in_offset_order`
+- `cluster_log::tests::raised_fences_refuse_every_pre_change_epoch`
 - `cluster_log::tests::recommit_requires_a_write_quorum_for_the_recovered_base`
 - `cluster_log::tests::recovered_log_serves_seeded_entries_and_continues`
 - `cluster_log::tests::replica_state_survives_reopen`
 - `cluster_log::tests::session_store_over_cluster_log_survives_replica_loss`
 - `cluster_log::tests::stale_leader_is_fenced`
 - `cluster_log::tests::the_default_layout_is_a_single_file_under_its_original_name`
+- `cluster_log::tests::the_joint_rule_needs_both_majorities`
 - `cluster_log::tests::the_migration_registry_covers_the_contract_range`
 - `cluster_log::tests::the_unlocked_shard_writer_matches_apply_batch`
 - `cluster_log::tests::truncate_is_local_first_and_propagates`
@@ -325,6 +329,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `cluster_store::tests::a_foreign_topics_retained_write_is_refused_not_diverged`
 - `cluster_store::tests::a_higher_lease_epoch_rebuilds_and_re_recovers_the_log`
 - `cluster_store::tests::a_joiner_enters_the_hot_paths_replica_set_on_the_next_append`
+- `cluster_store::tests::a_joint_epoch_needs_a_quorum_of_the_new_set_too`
 - `cluster_store::tests::a_lone_survivor_of_a_known_three_node_group_refuses_appends_by_default`
 - `cluster_store::tests::a_node_that_never_knew_a_cluster_acks_durable_writes_under_the_default_floor`
 - `cluster_store::tests::a_retained_set_commits_through_the_group_and_replicates`
@@ -421,12 +426,13 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `lease_raft::tests::assign_many_applies_each_at_a_fresh_epoch`
 - `lease_raft::tests::assign_mints_a_lease_at_a_fresh_epoch`
 - `lease_raft::tests::epochs_are_globally_monotonic_across_groups`
+- `lease_raft::tests::founding_and_commit_leave_the_lease_table_alone`
 - `lease_raft::tests::lease_config_is_a_valid_raft_type_config`
 - `lease_raft::tests::lease_map_serde_roundtrips`
+- `lease_raft::tests::opening_a_change_re_mints_every_lease_above_since`
 - `lease_raft::tests::openraft_wire_types_roundtrip_under_postcard`
 - `lease_raft::tests::reassign_bumps_the_epoch_monotonically`
 - `lease_raft::tests::replay_is_deterministic`
-- `lease_raft::tests::replication_commands_leave_the_lease_table_alone`
 - `lease_raft::tests::set_replicas_founds_the_factor_once`
 - `lease_raft::tests::unknown_group_has_no_lease`
 - `lease_raft::tests::unset_state_encodes_exactly_as_the_legacy_table`
@@ -455,6 +461,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `placement::tests::a_declared_member_count_arms_the_write_floor_before_gossip_or_the_roster`
 - `placement::tests::a_joining_node_moves_only_a_minority`
 - `placement::tests::a_memo_hit_does_not_recompute_the_hrw_pass`
+- `placement::tests::a_narrower_replica_set_is_a_prefix_of_a_wider_one`
 - `placement::tests::a_new_replication_factor_reshapes_sets_and_keeps_owners`
 - `placement::tests::alive_and_suspect_are_eligible_dead_is_removed`
 - `placement::tests::alone_this_node_owns_everything`
@@ -481,6 +488,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `placement::tests::the_committed_ownership_snapshot_filters_a_corpse_and_reports_routability`
 - `placement::tests::the_derived_write_floor_is_one_alone_and_two_once_the_cluster_is_known`
 - `placement::tests::the_durable_roster_is_the_authority_for_the_derived_floor`
+- `placement::tests::the_joint_prefix_follows_the_replication_record`
 - `placement::tests::the_memo_invalidates_on_every_input_that_moves_a_replica_set`
 - `placement::tests::the_memoized_replica_set_equals_the_direct_hrw_computation`
 - `placement::tests::the_ownership_version_moves_only_on_a_real_committed_change`
@@ -503,6 +511,10 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `replay::tests::reopening_resumes_above_the_last_reserved_block_never_reusing`
 - `replay::tests::reserves_one_block_per_block_of_numbers`
 - `replay::tests::strictly_increasing_sequences_are_all_fresh`
+- `replica_change::tests::a_dropped_copy_is_collected_only_once_the_new_set_holds_it`
+- `replica_change::tests::a_proposal_opens_a_change_only_when_the_cluster_can_take_it`
+- `replica_change::tests::a_round_finds_an_entry_short_of_the_new_set_and_the_recommit_fixes_it`
+- `replica_change::tests::the_status_fragment_reports_progress_and_notes`
 - `segment_log::tests::a_batch_larger_than_a_segment_still_lands_whole`
 - `segment_log::tests::a_first_segment_cut_short_while_zeroing_is_filled_out`
 - `segment_log::tests::a_gap_between_segments_is_corruption`
@@ -1486,9 +1498,10 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tls_check::tests::nothing_configured_is_a_single_ok_line`
 - `tls_check::tests::valid_material_passes_and_reports_names`
 
-## `crates/mqttd/src/main.rs` — 18 test(s)
+## `crates/mqttd/src/main.rs` — 19 test(s)
 
 - `tests::a_non_durable_node_resolves_no_write_floor`
+- `tests::a_reload_proposes_a_changed_replication_factor`
 - `tests::a_vanished_peer_is_retried_immediately_not_paused`
 - `tests::changing_the_identity_source_requires_a_restart`
 - `tests::cli_shape_accepts_documented_invocations`
@@ -1643,7 +1656,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 
 - `a_soak_under_sustained_load_shows_no_drift` — `#[ignore]`d
 
-## `crates/mqttd/tests/cluster_stress.rs` — 13 test(s)
+## `crates/mqttd/tests/cluster_stress.rs` — 14 test(s)
 
 - `a_browned_out_session_owner_refuses_the_publisher_rather_than_owing_a_lost_message`
 - `a_cross_node_shared_subscriber_is_never_bypassed_by_an_ack`
@@ -1658,6 +1671,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `no_node_keeps_a_stamp_for_a_group_it_left`
 - `rolling_replacement_swaps_a_node_without_loss`
 - `seeded_fault_schedules_hold_the_catalog_post_quiesce`
+- `the_replication_factor_changes_live_both_ways_without_losing_an_acked_message`
 
 ## `crates/mqttd/tests/cluster_upgrade.rs` — 2 test(s)
 

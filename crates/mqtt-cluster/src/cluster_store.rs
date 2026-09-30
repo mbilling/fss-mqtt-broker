@@ -25,10 +25,10 @@
 //!   at step 4f.
 
 use crate::cluster_log::{
-    merge_replica_logs_tagged, ClusterLog, EpochEntry, ReplicaState, ReplicaTransport,
+    merge_replica_logs_tagged, ClusterLog, EpochEntry, Quorum, ReplicaState, ReplicaTransport,
 };
 use crate::lease::{Epoch, OwnershipLease};
-use crate::lease_raft::{GroupId, RaftNodeId};
+use crate::lease_raft::{GroupId, RaftNodeId, ReplicationRecord};
 use crate::lease_store::LeaseStore;
 use crate::placement::{group_of_key, Placement};
 use crate::NodeId;
@@ -50,6 +50,21 @@ pub trait LeaseSource: Send + Sync {
     /// # Errors
     /// [`ReplError`] if the lease cannot be acquired (no quorum / not owner).
     async fn epoch_for(&self, group: GroupId) -> Result<Epoch, ReplError>;
+
+    /// [`epoch_for`](Self::epoch_for) together with the replication record read
+    /// from the same lease state (ADR 0080 §4), so a log built at an epoch minted
+    /// by a factor change always counts acks by that change's joint rule. `None`
+    /// for the record means the source has none (test sources): the placement's
+    /// adopted factor applies.
+    ///
+    /// # Errors
+    /// As [`epoch_for`](Self::epoch_for).
+    async fn lease_for(
+        &self,
+        group: GroupId,
+    ) -> Result<(Epoch, Option<ReplicationRecord>), ReplError> {
+        Ok((self.epoch_for(group).await?, None))
+    }
 }
 
 /// The production [`LeaseSource`]: reads the group's lease epoch from this node's
@@ -79,10 +94,17 @@ impl LocalLeaseSource {
 #[async_trait]
 impl LeaseSource for LocalLeaseSource {
     async fn epoch_for(&self, group: GroupId) -> Result<Epoch, ReplError> {
-        let current = self.store.current_lease(group);
+        self.lease_for(group).await.map(|(epoch, _)| epoch)
+    }
+
+    async fn lease_for(
+        &self,
+        group: GroupId,
+    ) -> Result<(Epoch, Option<ReplicationRecord>), ReplError> {
+        let (current, replication) = self.store.lease_with_replication(group);
         match &current {
             // The lease is assigned to us — return the epoch we hold it at.
-            Some(rec) if rec.holder == self.local => Ok(rec.epoch),
+            Some(rec) if rec.holder == self.local => Ok((rec.epoch, Some(replication))),
             // Assigned to another node, or not yet assigned: we cannot write durably.
             // This path is only reached AFTER `owns_group` passed (the placement ring
             // says this node owns the group), so a refusal here is the ring/lease split
@@ -115,6 +137,9 @@ struct GroupEntry<T: ReplicaTransport> {
     /// fan out to the **current** set — a cached log pinned to the old set would
     /// never deliver to a joiner, leaving it hollow forever.
     replica_set: Vec<NodeId>,
+    /// The joint prefix the log counts acks by while a replication-factor change
+    /// is open (ADR 0080 §4); opening or closing a change rebuilds the entry.
+    joint_prefix: Option<usize>,
 }
 
 /// A [`ReplicatedLog`] that routes each key to its placement group's
@@ -236,7 +261,7 @@ impl<S: LeaseSource, T: ReplicaTransport + Clone + 'static> GroupRoutedLog<S, T>
         // two N-element `Vec<NodeId>` clones read only inside the rare `Err(e)` arm, so
         // on the success path they were ~2N `String` allocations per message, allocated
         // and immediately dropped. They are taken in that arm instead.
-        let (replica_set, ring_owner) = {
+        let ring_owner = {
             let placement = self
                 .placement
                 .read()
@@ -245,11 +270,47 @@ impl<S: LeaseSource, T: ReplicaTransport + Clone + 'static> GroupRoutedLog<S, T>
             if ring_owner != *placement.local() {
                 return Err(ReplError::NotOwner);
             }
-            // Memoized inside `Placement` on its ring version, so the O(N log N) HRW pass
-            // this used to run on every message is paid once per topology change. Still
+            ring_owner
+        };
+
+        // Read the group's current lease epoch on every call. A higher epoch than the
+        // cached log's means ownership was lost and regained: the cached log writes at
+        // the old epoch and would be fenced by followers forever, so it must be rebuilt
+        // (and the group's keys re-recovered) against the new lease. The replication
+        // record comes from the same lease state (ADR 0080 §4): the epochs a factor
+        // change mints are only ever seen together with its joint rule.
+        let (epoch, replication) = self.lease_of(key, group, &ring_owner).await?;
+
+        let (replica_set, joint_prefix) = {
+            let placement = self
+                .placement
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // Ownership may have moved while the lease was read; the log is only
+            // ever built over a set this node leads.
+            if placement.group_owner(group) != *placement.local() {
+                return Err(ReplError::NotOwner);
+            }
+            // The set's width and joint prefix follow the record read WITH the epoch;
+            // a source without one (test harnesses) follows the placement's factor.
+            let (width, joint_prefix) = match replication {
+                Some(record) => match record.change {
+                    Some(change) => (
+                        usize::from(change.joint_width()),
+                        Some(usize::from(change.prefix_width())),
+                    ),
+                    None => (usize::from(record.effective()), None),
+                },
+                None => (placement.desired_replicas(), placement.joint_prefix()),
+            };
+            // Memoized inside `Placement` on its ring version (at the adopted factor, which
+            // the record's width equals outside the tick a change lands in), so the
+            // O(N log N) HRW pass this used to run on every message is paid once per
+            // topology change. Still
             // read under THIS guard (see the doc above) so the floor below is judged
             // against the very set the returned `ClusterLog` is built over.
-            let replica_set = placement.group_replica_set(group);
+            let replica_set = placement.group_replica_set_of_width(group, width);
+            let joint_prefix = joint_prefix.filter(|p| *p < replica_set.len());
             // The min-replicas write floor (issues #167, #239): replica sets truncate to
             // min(R, members), so a shrinking cluster silently commits new durability
             // promises on fewer copies than the operator configured — down to
@@ -268,15 +329,115 @@ impl<S: LeaseSource, T: ReplicaTransport + Clone + 'static> GroupRoutedLog<S, T>
                     });
                 }
             }
-            (replica_set, ring_owner)
+            (replica_set, joint_prefix)
         };
 
-        // Read the group's current lease epoch on every call. A higher epoch than the
-        // cached log's means ownership was lost and regained: the cached log writes at
-        // the old epoch and would be fenced by followers forever, so it must be rebuilt
-        // (and the group's keys re-recovered) against the new lease.
-        let epoch = match self.leases.epoch_for(group).await {
-            Ok(epoch) => epoch,
+        // Get-or-(re)build the group entry at the current epoch **and replica set**.
+        // A replica-set change rebuilds (and re-recovers, which re-commits to the
+        // new set — ADR 0043 P1) even under an unchanged lease. Resolve to an owned
+        // `Arc` and drop the guard before any await (the guard is not `Send`).
+        let entry = self.group_entry(group, epoch, &replica_set, joint_prefix);
+
+        // Recover this key once per epoch: a new owner was a replica, so the committed
+        // log lives in the replica set (its own copy + peers). Seeding it lets the
+        // recovered queue replay (a fresh session simply recovers to empty). The marker
+        // lives in the entry, so an epoch rebuild above resets it for the group.
+        let recover = !entry
+            .recovered
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(key);
+        if recover {
+            let (recovered, floor, reads_high) = self
+                .recover_key(key, &replica_set, entry.log.quorum_rule())
+                .await?;
+            // Re-commit the recovered base to a write quorum at the new epoch
+            // BEFORE serving or appending (ADR 0042 T6, exhibit ②): a merge can
+            // adopt a single-replica orphan, and building on it un-replicated lets
+            // the next takeover gap out the acked tail above it. A NoQuorum here
+            // leaves the recovery marker unset, so the next touch retries. The
+            // floor keeps the offset space above every read replica's durable
+            // truncation watermark (the exhibit's second face: an empty merge
+            // must not restart a truncated queue's offsets at 1).
+            let recovered = entry.log.recommit_tagged(key, &recovered).await?;
+            // Continue above every seq this epoch has already used for the key, in
+            // ANY read — including a tail the merge dropped (#634). Under a new
+            // epoch nothing qualifies and the counter continues from the re-commit
+            // as before; under the same epoch (a replica-set rebuild) this is what
+            // keeps the next append from being stamped below tags already on disk.
+            let seq_floor = reads_high
+                .filter(|(e, _)| *e == epoch)
+                .map_or(0, |(_, s)| s);
+            entry.log.seed_key(key, recovered, floor, seq_floor).await;
+            entry
+                .recovered
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(key.to_string());
+        }
+        Ok(entry.log.clone())
+    }
+
+    /// The group's cached entry at `epoch`, `replica_set` and `joint_prefix`, rebuilt
+    /// (with its recovery markers reset) when any of them moved.
+    fn group_entry(
+        &self,
+        group: GroupId,
+        epoch: Epoch,
+        replica_set: &[NodeId],
+        joint_prefix: Option<usize>,
+    ) -> Arc<GroupEntry<T>> {
+        let mut cache = self.cache();
+        if let Some(entry) = cache.get(&group).filter(|entry| {
+            entry.log.epoch() == epoch
+                && entry.replica_set == replica_set
+                && entry.joint_prefix == joint_prefix
+        }) {
+            return entry.clone();
+        }
+        let lease = OwnershipLease {
+            holder: self.local.clone(),
+            epoch,
+        };
+        let mut log = ClusterLog::new(
+            self.local.clone(),
+            lease,
+            replica_set,
+            self.transport.clone(),
+        );
+        if let Some(prefix) = joint_prefix {
+            log = log.with_joint_prefix(replica_set, prefix);
+        }
+        let entry = Arc::new(GroupEntry {
+            log: Arc::new(
+                log
+                    // The owner's self-ack is durable (ADR 0042 T8): it
+                    // counts toward quorum only once the op is applied to
+                    // this node's own replica copy — the same copy its
+                    // recovery reads consult after a restart. With a
+                    // writer attached (ADR 0071) those applies
+                    // group-commit through the shared serializer.
+                    .with_local_store(self.local_replicas.clone())
+                    .maybe_owner_writer(self.writer_for(group)),
+            ),
+            recovered: Mutex::new(BTreeSet::new()),
+            replica_set: replica_set.to_vec(),
+            joint_prefix,
+        });
+        cache.insert(group, entry.clone());
+        entry
+    }
+
+    /// The group's lease epoch and replication record (see [`LeaseSource::lease_for`]),
+    /// with the ownership-split diagnostic on a refusal.
+    async fn lease_of(
+        &self,
+        key: &str,
+        group: GroupId,
+        ring_owner: &NodeId,
+    ) -> Result<(Epoch, Option<ReplicationRecord>), ReplError> {
+        match self.leases.lease_for(group).await {
+            Ok(lease) => Ok(lease),
             // This node OWNS the group by the placement ring (it passed `owns_group`
             // above) yet the lease store refuses the epoch — the ring and the
             // lease-assigner disagree about who holds `group`. Steady-state this must not
@@ -308,87 +469,9 @@ impl<S: LeaseSource, T: ReplicaTransport + Clone + 'static> GroupRoutedLog<S, T>
                     error = ?e,
                     "durable ownership split: placement ring owns this group but the lease store refuses its epoch"
                 );
-                return Err(e);
+                Err(e)
             }
-        };
-
-        // Get-or-(re)build the group entry at the current epoch **and replica set**.
-        // A replica-set change rebuilds (and re-recovers, which re-commits to the
-        // new set — ADR 0043 P1) even under an unchanged lease. Resolve to an owned
-        // `Arc` and drop the guard before any await (the guard is not `Send`).
-        let entry = {
-            let mut cache = self.cache();
-            match cache.get(&group) {
-                Some(entry) if entry.log.epoch() == epoch && entry.replica_set == replica_set => {
-                    entry.clone()
-                }
-                _ => {
-                    let lease = OwnershipLease {
-                        holder: self.local.clone(),
-                        epoch,
-                    };
-                    let entry = Arc::new(GroupEntry {
-                        log: Arc::new(
-                            ClusterLog::new(
-                                self.local.clone(),
-                                lease,
-                                &replica_set,
-                                self.transport.clone(),
-                            )
-                            // The owner's self-ack is durable (ADR 0042 T8): it
-                            // counts toward quorum only once the op is applied to
-                            // this node's own replica copy — the same copy its
-                            // recovery reads consult after a restart. With a
-                            // writer attached (ADR 0071) those applies
-                            // group-commit through the shared serializer.
-                            .with_local_store(self.local_replicas.clone())
-                            .maybe_owner_writer(self.writer_for(group)),
-                        ),
-                        recovered: Mutex::new(BTreeSet::new()),
-                        replica_set: replica_set.clone(),
-                    });
-                    cache.insert(group, entry.clone());
-                    entry
-                }
-            }
-        };
-
-        // Recover this key once per epoch: a new owner was a replica, so the committed
-        // log lives in the replica set (its own copy + peers). Seeding it lets the
-        // recovered queue replay (a fresh session simply recovers to empty). The marker
-        // lives in the entry, so an epoch rebuild above resets it for the group.
-        let recover = !entry
-            .recovered
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .contains(key);
-        if recover {
-            let (recovered, floor, reads_high) = self.recover_key(key, &replica_set).await?;
-            // Re-commit the recovered base to a write quorum at the new epoch
-            // BEFORE serving or appending (ADR 0042 T6, exhibit ②): a merge can
-            // adopt a single-replica orphan, and building on it un-replicated lets
-            // the next takeover gap out the acked tail above it. A NoQuorum here
-            // leaves the recovery marker unset, so the next touch retries. The
-            // floor keeps the offset space above every read replica's durable
-            // truncation watermark (the exhibit's second face: an empty merge
-            // must not restart a truncated queue's offsets at 1).
-            let recovered = entry.log.recommit_tagged(key, &recovered).await?;
-            // Continue above every seq this epoch has already used for the key, in
-            // ANY read — including a tail the merge dropped (#634). Under a new
-            // epoch nothing qualifies and the counter continues from the re-commit
-            // as before; under the same epoch (a replica-set rebuild) this is what
-            // keeps the next append from being stamped below tags already on disk.
-            let seq_floor = reads_high
-                .filter(|(e, _)| *e == epoch)
-                .map_or(0, |(_, s)| s);
-            entry.log.seed_key(key, recovered, floor, seq_floor).await;
-            entry
-                .recovered
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .insert(key.to_string());
         }
-        Ok(entry.log.clone())
     }
 
     /// Recover `key`'s committed log by reading a quorum of the replica set: this
@@ -403,15 +486,20 @@ impl<S: LeaseSource, T: ReplicaTransport + Clone + 'static> GroupRoutedLog<S, T>
         &self,
         key: &str,
         replica_set: &[NodeId],
+        quorum: &Quorum,
     ) -> Result<(Vec<EpochEntry>, Offset, Option<(Epoch, u64)>), ReplError> {
-        let quorum = replica_set.len() / 2 + 1;
-        let enough = |reads: &[crate::cluster_log::ReplicaRead]| {
-            reads.len() >= quorum && reads.iter().any(|r| r.complete)
+        // Reads are counted by position in the ordered set, so a joint rule (ADR
+        // 0080 §4) can ask for a majority of the prefix as well as of the whole.
+        let position = |node: &NodeId| replica_set.iter().position(|n| n == node);
+        let mut read_from: Vec<usize> = Vec::new();
+        let enough = |reads: &[crate::cluster_log::ReplicaRead], read_from: &[usize]| {
+            quorum.met_by(read_from.iter().copied()) && reads.iter().any(|r| r.complete)
         };
         let group = group_of_key(key);
         // Local copy first (sync; the guard is dropped before any await). Each read
         // carries the replica's truncation low-water so the merge cannot resurrect an
         // already-acked prefix from a stale replica (ADR 0018 §3b).
+        read_from.extend(position(&self.local));
         let mut reads = vec![{
             let r = self
                 .local_replicas
@@ -431,24 +519,30 @@ impl<S: LeaseSource, T: ReplicaTransport + Clone + 'static> GroupRoutedLog<S, T>
         // enough have responded — a quorum, at least one of it complete — so a slow
         // or just-died replica's RPC timeout does not serialize recovery when quorum
         // is reachable from faster replicas.
-        if !enough(&reads) {
+        if !enough(&reads, &read_from) {
             let mut inflight = tokio::task::JoinSet::new();
-            for replica in replica_set.iter().filter(|n| **n != self.local) {
+            for (i, replica) in replica_set.iter().enumerate() {
+                if *replica == self.local {
+                    continue;
+                }
                 let transport = self.transport.clone();
                 let replica = replica.clone();
                 let key = key.to_string();
-                inflight.spawn(async move { transport.read_replica(&replica, &key).await });
+                inflight.spawn(async move { (i, transport.read_replica(&replica, &key).await) });
             }
-            while !enough(&reads) {
+            while !enough(&reads, &read_from) {
                 match inflight.join_next().await {
-                    Some(Ok(Some(read))) => reads.push(read),
+                    Some(Ok((i, Some(read)))) => {
+                        reads.push(read);
+                        read_from.push(i);
+                    }
                     // A replica that did not respond (or a join error): keep waiting.
-                    Some(Ok(None) | Err(_)) => {}
+                    Some(Ok((_, None)) | Err(_)) => {}
                     None => break, // every replica reported; not enough
                 }
             }
         }
-        if reads.len() < quorum {
+        if !quorum.met_by(read_from.iter().copied()) {
             return Err(ReplError::NoQuorum);
         }
         if !reads.iter().any(|r| r.complete) {
@@ -1637,6 +1731,125 @@ mod tests {
             matches!(err, mqtt_storage::repl::ReplError::NoQuorum),
             "below quorum, recovery must fail closed with NoQuorum (never an empty log); got {err:?}"
         );
+    }
+
+    /// A lease source that also reports a replication record, as the lease
+    /// store does (ADR 0080 §4).
+    #[derive(Debug)]
+    struct LeaseWithRecord(Epoch, crate::lease_raft::ReplicationRecord);
+
+    #[async_trait]
+    impl LeaseSource for LeaseWithRecord {
+        async fn epoch_for(&self, _group: GroupId) -> Result<Epoch, mqtt_storage::repl::ReplError> {
+            Ok(self.0)
+        }
+
+        async fn lease_for(
+            &self,
+            _group: GroupId,
+        ) -> Result<
+            (Epoch, Option<crate::lease_raft::ReplicationRecord>),
+            mqtt_storage::repl::ReplError,
+        > {
+            Ok((self.0, Some(self.1)))
+        }
+    }
+
+    /// ADR 0080 §4, end to end through the store: the log follows the record
+    /// read WITH the lease epoch, not the factor placement last adopted. During a
+    /// 3 → 2 shrink, the owner plus the member being dropped are a majority of the
+    /// old set but not of the new one, so neither recovery nor an append may
+    /// complete on them; with the kept member they do, and once the change
+    /// commits the log is rebuilt over the two-member set.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_joint_epoch_needs_a_quorum_of_the_new_set_too() {
+        use crate::lease_raft::{ReplicaChange, ReplicationRecord};
+        let owner = nid("owner");
+        // Placement still at 2: the record, not the adopted factor, decides.
+        let mut p = Placement::new(owner.clone(), 2);
+        p.observe(&nid("f1"), MemberState::Alive, "f1:7000", None);
+        p.observe(&nid("f2"), MemberState::Alive, "f2:7000", None);
+        let (group, client) = owned_group_and_client(&p);
+        let set = p.group_replica_set_of_width(group, 3);
+        let (kept, dropped) = (set[1].clone(), set[2].clone());
+        let placement = Arc::new(RwLock::new(p));
+        let joint = ReplicationRecord {
+            replicas: Some(3),
+            change: Some(ReplicaChange {
+                from: 3,
+                to: 2,
+                since: 4,
+            }),
+        };
+        let qkey = format!("q/{}", client.0);
+        let msg = Message::new(
+            "t".to_string(),
+            bytes::Bytes::from_static(b"durable"),
+            QoS::AtLeastOnce,
+            false,
+        );
+
+        // Wire only `reachable`; the owner's own copy is stamped current for the
+        // joint set, so recovery has its complete anchor.
+        let build = |reachable: &NodeId, record: ReplicationRecord| {
+            let transport = Arc::new(PeerReplicaTransport::new());
+            let (tx, rx) = mpsc::unbounded_channel();
+            transport.register(reachable.clone(), tx);
+            spawn_follower(
+                transport.clone(),
+                Arc::new(Mutex::new(ReplicaState::new())),
+                rx,
+            );
+            let own = Arc::new(Mutex::new(ReplicaState::new()));
+            own.lock()
+                .unwrap()
+                .mark_groups_current(&[(group, set.clone())]);
+            GroupRoutedLog::new(
+                owner.clone(),
+                placement.clone(),
+                transport,
+                LeaseWithRecord(5, record),
+                own,
+            )
+        };
+
+        // Before the change, the owner and `dropped` are a quorum of three.
+        let before = ReplicatedSessionStore::new(build(
+            &dropped,
+            ReplicationRecord {
+                replicas: Some(3),
+                change: None,
+            },
+        ));
+        before.ensure_session(&client).await.unwrap();
+        before.enqueue(&client, &msg).await.unwrap();
+
+        let only_dropped = ReplicatedSessionStore::new(build(&dropped, joint));
+        let _ = only_dropped.ensure_session(&client).await;
+        assert!(
+            only_dropped.enqueue(&client, &msg).await.is_err(),
+            "the old set's majority alone must not serve a joint group"
+        );
+
+        let with_kept = build(&kept, joint);
+        let log = with_kept.log_for_key(&qkey, true).await.unwrap();
+        assert!(log.quorum_rule().is_joint());
+        let with_kept = ReplicatedSessionStore::new(with_kept);
+        with_kept.ensure_session(&client).await.unwrap();
+        with_kept.enqueue(&client, &msg).await.unwrap();
+
+        // Committed at 2: the set narrows to [owner, kept] and the rule is a
+        // plain majority of it.
+        let committed = build(
+            &kept,
+            ReplicationRecord {
+                replicas: Some(2),
+                change: None,
+            },
+        );
+        let log = committed.log_for_key(&qkey, true).await.unwrap();
+        assert!(!log.quorum_rule().is_joint());
+        assert_eq!(log.quorum(), 2);
     }
 
     /// ADR 0043 P1, the empty-joiner face of the hazard: an owner that has not

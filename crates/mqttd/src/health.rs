@@ -660,6 +660,13 @@ impl HealthState {
         // (ADR 0049's posture, including the operator escape hatch and any
         // mixed-version window).
         if let Some(plane) = &self.durable {
+            // The committed replication factor, an open change's progress, and a
+            // reload's proposal with why it waits or was refused (ADR 0080 §4).
+            let _ = write!(
+                s,
+                ",\"replication_factor\":{}",
+                plane.replica_change().statusz_fragment()
+            );
             let (is_leader, epoch) = plane.lease_role();
             let _ = write!(
                 s,

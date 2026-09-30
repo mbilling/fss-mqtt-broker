@@ -168,6 +168,46 @@ so a node that re-entered a set could answer a recovery read "complete" for hist
 never received. It lost acknowledged messages once in about 30 runs (#727). Fixed with T3:
 a node clears its stamp when it leaves a set, and an adopted factor arms the catch-up sweep.
 
+## Amendment, 2026-09-30 — the live change as built (T5)
+
+§4 holds with five refinements, found while building it:
+
+- **The trigger is a reload only.** [ADR 0081](0081-admin-api.md) keeps configuration in the
+  file, so its admin API does not set `durable.replicas`. Only the lease leader can write to
+  the lease group, so the leader proposes when its own reload asks for the change: reload
+  every node (a config-map roll does). A follower's reload is held until that node leads or
+  the change lands. Refusals (fewer eligible nodes than R′, a change already running) and
+  holds (not the leader, a member not yet speaking proto 9) are logged and shown on
+  `/statusz` under `replication_factor`, with the open change's progress.
+- **Opening the change re-mints every lease.** `BeginReplicaChange` records `since`, the
+  highest epoch minted before it, and assigns every lease to its current holder at a fresh
+  epoch in the same entry. An owner reads the record together with its lease epoch from one
+  applied state, so every log at an epoch above `since` counts acks by the joint rule, and
+  recovery reads the same joint quorum. Each node that applies the change also raises its
+  replica fences above `since` for every group, durably, so an owner that has not applied it
+  yet cannot commit through that node on the old quorum. Only entries at or below `since` can
+  sit on too few members of S′.
+- **The catch-up condition is a quorum of S′, not every member.** Before the switch, every
+  entry at or below `since` that a joint-quorum recovery would return must be held by a
+  majority of S′: that is what a recovery over S′ alone needs to see it. Requiring every
+  member of S′ would not converge under load, since joint writes reach a majority, not
+  everyone. The lease leader checks it per key with the existing key-discovery and recovery
+  reads. A key that falls short goes to its owner, whose recovery and re-commit rewrite it
+  at the current epoch under the joint rule. The ADR 0043 stamps are unchanged. Growing, the
+  sweep stamps the wider set. Shrinking, the pure-shrink rule re-stamps the kept members,
+  which were in the set throughout. The first round waits 5 s after the change opens, so an
+  append a pre-change log had already sent resolves before it is checked.
+- **Collection is scoped to the change.** After a shrink commits, a node deletes its copies
+  of the groups the shrink took it out of, and only once every member of the group's new set
+  holds everything the copy holds (the decommission drain's check, ADR 0043 P3). A copy left
+  by other membership moves stays: the #390 roster sweep reads former holders. A crash
+  between the commit and the collection leaves a copy on disk, which costs space, not
+  safety.
+- **Opening costs a short pause.** Re-minting every lease makes each owner re-recover a key
+  on its first touch, as after a failover that moves nothing. Growing also waits for the
+  sweep to stamp the wider set (about a second in the three-node test). Not yet measured
+  under load.
+
 ## Alternatives considered
 
 - **Keep R = 3 and document the difference.** Honest, but it leaves a third of every
