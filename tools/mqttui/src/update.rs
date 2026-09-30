@@ -351,8 +351,26 @@ mod tests {
                 std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
                 p.display().to_string()
             };
+            // A stub is exec'd right after it is written. A sibling test forking in
+            // between inherits the write descriptor until its child execs, and exec of
+            // a file open for writing fails with ETXTBSY (#764). That is the test's
+            // race, not the verifier's answer, so retry it, bounded.
+            let run = |program: &str| {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                loop {
+                    match verify_with(&work, program) {
+                        Err(e)
+                            if e.contains("Text file busy")
+                                && std::time::Instant::now() < deadline =>
+                        {
+                            std::thread::sleep(std::time::Duration::from_millis(20));
+                        }
+                        result => return result,
+                    }
+                }
+            };
             let refuser = stub("refuser", "echo 'stub: signature refused' >&2\nexit 1\n");
-            let err = verify_with(&work, &refuser).expect_err("garbage must never verify");
+            let err = run(&refuser).expect_err("garbage must never verify");
             assert!(
                 err.contains("FAILED"),
                 "the error must say what happened: {err}"
@@ -383,8 +401,7 @@ esac
 exit 0
 "#,
             );
-            verify_with(&work, &accepter)
-                .expect("a verifier that accepts must verify — and be handed both pins");
+            run(&accepter).expect("a verifier that accepts must verify — and be handed both pins");
         }
 
         // The strong form, when the environment allows it: the REAL cosign must refuse the
