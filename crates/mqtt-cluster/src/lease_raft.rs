@@ -99,8 +99,38 @@ pub const REPLICAS_MAX: u8 = 7;
 pub struct ReplicationRecord {
     /// The committed factor; `None` for a cluster that never set one.
     pub replicas: Option<u8>,
-    /// A live change in progress, `(from, to)`: the joint phase.
-    pub change: Option<(u8, u8)>,
+    /// A live change in progress: the joint phase.
+    pub change: Option<ReplicaChange>,
+}
+
+/// An open live change of the replication factor (ADR 0080 §4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplicaChange {
+    /// The factor in force when the change opened.
+    pub from: u8,
+    /// The factor being moved to.
+    pub to: u8,
+    /// The highest epoch minted before the change opened. Opening it re-mints
+    /// every lease above this, so an entry written at a higher epoch was written by
+    /// an owner that already applied the joint quorum rule. Only entries at or
+    /// below it can sit on too few of the new set, and only they need checking
+    /// before the switch.
+    pub since: Epoch,
+}
+
+impl ReplicaChange {
+    /// The width of the joint replica set: the larger factor. The smaller set is
+    /// its prefix (`owner_led_replica_set` truncates one fixed order).
+    #[must_use]
+    pub fn joint_width(&self) -> u8 {
+        self.from.max(self.to)
+    }
+
+    /// The width of the prefix whose quorum a joint write also needs.
+    #[must_use]
+    pub fn prefix_width(&self) -> u8 {
+        self.from.min(self.to)
+    }
 }
 
 impl ReplicationRecord {
@@ -121,6 +151,11 @@ impl ReplicationRecord {
         (REPLICAS_MIN..=REPLICAS_MAX).contains(&r)
     }
 
+    /// Whether a `BeginReplicaChange { from, to }` would open a change.
+    fn can_begin(&self, from: u8, to: u8) -> bool {
+        self.change.is_none() && from == self.effective() && Self::valid(to) && to != from
+    }
+
     /// Apply one replication command. Deterministic, as every state-machine
     /// transition must be: a command whose precondition does not hold is a no-op
     /// on every replica alike, never an error.
@@ -131,22 +166,16 @@ impl ReplicationRecord {
                     self.replicas = Some(r);
                 }
             }
-            LeaseRequest::BeginReplicaChange { from, to } => {
-                if self.change.is_none()
-                    && from == self.effective()
-                    && Self::valid(to)
-                    && to != from
-                {
-                    self.change = Some((from, to));
-                }
-            }
             LeaseRequest::CommitReplicaChange { to } => {
-                if self.change.is_some_and(|(_, target)| target == to) {
+                if self.change.is_some_and(|c| c.to == to) {
                     self.replicas = Some(to);
                     self.change = None;
                 }
             }
-            LeaseRequest::Assign { .. } | LeaseRequest::AssignMany { .. } => {}
+            // A change is opened by `LeaseMap::apply`, which also re-mints the leases.
+            LeaseRequest::BeginReplicaChange { .. }
+            | LeaseRequest::Assign { .. }
+            | LeaseRequest::AssignMany { .. } => {}
         }
     }
 }
@@ -249,9 +278,30 @@ impl LeaseMap {
                 .iter()
                 .map(|(group, node)| self.assign_one(*group, *node))
                 .last(),
-            LeaseRequest::SetReplicas { .. }
-            | LeaseRequest::BeginReplicaChange { .. }
-            | LeaseRequest::CommitReplicaChange { .. } => {
+            LeaseRequest::BeginReplicaChange { from, to } => {
+                if !self.replication.can_begin(*from, *to) {
+                    return None;
+                }
+                // Open the joint phase and re-mint every lease to its holder in
+                // the same entry: no state holds the change without the fresh
+                // epochs, so an owner that reads an epoch above `since` reads the
+                // joint rule with it, and every entry it writes is joint-durable.
+                let since = self.next_epoch;
+                self.replication.change = Some(ReplicaChange {
+                    from: *from,
+                    to: *to,
+                    since,
+                });
+                let held: Vec<(GroupId, RaftNodeId)> = self
+                    .leases
+                    .iter()
+                    .map(|(group, rec)| (*group, rec.holder))
+                    .collect();
+                held.into_iter()
+                    .map(|(group, node)| self.assign_one(group, node))
+                    .last()
+            }
+            LeaseRequest::SetReplicas { .. } | LeaseRequest::CommitReplicaChange { .. } => {
                 self.replication.apply(req);
                 None
             }
@@ -314,7 +364,7 @@ openraft::declare_raft_types!(
 #[cfg(test)]
 mod tests {
     use super::{
-        decode_state, encode_state, LeaseConfig, LeaseMap, LeaseRequest, RaftNodeId,
+        decode_state, encode_state, LeaseConfig, LeaseMap, LeaseRequest, RaftNodeId, ReplicaChange,
         ReplicationRecord, REPLICAS_LEGACY,
     };
 
@@ -487,9 +537,14 @@ mod tests {
             "a change to itself is no change"
         );
         m.apply(&LeaseRequest::BeginReplicaChange { from: 3, to: 2 });
-        assert_eq!(m.replication().change, Some((3, 2)));
+        let open = Some(ReplicaChange {
+            from: 3,
+            to: 2,
+            since: 0,
+        });
+        assert_eq!(m.replication().change, open);
         m.apply(&LeaseRequest::BeginReplicaChange { from: 3, to: 5 });
-        assert_eq!(m.replication().change, Some((3, 2)), "changes do not stack");
+        assert_eq!(m.replication().change, open, "changes do not stack");
         m.apply(&LeaseRequest::SetReplicas { r: 5 });
         assert_eq!(
             m.replication().replicas,
@@ -497,11 +552,7 @@ mod tests {
             "no founding during a change"
         );
         m.apply(&LeaseRequest::CommitReplicaChange { to: 5 });
-        assert_eq!(
-            m.replication().change,
-            Some((3, 2)),
-            "commit names the open target"
-        );
+        assert_eq!(m.replication().change, open, "commit names the open target");
         m.apply(&LeaseRequest::CommitReplicaChange { to: 2 });
         assert_eq!(
             m.replication(),
@@ -512,16 +563,42 @@ mod tests {
         );
     }
 
-    /// Replication commands mint no epoch and touch no lease.
+    /// Founding and committing mint no epoch and touch no lease.
     #[test]
-    fn replication_commands_leave_the_lease_table_alone() {
+    fn founding_and_commit_leave_the_lease_table_alone() {
         let mut m = LeaseMap::new();
         m.apply(&assign(1, 10));
         m.apply(&LeaseRequest::SetReplicas { r: 2 });
-        m.apply(&LeaseRequest::BeginReplicaChange { from: 2, to: 3 });
-        m.apply(&LeaseRequest::CommitReplicaChange { to: 3 });
         assert_eq!(m.high_epoch(), 1);
+        m.apply(&LeaseRequest::BeginReplicaChange { from: 2, to: 3 });
+        let minted = m.high_epoch();
+        m.apply(&LeaseRequest::CommitReplicaChange { to: 3 });
+        assert_eq!(m.high_epoch(), minted);
         assert_eq!(m.get(1).unwrap().holder, 10);
+    }
+
+    /// ADR 0080 §4: opening a change re-mints every lease to its holder above
+    /// `since` in the same entry, so every epoch above `since` carries the joint
+    /// rule; a refused open mints nothing.
+    #[test]
+    fn opening_a_change_re_mints_every_lease_above_since() {
+        let mut m = LeaseMap::new();
+        m.apply(&assign(1, 10));
+        m.apply(&assign(2, 20));
+        m.apply(&assign(1, 30));
+        let before = m.high_epoch();
+        m.apply(&LeaseRequest::BeginReplicaChange { from: 2, to: 3 });
+        assert_eq!(m.high_epoch(), before, "a refused open mints nothing");
+        let last = m.apply(&LeaseRequest::BeginReplicaChange { from: 3, to: 2 });
+        let change = m.replication().change.expect("open");
+        assert_eq!(change.since, before);
+        assert_eq!((change.joint_width(), change.prefix_width()), (3, 2));
+        for (group, holder) in [(1, 30), (2, 20)] {
+            let lease = m.get(group).unwrap();
+            assert_eq!(lease.holder, holder, "the holder is kept");
+            assert!(lease.epoch > change.since, "group {group} re-minted");
+        }
+        assert_eq!(last.map(|l| l.epoch), Some(m.high_epoch()));
     }
 
     /// The rolling-upgrade contract (ADR 0080 §1): while no factor is recorded the

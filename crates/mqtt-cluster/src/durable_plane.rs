@@ -118,6 +118,9 @@ pub struct DurablePlane {
     /// [`lease_group_ready`](Self::lease_group_ready) so a learner-owner
     /// reports ready.
     ownership_domain_all: Arc<std::sync::atomic::AtomicBool>,
+    /// A live replication-factor change (ADR 0080 §4): the reload's proposal in,
+    /// progress out to `/statusz`.
+    replica_change: Arc<crate::replica_change::ReplicaChangeControl>,
 }
 
 /// Aborts a spawned task when dropped — used to bound the replica-writer's lifetime to the
@@ -172,6 +175,7 @@ impl DurablePlane {
             _writers: Arc::new(aborts),
             writer_stats,
             ownership_domain_all: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            replica_change: Arc::new(crate::replica_change::ReplicaChangeControl::new()),
         }
     }
 
@@ -180,6 +184,13 @@ impl DurablePlane {
     pub fn with_ownership_domain_all(mut self, flag: Arc<std::sync::atomic::AtomicBool>) -> Self {
         self.ownership_domain_all = flag;
         self
+    }
+
+    /// The live replication-factor change control (ADR 0080 §4): the config
+    /// reload proposes through it and `/statusz` reads its progress.
+    #[must_use]
+    pub fn replica_change(&self) -> Arc<crate::replica_change::ReplicaChangeControl> {
+        self.replica_change.clone()
     }
 
     /// The per-shard senders into the durable-write serializers, for the OWNER
@@ -378,6 +389,34 @@ impl DurablePlane {
                 !set.contains(&local) && r.caught_up_set(*g).is_some_and(|s| !s.is_empty())
             })
             .map(|(g, _)| g)
+            .collect()
+    }
+
+    /// Keys this node still holds a copy of although the key's group's current
+    /// replica set excludes it. After a committed shrink of the replication
+    /// factor these are collected (ADR 0080 §4); other membership moves leave
+    /// them in place.
+    #[must_use]
+    pub fn copies_outside_custody(&self) -> Vec<String> {
+        let (local, sets): (NodeId, Vec<Vec<NodeId>>) = {
+            let p = self
+                .placement
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let sets = (0..crate::placement::NUM_GROUPS)
+                .map(|g| p.group_replica_set(g))
+                .collect();
+            (p.local().clone(), sets)
+        };
+        self.lock_replicas()
+            .keys()
+            .into_iter()
+            .filter(|k| {
+                usize::try_from(crate::placement::group_of_key(k))
+                    .ok()
+                    .and_then(|g| sets.get(g))
+                    .is_some_and(|set| !set.contains(&local))
+            })
             .collect()
     }
 

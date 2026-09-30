@@ -1128,6 +1128,44 @@ impl ReplicaState {
         true
     }
 
+    /// Raise every placement group's fence to at least `floor`, durably (ADR 0080
+    /// §4). A replication-factor change re-mints every lease above its `since`, so
+    /// once this node has applied it, an op at `since` or below comes from a log
+    /// built before the change, counting acks by the old rule: refusing it here is
+    /// what keeps an owner that has not applied the change yet from committing
+    /// on the old quorum alone. Returns whether the raised fences were stored.
+    pub fn raise_fences(&mut self, floor: Epoch) -> bool {
+        let advanced: Fences = (0..crate::placement::NUM_GROUPS)
+            .filter(|g| self.fences.get(g).copied().unwrap_or(0) < floor)
+            .map(|g| (g, floor))
+            .collect();
+        if advanced.is_empty() {
+            return true;
+        }
+        let to_fence = self.unpersisted(&advanced);
+        if let Err(e) = self.persist_batch(&to_fence, &[]) {
+            tracing::warn!(error = %e, "raising the replica fences failed; retrying");
+            return false;
+        }
+        self.persisted_fences.extend(to_fence);
+        self.fences.extend(advanced);
+        true
+    }
+
+    /// Delete this node's copy of `key` (ADR 0080 §4 collection): a `Remove`
+    /// applied at the group's own fence, so it persists like any op and leaves
+    /// the fence where it was: a later owner's writes are judged exactly as
+    /// before. Returns whether it was stored.
+    pub fn forget(&mut self, key: &str) -> bool {
+        let fence = self.fence_for_key(key);
+        self.apply(
+            fence,
+            &ReplOp::Remove {
+                key: key.to_string(),
+            },
+        )
+    }
+
     /// Whether `op` is an Append for an offset already held at a higher
     /// `(epoch, seq)` — a late duplicate of a superseded attempt (ADR 0042 T7).
     fn is_stale_attempt(&self, epoch: Epoch, op: &ReplOp) -> bool {
@@ -1616,6 +1654,98 @@ enum LocalAck {
     Pending(oneshot::Receiver<bool>),
 }
 
+/// The write (and recovery-read) quorum of one group's ordered replica set
+/// (ADR 0080 §4). Normally a majority of the set. While a replication-factor
+/// change is open, the set is the larger of the old and new sets and the smaller
+/// is its prefix; an op then needs a majority of the whole set **and** a
+/// majority of the prefix (the Raft joint-consensus rule), so it intersects any
+/// later quorum of either set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Quorum {
+    /// Whether each member of the ordered set lies in the prefix.
+    in_prefix: Vec<bool>,
+    /// Acks needed from the whole set.
+    need: usize,
+    /// Acks needed from the prefix; 0 outside a change.
+    need_prefix: usize,
+}
+
+impl Quorum {
+    /// A majority of a set of `width` members.
+    #[must_use]
+    pub fn majority(width: usize) -> Self {
+        Self {
+            in_prefix: vec![true; width],
+            need: width / 2 + 1,
+            need_prefix: 0,
+        }
+    }
+
+    /// The joint rule over a set of `width` members whose first `prefix` form the
+    /// other set. A prefix as wide as the set is just a majority.
+    #[must_use]
+    pub fn joint(width: usize, prefix: usize) -> Self {
+        let prefix = prefix.min(width);
+        if prefix == width {
+            return Self::majority(width);
+        }
+        Self {
+            in_prefix: (0..width).map(|i| i < prefix).collect(),
+            need: width / 2 + 1,
+            need_prefix: prefix / 2 + 1,
+        }
+    }
+
+    /// Acks needed from the whole set.
+    #[must_use]
+    pub fn need(&self) -> usize {
+        self.need
+    }
+
+    /// Whether the member at `index` of the ordered set lies in the prefix.
+    #[must_use]
+    pub fn in_prefix(&self, index: usize) -> bool {
+        self.in_prefix.get(index).copied().unwrap_or(false)
+    }
+
+    /// Whether a joint rule is in force.
+    #[must_use]
+    pub fn is_joint(&self) -> bool {
+        self.need_prefix > 0
+    }
+
+    /// Whether `tally` meets the rule.
+    #[must_use]
+    pub fn met(&self, tally: Tally) -> bool {
+        tally.all >= self.need && tally.prefix >= self.need_prefix
+    }
+
+    /// Whether the members at `indices` of the ordered set meet the rule.
+    #[must_use]
+    pub fn met_by(&self, indices: impl IntoIterator<Item = usize>) -> bool {
+        let mut tally = Tally::default();
+        for i in indices {
+            tally.add(self.in_prefix(i));
+        }
+        self.met(tally)
+    }
+}
+
+/// Acks counted toward a [`Quorum`]: all of them, and those from the prefix.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Tally {
+    all: usize,
+    prefix: usize,
+}
+
+impl Tally {
+    /// Count one ack from a member inside or outside the prefix.
+    pub fn add(&mut self, in_prefix: bool) {
+        self.all += 1;
+        self.prefix += usize::from(in_prefix);
+    }
+}
+
 /// The lease-holder's quorum-replicated [`ReplicatedLog`].
 ///
 /// Constructed for the node that currently holds the group's [`OwnershipLease`];
@@ -1625,7 +1755,11 @@ pub struct ClusterLog<T: ReplicaTransport> {
     local: NodeId,
     lease: OwnershipLease,
     followers: Vec<NodeId>,
-    quorum: usize,
+    /// Whether the owner, and each of `followers` by index, lies in the joint
+    /// prefix; with `quorum`, how acks are counted (ADR 0080 §4).
+    local_in_prefix: bool,
+    followers_in_prefix: Vec<bool>,
+    quorum: Quorum,
     transport: T,
     /// Arc'd so a pipelined append's durability wait (ADR 0075) can carry a
     /// `'static` handle to the commit watermark without borrowing the log.
@@ -1679,23 +1813,56 @@ impl<T: ReplicaTransport> ClusterLog<T> {
             lease.holder, local,
             "a ClusterLog is the lease-holder's log"
         );
-        let quorum = replica_set.len() / 2 + 1;
-        let followers = replica_set
-            .iter()
-            .filter(|n| **n != local)
-            .cloned()
-            .collect();
-        Self {
+        let mut log = Self {
             local,
             lease,
-            followers,
-            quorum,
+            followers: Vec::new(),
+            local_in_prefix: true,
+            followers_in_prefix: Vec::new(),
+            quorum: Quorum::majority(replica_set.len()),
             transport,
             state: Arc::new(tokio::sync::Mutex::new(BTreeMap::new())),
             commit_notify: Arc::new(tokio::sync::Notify::new()),
             local_store: None,
             writer: None,
+        };
+        log.set_quorum(replica_set, Quorum::majority(replica_set.len()));
+        log
+    }
+
+    /// Place `replica_set`'s members under `quorum`: the followers in set order,
+    /// and which of them (and the owner) lie in the joint prefix.
+    fn set_quorum(&mut self, replica_set: &[NodeId], quorum: Quorum) {
+        self.followers.clear();
+        self.followers_in_prefix.clear();
+        for (i, node) in replica_set.iter().enumerate() {
+            if *node == self.local {
+                self.local_in_prefix = quorum.in_prefix(i);
+            } else {
+                self.followers.push(node.clone());
+                self.followers_in_prefix.push(quorum.in_prefix(i));
+            }
         }
+        self.quorum = quorum;
+    }
+
+    /// Count this log's writes and re-commits under the joint rule of a live
+    /// replication-factor change (ADR 0080 §4): `replica_set` (the one this log
+    /// was built over) is the larger set, and its first `prefix` members the
+    /// smaller one.
+    #[must_use]
+    pub fn with_joint_prefix(mut self, replica_set: &[NodeId], prefix: usize) -> Self {
+        self.set_quorum(replica_set, Quorum::joint(replica_set.len(), prefix));
+        self
+    }
+
+    /// A fresh tally holding the owner's own ack if `local` is true.
+    fn tally_with_local(&self, local: bool) -> Tally {
+        let mut tally = Tally::default();
+        if local {
+            tally.add(self.local_in_prefix);
+        }
+        tally
     }
 
     /// Attach the node's own durable replica copy (ADR 0042 T8): see the field
@@ -1806,12 +1973,6 @@ impl<T: ReplicaTransport> ClusterLog<T> {
             lease.holder, local,
             "a ClusterLog is the lease-holder's log"
         );
-        let quorum = replica_set.len() / 2 + 1;
-        let followers = replica_set
-            .iter()
-            .filter(|n| **n != local)
-            .cloned()
-            .collect();
         let mut state = BTreeMap::new();
         for (key, entries) in logs {
             let mut ks = KeyState::default();
@@ -1829,23 +1990,33 @@ impl<T: ReplicaTransport> ClusterLog<T> {
             ks.assigned = ks.committed;
             state.insert(key, ks);
         }
-        Self {
+        let mut log = Self {
             local,
             lease,
-            followers,
-            quorum,
+            followers: Vec::new(),
+            local_in_prefix: true,
+            followers_in_prefix: Vec::new(),
+            quorum: Quorum::majority(replica_set.len()),
             transport,
             state: Arc::new(tokio::sync::Mutex::new(state)),
             commit_notify: Arc::new(tokio::sync::Notify::new()),
             local_store: None,
             writer: None,
-        }
+        };
+        log.set_quorum(replica_set, Quorum::majority(replica_set.len()));
+        log
     }
 
-    /// The quorum size for this group.
+    /// The acks a write needs from the whole replica set.
     #[must_use]
     pub fn quorum(&self) -> usize {
-        self.quorum
+        self.quorum.need()
+    }
+
+    /// The group's quorum rule, joint while a factor change is open.
+    #[must_use]
+    pub fn quorum_rule(&self) -> &Quorum {
+        &self.quorum
     }
 
     /// The leadership epoch this log writes at (its lease's epoch).
@@ -2107,21 +2278,21 @@ impl<T: ReplicaTransport + Clone + 'static> ClusterLog<T> {
                 key: key.to_string(),
                 up_to: 0,
             };
-            let mut acks = usize::from(self.local_ack(self.lease.epoch, &fence).await);
+            let mut acks = self.tally_with_local(self.local_ack(self.lease.epoch, &fence).await);
             let mut inflight = tokio::task::JoinSet::new();
-            for follower in &self.followers {
+            for (f, follower) in self.followers.iter().enumerate() {
                 let transport = self.transport.clone();
                 let follower = follower.clone();
                 let epoch = self.lease.epoch;
                 let op = fence.clone();
-                inflight.spawn(async move { transport.deliver(&follower, epoch, &op).await });
+                inflight.spawn(async move { (f, transport.deliver(&follower, epoch, &op).await) });
             }
             while let Some(res) = inflight.join_next().await {
-                if let Ok(true) = res {
-                    acks += 1;
+                if let Ok((f, true)) = res {
+                    acks.add(self.followers_in_prefix[f]);
                 }
             }
-            return if acks >= self.quorum {
+            return if self.quorum.met(acks) {
                 Ok(())
             } else {
                 tracing::warn!(
@@ -2146,29 +2317,32 @@ impl<T: ReplicaTransport + Clone + 'static> ClusterLog<T> {
             seq: entry.seq,
             record: entry.record.clone(),
         };
-        let mut acks: Vec<usize> = Vec::with_capacity(entries.len());
+        let mut acks: Vec<Tally> = Vec::with_capacity(entries.len());
         for (i, entry) in entries.iter().enumerate() {
-            acks.push(usize::from(
-                self.local_ack(self.lease.epoch, &recommit_op(i, entry))
-                    .await,
-            ));
+            acks.push(
+                self.tally_with_local(
+                    self.local_ack(self.lease.epoch, &recommit_op(i, entry))
+                        .await,
+                ),
+            );
         }
         let mut inflight = tokio::task::JoinSet::new();
-        for follower in &self.followers {
+        for (f, follower) in self.followers.iter().enumerate() {
             for (i, entry) in entries.iter().enumerate() {
                 let transport = self.transport.clone();
                 let follower = follower.clone();
                 let epoch = self.lease.epoch;
                 let op = recommit_op(i, entry);
-                inflight.spawn(async move { (i, transport.deliver(&follower, epoch, &op).await) });
+                inflight
+                    .spawn(async move { (i, f, transport.deliver(&follower, epoch, &op).await) });
             }
         }
         while let Some(res) = inflight.join_next().await {
-            if let Ok((i, true)) = res {
-                acks[i] += 1;
+            if let Ok((i, f, true)) = res {
+                acks[i].add(self.followers_in_prefix[f]);
             }
         }
-        if acks.iter().all(|a| *a >= self.quorum) {
+        if acks.iter().all(|a| self.quorum.met(*a)) {
             Ok(())
         } else {
             tracing::warn!(
@@ -2326,10 +2500,7 @@ impl<T: ReplicaTransport + Clone + 'static> ReplicatedLog for ClusterLog<T> {
         // replication to followers continues detached, best-effort. `Relaxed`
         // is an ACK-GATE tier handled above this layer; here it appends with
         // full quorum semantics, exactly like `Quorum`.
-        let required = match tier {
-            DurabilityTier::Local => 1,
-            DurabilityTier::Quorum | DurabilityTier::Relaxed => self.quorum,
-        };
+        let local_only = matches!(tier, DurabilityTier::Local);
         // SUBMIT (ADR 0075): under a SHORT lock — assign the next offset,
         // stage the entry, and hand the op to the shared writer, whose FIFO
         // then preserves same-key offset order. No durability is awaited here,
@@ -2368,8 +2539,10 @@ impl<T: ReplicaTransport + Clone + 'static> ReplicatedLog for ClusterLog<T> {
         let notify = Arc::clone(&self.commit_notify);
         let transport = self.transport.clone();
         let followers = self.followers.clone();
+        let followers_in_prefix = self.followers_in_prefix.clone();
+        let local_in_prefix = self.local_in_prefix;
         let epoch = self.lease.epoch;
-        let quorum = self.quorum;
+        let quorum = self.quorum.clone();
         let key = key.clone();
         PendingAppend::new(async move {
             // Fan out to every follower **concurrently** and count acks until
@@ -2379,29 +2552,43 @@ impl<T: ReplicaTransport + Clone + 'static> ReplicatedLog for ClusterLog<T> {
             // requirement is met the remaining deliveries are abandoned (their
             // frames were already sent, so a reachable replica still applies
             // them for best-effort spread).
-            let mut acks = usize::from(match local {
+            let local_durable = match local {
                 LocalAck::Done(b) => b,
                 LocalAck::Pending(rx) => rx.await.unwrap_or(false),
-            });
-            if acks < required {
+            };
+            let mut acks = Tally::default();
+            if local_durable {
+                acks.add(local_in_prefix);
+            }
+            // `Local` needs the owner's own copy only; the others the group's
+            // quorum rule, joint while a factor change is open (ADR 0080 §4).
+            let met_now = |acks: Tally| {
+                if local_only {
+                    acks.all >= 1
+                } else {
+                    quorum.met(acks)
+                }
+            };
+            if !met_now(acks) {
                 let mut inflight = tokio::task::JoinSet::new();
-                for follower in &followers {
+                for (f, follower) in followers.iter().enumerate() {
                     let transport = transport.clone();
                     let follower = follower.clone();
                     let op = op.clone();
-                    inflight.spawn(async move { transport.deliver(&follower, epoch, &op).await });
+                    inflight
+                        .spawn(async move { (f, transport.deliver(&follower, epoch, &op).await) });
                 }
-                while acks < required {
+                while !met_now(acks) {
                     match inflight.join_next().await {
-                        Some(Ok(true)) => acks += 1,
+                        Some(Ok((f, true))) => acks.add(followers_in_prefix[f]),
                         // A reject/unreachable, or a delivery task that failed —
                         // keep waiting for the other followers.
-                        Some(Ok(false) | Err(_)) => {}
+                        Some(Ok((_, false)) | Err(_)) => {}
                         // Every follower has reported; not reached.
                         None => break,
                     }
                 }
-            } else if required < quorum {
+            } else if local_only {
                 // A Local-tier append satisfied by the owner's copy must still
                 // start its replication, detached and best-effort — the entry
                 // reaching followers is what lets a later owner recover it if
@@ -2415,7 +2602,7 @@ impl<T: ReplicaTransport + Clone + 'static> ReplicatedLog for ClusterLog<T> {
                     });
                 }
             }
-            let met = acks >= required;
+            let met = met_now(acks);
 
             // COMMIT, strictly in offset order (ADR 0075): a success is only
             // ever reported at or below the watermark, so an acked append can
@@ -2522,15 +2709,17 @@ impl<T: ReplicaTransport + Clone + 'static> ReplicatedLog for ClusterLog<T> {
             key: key.clone(),
             up_to,
         };
-        let mut acks = usize::from(self.local_ack(self.lease.epoch, &op).await);
-        for follower in &self.followers {
-            acks += usize::from(
-                self.transport
-                    .deliver(follower, self.lease.epoch, &op)
-                    .await,
-            );
+        let mut acks = self.tally_with_local(self.local_ack(self.lease.epoch, &op).await);
+        for (f, follower) in self.followers.iter().enumerate() {
+            if self
+                .transport
+                .deliver(follower, self.lease.epoch, &op)
+                .await
+            {
+                acks.add(self.followers_in_prefix[f]);
+            }
         }
-        if acks < self.quorum {
+        if !self.quorum.met(acks) {
             return Err(ReplError::NoQuorum);
         }
         if let Some(ks) = self.state.lock().await.get_mut(key) {
@@ -3400,6 +3589,104 @@ mod tests {
         let all = log.read(&k, 0, 100).await.unwrap();
         assert_eq!(all.len(), 1);
         assert_eq!(&all[0].record, b"kept");
+    }
+
+    /// ADR 0080 §4: once a node has applied a factor change, an op at or below the
+    /// change's `since` is refused for every group, and an op above it is taken; a
+    /// fence already higher is left alone, and the raise survives a reopen.
+    #[test]
+    fn raised_fences_refuse_every_pre_change_epoch() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("replicas.redb");
+        let ap = |key: &str| ReplOp::Append {
+            key: key.to_string(),
+            offset: 1,
+            seq: 1,
+            record: b"v".to_vec(),
+        };
+        {
+            let mut r = ReplicaState::open(&path).unwrap();
+            assert!(r.apply(12, &ap("q/high")));
+            assert!(r.raise_fences(8));
+            assert!(!r.apply(7, &ap("q/a")), "a pre-change log is refused");
+            assert_eq!(r.fence_for_key("q/high"), 12, "a higher fence is kept");
+        }
+        let mut r = ReplicaState::open(&path).unwrap();
+        assert!(!r.apply(7, &ap("q/b")), "the raise was stored");
+        assert!(r.apply(8, &ap("q/b")));
+    }
+
+    /// ADR 0080 §4: the joint rule needs a majority of the whole set AND of its
+    /// prefix; a prefix as wide as the set is a plain majority.
+    #[test]
+    fn the_joint_rule_needs_both_majorities() {
+        use super::Quorum;
+        // Shrinking 3 → 2: set [a, b, c], prefix [a, b].
+        let shrink = Quorum::joint(3, 2);
+        assert!(shrink.is_joint());
+        assert!(shrink.met_by([0, 1]));
+        assert!(
+            !shrink.met_by([0, 2]),
+            "a majority of 3 but one of the prefix"
+        );
+        assert!(!shrink.met_by([1, 2]));
+        // Growing 3 → 4: set [a, b, c, d], prefix [a, b, c].
+        let grow = Quorum::joint(4, 3);
+        assert_eq!(grow.need(), 3);
+        assert!(grow.met_by([0, 1, 3]));
+        assert!(grow.met_by([1, 2, 3]), "the owner's own ack is not special");
+        assert!(!grow.met_by([0, 3]), "two of four is not a majority");
+        // A membership-truncated set no wider than the prefix: plain majority.
+        assert_eq!(Quorum::joint(2, 3), Quorum::majority(2));
+        assert!(!Quorum::joint(3, 3).is_joint());
+    }
+
+    /// A shrink's joint phase (3 → 2 over [a, b, c]): an append acked by the
+    /// owner and the member being dropped is a majority of the old set but not
+    /// of the new one, so it must not commit; with the kept follower it does.
+    #[tokio::test]
+    async fn a_joint_append_needs_a_quorum_of_the_new_set_too() {
+        let (log, sim, followers) = group(1);
+        let set = vec![n("a"), n("b"), n("c")];
+        let log = log.with_joint_prefix(&set, 2);
+        let k = "x".to_string();
+        sim.down(&followers[0]); // b, the kept follower
+        assert!(matches!(
+            log.append(&k, b"lost".to_vec()).await,
+            Err(mqtt_storage::repl::ReplError::NoQuorum)
+        ));
+        sim.up(&followers[0]);
+        sim.down(&followers[1]); // c, the member being dropped
+        assert_eq!(log.append(&k, b"kept".to_vec()).await.unwrap(), 1);
+        assert_eq!(sim.entries(&followers[0], &k), vec![1]);
+        sim.assert_fencing_held();
+    }
+
+    /// The re-commit and the empty-log fence round count by the same joint rule.
+    #[tokio::test]
+    async fn a_joint_recommit_and_fence_need_a_quorum_of_the_new_set_too() {
+        let (log, sim, followers) = group(5);
+        let set = vec![n("a"), n("b"), n("c")];
+        let log = log.with_joint_prefix(&set, 2);
+        let k = "x".to_string();
+        let base = vec![LogEntry {
+            offset: 1,
+            record: b"acked".to_vec(),
+        }];
+        sim.down(&followers[0]);
+        assert!(matches!(
+            log.recommit_key(&k, &base).await,
+            Err(mqtt_storage::repl::ReplError::NoQuorum)
+        ));
+        assert!(matches!(
+            log.recommit_key("empty", &[]).await,
+            Err(mqtt_storage::repl::ReplError::NoQuorum)
+        ));
+        sim.up(&followers[0]);
+        sim.down(&followers[1]);
+        log.recommit_key(&k, &base).await.unwrap();
+        log.recommit_key("empty", &[]).await.unwrap();
+        sim.assert_fencing_held();
     }
 
     /// ADR 0072 — the LOCAL tier: an append whose publisher chose
