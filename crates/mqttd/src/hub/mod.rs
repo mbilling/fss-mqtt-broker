@@ -3931,8 +3931,8 @@ impl Hub {
         // message whose MQTT 5.0 expiry deadline has passed is dropped, not delivered,
         // and the remaining interval is forwarded on the rest (ADR 0009 §3).
         if !clean_start {
-            let replay = match self.store.pending(&client, 0, REPLAY_LIMIT).await {
-                Ok(pending) => Some(pending),
+            let pending = match self.store.pending(&client, 0, REPLAY_LIMIT).await {
+                Ok(pending) => pending,
                 Err(error) => {
                     // The warm-up in `recover_once` is not a lock: the group's lease
                     // can move, or its log be rebuilt, between it and this read (a
@@ -3940,143 +3940,142 @@ impl Hub {
                     // recovers again and may be refused. Carrying on would leave the
                     // client attached with its queue undelivered until it happened to
                     // reconnect. Close it instead: its reconnect recovers the queue
-                    // and replays it (ADR 0017).
+                    // and replays it (ADR 0017). Return before the QoS 2 orphan work below:
+                    // it would queue PUBRELs and retire work on a closed connection.
                     warn!(client = %client.0, %error,
                           "queued messages could not be read for replay; closing the \
                            connection so the client reconnects and receives them");
                     self.close_for_retry(&client, conn_id).await;
-                    None
+                    return;
                 }
             };
-            if let Some(pending) = replay {
-                let now = self.clock.now_epoch_secs();
-                let mut last = 0;
-                for qm in pending {
-                    last = qm.offset;
-                    // Raise the truncation ceiling for every entry read, so the ones
-                    // dropped below are let go of even though nothing will deliver
-                    // them (#124). Entries that ARE sent additionally become owed, in
-                    // `send_to_client`, and hold the ceiling down until acknowledged.
+            let now = self.clock.now_epoch_secs();
+            let mut last = 0;
+            for qm in pending {
+                last = qm.offset;
+                // Raise the truncation ceiling for every entry read, so the ones
+                // dropped below are let go of even though nothing will deliver
+                // them (#124). Entries that ARE sent additionally become owed, in
+                // `send_to_client`, and hold the ceiling down until acknowledged.
+                self.inflight
+                    .entry(client.clone())
+                    .or_default()
+                    .note_offset(qm.offset);
+                // Still in the in-flight table means this is a client reconnect, not
+                // a broker restart: the DUP resume above already re-sent it under its
+                // original packet id — and for `QoS` 2 possibly as a bare PUBREL,
+                // because the client has acknowledged receipt and only owes the
+                // release. Replaying the PUBLISH here would deliver it twice.
+                if resumed_offsets.contains(&qm.offset) {
+                    debug!(client = %client.0, offset = qm.offset,
+                           "queued message is still in flight in memory; not replaying");
+                    restored.remove(&qm.offset);
+                    continue;
+                }
+                // A broker restart with a durably-recorded id (ADR 0057): resume the
+                // handshake mid-phrase UNDER THE ORIGINAL ID, never through a fresh
+                // allocation. Before PUBREC: the PUBLISH goes out again with DUP and
+                // the id the subscriber may already hold. After PUBREC: a bare
+                // PUBREL — the subscriber has the message; re-publishing it is the
+                // #130 duplicate this table exists to prevent.
+                if let Some((pkid, pubrec_seen)) = restored.remove(&qm.offset) {
+                    let inf = self.inflight.entry(client.clone()).or_default();
+                    inf.orphaned_qos2.remove(&pkid);
+                    inf.orphaned_qos2_cleanup.remove(&pkid);
+                    let state = if pubrec_seen {
+                        OutState::AwaitingPubComp
+                    } else {
+                        OutState::AwaitingPubRec
+                    };
+                    // Restored handshakes still owe their queued delivery. Without
+                    // this, replay's prefix truncate can delete an earlier unacked
+                    // restored message while completing a later one (#577).
                     self.inflight
                         .entry(client.clone())
                         .or_default()
-                        .note_offset(qm.offset);
-                    // Still in the in-flight table means this is a client reconnect, not
-                    // a broker restart: the DUP resume above already re-sent it under its
-                    // original packet id — and for `QoS` 2 possibly as a bare PUBREL,
-                    // because the client has acknowledged receipt and only owes the
-                    // release. Replaying the PUBLISH here would deliver it twice.
-                    if resumed_offsets.contains(&qm.offset) {
-                        debug!(client = %client.0, offset = qm.offset,
-                               "queued message is still in flight in memory; not replaying");
-                        restored.remove(&qm.offset);
+                        .track(qm.offset);
+                    self.inflight
+                        .entry(client.clone())
+                        .or_default()
+                        .pending
+                        .insert(
+                            pkid,
+                            PendingOut {
+                                message: qm.message.clone(),
+                                state,
+                                offset: Some(qm.offset),
+                            },
+                        );
+                    let packet = if pubrec_seen {
+                        Packet::PubRel(pkid.into())
+                    } else {
+                        publish_packet(
+                            &qm.message.topic,
+                            qm.message.payload.clone(),
+                            qm.message.qos,
+                            Some(pkid),
+                            true,
+                            false,
+                            None,
+                            &qm.message.app,
+                            &self.matching_sub_ids(&client, &qm.message.topic),
+                        )
+                    };
+                    let _ = outbound.send(packet);
+                    continue;
+                }
+                // A queued message that only a revoked grant admits is dropped
+                // (ADR 0040 T3): delivering it would leak data the new policy
+                // denies. A topic a surviving grant also matches still replays.
+                if !revoked_grants.is_empty() {
+                    let topic = &qm.message.topic;
+                    let admits = |f: &str| {
+                        let f = parse_shared(f).map_or(f, |(_, inner)| inner);
+                        topic_matches(f, topic)
+                    };
+                    let survives = self
+                        .subs
+                        .get(&client)
+                        .is_some_and(|subs| subs.iter().any(|e| admits(&e.filter)));
+                    if revoked_grants.iter().map(String::as_str).any(admits) && !survives {
+                        debug!(client = %client.0, offset = qm.offset, %topic,
+                               "dropping queued message for a revoked grant (ADR 0040 T3)");
                         continue;
                     }
-                    // A broker restart with a durably-recorded id (ADR 0057): resume the
-                    // handshake mid-phrase UNDER THE ORIGINAL ID, never through a fresh
-                    // allocation. Before PUBREC: the PUBLISH goes out again with DUP and
-                    // the id the subscriber may already hold. After PUBREC: a bare
-                    // PUBREL — the subscriber has the message; re-publishing it is the
-                    // #130 duplicate this table exists to prevent.
-                    if let Some((pkid, pubrec_seen)) = restored.remove(&qm.offset) {
-                        let inf = self.inflight.entry(client.clone()).or_default();
-                        inf.orphaned_qos2.remove(&pkid);
-                        inf.orphaned_qos2_cleanup.remove(&pkid);
-                        let state = if pubrec_seen {
-                            OutState::AwaitingPubComp
-                        } else {
-                            OutState::AwaitingPubRec
-                        };
-                        // Restored handshakes still owe their queued delivery. Without
-                        // this, replay's prefix truncate can delete an earlier unacked
-                        // restored message while completing a later one (#577).
-                        self.inflight
-                            .entry(client.clone())
-                            .or_default()
-                            .track(qm.offset);
-                        self.inflight
-                            .entry(client.clone())
-                            .or_default()
-                            .pending
-                            .insert(
-                                pkid,
-                                PendingOut {
-                                    message: qm.message.clone(),
-                                    state,
-                                    offset: Some(qm.offset),
-                                },
-                            );
-                        let packet = if pubrec_seen {
-                            Packet::PubRel(pkid.into())
-                        } else {
-                            publish_packet(
-                                &qm.message.topic,
-                                qm.message.payload.clone(),
-                                qm.message.qos,
-                                Some(pkid),
-                                true,
-                                false,
-                                None,
-                                &qm.message.app,
-                                &self.matching_sub_ids(&client, &qm.message.topic),
-                            )
-                        };
-                        let _ = outbound.send(packet);
-                        continue;
+                }
+                match qm.expiry_at {
+                    Some(deadline) if deadline <= now => {
+                        debug!(client = %client.0, offset = qm.offset, "dropping expired queued message");
                     }
-                    // A queued message that only a revoked grant admits is dropped
-                    // (ADR 0040 T3): delivering it would leak data the new policy
-                    // denies. A topic a surviving grant also matches still replays.
-                    if !revoked_grants.is_empty() {
-                        let topic = &qm.message.topic;
-                        let admits = |f: &str| {
-                            let f = parse_shared(f).map_or(f, |(_, inner)| inner);
-                            topic_matches(f, topic)
-                        };
-                        let survives = self
-                            .subs
-                            .get(&client)
-                            .is_some_and(|subs| subs.iter().any(|e| admits(&e.filter)));
-                        if revoked_grants.iter().map(String::as_str).any(admits) && !survives {
-                            debug!(client = %client.0, offset = qm.offset, %topic,
-                                   "dropping queued message for a revoked grant (ADR 0040 T3)");
-                            continue;
-                        }
+                    Some(deadline) => {
+                        let remaining = u32::try_from(deadline - now).unwrap_or(u32::MAX);
+                        self.send_to_client(
+                            &client,
+                            &outbound,
+                            &qm.message,
+                            false,
+                            Some(remaining),
+                            Some(qm.offset),
+                        );
                     }
-                    match qm.expiry_at {
-                        Some(deadline) if deadline <= now => {
-                            debug!(client = %client.0, offset = qm.offset, "dropping expired queued message");
-                        }
-                        Some(deadline) => {
-                            let remaining = u32::try_from(deadline - now).unwrap_or(u32::MAX);
-                            self.send_to_client(
-                                &client,
-                                &outbound,
-                                &qm.message,
-                                false,
-                                Some(remaining),
-                                Some(qm.offset),
-                            );
-                        }
-                        None => {
-                            self.send_to_client(
-                                &client,
-                                &outbound,
-                                &qm.message,
-                                false,
-                                None,
-                                Some(qm.offset),
-                            );
-                        }
+                    None => {
+                        self.send_to_client(
+                            &client,
+                            &outbound,
+                            &qm.message,
+                            false,
+                            None,
+                            Some(qm.offset),
+                        );
                     }
                 }
-                if last > 0 {
-                    debug!(client = %client.0, up_to = last, "replayed queued messages");
-                    // Truncate only the entries this replay let go of — a `QoS` > 0
-                    // message that went on the wire is truncated when the subscriber
-                    // acknowledges it, not when it was sent (#124).
-                    self.truncate_acked(&client);
-                }
+            }
+            if last > 0 {
+                debug!(client = %client.0, up_to = last, "replayed queued messages");
+                // Truncate only the entries this replay let go of — a `QoS` > 0
+                // message that went on the wire is truncated when the subscriber
+                // acknowledges it, not when it was sent (#124).
+                self.truncate_acked(&client);
             }
 
             // IDs not matched in this replay window are only POSSIBLE orphans.
