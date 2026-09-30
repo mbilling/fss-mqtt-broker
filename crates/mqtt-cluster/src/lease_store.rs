@@ -204,6 +204,18 @@ impl LeaseStore {
         self.lock().sm.high_epoch()
     }
 
+    /// `group`'s current lease together with the replication record, read from
+    /// ONE applied state (ADR 0080 §4): a lease epoch minted when a factor change
+    /// opened is never seen without that change.
+    #[must_use]
+    pub fn lease_with_replication(
+        &self,
+        group: GroupId,
+    ) -> (Option<LeaseRecord>, ReplicationRecord) {
+        let guard = self.lock();
+        (guard.sm.get(group), guard.sm.replication())
+    }
+
     /// The replication factor in the applied state machine (ADR 0080).
     #[must_use]
     pub fn replication(&self) -> ReplicationRecord {

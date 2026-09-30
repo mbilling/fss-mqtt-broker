@@ -840,12 +840,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let hub_for_apply = hub_tx.clone();
         let audit_for_apply = policy.audit.clone();
+        let replica_change = durable_plane
+            .as_ref()
+            .map(mqtt_cluster::durable_plane::DurablePlane::replica_change);
         reloader.attach_config_source(reload::ConfigSource {
             live: live_config.clone(),
             path: config_path()?,
             precheck: Box::new(runtime_precheck),
             apply: Box::new(move |old, new| {
-                apply_live_config(old, new, &hub_for_apply, &audit_for_apply)
+                apply_live_config(
+                    old,
+                    new,
+                    &hub_for_apply,
+                    &audit_for_apply,
+                    replica_change.as_deref(),
+                )
             }),
         });
     }
@@ -3888,6 +3897,8 @@ fn requires_restart(old: &Config, new: &Config) -> Vec<&'static str> {
         // The admin role lists are read from the live config per request (ADR 0081 §1).
         c.admin.viewers = Vec::new();
         c.admin.operators = Vec::new();
+        // A changed replication factor is proposed to the running cluster (ADR 0080 §4).
+        c.durable.replicas = 0;
         c
     };
     let (o, n) = (mask(old), mask(new));
@@ -3940,11 +3951,31 @@ fn apply_live_config(
     new: &Config,
     hub: &mpsc::UnboundedSender<hub::HubCommand>,
     audit: &Arc<dyn AuditSink>,
+    replica_change: Option<&mqtt_cluster::replica_change::ReplicaChangeControl>,
 ) -> Vec<String> {
     // Quotas are live: push the new set (idempotent when unchanged). precheck guaranteed they
     // build, so this does not error.
     if let Ok(quotas) = quotas_from_config(new) {
         let _ = hub.send(hub::HubCommand::SetQuotas(quotas));
+    }
+    // A changed replication factor is a proposal to the running cluster (ADR 0080 §4): the
+    // lease leader opens the change when the cluster can take it, and `/statusz` shows its
+    // progress or why it was refused or held.
+    if new.durable.replicas != old.durable.replicas {
+        if let Some(control) = replica_change {
+            info!(
+                from = old.durable.replicas,
+                to = new.durable.replicas,
+                "config reload: durable.replicas changed; proposing the new replication \
+                 factor to the cluster (ADR 0080)"
+            );
+            audit.record(
+                "config.reload",
+                None,
+                &format!("durable.replicas proposed: {}", new.durable.replicas),
+            );
+            control.propose(new.durable.replicas);
+        }
     }
     let restart = requires_restart(old, new);
     if !restart.is_empty() {
@@ -5395,9 +5426,11 @@ mod tests {
         live.limits.max_sessions = Some(1000);
         live.admin.viewers = vec!["CN=oncall".into()];
         live.admin.operators = vec!["CN=root".into()];
+        // A changed replication factor is proposed to the cluster (ADR 0080 §4).
+        live.durable.replicas = base.durable.replicas + 1;
         assert!(
             requires_restart(&base, &live).is_empty(),
-            "quotas / allow_anonymous / ACL path / both-factors / admin roles are live"
+            "quotas / allow_anonymous / ACL path / both-factors / admin roles / replicas are live"
         );
 
         // Non-live edits DO require a restart, reported by section.
@@ -5412,6 +5445,24 @@ mod tests {
         assert!(sections.contains(&"cluster"));
         assert!(sections.contains(&"durable"));
         assert!(!sections.contains(&"security"));
+    }
+
+    /// ADR 0080 §4: a reload that changes `durable.replicas` hands the new factor to the
+    /// cluster as a proposal; one that leaves it alone proposes nothing.
+    #[test]
+    fn a_reload_proposes_a_changed_replication_factor() {
+        let base = Config::default();
+        let (hub, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let recorder = std::sync::Arc::new(mqtt_observability::RecordingAuditSink::new());
+        let audit: std::sync::Arc<dyn mqtt_observability::AuditSink> = recorder.clone();
+        let control = mqtt_cluster::replica_change::ReplicaChangeControl::new();
+        super::apply_live_config(&base, &base, &hub, &audit, Some(&control));
+        assert_eq!(control.proposed(), None);
+        let mut changed = base.clone();
+        changed.durable.replicas = 3;
+        super::apply_live_config(&base, &changed, &hub, &audit, Some(&control));
+        assert_eq!(control.proposed(), Some(3));
+        assert_eq!(recorder.kinds(), vec!["config.reload".to_string()]);
     }
 
     /// The config crate validates the spelling; `mqtt_auth` decides what it means. The two

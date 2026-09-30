@@ -111,6 +111,15 @@ impl LeaseAssigner {
         self.founding.as_ref().map(|f| f.replicas)
     }
 
+    /// Whether every member speaks the replication-factor protocol, so a factor
+    /// change may be proposed (ADR 0080 §4). False without a founding setting.
+    #[must_use]
+    pub fn replication_capable(&self) -> bool {
+        self.founding
+            .as_ref()
+            .is_some_and(|f| f.capable.load(std::sync::atomic::Ordering::Acquire))
+    }
+
     /// On a FRESH cluster — no lease ever minted, no factor recorded — commit the
     /// configured factor before anything is assigned, so no durable write is ever
     /// made under another one. Returns `false` while the first assignment must

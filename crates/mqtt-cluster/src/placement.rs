@@ -143,6 +143,10 @@ impl Clone for ReplicaSetMemo {
 pub struct Placement {
     local: NodeId,
     replicas: usize,
+    /// While a live replication-factor change is open (ADR 0080 §4): the width of
+    /// the smaller of the old and new sets, a prefix of every group's replica set
+    /// (which `replicas` then sizes to the larger). `None` outside a change.
+    joint_prefix: Option<usize>,
     /// Nodes eligible to own sessions: this node plus non-`Dead` peers. A
     /// `BTreeSet` keeps the derived node list deterministic across calls.
     eligible: BTreeSet<NodeId>,
@@ -290,6 +294,7 @@ impl Placement {
         Self {
             local,
             replicas: replicas.max(1),
+            joint_prefix: None,
             eligible,
             voters: BTreeSet::new(),
             lease_owners: BTreeMap::new(),
@@ -441,6 +446,23 @@ impl Placement {
         self.replicas = replicas;
         self.ring_version += 1;
         true
+    }
+
+    /// Adopt the committed replication record (ADR 0080): `width` sizes every
+    /// replica set — the larger factor while a change is open — and `prefix` is
+    /// the smaller factor then, `None` otherwise. Returns whether either changed.
+    pub fn set_replication(&mut self, width: usize, prefix: Option<usize>) -> bool {
+        let widened = self.set_replicas(width);
+        let prefix = prefix.map(|p| p.max(1)).filter(|p| *p < self.replicas);
+        let reprefixed = prefix != self.joint_prefix;
+        self.joint_prefix = prefix;
+        widened || reprefixed
+    }
+
+    /// The joint prefix width while a replication-factor change is open.
+    #[must_use]
+    pub fn joint_prefix(&self) -> Option<usize> {
+        self.joint_prefix
     }
 
     /// Push the durable raft membership roster (issue #229): `known` are the
@@ -719,10 +741,22 @@ impl Placement {
         nodes: &[NodeId],
         owner: NodeId,
     ) -> Vec<NodeId> {
-        let mut set = hrw::replica_set(group_key(group).as_bytes(), nodes, self.replicas);
+        Self::owner_led_set_of_width(group, nodes, owner, self.replicas)
+    }
+
+    /// [`owner_led_replica_set`](Self::owner_led_replica_set) at an explicit
+    /// width. One fixed order truncated, so a narrower set is always a prefix of a
+    /// wider one over the same nodes and owner (ADR 0080 §4 relies on it).
+    fn owner_led_set_of_width(
+        group: GroupId,
+        nodes: &[NodeId],
+        owner: NodeId,
+        width: usize,
+    ) -> Vec<NodeId> {
+        let mut set = hrw::replica_set(group_key(group).as_bytes(), nodes, width);
         set.retain(|n| n != &owner);
         set.insert(0, owner);
-        set.truncate(self.replicas.max(1));
+        set.truncate(width.max(1));
         set
     }
 
@@ -803,6 +837,18 @@ impl Placement {
         let set = self.owner_led_replica_set(group, &self.nodes(), self.group_owner(group));
         self.memo_put(group, &set);
         set
+    }
+
+    /// [`group_replica_set`](Self::group_replica_set) at an explicit `width` — the
+    /// data path's form, which sizes a group's set by the replication record it
+    /// read with the group's lease epoch rather than by the factor this placement
+    /// last adopted (ADR 0080 §4). Memoised only at the adopted width.
+    #[must_use]
+    pub fn group_replica_set_of_width(&self, group: GroupId, width: usize) -> Vec<NodeId> {
+        if width.max(1) == self.replicas {
+            return self.group_replica_set(group);
+        }
+        Self::owner_led_set_of_width(group, &self.nodes(), self.group_owner(group), width)
     }
 
     /// Whether this node holds placement `group`'s committed lease (its actual owner).
@@ -1332,6 +1378,42 @@ mod tests {
                 "group {g} replica set missing its owner"
             );
         }
+    }
+
+    /// ADR 0080 §4 rests on this: for every group, the replica set at a smaller
+    /// factor is a prefix of the set at a larger one, including a committed owner
+    /// that HRW would not rank first and a set truncated by the member count.
+    #[test]
+    fn a_narrower_replica_set_is_a_prefix_of_a_wider_one() {
+        use super::NUM_GROUPS;
+        let p = ring("a", &["b", "c", "d", "e"]);
+        let mut leased = p.clone();
+        leased.set_lease_owners((0..NUM_GROUPS).map(|g| (g, node("e"))).collect());
+        for p in [&p, &leased] {
+            for group in 0..NUM_GROUPS {
+                for narrow in 1..=6 {
+                    for wide in narrow..=7 {
+                        let small = p.group_replica_set_of_width(group, narrow);
+                        let large = p.group_replica_set_of_width(group, wide);
+                        assert_eq!(small[..], large[..small.len()], "group {group}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// The joint prefix is adopted beside the width and dropped once the change
+    /// closes; a prefix no narrower than the set is no joint phase.
+    #[test]
+    fn the_joint_prefix_follows_the_replication_record() {
+        let mut p = ring("a", &["b", "c"]);
+        assert!(p.set_replication(3, Some(2)));
+        assert_eq!((p.desired_replicas(), p.joint_prefix()), (3, Some(2)));
+        assert!(!p.set_replication(3, Some(2)), "no change");
+        assert!(p.set_replication(2, None));
+        assert_eq!((p.desired_replicas(), p.joint_prefix()), (2, None));
+        assert!(!p.set_replication(2, Some(2)));
+        assert_eq!(p.joint_prefix(), None);
     }
 
     /// Ownership is voter-bounded, but data replication still spans learners —

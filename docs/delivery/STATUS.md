@@ -214,7 +214,7 @@
 
 **0080 — # 0080. The replication factor is cluster state: configurable, default 2, changeable live**
 
-- `0080-T5` ⬜ planned ([#704](https://github.com/mbilling/fss-mqtt-broker/issues/704)): "Change R on a running cluster: joint phase, catch-up, switch, collect" — "Config reload or admin API proposes; refused below R' eligible nodes or while a change runs; progress on /statusz."
+- `0080-T5` ⬜ planned ([#704](https://github.com/mbilling/fss-mqtt-broker/issues/704)): "Change R on a running cluster: joint phase, catch-up, switch, collect" — "Built, in review: a reload of durable.replicas proposes; the lease leader opens the change (re-minting every lease above `since`), verifies every pre-change entry is on a majority of the new sets, and commits; joint quorums in appends, re-commits and recovery; a shrink collects the dropped copies; progress on /statusz. Flipped to done in a follow-up PR."
 - `0080-T6` ⬜ planned ([#705](https://github.com/mbilling/fss-mqtt-broker/issues/705)): "Evidence: R=2 against R=3 on the calibration shape (paid)" — "3 × CCX23, durable QoS 1, log store, one provisioning. Expected ~1.5x the durable ceiling at N=3."
 
 **0081 — # 0081. An authenticated admin API: reads cluster-wide, actions audited, config stays in the file**

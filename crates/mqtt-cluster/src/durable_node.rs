@@ -28,12 +28,16 @@ use crate::durable_plane::DurablePlane;
 use crate::lease_assign::LeaseAssigner;
 use crate::lease_group::{config as lease_config, LeaseRaft};
 use crate::lease_membership::{apply_action, raft_view, FailureDomain, MembershipReconciler};
-use crate::lease_raft::{GroupId, RaftNodeId};
+use crate::lease_raft::{GroupId, LeaseRequest, RaftNodeId, ReplicaChange, ReplicationRecord};
 use crate::lease_store::LeaseStore;
 use crate::node_registry::raft_id;
 use crate::placement::{group_of_key, Placement, NUM_GROUPS};
 use crate::raft_mesh::MeshRaftNetwork;
 use crate::repl_net::PeerReplicaTransport;
+use crate::replica_change::{
+    collect_round, decide_proposal, ChangeVerifier, ProposalAction, ReplicaChangeControl,
+    RoundOutcome,
+};
 use crate::NodeId;
 use mqtt_storage::logged::ReplicatedSessionStore;
 use mqtt_storage::retained_log::{DurableRetained, ReplicatedRetained};
@@ -279,6 +283,13 @@ pub async fn build_durable_node_with(
         .iter()
         .map(|(node, dom)| (raft_id(node), dom.clone()))
         .collect();
+    let verifier = Arc::new(ChangeVerifier {
+        node: node_id.clone(),
+        placement: placement.clone(),
+        transport: transport.clone(),
+        replicas: replicas.clone(),
+        source: group_log.clone(),
+    });
     let driver = tokio::spawn(run_driver(
         raft,
         network,
@@ -298,6 +309,7 @@ pub async fn build_durable_node_with(
             replicas,
             source: group_log,
         },
+        ChangeDriver::new(plane.replica_change(), verifier),
     ));
 
     (store, retained, plane, driver)
@@ -562,12 +574,14 @@ async fn run_driver(
     domains: BTreeMap<RaftNodeId, FailureDomain>,
     ownership_domain_all: Arc<std::sync::atomic::AtomicBool>,
     catch_up: CatchUp,
+    mut change: ChangeDriver,
 ) {
     // A one-tick debounce: only act once the desired set is stable across a tick, so
     // a flapping member does not churn the voter set.
     let mut prev_desired: BTreeSet<RaftNodeId> = BTreeSet::new();
-    // ADR 0080: say once when this node's durable.replicas is not what the cluster
-    // it runs in committed (it joined, or restarted, into an existing cluster).
+    // ADR 0080: say once, at startup, when this node's durable.replicas is not what
+    // the cluster it runs in committed (it joined, or restarted, into an existing
+    // cluster).
     let mut replicas_mismatch_logged = false;
     // Catch-up sweep state: armed (with a budget) on boot and on every placement
     // membership change, run every few ticks until nothing is hollow or the budget
@@ -664,16 +678,19 @@ async fn run_driver(
         // lease owners: a node acts as a group's owner only once its placement holds
         // that lease, and a founded factor is committed before any lease is minted,
         // so every lease placement shows comes with a factor at least that recent.
-        let replicas = lease_store.replication().effective();
-        if let Some(configured) = assigner.founding_replicas() {
-            if !replicas_mismatch_logged && lease_store.high_epoch() > 0 && configured != replicas {
-                replicas_mismatch_logged = true;
+        let record = lease_store.replication();
+        let replicas = record.effective();
+        // Checked once, on the first tick that sees a formed cluster: later a live
+        // change moves the factor away from the startup setting on purpose.
+        if !replicas_mismatch_logged && lease_store.high_epoch() > 0 {
+            replicas_mismatch_logged = true;
+            if let Some(configured) = assigner.founding_replicas().filter(|c| *c != replicas) {
                 tracing::warn!(
                     configured,
                     cluster = replicas,
-                    "durable.replicas is not applied: this cluster runs at the replication \
-                     factor it committed when it was founded ({replicas}); a node's own \
-                     setting only founds a NEW cluster (ADR 0080)"
+                    "durable.replicas is not applied at startup: this cluster runs at the \
+                     replication factor it committed ({replicas}); change it live by editing \
+                     durable.replicas and reloading (ADR 0080)"
                 );
             }
         }
@@ -681,14 +698,32 @@ async fn run_driver(
             let mut p = placement
                 .write()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            p.set_replicas(usize::from(replicas))
+            // While a change is open (ADR 0080 §4) every set is the larger one and
+            // the smaller one is its prefix.
+            let (width, prefix) = match record.change {
+                Some(change) => (
+                    usize::from(change.joint_width()),
+                    Some(usize::from(change.prefix_width())),
+                ),
+                None => (usize::from(replicas), None),
+            };
+            p.set_replication(width, prefix)
                 .then(|| p.min_replicas_configured())
         };
         if let Some(floor) = adopted {
-            tracing::info!(
-                replicas,
-                "replication factor adopted from the lease group (ADR 0080)"
-            );
+            if let Some(change) = record.change {
+                tracing::info!(
+                    from = change.from,
+                    to = change.to,
+                    "replication factor change open: writes need a quorum of both sets \
+                     until it commits (ADR 0080)"
+                );
+            } else {
+                tracing::info!(
+                    replicas,
+                    "replication factor adopted from the lease group (ADR 0080)"
+                );
+            }
             if let Some(floor) = floor.filter(|f| *f > usize::from(replicas)) {
                 tracing::warn!(
                     floor,
@@ -700,6 +735,20 @@ async fn run_driver(
         }
 
         push_committed_lease_owners(&placement, &lease_store, &mut id_map);
+
+        // A live factor change (ADR 0080 §4): the reload's proposal, the leader's
+        // verification and commit, and collecting the copies a shrink dropped.
+        let leader = raft.metrics().borrow().current_leader == Some(local);
+        change
+            .tick(
+                &raft,
+                &placement,
+                &catch_up,
+                record,
+                leader,
+                assigner.replication_capable(),
+            )
+            .await;
 
         // The durable membership ROSTER (issue #229): every raft member — voters
         // and learners — named where the accumulated id map can, counted where it
@@ -801,6 +850,262 @@ async fn run_driver(
                 ticks_to_sweep -= 1;
             }
         }
+    }
+}
+
+/// Pause between a factor change opening and the leader's first verification
+/// round (ADR 0080 §4): long enough for an append a pre-change log had already
+/// fanned out to resolve. Such an append is counted by the old rule at an epoch
+/// at or below `since`, so the round must see it rather than race it.
+const CHANGE_GRACE: Duration = Duration::from_secs(5);
+
+/// Ticks between verification rounds, and between collection passes: time for
+/// the owners' re-commits and hand-offs a round asked for to land.
+const CHANGE_ROUND_EVERY: u32 = 2;
+
+/// The driver's share of a live replication-factor change (ADR 0080 §4); see
+/// [`crate::replica_change`].
+struct ChangeDriver {
+    control: Arc<ReplicaChangeControl>,
+    verifier: Arc<ChangeVerifier>,
+    /// The open change as last seen, and when it was first seen.
+    seen: Option<(ReplicaChange, tokio::time::Instant)>,
+    /// The `since` this node's replica fences were last raised above.
+    fenced: Option<u64>,
+    /// The leader's verification round in flight.
+    round: Option<tokio::task::JoinHandle<RoundOutcome>>,
+    ticks_to_round: u32,
+    /// Groups a committed shrink took this node out of, still holding copies.
+    collect: BTreeSet<GroupId>,
+    /// The collection pass in flight, handing the groups left back.
+    collecting: Option<tokio::task::JoinHandle<(usize, BTreeSet<GroupId>)>>,
+    ticks_to_collect: u32,
+}
+
+impl ChangeDriver {
+    fn new(control: Arc<ReplicaChangeControl>, verifier: Arc<ChangeVerifier>) -> Self {
+        Self {
+            control,
+            verifier,
+            seen: None,
+            fenced: None,
+            round: None,
+            ticks_to_round: 0,
+            collect: BTreeSet::new(),
+            collecting: None,
+            ticks_to_collect: 0,
+        }
+    }
+
+    async fn tick(
+        &mut self,
+        raft: &LeaseRaft,
+        placement: &Arc<RwLock<Placement>>,
+        catch_up: &CatchUp,
+        record: ReplicationRecord,
+        leader: bool,
+        capable: bool,
+    ) {
+        let closed = self
+            .seen
+            .map(|(c, _)| c)
+            .filter(|_| record.change.is_none());
+        self.control.set_record(record);
+        // Fence every pre-change log out of this node's copies (see
+        // `ReplicaState::raise_fences`): an owner that has not applied the change
+        // yet cannot commit on the old quorum through this node.
+        if let Some(c) = record.change.filter(|c| self.fenced != Some(c.since)) {
+            let replicas = catch_up.replicas.clone();
+            let raised = tokio::task::spawn_blocking(move || {
+                replicas
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .raise_fences(c.since + 1)
+            })
+            .await
+            .unwrap_or(false);
+            if raised {
+                self.fenced = Some(c.since);
+            }
+        }
+        self.propose(raft, placement, record, leader, capable).await;
+        self.verify(raft, record, leader).await;
+        if let Some(c) = closed {
+            if record.replicas == Some(c.to) && c.to < c.from {
+                let p = placement
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                for group in 0..NUM_GROUPS {
+                    let node = &catch_up.node;
+                    if p.group_replica_set_of_width(group, usize::from(c.from))
+                        .contains(node)
+                        && !p.group_replica_set(group).contains(node)
+                    {
+                        self.collect.insert(group);
+                    }
+                }
+                tracing::info!(
+                    groups = self.collect.len(),
+                    "replication factor change committed: collecting the copies this node no \
+                     longer holds for (ADR 0080)"
+                );
+            }
+        }
+        self.collect(placement, catch_up).await;
+    }
+
+    async fn propose(
+        &self,
+        raft: &LeaseRaft,
+        placement: &Arc<RwLock<Placement>>,
+        record: ReplicationRecord,
+        leader: bool,
+        capable: bool,
+    ) {
+        let proposed = self.control.proposed();
+        let eligible = placement
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .member_count();
+        match decide_proposal(proposed, record, eligible, capable, leader) {
+            ProposalAction::Done => {
+                if proposed.is_some() {
+                    self.control.clear(None);
+                }
+            }
+            ProposalAction::Begin { from, to } => {
+                match raft
+                    .client_write(LeaseRequest::BeginReplicaChange { from, to })
+                    .await
+                {
+                    Ok(_) => {
+                        tracing::info!(
+                            from,
+                            to,
+                            "replication factor change proposed: every lease is re-minted and \
+                             writes need a quorum of both sets until it commits (ADR 0080)"
+                        );
+                        self.control.clear(None);
+                    }
+                    Err(e) => {
+                        warn!(error = %e, from, to, "proposing the replication factor change failed; retrying");
+                    }
+                }
+            }
+            ProposalAction::Refuse(why) => {
+                warn!(proposed = ?proposed, reason = %why, "replication factor change refused (ADR 0080)");
+                self.control.clear(Some(why));
+            }
+            ProposalAction::Hold(why) => {
+                if self.control.hold(why) {
+                    tracing::info!(proposed = ?proposed, reason = why, "replication factor change held (ADR 0080)");
+                }
+            }
+        }
+    }
+
+    async fn verify(&mut self, raft: &LeaseRaft, record: ReplicationRecord, leader: bool) {
+        let Some(open) = record.change else {
+            self.seen = None;
+            if let Some(task) = self.round.take() {
+                task.abort();
+            }
+            return;
+        };
+        if self.seen.is_none_or(|(c, _)| c != open) {
+            self.seen = Some((open, tokio::time::Instant::now()));
+        }
+        if !leader {
+            if let Some(task) = self.round.take() {
+                task.abort();
+            }
+            return;
+        }
+        if self
+            .round
+            .as_ref()
+            .is_some_and(tokio::task::JoinHandle::is_finished)
+        {
+            let outcome = match self.round.take() {
+                Some(task) => task.await.unwrap_or(RoundOutcome {
+                    verified_groups: 0,
+                    pending: 1,
+                }),
+                None => return,
+            };
+            self.control.record_round(outcome);
+            if outcome.pending == 0 {
+                match raft
+                    .client_write(LeaseRequest::CommitReplicaChange { to: open.to })
+                    .await
+                {
+                    Ok(_) => tracing::info!(
+                        from = open.from,
+                        to = open.to,
+                        "replication factor change committed: every entry written before it \
+                         is held by a quorum of the new replica sets (ADR 0080)"
+                    ),
+                    Err(e) => {
+                        warn!(error = %e, "committing the replication factor change failed; retrying");
+                    }
+                }
+                return;
+            }
+            debug!(
+                verified = outcome.verified_groups,
+                pending = outcome.pending,
+                "replication factor change: round found keys short; owners asked to re-commit"
+            );
+            self.ticks_to_round = CHANGE_ROUND_EVERY;
+        }
+        if self.round.is_some() {
+            return;
+        }
+        let since_seen = self.seen.map_or(Duration::ZERO, |(_, at)| at.elapsed());
+        if since_seen < CHANGE_GRACE {
+            return;
+        }
+        if self.ticks_to_round > 0 {
+            self.ticks_to_round -= 1;
+            return;
+        }
+        let verifier = self.verifier.clone();
+        self.round = Some(tokio::spawn(async move { verifier.round(open).await }));
+    }
+
+    async fn collect(&mut self, placement: &Arc<RwLock<Placement>>, catch_up: &CatchUp) {
+        if self
+            .collecting
+            .as_ref()
+            .is_some_and(tokio::task::JoinHandle::is_finished)
+        {
+            if let Some(task) = self.collecting.take() {
+                if let Ok((left, groups)) = task.await {
+                    self.collect.extend(groups);
+                    self.control.set_collect_pending(left);
+                    if left == 0 && self.collect.is_empty() {
+                        tracing::info!("dropped copies collected (ADR 0080)");
+                    }
+                }
+            }
+            self.ticks_to_collect = CHANGE_ROUND_EVERY;
+        }
+        if self.collecting.is_some() || self.collect.is_empty() {
+            return;
+        }
+        if self.ticks_to_collect > 0 {
+            self.ticks_to_collect -= 1;
+            return;
+        }
+        let mut groups = std::mem::take(&mut self.collect);
+        let node = catch_up.node.clone();
+        let placement = placement.clone();
+        let transport = catch_up.transport.clone();
+        let replicas = catch_up.replicas.clone();
+        self.collecting = Some(tokio::spawn(async move {
+            let left = collect_round(&node, &placement, &transport, &replicas, &mut groups).await;
+            (left, groups)
+        }));
     }
 }
 

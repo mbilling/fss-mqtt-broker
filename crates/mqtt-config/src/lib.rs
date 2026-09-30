@@ -487,6 +487,12 @@ pub struct Durable {
     /// restarting in one, a different value here changes nothing (it is logged). A
     /// cluster founded before ADR 0080 runs at 3.
     ///
+    /// Changing it and reloading (SIGHUP or the file watch) proposes the new factor
+    /// to the running cluster (ADR 0080 §4). The lease leader opens the change when
+    /// its own reload asks for it, so reload every node (a config-map roll does). The
+    /// change is refused with fewer nodes than copies or while another change runs;
+    /// `/statusz` `replication_factor` shows its progress, or why it waits.
+    ///
     /// At 2 the write quorum is both copies, so a slow, suspected or dead node pauses
     /// durable writes for every group it holds a copy of; at 3 only for the groups it
     /// OWNS (a lost non-owner copy is ridden through). Either way the paused groups

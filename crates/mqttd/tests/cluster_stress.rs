@@ -3401,6 +3401,152 @@ async fn a_cross_node_shared_subscriber_is_never_bypassed_by_an_ack() {
     }
 }
 
+/// Every node's committed replication record reads `replicas` with no change
+/// open, and every placement has adopted it (ADR 0080 §4).
+async fn wait_factor(nodes: &[&StressNode], replicas: u8, within: Duration) -> bool {
+    let deadline = Instant::now() + within;
+    loop {
+        let settled = nodes.iter().all(|n| {
+            let record = n
+                .plane
+                .as_ref()
+                .map(|p| p.replica_change().record())
+                .unwrap_or_default();
+            record.replicas == Some(replicas)
+                && record.change.is_none()
+                && n.placement.read().unwrap().desired_replicas() == usize::from(replicas)
+        });
+        if settled {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+}
+
+/// ADR 0080 §4, end to end on three nodes: the replication factor moves 2 → 3
+/// and back 3 → 2 on the running cluster, proposed as a reload proposes it, with
+/// `QoS` 1 publishes acked before, during and after each change. No acked message
+/// is lost, and after the shrink commits each node drops the copies it no longer
+/// holds for.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[allow(clippy::too_many_lines)] // one scenario, start to verify; its phases share the ledger
+async fn the_replication_factor_changes_live_both_ways_without_losing_an_acked_message() {
+    if std::env::var("MQTTD_STRESS_LOG").is_ok() {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .try_init();
+    }
+    let disk = tempfile::tempdir().expect("tempdir");
+    let dir = |n: &str| {
+        let d = disk.path().join(n);
+        std::fs::create_dir_all(&d).expect("node dir");
+        d
+    };
+    let a = start_stress_node_at("rf-a", vec![], &dir("a"), 2).await;
+    let b = start_stress_node_at("rf-b", vec![a.swim_addr.clone()], &dir("b"), 2).await;
+    let c = start_stress_node_at("rf-c", vec![a.swim_addr.clone()], &dir("c"), 2).await;
+    let nodes = [&a, &b, &c];
+    assert!(
+        wait_factor(&nodes, 2, Duration::from_secs(60)).await,
+        "the cluster never founded at 2"
+    );
+    wait_members(&nodes, 3).await;
+
+    // Offline durable subscribers spread over many groups, so both changes
+    // have queues to verify, re-commit and collect.
+    let subs: Vec<String> = (0..8).map(|i| format!("rf-sub-{i}")).collect();
+    for sub in &subs {
+        establish_offline_subscriber(&nodes, sub, "rf/t").await;
+    }
+    let mut owed: Vec<Vec<u8>> = Vec::new();
+    let mut publish = |n: usize| {
+        let payload = format!("rf-m{n}").into_bytes();
+        owed.push(payload.clone());
+        (nodes[n % 3].client_addr, payload)
+    };
+    let mut published = 0;
+
+    for (from, to) in [(2u8, 3u8), (3, 2)] {
+        for _ in 0..3 {
+            let (addr, payload) = publish(published);
+            publish_until_acked(
+                &nodes,
+                addr,
+                &format!("rf-pub-{published}"),
+                "rf/t",
+                &payload,
+            )
+            .await;
+            published += 1;
+        }
+        // A reload of durable.replicas on every node, as a config-map roll does.
+        for n in &nodes {
+            n.plane.as_ref().unwrap().replica_change().propose(to);
+        }
+        // Keep publishing while the change runs.
+        let deadline = Instant::now() + Duration::from_secs(120);
+        loop {
+            let (addr, payload) = publish(published);
+            publish_until_acked(
+                &nodes,
+                addr,
+                &format!("rf-pub-{published}"),
+                "rf/t",
+                &payload,
+            )
+            .await;
+            published += 1;
+            if wait_factor(&nodes, to, Duration::from_millis(500)).await {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the change {from} -> {to} never committed: {}",
+                a.plane
+                    .as_ref()
+                    .unwrap()
+                    .replica_change()
+                    .statusz_fragment()
+            );
+        }
+        let (addr, payload) = publish(published);
+        publish_until_acked(
+            &nodes,
+            addr,
+            &format!("rf-pub-{published}"),
+            "rf/t",
+            &payload,
+        )
+        .await;
+        published += 1;
+    }
+
+    // Collection: every node lets go of the groups the shrink took it out of.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let left: usize = nodes
+            .iter()
+            .map(|n| n.plane.as_ref().unwrap().copies_outside_custody().len())
+            .sum();
+        if left == 0 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{left} copies outside custody were never collected"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    let owed: Vec<&[u8]> = owed.iter().map(Vec::as_slice).collect();
+    for sub in &subs {
+        resume_and_verify(&nodes, sub, &owed).await;
+    }
+}
+
 /// Bring-up gate shared by the resize/restart tests: full membership + full
 /// voters across every given node.
 async fn wait_cluster_ready(nodes: &[&StressNode]) {
