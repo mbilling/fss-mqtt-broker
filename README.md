@@ -18,7 +18,7 @@
 > - **QoS 1, clean sessions:** ~39,000–42,000 msg/s per node — **390,000–420,000 msg/s on 10 nodes**.
 > - **Durable QoS 1** (ack after fsync + replication): **90,000 msg/s on 3 nodes, 12 vCPU** ([↓](#durable-and-qos-1-scale-out)).
 >
-> Both use shared subscriptions. [Scale-out ↓](#cluster-scale-out-qos-0-shared-subscriptions)
+> All three use shared subscriptions. [Scale-out ↓](#cluster-scale-out-qos-0-shared-subscriptions)
 
 ---
 
