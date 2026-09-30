@@ -20,6 +20,8 @@ audit it · contribute*.
 | [SECURED-CLUSTER-TUTORIAL.md](SECURED-CLUSTER-TUTORIAL.md) | Newcomer standing it up | Three-node TLS + mTLS + ACL cluster on Compose, CI-smoked. |
 | [CLIENT-GUIDE.md](CLIENT-GUIDE.md) | Application developer | Session/expiry, the emitted reason-code catalogue, flow-control, refusal, worked examples. |
 | [OPERATIONS.md](OPERATIONS.md) | Operator / SRE (day 2) | Rotation, backup/restore, shipped alerts with per-alert runbooks. |
+| [ADMIN-CLI.md](ADMIN-CLI.md) | Operator / SRE | Every `mqttd --admin` command: connecting, roles, output, exit codes, recipes. |
+| [ADMIN-API.md](ADMIN-API.md) | Operator / SRE, tooling author | The authenticated admin API: turning it on, roles, errors, limits, every endpoint. |
 | [CONFIGURATION.md](CONFIGURATION.md) | Operator / SRE | Generated `MQTTD_*` / TOML reference; CI-checked against the config code. |
 | [SIZING.md](SIZING.md) | Operator / SRE | Capacity arithmetic: what each quota bounds, and what still merely browns out. |
 | [TROUBLESHOOTING.md](TROUBLESHOOTING.md) | Operator / SRE | First-deployment failure modes and how to read them. |

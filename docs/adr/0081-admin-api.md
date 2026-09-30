@@ -145,8 +145,11 @@ originally over the peer bus.)
   that rejection.
 - The peer protocol is unchanged: node-to-node admin traffic uses the admin listeners
   (amendment below).
-- Endpoint paths and JSON field names become a compatibility surface. They are `v1` and
-  unstable until 1.0 (pre-1.0 policy); from 1.0 the ADR 0058 contract applies.
+- Endpoint paths and JSON field names become a compatibility surface. The `[admin]` keys
+  fall under ADR 0058's frozen config surface. ADR 0058 does not enumerate HTTP interfaces;
+  for this one the rule is (corrected 2026-09-30 — the line first said "unstable until 1.0",
+  but the API shipped after v1.0.0): within 1.x the `v1` paths, parameters, fields and error
+  codes change only by addition, and a breaking change ships as `/admin/v2` beside `v1`.
 
 ## Alternatives considered
 
