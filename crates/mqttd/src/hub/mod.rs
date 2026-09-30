@@ -12130,14 +12130,19 @@ mod tests {
         store
             .fail_replay
             .store(1, std::sync::atomic::Ordering::SeqCst);
-        let (mut rx, _) = attach(&tx, "p", 2, false).await;
+        let mut rx = attach_persistent_v5(&tx, "p", 2).await;
         let closed = timeout(Duration::from_secs(2), async {
-            while rx.recv().await.is_some() {}
+            let mut last = None;
+            while let Some(pkt) = rx.recv().await {
+                last = Some(pkt);
+            }
+            last
         })
-        .await;
+        .await
+        .expect("the connection must be closed, not left attached with an unread queue");
         assert!(
-            closed.is_ok(),
-            "the connection must be closed, not left attached with an unread queue"
+            matches!(closed.as_deref(), Some(Packet::Disconnect(d)) if d.reason == mqtt_codec::reason::SERVER_BUSY),
+            "a v5 client is told the server is busy (0x89) before the close; got {closed:?}"
         );
 
         let (mut rx, _) = attach(&tx, "p", 3, false).await;
