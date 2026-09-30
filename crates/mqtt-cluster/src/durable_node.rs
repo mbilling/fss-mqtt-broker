@@ -406,7 +406,8 @@ impl CatchUp {
     ///   current member was in the cohort this node was already current with) →
     ///   re-stamp immediately, no data moved;
     /// - otherwise (never stamped, or new cohort members) → full catch-up: every
-    ///   other member of the set must answer key discovery, every discovered key
+    ///   other live member must answer key discovery (not only the set's: the
+    ///   history may sit only on members outside it), every discovered key
     ///   of the group must be locally gap-free (hollow keys are healed by asking
     ///   the owner to re-commit — or re-committing ourselves when we own the
     ///   group), and only then is the group stamped.
@@ -436,6 +437,20 @@ impl CatchUp {
                 .insert(key);
         }
 
+        // A full catch-up may only conclude "nothing is hollow" once EVERY live
+        // member has answered, not just the group's own set: after a grow onto
+        // data-less nodes the new set can be all newcomers, and the only copies of
+        // the group's history then sit on members outside it (#390). A newcomer
+        // that stamped from its set's answers alone would certify an empty copy,
+        // and a recovery would trust it (#755).
+        let heard_everyone = placement
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .members()
+            .iter()
+            .filter(|n| **n != self.node)
+            .all(|n| responses.contains_key(n));
+
         let mut pending = 0;
         let mut stamps: Vec<(GroupId, Vec<NodeId>)> = Vec::new();
         for group in 0..NUM_GROUPS {
@@ -462,12 +477,8 @@ impl CatchUp {
                 }
                 StampDecision::CatchUp => {}
             }
-            // Full catch-up: every other member must have answered discovery.
-            if !set
-                .iter()
-                .filter(|n| **n != self.node)
-                .all(|n| responses.contains_key(n))
-            {
+            // Full catch-up: every other live member must have answered discovery.
+            if !heard_everyone {
                 pending += 1;
                 continue;
             }
@@ -1462,6 +1473,99 @@ mod tests {
 
     fn ids(names: &[&str]) -> Vec<NodeId> {
         names.iter().map(|n| NodeId((*n).to_string())).collect()
+    }
+
+    /// #755: after a grow onto data-less nodes, a group's history may sit only on a
+    /// member OUTSIDE its new set. A newcomer whose set-mate answered key discovery
+    /// but whose link to that old holder is not up yet must not stamp the group
+    /// caught-up, or it certifies an empty copy that a recovery then trusts. Once
+    /// the old holder answers, the key is found hollow and the group stays pending.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_catch_up_stamp_waits_for_every_member_not_only_the_set() {
+        use super::CatchUp;
+        use crate::cluster_log::{ReplOp, ReplicaState};
+        use crate::peer::PeerMessage;
+        use crate::placement::group_of_key;
+        use crate::repl_net::PeerReplicaTransport;
+        use crate::swim::MemberState;
+        use std::sync::Mutex;
+        use tokio::sync::mpsc;
+
+        struct NoSource;
+        #[async_trait::async_trait]
+        impl crate::durable_plane::CatchUpSource for NoSource {
+            async fn catch_up_key(&self, _key: &str) {}
+            async fn catch_up_key_to(&self, _key: &str, _target: &NodeId) {}
+        }
+        fn answer_keys(
+            transport: Arc<PeerReplicaTransport>,
+            state: Arc<Mutex<ReplicaState>>,
+            mut rx: mpsc::UnboundedReceiver<PeerMessage>,
+        ) {
+            tokio::spawn(async move {
+                while let Some(msg) = rx.recv().await {
+                    if let PeerMessage::ReplicaKeys { req_id } = msg {
+                        let keys = state.lock().unwrap().keys();
+                        transport.complete_keys(req_id, keys);
+                    }
+                }
+            });
+        }
+
+        let newcomer = NodeId("new".into());
+        let (mate, old) = (NodeId("mate".into()), NodeId("old".into()));
+        let mut p = Placement::new(newcomer.clone(), 2);
+        for peer in [&mate, &old] {
+            p.observe(peer, MemberState::Alive, &format!("{}:7000", peer.0), None);
+        }
+        // A key whose two-member set is {newcomer, mate}: `old` holds its only copy.
+        let key = (0..100_000)
+            .map(|i| format!("q/sweep-{i}"))
+            .find(|k| {
+                let set = p.group_replica_set(group_of_key(k));
+                set.contains(&newcomer) && set.contains(&mate)
+            })
+            .expect("a group led into {newcomer, mate}");
+        let group = group_of_key(&key);
+        let placement = Arc::new(RwLock::new(p));
+
+        let transport = Arc::new(PeerReplicaTransport::new());
+        let (tx, rx) = mpsc::unbounded_channel();
+        transport.register(mate.clone(), tx);
+        answer_keys(
+            transport.clone(),
+            Arc::new(Mutex::new(ReplicaState::new())),
+            rx,
+        );
+        let old_state = Arc::new(Mutex::new(ReplicaState::new()));
+        assert!(old_state.lock().unwrap().apply(
+            3,
+            &ReplOp::Append {
+                key: key.clone(),
+                offset: 1,
+                seq: 1,
+                record: b"acked".to_vec(),
+            }
+        ));
+        let replicas = Arc::new(Mutex::new(ReplicaState::new()));
+        let sweep = CatchUp {
+            node: newcomer.clone(),
+            transport: transport.clone(),
+            replicas: replicas.clone(),
+            source: Arc::new(NoSource),
+        };
+
+        // `old` has no link yet: nothing is known to be missing, but that proves
+        // nothing, so the group must not be stamped.
+        assert!(sweep.sweep(&placement).await > 0);
+        assert!(replicas.lock().unwrap().caught_up_set(group).is_none());
+
+        // Its link comes up: the key is discovered, our copy is hollow, still pending.
+        let (tx, rx) = mpsc::unbounded_channel();
+        transport.register(old.clone(), tx);
+        answer_keys(transport.clone(), old_state, rx);
+        assert!(sweep.sweep(&placement).await > 0);
+        assert!(replicas.lock().unwrap().caught_up_set(group).is_none());
     }
 
     /// The rule behind the R=2 near-miss (ADR 0080 T3): a stamp must not outlive

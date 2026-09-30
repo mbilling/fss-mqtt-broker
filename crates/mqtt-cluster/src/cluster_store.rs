@@ -575,7 +575,11 @@ impl<S: LeaseSource, T: ReplicaTransport + Clone + 'static> GroupRoutedLog<S, T>
     /// sweep. See the call site for the safety argument; the invariants enforced here:
     ///
     /// 1. the durable roster is fully known (an unobservable member might hold
-    ///    history — refuse);
+    ///    history — refuse) and current: it names this node and every member of
+    ///    the set. A node that has not caught up the lease log yet holds the
+    ///    membership from before it joined, empty on a fresh node; sweeping that
+    ///    reads nobody and would serve an empty union as the key's whole history
+    ///    (#755) — refuse;
     /// 2. EVERY roster member outside the current set answers the read (one silent
     ///    member could hold the only copy of a committed entry — refuse);
     /// 3. the merged union is gap-free: no read may hold an entry above what the
@@ -598,6 +602,9 @@ impl<S: LeaseSource, T: ReplicaTransport + Clone + 'static> GroupRoutedLog<S, T>
         };
         if unknown > 0 {
             return Err(ReplError::NoQuorum); // an unobservable member might hold history
+        }
+        if !known.contains(&self.local) || replica_set.iter().any(|n| !known.contains(n)) {
+            return Err(ReplError::NoQuorum); // a roster from before we joined: stale
         }
         let extras: Vec<NodeId> = known
             .iter()
@@ -1850,6 +1857,108 @@ mod tests {
         let log = committed.log_for_key(&qkey, true).await.unwrap();
         assert!(!log.quorum_rule().is_joint());
         assert_eq!(log.quorum(), 2);
+    }
+
+    /// #755: the #390 roster fallback on a newcomer whose own view of the durable
+    /// roster is still the empty one from before it joined. The group's set is two
+    /// data-less newcomers, the key's only copy sits on an old member outside it,
+    /// and "every roster member answered" is vacuously true of an empty roster:
+    /// the fallback used to read nobody and serve an empty queue as the key's
+    /// whole history. A roster that does not name this node and the set must be
+    /// refused; once it does, the sweep reads the old member and recovers the entry.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_roster_from_before_this_node_joined_cannot_certify_an_empty_history() {
+        use std::collections::BTreeSet;
+        let (new, mate, old) = (nid("new"), nid("mate"), nid("old"));
+        let mut p = Placement::new(new.clone(), 2);
+        p.observe(&mate, MemberState::Alive, "mate:7000", None);
+        p.observe(&old, MemberState::Alive, "old:7000", None);
+        let client = (0..100_000)
+            .map(|i| format!("roster-{i}"))
+            .find(|c| {
+                let set = p.group_replica_set(group_of(c));
+                set.first() == Some(&new) && set.contains(&mate)
+            })
+            .expect("a group `new` owns with `mate`");
+        let qkey = format!("q/{client}");
+
+        // `mate` is a newcomer too: hollow, never complete. `old` holds the entry.
+        let transport = Arc::new(PeerReplicaTransport::new());
+        let mate_state = Arc::new(Mutex::new(ReplicaState::new()));
+        let old_state = Arc::new(Mutex::new(ReplicaState::new()));
+        old_state.lock().unwrap().apply(
+            2,
+            &ReplOp::Append {
+                key: qkey.clone(),
+                offset: 1,
+                seq: 1,
+                record: b"acked".to_vec(),
+            },
+        );
+        for (node, state, complete) in [(&mate, &mate_state, false), (&old, &old_state, true)] {
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            transport.register(node.clone(), tx);
+            let transport = transport.clone();
+            let state = state.clone();
+            tokio::spawn(async move {
+                while let Some(msg) = rx.recv().await {
+                    match msg {
+                        PeerMessage::Replicate { req_id, epoch, op } => {
+                            let ok = state.lock().unwrap().apply(epoch, &op);
+                            transport.complete_ack(req_id, ok);
+                        }
+                        PeerMessage::ReplicaRead { req_id, key } => {
+                            let (watermark, entries) = {
+                                let s = state.lock().unwrap();
+                                let entries = s
+                                    .epoch_entries(&key)
+                                    .into_iter()
+                                    .map(|e| crate::peer::ReplicaEntryWire {
+                                        offset: e.offset,
+                                        epoch: e.epoch,
+                                        seq: e.seq,
+                                        record: e.record,
+                                    })
+                                    .collect();
+                                (s.watermark(&key), entries)
+                            };
+                            transport.complete_read(req_id, watermark, complete, entries);
+                        }
+                        _ => {}
+                    }
+                }
+            });
+        }
+        let placement = Arc::new(RwLock::new(p));
+        let log = GroupRoutedLog::new(
+            new.clone(),
+            placement.clone(),
+            transport,
+            FixedLease(7),
+            Arc::new(Mutex::new(ReplicaState::new())),
+        );
+
+        // Not yet caught up the lease log: the roster is the empty one.
+        placement
+            .write()
+            .unwrap()
+            .set_durable_roster(BTreeSet::new(), 0);
+        assert!(
+            matches!(
+                log.read(&qkey, 0, 10).await,
+                Err(mqtt_storage::repl::ReplError::NoQuorum)
+            ),
+            "an empty roster must not certify an empty history"
+        );
+
+        // Caught up: the roster names everyone, `old` is swept, the entry is back.
+        placement
+            .write()
+            .unwrap()
+            .set_durable_roster([new, mate, old].into_iter().collect(), 0);
+        let recovered = log.read(&qkey, 0, 10).await.unwrap();
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].record, b"acked");
     }
 
     /// ADR 0043 P1, the empty-joiner face of the hazard: an owner that has not
