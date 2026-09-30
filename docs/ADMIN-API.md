@@ -476,9 +476,14 @@ Restores the configured filter now. Returns the [`log-level`](#get-adminv1log-le
 
 ## Compatibility
 
-The `[admin]` config keys are part of the config surface the 1.x stability contract freezes
-([ADR 0058](adr/0058-one-dot-zero-stability-contract.md)). The HTTP interface follows the same
-rule within the 1.x line: the `v1` paths, parameters, JSON field names and error codes change
-only by addition. New endpoints, parameters and response fields may appear in any minor
-release — ignore fields you do not know. A change that would break a `v1` client ships under
-a new path version (`/admin/v2/…`) beside `v1`, not in place of it.
+The admin API follows mqttd's own [semantic version](https://semver.org): the paths,
+parameters, JSON field names and error codes are the public interface.
+
+| mqttd release | The admin API |
+|---|---|
+| patch (`1.2.x`) | does not change |
+| minor (`1.x.0`) | may add endpoints, parameters, response fields and error codes; nothing existing changes or goes away — ignore fields you do not know |
+| major (`2.0.0`) | may change or remove anything; the path version moves with it (`/admin/v2/…` in mqttd 2.x) and the release notes list every break |
+
+The `[admin]` config keys are part of the config surface the same contract covers
+([ADR 0058](adr/0058-one-dot-zero-stability-contract.md)).
