@@ -3628,8 +3628,8 @@ mod tests {
         assert_eq!(&all[0].record, b"kept");
     }
 
-    /// #758: a page walks the log from `after`, stops once its records reach the
-    /// budget (never empty while entries remain), and says whether more remain.
+    /// #758: a page walks the log from `after`, stops before an entry that would
+    /// cross the budget (never empty while entries remain), and says whether more remain.
     #[test]
     fn a_log_is_paged_from_an_offset_within_a_byte_budget() {
         let mut r = ReplicaState::new();
