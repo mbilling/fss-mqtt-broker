@@ -51,6 +51,11 @@ use tokio::sync::{mpsc, oneshot};
 /// that stays up but stops answering.
 const DEFAULT_RPC_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// The record-byte budget of one page of a paged recovery read (#758): well under
+/// [`crate::peer::MAX_FRAME`] with room for the entries' framing, and small enough
+/// that a page crosses a busy link inside the RPC timeout.
+const READ_PAGE_BYTES: u32 = 4 * 1024 * 1024;
+
 /// A leader-side [`ReplicaTransport`] that replicates over the peer mesh.
 ///
 /// Holds, per replica, the outbound channel into that peer's link, and a table of
@@ -73,6 +78,11 @@ impl Default for PeerReplicaTransport {
 #[derive(Debug, Default)]
 struct Inner {
     followers: HashMap<NodeId, mpsc::UnboundedSender<PeerMessage>>,
+    /// The peer-bus proto each link negotiated, where the caller said (#758): a
+    /// link at [`crate::peer::PROTO_REPLICA_READ_PAGED`] or above reads in pages.
+    protos: HashMap<NodeId, u32>,
+    /// In-flight pages of paged recovery-reads (#758), keyed by `req_id`.
+    pending_chunks: HashMap<u64, PendingChunk>,
     pending: HashMap<u64, Pending>,
     /// In-flight recovery-reads (workstream F), keyed by `req_id`.
     pending_reads: HashMap<u64, PendingRead>,
@@ -95,6 +105,15 @@ struct Pending {
 /// A recovery-read reply: the replica's truncation low-water, its completeness
 /// verdict (ADR 0043 P1), and its stored entries.
 type ReadReply = (u64, bool, Vec<ReplicaEntryWire>);
+
+/// One page of a paged recovery-read: as [`ReadReply`], plus whether more remain.
+type ChunkReply = (u64, bool, Vec<ReplicaEntryWire>, bool);
+
+#[derive(Debug)]
+struct PendingChunk {
+    node: NodeId,
+    reply: oneshot::Sender<ChunkReply>,
+}
 
 #[derive(Debug)]
 struct PendingRead {
@@ -128,7 +147,22 @@ impl PeerReplicaTransport {
     /// `tx` is the sender into that peer's link — the same channel the hub holds
     /// for the node. Called when a peer link is (re)established.
     pub fn register(&self, node: NodeId, tx: mpsc::UnboundedSender<PeerMessage>) {
-        self.lock().followers.insert(node, tx);
+        let mut inner = self.lock();
+        inner.protos.remove(&node);
+        inner.followers.insert(node, tx);
+    }
+
+    /// [`register`](Self::register), recording the proto the link negotiated so
+    /// recovery reads can be paged where the peer understands it (#758).
+    pub fn register_with_proto(
+        &self,
+        node: NodeId,
+        tx: mpsc::UnboundedSender<PeerMessage>,
+        proto: u32,
+    ) {
+        let mut inner = self.lock();
+        inner.protos.insert(node.clone(), proto);
+        inner.followers.insert(node, tx);
     }
 
     /// Drop a replica and fail every request in flight to it.
@@ -169,6 +203,16 @@ impl PeerReplicaTransport {
         for id in failed_keys {
             inner.pending_keys.remove(&id);
         }
+        inner.protos.remove(node);
+        let failed_chunks: Vec<u64> = inner
+            .pending_chunks
+            .iter()
+            .filter(|(_, p)| p.node == *node)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in failed_chunks {
+            inner.pending_chunks.remove(&id);
+        }
     }
 
     /// Resolve a pending request with the replica's verdict.
@@ -195,6 +239,98 @@ impl PeerReplicaTransport {
         if let Some(p) = self.lock().pending_reads.remove(&req_id) {
             let _ = p.reply.send((watermark, complete, entries));
         }
+    }
+
+    /// Resolve one page of a paged recovery-read (#758).
+    ///
+    /// Called by the link handler when a [`PeerMessage::ReplicaReadChunk`] arrives.
+    pub fn complete_read_chunk(
+        &self,
+        req_id: u64,
+        watermark: u64,
+        complete: bool,
+        entries: Vec<ReplicaEntryWire>,
+        more: bool,
+    ) {
+        if let Some(p) = self.lock().pending_chunks.remove(&req_id) {
+            let _ = p.reply.send((watermark, complete, entries, more));
+        }
+    }
+
+    /// Ask one page of `key` from `replica`, above offset `after`.
+    async fn read_page(&self, replica: &NodeId, key: &str, after: u64) -> Option<ChunkReply> {
+        let req_id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let (reply_tx, reply_rx) = oneshot::channel();
+        {
+            let mut inner = self.lock();
+            let tx = inner.followers.get(replica).cloned()?;
+            inner.pending_chunks.insert(
+                req_id,
+                PendingChunk {
+                    node: replica.clone(),
+                    reply: reply_tx,
+                },
+            );
+            let frame = PeerMessage::ReplicaReadFrom {
+                req_id,
+                key: key.to_string(),
+                after,
+                max_bytes: READ_PAGE_BYTES,
+            };
+            if tx.send(frame).is_err() {
+                inner.pending_chunks.remove(&req_id);
+                return None;
+            }
+        }
+        let Ok(res) = tokio::time::timeout(self.rpc_timeout, reply_rx).await else {
+            self.lock().pending_chunks.remove(&req_id);
+            return None;
+        };
+        res.ok()
+    }
+
+    /// A recovery read assembled from pages (#758): each page bounded by the RPC
+    /// timeout, the watermark the highest any page reported, complete only if every
+    /// page was, and the entries every page returned above that watermark.
+    async fn read_replica_paged(
+        &self,
+        replica: &NodeId,
+        key: &str,
+    ) -> Option<crate::cluster_log::ReplicaRead> {
+        let mut after = 0;
+        let mut watermark = 0;
+        let mut complete = true;
+        let mut entries: Vec<ReplicaEntryWire> = Vec::new();
+        loop {
+            let (wm, page_complete, page, more) = self.read_page(replica, key, after).await?;
+            watermark = watermark.max(wm);
+            complete &= page_complete;
+            let progressed = page.last().is_some_and(|e| e.offset > after);
+            for entry in page {
+                if entry.offset > after {
+                    after = entry.offset;
+                    entries.push(entry);
+                }
+            }
+            // A page that moved nothing forward would ask the same page again.
+            if !more || !progressed {
+                break;
+            }
+        }
+        entries.retain(|e| e.offset > watermark);
+        Some(crate::cluster_log::ReplicaRead {
+            watermark,
+            complete,
+            entries: entries
+                .into_iter()
+                .map(|e| crate::cluster_log::EpochEntry {
+                    epoch: e.epoch,
+                    seq: e.seq,
+                    offset: e.offset,
+                    record: e.record,
+                })
+                .collect(),
+        })
     }
 
     /// Ask `owner` to re-commit `key`'s committed log (ADR 0043 P1) — the
@@ -327,6 +463,16 @@ impl ReplicaTransport for PeerReplicaTransport {
         replica: &NodeId,
         key: &str,
     ) -> Option<crate::cluster_log::ReplicaRead> {
+        // A link that pages reads in pages: a log over MAX_FRAME cannot be read
+        // in one frame at all (#758).
+        let paged = self
+            .lock()
+            .protos
+            .get(replica)
+            .is_some_and(|p| *p >= crate::peer::PROTO_REPLICA_READ_PAGED);
+        if paged {
+            return self.read_replica_paged(replica, key).await;
+        }
         let req_id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (reply_tx, reply_rx) = oneshot::channel();
         {
@@ -561,6 +707,115 @@ mod tests {
         let (out_tx, _out_rx) = mpsc::unbounded_channel();
         transport.register(b.clone(), out_tx);
         assert!(transport.read_replica(&b, "k").await.is_none());
+    }
+
+    /// #758: a replica whose log is larger than one peer frame can carry is read in
+    /// pages over a proto-10 link, and the assembled read is exactly the replica's
+    /// (every entry above its watermark, in order, with its tags). A proto-9 link
+    /// still gets the one-frame read.
+    #[tokio::test]
+    async fn a_log_larger_than_a_frame_is_read_in_pages() {
+        use crate::cluster_log::{ReplOp, ReplicaState};
+        let transport = Arc::new(PeerReplicaTransport::new());
+        let b = n("b");
+        // 12 records of 1 MiB: three 4 MiB pages, and over `MAX_FRAME` in total.
+        let state = Arc::new(Mutex::new(ReplicaState::new()));
+        {
+            let mut r = state.lock().unwrap();
+            for off in 1..=12u64 {
+                assert!(r.apply(
+                    2,
+                    &ReplOp::Append {
+                        key: "q/big".into(),
+                        offset: off,
+                        seq: off,
+                        record: vec![u8::try_from(off).unwrap(); 1 << 20],
+                    }
+                ));
+            }
+            assert!(r.apply(
+                2,
+                &ReplOp::Truncate {
+                    key: "q/big".into(),
+                    up_to: 2
+                }
+            ));
+        }
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        transport.register_with_proto(b.clone(), tx, crate::peer::PROTO_REPLICA_READ_PAGED);
+        let server = {
+            let transport = transport.clone();
+            let state = state.clone();
+            tokio::spawn(async move {
+                let mut pages = 0;
+                let mut legacy = 0;
+                while let Some(msg) = rx.recv().await {
+                    match msg {
+                        PeerMessage::ReplicaReadFrom {
+                            req_id,
+                            key,
+                            after,
+                            max_bytes,
+                        } => {
+                            pages += 1;
+                            let r = state.lock().unwrap();
+                            let wm = r.watermark(&key);
+                            let (page, more) =
+                                r.epoch_entries_page(&key, after.max(wm), max_bytes as usize);
+                            let entries = page
+                                .into_iter()
+                                .map(|e| crate::peer::ReplicaEntryWire {
+                                    offset: e.offset,
+                                    epoch: e.epoch,
+                                    seq: e.seq,
+                                    record: e.record,
+                                })
+                                .collect();
+                            transport.complete_read_chunk(req_id, wm, true, entries, more);
+                        }
+                        PeerMessage::ReplicaRead { req_id, .. } => {
+                            legacy += 1;
+                            transport.complete_read(req_id, 0, true, Vec::new());
+                        }
+                        _ => {}
+                    }
+                }
+                (pages, legacy)
+            })
+        };
+
+        let read = transport.read_replica(&b, "q/big").await.expect("read");
+        assert_eq!(read.watermark, 2);
+        assert!(read.complete);
+        assert_eq!(
+            read.entries.iter().map(|e| e.offset).collect::<Vec<_>>(),
+            (3..=12).collect::<Vec<_>>(),
+            "every entry above the watermark, in order"
+        );
+        assert!(read
+            .entries
+            .iter()
+            .all(|e| e.epoch == 2 && e.seq == e.offset));
+        assert!(read
+            .entries
+            .iter()
+            .all(|e| e.record == vec![u8::try_from(e.offset).unwrap(); 1 << 20]));
+
+        // The same replica behind a proto-9 link: the one-frame read.
+        let (tx9, rx9) = mpsc::unbounded_channel();
+        drop(rx9);
+        transport.register(b.clone(), tx9);
+        assert!(
+            transport.read_replica(&b, "q/big").await.is_none(),
+            "legacy path, no server"
+        );
+        transport.fail_node(&b);
+        let (pages, legacy) = server.await.unwrap();
+        assert_eq!(
+            (pages, legacy),
+            (3, 0),
+            "three pages over the proto-10 link"
+        );
     }
 
     /// Catch-up requests (ADR 0043 P1/P3) reach a connected owner's link and

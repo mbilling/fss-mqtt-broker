@@ -85,7 +85,13 @@ pub const PROTO_MIN: u32 = 6;
 /// (`LeaseRequest::SetReplicas` and the live-change pair). They ride existing
 /// `RaftRpc` payloads, which an older build would fail to apply, so they are
 /// proposed only once every member's link negotiated ≥ 9.
-pub const PROTO_MAX: u32 = 9;
+///
+/// Proto 10 (#758) is additive again: [`ReplicaReadFrom`](PeerMessage::ReplicaReadFrom)
+/// and [`ReplicaReadChunk`](PeerMessage::ReplicaReadChunk) page a recovery read, chosen
+/// per LINK. A key whose log exceeded [`MAX_FRAME`] could not be read at all through the
+/// one-frame [`ReplicaReadReply`](PeerMessage::ReplicaReadReply), so a new owner could
+/// never recover it. A proto-9 link keeps the one-frame read.
+pub const PROTO_MAX: u32 = 10;
 
 /// The peer-bus proto at which a build computes durable ownership over all admitted
 /// members (ADR 0073). Purely a capability marker — see [`PROTO_MAX`].
@@ -95,6 +101,9 @@ pub const PROTO_OWNERSHIP_DOMAIN: u32 = 8;
 /// replication-factor commands (ADR 0080). Purely a capability marker — see
 /// [`PROTO_MAX`].
 pub const PROTO_REPLICATION_FACTOR: u32 = 9;
+
+/// The peer-bus proto at which a link carries paged recovery reads (#758).
+pub const PROTO_REPLICA_READ_PAGED: u32 = 10;
 
 /// Negotiate a link's protocol version from both sides' announced ranges
 /// (ADR 0038): the newest version both can speak, or `None` when the ranges are
@@ -583,6 +592,40 @@ pub enum PeerMessage {
         /// The publisher's forwardable MQTT 5 application properties (ADR 0030).
         app: WireAppProps,
     },
+    // ---------------------------------------------------------------------
+    // Proto 10 (#758). Appended, like everything since proto 7.
+    // ---------------------------------------------------------------------
+    /// One page of a recovery read: `key`'s entries above offset `after` (and
+    /// above the replica's truncation low-water), at most about `max_bytes` of
+    /// records but always at least one entry when any remain. Answered with a
+    /// [`ReplicaReadChunk`](PeerMessage::ReplicaReadChunk); the reader asks again
+    /// from the last offset it received until `more` is false. Sent instead of
+    /// [`ReplicaRead`](PeerMessage::ReplicaRead) on a link that negotiated proto
+    /// ≥ 10, so a log larger than [`MAX_FRAME`] can still be read.
+    ReplicaReadFrom {
+        /// Correlates this request with its reply on the same link.
+        req_id: u64,
+        /// The log (session key) to read.
+        key: String,
+        /// Read entries with offset strictly above this.
+        after: u64,
+        /// The page's record-byte budget.
+        max_bytes: u32,
+    },
+    /// The reply to a [`ReplicaReadFrom`](PeerMessage::ReplicaReadFrom): as
+    /// [`ReplicaReadReply`](PeerMessage::ReplicaReadReply), for one page.
+    ReplicaReadChunk {
+        /// The `req_id` of the request answered.
+        req_id: u64,
+        /// The replica's truncation low-water for the key, as of this page.
+        watermark: u64,
+        /// The replica's completeness verdict, as of this page.
+        complete: bool,
+        /// This page's entries, in offset order.
+        entries: Vec<ReplicaEntryWire>,
+        /// Whether entries remain above this page's last offset.
+        more: bool,
+    },
 }
 
 /// What a node did with a forward it was asked to take responsibility for
@@ -913,7 +956,7 @@ mod tests {
         decode, encode, encode_legacy, negotiate_proto, ForwardVerdict, PeerCodecError,
         PeerMessage, ReplicaEntryWire, RetainedWireEntry, SharedGroupWire, SharedMemberWire,
         WireAppProps, MAX_FRAME, PROTO_MAX, PROTO_MIN, PROTO_OWNERSHIP_DOMAIN,
-        PROTO_REPLICATION_FACTOR,
+        PROTO_REPLICATION_FACTOR, PROTO_REPLICA_READ_PAGED,
     };
     use bytes::BytesMut;
 
@@ -1258,10 +1301,51 @@ mod tests {
             Some(PROTO_OWNERSHIP_DOMAIN),
             "a pre-0080 build keeps the proto-8 scale-out capability (ADR 0073)"
         );
+    }
+
+    /// #758: the proto-10 paged-read frames round-trip and are APPENDED after every
+    /// earlier frame (a variant inserted anywhere else re-tags the frames after it).
+    #[test]
+    fn paged_replica_read_frames_roundtrip_at_appended_indices() {
+        let from = PeerMessage::ReplicaReadFrom {
+            req_id: 7,
+            key: "q/c".into(),
+            after: 41,
+            max_bytes: 4 << 20,
+        };
+        let chunk = PeerMessage::ReplicaReadChunk {
+            req_id: 7,
+            watermark: 3,
+            complete: true,
+            entries: vec![ReplicaEntryWire {
+                offset: 42,
+                epoch: 5,
+                seq: 1,
+                record: b"r".to_vec(),
+            }],
+            more: false,
+        };
+        roundtrip(&from);
+        roundtrip(&chunk);
+        let tag = |msg: &PeerMessage| {
+            let mut out = Vec::new();
+            encode(msg, &mut out).unwrap();
+            out[4]
+        };
+        assert_eq!(tag(&from), 26);
+        assert_eq!(tag(&chunk), 27);
+
+        // Gated per link: a proto-9 peer (a pre-#758 build) negotiates 9, keeping
+        // the replication-factor commands and the one-frame read.
+        assert_eq!(
+            negotiate_proto((PROTO_MIN, PROTO_MAX), (6, PROTO_REPLICATION_FACTOR)),
+            Some(PROTO_REPLICATION_FACTOR),
+            "a pre-#758 build keeps the proto-9 replication-factor capability (ADR 0080)"
+        );
         assert_eq!(
             negotiate_proto((PROTO_MIN, PROTO_MAX), (PROTO_MIN, PROTO_MAX)),
-            Some(PROTO_REPLICATION_FACTOR),
-            "this build must announce the proto-9 replication-factor capability (ADR 0080)"
+            Some(PROTO_REPLICA_READ_PAGED),
+            "this build must announce the proto-10 paged recovery read (#758)"
         );
     }
 

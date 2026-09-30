@@ -1557,6 +1557,39 @@ impl ReplicaState {
             })
             .unwrap_or_default()
     }
+
+    /// One page of [`epoch_entries`](Self::epoch_entries) (#758): the entries with
+    /// offset above `after`, in offset order, until their records reach
+    /// `max_bytes` (always at least one entry when any remain), and whether more
+    /// remain above the page. Walks the log from `after`, so paging a long log
+    /// costs its size once, not once per page.
+    #[must_use]
+    pub fn epoch_entries_page(
+        &self,
+        key: &str,
+        after: Offset,
+        max_bytes: usize,
+    ) -> (Vec<EpochEntry>, bool) {
+        let Some(log) = self.logs.get(key) else {
+            return (Vec::new(), false);
+        };
+        let mut page = Vec::new();
+        let mut bytes = 0usize;
+        let mut rest = log.range((Excluded(after), std::ops::Bound::Unbounded));
+        for (offset, ((epoch, seq), record)) in rest.by_ref() {
+            page.push(EpochEntry {
+                epoch: *epoch,
+                seq: *seq,
+                offset: *offset,
+                record: record.clone(),
+            });
+            bytes += record.len();
+            if bytes >= max_bytes {
+                break;
+            }
+        }
+        (page, rest.next().is_some())
+    }
 }
 
 /// Sends replication ops from the lease-holder to its followers.
@@ -3589,6 +3622,38 @@ mod tests {
         let all = log.read(&k, 0, 100).await.unwrap();
         assert_eq!(all.len(), 1);
         assert_eq!(&all[0].record, b"kept");
+    }
+
+    /// #758: a page walks the log from `after`, stops once its records reach the
+    /// budget (never empty while entries remain), and says whether more remain.
+    #[test]
+    fn a_log_is_paged_from_an_offset_within_a_byte_budget() {
+        let mut r = ReplicaState::new();
+        for off in 1..=5u64 {
+            assert!(r.apply(
+                1,
+                &ReplOp::Append {
+                    key: "q/p".into(),
+                    offset: off,
+                    seq: off,
+                    record: vec![0; 10],
+                }
+            ));
+        }
+        let offsets = |p: &[super::EpochEntry]| p.iter().map(|e| e.offset).collect::<Vec<_>>();
+        let (page, more) = r.epoch_entries_page("q/p", 0, 25);
+        assert_eq!((offsets(&page), more), (vec![1, 2, 3], true));
+        let (page, more) = r.epoch_entries_page("q/p", 3, 25);
+        assert_eq!((offsets(&page), more), (vec![4, 5], false));
+        let (page, more) = r.epoch_entries_page("q/p", 0, 1);
+        assert_eq!(
+            (offsets(&page), more),
+            (vec![1], true),
+            "at least one entry"
+        );
+        let (page, more) = r.epoch_entries_page("q/p", 5, 25);
+        assert!(page.is_empty() && !more);
+        assert_eq!(r.epoch_entries_page("q/none", 0, 25), (Vec::new(), false));
     }
 
     /// ADR 0080 §4: once a node has applied a factor change, an op at or below the

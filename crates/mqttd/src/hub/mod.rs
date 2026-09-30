@@ -6447,7 +6447,7 @@ impl Hub {
         // 16 MiB retained snapshot blows its 500 ms deadline and churns elections),
         // bulk replication data rides the ordinary lane.
         if let Some(plane) = &self.durable_plane {
-            plane.register(&node, ctl.clone(), tx.clone());
+            plane.register_with_proto(&node, ctl.clone(), tx.clone(), proto);
         }
         // ADR 0073: remember the negotiated proto across link flaps (removed only
         // on confirmed death) — the ownership-domain capability check reads this.

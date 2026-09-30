@@ -258,7 +258,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `two_bridge_instances_do_not_duplicate_forwarding`
 - `two_partitioned_instances_deliver_each_inbound_message_exactly_once`
 
-## `crates/mqtt-cluster/src/lib.rs` — 354 test(s)
+## `crates/mqtt-cluster/src/lib.rs` — 357 test(s)
 
 - `cluster_identity::tests::a_founder_mints_once_and_reloads_stably`
 - `cluster_identity::tests::a_joiner_adopts_once_and_persists`
@@ -286,6 +286,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `cluster_log::tests::a_joint_recommit_and_fence_need_a_quorum_of_the_new_set_too`
 - `cluster_log::tests::a_key_lives_in_exactly_one_shard`
 - `cluster_log::tests::a_local_tier_append_returns_on_the_owners_durability_alone`
+- `cluster_log::tests::a_log_is_paged_from_an_offset_within_a_byte_budget`
 - `cluster_log::tests::a_missing_shard_fails_the_open_closed`
 - `cluster_log::tests::a_replica_keeps_the_newer_version_of_an_offset`
 - `cluster_log::tests::a_sharded_store_round_trips_every_key_and_survives_reopen`
@@ -449,6 +450,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `node_registry::tests::registry_round_trips_and_is_idempotent`
 - `peer::tests::a_frozen_frame_with_a_lying_inner_length_is_rejected`
 - `peer::tests::an_oversized_frame_is_rejected_at_encode`
+- `peer::tests::paged_replica_read_frames_roundtrip_at_appended_indices`
 - `peer::tests::partial_frame_returns_none`
 - `peer::tests::proto_negotiation_picks_the_newest_common_version_or_rejects`
 - `peer::tests::publish_verdict_and_shared_deliver_acked_roundtrip_at_stable_variant_indices`
@@ -498,6 +500,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `placement::tests::visiting_the_member_set_never_calls_the_allocating_one`
 - `placement::tests::voter_restricted_owner_is_always_a_voter`
 - `raft_mesh::tests::two_nodes_elect_and_replicate_over_the_wire`
+- `repl_net::tests::a_log_larger_than_a_frame_is_read_in_pages`
 - `repl_net::tests::catch_up_requests_reach_the_owner_link`
 - `repl_net::tests::deliver_round_trips_and_applies_on_the_follower`
 - `repl_net::tests::deliver_times_out_on_a_wedged_replica`

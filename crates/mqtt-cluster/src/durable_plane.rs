@@ -457,6 +457,20 @@ impl DurablePlane {
         self.transport.register(node.clone(), bulk);
     }
 
+    /// [`register`](Self::register), with the proto the link negotiated: a link at
+    /// [`crate::peer::PROTO_REPLICA_READ_PAGED`] or above reads in pages (#758).
+    pub fn register_with_proto(
+        &self,
+        node: &NodeId,
+        ctl: mpsc::UnboundedSender<PeerMessage>,
+        bulk: mpsc::UnboundedSender<PeerMessage>,
+        proto: u32,
+    ) {
+        self.network.register(raft_id(node), ctl);
+        self.transport
+            .register_with_proto(node.clone(), bulk, proto);
+    }
+
     /// Fail a peer on both planes when its link drops, so in-flight consensus RPCs
     /// and replication appends resolve rather than hang.
     pub fn fail(&self, node: &NodeId) {
@@ -590,6 +604,62 @@ impl DurablePlane {
             } => {
                 self.transport
                     .complete_read(req_id, watermark, complete, entries);
+                None
+            }
+            // One page of a recovery read (#758): the same verdicts as a
+            // `ReplicaRead`, for the entries above `after` and the watermark, up
+            // to the page's byte budget.
+            PeerMessage::ReplicaReadFrom {
+                req_id,
+                key,
+                after,
+                max_bytes,
+            } => {
+                let group = group_of_key(&key);
+                let set = self
+                    .placement
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .group_replica_set(group);
+                let (watermark, complete, entries, more) = {
+                    let r = self.lock_replicas();
+                    let watermark = r.watermark(&key);
+                    let (page, more) = r.epoch_entries_page(
+                        &key,
+                        after.max(watermark),
+                        usize::try_from(max_bytes).unwrap_or(usize::MAX),
+                    );
+                    (
+                        watermark,
+                        r.complete(&key) && r.group_current(group, &set),
+                        page.into_iter()
+                            .map(|e| crate::peer::ReplicaEntryWire {
+                                offset: e.offset,
+                                epoch: e.epoch,
+                                seq: e.seq,
+                                record: e.record,
+                            })
+                            .collect(),
+                        more,
+                    )
+                };
+                Some(PeerMessage::ReplicaReadChunk {
+                    req_id,
+                    watermark,
+                    complete,
+                    entries,
+                    more,
+                })
+            }
+            PeerMessage::ReplicaReadChunk {
+                req_id,
+                watermark,
+                complete,
+                entries,
+                more,
+            } => {
+                self.transport
+                    .complete_read_chunk(req_id, watermark, complete, entries, more);
                 None
             }
             // Catch-up request (ADR 0043 P1): a replica that entered `key`'s
