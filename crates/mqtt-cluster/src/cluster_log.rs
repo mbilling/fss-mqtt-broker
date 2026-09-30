@@ -1559,10 +1559,13 @@ impl ReplicaState {
     }
 
     /// One page of [`epoch_entries`](Self::epoch_entries) (#758): the entries with
-    /// offset above `after`, in offset order, until their records reach
-    /// `max_bytes` (always at least one entry when any remain), and whether more
-    /// remain above the page. Walks the log from `after`, so paging a long log
-    /// costs its size once, not once per page.
+    /// offset above `after`, in offset order, whose records fit in `max_bytes`,
+    /// and whether more remain above the page. The budget is never exceeded
+    /// except by a page's single first entry, so a page is at most
+    /// `max(max_bytes, one record)`: adding the entry that crosses the budget
+    /// could push a page of small entries plus one large message past the peer
+    /// frame limit, and that page could then never be sent. Walks the log from
+    /// `after`, so paging a long log costs its size once, not once per page.
     #[must_use]
     pub fn epoch_entries_page(
         &self,
@@ -1575,8 +1578,12 @@ impl ReplicaState {
         };
         let mut page = Vec::new();
         let mut bytes = 0usize;
-        let mut rest = log.range((Excluded(after), std::ops::Bound::Unbounded));
-        for (offset, ((epoch, seq), record)) in rest.by_ref() {
+        let mut rest = log
+            .range((Excluded(after), std::ops::Bound::Unbounded))
+            .peekable();
+        while let Some((offset, ((epoch, seq), record))) =
+            rest.next_if(|(_, (_, r))| page.is_empty() || bytes + r.len() <= max_bytes)
+        {
             page.push(EpochEntry {
                 epoch: *epoch,
                 seq: *seq,
@@ -1584,11 +1591,8 @@ impl ReplicaState {
                 record: record.clone(),
             });
             bytes += record.len();
-            if bytes >= max_bytes {
-                break;
-            }
         }
-        (page, rest.next().is_some())
+        (page, rest.peek().is_some())
     }
 }
 
@@ -3624,8 +3628,8 @@ mod tests {
         assert_eq!(&all[0].record, b"kept");
     }
 
-    /// #758: a page walks the log from `after`, stops once its records reach the
-    /// budget (never empty while entries remain), and says whether more remain.
+    /// #758: a page walks the log from `after`, stops before an entry that would
+    /// cross the budget (never empty while entries remain), and says whether more remain.
     #[test]
     fn a_log_is_paged_from_an_offset_within_a_byte_budget() {
         let mut r = ReplicaState::new();
@@ -3641,10 +3645,19 @@ mod tests {
             ));
         }
         let offsets = |p: &[super::EpochEntry]| p.iter().map(|e| e.offset).collect::<Vec<_>>();
+        // 10-byte records, a 25-byte budget: two fit, the third would cross it.
         let (page, more) = r.epoch_entries_page("q/p", 0, 25);
-        assert_eq!((offsets(&page), more), (vec![1, 2, 3], true));
-        let (page, more) = r.epoch_entries_page("q/p", 3, 25);
-        assert_eq!((offsets(&page), more), (vec![4, 5], false));
+        assert_eq!((offsets(&page), more), (vec![1, 2], true));
+        let (page, more) = r.epoch_entries_page("q/p", 2, 25);
+        assert_eq!((offsets(&page), more), (vec![3, 4], true));
+        let (page, more) = r.epoch_entries_page("q/p", 4, 25);
+        assert_eq!((offsets(&page), more), (vec![5], false));
+        let (page, more) = r.epoch_entries_page("q/p", 0, 20);
+        assert_eq!(
+            (offsets(&page), more),
+            (vec![1, 2], true),
+            "exactly at the budget fits"
+        );
         let (page, more) = r.epoch_entries_page("q/p", 0, 1);
         assert_eq!(
             (offsets(&page), more),
