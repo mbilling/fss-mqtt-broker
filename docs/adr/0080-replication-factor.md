@@ -208,6 +208,27 @@ a node clears its stamp when it leaves a set, and an adopted factor arms the cat
   sweep to stamp the wider set (about a second in the three-node test). Not yet measured
   under load.
 
+## Amendment, 2026-09-30 — the capacity gain, measured (T6)
+
+Context predicted that R = 2 carries about 1.5× the durable rate of R = 3 at N = 3, on the
+premise that each node's writer sets the ceiling. Measured on one provisioning of 3 × CCX23
+with the log store ([`bench/scale/0080-replicas-ab-n3.md`](../../bench/scale/0080-replicas-ab-n3.md)):
+
+| | R = 3 | R = 2 |
+|---|---|---|
+| certified GREEN knee | 90,000 msg/s (15 sites) | 90,000 msg/s (15 sites) |
+| 108,000 msg/s offered | never steady, 104,716/s | steady in 16 s, 107,355/s (not certified: scrape window) |
+| most delivered | 104,716/s (108,832/s on the earlier hosts) | 122,594/s, at the fleet's 126,000 offer ceiling |
+| writer ops/s per node at 90,000 msg/s | 99,025–99,037 | 62,335–69,599 |
+
+R = 2 does remove a third of each node's replication work, as the R / N arithmetic says,
+but that buys about 17% more throughput, not 50%: at this load the brokers are CPU-bound
+(80–95% busy) at both factors, with the disks under 27% utilised and the drivers under 40%
+busy. Receiving, routing and delivering a message cost CPU that does not depend on R. The
+Consequences' "about 1.5× the durable rate" is therefore about 1.17× on this hardware; the
+storage saving (a third less per node) stands. The comparison with HiveMQ still uses equal
+copy counts, which was the default's other reason.
+
 ## Alternatives considered
 
 - **Keep R = 3 and document the difference.** Honest, but it leaves a third of every
