@@ -214,7 +214,7 @@
 
 **0080 — # 0080. The replication factor is cluster state: configurable, default 2, changeable live**
 
-- `0080-T6` ⬜ planned ([#705](https://github.com/mbilling/fss-mqtt-broker/issues/705)): "Evidence: R=2 against R=3 on the calibration shape (paid)" — "3 × CCX23, durable QoS 1, log store, one provisioning. Expected ~1.5x the durable ceiling at N=3."
+- `0080-T6` ⬜ planned ([#705](https://github.com/mbilling/fss-mqtt-broker/issues/705)): "Evidence: R=2 against R=3 on the calibration shape (paid)" — "Run 2026-09-30 (bench/scale/0080-replicas-ab-n3.md): same certified knee (90k msg/s), R=2 ceiling ~17% higher (122.6k vs 104.7k delivered), writer ops/node a third lower; brokers CPU-bound at both factors, so not the predicted 1.5x. Flipped to done in a follow-up PR."
 
 **0081 — # 0081. An authenticated admin API: reads cluster-wide, actions audited, config stays in the file**
 

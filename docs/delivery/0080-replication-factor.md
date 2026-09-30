@@ -37,7 +37,7 @@ tasks:
     title: "Evidence: R=2 against R=3 on the calibration shape (paid)"
     status: planned
     issue: 705
-    notes: "3 × CCX23, durable QoS 1, log store, one provisioning. Expected ~1.5x the durable ceiling at N=3."
+    notes: "Run 2026-09-30 (bench/scale/0080-replicas-ab-n3.md): same certified knee (90k msg/s), R=2 ceiling ~17% higher (122.6k vs 104.7k delivered), writer ops/node a third lower; brokers CPU-bound at both factors, so not the predicted 1.5x. Flipped to done in a follow-up PR."
 ---
 
 # Delivery: ADR 0080 — the replication factor is cluster state
@@ -53,7 +53,7 @@ frontmatter above · this file is the plan, progress log, and changelog.
 | 0080-T3 | ✅ done | [#702](https://github.com/mbilling/fss-mqtt-broker/issues/702) | 2026-09-30 | "PR #740. R=2 validated on redb and the log store: cluster 6, durable_sessions 13, cluster_stress 13, cluster_proc 5, cluster_chaos 6, decommission 3, inflight_durability 3, persistence 2, backup_restore 8 — plus default suites and cluster_upgrade 2/2. Harnesses found at MQTTD_REPLICAS and readiness requires every node to report the founded factor. Two tests that assumed R=3 on three nodes made R-agnostic. Found and fixed #727: a caught-up stamp outlived the node's membership of the group's set, so a re-entering node could answer a recovery read 'complete' for history it never received (acked data lost once in ~30 runs); the stamp is now cleared on leaving a set and an adopted factor arms the sweep (0 complete-but-empty reads in 198 recoveries vs ~1 in 9; regression test fails with either half removed). Write pause measured (replication_pause.rs): R=2 pauses more groups than R=3 (38 vs 30 of 48 on a crash) for about as long (~15 s, failover — #738); ADR amended." |
 | 0080-T4 | ✅ done | [#703](https://github.com/mbilling/fss-mqtt-broker/issues/703) | 2026-09-30 | "PR #742. durable.replicas / MQTTD_REPLICAS defaults to 2 for NEW clusters; existing clusters have no committed factor and keep 3 (moving them is T5). Example config, COMPARISON (quorum R=3 -> 2 copies, both ack, configurable 2-7) and CONFIGURATION.md follow. Validated at the new default with no MQTTD_REPLICAS set, both stores: cluster, durable_sessions, cluster_stress, cluster_proc, cluster_chaos, decommission, inflight_durability, persistence, backup_restore, check_config all pass; cluster_upgrade --include-ignored 2/2 (a baseline-founded cluster keeps its legacy 3)." |
 | 0080-T5 | ✅ done | [#704](https://github.com/mbilling/fss-mqtt-broker/issues/704) | 2026-09-30 | "PR #744. A reload of durable.replicas proposes; the lease leader opens BeginReplicaChange (records since, re-mints every lease in the same entry) or refuses/holds it on /statusz. Owners read the record with the lease epoch, so every log above since counts acks by the joint rule (majority of the larger set and of its prefix) in appends, re-commits, the fence round, durable truncation and recovery; nodes raise replica fences above since. The leader verifies every entry at or below since is on a majority of the new set, has owners re-commit short keys, then commits; a shrink collects dropped copies once the new set holds them. cluster_stress 2->3->2 under acked QoS 1 load loses nothing and collects every dropped copy; nine durability suites pass on both stores; local load check level with main (no stall, no drops)." |
-| 0080-T6 | ⬜ planned | [#705](https://github.com/mbilling/fss-mqtt-broker/issues/705) | — | "3 × CCX23, durable QoS 1, log store, one provisioning. Expected ~1.5x the durable ceiling at N=3." |
+| 0080-T6 | ⬜ planned | [#705](https://github.com/mbilling/fss-mqtt-broker/issues/705) | — | "Run 2026-09-30 (bench/scale/0080-replicas-ab-n3.md): same certified knee (90k msg/s), R=2 ceiling ~17% higher (122.6k vs 104.7k delivered), writer ops/node a third lower; brokers CPU-bound at both factors, so not the predicted 1.5x. Flipped to done in a follow-up PR." |
 <!-- /status-table:0080 -->
 
 ## Plan
@@ -76,3 +76,4 @@ frontmatter above · this file is the plan, progress log, and changelog.
 - 2026-09-30: T3 done (#740): R=2 validated; #727 found and fixed; the write pause measured and the ADR amended.
 - 2026-09-30: T4 done (#742): new clusters default to 2 replicas.
 - 2026-09-30: T5 done (#744): the replication factor changes live through a reload; ADR amended with the design as built.
+- 2026-09-30: T6 measured: R=2 raises the 3-node durable ceiling about 17%, not 1.5x (the brokers are CPU-bound); ADR amended.
