@@ -87,7 +87,7 @@
 | [0077](../adr/0077-workload-targeted-performance.md) | # 0077. Workload-targeted performance — a shape is not a result without its tail | Proposed | [6/10 done](0077-workload-targeted-performance.md) | 4 open |
 | [0078](../adr/0078-replica-segment-log.md) | # 0078. The replica store becomes an append-only segment log — the disk is the limit, not the B-tree | Accepted | [3/4 done](0078-replica-segment-log.md) | 1 open |
 | [0079](../adr/0079-global-allocator.md) | # 0079. mqttd links mimalloc as its global allocator | Accepted | [1/2 done](0079-global-allocator.md) | 1 open |
-| [0080](../adr/0080-replication-factor.md) | # 0080. The replication factor is cluster state: configurable, default 2, changeable live | Accepted | [5/6 done](0080-replication-factor.md) | 1 open |
+| [0080](../adr/0080-replication-factor.md) | # 0080. The replication factor is cluster state: configurable, default 2, changeable live | Accepted | [6/6 done](0080-replication-factor.md) | — |
 | [0081](../adr/0081-admin-api.md) | # 0081. An authenticated admin API: reads cluster-wide, actions audited, config stays in the file | Accepted | [12/14 done](0081-admin-api.md) | 2 deferred |
 
 ## Open and deferred work
@@ -211,10 +211,6 @@
 **0079 — # 0079. mqttd links mimalloc as its global allocator**
 
 - `0079-T2` ⬜ planned ([#684](https://github.com/mbilling/fss-mqtt-broker/issues/684)): "Evidence — per-op commit cost and RSS on the shipped binary, on the calibration shape" — "Measured in the same paid run as ADR 0078 T4: the durable writer's ms/op against the musl-allocator run of 2026-09-28 (~0.024 ms/op), plus idle and post-burst RSS."
-
-**0080 — # 0080. The replication factor is cluster state: configurable, default 2, changeable live**
-
-- `0080-T6` ⬜ planned ([#705](https://github.com/mbilling/fss-mqtt-broker/issues/705)): "Evidence: R=2 against R=3 on the calibration shape (paid)" — "Run 2026-09-30 (bench/scale/0080-replicas-ab-n3.md): same certified knee (90k msg/s), R=2 ceiling ~17% higher (122.6k vs 104.7k delivered), writer ops/node a third lower; brokers CPU-bound at both factors, so not the predicted 1.5x. Flipped to done in a follow-up PR."
 
 **0081 — # 0081. An authenticated admin API: reads cluster-wide, actions audited, config stays in the file**
 
