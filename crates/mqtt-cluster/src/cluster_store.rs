@@ -575,11 +575,14 @@ impl<S: LeaseSource, T: ReplicaTransport + Clone + 'static> GroupRoutedLog<S, T>
     /// sweep. See the call site for the safety argument; the invariants enforced here:
     ///
     /// 1. the durable roster is fully known (an unobservable member might hold
-    ///    history — refuse) and current: it names this node and every member of
-    ///    the set. A node that has not caught up the lease log yet holds the
-    ///    membership from before it joined, empty on a fresh node; sweeping that
-    ///    reads nobody and would serve an empty union as the key's whole history
-    ///    (#755) — refuse;
+    ///    history — refuse) and current: it names this node. A node that has not
+    ///    caught up the lease log yet holds the membership from before it joined,
+    ///    empty on a fresh node; sweeping that reads nobody and would serve an
+    ///    empty union as the key's whole history (#755) — refuse. A member of the
+    ///    SET missing from the roster is no reason to refuse: set members are read
+    ///    as the set, and a node the lease group dropped while it was dead is
+    ///    re-admitted a moment after gossip sees it alive again, the window a
+    ///    recovery of its groups falls in (#758);
     /// 2. EVERY roster member outside the current set answers the read (one silent
     ///    member could hold the only copy of a committed entry — refuse);
     /// 3. the merged union is gap-free: no read may hold an entry above what the
@@ -603,7 +606,7 @@ impl<S: LeaseSource, T: ReplicaTransport + Clone + 'static> GroupRoutedLog<S, T>
         if unknown > 0 {
             return Err(ReplError::NoQuorum); // an unobservable member might hold history
         }
-        if !known.contains(&self.local) || replica_set.iter().any(|n| !known.contains(n)) {
+        if !known.contains(&self.local) {
             return Err(ReplError::NoQuorum); // a roster from before we joined: stale
         }
         let extras: Vec<NodeId> = known
@@ -1951,11 +1954,13 @@ mod tests {
             "an empty roster must not certify an empty history"
         );
 
-        // Caught up: the roster names everyone, `old` is swept, the entry is back.
+        // Caught up on this node's own admission, while `mate` (a member of the
+        // set, just back from the dead) is not re-admitted yet: `old` is swept and
+        // the entry is back. `mate` missing from the roster must not refuse.
         placement
             .write()
             .unwrap()
-            .set_durable_roster([new, mate, old].into_iter().collect(), 0);
+            .set_durable_roster([new, old].into_iter().collect(), 0);
         let recovered = log.read(&qkey, 0, 10).await.unwrap();
         assert_eq!(recovered.len(), 1);
         assert_eq!(recovered[0].record, b"acked");
