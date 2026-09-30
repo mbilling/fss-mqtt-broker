@@ -258,7 +258,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `two_bridge_instances_do_not_duplicate_forwarding`
 - `two_partitioned_instances_deliver_each_inbound_message_exactly_once`
 
-## `crates/mqtt-cluster/src/lib.rs` — 351 test(s)
+## `crates/mqtt-cluster/src/lib.rs` — 352 test(s)
 
 - `cluster_identity::tests::a_founder_mints_once_and_reloads_stably`
 - `cluster_identity::tests::a_joiner_adopts_once_and_persists`
@@ -314,6 +314,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `cluster_log::tests::merge_takes_the_contiguous_run_from_a_quorum`
 - `cluster_log::tests::merge_truncates_a_tail_whose_tag_regresses`
 - `cluster_log::tests::pipelined_appends_overlap_and_commit_in_offset_order`
+- `cluster_log::tests::raised_fences_refuse_every_pre_change_epoch`
 - `cluster_log::tests::recommit_requires_a_write_quorum_for_the_recovered_base`
 - `cluster_log::tests::recovered_log_serves_seeded_entries_and_continues`
 - `cluster_log::tests::replica_state_survives_reopen`
