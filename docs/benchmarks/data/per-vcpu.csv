@@ -1,0 +1,18 @@
+# Throughput per vCPU and per physical core, one row per published or measured figure.
+# Compare rows only within one workload class: the classes differ by 2-10x in cost per message.
+# vcpu_is: "smt-thread" (a vCPU is one hyperthread; 2 per physical core) or "core" (no SMT),
+# or "unknown" when the source does not say. physical_cores is derived from it.
+# origin: "measured" (our harness, our hosts) or "published" (the vendor's own report).
+# payload_bytes is the application payload; the audited QoS 1 driver appends 16 bytes (216 = 200 + 16).
+# Blank means the source does not state it.
+class,broker,version,date,origin,msg_per_s,nodes,instance,cpu,vcpu,vcpu_is,physical_cores,payload_bytes,connections,note,source
+single-node-qos0,mqttd,1.0.17,2026-09-16,measured,75000,1,Hetzner CCX23,AMD EPYC Milan,4,smt-thread,2,200,6000,GREEN knee; same host as the three below,docs/benchmarks/SINGLE-NODE-COMPARISON.md
+single-node-qos0,Mosquitto,2.0.20,2026-09-16,measured,45000,1,Hetzner CCX23,AMD EPYC Milan,4,smt-thread,2,200,3600,single-threaded: uses one of the four vCPUs,docs/benchmarks/SINGLE-NODE-COMPARISON.md
+single-node-qos0,EMQX,5.8.6,2026-09-16,measured,45000,1,Hetzner CCX23,AMD EPYC Milan,4,smt-thread,2,200,3600,GREEN knee,docs/benchmarks/SINGLE-NODE-COMPARISON.md
+single-node-qos0,HiveMQ CE,2024.3,2026-09-16,measured,30000,1,Hetzner CCX23,AMD EPYC Milan,4,smt-thread,2,200,2400,GREEN knee,docs/benchmarks/SINGLE-NODE-COMPARISON.md
+cluster-qos0,mqttd,main-0a08187,2026-09-26,measured,1140000,10,Hetzner CCX23,AMD EPYC Milan,40,smt-thread,20,200,45000,~114k msg/s per node; 810k certified at 7 nodes,bench/scale/knee-3-5-7-10.md
+cluster-qos0,EMQX,4.3,2021,published,505000,5,32-core hosts,not published,160,unknown,,50,10000000,1:1 at 10M connections,https://www.emqx.com/en/resources/emqx-v-4-3-0-ten-million-connections-performance-test-report
+cluster-qos1,mqttd,1.0.18,2026-09-26,measured,390000,10,Hetzner CCX23,AMD EPYC Milan,40,smt-thread,20,216,,clean sessions; $share consumers,docs/benchmarks/QOS1-SCALE-CURVE.md
+cluster-qos1,HiveMQ,4.18,2023,published,270000,3,AWS m6a.8xlarge,AMD EPYC Milan,96,smt-thread,48,,20000,session persistence not published; payload not published,https://www.hivemq.com/blog/hivemq-4-18-delivers-higher-mqtt-throughput/
+cluster-qos1,EMQX,5.0,2022,published,1000000,23,AWS c6g.metal,AWS Graviton2,1472,core,1472,256,100000000,inbound rate; at 100M connections,https://www.emqx.com/en/blog/reaching-100m-mqtt-connections-with-emqx-5-0
+cluster-durable-qos1,mqttd,main-039232d,2026-09-30,measured,90000,3,Hetzner CCX23,AMD EPYC Milan,12,smt-thread,6,216,9300,acked after fsync + quorum; same knee at 2 and 3 replicas; unreleased build,bench/scale/0080-replicas-ab-n3.md
