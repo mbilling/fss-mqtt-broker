@@ -1,0 +1,20 @@
+# Shared settings for the admin-API end-to-end cluster; per-node values come from env.
+[listeners]
+plaintext_bind = "0.0.0.0:1883"
+health_bind = "0.0.0.0:8080"
+
+[security]
+allow_anonymous = true
+acl_file = "/e2e/acl.toml"
+
+[durable]
+allow_ephemeral = true
+
+[cluster.peer_tls]
+ca = "/e2e/pki/cluster-ca.pem"
+
+[admin]
+bind = "0.0.0.0:9443"
+client_ca = "/e2e/pki/admin-ca.pem"
+viewers = ["CN=oncall"]
+operators = ["CN=root, O=example"]

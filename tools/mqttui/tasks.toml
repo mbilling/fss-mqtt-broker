@@ -456,6 +456,66 @@ default = "ghcr.io/mbilling/fss-mqtt-broker:latest"
 help = "Image to exercise"
 
 [[task]]
+id = "admin-e2e"
+group = "Try it"
+name = "Try the admin API on a three-node cluster, or check every admin command"
+script = "scripts/admin-e2e.sh"
+about = """
+Starts a three-node mqttd cluster in Docker with cluster mTLS and the admin API (ADR 0081)
+on every node, then either leaves it running for you (`up`, then `env` prints the exports
+that point `mqttd --admin` at it) or checks every admin command end to end (`test`): roles,
+the cluster view from each node, clients/sessions/subscribers/backlog/retained with real
+MQTT clients, the authorization dry run, config and reload (including a rejected edit),
+kick with the client receiving DISCONNECT 0x98, purge, cordon, the log override, audit
+records, and the offline commands inside a container. Each admin verb goes through the CLI
+and through curl. `all` = up, test, down.
+
+It found a real bug the unit tests missed (kick of a clean-session client forwarded to the
+placement owner, which never held it — fixed in #746).
+"""
+requires = ["docker", "openssl", "curl", "python3", "mosquitto_pub", "mosquitto_sub", "cargo"]
+needs_checkout = true
+duration = "~15 min the first time (image build), ~2 min after"
+args = ["${ACTION}"]
+[[task.env]]
+name = "ACTION"
+default = "all"
+help = "up | env | test | down | all"
+
+[[task]]
+id = "admin-e2e-pki"
+group = "Try it"
+name = "Mint the admin-e2e cluster's throwaway PKI (run by admin-e2e)"
+script = "scripts/admin-e2e/pki.sh"
+hidden = true
+needs_checkout = true
+about = """
+Helper of admin-e2e: a cluster CA with one certificate per node and an admin CA with a viewer, an operator and an unlisted identity, written to the directory it is given.
+"""
+
+[[task]]
+id = "admin-e2e-checks"
+group = "Try it"
+name = "Run the admin-e2e checks (run by admin-e2e test)"
+script = "scripts/admin-e2e/checks.sh"
+hidden = true
+needs_checkout = true
+about = """
+Helper of admin-e2e: the PASS/FAIL checks against the running kit cluster. Needs the state directory and BIN, which admin-e2e supplies; it edits node 1's config and cordons node 3, restoring both.
+"""
+
+[[task]]
+id = "admin-e2e-raw-v5"
+group = "Try it"
+name = "A never-reconnecting MQTT 5 client (used by admin-e2e)"
+script = "scripts/admin-e2e/raw_v5.py"
+hidden = true
+needs_checkout = true
+about = """
+Helper of admin-e2e: connects, then prints every packet until the server closes, so a kick's DISCONNECT reason code is observable (mosquitto_sub reconnects).
+"""
+
+[[task]]
 id = "compose-smoke"
 group = "Try it"
 name = "Bring the shipped compose reference deployment up in containers"
