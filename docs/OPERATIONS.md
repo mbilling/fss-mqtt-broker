@@ -62,7 +62,7 @@ A single shared certificate cannot work, however it is minted (issue #262). Four
 three of which fail at runtime rather than at issue time:
 
 1. **CN == node id == pod name.** A peer may only claim the id its certificate attests to
-   ([ADR 0004](adr/0004-authentication-authorization.md)); a mismatch logs `peer Hello node
+   ([ADR 0004](adr/0004-identity-and-authentication.md)); a mismatch logs `peer Hello node
    id does not match its certificate Common Name` and drops the link.
 2. **A SAN covering that pod's advertise host** —
    `<pod>.<release>-mqttd-headless.<ns>.svc.cluster.local`. That is the name a dialing peer
@@ -443,7 +443,7 @@ kubectl -n <ns> apply -f deploy/helm/mqttd-operator/example-mqttdcluster.yaml
 ```
 
 The operator image is cut by the same release pipeline as the broker — signed
-(cosign, keyless), SBOM-attested, reproducible ([RELEASING](RELEASING.md)) — and the
+(cosign, keyless), SBOM-attested, reproducible ([RELEASING](../RELEASING.md)) — and the
 chart forward-pins the first release that publishes it (`v0.9.1`, the same
 gate-proven pin as the compose default; until that tag is pushed the image is not on
 GHCR). Render parity between the operator and the chart is a per-PR CI gate: both
@@ -836,6 +836,9 @@ Everything below runs from the `mqttd` binary itself, so it works in the distrol
 | Remove a node for good | `mqttd --decommission` |
 
 ## The admin API (ADR 0081)
+
+The full references are [ADMIN-CLI.md](ADMIN-CLI.md) (every command) and
+[ADMIN-API.md](ADMIN-API.md) (every endpoint); this section is the operator's summary.
 
 **Try it first.** `scripts/admin-e2e.sh up` starts a three-node cluster in Docker with the
 admin API on every node and prints the exports that point `mqttd --admin` at it (viewer and

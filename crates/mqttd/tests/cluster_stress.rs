@@ -2038,6 +2038,27 @@ async fn a_decommissioned_nodes_departure_loses_nothing() {
 
     // A durable subscriber owned by the node we will remove — the sharpest
     // case: its session's data AND its attach point both walk out the door.
+    // Readiness counts members and voters, not lease rebalancing: the leaver may
+    // own no group yet when it returns, so wait until the assigner has moved one
+    // onto it. Poll the 256 group owners, not client ids: a client-id scan per
+    // poll burns a core and starves the other cluster tests in this binary.
+    {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let owns = {
+                let p = leaver.placement.read().unwrap();
+                (0..mqtt_cluster::placement::NUM_GROUPS).any(|g| p.group_owner(g) == leaver.node_id)
+            };
+            if owns {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the leaver never came to own a group"
+            );
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    }
     let sub_id = {
         let p = leaver.placement.read().unwrap();
         (0..100_000)
@@ -3449,8 +3470,9 @@ async fn the_replication_factor_changes_live_both_ways_without_losing_an_acked_m
     let b = start_stress_node_at("rf-b", vec![a.swim_addr.clone()], &dir("b"), 2).await;
     let c = start_stress_node_at("rf-c", vec![a.swim_addr.clone()], &dir("c"), 2).await;
     let nodes = [&a, &b, &c];
+    // 120 s: CI runs every cluster test of this binary at once on a few vCPUs.
     assert!(
-        wait_factor(&nodes, 2, Duration::from_secs(60)).await,
+        wait_factor(&nodes, 2, Duration::from_secs(120)).await,
         "the cluster never founded at 2"
     );
     wait_members(&nodes, 3).await;

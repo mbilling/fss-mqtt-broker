@@ -145,8 +145,12 @@ originally over the peer bus.)
   that rejection.
 - The peer protocol is unchanged: node-to-node admin traffic uses the admin listeners
   (amendment below).
-- Endpoint paths and JSON field names become a compatibility surface. They are `v1` and
-  unstable until 1.0 (pre-1.0 policy); from 1.0 the ADR 0058 contract applies.
+- Endpoint paths and JSON field names become a compatibility surface. The `[admin]` keys
+  fall under ADR 0058's frozen config surface. ADR 0058 does not enumerate HTTP interfaces;
+  this one follows mqttd's semantic version (decided 2026-09-30 — the line first said
+  "unstable until 1.0", but the API shipped after v1.0.0): a patch release does not change
+  it, a minor release only adds to it, and only a major release may break it, with the path
+  version following the major (`/admin/v2` in mqttd 2.x).
 
 ## Alternatives considered
 

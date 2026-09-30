@@ -596,6 +596,27 @@ Memory watermark at 75–85% of the container limit; the container limit is the 
 | Dashboards | Grafana for broker + bridge: [`deploy/observability/`](deploy/observability/); alert runbooks: [OPERATIONS.md](docs/OPERATIONS.md) |
 | Demo | `cd demo && docker compose up --build` → cluster + Grafana + Prometheus + Alloy at `localhost:3000` |
 
+## Admin API & CLI
+
+An authenticated admin API — its own mTLS listener, `viewer` and `operator` roles, every
+request audited — answers what metrics cannot, and `mqttd --admin` drives it from the same
+binary (so it works in the distroless image). Off until `admin.bind` is set; it never writes
+configuration.
+
+```sh
+mqttd --admin cluster                        # every node, from any node: ready, version, lag, agreement
+mqttd --admin clients --prefix sensor-       # who is connected, from where
+mqttd --admin session sensor-7               # subscriptions, in flight, backlog, owner
+mqttd --admin authz device-7 publish plant/7/temp   # allowed? which ACL rule decided?
+mqttd --admin reload                         # re-read the config file; says what changed or why not
+mqttd --admin kick sensor-7                  # operator: disconnect (MQTT 5 reason 0x98), from any node
+mqttd --admin cordon                         # operator: stop new connections without draining
+```
+
+Try it on a local three-node cluster: `scripts/admin-e2e.sh up`. Reference:
+[ADMIN-CLI.md](docs/ADMIN-CLI.md) (every command) · [ADMIN-API.md](docs/ADMIN-API.md) (every
+endpoint, roles, errors).
+
 ---
 
 ## Architecture
@@ -656,7 +677,7 @@ Index: [docs/README.md](docs/README.md)
 | Evaluate | [EVALUATION.md](docs/EVALUATION.md) · [COMPARISON.md](docs/COMPARISON.md) |
 | Deploy | [SECURED-CLUSTER-TUTORIAL.md](docs/SECURED-CLUSTER-TUTORIAL.md) · [KUBERNETES.md](docs/KUBERNETES.md) |
 | Build clients | [CLIENT-GUIDE.md](docs/CLIENT-GUIDE.md) |
-| Operate | [OPERATIONS.md](docs/OPERATIONS.md) · [SIZING.md](docs/SIZING.md) · [TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) |
+| Operate | [OPERATIONS.md](docs/OPERATIONS.md) · [ADMIN-CLI.md](docs/ADMIN-CLI.md) · [ADMIN-API.md](docs/ADMIN-API.md) · [SIZING.md](docs/SIZING.md) · [TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) |
 | Audit | [THREAT-MODEL.md](docs/THREAT-MODEL.md) · [HARDENING.md](docs/HARDENING.md) · [compliance/](docs/compliance/) |
 | Migrate | [MIGRATION.md](docs/MIGRATION.md) |
 | Decisions | [adr/](docs/adr/) · [delivery dashboard](docs/delivery/STATUS.md) |
