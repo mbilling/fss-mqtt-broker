@@ -1420,12 +1420,26 @@ pub async fn oracle_acked_facts(proc: &mut Proc) {
                 conn.disconnect().await;
             }
         }
-        proc.bring_subscriber_online(i, true).await;
-        proc.drain_subscriber(i).await;
-        proc.drain_subscriber(i).await; // settle a replay racing the window
-
         let topic = proc.subs[i].topic.clone();
         let owed = proc.acked.get(&topic).cloned().unwrap_or_default();
+        // A client reconnects when the broker closes its connection. The broker does
+        // exactly that when it cannot read a resumed session's queue for replay (a
+        // lease moved under it), so a server close is a retry, not a verdict. A
+        // connection still open with payloads missing is.
+        for _ in 0..5 {
+            proc.bring_subscriber_online(i, true).await;
+            proc.drain_subscriber(i).await;
+            proc.drain_subscriber(i).await; // settle a replay racing the window
+            let all_in = owed.iter().all(|p| proc.subs[i].received.contains(p));
+            if all_in || proc.subs[i].conn.is_some() {
+                break;
+            }
+            proc.note(format!(
+                "{}: connection closed by the broker during replay; reconnecting",
+                proc.subs[i].id
+            ));
+        }
+
         let missing: Vec<String> = owed
             .iter()
             .filter(|p| !proc.subs[i].received.contains(*p))

@@ -132,6 +132,7 @@ production emissions, not the full MQTT 5 catalogue in `mqtt-codec`.
 | `0x82` | `PROTOCOL_ERROR` | Protocol violation (illegal packet for the current state). | provoked in integration tests |
 | `0x84` | `UNSUPPORTED_PROTOCOL_VERSION` | Mapped in `conn.rs::codec_reason` for totality; unreachable on the wire (CONNECT with an unsupported protocol level closes silently per [MQTT-3.14.0-1]). | exempt (see `scripts/check-reason-codes.py`) |
 | `0x87` | `NOT_AUTHORIZED` | Authentication or ACL denial (CONNACK, PUBACK/PUBREC, DISCONNECT on revocation sweep). | provoked in integration tests |
+| `0x89` | `SERVER_BUSY` | A resumed session's queue could not be read for replay (its group's log was being rebuilt); reconnect and the replay runs again (issue #762). | exempt (see `scripts/check-reason-codes.py`) |
 | `0x8b` | `SERVER_SHUTTING_DOWN` | Graceful drain of live v5 sessions (ADR 0019 / `SIGTERM`). | exempt (see `scripts/check-reason-codes.py`) |
 | `0x8c` | `BAD_AUTHENTICATION_METHOD` | Enhanced-authentication method the broker does not accept. | provoked in integration tests |
 | `0x8f` | `TOPIC_FILTER_INVALID` | SUBSCRIBE/UNSUBSCRIBE filter the broker rejects (including a malformed `$share/...`). | provoked in integration tests |

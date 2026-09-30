@@ -40,6 +40,7 @@ WHEN_EMITTED: dict[int, str] = {
     0x82: "Protocol violation (illegal packet for the current state).",
     0x84: "Mapped in `conn.rs::codec_reason` for totality; unreachable on the wire (CONNECT with an unsupported protocol level closes silently per [MQTT-3.14.0-1]).",
     0x87: "Authentication or ACL denial (CONNACK, PUBACK/PUBREC, DISCONNECT on revocation sweep).",
+    0x89: "A resumed session's queue could not be read for replay (its group's log was being rebuilt); reconnect and the replay runs again (issue #762).",
     0x8B: "Graceful drain of live v5 sessions (ADR 0019 / `SIGTERM`).",
     0x8C: "Enhanced-authentication method the broker does not accept.",
     0x8F: "SUBSCRIBE/UNSUBSCRIBE filter the broker rejects (including a malformed `$share/...`).",
@@ -69,6 +70,16 @@ EXEMPT: dict[int, str] = {
         "driving a duplex stream, and this gate deliberately counts integration "
         "provocations only. TODO: drive a drain from the in-process harness so "
         "the code is observed on a real socket, then delete this entry."
+    ),
+    0x89: (
+        "SERVER_BUSY — sent to a v5 client whose resumed session's queue could not "
+        "be read for replay, so it reconnects and the replay runs again "
+        "(hub.rs::close_for_retry, #762). Covered by the hub unit test "
+        "`a_failed_replay_read_closes_the_connection_instead_of_stranding_the_queue`, "
+        "which asserts this exact code on an mpsc channel; this gate counts "
+        "integration provocations only. Provoking it on a socket needs a store read "
+        "to fail mid-attach, which the in-process MemorySessionStore cannot do. "
+        "TODO: provoke it in the out-of-process cluster harness, then delete this entry."
     ),
     0x9C: (
         "USE_ANOTHER_SERVER — sent to a v5 session this node no longer owns after "
