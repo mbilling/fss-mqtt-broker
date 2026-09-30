@@ -1867,8 +1867,9 @@ mod tests {
     /// data-less newcomers, the key's only copy sits on an old member outside it,
     /// and "every roster member answered" is vacuously true of an empty roster:
     /// the fallback used to read nobody and serve an empty queue as the key's
-    /// whole history. A roster that does not name this node and the set must be
-    /// refused; once it does, the sweep reads the old member and recovers the entry.
+    /// whole history. A roster that does not name this node must be refused; once
+    /// it does, the sweep reads the old member and recovers the entry, even while
+    /// a member of the set is not back on the roster yet (#758).
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_roster_from_before_this_node_joined_cannot_certify_an_empty_history() {
         use std::collections::BTreeSet;
