@@ -649,6 +649,8 @@ fn forward_inbound(
         | PeerMessage::RaftRpcReply { .. }
         | PeerMessage::ReplicaRead { .. }
         | PeerMessage::ReplicaReadReply { .. }
+        | PeerMessage::ReplicaReadFrom { .. }
+        | PeerMessage::ReplicaReadChunk { .. }
         | PeerMessage::ReplicaCatchUp { .. }
         | PeerMessage::ReplicaCatchUpTo { .. }
         | PeerMessage::ReplicaKeys { .. }
@@ -877,6 +879,8 @@ fn forward_inbound(
         | PeerMessage::RaftRpcReply { .. }
         | PeerMessage::ReplicaRead { .. }
         | PeerMessage::ReplicaReadReply { .. }
+        | PeerMessage::ReplicaReadFrom { .. }
+        | PeerMessage::ReplicaReadChunk { .. }
         | PeerMessage::ReplicaCatchUp { .. }
         | PeerMessage::ReplicaCatchUpTo { .. }
         | PeerMessage::ReplicaKeys { .. }
