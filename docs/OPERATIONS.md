@@ -793,6 +793,48 @@ names. The cost is the reason it is no longer the only path: stopping a node mea
 decommission drain, whose measured per-pod cost is issue #248's, and during it the cluster
 runs one replica short. Use it deliberately, not as routine DR.
 
+## Day 0, 1 and 2 from the command line
+
+Everything below runs from the `mqttd` binary itself, so it works in the distroless image
+(`kubectl exec <pod> -- mqttd …`). The `--admin` verbs need the [admin API](#the-admin-api-adr-0081).
+
+**Day 0: before the first boot**
+
+| Question | Command |
+|---|---|
+| Is the config valid? | `mqttd --check-config --config mqttd.toml` |
+| …and will it start on *this* host (files readable, binds free)? | `mqttd --check-config --preflight --config mqttd.toml` |
+| What will it actually run with (file + env + defaults)? | `mqttd --print-config --config mqttd.toml` (secrets fingerprinted) |
+| Are the certificates right (chain, key match, expiry, SANs)? | `mqttd --check-tls --config mqttd.toml` |
+| A password-file line | `mqttd --hash-password alice` |
+
+**Day 1: bring-up**
+
+| Question | Command |
+|---|---|
+| Is this node live and ready? | `mqttd --probe /readyz` |
+| Did every node join, on one cluster id, one version, one config? | `mqttd --admin cluster` (the `summary` block) |
+| Does every node see the same membership? | `mqttd --admin placement` |
+| Which certificate identity and role do I have? | `mqttd --admin whoami` |
+| Is the policy right for a device before it connects? | `mqttd --admin authz device-7 publish devices/device-7/temp` |
+| First backup | `mqttd --backup` |
+
+**Day 2: running it**
+
+| Question | Command |
+|---|---|
+| Which clients are here, from where? | `mqttd --admin clients [--prefix p] [--user u] [--source 10.1.]` |
+| Why is this session's queue growing? | `mqttd --admin session <client>`, `mqttd --admin backlog` |
+| Who receives this topic? | `mqttd --admin subscribers <topic>` |
+| Why is this client denied? | `mqttd --admin authz <user> <action> <target>` |
+| What retained data is there? | `mqttd --admin retained --prefix p` |
+| Is the running config the committed one? | `mqttd --admin config` (`file_checksum`) |
+| Did my config change take? | `mqttd --admin reload` (outcome, or 409 with the reason) |
+| Get a misbehaving client off | `mqttd --admin kick <client>`; delete its session: `purge` |
+| Stop new connections to a node (keep the current ones) | `mqttd --admin cordon` / `uncordon` |
+| More logging for 15 minutes | `mqttd --admin log-override 'mqttd::hub=debug' --ttl 900` |
+| Remove a node for good | `mqttd --decommission` |
+
 ## The admin API (ADR 0081)
 
 An authenticated HTTPS listener for questions `/statusz` cannot answer and for a short
@@ -931,6 +973,37 @@ mqttd --admin purge dev-0042    # disconnect if connected, then delete the sessi
   certificate, carrying your subject), and the answer says `forwarded_to`. Both nodes audit
   it. A forwarded action is never forwarded again.
 - `404 not-found` means the owner holds no session or connection for that id.
+
+**Taking a node out of rotation without draining it.** `cordon` (operator role, this node
+only) refuses every new connection at accept and makes `/readyz` report not-ready, with
+`"cordon":{"active":true,"reason":"cordoned-by-operator"}`, so load balancers and
+Kubernetes Services stop sending new clients; `/livez` stays healthy, so nothing restarts
+it. Connected sessions are untouched. `uncordon` reverses it.
+
+```sh
+mqttd --admin cordon --url https://mqttd-2.mqttd:9443
+mqttd --admin cluster                 # the node shows ready: false
+mqttd --admin uncordon --url https://mqttd-2.mqttd:9443
+```
+
+It is not persisted: a restart comes back uncordoned. Refused connections count as
+`admission_rejected{reason="cordon"}`. To move the connected clients off too, follow with
+`kick`, or use `--decommission` to remove the node for good.
+
+**More logging for an incident, without a restart.** `log-override` (operator) replaces
+the tracing filter for a while, then the configured one (`RUST_LOG`, default `info`) comes
+back on its own:
+
+```sh
+mqttd --admin log-override 'mqttd::hub=debug' --ttl 900   # 15 minutes; at most 3600
+mqttd --admin log-level                                   # base, override, seconds left
+mqttd --admin log-reset                                   # restore now
+```
+
+The filter uses `RUST_LOG` syntax. Audit records always keep logging: every override
+carries `audit=info`, and a filter that names the `audit` target is refused. `/statusz`
+shows an active override (`log_filter.override`, `remaining_secs`), and a newer override
+replaces an older one along with its timer. It is not persisted.
 
 **Why is this client denied?** `authz` asks the live policy, the one the last reload
 published, and names the rule that decides. It changes nothing.

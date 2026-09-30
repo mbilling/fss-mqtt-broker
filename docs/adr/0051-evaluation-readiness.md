@@ -300,6 +300,9 @@ semantics (ADR 0039 applies from 1.0.0; ADR 0038's freeze regime until then).
   health listener and signal-driven operator control are deliberate (README, ADR 0032/0040
   posture). The comparison matrix discloses these as by-design; parity is not the bar.
   Rejected.
+
+  > **Revisited by [ADR 0081](0081-admin-api.md) (2026-09-29).** An authenticated admin API now exists for reads and a short, fixed list of audited actions. The dashboard and rule engine remain absent by decision; configuration is still never written over the network.
+
 - **Let the docs grow organically:** the demonstrated failure mode — a finished flagship
   feature invisible in the README and a hand-written count three ADRs stale (twice: the
   ADR catalogue drifted the same way before it was generated). Rejected.

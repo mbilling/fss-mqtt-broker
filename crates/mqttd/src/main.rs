@@ -243,11 +243,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(rest) = args.strip_prefix(&["--admin".to_string()]) {
         std::process::exit(mqttd::admin::cli::run(rest).await);
     }
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
-        )
-        .init();
+    // The filter is reloadable (ADR 0081 T9): the admin API can raise it for a while and it
+    // falls back to this one — `RUST_LOG`, or `info`.
+    mqttd::log_filter::init(
+        &std::env::var("RUST_LOG")
+            .ok()
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| "info".to_string()),
+    );
 
     // `--version` / `-V` and `--help` / `-h`: local, print-and-exit, before any subcommand
     // or config work (#169). `--version` in particular MUST exist — an operator typing it
@@ -665,6 +668,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // handle to stop openraft cleanly on shutdown.
     let plane_for_shutdown = durable_plane.clone();
     let startup_complete = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // Cordon (ADR 0081 T8): set by the admin API; the admission gate refuses new
+    // connections and /readyz reports not-ready while it is set.
+    let cordon = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let (draining, decommission_slot, health_state) = start_health(
         &config,
         &hub_tx,
@@ -689,6 +695,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         durable_plane
             .as_ref()
             .map(mqtt_cluster::durable_plane::DurablePlane::shard_count),
+        cordon.clone(),
     )
     .await?;
 
@@ -1018,6 +1025,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &mut reloader,
         &shutdown,
         &connections,
+        &cordon,
     )
     .await?;
     // A restored lease group can be ready before startup reaches the MQTT binds.
@@ -1052,6 +1060,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             reloader: reloader_for_admin,
             stamp: config_stamp.clone(),
         },
+        cordon,
     )
     .await?;
 
@@ -1299,10 +1308,13 @@ async fn start_client_listeners(
     reloader: &mut reload::Reloader,
     shutdown: &tokio_util::sync::CancellationToken,
     connections: &tokio_util::task::TaskTracker,
+    cordon: &Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut any = false;
-    // Connection admission caps (ADR 0041 T1), shared by every client listener.
-    let gate = admission_gate(config, policy.metrics.clone(), Some(policy.audit.clone()))?;
+    // Connection admission caps (ADR 0041 T1), shared by every client listener, and the
+    // admin API's cordon (ADR 0081 T8).
+    let gate = admission_gate(config, policy.metrics.clone(), Some(policy.audit.clone()))?
+        .with_cordon(cordon.clone());
     let tls_bind = config.listeners.tls_bind.clone();
     let wss_bind = config.listeners.wss_bind.clone();
 
@@ -2450,6 +2462,7 @@ async fn start_health(
     store_probe: Arc<mqttd::store_probe::ProbeSlot>,
     writer_stats: Option<Arc<mqtt_cluster::durable_plane::WriterStats>>,
     store_shards: Option<usize>,
+    cordon: Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<
     (
         Arc<std::sync::atomic::AtomicBool>,
@@ -2503,6 +2516,7 @@ async fn start_health(
         Some(flag) => state.with_swim_isolated(flag),
         None => state,
     };
+    let state = state.with_cordon(cordon);
     // The state is built even with neither server bound: the admin API (ADR 0081)
     // answers `/admin/v1/node` from it, and the caller's shutdown path reads its handles.
     let draining = state.draining_handle();
@@ -2536,6 +2550,7 @@ async fn start_admin(
     sessions: mqttd::admin::sessions::SessionAccess,
     authz: mqttd::admin::authz::LiveAuthorizer,
     reload: mqttd::admin::config::ReloadAccess,
+    cordon: Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let admin = &config.admin;
     let Some(bind) = &admin.bind else {
@@ -2565,7 +2580,8 @@ async fn start_admin(
         mqttd::admin::AdminState::new(node_id.0.clone(), health, live_config.clone(), audit)
             .with_sessions(sessions)
             .with_authorizer(authz)
-            .with_reload(reload);
+            .with_reload(reload)
+            .with_cordon(cordon);
     if let Some(ca) = cluster_ca {
         state = state.with_cluster_ca(tls::ChainCheck::new(ca)?);
     }

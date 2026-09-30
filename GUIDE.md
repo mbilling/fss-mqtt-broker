@@ -112,9 +112,10 @@ ideas are what the rest of this file assumes, and nothing else here explains the
 
 Two things about this broker specifically that surprise people, both explained
 where they matter: a **two-node cluster is worse than one node** for write
-availability ([Resizing](#resizing-the-cluster)), and there is **no admin API or
-dashboard** — operations are signals and files, on purpose
-([Configuration](#configuration)).
+availability ([Resizing](#resizing-the-cluster)), and there is **no dashboard, and
+configuration only changes through files** — operations are signals and files, on purpose
+([Configuration](#configuration)), with an optional authenticated admin API for questions
+and a few audited actions ([OPERATIONS](docs/OPERATIONS.md#the-admin-api-adr-0081)).
 
 **Jump to:** [**Start here**](#start-here) ·
 [Try it in two minutes](#try-it-in-two-minutes) ·
@@ -625,10 +626,13 @@ Standalone and HA topologies, with schematics and what HA does *not* cover:
   with a fixed RAM/disk budget — which limits to set and the arithmetic — is
   [docs/SIZING.md](docs/SIZING.md), with a ready preset in
   [docs/examples/bounded-node.toml](docs/examples/bounded-node.toml).
-- **Operator control is signal-driven, not an admin API** (deliberate: the
-  health listener stays read-only and unauthenticated): `SIGHUP` reloads the
-  security policy on live connections, `SIGUSR1` begins a decommission drain,
-  `SIGTERM` graceful-shuts-down.
+- **Operator control is signal-driven** (deliberate: the health listener stays
+  read-only and unauthenticated): `SIGHUP` reloads the security policy on live
+  connections, `SIGUSR1` begins a decommission drain, `SIGTERM` graceful-shuts-down.
+  The optional **admin API** (ADR 0081) is a separate mTLS listener with viewer and
+  operator roles: the cluster view, clients and sessions, an authorization dry run,
+  reload-with-outcome, kick/purge, cordon and a temporary log filter, all audited, driven
+  by `mqttd --admin`. It never writes configuration.
 
 ### Assurance
 Continuous, not audited-once ([ADR 0044](docs/adr/0044-release-readiness-assurance.md)):
@@ -660,7 +664,7 @@ version:
 | Durable sessions | Quorum-replicated **by default**; acked QoS 1/2 survives node loss (proven under SIGKILL/partition harnesses), and covers a message **in flight to a connected subscriber** as well as one queued for a disconnected one — the durable append happens before the wire send ([#124](https://github.com/mbilling/fss-mqtt-broker/issues/124), reproduced against the real binary under SIGKILL). Those appends — and the QoS 2 outbound-id records and packet-id reservations that precede an online wire send — run **off the hub loop** in per-session lanes (ADR 0061, issue #242): a placement group with a degraded follower set delays only its own sessions' publishes and deliveries (bounded by the 5 s replication RPC timeout per lane job, 256 queued jobs per session, then the newest publish is withheld and retried) — never other groups' publishes, connects, or subscribes, with the residuals named in the ADR (the *ack* path's store writes — truncation, QoS 2 phase advances, id clears — still run on-loop, watched by the dispatch histogram's `ack` class, as does one publish-path corner: the eviction truncate past a 10 000-entry per-session backlog) — and time-on-loop is exported as `mqttd_hub_dispatch_seconds` so a regression pages before 3 a.m. does. A group too thin to keep the promise **refuses** new durable writes by default (the min-replicas floor, `MQTTD_MIN_REPLICAS=majority`: a majority of the members the node knows about, capped at R) rather than acking on one copy; a node that has never known peers still serves fully. Above the (off-by-default) store or memory watermark the broker likewise **refuses the publisher** rather than acking a message it will not store — v5 gets `0x97 Quota exceeded`, v3.1.1 gets no ack and a close — including when the refusing session owner is a *peer* node: the refusal crosses the peer bus as a verdict (during a rolling upgrade, a link to an older build degrades to a withheld ack and a close). Nothing acked is lost; whether the message is re-sent is the *application's* decision — a v5 reason ≥ `0x80` completes the packet-id lifecycle (no client library retransmits it) and a clean-session v3.1.1 publisher resends nothing (ADR 0041 §5/T11/T12, counted as `quota_rejections_total{reason="brownout-publish"}`). The arms that still ack-and-drop, stated where the claim is: the **default** `drop-oldest` offline-queue overflow, which truncates the oldest *already-acked* entries out of a session's durable queue at the cap (counted `publish_dropped{reason="queue-overflow"}`); its opt-in `reject-newest` sibling, which acks and sheds the newest; for retained *values* only, a v3.1.1 retained publish over the retained quota or under brownout (delivered live, not retained); a publish for a durable session whose owner is gone, acked-and-dropped by the no-known-subscriber path; and — on a **co-subscribed filter** — a publish acked on one subscriber's storage while a mid-move durable co-subscriber's copy is stored nowhere (issue #305: `Accepted` means stored for **at least one** subscriber owed the message, not every one; the sole-subscriber form withholds, and the gap is pinned by a test that fails the day the promise strengthens). One deliberate, double-opt-in exception (ADR 0072): an MQTT 5 publisher may weaken **its own** ack per message via the `mqttd-durability` user property — `local` (ack after the owner's fsync, single-copy) or `relaxed` (ack at accept+submit, everything still runs best-effort) — honored only when the operator sets `MQTTD_ALLOW_RELAXED_PUBLISH`; otherwise the property is ignored and the publish gets the full quorum path, stronger than asked, never weaker. Mosquitto/NanoMQ are single-node; VerneMQ documents queue loss on node death; EMQX's durable sessions are opt-in. |
 | Revocation | A policy reload **evicts live sessions and flows** (CRL'd cert, removed user, tightened grant — ADR 0040). Not documented by any compared broker. |
 | Licensing | Apache-2.0 including signed, reproducible binaries. EMQX is BSL 1.1 (clustering commercial) since 5.9; VerneMQ's production binaries are EULA-paid. |
-| Where we lose | No dashboard, rule engine (the replacement — a CI-tested external-consumer pattern — is the blueprint in [docs/INTEGRATION.md](docs/INTEGRATION.md)), HTTP admin API (by design — signal-driven ops), no MQTT-SN/CoAP, and **no production track record**: the matrix says so in as many words. |
+| Where we lose | No dashboard, rule engine (the replacement — a CI-tested external-consumer pattern — is the blueprint in [docs/INTEGRATION.md](docs/INTEGRATION.md)), no UI (the admin API is mTLS + CLI, not a dashboard), no MQTT-SN/CoAP, and **no production track record**: the matrix says so in as many words. |
 
 ## Enterprise readiness
 
