@@ -1447,6 +1447,14 @@ requires = ["python3", "jq"]
 hidden = true
 
 [[task]]
+id = "scale-chart-per-vcpu"
+group = "Benchmark"
+hidden = true
+name = "Regenerate the README's per-vCPU comparison chart"
+script = "bench/scale/chart-per-vcpu.py"
+about = "Draws docs/benchmarks/img/per-vcpu.svg from docs/benchmarks/data/per-vcpu.csv: msg/s per vCPU and per physical core for every measured and vendor-published figure, one bar group per workload class on its own scale, each labelled with what a vCPU is on that hardware (an SMT thread or a whole core). The output is committed; a diff after running means the chart and its data disagree."
+
+[[task]]
 id = "scale-chart-scale-out"
 group = "Benchmark"
 hidden = true

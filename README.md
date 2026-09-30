@@ -15,7 +15,8 @@
 >
 > **Linear scale-out, 3 → 10 nodes:**
 > - **QoS 0:** ~114,000 msg/s **per 4-vCPU node** — **1.14M msg/s on 10 nodes, 40 vCPU in total**; 1.2M at p99 ≤ 2 s, no loss.
-> - **QoS 1, clean sessions:** ~39,000–42,000 msg/s per node — **390,000–420,000 msg/s on 10 nodes**. Durable QoS 1 is a separate, lower curve ([↓](#durable-and-qos-1-scale-out)).
+> - **QoS 1, clean sessions:** ~39,000–42,000 msg/s per node — **390,000–420,000 msg/s on 10 nodes**.
+> - **Durable QoS 1** (ack after fsync + replication): **90,000 msg/s on 3 nodes, 12 vCPU** ([↓](#durable-and-qos-1-scale-out)).
 >
 > Both use shared subscriptions. [Scale-out ↓](#cluster-scale-out-qos-0-shared-subscriptions)
 
@@ -27,6 +28,7 @@
 |---|---|---|
 | **Single-node throughput** | 75k msg/s at p99 ≤ 1 s, 30% CPU idle | 45k / 45k / 30k (Mosquitto / EMQX / HiveMQ CE) |
 | **Cluster scale-out** | flat per node from 3 → 10 nodes: ~114k msg/s QoS 0 and ~39k QoS 1 (clean sessions) per 4-vCPU node; ~1M msg/s QoS 0 on **40 vCPU** | vendor-published ~1M msg/s runs: HiveMQ on 40 nodes, EMQX on 1,472 cores ([different workloads ↓](#against-published-cluster-benchmarks)) |
+| **Per vCPU** (same kind of vCPU) | 9,750 msg/s QoS 1 · 7,500 durable QoS 1 | HiveMQ 4.18: 2,812 QoS 1 ([like for like ↓](#per-vcpu-like-for-like)) |
 | **Durable sessions** | quorum-replicated, **default**; acked QoS 1/2 survives node loss, even in flight | Mosquitto/NanoMQ single-node · VerneMQ loses queues on node death · EMQX opt-in |
 | **Revocation** | policy reload **evicts live sessions** | not documented by any compared broker |
 | **Secure by default** | TLS 1.3, mTLS/OIDC, deny-by-default ACL, hash-chained audit; insecure = opt-in + `INSECURE:` log | varies; NanoMQ and Mosquitto < 2.0 allow anonymous by default |
@@ -39,7 +41,7 @@
 
 **How a rung is judged** ([ADR 0048](docs/adr/0048-comparative-benchmarking.md#amendment-2026-09-27-a-rung-fails-only-on-loss-p99-is-graded-green--yellow--red)): a rung **fails only if it loses messages**. A lossless rung is graded by p99 — **GREEN ≤ 1 s (certified)**, **YELLOW ≤ 5 s**, **RED** above. Every knee below is the highest GREEN rung; the YELLOW figure beside it is the latency around the knee, for workloads that can take it.
 
-Sources: [SINGLE-NODE-COMPARISON.md](docs/benchmarks/SINGLE-NODE-COMPARISON.md) (2026-09-16, one Hetzner CCX23, 4 vCPU / 16 GB, brokers in sequence, untuned) · [knee-3-5-7-10.md](bench/scale/knee-3-5-7-10.md) (2026-09-26, QoS 0 scale-out, 3 → 10 nodes on one provisioning) · [SCALE-CURVE.md](docs/benchmarks/SCALE-CURVE.md) (one host + NVMe per broker).
+Sources: [SINGLE-NODE-COMPARISON.md](docs/benchmarks/SINGLE-NODE-COMPARISON.md) (2026-09-16, one Hetzner CCX23, 4 vCPU / 16 GB, brokers in sequence, untuned) · [knee-3-5-7-10.md](bench/scale/knee-3-5-7-10.md) (2026-09-26, QoS 0 scale-out, 3 → 10 nodes on one provisioning) · [SCALE-CURVE.md](docs/benchmarks/SCALE-CURVE.md) (one host + NVMe per broker) · [0080-replicas-ab-n3.md](bench/scale/0080-replicas-ab-n3.md) (2026-09-30, durable QoS 1 on 3 nodes) · [per-vcpu.csv](docs/benchmarks/data/per-vcpu.csv) (every per-vCPU figure and its source).
 
 **Single-node knee** — highest GREEN rate, p99 ≤ 1 s (1:1 QoS 0, 200 B). Qualified at ≥ 99% delivered before the zero-loss rule; the raw runs are not retained, so zero loss is not re-checked:
 
@@ -122,7 +124,15 @@ does not reproduce under a controlled harness.
 
 ### Durable and QoS 1 scale-out
 
-**Cluster scale-out, durable QoS 1** (ack after fsync + quorum):
+**Durable QoS 1 on 3 nodes** (every ack waits for fsync + replication; persistent
+`$share` consumers; 3 × CCX23, 12 vCPU, log store): **90,000 msg/s GREEN**, p99
+≤ 100 ms, no loss, **7,500 msg/s per vCPU**. The same at 2 and 3 replicas; 2
+replicas carried 122,594 msg/s at most against 104,716 for 3. Measured 2026-09-30
+on an unreleased build of main ([0080-replicas-ab-n3.md](bench/scale/0080-replicas-ab-n3.md)).
+
+The earlier curve below is a different harness: closed loop, 48 publishers with 8
+messages in flight each, so its rate is set by latency at that concurrency, not by
+capacity (v1.0.5, [SCALE-CURVE.md](docs/benchmarks/SCALE-CURVE.md)):
 
 ```text
 1 node  ████████████████████░░░░░░░░░░░░░   8.5k msg/s   p99 90 ms
@@ -181,6 +191,34 @@ rather than by sampling CPU. Spreading that softirq is a settled dead end for ca
 per-core breakdown, and two earlier revisions of this claim that were wrong:
 [QOS1-SCALE-CURVE.md](docs/benchmarks/QOS1-SCALE-CURVE.md).
 
+### Per vCPU, like for like
+
+![Throughput per vCPU, like for like](docs/benchmarks/img/per-vcpu.svg)
+
+A vCPU is not a fixed unit, so every figure here says what one is:
+- **An SMT thread** on our Hetzner CCX23s and on HiveMQ's AWS `m6a`: both AMD EPYC
+  Milan, two vCPUs per physical core. Per vCPU, these compare directly.
+- **A whole core** on EMQX 5.0's AWS `c6g` (Graviton2, no SMT). A core does more work
+  than one thread, so per vCPU it is flattered against an SMT host; compare it per
+  physical core instead (the chart shows both).
+
+Figures are only compared inside one workload class. A durable, replicated QoS 1
+message costs several times a QoS 0 one, and connection count dominates the large
+vendor runs.
+
+| class | mqttd | best comparable | ratio |
+|---|---|---|---|
+| single node, QoS 0, **same host, measured by us** | 18,750 /vCPU | EMQX 5.8.6 11,250 · HiveMQ CE 7,500 | 1.7× · 2.5× |
+| cluster, QoS 1 | 9,750 /vCPU (clean sessions) | HiveMQ 4.18 2,812 /vCPU (published; persistence not stated) | 3.5× |
+| cluster, durable QoS 1 | 7,500 /vCPU (fsync + replication) | none published | — |
+
+Mosquitto (11,250 /vCPU on the same host) is single-threaded: it uses one of the
+four vCPUs, so per vCPU it undersells what one thread does. HiveMQ 4.18's figure is
+the nearest thing to a durable comparison: if its sessions were persistent, mqttd's
+durable 7,500 /vCPU is 2.7× it on the same kind of thread. Data, with every source:
+[per-vcpu.csv](docs/benchmarks/data/per-vcpu.csv); chart:
+`bench/scale/chart-per-vcpu.py`.
+
 ### Against published cluster benchmarks
 
 HiveMQ and EMQX publish large-cluster results around 1M msg/s. **We have not
@@ -191,7 +229,9 @@ every difference that matters shown alongside:
 |---|---|---|---|---|---|
 | throughput | **1.14M** QoS 0 (810k certified at 7 nodes) | 1M QoS 1 PUBLISH/s peak | > 1M QoS 1 in and out | 505k QoS 0, 1:1 | 270k QoS 1 |
 | cluster | **10 × 4 vCPU = 40 vCPU** | 40 nodes (AWS; instance type not published) | 23 × `c6g.metal` = 1,472 cores | 5 × 32 cores = 160 cores | 3 × `m6a.8xlarge` = 96 vCPU |
-| per core | **~28,500 msg/s** | — | ~680 in | ~3,200 | ~2,800 |
+| per vCPU | **~28,500 msg/s** | — | ~680 in | ~3,200 | ~2,800 |
+| one vCPU is | SMT thread (EPYC Milan) | not published | whole core (Graviton2) | not published (per core) | SMT thread (EPYC Milan) |
+| per physical core | **~57,000 msg/s** | — | ~680 in | ~3,200 | ~5,600 |
 | connections | ~45k | 200M | 100M | 10M | 20k |
 | payload · pattern | 200 B · 1:1 `$share` | 16 B · 20M pubs → 180M subs | 256 B · 1:1 wildcard | 50 B · 1:1 | not published |
 | CPU at that rate | busiest broker 11–19% idle | 75–80% | 97% | 56–68% | not published |
@@ -200,12 +240,14 @@ every difference that matters shown alongside:
 more connections** than ours (EMQX 4.3: ~220×), and connection count dominates
 their resource use: HiveMQ reports about 13 KB of heap per connection, and EMQX
 uses 90% of RAM at 100M connections. HiveMQ's runs and EMQX 5.0's are QoS 1;
-ours is QoS 0. So the per-core row is **not a like-for-like ratio**. It is a statement about the hardware each system needs to
+ours is QoS 0. So the per-vCPU rows are **not a like-for-like ratio**. It is a statement about the hardware each system needs to
 carry a message at the connection counts shown.
 
-The closest comparison is HiveMQ 4.18, with 20k clients and QoS 1. mqttd's own
-QoS 1 figures (above) are 180k msg/s on 5 × 4 vCPU and 390k on 10 × 4 vCPU: **~9,000–9,750
-msg/s per vCPU against HiveMQ's ~2,800**. Its payload is not published.
+The closest comparison is HiveMQ 4.18, with 20k clients, QoS 1 and the same CPU
+(EPYC Milan, a vCPU is an SMT thread on both). mqttd's own QoS 1 figures (above)
+are 180k msg/s on 5 × 4 vCPU and 390k on 10 × 4 vCPU: **~9,000–9,750 msg/s per
+vCPU against HiveMQ's ~2,800** ([per vCPU ↑](#per-vcpu-like-for-like)). Its payload
+is not published.
 
 What the table does not show, and where the others lead:
 - **connection scale:** 100–200M connections is a regime we have not measured
@@ -664,7 +706,7 @@ Tracked on the [delivery dashboard](docs/delivery/STATUS.md).
 ```sh
 cargo build && cargo test && cargo clippy --all-targets && cargo deny check
 ./scripts/interop/run.sh     # foreign-client conformance
-mqttui --list                # There are 97 runnable scripts here: demos, smokes, migrations, benches
+mqttui --list                # There are 98 runnable scripts here: demos, smokes, migrations, benches
 ```
 
 ---
