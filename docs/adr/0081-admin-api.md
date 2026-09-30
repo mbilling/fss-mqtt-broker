@@ -147,9 +147,10 @@ originally over the peer bus.)
   (amendment below).
 - Endpoint paths and JSON field names become a compatibility surface. The `[admin]` keys
   fall under ADR 0058's frozen config surface. ADR 0058 does not enumerate HTTP interfaces;
-  for this one the rule is (corrected 2026-09-30 — the line first said "unstable until 1.0",
-  but the API shipped after v1.0.0): within 1.x the `v1` paths, parameters, fields and error
-  codes change only by addition, and a breaking change ships as `/admin/v2` beside `v1`.
+  this one follows mqttd's semantic version (decided 2026-09-30 — the line first said
+  "unstable until 1.0", but the API shipped after v1.0.0): a patch release does not change
+  it, a minor release only adds to it, and only a major release may break it, with the path
+  version following the major (`/admin/v2` in mqttd 2.x).
 
 ## Alternatives considered
 
