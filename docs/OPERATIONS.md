@@ -837,6 +837,11 @@ Everything below runs from the `mqttd` binary itself, so it works in the distrol
 
 ## The admin API (ADR 0081)
 
+**Try it first.** `scripts/admin-e2e.sh up` starts a three-node cluster in Docker with the
+admin API on every node and prints the exports that point `mqttd --admin` at it (viewer and
+operator certificates included); `scripts/admin-e2e.sh test` checks every command below
+against it, through the CLI and through curl; `down` removes it.
+
 An authenticated HTTPS listener for questions `/statusz` cannot answer and for a short
 list of audited actions. It is **off unless `admin.bind` is set**, and it is never the
 health or metrics listener.

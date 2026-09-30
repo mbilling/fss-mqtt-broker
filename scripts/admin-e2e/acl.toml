@@ -1,0 +1,9 @@
+# Everyone may publish and subscribe anywhere, except publishing under secret/.
+[[rules]]
+actions = ["publish", "subscribe"]
+topics = ["#"]
+
+[[rules]]
+actions = ["publish"]
+effect = "deny"
+topics = ["secret/#"]
