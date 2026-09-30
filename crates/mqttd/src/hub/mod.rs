@@ -3927,11 +3927,28 @@ impl Hub {
         }
 
         // Replay queued messages (they land in the channel after CONNACK). The lease is
-        // warm (recovery just succeeded), so these reads are fast and local. A message
-        // whose MQTT 5.0 expiry deadline has passed is dropped, not delivered, and the
-        // remaining interval is forwarded on the rest (ADR 0009 §3).
+        // usually warm (recovery just succeeded), so these reads are fast and local. A
+        // message whose MQTT 5.0 expiry deadline has passed is dropped, not delivered,
+        // and the remaining interval is forwarded on the rest (ADR 0009 §3).
         if !clean_start {
-            if let Ok(pending) = self.store.pending(&client, 0, REPLAY_LIMIT).await {
+            let replay = match self.store.pending(&client, 0, REPLAY_LIMIT).await {
+                Ok(pending) => Some(pending),
+                Err(error) => {
+                    // The warm-up in `recover_once` is not a lock: the group's lease
+                    // can move, or its log be rebuilt, between it and this read (a
+                    // restarted node rejoining re-mints epochs), and the read then
+                    // recovers again and may be refused. Carrying on would leave the
+                    // client attached with its queue undelivered until it happened to
+                    // reconnect. Close it instead: its reconnect recovers the queue
+                    // and replays it (ADR 0017).
+                    warn!(client = %client.0, %error,
+                          "queued messages could not be read for replay; closing the \
+                           connection so the client reconnects and receives them");
+                    self.close_for_retry(&client, conn_id).await;
+                    None
+                }
+            };
+            if let Some(pending) = replay {
                 let now = self.clock.now_epoch_secs();
                 let mut last = 0;
                 for qm in pending {
@@ -4724,6 +4741,24 @@ impl Hub {
             }));
         }
         let conn_id = online.conn_id;
+        self.detach(client, conn_id, false, None).await;
+    }
+
+    /// Close a connection the hub cannot serve right now, so the client retries: v5 is
+    /// told the server is busy (`0x89`), v3.1.1 just loses the connection. Routed
+    /// through [`detach`](Self::detach) like every server-side close, so the session
+    /// is retained and the will follows the protocol's rule for a close without
+    /// DISCONNECT.
+    async fn close_for_retry(&mut self, client: &ClientId, conn_id: u64) {
+        let Some(online) = self.online.get(client).filter(|o| o.conn_id == conn_id) else {
+            return;
+        };
+        if online.admission.protocol == ProtocolVersion::V5 {
+            let _ = online.tx.send(Packet::Disconnect(Disconnect {
+                reason: mqtt_codec::reason::SERVER_BUSY,
+                properties: mqtt_codec::Properties::new(),
+            }));
+        }
         self.detach(client, conn_id, false, None).await;
     }
 
@@ -7274,6 +7309,9 @@ mod tests {
         /// SEPARATE lever from the enqueue one, because the append happens first and
         /// failing it would mask the very path ADR 0057's tests exist to exercise.
         fail_outbound: std::sync::atomic::AtomicBool,
+        /// The next this-many REPLAY reads (`pending` at `REPLAY_LIMIT`) fail with
+        /// `NoQuorum`; the one-entry warm-up read in `recover_once` is untouched.
+        fail_replay: std::sync::atomic::AtomicUsize,
     }
 
     impl FlakyStore {
@@ -7283,6 +7321,7 @@ mod tests {
                 fail_remaining: std::sync::atomic::AtomicUsize::new(fail_ensure),
                 fail_enqueue_no_quorum: false,
                 fail_outbound: std::sync::atomic::AtomicBool::new(false),
+                fail_replay: std::sync::atomic::AtomicUsize::new(0),
             })
         }
 
@@ -7294,6 +7333,7 @@ mod tests {
                 fail_remaining: std::sync::atomic::AtomicUsize::new(0),
                 fail_enqueue_no_quorum: true,
                 fail_outbound: std::sync::atomic::AtomicBool::new(false),
+                fail_replay: std::sync::atomic::AtomicUsize::new(0),
             })
         }
     }
@@ -7353,6 +7393,15 @@ mod tests {
             after: mqtt_storage::Offset,
             limit: usize,
         ) -> Result<Vec<mqtt_storage::QueuedMessage>, mqtt_storage::StorageError> {
+            use std::sync::atomic::Ordering;
+            if limit == super::REPLAY_LIMIT
+                && self
+                    .fail_replay
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                    .is_ok()
+            {
+                return Err(mqtt_storage::StorageError::NoQuorum);
+            }
             self.inner.pending(client, after, limit).await
         }
 
@@ -12060,6 +12109,42 @@ mod tests {
             2,
             "both deliveries recorded their ids once the store allowed it"
         );
+    }
+
+    /// A resumed session whose replay read fails (the group's log rebuilt between the
+    /// attach warm-up and the replay, as after a node restart) must not be left
+    /// attached with its queue undelivered: the connection is closed so the client
+    /// reconnects, and the reconnect replays the queue. Before, the failure was
+    /// swallowed, and the queued messages reached the client only on some later
+    /// reconnect (the disk-bound crash test on CI: "30 acked payloads never delivered").
+    #[tokio::test]
+    async fn a_failed_replay_read_closes_the_connection_instead_of_stranding_the_queue() {
+        let store = FlakyStore::new(0);
+        let tx = start_hub_with_arc(store.clone());
+        let (_rx, _) = attach(&tx, "p", 1, false).await;
+        subscribe(&tx, "p", "t");
+        detach(&tx, "p", 1);
+        publish_with_expiry(&tx, "t", b"queued", Some(3600));
+        let _ = attach(&tx, "barrier", 99, true).await; // flush the enqueue
+
+        store
+            .fail_replay
+            .store(1, std::sync::atomic::Ordering::SeqCst);
+        let (mut rx, _) = attach(&tx, "p", 2, false).await;
+        let closed = timeout(Duration::from_secs(2), async {
+            while rx.recv().await.is_some() {}
+        })
+        .await;
+        assert!(
+            closed.is_ok(),
+            "the connection must be closed, not left attached with an unread queue"
+        );
+
+        let (mut rx, _) = attach(&tx, "p", 3, false).await;
+        let pkt = recv_packet(&mut rx)
+            .await
+            .expect("the reconnect replays the queue");
+        assert_eq!(payload_of(&pkt), b"queued");
     }
 
     /// ADR 0057, fail closed at PUBREC: if the phase cannot advance durably, the PUBREL

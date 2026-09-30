@@ -1005,7 +1005,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 496 test(s)
+## `crates/mqttd/src/lib.rs` — 497 test(s)
 
 - `admin::cli::tests::answers_render_as_tables_and_lines`
 - `admin::cli::tests::invocations_are_validated_before_anything_runs`
@@ -1223,6 +1223,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::a_failed_outbound_id_write_defers_the_publish_in_order`
 - `hub::tests::a_failed_outbound_id_write_is_counted_and_the_next_drain_retries`
 - `hub::tests::a_failed_phase_advance_withholds_the_pubrel`
+- `hub::tests::a_failed_replay_read_closes_the_connection_instead_of_stranding_the_queue`
 - `hub::tests::a_failed_retained_store_write_leaves_the_topic_repairable`
 - `hub::tests::a_failed_retained_store_write_withholds_the_publishers_ack`
 - `hub::tests::a_failed_shared_enqueue_withholds_the_publishers_ack`
