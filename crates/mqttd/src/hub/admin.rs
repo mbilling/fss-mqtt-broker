@@ -77,6 +77,11 @@ pub enum AdminRequest {
     Purge {
         /// The client id.
         client: String,
+        /// Whether this node is the session's placement owner. Only the owner removes a
+        /// stored session it has not materialized (a cold durable session); another node
+        /// that holds nothing for the client leaves the store alone, so asking it cannot
+        /// delete durable state it does not own.
+        owner: bool,
         /// What happened.
         reply: oneshot::Sender<ActionOutcome>,
     },
@@ -303,13 +308,20 @@ impl Hub {
                     session_found,
                 });
             }
-            AdminRequest::Purge { client, reply } => {
+            AdminRequest::Purge {
+                client,
+                owner,
+                reply,
+            } => {
                 let client = ClientId(client.into());
                 let disconnected = self.admin_disconnect(&client).await;
                 let session_found = self.admin_known_clients().any(|c| c == &client);
-                // The store may hold a session this node has not materialized (a cold
-                // durable session): remove it regardless; `discard_session` does both.
-                self.discard_session(&client);
+                // The owner's store may hold a session this node has not materialized (a
+                // cold durable session), so the owner removes regardless; `discard_session`
+                // does memory and store. A non-owner acts only on what it holds.
+                if session_found || disconnected || owner {
+                    self.discard_session(&client);
+                }
                 if session_found || disconnected {
                     warn!(client = %client.0, "session purged by an admin action");
                 }
