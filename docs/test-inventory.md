@@ -258,7 +258,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `two_bridge_instances_do_not_duplicate_forwarding`
 - `two_partitioned_instances_deliver_each_inbound_message_exactly_once`
 
-## `crates/mqtt-cluster/src/lib.rs` — 357 test(s)
+## `crates/mqtt-cluster/src/lib.rs` — 358 test(s)
 
 - `cluster_identity::tests::a_founder_mints_once_and_reloads_stably`
 - `cluster_identity::tests::a_joiner_adopts_once_and_persists`
@@ -501,6 +501,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `placement::tests::voter_restricted_owner_is_always_a_voter`
 - `raft_mesh::tests::two_nodes_elect_and_replicate_over_the_wire`
 - `repl_net::tests::a_log_larger_than_a_frame_is_read_in_pages`
+- `repl_net::tests::a_paged_read_that_stops_short_fails_whole`
 - `repl_net::tests::catch_up_requests_reach_the_owner_link`
 - `repl_net::tests::deliver_round_trips_and_applies_on_the_follower`
 - `repl_net::tests::deliver_times_out_on_a_wedged_replica`

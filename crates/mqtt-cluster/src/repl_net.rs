@@ -291,7 +291,11 @@ impl PeerReplicaTransport {
 
     /// A recovery read assembled from pages (#758): each page bounded by the RPC
     /// timeout, the watermark the highest any page reported, complete only if every
-    /// page was, and the entries every page returned above that watermark.
+    /// page was, and the entries every page returned above that watermark. All or
+    /// nothing: a page that does not arrive (the replica crashed, the link dropped,
+    /// the timeout fired), or one that claims more but brings nothing new, fails the
+    /// whole read, exactly as an unreachable replica would. Recovery then counts it
+    /// as unanswered and retries from the first page on its next attempt.
     async fn read_replica_paged(
         &self,
         replica: &NodeId,
@@ -312,9 +316,15 @@ impl PeerReplicaTransport {
                     entries.push(entry);
                 }
             }
-            // A page that moved nothing forward would ask the same page again.
-            if !more || !progressed {
+            if !more {
                 break;
+            }
+            // "More remain" but nothing new arrived: the replica is not answering
+            // the read it was asked. Returning what came so far would hand the
+            // merge a copy short of its tail as if it were whole, so the read
+            // fails like an unreachable replica, and recovery retries it.
+            if !progressed {
+                return None;
             }
         }
         entries.retain(|e| e.offset > watermark);
@@ -816,6 +826,53 @@ mod tests {
             (3, 0),
             "three pages over the proto-10 link"
         );
+    }
+
+    /// #758: a paged read is all or nothing. A replica that stops answering after
+    /// the first page, or claims more but sends nothing new, fails the whole read:
+    /// the pages that did arrive are never returned as if they were the replica's
+    /// whole copy.
+    #[tokio::test]
+    async fn a_paged_read_that_stops_short_fails_whole() {
+        for stall in [true, false] {
+            let transport = Arc::new(PeerReplicaTransport::with_timeout(Duration::from_millis(
+                100,
+            )));
+            let b = n("b");
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            transport.register_with_proto(b.clone(), tx, crate::peer::PROTO_REPLICA_READ_PAGED);
+            let server = {
+                let transport = transport.clone();
+                tokio::spawn(async move {
+                    let mut pages = 0;
+                    while let Some(msg) = rx.recv().await {
+                        if let PeerMessage::ReplicaReadFrom { req_id, after, .. } = msg {
+                            pages += 1;
+                            if pages == 1 {
+                                // One real entry, and "more remain".
+                                let entry = crate::peer::ReplicaEntryWire {
+                                    offset: after + 1,
+                                    epoch: 1,
+                                    seq: 1,
+                                    record: b"m".to_vec(),
+                                };
+                                transport.complete_read_chunk(req_id, 0, true, vec![entry], true);
+                            } else if !stall {
+                                // "More remain" again, but nothing new.
+                                transport.complete_read_chunk(req_id, 0, true, Vec::new(), true);
+                            }
+                            // stall: never answer the second page (a crashed replica).
+                        }
+                    }
+                })
+            };
+            assert!(
+                transport.read_replica(&b, "q/k").await.is_none(),
+                "a read that stops short must fail whole (stall={stall})"
+            );
+            transport.fail_node(&b);
+            server.abort();
+        }
     }
 
     /// Catch-up requests (ADR 0043 P1/P3) reach a connected owner's link and
