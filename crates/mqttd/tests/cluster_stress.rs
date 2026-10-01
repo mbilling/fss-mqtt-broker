@@ -1415,11 +1415,7 @@ async fn run_schedule(seed: u64) {
 #[allow(clippy::too_many_lines)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_full_cluster_stop_start_recovers_every_acked_fact() {
-    if std::env::var("MQTTD_STRESS_LOG").is_ok() {
-        let _ = tracing_subscriber::fmt()
-            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-            .try_init();
-    }
+    stress_tracing();
     let disk = tempfile::tempdir().expect("tempdir");
     let dir = |n: &str| {
         let d = disk.path().join(n);
@@ -1613,11 +1609,7 @@ async fn a_full_cluster_stop_start_recovers_every_acked_fact() {
 #[allow(clippy::too_many_lines)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn growing_one_node_to_three_back_fills_and_survives_the_founder() {
-    if std::env::var("MQTTD_STRESS_LOG").is_ok() {
-        let _ = tracing_subscriber::fmt()
-            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-            .try_init();
-    }
+    stress_tracing();
     let disk = tempfile::tempdir().expect("tempdir");
     let dir = |n: &str| {
         let d = disk.path().join(n);
@@ -1844,11 +1836,7 @@ async fn growing_one_node_to_three_back_fills_and_survives_the_founder() {
 #[allow(clippy::too_many_lines)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn growth_migrates_moved_sessions_eagerly_and_acks_stay_honest() {
-    if std::env::var("MQTTD_STRESS_LOG").is_ok() {
-        let _ = tracing_subscriber::fmt()
-            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-            .try_init();
-    }
+    stress_tracing();
     let disk = tempfile::tempdir().expect("tempdir");
     let dir = |n: &str| {
         let d = disk.path().join(n);
@@ -2019,11 +2007,7 @@ async fn growth_migrates_moved_sessions_eagerly_and_acks_stay_honest() {
 #[allow(clippy::too_many_lines)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_decommissioned_nodes_departure_loses_nothing() {
-    if std::env::var("MQTTD_STRESS_LOG").is_ok() {
-        let _ = tracing_subscriber::fmt()
-            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-            .try_init();
-    }
+    stress_tracing();
     let disk = tempfile::tempdir().expect("tempdir");
     let dir = |n: &str| {
         let d = disk.path().join(n);
@@ -2531,11 +2515,7 @@ async fn wait_members(nodes: &[&StressNode], n: usize) {
 /// survive on {original, joiner, joiner}.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn growing_three_to_five_zone_spread_survives_losing_two_originals() {
-    if std::env::var("MQTTD_STRESS_LOG").is_ok() {
-        let _ = tracing_subscriber::fmt()
-            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-            .try_init();
-    }
+    stress_tracing();
     let disk = tempfile::tempdir().expect("tempdir");
     let dir = |n: &str| {
         let d = disk.path().join(n);
@@ -2633,11 +2613,7 @@ async fn growing_three_to_five_zone_spread_survives_losing_two_originals() {
 /// remaining three.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn cost_reduction_five_to_three_via_two_decommissions() {
-    if std::env::var("MQTTD_STRESS_LOG").is_ok() {
-        let _ = tracing_subscriber::fmt()
-            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-            .try_init();
-    }
+    stress_tracing();
     let disk = tempfile::tempdir().expect("tempdir");
     let dir = |n: &str| {
         let d = disk.path().join(n);
@@ -2696,11 +2672,7 @@ async fn cost_reduction_five_to_three_via_two_decommissions() {
 /// one node at a time, drain before leave.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn rolling_replacement_swaps_a_node_without_loss() {
-    if std::env::var("MQTTD_STRESS_LOG").is_ok() {
-        let _ = tracing_subscriber::fmt()
-            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-            .try_init();
-    }
+    stress_tracing();
     let disk = tempfile::tempdir().expect("tempdir");
     let dir = |n: &str| {
         let d = disk.path().join(n);
@@ -2773,11 +2745,7 @@ async fn rolling_replacement_swaps_a_node_without_loss() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[allow(clippy::too_many_lines)] // one straight-line two-node scenario; splitting it hides the shape
 async fn a_browned_out_session_owner_refuses_the_publisher_rather_than_owing_a_lost_message() {
-    if std::env::var("MQTTD_STRESS_LOG").is_ok() {
-        let _ = tracing_subscriber::fmt()
-            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-            .try_init();
-    }
+    stress_tracing();
     let disk = tempfile::tempdir().expect("tempdir");
     let dir = |n: &str| {
         let d = disk.path().join(n);
@@ -3459,11 +3427,7 @@ async fn wait_factor(nodes: &[&StressNode], replicas: u8, within: Duration) -> b
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[allow(clippy::too_many_lines)] // one scenario, start to verify; its phases share the ledger
 async fn the_replication_factor_changes_live_both_ways_without_losing_an_acked_message() {
-    if std::env::var("MQTTD_STRESS_LOG").is_ok() {
-        let _ = tracing_subscriber::fmt()
-            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-            .try_init();
-    }
+    stress_tracing();
     let disk = tempfile::tempdir().expect("tempdir");
     let dir = |n: &str| {
         let d = disk.path().join(n);
@@ -3573,6 +3537,21 @@ async fn the_replication_factor_changes_live_both_ways_without_losing_an_acked_m
     }
 }
 
+/// Broker tracing for a stress test. `MQTTD_STRESS_LOG=1` wires `RUST_LOG` through as a
+/// debug aid. Without it only the lease-Raft contradiction report (#754) prints, so a
+/// CI failure that hits it carries the evidence instead of a bare openraft panic.
+fn stress_tracing() {
+    let filter = if std::env::var("MQTTD_STRESS_LOG").is_ok() {
+        tracing_subscriber::EnvFilter::from_default_env()
+    } else {
+        tracing_subscriber::EnvFilter::new("mqtt_cluster::raft_mesh=error")
+    };
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_test_writer()
+        .try_init();
+}
+
 /// Bring-up gate shared by the resize/restart tests: full membership + full
 /// voters across every given node.
 async fn wait_cluster_ready(nodes: &[&StressNode]) {
@@ -3606,12 +3585,7 @@ async fn wait_cluster_ready(nodes: &[&StressNode]) {
 /// the T1 catalog (as MQTT-observable facts) is the post-quiesce oracle.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn seeded_fault_schedules_hold_the_catalog_post_quiesce() {
-    // Debug aid: MQTTD_STRESS_LOG=1 wires broker tracing through to stderr.
-    if std::env::var("MQTTD_STRESS_LOG").is_ok() {
-        let _ = tracing_subscriber::fmt()
-            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-            .try_init();
-    }
+    stress_tracing();
     for seed in seeds() {
         run_schedule(seed).await;
         eprintln!("cluster_stress: seed {seed} held the catalog");
@@ -3678,11 +3652,7 @@ async fn a_fleet_scale_grow_and_shrink_soak_loses_no_acked_fact() {
     const VOTER_CAP: usize = 5;
     const SUBS: usize = 8;
 
-    if std::env::var("MQTTD_STRESS_LOG").is_ok() {
-        let _ = tracing_subscriber::fmt()
-            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-            .try_init();
-    }
+    stress_tracing();
 
     let disk = tempfile::tempdir().expect("tempdir");
     let dir = |n: &str| {
