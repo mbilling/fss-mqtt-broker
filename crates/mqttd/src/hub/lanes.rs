@@ -190,6 +190,9 @@ pub(super) struct RemoteAppendGate {
     /// uncongested forward — issue #399); completion must not answer twice,
     /// and a post-answer degradation surfaces in metrics, not on the wire.
     pub(super) answered: bool,
+    /// The fan-out matched a subscriber here, so a stored answer is
+    /// [`ForwardVerdict::Reached`](mqtt_cluster::peer::ForwardVerdict::Reached) (#738).
+    pub(super) reached: bool,
 }
 
 /// Bound on jobs queued in one session's append lane (issue #242). At the cap the
@@ -787,6 +790,7 @@ impl Hub {
                         worst: DurableOutcome::Ok,
                         congested: false,
                         answered: false,
+                        reached: false,
                     });
                 g.awaiting += 1;
                 // The valve's owner half (issue #399): a deep lane holds a
@@ -920,7 +924,11 @@ impl Hub {
                                     }
                                 }
                             } else {
-                                self.answer_forward(&node, seq, g.worst.to_verdict());
+                                self.answer_forward(
+                                    &node,
+                                    seq,
+                                    g.worst.to_verdict_reached(g.reached),
+                                );
                             }
                         }
                     }

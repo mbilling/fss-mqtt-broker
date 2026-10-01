@@ -91,7 +91,12 @@ pub const PROTO_MIN: u32 = 6;
 /// per LINK. A key whose log exceeded [`MAX_FRAME`] could not be read at all through the
 /// one-frame [`ReplicaReadReply`](PeerMessage::ReplicaReadReply), so a new owner could
 /// never recover it. A proto-9 link keeps the one-frame read.
-pub const PROTO_MAX: u32 = 10;
+///
+/// Proto 11 (#738) is additive: [`ForwardVerdict::Reached`] says a forward was stored
+/// AND matched a subscriber on the receiver, which lets the origin release a held
+/// ack during a takeover window without waiting for the window to close. A proto-10
+/// link is answered [`ForwardVerdict::Stored`], exactly as before.
+pub const PROTO_MAX: u32 = 11;
 
 /// The peer-bus proto at which a build computes durable ownership over all admitted
 /// members (ADR 0073). Purely a capability marker — see [`PROTO_MAX`].
@@ -104,6 +109,10 @@ pub const PROTO_REPLICATION_FACTOR: u32 = 9;
 
 /// The peer-bus proto at which a link carries paged recovery reads (#758).
 pub const PROTO_REPLICA_READ_PAGED: u32 = 10;
+
+/// The peer-bus proto at which a link may answer a forward with
+/// [`ForwardVerdict::Reached`] (#738).
+pub const PROTO_FORWARD_REACHED: u32 = 11;
 
 /// Negotiate a link's protocol version from both sides' announced ranges
 /// (ADR 0038): the newest version both can speak, or `None` when the ranges are
@@ -652,6 +661,12 @@ pub enum ForwardVerdict {
     /// withholds the acknowledgement. Weaker than `Refused` on purpose — it claims
     /// nothing about what was or was not stored.
     Failed,
+    /// [`Stored`](Self::Stored), and the receiver's fan-out matched at least one
+    /// subscriber: the message reached someone (proto 11, #738). `Stored` alone
+    /// cannot say that — a receiver whose view is settled answers `Stored` for a
+    /// fan-out that matched nobody — so only this variant is evidence the origin
+    /// may release a held ack on. Appended last, so earlier variants keep their tags.
+    Reached,
 }
 
 /// The hand-rolled codec for the two ADR 0038 **frozen** bootstrap frames.
@@ -955,8 +970,8 @@ mod tests {
     use super::{
         decode, encode, encode_legacy, negotiate_proto, ForwardVerdict, PeerCodecError,
         PeerMessage, ReplicaEntryWire, RetainedWireEntry, SharedGroupWire, SharedMemberWire,
-        WireAppProps, MAX_FRAME, PROTO_MAX, PROTO_MIN, PROTO_OWNERSHIP_DOMAIN,
-        PROTO_REPLICATION_FACTOR, PROTO_REPLICA_READ_PAGED,
+        WireAppProps, MAX_FRAME, PROTO_FORWARD_REACHED, PROTO_MAX, PROTO_MIN,
+        PROTO_OWNERSHIP_DOMAIN, PROTO_REPLICATION_FACTOR, PROTO_REPLICA_READ_PAGED,
     };
     use bytes::BytesMut;
 
@@ -1199,6 +1214,7 @@ mod tests {
             ForwardVerdict::Refused { code: 1 },
             ForwardVerdict::Refused { code: 0xFFFF },
             ForwardVerdict::Failed,
+            ForwardVerdict::Reached,
         ] {
             roundtrip(&PeerMessage::PublishVerdict { seq: 9, verdict });
         }
@@ -1343,9 +1359,34 @@ mod tests {
             "a pre-#758 build keeps the proto-9 replication-factor capability (ADR 0080)"
         );
         assert_eq!(
-            negotiate_proto((PROTO_MIN, PROTO_MAX), (PROTO_MIN, PROTO_MAX)),
+            negotiate_proto((PROTO_MIN, PROTO_MAX), (6, PROTO_REPLICA_READ_PAGED)),
             Some(PROTO_REPLICA_READ_PAGED),
-            "this build must announce the proto-10 paged recovery read (#758)"
+            "a pre-#738 build keeps the proto-10 paged recovery read (#758)"
+        );
+    }
+
+    /// Proto 11 (#738): `ForwardVerdict::Reached` is appended after `Failed`, so the
+    /// three earlier verdicts keep their tags, and this build announces 11.
+    #[test]
+    fn the_reached_verdict_is_appended_and_announced_at_proto_11() {
+        let tag = |v: ForwardVerdict| {
+            let mut buf = Vec::new();
+            encode(
+                &PeerMessage::PublishVerdict { seq: 0, verdict: v },
+                &mut buf,
+            )
+            .unwrap();
+            // Frame: 4-byte length, the message tag, `seq` (a one-byte varint 0),
+            // then the verdict's tag.
+            buf[6]
+        };
+        assert_eq!(tag(ForwardVerdict::Stored), 0);
+        assert_eq!(tag(ForwardVerdict::Failed), 2);
+        assert_eq!(tag(ForwardVerdict::Reached), 3);
+        assert_eq!(
+            negotiate_proto((PROTO_MIN, PROTO_MAX), (PROTO_MIN, PROTO_MAX)),
+            Some(PROTO_FORWARD_REACHED),
+            "this build must announce the proto-11 reached verdict (#738)"
         );
     }
 

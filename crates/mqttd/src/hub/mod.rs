@@ -38,7 +38,7 @@ pub use crate::backpressure::SubscriberLimits;
 use crate::backpressure::{message_bytes, packet_bytes, BacklogBound, BacklogEntry, BacklogQueue};
 use bytes::Bytes;
 use mqtt_cluster::durable_plane::DurablePlane;
-use mqtt_cluster::peer::{ForwardVerdict, PeerMessage, RetainedWireEntry};
+use mqtt_cluster::peer::{ForwardVerdict, PeerMessage, RetainedWireEntry, PROTO_FORWARD_REACHED};
 use mqtt_cluster::placement::Placement;
 use mqtt_cluster::NodeId;
 use mqtt_codec::{
@@ -777,13 +777,22 @@ impl DurableOutcome {
         }
     }
 
+    /// [`to_verdict`](Self::to_verdict), saying [`ForwardVerdict::Reached`] for a
+    /// stored forward whose fan-out matched a subscriber here (#738).
+    fn to_verdict_reached(self, reached: bool) -> ForwardVerdict {
+        match self {
+            Self::Ok if reached => ForwardVerdict::Reached,
+            other => other.to_verdict(),
+        }
+    }
+
     /// Interpret a peer's verdict. An unknown refusal code degrades to
     /// [`Failed`](Self::Failed) — withhold, never a fabricated refusal and never an
     /// ack: `Failed` claims nothing about what the peer stored, which is the only
     /// honest thing to say about an answer this build cannot read.
     fn from_verdict(v: ForwardVerdict) -> Self {
         match v {
-            ForwardVerdict::Stored => Self::Ok,
+            ForwardVerdict::Stored | ForwardVerdict::Reached => Self::Ok,
             ForwardVerdict::Refused { code } => match PublishRefusal::from_wire_code(code) {
                 Some(r) => Self::Refused(r),
                 None => Self::Failed,
@@ -2984,7 +2993,7 @@ impl Hub {
                 // submit-acceptance (issue #399) — `Stored` then means what the
                 // relaxed ack means.
                 let relaxed = self.relaxed_requested(&app);
-                self.finish_peer_verdict(&node, seq, sync, relaxed);
+                self.finish_peer_verdict(&node, seq, sync, relaxed, matched > 0);
             }
             HubCommand::RemotePublishAck { node, seq, ok } => {
                 // A proto-6 peer's boolean: `false` means only "not stored, reason
@@ -3039,8 +3048,10 @@ impl Hub {
                 // Answered now, or at the append's `AppendDone` (issue #242) —
                 // or, for an uncongested RELAXED delivery, at submit-acceptance
                 // (issue #399).
+                // `reached` stays false: the origin already counts a shared
+                // placement as evidence (`settle::awaits_settle`).
                 let relaxed = self.relaxed_requested(&app);
-                self.finish_peer_verdict(&node, seq, out, relaxed);
+                self.finish_peer_verdict(&node, seq, out, relaxed, false);
             }
             HubCommand::RemotePublish {
                 topic,
@@ -4390,16 +4401,20 @@ impl Hub {
     /// actually stored.
     /// `relaxed` is derived by THIS node from the forwarded message's own
     /// properties under THIS node's opt-in (ADR 0072's placement rule: the tier
-    /// is derived where it is acted on).
+    /// is derived where it is acted on). `reached` is whether the fan-out matched a
+    /// subscriber here, which a stored answer then says as
+    /// [`ForwardVerdict::Reached`] (#738).
     fn finish_peer_verdict(
         &mut self,
         node: &NodeId,
         seq: u64,
         sync: DurableOutcome,
         relaxed: bool,
+        reached: bool,
     ) {
         if let Some(g) = self.remote_append_pending.get_mut(&(node.clone(), seq)) {
             g.worst = g.worst.and(sync);
+            g.reached |= reached;
             // The congestion valve's owner half (issue #399): a relaxed forward
             // whose every lane submit was admitted BELOW the congestion
             // threshold is answered `Stored` now, at submit-acceptance — which
@@ -4414,12 +4429,13 @@ impl Hub {
             if answer_early {
                 g.answered = true;
             }
+            let verdict = DurableOutcome::Ok.to_verdict_reached(g.reached);
             if answer_early {
-                self.answer_forward(node, seq, ForwardVerdict::Stored);
+                self.answer_forward(node, seq, verdict);
             }
             return;
         }
-        self.answer_forward(node, seq, sync.to_verdict());
+        self.answer_forward(node, seq, sync.to_verdict_reached(reached));
     }
 
     /// PUBACK: completes a `QoS` 1 delivery, freeing a quota slot (ADR 0012) and
@@ -11074,6 +11090,41 @@ mod tests {
         );
     }
 
+    /// #738: a forward this node stored for a subscriber is answered `Reached`; one
+    /// that matched nobody is answered `Stored`, which claims only that nothing failed.
+    /// The origin releases a held ack on the first and never on the second.
+    #[tokio::test]
+    async fn a_forward_that_matched_a_subscriber_is_answered_reached() {
+        let tx = start_hub();
+        let mut peer = connect_peer_at_proto(&tx, "origin", 1, super::PROTO_FORWARD_REACHED);
+        let (_rx, _) = attach(&tx, "s", 9, false).await;
+        subscribe_qos(&tx, "s", "rv/t", QoS::AtLeastOnce);
+        detach(&tx, "s", 9);
+
+        for (seq, topic, expected) in [
+            (1u64, "rv/t", ForwardVerdict::Reached),
+            (2, "rv/nobody", ForwardVerdict::Stored),
+        ] {
+            tx.send(HubCommand::RemotePublishAcked {
+                node: NodeId("origin".into()),
+                seq,
+                topic: topic.into(),
+                payload: Bytes::from_static(b"x"),
+                qos: QoS::AtLeastOnce,
+                retain: false,
+                message_expiry: None,
+                app: mqtt_core::AppProperties::default(),
+            })
+            .unwrap();
+            match next_forward_answer(&mut peer).await {
+                PeerMessage::PublishVerdict { seq: s, verdict } => {
+                    assert_eq!((s, verdict), (seq, expected), "{topic}");
+                }
+                other => panic!("expected a PublishVerdict, got {other:?}"),
+            }
+        }
+    }
+
     /// Issue #238 — 0041-T12's wire choice, both directions. A refusal is a verdict on a
     /// proto-7 link and collapses to today's boolean on a proto-6 one, and each link sees
     /// exactly one of the two frames.
@@ -17668,8 +17719,9 @@ mod tests {
         };
         assert_eq!(
             verdict,
-            mqtt_cluster::peer::ForwardVerdict::Stored,
-            "an uncongested relaxed forward answers Stored at submit-acceptance"
+            mqtt_cluster::peer::ForwardVerdict::Reached,
+            "an uncongested relaxed forward answers at submit-acceptance — Reached, as it \
+             matched a subscriber here and the link speaks proto 11 (#738)"
         );
         assert!(
             store.ops().iter().all(|(op, _)| op != "enqueue"),
@@ -17780,7 +17832,8 @@ mod tests {
         })
         .await
         .expect("the congested relaxed forward answers once its append lands");
-        assert_eq!(verdict, mqtt_cluster::peer::ForwardVerdict::Stored);
+        // Reached: it matched a subscriber here, on a proto-11 link (#738).
+        assert_eq!(verdict, mqtt_cluster::peer::ForwardVerdict::Reached);
     }
 
     /// ADR 0072 — the `mqttd-durability` property is INERT without the operator

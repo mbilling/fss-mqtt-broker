@@ -252,7 +252,7 @@ async fn a_retransmission_after_the_answer_is_re_answered_not_stored_twice() {
     );
     assert_eq!(
         rig.answers(),
-        vec![(seq, ForwardVerdict::Stored)],
+        vec![(seq, ForwardVerdict::Reached)],
         "the first copy is answered once its append landed"
     );
     // That answer is lost: it never reaches the sender.
@@ -268,7 +268,7 @@ async fn a_retransmission_after_the_answer_is_re_answered_not_stored_twice() {
     let answers = rig.answers();
     assert_eq!(
         answers,
-        vec![(seq, ForwardVerdict::Stored)],
+        vec![(seq, ForwardVerdict::Reached)],
         "the retransmission must still be ANSWERED — the sender retires the \
          obligation only on an answer, and the first one was lost"
     );
@@ -311,7 +311,7 @@ async fn a_retransmission_during_the_append_is_dropped_and_answered_once() {
     );
     assert_eq!(
         rig.answers(),
-        vec![(seq, ForwardVerdict::Stored)],
+        vec![(seq, ForwardVerdict::Reached)],
         "exactly one answer, sent when the one append landed"
     );
 }
