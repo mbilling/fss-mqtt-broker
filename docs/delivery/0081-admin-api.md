@@ -77,9 +77,10 @@ tasks:
     evidence: "PR #728. mqttd --check-tls (crates/mqttd/src/tls_check.rs) checks chain, key match, expiry (fail/warn under 30 days) and SANs for [tls] and [cluster.peer_tls]; rcgen-minted ok/expired/key-mismatch tests."
   - id: 0081-T15
     title: "Helm chart and operator support: admin values, certs from Secrets, Service port, NetworkPolicy, CRD field"
-    status: in-progress
+    status: done
     issue: 770
-    notes: "Kubernetes is the primary deployment and neither the chart nor the CRD can enable the admin API today. NetworkPolicy split out to #778: it must cover every broker port, not only admin."
+    date: 2026-10-01
+    evidence: "PR #779. Chart admin.* values and CR spec.admin serve the admin API on 9443 of every pod with its own cluster-bus leaf (headless Service only); render parity admin-on pass; kind smoke checks whoami=operator, anonymous refused, cluster view 3/3. NetworkPolicy split to #778."
   - id: 0081-T16
     title: "Admin e2e scenario suite (kill, partition, scale, decommission, durability, policy, drills), nightly in CI"
     status: planned
@@ -127,7 +128,7 @@ frontmatter above · this file is the plan, progress log, and changelog.
 | 0081-T10 | ✅ done | [#719](https://github.com/mbilling/fss-mqtt-broker/issues/719) | 2026-09-30 | "PR #737. OPERATIONS.md day 0/1/2 table mapping operator questions to mqttd commands; dated notes on ADRs 0032, 0033, 0051 and 0055 pointing to ADR 0081; README, GUIDE and COMPARISON no longer claim there is no admin API." |
 | 0081-T11 | ✅ done | [#720](https://github.com/mbilling/fss-mqtt-broker/issues/720) | 2026-09-29 | "PR #728. mqttd --print-config prints the effective config (defaults < file < env) with secrets fingerprinted via Config::redacted (mqtt-config) and mqttd::config_view; unit tests pin that no secret field survives redaction and URL separators are preserved." |
 | 0081-T12 | ✅ done | [#721](https://github.com/mbilling/fss-mqtt-broker/issues/721) | 2026-09-29 | "PR #728. mqttd --check-tls (crates/mqttd/src/tls_check.rs) checks chain, key match, expiry (fail/warn under 30 days) and SANs for [tls] and [cluster.peer_tls]; rcgen-minted ok/expired/key-mismatch tests." |
-| 0081-T15 | 🚧 in-progress | [#770](https://github.com/mbilling/fss-mqtt-broker/issues/770) | — | "Kubernetes is the primary deployment and neither the chart nor the CRD can enable the admin API today. NetworkPolicy split out to #778: it must cover every broker port, not only admin." |
+| 0081-T15 | ✅ done | [#770](https://github.com/mbilling/fss-mqtt-broker/issues/770) | 2026-10-01 | "PR #779. Chart admin.* values and CR spec.admin serve the admin API on 9443 of every pod with its own cluster-bus leaf (headless Service only); render parity admin-on pass; kind smoke checks whoami=operator, anonymous refused, cluster view 3/3. NetworkPolicy split to #778." |
 | 0081-T16 | ⬜ planned | [#771](https://github.com/mbilling/fss-mqtt-broker/issues/771) | — | "Extends scripts/admin-e2e.sh; one fresh cluster per scenario; asserts through the admin API." |
 | 0081-T17 | ⬜ planned | [#772](https://github.com/mbilling/fss-mqtt-broker/issues/772) | — |  |
 | 0081-T18 | ⬜ planned | [#773](https://github.com/mbilling/fss-mqtt-broker/issues/773) | — |  |
@@ -171,3 +172,4 @@ the reads it depends on.
 - 2026-09-30: T4 (PR #731), T5 (PR #732), T6 (PR #733), T7 (PR #734), T8 (PR #735) and T9 (PR #736) delivered and merged.
 - 2026-09-30: T10 delivered (PR #737 merged). Every planned task is done; T13 and T14 stay deferred.
 - 2026-10-01: T15–T19 added after the live-cluster test and the docs pass (issues #770–#774); T15 and T16 first.
+- 2026-10-01: T15 delivered (PR #779 merged): the chart and the operator enable the admin API; NetworkPolicy split out to #778.
