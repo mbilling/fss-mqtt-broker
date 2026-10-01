@@ -41,10 +41,11 @@ next to the sensor and kilobytes matter. **Choose VerneMQ when** you want
 Erlang-ecosystem clustering and can accept node-local queue durability and EULA'd
 production binaries.
 
-**Do not choose mqttd (yet) if** you need a built-in dashboard, a rule engine (the
+**Do not choose mqttd (yet) if** you need a built-in web dashboard (there is an
+authenticated admin API and CLI, not a UI), a rule engine (the
 replacement — an external consumer group you operate — is documented and CI-tested in
 [INTEGRATION.md](INTEGRATION.md), but it is code, not SQL), MQTT-SN
-or CoAP gateways, an HTTP management API — or a broker with a production track record:
+or CoAP gateways — or a broker with a production track record:
 mqttd has released versions (`v1.0.0` current) but **no production users**. What it offers
 against that last, honestly disqualifying-for-some fact is verifiability: reproducible
 builds, signed artifacts, SBOM, continuous fuzzing, and conformance CI against foreign
@@ -114,11 +115,16 @@ logged; the same is not uniformly true elsewhere (e.g. NanoMQ defaults to
 
 ## Operations, observability, integration
 
+The three admin rows were re-verified on 2026-10-01 against each project's own documentation
+(Mosquitto 2.1 `mosquitto.conf(5)` and release review, HiveMQ's edition docs, NanoMQ's CLI and
+HTTP API pages, VerneMQ's status page and HTTP listener docs).
+
 | | mqttd | Mosquitto | EMQX 6.2 | NanoMQ | VerneMQ 2.1 |
 |---|---|---|---|---|---|
 | Metrics | Prometheus + OTLP push + k8s probes | `$SYS` topics | dashboard + Prometheus + `$SYS` | HTTP API + Prometheus endpoint + limited `$SYS` events | Prometheus + `vmq-admin` |
-| Dashboard / UI | ✖ **by design** — signal-driven ops, read-only health listener; a provisioned Grafana demo ships instead (ADR 0020 posture). An authenticated admin API + `mqttd --admin` CLI (ADR 0081) covers inspection and a few audited actions, with no UI and no config writes | ✖ | ✅ | ✖ | ✖ (CLI + HTTP mgmt API) |
-| HTTP management API | ✖ **by design** (same decision) | ⚠️ dynsec over MQTT topics | ✅ | ✅ | ✅ |
+| Admin API (HTTP) | ✅ its own mTLS listener, viewer/operator roles, every request audited; the cluster view from any node, clients/sessions/subscribers, an ACL dry run, reload with outcome, kick/purge, cordon; never writes config ([ADR 0081](adr/0081-admin-api.md), [ADMIN-API.md](ADMIN-API.md)) | ⚠️ 2.0: none (dynsec is over MQTT `$CONTROL` topics); 2.1: an **experimental** `http_api` listener with read-only broker-info endpoints and **no authentication** — the manual says to front it with a reverse proxy | ✅ REST API | ✅ HTTP API (stats, clients, subscriptions, config reload) | ✅ HTTP management API |
+| Admin CLI | ✅ `mqttd --admin`, the same binary (works in the distroless image) ([ADMIN-CLI.md](ADMIN-CLI.md)) | ⚠️ `mosquitto_ctrl`: dynamic-security users/roles/ACLs and plugin listing, not runtime inspection | ✅ `emqx ctl` | ⚠️ `nanomq` start/reload; `nanomq_cli` is a client/rules tool | ✅ `vmq-admin` (sessions, cluster, config) |
+| Admin dashboard (web UI) | ✖ **by design** — the admin API and CLI instead; a provisioned Grafana demo for metrics (ADR 0020, 0081) | ⚠️ 2.1: an **experimental** dashboard served by the `http_api` listener | ✅ | ✖ (third-party projects only) | ⚠️ built-in read-only **status page**; full UIs are third-party |
 | Rule engine | ✖ by design — a documented, CI-tested **external-consumer pattern** instead ([INTEGRATION.md](INTEGRATION.md), ADR 0063): `$share` consumer groups on durable session queues feed Kafka/webhooks at-least-once, deduped at the sink; transforms are code you run, not SQL the broker runs | ✖ | ✅ SQL | ✅ SQL (full build) | ✖ |
 | Bridging | ✅ standalone bridge, deny-by-default directional rules, hop-count loop prevention, spool (ADR 0025) | ✅ built-in (the reference implementation) | ✅ data-integration bridges | ✅ TCP/QUIC/AWS bridges | ✅ basic `vmq_bridge` |
 | MQTT-SN / CoAP gateways | ✖ | ✖ (separate projects) | ✅ (SN, CoAP, LwM2M, …) | ✖ (DDS/SOME-IP/ZMQ instead) | ✖ |
