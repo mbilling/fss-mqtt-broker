@@ -28,6 +28,21 @@
 
 set -euo pipefail
 . "$(dirname "$0")/lib.sh"
+
+# Epoch milliseconds on THIS machine. GNU `date +%s%3N` where it works; macOS's BSD
+# date has no %N and prints a literal "...3N", which broke the steady gate's arithmetic
+# ("value too great for base") and silently ended lane E after calibration (the #504
+# acceptance run, 2026-10-01). python3 is already a hard requirement of the rig.
+# Defined here, unconditionally: the lane bodies below are inside if-blocks.
+now_ms() {
+	local t
+	t=$(date +%s%3N 2>/dev/null) || t=
+	case "$t" in
+	'' | *[!0-9]*) python3 -c 'import time; print(int(time.time() * 1000))' ;;
+	*) printf '%s\n' "$t" ;;
+	esac
+}
+
 . "$SCALE_DIR/cpu.sh"
 
 RUN="${1:?usage: run-curve.sh <run-dir> <inventory.json>}"
@@ -2341,11 +2356,11 @@ IMAGES
 		# faked, instant `sleep` produces, and it hung the test suite.
 		local prev_recv cur_recv flat=0 waited=0 waited_ms=0 rate delta prev_ms cur_ms elapsed_ms
 		prev_recv=$(lane_e_recv_total) || die "incomplete steady poll"
-		prev_ms=$(date +%s%3N)
+		prev_ms=$(now_ms)
 		while :; do
 			sleep "$LANE_E_DRAIN_POLL"
 			cur_recv=$(lane_e_recv_total) || die "incomplete steady poll"
-			cur_ms=$(date +%s%3N)
+			cur_ms=$(now_ms)
 			elapsed_ms=$((cur_ms - prev_ms))
 			[ "$elapsed_ms" -gt 0 ] || elapsed_ms=1
 			waited_ms=$((waited_ms + elapsed_ms))
