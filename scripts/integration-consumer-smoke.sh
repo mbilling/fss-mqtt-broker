@@ -83,7 +83,24 @@ A_PID=$!; PIDS+=("$A_PID")
 mosquitto_sub -h 127.0.0.1 -p "$PORT" -V mqttv311 -q 1 -c -i sink-b \
   -t "$GROUP_FILTER" -v >"$B_OUT" 2>/dev/null &
 B_PID=$!; PIDS+=("$B_PID")
-sleep 1  # let both subscriptions land before the stream starts
+# Wait until BOTH members are in the group instead of sleeping and hoping: on a slow CI
+# runner one subscription had not landed after a fixed 1 s, so the whole stream went to
+# the other member and the round-robin assertion failed (PR #787, 2026-10-01). Probes go
+# into the group until each member has received one; round-robin alternates, so that
+# takes a couple of publishes once both have joined. The stream assertions skip probes.
+PROBE='^telemetry/probe/'
+joined() { grep -q "$PROBE" "$A_OUT" 2>/dev/null && grep -q "$PROBE" "$B_OUT" 2>/dev/null; }
+for p in $(seq 1 50); do
+  joined && break
+  pub -q 1 -i producer -t "telemetry/probe/$p" -m "p$p" 2>/dev/null
+  sleep 0.2
+done
+if ! joined; then
+  echo "  FAIL — the two group members never both joined (50 probes, neither split reached both)"
+  exit 1
+fi
+# Stream lines only: what a file (or files) received, probes excluded.
+stream() { cat "$@" 2>/dev/null | grep -v "$PROBE" | grep -c . || true; }
 
 echo "── 1. group single delivery: two members split a QoS 1 stream ──"
 N=10
@@ -91,7 +108,7 @@ for i in $(seq 1 "$N"); do
   pub -q 1 -i producer -t "telemetry/dev$i/state" -m "m$i" 2>/dev/null
 done
 
-lines() { cat "$A_OUT" "$B_OUT" 2>/dev/null | grep -c . || true; }
+lines() { stream "$A_OUT" "$B_OUT"; }
 for _ in $(seq 1 50); do [[ "$(lines)" -ge "$N" ]] && break; sleep 0.2; done
 
 TOTAL="$(lines)"
@@ -103,7 +120,7 @@ for i in $(seq 1 "$N"); do
   grep -q "^telemetry/dev$i/state m$i\$" "$A_OUT" "$B_OUT" || {
     echo "  FAIL — m$i was never delivered to any group member"; exit 1; }
 done
-A_GOT="$(grep -c . "$A_OUT" || true)"; B_GOT="$(grep -c . "$B_OUT" || true)"
+A_GOT="$(stream "$A_OUT")"; B_GOT="$(stream "$B_OUT")"
 if [[ "$A_GOT" -lt 1 || "$B_GOT" -lt 1 ]]; then
   echo "  FAIL — round-robin did not reach both members (v5: $A_GOT, 3.1.1: $B_GOT)"
   exit 1
