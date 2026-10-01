@@ -1,7 +1,7 @@
 # 0082. Bounded hub ingress: a control lane that never waits behind data, and byte credits that push back on publishers
 
-- **Status:** Proposed
-- **Date:** 2026-10-01
+- **Status:** Accepted
+- **Date:** 2026-10-01 (proposed), 2026-10-02 (accepted)
 - **Deciders:** project maintainers
 - **Delivery:** [docs/delivery/0082-bounded-hub-ingress.md](../delivery/0082-bounded-hub-ingress.md) — plan, progress, and changelog
 - **Related:** [ADR 0041](0041-resource-governance.md) (resource governance: what a brownout
@@ -134,6 +134,22 @@ broker. A client whose PINGREQ goes unread past its own timeout will reconnect, 
 the honest signal that the broker is saturated. It happens only under sustained overload,
 and the reconnect lands in the same credit queue.
 
+### 2a. What a client connection does past its credit is configurable; pausing is the default
+
+`MQTTD_INGRESS_OVERLOAD` (`[limits] ingress_overload`) selects the behaviour for
+**client QoS 0** past the credit:
+
+- **`pause`** (default): the connection stops reading, as in §2. It is lossless. Under
+  sustained overload, a client with a short PINGREQ timeout reconnects.
+- **`shed-qos0`**: the connection keeps reading. A QoS 0 publish that cannot get credit is
+  dropped and counted as `publish_dropped{reason="hub-ingress"}`. Clients stay connected,
+  but QoS 0 messages a slower read would have kept are lost, and the broker still pays the
+  read and decode of every dropped publish, so CPU is not bounded the way memory is.
+
+**QoS 1 and 2 pause under either setting.** A publish the broker will acknowledge, or
+already has, is never shed to satisfy a memory bound. The setting is hot-reloadable with
+the other limits.
+
 ### 3. Peer data is shed, never paused
 
 A peer link carries raft and replication frames in the same TCP stream as data. Pausing its
@@ -199,7 +215,8 @@ version-skew window.
 - **Bound the single channel with blocking `send`.** Rejected: the hub sends to itself and
   peer readers carry raft frames. One full channel would deadlock the hub on its own
   completions and stall consensus.
-- **Shed client QoS 0 at ingress instead of pausing.** This keeps clients connected but
+- **Shed client QoS 0 at ingress instead of pausing, as the only behaviour.** Adopted as
+  the opt-in `shed-qos0` setting (§2a), not the default. This keeps clients connected but
   loses messages a slower read would have kept. It also still pays read and decode for every
   dropped publish, so it doesn't bound CPU. It is kept as a possible future knob, not the
   default.
@@ -212,3 +229,14 @@ version-skew window.
   mid-connection, and QoS 0 has no flow control at all.
 - **Shard the hub.** Raises capacity but doesn't bound memory. Any shard can still be
   outrun.
+
+## Decision record (2026-10-02)
+
+The maintainer accepted this ADR with three answers to the questions the proposal left open:
+
+1. **Overload behaviour is configurable, with `pause` as the default** (§2a,
+   `MQTTD_INGRESS_OVERLOAD=pause|shed-qos0`). QoS 1/2 pause under either setting.
+2. **The defaults stand as proposed:** the pool is 1/8 of `MQTTD_MEMORY_MAX_BYTES` (or
+   256 MiB), and the per-connection cap is 1 MiB.
+3. **T2 ships on its own first:** the lane split, with no admission change. The credits (T3)
+   follow.
