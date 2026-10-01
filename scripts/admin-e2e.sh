@@ -28,16 +28,32 @@
 # `scenarios` never touches the `up` cluster: it uses its own compose project
 # (mqttd-admin-scenarios), host ports (42010 and up) and state (target/admin-scenarios),
 # all overridable with the ADMIN_E2E_* variables described in scripts/admin-e2e/lib.sh.
+#
+# Most of a run is quiet: the first image build takes minutes, and waits print only on a
+# timeout. VERBOSE=1 shows the image and binary builds and docker compose output, and
+# reports progress every 10 s while waiting. `bash -x scripts/admin-e2e.sh ...` traces
+# every command.
 set -euo pipefail
 
 KIT="$(cd "$(dirname "$0")/admin-e2e" && pwd)"
 
 build() {
+  local quiet_hint=""
+  [ "${VERBOSE:-0}" = 1 ] || quiet_hint=" (VERBOSE=1 shows its output)"
   if [ "${SKIP_BUILD:-0}" != 1 ]; then
-    echo "building the image $IMAGE (demo/Dockerfile) — the first build takes several minutes"
-    docker build -q -f "$ROOT/demo/Dockerfile" -t "$IMAGE" "$ROOT" >/dev/null
-    echo "building the host binary $BIN"
-    (cd "$ROOT" && cargo build -q --release --bin mqttd)
+    echo "building the image $IMAGE (demo/Dockerfile) — the first build takes several minutes${quiet_hint}"
+    if [ "${VERBOSE:-0}" = 1 ]; then
+      docker build -f "$ROOT/demo/Dockerfile" -t "$IMAGE" "$ROOT"
+    else
+      docker build -q -f "$ROOT/demo/Dockerfile" -t "$IMAGE" "$ROOT" >/dev/null
+    fi
+    echo "building the host binary $BIN${quiet_hint}"
+    # Without -q, cargo also says when it is blocked on another build's lock on target/.
+    if [ "${VERBOSE:-0}" = 1 ]; then
+      (cd "$ROOT" && cargo build --release --bin mqttd)
+    else
+      (cd "$ROOT" && cargo build -q --release --bin mqttd)
+    fi
   fi
 }
 
@@ -51,7 +67,9 @@ up() {
   build
   prepare_state
   echo -n "waiting for three ready nodes"
-  if cluster_up >/dev/null; then
+  local ready=0
+  if [ "$VERBOSE" = 1 ]; then cluster_up && ready=1; else cluster_up >/dev/null && ready=1; fi
+  if [ "$ready" = 1 ]; then
     echo " — ready"
     env_hint
   else

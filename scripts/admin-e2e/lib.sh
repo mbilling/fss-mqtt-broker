@@ -11,6 +11,8 @@
 #   ADMIN_E2E_DATA       1 = each node keeps its state in a data dir (durable across
 #                        restarts); 0 = ephemeral durability (default 0)
 #   IMAGE, BIN           the broker image and the host mqttd binary
+#   VERBOSE              1 = show the image and binary builds and docker compose output,
+#                        and report progress every 10 s while waiting (default 0)
 
 KIT="${KIT:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
 ROOT="${ROOT:-$(cd "$KIT/../.." && pwd)}"
@@ -21,8 +23,12 @@ NODES="${ADMIN_E2E_NODES:-3}"
 DATA="${ADMIN_E2E_DATA:-0}"
 IMAGE="${IMAGE:-mqttd-admin-e2e:latest}"
 BIN="${BIN:-$ROOT/target/release/mqttd}"
+VERBOSE="${VERBOSE:-0}"
 P="$STATE/pki"
-export IMAGE
+export IMAGE VERBOSE
+
+# Run a noisy command: its output is shown with VERBOSE=1 and discarded otherwise.
+noisy() { if [ "$VERBOSE" = 1 ]; then "$@"; else "$@" >/dev/null 2>&1; fi; }
 
 # --- ports and names ------------------------------------------------------------------
 
@@ -77,7 +83,7 @@ EOF
 # Fresh state: PKI for $NODES nodes, the ACL, an (empty) password file, per-node config
 # and data dirs, the compose file. Removes any previous cluster of THIS project first.
 prepare_state() {
-  if [ -f "$STATE/compose.yml" ]; then compose down -v >/dev/null 2>&1 || true; fi
+  if [ -f "$STATE/compose.yml" ]; then noisy compose down -v || true; fi
   rm -rf "$STATE"
   mkdir -p "$STATE"
   cp "$KIT/acl.toml" "$STATE/acl.toml"
@@ -100,12 +106,12 @@ cluster_up() {
   local services=()
   local n
   for n in "${nodes[@]}"; do services+=("mqttd-$n"); done
-  compose up -d "${services[@]}" >/dev/null 2>&1
+  noisy compose up -d "${services[@]}"
   wait_ready "${nodes[@]}"
 }
 
 cluster_down() {
-  if [ -f "$STATE/compose.yml" ]; then compose down -v >/dev/null 2>&1 || true; fi
+  if [ -f "$STATE/compose.yml" ]; then noisy compose down -v || true; fi
 }
 
 # Wait (at most 120 s) until every listed node's /readyz says ready.
@@ -196,8 +202,12 @@ check() { local name=$1; shift; if "$@" >/dev/null 2>&1; then ok "$name"; else b
 # command succeeds; on timeout, say what never happened and return 1.
 wait_until() {
   local desc=$1 timeout=$2; shift 2
-  local deadline=$((SECONDS + timeout))
+  local deadline=$((SECONDS + timeout)) started=$SECONDS next=$((SECONDS + 10))
   while ! "$@" >/dev/null 2>&1; do
+    if [ "$VERBOSE" = 1 ] && [ "$SECONDS" -ge "$next" ]; then
+      echo "      still waiting for: $desc ($((SECONDS - started))s of ${timeout}s)" >&2
+      next=$((SECONDS + 10))
+    fi
     if [ "$SECONDS" -ge "$deadline" ]; then
       echo "      timed out after ${timeout}s waiting for: $desc"
       return 1
