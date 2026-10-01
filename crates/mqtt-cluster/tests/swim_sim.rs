@@ -95,6 +95,10 @@ struct Sim {
     rng: Rng,
     now: u64,
     seqno: u64,
+    /// Seeding topology: every node seeded to every other (the default), or — as
+    /// the chart and the compose kit deploy it — node 0 founds with no seeds and
+    /// every other node seeds to node 0 alone.
+    founder_seeded: bool,
 }
 
 impl Sim {
@@ -103,15 +107,32 @@ impl Sim {
     /// job in production, so the harness gives the gossip layer, which is what we test here,
     /// a fair chance to form the cluster even under heavy loss).
     fn new(n: usize, net: Net, seed: u64) -> Self {
+        Self::build(n, net, seed, false)
+    }
+
+    /// `n` nodes seeded the way production deploys them: node 0 is the founder (no
+    /// seeds) and every other node seeds to it alone. It matters for restarts: here
+    /// no survivor holds a restarted non-founder as a seed, so none re-greets it, and
+    /// only the restarted node's own datagrams can bring it back (issue #783).
+    fn founder_seeded(n: usize, net: Net, seed: u64) -> Self {
+        Self::build(n, net, seed, true)
+    }
+
+    /// The seed addresses node `i` starts with under the given topology.
+    fn seeds_for(n: usize, i: usize, founder_seeded: bool) -> Vec<String> {
+        (0..n)
+            .filter(|&j| j != i && (!founder_seeded || (j == 0 && i != 0)))
+            .map(|j| format!("n{j}:7946"))
+            .collect()
+    }
+
+    fn build(n: usize, net: Net, seed: u64, founder_seeded: bool) -> Self {
         let cfg = sim_cfg();
         let mut nodes = Vec::new();
         let mut index = HashMap::new();
         for i in 0..n {
             let a = format!("n{i}:7946");
-            let seeds: Vec<String> = (0..n)
-                .filter(|&j| j != i)
-                .map(|j| format!("n{j}:7946"))
-                .collect();
+            let seeds = Self::seeds_for(n, i, founder_seeded);
             nodes.push(Swim::new(
                 NodeId(format!("n{i}")),
                 a.clone(),
@@ -135,6 +156,7 @@ impl Sim {
             rng: Rng::new(seed),
             now: 0,
             seqno: 0,
+            founder_seeded,
         }
     }
 
@@ -220,16 +242,22 @@ impl Sim {
         self.up[i] = false;
     }
 
+    /// Stop a node GRACEFULLY (ADR 0019 §2): it announces its own departure, the
+    /// datagrams go out on the network, and only then does the process stop — what
+    /// SIGTERM does, as opposed to [`kill`](Self::kill)'s crash.
+    fn leave(&mut self, i: usize) {
+        let acts = self.nodes[i].leave();
+        self.apply(i, acts);
+        self.up[i] = false;
+    }
+
     /// Restart a killed node's PROCESS under the SAME id and address — what a
     /// Kubernetes pod restart is (issue #92). A fresh `Swim` means a fresh
     /// incarnation counter, and a strictly greater generation is what tells peers
     /// this is a new life rather than the corpse they just buried.
     fn restart(&mut self, i: usize, generation: u64) {
         let a = format!("n{i}:7946");
-        let seeds: Vec<String> = (0..self.n())
-            .filter(|&j| j != i)
-            .map(|j| format!("n{j}:7946"))
-            .collect();
+        let seeds = Self::seeds_for(self.n(), i, self.founder_seeded);
         self.nodes[i] = Swim::new(
             NodeId(format!("n{i}")),
             a.clone(),
@@ -391,6 +419,52 @@ fn a_restarted_node_rejoins_and_stays_alive() {
                 sim.fully_converged(),
                 "seed {seed}: the restarted node was evicted again after rejoining — \
                  a claim about its previous life is still killing it \
+                 (re-run with REPRO_SEED = Some({seed}))"
+            );
+        }
+    }
+}
+
+/// Issue #783: a node stopped GRACEFULLY — its own `Dead` announced to every peer,
+/// so they hold it tombstoned at once rather than after a suspicion window — and
+/// restarted well inside `dead_ttl_ms` must be re-admitted, and must STILL be
+/// admitted after the tombstones would have been pruned. Before the fix this held
+/// it out for good: its new life spoke only in datagram headers the peers ignored,
+/// and each prune let a survivor re-learn the old life's `Dead` from another.
+#[test]
+fn a_gracefully_stopped_node_rejoins_after_a_restart_and_stays() {
+    for seed in seeds() {
+        // Seeded as deployed: no survivor re-greets node 3 (only node 0 is a seed).
+        let mut sim = Sim::founder_seeded(5, RELIABLE, seed);
+        assert!(
+            sim.run_until(20, 800, Sim::fully_converged),
+            "seed {seed}: precondition (converge) failed"
+        );
+        sim.leave(3);
+        assert!(
+            sim.run_until(20, 50, |s| s.all_see_dead(3)),
+            "seed {seed}: precondition (the departure is seen at once) failed"
+        );
+
+        // Back at once, and re-admitted within 2 s — while the tombstones (5 s) still
+        // stand. Waiting out the prune is NOT re-admission: here the sim's gossip has
+        // drained by then and the id would slip back in, but in production a survivor
+        // still holding the old `Dead` re-feeds it at every prune (the loop #783
+        // observed for minutes), which five reliable sim nodes cannot reproduce.
+        // (Seeded all-to-all, the survivors would re-greet node 3 and its Sync reply
+        // would carry its self-claim — which is why the default topology hid this.)
+        sim.restart(3, 2);
+        assert!(
+            sim.run_until(20, 100, Sim::fully_converged),
+            "seed {seed}: a gracefully stopped node was not re-admitted while its \
+             tombstones stood (re-run with REPRO_SEED = Some({seed}))"
+        );
+        // Past the tombstone TTL (5 s), by when the old life's Dead had every chance.
+        for _ in 0..600 {
+            sim.step(20);
+            assert!(
+                sim.fully_converged(),
+                "seed {seed}: the restarted node was evicted again after rejoining \
                  (re-run with REPRO_SEED = Some({seed}))"
             );
         }

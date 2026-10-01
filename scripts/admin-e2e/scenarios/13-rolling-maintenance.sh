@@ -2,11 +2,9 @@
 # ready, new connections refused), kick the client, publish while it is away, restart the
 # node, uncordon — and the client reconnects to its intact session and gets the message.
 #
-# The restart is a kill + start, not a graceful stop. Known defect (reported with this
-# suite as #783): after a GRACEFUL stop (SIGTERM, drained) and a start with the same id and data
-# dir, the other nodes keep the node DEAD in their membership (re-declared every 30 s, still
-# excluded after 2 min, with or without a pause before the start) while it believes it has
-# rejoined. Switch this back to `node_restart` once that is fixed.
+# The restart is GRACEFUL (SIGTERM, drained, then a start with the same id and data dir),
+# as maintenance is. Until #783 the other nodes kept a gracefully stopped node DEAD after
+# its restart (re-declared every 30 s, never re-admitted), so this drill is its guard.
 
 # One reconnect attempt. Right after a restart the node can answer 0x88 "server
 # unavailable, retry" while its durable plane re-forms (ADR 0017); a real client retries.
@@ -34,7 +32,7 @@ run() {
   eventually "worker's connection is closed" 15 raw_closed worker
   local other=$(( node % 3 + 1 ))
   pub "$other" -q 1 -t jobs/1 -m while-away
-  node_kill "$node"; node_start "$node"  # unclean on purpose: see the header
+  node_restart "$node"  # graceful: see the header
   wait_ready "$node" && ok "mqttd-$node restarted and is ready (cordon not persisted)" || bad "mqttd-$node restarted and is ready"
   expect "uncordon is a no-op after the restart" '"changed":false' "$(api root "$node" POST /admin/v1/uncordon)"
   eventually "the cluster re-forms" 90 formed 1
