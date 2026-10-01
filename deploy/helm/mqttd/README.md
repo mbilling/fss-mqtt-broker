@@ -38,6 +38,7 @@ Every key is commented in [`values.yaml`](values.yaml). Top-level groups:
 | `secrets.peerTls` | unset | `ca.crt` plus `<pod>.crt` / `<pod>.key` per ordinal. One shared cert cannot work. |
 | `secrets.gossipKey` | unset | Secret key `swim-key`. Together with `peerTls` arms signed gossip. |
 | `admin` | disabled | The authenticated admin API on port 9443 of every pod ([below](#admin-api)). Needs `secrets.peerTls`. |
+| `networkPolicy` | disabled | Ingress `NetworkPolicy` for the broker pods ([below](#networkpolicy)). |
 | `extraEnv` | `[]` | Extra `MQTTD_*` (or any) env on the broker container. |
 | `clusterEstablished` | `false` | `false` on first install so pod-0 may found. Set `true` after the cluster is healthy so a lost pod-0 volume cannot re-bootstrap. |
 | `persistence` | enabled, `10Gi` | Per-pod PVC for `/var/lib/mqttd`. |
@@ -93,6 +94,39 @@ mqttd --admin --url https://127.0.0.1:19443 \
 
 The scripted check is in `scripts/k8s/kind-smoke.sh`: it mints a client CA, enables the API
 and expects `whoami` to return `operator` and the cluster view to show 3 of 3 replied.
+
+## NetworkPolicy
+
+`networkPolicy.enabled=true` renders an ingress `NetworkPolicy` for the broker pods:
+
+| Port | Admitted from |
+|---|---|
+| peer bus 7001/TCP, gossip 7946/UDP, admin 9443/TCP | this release's broker pods only |
+| client ports (`service.ports`) | `networkPolicy.clientFrom`, or anywhere when empty |
+| health and metrics 8080 | `networkPolicy.healthFrom`, or anywhere when empty (kubelet probes, Prometheus) |
+| admin 9443/TCP, from outside the pod mesh | `networkPolicy.adminFrom` (with `admin.enabled`) |
+
+Each list holds standard `NetworkPolicyPeer` objects:
+
+```yaml
+networkPolicy:
+  enabled: true
+  clientFrom:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: iot
+  healthFrom:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: monitoring
+```
+
+With no lists, the policy still closes the cluster ports to everything but the broker pods,
+while clients, probes and scrapes keep working. `kubectl port-forward` to the admin port is
+unaffected. Egress is not restricted. The policy needs a CNI that enforces NetworkPolicy
+(Calico, Cilium, kindnet, …). Without one, Kubernetes accepts the object and it has no
+effect. `scripts/k8s/kind-smoke.sh` runs the whole smoke with the policy on and checks that a
+non-broker pod reaches health but is refused on 7001 and 9443.
 
 ## Shipped alerting
 

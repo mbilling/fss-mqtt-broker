@@ -142,6 +142,7 @@ fn gvk_for(kind: &str) -> Option<GroupVersionKind> {
         "ConfigMap" => GroupVersionKind::gvk("", "v1", "ConfigMap"),
         "ServiceAccount" => GroupVersionKind::gvk("", "v1", "ServiceAccount"),
         "PodDisruptionBudget" => GroupVersionKind::gvk("policy", "v1", "PodDisruptionBudget"),
+        "NetworkPolicy" => GroupVersionKind::gvk("networking.k8s.io", "v1", "NetworkPolicy"),
         _ => return None,
     })
 }
@@ -182,6 +183,29 @@ async fn apply_owned(
             Api::namespaced_with(client.clone(), ns, &ApiResource::from_gvk(&gvk));
         api.patch(&name, &params, &Patch::Apply(&object)).await?;
         applied += 1;
+    }
+    // The one optional object: a CR that drops `networkPolicy` must not leave the old
+    // policy enforcing (issue #778). Deleting a policy only ever widens access back to
+    // the cluster's default; it never touches data.
+    if rendered.networkpolicy.is_none() {
+        if let Some(gvk) = gvk_for("NetworkPolicy") {
+            let api: Api<DynamicObject> =
+                Api::namespaced_with(client.clone(), ns, &ApiResource::from_gvk(&gvk));
+            match api
+                .delete(
+                    &crate::render::network_policy_name(cr),
+                    &kube::api::DeleteParams::default(),
+                )
+                .await
+            {
+                Ok(_) => info!(
+                    namespace = ns,
+                    "deleted the NetworkPolicy the CR no longer asks for"
+                ),
+                Err(kube::Error::Api(e)) if e.code == 404 => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
     }
     Ok(applied)
 }
@@ -384,7 +408,11 @@ mod tests {
     /// someone adds an object to the render without teaching the applier about it.
     #[test]
     fn every_rendered_kind_has_a_gvk() {
-        let rendered = crate::render::render(&cr("abc-123"), None);
+        // With the optional NetworkPolicy, so it is covered too (issue #778).
+        let mut cr = cr("abc-123");
+        cr.spec.network_policy = Some(crate::crd::NetworkPolicySpec::default());
+        let rendered = crate::render::render(&cr, None);
+        assert!(rendered.networkpolicy.is_some());
         for object in rendered.all() {
             let kind = object["kind"]
                 .as_str()

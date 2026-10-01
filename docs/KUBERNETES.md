@@ -51,6 +51,14 @@ required. The port is on the headless Service only. Admin client certificates co
 dedicated CA in a Secret with key `ca.crt`. Setup and the port-forward recipe are in the
 [chart README](../deploy/helm/mqttd/README.md#admin-api).
 
+## NetworkPolicy
+
+Both paths can render an ingress `NetworkPolicy` for the broker pods: the chart's
+`networkPolicy` values or the CR's `spec.networkPolicy`. It admits the peer bus, gossip and
+admin ports only between the broker pods. Clients and health/metrics are admitted from the
+peers you list, or from anywhere when a list is empty. Egress is not restricted, and it
+needs an enforcing CNI. Details: [chart README](../deploy/helm/mqttd/README.md#networkpolicy).
+
 ## Quick start
 
 ```sh

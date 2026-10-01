@@ -969,7 +969,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/bin/render_sample.rs` — 0 test(s)
 
 
-## `crates/mqttd-operator/src/lib.rs` — 35 test(s)
+## `crates/mqttd-operator/src/lib.rs` — 36 test(s)
 
 - `controller::tests::an_unknown_kind_has_no_gvk`
 - `controller::tests::every_rendered_kind_has_a_gvk`
@@ -1003,6 +1003,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `render::tests::renders_the_chart_object_set`
 - `render::tests::secret_references_mount_by_path_and_are_optional`
 - `render::tests::the_admin_api_renders_only_with_the_cluster_bus_and_a_role`
+- `render::tests::the_network_policy_closes_the_cluster_ports_to_everything_but_the_pods`
 - `render::tests::the_readiness_floor_follows_the_founder_guard`
 - `render::tests::the_render_script_decides_seeds_by_ordinal_and_guard`
 - `render::tests::the_watermark_env_follows_the_observed_pvc_size`

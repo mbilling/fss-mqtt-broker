@@ -1,0 +1,58 @@
+{{/* Optional ingress NetworkPolicy for the broker pods (issue #778). Off by default. */}}
+{{- if .Values.networkPolicy.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "mqttd.fullname" . }}
+  labels:
+    {{- include "mqttd.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "mqttd.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+  ingress:
+    # Pod to pod: the peer bus, gossip and (with admin.enabled) the admin API, only
+    # between this release's broker pods.
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "mqttd.selectorLabels" . | nindent 14 }}
+      ports:
+        - port: peer
+          protocol: TCP
+        - port: gossip
+          protocol: UDP
+        {{- if .Values.admin.enabled }}
+        - port: admin
+          protocol: TCP
+        {{- end }}
+    # Clients: the client Service's ports, from networkPolicy.clientFrom (empty = anywhere).
+    - ports:
+        {{- range .Values.service.ports }}
+        - port: {{ .targetPort }}
+          protocol: {{ .protocol | default "TCP" }}
+        {{- end }}
+      {{- with .Values.networkPolicy.clientFrom }}
+      from:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    # Health and metrics, from networkPolicy.healthFrom (empty = anywhere, so kubelet
+    # probes and Prometheus keep working).
+    - ports:
+        - port: health
+          protocol: TCP
+      {{- with .Values.networkPolicy.healthFrom }}
+      from:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    {{- if and .Values.admin.enabled .Values.networkPolicy.adminFrom }}
+    # The admin API from outside the pod mesh, e.g. a bastion namespace.
+    - ports:
+        - port: admin
+          protocol: TCP
+      from:
+        {{- toYaml .Values.networkPolicy.adminFrom | nindent 8 }}
+    {{- end }}
+{{- end }}

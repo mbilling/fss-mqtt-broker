@@ -1,0 +1,18 @@
+# Render-parity pass with the NetworkPolicy on (issue #778). Not packaged (`ci/`). Used by
+# scripts/k8s/render-parity.sh together with the admin-API flags, so every rule renders:
+# the pod mesh (with admin), clients, health and admin-from-outside. The operator side is
+# `render_sample --admin --netpol`, which must render exactly these peers.
+networkPolicy:
+  enabled: true
+  clientFrom:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: iot
+  healthFrom:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: monitoring
+  adminFrom:
+    - podSelector:
+        matchLabels:
+          app: bastion
