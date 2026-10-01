@@ -25,6 +25,7 @@ pub mod config;
 pub mod http;
 pub mod roles;
 mod routes;
+pub mod scope;
 pub mod sessions;
 
 pub use roles::{Caller, Role};

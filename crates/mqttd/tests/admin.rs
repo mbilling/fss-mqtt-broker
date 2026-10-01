@@ -1236,8 +1236,17 @@ async fn a_log_override_is_an_operator_action_that_never_silences_audit() {
 /// Found on the live cluster: a CLEAN session stays on the node the client connected to,
 /// not its placement owner. Kick must act where the client is: locally when asked there,
 /// and by asking the other members when asked on the owner, which holds nothing.
-#[tokio::test]
-async fn a_clean_session_is_kicked_where_it_is_not_where_placement_points() {
+/// Two brokers, `a` and `b`, each placing the other as a peer and reaching its admin
+/// listener over mTLS with its cluster certificate; plus a client id `b` owns.
+struct TwoBrokers {
+    a: Broker,
+    b: Broker,
+    owned_by_b: String,
+    admin_ca: Arc<Ca>,
+    cluster: Ca,
+}
+
+async fn two_brokers() -> TwoBrokers {
     let admin_ca = Arc::new(mint_ca("admin"));
     let cluster = mint_ca("cluster");
     // Two admin listeners bound first, so each node's peer map can name the other.
@@ -1299,6 +1308,24 @@ async fn a_clean_session_is_kicked_where_it_is_not_where_placement_points() {
             .find(|c| p.owner(c).0 == "b")
             .unwrap()
     };
+    TwoBrokers {
+        a,
+        b,
+        owned_by_b,
+        admin_ca,
+        cluster,
+    }
+}
+
+#[tokio::test]
+async fn a_clean_session_is_kicked_where_it_is_not_where_placement_points() {
+    let TwoBrokers {
+        a,
+        b,
+        owned_by_b,
+        admin_ca,
+        ..
+    } = two_brokers().await;
     let root = mint_leaf(&admin_ca, "root", None);
 
     // Connected to `a` with a clean session: `a` holds it, although `b` owns the id.
@@ -1337,4 +1364,141 @@ async fn a_clean_session_is_kicked_where_it_is_not_where_placement_points() {
     assert_eq!((status, code(&body)), (404, "not-found"));
     let message = body["error"]["message"].as_str().unwrap();
     assert!(message.contains("asked: b, a"), "{message}");
+}
+
+/// T17: `scope=cluster` answers for every node, from any node — the operator does not
+/// need to know which node holds a client — and a peer may read these only as a forward.
+#[tokio::test]
+async fn cluster_scope_finds_a_client_on_any_node_and_peers_read_only_as_a_forward() {
+    let TwoBrokers {
+        a,
+        b,
+        admin_ca,
+        cluster,
+        ..
+    } = two_brokers().await;
+    let mut on_a = Client::connect_v5_ok(a.mqtt, "dev-on-a").await;
+    let mut on_b = Client::connect_v5_ok(b.mqtt, "dev-on-b").await;
+    on_a.subscribe(1, "fleet/#", QoS::AtLeastOnce).await;
+    on_b.subscribe(1, "fleet/+/cmd", QoS::AtLeastOnce).await;
+    view_until(&a, "/admin/v1/clients", |v| v["matched"] == 1).await;
+    view_until(&b, "/admin/v1/clients", |v| v["matched"] == 1).await;
+    let alice = mint_leaf(&admin_ca, "alice", None);
+
+    // Node scope is unchanged: a sees only its own client.
+    let (status, body) = a.admin.get(&alice, "/admin/v1/clients").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["sessions"].as_array().unwrap().len(), 1, "{body}");
+
+    let (status, body) = a.admin.get(&alice, "/admin/v1/clients?scope=cluster").await;
+    assert_eq!(status, 200, "{body}");
+    let rows: Vec<(String, String)> = body["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| {
+            (
+                r["client_id"].as_str().unwrap().to_string(),
+                r["node"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        rows,
+        [
+            ("dev-on-a".into(), "a".into()),
+            ("dev-on-b".into(), "b".into())
+        ],
+        "{body}"
+    );
+    assert_eq!(body["matched"], 2);
+    assert_eq!(body["answered_by"], "a");
+    assert!(body["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|n| n["replied"] == true));
+
+    // A session held on the other node, asked on this one.
+    let (status, body) = a
+        .admin
+        .get(&alice, "/admin/v1/session?client=dev-on-b&scope=cluster")
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["node"], "b", "{body}");
+    assert_eq!(body["found_on"], serde_json::json!(["b"]));
+    let (status, body) = a
+        .admin
+        .get(&alice, "/admin/v1/session?client=nobody&scope=cluster")
+        .await;
+    assert_eq!((status, code(&body)), (404, "not-found"), "{body}");
+    let message = body["error"]["message"].as_str().unwrap();
+    assert!(message.contains("asked: a, b"), "{message}");
+
+    // Everyone on every node who would receive a publish to the topic.
+    let (status, body) = b
+        .admin
+        .get(
+            &alice,
+            "/admin/v1/subscribers?topic=fleet/7/cmd&scope=cluster",
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let subs: Vec<(&str, &str)> = body["subscribers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| {
+            (
+                r["client_id"].as_str().unwrap(),
+                r["node"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(subs, [("dev-on-a", "a"), ("dev-on-b", "b")], "{body}");
+
+    let (status, body) = a.admin.get(&alice, "/admin/v1/clients?scope=all").await;
+    assert_eq!((status, code(&body)), (400, "bad-request"), "{body}");
+
+    // The peer side audited the forwarded read, naming the operator it was for.
+    let b_log = b.admin.audit.0.lock().unwrap().clone();
+    assert!(
+        b_log
+            .iter()
+            .any(|(_, who, d)| who.as_deref() == Some("CN=a")
+                && d.contains("role=peer GET /admin/v1/clients")
+                && d.contains("forwarded_for=CN%3Dalice")),
+        "{b_log:?}"
+    );
+
+    // A node certificate reads these only as a forward, and a forward is node scope.
+    let (cert, key) = mint_leaf(&cluster, "a", None);
+    let as_peer = Target {
+        connector: mqtt_net::tls::client_connector_multi(
+            &[&admin_ca.pem, &cluster.pem],
+            &cert,
+            &key,
+        )
+        .unwrap(),
+        ..b.admin.target(&cert, &key)
+    };
+    let (status, _) = client::call(&as_peer, "GET", "/admin/v1/clients?scope=cluster", None)
+        .await
+        .unwrap();
+    assert_eq!(status, 403);
+    let (status, body) = client::call(
+        &as_peer,
+        "GET",
+        "/admin/v1/clients?scope=cluster&forwarded_for=CN%3Dalice",
+        None,
+    )
+    .await
+    .unwrap();
+    let body: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(status, 200, "{body}");
+    assert!(
+        body.get("scope").is_none(),
+        "a forward never fans out: {body}"
+    );
+    assert_eq!(body["sessions"].as_array().unwrap().len(), 1, "{body}");
 }
