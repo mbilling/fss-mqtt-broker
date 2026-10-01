@@ -141,6 +141,7 @@ async fn start_tls_node(acceptor: TlsAcceptor) -> SocketAddr {
                         shutdown: None,
                         metrics: None,
                         enhanced: None,
+                        ingress: None,
                     });
                     mqttd::conn::handle_stream(tls, Some(peer), None, policy, hub).await;
                 }
@@ -540,6 +541,7 @@ async fn start_identity_node(
                         shutdown: None,
                         metrics: None,
                         enhanced: None,
+                        ingress: None,
                     });
                     mqttd::conn::handle_stream(tls, Some(peer), identity, policy, hub).await;
                 }
@@ -768,6 +770,7 @@ async fn tls_without_client_cert_is_not_authorized_under_deny_anonymous() {
                         shutdown: None,
                         metrics: None,
                         enhanced: None,
+                        ingress: None,
                     });
                     mqttd::conn::handle_stream(tls, Some(peer), identity, policy, hub).await;
                 }
@@ -1058,6 +1061,7 @@ async fn start_reloadable_mtls_node(
                         shutdown: None,
                         metrics: None,
                         enhanced: None,
+                        ingress: None,
                     });
                     let cert = mqttd::conn::tls_admission(
                         &tls,
@@ -1296,6 +1300,7 @@ async fn start_both_factors_node(pki: &Pki, password_line: &str, both_factors: b
                         shutdown: None,
                         metrics: None,
                         enhanced: None,
+                        ingress: None,
                     });
                     mqttd::conn::handle_stream(tls, Some(peer), identity, policy, hub).await;
                 }

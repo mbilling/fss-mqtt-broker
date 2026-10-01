@@ -375,6 +375,7 @@ pub fn permissive_policy(connect_timeout: Duration) -> Arc<ConnPolicy> {
         connect_timeout,
         shutdown: None,
         metrics: None,
+        ingress: None,
     })
 }
 
@@ -1129,6 +1130,7 @@ pub mod enhanced {
             connect_timeout: std::time::Duration::from_secs(10),
             shutdown: None,
             metrics: None,
+            ingress: None,
         })
     }
 

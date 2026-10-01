@@ -236,6 +236,7 @@ impl Rig {
                 done: None,
                 v5: false,
                 publisher: None,
+                credit: None,
             })
             .await;
         seq

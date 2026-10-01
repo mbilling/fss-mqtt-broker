@@ -190,6 +190,7 @@ async fn publish_burst(tx: &mpsc::UnboundedSender<HubCommand>, count: usize) {
             done: Some(done_tx),
             publisher: None,
             v5: false,
+            credit: None,
         });
         if last {
             let _ = done_rx.await;

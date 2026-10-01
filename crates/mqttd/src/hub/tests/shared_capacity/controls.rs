@@ -24,6 +24,7 @@ async fn qos0_shared_capacity_includes_application_properties() {
                 done: None,
                 publisher: None,
                 v5: false,
+                credit: None,
             })
             .unwrap();
         ping(&rig.tx).await;

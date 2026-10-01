@@ -268,3 +268,29 @@ Two further details:
 - **Metrics.** `mqttd_hub_queue_depth` keeps its meaning (everything queued, now the
   channel plus both lanes) so existing dashboards hold. The per-lane split is a new
   family, `mqttd_hub_lane_depth{lane="control|data"}`.
+
+## Amendment (2026-10-02): client credit, as built in T3
+
+§2 and §2a stand, with these details settled in the implementation (`crates/mqttd/src/ingress.rs`
+and the connection's serve loop):
+- **Where credit is taken.** After the publish-rate limiter (ADR 0041 T3), so a throttled
+  publish holds no credit while it waits for a token. Only a PUBLISH read from a client socket
+  is charged; every other packet passes uncharged.
+- **The charge.** `topic + payload + 800` bytes. The 800 comes from #504's measured 1,019 B per
+  queued command at 200 B payloads, and stays until T1 measures it directly.
+- **A paused connection keeps working.** The parked publish waits in its own `select!` branch,
+  so deliveries to the client, PUBACK release and shutdown all continue while reading is
+  stopped. The keepalive timer is disarmed while parked and restarts when reading resumes.
+- **Shedding happens after the connection's own bookkeeping.** Under `shed-qos0`, a QoS 0
+  publish without credit still has its topic alias registered, its topic validated and the ACL
+  applied. Only the hand-off to the hub is skipped, so later publishes that use the alias stay
+  valid.
+- **Restart-scoped, not hot-reloadable.** §2a said the setting reloads with the other limits.
+  In fact the whole `[limits]` section is restart-scoped (ADR 0041 §6), and the pool is built
+  once at startup. The three settings follow the rest of the section.
+- **Metrics.** `mqttd_ingress_paused_total` (a counter), `mqttd_ingress_paused_seconds` (a
+  histogram rather than §4's `_seconds_total` counter, so the length of a pause is visible,
+  not just the sum), and `mqttd_ingress_credit_bytes{state="in_use|capacity"}` in place of
+  §4's `mqttd_hub_ingress_bytes`. The hub exports the gauge on its sweep. Client QoS 0 shed
+  under `shed-qos0` counts as `publish_dropped{reason="hub-ingress"}`, the reason T4 will use
+  for peer QoS 0.

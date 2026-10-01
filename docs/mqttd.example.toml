@@ -285,6 +285,16 @@ queue_overflow = "drop-oldest"       # or "reject-newest"
 # container limit and that gap IS the overshoot allowance (docs/SIZING.md).
 # Requires /proc (Linux); elsewhere the broker logs that it is not enforcing and carries on.
 # memory_max_bytes = 2147483648      # 2 GiB
+# Hub ingress credit (ADR 0082 T3): the bytes of client publishes that may wait for the hub at
+# once (topic + payload + ~800 bytes each, held until the hub dispatches them). Past it a
+# connection stops reading its socket until credit frees — TCP backpressure, nothing lost.
+# Unset = 1/8 of memory_max_bytes when set, else 256 MiB. Minimum 4096.
+# hub_ingress_bytes = 268435456      # 256 MiB
+# The most of that pool one connection may hold (default 1 MiB, minimum 4096).
+# conn_ingress_bytes = 1048576
+# A QoS 0 publish with no credit: "pause" (default) waits like QoS 1/2; "shed-qos0" keeps
+# reading and drops it, counted as publish_dropped{reason="hub-ingress"}. QoS 1/2 always pause.
+# ingress_overload = "pause"
 # How often BOTH watermark watchers (disk, memory) sample their axis, seconds. Range 1-300 —
 # a value outside it is a startup error. Within 10% of a mark the watchers re-check every
 # watermark_poll_secs/10 (floor 1 s), which is also how quickly a CLEARED brownout lifts.
