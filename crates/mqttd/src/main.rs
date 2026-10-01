@@ -2299,6 +2299,8 @@ async fn run_restore(
 
     let sink = HubRetainedSink {
         hub: hub_tx.clone(),
+        timeout: Duration::from_secs(config.backup.restore_timeout_secs),
+        warn_every: RESTORE_RETAINED_WARN_EVERY,
     };
     let report = match mqttd::backup::apply(&plan, store, &sink).await {
         Ok(report) => report,
@@ -2369,7 +2371,17 @@ async fn run_restore(
 /// outward traffic is the token-carrying fan-out to peer caches.
 struct HubRetainedSink {
     hub: mpsc::UnboundedSender<hub::HubCommand>,
+    /// How long one retained write may wait for the hub's answer before the restore fails
+    /// (`backup.restore_timeout_secs`, issue #799). Without it a stalled commit, like the
+    /// retained-handoff deadlock of #739, left the node `in-progress` forever with nothing
+    /// logged.
+    timeout: Duration,
+    /// How often a write that is still waiting logs a warning naming its topic.
+    warn_every: Duration,
 }
+
+/// How often a retained write still waiting on the hub says so (issue #799).
+const RESTORE_RETAINED_WARN_EVERY: Duration = Duration::from_secs(15);
 
 #[async_trait::async_trait]
 impl mqttd::backup::RetainedSink for HubRetainedSink {
@@ -2390,7 +2402,33 @@ impl mqttd::backup::RetainedSink for HubRetainedSink {
                 done: tx,
             })
             .map_err(|_| "restore: the hub is gone".to_string())?;
-        match rx.await {
+        // Bounded and visible (issue #799): warn while the write waits, fail at the deadline.
+        let started = std::time::Instant::now();
+        let deadline = tokio::time::Instant::now() + self.timeout;
+        tokio::pin!(rx);
+        let answer = loop {
+            let tick = (tokio::time::Instant::now() + self.warn_every).min(deadline);
+            match tokio::time::timeout_at(tick, &mut rx).await {
+                Ok(answer) => break answer,
+                Err(_) if tokio::time::Instant::now() >= deadline => {
+                    return Err(format!(
+                        "restore: retained topic {:?} got no answer from the hub within {}s \
+                         (backup.restore_timeout_secs); the retained commit stalled, so the \
+                         restore stops here rather than hang. Nothing after this topic was \
+                         imported",
+                        message.topic,
+                        self.timeout.as_secs()
+                    ));
+                }
+                Err(_) => warn!(
+                    topic = %message.topic,
+                    waited_secs = started.elapsed().as_secs(),
+                    limit_secs = self.timeout.as_secs(),
+                    "restore: a retained write is still waiting for its durable commit"
+                ),
+            }
+        };
+        match answer {
             Ok(mqttd::hub::PublishOutcome::Accepted) => Ok(()),
             Ok(mqttd::hub::PublishOutcome::Refused(r)) => Err(format!(
                 "restore: retained topic {:?} was REFUSED ({r:?}) — nothing further was \
@@ -5239,6 +5277,72 @@ mod tests {
     use mqtt_config::{Config, MinReplicas};
     use mqtt_storage::OverflowPolicy;
     use std::time::Duration;
+
+    /// Issue #799: a retained write in a restore waits for the hub's answer for at most
+    /// `backup.restore_timeout_secs`, then fails the restore naming the topic, instead of
+    /// hanging silently as the #739 deadlock did. An answered write still succeeds. Paused
+    /// time: the 300 s deadline costs nothing.
+    #[tokio::test(start_paused = true)]
+    async fn a_restore_retained_write_fails_at_its_deadline_instead_of_hanging() {
+        use mqttd::backup::RetainedSink;
+        let record = mqttd::backup::RetainedRecord {
+            kind: "retained".into(),
+            topic: "cfg/1/desired".into(),
+            payload_b64: "b24=".into(),
+            qos: 1,
+            expires_at: None,
+            props: mqttd::backup::PropsRecord::default(),
+            token: None,
+            tombstone: false,
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let sink = super::HubRetainedSink {
+            hub: tx,
+            timeout: Duration::from_secs(300),
+            warn_every: Duration::from_secs(15),
+        };
+
+        // The hub takes the command and never answers (the shape of the #739 stall).
+        let held = tokio::spawn(async move {
+            let mut kept = Vec::new();
+            while let Some(cmd) = rx.recv().await {
+                match cmd {
+                    hub::HubCommand::RestoreRetained { done, .. } => kept.push(done),
+                    _ => unreachable!("only restore commands are sent"),
+                }
+            }
+            kept
+        });
+        let started = tokio::time::Instant::now();
+        let err = sink.publish(&record, None).await.unwrap_err();
+        assert!(
+            err.contains("\"cfg/1/desired\"") && err.contains("within 300s"),
+            "{err}"
+        );
+        assert_eq!(
+            started.elapsed(),
+            Duration::from_secs(300),
+            "fails AT the deadline"
+        );
+        drop(sink);
+        assert_eq!(held.await.unwrap().len(), 1);
+
+        // An answered write succeeds, well inside the deadline.
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Some(hub::HubCommand::RestoreRetained { done, .. }) = rx.recv().await {
+                let _ = done.send(mqttd::hub::PublishOutcome::Accepted);
+            }
+        });
+        let sink = super::HubRetainedSink {
+            hub: tx,
+            timeout: Duration::from_secs(300),
+            warn_every: Duration::from_secs(15),
+        };
+        sink.publish(&record, None)
+            .await
+            .expect("an answered write is accepted");
+    }
 
     /// Issue #269: the peer-bus CA/cert/key are IN the file-watch scope. Before this,
     /// only the peer CRL was watched — with a full bus configured, a rotated leaf sat

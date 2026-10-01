@@ -636,7 +636,8 @@ pub struct Backup {
     /// Seconds the restore waits for the durable plane to become ready before giving up
     /// (`MQTTD_RESTORE_TIMEOUT`, default 300). A cluster restore must place sessions by
     /// the CONVERGED ring, so it waits for the mesh rather than importing into a
-    /// single-member view.
+    /// single-member view. Also the most one retained value's import may wait for its
+    /// durable commit: past it the restore fails, naming the topic, instead of hanging.
     pub restore_timeout_secs: u64,
     /// Import a set that is MISSING a cluster member's export, forfeiting that node's
     /// sessions (`MQTTD_RESTORE_PARTIAL_ACCEPT_DATA_LOSS`, default `false` = refuse).
