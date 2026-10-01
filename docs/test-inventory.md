@@ -340,6 +340,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `cluster_store::tests::an_acked_append_survives_owner_restart_via_its_durable_self_copy`
 - `cluster_store::tests::an_unstamped_owner_cannot_fabricate_an_empty_log`
 - `cluster_store::tests::appends_below_the_min_replicas_floor_are_refused_until_capacity_returns`
+- `cluster_store::tests::concurrent_first_touches_recover_a_key_once`
 - `cluster_store::tests::enqueue_replicates_to_a_follower`
 - `cluster_store::tests::foreign_group_is_not_owned`
 - `cluster_store::tests::growing_a_one_node_group_back_fills_the_joiners`
