@@ -669,6 +669,16 @@ impl Swim {
             let inc_advanced = new_life || u.incarnation > m.incarnation;
             m.generation = u.generation;
             m.incarnation = u.incarnation;
+            if new_life {
+                // Our probe history is about the old process too (issue #783): its
+                // missed probes are not this life's, and a probe of ours still in
+                // flight was aimed at the corpse — left to conclude, it would
+                // suspect the new life the moment it came up.
+                m.unanswered_probes = 0;
+                if self.probe.as_ref().is_some_and(|p| p.target == id) {
+                    self.probe = None;
+                }
+            }
             // An unroutable claim must not overwrite an address we can actually
             // dial (issue #396): a node bound to `0.0.0.0` self-claims it in every
             // update it emits — including its own refutations, which supersede by
@@ -867,6 +877,25 @@ impl Swim {
         if !self.bootstrapped {
             self.bootstrapped = true;
             self.next_probe_at = now + self.cfg.protocol_period_ms;
+            // Announce ourselves, so the greetings below (and the first datagrams
+            // after them) carry a FIRST-HAND claim of this life at its real
+            // incarnation (issue #783). A peer that still holds an earlier life of
+            // this id — `Dead` after a graceful leave — is superseded at once; and
+            // one that learned us only from a datagram header (which carries no
+            // incarnation, so it records 0) learns the incarnation we actually run
+            // at, without which a Suspect it raised at 0 is one we would never
+            // refute (ours is higher) and it would kill this life.
+            let me = Update {
+                id: self.local.0.clone(),
+                addr: self.local_addr.clone(),
+                peer_addr: self.local_peer_addr.clone(),
+                incarnation: self.incarnation,
+                generation: self.generation,
+                state: MemberState::Alive,
+                suspecter: None,
+                failure_domain: self.local_domain.clone(),
+            };
+            self.enqueue_gossip(me);
             // Greet seeds so they add us and send their membership back.
             let seeds = self.seeds.clone();
             for addr in seeds {
@@ -1082,6 +1111,32 @@ impl Swim {
             if let Some(m) = self.members.get_mut(&from_id) {
                 if m.addr != msg.from_addr && !unroutable(&msg.from_addr) {
                     m.addr.clone_from(&msg.from_addr);
+                }
+                // A datagram from a NEWER LIFE of a known member is itself proof that
+                // the new process is alive (issue #783). Before this, a node that left
+                // gracefully stayed `Dead` on every peer after its restart: its own
+                // datagrams only refreshed the address, its Join carried no claim about
+                // itself, and — seeded only to the founder, as deployed — no survivor
+                // re-greeted it to draw out its full state; once the tombstone was
+                // pruned each survivor re-learned the old life's `Dead` from another,
+                // re-declared every `dead_ttl_ms`, never re-admitted. (A crash-restart
+                // hid this: peers still held the old life `Alive`, and acks do not look
+                // at generations.) The bootstrap self-announcement in `tick` now also
+                // carries the new life; this is the half that does not depend on that
+                // claim's gossip budget lasting. First-hand, as in #383: the sender's
+                // own authenticated datagram, which a dead process cannot send.
+                if msg.from_generation > m.generation {
+                    let update = Update {
+                        id: msg.from.clone(),
+                        addr: msg.from_addr.clone(),
+                        peer_addr: msg.from_peer_addr.clone(),
+                        incarnation: 0,
+                        generation: msg.from_generation,
+                        state: MemberState::Alive,
+                        suspecter: None,
+                        failure_domain: msg.from_domain.clone(),
+                    };
+                    self.apply_update_from(&update, now, &mut out, true);
                 }
             } else {
                 let update = Update {
@@ -1503,6 +1558,122 @@ mod tests {
                 .any(|a| matches!(a, Action::StateChange { id, state, .. }
                     if id.0 == "a" && *state == MemberState::Dead)),
             "the peer emits a Dead state change for the leaver"
+        );
+    }
+
+    /// Issue #783: a node that left GRACEFULLY is re-admitted when it restarts. The
+    /// peers hold it `Dead` and tombstoned, and the restarted process (a newer
+    /// generation) greets a seed with a Join. Either half of the fix revives it on its
+    /// own: the Join's first-hand self-claim, and — should that claim not be on board
+    /// (its gossip budget spent, say) — the datagram's newer generation alone. A
+    /// still-circulating `Dead` about the old life must not undo it, on the greeted
+    /// peer or on a third node that hears of the new life by relay.
+    #[test]
+    fn a_gracefully_left_node_is_readmitted_when_it_restarts() {
+        let mut leaver = node("a", "a:1", &[]);
+        let mut b = node("b", "b:1", &[]);
+        let mut c = node("c", "c:1", &[]);
+        let mut d = node("d", "d:1", &[]);
+        let mut out = Vec::new();
+        for peer in ["b", "c", "d"] {
+            leaver.apply_update(&alive_update(peer, &format!("{peer}:1"), 0), 0, &mut out);
+        }
+        for peer in [&mut b, &mut c, &mut d] {
+            peer.apply_update(&alive_update("a", "a:1", 0), 0, &mut out);
+        }
+        b.apply_update(&alive_update("c", "c:1", 0), 0, &mut out);
+        c.apply_update(&alive_update("b", "b:1", 0), 0, &mut out);
+
+        // The graceful stop: a's Dead departure reaches every peer.
+        for action in leaver.leave() {
+            if let Action::Send { to, msg } = action {
+                match to.as_str() {
+                    "b:1" => drop(b.handle(msg, 0)),
+                    "c:1" => drop(c.handle(msg, 0)),
+                    "d:1" => drop(d.handle(msg, 0)),
+                    _ => {}
+                }
+            }
+        }
+        for peer in [&b, &c, &d] {
+            assert_eq!(member_state(peer, "a"), Some(MemberState::Dead));
+        }
+
+        // The restart: same id and address, a newer generation, seeded at b.
+        let mut restarted = Swim::new(
+            NodeId("a".into()),
+            "a:1".into(),
+            peer_addr_of("a:1"),
+            None,
+            2,
+            fast_cfg(),
+            vec!["b:1".into()],
+        );
+        let join = restarted
+            .tick(10)
+            .into_iter()
+            .find_map(|a| match a {
+                Action::Send { to, msg } if to == "b:1" && matches!(msg.kind, Kind::Join) => {
+                    Some(msg)
+                }
+                _ => None,
+            })
+            .expect("the restarted node greets its seed");
+        assert!(
+            join.gossip.iter().any(|u| u.id == "a"
+                && u.generation == 2
+                && u.incarnation == 1
+                && u.state == MemberState::Alive),
+            "the greeting carries a first-hand claim of the new life at its real incarnation"
+        );
+
+        // Half one: the self-claim alone revives it (d gets the Join as sent).
+        drop(d.handle(join.clone(), 10));
+        assert_eq!(
+            member_state(&d, "a"),
+            Some(MemberState::Alive),
+            "the self-claim re-admits the new life"
+        );
+
+        // Half two: with the claim stripped, the datagram's newer generation alone does.
+        let bare = Message {
+            gossip: Vec::new(),
+            ..join
+        };
+        let observed = b.handle(bare, 10);
+        assert_eq!(
+            member_state(&b, "a"),
+            Some(MemberState::Alive),
+            "the greeted peer re-admits the new life from its own datagram"
+        );
+        assert!(
+            observed
+                .iter()
+                .any(|a| matches!(a, Action::StateChange { id, state, .. }
+                if id.0 == "a" && *state == MemberState::Alive)),
+            "and tells the link layer, so it dials the restarted node"
+        );
+
+        // The old life's Dead, still relayed by c, says nothing about the new life.
+        drop(b.handle(
+            m("c", "c:1", Kind::Sync, vec![dead_update("a", "a:1", 1)]),
+            11,
+        ));
+        assert_eq!(member_state(&b, "a"), Some(MemberState::Alive));
+
+        // c hears of the new life from b's piggybacked gossip and re-admits it too.
+        let gossip = b.take_gossip();
+        assert!(
+            gossip
+                .iter()
+                .any(|u| u.id == "a" && u.generation == 2 && u.state == MemberState::Alive),
+            "b relays the new life"
+        );
+        drop(c.handle(m("b", "b:1", Kind::Sync, gossip), 12));
+        assert_eq!(
+            member_state(&c, "a"),
+            Some(MemberState::Alive),
+            "a third node re-admits the new life by relay"
         );
     }
 
