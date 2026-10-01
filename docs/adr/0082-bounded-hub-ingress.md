@@ -1,0 +1,214 @@
+# 0082. Bounded hub ingress: a control lane that never waits behind data, and byte credits that push back on publishers
+
+- **Status:** Proposed
+- **Date:** 2026-10-01
+- **Deciders:** project maintainers
+- **Delivery:** [docs/delivery/0082-bounded-hub-ingress.md](../delivery/0082-bounded-hub-ingress.md) — plan, progress, and changelog
+- **Related:** [ADR 0041](0041-resource-governance.md) (resource governance: what a brownout
+  refuses, the outbound and backlog caps), [ADR 0061](0061-off-loop-durable-appends.md)
+  (per-session append lanes, already bounded), [ADR 0015](0015-cluster-shared-subscriptions.md)
+  (`$share` delivery and its capacity fallback), [ADR 0020](0020-metrics-and-observability.md)
+  (metrics and label cardinality). Issues: #535 (the queue-budget design this ADR is),
+  #504 (overload non-recovery, whose acceptance this closes), #509 (the pending-publish table,
+  which stays its own owner).
+
+> This record states the decision only. How it is being built and how far along it is
+> live in the [delivery doc](../delivery/0082-bounded-hub-ingress.md).
+
+## Context
+
+The hub is one task with one command channel, and that channel is unbounded
+(`crates/mqttd/src/hub/mod.rs:2382`). Every client connection, every peer link and the hub
+itself push into it with `send`, which never waits:
+
+- **Client publishes:** `conn.rs` `handle_inbound` reads a PUBLISH and calls
+  `hub.send(HubCommand::Publish { … })` (`conn.rs:2147`). A QoS 0 publish carries no
+  completion and nothing slows the read loop down.
+- **Peer data:** the peer reader forwards remote publishes, shared deliveries and retained
+  updates the same way (`peer.rs:682-919`).
+- **The durable plane rides the same channel.** Raft RPCs, replication and replica reads
+  arrive as `HubCommand::DurableFrame` (`peer.rs:901-919`). So do completions, attach and
+  detach, acks, admin requests, and the `Ping` that `/livez` waits on (`health.rs:43`, 2 s).
+
+### What failed, measured
+
+The #504 cloud acceptance runs on 2026-10-01 put a 3-node cluster at 1.5× capacity (QoS 0
+`$share`, 540k msg/s offered).
+
+**First run:** one broker froze at its cgroup `MemoryHigh` (10 GB) with 15M QoS 0 frames on
+its peer links. #811 bounded that path.
+
+**Re-run** (candidate c7fc480, including #811):
+- **Brokers 0 and 2 froze** at 10.7 GB anonymous RSS. Every tokio worker was in state `D`
+  in `mem_cgroup_handle_over_high` (throttled, not deadlocked), and each still held about
+  7,200 dead client sockets.
+- **Broker 1 stayed under the limit and recovered on its own.** Its scrapes name the queue:
+
+| Scrape | `mqttd_hub_queue_depth` | RSS |
+|---|---|---|
+| Baseline (6 sites) | 0 | 108 MB |
+| Rung 18, window open | **2,553,413** | 2.60 GB |
+| Rung 18, window close (drained) | 705 | 275 MB |
+
+That is about **1,019 bytes per queued command** at 200 B payloads. The hub dispatched
+46.85M publishes in 184.6 s, about 3.9 µs each. So 2.5M queued commands is also about
+**10 s of latency for anything behind them**, raft votes included. That is the 1.5 s
+vote-timeout churn and the SWIM flapping the first run logged before its broker went silent.
+
+The memory brownout (ADR 0041 T8, `MQTTD_MEMORY_MAX_BYTES`) does not help here. It refuses
+*growth*: new sessions, new retained topics, offline enqueues. A QoS 0 publish passes
+straight through into the queue. Production's shipped unit has `MemoryHigh=1500M`, so it
+reaches the same wall about seven times sooner.
+
+### Queue inventory
+
+| Queue | Where | Bound today |
+|---|---|---|
+| **Hub command channel** (all producers) | `hub/mod.rs:2382` | **none** ← the 10 GB |
+| Client outbound per subscriber | `hub/mod.rs:387` `MAX_OUTBOUND_QUEUE` (10,000) + `MQTTD_MAX_OUTBOUND_BYTES` | yes (QoS 0 shed, counted) |
+| Flow-control backlog per session | `backpressure.rs:86` (10,000) + `MQTTD_MAX_BACKLOG_BYTES` | yes |
+| Peer link lanes, QoS 0 | `peer.rs:470,478`, `PEER_QOS0_BACKLOG_CAP` (100,000) | yes (#811, shed counted) |
+| Peer link lanes, QoS ≥ 1 forwards | same lanes | by the origin's pending-publish table |
+| Pending-publish table | `hub/mod.rs:2319,2327` (65,536 / 64 MiB) | yes (#509 owns the design) |
+| Per-session append lanes | `hub/lanes.rs:217` `LANE_QUEUE_CAP` (256) + control headroom | yes |
+| Store truncate queue | `hub/mod.rs:2660` | unbounded, one entry per acked offset; small |
+| Retained handoff queues | `hub/retained.rs` (#798) | capped, drop-oldest |
+| Bridge spool | `mqtt-bridge` (#540) | by bytes |
+
+The hub command channel is the only unbounded queue whose producers are external and
+unthrottled. Everything downstream of it is already bounded.
+
+## Decision
+
+### 1. Two lanes into the hub: control first, data second
+
+The single channel becomes two, and the hub loop polls them `biased`, control first.
+
+- **Control:** everything whose volume is bounded by something other than the publish rate,
+  or whose delay breaks a protocol. That covers:
+  - attach, detach, evict;
+  - PUBACK, PUBREC and PUBCOMP from clients;
+  - lane and store completions (`AppendDone` and the like);
+  - `DurableFrame` (raft, replication, replica reads);
+  - membership and interest gossip;
+  - retained commits, acks and snapshots;
+  - remote acks and verdicts;
+  - `Ping`, admin, quota and brownout settings.
+- **Data:** client `Publish`; remote `RemotePublish` and `RemoteSharedDeliver`; and
+  `RemoteRetainedUpdate`, which is a cache update that converges by digest.
+
+The control lane stays unbounded. Its producers are bounded by connection count, by
+in-flight windows, or by the hub's own outstanding work, and a bounded control lane is
+exactly where a credit cycle would form (the hub awaiting capacity that only its own
+dispatch frees). Under any data backlog, a raft RPC, a detach or a `/livez` ping waits
+behind control traffic only.
+
+### 2. Client publishes acquire byte credit; a connection without credit stops reading
+
+There is one node-wide **byte pool** (`MQTTD_HUB_INGRESS_BYTES`) and a **per-connection
+cap** (`MQTTD_CONN_INGRESS_BYTES`).
+
+- **Acquire:** after a client PUBLISH is read and decoded, its handler acquires `cost`
+  bytes, first from its connection's allowance and then from the pool, before handing the
+  command to the data lane.
+- **Charge:** `cost` is the topic length plus the payload length plus a fixed per-command
+  overhead calibrated in T1. The measured figure is about 800 B beyond the payload, so the
+  pool bounds *retained* memory, not just payload bytes.
+- **Release:** the permit (an owned semaphore permit) **travels inside the command** and is
+  released when the hub drops it after dispatch. The hub never acquires credit, so no
+  credit cycle can form.
+- **Pausing:** while a connection waits for credit it **does not read its socket**. The
+  kernel's receive buffer fills, TCP closes the window, and that publisher slows to the rate
+  the hub retires its work. This is lossless at every QoS and costs nothing per message.
+- **Fairness:** the pool's semaphore is FIFO, so waiting connections are served in order.
+  The per-connection cap stops one hot publisher from holding the whole pool.
+- **Oversize:** a single message larger than the cap is clamped to the cap, so it can
+  always eventually proceed. `MQTTD_MAX_PACKET_SIZE` already bounds the maximum.
+
+**QoS 1/2 are unchanged.** Nothing is acknowledged before it is read, so pausing the read
+accepts no obligation. Receive Maximum is not renegotiated. Durable work already accepted
+keeps its existing acks and refusals.
+
+**Keepalive:** a connection's own keepalive deadline does not run while it is paused by the
+broker. A client whose PINGREQ goes unread past its own timeout will reconnect, which is
+the honest signal that the broker is saturated. It happens only under sustained overload,
+and the reconnect lands in the same credit queue.
+
+### 3. Peer data is shed, never paused
+
+A peer link carries raft and replication frames in the same TCP stream as data. Pausing its
+reads to bound memory would stall consensus, which is the failure mode this ADR exists to
+remove. So peer data uses non-blocking admission:
+
+- **Remote QoS 0** (forwards and shared deliveries) tries for pool credit. Without it, the
+  message is dropped and counted as `publish_dropped{reason="hub-ingress"}`. QoS 0 promises
+  nothing, and the same drop already happens at the outbound and peer-backlog caps.
+- **Remote QoS ≥ 1 is not charged.** The origin's pending-publish table already bounds how
+  many of these exist per origin (#509). Charging them would turn a bounded obligation into
+  a refusal path with version-skew cost, for no memory gain.
+- **Control and durable frames are never charged.**
+
+### 4. What an operator sees
+
+All new series have bounded label cardinality:
+- `mqttd_hub_queue_depth{class="control|data"}` and `mqttd_hub_ingress_bytes`: queued bytes
+  against the pool;
+- `mqttd_ingress_paused_total` and `mqttd_ingress_paused_seconds_total`: connections that
+  waited for credit;
+- `publish_dropped{reason="hub-ingress"}`: peer QoS 0 shed.
+
+`/livez` keeps answering under overload because its ping is control traffic.
+
+### 5. Defaults
+
+- **`MQTTD_HUB_INGRESS_BYTES`:** 1/8 of `MQTTD_MEMORY_MAX_BYTES` when that is set, otherwise
+  256 MiB. At about 1 KB per command, that is roughly 250k queued commands, or about a
+  second of hub work. So the bound also caps the added latency, not only memory.
+- **`MQTTD_CONN_INGRESS_BYTES`:** 1 MiB.
+
+Both are hot-reloadable as limits. SIZING.md states the arithmetic against the shipped
+unit's `MemoryHigh=1500M`.
+
+### 6. No wire change
+
+Everything here is local admission. Peer QoS 0 shedding already exists as a behavior
+(#811), and remote QoS ≥ 1 is untouched, so there is no protocol bump and no
+version-skew window.
+
+## Consequences
+
+**Good:**
+- A node's memory under ingress overload is bounded by configuration, not by the offer.
+- The process keeps scheduling, so overload ends and the node recovers without a restart.
+- Consensus, cleanup and health stay live under data saturation, because they no longer
+  queue behind publishes. That removes the leader churn seen under load.
+- Publishers are slowed by TCP, which every MQTT client already handles.
+
+**Bad:**
+- Under sustained overload, publishers see backpressure rather than acceptance. Clients
+  with short PINGREQ timeouts reconnect.
+- Remote QoS 0 is shed at a second place, the hub ingress (counted).
+
+**Neutral:**
+- The per-command charge is a calibrated estimate, re-checked by T1's measurement whenever
+  the command layout changes.
+- `hub_queue_depth` changes from one series to two.
+
+## Alternatives considered
+
+- **Bound the single channel with blocking `send`.** Rejected: the hub sends to itself and
+  peer readers carry raft frames. One full channel would deadlock the hub on its own
+  completions and stall consensus.
+- **Shed client QoS 0 at ingress instead of pausing.** This keeps clients connected but
+  loses messages a slower read would have kept. It also still pays read and decode for every
+  dropped publish, so it doesn't bound CPU. It is kept as a possible future knob, not the
+  default.
+- **Refuse client QoS 1/2 with a reason code when over credit.** Unnecessary: an unread
+  PUBLISH carries no obligation, so pausing is lossless where a refusal makes the client
+  resend.
+- **Rely on the memory brownout (ADR 0041 T8).** It refuses growth, not publishes, and it
+  reacts to RSS after the fact. The hub queue fills between samples.
+- **Credit per publisher via MQTT flow control.** Receive Maximum can't be changed
+  mid-connection, and QoS 0 has no flow control at all.
+- **Shard the hub.** Raises capacity but doesn't bound memory. Any shard can still be
+  outrun.
