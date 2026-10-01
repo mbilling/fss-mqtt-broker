@@ -214,7 +214,7 @@
 
 **0081 — # 0081. An authenticated admin API: reads cluster-wide, actions audited, config stays in the file**
 
-- `0081-T15` ⬜ planned ([#770](https://github.com/mbilling/fss-mqtt-broker/issues/770)): "Helm chart and operator support: admin values, certs from Secrets, Service port, NetworkPolicy, CRD field" — "Kubernetes is the primary deployment and neither the chart nor the CRD can enable the admin API today."
+- `0081-T15` 🚧 in-progress ([#770](https://github.com/mbilling/fss-mqtt-broker/issues/770)): "Helm chart and operator support: admin values, certs from Secrets, Service port, NetworkPolicy, CRD field" — "Kubernetes is the primary deployment and neither the chart nor the CRD can enable the admin API today. NetworkPolicy split out to #778: it must cover every broker port, not only admin."
 - `0081-T16` ⬜ planned ([#771](https://github.com/mbilling/fss-mqtt-broker/issues/771)): "Admin e2e scenario suite (kill, partition, scale, decommission, durability, policy, drills), nightly in CI" — "Extends scripts/admin-e2e.sh; one fresh cluster per scenario; asserts through the admin API."
 - `0081-T17` ⬜ planned ([#772](https://github.com/mbilling/fss-mqtt-broker/issues/772)): "Cluster-wide clients/session/subscribers (--all-nodes, scope=cluster)"
 - `0081-T18` ⬜ planned ([#773](https://github.com/mbilling/fss-mqtt-broker/issues/773)): "Hot reload of the admin listener's certificate, key and CA"

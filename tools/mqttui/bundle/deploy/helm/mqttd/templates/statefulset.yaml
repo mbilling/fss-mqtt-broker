@@ -209,6 +209,10 @@ spec:
             - name: gossip
               containerPort: 7946
               protocol: UDP
+            {{- if .Values.admin.enabled }}
+            - name: admin
+              containerPort: 9443
+            {{- end }}
           # Scale-down is a decommission, not a crash (ADR 0043 / 0047 T4): `mqttd --decommission`
           # sends SIGUSR1 to the broker (PID 1) to drain every held key to its post-departure
           # replica set, then BLOCKS until the broker exits — so k8s holds the pod open for the
@@ -255,6 +259,11 @@ spec:
               mountPath: {{ .Values.secrets.gossipKey.mountPath }}
               readOnly: true
             {{- end }}
+            {{- if .Values.admin.enabled }}
+            - name: admin-client-ca
+              mountPath: {{ .Values.admin.clientCa.mountPath }}
+              readOnly: true
+            {{- end }}
             {{- /* Broker-level extension point (issue #262): the intended use is a
                    cert-manager csi-driver volume for per-pod peer-bus keys, paired with
                    secrets.peerTls.dir. */}}
@@ -286,6 +295,11 @@ spec:
         - name: gossip-key
           secret:
             secretName: {{ .Values.secrets.gossipKey.secretName }}
+        {{- end }}
+        {{- if .Values.admin.enabled }}
+        - name: admin-client-ca
+          secret:
+            secretName: {{ .Values.admin.clientCa.secretName }}
         {{- end }}
         {{- with .Values.extraVolumes }}
         {{- toYaml . | nindent 8 }}

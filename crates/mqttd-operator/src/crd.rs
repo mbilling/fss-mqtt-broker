@@ -72,6 +72,28 @@ pub struct MqttdClusterSpec {
     /// verification signals. Cleared by the operator when the rotation completes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gossip_key_rotation: Option<GossipKeyRotation>,
+    /// The authenticated admin API (ADR 0081), mirroring the chart's `admin` values.
+    /// Presence enables it: every pod serves it on port 9443 with its own cluster-bus
+    /// certificate, so `secrets.peerTls` is required (without it nothing is rendered).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admin: Option<AdminSpec>,
+}
+
+/// The admin API settings (ADR 0081; `docs/ADMIN-API.md`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct AdminSpec {
+    /// A Secret with key `ca.crt`: the CA that issues admin client certificates. Use a
+    /// dedicated CA — with the cluster CA, every unlisted node certificate is admitted
+    /// as the read-only `peer` role instead of refused.
+    pub client_ca_secret: String,
+    /// Certificate subjects granted the read-only `viewer` role: the whole subject
+    /// (`CN=oncall, O=example`) or `CN=<name>`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub viewers: Vec<String>,
+    /// Certificate subjects granted the `operator` role (reads and actions).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub operators: Vec<String>,
 }
 
 /// By-path secret references, mirroring the chart's `secrets` values block.

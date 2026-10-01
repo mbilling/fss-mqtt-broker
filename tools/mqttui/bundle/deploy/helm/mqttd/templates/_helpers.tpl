@@ -131,6 +131,35 @@ app.kubernetes.io/component: broker
   value: {{ printf "%s/swim-key" $gossip.mountPath | quote }}
 {{- end }}
 {{- end }}
+{{- /* The admin API (ADR 0081): served with the pod's own cluster-bus certificate. */}}
+{{- $admin := .Values.admin -}}
+{{- if $admin.enabled }}
+{{- if not (or $peer.secretName $peer.dir) }}
+{{- fail "admin.enabled needs the cluster-bus certificates (secrets.peerTls): each pod serves the admin API with its own cluster certificate" }}
+{{- end }}
+{{- if not $admin.clientCa.secretName }}
+{{- fail "admin.enabled needs admin.clientCa.secretName: a Secret with ca.crt, the CA that issues admin client certificates" }}
+{{- end }}
+{{- if not (or $admin.viewers $admin.operators) }}
+{{- fail "admin.enabled needs at least one certificate subject in admin.viewers or admin.operators" }}
+{{- end }}
+- name: MQTTD_ADMIN_BIND
+  value: "0.0.0.0:9443"
+- name: MQTTD_ADMIN_CERT
+  value: {{ ternary (printf "%s/$(POD_NAME).crt" $peer.mountPath) (printf "%s/tls.crt" $peer.dir) (not (empty $peer.secretName)) | quote }}
+- name: MQTTD_ADMIN_KEY
+  value: {{ ternary (printf "%s/$(POD_NAME).key" $peer.mountPath) (printf "%s/tls.key" $peer.dir) (not (empty $peer.secretName)) | quote }}
+- name: MQTTD_ADMIN_CLIENT_CA
+  value: {{ printf "%s/ca.crt" $admin.clientCa.mountPath | quote }}
+{{- with $admin.viewers }}
+- name: MQTTD_ADMIN_VIEWERS
+  value: {{ join ";" . | quote }}
+{{- end }}
+{{- with $admin.operators }}
+- name: MQTTD_ADMIN_OPERATORS
+  value: {{ join ";" . | quote }}
+{{- end }}
+{{- end }}
 {{- with .Values.extraEnv }}
 {{ toYaml . }}
 {{- end }}

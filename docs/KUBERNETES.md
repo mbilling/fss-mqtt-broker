@@ -42,6 +42,15 @@ operator release per namespace that runs brokers. Helm installs CRDs but does
 - `resources: {}` — set a memory limit; the broker's watermark is not a
   cgroup ceiling ([SIZING.md](SIZING.md)).
 
+## Admin API
+
+Both paths can turn on the admin API ([ADMIN-API.md](ADMIN-API.md), CLI:
+[ADMIN-CLI.md](ADMIN-CLI.md)): the chart's `admin` values or the CR's `spec.admin`. Every
+pod serves it on port 9443 with its own cluster-bus certificate, so `secrets.peerTls` is
+required. The port is on the headless Service only. Admin client certificates come from a
+dedicated CA in a Secret with key `ca.crt`. Setup and the port-forward recipe are in the
+[chart README](../deploy/helm/mqttd/README.md#admin-api).
+
 ## Quick start
 
 ```sh

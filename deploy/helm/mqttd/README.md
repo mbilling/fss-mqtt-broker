@@ -37,6 +37,7 @@ Every key is commented in [`values.yaml`](values.yaml). Top-level groups:
 | `secrets.acl` | unset | ConfigMap/Secret key `acl.toml`. Missing ACL is deny-open and logged `INSECURE`. |
 | `secrets.peerTls` | unset | `ca.crt` plus `<pod>.crt` / `<pod>.key` per ordinal. One shared cert cannot work. |
 | `secrets.gossipKey` | unset | Secret key `swim-key`. Together with `peerTls` arms signed gossip. |
+| `admin` | disabled | The authenticated admin API on port 9443 of every pod ([below](#admin-api)). Needs `secrets.peerTls`. |
 | `extraEnv` | `[]` | Extra `MQTTD_*` (or any) env on the broker container. |
 | `clusterEstablished` | `false` | `false` on first install so pod-0 may found. Set `true` after the cluster is healthy so a lost pod-0 volume cannot re-bootstrap. |
 | `persistence` | enabled, `10Gi` | Per-pod PVC for `/var/lib/mqttd`. |
@@ -53,6 +54,45 @@ Every key is commented in [`values.yaml`](values.yaml). Top-level groups:
 
 Full commented defaults: [`values.yaml`](values.yaml). Broker knobs inside
 `config:` match [`docs/CONFIGURATION.md`](../../../docs/CONFIGURATION.md).
+
+## Admin API
+
+`admin.enabled=true` turns on the admin API ([`docs/ADMIN-API.md`](../../../docs/ADMIN-API.md),
+CLI: [`docs/ADMIN-CLI.md`](../../../docs/ADMIN-CLI.md)) on every pod. Each pod serves it on
+port 9443 with **its own cluster-bus certificate**, so `secrets.peerTls` is required: that
+certificate already names the pod and chains to the cluster CA, which is what lets any pod
+answer the cluster view and forward kick/purge to the pod holding a client. The port is on
+the headless Service only, never on the client Service.
+
+```yaml
+admin:
+  enabled: true
+  viewers: ["CN=oncall"]
+  operators: ["CN=sre-lead, O=example"]
+  clientCa:
+    secretName: mqttd-admin-ca   # key ca.crt: the CA that issues admin CLIENT certificates
+```
+
+Use a **dedicated** client CA. With the cluster CA, every unlisted node certificate is
+admitted as the read-only `peer` role instead of refused.
+
+Put the subject lists in a values file. `helm --set` splits on commas, so
+`--set admin.operators[0]=CN=sre-lead, O=example` breaks the subject in two; escape the
+comma (`\,`) if you must use `--set`.
+
+Reach it from your workstation with a port-forward. `--server-name` is the pod's DNS name,
+because that is what its certificate names, and `--ca` is the **cluster** CA, which issued it
+(`bootstrap.sh` keeps it as `ca/cluster-ca.pem` under its PKI directory):
+
+```sh
+kubectl -n mqttd port-forward pod/mqttd-0 19443:9443 &
+mqttd --admin --url https://127.0.0.1:19443 \
+  --server-name mqttd-0.mqttd-headless.mqttd.svc.cluster.local \
+  --ca cluster-ca.pem --cert me.pem --key me.key cluster
+```
+
+The scripted check is in `scripts/k8s/kind-smoke.sh`: it mints a client CA, enables the API
+and expects `whoami` to return `operator` and the cluster view to show 3 of 3 replied.
 
 ## Shipped alerting
 
