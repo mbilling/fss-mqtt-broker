@@ -3537,8 +3537,6 @@ async fn the_replication_factor_changes_live_both_ways_without_losing_an_acked_m
     }
 }
 
-/// Bring-up gate shared by the resize/restart tests: full membership + full
-/// voters across every given node.
 /// Broker tracing for a stress test. `MQTTD_STRESS_LOG=1` wires `RUST_LOG` through as a
 /// debug aid. Without it only the lease-Raft contradiction report (#754) prints, so a
 /// CI failure that hits it carries the evidence instead of a bare openraft panic.
@@ -3554,6 +3552,8 @@ fn stress_tracing() {
         .try_init();
 }
 
+/// Bring-up gate shared by the resize/restart tests: full membership + full
+/// voters across every given node.
 async fn wait_cluster_ready(nodes: &[&StressNode]) {
     let expected = nodes.len();
     // ADR 0080: every node follows the factor the harness founded, so a run with
