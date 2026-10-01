@@ -1621,6 +1621,21 @@ pub enum HubCommand {
         /// Replied to with `()` when the loop reaches this command.
         reply: oneshot::Sender<()>,
     },
+    /// A barrier on the DATA lane (ADR 0082 T2): replied to with `()` once every
+    /// command sent before it, in either lane, has been dispatched. Data is FIFO and
+    /// control always drains first, so reaching this means nothing older is left.
+    /// [`HubCommand::Ping`] is a control command and answers as soon as the control
+    /// lane is clear, which is what /livez wants and a "flush" does not.
+    Flush {
+        /// Replied to with `()` when the loop reaches this command.
+        reply: oneshot::Sender<()>,
+    },
+    /// Test-only: dispatch the inner command from the DATA lane (ADR 0082 T2). Tests
+    /// inject acks and verdicts that, in production, can only exist after the work
+    /// they answer was dispatched; on the control lane such a synthetic reply would
+    /// overtake that work. Wrapping it keeps the test's causal order.
+    #[cfg(test)]
+    Ordered(Box<HubCommand>),
     /// An admin API query or action (ADR 0081), answered from the loop.
     Admin(admin::AdminRequest),
 }
@@ -1631,6 +1646,74 @@ impl HubCommand {
     /// ADR 0020 §3). `AppendDone` counts as `publish` — it is the publish path's
     /// completion half, and any store await smuggled back into it must show up in
     /// the same series operators alert on.
+    /// Which hub lane this command waits in (ADR 0082 T2). The match is exhaustive
+    /// on purpose: a new variant does not compile until someone decides its lane.
+    ///
+    /// Control overtakes everything already queued as data, so a command is control
+    /// only if **nothing queued before it can change what it does**:
+    /// - completions and acks, which follow the work they complete (lane and store
+    ///   completions, client PUBACK/PUBREC/PUBCOMP, a peer's ack or verdict for a
+    ///   forward, a retained commit's ack and completion);
+    /// - the durable plane (raft and replication frames run their own state machine,
+    ///   and are what timed out at 1.5 s behind 2.5M publishes on the #504 cloud run);
+    /// - the /livez ping and admin.
+    ///
+    /// Everything else stays on the data lane, in arrival order, because its effect
+    /// depends on what was queued before it: publishes of every kind, a client's
+    /// attach, recovery, subscriptions and detach (a DISCONNECT must not overtake that
+    /// client's `PUBLISH`es), admission policy changes (a publish is decided under the
+    /// policy in force when it arrived, #238), retained reads and writes, peer link
+    /// lifecycle and interest gossip (link-up offers the retained digest and drains the
+    /// handoff queue built by earlier publishes), and the inherited-session scan.
+    pub(crate) fn lane(&self) -> Lane {
+        match self {
+            Self::AppendDone { .. }
+            | Self::Qos2OpDone { .. }
+            | Self::PkidBlockReserved { .. }
+            | Self::PubAck { .. }
+            | Self::PubRec { .. }
+            | Self::PubComp { .. }
+            | Self::RemotePublishAck { .. }
+            | Self::RemotePublishVerdict { .. }
+            | Self::RemoteRetainedCommitAck { .. }
+            | Self::RetainedCommitDone { .. }
+            | Self::DurableFrame { .. }
+            | Self::Ping { .. }
+            | Self::Admin(_) => Lane::Control,
+            Self::Publish { .. }
+            | Self::RemotePublish { .. }
+            | Self::RemotePublishAcked { .. }
+            | Self::RemoteSharedDeliver { .. }
+            | Self::RemoteSharedDeliverAcked { .. }
+            | Self::Attach { .. }
+            | Self::SessionRecovered { .. }
+            | Self::Detach { .. }
+            | Self::Evict { .. }
+            | Self::Subscribe { .. }
+            | Self::Unsubscribe { .. }
+            | Self::SetQuotas(_)
+            | Self::SetBrownout { .. }
+            | Self::SweepIdentities(_)
+            | Self::AttachAuthorizer(_)
+            | Self::RemoteRetainedUpdate { .. }
+            | Self::RemoteRetainedSnapshot { .. }
+            | Self::RemoteRetainedDigest { .. }
+            | Self::RemoteRetainedRequest { .. }
+            | Self::RemoteRetainedCommit { .. }
+            | Self::RestoreRetained { .. }
+            | Self::RetainedExportSnapshot { .. }
+            | Self::PeerConnected { .. }
+            | Self::PeerDisconnected { .. }
+            | Self::PeerDead { .. }
+            | Self::RemoteInterest { .. }
+            | Self::RemoteSharedInterest { .. }
+            | Self::InheritedSessions { .. }
+            | Self::Flush { .. } => Lane::Data,
+            #[cfg(test)]
+            Self::Ordered(_) => Lane::Data,
+        }
+    }
+
     fn class(&self) -> &'static str {
         match self {
             Self::Attach { .. } | Self::SessionRecovered { .. } => "attach",
@@ -1648,11 +1731,36 @@ impl HubCommand {
             | Self::Evict { .. }
             | Self::SweepIdentities(_)
             | Self::AttachAuthorizer(_)
-            | Self::Ping { .. } => "control",
+            | Self::Ping { .. }
+            | Self::Flush { .. } => "control",
+            #[cfg(test)]
+            Self::Ordered(inner) => inner.class(),
             _ => "cluster",
         }
     }
 }
+
+/// The two lanes a [`HubCommand`] waits in inside the hub (ADR 0082 T2): control is
+/// always dispatched before data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Lane {
+    /// Bounded-volume, protocol-critical: acks, completions, durable plane, membership,
+    /// the /livez ping, admin.
+    Control,
+    /// Publishes and the per-client lifecycle ordered with them.
+    Data,
+}
+
+/// Commands moved off the channel into the lanes before each dispatch (ADR 0082 T2).
+/// Sorting is a pop and a push, so the hub sorts this many arrivals per command it
+/// retires: a control command buried D deep in the channel is reached after about
+/// D / 1024 data dispatches (2.5M deep, the #504 cloud run's backlog, is ~2.4k
+/// dispatches, ~10 ms), and one already sorted is next.
+const HUB_INGEST_BATCH: usize = 1024;
+
+/// Dispatches between cooperative yields while the hub is busy (ADR 0082 T2): the loop
+/// no longer awaits the channel per command, so it yields itself.
+const HUB_YIELD_EVERY: usize = 64;
 
 /// A live session seen hosted on a node that does not own its placement group
 /// (issue #284) — the grace counter and last-close time behind rehome-on-settle.
@@ -1849,6 +1957,10 @@ fn min_qos(a: QoS, b: QoS) -> QoS {
 #[derive(Debug)]
 pub struct Hub {
     rx: mpsc::UnboundedReceiver<HubCommand>,
+    /// Sorted, undispatched control commands (ADR 0082 T2): drained before any data.
+    control_q: std::collections::VecDeque<HubCommand>,
+    /// Sorted, undispatched data commands (ADR 0082 T2), in arrival order.
+    data_q: std::collections::VecDeque<HubCommand>,
     /// This node's identity.
     node_id: NodeId,
     /// Currently-connected clients.
@@ -2383,6 +2495,8 @@ impl Hub {
         (
             Self {
                 rx,
+                control_q: std::collections::VecDeque::new(),
+                data_q: std::collections::VecDeque::new(),
                 self_tx: tx.clone(),
                 connecting: HashMap::new(),
                 append_lanes: HashMap::new(),
@@ -2675,51 +2789,108 @@ impl Hub {
         // sweep tick later: on a fresh or restarted node it completes in
         // milliseconds and releases any publish acks gated on it (ADR 0042 T9).
         self.spawn_inherited_session_scan();
+        let mut since_yield = 0usize;
         loop {
+            // ADR 0082 T2: sort what has arrived into the two lanes, then take the next
+            // command, control before data. A raft frame, an ack or the /livez ping no
+            // longer waits behind the whole backlog (2.5M commands, ~10 s, on the #504
+            // cloud run).
+            let closed = self.ingest();
+            if let Some(cmd) = self.next_command() {
+                self.dispatch_timed(cmd).await;
+                since_yield += 1;
+                if since_yield >= HUB_YIELD_EVERY {
+                    since_yield = 0;
+                    // Busy: the sweep still runs on schedule (Interval::tick is cancel
+                    // safe), and the hub yields so it never monopolizes a worker.
+                    if futures_util::FutureExt::now_or_never(sweep.tick()).is_some() {
+                        self.run_sweep().await;
+                    }
+                    tokio::task::yield_now().await;
+                }
+                continue;
+            }
+            if closed {
+                break;
+            }
             tokio::select! {
                 cmd = self.rx.recv() => match cmd {
-                    Some(cmd) => {
-                        // Time-on-loop per dispatch (issue #242): the regression
-                        // tripwire for any await smuggled back onto the single-
-                        // threaded loop. Coarse command class, never per-variant.
-                        let class = cmd.class();
-                        let started = Instant::now();
-                        self.dispatch(cmd).await;
-                        if let Some(m) = &self.metrics {
-                            m.observe_hub_dispatch(class, started.elapsed().as_secs_f64());
-                        }
-                    }
+                    Some(cmd) => self.enqueue(cmd),
                     None => break,
                 },
-                _ = sweep.tick() => {
-                    let started = Instant::now();
-                    self.sweep_expired_sessions().await;
-                    self.submit_pending_qos2_cleanup();
-                    self.refresh_gauges().await;
-                    self.refresh_ownership_domain();
-                    self.refresh_replication_capable();
-                    // Retransmit an unanswered retained handoff (T8 — same seq, the
-                    // owner dedups), then retry queued retained mutations (ADR 0037
-                    // §5): covers heals with no link event — a lease landing locally,
-                    // or quorum returning on links that never dropped. No-ops when idle.
-                    self.retry_retained_handoff();
-                    self.kick_retained_queue();
-                    // Retransmit / re-route acked publish forwards (ADR 0042 T9,
-                    // exhibit ⑤); no-op when none are pending.
-                    self.sweep_pending_forwards();
-                    // Reap idle append lanes (issue #242): dropping the sender ends
-                    // the worker; a later submission re-spawns one. Only with zero
-                    // outstanding jobs, so no completion is ever orphaned.
-                    self.append_lanes.retain(|_, lane| lane.outstanding > 0);
-                    // Reap the reaped lanes' finished workers too: a JoinSet holds a
-                    // completed task's slot until polled, so without this the set grows
-                    // by one per lane ever spawned.
-                    while self.owned_tasks.try_join_next().is_some() {}
-                    if let Some(m) = &self.metrics {
-                        m.observe_hub_dispatch("sweep", started.elapsed().as_secs_f64());
-                    }
-                }
+                _ = sweep.tick() => self.run_sweep().await,
             }
+        }
+    }
+
+    /// The next command to dispatch: the oldest control command, else the oldest data
+    /// command (ADR 0082 T2). Within a lane, arrival order is kept.
+    fn next_command(&mut self) -> Option<HubCommand> {
+        self.control_q
+            .pop_front()
+            .or_else(|| self.data_q.pop_front())
+    }
+
+    /// Move up to [`HUB_INGEST_BATCH`] commands from the channel into their lanes.
+    /// Returns `true` when the channel is closed (every sender gone).
+    fn ingest(&mut self) -> bool {
+        for _ in 0..HUB_INGEST_BATCH {
+            match self.rx.try_recv() {
+                Ok(cmd) => self.enqueue(cmd),
+                Err(mpsc::error::TryRecvError::Empty) => return false,
+                Err(mpsc::error::TryRecvError::Disconnected) => return true,
+            }
+        }
+        false
+    }
+
+    /// Put one command in its lane (ADR 0082 T2).
+    fn enqueue(&mut self, cmd: HubCommand) {
+        match cmd.lane() {
+            Lane::Control => self.control_q.push_back(cmd),
+            Lane::Data => self.data_q.push_back(cmd),
+        }
+    }
+
+    /// Dispatch one command and record its time on the loop (issue #242): the
+    /// regression tripwire for any await smuggled back onto the single-threaded loop.
+    /// Coarse command class, never per-variant.
+    async fn dispatch_timed(&mut self, cmd: HubCommand) {
+        let class = cmd.class();
+        let started = Instant::now();
+        self.dispatch(cmd).await;
+        if let Some(m) = &self.metrics {
+            m.observe_hub_dispatch(class, started.elapsed().as_secs_f64());
+        }
+    }
+
+    /// The once-a-second sweep: expiry, cleanup, gauges, retransmits, lane reaping.
+    async fn run_sweep(&mut self) {
+        let started = Instant::now();
+        self.sweep_expired_sessions().await;
+        self.submit_pending_qos2_cleanup();
+        self.refresh_gauges().await;
+        self.refresh_ownership_domain();
+        self.refresh_replication_capable();
+        // Retransmit an unanswered retained handoff (T8 — same seq, the
+        // owner dedups), then retry queued retained mutations (ADR 0037
+        // §5): covers heals with no link event — a lease landing locally,
+        // or quorum returning on links that never dropped. No-ops when idle.
+        self.retry_retained_handoff();
+        self.kick_retained_queue();
+        // Retransmit / re-route acked publish forwards (ADR 0042 T9,
+        // exhibit ⑤); no-op when none are pending.
+        self.sweep_pending_forwards();
+        // Reap idle append lanes (issue #242): dropping the sender ends
+        // the worker; a later submission re-spawns one. Only with zero
+        // outstanding jobs, so no completion is ever orphaned.
+        self.append_lanes.retain(|_, lane| lane.outstanding > 0);
+        // Reap the reaped lanes' finished workers too: a JoinSet holds a
+        // completed task's slot until polled, so without this the set grows
+        // by one per lane ever spawned.
+        while self.owned_tasks.try_join_next().is_some() {}
+        if let Some(m) = &self.metrics {
+            m.observe_hub_dispatch("sweep", started.elapsed().as_secs_f64());
         }
     }
 
@@ -3164,6 +3335,13 @@ impl Hub {
             }
             HubCommand::InheritedSessions { sessions, complete } => {
                 self.inherit_sessions(sessions, complete);
+            }
+            HubCommand::Flush { reply } => {
+                let _ = reply.send(());
+            }
+            #[cfg(test)]
+            HubCommand::Ordered(inner) => {
+                Box::pin(self.dispatch(*inner)).await;
             }
             HubCommand::Ping { reply } => {
                 // Reached the loop → it is live. The receiver may be gone if the
@@ -6389,7 +6567,11 @@ impl Hub {
         m.set_pending_publishes_awaiting_settle(awaiting_settle);
         // Issue #613 item 3.5: the hub is ONE task, so the depth of its inbound
         // queue is its saturation, full stop.
-        m.set_hub_queue_depth(self.rx.len());
+        m.set_hub_queue_depth(self.rx.len() + self.control_q.len() + self.data_q.len());
+        // ADR 0082 T2: the sorted lanes. Commands still on the channel are unsorted
+        // and counted in the total only.
+        m.set_hub_lane_depth("control", self.control_q.len());
+        m.set_hub_lane_depth("data", self.data_q.len());
     }
 
     /// Persist the current subscription set for a client if its session is durable.
@@ -7738,11 +7920,130 @@ mod tests {
         }
     }
 
-    /// Flush the hub command queue: a reply-bearing Ping cannot be answered until
-    /// everything queued ahead of it has been handled.
+    /// ADR 0082 T2: a control command queued behind a deep data backlog is reached
+    /// after a bounded number of data dispatches, not after the whole backlog. With one
+    /// FIFO channel the ping below would come out 100,001st; that is the #504 cloud
+    /// run's failure, where raft votes waited behind 2.5M publishes (~10 s) and timed
+    /// out at 1.5 s. Drives the loop's own `ingest` and `next_command`, so it is
+    /// deterministic and needs no clock.
+    #[tokio::test]
+    async fn a_control_command_is_reached_ahead_of_a_deep_data_backlog() {
+        const BACKLOG: usize = 100_000;
+        let (mut hub, tx) = Hub::with_config(
+            NodeId("hub-test".into()),
+            std::sync::Arc::new(MemorySessionStore::new()),
+        );
+        for _ in 0..BACKLOG {
+            publish(&tx, "flood/t", b"x");
+        }
+        let (reply, _wait) = oneshot::channel();
+        tx.send(HubCommand::Ping { reply }).unwrap();
+        publish(&tx, "flood/t", b"after");
+
+        let mut data_before = 0usize;
+        loop {
+            hub.ingest();
+            match hub
+                .next_command()
+                .expect("the ping is still queued until it is taken")
+            {
+                HubCommand::Ping { .. } => break,
+                _ => data_before += 1,
+            }
+        }
+        assert!(
+            data_before <= BACKLOG / super::HUB_INGEST_BATCH + 1,
+            "the ping waited behind {data_before} data commands of {BACKLOG}"
+        );
+        // Nothing was lost or reordered within the data lane: everything else is
+        // still there, oldest first, and the publish sent after the ping is last.
+        let mut rest = Vec::new();
+        loop {
+            hub.ingest();
+            match hub.next_command() {
+                Some(cmd) => rest.push(cmd),
+                None => break,
+            }
+        }
+        assert_eq!(data_before + rest.len(), BACKLOG + 1);
+        match rest.last() {
+            Some(HubCommand::Publish { payload, .. }) => assert_eq!(&payload[..], b"after"),
+            other => panic!("expected the last publish, got {other:?}"),
+        }
+    }
+
+    /// ADR 0082 T2: the lanes. Control is acks, completions, the durable plane, the
+    /// ping and admin; everything whose effect depends on earlier publishes (a
+    /// client's DISCONNECT, a peer's link lifecycle) stays ordered on the data lane. (A new variant
+    /// does not compile until `HubCommand::lane` places it: the match is exhaustive.)
+    #[tokio::test]
+    async fn commands_sort_into_the_control_and_data_lanes() {
+        let (reply, _) = oneshot::channel();
+        assert_eq!(HubCommand::Ping { reply }.lane(), super::Lane::Control);
+        let (reply, _) = oneshot::channel();
+        assert_eq!(HubCommand::Flush { reply }.lane(), super::Lane::Data);
+        assert_eq!(
+            HubCommand::PubAck {
+                client: ClientId("c".into()),
+                pkid: 1,
+            }
+            .lane(),
+            super::Lane::Control
+        );
+        assert_eq!(
+            HubCommand::Detach {
+                client: ClientId("c".into()),
+                conn_id: 1,
+                graceful: false,
+                session_expiry_override: None,
+            }
+            .lane(),
+            super::Lane::Data
+        );
+        assert_eq!(
+            HubCommand::PeerDead {
+                node: NodeId("n".into()),
+            }
+            .lane(),
+            super::Lane::Data
+        );
+    }
+
+    /// ADR 0082 T2, end to end: a running hub answers `Flush` only after every
+    /// publish queued before it has been dispatched (the data lane is FIFO and control
+    /// drains first), which is what every test barrier relies on now that `Ping`
+    /// overtakes data.
+    #[tokio::test]
+    async fn flush_waits_for_every_publish_sent_before_it() {
+        const N: usize = 2_000;
+        let tx = start_hub();
+        let (mut out, _) = attach(&tx, "sub", 1, true).await;
+        subscribe(&tx, "sub", "flood/#");
+        ping(&tx).await;
+        for _ in 0..N {
+            publish(&tx, "flood/t", b"x");
+        }
+        let (flush, flushed) = oneshot::channel();
+        tx.send(HubCommand::Flush { reply: flush }).unwrap();
+        timeout(Duration::from_secs(10), flushed)
+            .await
+            .expect("the hub should reach the flush")
+            .expect("the hub should still be running");
+        let mut delivered = 0usize;
+        while out.try_recv().is_ok() {
+            delivered += 1;
+        }
+        assert_eq!(
+            delivered, N,
+            "a flush answered before its earlier publishes"
+        );
+    }
+
+    /// Flush the hub command queue: a [`HubCommand::Flush`] is not answered until
+    /// everything queued ahead of it, in both lanes, has been handled (ADR 0082 T2).
     async fn ping(tx: &HubTx) {
         let (reply, wait) = oneshot::channel();
-        tx.send(HubCommand::Ping { reply }).unwrap();
+        tx.send(HubCommand::Flush { reply }).unwrap();
         timeout(Duration::from_secs(5), wait)
             .await
             .expect("the hub should answer a ping")
@@ -7958,27 +8259,33 @@ mod tests {
     }
 
     fn pub_rec(tx: &HubTx, client: &str, pkid: u16) {
-        tx.send(HubCommand::PubRec {
+        tx.send(ordered(HubCommand::PubRec {
             client: ClientId(client.into()),
             pkid,
-        })
+        }))
         .unwrap();
     }
 
     fn pub_comp(tx: &HubTx, client: &str, pkid: u16) {
-        tx.send(HubCommand::PubComp {
+        tx.send(ordered(HubCommand::PubComp {
             client: ClientId(client.into()),
             pkid,
-        })
+        }))
         .unwrap();
     }
 
     fn pub_ack(tx: &HubTx, client: &str, pkid: u16) {
-        tx.send(HubCommand::PubAck {
+        tx.send(ordered(HubCommand::PubAck {
             client: ClientId(client.into()),
             pkid,
-        })
+        }))
         .unwrap();
+    }
+
+    /// Wrap a synthetic ack or verdict so it stays behind the data it answers
+    /// (ADR 0082 T2; see [`HubCommand::Ordered`]).
+    fn ordered(cmd: HubCommand) -> HubCommand {
+        HubCommand::Ordered(Box::new(cmd))
     }
 
     fn pkid_of(packet: &Packet) -> u16 {
@@ -11428,13 +11735,13 @@ mod tests {
 
         // Refused → the publisher is TOLD.
         let done = publish_gated(&tx, "cv/t", b"a", QoS::AtLeastOnce, true);
-        tx.send(HubCommand::RemotePublishVerdict {
+        tx.send(ordered(HubCommand::RemotePublishVerdict {
             node: NodeId("n2".into()),
             seq: 1,
             verdict: ForwardVerdict::Refused {
                 code: PublishRefusal::Brownout.wire_code(),
             },
-        })
+        }))
         .unwrap();
         assert_eq!(
             done.await.unwrap(),
@@ -11444,11 +11751,11 @@ mod tests {
 
         // Failed → withheld, exactly as before.
         let done = publish_gated(&tx, "cv/t", b"b", QoS::AtLeastOnce, true);
-        tx.send(HubCommand::RemotePublishVerdict {
+        tx.send(ordered(HubCommand::RemotePublishVerdict {
             node: NodeId("n2".into()),
             seq: 2,
             verdict: ForwardVerdict::Failed,
-        })
+        }))
         .unwrap();
         assert!(
             done.await.is_err(),
@@ -11457,11 +11764,11 @@ mod tests {
 
         // A proto-6 peer's `ok: false` is the same withhold — the skew fallback.
         let done = publish_gated(&tx, "cv/t", b"c", QoS::AtLeastOnce, true);
-        tx.send(HubCommand::RemotePublishAck {
+        tx.send(ordered(HubCommand::RemotePublishAck {
             node: NodeId("n2".into()),
             seq: 3,
             ok: false,
-        })
+        }))
         .unwrap();
         assert!(done.await.is_err(), "the boolean can only mean 'withhold'");
     }
@@ -11477,11 +11784,11 @@ mod tests {
         remote_interest(&tx, "n2", &["uv/t"]);
 
         let done = publish_gated(&tx, "uv/t", b"a", QoS::AtLeastOnce, true);
-        tx.send(HubCommand::RemotePublishVerdict {
+        tx.send(ordered(HubCommand::RemotePublishVerdict {
             node: NodeId("n2".into()),
             seq: 1,
             verdict: ForwardVerdict::Refused { code: 0xFFFF },
-        })
+        }))
         .unwrap();
         match done.await {
             Err(_) => {}
@@ -11490,13 +11797,13 @@ mod tests {
 
         // Non-vacuity: a code this build DOES know resolves as a refusal.
         let done = publish_gated(&tx, "uv/t", b"b", QoS::AtLeastOnce, true);
-        tx.send(HubCommand::RemotePublishVerdict {
+        tx.send(ordered(HubCommand::RemotePublishVerdict {
             node: NodeId("n2".into()),
             seq: 2,
             verdict: ForwardVerdict::Refused {
                 code: PublishRefusal::Brownout.wire_code(),
             },
-        })
+        }))
         .unwrap();
         assert_eq!(
             done.await.unwrap(),
@@ -11531,13 +11838,13 @@ mod tests {
                 .is_ok(),
             "sanity"
         );
-        tx.send(HubCommand::RemotePublishVerdict {
+        tx.send(ordered(HubCommand::RemotePublishVerdict {
             node: NodeId("n2".into()),
             seq,
             verdict: ForwardVerdict::Refused {
                 code: PublishRefusal::Brownout.wire_code(),
             },
-        })
+        }))
         .unwrap();
         assert_eq!(
             done.await.unwrap(),
@@ -11559,13 +11866,13 @@ mod tests {
             PeerMessage::SharedDeliverAcked { seq, .. } => seq,
             other => panic!("expected SharedDeliverAcked, got {other:?}"),
         };
-        tx.send(HubCommand::RemotePublishVerdict {
+        tx.send(ordered(HubCommand::RemotePublishVerdict {
             node: NodeId("n2".into()),
             seq,
             verdict: ForwardVerdict::Refused {
                 code: PublishRefusal::Brownout.wire_code(),
             },
-        })
+        }))
         .unwrap();
         assert_eq!(
             done.await.unwrap(),
@@ -11650,13 +11957,13 @@ mod tests {
 
         let done = publish_gated(&tx, "rp/t", b"a", QoS::AtLeastOnce, true);
         // The peer then refuses its half — a refusal arriving for a publish that IS held.
-        tx.send(HubCommand::RemotePublishVerdict {
+        tx.send(ordered(HubCommand::RemotePublishVerdict {
             node: NodeId("n2".into()),
             seq: 1,
             verdict: ForwardVerdict::Refused {
                 code: PublishRefusal::Brownout.wire_code(),
             },
-        })
+        }))
         .unwrap();
         assert!(
             done.await.is_err(),
@@ -13552,11 +13859,11 @@ mod tests {
                         continue;
                     }
                     // Acknowledge the commit so the sender releases the next one.
-                    tx.send(HubCommand::RemoteRetainedCommitAck {
+                    tx.send(ordered(HubCommand::RemoteRetainedCommitAck {
                         node: NodeId("n".into()),
                         seq,
                         token: Some((1, nth as u64)),
-                    })
+                    }))
                     .unwrap();
                 }
                 Some(PeerMessage::Interest { .. } | PeerMessage::RetainedDigest { .. }) => {}
@@ -14679,7 +14986,12 @@ mod tests {
                     );
                     break;
                 }
-                Some(PeerMessage::RetainedDigest { .. }) => {}
+                // The interest snapshot follows the boot scan on its own schedule.
+                Some(
+                    PeerMessage::Interest { .. }
+                    | PeerMessage::SharedInterest { .. }
+                    | PeerMessage::RetainedDigest { .. },
+                ) => {}
                 other => panic!("unexpected peer frame {other:?}"),
             }
         }
@@ -14888,11 +15200,11 @@ mod tests {
         }
 
         // Ack releases the next mutation, with a fresh seq.
-        tx.send(HubCommand::RemoteRetainedCommitAck {
+        tx.send(ordered(HubCommand::RemoteRetainedCommitAck {
             node: NodeId("n".into()),
             seq: first_seq,
             token: Some((1, 1)),
-        })
+        }))
         .unwrap();
         loop {
             match recv_peer_data(&mut peer).await {
@@ -15090,11 +15402,11 @@ mod tests {
             }
         };
         // The peer answers NACK (its lease moved away).
-        tx.send(HubCommand::RemoteRetainedCommitAck {
+        tx.send(ordered(HubCommand::RemoteRetainedCommitAck {
             node: NodeId("n".into()),
             seq,
             token: None,
-        })
+        }))
         .unwrap();
         // Placement catches up: the peer is dead, this node owns the group now.
         placement
@@ -16714,8 +17026,12 @@ mod tests {
                 ]
             };
             for (node, seq, verdict) in answers {
-                tx.send(HubCommand::RemotePublishVerdict { node, seq, verdict })
-                    .unwrap();
+                tx.send(ordered(HubCommand::RemotePublishVerdict {
+                    node,
+                    seq,
+                    verdict,
+                }))
+                .unwrap();
             }
 
             let got = timeout(Duration::from_secs(5), publisher).await;
@@ -18896,7 +19212,7 @@ mod tests {
         // Barrier: every submission is processed (and the overflow rejected) BEFORE
         // the stalled group is released — the loop is free to do this (#242).
         let (ping_tx, ping_rx) = oneshot::channel();
-        tx.send(HubCommand::Ping { reply: ping_tx }).unwrap();
+        tx.send(HubCommand::Flush { reply: ping_tx }).unwrap();
         timeout(Duration::from_secs(1), ping_rx)
             .await
             .expect("the loop must not be parked with the appends")
@@ -19057,7 +19373,7 @@ mod tests {
         // Barrier: the job is ADMITTED and parked in the lane before the crash, so a
         // worker is genuinely holding the store when the abort lands.
         let (ping_tx, ping_rx) = oneshot::channel();
-        tx.send(HubCommand::Ping { reply: ping_tx }).unwrap();
+        tx.send(HubCommand::Flush { reply: ping_tx }).unwrap();
         timeout(Duration::from_secs(1), ping_rx)
             .await
             .unwrap()
@@ -19155,7 +19471,7 @@ mod tests {
         // Prove the loop already recorded the publish dispatch (it is NOT waiting on
         // the parked append) by round-tripping a later command...
         let (ping_tx, ping_rx) = oneshot::channel();
-        tx.send(HubCommand::Ping { reply: ping_tx }).unwrap();
+        tx.send(HubCommand::Flush { reply: ping_tx }).unwrap();
         timeout(Duration::from_millis(500), ping_rx)
             .await
             .expect("the loop must not be parked with the append")
@@ -19334,7 +19650,7 @@ mod tests {
         // parked, and an inline spill would wedge every client on the node.
         detach(&tx, "s", 1);
         let (ping_tx, ping_rx) = oneshot::channel();
-        tx.send(HubCommand::Ping { reply: ping_tx }).unwrap();
+        tx.send(HubCommand::Flush { reply: ping_tx }).unwrap();
         timeout(Duration::from_millis(500), ping_rx)
             .await
             .expect("the detach spill parked the hub loop (#242 finding C)")
@@ -19392,7 +19708,7 @@ mod tests {
         // Barrier: the discard is DISPATCHED (racing the still-parked append)
         // before the store is released — the exact window of the ghost race.
         let (ping_tx, ping_rx) = oneshot::channel();
-        tx.send(HubCommand::Ping { reply: ping_tx }).unwrap();
+        tx.send(HubCommand::Flush { reply: ping_tx }).unwrap();
         timeout(Duration::from_secs(1), ping_rx)
             .await
             .expect("the discard must not park the loop either (#242 finding C)")
@@ -19682,7 +19998,7 @@ mod tests {
         pub_comp(&tx, "p", 1);
         // Barrier: the PUBCOMP dispatch has run.
         let (ping_tx, ping_rx) = oneshot::channel();
-        tx.send(HubCommand::Ping { reply: ping_tx }).unwrap();
+        tx.send(HubCommand::Flush { reply: ping_tx }).unwrap();
         timeout(Duration::from_secs(1), ping_rx)
             .await
             .unwrap()

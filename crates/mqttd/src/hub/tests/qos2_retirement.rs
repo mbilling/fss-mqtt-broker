@@ -171,7 +171,7 @@ async fn restored_qos2_offsets_pin_the_prefix_until_each_handshake_completes() {
     }
     pub_comp(&tx, client.as_str(), 2);
     let (reply, done) = oneshot::channel();
-    tx.send(HubCommand::Ping { reply }).unwrap();
+    tx.send(HubCommand::Flush { reply }).unwrap();
     timeout(Duration::from_secs(5), done)
         .await
         .unwrap()

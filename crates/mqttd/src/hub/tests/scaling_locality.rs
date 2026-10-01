@@ -554,7 +554,7 @@ async fn the_peek_and_the_commit_choose_the_same_member_however_loaded_the_hub_i
         // quantity in the rejected design that moves without the hub running.
         for _ in 0..QUEUE_LOAD {
             let (reply, _drop) = oneshot::channel();
-            rig.tx.send(HubCommand::Ping { reply }).unwrap();
+            rig.tx.send(HubCommand::Flush { reply }).unwrap();
         }
         assert_eq!(
             rig.hub.rx.len(),

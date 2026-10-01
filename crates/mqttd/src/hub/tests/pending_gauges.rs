@@ -9,9 +9,9 @@
 //! proves the one thing 2.4 still contributes, the `pending-cap-replay` count.
 //! What remains here is the dashboard half, which needs a real, spawned hub.
 //!
-//! DETERMINISM. No wall clock. `HubCommand` rides one FIFO channel and
-//! `HubCommand::Ping` is answered from inside `dispatch`, so when [`ping`]
-//! resolves every earlier command has been processed; ack state is read with a
+//! DETERMINISM. No wall clock. [`ping`] sends a `HubCommand::Flush`, a data-lane
+//! barrier answered from inside `dispatch` (ADR 0082 T2), so when it resolves
+//! every earlier command has been processed; ack state is read with a
 //! non-blocking `try_recv`; the sweep tick is driven under a paused clock.
 
 use super::*;

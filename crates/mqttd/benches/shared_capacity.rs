@@ -133,7 +133,7 @@ impl Rig {
 
     async fn barrier(&self) {
         let (reply, wait) = oneshot::channel();
-        self.tx.send(HubCommand::Ping { reply }).unwrap();
+        self.tx.send(HubCommand::Flush { reply }).unwrap();
         tokio::time::timeout(Duration::from_secs(10), wait)
             .await
             .unwrap()
