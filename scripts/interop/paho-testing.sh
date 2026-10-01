@@ -124,23 +124,82 @@ MQTTD_DATA_DIR="$WORK/data" \
 RUST_LOG=off "$MQTTD_BIN" > "$WORK/broker.log" 2>&1 &
 BROKER_PID=$!
 
-for _ in $(seq 1 60); do
-  if python3 -c "
-import socket,sys
+# Ready means READY, not "the port accepts" (#487). The suite's setUpClass connects and
+# waits for a CONNACK with a short socket timeout. A broker whose listener is bound but
+# whose lease group is still forming accepts the TCP connection and answers late, and the
+# suite then dies in setup with `0 tests run`, which reads like a pin change. So wait for
+# /readyz to say ready AND for a real MQTT 5 CONNECT to get its CONNACK. If neither comes
+# within the budget, fail here with the broker's log, rather than falling through to a
+# suite run that can only time out.
+probe() { # probe <timeout s> — exit 0 when a CONNECT is answered by a CONNACK in time
+  python3 - "$MQTT" "$1" <<'PY'
+import socket, sys
+port, timeout = int(sys.argv[1]), float(sys.argv[2])
+# MQTT 5 CONNECT: clean start, keep alive 60, no properties, client id "paho-ready".
+cid = b"paho-ready"
+var = b"\x00\x04MQTT\x05\x02\x00\x3c\x00"
+payload = len(cid).to_bytes(2, "big") + cid
+pkt = bytes([0x10, len(var) + len(payload)]) + var + payload
 try:
-    socket.create_connection(('127.0.0.1', $MQTT), 0.5).close()
+    s = socket.create_connection(("127.0.0.1", port), timeout)
+    s.settimeout(timeout)
+    s.sendall(pkt)
+    head = s.recv(1)
+    s.sendall(b"\xe0\x00")  # DISCONNECT
+    s.close()
 except OSError:
     sys.exit(1)
-" 2>/dev/null; then break; fi
+sys.exit(0 if head == b"\x20" else 1)
+PY
+}
+readyz() {
+  python3 -c "
+import json, sys, urllib.request
+try:
+    body = urllib.request.urlopen('http://127.0.0.1:$HEALTH/readyz', timeout=1).read()
+    sys.exit(0 if json.loads(body).get('ready') is True else 1)
+except Exception:
+    sys.exit(1)
+" 2>/dev/null
+}
+READY=""
+for _ in $(seq 1 120); do
+  if readyz && probe 2; then READY=1; break; fi
   sleep 0.5
 done
-echo "listener: 127.0.0.1:$MQTT"
+if [[ -z "$READY" ]]; then
+  echo "FAIL: the broker was not ready within 60 s (/readyz ready and a CONNACK to a probe CONNECT)."
+  echo "      Nothing was run against it; this is a startup problem, not a conformance verdict."
+  echo "--- broker log ---"; tail -50 "$WORK/broker.log"
+  exit 1
+fi
+echo "listener: 127.0.0.1:$MQTT (ready: /readyz and a CONNECT answered)"
 
 # --- run --------------------------------------------------------------------
 # unittest writes its per-test verdicts to stderr; keep both streams.
-set +e
-(cd "$CACHE/interoperability" && python3 client_test5.py -p "$MQTT") > "$WORK/out.txt" 2>&1
-set -e
+run_suite() {
+  set +e
+  (cd "$CACHE/interoperability" && python3 client_test5.py -p "$MQTT") > "$WORK/out.txt" 2>&1
+  set -e
+}
+run_suite
+# A run that did not COMPLETE (no "Ran N tests" line, e.g. setUpClass timed out waiting for
+# a CONNACK, as in #487) gets a diagnosis and, only if the broker is demonstrably healthy,
+# ONE re-run. A dead or unresponsive broker is never re-run into a pass: it fails below
+# with the evidence.
+if ! grep -qE '^Ran [0-9]+ tests?' "$WORK/out.txt"; then
+  alive=no; kill -0 "$BROKER_PID" 2>/dev/null && alive=yes
+  t0=$(python3 -c 'import time; print(time.monotonic())')
+  if probe 5; then answer=yes; else answer=no; fi
+  ms=$(python3 -c "import time; print(int((time.monotonic() - $t0) * 1000))")
+  echo "suite did not complete; broker alive=$alive, probe CONNECT answered=$answer in ${ms} ms"
+  sed -n '/^ERROR: setUpClass/,/^---/p' "$WORK/out.txt" | head -20
+  if [[ $alive == yes && $answer == yes ]] && readyz; then
+    echo "the broker is healthy now: re-running the suite ONCE (a second incomplete run fails)"
+    cp "$WORK/out.txt" "$WORK/out.first.txt"
+    run_suite
+  fi
+fi
 
 python3 - "$WORK/out.txt" "$CACHE/interoperability" "$MQTT" <<'PY'
 import re, subprocess, sys
