@@ -88,7 +88,7 @@
 | [0078](../adr/0078-replica-segment-log.md) | # 0078. The replica store becomes an append-only segment log — the disk is the limit, not the B-tree | Accepted | [3/4 done](0078-replica-segment-log.md) | 1 open |
 | [0079](../adr/0079-global-allocator.md) | # 0079. mqttd links mimalloc as its global allocator | Accepted | [1/2 done](0079-global-allocator.md) | 1 open |
 | [0080](../adr/0080-replication-factor.md) | # 0080. The replication factor is cluster state: configurable, default 2, changeable live | Accepted | [6/6 done](0080-replication-factor.md) | — |
-| [0081](../adr/0081-admin-api.md) | # 0081. An authenticated admin API: reads cluster-wide, actions audited, config stays in the file | Accepted | [15/19 done](0081-admin-api.md) | 2 open, 2 deferred |
+| [0081](../adr/0081-admin-api.md) | # 0081. An authenticated admin API: reads cluster-wide, actions audited, config stays in the file | Accepted | [16/19 done](0081-admin-api.md) | 1 open, 2 deferred |
 
 ## Open and deferred work
 
@@ -214,7 +214,6 @@
 
 **0081 — # 0081. An authenticated admin API: reads cluster-wide, actions audited, config stays in the file**
 
-- `0081-T18` ⬜ planned ([#773](https://github.com/mbilling/fss-mqtt-broker/issues/773)): "Hot reload of the admin listener's certificate, key and CA"
-- `0081-T19` 🚧 in-progress ([#774](https://github.com/mbilling/fss-mqtt-broker/issues/774)): "CLI output polish: compact cluster table, wrapped help"
+- `0081-T18` 🚧 in-progress ([#773](https://github.com/mbilling/fss-mqtt-broker/issues/773)): "Hot reload of the admin listener's certificate, key and CA"
 - `0081-T13` 💤 deferred: "OIDC bearer tokens as a second admin authenticator on the same roles" — "After T1–T9 are in use."
 - `0081-T14` 💤 deferred: "Bulk retained-message deletion by prefix" — "Needs a demonstrated need and a dry-run design (ADR §5)."

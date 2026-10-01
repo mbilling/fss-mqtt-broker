@@ -96,6 +96,11 @@ pub type ClientCrlBuildResult = Result<RevocationList, String>;
 /// string that aborts the swap.
 pub type PeerTlsBuildResult = Result<(TlsAcceptor, tokio_rustls::TlsConnector), String>;
 
+/// What an admin-TLS build returns (ADR 0081 T18): the rebuilt material, as a commit that
+/// swaps it in once every other build of the same reload has succeeded, or why it could
+/// not be built.
+pub type AdminTlsBuildResult = Result<Box<dyn FnOnce() + Send>, String>;
+
 /// What a gossip-signer `build` closure returns (issue #269): a freshly-built signer over
 /// the re-read peer-bus leaf certificate + key, or an error string that aborts the swap.
 /// Swapped into the live [`SignerSlot`](mqtt_cluster::swim_auth::SignerSlot) the SWIM
@@ -225,6 +230,9 @@ pub struct Reloader {
         watch::Sender<tokio_rustls::TlsConnector>,
     )>,
     peer_tls_build: Option<Box<dyn Fn() -> PeerTlsBuildResult + Send + Sync>>,
+    /// Set by [`attach_admin_tls`](Self::attach_admin_tls): rebuilds the admin listener's
+    /// TLS material from the live config (ADR 0081 T18).
+    admin_tls_build: Option<Box<dyn Fn() -> AdminTlsBuildResult + Send + Sync>>,
     /// Set by [`attach_gossip_signer`](Self::attach_gossip_signer) (issue #269): the SWIM
     /// driver's live signing identity, rebuilt from the re-read peer-bus leaf + key and
     /// swapped in the same atomic reload — a rotated leaf is embedded in the next
@@ -283,6 +291,7 @@ impl Reloader {
                 client_crl_build: None,
                 peer_tls: None,
                 peer_tls_build: None,
+                admin_tls_build: None,
                 gossip_signer: None,
                 gossip_signer_build: None,
                 config_source: None,
@@ -363,6 +372,19 @@ impl Reloader {
     ) {
         self.peer_tls = Some((acceptor_tx, connector_tx));
         self.peer_tls_build = Some(build);
+    }
+
+    /// Register the admin listener's TLS material for reload (ADR 0081 T18): `build`
+    /// re-reads `admin.cert` / `admin.key` / `admin.client_ca` (and the cluster CA and
+    /// node certificate the admin plane also uses) from the live config, which a config
+    /// reload has already swapped, and returns a commit. Folded into the same atomic
+    /// validate-before-swap reload: a bad certificate rejects the whole reload and the
+    /// running admin TLS stays in force.
+    pub fn attach_admin_tls(
+        &mut self,
+        build: impl Fn() -> AdminTlsBuildResult + Send + Sync + 'static,
+    ) {
+        self.admin_tls_build = Some(Box::new(build));
     }
 
     /// Register the SWIM gossip signing identity for reload (issue #269, the second half
@@ -471,6 +493,7 @@ impl Reloader {
         let client_crl = self.client_crl_build.as_ref().map(|b| b());
         let peer_tls = self.peer_tls_build.as_ref().map(|b| b());
         let gossip_signer = self.gossip_signer_build.as_ref().map(|b| b());
+        let admin_tls = self.admin_tls_build.as_ref().map(|b| b());
         // A configured TLS or CRL build failed: reject the whole reload, swap nothing.
         if let Some(Err(e)) = &tls {
             rollback();
@@ -491,6 +514,10 @@ impl Reloader {
         if let Some(Err(e)) = &gossip_signer {
             rollback();
             return self.reject(trigger, &format!("gossip signer: {e}"));
+        }
+        if let Some(Err(e)) = &admin_tls {
+            rollback();
+            return self.reject(trigger, &format!("admin tls: {e}"));
         }
         match policy {
             // The ACL/authenticator build failed: reject, swap nothing.
@@ -521,6 +548,10 @@ impl Reloader {
                 // per datagram, so the rotated leaf is embedded on the next send.
                 if let (Some(slot), Some(Ok(signer))) = (&self.gossip_signer, gossip_signer) {
                     slot.swap(signer);
+                }
+                // The admin listener (ADR 0081 T18): the next admin handshake serves it.
+                if let Some(Ok(commit)) = admin_tls {
+                    commit();
                 }
                 // Revocation reaches live state (ADR 0040 T2/T3/T4): the hub
                 // re-evaluates every online session, subscription grant, and peer

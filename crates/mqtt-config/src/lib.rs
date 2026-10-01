@@ -592,12 +592,13 @@ pub struct Admin {
     /// Admin API listener (`MQTTD_ADMIN_BIND`), e.g. `0.0.0.0:9443`. Unset = no admin API.
     /// Needs [`Admin::cert`], [`Admin::key`] and [`Admin::client_ca`].
     pub bind: Option<String>,
-    /// Admin listener server certificate chain PEM (`MQTTD_ADMIN_CERT`).
+    /// Admin listener server certificate chain PEM (`MQTTD_ADMIN_CERT`). Hot-reloadable:
+    /// a reload serves the renewed certificate on the next admin connection.
     pub cert: Option<String>,
-    /// Admin listener private key PEM (`MQTTD_ADMIN_KEY`).
+    /// Admin listener private key PEM (`MQTTD_ADMIN_KEY`). Hot-reloadable.
     pub key: Option<String>,
     /// CA bundle PEM that issues admin client certificates (`MQTTD_ADMIN_CLIENT_CA`).
-    /// Every admin request presents a certificate it issued.
+    /// Every admin request presents a certificate it issued. Hot-reloadable.
     pub client_ca: Option<String>,
     /// Certificate subjects granted the read-only `viewer` role (`MQTTD_ADMIN_VIEWERS`,
     /// `;`-separated). An entry is either the full subject (`CN=ops,O=example`) or

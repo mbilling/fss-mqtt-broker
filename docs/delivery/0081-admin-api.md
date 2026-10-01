@@ -95,12 +95,14 @@ tasks:
     evidence: "PR #787. scope=cluster on clients/session/subscribers (CLI --all-nodes) fans out over the peer role with forwarded_for and merges: cross-cluster paging by client id, session found_on, nodes[] with replied; two-broker integration test; live e2e 72/72."
   - id: 0081-T18
     title: "Hot reload of the admin listener's certificate, key and CA"
-    status: planned
+    status: in-progress
     issue: 773
   - id: 0081-T19
     title: "CLI output polish: compact cluster table, wrapped help"
-    status: in-progress
+    status: done
     issue: 774
+    date: 2026-10-01
+    evidence: "PR #794. cluster prints a summary, agreement line and a 100-column row per node (state, lease, members, lag, version, short cluster id, ms, notes); tables lead with identifying columns; help wraps to 100 columns; golden test plus live e2e check."
   - id: 0081-T13
     title: "OIDC bearer tokens as a second admin authenticator on the same roles"
     status: deferred
@@ -134,8 +136,8 @@ frontmatter above · this file is the plan, progress log, and changelog.
 | 0081-T15 | ✅ done | [#770](https://github.com/mbilling/fss-mqtt-broker/issues/770) | 2026-10-01 | "PR #779. Chart admin.* values and CR spec.admin serve the admin API on 9443 of every pod with its own cluster-bus leaf (headless Service only); render parity admin-on pass; kind smoke checks whoami=operator, anonymous refused, cluster view 3/3. NetworkPolicy split to #778." |
 | 0081-T16 | ✅ done | [#771](https://github.com/mbilling/fss-mqtt-broker/issues/771) | 2026-10-01 | "PR #782. scripts/admin-e2e.sh scenarios: 16 scripted incidents, each on a fresh compose cluster and asserted through the admin API (123 checks; 2 consecutive local runs 16/16), nightly job admin-scenarios. Surfaced #783 and #784." |
 | 0081-T17 | ✅ done | [#772](https://github.com/mbilling/fss-mqtt-broker/issues/772) | 2026-10-01 | "PR #787. scope=cluster on clients/session/subscribers (CLI --all-nodes) fans out over the peer role with forwarded_for and merges: cross-cluster paging by client id, session found_on, nodes[] with replied; two-broker integration test; live e2e 72/72." |
-| 0081-T18 | ⬜ planned | [#773](https://github.com/mbilling/fss-mqtt-broker/issues/773) | — |  |
-| 0081-T19 | 🚧 in-progress | [#774](https://github.com/mbilling/fss-mqtt-broker/issues/774) | — |  |
+| 0081-T18 | 🚧 in-progress | [#773](https://github.com/mbilling/fss-mqtt-broker/issues/773) | — |  |
+| 0081-T19 | ✅ done | [#774](https://github.com/mbilling/fss-mqtt-broker/issues/774) | 2026-10-01 | "PR #794. cluster prints a summary, agreement line and a 100-column row per node (state, lease, members, lag, version, short cluster id, ms, notes); tables lead with identifying columns; help wraps to 100 columns; golden test plus live e2e check." |
 | 0081-T13 | 💤 deferred | — | — | "After T1–T9 are in use." |
 | 0081-T14 | 💤 deferred | — | — | "Needs a demonstrated need and a dry-run design (ADR §5)." |
 <!-- /status-table:0081 -->
@@ -178,3 +180,4 @@ the reads it depends on.
 - 2026-10-01: T15 delivered (PR #779 merged): the chart and the operator enable the admin API; NetworkPolicy split out to #778.
 - 2026-10-01: T16 delivered (PR #782 merged): the admin e2e scenario suite, nightly; it surfaced #783 and #784.
 - 2026-10-01: T17 delivered (PR #787 merged): cluster-wide clients, session and subscribers.
+- 2026-10-01: T19 delivered (PR #794 merged): compact cluster view, leading identity columns, wrapped help.

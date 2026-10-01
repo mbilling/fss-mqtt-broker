@@ -143,7 +143,7 @@ async fn ask(
     let target = Target {
         server_name: client::host_of(&addr),
         addr,
-        connector: peers.connector.clone(),
+        connector: peers.connector(),
         timeout: peers.timeout,
     };
     let (status, body) = client::call(&target, "GET", path, None).await?;
