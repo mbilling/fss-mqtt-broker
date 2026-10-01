@@ -1531,10 +1531,11 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tls_check::tests::nothing_configured_is_a_single_ok_line`
 - `tls_check::tests::valid_material_passes_and_reports_names`
 
-## `crates/mqttd/src/main.rs` — 19 test(s)
+## `crates/mqttd/src/main.rs` — 20 test(s)
 
 - `tests::a_non_durable_node_resolves_no_write_floor`
 - `tests::a_reload_proposes_a_changed_replication_factor`
+- `tests::a_restore_retained_write_fails_at_its_deadline_instead_of_hanging`
 - `tests::a_vanished_peer_is_retried_immediately_not_paused`
 - `tests::changing_the_identity_source_requires_a_restart`
 - `tests::cli_shape_accepts_documented_invocations`
