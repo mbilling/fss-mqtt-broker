@@ -128,6 +128,11 @@ originally over the peer bus.)
   The API reports their progress.
 - **Change the operator.** ADR 0055 stands: the operator acts through Kubernetes objects and
   reads `/statusz`.
+- **Serve a dashboard.** There is no admin web UI, now or as a later task. The API and the
+  CLI are the operator surface. A browser-facing UI would add login sessions and
+  CSRF/XSS exposure to the admin plane and a frontend to maintain, and for metrics it
+  would duplicate Grafana (ADR 0020). Anyone who wants a dashboard can build one on the
+  JSON API, whose compatibility is versioned (`/admin/v1/`). Decided 2026-10-01.
 - **Delete retained messages** in bulk. It is easy to delete far more than intended, and
   retained topics can be cleared by publishing an empty retained message. Deferred until
   there is a demonstrated need and a dry-run design.
