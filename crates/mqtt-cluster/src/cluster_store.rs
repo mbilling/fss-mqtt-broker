@@ -35,7 +35,7 @@ use crate::NodeId;
 use async_trait::async_trait;
 use mqtt_storage::repl::{DurabilityTier, LogEntry, PendingAppend, ReplError, ReplicatedLog};
 use mqtt_storage::Offset;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex, RwLock};
 
 /// Yields the current ownership-lease epoch for a group this node owns.
@@ -142,6 +142,49 @@ struct GroupEntry<T: ReplicaTransport> {
     joint_prefix: Option<usize>,
 }
 
+type RecoveryGates = Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>;
+
+/// A touch's exclusive turn at recovering one key. Dropping it releases the turn
+/// and forgets the key's gate once no other touch is waiting on it.
+struct RecoveryTurn<'a> {
+    gates: &'a RecoveryGates,
+    key: &'a str,
+    guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+impl<'a> RecoveryTurn<'a> {
+    async fn take(gates: &'a RecoveryGates, key: &'a str) -> Self {
+        let gate = gates
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(key.to_string())
+            .or_default()
+            .clone();
+        Self {
+            gates,
+            key,
+            guard: Some(gate.lock_owned().await),
+        }
+    }
+}
+
+impl Drop for RecoveryTurn<'_> {
+    fn drop(&mut self) {
+        let mut gates = self
+            .gates
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        drop(self.guard.take());
+        // Every waiter holds a clone, so a lone reference is the map's own.
+        if gates
+            .get(self.key)
+            .is_some_and(|g| Arc::strong_count(g) == 1)
+        {
+            gates.remove(self.key);
+        }
+    }
+}
+
 /// A [`ReplicatedLog`] that routes each key to its placement group's
 /// [`ClusterLog`], building (and caching) that log lazily on first touch,
 /// **recovering** each key from a quorum of replicas the first time it is served
@@ -160,6 +203,9 @@ pub struct GroupRoutedLog<S: LeaseSource, T: ReplicaTransport + Clone + 'static>
     /// Per-group cached log + recovery markers, built lazily and rebuilt when the
     /// lease epoch advances. Cached so a group's offset state is stable across calls.
     groups: Mutex<BTreeMap<GroupId, Arc<GroupEntry<T>>>>,
+    /// One recovery at a time per key (see [`RecoveryTurn`]), across group-entry
+    /// rebuilds too: a key appears here only while a touch is recovering it.
+    recovering: RecoveryGates,
     /// The durable-write serializers (ADR 0071), one per store shard (ADR 0076
     /// T2). Each group's `ClusterLog` is handed the sender for ITS OWN shard, so
     /// owner local acks group-commit with each other (and with the follower's
@@ -198,6 +244,7 @@ impl<S: LeaseSource, T: ReplicaTransport + Clone + 'static> GroupRoutedLog<S, T>
             leases,
             local_replicas,
             groups: Mutex::new(BTreeMap::new()),
+            recovering: Mutex::new(HashMap::new()),
             owner_writer: None,
         }
     }
@@ -342,12 +389,25 @@ impl<S: LeaseSource, T: ReplicaTransport + Clone + 'static> GroupRoutedLog<S, T>
         // log lives in the replica set (its own copy + peers). Seeding it lets the
         // recovered queue replay (a fresh session simply recovers to empty). The marker
         // lives in the entry, so an epoch rebuild above resets it for the group.
-        let recover = !entry
-            .recovered
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .contains(key);
-        if recover {
+        //
+        // Two touches must never recover the same key at once: the re-commit retags
+        // the owner's own copy entry by entry, so a second recovery reading it midway
+        // sees `[1@E.1, 2@old, ..]`, merges that down to offset 1 (a tag regression
+        // reads as a stale tail), and whichever touch seeds first wins: a short seed
+        // lets the next append overwrite acked entries. So recovery takes the key's
+        // turn and re-checks the marker under it.
+        let recovered = |entry: &GroupEntry<T>| {
+            entry
+                .recovered
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains(key)
+        };
+        if recovered(&entry) {
+            return Ok(entry.log.clone());
+        }
+        let _turn = RecoveryTurn::take(&self.recovering, key).await;
+        if !recovered(&entry) {
             let (recovered, floor, reads_high) = self
                 .recover_key(key, &replica_set, entry.log.quorum_rule())
                 .await?;
@@ -1495,6 +1555,171 @@ mod tests {
         // Appends continue after the recovered watermark (no offset reuse).
         assert_eq!(log.append(&qkey, b"m3".to_vec()).await.unwrap(), 3);
         assert_eq!(log.read(&qkey, 0, 100).await.unwrap().len(), 3);
+    }
+
+    /// A follower like [`spawn_follower`] whose FIRST recovery-read waits for
+    /// `reads`, and whose epoch-2 appends at offset 2 wait for `appends`: the
+    /// interleaving of two concurrent first touches of one key. `held` counts the
+    /// frames parked so far.
+    fn spawn_gated_follower(
+        transport: Arc<PeerReplicaTransport>,
+        state: Arc<Mutex<ReplicaState>>,
+        mut rx: mpsc::UnboundedReceiver<PeerMessage>,
+        reads: tokio::sync::watch::Receiver<bool>,
+        appends: tokio::sync::watch::Receiver<bool>,
+        held: Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        let (tx, inner) = mpsc::unbounded_channel();
+        spawn_follower(transport, state, inner);
+        tokio::spawn(async move {
+            let mut first_read = true;
+            while let Some(msg) = rx.recv().await {
+                let gate = match &msg {
+                    PeerMessage::ReplicaRead { .. } if first_read => {
+                        first_read = false;
+                        Some(reads.clone())
+                    }
+                    PeerMessage::Replicate {
+                        epoch: 2,
+                        op: ReplOp::Append { offset: 2, .. },
+                        ..
+                    } => Some(appends.clone()),
+                    _ => None,
+                };
+                match gate.filter(|g| !*g.borrow()) {
+                    Some(mut gate) => {
+                        held.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let tx = tx.clone();
+                        tokio::spawn(async move {
+                            let _ = gate.wait_for(|open| *open).await;
+                            let _ = tx.send(msg);
+                        });
+                    }
+                    None => {
+                        let _ = tx.send(msg);
+                    }
+                }
+            }
+        });
+    }
+
+    /// Two concurrent first touches of one key must not both recover it. In
+    /// the ADR 0080 resize test (`cluster_stress::the_replication_factor_
+    /// changes_live_both_ways_without_losing_an_acked_message`) touch B read
+    /// the owner's copy while touch A's re-commit was halfway through retagging
+    /// it, merged `[1@E.1, 2@old]` down to offset 1 (a tag regression reads as
+    /// a stale tail), re-committed and seeded that, and A's full seed was then
+    /// ignored: the next append reused offset 2 and overwrote an acked entry.
+    /// Here B's peer reads see A's half-done re-commit on the followers.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_first_touches_recover_a_key_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        let owner = nid("owner");
+        // A 3-node ring (R=3, quorum=2): owner + f1 + f2.
+        let mut p = Placement::new(owner.clone(), DEFAULT_REPLICAS);
+        p.observe(&nid("f1"), MemberState::Alive, "f1:7000", None);
+        p.observe(&nid("f2"), MemberState::Alive, "f2:7000", None);
+        let placement = Arc::new(RwLock::new(p));
+        let (_group, client) = owned_group_and_client(&placement.read().unwrap());
+        let qkey = format!("q/{}", client.0);
+
+        // Every replica holds the committed queue [m1, m2] from epoch 1.
+        let seeded = || {
+            let state = Arc::new(Mutex::new(ReplicaState::new()));
+            for (offset, record) in [(1u64, b"m1"), (2, b"m2")] {
+                assert!(state.lock().unwrap().apply(
+                    1,
+                    &ReplOp::Append {
+                        key: qkey.clone(),
+                        offset,
+                        seq: offset,
+                        record: record.to_vec(),
+                    }
+                ));
+            }
+            stamp_current(&state, &placement.read().unwrap());
+            state
+        };
+        let (reads_tx, reads) = tokio::sync::watch::channel(false);
+        let (appends_tx, appends) = tokio::sync::watch::channel(false);
+        let held = Arc::new(AtomicUsize::new(0));
+        let transport = Arc::new(PeerReplicaTransport::new());
+        for node in [nid("f1"), nid("f2")] {
+            let (tx, rx) = mpsc::unbounded_channel();
+            transport.register(node, tx);
+            spawn_gated_follower(
+                transport.clone(),
+                seeded(),
+                rx,
+                reads.clone(),
+                appends.clone(),
+                held.clone(),
+            );
+        }
+        let log = Arc::new(GroupRoutedLog::new(
+            owner,
+            placement.clone(),
+            transport,
+            FixedLease(2),
+            seeded(),
+        ));
+        // Whether `n` frames have parked within `within`.
+        let parked = |n: usize, within: Duration| {
+            let held = held.clone();
+            async move {
+                let deadline = tokio::time::Instant::now() + within;
+                while held.load(Ordering::SeqCst) < n {
+                    if tokio::time::Instant::now() >= deadline {
+                        return false;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                true
+            }
+        };
+
+        // Touch B reads the owner's copy (epoch-1 tags) and parks on its peer reads.
+        let mut b = tokio::spawn({
+            let (log, qkey) = (log.clone(), qkey.clone());
+            async move { log.read(&qkey, 0, 100).await }
+        });
+        assert!(
+            parked(2, Duration::from_secs(10)).await,
+            "touch B never reached its peer reads"
+        );
+        // Touch A recovers in full and starts re-committing at epoch 2: offset 1
+        // lands on the followers, offset 2 parks. Serialized, A waits for B
+        // instead and this times out.
+        let a = tokio::spawn({
+            let (log, qkey) = (log.clone(), qkey.clone());
+            async move { log.append(&qkey, b"m3".to_vec()).await }
+        });
+        let _ = parked(4, Duration::from_secs(1)).await;
+        // B's peer reads now see A's half-done re-commit; let B finish first if
+        // it can, then release A.
+        reads_tx.send(true).unwrap();
+        let b_done = tokio::time::timeout(Duration::from_secs(1), &mut b).await;
+        appends_tx.send(true).unwrap();
+        match b_done {
+            Ok(done) => drop(done.unwrap().unwrap()),
+            Err(_) => drop(b.await.unwrap().unwrap()),
+        }
+        assert_eq!(a.await.unwrap().unwrap(), 3, "m3 appends after m1, m2");
+
+        let records: Vec<Vec<u8>> = log
+            .read(&qkey, 0, 100)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|e| e.record)
+            .collect();
+        assert_eq!(
+            records,
+            vec![b"m1".to_vec(), b"m2".to_vec(), b"m3".to_vec()],
+            "the acked m2 survives two concurrent first touches"
+        );
     }
 
     /// Exhibit ② regression (ADR 0042 T6): an entry the takeover merge ADOPTS
