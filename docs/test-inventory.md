@@ -1014,7 +1014,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 513 test(s)
+## `crates/mqttd/src/lib.rs` — 514 test(s)
 
 - `admin::cli::tests::all_nodes_asks_for_the_cluster_scope_on_the_verbs_that_have_one`
 - `admin::cli::tests::answers_render_as_tables_and_lines`
@@ -1322,6 +1322,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::an_online_persistent_subscriber_receives_the_wire_send_only_after_the_append_resolves`
 - `hub::tests::an_online_session_whose_group_moved_is_closed_so_it_relocates`
 - `hub::tests::an_orphaned_released_id_is_cleared_by_the_spurious_pubrel_cycle`
+- `hub::tests::an_outstanding_handoff_does_not_block_a_routed_commit_this_node_owns`
 - `hub::tests::an_oversized_single_retained_message_is_skipped_not_sent`
 - `hub::tests::an_owner_dedups_a_retransmitted_handoff`
 - `hub::tests::an_owner_reaps_an_expired_retained_value_as_a_committed_clear`
