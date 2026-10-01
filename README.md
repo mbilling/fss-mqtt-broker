@@ -443,32 +443,43 @@ Other published measurements (dev-grade, single host, never capacity): [DURABLE-
 
 | Feature | mqttd | Mosquitto 2.x | EMQX 6.x | HiveMQ CE | VerneMQ 2.1 | NanoMQ 0.25 |
 |---|---|---|---|---|---|---|
+| **Protocol** | | | | | | |
 | MQTT 3.1.1 + 5.0 | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | QoS 0/1/2, retained, LWT | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Shared subscriptions | ✅ cluster-wide | ✅ node | ✅ | ✅ node | ⚠️ | ⚠️ |
 | WebSocket | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | QUIC | ✅ | ✖ | ✅ | ✖ | ✖ | ⚠️ |
-| TLS 1.3 default | ✅ | ⚠️ | ⚠️ | n/v | ⚠️ | ⚠️ |
+| MQTT-SN gateway | ✖ | ✖ | ✅ | ✖ | ✖ | ✖ |
+| CoAP gateway | ✖ | ✖ | ✅ | ✖ | ✖ | ✖ |
+| **Security** | | | | | | |
+| TLS 1.3 by default | ✅ | ⚠️ | ⚠️ | n/v | ⚠️ | ⚠️ |
 | mTLS | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| OIDC / JWT built in | ✅ | ✖ | ✅ | 💰 | ✖ | ✖ |
-| Reload evicts live sessions | ✅ | ⚠️ | n/v | n/v | ⚠️ | ⚠️ |
+| JWT client auth | ✅ | ✖ | ✅ | 💰 | ✖ | ✖ |
+| OIDC (JWKS discovery) | ✅ | ✖ | ⚠️ JWKS URL | 💰 | ✖ | ✖ |
+| Hot reload: policy + certs | ✅ | ⚠️ certs from 2.1 | ✅ | ⚠️ certs only | ✅ | ⚠️ no TLS |
+| Revocation reaches live sessions | ✅ | ⚠️ dynsec only | n/v | ✖ | ✖ | n/v |
 | Tamper-evident audit | ✅ | ✖ | n/v | n/v | ✖ | ✖ |
-| **Clustering** | ✅ | ✖ | 💰 BSL | 💰 | ✅ (💰 binaries) | ✖ |
-| **Replicated sessions** | ✅ default | n/a | ⚠️ opt-in | 💰 | ✖ | ✖ |
+| **Clustering & durability** | | | | | | |
+| Clustering | ✅ | ✖ | 💰 BSL | 💰 | ✅ (💰 binaries) | ✖ |
+| Replicated sessions | ✅ default | n/a | ⚠️ opt-in | 💰 | ✖ | ✖ |
 | Acked msg survives node loss | ✅ proven | n/a | n/v | 💰 | ✖ | ✖ |
 | Data-safe resize | ✅ | n/a | n/v | 💰 | ⚠️ | n/a |
-| Prometheus | ✅ + OTLP | `$SYS` | ✅ | 💰 | ✅ | ✅ |
-| Helm + operator | ✅ | ✖ | ✅ | 💰 | ⚠️ | ⚠️ |
 | Online backup/restore | ✅ | ⚠️ | n/v | 💰 | n/v | n/v |
-| Bridge | ✅ | ✅ | ✅ | ✖ | ✅ | ✅ |
-| Rule engine | ✖ by design | ✖ | ✅ | ✖ | ✖ | ✅ |
+| **Operations** | | | | | | |
+| Prometheus metrics | ✅ | ✖ `$SYS` only | ✅ | ✅ free extension | ✅ | ✅ |
+| OpenTelemetry export | ✅ | ✖ | ✅ | 💰 | ✖ | ✖ |
+| Helm chart | ✅ | ✖ | ✅ | 💰 | ✅ | ✖ |
+| Kubernetes operator | ✅ | ✖ | ✅ | 💰 | ⚠️ unmaintained | ✖ |
 | Admin API | ✅ mTLS, roles, audited | ⚠️ 2.1: experimental, no auth | ✅ | 💰 | ✅ | ✅ |
 | Admin CLI | ✅ `mqttd --admin` | ⚠️ `mosquitto_ctrl`: security config | ✅ `emqx ctl` | ✖ | ✅ `vmq-admin` | ⚠️ start/reload |
 | Admin dashboard | ✖ by design | ⚠️ 2.1: experimental | ✅ | 💰 | ⚠️ status page | ✖ |
-| MQTT-SN / CoAP | ✖ | ✖ | ✅ | ✖ | ✖ | ✖ |
+| **Integration** | | | | | | |
+| Bridge | ✅ | ✅ | ✅ | ✖ | ✅ | ✅ |
+| Rule engine | ✖ by design | ✖ | ✅ | ✖ | ✖ | ✅ |
+| **Build & licence** | | | | | | |
 | Signed reproducible builds + SBOM | ✅ | ✖ | n/v | n/v | ✖ | ✖ |
 | FIPS variant | ✅ | ✖ | n/v | 💰 | ✖ | ✖ |
-| Memory-safe | ✅ Rust | C | Erlang | Java | Erlang | C |
+| Language | Rust | C | Erlang | Java | Erlang | C |
 | **License** | **Apache-2.0** | EPL/EDL | BSL 1.1 | Apache-2.0 | Apache src / EULA bin | MIT |
 
 ---
