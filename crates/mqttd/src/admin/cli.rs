@@ -323,11 +323,74 @@ fn verb_names() -> String {
     VERBS.iter().map(|v| v.name).collect::<Vec<_>>().join(", ")
 }
 
+/// Help lines are wrapped to this width.
+const HELP_WIDTH: usize = 100;
+/// The column a verb's description starts in.
+const HELP_COLUMN: usize = 46;
+
+/// Break `text` into lines of at most `width` characters, at spaces (a longer word gets a
+/// line of its own).
+fn wrap(text: &str, width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    for word in text.split_whitespace() {
+        if !line.is_empty() && line.len() + 1 + word.len() > width {
+            lines.push(std::mem::take(&mut line));
+        }
+        if !line.is_empty() {
+            line.push(' ');
+        }
+        line.push_str(word);
+    }
+    if !line.is_empty() {
+        lines.push(line);
+    }
+    lines
+}
+
+/// One verb in the help: its shape from column 2, its description from [`HELP_COLUMN`],
+/// both wrapped to [`HELP_WIDTH`]. A shape too long for its column gets lines of its own.
+fn usage_entry(out: &mut String, shape: &str, help: &str) {
+    let shape_lines = wrap(shape, HELP_WIDTH - 4);
+    let help_lines = wrap(help, HELP_WIDTH - HELP_COLUMN);
+    let pad = " ".repeat(HELP_COLUMN);
+    let fits = shape_lines.len() == 1 && shape_lines[0].len() + 3 <= HELP_COLUMN;
+    if fits {
+        let _ = writeln!(
+            out,
+            "  {:<w$}{}",
+            shape_lines[0],
+            help_lines.first().map_or("", String::as_str),
+            w = HELP_COLUMN - 2
+        );
+        for line in help_lines.iter().skip(1) {
+            let _ = writeln!(out, "{pad}{line}");
+        }
+        return;
+    }
+    for (i, line) in shape_lines.iter().enumerate() {
+        let indent = if i == 0 { "  " } else { "      " };
+        let _ = writeln!(out, "{indent}{line}");
+    }
+    for line in &help_lines {
+        let _ = writeln!(out, "{pad}{line}");
+    }
+}
+
 fn usage() -> String {
-    let mut s = String::from(
+    let mut s = String::new();
+    for (i, line) in wrap(
         "USAGE: mqttd --admin <verb> [args] [--json] [--url https://host:port] [--ca <pem>] \
-         [--cert <pem>] [--key <pem>] [--server-name <name>] [--config <path>]\n\nVERBS:\n",
-    );
+         [--cert <pem>] [--key <pem>] [--server-name <name>] [--config <path>]",
+        HELP_WIDTH - 7,
+    )
+    .iter()
+    .enumerate()
+    {
+        let indent = if i == 0 { "" } else { "       " };
+        let _ = writeln!(s, "{indent}{line}");
+    }
+    s.push_str("\nVERBS:\n");
     for v in VERBS {
         let mut shape = v.name.to_string();
         for r in v.required {
@@ -339,12 +402,16 @@ fn usage() -> String {
         if ALL_NODES_VERBS.contains(&v.name) {
             shape.push_str(" [--all-nodes]");
         }
-        let _ = writeln!(s, "  {shape:<44} {}", v.help);
+        usage_entry(&mut s, &shape, v.help);
     }
-    s.push_str(
-        "\nENVIRONMENT: MQTTD_ADMIN_URL, MQTTD_ADMIN_CA, MQTTD_ADMIN_CLIENT_CERT, \
-         MQTTD_ADMIN_CLIENT_KEY, MQTTD_ADMIN_SERVER_NAME (the options win).\n",
-    );
+    s.push('\n');
+    for line in wrap(
+        "ENVIRONMENT: MQTTD_ADMIN_URL, MQTTD_ADMIN_CA, MQTTD_ADMIN_CLIENT_CERT, \
+         MQTTD_ADMIN_CLIENT_KEY, MQTTD_ADMIN_SERVER_NAME (the options win).",
+        HELP_WIDTH,
+    ) {
+        let _ = writeln!(s, "{line}");
+    }
     s
 }
 
@@ -462,7 +529,7 @@ pub async fn run(args: &[String]) -> i32 {
                         serde_json::to_string_pretty(&value).unwrap_or_default()
                     );
                 } else {
-                    print!("{}", render(&value));
+                    print!("{}", render_for(inv.verb, &value));
                 }
                 0
             } else {
@@ -496,6 +563,134 @@ pub async fn run(args: &[String]) -> i32 {
         }
     }
 }
+
+/// Render `verb`'s answer for a terminal: the compact cluster view for `cluster`, the
+/// generic [`render`] for the rest. `--json` always has the whole answer.
+#[must_use]
+pub fn render_for(verb: &str, value: &Value) -> String {
+    if verb == "cluster" {
+        if let Some(out) = render_cluster(value) {
+            return out;
+        }
+    }
+    render(value)
+}
+
+/// The cluster view in a terminal's width: a summary line, whether the nodes agree, and
+/// one short row per node. The full rows (addresses, checksums, the whole cluster id) are
+/// in `--json`.
+fn render_cluster(value: &Value) -> Option<String> {
+    let nodes = value.get("nodes")?.as_array()?;
+    let summary = value.get("summary")?;
+    let count = |k: &str| summary.get(k).and_then(Value::as_u64).unwrap_or(0);
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "{} nodes: {} replied, {} ready (answered by {})",
+        count("nodes"),
+        count("replied"),
+        count("ready"),
+        scalar(value.get("answered_by").unwrap_or(&Value::Null)),
+    );
+    let differ: Vec<&str> = [
+        ("same_cluster_id", "cluster id"),
+        ("same_version", "version"),
+        ("same_config", "config"),
+        ("same_membership", "membership"),
+    ]
+    .iter()
+    .filter(|(k, _)| summary.get(*k) == Some(&Value::Bool(false)))
+    .map(|(_, label)| *label)
+    .collect();
+    if differ.is_empty() {
+        out.push_str("they agree on cluster id, version, config and membership\n");
+    } else {
+        let _ = writeln!(out, "they DIFFER on: {}", differ.join(", "));
+    }
+    out.push('\n');
+    let columns = [
+        "NODE", "STATE", "LEADER", "EPOCH", "MEMBERS", "LAG", "VERSION", "CLUSTER", "MS", "NOTES",
+    ];
+    let cells = nodes.iter().map(cluster_row).collect::<Vec<_>>();
+    out.push_str(&grid(
+        &columns.iter().map(|c| (*c).to_string()).collect::<Vec<_>>(),
+        &cells,
+    ));
+    Some(out)
+}
+
+/// One node's compact row: identity, state, lease, size, lag, version, the first 8
+/// characters of its cluster id, how long it took to answer, and anything wrong with it.
+fn cluster_row(row: &Value) -> Vec<String> {
+    let text = |k: &str| row.get(k).map_or_else(|| "-".to_string(), scalar);
+    let is = |k: &str| row.get(k) == Some(&Value::Bool(true));
+    let replied = is("replied");
+    let state = if !replied {
+        "no reply"
+    } else if is("ready") {
+        "ready"
+    } else {
+        "not ready"
+    };
+    let mut notes: Vec<String> = Vec::new();
+    if replied {
+        if row.get("live") == Some(&Value::Bool(false)) {
+            notes.push("not live".into());
+        }
+        for (k, label) in [
+            ("quarantined", "quarantined"),
+            ("brownout", "brownout"),
+            ("swim_isolated", "swim-isolated"),
+            ("under_replicated", "under-replicated"),
+        ] {
+            if is(k) {
+                notes.push(label.into());
+            }
+        }
+        if row.get("decommissioning").is_some_and(|d| !d.is_null()) {
+            notes.push("decommissioning".into());
+        }
+    } else {
+        notes.push(text("error"));
+    }
+    let cluster: String = row
+        .get("cluster_id")
+        .and_then(Value::as_str)
+        .map_or_else(|| "-".to_string(), |id| id.chars().take(8).collect());
+    let or_dash = |s: String| if replied { s } else { "-".to_string() };
+    vec![
+        text("node_id"),
+        state.to_string(),
+        if is("lease_leader") {
+            "*".into()
+        } else {
+            "-".into()
+        },
+        or_dash(text("lease_epoch")),
+        or_dash(text("members")),
+        or_dash(text("replica_lag_groups")),
+        or_dash(text("version")),
+        or_dash(cluster),
+        or_dash(text("elapsed_ms")),
+        if notes.is_empty() {
+            "-".into()
+        } else {
+            notes.join(", ")
+        },
+    ]
+}
+
+/// Columns that identify a row come first, in this order, whatever the answer; the rest
+/// follow in their own order.
+const LEADING_COLUMNS: &[&str] = &[
+    "node_id",
+    "client_id",
+    "node",
+    "topic",
+    "filter",
+    "replied",
+    "connected",
+];
 
 /// Render an answer for a terminal: scalars as `key  value` lines (nested keys joined with
 /// `.`), then each array of objects as a table under its key.
@@ -558,7 +753,8 @@ fn scalar(value: &Value) -> String {
     }
 }
 
-/// A fixed-width table over the union of the rows' keys, in first-seen order.
+/// A fixed-width table over the union of the rows' keys: the [`LEADING_COLUMNS`] present,
+/// then the rest in first-seen order.
 fn table(rows: &[Value]) -> String {
     let mut columns: Vec<String> = Vec::new();
     for row in rows {
@@ -570,6 +766,8 @@ fn table(rows: &[Value]) -> String {
             }
         }
     }
+    let lead = |c: &String| LEADING_COLUMNS.iter().position(|l| l == c);
+    columns.sort_by_key(|c| lead(c).unwrap_or(LEADING_COLUMNS.len()));
     let cells: Vec<Vec<String>> = rows
         .iter()
         .map(|row| {
@@ -579,6 +777,12 @@ fn table(rows: &[Value]) -> String {
                 .collect()
         })
         .collect();
+    let headers: Vec<String> = columns.iter().map(|c| c.to_uppercase()).collect();
+    grid(&headers, &cells)
+}
+
+/// Fixed-width columns: a header line, then one line per row, two spaces apart.
+fn grid(columns: &[String], cells: &[Vec<String>]) -> String {
     let widths: Vec<usize> = columns
         .iter()
         .enumerate()
@@ -602,9 +806,9 @@ fn table(rows: &[Value]) -> String {
         s.push('\n');
         s
     };
-    let mut out = line(columns.iter().map(|c| c.to_uppercase()).collect());
+    let mut out = line(columns.to_vec());
     for row in cells {
-        out.push_str(&line(row));
+        out.push_str(&line(row.clone()));
     }
     out
 }
@@ -630,6 +834,72 @@ mod tests {
         assert!(validate(&args("node --url https://a:1 --url https://b:1")).is_err());
         assert!(validate(&args("node --bogus x")).is_err());
         assert!(validate(&args("node --json --json")).is_err());
+    }
+
+    #[test]
+    fn the_cluster_view_is_compact_and_says_what_is_wrong() {
+        let answer = json!({
+            "answered_by": "n1",
+            "summary": {"nodes": 3, "replied": 2, "ready": 1, "same_cluster_id": true,
+                        "same_config": false, "same_membership": true, "same_version": true},
+            "nodes": [
+                {"node_id": "n1", "replied": true, "ready": true, "live": true,
+                 "lease_leader": true, "lease_epoch": 4, "members": 3, "replica_lag_groups": 0,
+                 "version": "1.0.18", "cluster_id": "f8995cf8f6cd90e4", "elapsed_ms": 0,
+                 "config_checksum": "aaaa", "decommissioning": null},
+                {"node_id": "n2", "replied": true, "ready": false, "live": true,
+                 "lease_leader": false, "lease_epoch": 4, "members": 3, "replica_lag_groups": 2,
+                 "version": "1.0.18", "cluster_id": "f8995cf8f6cd90e4", "elapsed_ms": 41,
+                 "brownout": true, "under_replicated": true, "admin_addr": "n2:9443"},
+                {"node_id": "n3", "replied": false, "admin_addr": "n3:9443",
+                 "error": "connect failed"}
+            ]
+        });
+        let out = render_for("cluster", &answer);
+        assert_eq!(
+            out,
+            "3 nodes: 2 replied, 1 ready (answered by n1)\n\
+             they DIFFER on: config\n\
+             \n\
+             NODE  STATE      LEADER  EPOCH  MEMBERS  LAG  VERSION  CLUSTER   MS  NOTES\n\
+             n1    ready      *       4      3        0    1.0.18   f8995cf8  0   -\n\
+             n2    not ready  -       4      3        2    1.0.18   f8995cf8  41  brownout, under-replicated\n\
+             n3    no reply   -       -      -        -    -        -         -   connect failed\n"
+        );
+        assert!(out.lines().all(|l| l.len() <= HELP_WIDTH), "{out}");
+        // Other verbs keep the generic rendering.
+        assert_eq!(render_for("node", &json!({"a": 1})), "a  1\n");
+    }
+
+    #[test]
+    fn identifying_columns_lead_every_table() {
+        let out = render(&json!({
+            "sessions": [{"auth": "x", "backlog": 0, "client_id": "c1", "connected": true, "node": "n2"}]
+        }));
+        assert!(
+            out.contains("CLIENT_ID  NODE  CONNECTED  AUTH  BACKLOG"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn help_wraps_to_the_terminal_width() {
+        let help = usage();
+        assert!(
+            help.lines().all(|l| l.len() <= HELP_WIDTH),
+            "a help line is wider than {HELP_WIDTH}:\n{help}"
+        );
+        // Every verb is still listed, and a long shape keeps its description.
+        for v in VERBS {
+            assert!(
+                help.lines().any(|l| l.trim_start().starts_with(v.name)),
+                "{}",
+                v.name
+            );
+        }
+        let flowing = help.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(flowing.contains("--all-nodes: on every node"), "{help}");
+        assert_eq!(wrap("aa bb cc", 5), ["aa bb", "cc"]);
     }
 
     #[test]

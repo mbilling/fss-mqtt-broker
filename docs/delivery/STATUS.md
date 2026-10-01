@@ -215,6 +215,6 @@
 **0081 — # 0081. An authenticated admin API: reads cluster-wide, actions audited, config stays in the file**
 
 - `0081-T18` ⬜ planned ([#773](https://github.com/mbilling/fss-mqtt-broker/issues/773)): "Hot reload of the admin listener's certificate, key and CA"
-- `0081-T19` ⬜ planned ([#774](https://github.com/mbilling/fss-mqtt-broker/issues/774)): "CLI output polish: compact cluster table, wrapped help"
+- `0081-T19` 🚧 in-progress ([#774](https://github.com/mbilling/fss-mqtt-broker/issues/774)): "CLI output polish: compact cluster table, wrapped help"
 - `0081-T13` 💤 deferred: "OIDC bearer tokens as a second admin authenticator on the same roles" — "After T1–T9 are in use."
 - `0081-T14` 💤 deferred: "Bulk retained-message deletion by prefix" — "Needs a demonstrated need and a dry-run design (ADR §5)."
