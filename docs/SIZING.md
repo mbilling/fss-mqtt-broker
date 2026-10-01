@@ -117,6 +117,7 @@ channel's *packet* count stays here while its *bytes* became `MQTTD_MAX_OUTBOUND
 | Internal bound | Value |
 |---|---|
 | Outbound socket channel per connection, **packets** | 10 000; `QoS` 0 over it is shed and counted (`publish_dropped{reason="outbound-full"}`), control packets and `QoS` 1/2 always flow. Its *bytes* are `MQTTD_MAX_OUTBOUND_BYTES` |
+| Unwritten frames per peer link, for new `QoS` 0 forwards (issue #504) | 100 000; past it, ungated `QoS` 0 forwards and shared deliveries to that peer are shed and counted (`publish_dropped{reason="peer-backlog"}`), and the shared-subscription pressure fallback stops choosing that peer's members. Retained broadcasts and gated `QoS` 1/2 forwards always flow (the latter are bounded by the pending-publish cap). Watch `mqttd_peer_forwards_in_flight`. Without this bound an overloaded node queued 15M frames (10 GB) and froze at its cgroup `MemoryHigh` |
 | Replay to a resuming session | 10 000 msgs |
 | Pending publishes awaiting durability | 4 096, ack withheld |
 | Durable-append lane per session (issue #242) | 256 jobs (appends and QoS 2 outbound-id records share the cap), reject-newest (ack withheld), plus 16 reserved control slots for detach-spill/discard jobs; payload bytes are refcounted clones of the pending entry's, so the added cost per job is the message envelope, not a second payload copy |

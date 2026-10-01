@@ -1349,7 +1349,13 @@ impl Hub {
                 let Some(group) = self.remote_shared.get(node).and_then(|g| g.get(*idx)) else {
                     continue;
                 };
-                let linked = self.peers.get(node).is_some_and(|p| !p.tx.is_closed());
+                // A link that cannot drain is not an escape (issue #504): under
+                // overload every local member fills, and forwarding to a backlogged
+                // peer only moves the overload into unbounded peer-link memory.
+                let linked = self
+                    .peers
+                    .get(node)
+                    .is_some_and(|p| !p.tx.is_closed() && !super::peer_backlogged(p));
                 for (client, qos, online) in &group.members {
                     candidates.push(SharedCandidateRef {
                         node: Some(node),

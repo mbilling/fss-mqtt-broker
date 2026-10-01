@@ -1014,7 +1014,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 514 test(s)
+## `crates/mqttd/src/lib.rs` — 516 test(s)
 
 - `admin::cli::tests::all_nodes_asks_for_the_cluster_scope_on_the_verbs_that_have_one`
 - `admin::cli::tests::answers_render_as_tables_and_lines`
@@ -1212,6 +1212,8 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::settle::tests::a_settled_view_never_holds`
 - `hub::settle::tests::a_shared_placement_is_evidence`
 - `hub::settle::tests::a_zero_match_fan_out_on_an_unsettled_view_still_holds`
+- `hub::tests::a_backlogged_peer_link_sheds_qos0_forwards_but_never_retained_broadcasts`
+- `hub::tests::a_backlogged_peer_link_sheds_qos0_shared_deliveries_until_it_drains`
 - `hub::tests::a_brownout_refusal_delivers_to_nobody_even_when_a_subscriber_owed_no_durability`
 - `hub::tests::a_brownout_refusal_is_counted_as_a_quota_rejection_not_a_drop`
 - `hub::tests::a_brownout_refused_will_does_not_overtake_an_inflight_qos1_append`

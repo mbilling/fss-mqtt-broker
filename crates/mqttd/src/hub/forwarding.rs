@@ -802,6 +802,15 @@ impl Hub {
             if !(retain_broadcasts || interested) {
                 continue;
             }
+            // Issue #504: an ungated QoS 0 forward onto a link that cannot drain is
+            // shed and counted rather than queued without bound. A retained
+            // broadcast is never shed: peer caches must converge.
+            if qos == QoS::AtMostOnce && !retain && super::peer_backlogged(peer) {
+                if let Some(m) = &self.metrics {
+                    m.publish_dropped("peer-backlog");
+                }
+                continue;
+            }
             if let Some(m) = &self.metrics {
                 m.publish_forwarded("subscriber-remote");
             }

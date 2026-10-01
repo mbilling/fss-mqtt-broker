@@ -386,6 +386,27 @@ impl Outbound {
 /// the missing dimension, not the count.
 pub const MAX_OUTBOUND_QUEUE: usize = 10_000;
 
+/// How many frames may sit unwritten on one peer link before this node stops adding
+/// fire-and-forget `QoS 0` forwards to it (issue #504).
+///
+/// Both peer lanes are unbounded, so without this an overloaded node keeps queueing
+/// `QoS 0` forwards its peers cannot drain. The #504 cloud run measured exactly that:
+/// under 1.5x overload every local `$share` consumer filled, the capacity fallback sent
+/// 17.9M publishes to remote members, 15M frames piled up on the links (10 GB RSS), and
+/// the process froze at the cgroup's `MemoryHigh` without an OOM kill — no logs, no
+/// `/metrics`, for good. `QoS 0` promises nothing, so a counted drop
+/// (`publish_dropped{reason="peer-backlog"}`) is the honest answer, exactly as
+/// [`MAX_OUTBOUND_QUEUE`] sheds `QoS 0` for a client socket. `QoS` >= 1 forwards are
+/// not affected: they are gated and bounded by the pending-publish cap. Retained
+/// broadcasts are never dropped (peer caches must converge). 100k frames is about a
+/// second of a busy link's traffic and tens of MB, so a healthy link never reaches it.
+pub const PEER_QOS0_BACKLOG_CAP: usize = 100_000;
+
+/// Whether `peer`'s link already holds [`PEER_QOS0_BACKLOG_CAP`] unwritten frames.
+fn peer_backlogged(peer: &Peer) -> bool {
+    peer.depth.load(std::sync::atomic::Ordering::Relaxed) >= PEER_QOS0_BACKLOG_CAP
+}
+
 /// One WARN for a backlog eviction, naming **which bound fired** and how much it shed
 /// (issue #241).
 ///
@@ -6755,6 +6776,14 @@ impl Hub {
         app: &AppProperties,
     ) {
         if let Some(peer) = self.peers.get(node) {
+            // Issue #504: a fire-and-forget QoS 0 delivery onto a link that cannot
+            // drain is shed and counted, never queued without bound.
+            if qos == QoS::AtMostOnce && peer_backlogged(peer) {
+                if let Some(m) = &self.metrics {
+                    m.publish_dropped("peer-backlog");
+                }
+                return;
+            }
             if let Some(m) = &self.metrics {
                 m.publish_forwarded("shared-remote");
             }
@@ -8675,6 +8704,118 @@ mod tests {
             recv_packet(&mut ra).await.is_none(),
             "single delivery per publish"
         );
+    }
+
+    /// [`connect_peer`] whose link pump depth the test controls (issue #504), so a
+    /// backlogged link can be simulated without a real pump.
+    fn connect_peer_with_depth(
+        tx: &HubTx,
+        node: &str,
+        conn_id: u64,
+        depth: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) -> mpsc::UnboundedReceiver<PeerMessage> {
+        let (peer_tx, peer_rx): (PeerOutbound, _) = mpsc::unbounded_channel();
+        tx.send(HubCommand::PeerConnected {
+            node: NodeId(node.into()),
+            conn_id,
+            ctl: peer_tx.clone(),
+            tx: peer_tx,
+            cert_serial: None,
+            depth,
+            proto: mqtt_cluster::peer::PROTO_MAX,
+        })
+        .unwrap();
+        peer_rx
+    }
+
+    /// Issue #504: a `QoS 0` shared delivery to a remote member is SHED while that
+    /// member's peer link holds [`PEER_QOS0_BACKLOG_CAP`] unwritten frames, and flows
+    /// again once the link drains. Without the bound, an overloaded node escaped every
+    /// full local consumer to remote members and queued 15M frames (10 GB) on its links
+    /// until the cgroup's `MemoryHigh` froze the process.
+    #[tokio::test]
+    async fn a_backlogged_peer_link_sheds_qos0_shared_deliveries_until_it_drains() {
+        let tx = start_hub();
+        let depth = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(
+            super::PEER_QOS0_BACKLOG_CAP,
+        ));
+        let mut peer = connect_peer_with_depth(&tx, "n", 1, depth.clone());
+        assert!(matches!(
+            recv_peer(&mut peer).await,
+            Some(PeerMessage::Interest { .. })
+        ));
+        // The group's only member is on the peer.
+        remote_shared_interest(&tx, "n", "g", "t", &["rb"]);
+
+        publish(&tx, "t", b"shed");
+        assert!(
+            no_peer_data(&mut peer).await,
+            "a QoS 0 shared delivery was queued on a link already at the backlog cap"
+        );
+
+        depth.store(0, std::sync::atomic::Ordering::Relaxed);
+        publish(&tx, "t", b"flows");
+        match next_shared_deliver(&mut peer).await {
+            PeerMessage::SharedDeliver {
+                client, payload, ..
+            } => {
+                assert_eq!(client, "rb");
+                assert_eq!(&payload[..], b"flows");
+            }
+            other => panic!("expected SharedDeliver once the link drained, got {other:?}"),
+        }
+    }
+
+    /// Issue #504, the ordinary-subscriber fan-out: an ungated `QoS 0` forward onto a
+    /// backlogged link is shed, a retained broadcast is NOT (peer caches must
+    /// converge), and forwarding resumes once the link drains.
+    #[tokio::test]
+    async fn a_backlogged_peer_link_sheds_qos0_forwards_but_never_retained_broadcasts() {
+        let tx = start_hub();
+        let depth = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(
+            super::PEER_QOS0_BACKLOG_CAP,
+        ));
+        let mut peer = connect_peer_with_depth(&tx, "n", 1, depth.clone());
+        assert!(matches!(
+            recv_peer(&mut peer).await,
+            Some(PeerMessage::Interest { .. })
+        ));
+        remote_interest(&tx, "n", &["t/#"]);
+
+        publish(&tx, "t/x", b"shed");
+        assert!(
+            no_peer_data(&mut peer).await,
+            "a QoS 0 forward was queued on a link already at the backlog cap"
+        );
+
+        tx.send(HubCommand::Publish {
+            topic: "t/r".into(),
+            payload: Bytes::from_static(b"kept"),
+            qos: QoS::AtMostOnce,
+            retain: true,
+            message_expiry: None,
+            app: AppProperties::default(),
+            done: None,
+            v5: false,
+            publisher: None,
+        })
+        .unwrap();
+        match recv_peer_data(&mut peer).await {
+            Some(PeerMessage::Publish {
+                retain, payload, ..
+            }) => {
+                assert!(retain, "the retained broadcast must still reach the peer");
+                assert_eq!(&payload[..], b"kept");
+            }
+            other => panic!("expected the retained broadcast, got {other:?}"),
+        }
+
+        depth.store(0, std::sync::atomic::Ordering::Relaxed);
+        publish(&tx, "t/x", b"flows");
+        match recv_peer_data(&mut peer).await {
+            Some(PeerMessage::Publish { payload, .. }) => assert_eq!(&payload[..], b"flows"),
+            other => panic!("expected the forward once the link drained, got {other:?}"),
+        }
     }
 
     /// Cross-node round-robin is STABLE across publishes, with a group spanning
