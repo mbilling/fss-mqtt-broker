@@ -1,12 +1,19 @@
 //! Hold a real startup stage, rather than hoping to win the ready-before-bind race.
 use super::*;
-use rustix::fs::{mkfifoat, open, Mode, OFlags, CWD};
+use rustix::fs::{open, Mode, OFlags};
 
 #[tokio::test]
 async fn a_live_process_is_not_ready_while_client_startup_is_held() {
     let root = tempfile::tempdir().unwrap();
     let fifo = root.path().join("credentials");
-    mkfifoat(CWD, &fifo, Mode::RUSR | Mode::WUSR).unwrap();
+    // The POSIX `mkfifo` utility rather than rustix's `mkfifoat`, which rustix does not
+    // provide on Apple targets — this test must build on macOS too.
+    let made = std::process::Command::new("mkfifo")
+        .args(["-m", "600"])
+        .arg(&fifo)
+        .status()
+        .expect("run mkfifo");
+    assert!(made.success(), "mkfifo failed: {made}");
     let path = fifo.to_str().unwrap();
     // Credential loading happens after health is bound but before MQTT is bound.
     // Disable durability here so a lease election cannot mask a missing startup gate.
