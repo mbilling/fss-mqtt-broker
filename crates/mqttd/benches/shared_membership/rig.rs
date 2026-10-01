@@ -356,7 +356,7 @@ impl Rig {
 
     pub async fn barrier(&self) {
         let (reply, wait) = oneshot::channel();
-        self.tx.send(HubCommand::Ping { reply }).unwrap();
+        self.tx.send(HubCommand::Flush { reply }).unwrap();
         wait.await.unwrap();
     }
 

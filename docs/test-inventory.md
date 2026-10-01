@@ -1015,7 +1015,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 516 test(s)
+## `crates/mqttd/src/lib.rs` — 519 test(s)
 
 - `admin::cli::tests::all_nodes_asks_for_the_cluster_scope_on_the_verbs_that_have_one`
 - `admin::cli::tests::answers_render_as_tables_and_lines`
@@ -1231,6 +1231,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::a_completed_qos2_delivery_does_not_replay_when_the_truncate_lands`
 - `hub::tests::a_congested_relaxed_forward_is_answered_at_append_completion`
 - `hub::tests::a_congested_relaxed_publish_waits_for_its_append`
+- `hub::tests::a_control_command_is_reached_ahead_of_a_deep_data_backlog`
 - `hub::tests::a_crashed_hub_releases_the_store_so_the_node_can_restart`
 - `hub::tests::a_cross_node_shared_delivery_is_answered_and_reselects_before_refusing`
 - `hub::tests::a_detach_spill_rides_the_lane_keeping_the_loop_live_and_replay_order`
@@ -1345,12 +1346,14 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::brownout_refuses_the_ack_and_the_live_send_for_an_online_persistent_subscriber`
 - `hub::tests::brownout_refuses_the_publishers_ack_for_an_offline_persistent_subscriber`
 - `hub::tests::clean_session_attach_wipes_prior_persistent_state`
+- `hub::tests::commands_sort_into_the_control_and_data_lanes`
 - `hub::tests::durable_failure_reasons_are_bounded`
 - `hub::tests::durable_off_keeps_the_adr_0014_behaviour_with_no_retained_commit`
 - `hub::tests::evicting_a_v311_client_closes_without_a_disconnect_packet`
 - `hub::tests::eviction_disconnects_the_target_and_leaves_others_undisturbed`
 - `hub::tests::expired_queued_message_is_dropped_at_replay`
 - `hub::tests::flow_control_backlog_is_bounded_drop_oldest`
+- `hub::tests::flush_waits_for_every_publish_sent_before_it`
 - `hub::tests::forward_repeat::a_re_used_seq_with_new_content_is_applied_and_a_dead_origin_is_forgotten`
 - `hub::tests::forward_repeat::a_repeated_shared_delivery_is_re_answered_not_delivered_twice`
 - `hub::tests::forward_repeat::a_retransmission_after_the_answer_is_re_answered_not_stored_twice`

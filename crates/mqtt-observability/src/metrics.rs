@@ -58,6 +58,12 @@ struct ReasonLabel {
     reason: String,
 }
 
+/// `{lane}` label — a bounded set: `control`, `data` (ADR 0082 T2).
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct LaneLabel {
+    lane: String,
+}
+
 /// `{listener}` label — a bounded set: `tls`, `plaintext`.
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 struct ListenerLabel {
@@ -147,6 +153,7 @@ struct OtelInstruments {
     hub_fanout: OtelHistogram<f64>,
     hub_fanout_peer_visits: OtelCounter<u64>,
     hub_queue_depth: OtelGauge<i64>,
+    hub_lane_depth: OtelGauge<i64>,
     routing_unsettled: OtelGauge<i64>,
     pending_publishes_awaiting_settle: OtelGauge<i64>,
     shared_selected: OtelCounter<u64>,
@@ -230,6 +237,7 @@ impl OtelInstruments {
             hub_fanout: meter.f64_histogram("hub_fanout_seconds").build(),
             hub_fanout_peer_visits: meter.u64_counter("hub_fanout_peer_visits").build(),
             hub_queue_depth: meter.i64_gauge("hub_queue_depth").build(),
+            hub_lane_depth: meter.i64_gauge("hub_lane_depth").build(),
             routing_unsettled: meter.i64_gauge("routing_unsettled").build(),
             pending_publishes_awaiting_settle: meter
                 .i64_gauge("pending_publishes_awaiting_settle")
@@ -337,6 +345,8 @@ pub struct Metrics {
     /// Issue #613 item 3.5: the hub's inbound queue depth. The hub is a single
     /// task, so this is its saturation, full stop.
     hub_queue_depth: Gauge,
+    /// ADR 0082 T2: the hub's queued commands by lane, `control` and `data`.
+    hub_lane_depth: Family<LaneLabel, Gauge>,
     /// Issue #613 item 2.5: one series per term of `routing_unsettled()`, all of
     /// them emitted every scrape so a disappearing series is never read as 0.
     routing_unsettled: Family<ReasonLabel, Gauge>,
@@ -598,6 +608,16 @@ impl Metrics {
             "Commands queued for the single-threaded hub loop (issue #613 item \
              3.5). The hub is one task, so this IS the statement \"work is arriving \
              faster than it is retired\"",
+        );
+        let hub_lane_depth = register_gauge_family(
+            &mut registry,
+            "hub_lane_depth",
+            "Commands the hub has sorted and not yet dispatched, by lane (ADR 0082 \
+             T2): `control` (acks, completions, durable-plane and membership frames, \
+             the /livez ping, admin) is always dispatched before `data` (publishes, \
+             subscriptions, session lifecycle). A growing `data` lane with a near-zero \
+             `control` lane is overload that consensus and health no longer wait \
+             behind",
         );
         let routing_unsettled = register_gauge_family(
             &mut registry,
@@ -1117,6 +1137,7 @@ impl Metrics {
             hub_fanout_seconds,
             hub_fanout_peer_visits_total,
             hub_queue_depth,
+            hub_lane_depth,
             routing_unsettled,
             pending_publishes_awaiting_settle,
             shared_selected_total,
@@ -1386,6 +1407,19 @@ impl Metrics {
     pub fn set_hub_queue_depth(&self, n: usize) {
         self.hub_queue_depth.set(clamp_gauge(n));
         self.otel.hub_queue_depth.record(clamp_gauge(n), &[]);
+    }
+
+    /// Set one lane of `hub_lane_depth` (ADR 0082 T2). `lane` is `control` or `data`;
+    /// the caller sets both on every refresh.
+    pub fn set_hub_lane_depth(&self, lane: &str, n: usize) {
+        self.hub_lane_depth
+            .get_or_create(&LaneLabel {
+                lane: lane.to_string(),
+            })
+            .set(clamp_gauge(n));
+        self.otel
+            .hub_lane_depth
+            .record(clamp_gauge(n), &[KeyValue::new("lane", lane.to_string())]);
     }
 
     /// Set one term of `routing_unsettled()` (issue #613 item 2.5). `reason` is a

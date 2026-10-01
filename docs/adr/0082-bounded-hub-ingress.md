@@ -240,3 +240,31 @@ The maintainer accepted this ADR with three answers to the questions the proposa
    256 MiB), and the per-connection cap is 1 MiB.
 3. **T2 ships on its own first:** the lane split, with no admission change. The credits (T3)
    follow.
+
+## Amendment (2026-10-02): which commands are control, as built in T2
+
+§1 listed attach, detach, membership, interest gossip, retained snapshots and policy
+changes as control. Implementing T2 showed that each of those changes what an
+**earlier-queued** data command does, so letting it overtake them changes behaviour:
+- a client's DISCONNECT overtaking its own PUBLISHes fires its will first;
+- a brownout flip overtaking a publish refuses something admitted under the old policy
+  (#238);
+- a peer's link-up overtaking retained publishes offers a digest and drains a handoff
+  queue those publishes had not built yet;
+- a retained snapshot or digest overtaking a retained publish leaves it out.
+
+So the rule, as built (`HubCommand::lane`), is: **a command is control only if nothing
+queued before it can change what it does.** Control is completions and acks (lane, store
+and retained-commit completions; client PUBACK, PUBREC and PUBCOMP; a peer's forward ack
+and verdict), the durable plane (raft and replication frames), the `/livez` ping and
+admin. Everything else stays ordered on the data lane. The goals of §1 still hold:
+consensus frames, acks and health never wait behind publishes. Session lifecycle,
+membership and policy changes keep arrival order, as before the split.
+
+Two further details:
+- **A data-lane barrier.** `HubCommand::Flush` replies once everything sent before it, in
+  either lane, is dispatched. `Ping` now answers as soon as the control lane is clear,
+  which is right for `/livez` and wrong for a flush.
+- **Metrics.** `mqttd_hub_queue_depth` keeps its meaning (everything queued, now the
+  channel plus both lanes) so existing dashboards hold. The per-lane split is a new
+  family, `mqttd_hub_lane_depth{lane="control|data"}`.
