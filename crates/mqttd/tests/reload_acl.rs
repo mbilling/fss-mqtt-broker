@@ -178,6 +178,7 @@ async fn start_reloadable_node(
                 shutdown: None,
                 metrics: None,
                 enhanced: None,
+                ingress: None,
             });
             let hub = hub_tx.clone();
             tokio::spawn(async move {

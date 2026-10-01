@@ -46,6 +46,7 @@ fn permissive_policy() -> Arc<ConnPolicy> {
         shutdown: None,
         metrics: None,
         enhanced: None,
+        ingress: None,
     })
 }
 

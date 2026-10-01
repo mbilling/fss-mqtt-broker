@@ -53,6 +53,7 @@ RSS ≈ base (~15 MiB idle + ~24 KiB per idle connection — see the note below)
     + connections × max_packet_size            (read buffering, worst case)
     + sessions × queued_messages × avg_msg     (offline queues — THE dominant term)
     + retained_topics × avg_retained_value
+    + hub_ingress_bytes                        (client publishes waiting for the hub — below)
     + per slow live subscriber (RAM, issue #241 — all three now lowerable):
         flow-control backlog:  max_backlog_bytes + 2 × (max_packet_size + 256)   [byte cap set]
                              = max_backlog_messages × (avg_msg + 256)           [byte cap unset]
@@ -202,6 +203,40 @@ Watch it with `process_resident_bytes / memory_max_bytes`. Two rules, with numbe
   exported as a literal `0` (not absent), and PromQL follows IEEE 754, so the bare ratio is
   `+Inf` and fires permanently on the default configuration. If you have no watermark,
   alert against the container limit instead.
+
+### Hub ingress credit (`MQTTD_HUB_INGRESS_BYTES`)
+
+Every client publish waits in the hub's queue between being read and being dispatched.
+That queue used to be unbounded: when the hub fell behind, the #504 cloud run measured
+**2.55 million** queued commands at **2.60 GB** of RSS, and the node froze at its cgroup
+`MemoryHigh` (ADR 0082). It is bounded now, at the producer. A publish holds **credit**
+for `topic + payload + 800` bytes (the 800 is the measured per-command overhead) from the
+moment it is read until the hub has dispatched it. Two limits apply:
+
+| Knob | Default | Bounds |
+|---|---|---|
+| `MQTTD_HUB_INGRESS_BYTES` | 1/8 of `MQTTD_MEMORY_MAX_BYTES` when that is set, else **256 MiB** | the node: all publishes waiting for the hub together |
+| `MQTTD_CONN_INGRESS_BYTES` | **1 MiB** (clamped to the pool) | one connection, so one hot publisher cannot hold the whole pool |
+| `MQTTD_INGRESS_OVERLOAD` | `pause` | what a `QoS` 0 publish does with no credit (`QoS` 1/2 always pause) |
+
+A connection without credit **stops reading its socket** until credit frees, so the
+publisher waits in TCP and nothing is lost. It still receives deliveries and acks while
+paused. Keepalive is not enforced against it: it is silent because the broker stopped
+reading it. Acks, subscriptions, pings and everything else on the control path are never
+charged. `shed-qos0` trades that losslessness for liveness. It keeps reading, and drops a
+`QoS` 0 publish that finds no credit, counted as
+`publish_dropped{reason="hub-ingress"}`. Use it when publishers sit behind a short
+PINGREQ timeout, or when you would rather lose telemetry than slow its producers. A
+`QoS` 1 or 2 publish is never shed under either setting.
+
+The credit counts **queued** bytes, not RSS: the formula adds the whole pool, because a
+saturated hub holds that much in its queue. At a 2 GiB watermark the default is 256 MiB:
+about 265 000 waiting 200-byte publishes. Watch:
+
+- `mqttd_ingress_credit_bytes{state="in_use"}` against `{state="capacity"}`. In use near
+  capacity means the hub is the bottleneck and publishers are pausing.
+- `mqttd_ingress_paused_total` and `mqttd_ingress_paused_seconds` for how often publishers
+  pause and for how long. Sustained pauses mean the node needs fewer publishers or more hub.
 
 ## Disk: the formula
 

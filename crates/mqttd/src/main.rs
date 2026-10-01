@@ -392,6 +392,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Shared operator-state snapshots (ADR 0054): the hub flips brownout, the store
     // watcher fills sizes, /statusz reads both.
     let brownout_status = Arc::new(mqttd::health::BrownoutStatus::default());
+    // Ingress credit for client publishes (ADR 0082 T3), shared by every connection
+    // (which acquires it) and the hub (which releases it and exports its gauges).
+    let ingress = ingress_from_config(&config);
     let store_snapshot = Arc::new(mqttd::store_watch::StoreSnapshot::default());
     // Online backup + restore state (ADR 0062), shared with /statusz and /readyz.
     let backup_status = Arc::new(mqttd::backup::BackupStatus::default());
@@ -538,8 +541,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         });
     }
-    let (hub_tx, store, retained_store, durable_plane, lease_driver) =
-        start_hub(&config, &node_id, &placement, &metrics, &brownout_status).await?;
+    let (hub_tx, store, retained_store, durable_plane, lease_driver) = start_hub(
+        &config,
+        &node_id,
+        &placement,
+        &metrics,
+        &brownout_status,
+        &ingress,
+    )
+    .await?;
 
     // ADR 0076 T1: the broker measures its OWN volume once, shortly after
     // start (never contending with recovery), and publishes the result — the
@@ -723,6 +733,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         store.clone(),
         shutdown.clone(),
         metrics.clone(),
+        ingress.clone(),
     )?;
     let audit_for_shutdown = policy.audit.clone();
     let audit_for_admin = policy.audit.clone();
@@ -1475,6 +1486,7 @@ fn client_policy(
     store: Arc<dyn SessionStore>,
     shutdown: tokio_util::sync::CancellationToken,
     metrics: Arc<mqtt_observability::metrics::Metrics>,
+    ingress: Arc<mqttd::ingress::IngressCredit>,
 ) -> Result<(Arc<conn::ConnPolicy>, reload::Reloader), Box<dyn std::error::Error>> {
     // ADR 0066 T3: with an export endpoint configured, every audit record —
     // genesis and the closing shutdown record included — also ships to the SIEM
@@ -1547,6 +1559,7 @@ fn client_policy(
         enhanced: None,
         shutdown: Some(shutdown),
         metrics: Some(metrics),
+        ingress: Some(ingress),
     });
     Ok((policy, reloader))
 }
@@ -1966,6 +1979,7 @@ async fn start_hub(
     placement: &Arc<RwLock<Placement>>,
     metrics: &Arc<mqtt_observability::metrics::Metrics>,
     brownout_status: &Arc<mqttd::health::BrownoutStatus>,
+    ingress: &Arc<mqttd::ingress::IngressCredit>,
 ) -> Result<HubHandle, Box<dyn std::error::Error>> {
     // Claim the data directory for this node (ADR 0018 phase 5): refuse to open another
     // node's persistent state, before any store touches disk.
@@ -2147,7 +2161,7 @@ async fn start_hub(
             hub.attach_retained_store(retained.clone());
             retained_handle = Some(retained);
         }
-        wire_hub(&mut hub, config, metrics, brownout_status)?;
+        wire_hub(&mut hub, config, metrics, brownout_status, ingress)?;
         tokio::spawn(hub.run());
         Ok((
             hub_tx,
@@ -2184,7 +2198,7 @@ async fn start_hub(
         // because this arm returns the retained handle for the backup exporter (#249).
         let retained = persistent_retained(&dir)?; // ADR 0018 phase 4
         hub.attach_retained_store(retained.clone());
-        wire_hub(&mut hub, config, metrics, brownout_status)?;
+        wire_hub(&mut hub, config, metrics, brownout_status, ingress)?;
         tokio::spawn(hub.run());
         Ok((hub_tx, store, Some(retained), None, None))
     } else {
@@ -2199,7 +2213,7 @@ async fn start_hub(
         if cluster_configured {
             hub.set_cluster_configured();
         }
-        wire_hub(&mut hub, config, metrics, brownout_status)?;
+        wire_hub(&mut hub, config, metrics, brownout_status, ingress)?;
         tokio::spawn(hub.run());
         Ok((hub_tx, store, None, None, None))
     }
@@ -2878,6 +2892,25 @@ fn subscriber_limits_from_config(
     Ok(limits)
 }
 
+/// The node's ingress credit from config (ADR 0082 T3): the pool (explicit, else 1/8 of
+/// the memory watermark, else 256 MiB), the per-connection cap and the overload mode.
+fn ingress_from_config(config: &Config) -> Arc<mqttd::ingress::IngressCredit> {
+    use mqttd::ingress::{IngressCredit, OverloadMode, DEFAULT_CONN_BYTES};
+    let limits = &config.limits;
+    let pool = IngressCredit::pool_from_config(limits.hub_ingress_bytes, limits.memory_max_bytes);
+    let conn = limits.conn_ingress_bytes.map_or(DEFAULT_CONN_BYTES, |b| {
+        usize::try_from(b).unwrap_or(usize::MAX)
+    });
+    let mode = OverloadMode::from_config(limits.ingress_overload.as_deref());
+    info!(
+        pool_bytes = pool,
+        conn_bytes = conn,
+        mode = ?mode,
+        "ingress credit (ADR 0082 T3): client publishes wait at the socket past these bounds"
+    );
+    Arc::new(IngressCredit::new(pool, conn, mode))
+}
+
 /// Everything every hub-construction arm must do before [`hub::Hub::run`] (issue #241).
 ///
 /// It exists because there are three arms (durable / persistent single-node / in-memory)
@@ -2889,8 +2922,10 @@ fn wire_hub(
     config: &Config,
     metrics: &Arc<mqtt_observability::metrics::Metrics>,
     brownout_status: &Arc<mqttd::health::BrownoutStatus>,
+    ingress: &Arc<mqttd::ingress::IngressCredit>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     hub.attach_metrics(metrics.clone());
+    hub.attach_ingress(ingress.clone());
     hub.attach_brownout_status(brownout_status.clone());
     hub.set_subscriber_limits(subscriber_limits_from_config(config)?);
     // ADR 0072: per-message durability tiers, only under the operator's opt-in.

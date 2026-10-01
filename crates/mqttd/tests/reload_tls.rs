@@ -160,6 +160,7 @@ async fn start_reloadable_tls_node(cert: PathBuf, key: PathBuf) -> (SocketAddr, 
                         shutdown: None,
                         metrics: None,
                         enhanced: None,
+                        ingress: None,
                     });
                     mqttd::conn::handle_stream(tls, Some(peer), None, policy, hub).await;
                 }

@@ -58,6 +58,7 @@ async fn start_acl_node(policy_toml: &str) -> (SocketAddr, mpsc::UnboundedSender
                 shutdown: None,
                 metrics: None,
                 enhanced: None,
+                ingress: None,
             });
             let hub = hub_tx.clone();
             tokio::spawn(async move {

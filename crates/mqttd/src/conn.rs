@@ -288,6 +288,9 @@ pub struct ConnPolicy {
     /// Prometheus metrics (ADR 0020), when enabled: the connection lifecycle updates the
     /// active-connections gauge and the per-protocol total. `None` in tests.
     pub metrics: Option<Arc<mqtt_observability::metrics::Metrics>>,
+    /// The node's ingress credit for client publishes (ADR 0082 T3). `None` disables
+    /// it (tests that do not exercise it).
+    pub ingress: Option<Arc<crate::ingress::IngressCredit>>,
 }
 
 /// Default [`ConnPolicy::connect_timeout`]: generous for a real handshake on a slow
@@ -364,6 +367,7 @@ pub async fn handle(stream: TcpStream, hub: mpsc::UnboundedSender<HubCommand>) {
         enhanced: None,
         shutdown: None,
         metrics: None,
+        ingress: None,
     });
     handle_stream(stream, peer, None, policy, hub).await;
 }
@@ -1827,13 +1831,21 @@ where
     let mut pending_pubacks: std::collections::VecDeque<PendingPuback> =
         std::collections::VecDeque::new();
     let mut current: Option<PendingPuback> = None;
+    // Ingress credit (ADR 0082 T3): this connection's cap over the node pool. A
+    // publish that finds none is parked with the socket unread, so the publisher backs
+    // up in TCP, while acks, deliveries and shutdown keep flowing below.
+    let credit = policy
+        .ingress
+        .as_ref()
+        .map(crate::ingress::IngressCredit::connection);
+    let mut parked: Option<Parked> = None;
 
     loop {
         if current.is_none() {
             current = pending_pubacks.pop_front();
         }
         tokio::select! {
-            inbound = reader.next_packet() => {
+            inbound = reader.next_packet(), if parked.is_none() => {
                 // Any client packet resets the keepalive deadline.
                 deadline = grace.map(|g| Instant::now() + g);
                 // A DECODE failure is told to the client before the close, so an operator
@@ -1877,6 +1889,22 @@ where
                         if let (Some(limiter), Packet::Publish(_)) = (&mut publish_rate, &packet) {
                             limiter.acquire().await;
                         }
+                        // Ingress credit (ADR 0082 T3), after the rate limit so a
+                        // throttled publish holds no credit while it waits for a token.
+                        let admission = match (&credit, &packet) {
+                            (Some(credit), Packet::Publish(publish)) => admit(credit, publish),
+                            _ => Ok(IngressAdmit::Credit(None)),
+                        };
+                        let admission = match admission {
+                            Ok(admission) => admission,
+                            Err(wait) => {
+                                if let Some(m) = &policy.metrics {
+                                    m.ingress_paused();
+                                }
+                                parked = Some(Parked { packet, wait, since: Instant::now() });
+                                continue;
+                            }
+                        };
                         // Only a client DISCONNECT with reason 0x00 is graceful. A
                         // broker-initiated close — protocol violation, hub gone, or
                         // a refusal v3.1.1 can only say by hanging up — is
@@ -1884,13 +1912,30 @@ where
                         // [MQTT-3.14.4-3]); so is a v5 DISCONNECT with a non-zero
                         // reason, where the CLIENT asks for its Will (issue #265,
                         // [MQTT-3.1.2-10]).
-                        match handle_inbound(packet, writer, hub, client, &principal, policy, &mut qos2_inbound, &mut qos2_inflight, &mut pending_pubacks, &mut current, is_v5, inbound_aliases, session_expiry, session_expiry_override).await? {
+                        match handle_inbound(packet, writer, hub, client, &principal, policy, &mut qos2_inbound, &mut qos2_inflight, &mut pending_pubacks, &mut current, is_v5, inbound_aliases, session_expiry, session_expiry_override, admission).await? {
                             PacketOutcome::Continue => {}
                             PacketOutcome::ClientDisconnect => return Ok(true),
                             PacketOutcome::ClientDisconnectWithWill
                             | PacketOutcome::BrokerClose => return Ok(false),
                         }
                     }
+                }
+            }
+            permit = async {
+                parked.as_mut().expect("branch guarded on is_some").wait.as_mut().await
+            }, if parked.is_some() => {
+                let Parked { packet, since, .. } = parked.take().expect("guarded");
+                if let Some(m) = &policy.metrics {
+                    m.observe_ingress_paused(since.elapsed().as_secs_f64());
+                }
+                // The broker paused this client, not the client going quiet: the
+                // keepalive restarts from the moment reading resumes.
+                deadline = grace.map(|g| Instant::now() + g);
+                match handle_inbound(packet, writer, hub, client, &principal, policy, &mut qos2_inbound, &mut qos2_inflight, &mut pending_pubacks, &mut current, is_v5, inbound_aliases, session_expiry, session_expiry_override, IngressAdmit::Credit(Some(permit))).await? {
+                    PacketOutcome::Continue => {}
+                    PacketOutcome::ClientDisconnect => return Ok(true),
+                    PacketOutcome::ClientDisconnectWithWill
+                    | PacketOutcome::BrokerClose => return Ok(false),
                 }
             }
             outcome = async {
@@ -1976,7 +2021,9 @@ where
                 }
                 writer.flush_queued().await?;
             }
-            () = &mut idle, if deadline.is_some() => {
+            // Not while parked (ADR 0082 T3): a client the broker stopped reading cannot
+            // be blamed for its silence. Resuming resets the deadline.
+            () = &mut idle, if deadline.is_some() && parked.is_none() => {
                 // The timer fired at the deadline it was armed with; packets since
                 // then only moved `deadline`. Re-arm to the current one while it is
                 // still ahead — otherwise the client really has gone quiet.
@@ -2007,6 +2054,34 @@ where
     }
 }
 
+/// A client publish waiting for ingress credit, with the socket unread (ADR 0082 T3).
+struct Parked {
+    packet: Packet,
+    wait: futures_util::future::BoxFuture<'static, crate::ingress::IngressPermit>,
+    since: Instant,
+}
+
+/// Admit a client publish against the connection's ingress credit (ADR 0082 T3): the
+/// credit now, a shed `QoS` 0 under `shed-qos0`, or — `Err` — the wait for it. `QoS` 1
+/// and 2 always wait: a publish the broker will acknowledge is never shed.
+fn admit(
+    credit: &crate::ingress::ConnCredit,
+    publish: &Publish,
+) -> Result<IngressAdmit, futures_util::future::BoxFuture<'static, crate::ingress::IngressPermit>> {
+    let cost = credit
+        .node()
+        .cost(publish.topic.len(), publish.payload.len());
+    if let Some(permit) = credit.try_acquire(cost) {
+        return Ok(IngressAdmit::Credit(Some(permit)));
+    }
+    if publish.qos == QoS::AtMostOnce
+        && credit.node().mode() == crate::ingress::OverloadMode::ShedQos0
+    {
+        return Ok(IngressAdmit::Shed);
+    }
+    Err(Box::pin(credit.clone().acquire(cost)))
+}
+
 /// Resolve to ready once the policy's shutdown token is cancelled; pends forever when no
 /// token is set (so the `select!` arm is a no-op outside graceful shutdown).
 async fn drain_signal(policy: &ConnPolicy) {
@@ -2014,6 +2089,18 @@ async fn drain_signal(policy: &ConnPolicy) {
         Some(token) => token.cancelled().await,
         None => std::future::pending().await,
     }
+}
+
+/// The ingress credit a client PUBLISH is admitted with (ADR 0082 T3).
+enum IngressAdmit {
+    /// Forward it holding this credit, which the hub releases by dropping the command.
+    /// `None` when the connection has no credit pool.
+    Credit(Option<crate::ingress::IngressPermit>),
+    /// A `QoS` 0 publish that found no credit under `shed-qos0`. Everything up to the
+    /// forward still happens — alias registration, topic validation, the ACL — so the
+    /// connection's state is exactly as if it had been delivered; then it is dropped and
+    /// counted as `publish_dropped{reason="hub-ingress"}`.
+    Shed,
 }
 
 /// Handle one inbound PUBLISH: topic validation, ACL gate, inbound `QoS`
@@ -2039,6 +2126,7 @@ async fn handle_publish<W: AsyncWrite + Unpin>(
     current_puback: &mut Option<PendingPuback>,
     is_v5: bool,
     inbound_aliases: &mut InboundAliases,
+    admission: IngressAdmit,
 ) -> Result<PacketOutcome, NetError> {
     // The MQTT 5.0 Message Expiry Interval (if the publisher set one) bounds how long
     // a queued copy is deliverable (ADR 0009 §3).
@@ -2138,6 +2226,17 @@ async fn handle_publish<W: AsyncWrite + Unpin>(
     let forward = |hub: &mpsc::UnboundedSender<HubCommand>|
      -> Option<oneshot::Receiver<crate::hub::PublishOutcome>> {
         if authorized {
+            let credit = match admission {
+                IngressAdmit::Credit(credit) => credit,
+                // Only ever `QoS` 0, which has nothing to answer: the alias is
+                // registered and the topic checked above, the message goes no further.
+                IngressAdmit::Shed => {
+                    if let Some(m) = &policy.metrics {
+                        m.publish_dropped("hub-ingress");
+                    }
+                    return None;
+                }
+            };
             let (done, rx) = if gated {
                 let (tx, rx) = oneshot::channel();
                 (Some(tx), Some(rx))
@@ -2154,6 +2253,7 @@ async fn handle_publish<W: AsyncWrite + Unpin>(
                 done,
                 v5: is_v5,
                 publisher: Some(client.clone()), // #198: No Local excludes this publisher
+                credit,
             });
             rx
         } else {
@@ -2484,6 +2584,8 @@ async fn handle_inbound<W: AsyncWrite + Unpin>(
     // Set when a DISCONNECT overrides that interval; read by the caller when it
     // sends the `Detach`.
     session_expiry_override: &mut Option<u32>,
+    // The ingress credit a PUBLISH carries (ADR 0082 T3); ignored for anything else.
+    admission: IngressAdmit,
 ) -> Result<PacketOutcome, NetError> {
     match packet {
         Packet::Publish(publish) => {
@@ -2503,6 +2605,7 @@ async fn handle_inbound<W: AsyncWrite + Unpin>(
                 current_puback,
                 is_v5,
                 inbound_aliases,
+                admission,
             )
             .await?
             {
@@ -2836,6 +2939,7 @@ mod tests {
             enhanced: None,
             shutdown: None,
             metrics: None,
+            ingress: None,
         })
     }
 
@@ -2871,6 +2975,7 @@ mod tests {
             enhanced: None,
             shutdown: None,
             metrics: None,
+            ingress: None,
         });
         tokio::spawn(handle_stream(server, None, None, policy, hub_tx));
         let (rh, wh) = tokio::io::split(client);
@@ -3076,6 +3181,7 @@ mod tests {
             enhanced: None,
             shutdown: Some(shutdown),
             metrics: None,
+            ingress: None,
         });
         tokio::spawn(handle_stream(server, None, None, policy, hub_tx));
         let (rh, wh) = tokio::io::split(client);
@@ -3191,6 +3297,7 @@ mod tests {
             enhanced: None,
             shutdown: None,
             metrics: Some(metrics.clone()),
+            ingress: None,
         });
         let conn = tokio::spawn(handle_stream(server, None, None, policy, hub_tx));
         let (rh, wh) = tokio::io::split(client);
@@ -3245,6 +3352,7 @@ mod tests {
             enhanced: None,
             shutdown: None,
             metrics: Some(metrics.clone()),
+            ingress: None,
         });
         let conn = tokio::spawn(handle_stream(server, None, None, policy, hub_tx));
         let (rh, wh) = tokio::io::split(client);
@@ -3347,6 +3455,7 @@ mod tests {
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             shutdown: None,
             metrics: None,
+            ingress: None,
         });
         tokio::spawn(handle_stream(server, None, None, policy, hub_tx));
         let (rh, wh) = tokio::io::split(client);
@@ -3573,6 +3682,7 @@ mod tests {
             enhanced: None,
             shutdown: None,
             metrics: None,
+            ingress: None,
         });
         let conn = tokio::spawn(handle_stream(server, None, None, policy, hub_tx));
 
@@ -3708,6 +3818,7 @@ mod tests {
             enhanced: None,
             shutdown: None,
             metrics: None,
+            ingress: None,
         });
 
         let (client, owner_side) = tokio::io::duplex(4096);
@@ -3780,6 +3891,7 @@ mod tests {
                 enhanced: None,
                 shutdown: None,
                 metrics: None,
+                ingress: None,
             });
             let (client, owner_side) = tokio::io::duplex(4096);
             let (owner_read, owner_write) = tokio::io::split(owner_side);
@@ -4418,6 +4530,7 @@ mod tests {
             enhanced: None,
             shutdown: None,
             metrics: None,
+            ingress: None,
         });
         tokio::spawn(handle_stream(server, None, None, policy, hub_tx));
         let (rh, wh) = tokio::io::split(client);
@@ -4705,6 +4818,7 @@ mod tests {
             enhanced: None,
             shutdown: None,
             metrics: None,
+            ingress: None,
         });
         tokio::spawn(handle_stream(server, None, None, policy, hub_tx));
         let (rh, wh) = tokio::io::split(client);
@@ -5554,4 +5668,6 @@ mod tests {
             );
         }
     }
+
+    mod ingress_credit;
 }

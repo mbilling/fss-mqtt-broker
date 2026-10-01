@@ -112,6 +112,7 @@ impl Rig {
                 done: Some(done),
                 v5: true,
                 publisher: None,
+                credit: None,
             })
             .unwrap();
         wait

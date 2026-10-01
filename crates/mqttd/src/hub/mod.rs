@@ -1206,6 +1206,10 @@ pub enum HubCommand {
         /// **No Local** subscriptions. `None` for internally-generated publishes (a Will, a
         /// peer-forwarded message) — those have no local publisher to exclude.
         publisher: Option<ClientId>,
+        /// The ingress credit this publish holds while it waits (ADR 0082 T3), returned
+        /// when the command is dropped after dispatch. `None` for anything not read from
+        /// a client socket under a credit pool.
+        credit: Option<crate::ingress::IngressPermit>,
     },
     /// Write one **restored** retained value as retained state (ADR 0062, issue #249):
     /// commit it through the topic's group lease-owner and warm the caches, with **no
@@ -2359,6 +2363,9 @@ pub struct Hub {
     forward_windows: HashMap<NodeId, forwarding::ForwardWindow>,
     /// Prometheus metrics (ADR 0020), when enabled. Updated on the publish/deliver paths.
     metrics: Option<Arc<mqtt_observability::metrics::Metrics>>,
+    /// The node's ingress credit (ADR 0082 T3), held only to export its gauges: the hub
+    /// never acquires credit, it releases it by dropping dispatched publishes.
+    ingress: Option<Arc<crate::ingress::IngressCredit>>,
     /// Shared brownout state for the `/statusz` body (ADR 0054), flipped alongside
     /// the internal flag on [`HubCommand::SetBrownout`] transitions.
     brownout_status: Option<Arc<crate::health::BrownoutStatus>>,
@@ -2586,6 +2593,7 @@ impl Hub {
                 mesh: mesh::MeshCache::default(),
                 placement,
                 metrics: None,
+                ingress: None,
                 clock: crate::clock::system_clock(),
                 subscriber_limits: SubscriberLimits::default(),
                 #[cfg(test)]
@@ -2745,6 +2753,12 @@ impl Hub {
     /// publish/deliver/drop counts (ADR 0020).
     pub fn attach_metrics(&mut self, metrics: Arc<mqtt_observability::metrics::Metrics>) {
         self.metrics = Some(metrics);
+    }
+
+    /// Attach the node's ingress credit before [`run`](Self::run) (ADR 0082 T3) so the
+    /// sweep exports `ingress_credit_bytes`. Connections acquire it; the hub only reports it.
+    pub fn attach_ingress(&mut self, ingress: Arc<crate::ingress::IngressCredit>) {
+        self.ingress = Some(ingress);
     }
 
     /// Set the per-subscriber in-memory bounds before [`run`](Self::run) (issue #241).
@@ -2975,6 +2989,9 @@ impl Hub {
                 done,
                 v5,
                 publisher,
+                // Held to the end of this dispatch, then dropped: the publish's
+                // ingress credit returns to its connection and the pool (ADR 0082 T3).
+                credit: _credit,
             } => {
                 if let Some(m) = &self.metrics {
                     m.publish_received(qos_num(qos));
@@ -6572,6 +6589,9 @@ impl Hub {
         // and counted in the total only.
         m.set_hub_lane_depth("control", self.control_q.len());
         m.set_hub_lane_depth("data", self.data_q.len());
+        if let Some(credit) = &self.ingress {
+            m.set_ingress_credit(credit.in_use(), credit.pool_bytes());
+        }
     }
 
     /// Persist the current subscription set for a client if its session is durable.
@@ -8092,6 +8112,7 @@ mod tests {
             done: None,
             v5: false,
             publisher: None,
+            credit: None,
         })
         .unwrap();
     }
@@ -8239,6 +8260,7 @@ mod tests {
             done: None,
             v5: false,
             publisher: None,
+            credit: None,
         })
         .unwrap();
     }
@@ -8254,6 +8276,7 @@ mod tests {
             done: None,
             v5: false,
             publisher: None,
+            credit: None,
         })
         .unwrap();
     }
@@ -9105,6 +9128,7 @@ mod tests {
             done: None,
             v5: false,
             publisher: None,
+            credit: None,
         })
         .unwrap();
         match recv_peer_data(&mut peer).await {
@@ -10597,6 +10621,7 @@ mod tests {
             done: Some(done_tx),
             v5: false,
             publisher: None,
+            credit: None,
         })
         .unwrap();
         assert!(
@@ -10632,6 +10657,7 @@ mod tests {
             done: Some(done_tx),
             v5: false,
             publisher: None,
+            credit: None,
         })
         .unwrap();
         assert!(
@@ -10668,6 +10694,7 @@ mod tests {
             done: Some(ok_tx),
             v5: false,
             publisher: None,
+            credit: None,
         })
         .unwrap();
         assert!(
@@ -10688,6 +10715,7 @@ mod tests {
             done: Some(fail_tx),
             v5: false,
             publisher: None,
+            credit: None,
         })
         .unwrap();
         assert!(
@@ -10738,6 +10766,7 @@ mod tests {
             done: None,
             v5: true,
             publisher: Some(ClientId("pub-nl".into())),
+            credit: None,
         })
         .unwrap();
 
@@ -10795,6 +10824,7 @@ mod tests {
             done: None,
             v5: true,
             publisher: Some(ClientId("someone-else".into())),
+            credit: None,
         })
         .unwrap();
 
@@ -10835,6 +10865,7 @@ mod tests {
             done: None,
             v5: true,
             publisher: None,
+            credit: None,
         })
         .unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -10905,6 +10936,7 @@ mod tests {
             done: None,
             v5: true,
             publisher: Some(ClientId("someone-else".into())),
+            credit: None,
         })
         .unwrap();
         match recv_packet(&mut rx).await {
@@ -10942,6 +10974,7 @@ mod tests {
             done: None,
             v5: true,
             publisher: Some(ClientId("pub-plain".into())),
+            credit: None,
         })
         .unwrap();
         assert!(
@@ -10970,6 +11003,7 @@ mod tests {
             done: Some(done_tx),
             v5: false,
             publisher: None,
+            credit: None,
         })
         .unwrap();
         assert!(
@@ -11136,6 +11170,7 @@ mod tests {
                 done: Some(done_tx),
                 v5: true,
                 publisher: None,
+                credit: None,
             })
             .unwrap();
             done_rx
@@ -11242,6 +11277,7 @@ mod tests {
             done: Some(done_tx),
             v5,
             publisher: None,
+            credit: None,
         })
         .unwrap();
         done_rx
@@ -11489,6 +11525,7 @@ mod tests {
                 done: Some(done_tx),
                 v5: true,
                 publisher: None,
+                credit: None,
             })
             .unwrap();
             done_rx
@@ -12178,6 +12215,7 @@ mod tests {
             done: None,
             v5: false,
             publisher: None,
+            credit: None,
         })
         .unwrap();
     }
@@ -12964,6 +13002,7 @@ mod tests {
             done: None,
             v5: false,
             publisher: None,
+            credit: None,
         })
         .unwrap();
     }
@@ -13004,6 +13043,7 @@ mod tests {
             done: None,
             v5: false,
             publisher: None,
+            credit: None,
         })
         .unwrap();
     }
@@ -13250,6 +13290,7 @@ mod tests {
             done: None,
             v5: false,
             publisher: None,
+            credit: None,
         })
         .unwrap();
 
@@ -13901,6 +13942,7 @@ mod tests {
             done: None,
             v5: false,
             publisher: None,
+            credit: None,
         })
         .unwrap();
         tx.send(HubCommand::Publish {
@@ -13913,6 +13955,7 @@ mod tests {
             done: None,
             v5: false,
             publisher: None,
+            credit: None,
         })
         .unwrap();
         // No local durable write for a foreign topic while queued.
@@ -13960,6 +14003,7 @@ mod tests {
             done: None,
             v5: false,
             publisher: None,
+            credit: None,
         })
         .unwrap();
         tx.send(HubCommand::Publish {
@@ -13972,6 +14016,7 @@ mod tests {
             done: None,
             v5: false,
             publisher: None,
+            credit: None,
         })
         .unwrap();
         // No local durable write for a foreign topic while queued.
@@ -14032,6 +14077,7 @@ mod tests {
                 done: None,
                 v5: false,
                 publisher: None,
+                credit: None,
             })
             .unwrap();
         }
@@ -15154,6 +15200,7 @@ mod tests {
                 done: None,
                 v5: false,
                 publisher: None,
+                credit: None,
             })
             .unwrap();
         }
@@ -15476,6 +15523,7 @@ mod tests {
             done: None,
             v5: false,
             publisher: None,
+            credit: None,
         })
         .unwrap();
     }
@@ -15922,6 +15970,7 @@ mod tests {
                 done: Some(done_tx),
                 v5: false,
                 publisher: None,
+                credit: None,
             })
             .unwrap();
             // Anything else — withheld (Err), held past the bound, or a
@@ -18184,6 +18233,7 @@ mod tests {
             done: Some(done_tx),
             v5: true,
             publisher: None,
+            credit: None,
         })
         .unwrap();
 
@@ -18250,6 +18300,7 @@ mod tests {
                 done: None,
                 v5: true,
                 publisher: None,
+                credit: None,
             })
             .unwrap();
         }
@@ -18268,6 +18319,7 @@ mod tests {
             done: Some(done_tx),
             v5: true,
             publisher: None,
+            credit: None,
         })
         .unwrap();
 
@@ -18406,6 +18458,7 @@ mod tests {
                 done: None,
                 v5: true,
                 publisher: None,
+                credit: None,
             })
             .unwrap();
         }
@@ -18490,6 +18543,7 @@ mod tests {
             done: Some(done_tx),
             v5: true,
             publisher: None,
+            credit: None,
         })
         .unwrap();
 
@@ -19205,6 +19259,7 @@ mod tests {
                 done: Some(done_tx),
                 v5: true,
                 publisher: None,
+                credit: None,
             })
             .unwrap();
             dones.push(done_rx);

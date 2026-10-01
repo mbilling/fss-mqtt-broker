@@ -53,6 +53,7 @@ async fn start_broker(identity: Option<Identity>, auth: Arc<dyn Authenticator>) 
                 shutdown: None,
                 metrics: None,
                 enhanced: None,
+                ingress: None,
             });
             tokio::spawn(mqttd::conn::handle_stream(
                 stream,

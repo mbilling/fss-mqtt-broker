@@ -849,6 +849,22 @@ pub struct Limits {
     /// over minutes degrades to read-mostly with a metric and a log line, instead of
     /// arriving as an OOM kill.
     pub memory_max_bytes: Option<u64>,
+    /// Bytes of client publishes that may wait for the hub at once, node-wide
+    /// (`MQTTD_HUB_INGRESS_BYTES`, ADR 0082 T3). Each publish holds credit for its topic,
+    /// payload and a fixed per-command overhead from the moment it is read until the hub
+    /// has dispatched it. Unset = 1/8 of [`Limits::memory_max_bytes`] when that is set,
+    /// otherwise 256 MiB. At least 4096. Restart-scoped.
+    pub hub_ingress_bytes: Option<u64>,
+    /// The most of [`Limits::hub_ingress_bytes`] one connection may hold
+    /// (`MQTTD_CONN_INGRESS_BYTES`, ADR 0082 T3), so one hot publisher cannot take the
+    /// whole pool. Default 1 MiB; at least 4096; clamped to the pool. Restart-scoped.
+    pub conn_ingress_bytes: Option<u64>,
+    /// What a client connection does with a `QoS` 0 publish when it has no ingress
+    /// credit (`MQTTD_INGRESS_OVERLOAD`, ADR 0082 §2a): `pause` (default) stops reading
+    /// its socket until credit frees, so TCP pushes back and nothing is lost;
+    /// `shed-qos0` keeps reading and drops it, counted as
+    /// `publish_dropped{reason="hub-ingress"}`. `QoS` 1 and 2 always pause. Restart-scoped.
+    pub ingress_overload: Option<String>,
     /// How often BOTH watermark watchers sample their axis, seconds
     /// (`MQTTD_WATERMARK_POLL`, ADR 0041 T14). Default 10; a value outside `1..=300`
     /// is a startup error.
@@ -886,6 +902,9 @@ impl Default for Limits {
             topic_alias_max: None,
             queue_overflow: None,
             memory_max_bytes: None,
+            hub_ingress_bytes: None,
+            conn_ingress_bytes: None,
+            ingress_overload: None,
             watermark_poll_secs: 10,
         }
     }
@@ -1504,6 +1523,15 @@ impl Config {
         on!("MQTTD_MEMORY_MAX_BYTES", v, {
             self.limits.memory_max_bytes = Some(num("MQTTD_MEMORY_MAX_BYTES", &v)?);
         });
+        on!("MQTTD_HUB_INGRESS_BYTES", v, {
+            self.limits.hub_ingress_bytes = Some(num("MQTTD_HUB_INGRESS_BYTES", &v)?);
+        });
+        on!("MQTTD_CONN_INGRESS_BYTES", v, {
+            self.limits.conn_ingress_bytes = Some(num("MQTTD_CONN_INGRESS_BYTES", &v)?);
+        });
+        on!("MQTTD_INGRESS_OVERLOAD", v, {
+            self.limits.ingress_overload = Some(v);
+        });
         on!("MQTTD_WATERMARK_POLL", v, {
             self.limits.watermark_poll_secs = num("MQTTD_WATERMARK_POLL", &v)?;
         });
@@ -1822,6 +1850,13 @@ impl Config {
         // gates are covered by construction, with no separate startup-only check.
         self.refuse_out_of_range_subscriber_bounds()
             .map_err(ConfigError::Invalid)?;
+        if let Some(m) = &self.limits.ingress_overload {
+            if m != "pause" && m != "shed-qos0" {
+                return Err(ConfigError::Invalid(format!(
+                    "limits.ingress_overload must be \"pause\" or \"shed-qos0\", got {m:?}"
+                )));
+            }
+        }
         if let Some(p) = &self.limits.queue_overflow {
             if p != "drop-oldest" && p != "reject-newest" {
                 return Err(ConfigError::Invalid(format!(
@@ -1903,6 +1938,8 @@ impl Config {
         for (field, v) in [
             ("max_backlog_bytes", self.limits.max_backlog_bytes),
             ("max_outbound_bytes", self.limits.max_outbound_bytes),
+            ("hub_ingress_bytes", self.limits.hub_ingress_bytes),
+            ("conn_ingress_bytes", self.limits.conn_ingress_bytes),
         ] {
             if let Some(n) = v {
                 if n < 4096 {
@@ -2133,6 +2170,9 @@ pub const ENV_VARS: &[&str] = &[
     "MQTTD_TOPIC_ALIAS_MAX",
     "MQTTD_QUEUE_OVERFLOW",
     "MQTTD_MEMORY_MAX_BYTES",
+    "MQTTD_HUB_INGRESS_BYTES",
+    "MQTTD_CONN_INGRESS_BYTES",
+    "MQTTD_INGRESS_OVERLOAD",
     "MQTTD_WATERMARK_POLL",
     "MQTTD_HTTP_AUTH_URL",
     "MQTTD_HTTP_AUTH_TIMEOUT",
@@ -2900,6 +2940,7 @@ mod tests {
             // Enums: any valid, non-default (default None) member.
             "MQTTD_SWIM_SIGNED" | "MQTTD_SWIM_REPLAY" => "require",
             "MQTTD_QUEUE_OVERFLOW" => "reject-newest",
+            "MQTTD_INGRESS_OVERLOAD" => "shed-qos0",
             "MQTTD_MTLS_IDENTITY_SOURCE" => "san-dns",
             // Default is "members" (ADR 0073), so only the escape hatch *changes* it.
             "MQTTD_OWNERSHIP_DOMAIN" => "voters",
@@ -2909,7 +2950,10 @@ mod tests {
             "MQTTD_MIN_REPLICAS" => "2",
             // Byte caps are refused below 4096 (a value under one message is a
             // configuration mistake, not a tight budget), so "7" would not validate.
-            "MQTTD_MAX_BACKLOG_BYTES" | "MQTTD_MAX_OUTBOUND_BYTES" => "8192",
+            "MQTTD_MAX_BACKLOG_BYTES"
+            | "MQTTD_MAX_OUTBOUND_BYTES"
+            | "MQTTD_HUB_INGRESS_BYTES"
+            | "MQTTD_CONN_INGRESS_BYTES" => "8192",
             // The node=domain map needs a well-formed entry.
             "MQTTD_FAILURE_DOMAINS" => "n1=rack-a",
             // Numerics (all widths parse "7").
@@ -3091,7 +3135,9 @@ mod tests {
             // plus the five MQTTD_<LISTENER>_ALLOW_ANONYMOUS overrides (issue #669),
             // plus MQTTD_REPLICAS (ADR 0080),
             // plus the seven MQTTD_ADMIN_* variables (ADR 0081).
-            109,
+            // plus MQTTD_HUB_INGRESS_BYTES, MQTTD_CONN_INGRESS_BYTES and
+            // MQTTD_INGRESS_OVERLOAD (ADR 0082 T3).
+            112,
             "the MQTTD_* surface changed — update ENV_VARS"
         );
         // Issue #239: MQTTD_MIN_REPLICAS was wired in `overlay_from` but never

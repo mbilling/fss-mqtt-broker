@@ -76,6 +76,7 @@ impl Rig {
                 done: None,
                 publisher: None,
                 v5: false,
+                credit: None,
             })
             .unwrap();
     }

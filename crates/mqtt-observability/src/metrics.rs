@@ -154,6 +154,9 @@ struct OtelInstruments {
     hub_fanout_peer_visits: OtelCounter<u64>,
     hub_queue_depth: OtelGauge<i64>,
     hub_lane_depth: OtelGauge<i64>,
+    ingress_paused: OtelCounter<u64>,
+    ingress_paused_seconds: OtelHistogram<f64>,
+    ingress_credit_bytes: OtelGauge<i64>,
     routing_unsettled: OtelGauge<i64>,
     pending_publishes_awaiting_settle: OtelGauge<i64>,
     shared_selected: OtelCounter<u64>,
@@ -238,6 +241,9 @@ impl OtelInstruments {
             hub_fanout_peer_visits: meter.u64_counter("hub_fanout_peer_visits").build(),
             hub_queue_depth: meter.i64_gauge("hub_queue_depth").build(),
             hub_lane_depth: meter.i64_gauge("hub_lane_depth").build(),
+            ingress_paused: meter.u64_counter("ingress_paused").build(),
+            ingress_paused_seconds: meter.f64_histogram("ingress_paused_seconds").build(),
+            ingress_credit_bytes: meter.i64_gauge("ingress_credit_bytes").build(),
             routing_unsettled: meter.i64_gauge("routing_unsettled").build(),
             pending_publishes_awaiting_settle: meter
                 .i64_gauge("pending_publishes_awaiting_settle")
@@ -347,6 +353,13 @@ pub struct Metrics {
     hub_queue_depth: Gauge,
     /// ADR 0082 T2: the hub's queued commands by lane, `control` and `data`.
     hub_lane_depth: Family<LaneLabel, Gauge>,
+    /// ADR 0082 T3: client connections that stopped reading for want of ingress
+    /// credit, and for how long each pause lasted.
+    ingress_paused_total: Counter,
+    ingress_paused_seconds: Histogram,
+    /// ADR 0082 T3: the ingress credit pool, by `state` — `in_use` (held by queued
+    /// client publishes) and `capacity`.
+    ingress_credit_bytes: Family<StateLabel, Gauge>,
     /// Issue #613 item 2.5: one series per term of `routing_unsettled()`, all of
     /// them emitted every scrape so a disappearing series is never read as 0.
     routing_unsettled: Family<ReasonLabel, Gauge>,
@@ -618,6 +631,28 @@ impl Metrics {
              subscriptions, session lifecycle). A growing `data` lane with a near-zero \
              `control` lane is overload that consensus and health no longer wait \
              behind",
+        );
+        let ingress_paused_total = register_counter(
+            &mut registry,
+            "ingress_paused",
+            "Times a client connection stopped reading its socket because it had no \
+             ingress credit (ADR 0082 T3): the hub is behind and the bytes already \
+             queued for it hit the node pool or the connection's cap. The publisher \
+             waits in TCP, losslessly. QoS 0 shed instead under \
+             MQTTD_INGRESS_OVERLOAD=shed-qos0 is publish_dropped{reason=\"hub-ingress\"}",
+        );
+        let ingress_paused_seconds = register_latency_histogram(
+            &mut registry,
+            "ingress_paused_seconds",
+            "How long each ingress-credit pause lasted (ADR 0082 T3), from the publish \
+             that found no credit to the credit freeing",
+        );
+        let ingress_credit_bytes = register_gauge_family(
+            &mut registry,
+            "ingress_credit_bytes",
+            "The node's ingress credit pool (ADR 0082 T3), by state: `in_use` is the \
+             bytes held by client publishes read but not yet dispatched by the hub, \
+             `capacity` the pool. in_use near capacity means publishers are pausing",
         );
         let routing_unsettled = register_gauge_family(
             &mut registry,
@@ -1138,6 +1173,9 @@ impl Metrics {
             hub_fanout_peer_visits_total,
             hub_queue_depth,
             hub_lane_depth,
+            ingress_paused_total,
+            ingress_paused_seconds,
+            ingress_credit_bytes,
             routing_unsettled,
             pending_publishes_awaiting_settle,
             shared_selected_total,
@@ -1420,6 +1458,32 @@ impl Metrics {
         self.otel
             .hub_lane_depth
             .record(clamp_gauge(n), &[KeyValue::new("lane", lane.to_string())]);
+    }
+
+    /// A client connection paused for want of ingress credit (ADR 0082 T3).
+    pub fn ingress_paused(&self) {
+        self.ingress_paused_total.inc();
+        self.otel.ingress_paused.add(1, &[]);
+    }
+
+    /// An ingress-credit pause ended after `seconds` (ADR 0082 T3).
+    pub fn observe_ingress_paused(&self, seconds: f64) {
+        self.ingress_paused_seconds.observe(seconds);
+        self.otel.ingress_paused_seconds.record(seconds, &[]);
+    }
+
+    /// Set the ingress credit pool gauges (ADR 0082 T3): bytes in use and capacity.
+    pub fn set_ingress_credit(&self, in_use: usize, capacity: usize) {
+        for (state, n) in [("in_use", in_use), ("capacity", capacity)] {
+            self.ingress_credit_bytes
+                .get_or_create(&StateLabel {
+                    state: state.to_string(),
+                })
+                .set(clamp_gauge(n));
+            self.otel
+                .ingress_credit_bytes
+                .record(clamp_gauge(n), &[KeyValue::new("state", state.to_string())]);
+        }
     }
 
     /// Set one term of `routing_unsettled()` (issue #613 item 2.5). `reason` is a
