@@ -37,7 +37,7 @@ use std::time::{Duration, Instant};
 use mqtt_cluster::durable_node::build_durable_node_with;
 use mqtt_cluster::placement::{Placement, DEFAULT_REPLICAS};
 use mqtt_cluster::swim::{Config as SwimConfig, Swim};
-use mqtt_cluster::swim_auth::{SwimAuth, KEY_LEN};
+use mqtt_cluster::swim_auth::SwimAuth;
 use mqtt_cluster::{swim_driver, NodeId};
 use mqtt_core::{ClientId, Message, QoS};
 use mqtt_storage::SessionStore;
@@ -210,7 +210,9 @@ async fn start_durable_node_capped(
         swim_seeds,
     );
     let (event_tx, event_rx) = mpsc::unbounded_channel();
-    let auth = SwimAuth::new(&[0x5A; KEY_LEN]);
+    // This test's own key (#754), so a killed node's recycled port cannot merge
+    // another concurrently running test's cluster into this one.
+    let auth = SwimAuth::new(&common::this_tests_cluster_key());
     aborts.push(
         tokio::spawn(swim_driver::run(
             socket,

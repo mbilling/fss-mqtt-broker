@@ -1428,3 +1428,42 @@ pub fn replica_store() -> mqtt_cluster::cluster_log::StoreBackend {
             v.parse().expect("MQTTD_REPLICA_STORE must be redb or log")
         })
 }
+
+/// The SWIM gossip key for ONE test's in-process cluster, derived from `discriminator`
+/// (issue #754).
+///
+/// The tests of one binary run concurrently in one process on ephemeral loopback ports,
+/// and SWIM re-greets a dead seed's address every protocol period. With a single key
+/// shared by every test, a killed node's recycled port let another test's cluster answer
+/// that greeting, the two memberships merged, and two lease Rafts replicated into each
+/// other: openraft's `has_log_id` assertion fired on the receiving nodes (a later term at
+/// an index they had already committed), and the other test never founded. Production
+/// contains a foreign cluster with the cluster identity (ADR 0054); these harnesses run
+/// without one, so the key does it. Every node of one test's cluster must pass the same
+/// discriminator, and different tests different ones.
+#[must_use]
+pub fn cluster_key(discriminator: &str) -> [u8; mqtt_cluster::swim_auth::KEY_LEN] {
+    use std::hash::{Hash, Hasher};
+    let mut key = [0u8; mqtt_cluster::swim_auth::KEY_LEN];
+    for (i, chunk) in key.chunks_mut(8).enumerate() {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        (i, discriminator).hash(&mut h);
+        let bytes = h.finish().to_le_bytes();
+        chunk.copy_from_slice(&bytes[..chunk.len()]);
+    }
+    key
+}
+
+/// [`cluster_key`] for the test running on this thread: libtest names each test's
+/// thread after the test, and a `#[tokio::test]` body runs on it. Panics off that
+/// thread (a runtime worker, an unnamed thread), where every caller would silently share
+/// one key again.
+#[must_use]
+pub fn this_tests_cluster_key() -> [u8; mqtt_cluster::swim_auth::KEY_LEN] {
+    let thread = std::thread::current();
+    let name = thread
+        .name()
+        .filter(|n| *n != "main" && !n.starts_with("tokio-runtime"))
+        .expect("start cluster nodes from the test body, on the test's own thread (#754)");
+    cluster_key(name)
+}

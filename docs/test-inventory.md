@@ -1693,7 +1693,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 
 - `a_soak_under_sustained_load_shows_no_drift` — `#[ignore]`d
 
-## `crates/mqttd/tests/cluster_stress.rs` — 14 test(s)
+## `crates/mqttd/tests/cluster_stress.rs` — 15 test(s)
 
 - `a_browned_out_session_owner_refuses_the_publisher_rather_than_owing_a_lost_message`
 - `a_cross_node_shared_subscriber_is_never_bypassed_by_an_ack`
@@ -1701,6 +1701,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `a_fleet_scale_grow_and_shrink_soak_loses_no_acked_fact`
 - `a_full_cluster_stop_start_recovers_every_acked_fact`
 - `a_v5_publisher_on_a_healthy_node_is_told_0x97_when_the_session_owning_peer_refuses`
+- `another_tests_cluster_greeting_a_recycled_seed_address_is_not_admitted`
 - `cost_reduction_five_to_three_via_two_decommissions`
 - `growing_one_node_to_three_back_fills_and_survives_the_founder`
 - `growing_three_to_five_zone_spread_survives_losing_two_originals`
