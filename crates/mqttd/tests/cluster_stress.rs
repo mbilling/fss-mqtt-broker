@@ -117,7 +117,7 @@ use mqtt_cluster::invariants::{
 };
 use mqtt_cluster::placement::{Placement, DEFAULT_REPLICAS};
 use mqtt_cluster::swim::{Config as SwimConfig, Swim};
-use mqtt_cluster::swim_auth::{SwimAuth, KEY_LEN};
+use mqtt_cluster::swim_auth::SwimAuth;
 use mqtt_cluster::{swim_driver, NodeId};
 use mqtt_codec::{Packet, QoS};
 use mqttd::Hub;
@@ -432,7 +432,11 @@ async fn start_stress_node_full(
         swim_seeds,
     );
     let (event_tx, event_rx) = mpsc::unbounded_channel();
-    let auth = SwimAuth::new(&[0x5A; KEY_LEN]);
+    // This test's own key (#754): every node's data dir sits under its test's disk
+    // root, so the root names the cluster, restarts included.
+    let auth = SwimAuth::new(&common::cluster_key(
+        &data_dir.parent().unwrap_or(data_dir).to_string_lossy(),
+    ));
     aborts.push(
         tokio::spawn(swim_driver::run(
             socket,
@@ -3898,4 +3902,58 @@ async fn no_node_keeps_a_stamp_for_a_group_it_left() {
         );
         tokio::time::sleep(Duration::from_millis(300)).await;
     }
+}
+
+/// #754: tests in this binary run concurrently in one process on ephemeral loopback
+/// ports, and SWIM re-greets a dead seed's address every protocol period. With one gossip
+/// key shared by every test, a killed node's recycled port let ANOTHER test's cluster
+/// answer that greeting and the two memberships merged — two lease Rafts then replicated
+/// into each other, and openraft's `has_log_id` assertion fired on the receiving nodes
+/// (a later term at an index they had already committed). Production contains this with
+/// the cluster identity (ADR 0054); this harness runs without one, so each test's cluster
+/// gets its own key. Here a node of a "second test" (its own disk root) greets the first
+/// cluster's address exactly as a recycled seed port would; a node of the SAME cluster,
+/// greeting the same address meanwhile, is the positive control that gossip was flowing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn another_tests_cluster_greeting_a_recycled_seed_address_is_not_admitted() {
+    stress_tracing();
+    let (disk_one, disk_two) = (
+        tempfile::tempdir().expect("tempdir"),
+        tempfile::tempdir().expect("tempdir"),
+    );
+    let dir = |root: &tempfile::TempDir, n: &str| {
+        let d = root.path().join(n);
+        std::fs::create_dir_all(&d).expect("node dir");
+        d
+    };
+    let a1 = start_stress_node("x754-a1", vec![], &dir(&disk_one, "a1")).await;
+    // The other test's node, greeting a1's address from its first protocol period on.
+    let b1 = start_stress_node("x754-b1", vec![a1.swim_addr.clone()], &dir(&disk_two, "b1")).await;
+    // Positive control: a node of a1's own cluster joins through the same greeting.
+    let a2 = start_stress_node("x754-a2", vec![a1.swim_addr.clone()], &dir(&disk_one, "a2")).await;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let members = |n: &StressNode| {
+        n.placement
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .members()
+    };
+    while !members(&a1).contains(&a2.node_id) {
+        assert!(
+            Instant::now() < deadline,
+            "positive control: x754-a2 never joined x754-a1 (gossip not flowing)"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    // b1 had been greeting a1 since before a2 started; a2 is in, b1 must not be.
+    assert!(
+        !members(&a1).contains(&b1.node_id),
+        "a second test's cluster merged into the first through a greeted address: {:?}",
+        members(&a1)
+    );
+    assert!(
+        !members(&b1).contains(&a1.node_id),
+        "the first cluster merged into the second test's node: {:?}",
+        members(&b1)
+    );
 }
