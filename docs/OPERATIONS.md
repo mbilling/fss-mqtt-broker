@@ -843,7 +843,12 @@ The full references are [ADMIN-CLI.md](ADMIN-CLI.md) (every command) and
 **Try it first.** `scripts/admin-e2e.sh up` starts a three-node cluster in Docker with the
 admin API on every node and prints the exports that point `mqttd --admin` at it (viewer and
 operator certificates included); `scripts/admin-e2e.sh test` checks every command below
-against it, through the CLI and through curl; `down` removes it.
+against it, through the CLI and through curl; `down` removes it. `scripts/admin-e2e.sh
+scenarios` runs the incidents this section is for, each on a fresh cluster and observed
+through the admin API: a node dying, a partition, scale-out, decommission, a split brain,
+queued messages outliving their owner, takeover, revocation and credential removal
+reaching live sessions, config drift, role boundaries, a cordon-restart-uncordon drill,
+quotas, an expiring log override and the audit trail. It runs nightly in CI.
 
 An authenticated HTTPS listener for questions `/statusz` cannot answer and for a short
 list of audited actions. It is **off unless `admin.bind` is set**, and it is never the

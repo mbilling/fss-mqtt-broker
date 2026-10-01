@@ -3,9 +3,10 @@
 # cert per node (CN = node id, SAN = its hostname; it serves the peer bus AND the admin
 # listener), and an admin CA with three client identities: oncall (viewer), root
 # (operator), stranger (in no role list). Throwaway, 3-day validity.
-# Usage: pki.sh <output dir>
+# Usage: pki.sh <output dir> [nodes, default 3]
 set -eu
-D="${1:?usage: pki.sh <output dir>}"
+D="${1:?usage: pki.sh <output dir> [nodes]}"
+N="${2:-3}"
 rm -rf "$D"; mkdir -p "$D"; cd "$D"
 
 ca() { # name
@@ -25,7 +26,7 @@ leaf() { # ca name subject san
 
 ca cluster
 ca admin
-for n in 1 2 3; do
+for n in $(seq 1 "$N"); do
   leaf cluster "mqttd-$n" "/CN=mqttd-$n" "DNS:mqttd-$n,DNS:localhost,IP:127.0.0.1"
 done
 leaf admin oncall "/CN=oncall/O=example" "DNS:oncall"

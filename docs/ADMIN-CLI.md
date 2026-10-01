@@ -423,4 +423,21 @@ A day 0 / day 1 / day 2 table of which command answers which question is in
 scripts/admin-e2e.sh up     # three nodes in Docker with the admin API; prints the exports above
 scripts/admin-e2e.sh test   # every command on this page, checked (CLI and curl)
 scripts/admin-e2e.sh down
+
+scripts/admin-e2e.sh scenarios        # the operator scenarios, each on a fresh cluster (~3 min after the build)
+scripts/admin-e2e.sh scenarios drift  # just the ones whose name matches
+scripts/admin-e2e.sh list             # the scenario names
 ```
+
+The scenarios script real incidents and check what the admin API shows during and after
+each: a node killed (its row turns `replied: false` with the reason, then it rejoins), a
+network partition seen from both sides, a fourth node joining, `mqttd --decommission`
+draining a node out, a founder restarting without its state and quarantining itself
+(`same_cluster_id: false`), queued messages surviving their owner's death, retained
+replication, a cross-node session takeover, an ACL change and a password-file change
+reaching already-connected clients, config drift (`same_config: false`), the peer, viewer
+and unlisted-certificate role boundaries, a cordon → kick → restart → uncordon drill, a
+reloaded session quota, a 3-second log override expiring on its own, and the audit records
+of it all. They use their own compose project and ports (42010 and up), so they can run
+beside a cluster from `up`, and they run nightly in CI; a failed scenario leaves its node
+logs under `target/admin-scenarios/<name>/logs/`.
