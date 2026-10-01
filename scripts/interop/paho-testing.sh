@@ -61,8 +61,31 @@ if [[ ! -d "$CACHE/.git" ]]; then
   git clone --quiet "$PAHO_REPO" "$CACHE"
 fi
 git -C "$CACHE" fetch --quiet origin "$PAHO_REF" 2>/dev/null || git -C "$CACHE" fetch --quiet origin
-git -C "$CACHE" checkout --quiet "$PAHO_REF"
+# --force: a cached checkout still carries the correction below from its last run.
+git -C "$CACHE" checkout --quiet --force "$PAHO_REF"
 echo "suite:    $CACHE @ $(git -C "$CACHE" rev-parse --short HEAD)"
+
+# One correction to the pinned suite (#777). test_subscribe_options (its noLocal step)
+# and test_request_response both have bclient subscribe, then wait on
+# `callback.subscribeds`: aclient's queue, which already holds aclient's SUBACK, so they
+# never wait for bclient's. aclient publishes at once, and MQTT promises a subscription
+# only once its SUBACK is sent [MQTT-3.8.4-1], so on a slow runner bclient misses the
+# message and the test reads 0 != 1. Measured with test_subscribe_options alone on one
+# CPU-starved core: 13 of 30 runs failed as shipped, 0 of 30 with the wait on bclient's
+# own queue. The edit fails loudly if a new pin no longer has exactly these two.
+python3 - "$CACHE/interoperability/client_test5.py" <<'PY'
+import sys
+path = sys.argv[1]
+src = open(path, encoding="utf-8").read()
+racy = (
+    "      bclient.subscribe([topics[0]], [MQTTV5.SubscribeOptions(2, noLocal=True)])\n"
+    "      self.waitfor(callback.subscribeds, 1, 3)\n"
+)
+fixed = racy.replace("callback.subscribeds", "callback2.subscribeds")
+if src.count(racy) != 2:
+    sys.exit("paho suite correction (#777): the two racy waits are not where they were; re-check them against this pin")
+open(path, "w", encoding="utf-8").write(src.replace(racy, fixed))
+PY
 echo "broker:   $MQTTD_BIN"
 
 # --- the broker -------------------------------------------------------------

@@ -805,9 +805,16 @@ if re.search(r"curl -(?:s|fsS) -m 10 http://localhost:94", cmd) and os.environ.g
     if not t0.exists():
         t0.write_text(repr(time.time()))
     elapsed = time.time() - float(t0.read_text())
+    # FAKE_RECV_BURST: from each consumer's SECOND scrape on, its counter carries a
+    # one-off jump of that many messages, so exactly one steady-gate poll reads
+    # above the offer and every later one reads the offer again (#786).
+    burst = int(os.environ.get("FAKE_RECV_BURST", "0"))
     for name in re.findall(r"@@@ ([A-Za-z0-9_-]+)", cmd):
+        seen = state / ("recv-scrapes-" + name)
+        n = int(seen.read_text()) + 1 if seen.exists() else 1
+        seen.write_text(str(n))
         print("\n@@@ %s" % name)
-        print("recv %d" % int(rate * elapsed))
+        print("recv %d" % (int(rate * elapsed) + (burst if n >= 2 else 0)))
         print("connect_succ 600")
     log()
     sys.exit(0)
@@ -1313,6 +1320,29 @@ if sys.argv[1:] == ["show", "-p", "MainPID", "--value", "mqttd"]:
         self.assertIn("steady=yes", rung,
                       f"a broker delivering exactly its offer was not called steady:\n{rung}")
         self.assertNotIn("steady_reason=repaying", rung)
+
+    def test_a_rung_that_settles_after_an_out_of_band_poll_records_no_reason(self):
+        # #786: `steady_reason` says why a rung is NOT steady. It was set on every
+        # out-of-band poll and never cleared, so a rung that went steady after one
+        # transient poll (a loaded runner stamping a scrape late is enough) was
+        # recorded `steady=yes steady_reason=repaying`. Here one poll is forced
+        # above the offer, deterministically, and the rung must still go steady
+        # with no reason recorded.
+        env, nodes, _ = self.lane_e_fleet(
+            LANE_E_SITES_OVERRIDE="1", LANE_E_SUBS_PER_SITE="6",
+            LANE_E_DRAIN_POLL="1", LANE_E_STEADY_POLLS="3", LANE_E_STEADY_BUDGET="30",
+            FAKE_RECV_RATE="30000", FAKE_SCRAPE_SECS="0.4",
+            # A jump of 5,000 per consumer: 30,000 more over one ~1.4 s poll, far
+            # outside the 5% band and above the offer.
+            FAKE_RECV_BURST="5000",
+            FAKE_CONNS=str(1 * (1200 + 6)),
+        )
+        result, out = self.run_lane_e(env)
+        self.assertEqual(result.returncode, 0, result.stderr[-3000:])
+        rung = (out / f"results/nodes={nodes}/laneE/sites-1/rung.txt").read_text()
+        self.assertIn("steady=yes", rung, f"one high poll must not keep the rung unsteady:\n{rung}")
+        self.assertIn("steady_reason=none", rung,
+                      f"a steady rung must not carry the reason of a poll it recovered from:\n{rung}")
 
     def test_lane_e_brokers_consumers_and_cpu_share_one_window(self):
         env, nodes, _ = self.lane_e_fleet()
