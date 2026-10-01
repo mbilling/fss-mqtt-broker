@@ -88,7 +88,7 @@
 | [0078](../adr/0078-replica-segment-log.md) | # 0078. The replica store becomes an append-only segment log — the disk is the limit, not the B-tree | Accepted | [3/4 done](0078-replica-segment-log.md) | 1 open |
 | [0079](../adr/0079-global-allocator.md) | # 0079. mqttd links mimalloc as its global allocator | Accepted | [1/2 done](0079-global-allocator.md) | 1 open |
 | [0080](../adr/0080-replication-factor.md) | # 0080. The replication factor is cluster state: configurable, default 2, changeable live | Accepted | [6/6 done](0080-replication-factor.md) | — |
-| [0081](../adr/0081-admin-api.md) | # 0081. An authenticated admin API: reads cluster-wide, actions audited, config stays in the file | Accepted | [13/19 done](0081-admin-api.md) | 4 open, 2 deferred |
+| [0081](../adr/0081-admin-api.md) | # 0081. An authenticated admin API: reads cluster-wide, actions audited, config stays in the file | Accepted | [14/19 done](0081-admin-api.md) | 3 open, 2 deferred |
 
 ## Open and deferred work
 
@@ -214,7 +214,6 @@
 
 **0081 — # 0081. An authenticated admin API: reads cluster-wide, actions audited, config stays in the file**
 
-- `0081-T16` 🚧 in-progress ([#771](https://github.com/mbilling/fss-mqtt-broker/issues/771)): "Admin e2e scenario suite (kill, partition, scale, decommission, durability, policy, drills), nightly in CI" — "Extends scripts/admin-e2e.sh; one fresh cluster per scenario; asserts through the admin API."
 - `0081-T17` ⬜ planned ([#772](https://github.com/mbilling/fss-mqtt-broker/issues/772)): "Cluster-wide clients/session/subscribers (--all-nodes, scope=cluster)"
 - `0081-T18` ⬜ planned ([#773](https://github.com/mbilling/fss-mqtt-broker/issues/773)): "Hot reload of the admin listener's certificate, key and CA"
 - `0081-T19` ⬜ planned ([#774](https://github.com/mbilling/fss-mqtt-broker/issues/774)): "CLI output polish: compact cluster table, wrapped help"

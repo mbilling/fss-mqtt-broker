@@ -83,9 +83,10 @@ tasks:
     evidence: "PR #779. Chart admin.* values and CR spec.admin serve the admin API on 9443 of every pod with its own cluster-bus leaf (headless Service only); render parity admin-on pass; kind smoke checks whoami=operator, anonymous refused, cluster view 3/3. NetworkPolicy split to #778."
   - id: 0081-T16
     title: "Admin e2e scenario suite (kill, partition, scale, decommission, durability, policy, drills), nightly in CI"
-    status: in-progress
+    status: done
     issue: 771
-    notes: "Extends scripts/admin-e2e.sh; one fresh cluster per scenario; asserts through the admin API."
+    date: 2026-10-01
+    evidence: "PR #782. scripts/admin-e2e.sh scenarios: 16 scripted incidents, each on a fresh compose cluster and asserted through the admin API (123 checks; 2 consecutive local runs 16/16), nightly job admin-scenarios. Surfaced #783 and #784."
   - id: 0081-T17
     title: "Cluster-wide clients/session/subscribers (--all-nodes, scope=cluster)"
     status: planned
@@ -129,7 +130,7 @@ frontmatter above · this file is the plan, progress log, and changelog.
 | 0081-T11 | ✅ done | [#720](https://github.com/mbilling/fss-mqtt-broker/issues/720) | 2026-09-29 | "PR #728. mqttd --print-config prints the effective config (defaults < file < env) with secrets fingerprinted via Config::redacted (mqtt-config) and mqttd::config_view; unit tests pin that no secret field survives redaction and URL separators are preserved." |
 | 0081-T12 | ✅ done | [#721](https://github.com/mbilling/fss-mqtt-broker/issues/721) | 2026-09-29 | "PR #728. mqttd --check-tls (crates/mqttd/src/tls_check.rs) checks chain, key match, expiry (fail/warn under 30 days) and SANs for [tls] and [cluster.peer_tls]; rcgen-minted ok/expired/key-mismatch tests." |
 | 0081-T15 | ✅ done | [#770](https://github.com/mbilling/fss-mqtt-broker/issues/770) | 2026-10-01 | "PR #779. Chart admin.* values and CR spec.admin serve the admin API on 9443 of every pod with its own cluster-bus leaf (headless Service only); render parity admin-on pass; kind smoke checks whoami=operator, anonymous refused, cluster view 3/3. NetworkPolicy split to #778." |
-| 0081-T16 | 🚧 in-progress | [#771](https://github.com/mbilling/fss-mqtt-broker/issues/771) | — | "Extends scripts/admin-e2e.sh; one fresh cluster per scenario; asserts through the admin API." |
+| 0081-T16 | ✅ done | [#771](https://github.com/mbilling/fss-mqtt-broker/issues/771) | 2026-10-01 | "PR #782. scripts/admin-e2e.sh scenarios: 16 scripted incidents, each on a fresh compose cluster and asserted through the admin API (123 checks; 2 consecutive local runs 16/16), nightly job admin-scenarios. Surfaced #783 and #784." |
 | 0081-T17 | ⬜ planned | [#772](https://github.com/mbilling/fss-mqtt-broker/issues/772) | — |  |
 | 0081-T18 | ⬜ planned | [#773](https://github.com/mbilling/fss-mqtt-broker/issues/773) | — |  |
 | 0081-T19 | ⬜ planned | [#774](https://github.com/mbilling/fss-mqtt-broker/issues/774) | — |  |
@@ -173,3 +174,4 @@ the reads it depends on.
 - 2026-09-30: T10 delivered (PR #737 merged). Every planned task is done; T13 and T14 stay deferred.
 - 2026-10-01: T15–T19 added after the live-cluster test and the docs pass (issues #770–#774); T15 and T16 first.
 - 2026-10-01: T15 delivered (PR #779 merged): the chart and the operator enable the admin API; NetworkPolicy split out to #778.
+- 2026-10-01: T16 delivered (PR #782 merged): the admin e2e scenario suite, nightly; it surfaced #783 and #784.
