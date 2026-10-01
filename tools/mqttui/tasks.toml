@@ -470,6 +470,15 @@ kick with the client receiving DISCONNECT 0x98, purge, cordon, the log override,
 records, and the offline commands inside a container. Each admin verb goes through the CLI
 and through curl. `all` = up, test, down.
 
+`scenarios` runs the operator scenario suite instead (the nightly CI lane): sixteen
+scripted incidents, each on its own fresh cluster — a node dying, a network partition,
+scale-out, decommission, a split brain, queued messages surviving their owner, retained
+replication, session takeover, revocation and credential removal reaching live sessions,
+config drift, role boundaries, a rolling-maintenance drill, quotas, an expiring log
+override and the audit trail — observed through the admin API. It uses its own compose
+project and ports (42010+), so a kit cluster from `up` can stay running beside it.
+`scenarios` takes ~3 min after the build.
+
 It found a real bug the unit tests missed (kick of a clean-session client forwarded to the
 placement owner, which never held it — fixed in #746).
 """
@@ -480,7 +489,7 @@ args = ["${ACTION}"]
 [[task.env]]
 name = "ACTION"
 default = "all"
-help = "up | env | test | down | all"
+help = "up | env | test | down | all | scenarios"
 
 [[task]]
 id = "admin-e2e-pki"
@@ -512,7 +521,216 @@ script = "scripts/admin-e2e/raw_v5.py"
 hidden = true
 needs_checkout = true
 about = """
-Helper of admin-e2e: connects, then prints every packet until the server closes, so a kick's DISCONNECT reason code is observable (mosquitto_sub reconnects).
+Helper of admin-e2e: connects (optionally with credentials, a persistent session and a subscription), then prints every packet until the server closes, so a kick's or an eviction's DISCONNECT reason code is observable (mosquitto_sub reconnects).
+"""
+
+[[task]]
+id = "admin-e2e-lib"
+group = "Try it"
+name = "Shared helpers of the admin-e2e kit (sourced, not run)"
+script = "scripts/admin-e2e/lib.sh"
+hidden = true
+needs_checkout = true
+about = """
+Helper of admin-e2e: settings, cluster lifecycle (render compose, up, down, logs), node faults (kill, restart, network cut), admin and MQTT client wrappers and the PASS/FAIL assertions that checks.sh and every scenario use. Sourced, never run directly.
+"""
+
+[[task]]
+id = "admin-e2e-run-scenario"
+group = "Try it"
+name = "Run one admin-e2e scenario on a fresh cluster (run by admin-e2e scenarios)"
+script = "scripts/admin-e2e/run-scenario.sh"
+hidden = true
+needs_checkout = true
+about = """
+Helper of admin-e2e scenarios: brings up a fresh cluster for one scenario file, runs it, collects the node logs if a check failed and always tears the cluster down.
+"""
+
+[[task]]
+id = "admin-e2e-edit"
+group = "Try it"
+name = "Edit a bind-mounted file in place (used by admin-e2e)"
+script = "scripts/admin-e2e/edit.py"
+hidden = true
+needs_checkout = true
+about = """
+Helper of admin-e2e: replaces text in, or rewrites, a file without changing its inode, so a container's bind mount sees the edit.
+"""
+
+[[task]]
+id = "admin-scenario-01-node-dies"
+group = "Try it"
+name = "admin-e2e scenario 01: node dies (run by admin-e2e scenarios)"
+script = "scripts/admin-e2e/scenarios/01-node-dies.sh"
+hidden = true
+needs_checkout = true
+about = """
+Scenario of admin-e2e scenarios: A node dies: the survivors' cluster view shows it as not replying (with the reason), never silently dropped while it is still a member; restarted, it rejoins with the same cluster identity and membership. Node 3 (not the founder) is killed; data dirs keep its identity across the restart.
+"""
+
+[[task]]
+id = "admin-scenario-02-partition"
+group = "Try it"
+name = "admin-e2e scenario 02: partition (run by admin-e2e scenarios)"
+script = "scripts/admin-e2e/scenarios/02-partition.sh"
+hidden = true
+needs_checkout = true
+about = """
+Scenario of admin-e2e scenarios: A network partition: node 3 is cut off the cluster network. The majority side shows it as not replying; node 3's own view (asked from inside its container, since the host cannot reach it either) shows it cannot reach its peers. Healed, the views converge.
+"""
+
+[[task]]
+id = "admin-scenario-03-scale-out"
+group = "Try it"
+name = "admin-e2e scenario 03: scale out (run by admin-e2e scenarios)"
+script = "scripts/admin-e2e/scenarios/03-scale-out.sh"
+hidden = true
+needs_checkout = true
+about = """
+Scenario of admin-e2e scenarios: Scale out: a 4th node joins a running 3-node cluster; every node's view shows four members, all replying and agreeing.
+"""
+
+[[task]]
+id = "admin-scenario-04-decommission"
+group = "Try it"
+name = "admin-e2e scenario 04: decommission (run by admin-e2e scenarios)"
+script = "scripts/admin-e2e/scenarios/04-decommission.sh"
+hidden = true
+needs_checkout = true
+about = """
+Scenario of admin-e2e scenarios: Decommission: `mqttd --decommission` on node 3 drains its durable data to the others and stops it; the drain is visible on its health endpoint while it runs, the process exits, and the remaining nodes' views settle on two members.
+"""
+
+[[task]]
+id = "admin-scenario-05-split-brain"
+group = "Try it"
+name = "admin-e2e scenario 05: split brain (run by admin-e2e scenarios)"
+script = "scripts/admin-e2e/scenarios/05-split-brain.sh"
+hidden = true
+needs_checkout = true
+about = """
+Scenario of admin-e2e scenarios: Split-brain detection: the founder restarts WITHOUT its state (ephemeral durability), so it founds a second cluster beside the live one. Hearing the other cluster's gossip, it quarantines itself (the re-found guard), and the cluster view flags the split: `same_cluster_id: false` and the node marked quarantined.
+"""
+
+[[task]]
+id = "admin-scenario-06-queue-survives-owner"
+group = "Try it"
+name = "admin-e2e scenario 06: queue survives owner (run by admin-e2e scenarios)"
+script = "scripts/admin-e2e/scenarios/06-queue-survives-owner.sh"
+hidden = true
+needs_checkout = true
+about = """
+Scenario of admin-e2e scenarios: Durability through the admin API: a persistent session with three queued QoS 1 messages; its owner node is killed; the session — with the messages — shows up on a surviving node, and the client reconnecting there receives all three.
+"""
+
+[[task]]
+id = "admin-scenario-07-retained-replicates"
+group = "Try it"
+name = "admin-e2e scenario 07: retained replicates (run by admin-e2e scenarios)"
+script = "scripts/admin-e2e/scenarios/07-retained-replicates.sh"
+hidden = true
+needs_checkout = true
+about = """
+Scenario of admin-e2e scenarios: Retained replication: a retained message published on node 1 is served by nodes 2 and 3, and clearing it on node 3 clears it everywhere.
+"""
+
+[[task]]
+id = "admin-scenario-08-session-takeover"
+group = "Try it"
+name = "admin-e2e scenario 08: session takeover (run by admin-e2e scenarios)"
+script = "scripts/admin-e2e/scenarios/08-session-takeover.sh"
+hidden = true
+needs_checkout = true
+about = """
+Scenario of admin-e2e scenarios: Session takeover across nodes: a persistent client id connected on node 1 connects again on node 2 (persistent sessions live on their placement owner, ADR 0005; clean-start ones are served where they land, so only persistent sessions can be taken over across nodes); the first connection is closed, the second stays, and the cluster holds one connected session for that id.
+"""
+
+[[task]]
+id = "admin-scenario-09-revocation-live"
+group = "Try it"
+name = "admin-e2e scenario 09: revocation live (run by admin-e2e scenarios)"
+script = "scripts/admin-e2e/scenarios/09-revocation-live.sh"
+hidden = true
+needs_checkout = true
+about = """
+Scenario of admin-e2e scenarios: Revocation reaches a live session: a client subscribed to feed/# receives; the ACL is tightened to deny subscribing to feed/# and every node reloads; the dry run reports the deny, and the already-connected subscriber stops receiving.
+"""
+
+[[task]]
+id = "admin-scenario-10-credential-removal"
+group = "Try it"
+name = "admin-e2e scenario 10: credential removal (run by admin-e2e scenarios)"
+script = "scripts/admin-e2e/scenarios/10-credential-removal.sh"
+hidden = true
+needs_checkout = true
+about = """
+Scenario of admin-e2e scenarios: Removing a user evicts their live connection: password auth (no anonymous access), two users connected; alice is removed from the password file and every node reloads; alice's connection is closed, bob's stays, and alice can no longer connect.
+"""
+
+[[task]]
+id = "admin-scenario-11-config-drift"
+group = "Try it"
+name = "admin-e2e scenario 11: config drift (run by admin-e2e scenarios)"
+script = "scripts/admin-e2e/scenarios/11-config-drift.sh"
+hidden = true
+needs_checkout = true
+about = """
+Scenario of admin-e2e scenarios: Config drift: one node's config file changes and only that node reloads; the cluster view flags `same_config: false`; restoring the file and reloading brings it back to true.
+"""
+
+[[task]]
+id = "admin-scenario-12-role-boundaries"
+group = "Try it"
+name = "admin-e2e scenario 12: role boundaries (run by admin-e2e scenarios)"
+script = "scripts/admin-e2e/scenarios/12-role-boundaries.sh"
+hidden = true
+needs_checkout = true
+about = """
+Scenario of admin-e2e scenarios: Role boundaries: a node's cluster certificate (the peer role) may read a node's own state and nothing else; it may not act unless it is forwarding; an unlisted certificate gets nothing; a viewer may not act.
+"""
+
+[[task]]
+id = "admin-scenario-13-rolling-maintenance"
+group = "Try it"
+name = "admin-e2e scenario 13: rolling maintenance (run by admin-e2e scenarios)"
+script = "scripts/admin-e2e/scenarios/13-rolling-maintenance.sh"
+hidden = true
+needs_checkout = true
+about = """
+Scenario of admin-e2e scenarios: A rolling-maintenance drill on the node holding a persistent session: cordon it (not ready, new connections refused), kick the client, publish while it is away, restart the node, uncordon — and the client reconnects to its intact session and gets the message.
+"""
+
+[[task]]
+id = "admin-scenario-14-session-quota"
+group = "Try it"
+name = "admin-e2e scenario 14: session quota (run by admin-e2e scenarios)"
+script = "scripts/admin-e2e/scenarios/14-session-quota.sh"
+hidden = true
+needs_checkout = true
+about = """
+Scenario of admin-e2e scenarios: Quotas through reload: node 1 reloads with max_sessions = 1; with one client connected the next is refused (MQTT 5 CONNACK 0x97 Quota exceeded); raised again, a client connects.
+"""
+
+[[task]]
+id = "admin-scenario-15-log-override-expires"
+group = "Try it"
+name = "admin-e2e scenario 15: log override expires (run by admin-e2e scenarios)"
+script = "scripts/admin-e2e/scenarios/15-log-override-expires.sh"
+hidden = true
+needs_checkout = true
+about = """
+Scenario of admin-e2e scenarios: The temporary log filter expires on its own: a 3 s override is shown on the node and in log-level, then gone without anyone resetting it.
+"""
+
+[[task]]
+id = "admin-scenario-16-audit-trail"
+group = "Try it"
+name = "admin-e2e scenario 16: audit trail (run by admin-e2e scenarios)"
+script = "scripts/admin-e2e/scenarios/16-audit-trail.sh"
+hidden = true
+needs_checkout = true
+about = """
+Scenario of admin-e2e scenarios: The audit trail: every admin request this scenario makes — actions, reads and refusals — is one admin.request record naming the certificate subject, role and outcome, and the reload is also a security.reload record with trigger=admin.
 """
 
 [[task]]

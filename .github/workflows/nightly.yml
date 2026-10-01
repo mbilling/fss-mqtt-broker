@@ -233,6 +233,39 @@ jobs:
       - name: operator e2e
         run: ./scripts/k8s/operator-e2e.sh
 
+  admin-scenarios:
+    name: admin API operator scenarios (compose)
+    runs-on: ubuntu-latest
+    # ~3 min of scenarios locally (sixteen fresh clusters, several waiting out real failure
+    # detection) plus the image and host-binary builds.
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master; `with:` selects the toolchain
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: Install mosquitto clients
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends mosquitto-clients
+      # ADR 0081 T16: scripted incidents — a node dying, a partition, scale-out,
+      # decommission, a split brain, queued messages outliving their owner, takeover,
+      # revocation and credential removal on live sessions, drift, role boundaries, a
+      # maintenance drill, quotas, log-override expiry, the audit trail — each on a fresh
+      # three-node cluster, observed through the admin API. Builds the image and the host
+      # mqttd itself. Too slow for per-PR CI.
+      - name: admin scenarios
+        run: ./scripts/admin-e2e.sh scenarios
+      - name: Upload scenario logs
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: admin-scenarios-logs
+          path: |
+            target/admin-scenarios/*/logs/
+            target/admin-scenarios/*/*.out
+            target/admin-scenarios-results/
+          if-no-files-found: ignore
+
   oidc:
     name: OIDC integration (real Keycloak, forced rotation) (ADR 0050 T4)
     runs-on: ubuntu-latest
