@@ -720,6 +720,32 @@ fn forward_inbound(
                 retain,
                 message_expiry,
                 app: crate::hub::app_from_wire(app),
+                origin: None,
+                replay: false,
+            });
+        }
+        PeerMessage::PublishAckedTagged {
+            seq,
+            origin,
+            replay,
+            topic,
+            payload,
+            qos,
+            retain,
+            message_expiry,
+            app,
+        } => {
+            let _ = hub.send(HubCommand::RemotePublishAcked {
+                node: remote.clone(),
+                seq,
+                topic,
+                payload: payload.into(),
+                qos: mqtt_codec::QoS::from_u8(qos).unwrap_or(mqtt_codec::QoS::AtMostOnce),
+                retain,
+                message_expiry,
+                app: crate::hub::app_from_wire(app),
+                origin: Some(origin),
+                replay,
             });
         }
         PeerMessage::PublishAck { seq, ok } => {

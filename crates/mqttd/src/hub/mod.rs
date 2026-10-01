@@ -1500,6 +1500,11 @@ pub enum HubCommand {
         message_expiry: Option<u32>,
         /// The publisher's forwardable MQTT 5 application properties (ADR 0030).
         app: AppProperties,
+        /// The publish's id on the sending node (#784, proto 12): recorded with
+        /// every copy queued here. `None` from a proto-11 sender.
+        origin: Option<u64>,
+        /// A takeover re-route (#784): skip a session already holding the publish.
+        replay: bool,
     },
     /// A peer's durability-gated answer to a forwarded publish (ADR 0042 T9,
     /// exhibit ⑤): resolves the matching obligation on the pending publish that
@@ -2049,7 +2054,10 @@ pub struct Hub {
     /// oldest. Entries resolve via forward acks, the retained commit, and the
     /// local fan-out; the sweep tick retransmits and re-routes.
     pending_publishes: forwarding::PendingTable,
-    /// Monotonic pending-publish id source.
+    /// Monotonic pending-publish id source. With this node's id it is a publish's
+    /// cluster-wide identity (#784), recorded with every queued copy — so it starts at
+    /// a random point per process, like `forward_seq`, and a restarted node does not
+    /// re-issue ids its previous life left in some session's queue.
     publish_ids: u64,
     /// Per-node monotonic forward sequence (ADR 0042 T9, exhibit ⑤). Starts at a
     /// random point per process (issue #648, [`forwarding::initial_forward_seq`]).
@@ -2402,7 +2410,7 @@ impl Hub {
                 retained_handoff_seen: HashMap::new(),
                 retained_handoff_pending: HashMap::new(),
                 pending_publishes: forwarding::PendingTable::default(),
-                publish_ids: 0,
+                publish_ids: forwarding::initial_forward_seq(),
                 forward_seq: forwarding::initial_forward_seq(),
                 forward_index: HashMap::new(),
                 durable_writes: 0,
@@ -2933,6 +2941,8 @@ impl Hub {
                 retain,
                 message_expiry,
                 app,
+                origin,
+                replay,
             } => {
                 // A retransmission of a forward already applied here is answered
                 // (again) or left to its in-flight append, never applied twice
@@ -2973,6 +2983,8 @@ impl Hub {
                         &AppendGate::Peer {
                             node: node.clone(),
                             seq,
+                            origin,
+                            replay,
                         },
                     )
                     .await;
@@ -3043,6 +3055,8 @@ impl Hub {
                     &AppendGate::Peer {
                         node: node.clone(),
                         seq,
+                        origin: None,
+                        replay: false,
                     },
                 );
                 // Answered now, or at the append's `AppendDone` (issue #242) —
@@ -6592,7 +6606,7 @@ impl Hub {
                 };
                 match o.kind {
                     ForwardKind::Shared { .. } => dead_shared.push((*id, o)),
-                    ForwardKind::Ordinary => had_ordinary = true,
+                    ForwardKind::Ordinary { .. } => had_ordinary = true,
                 }
                 dead_seqs.push(seq);
             }
@@ -6748,9 +6762,30 @@ impl Hub {
 /// KIND: a shared obligation must retransmit `SharedDeliverAcked` targeted at its
 /// chosen member, never a fan-out `PublishAcked` (which the receiver would deliver to
 /// every matching ordinary subscriber instead).
-fn forward_frame(p: &PendingPublish, seq: u64, obligation: &ForwardObligation) -> PeerMessage {
+fn forward_frame(
+    id: u64,
+    p: &PendingPublish,
+    seq: u64,
+    obligation: &ForwardObligation,
+    proto: u32,
+) -> PeerMessage {
     match &obligation.kind {
-        ForwardKind::Ordinary => PeerMessage::PublishAcked {
+        // A proto-12 link carries the publish's id and whether this is a re-route
+        // (#784), so the receiver can record the one and honour the other.
+        ForwardKind::Ordinary { replay } if proto >= mqtt_cluster::peer::PROTO_PUBLISH_ORIGIN => {
+            PeerMessage::PublishAckedTagged {
+                seq,
+                origin: id,
+                replay: *replay,
+                topic: p.topic.clone(),
+                payload: p.payload.to_vec(),
+                qos: p.qos as u8,
+                retain: p.retain,
+                message_expiry: p.message_expiry,
+                app: app_to_wire(p.app()),
+            }
+        }
+        ForwardKind::Ordinary { .. } => PeerMessage::PublishAcked {
             seq,
             topic: p.topic.clone(),
             payload: p.payload.to_vec(),
@@ -11114,6 +11149,8 @@ mod tests {
                 retain: false,
                 message_expiry: None,
                 app: mqtt_core::AppProperties::default(),
+                origin: None,
+                replay: false,
             })
             .unwrap();
             match next_forward_answer(&mut peer).await {
@@ -11155,6 +11192,8 @@ mod tests {
                 retain: false,
                 message_expiry: None,
                 app: mqtt_core::AppProperties::default(),
+                origin: None,
+                replay: false,
             })
             .unwrap();
         }
@@ -15426,6 +15465,8 @@ mod tests {
             retain: false,
             message_expiry: None,
             app: mqtt_core::AppProperties::default(),
+            origin: None,
+            replay: false,
         })
         .unwrap();
         // Read the verdict off the raw peer channel (`recv_peer` skips verdicts).
@@ -16298,6 +16339,8 @@ mod tests {
             retain: false,
             message_expiry: None,
             app: mqtt_core::AppProperties::default(),
+            origin: None,
+            replay: false,
         })
         .unwrap();
         next_verdict(peer, this).await
@@ -16425,7 +16468,10 @@ mod tests {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         loop {
             match timeout(Duration::from_millis(300), rx.recv()).await {
-                Ok(Some(PeerMessage::PublishAcked { seq, topic: t, .. })) if t == topic => {
+                Ok(Some(
+                    PeerMessage::PublishAcked { seq, topic: t, .. }
+                    | PeerMessage::PublishAckedTagged { seq, topic: t, .. },
+                )) if t == topic => {
                     return seq;
                 }
                 _ => assert!(
@@ -17701,6 +17747,8 @@ mod tests {
                 user_properties: vec![("mqttd-durability".into(), "relaxed".into())],
                 ..Default::default()
             },
+            origin: None,
+            replay: false,
         })
         .unwrap();
 
@@ -17799,6 +17847,8 @@ mod tests {
                 user_properties: vec![("mqttd-durability".into(), "relaxed".into())],
                 ..Default::default()
             },
+            origin: None,
+            replay: false,
         })
         .unwrap();
 
@@ -18462,7 +18512,11 @@ mod tests {
         for i in 1..=3u8 {
             let mut job = super::lanes::AppendJob::control(
                 ClientId("c".into()),
-                super::lanes::LaneWork::Append { expiry_at: None },
+                super::lanes::LaneWork::Append {
+                    expiry_at: None,
+                    origin: None,
+                    dedupe: false,
+                },
             );
             job.message.qos = QoS::AtLeastOnce;
             job.message.payload = Bytes::from(vec![i]);
@@ -18511,7 +18565,11 @@ mod tests {
         for i in 1..=2u8 {
             let mut job = super::lanes::AppendJob::control(
                 ClientId("c".into()),
-                super::lanes::LaneWork::Append { expiry_at: None },
+                super::lanes::LaneWork::Append {
+                    expiry_at: None,
+                    origin: None,
+                    dedupe: false,
+                },
             );
             job.message.qos = QoS::AtLeastOnce;
             job.message.payload = Bytes::from(vec![i]);

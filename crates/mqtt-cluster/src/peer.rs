@@ -96,7 +96,15 @@ pub const PROTO_MIN: u32 = 6;
 /// AND matched a subscriber on the receiver, which lets the origin release a held
 /// ack during a takeover window without waiting for the window to close. A proto-10
 /// link is answered [`ForwardVerdict::Stored`], exactly as before.
-pub const PROTO_MAX: u32 = 11;
+///
+/// Proto 12 (#784) is additive: [`PublishAckedTagged`](PeerMessage::PublishAckedTagged)
+/// is [`PublishAcked`](PeerMessage::PublishAcked) plus the publish's id on its origin
+/// node and whether the forward is a takeover RE-ROUTE. The receiver records the id
+/// with each queued copy, and a re-route skips a session that already holds it — so a
+/// publish stored on a node that then died is not stored a second time when its
+/// session moves. A proto-11 link keeps the untagged frame: a re-route over it can
+/// still duplicate (legal at `QoS` 1), never lose.
+pub const PROTO_MAX: u32 = 12;
 
 /// The peer-bus proto at which a build computes durable ownership over all admitted
 /// members (ADR 0073). Purely a capability marker — see [`PROTO_MAX`].
@@ -113,6 +121,10 @@ pub const PROTO_REPLICA_READ_PAGED: u32 = 10;
 /// The peer-bus proto at which a link may answer a forward with
 /// [`ForwardVerdict::Reached`] (#738).
 pub const PROTO_FORWARD_REACHED: u32 = 11;
+
+/// The peer-bus proto at which a link carries
+/// [`PublishAckedTagged`](PeerMessage::PublishAckedTagged) (#784).
+pub const PROTO_PUBLISH_ORIGIN: u32 = 12;
 
 /// Negotiate a link's protocol version from both sides' announced ranges
 /// (ADR 0038): the newest version both can speak, or `None` when the ranges are
@@ -635,6 +647,36 @@ pub enum PeerMessage {
         /// Whether entries remain above this page's last offset.
         more: bool,
     },
+    // ---------------------------------------------------------------------
+    // Proto 12 (#784). Appended, like everything since proto 7.
+    // ---------------------------------------------------------------------
+    /// [`PublishAcked`](PeerMessage::PublishAcked), carrying the publish's identity
+    /// on the sending node and whether this forward is a takeover re-route. Answered
+    /// exactly as `PublishAcked` is, and recognised as a repeat by the same
+    /// `(sender, seq)` window. Sent instead of it on a link that negotiated proto
+    /// ≥ 12.
+    PublishAckedTagged {
+        /// Per-sender monotonic forward sequence (correlates the answer).
+        seq: u64,
+        /// The publish's id on the sending node: with the sender's node id, its
+        /// cluster-wide identity. The receiver records it with every copy it queues.
+        origin: u64,
+        /// A takeover re-route of a publish already forwarded elsewhere: the
+        /// receiver skips a session whose queue already holds a copy of it.
+        replay: bool,
+        /// Destination topic (no wildcards).
+        topic: String,
+        /// Application payload.
+        payload: Vec<u8>,
+        /// Publish `QoS` as its 2-bit wire value.
+        qos: u8,
+        /// Whether the message was published with the retain flag.
+        retain: bool,
+        /// The publisher's Message Expiry Interval (seconds), if any.
+        message_expiry: Option<u32>,
+        /// The publisher's forwardable MQTT 5 application properties.
+        app: WireAppProps,
+    },
 }
 
 /// What a node did with a forward it was asked to take responsibility for
@@ -971,7 +1013,8 @@ mod tests {
         decode, encode, encode_legacy, negotiate_proto, ForwardVerdict, PeerCodecError,
         PeerMessage, ReplicaEntryWire, RetainedWireEntry, SharedGroupWire, SharedMemberWire,
         WireAppProps, MAX_FRAME, PROTO_FORWARD_REACHED, PROTO_MAX, PROTO_MIN,
-        PROTO_OWNERSHIP_DOMAIN, PROTO_REPLICATION_FACTOR, PROTO_REPLICA_READ_PAGED,
+        PROTO_OWNERSHIP_DOMAIN, PROTO_PUBLISH_ORIGIN, PROTO_REPLICATION_FACTOR,
+        PROTO_REPLICA_READ_PAGED,
     };
     use bytes::BytesMut;
 
@@ -1384,9 +1427,40 @@ mod tests {
         assert_eq!(tag(ForwardVerdict::Failed), 2);
         assert_eq!(tag(ForwardVerdict::Reached), 3);
         assert_eq!(
-            negotiate_proto((PROTO_MIN, PROTO_MAX), (PROTO_MIN, PROTO_MAX)),
+            negotiate_proto((PROTO_MIN, PROTO_MAX), (PROTO_MIN, PROTO_FORWARD_REACHED)),
             Some(PROTO_FORWARD_REACHED),
-            "this build must announce the proto-11 reached verdict (#738)"
+            "a pre-#784 build keeps the proto-11 reached verdict (#738)"
+        );
+    }
+
+    /// Proto 12 (#784): the tagged forward round-trips, is APPENDED after every
+    /// earlier frame, and this build announces 12 — while a proto-11 peer still
+    /// negotiates 11 and is sent the untagged `PublishAcked`.
+    #[test]
+    fn the_tagged_forward_is_appended_and_announced_at_proto_12() {
+        let msg = PeerMessage::PublishAckedTagged {
+            seq: 9,
+            origin: 0x7fff_0000_0001,
+            replay: true,
+            topic: "q/1".into(),
+            payload: b"m".to_vec(),
+            qos: 1,
+            retain: false,
+            message_expiry: Some(5),
+            app: WireAppProps::default(),
+        };
+        roundtrip(&msg);
+        let mut out = Vec::new();
+        encode(&msg, &mut out).unwrap();
+        assert_eq!(out[4], 28, "appended after ReplicaReadChunk (27)");
+        assert_eq!(
+            negotiate_proto((PROTO_MIN, PROTO_MAX), (PROTO_MIN, PROTO_MAX)),
+            Some(PROTO_PUBLISH_ORIGIN),
+            "this build must announce the proto-12 tagged forward (#784)"
+        );
+        assert_eq!(
+            negotiate_proto((PROTO_MIN, PROTO_MAX), (PROTO_MIN, PROTO_FORWARD_REACHED)),
+            Some(PROTO_FORWARD_REACHED)
         );
     }
 

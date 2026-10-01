@@ -539,8 +539,15 @@ async fn an_early_acked_publish_still_re_routes_to_a_peer_that_advertises_intere
     );
     let mut acked_forwards = 0;
     while let Ok(frame) = peer_rx.try_recv() {
-        if matches!(frame, PeerMessage::PublishAcked { .. }) {
-            acked_forwards += 1;
+        match frame {
+            PeerMessage::PublishAcked { .. } => acked_forwards += 1,
+            // A re-route is marked as one on a proto-12 link (#784), so the
+            // successor skips a session that already holds this publish.
+            PeerMessage::PublishAckedTagged { replay, .. } => {
+                assert!(replay, "a settle-pass re-route must carry replay = true");
+                acked_forwards += 1;
+            }
+            _ => {}
         }
     }
     assert_eq!(
@@ -990,4 +997,214 @@ async fn a_session_the_original_fan_out_reached_is_not_re_delivered_to() {
          enqueued to: it did not miss the publish, and the second copy replays \
          with DUP = 0 [MQTT-4.4.0-1]. Queue: {queued:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Issue #784 — a replay must not store a publish twice in a session that
+// already holds it.
+// ---------------------------------------------------------------------------
+
+/// Plant a copy of `topic` in `client`'s queue as the node that died had stored it
+/// there: tagged with this publish's cluster-wide identity.
+async fn plant_held_copy(fix: &Fix, client: &str, topic: &str, origin_node: &str, id: u64) {
+    fix.store
+        .enqueue_tagged(
+            &ClientId(client.into()),
+            &mqtt_core::Message::new(
+                topic.into(),
+                Bytes::from_static(b"settle-gate"),
+                QoS::AtLeastOnce,
+                false,
+            ),
+            None,
+            Some(&mqtt_storage::PublishOrigin {
+                node: origin_node.into(),
+                id,
+            }),
+        )
+        .await
+        .unwrap();
+}
+
+/// **#784, the local re-delivery.** This node took three `QoS` 1 publishes during a
+/// takeover window and forwarded them to the owner of `keeper`'s session, which
+/// stored them and then died. The session moves here with its replicated queue —
+/// three copies, each tagged with this node's id for its publish — and the scan
+/// materialises it. The settle pass re-delivers the held publishes to it.
+///
+/// Before #784 that re-delivery appended all three again: `reached` counts only
+/// LOCAL recipients, so a copy stored by the dead owner looked like a miss, and
+/// the session held six (scenario 06: `queued: 6`, each delivered twice). Now the
+/// replay skips a session whose queue already holds the publish — and a session
+/// that does NOT hold it (`fresh`) still receives all three, so nothing that was
+/// owed is lost.
+#[tokio::test]
+async fn a_settle_window_replay_skips_a_session_that_already_holds_the_publish() {
+    let mut fix = clustered_fixture();
+    fix.store_only_session("keeper", "q/#").await;
+    fix.store_only_session("fresh", "q/#").await;
+    assert!(
+        fix.hub.routing_unsettled(),
+        "fixture invariant: the takeover window must be open"
+    );
+    let mut acks = Vec::new();
+    for n in 1..=3 {
+        acks.push(fix.publish_gated(&format!("q/{n}")).await);
+    }
+    let ids: Vec<u64> = fix.hub.pending_publishes.keys().copied().collect();
+    assert_eq!(ids.len(), 3, "fixture invariant: three held publishes");
+    let me = fix.hub.node_id.0.clone();
+    for (n, id) in (1..=3).zip(&ids) {
+        plant_held_copy(&fix, "keeper", &format!("q/{n}"), &me, *id).await;
+    }
+    assert_eq!(fix.queued("keeper").await.len(), 3);
+    assert!(fix.queued("fresh").await.is_empty());
+
+    fix.scan_lands(&["keeper", "fresh"], false).await;
+
+    let keeper = fix.queued("keeper").await;
+    assert_eq!(
+        keeper.len(),
+        3,
+        "the settle pass stored a publish a second time in a session that \
+         already held it (#784): each copy replays as a new message with DUP = 0. \
+         Queue: {keeper:?}"
+    );
+    let fresh = fix.queued("fresh").await;
+    assert_eq!(
+        fresh.len(),
+        3,
+        "a session that did not hold the publishes must still receive every one \
+         of them: the dedupe may skip only a copy that exists. Queue: {fresh:?}"
+    );
+    // And the replayed copies carry the publish's identity in turn, so a LATER
+    // replay (another takeover) recognises them too.
+    for (q, id) in fresh.iter().zip(&ids) {
+        assert_eq!(
+            q.origin,
+            Some(mqtt_storage::PublishOrigin {
+                node: me.clone(),
+                id: *id
+            })
+        );
+    }
+}
+
+/// **#784, the re-route.** A takeover re-route arrives at the node the session
+/// moved to, marked as a replay and carrying the publish's identity (proto 12).
+/// The receiver skips a session whose queue already holds that publish, and
+/// stores a different publish as usual. A FIRST delivery (`replay: false`) never
+/// pays for the check, whatever it carries.
+#[tokio::test]
+async fn a_rerouted_forward_skips_a_session_that_already_holds_the_publish() {
+    let mut fix = clustered_fixture();
+    fix.store_only_session("keeper", "q/#").await;
+    fix.scan_lands(&["keeper"], false).await;
+    plant_held_copy(&fix, "keeper", "q/1", "origin-node", 41).await;
+
+    let forward =
+        |seq: u64, topic: &str, origin: u64, replay: bool| HubCommand::RemotePublishAcked {
+            node: NodeId("origin-node".into()),
+            seq,
+            topic: topic.into(),
+            payload: Bytes::from_static(b"settle-gate"),
+            qos: QoS::AtLeastOnce,
+            retain: false,
+            message_expiry: None,
+            app: AppProperties::default(),
+            origin: Some(origin),
+            replay,
+        };
+    // The re-route of the publish the dead owner already stored: skipped.
+    fix.dispatch(forward(1, "q/1", 41, true)).await;
+    assert_eq!(
+        fix.queued("keeper").await.len(),
+        1,
+        "a re-routed publish was stored again in a session that already held it (#784)"
+    );
+    // The re-route of a publish the session does NOT hold: stored, tagged.
+    fix.dispatch(forward(2, "q/2", 42, true)).await;
+    let queued = fix.queued("keeper").await;
+    assert_eq!(
+        queued.len(),
+        2,
+        "a publish the session lacks must be stored"
+    );
+    assert_eq!(
+        queued[1].origin,
+        Some(mqtt_storage::PublishOrigin {
+            node: "origin-node".into(),
+            id: 42
+        })
+    );
+    // A first delivery is never checked: even a repeat of an id is stored (the
+    // receiver's repeat window, not the queue, is what recognises a retransmit).
+    fix.dispatch(forward(3, "q/3", 41, false)).await;
+    assert_eq!(fix.queued("keeper").await.len(), 3);
+}
+
+/// **#784, mixed versions.** A proto-11 peer cannot carry the publish's identity, so
+/// it is sent the untagged `PublishAcked`, and an untagged forward arriving here is
+/// stored as before — no check, no tag. The upgrade window therefore keeps today's
+/// behaviour on old links (a re-route can duplicate, legal at `QoS` 1) and never
+/// drops a message.
+#[tokio::test]
+async fn a_proto_11_peer_gets_the_untagged_forward_and_an_untagged_replay_still_delivers() {
+    let mut fix = clustered_fixture();
+    let (peer_tx, mut peer_rx): (PeerOutbound, _) = mpsc::unbounded_channel();
+    fix.dispatch(HubCommand::PeerConnected {
+        node: NodeId("old-peer".into()),
+        conn_id: 1,
+        ctl: peer_tx.clone(),
+        tx: peer_tx,
+        cert_serial: None,
+        proto: mqtt_cluster::peer::PROTO_FORWARD_REACHED,
+        depth: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+    })
+    .await;
+    fix.dispatch(HubCommand::RemoteInterest {
+        node: NodeId("old-peer".into()),
+        filters: vec!["q/#".into()],
+    })
+    .await;
+    let _ack = fix.publish_gated("q/1").await;
+    let mut untagged = 0;
+    while let Ok(frame) = peer_rx.try_recv() {
+        match frame {
+            PeerMessage::PublishAcked { .. } => untagged += 1,
+            PeerMessage::PublishAckedTagged { .. } => {
+                panic!("a proto-11 peer was sent a proto-12 frame it cannot decode")
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(untagged, 1, "the proto-11 peer must get its acked forward");
+
+    // The receiving side, on a node of its own: an untagged forward (from an old
+    // sender) to a session that already holds a copy of the same message is stored
+    // again — the old behaviour, a QoS 1 duplicate, never a loss.
+    let mut fix = clustered_fixture();
+    fix.store_only_session("keeper", "q/#").await;
+    fix.scan_lands(&["keeper"], false).await;
+    plant_held_copy(&fix, "keeper", "q/9", "old-peer", 7).await;
+    fix.dispatch(HubCommand::RemotePublishAcked {
+        node: NodeId("old-peer".into()),
+        seq: 1,
+        topic: "q/9".into(),
+        payload: Bytes::from_static(b"settle-gate"),
+        qos: QoS::AtLeastOnce,
+        retain: false,
+        message_expiry: None,
+        app: AppProperties::default(),
+        origin: None,
+        replay: false,
+    })
+    .await;
+    let queued = fix.queued("keeper").await;
+    assert_eq!(
+        queued.len(),
+        2,
+        "an untagged forward must be stored as before"
+    );
+    assert_eq!(queued[1].origin, None);
 }

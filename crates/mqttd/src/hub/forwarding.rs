@@ -508,7 +508,12 @@ pub(super) struct ForwardObligation {
 pub(super) enum ForwardKind {
     /// An interest-driven fan-out forward ([`PeerMessage::PublishAcked`]): the peer
     /// delivers to whichever of its own subscribers match.
-    Ordinary,
+    Ordinary {
+        /// A takeover re-route (#784): the publish was already forwarded to a node
+        /// that may have stored it before dying, so the receiver skips a session
+        /// whose queue already holds it. Retransmits carry the same flag.
+        replay: bool,
+    },
     /// A shared-group delivery targeted at one named member
     /// ([`PeerMessage::SharedDeliverAcked`], proto 7). A refusal here does not refuse
     /// the publisher: a shared group exists so that one member's browned-out node
@@ -590,8 +595,11 @@ impl Hub {
                 // A gated publisher IS waiting on this id, so a refusal here is
                 // answerable — but only as a WITHHOLD if the original fan-out
                 // already stored the message (or still might, via an in-flight
-                // lane append), which `refuse_pending` enforces.
-                &AppendGate::Pending(id),
+                // lane append), which `refuse_pending` enforces. A REPLAY gate
+                // (#784): the session may already hold this publish — stored by a
+                // node that died before the session moved here — and the append
+                // is skipped if it does.
+                &AppendGate::Replay(id),
             ));
         }
         all_durable
@@ -688,7 +696,7 @@ impl Hub {
                 }
             }
             for node in candidates {
-                self.send_acked_forward(id, &node);
+                self.send_acked_forward(id, &node, true);
             }
             if window_over {
                 if let Some(p) = self.pending_publishes.get_mut(id) {
@@ -760,7 +768,7 @@ impl Hub {
             // QoS 0 fan-out below never mints one.
             for c in &interested_nodes {
                 let node = NodeId(c.as_str().to_string());
-                self.send_acked_forward(id, &node);
+                self.send_acked_forward(id, &node, false);
             }
             if !retain_broadcasts {
                 self.interest_scratch = interested_nodes;
@@ -849,13 +857,14 @@ impl Hub {
     }
 
     /// Send (or re-send, on re-route) one acked forward of pending publish `id` to
-    /// `node`, recording the obligation (ADR 0042 T9, exhibit ⑤).
-    pub(super) fn send_acked_forward(&mut self, id: u64, node: &NodeId) {
+    /// `node`, recording the obligation (ADR 0042 T9, exhibit ⑤). `replay` marks a
+    /// takeover re-route (#784).
+    pub(super) fn send_acked_forward(&mut self, id: u64, node: &NodeId, replay: bool) {
         self.register_forward(
             id,
             ForwardObligation {
                 node: node.clone(),
-                kind: ForwardKind::Ordinary,
+                kind: ForwardKind::Ordinary { replay },
             },
         );
     }
@@ -875,7 +884,8 @@ impl Hub {
         let Some(p) = self.pending_publishes.get_mut(id) else {
             return;
         };
-        let frame = forward_frame(p, seq, &obligation);
+        let proto = self.peers.get(&node).map_or(0, |peer| peer.proto);
+        let frame = forward_frame(id, p, seq, &obligation, proto);
         // Issue #480. Counted where the obligation is RECORDED rather than where
         // the frame is written, so a forward to a link that is momentarily down
         // still counts: the sweep will send it when the link returns, and it
@@ -884,7 +894,7 @@ impl Hub {
         if let Some(m) = &self.metrics {
             m.publish_forwarded(match obligation.kind {
                 ForwardKind::Shared { .. } => "shared-remote",
-                ForwardKind::Ordinary => "subscriber-remote",
+                ForwardKind::Ordinary { .. } => "subscriber-remote",
             });
         }
         p.awaiting.insert(seq, obligation);
@@ -1335,7 +1345,7 @@ impl Hub {
                 ForwardKind::Shared { .. } => {
                     self.reselect_shared(id, obligation, DurableOutcome::Refused(r));
                 }
-                ForwardKind::Ordinary => self.refuse_pending(id, r),
+                ForwardKind::Ordinary { .. } => self.refuse_pending(id, r),
             },
         }
     }
@@ -1395,7 +1405,9 @@ impl Hub {
                 // from the first send — and, since 0041-T12, so a SHARED obligation
                 // retransmits `SharedDeliverAcked` rather than a fan-out
                 // `PublishAcked` that would deliver to the wrong subscribers.
-                let _ = peer.tx.send(forward_frame(p, *seq, obligation));
+                let _ = peer
+                    .tx
+                    .send(forward_frame(id, p, *seq, obligation, peer.proto));
             }
             // Re-route after a target death (grace engaged by peer_dead).
             let Some(p) = self.pending_publishes.get(id) else {
@@ -1415,7 +1427,7 @@ impl Hub {
                     p.reroute_grace = None;
                 }
                 for node in candidates {
-                    self.send_acked_forward(id, &node);
+                    self.send_acked_forward(id, &node, true);
                 }
                 continue;
             }
@@ -2241,7 +2253,7 @@ mod zone_fwd_proofs {
     /// unsettled (so its ack is held), with the forward sent and its seq returned.
     fn held_forward(h: &mut Hub, peer: &NodeId) -> (u64, u64, oneshot::Receiver<PublishOutcome>) {
         let (id, rx) = register(h, "t/x");
-        h.send_acked_forward(id, peer);
+        h.send_acked_forward(id, peer, false);
         h.pending_local_done(id);
         let seq = *h.pending_publishes[&id]
             .awaiting
@@ -2689,7 +2701,7 @@ mod pending_bounds {
             Arc::default(),
         );
         let (id, _wait) = register(&mut hub, "t", &Bytes::from_static(b"x"));
-        hub.send_acked_forward(id, &peer);
+        hub.send_acked_forward(id, &peer, false);
         while rx.try_recv().is_ok() {}
 
         hub.sweep_pending_forwards();
@@ -2742,7 +2754,7 @@ mod pending_bounds {
         back_date(&mut hub, crate::hub::SESSION_SWEEP_INTERVAL * 8);
 
         // The re-route: a NEW obligation, sent now.
-        hub.send_acked_forward(id, &peer);
+        hub.send_acked_forward(id, &peer, false);
         assert!(rx.try_recv().is_ok(), "the re-routed forward is sent");
         assert!(rx.try_recv().is_err());
 
@@ -2789,7 +2801,7 @@ mod pending_bounds {
             let mut waits = Vec::with_capacity(entries);
             for _ in 0..entries {
                 let (id, wait) = register(&mut hub, "fleet/site/1/telemetry", &payload);
-                hub.send_acked_forward(id, &peer);
+                hub.send_acked_forward(id, &peer, false);
                 waits.push(wait);
             }
             while rx.try_recv().is_ok() {}
