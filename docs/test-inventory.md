@@ -500,6 +500,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `placement::tests::this_node_is_never_removed`
 - `placement::tests::visiting_the_member_set_never_calls_the_allocating_one`
 - `placement::tests::voter_restricted_owner_is_always_a_voter`
+- `raft_mesh::tests::a_prev_log_id_newer_than_the_applied_entry_at_or_below_its_index_contradicts`
 - `raft_mesh::tests::two_nodes_elect_and_replicate_over_the_wire`
 - `repl_net::tests::a_log_larger_than_a_frame_is_read_in_pages`
 - `repl_net::tests::a_paged_read_that_stops_short_fails_whole`

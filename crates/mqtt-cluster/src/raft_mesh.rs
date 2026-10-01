@@ -85,10 +85,13 @@ enum RpcReply {
 #[must_use]
 pub async fn dispatch(raft: &LeaseRaft, payload: &[u8]) -> Vec<u8> {
     let reply = match strict_decode::<RpcRequest>(payload) {
-        Ok(RpcRequest::AppendEntries(rpc)) => match raft.append_entries(rpc).await {
-            Ok(r) => RpcReply::AppendEntries(r),
-            Err(e) => RpcReply::Err(e.to_string()),
-        },
+        Ok(RpcRequest::AppendEntries(rpc)) => {
+            report_contradicting_append(raft, &rpc);
+            match raft.append_entries(rpc).await {
+                Ok(r) => RpcReply::AppendEntries(r),
+                Err(e) => RpcReply::Err(e.to_string()),
+            }
+        }
         Ok(RpcRequest::Vote(rpc)) => match raft.vote(rpc).await {
             Ok(r) => RpcReply::Vote(r),
             Err(e) => RpcReply::Err(e.to_string()),
@@ -100,6 +103,49 @@ pub async fn dispatch(raft: &LeaseRaft, payload: &[u8]) -> Vec<u8> {
         Err(e) => RpcReply::Err(format!("undecodable raft rpc: {e}")),
     };
     postcard::to_allocvec(&reply).unwrap_or_default()
+}
+
+/// Whether a leader's `prev_log_id` contradicts this node's applied log (#754).
+///
+/// Every entry at or below `last_applied` is committed, and committed entries never
+/// change, so a `prev_log_id` at such an index can name a leader no newer than the one
+/// that wrote the applied entry. A newer one means some node's lease-Raft state went
+/// backwards. openraft checks the same thing only as a `debug_assert` (against
+/// `committed`, which is never behind `last_applied`), so a release build would accept
+/// it silently and a debug build panics without saying who sent what.
+fn prev_contradicts_applied(
+    prev: Option<&openraft::LogId<RaftNodeId>>,
+    applied: Option<&openraft::LogId<RaftNodeId>>,
+) -> bool {
+    match (prev, applied) {
+        (Some(prev), Some(applied)) => {
+            prev.index <= applied.index && prev.leader_id > applied.leader_id
+        }
+        _ => false,
+    }
+}
+
+/// Log the evidence when an inbound `AppendEntries` contradicts the applied log (#754),
+/// before openraft sees it. The condition is impossible in a correct cluster, so this
+/// costs one metrics read per request and logs nothing.
+fn report_contradicting_append(raft: &LeaseRaft, rpc: &AppendEntriesRequest<LeaseConfig>) {
+    let metrics = raft.metrics();
+    let m = metrics.borrow();
+    if prev_contradicts_applied(rpc.prev_log_id.as_ref(), m.last_applied.as_ref()) {
+        tracing::error!(
+            local = m.id,
+            local_vote = %m.vote,
+            request_vote = %rpc.vote,
+            prev_log_id = ?rpc.prev_log_id,
+            last_applied = ?m.last_applied,
+            last_log_index = ?m.last_log_index,
+            leader_commit = ?rpc.leader_commit,
+            entries = rpc.entries.len(),
+            membership = ?m.membership_config,
+            "lease raft: a leader named a log id newer than this node's applied entry at \
+             that index; some node's lease-Raft state went backwards (#754)"
+        );
+    }
 }
 
 struct Pending {
@@ -332,6 +378,32 @@ impl RaftNetwork<LeaseConfig> for MeshConn {
 
 #[cfg(test)]
 mod tests {
+    /// #754: a `prev_log_id` at or below the applied index is contradictory exactly
+    /// when its leader is newer than the applied entry's.
+    #[test]
+    fn a_prev_log_id_newer_than_the_applied_entry_at_or_below_its_index_contradicts() {
+        use openraft::{CommittedLeaderId, LogId};
+        let id = |term, node, index| LogId::new(CommittedLeaderId::new(term, node), index);
+        let applied = id(3, 1, 10);
+        let check = |prev: LogId<u64>| super::prev_contradicts_applied(Some(&prev), Some(&applied));
+        assert!(check(id(4, 2, 10)), "same index, newer leader");
+        assert!(
+            check(id(3, 2, 7)),
+            "lower index, same term, newer leader node"
+        );
+        assert!(!check(id(3, 1, 10)), "the applied entry itself");
+        assert!(
+            !check(id(2, 9, 7)),
+            "an older leader below the applied index"
+        );
+        assert!(
+            !check(id(5, 1, 11)),
+            "past the applied index, the log decides"
+        );
+        assert!(!super::prev_contradicts_applied(None, Some(&applied)));
+        assert!(!super::prev_contradicts_applied(Some(&applied), None));
+    }
+
     use super::{dispatch, MeshRaftNetwork};
     use crate::lease_group::{config, LeaseRaft};
     use crate::lease_raft::{LeaseRecord, LeaseRequest};
