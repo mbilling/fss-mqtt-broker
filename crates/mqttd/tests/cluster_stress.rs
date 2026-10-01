@@ -3216,8 +3216,10 @@ async fn a_cross_node_shared_subscriber_is_never_bypassed_by_an_ack() {
     // The group's first member: ONLINE and PERSISTENT (a shared subscriber is a persistent
     // subscriber, #164) on the node about to be browned out.
     let deadline = Instant::now() + Duration::from_secs(60);
+    let started = Instant::now();
+    let mut attempts = Vec::new();
     let (mut member_b, _) = loop {
-        if let Some(ok) = common::Client::connect_v311_within(
+        match common::Client::connect_v311_explained(
             nodes[refusing_idx].client_addr,
             &refusing_id,
             false,
@@ -3225,11 +3227,13 @@ async fn a_cross_node_shared_subscriber_is_never_bypassed_by_an_ack() {
         )
         .await
         {
-            break ok;
+            Ok(ok) => break ok,
+            Err(why) => attempts.push(format!("{:.1}s: {why}", started.elapsed().as_secs_f64())),
         }
         assert!(
             Instant::now() < deadline,
-            "member never connected to its owner"
+            "member {refusing_id} never connected to its owner {}; attempts: {attempts:#?}",
+            nodes[refusing_idx].node_id.0
         );
         tokio::time::sleep(Duration::from_millis(500)).await;
     };

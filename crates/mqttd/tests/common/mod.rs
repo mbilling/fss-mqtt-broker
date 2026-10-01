@@ -498,11 +498,27 @@ impl Client {
         clean: bool,
         wait: Duration,
     ) -> Option<(Self, bool)> {
-        // A refused/unreachable TCP connect is also a `None` (not a panic):
+        Self::connect_v311_explained(addr, client_id, clean, wait)
+            .await
+            .ok()
+    }
+
+    /// [`connect_v311_within`](Self::connect_v311_within), but a failure says what
+    /// happened (TCP refused or timed out, CONNACK code, no CONNACK, closed), so a
+    /// caller that gives up can report why every attempt failed (#724).
+    pub async fn connect_v311_explained(
+        addr: SocketAddr,
+        client_id: &str,
+        clean: bool,
+        wait: Duration,
+    ) -> Result<(Self, bool), String> {
+        // A refused/unreachable TCP connect is also an `Err` (not a panic):
         // the out-of-process harness (ADR 0044) dials brokers that may still
         // be booting — or be SIGKILLED — and its callers retry.
-        let Ok(Ok(stream)) = timeout(wait, TcpStream::connect(addr)).await else {
-            return None;
+        let stream = match timeout(wait, TcpStream::connect(addr)).await {
+            Ok(Ok(stream)) => stream,
+            Ok(Err(e)) => return Err(format!("tcp connect failed: {e}")),
+            Err(_) => return Err(format!("tcp connect timed out after {wait:?}")),
         };
         let (rh, wh) = stream.into_split();
         let mut c = Client {
@@ -521,10 +537,14 @@ impl Client {
         }))
         .await;
         match timeout(wait, c.reader.next_packet()).await {
-            Ok(Ok(Some(Packet::ConnAck(a)))) if a.code == 0 => Some((c, a.session_present)),
+            Ok(Ok(Some(Packet::ConnAck(a)))) if a.code == 0 => Ok((c, a.session_present)),
             // Refused (transient Server-unavailable), timed out, errored, or closed:
             // the caller retries a fresh connect.
-            _ => None,
+            Ok(Ok(Some(Packet::ConnAck(a)))) => Err(format!("CONNACK code {:#04x}", a.code)),
+            Ok(Ok(Some(other))) => Err(format!("expected CONNACK, got {other:?}")),
+            Ok(Ok(None)) => Err("closed before CONNACK".into()),
+            Ok(Err(e)) => Err(format!("read error before CONNACK: {e}")),
+            Err(_) => Err(format!("no CONNACK within {wait:?}")),
         }
     }
 
