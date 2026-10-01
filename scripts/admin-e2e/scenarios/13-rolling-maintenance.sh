@@ -3,7 +3,7 @@
 # node, uncordon — and the client reconnects to its intact session and gets the message.
 #
 # The restart is a kill + start, not a graceful stop. Known defect (reported with this
-# suite): after a GRACEFUL stop (SIGTERM, drained) and a start with the same id and data
+# suite as #783): after a GRACEFUL stop (SIGTERM, drained) and a start with the same id and data
 # dir, the other nodes keep the node DEAD in their membership (re-declared every 30 s, still
 # excluded after 2 min, with or without a pause before the start) while it believes it has
 # rejoined. Switch this back to `node_restart` once that is fixed.

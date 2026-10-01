@@ -214,7 +214,7 @@
 
 **0081 — # 0081. An authenticated admin API: reads cluster-wide, actions audited, config stays in the file**
 
-- `0081-T16` ⬜ planned ([#771](https://github.com/mbilling/fss-mqtt-broker/issues/771)): "Admin e2e scenario suite (kill, partition, scale, decommission, durability, policy, drills), nightly in CI" — "Extends scripts/admin-e2e.sh; one fresh cluster per scenario; asserts through the admin API."
+- `0081-T16` 🚧 in-progress ([#771](https://github.com/mbilling/fss-mqtt-broker/issues/771)): "Admin e2e scenario suite (kill, partition, scale, decommission, durability, policy, drills), nightly in CI" — "Extends scripts/admin-e2e.sh; one fresh cluster per scenario; asserts through the admin API."
 - `0081-T17` ⬜ planned ([#772](https://github.com/mbilling/fss-mqtt-broker/issues/772)): "Cluster-wide clients/session/subscribers (--all-nodes, scope=cluster)"
 - `0081-T18` ⬜ planned ([#773](https://github.com/mbilling/fss-mqtt-broker/issues/773)): "Hot reload of the admin listener's certificate, key and CA"
 - `0081-T19` ⬜ planned ([#774](https://github.com/mbilling/fss-mqtt-broker/issues/774)): "CLI output polish: compact cluster table, wrapped help"

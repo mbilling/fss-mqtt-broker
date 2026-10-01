@@ -2,7 +2,7 @@
 # its owner node is killed; the session — with the messages — shows up on a surviving node,
 # and the client reconnecting there receives all three.
 #
-# Known defect this surfaces (reported, not asserted): when the owner dies within seconds
+# Known defect this surfaces (#784; reported, not asserted): when the owner dies within seconds
 # of the enqueue, the promoted copy holds every message twice (queued 6, each delivered
 # twice). QoS 1 allows redelivery, so survival is what passes or fails here; the count is
 # printed as a NOTE so a fix shows up in the nightly log.
