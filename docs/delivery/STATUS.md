@@ -60,7 +60,7 @@
 | [0050](../adr/0050-oidc-token-authentication.md) | OIDC-integrated token authentication (discovery, JWKS rotation, proven against a real IdP) | Accepted | [5/5 done](0050-oidc-token-authentication.md) | — |
 | [0051](../adr/0051-evaluation-readiness.md) | Evaluation readiness: an assessable, comparable, migratable first release | Proposed | [21/23 done](0051-evaluation-readiness.md) | 2 open |
 | [0052](../adr/0052-codec-succession.md) | Codec succession: postcard replaces bincode on every cluster surface | Accepted | [4/4 done](0052-codec-succession.md) | — |
-| [0053](../adr/0053-single-crypto-provider-aws-lc-rs.md) | One crypto provider: aws-lc-rs everywhere, ring evicted | Accepted | [4/5 done](0053-single-crypto-provider.md) | 1 open |
+| [0053](../adr/0053-single-crypto-provider-aws-lc-rs.md) | One crypto provider: aws-lc-rs everywhere, ring evicted | Accepted | [5/5 done](0053-single-crypto-provider.md) | — |
 | [0054](../adr/0054-operator-facing-state-surface.md) | Operator-facing state surface: `/statusz` + state gauges | Accepted | [5/5 done](0054-operator-facing-state-surface.md) | — |
 | [0055](../adr/0055-kubernetes-operator.md) | The mqttd Kubernetes operator (`MqttdCluster` CRD, kube-rs controller) | Accepted | [10/12 done](0055-kubernetes-operator.md) | 2 open |
 | [0056](../adr/0056-mqttui.md) | `mqttui`: a terminal UI for running the demo, migration and test scripts | Proposed | [10/10 done](0056-mqttui.md) | — |
@@ -160,10 +160,6 @@
 
 - `0051-T8` ⬜ planned ([#546](https://github.com/mbilling/fss-mqtt-broker/issues/546)): Migration from NanoMQ — scripts/migrate/from-nanomq.py (listeners, TLS, auth, bridge config → common-subset TOML) + guide + fixture tests; same three converter rules
 - `0051-T10` ⬜ planned ([#547](https://github.com/mbilling/fss-mqtt-broker/issues/547)): The bridge made assessable — a demo/ second security zone (Mosquitto upstream + mqtt-bridge with directional rules), a walkthrough doc, and the Grafana screenshot into the README
-
-**0053 — One crypto provider: aws-lc-rs everywhere, ring evicted**
-
-- `0053-T5` ⬜ planned ([#548](https://github.com/mbilling/fss-mqtt-broker/issues/548)): FIPS-mode evaluation (aws-lc-rs fips feature — the ADR 0002 certified-builds line) and rcgen 0.13→0.14 Issuer migration
 
 **0055 — The mqttd Kubernetes operator (`MqttdCluster` CRD, kube-rs controller)**
 
