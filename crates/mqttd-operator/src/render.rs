@@ -143,6 +143,26 @@ const DEFAULT_PVC_SIZE: &str = "10Gi";
 const PEER_TLS_PATH: &str = "/etc/mqttd/cluster";
 /// Mount path for the gossip-key Secret (the chart's `secrets.gossipKey.mountPath`).
 const GOSSIP_PATH: &str = "/etc/mqttd/gossip";
+/// Mount path for the admin client-CA Secret (the chart's `admin.clientCa.mountPath`).
+const ADMIN_CA_PATH: &str = "/etc/mqttd/admin";
+/// The admin API port (ADR 0081), on the container and the headless Service.
+const ADMIN_PORT: i64 = 9443;
+
+/// The admin API settings when they can be rendered: the CR asks for it AND names the
+/// cluster-bus Secret whose per-pod leaf serves it (the chart `fail`s without one; the
+/// operator renders nothing rather than a broker that cannot start).
+fn admin(cr: &MqttdCluster) -> Option<&crate::crd::AdminSpec> {
+    let peer_tls = cr
+        .spec
+        .secrets
+        .as_ref()
+        .and_then(|s| s.peer_tls.as_ref())
+        .is_some();
+    cr.spec
+        .admin
+        .as_ref()
+        .filter(|a| peer_tls && (!a.viewers.is_empty() || !a.operators.is_empty()))
+}
 
 /// Every object the operator owns for one `MqttdCluster`.
 #[derive(Debug)]
@@ -218,7 +238,7 @@ pub fn render(cr: &MqttdCluster, observed_pvc_max: Option<u64>) -> Rendered {
     Rendered {
         serviceaccount: serviceaccount(&names),
         configmap: configmap(cr, &names),
-        services: vec![headless_service(&names), client_service(&names)],
+        services: vec![headless_service(cr, &names), client_service(&names)],
         pdb: pdb(&names),
         statefulset: statefulset(cr, &names, observed_pvc_max),
     }
@@ -249,8 +269,8 @@ fn configmap(cr: &MqttdCluster, names: &Names) -> Value {
     })
 }
 
-fn headless_service(names: &Names) -> Value {
-    json!({
+fn headless_service(cr: &MqttdCluster, names: &Names) -> Value {
+    let mut svc = json!({
         "apiVersion": "v1",
         "kind": "Service",
         "metadata": {
@@ -268,7 +288,14 @@ fn headless_service(names: &Names) -> Value {
                 { "name": "gossip", "port": 7946, "targetPort": "gossip", "protocol": "UDP" },
             ],
         },
-    })
+    });
+    // The admin API, pod to pod (ADR 0081) — never on the client-facing Service.
+    if admin(cr).is_some() {
+        if let Some(ports) = svc["spec"]["ports"].as_array_mut() {
+            ports.push(json!({ "name": "admin", "port": ADMIN_PORT, "targetPort": "admin", "protocol": "TCP" }));
+        }
+    }
+    svc
 }
 
 fn client_service(names: &Names) -> Value {
@@ -343,6 +370,13 @@ fn secret_wiring(cr: &MqttdCluster) -> (Vec<Value>, Vec<Value>) {
             "gossip-key",
             GOSSIP_PATH,
             json!({ "name": "gossip-key", "secret": { "secretName": key } }),
+        );
+    }
+    if let Some(a) = admin(cr) {
+        add(
+            "admin-client-ca",
+            ADMIN_CA_PATH,
+            json!({ "name": "admin-client-ca", "secret": { "secretName": a.client_ca_secret } }),
         );
     }
     (mounts, volumes)
@@ -440,6 +474,29 @@ fn statefulset(cr: &MqttdCluster, names: &Names, observed_pvc_max: Option<u64>) 
         broker_env.push(
             json!({ "name": "MQTTD_SWIM_KEY_FILE", "value": format!("{GOSSIP_PATH}/swim-key") }),
         );
+    }
+    // The admin API (ADR 0081), served with the pod's own cluster-bus leaf — the same
+    // variables, values and order as the chart's `mqttd.brokerEnv`.
+    let admin = admin(cr);
+    if let Some(a) = admin {
+        broker_env
+            .push(json!({ "name": "MQTTD_ADMIN_BIND", "value": format!("0.0.0.0:{ADMIN_PORT}") }));
+        broker_env.push(
+            json!({ "name": "MQTTD_ADMIN_CERT", "value": format!("{PEER_TLS_PATH}/$(POD_NAME).crt") }),
+        );
+        broker_env.push(
+            json!({ "name": "MQTTD_ADMIN_KEY", "value": format!("{PEER_TLS_PATH}/$(POD_NAME).key") }),
+        );
+        broker_env.push(
+            json!({ "name": "MQTTD_ADMIN_CLIENT_CA", "value": format!("{ADMIN_CA_PATH}/ca.crt") }),
+        );
+        if !a.viewers.is_empty() {
+            broker_env.push(json!({ "name": "MQTTD_ADMIN_VIEWERS", "value": a.viewers.join(";") }));
+        }
+        if !a.operators.is_empty() {
+            broker_env
+                .push(json!({ "name": "MQTTD_ADMIN_OPERATORS", "value": a.operators.join(";") }));
+        }
     }
     let (secret_mounts, secret_volumes) = secret_wiring(cr);
     let persistence = cr.spec.persistence.as_ref();
@@ -567,6 +624,13 @@ fn statefulset(cr: &MqttdCluster, names: &Names, observed_pvc_max: Option<u64>) 
             }],
         },
     });
+    if admin.is_some() {
+        if let Some(ports) =
+            sts["spec"]["template"]["spec"]["containers"][0]["ports"].as_array_mut()
+        {
+            ports.push(json!({ "name": "admin", "containerPort": ADMIN_PORT }));
+        }
+    }
     // Emitted only when there is something to emit, so a secret-less CR renders a
     // container with NO env key — exactly what the chart's `{{- with ... }}` does.
     if !broker_env.is_empty() {
@@ -667,6 +731,78 @@ mod tests {
             }
         }))
         .expect("sample CR")
+    }
+
+    /// ADR 0081 T15: `spec.admin` with the cluster-bus Secret renders the admin API —
+    /// the `MQTTD_ADMIN_*` env served with each pod's own leaf, the client-CA mount and the
+    /// admin port on the container and the headless Service (never the client Service).
+    /// Without `peerTls`, or with no subject in either role list, it renders nothing
+    /// rather than a broker that cannot start.
+    #[test]
+    fn the_admin_api_renders_only_with_the_cluster_bus_and_a_role() {
+        let with = |secrets: serde_json::Value, admin: serde_json::Value| {
+            let mut cr = sample();
+            cr.spec.secrets = serde_json::from_value(secrets).unwrap();
+            cr.spec.admin = serde_json::from_value(admin).unwrap();
+            render(&cr, None)
+        };
+        let names = |v: &serde_json::Value| -> Vec<String> {
+            v.as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|e| e["name"].as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let peer = serde_json::json!({ "peerTls": "mqttd-peer-tls" });
+        let admin =
+            serde_json::json!({ "clientCaSecret": "mqttd-admin-ca", "operators": ["CN=root"] });
+
+        let r = with(peer.clone(), admin.clone());
+        let pod = &r.statefulset["spec"]["template"]["spec"];
+        let container = &pod["containers"][0];
+        let env = &container["env"];
+        let value = |name: &str| {
+            env.as_array()
+                .unwrap()
+                .iter()
+                .find(|e| e["name"] == name)
+                .and_then(|e| e["value"].as_str())
+                .map(String::from)
+        };
+        assert_eq!(value("MQTTD_ADMIN_BIND").as_deref(), Some("0.0.0.0:9443"));
+        assert_eq!(
+            value("MQTTD_ADMIN_CERT").as_deref(),
+            Some("/etc/mqttd/cluster/$(POD_NAME).crt")
+        );
+        assert_eq!(
+            value("MQTTD_ADMIN_CLIENT_CA").as_deref(),
+            Some("/etc/mqttd/admin/ca.crt")
+        );
+        assert_eq!(value("MQTTD_ADMIN_OPERATORS").as_deref(), Some("CN=root"));
+        assert_eq!(value("MQTTD_ADMIN_VIEWERS"), None);
+        assert!(names(&container["ports"]).contains(&"admin".to_string()));
+        assert!(names(&container["volumeMounts"]).contains(&"admin-client-ca".to_string()));
+        assert!(names(&pod["volumes"]).contains(&"admin-client-ca".to_string()));
+        assert!(names(&r.services[0]["spec"]["ports"]).contains(&"admin".to_string()));
+        assert!(!names(&r.services[1]["spec"]["ports"]).contains(&"admin".to_string()));
+
+        // No cluster bus, or no role: nothing admin-shaped at all.
+        for r in [
+            with(serde_json::Value::Null, admin),
+            with(
+                peer,
+                serde_json::json!({ "clientCaSecret": "mqttd-admin-ca" }),
+            ),
+        ] {
+            let text = serde_json::to_string(&r.statefulset).unwrap();
+            assert!(
+                !text.contains("MQTTD_ADMIN_") && !text.contains("admin-client-ca"),
+                "{text}"
+            );
+            assert!(!names(&r.services[0]["spec"]["ports"]).contains(&"admin".to_string()));
+        }
     }
 
     /// Run the REAL init script with the given inputs; return the rendered config.

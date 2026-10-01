@@ -135,6 +135,23 @@ for i in 0 1 2; do
 done
 echo "peer-bus Secret carries ca.crt + one leaf per pod, and no CA private key"
 
+log "Mint the admin client CA + one operator client certificate (ADR 0081 T15)"
+# A DEDICATED CA, as the chart asks: only its ca.crt goes into the cluster. The client leaf
+# (CN=smoke-admin, clientAuth) stays on this host and is what curl presents below.
+OPENSSL="${OPENSSL:-openssl}"
+ADMIN_PKI="$PKI_DIR/admin"
+mkdir -p "$ADMIN_PKI"
+"$OPENSSL" req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
+  -keyout "$ADMIN_PKI/ca.key" -out "$ADMIN_PKI/ca.crt" -subj "/CN=smoke admin CA" -days 2 \
+  -addext "basicConstraints=critical,CA:TRUE" -addext "keyUsage=critical,keyCertSign,cRLSign" \
+  2>/dev/null
+"$OPENSSL" req -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
+  -keyout "$ADMIN_PKI/client.key" -out "$ADMIN_PKI/client.csr" -subj "/CN=smoke-admin" 2>/dev/null
+printf 'basicConstraints=CA:FALSE\nextendedKeyUsage=clientAuth\n' >"$ADMIN_PKI/client.ext"
+"$OPENSSL" x509 -req -in "$ADMIN_PKI/client.csr" -CA "$ADMIN_PKI/ca.crt" -CAkey "$ADMIN_PKI/ca.key" \
+  -CAcreateserial -out "$ADMIN_PKI/client.crt" -days 2 -extfile "$ADMIN_PKI/client.ext" 2>/dev/null
+kubectl -n "$NS" create secret generic mqttd-admin-ca --from-file=ca.crt="$ADMIN_PKI/ca.crt"
+
 log "helm install the chart (smoke values, cluster bus ON)"
 helm install "$RELEASE" "$CHART" -n "$NS" -f "$SMOKE_VALUES" \
   --set image.repository="${IMAGE%:*}" --set image.tag="${IMAGE#*:}" \
@@ -166,6 +183,45 @@ for i in 0 1 2; do
          printf '%s\n' "$plog" | grep 'Common Name'; exit 1; }
 done
 echo "all 3 pods: peer listener mtls=true, gossip SIGNED per-node, no CN-binding drops"
+
+log "Admin API — mTLS on every pod, roles from the chart, and the cluster view (ADR 0081 T15)"
+# Through a port-forward to pod-0, with the server name pinned to the pod's DNS name: the
+# listener serves the pod's own cluster-bus leaf, whose SAN is that name and whose issuer is
+# the cluster CA. The cluster view then proves pod-0 reached the OTHER pods' admin listeners
+# over the headless Service with the same certificates — the T15 wiring end to end.
+ADMIN_HOST="$STS-0.$STS-headless.$NS.svc.cluster.local"
+kubectl -n "$NS" port-forward "pod/$STS-0" 19443:9443 >"$PKI_DIR/port-forward.log" 2>&1 &
+PF_PID=$!
+admin_get() { # admin_get <path> — the response body; fails on any non-2xx
+  curl -sS --fail-with-body --max-time 20 \
+    --resolve "$ADMIN_HOST:19443:127.0.0.1" --cacert "$PKI_DIR/ca/cluster-ca.pem" \
+    --cert "$ADMIN_PKI/client.crt" --key "$ADMIN_PKI/client.key" \
+    "https://$ADMIN_HOST:19443/admin/v1/$1"
+}
+whoami=""
+for _ in $(seq 1 20); do
+  whoami="$(admin_get whoami 2>/dev/null)" && break
+  sleep 2
+done
+echo "whoami: $whoami"
+case "$whoami" in
+  *'"role":"operator"'*) : ;;
+  *) echo "FAIL: the admin API did not admit CN=smoke-admin as operator"
+     cat "$PKI_DIR/port-forward.log"; kill "$PF_PID" 2>/dev/null; exit 1 ;;
+esac
+# Without a client certificate the handshake itself must fail — there is no anonymous mode.
+if curl -sS --max-time 10 --resolve "$ADMIN_HOST:19443:127.0.0.1" \
+     --cacert "$PKI_DIR/ca/cluster-ca.pem" "https://$ADMIN_HOST:19443/admin/v1/whoami" >/dev/null 2>&1; then
+  echo "FAIL: the admin API answered a caller with NO client certificate"; kill "$PF_PID"; exit 1
+fi
+cluster="$(admin_get cluster)"
+echo "cluster: $cluster"
+printf '%s' "$cluster" | grep -Eq '"replied": ?3' \
+  || { echo "FAIL: the cluster view did not hear from all 3 pods"; kill "$PF_PID"; exit 1; }
+printf '%s' "$cluster" | grep -Eq '"same_cluster_id": ?true' \
+  || { echo "FAIL: the cluster view reports diverging cluster identities"; kill "$PF_PID"; exit 1; }
+kill "$PF_PID" 2>/dev/null || true
+echo "admin API: operator admitted, anonymous refused, cluster view 3/3 replied from pod-0"
 
 log "Connectivity + durable retained publish"
 # Publish a RETAINED message; a fresh subscriber must receive it (retained state is durable).
@@ -285,4 +341,4 @@ case "$eps" in
 esac
 echo "self-quarantine held: pod-0 refuses readiness and is out of the Service endpoints"
 
-log "SMOKE PASSED: cluster formed over a MUTUALLY AUTHENTICATED bus (per-node certs from the shipped bootstrap.sh, signed per-node gossip), drained on scale-down, survived a quorum-safe roll that STAYED healthy, self-quarantined a re-founder, and rejoined a wiped pod-0 once the founder guard was armed"
+log "SMOKE PASSED: cluster formed over a MUTUALLY AUTHENTICATED bus (per-node certs from the shipped bootstrap.sh, signed per-node gossip), served the admin API from every pod (3/3 cluster view), drained on scale-down, survived a quorum-safe roll that STAYED healthy, self-quarantined a re-founder, and rejoined a wiped pod-0 once the founder guard was armed"

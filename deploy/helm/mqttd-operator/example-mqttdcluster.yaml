@@ -26,6 +26,13 @@ spec:
     gossipKey: mqttd-gossip-key
   persistence:
     size: 10Gi
+  # The admin API (ADR 0081, docs/ADMIN-API.md) on port 9443 of every pod, served with
+  # each pod's cluster-bus certificate. The Secret holds ca.crt: a DEDICATED CA that
+  # issues admin client certificates (not the cluster CA).
+  # admin:
+  #   clientCaSecret: mqttd-admin-ca
+  #   viewers: ["CN=oncall"]
+  #   operators: ["CN=sre-lead, O=example"]
   # Every destructive remediation is OPT-IN; the default posture is Alert-only.
   # Uncomment to let the operator fence the minority founder of a detected split
   # brain (it labels the PVC and deletes the pod — it can never delete data; its

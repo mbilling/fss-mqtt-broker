@@ -61,6 +61,17 @@ secrets:
   gossipKey:
     secretName: "mqttd-gossip"
 
+# The admin API (ADR 0081 T15) is ON: every pod serves it on 9443 with its own cluster-bus
+# leaf, and kind-smoke.sh mints the dedicated admin client CA (Secret mqttd-admin-ca) plus a
+# client certificate for CN=smoke-admin, then calls whoami and the cluster view over a
+# port-forward. In the file for the same --reuse-values reason as the Secrets above.
+admin:
+  enabled: true
+  operators:
+    - "CN=smoke-admin"
+  clientCa:
+    secretName: "mqttd-admin-ca"
+
 # The client Service exposes the plaintext listener for the smoke. targetPort is numeric (the
 # container declares only the TLS/health/peer/gossip named ports; kube-proxy routes to a numeric
 # pod port regardless).

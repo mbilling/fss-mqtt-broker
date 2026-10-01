@@ -172,6 +172,25 @@ secrets:
     secretName: ""
     mountPath: /etc/mqttd/gossip
 
+# The authenticated admin API (ADR 0081; docs/ADMIN-API.md). Off by default. When enabled,
+# every pod serves it on port 9443 with ITS OWN cluster-bus certificate (secrets.peerTls),
+# which already names the pod's DNS name and chains to the cluster CA — what lets any pod
+# answer for the cluster and forward kick/purge to the pod holding a client. The port is on
+# the headless Service only (pod to pod), never on the client-facing Service: reach it with
+# `kubectl exec <pod> -- mqttd --admin …` or `kubectl port-forward <pod> 9443`.
+admin:
+  enabled: false
+  # Certificate subjects granted each role. An entry is the whole subject
+  # ("CN=sre-lead, O=example") or "CN=<name>". At least one subject is required.
+  viewers: []
+  operators: []
+  # A Secret with key `ca.crt`: the CA that issues admin CLIENT certificates. Use a
+  # dedicated CA — if it is the cluster CA, every unlisted node certificate is admitted
+  # as the read-only `peer` role instead of refused.
+  clientCa:
+    secretName: ""
+    mountPath: /etc/mqttd/admin
+
 # Extra environment variables (the highest config layer — override any file setting per ADR 0046).
 # A name set here WINS over the chart-derived secret paths above, so this stays the escape
 # hatch for a layout the chart does not assume.

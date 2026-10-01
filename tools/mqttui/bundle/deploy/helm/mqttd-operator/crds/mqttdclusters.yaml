@@ -47,6 +47,34 @@
               "spec": {
                 "description": "The desired state of one mqttd cluster.",
                 "properties": {
+                  "admin": {
+                    "description": "The authenticated admin API (ADR 0081), mirroring the chart's `admin` values.\nPresence enables it: every pod serves it on port 9443 with its own cluster-bus\ncertificate, so `secrets.peerTls` is required (without it nothing is rendered).",
+                    "nullable": true,
+                    "properties": {
+                      "clientCaSecret": {
+                        "description": "A Secret with key `ca.crt`: the CA that issues admin client certificates. Use a\ndedicated CA — with the cluster CA, every unlisted node certificate is admitted\nas the read-only `peer` role instead of refused.",
+                        "type": "string"
+                      },
+                      "operators": {
+                        "description": "Certificate subjects granted the `operator` role (reads and actions).",
+                        "items": {
+                          "type": "string"
+                        },
+                        "type": "array"
+                      },
+                      "viewers": {
+                        "description": "Certificate subjects granted the read-only `viewer` role: the whole subject\n(`CN=oncall, O=example`) or `CN=<name>`.",
+                        "items": {
+                          "type": "string"
+                        },
+                        "type": "array"
+                      }
+                    },
+                    "required": [
+                      "clientCaSecret"
+                    ],
+                    "type": "object"
+                  },
                   "bootstrapPolicy": {
                     "default": "Guarded",
                     "description": "Whether ordinal 0 may found a cluster (ADR 0055 §3.5, T9).\n\nNOT a remediation: the guard is a rendering property that must hold before a\npod starts, and it applies with the default Alert-only posture — an operator\ninstalled with defaults must still be protected from a lost pod-0 volume.",

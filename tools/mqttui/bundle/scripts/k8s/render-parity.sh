@@ -14,5 +14,10 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 "$HERE/render-parity-one.sh" "cluster bus ON (peer TLS + gossip key)" \
   "--set secrets.peerTls.secretName=mqttd-peer-tls --set secrets.gossipKey.secretName=mqttd-gossip" \
   "--peer-tls"
+# ADR 0081 T15: the admin API on — the MQTTD_ADMIN_* env (served with each pod's own
+# cluster-bus leaf), the client-CA mount and the admin container/headless-service ports.
+"$HERE/render-parity-one.sh" "admin API ON (cluster bus + admin)" \
+  "--set secrets.peerTls.secretName=mqttd-peer-tls --set secrets.gossipKey.secretName=mqttd-gossip --set admin.enabled=true --set admin.clientCa.secretName=mqttd-admin-ca --set admin.viewers[0]=CN=oncall --set admin.operators[0]=CN=sre-lead" \
+  "--admin"
 echo
-echo "RENDER PARITY OK IN BOTH FOUNDER-GUARD STATES, AND WITH THE CLUSTER BUS ON"
+echo "RENDER PARITY OK IN BOTH FOUNDER-GUARD STATES, WITH THE CLUSTER BUS ON, AND WITH THE ADMIN API ON"

@@ -20,6 +20,14 @@ spec:
       port: 7946
       targetPort: gossip
       protocol: UDP
+    {{- if .Values.admin.enabled }}
+    # The admin API (ADR 0081), pod to pod: the cluster view and forwarded kick/purge.
+    # Deliberately NOT on the client-facing Service below.
+    - name: admin
+      port: 9443
+      targetPort: admin
+      protocol: TCP
+    {{- end }}
 ---
 {{/* Client-facing service (load-balanced across ready pods). */}}
 apiVersion: v1

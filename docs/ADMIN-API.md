@@ -51,6 +51,10 @@ certificate — `admin.cert = <peer_tls.cert>`, `admin.key = <peer_tls.key>` —
 names the node and chains to the cluster CA, which is what [the cluster view](#the-cluster-view)
 needs.
 
+**On Kubernetes**, the Helm chart's `admin` values and the operator's `spec.admin` wire exactly
+that on every pod, on port 9443 of the headless Service. See
+[the chart README](../deploy/helm/mqttd/README.md#admin-api).
+
 ## Authentication and roles
 
 TLS 1.3 with a **required client certificate**; there is no plaintext mode, no anonymous access,

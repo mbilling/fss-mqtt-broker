@@ -19,8 +19,21 @@ fn main() {
     // both paths must derive the per-pod MQTTD_PEER_TLS_* / MQTTD_SWIM_KEY_FILE paths from
     // the secret names, and a secret-less parity pass alone would never compare that
     // wiring — which is how the chart came to mount cluster-bus material nothing read.
-    let secrets = if std::env::args().any(|a| a == "--peer-tls") {
+    // `--admin` renders the cluster bus ON plus the admin API (ADR 0081), matching
+    // `helm template` with secrets.peerTls/gossipKey and admin.* set — the per-pod
+    // MQTTD_ADMIN_* wiring, the client-CA mount and the admin ports must agree too.
+    let admin_on = std::env::args().any(|a| a == "--admin");
+    let secrets = if admin_on || std::env::args().any(|a| a == "--peer-tls") {
         serde_json::json!({ "peerTls": "mqttd-peer-tls", "gossipKey": "mqttd-gossip" })
+    } else {
+        serde_json::Value::Null
+    };
+    let admin = if admin_on {
+        serde_json::json!({
+            "clientCaSecret": "mqttd-admin-ca",
+            "viewers": ["CN=oncall"],
+            "operators": ["CN=sre-lead"],
+        })
     } else {
         serde_json::Value::Null
     };
@@ -37,6 +50,7 @@ fn main() {
                 "/../../deploy/helm/mqttd/parity-config.toml"
             )),
             "secrets": secrets,
+            "admin": admin,
         },
         "status": status,
     }))

@@ -59,6 +59,16 @@ who can reach UDP 7946 can inject membership claims. This pairing is almost neve
 you want: set secrets.gossipKey.secretName (bootstrap.sh creates mqttd-gossip).
 {{- end }}
 {{- end }}
+{{- if .Values.admin.enabled }}
+
+Admin API (ADR 0081): every pod serves it on port 9443 with its own cluster-bus certificate,
+admitting client certificates issued by the CA in Secret "{{ .Values.admin.clientCa.secretName }}".
+It is on the headless Service only. From your workstation:
+  kubectl -n {{ .Release.Namespace }} port-forward pod/{{ include "mqttd.fullname" . }}-0 19443:9443 &
+  mqttd --admin --url https://127.0.0.1:19443 \
+    --server-name {{ include "mqttd.fullname" . }}-0.{{ include "mqttd.headlessName" . }}.{{ .Release.Namespace }}.svc.cluster.local \
+    --ca <cluster-ca.pem> --cert <you.pem> --key <you.key> cluster
+{{- end }}
 {{- if not .Values.secrets.acl.configMapName }}
 
 WARNING: no ACL is set (secrets.acl.configMapName is empty). Topic authorization is then
