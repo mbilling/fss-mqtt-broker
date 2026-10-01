@@ -1041,6 +1041,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Do not route clients here until every configured listener actually exists.
     startup_complete.store(true, std::sync::atomic::Ordering::Release);
 
+    // The admin listener's TLS (ADR 0081 T18): built now, while the reloader can still take
+    // its rebuild, so a reload rotates the admin certificate and CAs too.
+    let admin_tls = prepare_admin_tls(&config, &live_config, &mut reloader)?;
+
     // Share the (now fully-configured) reloader between the SIGHUP handler and the optional
     // filesystem watcher; both drive the same validate-before-swap routine.
     let reloader = std::sync::Arc::new(reloader);
@@ -1059,6 +1063,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // listeners, like them: it reports a node that is actually serving.
     start_admin(
         &config,
+        admin_tls,
         &node_id,
         health_state,
         &live_config,
@@ -2546,12 +2551,133 @@ async fn start_health(
     Ok((draining, decommission, state))
 }
 
+/// The admin plane's TLS material (ADR 0081), built from one config: the listener's
+/// acceptor (its certificate, admitting the admin client CA and, on a cluster node, the
+/// cluster CA), the cluster-CA check behind the `peer` role, and the connector this node
+/// presents to its peers' admin listeners.
+struct AdminTlsMaterial {
+    acceptor: tokio_rustls::TlsAcceptor,
+    cluster_ca: Option<tls::ChainCheck>,
+    connector: Option<tokio_rustls::TlsConnector>,
+}
+
+fn admin_tls_material(config: &Config) -> Result<AdminTlsMaterial, String> {
+    let admin = &config.admin;
+    // `Config::validate` refuses a bind without these; this is the same refusal, typed.
+    let (Some(cert), Some(key), Some(client_ca)) = (&admin.cert, &admin.key, &admin.client_ca)
+    else {
+        return Err("admin.bind needs admin.cert, admin.key and admin.client_ca".into());
+    };
+    let peer_tls = &config.cluster.peer_tls;
+    let cluster_ca = peer_tls.ca.as_deref().map(Path::new);
+    let mut cas = vec![Path::new(client_ca)];
+    cas.extend(cluster_ca);
+    let acceptor =
+        tls::admin_acceptor(Path::new(cert), Path::new(key), &cas).map_err(|e| e.to_string())?;
+    let cluster_ca = cluster_ca
+        .map(tls::ChainCheck::new)
+        .transpose()
+        .map_err(|e| format!("cluster CA: {e}"))?;
+    // The cluster view (ADR 0081 §2): ask peers' admin listeners, presenting this node's
+    // cluster certificate (admitted there as the `peer` role), trusting whichever of the
+    // admin or cluster CA issued their server certificates.
+    let connector = match (&peer_tls.ca, &peer_tls.cert, &peer_tls.key) {
+        (Some(ca), Some(node_cert), Some(node_key)) => Some(
+            tls::client_connector_multi(
+                &[Path::new(client_ca), Path::new(ca)],
+                Path::new(node_cert),
+                Path::new(node_key),
+            )
+            .map_err(|e| format!("peer connector: {e}"))?,
+        ),
+        _ => None,
+    };
+    Ok(AdminTlsMaterial {
+        acceptor,
+        cluster_ca,
+        connector,
+    })
+}
+
+/// The live admin TLS cells (ADR 0081 T18): read per handshake and per request, swapped by
+/// a reload.
+struct AdminTls {
+    acceptor: tokio::sync::watch::Receiver<tokio_rustls::TlsAcceptor>,
+    cluster_ca: mqttd::admin::ClusterCaSlot,
+    connector: Option<mqttd::admin::cluster::ConnectorSlot>,
+}
+
+/// Build the admin TLS from `config` when `admin.bind` is set, and register its rebuild
+/// with the reloader: a reload re-reads the certificate, key and CAs from the live config
+/// and swaps them in only if every build of that reload succeeded. `None` without a bind.
+fn prepare_admin_tls(
+    config: &Config,
+    live_config: &Arc<RwLock<Config>>,
+    reloader: &mut mqttd::reload::Reloader,
+) -> Result<Option<AdminTls>, Box<dyn std::error::Error>> {
+    if config.admin.bind.is_none() {
+        return Ok(None);
+    }
+    let same_file = |a: &Path, b: &Path| match (a.canonicalize(), b.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    };
+    if let (Some(cluster_ca), Some(client_ca)) =
+        (&config.cluster.peer_tls.ca, &config.admin.client_ca)
+    {
+        if same_file(Path::new(cluster_ca), Path::new(client_ca)) {
+            warn!(
+                "admin.client_ca is the cluster CA: every certificate it issued that is in no \
+                 admin role list is admitted as the read-only peer role instead of refused. \
+                 Use a dedicated admin CA (HARDENING H-7.7)"
+            );
+        }
+    }
+    let initial = admin_tls_material(config)?;
+    let (acceptor_tx, acceptor) = tokio::sync::watch::channel(initial.acceptor);
+    let cluster_ca: mqttd::admin::ClusterCaSlot =
+        Arc::new(RwLock::new(initial.cluster_ca.map(Arc::new)));
+    let connector = initial
+        .connector
+        .map(|c| Arc::new(RwLock::new(c)) as mqttd::admin::cluster::ConnectorSlot);
+    let acceptor_tx = Arc::new(acceptor_tx);
+    let (live, ca_slot, conn_slot) = (live_config.clone(), cluster_ca.clone(), connector.clone());
+    reloader.attach_admin_tls(move || {
+        let config = live
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let m = admin_tls_material(&config)?;
+        let (tx, ca_slot, conn_slot) = (acceptor_tx.clone(), ca_slot.clone(), conn_slot.clone());
+        Ok(Box::new(move || {
+            let _ = tx.send(m.acceptor);
+            *ca_slot
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = m.cluster_ca.map(Arc::new);
+            // Whether this node reaches its peers at all is fixed at startup; a reload
+            // rotates the certificate it presents.
+            if let (Some(slot), Some(c)) = (conn_slot, m.connector) {
+                *slot
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = c;
+            }
+        }) as Box<dyn FnOnce() + Send>)
+    });
+    Ok(Some(AdminTls {
+        acceptor,
+        cluster_ca,
+        connector,
+    }))
+}
+
 /// Start the admin API listener (ADR 0081) when `admin.bind` is set; a no-op otherwise.
 /// Its TLS trusts the admin client CA and, on a cluster node, the cluster CA — the latter
-/// only so peers can read each other's state (the `peer` role).
+/// only so peers can read each other's state (the `peer` role). The TLS material comes
+/// from [`prepare_admin_tls`], so a reload rotates it.
 #[allow(clippy::too_many_arguments)] // a wiring seam: one call site, named handles
 async fn start_admin(
     config: &Config,
+    admin_tls: Option<AdminTls>,
     node_id: &NodeId,
     health: mqttd::health::HealthState,
     live_config: &Arc<RwLock<Config>>,
@@ -2562,45 +2688,18 @@ async fn start_admin(
     cordon: Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let admin = &config.admin;
-    let Some(bind) = &admin.bind else {
+    let (Some(bind), Some(admin_tls)) = (&admin.bind, admin_tls) else {
         return Ok(());
     };
-    // `Config::validate` refuses a bind without these; this is the same refusal, typed.
-    let (Some(cert), Some(key), Some(client_ca)) = (&admin.cert, &admin.key, &admin.client_ca)
-    else {
-        return Err("admin.bind needs admin.cert, admin.key and admin.client_ca".into());
-    };
-    let cluster_ca = config.cluster.peer_tls.ca.as_deref().map(Path::new);
-    let same_file = |a: &Path, b: &Path| match (a.canonicalize(), b.canonicalize()) {
-        (Ok(a), Ok(b)) => a == b,
-        _ => a == b,
-    };
-    if cluster_ca.is_some_and(|ca| same_file(ca, Path::new(client_ca))) {
-        warn!(
-            "admin.client_ca is the cluster CA: every certificate it issued that is in no \
-             admin role list is admitted as the read-only peer role instead of refused. Use a \
-             dedicated admin CA (HARDENING H-7.7)"
-        );
-    }
-    let mut cas = vec![Path::new(client_ca)];
-    cas.extend(cluster_ca);
-    let acceptor = tls::admin_acceptor(Path::new(cert), Path::new(key), &cas)?;
+    let peers = admin_tls.connector.is_some();
     let mut state =
         mqttd::admin::AdminState::new(node_id.0.clone(), health, live_config.clone(), audit)
             .with_sessions(sessions)
             .with_authorizer(authz)
             .with_reload(reload)
-            .with_cordon(cordon);
-    if let Some(ca) = cluster_ca {
-        state = state.with_cluster_ca(tls::ChainCheck::new(ca)?);
-    }
-    // The cluster view (ADR 0081 §2): ask peers' admin listeners, presenting this node's
-    // cluster certificate (admitted there as the `peer` role), trusting whichever of the
-    // admin or cluster CA issued their server certificates.
-    let peer_tls = &config.cluster.peer_tls;
-    if let (Some(ca), Some(node_cert), Some(node_key)) =
-        (&peer_tls.ca, &peer_tls.cert, &peer_tls.key)
-    {
+            .with_cordon(cordon)
+            .with_cluster_ca_slot(admin_tls.cluster_ca);
+    if let Some(connector) = admin_tls.connector {
         let port = match admin.peer_port {
             Some(port) => port,
             None => bind
@@ -2608,12 +2707,7 @@ async fn start_admin(
                 .and_then(|(_, p)| p.parse().ok())
                 .ok_or_else(|| format!("admin.bind {bind} has no port"))?,
         };
-        let connector = tls::client_connector_multi(
-            &[Path::new(client_ca), Path::new(ca)],
-            Path::new(node_cert),
-            Path::new(node_key),
-        )?;
-        state = state.with_peers(mqttd::admin::cluster::PeerAccess::new(
+        state = state.with_peers(mqttd::admin::cluster::PeerAccess::with_slot(
             connector,
             mqttd::admin::cluster::PeerAccess::same_host(port),
         ));
@@ -2623,10 +2717,14 @@ async fn start_admin(
         %bind,
         viewers = admin.viewers.len(),
         operators = admin.operators.len(),
-        peers = cluster_ca.is_some(),
+        peers,
         "serving the admin API (mTLS; ADR 0081)"
     );
-    tokio::spawn(mqttd::admin::serve(listener, acceptor, state));
+    tokio::spawn(mqttd::admin::serve_reloadable(
+        listener,
+        admin_tls.acceptor,
+        state,
+    ));
     Ok(())
 }
 
@@ -3897,6 +3995,10 @@ fn requires_restart(old: &Config, new: &Config) -> Vec<&'static str> {
         // The admin role lists are read from the live config per request (ADR 0081 §1).
         c.admin.viewers = Vec::new();
         c.admin.operators = Vec::new();
+        // The admin TLS material is rebuilt by the reloader (ADR 0081 T18).
+        c.admin.cert = None;
+        c.admin.key = None;
+        c.admin.client_ca = None;
         // A changed replication factor is proposed to the running cluster (ADR 0080 §4).
         c.durable.replicas = 0;
         c
@@ -3935,7 +4037,8 @@ fn requires_restart(old: &Config, new: &Config) -> Vec<&'static str> {
     if o.backup != n.backup {
         changed.push("backup");
     }
-    // The admin listener's bind and TLS material are bound at startup (ADR 0081).
+    // The admin listener's bind and peer port are bound at startup (ADR 0081); its
+    // certificate, key and client CA are rebuilt by the reload (T18).
     if o.admin != n.admin {
         changed.push("admin");
     }
@@ -5426,11 +5529,13 @@ mod tests {
         live.limits.max_sessions = Some(1000);
         live.admin.viewers = vec!["CN=oncall".into()];
         live.admin.operators = vec!["CN=root".into()];
+        live.admin.cert = Some("/etc/mqttd/admin/renewed.pem".into());
+        live.admin.client_ca = Some("/etc/mqttd/admin/new-ca.pem".into());
         // A changed replication factor is proposed to the cluster (ADR 0080 §4).
         live.durable.replicas = base.durable.replicas + 1;
         assert!(
             requires_restart(&base, &live).is_empty(),
-            "quotas / allow_anonymous / ACL path / both-factors / admin roles / replicas are live"
+            "quotas / allow_anonymous / ACL path / both-factors / admin roles and TLS / replicas are live"
         );
 
         // Non-live edits DO require a restart, reported by section.

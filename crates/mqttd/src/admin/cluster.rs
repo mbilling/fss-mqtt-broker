@@ -26,10 +26,14 @@ pub const PEER_TIMEOUT: Duration = Duration::from_secs(3);
 /// Maps a member `(node id, cluster-bus address)` to its admin listener `host:port`.
 pub type AdminAddr = Arc<dyn Fn(&str, &str) -> Option<String> + Send + Sync>;
 
+/// The connector this node presents to its peers, swappable so a reload that rotates the
+/// node's cluster certificate (T18) presents the new one on the next call.
+pub type ConnectorSlot = Arc<std::sync::RwLock<TlsConnector>>;
+
 /// How this node reaches its peers' admin listeners.
 #[derive(Clone)]
 pub struct PeerAccess {
-    pub(super) connector: TlsConnector,
+    connector: ConnectorSlot,
     pub(super) admin_addr: AdminAddr,
     pub(super) timeout: Duration,
 }
@@ -46,10 +50,35 @@ impl PeerAccess {
     #[must_use]
     pub fn new(connector: TlsConnector, admin_addr: AdminAddr) -> Self {
         Self {
+            connector: Arc::new(std::sync::RwLock::new(connector)),
+            admin_addr,
+            timeout: PEER_TIMEOUT,
+        }
+    }
+
+    /// [`new`](Self::new), reading the connector from `slot`, which a reload swaps (T18).
+    #[must_use]
+    pub fn with_slot(connector: ConnectorSlot, admin_addr: AdminAddr) -> Self {
+        Self {
             connector,
             admin_addr,
             timeout: PEER_TIMEOUT,
         }
+    }
+
+    /// The connector current now.
+    #[must_use]
+    pub fn connector(&self) -> TlsConnector {
+        self.connector
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// The live connector, for a reload to swap (T18).
+    #[must_use]
+    pub fn connector_slot(&self) -> ConnectorSlot {
+        self.connector.clone()
     }
 
     /// The production mapping: the host of the peer's cluster-bus address, and `port`.
@@ -142,7 +171,7 @@ async fn ask(peers: Option<&PeerAccess>, member: &Member) -> Reply {
     let target = Target {
         server_name: client::host_of(&addr),
         addr: addr.clone(),
-        connector: peers.connector.clone(),
+        connector: peers.connector(),
         timeout: peers.timeout,
     };
     let started = Instant::now();

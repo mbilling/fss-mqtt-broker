@@ -1557,11 +1557,12 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `narrow_allow_does_not_cover_broad_subscription`
 - `unauthorized_will_topic_is_refused_at_connect`
 
-## `crates/mqttd/tests/admin.rs` — 18 test(s)
+## `crates/mqttd/tests/admin.rs` — 19 test(s)
 
 - `a_certificate_from_another_ca_fails_the_handshake`
 - `a_clean_session_is_kicked_where_it_is_not_where_placement_points`
 - `a_log_override_is_an_operator_action_that_never_silences_audit`
+- `a_reload_rotates_the_admin_client_ca_and_a_broken_one_keeps_the_old`
 - `a_session_shows_its_subscriptions_and_an_offline_one_its_queue`
 - `an_action_on_another_nodes_session_is_forwarded_to_its_owner`
 - `any_node_answers_for_the_cluster_and_a_silent_node_is_listed_as_silent`

@@ -124,6 +124,28 @@ out=$(api root 1 POST /admin/v1/reload); expect "api reload 409 carries outcome"
 cp "$E/cfg1/good.toml" "$E/cfg1/mqttd.toml"; sleep 2
 out=$(cli root 1 reload); expect "restored reload applied" "[exit=0]" "$out"
 
+# T18: rotating the admin client CA is a reload, not a restart. A second admin CA's
+# certificate is refused, the CA is added to admin-ca.pem, a reload admits it, and
+# restoring the file and reloading refuses it again.
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -keyout "$P/admin2-ca.key" \
+  -out "$P/admin2-ca.pem" -subj "/CN=admin2 CA" -days 3 \
+  -addext "basicConstraints=critical,CA:TRUE" -addext "keyUsage=critical,keyCertSign,cRLSign" 2>/dev/null
+openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -keyout "$P/oncall2.key" \
+  -out "$P/oncall2.csr" -subj "/CN=oncall/O=rotated" 2>/dev/null
+printf 'extendedKeyUsage=clientAuth\n' > "$P/oncall2.ext"
+openssl x509 -req -in "$P/oncall2.csr" -CA "$P/admin2-ca.pem" -CAkey "$P/admin2-ca.key" \
+  -CAcreateserial -out "$P/oncall2.pem" -days 3 -extfile "$P/oncall2.ext" 2>/dev/null
+chmod 644 "$P/oncall2.key" "$P/oncall2.pem"
+out=$(cli oncall2 1 whoami); expect_not "a second admin CA's certificate is refused before the rotation" "[exit=0]" "$out"
+cp "$P/admin-ca.pem" "$E/admin-ca.orig.pem"
+cat "$E/admin-ca.orig.pem" "$P/admin2-ca.pem" > "$P/admin-ca.pem"; sleep 2
+out=$(cli root 1 reload); expect "reload with a rotated admin client CA applied" "[exit=0]" "$out"
+expect_not "the admin CA is not reported restart-scoped" "admin" "$(grep -i 'requires.restart' <<<"$out")"
+out=$(cli oncall2 1 whoami); expect "the rotated CA's certificate is admitted after the reload" "viewer" "$out"
+cat "$E/admin-ca.orig.pem" > "$P/admin-ca.pem"; sleep 2
+out=$(cli root 1 reload); expect "reload restoring the admin client CA applied" "[exit=0]" "$out"
+out=$(cli oncall2 1 whoami); expect_not "the removed CA's certificate is refused again" "[exit=0]" "$out"
+
 echo "=== kick and purge (forwarded to the owner from another node)"
 python3 -u "$KIT/raw_v5.py" "$(mqtt_port 3)" kickme > "$E/kickme.out" 2>&1 &
 KICK_PID=$!

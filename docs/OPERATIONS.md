@@ -868,8 +868,10 @@ operators = ["CN=sre-lead, O=example"]    # reads + actions
   subject is matched against `viewers` and `operators`: an entry is the whole subject
   (`CN=sre-lead, O=example`) or `CN=<name>` for any subject with that Common Name. A
   subject in neither list gets `403 forbidden`. The lists hot-reload with the rest of the
-  config; the listener's bind, certificate, key and CA are restart-scoped (a reload that
-  changes them logs `admin` among the requires-restart sections). On a cluster node the
+  config. So do the listener's certificate, key and CA: a reload rebuilds them, and a
+  broken one rejects the reload and keeps the running TLS
+  ([rotating them](ADMIN-API.md#turning-it-on)). Only the bind and peer port are
+  restart-scoped. On a cluster node the
   cluster CA is trusted too, and a node certificate that is in no list gets the `peer` role,
   which can read only the node's own state (so any node can answer for the cluster). Use a
   dedicated admin CA for `client_ca`: if it is the cluster CA, every unlisted certificate it

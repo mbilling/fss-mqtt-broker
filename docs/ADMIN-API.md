@@ -35,15 +35,31 @@ operators = ["CN=sre-lead, O=example"]    # reads + actions
 | Key | Environment | Notes |
 |---|---|---|
 | `admin.bind` | `MQTTD_ADMIN_BIND` | unset = no admin API |
-| `admin.cert`, `admin.key` | `MQTTD_ADMIN_CERT`, `MQTTD_ADMIN_KEY` | required with `bind`; restart-scoped |
-| `admin.client_ca` | `MQTTD_ADMIN_CLIENT_CA` | required with `bind`; restart-scoped. Use a dedicated admin CA (see below) |
+| `admin.cert`, `admin.key` | `MQTTD_ADMIN_CERT`, `MQTTD_ADMIN_KEY` | required with `bind`; hot-reloadable |
+| `admin.client_ca` | `MQTTD_ADMIN_CLIENT_CA` | required with `bind`; hot-reloadable. Use a dedicated admin CA (see below) |
 | `admin.viewers` | `MQTTD_ADMIN_VIEWERS` (`;`-separated) | hot-reloadable |
 | `admin.operators` | `MQTTD_ADMIN_OPERATORS` (`;`-separated) | hot-reloadable |
 | `admin.peer_port` | `MQTTD_ADMIN_PEER_PORT` | default: the port of `admin.bind` |
 
 The config is refused if `bind` is set without the certificate, key and CA, or with both role
-lists empty. A reload that changes `bind`, `cert`, `key`, `client_ca` or `peer_port` logs
-`admin` among the requires-restart sections; the role lists apply to the next request.
+lists empty. The role lists apply to the next request.
+
+**Rotating the certificates is a reload, not a restart.** On every reload (`SIGHUP`, the file
+watcher, or `POST /admin/v1/reload`) the node rebuilds the admin TLS from the live config:
+- the listener's certificate and key;
+- the client CA, plus the cluster CA it also admits;
+- the cluster-CA check behind the `peer` role;
+- the certificate it presents to its peers' admin listeners.
+
+The next admin connection uses the rebuilt material, and connections already open are
+undisturbed. This happens in the same validate-before-swap step as the rest of the reload:
+a certificate, key or CA that does not load rejects the whole reload (`admin tls: …` in
+its outcome and in the `security.reload` audit record), and the running TLS stays.
+
+To rotate the client CA without a gap, first reload with a bundle holding both the old
+and the new CA. Re-issue the admin certificates, then reload with the new CA alone. A
+reload that changes `bind` or `peer_port` logs `admin` among the requires-restart
+sections.
 
 **On a cluster**, run the admin listener on every node (same port, or set `peer_port`) and
 give the node `[cluster.peer_tls]`. The simplest server certificate is the node's own cluster

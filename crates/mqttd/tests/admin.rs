@@ -1508,3 +1508,100 @@ async fn peers_read_only_as_a_forward(b: &Broker, admin_ca: &Ca, cluster: &Ca) {
     );
     assert_eq!(body["sessions"].as_array().unwrap().len(), 1, "{body}");
 }
+
+/// T18: the admin listener's TLS rotates on reload, through the reloader's
+/// validate-before-swap. A rotated client CA admits its certificates on the next
+/// connection and refuses the old CA's; a reload with a broken CA file is rejected and the
+/// listener keeps serving what it had.
+#[tokio::test]
+async fn a_reload_rotates_the_admin_client_ca_and_a_broken_one_keeps_the_old() {
+    let server = mint_ca("server");
+    let old = mint_ca("old-admin");
+    let new = mint_ca("new-admin");
+    let (server_cert, server_key) = mint_leaf(&server, "node-server", None);
+    // The live client-CA file the reload re-reads, as an operator would replace it.
+    let live_dir = temp_dir("live-ca");
+    let client_ca = live_dir.join("admin-ca.pem");
+    std::fs::copy(&old.pem, &client_ca).unwrap();
+
+    let make_policy = || -> mqttd::reload::BuildResult {
+        Ok((
+            Arc::new(mqtt_auth::AllowAll) as Arc<dyn mqtt_auth::Authorizer>,
+            Arc::new(mqtt_auth::basic::BasicAuthenticator {
+                allow_anonymous: true,
+            }) as Arc<dyn mqtt_auth::Authenticator>,
+        ))
+    };
+    let audit = Arc::new(Recorded::default());
+    let (mut reloader, _handles) =
+        mqttd::reload::Reloader::new(make_policy().unwrap(), audit.clone(), make_policy);
+    let build = {
+        let (cert, key, ca) = (server_cert.clone(), server_key.clone(), client_ca.clone());
+        move || mqtt_net::tls::admin_acceptor(&cert, &key, &[&ca]).map_err(|e| e.to_string())
+    };
+    let (tx, acceptor) = tokio::sync::watch::channel(build().unwrap());
+    let tx = Arc::new(tx);
+    reloader.attach_admin_tls(move || {
+        let acceptor = build()?;
+        let tx = tx.clone();
+        Ok(Box::new(move || {
+            let _ = tx.send(acceptor);
+        }) as Box<dyn FnOnce() + Send>)
+    });
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let config = Arc::new(RwLock::new(mqtt_config::Config::default()));
+    config.write().unwrap().admin.viewers = vec!["CN=alice".into()];
+    let health = {
+        let (hub, tx) = Hub::with_config(NodeId("n1".into()), Arc::new(MemorySessionStore::new()));
+        tokio::spawn(hub.run());
+        HealthState::new(tx, None, None, 1)
+    };
+    let state = AdminState::new("n1".into(), health, config, audit.clone());
+    tokio::spawn(mqttd::admin::serve_reloadable(listener, acceptor, state));
+
+    let whoami = |ca: &Ca, name: &str| {
+        let (cert, key) = mint_leaf(ca, name, None);
+        let target = Target {
+            addr: addr.clone(),
+            server_name: "127.0.0.1".into(),
+            connector: mqtt_net::tls::client_connector_multi(&[&server.pem], &cert, &key).unwrap(),
+            timeout: Duration::from_secs(10),
+        };
+        async move {
+            client::call(&target, "GET", "/admin/v1/whoami", None)
+                .await
+                .map(|(status, _)| status)
+        }
+    };
+    assert_eq!(whoami(&old, "alice").await, Ok(200));
+    assert!(
+        whoami(&new, "alice").await.is_err(),
+        "the new CA is not trusted yet"
+    );
+
+    // Rotate: the new CA replaces the old one on disk, then a reload.
+    std::fs::copy(&new.pem, &client_ca).unwrap();
+    let outcome = reloader.reload_with_outcome("admin");
+    assert!(outcome.applied, "{outcome:?}");
+    assert_eq!(whoami(&new, "alice").await, Ok(200));
+    assert!(
+        whoami(&old, "alice").await.is_err(),
+        "the rotated-out CA is refused at the handshake"
+    );
+
+    // A broken CA file: the reload is rejected and the listener keeps the new CA.
+    std::fs::write(&client_ca, "not a certificate").unwrap();
+    let outcome = reloader.reload_with_outcome("admin");
+    assert!(!outcome.applied);
+    let error = outcome.error.unwrap_or_default();
+    assert!(error.starts_with("admin tls:"), "{error}");
+    assert_eq!(whoami(&new, "alice").await, Ok(200));
+    let log = audit.0.lock().unwrap().clone();
+    assert!(
+        log.iter()
+            .any(|(kind, _, d)| kind == "security.reload" && d.contains("admin tls:")),
+        "{log:?}"
+    );
+}

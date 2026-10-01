@@ -44,6 +44,10 @@ const MAX_CONCURRENT: usize = 32;
 /// Upper bound on answering one request once it has been read.
 const HANDLER_DEADLINE: Duration = Duration::from_secs(30);
 
+/// The cluster-CA check behind [`Role::Peer`], swappable so a reload that rotates the
+/// cluster CA (ADR 0081 T18) re-maps node certificates on the next request.
+pub type ClusterCaSlot = Arc<RwLock<Option<Arc<mqtt_net::tls::ChainCheck>>>>;
+
 /// What the admin handlers read. Cheap to clone: every field is shared.
 #[derive(Clone)]
 pub struct AdminState {
@@ -52,8 +56,8 @@ pub struct AdminState {
     live_config: Arc<RwLock<mqtt_config::Config>>,
     audit: Arc<dyn AuditSink>,
     /// Tells a certificate the cluster CA issued apart from an admin one, for
-    /// [`Role::Peer`]. `None` when the node has no cluster TLS.
-    cluster_ca: Option<Arc<mqtt_net::tls::ChainCheck>>,
+    /// [`Role::Peer`]. Holds `None` when the node has no cluster TLS.
+    cluster_ca: ClusterCaSlot,
     /// How to reach the other nodes' admin listeners for the cluster view. `None` when
     /// this node has no cluster TLS: its peers are then listed as not queryable.
     peers: Option<Arc<cluster::PeerAccess>>,
@@ -91,7 +95,7 @@ impl AdminState {
             health,
             live_config,
             audit,
-            cluster_ca: None,
+            cluster_ca: Arc::new(RwLock::new(None)),
             peers: None,
             sessions: None,
             authz: None,
@@ -149,9 +153,25 @@ impl AdminState {
 
     /// Grant [`Role::Peer`] to certificates that verify against the cluster CA.
     #[must_use]
-    pub fn with_cluster_ca(mut self, check: mqtt_net::tls::ChainCheck) -> Self {
-        self.cluster_ca = Some(Arc::new(check));
+    pub fn with_cluster_ca(self, check: mqtt_net::tls::ChainCheck) -> Self {
+        *self
+            .cluster_ca
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::new(check));
         self
+    }
+
+    /// Read the cluster-CA check from `slot`, which a reload swaps (T18).
+    #[must_use]
+    pub fn with_cluster_ca_slot(mut self, slot: ClusterCaSlot) -> Self {
+        self.cluster_ca = slot;
+        self
+    }
+
+    /// The live cluster-CA check, for a reload to swap (T18).
+    #[must_use]
+    pub fn cluster_ca_slot(&self) -> ClusterCaSlot {
+        self.cluster_ca.clone()
     }
 
     /// Identify the caller from the verified certificate chain (leaf first).
@@ -166,7 +186,12 @@ impl AdminState {
                 role: None,
             };
         };
-        let is_peer = self.cluster_ca.as_ref().is_some_and(|c| c.verifies(chain));
+        let is_peer = self
+            .cluster_ca
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .is_some_and(|c| c.verifies(chain));
         let role = {
             let live = self
                 .live_config
@@ -178,8 +203,20 @@ impl AdminState {
     }
 }
 
-/// Serve the admin API on `listener` until it errors.
+/// Serve the admin API on `listener` until it errors, with a fixed acceptor.
 pub async fn serve(listener: TcpListener, acceptor: TlsAcceptor, state: AdminState) {
+    let (_keep, acceptor) = tokio::sync::watch::channel(acceptor);
+    serve_reloadable(listener, acceptor, state).await;
+}
+
+/// Serve the admin API on `listener` until it errors. Each handshake uses the acceptor
+/// current at accept, so a reload that rebuilds it (T18) serves the renewed certificate
+/// and client CA on the next connection; connections already accepted are undisturbed.
+pub async fn serve_reloadable(
+    listener: TcpListener,
+    acceptor: tokio::sync::watch::Receiver<TlsAcceptor>,
+    state: AdminState,
+) {
     let slots = Arc::new(Semaphore::new(MAX_CONCURRENT));
     loop {
         let Ok(permit) = slots.clone().acquire_owned().await else {
@@ -187,7 +224,7 @@ pub async fn serve(listener: TcpListener, acceptor: TlsAcceptor, state: AdminSta
         };
         match listener.accept().await {
             Ok((stream, _)) => {
-                let (acceptor, state) = (acceptor.clone(), state.clone());
+                let (acceptor, state) = (acceptor.borrow().clone(), state.clone());
                 tokio::spawn(async move {
                     handle(stream, acceptor, state).await;
                     drop(permit);

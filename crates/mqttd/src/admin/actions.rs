@@ -329,7 +329,7 @@ async fn forward(
     let target = Target {
         server_name: client::host_of(&addr),
         addr: addr.clone(),
-        connector: peers.connector.clone(),
+        connector: peers.connector(),
         timeout: peers.timeout,
     };
     match client::call(&target, "POST", &path, Some("")).await {
