@@ -796,8 +796,15 @@ impl Hub {
     /// cap (ADR 0037 §5). A dropped peer-routed mutation also clears its pending
     /// marker, so the sender's retransmission can be admitted again later.
     pub(super) fn enqueue_retained_mutation(&mut self, mutation: RetainedMutation) {
-        if self.retained_queue.len() >= RETAINED_QUEUE_CAP {
-            if let Some(dropped) = self.retained_queue.pop_front() {
+        // A peer-routed mutation (it carries the handoff `reply`) waits on the owner-side
+        // queue, which this node's own outstanding handoff never blocks (issue #739).
+        let queue = if mutation.reply.is_some() {
+            &mut self.retained_routed_queue
+        } else {
+            &mut self.retained_queue
+        };
+        if queue.len() >= RETAINED_QUEUE_CAP {
+            if let Some(dropped) = queue.pop_front() {
                 warn!(
                     topic = %dropped.topic,
                     cap = RETAINED_QUEUE_CAP,
@@ -819,7 +826,11 @@ impl Hub {
                 m.retained_queue_dropped();
             }
         }
-        self.retained_queue.push_back(mutation);
+        if mutation.reply.is_some() {
+            self.retained_routed_queue.push_back(mutation);
+        } else {
+            self.retained_queue.push_back(mutation);
+        }
     }
 
     /// Accept a retained mutation a peer routed to this node (ADR 0037 §1/T8):
@@ -878,45 +889,44 @@ impl Hub {
         }
     }
 
-    /// Drive the retained mutation queue (ADR 0037 §5/T8): drain entries in order —
-    /// an owner-local head starts the (single) off-loop commit; a peer-owned head is
-    /// handed to its linked owner and **held until the commit-gated ack** (one
-    /// handoff in flight, retransmitted by the sweep tick) — and stop at an entry
-    /// whose owner is unreachable, leaving it queued for the next heal trigger (a
-    /// peer link coming up, the sweep tick, or the next enqueue).
+    /// Drive the retained mutation queues (ADR 0037 §5/T8). This node's own queue drains
+    /// in order: an owner-local head starts the (single) off-loop commit; a peer-owned
+    /// head is handed to its linked owner and **held until the commit-gated ack** (one
+    /// handoff in flight, retransmitted by the sweep tick); an entry whose owner is
+    /// unreachable stays queued for the next heal trigger (a peer link coming up, the
+    /// sweep tick, or the next enqueue). The owner-side queue of peer-routed mutations
+    /// shares the one commit slot but none of those stops, so it keeps draining while
+    /// this node waits on a handoff of its own (issue #739).
     pub(super) fn kick_retained_queue(&mut self) {
-        if self.retained_handoff.is_some() {
-            return; // a handoff is awaiting its ack: order requires we wait
-        }
+        // This node's own queue stops for an outstanding handoff (one in flight keeps
+        // per-node publish order) and at an unreachable owner. The owner-side queue of
+        // peer-routed mutations stops for neither (issue #739): it only ever commits here
+        // or NACKs, so it cannot wait on another node.
+        let mut own_blocked = self.retained_handoff.is_some();
         while !self.retained_commit_inflight {
+            let own_ready = !own_blocked && !self.retained_queue.is_empty();
+            let routed_ready = !self.retained_routed_queue.is_empty();
+            if !own_ready && !routed_ready {
+                return;
+            }
+            // Alternate when both can advance, so neither starves the other.
+            if routed_ready && (!own_ready || self.retained_routed_turn) {
+                self.retained_routed_turn = false;
+                let Some(mutation) = self.retained_routed_queue.pop_front() else {
+                    return;
+                };
+                self.drive_routed_retained(mutation);
+                continue;
+            }
+            self.retained_routed_turn = true;
             let Some(mutation) = self.retained_queue.pop_front() else {
                 return;
             };
-            // The owner of the topic's placement group; with no ring (single node /
-            // no cluster), this node is trivially the owner. Resolved at drain time,
-            // not enqueue time, so a lease that moved while queued re-routes.
-            let owner = self.placement.as_ref().map_or_else(
-                || self.node_id.clone(),
-                |p| {
-                    p.read()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .owner(&mutation.topic)
-                },
-            );
+            let owner = self.retained_owner(&mutation.topic);
             if owner == self.node_id {
                 self.retained_commit_inflight = true;
                 self.spawn_retained_commit(mutation);
                 return;
-            }
-            // Peer-owned. A mutation a peer routed HERE for a group this node no
-            // longer owns is NACKed back so the sender re-resolves (T8) — this node
-            // must not relay it onward (the ack chain would break).
-            if let Some((node, seq)) = mutation.reply {
-                if self.retained_handoff_pending.get(&node) == Some(&seq) {
-                    self.retained_handoff_pending.remove(&node);
-                }
-                self.send_retained_ack(&node, seq, None);
-                continue;
             }
             if self.peers.contains_key(&owner) {
                 // Hand the mutation to its owner and hold it until the commit-gated
@@ -926,7 +936,8 @@ impl Hub {
                 let seq = self.retained_handoff_seq;
                 self.send_retained_handoff(&owner, seq, &mutation);
                 self.retained_handoff = Some((owner, seq, mutation));
-                return;
+                own_blocked = true;
+                continue;
             }
             // Owner unreachable (partitioned or dead): queue-until-heal. Put the
             // entry back and wait for a trigger — never dropped silently.
@@ -937,8 +948,39 @@ impl Hub {
                 "retained mutation owner unreachable; queued until heal (ADR 0037 §5)"
             );
             self.retained_queue.push_front(mutation);
+            own_blocked = true;
+        }
+    }
+
+    /// One peer-routed mutation off the owner-side queue: commit it if this node still
+    /// owns the topic's group, else NACK it back so the sender re-resolves (T8) — this
+    /// node must not relay it onward (the ack chain would break).
+    fn drive_routed_retained(&mut self, mutation: RetainedMutation) {
+        if self.retained_owner(&mutation.topic) == self.node_id {
+            self.retained_commit_inflight = true;
+            self.spawn_retained_commit(mutation);
             return;
         }
+        if let Some((node, seq)) = mutation.reply {
+            if self.retained_handoff_pending.get(&node) == Some(&seq) {
+                self.retained_handoff_pending.remove(&node);
+            }
+            self.send_retained_ack(&node, seq, None);
+        }
+    }
+
+    /// The owner of `topic`'s placement group; with no ring (single node / no cluster),
+    /// this node is trivially the owner. Resolved at drain time, not enqueue time, so a
+    /// lease that moved while queued re-routes.
+    fn retained_owner(&self, topic: &str) -> NodeId {
+        self.placement.as_ref().map_or_else(
+            || self.node_id.clone(),
+            |p| {
+                p.read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .owner(topic)
+            },
+        )
     }
 
     /// Write one handoff frame toward `owner` (first send and retransmissions alike).

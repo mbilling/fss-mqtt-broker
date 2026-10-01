@@ -2029,6 +2029,17 @@ pub struct Hub {
     /// dropped. Bounded at [`RETAINED_QUEUE_CAP`]; the bound drops the **oldest**,
     /// loudly (`retained_queue_dropped_total`).
     retained_queue: VecDeque<RetainedMutation>,
+    /// Retained mutations PEERS routed here as the topic's owner (ADR 0037 T8), awaiting
+    /// their commit (or a NACK if the lease moved). Kept apart from `retained_queue` so
+    /// this node's own outstanding handoff never holds them back (issue #739): two nodes
+    /// each handing the other a topic the other owns used to wait on each other forever.
+    /// They are only ever committed here or refused back — never relayed — so draining them
+    /// cannot start a handoff of its own. Bounded at [`RETAINED_QUEUE_CAP`] like the
+    /// other queue.
+    retained_routed_queue: VecDeque<RetainedMutation>,
+    /// Which queue the next owner-local commit is taken from when both can advance,
+    /// so neither starves the other (see `kick_retained_queue`).
+    retained_routed_turn: bool,
     /// Whether an owner-local durable retained commit is currently in flight
     /// (off-loop). The queue head advances only when it completes, preserving
     /// per-node commit order.
@@ -2404,6 +2415,8 @@ impl Hub {
                 retained_tombstone_observed_at: HashMap::new(),
                 retained_may_expire: false,
                 retained_queue: VecDeque::new(),
+                retained_routed_queue: VecDeque::new(),
+                retained_routed_turn: false,
                 retained_commit_inflight: false,
                 retained_handoff: None,
                 retained_handoff_seq: 0,
@@ -3283,12 +3296,12 @@ impl Hub {
                     }
                     self.kick_retained_queue();
                 } else {
-                    // Failed (no quorum / lease moved): back to the queue FRONT —
-                    // order kept, reply tag kept (the ack flows once it commits) —
-                    // and wait for a heal trigger rather than hot-retrying. The
-                    // front slot may transiently exceed the cap by one (the entry
-                    // was already counted when first admitted).
-                    self.retained_queue.push_front(RetainedMutation {
+                    // Failed (no quorum / lease moved): back to the FRONT of the
+                    // queue it came from — order kept, reply tag kept (the ack flows
+                    // once it commits) — and wait for a heal trigger rather than
+                    // hot-retrying. The front slot may transiently exceed the cap by
+                    // one (the entry was already counted when first admitted).
+                    let mutation = RetainedMutation {
                         topic,
                         payload,
                         qos,
@@ -3297,7 +3310,12 @@ impl Hub {
                         publish,
                         expires_at,
                         restore,
-                    });
+                    };
+                    if mutation.reply.is_some() {
+                        self.retained_routed_queue.push_front(mutation);
+                    } else {
+                        self.retained_queue.push_front(mutation);
+                    }
                 }
             }
             HubCommand::RemoteRetainedUpdate {
@@ -14708,6 +14726,73 @@ mod tests {
                     break;
                 }
                 other => panic!("expected the second handoff, got {other:?}"),
+            }
+        }
+    }
+
+    /// Issue #739: a node holding its OWN outstanding handoff still commits — and acks —
+    /// a mutation a peer routed to it for a topic it owns. The two used to share one
+    /// FIFO gated on the outbound handoff, so two nodes each handing the other a topic
+    /// the other owns waited on each other forever: each held its handoff for the
+    /// other's ack, each other's routed mutation sat behind it, and the retransmissions
+    /// were swallowed as duplicates. A cluster restore hit exactly that (two nodes, each
+    /// owning one of the restored retained topics) and hung `restore-in-progress`.
+    #[tokio::test]
+    async fn an_outstanding_handoff_does_not_block_a_routed_commit_this_node_owns() {
+        let (tx, durable, placement) = start_hub_with_durable_retained(&["n"]);
+        let mut peer = connect_peer(&tx, "n", 1);
+        let (theirs, ours) = {
+            let p = placement.read().unwrap();
+            let find = |owner: &str| {
+                (0..100_000)
+                    .map(|i| format!("dev/{i}/state"))
+                    .find(|t| p.owner(t) == NodeId(owner.into()))
+                    .expect("some topic is owned by each node")
+            };
+            (find("n"), find(p.local().0.as_str()))
+        };
+
+        // This node hands a peer-owned topic to the peer and holds the handoff.
+        publish_retained_dynamic(&tx, &theirs, b"mine");
+        let held = loop {
+            match recv_peer(&mut peer).await {
+                Some(PeerMessage::RetainedCommit { seq, .. }) => break seq,
+                Some(PeerMessage::Interest { .. } | PeerMessage::RetainedDigest { .. }) => {}
+                other => panic!("unexpected peer frame {other:?}"),
+            }
+        };
+
+        // The peer, holding its own handoff to us, routes us a topic WE own. It is
+        // never going to ack `held` until we answer this one.
+        tx.send(HubCommand::RemoteRetainedCommit {
+            node: NodeId("n".into()),
+            topic: ours.clone(),
+            payload: Bytes::from_static(b"theirs"),
+            qos: 0,
+            app: AppProperties::default(),
+            seq: 41,
+            expires_at: None,
+        })
+        .unwrap();
+
+        // Committed and acked, with our own handoff still unanswered.
+        let e = wait_durable_retained(&durable, &ours, |_| true).await;
+        assert_eq!(e.payload, b"theirs");
+        loop {
+            match recv_peer_data(&mut peer).await {
+                Some(PeerMessage::RetainedCommitAck { seq, token }) => {
+                    assert_eq!(seq, 41);
+                    assert!(token.is_some(), "the routed commit is acked as committed");
+                    break;
+                }
+                // Our own handoff's retransmission, or the commit's fan-out.
+                Some(PeerMessage::RetainedCommit { seq, .. }) => assert_eq!(seq, held),
+                Some(PeerMessage::RetainedUpdate { .. }) => {}
+                None => panic!(
+                    "no ack for the routed commit: an outstanding outbound handoff \
+                     blocked a commit this node owns (the #739 deadlock)"
+                ),
+                other => panic!("unexpected peer frame {other:?}"),
             }
         }
     }
