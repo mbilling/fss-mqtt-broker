@@ -223,6 +223,30 @@ printf '%s' "$cluster" | grep -Eq '"same_cluster_id": ?true' \
 kill "$PF_PID" 2>/dev/null || true
 echo "admin API: operator admitted, anonymous refused, cluster view 3/3 replied from pod-0"
 
+log "NetworkPolicy — a non-broker pod reaches health but not the peer bus or the admin API (#778)"
+# kindnet enforces NetworkPolicy. A probe pod first proves it has a network at all (health,
+# which the policy admits from anywhere), then that the cluster ports refuse it. Every
+# earlier step already ran under the policy: formation, the admin fan-out, clients.
+POD0="$STS-0.$STS-headless.$NS.svc.cluster.local"
+kubectl -n "$NS" run np-probe --image=busybox:1.36 --restart=Never --command -- sh -c "
+  wget -qO- -T 5 http://$POD0:8080/livez >/dev/null && echo health=open || echo health=closed
+  nc -w 3 $POD0 7001 </dev/null >/dev/null 2>&1 && echo peer=open || echo peer=closed
+  nc -w 3 $POD0 9443 </dev/null >/dev/null 2>&1 && echo admin=open || echo admin=closed
+" >/dev/null
+kubectl -n "$NS" wait --for=jsonpath='{.status.phase}'=Succeeded pod/np-probe --timeout=90s >/dev/null
+probe="$(kubectl -n "$NS" logs np-probe)"
+kubectl -n "$NS" delete pod np-probe --wait=false >/dev/null 2>&1 || true
+echo "$probe"
+case "$probe" in
+  *health=open*) : ;;
+  *) echo "FAIL: the probe pod could not reach health — the policy (or the probe) is wrong"; exit 1 ;;
+esac
+case "$probe" in
+  *peer=open*|*admin=open*)
+    echo "FAIL: a non-broker pod reached the peer bus or the admin API through the NetworkPolicy"; exit 1 ;;
+esac
+echo "NetworkPolicy enforced: health open to the probe, peer bus and admin API closed to it"
+
 log "Connectivity + durable retained publish"
 # Publish a RETAINED message; a fresh subscriber must receive it (retained state is durable).
 mqtt pub -h "$RELEASE-mqttd.$NS.svc" -t smoke/state -m "hello-v1" -q 1 -r
@@ -341,4 +365,4 @@ case "$eps" in
 esac
 echo "self-quarantine held: pod-0 refuses readiness and is out of the Service endpoints"
 
-log "SMOKE PASSED: cluster formed over a MUTUALLY AUTHENTICATED bus (per-node certs from the shipped bootstrap.sh, signed per-node gossip), served the admin API from every pod (3/3 cluster view), drained on scale-down, survived a quorum-safe roll that STAYED healthy, self-quarantined a re-founder, and rejoined a wiped pod-0 once the founder guard was armed"
+log "SMOKE PASSED: cluster formed over a MUTUALLY AUTHENTICATED bus (per-node certs from the shipped bootstrap.sh, signed per-node gossip), served the admin API from every pod (3/3 cluster view), held its cluster ports closed under a NetworkPolicy, drained on scale-down, survived a quorum-safe roll that STAYED healthy, self-quarantined a re-founder, and rejoined a wiped pod-0 once the founder guard was armed"

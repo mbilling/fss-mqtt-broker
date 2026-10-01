@@ -72,6 +72,13 @@ admin:
   clientCa:
     secretName: "mqttd-admin-ca"
 
+# The NetworkPolicy is ON (issue #778), with no peer lists: clients and health from anywhere,
+# the peer bus, gossip and admin only pod to pod. Every step of kind-smoke.sh then runs under
+# it (formation, the admin fan-out, clients through the Service, scale-down, the roll), and a
+# dedicated step checks a non-broker pod is refused on 7001 and 9443 but reaches 8080.
+networkPolicy:
+  enabled: true
+
 # The client Service exposes the plaintext listener for the smoke. targetPort is numeric (the
 # container declares only the TLS/health/peer/gossip named ports; kube-proxy routes to a numeric
 # pod port regardless).

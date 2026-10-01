@@ -29,6 +29,11 @@ spec:
   # The admin API (ADR 0081, docs/ADMIN-API.md) on port 9443 of every pod, served with
   # each pod's cluster-bus certificate. The Secret holds ca.crt: a DEDICATED CA that
   # issues admin client certificates (not the cluster CA).
+  # An ingress NetworkPolicy (issue #778): the peer bus, gossip and admin ports only pod to
+  # pod; clients and health from these peers (empty = anywhere). Needs an enforcing CNI.
+  # networkPolicy:
+  #   clientFrom:
+  #     - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: iot } }
   # admin:
   #   clientCaSecret: mqttd-admin-ca
   #   viewers: ["CN=oncall"]
