@@ -7,7 +7,7 @@ tasks:
     title: "Measure and expose: hub queue depth and bytes per class, the per-command memory cost, and the overload harness"
     status: planned
     issue: 814
-    notes: "The 2026-10-01 re-run measured 2,553,413 queued commands at 2.60 GB RSS (about 1,019 B each at 200 B payloads). The harness is the before / overload / idle / control sequence #504's acceptance names, asserting RSS, /livez and the control rung."
+    notes: "The 2026-10-01 re-run measured 2,553,413 queued commands at 2.60 GB RSS (about 1,019 B each at 200 B payloads). T3 charges topic + payload + 800 B from that figure; it uses the wire topic, so an alias-only PUBLISH is undercharged by its topic length. Calibrate both here. The harness is the before / overload / idle / control sequence #504's acceptance names, asserting RSS, /livez and the control rung."
   - id: 0082-T2
     title: "Split the hub command channel: a control lane drained first, a data lane for publishes"
     status: done
@@ -16,8 +16,10 @@ tasks:
     evidence: "PR #821. The hub sorts arrivals into a control lane (completions and acks, the durable plane, Ping, admin) dispatched before the data lane; everything earlier data can change stays ordered on data (ADR amendment 2026-10-02). HubCommand::lane is an exhaustive match; Flush is the data-lane barrier; mqttd_hub_lane_depth{lane}. A ping behind 100,000 publishes is reached after <=98 data dispatches (with one FIFO, 100,000; mutation-proven); lib 517, cluster_stress, durable_sessions, cluster, admin, binary_smoke pass."
   - id: 0082-T3
     title: "Client ingress credits: a global byte pool plus a per-connection cap; a connection over its credit stops reading its socket"
-    status: in-progress
+    status: done
     issue: 816
+    date: 2026-10-02
+    evidence: "PR #823. Node pool plus a 1 MiB cap per connection; the permit rides in HubCommand::Publish and is dropped by the hub after dispatch. A connection without credit parks the publish with its socket unread; keepalive is disarmed while parked. MQTTD_INGRESS_OVERLOAD=pause|shed-qos0. Against a stalled hub, 8 publishers held the queue at 65 commands (the 64 KiB pool) under both settings: QoS 1 2,400/2,400 dispatched and acked; shed-qos0 QoS 0 65 dispatched + 15,935 shed = 16,000 sent. Without credit: 2,056 (QoS 1) and 16,000 (QoS 0). Real hub under a full pool: /livez worst ~11 ms, ping <2 ms. Mutation-proven (admit always granting; keepalive armed while parked)."
     notes: "The permit travels inside the command and is released when the hub drops it. The keepalive deadline does not run during broker-imposed pauses. QoS 1/2 semantics and Receive Maximum are unchanged. Implements MQTTD_INGRESS_OVERLOAD=pause|shed-qos0 (default pause; QoS 1/2 always pause), decided 2026-10-02. Charge = topic + payload + 800 B, from #504's measured 1,019 B per queued command, until T1 measures it directly. Brings forward T5's three settings with CONFIGURATION.md, SIZING.md and the example TOML."
   - id: 0082-T4
     title: "Peer ingress: shed remote QoS 0 data past the credit (counted); never pause a peer link"
@@ -44,9 +46,9 @@ status lives in the frontmatter above. The table below is generated from it.
 <!-- status-table:0082 -->
 | Task | Status | Issue | When | Evidence / notes |
 |------|--------|-------|------|------------------|
-| 0082-T1 | ⬜ planned | [#814](https://github.com/mbilling/fss-mqtt-broker/issues/814) | — | "The 2026-10-01 re-run measured 2,553,413 queued commands at 2.60 GB RSS (about 1,019 B each at 200 B payloads). The harness is the before / overload / idle / control sequence #504's acceptance names, asserting RSS, /livez and the control rung." |
+| 0082-T1 | ⬜ planned | [#814](https://github.com/mbilling/fss-mqtt-broker/issues/814) | — | "The 2026-10-01 re-run measured 2,553,413 queued commands at 2.60 GB RSS (about 1,019 B each at 200 B payloads). T3 charges topic + payload + 800 B from that figure; it uses the wire topic, so an alias-only PUBLISH is undercharged by its topic length. Calibrate both here. The harness is the before / overload / idle / control sequence #504's acceptance names, asserting RSS, /livez and the control rung." |
 | 0082-T2 | ✅ done | [#815](https://github.com/mbilling/fss-mqtt-broker/issues/815) | 2026-10-02 | "PR #821. The hub sorts arrivals into a control lane (completions and acks, the durable plane, Ping, admin) dispatched before the data lane; everything earlier data can change stays ordered on data (ADR amendment 2026-10-02). HubCommand::lane is an exhaustive match; Flush is the data-lane barrier; mqttd_hub_lane_depth{lane}. A ping behind 100,000 publishes is reached after <=98 data dispatches (with one FIFO, 100,000; mutation-proven); lib 517, cluster_stress, durable_sessions, cluster, admin, binary_smoke pass." |
-| 0082-T3 | 🚧 in-progress | [#816](https://github.com/mbilling/fss-mqtt-broker/issues/816) | — | "The permit travels inside the command and is released when the hub drops it. The keepalive deadline does not run during broker-imposed pauses. QoS 1/2 semantics and Receive Maximum are unchanged. Implements MQTTD_INGRESS_OVERLOAD=pause|shed-qos0 (default pause; QoS 1/2 always pause), decided 2026-10-02. Charge = topic + payload + 800 B, from #504's measured 1,019 B per queued command, until T1 measures it directly. Brings forward T5's three settings with CONFIGURATION.md, SIZING.md and the example TOML." |
+| 0082-T3 | ✅ done | [#816](https://github.com/mbilling/fss-mqtt-broker/issues/816) | 2026-10-02 | "PR #823. Node pool plus a 1 MiB cap per connection; the permit rides in HubCommand::Publish and is dropped by the hub after dispatch. A connection without credit parks the publish with its socket unread; keepalive is disarmed while parked. MQTTD_INGRESS_OVERLOAD=pause|shed-qos0. Against a stalled hub, 8 publishers held the queue at 65 commands (the 64 KiB pool) under both settings: QoS 1 2,400/2,400 dispatched and acked; shed-qos0 QoS 0 65 dispatched + 15,935 shed = 16,000 sent. Without credit: 2,056 (QoS 1) and 16,000 (QoS 0). Real hub under a full pool: /livez worst ~11 ms, ping <2 ms. Mutation-proven (admit always granting; keepalive armed while parked)." |
 | 0082-T4 | ⬜ planned | [#817](https://github.com/mbilling/fss-mqtt-broker/issues/817) | — | "publish_dropped{reason=hub-ingress}. Remote QoS >= 1 is uncharged (the origin's pending table bounds it). Control and durable frames are never charged." |
 | 0082-T5 | ⬜ planned | [#818](https://github.com/mbilling/fss-mqtt-broker/issues/818) | — | "Also MQTTD_INGRESS_OVERLOAD ([limits] ingress_overload) in mqtt-config and the docs, with the pause versus shed-qos0 trade-off stated. Defaults accepted 2026-10-02: the pool is 1/8 of MQTTD_MEMORY_MAX_BYTES or 256 MiB; 1 MiB per connection. The three settings, CONFIGURATION.md, SIZING.md and the example TOML land with T3 (#816); OPERATIONS.md (runbook, alerts on ingress_credit_bytes and ingress_paused_seconds) remains." |
 | 0082-T6 | ⬜ planned | [#819](https://github.com/mbilling/fss-mqtt-broker/issues/819) | — | "Closes #504 and #535 when it passes." |
@@ -71,3 +73,5 @@ status lives in the frontmatter above. The table below is generated from it.
 - 2026-10-02: ADR accepted. Overload behaviour is configurable (`MQTTD_INGRESS_OVERLOAD`,
   default `pause`), the defaults stand, and T2 ships first.
 - 2026-10-02: T2 delivered (PR #821 merged): the control lane.
+- 2026-10-02: T3 delivered (PR #823 merged): client ingress credit, with the overload knob
+  and T5's three settings, CONFIGURATION.md and SIZING.md.
