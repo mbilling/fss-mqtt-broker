@@ -16,12 +16,31 @@ D=$(driver_count)
 OUT="$RUN/results/nodes=$N/hosts"
 mkdir -p "$OUT"
 
+# Run "$@" for at most <secs> seconds: GNU `timeout` where it exists (Linux, or
+# coreutils' `gtimeout` on macOS), otherwise a background watchdog. macOS ships
+# no `timeout` at all, and the bare call failed every attempt with "command not
+# found" — so a run that failed on a macOS operator's machine lost exactly the
+# evidence this script exists to keep (the #504 acceptance run, 2026-10-01).
+bounded() {
+    local secs="$1"; shift
+    if command -v timeout >/dev/null 2>&1; then timeout "$secs" "$@"; return; fi
+    if command -v gtimeout >/dev/null 2>&1; then gtimeout "$secs" "$@"; return; fi
+    "$@" &
+    local pid=$! rc=0
+    ( sleep "$secs"; kill -TERM "$pid" 2>/dev/null ) &
+    local watchdog=$!
+    wait "$pid" || rc=$?
+    kill "$watchdog" 2>/dev/null || true
+    wait "$watchdog" 2>/dev/null || true
+    return "$rc"
+}
+
 # Transient SSH failures must not erase the only failure evidence. Bound each
 # attempt and run hosts in parallel so unreachable hosts cannot delay teardown.
 collect_one() {
     local ip="$1" dest="$2" command="$3" attempt
     for attempt in 1 2 3; do
-        if timeout 20 ssh "${SSH_OPTS[@]}" -o UserKnownHostsFile="$RUN/known_hosts" \
+        if bounded 20 ssh "${SSH_OPTS[@]}" -o UserKnownHostsFile="$RUN/known_hosts" \
             "root@$ip" "$command" >"$dest.attempt$attempt" 2>&1; then
             cp "$dest.attempt$attempt" "$dest"
             printf 'success attempt=%s\n' "$attempt" >"$dest.status"
