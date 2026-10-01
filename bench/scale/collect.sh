@@ -37,10 +37,10 @@ bounded() {
 
 # Transient SSH failures must not erase the only failure evidence. Bound each
 # attempt and run hosts in parallel so unreachable hosts cannot delay teardown.
-collect_one() {
-    local ip="$1" dest="$2" command="$3" attempt
+collect_one() { # collect_one <ip> <dest> <command> [bound seconds, default 20]
+    local ip="$1" dest="$2" command="$3" secs="${4:-20}" attempt
     for attempt in 1 2 3; do
-        if bounded 20 ssh "${SSH_OPTS[@]}" -o UserKnownHostsFile="$RUN/known_hosts" \
+        if bounded "$secs" ssh "${SSH_OPTS[@]}" -o UserKnownHostsFile="$RUN/known_hosts" \
             "root@$ip" "$command" >"$dest.attempt$attempt" 2>&1; then
             cp "$dest.attempt$attempt" "$dest"
             printf 'success attempt=%s\n' "$attempt" >"$dest.status"
@@ -80,10 +80,48 @@ cat /var/log/cloud-init-output.log
 test ! -f /var/log/bench-build.log || cat /var/log/bench-build.log
 COMMAND
 )
+# What a STALLED broker looks like from the outside (#504, 2026-10-01): the process
+# alive, its journal silent, /metrics accepting connections and never answering —
+# and nothing captured could say why. So, FIRST and before anything that might
+# disturb it: system pressure, the process's memory and fds, every thread's state,
+# CPU, kernel wait channel and kernel stack, sockets, kernel warnings (hung task,
+# OOM), and a gdb thread dump when gdb is there. Blocked-in-a-lock, spinning and
+# memory-starved look different here even with a stripped binary.
+broker_diag_command=$(cat <<'COMMAND'
+date -u
+uptime
+free -m
+for f in cpu memory io; do printf 'pressure %s: ' "$f"; cat "/proc/pressure/$f" 2>/dev/null | tr '\n' ' '; echo; done
+PID=$(systemctl show -p MainPID --value mqttd 2>/dev/null)
+echo "mqttd MainPID=$PID"
+systemctl status mqttd --no-pager -l 2>&1 | head -20
+if [ -n "$PID" ] && [ "$PID" != 0 ] && [ -d "/proc/$PID" ]; then
+    echo "--- /proc/$PID/status"; cat "/proc/$PID/status"
+    echo "--- open fds: $(ls "/proc/$PID/fd" 2>/dev/null | wc -l)"
+    echo "--- per-thread CPU (top -H)"; top -H -b -n 1 -p "$PID" 2>/dev/null | head -60
+    echo "--- threads: tid comm state wchan"
+    for t in /proc/"$PID"/task/*; do
+        printf '%s %s %s %s\n' "${t##*/}" "$(cat "$t/comm" 2>/dev/null)" \
+            "$(awk '{print $3}' "$t/stat" 2>/dev/null)" "$(cat "$t/wchan" 2>/dev/null)"
+    done
+    echo "--- kernel stacks"
+    for t in /proc/"$PID"/task/*; do echo "-- tid ${t##*/}"; cat "$t/stack" 2>/dev/null; done
+    echo "--- sockets"; ss -s; ss -tnp 2>/dev/null | grep -c "pid=$PID," | sed 's/^/tcp sockets held: /'
+    if command -v gdb >/dev/null; then
+        echo "--- gdb thread dump"
+        timeout 60 gdb -p "$PID" -batch -ex 'set pagination off' -ex 'thread apply all bt' 2>&1 | head -2000
+    else
+        echo "--- gdb not installed; no user-space thread dump"
+    fi
+fi
+echo "--- kernel log (30 min)"; journalctl -k --since '-30 minutes' --no-pager | tail -100
+COMMAND
+)
 pids=()
 for ((i = 0; i < N; i++)); do
     (
         ip=$(broker_pub_ip "$i")
+        collect_one "$ip" "$OUT/broker$i-diag.log" "$broker_diag_command" 90
         collect_one "$ip" "$OUT/broker$i-journal.log" "journalctl -u mqttd --no-pager"
         collect_one "$ip" "$OUT/broker$i-final-metrics.prom" "curl -fsS -m 10 http://localhost:8080/metrics"
         collect_one "$ip" "$OUT/broker$i-cloud-init.log" "cat /var/log/cloud-init-output.log"

@@ -23,6 +23,8 @@ packages:
   - chrony
   - sysstat
   - ethtool
+  # Thread dumps of a stalled broker for collect.sh (#504). Inert unless invoked.
+  - gdb
 %{ if docker ~}
   # ADR 0048 T4's comparison runs every broker under test as a container on this
   # host — mqttd included, so no broker gets a different runtime. Off by default:

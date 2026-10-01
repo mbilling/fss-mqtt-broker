@@ -38,6 +38,11 @@ The prerequisites and pricing below describe the default Hetzner platform.
    `openssl@3` (`brew install openssl@3`; the system LibreSSL cannot mint the
    cluster PKI and `deploy/systemd/gen-certs.sh` refuses it loudly). The
    `hcloud` CLI is optional but lets `teardown.sh` audit by label.
+   **bash ≥ 4.4**: `run.sh`, `482-per-node-knee.sh` and `compare-brokers.sh` refuse
+   older shells. macOS ships bash 3.2, so `brew install bash` and put Homebrew's
+   bin first in PATH; the scripts use `#!/usr/bin/env bash`. Under 3.2 the CPU
+   samplers died inside every rung (2026-10-01). `teardown.sh` still runs on any
+   bash, so an emergency teardown never depends on it.
    Provisioning, teardown (including the sweeper), and quota tests require `tofu`;
    there is no Terraform fallback, even if Terraform is installed. No Terraform
    Cloud/Enterprise features are used. Existing `terraform*/` directories,
