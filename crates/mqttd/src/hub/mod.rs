@@ -8149,14 +8149,22 @@ mod tests {
         Some(*boxed)
     }
 
+    /// How long [`recv_peer`] waits for a frame it EXPECTS. A bounded poll, so a passing
+    /// test returns the moment the frame lands; the budget only matters on a loaded CI
+    /// runner, where the previous 300 ms failed `peer_dead_drops_routing_…` 1 run in 5
+    /// (#487). "Nothing arrives" checks use [`no_peer_data`] and its short window instead.
+    const PEER_FRAME_WAIT: Duration = Duration::from_secs(5);
+
+    /// How long [`no_peer_data`] watches for a frame that must NOT arrive.
+    const NO_PEER_FRAME_WINDOW: Duration = Duration::from_millis(300);
+
     /// The next peer message, skipping the `SharedInterest` snapshots that now ride
     /// alongside every `Interest` gossip (ADR 0015) — these routing tests assert on
-    /// ordinary interest and publishes, not shared membership.
+    /// ordinary interest and publishes, not shared membership. `None` when the channel
+    /// closed, or nothing came within [`PEER_FRAME_WAIT`].
     async fn recv_peer(rx: &mut mpsc::UnboundedReceiver<PeerMessage>) -> Option<PeerMessage> {
         loop {
-            let msg = timeout(Duration::from_millis(300), rx.recv())
-                .await
-                .ok()??;
+            let msg = timeout(PEER_FRAME_WAIT, rx.recv()).await.ok()??;
             if !matches!(msg, PeerMessage::SharedInterest { .. }) {
                 return Some(msg);
             }
@@ -8173,6 +8181,36 @@ mod tests {
             match recv_peer(rx).await {
                 Some(PeerMessage::Interest { .. } | PeerMessage::RetainedDigest { .. }) => {}
                 other => return other,
+            }
+        }
+    }
+
+    /// [`recv_peer`] with the short [`NO_PEER_FRAME_WINDOW`]: for loops that drain frames
+    /// UNTIL QUIET, which a long wait would stretch (or, under paused time with periodic
+    /// retransmissions, never end).
+    async fn recv_peer_quiet(rx: &mut mpsc::UnboundedReceiver<PeerMessage>) -> Option<PeerMessage> {
+        loop {
+            let msg = timeout(NO_PEER_FRAME_WINDOW, rx.recv()).await.ok()??;
+            if !matches!(msg, PeerMessage::SharedInterest { .. }) {
+                return Some(msg);
+            }
+        }
+    }
+
+    /// True when no DATA frame (see [`recv_peer_data`]) arrives within
+    /// [`NO_PEER_FRAME_WINDOW`], or the channel is closed: the "must not be relayed"
+    /// assertion, which cannot use [`recv_peer`]'s long wait without paying all of it.
+    async fn no_peer_data(rx: &mut mpsc::UnboundedReceiver<PeerMessage>) -> bool {
+        let deadline = tokio::time::Instant::now() + NO_PEER_FRAME_WINDOW;
+        loop {
+            match tokio::time::timeout_at(deadline, rx.recv()).await {
+                Err(_) | Ok(None) => return true,
+                Ok(Some(
+                    PeerMessage::SharedInterest { .. }
+                    | PeerMessage::Interest { .. }
+                    | PeerMessage::RetainedDigest { .. },
+                )) => {}
+                Ok(Some(_)) => return false,
             }
         }
     }
@@ -14681,8 +14719,9 @@ mod tests {
         // the clock, so sweep-tick retransmissions of v1 can legitimately land in
         // this window; what must never appear is a different seq.)
         loop {
-            match recv_peer_data(&mut peer).await {
+            match recv_peer_quiet(&mut peer).await {
                 None => break,
+                Some(PeerMessage::Interest { .. } | PeerMessage::RetainedDigest { .. }) => {}
                 Some(PeerMessage::RetainedCommit { payload, seq, .. }) => {
                     assert_eq!(payload, b"v1");
                     assert_eq!(
@@ -14998,7 +15037,7 @@ mod tests {
         publish_retained(&tx, "t", b"v");
 
         let mut saw_broadcast = false;
-        while let Some(msg) = recv_peer(&mut peer).await {
+        while let Some(msg) = recv_peer_quiet(&mut peer).await {
             match msg {
                 PeerMessage::Publish { retain, .. } => saw_broadcast = retain,
                 PeerMessage::RetainedCommit { .. } => {
@@ -16989,14 +17028,8 @@ mod tests {
         .unwrap();
         // Neither peer may see any further DATA frame (n1's non-match included;
         // late handshake frames are order-free and skipped).
-        assert!(
-            recv_peer_data(&mut p2).await.is_none(),
-            "remote publish relayed"
-        );
-        assert!(
-            recv_peer_data(&mut p1).await.is_none(),
-            "n1 got a non-matching publish"
-        );
+        assert!(no_peer_data(&mut p2).await, "remote publish relayed");
+        assert!(no_peer_data(&mut p1).await, "n1 got a non-matching publish");
     }
 
     /// Local interest changes (subscribe / unsubscribe / clean-session detach)

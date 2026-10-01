@@ -110,37 +110,54 @@ impl Drop for Broker {
 
 /// Boot the real binary with the hook pointed at `hook_url`.
 async fn start_broker(hook_url: &str, extra: &[(&str, &str)]) -> (Broker, SocketAddr) {
-    let client: SocketAddr = format!("127.0.0.1:{}", free_tcp_port()).parse().unwrap();
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_mqttd"));
-    for (k, _) in std::env::vars() {
-        if k.starts_with("MQTTD_") {
-            cmd.env_remove(k);
+    // `free_tcp_port` closes the port before the broker binds it, so another process can
+    // take it in between (#487): the readiness poll below then connects to THAT process,
+    // the broker exits on its failed bind, and the test later sees `ConnectionRefused`
+    // from nowhere. So a broker that exits while we wait is a lost race: retry on a
+    // fresh port, and only a broker that keeps failing is a real startup failure.
+    for attempt in 1..=3 {
+        let client: SocketAddr = format!("127.0.0.1:{}", free_tcp_port()).parse().unwrap();
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_mqttd"));
+        for (k, _) in std::env::vars() {
+            if k.starts_with("MQTTD_") {
+                cmd.env_remove(k);
+            }
+        }
+        cmd.env("MQTTD_NODE_ID", "hook-node")
+            .env("MQTTD_ALLOW_EPHEMERAL_DURABILITY", "1")
+            .env("MQTTD_PLAINTEXT_BIND", client.to_string())
+            .env("MQTTD_HTTP_AUTH_URL", hook_url)
+            // The stub speaks plaintext; the broker refuses that unless told, which is
+            // itself covered by a unit test.
+            .env("MQTTD_HTTP_AUTH_ALLOW_HTTP", "1")
+            .env("RUST_LOG", "off");
+        for (k, v) in extra {
+            cmd.env(k, v);
+        }
+        let child = cmd
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn mqttd");
+        let mut broker = Broker(child);
+        for _ in 0..300 {
+            if let Ok(Some(status)) = broker.0.try_wait() {
+                eprintln!(
+                    "mqttd exited ({status}) before listening on {client}, attempt {attempt}"
+                );
+                break;
+            }
+            if TcpStream::connect(client).await.is_ok() {
+                // Connected — but to the broker? Only if it is still running.
+                if broker.0.try_wait().ok().flatten().is_none() {
+                    return (broker, client);
+                }
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
     }
-    cmd.env("MQTTD_NODE_ID", "hook-node")
-        .env("MQTTD_ALLOW_EPHEMERAL_DURABILITY", "1")
-        .env("MQTTD_PLAINTEXT_BIND", client.to_string())
-        .env("MQTTD_HTTP_AUTH_URL", hook_url)
-        // The stub speaks plaintext; the broker refuses that unless told, which is
-        // itself covered by a unit test.
-        .env("MQTTD_HTTP_AUTH_ALLOW_HTTP", "1")
-        .env("RUST_LOG", "off");
-    for (k, v) in extra {
-        cmd.env(k, v);
-    }
-    let child = cmd
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn mqttd");
-    let broker = Broker(child);
-    for _ in 0..300 {
-        if TcpStream::connect(client).await.is_ok() {
-            return (broker, client);
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    panic!("mqttd never listened on {client}");
+    panic!("mqttd failed to start and listen in 3 attempts on fresh ports");
 }
 
 /// CONNECT with credentials; return the CONNACK return code.
