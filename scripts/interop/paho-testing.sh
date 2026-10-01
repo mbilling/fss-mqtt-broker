@@ -183,11 +183,13 @@ run_suite() {
   set -e
 }
 run_suite
-# A run that did not COMPLETE (no "Ran N tests" line, e.g. setUpClass timed out waiting for
-# a CONNACK, as in #487) gets a diagnosis and, only if the broker is demonstrably healthy,
-# ONE re-run. A dead or unresponsive broker is never re-run into a pass: it fails below
-# with the evidence.
-if ! grep -qE '^Ran [0-9]+ tests?' "$WORK/out.txt"; then
+# A run that did not COMPLETE gets a diagnosis and, only if the broker is demonstrably
+# healthy, ONE re-run. Incomplete means no "Ran N tests" line at all, OR "Ran 0 tests":
+# unittest still prints that line when setUpClass fails, which is exactly the #487 case
+# (setUpClass timing out waiting for a CONNACK). Counting 0 as complete let that case
+# skip the re-run and fail as a "pin moved" (PR #808, 2026-10-01). A dead or unresponsive
+# broker is never re-run into a pass: it fails below with the evidence.
+if ! grep -qE '^Ran [1-9][0-9]* tests?' "$WORK/out.txt"; then
   alive=no; kill -0 "$BROKER_PID" 2>/dev/null && alive=yes
   t0=$(python3 -c 'import time; print(time.monotonic())')
   if probe 5; then answer=yes; else answer=no; fi
@@ -244,7 +246,13 @@ problems = []
 # so every EXPECTED entry looks like it "now passes" and a broker that failed to start
 # reads as a broker that fixed four bugs. That exact output was this script's first run.
 EXPECTED_TESTS = 27
-if not ran:
+if ran and int(ran.group(1)) == 0:
+    problems.append(
+        "the suite ran 0 tests: its setUpClass failed (the suite's own connection setup, "
+        "not a conformance verdict), and did so again on the one re-run, so NOTHING was "
+        "verified. See the setUpClass error in the output below."
+    )
+elif not ran:
     problems.append(
         "the suite printed no 'Ran N tests' line — it did not complete, so NOTHING was "
         "verified. The broker most likely failed to start; see the output below."
