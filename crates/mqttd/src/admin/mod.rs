@@ -37,7 +37,7 @@ use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
 use tokio_rustls::TlsAcceptor;
-use tracing::{debug, warn};
+use tracing::debug;
 
 /// Most admin connections served at once; more wait in the accept backlog.
 const MAX_CONCURRENT: usize = 32;
@@ -230,10 +230,8 @@ pub async fn serve_reloadable(
                     drop(permit);
                 });
             }
-            Err(e) => {
-                warn!(error = %e, "admin listener accept failed");
-                return;
-            }
+            // Issue #504: pause and accept again; never end the listener.
+            Err(e) => crate::accept::pause_after_error(&e, "admin").await,
         }
     }
 }

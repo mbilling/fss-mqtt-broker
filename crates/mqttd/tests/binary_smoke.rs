@@ -821,3 +821,180 @@ async fn the_listener_survives_fd_exhaustion_and_accepts_again() {
          process was still alive and the descriptors had been released. Logs were: {logs}"
     );
 }
+
+/// The broker log at `path` with ANSI escapes removed: tracing writes them between a
+/// field's name and its value even to a file.
+fn plain_log(path: &std::path::Path) -> String {
+    let raw = std::fs::read_to_string(path).unwrap_or_default();
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            for c in chars.by_ref() {
+                if c.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Whether the log shows `listener` failing an accept (the shared #504 warning).
+fn logged_accept_failure(log: &str, listener: &str) -> bool {
+    log.lines().any(|l| {
+        l.contains("listener accept failed") && l.contains(&format!("listener=\"{listener}\""))
+    })
+}
+
+async fn try_connect(addr: SocketAddr) -> Option<tokio::net::TcpStream> {
+    tokio::time::timeout(
+        Duration::from_millis(200),
+        tokio::net::TcpStream::connect(addr),
+    )
+    .await
+    .ok()
+    .and_then(Result::ok)
+}
+
+/// Whether `/livez` answers HTTP 200 within ~10 s — a real answer, not a TCP connect
+/// (which the kernel completes into the backlog with the listener dead).
+async fn livez_answers(health: SocketAddr) -> bool {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    for _ in 0..100 {
+        if let Some(mut s) = try_connect(health).await {
+            let asked = s
+                .write_all(b"GET /livez HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n")
+                .await
+                .is_ok();
+            let mut body = Vec::new();
+            let read =
+                tokio::time::timeout(Duration::from_millis(500), s.read_to_end(&mut body)).await;
+            if asked && read.is_ok() && body.starts_with(b"HTTP/1.1 200") {
+                return true;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    false
+}
+
+/// Whether the peer listener accepts and handles a connection within ~10 s: it reads our
+/// EOF and closes its side. A dead listener never reads the backlogged connection.
+async fn peer_listener_accepts(peer: SocketAddr) -> bool {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    for _ in 0..100 {
+        if let Some(mut s) = try_connect(peer).await {
+            let _ = s.shutdown().await;
+            let mut buf = [0u8; 64];
+            if let Ok(Ok(0) | Err(_)) =
+                tokio::time::timeout(Duration::from_millis(500), s.read(&mut buf)).await
+            {
+                return true;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    false
+}
+
+/// Issue #504, the rest of the class: the HEALTH and CLUSTER-BUS listeners must survive an
+/// accept error too.
+///
+/// Found by a local overload of the real binary on main after the client-listener fix:
+/// the MQTT listener recovered from the fd squeeze, but `/metrics`, `/readyz` and `/livez`
+/// never answered again, because the health loop still `return`ed on any accept error —
+/// as did the peer listener (a node that can never accept another peer link) and the
+/// admin listener. On Kubernetes the dead liveness probe then restarts the pod, which is
+/// the "restart away the symptom" #504 forbids.
+///
+/// Same squeeze as above, aimed at all three listeners. Each must have LOGGED an accept
+/// failure (else the recovery below proves nothing), then answer once fds are released.
+#[tokio::test]
+async fn the_health_and_peer_listeners_survive_fd_exhaustion() {
+    const FD_LIMIT: usize = 128;
+    const CLIENT_SOCKETS: usize = 300;
+    const SIDE_SOCKETS: usize = 40;
+
+    let mqtt: SocketAddr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+    let health: SocketAddr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+    let peer: SocketAddr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+    let logs = tempfile::NamedTempFile::new().expect("broker log file");
+    let log_path = logs.path().to_path_buf();
+    let log_sink = logs.reopen().expect("broker log handle");
+    let mut cmd = Command::new("/bin/sh");
+    cmd.arg("-c")
+        .arg(format!("ulimit -n {FD_LIMIT}; exec \"$0\""))
+        .arg(env!("CARGO_BIN_EXE_mqttd"));
+    for (k, _) in std::env::vars() {
+        if k.starts_with("MQTTD_") {
+            cmd.env_remove(k);
+        }
+    }
+    let child = cmd
+        .env("MQTTD_NODE_ID", "fd-squeeze-side")
+        .env("MQTTD_PLAINTEXT_BIND", mqtt.to_string())
+        .env("MQTTD_HEALTH_BIND", health.to_string())
+        .env("MQTTD_PEER_BIND", peer.to_string())
+        .env("MQTTD_ALLOW_ANONYMOUS", "1")
+        .env("MQTTD_ALLOW_EPHEMERAL_DURABILITY", "1")
+        .env("RUST_LOG", "warn")
+        .stdout(Stdio::from(log_sink))
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn the mqttd binary");
+    let mut guard = ChildGuard(child);
+    for addr in [mqtt, health, peer] {
+        wait_until_listening(addr).await;
+    }
+
+    // Exhaust the descriptors through the client listener, then knock on the other two so
+    // their accept() runs into the full table.
+    let mut held = Vec::new();
+    for _ in 0..CLIENT_SOCKETS {
+        match try_connect(mqtt).await {
+            Some(s) => held.push(s),
+            None => break,
+        }
+    }
+    for _ in 0..SIDE_SOCKETS {
+        for addr in [health, peer] {
+            held.extend(try_connect(addr).await);
+        }
+    }
+    let squeeze_deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let squeezed = loop {
+        let log = plain_log(&log_path);
+        if logged_accept_failure(&log, "health") && logged_accept_failure(&log, "peer") {
+            break true;
+        }
+        if std::time::Instant::now() >= squeeze_deadline {
+            break false;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert!(
+        squeezed,
+        "the squeeze never forced an accept error on BOTH the health and the peer \
+         listener in 20s, so this test proves nothing about surviving one. Log: {}",
+        plain_log(&log_path)
+    );
+    drop(held);
+
+    let livez = livez_answers(health).await;
+    let peer_alive = peer_listener_accepts(peer).await;
+    let _ = guard.0.kill();
+    let log = plain_log(&log_path);
+    assert!(
+        livez,
+        "the health listener never answered /livez again after an accept error (#504) — \
+         /metrics, /readyz and /livez stay dead while the broker runs. Log: {log}"
+    );
+    assert!(
+        peer_alive,
+        "the cluster-bus listener never accepted again after an accept error (#504) — \
+         this node could take no new peer link. Log: {log}"
+    );
+}

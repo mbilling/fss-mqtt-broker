@@ -199,10 +199,9 @@ pub async fn serve_listener(
                     }
                 });
             }
-            Err(e) => {
-                warn!(error = %e, "peer listener accept failed");
-                return;
-            }
+            // Issue #504: an fd squeeze must not end the cluster-bus listener — that
+            // would leave this node unable to accept any peer link for good.
+            Err(e) => crate::accept::pause_after_error(&e, "peer").await,
         }
     }
 }

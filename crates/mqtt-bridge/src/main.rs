@@ -112,8 +112,19 @@ fn serve_metrics(bind: String, metrics: Arc<BridgeMetrics>) {
             }
         };
         loop {
-            let Ok((mut stream, _)) = listener.accept().await else {
-                continue;
+            // An accept error must neither end this loop nor spin it: an fd squeeze
+            // retried in a tight loop burns a core and frees nothing (issue #504).
+            let mut stream = match listener.accept().await {
+                Ok((stream, _)) => stream,
+                Err(e) => {
+                    if e.kind() != std::io::ErrorKind::ConnectionAborted
+                        && e.kind() != std::io::ErrorKind::Interrupted
+                    {
+                        warn!(%bind, error = %e, "metrics accept failed; pausing");
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    }
+                    continue;
+                }
             };
             let metrics = metrics.clone();
             tokio::spawn(async move {

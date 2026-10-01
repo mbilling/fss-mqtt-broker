@@ -212,6 +212,7 @@ use mqtt_storage::logged::ReplicatedSessionStore;
 use mqtt_storage::persistent_log::PersistentLog;
 use mqtt_storage::persistent_retained::PersistentRetainedStore;
 use mqtt_storage::{MemorySessionStore, OverflowPolicy, QueueLimits, RetainedStore, SessionStore};
+use mqttd::accept::accept_backoff;
 use mqttd::{admission, cluster, config_watch, conn, hub, peer, reload};
 use std::path::Path;
 use std::sync::{Arc, RwLock};
@@ -3532,44 +3533,6 @@ async fn start_swim(
         plane,
     ));
     Ok(())
-}
-
-/// How long the accept loop pauses after `accept()` returns an error.
-///
-/// Fixed rather than exponential on purpose: the failure this exists for is a
-/// full fd table, which clears when connections drain and not as a function of
-/// how long we have been failing. 100 ms is ten attempts a second — free at this
-/// scale — so the listener is back within 100 ms of the resource returning,
-/// while a tight retry loop would burn a core and free nothing.
-const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
-
-/// How long to wait before accepting again after `accept()` failed.
-///
-/// The listener must NEVER exit on an accept error (issue #504). It used to
-/// `return` on any error, which killed that listener for the life of the
-/// process: the broker stayed up, kept answering `/metrics`, drained its
-/// existing connections to zero and never accepted another client — observed on
-/// v1.0.13 as `connections_total` frozen across two rungs while
-/// `connections_active` fell 4,099 → 1,171 → 0. A `warn!` was the only trace.
-///
-/// Every accept error is either per-connection or transient, so the loop always
-/// continues; the only question is whether to pause first.
-///
-/// - `ConnectionAborted` and `Interrupted` are routine, not faults: the peer
-///   vanished between its SYN and our `accept()`, or a signal landed. The next
-///   accept is unaffected, so retry immediately — pausing here would add latency
-///   for every other waiting client in response to a non-event. This is also the
-///   cheapest possible trigger for the old bug: one client hanging up at the
-///   wrong moment was enough to take the listener down.
-/// - Everything else is treated as resource exhaustion — EMFILE/ENFILE (the
-///   per-process and system fd limits) and ENOBUFS are what an overloaded broker
-///   actually hits — and pauses, because retrying an exhausted fd table in a
-///   tight loop empties nothing.
-fn accept_backoff(e: &std::io::Error) -> Duration {
-    match e.kind() {
-        std::io::ErrorKind::ConnectionAborted | std::io::ErrorKind::Interrupted => Duration::ZERO,
-        _ => ACCEPT_ERROR_BACKOFF,
-    }
 }
 
 /// The shared accept loop behind every TCP-based client listener (TLS, plaintext,
