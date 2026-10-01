@@ -597,6 +597,15 @@ impl Hub {
         all_durable
     }
 
+    /// How many sessions pending publish `id` has been handed to so far (see
+    /// [`PendingPublish::reached`]).
+    fn reached_count(&self, id: u64) -> usize {
+        self.pending_publishes
+            .get(id)
+            .and_then(|p| p.reached.as_ref())
+            .map_or(0, |r| r.len())
+    }
+
     /// Record that pending publish `id` has been handed to `clients` (see
     /// [`PendingPublish::reached`]). Recorded at SUBMIT, like the lane
     /// obligations: a delivery whose append later fails drops the whole entry,
@@ -635,6 +644,7 @@ impl Hub {
         // the one observable-state predicate for all of it.
         let window_over = !self.routing_unsettled();
         for id in held {
+            let reached_before = self.reached_count(id);
             let out = self.redeliver_pending(id);
             match out {
                 DurableOutcome::Ok => {}
@@ -650,12 +660,34 @@ impl Hub {
                     continue;
                 }
             }
+            // The re-delivery reached a session nobody had handed this publish: the
+            // dead target's subscriber has materialized HERE. That is the evidence
+            // the re-route grace waits for, just as a remote re-route is (the sweep
+            // ends the grace there too), so the ack need not wait out the rest of
+            // the grace (#738: about five seconds of every failover pause).
+            if self.reached_count(id) > reached_before {
+                if let Some(p) = self.pending_publishes.get_mut(id) {
+                    p.reroute_grace = None;
+                    // And it is fan-out evidence, exactly as a local match at publish
+                    // time is: the ack no longer needs the window to close.
+                    p.ack_awaits_settle = false;
+                }
+            }
             // The successor may have materialized the subscriber on ANOTHER node
             // and advertised its interest since this publish's original fan-out
             // (which found nothing): forward to it now — a publish that arrived
             // after the death dropped the dead node's interest has no obligation
             // to re-route, so this is where it re-targets.
-            for node in self.reroute_candidates(id) {
+            let candidates = self.reroute_candidates(id);
+            if !candidates.is_empty() {
+                // A re-route answers the grace's question exactly as the sweep's
+                // re-route does: the subscriber has a new home. Its forward is now
+                // the obligation, so the ack waits on that, not on the grace (#738).
+                if let Some(p) = self.pending_publishes.get_mut(id) {
+                    p.reroute_grace = None;
+                }
+            }
+            for node in candidates {
                 self.send_acked_forward(id, &node);
             }
             if window_over {
@@ -1223,6 +1255,12 @@ impl Hub {
         let Some(peer) = self.peers.get(node) else {
             return; // link gone: the sender's sweep will retransmit
         };
+        // A peer older than proto 11 cannot decode `Reached`; to it, it is `Stored`.
+        let verdict = if verdict == ForwardVerdict::Reached && peer.proto < PROTO_FORWARD_REACHED {
+            ForwardVerdict::Stored
+        } else {
+            verdict
+        };
         let frame = if peer.proto >= PROTO_FORWARD_VERDICT {
             PeerMessage::PublishVerdict { seq, verdict }
         } else {
@@ -1260,6 +1298,11 @@ impl Hub {
             DurableOutcome::Ok => {
                 debug!(publish = id, seq, from = %node.0, "forward stored");
                 p.stored = true;
+                // Fan-out evidence, as a local match is (#738): the receiver stored it
+                // for a subscriber, so the ack need not wait for the window to close.
+                if verdict == ForwardVerdict::Reached {
+                    p.ack_awaits_settle = false;
+                }
                 if !p.acked_nodes.iter().any(|a| a == node) {
                     p.acked_nodes.push(node.clone());
                 }
@@ -2168,6 +2211,173 @@ mod zone_fwd_proofs {
             matches!(rx.try_recv(), Ok(PublishOutcome::Accepted)),
             "the ack held for the window must be released when it closes"
         );
+    }
+
+    // ---- #738: a failover's acks wait only for evidence, not for the window ----
+
+    /// One peer link at an explicit proto, advertising `filter`.
+    fn attach_peer_at(hub: &mut Hub, name: &str, proto: u32, filter: &str) -> PeerLink {
+        let node = NodeId(name.into());
+        let (tx, rx) = mpsc::unbounded_channel();
+        let (ctl, ctl_rx) = mpsc::unbounded_channel();
+        hub.peer_connected(
+            node.clone(),
+            0,
+            tx,
+            ctl,
+            None,
+            proto,
+            std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        );
+        hub.interest.replace(node.clone(), vec![filter.to_string()]);
+        PeerLink {
+            node,
+            rx,
+            _ctl_rx: ctl_rx,
+        }
+    }
+
+    /// A publish whose only route is a forward, registered while the view is
+    /// unsettled (so its ack is held), with the forward sent and its seq returned.
+    fn held_forward(h: &mut Hub, peer: &NodeId) -> (u64, u64, oneshot::Receiver<PublishOutcome>) {
+        let (id, rx) = register(h, "t/x");
+        h.send_acked_forward(id, peer);
+        h.pending_local_done(id);
+        let seq = *h.pending_publishes[&id]
+            .awaiting
+            .keys()
+            .next()
+            .expect("the forward is outstanding");
+        (id, seq, rx)
+    }
+
+    /// #738: during a takeover window a forward answered `Reached` is evidence the
+    /// message reached a subscriber, so the ack is released at once; one answered
+    /// `Stored` is not (a settled receiver says `Stored` for a fan-out that matched
+    /// nobody — issue #294), so it keeps waiting for the window to close.
+    #[test]
+    fn a_reached_forward_releases_a_held_ack_and_a_stored_one_does_not() {
+        for (verdict, released) in [
+            (ForwardVerdict::Reached, true),
+            (ForwardVerdict::Stored, false),
+        ] {
+            let mut h = hub();
+            h.set_cluster_configured();
+            assert!(h.routing_unsettled(), "the rig must be unsettled");
+            let peer = attach_peer_at(&mut h, "p", PROTO_FORWARD_REACHED, "t/x");
+            let (_id, seq, mut rx) = held_forward(&mut h, &peer.node);
+            h.forward_answered(&peer.node, seq, verdict);
+            assert_eq!(
+                matches!(rx.try_recv(), Ok(PublishOutcome::Accepted)),
+                released,
+                "{verdict:?}: released must be {released}"
+            );
+        }
+    }
+
+    /// #738: `Reached` goes on the wire only to a peer that can decode it. A
+    /// proto-10 peer hears `Stored`, a proto-6 peer `PublishAck { ok: true }`.
+    #[test]
+    fn a_reached_answer_is_downgraded_for_an_older_peer() {
+        let mut h = hub();
+        let mut links: Vec<_> = [
+            ("new", PROTO_FORWARD_REACHED),
+            ("ten", PROTO_FORWARD_REACHED - 1),
+            ("six", PROTO_FORWARD_VERDICT - 1),
+        ]
+        .into_iter()
+        .map(|(name, proto)| attach_peer_at(&mut h, name, proto, "t/x"))
+        .collect();
+        for link in &links {
+            h.answer_forward(&link.node, 5, ForwardVerdict::Reached);
+        }
+        let sent: Vec<_> = links
+            .iter_mut()
+            .map(|l| l.rx.try_recv().expect("an answer was sent"))
+            .collect();
+        assert!(matches!(
+            sent[0],
+            PeerMessage::PublishVerdict {
+                seq: 5,
+                verdict: ForwardVerdict::Reached
+            }
+        ));
+        assert!(matches!(
+            sent[1],
+            PeerMessage::PublishVerdict {
+                seq: 5,
+                verdict: ForwardVerdict::Stored
+            }
+        ));
+        assert!(matches!(
+            sent[2],
+            PeerMessage::PublishAck { seq: 5, ok: true }
+        ));
+    }
+
+    /// #738: a publish whose forward target died waits out the re-route grace for
+    /// the subscriber to reappear. When the takeover scan materializes it HERE and
+    /// the settle pass re-delivers to it, that is the answer: the grace and the ack
+    /// hold both end, instead of the ack waiting for the grace and the window.
+    #[tokio::test]
+    async fn a_takeover_redelivery_that_reaches_a_session_ends_the_grace_and_the_hold() {
+        for materialized in [true, false] {
+            let mut h = hub();
+            h.set_cluster_configured();
+            let (id, _rx) = register(&mut h, "t/x");
+            h.pending_publishes.get_mut(id).unwrap().reroute_grace = Some(REROUTE_GRACE_TICKS);
+            let sessions = if materialized {
+                vec![(
+                    ClientId("moved".into()),
+                    vec![mqtt_core::Subscription {
+                        filter: "t/x".into(),
+                        max_qos: QoS::AtLeastOnce,
+                        no_local: false,
+                        sub_id: None,
+                    }],
+                    None,
+                )]
+            } else {
+                Vec::new()
+            };
+            h.inherit_sessions(sessions, true);
+            let p = &h.pending_publishes[&id];
+            assert_eq!(
+                p.reroute_grace.is_none(),
+                materialized,
+                "materialized={materialized}: the grace ends only when the re-delivery reached someone"
+            );
+            assert_eq!(
+                !p.ack_awaits_settle, materialized,
+                "materialized={materialized}: the ack hold ends only on that evidence"
+            );
+        }
+    }
+
+    /// #738: the settle pass re-routing a died-target publish to a peer that now
+    /// advertises the topic ends the grace, as the sweep's own re-route does; the
+    /// ack then waits on that forward's answer, not on the grace running out.
+    #[test]
+    fn a_takeover_reroute_ends_the_grace() {
+        for advertised in [true, false] {
+            let mut h = hub();
+            h.set_cluster_configured();
+            let filter = if advertised { "t/x" } else { "other" };
+            let mut peer = attach_peer_at(&mut h, "succ", PROTO_FORWARD_REACHED, filter);
+            let (id, _rx) = register(&mut h, "t/x");
+            h.pending_publishes.get_mut(id).unwrap().reroute_grace = Some(REROUTE_GRACE_TICKS);
+            h.settle_pending_publishes();
+            assert_eq!(
+                h.pending_publishes[&id].reroute_grace.is_none(),
+                advertised,
+                "advertised={advertised}: the grace ends only on a re-route"
+            );
+            assert_eq!(
+                matches!(peer.rx.try_recv(), Ok(PeerMessage::PublishAcked { .. })),
+                advertised,
+                "advertised={advertised}: the re-route forward is sent"
+            );
+        }
     }
 
     /// An entry that has already been answered and survives only for the

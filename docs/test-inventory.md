@@ -258,7 +258,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `two_bridge_instances_do_not_duplicate_forwarding`
 - `two_partitioned_instances_deliver_each_inbound_message_exactly_once`
 
-## `crates/mqtt-cluster/src/lib.rs` — 358 test(s)
+## `crates/mqtt-cluster/src/lib.rs` — 359 test(s)
 
 - `cluster_identity::tests::a_founder_mints_once_and_reloads_stably`
 - `cluster_identity::tests::a_joiner_adopts_once_and_persists`
@@ -456,6 +456,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `peer::tests::publish_verdict_and_shared_deliver_acked_roundtrip_at_stable_variant_indices`
 - `peer::tests::roundtrips_all_variants`
 - `peer::tests::the_frozen_frames_encode_byte_for_byte_stably`
+- `peer::tests::the_reached_verdict_is_appended_and_announced_at_proto_11`
 - `peer::tests::trailing_bytes_after_a_postcard_body_are_rejected`
 - `peer::tests::two_frames_in_one_buffer`
 - `placement::tests::a_cloned_ring_keeps_a_correct_memo`
@@ -1005,7 +1006,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 497 test(s)
+## `crates/mqttd/src/lib.rs` — 502 test(s)
 
 - `admin::cli::tests::answers_render_as_tables_and_lines`
 - `admin::cli::tests::invocations_are_validated_before_anything_runs`
@@ -1174,6 +1175,10 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::forwarding::pending_bounds::the_reached_record_is_charged_and_released_with_its_entry`
 - `hub::forwarding::pending_bounds::the_sweep_retransmits_only_overdue_forwards`
 - `hub::forwarding::zone_fwd_proofs::a_qos0_publish_nobody_wants_does_not_walk_the_peer_map`
+- `hub::forwarding::zone_fwd_proofs::a_reached_answer_is_downgraded_for_an_older_peer`
+- `hub::forwarding::zone_fwd_proofs::a_reached_forward_releases_a_held_ack_and_a_stored_one_does_not`
+- `hub::forwarding::zone_fwd_proofs::a_takeover_redelivery_that_reaches_a_session_ends_the_grace_and_the_hold`
+- `hub::forwarding::zone_fwd_proofs::a_takeover_reroute_ends_the_grace`
 - `hub::forwarding::zone_fwd_proofs::an_already_acknowledged_entry_is_never_refused_or_withheld`
 - `hub::forwarding::zone_fwd_proofs::an_already_answered_victim_is_not_counted_as_a_withheld_ack`
 - `hub::forwarding::zone_fwd_proofs::closing_the_window_clears_both_holds_and_acks`
@@ -1229,6 +1234,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::a_failed_shared_enqueue_withholds_the_publishers_ack`
 - `hub::tests::a_foreign_topics_retained_publish_routes_the_commit_to_its_owner`
 - `hub::tests::a_forward_for_a_just_released_moved_session_is_not_answered_stored`
+- `hub::tests::a_forward_that_matched_a_subscriber_is_answered_reached`
 - `hub::tests::a_forwarded_publish_is_counted_received_and_then_accounted_nowhere`
 - `hub::tests::a_full_append_lane_withholds_the_publisher_and_reorders_nothing`
 - `hub::tests::a_group_with_no_committed_lease_is_never_rehomed`
