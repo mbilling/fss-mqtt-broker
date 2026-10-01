@@ -77,6 +77,40 @@ pub struct MqttdClusterSpec {
     /// certificate, so `secrets.peerTls` is required (without it nothing is rendered).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub admin: Option<AdminSpec>,
+    /// An ingress `NetworkPolicy` for the broker pods (issue #778), mirroring the chart's
+    /// `networkPolicy` values. Presence enables it; removing it deletes the policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network_policy: Option<NetworkPolicySpec>,
+}
+
+/// Who may reach the broker pods (issue #778). Pod to pod, the peer bus, gossip and (with
+/// `admin`) the admin API are admitted only between the cluster's own pods. Each list holds
+/// Kubernetes `NetworkPolicyPeer` objects (`podSelector` / `namespaceSelector` / `ipBlock`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct NetworkPolicySpec {
+    /// Who may reach the client listener. Empty = anywhere.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schemars(schema_with = "network_policy_peers")]
+    pub client_from: Vec<serde_json::Value>,
+    /// Who may reach health and metrics (8080). Empty = anywhere, so kubelet probes and
+    /// Prometheus keep working.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schemars(schema_with = "network_policy_peers")]
+    pub health_from: Vec<serde_json::Value>,
+    /// Who besides the cluster's pods may reach the admin API (with `admin`). Empty = the
+    /// pods only; `kubectl port-forward` still reaches it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schemars(schema_with = "network_policy_peers")]
+    pub admin_from: Vec<serde_json::Value>,
+}
+
+/// A list of `NetworkPolicyPeer` objects, passed through to the `NetworkPolicy` as written.
+fn network_policy_peers(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "type": "array",
+        "items": { "type": "object", "x-kubernetes-preserve-unknown-fields": true }
+    })
 }
 
 /// The admin API settings (ADR 0081; `docs/ADMIN-API.md`).

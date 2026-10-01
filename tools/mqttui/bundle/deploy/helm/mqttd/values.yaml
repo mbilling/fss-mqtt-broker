@@ -191,6 +191,25 @@ admin:
     secretName: ""
     mountPath: /etc/mqttd/admin
 
+# An optional ingress NetworkPolicy for the broker pods (issue #778). Off by default. When
+# enabled it admits:
+#   - pod to pod: the peer bus (7001/TCP), gossip (7946/UDP) and, with admin.enabled, the
+#     admin API (9443/TCP), only between this release's broker pods;
+#   - clients: the client Service's ports (service.ports), from `clientFrom`;
+#   - health and metrics (8080), from `healthFrom`;
+#   - the admin API from outside the pod mesh, from `adminFrom` (with admin.enabled).
+# Each list holds NetworkPolicyPeer objects (podSelector / namespaceSelector / ipBlock). An
+# empty clientFrom or healthFrom admits that port from anywhere, so a policy switched on with
+# no lists still lets clients, kubelet probes and Prometheus in while closing the cluster
+# ports. An empty adminFrom keeps the admin API to the pods; `kubectl port-forward` still
+# reaches it. Egress is not restricted. Enforcement needs a CNI that implements
+# NetworkPolicy; without one the object is accepted and does nothing.
+networkPolicy:
+  enabled: false
+  clientFrom: []
+  healthFrom: []
+  adminFrom: []
+
 # Extra environment variables (the highest config layer — override any file setting per ADR 0046).
 # A name set here WINS over the chart-derived secret paths above, so this stays the escape
 # hatch for a layout the chart does not assume.

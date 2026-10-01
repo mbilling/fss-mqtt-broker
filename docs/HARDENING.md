@@ -69,6 +69,7 @@ Single-node deployments: verify none of the cluster binds are set and skip to §
 | H-4.6 | L2 | Peer-bus CRL configured and hot | `MQTTD_PEER_TLS_CRL` | revoke a node's cert, SIGHUP: its links drop without a broker restart |
 | H-4.7 | L2 | Kubernetes: per-pod peer keys (cert-manager csi-driver), not the starter one-Secret-for-all | deployment choice | `kubectl get secret` — no single secret holding every node's key |
 | H-4.8 | L2 | Refound guard on (split-brain containment) | `MQTTD_REFOUND_GUARD` (default on) | absent from config (default) or explicitly `true`; never `false` in production |
+| H-4.9 | L2 | Kubernetes: the cluster ports (7001, 7946, 9443) reachable only pod to pod, under an enforcing CNI | chart `networkPolicy.enabled` / CR `spec.networkPolicy` (default off) | `kubectl get networkpolicy`; a probe pod outside the release cannot connect to a pod's 7001 (the kind smoke does exactly this) |
 
 ## 5. Resource governance
 

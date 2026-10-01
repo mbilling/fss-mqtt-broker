@@ -107,6 +107,37 @@
                     "nullable": true,
                     "type": "string"
                   },
+                  "networkPolicy": {
+                    "description": "An ingress `NetworkPolicy` for the broker pods (issue #778), mirroring the chart's\n`networkPolicy` values. Presence enables it; removing it deletes the policy.",
+                    "nullable": true,
+                    "properties": {
+                      "adminFrom": {
+                        "description": "Who besides the cluster's pods may reach the admin API (with `admin`). Empty = the\npods only; `kubectl port-forward` still reaches it.",
+                        "items": {
+                          "type": "object",
+                          "x-kubernetes-preserve-unknown-fields": true
+                        },
+                        "type": "array"
+                      },
+                      "clientFrom": {
+                        "description": "Who may reach the client listener. Empty = anywhere.",
+                        "items": {
+                          "type": "object",
+                          "x-kubernetes-preserve-unknown-fields": true
+                        },
+                        "type": "array"
+                      },
+                      "healthFrom": {
+                        "description": "Who may reach health and metrics (8080). Empty = anywhere, so kubelet probes and\nPrometheus keep working.",
+                        "items": {
+                          "type": "object",
+                          "x-kubernetes-preserve-unknown-fields": true
+                        },
+                        "type": "array"
+                      }
+                    },
+                    "type": "object"
+                  },
                   "persistence": {
                     "description": "Per-pod persistent volume settings (mirrors the chart's `persistence`).",
                     "nullable": true,

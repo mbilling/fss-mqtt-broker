@@ -179,6 +179,8 @@ pub struct Rendered {
     pub configmap: Value,
     /// The `PodDisruptionBudget` (always rendered; the chart makes it optional).
     pub pdb: Value,
+    /// The ingress `NetworkPolicy`, when the CR asks for one (issue #778).
+    pub networkpolicy: Option<Value>,
 }
 
 impl Rendered {
@@ -188,6 +190,7 @@ impl Rendered {
         let mut v = vec![&self.serviceaccount, &self.configmap];
         v.extend(self.services.iter());
         v.push(&self.pdb);
+        v.extend(self.networkpolicy.as_ref());
         v.push(&self.statefulset);
         v
     }
@@ -240,8 +243,72 @@ pub fn render(cr: &MqttdCluster, observed_pvc_max: Option<u64>) -> Rendered {
         configmap: configmap(cr, &names),
         services: vec![headless_service(cr, &names), client_service(&names)],
         pdb: pdb(&names),
+        networkpolicy: network_policy(cr, &names),
         statefulset: statefulset(cr, &names, observed_pvc_max),
     }
+}
+
+/// The name the `NetworkPolicy` gets (the chart's `mqttd.fullname`), so the applier can
+/// delete it when the CR stops asking for one.
+#[must_use]
+pub fn network_policy_name(cr: &MqttdCluster) -> String {
+    Names::of(cr).full
+}
+
+/// The ingress `NetworkPolicy` (issue #778), the chart's `templates/networkpolicy.yaml`:
+/// pod to pod the cluster ports, then the client ports, health, and the admin API from
+/// outside the pod mesh — in that order, as the chart renders them.
+fn network_policy(cr: &MqttdCluster, names: &Names) -> Option<Value> {
+    let np = cr.spec.network_policy.as_ref()?;
+    let admin = admin(cr).is_some();
+    let rule = |ports: Value, from: &[Value]| {
+        let mut r = json!({ "ports": ports });
+        if !from.is_empty() {
+            r["from"] = json!(from);
+        }
+        r
+    };
+    let mut mesh_ports = vec![
+        json!({ "port": "peer", "protocol": "TCP" }),
+        json!({ "port": "gossip", "protocol": "UDP" }),
+    ];
+    if admin {
+        mesh_ports.push(json!({ "port": "admin", "protocol": "TCP" }));
+    }
+    let mut ingress = vec![
+        json!({
+            "from": [{ "podSelector": { "matchLabels": selector_labels(names) } }],
+            "ports": mesh_ports,
+        }),
+        rule(
+            json!([{ "port": "mqtt-tls", "protocol": "TCP" }]),
+            &np.client_from,
+        ),
+        rule(
+            json!([{ "port": "health", "protocol": "TCP" }]),
+            &np.health_from,
+        ),
+    ];
+    if admin && !np.admin_from.is_empty() {
+        ingress.push(rule(
+            json!([{ "port": "admin", "protocol": "TCP" }]),
+            &np.admin_from,
+        ));
+    }
+    Some(json!({
+        "apiVersion": "networking.k8s.io/v1",
+        "kind": "NetworkPolicy",
+        "metadata": {
+            "name": names.full,
+            "namespace": names.namespace,
+            "labels": labels(names),
+        },
+        "spec": {
+            "podSelector": { "matchLabels": selector_labels(names) },
+            "policyTypes": ["Ingress"],
+            "ingress": ingress,
+        },
+    }))
 }
 
 fn serviceaccount(names: &Names) -> Value {
@@ -738,6 +805,84 @@ mod tests {
     /// admin port on the container and the headless Service (never the client Service).
     /// Without `peerTls`, or with no subject in either role list, it renders nothing
     /// rather than a broker that cannot start.
+    /// Issue #778: `spec.networkPolicy` renders an ingress policy whose pod-mesh rule
+    /// admits only the cluster's own pods to the peer bus and gossip (and the admin port
+    /// when the admin API is on); the client and health rules pass their peer lists
+    /// through and admit anyone when a list is empty; the admin-from-outside rule exists
+    /// only with the admin API AND an `adminFrom` list. Without the field: no policy.
+    #[test]
+    fn the_network_policy_closes_the_cluster_ports_to_everything_but_the_pods() {
+        let mut cr = sample();
+        assert!(render(&cr, None).networkpolicy.is_none());
+        assert_eq!(render(&cr, None).all().len(), 6);
+
+        cr.spec.network_policy = serde_json::from_value(serde_json::json!({})).unwrap();
+        let r = render(&cr, None);
+        let np = r.networkpolicy.as_ref().expect("a policy");
+        assert_eq!(r.all().len(), 7);
+        assert_eq!(np["spec"]["policyTypes"], serde_json::json!(["Ingress"]));
+        let ingress = np["spec"]["ingress"].as_array().unwrap();
+        assert_eq!(ingress.len(), 3, "mesh, clients, health: {np}");
+        let mesh = &ingress[0];
+        assert_eq!(
+            mesh["from"][0]["podSelector"]["matchLabels"], np["spec"]["podSelector"]["matchLabels"],
+            "the mesh rule admits exactly the pods the policy covers"
+        );
+        assert_eq!(
+            mesh["ports"],
+            serde_json::json!([
+                { "port": "peer", "protocol": "TCP" },
+                { "port": "gossip", "protocol": "UDP" },
+            ])
+        );
+        assert!(
+            ingress[1].get("from").is_none(),
+            "no clientFrom: clients from anywhere"
+        );
+        assert!(
+            ingress[2].get("from").is_none(),
+            "no healthFrom: probes from anywhere"
+        );
+
+        // With the admin API and every list: the admin port joins the mesh, the lists
+        // pass through, and the admin-from-outside rule appears.
+        cr.spec.secrets = serde_json::from_value(serde_json::json!({ "peerTls": "p" })).unwrap();
+        cr.spec.admin = serde_json::from_value(
+            serde_json::json!({ "clientCaSecret": "ca", "operators": ["CN=root"] }),
+        )
+        .unwrap();
+        let bastion = serde_json::json!({ "podSelector": { "matchLabels": { "app": "bastion" } } });
+        let iot = serde_json::json!({ "namespaceSelector": { "matchLabels": { "team": "iot" } } });
+        cr.spec.network_policy = serde_json::from_value(serde_json::json!({
+            "clientFrom": [iot], "adminFrom": [bastion],
+        }))
+        .unwrap();
+        let r = render(&cr, None);
+        let ingress = r.networkpolicy.as_ref().unwrap()["spec"]["ingress"].clone();
+        assert_eq!(
+            ingress[0]["ports"][2],
+            serde_json::json!({ "port": "admin", "protocol": "TCP" })
+        );
+        assert_eq!(ingress[1]["from"], serde_json::json!([iot]));
+        assert_eq!(ingress[3]["from"], serde_json::json!([bastion]));
+        assert_eq!(
+            ingress[3]["ports"],
+            serde_json::json!([{ "port": "admin", "protocol": "TCP" }])
+        );
+
+        // adminFrom without the admin API renders no admin rule at all.
+        cr.spec.admin = None;
+        let r = render(&cr, None);
+        let ingress = r.networkpolicy.as_ref().unwrap()["spec"]["ingress"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert_eq!(ingress.len(), 3);
+        assert!(!serde_json::to_string(&ingress)
+            .unwrap()
+            .contains("\"admin\""));
+    }
+
     #[test]
     fn the_admin_api_renders_only_with_the_cluster_bus_and_a_role() {
         let with = |secrets: serde_json::Value, admin: serde_json::Value| {

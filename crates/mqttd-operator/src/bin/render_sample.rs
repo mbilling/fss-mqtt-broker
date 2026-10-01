@@ -37,6 +37,17 @@ fn main() {
     } else {
         serde_json::Value::Null
     };
+    // `--netpol` adds the NetworkPolicy (issue #778) with the peers of the chart's
+    // ci/values-parity-netpol.yaml, so every ingress rule is compared.
+    let network_policy = if std::env::args().any(|a| a == "--netpol") {
+        serde_json::json!({
+            "clientFrom": [{ "namespaceSelector": { "matchLabels": { "kubernetes.io/metadata.name": "iot" } } }],
+            "healthFrom": [{ "namespaceSelector": { "matchLabels": { "kubernetes.io/metadata.name": "monitoring" } } }],
+            "adminFrom": [{ "podSelector": { "matchLabels": { "app": "bastion" } } }],
+        })
+    } else {
+        serde_json::Value::Null
+    };
     let cr: mqttd_operator::crd::MqttdCluster = serde_json::from_value(serde_json::json!({
         "apiVersion": "mqttd.io/v1alpha1",
         "kind": "MqttdCluster",
@@ -51,6 +62,7 @@ fn main() {
             )),
             "secrets": secrets,
             "admin": admin,
+            "networkPolicy": network_policy,
         },
         "status": status,
     }))

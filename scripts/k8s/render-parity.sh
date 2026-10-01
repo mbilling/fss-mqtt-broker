@@ -19,5 +19,9 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 "$HERE/render-parity-one.sh" "admin API ON (cluster bus + admin)" \
   "--set secrets.peerTls.secretName=mqttd-peer-tls --set secrets.gossipKey.secretName=mqttd-gossip --set admin.enabled=true --set admin.clientCa.secretName=mqttd-admin-ca --set admin.viewers[0]=CN=oncall --set admin.operators[0]=CN=sre-lead" \
   "--admin"
+# Issue #778: the NetworkPolicy on, with the admin API, so every ingress rule renders.
+"$HERE/render-parity-one.sh" "NetworkPolicy ON (admin API + every peer list)" \
+  "--set secrets.peerTls.secretName=mqttd-peer-tls --set secrets.gossipKey.secretName=mqttd-gossip --set admin.enabled=true --set admin.clientCa.secretName=mqttd-admin-ca --set admin.viewers[0]=CN=oncall --set admin.operators[0]=CN=sre-lead -f $HERE/../../deploy/helm/mqttd/ci/values-parity-netpol.yaml" \
+  "--admin --netpol"
 echo
-echo "RENDER PARITY OK IN BOTH FOUNDER-GUARD STATES, WITH THE CLUSTER BUS ON, AND WITH THE ADMIN API ON"
+echo "RENDER PARITY OK IN BOTH FOUNDER-GUARD STATES, WITH THE CLUSTER BUS ON, WITH THE ADMIN API ON, AND WITH THE NETWORKPOLICY ON"
