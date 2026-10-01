@@ -462,7 +462,9 @@ Other published measurements (dev-grade, single host, never capacity): [DURABLE-
 | Online backup/restore | ✅ | ⚠️ | n/v | 💰 | n/v | n/v |
 | Bridge | ✅ | ✅ | ✅ | ✖ | ✅ | ✅ |
 | Rule engine | ✖ by design | ✖ | ✅ | ✖ | ✖ | ✅ |
-| Dashboard / admin API | ⚠️ admin API + CLI, no dashboard | ✖ | ✅ | 💰 | ✅ | ✅ |
+| Admin API | ✅ mTLS, roles, audited | ⚠️ 2.1: experimental, no auth | ✅ | 💰 | ✅ | ✅ |
+| Admin CLI | ✅ `mqttd --admin` | ⚠️ `mosquitto_ctrl`: security config | ✅ `emqx ctl` | ✖ | ✅ `vmq-admin` | ⚠️ start/reload |
+| Admin dashboard | ✖ by design | ⚠️ 2.1: experimental | ✅ | 💰 | ⚠️ status page | ✖ |
 | MQTT-SN / CoAP | ✖ | ✖ | ✅ | ✖ | ✖ | ✖ |
 | Signed reproducible builds + SBOM | ✅ | ✖ | n/v | n/v | ✖ | ✖ |
 | FIPS variant | ✅ | ✖ | n/v | 💰 | ✖ | ✖ |
