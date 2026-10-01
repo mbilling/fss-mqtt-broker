@@ -13,7 +13,7 @@ tasks:
     title: "Evidence — per-op commit cost and RSS on the shipped binary, on the calibration shape"
     status: planned
     issue: 684
-    notes: "Measured in the same paid run as ADR 0078 T4: the durable writer's ms/op against the musl-allocator run of 2026-09-28 (~0.024 ms/op), plus idle and post-burst RSS."
+    notes: "Measured in the same paid run as ADR 0078 T4: the durable writer's ms/op against the musl-allocator run of 2026-09-28 (~0.024 ms/op), plus idle and post-burst RSS. AUDIT 2026-10-01 (recorded from an issue audit; status unchanged): The per-op half was measured in the 2026-09-29 run (issue #662; candidate 512ec41 carries mimalloc from PR #686): durable writer 0.010 ms/op on the log store and 0.021 on redb, against the musl run's ~0.024. Remaining: idle and post-burst RSS (not reported), and putting both numbers in a doc rather than an issue comment."
 ---
 
 # Delivery: ADR 0079 — mqttd links mimalloc as its global allocator
@@ -25,7 +25,7 @@ frontmatter above · this file is the plan, progress log, and changelog.
 | Task | Status | Issue | When | Evidence / notes |
 |------|--------|-------|------|------------------|
 | 0079-T1 | ✅ done | [#683](https://github.com/mbilling/fss-mqtt-broker/issues/683) | 2026-09-28 | "PR #686. #[global_allocator] static GLOBAL: mimalloc::MiMalloc in crates/mqttd/src/main.rs (binary only; default features, so the C malloc aws-lc uses is not overridden); mimalloc as a workspace dependency (MIT). The reproducible musl build (build-repro.sh, zig cc) links it — MIMALLOC_VERBOSE=1 mqttd --version prints mimalloc v3.3.2 at process init; cargo test -p mqttd, clippy -D warnings, cargo deny (supply-chain audit) and the FIPS variant pass in CI." |
-| 0079-T2 | ⬜ planned | [#684](https://github.com/mbilling/fss-mqtt-broker/issues/684) | — | "Measured in the same paid run as ADR 0078 T4: the durable writer's ms/op against the musl-allocator run of 2026-09-28 (~0.024 ms/op), plus idle and post-burst RSS." |
+| 0079-T2 | ⬜ planned | [#684](https://github.com/mbilling/fss-mqtt-broker/issues/684) | — | "Measured in the same paid run as ADR 0078 T4: the durable writer's ms/op against the musl-allocator run of 2026-09-28 (~0.024 ms/op), plus idle and post-burst RSS. AUDIT 2026-10-01 (recorded from an issue audit; status unchanged): The per-op half was measured in the 2026-09-29 run (issue #662; candidate 512ec41 carries mimalloc from PR #686): durable writer 0.010 ms/op on the log store and 0.021 on redb, against the musl run's ~0.024. Remaining: idle and post-burst RSS (not reported), and putting both numbers in a doc rather than an issue comment." |
 <!-- /status-table:0079 -->
 
 ## Plan
