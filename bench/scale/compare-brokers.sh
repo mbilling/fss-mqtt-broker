@@ -32,6 +32,7 @@
 # preflight uses it before any cloud call.
 set -euo pipefail
 . "$(dirname "$0")/lib.sh"
+require_modern_bash
 . "$SCALE_DIR/cpu.sh"
 
 # ── the brokers, pinned by digest ────────────────────────────────────────────

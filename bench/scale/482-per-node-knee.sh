@@ -38,6 +38,7 @@
 
 set -euo pipefail
 . "$(dirname "$0")/lib.sh"
+require_modern_bash
 
 : "${KNEE_ARMS:?source a knee env first (KNEE_ARMS=<brokers>:<drivers>:<ladder>;...)}"
 # Parse once, refuse early: a malformed arm must not surface after provisioning.

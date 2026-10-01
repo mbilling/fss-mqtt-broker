@@ -25,6 +25,7 @@
 
 set -euo pipefail
 . "$(dirname "$0")/lib.sh"
+require_modern_bash
 . "$SCALE_DIR/cloud.sh"
 # Provisioning requires the public key. Keep this out of lib.sh: emergency
 # teardown must still reach the provider's label audit if this file is lost.

@@ -5,6 +5,19 @@
 
 set -euo pipefail
 
+# The rig is written for bash >= 4.4 (empty arrays under `set -u`, subshell traps).
+# macOS ships bash 3.2, and under it the CPU samplers died inside every rung of the
+# #504 acceptance run (2026-10-01) — `__cpu_pids[@]: unbound variable` — leaving
+# cpu_window=incomplete everywhere. Called by the PAID entry points only: teardown
+# also sources this file, and must keep working on any shell.
+require_modern_bash() {
+	if [ "${BASH_VERSINFO[0]}" -lt 4 ] || { [ "${BASH_VERSINFO[0]}" -eq 4 ] && [ "${BASH_VERSINFO[1]}" -lt 4 ]; }; then
+		printf 'FATAL: the scale rig needs bash >= 4.4; this is %s (%s).\n' "$BASH_VERSION" "$BASH" >&2
+		printf '       macOS: brew install bash, and put its bin directory first in PATH (scripts use #!/usr/bin/env bash).\n' >&2
+		exit 2
+	fi
+}
+
 SCALE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck disable=SC2034 # consumed by the sourcing scripts (bootstrap-cluster.sh)
 REPO_ROOT="$(cd "$SCALE_DIR/../.." && pwd)"
