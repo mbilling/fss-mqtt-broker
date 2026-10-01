@@ -25,8 +25,10 @@ tasks:
     evidence: "cargo deny check → advisories/bans/licenses/sources all ok; ban verified to trip unscoped (lockfile records disabled optionals) and pass wrapper-scoped; amendment notes added at each ADR's affected passage"
   - id: 0053-T5
     title: FIPS-mode evaluation (aws-lc-rs fips feature — the ADR 0002 certified-builds line) and rcgen 0.13→0.14 Issuer migration
-    status: planned
+    status: done
     issue: 548
+    date: 2026-10-01
+    evidence: "Delivered under ADR 0068: the fips variant (PR #347) and the fips release artifacts (PR #352), every 0068 task done; rcgen 0.13 to 0.14 with the CertifiedIssuer migration (PR #337; Cargo.toml pins rcgen 0.14). Recorded here on 2026-10-01 after an issue audit found the task still marked planned."
 ---
 
 # 0053 — Single crypto provider: delivery
@@ -43,7 +45,7 @@ ring is banned from returning.
 | 0053-T2 | ✅ done | — | 2026-08-04 | "cargo tree -i ring → nothing compiled; quinn-proto feature graph shows only aws-lc; full sweep green: mqtt-auth 120, mqtt-cluster 229 (swim_auth golden HMAC vector = wire bytes unchanged), mqtt-net, mqttd tls/reload_tls/ws/quic/peer_identity/auth/protocol_violations" |
 | 0053-T3 | ✅ done | — | 2026-08-04 | "signed_gossip tests green: ECDSA P-256/P-384 + Ed25519 round-trips, a_crl_not_signed_by_the_cluster_ca_is_rejected_at_load, a_cert_not_chaining_to_the_ca_is_rejected — both call sites exercise the new dispatch; x509-parser verify feature dropped from mqtt-auth" |
 | 0053-T4 | ✅ done | — | 2026-08-04 | "cargo deny check → advisories/bans/licenses/sources all ok; ban verified to trip unscoped (lockfile records disabled optionals) and pass wrapper-scoped; amendment notes added at each ADR's affected passage" |
-| 0053-T5 | ⬜ planned | [#548](https://github.com/mbilling/fss-mqtt-broker/issues/548) | — |  |
+| 0053-T5 | ✅ done | [#548](https://github.com/mbilling/fss-mqtt-broker/issues/548) | 2026-10-01 | "Delivered under ADR 0068: the fips variant (PR #347) and the fips release artifacts (PR #352), every 0068 task done; rcgen 0.13 to 0.14 with the CertifiedIssuer migration (PR #337; Cargo.toml pins rcgen 0.14). Recorded here on 2026-10-01 after an issue audit found the task still marked planned." |
 <!-- /status-table:0053 -->
 
 ## Notes

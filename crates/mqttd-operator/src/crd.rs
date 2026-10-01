@@ -66,10 +66,13 @@ pub struct MqttdClusterSpec {
     /// installed with defaults must still be protected from a lost pod-0 volume.
     #[serde(default)]
     pub bootstrap_policy: BootstrapPolicy,
-    /// Presence starts an unattended three-phase SWIM key rotation
-    /// (ADR 0003 / 0055 §3.3): the operator stages `newKeySecretRef`, flips the
-    /// sealer, and closes the window, gating each phase on the ADR 0054
-    /// verification signals. Cleared by the operator when the rotation completes.
+    /// RESERVED, not implemented yet (0055-T5, issue #549): setting it has NO effect
+    /// today. The planned behavior is an unattended three-phase SWIM key rotation
+    /// (ADR 0003 / 0055 §3.3), staging `newKeySecretRef`, flipping the sealer and
+    /// closing the window, each phase gated on the ADR 0054 verification signals.
+    /// Until then, rotate with the three config rolls in OPERATIONS.md (SWIM gossip
+    /// key rotation); the operator does raise `RotationInProgress` while more than
+    /// one key is accepted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gossip_key_rotation: Option<GossipKeyRotation>,
     /// The authenticated admin API (ADR 0081), mirroring the chart's `admin` values.
@@ -243,7 +246,7 @@ pub enum BrownoutAction {
     ExpandPvc,
 }
 
-/// An unattended gossip key rotation request (ADR 0055 §3.3).
+/// A gossip key rotation request (ADR 0055 §3.3). Reserved: not acted on yet (#549).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct GossipKeyRotation {

@@ -51,7 +51,7 @@ Group `mqttd.io`, kind `MqttdCluster`, shortName `mqc`, namespaced,
 | `secrets.tls` / `acl` / `peerTls` / `gossipKey` | string | Secret/ConfigMap **names**. The operator never reads key material. |
 | `admin.clientCaSecret` / `viewers` / `operators` | string / list | The admin API on port 9443 of every pod (ADR 0081), the chart's `admin` values. Needs `secrets.peerTls`; with no subject in either list nothing is rendered. |
 | `networkPolicy.clientFrom` / `healthFrom` / `adminFrom` | `NetworkPolicyPeer` lists | Ingress `NetworkPolicy` for the broker pods, the chart's `networkPolicy` values. Presence enables it; removing it deletes the policy. |
-| `gossipKeyRotation.newKeySecretRef` | string | Unattended three-phase SWIM rotation. Cleared when complete. |
+| `gossipKeyRotation.newKeySecretRef` | string | **Reserved, not implemented yet** ([#549](https://github.com/mbilling/fss-mqtt-broker/issues/549)): setting it has no effect. Rotate the SWIM key with the three config rolls in [OPERATIONS.md](../../../docs/OPERATIONS.md#swim-gossip-key-rotation--three-config-rolls-manual-by-design); the operator raises `RotationInProgress` while more than one key is accepted. |
 | `remediation.brownout` | `Alert` (default) / `ExpandPvc` | Disk brownout. |
 | `remediation.splitBrain` | `Alert` (default) / `Fence` | Two cluster identities. Fence deletes the new-founder **pod** and labels the PVC; it cannot delete the volume. |
 

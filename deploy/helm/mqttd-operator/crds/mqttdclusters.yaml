@@ -89,7 +89,7 @@
                     "type": "string"
                   },
                   "gossipKeyRotation": {
-                    "description": "Presence starts an unattended three-phase SWIM key rotation\n(ADR 0003 / 0055 §3.3): the operator stages `newKeySecretRef`, flips the\nsealer, and closes the window, gating each phase on the ADR 0054\nverification signals. Cleared by the operator when the rotation completes.",
+                    "description": "RESERVED, not implemented yet (0055-T5, issue #549): setting it has NO effect\ntoday. The planned behavior is an unattended three-phase SWIM key rotation\n(ADR 0003 / 0055 §3.3), staging `newKeySecretRef`, flipping the sealer and\nclosing the window, each phase gated on the ADR 0054 verification signals.\nUntil then, rotate with the three config rolls in OPERATIONS.md (SWIM gossip\nkey rotation); the operator does raise `RotationInProgress` while more than\none key is accepted.",
                     "nullable": true,
                     "properties": {
                       "newKeySecretRef": {
