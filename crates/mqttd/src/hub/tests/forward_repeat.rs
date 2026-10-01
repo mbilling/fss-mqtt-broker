@@ -144,7 +144,7 @@ impl Rig {
             None,
             &AppProperties::default(),
         );
-        self.sender.send_acked_forward(id, &target());
+        self.sender.send_acked_forward(id, &target(), false);
         // The local half is done; only the peer's answer is outstanding.
         self.sender.pending_local_done(id);
         let first = self.next_forward();
@@ -173,7 +173,10 @@ impl Rig {
                 .to_receiver
                 .try_recv()
                 .expect("the sender put an acked forward on the link");
-            if matches!(frame, PeerMessage::PublishAcked { .. }) {
+            if matches!(
+                frame,
+                PeerMessage::PublishAcked { .. } | PeerMessage::PublishAckedTagged { .. }
+            ) {
                 return frame;
             }
         }
@@ -181,17 +184,49 @@ impl Rig {
 
     /// What the receiver's peer-link pump would dispatch for `frame`.
     fn arrive(frame: PeerMessage) -> HubCommand {
-        let PeerMessage::PublishAcked {
-            seq,
-            topic,
-            payload,
-            qos,
-            retain,
-            message_expiry,
-            app,
-        } = frame
-        else {
-            panic!("not an acked forward: {frame:?}");
+        // A proto-12 link carries the tagged frame (#784); both arrive as one command.
+        let (seq, topic, payload, qos, retain, message_expiry, app, tag, replay) = match frame {
+            PeerMessage::PublishAcked {
+                seq,
+                topic,
+                payload,
+                qos,
+                retain,
+                message_expiry,
+                app,
+            } => (
+                seq,
+                topic,
+                payload,
+                qos,
+                retain,
+                message_expiry,
+                app,
+                None,
+                false,
+            ),
+            PeerMessage::PublishAckedTagged {
+                seq,
+                origin: tag,
+                replay,
+                topic,
+                payload,
+                qos,
+                retain,
+                message_expiry,
+                app,
+            } => (
+                seq,
+                topic,
+                payload,
+                qos,
+                retain,
+                message_expiry,
+                app,
+                Some(tag),
+                replay,
+            ),
+            other => panic!("not an acked forward: {other:?}"),
         };
         HubCommand::RemotePublishAcked {
             node: origin(),
@@ -202,6 +237,8 @@ impl Rig {
             retain,
             message_expiry,
             app: crate::hub::app_from_wire(app),
+            origin: tag,
+            replay,
         }
     }
 
@@ -227,7 +264,7 @@ impl Rig {
 
 fn seq_of(frame: &PeerMessage) -> u64 {
     match frame {
-        PeerMessage::PublishAcked { seq, .. } => *seq,
+        PeerMessage::PublishAcked { seq, .. } | PeerMessage::PublishAckedTagged { seq, .. } => *seq,
         other => panic!("not an acked forward: {other:?}"),
     }
 }
@@ -360,6 +397,8 @@ async fn a_re_used_seq_with_new_content_is_applied_and_a_dead_origin_is_forgotte
         retain: false,
         message_expiry: None,
         app: AppProperties::default(),
+        origin: None,
+        replay: false,
     };
     rig.dispatch(forward(b"first life")).await;
     rig.dispatch(forward(b"second life")).await;

@@ -258,7 +258,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `two_bridge_instances_do_not_duplicate_forwarding`
 - `two_partitioned_instances_deliver_each_inbound_message_exactly_once`
 
-## `crates/mqtt-cluster/src/lib.rs` — 361 test(s)
+## `crates/mqtt-cluster/src/lib.rs` — 362 test(s)
 
 - `cluster_identity::tests::a_founder_mints_once_and_reloads_stably`
 - `cluster_identity::tests::a_joiner_adopts_once_and_persists`
@@ -457,6 +457,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `peer::tests::roundtrips_all_variants`
 - `peer::tests::the_frozen_frames_encode_byte_for_byte_stably`
 - `peer::tests::the_reached_verdict_is_appended_and_announced_at_proto_11`
+- `peer::tests::the_tagged_forward_is_appended_and_announced_at_proto_12`
 - `peer::tests::trailing_bytes_after_a_postcard_body_are_rejected`
 - `peer::tests::two_frames_in_one_buffer`
 - `placement::tests::a_cloned_ring_keeps_a_correct_memo`
@@ -871,7 +872,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::sink_records_through_a_trait_object`
 - `tests::tampering_with_any_field_changes_the_head`
 
-## `crates/mqtt-storage/src/lib.rs` — 89 test(s)
+## `crates/mqtt-storage/src/lib.rs` — 91 test(s)
 
 - `app_props::tests::converts_to_and_from_core_properties_losslessly`
 - `app_props::tests::encode_decode_roundtrips_and_fails_closed`
@@ -881,6 +882,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `logged::metadata_concurrency::clearing_one_id_cannot_erase_a_concurrent_delivery_identity`
 - `logged::metadata_concurrency::metadata_lock_pruning_and_waiter_cancellation_preserve_exclusion`
 - `logged::tests::a_pre_0057_record_decodes_with_an_empty_outbound_window`
+- `logged::tests::a_tagged_enqueue_is_found_by_its_origin`
 - `logged::tests::ack_truncates_and_is_idempotent`
 - `logged::tests::an_unacked_inbound_qos2_id_survives_reopen_and_is_not_reported_as_a_duplicate`
 - `logged::tests::application_properties_survive_enqueue_and_replay`
@@ -893,6 +895,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `logged::tests::ensure_session_reports_existence`
 - `logged::tests::outbound_qos2_state_replicates_through_the_log`
 - `logged::tests::qos2_state_replicates_through_the_log`
+- `logged::tests::queued_codec_carries_the_publish_origin_as_an_optional_tail`
 - `logged::tests::queued_codec_reads_a_pre_0030_record_as_empty`
 - `logged::tests::queued_codec_round_trips_application_properties`
 - `logged::tests::reject_newest_keeps_oldest`
@@ -1011,7 +1014,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 510 test(s)
+## `crates/mqttd/src/lib.rs` — 513 test(s)
 
 - `admin::cli::tests::all_nodes_asks_for_the_cluster_scope_on_the_verbs_that_have_one`
 - `admin::cli::tests::answers_render_as_tables_and_lines`
@@ -1428,7 +1431,10 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::session_expiry_zero_discards_at_disconnect`
 - `hub::tests::settle_gate::a_held_ack_retires_on_the_sweep_when_the_window_closes_without_a_scan`
 - `hub::tests::settle_gate::a_held_publish_is_re_delivered_to_a_materialised_session_once_not_per_pass`
+- `hub::tests::settle_gate::a_proto_11_peer_gets_the_untagged_forward_and_an_untagged_replay_still_delivers`
+- `hub::tests::settle_gate::a_rerouted_forward_skips_a_session_that_already_holds_the_publish`
 - `hub::tests::settle_gate::a_session_the_original_fan_out_reached_is_not_re_delivered_to`
+- `hub::tests::settle_gate::a_settle_window_replay_skips_a_session_that_already_holds_the_publish`
 - `hub::tests::settle_gate::a_settled_node_with_no_durable_plane_still_skips_the_periodic_scan`
 - `hub::tests::settle_gate::a_zero_match_publish_still_holds_its_ack_on_an_unsettled_view`
 - `hub::tests::settle_gate::an_early_acked_publish_still_re_routes_to_a_peer_that_advertises_interest_later`

@@ -266,6 +266,16 @@ impl<L: ReplicatedLog<Key = String>> SessionStore for ReplicatedSessionStore<L> 
         message: &Message,
         expiry_at: Option<u64>,
     ) -> Result<Enqueued, StorageError> {
+        self.enqueue_tagged(client, message, expiry_at, None).await
+    }
+
+    async fn enqueue_tagged(
+        &self,
+        client: &ClientId,
+        message: &Message,
+        expiry_at: Option<u64>,
+        origin: Option<&crate::PublishOrigin>,
+    ) -> Result<Enqueued, StorageError> {
         let qkey = Self::queue_key(client);
         let cap = self.limits.max_messages.max(1);
 
@@ -311,7 +321,7 @@ impl<L: ReplicatedLog<Key = String>> SessionStore for ReplicatedSessionStore<L> 
         };
         let offset = self
             .log
-            .append_tiered(&qkey, encode_queued(message, expiry_at), tier)
+            .append_tiered(&qkey, encode_queued(message, expiry_at, origin), tier)
             .await?;
         Ok(Enqueued::Stored { offset, evicted })
     }
@@ -321,6 +331,17 @@ impl<L: ReplicatedLog<Key = String>> SessionStore for ReplicatedSessionStore<L> 
         client: &ClientId,
         message: &Message,
         expiry_at: Option<u64>,
+    ) -> crate::PendingEnqueue {
+        self.submit_enqueue_tagged(client, message, expiry_at, None)
+            .await
+    }
+
+    async fn submit_enqueue_tagged(
+        &self,
+        client: &ClientId,
+        message: &Message,
+        expiry_at: Option<u64>,
+        origin: Option<&crate::PublishOrigin>,
     ) -> crate::PendingEnqueue {
         // The two-phase split (ADR 0075): everything that must happen in
         // submission order — cap policy, tier selection, offset assignment —
@@ -365,7 +386,7 @@ impl<L: ReplicatedLog<Key = String>> SessionStore for ReplicatedSessionStore<L> 
         };
         let pending = self
             .log
-            .submit_tiered(&qkey, encode_queued(message, expiry_at), tier)
+            .submit_tiered(&qkey, encode_queued(message, expiry_at, origin), tier)
             .await;
         crate::PendingEnqueue::new(async move {
             let offset = pending.await?;
@@ -382,11 +403,12 @@ impl<L: ReplicatedLog<Key = String>> SessionStore for ReplicatedSessionStore<L> 
         let qkey = Self::queue_key(client);
         let mut out = Vec::new();
         for entry in self.log.read(&qkey, after, limit).await? {
-            let (message, expiry_at) = decode_queued(&entry.record)?;
+            let (message, expiry_at, origin) = decode_queued(&entry.record)?;
             out.push(QueuedMessage {
                 offset: entry.offset,
                 message,
                 expiry_at,
+                origin,
             });
         }
         Ok(out)
@@ -643,12 +665,13 @@ impl<L: ReplicatedLog<Key = String>> SessionStore for ReplicatedSessionStore<L> 
         let mut queue = Vec::new();
         let mut high_offset = 0u64;
         for entry in self.log.read(&qkey, 0, usize::MAX).await? {
-            let (message, expiry_at) = decode_queued(&entry.record)?;
+            let (message, expiry_at, origin) = decode_queued(&entry.record)?;
             high_offset = high_offset.max(entry.offset);
             queue.push(QueuedMessage {
                 offset: entry.offset,
                 message,
                 expiry_at,
+                origin,
             });
         }
         // The epoch half of the ADR 0037 audit token: a POSITION query, not session
@@ -815,7 +838,15 @@ fn encode_message(m: &Message) -> Vec<u8> {
 /// User Properties (ADR 0030). The properties are written **last** so a record from an
 /// older build (no trailing bytes) still decodes — [`decode_queued`] reads them only if
 /// bytes remain, the same EOF-defaulting discipline as the session-expiry field.
-fn encode_queued(m: &Message, expiry_at: Option<u64>) -> Vec<u8> {
+///
+/// The publish's origin (issue #784) follows everything else, and ONLY when there is
+/// one: a record without it is byte-identical to what the previous build wrote, and
+/// an older build reading a record with it ignores the unread trailing bytes.
+fn encode_queued(
+    m: &Message,
+    expiry_at: Option<u64>,
+    origin: Option<&crate::PublishOrigin>,
+) -> Vec<u8> {
     let mut out = encode_message(m);
     match expiry_at {
         Some(deadline) => {
@@ -839,6 +870,11 @@ fn encode_queued(m: &Message, expiry_at: Option<u64>) -> Vec<u8> {
     put_opt_str(&mut out, m.app.content_type.as_deref());
     put_opt_str(&mut out, m.app.response_topic.as_deref());
     put_opt_bytes(&mut out, m.app.correlation_data.as_deref());
+    if let Some(o) = origin {
+        out.push(1);
+        put_str(&mut out, &o.node);
+        out.extend_from_slice(&o.id.to_be_bytes());
+    }
     out
 }
 
@@ -1018,7 +1054,11 @@ fn qos_from_u8(v: u8) -> Result<QoS, StorageError> {
     QoS::from_u8(v).ok_or_else(corrupt)
 }
 
-fn decode_queued(buf: &[u8]) -> Result<(Message, Option<u64>), StorageError> {
+/// What one queued record decodes to: the message, its absolute expiry deadline, and
+/// the publish it came from (issue #784), when the record names one.
+type DecodedQueued = (Message, Option<u64>, Option<crate::PublishOrigin>);
+
+fn decode_queued(buf: &[u8]) -> Result<DecodedQueued, StorageError> {
     let mut r = Reader::new(buf);
     let topic = r.string()?;
     let payload = bytes::Bytes::copy_from_slice(r.bytes()?);
@@ -1051,7 +1091,17 @@ fn decode_queued(buf: &[u8]) -> Result<(Message, Option<u64>), StorageError> {
             message.app.correlation_data = Some(bytes::Bytes::copy_from_slice(r.bytes()?));
         }
     }
-    Ok((message, expiry_at))
+    // The publish's origin (issue #784), written only when known; an older record ends
+    // before it.
+    let origin = if !r.is_empty() && r.u8()? == 1 {
+        Some(crate::PublishOrigin {
+            node: r.string()?,
+            id: r.u64()?,
+        })
+    } else {
+        None
+    };
+    Ok((message, expiry_at, origin))
 }
 
 fn decode_session_meta(buf: &[u8]) -> Result<SessionMeta, StorageError> {
@@ -1205,10 +1255,61 @@ mod tests {
         m.app.content_type = Some("application/json".into());
         m.app.response_topic = Some("resp/x".into());
         m.app.correlation_data = Some(bytes::Bytes::from_static(b"\x00\x01corr"));
-        let bytes = super::encode_queued(&m, Some(123));
-        let (back, expiry) = super::decode_queued(&bytes).unwrap();
+        let bytes = super::encode_queued(&m, Some(123), None);
+        let (back, expiry, origin) = super::decode_queued(&bytes).unwrap();
         assert_eq!(expiry, Some(123));
         assert_eq!(back.app, m.app);
+        assert_eq!(origin, None);
+    }
+
+    /// Issue #784: a queued record carries the publish's origin when the enqueue knew
+    /// it, appended after every other field. A record without one is byte-identical to
+    /// the previous build's, and a record with one starts with exactly those bytes, so
+    /// an older build reads it and ignores the tail.
+    #[test]
+    fn queued_codec_carries_the_publish_origin_as_an_optional_tail() {
+        let mut m = msg("t", b"p", QoS::AtLeastOnce);
+        m.app.user_properties = vec![("a".into(), "1".into())];
+        m.app.correlation_data = Some(bytes::Bytes::from_static(b"c"));
+        let origin = crate::PublishOrigin {
+            node: "mqttd-2".into(),
+            id: 0x0001_2345_6789_abcd,
+        };
+        let without = super::encode_queued(&m, Some(9), None);
+        let with = super::encode_queued(&m, Some(9), Some(&origin));
+        assert!(
+            with.starts_with(&without),
+            "the origin must be a pure tail, so an older decoder reads the same prefix"
+        );
+        let (back, expiry, got) = super::decode_queued(&with).unwrap();
+        assert_eq!((back.app, expiry), (m.app.clone(), Some(9)));
+        assert_eq!(got, Some(origin));
+        let (_, _, none) = super::decode_queued(&without).unwrap();
+        assert_eq!(none, None);
+    }
+
+    /// Issue #784, end to end: the origin survives a durable enqueue and replay, and
+    /// `holds_origin` finds it — and only it.
+    #[tokio::test]
+    async fn a_tagged_enqueue_is_found_by_its_origin() {
+        let s = store();
+        let c = cid("c");
+        let tag = |id| crate::PublishOrigin {
+            node: "n1".into(),
+            id,
+        };
+        s.enqueue(&c, &msg("t", b"untagged", QoS::AtLeastOnce))
+            .await
+            .unwrap();
+        s.enqueue_tagged(&c, &msg("t", b"x", QoS::AtLeastOnce), None, Some(&tag(7)))
+            .await
+            .unwrap();
+        let pending = s.pending(&c, 0, 10).await.unwrap();
+        assert_eq!(pending[0].origin, None);
+        assert_eq!(pending[1].origin, Some(tag(7)));
+        assert!(s.holds_origin(&c, &tag(7)).await.unwrap());
+        assert!(!s.holds_origin(&c, &tag(8)).await.unwrap());
+        assert!(!s.holds_origin(&cid("other"), &tag(7)).await.unwrap());
     }
 
     /// Backward compatibility: a record written before ADR 0030 (no trailing property
@@ -1220,9 +1321,10 @@ mod tests {
         // nothing after it.
         let mut old = super::encode_message(&m);
         old.push(0); // expiry absent
-        let (back, expiry) = super::decode_queued(&old).unwrap();
+        let (back, expiry, origin) = super::decode_queued(&old).unwrap();
         assert_eq!(expiry, None);
         assert!(back.app.is_empty());
+        assert_eq!(origin, None);
     }
 
     /// End to end: application properties survive a durable enqueue + replay (ADR 0030).

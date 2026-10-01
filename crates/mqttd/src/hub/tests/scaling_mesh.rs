@@ -272,6 +272,8 @@ impl Mesh {
                 retain: false,
                 message_expiry: None,
                 app: AppProperties::default(),
+                origin: None,
+                replay: false,
             })
             .await;
     }

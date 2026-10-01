@@ -19,6 +19,7 @@ use super::qos2::exec_qos2_lane_op;
 // re-couple every future hub change to six import lists. Scoped to these files.
 use super::*;
 use futures_util::stream::{FuturesOrdered, StreamExt};
+use mqtt_storage::PublishOrigin;
 
 /// The outcome an append lane reports back to the loop (issue #242 / ADR 0061).
 ///
@@ -43,6 +44,11 @@ pub enum LaneOutcome {
     /// A [`LaneWork::Passthrough`] job: no store write was owed — the lane was used
     /// purely so this send cannot overtake an earlier append's post-durable live send.
     Passed,
+    /// A REPLAY's append was skipped because the session's queue already holds a copy
+    /// of the same publish (#784) — stored, typically, by a node that died before the
+    /// session moved here. The copy is durable and replays (or replayed) on attach,
+    /// so nothing is sent live and the obligation is met.
+    Held,
 }
 
 /// The on-loop continuation an [`AppendDone`](HubCommand::AppendDone) runs — WHO is
@@ -67,6 +73,12 @@ pub enum LaneWork {
     Append {
         /// Absolute expiry deadline (Unix epoch seconds), if the publisher set one.
         expiry_at: Option<u64>,
+        /// The publish this copy comes from (#784), recorded with it. `None` when the
+        /// delivery has no publish identity (a Will, an untagged peer forward).
+        origin: Option<PublishOrigin>,
+        /// A replay (a takeover re-delivery or re-route, #784): skip the append if the
+        /// session's queue already holds `origin`. A first delivery never checks.
+        dedupe: bool,
     },
     /// No store work: a `QoS` 0 send routed through a busy lane purely for per-client
     /// wire order (it must not overtake an earlier append's post-durable live send).
@@ -221,12 +233,21 @@ pub(super) const RELAXED_CONGESTION_DEPTH: usize = LANE_QUEUE_CAP / 2;
 pub(super) enum AppendGate {
     /// A locally-gated publish: the pending-publish id whose ack awaits every append.
     Pending(u64),
+    /// A settle-window RE-DELIVERY of pending publish `id` (#784): gated like
+    /// [`Pending`](Self::Pending), but the session may already hold the publish —
+    /// stored by a node that died before the session moved here — so the append is
+    /// skipped if its queue does.
+    Replay(u64),
     /// A peer awaiting a durability verdict for forward `seq` (0041-T12).
     Peer {
         /// The origin node.
         node: NodeId,
         /// Its forward sequence.
         seq: u64,
+        /// The publish's id on the origin node, when the forward carried it (#784).
+        origin: Option<u64>,
+        /// A takeover re-route (#784): skip a session already holding the publish.
+        replay: bool,
     },
     /// Nobody is told (a Will, a plain forward, a retained-window back-fill): a
     /// refused durable copy is a counted drop and the live delivery still happens
@@ -243,9 +264,44 @@ impl AppendGate {
     /// The on-loop continuation a job submitted under this gate carries.
     pub(super) fn then(&self) -> AppendThen {
         match self {
-            Self::Pending(id) => AppendThen::Gate(*id),
-            Self::Peer { node, seq } => AppendThen::Peer(node.clone(), *seq),
+            Self::Pending(id) | Self::Replay(id) => AppendThen::Gate(*id),
+            Self::Peer { node, seq, .. } => AppendThen::Peer(node.clone(), *seq),
             Self::None => AppendThen::Ungated,
+        }
+    }
+
+    /// The publish a copy appended under this gate comes from, and whether the append
+    /// is a replay that must skip a session already holding it (#784). `me` is this
+    /// node, the origin of its own pending publishes.
+    pub(super) fn origin(&self, me: &NodeId) -> (Option<PublishOrigin>, bool) {
+        match self {
+            Self::Pending(id) => (
+                Some(PublishOrigin {
+                    node: me.0.clone(),
+                    id: *id,
+                }),
+                false,
+            ),
+            Self::Replay(id) => (
+                Some(PublishOrigin {
+                    node: me.0.clone(),
+                    id: *id,
+                }),
+                true,
+            ),
+            Self::Peer {
+                node,
+                origin: Some(id),
+                replay,
+                ..
+            } => (
+                Some(PublishOrigin {
+                    node: node.0.clone(),
+                    id: *id,
+                }),
+                *replay,
+            ),
+            Self::Peer { origin: None, .. } | Self::None => (None, false),
         }
     }
 }
@@ -340,15 +396,49 @@ pub(super) async fn append_lane_worker(
                 let Some(job) = job else { break };
                 match job {
                     LaneJob::Deliver(job) if matches!(job.work, LaneWork::Append { .. }) => {
-                        let LaneWork::Append { expiry_at } = job.work else {
+                        let LaneWork::Append {
+                            expiry_at,
+                            origin,
+                            dedupe,
+                        } = &job.work
+                        else {
                             unreachable!("matched above");
                         };
+                        let (expiry_at, origin, dedupe) = (*expiry_at, origin.clone(), *dedupe);
+                        // A replay whose session already holds this publish (#784)
+                        // appends nothing. Earlier appends of this session are
+                        // already SUBMITTED (offset assigned) by now, so the read
+                        // sees them; a failed read appends anyway — a duplicate is
+                        // legal at QoS 1, a loss is not.
+                        if dedupe {
+                            if let Some(o) = &origin {
+                                if matches!(store.holds_origin(&job.client, o).await, Ok(true)) {
+                                    debug!(client = %job.client.0, origin = %o.node, id = o.id,
+                                           "replay skipped: the session already holds this publish (#784)");
+                                    let done = HubCommand::AppendDone {
+                                        job,
+                                        outcome: LaneOutcome::Held,
+                                    };
+                                    if inflight.is_empty() {
+                                        let _ = self_tx.send(done);
+                                    } else {
+                                        inflight.push_back(Box::pin(std::future::ready(Some(done))));
+                                    }
+                                    continue;
+                                }
+                            }
+                        }
                         // SUBMIT in lane order (ADR 0075): cap policy, tier and
                         // offset assignment happen here, cheaply; the wait is
                         // pipelined.
                         let started = Instant::now();
                         let mut pending = store
-                            .submit_enqueue_with_expiry(&job.client, &job.message, expiry_at)
+                            .submit_enqueue_tagged(
+                                &job.client,
+                                &job.message,
+                                expiry_at,
+                                origin.as_ref(),
+                            )
                             .await;
                         // Already resolved (the eager default backends): complete
                         // inline, exactly as the serial worker did — spawning a
@@ -530,14 +620,28 @@ pub(super) async fn run_lane_job(
             }
             return LaneOutcome::Passed;
         }
-        LaneWork::Append { expiry_at } => *expiry_at,
+        LaneWork::Append {
+            expiry_at,
+            origin,
+            dedupe,
+        } => {
+            // A replay whose session already holds this publish appends nothing
+            // (#784); a failed read appends anyway (a duplicate, never a loss).
+            if let (true, Some(o)) = (*dedupe, origin) {
+                if matches!(store.holds_origin(&job.client, o).await, Ok(true)) {
+                    return LaneOutcome::Held;
+                }
+            }
+            (*expiry_at, origin.as_ref())
+        }
     };
+    let (expiry_at, origin) = expiry_at;
     // Durable (quorum) append: time it and classify any failure (ADR 0020-T6).
     // The latency histogram is only meaningful when the store is the replicated
     // one, so gate it on durable mode; a failure reason is recorded either way.
     let started = Instant::now();
     let result = store
-        .enqueue_with_expiry(&job.client, &job.message, expiry_at)
+        .enqueue_tagged(&job.client, &job.message, expiry_at, origin)
         .await;
     if durable {
         if let Some(m) = metrics {
@@ -646,6 +750,7 @@ impl Hub {
             }
             return Submitted::Refused(PublishRefusal::Brownout);
         }
+        let (origin, dedupe) = gate.origin(&self.node_id);
         let job = AppendJob {
             client: client.clone(),
             message: message.clone(),
@@ -655,6 +760,8 @@ impl Hub {
                 expiry_at: message
                     .expires_at
                     .or_else(|| message_expiry.map(|s| self.clock.now_epoch_secs() + u64::from(s))),
+                origin,
+                dedupe,
             },
             then: gate.then(),
             planned_conn,
@@ -824,7 +931,8 @@ impl Hub {
                 self.durable_writes += 1;
                 Some(o)
             }
-            LaneOutcome::Dropped | LaneOutcome::Failed | LaneOutcome::Passed => None,
+            // Nothing new was written: dropped, failed, passed through, or held (#784).
+            _ => None,
         };
         // The post-durable live send (ACK-AFTER-DURABLE's wire half, #124): the packet
         // structurally cannot reach the conn channel before the store answered —
@@ -838,7 +946,8 @@ impl Hub {
         // is being replaced and the new one's replay owns delivery.
         let mut send = !self.connecting.contains_key(&job.client)
             && match outcome {
-                LaneOutcome::Failed => false,
+                // Held (#784): already queued here, the attach replay's to deliver.
+                LaneOutcome::Failed | LaneOutcome::Held => false,
                 // No durable copy exists (queue-cap drop) or none was owed
                 // (passthrough): the live send is delivery itself, valid only for
                 // the exact planned connection.
@@ -883,7 +992,8 @@ impl Hub {
             AppendThen::Gate(id) => {
                 if let Some(p) = self.pending_publishes.get_mut(id) {
                     p.appends_outstanding = p.appends_outstanding.saturating_sub(1);
-                    if offset.is_some() {
+                    // A held copy is a stored copy (#784): the session's queue has it.
+                    if offset.is_some() || matches!(outcome, LaneOutcome::Held) {
                         // Event-driven successor of the old durable-writes snapshot
                         // trick: a refusal for this publish may now only WITHHOLD
                         // (issue #238).
@@ -1038,7 +1148,10 @@ impl Hub {
                 self.drop_staged_entry(&job.client, pkid);
                 self.drain_backlog(&job.client);
             }
-            LaneOutcome::Failed | LaneOutcome::Dropped | LaneOutcome::Passed => {
+            LaneOutcome::Failed
+            | LaneOutcome::Dropped
+            | LaneOutcome::Passed
+            | LaneOutcome::Held => {
                 // The record write failed — ADR 0057's failure arm, relocated
                 // verbatim: the PUBLISH is withheld, not sent under an id that
                 // would not survive. The message is already durable at `offset`,

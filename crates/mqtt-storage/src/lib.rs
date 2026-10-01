@@ -83,6 +83,22 @@ impl StorageError {
     }
 }
 
+/// The cluster-wide identity of one publish (issue #784): the node that accepted it
+/// from its publisher, and that node's id for it.
+///
+/// Recorded with a queued copy so a REPLAY of the same publish — a takeover
+/// window's re-delivery or re-route — can tell that a session already holds it,
+/// typically because the node that died had stored it there before the session
+/// moved. The id is unique per node across restarts (each process starts its id
+/// space at a random point), so two lives of one node never collide in practice.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct PublishOrigin {
+    /// The node that accepted the publish.
+    pub node: String,
+    /// That node's id for the publish.
+    pub id: u64,
+}
+
 /// A queued message together with the offset it was assigned on `enqueue`.
 #[derive(Debug, Clone)]
 pub struct QueuedMessage {
@@ -94,6 +110,10 @@ pub struct QueuedMessage {
     /// Interval), or `None` for no expiry. A message past its deadline is dropped on
     /// replay rather than delivered (ADR 0009 §3).
     pub expiry_at: Option<u64>,
+    /// The publish this copy came from, when the enqueue recorded one (issue #784).
+    /// `None` for records written without it — by an older build, or by a path that
+    /// has no publish identity (a Will, a spilled backlog).
+    pub origin: Option<PublishOrigin>,
 }
 
 /// What a session's offline queue does when it is full (ADR 0001 §6 — a
@@ -404,6 +424,69 @@ pub trait SessionStore: Send + Sync + std::fmt::Debug {
         expiry_at: Option<u64>,
     ) -> PendingEnqueue {
         PendingEnqueue::ready(self.enqueue_with_expiry(client, message, expiry_at).await)
+    }
+
+    /// [`enqueue_with_expiry`](Self::enqueue_with_expiry), recording which publish the
+    /// copy came from (issue #784) so a later replay can recognise it with
+    /// [`holds_origin`](Self::holds_origin). The default ignores `origin`: a backend
+    /// that cannot record it makes a replay append a (`QoS` 1-legal) duplicate, never
+    /// lose a message.
+    async fn enqueue_tagged(
+        &self,
+        client: &ClientId,
+        message: &Message,
+        expiry_at: Option<u64>,
+        origin: Option<&PublishOrigin>,
+    ) -> Result<Enqueued, StorageError> {
+        let _ = origin;
+        self.enqueue_with_expiry(client, message, expiry_at).await
+    }
+
+    /// [`submit_enqueue_with_expiry`](Self::submit_enqueue_with_expiry), recording the
+    /// publish's origin as [`enqueue_tagged`](Self::enqueue_tagged) does.
+    async fn submit_enqueue_tagged(
+        &self,
+        client: &ClientId,
+        message: &Message,
+        expiry_at: Option<u64>,
+        origin: Option<&PublishOrigin>,
+    ) -> PendingEnqueue {
+        match origin {
+            // Nothing to record: keep the backend's own (possibly pipelined) submit.
+            None => {
+                self.submit_enqueue_with_expiry(client, message, expiry_at)
+                    .await
+            }
+            // Eager, through `enqueue_tagged`, so a backend that records origins
+            // only there still records this one.
+            Some(_) => PendingEnqueue::ready(
+                self.enqueue_tagged(client, message, expiry_at, origin)
+                    .await,
+            ),
+        }
+    }
+
+    /// Whether `client`'s queue already holds a copy of the publish `origin` names
+    /// (issue #784). Asked only by a REPLAY — a takeover window's re-delivery or
+    /// re-route — never on a first delivery, so its O(queue) read stays off the
+    /// message path. A record written without an origin never matches.
+    async fn holds_origin(
+        &self,
+        client: &ClientId,
+        origin: &PublishOrigin,
+    ) -> Result<bool, StorageError> {
+        const PAGE: usize = 1024;
+        let mut after = 0;
+        loop {
+            let page = self.pending(client, after, PAGE).await?;
+            if page.iter().any(|m| m.origin.as_ref() == Some(origin)) {
+                return Ok(true);
+            }
+            match page.last() {
+                Some(last) if page.len() == PAGE => after = last.offset,
+                _ => return Ok(false),
+            }
+        }
     }
 
     /// Replay undelivered messages with offset strictly greater than `after`, up
@@ -792,6 +875,16 @@ impl SessionStore for MemorySessionStore {
         message: &Message,
         expiry_at: Option<u64>,
     ) -> Result<Enqueued, StorageError> {
+        self.enqueue_tagged(client, message, expiry_at, None).await
+    }
+
+    async fn enqueue_tagged(
+        &self,
+        client: &ClientId,
+        message: &Message,
+        expiry_at: Option<u64>,
+        origin: Option<&PublishOrigin>,
+    ) -> Result<Enqueued, StorageError> {
         let cap = self.limits.max_messages.max(1);
         let mut map = self.lock();
         let entry = map.entry(client.clone()).or_default();
@@ -820,6 +913,7 @@ impl SessionStore for MemorySessionStore {
             offset,
             message: message.clone(),
             expiry_at,
+            origin: origin.cloned(),
         });
         Ok(Enqueued::Stored { offset, evicted })
     }
