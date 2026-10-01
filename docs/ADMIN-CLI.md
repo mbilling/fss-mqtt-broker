@@ -150,13 +150,17 @@ the node you ask must have cluster TLS ([ADMIN-API.md § The cluster view](ADMIN
 ### `clients`, `session`, `subscribers`, `backlog`, `retained`
 
 These answer for **the node you ask**: the sessions it holds and the retained messages it
-serves. `cluster` lists every node's admin address.
+serves. `--all-nodes` on `clients`, `session` and `subscribers` asks every node instead and
+merges the answers, each row naming its `node`, so you do not need to know where a client
+is. A `nodes` table lists which nodes answered; a node that did not is a row with the
+reason, so a partial answer says so
+([ADMIN-API.md § Cluster-wide reads](ADMIN-API.md#cluster-wide-reads-scopecluster)).
 
 | Verb | Answers |
 |---|---|
-| `clients [--prefix <p>] [--user <u>] [--source <s>] [--limit <n>] [--cursor <c>]` | sessions by client id, 100 per page: connected or not, user, auth method, protocol, source address, age, persistence and expiry, subscription / in-flight / backlog counts |
-| `session <client>` | one session: every subscription with its options, in-flight messages by acknowledgement state, receive maximum, backlog, the Will (without its payload), the owning node, and for a disconnected persistent session its `queued` count |
-| `subscribers <topic> [--limit <n>]` | who on this node receives a publish to `<topic>` (a topic name, no wildcards): ordinary and `$share` subscriptions |
+| `clients [--prefix <p>] [--user <u>] [--source <s>] [--limit <n>] [--cursor <c>] [--all-nodes]` | sessions by client id, 100 per page: connected or not, user, auth method, protocol, source address, age, persistence and expiry, subscription / in-flight / backlog counts |
+| `session <client> [--all-nodes]` | one session: every subscription with its options, in-flight messages by acknowledgement state, receive maximum, backlog, the Will (without its payload), the owning node, and for a disconnected persistent session its `queued` count |
+| `subscribers <topic> [--limit <n>] [--all-nodes]` | who receives a publish to `<topic>` (a topic name, no wildcards): ordinary and `$share` subscriptions |
 | `backlog [--top <n>]` | the sessions with the most messages in flight or waiting (default 20) |
 | `retained [--prefix <p>] [--limit <n>] [--cursor <c>]` | retained messages under a topic prefix: count and bytes, then topics (no payloads), paged |
 
@@ -195,11 +199,14 @@ EXPIRES_AT  PAYLOAD_BYTES  QOS  TOPIC
 -           7              1    plant/8/status
 ```
 
-A session the node does not hold is a `404` that says where placement puts it:
+A session the node does not hold is a `404` that says where placement puts it; with
+`--all-nodes` the node finds it wherever it is:
 
 ```text
 $ mqttd --admin session archiver
 mqttd: 404 not-found: this node (mqttd-1) holds no session for "archiver"; placement puts it on mqttd-2
+$ mqttd --admin session archiver --all-nodes --json | jq '{node, found_on, connected}'
+{"node": "mqttd-2", "found_on": ["mqttd-2"], "connected": false}
 ```
 
 `session` and `clients` take their `--json` form from the same data; see

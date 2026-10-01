@@ -1010,8 +1010,9 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 502 test(s)
+## `crates/mqttd/src/lib.rs` — 507 test(s)
 
+- `admin::cli::tests::all_nodes_asks_for_the_cluster_scope_on_the_verbs_that_have_one`
 - `admin::cli::tests::answers_render_as_tables_and_lines`
 - `admin::cli::tests::invocations_are_validated_before_anything_runs`
 - `admin::client::tests::responses_split_into_status_and_body`
@@ -1024,6 +1025,10 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `admin::http::tests::oversized_and_malformed_requests_are_refused`
 - `admin::roles::tests::operator_wins_and_cluster_certificates_are_peers`
 - `admin::roles::tests::subjects_map_to_roles`
+- `admin::scope::tests::a_session_is_the_connected_copy_else_the_owners_and_a_miss_names_every_node`
+- `admin::scope::tests::client_pages_merge_by_client_id_and_page_across_the_cluster`
+- `admin::scope::tests::only_node_and_cluster_are_scopes_and_a_forward_is_always_node_scope`
+- `admin::scope::tests::subscribers_merge_with_their_node_and_honour_the_limit`
 - `admission::tests::a_cordon_refuses_new_connections_until_lifted`
 - `admission::tests::the_global_cap_refuses_at_the_bound_and_recovers`
 - `admission::tests::the_penalty_box_refuses_after_the_threshold`
@@ -1549,7 +1554,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `narrow_allow_does_not_cover_broad_subscription`
 - `unauthorized_will_topic_is_refused_at_connect`
 
-## `crates/mqttd/tests/admin.rs` — 17 test(s)
+## `crates/mqttd/tests/admin.rs` — 18 test(s)
 
 - `a_certificate_from_another_ca_fails_the_handshake`
 - `a_clean_session_is_kicked_where_it_is_not_where_placement_points`
@@ -1559,6 +1564,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `any_node_answers_for_the_cluster_and_a_silent_node_is_listed_as_silent`
 - `clients_are_listed_filtered_and_paged_with_their_connection_facts`
 - `cluster_certificates_get_the_peer_role`
+- `cluster_scope_finds_a_client_on_any_node_and_peers_read_only_as_a_forward`
 - `config_is_served_redacted_and_reload_is_an_operator_action_with_an_outcome`
 - `cordon_stops_readiness_until_uncordoned_and_is_an_operator_action`
 - `every_request_is_audited_with_subject_role_and_outcome`

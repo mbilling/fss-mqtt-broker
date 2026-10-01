@@ -5,8 +5,9 @@
 //! from the session store, retained messages from the hub's retained store (a handle the
 //! hub lends) — so no store I/O runs on the hub loop.
 //!
-//! Every answer is this node's view: the sessions it holds, the retained messages it
-//! caches. `mqttd --admin cluster` lists every node's admin address.
+//! Every answer here is this node's view: the sessions it holds, the retained messages it
+//! caches. `scope=cluster` on clients, session and subscribers asks every node and merges
+//! the answers ([`super::scope`]).
 
 use super::http::Request;
 use super::routes::{error, Answer};
@@ -22,7 +23,7 @@ use std::sync::{Arc, RwLock};
 use tokio::sync::{mpsc, oneshot};
 
 /// Default page size when a request names none.
-const DEFAULT_LIMIT: usize = 100;
+pub(super) const DEFAULT_LIMIT: usize = 100;
 /// The most queued messages counted for one offline session; beyond it the answer says
 /// "at least this many" rather than reading the whole log.
 const QUEUE_COUNT_CAP: usize = 10_000;
@@ -55,7 +56,7 @@ fn access(state: &AdminState) -> Result<&SessionAccess, Answer> {
 }
 
 /// A `limit`/`top` parameter: absent → `default`; not a positive integer → 400.
-fn count_param(req: &Request, name: &str, default: usize) -> Result<usize, Answer> {
+pub(super) fn count_param(req: &Request, name: &str, default: usize) -> Result<usize, Answer> {
     match req.param(name) {
         None => Ok(default),
         Some(v) => match v.parse::<usize>() {

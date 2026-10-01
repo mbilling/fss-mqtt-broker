@@ -65,7 +65,7 @@ and no session resumption (every connection is fully verified). The certificate 
 |---|---|---|
 | `operator` | a subject in `admin.operators` | everything |
 | `viewer` | a subject in `admin.viewers` | every `GET` |
-| `peer` | a certificate the **cluster CA** issued whose subject is in neither list | `whoami`, `node`, and forwarded `kick`/`purge` (below) — a node's own state, so any node can answer for the cluster |
+| `peer` | a certificate the **cluster CA** issued whose subject is in neither list | `whoami`, `node`, and forwarded `kick`/`purge` and `clients`/`session`/`subscribers` reads (below) — a node's own state, so any node can answer for the cluster |
 | none | anyone else | nothing: `403 forbidden` |
 
 A list entry is either the whole subject (`CN=sre-lead, O=example`, spaces after commas
@@ -163,6 +163,38 @@ parallel, presenting its **cluster certificate** (admitted there as `peer`):
 uses the admin listeners, not the cluster bus: the admin plane shares no protocol version
 and no failure with message delivery (ADR 0081, 2026-09-29 amendment).
 
+## Cluster-wide reads: `scope=cluster`
+
+`clients`, `session` and `subscribers` answer for the node you ask. Add `scope=cluster`
+(CLI: `--all-nodes`) and that node answers for every node instead, so you do not need to
+know which node holds a client. It asks each member's admin listener for the same request
+in parallel, as the cluster view does, presenting its cluster certificate and adding
+`forwarded_for`, `forwarded_role` and `forwarded_from`. Then it merges the answers:
+
+- `clients`: every node's sessions by client id, each row with its `node`. Paging works
+  across the cluster: `next_cursor` is a client id, and `matched` is the sum over the nodes
+  that answered. A client id held on two nodes is never split across pages, so a page can
+  hold a row or two more than `limit`.
+- `session`: the connected copy, else the placement owner's, else the first by node, with
+  `found_on` listing every node that holds one. A `404` names every node asked, and any
+  that did not answer.
+- `subscribers`: every node's subscribers to the topic, each with its `node`.
+
+Every cluster-scope answer adds `scope: "cluster"`, `answered_by` and `nodes[]`: one row
+per node with `replied`, and `error` when it did not answer. A partial answer is
+therefore never mistaken for a complete one. Any other `scope` value is `400`.
+
+The `peer` role may read these three only with `forwarded_for` set, and a forwarded read
+is always answered at node scope, so the fan-out never recurses.
+
+```json
+{"scope": "cluster", "answered_by": "mqttd-1", "matched": 2, "next_cursor": null,
+ "sessions": [{"client_id": "dev-on-1", "node": "mqttd-1", "connected": true, "…": "…"},
+              {"client_id": "dev-on-3", "node": "mqttd-3", "connected": true, "…": "…"}],
+ "nodes": [{"node_id": "mqttd-1", "replied": true}, {"node_id": "mqttd-2", "replied": true},
+           {"node_id": "mqttd-3", "replied": true}]}
+```
+
 ## Actions on a client: where they run
 
 A persistent session lives on its placement owner (a relocated connection is proxied there),
@@ -187,9 +219,9 @@ session.
 | GET | [`/admin/v1/node`](#get-adminv1node) | peer | `node` |
 | GET | [`/admin/v1/cluster`](#get-adminv1cluster) | viewer | `cluster` |
 | GET | [`/admin/v1/placement`](#get-adminv1placement) | viewer | `placement` |
-| GET | [`/admin/v1/clients`](#get-adminv1clients) | viewer | `clients` |
-| GET | [`/admin/v1/session`](#get-adminv1session) | viewer | `session` |
-| GET | [`/admin/v1/subscribers`](#get-adminv1subscribers) | viewer | `subscribers` |
+| GET | [`/admin/v1/clients`](#get-adminv1clients) | viewer (peer when forwarded) | `clients` |
+| GET | [`/admin/v1/session`](#get-adminv1session) | viewer (peer when forwarded) | `session` |
+| GET | [`/admin/v1/subscribers`](#get-adminv1subscribers) | viewer (peer when forwarded) | `subscribers` |
 | GET | [`/admin/v1/backlog`](#get-adminv1backlog) | viewer | `backlog` |
 | GET | [`/admin/v1/retained`](#get-adminv1retained) | viewer | `retained` |
 | GET | [`/admin/v1/authz`](#get-adminv1authz) | viewer | `authz` |
@@ -261,10 +293,12 @@ This node's placement view and whether the others agree: `members[]` (`id`, `add
 
 ### `GET /admin/v1/clients`
 
-Sessions on this node, by client id.
+Sessions on this node, by client id; with `scope=cluster`, on every node
+([cluster-wide reads](#cluster-wide-reads-scopecluster)).
 
 | Parameter | Meaning |
 |---|---|
+| `scope` | `node` (default) or `cluster` |
 | `prefix` | client ids starting with this |
 | `user` | connected clients authenticated as exactly this principal |
 | `source` | connected clients whose `ip:port` starts with this |
@@ -295,8 +329,8 @@ Returns `sessions[]`, `next_cursor`, and `matched` (the total across pages). A s
 
 ### `GET /admin/v1/session`
 
-One session. Parameter: `client` (required). Every [`clients`](#get-adminv1clients) field,
-plus:
+One session. Parameters: `client` (required), `scope` (`cluster` finds it on whichever node
+holds it). Every [`clients`](#get-adminv1clients) field, plus:
 
 | Field | Meaning |
 |---|---|
@@ -308,7 +342,8 @@ plus:
 | `node`, `owner_node` | the node that answered; where placement puts the session |
 | `queued`, `queued_capped` | a disconnected persistent session's stored messages, counted up to 10 000 (`queued_error` if the store could not be read) |
 
-`404 not-found` when this node holds no such session; the message names the owner.
+`404 not-found` when this node holds no such session; the message names the owner. With
+`scope=cluster`, `found_on` lists every node holding a copy.
 
 ```json
 {
@@ -324,7 +359,7 @@ plus:
 ### `GET /admin/v1/subscribers`
 
 Who on this node receives a publish to a topic. Parameters: `topic` (required, a topic name —
-`+` or `#` is `400`), `limit`. Returns `topic`, `truncated`, and `subscribers[]`: `client_id`,
+`+` or `#` is `400`), `limit`, `scope` (`cluster`: on every node, each row with its `node`). Returns `topic`, `truncated`, and `subscribers[]`: `client_id`,
 `filter`, `qos`, `shared_group` (one member of a share group receives each message),
 `connected`.
 

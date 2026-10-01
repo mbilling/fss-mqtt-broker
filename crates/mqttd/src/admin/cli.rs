@@ -160,7 +160,7 @@ const VERBS: &[Verb] = &[
         path: "/admin/v1/clients",
         required: &[],
         optional: &["prefix", "user", "source", "limit", "cursor"],
-        help: "sessions on this node, by client id (paged)",
+        help: "sessions by client id (paged); --all-nodes: on every node",
     },
     Verb {
         name: "session",
@@ -168,7 +168,7 @@ const VERBS: &[Verb] = &[
         path: "/admin/v1/session",
         required: &["client"],
         optional: &[],
-        help: "one session: subscriptions, in flight, backlog, will, owner",
+        help: "one session: subscriptions, in flight, backlog, will, owner; --all-nodes: wherever it is",
     },
     Verb {
         name: "subscribers",
@@ -176,7 +176,7 @@ const VERBS: &[Verb] = &[
         path: "/admin/v1/subscribers",
         required: &["topic"],
         optional: &["limit"],
-        help: "who on this node would receive a publish to <topic>",
+        help: "who would receive a publish to <topic>; --all-nodes: on every node",
     },
     Verb {
         name: "backlog",
@@ -195,6 +195,9 @@ const VERBS: &[Verb] = &[
         help: "retained messages by topic prefix: count, bytes, list (paged)",
     },
 ];
+
+/// The verbs that take `--all-nodes` (`scope=cluster`): ask every node and merge.
+const ALL_NODES_VERBS: &[&str] = &["clients", "session", "subscribers"];
 
 /// Options that take a value and apply to every verb.
 const GLOBAL_OPTIONS: &[&str] = &[
@@ -262,6 +265,20 @@ fn parse(args: &[String]) -> Result<Invocation, String> {
             }
             continue;
         }
+        if arg == "--all-nodes" {
+            if !ALL_NODES_VERBS.contains(&verb.name) {
+                return Err(format!(
+                    "--all-nodes is not an option of --admin {}",
+                    verb.name
+                ));
+            }
+            if inv.params.iter().any(|(k, _)| k == "scope") {
+                return Err("repeated option: --all-nodes".to_string());
+            }
+            inv.params
+                .push(("scope".to_string(), "cluster".to_string()));
+            continue;
+        }
         if let Some(name) = arg.strip_prefix("--") {
             let is_global = GLOBAL_OPTIONS.contains(&arg.as_str());
             if !is_global && !verb.optional.contains(&name) {
@@ -318,6 +335,9 @@ fn usage() -> String {
         }
         for o in v.optional {
             let _ = write!(shape, " [--{o} <v>]");
+        }
+        if ALL_NODES_VERBS.contains(&v.name) {
+            shape.push_str(" [--all-nodes]");
         }
         let _ = writeln!(s, "  {shape:<44} {}", v.help);
     }
@@ -610,6 +630,23 @@ mod tests {
         assert!(validate(&args("node --url https://a:1 --url https://b:1")).is_err());
         assert!(validate(&args("node --bogus x")).is_err());
         assert!(validate(&args("node --json --json")).is_err());
+    }
+
+    #[test]
+    fn all_nodes_asks_for_the_cluster_scope_on_the_verbs_that_have_one() {
+        let inv = parse(&args("session dev-1 --all-nodes")).unwrap();
+        assert_eq!(
+            inv.params,
+            [
+                ("client".to_string(), "dev-1".to_string()),
+                ("scope".to_string(), "cluster".to_string())
+            ]
+        );
+        assert!(validate(&args("clients --all-nodes --limit 5")).is_ok());
+        assert!(validate(&args("subscribers t --all-nodes")).is_ok());
+        assert!(validate(&args("clients --all-nodes --all-nodes")).is_err());
+        assert!(validate(&args("node --all-nodes")).is_err());
+        assert!(validate(&args("kick dev-1 --all-nodes")).is_err());
     }
 
     #[test]

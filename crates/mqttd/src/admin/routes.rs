@@ -129,6 +129,30 @@ const ENDPOINTS: &[Endpoint] = &[
 /// The actions a node may forward to a session's owner as the `peer` role.
 const FORWARDABLE: &[&str] = &["/admin/v1/kick", "/admin/v1/purge"];
 
+/// A read that may be asked of one node or, with `scope=cluster`, of all of them.
+async fn scoped(
+    state: &AdminState,
+    caller: &Caller,
+    role: Role,
+    req: &Request,
+    path: &str,
+) -> Answer {
+    use super::{scope, sessions};
+    let cluster = match scope::wants_cluster(req) {
+        Ok(c) => c,
+        Err(e) => return e,
+    };
+    match (path, cluster) {
+        ("/admin/v1/clients", false) => sessions::clients(state, req).await,
+        ("/admin/v1/clients", true) => scope::clients(state, caller, role, req).await,
+        ("/admin/v1/session", false) => sessions::session(state, req).await,
+        ("/admin/v1/session", true) => scope::session(state, caller, role, req).await,
+        ("/admin/v1/subscribers", false) => sessions::subscribers(state, req).await,
+        (_, true) => scope::subscribers(state, caller, role, req).await,
+        _ => error(404, "not-found", "no such admin endpoint"),
+    }
+}
+
 /// Route one authorized request.
 pub async fn route(state: &AdminState, caller: &Caller, role: Role, req: &Request) -> Answer {
     let mut path_known = false;
@@ -150,10 +174,13 @@ pub async fn route(state: &AdminState, caller: &Caller, role: Role, req: &Reques
     };
     // A node forwards an operator's action to the session's owner under its own
     // certificate (T7): the `peer` role may call exactly these, and only as a forward.
-    let forwarded_action = role == Role::Peer
-        && FORWARDABLE.contains(&endpoint.path)
+    // Likewise a cluster-scope read (T17): the `peer` role may read these, and only as
+    // a forward, which is always answered at node scope.
+    let forwarded = role == Role::Peer
+        && (FORWARDABLE.contains(&endpoint.path)
+            || super::scope::FORWARDABLE_READS.contains(&endpoint.path))
         && req.param(super::actions::FORWARDED_FOR).is_some();
-    if role < endpoint.min_role && !forwarded_action {
+    if role < endpoint.min_role && !forwarded {
         return error(
             403,
             "forbidden",
@@ -188,9 +215,9 @@ pub async fn route(state: &AdminState, caller: &Caller, role: Role, req: &Reques
             super::actions::act(state, caller, role, req, super::actions::Action::Purge).await
         }
         "/admin/v1/authz" => super::authz::check(state, req),
-        "/admin/v1/clients" => super::sessions::clients(state, req).await,
-        "/admin/v1/session" => super::sessions::session(state, req).await,
-        "/admin/v1/subscribers" => super::sessions::subscribers(state, req).await,
+        "/admin/v1/clients" | "/admin/v1/session" | "/admin/v1/subscribers" => {
+            scoped(state, caller, role, req, endpoint.path).await
+        }
         "/admin/v1/backlog" => super::sessions::backlog(state, req).await,
         "/admin/v1/retained" => super::sessions::retained(state, req).await,
         _ => error(404, "not-found", "no such admin endpoint"),

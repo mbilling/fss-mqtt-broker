@@ -73,6 +73,19 @@ if [ -n "$found_keeper" ]; then
   body=$(sed '$d' <<<"$out")
   expect "api session: queued 1" "1" "$(jqv 'd.get("queued")' <<<"$body")"
 fi
+# T17: --all-nodes answers the same from every node, wherever the client is.
+for n in 1 2 3; do
+  [ -n "$found_keeper" ] || break
+  out=$(cli oncall $n session keeper --all-nodes --json)
+  body=$(sed '$d' <<<"$out")
+  expect "session --all-nodes on mqttd-$n: keeper on mqttd-$found_keeper" "mqttd-$found_keeper" "$(jqv 'd.get("node")' <<<"$body")"
+done
+out=$(cli oncall 1 clients --all-nodes --json)
+body=$(sed '$d' <<<"$out")
+expect "clients --all-nodes: all 3 nodes replied" "3" "$(jqv 'sum(1 for n in d["nodes"] if n["replied"])' <<<"$body")"
+expect "clients --all-nodes: keeper and watcher listed" "keeper watcher" "$(jqv '" ".join(c for c in ("keeper","watcher") if any(s["client_id"]==c for s in d["sessions"]))' <<<"$body")"
+out=$(cli oncall 2 subscribers a/b/temp --all-nodes)
+expect "subscribers --all-nodes from mqttd-2: watcher" "watcher" "$out"
 if [ -n "$found_watcher" ]; then
   out=$(cli oncall "$found_watcher" subscribers a/b/temp)
   expect "subscribers a/b/temp: watcher" "watcher" "$out"
