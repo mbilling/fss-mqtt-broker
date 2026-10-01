@@ -74,8 +74,12 @@ so they are not in [CONFIGURATION.md](CONFIGURATION.md).
 ## Output and exit codes
 
 By default the answer is printed for a terminal: `key  value` lines (nested fields joined
-with `.`), and each list as a table under its name. `--json` prints the API's JSON instead,
-for scripts and `jq` — refusals included, so a rejected `reload` still shows its outcome.
+with `.`), and each list as a table under its name. A table's identifying columns come
+first, always in this order: `NODE_ID`, `CLIENT_ID`, `NODE`, `TOPIC`, `FILTER`, `REPLIED`,
+`CONNECTED`. The rest follow alphabetically. `cluster` prints a compact view instead
+([below](#node-cluster-placement)). `--json` prints the API's JSON, for scripts and `jq`,
+refusals included, so a rejected `reload` still shows its outcome. `help` wraps to 100
+columns.
 
 | Exit | Meaning |
 |---|---|
@@ -125,27 +129,32 @@ merges the answers. A node that does not answer is a row with `replied: false` a
 reason — never left out, never shown as healthy. The summary is the split-brain and
 convergence check: `same_cluster_id`, `same_version`, `same_config`, `same_membership`.
 
+The terminal view fits in 100 columns: a summary line, whether the nodes agree (or which
+check differs), and one short row per node.
+
 ```text
 $ mqttd --admin cluster
-answered_by              mqttd-1
-summary.nodes            3
-summary.ready            3
-summary.replied          3
-summary.same_cluster_id  true
-summary.same_config      true
-summary.same_membership  true
-summary.same_version     true
+3 nodes: 3 replied, 3 ready (answered by mqttd-1)
+they agree on cluster id, version, config and membership
 
-nodes:
-BROWNOUT  CLUSTER_ID                        CONFIG_CHECKSUM   …  LEASE_LEADER  LIVE  MEMBERS  NODE_ID  …  READY  REPLICA_LAG_GROUPS  REPLIED  …  VERSION  ADMIN_ADDR
-false     f8995cf8f6cd90e4ab4a321e17c07585  545674d7…        …  true          true  3        mqttd-1  …  true   0                   true     …  1.0.18   -
-false     f8995cf8f6cd90e4ab4a321e17c07585  545674d7…        …  false         true  3        mqttd-2  …  true   0                   true     …  1.0.18   mqttd-2:9443
-false     f8995cf8f6cd90e4ab4a321e17c07585  545674d7…        …  false         true  3        mqttd-3  …  true   0                   true     …  1.0.18   mqttd-3:9443
+NODE     STATE  LEADER  EPOCH  MEMBERS  LAG  VERSION  CLUSTER   MS  NOTES
+mqttd-1  ready  *       1      3        0    1.0.18   f8995cf8  0   -
+mqttd-2  ready  -       1      3        0    1.0.18   f8995cf8  44  -
+mqttd-3  ready  -       1      3        0    1.0.18   f8995cf8  39  -
 ```
 
-The table is wide; `mqttd --admin cluster --json | jq '.nodes[] | {node_id, ready, version}'`
-picks the columns you want. For every node to appear, each must run its admin listener and
-the node you ask must have cluster TLS ([ADMIN-API.md § The cluster view](ADMIN-API.md#the-cluster-view)).
+| Column | Meaning |
+|---|---|
+| `STATE` | `ready`, `not ready`, or `no reply` |
+| `LEADER`, `EPOCH` | `*` on the lease leader; the lease epoch |
+| `MEMBERS`, `LAG` | how many members the node sees; replica groups it lags in |
+| `CLUSTER` | the first 8 characters of the node's cluster id |
+| `MS` | how long the node took to answer |
+| `NOTES` | what is wrong: `quarantined`, `brownout`, `swim-isolated`, `under-replicated`, `decommissioning`, `not live`, or why the node did not reply |
+
+`--json` has every field of every row: admin address, full cluster id, config checksum,
+protocol version. For every node to appear, each must run its admin listener and the node
+you ask must have cluster TLS ([ADMIN-API.md § The cluster view](ADMIN-API.md#the-cluster-view)).
 
 ### `clients`, `session`, `subscribers`, `backlog`, `retained`
 
@@ -175,17 +184,17 @@ matched      2
 next_cursor  -
 
 sessions:
-AUTH       BACKLOG  BACKLOG_BYTES  CLIENT_ID  CONNECTED  CONNECTED_SECS  EXPIRES_AT  EXPIRY_SECS  INFLIGHT  PERSISTENT  PROTOCOL  SOURCE              SUBSCRIPTIONS  USER
-anonymous  0        0              me         true       0               -           -            0         false       3.1.1     192.168.65.1:26450  1              anonymous
-anonymous  0        0              sensor-7   true       4               -           -            0         false       5         192.168.65.1:53942  1              anonymous
+CLIENT_ID  CONNECTED  AUTH       BACKLOG  BACKLOG_BYTES  CONNECTED_SECS  EXPIRES_AT  EXPIRY_SECS  INFLIGHT  PERSISTENT  PROTOCOL  SOURCE              SUBSCRIPTIONS  USER
+me         true       anonymous  0        0              0               -           -            0         false       3.1.1     192.168.65.1:26450  1              anonymous
+sensor-7   true       anonymous  0        0              4               -           -            0         false       5         192.168.65.1:53942  1              anonymous
 
 $ mqttd --admin subscribers plant/7/temp
 topic      plant/7/temp
 truncated  false
 
 subscribers:
-CLIENT_ID  CONNECTED  FILTER        QOS  SHARED_GROUP
-sensor-7   true       plant/+/temp  1    -
+CLIENT_ID  FILTER        CONNECTED  QOS  SHARED_GROUP
+sensor-7   plant/+/temp  true       1    -
 
 $ mqttd --admin retained --prefix plant/
 count          2
@@ -194,9 +203,9 @@ payload_bytes  13
 prefix         plant/
 
 retained:
-EXPIRES_AT  PAYLOAD_BYTES  QOS  TOPIC
--           6              1    plant/7/status
--           7              1    plant/8/status
+TOPIC           EXPIRES_AT  PAYLOAD_BYTES  QOS
+plant/7/status  -           6              1
+plant/8/status  -           7              1
 ```
 
 A session the node does not hold is a `404` that says where placement puts it; with

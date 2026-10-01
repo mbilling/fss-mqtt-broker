@@ -1010,11 +1010,14 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 507 test(s)
+## `crates/mqttd/src/lib.rs` — 510 test(s)
 
 - `admin::cli::tests::all_nodes_asks_for_the_cluster_scope_on_the_verbs_that_have_one`
 - `admin::cli::tests::answers_render_as_tables_and_lines`
+- `admin::cli::tests::help_wraps_to_the_terminal_width`
+- `admin::cli::tests::identifying_columns_lead_every_table`
 - `admin::cli::tests::invocations_are_validated_before_anything_runs`
+- `admin::cli::tests::the_cluster_view_is_compact_and_says_what_is_wrong`
 - `admin::client::tests::responses_split_into_status_and_body`
 - `admin::client::tests::urls_need_https_and_a_port`
 - `admin::cluster::tests::a_silent_node_is_a_row_with_its_reason_not_a_healthy_one`

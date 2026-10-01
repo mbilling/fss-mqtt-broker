@@ -97,7 +97,7 @@ tasks:
     issue: 773
   - id: 0081-T19
     title: "CLI output polish: compact cluster table, wrapped help"
-    status: planned
+    status: in-progress
     issue: 774
   - id: 0081-T13
     title: "OIDC bearer tokens as a second admin authenticator on the same roles"
@@ -133,7 +133,7 @@ frontmatter above · this file is the plan, progress log, and changelog.
 | 0081-T16 | ✅ done | [#771](https://github.com/mbilling/fss-mqtt-broker/issues/771) | 2026-10-01 | "PR #782. scripts/admin-e2e.sh scenarios: 16 scripted incidents, each on a fresh compose cluster and asserted through the admin API (123 checks; 2 consecutive local runs 16/16), nightly job admin-scenarios. Surfaced #783 and #784." |
 | 0081-T17 | 🚧 in-progress | [#772](https://github.com/mbilling/fss-mqtt-broker/issues/772) | — |  |
 | 0081-T18 | ⬜ planned | [#773](https://github.com/mbilling/fss-mqtt-broker/issues/773) | — |  |
-| 0081-T19 | ⬜ planned | [#774](https://github.com/mbilling/fss-mqtt-broker/issues/774) | — |  |
+| 0081-T19 | 🚧 in-progress | [#774](https://github.com/mbilling/fss-mqtt-broker/issues/774) | — |  |
 | 0081-T13 | 💤 deferred | — | — | "After T1–T9 are in use." |
 | 0081-T14 | 💤 deferred | — | — | "Needs a demonstrated need and a dry-run design (ADR §5)." |
 <!-- /status-table:0081 -->

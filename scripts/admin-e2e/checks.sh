@@ -40,7 +40,10 @@ for n in 1 2 3; do
   body=$(sed '$d' <<<"$out")
   expect "cluster from mqttd-$n: 3 nodes replied" "3/3/True/True" "$(jqv 'f"{d["summary"]["nodes"]}/{d["summary"]["replied"]}/{d["summary"]["same_cluster_id"]}/{d["summary"]["same_membership"]}"' <<<"$body")"
 done
-out=$(cli oncall 2 cluster);   expect "cluster CLI table" "NODE_ID" "$out"
+out=$(cli oncall 2 cluster);   expect "cluster CLI: compact table" "LEADER  EPOCH  MEMBERS" "$out"
+expect "cluster CLI: summary line" "3 nodes: 3 replied, 3 ready" "$out"
+expect "cluster CLI: nodes agree" "they agree on cluster id, version, config and membership" "$out"
+check "cluster CLI: fits a 100-column terminal" test -z "$(awk 'length > 100' <<<"$out")"
 out=$(cli oncall 3 placement); expect "placement CLI" "views:" "$out"
 out=$(api oncall 1 GET /admin/v1/placement); expect "api placement" ""views"" "$out"
 
