@@ -2362,6 +2362,9 @@ IMAGES
 				if [ "$flat" -ge "$LANE_E_STEADY_POLLS" ]; then
 					steady=yes
 					steady_s="$waited"
+					# The reason describes a rung that is NOT steady; one that
+					# recovered from an out-of-band poll has none (#786).
+					steady_reason=none
 					break
 				fi
 			else
