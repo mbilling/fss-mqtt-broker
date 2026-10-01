@@ -1460,6 +1460,12 @@ async fn cluster_scope_finds_a_client_on_any_node_and_peers_read_only_as_a_forwa
     let (status, body) = a.admin.get(&alice, "/admin/v1/clients?scope=all").await;
     assert_eq!((status, code(&body)), (400, "bad-request"), "{body}");
 
+    peers_read_only_as_a_forward(&b, &admin_ca, &cluster).await;
+}
+
+/// The rest of the T17 test: the peer side audited the forwarded read, and a node
+/// certificate reads these only as a forward, which is always node scope.
+async fn peers_read_only_as_a_forward(b: &Broker, admin_ca: &Ca, cluster: &Ca) {
     // The peer side audited the forwarded read, naming the operator it was for.
     let b_log = b.admin.audit.0.lock().unwrap().clone();
     assert!(
@@ -1472,7 +1478,7 @@ async fn cluster_scope_finds_a_client_on_any_node_and_peers_read_only_as_a_forwa
     );
 
     // A node certificate reads these only as a forward, and a forward is node scope.
-    let (cert, key) = mint_leaf(&cluster, "a", None);
+    let (cert, key) = mint_leaf(cluster, "a", None);
     let as_peer = Target {
         connector: mqtt_net::tls::client_connector_multi(
             &[&admin_ca.pem, &cluster.pem],
