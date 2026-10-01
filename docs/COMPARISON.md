@@ -104,7 +104,7 @@ node clusters under kill/partition/upgrade/soak harnesses.
 | mTLS client certs | ✅ identity from CN/SAN, no-fallback (ADR 0004) | ✅ | ✅ | ✅ | ✅ |
 | Built-in authentication | mTLS + Argon2id passwords + JWT + **OIDC with live JWKS rotation** | password file + dynamic-security plugin | extensive built-ins (DB, JWT, HTTP, LDAP, …) | password file + HTTP auth | files/DB via plugins; no built-in OIDC |
 | Authorization | deny-by-default TOML ACLs, `%i`/`%c`, connect ACL; a denied MQTT 5 publish is answered `0x87 Not authorized` | `acl_file` + dynsec | built-in authz sources | HOCON ACL | `vmq_acl` file / DB plugins |
-| Policy hot reload | ✅ validate-before-swap, **and the reload sweeps live state** — revoked cert/user/grant evicts running sessions and flows (ADR 0040) | ⚠️ SIGHUP reloads; live eviction not documented | n/v | ⚠️ HTTP `/reload`, subset | ⚠️ live reconfig via CLI; live eviction not documented |
+| Policy hot reload | ✅ validate-before-swap, **and the reload sweeps live state** — revoked cert/user/grant evicts running sessions and flows (ADR 0040) | ⚠️ SIGHUP reloads ACL and password files (TLS certificates too from 2.1); dynsec delete/disable disconnects the client, but file changes leave connected clients alone | ✅ authn/authz changes via API or dashboard; certificate files re-read every 120 s; the effect on connected clients is not documented | ⚠️ `nanomq reload` covers basic/sqlite/auth/log sections, not TLS; live effect not documented | ✅ ACL/password files re-read every 10 s, certificates via `vmq-admin tls clear-pem-cache` — and documented: active subscriptions and running TLS sessions are **not** affected |
 | Audit trail | ✅ hash-chained, tamper-evident | not documented | n/v | not documented | not documented |
 | Memory safety | Rust, `#![forbid(unsafe_code)]` | C | Erlang/BEAM | C | Erlang/BEAM |
 | Release integrity | reproducible builds, keyless cosign signatures, SLSA provenance, SBOM — shipped with `v0.9.0` (15 signed assets) | — | n/v | — | — |
@@ -115,7 +115,7 @@ logged; the same is not uniformly true elsewhere (e.g. NanoMQ defaults to
 
 ## Operations, observability, integration
 
-The three admin rows were re-verified on 2026-10-01 against each project's own documentation
+The three admin rows, the policy-reload row and the Kubernetes row were re-verified on 2026-10-01 against each project's own documentation
 (Mosquitto 2.1 `mosquitto.conf(5)` and release review, HiveMQ's edition docs, NanoMQ's CLI and
 HTTP API pages, VerneMQ's status page and HTTP listener docs).
 
@@ -128,7 +128,7 @@ HTTP API pages, VerneMQ's status page and HTTP listener docs).
 | Rule engine | ✖ by design — a documented, CI-tested **external-consumer pattern** instead ([INTEGRATION.md](INTEGRATION.md), ADR 0063): `$share` consumer groups on durable session queues feed Kafka/webhooks at-least-once, deduped at the sink; transforms are code you run, not SQL the broker runs | ✖ | ✅ SQL | ✅ SQL (full build) | ✖ |
 | Bridging | ✅ standalone bridge, deny-by-default directional rules, hop-count loop prevention, spool (ADR 0025) | ✅ built-in (the reference implementation) | ✅ data-integration bridges | ✅ TCP/QUIC/AWS bridges | ✅ basic `vmq_bridge` |
 | MQTT-SN / CoAP gateways | ✖ | ✖ (separate projects) | ✅ (SN, CoAP, LwM2M, …) | ✖ (DDS/SOME-IP/ZMQ instead) | ✖ |
-| Kubernetes | Helm chart: StatefulSet, per-pod PV, decommission-draining scale-down, automatic cert/policy rotation via file-watch, PVC lifecycle on shrink (ADR 0047). A Kubernetes **operator** (`MqttdCluster` CRD, split-brain detection and fencing, brownout PVC expansion — ADR 0055) is end-to-end tested and **packaged**: an install chart (`deploy/helm/mqttd-operator`) plus a signed, SBOM-attested image cut by the release pipeline (first published at v0.9.1). The chart-only path stays fully supported; the CRD is v1alpha1, schema-pinned in CI | — | Operator + Helm | container | k8s discovery in image |
+| Kubernetes | Helm chart: StatefulSet, per-pod PV, decommission-draining scale-down, automatic cert/policy rotation via file-watch, PVC lifecycle on shrink (ADR 0047). A Kubernetes **operator** (`MqttdCluster` CRD, split-brain detection and fencing, brownout PVC expansion — ADR 0055) is end-to-end tested and **packaged**: an install chart (`deploy/helm/mqttd-operator`) plus a signed, SBOM-attested image cut by the release pipeline (first published at v0.9.1). The chart-only path stays fully supported; the CRD is v1alpha1, schema-pinned in CI | — | Operator + Helm | container image only (no official chart or operator) | official Helm chart (`docker-vernemq`); `vmq-operator` sees only dependency bumps |
 | Config | TOML + env, strict schema, `--check-config`, whole-config hot reload | conf file, SIGHUP | HOCON + dashboard/API | HOCON + env, hot reload | conf file + env mapping, live reconfig |
 
 ## Operational limits & resource governance
