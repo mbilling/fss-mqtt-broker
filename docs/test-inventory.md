@@ -1621,7 +1621,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `startup::a_live_process_is_not_ready_while_client_startup_is_held`
 - `the_extended_budget_follows_observed_restore_state`
 
-## `crates/mqttd/tests/binary_smoke.rs` — 11 test(s)
+## `crates/mqttd/tests/binary_smoke.rs` — 12 test(s)
 
 - `a_graceful_stop_closes_the_audit_chain`
 - `binary_serves_a_plaintext_pubsub_roundtrip`
@@ -1633,6 +1633,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `repeated_auth_failures_penalize_the_source_address_then_decay`
 - `the_audit_export_ships_a_verifiable_chain`
 - `the_ephemeral_opt_in_boots_and_still_warns`
+- `the_health_and_peer_listeners_survive_fd_exhaustion`
 - `the_listener_survives_fd_exhaustion_and_accepts_again`
 
 ## `crates/mqttd/tests/brownout_ack.rs` — 5 test(s)

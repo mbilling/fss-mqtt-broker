@@ -36,7 +36,7 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot};
-use tracing::{debug, warn};
+use tracing::debug;
 
 /// How long the liveness probe waits for the hub to answer its ping before
 /// reporting the broker wedged.
@@ -771,8 +771,10 @@ impl HealthState {
     }
 }
 
-/// Serve health endpoints on `listener` until it errors. Each connection is handled
-/// off the accept loop so a slow client cannot stall probes.
+/// Serve health endpoints on `listener` for the life of the process. Each connection is
+/// handled off the accept loop so a slow client cannot stall probes, and an accept error
+/// pauses rather than ends the loop (issue #504): a dead health listener leaves `/metrics`,
+/// `/readyz` and `/livez` unanswered while the broker runs.
 pub async fn serve(listener: TcpListener, state: HealthState) {
     loop {
         match listener.accept().await {
@@ -784,10 +786,7 @@ pub async fn serve(listener: TcpListener, state: HealthState) {
                     }
                 });
             }
-            Err(e) => {
-                warn!(error = %e, "health listener accept failed");
-                return;
-            }
+            Err(e) => crate::accept::pause_after_error(&e, "health").await,
         }
     }
 }
