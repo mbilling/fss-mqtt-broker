@@ -16,6 +16,7 @@
 mod common;
 mod proc_common;
 
+use std::io::{BufRead as _, BufReader};
 use std::net::SocketAddr;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -108,13 +109,24 @@ impl Drop for Broker {
     }
 }
 
+/// The line the broker logs once its plaintext client listener is BOUND (`main.rs`,
+/// `start_client_listeners`). It is logged after `bind` succeeds, so from then on the port
+/// is this broker's and a CONNECT waits in its accept backlog.
+const LISTENING: &str = "accepting MQTT 3.1.1 clients";
+
 /// Boot the real binary with the hook pointed at `hook_url`.
+///
+/// Ready means the broker SAYS it bound the port. A TCP connect to the port succeeding is
+/// not enough (#827). `free_tcp_port` releases the port before the broker binds it, and its
+/// band is shared with every other test process on the machine (#487). While our broker is
+/// still booting, a connect proves only that SOMEBODY listens there: another process's
+/// broker, or another process's `free_tcp_port` probe, whose `bind` is a listening socket
+/// for an instant. The old poll took such a connect, saw our child still alive (it had not
+/// reached its own `bind`), and returned. The first CONNECT then went to that other
+/// listener and was reset when it closed. Waiting for the broker's own log line closes the
+/// race: a broker that lost the port exits instead of printing [`LISTENING`], and we retry
+/// on a fresh port.
 async fn start_broker(hook_url: &str, extra: &[(&str, &str)]) -> (Broker, SocketAddr) {
-    // `free_tcp_port` closes the port before the broker binds it, so another process can
-    // take it in between (#487): the readiness poll below then connects to THAT process,
-    // the broker exits on its failed bind, and the test later sees `ConnectionRefused`
-    // from nowhere. So a broker that exits while we wait is a lost race: retry on a
-    // fresh port, and only a broker that keeps failing is a real startup failure.
     for attempt in 1..=3 {
         let client: SocketAddr = format!("127.0.0.1:{}", free_tcp_port()).parse().unwrap();
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_mqttd"));
@@ -130,31 +142,38 @@ async fn start_broker(hook_url: &str, extra: &[(&str, &str)]) -> (Broker, Socket
             // The stub speaks plaintext; the broker refuses that unless told, which is
             // itself covered by a unit test.
             .env("MQTTD_HTTP_AUTH_ALLOW_HTTP", "1")
-            .env("RUST_LOG", "off");
+            // The broker's own info lines carry [`LISTENING`]; nothing else is needed.
+            .env("RUST_LOG", "mqttd=info");
         for (k, v) in extra {
             cmd.env(k, v);
         }
-        let child = cmd
-            .stdout(Stdio::null())
+        let mut child = cmd
+            // The tracing subscriber writes to stdout.
+            .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
             .expect("spawn mqttd");
-        let mut broker = Broker(child);
-        for _ in 0..300 {
-            if let Ok(Some(status)) = broker.0.try_wait() {
-                eprintln!(
-                    "mqttd exited ({status}) before listening on {client}, attempt {attempt}"
-                );
-                break;
-            }
-            if TcpStream::connect(client).await.is_ok() {
-                // Connected — but to the broker? Only if it is still running.
-                if broker.0.try_wait().ok().flatten().is_none() {
-                    return (broker, client);
+        let stdout = child.stdout.take().expect("stdout piped");
+        let broker = Broker(child);
+        // A plain thread reads the log. It signals the listener line once, then keeps
+        // draining to EOF so the broker never blocks on a full pipe. EOF before the line
+        // means the broker exited; dropping the sender tells the wait below.
+        let (listening_tx, listening_rx) = tokio::sync::oneshot::channel::<()>();
+        std::thread::spawn(move || {
+            let mut listening_tx = Some(listening_tx);
+            for line in BufReader::new(stdout).lines() {
+                let Ok(line) = line else { break };
+                if line.contains(LISTENING) {
+                    if let Some(tx) = listening_tx.take() {
+                        let _ = tx.send(());
+                    }
                 }
-                break;
             }
-            tokio::time::sleep(Duration::from_millis(100)).await;
+        });
+        match tokio::time::timeout(Duration::from_secs(30), listening_rx).await {
+            Ok(Ok(())) => return (broker, client),
+            Ok(Err(_)) => eprintln!("mqttd exited before listening on {client}, attempt {attempt}"),
+            Err(_) => eprintln!("mqttd did not listen on {client} within 30s, attempt {attempt}"),
         }
     }
     panic!("mqttd failed to start and listen in 3 attempts on fresh ports");
