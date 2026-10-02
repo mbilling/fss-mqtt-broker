@@ -1015,7 +1015,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 530 test(s)
+## `crates/mqttd/src/lib.rs` — 533 test(s)
 
 - `admin::cli::tests::all_nodes_asks_for_the_cluster_scope_on_the_verbs_that_have_one`
 - `admin::cli::tests::answers_render_as_tables_and_lines`
@@ -1495,6 +1495,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::the_retained_queue_bound_drops_the_oldest_loudly`
 - `hub::tests::the_snapshot_carries_tokens_and_tombstone_entries`
 - `hub::tests::the_subscribe_replay_seeds_the_windows_ledger`
+- `hub::tests::the_sweep_moves_peer_sheds_into_publish_dropped`
 - `hub::tests::the_windowed_apply_defers_to_a_live_copy_already_delivered`
 - `hub::tests::transient_lease_does_not_downgrade_a_persistent_attach`
 - `hub::tests::truncate_flusher::a_burst_flushes_once_at_its_highest_watermark`
@@ -1505,6 +1506,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::two_publishes_to_one_offline_subscriber_append_in_arrival_order`
 - `hub::tests::without_no_local_a_publisher_receives_its_own_delivery`
 - `ingress::tests::credit_is_returned_when_the_permit_drops_and_the_cap_bounds_one_connection`
+- `ingress::tests::peer_credit_draws_on_the_pool_alone_and_counts_what_it_sheds`
 - `ingress::tests::the_pool_follows_the_config_then_the_watermark_then_the_default`
 - `log_filter::tests::a_newer_override_is_not_ended_by_the_older_timer`
 - `log_filter::tests::an_override_applies_then_expires_back_to_the_base`
@@ -1519,6 +1521,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `memory_watch::tests::vm_rss_is_parsed_in_bytes_from_the_right_line`
 - `memory_watch::tests::without_a_watermark_nothing_is_ever_browned_out`
 - `peer::tests::control_frames_jump_the_bulk_queue`
+- `peer::tests::peer_qos0_is_shed_when_the_pool_is_full_and_nothing_else_is`
 - `reload::tests::a_bad_gossip_crl_rejects_the_whole_reload`
 - `reload::tests::a_config_reload_swaps_live_and_keeps_it_on_any_failure`
 - `reload::tests::a_failed_reload_keeps_the_running_policy`

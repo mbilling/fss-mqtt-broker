@@ -36,6 +36,22 @@ use tracing::{info, warn};
 /// is kept in sync with membership (ADR 0005) so the hub can identify session
 /// owners.
 pub async fn maintain_peer_links(
+    events: mpsc::UnboundedReceiver<MembershipEvent>,
+    local: NodeId,
+    hub: mpsc::UnboundedSender<HubCommand>,
+    tls: Option<peer::PeerTls>,
+    placement: Option<Arc<RwLock<Placement>>>,
+    metrics: Option<Arc<mqtt_observability::metrics::Metrics>>,
+    plane: Option<mqtt_cluster::durable_plane::DurablePlane>,
+) {
+    maintain_peer_links_with_ingress(events, local, hub, tls, placement, metrics, plane, None)
+        .await;
+}
+
+/// [`maintain_peer_links`], with every dialed link charging the node's ingress credit
+/// for inbound peer `QoS` 0 publishes (ADR 0082 T4). `None` charges nothing.
+#[allow(clippy::too_many_arguments)] // the wiring seam above, plus the credit
+pub async fn maintain_peer_links_with_ingress(
     mut events: mpsc::UnboundedReceiver<MembershipEvent>,
     local: NodeId,
     hub: mpsc::UnboundedSender<HubCommand>,
@@ -43,6 +59,7 @@ pub async fn maintain_peer_links(
     placement: Option<Arc<RwLock<Placement>>>,
     metrics: Option<Arc<mqtt_observability::metrics::Metrics>>,
     plane: Option<mqtt_cluster::durable_plane::DurablePlane>,
+    ingress: Option<Arc<crate::ingress::IngressCredit>>,
 ) {
     // Active dialer per peer we own the link to. The book aborts every dialer
     // when it drops — the dial tasks are children of THIS task, and must not
@@ -116,12 +133,13 @@ pub async fn maintain_peer_links(
                     }
                 }
                 info!(peer = %ev.id.0, addr = %ev.peer_addr, "membership: peer alive; establishing link");
-                let handle = tokio::spawn(peer::dial_forever(
+                let handle = tokio::spawn(peer::dial_forever_with_ingress(
                     ev.peer_addr.clone(),
                     local.clone(),
                     hub.clone(),
                     tls.clone(),
                     plane.clone(),
+                    ingress.clone(),
                 ));
                 dialers
                     .0

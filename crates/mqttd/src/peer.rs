@@ -22,6 +22,7 @@
 
 use crate::conn::ConnPolicy;
 use crate::hub::{HubCommand, PeerOutbound};
+use crate::ingress::{IngressCredit, IngressPermit};
 use bytes::BytesMut;
 use mqtt_cluster::durable_plane::DurablePlane;
 use mqtt_cluster::peer::{self, PeerMessage};
@@ -162,6 +163,20 @@ pub async fn serve_listener(
     client_policy: Option<Arc<ConnPolicy>>,
     plane: Option<DurablePlane>,
 ) {
+    serve_listener_with_ingress(listener, local, hub, tls, client_policy, plane, None).await;
+}
+
+/// [`serve_listener`], with the node's ingress credit charged for inbound peer `QoS` 0
+/// publishes (ADR 0082 T4). `None` charges nothing.
+pub async fn serve_listener_with_ingress(
+    listener: TcpListener,
+    local: NodeId,
+    hub: mpsc::UnboundedSender<HubCommand>,
+    tls: Option<PeerTls>,
+    client_policy: Option<Arc<ConnPolicy>>,
+    plane: Option<DurablePlane>,
+    ingress: Option<Arc<IngressCredit>>,
+) {
     loop {
         match listener.accept().await {
             Ok((stream, _peer)) => {
@@ -170,6 +185,7 @@ pub async fn serve_listener(
                 let tls = tls.clone();
                 let policy = client_policy.clone();
                 let plane = plane.clone();
+                let ingress = ingress.clone();
                 tokio::spawn(async move {
                     let _ = stream.set_nodelay(true);
                     // Read the CURRENT acceptor per accept (ADR 0040 T4): a reload's
@@ -184,15 +200,30 @@ pub async fn serve_listener(
                                     return; // revoked: fail closed (ADR 0040 T4)
                                 };
                                 let expected_cn = peer_cert_cn(s.get_ref().1);
-                                handle(s, local, hub, false, expected_cn, serial, policy, plane)
-                                    .await
+                                handle(
+                                    s,
+                                    local,
+                                    hub,
+                                    false,
+                                    expected_cn,
+                                    serial,
+                                    policy,
+                                    plane,
+                                    ingress,
+                                )
+                                .await
                             }
                             Err(e) => {
                                 debug!(error = %e, "peer mTLS handshake failed; link rejected");
                                 return;
                             }
                         },
-                        _ => handle(stream, local, hub, false, None, None, policy, plane).await,
+                        _ => {
+                            handle(
+                                stream, local, hub, false, None, None, policy, plane, ingress,
+                            )
+                            .await
+                        }
                     };
                     if let Err(e) = result {
                         debug!(error = %e, "inbound peer link ended");
@@ -221,6 +252,19 @@ pub async fn dial_forever(
     hub: mpsc::UnboundedSender<HubCommand>,
     tls: Option<PeerTls>,
     plane: Option<DurablePlane>,
+) {
+    dial_forever_with_ingress(addr, local, hub, tls, plane, None).await;
+}
+
+/// [`dial_forever`], with the node's ingress credit charged for inbound peer `QoS` 0
+/// publishes (ADR 0082 T4). `None` charges nothing.
+pub async fn dial_forever_with_ingress(
+    addr: String,
+    local: NodeId,
+    hub: mpsc::UnboundedSender<HubCommand>,
+    tls: Option<PeerTls>,
+    plane: Option<DurablePlane>,
+    ingress: Option<Arc<IngressCredit>>,
 ) {
     // An undialable name is permanent; retrying would only spin.
     let server_name = match tls.as_ref().map(|_| tls::server_name(&addr)).transpose() {
@@ -258,6 +302,7 @@ pub async fn dial_forever(
                                     serial,
                                     None,
                                     plane.clone(),
+                                    ingress.clone(),
                                 )
                                 .await
                             }
@@ -278,6 +323,7 @@ pub async fn dial_forever(
                             None,
                             None,
                             plane.clone(),
+                            ingress.clone(),
                         )
                         .await
                     }
@@ -355,6 +401,7 @@ async fn handle<S>(
     cert_serial: Option<Vec<u8>>,
     client_policy: Option<Arc<ConnPolicy>>,
     plane: Option<DurablePlane>,
+    ingress: Option<Arc<IngressCredit>>,
 ) -> Result<LinkOutcome, std::io::Error>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -518,6 +565,7 @@ where
         &reply_bulk,
         &depth,
         plane.as_ref(),
+        ingress.as_deref(),
     )
     .await;
     let _ = hub.send(HubCommand::PeerDisconnected {
@@ -540,6 +588,7 @@ async fn pump<R, W>(
     reply_bulk: &mpsc::WeakUnboundedSender<PeerMessage>,
     depth: &std::sync::atomic::AtomicUsize,
     plane: Option<&DurablePlane>,
+    ingress: Option<&IngressCredit>,
 ) -> Result<(), std::io::Error>
 where
     R: AsyncRead + Unpin,
@@ -582,7 +631,9 @@ where
             inbound = read_frame(rh, buf) => {
                 match inbound? {
                     None => return Ok(()), // peer closed
-                    Some(msg) => forward_inbound(msg, hub, remote, plane, reply_ctl, reply_bulk),
+                    Some(msg) => {
+                        forward_inbound(msg, hub, remote, plane, ingress, reply_ctl, reply_bulk);
+                    }
                 }
             }
             maybe_out = out_rx.recv() => {
@@ -600,6 +651,33 @@ where
     }
 }
 
+/// The credit an inbound peer publish takes before it is queued for the hub (ADR 0082
+/// T4, §3). Only a non-retained `QoS` 0 publish is charged, against the node pool with
+/// no per-link cap; `Ok(None)` = uncharged. `Err(())` = no credit: the caller drops it,
+/// counted. Never paused — a peer link also carries consensus and replication, which
+/// must not stall behind best-effort data. `QoS` 1 and 2 were promised upstream, and a
+/// retained copy is this node's only record of the topic's state, so neither is shed.
+fn peer_credit(
+    ingress: Option<&IngressCredit>,
+    qos: mqtt_codec::QoS,
+    retain: bool,
+    topic_len: usize,
+    payload_len: usize,
+) -> Result<Option<IngressPermit>, ()> {
+    let Some(ingress) = ingress else {
+        return Ok(None);
+    };
+    if qos != mqtt_codec::QoS::AtMostOnce || retain {
+        return Ok(None);
+    }
+    let permit = ingress.try_acquire_pool(ingress.cost(topic_len, payload_len));
+    if permit.is_none() {
+        ingress.note_peer_shed();
+        return Err(());
+    }
+    Ok(permit)
+}
+
 /// Translate an inbound peer message into a hub command.
 // One arm per wire variant — a flat dispatch table, not a refactor smell.
 #[allow(clippy::too_many_lines)]
@@ -608,6 +686,7 @@ fn forward_inbound(
     hub: &mpsc::UnboundedSender<HubCommand>,
     remote: &NodeId,
     plane: Option<&DurablePlane>,
+    ingress: Option<&IngressCredit>,
     reply_ctl: &mpsc::WeakUnboundedSender<PeerMessage>,
     reply_bulk: &mpsc::WeakUnboundedSender<PeerMessage>,
 ) {
@@ -692,13 +771,18 @@ fn forward_inbound(
             message_expiry,
             app,
         } => {
+            let qos = mqtt_codec::QoS::from_u8(qos).unwrap_or(mqtt_codec::QoS::AtMostOnce);
+            let Ok(credit) = peer_credit(ingress, qos, retain, topic.len(), payload.len()) else {
+                return;
+            };
             let _ = hub.send(HubCommand::RemotePublish {
                 topic,
                 payload: payload.into(),
-                qos: mqtt_codec::QoS::from_u8(qos).unwrap_or(mqtt_codec::QoS::AtMostOnce),
+                qos,
                 retain,
                 message_expiry,
                 app: crate::hub::app_from_wire(app),
+                credit,
             });
         }
         PeerMessage::PublishAcked {
@@ -814,13 +898,18 @@ fn forward_inbound(
             message_expiry,
             app,
         } => {
+            let qos = mqtt_codec::QoS::from_u8(qos).unwrap_or(mqtt_codec::QoS::AtMostOnce);
+            let Ok(credit) = peer_credit(ingress, qos, false, topic.len(), payload.len()) else {
+                return;
+            };
             let _ = hub.send(HubCommand::RemoteSharedDeliver {
                 client: mqtt_core::ClientId(client.into()),
                 topic,
                 payload: payload.into(),
-                qos: mqtt_codec::QoS::from_u8(qos).unwrap_or(mqtt_codec::QoS::AtMostOnce),
+                qos,
                 message_expiry,
                 app: crate::hub::app_from_wire(app),
+                credit,
             });
         }
         PeerMessage::RetainedSnapshot { messages } => {
@@ -1071,6 +1160,7 @@ mod tests {
                 &reply_bulk,
                 &std::sync::atomic::AtomicUsize::new(0),
                 None,
+                None,
             )
             .await
         });
@@ -1099,5 +1189,85 @@ mod tests {
         drop(ctl_tx);
         drop(out_tx);
         pump_task.await.expect("pump task").expect("pump exits Ok");
+    }
+
+    /// ADR 0082 T4 (§3): with the node pool exhausted, an inbound peer `QoS` 0 publish
+    /// or shared delivery is shed and counted, never queued for the hub, and the reader
+    /// never waits. Retained and `QoS` 1 publishes still pass, uncharged. With credit,
+    /// a `QoS` 0 forward carries its permit into the hub, which returns it on drop.
+    #[test]
+    fn peer_qos0_is_shed_when_the_pool_is_full_and_nothing_else_is() {
+        use crate::ingress::OverloadMode;
+        use mqtt_cluster::peer::WireAppProps;
+
+        let publish = |qos: u8, retain: bool| PeerMessage::Publish {
+            topic: "t".into(),
+            payload: vec![0; 200],
+            qos,
+            retain,
+            message_expiry: None,
+            app: WireAppProps::default(),
+        };
+        let shared = |qos: u8| PeerMessage::SharedDeliver {
+            client: "c1".into(),
+            topic: "t".into(),
+            payload: vec![0; 200],
+            qos,
+            message_expiry: None,
+            app: WireAppProps::default(),
+        };
+        let (hub, mut rx) = mpsc::unbounded_channel();
+        let (ctl, _ctl_rx) = mpsc::unbounded_channel::<PeerMessage>();
+        let (bulk, _bulk_rx) = mpsc::unbounded_channel::<PeerMessage>();
+        let (ctl, bulk) = (ctl.downgrade(), bulk.downgrade());
+        let remote = NodeId("n2".into());
+        let credit = IngressCredit::new(4_096, 1_024, OverloadMode::Pause);
+        let forward = |msg| forward_inbound(msg, &hub, &remote, None, Some(&credit), &ctl, &bulk);
+
+        // With credit: the permit rides inside the command until the hub drops it.
+        forward(publish(0, false));
+        let cmd = rx.try_recv().expect("forwarded");
+        assert!(matches!(
+            cmd,
+            HubCommand::RemotePublish {
+                credit: Some(_),
+                ..
+            }
+        ));
+        assert_eq!(credit.in_use(), 1_001, "topic + payload + overhead");
+        drop(cmd);
+        assert_eq!(credit.in_use(), 0, "dispatching returns the credit");
+
+        // The pool exhausted: QoS 0 is shed, and counted.
+        let full = credit.try_acquire_pool(4_096).unwrap();
+        forward(publish(0, false));
+        forward(shared(0));
+        assert!(rx.try_recv().is_err(), "nothing queued for the hub");
+        assert_eq!(credit.take_peer_shed(), 2);
+
+        // A retained copy, QoS 1 and a QoS 1 shared delivery pass, uncharged.
+        forward(publish(0, true));
+        forward(publish(1, false));
+        forward(shared(1));
+        for _ in 0..3 {
+            let cmd = rx.try_recv().expect("never shed");
+            assert!(
+                matches!(
+                    cmd,
+                    HubCommand::RemotePublish { credit: None, .. }
+                        | HubCommand::RemoteSharedDeliver { credit: None, .. }
+                ),
+                "uncharged"
+            );
+        }
+        assert_eq!(credit.take_peer_shed(), 0);
+        drop(full);
+
+        // No credit configured: nothing is charged or shed.
+        forward_inbound(publish(0, false), &hub, &remote, None, None, &ctl, &bulk);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(HubCommand::RemotePublish { credit: None, .. })
+        ));
     }
 }
