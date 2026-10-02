@@ -89,7 +89,7 @@
 | [0079](../adr/0079-global-allocator.md) | # 0079. mqttd links mimalloc as its global allocator | Accepted | [1/2 done](0079-global-allocator.md) | 1 open |
 | [0080](../adr/0080-replication-factor.md) | # 0080. The replication factor is cluster state: configurable, default 2, changeable live | Accepted | [6/6 done](0080-replication-factor.md) | — |
 | [0081](../adr/0081-admin-api.md) | # 0081. An authenticated admin API: reads cluster-wide, actions audited, config stays in the file | Accepted | [17/19 done](0081-admin-api.md) | 2 deferred |
-| [0082](../adr/0082-bounded-hub-ingress.md) | # 0082. Bounded hub ingress: a control lane that never waits behind data, and byte credits that push back on publishers | Accepted | [4/6 done](0082-bounded-hub-ingress.md) | 2 open |
+| [0082](../adr/0082-bounded-hub-ingress.md) | # 0082. Bounded hub ingress: a control lane that never waits behind data, and byte credits that push back on publishers | Accepted | [5/6 done](0082-bounded-hub-ingress.md) | 1 open |
 
 ## Open and deferred work
 
@@ -217,4 +217,3 @@
 **0082 — # 0082. Bounded hub ingress: a control lane that never waits behind data, and byte credits that push back on publishers**
 
 - `0082-T1` ⬜ planned ([#814](https://github.com/mbilling/fss-mqtt-broker/issues/814)): "Measure and expose: hub queue depth and bytes per class, the per-command memory cost, and the overload harness" — "The 2026-10-01 re-run measured 2,553,413 queued commands at 2.60 GB RSS (about 1,019 B each at 200 B payloads). T3 charges topic + payload + 800 B from that figure; it uses the wire topic, so an alias-only PUBLISH is undercharged by its topic length. Calibrate both here. The harness is the before / overload / idle / control sequence #504's acceptance names, asserting RSS, /livez and the control rung."
-- `0082-T5` 🚧 in-progress ([#818](https://github.com/mbilling/fss-mqtt-broker/issues/818)): "Configuration, defaults and documentation: MQTTD_HUB_INGRESS_BYTES and MQTTD_CONN_INGRESS_BYTES, SIZING, OPERATIONS and metrics" — "Also MQTTD_INGRESS_OVERLOAD ([limits] ingress_overload) in mqtt-config and the docs, with the pause versus shed-qos0 trade-off stated. Defaults accepted 2026-10-02: the pool is 1/8 of MQTTD_MEMORY_MAX_BYTES or 256 MiB; 1 MiB per connection. The three settings, CONFIGURATION.md, SIZING.md and the example TOML land with T3 (#816); OPERATIONS.md (runbook, alerts on ingress_credit_bytes and ingress_paused_seconds) remains."
