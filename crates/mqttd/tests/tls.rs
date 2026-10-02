@@ -4,6 +4,8 @@
 //! Tests mint a real throwaway CA with `rcgen` — there is no
 //! "skip verification" path anywhere, including here.
 
+mod listen_wait;
+
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -1451,40 +1453,32 @@ async fn spawn_two_listener_broker(
     password_file: &Path,
     env: &[(&str, &str)],
 ) -> (Broker, SocketAddr, SocketAddr) {
-    let tls: SocketAddr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
-    let plain: SocketAddr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
-    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_mqttd"));
-    for (k, _) in std::env::vars() {
-        if k.starts_with("MQTTD_") {
-            cmd.env_remove(k);
-        }
-    }
-    cmd.env("MQTTD_NODE_ID", "anon-per-listener")
-        .env("MQTTD_DURABLE_SESSIONS", "0")
-        .env("MQTTD_TLS_BIND", tls.to_string())
-        .env("MQTTD_TLS_CERT", &pki.cert)
-        .env("MQTTD_TLS_KEY", &pki.key)
-        .env("MQTTD_PLAINTEXT_BIND", plain.to_string())
-        .env("MQTTD_PASSWORD_FILE", password_file)
-        .env("RUST_LOG", "off")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    for (k, v) in env {
-        cmd.env(k, v);
-    }
-    let broker = Broker(cmd.spawn().unwrap());
-    for addr in [tls, plain] {
-        let mut up = false;
-        for _ in 0..300 {
-            if TcpStream::connect(addr).await.is_ok() {
-                up = true;
-                break;
+    // Ready when the broker's own log says it bound both (#827): a bare TCP connect
+    // can be answered by another test process holding a released port.
+    let (child, (tls, plain)) = listen_wait::spawn_listening(|| {
+        let tls: SocketAddr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+        let plain: SocketAddr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+        let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_mqttd"));
+        for (k, _) in std::env::vars() {
+            if k.starts_with("MQTTD_") {
+                cmd.env_remove(k);
             }
-            tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        assert!(up, "the broker never listened on {addr}");
-    }
-    (broker, tls, plain)
+        cmd.env("MQTTD_NODE_ID", "anon-per-listener")
+            .env("MQTTD_DURABLE_SESSIONS", "0")
+            .env("MQTTD_TLS_BIND", tls.to_string())
+            .env("MQTTD_TLS_CERT", &pki.cert)
+            .env("MQTTD_TLS_KEY", &pki.key)
+            .env("MQTTD_PLAINTEXT_BIND", plain.to_string())
+            .env("MQTTD_PASSWORD_FILE", password_file)
+            .stderr(std::process::Stdio::null());
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        (cmd, vec![tls, plain], (tls, plain))
+    })
+    .await;
+    (Broker(child), tls, plain)
 }
 
 /// The issue's measurement, and its fix: `allow_anonymous` was one global flag, so opening

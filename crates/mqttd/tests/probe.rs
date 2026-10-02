@@ -14,6 +14,7 @@
 //! *not* killed, and only a probe that tells those apart can express that.
 
 mod common;
+mod listen_wait;
 mod proc_common;
 
 use std::net::SocketAddr;
@@ -21,7 +22,6 @@ use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 use proc_common::free_tcp_port;
-use tokio::net::TcpStream;
 
 fn mqttd() -> Command {
     let mut c = Command::new(env!("CARGO_BIN_EXE_mqttd"));
@@ -45,35 +45,26 @@ impl Drop for Broker {
 /// Boot a broker with a health endpoint; `min_members` drives whether it can be Ready
 /// alone. Returns the broker and its health address.
 async fn start_broker(min_members: u32) -> (Broker, SocketAddr, tempfile::TempDir) {
-    let client: SocketAddr = format!("127.0.0.1:{}", free_tcp_port()).parse().unwrap();
-    let health: SocketAddr = format!("127.0.0.1:{}", free_tcp_port()).parse().unwrap();
-    let swim = format!("127.0.0.1:{}", free_tcp_port());
-    let peer = format!("127.0.0.1:{}", free_tcp_port());
-    let dir = tempfile::tempdir().expect("temp data dir");
-
-    let child = mqttd()
-        .env("MQTTD_NODE_ID", "probe-node")
-        .env("MQTTD_PLAINTEXT_BIND", client.to_string())
-        .env("MQTTD_HEALTH_BIND", health.to_string())
-        .env("MQTTD_SWIM_BIND", &swim)
-        .env("MQTTD_PEER_BIND", &peer)
-        .env("MQTTD_ALLOW_ANONYMOUS", "1")
-        .env("MQTTD_READY_MIN_MEMBERS", min_members.to_string())
-        .env("MQTTD_DATA_DIR", dir.path())
-        .env("RUST_LOG", "off")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn mqttd");
-    let broker = Broker(child);
-
-    for _ in 0..300 {
-        if TcpStream::connect(health).await.is_ok() {
-            return (broker, health, dir);
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    panic!("mqttd never served health on {health}");
+    let (child, (health, dir)) = listen_wait::spawn_listening(|| {
+        let client: SocketAddr = format!("127.0.0.1:{}", free_tcp_port()).parse().unwrap();
+        let health: SocketAddr = format!("127.0.0.1:{}", free_tcp_port()).parse().unwrap();
+        let swim = format!("127.0.0.1:{}", free_tcp_port());
+        let peer: SocketAddr = format!("127.0.0.1:{}", free_tcp_port()).parse().unwrap();
+        let dir = tempfile::tempdir().expect("temp data dir");
+        let mut cmd = mqttd();
+        cmd.env("MQTTD_NODE_ID", "probe-node")
+            .env("MQTTD_PLAINTEXT_BIND", client.to_string())
+            .env("MQTTD_HEALTH_BIND", health.to_string())
+            .env("MQTTD_SWIM_BIND", &swim)
+            .env("MQTTD_PEER_BIND", peer.to_string())
+            .env("MQTTD_ALLOW_ANONYMOUS", "1")
+            .env("MQTTD_READY_MIN_MEMBERS", min_members.to_string())
+            .env("MQTTD_DATA_DIR", dir.path())
+            .stderr(Stdio::null());
+        (cmd, vec![client, health, peer], (health, dir))
+    })
+    .await;
+    (Broker(child), health, dir)
 }
 
 /// Run `mqttd --probe <args>` and return `(exit code, stdout+stderr)`.
@@ -197,23 +188,27 @@ fn a_probe_with_no_endpoint_is_a_usage_error() {
 /// probe rewrites it to loopback rather than failing on `0.0.0.0`.
 #[tokio::test]
 async fn a_wildcard_health_bind_is_probed_on_loopback() {
-    let port = free_tcp_port();
-    let client: SocketAddr = format!("127.0.0.1:{}", free_tcp_port()).parse().unwrap();
-    let dir = tempfile::tempdir().expect("temp data dir");
-    let child = mqttd()
-        .env("MQTTD_NODE_ID", "wildcard-node")
-        .env("MQTTD_PLAINTEXT_BIND", client.to_string())
-        .env("MQTTD_HEALTH_BIND", format!("0.0.0.0:{port}"))
-        .env("MQTTD_SWIM_BIND", format!("127.0.0.1:{}", free_tcp_port()))
-        .env("MQTTD_PEER_BIND", format!("127.0.0.1:{}", free_tcp_port()))
-        .env("MQTTD_ALLOW_ANONYMOUS", "1")
-        .env("MQTTD_READY_MIN_MEMBERS", "1")
-        .env("MQTTD_DATA_DIR", dir.path())
-        .env("RUST_LOG", "off")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn mqttd");
+    // Waiting for the broker's own bind line matters doubly here: a stranger on
+    // 127.0.0.1:{port} would answer the probe and pass this test while our broker sat
+    // exiting with EADDRINUSE.
+    let (child, (port, _dir)) = listen_wait::spawn_listening(|| {
+        let port = free_tcp_port();
+        let client: SocketAddr = format!("127.0.0.1:{}", free_tcp_port()).parse().unwrap();
+        let health: SocketAddr = format!("0.0.0.0:{port}").parse().unwrap();
+        let dir = tempfile::tempdir().expect("temp data dir");
+        let mut cmd = mqttd();
+        cmd.env("MQTTD_NODE_ID", "wildcard-node")
+            .env("MQTTD_PLAINTEXT_BIND", client.to_string())
+            .env("MQTTD_HEALTH_BIND", health.to_string())
+            .env("MQTTD_SWIM_BIND", format!("127.0.0.1:{}", free_tcp_port()))
+            .env("MQTTD_PEER_BIND", format!("127.0.0.1:{}", free_tcp_port()))
+            .env("MQTTD_ALLOW_ANONYMOUS", "1")
+            .env("MQTTD_READY_MIN_MEMBERS", "1")
+            .env("MQTTD_DATA_DIR", dir.path())
+            .stderr(Stdio::null());
+        (cmd, vec![client, health], (port, dir))
+    })
+    .await;
     let _broker = Broker(child);
 
     // The probe reads MQTTD_HEALTH_BIND from its own environment — exactly the situation

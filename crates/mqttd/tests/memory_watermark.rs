@@ -16,6 +16,7 @@
 #![cfg(target_os = "linux")]
 
 mod common;
+mod listen_wait;
 mod proc_common;
 
 use std::net::SocketAddr;
@@ -60,42 +61,32 @@ async fn start_broker_with(
     memory_max: Option<u64>,
     extra_env: &[(&str, &str)],
 ) -> (Broker, SocketAddr, SocketAddr, tempfile::TempDir) {
-    let client: SocketAddr = format!("127.0.0.1:{}", free_tcp_port()).parse().unwrap();
-    let health: SocketAddr = format!("127.0.0.1:{}", free_tcp_port()).parse().unwrap();
-    let dir = tempfile::tempdir().expect("temp data dir");
-
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_mqttd"));
-    for (k, _) in std::env::vars() {
-        if k.starts_with("MQTTD_") {
-            cmd.env_remove(k);
+    let (child, (client, health, dir)) = listen_wait::spawn_listening(|| {
+        let client: SocketAddr = format!("127.0.0.1:{}", free_tcp_port()).parse().unwrap();
+        let health: SocketAddr = format!("127.0.0.1:{}", free_tcp_port()).parse().unwrap();
+        let dir = tempfile::tempdir().expect("temp data dir");
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_mqttd"));
+        for (k, _) in std::env::vars() {
+            if k.starts_with("MQTTD_") {
+                cmd.env_remove(k);
+            }
         }
-    }
-    cmd.env("MQTTD_NODE_ID", "mem-node")
-        .env("MQTTD_PLAINTEXT_BIND", client.to_string())
-        .env("MQTTD_HEALTH_BIND", health.to_string())
-        .env("MQTTD_ALLOW_ANONYMOUS", "1")
-        .env("MQTTD_DATA_DIR", dir.path())
-        .env("RUST_LOG", "off");
-    if let Some(max) = memory_max {
-        cmd.env("MQTTD_MEMORY_MAX_BYTES", max.to_string());
-    }
-    for (k, v) in extra_env {
-        cmd.env(k, v);
-    }
-    let child = cmd
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn mqttd");
-    let broker = Broker(child);
-
-    for _ in 0..300 {
-        if TcpStream::connect(client).await.is_ok() {
-            return (broker, client, health, dir);
+        cmd.env("MQTTD_NODE_ID", "mem-node")
+            .env("MQTTD_PLAINTEXT_BIND", client.to_string())
+            .env("MQTTD_HEALTH_BIND", health.to_string())
+            .env("MQTTD_ALLOW_ANONYMOUS", "1")
+            .env("MQTTD_DATA_DIR", dir.path())
+            .stderr(Stdio::null());
+        if let Some(max) = memory_max {
+            cmd.env("MQTTD_MEMORY_MAX_BYTES", max.to_string());
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    panic!("mqttd never listened on {client}");
+        for (k, v) in extra_env {
+            cmd.env(k, v);
+        }
+        (cmd, vec![client, health], (client, health, dir))
+    })
+    .await;
+    (Broker(child), client, health, dir)
 }
 
 /// Scrape `/metrics` and return the body.

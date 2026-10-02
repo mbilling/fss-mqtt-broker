@@ -27,6 +27,7 @@
 //! `stat`s is the only thing this test perturbs.
 
 mod common;
+mod listen_wait;
 mod proc_common;
 
 use std::net::SocketAddr;
@@ -67,38 +68,28 @@ impl Drop for Broker {
 
 /// Boot the real binary with a disk watermark and an explicit poll cadence.
 async fn start_broker(poll_secs: &str) -> (Broker, SocketAddr, tempfile::TempDir) {
-    let client: SocketAddr = format!("127.0.0.1:{}", free_tcp_port()).parse().unwrap();
-    let health: SocketAddr = format!("127.0.0.1:{}", free_tcp_port()).parse().unwrap();
-    let dir = tempfile::tempdir().expect("temp data dir");
-
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_mqttd"));
-    for (k, _) in std::env::vars() {
-        if k.starts_with("MQTTD_") {
-            cmd.env_remove(k);
+    let (child, (health, dir)) = listen_wait::spawn_listening(|| {
+        let client: SocketAddr = format!("127.0.0.1:{}", free_tcp_port()).parse().unwrap();
+        let health: SocketAddr = format!("127.0.0.1:{}", free_tcp_port()).parse().unwrap();
+        let dir = tempfile::tempdir().expect("temp data dir");
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_mqttd"));
+        for (k, _) in std::env::vars() {
+            if k.starts_with("MQTTD_") {
+                cmd.env_remove(k);
+            }
         }
-    }
-    cmd.env("MQTTD_NODE_ID", "disk-poll-node")
-        .env("MQTTD_PLAINTEXT_BIND", client.to_string())
-        .env("MQTTD_HEALTH_BIND", health.to_string())
-        .env("MQTTD_ALLOW_ANONYMOUS", "1")
-        .env("MQTTD_DATA_DIR", dir.path())
-        .env("MQTTD_STORE_MAX_BYTES", MARK_BYTES.to_string())
-        .env("MQTTD_WATERMARK_POLL", poll_secs)
-        .env("RUST_LOG", "off");
-    let child = cmd
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn mqttd");
-    let broker = Broker(child);
-
-    for _ in 0..300 {
-        if TcpStream::connect(client).await.is_ok() {
-            return (broker, health, dir);
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    panic!("mqttd never listened on {client}");
+        cmd.env("MQTTD_NODE_ID", "disk-poll-node")
+            .env("MQTTD_PLAINTEXT_BIND", client.to_string())
+            .env("MQTTD_HEALTH_BIND", health.to_string())
+            .env("MQTTD_ALLOW_ANONYMOUS", "1")
+            .env("MQTTD_DATA_DIR", dir.path())
+            .env("MQTTD_STORE_MAX_BYTES", MARK_BYTES.to_string())
+            .env("MQTTD_WATERMARK_POLL", poll_secs)
+            .stderr(Stdio::null());
+        (cmd, vec![client, health], (health, dir))
+    })
+    .await;
+    (Broker(child), health, dir)
 }
 
 /// The brownout/size lines alone — what a failure needs to show.

@@ -1602,8 +1602,10 @@ fn authorizer_from_config(
     config: &Config,
 ) -> Result<Arc<dyn Authorizer>, Box<dyn std::error::Error>> {
     if let Some(path) = &config.security.acl_file {
-        tls_path_readable("MQTTD_ACL_FILE", path)?;
-        let text = std::fs::read_to_string(path)?;
+        // One open: a probe then a read is two, and the second can wait forever on a
+        // FIFO whose writer has gone (see the password file).
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| format!("cannot read MQTTD_ACL_FILE ({path}): {e}"))?;
         let policy = mqtt_auth::acl::AclPolicy::from_toml_str(&text)?;
         info!(%path, "topic ACL policy loaded (deny by default)");
         Ok(Arc::new(policy))
@@ -1727,8 +1729,11 @@ fn authenticator_from_config(
         vec![Arc::new(BasicAuthenticator { allow_anonymous })];
 
     if let Some(path) = &config.security.password_file {
-        tls_path_readable("MQTTD_PASSWORD_FILE", path)?;
-        let text = std::fs::read_to_string(path)?;
+        // One open, not a readability probe followed by a read: the file may be a FIFO a
+        // secret agent writes once, and a second open after the writer has gone waits for a
+        // writer forever, leaving startup held at credential loading.
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| format!("cannot read MQTTD_PASSWORD_FILE ({path}): {e}"))?;
         let pw = mqtt_auth::password::PasswordAuthenticator::from_file_contents(&text)?;
         info!(%path, "Argon2id password file loaded");
         members.push(Arc::new(pw));
@@ -3138,12 +3143,14 @@ fn swim_auth_from_config(
         match (&config.cluster.swim.key, &config.cluster.swim.key_file) {
             (Some(hex), _) => Some(hex.clone()),
             (None, Some(path)) => {
-                // Named-variable readability check, same reason as `tls_path_readable`:
-                // a bare `Os { code: 2 }` here is indistinguishable from an unreadable
-                // password or ACL file, and the operator was just told to edit three
-                // secrets-by-path lines (issue #254 round 3).
-                tls_path_readable("MQTTD_SWIM_KEY_FILE", path)?;
-                Some(String::from_utf8_lossy(&mqtt_core::read_secret_file(path)?).to_string())
+                // The error names the variable, same reason as `tls_path_readable`: a bare
+                // `Os { code: 2 }` here is indistinguishable from an unreadable password or
+                // ACL file, and the operator was just told to edit three secrets-by-path
+                // lines (issue #254 round 3). One open: a probe then a read would open a
+                // FIFO twice, and the second open can wait forever.
+                let key = mqtt_core::read_secret_file(path)
+                    .map_err(|e| format!("cannot read MQTTD_SWIM_KEY_FILE ({path}): {e}"))?;
+                Some(String::from_utf8_lossy(&key).to_string())
             }
             (None, None) => None,
         };
