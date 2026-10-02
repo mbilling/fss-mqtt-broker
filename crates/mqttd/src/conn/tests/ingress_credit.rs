@@ -474,3 +474,37 @@ async fn keepalive_is_not_enforced_while_the_broker_pauses_the_connection() {
         "keepalive applies again once the broker reads"
     );
 }
+
+/// ADR 0082 T1: the charge is for what the hub will hold. An alias-only PUBLISH pays for
+/// the topic its alias stands for, not its empty wire topic, and its properties are
+/// charged with the payload: a small payload with large user properties is not cheap.
+#[test]
+fn an_alias_only_publish_pays_for_its_topic_and_its_properties() {
+    use crate::aliases::InboundAliases;
+    use crate::conn::{admit, IngressAdmit};
+    let node = Arc::new(IngressCredit::new(1 << 20, 1 << 20, OverloadMode::Pause));
+    let conn = node.connection();
+    let mut aliases = InboundAliases::new(8);
+    aliases.resolve(TOPIC, Some(1)).unwrap();
+    let properties = Properties(vec![
+        mqtt_codec::Property::TopicAlias(1),
+        mqtt_codec::Property::UserProperty("k".into(), "v".repeat(4_000)),
+    ]);
+    let publish = Publish {
+        properties,
+        dup: false,
+        qos: QoS::AtMostOnce,
+        retain: false,
+        topic: String::new(),
+        pkid: None,
+        payload: Bytes::from(vec![0u8; PAYLOAD]),
+    };
+    let Ok(IngressAdmit::Credit(Some(_permit))) = admit(&conn, &publish, &aliases) else {
+        panic!("credit is free, so the publish is admitted at once");
+    };
+    assert_eq!(
+        node.in_use(),
+        COST + 4_001,
+        "resolved topic and properties charged"
+    );
+}

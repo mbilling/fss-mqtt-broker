@@ -662,7 +662,7 @@ fn peer_credit(
     qos: mqtt_codec::QoS,
     retain: bool,
     topic_len: usize,
-    payload_len: usize,
+    body_len: usize,
 ) -> Result<Option<IngressPermit>, ()> {
     let Some(ingress) = ingress else {
         return Ok(None);
@@ -670,7 +670,7 @@ fn peer_credit(
     if qos != mqtt_codec::QoS::AtMostOnce || retain {
         return Ok(None);
     }
-    let permit = ingress.try_acquire_pool(ingress.cost(topic_len, payload_len));
+    let permit = ingress.try_acquire_pool(ingress.cost(topic_len, body_len));
     if permit.is_none() {
         ingress.note_peer_shed();
         return Err(());
@@ -772,7 +772,9 @@ fn forward_inbound(
             app,
         } => {
             let qos = mqtt_codec::QoS::from_u8(qos).unwrap_or(mqtt_codec::QoS::AtMostOnce);
-            let Ok(credit) = peer_credit(ingress, qos, retain, topic.len(), payload.len()) else {
+            let app = crate::hub::app_from_wire(app);
+            let body = payload.len() + app.accounted_bytes();
+            let Ok(credit) = peer_credit(ingress, qos, retain, topic.len(), body) else {
                 return;
             };
             let _ = hub.send(HubCommand::RemotePublish {
@@ -781,7 +783,7 @@ fn forward_inbound(
                 qos,
                 retain,
                 message_expiry,
-                app: crate::hub::app_from_wire(app),
+                app,
                 credit,
             });
         }
@@ -899,7 +901,9 @@ fn forward_inbound(
             app,
         } => {
             let qos = mqtt_codec::QoS::from_u8(qos).unwrap_or(mqtt_codec::QoS::AtMostOnce);
-            let Ok(credit) = peer_credit(ingress, qos, false, topic.len(), payload.len()) else {
+            let app = crate::hub::app_from_wire(app);
+            let body = payload.len() + app.accounted_bytes();
+            let Ok(credit) = peer_credit(ingress, qos, false, topic.len(), body) else {
                 return;
             };
             let _ = hub.send(HubCommand::RemoteSharedDeliver {
@@ -908,7 +912,7 @@ fn forward_inbound(
                 payload: payload.into(),
                 qos,
                 message_expiry,
-                app: crate::hub::app_from_wire(app),
+                app,
                 credit,
             });
         }
@@ -1221,7 +1225,8 @@ mod tests {
         let (bulk, _bulk_rx) = mpsc::unbounded_channel::<PeerMessage>();
         let (ctl, bulk) = (ctl.downgrade(), bulk.downgrade());
         let remote = NodeId("n2".into());
-        let credit = IngressCredit::new(4_096, 1_024, OverloadMode::Pause);
+        let unit = 1 + 200 + crate::ingress::COMMAND_OVERHEAD; // topic + payload + overhead
+        let credit = IngressCredit::new(4 * unit, 2 * unit, OverloadMode::Pause);
         let forward = |msg| forward_inbound(msg, &hub, &remote, None, Some(&credit), &ctl, &bulk);
 
         // With credit: the permit rides inside the command until the hub drops it.
@@ -1234,12 +1239,14 @@ mod tests {
                 ..
             }
         ));
-        assert_eq!(credit.in_use(), 1_001, "topic + payload + overhead");
+        assert_eq!(credit.in_use(), unit, "topic + payload + overhead");
         drop(cmd);
         assert_eq!(credit.in_use(), 0, "dispatching returns the credit");
 
         // The pool exhausted: QoS 0 is shed, and counted.
-        let full = credit.try_acquire_pool(4_096).unwrap();
+        let full = credit
+            .try_acquire_pool(u32::try_from(4 * unit).unwrap())
+            .unwrap();
         forward(publish(0, false));
         forward(shared(0));
         assert!(rx.try_recv().is_err(), "nothing queued for the hub");

@@ -2864,6 +2864,15 @@ impl Hub {
         false
     }
 
+    /// Give back lane memory an overload left behind (ADR 0082 T1). A `VecDeque` never
+    /// shrinks on its own, so a lane that once held the pool's worth of commands (about
+    /// 200k at the default pool, two 408-byte slots each at worst) would keep that
+    /// memory for the life of the process. Run from the once-a-second sweep.
+    fn shrink_idle_lanes(&mut self) {
+        shrink_idle_lane(&mut self.control_q);
+        shrink_idle_lane(&mut self.data_q);
+    }
+
     /// Put one command in its lane (ADR 0082 T2).
     fn enqueue(&mut self, cmd: HubCommand) {
         match cmd.lane() {
@@ -2890,6 +2899,7 @@ impl Hub {
         self.sweep_expired_sessions().await;
         self.submit_pending_qos2_cleanup();
         self.refresh_gauges().await;
+        self.shrink_idle_lanes();
         self.refresh_ownership_domain();
         self.refresh_replication_capable();
         // Retransmit an unanswered retained handoff (T8 — same seq, the
@@ -7080,6 +7090,19 @@ pub(crate) fn app_to_wire(a: &AppProperties) -> mqtt_cluster::peer::WireAppProps
 }
 
 /// Convert cross-node wire application properties back to the in-memory form.
+/// The lane capacity a sweep never shrinks below: a lane this small costs little, and
+/// keeping it spares the steady state any reallocation.
+const LANE_RETAIN: usize = 1024;
+
+/// Shrink `lane` once it is three-quarters empty, to twice what it holds (never below
+/// [`LANE_RETAIN`]). The slack keeps a lane that refills from shrinking and regrowing
+/// every sweep.
+fn shrink_idle_lane<T>(lane: &mut std::collections::VecDeque<T>) {
+    if lane.capacity() > LANE_RETAIN && lane.len() <= lane.capacity() / 4 {
+        lane.shrink_to((lane.len() * 2).max(LANE_RETAIN));
+    }
+}
+
 pub(crate) fn app_from_wire(w: mqtt_cluster::peer::WireAppProps) -> AppProperties {
     AppProperties {
         payload_format: w.payload_format,
@@ -8260,6 +8283,35 @@ mod tests {
         let out = metrics.render();
         assert!(out.contains("mqttd_sessions 1"), "{out}");
         assert!(out.contains("mqttd_subscriptions 2"), "{out}");
+    }
+
+    /// ADR 0082 T1: a lane an overload grew gives its memory back once it drains, and
+    /// a lane still busy, or already small, is left alone.
+    #[test]
+    fn an_idle_lane_gives_back_what_an_overload_grew() {
+        let mut lane: std::collections::VecDeque<u64> = (0..200_000).collect();
+        let grown = lane.capacity();
+        super::shrink_idle_lane(&mut lane);
+        assert_eq!(lane.capacity(), grown, "a full lane is not shrunk");
+        lane.drain(..140_000);
+        super::shrink_idle_lane(&mut lane);
+        assert_eq!(lane.capacity(), grown, "a lane over a quarter full is kept");
+        lane.drain(..59_000);
+        super::shrink_idle_lane(&mut lane);
+        assert!(
+            lane.capacity() < grown / 8 && lane.capacity() >= 2_000,
+            "a drained lane shrinks to twice what it holds: {}",
+            lane.capacity()
+        );
+        lane.clear();
+        super::shrink_idle_lane(&mut lane);
+        assert!(
+            lane.capacity() >= super::LANE_RETAIN,
+            "never below the floor"
+        );
+        let floor = lane.capacity();
+        super::shrink_idle_lane(&mut lane);
+        assert_eq!(lane.capacity(), floor, "the floor is stable");
     }
 
     /// ADR 0082 T4: peer readers count what they shed on the shared credit, and the

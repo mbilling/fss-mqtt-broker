@@ -32,6 +32,18 @@ impl InboundAliases {
         }
     }
 
+    /// The length of the topic `(topic, alias)` resolves to, without resolving it: for
+    /// charging ingress credit before the PUBLISH is processed (ADR 0082 T1). An
+    /// alias-only reference reports the mapped topic's length; an unknown alias, which
+    /// [`resolve`](Self::resolve) will refuse, reports 0.
+    #[must_use]
+    pub fn resolved_len(&self, topic: &str, alias: Option<u16>) -> usize {
+        match alias {
+            Some(alias) if topic.is_empty() => self.map.get(&alias).map_or(0, String::len),
+            _ => topic.len(),
+        }
+    }
+
     /// Resolve a PUBLISH's `(topic, alias)` to the effective full topic name,
     /// updating the map when the PUBLISH establishes a mapping.
     ///

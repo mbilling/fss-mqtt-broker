@@ -30,11 +30,19 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-/// What one queued publish costs beyond its topic and payload (ADR 0082 T1): the
-/// command, its channel slot and the allocations around it. The #504 cloud re-run
-/// measured about 1,019 bytes per queued command at 200-byte payloads (2,553,413
-/// commands at 2.60 GB RSS), so about 800 beyond the payload.
-pub const COMMAND_OVERHEAD: usize = 800;
+/// What one queued publish costs beyond its topic, payload and properties (ADR 0082
+/// T1), measured by `tests/ingress_cost.rs` under the release allocator.
+///
+/// Under overload the hub holds its backlog in a lane, a `VecDeque<HubCommand>` whose
+/// capacity doubles. Just past a doubling, half its slots are empty, so a queued
+/// command can cost **two** slots. The rest covers the topic's own allocation, the
+/// frame's share of the connection's read buffer (the payload is a zero-copy slice of
+/// it) and allocator rounding. Derived from the slot size, so the charge follows the
+/// command if it grows.
+///
+/// Measured 2026-10-02 (408-byte slot): 455-601 B beyond topic and payload while
+/// queued on the channel, 882-1,076 B in a lane at its worst point.
+pub const COMMAND_OVERHEAD: usize = 2 * std::mem::size_of::<crate::hub::HubCommand>() + 384;
 
 /// The pool when neither it nor a memory watermark is configured (ADR 0082 §5).
 pub const DEFAULT_POOL_BYTES: usize = 256 * 1024 * 1024;
@@ -151,7 +159,9 @@ impl IngressCredit {
     }
 
     /// What a publish of `topic_len` and `payload_len` bytes costs, clamped to the
-    /// per-connection cap so even the largest message can eventually proceed.
+    /// per-connection cap so even the largest message can eventually proceed. The
+    /// payload length includes the publish's properties (their `accounted_bytes`):
+    /// they are publisher-controlled and held as long as the payload.
     #[must_use]
     pub fn cost(&self, topic_len: usize, payload_len: usize) -> u32 {
         let c = topic_len
@@ -246,26 +256,27 @@ mod tests {
 
     #[test]
     fn credit_is_returned_when_the_permit_drops_and_the_cap_bounds_one_connection() {
-        let node = Arc::new(IngressCredit::new(10_000, 4_000, OverloadMode::Pause));
+        let unit = 200 + COMMAND_OVERHEAD; // one 4-byte-topic, 196-byte-payload publish
+        let node = Arc::new(IngressCredit::new(10 * unit, 4 * unit, OverloadMode::Pause));
         let a = node.connection();
         let b = node.connection();
-        let cost = node.cost(4, 196); // 1,000 bytes
-        assert_eq!(cost, 1_000);
+        let cost = node.cost(4, 196);
+        assert_eq!(cost as usize, unit);
         let held: Vec<_> = (0..4).map(|_| a.try_acquire(cost).unwrap()).collect();
-        assert!(a.try_acquire(cost).is_none(), "a's cap is 4,000");
-        assert_eq!(node.in_use(), 4_000);
+        assert!(a.try_acquire(cost).is_none(), "a's cap is four publishes");
+        assert_eq!(node.in_use(), 4 * unit);
         let b_held: Vec<_> = (0..4).map(|_| b.try_acquire(cost).unwrap()).collect();
-        assert_eq!(node.in_use(), 8_000);
+        assert_eq!(node.in_use(), 8 * unit);
         drop(held);
         assert_eq!(
             node.in_use(),
-            4_000,
+            4 * unit,
             "dropping the permits returns the bytes"
         );
         assert!(a.try_acquire(cost).is_some());
         drop(b_held);
         // A message larger than the cap is clamped to it, so it can still proceed.
-        assert_eq!(node.cost(10, 1 << 20), 4_000);
+        assert_eq!(node.cost(10, 1 << 20) as usize, 4 * unit);
     }
 
     #[test]
