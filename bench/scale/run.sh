@@ -392,6 +392,26 @@ for N in "${SIZES[@]}"; do
 	# `cloud-init clean` re-runs everything against settled metadata, so each
 	# host gets exactly one such retry before the run gives up.
 	CI_OK='cloud-init status --wait >/dev/null 2>&1; rc=$?; [ $rc -eq 0 ] || [ $rc -eq 2 ]'
+	# cloud_init_rc <ip>: cloud-init's verdict on <ip>, as CI_OK's exit status (0 =
+	# done). `cloud-init status --wait` can run for minutes on a booting host, and the
+	# ssh session carrying it drops when the host goes quiet past the keepalive budget
+	# (10s) — the network is being reconfigured mid-boot. ssh exits 255 for that; it is
+	# a lost connection, not a cloud-init verdict, so reconnect and ask again, for up to
+	# 10 minutes. Any other non-zero is cloud-init's own answer. Measured on 2026-10-02:
+	# a broker dropped the session ("server not responding"), the run died, and its
+	# cloud-init then finished cleanly 200 s after boot. Both checks below go through
+	# here: on the FIRST boot (the slow one) a dropped session used to be read as
+	# "cloud-init errored" and cost the host a needless clean+reboot.
+	cloud_init_rc() {
+		local deadline=$((SECONDS + 600)) rc
+		while :; do
+			rc=0
+			rssh "$1" "$CI_OK" || rc=$?
+			[ "$rc" -eq 255 ] && [ "$SECONDS" -lt "$deadline" ] || return "$rc"
+			warn "ssh to $1 dropped while cloud-init was finishing — reconnecting"
+			sleep 5
+		done
+	}
 	# True once <ip> presents a kernel boot id that is non-empty and differs
 	# from <old> — i.e. the machine has verifiably completed its reboot. Probes
 	# use a THROWAWAY known_hosts: a poll that lands in the pre-reboot window
@@ -405,8 +425,10 @@ for N in "${SIZES[@]}"; do
 	for pair in $(jq -r '(.brokers[], .drivers[]) | "\(.public_ip)=\(.private_ip)"' "$INVENTORY"); do
 		ip="${pair%%=*}" priv="${pair##*=}"
 		wait_for "ssh on $ip" 300 rssh "$ip" "true"
-		if ! rssh "$ip" "$CI_OK"; then
-			warn "cloud-init errored on $ip — one clean+reboot retry (private-net attach race)"
+		ci_rc=0
+		cloud_init_rc "$ip" || ci_rc=$?
+		if [ "$ci_rc" -ne 0 ]; then
+			warn "cloud-init errored on $ip (exit $ci_rc) — one clean+reboot retry (private-net attach race)"
 			OLD_BOOT=$(rssh "$ip" "cat /proc/sys/kernel/random/boot_id" 2>/dev/null || echo unknown)
 			rssh "$ip" "cloud-init clean --logs; reboot" || true
 			# cloud-init clean makes the next boot regenerate SSH HOST KEYS; drop
@@ -419,21 +441,8 @@ for N in "${SIZES[@]}"; do
 			# Drop whatever key a pre-reboot poll may have re-recorded; the next
 			# rssh accepts the NEW boot's key fresh.
 			ssh-keygen -R "$ip" -f "$RUN/known_hosts" >/dev/null 2>&1 || true
-			# `cloud-init status --wait` can run for minutes on a booting host, and the
-			# ssh session carrying it drops when the host goes quiet past the keepalive
-			# budget (10s) — the network is being reconfigured mid-boot. ssh exits 255
-			# for that; it is a lost connection, not a cloud-init verdict, so reconnect
-			# and ask again. Any other non-zero is cloud-init's own answer. Measured on
-			# 2026-10-02: a broker dropped the session ("server not responding"), the
-			# run died, and its cloud-init then finished cleanly 200 s after boot.
-			ci_deadline=$((SECONDS + 600))
-			while :; do
-				ci_rc=0
-				rssh "$ip" "$CI_OK" || ci_rc=$?
-				[ "$ci_rc" -eq 255 ] && [ "$SECONDS" -lt "$ci_deadline" ] || break
-				warn "ssh to $ip dropped while cloud-init was finishing — reconnecting"
-				sleep 5
-			done
+			ci_rc=0
+			cloud_init_rc "$ip" || ci_rc=$?
 			[ "$ci_rc" -eq 0 ] ||
 				die "cloud-init failed on $ip even after a clean reboot (exit $ci_rc) — check /var/log/cloud-init-output.log there"
 		fi
