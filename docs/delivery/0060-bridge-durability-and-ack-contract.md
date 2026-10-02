@@ -40,8 +40,9 @@ tasks:
     evidence: "crates/mqtt-bridge/benches/hotpaths.rs (criterion, mirroring mqtt-cluster/benches/durable_hotpaths.rs): plan_forwards match/miss, set_hop_count at 0 and 4 user properties, owns (partitioned HA), and in-memory spool push below-cap / at-cap under BOTH overflow policies. Numbers recorded in docs/benchmarks/BASELINE.md under a Bridge section, explicitly labelled as dev-machine (not the Xeon reference) so they are not compared across sections. Wired into the nightly bench job. Two findings fell out: partitioned-HA ownership is sub-nanosecond (the ADR 0059 default costs nothing per message), and Refuse is ~24x cheaper than DropOldest at the cap (~9ns vs ~214ns) — the safer default is also the faster one. NOTE: this is the CPU-side baseline; the fast-path THROUGHPUT claim in ADR 0060 §5 is network-bound and belongs to the macro harness (bench/, ADR 0048) when T8 lands."
   - id: 0060-T8
     title: "Fast path waits for the downstream PUBACK: correlate the destination's pkid back to the source obligation, closing the dispatch->ack window (ADR 0060 §5.1-5.2)"
-    status: planned
+    status: deferred
     issue: 552
+    notes: "Deferred 2026-10-02: issue #552 closed; was planned."
 ---
 
 # Delivery — ADR 0060
@@ -59,7 +60,7 @@ tasks:
 | 0060-T5 | ✅ done | — | 2026-08-11 | "spool.rs push: when dropping the oldest at the cap, decode it and emit a bridge::audit event (topic, reason=spool-full) — a lost auditable-crossing message now leaves a trail, not just a counter." |
 | 0060-T6 | ✅ done | — | 2026-08-12 | "ADR 0025 §7 gains an 'As delivered' block, inline where a reader of the store-and-forward section will see it (not only in a later amendment note): acknowledge only after durable acceptance (with the T8 fast-path residual named), refuse-don't-shed at the cap and why, never silently non-durable, and losses audited. Records that §7 originally left the ack TIMING unspecified, which is what made its at-least-once promise untrue in the implementation." |
 | 0060-T7 | ✅ done | — | 2026-08-12 | "crates/mqtt-bridge/benches/hotpaths.rs (criterion, mirroring mqtt-cluster/benches/durable_hotpaths.rs): plan_forwards match/miss, set_hop_count at 0 and 4 user properties, owns (partitioned HA), and in-memory spool push below-cap / at-cap under BOTH overflow policies. Numbers recorded in docs/benchmarks/BASELINE.md under a Bridge section, explicitly labelled as dev-machine (not the Xeon reference) so they are not compared across sections. Wired into the nightly bench job. Two findings fell out: partitioned-HA ownership is sub-nanosecond (the ADR 0059 default costs nothing per message), and Refuse is ~24x cheaper than DropOldest at the cap (~9ns vs ~214ns) — the safer default is also the faster one. NOTE: this is the CPU-side baseline; the fast-path THROUGHPUT claim in ADR 0060 §5 is network-bound and belongs to the macro harness (bench/, ADR 0048) when T8 lands." |
-| 0060-T8 | ⬜ planned | [#552](https://github.com/mbilling/fss-mqtt-broker/issues/552) | — |  |
+| 0060-T8 | 💤 deferred | [#552](https://github.com/mbilling/fss-mqtt-broker/issues/552) | — | "Deferred 2026-10-02: issue #552 closed; was planned." |
 <!-- /status-table:0060 -->
 
 Closes the durability/ack half of the bridge audit (epic #186, finding #5, issue #188). The
@@ -85,3 +86,4 @@ trade is latency per `QoS`≥1 message, not throughput.
 **T7 exists because that is a performance claim about a hot path.** It lands with a bridge
 throughput/latency benchmark and a regression floor in `bench/` (ADR 0048), measured before and
 after T8 — this project's standard is evidence, not assertion.
+- 2026-10-02: 0060-T8 deferred: their issues (#552) were closed without the work shipping.
