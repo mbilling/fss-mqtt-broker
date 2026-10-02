@@ -33,9 +33,10 @@ tasks:
     notes: "Also MQTTD_INGRESS_OVERLOAD ([limits] ingress_overload) in mqtt-config and the docs, with the pause versus shed-qos0 trade-off stated. Defaults accepted 2026-10-02: the pool is 1/8 of MQTTD_MEMORY_MAX_BYTES or 256 MiB; 1 MiB per connection. The three settings, CONFIGURATION.md, SIZING.md and the example TOML land with T3 (#816); OPERATIONS.md (runbook, alerts on ingress_credit_bytes and ingress_paused_seconds) remains."
   - id: 0082-T6
     title: "Acceptance: the #504 cloud shape at 1.5-2x overload holds RSS bounded and recovers without a restart"
-    status: planned
+    status: done
     issue: 819
-    notes: "Closes #504 and #535 when it passes."
+    date: 2026-10-02
+    evidence: "Passed 2026-10-02 on bench-candidate-a3a71da (T2+T3 defaults: pause, 256 MiB pool, 1 MiB/conn), 3xCCX23 + 12xCCX33. 3-node arm: overload at 18 and 24 sites; every scrape answered; hub queue held at about 263k commands = the pool; RSS 0.47-0.91 GB (was 10.7 GB frozen); the 6-site control matched its baseline exactly (180,000 msg/s, p99 <=5 ms, GREEN) after the reset gate (1 conn, 0 sessions). 1-node arm: 2-4x overload with 0 dropped under pause; control 89,977 vs baseline 89,983, p99 <=500 ms. Run exited 0, teardown audited clean. Evidence: the #504 comment; follow-up #825 (slow reaping of credit-paused connections)."
 ---
 
 # Delivery: ADR 0082 — bounded hub ingress
@@ -51,7 +52,7 @@ status lives in the frontmatter above. The table below is generated from it.
 | 0082-T3 | ✅ done | [#816](https://github.com/mbilling/fss-mqtt-broker/issues/816) | 2026-10-02 | "PR #823. Node pool plus a 1 MiB cap per connection; the permit rides in HubCommand::Publish and is dropped by the hub after dispatch. A connection without credit parks the publish with its socket unread; keepalive is disarmed while parked. MQTTD_INGRESS_OVERLOAD=pause|shed-qos0. Against a stalled hub, 8 publishers held the queue at 65 commands (the 64 KiB pool) under both settings: QoS 1 2,400/2,400 dispatched and acked; shed-qos0 QoS 0 65 dispatched + 15,935 shed = 16,000 sent. Without credit: 2,056 (QoS 1) and 16,000 (QoS 0). Real hub under a full pool: /livez worst ~11 ms, ping <2 ms. Mutation-proven (admit always granting; keepalive armed while parked)." |
 | 0082-T4 | ⬜ planned | [#817](https://github.com/mbilling/fss-mqtt-broker/issues/817) | — | "publish_dropped{reason=hub-ingress}. Remote QoS >= 1 is uncharged (the origin's pending table bounds it). Control and durable frames are never charged." |
 | 0082-T5 | ⬜ planned | [#818](https://github.com/mbilling/fss-mqtt-broker/issues/818) | — | "Also MQTTD_INGRESS_OVERLOAD ([limits] ingress_overload) in mqtt-config and the docs, with the pause versus shed-qos0 trade-off stated. Defaults accepted 2026-10-02: the pool is 1/8 of MQTTD_MEMORY_MAX_BYTES or 256 MiB; 1 MiB per connection. The three settings, CONFIGURATION.md, SIZING.md and the example TOML land with T3 (#816); OPERATIONS.md (runbook, alerts on ingress_credit_bytes and ingress_paused_seconds) remains." |
-| 0082-T6 | ⬜ planned | [#819](https://github.com/mbilling/fss-mqtt-broker/issues/819) | — | "Closes #504 and #535 when it passes." |
+| 0082-T6 | ✅ done | [#819](https://github.com/mbilling/fss-mqtt-broker/issues/819) | 2026-10-02 | "Passed 2026-10-02 on bench-candidate-a3a71da (T2+T3 defaults: pause, 256 MiB pool, 1 MiB/conn), 3xCCX23 + 12xCCX33. 3-node arm: overload at 18 and 24 sites; every scrape answered; hub queue held at about 263k commands = the pool; RSS 0.47-0.91 GB (was 10.7 GB frozen); the 6-site control matched its baseline exactly (180,000 msg/s, p99 <=5 ms, GREEN) after the reset gate (1 conn, 0 sessions). 1-node arm: 2-4x overload with 0 dropped under pause; control 89,977 vs baseline 89,983, p99 <=500 ms. Run exited 0, teardown audited clean. Evidence: the #504 comment; follow-up #825 (slow reaping of credit-paused connections)." |
 <!-- /status-table:0082 -->
 
 ## Sequencing
@@ -75,3 +76,6 @@ status lives in the frontmatter above. The table below is generated from it.
 - 2026-10-02: T2 delivered (PR #821 merged): the control lane.
 - 2026-10-02: T3 delivered (PR #823 merged): client ingress credit, with the overload knob
   and T5's three settings, CONFIGURATION.md and SIZING.md.
+- 2026-10-02: T6 passed: the #504 cloud acceptance on both arms (RSS bounded, every scrape
+  answered, control rungs matched their baselines without a restart). #504, #535 and #819 are
+  closed; follow-up #825 tracks slow reaping of credit-paused connections.
