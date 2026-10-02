@@ -1,14 +1,16 @@
 # syntax=docker/dockerfile:1
 # Build the mqttd broker binary, then ship it on a slim runtime. Build context is the
 # repo root (see docker-compose.yml `build.context: ..`).
-FROM rust:1-bookworm AS builder
+# Base images are digest-pinned (OpenSSF Pinned-Dependencies); Dependabot's docker
+# ecosystem entry for /demo proposes the digest bumps.
+FROM rust:1-bookworm@sha256:59037199c44290f2befcdd58dcc540164763fc296950255aaefeef096a1866b0 AS builder
 WORKDIR /src
 COPY . .
 # Pure-Rust TLS (rustls/ring) + OTLP-over-rustls: no OpenSSL/system crypto needed.
 # Also build the MQTT-over-QUIC demo client (ADR 0036) used by the `quic-demo` service.
 RUN cargo build --release --bin mqttd --example quic_demo
 
-FROM debian:bookworm-slim
+FROM debian:bookworm-slim@sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*

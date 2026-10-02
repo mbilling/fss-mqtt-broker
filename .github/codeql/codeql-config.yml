@@ -1,0 +1,16 @@
+# CodeQL configuration (referenced from .github/workflows/codeql.yml).
+#
+# Test, benchmark and fuzz code is excluded from analysis. Those trees are full of
+# deliberate fixtures — literal passwords, salts and keys handed to the code under
+# test — which rust/hard-coded-cryptographic-value correctly recognises as constants
+# and reports, burying any finding in shipped code. None of it is compiled into a
+# release binary.
+#
+# Not covered here: `#[cfg(test)] mod tests { ... }` blocks inline in src/ files.
+# A path filter cannot address part of a file, so alerts in those blocks are
+# dismissed individually in code scanning as "used in tests". Test submodules that
+# live in their own files under src/**/tests/ are covered by the first pattern.
+paths-ignore:
+  - "**/tests/**"
+  - "**/benches/**"
+  - "**/fuzz/**"
