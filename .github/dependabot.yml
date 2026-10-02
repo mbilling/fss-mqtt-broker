@@ -10,8 +10,6 @@
 # NOT covered here, deliberately:
 #   - deploy/ image pins — they advance with OUR release train (RELEASING.md),
 #     not with upstream; check-deploy-image-pin.sh gates them.
-#   - the Python interop tooling — no manifest exists (CI installs paho inline);
-#     if scripts/ ever grows a requirements.txt, add a pip ecosystem entry.
 # Groups carry MINOR + PATCH only. A semver-major arrives as its own PR, alone,
 # because a major is an API/behaviour change someone must actually read — the
 # first weekly sweep proved it by burying redb 2->4 (the storage engine!) and a
@@ -58,3 +56,40 @@ updates:
         patterns: ["*"]
         update-types: ["minor", "patch"]
     open-pull-requests-limit: 3
+
+  # Fuzz harnesses are separate cargo workspaces with their own lockfiles. They
+  # ship nothing, but repository-wide scanners (Scorecard's OSV check) read them,
+  # and left alone they go stale: mqtt-auth's sat at jsonwebtoken 9.3.1, inside
+  # GHSA-h395-gr6q-cpjc's range, long after the workspace moved to 11.x.
+  - package-ecosystem: cargo
+    directories:
+      - /crates/mqtt-auth/fuzz
+      - /crates/mqtt-cluster/fuzz
+      - /crates/mqtt-codec/fuzz
+    schedule:
+      interval: weekly
+      day: monday
+    groups:
+      fuzz-lockfiles:
+        patterns: ["*"]
+    open-pull-requests-limit: 2
+
+  # Digest-pinned base images of the demo stack (demo/Dockerfile*). After a bump,
+  # re-run scripts/vendor-mqttui-examples.sh (CI checks the vendored copy).
+  - package-ecosystem: docker
+    directory: /demo
+    schedule:
+      interval: weekly
+      day: monday
+    groups:
+      demo-base-images:
+        patterns: ["*"]
+    open-pull-requests-limit: 1
+
+  # The interop suite's hash-pinned Python requirements.
+  - package-ecosystem: pip
+    directory: /scripts/interop
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 1

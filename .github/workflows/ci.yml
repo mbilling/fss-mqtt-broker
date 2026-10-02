@@ -237,7 +237,7 @@ jobs:
           APT="-o Acquire::Retries=3 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 -o DPkg::Lock::Timeout=120"
           sudo apt-get $APT update && sudo apt-get $APT install -y mosquitto-clients
       - name: Install Paho
-        run: python3 -m pip install --quiet paho-mqtt
+        run: python3 -m pip install --quiet --require-hashes -r scripts/interop/requirements.txt
       - name: Build broker
         run: cargo build --quiet -p mqttd
       - name: Interop conformance (mosquitto)
