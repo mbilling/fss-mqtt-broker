@@ -1308,12 +1308,26 @@ if [ -n "${QOS1_DRIVER_ARCHIVE:-}" ]; then
     [ "$LANES" = E ] && [ "$LANE_E_QOS" = 1 ] || die "audit driver requires LANES=E and QoS 1"
     [ -f "$QOS1_DRIVER_ARCHIVE" ] || die "missing audit driver archive"
     audit_archive_sha=$(sha256sum "$QOS1_DRIVER_ARCHIVE" | cut -d' ' -f1)
-    audit_image_id=$(docker image inspect --format '{{.Id}}' fss-qos1-audit:local)
+    # The image's identity is its layer list (`.RootFS.Layers`, the diff IDs), not `.Id`:
+    # `.Id` is the config digest under the classic image store but the manifest digest
+    # under the containerd snapshotter, which Ubuntu's docker.io 29 enables. The same
+    # image then has two `.Id`s and every driver read as a mismatch. The diff IDs are
+    # content hashes of the layers and agree across both stores.
+    audit_image_layers=$(docker image inspect --format '{{json .RootFS.Layers}}' fss-qos1-audit:local)
+    audit_image_id=""
     for ((di = 0; di < D; di++)); do
         rscp "$QOS1_DRIVER_ARCHIVE" "root@$(driver_pub_ip "$di"):/tmp/qos1-driver.tar.gz"
         rssh "$(driver_pub_ip "$di")" "echo '$audit_archive_sha  /tmp/qos1-driver.tar.gz' | sha256sum -c - >/dev/null && docker load -i /tmp/qos1-driver.tar.gz >/dev/null"
-        actual_id=$(rssh "$(driver_pub_ip "$di")" "docker image inspect --format '{{.Id}}' fss-qos1-audit:local")
-        [ "$actual_id" = "$audit_image_id" ] || die "audit image mismatch on driver$di"
+        actual_layers=$(rssh "$(driver_pub_ip "$di")" "docker image inspect --format '{{json .RootFS.Layers}}' fss-qos1-audit:local")
+        [ "$actual_layers" = "$audit_image_layers" ] ||
+            die "audit image mismatch on driver$di: layers $actual_layers, expected $audit_image_layers"
+        # The ID containers will report (`docker inspect .Image`) is the DRIVER's, in the
+        # driver's image store; the per-rung provenance check compares against it. The
+        # drivers are provisioned alike, so they must agree with each other.
+        driver_id=$(rssh "$(driver_pub_ip "$di")" "docker image inspect --format '{{.Id}}' fss-qos1-audit:local")
+        [ -n "${audit_image_id:-}" ] || audit_image_id=$driver_id
+        [ "$driver_id" = "$audit_image_id" ] ||
+            die "audit image ID differs between drivers: driver$di has $driver_id, driver0 $audit_image_id (same layers, different image stores?)"
     done
     BENCH_IMG=fss-qos1-audit:local
     DOCKER_RUN+=" -e QOS1_AUDIT=1"
@@ -1342,6 +1356,7 @@ mkdir -p "$OUT/env"
 	echo "harness_describe=$(git -C "$SCALE_DIR" describe --tags --always --dirty 2>/dev/null || echo unknown)"
 	echo "driver_image=$BENCH_IMG"
 	echo "audit_archive_sha256=${audit_archive_sha:-none} audit_image_id=${audit_image_id:-none}"
+	echo "audit_image_layers=${audit_image_layers:-none}"
 	echo "mqttd_version=${MQTTD_VERSION:-unset}"
 	echo "mqttd_url=${MQTTD_URL:-}"
 	echo "mqttd_sha256_expected=${MQTTD_SHA256:-}"
