@@ -210,8 +210,8 @@ Every client publish waits in the hub's queue between being read and being dispa
 That queue used to be unbounded: when the hub fell behind, the #504 cloud run measured
 **2.55 million** queued commands at **2.60 GB** of RSS, and the node froze at its cgroup
 `MemoryHigh` (ADR 0082). It is bounded now, at the producer. A publish holds **credit**
-for `topic + payload + properties + 1,200` bytes from the moment it is read until the hub
-has dispatched it. The 1,200 is the measured per-command overhead (ADR 0082 T1): two
+for `topic + payload + properties + 880` bytes from the moment it is read until the hub
+has dispatched it. The 880 is the measured per-command overhead (ADR 0082 T1, #835): two
 command slots, since a queued command can occupy two in the hub's lane at its worst point,
 plus allocations. Two limits apply:
 
@@ -233,7 +233,7 @@ PINGREQ timeout, or when you would rather lose telemetry than slow its producers
 
 The credit counts **queued** bytes, not RSS: the formula adds the whole pool, because a
 saturated hub holds that much in its queue. At a 2 GiB watermark the default is 256 MiB:
-about 190 000 waiting 200-byte publishes. Watch:
+about 245 000 waiting 200-byte publishes. Watch:
 
 - `mqttd_ingress_credit_bytes{state="in_use"}` against `{state="capacity"}`. In use near
   capacity means the hub is the bottleneck and publishers are pausing.

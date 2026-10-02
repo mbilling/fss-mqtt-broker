@@ -1015,7 +1015,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 535 test(s)
+## `crates/mqttd/src/lib.rs` — 536 test(s)
 
 - `admin::cli::tests::all_nodes_asks_for_the_cluster_scope_on_the_verbs_that_have_one`
 - `admin::cli::tests::answers_render_as_tables_and_lines`
@@ -1270,6 +1270,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::a_group_with_no_committed_lease_is_never_rehomed`
 - `hub::tests::a_handoff_is_retransmitted_until_the_owner_acks`
 - `hub::tests::a_handoff_retransmitted_before_its_ack_is_not_a_second_mutation`
+- `hub::tests::a_hub_command_slot_stays_publish_sized`
 - `hub::tests::a_large_retained_set_is_chunked_under_the_frame_budget`
 - `hub::tests::a_live_qos1_delivery_to_a_clean_session_writes_nothing`
 - `hub::tests::a_live_qos1_delivery_to_a_persistent_subscriber_is_durable_until_acked`

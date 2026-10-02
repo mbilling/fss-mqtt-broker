@@ -91,7 +91,7 @@ impl Rig {
         let (reply, wait) = oneshot::channel();
         self.dispatch(HubCommand::Attach {
             client: ClientId(SUB.into()),
-            admission: admission(SUB),
+            admission: Box::new(admission(SUB)),
             conn_id: 7,
             clean_start: false,
             session_expiry: u32::MAX,

@@ -553,7 +553,7 @@ async fn run_barrier_job(
             let client = pending.client.clone();
             let _ = store.remove(&client).await;
             let _ = self_tx.send(HubCommand::SessionRecovered {
-                pending: *pending,
+                pending,
                 recovery: SessionRecovery::Cleaned,
             });
             let _ = self_tx.send(HubCommand::AppendDone {

@@ -40,8 +40,9 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 /// it) and allocator rounding. Derived from the slot size, so the charge follows the
 /// command if it grows.
 ///
-/// Measured 2026-10-02 (408-byte slot): 455-601 B beyond topic and payload while
-/// queued on the channel, 882-1,076 B in a lane at its worst point.
+/// Measured 2026-10-02 with the 408-byte slot: 455-610 B beyond topic and payload while
+/// queued on the channel, 731-1,076 B in a lane at its worst point. With the slot cut
+/// to 248 B (#835): 256-412 B on the channel, up to 552 B in a lane.
 pub const COMMAND_OVERHEAD: usize = 2 * std::mem::size_of::<crate::hub::HubCommand>() + 384;
 
 /// The pool when neither it nor a memory watermark is configured (ADR 0082 §5).

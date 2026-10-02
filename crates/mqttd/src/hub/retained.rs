@@ -1067,7 +1067,7 @@ impl Hub {
                 topic,
                 payload,
                 qos,
-                app,
+                app: Box::new(app),
                 token,
                 reply,
                 publish,

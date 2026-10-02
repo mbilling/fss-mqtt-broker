@@ -113,7 +113,7 @@ cap** (`MQTTD_CONN_INGRESS_BYTES`).
   command to the data lane.
 - **Charge:** `cost` is the topic length plus the payload length plus a fixed per-command
   overhead calibrated in T1, so the pool bounds *retained* memory, not just payload bytes.
-  As calibrated: `2 × size_of::<HubCommand>() + 384` (1,200 B today), with the properties
+  As calibrated: `2 × size_of::<HubCommand>() + 384` (880 B since #835), with the properties
   charged alongside the payload (T1 amendment below).
 - **Release:** the permit (an owned semaphore permit) **travels inside the command** and is
   released when the hub drops it after dispatch. The hub never acquires credit, so no
@@ -352,7 +352,7 @@ connection's own path, under the release allocator (mimalloc):
 Topic and payload bytes are pseudo-random, because macOS compresses idle pages and
 identical bytes would read as almost nothing. Each case keeps its memory alive to the end,
 so the allocator cannot recycle one case's pages into the next. The test asserts the charge
-covers every case and is no more than 3× what is retained. It fails if the overhead drops
+covers every case and is no more than 4× what is retained (3× before #835 shrank the slot). It fails if the overhead drops
 to one slot.
 
 | Where the command waits | Retained beyond topic + payload |
@@ -394,4 +394,42 @@ cost above is the part CI can check on every PR.
 
 **Follow-up.** The slot is the largest term: two of them are 816 of the 1,200 bytes. Boxing
 `HubCommand`'s largest variants would shrink every queued command, and with it the charge.
+
+## Amendment (2026-10-02): a smaller command slot (#835)
+
+The T1 follow-up is done. `-Zprint-type-sizes` showed the 408-byte slot was set by rare
+variants, not by publishes:
+
+| Variant | Before | Largest field |
+|---|---|---|
+| `SessionRecovered` | 408 | `pending` 376 |
+| `Attach` | 383 | `will` 200, `admission` 112 |
+| `RetainedCommitDone` | 266 | `app` 112 |
+| `Publish` | 251 | `app` 112 |
+
+Those fields are now boxed:
+- `SessionRecovered.pending`;
+- `Attach.admission` and `Attach.will`;
+- `RetainedCommitDone.app`.
+
+Each is sent once per session recovery, connect or retained commit, so the extra
+allocation is off the publish path. The slot is now **248 B**, set by `Publish`, and a test
+pins it at 256 B or less.
+
+The charge follows the slot. `COMMAND_OVERHEAD` falls from 1,200 B to **880 B**, and the
+default 256 MiB pool now holds about 245,000 waiting 200-byte publishes, up from about
+190,000. Each such publish holds about 200 B less memory.
+
+Re-measured with `tests/ingress_cost.rs`:
+
+| Where the command waits | Retained beyond topic + payload |
+|---|---|
+| hub channel | 256-412 B |
+| hub lane, worst point | up to 552 B |
+
+The charge still covers every case. The test's upper bound moves from 3× to 4×, because an
+empty payload is now 896 B charged against 272 B held.
+
+What remains is `AppProperties` at 112 B: every publish variant carries it, and shrinking it
+would need a broad API change.
 
