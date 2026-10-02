@@ -46,6 +46,13 @@ fn every_platform_gated_suite_compiled_on_this_runner() {
         "backup_restore.rs uses #[cfg(unix)] for startup/cleanup controls; this CI run must exercise them"
     );
 
+    // binary_smoke.rs has a Unix-only stop-signal regression (SIGTERM right after the bind).
+    assert!(
+        !in_ci || cfg!(unix),
+        "binary_smoke.rs uses #[cfg(unix)] for the early SIGTERM drain; this CI run must \
+         exercise it"
+    );
+
     // check_config.rs has a Unix-only unreadable-file regression (issue #671).
     assert!(
         !in_ci || cfg!(unix),
@@ -76,6 +83,7 @@ fn the_mirrored_predicates_still_describe_the_suites() {
         ("decommission.rs", "#![cfg(unix)]"),
         ("backup_restore.rs", "#[cfg(unix)]"),
         ("check_config.rs", "#[cfg(unix)]"),
+        ("binary_smoke.rs", "#[cfg(unix)]"),
         ("shared_membership.rs", "#[cfg(target_os = \"linux\")]"),
     ] {
         let src = std::fs::read_to_string(dir.join(file))

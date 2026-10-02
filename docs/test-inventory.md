@@ -1644,10 +1644,11 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `startup::a_live_process_is_not_ready_while_client_startup_is_held`
 - `the_extended_budget_follows_observed_restore_state`
 
-## `crates/mqttd/tests/binary_smoke.rs` — 13 test(s)
+## `crates/mqttd/tests/binary_smoke.rs` — 14 test(s)
 
 - `a_bound_line_names_the_exact_address`
 - `a_graceful_stop_closes_the_audit_chain`
+- `a_stop_right_after_the_client_bind_drains_instead_of_killing`
 - `binary_serves_a_plaintext_pubsub_roundtrip`
 - `durable_on_with_no_data_dir_refuses_to_start`
 - `help_and_version_still_exit_successfully_without_loading_config`
