@@ -31,6 +31,7 @@
 //! narrower than the README states.
 
 mod common;
+mod listen_wait;
 mod proc_common;
 
 use std::net::SocketAddr;
@@ -40,7 +41,6 @@ use std::time::Duration;
 use common::{Client, Recv};
 use mqtt_codec::{Packet, QoS};
 use proc_common::free_tcp_port;
-use tokio::net::TcpStream;
 
 /// Where a spawned broker's own log goes. Kept next to the data dir rather than
 /// `/dev/null` so a failure to start reports *why* instead of only that it did not —
@@ -115,9 +115,17 @@ impl Broker {
         }
     }
 
+    /// Wait for this broker's own log to report binding `addr` (#827): a bare TCP
+    /// connect can be answered by another test process holding the port.
     async fn wait_until_listening(&mut self, addr: SocketAddr) {
+        let addr_text = addr.to_string();
+        let path = log_path(&self.data_dir, self.which);
         for _ in 0..200 {
-            if TcpStream::connect(addr).await.is_ok() {
+            let log = std::fs::read_to_string(&path).unwrap_or_default();
+            if log
+                .lines()
+                .any(|line| listen_wait::reports_bound(line, &addr_text))
+            {
                 return;
             }
             if let Ok(Some(status)) = self.child.try_wait() {

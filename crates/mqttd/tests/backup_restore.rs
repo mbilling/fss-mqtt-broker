@@ -26,6 +26,7 @@ mod artifacts;
 #[path = "backup_restore/cleanup.rs"]
 mod cleanup;
 mod common;
+mod listen_wait;
 mod proc_common;
 #[cfg(unix)]
 #[path = "backup_restore/startup.rs"]
@@ -110,12 +111,32 @@ fn the_extended_budget_follows_observed_restore_state() {
     assert!(proc_common::convergence_budget(true) > proc_common::convergence_budget(false));
 }
 
-/// Wait for one node's `/readyz` to report ready (the operator's own signal).
-async fn wait_ready(node: &ProcNode, timeout: Duration) -> bool {
+/// The length of the log at `path` now: a spawn's mark, so a readiness check reads only
+/// what that process wrote (the logs append across restarts).
+fn log_mark(path: &Path) -> u64 {
+    std::fs::metadata(path).map_or(0, |m| m.len())
+}
+
+/// Whether the log at `path`, past byte `mark`, shows the broker binding `addr` (#827).
+/// `/readyz` alone can be answered by another test process's broker on a released port.
+fn bound_since(path: &Path, mark: u64, addr: std::net::SocketAddr) -> bool {
+    let log = std::fs::read(path).unwrap_or_default();
+    let fresh = log
+        .get(usize::try_from(mark).unwrap_or(usize::MAX)..)
+        .unwrap_or_default();
+    let addr = addr.to_string();
+    String::from_utf8_lossy(fresh)
+        .lines()
+        .any(|line| listen_wait::reports_bound(line, &addr))
+}
+
+/// Wait for one node's `/readyz` to report ready (the operator's own signal), from the
+/// process spawned after its log reached `mark`.
+async fn wait_ready(node: &ProcNode, mark: u64, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     loop {
         if let Some((ready, _, _)) = node.readyz().await {
-            if ready {
+            if ready && bound_since(&node.log_path, mark, node.health_addr) {
                 return true;
             }
         }
@@ -456,8 +477,9 @@ async fn a_live_cluster_export_restores_sessions_retained_and_acked_facts() {
     // left locked (ADR 0061 / issue #242 — a leaked handle fails the next start with
     // "Database already open", and CI has caught exactly that before).
     nodes[0].terminate().await;
+    let mark = log_mark(&nodes[0].log_path);
     nodes[0].spawn();
-    let restarted = wait_ready(&nodes[0], Duration::from_secs(60)).await;
+    let restarted = wait_ready(&nodes[0], mark, Duration::from_secs(60)).await;
     assert!(
         restarted,
         "a node did not come back over its own data dir straight after an export — check for \
@@ -844,6 +866,8 @@ struct Standalone {
     client: std::net::SocketAddr,
     data_dir: PathBuf,
     log_path: PathBuf,
+    /// The log's length when the current process was spawned (see [`log_mark`]).
+    log_mark: u64,
     env: Vec<(String, String)>,
 }
 
@@ -857,6 +881,7 @@ impl Standalone {
             client: format!("127.0.0.1:{}", free_tcp_port()).parse().unwrap(),
             data_dir,
             log_path: root.join(format!("{id}.log")),
+            log_mark: 0,
             env: env
                 .iter()
                 .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
@@ -869,6 +894,7 @@ impl Standalone {
             self.child.is_none(),
             "stop the previous process before respawning"
         );
+        self.log_mark = log_mark(&self.log_path);
         let log = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -905,7 +931,9 @@ impl Standalone {
         let deadline = Instant::now() + timeout;
         loop {
             if let Some(body) = http_get(self.health, "/readyz").await {
-                if body.contains("\"ready\":true") {
+                if body.contains("\"ready\":true")
+                    && bound_since(&self.log_path, self.log_mark, self.health)
+                {
                     return true;
                 }
             }

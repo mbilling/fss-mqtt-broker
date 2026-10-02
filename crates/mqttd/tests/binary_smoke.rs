@@ -4,10 +4,11 @@
 //! the accept loop — end to end. See `docs/TEST-PLAN.md`.
 
 mod common;
+mod listen_wait;
 
 use std::io::Read as _;
 use std::net::SocketAddr;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 use common::Client;
@@ -33,15 +34,21 @@ fn free_port() -> u16 {
         .port()
 }
 
-/// Wait for the broker to accept TCP connections, or panic after ~5s.
-async fn wait_until_listening(addr: SocketAddr) {
-    for _ in 0..50 {
-        if tokio::net::TcpStream::connect(addr).await.is_ok() {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    panic!("the mqttd binary never started listening on {addr}");
+/// Wait for the broker's own log to report binding every address, or panic (#827). A bare
+/// TCP connect can be answered by another test process that holds a released port, so
+/// the broker's stdout must be piped and `RUST_LOG` must pass `mqttd`'s info lines.
+/// Returns the log, which the reader keeps draining.
+async fn wait_until_listening(child: &mut Child, addrs: &[SocketAddr]) -> listen_wait::Log {
+    listen_wait::wait_bound(child, addrs, listen_wait::BIND_TIMEOUT)
+        .await
+        .unwrap_or_else(|why| panic!("{why}"))
+}
+
+/// As [`wait_until_listening`], for a broker logging to the file at `path`.
+async fn wait_until_logged(child: &mut Child, path: &std::path::Path, addrs: &[SocketAddr]) {
+    listen_wait::wait_logged_file(child, path, addrs, listen_wait::BIND_TIMEOUT)
+        .await
+        .unwrap_or_else(|why| panic!("{why}"));
 }
 
 /// Run a CLI invocation with unusable config and an unopened data path. A
@@ -217,24 +224,18 @@ async fn the_ephemeral_opt_in_boots_and_still_warns() {
         .env("MQTTD_NODE_ID", "opted-ephemeral")
         .env("MQTTD_PLAINTEXT_BIND", addr.to_string())
         .env("MQTTD_ALLOW_EPHEMERAL_DURABILITY", "1")
-        .env("RUST_LOG", "warn")
+        .env("RUST_LOG", "mqttd=info")
         // The tracing subscriber writes to STDOUT; that is where the warning lands.
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
         .expect("failed to spawn the mqttd binary");
     let mut guard = ChildGuard(child);
-    wait_until_listening(addr).await;
+    let log = wait_until_listening(&mut guard.0, &[addr]).await;
     // The broker is up (the opt-in worked); kill it and read the captured log.
     let _ = guard.0.kill();
-    let mut logs = String::new();
-    guard
-        .0
-        .stdout
-        .take()
-        .expect("stdout piped")
-        .read_to_string(&mut logs)
-        .unwrap();
+    let _ = guard.0.wait();
+    let logs = log.complete(Duration::from_secs(5)).await;
     assert!(
         logs.contains("EPHEMERAL durability"),
         "the opt-in must not silence the EPHEMERAL warning; logs were: {logs}"
@@ -252,14 +253,14 @@ async fn binary_serves_a_plaintext_pubsub_roundtrip() {
         .env("MQTTD_ALLOW_ANONYMOUS", "1")
         // Ephemeral durability needs the explicit opt-in (#240); tests are its use case.
         .env("MQTTD_ALLOW_EPHEMERAL_DURABILITY", "1")
-        .env("RUST_LOG", "off")
-        .stdout(Stdio::null())
+        .env("RUST_LOG", "mqttd=info")
+        .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
         .expect("failed to spawn the mqttd binary");
-    let _guard = ChildGuard(child);
+    let mut guard = ChildGuard(child);
 
-    wait_until_listening(addr).await;
+    wait_until_listening(&mut guard.0, &[addr]).await;
 
     // A full pub/sub round-trip through the real server process.
     let mut sub = Client::connect(addr, "smoke-sub").await;
@@ -311,13 +312,13 @@ async fn max_connections_cap_refuses_at_accept_and_recovers() {
         .env("MQTTD_PLAINTEXT_BIND", addr.to_string())
         .env("MQTTD_ALLOW_ANONYMOUS", "1")
         .env("MQTTD_MAX_CONNECTIONS", "2")
-        .env("RUST_LOG", "off")
-        .stdout(Stdio::null())
+        .env("RUST_LOG", "mqttd=info")
+        .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
         .expect("failed to spawn the mqttd binary");
-    let _guard = ChildGuard(child);
-    wait_until_listening(addr).await;
+    let mut guard = ChildGuard(child);
+    wait_until_listening(&mut guard.0, &[addr]).await;
 
     // The readiness probes above consumed slots transiently; connect the two
     // holders with the tolerant variant.
@@ -351,13 +352,13 @@ async fn per_ip_cap_refuses_a_second_connection_from_the_same_address() {
         .env("MQTTD_PLAINTEXT_BIND", addr.to_string())
         .env("MQTTD_ALLOW_ANONYMOUS", "1")
         .env("MQTTD_MAX_CONNECTIONS_PER_IP", "1")
-        .env("RUST_LOG", "off")
-        .stdout(Stdio::null())
+        .env("RUST_LOG", "mqttd=info")
+        .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
         .expect("failed to spawn the mqttd binary");
-    let _guard = ChildGuard(child);
-    wait_until_listening(addr).await;
+    let mut guard = ChildGuard(child);
+    wait_until_listening(&mut guard.0, &[addr]).await;
 
     let mut only = connect_when_slot_frees(addr, "ip-1").await;
     // Everything in this test comes from 127.0.0.1: the second is refused.
@@ -446,13 +447,13 @@ async fn repeated_auth_failures_penalize_the_source_address_then_decay() {
         .env("MQTTD_PASSWORD_FILE", &pw_path)
         .env("MQTTD_AUTH_PENALTY_THRESHOLD", "2")
         .env("MQTTD_AUTH_PENALTY_DECAY_SECS", "1")
-        .env("RUST_LOG", "off")
-        .stdout(Stdio::null())
+        .env("RUST_LOG", "mqttd=info")
+        .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
         .expect("failed to spawn the mqttd binary");
-    let _guard = ChildGuard(child);
-    wait_until_listening(addr).await;
+    let mut guard = ChildGuard(child);
+    wait_until_listening(&mut guard.0, &[addr]).await;
     let _cleanup = scopeguard(pw_path.clone());
 
     // Two failed authentications from 127.0.0.2: each gets its CONNACK 0x04.
@@ -523,12 +524,13 @@ async fn a_graceful_stop_closes_the_audit_chain() {
         .env("MQTTD_DURABLE_SESSIONS", "0")
         .env("MQTTD_SHUTDOWN_GRACE", "5")
         // The tracing subscriber writes to STDOUT; capture that, not stderr.
+        .env("RUST_LOG", "info")
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
         .expect("failed to spawn the mqttd binary");
     let mut guard = ChildGuard(child);
-    wait_until_listening(addr).await;
+    let log = wait_until_listening(&mut guard.0, &[addr]).await;
 
     let pid = guard.0.id();
     let sent = Command::new("kill")
@@ -553,14 +555,7 @@ async fn a_graceful_stop_closes_the_audit_chain() {
         "graceful stop must exit 0, got {status:?}"
     );
 
-    let mut stdout = String::new();
-    guard
-        .0
-        .stdout
-        .take()
-        .expect("stdout piped")
-        .read_to_string(&mut stdout)
-        .unwrap();
+    let stdout = log.complete(Duration::from_secs(5)).await;
     assert!(
         stdout.contains("audit chain genesis"),
         "boot must announce the chain genesis; stdout was:\n{stdout}"
@@ -623,12 +618,13 @@ async fn the_audit_export_ships_a_verifiable_chain() {
         .env("MQTTD_DURABLE_SESSIONS", "0")
         .env("MQTTD_SHUTDOWN_GRACE", "5")
         .env("MQTTD_AUDIT_SYSLOG", &syslog_addr)
-        .stdout(Stdio::null())
+        .env("RUST_LOG", "mqttd=info")
+        .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
         .expect("failed to spawn the mqttd binary");
     let mut guard = ChildGuard(child);
-    wait_until_listening(addr).await;
+    wait_until_listening(&mut guard.0, &[addr]).await;
 
     // One real client connect produces an auth.success record between genesis
     // and shutdown, so the verified chain is not vacuously genesis-only.
@@ -744,7 +740,7 @@ async fn the_listener_survives_fd_exhaustion_and_accepts_again() {
         .env("MQTTD_PLAINTEXT_BIND", addr.to_string())
         .env("MQTTD_ALLOW_ANONYMOUS", "1")
         .env("MQTTD_ALLOW_EPHEMERAL_DURABILITY", "1")
-        .env("RUST_LOG", "warn")
+        .env("RUST_LOG", "warn,mqttd=info")
         // STDOUT to a FILE, not a pipe: the accept-failure warning is the observable
         // this test waits on, and a pipe cannot be read until the child ends.
         .stdout(Stdio::from(log_sink))
@@ -753,7 +749,7 @@ async fn the_listener_survives_fd_exhaustion_and_accepts_again() {
         .expect("failed to spawn the mqttd binary");
     let mut guard = ChildGuard(child);
 
-    wait_until_listening(addr).await;
+    wait_until_logged(&mut guard.0, &log_path, &[addr]).await;
 
     // Squeeze: hold far more sockets open than the broker has descriptors, so its
     // accept() runs out. Held in a Vec — dropping one would hand the fd back.
@@ -940,15 +936,13 @@ async fn the_health_and_peer_listeners_survive_fd_exhaustion() {
         .env("MQTTD_PEER_BIND", peer.to_string())
         .env("MQTTD_ALLOW_ANONYMOUS", "1")
         .env("MQTTD_ALLOW_EPHEMERAL_DURABILITY", "1")
-        .env("RUST_LOG", "warn")
+        .env("RUST_LOG", "warn,mqttd=info")
         .stdout(Stdio::from(log_sink))
         .stderr(Stdio::null())
         .spawn()
         .expect("failed to spawn the mqttd binary");
     let mut guard = ChildGuard(child);
-    for addr in [mqtt, health, peer] {
-        wait_until_listening(addr).await;
-    }
+    wait_until_logged(&mut guard.0, &log_path, &[mqtt, health, peer]).await;
 
     // Exhaust the descriptors through the client listener, then knock on the other two so
     // their accept() runs into the full table.
@@ -997,4 +991,24 @@ async fn the_health_and_peer_listeners_survive_fd_exhaustion() {
         "the cluster-bus listener never accepted again after an accept error (#504) — \
          this node could take no new peer link. Log: {log}"
     );
+}
+
+/// #827: the readiness wait matches the broker's own post-bind line for the exact address
+/// (a port that is a prefix of another must not match), and nothing else.
+#[test]
+fn a_bound_line_names_the_exact_address() {
+    let line = "INFO mqttd: accepting MQTT 3.1.1 clients addr=127.0.0.1:20001";
+    assert!(listen_wait::reports_bound(line, "127.0.0.1:20001"));
+    assert!(
+        !listen_wait::reports_bound(line, "127.0.0.1:2000"),
+        "a prefix of the port"
+    );
+    assert!(!listen_wait::reports_bound(
+        "INFO mqttd: starting addr=127.0.0.1:20001",
+        "127.0.0.1:20001"
+    ));
+    assert!(listen_wait::reports_bound(
+        "INFO mqttd: serving health endpoints bind=127.0.0.1:20002 min_members=1",
+        "127.0.0.1:20002"
+    ));
 }

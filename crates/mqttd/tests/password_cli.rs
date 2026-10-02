@@ -22,6 +22,7 @@ use std::time::Duration;
 use mqtt_codec::{packet::Connect, Packet, ProtocolVersion};
 use tokio::net::TcpStream;
 
+mod listen_wait;
 mod proc_common;
 use proc_common::free_tcp_port;
 
@@ -88,26 +89,19 @@ impl Drop for Broker {
 /// Boot the real binary with `password_file` as its only credential source, and wait
 /// until it is listening.
 async fn start_broker(password_file: &std::path::Path) -> (Broker, SocketAddr) {
-    let addr: SocketAddr = format!("127.0.0.1:{}", free_tcp_port()).parse().unwrap();
-    let child = mqttd()
-        .env("MQTTD_NODE_ID", "pwcli")
-        .env("MQTTD_ALLOW_EPHEMERAL_DURABILITY", "1")
-        .env("MQTTD_PLAINTEXT_BIND", addr.to_string())
-        .env("MQTTD_PASSWORD_FILE", password_file)
-        // Anonymous stays OFF: the password file is the whole gate under test.
-        .env("RUST_LOG", "off")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn mqttd");
-    let broker = Broker(child);
-    for _ in 0..200 {
-        if TcpStream::connect(addr).await.is_ok() {
-            return (broker, addr);
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    panic!("mqttd never started listening on {addr}");
+    let (child, addr) = listen_wait::spawn_listening(|| {
+        let addr: SocketAddr = format!("127.0.0.1:{}", free_tcp_port()).parse().unwrap();
+        let mut cmd = mqttd();
+        cmd.env("MQTTD_NODE_ID", "pwcli")
+            .env("MQTTD_ALLOW_EPHEMERAL_DURABILITY", "1")
+            .env("MQTTD_PLAINTEXT_BIND", addr.to_string())
+            .env("MQTTD_PASSWORD_FILE", password_file)
+            // Anonymous stays OFF: the password file is the whole gate under test.
+            .stderr(Stdio::null());
+        (cmd, vec![addr], addr)
+    })
+    .await;
+    (Broker(child), addr)
 }
 
 /// CONNECT with `username`/`password` and return the CONNACK return code.
