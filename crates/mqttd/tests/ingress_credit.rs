@@ -5,6 +5,9 @@
 //! The hub is made genuinely slow — every publish fans out to [`SUBSCRIBERS`] sessions —
 //! and [`PUBLISHERS`] clients write `QoS` 0 as fast as TCP takes it, so the hub falls
 //! behind and the credit pool, not the hub, decides how much waits for it.
+//!
+//! A client that hangs up while paused is reaped promptly though the pool stays full
+//! (#825).
 
 mod common;
 
@@ -81,12 +84,15 @@ async fn start(
         tokio::spawn(async move {
             loop {
                 let (stream, peer) = listener.accept().await.unwrap();
-                tokio::spawn(mqttd::conn::handle_stream(
+                // As the production listeners do: watch the raw socket (#825).
+                let watch = mqttd::conn::PeerClosedWatch::new(&stream);
+                tokio::spawn(mqttd::conn::handle_stream_watched(
                     stream,
                     Some(peer),
                     None,
                     policy.clone(),
                     hub_tx.clone(),
+                    watch,
                 ));
             }
         });
@@ -199,4 +205,70 @@ async fn livez_and_the_control_lane_answer_while_publishes_are_credit_blocked() 
         "CONNECT took {connect_took:?}"
     );
     assert!(in_use <= POOL);
+}
+
+/// #825: a client that hangs up while paused for credit, with publishes still unread in
+/// its socket, is reaped promptly though the pool stays full: its Will fires, nothing
+/// it sent is acknowledged, and no credit leaks. Before the fix the paused read loop
+/// never saw the FIN — keepalive is disarmed while paused — so the connection lived
+/// until credit freed, which here is never.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_client_that_hangs_up_while_paused_is_reaped_though_the_pool_stays_full() {
+    const SMALL_POOL: usize = 4096;
+    let credit = Arc::new(IngressCredit::new(
+        SMALL_POOL,
+        SMALL_POOL,
+        OverloadMode::Pause,
+    ));
+    let metrics = Arc::new(Metrics::new("test"));
+    let (addr, _health, _hub_tx) = start(&credit, &metrics).await;
+
+    let mut watcher = Client::connect(addr, "watcher").await;
+    watcher.subscribe(1, "will/#", QoS::AtLeastOnce).await;
+
+    // Something else holds the whole pool for the rest of the test.
+    let hog = credit
+        .connection()
+        .try_acquire(u32::try_from(SMALL_POOL).unwrap())
+        .expect("the pool starts empty");
+
+    let mut publisher = Client::open(addr, mqtt_codec::ProtocolVersion::V311).await;
+    publisher
+        .connect_with_will("paused", "will/paused", b"gone")
+        .await;
+    // The first parks on the empty pool; the rest stay unread in the socket.
+    for id in 1..=8u16 {
+        publisher
+            .publish("data/t", &[1u8; 256], QoS::AtLeastOnce, Some(id), vec![])
+            .await;
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while paused(&metrics) < 1 {
+        assert!(Instant::now() < deadline, "the publisher never paused");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    // Hang up without DISCONNECT: a FIN behind the unread publishes.
+    let hung_up = Instant::now();
+    drop(publisher);
+
+    let will = match watcher.recv_bounded(Duration::from_secs(5)).await {
+        common::Recv::Packet(Packet::Publish(p)) => p,
+        common::Recv::Packet(other) => panic!("unexpected {other:?}"),
+        common::Recv::Quiet => panic!(
+            "the paused connection was not reaped {:?} after its client hung up",
+            hung_up.elapsed()
+        ),
+        common::Recv::Closed => panic!("the watcher was closed"),
+    };
+    assert_eq!(will.topic, "will/paused");
+    assert_eq!(will.payload.as_ref(), b"gone");
+    eprintln!(
+        "reaped (Will delivered) {:?} after the hang-up",
+        hung_up.elapsed()
+    );
+    // Reaped while the pool was still full, and the parked publish took none of it.
+    assert_eq!(credit.in_use(), SMALL_POOL);
+    drop(hog);
+    assert_eq!(credit.in_use(), 0, "the reaped connection leaked credit");
 }

@@ -37,6 +37,9 @@ use tokio::time::Instant;
 use tokio_rustls::TlsConnector;
 use tracing::{debug, info, warn};
 
+mod peer_closed;
+pub use peer_closed::PeerClosedWatch;
+
 /// Keepalive grace factor: the spec allows one and a half keepalive periods.
 const KEEPALIVE_GRACE_NUM: u64 = 3;
 const KEEPALIVE_GRACE_DEN: u64 = 2;
@@ -397,8 +400,36 @@ pub async fn handle_stream<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    handle_stream_watched(stream, peer, cert, policy, hub, None).await
+}
+
+/// [`handle_stream`] with a [`PeerClosedWatch`] on the underlying TCP socket, so a
+/// connection paused for ingress credit still notices its client hanging up
+/// (ADR 0082 T3, #825). The production listeners build the watch from the raw
+/// socket before wrapping it in TLS or WebSocket.
+pub async fn handle_stream_watched<S>(
+    stream: S,
+    peer: Option<SocketAddr>,
+    cert: Option<CertAdmission>,
+    policy: Arc<ConnPolicy>,
+    hub: mpsc::UnboundedSender<HubCommand>,
+    watch: Option<PeerClosedWatch>,
+) -> ConnOutcome
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let auth_failed = std::sync::atomic::AtomicBool::new(false);
-    if let Err(e) = run(stream, peer, cert, &policy, hub, &auth_failed).await {
+    if let Err(e) = run(
+        stream,
+        peer,
+        cert,
+        &policy,
+        hub,
+        &auth_failed,
+        watch.as_ref(),
+    )
+    .await
+    {
         warn!(?peer, error = %e, "connection ended with error");
     }
     ConnOutcome {
@@ -413,6 +444,7 @@ async fn run<S>(
     policy: &ConnPolicy,
     hub: mpsc::UnboundedSender<HubCommand>,
     auth_failed: &std::sync::atomic::AtomicBool,
+    watch: Option<&PeerClosedWatch>,
 ) -> Result<(), NetError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -432,6 +464,7 @@ where
         true,
         None,
         auth_failed,
+        watch,
     )
     .await
 }
@@ -612,6 +645,8 @@ async fn run_framed<R, W>(
     allow_proxy: bool,
     via: Option<String>,
     auth_failed: &std::sync::atomic::AtomicBool,
+    // Sees the client hang up while serve has paused reading (#825).
+    watch: Option<&PeerClosedWatch>,
 ) -> Result<(), NetError>
 where
     R: AsyncRead + Unpin,
@@ -850,6 +885,7 @@ where
         &mut outbound_aliases,
         session_expiry,
         &mut session_expiry_override,
+        watch,
     )
     .await;
     count_connection_closed(policy);
@@ -995,6 +1031,8 @@ pub async fn serve_proxied<R, W>(
         false,
         via,
         &auth_failed,
+        // The stream is the relaying node's peer link, not the client's socket.
+        None,
     )
     .await
     {
@@ -1791,6 +1829,8 @@ async fn serve<R, W>(
     // out-param rather than a richer return type because every `return Ok(..)` in
     // this loop would otherwise have to carry a value only one of them can set.
     session_expiry_override: &mut Option<u32>,
+    // The client's TCP socket, watched for a hangup while `parked` (#825).
+    watch: Option<&PeerClosedWatch>,
 ) -> Result<bool, NetError>
 where
     R: AsyncRead + Unpin,
@@ -2020,6 +2060,17 @@ where
                     }
                 }
                 writer.flush_queued().await?;
+            }
+            // While parked the socket is unread, so a client that hung up behind its
+            // unread publishes would go unnoticed until credit frees (#825). The kernel
+            // reports the FIN or RST regardless; treat it as the EOF the read would
+            // have reached: ungraceful, so the Will fires, and the parked and unread
+            // publishes are dropped unacknowledged. Dropping `parked` drops the credit
+            // wait.
+            () = async { watch.expect("branch guarded on is_some").closed().await },
+                if parked.is_some() && watch.is_some() => {
+                debug!(client = %client.0, "client closed while paused for ingress credit; closing");
+                return Ok(false);
             }
             // Not while parked (ADR 0082 T3): a client the broker stopped reading cannot
             // be blamed for its silence. Resuming resets the deadline.

@@ -79,3 +79,6 @@ status lives in the frontmatter above. The table below is generated from it.
 - 2026-10-02: T6 passed: the #504 cloud acceptance on both arms (RSS bounded, every scrape
   answered, control rungs matched their baselines without a restart). #504, #535 and #819 are
   closed; follow-up #825 tracks slow reaping of credit-paused connections.
+- 2026-10-02: #825 fixed: a paused connection watches its transport (TCP, TLS, WS, WSS,
+  QUIC) for the client leaving and is reaped at once, with the Will fired; keepalive stays
+  disarmed while paused (ADR amendment 2026-10-02).
