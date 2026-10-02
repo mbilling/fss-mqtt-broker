@@ -223,4 +223,29 @@ spec:
           annotations:
             summary: New publishes are withheld because the append lane is at cap.
             runbook: docs/OPERATIONS.md#alert-append-lane-saturating
+        - alert: MqttdIngressCreditSaturated
+          # The pool is always exported and never zero, so the ratio needs no guard.
+          expr: mqttd_ingress_credit_bytes{state="in_use"} / ignoring(state) mqttd_ingress_credit_bytes{state="capacity"} > 0.9
+          for: 5m
+          labels:
+            severity: warn
+          annotations:
+            summary: Ingress credit has been near the pool for 5m; client publishes are pausing behind the hub.
+            runbook: docs/OPERATIONS.md#alert-ingress-credit-saturated
+        - alert: MqttdIngressPausesLong
+          expr: histogram_quantile(0.99, rate(mqttd_ingress_paused_seconds_bucket[5m])) > 1
+          for: 10m
+          labels:
+            severity: warn
+          annotations:
+            summary: p99 ingress-credit pauses exceed 1s; clients with short PINGREQ timeouts may reconnect.
+            runbook: docs/OPERATIONS.md#alert-ingress-credit-saturated
+        - alert: MqttdIngressShedding
+          expr: rate(mqttd_publish_dropped_total{reason="hub-ingress"}[5m]) > 0
+          for: 5m
+          labels:
+            severity: warn
+          annotations:
+            summary: QoS 0 publishes are shed for want of ingress credit (peer forwards, or shed-qos0).
+            runbook: docs/OPERATIONS.md#alert-publishes-shed-at-ingress
 {{- end }}
