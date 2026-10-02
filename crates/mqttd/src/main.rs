@@ -3680,11 +3680,23 @@ async fn serve_tls_clients(
             let hub = hub_tx.clone();
             let policy = per_conn_policy.clone();
             async move {
+                // Built from the raw socket before TLS wraps it (#825).
+                let watch = conn::PeerClosedWatch::new(&stream);
                 match acceptor.accept(stream).await {
                     Ok(tls_stream) => {
                         // mTLS admission (ADR 0004/0040): the verified leaf cert's CN + serial.
                         let cert = conn::tls_admission(&tls_stream, policy.identity_source);
-                        Some(conn::handle_stream(tls_stream, Some(peer), cert, policy, hub).await)
+                        Some(
+                            conn::handle_stream_watched(
+                                tls_stream,
+                                Some(peer),
+                                cert,
+                                policy,
+                                hub,
+                                watch,
+                            )
+                            .await,
+                        )
                     }
                     Err(e) => {
                         debug!(%peer, error = %e, "TLS handshake failed");
@@ -3720,7 +3732,12 @@ async fn serve_plaintext_clients(
         move |stream, peer| {
             let hub = hub_tx.clone();
             let policy = per_conn_policy.clone();
-            async move { Some(conn::handle_stream(stream, Some(peer), None, policy, hub).await) }
+            async move {
+                let watch = conn::PeerClosedWatch::new(&stream);
+                Some(
+                    conn::handle_stream_watched(stream, Some(peer), None, policy, hub, watch).await,
+                )
+            }
         },
     )
     .await;
@@ -3749,8 +3766,12 @@ async fn serve_ws_clients(
             let hub = hub_tx.clone();
             let policy = per_conn_policy.clone();
             async move {
+                // Built from the raw socket before WebSocket wraps it (#825).
+                let watch = conn::PeerClosedWatch::new(&stream);
                 match mqtt_net::ws::accept(stream).await {
-                    Ok(ws) => Some(conn::handle_stream(ws, Some(peer), None, policy, hub).await),
+                    Ok(ws) => Some(
+                        conn::handle_stream_watched(ws, Some(peer), None, policy, hub, watch).await,
+                    ),
                     Err(e) => {
                         debug!(%peer, error = %e, "websocket handshake failed");
                         if let Some(m) = &policy.metrics {
@@ -3793,15 +3814,25 @@ async fn serve_wss_clients(
             let hub = hub_tx.clone();
             let policy = per_conn_policy.clone();
             async move {
+                // Built from the raw socket before TLS and WebSocket wrap it (#825).
+                let watch = conn::PeerClosedWatch::new(&stream);
                 match acceptor.accept(stream).await {
                     Ok(tls) => {
                         // mTLS admission (ADR 0004/0040): the verified leaf cert's CN + serial —
                         // read before the TLS stream is consumed by the WebSocket adapter.
                         let cert = conn::tls_admission(&tls, policy.identity_source);
                         match mqtt_net::ws::accept(tls).await {
-                            Ok(ws) => {
-                                Some(conn::handle_stream(ws, Some(peer), cert, policy, hub).await)
-                            }
+                            Ok(ws) => Some(
+                                conn::handle_stream_watched(
+                                    ws,
+                                    Some(peer),
+                                    cert,
+                                    policy,
+                                    hub,
+                                    watch,
+                                )
+                                .await,
+                            ),
                             Err(e) => {
                                 debug!(%peer, error = %e, "websocket handshake failed");
                                 if let Some(m) = &policy.metrics {
@@ -3886,9 +3917,19 @@ async fn serve_quic_clients(
             spawn_quic_migration_watch(conn.clone(), identity.clone(), policy.metrics.clone());
             // Multi-stream mux (ADR 0036): the control stream carries the session; any data
             // streams the client opens feed PUBLISH into the same session, no HoL blocking.
+            // A paused session still sees the connection close (#825).
+            let watch = conn::PeerClosedWatch::quic(&conn);
             match mqtt_net::quic::accept_mux(conn).await {
                 Ok(mux) => {
-                    let outcome = conn::handle_stream(mux, Some(peer), cert, policy, hub).await;
+                    let outcome = conn::handle_stream_watched(
+                        mux,
+                        Some(peer),
+                        cert,
+                        policy,
+                        hub,
+                        Some(watch),
+                    )
+                    .await;
                     if outcome.auth_failed {
                         gate.record_auth_failure(Some(peer.ip()));
                     }

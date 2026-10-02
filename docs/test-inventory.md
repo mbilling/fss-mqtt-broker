@@ -1015,7 +1015,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 528 test(s)
+## `crates/mqttd/src/lib.rs` — 530 test(s)
 
 - `admin::cli::tests::all_nodes_asks_for_the_cluster_scope_on_the_verbs_that_have_one`
 - `admin::cli::tests::answers_render_as_tables_and_lines`
@@ -1091,6 +1091,8 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `config_watch::tests::a_settled_edit_applies_exactly_once`
 - `config_watch::tests::an_atomic_rename_is_detected`
 - `config_watch::tests::no_change_does_not_reload`
+- `conn::peer_closed::tests::a_fin_behind_unread_data_is_seen_without_consuming_the_data_or_spinning`
+- `conn::peer_closed::tests::a_reset_behind_unread_data_is_seen`
 - `conn::tests::a_client_cannot_size_the_outbound_alias_table_by_asking_for_more`
 - `conn::tests::a_client_disconnect_is_still_reported_as_graceful`
 - `conn::tests::a_denied_qos0_publish_stays_a_silent_drop_in_both_versions`
@@ -1801,8 +1803,9 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `an_acked_qos2_before_pubrec_republishes_dup_under_the_same_id`
 - `an_acked_qos2_past_pubrec_resumes_with_pubrel_under_the_same_id`
 
-## `crates/mqttd/tests/ingress_credit.rs` — 1 test(s)
+## `crates/mqttd/tests/ingress_credit.rs` — 2 test(s)
 
+- `a_client_that_hangs_up_while_paused_is_reaped_though_the_pool_stays_full`
 - `livez_and_the_control_lane_answer_while_publishes_are_credit_blocked`
 
 ## `crates/mqttd/tests/keepalive_lwt.rs` — 7 test(s)
@@ -1890,12 +1893,13 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `suback_grants_requested_qos_up_to_2`
 - `unacked_downstream_qos2_is_resent_with_dup_until_pubcomp`
 
-## `crates/mqttd/tests/quic.rs` — 5 test(s)
+## `crates/mqttd/tests/quic.rs` — 6 test(s)
 
 - `quic_connection_migration_survives_path_change`
 - `quic_mtls_pubsub_roundtrip`
 - `quic_multistream_demux_no_head_of_line_blocking`
 - `quic_outbound_fans_publishes_across_streams`
+- `quic_peer_closed_watch_sees_the_close_behind_unread_data`
 - `quic_without_client_cert_is_refused`
 
 ## `crates/mqttd/tests/quotas.rs` — 6 test(s)

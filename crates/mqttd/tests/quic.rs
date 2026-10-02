@@ -706,3 +706,47 @@ async fn quic_without_client_cert_is_refused() {
         "a QUIC client without a certificate must never receive a CONNACK (mTLS enforced)"
     );
 }
+
+/// #825: the watch a paused QUIC session uses to notice its client leaving. The server
+/// never reads the client's stream (as a session paused for ingress credit does not),
+/// yet the connection's close is seen promptly; while the client stays connected with
+/// data unread, it is not reported closed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn quic_peer_closed_watch_sees_the_close_behind_unread_data() {
+    let pki = mint_pki("closed-watch");
+    let server = mqtt_net::quic::server_endpoint(
+        "127.0.0.1:0".parse().unwrap(),
+        &pki.cert,
+        &pki.key,
+        Some(&pki.ca),
+    )
+    .unwrap();
+    let addr = server.local_addr().unwrap();
+    let client = quic_client(&pki.ca, Some((&pki.cert, &pki.key)));
+    let (client_conn, server_conn) = tokio::join!(
+        async {
+            client
+                .connect(addr, "127.0.0.1")
+                .unwrap()
+                .await
+                .expect("QUIC connect")
+        },
+        async { server.accept().await.unwrap().await.expect("QUIC accept") },
+    );
+    let watch = mqttd::conn::PeerClosedWatch::quic(&server_conn);
+
+    // Data the server never reads: it does not even accept the stream.
+    let (mut send, _recv) = client_conn.open_bi().await.unwrap();
+    send.write_all(&vec![7u8; 64 * 1024]).await.unwrap();
+    assert!(
+        timeout(Duration::from_millis(300), watch.closed())
+            .await
+            .is_err(),
+        "a connected QUIC client with unread data was reported closed"
+    );
+
+    client_conn.close(0u32.into(), b"gone");
+    timeout(Duration::from_secs(2), watch.closed())
+        .await
+        .expect("the QUIC close behind unread data was not seen");
+}

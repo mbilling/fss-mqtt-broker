@@ -294,3 +294,35 @@ and the connection's serve loop):
   §4's `mqttd_hub_ingress_bytes`. The hub exports the gauge on its sweep. Client QoS 0 shed
   under `shed-qos0` counts as `publish_dropped{reason="hub-ingress"}`, the reason T4 will use
   for peer QoS 0.
+
+## Amendment (2026-10-02): a paused connection still notices its client leaving (#825)
+
+T3 left a gap that the #504 cloud acceptance (T6) measured: a paused connection does not
+read its socket, so a client's FIN queued behind unread publishes went unseen until credit
+freed. With keepalive disarmed, nothing else reaped it. At 4× overload on one node, hundreds
+of such connections outlived the reset budget.
+
+- **The watch.** While a publish is parked, the serve loop also waits for the transport to
+  report the peer gone (`conn::PeerClosedWatch`). It never reads payload, so backpressure
+  is unchanged:
+  - **TCP, TLS, WS, WSS:** the watch is built from the raw accepted socket before TLS or
+    WebSocket wraps it. It registers a duplicate descriptor for read-closed readiness only:
+    `EPOLLRDHUP` on Linux, `EV_EOF` on macOS. The kernel raises it on the peer's FIN or RST
+    however much data is still buffered. Plain data-arrival wakeups are edge-triggered and
+    waited past, so they do not spin.
+  - **QUIC:** the watch is the connection's close, which quinn raises on the client's
+    CONNECTION_CLOSE or its own idle timeout whether or not the stream is read.
+  - **Not watched:** non-unix targets, which keep the T3 behaviour, and sessions proxied
+    from a relaying node, whose stream is the peer link, not the client socket.
+- **What happens on a hangup.** The same as reaching EOF without DISCONNECT: the close is
+  ungraceful and the Will fires. The parked publish and anything unread behind it are
+  dropped and never acknowledged; the parked publish never held credit. A client that
+  queued a DISCONNECT behind its publishes and then closed is treated the same way: the
+  broker never read the DISCONNECT. Before this change that client's publishes would have
+  been served once credit freed.
+- **Keepalive stays disarmed while paused.** The broker caused the silence, and a client
+  whose writes are blocked by TCP flow control cannot get a PINGREQ through. Re-arming
+  keepalive would disconnect healthy clients exactly when the node is busiest. The watch
+  covers clients that close or reset. A client that vanishes without either (power loss, a
+  dropped network path) is still reaped by keepalive once reading resumes, so it stays
+  bounded by the pause plus the grace period.
