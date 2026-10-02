@@ -173,12 +173,16 @@ remove. So peer data uses non-blocking admission:
 
 ### 4. What an operator sees
 
-All new series have bounded label cardinality:
-- `mqttd_hub_queue_depth{class="control|data"}` and `mqttd_hub_ingress_bytes`: queued bytes
-  against the pool;
-- `mqttd_ingress_paused_total` and `mqttd_ingress_paused_seconds_total`: connections that
-  waited for credit;
-- `publish_dropped{reason="hub-ingress"}`: peer QoS 0 shed.
+All new series have bounded label cardinality. As built (names corrected 2026-10-02, T5):
+- `mqttd_hub_lane_depth{lane="control|data"}` (T2), beside the existing total
+  `mqttd_hub_queue_depth`;
+- `mqttd_ingress_credit_bytes{state="in_use|capacity"}` (T3): queued bytes against the pool;
+- `mqttd_ingress_paused_total` and the `mqttd_ingress_paused_seconds` histogram (T3):
+  connections that waited for credit, and for how long;
+- `publish_dropped{reason="hub-ingress"}`: peer QoS 0 shed (T4), and client QoS 0 under
+  `shed-qos0` (T3).
+
+The runbook and the shipped alerts are in [OPERATIONS](../OPERATIONS.md#overload-bounded-hub-ingress-adr-0082) (T5).
 
 `/livez` keeps answering under overload because its ping is control traffic.
 

@@ -1059,6 +1059,50 @@ The export never blocks the broker: past the bounded queue it sheds-and-counts
 (`audit_export_dropped` — alert on non-zero; the shed is also visible downstream
 as a `seq` gap).
 
+## Overload: bounded hub ingress (ADR 0082)
+
+Each node routes every publish through one hub loop. When publishers offer more than the
+hub can route, the excess waits in the hub's queue. Before ADR 0082 that queue had no
+bound: the #504 cloud run grew it to 2.5M commands and 10 GB, and the node froze at its
+cgroup `MemoryHigh`. Now a node under overload **slows its publishers instead of growing**:
+
+- **Control first.** The hub dispatches control traffic (completions, acks, the durable
+  plane, the `/livez` ping, admin) before data (publishes, subscriptions, session
+  lifecycle). `/livez` and consensus keep answering under overload.
+  `mqttd_hub_lane_depth{lane="control"|"data"}` shows the split.
+- **Client publishes take byte credit** from the node pool (`MQTTD_HUB_INGRESS_BYTES`)
+  and a per-connection cap (`MQTTD_CONN_INGRESS_BYTES`) before they are queued. A
+  connection without credit **stops reading its socket**, so the publisher waits in TCP.
+  Under `MQTTD_INGRESS_OVERLOAD=shed-qos0` a `QoS` 0 publish is dropped and counted
+  instead. `QoS` 1 and 2 always wait. Knobs and sizing: [SIZING](SIZING.md).
+- **Peer `QoS` 0 is shed, never paused.** A peer link also carries consensus, so its reads
+  never stop. A peer's `QoS` 0 publish that finds the pool full is dropped and counted.
+  Peer `QoS` ≥ 1, retained forwards and control frames are never charged.
+- **A paused client that hangs up is reaped at once**, with its Will fired. Keepalive is
+  not enforced while the broker itself is pausing a connection.
+
+**What healthy overload looks like** (the T6 cloud acceptance, 2-4× the knee):
+- `in_use` sits at `capacity`, and the hub queue stops near the pool's command count;
+- RSS stays flat and every scrape answers;
+- after the load drops, the node returns to its baseline without a restart.
+
+That is the design working. The alerts below say a node is **spending real time there**.
+
+**What to do when a node lives at its credit ceiling:**
+1. **Confirm it is the hub.** Look for `in_use` at `capacity` together with a deep
+   `mqttd_hub_lane_depth{lane="data"}`. If the hub is shallow and only one connection
+   pauses, that publisher is bursting past its own 1 MiB cap, which is working as
+   intended.
+2. **Spread the load:** add nodes, move publishers, or re-shard topics. A bigger pool
+   only buys a longer queue (more memory and latency), not more throughput. Size it
+   against the memory watermark, not against the overload.
+3. **Pick the overload behaviour deliberately.**
+   - `pause` (the default) is lossless, but clients with a short PINGREQ timeout
+     reconnect during long pauses.
+   - `shed-qos0` keeps `QoS` 0 producers moving and drops their excess telemetry
+     instead.
+4. **Check the hub itself.** A slow hub (see *Hub loop held*) fills the pool at any load.
+
 ## Monitoring for the operator (and humans)
 
 The signals the future controller will reconcile on
@@ -1111,6 +1155,8 @@ the human-readable superset.
 | **Degraded durable plane** | `mqttd_lease_quorum_ack_ms` growing (ADR 0049) | [runbook](#alert-degraded-durable-plane) |
 | **Hub loop held** | `histogram_quantile(0.99, rate(mqttd_hub_dispatch_seconds_bucket[5m])) > 0.1` sustained 5m (page) | [runbook](#alert-hub-loop-held) |
 | **Acked messages being shed for a slow subscriber** | `increase(mqttd_publish_dropped_total{reason="backlog-overflow"}[5m]) > 0` (warn), alongside `mqttd_backlog_bytes` | [runbook](#alert-acked-messages-being-shed-for-a-slow-subscriber) |
+| **Ingress credit saturated** | `mqttd_ingress_credit_bytes{state="in_use"} / ignoring(state) mqttd_ingress_credit_bytes{state="capacity"} > 0.9` for 5m (warn); `histogram_quantile(0.99, rate(mqttd_ingress_paused_seconds_bucket[5m])) > 1` for 10m (warn) | [runbook](#alert-ingress-credit-saturated) |
+| **Publishes shed at ingress** | `rate(mqttd_publish_dropped_total{reason="hub-ingress"}[5m]) > 0` for 5m (warn) | [runbook](#alert-publishes-shed-at-ingress) |
 | **Append lane saturating** | `mqttd_append_lane_jobs` growing sustained (warn); `rate(mqttd_publish_dropped_total{reason="append-backlog-full"}[5m]) > 0` (page) | [runbook](#alert-append-lane-saturating) |
 
 ### Alert: Split brain
@@ -1244,6 +1290,44 @@ the human-readable superset.
 **Rule:** `mqttd_append_lane_jobs` growing sustained (warn); `rate(mqttd_publish_dropped_total{reason="append-backlog-full"}[5m]) > 0` (page) — also in the chart `PrometheusRule` (`deploy/helm/mqttd/templates/prometheusrule.yaml`) when `metrics.prometheusRule.enabled` is true.
 
 **When it fires / what to do:** A session's placement group is not keeping up (degraded follower set: each append or QoS 2 outbound-id record is bounded by the 5s replication RPC timeout, FIFO per session — 256 queued jobs max per session, then the NEWEST publish is withheld so its publisher retries; a detach spill past the cap+headroom sheds into this same counter). Only that group's sessions are affected — connects, subscribes and other groups' publishes keep flowing (issue #242). The degraded-group signals are per-session ones: this gauge/counter pair, `rate(mqttd_publish_dropped_total{reason="outbound-id-write-failed"}[5m])` (a QoS 2 outbound-id record write failed; the delivery is re-queued and retried on the next drain), and end-to-end QoS 2 delivery latency to that group's subscribers — NOT hub dispatch tails, which stay flat by design. Find the degraded group's followers: `mqttd_replica_groups_tracked - mqttd_replica_groups_current`, `mqttd_durable_append_failures_total`, and the *Durable writes refused* row
+
+### Alert: Ingress credit saturated
+
+**Rule:** `mqttd_ingress_credit_bytes{state="in_use"} / ignoring(state) mqttd_ingress_credit_bytes{state="capacity"} > 0.9` for 5m (warn); `histogram_quantile(0.99, rate(mqttd_ingress_paused_seconds_bucket[5m])) > 1` for 10m (warn) — also in the chart `PrometheusRule` (`deploy/helm/mqttd/templates/prometheusrule.yaml`) when `metrics.prometheusRule.enabled` is true.
+
+**When it fires / what to do:**
+- **What it means:** the node has spent minutes at its ingress ceiling. The hub is
+  behind, and client publishes are waiting for credit, paused in TCP. Under `pause` that
+  is lossless, but publishers are slowed, and clients with a short PINGREQ timeout may
+  reconnect.
+- **Why the ratio needs no guard:** the pool is always exported and never zero.
+- **The second rule** catches the other form: pauses long enough to hurt clients, even
+  when the pool only touches its ceiling in bursts.
+  - Its buckets stop near 3.3 s, so the quantile cannot read higher.
+  - `rate(mqttd_ingress_paused_seconds_sum[5m]) / rate(mqttd_ingress_paused_seconds_count[5m])`
+    is the mean pause.
+  - `rate(mqttd_ingress_paused_total[5m])` is how often pauses start.
+- **What to do:** follow the overload steps [above](#overload-bounded-hub-ingress-adr-0082).
+  Do not raise `MQTTD_HUB_INGRESS_BYTES` to silence it: a bigger pool is a longer queue,
+  not a faster hub.
+
+### Alert: Publishes shed at ingress
+
+**Rule:** `rate(mqttd_publish_dropped_total{reason="hub-ingress"}[5m]) > 0` for 5m (warn) — also in the chart `PrometheusRule` (`deploy/helm/mqttd/templates/prometheusrule.yaml`) when `metrics.prometheusRule.enabled` is true.
+
+**When it fires / what to do:**
+- **What it means:** `QoS` 0 publishes are being dropped for want of ingress credit. Two
+  sources share the reason:
+  - inbound **peer** `QoS` 0 forwards and shared deliveries, which are shed rather than
+    pausing a link that also carries consensus;
+  - client `QoS` 0 under `MQTTD_INGRESS_OVERLOAD=shed-qos0`.
+- **Why it is a warning:** `QoS` 0 promises nothing, so this is a capacity warning, not
+  data loss you owed anyone. `QoS` 1 and 2 are never shed here.
+- **What to do:**
+  - Persistent shedding on one node, while its peers are fine, means it receives more
+    remote fan-out than it can route. Rebalance subscribers, or add capacity.
+  - Read it alongside *Ingress credit saturated*: the same overload, seen from the
+    losing side.
 
 `curl <pod>:8080/statusz` is the human-readable superset of all of it.
 
