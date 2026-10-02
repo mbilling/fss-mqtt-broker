@@ -1041,6 +1041,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // The stop signals are registered BEFORE the first client can connect: from here on a
+    // SIGTERM must drain, not kill. Registered later (when `graceful_shutdown` first
+    // waits), a stop landing in the rest of startup took the signal's default action and
+    // ended a node already serving clients with no drain and no closing audit record.
+    // Earlier than this there is nothing to drain, and the default action keeps a stuck
+    // startup killable.
+    let (mut stop, mut decommission) = (StopSignals::install(), DecommissionSignal::install());
     start_client_listeners(
         &config,
         hub_tx,
@@ -1094,6 +1101,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Run until a shutdown signal, then drain gracefully (ADR 0019).
     graceful_shutdown(
+        &mut stop,
+        &mut decommission,
         Duration::from_secs(config.runtime.shutdown_grace_secs),
         &shutdown,
         &connections,
@@ -5166,6 +5175,8 @@ fn wire_limits_from_config(
 /// crash mid-decommission is just a crash, handled by the survivors.
 #[allow(clippy::too_many_arguments)]
 async fn graceful_shutdown(
+    stop: &mut StopSignals,
+    decommission: &mut DecommissionSignal,
     grace: Duration,
     shutdown: &tokio_util::sync::CancellationToken,
     connections: &tokio_util::task::TaskTracker,
@@ -5179,8 +5190,8 @@ async fn graceful_shutdown(
 ) {
     connections.close(); // no more spawns once the accept loops stop
     tokio::select! {
-        () = wait_for_shutdown_signal() => {}
-        () = wait_for_decommission_signal() => {
+        () = stop.recv() => {}
+        () = decommission.recv() => {
             // Fail readiness for the whole drain: orchestrators steer new
             // traffic elsewhere while this node hands its data off.
             draining.store(true, std::sync::atomic::Ordering::Release);
@@ -5210,7 +5221,7 @@ async fn graceful_shutdown(
                     () = drain.run() => {
                         warn!("decommission drain complete; proceeding with the graceful leave");
                     }
-                    () = wait_for_shutdown_signal() => {
+                    () = stop.recv() => {
                         warn!("shutdown signal during decommission drain; leaving with crash semantics (survivors recover)");
                     }
                 }
@@ -5240,7 +5251,7 @@ async fn graceful_shutdown(
             warn!("drain grace elapsed; forcing shutdown with connections still open");
             "grace-elapsed"
         }
-        () = wait_for_shutdown_signal() => {
+        () = stop.recv() => {
             warn!("second signal; forcing immediate shutdown");
             "second-signal"
         }
@@ -5272,49 +5283,95 @@ async fn graceful_shutdown(
     info!("shutdown complete");
 }
 
-/// Resolve once a decommission is requested: `SIGUSR1` (ADR 0043 P3). Pends
-/// forever on platforms without it (or if the handler cannot install) — plain
-/// shutdown signals still work.
-async fn wait_for_decommission_signal() {
+/// `SIGUSR1`, the decommission request (ADR 0043 P3), registered once at startup (see
+/// [`StopSignals`]). Its default action ends the process, so it is registered with the
+/// stop signals.
+struct DecommissionSignal {
     #[cfg(unix)]
-    {
-        use tokio::signal::unix::{signal, SignalKind};
-        match signal(SignalKind::user_defined1()) {
-            Ok(mut usr1) => {
-                let _ = usr1.recv().await;
-                return;
-            }
-            Err(e) => {
-                warn!(error = %e, "cannot install SIGUSR1 handler; decommission unavailable");
-            }
-        }
-    }
-    std::future::pending::<()>().await;
+    usr1: Option<tokio::signal::unix::Signal>,
 }
 
-/// Resolve once a shutdown signal arrives: `SIGTERM` (the orchestrator stop signal) or
-/// `SIGINT` (Ctrl-C). Called again during drain so a *second* signal can escalate to an
-/// immediate exit.
-async fn wait_for_shutdown_signal() {
+impl DecommissionSignal {
+    fn install() -> Self {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            let usr1 = signal(SignalKind::user_defined1())
+                .inspect_err(|e| {
+                    warn!(error = %e, "cannot install SIGUSR1 handler; decommission unavailable");
+                })
+                .ok();
+            Self { usr1 }
+        }
+        #[cfg(not(unix))]
+        Self {}
+    }
+
+    /// Resolve once a decommission is requested. Pends forever on platforms without
+    /// `SIGUSR1` (or if the handler could not install): plain shutdown signals still work.
+    async fn recv(&mut self) {
+        #[cfg(unix)]
+        if let Some(usr1) = &mut self.usr1 {
+            let _ = usr1.recv().await;
+            return;
+        }
+        std::future::pending::<()>().await;
+    }
+}
+
+/// The shutdown signals, `SIGTERM` (the orchestrator stop) and `SIGINT` (Ctrl-C),
+/// registered once, before the client listeners bind. A signal that arrives before
+/// [`recv`](Self::recv) is first awaited is kept, not lost and not left to the default
+/// action that ends the process. Received again during the drain, a second signal
+/// escalates to an immediate exit.
+struct StopSignals {
     #[cfg(unix)]
-    {
-        use tokio::signal::unix::{signal, SignalKind};
-        match signal(SignalKind::terminate()) {
-            Ok(mut term) => {
-                tokio::select! {
-                    _ = tokio::signal::ctrl_c() => {}
-                    _ = term.recv() => {}
+    term: Option<tokio::signal::unix::Signal>,
+    #[cfg(unix)]
+    int: Option<tokio::signal::unix::Signal>,
+}
+
+impl StopSignals {
+    fn install() -> Self {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            let term = signal(SignalKind::terminate())
+                .inspect_err(|e| {
+                    warn!(error = %e, "cannot install SIGTERM handler; only Ctrl-C stops the broker");
+                })
+                .ok();
+            let int = signal(SignalKind::interrupt())
+                .inspect_err(|e| warn!(error = %e, "cannot install SIGINT handler"))
+                .ok();
+            Self { term, int }
+        }
+        #[cfg(not(unix))]
+        Self {}
+    }
+
+    /// Resolve once a shutdown signal has arrived (since registration, or since the last
+    /// call).
+    async fn recv(&mut self) {
+        #[cfg(unix)]
+        {
+            async fn next(s: &mut Option<tokio::signal::unix::Signal>) {
+                match s {
+                    Some(s) => {
+                        let _ = s.recv().await;
+                    }
+                    None => std::future::pending::<()>().await,
                 }
             }
-            Err(e) => {
-                warn!(error = %e, "cannot install SIGTERM handler; only Ctrl-C stops the broker");
-                let _ = tokio::signal::ctrl_c().await;
+            tokio::select! {
+                () = next(&mut self.term) => {}
+                () = next(&mut self.int) => {}
             }
         }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = tokio::signal::ctrl_c().await;
+        #[cfg(not(unix))]
+        {
+            let _ = tokio::signal::ctrl_c().await;
+        }
     }
 }
 

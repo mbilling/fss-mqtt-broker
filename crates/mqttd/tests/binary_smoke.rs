@@ -5,10 +5,11 @@
 
 mod common;
 mod listen_wait;
+mod proc_common;
 
 use std::io::Read as _;
 use std::net::SocketAddr;
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use common::Client;
@@ -24,31 +25,66 @@ impl Drop for ChildGuard {
     }
 }
 
-/// Reserve an ephemeral port, then release it for the broker to bind. A small race
-/// window, acceptable on loopback for a short-lived test.
+/// A port for the broker to bind, from the shared test band (`proc_common`), not the
+/// kernel's ephemeral range. A port released from the ephemeral range is handed straight
+/// back out as the source port of an outgoing connect, and these tests make hundreds of
+/// connects: under parallel load the broker then lost its port before binding it.
 fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+    proc_common::free_tcp_port()
 }
 
-/// Wait for the broker's own log to report binding every address, or panic (#827). A bare
-/// TCP connect can be answered by another test process that holds a released port, so
-/// the broker's stdout must be piped and `RUST_LOG` must pass `mqttd`'s info lines.
-/// Returns the log, which the reader keeps draining.
-async fn wait_until_listening(child: &mut Child, addrs: &[SocketAddr]) -> listen_wait::Log {
-    listen_wait::wait_bound(child, addrs, listen_wait::BIND_TIMEOUT)
-        .await
-        .unwrap_or_else(|why| panic!("{why}"))
+/// Spawn the broker `make` builds for `addr`, on a fresh band port, until it reports
+/// binding that address; a broker that exits first lost its port to another process and
+/// is retried (#827). The returned [`listen_wait::Log`] keeps collecting its stdout.
+async fn spawn_smoke(
+    mut make: impl FnMut(SocketAddr) -> Command,
+) -> (ChildGuard, listen_wait::Log, SocketAddr) {
+    let (child, log, addr) = listen_wait::spawn_listening_logged(|| {
+        let addr: SocketAddr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+        (make(addr), vec![addr], addr)
+    })
+    .await;
+    (ChildGuard(child), log, addr)
 }
 
-/// As [`wait_until_listening`], for a broker logging to the file at `path`.
-async fn wait_until_logged(child: &mut Child, path: &std::path::Path, addrs: &[SocketAddr]) {
-    listen_wait::wait_logged_file(child, path, addrs, listen_wait::BIND_TIMEOUT)
+/// As [`spawn_smoke`], for a broker whose stdout goes to a log FILE (a test that reads
+/// the log while the broker runs). `make` gets `n` fresh band addresses and the log file
+/// to send stdout to; `RUST_LOG` must pass `mqttd`'s info lines. Returns the broker, the
+/// log file and the addresses.
+async fn spawn_smoke_to_file(
+    n: usize,
+    mut make: impl FnMut(&[SocketAddr], std::fs::File) -> Command,
+) -> (ChildGuard, tempfile::NamedTempFile, Vec<SocketAddr>) {
+    let mut failures = Vec::new();
+    for attempt in 1..=3 {
+        let addrs: Vec<SocketAddr> = (0..n)
+            .map(|_| format!("127.0.0.1:{}", free_port()).parse().unwrap())
+            .collect();
+        let log = tempfile::NamedTempFile::new().expect("broker log file");
+        let sink = log.reopen().expect("broker log handle");
+        let child = make(&addrs, sink)
+            .spawn()
+            .expect("failed to spawn the mqttd binary");
+        let mut guard = ChildGuard(child);
+        match listen_wait::wait_logged_file(
+            &mut guard.0,
+            log.path(),
+            &addrs,
+            listen_wait::BIND_TIMEOUT,
+        )
         .await
-        .unwrap_or_else(|why| panic!("{why}"));
+        {
+            Ok(()) => return (guard, log, addrs),
+            Err(why) => {
+                eprintln!("attempt {attempt}: {why}");
+                failures.push(why);
+            }
+        }
+    }
+    panic!(
+        "mqttd failed to bind in 3 attempts on fresh ports:\n{}",
+        failures.join("\n---\n")
+    );
 }
 
 /// Run a CLI invocation with unusable config and an unopened data path. A
@@ -213,25 +249,22 @@ fn durable_on_with_no_data_dir_refuses_to_start() {
 /// still fires. The flag permits the mode; it must never silence the loud register.
 #[tokio::test]
 async fn the_ephemeral_opt_in_boots_and_still_warns() {
-    let addr: SocketAddr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_mqttd"));
-    for (k, _) in std::env::vars() {
-        if k.starts_with("MQTTD_") {
-            cmd.env_remove(k);
+    let (mut guard, log, _addr) = spawn_smoke(|addr| {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_mqttd"));
+        for (k, _) in std::env::vars() {
+            if k.starts_with("MQTTD_") {
+                cmd.env_remove(k);
+            }
         }
-    }
-    let child = cmd
-        .env("MQTTD_NODE_ID", "opted-ephemeral")
-        .env("MQTTD_PLAINTEXT_BIND", addr.to_string())
-        .env("MQTTD_ALLOW_EPHEMERAL_DURABILITY", "1")
-        .env("RUST_LOG", "mqttd=info")
-        // The tracing subscriber writes to STDOUT; that is where the warning lands.
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("failed to spawn the mqttd binary");
-    let mut guard = ChildGuard(child);
-    let log = wait_until_listening(&mut guard.0, &[addr]).await;
+        cmd.env("MQTTD_NODE_ID", "opted-ephemeral")
+            .env("MQTTD_PLAINTEXT_BIND", addr.to_string())
+            .env("MQTTD_ALLOW_EPHEMERAL_DURABILITY", "1")
+            .env("RUST_LOG", "mqttd=info")
+            // The tracing subscriber writes to STDOUT; that is where the warning lands.
+            .stderr(Stdio::null());
+        cmd
+    })
+    .await;
     // The broker is up (the opt-in worked); kill it and read the captured log.
     let _ = guard.0.kill();
     let _ = guard.0.wait();
@@ -244,23 +277,19 @@ async fn the_ephemeral_opt_in_boots_and_still_warns() {
 
 #[tokio::test]
 async fn binary_serves_a_plaintext_pubsub_roundtrip() {
-    let addr: SocketAddr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
-
     // Launch the actual binary as a child process with a plaintext listener.
-    let child = Command::new(env!("CARGO_BIN_EXE_mqttd"))
-        .env("MQTTD_NODE_ID", "smoke")
-        .env("MQTTD_PLAINTEXT_BIND", addr.to_string())
-        .env("MQTTD_ALLOW_ANONYMOUS", "1")
-        // Ephemeral durability needs the explicit opt-in (#240); tests are its use case.
-        .env("MQTTD_ALLOW_EPHEMERAL_DURABILITY", "1")
-        .env("RUST_LOG", "mqttd=info")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("failed to spawn the mqttd binary");
-    let mut guard = ChildGuard(child);
-
-    wait_until_listening(&mut guard.0, &[addr]).await;
+    let (_guard, _log, addr) = spawn_smoke(|addr| {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_mqttd"));
+        cmd.env("MQTTD_NODE_ID", "smoke")
+            .env("MQTTD_PLAINTEXT_BIND", addr.to_string())
+            .env("MQTTD_ALLOW_ANONYMOUS", "1")
+            // Ephemeral durability needs the explicit opt-in (#240); tests are its use case.
+            .env("MQTTD_ALLOW_EPHEMERAL_DURABILITY", "1")
+            .env("RUST_LOG", "mqttd=info")
+            .stderr(Stdio::null());
+        cmd
+    })
+    .await;
 
     // A full pub/sub round-trip through the real server process.
     let mut sub = Client::connect(addr, "smoke-sub").await;
@@ -305,20 +334,18 @@ async fn connect_when_slot_frees(addr: SocketAddr, id: &str) -> Client {
 /// at accept (no CONNACK), and a slot freed by a disconnect is reusable.
 #[tokio::test]
 async fn max_connections_cap_refuses_at_accept_and_recovers() {
-    let addr: SocketAddr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
-    let child = Command::new(env!("CARGO_BIN_EXE_mqttd"))
-        .env("MQTTD_NODE_ID", "cap")
-        .env("MQTTD_ALLOW_EPHEMERAL_DURABILITY", "1")
-        .env("MQTTD_PLAINTEXT_BIND", addr.to_string())
-        .env("MQTTD_ALLOW_ANONYMOUS", "1")
-        .env("MQTTD_MAX_CONNECTIONS", "2")
-        .env("RUST_LOG", "mqttd=info")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("failed to spawn the mqttd binary");
-    let mut guard = ChildGuard(child);
-    wait_until_listening(&mut guard.0, &[addr]).await;
+    let (_guard, _log, addr) = spawn_smoke(|addr| {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_mqttd"));
+        cmd.env("MQTTD_NODE_ID", "cap")
+            .env("MQTTD_ALLOW_EPHEMERAL_DURABILITY", "1")
+            .env("MQTTD_PLAINTEXT_BIND", addr.to_string())
+            .env("MQTTD_ALLOW_ANONYMOUS", "1")
+            .env("MQTTD_MAX_CONNECTIONS", "2")
+            .env("RUST_LOG", "mqttd=info")
+            .stderr(Stdio::null());
+        cmd
+    })
+    .await;
 
     // The readiness probes above consumed slots transiently; connect the two
     // holders with the tolerant variant.
@@ -345,20 +372,18 @@ async fn max_connections_cap_refuses_at_accept_and_recovers() {
 /// is refused at accept while the first stays served, and the slot recycles.
 #[tokio::test]
 async fn per_ip_cap_refuses_a_second_connection_from_the_same_address() {
-    let addr: SocketAddr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
-    let child = Command::new(env!("CARGO_BIN_EXE_mqttd"))
-        .env("MQTTD_NODE_ID", "ipcap")
-        .env("MQTTD_ALLOW_EPHEMERAL_DURABILITY", "1")
-        .env("MQTTD_PLAINTEXT_BIND", addr.to_string())
-        .env("MQTTD_ALLOW_ANONYMOUS", "1")
-        .env("MQTTD_MAX_CONNECTIONS_PER_IP", "1")
-        .env("RUST_LOG", "mqttd=info")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("failed to spawn the mqttd binary");
-    let mut guard = ChildGuard(child);
-    wait_until_listening(&mut guard.0, &[addr]).await;
+    let (_guard, _log, addr) = spawn_smoke(|addr| {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_mqttd"));
+        cmd.env("MQTTD_NODE_ID", "ipcap")
+            .env("MQTTD_ALLOW_EPHEMERAL_DURABILITY", "1")
+            .env("MQTTD_PLAINTEXT_BIND", addr.to_string())
+            .env("MQTTD_ALLOW_ANONYMOUS", "1")
+            .env("MQTTD_MAX_CONNECTIONS_PER_IP", "1")
+            .env("RUST_LOG", "mqttd=info")
+            .stderr(Stdio::null());
+        cmd
+    })
+    .await;
 
     let mut only = connect_when_slot_frees(addr, "ip-1").await;
     // Everything in this test comes from 127.0.0.1: the second is refused.
@@ -439,21 +464,19 @@ async fn repeated_auth_failures_penalize_the_source_address_then_decay() {
     let pw_path = std::env::temp_dir().join(format!("mqttd-pen-{}.pw", std::process::id()));
     std::fs::write(&pw_path, format!("alice:{phc}\n")).unwrap();
 
-    let addr: SocketAddr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
-    let child = Command::new(env!("CARGO_BIN_EXE_mqttd"))
-        .env("MQTTD_NODE_ID", "penalty")
-        .env("MQTTD_ALLOW_EPHEMERAL_DURABILITY", "1")
-        .env("MQTTD_PLAINTEXT_BIND", addr.to_string())
-        .env("MQTTD_PASSWORD_FILE", &pw_path)
-        .env("MQTTD_AUTH_PENALTY_THRESHOLD", "2")
-        .env("MQTTD_AUTH_PENALTY_DECAY_SECS", "1")
-        .env("RUST_LOG", "mqttd=info")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("failed to spawn the mqttd binary");
-    let mut guard = ChildGuard(child);
-    wait_until_listening(&mut guard.0, &[addr]).await;
+    let (_guard, _log, addr) = spawn_smoke(|addr| {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_mqttd"));
+        cmd.env("MQTTD_NODE_ID", "penalty")
+            .env("MQTTD_ALLOW_EPHEMERAL_DURABILITY", "1")
+            .env("MQTTD_PLAINTEXT_BIND", addr.to_string())
+            .env("MQTTD_PASSWORD_FILE", &pw_path)
+            .env("MQTTD_AUTH_PENALTY_THRESHOLD", "2")
+            .env("MQTTD_AUTH_PENALTY_DECAY_SECS", "1")
+            .env("RUST_LOG", "mqttd=info")
+            .stderr(Stdio::null());
+        cmd
+    })
+    .await;
     let _cleanup = scopeguard(pw_path.clone());
 
     // Two failed authentications from 127.0.0.2: each gets its CONNACK 0x04.
@@ -510,27 +533,24 @@ fn scopeguard(path: std::path::PathBuf) -> impl Drop {
 /// announcement, closing record — is pinned end to end on the real binary.
 #[tokio::test]
 async fn a_graceful_stop_closes_the_audit_chain() {
-    let addr: SocketAddr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_mqttd"));
-    for (k, _) in std::env::vars() {
-        if k.starts_with("MQTTD_") {
-            cmd.env_remove(k);
+    let (mut guard, log, _addr) = spawn_smoke(|addr| {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_mqttd"));
+        for (k, _) in std::env::vars() {
+            if k.starts_with("MQTTD_") {
+                cmd.env_remove(k);
+            }
         }
-    }
-    let child = cmd
-        .env("MQTTD_NODE_ID", "audit-close")
-        .env("MQTTD_PLAINTEXT_BIND", addr.to_string())
-        .env("MQTTD_ALLOW_ANONYMOUS", "1")
-        .env("MQTTD_DURABLE_SESSIONS", "0")
-        .env("MQTTD_SHUTDOWN_GRACE", "5")
-        // The tracing subscriber writes to STDOUT; capture that, not stderr.
-        .env("RUST_LOG", "info")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("failed to spawn the mqttd binary");
-    let mut guard = ChildGuard(child);
-    let log = wait_until_listening(&mut guard.0, &[addr]).await;
+        cmd.env("MQTTD_NODE_ID", "audit-close")
+            .env("MQTTD_PLAINTEXT_BIND", addr.to_string())
+            .env("MQTTD_ALLOW_ANONYMOUS", "1")
+            .env("MQTTD_DURABLE_SESSIONS", "0")
+            .env("MQTTD_SHUTDOWN_GRACE", "5")
+            // The tracing subscriber writes to STDOUT; capture that, not stderr.
+            .env("RUST_LOG", "info")
+            .stderr(Stdio::null());
+        cmd
+    })
+    .await;
 
     let pid = guard.0.id();
     let sent = Command::new("kill")
@@ -585,7 +605,6 @@ async fn a_graceful_stop_closes_the_audit_chain() {
 /// what the SIEM holds is enough to detect any rewrite.
 #[tokio::test]
 async fn the_audit_export_ships_a_verifiable_chain() {
-    let addr: SocketAddr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
     let syslog = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let syslog_addr = syslog.local_addr().unwrap().to_string();
     let collector = std::thread::spawn(move || {
@@ -605,26 +624,24 @@ async fn the_audit_export_ships_a_verifiable_chain() {
         String::from_utf8_lossy(&buf).into_owned()
     });
 
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_mqttd"));
-    for (k, _) in std::env::vars() {
-        if k.starts_with("MQTTD_") {
-            cmd.env_remove(k);
+    let (mut guard, _log, addr) = spawn_smoke(|addr| {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_mqttd"));
+        for (k, _) in std::env::vars() {
+            if k.starts_with("MQTTD_") {
+                cmd.env_remove(k);
+            }
         }
-    }
-    let child = cmd
-        .env("MQTTD_NODE_ID", "audit-export")
-        .env("MQTTD_PLAINTEXT_BIND", addr.to_string())
-        .env("MQTTD_ALLOW_ANONYMOUS", "1")
-        .env("MQTTD_DURABLE_SESSIONS", "0")
-        .env("MQTTD_SHUTDOWN_GRACE", "5")
-        .env("MQTTD_AUDIT_SYSLOG", &syslog_addr)
-        .env("RUST_LOG", "mqttd=info")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("failed to spawn the mqttd binary");
-    let mut guard = ChildGuard(child);
-    wait_until_listening(&mut guard.0, &[addr]).await;
+        cmd.env("MQTTD_NODE_ID", "audit-export")
+            .env("MQTTD_PLAINTEXT_BIND", addr.to_string())
+            .env("MQTTD_ALLOW_ANONYMOUS", "1")
+            .env("MQTTD_DURABLE_SESSIONS", "0")
+            .env("MQTTD_SHUTDOWN_GRACE", "5")
+            .env("MQTTD_AUDIT_SYSLOG", &syslog_addr)
+            .env("RUST_LOG", "mqttd=info")
+            .stderr(Stdio::null());
+        cmd
+    })
+    .await;
 
     // One real client connect produces an auth.success record between genesis
     // and shutdown, so the verified chain is not vacuously genesis-only.
@@ -722,55 +739,39 @@ async fn the_listener_survives_fd_exhaustion_and_accepts_again() {
     const FD_LIMIT: usize = 128;
     const SOCKETS: usize = 400;
 
-    let addr: SocketAddr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
-    let logs = tempfile::NamedTempFile::new().expect("broker log file");
-    let log_path = logs.path().to_path_buf();
-    let log_sink = logs.reopen().expect("broker log handle");
-    let mut cmd = Command::new("/bin/sh");
-    cmd.arg("-c")
-        .arg(format!("ulimit -n {FD_LIMIT}; exec \"$0\""))
-        .arg(env!("CARGO_BIN_EXE_mqttd"));
-    for (k, _) in std::env::vars() {
-        if k.starts_with("MQTTD_") {
-            cmd.env_remove(k);
+    let (mut guard, logs, addrs) = spawn_smoke_to_file(1, |addrs, sink| {
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c")
+            .arg(format!("ulimit -n {FD_LIMIT}; exec \"$0\""))
+            .arg(env!("CARGO_BIN_EXE_mqttd"));
+        for (k, _) in std::env::vars() {
+            if k.starts_with("MQTTD_") {
+                cmd.env_remove(k);
+            }
         }
-    }
-    let child = cmd
-        .env("MQTTD_NODE_ID", "fd-squeeze")
-        .env("MQTTD_PLAINTEXT_BIND", addr.to_string())
-        .env("MQTTD_ALLOW_ANONYMOUS", "1")
-        .env("MQTTD_ALLOW_EPHEMERAL_DURABILITY", "1")
-        .env("RUST_LOG", "warn,mqttd=info")
-        // STDOUT to a FILE, not a pipe: the accept-failure warning is the observable
-        // this test waits on, and a pipe cannot be read until the child ends.
-        .stdout(Stdio::from(log_sink))
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("failed to spawn the mqttd binary");
-    let mut guard = ChildGuard(child);
-
-    wait_until_logged(&mut guard.0, &log_path, &[addr]).await;
+        cmd.env("MQTTD_NODE_ID", "fd-squeeze")
+            .env("MQTTD_PLAINTEXT_BIND", addrs[0].to_string())
+            .env("MQTTD_ALLOW_ANONYMOUS", "1")
+            .env("MQTTD_ALLOW_EPHEMERAL_DURABILITY", "1")
+            .env("RUST_LOG", "warn,mqttd=info")
+            // STDOUT to a FILE, not a pipe: the accept-failure warning is the observable
+            // this test waits on, and a pipe cannot be read until the child ends.
+            .stdout(Stdio::from(sink))
+            .stderr(Stdio::null());
+        cmd
+    })
+    .await;
+    let (addr, log_path) = (addrs[0], logs.path().to_path_buf());
 
     // Squeeze: hold far more sockets open than the broker has descriptors, so its
     // accept() runs out. Held in a Vec — dropping one would hand the fd back.
+    //
+    // Keep connecting until the WALL ITSELF is observed, not for one burst: the squeeze
+    // is only on once the broker has actually failed an accept, and if it never does
+    // then nothing below proves anything about surviving one. A failed or slow connect
+    // does not end it — under parallel load one burst gave up after a handful of
+    // sockets, far short of the broker's 128 descriptors.
     let mut held = Vec::with_capacity(SOCKETS);
-    for _ in 0..SOCKETS {
-        match tokio::time::timeout(
-            Duration::from_millis(200),
-            tokio::net::TcpStream::connect(addr),
-        )
-        .await
-        {
-            Ok(Ok(s)) => held.push(s),
-            // Refused/timed out is fine and expected once the backlog fills: the
-            // squeeze is already on by then.
-            _ => break,
-        }
-    }
-    // Wait for the WALL ITSELF, not for a duration: the squeeze is only on once
-    // the broker has actually failed an accept, and if it never does then nothing
-    // below proves anything about surviving one. A bounded poll says which of
-    // those happened; a sleep would have let a silent no-op read as a pass.
     let squeeze_deadline = std::time::Instant::now() + Duration::from_secs(20);
     let squeezed = loop {
         if std::fs::read_to_string(&log_path)
@@ -782,12 +783,19 @@ async fn the_listener_survives_fd_exhaustion_and_accepts_again() {
         if std::time::Instant::now() >= squeeze_deadline {
             break false;
         }
+        if held.len() < SOCKETS {
+            if let Some(s) = try_connect(addr).await {
+                held.push(s);
+                continue;
+            }
+        }
         tokio::time::sleep(Duration::from_millis(50)).await;
     };
     assert!(
         squeezed,
-        "the squeeze never forced an accept error in 20s, so this test proves nothing \
+        "holding {} sockets, the squeeze never forced an accept error in 20s, so this test proves nothing \
          about surviving one — raise SOCKETS or lower FD_LIMIT. Log: {}",
+        held.len(),
         std::fs::read_to_string(&log_path).unwrap_or_default()
     );
 
@@ -914,65 +922,78 @@ async fn the_health_and_peer_listeners_survive_fd_exhaustion() {
     const CLIENT_SOCKETS: usize = 300;
     const SIDE_SOCKETS: usize = 40;
 
-    let mqtt: SocketAddr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
-    let health: SocketAddr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
-    let peer: SocketAddr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
-    let logs = tempfile::NamedTempFile::new().expect("broker log file");
-    let log_path = logs.path().to_path_buf();
-    let log_sink = logs.reopen().expect("broker log handle");
-    let mut cmd = Command::new("/bin/sh");
-    cmd.arg("-c")
-        .arg(format!("ulimit -n {FD_LIMIT}; exec \"$0\""))
-        .arg(env!("CARGO_BIN_EXE_mqttd"));
-    for (k, _) in std::env::vars() {
-        if k.starts_with("MQTTD_") {
-            cmd.env_remove(k);
+    let (mut guard, logs, addrs) = spawn_smoke_to_file(3, |addrs, sink| {
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c")
+            .arg(format!("ulimit -n {FD_LIMIT}; exec \"$0\""))
+            .arg(env!("CARGO_BIN_EXE_mqttd"));
+        for (k, _) in std::env::vars() {
+            if k.starts_with("MQTTD_") {
+                cmd.env_remove(k);
+            }
         }
-    }
-    let child = cmd
-        .env("MQTTD_NODE_ID", "fd-squeeze-side")
-        .env("MQTTD_PLAINTEXT_BIND", mqtt.to_string())
-        .env("MQTTD_HEALTH_BIND", health.to_string())
-        .env("MQTTD_PEER_BIND", peer.to_string())
-        .env("MQTTD_ALLOW_ANONYMOUS", "1")
-        .env("MQTTD_ALLOW_EPHEMERAL_DURABILITY", "1")
-        .env("RUST_LOG", "warn,mqttd=info")
-        .stdout(Stdio::from(log_sink))
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("failed to spawn the mqttd binary");
-    let mut guard = ChildGuard(child);
-    wait_until_logged(&mut guard.0, &log_path, &[mqtt, health, peer]).await;
+        cmd.env("MQTTD_NODE_ID", "fd-squeeze-side")
+            .env("MQTTD_PLAINTEXT_BIND", addrs[0].to_string())
+            .env("MQTTD_HEALTH_BIND", addrs[1].to_string())
+            .env("MQTTD_PEER_BIND", addrs[2].to_string())
+            .env("MQTTD_ALLOW_ANONYMOUS", "1")
+            .env("MQTTD_ALLOW_EPHEMERAL_DURABILITY", "1")
+            .env("RUST_LOG", "warn,mqttd=info")
+            .stdout(Stdio::from(sink))
+            .stderr(Stdio::null());
+        cmd
+    })
+    .await;
+    let (mqtt, health, peer) = (addrs[0], addrs[1], addrs[2]);
+    let log_path = logs.path().to_path_buf();
 
     // Exhaust the descriptors through the client listener, then knock on the other two so
     // their accept() runs into the full table.
+    //
+    // Until BOTH have logged the failure, not one burst: a knock sent before the client
+    // squeeze has filled the table is accepted normally, and under parallel load one
+    // burst of knocks often all landed before the table was full, so neither listener
+    // ever hit the wall. Each knock is retried until its listener has.
     let mut held = Vec::new();
-    for _ in 0..CLIENT_SOCKETS {
-        match try_connect(mqtt).await {
-            Some(s) => held.push(s),
-            None => break,
-        }
-    }
-    for _ in 0..SIDE_SOCKETS {
-        for addr in [health, peer] {
-            held.extend(try_connect(addr).await);
-        }
-    }
+    let (mut clients, mut side) = (0, [0usize; 2]);
     let squeeze_deadline = std::time::Instant::now() + Duration::from_secs(20);
     let squeezed = loop {
         let log = plain_log(&log_path);
-        if logged_accept_failure(&log, "health") && logged_accept_failure(&log, "peer") {
+        let failed = [
+            logged_accept_failure(&log, "health"),
+            logged_accept_failure(&log, "peer"),
+        ];
+        if failed == [true, true] {
             break true;
         }
         if std::time::Instant::now() >= squeeze_deadline {
             break false;
         }
+        if clients < CLIENT_SOCKETS {
+            if let Some(s) = try_connect(mqtt).await {
+                held.push(s);
+                clients += 1;
+                continue;
+            }
+        }
+        for (i, addr) in [health, peer].into_iter().enumerate() {
+            if !failed[i] && side[i] < SIDE_SOCKETS {
+                if let Some(s) = try_connect(addr).await {
+                    held.push(s);
+                    side[i] += 1;
+                }
+            }
+        }
         tokio::time::sleep(Duration::from_millis(50)).await;
     };
     assert!(
         squeezed,
-        "the squeeze never forced an accept error on BOTH the health and the peer \
+        "holding {} sockets (health failed: {}, peer failed: {}), the squeeze never forced an \
+         accept error on BOTH the health and the peer \
          listener in 20s, so this test proves nothing about surviving one. Log: {}",
+        held.len(),
+        logged_accept_failure(&plain_log(&log_path), "health"),
+        logged_accept_failure(&plain_log(&log_path), "peer"),
         plain_log(&log_path)
     );
     drop(held);
@@ -1011,4 +1032,71 @@ fn a_bound_line_names_the_exact_address() {
         "INFO mqttd: serving health endpoints bind=127.0.0.1:20002 min_members=1",
         "127.0.0.1:20002"
     ));
+}
+
+/// A stop that lands right after the client listener binds drains, not kills. The SIGTERM
+/// handler used to be registered only when startup finished and the drain began waiting,
+/// so a stop in the tail of startup (the admin listener, the reload handlers) took the
+/// signal's default action: the process died by signal 15, a node already serving clients
+/// went with no drain and no closing audit record. The stop signals are now registered
+/// before the client listeners bind. The signal goes from the log reader the moment the
+/// bind line appears, the earliest an orchestrator could see the node serving.
+#[cfg(unix)]
+#[test]
+fn a_stop_right_after_the_client_bind_drains_instead_of_killing() {
+    use rustix::process::{kill_process, Pid, Signal};
+    use std::io::{BufRead, BufReader};
+    let (mut round, mut lost_port) = (0, 0);
+    while round < 10 {
+        let addr: SocketAddr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_mqttd"));
+        for (k, _) in std::env::vars() {
+            if k.starts_with("MQTTD_") {
+                cmd.env_remove(k);
+            }
+        }
+        let child = cmd
+            .env("MQTTD_NODE_ID", "early-stop")
+            .env("MQTTD_PLAINTEXT_BIND", addr.to_string())
+            .env("MQTTD_ALLOW_ANONYMOUS", "1")
+            .env("MQTTD_DURABLE_SESSIONS", "0")
+            .env("MQTTD_SHUTDOWN_GRACE", "5")
+            .env("RUST_LOG", "mqttd=info")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("failed to spawn the mqttd binary");
+        let mut guard = ChildGuard(child);
+        let pid = Pid::from_raw(i32::try_from(guard.0.id()).unwrap()).unwrap();
+        let mut log = Vec::new();
+        let mut signalled = false;
+        for line in BufReader::new(guard.0.stdout.take().unwrap()).lines() {
+            let Ok(line) = line else { break };
+            if !signalled && listen_wait::reports_bound(&line, &addr.to_string()) {
+                kill_process(pid, Signal::TERM).expect("send SIGTERM");
+                signalled = true;
+            }
+            log.push(line);
+        }
+        // EOF: the process has exited (or closed stdout on its way out).
+        let status = guard.0.wait().expect("wait");
+        if !signalled {
+            // The broker exited before binding: another process took the port between
+            // its release and the bind. Not this test's subject; take a fresh port.
+            lost_port += 1;
+            assert!(
+                lost_port <= 5,
+                "round {round}: the broker exited before binding {lost_port} times; log:\n{}",
+                log.join("\n")
+            );
+            continue;
+        }
+        assert!(
+            status.success(),
+            "round {round}: a SIGTERM right after the bind must drain and exit 0, got \
+             {status:?}; log:\n{}",
+            log.join("\n")
+        );
+        round += 1;
+    }
 }

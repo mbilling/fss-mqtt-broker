@@ -129,25 +129,34 @@ pub async fn wait_bound(
 
 /// Spawn a broker from `make` until it reports binding every address `make` returned:
 /// `make` builds the command on fresh ports and returns it, the addresses to wait for,
-/// and any context the caller needs back (a temp dir, the ports). Stdout is piped and
-/// `RUST_LOG` set to `mqttd=info`, overriding the caller's. A child that exits before
-/// binding (it lost a port) is reaped and `make` is called again, up to three times.
+/// and any context the caller needs back (a temp dir, the ports). Stdout is piped. When
+/// the command sets no `RUST_LOG`, it gets `mqttd=info`; one it sets must pass `mqttd`'s
+/// info lines. A child that exits before binding (it lost a port) is reaped and `make` is
+/// called again, up to three times.
 ///
 /// # Panics
 /// When every attempt fails.
-pub async fn spawn_listening<T>(
+pub async fn spawn_listening<T>(make: impl FnMut() -> (Command, Vec<SocketAddr>, T)) -> (Child, T) {
+    let (child, _log, ctx) = spawn_listening_logged(make).await;
+    (child, ctx)
+}
+
+/// As [`spawn_listening`], also returning the broker's [`Log`], which keeps collecting.
+///
+/// # Panics
+/// When every attempt fails.
+pub async fn spawn_listening_logged<T>(
     mut make: impl FnMut() -> (Command, Vec<SocketAddr>, T),
-) -> (Child, T) {
+) -> (Child, Log, T) {
     let mut failures = Vec::new();
     for attempt in 1..=ATTEMPTS {
         let (mut cmd, addrs, ctx) = make();
-        let mut child = cmd
-            .env("RUST_LOG", "mqttd=info")
-            .stdout(Stdio::piped())
-            .spawn()
-            .expect("spawn mqttd");
+        if !cmd.get_envs().any(|(k, _)| k == "RUST_LOG") {
+            cmd.env("RUST_LOG", "mqttd=info");
+        }
+        let mut child = cmd.stdout(Stdio::piped()).spawn().expect("spawn mqttd");
         match wait_bound(&mut child, &addrs, BIND_TIMEOUT).await {
-            Ok(_log) => return (child, ctx),
+            Ok(log) => return (child, log, ctx),
             Err(why) => {
                 let _ = child.kill();
                 let _ = child.wait();
