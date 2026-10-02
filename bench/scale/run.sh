@@ -419,8 +419,23 @@ for N in "${SIZES[@]}"; do
 			# Drop whatever key a pre-reboot poll may have re-recorded; the next
 			# rssh accepts the NEW boot's key fresh.
 			ssh-keygen -R "$ip" -f "$RUN/known_hosts" >/dev/null 2>&1 || true
-			rssh "$ip" "$CI_OK" ||
-				die "cloud-init failed on $ip even after a clean reboot — check /var/log/cloud-init-output.log there"
+			# `cloud-init status --wait` can run for minutes on a booting host, and the
+			# ssh session carrying it drops when the host goes quiet past the keepalive
+			# budget (10s) — the network is being reconfigured mid-boot. ssh exits 255
+			# for that; it is a lost connection, not a cloud-init verdict, so reconnect
+			# and ask again. Any other non-zero is cloud-init's own answer. Measured on
+			# 2026-10-02: a broker dropped the session ("server not responding"), the
+			# run died, and its cloud-init then finished cleanly 200 s after boot.
+			ci_deadline=$((SECONDS + 600))
+			while :; do
+				ci_rc=0
+				rssh "$ip" "$CI_OK" || ci_rc=$?
+				[ "$ci_rc" -eq 255 ] && [ "$SECONDS" -lt "$ci_deadline" ] || break
+				warn "ssh to $ip dropped while cloud-init was finishing — reconnecting"
+				sleep 5
+			done
+			[ "$ci_rc" -eq 0 ] ||
+				die "cloud-init failed on $ip even after a clean reboot (exit $ci_rc) — check /var/log/cloud-init-output.log there"
 		fi
 		# The lanes ride the private network; do not proceed until this host's
 		# private address is actually configured.
