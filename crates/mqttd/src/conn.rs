@@ -1932,7 +1932,9 @@ where
                         // Ingress credit (ADR 0082 T3), after the rate limit so a
                         // throttled publish holds no credit while it waits for a token.
                         let admission = match (&credit, &packet) {
-                            (Some(credit), Packet::Publish(publish)) => admit(credit, publish),
+                            (Some(credit), Packet::Publish(publish)) => {
+                                admit(credit, publish, inbound_aliases)
+                            }
                             _ => Ok(IngressAdmit::Credit(None)),
                         };
                         let admission = match admission {
@@ -2115,13 +2117,20 @@ struct Parked {
 /// Admit a client publish against the connection's ingress credit (ADR 0082 T3): the
 /// credit now, a shed `QoS` 0 under `shed-qos0`, or — `Err` — the wait for it. `QoS` 1
 /// and 2 always wait: a publish the broker will acknowledge is never shed.
+///
+/// The charge is for what the hub will hold (ADR 0082 T1): the topic as resolved, so an
+/// alias-only PUBLISH pays for the topic its alias stands for, and the properties
+/// alongside the payload.
 fn admit(
     credit: &crate::ingress::ConnCredit,
     publish: &Publish,
+    aliases: &InboundAliases,
 ) -> Result<IngressAdmit, futures_util::future::BoxFuture<'static, crate::ingress::IngressPermit>> {
-    let cost = credit
-        .node()
-        .cost(publish.topic.len(), publish.payload.len());
+    let topic_len = aliases.resolved_len(&publish.topic, publish.properties.topic_alias());
+    let cost = credit.node().cost(
+        topic_len,
+        publish.payload.len() + publish.properties.accounted_bytes(),
+    );
     if let Some(permit) = credit.try_acquire(cost) {
         return Ok(IngressAdmit::Credit(Some(permit)));
     }

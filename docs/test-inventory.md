@@ -1015,7 +1015,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 533 test(s)
+## `crates/mqttd/src/lib.rs` — 535 test(s)
 
 - `admin::cli::tests::all_nodes_asks_for_the_cluster_scope_on_the_verbs_that_have_one`
 - `admin::cli::tests::answers_render_as_tables_and_lines`
@@ -1122,6 +1122,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `conn::tests::graceful_shutdown_sends_v5_server_shutting_down_disconnect`
 - `conn::tests::idle_connection_is_closed_after_keepalive_grace`
 - `conn::tests::ingress_credit::a_paused_publisher_resumes_and_still_receives_while_paused`
+- `conn::tests::ingress_credit::an_alias_only_publish_pays_for_its_topic_and_its_properties`
 - `conn::tests::ingress_credit::keepalive_is_not_enforced_while_the_broker_pauses_the_connection`
 - `conn::tests::ingress_credit::under_pause_qos0_waits_rather_than_drops`
 - `conn::tests::ingress_credit::under_pause_the_queue_stays_within_the_pool_and_qos1_loses_nothing`
@@ -1331,6 +1332,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::a_windowed_commit_reaches_an_offline_durable_subscriber_on_resume`
 - `hub::tests::an_already_durable_append_does_not_overtake_a_waiting_one`
 - `hub::tests::an_expired_retained_value_is_not_replayed_and_is_reaped`
+- `hub::tests::an_idle_lane_gives_back_what_an_overload_grew`
 - `hub::tests::an_inflight_ceiling_caps_the_clients_own_receive_maximum`
 - `hub::tests::an_online_persistent_subscriber_receives_the_wire_send_only_after_the_append_resolves`
 - `hub::tests::an_online_session_whose_group_moved_is_closed_so_it_relocates`
@@ -1805,6 +1807,10 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `an_acked_qos1_in_flight_to_an_online_subscriber_survives_a_crash`
 - `an_acked_qos2_before_pubrec_republishes_dup_under_the_same_id`
 - `an_acked_qos2_past_pubrec_resumes_with_pubrel_under_the_same_id`
+
+## `crates/mqttd/tests/ingress_cost.rs` — 1 test(s)
+
+- `the_charge_covers_what_a_queued_publish_retains`
 
 ## `crates/mqttd/tests/ingress_credit.rs` — 2 test(s)
 

@@ -286,7 +286,7 @@ queue_overflow = "drop-oldest"       # or "reject-newest"
 # Requires /proc (Linux); elsewhere the broker logs that it is not enforcing and carries on.
 # memory_max_bytes = 2147483648      # 2 GiB
 # Hub ingress credit (ADR 0082 T3): the bytes of client publishes that may wait for the hub at
-# once (topic + payload + ~800 bytes each, held until the hub dispatches them). Past it a
+# once (topic + payload + properties + ~1,200 bytes each, held until the hub dispatches them). Past it a
 # connection stops reading its socket until credit frees — TCP backpressure, nothing lost.
 # Unset = 1/8 of memory_max_bytes when set, else 256 MiB. Minimum 4096.
 # hub_ingress_bytes = 268435456      # 256 MiB

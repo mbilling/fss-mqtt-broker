@@ -112,8 +112,9 @@ cap** (`MQTTD_CONN_INGRESS_BYTES`).
   bytes, first from its connection's allowance and then from the pool, before handing the
   command to the data lane.
 - **Charge:** `cost` is the topic length plus the payload length plus a fixed per-command
-  overhead calibrated in T1. The measured figure is about 800 B beyond the payload, so the
-  pool bounds *retained* memory, not just payload bytes.
+  overhead calibrated in T1, so the pool bounds *retained* memory, not just payload bytes.
+  As calibrated: `2 × size_of::<HubCommand>() + 384` (1,200 B today), with the properties
+  charged alongside the payload (T1 amendment below).
 - **Release:** the permit (an owned semaphore permit) **travels inside the command** and is
   released when the hub drops it after dispatch. The hub never acquires credit, so no
   credit cycle can form.
@@ -288,7 +289,8 @@ and the connection's serve loop):
   publish holds no credit while it waits for a token. Only a PUBLISH read from a client socket
   is charged; every other packet passes uncharged.
 - **The charge.** `topic + payload + 800` bytes. The 800 comes from #504's measured 1,019 B per
-  queued command at 200 B payloads, and stays until T1 measures it directly.
+  queued command at 200 B payloads, and stays until T1 measures it directly. (Superseded by
+  the T1 amendment below.)
 - **A paused connection keeps working.** The parked publish waits in its own `select!` branch,
   so deliveries to the client, PUBACK release and shutdown all continue while reading is
   stopped. The keepalive timer is disarmed while parked and restarts when reading resumes.
@@ -337,3 +339,59 @@ of such connections outlived the reset budget.
   covers clients that close or reset. A client that vanishes without either (power loss, a
   dropped network path) is still reaped by keepalive once reading resumes, so it stays
   bounded by the pause plus the grace period.
+
+## Amendment (2026-10-02): the charge, calibrated in T1
+
+**The measurement.** `crates/mqttd/tests/ingress_cost.rs` runs publishes down the
+connection's own path, under the release allocator (mimalloc):
+1. the production `FrameReader` decodes framed PUBLISHes from a stream read in TCP-sized
+   segments;
+2. each becomes a `HubCommand::Publish` and is queued;
+3. the test reads the RSS each queued command added.
+
+Topic and payload bytes are pseudo-random, because macOS compresses idle pages and
+identical bytes would read as almost nothing. Each case keeps its memory alive to the end,
+so the allocator cannot recycle one case's pages into the next. The test asserts the charge
+covers every case and is no more than 3× what is retained. It fails if the overhead drops
+to one slot.
+
+| Where the command waits | Retained beyond topic + payload |
+|---|---|
+| on the hub's channel (408-byte `HubCommand`) | 455-610 B |
+| in a hub lane (`VecDeque`) just past a doubling | 731-1,076 B |
+
+**The lane is the case that matters.** Under overload the hub moves its backlog off the
+channel into its lanes (T2), and a `VecDeque`'s capacity doubles. Just past a doubling, half
+its slots are empty, so one command can cost two 408-byte slots. Hence:
+
+**`COMMAND_OVERHEAD = 2 × size_of::<HubCommand>() + 384`**, which is 1,200 B today. It is
+derived from the slot, so the charge follows the command if the command grows. The 800 it
+replaces undercharged the lane case by up to about 25%. At the default 256 MiB pool and
+200-byte payloads, the pool now holds about 190,000 publishes, not 263,000. The cloud
+measurement it came from, 1,019 B per command, divided total RSS, baseline included, by the
+queue.
+
+Two undercharges are also fixed:
+- **Properties are charged with the payload**, using the same `accounted_bytes` the
+  subscriber backlog bound uses (#241). These bytes are publisher-controlled and held as
+  long as the payload: a 20-byte payload with 8 KiB of user properties was charged as
+  20 bytes. Peer forwards charge their properties too.
+- **An alias-only PUBLISH pays for the topic its alias stands for**
+  (`InboundAliases::resolved_len`), not for its empty wire topic.
+
+**The lanes shrink after an overload.** A `VecDeque` never shrinks on its own, so a lane
+that once held the pool would keep about 200 MB, two slots per command at the default pool,
+for the life of the process. The sweep now shrinks a lane that is three-quarters empty to
+twice what it holds, never below 1,024 slots.
+
+**The harness.** The process-level before / overload / idle / control sequence is the scale
+rig's knee harness (`bench/scale/482-per-node-knee.sh` with `run-curve.sh`). It drives a
+baseline rung, overload rungs, an idle and reset gate, and the same control rung, with no
+restart. It asserts delivery, p99, reset and admission. It also scrapes every broker's
+`/metrics` before and after each rung, which records RSS, the hub queue and credit in use,
+and fails on an unanswered scrape. T6 ran it in the cloud. The per-command
+cost above is the part CI can check on every PR.
+
+**Follow-up.** The slot is the largest term: two of them are 816 of the 1,200 bytes. Boxing
+`HubCommand`'s largest variants would shrink every queued command, and with it the charge.
+
