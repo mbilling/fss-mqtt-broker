@@ -162,7 +162,14 @@ remove. So peer data uses non-blocking admission:
 - **Remote QoS ≥ 1 is not charged.** The origin's pending-publish table already bounds how
   many of these exist per origin (#509). Charging them would turn a bounded obligation into
   a refusal path with version-skew cost, for no memory gain.
+- **A retained forward is not charged, whatever its QoS** (T4, 2026-10-02). It is this
+  node's only copy of the topic's retained state: shedding it would leave the node serving
+  a stale retained message until the next one, which outlasts the overload. Retained
+  updates are rare beside live traffic.
 - **Control and durable frames are never charged.**
+- The pool is the node's, with no per-link cap: one link carries many publishers. The
+  reader counts each shed on the shared credit, and the hub's once-a-second sweep moves the
+  count into the counter, so the reader needs no metrics handle.
 
 ### 4. What an operator sees
 

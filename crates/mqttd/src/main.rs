@@ -790,13 +790,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         let listener = TcpListener::bind(bind).await?;
         info!(%bind, mtls = peer_tls.is_some(), "accepting cluster peer links");
-        tokio::spawn(peer::serve_listener(
+        tokio::spawn(peer::serve_listener_with_ingress(
             listener,
             node_id.clone(),
             hub_tx.clone(),
             peer_tls.clone(),
             Some(policy.clone()),
             durable_plane.clone(),
+            Some(ingress.clone()),
         ));
     }
     for addr in &config.cluster.peers {
@@ -829,6 +830,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         foreign_cluster_seen.clone(),
         swim_isolated.clone(),
         &mut reloader,
+        ingress.clone(),
     )
     .await?;
 
@@ -3401,6 +3403,8 @@ async fn start_swim(
     // Attached when signed gossip is on (issue #269): the signing identity is rebuilt
     // from the re-read leaf/key in the same atomic reload as the peer TLS contexts.
     reloader: &mut reload::Reloader,
+    // Charged by inbound peer `QoS` 0 publishes on every dialed link (ADR 0082 T4).
+    ingress: Arc<mqttd::ingress::IngressCredit>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let Some(bind) = config.cluster.swim.bind.clone() else {
         return Ok(());
@@ -3558,7 +3562,7 @@ async fn start_swim(
             }
         }
     });
-    tokio::spawn(cluster::maintain_peer_links(
+    tokio::spawn(cluster::maintain_peer_links_with_ingress(
         event_rx,
         node_id.clone(),
         hub_tx.clone(),
@@ -3566,6 +3570,7 @@ async fn start_swim(
         Some(placement),
         Some(metrics),
         plane,
+        Some(ingress),
     ));
     Ok(())
 }

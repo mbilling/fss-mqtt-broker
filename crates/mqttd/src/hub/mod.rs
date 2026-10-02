@@ -1501,6 +1501,9 @@ pub enum HubCommand {
         message_expiry: Option<u32>,
         /// The publisher's forwardable MQTT 5 application properties (ADR 0030).
         app: AppProperties,
+        /// Pool credit a `QoS` 0 delivery holds while it waits (ADR 0082 T4), returned
+        /// when the hub drops the dispatched command. `None` = uncharged.
+        credit: Option<crate::ingress::IngressPermit>,
     },
     /// An **acknowledged** publish forward from a peer (ADR 0042 T9, exhibit ⑤;
     /// proto 3): local delivery only (never re-forwarded), answered with a
@@ -1595,6 +1598,9 @@ pub enum HubCommand {
         message_expiry: Option<u32>,
         /// The publisher's forwardable MQTT 5 application properties (ADR 0030).
         app: AppProperties,
+        /// Pool credit a `QoS` 0 forward holds while it waits (ADR 0082 T4), returned
+        /// when the hub drops the dispatched command. `None` = uncharged.
+        credit: Option<crate::ingress::IngressPermit>,
     },
     /// A durable-plane frame (consensus / session-log replication, ADR 0006/0007)
     /// from `node`, routed to the [`DurablePlane`]. The hub spawns its handling so
@@ -3296,6 +3302,8 @@ impl Hub {
                 retain,
                 message_expiry,
                 app,
+                // Dropped at the end of the arm: the credit returns to the pool (T4).
+                credit: _credit,
             } => {
                 // Forwarded from a peer: apply locally (deliver + store retained) but
                 // never re-forward. A retained copy updates this node's store so a
@@ -3560,6 +3568,8 @@ impl Hub {
                 qos,
                 message_expiry,
                 app,
+                // Dropped at the end of the arm: the credit returns to the pool (T4).
+                credit: _credit,
             } => {
                 // Targeted by a peer's shared selection: deliver to this one client
                 // (ADR 0015), never re-selected or re-forwarded. The publisher's message
@@ -6591,6 +6601,9 @@ impl Hub {
         m.set_hub_lane_depth("data", self.data_q.len());
         if let Some(credit) = &self.ingress {
             m.set_ingress_credit(credit.in_use(), credit.pool_bytes());
+            // ADR 0082 T4: peer readers shed `QoS` 0 without the metrics handle; the
+            // count they keep on the credit moves here.
+            m.publish_dropped_by("hub-ingress", credit.take_peer_shed());
         }
     }
 
@@ -8247,6 +8260,40 @@ mod tests {
         let out = metrics.render();
         assert!(out.contains("mqttd_sessions 1"), "{out}");
         assert!(out.contains("mqttd_subscriptions 2"), "{out}");
+    }
+
+    /// ADR 0082 T4: peer readers count what they shed on the shared credit, and the
+    /// sweep moves the count into `publish_dropped{reason="hub-ingress"}` — once, so a
+    /// second sweep adds nothing.
+    #[tokio::test(start_paused = true)]
+    async fn the_sweep_moves_peer_sheds_into_publish_dropped() {
+        use crate::ingress::{IngressCredit, OverloadMode};
+        let metrics = std::sync::Arc::new(mqtt_observability::metrics::Metrics::new("t"));
+        let credit = Arc::new(IngressCredit::new(4_096, 1_024, OverloadMode::Pause));
+        let (mut hub, _tx) = Hub::with_config(
+            NodeId("shed-test".into()),
+            std::sync::Arc::new(MemorySessionStore::new()),
+        );
+        hub.attach_metrics(metrics.clone());
+        hub.attach_ingress(credit.clone());
+        tokio::spawn(hub.run());
+
+        for _ in 0..3 {
+            credit.note_peer_shed();
+        }
+        tokio::time::sleep(super::SESSION_SWEEP_INTERVAL * 2).await;
+        let out = metrics.render();
+        assert!(
+            out.contains("mqttd_publish_dropped_total{reason=\"hub-ingress\"} 3"),
+            "{out}"
+        );
+        assert_eq!(credit.take_peer_shed(), 0, "the sweep took the count");
+        tokio::time::sleep(super::SESSION_SWEEP_INTERVAL * 2).await;
+        let out = metrics.render();
+        assert!(
+            out.contains("mqttd_publish_dropped_total{reason=\"hub-ingress\"} 3"),
+            "{out}"
+        );
     }
 
     fn publish_qos1(tx: &HubTx, topic: &str, payload: &'static [u8]) {
@@ -13503,6 +13550,7 @@ mod tests {
             retain: true,
             message_expiry: None,
             app: AppProperties::default(),
+            credit: None,
         })
         .unwrap();
 
@@ -14651,6 +14699,7 @@ mod tests {
             retain: true,
             message_expiry: None,
             app: AppProperties::default(),
+            credit: None,
         })
         .unwrap();
         assert_eq!(payload_of(&recv_packet(&mut sub).await.unwrap()), b"v1");
@@ -17530,6 +17579,7 @@ mod tests {
             retain: false,
             message_expiry: None,
             app: AppProperties::default(),
+            credit: None,
         })
         .unwrap();
         // Neither peer may see any further DATA frame (n1's non-match included;

@@ -16,9 +16,17 @@
 //!   0 publish is dropped and counted instead. `QoS` 1 and 2 always wait: a publish the
 //!   broker will acknowledge is never shed to satisfy a memory bound.
 //!
-//! Only client publishes are charged. Acks, subscriptions, pings and every control
-//! command are not, and neither is anything the hub sends itself.
+//! Peer links (ADR 0082 T4, §3) draw on the same pool, with no per-link cap. A peer's
+//! `QoS` 0 publish without credit is **shed**, never paused: a peer link carries
+//! consensus and replication frames, and pausing its reads would stall the cluster
+//! behind best-effort traffic. Peer `QoS` 1 and 2, retained publishes and every
+//! control frame are uncharged.
+//!
+//! Only client publishes and peer `QoS` 0 publishes are charged. Acks, subscriptions,
+//! pings and every control command are not, and neither is anything the hub sends
+//! itself.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
@@ -62,6 +70,8 @@ pub struct IngressCredit {
     pool_bytes: usize,
     conn_bytes: usize,
     mode: OverloadMode,
+    /// Peer `QoS` 0 publishes shed since the hub last took the count (T4).
+    peer_shed: AtomicU64,
 }
 
 impl IngressCredit {
@@ -75,6 +85,7 @@ impl IngressCredit {
             pool_bytes,
             conn_bytes: conn_bytes.clamp(1, pool_bytes),
             mode,
+            peer_shed: AtomicU64::new(0),
         }
     }
 
@@ -116,6 +127,29 @@ impl IngressCredit {
         }
     }
 
+    /// Take `cost` bytes from the pool alone, now, or nothing (ADR 0082 T4). Peer links
+    /// have no per-link cap: one link carries many publishers' traffic.
+    #[must_use]
+    pub fn try_acquire_pool(&self, cost: u32) -> Option<IngressPermit> {
+        let pool = self.pool.clone().try_acquire_many_owned(cost).ok()?;
+        Some(IngressPermit {
+            _conn: None,
+            _pool: pool,
+        })
+    }
+
+    /// Count one peer `QoS` 0 publish shed for want of credit.
+    pub fn note_peer_shed(&self) {
+        self.peer_shed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The peer publishes shed since the last call, resetting the count: the hub's
+    /// sweep moves them into `publish_dropped{reason="hub-ingress"}`.
+    #[must_use]
+    pub fn take_peer_shed(&self) -> u64 {
+        self.peer_shed.swap(0, Ordering::Relaxed)
+    }
+
     /// What a publish of `topic_len` and `payload_len` bytes costs, clamped to the
     /// per-connection cap so even the largest message can eventually proceed.
     #[must_use]
@@ -148,7 +182,7 @@ impl ConnCredit {
         let conn = self.conn.clone().try_acquire_many_owned(cost).ok()?;
         let pool = self.node.pool.clone().try_acquire_many_owned(cost).ok()?;
         Some(IngressPermit {
-            _conn: conn,
+            _conn: Some(conn),
             _pool: pool,
         })
     }
@@ -174,18 +208,19 @@ impl ConnCredit {
             .await
             .expect("the ingress pool is never closed");
         IngressPermit {
-            _conn: conn,
+            _conn: Some(conn),
             _pool: pool,
         }
     }
 }
 
-/// Credit held by one queued client publish. Dropping it — when the hub has dispatched
+/// Credit held by one queued client publish, or by a peer `QoS` 0 publish (pool only,
+/// no connection cap). Dropping it — when the hub has dispatched
 /// the command, or on any path that discards it — returns the bytes to the connection
 /// and the pool.
 #[derive(Debug)]
 pub struct IngressPermit {
-    _conn: OwnedSemaphorePermit,
+    _conn: Option<OwnedSemaphorePermit>,
     _pool: OwnedSemaphorePermit,
 }
 
@@ -231,5 +266,22 @@ mod tests {
         drop(b_held);
         // A message larger than the cap is clamped to it, so it can still proceed.
         assert_eq!(node.cost(10, 1 << 20), 4_000);
+    }
+
+    #[test]
+    fn peer_credit_draws_on_the_pool_alone_and_counts_what_it_sheds() {
+        let node = Arc::new(IngressCredit::new(3_000, 1_000, OverloadMode::Pause));
+        // No per-link cap: three permits at the connection cap fill the whole pool.
+        let held: Vec<_> = (0..3)
+            .map(|_| node.try_acquire_pool(1_000).unwrap())
+            .collect();
+        assert_eq!(node.in_use(), 3_000);
+        assert!(node.try_acquire_pool(1).is_none(), "the pool is full");
+        node.note_peer_shed();
+        node.note_peer_shed();
+        assert_eq!(node.take_peer_shed(), 2);
+        assert_eq!(node.take_peer_shed(), 0, "taking the count resets it");
+        drop(held);
+        assert_eq!(node.in_use(), 0);
     }
 }

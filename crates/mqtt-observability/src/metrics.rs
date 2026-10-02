@@ -1389,6 +1389,22 @@ impl Metrics {
             .add(1, &[KeyValue::new("reason", reason.to_string())]);
     }
 
+    /// Count `n` dropped publishes at once (a batch counted elsewhere and moved in by a
+    /// sweep). `n == 0` touches nothing, so an idle reason never appears as a series.
+    pub fn publish_dropped_by(&self, reason: &str, n: u64) {
+        if n == 0 {
+            return;
+        }
+        self.publish_dropped_total
+            .get_or_create(&ReasonLabel {
+                reason: reason.to_string(),
+            })
+            .inc_by(n);
+        self.otel
+            .publish_dropped
+            .add(n, &[KeyValue::new("reason", reason.to_string())]);
+    }
+
     /// Observe a publish-to-deliver latency in seconds.
     pub fn observe_deliver_latency(&self, seconds: f64) {
         self.deliver_latency_seconds.observe(seconds);
