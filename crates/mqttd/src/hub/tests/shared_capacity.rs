@@ -42,7 +42,7 @@ impl Rig {
         self.tx
             .send(HubCommand::Attach {
                 client: ClientId(name.into()),
-                admission: admission(name),
+                admission: Box::new(admission(name)),
                 conn_id: 1,
                 clean_start: true,
                 session_expiry: 0,

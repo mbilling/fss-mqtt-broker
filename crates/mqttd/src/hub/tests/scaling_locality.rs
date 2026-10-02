@@ -161,7 +161,7 @@ impl Rig {
         let (reply, wait) = oneshot::channel();
         hub.dispatch(HubCommand::Attach {
             client: ClientId(LOCAL.into()),
-            admission: admission(LOCAL),
+            admission: Box::new(admission(LOCAL)),
             conn_id: 1,
             clean_start: true,
             session_expiry: 0,

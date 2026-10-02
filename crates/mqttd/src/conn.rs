@@ -742,18 +742,18 @@ where
     if hub
         .send(HubCommand::Attach {
             client: client.clone(),
-            admission: Admission {
+            admission: Box::new(Admission {
                 identity: principal.clone(),
                 method: auth_method,
                 cert_serial: cert.and_then(|c| c.serial),
                 protocol: connect.protocol,
                 source: peer,
-            },
+            }),
             conn_id,
             clean_start,
             session_expiry,
             receive_maximum,
-            will,
+            will: will.map(Box::new),
             outbound: out_tx,
             reply: reply_tx,
         })

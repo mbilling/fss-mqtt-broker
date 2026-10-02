@@ -143,7 +143,7 @@ fn hub_with_subscribers(
             let (reply_tx, reply_rx) = oneshot::channel();
             tx.send(HubCommand::Attach {
                 client: client.clone(),
-                admission: admission(&format!("sub{i}")),
+                admission: Box::new(admission(&format!("sub{i}"))),
                 conn_id: i as u64 + 1,
                 clean_start: true,
                 session_expiry: 0,

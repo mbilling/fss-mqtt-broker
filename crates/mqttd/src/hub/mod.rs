@@ -1059,8 +1059,9 @@ pub enum HubCommand {
         client: ClientId,
         /// The revocable facts the connection was admitted under (ADR 0040 T1). Its
         /// `subject` (mTLS CN / username / token subject, or the shared `"anonymous"`
-        /// principal) binds the session to its owner (ADR 0031).
-        admission: Admission,
+        /// principal) binds the session to its owner (ADR 0031). Boxed, like `will`:
+        /// a once-per-connect field must not size every queued command (#835).
+        admission: Box<Admission>,
         /// Unique id for this physical connection.
         conn_id: u64,
         /// MQTT 5.0 Clean Start: discard any existing session before attaching
@@ -1073,8 +1074,8 @@ pub enum HubCommand {
         /// may have outstanding to this client at once (ADR 0012).
         receive_maximum: u16,
         /// Will message to publish if the connection ends ungracefully, with the
-        /// delay the client asked for (§3.1.3.2.2).
-        will: Option<Will>,
+        /// delay the client asked for (§3.1.3.2.2). Boxed (#835).
+        will: Option<Box<Will>>,
         /// Channel the hub uses to deliver packets to this client.
         outbound: Outbound,
         /// Reply with the [`AttachOutcome`] so the connection can CONNACK (or reject).
@@ -1084,8 +1085,10 @@ pub enum HubCommand {
     /// finished; finish registration on the hub loop (ADR 0017). Not sent by
     /// connections — the hub posts it to itself.
     SessionRecovered {
-        /// The connection context carried across the wait.
-        pending: PendingAttach,
+        /// The connection context carried across the wait. Boxed: it is the largest
+        /// thing any command carries, and once per recovery must not size every queued
+        /// publish (#835).
+        pending: Box<PendingAttach>,
         /// The authoritative recovery result (or `Unavailable`).
         recovery: SessionRecovery,
     },
@@ -1450,7 +1453,8 @@ pub enum HubCommand {
         qos: u8,
         /// The application properties the commit carried (ADR 0038 T3) — fanned out
         /// with the value on success, kept with the re-queued mutation on failure.
-        app: AppProperties,
+        /// Boxed (#835).
+        app: Box<AppProperties>,
         /// `Some((epoch, offset))` on success; `None` = the commit failed and the
         /// mutation is re-queued.
         token: Option<(u64, u64)>,
@@ -2866,7 +2870,7 @@ impl Hub {
 
     /// Give back lane memory an overload left behind (ADR 0082 T1). A `VecDeque` never
     /// shrinks on its own, so a lane that once held the pool's worth of commands (about
-    /// 200k at the default pool, two 408-byte slots each at worst) would keep that
+    /// 245k at the default pool, up to two slots each) would keep that
     /// memory for the life of the process. Run from the once-a-second sweep.
     fn shrink_idle_lanes(&mut self) {
         shrink_idle_lane(&mut self.control_q);
@@ -2943,11 +2947,11 @@ impl Hub {
                 self.attach(
                     PendingAttach {
                         client,
-                        admission,
+                        admission: *admission,
                         conn_id,
                         session_expiry,
                         receive_maximum,
-                        will,
+                        will: will.map(|w| *w),
                         outbound,
                         reply,
                     },
@@ -2955,7 +2959,7 @@ impl Hub {
                 );
             }
             HubCommand::SessionRecovered { pending, recovery } => {
-                self.session_recovered(pending, recovery).await;
+                self.session_recovered(*pending, recovery).await;
             }
             HubCommand::Subscribe {
                 client,
@@ -3539,7 +3543,7 @@ impl Hub {
                         topic,
                         payload,
                         qos,
-                        app,
+                        app: *app,
                         reply,
                         publish,
                         expires_at,
@@ -7305,7 +7309,10 @@ async fn recover_session(
 ) {
     let recovery =
         recover_until_ready(&store, &pending.client, &pending.admission.identity.subject).await;
-    let _ = self_tx.send(HubCommand::SessionRecovered { pending, recovery });
+    let _ = self_tx.send(HubCommand::SessionRecovered {
+        pending: Box::new(pending),
+        recovery,
+    });
 }
 
 /// Discard a clean-start client's prior **durable** state off the hub command loop, then
@@ -7321,7 +7328,7 @@ async fn discard_session(
 ) {
     let _ = store.remove(&pending.client).await;
     let _ = self_tx.send(HubCommand::SessionRecovered {
-        pending,
+        pending: Box::new(pending),
         recovery: SessionRecovery::Cleaned,
     });
 }
@@ -7518,7 +7525,7 @@ mod tests {
         let (reply_tx, reply_rx) = oneshot::channel();
         tx.send(HubCommand::Attach {
             client: ClientId(client.into()),
-            admission: admission(client),
+            admission: Box::new(admission(client)),
             conn_id,
             clean_start: false,
             session_expiry: u32::MAX,
@@ -7547,7 +7554,7 @@ mod tests {
         let (reply_tx, reply_rx) = oneshot::channel();
         tx.send(HubCommand::Attach {
             client: ClientId(client.into()),
-            admission: admission(owner),
+            admission: Box::new(admission(owner)),
             conn_id,
             clean_start: false,
             session_expiry: u32::MAX,
@@ -7886,7 +7893,7 @@ mod tests {
         let (reply_tx, reply_rx) = oneshot::channel();
         tx.send(HubCommand::Attach {
             client: ClientId(client.into()),
-            admission: admission(client),
+            admission: Box::new(admission(client)),
             conn_id,
             clean_start,
             session_expiry,
@@ -7931,12 +7938,12 @@ mod tests {
         let (reply_tx, reply_rx) = oneshot::channel();
         tx.send(HubCommand::Attach {
             client: ClientId(client.into()),
-            admission: admission(client),
+            admission: Box::new(admission(client)),
             conn_id,
             clean_start,
             session_expiry: if clean_start { 0 } else { u32::MAX },
             receive_maximum: u16::MAX,
-            will: Some(will),
+            will: Some(Box::new(will)),
             outbound: out_tx,
             reply: reply_tx,
         })
@@ -8283,6 +8290,19 @@ mod tests {
         let out = metrics.render();
         assert!(out.contains("mqttd_sessions 1"), "{out}");
         assert!(out.contains("mqttd_subscriptions 2"), "{out}");
+    }
+
+    /// #835: every queued command occupies one `HubCommand` slot, and in a lane just
+    /// past a doubling it can occupy two, so the slot is the largest term in the ingress
+    /// charge (`COMMAND_OVERHEAD`). Rare variants box their large fields so the slot is
+    /// set by a publish, not by a session recovery or a connect. A variant that grows
+    /// past this fails here: box its cold fields, or raise the pin knowing every queued
+    /// publish pays for it twice.
+    #[test]
+    fn a_hub_command_slot_stays_publish_sized() {
+        let slot = std::mem::size_of::<HubCommand>();
+        println!("HubCommand slot = {slot} B");
+        assert!(slot <= 256, "HubCommand grew to {slot} B (pinned at 256)");
     }
 
     /// ADR 0082 T1: a lane an overload grew gives its memory back once it drains, and
@@ -8745,7 +8765,7 @@ mod tests {
         let (reply_tx, reply_rx) = oneshot::channel();
         tx.send(HubCommand::Attach {
             client: ClientId("victim".into()),
-            admission: Admission {
+            admission: Box::new(Admission {
                 identity: mqtt_auth::Identity {
                     subject: "victim".into(),
                     groups: vec![],
@@ -8754,12 +8774,12 @@ mod tests {
                 cert_serial: Some(vec![0x0a, 0x0b]),
                 protocol: ProtocolVersion::V5,
                 source: None,
-            },
+            }),
             conn_id: 2,
             clean_start: true,
             session_expiry: 0,
             receive_maximum: u16::MAX,
-            will: Some(Will {
+            will: Some(Box::new(Will {
                 delay_secs: 0,
                 message: mqtt_core::Message {
                     topic: "wills/victim".into(),
@@ -8769,7 +8789,7 @@ mod tests {
                     app: mqtt_core::AppProperties::default(),
                     expires_at: None,
                 },
-            }),
+            })),
             outbound: out_tx,
             reply: reply_tx,
         })
@@ -8870,7 +8890,7 @@ mod tests {
                 let (reply_tx, reply_rx) = oneshot::channel();
                 tx.send(HubCommand::Attach {
                     client: ClientId(client.into()),
-                    admission: adm,
+                    admission: Box::new(adm),
                     conn_id,
                     clean_start: true,
                     session_expiry: 0,
@@ -16622,7 +16642,7 @@ mod tests {
         let (reply_tx, reply_rx) = oneshot::channel();
         tx.send(HubCommand::Attach {
             client: ClientId(client.into()),
-            admission: Admission {
+            admission: Box::new(Admission {
                 identity: mqtt_auth::Identity {
                     subject: client.to_string(),
                     groups: vec![],
@@ -16631,12 +16651,12 @@ mod tests {
                 cert_serial: None,
                 protocol: ProtocolVersion::V5,
                 source: None,
-            },
+            }),
             conn_id,
             clean_start: false,
             session_expiry,
             receive_maximum: u16::MAX,
-            will,
+            will: will.map(Box::new),
             outbound: out_tx,
             reply: reply_tx,
         })
@@ -17827,7 +17847,7 @@ mod tests {
         let (reply_tx, mut a_reply) = oneshot::channel();
         tx.send(HubCommand::Attach {
             client: ClientId("a".into()),
-            admission: admission("a"),
+            admission: Box::new(admission("a")),
             conn_id: 1,
             clean_start: false,
             session_expiry: u32::MAX,

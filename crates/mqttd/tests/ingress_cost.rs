@@ -215,9 +215,10 @@ async fn the_charge_covers_what_a_queued_publish_retains() {
             held <= charged,
             "topic {topic} payload {payload}: retains {held} B but is charged {charged} B\n{report}"
         );
-        // And it is not padded into fiction: the pool still holds what it says, within 3x.
+        // And it is not padded into fiction: the pool still holds what it says, within
+        // 4x. The fixed overhead dominates an empty payload, the case nearest the bound.
         assert!(
-            charged <= 3 * held,
+            charged <= 4 * held,
             "topic {topic} payload {payload}: charged {charged} B for {held} B retained\n{report}"
         );
     }

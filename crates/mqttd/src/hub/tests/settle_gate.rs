@@ -162,7 +162,7 @@ impl Fix {
         let (reply, wait) = oneshot::channel();
         self.dispatch(HubCommand::Attach {
             client: ClientId(client.into()),
-            admission: admission(client),
+            admission: Box::new(admission(client)),
             conn_id,
             clean_start: true,
             session_expiry: 0,

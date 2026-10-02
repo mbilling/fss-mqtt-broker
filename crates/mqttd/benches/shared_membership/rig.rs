@@ -319,7 +319,7 @@ impl Rig {
         self.tx
             .send(HubCommand::Attach {
                 client: ClientId(name.clone().into()),
-                admission: Admission {
+                admission: Box::new(Admission {
                     identity: mqtt_auth::Identity {
                         subject: name.clone(),
                         groups: vec![],
@@ -328,7 +328,7 @@ impl Rig {
                     cert_serial: None,
                     protocol: ProtocolVersion::V311,
                     source: None,
-                },
+                }),
                 conn_id: 1,
                 clean_start: true,
                 session_expiry: 0,
