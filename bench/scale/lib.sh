@@ -22,11 +22,58 @@ SCALE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck disable=SC2034 # consumed by the sourcing scripts (bootstrap-cluster.sh)
 REPO_ROOT="$(cd "$SCALE_DIR/../.." && pwd)"
 
-say() { printf '\033[1;34m==>\033[0m %s\n' "$*" >&2; }
-warn() { printf '\033[1;33mWARN\033[0m %s\n' "$*" >&2; }
+# Every line carries a UTC time: a run that dies hours in must be reconstructible from
+# run.log alone (the 2026-10-03 knee run's bring-up failure could not be placed in time).
+say() { printf '\033[1;34m==>\033[0m %s %s\n' "$(date -u +%H:%M:%SZ)" "$*" >&2; }
+warn() { printf '\033[1;33mWARN\033[0m %s %s\n' "$(date -u +%H:%M:%SZ)" "$*" >&2; }
 die() {
-	printf '\033[1;31mFAIL\033[0m %s\n' "$*" >&2
+	printf '\033[1;31mFAIL\033[0m %s %s\n' "$(date -u +%H:%M:%SZ)" "$*" >&2
 	exit 1
+}
+
+# A rig run is orchestrated from this machine: if it sleeps, every ssh session to the
+# fleet freezes while the servers keep billing, and the run dies on wake (2026-10-02 and
+# 2026-10-03: idle and clamshell sleep killed two 30-server runs). On macOS hold an
+# idle/system-sleep assertion for the OUTERMOST rig script's lifetime. A closed lid on
+# battery cannot be held off by any assertion — say so up front.
+keep_awake() {
+	[ "$(uname -s)" = Darwin ] && command -v caffeinate >/dev/null 2>&1 || return 0
+	[ -z "${BENCH_KEEP_AWAKE_PID:-}" ] || return 0
+	caffeinate -ims -w $$ </dev/null >/dev/null 2>&1 &
+	export BENCH_KEEP_AWAKE_PID=$!
+	if pmset -g batt 2>/dev/null | grep -q "Battery Power"; then
+		warn "on battery: closing the lid will SUSPEND this run (servers keep billing) — plug in, or keep the lid open"
+	fi
+}
+keep_awake
+
+# run_bounded <secs> <cmd...>: run <cmd>, and kill it if it is still running after <secs>
+# seconds. Returns <cmd>'s own status, or 124 if it had to be killed (GNU timeout's code;
+# macOS ships no timeout(1), so this is bash-native). ssh needs this: ConnectTimeout bounds
+# only the TCP connect and ServerAlive* only an ESTABLISHED session, so a connection that
+# stalls between the two (the key exchange of a host reconfiguring its network mid-boot)
+# waits for TCP to give up — measured on 2026-10-03 as longer than the 10-minute budget.
+run_bounded() {
+	local secs="$1"
+	shift
+	"$@" &
+	local pid=$!
+	(
+		sleep "$secs"
+		kill -TERM "$pid" 2>/dev/null || exit 0
+		sleep 5
+		kill -KILL "$pid" 2>/dev/null || true
+	) </dev/null >/dev/null 2>&1 & # detached stdio: an orphaned sleep must not hold a caller's $(...) pipe open
+	local watcher=$!
+	local rc=0
+	wait "$pid" || rc=$?
+	kill "$watcher" 2>/dev/null || true
+	wait "$watcher" 2>/dev/null || true
+	# 143 = TERM, 137 = KILL: the watcher's doing, not the command's verdict.
+	if [ "$rc" -eq 143 ] || [ "$rc" -eq 137 ]; then
+		return 124
+	fi
+	return "$rc"
 }
 
 # ssh/scp with a per-run known_hosts file: fresh servers mean fresh host keys,
@@ -61,6 +108,47 @@ rssh() { # rssh <public-ip> <command...>
 }
 rscp() { # rscp <src...> <public-ip>:<dst>  (or <public-ip>:<src> <dst>)
 	scp -q "${SSH_OPTS[@]}" -o UserKnownHostsFile="$RUN/known_hosts" "$@"
+}
+
+# cloud_init_rc <ip>: cloud-init's verdict on <ip> — 0 done (or degraded-done), 3 still
+# running when the budget ran out, 124/255 unreachable for the whole budget, anything
+# else cloud-init's own error. Each ATTEMPT is a short, wall-bounded poll; the BUDGET
+# (CLOUD_INIT_BUDGET, default 20 min) bounds the whole wait.
+#  - Poll, never `cloud-init status --wait`: a --wait session spans the whole boot,
+#    exactly while the host reconfigures its network, so it is the session most likely
+#    to be cut or wedged. A poll is in and out in seconds.
+#  - Bound every attempt (run_bounded): on 2026-10-03 one ssh attempt to a HEALTHY
+#    driver (cloud-init finished cleanly at 192 s) hung past the whole 10-minute budget
+#    and ended in "Broken pipe"; the deadline was only checked between attempts, so the
+#    run died without a single retry. No attempt can outlive CI_ATTEMPT_SECS now.
+#  - ssh exiting 255 (session dropped: "server not responding", "Connection reset") and
+#    an attempt killed at its bound (124) are lost connections, not verdicts: ask again.
+#    Measured on 2026-10-02 and 2026-10-03 on otherwise healthy hosts.
+CI_POLL='s=$(cloud-init status 2>/dev/null); rc=$?; case "$s" in *running* | *"not started"* | *"not run"*) exit 3 ;; esac; [ $rc -eq 0 ] || [ $rc -eq 2 ]'
+CI_ATTEMPT_SECS=45
+cloud_init_rc() {
+	local deadline=$((SECONDS + ${CLOUD_INIT_BUDGET:-1200})) rc
+	while :; do
+		rc=0
+		local t0=$SECONDS
+		run_bounded "$CI_ATTEMPT_SECS" rssh "$1" "$CI_POLL" || rc=$?
+		# An attempt is bounded, so one that took far longer means THIS machine was
+		# suspended (a laptop sleeping under the run: 2026-10-03, ~2 h). Nobody was waiting
+		# on the host then; that time does not count against its cloud-init budget.
+		local took=$((SECONDS - t0))
+		if [ "$took" -gt $((CI_ATTEMPT_SECS + 30)) ]; then
+			warn "orchestrator was suspended ~$((took / 60)) min (laptop sleep?) during the check on $1 — not counted against its cloud-init budget"
+			deadline=$((deadline + took))
+		fi
+		case "$rc" in
+		0) return 0 ;;
+		3) ;; # still booting — keep polling
+		124 | 255) warn "ssh to $1 lost (exit $rc) while cloud-init was finishing — reconnecting" ;;
+		*) return "$rc" ;; # cloud-init's own error verdict
+		esac
+		[ "$SECONDS" -lt "$deadline" ] || return "$rc"
+		sleep 5
+	done
 }
 
 # Inventory accessors — the JSON written by `tofu output -json inventory`.

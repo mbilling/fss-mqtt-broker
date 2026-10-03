@@ -109,6 +109,14 @@ export MQTTD_VERSION=1.0.6   # the release under test — required, recorded in 
 python3 summarize-curve.py .runs/<stamp>/results   # markdown for the doc
 ```
 
+**The orchestrator is this machine — keep it awake.** Every ssh session to the fleet
+lives on it: if it sleeps, the run freezes while the servers keep billing, and dies
+on wake. Two 30-server runs were lost this way on 2026-10-02/03 (idle sleep, then a
+closed lid on battery, which left the fleet idle for ~2 h). On macOS the rig holds an
+idle/system-sleep assertion (`caffeinate`) for the whole run and warns at start when
+on battery; **a closed lid on battery still suspends it** — plug in, or keep the lid
+open. Long campaigns are safest from a host that never sleeps.
+
 Each size is applied **fresh and destroyed** before the next — a grown cluster
 keeps replica groups tracked under an earlier membership and never re-greens,
 so growing 1→3→5 would measure a known-degraded configuration. `RESUME`: a
