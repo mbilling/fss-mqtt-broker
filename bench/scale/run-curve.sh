@@ -1315,9 +1315,41 @@ if [ -n "${QOS1_DRIVER_ARCHIVE:-}" ]; then
     # content hashes of the layers and agree across both stores.
     audit_image_layers=$(docker image inspect --format '{{json .RootFS.Layers}}' fss-qos1-audit:local)
     audit_image_id=""
+    # Upload ONCE over the operator's uplink, then fan out over the private network. One
+    # scp per driver from a laptop was ~1 min each for the ~120 MB archive (2026-10-03:
+    # ~20 min of a 30-server fleet idling before the first rung). Driver 0 serves it on
+    # its PRIVATE address only (Hetzner firewalls filter the public interface; the
+    # private network is the fleet's own), every other driver fetches it in parallel,
+    # and every driver still checks the sha256 before `docker load` — the transport
+    # changed, the integrity check did not.
+    src_pub=$(driver_pub_ip 0) src_priv=$(driver_priv_ip 0)
+    say "audit driver image: uploading once to driver0, fanning out to $((D - 1)) more over the private network"
+    rscp "$QOS1_DRIVER_ARCHIVE" "root@$src_pub:/tmp/qos1-driver.tar.gz"
+    if [ "$D" -gt 1 ]; then
+        rssh "$src_pub" "cd /tmp && nohup python3 -m http.server 8097 --bind $src_priv >/tmp/qos1-serve.log 2>&1 </dev/null &"
+        wait_for "audit archive served on driver0 ($src_priv:8097)" 30 \
+            rssh "$src_pub" "curl -fsI http://$src_priv:8097/qos1-driver.tar.gz"
+        fetch_pids=()
+        for ((di = 1; di < D; di++)); do
+            rssh "$(driver_pub_ip "$di")" "curl -fsS --retry 3 -o /tmp/qos1-driver.tar.gz http://$src_priv:8097/qos1-driver.tar.gz" &
+            fetch_pids+=("$!")
+        done
+        fetch_failed=0
+        for p in "${fetch_pids[@]}"; do wait "$p" || fetch_failed=$((fetch_failed + 1)); done
+        # By command line, not a saved $!: a python3 launcher may re-exec under another pid.
+        rssh "$src_pub" "pkill -f 'http.server 8097' || true" || true
+        [ "$fetch_failed" -eq 0 ] ||
+            die "$fetch_failed driver(s) could not fetch the audit archive from driver0 over the private network"
+    fi
+    load_pids=()
     for ((di = 0; di < D; di++)); do
-        rscp "$QOS1_DRIVER_ARCHIVE" "root@$(driver_pub_ip "$di"):/tmp/qos1-driver.tar.gz"
-        rssh "$(driver_pub_ip "$di")" "echo '$audit_archive_sha  /tmp/qos1-driver.tar.gz' | sha256sum -c - >/dev/null && docker load -i /tmp/qos1-driver.tar.gz >/dev/null"
+        rssh "$(driver_pub_ip "$di")" "echo '$audit_archive_sha  /tmp/qos1-driver.tar.gz' | sha256sum -c - >/dev/null && docker load -i /tmp/qos1-driver.tar.gz >/dev/null" &
+        load_pids+=("$!")
+    done
+    for ((di = 0; di < D; di++)); do
+        wait "${load_pids[di]}" || die "audit archive failed its sha256 check or docker load on driver$di"
+    done
+    for ((di = 0; di < D; di++)); do
         actual_layers=$(rssh "$(driver_pub_ip "$di")" "docker image inspect --format '{{json .RootFS.Layers}}' fss-qos1-audit:local")
         [ "$actual_layers" = "$audit_image_layers" ] ||
             die "audit image mismatch on driver$di: layers $actual_layers, expected $audit_image_layers"

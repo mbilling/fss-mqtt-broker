@@ -159,6 +159,7 @@ broker_priv_ip() { inv ".brokers[$1].private_ip"; }
 broker_node_id() { inv ".brokers[$1].node_id"; }
 driver_count() { inv '.drivers | length'; }
 driver_pub_ip() { inv ".drivers[$1].public_ip"; }
+driver_priv_ip() { inv ".drivers[$1].private_ip"; }
 
 # wait_for <label> <deadline-secs> <command...>: poll a command (usually rssh)
 # until it succeeds or the budget elapses. Bounded, never sleeps blind.
