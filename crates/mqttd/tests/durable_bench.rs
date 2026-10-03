@@ -1081,6 +1081,9 @@ struct RunStats {
     append_failures: f64,
     backlog_drops: f64,
     floor_ok: bool,
+    /// `mqttd_durable_stage_seconds{stage}` and `mqttd_publish_ack_seconds` over the
+    /// arm: (label, samples summed over nodes, mean ms over nodes, node-0 p99 bound ms).
+    stages: Vec<(&'static str, f64, f64, f64)>,
     driver_cpu: f64,
     node_cpu: Vec<f64>,
     rss: Vec<u64>,
@@ -1558,6 +1561,7 @@ async fn run_arm(cl: &mut Cluster, cfg: &Cfg, arm: &Arm, tag: &str) -> RunStats 
         after[i].get("mqttd_replication_min_actual")
             >= after[i].get("mqttd_replication_write_floor")
     });
+    let stages = stage_breakdown(&before, &after);
 
     RunStats {
         completed,
@@ -1586,6 +1590,7 @@ async fn run_arm(cl: &mut Cluster, cfg: &Cfg, arm: &Arm, tag: &str) -> RunStats 
         append_failures,
         backlog_drops,
         floor_ok,
+        stages,
         driver_cpu: driver_cpu_after - driver_cpu_before,
         node_cpu: cpu_after
             .iter()
@@ -1594,6 +1599,43 @@ async fn run_arm(cl: &mut Cluster, cfg: &Cfg, arm: &Arm, tag: &str) -> RunStats 
             .collect(),
         rss,
     }
+}
+
+/// Where the durable wait goes, stage by stage, over one arm (the deltas of
+/// `mqttd_durable_stage_seconds{stage}` plus `mqttd_publish_ack_seconds`).
+fn stage_breakdown(before: &[Scrape], after: &[Scrape]) -> Vec<(&'static str, f64, f64, f64)> {
+    const STAGE: &str = "mqttd_durable_stage_seconds";
+    let mut out = Vec::new();
+    let series = [
+        "lane_queue",
+        "local_durable",
+        "quorum",
+        "order",
+        "commit",
+        "fsync",
+        "publish_ack",
+    ];
+    for label in series {
+        let (name, sel) = if label == "publish_ack" {
+            ("mqttd_publish_ack_seconds".to_string(), None)
+        } else {
+            (STAGE.to_string(), Some(format!("stage=\"{label}\"")))
+        };
+        let sel = sel.as_deref();
+        let (mut count, mut sum) = (0.0, 0.0);
+        for (b, a) in before.iter().zip(after) {
+            count += a.hist_count(&name, sel) - b.hist_count(&name, sel);
+            sum += a.hist_sum(&name, sel) - b.hist_sum(&name, sel);
+        }
+        let mean_ms = if count > 0.0 {
+            sum / count * 1000.0
+        } else {
+            f64::NAN
+        };
+        let p99 = delta_quantile(&before[0], &after[0], &name, sel, 0.99);
+        out.push((label, count, mean_ms, p99));
+    }
+    out
 }
 
 fn median_f64(mut v: Vec<f64>) -> f64 {
@@ -1744,6 +1786,14 @@ async fn durable_path_floor() {
                     format!("INVALID: {}", st.violations().join("; "))
                 }
             );
+            println!(
+                "    stages (mean / node-0 p99<=, ms; samples): {}",
+                st.stages
+                    .iter()
+                    .map(|(l, n, mean, p99)| format!("{l} {mean:.3}/{p99:.3} ({n:.0})"))
+                    .collect::<Vec<_>>()
+                    .join("  ")
+            );
             // One machine-readable line per rep, additive to the human tables above —
             // the multi-host curve summarizer parses these instead of scraping prose.
             println!(
@@ -1775,6 +1825,9 @@ async fn durable_path_floor() {
                     "max_ms": ms(st.max),
                     "stalls_1s": st.stalls_1s,
                     "append_mean_ms": st.append_mean_ms,
+                    "stages": st.stages.iter().map(|(l, n, mean, p99)| serde_json::json!({
+                        "stage": l, "samples": n, "mean_ms": mean, "p99_ms": p99,
+                    })).collect::<Vec<_>>(),
                     "append_p99_ms": st.append_p99_ms,
                     "violations": st.violations(),
                     "caveats": st.caveats(),

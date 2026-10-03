@@ -188,6 +188,13 @@ def render(env_vars: list[str], toml_keys: dict[str, str], docs: dict[str, str])
                 "its hardware evidence is in: it imports an existing redb store once (the redb "
                 "files are kept as `*.imported`) and there is no conversion back."
             )
+        elif var == "MQTTD_DIAG_SIMULATED_FSYNC_US":
+            desc = (
+                f"{why}. Source: `{where}`. DIAGNOSTIC, and inert unless the binary was built "
+                "with the `diag-simulated-fsync` feature (release builds are not): every "
+                "segment-log sync becomes a sleep of this many microseconds, for fsync-latency "
+                "sweeps on one machine. Such a build is NOT durable; it warns on stderr."
+            )
         else:
             desc = docs.get(
                 var,
