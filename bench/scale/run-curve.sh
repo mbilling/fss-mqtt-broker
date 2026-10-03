@@ -1326,7 +1326,11 @@ if [ -n "${QOS1_DRIVER_ARCHIVE:-}" ]; then
     say "audit driver image: uploading once to driver0, fanning out to $((D - 1)) more over the private network"
     rscp "$QOS1_DRIVER_ARCHIVE" "root@$src_pub:/tmp/qos1-driver.tar.gz"
     if [ "$D" -gt 1 ]; then
-        rssh "$src_pub" "cd /tmp && nohup python3 -m http.server 8097 --bind $src_priv >/tmp/qos1-serve.log 2>&1 </dev/null &"
+        # No `cd /tmp && …` here: `&` would background the whole && list as a subshell that
+        # keeps the ssh channel's stdout open while it waits for the server, and ssh never
+        # returns (2026-10-03: the rig hung 20 min on this line). `--directory` instead, so
+        # `&` backgrounds only the fully redirected server.
+        rssh "$src_pub" "nohup python3 -m http.server 8097 --bind $src_priv --directory /tmp >/tmp/qos1-serve.log 2>&1 </dev/null &"
         wait_for "audit archive served on driver0 ($src_priv:8097)" 30 \
             rssh "$src_pub" "curl -fsI http://$src_priv:8097/qos1-driver.tar.gz"
         fetch_pids=()
