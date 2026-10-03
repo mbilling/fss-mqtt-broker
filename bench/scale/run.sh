@@ -115,6 +115,10 @@ esac
 if [ "${PREFLIGHT_ONLY:-0}" != 1 ]; then require_scale_token; fi
 # The UpCloud cloud-init template does not implement this Hetzner tuning arm.
 # Refuse explicitly before provisioning rather than silently measuring a no-op.
+if [ "${BROKER_DATA_TMPFS:-false}" = true ]; then
+	[ "$CLOUD" = hcloud ] || die "BROKER_DATA_TMPFS is only implemented for CLOUD=hcloud"
+	warn "BROKER_DATA_TMPFS=true — broker data dirs are RAM: a DIAGNOSTIC of fsync cost, NOT durability; never cite these numbers as a curve point"
+fi
 if [ "$CLOUD" = upcloud ] && [ -n "${BROKER_NIC_SPREAD:-}" ]; then
 	die "BROKER_NIC_SPREAD is not supported with CLOUD=upcloud; unset it"
 fi
@@ -366,6 +370,7 @@ for N in "${SIZES[@]}"; do
 	[ -z "${BROKER_TYPE:-}" ] || TF_APPLY_ARGS+=(-var broker_server_type="$BROKER_TYPE")
 	[ -z "${DRIVER_TYPE:-}" ] || TF_APPLY_ARGS+=(-var driver_server_type="$DRIVER_TYPE")
 	[ -z "${BROKER_NIC_SPREAD:-}" ] || TF_APPLY_ARGS+=(-var broker_nic_spread="$BROKER_NIC_SPREAD")
+	[ -z "${BROKER_DATA_TMPFS:-}" ] || TF_APPLY_ARGS+=(-var broker_data_tmpfs="$BROKER_DATA_TMPFS")
 	[ -z "${COMPARE:-}" ] || TF_APPLY_ARGS+=(-var broker_docker=true)
 	declare -p TF_APPLY_ARGS >"$RUN/tf-apply-args-$N.sh"
 	(cd "$TFDIR" && "$TF" apply -auto-approve -input=false "${TF_APPLY_ARGS[@]}" \

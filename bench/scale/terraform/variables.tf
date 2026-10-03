@@ -46,6 +46,12 @@ variable "broker_nic_spread" {
   default     = false
 }
 
+variable "broker_data_tmpfs" {
+  description = "DIAGNOSTIC ONLY: put each broker's data dir (/var/lib/mqttd) on a RAM tmpfs, so the durable store's fsyncs cost ~nothing while everything else (quorum replication, config, systemd sandbox) is unchanged. Answers 'is serial fsync latency the durable QoS 1 limit?' (2026-10-03). Nothing written survives a reboot — never a published number. The barrier probe stays on the disk (/var/lib/mqttd-probe), so the floor it reports is still the disk's."
+  type        = bool
+  default     = false
+}
+
 variable "broker_server_type" {
   description = "Dedicated-vCPU type for brokers. Shared-vCPU (cx/cpx) steal ruins p99 honesty; local NVMe is required — a network volume would make the per-host fsync floor a measurement of Ceph, not the disk."
   type        = string
@@ -129,7 +135,7 @@ variable "run_label" {
 }
 
 variable "build_bench" {
-  type = bool
-  default = true
+  type        = bool
+  default     = true
   description = "Build lane A driver; disable for lane E-only campaigns."
 }
