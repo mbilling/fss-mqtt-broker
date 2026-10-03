@@ -391,27 +391,6 @@ for N in "${SIZES[@]}"; do
 	# still settling and Tracebacks on the half-written metadata). A reboot after
 	# `cloud-init clean` re-runs everything against settled metadata, so each
 	# host gets exactly one such retry before the run gives up.
-	CI_OK='cloud-init status --wait >/dev/null 2>&1; rc=$?; [ $rc -eq 0 ] || [ $rc -eq 2 ]'
-	# cloud_init_rc <ip>: cloud-init's verdict on <ip>, as CI_OK's exit status (0 =
-	# done). `cloud-init status --wait` can run for minutes on a booting host, and the
-	# ssh session carrying it drops when the host goes quiet past the keepalive budget
-	# (10s) — the network is being reconfigured mid-boot. ssh exits 255 for that; it is
-	# a lost connection, not a cloud-init verdict, so reconnect and ask again, for up to
-	# 10 minutes. Any other non-zero is cloud-init's own answer. Measured on 2026-10-02:
-	# a broker dropped the session ("server not responding"), the run died, and its
-	# cloud-init then finished cleanly 200 s after boot. Both checks below go through
-	# here: on the FIRST boot (the slow one) a dropped session used to be read as
-	# "cloud-init errored" and cost the host a needless clean+reboot.
-	cloud_init_rc() {
-		local deadline=$((SECONDS + 600)) rc
-		while :; do
-			rc=0
-			rssh "$1" "$CI_OK" || rc=$?
-			[ "$rc" -eq 255 ] && [ "$SECONDS" -lt "$deadline" ] || return "$rc"
-			warn "ssh to $1 dropped while cloud-init was finishing — reconnecting"
-			sleep 5
-		done
-	}
 	# True once <ip> presents a kernel boot id that is non-empty and differs
 	# from <old> — i.e. the machine has verifiably completed its reboot. Probes
 	# use a THROWAWAY known_hosts: a poll that lands in the pre-reboot window
@@ -471,7 +450,10 @@ for N in "${SIZES[@]}"; do
 			ssh-keygen -R "$ip" -f "$RUN/known_hosts" >/dev/null 2>&1 || true
 			wait_for "reboot of $ip (new boot id)" 300 boot_id_changed "$ip" "$OLD_BOOT"
 			ssh-keygen -R "$ip" -f "$RUN/known_hosts" >/dev/null 2>&1 || true
-			wait_for "cloud-init after mesh retry on $ip" 300 rssh "$ip" "$CI_OK"
+			ci_rc=0
+			cloud_init_rc "$ip" || ci_rc=$?
+			[ "$ci_rc" -eq 0 ] ||
+				die "cloud-init failed on $ip after the mesh-retry reboot (exit $ci_rc) — check /var/log/cloud-init-output.log there"
 			BAD=$(mesh_ok "$ip") ||
 				die "private-net STILL one-way from $ip (cannot reach ${BAD:-?}) after a clean reboot — Hetzner attach fault; tear down and re-apply"
 		fi

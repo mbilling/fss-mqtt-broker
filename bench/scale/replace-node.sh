@@ -113,9 +113,10 @@ say "  $KIND $IDX is now $NEW_PUB (private $PRIV unchanged)"
 # The same readiness run.sh demands of a fresh provisioning, for one host.
 RUN="$ARM_DIR"
 export RUN
-CI_OK='cloud-init status --wait >/dev/null 2>&1; rc=$?; [ $rc -eq 0 ] || [ $rc -eq 2 ]'
 wait_for "ssh on $NEW_PUB" 300 rssh "$NEW_PUB" true
-rssh "$NEW_PUB" "$CI_OK" || die "cloud-init failed on the replacement $KIND $IDX ($NEW_PUB)"
+ci_rc=0
+cloud_init_rc "$NEW_PUB" || ci_rc=$?
+[ "$ci_rc" -eq 0 ] || die "cloud-init failed on the replacement $KIND $IDX ($NEW_PUB) (exit $ci_rc)"
 wait_for "cloud-init marker on $NEW_PUB" 900 rssh "$NEW_PUB" "test -f /run/bench-cloudinit-done"
 wait_for "private ip $PRIV on $NEW_PUB" 180 rssh "$NEW_PUB" "ip -4 addr show | grep -qF $PRIV"
 ALL_PRIVS=$(jq -r '[(.brokers[], .drivers[]) | .private_ip] | join(" ")' "$PROV_INV")
