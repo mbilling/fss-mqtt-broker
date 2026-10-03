@@ -2538,6 +2538,8 @@ impl<T: ReplicaTransport + Clone + 'static> ReplicatedLog for ClusterLog<T> {
         // is an ACK-GATE tier handled above this layer; here it appends with
         // full quorum semantics, exactly like `Quorum`.
         let local_only = matches!(tier, DurabilityTier::Local);
+        // Stage timing (mqttd_durable_stage_seconds): local_durable runs from here.
+        let submitted = std::time::Instant::now();
         // SUBMIT (ADR 0075): under a SHORT lock — assign the next offset,
         // stage the entry, and hand the op to the shared writer, whose FIFO
         // then preserves same-key offset order. No durability is awaited here,
@@ -2593,6 +2595,11 @@ impl<T: ReplicaTransport + Clone + 'static> ReplicatedLog for ClusterLog<T> {
                 LocalAck::Done(b) => b,
                 LocalAck::Pending(rx) => rx.await.unwrap_or(false),
             };
+            let local_at = std::time::Instant::now();
+            crate::stage_timing::record(
+                crate::stage_timing::Stage::LocalDurable,
+                local_at.duration_since(submitted),
+            );
             let mut acks = Tally::default();
             if local_durable {
                 acks.add(local_in_prefix);
@@ -2640,6 +2647,13 @@ impl<T: ReplicaTransport + Clone + 'static> ReplicatedLog for ClusterLog<T> {
                 }
             }
             let met = met_now(acks);
+            let quorum_at = std::time::Instant::now();
+            if met {
+                crate::stage_timing::record(
+                    crate::stage_timing::Stage::Quorum,
+                    quorum_at.duration_since(local_at),
+                );
+            }
 
             // COMMIT, strictly in offset order (ADR 0075): a success is only
             // ever reported at or below the watermark, so an acked append can
@@ -2687,6 +2701,10 @@ impl<T: ReplicaTransport + Clone + 'static> ReplicatedLog for ClusterLog<T> {
                     }
                     if ks.committed + 1 == offset {
                         ks.committed = offset;
+                        crate::stage_timing::record(
+                            crate::stage_timing::Stage::Order,
+                            quorum_at.elapsed(),
+                        );
                         Self::pipeline_resolved(ks);
                         notify.notify_waiters();
                         return Ok(offset);

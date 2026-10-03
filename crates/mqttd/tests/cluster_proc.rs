@@ -839,6 +839,69 @@ fn one_durable_client_per_node(seed: u64, ids: &[String]) -> Vec<String> {
     panic!("no client id found for some node in {ids:?}");
 }
 
+/// The durable-path stage histograms (`mqttd_durable_stage_seconds{stage}`) and the
+/// server-side publish-to-PUBACK histogram are fed by a REAL clustered durable `QoS` 1
+/// publish on the segment-log store.
+///
+/// The stages are recorded in `mqtt-cluster`, which cannot see the metrics crate; the
+/// binary installs a process-wide sink at startup. A missing install, or a stage whose
+/// record site the path never reaches, leaves its series absent — which is what this
+/// pins, on the operator's own `/metrics` surface.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_durable_publish_feeds_every_stage_histogram() {
+    let _serial = SERIAL.lock().await;
+    let seed = 241;
+    let disk = tempfile::tempdir().expect("tempdir");
+    let mut nodes = build_topology(seed, disk.path()).await;
+    let ids: Vec<String> = nodes.iter().map(|n| n.id.clone()).collect();
+    let owned = one_durable_client_per_node(seed, &ids);
+    for n in &mut nodes {
+        // The fsync stage lives in the segment log (ADR 0078); redb has no such seam.
+        n.extra_env
+            .push(("MQTTD_REPLICA_STORE".to_string(), "log".to_string()));
+        n.spawn();
+    }
+    wait_all_ready(&mut nodes, seed).await;
+    let mut proc = proc_over(seed, nodes);
+    subscribe_on_owner(&mut proc, 0, &owned[0]).await;
+    assert_acked_and_delivered(
+        &mut proc,
+        0,
+        0,
+        "stages",
+        "a durable publish on a healthy cluster",
+    )
+    .await;
+
+    let node = &proc.nodes[0];
+    for stage in [
+        "lane_queue",
+        "local_durable",
+        "quorum",
+        "order",
+        "commit",
+        "fsync",
+    ] {
+        let series = format!("mqttd_durable_stage_seconds_count{{stage=\"{stage}\"}}");
+        let count = node.metric(&series).await.unwrap_or(0);
+        assert!(
+            count > 0,
+            "{series} is {count} after an acked durable publish — the stage is not \
+             recorded (or the sink is not installed)\n{}",
+            log_tail(&node.log_path)
+        );
+    }
+    let acks = node
+        .metric("mqttd_publish_ack_seconds_count")
+        .await
+        .unwrap_or(0);
+    assert!(
+        acks > 0,
+        "mqttd_publish_ack_seconds_count is {acks} after an acked publish\n{}",
+        log_tail(&node.log_path)
+    );
+}
+
 /// Register subscriber `i` as `client`, connected to node `i` — the node that HRW-owns its
 /// placement group — with `clean_session = false` and a `QoS` 1 subscription. Connecting to
 /// the OWNER is the point: the session is hosted there (no ADR 0005 relocation), so it is

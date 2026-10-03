@@ -258,7 +258,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `two_bridge_instances_do_not_duplicate_forwarding`
 - `two_partitioned_instances_deliver_each_inbound_message_exactly_once`
 
-## `crates/mqtt-cluster/src/lib.rs` — 362 test(s)
+## `crates/mqtt-cluster/src/lib.rs` — 365 test(s)
 
 - `cluster_identity::tests::a_founder_mints_once_and_reloads_stably`
 - `cluster_identity::tests::a_joiner_adopts_once_and_persists`
@@ -540,6 +540,8 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `segment_log::tests::reserved_kinds_and_oversized_payloads_are_refused_unwritten`
 - `segment_log::tests::segments_are_zeroed_not_sparse_even_after_a_torn_tail`
 - `segment_log::tests::segments_double_from_the_first_size_up_to_the_configured_one`
+- `stage_timing::tests::a_normal_build_never_simulates`
+- `stage_timing::tests::labels_are_the_documented_bounded_set`
 - `swim::tests::a_changed_routing_address_is_surfaced_even_when_the_state_is_unchanged`
 - `swim::tests::a_dead_member_is_not_revived_by_stale_higher_incarnation_gossip`
 - `swim::tests::a_deaf_member_gets_a_certificate_carrying_regreet`
@@ -854,12 +856,13 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tls::tls12_hardening_tests::the_tls12_suites_are_exactly_the_allowlist`
 - `tls::tls12_hardening_tests::tls12_session_tickets_are_off`
 
-## `crates/mqtt-observability/src/lib.rs` — 16 test(s)
+## `crates/mqtt-observability/src/lib.rs` — 17 test(s)
 
 - `audit_export::tests::a_full_queue_sheds_and_counts_instead_of_blocking`
 - `audit_export::tests::frames_reach_a_tcp_listener_and_flush_waits`
 - `audit_export::tests::rfc3339_formatting_matches_known_dates`
 - `metrics::tests::counters_and_gauges_move_and_render`
+- `metrics::tests::durable_stage_and_publish_ack_histograms_render`
 - `metrics::tests::hub_dispatch_and_append_lane_metrics_render`
 - `metrics::tests::no_unbounded_label_keys_are_used`
 - `metrics::tests::otlp_export_posts_to_the_endpoint`
@@ -1519,7 +1522,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `memory_watch::tests::a_status_without_vm_rss_yields_none_not_zero`
 - `memory_watch::tests::an_unreadable_rss_stops_the_watcher_instead_of_reporting_zero`
 - `memory_watch::tests::nearing_the_watermark_shortens_the_poll`
-- `memory_watch::tests::the_real_sampler_reports_a_plausible_rss_on_linux`
+- `memory_watch::tests::the_real_sampler_reports_a_plausible_rss_on_linux` — only when `cfg(target_os = "linux")`
 - `memory_watch::tests::the_watcher_drives_brownout_on_watermark_transitions`
 - `memory_watch::tests::vm_rss_is_parsed_in_bytes_from_the_right_line`
 - `memory_watch::tests::without_a_watermark_nothing_is_ever_browned_out`
@@ -1707,9 +1710,10 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `retained_message_replicates_across_nodes`
 - `shared_subscription_delivers_once_cluster_wide`
 
-## `crates/mqttd/tests/cluster_proc.rs` — 5 test(s)
+## `crates/mqttd/tests/cluster_proc.rs` — 6 test(s)
 
 - `a_disk_bound_crash_mid_write_loses_no_acked_fact`
+- `a_durable_publish_feeds_every_stage_histogram`
 - `rapid_kill_restart_flapping_loses_no_acked_fact`
 - `spawned_node_ports_come_from_outside_the_ephemeral_range`
 - `spawned_process_schedules_hold_acked_facts`
@@ -1977,7 +1981,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `membership_cpu_accounting_handles_parentheses_and_excludes_child_time`
 - `membership_fixture_delivers_exactly_once_across_all_arms`
 - `membership_peer_oracle_rejects_forwarding_even_with_local_receipts`
-- `membership_perf_ack_requires_complete_confirmation`
+- `membership_perf_ack_requires_complete_confirmation` — only when `cfg(target_os = "linux")`
 - `membership_receipt_oracle_rejects_loss_duplicates_and_stale_bursts`
 - `membership_tcp_fixture_receives_all_data_before_each_socket_fence`
 

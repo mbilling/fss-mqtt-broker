@@ -58,6 +58,8 @@ rustix = { version = "1", features = ["process"] }
 # AWS-LC module across the whole graph. A variant, not a default: heavier
 # build (cmake + Go), narrower platform matrix.
 fips = ["aws-lc-rs/fips", "mqtt-net/fips", "mqtt-auth/fips", "mqtt-cluster/fips", "mqtt-observability/fips"]
+# DIAGNOSTIC ONLY — never in a shipped build (see mqtt-cluster's stage_timing.rs).
+diag-simulated-fsync = ["mqtt-cluster/diag-simulated-fsync"]
 
 [dev-dependencies]
 # Criterion for the publish-dispatch benchmark (ADR 0077 T4 follow-up). Already

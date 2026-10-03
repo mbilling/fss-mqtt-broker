@@ -799,6 +799,7 @@ fn spawn_replica_writer(
             .await
             .unwrap_or_else(|_| vec![false; n]);
             let commit = commit_started.elapsed();
+            crate::stage_timing::record(crate::stage_timing::Stage::Commit, commit);
             stats.commit_nanos.fetch_add(
                 u64::try_from(commit.as_nanos()).unwrap_or(u64::MAX),
                 Relaxed,

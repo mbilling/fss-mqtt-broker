@@ -177,7 +177,7 @@ fn sync_dir(dir: &Path) -> Result<(), LogError> {
     // filesystem makes it.
     #[cfg(unix)]
     File::open(dir)
-        .and_then(|d| d.sync_all())
+        .and_then(|d| durable_sync(&d, true))
         .map_err(io(format!("syncing directory {}", dir.display())))?;
     #[cfg(not(unix))]
     let _ = dir;
@@ -442,7 +442,7 @@ impl SegmentLog {
                     .open(&path)
                     .map_err(io(format!("creating {}", path.display())))?;
                 zero_fill(&file, 0, bytes, true)
-                    .and_then(|()| file.sync_all())
+                    .and_then(|()| durable_sync(&file, true))
                     .map_err(io(format!("zeroing {}", path.display())))?;
                 Ok(Spare { file, bytes })
             })
@@ -513,9 +513,10 @@ impl SegmentLog {
             .expect("the log always has an active segment");
         write_all_at(&self.active, &self.buf, seg.bytes)
             .map_err(io(format!("writing {}", seg.path.display())))?;
-        self.active
-            .sync_data()
+        let synced = std::time::Instant::now();
+        durable_sync(&self.active, false)
             .map_err(io(format!("flushing {}", seg.path.display())))?;
+        crate::stage_timing::record(crate::stage_timing::Stage::Fsync, synced.elapsed());
         seg.bytes += self.buf.len() as u64;
         let half_full = seg.bytes.saturating_mul(2) >= self.active_bytes;
         self.next_lsn = lsn;
@@ -567,7 +568,7 @@ fn reopen_active(seg: &SegmentInfo, torn: u64, first_bytes: u64) -> Result<(File
     if torn_end > seg.bytes || full > len {
         zero_fill(&f, seg.bytes, torn_end.max(full), false)
             .map_err(io(format!("zeroing {}", seg.path.display())))?;
-        f.sync_all().map_err(io("flushing a recovered segment"))?;
+        durable_sync(&f, true).map_err(io("flushing a recovered segment"))?;
     }
     Ok((f, full))
 }
@@ -581,8 +582,7 @@ fn create_segment(dir: &Path, first: Lsn, segment_bytes: u64) -> Result<File, Lo
         .open(&path)
         .map_err(io(format!("creating {}", path.display())))?;
     zero_fill(&f, 0, segment_bytes, false).map_err(io(format!("zeroing {}", path.display())))?;
-    f.sync_all()
-        .map_err(io(format!("flushing {}", path.display())))?;
+    durable_sync(&f, true).map_err(io(format!("flushing {}", path.display())))?;
     sync_dir(dir)?;
     Ok(f)
 }
@@ -597,7 +597,7 @@ fn zero_fill(f: &File, from: u64, to: u64, trickle: bool) -> std::io::Result<()>
         let n = usize::try_from(to - at).map_or(ZERO_CHUNK, |left| left.min(ZERO_CHUNK));
         write_all_at(f, &zeros[..n], at)?;
         if trickle {
-            f.sync_data()?;
+            durable_sync(f, false)?;
         }
         at += n as u64;
     }
@@ -614,6 +614,22 @@ impl Drop for SegmentLog {
 }
 
 #[cfg(unix)]
+/// Every data/metadata sync in the segment log goes through here, so the diagnostic
+/// stand-in (`diag-simulated-fsync`, see `stage_timing`) covers all of them — a hot path
+/// on a simulated barrier racing background syncs on the real device would measure the
+/// device again. A normal build compiles this to the plain call.
+fn durable_sync(f: &File, all: bool) -> std::io::Result<()> {
+    if let Some(d) = crate::stage_timing::simulated_fsync() {
+        std::thread::sleep(d);
+        return Ok(());
+    }
+    if all {
+        f.sync_all()
+    } else {
+        f.sync_data()
+    }
+}
+
 fn write_all_at(f: &File, buf: &[u8], offset: u64) -> std::io::Result<()> {
     use std::os::unix::fs::FileExt;
     f.write_all_at(buf, offset)
