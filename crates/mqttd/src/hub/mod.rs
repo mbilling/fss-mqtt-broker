@@ -2094,6 +2094,9 @@ pub struct Hub {
     /// `shared_prefer_local` guards, so the boolean stays the outer gate and 1000
     /// — the constructor's value — is bit-identical to today.
     shared_local_bias_permille: u16,
+    /// Per-session durable pipeline depth handed to every append-lane worker (ADR
+    /// 0075; `limits.append_lane_depth`). Read when a lane spawns.
+    lane_pipeline_depth: usize,
     /// ADR 0073: the cluster-wide scale-out ownership capability. `Some((flag,
     /// enabled))` on a cluster node: `enabled` is the operator's
     /// `durable.ownership_domain = "members"` choice; `flag` is the shared verdict
@@ -2551,6 +2554,7 @@ impl Hub {
                 // on — and at 1000 every existing `set_shared_prefer_local(true)`
                 // call site keeps today's behaviour with no edit (issue #613).
                 shared_local_bias_permille: 1000,
+                lane_pipeline_depth: lanes::LANE_PIPELINE_DEPTH,
                 ownership_domain: None,
                 replication_capable: None,
                 known_peer_protos: HashMap::new(),
@@ -2646,6 +2650,17 @@ impl Hub {
     /// the field lie.
     pub fn set_shared_local_bias_permille(&mut self, permille: u16) {
         self.shared_local_bias_permille = permille.min(1000);
+    }
+
+    /// How many of one persistent session's durable appends may await durability at
+    /// once (`limits.append_lane_depth`, ADR 0075). `None` keeps the built-in default.
+    /// Set before [`run`](Self::run): a lane reads it when it spawns. The clamp to
+    /// `1..=LANE_QUEUE_CAP` is belt and braces — `mqtt-config` refuses anything outside
+    /// it at startup — so a test or bench passing a raw number cannot make it lie.
+    pub fn set_lane_pipeline_depth(&mut self, depth: Option<usize>) {
+        if let Some(d) = depth {
+            self.lane_pipeline_depth = d.clamp(1, lanes::LANE_QUEUE_CAP);
+        }
     }
 
     /// The EFFECTIVE local bias: 0 when `shared_prefer_local` is off, otherwise
@@ -19259,6 +19274,7 @@ mod tests {
             lane_rx,
             None,
             true,
+            super::lanes::LANE_PIPELINE_DEPTH,
         ));
         for i in 1..=3u8 {
             let mut job = super::lanes::AppendJob::control(
@@ -19298,6 +19314,90 @@ mod tests {
         worker.await.unwrap();
     }
 
+    /// The lane admits exactly `depth` appends into their durability wait, and one
+    /// more per completion (ADR 0075, `limits.append_lane_depth`). A session's durable
+    /// throughput is therefore at most `depth / latency`, so this is the knob the
+    /// 2026-10-03 knee measurement turned on: the depth must be what the worker obeys,
+    /// at every value, not only the built-in 16.
+    #[tokio::test]
+    async fn the_lane_holds_exactly_depth_appends_in_flight() {
+        for depth in [1usize, 4, 16, 64] {
+            let store = ParkingStore::new();
+            let n = depth + 3;
+            let mut gates = store.pipeline("c", n);
+            let submitted = |s: &ParkingStore| {
+                n - s
+                    .pipelined
+                    .lock()
+                    .unwrap()
+                    .get("c")
+                    .map_or(0, std::collections::VecDeque::len)
+            };
+            let (self_tx, _self_rx) = mpsc::unbounded_channel();
+            let (lane_tx, lane_rx) = mpsc::channel(n + 1);
+            let worker = tokio::spawn(super::lanes::append_lane_worker(
+                store.clone(),
+                self_tx,
+                lane_rx,
+                None,
+                true,
+                depth,
+            ));
+            for i in 0..n {
+                let mut job = super::lanes::AppendJob::control(
+                    ClientId("c".into()),
+                    super::lanes::LaneWork::Append {
+                        expiry_at: None,
+                        origin: None,
+                        dedupe: false,
+                    },
+                );
+                job.message.qos = QoS::AtLeastOnce;
+                job.message.payload = Bytes::from(vec![u8::try_from(i % 251).unwrap()]);
+                lane_tx
+                    .send(super::lanes::LaneJob::Deliver(Box::new(job)))
+                    .await
+                    .unwrap();
+            }
+            // Bounded poll: the worker fills its window, then must stop there.
+            for _ in 0..1000 {
+                if submitted(&store) >= depth {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            for _ in 0..50 {
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(
+                submitted(&store),
+                depth,
+                "depth {depth}: window not respected"
+            );
+            // One completion admits exactly one more.
+            gates.remove(0).send(()).unwrap();
+            for _ in 0..1000 {
+                if submitted(&store) > depth {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            for _ in 0..50 {
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(
+                submitted(&store),
+                depth + 1,
+                "depth {depth}: one completion, one admission"
+            );
+            for g in gates {
+                let _ = g.send(());
+            }
+            drop(lane_tx);
+            worker.await.unwrap();
+        }
+    }
+
     /// An append whose store answers at once (no durability wait) must not
     /// overtake an earlier one still waiting: it queues behind it.
     #[tokio::test]
@@ -19312,6 +19412,7 @@ mod tests {
             lane_rx,
             None,
             true,
+            super::lanes::LANE_PIPELINE_DEPTH,
         ));
         for i in 1..=2u8 {
             let mut job = super::lanes::AppendJob::control(

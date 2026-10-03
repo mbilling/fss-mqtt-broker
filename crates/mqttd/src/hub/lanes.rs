@@ -359,8 +359,9 @@ impl AppendJob {
 /// retries nothing and decides nothing; and it always runs an accepted job to a real
 /// store outcome, even if the hub is already gone (the completion send then no-ops and
 /// the publisher's pending entry died withheld — fail closed).
-/// How many of one session's durable appends may be awaiting durability at
-/// once (ADR 0075). Submission stays serial — offset order is delivery order —
+/// The DEFAULT for how many of one session's durable appends may be awaiting
+/// durability at once (ADR 0075); `limits.append_lane_depth` /
+/// `MQTTD_APPEND_LANE_DEPTH` overrides it per node. Submission stays serial — offset order is delivery order —
 /// but the quorum round trips overlap, so a publisher's window stops paying
 /// one full round trip per message. Sized above the default publisher window
 /// so the lane, not this constant, is what a busy session saturates.
@@ -372,6 +373,7 @@ pub(super) async fn append_lane_worker(
     mut rx: mpsc::Receiver<LaneJob>,
     metrics: Option<Arc<mqtt_observability::metrics::Metrics>>,
     durable: bool,
+    depth: usize,
 ) {
     // The pipelined durability waits (ADR 0075). Owned by this worker — a
     // hub-owned task — so abort at shutdown drops them with it; the futures
@@ -392,7 +394,7 @@ pub(super) async fn append_lane_worker(
     let mut inflight: FuturesOrdered<Completion> = FuturesOrdered::new();
     loop {
         tokio::select! {
-            job = rx.recv(), if inflight.len() < LANE_PIPELINE_DEPTH => {
+            job = rx.recv(), if inflight.len() < depth => {
                 let Some(job) = job else { break };
                 match job {
                     LaneJob::Deliver(job) if matches!(job.work, LaneWork::Append { .. }) => {
@@ -809,6 +811,7 @@ impl Hub {
                 rx,
                 self.metrics.clone(),
                 self.durable_plane.is_some(),
+                self.lane_pipeline_depth,
             ));
             self.append_lanes
                 .insert(client.clone(), AppendLane { tx, outstanding: 0 });

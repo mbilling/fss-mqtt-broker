@@ -727,7 +727,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 
 - `publish_codec_round_trip_clears_the_floor`
 
-## `crates/mqtt-config/src/lib.rs` — 40 test(s)
+## `crates/mqtt-config/src/lib.rs` — 41 test(s)
 
 - `tests::a_backup_dir_inside_the_data_dir_is_a_config_error`
 - `tests::a_bad_enum_value_is_rejected`
@@ -742,6 +742,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::an_unknown_top_level_table_is_rejected`
 - `tests::an_unset_env_leaves_file_and_defaults_intact`
 - `tests::an_unspecified_swim_advertise_is_refused`
+- `tests::append_lane_depth_is_optional_and_range_checked`
 - `tests::comma_lists_and_the_domain_map_parse`
 - `tests::defaults_are_secure`
 - `tests::durable_on_without_a_data_dir_refuses_naming_both_remedies`
@@ -1015,7 +1016,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 536 test(s)
+## `crates/mqttd/src/lib.rs` — 537 test(s)
 
 - `admin::cli::tests::all_nodes_asks_for_the_cluster_scope_on_the_verbs_that_have_one`
 - `admin::cli::tests::answers_render_as_tables_and_lines`
@@ -1486,6 +1487,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::the_fanout_and_snapshot_carry_the_deadline`
 - `hub::tests::the_grant_sweep_removes_revoked_subscriptions_without_disconnecting`
 - `hub::tests::the_identity_sweep_evicts_revoked_sessions_and_spares_the_rest`
+- `hub::tests::the_lane_holds_exactly_depth_appends_in_flight`
 - `hub::tests::the_log_truncates_only_through_the_contiguous_acked_prefix`
 - `hub::tests::the_memory_axis_refuses_the_publishers_ack_just_as_the_disk_axis_does`
 - `hub::tests::the_outbound_byte_cap_sheds_qos0_before_the_packet_count_cap`

@@ -2954,6 +2954,14 @@ fn wire_hub(
     // cannot be inert on one deployment shape (issue #241, see this function's own
     // doc comment).
     hub.set_shared_local_bias_permille(config.cluster.effective_shared_local_bias_permille());
+    if let Some(depth) = config.limits.append_lane_depth {
+        info!(
+            depth,
+            "durable append lanes: up to {depth} appends per persistent session await \
+             durability at once (limits.append_lane_depth; default 16)"
+        );
+    }
+    hub.set_lane_pipeline_depth(config.limits.append_lane_depth);
     Ok(())
 }
 

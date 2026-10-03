@@ -881,6 +881,17 @@ pub struct Limits {
     /// memory at different rates. Read at startup only — a reload reports the `limits`
     /// section as requires-restart (ADR 0041 §6).
     pub watermark_poll_secs: u64,
+    /// How many of ONE persistent session's durable appends may await durability at
+    /// once (`MQTTD_APPEND_LANE_DEPTH`, ADR 0075's `LANE_PIPELINE_DEPTH`; unset = 16).
+    /// A session's lane submits in offset order and posts completions in that order,
+    /// so its durable throughput is at most `depth / append latency`. A consumer fed
+    /// by fan-in (a `$share` group under many publishers) needs far more than one
+    /// publisher's window: on 2026-10-03 the 3-node durable knee was exactly where
+    /// 16 / p99-latency fell below a consumer session's ~300 msg/s. Raising it changes
+    /// no ordering or durability rule — only how many appends overlap their wait.
+    /// 1..=256 (the lane's queue cap: more in flight than can be queued means
+    /// nothing). Read at startup — a reload reports `limits` as requires-restart.
+    pub append_lane_depth: Option<usize>,
 }
 
 impl Default for Limits {
@@ -903,6 +914,7 @@ impl Default for Limits {
             queue_overflow: None,
             memory_max_bytes: None,
             hub_ingress_bytes: None,
+            append_lane_depth: None,
             conn_ingress_bytes: None,
             ingress_overload: None,
             watermark_poll_secs: 10,
@@ -1491,6 +1503,9 @@ impl Config {
         on!("MQTTD_MAX_BACKLOG_MESSAGES", v, {
             self.limits.max_backlog_messages = Some(num("MQTTD_MAX_BACKLOG_MESSAGES", &v)?);
         });
+        on!("MQTTD_APPEND_LANE_DEPTH", v, {
+            self.limits.append_lane_depth = Some(num("MQTTD_APPEND_LANE_DEPTH", &v)?);
+        });
         on!("MQTTD_MAX_BACKLOG_BYTES", v, {
             self.limits.max_backlog_bytes = Some(num("MQTTD_MAX_BACKLOG_BYTES", &v)?);
         });
@@ -1720,6 +1735,16 @@ impl Config {
                  and a watermark sampled less often than every 5 minutes is decoration"
                     .to_string(),
             ));
+        }
+        // A session's durable pipeline depth (ADR 0075): zero would admit nothing and
+        // stall every persistent session; above the lane's 256-job queue cap it could
+        // never fill. Both are instructions that cannot have been meant.
+        if let Some(d) = self.limits.append_lane_depth {
+            if !(1..=256).contains(&d) {
+                return Err(ConfigError::Invalid(format!(
+                    "limits.append_lane_depth must be between 1 and 256 (default 16), got {d}"
+                )));
+            }
         }
         if self.observability.otlp_interval_secs == 0 {
             return Err(ConfigError::Invalid(
@@ -2161,6 +2186,7 @@ pub const ENV_VARS: &[&str] = &[
     "MQTTD_MAX_QUEUED_MESSAGES",
     "MQTTD_MAX_BACKLOG_MESSAGES",
     "MQTTD_MAX_BACKLOG_BYTES",
+    "MQTTD_APPEND_LANE_DEPTH",
     "MQTTD_MAX_OUTBOUND_BYTES",
     "MQTTD_MAX_INFLIGHT_MESSAGES",
     "MQTTD_MAX_RETAINED_MESSAGES",
@@ -2713,6 +2739,29 @@ mod tests {
         );
     }
 
+    /// The durable lane depth (ADR 0075): unset keeps the built-in 16; the env and
+    /// TOML set it; 0 and anything above the 256-job lane cap are refused.
+    #[test]
+    fn append_lane_depth_is_optional_and_range_checked() {
+        assert_eq!(Config::default().limits.append_lane_depth, None);
+        let flag = "[durable]\nallow_ephemeral = true\n";
+        let c = Config::from_toml(&format!("[limits]\nappend_lane_depth = 64\n{flag}")).unwrap();
+        assert_eq!(c.limits.append_lane_depth, Some(64));
+        for bad in [0, 257] {
+            let err = Config::from_toml(&format!("[limits]\nappend_lane_depth = {bad}\n{flag}"))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("append_lane_depth must be between 1 and 256"),
+                "{bad}: {err}"
+            );
+        }
+        let mut c = Config::default();
+        c.overlay_from(getter(&[("MQTTD_APPEND_LANE_DEPTH", "128")]))
+            .unwrap();
+        assert_eq!(c.limits.append_lane_depth, Some(128));
+    }
+
     #[test]
     fn per_var_boolean_conventions_are_honoured() {
         // MQTTD_ALLOW_ANONYMOUS: *any* value means "on" (the footgun a naive flatten hits).
@@ -2987,7 +3036,8 @@ mod tests {
             | "MQTTD_OIDC_MAX_STALE"
             | "MQTTD_BACKUP_EVERY"
             | "MQTTD_TLS_SESSION_CACHE"
-            | "MQTTD_ADMIN_PEER_PORT" => "7",
+            | "MQTTD_ADMIN_PEER_PORT"
+            | "MQTTD_APPEND_LANE_DEPTH" => "7",
             // The default is already 7 (backup.keep) / 300 (restore timeout), so "7" would
             // change nothing and the totality sweep would read as a missing mapping.
             // MQTTD_REPLICAS (ADR 0080): a valid factor that is not the default (2).
@@ -3136,8 +3186,9 @@ mod tests {
             // plus MQTTD_REPLICAS (ADR 0080),
             // plus the seven MQTTD_ADMIN_* variables (ADR 0081).
             // plus MQTTD_HUB_INGRESS_BYTES, MQTTD_CONN_INGRESS_BYTES and
-            // MQTTD_INGRESS_OVERLOAD (ADR 0082 T3).
-            112,
+            // MQTTD_INGRESS_OVERLOAD (ADR 0082 T3),
+            // plus MQTTD_APPEND_LANE_DEPTH (ADR 0075 amendment).
+            113,
             "the MQTTD_* surface changed — update ENV_VARS"
         );
         // Issue #239: MQTTD_MIN_REPLICAS was wired in `overlay_from` but never
