@@ -380,6 +380,8 @@ stages inside it are exported separately, on finer buckets (20µs to ~5s, ×1.5)
 | `order` | quorum met → the append is committed in offset order (head-of-line wait) |
 | `commit` | one shard-writer group commit (one sample per batch, not per append) |
 | `fsync` | one segment-log data sync (one sample per batch) |
+| `replicate_rtt` | leader, per follower: Replicate queued to the peer link → its ack back |
+| `replica_apply` | follower: Replicate received → its ack put on the link (writer queue + commit) |
 
 `mqttd_publish_ack_seconds` is the server-side publish → PUBACK release for QoS 1
 publishes that went through the pending table: the broker's own share of the client's

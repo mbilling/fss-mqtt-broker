@@ -1613,6 +1613,8 @@ fn stage_breakdown(before: &[Scrape], after: &[Scrape]) -> Vec<(&'static str, f6
         "order",
         "commit",
         "fsync",
+        "replicate_rtt",
+        "replica_apply",
         "publish_ack",
     ];
     for label in series {

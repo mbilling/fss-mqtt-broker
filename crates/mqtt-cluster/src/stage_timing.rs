@@ -30,6 +30,13 @@ pub enum Stage {
     Commit,
     /// The data sync alone.
     Fsync,
+    /// Leader side, per follower: Replicate queued to the link until its ack is
+    /// back — the peer bus both ways plus the follower's whole apply.
+    ReplicateRtt,
+    /// Follower side: Replicate received until its ack is put on the link — the
+    /// follower's writer queue wait plus its group commit. `replicate_rtt` minus
+    /// this is the network and the two peer-bus queues.
+    ReplicaApply,
 }
 
 impl Stage {
@@ -42,6 +49,8 @@ impl Stage {
             Stage::Order => "order",
             Stage::Commit => "commit",
             Stage::Fsync => "fsync",
+            Stage::ReplicateRtt => "replicate_rtt",
+            Stage::ReplicaApply => "replica_apply",
         }
     }
 }
@@ -101,11 +110,21 @@ mod tests {
             Stage::Order,
             Stage::Commit,
             Stage::Fsync,
+            Stage::ReplicateRtt,
+            Stage::ReplicaApply,
         ];
         let labels: Vec<_> = all.iter().map(|s| s.label()).collect();
         assert_eq!(
             labels,
-            ["local_durable", "quorum", "order", "commit", "fsync"]
+            [
+                "local_durable",
+                "quorum",
+                "order",
+                "commit",
+                "fsync",
+                "replicate_rtt",
+                "replica_apply"
+            ]
         );
     }
 
