@@ -120,11 +120,14 @@ pub fn crc32c(data: &[u8]) -> u32 {
     crc32c_update(0, data)
 }
 
-fn crc32c_update(crc: u32, data: &[u8]) -> u32 {
-    static TABLE: std::sync::OnceLock<[u32; 256]> = std::sync::OnceLock::new();
-    let table = TABLE.get_or_init(|| {
-        let mut t = [0u32; 256];
-        for (i, slot) in (0u32..).zip(t.iter_mut()) {
+/// Slicing-by-16 tables: `T[0]` is the classic byte table; `T[k][i]` is the CRC
+/// of byte `i` followed by `k` zero bytes, so sixteen independent lookups fold
+/// sixteen input bytes per step instead of one dependent lookup per byte.
+fn crc32c_tables() -> &'static [[u32; 256]; 16] {
+    static TABLES: std::sync::OnceLock<Box<[[u32; 256]; 16]>> = std::sync::OnceLock::new();
+    TABLES.get_or_init(|| {
+        let mut t = Box::new([[0u32; 256]; 16]);
+        for (i, slot) in (0u32..).zip(t[0].iter_mut()) {
             let mut c = i;
             for _ in 0..8 {
                 c = if c & 1 == 1 {
@@ -135,11 +138,46 @@ fn crc32c_update(crc: u32, data: &[u8]) -> u32 {
             }
             *slot = c;
         }
+        for k in 1..16 {
+            for i in 0..256 {
+                let prev = t[k - 1][i];
+                t[k][i] = (prev >> 8) ^ t[0][(prev & 0xff) as usize];
+            }
+        }
         t
-    });
+    })
+}
+
+/// The segment log's hot path: every record written and every record read on
+/// recovery is checksummed here. Slicing-by-16 is several times faster than the
+/// byte-at-a-time loop it replaced (which was the single hottest function on a
+/// follower's writer), and produces the same values, so the on-disk format is
+/// unchanged.
+fn crc32c_update(crc: u32, data: &[u8]) -> u32 {
+    let t = crc32c_tables();
     let mut c = !crc;
-    for b in data {
-        c = table[((c ^ u32::from(*b)) & 0xff) as usize] ^ (c >> 8);
+    let mut chunks = data.chunks_exact(16);
+    for b in &mut chunks {
+        c ^= u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+        c = t[15][(c & 0xff) as usize]
+            ^ t[14][((c >> 8) & 0xff) as usize]
+            ^ t[13][((c >> 16) & 0xff) as usize]
+            ^ t[12][(c >> 24) as usize]
+            ^ t[11][usize::from(b[4])]
+            ^ t[10][usize::from(b[5])]
+            ^ t[9][usize::from(b[6])]
+            ^ t[8][usize::from(b[7])]
+            ^ t[7][usize::from(b[8])]
+            ^ t[6][usize::from(b[9])]
+            ^ t[5][usize::from(b[10])]
+            ^ t[4][usize::from(b[11])]
+            ^ t[3][usize::from(b[12])]
+            ^ t[2][usize::from(b[13])]
+            ^ t[1][usize::from(b[14])]
+            ^ t[0][usize::from(b[15])];
+    }
+    for b in chunks.remainder() {
+        c = t[0][((c ^ u32::from(*b)) & 0xff) as usize] ^ (c >> 8);
     }
     !c
 }
@@ -693,9 +731,45 @@ mod tests {
     }
 
     #[test]
+    fn sliced_crc_matches_the_bytewise_definition_at_every_length_and_split() {
+        // The byte-at-a-time loop the slicing replaced, kept here as the oracle.
+        fn bytewise(crc: u32, data: &[u8]) -> u32 {
+            let t = &super::crc32c_tables()[0];
+            let mut c = !crc;
+            for b in data {
+                c = t[((c ^ u32::from(*b)) & 0xff) as usize] ^ (c >> 8);
+            }
+            !c
+        }
+        let data: Vec<u8> = (0u32..600)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 13).to_le_bytes()[0])
+            .collect();
+        for len in 0..data.len() {
+            assert_eq!(crc32c(&data[..len]), bytewise(0, &data[..len]), "len {len}");
+        }
+        // Chained updates (record_crc's head-then-payload) at every split point,
+        // from every misaligned start.
+        for start in 0..16 {
+            let d = &data[start..start + 100];
+            for split in 0..=d.len() {
+                assert_eq!(
+                    crc32c_update(crc32c(&d[..split]), &d[split..]),
+                    bytewise(0, d),
+                    "start {start} split {split}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn crc32c_matches_the_standard_check_value() {
         assert_eq!(crc32c(b"123456789"), 0xE306_9283);
         assert_eq!(crc32c(b""), 0);
+        // RFC 3720 B.4 vectors: 32 bytes of zeros, of 0xFF, and ascending.
+        assert_eq!(crc32c(&[0u8; 32]), 0x8A91_36AA);
+        assert_eq!(crc32c(&[0xFFu8; 32]), 0x62A8_AB43);
+        let ascending: Vec<u8> = (0u8..32).collect();
+        assert_eq!(crc32c(&ascending), 0x46DD_794E);
     }
 
     #[test]
