@@ -18,6 +18,10 @@
 # compared on one provisioning. Arm 1 runs as the hosts booted, so its value must
 # match BROKER_NIC_SPREAD.
 #
+# RIG_BINARY=main|alt swaps every broker's binary in place before the arm
+# (swap-binary.sh), so two builds are compared on one provisioning: `alt` is
+# ALT_MQTTD_URL/ALT_MQTTD_SHA256, `main` is MQTTD_URL/MQTTD_SHA256. Arm 1 is main.
+#
 # Every arm starts from empty stores, so a store-changing variable is safe to
 # vary per arm: that is how two configurations are compared on the SAME
 # hardware (two provisionings differ by ~40%; the disks alone by 3.5x).
@@ -48,7 +52,7 @@ require_modern_bash
 
 : "${KNEE_ARMS:?source a knee env first (KNEE_ARMS=<brokers>:<drivers>:<ladder>;...)}"
 # Parse once, refuse early: a malformed arm must not surface after provisioning.
-ARM_N=() ARM_D=() ARM_L=() ARM_E=() ARM_RPS=()
+ARM_N=() ARM_D=() ARM_L=() ARM_E=() ARM_RPS=() ARM_BIN=()
 IFS=';' read -r -a _arms <<<"$KNEE_ARMS"
 for _a in "${_arms[@]}"; do
 	_a="$(echo "$_a" | sed 's/^ *//; s/ *$//')"
@@ -56,7 +60,7 @@ for _a in "${_arms[@]}"; do
 	IFS=':' read -r _n _d _l _e <<<"$_a"
 	[[ "$_n" =~ ^[1-9][0-9]*$ && "$_d" =~ ^[1-9][0-9]*$ && -n "${_l// /}" ]] ||
 		die "KNEE_ARMS: '$_a' is not <brokers>:<drivers>:<ladder>[:<broker env>]"
-	_env="" _rps=""
+	_env="" _rps="" _bin=""
 	if [ -n "${_e// /}" ]; then
 		IFS=',' read -r -a _kvs <<<"$_e"
 		for _kv in "${_kvs[@]}"; do
@@ -66,18 +70,34 @@ for _a in "${_arms[@]}"; do
 				_rps="${BASH_REMATCH[1]}"
 				continue
 			fi
+			if [[ "$_kv" =~ ^RIG_BINARY=(main|alt)$ ]]; then
+				_bin="${BASH_REMATCH[1]}"
+				continue
+			fi
 			[[ "$_kv" =~ ^MQTTD_[A-Z0-9_]+=[^[:space:]]*$ ]] ||
-				die "KNEE_ARMS: '$_kv' in '$_a' is not MQTTD_<NAME>=<value> or RIG_NIC_SPREAD=on|off"
+				die "KNEE_ARMS: '$_kv' in '$_a' is not MQTTD_<NAME>=<value>, RIG_NIC_SPREAD=on|off or RIG_BINARY=main|alt"
 			_env+="${_env:+$'\n'}$_kv"
 		done
 	fi
-	ARM_N+=("$_n") ARM_D+=("$_d") ARM_L+=("$_l") ARM_E+=("$_env") ARM_RPS+=("$_rps")
+	ARM_N+=("$_n") ARM_D+=("$_d") ARM_L+=("$_l") ARM_E+=("$_env") ARM_RPS+=("$_rps") ARM_BIN+=("$_bin")
 done
 # Arm 1 boots the hosts, so its spread is BROKER_NIC_SPREAD's, set by cloud-init.
 case "${ARM_RPS[0]}:${BROKER_NIC_SPREAD:-false}" in
 "on:true" | "off:false" | ":"*) ;;
 *) die "arm 1 has RIG_NIC_SPREAD=${ARM_RPS[0]} but BROKER_NIC_SPREAD=${BROKER_NIC_SPREAD:-false} — arm 1 runs as the hosts booted; set BROKER_NIC_SPREAD to match" ;;
 esac
+# RIG_BINARY: arm 1 runs the binary the hosts installed (MQTTD_URL, or the
+# release); a later arm swaps every broker in place (swap-binary.sh) — `alt` to
+# ALT_MQTTD_URL/ALT_MQTTD_SHA256, `main` back to MQTTD_URL/MQTTD_SHA256.
+[ "${ARM_BIN[0]:-main}" = main ] || die "arm 1 has RIG_BINARY=${ARM_BIN[0]} — arm 1 runs the provisioned binary (main)"
+for _b in "${ARM_BIN[@]}"; do
+	case "$_b" in
+	alt) [[ -n "${ALT_MQTTD_URL:-}" && -n "${ALT_MQTTD_SHA256:-}" ]] ||
+		die "an arm uses RIG_BINARY=alt but ALT_MQTTD_URL / ALT_MQTTD_SHA256 are not both set" ;;
+	main) [[ -n "${MQTTD_URL:-}" && -n "${MQTTD_SHA256:-}" ]] ||
+		die "an arm uses RIG_BINARY=main but MQTTD_URL / MQTTD_SHA256 are not both set (swapping back needs a URL)" ;;
+	esac
+done
 [ "${#ARM_N[@]}" -ge 2 ] || die "KNEE_ARMS needs at least two arms (a comparison), got ${#ARM_N[@]}"
 for ((k = 1; k < ${#ARM_N[@]}; k++)); do
 	[ "${ARM_N[$k]}" -le "${ARM_N[0]}" ] || die "arm $((k + 1)) has ${ARM_N[$k]} brokers, more than the ${ARM_N[0]} the first arm provisions"
@@ -197,15 +217,21 @@ set_nic_spread() {
 
 # run.sh's per-size tail (run-curve, collect, observe) for an arm that
 # resize-cluster.sh + bootstrap-cluster.sh brought up instead of run.sh.
-resized_arm() { # resized_arm <size> <drivers> <arm-dir> <ladder> <broker-env> <nic-spread> [retry]
-	local n="$1" d="$2" dir="$3" ladder="$4" env="$5" rps="$6" retry="${7:-0}" rc=0
-	say "════ arm $(basename "$dir"): $n nodes, $d drivers, on the same hosts — ladder: $ladder${env:+ — broker env: ${env//$'\n'/ }}${rps:+ — nic spread: $rps} ════"
+resized_arm() { # resized_arm <size> <drivers> <arm-dir> <ladder> <broker-env> <nic-spread> <binary> [retry]
+	local n="$1" d="$2" dir="$3" ladder="$4" env="$5" rps="$6" bin="$7" retry="${8:-0}" rc=0
+	say "════ arm $(basename "$dir"): $n nodes, $d drivers, on the same hosts — ladder: $ladder${env:+ — broker env: ${env//$'\n'/ }}${rps:+ — nic spread: $rps}${bin:+ — binary: $bin} ════"
 	ARM_DIR="$dir" ARM_INV="$dir/inventory-$n.json"
 	"$SCALE_DIR/resize-cluster.sh" "$FULL_INV" "$n" "$dir" "$d"
 	mkdir -p "$dir" && printf '%s\n' "$env" >"$dir/arm-env.txt"
 	if [ -n "$rps" ]; then
 		set_nic_spread "$rps" "$dir/inventory-$n.json" | tee "$dir/nic-spread.txt" >&2
 	fi
+	case "$bin" in
+	alt) "$SCALE_DIR/swap-binary.sh" "$dir/inventory-$n.json" "$ALT_MQTTD_URL" "$ALT_MQTTD_SHA256" 2>&1 | grep -v "^  " >&2
+		printf 'binary=alt\nurl=%s\nsha256=%s\n' "$ALT_MQTTD_URL" "$ALT_MQTTD_SHA256" >"$dir/arm-binary.txt" ;;
+	main) "$SCALE_DIR/swap-binary.sh" "$dir/inventory-$n.json" "$MQTTD_URL" "$MQTTD_SHA256" 2>&1 | grep -v "^  " >&2
+		printf 'binary=main\nurl=%s\nsha256=%s\n' "$MQTTD_URL" "$MQTTD_SHA256" >"$dir/arm-binary.txt" ;;
+	esac
 	EXTRA_BROKER_ENV="$env" "$SCALE_DIR/bootstrap-cluster.sh" "$dir" "$dir/inventory-$n.json" durable
 	if [ "${OBSERVE:-1}" = 1 ]; then
 		"$SCALE_DIR/observe.sh" attach "$dir" "$dir/inventory-$n.json" || warn "observe attach failed — continuing unobserved"
@@ -213,7 +239,7 @@ resized_arm() { # resized_arm <size> <drivers> <arm-dir> <ladder> <broker-env> <
 	LANE_E_SITES_OVERRIDE="$ladder" "$SCALE_DIR/run-curve.sh" "$dir" "$dir/inventory-$n.json" || rc=$?
 	if [ "$rc" -ne 0 ]; then
 		if [ "$retry" = 0 ] && swap_bad_brokers "$dir" "$n"; then
-			resized_arm "$n" "$d" "$dir-r2" "$ladder" "$env" "$rps" 1
+			resized_arm "$n" "$d" "$dir-r2" "$ladder" "$env" "$rps" "$bin" 1
 			return
 		fi
 		return "$rc"
@@ -237,12 +263,12 @@ FULL_INV="$ARM_INV"
 DONE_ARMS=("$A1")
 if [ "$rc" -ne 0 ]; then
 	swap_bad_brokers "$CAMPAIGN/$A1" "${ARM_N[0]}" || exit "$rc"
-	resized_arm "${ARM_N[0]}" "${ARM_D[0]}" "$CAMPAIGN/$A1-r2" "${ARM_L[0]}" "$(arm_env 0)" "${ARM_RPS[0]}" 1
+	resized_arm "${ARM_N[0]}" "${ARM_D[0]}" "$CAMPAIGN/$A1-r2" "${ARM_L[0]}" "$(arm_env 0)" "${ARM_RPS[0]}" "" 1
 	DONE_ARMS=("$LAST_ARM")
 fi
 
 for ((k = 1; k < ${#ARM_N[@]}; k++)); do
-	resized_arm "${ARM_N[$k]}" "${ARM_D[$k]}" "$CAMPAIGN/$((k + 1))-n${ARM_N[$k]}" "${ARM_L[$k]}" "$(arm_env "$k")" "${ARM_RPS[$k]}"
+	resized_arm "${ARM_N[$k]}" "${ARM_D[$k]}" "$CAMPAIGN/$((k + 1))-n${ARM_N[$k]}" "${ARM_L[$k]}" "$(arm_env "$k")" "${ARM_RPS[$k]}" "${ARM_BIN[$k]}"
 	DONE_ARMS+=("$LAST_ARM")
 done
 
