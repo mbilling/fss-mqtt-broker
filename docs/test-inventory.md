@@ -258,7 +258,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `two_bridge_instances_do_not_duplicate_forwarding`
 - `two_partitioned_instances_deliver_each_inbound_message_exactly_once`
 
-## `crates/mqtt-cluster/src/lib.rs` — 365 test(s)
+## `crates/mqtt-cluster/src/lib.rs` — 366 test(s)
 
 - `cluster_identity::tests::a_founder_mints_once_and_reloads_stably`
 - `cluster_identity::tests::a_joiner_adopts_once_and_persists`
@@ -540,6 +540,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `segment_log::tests::reserved_kinds_and_oversized_payloads_are_refused_unwritten`
 - `segment_log::tests::segments_are_zeroed_not_sparse_even_after_a_torn_tail`
 - `segment_log::tests::segments_double_from_the_first_size_up_to_the_configured_one`
+- `segment_log::tests::sliced_crc_matches_the_bytewise_definition_at_every_length_and_split`
 - `stage_timing::tests::a_normal_build_never_simulates`
 - `stage_timing::tests::labels_are_the_documented_bounded_set`
 - `swim::tests::a_changed_routing_address_is_surfaced_even_when_the_state_is_unchanged`
