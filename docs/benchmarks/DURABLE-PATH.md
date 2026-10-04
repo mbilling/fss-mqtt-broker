@@ -409,9 +409,35 @@ A/B on one machine (M1 Pro, 3 local nodes, log store, simulated fsync, `qos1-dur
 | 1 ms → 1.46 ms | 11,233 / 10,887 | 20,064 / 20,305 | +83% | 11.0 → 5.85 ms | 3.0 → 0.19 ms |
 | 2 ms → 2.94 ms | 5,593 / 5,575 | 10,295 / 10,458 | +85% | 22.3 → 11.4 ms | 5.65 → 0.38 ms |
 
-This is a closed-loop driver on loopback, where the follower round trip costs almost nothing.
-On separate hosts the overlap still removes one barrier, but the network round trip comes back
-into `quorum`. The knob stays off until the multi-host rig confirms the gain.
+That is a closed-loop driver on loopback, where the follower round trip costs almost nothing
+and macOS's simulated barrier dominates. **It is a latency result, not a capacity one.**
+
+**On the rig, overlap did not move the knee** (2026-10-04, 3 × CCX23 brokers, 8 × CCX33
+drivers, log store, durable QoS 1 consumers, lane E, one provisioning, serial and overlap
+arms plus a closing serial control):
+
+| sites (per node) | serial | overlap |
+|---|---|---|
+| 13 (26k) | GREEN | GREEN |
+| 16 (32k) | GREEN | GREEN |
+| 18 (36k) | GREEN | GREEN |
+| 20 (40k) | not carried: not steady, below offer | not carried: steady, 11% of publishes late |
+| 21 (42k) | not carried | not carried |
+
+Overlap did what it was built to do. At 16 sites `quorum` fell from 4.17 to 2.75 ms (−34%) and
+the PUBACK mean from 7.87 to 7.18 ms, but `local_durable` rose from 2.55 to 3.02 ms. The
+reason it could not move the knee is visible in the same run:
+
+- **The barrier is cheap on this hardware.** `fsync` is 0.3–0.5 ms, against ~4 ms on a Mac.
+- **The brokers were close to CPU-saturated at the knee:** 84–91% busy (idle 9–16%), with
+  about 45% of it kernel time (sys ≈ 27%, softirq ≈ 18%) and the NIC's softirq core ~98%.
+- **Each node's durable writer is never idle under load.** Batches grow from 37 to 194 entries
+  per commit between 13 and 20 sites, at a steady ~5 µs of non-fsync work per entry, and with
+  three replicas every node writes every message.
+
+Overlap shortens a wait. Here there was no idle CPU to fill the time it frees. It stays
+experimental and off by default. The levers this points at are per-entry CPU in the
+writer and the kernel's share of the publish path.
 
 ## Result 3 — head-of-line isolation under a degraded placement group
 
