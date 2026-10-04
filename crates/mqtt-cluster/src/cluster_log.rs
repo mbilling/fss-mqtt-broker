@@ -1678,6 +1678,12 @@ struct KeyState {
     /// pending append at or above it fails too (tail-fail — the committed range
     /// stays gap-free by construction). Cleared when the pipeline drains.
     abort_floor: Option<Offset>,
+    /// Wakes THIS key's parked pipelined appends whenever one of them resolves,
+    /// so its in-order commits cascade (ADR 0075). Per key, not per log: an
+    /// append only ever waits on earlier offsets of its own key, and one shared
+    /// wake-up made every commit re-wake every parked append in the log, each
+    /// re-taking `state`'s lock to find it was not its turn.
+    commit: Arc<tokio::sync::Notify>,
 }
 
 /// The submit half's view of the owner's own durability (ADR 0075): either
@@ -1801,9 +1807,6 @@ pub struct ClusterLog<T: ReplicaTransport> {
     /// Arc'd so a pipelined append's durability wait (ADR 0075) can carry a
     /// `'static` handle to the commit watermark without borrowing the log.
     state: Arc<tokio::sync::Mutex<BTreeMap<String, KeyState>>>,
-    /// Wakes parked pipelined appends whenever any append resolves, so
-    /// in-order commits cascade (ADR 0075).
-    commit_notify: Arc<tokio::sync::Notify>,
     /// The node's own **durable** replica copy (ADR 0042 T8, exhibit ④). When
     /// attached, the owner's self-ack counts toward a write quorum only after
     /// the op is durably applied here — so an acked entry exists on a full
@@ -1859,7 +1862,6 @@ impl<T: ReplicaTransport> ClusterLog<T> {
             quorum: Quorum::majority(replica_set.len()),
             transport,
             state: Arc::new(tokio::sync::Mutex::new(BTreeMap::new())),
-            commit_notify: Arc::new(tokio::sync::Notify::new()),
             local_store: None,
             writer: None,
         };
@@ -2036,7 +2038,6 @@ impl<T: ReplicaTransport> ClusterLog<T> {
             quorum: Quorum::majority(replica_set.len()),
             transport,
             state: Arc::new(tokio::sync::Mutex::new(state)),
-            commit_notify: Arc::new(tokio::sync::Notify::new()),
             local_store: None,
             writer: None,
         };
@@ -2573,7 +2574,6 @@ impl<T: ReplicaTransport + Clone + 'static> ReplicatedLog for ClusterLog<T> {
         // whoever drives it (the session lane, a hub-owned task) carries the
         // right teardown semantics for free (ADR 0061 / issue #242).
         let state = Arc::clone(&self.state);
-        let notify = Arc::clone(&self.commit_notify);
         let transport = self.transport.clone();
         let followers = self.followers.clone();
         let followers_in_prefix = self.followers_in_prefix.clone();
@@ -2646,54 +2646,63 @@ impl<T: ReplicaTransport + Clone + 'static> ReplicatedLog for ClusterLog<T> {
             // never be retroactively lost to an earlier offset's failure; a
             // failure fails every staged offset above it (tail-fail) and the
             // committed range stays gap-free by construction.
+            // This key's waker, kept once seen: if the key is removed under us
+            // the earlier appends parked on it must still be woken.
+            let mut waker: Option<Arc<tokio::sync::Notify>> = None;
             loop {
+                let mut guard = state.lock().await;
+                let Some(ks) = guard.get_mut(&key) else {
+                    // The key was removed mid-flight (session discard):
+                    // there is no watermark left to commit into.
+                    if let Some(w) = &waker {
+                        w.notify_waiters();
+                    }
+                    return Err(ReplError::NoQuorum);
+                };
+                let notify = Arc::clone(&ks.commit);
+                // Registered while the lock is held, so no resolution between
+                // this check and the await below can be missed.
                 let notified = notify.notified();
                 tokio::pin!(notified);
                 notified.as_mut().enable();
-                {
-                    let mut guard = state.lock().await;
-                    let Some(ks) = guard.get_mut(&key) else {
-                        // The key was removed mid-flight (session discard):
-                        // there is no watermark left to commit into.
-                        return Err(ReplError::NoQuorum);
-                    };
-                    if ks.abort_floor.is_some_and(|floor| offset >= floor) {
-                        // An earlier offset failed under us: tail-fail.
-                        ks.entries.remove(&offset);
-                        ks.tags.remove(&offset);
-                        Self::pipeline_resolved(ks);
-                        notify.notify_waiters();
-                        return Err(ReplError::NoQuorum);
-                    }
-                    if !met {
-                        // Not durable: fail this offset and everything staged
-                        // above it. Do not advance the watermark; the retries
-                        // reuse these offsets at a higher seq (ADR 0042 T7),
-                        // superseding any replica that stored a failed attempt.
-                        ks.abort_floor = Some(ks.abort_floor.map_or(offset, |f| f.min(offset)));
-                        let doomed: Vec<Offset> = ks
-                            .entries
-                            .range((Excluded(ks.committed), Included(ks.assigned)))
-                            .map(|(o, _)| *o)
-                            .filter(|o| *o >= offset)
-                            .collect();
-                        for o in doomed {
-                            ks.entries.remove(&o);
-                            ks.tags.remove(&o);
-                        }
-                        Self::pipeline_resolved(ks);
-                        notify.notify_waiters();
-                        return Err(ReplError::NoQuorum);
-                    }
-                    if ks.committed + 1 == offset {
-                        ks.committed = offset;
-                        Self::pipeline_resolved(ks);
-                        notify.notify_waiters();
-                        return Ok(offset);
-                    }
-                    // An earlier offset is still pending: park until any
-                    // append resolves, then re-check.
+                if ks.abort_floor.is_some_and(|floor| offset >= floor) {
+                    // An earlier offset failed under us: tail-fail.
+                    ks.entries.remove(&offset);
+                    ks.tags.remove(&offset);
+                    Self::pipeline_resolved(ks);
+                    notify.notify_waiters();
+                    return Err(ReplError::NoQuorum);
                 }
+                if !met {
+                    // Not durable: fail this offset and everything staged
+                    // above it. Do not advance the watermark; the retries
+                    // reuse these offsets at a higher seq (ADR 0042 T7),
+                    // superseding any replica that stored a failed attempt.
+                    ks.abort_floor = Some(ks.abort_floor.map_or(offset, |f| f.min(offset)));
+                    let doomed: Vec<Offset> = ks
+                        .entries
+                        .range((Excluded(ks.committed), Included(ks.assigned)))
+                        .map(|(o, _)| *o)
+                        .filter(|o| *o >= offset)
+                        .collect();
+                    for o in doomed {
+                        ks.entries.remove(&o);
+                        ks.tags.remove(&o);
+                    }
+                    Self::pipeline_resolved(ks);
+                    notify.notify_waiters();
+                    return Err(ReplError::NoQuorum);
+                }
+                if ks.committed + 1 == offset {
+                    ks.committed = offset;
+                    Self::pipeline_resolved(ks);
+                    notify.notify_waiters();
+                    return Ok(offset);
+                }
+                // An earlier offset of this key is still pending: park until
+                // one of them resolves, then re-check.
+                drop(guard);
+                waker = Some(Arc::clone(&notify));
                 notified.await;
             }
         })
@@ -2806,7 +2815,11 @@ impl<T: ReplicaTransport + Clone + 'static> ReplicatedLog for ClusterLog<T> {
     async fn remove(&self, key: &String) -> Result<(), ReplError> {
         {
             let mut state = self.state.lock().await;
-            state.remove(key);
+            // Appends of this key parked on its waker re-check and fail: the
+            // key has no watermark left to commit into.
+            if let Some(ks) = state.remove(key) {
+                ks.commit.notify_waiters();
+            }
         }
         let op = ReplOp::Remove { key: key.clone() };
         let _ = self.local_ack(self.lease.epoch, &op).await;
@@ -4698,6 +4711,39 @@ mod tests {
             all.iter().map(|e| e.offset).collect::<Vec<_>>(),
             vec![1, 2, 3]
         );
+    }
+
+    /// Waking is per key (the commit waker lives in the key's state), so a
+    /// removal must wake that key's parked appends itself: an append parked
+    /// behind an earlier, still-gated offset resolves as soon as its key is
+    /// removed, instead of waiting for the earlier offset to resolve.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn removing_a_key_wakes_its_parked_appends() {
+        let gate = GatedFollowers::new();
+        let log = Arc::new(pipelined_log(gate.clone()));
+        let k = "x".to_string();
+        let p1 = log
+            .submit_tiered(&k, b"1".to_vec(), DurabilityTier::Quorum)
+            .await;
+        let p2 = log
+            .submit_tiered(&k, b"2".to_vec(), DurabilityTier::Quorum)
+            .await;
+        let p2 = tokio::spawn(p2);
+        // Offset 2 reaches quorum and parks behind offset 1, which stays gated.
+        gate.release(2, true);
+        // SETTLE(parked-behind-earlier): an absence window — offset 2 must not
+        // complete while offset 1 is pending. A slower machine only narrows it.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(!p2.is_finished(), "offset 2 completed ahead of offset 1");
+        log.remove(&k).await.unwrap();
+        let r2 = tokio::time::timeout(std::time::Duration::from_secs(5), p2)
+            .await
+            .expect("the parked append was never woken by the removal")
+            .unwrap();
+        assert!(matches!(r2, Err(ReplError::NoQuorum)));
+        // The earlier offset, released afterwards, finds no key either.
+        gate.release(1, true);
+        assert!(matches!(p1.await, Err(ReplError::NoQuorum)));
     }
 
     /// A mid-pipeline failure fails every staged offset above it (tail-fail),
