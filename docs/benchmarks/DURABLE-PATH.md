@@ -392,6 +392,27 @@ from whatever the local disk does (`F_FULLFSYNC` on macOS is ~4ms) to a chosen v
 so one machine can show how each stage responds to it. **It disables durability** — a
 measurement build only, never a release.
 
+### Overlapped replication (experimental, `MQTTD_REPLICATION_OVERLAP=1`)
+
+The stage histograms showed the store wait as two near-equal halves in series:
+`local_durable` (≈1.8× fsync) and then `quorum` (≈2× fsync), because the follower fan-out
+started only once the owner's own write was durable. With `MQTTD_REPLICATION_OVERLAP=1` the
+fan-out starts at submit. The ack rule is unchanged: the local outcome is still awaited and
+counted exactly as before.
+
+A/B on one machine (M1 Pro, 3 local nodes, log store, simulated fsync, `qos1-durable-owner`,
+8 publishers × window 16, 2 reps each, all VALID):
+
+| fsync (requested → measured) | serial msg/s | overlap msg/s | gain | PUBACK mean serial → overlap | `quorum` stage serial → overlap |
+|---|---|---|---|---|---|
+| 0.25 ms → 0.38 ms | 36,751 / 37,124 | 55,993 / 57,250 | +53% | 3.36 → 1.89 ms | 0.90 → 0.22 ms |
+| 1 ms → 1.46 ms | 11,233 / 10,887 | 20,064 / 20,305 | +83% | 11.0 → 5.85 ms | 3.0 → 0.19 ms |
+| 2 ms → 2.94 ms | 5,593 / 5,575 | 10,295 / 10,458 | +85% | 22.3 → 11.4 ms | 5.65 → 0.38 ms |
+
+This is a closed-loop driver on loopback, where the follower round trip costs almost nothing.
+On separate hosts the overlap still removes one barrier, but the network round trip comes back
+into `quorum`. The knob stays off until the multi-host rig confirms the gain.
+
 ## Result 3 — head-of-line isolation under a degraded placement group
 
 [ADR 0061](../adr/0061-off-loop-durable-appends.md) moved durable appends off the hub

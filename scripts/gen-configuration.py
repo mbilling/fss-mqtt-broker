@@ -188,6 +188,13 @@ def render(env_vars: list[str], toml_keys: dict[str, str], docs: dict[str, str])
                 "its hardware evidence is in: it imports an existing redb store once (the redb "
                 "files are kept as `*.imported`) and there is no conversion back."
             )
+        elif var == "MQTTD_REPLICATION_OVERLAP":
+            desc = (
+                f"{why}. Source: `{where}`. `1` starts the follower fan-out of a durable "
+                "append before the owner's own write is durable, so the two barriers run "
+                "concurrently instead of in series. The ack rule is unchanged. EXPERIMENTAL "
+                "and off by default until rig measurements support it; warned when engaged."
+            )
         elif var == "MQTTD_DIAG_SIMULATED_FSYNC_US":
             desc = (
                 f"{why}. Source: `{where}`. DIAGNOSTIC, and inert unless the binary was built "
