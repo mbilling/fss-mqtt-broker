@@ -431,9 +431,9 @@ reason it could not move the knee is visible in the same run:
 - **The barrier is cheap on this hardware.** `fsync` is 0.3–0.5 ms, against ~4 ms on a Mac.
 - **The brokers were close to CPU-saturated at the knee:** 84–91% busy (idle 9–16%), with
   about 45% of it kernel time (sys ≈ 27%, softirq ≈ 18%) and the NIC's softirq core ~98%.
-- **Each node's durable writer is never idle under load.** Batches grow from 37 to 194 entries
-  per commit between 13 and 20 sites, at a steady ~5 µs of non-fsync work per entry, and with
-  three replicas every node writes every message.
+- **Each node's durable writer is never idle under load.** Batches grow from about 25 to 130
+  entries per commit between 13 and 20 sites, at a steady ~7.5 µs of non-fsync work per entry.
+  At the default replication factor of 2, every message is written on two of the three nodes.
 
 Overlap shortens a wait. Here there was no idle CPU to fill the time it frees. It stays
 experimental and off by default. The levers this points at are per-entry CPU in the
