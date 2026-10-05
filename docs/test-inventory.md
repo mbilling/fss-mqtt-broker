@@ -258,7 +258,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `two_bridge_instances_do_not_duplicate_forwarding`
 - `two_partitioned_instances_deliver_each_inbound_message_exactly_once`
 
-## `crates/mqtt-cluster/src/lib.rs` — 362 test(s)
+## `crates/mqtt-cluster/src/lib.rs` — 363 test(s)
 
 - `cluster_identity::tests::a_founder_mints_once_and_reloads_stably`
 - `cluster_identity::tests::a_joiner_adopts_once_and_persists`
@@ -1015,7 +1015,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 536 test(s)
+## `crates/mqttd/src/lib.rs` — 537 test(s)
 
 - `admin::cli::tests::all_nodes_asks_for_the_cluster_scope_on_the_verbs_that_have_one`
 - `admin::cli::tests::answers_render_as_tables_and_lines`
@@ -1519,10 +1519,11 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `memory_watch::tests::a_status_without_vm_rss_yields_none_not_zero`
 - `memory_watch::tests::an_unreadable_rss_stops_the_watcher_instead_of_reporting_zero`
 - `memory_watch::tests::nearing_the_watermark_shortens_the_poll`
-- `memory_watch::tests::the_real_sampler_reports_a_plausible_rss_on_linux`
+- `memory_watch::tests::the_real_sampler_reports_a_plausible_rss_on_linux` — only when `cfg(target_os = "linux")`
 - `memory_watch::tests::the_watcher_drives_brownout_on_watermark_transitions`
 - `memory_watch::tests::vm_rss_is_parsed_in_bytes_from_the_right_line`
 - `memory_watch::tests::without_a_watermark_nothing_is_ever_browned_out`
+- `peer::tests::a_frame_produced_during_the_yield_joins_the_same_write`
 - `peer::tests::control_frames_jump_the_bulk_queue`
 - `peer::tests::peer_qos0_is_shed_when_the_pool_is_full_and_nothing_else_is`
 - `reload::tests::a_bad_gossip_crl_rejects_the_whole_reload`
@@ -1977,7 +1978,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `membership_cpu_accounting_handles_parentheses_and_excludes_child_time`
 - `membership_fixture_delivers_exactly_once_across_all_arms`
 - `membership_peer_oracle_rejects_forwarding_even_with_local_receipts`
-- `membership_perf_ack_requires_complete_confirmation`
+- `membership_perf_ack_requires_complete_confirmation` — only when `cfg(target_os = "linux")`
 - `membership_receipt_oracle_rejects_loss_duplicates_and_stale_bursts`
 - `membership_tcp_fixture_receives_all_data_before_each_socket_fence`
 
