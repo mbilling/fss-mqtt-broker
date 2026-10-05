@@ -1298,6 +1298,22 @@ requires = ["python3"]
 duration = "~1s"
 
 [[task]]
+id = "scale-cost-per-message"
+group = "Benchmark"
+name = "Broker CPU per delivered message, per arm of a knee campaign"
+script = "bench/scale/cost-per-message.py"
+about = """
+For one rung of every arm of a 482-per-node-knee.sh campaign: broker busy CPU
+(each broker's mpstat stream, split usr/sys/soft) per 1,000 messages the brokers
+delivered in the window, grouped by the binary the arm ran (RIG_BINARY). Resolves
+about 1% at a rung below the knee, where the knee itself moves a full rung between
+arms of one binary. Use it to compare two builds on one provisioning with an
+alternating A/B/A/B campaign: `cost-per-message.py bench/scale/.runs/<stamp> <sites>`.
+"""
+requires = ["python3"]
+duration = "~1s"
+
+[[task]]
 id = "scale-extract-lane-e"
 group = "Benchmark"
 name = "Extract Lane E crossing, hub dispatch and idle hints from a run"
