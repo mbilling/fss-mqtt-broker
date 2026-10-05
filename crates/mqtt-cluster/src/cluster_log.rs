@@ -4844,6 +4844,47 @@ mod tests {
         }
     }
 
+    /// A local write that FAILS after an early fan-out ends exactly as it does on
+    /// the serial path: the owner's copy is not counted, and the outcome is decided
+    /// by the followers alone. With R=3 and both followers accepting, that is still
+    /// a majority, so the append succeeds in both modes. Overlap changes when the
+    /// followers are asked, never what their answers mean.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_local_failure_after_an_early_fan_out_ends_as_the_serial_path_does() {
+        for overlap in [true, false] {
+            let followers = CountingFollowers::default();
+            let (writer, mut parked) =
+                tokio::sync::mpsc::unbounded_channel::<super::DurableWrite>();
+            let local = n("a");
+            let set = vec![n("a"), n("b"), n("c")];
+            let lease = OwnershipLease {
+                holder: local.clone(),
+                epoch: 1,
+            };
+            let log = ClusterLog::new(local, lease, &set, followers.clone())
+                .with_local_store(Arc::new(std::sync::Mutex::new(ReplicaState::new())))
+                .with_owner_writer(writer)
+                .with_overlap(overlap);
+            let pending = log
+                .submit_tiered(&"x".to_string(), b"m".to_vec(), DurabilityTier::Quorum)
+                .await;
+            let append = tokio::spawn(pending);
+            let (_, _, reply) = parked.recv().await.expect("the owner's local write");
+            // The owner's own write is NOT durable.
+            reply.send(false);
+            assert_eq!(
+                append.await.unwrap().unwrap(),
+                1,
+                "overlap={overlap}: two accepting followers are a majority of three"
+            );
+            assert_eq!(
+                followers.0.load(std::sync::atomic::Ordering::SeqCst),
+                2,
+                "overlap={overlap}: both followers were asked"
+            );
+        }
+    }
+
     /// A mid-pipeline failure fails every staged offset above it (tail-fail),
     /// leaves the committed range gap-free, and the drained pipeline reuses
     /// the failed offsets at a higher seq — exactly the serial retry contract.
