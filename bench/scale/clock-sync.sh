@@ -58,6 +58,11 @@ qos1_clock_setup() {
         allow+="printf '%s' '$refconf' > /etc/chrony/chrony.conf; systemctl restart chrony; chronyc waitsync 60 0 0 1; "
     else
         while read -r ip; do allow+="chronyc allow $ip; "; done < <(inv '(.brokers[], .drivers[]) | .private_ip')
+        # Keep the image's sources, but poll them every 16-64 s instead of up to
+        # ~17 min: the reference's root dispersion, which every host inherits, grows
+        # between its upstream polls (2.85 ms of a 6.8 ms bound at an 18-site rung).
+        # shellcheck disable=SC2016 # expanded by the REMOTE shell
+        allow+='chronyc waitsync 30 0 0 1; for a in $(chronyc -n sources | awk '"'"'/^\^/ {print $2}'"'"'); do chronyc minpoll "$a" 4 >/dev/null || true; chronyc maxpoll "$a" 6 >/dev/null || true; done; '
     fi
     allow+='chronyc waitsync 30 0.001 0 1; chronyc makestep; chronyc makestep 0.001 0; chronyc waitsync 30 0.001 0 1'
     rssh "$(broker_pub_ip 0)" "$allow" >"$OUT/clock-reference-setup.log" 2>&1 || die "NTP reference failed to synchronize"

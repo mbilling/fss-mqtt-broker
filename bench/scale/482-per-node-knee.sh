@@ -13,7 +13,7 @@
 #   KNEE_ARMS="3:8:3 6 9:MQTTD_REPLICA_STORE=redb; 3:8:3 6 9:MQTTD_REPLICA_STORE=log"
 #   KNEE_ARMS="3:8:1 16:RIG_NIC_SPREAD=off; 3:8:1 16:RIG_NIC_SPREAD=on"
 #
-# RIG_NIC_SPREAD=on|off is the one non-MQTTD_ key: it sets RPS/RFS on every
+# RIG_NIC_SPREAD=on|off is one of the two non-MQTTD_ keys: it sets RPS/RFS on every
 # broker live, before the arm (set_nic_spread), so the #505 softirq spread can be
 # compared on one provisioning. Arm 1 runs as the hosts booted, so its value must
 # match BROKER_NIC_SPREAD.
@@ -65,7 +65,7 @@ for _a in "${_arms[@]}"; do
 		IFS=',' read -r -a _kvs <<<"$_e"
 		for _kv in "${_kvs[@]}"; do
 			_kv="$(echo "$_kv" | sed 's/^ *//; s/ *$//')"
-			# RIG_NIC_SPREAD is the one non-broker key: a host setting, not env.
+			# RIG_NIC_SPREAD and RIG_BINARY are the only non-broker keys: host settings, not env.
 			if [[ "$_kv" =~ ^RIG_NIC_SPREAD=(on|off)$ ]]; then
 				_rps="${BASH_REMATCH[1]}"
 				continue
@@ -211,6 +211,10 @@ set_nic_spread() {
 		if [ "$mode" = on ] && grep -qE 'rps_cpus=0+(,0+)*$' "$tmp"; then
 			die "RIG_NIC_SPREAD=on did not take on broker $i: $(tr '\n' ' ' <"$tmp")"
 		fi
+		# And symmetrically: an "off" that left a mask set would measure spread.
+		if [ "$mode" = off ] && grep -E 'rps_cpus=' "$tmp" | grep -qvE 'rps_cpus=0+(,0+)*$'; then
+			die "RIG_NIC_SPREAD=off did not take on broker $i: $(tr '\n' ' ' <"$tmp")"
+		fi
 	done
 	rm -f "$tmp"
 }
@@ -227,9 +231,9 @@ resized_arm() { # resized_arm <size> <drivers> <arm-dir> <ladder> <broker-env> <
 		set_nic_spread "$rps" "$dir/inventory-$n.json" | tee "$dir/nic-spread.txt" >&2
 	fi
 	case "$bin" in
-	alt) "$SCALE_DIR/swap-binary.sh" "$dir/inventory-$n.json" "$ALT_MQTTD_URL" "$ALT_MQTTD_SHA256" 2>&1 | grep -v "^  " >&2
+	alt) "$SCALE_DIR/swap-binary.sh" "$dir/inventory-$n.json" "$ALT_MQTTD_URL" "$ALT_MQTTD_SHA256" 2>&1 | { grep -v "^  " || true; } >&2
 		printf 'binary=alt\nurl=%s\nsha256=%s\n' "$ALT_MQTTD_URL" "$ALT_MQTTD_SHA256" >"$dir/arm-binary.txt" ;;
-	main) "$SCALE_DIR/swap-binary.sh" "$dir/inventory-$n.json" "$MQTTD_URL" "$MQTTD_SHA256" 2>&1 | grep -v "^  " >&2
+	main) "$SCALE_DIR/swap-binary.sh" "$dir/inventory-$n.json" "$MQTTD_URL" "$MQTTD_SHA256" 2>&1 | { grep -v "^  " || true; } >&2
 		printf 'binary=main\nurl=%s\nsha256=%s\n' "$MQTTD_URL" "$MQTTD_SHA256" >"$dir/arm-binary.txt" ;;
 	esac
 	EXTRA_BROKER_ENV="$env" "$SCALE_DIR/bootstrap-cluster.sh" "$dir" "$dir/inventory-$n.json" durable
