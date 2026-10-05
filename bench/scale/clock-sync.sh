@@ -51,7 +51,12 @@ qos1_clock_setup() {
         # Replace the reference's sources with the declared upstream, serving the
         # fleet's private IPs only (the same allow list as below, as config lines).
         local refconf="" s
-        for s in $QOS1_CLOCK_UPSTREAM; do refconf+="server $s iburst"$'\n'; done
+        # Poll the upstream every 16-64 s, not chrony's default up to ~17 min:
+        # the gate keeps root dispersion WHOLE, and the reference's dispersion,
+        # which every host inherits, grows between its polls. On 2026-10-05 it was
+        # 2.85 ms of a driver's 6.8 ms bound at an 18-site rung, every offset
+        # under 0.32 ms.
+        for s in $QOS1_CLOCK_UPSTREAM; do refconf+="server $s iburst minpoll 4 maxpoll 6"$'\n'; done
         refconf+=$'driftfile /var/lib/chrony/chrony.drift\nrtcsync\nlogdir /var/log/chrony\nlog tracking measurements statistics\n'
         while read -r ip; do refconf+="allow $ip"$'\n'; done < <(inv '(.brokers[], .drivers[]) | .private_ip')
         allow+="printf '%s' '$refconf' > /etc/chrony/chrony.conf; systemctl restart chrony; chronyc waitsync 60 0 0 1; "
