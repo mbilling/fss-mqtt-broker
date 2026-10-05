@@ -5,6 +5,16 @@ QOS1_CLOCK_MAX_ERROR_MS=${QOS1_CLOCK_MAX_ERROR_MS:-5}
 # often to re-check. Root dispersion falls over the first few poll intervals.
 QOS1_CLOCK_CONVERGE_BUDGET=${QOS1_CLOCK_CONVERGE_BUDGET:-300}
 QOS1_CLOCK_CONVERGE_POLL=${QOS1_CLOCK_CONVERGE_POLL:-15}
+# The reference broker's upstream NTP servers. The fleet syncs to broker0, so each
+# host's error bound inherits broker0's root delay to ITS upstream. On the image's
+# default internet pool that was ~16 ms, half of which the bound counts, and on
+# 2026-10-05 a run was aborted mid-rung at 5.171 ms with every offset under
+# 0.2 ms. Hetzner's own servers sit inside its network. Set to the empty string
+# to keep the image's default sources.
+if [ -z "${QOS1_CLOCK_UPSTREAM+set}" ] && [ "${CLOUD:-hcloud}" = hcloud ]; then
+    QOS1_CLOCK_UPSTREAM="ntp1.hetzner.de ntp2.hetzner.com ntp3.hetzner.net"
+fi
+QOS1_CLOCK_UPSTREAM=${QOS1_CLOCK_UPSTREAM-}
 
 qos1_clock_hosts() {
     local i
@@ -37,7 +47,17 @@ qos1_clock_setup() {
     # Use the first broker's existing external NTP sources. Do not invent local
     # stratum or serve an unsynchronized clock. Allow only fleet private IPs.
     local allow='set -e; systemctl enable --now chrony; '
-    while read -r ip; do allow+="chronyc allow $ip; "; done < <(inv '(.brokers[], .drivers[]) | .private_ip')
+    if [ -n "$QOS1_CLOCK_UPSTREAM" ]; then
+        # Replace the reference's sources with the declared upstream, serving the
+        # fleet's private IPs only (the same allow list as below, as config lines).
+        local refconf="" s
+        for s in $QOS1_CLOCK_UPSTREAM; do refconf+="server $s iburst"$'\n'; done
+        refconf+=$'driftfile /var/lib/chrony/chrony.drift\nrtcsync\nlogdir /var/log/chrony\nlog tracking measurements statistics\n'
+        while read -r ip; do refconf+="allow $ip"$'\n'; done < <(inv '(.brokers[], .drivers[]) | .private_ip')
+        allow+="printf '%s' '$refconf' > /etc/chrony/chrony.conf; systemctl restart chrony; chronyc waitsync 60 0 0 1; "
+    else
+        while read -r ip; do allow+="chronyc allow $ip; "; done < <(inv '(.brokers[], .drivers[]) | .private_ip')
+    fi
     allow+='chronyc waitsync 30 0.001 0 1; chronyc makestep; chronyc makestep 0.001 0; chronyc waitsync 30 0.001 0 1'
     rssh "$(broker_pub_ip 0)" "$allow" >"$OUT/clock-reference-setup.log" 2>&1 || die "NTP reference failed to synchronize"
     # No makestep directive: one explicit correction BEFORE clients start,
