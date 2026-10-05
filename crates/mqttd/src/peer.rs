@@ -1036,6 +1036,15 @@ const PEER_WRITE_BUDGET: usize = 256 * 1024;
 /// empty, so an idle link writes a batch of one and behaves exactly as before.
 /// Batching engages only under backlog, which is when it is worth anything.
 ///
+/// One YIELD before draining when the queue is empty. Without it, a backlog of
+/// frames produced concurrently by other tasks (every durable append's
+/// `Replicate`) never forms: the pump wakes on the first frame and writes it
+/// before the next producer has run. Measured on a 3-node local cluster (#662):
+/// the owner's Replicate stream averaged 3.1 frames per write syscall. With one
+/// `yield_now` it was 15.1, peer write syscalls fell 78%, and owner throughput
+/// rose 9.6% at the same CPU. A yield is a reschedule, not a timer, so it costs
+/// an idle link no fixed delay.
+///
 /// `buf` is owned by the link and only ever `clear()`ed, so steady state is zero
 /// allocations per frame. It is shrunk back after an oversized batch: `MAX_FRAME`
 /// is 16 MiB and a retained snapshot would otherwise leave that capacity
@@ -1062,6 +1071,9 @@ async fn write_batch<W: AsyncWrite + Unpin>(
         }
     };
     encode_into(buf, first);
+    if rx.is_empty() {
+        tokio::task::yield_now().await;
+    }
     while buf.len() < PEER_WRITE_BUDGET {
         match rx.try_recv() {
             Ok(msg) => encode_into(buf, &msg),
@@ -1118,6 +1130,70 @@ async fn read_frame<R: AsyncRead + Unpin>(
 mod tests {
     use super::*;
     use tokio::sync::mpsc;
+
+    /// A frame produced while the writer holds the first one leaves in the SAME
+    /// write: `write_batch` yields once before draining, so a concurrent producer
+    /// (another append's `Replicate`) runs and its frame joins the batch instead
+    /// of costing its own syscall and segment. Single-threaded runtime, so the
+    /// order is deterministic: the producer can only run at that yield.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_frame_produced_during_the_yield_joins_the_same_write() {
+        use std::pin::Pin;
+        use std::task::{Context, Poll};
+        /// Counts `poll_write` calls that wrote bytes.
+        #[derive(Default)]
+        struct CountingWriter {
+            writes: usize,
+            bytes: Vec<u8>,
+        }
+        impl tokio::io::AsyncWrite for CountingWriter {
+            fn poll_write(
+                mut self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+                b: &[u8],
+            ) -> Poll<std::io::Result<usize>> {
+                self.writes += 1;
+                self.bytes.extend_from_slice(b);
+                Poll::Ready(Ok(b.len()))
+            }
+            fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+            fn poll_shutdown(
+                self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let first = PeerMessage::ReplicateAck {
+            req_id: 1,
+            accepted: true,
+        };
+        // The producer is spawned but cannot run until the writer yields.
+        let producer = tokio::spawn(async move {
+            tx.send(PeerMessage::ReplicateAck {
+                req_id: 2,
+                accepted: true,
+            })
+            .unwrap();
+        });
+        let mut w = CountingWriter::default();
+        let mut buf = Vec::new();
+        write_batch(&mut w, &mut buf, &first, &mut rx, &NodeId("peer".into()))
+            .await
+            .unwrap();
+        producer.await.unwrap();
+        assert_eq!(w.writes, 1, "both frames must leave in one write");
+        let mut wire = BytesMut::from(&w.bytes[..]);
+        let mut ids = Vec::new();
+        while let Some(PeerMessage::ReplicateAck { req_id, .. }) = peer::decode(&mut wire).unwrap()
+        {
+            ids.push(req_id);
+        }
+        assert_eq!(ids, vec![1, 2]);
+    }
 
     /// The control lane is drained before the bulk lane (issue #358): with both
     /// queues pre-loaded, every control frame must reach the wire before any bulk
