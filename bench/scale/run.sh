@@ -372,6 +372,11 @@ for N in "${SIZES[@]}"; do
 	[ -z "${BROKER_NIC_SPREAD:-}" ] || TF_APPLY_ARGS+=(-var broker_nic_spread="$BROKER_NIC_SPREAD")
 	[ -z "${BROKER_DATA_TMPFS:-}" ] || TF_APPLY_ARGS+=(-var broker_data_tmpfs="$BROKER_DATA_TMPFS")
 	[ -z "${COMPARE:-}" ] || TF_APPLY_ARGS+=(-var broker_docker=true)
+	# UpCloud locks a strict anti-affinity server group while a server is being
+	# created into it, and rejects concurrent creates into the same group ("Server
+	# group with strict anti-affinity policy is currently locked"; 2026-10-05, two
+	# brokers raced and the apply failed). Create servers one at a time there.
+	[ "$CLOUD" != upcloud ] || TF_APPLY_ARGS+=(-parallelism=1)
 	declare -p TF_APPLY_ARGS >"$RUN/tf-apply-args-$N.sh"
 	(cd "$TFDIR" && "$TF" apply -auto-approve -input=false "${TF_APPLY_ARGS[@]}" \
 		>"$RUN/tf-apply-$N.log" 2>&1) || {
