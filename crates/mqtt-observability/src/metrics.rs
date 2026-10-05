@@ -856,7 +856,9 @@ impl Metrics {
              own copy is durable), quorum (own copy durable until the quorum is met — the \
              follower's fsync and the round trip), order (quorum met until the in-order \
              commit releases it), commit (one group commit on a shard writer, fsync \
-             included), fsync (the data sync alone). Fine buckets from 20us so a \
+             included), fsync (the data sync alone), replicate_rtt (leader, per follower: \
+             Replicate queued to the peer link until its ack is back), replica_apply \
+             (follower: Replicate received until its ack is queued). Fine buckets from 20us so a \
              millisecond-scale fsync is resolved, not rounded to the next power of two",
             durable_stage_seconds.clone(),
         );

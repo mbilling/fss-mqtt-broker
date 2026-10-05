@@ -613,7 +613,6 @@ impl Drop for SegmentLog {
     }
 }
 
-#[cfg(unix)]
 /// Every data/metadata sync in the segment log goes through here, so the diagnostic
 /// stand-in (`diag-simulated-fsync`, see `stage_timing`) covers all of them — a hot path
 /// on a simulated barrier racing background syncs on the real device would measure the
@@ -630,6 +629,7 @@ fn durable_sync(f: &File, all: bool) -> std::io::Result<()> {
     }
 }
 
+#[cfg(unix)]
 fn write_all_at(f: &File, buf: &[u8], offset: u64) -> std::io::Result<()> {
     use std::os::unix::fs::FileExt;
     f.write_all_at(buf, offset)
