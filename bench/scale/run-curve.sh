@@ -2078,7 +2078,7 @@ if [ -n "$PERF_RUNG" ]; then
 			mkdir -p /tmp/symfs/usr/local/bin" >"$OUT/perf-setup-broker$i.log" 2>&1 ||
 			die "perf install failed on broker $i — see $OUT/perf-setup-broker$i.log"
 		if [ -n "${PERF_SYMBOLS:-}" ]; then
-			rscp "$PERF_SYMBOLS" "$(broker_pub_ip "$i"):/tmp/symfs/usr/local/bin/mqttd"
+			rscp "$PERF_SYMBOLS" "root@$(broker_pub_ip "$i"):/tmp/symfs/usr/local/bin/mqttd"
 		fi
 	done
 	say "[$N nodes] lane E: perf ready on every broker — profiling rung $PERF_RUNG for ${PERF_SECS}s at ${PERF_FREQ} Hz${PERF_SYMBOLS:+ (symbols: $(basename "$PERF_SYMBOLS"))}"
@@ -2563,10 +2563,10 @@ IMAGES
 				perf report -i perf-rung.data $symfs --kallsyms /proc/kallsyms --stdio --no-children --sort comm,dso --percent-limit 0.1 >perf-comm.txt 2>>perf-report.err || true
 				perf script -i perf-rung.data $symfs --kallsyms /proc/kallsyms -F comm,tid,cpu,period,ip,sym,dso 2>>perf-report.err | gzip >perf-script.gz || true" \
 				>>"$rdir/perf/broker$i-record.log" 2>&1 || true
-			rscp "$ip:/tmp/perf-self.txt" "$rdir/perf/broker$i-self.txt" || true
-			rscp "$ip:/tmp/perf-comm.txt" "$rdir/perf/broker$i-comm.txt" || true
-			rscp "$ip:/tmp/perf-script.gz" "$rdir/perf/broker$i-script.gz" || true
-			rscp "$ip:/tmp/perf-report.err" "$rdir/perf/broker$i-report.err" || true
+			rscp "root@$ip:/tmp/perf-self.txt" "$rdir/perf/broker$i-self.txt" || true
+			rscp "root@$ip:/tmp/perf-comm.txt" "$rdir/perf/broker$i-comm.txt" || true
+			rscp "root@$ip:/tmp/perf-script.gz" "$rdir/perf/broker$i-script.gz" || true
+			rscp "root@$ip:/tmp/perf-report.err" "$rdir/perf/broker$i-report.err" || true
 		done
 		say "[$N nodes] lane E: perf profiles collected -> $rdir/perf"
 	}
