@@ -45,15 +45,19 @@ locals {
     # the drop rule below chrony never heard back from its pool (2026-10-05: every
     # chronyc poll had refid 00000000 and the run died at "NTP reference failed to
     # synchronize"). Admit the replies the hosts need, by SOURCE port: NTP, DNS, and
-    # HTTP(S) for the package and binary downloads the rig does after boot.
+    # HTTP(S) for the package and binary downloads the rig does after boot. The
+    # firewall is stateless, so a packet merely SENT from one of those ports would
+    # pass too: the destination is bounded to unprivileged ports, where replies
+    # land (drivers widen ip_local_port_range to 1024-65535), which keeps SSH and
+    # every other privileged listener behind admin_cidr and the drop rule.
     {
       comment   = "NTP replies"
       direction = "in"
       action    = "accept"
       protocol  = "udp"
       family    = "IPv4"
-      dport_s   = ""
-      dport_e   = ""
+      dport_s   = "1024"
+      dport_e   = "65535"
       sport_s   = "123"
       sport_e   = "123"
       source    = "0.0.0.0/0"
@@ -64,8 +68,8 @@ locals {
       action    = "accept"
       protocol  = "udp"
       family    = "IPv4"
-      dport_s   = ""
-      dport_e   = ""
+      dport_s   = "1024"
+      dport_e   = "65535"
       sport_s   = "53"
       sport_e   = "53"
       source    = "0.0.0.0/0"
@@ -76,8 +80,8 @@ locals {
       action    = "accept"
       protocol  = "tcp"
       family    = "IPv4"
-      dport_s   = ""
-      dport_e   = ""
+      dport_s   = "1024"
+      dport_e   = "65535"
       sport_s   = "80"
       sport_e   = "80"
       source    = "0.0.0.0/0"
@@ -88,8 +92,8 @@ locals {
       action    = "accept"
       protocol  = "tcp"
       family    = "IPv4"
-      dport_s   = ""
-      dport_e   = ""
+      dport_s   = "1024"
+      dport_e   = "65535"
       sport_s   = "443"
       sport_e   = "443"
       source    = "0.0.0.0/0"
