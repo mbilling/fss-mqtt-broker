@@ -202,7 +202,7 @@ driver shortfall read as a broker limit.
 
 **Profiling a rung on the hosts themselves.** `PERF_RUNG=<sites>` runs `perf record -a -g` on every broker for `PERF_SECS` (default 20) inside that rung's measurement window, at `PERF_FREQ` Hz (default 199). Reports (`*-self.txt` by function, `*-comm.txt` by thread) and the raw samples (`*-script.gz`) land in the rung's `perf/`. The shipped binary is stripped, so pass `PERF_SYMBOLS=<path>`: a symbols build of the same commit from `scripts/release/build-repro.sh` with `BUILD_SYMBOLS=1`, which proves its `.text` identical. It's uploaded as a symfs so user-space frames get names. Profile here rather than locally: a macOS profile of a local cluster mis-ranked costs that the hosts then didn't show, and it can't see the kernel's share of broker CPU at all (#662).
 
-**Clock reference.** The fleet syncs to broker0, and broker0 syncs to `QOS1_CLOCK_UPSTREAM`. On `CLOUD=hcloud` that defaults to Hetzner's own NTP servers; set it empty to keep the image's default pool. Every host's error bound includes broker0's delay to its upstream, so a distant pool can fail the 5 ms gate on perfectly synced clocks.
+**Clock reference.** The fleet syncs to broker0. `QOS1_CLOCK_UPSTREAM` replaces broker0's NTP sources (unset keeps the image's pool), and makes it poll them every 16–64 s. Every host's error bound inherits broker0's root dispersion, so only point it at a low-dispersion source: Hetzner's own servers reported ~9–10 ms and failed the gate with no load.
 
 ## Anatomy of one size (what `full` executes, in order)
 

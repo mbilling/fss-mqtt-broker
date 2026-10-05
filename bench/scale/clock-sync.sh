@@ -5,15 +5,11 @@ QOS1_CLOCK_MAX_ERROR_MS=${QOS1_CLOCK_MAX_ERROR_MS:-5}
 # often to re-check. Root dispersion falls over the first few poll intervals.
 QOS1_CLOCK_CONVERGE_BUDGET=${QOS1_CLOCK_CONVERGE_BUDGET:-300}
 QOS1_CLOCK_CONVERGE_POLL=${QOS1_CLOCK_CONVERGE_POLL:-15}
-# The reference broker's upstream NTP servers. The fleet syncs to broker0, so each
-# host's error bound inherits broker0's root delay to ITS upstream. On the image's
-# default internet pool that was ~16 ms, half of which the bound counts, and on
-# 2026-10-05 a run was aborted mid-rung at 5.171 ms with every offset under
-# 0.2 ms. Hetzner's own servers sit inside its network. Set to the empty string
-# to keep the image's default sources.
-if [ -z "${QOS1_CLOCK_UPSTREAM+set}" ] && [ "${CLOUD:-hcloud}" = hcloud ]; then
-    QOS1_CLOCK_UPSTREAM="ntp1.hetzner.de ntp2.hetzner.com ntp3.hetzner.net"
-fi
+# The reference broker's upstream NTP servers; empty (the default) keeps the image's
+# pool. Every host's bound inherits the reference's root dispersion, so the upstream
+# must be a LOW-dispersion source. Hetzner's own servers are not: on 2026-10-05 they
+# reported ~9-10 ms root dispersion, failing the gate at the first rung with no load,
+# against ~1 ms from the image's pool in every earlier run.
 QOS1_CLOCK_UPSTREAM=${QOS1_CLOCK_UPSTREAM-}
 
 qos1_clock_hosts() {
