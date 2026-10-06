@@ -258,7 +258,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `two_bridge_instances_do_not_duplicate_forwarding`
 - `two_partitioned_instances_deliver_each_inbound_message_exactly_once`
 
-## `crates/mqtt-cluster/src/lib.rs` — 365 test(s)
+## `crates/mqtt-cluster/src/lib.rs` — 367 test(s)
 
 - `cluster_identity::tests::a_founder_mints_once_and_reloads_stably`
 - `cluster_identity::tests::a_joiner_adopts_once_and_persists`
@@ -285,6 +285,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `cluster_log::tests::a_joint_append_needs_a_quorum_of_the_new_set_too`
 - `cluster_log::tests::a_joint_recommit_and_fence_need_a_quorum_of_the_new_set_too`
 - `cluster_log::tests::a_key_lives_in_exactly_one_shard`
+- `cluster_log::tests::a_local_failure_after_an_early_fan_out_ends_as_the_serial_path_does`
 - `cluster_log::tests::a_local_tier_append_returns_on_the_owners_durability_alone`
 - `cluster_log::tests::a_log_is_paged_from_an_offset_within_a_byte_budget`
 - `cluster_log::tests::a_missing_shard_fails_the_open_closed`
@@ -314,6 +315,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `cluster_log::tests::merge_stops_at_gaps_and_handles_truncation`
 - `cluster_log::tests::merge_takes_the_contiguous_run_from_a_quorum`
 - `cluster_log::tests::merge_truncates_a_tail_whose_tag_regresses`
+- `cluster_log::tests::overlap_starts_the_fan_out_before_the_local_write_is_durable`
 - `cluster_log::tests::pipelined_appends_overlap_and_commit_in_offset_order`
 - `cluster_log::tests::raised_fences_refuse_every_pre_change_epoch`
 - `cluster_log::tests::recommit_requires_a_write_quorum_for_the_recovered_base`

@@ -80,6 +80,31 @@ enum Shard {
     Log(Arc<std::sync::Mutex<replica_log::LogShard>>),
 }
 
+/// Whether follower replication overlaps the leader's own write, from
+/// `MQTTD_REPLICATION_OVERLAP=1`. Read once.
+///
+/// **Default off.** Without it a durable append waits for the leader's barrier
+/// and THEN a follower's, two barriers in series; the local fsync sweep behind
+/// `mqttd_durable_stage_seconds` measured `local_durable` and `quorum` as near
+/// equal halves of the store wait. Overlapping them changes no ack rule (the
+/// local outcome is still awaited and counted exactly as before) and reaches no
+/// replica state the serial path cannot: a follower already holds entries the
+/// owner never made durable whenever the local write fails and the fan-out
+/// proceeds. Whether it pays is a measurement; until then it stays off.
+fn overlap_replication() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("MQTTD_REPLICATION_OVERLAP").is_ok_and(|v| v.trim() == "1");
+        if on {
+            tracing::warn!(
+                "MQTTD_REPLICATION_OVERLAP engages the EXPERIMENTAL overlapped replication: \
+                 follower deliveries start before the leader's own write is durable"
+            );
+        }
+        on
+    })
+}
+
 /// One queued durable write for the node-wide writer task (ADR 0027 follower
 /// half, ADR 0071 owner half): the op at its epoch, plus where to send whether
 /// it was durably applied (accepted / not fenced).
@@ -1828,6 +1853,9 @@ pub struct ClusterLog<T: ReplicaTransport> {
     /// group commit for the owner path, mirroring ADR 0027's follower half.
     /// `None` falls back to the inline one-op apply against `local_store`.
     writer: Option<mpsc::UnboundedSender<DurableWrite>>,
+    /// Start the follower fan-out before the owner's own write is durable
+    /// (experimental; [`overlap_replication`] is the process default).
+    overlap: bool,
 }
 
 // Manual Debug so the transport `T` need not be `Debug` (the trait requires
@@ -1872,6 +1900,7 @@ impl<T: ReplicaTransport> ClusterLog<T> {
             commit_notify: Arc::new(tokio::sync::Notify::new()),
             local_store: None,
             writer: None,
+            overlap: overlap_replication(),
         };
         log.set_quorum(replica_set, Quorum::majority(replica_set.len()));
         log
@@ -1917,6 +1946,13 @@ impl<T: ReplicaTransport> ClusterLog<T> {
     #[must_use]
     pub fn with_local_store(mut self, store: Arc<std::sync::Mutex<ReplicaState>>) -> Self {
         self.local_store = Some(store);
+        self
+    }
+
+    /// Override the overlapped-replication default ([`overlap_replication`]).
+    #[must_use]
+    pub fn with_overlap(mut self, overlap: bool) -> Self {
+        self.overlap = overlap;
         self
     }
 
@@ -2049,6 +2085,7 @@ impl<T: ReplicaTransport> ClusterLog<T> {
             commit_notify: Arc::new(tokio::sync::Notify::new()),
             local_store: None,
             writer: None,
+            overlap: overlap_replication(),
         };
         log.set_quorum(replica_set, Quorum::majority(replica_set.len()));
         log
@@ -2592,6 +2629,7 @@ impl<T: ReplicaTransport + Clone + 'static> ReplicatedLog for ClusterLog<T> {
         let local_in_prefix = self.local_in_prefix;
         let epoch = self.lease.epoch;
         let quorum = self.quorum.clone();
+        let overlap = self.overlap;
         let key = key.clone();
         PendingAppend::new(async move {
             // Fan out to every follower **concurrently** and count acks until
@@ -2601,6 +2639,22 @@ impl<T: ReplicaTransport + Clone + 'static> ReplicatedLog for ClusterLog<T> {
             // requirement is met the remaining deliveries are abandoned (their
             // frames were already sent, so a reachable replica still applies
             // them for best-effort spread).
+            // OVERLAP (experimental, `MQTTD_REPLICATION_OVERLAP`): start the
+            // follower fan-out BEFORE awaiting the local write, so the leader's
+            // and followers' barriers run concurrently instead of in series.
+            // The ack rule below is unchanged — the same tally, counted only
+            // after the local outcome is known — so this moves timing only.
+            let mut inflight = tokio::task::JoinSet::new();
+            let overlapped = !local_only && overlap;
+            if overlapped {
+                for (f, follower) in followers.iter().enumerate() {
+                    let transport = transport.clone();
+                    let follower = follower.clone();
+                    let op = op.clone();
+                    inflight
+                        .spawn(async move { (f, transport.deliver(&follower, epoch, &op).await) });
+                }
+            }
             let local_durable = match local {
                 LocalAck::Done(b) => b,
                 LocalAck::Pending(rx) => rx.await.unwrap_or(false),
@@ -2624,13 +2678,15 @@ impl<T: ReplicaTransport + Clone + 'static> ReplicatedLog for ClusterLog<T> {
                 }
             };
             if !met_now(acks) {
-                let mut inflight = tokio::task::JoinSet::new();
-                for (f, follower) in followers.iter().enumerate() {
-                    let transport = transport.clone();
-                    let follower = follower.clone();
-                    let op = op.clone();
-                    inflight
-                        .spawn(async move { (f, transport.deliver(&follower, epoch, &op).await) });
+                if !overlapped {
+                    for (f, follower) in followers.iter().enumerate() {
+                        let transport = transport.clone();
+                        let follower = follower.clone();
+                        let op = op.clone();
+                        inflight.spawn(async move {
+                            (f, transport.deliver(&follower, epoch, &op).await)
+                        });
+                    }
                 }
                 while !met_now(acks) {
                     match inflight.join_next().await {
@@ -2853,7 +2909,6 @@ impl<T: ReplicaTransport + Clone + 'static> ReplicatedLog for ClusterLog<T> {
         Ok(self.lease.epoch)
     }
 }
-
 #[cfg(test)]
 mod tests {
     /// ADR 0058 T2: the replicas.redb migration registry must cover the contract range, so a
@@ -4726,6 +4781,118 @@ mod tests {
             all.iter().map(|e| e.offset).collect::<Vec<_>>(),
             vec![1, 2, 3]
         );
+    }
+
+    /// A transport that acks at once and counts the deliveries it has seen.
+    #[derive(Clone, Default)]
+    struct CountingFollowers(Arc<std::sync::atomic::AtomicUsize>);
+    #[async_trait]
+    impl ReplicaTransport for CountingFollowers {
+        async fn deliver(&self, _replica: &NodeId, _epoch: Epoch, _op: &ReplOp) -> bool {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            true
+        }
+    }
+
+    /// `MQTTD_REPLICATION_OVERLAP`: with overlap on, the follower fan-out is
+    /// under way while the owner's own write is still parked in the writer —
+    /// and the append still does NOT succeed until that local write answers
+    /// (the ack rule is unchanged). With it off, nothing is sent to a follower
+    /// before the local write is durable: the serial default.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn overlap_starts_the_fan_out_before_the_local_write_is_durable() {
+        for overlap in [true, false] {
+            let followers = CountingFollowers::default();
+            let (writer, mut parked) =
+                tokio::sync::mpsc::unbounded_channel::<super::DurableWrite>();
+            let local = n("a");
+            let set = vec![n("a"), n("b"), n("c")];
+            let lease = OwnershipLease {
+                holder: local.clone(),
+                epoch: 1,
+            };
+            let log = ClusterLog::new(local, lease, &set, followers.clone())
+                .with_local_store(Arc::new(std::sync::Mutex::new(ReplicaState::new())))
+                .with_owner_writer(writer)
+                .with_overlap(overlap);
+            let k = "x".to_string();
+            let pending = log
+                .submit_tiered(&k, b"m".to_vec(), DurabilityTier::Quorum)
+                .await;
+            let append = tokio::spawn(pending);
+            // The local write reaches the writer and parks there: the test IS
+            // the writer and has not answered.
+            let (_, _, reply) = parked.recv().await.expect("the owner's local write");
+            if overlap {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                while followers.0.load(std::sync::atomic::Ordering::SeqCst) < 2 {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "overlap on: the followers were never sent the op while the \
+                         local write was pending"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+            } else {
+                // SETTLE(serial-fan-out): asserting an absence — nothing may reach a
+                // follower while the local write is parked. A slower machine only
+                // narrows the window, which makes the check more lenient, never flaky.
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                assert_eq!(
+                    followers.0.load(std::sync::atomic::Ordering::SeqCst),
+                    0,
+                    "overlap off: a follower was sent the op before the local write was durable"
+                );
+            }
+            assert!(
+                !append.is_finished(),
+                "overlap={overlap}: the append succeeded before the owner's own write answered"
+            );
+            reply.send(true);
+            assert_eq!(append.await.unwrap().unwrap(), 1, "overlap={overlap}");
+            assert!(followers.0.load(std::sync::atomic::Ordering::SeqCst) >= 1);
+        }
+    }
+
+    /// A local write that FAILS after an early fan-out ends exactly as it does on
+    /// the serial path: the owner's copy is not counted, and the outcome is decided
+    /// by the followers alone. With R=3 and both followers accepting, that is still
+    /// a majority, so the append succeeds in both modes. Overlap changes when the
+    /// followers are asked, never what their answers mean.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_local_failure_after_an_early_fan_out_ends_as_the_serial_path_does() {
+        for overlap in [true, false] {
+            let followers = CountingFollowers::default();
+            let (writer, mut parked) =
+                tokio::sync::mpsc::unbounded_channel::<super::DurableWrite>();
+            let local = n("a");
+            let set = vec![n("a"), n("b"), n("c")];
+            let lease = OwnershipLease {
+                holder: local.clone(),
+                epoch: 1,
+            };
+            let log = ClusterLog::new(local, lease, &set, followers.clone())
+                .with_local_store(Arc::new(std::sync::Mutex::new(ReplicaState::new())))
+                .with_owner_writer(writer)
+                .with_overlap(overlap);
+            let pending = log
+                .submit_tiered(&"x".to_string(), b"m".to_vec(), DurabilityTier::Quorum)
+                .await;
+            let append = tokio::spawn(pending);
+            let (_, _, reply) = parked.recv().await.expect("the owner's local write");
+            // The owner's own write is NOT durable.
+            reply.send(false);
+            assert_eq!(
+                append.await.unwrap().unwrap(),
+                1,
+                "overlap={overlap}: two accepting followers are a majority of three"
+            );
+            assert_eq!(
+                followers.0.load(std::sync::atomic::Ordering::SeqCst),
+                2,
+                "overlap={overlap}: both followers were asked"
+            );
+        }
     }
 
     /// A mid-pipeline failure fails every staged offset above it (tail-fail),
