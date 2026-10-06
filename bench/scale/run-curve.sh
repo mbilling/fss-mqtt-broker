@@ -3207,6 +3207,9 @@ lane_e_forward_canary
 lane_e_driver_gate
 lane_e_calibrate
 declare -a e_seen=()
+# Set before the loop: a neutral (INVALID EVIDENCE only) first rung neither
+# counts nor resets, and the stop check below reads it under `set -u`.
+e_fails=0
 for e_sites in "${LANE_E_SITES[@]}"; do
 	e_rep=1
 	for e_prev in ${e_seen[@]+"${e_seen[@]}"}; do
@@ -3250,7 +3253,7 @@ for e_sites in "${LANE_E_SITES[@]}"; do
 		done
 		if [[ "$e_verdict" == GREEN* || "$e_verdict" == YELLOW* ]]; then e_fails=0
 		elif [ "$e_neutral" = yes ]; then :
-		else e_fails=$((${e_fails:-0} + 1)); fi
+		else e_fails=$((e_fails + 1)); fi
 		if [ "$e_fails" -ge "$LANE_E_STOP_AFTER_FAILS" ] && [ "${#e_seen[@]}" -lt "${#LANE_E_SITES[@]}" ]; then
 			# Name every rung the ladder would still have run, exactly as the
 			# gate derives them from shape.txt (repeats counted in order).
