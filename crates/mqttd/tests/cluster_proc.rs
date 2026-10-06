@@ -916,6 +916,70 @@ async fn a_durable_publish_feeds_every_stage_histogram() {
     );
 }
 
+/// The per-link work counters (`mqttd_peer_link_stat{peer, stat}`, #662) are fed
+/// by a REAL link: on a formed 3-node cluster, node 0 reports at least one peer
+/// whose single link task has done work: frames both ways, I/O calls, and busy
+/// time. Raft heartbeats alone carry traffic, so no publish is needed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn peer_link_work_counters_are_exported_per_link() {
+    let _serial = SERIAL.lock().await;
+    let seed = 243;
+    let disk = tempfile::tempdir().expect("tempdir");
+    let mut nodes = build_topology(seed, disk.path()).await;
+    for n in &mut nodes {
+        n.spawn();
+    }
+    wait_all_ready(&mut nodes, seed).await;
+    let proc = proc_over(seed, nodes);
+    let node = &proc.nodes[0];
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let body = http_get(node.health_addr, "/metrics")
+            .await
+            .unwrap_or_default();
+        // stat -> the largest value any peer reports for it.
+        let mut best: std::collections::BTreeMap<String, f64> = std::collections::BTreeMap::new();
+        for line in body
+            .lines()
+            .filter(|l| l.starts_with("mqttd_peer_link_stat{"))
+        {
+            let Some((series, value)) = line.rsplit_once(' ') else {
+                continue;
+            };
+            let Some(stat) = series
+                .split("stat=\"")
+                .nth(1)
+                .and_then(|r| r.split('"').next())
+            else {
+                continue;
+            };
+            let v: f64 = value.trim().parse().unwrap_or(0.0);
+            let e = best.entry(stat.to_string()).or_insert(0.0);
+            *e = e.max(v);
+        }
+        let all = [
+            "busy_seconds",
+            "polls",
+            "frames_out",
+            "writes",
+            "frames_in",
+            "reads",
+        ];
+        if all
+            .iter()
+            .all(|s| best.get(*s).copied().unwrap_or(0.0) > 0.0)
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "node 0 never reported per-link work for every stat; got {best:?}\n{}",
+            log_tail(&node.log_path)
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
 /// Register subscriber `i` as `client`, connected to node `i` — the node that HRW-owns its
 /// placement group — with `clean_session = false` and a `QoS` 1 subscription. Connecting to
 /// the OWNER is the point: the session is hosted there (no ADR 0005 relocation), so it is

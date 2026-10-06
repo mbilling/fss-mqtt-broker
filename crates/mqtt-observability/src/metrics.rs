@@ -21,6 +21,14 @@ use prometheus_client::metrics::histogram::{exponential_buckets, Histogram};
 use prometheus_client::registry::Registry;
 
 /// `{version}` label for `mqttd_build_info`.
+/// `{peer, stat}` for `mqttd_peer_link_stat` (#662): one inter-node link's
+/// cumulative work counters, `stat` a bounded set (see `set_peer_link_stat`).
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct PeerLinkStatLabel {
+    peer: String,
+    stat: String,
+}
+
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 struct VersionLabel {
     version: String,
@@ -414,6 +422,8 @@ pub struct Metrics {
     retained_tombstones: Gauge,
     misplaced_sessions: Gauge,
     peer_links: Gauge,
+    /// Per-link work counters (`peer_link_stat{peer, stat}`), cumulative per link.
+    peer_link_stat: Family<PeerLinkStatLabel, Gauge<f64, std::sync::atomic::AtomicU64>>,
     peer_forwards_in_flight: Gauge,
     members_by_state: Family<StateLabel, Gauge>,
     lease_leader: Gauge,
@@ -783,6 +793,17 @@ impl Metrics {
             &mut registry,
             "peer_links",
             "Currently connected inter-node peer links",
+        );
+        let peer_link_stat =
+            Family::<PeerLinkStatLabel, Gauge<f64, std::sync::atomic::AtomicU64>>::default();
+        registry.register(
+            "peer_link_stat",
+            "One inter-node link's work, cumulative since it connected (read deltas over a \
+             window): busy_seconds (on-CPU time of the single task that carries the link: \
+             TLS, syscalls, codec, dispatch, never its waiting; busy_seconds per second near \
+             1 means the link is saturated), polls, frames_out, writes, frames_in, reads \
+             (frames per write/read is the batching per I/O call)",
+            peer_link_stat.clone(),
         );
         // Issue #504: the peer links are `mpsc::unbounded_channel()`, so a publish
         // forwarded to a peer is counted `received` here and then reported by
@@ -1265,6 +1286,7 @@ impl Metrics {
             backlog_bytes_max,
             cluster_members,
             peer_links,
+            peer_link_stat,
             peer_forwards_in_flight,
             replication_desired,
             replication_min_actual,
@@ -1725,6 +1747,17 @@ impl Metrics {
     }
 
     /// Set the current count of connected inter-node peer links.
+    /// Set one link's cumulative work counter. `stat` is one of `busy_seconds`,
+    /// `polls`, `frames_out`, `writes`, `frames_in`, `reads`.
+    pub fn set_peer_link_stat(&self, peer: &str, stat: &'static str, value: f64) {
+        self.peer_link_stat
+            .get_or_create(&PeerLinkStatLabel {
+                peer: peer.to_string(),
+                stat: stat.to_string(),
+            })
+            .set(value);
+    }
+
     pub fn set_peer_links(&self, n: usize) {
         self.peer_links.set(clamp_gauge(n));
         self.otel.peer_links.record(clamp_gauge(n), &[]);
