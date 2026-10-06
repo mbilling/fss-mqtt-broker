@@ -801,7 +801,9 @@ impl Metrics {
             "One inter-node link's work, cumulative since it connected (read deltas over a \
              window): busy_seconds (on-CPU time of the single task that carries the link: \
              TLS, syscalls, codec, dispatch, never its waiting; busy_seconds per second near \
-             1 means the link is saturated), polls, frames_out, writes, frames_in, reads \
+             1 means the link is saturated), write_wait_seconds (wall time inside socket \
+             writes, pending included: a write blocked on TCP backpressure), polls, \
+             frames_out, writes, frames_in, reads \
              (frames per write/read is the batching per I/O call)",
             peer_link_stat.clone(),
         );
@@ -1748,7 +1750,7 @@ impl Metrics {
 
     /// Set the current count of connected inter-node peer links.
     /// Set one link's cumulative work counter. `stat` is one of `busy_seconds`,
-    /// `polls`, `frames_out`, `writes`, `frames_in`, `reads`.
+    /// `write_wait_seconds`, `polls`, `frames_out`, `writes`, `frames_in`, `reads`.
     pub fn set_peer_link_stat(&self, peer: &str, stat: &'static str, value: f64) {
         self.peer_link_stat
             .get_or_create(&PeerLinkStatLabel {

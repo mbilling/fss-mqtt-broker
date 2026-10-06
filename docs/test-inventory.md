@@ -1020,7 +1020,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 538 test(s)
+## `crates/mqttd/src/lib.rs` — 539 test(s)
 
 - `admin::cli::tests::all_nodes_asks_for_the_cluster_scope_on_the_verbs_that_have_one`
 - `admin::cli::tests::answers_render_as_tables_and_lines`
@@ -1531,6 +1531,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `peer::tests::a_frame_produced_during_the_yield_joins_the_same_write`
 - `peer::tests::control_frames_jump_the_bulk_queue`
 - `peer::tests::peer_qos0_is_shed_when_the_pool_is_full_and_nothing_else_is`
+- `peer::tests::split_io_reads_while_a_write_is_blocked_and_serial_does_not`
 - `reload::tests::a_bad_gossip_crl_rejects_the_whole_reload`
 - `reload::tests::a_config_reload_swaps_live_and_keeps_it_on_any_failure`
 - `reload::tests::a_failed_reload_keeps_the_running_policy`

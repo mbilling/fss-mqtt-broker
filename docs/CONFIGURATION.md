@@ -200,6 +200,7 @@ Documented overlay variables: **112** in `ENV_VARS`, plus `MQTTD_CONFIG` (meta) 
 | `MQTTD_CONFIG` | `—` | read via `std::env::var` (not `mqtt_config::overlay_from`). Source: `crates/mqttd/src/main.rs`. Experimental; warned loudly when engaged (ADR 0076: K>1 sharding and linger were measured slower and stay off by default). |
 | `MQTTD_REPLICA_STORE` | `—` | read via `std::env::var` (not `mqtt_config::overlay_from`). Source: `crates/mqttd/src/main.rs`. `redb` (default) or `log` — the replica store's engine (ADR 0078). `log` is the append-only segment log, EXPERIMENTAL until its hardware evidence is in: it imports an existing redb store once (the redb files are kept as `*.imported`) and there is no conversion back. |
 | `MQTTD_STORE_SHARDS` | `—` | read via `std::env::var` (not `mqtt_config::overlay_from`). Source: `crates/mqttd/src/main.rs`. Experimental; warned loudly when engaged (ADR 0076: K>1 sharding and linger were measured slower and stay off by default). |
+| `MQTTD_PEER_SPLIT_IO` | `—` | read via `std::env::var` (not `mqtt_config::overlay_from`). Source: `crates/mqttd/src/peer.rs`. `1` drives each peer link's reads and writes as two concurrent halves, so a write parked on TCP backpressure no longer holds back that link's reads (#662). Frame order per lane is unchanged. EXPERIMENTAL and off by default until rig measurements support it; warned when engaged. |
 
 ## Documented exceptions
 

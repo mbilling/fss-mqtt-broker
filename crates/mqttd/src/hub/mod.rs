@@ -6532,6 +6532,7 @@ impl Hub {
             #[allow(clippy::cast_precision_loss)] // counters far below 2^53
             let f = |v: &std::sync::atomic::AtomicU64| v.load(Relaxed) as f64;
             m.set_peer_link_stat(&peer, "busy_seconds", f(&st.busy_ns) / 1e9);
+            m.set_peer_link_stat(&peer, "write_wait_seconds", f(&st.write_wait_ns) / 1e9);
             m.set_peer_link_stat(&peer, "polls", f(&st.polls));
             m.set_peer_link_stat(&peer, "frames_out", f(&st.frames_out));
             m.set_peer_link_stat(&peer, "writes", f(&st.writes));

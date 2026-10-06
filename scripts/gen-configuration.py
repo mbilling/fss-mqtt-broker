@@ -195,6 +195,13 @@ def render(env_vars: list[str], toml_keys: dict[str, str], docs: dict[str, str])
                 "concurrently instead of in series. The ack rule is unchanged. EXPERIMENTAL "
                 "and off by default until rig measurements support it; warned when engaged."
             )
+        elif var == "MQTTD_PEER_SPLIT_IO":
+            desc = (
+                f"{why}. Source: `{where}`. `1` drives each peer link's reads and writes as "
+                "two concurrent halves, so a write parked on TCP backpressure no longer holds "
+                "back that link's reads (#662). Frame order per lane is unchanged. EXPERIMENTAL "
+                "and off by default until rig measurements support it; warned when engaged."
+            )
         elif var == "MQTTD_DIAG_SIMULATED_FSYNC_US":
             desc = (
                 f"{why}. Source: `{where}`. DIAGNOSTIC, and inert unless the binary was built "
