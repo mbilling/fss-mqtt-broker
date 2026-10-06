@@ -1772,6 +1772,7 @@ impl Hub {
             planned_conn,
             retain,
             message_expiry,
+            queued_at: Instant::now(),
         };
         match self.submit_lane_job(job) {
             Submitted::Queued => QosSend::Staged,

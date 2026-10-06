@@ -12,7 +12,9 @@ MAX_REFERENCE_ABSOLUTE_MS = 50.0
 # Liveness bounds, not accuracy gates — accuracy is `max_error_ms`, which already
 # grows with staleness (see `tracking`). A fleet host polls the reference every
 # <=16 s (clock-sync.sh pins `maxpoll 4`) but its polls are DELAYED under load;
-# the reference polls the internet on chrony's own schedule, up to 1024 s.
+# the reference polls its upstream every 16-64 s (clock-sync.sh caps its sources at
+# `maxpoll 6`), best effort: a source chrony refuses the cap for keeps its own
+# schedule, up to 1024 s, which the reference age bound below still covers.
 FLEET_MAX_AGE_S = 900
 REFERENCE_MAX_AGE_S = 2 * 1024 + 60
 

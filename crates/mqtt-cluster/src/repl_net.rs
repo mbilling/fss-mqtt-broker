@@ -432,6 +432,7 @@ impl ReplicaTransport for PeerReplicaTransport {
             op: op.clone(),
         };
 
+        let sent = std::time::Instant::now();
         {
             let mut inner = self.lock();
             // Clone the sender so we hold no borrow of `inner` across the insert.
@@ -465,7 +466,11 @@ impl ReplicaTransport for PeerReplicaTransport {
             self.lock().pending.remove(&req_id);
             return false;
         };
-        res.unwrap_or(false)
+        let accepted = res.unwrap_or(false);
+        if accepted {
+            crate::stage_timing::record(crate::stage_timing::Stage::ReplicateRtt, sent.elapsed());
+        }
+        accepted
     }
 
     async fn read_replica(

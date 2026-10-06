@@ -6723,6 +6723,9 @@ impl Hub {
         if let Some(p) = self.pending_publishes.get_mut(id) {
             if !p.ack_awaits_settle && p.answer(PublishOutcome::Accepted) {
                 debug!(publish = id, topic = %p.topic, "pending publish complete; ack released");
+                if let Some(m) = &self.metrics {
+                    m.observe_publish_ack(p.created_at.elapsed().as_secs_f64());
+                }
             }
         }
         // Retire the entry only when the settle window is done with it AND its
