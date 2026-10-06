@@ -77,6 +77,12 @@ struct StageLabel {
     stage: String,
 }
 
+/// `{probe}` label for `mqttd_runtime_wake_seconds` (#662): `yield` or `channel`.
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct ProbeLabel {
+    probe: String,
+}
+
 /// Every `{stage}` value the broker records. Each one's histogram handle is resolved
 /// once and cached ([`Metrics::observe_durable_stage`] runs several times per durable
 /// append); a label outside this set still works, through the family lookup.
@@ -420,6 +426,8 @@ pub struct Metrics {
     durable_stage_cache: [std::sync::OnceLock<Histogram>; DURABLE_STAGES.len()],
     /// Server-side publish → PUBACK release for gated (`QoS` 1/2) publishes.
     publish_ack_seconds: Histogram,
+    /// Async-runtime scheduling delay, sampled by `mqttd::runtime_probe`.
+    runtime_wake_seconds: Family<ProbeLabel, Histogram>,
     /// HTTP auth hook round-trip latency in seconds (ADR 0004 T16). On the CONNECT path,
     /// so its tail IS connection-setup latency.
     http_auth_latency_seconds: Histogram,
@@ -862,6 +870,17 @@ impl Metrics {
              millisecond-scale fsync is resolved, not rounded to the next power of two",
             durable_stage_seconds.clone(),
         );
+        let runtime_wake_seconds = Family::<ProbeLabel, Histogram>::new_with_constructor(|| {
+            Histogram::new(fine_latency_buckets())
+        });
+        registry.register(
+            "runtime_wake_seconds",
+            "How late a ready task runs on the async runtime, sampled 100 times a second per \
+             probe: yield (a yield_now round trip: the wait behind other ready tasks) and \
+             channel (a message stamped by one task until another wakes to receive it: the \
+             hand-off every durable append makes several times). Fine buckets from 20us",
+            runtime_wake_seconds.clone(),
+        );
         let publish_ack_seconds = Histogram::new(fine_latency_buckets());
         registry.register(
             "publish_ack_seconds",
@@ -1259,6 +1278,7 @@ impl Metrics {
             durable_stage_seconds,
             durable_stage_cache: Default::default(),
             publish_ack_seconds,
+            runtime_wake_seconds,
             http_auth_latency_seconds,
             http_auth_outcomes_total,
             durable_append_failures_total,
@@ -1828,6 +1848,15 @@ impl Metrics {
     }
 
     /// Observe one gated publish's server-side publish → ack release.
+    /// Observe one runtime scheduling-delay sample (`probe` is `yield` or `channel`).
+    pub fn observe_runtime_wake(&self, probe: &'static str, seconds: f64) {
+        self.runtime_wake_seconds
+            .get_or_create(&ProbeLabel {
+                probe: probe.to_string(),
+            })
+            .observe(seconds);
+    }
+
     pub fn observe_publish_ack(&self, seconds: f64) {
         self.publish_ack_seconds.observe(seconds);
         self.otel.publish_ack.record(seconds, &[]);
