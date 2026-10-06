@@ -393,6 +393,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             metrics.observe_durable_stage(stage.label(), elapsed.as_secs_f64());
         });
     }
+    // Async-runtime scheduling delay (#662): mqttd_runtime_wake_seconds{probe}.
+    mqttd::runtime_probe::spawn(Arc::clone(&metrics));
 
     // Build and spawn the routing hub with its session store (durable opt-in, or
     // the bounded in-memory default). The store is shared with connections for the

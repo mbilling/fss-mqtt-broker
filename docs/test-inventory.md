@@ -1020,7 +1020,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 537 test(s)
+## `crates/mqttd/src/lib.rs` — 538 test(s)
 
 - `admin::cli::tests::all_nodes_asks_for_the_cluster_scope_on_the_verbs_that_have_one`
 - `admin::cli::tests::answers_render_as_tables_and_lines`
@@ -1544,6 +1544,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `reload::tests::checksum_is_sha256_lowercase_hex`
 - `reload::tests::committed_config_never_returns_a_rejected_candidate`
 - `reload::tests::reload_increments_the_metric_by_outcome`
+- `runtime_probe::tests::both_probes_feed_the_wake_histogram`
 - `store_probe::tests::probes_a_volume_and_cleans_up`
 - `store_probe::tests::sharding_pays_only_when_parallel_streams_are_nearly_independent`
 - `store_probe::tests::the_parallel_barrier_curve_covers_every_stream_count`
