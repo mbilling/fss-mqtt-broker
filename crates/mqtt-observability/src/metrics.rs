@@ -71,11 +71,25 @@ struct ListenerLabel {
 }
 
 /// `{stage}` label for `mqttd_durable_stage_seconds` — a bounded set, one per stage of a
-/// durable append: `lane_queue`, `local_durable`, `quorum`, `order`, `commit`, `fsync`.
+/// durable append ([`DURABLE_STAGES`]).
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 struct StageLabel {
     stage: String,
 }
+
+/// Every `{stage}` value the broker records. Each one's histogram handle is resolved
+/// once and cached ([`Metrics::observe_durable_stage`] runs several times per durable
+/// append); a label outside this set still works, through the family lookup.
+const DURABLE_STAGES: [&str; 8] = [
+    "lane_queue",
+    "local_durable",
+    "quorum",
+    "order",
+    "commit",
+    "fsync",
+    "replicate_rtt",
+    "replica_apply",
+];
 
 /// `{command}` label for `mqttd_hub_dispatch_seconds` (issue #242) — the COARSE hub
 /// command classes, a bounded 7-value set (`attach`, `publish`, `ack`, `subscribe`,
@@ -401,6 +415,9 @@ pub struct Metrics {
     durable_append_latency_seconds: Histogram,
     /// Each stage of a durable append, finely bucketed (`durable_stage_seconds`).
     durable_stage_seconds: Family<StageLabel, Histogram>,
+    /// [`DURABLE_STAGES`]' handles into that family, resolved on first use so an
+    /// unrecorded stage still renders no series.
+    durable_stage_cache: [std::sync::OnceLock<Histogram>; DURABLE_STAGES.len()],
     /// Server-side publish → PUBACK release for gated (`QoS` 1/2) publishes.
     publish_ack_seconds: Histogram,
     /// HTTP auth hook round-trip latency in seconds (ADR 0004 T16). On the CONNECT path,
@@ -839,7 +856,9 @@ impl Metrics {
              own copy is durable), quorum (own copy durable until the quorum is met — the \
              follower's fsync and the round trip), order (quorum met until the in-order \
              commit releases it), commit (one group commit on a shard writer, fsync \
-             included), fsync (the data sync alone). Fine buckets from 20us so a \
+             included), fsync (the data sync alone), replicate_rtt (leader, per follower: \
+             Replicate queued to the peer link until its ack is back), replica_apply \
+             (follower: Replicate received until its ack is queued). Fine buckets from 20us so a \
              millisecond-scale fsync is resolved, not rounded to the next power of two",
             durable_stage_seconds.clone(),
         );
@@ -1238,6 +1257,7 @@ impl Metrics {
             lease_epoch,
             durable_append_latency_seconds,
             durable_stage_seconds,
+            durable_stage_cache: Default::default(),
             publish_ack_seconds,
             http_auth_latency_seconds,
             http_auth_outcomes_total,
@@ -1789,15 +1809,22 @@ impl Metrics {
 
     /// Observe one stage of a durable append (`stage` is the bounded set documented on
     /// `mqttd_durable_stage_seconds`).
-    pub fn observe_durable_stage(&self, stage: &str, seconds: f64) {
-        self.durable_stage_seconds
-            .get_or_create(&StageLabel {
-                stage: stage.to_string(),
-            })
-            .observe(seconds);
+    pub fn observe_durable_stage(&self, stage: &'static str, seconds: f64) {
+        let label = || StageLabel {
+            stage: stage.to_string(),
+        };
+        match DURABLE_STAGES.iter().position(|s| *s == stage) {
+            Some(i) => self.durable_stage_cache[i]
+                .get_or_init(|| self.durable_stage_seconds.get_or_create(&label()).clone())
+                .observe(seconds),
+            None => self
+                .durable_stage_seconds
+                .get_or_create(&label())
+                .observe(seconds),
+        }
         self.otel
             .durable_stage
-            .record(seconds, &[KeyValue::new("stage", stage.to_string())]);
+            .record(seconds, &[KeyValue::new("stage", stage)]);
     }
 
     /// Observe one gated publish's server-side publish → ack release.

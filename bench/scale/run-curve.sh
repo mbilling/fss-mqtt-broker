@@ -2054,6 +2054,37 @@ if [[ "$LANES" != *E* ]]; then
 	say "[$N nodes] LANES=$LANES — skipping lane E"
 else
 say "[$N nodes] lane E: site ladder ${LANE_E_SITES[*]} x $LANE_E_SITE_RATE msg/s"
+
+# ── PERF_RUNG: a system-wide CPU profile of every broker inside the window of the
+# rung at that site count (every repeat of it, including a re-run after a driver swap).
+#
+# A macOS profile of a local cluster mis-ranked the broker's costs (#662: a CRC it
+# put at ~6% of CPU moved nothing on these hosts) and cannot see the ~45% of broker
+# CPU the rig spends in the kernel. So profile where the number is made: `perf
+# record -a -g` for PERF_SECS inside the rung's measurement window, at PERF_FREQ.
+# The shipped binary is stripped; PERF_SYMBOLS names a local symbols build of the
+# SAME commit (build-repro.sh BUILD_SYMBOLS=1 proves its .text identical), which is
+# uploaded as a symfs so the reports name functions. Reports and the raw data come
+# back under the rung's perf/.
+PERF_RUNG="${PERF_RUNG:-}"
+PERF_SECS="${PERF_SECS:-20}"
+PERF_FREQ="${PERF_FREQ:-199}"
+if [ -n "$PERF_RUNG" ]; then
+	[ "$PERF_SECS" -lt "$LANE_E_SECS" ] || die "PERF_SECS ($PERF_SECS) must fit inside the rung window (LANE_E_SECS=$LANE_E_SECS)"
+	[ -z "${PERF_SYMBOLS:-}" ] || [ -f "$PERF_SYMBOLS" ] || die "PERF_SYMBOLS=$PERF_SYMBOLS is not a file"
+	for ((i = 0; i < N; i++)); do
+		rssh "$(broker_pub_ip "$i")" "set -e
+			DEBIAN_FRONTEND=noninteractive apt-get install -y -qq linux-tools-\$(uname -r) linux-tools-common >/dev/null
+			sysctl -qw kernel.perf_event_paranoid=-1 kernel.kptr_restrict=0
+			mkdir -p /tmp/symfs/usr/local/bin" >"$OUT/perf-setup-broker$i.log" 2>&1 ||
+			die "perf install failed on broker $i — see $OUT/perf-setup-broker$i.log"
+		if [ -n "${PERF_SYMBOLS:-}" ]; then
+			rscp "$PERF_SYMBOLS" "root@$(broker_pub_ip "$i"):/tmp/symfs/usr/local/bin/mqttd" ||
+				die "PERF_SYMBOLS upload failed on broker $i"
+		fi
+	done
+	say "[$N nodes] lane E: perf ready on every broker — profiling rung $PERF_RUNG for ${PERF_SECS}s at ${PERF_FREQ} Hz${PERF_SYMBOLS:+ (symbols: $(basename "$PERF_SYMBOLS"))}"
+fi
 lane_e_rung() { # lane_e_rung <sites> [repeat-index] [is-control]
 	local sites="$1" rep="${2:-1}" is_control="${3:-no}"
     local LANE_E_PUB_CONTAINERS_PER_SITE="${4:-$LANE_E_PUB_CONTAINERS_PER_SITE}"
@@ -2497,6 +2528,16 @@ IMAGES
 	}
 	lane_e_window() {
 		lane_e_window_scrape open
+		local -a perf_pids=()
+		local q
+		if [ "$sites" = "$PERF_RUNG" ] && [ ! -d "$rdir/perf" ]; then
+			mkdir -p "$rdir/perf"
+			for ((i = 0; i < N; i++)); do
+				rssh "$(broker_pub_ip "$i")" "perf record -a -g -F $PERF_FREQ -o /tmp/perf-rung.data -- sleep $PERF_SECS" \
+					>"$rdir/perf/broker$i-record.log" 2>&1 &
+				perf_pids+=($!)
+			done
+		fi
         if [ -z "${QOS1_DRIVER_ARCHIVE:-}" ]; then
             sleep "$LANE_E_SECS"
         else
@@ -2508,7 +2549,31 @@ IMAGES
         done
         fi
 		lane_e_window_scrape close
+		if [ "${#perf_pids[@]}" -gt 0 ]; then
+			for q in "${perf_pids[@]}"; do wait "$q" || warn "lane E: perf record failed on a broker — see $rdir/perf/"; done
+			# Reports are built after the drain (below), not here: `perf report`
+			# and `perf script` would otherwise share the brokers' CPU with the
+			# rung's full offered load and its drain.
+			: >"$rdir/perf/.collect"
+		fi
 		: >"$rdir/.batch/window-ran"
+	}
+	lane_e_perf_collect() {
+		local i ip symfs=""
+		[ -z "${PERF_SYMBOLS:-}" ] || symfs="--symfs /tmp/symfs"
+		for ((i = 0; i < N; i++)); do
+			ip=$(broker_pub_ip "$i")
+			rssh "$ip" "cd /tmp
+				perf report -i perf-rung.data $symfs --kallsyms /proc/kallsyms --stdio --no-children --sort dso,sym --percent-limit 0.1 >perf-self.txt 2>perf-report.err || true
+				perf report -i perf-rung.data $symfs --kallsyms /proc/kallsyms --stdio --no-children --sort comm,dso --percent-limit 0.1 >perf-comm.txt 2>>perf-report.err || true
+				perf script -i perf-rung.data $symfs --kallsyms /proc/kallsyms -F comm,tid,cpu,period,ip,sym,dso 2>>perf-report.err | gzip >perf-script.gz || true" \
+				>>"$rdir/perf/broker$i-record.log" 2>&1 || true
+			rscp "root@$ip:/tmp/perf-self.txt" "$rdir/perf/broker$i-self.txt" || true
+			rscp "root@$ip:/tmp/perf-comm.txt" "$rdir/perf/broker$i-comm.txt" || true
+			rscp "root@$ip:/tmp/perf-script.gz" "$rdir/perf/broker$i-script.gz" || true
+			rscp "root@$ip:/tmp/perf-report.err" "$rdir/perf/broker$i-report.err" || true
+		done
+		say "[$N nodes] lane E: perf profiles collected -> $rdir/perf"
 	}
 	local cpu_window=aligned i phase cpu_rc=0
 	with_cpu_sampling "$rdir/cpu" lane_e_window || cpu_rc=$?
@@ -2724,6 +2789,13 @@ CONNFAIL
     if [ -n "${QOS1_DRIVER_ARCHIVE:-}" ]; then
         qos1_clock_capture "$rdir/clock/final" || die "clock health failed after drain"
     fi
+	if [ -f "$rdir/perf/.collect" ]; then
+		rm -f "$rdir/perf/.collect"
+		lane_e_perf_collect
+		# A profiled rung ran under `perf record -a -g`: stamp it, so a reader or
+		# a summary does not take it for a clean curve point.
+		echo "profiled=yes perf_secs=$PERF_SECS perf_freq=$PERF_FREQ" >>"$rdir/rung.txt"
+	fi
 	say "  lane E: $sites site(s) done ($((sites * LANE_E_SITE_RATE)) msg/s offered)"
 }
 # ── the forwarding positive control (#482 Option B) ──────────────────────────

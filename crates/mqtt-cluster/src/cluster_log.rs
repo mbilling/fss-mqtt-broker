@@ -127,6 +127,8 @@ pub enum WriteReply {
         lane: mpsc::WeakUnboundedSender<crate::peer::PeerMessage>,
         /// The `Replicate` being answered.
         req_id: u64,
+        /// When the `Replicate` arrived, for the `replica_apply` stage.
+        received: std::time::Instant,
     },
 }
 
@@ -138,7 +140,15 @@ impl WriteReply {
             Self::Oneshot(tx) => {
                 let _ = tx.send(accepted);
             }
-            Self::Ack { lane, req_id } => {
+            Self::Ack {
+                lane,
+                req_id,
+                received,
+            } => {
+                crate::stage_timing::record(
+                    crate::stage_timing::Stage::ReplicaApply,
+                    received.elapsed(),
+                );
                 if let Some(lane) = lane.upgrade() {
                     let _ = lane.send(crate::peer::PeerMessage::ReplicateAck { req_id, accepted });
                 }

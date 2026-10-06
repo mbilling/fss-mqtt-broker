@@ -1020,7 +1020,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 536 test(s)
+## `crates/mqttd/src/lib.rs` — 537 test(s)
 
 - `admin::cli::tests::all_nodes_asks_for_the_cluster_scope_on_the_verbs_that_have_one`
 - `admin::cli::tests::answers_render_as_tables_and_lines`
@@ -1528,6 +1528,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `memory_watch::tests::the_watcher_drives_brownout_on_watermark_transitions`
 - `memory_watch::tests::vm_rss_is_parsed_in_bytes_from_the_right_line`
 - `memory_watch::tests::without_a_watermark_nothing_is_ever_browned_out`
+- `peer::tests::a_frame_produced_during_the_yield_joins_the_same_write`
 - `peer::tests::control_frames_jump_the_bulk_queue`
 - `peer::tests::peer_qos0_is_shed_when_the_pool_is_full_and_nothing_else_is`
 - `reload::tests::a_bad_gossip_crl_rejects_the_whole_reload`

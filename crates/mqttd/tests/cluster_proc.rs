@@ -881,6 +881,7 @@ async fn a_durable_publish_feeds_every_stage_histogram() {
         "order",
         "commit",
         "fsync",
+        "replicate_rtt",
     ] {
         let series = format!("mqttd_durable_stage_seconds_count{{stage=\"{stage}\"}}");
         let count = node.metric(&series).await.unwrap_or(0);
@@ -891,6 +892,19 @@ async fn a_durable_publish_feeds_every_stage_histogram() {
             log_tail(&node.log_path)
         );
     }
+    // The follower half is recorded where the Replicate is applied: on the others.
+    let mut applied = 0;
+    for follower in &proc.nodes[1..] {
+        applied += follower
+            .metric("mqttd_durable_stage_seconds_count{stage=\"replica_apply\"}")
+            .await
+            .unwrap_or(0);
+    }
+    assert!(
+        applied > 0,
+        "no follower recorded replica_apply after an acked durable publish\n{}",
+        log_tail(&proc.nodes[1].log_path)
+    );
     let acks = node
         .metric("mqttd_publish_ack_seconds_count")
         .await
