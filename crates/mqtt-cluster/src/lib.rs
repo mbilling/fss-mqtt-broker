@@ -33,6 +33,7 @@ pub mod repl_net;
 pub mod replay;
 pub mod replica_change;
 pub mod segment_log;
+pub mod stage_timing;
 pub mod swim;
 pub mod swim_auth;
 pub mod swim_driver;

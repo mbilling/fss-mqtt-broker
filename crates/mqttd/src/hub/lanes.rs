@@ -133,6 +133,8 @@ pub struct AppendJob {
     pub(super) retain: bool,
     /// The remaining message-expiry interval to forward on the wire, if any.
     pub(super) message_expiry: Option<u32>,
+    /// When the hub queued the job, for the `lane_queue` durable stage.
+    pub(super) queued_at: Instant,
 }
 
 /// What a lane worker receives: append/passthrough work, or a clean-start discard
@@ -342,6 +344,7 @@ impl AppendJob {
             planned_conn: None,
             retain: false,
             message_expiry: None,
+            queued_at: Instant::now(),
         }
     }
 
@@ -365,6 +368,21 @@ impl AppendJob {
 /// one full round trip per message. Sized above the default publisher window
 /// so the lane, not this constant, is what a busy session saturates.
 pub(super) const LANE_PIPELINE_DEPTH: usize = 16;
+
+/// The `lane_queue` durable stage: hub queue to worker submit, durable stores only.
+fn observe_lane_queue(
+    metrics: Option<&mqtt_observability::metrics::Metrics>,
+    durable: bool,
+    job: &AppendJob,
+    started: Instant,
+) {
+    if let (true, Some(m)) = (durable, metrics) {
+        m.observe_durable_stage(
+            "lane_queue",
+            started.duration_since(job.queued_at).as_secs_f64(),
+        );
+    }
+}
 
 pub(super) async fn append_lane_worker(
     store: Arc<dyn SessionStore>,
@@ -432,6 +450,7 @@ pub(super) async fn append_lane_worker(
                         // offset assignment happen here, cheaply; the wait is
                         // pipelined.
                         let started = Instant::now();
+                        observe_lane_queue(metrics.as_deref(), durable, &job, started);
                         let mut pending = store
                             .submit_enqueue_tagged(
                                 &job.client,
@@ -767,6 +786,7 @@ impl Hub {
             planned_conn,
             retain: message.retain,
             message_expiry,
+            queued_at: Instant::now(),
         };
         self.submit_lane_job(job)
     }
@@ -789,6 +809,7 @@ impl Hub {
             planned_conn,
             retain: message.retain,
             message_expiry,
+            queued_at: Instant::now(),
         };
         self.submit_lane_job(job)
     }

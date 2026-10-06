@@ -26,6 +26,10 @@ redb = "2"
 # AWS-LC module across the whole graph. A variant, not a default: heavier
 # build (cmake + Go), narrower platform matrix.
 fips = ["aws-lc-rs/fips"]
+# DIAGNOSTIC ONLY — never in a shipped build: lets MQTTD_DIAG_SIMULATED_FSYNC_US replace
+# every segment-log data sync with a sleep, for controlled fsync-latency sweeps on one
+# machine (see stage_timing.rs). A build with it is NOT durable.
+diag-simulated-fsync = []
 
 [dev-dependencies]
 tempfile = "3"

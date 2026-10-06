@@ -366,6 +366,34 @@ quorum RPC becomes a real network round trip instead of a microsecond. The numbe
 below the barrier changes, the number above it changes, and nothing about this
 document predicts the result.
 
+### Where the time goes: per-stage histograms
+
+`mqttd_durable_append_latency_seconds` is one number for the whole store wait. The
+stages inside it are exported separately, on finer buckets (20µs to ~5s, ×1.5), as
+`mqttd_durable_stage_seconds{stage}`:
+
+| `stage` | measured from → to |
+|---|---|
+| `lane_queue` | hub queues the append → the session's lane worker submits it |
+| `local_durable` | submit → this node's copy is durable (writer queue + group commit) |
+| `quorum` | local durable → enough replica acks for the write floor |
+| `order` | quorum met → the append is committed in offset order (head-of-line wait) |
+| `commit` | one shard-writer group commit (one sample per batch, not per append) |
+| `fsync` | one segment-log data sync (one sample per batch) |
+| `replicate_rtt` | leader, per follower: Replicate queued to the peer link → its ack back |
+| `replica_apply` | follower: Replicate received → its ack put on the link (writer queue + commit) |
+
+`mqttd_publish_ack_seconds` is the server-side publish → PUBACK release for QoS 1
+publishes that went through the pending table: the broker's own share of the client's
+ack RTT, without the network or the client.
+
+For a controlled sweep of the barrier itself, build with the diagnostic feature
+`diag-simulated-fsync` and set `MQTTD_DIAG_SIMULATED_FSYNC_US`: every segment-log sync
+becomes a sleep of that length (the process warns on stderr at its first sync). That moves the barrier
+from whatever the local disk does (`F_FULLFSYNC` on macOS is ~4ms) to a chosen value,
+so one machine can show how each stage responds to it. **It disables durability** — a
+measurement build only, never a release.
+
 ## Result 3 — head-of-line isolation under a degraded placement group
 
 [ADR 0061](../adr/0061-off-loop-durable-appends.md) moved durable appends off the hub

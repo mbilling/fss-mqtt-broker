@@ -385,6 +385,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ADR 0068 runtime visibility: the metric half (the startup banner and
     // /statusz are the other two).
     metrics.set_crypto_module(mqtt_net::tls::crypto_module());
+    // Durable-path stage timings recorded inside mqtt-cluster, which cannot depend on
+    // the metrics crate: route them into mqttd_durable_stage_seconds.
+    {
+        let metrics = Arc::clone(&metrics);
+        mqtt_cluster::stage_timing::set_sink(move |stage, elapsed| {
+            metrics.observe_durable_stage(stage.label(), elapsed.as_secs_f64());
+        });
+    }
 
     // Build and spawn the routing hub with its session store (durable opt-in, or
     // the bounded in-memory default). The store is shared with connections for the
