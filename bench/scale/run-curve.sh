@@ -2055,7 +2055,8 @@ if [[ "$LANES" != *E* ]]; then
 else
 say "[$N nodes] lane E: site ladder ${LANE_E_SITES[*]} x $LANE_E_SITE_RATE msg/s"
 
-# ── PERF_RUNG: a system-wide CPU profile of every broker inside ONE rung's window.
+# ── PERF_RUNG: a system-wide CPU profile of every broker inside the window of the
+# rung at that site count (every repeat of it, including a re-run after a driver swap).
 #
 # A macOS profile of a local cluster mis-ranked the broker's costs (#662: a CRC it
 # put at ~6% of CPU moved nothing on these hosts) and cannot see the ~45% of broker
@@ -2078,7 +2079,8 @@ if [ -n "$PERF_RUNG" ]; then
 			mkdir -p /tmp/symfs/usr/local/bin" >"$OUT/perf-setup-broker$i.log" 2>&1 ||
 			die "perf install failed on broker $i — see $OUT/perf-setup-broker$i.log"
 		if [ -n "${PERF_SYMBOLS:-}" ]; then
-			rscp "$PERF_SYMBOLS" "root@$(broker_pub_ip "$i"):/tmp/symfs/usr/local/bin/mqttd"
+			rscp "$PERF_SYMBOLS" "root@$(broker_pub_ip "$i"):/tmp/symfs/usr/local/bin/mqttd" ||
+				die "PERF_SYMBOLS upload failed on broker $i"
 		fi
 	done
 	say "[$N nodes] lane E: perf ready on every broker — profiling rung $PERF_RUNG for ${PERF_SECS}s at ${PERF_FREQ} Hz${PERF_SYMBOLS:+ (symbols: $(basename "$PERF_SYMBOLS"))}"
@@ -2549,7 +2551,10 @@ IMAGES
 		lane_e_window_scrape close
 		if [ "${#perf_pids[@]}" -gt 0 ]; then
 			for q in "${perf_pids[@]}"; do wait "$q" || warn "lane E: perf record failed on a broker — see $rdir/perf/"; done
-			lane_e_perf_collect
+			# Reports are built after the drain (below), not here: `perf report`
+			# and `perf script` would otherwise share the brokers' CPU with the
+			# rung's full offered load and its drain.
+			: >"$rdir/perf/.collect"
 		fi
 		: >"$rdir/.batch/window-ran"
 	}
@@ -2784,6 +2789,13 @@ CONNFAIL
     if [ -n "${QOS1_DRIVER_ARCHIVE:-}" ]; then
         qos1_clock_capture "$rdir/clock/final" || die "clock health failed after drain"
     fi
+	if [ -f "$rdir/perf/.collect" ]; then
+		rm -f "$rdir/perf/.collect"
+		lane_e_perf_collect
+		# A profiled rung ran under `perf record -a -g`: stamp it, so a reader or
+		# a summary does not take it for a clean curve point.
+		echo "profiled=yes perf_secs=$PERF_SECS perf_freq=$PERF_FREQ" >>"$rdir/rung.txt"
+	fi
 	say "  lane E: $sites site(s) done ($((sites * LANE_E_SITE_RATE)) msg/s offered)"
 }
 # ── the forwarding positive control (#482 Option B) ──────────────────────────
