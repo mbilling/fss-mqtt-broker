@@ -914,6 +914,8 @@ async fn a_durable_publish_feeds_every_stage_histogram() {
         "mqttd_publish_ack_seconds_count is {acks} after an acked publish\n{}",
         log_tail(&node.log_path)
     );
+}
+
 /// The per-link work counters (`mqttd_peer_link_stat{peer, stat}`, #662) are fed
 /// by a REAL link: on a formed 3-node cluster, node 0 reports at least one peer
 /// whose single link task has done work: frames both ways, I/O calls, and busy
