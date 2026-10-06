@@ -1708,9 +1708,10 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `retained_message_replicates_across_nodes`
 - `shared_subscription_delivers_once_cluster_wide`
 
-## `crates/mqttd/tests/cluster_proc.rs` — 5 test(s)
+## `crates/mqttd/tests/cluster_proc.rs` — 6 test(s)
 
 - `a_disk_bound_crash_mid_write_loses_no_acked_fact`
+- `peer_link_work_counters_are_exported_per_link`
 - `rapid_kill_restart_flapping_loses_no_acked_fact`
 - `spawned_node_ports_come_from_outside_the_ephemeral_range`
 - `spawned_process_schedules_hold_acked_facts`

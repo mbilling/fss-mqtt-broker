@@ -148,6 +148,90 @@ const REDIAL_DELAY: Duration = Duration::from_millis(500);
 
 static PEER_CONN_ID: AtomicU64 = AtomicU64::new(1);
 
+/// Per-link work counters (#662). One task carries a whole peer link (both
+/// directions, the TLS session, encode and decode), so its busy share is the
+/// link's capacity question: `busy_ns` is the time the task spent being polled
+/// (on CPU: crypto, syscalls, codec, dispatch; never its waiting), `polls` how
+/// often it ran. Frames and I/O calls give the batching per syscall both ways.
+/// Cumulative since the link connected; read them as deltas over a window.
+#[derive(Debug, Default)]
+pub struct LinkStats {
+    pub busy_ns: AtomicU64,
+    pub polls: AtomicU64,
+    pub frames_out: AtomicU64,
+    pub writes: AtomicU64,
+    pub frames_in: AtomicU64,
+    pub reads: AtomicU64,
+}
+
+type LinkKey = (String, String); // (local node, remote node)
+static LINKS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::BTreeMap<LinkKey, Arc<LinkStats>>>,
+> = std::sync::OnceLock::new();
+
+fn links() -> &'static std::sync::Mutex<std::collections::BTreeMap<LinkKey, Arc<LinkStats>>> {
+    LINKS.get_or_init(Default::default)
+}
+
+/// The live links of `local` (keyed by local node, so in-process clusters in
+/// tests do not see each other's links), for the hub's metrics tick.
+pub fn link_stats(local: &NodeId) -> Vec<(String, Arc<LinkStats>)> {
+    links()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .filter(|((l, _), _)| *l == local.0)
+        .map(|((_, r), st)| (r.clone(), st.clone()))
+        .collect()
+}
+
+/// Counts read/write calls that moved bytes on one half of a link.
+struct Counted<'a, T> {
+    inner: T,
+    stats: &'a LinkStats,
+}
+
+impl<T: AsyncRead + Unpin> AsyncRead for Counted<'_, T> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let before = buf.filled().len();
+        let r = std::pin::Pin::new(&mut self.inner).poll_read(cx, buf);
+        if matches!(r, std::task::Poll::Ready(Ok(()))) && buf.filled().len() > before {
+            self.stats.reads.fetch_add(1, Ordering::Relaxed);
+        }
+        r
+    }
+}
+
+impl<T: AsyncWrite + Unpin> AsyncWrite for Counted<'_, T> {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        data: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let r = std::pin::Pin::new(&mut self.inner).poll_write(cx, data);
+        if matches!(r, std::task::Poll::Ready(Ok(n)) if n > 0) {
+            self.stats.writes.fetch_add(1, Ordering::Relaxed);
+        }
+        r
+    }
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
 /// Accept incoming peer links on `listener` forever.
 ///
 /// With a [`PeerTls`] context, every link must complete an mTLS handshake
@@ -553,21 +637,57 @@ where
         return Ok(LinkOutcome::Closed);
     }
 
-    let result = pump(
-        &mut rh,
-        &mut wh,
-        &mut buf,
-        &hub,
-        &remote,
-        &mut ctl_rx,
-        &mut out_rx,
-        &reply_ctl,
-        &reply_bulk,
-        &depth,
-        plane.as_ref(),
-        ingress.as_deref(),
-    )
-    .await;
+    let stats = Arc::new(LinkStats::default());
+    links()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert((local.0.clone(), remote.0.clone()), stats.clone());
+    let mut rh = Counted {
+        inner: rh,
+        stats: &stats,
+    };
+    let mut wh = Counted {
+        inner: wh,
+        stats: &stats,
+    };
+    // Scoped: the pump borrows `remote`, which the disconnect below moves.
+    let result = {
+        let link = pump(
+            &mut rh,
+            &mut wh,
+            &mut buf,
+            &hub,
+            &remote,
+            &mut ctl_rx,
+            &mut out_rx,
+            &reply_ctl,
+            &reply_bulk,
+            &depth,
+            &stats,
+            plane.as_ref(),
+            ingress.as_deref(),
+        );
+        // On-CPU time of the link task: every poll, timed, and none of its waiting.
+        let mut link = std::pin::pin!(link);
+        std::future::poll_fn(|cx| {
+            let started = std::time::Instant::now();
+            let r = std::future::Future::poll(link.as_mut(), cx);
+            let ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            stats.busy_ns.fetch_add(ns, Ordering::Relaxed);
+            stats.polls.fetch_add(1, Ordering::Relaxed);
+            r
+        })
+        .await
+    };
+    {
+        let mut map = links()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let key = (local.0.clone(), remote.0.clone());
+        if map.get(&key).is_some_and(|st| Arc::ptr_eq(st, &stats)) {
+            map.remove(&key);
+        }
+    }
     let _ = hub.send(HubCommand::PeerDisconnected {
         node: remote,
         conn_id,
@@ -587,6 +707,7 @@ async fn pump<R, W>(
     reply_ctl: &mpsc::WeakUnboundedSender<PeerMessage>,
     reply_bulk: &mpsc::WeakUnboundedSender<PeerMessage>,
     depth: &std::sync::atomic::AtomicUsize,
+    stats: &LinkStats,
     plane: Option<&DurablePlane>,
     ingress: Option<&IngressCredit>,
 ) -> Result<(), std::io::Error>
@@ -624,7 +745,10 @@ where
                     // Priority is unaffected — `biased` still drains this lane
                     // first, and a batch only ever contains frames already
                     // queued on it.
-                    Some(msg) => write_batch(wh, ctl_buf, &msg, ctl_rx, remote).await?,
+                    Some(msg) => {
+                        let n = write_batch(wh, ctl_buf, &msg, ctl_rx, remote).await?;
+                        stats.frames_out.fetch_add(n, Ordering::Relaxed);
+                    }
                     None => return Ok(()), // taken over or hub gone
                 }
             }
@@ -632,6 +756,7 @@ where
                 match inbound? {
                     None => return Ok(()), // peer closed
                     Some(msg) => {
+                        stats.frames_in.fetch_add(1, Ordering::Relaxed);
                         forward_inbound(msg, hub, remote, plane, ingress, reply_ctl, reply_bulk);
                     }
                 }
@@ -643,7 +768,10 @@ where
                     // severing every message on the link (and a link-up back-fill that
                     // dies on send would die again on every reconnect). Other I/O
                     // errors still end the link as before.
-                    Some(msg) => write_batch(wh, out_buf, &msg, out_rx, remote).await?,
+                    Some(msg) => {
+                        let n = write_batch(wh, out_buf, &msg, out_rx, remote).await?;
+                        stats.frames_out.fetch_add(n, Ordering::Relaxed);
+                    }
                     None => return Ok(()), // taken over or hub gone
                 }
             }
@@ -1055,8 +1183,9 @@ async fn write_batch<W: AsyncWrite + Unpin>(
     first: &PeerMessage,
     rx: &mut mpsc::UnboundedReceiver<PeerMessage>,
     remote: &NodeId,
-) -> Result<(), std::io::Error> {
+) -> Result<u64, std::io::Error> {
     buf.clear();
+    let mut frames = 1u64;
     let encode_into = |buf: &mut Vec<u8>, msg: &PeerMessage| {
         if let PeerMessage::Replicate { req_id, .. } = msg {
             tracing::debug!(req_id, peer = %remote.0, "replicate: writing to wire");
@@ -1076,12 +1205,15 @@ async fn write_batch<W: AsyncWrite + Unpin>(
     }
     while buf.len() < PEER_WRITE_BUDGET {
         match rx.try_recv() {
-            Ok(msg) => encode_into(buf, &msg),
+            Ok(msg) => {
+                frames += 1;
+                encode_into(buf, &msg);
+            }
             Err(_) => break, // empty, or closed — the closed case is seen by recv() next loop
         }
     }
     if buf.is_empty() {
-        return Ok(()); // every frame in the batch was refused
+        return Ok(0); // every frame in the batch was refused
     }
     wh.write_all(buf).await?;
     wh.flush().await?;
@@ -1089,7 +1221,7 @@ async fn write_batch<W: AsyncWrite + Unpin>(
     if buf.capacity() > PEER_WRITE_BUDGET * 2 {
         buf.shrink_to(PEER_WRITE_BUDGET);
     }
-    Ok(())
+    Ok(frames)
 }
 
 async fn write_frame<W: AsyncWrite + Unpin>(
@@ -1239,6 +1371,7 @@ mod tests {
                 &reply_ctl,
                 &reply_bulk,
                 &std::sync::atomic::AtomicUsize::new(0),
+                &LinkStats::default(),
                 None,
                 None,
             )
