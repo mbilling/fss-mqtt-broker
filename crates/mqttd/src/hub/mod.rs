@@ -6525,6 +6525,19 @@ impl Hub {
         }
         // Cluster shape (ADR 0020-T6): placement-eligible members and live peer links.
         m.set_peer_links(self.peers.len());
+        // Per-link work (#662): one task carries each link, so its busy share is
+        // the link's capacity. Cumulative per link; the scraper takes deltas.
+        for (peer, st) in crate::peer::link_stats(&self.node_id) {
+            use std::sync::atomic::Ordering::Relaxed;
+            #[allow(clippy::cast_precision_loss)] // counters far below 2^53
+            let f = |v: &std::sync::atomic::AtomicU64| v.load(Relaxed) as f64;
+            m.set_peer_link_stat(&peer, "busy_seconds", f(&st.busy_ns) / 1e9);
+            m.set_peer_link_stat(&peer, "polls", f(&st.polls));
+            m.set_peer_link_stat(&peer, "frames_out", f(&st.frames_out));
+            m.set_peer_link_stat(&peer, "writes", f(&st.writes));
+            m.set_peer_link_stat(&peer, "frames_in", f(&st.frames_in));
+            m.set_peer_link_stat(&peer, "reads", f(&st.reads));
+        }
         // Issue #504: both lanes are unbounded, so this is the only report of the
         // frames that have left the hub and not yet reached the wire — the
         // population that sits between `received` and `delivered`.
