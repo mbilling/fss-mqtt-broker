@@ -1098,7 +1098,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 558 test(s)
+## `crates/mqttd/src/lib.rs` — 560 test(s)
 
 - `admin::cli::tests::all_nodes_asks_for_the_cluster_scope_on_the_verbs_that_have_one`
 - `admin::cli::tests::answers_render_as_tables_and_lines`
@@ -1368,6 +1368,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::a_live_qos1_delivery_to_a_clean_session_writes_nothing`
 - `hub::tests::a_live_qos1_delivery_to_a_persistent_subscriber_is_durable_until_acked`
 - `hub::tests::a_live_qos2_delivery_records_its_packet_id_until_pubcomp`
+- `hub::tests::a_local_member_refused_by_a_brownout_after_the_drain_gated_it_still_gets_it_live`
 - `hub::tests::a_local_retained_publish_commits_to_the_durable_keyspace`
 - `hub::tests::a_local_shared_member_under_brownout_refuses_the_publisher`
 - `hub::tests::a_lost_link_reclaims_the_handoff_and_the_next_link_resends`
@@ -1414,6 +1415,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::a_retained_replay_carries_the_remaining_expiry_interval`
 - `hub::tests::a_session_that_becomes_misplaced_by_attaching_is_rehomed`
 - `hub::tests::a_shared_group_refusing_every_drain_gated_delivery_still_gets_it_plainly`
+- `hub::tests::a_shared_group_whose_last_candidate_died_still_gets_a_drain_gated_message`
 - `hub::tests::a_single_axis_still_toggles_brownout_on_its_own`
 - `hub::tests::a_stale_value_cannot_resurrect_a_committed_clear`
 - `hub::tests::a_stalled_group_a_append_does_not_delay_a_group_b_publish`
