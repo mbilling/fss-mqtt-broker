@@ -9,6 +9,7 @@ members = [
     "crates/mqtt-cluster",
     "crates/mqtt-observability",
     "crates/mqtt-config",
+    "crates/mqtt-rules",
     "crates/mqttd",
     "crates/mqtt-bridge",
     "crates/mqttd-operator",

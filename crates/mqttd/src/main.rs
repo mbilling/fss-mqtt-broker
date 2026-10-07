@@ -283,6 +283,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if std::env::args().skip(1).any(|a| a == "--check-tls") {
         check_tls();
     }
+    // ADR 0083: validate a rules file, or run one rule statement against a simulated
+    // message — offline, nothing bound.
+    if std::env::args().skip(1).any(|a| a == "--check-rules") {
+        check_rules_cli();
+    }
+    if std::env::args().skip(1).any(|a| a == "--rule-test") {
+        rule_test_cli();
+    }
 
     // `--hash-password [<username>]` prints an Argon2id password-file line and exits.
     // Before the broker configures anything: it is a local text utility, not a server mode.
@@ -959,6 +967,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _ = hub_tx.send(mqttd::hub::HubCommand::AttachAuthorizer(
         mqttd::hub::AuthzWatch(policy.authz.clone()),
     ));
+    // The hub runs the rule engine on the one publish it originates for a client — its
+    // Will (ADR 0083); client publishes are evaluated on their connection tasks.
+    if let Some(rules) = &policy.rules {
+        let _ = hub_tx.send(mqttd::hub::HubCommand::AttachRules(rules.clone()));
+    }
 
     // Restore from backup (ADR 0062), BEFORE any client listener binds: a node serving
     // half an import is the one state this design refuses. /readyz reports NotReady with
@@ -1557,8 +1570,46 @@ fn client_policy(
             Ok((authz, auth))
         }
     };
-    let (reloader, handles) =
+    let (mut reloader, handles) =
         reload::Reloader::with_metrics(initial, audit.clone(), Some(metrics.clone()), build);
+
+    // The rule engine (ADR 0083): loaded before any listener accepts — a rules file that
+    // does not load refuses the boot, exactly as an ACL file that does not parse does —
+    // and re-read by every reload, validate-before-swap, from whatever path the live
+    // config names then.
+    let initial_rules = {
+        let snap = live
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        mqttd::rules::load(snap.rules.file.as_deref()).map_err(|e| format!("rules: {e}"))?
+    };
+    metrics.set_rules_loaded(
+        reload::enabled_rules(&initial_rules),
+        initial_rules.digest(),
+    );
+    if !initial_rules.is_empty() {
+        info!(
+            rules = initial_rules.len(),
+            enabled = reload::enabled_rules(&initial_rules),
+            digest = %initial_rules.digest(),
+            "rule engine: rules loaded (ADR 0083)"
+        );
+    }
+    let (rules_tx, rules_rx) = tokio::sync::watch::channel(Arc::new(initial_rules));
+    let rules =
+        mqttd::rules::Rules::new(rules_rx, Arc::from(node.0.as_str()), Some(metrics.clone()));
+    reloader.attach_rules(rules_tx, {
+        let live = live.clone();
+        move || -> reload::RulesBuildResult {
+            let path = live
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .rules
+                .file
+                .clone();
+            mqttd::rules::load(path.as_deref()).map(Arc::new)
+        }
+    });
 
     let policy = Arc::new(conn::ConnPolicy {
         anonymous: None,
@@ -1581,6 +1632,7 @@ fn client_policy(
         shutdown: Some(shutdown),
         metrics: Some(metrics),
         ingress: Some(ingress),
+        rules: Some(rules),
     });
     Ok((policy, reloader))
 }
@@ -1685,6 +1737,8 @@ fn watched_policy_paths(config: &Config) -> Vec<std::path::PathBuf> {
         config.cluster.peer_tls.cert.as_ref(),
         config.cluster.peer_tls.key.as_ref(),
         config.cluster.peer_tls.crl.as_ref(),
+        // The rules file (ADR 0083): the reload rebuilds it, so an edit lands like an ACL edit.
+        config.rules.file.as_ref(),
     ]
     .into_iter()
     .flatten()
@@ -4237,6 +4291,14 @@ fn load_config() -> Result<Config, Box<dyn std::error::Error>> {
 /// `--probe` path) do not start with `-`, so they are never mistaken for flags.
 const KNOWN_FLAGS: &[&str] = &[
     "--check-config",
+    "--check-rules",
+    "--rule-test",
+    "--sql",
+    "--topic",
+    "--payload",
+    "--clientid",
+    "--username",
+    "--qos",
     "--preflight",
     "--print-config",
     "--check-tls",
@@ -4280,7 +4342,8 @@ fn validate_cli(args: &[String]) -> Result<(), String> {
     let mut tokens = args.iter().map(String::as_str).peekable();
     while let Some(arg) = tokens.next() {
         match arg {
-            "--config" | "--url" | "--pid" | "--timeout" => {
+            "--config" | "--url" | "--pid" | "--timeout" | "--sql" | "--topic" | "--payload"
+            | "--clientid" | "--username" | "--qos" => {
                 if !options.insert(arg) {
                     return Err(format!("repeated option: {arg}"));
                 }
@@ -4298,11 +4361,12 @@ fn validate_cli(args: &[String]) -> Result<(), String> {
                 }
             }
             "--check-config" | "--print-config" | "--check-tls" | "--hash-password" | "--probe"
-            | "--decommission" | "--backup" | "--version" | "-V" | "--help" | "-h" => {
+            | "--decommission" | "--backup" | "--check-rules" | "--rule-test" | "--version"
+            | "-V" | "--help" | "-h" => {
                 if let Some(previous) = mode.replace(arg) {
                     return Err(format!("choose one command, not {previous} and {arg}"));
                 }
-                if matches!(arg, "--hash-password" | "--probe") {
+                if matches!(arg, "--hash-password" | "--probe" | "--check-rules") {
                     if let Some(value) = tokens.next_if(|value| !value.starts_with('-')) {
                         if value.is_empty() || (arg == "--probe" && !value.starts_with('/')) {
                             return Err(format!(
@@ -4319,6 +4383,9 @@ fn validate_cli(args: &[String]) -> Result<(), String> {
     if preflight && mode != "--check-config" {
         return Err(format!("--preflight is not valid with {mode}"));
     }
+    if mode == "--rule-test" && !options.contains("--sql") {
+        return Err("--rule-test requires --sql <statement>".to_string());
+    }
     for option in options {
         let allowed = match option {
             "--config" => matches!(
@@ -4329,7 +4396,11 @@ fn validate_cli(args: &[String]) -> Result<(), String> {
                     | "--check-tls"
                     | "--probe"
                     | "--backup"
+                    | "--check-rules"
             ),
+            "--sql" | "--topic" | "--payload" | "--clientid" | "--username" | "--qos" => {
+                mode == "--rule-test"
+            }
             "--url" => mode == "--probe",
             "--pid" | "--timeout" => matches!(mode, "--decommission" | "--backup"),
             _ => unreachable!("only value options enter this set"),
@@ -4370,6 +4441,10 @@ fn print_usage() {
                                      current user, resolve every bind\n  \
            mqttd --print-config      print the effective config (secrets fingerprinted)\n  \
            mqttd --check-tls         check every configured certificate, key, CA and CRL\n  \
+           mqttd --check-rules [f]   validate a rules file (default: the config's rules.file)\n  \
+           mqttd --rule-test --sql <statement> [--topic t] [--payload p] [--clientid c]\n  \
+                             [--username u] [--qos n]\n  \
+                                     run one rule statement against a simulated publish\n  \
            mqttd --hash-password [u] print an Argon2id password-file line and exit\n  \
            mqttd --probe [/readyz]   query the running broker's health endpoint and exit\n  \
            mqttd --decommission      drain and gracefully stop the running broker\n  \
@@ -4379,7 +4454,7 @@ fn print_usage() {
            mqttd --help              print this help and exit\n\n\
          OPTIONS:\n  \
            --config <path>          config for startup, --check-config, --print-config,\n  \
-                                    --check-tls, --probe or --backup\n  \
+                                    --check-tls, --check-rules, --probe or --backup\n  \
            --url <host:port>        explicit endpoint for --probe\n  \
            --pid <n>                target process for --decommission or --backup\n  \
            --timeout <secs>         deadline for --decommission or --backup\n\n\
@@ -4417,6 +4492,85 @@ fn check_config() -> ! {
                 Some(p) => eprintln!("config INVALID ({}): {error}", p.display()),
                 None => eprintln!("config INVALID: {error}"),
             }
+            std::process::exit(1);
+        }
+    }
+}
+
+/// `mqttd --check-rules [<file>]` (ADR 0083): load a rules file exactly as startup and a
+/// reload load it, print its warnings and a verdict, and exit. Without a file argument the
+/// effective config's `rules.file` is checked. Exit `0` OK, `1` invalid, `2` usage.
+fn check_rules_cli() -> ! {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let named = args
+        .iter()
+        .skip_while(|a| *a != "--check-rules")
+        .nth(1)
+        .filter(|v| !v.starts_with('-'))
+        .cloned();
+    let Some(file) = named.or_else(|| load_config_or_exit().rules.file) else {
+        eprintln!(
+            "error: no rules file — pass one (mqttd --check-rules <file>) or set rules.file / \
+             MQTTD_RULES_FILE"
+        );
+        std::process::exit(2);
+    };
+    match mqtt_rules::RuleSet::load(Path::new(&file)) {
+        Ok(loaded) => {
+            for w in &loaded.warnings {
+                eprintln!("warning: {w}");
+            }
+            println!(
+                "rules OK: {file}: {} rule(s), {} enabled, sha256 {}",
+                loaded.rules.len(),
+                reload::enabled_rules(&loaded.rules),
+                loaded.rules.digest()
+            );
+            std::process::exit(0);
+        }
+        Err(e) => {
+            eprintln!("rules INVALID ({file}): {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// `mqttd --rule-test --sql <statement> …` (ADR 0083): EMQX's "SQL test" — run one
+/// statement against a simulated publish and print each output as JSON, one per line.
+fn rule_test_cli() -> ! {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let opt = |name: &str| args.iter().skip_while(|a| *a != name).nth(1).cloned();
+    let sql = opt("--sql").unwrap_or_default();
+    let topic = opt("--topic").unwrap_or_else(|| "t/1".to_string());
+    let payload = bytes::Bytes::from(opt("--payload").unwrap_or_else(|| "{}".to_string()));
+    let clientid = opt("--clientid").unwrap_or_else(|| "test-client".to_string());
+    let username = opt("--username");
+    let qos = match opt("--qos").as_deref() {
+        None | Some("0") => 0,
+        Some("1") => 1,
+        Some("2") => 2,
+        Some(other) => {
+            eprintln!("error: --qos takes 0, 1 or 2, not {other:?}");
+            std::process::exit(2);
+        }
+    };
+    let props = mqtt_core::AppProperties::default();
+    let mut input = mqtt_rules::PublishInput::new(&clientid, &topic, &payload, qos, &props);
+    input.username = username.as_deref();
+    input.node = "rule-test";
+    match mqtt_rules::test_sql(&sql, &input) {
+        Ok(outputs) if outputs.is_empty() => {
+            println!("(no output: the statement's WHERE / INCASE did not match this message)");
+            std::process::exit(0);
+        }
+        Ok(outputs) => {
+            for o in outputs {
+                println!("{o}");
+            }
+            std::process::exit(0);
+        }
+        Err(e) => {
+            eprintln!("rule test FAILED: {e}");
             std::process::exit(1);
         }
     }
@@ -4970,6 +5124,8 @@ fn host_checks(config: &Config) -> Result<(), String> {
     }
     authorizer_from_config(config).map_err(text)?;
     authenticator_from_config(config, None, None).map_err(text)?;
+    // The rules file (ADR 0083), loaded exactly as startup and a reload load it.
+    mqttd::rules::load(config.rules.file.as_deref()).map_err(|e| format!("rules: {e}"))?;
     let peer_tls = peer_tls_from_config(config).map_err(text)?;
     if config.cluster.swim.bind.is_some() {
         let (auth, signed) =
@@ -5485,6 +5641,19 @@ mod tests {
                 "{p} must be in the watch scope (got {paths:?})"
             );
         }
+    }
+
+    /// ADR 0083: a reload rebuilds the rules, so the watcher must stat the rules file or an
+    /// edit to it waits for a SIGHUP while an ACL edit beside it lands on its own.
+    #[test]
+    fn the_rules_file_is_file_watched() {
+        let mut config = Config::default();
+        config.rules.file = Some("/etc/mqttd/rules.toml".into());
+        let paths = watched_policy_paths(&config);
+        assert!(
+            paths.contains(&std::path::PathBuf::from("/etc/mqttd/rules.toml")),
+            "the rules file must be in the watch scope (got {paths:?})"
+        );
     }
 
     /// #169 self-guard: every double-dash flag this source compares against must be in

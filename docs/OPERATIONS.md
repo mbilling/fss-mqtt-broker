@@ -1103,6 +1103,47 @@ That is the design working. The alerts below say a node is **spending real time 
      instead.
 4. **Check the hub itself.** A slow hub (see *Hub loop held*) fills the pool at any load.
 
+## Rules (ADR 0083)
+
+The rule engine's reference is [RULES.md](RULES.md); this is the operating summary.
+
+- **Configure** with `[rules] file` (`MQTTD_RULES_FILE`). The file is per-node operator
+  configuration, like the ACL file: ship the same file to every node.
+- **Validate before you roll:** `mqttd --check-rules <file>`, and
+  `mqttd --rule-test --sql '…' --topic … --payload …` to see what a statement outputs.
+  `mqttd --check-config --preflight` loads the rules file too.
+- **Change** by editing the file and reloading (`SIGHUP`, `POST /admin/v1/reload`, or the
+  `MQTTD_CONFIG_WATCH` watcher, which stats the rules file). The reload is
+  validate-before-swap: a rules file that does not load rejects the **whole** reload with
+  `rules: …` and the running rules stay. At boot, a rules file that does not load
+  refuses the start.
+- **Drift:** `mqttd_rules_info{checksum}` is the file's SHA-256. More than one checksum
+  across the cluster means nodes evaluate their own clients' publishes differently:
+
+  ```promql
+  count(count by (checksum) (mqttd_rules_info == 1)) > 1
+  ```
+
+- **Failing rules:** `mqttd_rule_evaluations_total{rule,result="failed"}` and
+  `mqttd_rule_actions_total{rule,result="failed"}`; a failing rule also logs one WARN per
+  10 s. A failed rule never fails the message: the original is still routed.
+
+  ```promql
+  sum by (rule) (rate(mqttd_rule_evaluations_total{result="failed"}[5m])) > 0
+  ```
+
+- **Load:** rules run on connection tasks, so their CPU shows up as connection-task CPU,
+  not as hub-loop time. A derived message is routed like any publish, so a rule that
+  doubles your message count doubles the routing load and the
+  `mqttd_hub_lane_depth{lane="data"}` it causes. Derived messages ride their original's
+  ingress credit.
+- **Brownout:** a QoS 1/2 publisher's ack waits for its derived messages. If a derived
+  message is refused while the original was stored (or the reverse), the publisher gets
+  no ack and its connection closes, and it retries. Expect this only under brownout.
+
+These two expressions are recommendations; the chart's `PrometheusRule` does not ship
+them.
+
 ## Monitoring for the operator (and humans)
 
 The signals the future controller will reconcile on

@@ -47,6 +47,8 @@ pub struct Config {
     pub audit: Audit,
     /// The authenticated admin API (ADR 0081).
     pub admin: Admin,
+    /// The rule engine (ADR 0083).
+    pub rules: Rules,
     /// The unknown key paths the last parse IGNORED under
     /// [`UnknownConfigKeys::Warn`] (issue #230) — carried here so the caller can
     /// log them loudly without a signature change. Never serialized; empty under
@@ -613,6 +615,18 @@ pub struct Admin {
     /// address and this port. Unset = the port of [`Admin::bind`], the usual case when
     /// every node runs the same config.
     pub peer_port: Option<u16>,
+}
+
+/// The rule engine ([ADR 0083](../../../docs/adr/0083-rule-engine.md)): EMQX-compatible
+/// rule SQL evaluated on every publish, with `republish` and `console` actions
+/// (`docs/RULES.md`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Rules {
+    /// The rules file (`MQTTD_RULES_FILE`), a TOML file of `[rules.<id>]` tables. Unset =
+    /// no rules. Hot-reloadable: `SIGHUP` (or the config watch) re-reads it, validating
+    /// before the swap — a file that does not load keeps the running rules.
+    pub file: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1578,6 +1592,10 @@ impl Config {
         on!("MQTTD_AUDIT_SYSLOG", v, {
             self.audit.syslog = Some(v);
         });
+        // -- rule engine (ADR 0083) --
+        on!("MQTTD_RULES_FILE", v, {
+            self.rules.file = Some(v);
+        });
         // -- admin API (ADR 0081) --
         on!("MQTTD_ADMIN_BIND", v, {
             self.admin.bind = Some(v);
@@ -2189,6 +2207,8 @@ pub const ENV_VARS: &[&str] = &[
     "MQTTD_CONFIG_UNKNOWN_KEYS",
     // audit (ADR 0066 T3)
     "MQTTD_AUDIT_SYSLOG",
+    // rule engine (ADR 0083)
+    "MQTTD_RULES_FILE",
     // admin API (ADR 0081)
     "MQTTD_ADMIN_BIND",
     "MQTTD_ADMIN_CERT",
@@ -3136,8 +3156,9 @@ mod tests {
             // plus MQTTD_REPLICAS (ADR 0080),
             // plus the seven MQTTD_ADMIN_* variables (ADR 0081).
             // plus MQTTD_HUB_INGRESS_BYTES, MQTTD_CONN_INGRESS_BYTES and
-            // MQTTD_INGRESS_OVERLOAD (ADR 0082 T3).
-            112,
+            // MQTTD_INGRESS_OVERLOAD (ADR 0082 T3),
+            // plus MQTTD_RULES_FILE (ADR 0083).
+            113,
             "the MQTTD_* surface changed — update ENV_VARS"
         );
         // Issue #239: MQTTD_MIN_REPLICAS was wired in `overlay_from` but never

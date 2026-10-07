@@ -878,6 +878,57 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::sink_records_through_a_trait_object`
 - `tests::tampering_with_any_field_changes_the_head`
 
+## `crates/mqtt-rules/src/lib.rs` — 48 test(s)
+
+- `funcs::tests::erlang_replacements_translate`
+- `funcs::tests::function_names_are_unique`
+- `funcs::tests::md5_known_answers`
+- `funcs::tests::offsets_parse`
+- `lexer::tests::operators`
+- `lexer::tests::quotes_follow_emqx`
+- `lexer::tests::ranges_numbers_and_comments`
+- `template::tests::quoted_keys`
+- `template::tests::renders_paths_and_missing_values`
+- `template::tests::this_is_the_whole_output`
+- `tests::a_bad_rendered_topic_fails_the_action_not_the_rule`
+- `tests::a_non_json_payload_fails_only_rules_that_reach_into_it`
+- `tests::arithmetic_follows_erlang`
+- `tests::case_expression_emqx_docs`
+- `tests::comments_and_case_insensitive_keywords`
+- `tests::comparison_semantics_follow_emqx`
+- `tests::conditional_functions`
+- `tests::conversion_functions_emqx_docs`
+- `tests::double_quoted_comparisons_warn_but_parse_as_fields`
+- `tests::events_are_selected_by_either_emqx_spelling`
+- `tests::every_function_is_documented_in_rules_md`
+- `tests::expressions_emqx_docs`
+- `tests::file_level_validation`
+- `tests::foreach_default_item_and_chained_aliases_emqx_docs`
+- `tests::foreach_over_a_non_array_yields_nothing_and_is_capped`
+- `tests::foreach_with_do_and_incase_emqx_docs`
+- `tests::hashing_encoding_and_bits_emqx_docs`
+- `tests::indices_and_ranges`
+- `tests::invalid_qos_fails_the_action`
+- `tests::load_errors_are_specific`
+- `tests::map_and_array_functions_emqx_docs`
+- `tests::matching_dedups_orders_and_skips_disabled_rules`
+- `tests::original_user_properties_keep_wire_order_and_duplicates`
+- `tests::republish_args_render`
+- `tests::republish_defaults_follow_emqx`
+- `tests::select_fields_and_aliases_emqx_docs`
+- `tests::select_star_has_emqx_fields`
+- `tests::string_functions_emqx_docs`
+- `tests::time_functions_emqx_docs`
+- `tests::topic_match_operator_and_topic_function`
+- `tests::type_judgment_functions_emqx_docs`
+- `tests::unaliased_payload_path_nests_under_payload`
+- `tests::user_properties_and_pub_props_emqx_docs`
+- `tests::where_filters_and_can_use_select_aliases`
+- `value::tests::binary_is_never_silently_json_encoded`
+- `value::tests::floats_render_like_emqx_str`
+- `value::tests::json_round_trip_keeps_key_order_and_types`
+- `value::tests::numbers_compare_across_int_and_float`
+
 ## `crates/mqtt-storage/src/lib.rs` — 91 test(s)
 
 - `app_props::tests::converts_to_and_from_core_properties_losslessly`
@@ -1020,7 +1071,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 538 test(s)
+## `crates/mqttd/src/lib.rs` — 540 test(s)
 
 - `admin::cli::tests::all_nodes_asks_for_the_cluster_scope_on_the_verbs_that_have_one`
 - `admin::cli::tests::answers_render_as_tables_and_lines`
@@ -1524,7 +1575,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `memory_watch::tests::a_status_without_vm_rss_yields_none_not_zero`
 - `memory_watch::tests::an_unreadable_rss_stops_the_watcher_instead_of_reporting_zero`
 - `memory_watch::tests::nearing_the_watermark_shortens_the_poll`
-- `memory_watch::tests::the_real_sampler_reports_a_plausible_rss_on_linux` — only when `cfg(target_os = "linux")`
+- `memory_watch::tests::the_real_sampler_reports_a_plausible_rss_on_linux`
 - `memory_watch::tests::the_watcher_drives_brownout_on_watermark_transitions`
 - `memory_watch::tests::vm_rss_is_parsed_in_bytes_from_the_right_line`
 - `memory_watch::tests::without_a_watermark_nothing_is_ever_browned_out`
@@ -1540,10 +1591,12 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `reload::tests::a_reload_swaps_the_gossip_crl_into_the_live_slot`
 - `reload::tests::a_reload_swaps_the_gossip_signer_and_a_bad_build_rejects_everything`
 - `reload::tests::a_reload_swaps_the_peer_bus_tls_material`
+- `reload::tests::a_reload_swaps_the_rules_and_a_bad_rules_file_keeps_the_running_ones`
 - `reload::tests::a_successful_reload_swaps_the_policy`
 - `reload::tests::checksum_is_sha256_lowercase_hex`
 - `reload::tests::committed_config_never_returns_a_rejected_candidate`
 - `reload::tests::reload_increments_the_metric_by_outcome`
+- `rules::tests::the_publisher_is_acked_only_when_everything_was_accepted`
 - `runtime_probe::tests::both_probes_feed_the_wake_histogram`
 - `store_probe::tests::probes_a_volume_and_cleans_up`
 - `store_probe::tests::sharding_pays_only_when_parallel_streams_are_nearly_independent`
@@ -1561,7 +1614,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tls_check::tests::nothing_configured_is_a_single_ok_line`
 - `tls_check::tests::valid_material_passes_and_reports_names`
 
-## `crates/mqttd/src/main.rs` — 20 test(s)
+## `crates/mqttd/src/main.rs` — 21 test(s)
 
 - `tests::a_non_durable_node_resolves_no_write_floor`
 - `tests::a_reload_proposes_a_changed_replication_factor`
@@ -1580,6 +1633,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::subscriber_limits_from_config_maps_every_knob`
 - `tests::the_config_and_the_authenticator_agree_on_identity_source_spellings`
 - `tests::the_peer_bus_tls_material_is_file_watched`
+- `tests::the_rules_file_is_file_watched`
 - `tests::unknown_flags_are_caught_and_known_ones_pass`
 - `tests::wire_limits_apply_config_and_preserve_floors`
 - `tests::wire_limits_default_config_matches_the_spec_floors`
@@ -1981,12 +2035,24 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 
 - `a_rolled_node_disconnects_only_its_own_clients`
 
+## `crates/mqttd/tests/rules.rs` — 9 test(s)
+
+- `a_matching_publish_is_transformed_and_republished_beside_the_original`
+- `a_qos1_publish_acks_and_its_derived_message_is_qos1`
+- `a_qos2_publish_fires_its_rules_once_across_a_dup_resend`
+- `a_refused_derived_message_withholds_the_publishers_ack`
+- `a_rule_republishing_into_its_own_from_cannot_loop`
+- `a_will_runs_rules_when_the_hub_publishes_it`
+- `client_events_run_rules`
+- `foreach_fans_one_publish_out`
+- `in_a_cluster_each_message_is_evaluated_once_on_its_landing_node`
+
 ## `crates/mqttd/tests/shared_membership.rs` — 6 test(s)
 
 - `membership_cpu_accounting_handles_parentheses_and_excludes_child_time`
 - `membership_fixture_delivers_exactly_once_across_all_arms`
 - `membership_peer_oracle_rejects_forwarding_even_with_local_receipts`
-- `membership_perf_ack_requires_complete_confirmation` — only when `cfg(target_os = "linux")`
+- `membership_perf_ack_requires_complete_confirmation`
 - `membership_receipt_oracle_rejects_loss_duplicates_and_stale_bursts`
 - `membership_tcp_fixture_receives_all_data_before_each_socket_fence`
 

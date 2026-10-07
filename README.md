@@ -342,7 +342,8 @@ Plaintext + anonymous: a first look, never a deployment. Secured version (TLS 1.
 | Integrations | |
 |---|---|
 | Bridge | `mqtt-bridge`: separate signed binary/image, deny-by-default directional rules, loop prevention, bounded spool, HA pairs |
-| Kafka / webhook / DB | `$share` consumer group on durable sessions ([INTEGRATION.md](docs/INTEGRATION.md)); no rule engine, by design |
+| Rule engine | EMQX-compatible rule SQL: filter, transform and re-route at QoS 0/1/2, evaluated once per message on the node it arrived at ([RULES.md](docs/RULES.md)) |
+| Kafka / webhook / DB | `$share` consumer group on durable sessions ([INTEGRATION.md](docs/INTEGRATION.md)); the rule engine has no sinks, by design |
 | Migration | converters for Mosquitto, EMQX, HiveMQ configs + ACLs → reviewed draft ([MIGRATION.md](docs/MIGRATION.md)) |
 | Plugins | HTTP auth hook; `Authenticator` / `Authorizer` traits; no dynamic loader |
 
@@ -475,7 +476,7 @@ Other published measurements (dev-grade, single host, never capacity): [DURABLE-
 | Admin dashboard | ✖ by design | ⚠️ 2.1: experimental | ✅ | 💰 | ⚠️ status page | ✖ |
 | **Integration** | | | | | | |
 | Bridge | ✅ | ✅ | ✅ | ✖ | ✅ | ✅ |
-| Rule engine | ✖ by design | ✖ | ✅ | ✖ | ✖ | ✅ |
+| Rule engine | ✅ EMQX rule SQL, no sinks | ✖ | ✅ | ✖ | ✖ | ✅ |
 | **Build & licence** | | | | | | |
 | Signed reproducible builds + SBOM | ✅ | ✖ | n/v | n/v | ✖ | ✖ |
 | FIPS variant | ✅ | ✖ | n/v | 💰 | ✖ | ✖ |
@@ -659,7 +660,7 @@ endpoint, roles, errors).
 - consensus for control (epochs, ownership), small replica sets for data
 - refuse at the edge: reason code or backpressure, never a silent drop
 - bridge is a separate process and failure domain
-- decisions: [`docs/adr/`](docs/adr/) (82 ADRs, per-task status) · tour: [ARCHITECTURE.md](docs/ARCHITECTURE.md) · [THREAT-MODEL.md](docs/THREAT-MODEL.md)
+- decisions: [`docs/adr/`](docs/adr/) (83 ADRs, per-task status) · tour: [ARCHITECTURE.md](docs/ARCHITECTURE.md) · [THREAT-MODEL.md](docs/THREAT-MODEL.md)
 
 **Workspace layout**
 
@@ -673,6 +674,7 @@ endpoint, roles, errors).
 | `mqtt-cluster` | SWIM, gossip auth, HRW placement, peer wire, durable plane |
 | `mqtt-observability` | Prometheus/OTLP metrics, hash-chained audit |
 | `mqtt-config` | typed config, secure defaults |
+| `mqtt-rules` | rule engine: EMQX-compatible rule SQL, republish/console actions |
 | `mqtt-bridge` | zone-crossing bridge: spool, QoS 1 replay |
 | `mqttd` | the broker binary: hub, connections, peer mesh |
 | `mqttd-operator` | Kubernetes operator for `MqttdCluster` |
@@ -709,7 +711,7 @@ Tracked on the [delivery dashboard](docs/delivery/STATUS.md).
 - **Security:** OSS-Fuzz ([#553](https://github.com/mbilling/fss-mqtt-broker/issues/553)); funded third-party audit ([#554](https://github.com/mbilling/fss-mqtt-broker/issues/554))
 - **Routing:** bloom subscription digests; MQTT 5 Server-Reference redirect
 - **Operator:** CRD promotion from `v1alpha1`
-- **Not planned, by decision:** dashboard, writing config over the network, SQL rule engine, MQTT-SN/CoAP
+- **Not planned, by decision:** dashboard, writing config over the network, rule-engine data sinks (Kafka/HTTP/DB), MQTT-SN/CoAP
 
 ---
 

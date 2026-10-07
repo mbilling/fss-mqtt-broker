@@ -1,0 +1,1135 @@
+//! The built-in SQL functions, by EMQX name and EMQX semantics.
+//!
+//! Every function here is named, typed and behaves as in EMQX's
+//! `rule-sql-builtin-functions` reference; the examples in that reference are this
+//! module's tests. A call with an argument of the wrong type fails the rule's SQL
+//! (counted as a failure), as EMQX's does.
+//!
+//! Deliberately absent (docs/RULES.md lists them): `jq`, the compression family
+//! (`gzip`/`zip`/`lz4_*`), the bit-sequence family (`subbits`, `bitsize`), schema
+//! registry and Sparkplug functions, `maptab_lookup`, the `MongoDB` date helpers, and
+//! `getenv` — a rule reading the broker's environment is a secret-exfiltration path.
+
+use std::sync::Arc;
+
+use std::fmt::Write as _;
+
+use base64::Engine as _;
+use regex::Regex;
+
+use crate::eval::{resolve_index, EvalCtx};
+use crate::value::{json_decode, Map, Value};
+use crate::EvalError;
+
+/// What a function sees beyond its arguments.
+pub(crate) struct FnCtx<'a> {
+    pub ctx: &'a EvalCtx<'a>,
+    /// The load-time-compiled pattern when the function's regex argument is a literal.
+    pub regex: Option<&'a Regex>,
+}
+
+/// A built-in function.
+pub(crate) struct Func {
+    pub name: &'static str,
+    pub min: usize,
+    pub max: usize,
+    pub f: fn(&[Value], &FnCtx) -> Result<Value, EvalError>,
+    /// Which argument is a regular expression (compiled once when it is a literal).
+    pub regex_arg: Option<usize>,
+}
+
+impl std::fmt::Debug for Func {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name)
+    }
+}
+
+const MANY: usize = usize::MAX;
+
+macro_rules! funcs {
+    ($( $name:literal $min:literal ..= $max:tt => $f:expr $(, regex $r:literal)? ;)*) => {
+        static FUNCS: &[Func] = &[
+            $( Func {
+                name: $name,
+                min: $min,
+                max: funcs!(@max $max),
+                f: $f,
+                regex_arg: funcs!(@re $($r)?),
+            }, )*
+        ];
+    };
+    (@max MANY) => { MANY };
+    (@max $n:literal) => { $n };
+    (@re) => { None };
+    (@re $r:literal) => { Some($r) };
+}
+
+funcs! {
+    // -- mathematical
+    "abs" 1..=1 => |a, _| match &a[0] {
+        Value::Int(n) => n.checked_abs().map(Value::Int).ok_or_else(overflow),
+        v => Value::float(num(v)?.abs()),
+    };
+    "acos" 1..=1 => |a, _| math(a, f64::acos);
+    "acosh" 1..=1 => |a, _| math(a, f64::acosh);
+    "asin" 1..=1 => |a, _| math(a, f64::asin);
+    "asinh" 1..=1 => |a, _| math(a, f64::asinh);
+    "atan" 1..=1 => |a, _| math(a, f64::atan);
+    "atanh" 1..=1 => |a, _| math(a, f64::atanh);
+    "ceil" 1..=1 => |a, _| to_int_value(num(&a[0])?.ceil());
+    "cos" 1..=1 => |a, _| math(a, f64::cos);
+    "cosh" 1..=1 => |a, _| math(a, f64::cosh);
+    "exp" 1..=1 => |a, _| math(a, f64::exp);
+    "floor" 1..=1 => |a, _| to_int_value(num(&a[0])?.floor());
+    "fmod" 2..=2 => |a, _| Value::float(num(&a[0])? % num(&a[1])?);
+    "log" 1..=1 => |a, _| math(a, f64::ln);
+    "log10" 1..=1 => |a, _| math(a, f64::log10);
+    "log2" 1..=1 => |a, _| math(a, f64::log2);
+    "round" 1..=1 => |a, _| to_int_value(num(&a[0])?.round());
+    "power" 2..=2 => |a, _| Value::float(num(&a[0])?.powf(num(&a[1])?));
+    "random" 0..=0 => |_, _| {
+        let mut b = [0u8; 8];
+        random_bytes(&mut b)?;
+        // 53 random bits → [0, 1).
+        #[allow(clippy::cast_precision_loss)]
+        Value::float((u64::from_le_bytes(b) >> 11) as f64 / (1u64 << 53) as f64)
+    };
+    "sin" 1..=1 => |a, _| math(a, f64::sin);
+    "sinh" 1..=1 => |a, _| math(a, f64::sinh);
+    "sqrt" 1..=1 => |a, _| math(a, f64::sqrt);
+    "tan" 1..=1 => |a, _| math(a, f64::tan);
+    "tanh" 1..=1 => |a, _| math(a, f64::tanh);
+
+    // -- data type judgment
+    "is_array" 1..=1 => |a, _| Ok(Value::Bool(matches!(a[0], Value::Array(_))));
+    "is_bool" 1..=1 => |a, _| Ok(Value::Bool(matches!(a[0], Value::Bool(_))));
+    "is_float" 1..=1 => |a, _| Ok(Value::Bool(matches!(a[0], Value::Float(_))));
+    "is_int" 1..=1 => |a, _| Ok(Value::Bool(matches!(a[0], Value::Int(_))));
+    "is_map" 1..=1 => |a, _| Ok(Value::Bool(matches!(a[0], Value::Map(_))));
+    "is_null" 1..=1 => |a, _| Ok(Value::Bool(a[0].is_undefined()));
+    "is_not_null" 1..=1 => |a, _| Ok(Value::Bool(!a[0].is_undefined()));
+    "is_null_var" 1..=1 => |a, _| Ok(Value::Bool(matches!(a[0], Value::Undefined | Value::Null)));
+    "is_not_null_var" 1..=1 => |a, _| Ok(Value::Bool(!matches!(a[0], Value::Undefined | Value::Null)));
+    "is_num" 1..=1 => |a, _| Ok(Value::Bool(a[0].is_number()));
+    "is_str" 1..=1 => |a, _| Ok(Value::Bool(a[0].is_binary()));
+    "is_empty" 1..=1 => |a, _| {
+        let v = decode_if_text(&a[0]);
+        Ok(Value::Bool(match &v {
+            Value::Array(x) => x.is_empty(),
+            Value::Map(m) => m.is_empty(),
+            Value::Str(s) => s.is_empty(),
+            Value::Bin(b) => b.is_empty(),
+            other => return Err(type_err("an array or a map", other)),
+        }))
+    };
+
+    // -- data type conversion
+    "bool" 1..=1 => |a, _| match &a[0] {
+        Value::Bool(b) => Ok(Value::Bool(*b)),
+        v if v.is_number() && (num(v)? - 1.0).abs() < f64::EPSILON => Ok(Value::Bool(true)),
+        v if v.is_number() && num(v)?.abs() < f64::EPSILON => Ok(Value::Bool(false)),
+        v => match v.as_str() {
+            Some("true") => Ok(Value::Bool(true)),
+            Some("false") => Ok(Value::Bool(false)),
+            _ => Err(EvalError::new(format!("cannot convert {} to a boolean", v.to_text()?))),
+        },
+    };
+    "float" 1..=2 => |a, _| {
+        let f = to_float(&a[0])?;
+        match a.get(1) {
+            None => Value::float(f),
+            Some(d) => {
+                let d = int(d)?;
+                if !(1..=253).contains(&d) {
+                    return Err(EvalError::new("decimals must be in 1..=253"));
+                }
+                let s = format!("{f:.prec$}", prec = usize::try_from(d).unwrap_or(1));
+                Value::float(s.parse().map_err(|_| EvalError::new("float conversion failed"))?)
+            }
+        }
+    };
+    "float2str" 2..=2 => |a, _| {
+        let f = to_float(&a[0])?;
+        let d = usize::try_from(int(&a[1])?).map_err(|_| EvalError::new("decimals must be >= 0"))?;
+        Ok(Value::from(compact_decimals(&format!("{f:.d$}"))))
+    };
+    "int" 1..=1 => |a, _| Ok(Value::Int(to_int(&a[0])?));
+    "str" 1..=1 => |a, _| Ok(Value::from(a[0].to_text()?));
+    "str_utf8" 1..=1 => |a, _| Ok(Value::from(a[0].to_text()?));
+    "str_utf16_le" 1..=1 => |a, _| {
+        let s = a[0].to_text()?;
+        Ok(Value::Bin(s.encode_utf16().flat_map(u16::to_le_bytes).collect::<Vec<u8>>().into()))
+    };
+    "map" 1..=1 => |a, _| match decode_if_text(&a[0]) {
+        m @ Value::Map(_) => Ok(m),
+        v => Err(type_err("a map or a JSON object", &v)),
+    };
+
+    // -- string operations
+    "ascii" 1..=1 => |a, _| Ok(Value::Int(text(&a[0])?.chars().next().map_or(0, |c| i64::from(u32::from(c)))));
+    "concat" 1..=MANY => |a, _| {
+        let parts: Vec<Value> = match a {
+            [Value::Array(list)] => list.as_ref().clone(),
+            _ => a.to_vec(),
+        };
+        let mut s = String::new();
+        for p in &parts {
+            s.push_str(&p.to_text()?);
+        }
+        Ok(Value::from(s))
+    };
+    "find" 2..=3 => |a, _| {
+        let (s, p) = (text(&a[0])?, text(&a[1])?);
+        let at = match direction(a.get(2), &["leading", "trailing"])? {
+            "trailing" => s.rfind(p),
+            _ => s.find(p),
+        };
+        Ok(Value::from(at.map_or("", |i| &s[i..])))
+    };
+    "join_to_string" 1..=2 => |a, _| {
+        let (sep, list) = match a {
+            [list] => (", ".to_string(), list),
+            [sep, list] => (text(sep)?.to_string(), list),
+            _ => unreachable!("arity checked at load"),
+        };
+        let items = array(list)?;
+        let parts = items.iter().map(Value::to_text).collect::<Result<Vec<_>, _>>()?;
+        Ok(Value::from(parts.join(&sep)))
+    };
+    "lower" 1..=1 => |a, _| Ok(Value::from(text(&a[0])?.to_lowercase()));
+    "ltrim" 1..=1 => |a, _| Ok(Value::from(text(&a[0])?.trim_start()));
+    "pad" 2..=4 => |a, _| {
+        let s = text(&a[0])?;
+        let len = usize::try_from(int(&a[1])?).unwrap_or(0);
+        let dir = direction(a.get(2), &["trailing", "leading", "both"])?;
+        let ch = a.get(3).map(text).transpose()?.unwrap_or(" ");
+        let missing = len.saturating_sub(s.chars().count());
+        let (left, right) = match dir {
+            "leading" => (missing, 0),
+            "both" => (missing / 2, missing - missing / 2),
+            _ => (0, missing),
+        };
+        Ok(Value::from(format!("{}{s}{}", ch.repeat(left), ch.repeat(right))))
+    };
+    "regex_match" 2..=2 => |a, cx| Ok(Value::Bool(regex(cx, &a[1])?.is_match(text(&a[0])?))), regex 1;
+    "regex_replace" 3..=3 => |a, cx| {
+        let re = regex(cx, &a[1])?;
+        let rep = erlang_replacement(text(&a[2])?);
+        Ok(Value::from(re.replace_all(text(&a[0])?, rep.as_str()).into_owned()))
+    }, regex 1;
+    "regex_extract" 2..=2 => |a, cx| {
+        let re = regex(cx, &a[1])?;
+        let groups = re.captures(text(&a[0])?).map_or_else(Vec::new, |c| {
+            c.iter().skip(1).flatten().map(|m| Value::from(m.as_str())).collect()
+        });
+        Ok(Value::from(groups))
+    }, regex 1;
+    "replace" 3..=4 => |a, _| {
+        let (s, p, r) = (text(&a[0])?, text(&a[1])?, text(&a[2])?);
+        if p.is_empty() {
+            return Ok(Value::from(s));
+        }
+        Ok(Value::from(match direction(a.get(3), &["all", "leading", "trailing"])? {
+            "leading" => s.replacen(p, r, 1),
+            "trailing" => match s.rfind(p) {
+                Some(i) => format!("{}{r}{}", &s[..i], &s[i + p.len()..]),
+                None => s.to_string(),
+            },
+            _ => s.replace(p, r),
+        }))
+    };
+    "reverse" 1..=1 => |a, _| Ok(Value::from(text(&a[0])?.chars().rev().collect::<String>()));
+    "rm_prefix" 2..=2 => |a, _| {
+        let (s, p) = (text(&a[0])?, text(&a[1])?);
+        Ok(Value::from(s.strip_prefix(p).unwrap_or(s)))
+    };
+    "rtrim" 1..=1 => |a, _| Ok(Value::from(text(&a[0])?.trim_end()));
+    "split" 2..=3 => |a, _| {
+        let (s, sep) = (text(&a[0])?, text(&a[1])?);
+        let opt = direction(
+            a.get(2),
+            &["trim", "notrim", "leading", "leading_notrim", "trailing", "trailing_notrim"],
+        )?;
+        let mut parts: Vec<&str> = if sep.is_empty() {
+            vec![s]
+        } else if opt.starts_with("leading") {
+            s.splitn(2, sep).collect()
+        } else if opt.starts_with("trailing") {
+            let mut v: Vec<&str> = s.rsplitn(2, sep).collect();
+            v.reverse();
+            v
+        } else {
+            s.split(sep).collect()
+        };
+        if !opt.ends_with("notrim") {
+            parts.retain(|p| !p.is_empty());
+        }
+        Ok(Value::from(parts.into_iter().map(Value::from).collect::<Vec<_>>()))
+    };
+    "sprintf" 1..=MANY => |a, _| sprintf(text(&a[0])?, &a[1..]);
+    "strlen" 1..=1 => |a, _| Ok(Value::Int(i64::try_from(text(&a[0])?.chars().count()).unwrap_or(i64::MAX)));
+    "substr" 2..=3 => |a, _| {
+        let s = text(&a[0])?;
+        let start = usize::try_from(int(&a[1])?).map_err(|_| EvalError::new("start must be >= 0"))?;
+        let it = s.chars().skip(start);
+        Ok(Value::from(match a.get(2) {
+            Some(l) => it.take(usize::try_from(int(l)?).unwrap_or(0)).collect::<String>(),
+            None => it.collect::<String>(),
+        }))
+    };
+    "tokens" 2..=3 => |a, _| {
+        let s = text(&a[0])?;
+        let mut seps: Vec<char> = text(&a[1])?.chars().collect();
+        if direction(a.get(2), &["", "nocrlf"])? == "nocrlf" {
+            seps.extend(['\r', '\n']);
+        }
+        Ok(Value::from(
+            s.split(|c| seps.contains(&c)).filter(|p| !p.is_empty()).map(Value::from).collect::<Vec<_>>(),
+        ))
+    };
+    "trim" 1..=1 => |a, _| Ok(Value::from(text(&a[0])?.trim()));
+    "unescape" 1..=1 => |a, _| unescape(text(&a[0])?).map(Value::from);
+    "upper" 1..=1 => |a, _| Ok(Value::from(text(&a[0])?.to_uppercase()));
+
+    // -- map operations
+    "map_new" 0..=0 => |_, _| Ok(Value::from(Map::new()));
+    "map_get" 2..=3 => |a, _| {
+        let path = dotted(text(&a[0])?);
+        Ok(get_path(&decode_if_text(&a[1]), &path).unwrap_or_else(|| a.get(2).cloned().unwrap_or_default()))
+    };
+    "map_put" 3..=3 => |a, _| Ok(put_path(decode_if_text(&a[2]), &dotted(text(&a[0])?), a[1].clone()));
+    "mget" 2..=3 => |a, _| {
+        let path = key_list(&a[0])?;
+        Ok(get_path(&decode_if_text(&a[1]), &path).unwrap_or_else(|| a.get(2).cloned().unwrap_or_default()))
+    };
+    "mput" 3..=3 => |a, _| Ok(put_path(decode_if_text(&a[2]), &key_list(&a[0])?, a[1].clone()));
+    "map_keys" 1..=1 => |a, _| Ok(Value::from(map(&a[0])?.iter().map(|(k, _)| Value::Str(k.clone())).collect::<Vec<_>>()));
+    "map_values" 1..=1 => |a, _| Ok(Value::from(map(&a[0])?.iter().map(|(_, v)| v.clone()).collect::<Vec<_>>()));
+    "map_size" 1..=1 => |a, _| Ok(Value::Int(i64::try_from(map(&a[0])?.len()).unwrap_or(i64::MAX)));
+    "map_to_entries" 1..=1 => |a, _| Ok(Value::from(
+        map(&a[0])?
+            .iter()
+            .map(|(k, v)| {
+                let mut e = Map::with_capacity(2);
+                e.insert("key", Value::Str(k.clone()));
+                e.insert("value", v.clone());
+                Value::from(e)
+            })
+            .collect::<Vec<_>>(),
+    ));
+
+    // -- array operations
+    "contains" 2..=2 => |a, _| Ok(Value::Bool(array(&a[1])?.iter().any(|x| same(x, &a[0]))));
+    "first" 1..=1 => |a, _| array(&a[0])?.first().cloned().ok_or_else(|| EvalError::new("first([]) is undefined"));
+    "last" 1..=1 => |a, _| array(&a[0])?.last().cloned().ok_or_else(|| EvalError::new("last([]) is undefined"));
+    "length" 1..=1 => |a, _| Ok(Value::Int(i64::try_from(array(&a[0])?.len()).unwrap_or(i64::MAX)));
+    "nth" 2..=2 => |a, _| {
+        let list = array(&a[1])?;
+        let n = int(&a[0])?;
+        if n < 1 {
+            return Err(EvalError::new("nth() positions start at 1"));
+        }
+        resolve_index(n, list.len())
+            .map(|i| list[i].clone())
+            .ok_or_else(|| EvalError::new(format!("nth({n}) is past the end of a {}-element array", list.len())))
+    };
+    "sublist" 2..=3 => |a, _| {
+        let (start, len, list) = match a {
+            [len, list] => (1, int(len)?, array(list)?),
+            [start, len, list] => (int(start)?, int(len)?, array(list)?),
+            _ => unreachable!("arity checked at load"),
+        };
+        if start < 1 || len < 0 {
+            return Err(EvalError::new("sublist() takes start >= 1 and length >= 0"));
+        }
+        let start = usize::try_from(start - 1).unwrap_or(usize::MAX);
+        let len = usize::try_from(len).unwrap_or(usize::MAX);
+        Ok(Value::from(list.iter().skip(start).take(len).cloned().collect::<Vec<_>>()))
+    };
+
+    // -- hashing
+    "md5" 1..=1 => |a, _| Ok(Value::from(mqtt_core::hex_lower(&md5(bin(&a[0])?))));
+    "sha" 1..=1 => |a, _| Ok(Value::from(digest(&aws_lc_rs::digest::SHA1_FOR_LEGACY_USE_ONLY, bin(&a[0])?)));
+    "sha256" 1..=1 => |a, _| Ok(Value::from(digest(&aws_lc_rs::digest::SHA256, bin(&a[0])?)));
+    "hash_to_range" 3..=3 => |a, _| {
+        let h = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, bin(&a[0])?);
+        range_map(h.as_ref(), &a[1], &a[2])
+    };
+    "map_to_range" 3..=3 => |a, _| match &a[0] {
+        Value::Int(n) => range_map(&n.to_be_bytes(), &a[1], &a[2]).and_then(|v| {
+            // A negative integer maps by its value, not its two's-complement bytes.
+            let (lo, hi) = (int(&a[1])?, int(&a[2])?);
+            if *n < 0 { Ok(Value::Int(lo + n.rem_euclid(hi - lo + 1))) } else { Ok(v) }
+        }),
+        v => {
+            let b = bin(v)?;
+            if b.is_empty() {
+                return Err(EvalError::new("map_to_range() needs a non-empty string"));
+            }
+            range_map(b, &a[1], &a[2])
+        }
+    };
+
+    // -- bit operations
+    "bitand" 2..=2 => |a, _| Ok(Value::Int(int(&a[0])? & int(&a[1])?));
+    "bitor" 2..=2 => |a, _| Ok(Value::Int(int(&a[0])? | int(&a[1])?));
+    "bitxor" 2..=2 => |a, _| Ok(Value::Int(int(&a[0])? ^ int(&a[1])?));
+    "bitnot" 1..=1 => |a, _| Ok(Value::Int(!int(&a[0])?));
+    "bitsl" 2..=2 => |a, _| {
+        let (n, s) = (int(&a[0])?, u32::try_from(int(&a[1])?).map_err(|_| EvalError::new("shift must be >= 0"))?);
+        let r = n.checked_shl(s).ok_or_else(overflow)?;
+        if r >> s != n { return Err(overflow()); }
+        Ok(Value::Int(r))
+    };
+    "bitsr" 2..=2 => |a, _| {
+        let (n, s) = (int(&a[0])?, int(&a[1])?);
+        let s = u32::try_from(s.clamp(0, 63)).unwrap_or(63);
+        Ok(Value::Int(n >> s))
+    };
+
+    // -- encoding and decoding
+    "base64_encode" 1..=3 => |a, _| {
+        let engine = base64_engine(&a[1..])?;
+        Ok(Value::from(engine.encode(bin(&a[0])?)))
+    };
+    "base64_decode" 1..=3 => |a, _| {
+        let engine = base64_engine(&a[1..])?;
+        let raw = engine.decode(bin(&a[0])?).map_err(|e| EvalError::new(format!("invalid base64: {e}")))?;
+        Ok(Value::from_bytes(&raw.into()))
+    };
+    "json_decode" 1..=1 => |a, _| json_decode(bin(&a[0])?);
+    "json_encode" 1..=1 => |a, _| Ok(Value::from(a[0].to_json()?));
+    "bin2hexstr" 1..=1 => |a, _| Ok(Value::from(mqtt_core::hex_lower(bin(&a[0])?).to_uppercase()));
+    "hexstr2bin" 1..=1 => |a, _| Ok(Value::from_bytes(&hex_decode(text(&a[0])?)?.into()));
+    "sqlserver_bin2hexstr" 1..=1 => |a, _| Ok(Value::from(format!("0x{}", mqtt_core::hex_lower(bin(&a[0])?).to_uppercase())));
+
+    // -- date and time
+    "now_timestamp" 0..=1 => |a, _| Ok(Value::Int(scale_from_nanos(now_nanos(), unit(a.first())?)));
+    "now_rfc3339" 0..=1 => |a, _| rfc3339(now_nanos(), unit(a.first())?);
+    "unix_ts_to_rfc3339" 1..=2 => |a, _| {
+        let u = unit(a.get(1))?;
+        rfc3339(i128::from(int(&a[0])?) * nanos_per(u), u)
+    };
+    "rfc3339_to_unix_ts" 1..=2 => |a, _| {
+        let t = chrono::DateTime::parse_from_rfc3339(text(&a[0])?)
+            .map_err(|e| EvalError::new(format!("not an RFC 3339 time: {e}")))?;
+        Ok(Value::Int(scale_from_nanos(datetime_nanos(&t), unit(a.get(1))?)))
+    };
+    "timezone_to_offset_seconds" 1..=1 => |a, _| Ok(Value::Int(i64::from(offset_seconds(&a[0])?)));
+    "format_date" 4..=4 => |a, _| {
+        let u = unit(Some(&a[0]))?;
+        let offset = chrono::FixedOffset::east_opt(offset_seconds(&a[1])?)
+            .ok_or_else(|| EvalError::new("time zone offset out of range"))?;
+        let nanos = i128::from(int(&a[3])?) * nanos_per(u);
+        let secs = i64::try_from(nanos.div_euclid(1_000_000_000)).map_err(|_| overflow())?;
+        let sub = u32::try_from(nanos.rem_euclid(1_000_000_000)).unwrap_or(0);
+        let t = chrono::DateTime::from_timestamp(secs, sub)
+            .ok_or_else(|| EvalError::new("time out of range"))?
+            .with_timezone(&offset);
+        format_time(&t, text(&a[2])?).map(Value::from)
+    };
+    "date_to_unix_ts" 3..=4 => |a, _| {
+        let u = unit(Some(&a[0]))?;
+        let (offset, fmt, input) = match a {
+            [_, f, s] => (None, text(f)?, text(s)?),
+            [_, o, f, s] => (Some(offset_seconds(o)?), text(f)?, text(s)?),
+            _ => unreachable!("arity checked at load"),
+        };
+        Ok(Value::Int(scale_from_nanos(parse_time(fmt, input, offset)?, u)))
+    };
+
+    // -- uuid
+    "uuid_v4" 0..=0 => |_, _| uuid_v4(true).map(Value::from);
+    "uuid_v4_no_hyphen" 0..=0 => |_, _| uuid_v4(false).map(Value::from);
+
+    // -- conditional
+    "coalesce" 1..=MANY => |a, _| Ok(candidates(a).into_iter().find(|v| !v.is_undefined()).unwrap_or(Value::Null));
+    "coalesce_ne" 1..=MANY => |a, _| Ok(candidates(a)
+        .into_iter()
+        .find(|v| !v.is_undefined() && v.as_bytes().is_none_or(|b| !b.is_empty()))
+        .unwrap_or(Value::Null));
+
+    // -- legacy accessors (EMQX keeps these for 4.x-era rules)
+    "topic" 0..=1 => |a, cx| {
+        let topic = cx.ctx.input.field("topic");
+        match a.first() {
+            None => Ok(topic),
+            Some(n) => {
+                let levels: Vec<&str> = topic.as_str().unwrap_or_default().split('/').collect();
+                let n = usize::try_from(int(n)?).unwrap_or(0);
+                levels.get(n.wrapping_sub(1)).map(|l| Value::from(*l))
+                    .ok_or_else(|| EvalError::new("topic level out of range"))
+            }
+        }
+    };
+    "clientid" 0..=0 => |_, cx| Ok(cx.ctx.input.field("clientid"));
+    "username" 0..=0 => |_, cx| Ok(cx.ctx.input.field("username"));
+    "qos" 0..=0 => |_, cx| Ok(cx.ctx.input.field("qos"));
+    "msgid" 0..=0 => |_, cx| Ok(cx.ctx.input.field("id"));
+    "flags" 0..=0 => |_, cx| Ok(cx.ctx.input.field("flags"));
+    "flag" 1..=1 => |a, cx| {
+        let name = text(&a[0])?;
+        Ok(get_path(&cx.ctx.input.field("flags"), &[Arc::from(name)]).unwrap_or_default())
+    };
+    "peerhost" 0..=0 => |_, cx| Ok(cx.ctx.input.field("peerhost"));
+    "clientip" 0..=0 => |_, cx| Ok(cx.ctx.input.field("peerhost"));
+    "payload" 0..=1 => |a, cx| {
+        let p = cx.ctx.input.field("payload");
+        match a.first() {
+            None => Ok(p),
+            Some(path) => Ok(get_path(&decode_if_text(&p), &dotted(text(path)?)).unwrap_or_default()),
+        }
+    };
+}
+
+/// Look up a function by name.
+pub(crate) fn lookup(name: &str) -> Option<&'static Func> {
+    FUNCS.iter().find(|f| f.name == name)
+}
+
+/// Every built-in function name, for documentation and its drift test.
+#[must_use]
+pub fn names() -> Vec<&'static str> {
+    FUNCS.iter().map(|f| f.name).collect()
+}
+
+/// A rule-supplied regular expression, compiled with bounded size: patterns can come
+/// from a payload, and the engine's linear-time guarantee only holds if a pattern
+/// cannot balloon its automaton.
+pub(crate) fn compile_regex(pattern: &str) -> Result<Regex, EvalError> {
+    regex::RegexBuilder::new(pattern)
+        .size_limit(1 << 20)
+        .dfa_size_limit(1 << 20)
+        .build()
+        .map_err(|e| EvalError::new(format!("invalid regular expression: {e}")))
+}
+
+fn regex<'a>(cx: &'a FnCtx, pattern: &Value) -> Result<std::borrow::Cow<'a, Regex>, EvalError> {
+    match cx.regex {
+        Some(re) => Ok(std::borrow::Cow::Borrowed(re)),
+        None => compile_regex(text(pattern)?).map(std::borrow::Cow::Owned),
+    }
+}
+
+/// Erlang `re:replace` replacement syntax (`&` = whole match, `\N` = group N) in the
+/// regex crate's (`${N}`), with any literal `$` escaped.
+fn erlang_replacement(rep: &str) -> String {
+    let mut out = String::with_capacity(rep.len());
+    let mut chars = rep.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '$' => out.push_str("$$"),
+            '&' => out.push_str("${0}"),
+            '\\' => match chars.peek() {
+                Some(d) if d.is_ascii_digit() => {
+                    let mut n = String::new();
+                    while let Some(d) = chars.peek().filter(|d| d.is_ascii_digit()) {
+                        n.push(*d);
+                        chars.next();
+                    }
+                    let _ = write!(out, "${{{n}}}");
+                }
+                Some(&x @ ('&' | '\\')) => {
+                    out.push(x);
+                    chars.next();
+                }
+                _ => out.push('\\'),
+            },
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+fn overflow() -> EvalError {
+    EvalError::new("integer overflow")
+}
+
+fn type_err(wanted: &str, got: &Value) -> EvalError {
+    EvalError::new(format!("expected {wanted}, got a {}", got.type_name()))
+}
+
+fn num(v: &Value) -> Result<f64, EvalError> {
+    v.as_f64().ok_or_else(|| type_err("a number", v))
+}
+
+fn int(v: &Value) -> Result<i64, EvalError> {
+    match v {
+        Value::Int(n) => Ok(*n),
+        v => Err(type_err("an integer", v)),
+    }
+}
+
+fn text(v: &Value) -> Result<&str, EvalError> {
+    v.as_str().ok_or_else(|| type_err("a string", v))
+}
+
+fn bin(v: &Value) -> Result<&[u8], EvalError> {
+    v.as_bytes().ok_or_else(|| type_err("a string", v))
+}
+
+fn array(v: &Value) -> Result<&[Value], EvalError> {
+    match v {
+        Value::Array(a) => Ok(a),
+        v => Err(type_err("an array", v)),
+    }
+}
+
+fn map(v: &Value) -> Result<&Map, EvalError> {
+    match v {
+        Value::Map(m) => Ok(m),
+        v => Err(type_err("a map", v)),
+    }
+}
+
+fn math(a: &[Value], f: fn(f64) -> f64) -> Result<Value, EvalError> {
+    Value::float(f(num(&a[0])?))
+}
+
+fn to_int_value(f: f64) -> Result<Value, EvalError> {
+    if f.is_finite() && (-9.223_372_036_854_775e18..=9.223_372_036_854_775e18).contains(&f) {
+        // Range-checked just above.
+        #[allow(clippy::cast_possible_truncation)]
+        Ok(Value::Int(f as i64))
+    } else {
+        Err(overflow())
+    }
+}
+
+fn to_float(v: &Value) -> Result<f64, EvalError> {
+    match v {
+        v if v.is_number() => num(v),
+        v => v
+            .as_str()
+            .and_then(|s| s.trim().parse::<f64>().ok())
+            .filter(|f| f.is_finite())
+            .ok_or_else(|| {
+                EvalError::new(format!(
+                    "cannot convert {} to a float",
+                    v.to_text().unwrap_or_default()
+                ))
+            }),
+    }
+}
+
+fn to_int(v: &Value) -> Result<i64, EvalError> {
+    match v {
+        Value::Int(n) => Ok(*n),
+        Value::Float(f) => match to_int_value(f.floor())? {
+            Value::Int(n) => Ok(n),
+            _ => Err(overflow()),
+        },
+        Value::Bool(b) => Ok(i64::from(*b)),
+        v => {
+            let s = v
+                .as_str()
+                .ok_or_else(|| type_err("a number, boolean or numeric string", v))?
+                .trim();
+            if let Ok(n) = s.parse::<i64>() {
+                return Ok(n);
+            }
+            match s.parse::<f64>().ok().filter(|f| f.is_finite()) {
+                Some(f) => to_int(&Value::Float(f)),
+                None => Err(EvalError::new(format!(
+                    "cannot convert '{s}' to an integer"
+                ))),
+            }
+        }
+    }
+}
+
+/// Trim trailing zeros the way Erlang's `compact` float option does.
+fn compact_decimals(s: &str) -> String {
+    if !s.contains('.') {
+        return s.to_string();
+    }
+    let t = s.trim_end_matches('0');
+    if t.ends_with('.') {
+        format!("{t}0")
+    } else {
+        t.to_string()
+    }
+}
+
+/// An optional direction/option argument, defaulting to `allowed[0]`.
+fn direction<'a>(v: Option<&'a Value>, allowed: &[&'static str]) -> Result<&'a str, EvalError> {
+    match v {
+        None => Ok(allowed[0]),
+        Some(v) => {
+            let s = text(v)?;
+            if allowed.contains(&s) {
+                Ok(s)
+            } else {
+                Err(EvalError::new(format!(
+                    "'{s}' is not one of {}",
+                    allowed.join(", ")
+                )))
+            }
+        }
+    }
+}
+
+/// A string that holds JSON is read as the JSON it holds (EMQX accepts JSON text
+/// wherever it accepts a map).
+fn decode_if_text(v: &Value) -> Value {
+    match v {
+        Value::Str(_) | Value::Bin(_) => {
+            json_decode(v.as_bytes().unwrap_or_default()).unwrap_or_else(|_| v.clone())
+        }
+        other => other.clone(),
+    }
+}
+
+/// `map_get` keys are dotted paths.
+fn dotted(key: &str) -> Vec<Arc<str>> {
+    key.split('.').map(Arc::from).collect()
+}
+
+/// `mget` / `mput` keys: one key, or an array of keys for a nested path.
+fn key_list(v: &Value) -> Result<Vec<Arc<str>>, EvalError> {
+    match v {
+        Value::Array(a) => a.iter().map(|k| Ok(Arc::from(k.to_text()?))).collect(),
+        k => Ok(vec![Arc::from(k.to_text()?)]),
+    }
+}
+
+fn get_path(v: &Value, path: &[Arc<str>]) -> Option<Value> {
+    let mut cur = v.clone();
+    for k in path {
+        cur = match decode_if_text(&cur) {
+            Value::Map(m) => m.get(k)?.clone(),
+            _ => return None,
+        };
+    }
+    Some(cur)
+}
+
+fn put_path(target: Value, path: &[Arc<str>], v: Value) -> Value {
+    let Some((k, rest)) = path.split_first() else {
+        return v;
+    };
+    let mut m = match target {
+        Value::Map(m) => Arc::unwrap_or_clone(m),
+        _ => Map::new(),
+    };
+    let child = m.remove(k).unwrap_or_default();
+    m.insert(k.clone(), put_path(decode_if_text(&child), rest, v));
+    Value::from(m)
+}
+
+/// Erlang `lists:member` equality: exact, so `2` is not a member of `[2.0]`.
+fn same(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Int(_), Value::Float(_)) | (Value::Float(_), Value::Int(_)) => false,
+        _ => a.loose_eq(b),
+    }
+}
+
+fn candidates(a: &[Value]) -> Vec<Value> {
+    match a {
+        [Value::Array(list)] => list.as_ref().clone(),
+        _ => a.to_vec(),
+    }
+}
+
+fn digest(alg: &'static aws_lc_rs::digest::Algorithm, data: &[u8]) -> String {
+    mqtt_core::hex_lower(aws_lc_rs::digest::digest(alg, data).as_ref())
+}
+
+/// Map `bytes`, read as an unsigned big-endian integer, into `[lo, hi]`.
+fn range_map(bytes: &[u8], lo: &Value, hi: &Value) -> Result<Value, EvalError> {
+    let (lo, hi) = (int(lo)?, int(hi)?);
+    if lo > hi {
+        return Err(EvalError::new("range minimum must not exceed its maximum"));
+    }
+    let span = u128::try_from(i128::from(hi) - i128::from(lo) + 1).map_err(|_| overflow())?;
+    // (a·256 + b) mod n, folded byte by byte, is the big integer's remainder.
+    let rem = bytes
+        .iter()
+        .fold(0u128, |acc, b| (acc * 256 + u128::from(*b)) % span);
+    Ok(Value::Int(lo + i64::try_from(rem).map_err(|_| overflow())?))
+}
+
+fn hex_decode(s: &str) -> Result<Vec<u8>, EvalError> {
+    if !s.len().is_multiple_of(2) {
+        return Err(EvalError::new("hex string has an odd number of digits"));
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(s.get(i..i + 2).unwrap_or("zz"), 16))
+        .collect::<Result<_, _>>()
+        .map_err(|_| EvalError::new("not a hex string"))
+}
+
+fn base64_engine(opts: &[Value]) -> Result<base64::engine::GeneralPurpose, EvalError> {
+    use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD};
+    let (mut url, mut no_pad) = (false, false);
+    for o in opts {
+        match text(o)? {
+            "urlsafe" => url = true,
+            "no_padding" => no_pad = true,
+            other => return Err(EvalError::new(format!("unknown base64 option '{other}'"))),
+        }
+    }
+    Ok(match (url, no_pad) {
+        (false, false) => STANDARD,
+        (false, true) => STANDARD_NO_PAD,
+        (true, false) => URL_SAFE,
+        (true, true) => URL_SAFE_NO_PAD,
+    })
+}
+
+fn random_bytes(buf: &mut [u8]) -> Result<(), EvalError> {
+    aws_lc_rs::rand::fill(buf).map_err(|_| EvalError::new("the system random source failed"))
+}
+
+fn uuid_v4(hyphens: bool) -> Result<String, EvalError> {
+    let mut b = [0u8; 16];
+    random_bytes(&mut b)?;
+    b[6] = (b[6] & 0x0f) | 0x40;
+    b[8] = (b[8] & 0x3f) | 0x80;
+    let h = mqtt_core::hex_lower(&b);
+    Ok(if hyphens {
+        format!(
+            "{}-{}-{}-{}-{}",
+            &h[0..8],
+            &h[8..12],
+            &h[12..16],
+            &h[16..20],
+            &h[20..32]
+        )
+    } else {
+        h
+    })
+}
+
+/// Erlang `io_lib:format` for the control sequences rules use: `~s`, `~p`, `~w`
+/// (any value as text), `~n` (newline) and `~~`.
+fn sprintf(fmt: &str, args: &[Value]) -> Result<Value, EvalError> {
+    let mut out = String::new();
+    let mut args = args.iter();
+    let mut chars = fmt.chars();
+    while let Some(c) = chars.next() {
+        if c != '~' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('~') => out.push('~'),
+            Some('n') => out.push('\n'),
+            Some('s' | 'p' | 'w') => {
+                let v = args
+                    .next()
+                    .ok_or_else(|| EvalError::new("sprintf: more ~ directives than arguments"))?;
+                out.push_str(&v.to_text()?);
+            }
+            other => {
+                return Err(EvalError::new(format!(
+                    "sprintf: unsupported directive ~{}",
+                    other.map(String::from).unwrap_or_default()
+                )))
+            }
+        }
+    }
+    if args.next().is_some() {
+        return Err(EvalError::new("sprintf: more arguments than ~ directives"));
+    }
+    Ok(Value::from(out))
+}
+
+/// C escapes and `\xH…` hex escapes, as EMQX's `unescape/1`.
+fn unescape(s: &str) -> Result<String, EvalError> {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        let e = chars
+            .next()
+            .ok_or_else(|| EvalError::new("unescape: dangling backslash"))?;
+        out.push(match e {
+            'n' => '\n',
+            't' => '\t',
+            'r' => '\r',
+            'b' => '\u{08}',
+            'f' => '\u{0c}',
+            'v' => '\u{0b}',
+            'a' => '\u{07}',
+            '\'' | '"' | '\\' | '?' => e,
+            'x' => {
+                let mut hex = String::new();
+                while let Some(h) = chars.peek().filter(|h| h.is_ascii_hexdigit()) {
+                    hex.push(*h);
+                    chars.next();
+                }
+                u32::from_str_radix(&hex, 16)
+                    .ok()
+                    .and_then(char::from_u32)
+                    .ok_or_else(|| EvalError::new("unescape: invalid \\x escape"))?
+            }
+            other => {
+                return Err(EvalError::new(format!(
+                    "unescape: unknown escape \\{other}"
+                )))
+            }
+        });
+    }
+    Ok(out)
+}
+
+/// MD5 (RFC 1321) for EMQX's `md5/1` — a data checksum here, not a security
+/// primitive, and the workspace crypto provider does not expose it. Variable names
+/// follow the RFC.
+#[allow(clippy::many_single_char_names)]
+fn md5(input: &[u8]) -> [u8; 16] {
+    const S: [u32; 64] = [
+        7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 5, 9, 14, 20, 5, 9, 14, 20, 5,
+        9, 14, 20, 5, 9, 14, 20, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 6, 10,
+        15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21,
+    ];
+    // K[i] = floor(|sin(i + 1)| · 2^32)
+    let k: Vec<u32> = (0..64u32)
+        .map(|i| {
+            // Exactly representable and < 2^32 by construction.
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let v = (f64::from(i + 1).sin().abs() * 4_294_967_296.0) as u32;
+            v
+        })
+        .collect();
+    let mut msg = input.to_vec();
+    let bit_len = (input.len() as u64).wrapping_mul(8);
+    msg.push(0x80);
+    while msg.len() % 64 != 56 {
+        msg.push(0);
+    }
+    msg.extend_from_slice(&bit_len.to_le_bytes());
+    let (mut a0, mut b0, mut c0, mut d0) = (
+        0x6745_2301u32,
+        0xefcd_ab89u32,
+        0x98ba_dcfeu32,
+        0x1032_5476u32,
+    );
+    for chunk in msg.chunks_exact(64) {
+        let m: Vec<u32> = chunk
+            .chunks_exact(4)
+            .map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
+            .collect();
+        let (mut a, mut b, mut c, mut d) = (a0, b0, c0, d0);
+        for i in 0..64 {
+            let (f, g) = match i / 16 {
+                0 => ((b & c) | (!b & d), i),
+                1 => ((d & b) | (!d & c), (5 * i + 1) % 16),
+                2 => (b ^ c ^ d, (3 * i + 5) % 16),
+                _ => (c ^ (b | !d), (7 * i) % 16),
+            };
+            let f = f.wrapping_add(a).wrapping_add(k[i]).wrapping_add(m[g]);
+            a = d;
+            d = c;
+            c = b;
+            b = b.wrapping_add(f.rotate_left(S[i]));
+        }
+        a0 = a0.wrapping_add(a);
+        b0 = b0.wrapping_add(b);
+        c0 = c0.wrapping_add(c);
+        d0 = d0.wrapping_add(d);
+    }
+    let mut out = [0u8; 16];
+    for (i, w) in [a0, b0, c0, d0].iter().enumerate() {
+        out[i * 4..i * 4 + 4].copy_from_slice(&w.to_le_bytes());
+    }
+    out
+}
+
+// -- time
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Unit {
+    Second,
+    Milli,
+    Micro,
+    Nano,
+}
+
+fn unit(v: Option<&Value>) -> Result<Unit, EvalError> {
+    Ok(match v.map(text).transpose()? {
+        None | Some("second") => Unit::Second,
+        Some("millisecond") => Unit::Milli,
+        Some("microsecond") => Unit::Micro,
+        Some("nanosecond") => Unit::Nano,
+        Some(other) => {
+            return Err(EvalError::new(format!(
+                "unknown time unit '{other}' (second, millisecond, microsecond, nanosecond)"
+            )))
+        }
+    })
+}
+
+fn nanos_per(u: Unit) -> i128 {
+    match u {
+        Unit::Second => 1_000_000_000,
+        Unit::Milli => 1_000_000,
+        Unit::Micro => 1_000,
+        Unit::Nano => 1,
+    }
+}
+
+fn now_nanos() -> i128 {
+    let d = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    i128::try_from(d.as_nanos()).unwrap_or(i128::MAX)
+}
+
+fn scale_from_nanos(nanos: i128, u: Unit) -> i64 {
+    i64::try_from(nanos.div_euclid(nanos_per(u))).unwrap_or(i64::MAX)
+}
+
+fn datetime_nanos<Tz: chrono::TimeZone>(t: &chrono::DateTime<Tz>) -> i128 {
+    i128::from(t.timestamp()) * 1_000_000_000 + i128::from(t.timestamp_subsec_nanos())
+}
+
+/// An RFC 3339 string in the system's local offset, at the unit's precision.
+fn rfc3339(nanos: i128, u: Unit) -> Result<Value, EvalError> {
+    let secs = i64::try_from(nanos.div_euclid(1_000_000_000)).map_err(|_| overflow())?;
+    let sub = u32::try_from(nanos.rem_euclid(1_000_000_000)).unwrap_or(0);
+    let t = chrono::DateTime::from_timestamp(secs, sub)
+        .ok_or_else(|| EvalError::new("time out of range"))?
+        .with_timezone(&chrono::Local);
+    let fmt = match u {
+        Unit::Second => chrono::SecondsFormat::Secs,
+        Unit::Milli => chrono::SecondsFormat::Millis,
+        Unit::Micro => chrono::SecondsFormat::Micros,
+        Unit::Nano => chrono::SecondsFormat::Nanos,
+    };
+    Ok(Value::from(t.to_rfc3339_opts(fmt, false)))
+}
+
+/// `Z`, `local`, `±hh[:mm][:ss]`, `±hh[mm][ss]`, or seconds as an integer.
+fn offset_seconds(v: &Value) -> Result<i32, EvalError> {
+    if let Value::Int(n) = v {
+        return i32::try_from(*n).map_err(|_| EvalError::new("time zone offset out of range"));
+    }
+    let s = text(v)?;
+    match s {
+        "Z" | "z" => return Ok(0),
+        "local" => return Ok(chrono::Local::now().offset().local_minus_utc()),
+        _ => {}
+    }
+    let bad = || EvalError::new(format!("'{s}' is not a time zone offset"));
+    let (sign, rest) = match s.as_bytes().first() {
+        Some(b'+') => (1, &s[1..]),
+        Some(b'-') => (-1, &s[1..]),
+        _ => return Err(bad()),
+    };
+    let digits: String = rest.chars().filter(|c| *c != ':').collect();
+    if !matches!(digits.len(), 2 | 4 | 6) || !digits.chars().all(|c| c.is_ascii_digit()) {
+        return Err(bad());
+    }
+    let part = |i: usize| {
+        digits
+            .get(i..i + 2)
+            .and_then(|p| p.parse::<i32>().ok())
+            .unwrap_or(0)
+    };
+    let (h, m, sec) = (part(0), part(2), part(4));
+    if h > 23 || m > 59 || sec > 59 {
+        return Err(bad());
+    }
+    Ok(sign * (h * 3600 + m * 60 + sec))
+}
+
+/// EMQX's date placeholders in chrono's: `%N` → nanoseconds, `%6N` → micro, `%3N` →
+/// milli; the rest (`%Y %m %d %H %M %S %z %:z %::z`) are already chrono's.
+fn chrono_format(fmt: &str) -> String {
+    fmt.replace("%6N", "%6f")
+        .replace("%3N", "%3f")
+        .replace("%N", "%9f")
+}
+
+fn checked_items(fmt: &str) -> Result<Vec<chrono::format::Item<'_>>, EvalError> {
+    let items: Vec<_> = chrono::format::StrftimeItems::new(fmt).collect();
+    if items
+        .iter()
+        .any(|i| matches!(i, chrono::format::Item::Error))
+    {
+        return Err(EvalError::new(format!("invalid date format '{fmt}'")));
+    }
+    Ok(items)
+}
+
+fn format_time(t: &chrono::DateTime<chrono::FixedOffset>, fmt: &str) -> Result<String, EvalError> {
+    let fmt = chrono_format(fmt);
+    let items = checked_items(&fmt)?;
+    Ok(t.format_with_items(items.into_iter()).to_string())
+}
+
+fn parse_time(fmt: &str, input: &str, offset: Option<i32>) -> Result<i128, EvalError> {
+    let fmt = chrono_format(fmt);
+    checked_items(&fmt)?;
+    if let Ok(t) = chrono::DateTime::parse_from_str(input, &fmt) {
+        return Ok(datetime_nanos(&t));
+    }
+    // No offset in the string: parse it naive and apply the given one.
+    let naive_fmt = fmt.replace("%::z", "").replace("%:z", "").replace("%z", "");
+    let naive = chrono::NaiveDateTime::parse_from_str(input, &naive_fmt)
+        .map_err(|e| EvalError::new(format!("'{input}' does not match '{fmt}': {e}")))?;
+    let off = chrono::FixedOffset::east_opt(offset.unwrap_or(0))
+        .ok_or_else(|| EvalError::new("time zone offset out of range"))?;
+    let t = naive
+        .and_local_timezone(off)
+        .single()
+        .ok_or_else(|| EvalError::new("ambiguous local time"))?;
+    Ok(datetime_nanos(&t))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn md5_known_answers() {
+        // RFC 1321 appendix A.5, plus EMQX's own example.
+        assert_eq!(
+            mqtt_core::hex_lower(&md5(b"")),
+            "d41d8cd98f00b204e9800998ecf8427e"
+        );
+        assert_eq!(
+            mqtt_core::hex_lower(&md5(b"abc")),
+            "900150983cd24fb0d6963f7d28e17f72"
+        );
+        assert_eq!(
+            mqtt_core::hex_lower(&md5(
+                b"12345678901234567890123456789012345678901234567890123456789012345678901234567890"
+            )),
+            "57edf4a22be3c955ac49da2e2107b67a"
+        );
+        assert_eq!(
+            mqtt_core::hex_lower(&md5(b"hello")),
+            "5d41402abc4b2a76b9719d911017c592"
+        );
+    }
+
+    #[test]
+    fn erlang_replacements_translate() {
+        assert_eq!(erlang_replacement(r"<\1>&$"), "<${1}>${0}$$");
+    }
+
+    #[test]
+    fn offsets_parse() {
+        assert_eq!(offset_seconds(&Value::from("+08:00")).unwrap(), 28_800);
+        assert_eq!(offset_seconds(&Value::from("-0130")).unwrap(), -5_400);
+        assert_eq!(offset_seconds(&Value::from("+08:20:30")).unwrap(), 30_030);
+        assert!(offset_seconds(&Value::from("8")).is_err());
+    }
+
+    #[test]
+    fn function_names_are_unique() {
+        let mut names = names();
+        let n = names.len();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), n, "a function is registered twice");
+    }
+}

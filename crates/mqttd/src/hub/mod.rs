@@ -673,6 +673,9 @@ pub struct Will {
     pub message: Message,
     /// Will Delay Interval in seconds (§3.1.3.2.2); `0` publishes immediately.
     pub delay_secs: u32,
+    /// Who set it — the CONNECT username and the client's address — for the rule
+    /// engine, which evaluates a Will when the hub publishes it (ADR 0083).
+    pub publisher: crate::rules::Publisher,
 }
 
 /// A currently-online client connection.
@@ -1320,6 +1323,10 @@ pub enum HubCommand {
     /// grants are revoked at the moment delivery could resume. Sent once at
     /// startup, before any listener accepts.
     AttachAuthorizer(AuthzWatch),
+    /// Hand the hub the rule engine (ADR 0083), which it runs on the one publish it
+    /// originates for a client: the Will. Client publishes are evaluated on their
+    /// connection tasks, never here. Sent once at startup, before any listener accepts.
+    AttachRules(crate::rules::Rules),
 
     /// A peer node's link came up; register it and send our interest snapshot.
     PeerConnected {
@@ -1709,6 +1716,7 @@ impl HubCommand {
             | Self::SetBrownout { .. }
             | Self::SweepIdentities(_)
             | Self::AttachAuthorizer(_)
+            | Self::AttachRules(_)
             | Self::RemoteRetainedUpdate { .. }
             | Self::RemoteRetainedSnapshot { .. }
             | Self::RemoteRetainedDigest { .. }
@@ -1745,6 +1753,7 @@ impl HubCommand {
             | Self::Evict { .. }
             | Self::SweepIdentities(_)
             | Self::AttachAuthorizer(_)
+            | Self::AttachRules(_)
             | Self::Ping { .. }
             | Self::Flush { .. } => "control",
             #[cfg(test)]
@@ -2125,6 +2134,8 @@ pub struct Hub {
     /// (no re-check) until [`HubCommand::AttachAuthorizer`] arrives — harnesses
     /// without a reloadable policy keep today's restore-as-persisted behavior.
     authz: Option<AuthzWatch>,
+    /// The rule engine (ADR 0083), for Wills; `None` until [`HubCommand::AttachRules`].
+    rules: Option<crate::rules::Rules>,
     /// Brownout (ADR 0041 T5 disk, T8 memory): set while **any** watched resource is
     /// over its watermark — the stores' on-disk size above `MQTTD_STORE_MAX_BYTES`, or
     /// process RSS above `MQTTD_MEMORY_MAX_BYTES`. Growth writes (new retained topics,
@@ -2557,6 +2568,7 @@ impl Hub {
                 retained: Arc::new(MemoryRetainedStore::new()),
                 durable_retained: None,
                 authz: None,
+                rules: None,
                 brownout: false,
                 brownout_axes: HashSet::new(),
                 brownout_status: None,
@@ -3162,6 +3174,9 @@ impl Hub {
             HubCommand::AttachAuthorizer(watch) => {
                 self.authz = Some(watch);
             }
+            HubCommand::AttachRules(rules) => {
+                self.rules = Some(rules);
+            }
             // Peer- and cluster-facing commands.
             other => self.dispatch_cluster(other).await,
         }
@@ -3730,11 +3745,34 @@ impl Hub {
     /// still delivered LIVE and counted as a genuine drop — never suppressed. A Will
     /// suppressed under brownout is a device that stays "online" on every dashboard
     /// through exactly the incident [MQTT-3.14.4-3] exists for.
-    async fn publish_will(&mut self, w: &Message) {
+    ///
+    /// A Will is a publish like any other to the rule engine (EMQX runs its rules on
+    /// one, ADR 0083), and the hub is what publishes it, so the hub evaluates it. What
+    /// the rules produce is posted back as ordinary publishes — through the same
+    /// dispatch (quota checks included) as any other — and is ungated like the Will.
+    async fn publish_will(&mut self, client: &ClientId, will: &Will) {
+        let w = &will.message;
         self.publish(
             &w.topic, &w.payload, w.qos, w.retain, None, &w.app, None, None,
         )
         .await;
+        let Some(rules) = &self.rules else { return };
+        let derived = rules.on_publish(&crate::rules::PublishFacts {
+            client,
+            publisher: &will.publisher,
+            topic: &w.topic,
+            payload: &w.payload,
+            qos: w.qos,
+            retain: w.retain,
+            dup: false,
+            app: &w.app,
+            message_expiry: None,
+        });
+        for r in derived {
+            let _ = self
+                .self_tx
+                .send(crate::rules::derived_command(r, None, None));
+        }
     }
 
     /// Log when a persistent session attaches on a node that is not its placement
@@ -4107,7 +4145,7 @@ impl Hub {
         if let Some(old) = self.online.remove(&client) {
             warn!(client = %client.0, "session takeover: replacing existing connection");
             if let Some(w) = old.will {
-                self.publish_will(&w.message).await;
+                self.publish_will(&client, &w).await;
             }
         }
         self.online.insert(
@@ -5171,7 +5209,7 @@ impl Hub {
         let hold = w.delay_secs.min(expiry);
         if hold == 0 {
             info!(client = %client.0, topic = %w.message.topic, "publishing will (ungraceful disconnect)");
-            self.publish_will(&w.message).await;
+            self.publish_will(client, &w).await;
         } else {
             let due = Instant::now() + Duration::from_secs(u64::from(hold));
             info!(
@@ -5459,7 +5497,7 @@ impl Hub {
                 client = %client.0, topic = %will.message.topic,
                 "publishing will (delay elapsed)"
             );
-            self.publish_will(&will.message).await;
+            self.publish_will(&client, &will).await;
         }
 
         // Issue #504: connections_active can hit 0 while sessions linger in
@@ -7944,6 +7982,7 @@ mod tests {
     ) -> (mpsc::UnboundedReceiver<Box<Packet>>, bool) {
         // Delay 0: these predate Will Delay and assert the publish-at-once path.
         let will = Will {
+            publisher: crate::rules::Publisher::default(),
             message: will,
             delay_secs: 0,
         };
@@ -8796,6 +8835,7 @@ mod tests {
             session_expiry: 0,
             receive_maximum: u16::MAX,
             will: Some(Box::new(Will {
+                publisher: crate::rules::Publisher::default(),
                 delay_secs: 0,
                 message: mqtt_core::Message {
                     topic: "wills/victim".into(),
@@ -17278,6 +17318,7 @@ mod tests {
             1,
             u32::MAX,
             Some(Will {
+                publisher: crate::rules::Publisher::default(),
                 delay_secs: 0,
                 message: Message {
                     topic: "wills/284".into(),
@@ -17315,6 +17356,7 @@ mod tests {
             2,
             u32::MAX,
             Some(Will {
+                publisher: crate::rules::Publisher::default(),
                 delay_secs: 0,
                 message: Message {
                     topic: "wills/284".into(),

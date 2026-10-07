@@ -294,6 +294,88 @@ pub struct ConnPolicy {
     /// The node's ingress credit for client publishes (ADR 0082 T3). `None` disables
     /// it (tests that do not exercise it).
     pub ingress: Option<Arc<crate::ingress::IngressCredit>>,
+    /// The rule engine (ADR 0083): evaluated on the connection task for every
+    /// authorized publish and for this client's connect/disconnect/subscribe/
+    /// unsubscribe events. Its rule set is behind a `watch`, so a reload reaches live
+    /// connections. `None` = rules not wired (tests).
+    pub rules: Option<crate::rules::Rules>,
+}
+
+/// Why a connection ended, as `$events/client/disconnected` reports it (ADR 0083).
+/// EMQX's names where mqttd can tell the same thing apart; `server_closed` covers the
+/// broker ending the session (a takeover, an eviction, a protocol violation) and
+/// `shutdown` the ADR 0019 drain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum CloseReason {
+    TcpClosed,
+    Normal,
+    ServerClosed,
+    KeepaliveTimeout,
+    Shutdown,
+}
+
+impl CloseReason {
+    const ALL: [Self; 5] = [
+        Self::TcpClosed,
+        Self::Normal,
+        Self::ServerClosed,
+        Self::KeepaliveTimeout,
+        Self::Shutdown,
+    ];
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::TcpClosed => "tcp_closed",
+            Self::Normal => "normal",
+            Self::ServerClosed => "server_closed",
+            Self::KeepaliveTimeout => "keepalive_timeout",
+            Self::Shutdown => "shutdown",
+        }
+    }
+}
+
+/// What the rule engine knows about one connection (ADR 0083): who the client is, as
+/// a rule sees it, and why the connection ended, recorded by `serve` at each exit.
+/// Shared by reference across `serve`'s awaits, hence the atomic.
+#[derive(Debug)]
+struct RuleConn {
+    publisher: crate::rules::Publisher,
+    close_reason: std::sync::atomic::AtomicU8,
+}
+
+impl RuleConn {
+    fn closing(&self, reason: CloseReason) {
+        self.close_reason.store(reason as u8, Ordering::Relaxed);
+    }
+
+    fn close_reason(&self) -> &'static str {
+        let i = usize::from(self.close_reason.load(Ordering::Relaxed));
+        CloseReason::ALL
+            .get(i)
+            .copied()
+            .unwrap_or(CloseReason::TcpClosed)
+            .as_str()
+    }
+
+    /// Record why a packet ended the session and return `serve`'s graceful flag: only a
+    /// client DISCONNECT with reason `0x00` is graceful (issue #238/#265).
+    fn ended(&self, end: PacketOutcome) -> bool {
+        match end {
+            PacketOutcome::ClientDisconnect => {
+                self.closing(CloseReason::Normal);
+                true
+            }
+            PacketOutcome::ClientDisconnectWithWill => {
+                self.closing(CloseReason::Normal);
+                false
+            }
+            PacketOutcome::BrokerClose | PacketOutcome::Continue => {
+                self.closing(CloseReason::ServerClosed);
+                false
+            }
+        }
+    }
 }
 
 /// Default [`ConnPolicy::connect_timeout`]: generous for a real handshake on a slow
@@ -371,6 +453,7 @@ pub async fn handle(stream: TcpStream, hub: mpsc::UnboundedSender<HubCommand>) {
         shutdown: None,
         metrics: None,
         ingress: None,
+        rules: None,
     });
     handle_stream(stream, peer, None, policy, hub).await;
 }
@@ -671,6 +754,9 @@ where
         return Ok(());
     };
 
+    // A relocated session's socket peer is the relaying node, not the client
+    // (ADR 0005), so the rule engine is not told it.
+    let relocated = via.is_some();
     // Authentication gate: verify credentials BEFORE attaching to the hub, so a
     // rejected client never touches session state (enhanced exchange or single-shot).
     let Some((principal, auth_method)) = authenticate(
@@ -727,7 +813,18 @@ where
     }
 
     let conn_id = CONN_ID.fetch_add(1, Ordering::Relaxed);
-    let will = connect.last_will.map(into_will);
+    // Who this client is to the rule engine (ADR 0083) — its publishes, its events,
+    // and its Will, which the hub publishes (and evaluates) after it has gone.
+    let rule_conn = RuleConn {
+        publisher: crate::rules::Publisher {
+            username: connect.username.clone(),
+            peer: if relocated { None } else { peer },
+        },
+        close_reason: std::sync::atomic::AtomicU8::new(CloseReason::TcpClosed as u8),
+    };
+    let will = connect
+        .last_will
+        .map(|w| into_will(w, rule_conn.publisher.clone()));
     // The writer half owns the outbound METER and calls it as it drains, so the hub
     // can see how far behind this client is — in packets and in bytes (issue #241) —
     // and shed `QoS 0` rather than queue it without limit (#123).
@@ -858,6 +955,28 @@ where
     }
     debug!(client = %client.0, session_present, "CONNECT accepted");
     count_connection_opened(policy, connect.protocol);
+    let connected_at = mqtt_rules::now_ms();
+    if let Some(rules) = &policy.rules {
+        if rules.wants(mqtt_rules::EventKind::ClientConnected) {
+            let info = rules.client_info(&client, &rule_conn.publisher);
+            let proto_ver = if connect.protocol == ProtocolVersion::V5 {
+                5
+            } else {
+                4
+            };
+            rules.fire_event(
+                &mqtt_rules::EventInput::client_connected(
+                    &info,
+                    proto_ver,
+                    connect.keep_alive,
+                    clean_start,
+                    session_expiry,
+                    connected_at,
+                ),
+                &hub,
+            );
+        }
+    }
 
     // The connect Authentication Method (if any) bounds a later re-auth (ADR 0013 §4).
     let auth_method = connect
@@ -886,6 +1005,7 @@ where
         session_expiry,
         &mut session_expiry_override,
         watch,
+        &rule_conn,
     )
     .await;
     count_connection_closed(policy);
@@ -898,11 +1018,27 @@ where
     // reported as a client DISCONNECT (issue #238).
     let graceful = matches!(result, Ok(true));
     let _ = hub.send(HubCommand::Detach {
-        client,
+        client: client.clone(),
         conn_id,
         graceful,
         session_expiry_override,
     });
+    if let Some(rules) = &policy.rules {
+        if rules.wants(mqtt_rules::EventKind::ClientDisconnected) {
+            // A socket error ends the session as a closed connection, whatever `serve`
+            // was doing when it hit it.
+            let reason = if result.is_err() {
+                "tcp_closed"
+            } else {
+                rule_conn.close_reason()
+            };
+            let info = rules.client_info(&client, &rule_conn.publisher);
+            rules.fire_event(
+                &mqtt_rules::EventInput::client_disconnected(&info, reason, connected_at),
+                &hub,
+            );
+        }
+    }
     result.map(|_| ())
 }
 
@@ -1481,7 +1617,7 @@ where
 /// Convert a CONNECT's Last Will into a deferred [`Will`], carrying the will's
 /// application properties so a published will forwards them too (MQTT-3.3.2-17, ADR 0030)
 /// and the Will Delay Interval the hub holds it for (§3.1.3.2.2, issue #299).
-fn into_will(w: mqtt_codec::packet::LastWill) -> Will {
+fn into_will(w: mqtt_codec::packet::LastWill, publisher: crate::rules::Publisher) -> Will {
     let app = app_properties(&w.properties);
     // The Will Delay Interval lives in the WILL's property block, not the CONNECT's
     // — a distinct set, decoded from the payload alongside the topic and payload.
@@ -1496,6 +1632,7 @@ fn into_will(w: mqtt_codec::packet::LastWill) -> Will {
         .unwrap_or(0);
     Will {
         delay_secs,
+        publisher,
         message: Message {
             topic: w.topic,
             payload: w.payload,
@@ -1831,6 +1968,9 @@ async fn serve<R, W>(
     session_expiry_override: &mut Option<u32>,
     // The client's TCP socket, watched for a hangup while `parked` (#825).
     watch: Option<&PeerClosedWatch>,
+    // The rule engine's view of this connection (ADR 0083); `serve` records why it
+    // ended.
+    rule_conn: &RuleConn,
 ) -> Result<bool, NetError>
 where
     R: AsyncRead + Unpin,
@@ -1910,6 +2050,7 @@ where
                     if is_v5 {
                         let _ = disconnect(writer, reason).await;
                     }
+                    rule_conn.closing(CloseReason::ServerClosed);
                     return Ok(false);
                 }
                 match inbound? {
@@ -1954,11 +2095,9 @@ where
                         // [MQTT-3.14.4-3]); so is a v5 DISCONNECT with a non-zero
                         // reason, where the CLIENT asks for its Will (issue #265,
                         // [MQTT-3.1.2-10]).
-                        match handle_inbound(packet, writer, hub, client, &principal, policy, &mut qos2_inbound, &mut qos2_inflight, &mut pending_pubacks, &mut current, is_v5, inbound_aliases, session_expiry, session_expiry_override, admission).await? {
+                        match handle_inbound(packet, writer, hub, client, &principal, policy, &mut qos2_inbound, &mut qos2_inflight, &mut pending_pubacks, &mut current, is_v5, inbound_aliases, session_expiry, session_expiry_override, admission, rule_conn).await? {
                             PacketOutcome::Continue => {}
-                            PacketOutcome::ClientDisconnect => return Ok(true),
-                            PacketOutcome::ClientDisconnectWithWill
-                            | PacketOutcome::BrokerClose => return Ok(false),
+                            end => return Ok(rule_conn.ended(end)),
                         }
                     }
                 }
@@ -1973,11 +2112,9 @@ where
                 // The broker paused this client, not the client going quiet: the
                 // keepalive restarts from the moment reading resumes.
                 deadline = grace.map(|g| Instant::now() + g);
-                match handle_inbound(packet, writer, hub, client, &principal, policy, &mut qos2_inbound, &mut qos2_inflight, &mut pending_pubacks, &mut current, is_v5, inbound_aliases, session_expiry, session_expiry_override, IngressAdmit::Credit(Some(permit))).await? {
+                match handle_inbound(packet, writer, hub, client, &principal, policy, &mut qos2_inbound, &mut qos2_inflight, &mut pending_pubacks, &mut current, is_v5, inbound_aliases, session_expiry, session_expiry_override, IngressAdmit::Credit(Some(permit)), rule_conn).await? {
                     PacketOutcome::Continue => {}
-                    PacketOutcome::ClientDisconnect => return Ok(true),
-                    PacketOutcome::ClientDisconnectWithWill
-                    | PacketOutcome::BrokerClose => return Ok(false),
+                    end => return Ok(rule_conn.ended(end)),
                 }
             }
             outcome = async {
@@ -1990,6 +2127,7 @@ where
                 let mut entry = current.take().expect("guarded");
                 qos2_inflight = qos2_inflight.saturating_sub(1);
                 if !apply_publish_outcome(&mut entry, outcome, is_v5, client) {
+                    rule_conn.closing(CloseReason::ServerClosed);
                     return Ok(false);
                 }
                 writer.send(&Packet::PubAck(entry.ack)).await?;
@@ -2013,6 +2151,7 @@ where
                 )
                 .await?
                 {
+                    rule_conn.closing(CloseReason::ServerClosed);
                     return Ok(false);
                 }
                 // Batch the whole current backlog into one write + flush (issue
@@ -2026,6 +2165,7 @@ where
                 let Some(mut pkt) = maybe_out else {
                     // The hub dropped our sender: taken over by a new connection
                     // for this client id, or the hub shut down.
+                    rule_conn.closing(CloseReason::ServerClosed);
                     return Ok(false);
                 };
                 for _ in 0..OUTBOUND_BATCH_MAX {
@@ -2085,6 +2225,7 @@ where
                     _ => {
                         debug!(client = %client.0, keep_alive, "keepalive expired; closing connection");
                         count_connection_error(policy, "keepalive");
+                        rule_conn.closing(CloseReason::KeepaliveTimeout);
                         return Ok(false);
                     }
                 }
@@ -2101,6 +2242,7 @@ where
                     // gone, which the graceful close handles anyway.
                     let _ = disconnect(writer, DISCONNECT_SERVER_SHUTTING_DOWN).await;
                 }
+                rule_conn.closing(CloseReason::Shutdown);
                 return Ok(true);
             }
         }
@@ -2187,6 +2329,7 @@ async fn handle_publish<W: AsyncWrite + Unpin>(
     is_v5: bool,
     inbound_aliases: &mut InboundAliases,
     admission: IngressAdmit,
+    rule_conn: &RuleConn,
 ) -> Result<PacketOutcome, NetError> {
     // The MQTT 5.0 Message Expiry Interval (if the publisher set one) bounds how long
     // a queued copy is deliverable (ADR 0009 §3).
@@ -2226,6 +2369,7 @@ async fn handle_publish<W: AsyncWrite + Unpin>(
         pkid,
         payload,
         retain,
+        dup,
         ..
     } = publish;
     // [MQTT-3.3.2-2] / [MQTT-4.7.3-1]: a PUBLISH topic name MUST NOT contain
@@ -2297,11 +2441,37 @@ async fn handle_publish<W: AsyncWrite + Unpin>(
                     return None;
                 }
             };
+            // The rule engine (ADR 0083) runs HERE: after the ACL, on this
+            // connection's task, once per publish on the node it arrived at — so rule
+            // work scales with connections and nodes and never runs on the hub loop.
+            // What the rules republish follows the original into the hub, and a gated
+            // original's ack waits for it too (`rules::send_derived`).
+            let derived = match &policy.rules {
+                Some(rules) => rules.on_publish(&crate::rules::PublishFacts {
+                    client,
+                    publisher: &rule_conn.publisher,
+                    topic: &topic,
+                    payload: &payload,
+                    qos,
+                    retain,
+                    dup,
+                    app: &app,
+                    message_expiry,
+                }),
+                None => Vec::new(),
+            };
             let (done, rx) = if gated {
                 let (tx, rx) = oneshot::channel();
                 (Some(tx), Some(rx))
             } else {
                 (None, None)
+            };
+            // With derived messages behind it, the credit rides the batch's LAST
+            // command so it is held until the whole batch has been dispatched.
+            let (credit, batch_credit) = if derived.is_empty() {
+                (credit, None)
+            } else {
+                (None, credit)
             };
             let _ = hub.send(HubCommand::Publish {
                 topic,
@@ -2315,7 +2485,11 @@ async fn handle_publish<W: AsyncWrite + Unpin>(
                 publisher: Some(client.clone()), // #198: No Local excludes this publisher
                 credit,
             });
-            rx
+            if derived.is_empty() {
+                rx
+            } else {
+                crate::rules::send_derived(hub, rx, derived, batch_credit)
+            }
         } else {
             None
         }
@@ -2646,6 +2820,8 @@ async fn handle_inbound<W: AsyncWrite + Unpin>(
     session_expiry_override: &mut Option<u32>,
     // The ingress credit a PUBLISH carries (ADR 0082 T3); ignored for anything else.
     admission: IngressAdmit,
+    // The rule engine's view of this connection (ADR 0083).
+    rule_conn: &RuleConn,
 ) -> Result<PacketOutcome, NetError> {
     match packet {
         Packet::Publish(publish) => {
@@ -2666,6 +2842,7 @@ async fn handle_inbound<W: AsyncWrite + Unpin>(
                 is_v5,
                 inbound_aliases,
                 admission,
+                rule_conn,
             )
             .await?
             {
@@ -2801,6 +2978,15 @@ async fn handle_inbound<W: AsyncWrite + Unpin>(
                     }
                 }
             }
+            // `$events/session/subscribed` (ADR 0083): one per filter the SUBACK
+            // granted, after the SUBACK, as EMQX fires it.
+            let subscribed: Vec<(String, u8)> = s
+                .filters
+                .iter()
+                .zip(&return_codes)
+                .filter(|(_, code)| **code < 0x80)
+                .map(|(f, code)| (f.path.clone(), *code))
+                .collect();
             writer
                 .send(&Packet::SubAck(SubAck {
                     pkid: s.pkid,
@@ -2808,6 +2994,17 @@ async fn handle_inbound<W: AsyncWrite + Unpin>(
                     properties: mqtt_codec::Properties::new(),
                 }))
                 .await?;
+            if let Some(rules) = &policy.rules {
+                if rules.wants(mqtt_rules::EventKind::SessionSubscribed) {
+                    let info = rules.client_info(client, &rule_conn.publisher);
+                    for (filter, qos) in subscribed {
+                        rules.fire_event(
+                            &mqtt_rules::EventInput::session_subscribed(&info, &filter, qos),
+                            hub,
+                        );
+                    }
+                }
+            }
         }
         Packet::Unsubscribe(u) => {
             // One reason code per filter, in request order [MQTT-3.11.3-1]
@@ -2855,6 +3052,15 @@ async fn handle_inbound<W: AsyncWrite + Unpin>(
                     }
                 }
             }
+            // `$events/session/unsubscribed` (ADR 0083): one per filter that was
+            // actually removed.
+            let removed: Vec<String> = u
+                .filters
+                .iter()
+                .zip(&reason_codes)
+                .filter(|(_, code)| **code == 0x00)
+                .map(|(f, _)| f.clone())
+                .collect();
             writer
                 .send(&Packet::UnsubAck(mqtt_codec::packet::UnsubAck {
                     pkid: u.pkid,
@@ -2862,6 +3068,17 @@ async fn handle_inbound<W: AsyncWrite + Unpin>(
                     properties: mqtt_codec::Properties::new(),
                 }))
                 .await?;
+            if let Some(rules) = &policy.rules {
+                if rules.wants(mqtt_rules::EventKind::SessionUnsubscribed) {
+                    let info = rules.client_info(client, &rule_conn.publisher);
+                    for filter in removed {
+                        rules.fire_event(
+                            &mqtt_rules::EventInput::session_unsubscribed(&info, &filter),
+                            hub,
+                        );
+                    }
+                }
+            }
         }
         Packet::PingReq => writer.send(&Packet::PingResp).await?,
         Packet::Disconnect(d) => {
@@ -3000,6 +3217,7 @@ mod tests {
             shutdown: None,
             metrics: None,
             ingress: None,
+            rules: None,
         })
     }
 
@@ -3036,6 +3254,7 @@ mod tests {
             shutdown: None,
             metrics: None,
             ingress: None,
+            rules: None,
         });
         tokio::spawn(handle_stream(server, None, None, policy, hub_tx));
         let (rh, wh) = tokio::io::split(client);
@@ -3242,6 +3461,7 @@ mod tests {
             shutdown: Some(shutdown),
             metrics: None,
             ingress: None,
+            rules: None,
         });
         tokio::spawn(handle_stream(server, None, None, policy, hub_tx));
         let (rh, wh) = tokio::io::split(client);
@@ -3358,6 +3578,7 @@ mod tests {
             shutdown: None,
             metrics: Some(metrics.clone()),
             ingress: None,
+            rules: None,
         });
         let conn = tokio::spawn(handle_stream(server, None, None, policy, hub_tx));
         let (rh, wh) = tokio::io::split(client);
@@ -3413,6 +3634,7 @@ mod tests {
             shutdown: None,
             metrics: Some(metrics.clone()),
             ingress: None,
+            rules: None,
         });
         let conn = tokio::spawn(handle_stream(server, None, None, policy, hub_tx));
         let (rh, wh) = tokio::io::split(client);
@@ -3516,6 +3738,7 @@ mod tests {
             shutdown: None,
             metrics: None,
             ingress: None,
+            rules: None,
         });
         tokio::spawn(handle_stream(server, None, None, policy, hub_tx));
         let (rh, wh) = tokio::io::split(client);
@@ -3743,6 +3966,7 @@ mod tests {
             shutdown: None,
             metrics: None,
             ingress: None,
+            rules: None,
         });
         let conn = tokio::spawn(handle_stream(server, None, None, policy, hub_tx));
 
@@ -3879,6 +4103,7 @@ mod tests {
             shutdown: None,
             metrics: None,
             ingress: None,
+            rules: None,
         });
 
         let (client, owner_side) = tokio::io::duplex(4096);
@@ -3952,6 +4177,7 @@ mod tests {
                 shutdown: None,
                 metrics: None,
                 ingress: None,
+                rules: None,
             });
             let (client, owner_side) = tokio::io::duplex(4096);
             let (owner_read, owner_write) = tokio::io::split(owner_side);
@@ -4591,6 +4817,7 @@ mod tests {
             shutdown: None,
             metrics: None,
             ingress: None,
+            rules: None,
         });
         tokio::spawn(handle_stream(server, None, None, policy, hub_tx));
         let (rh, wh) = tokio::io::split(client);
@@ -4879,6 +5106,7 @@ mod tests {
             shutdown: None,
             metrics: None,
             ingress: None,
+            rules: None,
         });
         tokio::spawn(handle_stream(server, None, None, policy, hub_tx));
         let (rh, wh) = tokio::io::split(client);

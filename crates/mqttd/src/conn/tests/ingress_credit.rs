@@ -18,6 +18,7 @@ fn policy(credit: Option<Arc<IngressCredit>>, metrics: Option<Arc<Metrics>>) -> 
     let base = permissive();
     Arc::new(ConnPolicy {
         ingress: credit,
+        rules: None,
         metrics,
         ..(*base).clone()
     })

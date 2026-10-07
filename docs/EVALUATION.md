@@ -13,11 +13,13 @@ persistent sessions must survive the loss of the node that accepted them without
 an ops runbook. Durable, quorum-replicated sessions are the default, not an
 add-on.
 
-**No, if** you need a vendor dashboard, a SQL rule engine, or built-in
-Kafka/HTTP sinks. Those are recorded absences ([ADR 0063](adr/0063-external-consumer-integration.md),
+**No, if** you need a vendor dashboard or built-in Kafka/HTTP sinks. Those are
+recorded absences ([ADR 0063](adr/0063-external-consumer-integration.md),
 [COMPARISON.md](COMPARISON.md) losing cells), not gaps on a roadmap you can wait
 out. External consumers are an ordinary MQTT `$share` group; see
-[INTEGRATION.md](INTEGRATION.md).
+[INTEGRATION.md](INTEGRATION.md). Filtering, reshaping and re-routing messages inside
+the broker is covered (unreleased, after `v1.0.18`): mqttd runs EMQX's rule SQL with
+`republish` and `console` ([RULES.md](RULES.md), [ADR 0083](adr/0083-rule-engine.md)).
 
 **Not yet, if** your decision hinges on a measured near-linear scale-out curve
 across QoS 0/1/2. Horizontal scalability is an architectural claim with

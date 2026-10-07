@@ -49,6 +49,7 @@ the operator.
 | Revoked-but-connected clients | Policy reload sweeps **live** sessions: identity revocation terminates, permission tightening removes grants | ADR 0040; `mqttd/src/reload.rs` |
 | TLS downgrade / weak crypto | TLS 1.3 only by default (1.2 is per-listener opt-in); one audited build site, no skip-verification path, one crypto provider passed explicitly | ADR 0002, 0053; `mqtt-net/src/tls.rs` |
 | QUIC 0-RTT replay | `max_early_data_size = 0` — 0-RTT disabled | ADR 0036; `mqtt-net/src/quic.rs:52` |
+| A rule republishing where its publisher cannot | Not mitigated by the ACL, by design: the ACL decides whether the *original* is accepted, and what a rule derives from it is operator configuration with the ACL file's trust (see the control-plane accepted risks). A derived message carries no publisher identity and never re-enters the rule engine, so a client cannot steer one rule's output into another | ADR 0083 §3; `mqttd/src/rules.rs` |
 
 ### Repudiation
 
@@ -67,6 +68,7 @@ id, never a credential.
 | Slow/stalled subscribers | Per-subscriber bounds on backlog (messages **and** bytes — accounting includes topic+properties, or it would be evadable ~100×), in-flight window, outbound socket bytes | ADR 0041 T10; `mqttd/src/backpressure.rs` |
 | Publish floods | Read-pause (TCP backpressure), not drops or kills; in-flight overrun is a protocol error (`0x93`) | ADR 0012, 0041; `mqttd/src/conn.rs` |
 | Disk/memory exhaustion | Watermarks → **brownout**: growth writes refused effect-free while acks/reads/expiry continue; two independent axes ORed; refusal travels cross-node as a peer-bus verdict | ADR 0041 T5/T8/T12; `mqttd/src/store_watch.rs`, `hub/policy.rs` |
+| Rule work driven by payloads (deep JSON, hostile regex patterns, `FOREACH` fan-out) | Rules evaluate on the publisher's own connection task, never the hub loop; payload JSON is decoded once with serde_json's recursion limit; regular expressions use a linear-time engine with compiled-size limits, because a rule may apply a pattern read from a payload; at most 256 `FOREACH` outputs and 1,024 derived messages per publish; checked arithmetic; an evaluation error fails the rule, never the message or the connection; derived messages ride the original's ingress permit. Both untrusted inputs (the rules file, payloads under fixed rules) are nightly fuzz targets | ADR 0083 §8; `mqtt-rules`, `mqtt-rules/fuzz` |
 
 ### Accepted risks (client surface)
 
@@ -184,7 +186,7 @@ id, never a credential.
 
 ### Design posture
 
-There is **no dashboard and no rule engine**, and **configuration is never written
+There is **no dashboard**, and **configuration is never written
 over the network** (ADR 0033/0051, kept by ADR 0081 §5): the file stays the only source.
 The lifecycle surface is signals and files: SIGHUP reload, SIGUSR1 decommission, SIGUSR2
 backup, SIGTERM drain. The unauthenticated HTTP surface is strictly read-only GET/HEAD
@@ -217,6 +219,7 @@ short, fixed list of audited actions:
 | Secret leakage via config | Secrets referenced by path only, never inlined; unknown config keys refuse (listing all) unless the rollback-window hatch is set | ADR 0046 T5, 0058 T4 |
 | Operator (Kubernetes) overreach | Every destructive remediation opt-in per scenario, defaults Alert; **no action deletes data, ever** (fenced PVCs are labelled, not deleted); ambiguous evidence → no action; at most one destructive act per reconcile | ADR 0055; `mqttd-operator/src/remediate.rs` |
 | Repudiation of admin acts | Reloads, sweeps, backups audited into the same hash-chained log | ADR 0004/0032 |
+| A rules file as an injection path | The rules file is operator configuration on disk, like the ACL file: loaded all-or-nothing, a file that does not load refuses the boot and rejects a reload with the running rules kept; no network verb writes it; actions are confined to the broker (`republish`, `console` — a sink action is refused at load), and `getenv` is not provided, so a rule cannot read the broker's environment; `mqttd_rules_info{checksum}` exposes per-node drift | ADR 0083 §5/§6/§8; `mqttd/src/reload.rs`, `mqtt-rules` |
 
 ### Accepted risks (control plane)
 
@@ -228,6 +231,10 @@ short, fixed list of audited actions:
   certificate, key and CA are restart-scoped (the role lists hot-reload). An admitted
   cluster node can read any node's state through the `peer` role, consistent with the
   peer-bus trust model above.
+- **A rule can publish where its publisher cannot.** Whoever writes the rules file
+  can derive messages onto any topic from any accepted publish, bypassing the
+  publisher's ACL for the derived copy, and can amplify one publish into up to 1,024.
+  That is the ACL file's trust level, held by the same operator. (ADR 0083.)
 - **Metrics/health are unauthenticated by design** on the ops network; they carry
   no secrets, but topology and load are visible to anyone who can reach the port.
   (ADR 0020 §2.)

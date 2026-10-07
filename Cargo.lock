@@ -2072,6 +2072,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "mqtt-rules"
+version = "1.0.18"
+dependencies = [
+ "aws-lc-rs",
+ "base64 0.22.1",
+ "bytes",
+ "chrono",
+ "criterion",
+ "mqtt-core",
+ "regex",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "toml",
+]
+
+[[package]]
 name = "mqtt-storage"
 version = "1.0.18"
 dependencies = [
@@ -2106,6 +2123,7 @@ dependencies = [
  "mqtt-core",
  "mqtt-net",
  "mqtt-observability",
+ "mqtt-rules",
  "mqtt-storage",
  "quinn",
  "rcgen",
