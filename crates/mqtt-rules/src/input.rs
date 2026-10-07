@@ -186,6 +186,8 @@ pub struct PublishInput<'a> {
     pub node: &'a str,
     id: OnceCell<Arc<str>>,
     received: OnceCell<i64>,
+    /// `timestamp`, read once per message so every reference agrees.
+    stamped: OnceCell<i64>,
     /// `pub_props`, built once per message however many references read it.
     pub_props: OnceCell<Value>,
 }
@@ -216,8 +218,14 @@ impl<'a> PublishInput<'a> {
             node: "",
             id: OnceCell::new(),
             received: OnceCell::new(),
+            stamped: OnceCell::new(),
             pub_props: OnceCell::new(),
         }
+    }
+
+    fn received_at(&self) -> i64 {
+        self.received_at_ms
+            .unwrap_or_else(|| *self.received.get_or_init(now_ms))
     }
 
     fn flags(&self) -> Value {
@@ -262,13 +270,16 @@ impl Input for PublishInput<'_> {
                 .pub_props
                 .get_or_init(|| Value::from(pub_props(self.props, self.message_expiry)))
                 .clone(),
-            "publish_received_at" => Value::Int(
-                self.received_at_ms
-                    .unwrap_or_else(|| *self.received.get_or_init(now_ms)),
-            ),
+            "publish_received_at" => Value::Int(self.received_at()),
             "client_attrs" => Value::from(Map::new()),
             "event" => Value::from("message.publish"),
-            "timestamp" => Value::Int(now_ms()),
+            // EMQX's event time: when the rule engine first looked, never before the
+            // message arrived, and the same for every reference in every rule.
+            "timestamp" => Value::Int(
+                *self
+                    .stamped
+                    .get_or_init(|| now_ms().max(self.received_at())),
+            ),
             "node" => Value::from(self.node),
             _ => Value::Undefined,
         }
@@ -371,7 +382,8 @@ impl EventInput {
         insert_addr(&mut m, "sockname", c.sockname);
         m.insert("reason", Value::from(reason));
         m.insert("connected_at", Value::Int(connected_at_ms));
-        m.insert("disconnected_at", Value::Int(now_ms()));
+        let at = m.get("timestamp").cloned().unwrap_or_default();
+        m.insert("disconnected_at", at);
         m.insert("disconn_props", Value::from(Map::new()));
         Self { kind, fields: m }
     }

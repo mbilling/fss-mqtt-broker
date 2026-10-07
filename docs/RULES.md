@@ -759,7 +759,7 @@ leading wildcard does not match a `$`-topic.
 | `qos` | 0, 1 or 2 |
 | `flags` | `{"dup": …, "retain": …}` |
 | `pub_props` | MQTT 5 properties under their spec names: `User-Property` (a map; a repeated key keeps its last value), `User-Property-Pairs` (every pair, in order), `Content-Type`, `Response-Topic`, `Correlation-Data`, `Payload-Format-Indicator`, `Message-Expiry-Interval`. A publish that carried none (every MQTT 3.1.1 publish) has only an empty `User-Property` map, so `${pub_props.'Content-Type'}` renders `undefined`. |
-| `publish_received_at` / `timestamp` | Milliseconds since the epoch |
+| `publish_received_at` / `timestamp` | Milliseconds since the epoch: when the broker received the message / when the rules looked at it. Each is read once per message, so every reference in every rule sees the same value, and `timestamp` is never earlier than `publish_received_at` |
 | `node` | This node's id |
 | `event` | `message.publish` |
 | `metadata` | `{"rule_id": …}` |

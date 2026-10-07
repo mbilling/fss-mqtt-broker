@@ -1369,3 +1369,41 @@ fn failures_are_reported_once_per_interval_per_rule() {
     );
     assert!(a.failure_report_due(1_010, 10));
 }
+
+/// `timestamp` is the message's event time, read once: a statement that selects it
+/// twice — raw and formatted, as the cookbook's enrichment recipe does — and a second
+/// rule on the same message all see one instant, however long evaluation takes, and
+/// it is never earlier than `publish_received_at`.
+#[test]
+fn a_message_has_one_timestamp_however_often_it_is_read() {
+    let props = mqtt_core::AppProperties::default();
+    let payload = Bytes::new();
+    let input = PublishInput::new("c", "t/a", &payload, 0, &props);
+    let Value::Int(first) = input.field("timestamp") else {
+        panic!("timestamp is not an integer");
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while now_ms() <= first {
+        assert!(std::time::Instant::now() < deadline, "the clock never moved");
+        std::hint::spin_loop();
+    }
+    assert_eq!(input.field("timestamp"), Value::Int(first));
+    let Value::Int(received) = input.field("publish_received_at") else {
+        panic!("publish_received_at is not an integer");
+    };
+    assert!(received <= first, "{received} > {first}");
+    let sql = "SELECT timestamp AS ms, unix_ts_to_rfc3339(timestamp, 'millisecond') AS at FROM \"t/#\"";
+    let out = test_sql(sql, &input).unwrap();
+    let millis = format!(".{:03}+00:00", first % 1000);
+    assert!(
+        out.len() == 1
+            && out[0].starts_with(&format!(r#"{{"ms":{first},"at":""#))
+            && out[0].ends_with(&format!(r#"{millis}"}}"#)),
+        "{out:?}"
+    );
+    assert_eq!(test_sql(sql, &input).unwrap(), out, "a second rule saw another instant");
+
+    let mut later = PublishInput::new("c", "t/a", &payload, 0, &props);
+    later.received_at_ms = Some(first + 60_000);
+    assert_eq!(later.field("timestamp"), Value::Int(first + 60_000));
+}
