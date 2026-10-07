@@ -258,6 +258,29 @@ async fn a_qos1_publish_acks_and_its_derived_message_is_qos1() {
     sub.puback(p.pkid.unwrap()).await;
 }
 
+/// The `QoS` default trap, as in EMQX: `qos = "${qos}"` reads the rule's OUTPUT, so a
+/// rule that does not select `qos` republishes at `QoS` 0 even from a `QoS` 1 publish —
+/// a `QoS` 1 subscriber receives it at `QoS` 0. (The publisher is still acked.)
+#[tokio::test]
+async fn a_rule_that_does_not_select_qos_republishes_a_qos1_publish_at_qos0() {
+    let broker = start_broker(ALERT).await;
+    let mut sub = Client::connect(broker.addr, "sub0").await;
+    sub.subscribe(1, "alerts/#", QoS::AtLeastOnce).await;
+    let mut publ = Client::connect(broker.addr, "dev2").await;
+    publ.publish(
+        "sensors/dev2/data",
+        br#"{"temp":40}"#,
+        QoS::AtLeastOnce,
+        Some(6),
+        vec![],
+    )
+    .await;
+    assert_eq!(publ.recv().await, Packet::PubAck(6.into()));
+    let p = sub.expect_publish().await;
+    assert_eq!(p.topic, "alerts/dev2");
+    assert_eq!(p.qos, QoS::AtMostOnce, "not selected, so not inherited");
+}
+
 /// `QoS` 2 exactly-once inbound reaches what the rules produce: a DUP resend of a
 /// PUBREC'd packet id is answered from the dedup window and NOT re-forwarded, so its
 /// rules do not fire a second time.
@@ -328,6 +351,50 @@ fn brownout(broker: &Broker) {
             on: true,
         })
         .unwrap();
+}
+
+/// What an event derives is counted by its fate, not when it is sent: a presence
+/// message the broker stores is `ok`, one it refuses (a brownout, and it needs storage
+/// for an offline subscriber) is `failed`. Nobody else would ever learn of it — an
+/// event answers no publisher.
+#[tokio::test]
+async fn an_event_derived_message_is_counted_by_its_fate() {
+    const PRESENCE: &str = r#"
+[rules.presence]
+sql = 'SELECT clientid FROM "$events/client/disconnected"'
+actions = [{ function = "republish", args = { topic = "presence/${clientid}", payload = "offline", qos = 1 } }]
+"#;
+    let broker = start_broker(PRESENCE).await;
+    let counted = |result: &'static str, n: u64| {
+        let broker = &broker;
+        async move {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            while action_count(broker, "presence", result) != n {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "presence {result}: expected {n}, have {}",
+                    action_count(broker, "presence", result)
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+    };
+    // The watcher's own disconnect raises one, stored for its now-offline session.
+    park_a_sleeper(&broker, "watcher", "presence/#").await;
+    counted("ok", 1).await;
+    let mut a = Client::connect(broker.addr, "dev-a").await;
+    a.disconnect().await;
+    counted("ok", 2).await;
+
+    let mut b = Client::connect(broker.addr, "dev-b").await;
+    brownout(&broker);
+    b.disconnect().await;
+    counted("failed", 1).await;
+    assert_eq!(
+        action_count(&broker, "presence", "ok"),
+        2,
+        "refused, so not ok"
+    );
 }
 
 /// A derived message the broker refuses (brownout: it needs storage) fails its action;

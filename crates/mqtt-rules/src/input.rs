@@ -402,6 +402,21 @@ impl EventInput {
         m.insert("unsub_props", Value::from(Map::new()));
         Self { kind, fields: m }
     }
+
+    /// A sample of `kind` for `mqttd --rule-test`, EMQX's "SQL test" for event rules:
+    /// the client's own fields, the given `topic` and `qos` for the subscribe events,
+    /// and plausible values for the rest (MQTT 5, keepalive 60, a clean start, a
+    /// `normal` disconnect one second after connecting).
+    #[must_use]
+    pub fn sample(kind: EventKind, c: &ClientInfo, topic: &str, qos: u8) -> Self {
+        let now = now_ms();
+        match kind {
+            EventKind::ClientConnected => Self::client_connected(c, 5, 60, true, 0, now),
+            EventKind::ClientDisconnected => Self::client_disconnected(c, "normal", now - 1000),
+            EventKind::SessionSubscribed => Self::session_subscribed(c, topic, qos),
+            EventKind::SessionUnsubscribed => Self::session_unsubscribed(c, topic),
+        }
+    }
 }
 
 fn insert_addr(m: &mut Map, key: &str, addr: Option<SocketAddr>) {

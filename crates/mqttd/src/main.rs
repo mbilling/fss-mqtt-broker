@@ -225,11 +225,28 @@ use tracing::{debug, error, info, warn};
 /// SWIM driver tick; must stay below the ack timeout (250ms default config).
 const SWIM_TICK: Duration = Duration::from_millis(100);
 
+/// Why the broker could not start. Rust prints a `main` error with `Debug`, which
+/// would escape a multi-line message (a rules file's parse error points at the line
+/// and column it means) into one unreadable string; this prints the message as written.
+struct StartupError(Box<dyn std::error::Error>);
+
+impl<E: Into<Box<dyn std::error::Error>>> From<E> for StartupError {
+    fn from(e: E) -> Self {
+        Self(e.into())
+    }
+}
+
+impl std::fmt::Debug for StartupError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 // Startup is a linear wiring sequence; splitting it would only scatter the order it
 // documents.
 #[allow(clippy::too_many_lines)]
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<(), StartupError> {
     // Validate the entire invocation before even help/version dispatch. A typo,
     // stray value or misplaced option must never start a broker or signal one.
     reject_invalid_cli();
@@ -752,6 +769,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         shutdown.clone(),
         metrics.clone(),
         ingress.clone(),
+        &connections,
     )?;
     let audit_for_shutdown = policy.audit.clone();
     let audit_for_admin = policy.audit.clone();
@@ -1509,6 +1527,8 @@ async fn start_client_listeners(
 /// Build the connection policy — authentication, topic authorization, and
 /// auditing — from the `MQTTD_*` shims (ADR 0004). Everything is deny-by-default;
 /// the insecure fallbacks are explicit and loudly logged.
+// One argument per independent piece of wiring the policy is assembled from.
+#[allow(clippy::too_many_arguments)]
 fn client_policy(
     live: &Arc<RwLock<Config>>,
     // This node's id, passed explicitly rather than read off `proxy`: what this
@@ -1521,6 +1541,7 @@ fn client_policy(
     shutdown: tokio_util::sync::CancellationToken,
     metrics: Arc<mqtt_observability::metrics::Metrics>,
     ingress: Arc<mqttd::ingress::IngressCredit>,
+    connections: &tokio_util::task::TaskTracker,
 ) -> Result<(Arc<conn::ConnPolicy>, reload::Reloader), Box<dyn std::error::Error>> {
     // ADR 0066 T3: with an export endpoint configured, every audit record —
     // genesis and the closing shutdown record included — also ships to the SIEM
@@ -1596,8 +1617,11 @@ fn client_policy(
         );
     }
     let (rules_tx, rules_rx) = tokio::sync::watch::channel(Arc::new(initial_rules));
+    // Event- and Will-derived actions are counted on the connection tracker, so the
+    // graceful drain waits for what a disconnect raises as the broker stops.
     let rules =
-        mqttd::rules::Rules::new(rules_rx, Arc::from(node.0.as_str()), Some(metrics.clone()));
+        mqttd::rules::Rules::new(rules_rx, Arc::from(node.0.as_str()), Some(metrics.clone()))
+            .with_tasks(connections.clone());
     reloader.attach_rules(rules_tx, {
         let live = live.clone();
         move || -> reload::RulesBuildResult {
@@ -4299,6 +4323,7 @@ const KNOWN_FLAGS: &[&str] = &[
     "--clientid",
     "--username",
     "--qos",
+    "--event",
     "--preflight",
     "--print-config",
     "--check-tls",
@@ -4343,7 +4368,7 @@ fn validate_cli(args: &[String]) -> Result<(), String> {
     while let Some(arg) = tokens.next() {
         match arg {
             "--config" | "--url" | "--pid" | "--timeout" | "--sql" | "--topic" | "--payload"
-            | "--clientid" | "--username" | "--qos" => {
+            | "--clientid" | "--username" | "--qos" | "--event" => {
                 if !options.insert(arg) {
                     return Err(format!("repeated option: {arg}"));
                 }
@@ -4398,9 +4423,8 @@ fn validate_cli(args: &[String]) -> Result<(), String> {
                     | "--backup"
                     | "--check-rules"
             ),
-            "--sql" | "--topic" | "--payload" | "--clientid" | "--username" | "--qos" => {
-                mode == "--rule-test"
-            }
+            "--sql" | "--topic" | "--payload" | "--clientid" | "--username" | "--qos"
+            | "--event" => mode == "--rule-test",
             "--url" => mode == "--probe",
             "--pid" | "--timeout" => matches!(mode, "--decommission" | "--backup"),
             _ => unreachable!("only value options enter this set"),
@@ -4430,37 +4454,44 @@ fn reject_invalid_cli() {
 
 /// One-screen usage for `--help`.
 fn print_usage() {
+    // A raw string, laid out as printed: a `\` line continuation would strip the
+    // indentation of every wrapped description line.
     println!(
-        "mqttd {} — a security-first, cluster-native MQTT broker\n\n\
-         USAGE:\n  \
-           mqttd                     start the broker (configured by MQTTD_* env / --config)\n  \
-           mqttd --config <path>     start with a TOML config file (env still overlays)\n  \
-           mqttd --check-config      validate the effective config and exit (no ports bound)\n  \
-           mqttd --check-config --preflight\n  \
-                                     ...and this host: open every referenced file as the\n  \
-                                     current user, resolve every bind\n  \
-           mqttd --print-config      print the effective config (secrets fingerprinted)\n  \
-           mqttd --check-tls         check every configured certificate, key, CA and CRL\n  \
-           mqttd --check-rules [f]   validate a rules file (default: the config's rules.file)\n  \
-           mqttd --rule-test --sql <statement> [--topic t] [--payload p] [--clientid c]\n  \
-                             [--username u] [--qos n]\n  \
-                                     run one rule statement against a simulated publish\n  \
-           mqttd --hash-password [u] print an Argon2id password-file line and exit\n  \
-           mqttd --probe [/readyz]   query the running broker's health endpoint and exit\n  \
-           mqttd --decommission      drain and gracefully stop the running broker\n  \
-           mqttd --backup            take an online backup on the running broker and wait\n  \
-           mqttd --admin <verb>      call a running broker's admin API (mqttd --admin help)\n  \
-           mqttd --version           print the version and exit\n  \
-           mqttd --help              print this help and exit\n\n\
-         OPTIONS:\n  \
-           --config <path>          config for startup, --check-config, --print-config,\n  \
-                                    --check-tls, --check-rules, --probe or --backup\n  \
-           --url <host:port>        explicit endpoint for --probe\n  \
-           --pid <n>                target process for --decommission or --backup\n  \
-           --timeout <secs>         deadline for --decommission or --backup\n\n\
-         Choose one command. Unexpected, repeated or misplaced arguments exit 2 before startup.\n\
-         Configuration is via MQTTD_* environment variables and/or a --config TOML file;\n\
-         see docs/mqttd.example.toml and the README.",
+        r"mqttd {} — a security-first, cluster-native MQTT broker
+
+USAGE:
+  mqttd                     start the broker (configured by MQTTD_* env / --config)
+  mqttd --config <path>     start with a TOML config file (env still overlays)
+  mqttd --check-config      validate the effective config and exit (no ports bound)
+  mqttd --check-config --preflight
+                            ...and this host: open every referenced file as the
+                            current user, resolve every bind
+  mqttd --print-config      print the effective config (secrets fingerprinted)
+  mqttd --check-tls         check every configured certificate, key, CA and CRL
+  mqttd --check-rules [f]   validate a rules file and list its rules (default: the
+                            rules.file of the effective config, which is checked too)
+  mqttd --rule-test --sql <statement>
+                            run one rule statement against a simulated publish
+                            (--topic t --payload p --clientid c --username u --qos n)
+                            or, for a $events statement, a sample event (--event e)
+  mqttd --hash-password [u] print an Argon2id password-file line and exit
+  mqttd --probe [/readyz]   query the running broker's health endpoint and exit
+  mqttd --decommission      drain and gracefully stop the running broker
+  mqttd --backup            take an online backup on the running broker and wait
+  mqttd --admin <verb>      call a running broker's admin API (mqttd --admin help)
+  mqttd --version           print the version and exit
+  mqttd --help              print this help and exit
+
+OPTIONS:
+  --config <path>          config for startup, --check-config, --print-config,
+                           --check-tls, --check-rules, --probe or --backup
+  --url <host:port>        explicit endpoint for --probe
+  --pid <n>                target process for --decommission or --backup
+  --timeout <secs>         deadline for --decommission or --backup
+
+Choose one command. Unexpected, repeated or misplaced arguments exit 2 before startup.
+Configuration is via MQTTD_* environment variables and/or a --config TOML file;
+see docs/mqttd.example.toml and the README.",
         env!("CARGO_PKG_VERSION")
     );
 }
@@ -4526,6 +4557,30 @@ fn check_rules_cli() -> ! {
                 reload::enabled_rules(&loaded.rules),
                 loaded.rules.digest()
             );
+            // One line per rule, in the order they run (id order).
+            for rule in loaded.rules.rules() {
+                let from: Vec<String> = rule
+                    .topics()
+                    .iter()
+                    .map(|t| format!("\"{t}\""))
+                    .chain(
+                        rule.events()
+                            .iter()
+                            .map(|k| format!("\"$events/{}\"", k.event_name().replace('.', "/"))),
+                    )
+                    .collect();
+                println!(
+                    "  {} ({}): FROM {}, {} action(s)",
+                    rule.id(),
+                    if rule.enabled() {
+                        "enabled"
+                    } else {
+                        "disabled"
+                    },
+                    from.join(", "),
+                    rule.action_count()
+                );
+            }
             std::process::exit(0);
         }
         Err(e) => {
@@ -4536,7 +4591,8 @@ fn check_rules_cli() -> ! {
 }
 
 /// `mqttd --rule-test --sql <statement> …` (ADR 0083): EMQX's "SQL test" — run one
-/// statement against a simulated publish and print each output as JSON, one per line.
+/// statement against a simulated publish, or a sample event for a `$events` statement,
+/// and print each output as JSON, one per line.
 fn rule_test_cli() -> ! {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let opt = |name: &str| args.iter().skip_while(|a| *a != name).nth(1).cloned();
@@ -4558,7 +4614,50 @@ fn rule_test_cli() -> ! {
     let mut input = mqtt_rules::PublishInput::new(&clientid, &topic, &payload, qos, &props);
     input.username = username.as_deref();
     input.node = "rule-test";
-    match mqtt_rules::test_sql(&sql, &input) {
+    // A statement that selects events runs against a sample of one: the one --event
+    // names, else its first event when it selects no topic.
+    let event = match (mqtt_rules::statement_sources(&sql), opt("--event")) {
+        (Err(e), _) => {
+            eprintln!("rule test FAILED: {e}");
+            std::process::exit(1);
+        }
+        (Ok(_), Some(name)) => {
+            let kind = mqtt_rules::EventKind::ALL.into_iter().find(|k| {
+                let topic = name.trim_start_matches("$events/");
+                k.event_name() == name
+                    || mqtt_rules::EventKind::from_topic(&format!("$events/{topic}")) == Some(*k)
+            });
+            let Some(kind) = kind else {
+                eprintln!(
+                    "error: --event takes client.connected, client.disconnected, \
+                     session.subscribed or session.unsubscribed, not {name:?}"
+                );
+                std::process::exit(2);
+            };
+            Some(kind)
+        }
+        (Ok((topics, events)), None) if topics.is_empty() => events.first().copied(),
+        (Ok(_), None) => None,
+    };
+    let sample;
+    let input: &dyn mqtt_rules::Input = match event {
+        Some(kind) => {
+            let peer = "127.0.0.1:52345".parse().ok();
+            let sockname = "127.0.0.1:1883".parse().ok();
+            let client = mqtt_rules::ClientInfo {
+                clientid: &clientid,
+                username: username.as_deref(),
+                peer,
+                sockname,
+                node: "rule-test",
+            };
+            sample = mqtt_rules::EventInput::sample(kind, &client, &topic, qos);
+            eprintln!("(a sample {} event)", kind.event_name());
+            &sample
+        }
+        None => &input,
+    };
+    match mqtt_rules::test_sql(&sql, input) {
         Ok(outputs) if outputs.is_empty() => {
             println!("(no output: the statement's WHERE / INCASE did not match this message)");
             std::process::exit(0);

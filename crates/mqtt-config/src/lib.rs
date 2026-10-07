@@ -1096,12 +1096,21 @@ impl Config {
         if unknown.is_empty() {
             return Ok(cfg);
         }
+        // A rule written straight into the config (`[rules.<id>]` beside `[rules]`)
+        // is the natural mistake: the two share a name. Say where rules go.
+        let rules_hint = if unknown.iter().any(|k| k.starts_with("rules.")) {
+            ". Rules are not written in this file: put the [rules.<id>] tables in a \
+             rules file of their own and point [rules] file (MQTTD_RULES_FILE) at it \
+             (docs/RULES.md)"
+        } else {
+            ""
+        };
         match env_policy.unwrap_or(cfg.runtime.config_unknown_keys) {
             UnknownConfigKeys::Refuse => Err(ConfigError::Parse(format!(
                 "unknown config key(s): {} — a typo, or a config written for a NEWER \
                  broker version; set runtime.config_unknown_keys = \"warn\" (or \
                  MQTTD_CONFIG_UNKNOWN_KEYS=warn) to boot anyway during a rollback or \
-                 mixed-version window, ignored keys logged (ADR 0058 T4)",
+                 mixed-version window, ignored keys logged (ADR 0058 T4){rules_hint}",
                 unknown.join(", ")
             ))),
             UnknownConfigKeys::Warn => {
@@ -2360,6 +2369,24 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("security.allow_anonymus"), "{msg}");
         assert!(msg.contains("config_unknown_keys"), "{msg}");
+    }
+
+    /// ADR 0083: a rule written straight into the config — `[rules.<id>]` beside
+    /// `[rules]`, which share a name — is refused with where rules go instead.
+    #[test]
+    fn a_rule_written_into_the_config_is_refused_with_where_rules_go() {
+        let err = Config::from_toml("[rules.high_temp]\nsql = 'SELECT * FROM \"t\"'\n")
+            .expect_err("a rule is not a config key");
+        let msg = err.to_string();
+        assert!(msg.contains("rules.high_temp"), "{msg}");
+        assert!(msg.contains("rules file of their own"), "{msg}");
+        let typo = Config::from_toml("[security]\nallow_anonymus = true\n")
+            .expect_err("unknown key")
+            .to_string();
+        assert!(
+            !typo.contains("rules file"),
+            "only a rules key gets the hint: {typo}"
+        );
     }
 
     /// Issue #230 / ADR 0058 T4: the refusal lists EVERY unknown key at once —

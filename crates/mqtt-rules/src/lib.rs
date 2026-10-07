@@ -178,9 +178,27 @@ pub struct Rule {
     actions: Vec<action::Action>,
     topics: Vec<String>,
     events: Vec<EventKind>,
+    /// When a failure of this rule was last reported loudly (unix seconds); see
+    /// [`Rule::failure_report_due`].
+    last_report: std::sync::atomic::AtomicU64,
 }
 
 impl Rule {
+    /// Whether a failure of this rule at `now` (unix seconds) should be reported
+    /// loudly: the first in each `interval` seconds, per rule. A rule that fails on
+    /// every message is then logged once per interval however busy its topic, while a
+    /// second failing rule is still logged too.
+    #[must_use]
+    pub fn failure_report_due(&self, now: u64, interval: u64) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        let last = self.last_report.load(Relaxed);
+        (last == 0 || now >= last.saturating_add(interval))
+            && self
+                .last_report
+                .compare_exchange(last, now.max(1), Relaxed, Relaxed)
+                .is_ok()
+    }
+
     /// The rule's id (its table name in the rules file).
     #[must_use]
     pub fn id(&self) -> &Arc<str> {
@@ -388,6 +406,7 @@ impl RuleSet {
                 actions,
                 topics,
                 events,
+                last_report: std::sync::atomic::AtomicU64::new(0),
             });
         }
         for (i, rule) in set.rules.iter().enumerate() {
@@ -568,20 +587,50 @@ fn charge_derived(ctx: &EvalCtx<'_>, effect: Effect) -> Result<Effect, EvalError
     Ok(effect)
 }
 
+/// What one statement's `FROM` selects: its topic filters and its events.
+pub fn statement_sources(sql: &str) -> Result<(Vec<String>, Vec<EventKind>), String> {
+    compile(sql).map(|c| (c.topics, c.events))
+}
+
 /// Run one statement against one input and return its outputs as JSON — the
 /// `mqttd --rule-test` backend, EMQX's "SQL test".
 ///
-/// A message input whose topic no `FROM` filter matches is reported as such rather
-/// than evaluated: the broker would never have run the rule on it.
+/// An input the broker would never have run the rule on is reported as such rather
+/// than evaluated: a message whose topic no `FROM` filter matches, a message given to a
+/// statement that selects only events, or an event its `FROM` does not name.
 pub fn test_sql(sql: &str, input: &dyn Input) -> Result<Vec<String>, String> {
-    let Compiled { stmt, topics, .. } = compile(sql)?;
-    if let (Some(topic), false) = (input.field("topic").as_str(), topics.is_empty()) {
-        if !topics.iter().any(|f| mqtt_core::topic_matches(f, topic)) {
+    let Compiled {
+        stmt,
+        topics,
+        events,
+        ..
+    } = compile(sql)?;
+    let event = input.field("event");
+    let event = event.as_str().unwrap_or("message.publish");
+    if event == "message.publish" {
+        if topics.is_empty() {
             return Err(format!(
-                "topic \"{topic}\" matches none of the FROM filters ({})",
-                topics.join(", ")
+                "the statement selects only events ({}), so it never runs on a message; \
+                 simulate one of them instead",
+                events
+                    .iter()
+                    .map(|k| k.event_name())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ));
         }
+        if let Some(topic) = input.field("topic").as_str() {
+            if !topics.iter().any(|f| mqtt_core::topic_matches(f, topic)) {
+                return Err(format!(
+                    "topic \"{topic}\" matches none of the FROM filters ({})",
+                    topics.join(", ")
+                ));
+            }
+        }
+    } else if !events.iter().any(|k| k.event_name() == event) {
+        return Err(format!(
+            "the statement's FROM does not select the {event} event"
+        ));
     }
     let ctx = EvalCtx::new(input);
     *ctx.rule_id.borrow_mut() = Arc::from("test");

@@ -841,6 +841,23 @@ fn expressions_too_deep_to_evaluate_safely_fail_the_load() {
         ")".repeat(300)
     );
     assert!(check_sql(&calls).is_err());
+    // The documented limit exactly: 64 levels of parentheses or signs load, 65 do not.
+    let parens_at = |n: usize| {
+        format!(
+            "SELECT {}1{} AS x FROM \"t/#\"",
+            "(".repeat(n),
+            ")".repeat(n)
+        )
+    };
+    assert_eq!(one(&parens_at(64), "{}"), r#"{"x":1}"#);
+    assert!(check_sql(&parens_at(65))
+        .unwrap_err()
+        .contains("nests more than 64"));
+    let signs_at = |n: usize| format!("SELECT {}1 AS x FROM \"t/#\"", "- ".repeat(n));
+    check_sql(&signs_at(64)).unwrap();
+    assert!(check_sql(&signs_at(65))
+        .unwrap_err()
+        .contains("nests more than 64"));
 
     // Real rules are nowhere near the limits, and evaluate as before.
     check_sql(&chain(" + ", 200)).unwrap();
@@ -1131,10 +1148,37 @@ fn matching_dedups_orders_and_skips_disabled_rules() {
         ["a", "b"],
         "id order, each rule once, disabled rules never"
     );
-    let (out, _) = effects(&set, &msg("$SYS/x", &payload, &props));
-    assert!(out.is_empty(), "leading wildcards never match $-topics");
     let (out, _) = effects(&set, &msg("z", &payload, &props));
     assert!(out.is_empty());
+
+    // Leading wildcards never match a $-topic [MQTT-4.7.2-1]; a filter that names the
+    // $ level does. (Enabled rules here: the disabled `#` above proves nothing.)
+    let wild = load(
+        r##"
+        [rules.hash]
+        sql = 'SELECT 1 AS n FROM "#"'
+        actions = [{ function = "console" }]
+        [rules.plus]
+        sql = 'SELECT 1 AS n FROM "+/x"'
+        actions = [{ function = "console" }]
+        [rules.sys]
+        sql = 'SELECT 1 AS n FROM "$SYS/#"'
+        actions = [{ function = "console" }]
+        "##,
+    );
+    let ids = |topic: &str| -> Vec<String> {
+        effects(&wild, &msg(topic, &payload, &props))
+            .0
+            .iter()
+            .map(|(id, _)| id.to_string())
+            .collect()
+    };
+    assert_eq!(
+        ids("$SYS/x"),
+        ["sys"],
+        "only the filter naming $SYS matches it"
+    );
+    assert_eq!(ids("a/x"), ["hash", "plus"]);
 }
 
 #[test]
@@ -1225,4 +1269,103 @@ fn every_function_is_documented_in_rules_md() {
             "docs/RULES.md does not list `{f}`"
         );
     }
+}
+
+/// A `qos` or `retain` written as a literal that can never be valid fails the load:
+/// otherwise `--check-rules` passes the file and the action fails on every message.
+#[test]
+fn a_literal_qos_or_retain_that_can_never_be_valid_fails_the_load() {
+    let rule = |args: &str| {
+        format!(
+            "[rules.r]\nsql = 'SELECT * FROM \"t\"'\nactions = [{{ function = \"republish\", \
+             args = {{ topic = \"o\", {args} }} }}]\n"
+        )
+    };
+    for bad in [
+        "qos = 3",
+        "qos = -1",
+        "qos = 'high'",
+        "retain = 2",
+        "retain = 'yes'",
+    ] {
+        let e = RuleSet::parse(&rule(bad)).unwrap_err().to_string();
+        assert!(
+            e.contains("qos must be 0, 1 or 2") || e.contains("retain must be a boolean"),
+            "{bad}: {e}"
+        );
+    }
+    for good in [
+        "qos = 0",
+        "qos = 2",
+        "qos = '1'",
+        "qos = '${payload.q}'",
+        "retain = true",
+        "retain = 1",
+        "retain = 'false'",
+        "retain = '${flags.retain}'",
+    ] {
+        RuleSet::parse(&rule(good)).unwrap_or_else(|e| panic!("{good}: {e}"));
+    }
+}
+
+/// `mqttd --rule-test` on an event statement runs it against a sample of that event,
+/// and an input the broker would never have run the rule on is refused rather than
+/// evaluated into a plausible-looking output of undefined fields.
+#[test]
+fn the_sql_test_simulates_events_and_refuses_inputs_the_rule_never_sees() {
+    let c = ClientInfo {
+        clientid: "dev-1",
+        username: Some("u"),
+        peer: Some("127.0.0.1:50000".parse().unwrap()),
+        sockname: Some("127.0.0.1:1883".parse().unwrap()),
+        node: "n",
+    };
+    let sql = "SELECT clientid, event, proto_ver, keepalive FROM \"$events/client/connected\"";
+    let connected = EventInput::sample(EventKind::ClientConnected, &c, "", 0);
+    assert_eq!(
+        test_sql(sql, &connected).unwrap(),
+        vec![r#"{"clientid":"dev-1","event":"client.connected","proto_ver":5,"keepalive":60}"#]
+    );
+    let props = mqtt_core::AppProperties::default();
+    let payload = Bytes::new();
+    let msg = PublishInput::new("dev-1", "t/1", &payload, 0, &props);
+    let e = test_sql(sql, &msg).unwrap_err();
+    assert!(e.contains("selects only events (client.connected)"), "{e}");
+    let subscribed = EventInput::sample(EventKind::SessionSubscribed, &c, "a/#", 1);
+    let e = test_sql(sql, &subscribed).unwrap_err();
+    assert!(
+        e.contains("does not select the session.subscribed event"),
+        "{e}"
+    );
+    let sub = "SELECT topic, qos FROM \"$events/session/subscribed\"";
+    assert_eq!(
+        test_sql(sub, &subscribed).unwrap(),
+        vec![r#"{"topic":"a/#","qos":1}"#]
+    );
+    assert_eq!(
+        statement_sources("SELECT * FROM \"a/#\", \"$events/client/disconnected\"").unwrap(),
+        (vec!["a/#".to_string()], vec![EventKind::ClientDisconnected])
+    );
+}
+
+/// The broker logs a failing rule loudly once per interval PER RULE: a second rule
+/// failing at the same time is not hidden behind the first.
+#[test]
+fn failures_are_reported_once_per_interval_per_rule() {
+    let set = RuleSet::parse(
+        "[rules.a]\nsql = 'SELECT 1 AS x FROM \"t\"'\n[rules.b]\nsql = 'SELECT 1 AS x FROM \"t\"'\n",
+    )
+    .unwrap()
+    .rules;
+    let (a, b) = (&set.rules()[0], &set.rules()[1]);
+    assert!(a.failure_report_due(1_000, 10));
+    assert!(
+        !a.failure_report_due(1_005, 10),
+        "within the interval: counted, not reported"
+    );
+    assert!(
+        b.failure_report_due(1_005, 10),
+        "another rule is reported on its own"
+    );
+    assert!(a.failure_report_due(1_010, 10));
 }

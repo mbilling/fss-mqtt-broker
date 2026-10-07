@@ -1250,8 +1250,12 @@ impl Metrics {
         let rule_actions_total = register_family(
             &mut registry,
             "rule_actions",
-            "Rule actions run (ADR 0083), by rule id and result: ok, failed (a bad \
-             rendered topic or qos, or a message over the per-trigger effect cap)",
+            "Rule actions run (ADR 0083), by rule id and result: ok (a console action \
+             logged; a republish the broker accepted and routed), failed (the action could \
+             not render — a bad topic, qos or retain, a payload that is not text — or went \
+             over a message's limits, or the broker refused or dropped its message — a \
+             brownout, a refused original, an ingress shed, a failed durable write; the \
+             triggering message is unaffected)",
         );
         let rules_loaded = register_gauge(
             &mut registry,

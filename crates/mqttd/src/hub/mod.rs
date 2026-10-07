@@ -3841,7 +3841,8 @@ impl Hub {
     /// A Will is a publish like any other to the rule engine (EMQX runs its rules on
     /// one, ADR 0083), and the hub is what publishes it, so the hub evaluates it. What
     /// the rules produce is posted back as ordinary publishes — through the same
-    /// dispatch (quota checks included) as any other — and is ungated like the Will.
+    /// dispatch (quota checks included) as any other. Nobody waits for them, as nobody
+    /// waits for the Will, but each is gated so its action is counted by its fate.
     async fn publish_will(&mut self, client: &ClientId, will: &Will) {
         let w = &will.message;
         self.publish(
@@ -3849,20 +3850,23 @@ impl Hub {
         )
         .await;
         let Some(rules) = &self.rules else { return };
-        let derived = rules.on_will(&crate::rules::PublishFacts {
-            client,
-            publisher: &will.publisher,
-            topic: &w.topic,
-            payload: &w.payload,
-            qos: w.qos,
-            retain: w.retain,
-            dup: false,
-            app: &w.app,
-            message_expiry: None,
-        });
-        for cmd in derived {
-            let _ = self.self_tx.send(cmd);
-        }
+        let self_tx = &self.self_tx;
+        rules.on_will(
+            &crate::rules::PublishFacts {
+                client,
+                publisher: &will.publisher,
+                topic: &w.topic,
+                payload: &w.payload,
+                qos: w.qos,
+                retain: w.retain,
+                dup: false,
+                app: &w.app,
+                message_expiry: None,
+            },
+            |cmd| {
+                let _ = self_tx.send(cmd);
+            },
+        );
     }
 
     /// Log when a persistent session attaches on a node that is not its placement

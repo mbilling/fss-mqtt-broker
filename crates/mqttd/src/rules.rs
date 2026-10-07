@@ -30,7 +30,6 @@
 //!   0 publish has no acknowledgement, so nothing it produces is gated.
 
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
@@ -54,6 +53,9 @@ pub struct Rules {
     rx: RulesWatch,
     node: Arc<str>,
     metrics: Option<Arc<Metrics>>,
+    /// Where the waits that count event- and Will-derived actions run: the broker's
+    /// connection tracker, so a graceful shutdown waits for those messages too.
+    tasks: Option<tokio_util::task::TaskTracker>,
 }
 
 impl std::fmt::Debug for Rules {
@@ -133,11 +135,17 @@ fn qos_of(n: u8) -> QoS {
     }
 }
 
-/// When the last rule failure was logged at WARN (unix seconds). A failing rule fails
-/// on every message it sees; the metric counts each one, the log says so once per
-/// interval.
-static LAST_FAILURE_WARN: AtomicU64 = AtomicU64::new(0);
+/// A failing rule fails on every message it sees: the metric counts each failure, the
+/// log says so once per interval per rule ([`Rule::failure_report_due`]).
 const FAILURE_WARN_INTERVAL_SECS: u64 = 10;
+
+/// Whether this failure of `rule` is the one to log at WARN.
+fn warn_due(rule: &Rule) -> bool {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    rule.failure_report_due(now, FAILURE_WARN_INTERVAL_SECS)
+}
 
 /// Count what evaluation reports. A successful action is NOT counted here: a console
 /// action is counted when it logs and a republish once its fate is known
@@ -148,18 +156,10 @@ fn report(metrics: Option<&Metrics>, rule: &Rule, outcome: Outcome<'_>) {
         Outcome::Passed => (Some("passed"), None),
         Outcome::NoResult => (Some("no_result"), None),
         Outcome::Failed(e) => {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| d.as_secs());
-            let last = LAST_FAILURE_WARN.load(Ordering::Relaxed);
-            if now >= last + FAILURE_WARN_INTERVAL_SECS
-                && LAST_FAILURE_WARN
-                    .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
-                    .is_ok()
-            {
+            if warn_due(rule) {
                 warn!(rule = %rule.id(), error = %e,
                       "rule SQL failed (counted in mqttd_rule_evaluations_total{{result=\"failed\"}}; \
-                       further failures within {FAILURE_WARN_INTERVAL_SECS}s are logged at debug)");
+                       this rule's further failures within {FAILURE_WARN_INTERVAL_SECS}s are logged at debug)");
             } else {
                 debug!(rule = %rule.id(), error = %e, "rule SQL failed");
             }
@@ -167,7 +167,13 @@ fn report(metrics: Option<&Metrics>, rule: &Rule, outcome: Outcome<'_>) {
         }
         Outcome::ActionOk => (None, None),
         Outcome::ActionFailed(e) => {
-            debug!(rule = %rule.id(), error = %e, "rule action failed");
+            if warn_due(rule) {
+                warn!(rule = %rule.id(), error = %e,
+                      "rule action failed (counted in mqttd_rule_actions_total{{result=\"failed\"}}; \
+                       this rule's further failures within {FAILURE_WARN_INTERVAL_SECS}s are logged at debug)");
+            } else {
+                debug!(rule = %rule.id(), error = %e, "rule action failed");
+            }
             (None, Some("failed"))
         }
     };
@@ -228,7 +234,53 @@ impl Rules {
     /// The engine over a live rule set.
     #[must_use]
     pub fn new(rx: RulesWatch, node: Arc<str>, metrics: Option<Arc<Metrics>>) -> Self {
-        Self { rx, node, metrics }
+        Self {
+            rx,
+            node,
+            metrics,
+            tasks: None,
+        }
+    }
+
+    /// Run the waits that count event- and Will-derived actions on `tasks` — the
+    /// tracker a graceful shutdown waits on — so the messages a disconnect raises as the
+    /// broker drains are routed and stored before it exits.
+    #[must_use]
+    pub fn with_tasks(mut self, tasks: tokio_util::task::TaskTracker) -> Self {
+        self.tasks = Some(tasks);
+        self
+    }
+
+    /// Send what an event or a Will derived — there is no publisher to answer — each
+    /// behind its own gate, and count each action by its fate once the hub has
+    /// answered: `ok` when it was accepted (routed, and stored where owed), `failed`
+    /// otherwise. The wait runs on [`Rules::with_tasks`]'s tracker when there is one.
+    fn send_counted(&self, derived: Vec<Derived>, send: impl Fn(HubCommand)) {
+        if derived.is_empty() {
+            return;
+        }
+        let answers: Vec<DerivedAnswer> = derived
+            .into_iter()
+            .map(|d| {
+                let (tx, rx) = oneshot::channel();
+                send(derived_command(d.msg, Some(tx)));
+                (d.rule, rx)
+            })
+            .collect();
+        let metrics = self.metrics.clone();
+        let count = async move {
+            for (rule, rx) in answers {
+                let result = match rx.await {
+                    Ok(PublishOutcome::Accepted) => "ok",
+                    _ => "failed",
+                };
+                count_action(metrics.as_deref(), &rule, result);
+            }
+        };
+        match &self.tasks {
+            Some(t) => drop(t.spawn(count)),
+            None => drop(tokio::spawn(count)),
+        }
     }
 
     /// The rules in force now.
@@ -248,18 +300,12 @@ impl Rules {
         }
     }
 
-    /// Evaluate a Will the hub is publishing and return the commands for what its
-    /// rules produce: ungated, as the Will is (there is no publisher to answer).
-    #[must_use]
-    pub fn on_will(&self, f: &PublishFacts<'_>) -> Vec<HubCommand> {
-        let metrics = self.metrics.as_deref();
-        evaluate(&self.current(), &self.node, metrics, f)
-            .into_iter()
-            .map(|d| {
-                count_action(metrics, &d.rule, "ok");
-                derived_command(d.msg, None)
-            })
-            .collect()
+    /// Evaluate a Will the hub is publishing and hand `send` the commands for what its
+    /// rules produce. Nobody waits for them — there is no publisher to answer — but
+    /// each is gated so its action is counted by its fate ([`Rules::send_counted`]).
+    pub fn on_will(&self, f: &PublishFacts<'_>, send: impl Fn(HubCommand)) {
+        let derived = evaluate(&self.current(), &self.node, self.metrics.as_deref(), f);
+        self.send_counted(derived, send);
     }
 }
 
@@ -343,9 +389,10 @@ impl ConnRules {
         }
     }
 
-    /// Evaluate a client/session event and publish what its rules produce. Events
-    /// gate nothing — there is no publisher acknowledgement to hold — so the
-    /// republishes go to the hub ungated, as a Will's do.
+    /// Evaluate a client/session event and publish what its rules produce. An event
+    /// holds back no acknowledgement — there is no publisher to answer — but each
+    /// republish is gated so its action is counted by its fate, and so a graceful
+    /// shutdown waits for it ([`Rules::send_counted`]).
     pub fn fire_event(&self, input: &EventInput, hub: &mpsc::UnboundedSender<HubCommand>) {
         let metrics = self.engine.metrics.as_deref();
         let derived = self.with_set(|set| {
@@ -353,10 +400,9 @@ impl ConnRules {
             set.on_event(input, &mut |r, o| report(metrics, r, o), &mut effects);
             collect(metrics, effects)
         });
-        for d in derived {
-            count_action(metrics, &d.rule, "ok");
-            let _ = hub.send(derived_command(d.msg, None));
-        }
+        self.engine.send_counted(derived, |cmd| {
+            let _ = hub.send(cmd);
+        });
     }
 
     /// Drop derived messages unsent — a `QoS` 0 publish under `shed-qos0` found no

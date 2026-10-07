@@ -392,7 +392,9 @@ impl Parser<'_> {
         &mut self,
         f: impl FnOnce(&mut Self) -> Result<T, ParseError>,
     ) -> Result<T, ParseError> {
-        if self.nest >= MAX_NESTING {
+        // The statement's own expression is the first level, so `>`: a rule may nest
+        // MAX_NESTING levels of parentheses or signs inside it, as documented.
+        if self.nest > MAX_NESTING {
             return Err(self.err(format!(
                 "expression nests more than {MAX_NESTING} levels deep"
             )));

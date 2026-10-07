@@ -114,6 +114,49 @@ fn simple(v: Option<&toml::Value>, default: &str, what: &str) -> Result<Simple, 
     }
 }
 
+/// A republish's `qos`: 0, 1 or 2, as a number or its text; undefined is 0.
+fn qos_of(v: &Value) -> Result<u8, EvalError> {
+    match v {
+        Value::Undefined => Ok(0),
+        Value::Int(n @ 0..=2) => Ok(u8::try_from(*n).unwrap_or(0)),
+        v => match v.as_str() {
+            Some("0") => Ok(0),
+            Some("1") => Ok(1),
+            Some("2") => Ok(2),
+            _ => Err(EvalError::new(format!(
+                "qos must be 0, 1 or 2, got {}",
+                v.to_text()?
+            ))),
+        },
+    }
+}
+
+/// A republish's `retain`: a boolean, 0/1, or their text; undefined is false.
+fn retain_of(v: &Value) -> Result<bool, EvalError> {
+    match v {
+        Value::Undefined | Value::Bool(false) | Value::Int(0) => Ok(false),
+        Value::Bool(true) | Value::Int(1) => Ok(true),
+        v => match v.as_str() {
+            Some("true") => Ok(true),
+            Some("false") => Ok(false),
+            _ => Err(EvalError::new(format!(
+                "retain must be a boolean, got {}",
+                v.to_text()?
+            ))),
+        },
+    }
+}
+
+/// A `qos` or `retain` written as a literal is checked when the file loads, the way
+/// a rendered one is checked per message: a literal that can never be valid would
+/// otherwise fail the action on every message.
+fn checked(s: Simple, check: impl Fn(&Value) -> Result<(), EvalError>) -> Result<Simple, String> {
+    if let Simple::Const(v) = &s {
+        check(v).map_err(|e| e.to_string())?;
+    }
+    Ok(s)
+}
+
 /// Parse one entry of a rule's `actions` list.
 pub(crate) fn parse_action(v: &toml::Value, warnings: &mut Vec<String>) -> Result<Action, String> {
     let table = match v {
@@ -243,8 +286,12 @@ fn parse_republish(
     }
     Ok(RepublishSpec {
         topic,
-        qos: simple(args.get("qos"), "${qos}", "qos")?,
-        retain: simple(args.get("retain"), "${retain}", "retain")?,
+        qos: checked(simple(args.get("qos"), "${qos}", "qos")?, |v| {
+            qos_of(v).map(drop)
+        })?,
+        retain: checked(simple(args.get("retain"), "${retain}", "retain")?, |v| {
+            retain_of(v).map(drop)
+        })?,
         payload,
         user_properties,
         props,
@@ -267,35 +314,8 @@ impl RepublishSpec {
                 "rendered topic \"{topic}\" is a shared-subscription filter, not a topic"
             )));
         }
-        let qos = match resolve(&self.qos, out) {
-            Value::Undefined => 0,
-            Value::Int(n @ 0..=2) => u8::try_from(n).unwrap_or(0),
-            v => match v.as_str() {
-                Some("0") => 0,
-                Some("1") => 1,
-                Some("2") => 2,
-                _ => {
-                    return Err(EvalError::new(format!(
-                        "qos must be 0, 1 or 2, got {}",
-                        v.to_text()?
-                    )))
-                }
-            },
-        };
-        let retain = match resolve(&self.retain, out) {
-            Value::Undefined | Value::Bool(false) | Value::Int(0) => false,
-            Value::Bool(true) | Value::Int(1) => true,
-            v => match v.as_str() {
-                Some("true") => true,
-                Some("false") => false,
-                _ => {
-                    return Err(EvalError::new(format!(
-                        "retain must be a boolean, got {}",
-                        v.to_text()?
-                    )))
-                }
-            },
-        };
+        let qos = qos_of(&resolve(&self.qos, out))?;
+        let retain = retain_of(&resolve(&self.retain, out))?;
         let payload = Bytes::from(self.payload.render(out)?);
         let mut app = AppProperties::default();
         match &self.user_properties {

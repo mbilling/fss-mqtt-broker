@@ -41,8 +41,8 @@ mod peer_closed;
 pub use peer_closed::PeerClosedWatch;
 
 /// Keepalive grace factor: the spec allows one and a half keepalive periods.
-const KEEPALIVE_GRACE_NUM: u64 = 3;
-const KEEPALIVE_GRACE_DEN: u64 = 2;
+const KEEPALIVE_GRACE_NUM: u32 = 3;
+const KEEPALIVE_GRACE_DEN: u32 = 2;
 
 // MQTT 3.1.1 CONNACK **return codes** (0x01–0x05) — a code space distinct from v5 reason
 // codes (e.g. v3 return code 1 = unacceptable protocol; v5 reason 0x01 = Granted QoS 1), so
@@ -2121,7 +2121,9 @@ where
 {
     // [MQTT-3.1.2-24]: close after 1.5x the keepalive with no inbound traffic.
     let grace = (keep_alive > 0).then(|| {
-        Duration::from_secs(u64::from(keep_alive) * KEEPALIVE_GRACE_NUM / KEEPALIVE_GRACE_DEN)
+        // Exactly 1.5x: `Duration` divides in nanoseconds, where whole seconds would
+        // round 1 s down to 1 s and 3 s down to 4 s [MQTT-3.1.2-24].
+        Duration::from_secs(u64::from(keep_alive)) * KEEPALIVE_GRACE_NUM / KEEPALIVE_GRACE_DEN
     });
     let mut deadline = grace.map(|g| Instant::now() + g);
     // ONE keep-alive timer per connection, re-armed only when it fires (see the
@@ -3934,6 +3936,42 @@ mod tests {
         assert!(
             recv(&mut reader).await.is_none(),
             "an idle keep_alive=1 connection must close once the grace elapses"
+        );
+    }
+
+    /// The grace is one and a half keepalive periods exactly, not rounded down to
+    /// whole seconds: a silent `keep_alive=1` client is still connected at 1.4 s (a
+    /// rounded grace closed it at 1.0 s) and closed by 1.6 s [MQTT-3.1.2-24].
+    #[tokio::test(start_paused = true)]
+    async fn the_keepalive_grace_is_one_and_a_half_periods_exactly() {
+        let (mut reader, mut writer, hub_rx) = start_conn();
+        stub_hub(hub_rx);
+        writer
+            .send(&Packet::Connect(Connect {
+                properties: mqtt_codec::Properties::new(),
+                protocol: V4,
+                clean_session: true,
+                keep_alive: 1,
+                client_id: "exact".into(),
+                last_will: None,
+                username: None,
+                password: None,
+            }))
+            .await
+            .unwrap();
+        assert!(matches!(recv(&mut reader).await, Some(Packet::ConnAck(_))));
+        tokio::time::sleep(Duration::from_millis(1400)).await;
+        // Still open: it answers a ping. The ping is itself traffic, so the close is
+        // measured from it: 1.4 s later it is still open, by 1.6 s it is closed.
+        writer.send(&Packet::PingReq).await.unwrap();
+        assert_eq!(recv(&mut reader).await, Some(Packet::PingResp));
+        tokio::time::sleep(Duration::from_millis(1400)).await;
+        writer.send(&Packet::PingReq).await.unwrap();
+        assert_eq!(recv(&mut reader).await, Some(Packet::PingResp));
+        tokio::time::sleep(Duration::from_millis(1600)).await;
+        assert!(
+            recv(&mut reader).await.is_none(),
+            "closed once a full grace passes in silence"
         );
     }
 
