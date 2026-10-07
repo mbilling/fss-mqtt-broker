@@ -430,6 +430,7 @@ impl ReplicaTransport for PeerReplicaTransport {
             req_id,
             epoch,
             op: op.clone(),
+            queued: crate::peer::Queued::now(),
         };
 
         let sent = std::time::Instant::now();
@@ -600,7 +601,9 @@ mod tests {
             let mut buf = BytesMut::new();
             loop {
                 match read_frame(&mut rh, &mut buf).await {
-                    Some(PeerMessage::ReplicateAck { req_id, accepted }) => {
+                    Some(PeerMessage::ReplicateAck {
+                        req_id, accepted, ..
+                    }) => {
                         transport.complete_ack(req_id, accepted);
                     }
                     Some(_) => {}
@@ -618,11 +621,21 @@ mod tests {
         tokio::spawn(async move {
             let mut buf = BytesMut::new();
             while let Some(msg) = read_frame(&mut rh, &mut buf).await {
-                if let PeerMessage::Replicate { req_id, epoch, op } = msg {
+                if let PeerMessage::Replicate {
+                    req_id, epoch, op, ..
+                } = msg
+                {
                     let accepted = state.lock().unwrap().apply(epoch, &op);
                     let mut bytes = Vec::new();
-                    peer::encode(&PeerMessage::ReplicateAck { req_id, accepted }, &mut bytes)
-                        .unwrap();
+                    peer::encode(
+                        &PeerMessage::ReplicateAck {
+                            req_id,
+                            accepted,
+                            queued: crate::peer::Queued::default(),
+                        },
+                        &mut bytes,
+                    )
+                    .unwrap();
                     if wh.write_all(&bytes).await.is_err() {
                         break;
                     }

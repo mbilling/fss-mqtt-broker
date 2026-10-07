@@ -37,6 +37,13 @@ pub enum Stage {
     /// follower's writer queue wait plus its group commit. `replicate_rtt` minus
     /// this is the network and the two peer-bus queues.
     ReplicaApply,
+    /// Leader side: a `Replicate` queued on the peer link until the link encodes
+    /// it into a write (#662). The leader's half of `replicate_rtt` minus
+    /// `replica_apply` that is spent in-process rather than on the wire.
+    ReplicateQueue,
+    /// Follower side: a `ReplicateAck` queued on the peer link until the link
+    /// encodes it into a write — the follower's in-process half of the same gap.
+    AckQueue,
 }
 
 impl Stage {
@@ -51,6 +58,8 @@ impl Stage {
             Stage::Fsync => "fsync",
             Stage::ReplicateRtt => "replicate_rtt",
             Stage::ReplicaApply => "replica_apply",
+            Stage::ReplicateQueue => "replicate_queue",
+            Stage::AckQueue => "ack_queue",
         }
     }
 }
@@ -112,6 +121,8 @@ mod tests {
             Stage::Fsync,
             Stage::ReplicateRtt,
             Stage::ReplicaApply,
+            Stage::ReplicateQueue,
+            Stage::AckQueue,
         ];
         let labels: Vec<_> = all.iter().map(|s| s.label()).collect();
         assert_eq!(
@@ -123,7 +134,9 @@ mod tests {
                 "commit",
                 "fsync",
                 "replicate_rtt",
-                "replica_apply"
+                "replica_apply",
+                "replicate_queue",
+                "ack_queue"
             ]
         );
     }

@@ -382,6 +382,8 @@ stages inside it are exported separately, on finer buckets (20µs to ~5s, ×1.5)
 | `fsync` | one segment-log data sync (one sample per batch) |
 | `replicate_rtt` | leader, per follower: Replicate queued to the peer link → its ack back |
 | `replica_apply` | follower: Replicate received → its ack put on the link (writer queue + commit) |
+| `replicate_queue` | leader: Replicate queued on the peer link → encoded into a write (in-process share of transit) |
+| `ack_queue` | follower: ReplicateAck queued on the peer link → encoded into a write |
 
 `mqttd_publish_ack_seconds` is the server-side publish → PUBACK release for QoS 1
 publishes that went through the pending table: the broker's own share of the client's

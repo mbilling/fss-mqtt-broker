@@ -209,6 +209,35 @@ pub struct ReplicaEntryWire {
     pub record: Vec<u8>,
 }
 
+/// When a frame was put on a link's lane: local to this process, never on the wire
+/// (`#[serde(skip)]`), for the `replicate_queue` / `ack_queue` stages (#662). A
+/// decoded frame carries none. Every stamp equals every other, so frame equality
+/// (tests, codec round trips) ignores it.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Queued(Option<std::time::Instant>);
+
+impl Queued {
+    /// Stamped now.
+    #[must_use]
+    pub fn now() -> Self {
+        Self(Some(std::time::Instant::now()))
+    }
+
+    /// How long ago it was stamped; `None` for an unstamped (decoded) frame.
+    #[must_use]
+    pub fn elapsed(&self) -> Option<std::time::Duration> {
+        self.0.map(|t| t.elapsed())
+    }
+}
+
+impl PartialEq for Queued {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for Queued {}
+
 /// A message exchanged between broker nodes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PeerMessage {
@@ -357,6 +386,9 @@ pub enum PeerMessage {
         epoch: crate::lease::Epoch,
         /// The operation to apply (append / truncate / remove).
         op: crate::cluster_log::ReplOp,
+        /// When the lease-holder queued it on the link (local, not on the wire).
+        #[serde(skip)]
+        queued: Queued,
     },
     /// A replica's response to a [`Replicate`](PeerMessage::Replicate): whether it
     /// accepted the op (`false` = fenced at a stale epoch). The lease-holder counts
@@ -366,6 +398,9 @@ pub enum PeerMessage {
         req_id: u64,
         /// Whether the replica applied the op (`false` if fenced).
         accepted: bool,
+        /// When the replica queued it on the link (local, not on the wire).
+        #[serde(skip)]
+        queued: Queued,
     },
     /// An ownership-lease consensus (openraft) RPC carried over the peer bus
     /// (ADR 0006 §1, workstream E step 3b-ii mesh network). The codec treats
@@ -1155,10 +1190,12 @@ mod tests {
                 seq: 3,
                 record: b"payload".to_vec(),
             },
+            queued: crate::peer::Queued::default(),
         });
         roundtrip(&PeerMessage::ReplicateAck {
             req_id: 42,
             accepted: true,
+            queued: crate::peer::Queued::default(),
         });
         roundtrip(&PeerMessage::RaftRpc {
             req_id: 7,

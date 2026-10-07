@@ -26,6 +26,7 @@ use crate::ingress::{IngressCredit, IngressPermit};
 use bytes::BytesMut;
 use mqtt_cluster::durable_plane::DurablePlane;
 use mqtt_cluster::peer::{self, PeerMessage};
+use mqtt_cluster::stage_timing;
 use mqtt_cluster::NodeId;
 use mqtt_net::tls;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -826,12 +827,16 @@ fn forward_inbound(
         // durable node paid. A `Replicate` goes straight to its shard's writer,
         // which puts the `ReplicateAck` on the control lane when the batch
         // commits; an ack just wakes the waiting append.
-        PeerMessage::Replicate { req_id, epoch, op } if plane.is_some() => {
+        PeerMessage::Replicate {
+            req_id, epoch, op, ..
+        } if plane.is_some() => {
             if let Some(plane) = plane {
                 plane.submit_replicate(req_id, epoch, op, reply_ctl.clone());
             }
         }
-        PeerMessage::ReplicateAck { req_id, accepted } if plane.is_some() => {
+        PeerMessage::ReplicateAck {
+            req_id, accepted, ..
+        } if plane.is_some() => {
             if let Some(plane) = plane {
                 plane.complete_replicate_ack(req_id, accepted);
             }
@@ -1187,8 +1192,21 @@ async fn write_batch<W: AsyncWrite + Unpin>(
     buf.clear();
     let mut frames = 1u64;
     let encode_into = |buf: &mut Vec<u8>, msg: &PeerMessage| {
-        if let PeerMessage::Replicate { req_id, .. } = msg {
-            tracing::debug!(req_id, peer = %remote.0, "replicate: writing to wire");
+        // The in-process share of replication transit (#662): how long the frame
+        // sat on this link's lane before being batched into a write.
+        match msg {
+            PeerMessage::Replicate { req_id, queued, .. } => {
+                tracing::debug!(req_id, peer = %remote.0, "replicate: writing to wire");
+                if let Some(waited) = queued.elapsed() {
+                    stage_timing::record(stage_timing::Stage::ReplicateQueue, waited);
+                }
+            }
+            PeerMessage::ReplicateAck { queued, .. } => {
+                if let Some(waited) = queued.elapsed() {
+                    stage_timing::record(stage_timing::Stage::AckQueue, waited);
+                }
+            }
+            _ => {}
         }
         // An oversized or unencodable frame is skipped, not fatal: losing one
         // best-effort message beats severing every message on the link (and a
@@ -1302,12 +1320,14 @@ mod tests {
         let first = PeerMessage::ReplicateAck {
             req_id: 1,
             accepted: true,
+            queued: mqtt_cluster::peer::Queued::default(),
         };
         // The producer is spawned but cannot run until the writer yields.
         let producer = tokio::spawn(async move {
             tx.send(PeerMessage::ReplicateAck {
                 req_id: 2,
                 accepted: true,
+                queued: mqtt_cluster::peer::Queued::default(),
             })
             .unwrap();
         });
