@@ -145,16 +145,31 @@ pub(crate) fn parse(sql: &str) -> Result<(Statement, Vec<String>), ParseError> {
         toks,
         pos: 0,
         warnings: Vec::new(),
+        nest: 0,
     };
     let stmt = p.statement()?;
     Ok((stmt, p.warnings))
 }
+
+/// The tallest expression a statement may hold. Evaluating an expression — and dropping
+/// it — recurses once per level, so a taller tree (a 64 KiB `1+1+1+…`, or deep nesting)
+/// would overflow a connection task's stack when a message arrives. It is refused at
+/// load instead, with an error naming the place.
+pub(crate) const MAX_EXPR_HEIGHT: usize = 256;
+
+/// The deepest the parser itself recurses (parentheses and unary signs add no node).
+const MAX_NESTING: usize = 64;
+
+/// A parsed expression and its height.
+type Parsed = Result<(Expr, usize), ParseError>;
 
 struct Parser<'a> {
     sql: &'a str,
     toks: Vec<Spanned>,
     pos: usize,
     warnings: Vec<String>,
+    /// Current recursion depth (see [`MAX_NESTING`]).
+    nest: usize,
 }
 
 impl Parser<'_> {
@@ -361,48 +376,91 @@ impl Parser<'_> {
         })
     }
 
+    /// Parse an expression (for the statement level, which needs no height).
     fn expr(&mut self) -> Result<Expr, ParseError> {
-        let mut l = self.and_expr()?;
+        Ok(self.expr_h()?.0)
+    }
+
+    /// Parse an expression and return its height (see [`MAX_EXPR_HEIGHT`]).
+    fn expr_h(&mut self) -> Parsed {
+        self.nested(Self::or_expr)
+    }
+
+    /// Recurse one level deeper, refusing past [`MAX_NESTING`] (parentheses and unary
+    /// signs recurse without adding a node, so height alone does not bound them).
+    fn nested<T>(
+        &mut self,
+        f: impl FnOnce(&mut Self) -> Result<T, ParseError>,
+    ) -> Result<T, ParseError> {
+        if self.nest >= MAX_NESTING {
+            return Err(self.err(format!(
+                "expression nests more than {MAX_NESTING} levels deep"
+            )));
+        }
+        self.nest += 1;
+        let r = f(self);
+        self.nest -= 1;
+        r
+    }
+
+    /// The height of a node over children of height `h`, refused past
+    /// [`MAX_EXPR_HEIGHT`].
+    fn node(&self, h: usize) -> Result<usize, ParseError> {
+        let h = h + 1;
+        if h > MAX_EXPR_HEIGHT {
+            return Err(self.err(format!(
+                "expression is more than {MAX_EXPR_HEIGHT} levels deep; split it \
+                 (e.g. use IN (...) for a long OR of comparisons)"
+            )));
+        }
+        Ok(h)
+    }
+
+    fn or_expr(&mut self) -> Parsed {
+        let (mut l, mut h) = self.and_expr()?;
         while self.eat_kw(Kw::Or) {
-            let r = self.and_expr()?;
+            let (r, hr) = self.and_expr()?;
+            h = self.node(h.max(hr))?;
             l = Expr::Or(Box::new(l), Box::new(r));
         }
-        Ok(l)
+        Ok((l, h))
     }
 
-    fn and_expr(&mut self) -> Result<Expr, ParseError> {
-        let mut l = self.not_expr()?;
+    fn and_expr(&mut self) -> Parsed {
+        let (mut l, mut h) = self.not_expr()?;
         while self.eat_kw(Kw::And) {
-            let r = self.not_expr()?;
+            let (r, hr) = self.not_expr()?;
+            h = self.node(h.max(hr))?;
             l = Expr::And(Box::new(l), Box::new(r));
         }
-        Ok(l)
+        Ok((l, h))
     }
 
-    fn not_expr(&mut self) -> Result<Expr, ParseError> {
+    fn not_expr(&mut self) -> Parsed {
         if self.eat_kw(Kw::Not) {
-            return Ok(Expr::Not(Box::new(self.not_expr()?)));
+            let (e, h) = self.nested(Self::not_expr)?;
+            return Ok((Expr::Not(Box::new(e)), self.node(h)?));
         }
         self.cmp_expr()
     }
 
-    fn cmp_expr(&mut self) -> Result<Expr, ParseError> {
-        let l = self.add_expr()?;
+    fn cmp_expr(&mut self) -> Parsed {
+        let (l, hl) = self.add_expr()?;
         let op = match self.peek() {
             Tok::Cmp(op) => *op,
             Tok::Kw(Kw::In) => {
                 self.bump();
-                return self.in_list(l, false);
+                return self.in_list(l, hl, false);
             }
             Tok::Kw(Kw::Not) if *self.peek_at(1) == Tok::Kw(Kw::In) => {
                 self.bump();
                 self.bump();
-                return self.in_list(l, true);
+                return self.in_list(l, hl, true);
             }
-            _ => return Ok(l),
+            _ => return Ok((l, hl)),
         };
         self.bump();
-        let r = self.add_expr()?;
+        let (r, hr) = self.add_expr()?;
         let op = match op {
             "=" => CmpOp::Eq,
             "!=" | "<>" => CmpOp::Ne,
@@ -417,7 +475,8 @@ impl Parser<'_> {
                 self.err("comparisons do not chain; combine them with AND (e.g. a < b AND b < c)")
             );
         }
-        Ok(Expr::Cmp(op, Box::new(l), Box::new(r)))
+        let h = self.node(hl.max(hr))?;
+        Ok((Expr::Cmp(op, Box::new(l), Box::new(r)), h))
     }
 
     /// `"x"` compared to something is almost always a string the author meant to write
@@ -435,67 +494,79 @@ impl Parser<'_> {
         }
     }
 
-    fn in_list(&mut self, expr: Expr, negated: bool) -> Result<Expr, ParseError> {
+    fn in_list(&mut self, expr: Expr, h: usize, negated: bool) -> Parsed {
         self.expect(&Tok::LParen, "'(' after IN")?;
-        let mut list = vec![self.expr()?];
+        let (first, mut hi) = self.expr_h()?;
+        let mut list = vec![first];
         while self.eat(&Tok::Comma) {
-            list.push(self.expr()?);
+            let (e, he) = self.expr_h()?;
+            hi = hi.max(he);
+            list.push(e);
         }
         self.expect(&Tok::RParen, "')' closing the IN list")?;
-        Ok(Expr::In {
-            expr: Box::new(expr),
-            list,
-            negated,
-        })
+        let h = self.node(h.max(hi))?;
+        Ok((
+            Expr::In {
+                expr: Box::new(expr),
+                list,
+                negated,
+            },
+            h,
+        ))
     }
 
-    fn add_expr(&mut self) -> Result<Expr, ParseError> {
-        let mut l = self.mul_expr()?;
+    fn add_expr(&mut self) -> Parsed {
+        let (mut l, mut h) = self.mul_expr()?;
         loop {
             let op = match self.peek() {
                 Tok::Plus => ArithOp::Add,
                 Tok::Minus => ArithOp::Sub,
-                _ => return Ok(l),
+                _ => return Ok((l, h)),
             };
             self.bump();
-            let r = self.mul_expr()?;
+            let (r, hr) = self.mul_expr()?;
+            h = self.node(h.max(hr))?;
             l = Expr::Arith(op, Box::new(l), Box::new(r));
         }
     }
 
-    fn mul_expr(&mut self) -> Result<Expr, ParseError> {
-        let mut l = self.unary()?;
+    fn mul_expr(&mut self) -> Parsed {
+        let (mut l, mut h) = self.unary()?;
         loop {
             let op = match self.peek() {
                 Tok::Star => ArithOp::Mul,
                 Tok::Slash => ArithOp::Div,
                 Tok::Div => ArithOp::IntDiv,
                 Tok::Mod => ArithOp::Mod,
-                _ => return Ok(l),
+                _ => return Ok((l, h)),
             };
             self.bump();
-            let r = self.unary()?;
+            let (r, hr) = self.unary()?;
+            h = self.node(h.max(hr))?;
             l = Expr::Arith(op, Box::new(l), Box::new(r));
         }
     }
 
-    fn unary(&mut self) -> Result<Expr, ParseError> {
+    fn unary(&mut self) -> Parsed {
         if self.eat(&Tok::Minus) {
-            return Ok(match self.unary()? {
-                Expr::Const(Value::Int(n)) => Expr::Const(Value::Int(-n)),
-                Expr::Const(Value::Float(f)) => Expr::Const(Value::Float(-f)),
-                e => Expr::Neg(Box::new(e)),
+            let (e, h) = self.nested(Self::unary)?;
+            return Ok(match e {
+                Expr::Const(Value::Int(n)) => (Expr::Const(Value::Int(-n)), h),
+                Expr::Const(Value::Float(f)) => (Expr::Const(Value::Float(-f)), h),
+                e => (Expr::Neg(Box::new(e)), self.node(h)?),
             });
         }
         if self.eat(&Tok::Plus) {
-            return self.unary();
+            return self.nested(Self::unary);
         }
-        let base = self.primary()?;
-        self.postfix(base)
+        let (base, h) = self.primary()?;
+        self.postfix(base, h)
     }
 
-    fn postfix(&mut self, base: Expr) -> Result<Expr, ParseError> {
+    fn postfix(&mut self, base: Expr, h: usize) -> Parsed {
         let mut segs = Vec::new();
+        // The tallest index expression among the segments (0 when there is none).
+        let mut hs = 0;
         loop {
             match self.peek() {
                 Tok::Dot => {
@@ -504,59 +575,85 @@ impl Parser<'_> {
                 }
                 Tok::LBracket => {
                     self.bump();
-                    segs.push(self.index()?);
+                    let (seg, h_seg) = self.index()?;
+                    hs = hs.max(h_seg);
+                    segs.push(seg);
                 }
                 Tok::Range(lo, hi) => {
                     let (lo, hi) = (*lo, *hi);
                     self.bump();
+                    let h = if segs.is_empty() {
+                        h
+                    } else {
+                        self.node(h.max(hs))?
+                    };
                     let base = attach(base, std::mem::take(&mut segs));
-                    return Ok(Expr::GetRange {
-                        base: Box::new(base),
-                        lo,
-                        hi,
-                    });
+                    return Ok((
+                        Expr::GetRange {
+                            base: Box::new(base),
+                            lo,
+                            hi,
+                        },
+                        self.node(h)?,
+                    ));
                 }
-                _ => return Ok(attach(base, segs)),
+                _ => {
+                    let h = if segs.is_empty() {
+                        h
+                    } else {
+                        self.node(h.max(hs))?
+                    };
+                    return Ok((attach(base, segs), h));
+                }
             }
         }
     }
 
-    fn index(&mut self) -> Result<Seg, ParseError> {
+    fn index(&mut self) -> Result<(Seg, usize), ParseError> {
         let seg = match self.peek() {
-            Tok::Int(_) | Tok::Minus | Tok::Plus => Seg::Index(self.signed_int()?),
-            _ => Seg::IndexExpr(Box::new(self.expr()?)),
+            Tok::Int(_) | Tok::Minus | Tok::Plus => (Seg::Index(self.signed_int()?), 0),
+            _ => {
+                let (e, h) = self.expr_h()?;
+                (Seg::IndexExpr(Box::new(e)), h)
+            }
         };
         self.expect(&Tok::RBracket, "']'")?;
         Ok(seg)
     }
 
-    fn primary(&mut self) -> Result<Expr, ParseError> {
+    fn primary(&mut self) -> Parsed {
         let start = self.start();
+        let leaf = |e: Expr| Ok((e, 1));
         match self.bump() {
-            Tok::Str(s) => Ok(Expr::Const(Value::from(s))),
-            Tok::Int(n) => Ok(Expr::Const(Value::Int(n))),
-            Tok::Float(f) => Ok(Expr::Const(Value::Float(f))),
-            Tok::Range(lo, hi) => Ok(Expr::RangeLit(lo, hi)),
+            Tok::Str(s) => leaf(Expr::Const(Value::from(s))),
+            Tok::Int(n) => leaf(Expr::Const(Value::Int(n))),
+            Tok::Float(f) => leaf(Expr::Const(Value::Float(f))),
+            Tok::Range(lo, hi) => leaf(Expr::RangeLit(lo, hi)),
             Tok::LParen => {
-                let e = self.expr()?;
+                let e = self.expr_h()?;
                 self.expect(&Tok::RParen, "')'")?;
                 Ok(e)
             }
             Tok::LBracket => {
                 let mut list = Vec::new();
+                let mut h = 0;
                 if !self.eat(&Tok::RBracket) {
-                    list.push(self.expr()?);
-                    while self.eat(&Tok::Comma) {
-                        list.push(self.expr()?);
+                    loop {
+                        let (e, he) = self.expr_h()?;
+                        h = h.max(he);
+                        list.push(e);
+                        if !self.eat(&Tok::Comma) {
+                            break;
+                        }
                     }
                     self.expect(&Tok::RBracket, "']' closing the list")?;
                 }
-                Ok(Expr::List(list))
+                Ok((Expr::List(list), self.node(h)?))
             }
             Tok::Kw(Kw::Case) => self.case(),
             Tok::QName(s) => {
                 self.lint_quoted_literal(&s);
-                Ok(Expr::Path {
+                leaf(Expr::Path {
                     head: s.into(),
                     segs: Vec::new(),
                 })
@@ -567,12 +664,12 @@ impl Parser<'_> {
                     return self.call(&s, start);
                 }
                 if s.eq_ignore_ascii_case("true") {
-                    return Ok(Expr::Const(Value::Bool(true)));
+                    return leaf(Expr::Const(Value::Bool(true)));
                 }
                 if s.eq_ignore_ascii_case("false") {
-                    return Ok(Expr::Const(Value::Bool(false)));
+                    return leaf(Expr::Const(Value::Bool(false)));
                 }
-                Ok(Expr::Path {
+                leaf(Expr::Path {
                     head: s.into(),
                     segs: Vec::new(),
                 })
@@ -581,44 +678,60 @@ impl Parser<'_> {
         }
     }
 
-    fn case(&mut self) -> Result<Expr, ParseError> {
+    fn case(&mut self) -> Parsed {
+        let mut h = 0;
         let on = if *self.peek() == Tok::Kw(Kw::When) {
             None
         } else {
-            Some(Box::new(self.expr()?))
+            let (e, he) = self.expr_h()?;
+            h = he;
+            Some(Box::new(e))
         };
         let mut whens = Vec::new();
         while self.eat_kw(Kw::When) {
-            let cond = self.expr()?;
+            let (cond, hc) = self.expr_h()?;
             if !self.eat_kw(Kw::Then) {
                 return Err(self.err("expected THEN"));
             }
-            whens.push((cond, self.expr()?));
+            let (then, ht) = self.expr_h()?;
+            h = h.max(hc).max(ht);
+            whens.push((cond, then));
         }
         if whens.is_empty() {
             return Err(self.err("CASE needs at least one WHEN … THEN …"));
         }
         let otherwise = if self.eat_kw(Kw::Else) {
-            Some(Box::new(self.expr()?))
+            let (e, he) = self.expr_h()?;
+            h = h.max(he);
+            Some(Box::new(e))
         } else {
             None
         };
         if !self.eat_kw(Kw::End) {
             return Err(self.err("expected END closing CASE"));
         }
-        Ok(Expr::Case {
-            on,
-            whens,
-            otherwise,
-        })
+        let h = self.node(h)?;
+        Ok((
+            Expr::Case {
+                on,
+                whens,
+                otherwise,
+            },
+            h,
+        ))
     }
 
-    fn call(&mut self, name: &str, start: usize) -> Result<Expr, ParseError> {
+    fn call(&mut self, name: &str, start: usize) -> Parsed {
         let mut args = Vec::new();
+        let mut h = 0;
         if !self.eat(&Tok::RParen) {
-            args.push(self.expr()?);
-            while self.eat(&Tok::Comma) {
-                args.push(self.expr()?);
+            loop {
+                let (e, he) = self.expr_h()?;
+                h = h.max(he);
+                args.push(e);
+                if !self.eat(&Tok::Comma) {
+                    break;
+                }
             }
             self.expect(&Tok::RParen, "')' closing the argument list")?;
         }
@@ -654,7 +767,8 @@ impl Parser<'_> {
             )),
             _ => None,
         };
-        Ok(Expr::Call { func, args, regex })
+        let h = self.node(h)?;
+        Ok((Expr::Call { func, args, regex }, h))
     }
 }
 

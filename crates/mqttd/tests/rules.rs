@@ -2,8 +2,9 @@
 //!
 //! The `mqtt-rules` unit tests prove the SQL against EMQX's documented behaviour; these
 //! prove the broker around it — that a rule's output is delivered at every `QoS`, that a
-//! `QoS` 1/2 publisher's acknowledgement waits for what its rules produced, that a `QoS` 2
-//! publish fires its rules once across a DUP resend, that a republished message can never
+//! `QoS` 1/2 publisher's acknowledgement waits for what its rules produced and answers
+//! with the original's fate, that a refused original routes nothing it derived, that a
+//! `QoS` 2 publish fires its rules once across a DUP resend, that a republished message can never
 //! re-trigger a rule, that Wills and client events run rules, and that in a cluster each
 //! message is evaluated exactly once — on the node it arrived at — while its derived
 //! messages reach subscribers anywhere.
@@ -26,6 +27,8 @@ struct Broker {
     addr: SocketAddr,
     hub_tx: tokio::sync::mpsc::UnboundedSender<HubCommand>,
     metrics: Arc<mqtt_observability::metrics::Metrics>,
+    /// What a reload sends the new rules through.
+    rules_tx: tokio::sync::watch::Sender<Arc<mqtt_rules::RuleSet>>,
 }
 
 fn rule_set(text: &str) -> Arc<mqtt_rules::RuleSet> {
@@ -45,7 +48,7 @@ async fn start_node(name: &str, rules: &str) -> (Broker, TcpListener, NodeId) {
     let (hub, hub_tx) = Hub::with_config(id.clone(), store.clone());
     tokio::spawn(hub.run());
     let metrics = Arc::new(mqtt_observability::metrics::Metrics::new("test"));
-    let (_tx, rx) = tokio::sync::watch::channel(rule_set(rules));
+    let (rules_tx, rx) = tokio::sync::watch::channel(rule_set(rules));
     let engine = mqttd::rules::Rules::new(rx, Arc::from(name), Some(metrics.clone()));
     hub_tx
         .send(HubCommand::AttachRules(engine.clone()))
@@ -89,6 +92,7 @@ async fn start_node(name: &str, rules: &str) -> (Broker, TcpListener, NodeId) {
             addr,
             hub_tx,
             metrics,
+            rules_tx,
         },
         peer,
         id,
@@ -285,20 +289,21 @@ async fn a_qos2_publish_fires_its_rules_once_across_a_dup_resend() {
     sub.expect_silence().await;
 }
 
-/// The derived message's durability gates the ORIGINAL's acknowledgement. Under a
-/// disk brownout, the original — owed to nobody durable — would be accepted, but the
-/// derived message is owed to an offline persistent subscriber and is refused. A
-/// half-stored batch cannot honestly be refused ("nothing was stored" would be false)
-/// and must not be acked ("acked means owned" would be false), so the ack is WITHHELD:
-/// the v5 publisher's connection closes without a PUBACK, and it retries.
-#[tokio::test]
-async fn a_refused_derived_message_withholds_the_publishers_ack() {
-    let broker = start_broker(ALERT_QOS).await;
-    // A persistent QoS 1 subscriber on the DERIVED topic, then offline: its durable
-    // queue is the only place the derived message can go.
+fn action_count(broker: &Broker, rule: &str, result: &str) -> u64 {
+    let text = broker.metrics.render();
+    let key = format!(r#"mqttd_rule_actions_total{{rule="{rule}",result="{result}"}} "#);
+    text.lines()
+        .find_map(|l| l.strip_prefix(key.as_str()))
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+/// A persistent `QoS` 1 subscriber on `filter`, then offline: its durable queue is the
+/// only place a message for it can go, so a brownout refuses every such message.
+async fn park_a_sleeper(broker: &Broker, id: &str, filter: &str) {
     let (mut sleeper, ack) = Client::connect_v5(
         broker.addr,
-        "sleeper",
+        id,
         false,
         vec![mqtt_codec::Property::SessionExpiryInterval(u32::MAX)],
     )
@@ -306,28 +311,15 @@ async fn a_refused_derived_message_withholds_the_publishers_ack() {
     assert_eq!(ack.code, 0);
     assert_eq!(
         sleeper
-            .subscribe(1, "alerts/#", QoS::AtLeastOnce)
+            .subscribe(1, filter, QoS::AtLeastOnce)
             .await
             .return_codes,
         vec![1]
     );
     sleeper.disconnect().await;
+}
 
-    // Control: before the brownout the same publish is acked.
-    let mut publ = Client::connect_v5_ok(broker.addr, "dev3").await;
-    publ.publish(
-        "sensors/dev3/data",
-        br#"{"temp":31}"#,
-        QoS::AtLeastOnce,
-        Some(1),
-        vec![],
-    )
-    .await;
-    match publ.recv().await {
-        Packet::PubAck(a) => assert_eq!((a.pkid, a.reason), (1, 0)),
-        other => panic!("expected PUBACK, got {other:?}"),
-    }
-
+fn brownout(broker: &Broker) {
     broker
         .hub_tx
         .send(HubCommand::SetBrownout {
@@ -335,15 +327,136 @@ async fn a_refused_derived_message_withholds_the_publishers_ack() {
             on: true,
         })
         .unwrap();
+}
+
+/// A derived message the broker refuses (brownout: it needs storage) fails its action;
+/// the original — which needed none, and was delivered — is still acknowledged, every
+/// time. Withholding it instead would have the publisher re-send, and re-deliver, the
+/// original for as long as the brownout lasts.
+#[tokio::test]
+async fn a_refused_derived_message_fails_its_action_and_the_original_is_still_acked() {
+    let broker = start_broker(ALERT_QOS).await;
+    park_a_sleeper(&broker, "sleeper", "alerts/#").await;
+    let mut publ = Client::connect_v5_ok(broker.addr, "dev3").await;
+    let publish = |pkid: u16, temp: u8| (pkid, format!(r#"{{"temp":{temp}}}"#));
+
+    // Control: before the brownout the derived message is stored and counted `ok`.
+    let (pkid, payload) = publish(1, 31);
     publ.publish(
         "sensors/dev3/data",
-        br#"{"temp":32}"#,
+        payload.as_bytes(),
         QoS::AtLeastOnce,
-        Some(2),
+        Some(pkid),
         vec![],
     )
     .await;
-    publ.expect_closed().await;
+    match publ.recv().await {
+        Packet::PubAck(a) => assert_eq!((a.pkid, a.reason), (1, 0)),
+        other => panic!("expected PUBACK, got {other:?}"),
+    }
+    assert_eq!(action_count(&broker, "alert", "ok"), 1);
+
+    brownout(&broker);
+    for (pkid, temp) in [(2, 32), (3, 33)] {
+        let (pkid, payload) = publish(pkid, temp);
+        publ.publish(
+            "sensors/dev3/data",
+            payload.as_bytes(),
+            QoS::AtLeastOnce,
+            Some(pkid),
+            vec![],
+        )
+        .await;
+        match publ.recv().await {
+            Packet::PubAck(a) => assert_eq!(
+                (a.pkid, a.reason),
+                (pkid, 0),
+                "the original stored nothing and was accepted: acked"
+            ),
+            other => panic!("expected PUBACK, got {other:?}"),
+        }
+    }
+    assert_eq!(
+        action_count(&broker, "alert", "failed"),
+        2,
+        "each refused derived message is a failed action"
+    );
+    assert_eq!(action_count(&broker, "alert", "ok"), 1);
+}
+
+/// A refused original routes none of its derived messages: the hub decides the original
+/// first and drops what its rules produced, so a resend cannot duplicate them. Here the
+/// original needs storage (a parked subscriber) and the derived message does not (a live
+/// `QoS` 0 subscriber), so only this ordering keeps the alert from going out.
+#[tokio::test]
+async fn a_refused_original_routes_none_of_its_derived_messages() {
+    let broker = start_broker(ALERT_QOS).await;
+    park_a_sleeper(&broker, "keeper", "sensors/#").await;
+    let mut watcher = Client::connect(broker.addr, "watcher").await;
+    watcher.subscribe(1, "alerts/#", QoS::AtMostOnce).await;
+    let mut publ = Client::connect_v5_ok(broker.addr, "dev4").await;
+
+    brownout(&broker);
+    publ.publish(
+        "sensors/dev4/data",
+        br#"{"temp":34}"#,
+        QoS::AtLeastOnce,
+        Some(1),
+        vec![],
+    )
+    .await;
+    match publ.recv().await {
+        Packet::PubAck(a) => assert_eq!(
+            (a.pkid, a.reason),
+            (1, 0x97),
+            "the original is refused, and v5 is told so"
+        ),
+        other => panic!("expected PUBACK, got {other:?}"),
+    }
+    watcher.expect_silence().await;
+    assert_eq!(action_count(&broker, "alert", "failed"), 1);
+    assert_eq!(action_count(&broker, "alert", "ok"), 0);
+}
+
+/// A connection reads the rules through its own cached view, so a reload has to reach
+/// connections that were already open: the same publisher, before and after.
+#[tokio::test]
+async fn a_reload_reaches_connections_that_were_already_open() {
+    let broker = start_broker("").await;
+    let mut sub = Client::connect(broker.addr, "sub-reload").await;
+    sub.subscribe(1, "alerts/#", QoS::AtMostOnce).await;
+    let mut publ = Client::connect(broker.addr, "dev9").await;
+    publ.publish(
+        "sensors/dev9/data",
+        br#"{"temp":40}"#,
+        QoS::AtMostOnce,
+        None,
+        vec![],
+    )
+    .await;
+    sub.expect_silence().await;
+
+    broker.rules_tx.send(rule_set(ALERT)).unwrap();
+    publ.publish(
+        "sensors/dev9/data",
+        br#"{"temp":41}"#,
+        QoS::AtMostOnce,
+        None,
+        vec![],
+    )
+    .await;
+    assert_eq!(next_publish(&mut sub).await.0, "alerts/dev9");
+
+    broker.rules_tx.send(rule_set("")).unwrap();
+    publ.publish(
+        "sensors/dev9/data",
+        br#"{"temp":42}"#,
+        QoS::AtMostOnce,
+        None,
+        vec![],
+    )
+    .await;
+    sub.expect_silence().await;
 }
 
 /// A republished message never re-enters the rule engine (EMQX's `direct_dispatch`,

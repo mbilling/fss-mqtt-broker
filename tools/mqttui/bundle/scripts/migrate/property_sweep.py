@@ -1657,8 +1657,15 @@ FUZZ_TARGETS = {
             "acl.toml",
             "--out-bridge",
             "bridge.toml",
+            "--out-rules",
+            "rules.toml",
         ],
-        ["emqx-6.2.2.conf", "emqx-adversarial.conf", "emqx-silent-drops.conf"],
+        [
+            "emqx-6.2.2.conf",
+            "emqx-adversarial.conf",
+            "emqx-silent-drops.conf",
+            "emqx-rules.conf",
+        ],
     ),
     "hivemq": (
         ["FIXTURE", "--out-config", "out.toml", "--out-acl", "acl.toml"],

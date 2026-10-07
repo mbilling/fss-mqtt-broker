@@ -1052,6 +1052,20 @@ pub type RetainedExportCut = Vec<(Message, Option<(u64, u64)>)>;
 /// nothing, so the last-success timestamp does not move and the RPO alert fires.
 pub type RetainedExportAnswer = Result<RetainedExportCut, String>;
 
+/// A publish and what its rules derived, routed together (ADR 0083). See
+/// [`HubCommand::PublishBatch`].
+#[derive(Debug)]
+pub struct PublishBatch {
+    /// The client's publish: a [`HubCommand::Publish`].
+    pub original: HubCommand,
+    /// The rule-produced messages, each a [`HubCommand::Publish`], in rule then
+    /// action order. Routed only if the original was accepted.
+    pub derived: Vec<HubCommand>,
+    /// The original's ingress credit (ADR 0082 T3), held until the whole batch has
+    /// been dispatched.
+    pub credit: Option<crate::ingress::IngressPermit>,
+}
+
 /// A message from a connection task to the hub.
 #[derive(Debug)]
 pub enum HubCommand {
@@ -1217,6 +1231,11 @@ pub enum HubCommand {
         /// a client socket under a credit pool.
         credit: Option<crate::ingress::IngressPermit>,
     },
+    /// A client publish and the messages its rules derived from it (ADR 0083), as ONE
+    /// command: the original is routed first, and its derived messages only if the hub
+    /// accepted it. A refused publish therefore leaves nothing behind for its resend to
+    /// duplicate, and the batch keeps its place in the connection's FIFO data lane.
+    PublishBatch(Box<PublishBatch>),
     /// Write one **restored** retained value as retained state (ADR 0062, issue #249):
     /// commit it through the topic's group lease-owner and warm the caches, with **no
     /// ordinary fan-out to subscribers**.
@@ -1702,6 +1721,7 @@ impl HubCommand {
             | Self::Ping { .. }
             | Self::Admin(_) => Lane::Control,
             Self::Publish { .. }
+            | Self::PublishBatch(_)
             | Self::RemotePublish { .. }
             | Self::RemotePublishAcked { .. }
             | Self::RemoteSharedDeliver { .. }
@@ -1739,9 +1759,10 @@ impl HubCommand {
     fn class(&self) -> &'static str {
         match self {
             Self::Attach { .. } | Self::SessionRecovered { .. } => "attach",
-            Self::Publish { .. } | Self::AppendDone { .. } | Self::PkidBlockReserved { .. } => {
-                "publish"
-            }
+            Self::Publish { .. }
+            | Self::PublishBatch(_)
+            | Self::AppendDone { .. }
+            | Self::PkidBlockReserved { .. } => "publish",
             Self::PubAck { .. }
             | Self::PubRec { .. }
             | Self::PubComp { .. }
@@ -3011,111 +3032,24 @@ impl Hub {
                     let _ = reply.send(existed);
                 }
             }
-            HubCommand::Publish {
-                topic,
-                payload,
-                qos,
-                mut retain,
-                message_expiry,
-                app,
-                done,
-                v5,
-                publisher,
-                // Held to the end of this dispatch, then dropped: the publish's
-                // ingress credit returns to its connection and the pool (ADR 0082 T3).
-                credit: _credit,
-            } => {
-                if let Some(m) = &self.metrics {
-                    m.publish_received(qos_num(qos));
-                }
-                // Retained quota (ADR 0041 T4): a retained publish that would CREATE
-                // a new topic beyond the cap. Growth is refused; overwrite and clear
-                // (empty payload) always work. v5: refuse outright (the publisher is
-                // told 0x97); v3.1.1 has no reason codes: deliver live, retain nothing.
-                if retain && !payload.is_empty() && self.retained_quota_exceeded(&topic).await {
-                    if let Some(m) = &self.metrics {
-                        m.quota_rejected("retained");
-                    }
-                    if v5 {
-                        warn!(topic = %topic, "retained quota exceeded; publish refused 0x97 (ADR 0041)");
-                        if let Some(done) = done {
-                            let _ =
-                                done.send(PublishOutcome::Refused(PublishRefusal::RetainedQuota));
-                        }
-                        return;
-                    }
-                    warn!(topic = %topic,
-                          "retained quota exceeded; delivered live, NOT retained (v3.1.1, ADR 0041)");
-                    retain = false;
-                }
-                // A gated publish registers a pending entry FIRST (ADR 0042 T9), so
-                // the fan-out can attach its cluster-wide obligations: acked peer
-                // forwards (exhibit ⑤) and the retained authority commit (exhibit ⑦).
-                let gate = done.map(|done| {
-                    self.register_pending(done, &topic, &payload, qos, retain, message_expiry, &app)
-                });
-                // ADR 0072: the publisher may weaken ITS OWN ack per message via
-                // `mqttd-durability` — only under the operator's opt-in. `relaxed`
-                // releases the ack at local_done (everything still runs); `local`
-                // is honored inside the store's append; v3.1.1 can't carry the
-                // property, so it always gets the full quorum path. The property
-                // itself is forwarded unaltered (MQTT-3.3.2-17).
-                let tier = if self.allow_relaxed_publish {
-                    app.user_properties
-                        .iter()
-                        .rev()
-                        .find(|(k, _)| k == mqtt_storage::repl::DURABILITY_PROPERTY)
-                        .and_then(|(_, v)| mqtt_storage::repl::DurabilityTier::parse(v))
-                        .unwrap_or_default()
-                } else {
-                    mqtt_storage::repl::DurabilityTier::Quorum
-                };
-                if let Some(m) = &self.metrics {
-                    m.publish_tier(tier.as_str());
-                }
-                if tier == mqtt_storage::repl::DurabilityTier::Relaxed {
-                    if let Some(id) = gate {
-                        self.pending_mark_relaxed(id);
+            cmd @ HubCommand::Publish { .. } => {
+                self.dispatch_publish(cmd).await;
+            }
+            HubCommand::PublishBatch(batch) => {
+                // Held to the end of the whole batch, then dropped (ADR 0082 T3).
+                let PublishBatch {
+                    original,
+                    derived,
+                    credit: _credit,
+                } = *batch;
+                if self.dispatch_publish(original).await {
+                    for d in derived {
+                        self.dispatch_publish(d).await;
                     }
                 }
-                // Time the synchronous on-loop fan-out (plan + lane submissions +
-                // peer forward) as the hub's per-publish on-loop latency (ADR
-                // 0020-T4; since issue #242 the durable appends themselves run
-                // off-loop and are timed by `durable_append_latency_seconds`).
-                let started = Instant::now();
-                let durable = self
-                    .publish(
-                        &topic,
-                        &payload,
-                        qos,
-                        retain,
-                        message_expiry,
-                        &app,
-                        gate,
-                        publisher.as_ref(),
-                    )
-                    .await;
-                if let Some(m) = &self.metrics {
-                    m.observe_deliver_latency(started.elapsed().as_secs_f64());
-                }
-                // The LOCAL fan-out pass is complete: every owed durable append is
-                // now SUBMITTED to its session's lane (issue #242), counted in the
-                // gate's `appends_outstanding` — so `pending_local_done` can fire
-                // here while the ack still waits for every append's `AppendDone`
-                // (ADR 0018 + ADR 0042 T9). A submission the lane REJECTED (full)
-                // or a failed retained write WITHHOLDS the ack (drop the entry):
-                // the publisher's connection closes unacked and it retries — fail
-                // closed, never an ack for a message a subscriber will never see
-                // (ADR 0041 T5). A stated-policy REFUSAL (brownout) was decided at
-                // the plan pass, before any submission, and is told to the
-                // publisher instead of withheld (0041-T11, issue #238).
-                if let Some(id) = gate {
-                    match durable {
-                        DurableOutcome::Ok => self.pending_local_done(id),
-                        DurableOutcome::Refused(r) => self.refuse_pending(id, r),
-                        DurableOutcome::Failed => self.drop_pending(id),
-                    }
-                }
+                // Otherwise the derived commands are dropped unrouted: their gates
+                // close, and the publisher hears the original's refusal (or nothing,
+                // if it was withheld).
             }
             HubCommand::RestoreRetained {
                 topic,
@@ -3180,6 +3114,135 @@ impl Hub {
             // Peer- and cluster-facing commands.
             other => self.dispatch_cluster(other).await,
         }
+    }
+
+    /// Route one publish: a client's, or a message its rules derived. Returns whether
+    /// messages derived from it may follow it into the fan-out (ADR 0083).
+    ///
+    /// The body is the `Publish` arm of [`dispatch`](Self::dispatch), moved verbatim so
+    /// a [`HubCommand::PublishBatch`] routes its original and its derived messages
+    /// through exactly the same on-loop decision.
+    #[allow(clippy::too_many_lines)]
+    async fn dispatch_publish(&mut self, cmd: HubCommand) -> bool {
+        let HubCommand::Publish {
+            topic,
+            payload,
+            qos,
+            mut retain,
+            message_expiry,
+            app,
+            done,
+            v5,
+            publisher,
+            // Held to the end of this dispatch, then dropped: the publish's
+            // ingress credit returns to its connection and the pool (ADR 0082 T3).
+            credit: _credit,
+        } = cmd
+        else {
+            debug_assert!(false, "dispatch_publish routes Publish commands only");
+            return false;
+        };
+        if let Some(m) = &self.metrics {
+            m.publish_received(qos_num(qos));
+        }
+        // Retained quota (ADR 0041 T4): a retained publish that would CREATE
+        // a new topic beyond the cap. Growth is refused; overwrite and clear
+        // (empty payload) always work. v5: refuse outright (the publisher is
+        // told 0x97); v3.1.1 has no reason codes: deliver live, retain nothing.
+        if retain && !payload.is_empty() && self.retained_quota_exceeded(&topic).await {
+            if let Some(m) = &self.metrics {
+                m.quota_rejected("retained");
+            }
+            if v5 {
+                warn!(topic = %topic, "retained quota exceeded; publish refused 0x97 (ADR 0041)");
+                if let Some(done) = done {
+                    let _ = done.send(PublishOutcome::Refused(PublishRefusal::RetainedQuota));
+                }
+                return false;
+            }
+            warn!(topic = %topic,
+                  "retained quota exceeded; delivered live, NOT retained (v3.1.1, ADR 0041)");
+            retain = false;
+        }
+        // A gated publish registers a pending entry FIRST (ADR 0042 T9), so
+        // the fan-out can attach its cluster-wide obligations: acked peer
+        // forwards (exhibit ⑤) and the retained authority commit (exhibit ⑦).
+        let gate = done.map(|done| {
+            self.register_pending(done, &topic, &payload, qos, retain, message_expiry, &app)
+        });
+        // ADR 0072: the publisher may weaken ITS OWN ack per message via
+        // `mqttd-durability` — only under the operator's opt-in. `relaxed`
+        // releases the ack at local_done (everything still runs); `local`
+        // is honored inside the store's append; v3.1.1 can't carry the
+        // property, so it always gets the full quorum path. The property
+        // itself is forwarded unaltered (MQTT-3.3.2-17).
+        let tier = if self.allow_relaxed_publish {
+            app.user_properties
+                .iter()
+                .rev()
+                .find(|(k, _)| k == mqtt_storage::repl::DURABILITY_PROPERTY)
+                .and_then(|(_, v)| mqtt_storage::repl::DurabilityTier::parse(v))
+                .unwrap_or_default()
+        } else {
+            mqtt_storage::repl::DurabilityTier::Quorum
+        };
+        if let Some(m) = &self.metrics {
+            m.publish_tier(tier.as_str());
+        }
+        if tier == mqtt_storage::repl::DurabilityTier::Relaxed {
+            if let Some(id) = gate {
+                self.pending_mark_relaxed(id);
+            }
+        }
+        // Time the synchronous on-loop fan-out (plan + lane submissions +
+        // peer forward) as the hub's per-publish on-loop latency (ADR
+        // 0020-T4; since issue #242 the durable appends themselves run
+        // off-loop and are timed by `durable_append_latency_seconds`).
+        let started = Instant::now();
+        let durable = self
+            .publish(
+                &topic,
+                &payload,
+                qos,
+                retain,
+                message_expiry,
+                &app,
+                gate,
+                publisher.as_ref(),
+            )
+            .await;
+        if let Some(m) = &self.metrics {
+            m.observe_deliver_latency(started.elapsed().as_secs_f64());
+        }
+        // The LOCAL fan-out pass is complete: every owed durable append is
+        // now SUBMITTED to its session's lane (issue #242), counted in the
+        // gate's `appends_outstanding` — so `pending_local_done` can fire
+        // here while the ack still waits for every append's `AppendDone`
+        // (ADR 0018 + ADR 0042 T9). A submission the lane REJECTED (full)
+        // or a failed retained write WITHHOLDS the ack (drop the entry):
+        // the publisher's connection closes unacked and it retries — fail
+        // closed, never an ack for a message a subscriber will never see
+        // (ADR 0041 T5). A stated-policy REFUSAL (brownout) was decided at
+        // the plan pass, before any submission, and is told to the
+        // publisher instead of withheld (0041-T11, issue #238).
+        // What this publish's rules derived may follow it (ADR 0083) only if it was
+        // accepted here: never behind a refusal, and never behind a gated publish whose
+        // fan-out failed — that one is withheld, its publisher retries, and the retry
+        // derives them again. An ungated publish is never retried, so its derived
+        // messages still follow a failed copy.
+        let derived_may_follow = match &durable {
+            DurableOutcome::Ok => true,
+            DurableOutcome::Refused(_) => false,
+            DurableOutcome::Failed => gate.is_none(),
+        };
+        if let Some(id) = gate {
+            match durable {
+                DurableOutcome::Ok => self.pending_local_done(id),
+                DurableOutcome::Refused(r) => self.refuse_pending(id, r),
+                DurableOutcome::Failed => self.drop_pending(id),
+            }
+        }
+        derived_may_follow
     }
 
     /// Dispatch a peer-/cluster-facing command (forwarded publishes, peer link
@@ -3757,7 +3820,7 @@ impl Hub {
         )
         .await;
         let Some(rules) = &self.rules else { return };
-        let derived = rules.on_publish(&crate::rules::PublishFacts {
+        let derived = rules.on_will(&crate::rules::PublishFacts {
             client,
             publisher: &will.publisher,
             topic: &w.topic,
@@ -3768,10 +3831,8 @@ impl Hub {
             app: &w.app,
             message_expiry: None,
         });
-        for r in derived {
-            let _ = self
-                .self_tx
-                .send(crate::rules::derived_command(r, None, None));
+        for cmd in derived {
+            let _ = self.self_tx.send(cmd);
         }
     }
 

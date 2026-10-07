@@ -342,6 +342,8 @@ impl CloseReason {
 struct RuleConn {
     publisher: crate::rules::Publisher,
     close_reason: std::sync::atomic::AtomicU8,
+    /// This connection's view of the rules; `None` when rules are not wired (tests).
+    rules: Option<crate::rules::ConnRules>,
 }
 
 impl RuleConn {
@@ -821,6 +823,10 @@ where
             peer: if relocated { None } else { peer },
         },
         close_reason: std::sync::atomic::AtomicU8::new(CloseReason::TcpClosed as u8),
+        rules: policy
+            .rules
+            .as_ref()
+            .map(crate::rules::Rules::for_connection),
     };
     let will = connect
         .last_will
@@ -956,7 +962,7 @@ where
     debug!(client = %client.0, session_present, "CONNECT accepted");
     count_connection_opened(policy, connect.protocol);
     let connected_at = mqtt_rules::now_ms();
-    if let Some(rules) = &policy.rules {
+    if let Some(rules) = &rule_conn.rules {
         if rules.wants(mqtt_rules::EventKind::ClientConnected) {
             let info = rules.client_info(&client, &rule_conn.publisher);
             let proto_ver = if connect.protocol == ProtocolVersion::V5 {
@@ -1023,7 +1029,7 @@ where
         graceful,
         session_expiry_override,
     });
-    if let Some(rules) = &policy.rules {
+    if let Some(rules) = &rule_conn.rules {
         if rules.wants(mqtt_rules::EventKind::ClientDisconnected) {
             // A socket error ends the session as a closed connection, whatever `serve`
             // was doing when it hit it.
@@ -1855,6 +1861,37 @@ fn negotiate_v5_properties(
 struct PendingPuback {
     ack: mqtt_codec::packet::Ack,
     done: Option<oneshot::Receiver<crate::hub::PublishOutcome>>,
+    /// The hub acknowledgement gates this publish holds: its own, plus one per gated
+    /// message its rules derived (ADR 0083). At least 1, so an ACL-denied publish
+    /// still takes a slot.
+    gates: usize,
+}
+
+/// The parked `QoS` 1 acks (ADR 0075), counting the hub acknowledgement gates they
+/// hold. The pipeline is bounded by gates, not entries, so a rule that fans one
+/// publish out into many gated messages cannot multiply what one connection holds in
+/// the hub's pending-publish table (ADR 0083).
+#[derive(Default)]
+struct AckQueue {
+    queue: std::collections::VecDeque<PendingPuback>,
+    gates: usize,
+}
+
+impl AckQueue {
+    fn push_back(&mut self, entry: PendingPuback) {
+        self.gates += entry.gates;
+        self.queue.push_back(entry);
+    }
+
+    fn pop_front(&mut self) -> Option<PendingPuback> {
+        let entry = self.queue.pop_front()?;
+        self.gates -= entry.gates;
+        Some(entry)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.queue.is_empty()
+    }
 }
 
 /// Hard cap on a connection's pipelined `QoS` 1 acks: beyond it the reader
@@ -1909,7 +1946,7 @@ fn apply_publish_outcome(
 async fn flush_ready_pubacks<W: AsyncWrite + Unpin>(
     writer: &mut FrameWriter<W>,
     current: &mut Option<PendingPuback>,
-    pending: &mut std::collections::VecDeque<PendingPuback>,
+    pending: &mut AckQueue,
     qos2_inflight: &mut usize,
     is_v5: bool,
     client: &ClientId,
@@ -2008,8 +2045,7 @@ where
     // Pipelined QoS 1 acks (ADR 0075): parked in publish order; only the
     // promoted FRONT (`current`) is awaited, so acks can never reorder and
     // the drain future borrows nothing the other branches' handlers touch.
-    let mut pending_pubacks: std::collections::VecDeque<PendingPuback> =
-        std::collections::VecDeque::new();
+    let mut pending_pubacks = AckQueue::default();
     let mut current: Option<PendingPuback> = None;
     // Ingress credit (ADR 0082 T3): this connection's cap over the node pool. A
     // publish that finds none is parked with the socket unread, so the publisher backs
@@ -2324,7 +2360,7 @@ async fn handle_publish<W: AsyncWrite + Unpin>(
     policy: &ConnPolicy,
     qos2_inbound: &mut HashMap<u16, bool>,
     qos2_inflight: &mut usize,
-    pending_pubacks: &mut std::collections::VecDeque<PendingPuback>,
+    pending_pubacks: &mut AckQueue,
     current_puback: &mut Option<PendingPuback>,
     is_v5: bool,
     inbound_aliases: &mut InboundAliases,
@@ -2427,8 +2463,11 @@ async fn handle_publish<W: AsyncWrite + Unpin>(
     // Skipping the channel also skips a `oneshot::channel` allocation per QoS 0
     // publish, on a path already measured at ~31% of its cycles in malloc (#490).
     let gated = !matches!(qos, QoS::AtMostOnce);
+    //
+    // Returns the receiver and how many hub acknowledgement gates the publish holds
+    // (its own, plus one per gated message its rules derived — ADR 0083).
     let forward = |hub: &mpsc::UnboundedSender<HubCommand>|
-     -> Option<oneshot::Receiver<crate::hub::PublishOutcome>> {
+     -> (Option<oneshot::Receiver<crate::hub::PublishOutcome>>, usize) {
         if authorized {
             let credit = match admission {
                 IngressAdmit::Credit(credit) => credit,
@@ -2438,15 +2477,16 @@ async fn handle_publish<W: AsyncWrite + Unpin>(
                     if let Some(m) = &policy.metrics {
                         m.publish_dropped("hub-ingress");
                     }
-                    return None;
+                    return (None, 0);
                 }
             };
             // The rule engine (ADR 0083) runs HERE: after the ACL, on this
             // connection's task, once per publish on the node it arrived at — so rule
             // work scales with connections and nodes and never runs on the hub loop.
-            // What the rules republish follows the original into the hub, and a gated
-            // original's ack waits for it too (`rules::send_derived`).
-            let derived = match &policy.rules {
+            // What the rules republish travels with the original to the hub, which
+            // routes it only if it accepts the original, and a gated original's ack
+            // waits for it too (`ConnRules::send_batch`).
+            let derived = match &rule_conn.rules {
                 Some(rules) => rules.on_publish(&crate::rules::PublishFacts {
                     client,
                     publisher: &rule_conn.publisher,
@@ -2466,14 +2506,14 @@ async fn handle_publish<W: AsyncWrite + Unpin>(
             } else {
                 (None, None)
             };
-            // With derived messages behind it, the credit rides the batch's LAST
-            // command so it is held until the whole batch has been dispatched.
+            // With derived messages behind it, the credit rides the batch, so it is
+            // held until the whole batch has been dispatched.
             let (credit, batch_credit) = if derived.is_empty() {
                 (credit, None)
             } else {
                 (None, credit)
             };
-            let _ = hub.send(HubCommand::Publish {
+            let original = HubCommand::Publish {
                 topic,
                 payload,
                 qos,
@@ -2484,14 +2524,18 @@ async fn handle_publish<W: AsyncWrite + Unpin>(
                 v5: is_v5,
                 publisher: Some(client.clone()), // #198: No Local excludes this publisher
                 credit,
-            });
-            if derived.is_empty() {
-                rx
-            } else {
-                crate::rules::send_derived(hub, rx, derived, batch_credit)
+            };
+            match &rule_conn.rules {
+                Some(rules) if !derived.is_empty() => {
+                    rules.send_batch(hub, original, rx, derived, batch_credit)
+                }
+                _ => {
+                    let _ = hub.send(original);
+                    (rx, usize::from(gated))
+                }
             }
         } else {
-            None
+            (None, 0)
         }
     };
     match (qos, pkid) {
@@ -2519,14 +2563,18 @@ async fn handle_publish<W: AsyncWrite + Unpin>(
             // with it into `apply_publish_outcome`, verbatim. An ACL denial
             // (`forward` = `None`, issue #246) rides the same queue with its
             // verdict pre-decided, so acks can never overtake each other.
-            let done = forward(hub);
+            let (done, holds) = forward(hub);
             if done.is_none() && is_v5 {
                 ack.reason = mqtt_codec::reason::NOT_AUTHORIZED;
             }
+            let holds = holds.max(1);
             // Backpressure: past the cap, resolve the oldest inline before
-            // parking another — same order, bounded memory.
-            while pending_pubacks.len() + usize::from(current_puback.is_some())
-                >= CONN_ACK_PIPELINE_MAX
+            // parking another — same order, bounded memory. Counted in hub gates
+            // (ADR 0083), so a publish whose rules derive many gated messages takes
+            // as many slots; one that alone exceeds the cap waits for an empty pipe.
+            while (!pending_pubacks.is_empty() || current_puback.is_some())
+                && pending_pubacks.gates + current_puback.as_ref().map_or(0, |e| e.gates) + holds
+                    > CONN_ACK_PIPELINE_MAX
             {
                 let mut entry = match current_puback.take() {
                     Some(e) => e,
@@ -2545,7 +2593,11 @@ async fn handle_publish<W: AsyncWrite + Unpin>(
                 writer.send(&Packet::PubAck(entry.ack)).await?;
             }
             *qos2_inflight += 1;
-            pending_pubacks.push_back(PendingPuback { ack, done });
+            pending_pubacks.push_back(PendingPuback {
+                ack,
+                done,
+                gates: holds,
+            });
         }
         (QoS::ExactlyOnce, Some(id)) => {
             // Exactly-once inbound [MQTT-4.3.3-2]: forward only the first
@@ -2605,7 +2657,7 @@ async fn handle_publish<W: AsyncWrite + Unpin>(
                     return Ok(PacketOutcome::BrokerClose);
                 }
                 let mut rec = mqtt_codec::packet::Ack::from(id);
-                if let Some(done) = forward(hub) {
+                if let Some(done) = forward(hub).0 {
                     // As for QoS 1: PUBREC promises the broker owns the message, so
                     // it is released only after the durable fan-out completes.
                     //
@@ -2808,7 +2860,7 @@ async fn handle_inbound<W: AsyncWrite + Unpin>(
     policy: &ConnPolicy,
     qos2_inbound: &mut HashMap<u16, bool>,
     qos2_inflight: &mut usize,
-    pending_pubacks: &mut std::collections::VecDeque<PendingPuback>,
+    pending_pubacks: &mut AckQueue,
     current_puback: &mut Option<PendingPuback>,
     is_v5: bool,
     inbound_aliases: &mut InboundAliases,
@@ -2994,7 +3046,7 @@ async fn handle_inbound<W: AsyncWrite + Unpin>(
                     properties: mqtt_codec::Properties::new(),
                 }))
                 .await?;
-            if let Some(rules) = &policy.rules {
+            if let Some(rules) = &rule_conn.rules {
                 if rules.wants(mqtt_rules::EventKind::SessionSubscribed) {
                     let info = rules.client_info(client, &rule_conn.publisher);
                     for (filter, qos) in subscribed {
@@ -3068,7 +3120,7 @@ async fn handle_inbound<W: AsyncWrite + Unpin>(
                     properties: mqtt_codec::Properties::new(),
                 }))
                 .await?;
-            if let Some(rules) = &policy.rules {
+            if let Some(rules) = &rule_conn.rules {
                 if rules.wants(mqtt_rules::EventKind::SessionUnsubscribed) {
                     let info = rules.client_info(client, &rule_conn.publisher);
                     for filter in removed {
@@ -3120,7 +3172,33 @@ async fn handle_inbound<W: AsyncWrite + Unpin>(
 
 #[cfg(test)]
 mod tests {
-    use super::{assigned_client_id, NodeId};
+    use super::{assigned_client_id, AckQueue, NodeId, PendingPuback};
+
+    /// The parked-ack pipeline counts the hub acknowledgement gates its entries hold
+    /// (ADR 0083): a publish whose rules derived gated messages takes one slot per
+    /// gate, and popping it returns them all, so the cap bounds what one connection
+    /// can hold in the hub's pending-publish table however far a rule fans out.
+    #[test]
+    fn the_ack_pipeline_counts_hub_gates_not_entries() {
+        let entry = |pkid: u16, gates: usize| PendingPuback {
+            ack: mqtt_codec::packet::Ack::from(pkid),
+            done: None,
+            gates,
+        };
+        let mut q = AckQueue::default();
+        assert!(q.is_empty());
+        q.push_back(entry(1, 1));
+        q.push_back(entry(2, 200));
+        q.push_back(entry(3, 1));
+        assert_eq!(q.gates, 202);
+        assert_eq!(q.pop_front().map(|e| e.ack.pkid), Some(1));
+        assert_eq!(q.gates, 201);
+        assert_eq!(q.pop_front().map(|e| e.gates), Some(200));
+        assert_eq!(q.gates, 1);
+        assert_eq!(q.pop_front().map(|e| e.ack.pkid), Some(3));
+        assert_eq!((q.gates, q.is_empty()), (0, true));
+        assert!(q.pop_front().is_none());
+    }
 
     /// Two nodes must never hand out the same server-assigned id.
     ///

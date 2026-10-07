@@ -4,7 +4,9 @@
 //! The payload, its topic and its user properties are publisher-controlled, and rules
 //! run on every publish they select (ADR 0083). These rules reach into the payload
 //! every way a rule can — JSON paths, indices and ranges, FOREACH, regexes whose
-//! pattern comes from the payload, conversions, templates — so the evaluator's error
+//! pattern comes from the payload, conversions, templates, and every argument that
+//! sizes, nests or dates what a function builds (pad lengths, decimals, replacements,
+//! separators, key paths, ranges, timestamps, date formats) — so the evaluator's error
 //! paths, not just its happy ones, are exercised. A rule failing is a correct answer;
 //! a panic is a finding.
 
@@ -21,6 +23,59 @@ actions = [{ function = "republish", args = { topic = "e/${s}", payload = "${i}"
 
 [rules.funcs]
 sql = '''SELECT regex_match(str(payload.p), str(payload.r)) AS m, regex_replace(str(payload), '\d+', 'N') AS n, split(str(payload), ',') AS parts, base64_decode(str(payload.b)) AS raw, json_decode(str(payload.j)) AS j, map_get(str(payload.k), payload) AS v, substr(str(payload), 1, 4) AS sub, format_date('second', 'Z', str(payload.fmt), 0) AS fd, sprintf(str(payload.fmt), 1) AS sp FROM "#"'''
+actions = [{ function = "console" }]
+
+# One rule per function, so one failing does not stop the others from running.
+[rules.size_pad]
+sql = '''SELECT pad(str(payload.s), payload.n, str(payload.dir), str(payload.c)) AS v FROM "#"'''
+actions = [{ function = "republish", args = { topic = "s/pad", payload = "${v}" } }]
+
+[rules.size_float2str]
+sql = '''SELECT float2str(payload.v, payload.d) AS v FROM "#"'''
+actions = [{ function = "republish", args = { topic = "s/float2str", payload = "${v}" } }]
+
+[rules.size_float]
+sql = '''SELECT float(payload.v, payload.d) AS v FROM "#"'''
+actions = [{ function = "republish", args = { topic = "s/float", payload = "${v}" } }]
+
+[rules.size_replace]
+sql = '''SELECT replace(str(payload.s), str(payload.c), str(payload.r)) AS v FROM "#"'''
+actions = [{ function = "republish", args = { topic = "s/replace", payload = "${v}" } }]
+
+[rules.size_regex_replace]
+sql = '''SELECT regex_replace(str(payload.s), str(payload.re), str(payload.r)) AS v FROM "#"'''
+actions = [{ function = "republish", args = { topic = "s/regex_replace", payload = "${v}" } }]
+
+[rules.size_join]
+sql = '''SELECT join_to_string(str(payload.c), payload.a) AS v FROM "#"'''
+actions = [{ function = "republish", args = { topic = "s/join", payload = "${v}" } }]
+
+[rules.size_map_put]
+sql = '''SELECT map_put(str(payload.k), payload.v, payload) AS v FROM "#"'''
+actions = [{ function = "republish", args = { topic = "s/map_put", payload = "${v}" } }]
+
+[rules.size_mput]
+sql = '''SELECT mput(payload.a, 1, map_new()) AS v FROM "#"'''
+actions = [{ function = "republish", args = { topic = "s/mput", payload = "${v}" } }]
+
+[rules.size_map_to_range]
+sql = '''SELECT map_to_range(payload.n, payload.lo, payload.hi) AS v FROM "#"'''
+actions = [{ function = "republish", args = { topic = "s/map_to_range", payload = "${v}" } }]
+
+[rules.size_hash_to_range]
+sql = '''SELECT hash_to_range(str(payload.s), payload.lo, payload.hi) AS v FROM "#"'''
+actions = [{ function = "republish", args = { topic = "s/hash_to_range", payload = "${v}" } }]
+
+[rules.size_format_date]
+sql = '''SELECT format_date('millisecond', str(payload.tz), str(payload.fmt), payload.ts) AS v FROM "#"'''
+actions = [{ function = "republish", args = { topic = "s/format_date", payload = "${v}" } }]
+
+[rules.size_rfc3339]
+sql = '''SELECT unix_ts_to_rfc3339(payload.ts, 'millisecond') AS v FROM "#"'''
+actions = [{ function = "republish", args = { topic = "s/rfc3339", payload = "${v}" } }]
+
+[rules.each_regex]
+sql = '''FOREACH payload.a AS e DO e INCASE regex_match(str(e), str(payload.re)) FROM "#"'''
 actions = [{ function = "console" }]
 
 [rules.star]

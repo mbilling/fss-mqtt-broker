@@ -29,6 +29,11 @@ pub const MAX_OUTPUTS_PER_TRIGGER: usize = 256;
 /// The longest `[lo..hi]` range literal (it materialises an array).
 const MAX_RANGE_LEN: i64 = 10_000;
 
+/// The most elements one `FOREACH` iterates. The collection is usually a payload
+/// array, and every element costs an `INCASE` evaluation even when it produces no
+/// output, so the output cap alone does not bound the work.
+pub const MAX_FOREACH_ELEMENTS: usize = 10_000;
+
 /// Per-trigger evaluation state, shared by every rule the trigger matches.
 pub struct EvalCtx<'a> {
     pub(crate) input: &'a dyn Input,
@@ -36,7 +41,14 @@ pub struct EvalCtx<'a> {
     all_fields: OnceCell<Map>,
     /// The rule being evaluated (EMQX's `metadata.rule_id`).
     pub(crate) rule_id: std::cell::RefCell<Arc<str>>,
+    /// The last regular expression compiled from a non-literal pattern during this
+    /// message, and what compiling it gave (see `funcs::regex`).
+    pub(crate) regex_cache: RegexCache,
 }
+
+/// A pattern and the result of compiling it.
+pub(crate) type RegexCache =
+    std::cell::RefCell<Option<(String, Result<Arc<regex::Regex>, String>)>>;
 
 impl std::fmt::Debug for EvalCtx<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -53,6 +65,7 @@ impl<'a> EvalCtx<'a> {
             payload_json: OnceCell::new(),
             all_fields: OnceCell::new(),
             rule_id: std::cell::RefCell::new(Arc::from("")),
+            regex_cache: std::cell::RefCell::new(None),
         }
     }
 
@@ -158,6 +171,12 @@ fn run_foreach(stmt: &Statement, ctx: &EvalCtx, out: &mut Vec<Map>) -> Result<()
     }
     if !condition(stmt.where_.as_ref(), ctx, &[&selected, &aliases])? {
         return Ok(());
+    }
+    if collection.len() > MAX_FOREACH_ELEMENTS {
+        return Err(EvalError::new(format!(
+            "FOREACH over {} elements; at most {MAX_FOREACH_ELEMENTS} are iterated",
+            collection.len()
+        )));
     }
     for element in collection {
         let mut item = Map::with_capacity(1);
@@ -431,7 +450,7 @@ pub(crate) fn eval(e: &Expr, ctx: &EvalCtx, frames: Frames) -> Result<Value, Eva
                 .collect::<Result<Vec<_>, _>>()?;
             let fcx = FnCtx {
                 ctx,
-                regex: regex.as_deref(),
+                regex: regex.as_ref(),
             };
             (func.f)(&args, &fcx).map_err(|err| err.in_fn(func.name))?
         }

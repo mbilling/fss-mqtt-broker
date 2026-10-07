@@ -25,7 +25,7 @@ use crate::EvalError;
 pub(crate) struct FnCtx<'a> {
     pub ctx: &'a EvalCtx<'a>,
     /// The load-time-compiled pattern when the function's regex argument is a literal.
-    pub regex: Option<&'a Regex>,
+    pub regex: Option<&'a Arc<Regex>>,
 }
 
 /// A built-in function.
@@ -45,6 +45,35 @@ impl std::fmt::Debug for Func {
 }
 
 const MANY: usize = usize::MAX;
+
+/// How far a function may grow a string beyond its inputs: `pad`'s length, a
+/// `replace`/`regex_replace` that substitutes a longer string at every match, a
+/// `join_to_string` separator repeated between items. Sizes and strings like these are
+/// often payload fields, and output that grows with the *product* of two of them lets
+/// one small publish ask for gigabytes — an allocation failure aborts the process, as
+/// does `str::repeat`'s capacity panic under `panic = "abort"`. Past the bound the
+/// function fails, and so does the rule; the message is still routed.
+pub(crate) const MAX_BUILT_BYTES: usize = 1 << 20;
+
+/// The longest key path `map_put` / `mput` build. Each segment is one level of a nested
+/// map, built recursively and later rendered and dropped recursively, and the path is
+/// often a payload field.
+const MAX_PATH_SEGMENTS: usize = 64;
+
+/// Refuse an output of `output` bytes (`None`: too large to count) built from inputs
+/// totalling `input` bytes when it grows them by more than [`MAX_BUILT_BYTES`].
+fn bounded_growth(name: &str, input: usize, output: Option<usize>) -> Result<(), EvalError> {
+    match output {
+        Some(n) if n <= input.saturating_add(MAX_BUILT_BYTES) => Ok(()),
+        _ => Err(EvalError::new(format!(
+            "{name} would build more than {MAX_BUILT_BYTES} bytes beyond its input"
+        ))),
+    }
+}
+
+/// The decimals `float()` and `float2str()` accept: Erlang's `float_to_binary`'s own
+/// range, which is what EMQX formats with.
+const MAX_DECIMALS: i64 = 253;
 
 macro_rules! funcs {
     ($( $name:literal $min:literal ..= $max:tt => $f:expr $(, regex $r:literal)? ;)*) => {
@@ -140,8 +169,8 @@ funcs! {
             None => Value::float(f),
             Some(d) => {
                 let d = int(d)?;
-                if !(1..=253).contains(&d) {
-                    return Err(EvalError::new("decimals must be in 1..=253"));
+                if !(1..=MAX_DECIMALS).contains(&d) {
+                    return Err(EvalError::new(format!("decimals must be in 1..={MAX_DECIMALS}")));
                 }
                 let s = format!("{f:.prec$}", prec = usize::try_from(d).unwrap_or(1));
                 Value::float(s.parse().map_err(|_| EvalError::new("float conversion failed"))?)
@@ -150,7 +179,11 @@ funcs! {
     };
     "float2str" 2..=2 => |a, _| {
         let f = to_float(&a[0])?;
-        let d = usize::try_from(int(&a[1])?).map_err(|_| EvalError::new("decimals must be >= 0"))?;
+        let d = int(&a[1])?;
+        if !(0..=MAX_DECIMALS).contains(&d) {
+            return Err(EvalError::new(format!("decimals must be in 0..={MAX_DECIMALS}")));
+        }
+        let d = usize::try_from(d).unwrap_or(0);
         Ok(Value::from(compact_decimals(&format!("{f:.d$}"))))
     };
     "int" 1..=1 => |a, _| Ok(Value::Int(to_int(&a[0])?));
@@ -194,6 +227,9 @@ funcs! {
         };
         let items = array(list)?;
         let parts = items.iter().map(Value::to_text).collect::<Result<Vec<_>, _>>()?;
+        let text_len: usize = parts.iter().map(String::len).sum();
+        let seps = parts.len().saturating_sub(1).checked_mul(sep.len());
+        bounded_growth("join_to_string", text_len + sep.len(), seps.and_then(|n| n.checked_add(text_len)))?;
         Ok(Value::from(parts.join(&sep)))
     };
     "lower" 1..=1 => |a, _| Ok(Value::from(text(&a[0])?.to_lowercase()));
@@ -204,6 +240,7 @@ funcs! {
         let dir = direction(a.get(2), &["trailing", "leading", "both"])?;
         let ch = a.get(3).map(text).transpose()?.unwrap_or(" ");
         let missing = len.saturating_sub(s.chars().count());
+        bounded_growth("pad", s.len(), missing.checked_mul(ch.len()).and_then(|n| n.checked_add(s.len())))?;
         let (left, right) = match dir {
             "leading" => (missing, 0),
             "both" => (missing / 2, missing - missing / 2),
@@ -214,8 +251,8 @@ funcs! {
     "regex_match" 2..=2 => |a, cx| Ok(Value::Bool(regex(cx, &a[1])?.is_match(text(&a[0])?))), regex 1;
     "regex_replace" 3..=3 => |a, cx| {
         let re = regex(cx, &a[1])?;
-        let rep = erlang_replacement(text(&a[2])?);
-        Ok(Value::from(re.replace_all(text(&a[0])?, rep.as_str()).into_owned()))
+        let (s, rep) = (text(&a[0])?, text(&a[2])?);
+        bounded_replace_all(&re, s, &erlang_replacement(rep))
     }, regex 1;
     "regex_extract" 2..=2 => |a, cx| {
         let re = regex(cx, &a[1])?;
@@ -235,7 +272,13 @@ funcs! {
                 Some(i) => format!("{}{r}{}", &s[..i], &s[i + p.len()..]),
                 None => s.to_string(),
             },
-            _ => s.replace(p, r),
+            _ => {
+                if r.len() > p.len() {
+                    let grown = s.matches(p).count().checked_mul(r.len() - p.len());
+                    bounded_growth("replace", s.len() + r.len(), grown.and_then(|g| g.checked_add(s.len())))?;
+                }
+                s.replace(p, r)
+            }
         }))
     };
     "reverse" 1..=1 => |a, _| Ok(Value::from(text(&a[0])?.chars().rev().collect::<String>()));
@@ -297,12 +340,12 @@ funcs! {
         let path = dotted(text(&a[0])?);
         Ok(get_path(&decode_if_text(&a[1]), &path).unwrap_or_else(|| a.get(2).cloned().unwrap_or_default()))
     };
-    "map_put" 3..=3 => |a, _| Ok(put_path(decode_if_text(&a[2]), &dotted(text(&a[0])?), a[1].clone()));
+    "map_put" 3..=3 => |a, _| Ok(put_path(decode_if_text(&a[2]), &bounded_path(dotted(text(&a[0])?))?, a[1].clone()));
     "mget" 2..=3 => |a, _| {
         let path = key_list(&a[0])?;
         Ok(get_path(&decode_if_text(&a[1]), &path).unwrap_or_else(|| a.get(2).cloned().unwrap_or_default()))
     };
-    "mput" 3..=3 => |a, _| Ok(put_path(decode_if_text(&a[2]), &key_list(&a[0])?, a[1].clone()));
+    "mput" 3..=3 => |a, _| Ok(put_path(decode_if_text(&a[2]), &bounded_path(key_list(&a[0])?)?, a[1].clone()));
     "map_keys" 1..=1 => |a, _| Ok(Value::from(map(&a[0])?.iter().map(|(k, _)| Value::Str(k.clone())).collect::<Vec<_>>()));
     "map_values" 1..=1 => |a, _| Ok(Value::from(map(&a[0])?.iter().map(|(_, v)| v.clone()).collect::<Vec<_>>()));
     "map_size" 1..=1 => |a, _| Ok(Value::Int(i64::try_from(map(&a[0])?.len()).unwrap_or(i64::MAX)));
@@ -358,8 +401,15 @@ funcs! {
     "map_to_range" 3..=3 => |a, _| match &a[0] {
         Value::Int(n) => range_map(&n.to_be_bytes(), &a[1], &a[2]).and_then(|v| {
             // A negative integer maps by its value, not its two's-complement bytes.
-            let (lo, hi) = (int(&a[1])?, int(&a[2])?);
-            if *n < 0 { Ok(Value::Int(lo + n.rem_euclid(hi - lo + 1))) } else { Ok(v) }
+            // In i128: the span of an i64 range overflows an i64. `range_map` has
+            // already checked lo <= hi, so the result lies in [lo, hi].
+            let (lo, hi) = (i128::from(int(&a[1])?), i128::from(int(&a[2])?));
+            if *n < 0 {
+                let r = lo + i128::from(*n).rem_euclid(hi - lo + 1);
+                Ok(Value::Int(i64::try_from(r).map_err(|_| overflow())?))
+            } else {
+                Ok(v)
+            }
         }),
         v => {
             let b = bin(v)?;
@@ -420,12 +470,7 @@ funcs! {
         let u = unit(Some(&a[0]))?;
         let offset = chrono::FixedOffset::east_opt(offset_seconds(&a[1])?)
             .ok_or_else(|| EvalError::new("time zone offset out of range"))?;
-        let nanos = i128::from(int(&a[3])?) * nanos_per(u);
-        let secs = i64::try_from(nanos.div_euclid(1_000_000_000)).map_err(|_| overflow())?;
-        let sub = u32::try_from(nanos.rem_euclid(1_000_000_000)).unwrap_or(0);
-        let t = chrono::DateTime::from_timestamp(secs, sub)
-            .ok_or_else(|| EvalError::new("time out of range"))?
-            .with_timezone(&offset);
+        let t = utc_from_nanos(i128::from(int(&a[3])?) * nanos_per(u))?.with_timezone(&offset);
         format_time(&t, text(&a[2])?).map(Value::from)
     };
     "date_to_unix_ts" 3..=4 => |a, _| {
@@ -504,11 +549,50 @@ pub(crate) fn compile_regex(pattern: &str) -> Result<Regex, EvalError> {
         .map_err(|e| EvalError::new(format!("invalid regular expression: {e}")))
 }
 
-fn regex<'a>(cx: &'a FnCtx, pattern: &Value) -> Result<std::borrow::Cow<'a, Regex>, EvalError> {
-    match cx.regex {
-        Some(re) => Ok(std::borrow::Cow::Borrowed(re)),
-        None => compile_regex(text(pattern)?).map(std::borrow::Cow::Owned),
+/// The function's pattern: compiled at load when it is a literal; otherwise compiled
+/// here and remembered for the rest of the message, so a pattern taken from the payload
+/// and applied per `FOREACH` element is compiled once, not once per element.
+fn regex(cx: &FnCtx, pattern: &Value) -> Result<Arc<Regex>, EvalError> {
+    if let Some(re) = cx.regex {
+        return Ok(re.clone());
     }
+    let p = text(pattern)?;
+    let mut cache = cx.ctx.regex_cache.borrow_mut();
+    if let Some((cached, compiled)) = cache.as_ref() {
+        if cached.as_str() == p {
+            return compiled.clone().map_err(EvalError::new);
+        }
+    }
+    let compiled = compile_regex(p).map(Arc::new).map_err(|e| e.0);
+    *cache = Some((p.to_string(), compiled.clone()));
+    compiled.map_err(EvalError::new)
+}
+
+/// `replace_all`, refused once the output would grow its input by more than
+/// [`MAX_BUILT_BYTES`]. Checked before each expansion, against an upper bound on it:
+/// the replacement's own length plus, for every `$` reference in it, the whole match.
+fn bounded_replace_all(re: &Regex, s: &str, rep: &str) -> Result<Value, EvalError> {
+    let limit = s
+        .len()
+        .saturating_add(rep.len())
+        .saturating_add(MAX_BUILT_BYTES);
+    let refs = rep.bytes().filter(|b| *b == b'$').count();
+    let mut out = String::new();
+    let mut last = 0;
+    for caps in re.captures_iter(s) {
+        let Some(m) = caps.get(0) else { continue };
+        let worst = refs
+            .checked_mul(m.len())
+            .and_then(|n| n.checked_add(rep.len() + (m.start() - last) + out.len()));
+        if worst.is_none_or(|n| n > limit) {
+            bounded_growth("regex_replace", s.len() + rep.len(), None)?;
+        }
+        out.push_str(&s[last..m.start()]);
+        caps.expand(rep, &mut out);
+        last = m.end();
+    }
+    out.push_str(&s[last..]);
+    Ok(Value::from(out))
 }
 
 /// Erlang `re:replace` replacement syntax (`&` = whole match, `\N` = group N) in the
@@ -704,6 +788,17 @@ fn get_path(v: &Value, path: &[Arc<str>]) -> Option<Value> {
     Some(cur)
 }
 
+/// A `map_put` / `mput` path, refused past [`MAX_PATH_SEGMENTS`].
+fn bounded_path(path: Vec<Arc<str>>) -> Result<Vec<Arc<str>>, EvalError> {
+    if path.len() > MAX_PATH_SEGMENTS {
+        return Err(EvalError::new(format!(
+            "a key path of {} segments is longer than {MAX_PATH_SEGMENTS}",
+            path.len()
+        )));
+    }
+    Ok(path)
+}
+
 fn put_path(target: Value, path: &[Arc<str>], v: Value) -> Value {
     let Some((k, rest)) = path.split_first() else {
         return v;
@@ -747,7 +842,9 @@ fn range_map(bytes: &[u8], lo: &Value, hi: &Value) -> Result<Value, EvalError> {
     let rem = bytes
         .iter()
         .fold(0u128, |acc, b| (acc * 256 + u128::from(*b)) % span);
-    Ok(Value::Int(lo + i64::try_from(rem).map_err(|_| overflow())?))
+    // lo + rem <= hi, so it fits; the sum is taken in i128 because rem alone may not.
+    let v = i128::from(lo) + i128::try_from(rem).map_err(|_| overflow())?;
+    Ok(Value::Int(i64::try_from(v).map_err(|_| overflow())?))
 }
 
 fn hex_decode(s: &str) -> Result<Vec<u8>, EvalError> {
@@ -990,13 +1087,26 @@ fn datetime_nanos<Tz: chrono::TimeZone>(t: &chrono::DateTime<Tz>) -> i128 {
     i128::from(t.timestamp()) * 1_000_000_000 + i128::from(t.timestamp_subsec_nanos())
 }
 
+/// A UTC time from nanoseconds since the epoch, refused unless chrono can also render
+/// it in any offset: rendering adds the offset to the UTC time, and chrono PANICS when
+/// that sum leaves its range — so the range's last two days at either end are refused
+/// too. The timestamp is often a payload field.
+fn utc_from_nanos(nanos: i128) -> Result<chrono::DateTime<chrono::Utc>, EvalError> {
+    const MARGIN_SECS: i64 = 2 * 86_400;
+    let out_of_range = || EvalError::new("time out of range");
+    let secs = i64::try_from(nanos.div_euclid(1_000_000_000)).map_err(|_| out_of_range())?;
+    let sub = u32::try_from(nanos.rem_euclid(1_000_000_000)).unwrap_or(0);
+    let lo = chrono::DateTime::<chrono::Utc>::MIN_UTC.timestamp() + MARGIN_SECS;
+    let hi = chrono::DateTime::<chrono::Utc>::MAX_UTC.timestamp() - MARGIN_SECS;
+    if !(lo..=hi).contains(&secs) {
+        return Err(out_of_range());
+    }
+    chrono::DateTime::from_timestamp(secs, sub).ok_or_else(out_of_range)
+}
+
 /// An RFC 3339 string in the system's local offset, at the unit's precision.
 fn rfc3339(nanos: i128, u: Unit) -> Result<Value, EvalError> {
-    let secs = i64::try_from(nanos.div_euclid(1_000_000_000)).map_err(|_| overflow())?;
-    let sub = u32::try_from(nanos.rem_euclid(1_000_000_000)).unwrap_or(0);
-    let t = chrono::DateTime::from_timestamp(secs, sub)
-        .ok_or_else(|| EvalError::new("time out of range"))?
-        .with_timezone(&chrono::Local);
+    let t = utc_from_nanos(nanos)?.with_timezone(&chrono::Local);
     let fmt = match u {
         Unit::Second => chrono::SecondsFormat::Secs,
         Unit::Milli => chrono::SecondsFormat::Millis,
@@ -1062,7 +1172,19 @@ fn checked_items(fmt: &str) -> Result<Vec<chrono::format::Item<'_>>, EvalError> 
 fn format_time(t: &chrono::DateTime<chrono::FixedOffset>, fmt: &str) -> Result<String, EvalError> {
     let fmt = chrono_format(fmt);
     let items = checked_items(&fmt)?;
-    Ok(t.format_with_items(items.into_iter()).to_string())
+    // Not `to_string()`: a specifier chrono can parse but not format (`%#z`) makes the
+    // formatter fail, and `to_string()` panics on a failing `Display`.
+    let mut out = String::new();
+    std::fmt::Write::write_fmt(
+        &mut out,
+        format_args!("{}", t.format_with_items(items.into_iter())),
+    )
+    .map_err(|_| {
+        EvalError::new(format!(
+            "date format '{fmt}' cannot be used to format a date"
+        ))
+    })?;
+    Ok(out)
 }
 
 fn parse_time(fmt: &str, input: &str, offset: Option<i32>) -> Result<i128, EvalError> {

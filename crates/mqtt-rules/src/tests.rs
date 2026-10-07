@@ -549,6 +549,232 @@ fn load_errors_are_specific() {
     assert!(e.contains("line 2"), "{e}");
 }
 
+/// A size a function builds from is often a payload field, so it is bounded: past the
+/// bound the rule fails (counted, the message still routed) instead of allocating
+/// without limit — or panicking in `str::repeat`, which under `panic = "abort"` would
+/// end the process.
+#[test]
+fn payload_supplied_sizes_are_bounded() {
+    let pad = "SELECT pad(payload.s, payload.n, 'leading', payload.c) AS p FROM \"t/#\"";
+    assert_eq!(one(pad, r#"{"s":"ab","n":5,"c":"0"}"#), r#"{"p":"000ab"}"#);
+    // Growth up to 1 MiB beyond the input is allowed; a byte more is not.
+    one(pad, r#"{"s":"ab","n":1048578,"c":"0"}"#);
+    for n in ["1048579", "4000000000", "9223372036854775807"] {
+        let e = fails(pad, &format!(r#"{{"s":"ab","n":{n},"c":"0"}}"#));
+        assert!(
+            e.contains("more than 1048576 bytes beyond its input"),
+            "{n}: {e}"
+        );
+    }
+    // The bound is on bytes built, so a wide pad character cannot multiply it.
+    let e = fails(pad, r#"{"s":"ab","n":600000,"c":"ab"}"#);
+    assert!(e.contains("beyond its input"), "{e}");
+
+    let f2s = "SELECT float2str(payload.v, payload.d) AS f FROM \"t/#\"";
+    one(f2s, r#"{"v":3.25,"d":0}"#);
+    one(f2s, r#"{"v":3.25,"d":253}"#);
+    for d in ["254", "1000000000", "-1"] {
+        let e = fails(f2s, &format!(r#"{{"v":3.25,"d":{d}}}"#));
+        assert!(e.contains("decimals must be in 0..=253"), "{d}: {e}");
+    }
+}
+
+/// Output that grows with the PRODUCT of two payload sizes — a replacement repeated at
+/// every match, a separator repeated between items — is refused past 1 MiB of growth,
+/// before it is allocated: a 124 KB publish used to ask for 2 GB and abort the process.
+/// Ordinary use, including shrinking a large input, is untouched.
+#[test]
+fn quadratic_string_growth_is_refused_before_it_is_allocated() {
+    let big = |c: char, n: usize| c.to_string().repeat(n);
+    let replace = "SELECT replace(payload.s, ',', payload.r) AS o FROM \"t/#\"";
+    let e = fails(
+        replace,
+        &format!(
+            r#"{{"s":"{}","r":"{}"}}"#,
+            big(',', 62_000),
+            big('x', 62_000)
+        ),
+    );
+    assert!(e.contains("replace would build more than"), "{e}");
+    assert_eq!(
+        one(replace, r#"{"s":"a,b,c","r":"; "}"#),
+        r#"{"o":"a; b; c"}"#
+    );
+    // Shrinking a large input is fine whatever its size.
+    let shrink = format!(r#"{{"s":"{}","r":""}}"#, big(',', 2_000_000));
+    assert_eq!(one(replace, &shrink), r#"{"o":""}"#);
+
+    let rr = "SELECT regex_replace(payload.s, 'a', payload.r) AS o FROM \"t/#\"";
+    let e = fails(
+        rr,
+        &format!(
+            r#"{{"s":"{}","r":"{}"}}"#,
+            big('a', 20_000),
+            big('x', 60_000)
+        ),
+    );
+    assert!(e.contains("regex_replace would build more than"), "{e}");
+    // `&` is the whole match: 4,000 copies of a 20,000-byte match is 80 MB.
+    let rr_all = "SELECT regex_replace(payload.s, 'a+', payload.r) AS o FROM \"t/#\"";
+    let e = fails(
+        rr_all,
+        &format!(
+            r#"{{"s":"{}","r":"{}"}}"#,
+            big('a', 20_000),
+            big('&', 4_000)
+        ),
+    );
+    assert!(e.contains("regex_replace would build more than"), "{e}");
+    assert_eq!(
+        one(rr_all, r#"{"s":"xaay","r":"[&]"}"#),
+        r#"{"o":"x[aa]y"}"#
+    );
+
+    let join = "SELECT join_to_string(payload.sep, payload.items) AS o FROM \"t/#\"";
+    let items = format!("[{}]", vec!["\"\""; 20_000].join(","));
+    let e = fails(
+        join,
+        &format!(r#"{{"items":{items},"sep":"{}"}}"#, big('x', 60_000)),
+    );
+    assert!(e.contains("join_to_string would build more than"), "{e}");
+    assert_eq!(
+        one(join, r#"{"items":[1,2,3],"sep":"-"}"#),
+        r#"{"o":"1-2-3"}"#
+    );
+}
+
+/// Each of these crashed the process from a payload value, found by an audit of the
+/// functions against publisher-controlled arguments.
+#[test]
+fn payload_values_cannot_crash_the_evaluator() {
+    // A key path of 120,000 segments recursed once per segment: a stack overflow.
+    let put = "SELECT map_put(payload.k, 1, map_new()) AS m FROM \"t/#\"";
+    let e = fails(put, &format!(r#"{{"k":"{}"}}"#, ".".repeat(120_000)));
+    assert!(e.contains("longer than 64"), "{e}");
+    assert_eq!(one(put, r#"{"k":"a.b"}"#), r#"{"m":{"a":{"b":1}}}"#);
+    let mput = "SELECT mput(payload.k, 1, map_new()) AS m FROM \"t/#\"";
+    let keys = format!("[{}]", vec!["\"k\""; 65].join(","));
+    assert!(fails(mput, &format!(r#"{{"k":{keys}}}"#)).contains("longer than 64"));
+
+    // A parse-only specifier made the formatter fail, and `to_string()` panicked.
+    let fd = "SELECT format_date('second', 'Z', payload.f, 1700000000) AS d FROM \"t/#\"";
+    let e = fails(fd, r#"{"f":"%#z"}"#);
+    assert!(e.contains("cannot be used to format"), "{e}");
+    assert_eq!(one(fd, r#"{"f":"%Y"}"#), r#"{"d":"2023"}"#);
+
+    // At the edge of chrono's range, rendering in an offset panicked inside chrono.
+    for ts in ["8210266876799000", "-8334601228800000"] {
+        for sql in [
+            "SELECT unix_ts_to_rfc3339(payload.ts, 'millisecond') AS t FROM \"t/#\"",
+            "SELECT format_date('millisecond', '+14:00', '%Y', payload.ts) AS t FROM \"t/#\"",
+            "SELECT format_date('millisecond', '-14:00', '%Y', payload.ts) AS t FROM \"t/#\"",
+        ] {
+            let e = fails(sql, &format!(r#"{{"ts":{ts}}}"#));
+            assert!(e.contains("time out of range"), "{sql} {ts}: {e}");
+        }
+    }
+
+    // The span of a full i64 range overflowed: a panic with overflow checks on, a
+    // wrong (but in-range) answer without them.
+    let mtr = "SELECT map_to_range(payload.n, payload.lo, payload.hi) AS b FROM \"t/#\"";
+    assert_eq!(
+        one(mtr, r#"{"n":-5,"lo":-10,"hi":9223372036854775807}"#),
+        r#"{"b":9223372036854775803}"#
+    );
+    one(
+        mtr,
+        r#"{"n":-5,"lo":-9223372036854775808,"hi":9223372036854775807}"#,
+    );
+}
+
+/// Work that grew with the square of a payload size: decoding an object with many
+/// keys (each insert scanned the map), the user-property map (rebuilt on every
+/// reference), and a FOREACH whose INCASE ran for every element of any array.
+#[test]
+fn payload_shapes_cannot_make_evaluation_quadratic() {
+    // 200,000 distinct keys decode in linear time; repeated keys keep their first
+    // position and their last value, as before.
+    let keys: Vec<String> = (0..200_000).map(|i| format!(r#""k{i}":{i}"#)).collect();
+    let payload = format!("{{{}}}", keys.join(","));
+    let started = std::time::Instant::now();
+    assert_eq!(
+        one("SELECT payload.k199999 AS v FROM \"t/#\"", &payload),
+        r#"{"v":199999}"#
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "{:?}",
+        started.elapsed()
+    );
+    let mut dup: Vec<String> = (0..100).map(|i| format!(r#""k{i}":{i}"#)).collect();
+    dup.push(r#""k0":"last""#.into());
+    assert_eq!(
+        one(
+            "SELECT json_decode(payload) AS p FROM \"t/#\"",
+            &format!("{{{}}}", dup.join(","))
+        ),
+        format!(
+            r#"{{"p":{{{},{}}}}}"#,
+            r#""k0":"last""#,
+            dup[1..100].join(",")
+        )
+    );
+
+    // FOREACH iterates at most 10,000 elements, outputs or not.
+    let each = "FOREACH payload.a AS e DO e INCASE e > 1 FROM \"t/#\"";
+    let arr = |n: usize| format!(r#"{{"a":[{}]}}"#, vec!["0"; n].join(","));
+    assert!(run_on(each, "t/a", &arr(10_000)).unwrap().is_empty());
+    let e = fails(each, &arr(10_001));
+    assert!(e.contains("at most 10000 are iterated"), "{e}");
+}
+
+/// Evaluating (and dropping) an expression recurses once per level of its tree, so a
+/// tree tall enough to overflow a connection task's stack is refused at load with an
+/// error, whether it is built by nesting or by a long left-associative chain — which
+/// the parser builds in a loop, without recursing at all.
+#[test]
+fn expressions_too_deep_to_evaluate_safely_fail_the_load() {
+    let chain = |op: &str, n: usize| {
+        let terms = vec!["1"; n + 1].join(op);
+        format!("SELECT {terms} AS x FROM \"t/#\"")
+    };
+    let e = check_sql(&chain(" + ", 300)).unwrap_err();
+    assert!(e.contains("levels deep"), "{e}");
+    let e = check_sql(&chain(" OR ", 300)).unwrap_err();
+    assert!(e.contains("levels deep"), "{e}");
+    let nots = format!("SELECT a FROM \"t\" WHERE {}a", "NOT ".repeat(300));
+    assert!(check_sql(&nots).unwrap_err().contains("levels deep"));
+    let parens = format!(
+        "SELECT {}1{} AS x FROM \"t\"",
+        "(".repeat(100),
+        ")".repeat(100)
+    );
+    assert!(check_sql(&parens).unwrap_err().contains("nests more than"));
+    let signs = format!("SELECT {}1 AS x FROM \"t\"", "- ".repeat(100));
+    assert!(check_sql(&signs).unwrap_err().contains("nests more than"));
+    let calls = format!(
+        "SELECT {}a{} AS x FROM \"t\"",
+        "abs(".repeat(300),
+        ")".repeat(300)
+    );
+    assert!(check_sql(&calls).is_err());
+
+    // Real rules are nowhere near the limits, and evaluate as before.
+    check_sql(&chain(" + ", 200)).unwrap();
+    assert_eq!(one(&chain(" + ", 200), "{}"), r#"{"x":201}"#);
+    assert_eq!(
+        one(
+            &format!(
+                "SELECT {}1{} AS x FROM \"t/#\"",
+                "(".repeat(40),
+                ")".repeat(40)
+            ),
+            "{}"
+        ),
+        r#"{"x":1}"#
+    );
+}
+
 #[test]
 fn double_quoted_comparisons_warn_but_parse_as_fields() {
     // EMQX's grammar: "sensor_1" is a field, not a string.

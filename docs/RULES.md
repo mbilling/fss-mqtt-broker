@@ -58,22 +58,44 @@ an additional message.
 - **A republished message never re-enters the rule engine**, so no rule can loop. EMQX
   calls this `direct_dispatch`; in mqttd it is always on.
 - **Last Wills run rules too**, as in EMQX. The hub publishes a Will, so the hub
-  evaluates it. Wills are rare, so this is the one place rule SQL runs on the hub.
+  evaluates it; this is the one place rule SQL runs on the hub. Evaluating a Will at
+  CONNECT instead, on the connection task, would give it the wrong timestamps and miss
+  any reload before the client went away. A rule that selects no Will topic costs a
+  Will about 0.17 µs; one that matches costs what it costs any publish (see
+  [Performance](#performance)), on top of the Will's own routing. A mass disconnect
+  (a partition, a load-balancer restart) brings the Wills at once, so rules that match
+  Will topics add to that burst.
+- **A publish and its derived messages reach the hub as one command.** The hub routes
+  the original first, then its derived messages, and only if it accepted the original:
+  a refused publish produces nothing, so a resend cannot duplicate what its rules
+  derived.
 
 ## Delivery guarantees: QoS 0, 1 and 2
 
 | Inbound publish | What its rules' messages get |
 |---|---|
 | `QoS` 0 | Published at the `qos` each action sets. Nothing waits for them, because a QoS 0 publish has no acknowledgement. |
-| `QoS` 1 | Every derived message at QoS ≥ 1 gets its own acknowledgement gate. The publisher's **PUBACK is released only after the original and all of them are accepted**, durably where durability applies. |
+| `QoS` 1 | Every derived message at QoS ≥ 1 gets its own acknowledgement gate, and the **PUBACK waits for all of them**: when it is released, each derived message is stored wherever it was owed (durably where durability applies) or was refused and counted. |
 | `QoS` 2 | As for QoS 1, for the PUBREC. The broker's inbound exactly-once window covers the rules too: a DUP resend of an acknowledged packet id is answered without being forwarded again, so **its rules fire once**. |
 
-If the original and its derived messages disagree, for example the original is stored
-but a derived message is refused under a disk brownout, the acknowledgement is
-**withheld**: the connection closes without a PUBACK and the publisher retries. Telling
-the publisher "refused" would claim nothing was stored, which is false; acknowledging it
-would claim everything was, which is also false. A retry can duplicate the original,
-which QoS 1 allows. `tests/rules.rs` proves this over a real socket.
+**What the publisher is told is the original's answer:**
+
+- **Original refused** (a brownout, a retained quota): the publisher gets that refusal,
+  and the hub routed none of its derived messages, so nothing was stored for it
+  anywhere and a resend duplicates nothing.
+- **Original accepted, a derived message refused** (a brownout refuses it because it
+  needs storage): the derived message is dropped and counted as a failed action
+  (`mqttd_rule_actions_total{result="failed"}`), and the publisher is **acknowledged**.
+  The original was delivered; withholding its acknowledgement would have the publisher
+  resend it, and the broker re-deliver it, for as long as the brownout lasts. A
+  brownout refuses new growth writes, and a derived message is one.
+- **A fate nobody can vouch for** (a durable write that failed, the hub shutting down),
+  for the original or for any derived message: the acknowledgement is **withheld**, the
+  connection closes, and the publisher retries — as for any publish whose fate is
+  unknown. A retry can duplicate what was already delivered, which QoS 1 allows; for
+  QoS 2 it is the residual a mid-fan-out store failure already has.
+
+`tests/rules.rs` proves each of these over a real socket.
 
 A derived message is published **as no client**: MQTT 5 *No Local* does not suppress it
 for the original publisher (in EMQX the rule is the sender, too), and a retained-quota
@@ -104,8 +126,19 @@ description = ""      # optional
 Loading is **all-or-nothing**: one rule that does not parse rejects the file. At
 startup the broker refuses to boot, and on a reload the running rules stay in force.
 Unknown keys are errors. The limits are 1,024 rules per file, 16 actions per rule and
-64 KiB of SQL per rule. One message can produce at most 256 outputs from one `FOREACH`
-and 1,024 effects across all its rules.
+64 KiB of SQL per rule, and an expression at most 256 levels deep (64 levels of
+parentheses or signs): evaluating an expression recurses once per level, so a deeper
+one is refused at load rather than overflowing a stack when a message arrives.
+
+Per message, the limits protect the broker from what a publisher sends, because rules
+often pass payload fields to functions. A `FOREACH` iterates at most 10,000 elements
+and produces at most 256 outputs; all of a message's rules produce at most 1,024
+effects. A function may build at most 1 MiB beyond its inputs (`pad`'s length, a
+`replace` or `regex_replace` that substitutes a longer string at every match, a
+`join_to_string` separator), `map_put` / `mput` take a key path of at most 64
+segments, and a timestamp must lie within the date range every time zone can render.
+Past a limit the function fails, so the rule fails and is counted; the message itself
+is still routed.
 
 Rules evaluate in **id order**, and their derived messages are published in that order
 after the original.
@@ -280,7 +313,7 @@ Republish to a topic and consume it with a `$share` group
 | Try a statement | `mqttd --rule-test --sql '<statement>' [--topic t] [--payload p] [--clientid c] [--username u] [--qos n]` prints each output as JSON. This is EMQX's "SQL test", offline. |
 | Change rules | Edit the file, then `SIGHUP`, or `POST /admin/v1/reload`; with `MQTTD_CONFIG_WATCH` set, the file watcher picks the edit up on its own. The next publish runs the new rules. A file that does not load is rejected with the reload, keeping the running rules. |
 | Confirm every node runs the same rules | `mqttd_rules_info{checksum}`: the file's SHA-256, one series at 1 per node. Rules are per-node configuration like the ACL file, so a node with a different file evaluates its own clients' publishes with different rules. |
-| Watch rules work | `mqttd_rule_evaluations_total{rule,result}` (`passed`, `no_result`, `failed`) and `mqttd_rule_actions_total{rule,result}` (`ok`, `failed`) are EMQX's per-rule counters. `mqttd_rules_loaded` is the number of enabled rules. A rule failing on every message logs one WARN per 10 s with the error; the rest are at DEBUG. |
+| Watch rules work | `mqttd_rule_evaluations_total{rule,result}` (`passed`, `no_result`, `failed`) and `mqttd_rule_actions_total{rule,result}` (`ok`, `failed`) are EMQX's per-rule counters. An action is counted once its outcome is known: a republish is `ok` when the broker routed it (accepted it, for a QoS ≥ 1 message behind a QoS ≥ 1 publish; handed it to the hub, for anything ungated) and `failed` when it could not render, when the broker refused it, when the broker refused its original (and so routed none of its derived messages), or when its fate is unknown. `mqttd_rules_loaded` is the number of enabled rules. A rule failing on every message logs one WARN per 10 s with the error; the rest are at DEBUG. |
 
 Alert on a failing rule:
 
@@ -329,7 +362,9 @@ notice.
 | `client_attrs`, `mountpoint` | Client attributes, mountpoints | Always empty / absent |
 | Namespaces (6.x) | Rules can be confined to a namespace | No namespaces |
 | Unaliased computed field | Stored under a generated `_v_…` key | Stored under the expression's source text |
-| Ack semantics | The rule engine runs after the publish is accepted; a republish does not hold the publisher's ack | A QoS ≥ 1 republish holds the publisher's PUBACK/PUBREC until it is accepted ([above](#delivery-guarantees-qos-0-1-and-2)) |
+| Ack semantics | The rule engine runs after the publish is accepted; a republish does not hold the publisher's ack | A QoS ≥ 1 republish holds the publisher's PUBACK/PUBREC until its fate is known; the answer is the original's, and a refused republish is a failed action ([above](#delivery-guarantees-qos-0-1-and-2)) |
+| A refused publish | Rules ran on it before it was refused downstream | The hub routes none of its derived messages |
+| Limits on payload-driven work | None beyond the Erlang process's memory | A `FOREACH` iterates at most 10,000 elements; a function may build at most 1 MiB beyond its inputs; `map_put`/`mput` paths have at most 64 segments; timestamps must be renderable in every time zone; expressions at most 256 levels deep ([The rules file](#the-rules-file)) |
 | Where it runs | Every node | Every node, once per message at the node it arrived at, never on a forwarded copy |
 
 ## Migrating rules from EMQX

@@ -76,17 +76,28 @@ hub's **data lane is FIFO per connection, bounded by ingress credit** (ADR 0082)
    always on. The original is never altered or suppressed (ADR 0030 holds): a rule is a
    tap.
 
-4. **A QoS ≥ 1 publish's acknowledgement waits for what its rules produced.** Each
-   derived message at QoS ≥ 1 behind a gated original gets its own acknowledgement gate,
-   and the publisher's PUBACK/PUBREC answers all of them together:
-   - all accepted → acknowledged;
-   - all refused → the original's refusal (nothing was stored anywhere);
-   - otherwise → **withheld** (no ack, connection closed, publisher retries).
-   A refusal claims nothing was stored and an acknowledgement claims everything was;
-   for a half-stored batch both are false, so the withhold rule `refuse_pending` applies
-   per message (issue #238) is applied per batch. Inbound QoS 2 deduplication precedes
-   evaluation, so a rule fires once per QoS 2 message. A QoS 0 original gates nothing.
-   Client/session events gate nothing, because there is no acknowledgement to hold.
+4. **A QoS ≥ 1 publish's acknowledgement waits for what its rules produced, and
+   answers with the original's fate.** A publish and its derived messages reach the hub
+   as one command; the hub routes the original first and routes the derived messages
+   only if it accepted it. Each derived message at QoS ≥ 1 behind a gated original gets
+   its own acknowledgement gate, and the PUBACK/PUBREC is released once every gate has
+   answered, so an acknowledged publish's derived messages were each stored where owed
+   or refused and counted. The answer is:
+   - original refused → that refusal (none of its derived messages was routed, so
+     nothing was stored for it anywhere and a resend duplicates nothing);
+   - original accepted → acknowledged; a derived message the broker **refused** (a
+     brownout) was decided before any side effect and is counted as a failed action;
+   - any fate unknown (a failed durable write, shutdown) → **withheld** (no ack,
+     connection closed, publisher retries), as for any publish whose fate is unknown.
+   An earlier draft withheld whenever the original and a derived message disagreed. A
+   brownout is sticky, so that re-delivered an already-delivered original on every
+   retry for as long as the brownout lasted — and for QoS 2 the held-unacked dedup
+   record made each resend a first sighting (review of PR #871). Inbound QoS 2
+   deduplication precedes evaluation, so a rule fires once per QoS 2 message. A QoS 0
+   original gates nothing. Client/session events gate nothing, because there is no
+   acknowledgement to hold. A connection's pipeline of parked acknowledgements is
+   bounded in hub gates, not publishes, so a rule that fans a publish out cannot
+   multiply what one connection holds in the hub's pending-publish table.
 
 5. **No sinks.** ADR 0063 §1's sink clause and its reasons stand. An action naming a data
    bridge is refused at load, and §2's consumer group remains the way out of the broker.
@@ -106,12 +117,23 @@ hub's **data lane is FIFO per connection, bounded by ingress credit** (ADR 0082)
    most 1,024 rules.
 
 8. **Bounded by construction.** Per file: at most 1,024 rules, 16 actions per rule, 64 KiB
-   of SQL per rule. Per message: at most 256 `FOREACH` outputs and 1,024 effects. Regular
-   expressions use a linear-time engine with a bounded automaton, because a rule can apply
-   a pattern taken from a payload. Unknown functions and wrong argument counts fail at
-   load. `getenv` is not provided, because a rule must not read the broker's environment.
-   The original's ingress permit rides the last command of its batch, so it is held until
-   every derived message has been dispatched (ADR 0082 §2).
+   of SQL per rule, and expressions at most 256 levels deep (64 levels of parentheses or
+   signs), because evaluating an expression recurses once per level. Per message —
+   rules routinely pass payload fields to functions, so these bound what a publisher can
+   make one message cost: a `FOREACH` iterates at most 10,000 elements and produces at
+   most 256 outputs; at most 1,024 effects; a function may build at most 1 MiB beyond
+   its inputs (a pad length, a replacement repeated at every match, a separator repeated
+   between items — anything whose output grows with the product of two inputs);
+   `map_put`/`mput` paths have at most 64 segments; timestamps must be renderable in
+   every offset; decoding a payload object is linear in its keys; a regular expression
+   compiled from a payload is compiled once per message. Regular expressions use a
+   linear-time engine with a bounded automaton. Past a bound the function fails, so the
+   rule fails and is counted, and the message is still routed. Unknown functions and
+   wrong argument counts fail at load. `getenv` is not provided, because a rule must not
+   read the broker's environment. The original's ingress permit is held until its whole
+   batch has been dispatched (ADR 0082 §2). Every connection evaluates against its own
+   cached view of the rule set, refreshed only when a reload swaps it, so the publish
+   path does not write to shared state to read the rules.
 
 9. **The EMQX converter carries rules.** `from-emqx.py --out-rules` writes each rule's SQL
    verbatim with its `republish`/`console` actions. Every sink action becomes a
@@ -131,10 +153,16 @@ hub's **data lane is FIFO per connection, bounded by ingress credit** (ADR 0082)
 - **A rule can publish where its publisher cannot.** The ACL decides whether the original
   is accepted; what a rule republishes is operator configuration with the ACL file's
   trust. THREAT-MODEL.md records this as an operator-trusted surface.
-- **Withholding a half-stored batch can duplicate the original** when the publisher
-  retries. QoS 1 allows this. For QoS 2 it is the same residual as an existing mid-fan-out
-  store failure (`refuse_pending`). A mixed outcome needs one part refused while another
-  is stored, which in practice means a brownout.
+- **Under a brownout, a derived message that needs storage is dropped** while its
+  original is acknowledged, and counted (`mqttd_rule_actions_total{result="failed"}`). A
+  brownout refuses new growth writes, and a derived message is one; the alternative —
+  withholding the original until it can be stored too — re-delivered the original on
+  every retry for as long as the brownout lasted.
+- **An original refused after its derived messages were routed** — refused by a peer's
+  verdict, which arrives after the hub's own pass — leaves those derived messages
+  delivered, and a resend derives them again. An unknown fate withholds and can
+  duplicate what was already delivered: QoS 1 allows this, and for QoS 2 it is the same
+  residual as an existing mid-fan-out store failure.
 - **Amplification is the operator's choice.** One publish can produce up to 1,024 derived
   messages, each costing a publish's routing. Derived bytes are not charged ingress credit
   separately; they ride the original's permit, bounded by decision 8.

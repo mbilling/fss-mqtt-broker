@@ -1137,9 +1137,11 @@ The rule engine's reference is [RULES.md](RULES.md); this is the operating summa
   doubles your message count doubles the routing load and the
   `mqttd_hub_lane_depth{lane="data"}` it causes. Derived messages ride their original's
   ingress credit.
-- **Brownout:** a QoS 1/2 publisher's ack waits for its derived messages. If a derived
-  message is refused while the original was stored (or the reverse), the publisher gets
-  no ack and its connection closes, and it retries. Expect this only under brownout.
+- **Brownout:** a QoS 1/2 publisher's ack waits for its derived messages and answers
+  with the original's fate. A derived message that needs storage is refused like any
+  growth write and counted as a failed action, while its original is still acked; a
+  refused original routes none of its derived messages. Expect
+  `mqttd_rule_actions_total{result="failed"}` to climb during a brownout.
 
 These two expressions are recommendations; the chart's `PrometheusRule` does not ship
 them.

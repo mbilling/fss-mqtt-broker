@@ -124,20 +124,68 @@ impl Map {
 
     /// Merge `other` into this map, `other` winning on a shared key.
     pub fn merge_from(&mut self, other: &Map) {
-        for (k, v) in &other.entries {
-            self.insert(k.clone(), v.clone());
+        if self.entries.len().saturating_mul(other.entries.len()) <= LINEAR_SCAN_WORK {
+            for (k, v) in &other.entries {
+                self.insert(k.clone(), v.clone());
+            }
+            return;
         }
+        let mut pairs = std::mem::take(&mut self.entries);
+        pairs.extend(other.entries.iter().cloned());
+        *self = Self::from_pairs(pairs);
+    }
+
+    /// A map of `pairs` — a repeated key keeps its first position and its last value,
+    /// exactly as repeated [`insert`](Self::insert)s would leave it — built in linear
+    /// time. Inserting one by one scans the map each time, which for a decoded payload
+    /// object with many keys is quadratic in a size the publisher chooses.
+    #[must_use]
+    pub fn from_pairs(pairs: Vec<(Arc<str>, Value)>) -> Self {
+        if pairs.len() <= SMALL_MAP {
+            let mut m = Self::with_capacity(pairs.len());
+            for (k, v) in pairs {
+                m.insert(k, v);
+            }
+            return m;
+        }
+        let mut at: std::collections::HashMap<Arc<str>, usize> =
+            std::collections::HashMap::with_capacity(pairs.len());
+        let mut entries: Vec<(Arc<str>, Value)> = Vec::with_capacity(pairs.len());
+        for (k, v) in pairs {
+            if let Some(&i) = at.get(&k) {
+                entries[i].1 = v;
+            } else {
+                at.insert(k.clone(), entries.len());
+                entries.push((k, v));
+            }
+        }
+        Self { entries }
     }
 }
+
+/// Up to this many entries, a linear scan per key beats building a hash index.
+const SMALL_MAP: usize = 32;
+
+/// Up to this many key comparisons, compare or merge two maps by scanning.
+const LINEAR_SCAN_WORK: usize = SMALL_MAP * SMALL_MAP;
 
 impl PartialEq for Map {
     /// Structural, order-independent equality (Erlang map equality).
     fn eq(&self, other: &Self) -> bool {
-        self.len() == other.len()
-            && self
+        if self.len() != other.len() {
+            return false;
+        }
+        if self.len().saturating_mul(other.len()) <= LINEAR_SCAN_WORK {
+            return self
                 .entries
                 .iter()
-                .all(|(k, v)| other.get(k).is_some_and(|o| v.loose_eq(o)))
+                .all(|(k, v)| other.get(k).is_some_and(|o| v.loose_eq(o)));
+        }
+        let index: std::collections::HashMap<&str, &Value> =
+            other.entries.iter().map(|(k, v)| (&**k, v)).collect();
+        self.entries
+            .iter()
+            .all(|(k, v)| index.get(&**k).is_some_and(|o| v.loose_eq(o)))
     }
 }
 
@@ -549,12 +597,12 @@ impl<'de> serde::de::Visitor<'de> for ValueVisitor {
         Ok(Value::from(v))
     }
     fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Value, A::Error> {
-        let mut m = Map::with_capacity(map.size_hint().unwrap_or(0).min(4096));
+        let mut pairs = Vec::with_capacity(map.size_hint().unwrap_or(0).min(4096));
         while let Some(k) = map.next_key::<String>()? {
             let v = map.next_value_seed(ValueSeed)?;
-            m.insert(k, v);
+            pairs.push((Arc::from(k), v));
         }
-        Ok(Value::from(m))
+        Ok(Value::from(Map::from_pairs(pairs)))
     }
 }
 

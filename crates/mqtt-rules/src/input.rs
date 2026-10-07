@@ -117,10 +117,13 @@ fn sock_name(peer: Option<SocketAddr>) -> Value {
 #[must_use]
 pub fn pub_props(props: &AppProperties, message_expiry: Option<u32>) -> Map {
     let mut m = Map::new();
-    let mut user = Map::new();
-    for (k, v) in &props.user_properties {
-        user.insert(k.as_str(), Value::from(v.as_str()));
-    }
+    let user = Map::from_pairs(
+        props
+            .user_properties
+            .iter()
+            .map(|(k, v)| (Arc::from(k.as_str()), Value::from(v.as_str())))
+            .collect(),
+    );
     m.insert("User-Property", Value::from(user));
     if !props.user_properties.is_empty() {
         let pairs: Vec<Value> = props
@@ -183,6 +186,8 @@ pub struct PublishInput<'a> {
     pub node: &'a str,
     id: OnceCell<Arc<str>>,
     received: OnceCell<i64>,
+    /// `pub_props`, built once per message however many references read it.
+    pub_props: OnceCell<Value>,
 }
 
 impl<'a> PublishInput<'a> {
@@ -211,6 +216,7 @@ impl<'a> PublishInput<'a> {
             node: "",
             id: OnceCell::new(),
             received: OnceCell::new(),
+            pub_props: OnceCell::new(),
         }
     }
 
@@ -252,7 +258,10 @@ impl Input for PublishInput<'_> {
             "topic" => Value::from(self.topic),
             "qos" => Value::Int(i64::from(self.qos)),
             "flags" => self.flags(),
-            "pub_props" => Value::from(pub_props(self.props, self.message_expiry)),
+            "pub_props" => self
+                .pub_props
+                .get_or_init(|| Value::from(pub_props(self.props, self.message_expiry)))
+                .clone(),
             "publish_received_at" => Value::Int(
                 self.received_at_ms
                     .unwrap_or_else(|| *self.received.get_or_init(now_ms)),
