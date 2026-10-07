@@ -1376,23 +1376,27 @@ fn failures_are_reported_once_per_interval_per_rule() {
 /// it is never earlier than `publish_received_at`.
 #[test]
 fn a_message_has_one_timestamp_however_often_it_is_read() {
+    let int = |v: Value| match v {
+        Value::Int(i) => i,
+        other => panic!("{other:?} is not an integer"),
+    };
     let props = mqtt_core::AppProperties::default();
     let payload = Bytes::new();
     let input = PublishInput::new("c", "t/a", &payload, 0, &props);
-    let Value::Int(first) = input.field("timestamp") else {
-        panic!("timestamp is not an integer");
-    };
+    let first = int(input.field("timestamp"));
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     while now_ms() <= first {
-        assert!(std::time::Instant::now() < deadline, "the clock never moved");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the clock never moved"
+        );
         std::hint::spin_loop();
     }
-    assert_eq!(input.field("timestamp"), Value::Int(first));
-    let Value::Int(received) = input.field("publish_received_at") else {
-        panic!("publish_received_at is not an integer");
-    };
+    assert_eq!(int(input.field("timestamp")), first);
+    let received = int(input.field("publish_received_at"));
     assert!(received <= first, "{received} > {first}");
-    let sql = "SELECT timestamp AS ms, unix_ts_to_rfc3339(timestamp, 'millisecond') AS at FROM \"t/#\"";
+    let sql =
+        "SELECT timestamp AS ms, unix_ts_to_rfc3339(timestamp, 'millisecond') AS at FROM \"t/#\"";
     let out = test_sql(sql, &input).unwrap();
     let millis = format!(".{:03}+00:00", first % 1000);
     assert!(
@@ -1401,9 +1405,13 @@ fn a_message_has_one_timestamp_however_often_it_is_read() {
             && out[0].ends_with(&format!(r#"{millis}"}}"#)),
         "{out:?}"
     );
-    assert_eq!(test_sql(sql, &input).unwrap(), out, "a second rule saw another instant");
+    assert_eq!(
+        test_sql(sql, &input).unwrap(),
+        out,
+        "a second rule saw another instant"
+    );
 
     let mut later = PublishInput::new("c", "t/a", &payload, 0, &props);
     later.received_at_ms = Some(first + 60_000);
-    assert_eq!(later.field("timestamp"), Value::Int(first + 60_000));
+    assert_eq!(int(later.field("timestamp")), first + 60_000);
 }
