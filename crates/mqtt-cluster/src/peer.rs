@@ -216,9 +216,9 @@ pub struct ReplicaEntryWire {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Queued(Option<std::time::Instant>);
 
-/// One frame in this many is stamped (per thread; the first always is). These are
-/// two more histogram records per replicated message on the hottest path, and a
-/// mean needs a sample, not a census.
+/// About one frame in this many is stamped (the first on each thread always is).
+/// These are two more histogram records per replicated message on the hottest
+/// path, and a mean needs a sample, not a census.
 const QUEUED_SAMPLE_EVERY: u32 = 16;
 
 impl Queued {
@@ -228,30 +228,55 @@ impl Queued {
         Self(Some(std::time::Instant::now()))
     }
 
-    /// Stamped now for one frame in [`QUEUED_SAMPLE_EVERY`] on this thread,
-    /// starting with the first; unstamped otherwise.
+    /// Stamped now for about one frame in [`QUEUED_SAMPLE_EVERY`], drawn at
+    /// random; the first call on each thread always is. Random rather than every
+    /// Nth: an append's fan-out queues one `Replicate` per follower back to back,
+    /// usually on one worker thread, so a fixed stride could keep landing on the
+    /// same follower's link and describe only that one.
     #[must_use]
     pub fn sampled() -> Self {
         thread_local! {
-            static SEEN: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+            // xorshift32 state; 0 until this thread's first call seeds it.
+            static DRAW: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
         }
-        let n = SEEN.with(|seen| {
-            let n = seen.get();
-            seen.set(n.wrapping_add(1));
-            n
+        let stamp = DRAW.with(|draw| {
+            let mut x = draw.get();
+            if x == 0 {
+                draw.set(queued_seed());
+                return true;
+            }
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            draw.set(x);
+            x.is_multiple_of(QUEUED_SAMPLE_EVERY)
         });
-        if n.is_multiple_of(QUEUED_SAMPLE_EVERY) {
+        if stamp {
             Self::now()
         } else {
             Self(None)
         }
     }
 
-    /// How long ago it was stamped; `None` for an unstamped (decoded) frame.
+    /// When it was stamped; `None` for an unstamped (or decoded) frame.
     #[must_use]
-    pub fn elapsed(&self) -> Option<std::time::Duration> {
-        self.0.map(|t| t.elapsed())
+    pub fn stamped_at(&self) -> Option<std::time::Instant> {
+        self.0
     }
+}
+
+/// A distinct, well-spread, nonzero xorshift seed per thread: a Weyl step on a
+/// shared counter through murmur3's 32-bit finalizer (a bijection, so threads
+/// never share a sequence).
+fn queued_seed() -> u32 {
+    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0x9E37_79B9);
+    let mut s = NEXT.fetch_add(0x9E37_79B9, std::sync::atomic::Ordering::Relaxed);
+    s ^= s >> 16;
+    s = s.wrapping_mul(0x85EB_CA6B);
+    s ^= s >> 13;
+    s = s.wrapping_mul(0xC2B2_AE35);
+    s ^= s >> 16;
+    s.max(1) // 0 is xorshift's fixed point
 }
 
 impl PartialEq for Queued {
@@ -1720,5 +1745,42 @@ mod tests {
             Some(PeerMessage::Publish { .. })
         ));
         assert_eq!(decode(&mut buf).unwrap(), None);
+    }
+
+    /// `Queued::sampled` stamps the first frame on a thread (a lone durable publish
+    /// still feeds both stages), then about one in 16 at random: never a fixed
+    /// stride, which an append's back-to-back per-follower fan-out could alias
+    /// onto the same link every time (#662).
+    #[test]
+    fn queued_sampling_stamps_the_first_then_about_one_in_16_without_a_stride() {
+        // A fresh thread, so this is its first call whatever ran before.
+        std::thread::spawn(|| {
+            assert!(
+                super::Queued::sampled().stamped_at().is_some(),
+                "the first call on a thread must be stamped"
+            );
+            let calls = 16_000u32;
+            let (mut even, mut odd) = (0u32, 0u32);
+            for i in 0..calls {
+                if super::Queued::sampled().stamped_at().is_some() {
+                    if i % 2 == 0 {
+                        even += 1;
+                    } else {
+                        odd += 1;
+                    }
+                }
+            }
+            let stamped = even + odd;
+            assert!(
+                (calls / 32..=calls / 8).contains(&stamped),
+                "{stamped} of {calls} stamped, want about 1 in 16"
+            );
+            assert!(
+                even > 0 && odd > 0,
+                "stamps fell on one parity only (even {even}, odd {odd}): a stride"
+            );
+        })
+        .join()
+        .unwrap();
     }
 }

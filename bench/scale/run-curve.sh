@@ -2069,9 +2069,12 @@ say "[$N nodes] lane E: site ladder ${LANE_E_SITES[*]} x $LANE_E_SITE_RATE msg/s
 PERF_RUNG="${PERF_RUNG:-}"
 # PEER_SOCKETS=on samples every broker's peer-link sockets (`ss -tin` on the peer
 # port, once a second) through each lane E window into the rung's sockets/ (#662).
-# Send-Q / Recv-Q / rtt / cwnd tell the kernel's share of replication transit
-# apart from the in-process lanes (the replicate_queue / ack_queue stages). Off by
-# default: it is one more process per broker inside the window.
+# Send-Q / Recv-Q / rtt / cwnd show the kernel's share of replication transit.
+# A full Send-Q also shows up inside the replicate_queue / ack_queue stages (they
+# end when write and flush return), so read the two together: a stage that grows
+# with Send-Q is wire or receiver backpressure, one that grows without it is
+# in-process queueing. Off by default: it is one more process per broker inside
+# the window.
 PEER_SOCKETS="${PEER_SOCKETS:-off}"
 case "$PEER_SOCKETS" in on | off) ;; *) die "PEER_SOCKETS must be on or off, not '$PEER_SOCKETS'" ;; esac
 PERF_SECS="${PERF_SECS:-20}"
@@ -2540,9 +2543,13 @@ IMAGES
 		if [ "$PEER_SOCKETS" = on ]; then
 			mkdir -p "$rdir/sockets"
 			for ((i = 0; i < N; i++)); do
+				# A deadline taken remotely when the sampler starts, not a round
+				# count: each round is ss plus the sleep, so LANE_E_SECS rounds ran
+				# past the window and the last samples landed in the drain.
 				# shellcheck disable=SC2016 # expanded by the REMOTE shell
 				rssh "$(broker_pub_ip "$i")" 'port=$(sed -n "s/^MQTTD_PEER_BIND=.*://p" /etc/mqttd/mqttd.env)
-					for _ in $(seq '"$LANE_E_SECS"'); do
+					end=$(($(date +%s) + '"$LANE_E_SECS"'))
+					while [ "$(date +%s)" -lt "$end" ]; do
 						printf "SAMPLE %s\n" "$(date +%s.%N)"
 						ss -tinH state established "( sport = :$port or dport = :$port )"
 						sleep 1

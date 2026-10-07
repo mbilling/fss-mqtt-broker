@@ -890,9 +890,9 @@ impl Metrics {
              included), fsync (the data sync alone), replicate_rtt (leader, per follower: \
              Replicate queued to the peer link until its ack is back), replica_apply \
              (follower: Replicate received until its ack is queued), replicate_queue \
-             (leader: Replicate queued on the peer link until the link encodes it into a \
-             write), ack_queue (follower: the same for its ReplicateAck); both sampled, one frame \
-             in 16. Fine buckets from 20us so a \
+             (leader: Replicate queued on the peer link until the link has handed it to the \
+             kernel, write and flush returned), ack_queue (follower: the same for its \
+             ReplicateAck); both sampled, about one frame in 16. Fine buckets from 20us so a \
              millisecond-scale fsync is resolved, not rounded to the next power of two",
             durable_stage_seconds.clone(),
         );

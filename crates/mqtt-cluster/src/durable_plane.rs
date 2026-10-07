@@ -557,7 +557,7 @@ impl DurablePlane {
                 Some(PeerMessage::ReplicateAck {
                     req_id,
                     accepted,
-                    queued: crate::peer::Queued::default(),
+                    queued: crate::peer::Queued::sampled(),
                 })
             }
             // Replication ack → wake the waiting append.

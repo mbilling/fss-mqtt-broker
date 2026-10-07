@@ -37,12 +37,15 @@ pub enum Stage {
     /// follower's writer queue wait plus its group commit. `replicate_rtt` minus
     /// this is the network and the two peer-bus queues.
     ReplicaApply,
-    /// Leader side: a `Replicate` queued on the peer link until the link encodes
-    /// it into a write (#662). The leader's half of `replicate_rtt` minus
-    /// `replica_apply` that is spent in-process rather than on the wire.
+    /// Leader side: a `Replicate` queued on the peer link until the link has
+    /// handed it to the kernel (write and flush returned) (#662). The leader's
+    /// part of `replicate_rtt` minus `replica_apply` before the kernel sends:
+    /// in-process queueing plus any wait on a full send buffer, which is wire or
+    /// receiver backpressure. Sampled, about one frame in 16.
     ReplicateQueue,
-    /// Follower side: a `ReplicateAck` queued on the peer link until the link
-    /// encodes it into a write — the follower's in-process half of the same gap.
+    /// Follower side: a `ReplicateAck` queued on the peer link until the link has
+    /// handed it to the kernel — the follower's part of the same gap, with the
+    /// same send-buffer caveat. Sampled, about one frame in 16.
     AckQueue,
 }
 
