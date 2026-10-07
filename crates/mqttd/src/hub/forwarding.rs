@@ -827,6 +827,24 @@ impl Hub {
         self.observe_fanout(fanout_started, peer_visits);
     }
 
+    /// Send pending publish `id` to `node` as a plain, unanswered forward.
+    fn reforward_plain(&self, id: u64, node: &NodeId) {
+        let (Some(p), Some(peer)) = (self.pending_publishes.get(id), self.peers.get(node)) else {
+            return;
+        };
+        if let Some(m) = &self.metrics {
+            m.publish_forwarded("subscriber-remote");
+        }
+        let _ = peer.tx.send(PeerMessage::Publish {
+            topic: p.topic.clone(),
+            payload: p.payload.to_vec(),
+            qos: p.qos as u8,
+            retain: p.retain,
+            message_expiry: p.message_expiry,
+            app: app_to_wire(p.app()),
+        });
+    }
+
     /// Record one peer fan-out's own time and link count (issue #613 item 1.6).
     ///
     /// `started` is `None` exactly when no metrics are attached, which is what
@@ -984,6 +1002,10 @@ impl Hub {
             );
             if let Some(m) = &self.metrics {
                 m.publish_dropped("pending-cap");
+            }
+            // The drain barrier no longer waits for it; the drain reports how many.
+            if self.draining {
+                self.drain_evicted += 1;
             }
         }
         self.publish_ids += 1;
@@ -1353,6 +1375,14 @@ impl Hub {
                 // RE-BALANCE, not a cluster-wide publish refusal.
                 ForwardKind::Shared { .. } => {
                     self.reselect_shared(id, obligation, DurableOutcome::Refused(r));
+                }
+                // Gated by the hub itself during the drain, with nobody to retry it:
+                // the peer refused it before any side effect, so send it again as a
+                // plain forward, which it delivers live with its durable copy a
+                // counted drop — what it would have done had the drain not gated it.
+                ForwardKind::Ordinary { .. } if self.drain_gated.contains(&id) => {
+                    self.reforward_plain(id, node);
+                    self.try_complete_pending(id);
                 }
                 ForwardKind::Ordinary { .. } => self.refuse_pending(id, r),
             },
@@ -2525,6 +2555,37 @@ mod zone_fwd_proofs {
         ));
         assert_eq!(count("pending-cap"), 1);
         assert_eq!(count("pending-cap-replay"), 1);
+    }
+
+    /// ADR 0083: the drain barrier cannot wait for a publish the pending bound has
+    /// evicted, so it says how many it lost that way. An unanswered publish evicted
+    /// while draining is counted in the barrier's answer; one evicted before the
+    /// drain, or an answered one, is not (neither ever held the barrier).
+    #[test]
+    fn the_drain_barrier_reports_the_unanswered_publishes_the_bound_evicted() {
+        let mut h = hub();
+        let _ = register(&mut h, "t/0");
+        let (answered, _answered_rx) = register(&mut h, "t/1");
+        assert!(h
+            .pending_publishes
+            .get_mut(answered)
+            .unwrap()
+            .answer(PublishOutcome::Accepted));
+        for i in 2..PENDING_PUBLISH_CAP {
+            let _ = register(&mut h, &format!("t/{i}"));
+        }
+        let _ = register(&mut h, "t/before-the-drain"); // evicts t/0, unanswered
+        h.draining = true;
+        let _ = register(&mut h, "t/over-1"); // evicts t/1, answered
+        assert_eq!(h.drain_evicted, 0);
+        let _ = register(&mut h, "t/over-2"); // evicts t/2, unanswered
+        assert_eq!(h.drain_evicted, 1);
+
+        while h.pending_publishes.pop_first().is_some() {}
+        let (reply, mut answer) = oneshot::channel();
+        h.drained_waiters.push(reply);
+        h.wake_drained();
+        assert_eq!(answer.try_recv(), Ok(1));
     }
 }
 

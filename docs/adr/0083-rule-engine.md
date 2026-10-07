@@ -102,9 +102,14 @@ hub's **data lane is FIFO per connection, bounded by ingress credit** (ADR 0082)
    that answers once everything sent before it is dispatched, no durable append is in
    flight and no publish awaits an answer; while the broker drains, the hub gates what
    rules derive from events itself, so a forward to another node is acked and waited
-   for. What the drain's own disconnects derive is stored, here and on the nodes it was
-   forwarded to, before exit — unless a peer link stays down for the whole drain (a
-   draining node does not redial), which loses it at the grace deadline. A
+   for (a peer in a brownout that refuses one is sent it again unacked, which it delivers
+   live: nobody would retry it). What the drain's own disconnects derive is stored, here
+   and on the nodes it was forwarded to, before exit — except on a node draining in a
+   brownout, which does not gate them (a brownout refuses a gated publish owing a durable
+   copy outright, live copies and all), past the pending-publish table's bound (the
+   evicted are not waited for, and the drain logs how many), and when a peer link stays
+   down for the whole drain (a draining node does not redial), which loses it at the
+   grace deadline. A
    connection's pipeline of parked acknowledgements is
    bounded in hub gates, not publishes, so a rule that fans a publish out cannot
    multiply what one connection holds in the hub's pending-publish table.
@@ -224,8 +229,10 @@ hub's **data lane is FIFO per connection, bounded by ingress credit** (ADR 0082)
   `client/disconnected` with reason `shutdown` for each connection; the messages rules
   derive from those events are routed, and stored where owed — on another node too,
   forwarded acked and answered — before the broker exits, within the drain's
-  `shutdown_grace_secs`. A peer link down for the whole drain loses what it owed there.
-  A crash raises no events.
+  `shutdown_grace_secs`. Not waited for: forwards from a node draining in a brownout
+  (left ungated, so they still go out live), what the pending-publish bound evicts during
+  the drain (counted in a WARN), and what a peer link down for the whole drain owed
+  there. A crash raises no events.
 - **Rules are node-local configuration.** A node with a different file evaluates its own
   clients' publishes differently. `mqttd_rules_info` makes that visible; nothing prevents
   it, just as nothing prevents ACL drift.

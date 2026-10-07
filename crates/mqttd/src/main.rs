@@ -5529,11 +5529,14 @@ async fn graceful_shutdown(
         if hub.send(hub::HubCommand::Drained { reply }).is_ok() {
             let left = grace.saturating_sub(drain_started.elapsed());
             tokio::select! {
-                answered = tokio::time::timeout(left, drained) => {
-                    if answered.is_err() {
-                        warn!("drain grace elapsed with durable appends or peer answers still outstanding; what they owed is lost");
-                    }
-                }
+                answered = tokio::time::timeout(left, drained) => match answered {
+                    Err(_) => warn!("drain grace elapsed with durable appends or peer answers still outstanding; what they owed is lost"),
+                    Ok(Ok(evicted)) if evicted > 0 => warn!(
+                        evicted,
+                        "the pending-publish bound evicted messages derived during the drain before their peers answered; the drain did not wait for them"
+                    ),
+                    Ok(_) => {}
+                },
                 () = stop.recv() => warn!("second signal; forcing immediate shutdown"),
             }
         }

@@ -1376,9 +1376,11 @@ fn failures_are_reported_once_per_interval_per_rule() {
 /// it is never earlier than `publish_received_at`.
 #[test]
 fn a_message_has_one_timestamp_however_often_it_is_read() {
+    // The messages below name no value read through `field`: what it returns can be a
+    // username, and a test's panic output is a log like any other.
     let int = |v: Value| match v {
         Value::Int(i) => i,
-        other => panic!("{other:?} is not an integer"),
+        _ => panic!("a time field is not an integer"),
     };
     let props = mqtt_core::AppProperties::default();
     let payload = Bytes::new();
@@ -1392,9 +1394,15 @@ fn a_message_has_one_timestamp_however_often_it_is_read() {
         );
         std::hint::spin_loop();
     }
-    assert_eq!(int(input.field("timestamp")), first);
+    assert!(
+        int(input.field("timestamp")) == first,
+        "a second read of timestamp moved with the clock"
+    );
     let received = int(input.field("publish_received_at"));
-    assert!(received <= first, "{received} > {first}");
+    assert!(
+        received <= first,
+        "timestamp is earlier than publish_received_at"
+    );
     let sql =
         "SELECT timestamp AS ms, unix_ts_to_rfc3339(timestamp, 'millisecond') AS at FROM \"t/#\"";
     let out = test_sql(sql, &input).unwrap();
@@ -1403,15 +1411,17 @@ fn a_message_has_one_timestamp_however_often_it_is_read() {
         out.len() == 1
             && out[0].starts_with(&format!(r#"{{"ms":{first},"at":""#))
             && out[0].ends_with(&format!(r#"{millis}"}}"#)),
-        "{out:?}"
+        "the raw and formatted timestamps disagree"
     );
-    assert_eq!(
-        test_sql(sql, &input).unwrap(),
-        out,
+    assert!(
+        test_sql(sql, &input).unwrap() == out,
         "a second rule saw another instant"
     );
 
     let mut later = PublishInput::new("c", "t/a", &payload, 0, &props);
     later.received_at_ms = Some(first + 60_000);
-    assert_eq!(int(later.field("timestamp")), first + 60_000);
+    assert!(
+        int(later.field("timestamp")) == first + 60_000,
+        "timestamp is earlier than a later publish_received_at"
+    );
 }

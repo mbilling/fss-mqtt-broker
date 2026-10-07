@@ -1,6 +1,6 @@
 # External consumers: the integration blueprint
 
-**Verified against `v1.0.16` (2026-09-11); the rule-engine paragraphs against `main` after `v1.0.18` (2026-10-07).** How to get messages out of mqttd and into the rest of your stack — Kafka, a
+**Verified against `v1.0.16` (2026-09-11); the rule-engine paragraphs against `main` after `v1.1.0` (2026-10-07).** How to get messages out of mqttd and into the rest of your stack — Kafka, a
 webhook, a database, anything — and what the broker
 does and does not promise while you do it ([ADR 0063](adr/0063-external-consumer-integration.md)).
 

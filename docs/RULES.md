@@ -24,7 +24,7 @@ exact output to expect. [Testing and debugging rules](#testing-and-debugging-rul
 
 ### 1. Get a build that has the rule engine
 
-No release has the rule engine yet. `v1.0.18` and every earlier release do not: the
+No release has the rule engine yet. `v1.1.0` and every earlier release do not: the
 binaries, the `ghcr.io/mbilling/fss-mqtt-broker` images and the Helm chart's default
 image. Until the next release, build from source (Rust ≥ 1.88; the first build takes a few
 minutes):
@@ -37,8 +37,9 @@ mqttd --help | grep -e --rule-test
 ```
 
 The last command prints a `mqttd --rule-test --sql <statement>` line only in a build
-that has the rule engine. Do not go by `mqttd --version`: a build of `main` reports
-`mqttd 1.0.18` until the release bumps it.
+that has the rule engine. Do not go by `mqttd --version`: a build of `main` reports the
+last release's version (`mqttd 1.1.0` today), exactly as that release's binary does,
+until the next release bumps it.
 
 A release binary or image does not know rules, and does not always say so:
 `mqttd --check-rules` is an `unrecognised argument`, a `[rules]` table in `mqttd.toml` is
@@ -625,10 +626,24 @@ shutdown waits for them: the `client/disconnected` events (reason `shutdown`) ra
 the broker drains its connections are routed, and stored where they are owed (a
 persistent session's offline queue, durably where durability applies), before the broker
 exits. While it drains, what they derive for a subscriber or session on another node is
-forwarded acked, and the drain waits for that node's answer too. That wait is part of
-the drain, bounded by `shutdown_grace_secs`; a second signal ends it. A peer link that is
-down for the whole drain is not waited back: a draining node does not redial, so what it
-owes there is lost at the grace deadline, with a WARN. These messages are not charged to any connection's ingress credit,
+forwarded acked, and the drain waits for that node's answer too. A node that is itself
+in a brownout refuses such a forward when it owes a durable copy there; the draining
+node then sends it again unacked, and that node delivers it live. That wait is part of
+the drain, bounded by `shutdown_grace_secs`; a second signal ends it. The drain does not
+wait for:
+
+- **forwards from a node draining in a brownout.** A brownout refuses an acknowledged
+  publish that owes a durable copy outright, live copies and all, so a node in a brownout
+  does not gate what it derives: it goes out live everywhere, as at any other time, with a
+  refused durable copy counted as a drop.
+- **more than the table of publishes awaiting acknowledgement holds** (65,536 messages or
+  64 MiB, client publishes included). Past that the oldest are evicted and no longer
+  waited for, and the drain logs how many with a WARN. A node draining tens of thousands
+  of connections under a presence rule, or fewer under a `FOREACH`, can reach it.
+- **a peer link that is down for the whole drain.** A draining node does not redial, so
+  what it owes there is lost at the grace deadline, with a WARN.
+
+These messages are not charged to any connection's ingress credit,
 because no publish carries them: each event, and each Will, is bounded by the per-message
 limits instead (at most 1,024 derived messages, carrying at most 4 MiB together; a Will's
 budget also grows with four times its payload).
