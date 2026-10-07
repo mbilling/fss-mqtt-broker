@@ -1058,12 +1058,28 @@ pub type RetainedExportAnswer = Result<RetainedExportCut, String>;
 pub struct PublishBatch {
     /// The client's publish: a [`HubCommand::Publish`].
     pub original: HubCommand,
-    /// The rule-produced messages, each a [`HubCommand::Publish`], in rule then
-    /// action order. Routed only if the original was accepted.
-    pub derived: Vec<HubCommand>,
+    /// The rule-produced messages, in rule then action order. Routed only if the
+    /// original was accepted.
+    pub derived: Vec<DerivedPublish>,
     /// The original's ingress credit (ADR 0082 T3), held until the whole batch has
     /// been dispatched.
     pub credit: Option<crate::ingress::IngressPermit>,
+    /// The credit charged for the derived messages, held as long.
+    pub derived_credit: Option<crate::ingress::IngressPermit>,
+}
+
+/// One rule-produced message in a [`PublishBatch`].
+#[derive(Debug)]
+pub struct DerivedPublish {
+    /// The rule that produced it: its action is counted against this rule.
+    pub rule: Arc<str>,
+    /// The message: a [`HubCommand::Publish`].
+    pub publish: HubCommand,
+    /// Whether it carries an acknowledgement gate. A gated message's action is counted
+    /// by the publisher's connection when its gate answers (closed, if the hub never
+    /// routed it); an ungated one's is counted here, by the hub, which alone knows
+    /// whether it routed it.
+    pub gated: bool,
 }
 
 /// A message from a connection task to the hub.
@@ -3041,15 +3057,28 @@ impl Hub {
                     original,
                     derived,
                     credit: _credit,
+                    derived_credit: _derived_credit,
                 } = *batch;
-                if self.dispatch_publish(original).await {
-                    for d in derived {
-                        self.dispatch_publish(d).await;
+                let routed = self.dispatch_publish(original).await;
+                for DerivedPublish {
+                    rule,
+                    publish,
+                    gated,
+                } in derived
+                {
+                    // Counted before it is routed, so a subscriber never sees a
+                    // message its action has not counted yet.
+                    if !gated {
+                        if let Some(m) = &self.metrics {
+                            m.rule_action(&rule, if routed { "ok" } else { "failed" });
+                        }
+                    }
+                    // Not routed: the command is dropped, its gate (if any) closes, and
+                    // the publisher hears the original's own answer.
+                    if routed {
+                        self.dispatch_publish(publish).await;
                     }
                 }
-                // Otherwise the derived commands are dropped unrouted: their gates
-                // close, and the publisher hears the original's refusal (or nothing,
-                // if it was withheld).
             }
             HubCommand::RestoreRetained {
                 topic,
@@ -12242,6 +12271,110 @@ mod tests {
             done.await.is_err(),
             "a publish already stored durably may only be WITHHELD: `Refused` asserts \
              'nothing was stored', and a retry on that basis duplicates it"
+        );
+    }
+
+    /// A derived message stored locally and then refused by a peer (ADR 0083): the hub
+    /// turns that partial store into a withhold of the DERIVED message's gate (the #238
+    /// rule), and the publisher must still hear the ORIGINAL's answer. Withholding the
+    /// original instead re-delivered it on every resend for as long as the peer's
+    /// brownout lasted — and for a QoS 2 original as a fresh sighting each time. Found by
+    /// an adversarial review of PR #871; this was its reproduction, with the assertions
+    /// turned around.
+    #[tokio::test]
+    async fn a_peer_refusing_a_stored_derived_message_does_not_withhold_the_original() {
+        let tx = start_hub();
+        let mut peer = connect_peer_at_proto(&tx, "n2", 1, 7);
+        remote_interest(&tx, "n2", &["out/x"]);
+        // The original's only subscriber: local, persistent, QoS 2.
+        let (_r1, _) = attach(&tx, "osub", 2, false).await;
+        subscribe_qos(&tx, "osub", "in/t", QoS::ExactlyOnce);
+        detach(&tx, "osub", 2);
+        // The derived topic: a local persistent subscriber AND interest on n2.
+        let (_r2, _) = attach(&tx, "dsub", 3, false).await;
+        subscribe_qos(&tx, "dsub", "out/x", QoS::AtLeastOnce);
+        detach(&tx, "dsub", 3);
+
+        // Watch each gate's own answer on its way into the join.
+        let relay = |rx: oneshot::Receiver<PublishOutcome>| {
+            let (tx, out) = oneshot::channel();
+            let seen = tokio::spawn(async move {
+                let o = rx.await.ok();
+                if let Some(v) = o {
+                    let _ = tx.send(v);
+                }
+                o
+            });
+            (seen, out)
+        };
+        let (otx, orx) = oneshot::channel();
+        let (dtx, drx) = oneshot::channel();
+        let (orig_seen, orig_rx) = relay(orx);
+        let (derived_seen, derived_rx) = relay(drx);
+        tx.send(HubCommand::PublishBatch(Box::new(super::PublishBatch {
+            original: HubCommand::Publish {
+                topic: "in/t".into(),
+                payload: Bytes::from_static(b"orig"),
+                qos: QoS::ExactlyOnce,
+                retain: false,
+                message_expiry: None,
+                app: AppProperties::default(),
+                done: Some(otx),
+                v5: true,
+                publisher: Some(ClientId("pub".into())),
+                credit: None,
+            },
+            derived: vec![super::DerivedPublish {
+                rule: Arc::from("r"),
+                publish: crate::rules::derived_command(
+                    mqtt_rules::Republish {
+                        topic: "out/x".into(),
+                        payload: Bytes::from_static(b"der"),
+                        qos: 1,
+                        retain: false,
+                        app: AppProperties::default(),
+                        message_expiry: None,
+                    },
+                    Some(dtx),
+                ),
+                gated: true,
+            }],
+            credit: None,
+            derived_credit: None,
+        })))
+        .unwrap();
+        let joined = crate::rules::join_outcomes(orig_rx, vec![(Arc::from("r"), derived_rx)], None);
+
+        let seq = match next_forward_answer(&mut peer).await {
+            PeerMessage::PublishAcked { seq, topic, .. } => {
+                assert_eq!(topic, "out/x", "only the derived message is forwarded");
+                seq
+            }
+            other => panic!("expected the derived forward, got {other:?}"),
+        };
+        tx.send(ordered(HubCommand::RemotePublishVerdict {
+            node: NodeId("n2".into()),
+            seq,
+            verdict: ForwardVerdict::Refused {
+                code: PublishRefusal::Brownout.wire_code(),
+            },
+        }))
+        .unwrap();
+
+        let joined = timeout(Duration::from_secs(5), joined)
+            .await
+            .expect("the join resolves")
+            .ok();
+        assert_eq!(orig_seen.await.unwrap(), Some(PublishOutcome::Accepted));
+        assert_eq!(
+            derived_seen.await.unwrap(),
+            None,
+            "the hub withholds a derived message refused after a local store"
+        );
+        assert_eq!(
+            joined,
+            Some(PublishOutcome::Accepted),
+            "the publisher hears the original's own answer"
         );
     }
 

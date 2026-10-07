@@ -56,6 +56,14 @@ pub const MAX_ACTIONS_PER_RULE: usize = 16;
 /// across every rule it matches. Bounds the amplification a single publish can cause.
 pub const MAX_EFFECTS_PER_TRIGGER: usize = 1024;
 
+/// What all of one message's effects may carry together, beyond four times the
+/// message's own payload: the topics, payloads and properties of its derived messages,
+/// and the text of its console lines. Without it a `FOREACH` fan-out, times up to 16
+/// actions, times a template that repeats the payload, turns one small publish into a
+/// gigabyte of derived messages. Past it, further actions fail; the message is still
+/// routed.
+pub const MAX_DERIVED_BYTES: usize = 4 << 20;
+
 /// The longest rule statement accepted.
 pub const MAX_SQL_BYTES: usize = 64 * 1024;
 
@@ -530,7 +538,7 @@ fn apply(
                     spec.render(output, ctx.input).map(Effect::Republish)
                 }
             };
-            match effect {
+            match effect.and_then(|e| charge_derived(ctx, e)) {
                 Ok(e) => {
                     report(rule, Outcome::ActionOk);
                     out.push((rule.id.clone(), e));
@@ -539,6 +547,25 @@ fn apply(
             }
         }
     }
+}
+
+/// Charge an effect to the message's [`MAX_DERIVED_BYTES`] budget, refusing it past.
+fn charge_derived(ctx: &EvalCtx<'_>, effect: Effect) -> Result<Effect, EvalError> {
+    let bytes = match &effect {
+        Effect::Republish(r) => r.topic.len() + r.payload.len() + r.app.accounted_bytes(),
+        Effect::Console(line) => line.len(),
+    };
+    let own = ctx.input.payload().map_or(0, Bytes::len);
+    let limit = MAX_DERIVED_BYTES.saturating_add(own.saturating_mul(4));
+    let total = ctx.derived.get().saturating_add(bytes);
+    if total > limit {
+        return Err(EvalError::new(format!(
+            "this message's effects would carry more than {limit} bytes \
+             ({MAX_DERIVED_BYTES} plus four times its payload); the rest are dropped"
+        )));
+    }
+    ctx.derived.set(total);
+    Ok(effect)
 }
 
 /// Run one statement against one input and return its outputs as JSON — the

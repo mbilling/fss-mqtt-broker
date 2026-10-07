@@ -41,14 +41,18 @@ pub struct EvalCtx<'a> {
     all_fields: OnceCell<Map>,
     /// The rule being evaluated (EMQX's `metadata.rule_id`).
     pub(crate) rule_id: std::cell::RefCell<Arc<str>>,
-    /// The last regular expression compiled from a non-literal pattern during this
-    /// message, and what compiling it gave (see `funcs::regex`).
+    /// The regular expressions compiled from non-literal patterns during this message,
+    /// most recent first, and what compiling each gave (see `funcs::regex`).
     pub(crate) regex_cache: RegexCache,
+    /// Bytes this message's functions have built beyond their inputs so far (see
+    /// `funcs::MAX_BUILT_BYTES`).
+    pub(crate) built: std::cell::Cell<usize>,
+    /// Bytes this message's effects carry so far (see [`crate::MAX_DERIVED_BYTES`]).
+    pub(crate) derived: std::cell::Cell<usize>,
 }
 
-/// A pattern and the result of compiling it.
-pub(crate) type RegexCache =
-    std::cell::RefCell<Option<(String, Result<Arc<regex::Regex>, String>)>>;
+/// Patterns and the result of compiling each, most recent first.
+pub(crate) type RegexCache = std::cell::RefCell<Vec<(String, Result<Arc<regex::Regex>, String>)>>;
 
 impl std::fmt::Debug for EvalCtx<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -65,7 +69,9 @@ impl<'a> EvalCtx<'a> {
             payload_json: OnceCell::new(),
             all_fields: OnceCell::new(),
             rule_id: std::cell::RefCell::new(Arc::from("")),
-            regex_cache: std::cell::RefCell::new(None),
+            regex_cache: std::cell::RefCell::new(Vec::new()),
+            built: std::cell::Cell::new(0),
+            derived: std::cell::Cell::new(0),
         }
     }
 

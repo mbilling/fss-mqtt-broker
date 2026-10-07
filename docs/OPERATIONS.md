@@ -1135,12 +1135,14 @@ The rule engine's reference is [RULES.md](RULES.md); this is the operating summa
 - **Load:** rules run on connection tasks, so their CPU shows up as connection-task CPU,
   not as hub-loop time. A derived message is routed like any publish, so a rule that
   doubles your message count doubles the routing load and the
-  `mqttd_hub_lane_depth{lane="data"}` it causes. Derived messages ride their original's
-  ingress credit.
-- **Brownout:** a QoS 1/2 publisher's ack waits for its derived messages and answers
-  with the original's fate. A derived message that needs storage is refused like any
-  growth write and counted as a failed action, while its original is still acked; a
-  refused original routes none of its derived messages. Expect
+  `mqttd_hub_lane_depth{lane="data"}` it causes. Derived messages are charged to their
+  publisher's ingress credit, so a rule-heavy publisher reaches its credit cap (and
+  pauses) sooner — size `MQTTD_CONN_INGRESS_BYTES` for the publish plus what its rules
+  derive.
+- **Brownout:** a QoS 1/2 publisher's ack waits for its derived messages but answers
+  with the original's own fate. A derived message that needs storage is refused like any
+  growth write and counted as a failed action, while its original is still acked; an
+  original the hub refuses routes none of its derived messages. Expect
   `mqttd_rule_actions_total{result="failed"}` to climb during a brownout.
 
 These two expressions are recommendations; the chart's `PrometheusRule` does not ship

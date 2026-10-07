@@ -21,10 +21,11 @@
 //! - **`QoS`.** For an inbound `QoS` 1/2 publish, every `QoS` ≥ 1 message its rules
 //!   produce gets its own acknowledgement gate, and the publisher's PUBACK/PUBREC waits
 //!   for all of them ([`join_outcomes`]) — when it is released, each derived message
-//!   was stored where it was owed, or refused and counted. The answer itself is the
-//!   **original's**: a derived message the broker refuses (brownout) fails its action,
-//!   it never withholds an original that was already delivered. Only a derived
-//!   message whose fate is unknown withholds, as an unknown fate does for any publish.
+//!   was stored where it was owed or has failed and been counted. The answer itself is
+//!   exactly the **original's**: a derived message never changes what the publisher is
+//!   told, because withholding an original that was already delivered — to retry a
+//!   derived message the broker refused, or could not vouch for — re-delivers it on
+//!   every retry for as long as the condition lasts (a brownout, a peer's refusal).
 //!   Inbound `QoS` 2 dedup means a rule fires exactly once per `QoS` 2 message. A `QoS`
 //!   0 publish has no acknowledgement, so nothing it produces is gated.
 
@@ -40,7 +41,7 @@ use mqtt_rules::{ClientInfo, Effect, EventInput, Outcome, PublishInput, Republis
 use tokio::sync::{mpsc, oneshot, watch};
 use tracing::{debug, info, warn};
 
-use crate::hub::{HubCommand, PublishBatch, PublishOutcome};
+use crate::hub::{DerivedPublish, HubCommand, PublishBatch, PublishOutcome};
 
 /// The live rule set, swapped by a reload (ADR 0032 validate-before-swap).
 pub type RulesWatch = watch::Receiver<Arc<RuleSet>>;
@@ -102,6 +103,18 @@ pub struct PublishFacts<'a> {
 pub struct Derived {
     rule: Arc<str>,
     msg: Republish,
+}
+
+impl Derived {
+    /// Its topic length, and its payload-plus-properties length: what its ingress
+    /// credit is charged on (ADR 0082 T3).
+    #[must_use]
+    pub fn accounted(&self) -> (usize, usize) {
+        (
+            self.msg.topic.len(),
+            self.msg.payload.len() + self.msg.app.accounted_bytes(),
+        )
+    }
 }
 
 fn qos_num(q: QoS) -> u8 {
@@ -305,6 +318,13 @@ impl ConnRules {
         self.with_set(|set| evaluate(set, &self.engine.node, metrics, f))
     }
 
+    /// Pick up a reloaded rule set now, releasing the superseded one this connection
+    /// held — for a connection that is idle but alive (its PINGREQ), so a series of
+    /// reloads does not keep a series of old rule sets in memory.
+    pub fn refresh(&self) {
+        self.with_set(|_| ());
+    }
+
     /// Whether any rule selects `kind` (checked before building the event).
     #[must_use]
     pub fn wants(&self, kind: mqtt_rules::EventKind) -> bool {
@@ -339,6 +359,18 @@ impl ConnRules {
         }
     }
 
+    /// Drop derived messages unsent — a `QoS` 0 publish under `shed-qos0` found no
+    /// credit for them — counting each as a failed action.
+    pub fn shed(&self, derived: Vec<Derived>) {
+        let metrics = self.engine.metrics.as_deref();
+        for d in derived {
+            count_action(metrics, &d.rule, "failed");
+        }
+        if let Some(m) = metrics {
+            m.publish_dropped("hub-ingress");
+        }
+    }
+
     /// Send a publish and what its rules derived to the hub as one batch. Returns the
     /// receiver the publisher's acknowledgement waits on, and how many hub
     /// acknowledgement gates the batch holds — the original's, if gated, plus one per
@@ -347,8 +379,9 @@ impl ConnRules {
     ///
     /// `original` is the publish command and `done` its gate's receiver (`None` for
     /// `QoS` 0). Each derived message at `QoS` ≥ 1 behind a gated original gets its own
-    /// gate; `QoS` 0 ones promise nothing and are not waited for. `credit`, the
-    /// original's ingress permit, is held until the whole batch has been dispatched.
+    /// gate, and its action is counted when the gate answers; the hub counts the
+    /// others as it routes or drops them. `credit`, the original's ingress permit, is
+    /// held until the whole batch has been dispatched.
     #[must_use]
     pub fn send_batch(
         &self,
@@ -357,34 +390,31 @@ impl ConnRules {
         done: Option<oneshot::Receiver<PublishOutcome>>,
         derived: Vec<Derived>,
         credit: Option<crate::ingress::IngressPermit>,
+        derived_credit: Option<crate::ingress::IngressPermit>,
     ) -> (Option<oneshot::Receiver<PublishOutcome>>, usize) {
-        let metrics = self.engine.metrics.clone();
         let gated = done.is_some();
         let mut commands = Vec::with_capacity(derived.len());
-        let mut answers: Vec<DerivedAnswer> = Vec::with_capacity(derived.len());
+        let mut answers: Vec<DerivedAnswer> = Vec::new();
         for d in derived {
-            let gate = if gated && d.msg.qos > 0 {
+            let gate = (gated && d.msg.qos > 0).then(|| {
                 let (tx, rx) = oneshot::channel();
-                answers.push((d.rule, Some(rx)));
-                Some(tx)
-            } else {
-                if gated {
-                    answers.push((d.rule, None));
-                } else {
-                    // Nothing waits on a `QoS` 0 publish: handed to the hub is all that
-                    // will ever be known.
-                    count_action(metrics.as_deref(), &d.rule, "ok");
-                }
-                None
-            };
-            commands.push(derived_command(d.msg, gate));
+                answers.push((d.rule.clone(), rx));
+                tx
+            });
+            commands.push(DerivedPublish {
+                rule: d.rule,
+                gated: gate.is_some(),
+                publish: derived_command(d.msg, gate),
+            });
         }
-        let holds = answers.iter().filter(|(_, rx)| rx.is_some()).count() + usize::from(gated);
+        let holds = answers.len() + usize::from(gated);
         let _ = hub.send(HubCommand::PublishBatch(Box::new(PublishBatch {
             original,
             derived: commands,
             credit,
+            derived_credit,
         })));
+        let metrics = self.engine.metrics.clone();
         (done.map(|rx| join_outcomes(rx, answers, metrics)), holds)
     }
 }
@@ -411,25 +441,20 @@ pub fn derived_command(r: Republish, done: Option<oneshot::Sender<PublishOutcome
     }
 }
 
-/// A derived message's slot in [`join_outcomes`]: its rule, and its gate (`None` for
-/// a `QoS` 0 derived message, which promises nothing).
-pub type DerivedAnswer = (Arc<str>, Option<oneshot::Receiver<PublishOutcome>>);
+/// A gated derived message's slot in [`join_outcomes`]: its rule, and its gate.
+pub type DerivedAnswer = (Arc<str>, oneshot::Receiver<PublishOutcome>);
 
 /// One acknowledgement for a publish and the gated messages its rules produced. It
-/// resolves once every gate has answered, and says:
+/// resolves once every gate has answered, with **exactly the original's answer**:
+/// accepted, refused, or withheld when the original's own fate is unknown.
 ///
-/// - the original was **refused** → that refusal (the hub routed none of its derived
-///   messages, so nothing was stored for it anywhere);
-/// - the original's fate is **unknown** → withheld (the connection closes unacked and
-///   the publisher retries, as for any publish);
-/// - the original was **accepted** → accepted, unless a derived message's fate is
-///   unknown, which withholds as an unknown original would. A derived message the
-///   broker **refused** (a brownout, say) was decided before any side effect, so it is
-///   counted as a failed action and the original is still acknowledged: withholding an
-///   original that was already delivered would re-deliver it on every retry for as
-///   long as the refusal lasts.
-///
-/// Each derived message's action is counted here, once its fate is known.
+/// A derived message never changes it. One the broker accepted is counted `ok`; one
+/// it refused (a brownout), never routed (behind a refused original), or cannot vouch
+/// for (a failed durable write, or a peer refusing a copy after a local one was
+/// stored, which the hub turns into a withhold) is counted `failed`. Withholding the
+/// original instead, to have the publisher retry a derived message, re-delivers an
+/// original that was already delivered — on every retry, for as long as a sticky
+/// condition like a brownout lasts, and as a fresh `QoS` 2 sighting each time.
 #[must_use]
 pub fn join_outcomes(
     original: oneshot::Receiver<PublishOutcome>,
@@ -454,32 +479,15 @@ async fn combine(
     derived: Vec<DerivedAnswer>,
     metrics: Option<&Metrics>,
 ) -> Option<PublishOutcome> {
-    let first = original.await;
-    let original_refused = matches!(first, Ok(PublishOutcome::Refused(_)));
-    let mut unknown = false;
+    let answer = original.await.ok();
     for (rule, gate) in derived {
-        let result = match gate {
-            // `QoS` 0: routed exactly when the original was not refused.
-            None if original_refused => "failed",
-            None => "ok",
-            Some(rx) => match rx.await {
-                Ok(PublishOutcome::Accepted) => "ok",
-                Ok(PublishOutcome::Refused(_)) => "failed",
-                // Never routed, because the original was refused, or routed with a
-                // fate nobody can vouch for.
-                Err(_) => {
-                    unknown = true;
-                    "failed"
-                }
-            },
+        let result = match gate.await {
+            Ok(PublishOutcome::Accepted) => "ok",
+            Ok(PublishOutcome::Refused(_)) | Err(_) => "failed",
         };
         count_action(metrics, &rule, result);
     }
-    match first {
-        Ok(PublishOutcome::Refused(r)) => Some(PublishOutcome::Refused(r)),
-        Ok(PublishOutcome::Accepted) if !unknown => Some(PublishOutcome::Accepted),
-        _ => None,
-    }
+    answer
 }
 
 /// Load the configured rules file. `None` path = no rules. Warnings are logged.
@@ -513,7 +521,7 @@ mod tests {
     ) -> Option<PublishOutcome> {
         let rest = rest
             .iter()
-            .map(|o| (Arc::from("r"), Some(answered(*o))))
+            .map(|o| (Arc::from("r"), answered(*o)))
             .collect();
         join_outcomes(answered(first), rest, None).await.ok()
     }
@@ -522,24 +530,28 @@ mod tests {
     const REFUSED: Option<PublishOutcome> = Some(PublishOutcome::Refused(PublishRefusal::Brownout));
     const WITHHELD: Option<PublishOutcome> = None;
 
+    /// The publisher hears exactly the original's answer, whatever its derived messages
+    /// met: a derived failure is counted, never turned into a withhold that would have
+    /// the publisher re-send — and the broker re-deliver — an original it already
+    /// delivered.
     #[tokio::test]
-    async fn the_publisher_hears_the_originals_answer_unless_a_fate_is_unknown() {
-        assert_eq!(
-            joined(OK, &[]).await,
-            OK,
-            "no derived: the original's own answer"
-        );
-        assert_eq!(joined(OK, &[OK, OK]).await, OK);
-        // A refused derived message stored nothing: count it and ack the original that
-        // was delivered. Withholding would re-deliver it on every retry.
-        assert_eq!(joined(OK, &[REFUSED]).await, OK);
-        assert_eq!(joined(OK, &[OK, REFUSED]).await, OK);
-        // A refused original: the hub routed none of its derived messages.
-        assert_eq!(joined(REFUSED, &[WITHHELD]).await, REFUSED);
-        assert_eq!(joined(REFUSED, &[REFUSED]).await, REFUSED);
-        // An unknown fate anywhere withholds, as it does for any publish.
-        assert_eq!(joined(OK, &[OK, WITHHELD]).await, WITHHELD);
-        assert_eq!(joined(WITHHELD, &[OK]).await, WITHHELD);
+    async fn the_publisher_hears_exactly_the_originals_answer() {
+        for derived in [
+            &[][..],
+            &[OK, OK],
+            &[REFUSED],
+            &[OK, REFUSED],
+            &[WITHHELD],
+            &[OK, WITHHELD, REFUSED],
+        ] {
+            for original in [OK, REFUSED, WITHHELD] {
+                assert_eq!(
+                    joined(original, derived).await,
+                    original,
+                    "{original:?} with derived {derived:?}"
+                );
+            }
+        }
     }
 
     fn action_count(m: &Metrics, result: &str) -> u64 {
@@ -555,35 +567,23 @@ mod tests {
             .unwrap_or(0)
     }
 
-    /// A derived action is counted once its fate is known: routed → `ok`; refused,
-    /// skipped behind a refused original, or unknown → `failed`.
+    /// A gated derived action is counted once its gate answers: accepted → `ok`;
+    /// refused, never routed (its gate closed) or unknown → `failed`.
     #[tokio::test]
-    async fn derived_actions_are_counted_by_their_fate() {
+    async fn gated_derived_actions_are_counted_by_their_fate() {
         let metrics = Arc::new(Metrics::new("test"));
         let answers = vec![
-            (Arc::from("r"), Some(answered(OK))),
-            (Arc::from("r"), Some(answered(REFUSED))),
-            (Arc::from("r"), None),
+            (Arc::from("r"), answered(OK)),
+            (Arc::from("r"), answered(REFUSED)),
+            (Arc::from("r"), answered(WITHHELD)),
         ];
         let got = join_outcomes(answered(OK), answers, Some(metrics.clone())).await;
         assert_eq!(got.ok(), OK);
-        assert_eq!(
-            action_count(&metrics, "ok"),
-            2,
-            "the accepted one and the QoS 0 one"
-        );
-        assert_eq!(action_count(&metrics, "failed"), 1, "the refused one");
-
-        let answers = vec![
-            (Arc::from("r"), Some(answered(WITHHELD))),
-            (Arc::from("r"), None),
-        ];
-        let got = join_outcomes(answered(REFUSED), answers, Some(metrics.clone())).await;
-        assert_eq!(got.ok(), REFUSED);
+        assert_eq!(action_count(&metrics, "ok"), 1, "the accepted one");
         assert_eq!(
             action_count(&metrics, "failed"),
-            3,
-            "both skipped behind the refusal"
+            2,
+            "the refused and the unknown one"
         );
     }
 }

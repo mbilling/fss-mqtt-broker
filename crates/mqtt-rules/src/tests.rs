@@ -643,6 +643,89 @@ fn quadratic_string_growth_is_refused_before_it_is_allocated() {
     );
 }
 
+/// Patterns taken from the payload are compiled once per message and remembered —
+/// several of them, so two alternating per `FOREACH` element do not evict each other —
+/// and each still matches as its own pattern.
+#[test]
+fn payload_regex_patterns_are_cached_per_message_and_stay_distinct() {
+    let sql = "FOREACH payload.a AS e DO e INCASE regex_match(e, payload.r1) OR regex_match(e, payload.r2) FROM \"t/#\"";
+    let out = run_on(
+        sql,
+        "t/a",
+        r#"{"a":["ab","cd","xy","abab","zz"],"r1":"^(ab)+$","r2":"^c"}"#,
+    )
+    .unwrap();
+    assert_eq!(out, [r#"{"e":"ab"}"#, r#"{"e":"cd"}"#, r#"{"e":"abab"}"#]);
+}
+
+/// The growth budget is per message, not per call: a `FOREACH` that repeats a large
+/// `pad` per element runs out of it, where a per-call bound would have let 256 elements
+/// build 256 MiB from one small publish.
+#[test]
+fn the_growth_budget_is_per_message() {
+    let each = "FOREACH payload.a AS e DO pad('x', 600000) AS p FROM \"t/#\"";
+    assert_eq!(run_on(each, "t/a", r#"{"a":[1]}"#).unwrap().len(), 1);
+    let e = fails(each, r#"{"a":[1,2]}"#);
+    assert!(e.contains("budget is per message"), "{e}");
+}
+
+/// All of one message's effects together carry at most 4 MiB beyond four times its
+/// payload: a `FOREACH` fan-out times several actions times a template repeating the
+/// payload no longer turns one publish into a gigabyte of derived messages. Effects up
+/// to the budget are kept; past it, each further action fails and is reported.
+#[test]
+fn a_messages_effects_share_one_byte_budget() {
+    let action = |i: usize| {
+        format!(
+            r#"{{ function = "republish", args = {{ topic = "o/{i}", payload = "${{p}}${{p}}${{p}}${{p}}" }} }}"#
+        )
+    };
+    let text = format!(
+        "[rules.fan]\nsql = 'FOREACH payload.a AS e DO payload.p AS p FROM \"t/#\"'\nactions = [{}]\n",
+        (1..=4).map(action).collect::<Vec<_>>().join(", ")
+    );
+    let set = RuleSet::parse(&text).unwrap().rules;
+    // An 11 KB publish: 256 elements x 4 actions x a 40 KB rendered payload is 40 MB
+    // of derived messages unbounded.
+    let payload = Bytes::from(format!(
+        r#"{{"a":[{}],"p":"{}"}}"#,
+        vec!["0"; 256].join(","),
+        "x".repeat(10_000)
+    ));
+    let props = mqtt_core::AppProperties::default();
+    let input = PublishInput::new("c", "t/a", &payload, 0, &props);
+    let mut out = Vec::new();
+    let mut failed = 0;
+    set.on_publish(
+        &input,
+        &mut |_, o| {
+            if matches!(o, Outcome::ActionFailed(_)) {
+                failed += 1;
+            }
+        },
+        &mut out,
+    );
+    let carried: usize = out
+        .iter()
+        .map(|(_, e)| match e {
+            Effect::Republish(r) => r.topic.len() + r.payload.len(),
+            Effect::Console(l) => l.len(),
+        })
+        .sum();
+    let limit = MAX_DERIVED_BYTES + 4 * payload.len();
+    assert!(carried <= limit, "{carried} > {limit}");
+    assert!(
+        out.len() > 50 && failed > 0,
+        "{} kept, {failed} failed",
+        out.len()
+    );
+    assert_eq!(
+        out.len() + failed,
+        1024,
+        "every action is either kept or reported"
+    );
+}
+
 /// Each of these crashed the process from a payload value, found by an audit of the
 /// functions against publisher-controlled arguments.
 #[test]

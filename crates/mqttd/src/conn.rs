@@ -342,12 +342,19 @@ impl CloseReason {
 
 /// The `reason` EMQX reports for a client DISCONNECT: `normal` for `0x00` and otherwise
 /// the reason code's name (`emqx_channel:disconnect_reason/1` →
-/// `emqx_reason_codes:name/1`, emqx/emqx release-60). Codes a client may not send are
-/// named all the same, as EMQX names them.
+/// `emqx_reason_codes:name/1`, emqx/emqx release-60). Every code EMQX names is named
+/// the same here, including ones a client may not send in a DISCONNECT; the rest are
+/// `unknown_error`, as in EMQX.
 fn disconnect_reason_name(code: u8) -> &'static str {
     match code {
         0x00 => "normal",
+        0x01 => "granted_qos1",
+        0x02 => "granted_qos2",
         0x04 => "disconnect_with_will_message",
+        0x10 => "no_matching_subscribers",
+        0x11 => "no_subscription_existed",
+        0x18 => "continue_authentication",
+        0x19 => "re_authenticate",
         0x80 => "unspecified_error",
         0x81 => "malformed_packet",
         0x82 => "protocol_error",
@@ -2193,7 +2200,7 @@ where
                         // [MQTT-3.14.4-3]); so is a v5 DISCONNECT with a non-zero
                         // reason, where the CLIENT asks for its Will (issue #265,
                         // [MQTT-3.1.2-10]).
-                        match handle_inbound(packet, writer, hub, client, &principal, policy, &mut qos2_inbound, &mut qos2_inflight, &mut pending_pubacks, &mut current, is_v5, inbound_aliases, session_expiry, session_expiry_override, admission, rule_conn).await? {
+                        match handle_inbound(packet, writer, hub, client, &principal, policy, &mut qos2_inbound, &mut qos2_inflight, &mut pending_pubacks, &mut current, is_v5, inbound_aliases, session_expiry, session_expiry_override, admission, credit.as_ref(), rule_conn).await? {
                             PacketOutcome::Continue => {}
                             end => return Ok(rule_conn.ended(end)),
                         }
@@ -2210,7 +2217,7 @@ where
                 // The broker paused this client, not the client going quiet: the
                 // keepalive restarts from the moment reading resumes.
                 deadline = grace.map(|g| Instant::now() + g);
-                match handle_inbound(packet, writer, hub, client, &principal, policy, &mut qos2_inbound, &mut qos2_inflight, &mut pending_pubacks, &mut current, is_v5, inbound_aliases, session_expiry, session_expiry_override, IngressAdmit::Credit(Some(permit)), rule_conn).await? {
+                match handle_inbound(packet, writer, hub, client, &principal, policy, &mut qos2_inbound, &mut qos2_inflight, &mut pending_pubacks, &mut current, is_v5, inbound_aliases, session_expiry, session_expiry_override, IngressAdmit::Credit(Some(permit)), credit.as_ref(), rule_conn).await? {
                     PacketOutcome::Continue => {}
                     end => return Ok(rule_conn.ended(end)),
                 }
@@ -2403,6 +2410,75 @@ enum IngressAdmit {
     Shed,
 }
 
+/// What a publish's forward produced: sent, with the receiver its acknowledgement waits
+/// on and the hub gates it holds — or a batch with derived messages, still to be
+/// charged for them (ADR 0083).
+enum Forwarded {
+    Sent(Option<oneshot::Receiver<crate::hub::PublishOutcome>>, usize),
+    Batch(Box<PendingBatch>),
+}
+
+/// A publish and its derived messages, before their ingress credit is taken.
+struct PendingBatch {
+    original: HubCommand,
+    done: Option<oneshot::Receiver<crate::hub::PublishOutcome>>,
+    derived: Vec<crate::rules::Derived>,
+    /// The original's own ingress credit.
+    credit: Option<crate::ingress::IngressPermit>,
+    /// What the original was charged.
+    charged: u32,
+}
+
+/// Send what `forward` produced. A batch's derived messages are charged to the
+/// connection's ingress credit first (ADR 0082 T3): they are queued for the hub like
+/// any publish, so they are paid for like one, and a rule that multiplies a publish
+/// cannot multiply what one connection may hold in the hub's queue. The charge is
+/// clamped to what the connection's cap leaves beside the original, so the wait always
+/// ends; a `QoS` 0 publish under `shed-qos0` waits for nothing, and its derived messages
+/// are dropped (and counted) when the credit is not there.
+async fn send_forwarded(
+    forwarded: Forwarded,
+    hub: &mpsc::UnboundedSender<HubCommand>,
+    conn_credit: Option<&crate::ingress::ConnCredit>,
+    rule_conn: &RuleConn,
+    qos: QoS,
+) -> (Option<oneshot::Receiver<crate::hub::PublishOutcome>>, usize) {
+    let batch = match forwarded {
+        Forwarded::Sent(rx, holds) => return (rx, holds),
+        Forwarded::Batch(batch) => *batch,
+    };
+    let PendingBatch {
+        original,
+        done,
+        mut derived,
+        credit,
+        charged,
+    } = batch;
+    let Some(rules) = &rule_conn.rules else {
+        unreachable!("only a connection with rules derives messages");
+    };
+    let mut derived_credit = None;
+    if let Some(c) = conn_credit {
+        let cost = c.node().derived_cost(
+            charged,
+            derived.iter().map(crate::rules::Derived::accounted),
+        );
+        if cost > 0 {
+            derived_credit = match c.try_acquire(cost) {
+                Some(permit) => Some(permit),
+                None if qos == QoS::AtMostOnce
+                    && c.node().mode() == crate::ingress::OverloadMode::ShedQos0 =>
+                {
+                    rules.shed(std::mem::take(&mut derived));
+                    None
+                }
+                None => Some(c.clone().acquire(cost).await),
+            };
+        }
+    }
+    rules.send_batch(hub, original, done, derived, credit, derived_credit)
+}
+
 /// Handle one inbound PUBLISH: topic validation, ACL gate, inbound `QoS`
 /// handshakes, and the exactly-once dedup window.
 ///
@@ -2427,6 +2503,7 @@ async fn handle_publish<W: AsyncWrite + Unpin>(
     is_v5: bool,
     inbound_aliases: &mut InboundAliases,
     admission: IngressAdmit,
+    conn_credit: Option<&crate::ingress::ConnCredit>,
     rule_conn: &RuleConn,
 ) -> Result<PacketOutcome, NetError> {
     // The MQTT 5.0 Message Expiry Interval (if the publisher set one) bounds how long
@@ -2528,81 +2605,87 @@ async fn handle_publish<W: AsyncWrite + Unpin>(
     //
     // Returns the receiver and how many hub acknowledgement gates the publish holds
     // (its own, plus one per gated message its rules derived — ADR 0083).
-    let forward = |hub: &mpsc::UnboundedSender<HubCommand>|
-     -> (Option<oneshot::Receiver<crate::hub::PublishOutcome>>, usize) {
-        if authorized {
-            let credit = match admission {
-                IngressAdmit::Credit(credit) => credit,
-                // Only ever `QoS` 0, which has nothing to answer: the alias is
-                // registered and the topic checked above, the message goes no further.
-                IngressAdmit::Shed => {
-                    if let Some(m) = &policy.metrics {
-                        m.publish_dropped("hub-ingress");
-                    }
-                    return (None, 0);
+    let forward = |hub: &mpsc::UnboundedSender<HubCommand>| -> Forwarded {
+        if !authorized {
+            return Forwarded::Sent(None, 0);
+        }
+        let credit = match admission {
+            IngressAdmit::Credit(credit) => credit,
+            // Only ever `QoS` 0, which has nothing to answer: the alias is
+            // registered and the topic checked above, the message goes no further.
+            IngressAdmit::Shed => {
+                if let Some(m) = &policy.metrics {
+                    m.publish_dropped("hub-ingress");
                 }
-            };
-            // The rule engine (ADR 0083) runs HERE: after the ACL, on this
-            // connection's task, once per publish on the node it arrived at — so rule
-            // work scales with connections and nodes and never runs on the hub loop.
-            // What the rules republish travels with the original to the hub, which
-            // routes it only if it accepts the original, and a gated original's ack
-            // waits for it too (`ConnRules::send_batch`).
-            let derived = match &rule_conn.rules {
-                Some(rules) => rules.on_publish(&crate::rules::PublishFacts {
-                    client,
-                    publisher: &rule_conn.publisher,
-                    topic: &topic,
-                    payload: &payload,
-                    qos,
-                    retain,
-                    dup,
-                    app: &app,
-                    message_expiry,
-                }),
-                None => Vec::new(),
-            };
-            let (done, rx) = if gated {
-                let (tx, rx) = oneshot::channel();
-                (Some(tx), Some(rx))
-            } else {
-                (None, None)
-            };
-            // With derived messages behind it, the credit rides the batch, so it is
-            // held until the whole batch has been dispatched.
-            let (credit, batch_credit) = if derived.is_empty() {
-                (credit, None)
-            } else {
-                (None, credit)
-            };
-            let original = HubCommand::Publish {
-                topic,
-                payload,
+                return Forwarded::Sent(None, 0);
+            }
+        };
+        // The rule engine (ADR 0083) runs HERE: after the ACL, on this connection's
+        // task, once per publish on the node it arrived at — so rule work scales with
+        // connections and nodes and never runs on the hub loop. What the rules
+        // republish travels with the original to the hub, which routes it only if it
+        // accepts the original, and a gated original's ack waits for it too.
+        let derived = match &rule_conn.rules {
+            Some(rules) => rules.on_publish(&crate::rules::PublishFacts {
+                client,
+                publisher: &rule_conn.publisher,
+                topic: &topic,
+                payload: &payload,
                 qos,
                 retain,
+                dup,
+                app: &app,
                 message_expiry,
-                app,
-                done,
-                v5: is_v5,
-                publisher: Some(client.clone()), // #198: No Local excludes this publisher
-                credit,
-            };
-            match &rule_conn.rules {
-                Some(rules) if !derived.is_empty() => {
-                    rules.send_batch(hub, original, rx, derived, batch_credit)
-                }
-                _ => {
-                    let _ = hub.send(original);
-                    (rx, usize::from(gated))
-                }
-            }
+            }),
+            None => Vec::new(),
+        };
+        let (done, rx) = if gated {
+            let (tx, rx) = oneshot::channel();
+            (Some(tx), Some(rx))
         } else {
-            (None, 0)
+            (None, None)
+        };
+        // What the original was charged, for clamping its derived messages' charge.
+        let charged = conn_credit.map_or(0, |c| {
+            c.node()
+                .cost(topic.len(), payload.len() + app.accounted_bytes())
+        });
+        let batched = !derived.is_empty();
+        // With derived messages behind it, the credit rides the batch, so it is held
+        // until the whole batch has been dispatched.
+        let (own_credit, batch_credit) = if batched {
+            (None, credit)
+        } else {
+            (credit, None)
+        };
+        let original = HubCommand::Publish {
+            topic,
+            payload,
+            qos,
+            retain,
+            message_expiry,
+            app,
+            done,
+            v5: is_v5,
+            publisher: Some(client.clone()), // #198: No Local excludes this publisher
+            credit: own_credit,
+        };
+        if !batched {
+            let _ = hub.send(original);
+            return Forwarded::Sent(rx, usize::from(gated));
         }
+        Forwarded::Batch(Box::new(PendingBatch {
+            original,
+            done: rx,
+            derived,
+            credit: batch_credit,
+            charged,
+        }))
     };
     match (qos, pkid) {
         (QoS::AtMostOnce, _) => {
-            let _ = forward(hub); // nothing to acknowledge, nothing to gate
+            // Nothing to acknowledge, nothing to gate.
+            let _ = send_forwarded(forward(hub), hub, conn_credit, rule_conn, qos).await;
         }
         (QoS::AtLeastOnce, Some(id)) => {
             // Receive Maximum counts QoS 1 and QoS 2 publications TOGETHER
@@ -2625,7 +2708,8 @@ async fn handle_publish<W: AsyncWrite + Unpin>(
             // with it into `apply_publish_outcome`, verbatim. An ACL denial
             // (`forward` = `None`, issue #246) rides the same queue with its
             // verdict pre-decided, so acks can never overtake each other.
-            let (done, holds) = forward(hub);
+            let (done, holds) =
+                send_forwarded(forward(hub), hub, conn_credit, rule_conn, qos).await;
             if done.is_none() && is_v5 {
                 ack.reason = mqtt_codec::reason::NOT_AUTHORIZED;
             }
@@ -2719,7 +2803,10 @@ async fn handle_publish<W: AsyncWrite + Unpin>(
                     return Ok(PacketOutcome::BrokerClose);
                 }
                 let mut rec = mqtt_codec::packet::Ack::from(id);
-                if let Some(done) = forward(hub).0 {
+                if let Some(done) = send_forwarded(forward(hub), hub, conn_credit, rule_conn, qos)
+                    .await
+                    .0
+                {
                     // As for QoS 1: PUBREC promises the broker owns the message, so
                     // it is released only after the durable fan-out completes.
                     //
@@ -2934,6 +3021,9 @@ async fn handle_inbound<W: AsyncWrite + Unpin>(
     session_expiry_override: &mut Option<u32>,
     // The ingress credit a PUBLISH carries (ADR 0082 T3); ignored for anything else.
     admission: IngressAdmit,
+    // The connection's ingress credit, which a publish's derived messages are charged
+    // to (ADR 0083); `None` without a credit pool.
+    conn_credit: Option<&crate::ingress::ConnCredit>,
     // The rule engine's view of this connection (ADR 0083).
     rule_conn: &RuleConn,
 ) -> Result<PacketOutcome, NetError> {
@@ -2956,6 +3046,7 @@ async fn handle_inbound<W: AsyncWrite + Unpin>(
                 is_v5,
                 inbound_aliases,
                 admission,
+                conn_credit,
                 rule_conn,
             )
             .await?
@@ -3194,7 +3285,14 @@ async fn handle_inbound<W: AsyncWrite + Unpin>(
                 }
             }
         }
-        Packet::PingReq => writer.send(&Packet::PingResp).await?,
+        Packet::PingReq => {
+            // An idle connection still pings: let it drop a rule set a reload has
+            // superseded, rather than hold it until its next publish (ADR 0083).
+            if let Some(rules) = &rule_conn.rules {
+                rules.refresh();
+            }
+            writer.send(&Packet::PingResp).await?;
+        }
         Packet::Disconnect(d) => {
             // §3.14.2.2.2: a Session Expiry Interval HERE overrides the one agreed
             // at CONNECT — the documented way to say "hold my session, I'll be

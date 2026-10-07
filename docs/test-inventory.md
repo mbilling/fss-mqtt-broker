@@ -878,7 +878,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::sink_records_through_a_trait_object`
 - `tests::tampering_with_any_field_changes_the_head`
 
-## `crates/mqtt-rules/src/lib.rs` — 53 test(s)
+## `crates/mqtt-rules/src/lib.rs` — 56 test(s)
 
 - `funcs::tests::erlang_replacements_translate`
 - `funcs::tests::function_names_are_unique`
@@ -891,6 +891,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `template::tests::renders_paths_and_missing_values`
 - `template::tests::this_is_the_whole_output`
 - `tests::a_bad_rendered_topic_fails_the_action_not_the_rule`
+- `tests::a_messages_effects_share_one_byte_budget`
 - `tests::a_non_json_payload_fails_only_rules_that_reach_into_it`
 - `tests::arithmetic_follows_erlang`
 - `tests::case_expression_emqx_docs`
@@ -914,6 +915,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::map_and_array_functions_emqx_docs`
 - `tests::matching_dedups_orders_and_skips_disabled_rules`
 - `tests::original_user_properties_keep_wire_order_and_duplicates`
+- `tests::payload_regex_patterns_are_cached_per_message_and_stay_distinct`
 - `tests::payload_shapes_cannot_make_evaluation_quadratic`
 - `tests::payload_supplied_sizes_are_bounded`
 - `tests::payload_values_cannot_crash_the_evaluator`
@@ -923,6 +925,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::select_fields_and_aliases_emqx_docs`
 - `tests::select_star_has_emqx_fields`
 - `tests::string_functions_emqx_docs`
+- `tests::the_growth_budget_is_per_message`
 - `tests::time_functions_emqx_docs`
 - `tests::topic_match_operator_and_topic_function`
 - `tests::type_judgment_functions_emqx_docs`
@@ -1076,7 +1079,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 542 test(s)
+## `crates/mqttd/src/lib.rs` — 545 test(s)
 
 - `admin::cli::tests::all_nodes_asks_for_the_cluster_scope_on_the_verbs_that_have_one`
 - `admin::cli::tests::answers_render_as_tables_and_lines`
@@ -1182,7 +1185,9 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `conn::tests::graceful_shutdown_drains_an_established_connection`
 - `conn::tests::graceful_shutdown_sends_v5_server_shutting_down_disconnect`
 - `conn::tests::idle_connection_is_closed_after_keepalive_grace`
+- `conn::tests::ingress_credit::a_derived_charge_beyond_the_connection_cap_is_clamped_and_proceeds`
 - `conn::tests::ingress_credit::a_paused_publisher_resumes_and_still_receives_while_paused`
+- `conn::tests::ingress_credit::a_publishs_derived_messages_are_charged_to_its_credit`
 - `conn::tests::ingress_credit::an_alias_only_publish_pays_for_its_topic_and_its_properties`
 - `conn::tests::ingress_credit::keepalive_is_not_enforced_while_the_broker_pauses_the_connection`
 - `conn::tests::ingress_credit::under_pause_qos0_waits_rather_than_drops`
@@ -1347,6 +1352,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::a_nacked_handoff_re_routes_once_placement_catches_up`
 - `hub::tests::a_panicking_truncate_flush_does_not_strand_its_session`
 - `hub::tests::a_parked_qos2_truncate_does_not_stall_unrelated_sessions`
+- `hub::tests::a_peer_refusing_a_stored_derived_message_does_not_withhold_the_original`
 - `hub::tests::a_peer_that_missed_the_last_fanout_converges_from_a_restarted_owners_snapshot`
 - `hub::tests::a_peers_refusal_refuses_the_publisher_instead_of_dropping_the_gate`
 - `hub::tests::a_proto_6_peer_is_answered_with_the_boolean_and_a_proto_7_peer_with_the_verdict`
@@ -1602,8 +1608,8 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `reload::tests::checksum_is_sha256_lowercase_hex`
 - `reload::tests::committed_config_never_returns_a_rejected_candidate`
 - `reload::tests::reload_increments_the_metric_by_outcome`
-- `rules::tests::derived_actions_are_counted_by_their_fate`
-- `rules::tests::the_publisher_hears_the_originals_answer_unless_a_fate_is_unknown`
+- `rules::tests::gated_derived_actions_are_counted_by_their_fate`
+- `rules::tests::the_publisher_hears_exactly_the_originals_answer`
 - `runtime_probe::tests::both_probes_feed_the_wake_histogram`
 - `store_probe::tests::probes_a_volume_and_cleans_up`
 - `store_probe::tests::sharding_pays_only_when_parallel_streams_are_nearly_independent`
@@ -2042,7 +2048,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 
 - `a_rolled_node_disconnects_only_its_own_clients`
 
-## `crates/mqttd/tests/rules.rs` — 12 test(s)
+## `crates/mqttd/tests/rules.rs` — 13 test(s)
 
 - `a_disconnect_reason_code_is_reported_by_its_emqx_name`
 - `a_matching_publish_is_transformed_and_republished_beside_the_original`
@@ -2053,6 +2059,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `a_reload_reaches_connections_that_were_already_open`
 - `a_rule_republishing_into_its_own_from_cannot_loop`
 - `a_will_runs_rules_when_the_hub_publishes_it`
+- `an_idle_connection_releases_a_superseded_rule_set_when_it_pings`
 - `client_events_run_rules`
 - `foreach_fans_one_publish_out`
 - `in_a_cluster_each_message_is_evaluated_once_on_its_landing_node`

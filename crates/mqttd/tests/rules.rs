@@ -3,7 +3,7 @@
 //! The `mqtt-rules` unit tests prove the SQL against EMQX's documented behaviour; these
 //! prove the broker around it — that a rule's output is delivered at every `QoS`, that a
 //! `QoS` 1/2 publisher's acknowledgement waits for what its rules produced and answers
-//! with the original's fate, that a refused original routes nothing it derived, that a
+//! with the original's own fate, that a refused original routes nothing it derived, that a
 //! `QoS` 2 publish fires its rules once across a DUP resend, that a republished message can never
 //! re-trigger a rule, that Wills and client events run rules, and that in a cluster each
 //! message is evaluated exactly once — on the node it arrived at — while its derived
@@ -45,9 +45,10 @@ fn rule_set(text: &str) -> Arc<mqtt_rules::RuleSet> {
 async fn start_node(name: &str, rules: &str) -> (Broker, TcpListener, NodeId) {
     let store = Arc::new(MemorySessionStore::new());
     let id = NodeId(name.into());
-    let (hub, hub_tx) = Hub::with_config(id.clone(), store.clone());
-    tokio::spawn(hub.run());
+    let (mut hub, hub_tx) = Hub::with_config(id.clone(), store.clone());
     let metrics = Arc::new(mqtt_observability::metrics::Metrics::new("test"));
+    hub.attach_metrics(metrics.clone());
+    tokio::spawn(hub.run());
     let (rules_tx, rx) = tokio::sync::watch::channel(rule_set(rules));
     let engine = mqttd::rules::Rules::new(rx, Arc::from(name), Some(metrics.clone()));
     hub_tx
@@ -457,6 +458,32 @@ async fn a_reload_reaches_connections_that_were_already_open() {
     )
     .await;
     sub.expect_silence().await;
+}
+
+/// An idle connection lets go of a superseded rule set when it pings, instead of
+/// holding it until it next publishes: a series of reloads must not keep a series of
+/// old rule sets alive in idle connections.
+#[tokio::test]
+async fn an_idle_connection_releases_a_superseded_rule_set_when_it_pings() {
+    async fn ping(c: &mut Client) {
+        c.send(&Packet::PingReq).await;
+        match c.recv().await {
+            Packet::PingResp => {}
+            other => panic!("expected PINGRESP, got {other:?}"),
+        }
+    }
+    let broker = start_broker(ALERT).await;
+    let old = broker.rules_tx.borrow().clone();
+    let mut idle = Client::connect(broker.addr, "idle").await;
+    ping(&mut idle).await;
+    broker.rules_tx.send(rule_set("")).unwrap();
+    ping(&mut idle).await;
+    // The PINGRESP follows the refresh, so by now only this test holds the old set.
+    assert_eq!(
+        Arc::strong_count(&old),
+        1,
+        "the idle connection still holds the superseded rule set"
+    );
 }
 
 /// A republished message never re-enters the rule engine (EMQX's `direct_dispatch`,

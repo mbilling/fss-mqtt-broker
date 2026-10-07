@@ -46,12 +46,14 @@ impl std::fmt::Debug for Func {
 
 const MANY: usize = usize::MAX;
 
-/// How far a function may grow a string beyond its inputs: `pad`'s length, a
+/// How far one message's functions may grow strings beyond their inputs, TOGETHER —
+/// every call, in every rule, in every `FOREACH` output: `pad`'s length, a
 /// `replace`/`regex_replace` that substitutes a longer string at every match, a
 /// `join_to_string` separator repeated between items. Sizes and strings like these are
 /// often payload fields, and output that grows with the *product* of two of them lets
 /// one small publish ask for gigabytes — an allocation failure aborts the process, as
-/// does `str::repeat`'s capacity panic under `panic = "abort"`. Past the bound the
+/// does `str::repeat`'s capacity panic under `panic = "abort"`. A per-call bound alone
+/// is not enough: a `FOREACH` repeats the call per element. Past the budget the
 /// function fails, and so does the rule; the message is still routed.
 pub(crate) const MAX_BUILT_BYTES: usize = 1 << 20;
 
@@ -60,15 +62,27 @@ pub(crate) const MAX_BUILT_BYTES: usize = 1 << 20;
 /// often a payload field.
 const MAX_PATH_SEGMENTS: usize = 64;
 
-/// Refuse an output of `output` bytes (`None`: too large to count) built from inputs
-/// totalling `input` bytes when it grows them by more than [`MAX_BUILT_BYTES`].
-fn bounded_growth(name: &str, input: usize, output: Option<usize>) -> Result<(), EvalError> {
-    match output {
-        Some(n) if n <= input.saturating_add(MAX_BUILT_BYTES) => Ok(()),
-        _ => Err(EvalError::new(format!(
-            "{name} would build more than {MAX_BUILT_BYTES} bytes beyond its input"
-        ))),
-    }
+/// Charge an output of `output` bytes (`None`: too large to count) built from inputs
+/// totalling `input` bytes to the message's [`MAX_BUILT_BYTES`] budget, refusing it
+/// when the budget would be exceeded.
+fn bounded_growth(
+    cx: &FnCtx,
+    name: &str,
+    input: usize,
+    output: Option<usize>,
+) -> Result<(), EvalError> {
+    let built = output
+        .map(|n| n.saturating_sub(input))
+        .and_then(|g| g.checked_add(cx.ctx.built.get()))
+        .filter(|&total| total <= MAX_BUILT_BYTES)
+        .ok_or_else(|| {
+            EvalError::new(format!(
+                "{name} would build more than {MAX_BUILT_BYTES} bytes beyond its inputs \
+                 (the budget is per message, across every function call)"
+            ))
+        })?;
+    cx.ctx.built.set(built);
+    Ok(())
 }
 
 /// The decimals `float()` and `float2str()` accept: Erlang's `float_to_binary`'s own
@@ -219,7 +233,7 @@ funcs! {
         };
         Ok(Value::from(at.map_or("", |i| &s[i..])))
     };
-    "join_to_string" 1..=2 => |a, _| {
+    "join_to_string" 1..=2 => |a, cx| {
         let (sep, list) = match a {
             [list] => (", ".to_string(), list),
             [sep, list] => (text(sep)?.to_string(), list),
@@ -229,18 +243,18 @@ funcs! {
         let parts = items.iter().map(Value::to_text).collect::<Result<Vec<_>, _>>()?;
         let text_len: usize = parts.iter().map(String::len).sum();
         let seps = parts.len().saturating_sub(1).checked_mul(sep.len());
-        bounded_growth("join_to_string", text_len + sep.len(), seps.and_then(|n| n.checked_add(text_len)))?;
+        bounded_growth(cx, "join_to_string", text_len + sep.len(), seps.and_then(|n| n.checked_add(text_len)))?;
         Ok(Value::from(parts.join(&sep)))
     };
     "lower" 1..=1 => |a, _| Ok(Value::from(text(&a[0])?.to_lowercase()));
     "ltrim" 1..=1 => |a, _| Ok(Value::from(text(&a[0])?.trim_start()));
-    "pad" 2..=4 => |a, _| {
+    "pad" 2..=4 => |a, cx| {
         let s = text(&a[0])?;
         let len = usize::try_from(int(&a[1])?).unwrap_or(0);
         let dir = direction(a.get(2), &["trailing", "leading", "both"])?;
         let ch = a.get(3).map(text).transpose()?.unwrap_or(" ");
         let missing = len.saturating_sub(s.chars().count());
-        bounded_growth("pad", s.len(), missing.checked_mul(ch.len()).and_then(|n| n.checked_add(s.len())))?;
+        bounded_growth(cx, "pad", s.len(), missing.checked_mul(ch.len()).and_then(|n| n.checked_add(s.len())))?;
         let (left, right) = match dir {
             "leading" => (missing, 0),
             "both" => (missing / 2, missing - missing / 2),
@@ -252,7 +266,7 @@ funcs! {
     "regex_replace" 3..=3 => |a, cx| {
         let re = regex(cx, &a[1])?;
         let (s, rep) = (text(&a[0])?, text(&a[2])?);
-        bounded_replace_all(&re, s, &erlang_replacement(rep))
+        bounded_replace_all(cx, &re, s, &erlang_replacement(rep))
     }, regex 1;
     "regex_extract" 2..=2 => |a, cx| {
         let re = regex(cx, &a[1])?;
@@ -261,7 +275,7 @@ funcs! {
         });
         Ok(Value::from(groups))
     }, regex 1;
-    "replace" 3..=4 => |a, _| {
+    "replace" 3..=4 => |a, cx| {
         let (s, p, r) = (text(&a[0])?, text(&a[1])?, text(&a[2])?);
         if p.is_empty() {
             return Ok(Value::from(s));
@@ -275,7 +289,7 @@ funcs! {
             _ => {
                 if r.len() > p.len() {
                     let grown = s.matches(p).count().checked_mul(r.len() - p.len());
-                    bounded_growth("replace", s.len() + r.len(), grown.and_then(|g| g.checked_add(s.len())))?;
+                    bounded_growth(cx, "replace", s.len() + r.len(), grown.and_then(|g| g.checked_add(s.len())))?;
                 }
                 s.replace(p, r)
             }
@@ -549,6 +563,11 @@ pub(crate) fn compile_regex(pattern: &str) -> Result<Regex, EvalError> {
         .map_err(|e| EvalError::new(format!("invalid regular expression: {e}")))
 }
 
+/// How many patterns taken from payloads one message remembers compiled. Each may be
+/// as large as the compile limits allow, so the cache is small; four covers rules that
+/// apply a couple of payload patterns per `FOREACH` element.
+const REGEX_CACHE: usize = 4;
+
 /// The function's pattern: compiled at load when it is a literal; otherwise compiled
 /// here and remembered for the rest of the message, so a pattern taken from the payload
 /// and applied per `FOREACH` element is compiled once, not once per element.
@@ -558,24 +577,25 @@ fn regex(cx: &FnCtx, pattern: &Value) -> Result<Arc<Regex>, EvalError> {
     }
     let p = text(pattern)?;
     let mut cache = cx.ctx.regex_cache.borrow_mut();
-    if let Some((cached, compiled)) = cache.as_ref() {
-        if cached.as_str() == p {
-            return compiled.clone().map_err(EvalError::new);
-        }
+    if let Some(i) = cache.iter().position(|(cached, _)| cached.as_str() == p) {
+        let hit = cache.remove(i);
+        let compiled = hit.1.clone();
+        cache.insert(0, hit);
+        return compiled.map_err(EvalError::new);
     }
     let compiled = compile_regex(p).map(Arc::new).map_err(|e| e.0);
-    *cache = Some((p.to_string(), compiled.clone()));
+    cache.insert(0, (p.to_string(), compiled.clone()));
+    cache.truncate(REGEX_CACHE);
     compiled.map_err(EvalError::new)
 }
 
-/// `replace_all`, refused once the output would grow its input by more than
-/// [`MAX_BUILT_BYTES`]. Checked before each expansion, against an upper bound on it:
-/// the replacement's own length plus, for every `$` reference in it, the whole match.
-fn bounded_replace_all(re: &Regex, s: &str, rep: &str) -> Result<Value, EvalError> {
-    let limit = s
-        .len()
-        .saturating_add(rep.len())
-        .saturating_add(MAX_BUILT_BYTES);
+/// `replace_all`, refused once the output would take the message past its
+/// [`MAX_BUILT_BYTES`] budget. Checked before each expansion, against an upper bound on
+/// it: the replacement's own length plus, for every `$` reference in it, the whole
+/// match.
+fn bounded_replace_all(cx: &FnCtx, re: &Regex, s: &str, rep: &str) -> Result<Value, EvalError> {
+    let input = s.len().saturating_add(rep.len());
+    let limit = input.saturating_add(MAX_BUILT_BYTES.saturating_sub(cx.ctx.built.get()));
     let refs = rep.bytes().filter(|b| *b == b'$').count();
     let mut out = String::new();
     let mut last = 0;
@@ -585,13 +605,14 @@ fn bounded_replace_all(re: &Regex, s: &str, rep: &str) -> Result<Value, EvalErro
             .checked_mul(m.len())
             .and_then(|n| n.checked_add(rep.len() + (m.start() - last) + out.len()));
         if worst.is_none_or(|n| n > limit) {
-            bounded_growth("regex_replace", s.len() + rep.len(), None)?;
+            bounded_growth(cx, "regex_replace", input, None)?;
         }
         out.push_str(&s[last..m.start()]);
         caps.expand(rep, &mut out);
         last = m.end();
     }
     out.push_str(&s[last..]);
+    bounded_growth(cx, "regex_replace", input, Some(out.len()))?;
     Ok(Value::from(out))
 }
 

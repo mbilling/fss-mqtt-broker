@@ -509,3 +509,77 @@ fn an_alias_only_publish_pays_for_its_topic_and_its_properties() {
         "resolved topic and properties charged"
     );
 }
+
+/// A connection whose rules copy every publish to `copies` topics of the same length.
+fn policy_with_copies(credit: Arc<IngressCredit>, copies: usize) -> Arc<ConnPolicy> {
+    let actions: Vec<String> = (1..=copies)
+        .map(|i| format!(r#"{{ function = "republish", args = {{ topic = "copy/{i}" }} }}"#))
+        .collect();
+    let text = format!(
+        "[rules.copy]\nsql = 'SELECT * FROM \"load/#\"'\nactions = [{}]\n",
+        actions.join(", ")
+    );
+    let set = mqtt_rules::RuleSet::parse(&text)
+        .expect("test rules load")
+        .rules;
+    let (_tx, rx) = tokio::sync::watch::channel(Arc::new(set));
+    let base = permissive();
+    Arc::new(ConnPolicy {
+        ingress: Some(credit),
+        rules: Some(crate::rules::Rules::new(rx, Arc::from("n"), None)),
+        ..(*base).clone()
+    })
+}
+
+/// Derived messages are queued for the hub like any publish, so they are charged to
+/// the connection's credit like one (ADR 0083, ADR 0082 T3): a rule that copies a
+/// publish to three topics makes it cost four publishes until the hub has dispatched
+/// the batch — which is what keeps a rule's amplification inside the pool.
+#[tokio::test]
+async fn a_publishs_derived_messages_are_charged_to_its_credit() {
+    let credit = Arc::new(IngressCredit::new(POOL, CONN_CAP, OverloadMode::Pause));
+    let policy = policy_with_copies(credit.clone(), 3);
+    let (hub_tx, hub_rx) = mpsc::unbounded_channel();
+    let (mut queue, _outbound) = stalled_hub(hub_rx);
+    let (mut reader, mut writer) = open(&policy, &hub_tx, V4);
+    writer.send(&connect_packet("copier", true)).await.unwrap();
+    assert!(matches!(recv(&mut reader).await, Some(Packet::ConnAck(_))));
+    writer
+        .send(&publish(QoS::AtMostOnce, None, 0, 0))
+        .await
+        .unwrap();
+    let batch = queue.recv().await.expect("the publish reaches the hub");
+    assert!(matches!(batch, HubCommand::PublishBatch(_)), "{batch:?}");
+    // "copy/N" is as long as "load/t", and the copies carry the original's payload.
+    assert_eq!(credit.in_use(), 4 * COST, "the original and three copies");
+    drop(batch);
+    assert_eq!(credit.in_use(), 0, "dispatched: all of it returns");
+}
+
+/// The charge is clamped to what the connection's cap leaves beside the original, so
+/// a batch that alone costs more than the cap still proceeds, as the largest single
+/// message does.
+#[tokio::test]
+async fn a_derived_charge_beyond_the_connection_cap_is_clamped_and_proceeds() {
+    let cap = 2 * COST;
+    let credit = Arc::new(IngressCredit::new(POOL, cap, OverloadMode::Pause));
+    let policy = policy_with_copies(credit.clone(), 5);
+    let (hub_tx, hub_rx) = mpsc::unbounded_channel();
+    let (mut queue, _outbound) = stalled_hub(hub_rx);
+    let (mut reader, mut writer) = open(&policy, &hub_tx, V4);
+    writer
+        .send(&connect_packet("big-copier", true))
+        .await
+        .unwrap();
+    assert!(matches!(recv(&mut reader).await, Some(Packet::ConnAck(_))));
+    writer
+        .send(&publish(QoS::AtMostOnce, None, 0, 0))
+        .await
+        .unwrap();
+    let batch = tokio::time::timeout(Duration::from_secs(10), queue.recv())
+        .await
+        .expect("a batch costing more than the cap must not wait forever")
+        .expect("the publish reaches the hub");
+    assert!(matches!(batch, HubCommand::PublishBatch(_)));
+    assert_eq!(credit.in_use(), cap, "charged up to the cap, no further");
+}
