@@ -40,6 +40,11 @@ rules:
   - apiGroups: ["policy"]
     resources: ["poddisruptionbudgets"]
     verbs: ["get", "list", "watch", "create", "patch", "update"]
+  # The optional NetworkPolicy (issue #778). `delete` removes it when the CR drops
+  # spec.networkPolicy; a policy carries no data.
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies"]
+    verbs: ["get", "list", "watch", "create", "patch", "update", "delete"]
   # Observation (/statusz targets) + the T4 remediations. `delete` on pods is
   # the split-brain fence; PVCs are patched (quarantine label, expansion) and
   # NEVER deleted — the absence of `delete` here is the guarantee.
