@@ -2067,6 +2067,14 @@ say "[$N nodes] lane E: site ladder ${LANE_E_SITES[*]} x $LANE_E_SITE_RATE msg/s
 # uploaded as a symfs so the reports name functions. Reports and the raw data come
 # back under the rung's perf/.
 PERF_RUNG="${PERF_RUNG:-}"
+# NIC_COUNTERS=on snapshots every broker's network counters at each lane E window
+# edge into the rung's nic/ (#662): per-NIC queue counts and stats (ethtool -l/-S),
+# per-CPU softnet backlog drops and squeezes, kernel TCP/IP counters (nstat:
+# retransmits, backlog and listen drops), interrupt counts and the conntrack fill.
+# The window's deltas tell a NIC or softirq ceiling apart from the wire. Off by
+# default.
+NIC_COUNTERS="${NIC_COUNTERS:-off}"
+case "$NIC_COUNTERS" in on | off) ;; *) die "NIC_COUNTERS must be on or off, not '$NIC_COUNTERS'" ;; esac
 PERF_SECS="${PERF_SECS:-20}"
 PERF_FREQ="${PERF_FREQ:-199}"
 if [ -n "$PERF_RUNG" ]; then
@@ -2526,7 +2534,29 @@ IMAGES
 			sed "s/^/$phase $host: /" "$rdir/.batch/$phase-$host.err" >>"$rdir/window-ssh.log"
 		done
 	}
+	lane_e_nic_counters() { # lane_e_nic_counters <open|close>
+		[ "$NIC_COUNTERS" = on ] || return 0
+		local phase="$1" i q
+		local -a np=()
+		mkdir -p "$rdir/nic"
+		for ((i = 0; i < N; i++)); do
+			# shellcheck disable=SC2016 # expanded by the REMOTE shell
+			rssh "$(broker_pub_ip "$i")" 'printf "=== time %s\n" "$(date +%s.%N)"
+				for IF in $(ls /sys/class/net | grep -v "^lo$"); do
+					echo "=== ethtool-l $IF"; ethtool -l "$IF" 2>&1
+					echo "=== ethtool-S $IF"; ethtool -S "$IF" 2>&1
+				done
+				echo "=== softnet"; cat /proc/net/softnet_stat
+				echo "=== nstat"; nstat -az 2>&1
+				echo "=== interrupts"; cat /proc/interrupts
+				echo "=== conntrack"; cat /proc/sys/net/netfilter/nf_conntrack_count 2>/dev/null || echo none' \
+				>"$rdir/nic/$phase-broker$i.txt" 2>"$rdir/nic/$phase-broker$i.err" &
+			np+=($!)
+		done
+		for q in "${np[@]}"; do wait "$q" || warn "lane E: NIC counters ($phase) failed on a broker — see $rdir/nic/"; done
+	}
 	lane_e_window() {
+		lane_e_nic_counters open
 		lane_e_window_scrape open
 		local -a perf_pids=()
 		local q
@@ -2549,6 +2579,7 @@ IMAGES
         done
         fi
 		lane_e_window_scrape close
+		lane_e_nic_counters close
 		if [ "${#perf_pids[@]}" -gt 0 ]; then
 			for q in "${perf_pids[@]}"; do wait "$q" || warn "lane E: perf record failed on a broker — see $rdir/perf/"; done
 			# Reports are built after the drain (below), not here: `perf report`

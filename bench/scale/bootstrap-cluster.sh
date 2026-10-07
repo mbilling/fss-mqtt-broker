@@ -47,21 +47,41 @@ mkdir -p "$RUN"
 N=$(broker_count)
 say "bootstrapping a $N-node cluster (mode: $MODE)"
 
+# PEER_NET=private|public picks the network the peer bus (MQTTD_PEER_ADVERTISE,
+# :7001) runs over (#662): replication between brokers is one TCP connection
+# per pair, and the private network is an overlay (MTU 1450) whose path may
+# behave differently from the public one. SWIM, client traffic and scrapes stay
+# private. `public` puts each broker's PUBLIC address in its advertise line and
+# its peer certificate's SAN, and opens :7001 on the cloud firewall to exactly
+# the brokers' own public /32s (the firewall filters only the public side).
+PEER_NET="${PEER_NET:-private}"
+case "$PEER_NET" in private | public) ;; *) die "PEER_NET must be private or public, not '$PEER_NET'" ;; esac
+[ "$PEER_NET" = private ] || [ "${CLOUD:-hcloud}" = hcloud ] || die "PEER_NET=public is only wired for CLOUD=hcloud"
+peer_host() { # peer_host <index> — the address the peer bus advertises
+	if [ "$PEER_NET" = public ]; then broker_pub_ip "$1"; else broker_priv_ip "$1"; fi
+}
+
 # ── 1. Mint per-size secrets locally ─────────────────────────────────────────
 PKI="$RUN/pki-$N"
+# A PKI minted for one PEER_NET has the other network's SANs on its peer certs.
+if [ -d "$PKI" ] && [ "$(cat "$PKI/peer-net" 2>/dev/null || echo private)" != "$PEER_NET" ]; then
+	die "$PKI was minted for PEER_NET=$(cat "$PKI/peer-net" 2>/dev/null || echo private), not $PEER_NET — use a fresh run dir"
+fi
 if [ ! -d "$PKI" ]; then
 	mkdir -p "$PKI"
+	echo "$PEER_NET" >"$PKI/peer-net"
 	OPENSSL_BIN=$(pick_openssl)
 	say "minting cluster PKI with deploy/systemd/gen-certs.sh (OpenSSL: $OPENSSL_BIN)"
 	(cd "$PKI" && OPENSSL="$OPENSSL_BIN" PKI_DIR="$PKI/cluster" \
 		sh "$REPO_ROOT/deploy/systemd/gen-certs.sh" ca >"$PKI/gen-certs.log" 2>&1) ||
 		{ cat "$PKI/gen-certs.log" >&2; die "gen-certs.sh ca failed"; }
 	for ((i = 0; i < N; i++)); do
-		# The private IP is both the peer-advertise host and the address MQTT
-		# clients dial, so it goes in as an extra (client-facing) SAN too.
+		# The peer-advertise host (the private IP unless PEER_NET=public) is the
+		# peer certificate's SAN; the private IP is the address MQTT clients
+		# dial, so it goes in as the extra (client-facing) SAN.
 		(cd "$PKI" && OPENSSL="$OPENSSL_BIN" PKI_DIR="$PKI/cluster" \
 			sh "$REPO_ROOT/deploy/systemd/gen-certs.sh" node \
-			"$(broker_node_id "$i")" "$(broker_priv_ip "$i")" "$(broker_priv_ip "$i")" \
+			"$(broker_node_id "$i")" "$(peer_host "$i")" "$(broker_priv_ip "$i")" \
 			>>"$PKI/gen-certs.log" 2>&1) ||
 			{ cat "$PKI/gen-certs.log" >&2; die "gen-certs.sh node $(broker_node_id "$i") failed"; }
 	done
@@ -99,6 +119,7 @@ render_env() { # render_env <index> <ready-min> <seeds> > file
 	fi
 	sed -e "s|@NODE_ID@|$(broker_node_id "$i")|g" \
 		-e "s|@PRIVATE_IP@|$(broker_priv_ip "$i")|g" \
+		-e "s|@PEER_HOST@|$(peer_host "$i")|g" \
 		-e "s|@SWIM_SEEDS@|$seeds|g" \
 		-e "s|@READY_MIN_MEMBERS@|$ready|g" \
 		-e "s|@DURABLE_LINE@|$durable_line|g" \
@@ -159,6 +180,24 @@ for ((i = 0; i < ND; i++)); do
 		"$PKI/client-tls/certs/client.key" "root@$dip:/opt/bench-certs/"
 	rssh "$dip" "chmod 644 /opt/bench-certs/*"
 done
+
+# ── 3.4 PEER_NET=public: open the peer port to the brokers, and only them ────
+# Replaces any earlier :7001 rule (a broker swapped by replace-node.sh has a new
+# address) and keeps every other rule. Done here, after any resize, because the
+# firewall is tofu's: a later re-apply would drop the rule, and the next public
+# arm adds it back. Teardown destroys the firewall with it.
+if [ "$PEER_NET" = public ]; then
+	fw_rules="$RUN/firewall-rules.json"
+	src=$(for ((i = 0; i < N; i++)); do echo "$(broker_pub_ip "$i")/32"; done | jq -R . | jq -s .)
+	hcloud firewall describe mqttd-bench -o json |
+		jq --argjson src "$src" '[.rules[] | select(.port != "7001") | del(.destination_ips | select(length == 0))]
+			+ [{direction: "in", protocol: "tcp", port: "7001", source_ips: $src,
+				description: "peer bus over the public network (PEER_NET=public)"}]' >"$fw_rules" ||
+		die "could not read the mqttd-bench firewall"
+	hcloud firewall replace-rules mqttd-bench --rules-file "$fw_rules" >/dev/null ||
+		die "could not open :7001 on the mqttd-bench firewall to the brokers"
+	say "peer bus on the PUBLIC network: :7001 open to $(jq -r 'join(" ")' <<<"$src")"
+fi
 
 # ── 3.5 private-net full-mesh gate (issue #393 forensics) ────────────────────
 # After the cloud-init attach retry the fabric can drop a host's OUTBOUND
