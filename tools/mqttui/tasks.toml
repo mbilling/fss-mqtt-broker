@@ -114,9 +114,10 @@ Reads YOUR emqx.conf (HOCON) — or the dashboard-managed data/configs/cluster.h
 its acl.conf, and emits an mqttd TOML config, an ACL policy, and an mqtt-bridge config for
 the MQTT bridges it can express. Anything without an exact equivalent is emitted as a
 `# TODO(migrate):` comment at the point it belongs, including whole EMQX subsystems mqttd
-deliberately does not have (rule engine, data integration, gateways, exhook, plugins, zones,
-the dashboard) — a converter that silently dropped a setting would be worse than no
-converter, because you would deploy believing the policy came across.
+deliberately does not have (data-integration sinks, gateways, exhook, plugins, zones, the
+dashboard) — a converter that silently dropped a setting would be worse than no
+converter, because you would deploy believing the policy came across. With --out-rules it
+also writes the rule engine's rules as an mqttd rules file (docs/RULES.md).
 
 Mappings and fixtures come from emqx/emqx @ 6.2.2's own shipped examples; NO live EMQX was
 run. Review the output, then validate it: `mqttd --check-config --config <out>`.
@@ -385,7 +386,7 @@ group = "Try it"
 name = "Run the external-consumer integration blueprint's claims"
 script = "scripts/integration-consumer-smoke.sh"
 about = """
-Executes docs/INTEGRATION.md — the rule-engine replacement story (ADR 0063) — against
+Executes docs/INTEGRATION.md — the data-sink story (ADR 0063) — against
 the real broker with stock mosquitto clients: a `$share` consumer group (one MQTT 5
 member, one 3.1.1) splits a QoS 1 stream with single delivery; a retained value skips
 the group but reaches the documented plain-subscribe bootstrap; and with every member

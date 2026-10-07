@@ -33,6 +33,10 @@ clustering and security vocabulary — are defined at first use or in the
   [secured three-node tutorial](docs/SECURED-CLUSTER-TUTORIAL.md) or
   [Kubernetes](docs/KUBERNETES.md)
 - **build against it** — [CLIENT-GUIDE.md](docs/CLIENT-GUIDE.md)
+- **filter, reshape or re-route messages inside the broker** — the rule engine
+  (EMQX's rule SQL; unreleased, after `v1.0.18`): [RULES.md](docs/RULES.md) starts with a
+  two-minute first rule, and the [rule cookbook](docs/RULES-COOKBOOK.md) has sixteen
+  tested recipes
 - **secure and audit it** — [THREAT-MODEL.md](docs/THREAT-MODEL.md),
   [HARDENING.md](docs/HARDENING.md)
 - **contribute** — [ARCHITECTURE.md](docs/ARCHITECTURE.md),
@@ -1352,6 +1356,10 @@ The broker re-reads the configured files in place and swaps them on **live** con
   outgoing gossip datagram, and mixed old/new leaves coexist mid-rotation (verification is
   per-datagram against the CA). Rotating the cluster **CA itself** still needs a rolling
   restart.
+- **Rules** (`MQTTD_RULES_FILE`, ADR 0083; unreleased, after `v1.0.18`) — the next publish
+  on every connection, already-open ones included, runs the new rules. A rules file that
+  does not load rejects the **whole** reload, this list included, and the running policy
+  stays ([RULES.md](docs/RULES.md#operating-rules)).
 
 **Revocation reaches live state (ADR 0040).** A successful reload also **sweeps** what is
 already connected, with a two-tier rule — *who you are* revoked ends the session; *what you

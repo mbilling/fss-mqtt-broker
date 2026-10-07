@@ -35,6 +35,7 @@ audit it · contribute*.
 | [CONTRIBUTING-agent.md](CONTRIBUTING-agent.md) | Contributor (agent sessions) | Git/MCP workflow for automated sessions. |
 | [BRIDGE.md](BRIDGE.md) | Operator (boundary) | Single-instance vs HA pair topologies for the zone-crossing bridge. |
 | [RULES.md](RULES.md) | Application developer / migrator | The rule engine: EMQX-compatible rule SQL, functions, republish semantics at every QoS, and every difference from EMQX. |
+| [RULES-COOKBOOK.md](RULES-COOKBOOK.md) | Application developer | Sixteen working rule recipes, each a copyable file in `examples/rules/` that a test runs against the real broker. |
 | [INTEGRATION.md](INTEGRATION.md) | Application developer | External consumers (Kafka/webhook/DB) as an ordinary `$share` group; the rule engine has no sinks. |
 | [GLOSSARY.md](GLOSSARY.md) | All | MQTT + mqttd clustering/security vocabulary. |
 | [REVIEW-PANEL.md](REVIEW-PANEL.md) | Maintainer | Method for external-style documentation review panels. |

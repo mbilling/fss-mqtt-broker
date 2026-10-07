@@ -1,6 +1,6 @@
 # External consumers: the integration blueprint
 
-**Verified against `v1.0.16` (2026-09-11).** How to get messages out of mqttd and into the rest of your stack — Kafka, a
+**Verified against `v1.0.16` (2026-09-11); the rule-engine paragraphs against `main` after `v1.0.18` (2026-10-07).** How to get messages out of mqttd and into the rest of your stack — Kafka, a
 webhook, a database, anything — and what the broker
 does and does not promise while you do it ([ADR 0063](adr/0063-external-consumer-integration.md)).
 
@@ -248,6 +248,25 @@ pattern, and the converter names every connector/action it could not carry as a
 | Kafka / webhook / DB action (sink) | the consumer's producer / POST / upsert |
 | Rule-engine buffering & retry | the durable session queue + the consumer's ack-after-write |
 | Fan-out to several sinks | one group **per sink** — each group gets its own copy of the stream |
+
+A rule that prepares a stream for a sink group, filtering and reshaping it on the way:
+
+```toml
+[rules.export_raw]
+sql = '''
+SELECT payload.x AS x, topic FROM "raw/#" WHERE payload.x > 3
+'''
+actions = [
+  { function = "republish", args = { topic = "export/${topic}", qos = 1, payload = "${.}" } },
+]
+```
+
+A publish of `{"x": 5}` on `raw/dev1` reaches the group on `$share/sink/export/#` as
+`{"x":5,"topic":"raw/dev1"}` on `export/raw/dev1`, at QoS 1 and so queued for a member
+that is offline; `{"x": 1}` produces nothing. The derived topic is built from the
+original's own topic, so a publisher can reach only `export/` plus a topic the ACL let it
+publish on; a topic built from payload values needs a guard
+([RULES.md](RULES.md#security-values-the-publisher-chooses)).
 
 What you own that the rule engine used to own: the sink consumer processes
 themselves (deploy, restart, monitor — they are stateless; all state is the

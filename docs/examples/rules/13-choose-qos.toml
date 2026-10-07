@@ -1,0 +1,52 @@
+# Recipe 13: choose the QoS of what a rule publishes (and the default trap)
+#
+# A republish's qos defaults to "${qos}", and that placeholder reads the rule's OUTPUT,
+# not the incoming message. So a rule that does not SELECT qos publishes at QoS 0,
+# whatever QoS the device used. Set it on purpose:
+#
+# - alarm_upgrade: telemetry arrives at QoS 0 because it is cheap, but an alarm inside
+#   it must not be lost, so the alarm goes out at QoS 2.
+# - dashboard_copy: a live dashboard copy can be fire-and-forget, so it is QoS 0 even
+#   when the reading arrived at QoS 2.
+# - mirror_keep_qos: the copy keeps the device's QoS, because the rule SELECTs qos.
+# - mirror_forgot_qos: the same rule without qos in its SELECT. This is the trap: a QoS
+#   2 reading is copied at QoS 0.
+#
+# In:  tele/t-1/data  qos=2 retain=0  {"alarm": false, "v": 7}
+# Out: dash/t-1  qos=0 retain=0  {"alarm": false, "v": 7}
+# Out: mirror_gotcha/t-1  qos=0 retain=0  {"alarm": false, "v": 7}
+# Out: mirror/t-1  qos=2 retain=0  {"alarm": false, "v": 7}
+#
+# Tested by crates/mqttd/tests/rules_cookbook.rs; explained in docs/RULES-COOKBOOK.md.
+
+[rules.alarm_upgrade]
+description = "An alarm found in QoS 0 telemetry goes out at QoS 2"
+sql = '''
+SELECT topic(2) AS device, payload.code AS code
+FROM "tele/+/data"
+WHERE payload.alarm = true
+'''
+actions = [
+  { function = "republish", args = { topic = "alarms/${device}", qos = 2, payload = "${.}" } },
+]
+
+[rules.dashboard_copy]
+description = "A fire-and-forget copy for a live dashboard"
+sql = 'SELECT topic(2) AS device, payload FROM "tele/+/data"'
+actions = [
+  { function = "republish", args = { topic = "dash/${device}", qos = 0, payload = "${payload}" } },
+]
+
+[rules.mirror_keep_qos]
+description = "A copy at the device's own QoS: qos is selected"
+sql = 'SELECT topic(2) AS device, payload, qos FROM "tele/+/data"'
+actions = [
+  { function = "republish", args = { topic = "mirror/${device}", payload = "${payload}" } },
+]
+
+[rules.mirror_forgot_qos]
+description = "THE TRAP: the same copy without qos in the SELECT is always QoS 0"
+sql = 'SELECT topic(2) AS device, payload FROM "tele/+/data"'
+actions = [
+  { function = "republish", args = { topic = "mirror_gotcha/${device}", payload = "${payload}" } },
+]

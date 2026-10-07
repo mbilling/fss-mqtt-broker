@@ -649,3 +649,5 @@ pub fn check_sql(sql: &str) -> Result<Vec<String>, String> {
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_emqx_examples;

@@ -60,7 +60,8 @@ hub's **data lane is FIFO per connection, bounded by ingress credit** (ADR 0082)
    listed in [docs/RULES.md](../RULES.md#differences-from-emqx). EMQX's documented
    examples are the test oracle. The grammar accepts a small superset (`AND` in `SELECT`,
    keywords as path segments) only where the meaning is unambiguous. The engine is the
-   `mqtt-rules` crate, which is pure: no I/O and no broker state.
+   `mqtt-rules` crate, which holds no broker state and does no network I/O: it reads only
+   its rules file, the clock and a random source.
 
 2. **A client publish is evaluated on its connection task, after the ACL and before the
    hub, once, on the node it arrived at.** Connection tasks run in parallel on every core,
@@ -92,8 +93,10 @@ hub's **data lane is FIFO per connection, bounded by ingress credit** (ADR 0082)
    condition lasted (a brownout, a peer's brownout), and for QoS 2 the held-unacked
    dedup record made each resend a first sighting (review of PR #871). Inbound QoS 2
    deduplication precedes evaluation, so a rule fires once per QoS 2 message. A QoS 0
-   original gates nothing. Client/session events gate nothing, because there is no
-   acknowledgement to hold. A connection's pipeline of parked acknowledgements is
+   original gates nothing. Client/session events and Wills hold back no acknowledgement,
+   because there is none to hold, but each message they derive gets its own gate, so its
+   action is counted by its fate and a graceful shutdown's drain waits for it. A
+   connection's pipeline of parked acknowledgements is
    bounded in hub gates, not publishes, so a rule that fans a publish out cannot
    multiply what one connection holds in the hub's pending-publish table.
 
@@ -115,8 +118,9 @@ hub's **data lane is FIFO per connection, bounded by ingress credit** (ADR 0082)
    most 1,024 rules.
 
 8. **Bounded by construction.** Per file: at most 1,024 rules, 16 actions per rule, 64 KiB
-   of SQL per rule, and expressions at most 256 levels deep (64 levels of parentheses or
-   signs), because evaluating an expression recurses once per level. Per message —
+   of SQL per rule, and expressions at most 256 levels deep and nested at most 64 levels
+   (parentheses, signs, `NOT`, function calls and array literals inside each other),
+   because evaluating an expression recurses once per level. Per message —
    rules routinely pass payload fields to functions, so these bound what a publisher can
    make one message cost: a `FOREACH` iterates at most 10,000 elements and produces at
    most 256 outputs; at most 1,024 effects, carrying together at most 4 MiB beyond four
@@ -143,13 +147,15 @@ hub's **data lane is FIFO per connection, bounded by ingress credit** (ADR 0082)
    answer and a parked batch would never be sent, and the keepalive restarts once that
    wait is over. Under `shed-qos0` a QoS 0 publish's derived messages are dropped and
    counted instead of waited for. The batch holds its credit until it has been
-   dispatched. The clamp means the pool bounds hub memory only within a factor for
-   rule-heavy traffic: a batch may carry up to 4 MiB plus five times its payload (the
-   original and its derived bytes) while being charged at most one per-connection cap.
-   Every connection evaluates against its own cached view of the rule set, refreshed only
-   when a reload swaps it — at its next publish, event or PINGREQ, so an idle connection
-   does not hold a superseded set — and the publish path does not write to shared state
-   to read the rules.
+   dispatched. What a client/session event or a Will derives is charged to no
+   connection's credit, because no publish carries it: each event and each Will is held
+   to the per-message bounds above instead. The clamp means the pool bounds hub memory
+   only within a factor for rule-heavy traffic: a batch may carry up to 4 MiB plus five
+   times its payload (the original and its derived bytes) while being charged at most one
+   per-connection cap. Every connection evaluates against its own cached view of the
+   rule set, refreshed only when a reload swaps it — at its next publish, event or
+   PINGREQ, so an idle connection does not hold a superseded set — and the publish path
+   does not write to shared state to read the rules.
 
 9. **The EMQX converter carries rules.** `from-emqx.py --out-rules` writes each rule's SQL
    verbatim with its `republish`/`console` actions. Every sink action becomes a
@@ -162,13 +168,17 @@ hub's **data lane is FIFO per connection, bounded by ingress credit** (ADR 0082)
   as a reviewed file. Rule work scales with the cluster: it costs about 1.8 µs per
   matching publish on a connection task, against a hub loop near half a core at the knee.
   A rule's output keeps its input's guarantee, and a rule cannot loop. Rules can be tested
-  offline with `mqttd --rule-test` and `--check-rules`.
+  offline: `mqttd --check-rules` loads a file and lists every rule, and `mqttd --rule-test`
+  runs a statement against a simulated publish or a sample event.
 - **A new parser and evaluator on the publish path.** It reads publisher-controlled
   payloads, so it is bounded (decision 8), errors fail the rule rather than the message,
   and the parser and evaluator have nightly fuzz targets beside the codec's.
 - **A rule can publish where its publisher cannot.** The ACL decides whether the original
   is accepted; what a rule republishes is operator configuration with the ACL file's
-  trust. THREAT-MODEL.md records this as an operator-trusted surface.
+  trust. THREAT-MODEL.md records this as an operator-trusted surface. A topic template
+  filled from the payload, the client id or the username lets the publisher choose the
+  topic level (`x/../admin` is a valid one); docs/RULES.md shows the `WHERE` guard that
+  confines it.
 - **A derived message can be lost while its original is acknowledged**: under a
   brownout (a derived message that needs storage is a growth write, and is refused), or
   when its own durable write fails. It is counted
@@ -186,6 +196,23 @@ hub's **data lane is FIFO per connection, bounded by ingress credit** (ADR 0082)
   data-lane command, so the hub routes up to 1,025 messages back to back before the
   control lane gets a turn — a few milliseconds at worst, bounded by decision 8, in
   exchange for an atomic decision about the original and everything derived from it.
+- **Event- and Will-derived messages are not charged to ingress credit.** There is no
+  publish to charge them to and no connection to pause. Each event, and each Will, is
+  bounded by decision 8's per-message limits (at most 1,024 derived messages, carrying at
+  most 4 MiB plus four times a Will's payload). Events are raised only by connects,
+  disconnects and subscription changes, and nothing limits their rate: the connection
+  caps bound how many connections are open at once, not how fast they come and go; the
+  auth penalty box acts only on failed logins; `limits.max_publish_rate` counts
+  publishes only. `limits.max_subscriptions_per_client` and the packet size limit bound
+  how many events one SUBSCRIBE raises, since a rule on `$events/session/subscribed` runs
+  once per granted filter. A client that connects and disconnects, or subscribes and
+  unsubscribes, in a loop makes the hub route what the event rules derive on every turn,
+  paying a CONNECT or a SUBSCRIBE for each; what a turn costs the broker is the
+  operator's choice, like the amplification above. Accepted; THREAT-MODEL.md lists it.
+- **A graceful shutdown delivers what its disconnects derive.** Draining raises
+  `client/disconnected` with reason `shutdown` for each connection; the messages rules
+  derive from those events are routed, and stored where owed, before the broker exits,
+  within the drain's `shutdown_grace_secs`. A crash raises no events.
 - **Rules are node-local configuration.** A node with a different file evaluates its own
   clients' publishes differently. `mqttd_rules_info` makes that visible; nothing prevents
   it, just as nothing prevents ACL drift.

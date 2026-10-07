@@ -731,7 +731,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 
 - `publish_codec_round_trip_clears_the_floor`
 
-## `crates/mqtt-config/src/lib.rs` — 40 test(s)
+## `crates/mqtt-config/src/lib.rs` — 41 test(s)
 
 - `tests::a_backup_dir_inside_the_data_dir_is_a_config_error`
 - `tests::a_bad_enum_value_is_rejected`
@@ -739,6 +739,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::a_clustered_node_refuses_a_packet_size_it_cannot_forward`
 - `tests::a_crl_without_its_ca_is_rejected`
 - `tests::a_full_toml_round_trips`
+- `tests::a_rule_written_into_the_config_is_refused_with_where_rules_go`
 - `tests::a_swim_bind_requires_a_peer_bind`
 - `tests::a_type_mismatch_is_rejected`
 - `tests::an_unknown_key_is_rejected`
@@ -878,7 +879,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::sink_records_through_a_trait_object`
 - `tests::tampering_with_any_field_changes_the_head`
 
-## `crates/mqtt-rules/src/lib.rs` — 56 test(s)
+## `crates/mqtt-rules/src/lib.rs` — 73 test(s)
 
 - `funcs::tests::erlang_replacements_translate`
 - `funcs::tests::function_names_are_unique`
@@ -891,6 +892,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `template::tests::renders_paths_and_missing_values`
 - `template::tests::this_is_the_whole_output`
 - `tests::a_bad_rendered_topic_fails_the_action_not_the_rule`
+- `tests::a_literal_qos_or_retain_that_can_never_be_valid_fails_the_load`
 - `tests::a_messages_effects_share_one_byte_budget`
 - `tests::a_non_json_payload_fails_only_rules_that_reach_into_it`
 - `tests::arithmetic_follows_erlang`
@@ -904,6 +906,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::every_function_is_documented_in_rules_md`
 - `tests::expressions_emqx_docs`
 - `tests::expressions_too_deep_to_evaluate_safely_fail_the_load`
+- `tests::failures_are_reported_once_per_interval_per_rule`
 - `tests::file_level_validation`
 - `tests::foreach_default_item_and_chained_aliases_emqx_docs`
 - `tests::foreach_over_a_non_array_yields_nothing_and_is_capped`
@@ -926,12 +929,27 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::select_star_has_emqx_fields`
 - `tests::string_functions_emqx_docs`
 - `tests::the_growth_budget_is_per_message`
+- `tests::the_sql_test_simulates_events_and_refuses_inputs_the_rule_never_sees`
 - `tests::time_functions_emqx_docs`
 - `tests::topic_match_operator_and_topic_function`
 - `tests::type_judgment_functions_emqx_docs`
 - `tests::unaliased_payload_path_nests_under_payload`
 - `tests::user_properties_and_pub_props_emqx_docs`
 - `tests::where_filters_and_can_use_select_aliases`
+- `tests_emqx_examples::array_functions_match_emqx_examples`
+- `tests_emqx_examples::bit_functions_match_emqx_examples`
+- `tests_emqx_examples::conditional_functions_match_emqx_examples`
+- `tests_emqx_examples::conversion_functions_match_emqx_examples`
+- `tests_emqx_examples::encoding_functions_match_emqx_examples`
+- `tests_emqx_examples::every_implemented_function_has_an_example`
+- `tests_emqx_examples::hashing_functions_match_emqx_examples`
+- `tests_emqx_examples::legacy_accessors_match_emqx_source`
+- `tests_emqx_examples::map_functions_match_emqx_examples`
+- `tests_emqx_examples::math_functions_match_emqx_examples`
+- `tests_emqx_examples::string_functions_match_emqx_examples`
+- `tests_emqx_examples::time_functions_match_emqx_examples`
+- `tests_emqx_examples::type_judgment_functions_match_emqx_examples`
+- `tests_emqx_examples::uuid_functions_match_emqx_examples`
 - `value::tests::binary_is_never_silently_json_encoded`
 - `value::tests::floats_render_like_emqx_str`
 - `value::tests::json_round_trip_keeps_key_order_and_types`
@@ -1079,7 +1097,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 550 test(s)
+## `crates/mqttd/src/lib.rs` — 551 test(s)
 
 - `admin::cli::tests::all_nodes_asks_for_the_cluster_scope_on_the_verbs_that_have_one`
 - `admin::cli::tests::answers_render_as_tables_and_lines`
@@ -1209,6 +1227,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `conn::tests::rejected_auth_increments_the_error_counter`
 - `conn::tests::splice_relays_owner_bytes_after_client_half_close`
 - `conn::tests::the_ack_pipeline_counts_hub_gates_not_entries`
+- `conn::tests::the_keepalive_grace_is_one_and_a_half_periods_exactly`
 - `conn::tests::unknown_protocol_version_closes_without_connack`
 - `conn::tests::v311_connack_carries_no_properties`
 - `conn::tests::v311_receive_maximum_defaults_to_unlimited`
@@ -2053,7 +2072,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 
 - `a_rolled_node_disconnects_only_its_own_clients`
 
-## `crates/mqttd/tests/rules.rs` — 13 test(s)
+## `crates/mqttd/tests/rules.rs` — 15 test(s)
 
 - `a_disconnect_reason_code_is_reported_by_its_emqx_name`
 - `a_matching_publish_is_transformed_and_republished_beside_the_original`
@@ -2063,11 +2082,76 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `a_refused_original_routes_none_of_its_derived_messages`
 - `a_reload_reaches_connections_that_were_already_open`
 - `a_rule_republishing_into_its_own_from_cannot_loop`
+- `a_rule_that_does_not_select_qos_republishes_a_qos1_publish_at_qos0`
 - `a_will_runs_rules_when_the_hub_publishes_it`
+- `an_event_derived_message_is_counted_by_its_fate`
 - `an_idle_connection_releases_a_superseded_rule_set_when_it_pings`
 - `client_events_run_rules`
 - `foreach_fans_one_publish_out`
 - `in_a_cluster_each_message_is_evaluated_once_on_its_landing_node`
+
+## `crates/mqttd/tests/rules_binary.rs` — 38 test(s)
+
+- `a_failing_action_is_counted_failed_and_warned`
+- `a_failing_rule_never_affects_the_original_and_is_counted_failed`
+- `a_graceful_shutdown_keeps_every_shutdown_event_for_an_offline_watcher`
+- `a_qos1_derived_message_is_queued_for_an_offline_persistent_session`
+- `a_qos1_puback_is_released_only_once_each_derived_message_is_stored`
+- `a_republish_is_not_checked_against_the_publishers_acl`
+- `a_retained_derived_message_reaches_a_late_subscriber`
+- `a_rule_written_into_the_main_config_is_refused_with_where_rules_go`
+- `a_rules_file_that_does_not_load_on_sighup_is_rejected_and_the_old_rules_keep_working`
+- `a_shared_group_receives_derived_messages_balanced_across_members`
+- `a_will_runs_the_rules_in_force_when_the_broker_publishes_it`
+- `an_acl_denied_publish_runs_no_rules`
+- `check_rules_accepts_a_valid_file_and_lists_every_rule`
+- `check_rules_exits_2_on_a_usage_error`
+- `check_rules_loads_1024_rules_and_refuses_1025`
+- `check_rules_loads_16_actions_and_refuses_17`
+- `check_rules_loads_64_kib_of_sql_and_refuses_more`
+- `check_rules_refuses_a_literal_qos_of_3`
+- `check_rules_refuses_a_sink_action`
+- `check_rules_refuses_a_sql_syntax_error_with_its_position`
+- `check_rules_refuses_an_event_mqttd_does_not_raise`
+- `check_rules_refuses_an_unknown_function`
+- `check_rules_with_no_file_checks_the_configured_rules_file`
+- `client_connected_carries_the_connects_fields_for_v5_and_v311`
+- `client_disconnected_reports_normal_tcp_closed_and_a_v5_reason_by_its_emqx_name`
+- `in_a_two_process_cluster_a_publish_is_evaluated_once_on_its_landing_node`
+- `no_local_does_not_suppress_a_derived_message_for_its_publisher`
+- `rule_test_event_picks_among_several_events`
+- `rule_test_prints_each_output_of_a_publish_statement_as_json`
+- `rule_test_refuses_an_input_the_rule_would_never_see`
+- `rule_test_runs_a_topics_and_events_statement_against_a_publish_unless_event_is_given`
+- `rule_test_runs_an_events_statement_against_a_sample_event`
+- `session_subscribed_fires_once_per_granted_filter`
+- `session_unsubscribed_fires_once_per_filter_actually_removed`
+- `sighup_swaps_the_rules_for_a_client_that_stays_connected`
+- `the_broker_refuses_to_boot_on_a_rules_file_that_does_not_load`
+- `two_rules_failing_on_every_message_each_log_one_warn_per_ten_seconds`
+- `with_config_watch_an_edited_rules_file_is_picked_up_without_a_signal`
+
+## `crates/mqttd/tests/rules_cookbook.rs` — 11 test(s)
+
+- `every_recipe_does_on_the_real_broker_what_the_cookbook_shows`
+- `every_recipe_file_has_a_case_and_every_case_a_file`
+- `every_recipe_header_shows_what_the_recipe_does`
+- `every_recipe_passes_check_rules_with_no_warning`
+- `recipe_01_binary_payloads_warn_and_the_hex_variant_logs_them`
+- `recipe_01_rule_test_runs_a_statement_offline`
+- `the_gotchas_the_cookbook_states_hold`
+- `the_header_check_rejects_a_header_that_does_not_match`
+- `the_page_shows_exactly_the_blocks_this_suite_runs`
+- `the_pattern_matcher_checks_rendered_times`
+- `without_their_guards_the_recipes_do_what_the_cookbook_warns`
+
+## `crates/mqttd/tests/rules_docs.rs` — 5 test(s)
+
+- `documented_rule_test_and_check_rules_transcripts_match_the_binary`
+- `documented_rules_snippets_load`
+- `the_extraction_finds_every_documented_rules_file_and_snippet`
+- `the_extraction_recognises_every_documented_form`
+- `the_extraction_refuses_what_it_cannot_run`
 
 ## `crates/mqttd/tests/shared_membership.rs` — 6 test(s)
 

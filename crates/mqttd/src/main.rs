@@ -4642,13 +4642,13 @@ fn rule_test_cli() -> ! {
     let sample;
     let input: &dyn mqtt_rules::Input = match event {
         Some(kind) => {
-            let peer = "127.0.0.1:52345".parse().ok();
-            let sockname = "127.0.0.1:1883".parse().ok();
+            // No `sockname`: the broker's own events do not carry one, and a sample
+            // must show what a rule will really see.
             let client = mqtt_rules::ClientInfo {
                 clientid: &clientid,
                 username: username.as_deref(),
-                peer,
-                sockname,
+                peer: "127.0.0.1:52345".parse().ok(),
+                sockname: None,
                 node: "rule-test",
             };
             sample = mqtt_rules::EventInput::sample(kind, &client, &topic, qos);

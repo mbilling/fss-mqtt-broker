@@ -1105,33 +1105,60 @@ That is the design working. The alerts below say a node is **spending real time 
 
 ## Rules (ADR 0083)
 
-The rule engine's reference is [RULES.md](RULES.md); this is the operating summary.
+The rule engine's reference is [RULES.md](RULES.md), which starts with a two-minute
+walkthrough; tested recipes are in [RULES-COOKBOOK.md](RULES-COOKBOOK.md). This is the
+operating summary. The engine is unreleased: it lands after `v1.0.18`.
 
 - **Configure** with `[rules] file` (`MQTTD_RULES_FILE`). The file is per-node operator
-  configuration, like the ACL file: ship the same file to every node.
-- **Validate before you roll:** `mqttd --check-rules <file>`, and
-  `mqttd --rule-test --sql '…' --topic … --payload …` to see what a statement outputs.
+  configuration, like the ACL file: ship the same file to every node. Rules are written in
+  that file only; a `[rules.<id>]` table in `mqttd.toml` refuses the boot as an unknown
+  key. On Kubernetes, mount it from a ConfigMap ([KUBERNETES.md](KUBERNETES.md#rules));
+  under systemd or Docker Compose, see
+  [RULES.md § Shipping the rules file](RULES.md#shipping-the-rules-file). A release binary
+  ignores `MQTTD_RULES_FILE` without a word: a broker running rules logs
+  `rule engine: rules loaded` at startup.
+- **Validate before you roll:** `mqttd --check-rules <file>` loads the file as the broker
+  does and lists every rule (id, enabled or disabled, `FROM`, action count) under a line
+  carrying the file's SHA-256. With no file it loads the effective configuration first
+  and checks its `rules.file`, so a configuration error is reported instead.
+  `mqttd --rule-test --sql '…' --topic … --payload …` shows what a statement outputs; a
+  `$events` statement runs against a sample event (`--event` picks one).
   `mqttd --check-config --preflight` loads the rules file too.
-- **Change** by editing the file and reloading (`SIGHUP`, `POST /admin/v1/reload`, or the
-  `MQTTD_CONFIG_WATCH` watcher, which stats the rules file). The reload is
-  validate-before-swap: a rules file that does not load rejects the **whole** reload with
-  `rules: …` and the running rules stay. At boot, a rules file that does not load
-  refuses the start.
-- **Drift:** `mqttd_rules_info{checksum}` is the file's SHA-256. More than one checksum
-  across the cluster means nodes evaluate their own clients' publishes differently:
+- **Change** by editing the file and reloading: `SIGHUP` (`systemctl reload mqttd` under
+  the shipped unit; `docker kill --signal=HUP <container>` for a container, whose image has
+  no shell), the `MQTTD_CONFIG_WATCH` watcher, which stats the rules file (the Helm chart
+  sets `config_watch_secs = 30`), or `mqttd --admin reload` / `POST /admin/v1/reload`,
+  which needs the mTLS admin listener ([ADMIN-CLI.md](ADMIN-CLI.md#config-reload)). The
+  reload is validate-before-swap: a
+  rules file that does not load rejects the **whole** reload with `rules: …` and the
+  running rules stay. That includes an ACL or credential change made in the same reload:
+  a broken rules file holds back an urgent revocation until it is fixed, so check the
+  rules file before you reload, and look for `security reload REJECTED` after. At boot, a
+  rules file that does not load refuses the start.
+- **Drift:** `mqttd_rules_info{checksum}` is the file's SHA-256 (the same value
+  `--check-rules` prints). More than one checksum at 1 across the cluster means nodes
+  evaluate their own clients' publishes differently. A checksum replaced by a reload stays
+  exported at 0, which is why the query filters on `== 1`:
 
   ```promql
   count(count by (checksum) (mqttd_rules_info == 1)) > 1
   ```
 
-- **Failing rules:** `mqttd_rule_evaluations_total{rule,result="failed"}` and
-  `mqttd_rule_actions_total{rule,result="failed"}`; a failing rule also logs one WARN per
-  10 s. A failed rule never fails the message: the original is still routed.
+- **Failing rules:** `mqttd_rule_evaluations_total{rule,result="failed"}` counts
+  statements that raised an error, and `mqttd_rule_actions_total{rule,result="failed"}`
+  actions that failed (a bad rendered topic, `${.}` of binary data, a per-message limit, a
+  refused or dropped message). Watch both: a rule whose every republish fails passes every
+  evaluation. Each logs one WARN per rule per 10 s with the error (`rule SQL failed …` or
+  `rule action failed …`); a rule's further failures in that window are at DEBUG. A failed
+  rule never fails the message: the original is still routed.
 
   ```promql
   sum by (rule) (rate(mqttd_rule_evaluations_total{result="failed"}[5m])) > 0
+  sum by (rule) (rate(mqttd_rule_actions_total{result="failed"}[5m])) > 0
   ```
 
+  These series are on `/metrics`, which is served only on `listeners.health_bind`
+  (`MQTTD_HEALTH_BIND`) or `listeners.metrics_bind` (`MQTTD_METRICS_BIND`).
 - **Load:** rules run on connection tasks, so their CPU shows up as connection-task CPU,
   not as hub-loop time. A derived message is routed like any publish, so a rule that
   doubles your message count doubles the routing load and the
@@ -1143,14 +1170,23 @@ The rule engine's reference is [RULES.md](RULES.md); this is the operating summa
   `mqttd_ingress_paused_seconds`), so waiting connections never hold credit between
   them. The charge is clamped to one connection's cap, so the pool bounds the hub's
   queue in bytes only within a factor for rule-heavy traffic: a batch can carry up to
-  4 MiB plus five times its payload while being charged at most one cap.
+  4 MiB plus five times its payload while being charged at most one cap. What
+  client/session events and Wills derive is charged to no connection's credit; each event
+  or Will is bounded by the per-message limits instead (at most 1,024 messages carrying at
+  most 4 MiB, plus four times a Will's payload). A rule on `$events/session/subscribed`
+  runs once per granted filter, so a SUBSCRIBE with many filters raises many events.
 - **Brownout:** a QoS 1/2 publisher's ack waits for its derived messages but answers
   with the original's own fate. A derived message that needs storage is refused like any
   growth write and counted as a failed action, while its original is still acked; an
   original the hub refuses routes none of its derived messages. Expect
   `mqttd_rule_actions_total{result="failed"}` to climb during a brownout.
+- **Shutdown:** a graceful stop raises `$events/client/disconnected` with reason
+  `shutdown` for each connection it drains. The messages rules derive from those events
+  are routed, and stored where they are owed (a persistent session's queue), before the
+  broker exits, and each is counted `ok` or `failed` by its fate. The drain waits for them
+  within `shutdown_grace_secs`; a second signal cuts it short.
 
-These two expressions are recommendations; the chart's `PrometheusRule` does not ship
+These rule expressions are recommendations; the chart's `PrometheusRule` does not ship
 them.
 
 ## Monitoring for the operator (and humans)

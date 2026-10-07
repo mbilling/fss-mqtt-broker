@@ -393,6 +393,50 @@ destroys the data the restore just rebuilt. The only refusal here is a *differen
 source path, the instant, the file names, the set digest, and — if the restore was partial
 — `"partial": true` with every forfeited node and client id.
 
+## A rule does not fire, or publishes `undefined`
+
+The rule engine is unreleased (it lands after `v1.0.18`), so first check that the binary
+has it: `mqttd --help` lists `--check-rules` only in a build that does
+([RULES.md § Try it in two minutes](RULES.md#try-it-in-two-minutes)). A release binary or
+image ignores `MQTTD_RULES_FILE` without a word, so its startup log has no `rule engine:`
+line. The full checklist,
+with the commands, is [RULES.md § My rule does not fire](RULES.md#my-rule-does-not-fire);
+in short:
+
+**Symptom:** a rule's derived message never arrives, or arrives with `undefined` in its
+topic or payload.
+
+- **The file is not loaded, or not the one you edited.** The startup log says
+  `rule engine: rules loaded (ADR 0083) rules=<n> enabled=<n> digest=<sha256>`, and
+  `mqttd_rules_info{checksum}` must equal the `sha256` that `mqttd --check-rules <file>`
+  prints. An edit needs `SIGHUP` (or `MQTTD_CONFIG_WATCH`); a file that does not load is
+  rejected with `security reload REJECTED — keeping the running policy … error=rules: …`,
+  and the old rules keep running. Rules written into `mqttd.toml` itself refuse the boot:
+  they belong in their own file, named by `[rules] file`.
+- **`grep` finds the line but not the value.** The broker writes colour codes around each
+  field name even into a file, a pipe, `docker logs` or the journal, so `grep 'rules=1'`
+  or `grep 'digest=…'` matches nothing in a saved log while `grep 'rules loaded'` does.
+  Run the broker with `NO_COLOR=1` to get plain text.
+- **`FROM` does not match.** `mqttd --rule-test --sql '<statement>' --topic <topic>`
+  exits 1 with `matches none of the FROM filters` when it does not. A filter that starts
+  with `#` or `+` never matches a topic that starts with `$`.
+- **`WHERE` is false.** `mqttd_rule_evaluations_total{rule="<id>",result="no_result"}`
+  climbs. The usual cause is a double-quoted string, `WHERE name = "x"`, which compares
+  with a *field* called `x` (`--check-rules` warns about it); write `'x'`.
+- **The rule fails.** `result="failed"` climbs, and the log has one WARN per rule per
+  10 s naming the error, typically `payload is not JSON`.
+- **The action fails.** `mqttd_rule_actions_total{rule="<id>",result="failed"}` climbs,
+  with a WARN: a rendered topic with a wildcard, `${.}` of a binary payload (a
+  `SELECT *` rule meets this on any non-UTF-8 payload or Correlation-Data), a
+  per-message limit, or a refusal under brownout.
+- **`undefined` in the output.** A placeholder reads what the rule *selected*, not the
+  message: `${topic}` in a rule that did not select `topic` renders `undefined`, and so
+  does an event rule's default payload (events have none; use `payload = "${.}"`). A
+  rule that does not select `qos` republishes at QoS 0, which an offline session does
+  not queue.
+- **No metrics to look at.** `/metrics` is served only with `MQTTD_HEALTH_BIND` (or
+  `MQTTD_METRICS_BIND`) set.
+
 ## An unrecognised flag or `mqttd --version`
 
 - `mqttd --version` prints the version and exits; `mqttd --help` lists every flag. An

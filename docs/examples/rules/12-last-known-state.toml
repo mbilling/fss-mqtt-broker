@@ -1,0 +1,36 @@
+# Recipe 12: a retained "last known state" per device, and clearing it
+#
+# last_known_state copies each device's telemetry to state/<device>, retained, so an
+# app that subscribes later gets every device's latest reading at once. clear_state
+# deletes it when a device is decommissioned: anything published to
+# devices/<device>/decommission publishes an EMPTY retained message to state/<device>,
+# which is how MQTT deletes a retained message.
+#
+# The empty payload needs a trick: payload = "" does NOT mean empty (an empty template
+# is the whole output as JSON), so the rule selects an empty string and publishes that.
+#
+# A subscriber that is connected sees each copy with retain=0, as MQTT delivers any
+# live message; one that subscribes later gets the retained copies.
+#
+# In:   devices/d1/telemetry  qos=1 retain=0  {"temp": 23}
+# Out:  state/d1  qos=1 retain=0  {"temp": 23}
+# In:   devices/d3/decommission  qos=1 retain=0
+# Out:  state/d3  qos=1 retain=0
+# Late: state/d1  qos=1 retain=1  {"temp": 23}
+# (and nothing for d3: its retained state was deleted)
+#
+# Tested by crates/mqttd/tests/rules_cookbook.rs; explained in docs/RULES-COOKBOOK.md.
+
+[rules.last_known_state]
+description = "Keep each device's latest telemetry, retained"
+sql = 'SELECT topic(2) AS device, payload FROM "devices/+/telemetry"'
+actions = [
+  { function = "republish", args = { topic = "state/${device}", qos = 1, retain = true, payload = "${payload}" } },
+]
+
+[rules.clear_state]
+description = "Delete a decommissioned device's retained state"
+sql = '''SELECT topic(2) AS device, '' AS empty FROM "devices/+/decommission"'''
+actions = [
+  { function = "republish", args = { topic = "state/${device}", qos = 1, retain = true, payload = "${empty}" } },
+]
