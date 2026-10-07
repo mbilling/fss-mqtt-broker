@@ -1098,7 +1098,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 557 test(s)
+## `crates/mqttd/src/lib.rs` — 558 test(s)
 
 - `admin::cli::tests::all_nodes_asks_for_the_cluster_scope_on_the_verbs_that_have_one`
 - `admin::cli::tests::answers_render_as_tables_and_lines`
@@ -1305,7 +1305,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::forwarding::zone_fwd_proofs::releasing_the_ack_hold_does_not_shrink_the_settle_work_set`
 - `hub::forwarding::zone_fwd_proofs::the_ack_hold_clear_is_one_way_and_narrow`
 - `hub::forwarding::zone_fwd_proofs::the_answer_is_at_most_once`
-- `hub::forwarding::zone_fwd_proofs::the_drain_barrier_reports_the_unanswered_publishes_the_bound_evicted`
+- `hub::forwarding::zone_fwd_proofs::the_drain_barrier_reports_the_drain_gated_publishes_the_bound_evicted`
 - `hub::forwarding::zone_fwd_proofs::the_early_return_does_not_change_who_receives_a_publish`
 - `hub::forwarding::zone_fwd_proofs::the_early_return_never_swallows_a_retained_broadcast`
 - `hub::forwarding::zone_fwd_proofs::the_interest_buffer_is_reused_across_publishes`
@@ -1413,6 +1413,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::a_retained_publish_refused_by_brownout_leaves_the_previous_retained_value_intact`
 - `hub::tests::a_retained_replay_carries_the_remaining_expiry_interval`
 - `hub::tests::a_session_that_becomes_misplaced_by_attaching_is_rehomed`
+- `hub::tests::a_shared_group_refusing_every_drain_gated_delivery_still_gets_it_plainly`
 - `hub::tests::a_single_axis_still_toggles_brownout_on_its_own`
 - `hub::tests::a_stale_value_cannot_resurrect_a_committed_clear`
 - `hub::tests::a_stalled_group_a_append_does_not_delay_a_group_b_publish`
