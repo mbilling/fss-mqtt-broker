@@ -46,6 +46,8 @@ enum Body {
     /// UTF-8 text, shown as is. Empty is `mosquitto_pub -n`.
     Text(&'static str),
     /// Bytes that are not text, shown as `mosquitto_sub`'s `%x` shows them: lower-case hex.
+    /// Written as byte strings (`b"\x02"`): `scripts/check-reason-codes.py` reads a hex
+    /// literal from 0x80 up in an integration test as a reason code the test provokes.
     Bytes(&'static [u8]),
     /// Text with values that differ on every run: a [`match_pattern`] pattern.
     Varies(&'static str),
@@ -845,7 +847,7 @@ const R15: Recipe = Recipe {
             topic: "bin/nb-1/up",
             qos: 0,
             retain: false,
-            body: Body::Bytes(&[0x01, 0x09, 0xc4]),
+            body: Body::Bytes(b"\x01\x09\xc4"),
             props: &[],
             derived: &[
                 out(
@@ -857,7 +859,7 @@ const R15: Recipe = Recipe {
                     topic: "archive/nb-1",
                     qos: 0,
                     retain: false,
-                    body: Body::Bytes(&[0x01, 0x09, 0xc4]),
+                    body: Body::Bytes(b"\x01\x09\xc4"),
                     props: &[],
                 },
             ],
@@ -868,7 +870,7 @@ const R15: Recipe = Recipe {
             topic: "bin/nb-1/up",
             qos: 0,
             retain: false,
-            body: Body::Bytes(&[0x02, 0xff, 0x9c]),
+            body: Body::Bytes(b"\x02\xff\x9c"),
             props: &[],
             derived: &[
                 out(
@@ -880,7 +882,7 @@ const R15: Recipe = Recipe {
                     topic: "archive/nb-1",
                     qos: 0,
                     retain: false,
-                    body: Body::Bytes(&[0x02, 0xff, 0x9c]),
+                    body: Body::Bytes(b"\x02\xff\x9c"),
                     props: &[],
                 },
             ],
@@ -1006,7 +1008,7 @@ const BINARY_PUB: Pub = Pub {
     topic: "factory/line1/raw",
     qos: 0,
     retain: false,
-    body: Body::Bytes(&[0x01, 0xff, 0xc4]),
+    body: Body::Bytes(b"\x01\xff\xc4"),
     props: &[],
     derived: &[],
 };
@@ -1020,7 +1022,7 @@ const CORRELATION_PUB: Pub = Pub {
     qos: 0,
     retain: false,
     body: Body::Text(r#"{"t": 20.5}"#),
-    props: &[Prop::Correlation(&[0x01, 0xff, 0xc4])],
+    props: &[Prop::Correlation(b"\x01\xff\xc4")],
     derived: &[],
 };
 
@@ -2806,7 +2808,7 @@ const UNGUARDED_PUBS: [Pub; 5] = [
         topic: "bin/nb-1/up",
         qos: 0,
         retain: false,
-        body: Body::Bytes(&[0x01, 0x09, 0xc4]),
+        body: Body::Bytes(b"\x01\x09\xc4"),
         props: &[],
         derived: &[out("archive/nb-1", 0, "undefined")],
     },
