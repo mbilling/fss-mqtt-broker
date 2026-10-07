@@ -43,6 +43,7 @@ caller changes this file and the gate fails until it is regenerated and re-read.
 | `crates/mqttd/src/hub/mod.rs` | `enqueue_with_expiry` | `store-slow-first-enqueue` | ? | helper, 8 call site(s) |
 | `crates/mqttd/src/hub/mod.rs` | `an_uncongested_relaxed_forward_is_answered_at_submit` | `early-verdict-uniqueness` | 100ms | in the test itself |
 | `crates/mqttd/src/hub/mod.rs` | `the_durability_property_is_inert_without_the_operator_opt_in` | `inert-property-negative-window` | 300ms | in the test itself |
+| `crates/mqttd/src/peer.rs` | `wait_ns` | `peer-write-wait-hold` | ? | helper, 2 call site(s) |
 | `crates/mqttd/src/reload.rs` | `committed_config_never_returns_a_rejected_candidate` | `committed-config-reader-blocks` | 50ms | in the test itself |
 | `crates/mqttd/tests/backup_restore.rs` | `sigusr2_on_a_node_with_no_backup_dir_is_a_no_op_not_a_death` | `sigusr2-default-disposition-is-death` | 600ms | in the test itself |
 | `crates/mqttd/tests/cluster.rs` | `retained_mqtt5_properties_replay_from_any_nodes_cache` | `cluster-sever-eof-props` | 400ms | in the test itself |
@@ -54,7 +55,7 @@ caller changes this file and the gate fails until it is regenerated and re-read.
 | `crates/mqttd/tests/keepalive_lwt.rs` | `pinging_client_stays_connected_past_keepalive` | `keepalive-ping-cadence` | 500ms | in the test itself |
 | `crates/mqttd/tests/keepalive_lwt.rs` | `zero_keepalive_is_never_idle_disconnected` | `keepalive-zero-idle-window` | 2500ms | in the test itself |
 | `crates/mqttd/tests/peer_identity.rs` | `a_cluster_crl_reload_tears_down_the_revoked_nodes_link` | `crl-redial-attempt-window` | 2s | in the test itself |
-| `crates/mqttd/tests/proc_common/mod.rs` | `pump` | `relay-slow-link-fault` | ? | helper, 5 call site(s) |
+| `crates/mqttd/tests/proc_common/mod.rs` | `pump` | `relay-slow-link-fault` | ? | helper, 6 call site(s) |
 | `crates/mqttd/tests/proc_common/mod.rs` | `kill_step` | `nemesis-kill-offset` | ? | helper, 2 call site(s) |
 | `crates/mqttd/tests/reload_acl.rs` | `an_offline_sessions_revoked_grant_does_not_replay_its_queue_on_resume` | `acl-detach-offline` | 100ms | in the test itself |
 | `crates/mqttd/tests/replication_pause.rs` | `measure` | `pause-warm` | WARM | helper, 5 call site(s) |
