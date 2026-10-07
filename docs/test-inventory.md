@@ -878,7 +878,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::sink_records_through_a_trait_object`
 - `tests::tampering_with_any_field_changes_the_head`
 
-## `crates/mqtt-rules/src/lib.rs` — 48 test(s)
+## `crates/mqtt-rules/src/lib.rs` — 53 test(s)
 
 - `funcs::tests::erlang_replacements_translate`
 - `funcs::tests::function_names_are_unique`
@@ -902,6 +902,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::events_are_selected_by_either_emqx_spelling`
 - `tests::every_function_is_documented_in_rules_md`
 - `tests::expressions_emqx_docs`
+- `tests::expressions_too_deep_to_evaluate_safely_fail_the_load`
 - `tests::file_level_validation`
 - `tests::foreach_default_item_and_chained_aliases_emqx_docs`
 - `tests::foreach_over_a_non_array_yields_nothing_and_is_capped`
@@ -913,6 +914,10 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::map_and_array_functions_emqx_docs`
 - `tests::matching_dedups_orders_and_skips_disabled_rules`
 - `tests::original_user_properties_keep_wire_order_and_duplicates`
+- `tests::payload_shapes_cannot_make_evaluation_quadratic`
+- `tests::payload_supplied_sizes_are_bounded`
+- `tests::payload_values_cannot_crash_the_evaluator`
+- `tests::quadratic_string_growth_is_refused_before_it_is_allocated`
 - `tests::republish_args_render`
 - `tests::republish_defaults_follow_emqx`
 - `tests::select_fields_and_aliases_emqx_docs`
@@ -1071,7 +1076,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 540 test(s)
+## `crates/mqttd/src/lib.rs` — 542 test(s)
 
 - `admin::cli::tests::all_nodes_asks_for_the_cluster_scope_on_the_verbs_that_have_one`
 - `admin::cli::tests::answers_render_as_tables_and_lines`
@@ -1193,6 +1198,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `conn::tests::qos0_publish_is_not_durability_gated`
 - `conn::tests::rejected_auth_increments_the_error_counter`
 - `conn::tests::splice_relays_owner_bytes_after_client_half_close`
+- `conn::tests::the_ack_pipeline_counts_hub_gates_not_entries`
 - `conn::tests::unknown_protocol_version_closes_without_connack`
 - `conn::tests::v311_connack_carries_no_properties`
 - `conn::tests::v311_receive_maximum_defaults_to_unlimited`
@@ -1596,7 +1602,8 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `reload::tests::checksum_is_sha256_lowercase_hex`
 - `reload::tests::committed_config_never_returns_a_rejected_candidate`
 - `reload::tests::reload_increments_the_metric_by_outcome`
-- `rules::tests::the_publisher_is_acked_only_when_everything_was_accepted`
+- `rules::tests::derived_actions_are_counted_by_their_fate`
+- `rules::tests::the_publisher_hears_the_originals_answer_unless_a_fate_is_unknown`
 - `runtime_probe::tests::both_probes_feed_the_wake_histogram`
 - `store_probe::tests::probes_a_volume_and_cleans_up`
 - `store_probe::tests::sharding_pays_only_when_parallel_streams_are_nearly_independent`
@@ -2035,12 +2042,14 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 
 - `a_rolled_node_disconnects_only_its_own_clients`
 
-## `crates/mqttd/tests/rules.rs` — 9 test(s)
+## `crates/mqttd/tests/rules.rs` — 11 test(s)
 
 - `a_matching_publish_is_transformed_and_republished_beside_the_original`
 - `a_qos1_publish_acks_and_its_derived_message_is_qos1`
 - `a_qos2_publish_fires_its_rules_once_across_a_dup_resend`
-- `a_refused_derived_message_withholds_the_publishers_ack`
+- `a_refused_derived_message_fails_its_action_and_the_original_is_still_acked`
+- `a_refused_original_routes_none_of_its_derived_messages`
+- `a_reload_reaches_connections_that_were_already_open`
 - `a_rule_republishing_into_its_own_from_cannot_loop`
 - `a_will_runs_rules_when_the_hub_publishes_it`
 - `client_events_run_rules`
