@@ -1681,6 +1681,15 @@ requires = ["python3", "jq"]
 hidden = true
 
 [[task]]
+id = "scale-lane-e-ladder-tests"
+group = "Benchmark"
+name = "Offline tests for lane E's knee-stop count"
+script = "bench/scale/test-lane-e-ladder.py"
+about = "Runs run-curve.sh's lane_e_fails_after and its pre-loop init verbatim under set -euo pipefail over verdict sequences: neutral first rungs, mixed flags, resets. Invoked by CI with python3."
+requires = ["python3"]
+hidden = true
+
+[[task]]
 id = "scale-chart-per-vcpu"
 group = "Benchmark"
 hidden = true
