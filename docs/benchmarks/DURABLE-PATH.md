@@ -385,6 +385,8 @@ stages inside it are exported separately, on finer buckets (20µs to ~5s, ×1.5)
 | `replicate_queue` | leader: Replicate queued on the peer link → encoded into a write (in-process share of transit) |
 | `ack_queue` | follower: ReplicateAck queued on the peer link → encoded into a write |
 
+`replicate_queue` and `ack_queue` are sampled (one frame in 16 per thread), so their counts are a sixteenth of the others'; their means are comparable.
+
 `mqttd_publish_ack_seconds` is the server-side publish → PUBACK release for QoS 1
 publishes that went through the pending table: the broker's own share of the client's
 ack RTT, without the network or the client.

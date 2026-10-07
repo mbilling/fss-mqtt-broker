@@ -216,11 +216,35 @@ pub struct ReplicaEntryWire {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Queued(Option<std::time::Instant>);
 
+/// One frame in this many is stamped (per thread; the first always is). These are
+/// two more histogram records per replicated message on the hottest path, and a
+/// mean needs a sample, not a census.
+const QUEUED_SAMPLE_EVERY: u32 = 16;
+
 impl Queued {
     /// Stamped now.
     #[must_use]
     pub fn now() -> Self {
         Self(Some(std::time::Instant::now()))
+    }
+
+    /// Stamped now for one frame in [`QUEUED_SAMPLE_EVERY`] on this thread,
+    /// starting with the first; unstamped otherwise.
+    #[must_use]
+    pub fn sampled() -> Self {
+        thread_local! {
+            static SEEN: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+        }
+        let n = SEEN.with(|seen| {
+            let n = seen.get();
+            seen.set(n.wrapping_add(1));
+            n
+        });
+        if n.is_multiple_of(QUEUED_SAMPLE_EVERY) {
+            Self::now()
+        } else {
+            Self(None)
+        }
     }
 
     /// How long ago it was stamped; `None` for an unstamped (decoded) frame.

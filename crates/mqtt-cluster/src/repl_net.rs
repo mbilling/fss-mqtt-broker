@@ -430,7 +430,7 @@ impl ReplicaTransport for PeerReplicaTransport {
             req_id,
             epoch,
             op: op.clone(),
-            queued: crate::peer::Queued::now(),
+            queued: crate::peer::Queued::sampled(),
         };
 
         let sent = std::time::Instant::now();

@@ -153,7 +153,7 @@ impl WriteReply {
                     let _ = lane.send(crate::peer::PeerMessage::ReplicateAck {
                         req_id,
                         accepted,
-                        queued: crate::peer::Queued::now(),
+                        queued: crate::peer::Queued::sampled(),
                     });
                 }
             }
