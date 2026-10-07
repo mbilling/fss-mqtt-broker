@@ -2071,8 +2071,9 @@ PERF_RUNG="${PERF_RUNG:-}"
 # edge into the rung's nic/ (#662): per-NIC queue counts and stats (ethtool -l/-S),
 # per-CPU softnet backlog drops and squeezes, kernel TCP/IP counters (nstat:
 # retransmits, backlog and listen drops), interrupt counts and the conntrack fill.
-# The window's deltas tell a NIC or softirq ceiling apart from the wire. Off by
-# default.
+# The window's deltas tell a NIC or softirq ceiling apart from the wire; each
+# snapshot spans the window plus an ssh round trip, so rate them by the files'
+# own `=== time` stamps, not the window length. Off by default.
 NIC_COUNTERS="${NIC_COUNTERS:-off}"
 case "$NIC_COUNTERS" in on | off) ;; *) die "NIC_COUNTERS must be on or off, not '$NIC_COUNTERS'" ;; esac
 PERF_SECS="${PERF_SECS:-20}"
@@ -3052,6 +3053,17 @@ lane_e_swap_drivers() {
 		$LANE_E_SWAP_HOOK "$INVENTORY" driver "$d" "$why" ||
 			die "lane E: could not replace driver $d ($why) — see REPLACED.txt and the tf-replace log beside the provisioning inventory"
 	done
+	# The hook's tofu apply reconciles the cloud firewall first and replace-node.sh
+	# re-opens a PEER_NET=public :7001 rule only after it, so a peer link may have
+	# dropped meanwhile. Whatever the network, the next rung needs the full mesh
+	# the forwarding control was certified on.
+	if [ "$N" -gt 1 ]; then
+		local ev
+		ev="$OUT/laneE/mesh-after-swap-$(date -u +%Y%m%dT%H%M%SZ).txt"
+		await_full_mesh "$LANE_E_MESH_SETTLE_BUDGET" "$LANE_E_MESH_STABLE_POLLS" "$ev" ||
+			die "lane E: the mesh did not settle within ${LANE_E_MESH_SETTLE_BUDGET}s after swapping driver(s) $* — a rung now would measure a degraded mesh. Evidence: $ev"
+		say "[$N nodes] lane E: mesh intact after the swap ($(tail -n 1 "$ev" | cut -d' ' -f1))"
+	fi
 }
 
 # The driver gate: every driver bursts one publisher container at a rung's

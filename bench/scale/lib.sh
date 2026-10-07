@@ -213,6 +213,25 @@ await_full_mesh() {
 	done
 }
 
+# open_public_peer_port <run-dir>: PEER_NET=public (bootstrap-cluster.sh) runs
+# the peer bus on :7001 over the public network, which the mqttd-bench cloud
+# firewall filters. Opens :7001 to exactly the CURRENT inventory's broker public
+# /32s, replacing any earlier :7001 rule (a swapped broker has a new address) and
+# keeping every other rule. hcloud only. The rule set sent is kept in the run dir.
+open_public_peer_port() {
+	local fw_rules="$1/firewall-rules.json" src i n
+	n=$(broker_count)
+	src=$(for ((i = 0; i < n; i++)); do echo "$(broker_pub_ip "$i")/32"; done | jq -R . | jq -s .)
+	hcloud firewall describe mqttd-bench -o json |
+		jq --argjson src "$src" '[.rules[] | select(.port != "7001") | del(.destination_ips | select(length == 0))]
+			+ [{direction: "in", protocol: "tcp", port: "7001", source_ips: $src,
+				description: "peer bus over the public network (PEER_NET=public)"}]' >"$fw_rules" ||
+		die "could not read the mqttd-bench firewall"
+	hcloud firewall replace-rules mqttd-bench --rules-file "$fw_rules" >/dev/null ||
+		die "could not open :7001 on the mqttd-bench firewall to the brokers"
+	say "peer bus on the PUBLIC network: :7001 open to $(jq -r 'join(" ")' <<<"$src")"
+}
+
 # every_broker <command-template>: run over all broker indices sequentially.
 every_broker() { # every_broker fn — calls fn <index>
 	local fn="$1" i n

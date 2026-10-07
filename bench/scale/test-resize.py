@@ -454,6 +454,19 @@ if sys.argv[1:2] == ["output"]:
     sys.stdout.write(open(os.environ["TOFU_OUTPUT"]).read())
 '''
 
+# The cloud firewall as tofu left it (SSH + ICMP); replace-rules keeps what it was sent.
+HCLOUD_STUB = '''#!/usr/bin/env python3
+import json, os, shutil, sys
+with open(os.environ["CALL_LOG"], "a") as f:
+    f.write(json.dumps({"argv": ["hcloud"] + sys.argv[1:], "env": {}}) + "\\n")
+if sys.argv[1:3] == ["firewall", "describe"]:
+    print(json.dumps({"rules": [
+        {"direction": "in", "protocol": "tcp", "port": "22", "source_ips": ["0.0.0.0/0"], "destination_ips": []},
+        {"direction": "in", "protocol": "icmp", "port": None, "source_ips": ["0.0.0.0/0"], "destination_ips": []}]}))
+if sys.argv[1:3] == ["firewall", "replace-rules"]:
+    shutil.copy(sys.argv[sys.argv.index("--rules-file") + 1], os.environ["FW_SENT"])
+'''
+
 
 class ReplaceNodeTests(Rig):
     ARGS = ["-var", "node_count=7", "-var", "run_label=20260925T203528Z", "-var", "mqttd_url=https://x/y",
@@ -531,6 +544,31 @@ class ReplaceNodeTests(Rig):
         self.assertTrue(any("arm2/pki-5/" in a for a in scp[0]), "the ARM's PKI, not the provisioning's")
         self.assertIn("kind=driver index=3", (self.root / "arm2/REPLACED.txt").read_text())
 
+    def test_a_public_peer_arm_gets_its_peer_port_back_after_the_apply(self):
+        # The apply reconciles the firewall to firewall.tf, dropping the :7001 rule
+        # a PEER_NET=public arm's brokers advertise on; a driver swapped mid-arm
+        # must not leave the peer bus cut off.
+        subprocess.run(["bash", str(self.rig / "resize-cluster.sh"), str(self.full), "5", str(self.root / "arm2")],
+                       cwd=self.rig, env=self.env, check=True, capture_output=True)
+        arm = self.root / "arm2/inventory-5.json"
+        (self.root / "arm2/pki-5/cluster/ca").mkdir(parents=True)
+        (self.root / "arm2/pki-5/client-tls/certs").mkdir(parents=True)
+        hcloud = self.bin / "hcloud"
+        hcloud.write_text(HCLOUD_STUB)
+        hcloud.chmod(0o755)
+        sent = self.root / "fw-sent.json"
+        self.tofu_output("driver", 3, "192.0.2.50")
+        r = self.replace(arm, "driver", 3, env={"FW_SENT": str(sent)})
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertFalse([c for c in self.calls() if c["argv"][0] == "hcloud"], "a private arm's firewall is left alone")
+        (self.root / "arm2/pki-5/peer-net").write_text("public\n")
+        r = self.replace(arm, "driver", 3, env={"FW_SENT": str(sent)})
+        self.assertEqual(r.returncode, 0, r.stderr)
+        rules = json.loads(sent.read_text())
+        self.assertEqual([x["port"] for x in rules], ["22", None, "7001"], "every other rule is kept")
+        self.assertEqual(rules[-1]["source_ips"], [f"198.51.100.{i + 1}/32" for i in range(5)],
+                         "exactly the arm's brokers")
+
     def test_a_left_out_broker_changes_only_the_provisioning(self):
         subprocess.run(["bash", str(self.rig / "resize-cluster.sh"), str(self.full), "5", str(self.root / "arm2")],
                        cwd=self.rig, env=self.env, check=True, capture_output=True)
@@ -595,10 +633,15 @@ class DriverHealthTests(Rig):
         for name in self.FUNCS:
             start = src.index(f"\n{name}() {{") + 1
             funcs.append(src[start:src.index("\n}\n", start) + 3])
-        script = f". {self.rig}/lib.sh\n" + "".join(funcs) + body
+        # await_full_mesh is lib.sh's and tested on its own (MeshSettleTests); here
+        # it only records that a swap asked for the mesh, and fails on MESH_FAIL.
+        mesh = ('await_full_mesh() { echo "$*" >>"$OUT/mesh-calls"; echo "t=0s links/members: x" >"$3"; '
+                '[ -z "${MESH_FAIL:-}" ]; }\n')
+        script = f". {self.rig}/lib.sh\n" + "".join(funcs) + mesh + body
         return subprocess.run(["bash", "-c", script], text=True, capture_output=True, cwd=self.root,
                               env=self.env | {"OUT": str(self.root / "out"), "N": "3", "D": "4",
                                               "INVENTORY": str(self.full),
+                                              "LANE_E_MESH_SETTLE_BUDGET": "180", "LANE_E_MESH_STABLE_POLLS": "3",
                                               "LANE_E_DRIVER_SOFTIRQ_MAX": "80"} | (env or {}))
 
     def test_the_hottest_core_decides_not_the_average(self):
@@ -641,6 +684,29 @@ lane_e_rung_checked 10 2 no 2
         self.assertIn("pinned drivers: 2", (voided[0] / "VOIDED.txt").read_text())
         hook_call = (self.root / "hook.log").read_text().split()
         self.assertEqual(hook_call[:3], [str(self.full), "driver", "2"])
+        self.assertEqual(len((self.root / "out/mesh-calls").read_text().splitlines()), 1,
+                         "the rerun waits for the full mesh after the swap")
+
+    def test_a_swap_that_leaves_the_mesh_degraded_stops_the_size(self):
+        # A PEER_NET=public arm's :7001 rule is missing for the whole tofu apply
+        # of a driver swap; a peer link that dropped then must not be measured.
+        body = '''
+say() { :; }; warn() { :; }
+mkdir -p "$OUT/laneE"
+lane_e_swap_drivers "test" 1
+echo REACHED
+'''
+        hook = self.root / "hook.sh"
+        hook.write_text(f"#!/bin/sh\necho \"$@\" >>{self.root}/hook.log\n")
+        hook.chmod(0o755)
+        r = self.harness(body, env={"LANE_E_SWAP_HOOK": str(hook), "MESH_FAIL": "1"})
+        self.assertNotEqual(r.returncode, 0)
+        self.assertNotIn("REACHED", r.stdout)
+        self.assertIn("mesh did not settle within 180s after swapping driver(s) 1", r.stderr)
+        self.assertTrue((self.root / "hook.log").exists(), "the swap ran before the check")
+        calls = (self.root / "out/mesh-calls").read_text().split()
+        self.assertEqual(calls[:2], ["180", "3"])
+        self.assertIn("/laneE/mesh-after-swap-", calls[2])
 
     def test_without_a_hook_a_pinned_rung_is_recorded_not_hidden(self):
         body = '''

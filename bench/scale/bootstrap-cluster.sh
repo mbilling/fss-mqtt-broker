@@ -182,22 +182,11 @@ for ((i = 0; i < ND; i++)); do
 done
 
 # ── 3.4 PEER_NET=public: open the peer port to the brokers, and only them ────
-# Replaces any earlier :7001 rule (a broker swapped by replace-node.sh has a new
-# address) and keeps every other rule. Done here, after any resize, because the
-# firewall is tofu's: a later re-apply would drop the rule, and the next public
-# arm adds it back. Teardown destroys the firewall with it.
-if [ "$PEER_NET" = public ]; then
-	fw_rules="$RUN/firewall-rules.json"
-	src=$(for ((i = 0; i < N; i++)); do echo "$(broker_pub_ip "$i")/32"; done | jq -R . | jq -s .)
-	hcloud firewall describe mqttd-bench -o json |
-		jq --argjson src "$src" '[.rules[] | select(.port != "7001") | del(.destination_ips | select(length == 0))]
-			+ [{direction: "in", protocol: "tcp", port: "7001", source_ips: $src,
-				description: "peer bus over the public network (PEER_NET=public)"}]' >"$fw_rules" ||
-		die "could not read the mqttd-bench firewall"
-	hcloud firewall replace-rules mqttd-bench --rules-file "$fw_rules" >/dev/null ||
-		die "could not open :7001 on the mqttd-bench firewall to the brokers"
-	say "peer bus on the PUBLIC network: :7001 open to $(jq -r 'join(" ")' <<<"$src")"
-fi
+# Done here, after any resize, because the firewall is tofu's: a re-apply drops
+# the rule. replace-node.sh re-opens it after its own apply when the arm's PKI
+# was minted public; the next public arm opens it anyway. Teardown destroys the
+# firewall with it.
+[ "$PEER_NET" = private ] || open_public_peer_port "$RUN"
 
 # ── 3.5 private-net full-mesh gate (issue #393 forensics) ────────────────────
 # After the cloud-init attach retry the fabric can drop a host's OUTBOUND
@@ -288,6 +277,15 @@ if [ "$N" -gt 1 ]; then
 		follower_ready "$i"
 	done
 	say "founder armed; all $N nodes READY at majority floor $MAJORITY"
+	# /readyz is majority-only, so a public peer bus with a pair the cloud
+	# firewall still blocks can come up READY. Name that here, not as a
+	# forwarding-control failure later.
+	if [ "$PEER_NET" = public ]; then
+		mkdir -p "$RUN/formation"
+		await_full_mesh 180 3 "$RUN/formation/peer-mesh-public.txt" ||
+			die "PEER_NET=public: not every broker has its $((N - 1)) peer links within 180s — is :7001 open between the public addresses? Evidence: $RUN/formation/peer-mesh-public.txt"
+		say "public peer bus: full mesh on every broker"
+	fi
 fi
 
 say "cluster is up ($MODE mode)"

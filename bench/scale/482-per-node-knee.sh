@@ -211,10 +211,12 @@ set_nic_spread() {
 			echo \$FLOWS > /proc/sys/net/core/rps_sock_flow_entries || true
 			for IF in \$(ls /sys/class/net | grep -v '^lo\$'); do
 				# Hardware queues too, best effort: virtio offers more only if the
-				# host does. The boot-time count is kept so 'off' restores it.
+				# host does. 'off' restores the boot-time count cloud-init recorded
+				# before its own ethtool -L. Recording it here is only the fallback
+				# for a host without that file; it holds while nothing has resized.
 				CUR=\$(ethtool -l \$IF 2>/dev/null | awk '/^Current/{c=1} c && /^Combined/{print \$2; exit}')
 				if [ -n \"\$CUR\" ]; then
-					[ -f /run/nic-combined-\$IF ] || echo \$CUR > /run/nic-combined-\$IF
+					[ -s /run/nic-combined-\$IF ] || echo \$CUR > /run/nic-combined-\$IF
 					if [ '$mode' = on ]; then WANT=\$(nproc); else WANT=\$(cat /run/nic-combined-\$IF); fi
 					[ \"\$CUR\" = \"\$WANT\" ] || ethtool -L \$IF combined \$WANT 2>&1 | sed \"s/^/broker$i \$IF ethtool: /\" || true
 				fi
@@ -226,12 +228,13 @@ set_nic_spread() {
 				echo \"broker$i \$IF rps_cpus=\$(cat /sys/class/net/\$IF/queues/rx-0/rps_cpus) queues=\$(ls -d /sys/class/net/\$IF/queues/rx-* | wc -l)\"
 			done" >"$tmp" || die "could not reach broker $i ($ip) to set RIG_NIC_SPREAD=$mode"
 		cat "$tmp"
-		# A spread that did not take must not be measured as one.
-		if [ "$mode" = on ] && grep -qE 'rps_cpus=0+(,0+)*$' "$tmp"; then
+		# A spread that did not take must not be measured as one. The mask ends
+		# at a space (queues= follows it) or the end of the line.
+		if [ "$mode" = on ] && grep -qE 'rps_cpus=0+(,0+)*( |$)' "$tmp"; then
 			die "RIG_NIC_SPREAD=on did not take on broker $i: $(tr '\n' ' ' <"$tmp")"
 		fi
 		# And symmetrically: an "off" that left a mask set would measure spread.
-		if [ "$mode" = off ] && grep -E 'rps_cpus=' "$tmp" | grep -qvE 'rps_cpus=0+(,0+)*$'; then
+		if [ "$mode" = off ] && grep -E 'rps_cpus=' "$tmp" | grep -qvE 'rps_cpus=0+(,0+)*( |$)'; then
 			die "RIG_NIC_SPREAD=off did not take on broker $i: $(tr '\n' ' ' <"$tmp")"
 		fi
 	done
