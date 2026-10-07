@@ -945,8 +945,10 @@ impl Hub {
     /// nobody to retry it, however the pass ended — members refusing it (their nodes in
     /// a brownout, before any side effect) or their nodes dying: the first one tried
     /// still in the group gets it unanswered, as the group would have had the drain not
-    /// gated it. A dead member has left the group already; a copy after a failure is a
-    /// duplicate, which `QoS` 1 allows. Anything else answers the publisher.
+    /// gated it. A dead member has left the group already. A member whose node died may
+    /// have delivered it first, so this path is at least once, even at `QoS` 2 (as the
+    /// re-selection after a peer's death already is). Anything else answers the
+    /// publisher.
     fn shared_exhausted(
         &mut self,
         id: u64,
