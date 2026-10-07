@@ -879,7 +879,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::sink_records_through_a_trait_object`
 - `tests::tampering_with_any_field_changes_the_head`
 
-## `crates/mqtt-rules/src/lib.rs` — 73 test(s)
+## `crates/mqtt-rules/src/lib.rs` — 74 test(s)
 
 - `funcs::tests::erlang_replacements_translate`
 - `funcs::tests::function_names_are_unique`
@@ -893,6 +893,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `template::tests::this_is_the_whole_output`
 - `tests::a_bad_rendered_topic_fails_the_action_not_the_rule`
 - `tests::a_literal_qos_or_retain_that_can_never_be_valid_fails_the_load`
+- `tests::a_message_has_one_timestamp_however_often_it_is_read`
 - `tests::a_messages_effects_share_one_byte_budget`
 - `tests::a_non_json_payload_fails_only_rules_that_reach_into_it`
 - `tests::arithmetic_follows_erlang`
@@ -1097,7 +1098,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 553 test(s)
+## `crates/mqttd/src/lib.rs` — 554 test(s)
 
 - `admin::cli::tests::all_nodes_asks_for_the_cluster_scope_on_the_verbs_that_have_one`
 - `admin::cli::tests::answers_render_as_tables_and_lines`
@@ -1601,6 +1602,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::truncate_flusher::every_busy_session_is_flushed_in_turn`
 - `hub::tests::two_groups_on_one_filter_rotate_independently`
 - `hub::tests::two_publishes_to_one_offline_subscriber_append_in_arrival_order`
+- `hub::tests::while_draining_a_rule_derived_forward_holds_the_barrier_until_the_peer_answers`
 - `hub::tests::without_no_local_a_publisher_receives_its_own_delivery`
 - `ingress::tests::credit_is_returned_when_the_permit_drops_and_the_cap_bounds_one_connection`
 - `ingress::tests::peer_credit_draws_on_the_pool_alone_and_counts_what_it_sheds`
@@ -2092,10 +2094,11 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `foreach_fans_one_publish_out`
 - `in_a_cluster_each_message_is_evaluated_once_on_its_landing_node`
 
-## `crates/mqttd/tests/rules_binary.rs` — 38 test(s)
+## `crates/mqttd/tests/rules_binary.rs` — 39 test(s)
 
 - `a_failing_action_is_counted_failed_and_warned`
 - `a_failing_rule_never_affects_the_original_and_is_counted_failed`
+- `a_graceful_shutdown_forwards_every_shutdown_event_to_a_watcher_on_another_node`
 - `a_graceful_shutdown_keeps_every_shutdown_event_for_an_offline_watcher`
 - `a_qos1_derived_message_is_queued_for_an_offline_persistent_session`
 - `a_qos1_puback_is_released_only_once_each_derived_message_is_stored`
