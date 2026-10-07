@@ -583,3 +583,445 @@ async fn a_derived_charge_beyond_the_connection_cap_is_clamped_and_proceeds() {
     assert!(matches!(batch, HubCommand::PublishBatch(_)));
     assert_eq!(credit.in_use(), cap, "charged up to the cap, no further");
 }
+
+/// Answer every gate in a batch as the hub would on success, then drop it — which
+/// returns its credit.
+fn accept_batch(cmd: HubCommand) {
+    for done in dispatch_batch(cmd) {
+        let _ = done.send(crate::hub::PublishOutcome::Accepted);
+    }
+}
+
+/// Dispatch a batch without answering it yet: its credit is returned (the batch is
+/// dropped), and the gates it carried are handed back for the test to answer.
+fn dispatch_batch(cmd: HubCommand) -> Vec<oneshot::Sender<crate::hub::PublishOutcome>> {
+    let HubCommand::PublishBatch(batch) = cmd else {
+        panic!("expected a batch, got {cmd:?}");
+    };
+    let crate::hub::PublishBatch {
+        original, derived, ..
+    } = *batch;
+    std::iter::once(original)
+        .chain(derived.into_iter().map(|d| d.publish))
+        .filter_map(|p| match p {
+            HubCommand::Publish { done, .. } => done,
+            _ => None,
+        })
+        .collect()
+}
+
+/// Connect a client whose keepalive is 1 s, so a close for silence would come fast.
+async fn connect_impatient(writer: &mut Writer, reader: &mut Reader, id: &str) {
+    writer
+        .send(&Packet::Connect(Connect {
+            properties: Properties::new(),
+            protocol: V4,
+            clean_session: true,
+            keep_alive: 1,
+            client_id: id.into(),
+            last_will: None,
+            username: None,
+            password: None,
+        }))
+        .await
+        .unwrap();
+    assert!(matches!(recv(reader).await, Some(Packet::ConnAck(_))));
+}
+
+/// ADR 0083 with ADR 0082 T3 (review of PR #871): a batch whose derived messages find
+/// no credit waits parked, the way a publish waiting for credit does: the connection
+/// keeps delivering to its client, its keepalive is not enforced, and the batch is not
+/// sent until its whole charge is there. Once credit frees, the batch goes out and the
+/// publisher is acknowledged. (That it holds none of its own credit while it waits is
+/// `a_batch_waiting_for_credit_releases_its_originals_credit_first`.)
+#[tokio::test(start_paused = true)]
+async fn a_batch_waiting_for_derived_credit_waits_parked_and_keeps_delivering() {
+    let credit = Arc::new(IngressCredit::new(4 * COST, 4 * COST, OverloadMode::Pause));
+    let filler_policy = policy(Some(credit.clone()), None);
+    let copier_policy = policy_with_copies(credit.clone(), 3);
+    let (hub_tx, hub_rx) = mpsc::unbounded_channel();
+    let (mut queue, mut outbound) = stalled_hub(hub_rx);
+
+    // A publish without rules holds one cost of the pool of four.
+    let (mut filler_reader, mut filler_writer) = open(&filler_policy, &hub_tx, V4);
+    filler_writer
+        .send(&connect_packet("filler", true))
+        .await
+        .unwrap();
+    assert!(matches!(
+        recv(&mut filler_reader).await,
+        Some(Packet::ConnAck(_))
+    ));
+    let _filler_out = outbound.recv().await.unwrap();
+    filler_writer
+        .send(&publish(QoS::AtMostOnce, None, 1, 0))
+        .await
+        .unwrap();
+    let held = queue.recv().await.unwrap();
+    assert_eq!(credit.in_use(), COST);
+
+    // The copier (keepalive 1 s): its original fits in what is left, its three copies
+    // do not.
+    let (mut reader, mut writer) = open(&copier_policy, &hub_tx, V4);
+    connect_impatient(&mut writer, &mut reader, "copier").await;
+    let out = outbound.recv().await.unwrap();
+    writer
+        .send(&publish(QoS::AtLeastOnce, Some(1), 0, 0))
+        .await
+        .unwrap();
+    // Let the copier reach its wait. Virtual time: nothing else can move meanwhile.
+    // (The pool's FIFO semaphore hands the free bytes to the waiter at its head as they
+    // come, so `in_use` here counts the wait's partial grant, not a held permit.)
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Parked, the connection still delivers to its client...
+    let delivery = publish(QoS::AtMostOnce, None, 9, 9);
+    assert!(out.send(delivery.clone()));
+    assert_eq!(recv(&mut reader).await, Some(delivery), "outbound flows");
+    // ...and ten keepalive graces pass without closing it or sending the batch.
+    tokio::time::sleep(Duration::from_secs(15)).await;
+    match queue.try_recv() {
+        Err(_) => {}
+        Ok(HubCommand::Detach { .. }) => panic!("closed while the broker held it"),
+        Ok(other) => panic!("the batch went out without its credit: {other:?}"),
+    }
+
+    // Free the filler's credit: the batch goes out holding its whole charge.
+    drop(held);
+    let batch = timeout(Duration::from_secs(1), queue.recv())
+        .await
+        .expect("the parked batch proceeds once credit frees")
+        .unwrap();
+    assert_eq!(credit.in_use(), 4 * COST, "the original and three copies");
+    accept_batch(batch);
+    match recv(&mut reader).await {
+        Some(Packet::PubAck(a)) => assert_eq!(a.pkid, 1),
+        other => panic!("expected the PUBACK, got {other:?}"),
+    }
+    assert_eq!(credit.in_use(), 0, "every credit returned");
+}
+
+/// A `QoS` 2 batch whose derived messages find no credit waits in place: its PUBREC
+/// waits for the hub's answer inside the packet's handling, so the batch cannot be
+/// parked behind it. The broker reads nothing from the client meanwhile, so the
+/// keepalive restarts once the wait is over rather than closing a client the broker
+/// itself kept waiting, and the wait is counted as a pause (review of PR #871).
+#[tokio::test(start_paused = true)]
+async fn a_qos2_batch_waiting_for_credit_is_not_closed_for_the_brokers_wait() {
+    let credit = Arc::new(IngressCredit::new(4 * COST, 4 * COST, OverloadMode::Pause));
+    let filler_policy = policy(Some(credit.clone()), None);
+    let metrics = Arc::new(Metrics::new("test"));
+    let copier_policy = {
+        let p = policy_with_copies(credit.clone(), 3);
+        Arc::new(ConnPolicy {
+            metrics: Some(metrics.clone()),
+            ..(*p).clone()
+        })
+    };
+    let (hub_tx, hub_rx) = mpsc::unbounded_channel();
+    let (mut queue, mut outbound) = stalled_hub(hub_rx);
+
+    let (mut filler_reader, mut filler_writer) = open(&filler_policy, &hub_tx, V4);
+    filler_writer
+        .send(&connect_packet("filler", true))
+        .await
+        .unwrap();
+    assert!(matches!(
+        recv(&mut filler_reader).await,
+        Some(Packet::ConnAck(_))
+    ));
+    let _filler_out = outbound.recv().await.unwrap();
+    filler_writer
+        .send(&publish(QoS::AtMostOnce, None, 1, 0))
+        .await
+        .unwrap();
+    let held = queue.recv().await.unwrap();
+
+    let (mut reader, mut writer) = open(&copier_policy, &hub_tx, V4);
+    connect_impatient(&mut writer, &mut reader, "copier").await;
+    let _out = outbound.recv().await.unwrap();
+    writer
+        .send(&publish(QoS::ExactlyOnce, Some(1), 0, 0))
+        .await
+        .unwrap();
+    // Ten keepalive graces pass with the batch waiting for credit.
+    tokio::time::sleep(Duration::from_secs(15)).await;
+    assert!(queue.try_recv().is_err(), "nothing sent without its credit");
+
+    drop(held);
+    let batch = timeout(Duration::from_secs(1), queue.recv())
+        .await
+        .expect("the batch proceeds once credit frees")
+        .unwrap();
+    accept_batch(batch);
+    match recv(&mut reader).await {
+        Some(Packet::PubRec(a)) => assert_eq!(a.pkid, 1),
+        other => panic!("expected the PUBREC, got {other:?}"),
+    }
+    // Still open: the keepalive restarted when the wait ended.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    match queue.try_recv() {
+        Err(_) => {}
+        Ok(HubCommand::Detach { .. }) => panic!("closed for the broker's own wait"),
+        Ok(other) => panic!("unexpected command {other:?}"),
+    }
+    writer.send(&Packet::PingReq).await.unwrap();
+    assert_eq!(recv(&mut reader).await, Some(Packet::PingResp));
+    // The wait is a pause like any other, for the operator's pause alert.
+    assert_eq!(counter(&metrics, "mqttd_ingress_paused_total"), 1);
+}
+
+/// The same in-place wait reached the other way: a `QoS` 2 publish that first waited
+/// parked for its own credit, resumed, and then found none for its derived messages.
+/// The keepalive restarts after that wait too, so the client is not closed for it
+/// (review of PR #871), and each wait is counted as a pause.
+#[tokio::test(start_paused = true)]
+async fn a_resumed_qos2_publish_waiting_for_derived_credit_is_not_closed_for_it() {
+    let credit = Arc::new(IngressCredit::new(4 * COST, 4 * COST, OverloadMode::Pause));
+    let filler_policy = policy(Some(credit.clone()), None);
+    let metrics = Arc::new(Metrics::new("test"));
+    let copier_policy = {
+        let p = policy_with_copies(credit.clone(), 3);
+        Arc::new(ConnPolicy {
+            metrics: Some(metrics.clone()),
+            ..(*p).clone()
+        })
+    };
+    let (hub_tx, hub_rx) = mpsc::unbounded_channel();
+    let (mut queue, mut outbound) = stalled_hub(hub_rx);
+
+    // The filler takes the whole pool, one cost per publish.
+    let (mut filler_reader, mut filler_writer) = open(&filler_policy, &hub_tx, V4);
+    filler_writer
+        .send(&connect_packet("filler", true))
+        .await
+        .unwrap();
+    assert!(matches!(
+        recv(&mut filler_reader).await,
+        Some(Packet::ConnAck(_))
+    ));
+    let _filler_out = outbound.recv().await.unwrap();
+    let mut held = Vec::new();
+    for seq in 0..4 {
+        filler_writer
+            .send(&publish(QoS::AtMostOnce, None, 1, seq))
+            .await
+            .unwrap();
+        held.push(queue.recv().await.unwrap());
+    }
+    assert_eq!(credit.in_use(), 4 * COST);
+
+    // The copier's QoS 2 publish waits parked for its own cost...
+    let (mut reader, mut writer) = open(&copier_policy, &hub_tx, V4);
+    connect_impatient(&mut writer, &mut reader, "copier").await;
+    let _out = outbound.recv().await.unwrap();
+    writer
+        .send(&publish(QoS::ExactlyOnce, Some(1), 0, 0))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    // ...gets it, and then waits in place for its copies' credit, for ten graces.
+    drop(held.pop());
+    tokio::time::sleep(Duration::from_secs(15)).await;
+    assert!(queue.try_recv().is_err(), "nothing sent without its credit");
+
+    held.clear();
+    let batch = timeout(Duration::from_secs(1), queue.recv())
+        .await
+        .expect("the batch proceeds once credit frees")
+        .unwrap();
+    accept_batch(batch);
+    match recv(&mut reader).await {
+        Some(Packet::PubRec(a)) => assert_eq!(a.pkid, 1),
+        other => panic!("expected the PUBREC, got {other:?}"),
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    match queue.try_recv() {
+        Err(_) => {}
+        Ok(HubCommand::Detach { .. }) => panic!("closed for the broker's own wait"),
+        Ok(other) => panic!("unexpected command {other:?}"),
+    }
+    writer.send(&Packet::PingReq).await.unwrap();
+    assert_eq!(recv(&mut reader).await, Some(Packet::PingResp));
+    assert_eq!(
+        counter(&metrics, "mqttd_ingress_paused_total"),
+        2,
+        "the parked wait for its own credit and the in-place wait for its copies'"
+    );
+}
+
+/// A parked batch keeps its publish's place in the acknowledgement order: a `QoS` 1
+/// publish acknowledged after an earlier one whose batch was answered later still gets
+/// its PUBACK second, and no PUBACK leaves before the hub has answered it.
+#[tokio::test(start_paused = true)]
+async fn a_parked_batch_keeps_its_place_in_the_puback_order() {
+    let credit = Arc::new(IngressCredit::new(8 * COST, 8 * COST, OverloadMode::Pause));
+    let filler_policy = policy(Some(credit.clone()), None);
+    let copier_policy = policy_with_copies(credit.clone(), 3);
+    let (hub_tx, hub_rx) = mpsc::unbounded_channel();
+    let (mut queue, mut outbound) = stalled_hub(hub_rx);
+
+    let (mut filler_reader, mut filler_writer) = open(&filler_policy, &hub_tx, V4);
+    filler_writer
+        .send(&connect_packet("filler", true))
+        .await
+        .unwrap();
+    assert!(matches!(
+        recv(&mut filler_reader).await,
+        Some(Packet::ConnAck(_))
+    ));
+    let _filler_out = outbound.recv().await.unwrap();
+    filler_writer
+        .send(&publish(QoS::AtMostOnce, None, 1, 0))
+        .await
+        .unwrap();
+    let _held = queue.recv().await.unwrap();
+
+    let (mut reader, mut writer) = open(&copier_policy, &hub_tx, V4);
+    writer.send(&connect_packet("copier", true)).await.unwrap();
+    assert!(matches!(recv(&mut reader).await, Some(Packet::ConnAck(_))));
+    let _out = outbound.recv().await.unwrap();
+    // The first publish and its copies fit (five costs of eight in use)...
+    writer
+        .send(&publish(QoS::AtLeastOnce, Some(1), 0, 1))
+        .await
+        .unwrap();
+    let first = queue.recv().await.unwrap();
+    // ...the second's original would, its copies would not: it parks.
+    writer
+        .send(&publish(QoS::AtLeastOnce, Some(2), 0, 2))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        queue.try_recv().is_err(),
+        "the second batch waits for its credit"
+    );
+
+    // The hub dispatches the first batch, freeing its credit, but answers it last.
+    let first_gates = dispatch_batch(first);
+    let second = timeout(Duration::from_secs(1), queue.recv())
+        .await
+        .expect("the parked batch proceeds once the first is dispatched")
+        .unwrap();
+    accept_batch(second);
+    assert!(
+        timeout(Duration::from_millis(200), reader.next_packet())
+            .await
+            .is_err(),
+        "no PUBACK may overtake the first publish's"
+    );
+    for done in first_gates {
+        let _ = done.send(crate::hub::PublishOutcome::Accepted);
+    }
+    for pkid in [1, 2] {
+        match recv(&mut reader).await {
+            Some(Packet::PubAck(a)) => assert_eq!(a.pkid, pkid),
+            other => panic!("expected PUBACK {pkid}, got {other:?}"),
+        }
+    }
+}
+
+/// No connection holds credit while it waits for more (ADR 0082: there is no credit
+/// cycle). A batch whose derived messages find no credit releases its original's own
+/// permit BEFORE its wait for the whole charge begins; otherwise enough connections
+/// each holding an original whose command the hub never received could hold the whole
+/// pool, and nothing would ever free it (review of PR #871). Checked deterministically,
+/// before anything polls the wait: only the other holder's credit is in use.
+#[tokio::test]
+async fn a_batch_waiting_for_credit_releases_its_originals_credit_first() {
+    use crate::conn::{give_batch_credit, send_forwarded, Forwarded, PendingBatch, RuleConn};
+    use mqtt_core::{AppProperties, ClientId};
+    let credit = Arc::new(IngressCredit::new(2 * COST, 2 * COST, OverloadMode::Pause));
+    let other = credit
+        .connection()
+        .try_acquire(u32::try_from(COST).unwrap())
+        .expect("the pool is empty");
+    let conn = credit.connection();
+    let original_permit = conn
+        .try_acquire(u32::try_from(COST).unwrap())
+        .expect("the last cost of the pool");
+    assert_eq!(credit.in_use(), 2 * COST, "the pool is full");
+
+    let set = mqtt_rules::RuleSet::parse(
+        "[rules.copy]\nsql = 'SELECT * FROM \"load/#\"'\nactions = [{ function = \"republish\", args = { topic = \"copy/1\" } }]\n",
+    )
+    .unwrap()
+    .rules;
+    let (_tx, rx) = tokio::sync::watch::channel(Arc::new(set));
+    let rules = crate::rules::Rules::new(rx, Arc::from("n"), None).for_connection();
+    let client = ClientId("copier".into());
+    let payload = Bytes::from(vec![0u8; PAYLOAD]);
+    let app = AppProperties::default();
+    let publisher = crate::rules::Publisher::default();
+    let derived = rules.on_publish(&crate::rules::PublishFacts {
+        client: &client,
+        publisher: &publisher,
+        topic: TOPIC,
+        payload: &payload,
+        qos: QoS::AtLeastOnce,
+        retain: false,
+        dup: false,
+        app: &app,
+        message_expiry: None,
+    });
+    assert_eq!(derived.len(), 1);
+    let rule_conn = RuleConn {
+        publisher,
+        close_reason: std::sync::atomic::AtomicU8::new(0),
+        client_code: std::sync::atomic::AtomicU8::new(0),
+        rules: Some(rules),
+        parked_batch: std::sync::Mutex::new(None),
+    };
+    let (done_tx, done_rx) = oneshot::channel();
+    let original = HubCommand::Publish {
+        topic: TOPIC.into(),
+        payload,
+        qos: QoS::AtLeastOnce,
+        retain: false,
+        message_expiry: None,
+        app,
+        done: Some(done_tx),
+        v5: false,
+        publisher: Some(client),
+        credit: None,
+    };
+    let (hub_tx, mut hub_rx) = mpsc::unbounded_channel();
+    let (rx, holds) = send_forwarded(
+        Forwarded::Batch(Box::new(PendingBatch {
+            original,
+            done: Some(done_rx),
+            derived,
+            credit: Some(original_permit),
+            charged: u32::try_from(COST).unwrap(),
+        })),
+        &hub_tx,
+        Some(&conn),
+        &rule_conn,
+        QoS::AtLeastOnce,
+        None,
+    )
+    .await;
+    assert!(rx.is_some() && holds == 2, "the ack waits on the batch");
+    assert!(
+        hub_rx.try_recv().is_err(),
+        "not sent: its credit is not there"
+    );
+    assert_eq!(
+        credit.in_use(),
+        COST,
+        "waiting, the batch holds none of its own credit — only the other holder's is in use"
+    );
+
+    // The wait is for the whole charge; freeing the other holder's credit lets it end.
+    let (batch, wait) = rule_conn.take_parked().expect("the batch is parked");
+    drop(other);
+    let permit = timeout(Duration::from_secs(5), wait)
+        .await
+        .expect("the whole charge fits under the cap, so the wait ends");
+    let mut batch = batch;
+    give_batch_credit(&mut batch, permit);
+    assert_eq!(credit.in_use(), 2 * COST, "the original and its copy");
+    drop(batch);
+    assert_eq!(credit.in_use(), 0);
+}

@@ -131,15 +131,25 @@ hub's **data lane is FIFO per connection, bounded by ingress credit** (ADR 0082)
    linear-time engine with a bounded automaton. Past a bound the function fails, so the
    rule fails and is counted, and the message is still routed. Unknown functions and
    wrong argument counts fail at load. `getenv` is not provided, because a rule must not
-   read the broker's environment. **What a publish derives is charged to its
-   connection's ingress credit** before the batch is queued, like any publish (ADR 0082
-   §2), clamped to what the per-connection cap leaves beside the original so the wait
-   always ends; under `shed-qos0` a QoS 0 publish's derived messages are dropped and
-   counted instead of waited for. The original's permit and the derived messages' are
-   held until the whole batch has been dispatched. Every connection evaluates against its own
-   cached view of the rule set, refreshed only when a reload swaps it — at its next
-   publish, event or PINGREQ, so an idle connection does not hold a superseded set —
-   and the publish path does not write to shared state to read the rules.
+   read the broker's environment. **What a publish derives is charged to its connection's
+   ingress credit** before the batch is queued, like any publish (ADR 0082 §2), clamped
+   to what the per-connection cap leaves beside the original so the wait always ends. The
+   connection first tries for the derived charge; if it is not there, it drops its
+   original's permit and waits for the original's and the derived charge together in one
+   acquire, so no connection holds credit while it waits for more — ADR 0082's
+   no-credit-cycle invariant. A QoS 0 or 1 batch waits parked, as a publish waiting for
+   credit does (reading paused, deliveries and acks flowing, keepalive not enforced); a
+   QoS 2 batch waits in place, because its PUBREC already waits there for the hub's
+   answer and a parked batch would never be sent, and the keepalive restarts once that
+   wait is over. Under `shed-qos0` a QoS 0 publish's derived messages are dropped and
+   counted instead of waited for. The batch holds its credit until it has been
+   dispatched. The clamp means the pool bounds hub memory only within a factor for
+   rule-heavy traffic: a batch may carry up to 4 MiB plus five times its payload (the
+   original and its derived bytes) while being charged at most one per-connection cap.
+   Every connection evaluates against its own cached view of the rule set, refreshed only
+   when a reload swaps it — at its next publish, event or PINGREQ, so an idle connection
+   does not hold a superseded set — and the publish path does not write to shared state
+   to read the rules.
 
 9. **The EMQX converter carries rules.** `from-emqx.py --out-rules` writes each rule's SQL
    verbatim with its `republish`/`console` actions. Every sink action becomes a

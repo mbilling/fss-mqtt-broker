@@ -1138,7 +1138,12 @@ The rule engine's reference is [RULES.md](RULES.md); this is the operating summa
   `mqttd_hub_lane_depth{lane="data"}` it causes. Derived messages are charged to their
   publisher's ingress credit, so a rule-heavy publisher reaches its credit cap (and
   pauses) sooner — size `MQTTD_CONN_INGRESS_BYTES` for the publish plus what its rules
-  derive.
+  derive. A publish whose derived messages find no credit gives back its own and waits
+  for the whole charge, paused like any publish (it appears in
+  `mqttd_ingress_paused_seconds`), so waiting connections never hold credit between
+  them. The charge is clamped to one connection's cap, so the pool bounds the hub's
+  queue in bytes only within a factor for rule-heavy traffic: a batch can carry up to
+  4 MiB plus five times its payload while being charged at most one cap.
 - **Brownout:** a QoS 1/2 publisher's ack waits for its derived messages but answers
   with the original's own fate. A derived message that needs storage is refused like any
   growth write and counted as a failed action, while its original is still acked; an

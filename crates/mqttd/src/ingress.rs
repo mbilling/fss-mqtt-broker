@@ -162,8 +162,10 @@ impl IngressCredit {
     /// What a publish's derived messages (ADR 0083) cost on top of its own `charged`
     /// bytes: each costs what a publish of its size would, and together they are
     /// clamped to what the per-connection cap leaves beside the original — so the
-    /// batch, like the largest single message, can always eventually proceed. `derived`
-    /// yields each message's topic length and payload-plus-properties length.
+    /// batch's whole charge fits under the cap and, waited for in one acquire with
+    /// nothing else held, can always eventually be had, as the largest single message
+    /// can. `derived` yields each message's topic length and payload-plus-properties
+    /// length.
     #[must_use]
     pub fn derived_cost(&self, charged: u32, derived: impl Iterator<Item = (usize, usize)>) -> u32 {
         let room = self.conn_bytes.saturating_sub(charged as usize);

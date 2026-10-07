@@ -371,27 +371,27 @@ impl ConnRules {
         }
     }
 
-    /// Send a publish and what its rules derived to the hub as one batch. Returns the
-    /// receiver the publisher's acknowledgement waits on, and how many hub
-    /// acknowledgement gates the batch holds — the original's, if gated, plus one per
-    /// gated derived message — which is what the connection's ack pipeline is bounded
-    /// by.
+    /// Build the one hub command carrying a publish and what its rules derived, and
+    /// return it with the receiver the publisher's acknowledgement waits on and how many
+    /// hub acknowledgement gates the batch holds — the original's, if gated, plus one
+    /// per gated derived message — which is what the connection's ack pipeline is
+    /// bounded by. The caller sends the command, now or once its ingress credit is
+    /// there; the receiver resolves only after the hub has handled it.
     ///
     /// `original` is the publish command and `done` its gate's receiver (`None` for
     /// `QoS` 0). Each derived message at `QoS` ≥ 1 behind a gated original gets its own
     /// gate, and its action is counted when the gate answers; the hub counts the
-    /// others as it routes or drops them. `credit`, the original's ingress permit, is
-    /// held until the whole batch has been dispatched.
+    /// others as it routes or drops them. `credit` (the original's ingress permit) and
+    /// `derived_credit` are held until the whole batch has been dispatched.
     #[must_use]
-    pub fn send_batch(
+    pub fn build_batch(
         &self,
-        hub: &mpsc::UnboundedSender<HubCommand>,
         original: HubCommand,
         done: Option<oneshot::Receiver<PublishOutcome>>,
         derived: Vec<Derived>,
         credit: Option<crate::ingress::IngressPermit>,
         derived_credit: Option<crate::ingress::IngressPermit>,
-    ) -> (Option<oneshot::Receiver<PublishOutcome>>, usize) {
+    ) -> (HubCommand, Option<oneshot::Receiver<PublishOutcome>>, usize) {
         let gated = done.is_some();
         let mut commands = Vec::with_capacity(derived.len());
         let mut answers: Vec<DerivedAnswer> = Vec::new();
@@ -408,14 +408,18 @@ impl ConnRules {
             });
         }
         let holds = answers.len() + usize::from(gated);
-        let _ = hub.send(HubCommand::PublishBatch(Box::new(PublishBatch {
+        let batch = HubCommand::PublishBatch(Box::new(PublishBatch {
             original,
             derived: commands,
             credit,
             derived_credit,
-        })));
+        }));
         let metrics = self.engine.metrics.clone();
-        (done.map(|rx| join_outcomes(rx, answers, metrics)), holds)
+        (
+            batch,
+            done.map(|rx| join_outcomes(rx, answers, metrics)),
+            holds,
+        )
     }
 }
 

@@ -12278,7 +12278,7 @@ mod tests {
     /// turns that partial store into a withhold of the DERIVED message's gate (the #238
     /// rule), and the publisher must still hear the ORIGINAL's answer. Withholding the
     /// original instead re-delivered it on every resend for as long as the peer's
-    /// brownout lasted — and for a QoS 2 original as a fresh sighting each time. Found by
+    /// brownout lasted — and for a `QoS` 2 original as a fresh sighting each time. Found by
     /// an adversarial review of PR #871; this was its reproduction, with the assertions
     /// turned around.
     #[tokio::test]

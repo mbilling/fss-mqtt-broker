@@ -397,7 +397,6 @@ fn disconnect_reason_name(code: u8) -> &'static str {
 /// What the rule engine knows about one connection (ADR 0083): who the client is, as
 /// a rule sees it, and why the connection ended, recorded by `serve` at each exit.
 /// Shared by reference across `serve`'s awaits, hence the atomic.
-#[derive(Debug)]
 struct RuleConn {
     publisher: crate::rules::Publisher,
     close_reason: std::sync::atomic::AtomicU8,
@@ -406,9 +405,46 @@ struct RuleConn {
     client_code: std::sync::atomic::AtomicU8,
     /// This connection's view of the rules; `None` when rules are not wired (tests).
     rules: Option<crate::rules::ConnRules>,
+    /// A publish batch waiting for its ingress credit, for `serve` to park (see
+    /// `send_forwarded`).
+    parked_batch: std::sync::Mutex<Option<ParkedBatch>>,
+}
+
+/// A batch and the wait for the credit it needs.
+type ParkedBatch = (
+    HubCommand,
+    futures_util::future::BoxFuture<'static, crate::ingress::IngressPermit>,
+);
+
+impl std::fmt::Debug for RuleConn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RuleConn")
+            .field("publisher", &self.publisher)
+            .field("close_reason", &self.close_reason())
+            .finish_non_exhaustive()
+    }
 }
 
 impl RuleConn {
+    /// Leave a batch for `serve` to send once its credit has been acquired.
+    fn park(
+        &self,
+        batch: HubCommand,
+        wait: futures_util::future::BoxFuture<'static, crate::ingress::IngressPermit>,
+    ) {
+        *self
+            .parked_batch
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((batch, wait));
+    }
+
+    fn take_parked(&self) -> Option<ParkedBatch> {
+        self.parked_batch
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
+
     fn closing(&self, reason: CloseReason) {
         self.close_reason.store(reason as u8, Ordering::Relaxed);
     }
@@ -892,6 +928,7 @@ where
         },
         close_reason: std::sync::atomic::AtomicU8::new(CloseReason::TcpClosed as u8),
         client_code: std::sync::atomic::AtomicU8::new(0),
+        parked_batch: std::sync::Mutex::new(None),
         rules: policy
             .rules
             .as_ref()
@@ -2189,7 +2226,7 @@ where
                                 if let Some(m) = &policy.metrics {
                                     m.ingress_paused();
                                 }
-                                parked = Some(Parked { packet, wait, since: Instant::now() });
+                                parked = Some(Parked { resume: Resume::Packet(packet), wait, since: Instant::now() });
                                 continue;
                             }
                         };
@@ -2204,22 +2241,40 @@ where
                             PacketOutcome::Continue => {}
                             end => return Ok(rule_conn.ended(end)),
                         }
+                        // A QoS 2 publish is answered in place, and with rules it may
+                        // wait there for ingress credit (ADR 0083 decision 8): the
+                        // broker was not reading meanwhile, so that wait is not the
+                        // client's silence. The keepalive restarts once it is over.
+                        deadline = grace.map(|g| Instant::now() + g);
+                        parked = Parked::batch(rule_conn, policy);
                     }
                 }
             }
             permit = async {
                 parked.as_mut().expect("branch guarded on is_some").wait.as_mut().await
             }, if parked.is_some() => {
-                let Parked { packet, since, .. } = parked.take().expect("guarded");
+                let Parked { resume, since, .. } = parked.take().expect("guarded");
                 if let Some(m) = &policy.metrics {
                     m.observe_ingress_paused(since.elapsed().as_secs_f64());
                 }
                 // The broker paused this client, not the client going quiet: the
                 // keepalive restarts from the moment reading resumes.
                 deadline = grace.map(|g| Instant::now() + g);
-                match handle_inbound(packet, writer, hub, client, &principal, policy, &mut qos2_inbound, &mut qos2_inflight, &mut pending_pubacks, &mut current, is_v5, inbound_aliases, session_expiry, session_expiry_override, IngressAdmit::Credit(Some(permit)), credit.as_ref(), rule_conn).await? {
-                    PacketOutcome::Continue => {}
-                    end => return Ok(rule_conn.ended(end)),
+                match resume {
+                    Resume::Packet(packet) => {
+                        match handle_inbound(packet, writer, hub, client, &principal, policy, &mut qos2_inbound, &mut qos2_inflight, &mut pending_pubacks, &mut current, is_v5, inbound_aliases, session_expiry, session_expiry_override, IngressAdmit::Credit(Some(permit)), credit.as_ref(), rule_conn).await? {
+                            PacketOutcome::Continue => {}
+                            end => return Ok(rule_conn.ended(end)),
+                        }
+                        // As after a read: a resumed QoS 2 publish may have waited in
+                        // place for its derived messages' credit.
+                        deadline = grace.map(|g| Instant::now() + g);
+                        parked = Parked::batch(rule_conn, policy);
+                    }
+                    Resume::Batch(mut batch) => {
+                        give_batch_credit(&mut batch, permit);
+                        let _ = hub.send(batch);
+                    }
                 }
             }
             outcome = async {
@@ -2356,9 +2411,32 @@ where
 
 /// A client publish waiting for ingress credit, with the socket unread (ADR 0082 T3).
 struct Parked {
-    packet: Packet,
+    resume: Resume,
     wait: futures_util::future::BoxFuture<'static, crate::ingress::IngressPermit>,
     since: Instant,
+}
+
+/// What a connection paused for ingress credit resumes with.
+enum Resume {
+    /// A PUBLISH it has not handled yet.
+    Packet(Packet),
+    /// A publish batch it has handled and built, to send (ADR 0083).
+    Batch(HubCommand),
+}
+
+impl Parked {
+    /// Park the batch `send_forwarded` left, if it left one.
+    fn batch(rule_conn: &RuleConn, policy: &ConnPolicy) -> Option<Self> {
+        let (batch, wait) = rule_conn.take_parked()?;
+        if let Some(m) = &policy.metrics {
+            m.ingress_paused();
+        }
+        Some(Self {
+            resume: Resume::Batch(batch),
+            wait,
+            since: Instant::now(),
+        })
+    }
 }
 
 /// Admit a client publish against the connection's ingress credit (ADR 0082 T3): the
@@ -2433,15 +2511,30 @@ struct PendingBatch {
 /// connection's ingress credit first (ADR 0082 T3): they are queued for the hub like
 /// any publish, so they are paid for like one, and a rule that multiplies a publish
 /// cannot multiply what one connection may hold in the hub's queue. The charge is
-/// clamped to what the connection's cap leaves beside the original, so the wait always
-/// ends; a `QoS` 0 publish under `shed-qos0` waits for nothing, and its derived messages
-/// are dropped (and counted) when the credit is not there.
+/// clamped to what the connection's cap leaves beside the original.
+///
+/// When the credit is not there, the batch waits for the original's charge and its
+/// derived messages' together, holding NONE meanwhile — the original's own permit is
+/// released first — so no connection holds credit while it waits for more (ADR 0082:
+/// there is no credit cycle), and the wait always ends (the sum fits under the cap).
+/// For `QoS` 0 and 1 the batch is parked ([`RuleConn::park`]) and `serve` sends it when
+/// the credit comes, with its select loop — acks, deliveries, shutdown — still
+/// running; a `QoS` 1 acknowledgement keeps its place, because its receiver is queued
+/// now. A `QoS` 2 publish is handled inline, its PUBREC waiting for the hub's answer,
+/// so it waits for its credit inline too. Under `shed-qos0` a `QoS` 0 publish waits for
+/// nothing: its derived messages are dropped, and counted, instead.
+///
+/// A parked batch is sent only by `serve`'s loop. If the connection closes first — the
+/// rest of the packet's handling ends it, or shutdown or a hangup comes while it waits —
+/// the batch is dropped unsent, with its wait: nothing was acknowledged for it and it
+/// holds no credit, so the publisher's resend is the only copy.
 async fn send_forwarded(
     forwarded: Forwarded,
     hub: &mpsc::UnboundedSender<HubCommand>,
     conn_credit: Option<&crate::ingress::ConnCredit>,
     rule_conn: &RuleConn,
     qos: QoS,
+    metrics: Option<&mqtt_observability::metrics::Metrics>,
 ) -> (Option<oneshot::Receiver<crate::hub::PublishOutcome>>, usize) {
     let batch = match forwarded {
         Forwarded::Sent(rx, holds) => return (rx, holds),
@@ -2451,32 +2544,62 @@ async fn send_forwarded(
         original,
         done,
         mut derived,
-        credit,
+        mut credit,
         charged,
     } = batch;
     let Some(rules) = &rule_conn.rules else {
         unreachable!("only a connection with rules derives messages");
     };
     let mut derived_credit = None;
+    let mut wait = None;
     if let Some(c) = conn_credit {
         let cost = c.node().derived_cost(
             charged,
             derived.iter().map(crate::rules::Derived::accounted),
         );
         if cost > 0 {
-            derived_credit = match c.try_acquire(cost) {
-                Some(permit) => Some(permit),
+            match c.try_acquire(cost) {
+                Some(permit) => derived_credit = Some(permit),
                 None if qos == QoS::AtMostOnce
                     && c.node().mode() == crate::ingress::OverloadMode::ShedQos0 =>
                 {
                     rules.shed(std::mem::take(&mut derived));
-                    None
                 }
-                None => Some(c.clone().acquire(cost).await),
-            };
+                None => {
+                    credit = None;
+                    wait = Some((c, charged.saturating_add(cost)));
+                }
+            }
         }
     }
-    rules.send_batch(hub, original, done, derived, credit, derived_credit)
+    let (mut batch, rx, holds) = rules.build_batch(original, done, derived, credit, derived_credit);
+    match wait {
+        None => {
+            let _ = hub.send(batch);
+        }
+        Some((c, total)) if qos == QoS::ExactlyOnce => {
+            // Paused like any publish waiting for credit, so it is counted like one.
+            if let Some(m) = metrics {
+                m.ingress_paused();
+            }
+            let since = Instant::now();
+            let permit = c.clone().acquire(total).await;
+            if let Some(m) = metrics {
+                m.observe_ingress_paused(since.elapsed().as_secs_f64());
+            }
+            give_batch_credit(&mut batch, permit);
+            let _ = hub.send(batch);
+        }
+        Some((c, total)) => rule_conn.park(batch, Box::pin(c.clone().acquire(total))),
+    }
+    (rx, holds)
+}
+
+/// Hand a parked batch the credit it waited for.
+fn give_batch_credit(batch: &mut HubCommand, permit: crate::ingress::IngressPermit) {
+    if let HubCommand::PublishBatch(b) = batch {
+        b.credit = Some(permit);
+    }
 }
 
 /// Handle one inbound PUBLISH: topic validation, ACL gate, inbound `QoS`
@@ -2685,7 +2808,15 @@ async fn handle_publish<W: AsyncWrite + Unpin>(
     match (qos, pkid) {
         (QoS::AtMostOnce, _) => {
             // Nothing to acknowledge, nothing to gate.
-            let _ = send_forwarded(forward(hub), hub, conn_credit, rule_conn, qos).await;
+            let _ = send_forwarded(
+                forward(hub),
+                hub,
+                conn_credit,
+                rule_conn,
+                qos,
+                policy.metrics.as_deref(),
+            )
+            .await;
         }
         (QoS::AtLeastOnce, Some(id)) => {
             // Receive Maximum counts QoS 1 and QoS 2 publications TOGETHER
@@ -2708,8 +2839,15 @@ async fn handle_publish<W: AsyncWrite + Unpin>(
             // with it into `apply_publish_outcome`, verbatim. An ACL denial
             // (`forward` = `None`, issue #246) rides the same queue with its
             // verdict pre-decided, so acks can never overtake each other.
-            let (done, holds) =
-                send_forwarded(forward(hub), hub, conn_credit, rule_conn, qos).await;
+            let (done, holds) = send_forwarded(
+                forward(hub),
+                hub,
+                conn_credit,
+                rule_conn,
+                qos,
+                policy.metrics.as_deref(),
+            )
+            .await;
             if done.is_none() && is_v5 {
                 ack.reason = mqtt_codec::reason::NOT_AUTHORIZED;
             }
@@ -2803,9 +2941,16 @@ async fn handle_publish<W: AsyncWrite + Unpin>(
                     return Ok(PacketOutcome::BrokerClose);
                 }
                 let mut rec = mqtt_codec::packet::Ack::from(id);
-                if let Some(done) = send_forwarded(forward(hub), hub, conn_credit, rule_conn, qos)
-                    .await
-                    .0
+                if let Some(done) = send_forwarded(
+                    forward(hub),
+                    hub,
+                    conn_credit,
+                    rule_conn,
+                    qos,
+                    policy.metrics.as_deref(),
+                )
+                .await
+                .0
                 {
                     // As for QoS 1: PUBREC promises the broker owns the message, so
                     // it is released only after the durable fan-out completes.

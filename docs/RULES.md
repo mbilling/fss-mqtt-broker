@@ -72,20 +72,25 @@ an additional message.
   bounded by the per-message limits below, so it holds the hub loop for at most the
   routing of 1,025 messages.
 - **Derived messages are charged to the publisher's ingress credit** (ADR 0082), like
-  the publish itself: a connection waits for credit for what its rules derived before
-  the batch is queued, so a rule that multiplies a publish cannot multiply what one
-  connection may hold in the hub's queue. The charge is clamped to what the
-  per-connection cap leaves beside the original, so a batch larger than the cap still
-  proceeds, as the largest single message does. Under `MQTTD_INGRESS_OVERLOAD=shed-qos0`
-  a QoS 0 publish never waits: if the credit for its derived messages is not there,
-  they are dropped and counted as failed actions.
+  the publish itself, before the batch is queued, so a rule that multiplies a publish
+  cannot multiply what one connection may hold in the hub's queue. If the credit is
+  not there, the connection gives back its original's credit and waits for the whole
+  charge at once, holding none of it, so no connection holds credit while it waits for
+  more. It waits the way any publish waiting for credit does: it stops reading its
+  socket but keeps delivering to its client, and its keepalive is not enforced. (A QoS
+  2 publish, whose PUBREC already waits in place for the hub's answer, waits for this
+  credit in place too; its keepalive restarts when the wait ends.) The charge is
+  clamped to the per-connection cap, so a batch larger than the cap still proceeds, as
+  the largest single message does. Under `MQTTD_INGRESS_OVERLOAD=shed-qos0` a QoS 0
+  publish never waits: if the credit for its derived messages is not there, they are
+  dropped and counted as failed actions.
 
 ## Delivery guarantees: QoS 0, 1 and 2
 
 | Inbound publish | What its rules' messages get |
 |---|---|
 | `QoS` 0 | Published at the `qos` each action sets. Nothing waits for them, because a QoS 0 publish has no acknowledgement. |
-| `QoS` 1 | Every derived message at QoS ≥ 1 gets its own acknowledgement gate, and the **PUBACK waits for all of them**: when it is released, each derived message is stored wherever it was owed (durably where durability applies) or was refused and counted. |
+| `QoS` 1 | Every derived message at QoS ≥ 1 gets its own acknowledgement gate, and the **PUBACK waits for all of them**: when it is released, each derived message is stored wherever it was owed (durably where durability applies) or has failed and been counted. |
 | `QoS` 2 | As for QoS 1, for the PUBREC. The broker's inbound exactly-once window covers the rules too: a DUP resend of an acknowledged packet id is answered without being forwarded again, so **its rules fire once**. |
 
 **The publisher is told exactly what it would be told without rules — the original's
