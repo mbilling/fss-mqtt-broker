@@ -880,27 +880,7 @@ impl Hub {
                     publish = id, group = %key.0,
                     "shared re-selection exhausted; answering the publisher"
                 );
-                // Gated by the hub itself during the drain (ADR 0083), with nobody to
-                // retry it: every member refused it before any side effect, so the
-                // first one tried still gets it as a plain delivery — what the group
-                // would have received had the drain not gated it.
-                if matches!(last, DurableOutcome::Refused(_)) && self.drain_gated.contains(&id) {
-                    self.deliver_shared_plain(
-                        &key,
-                        &tried,
-                        &topic,
-                        &payload,
-                        qos,
-                        message_expiry,
-                        &app,
-                    );
-                    self.try_complete_pending(id);
-                    return;
-                }
-                match last {
-                    DurableOutcome::Refused(r) => self.refuse_pending(id, r),
-                    _ => self.drop_pending(id),
-                }
+                self.shared_exhausted(id, &key, &tried, last);
                 return;
             };
             let delivered_qos = min_qos(qos, chosen.qos);
@@ -960,23 +940,51 @@ impl Hub {
         }
     }
 
-    /// Deliver to the first of `tried` still in group `key`, unanswered: a peer member
-    /// gets a plain `SharedDeliver`, a local one an ungated delivery (live, a refused
-    /// durable copy a counted drop). Not counted in `publish_forwarded` again: the
-    /// message was counted when it was first delivered to the group.
-    #[allow(clippy::too_many_arguments)]
-    fn deliver_shared_plain(
+    /// Every member of group `key` was tried for pending publish `id`; `last` is the
+    /// final answer. A publish the hub gated itself during the drain (ADR 0083) has
+    /// nobody to retry it: if every member refused it, before any side effect, the
+    /// first one tried still in the group gets it unanswered — what the group would
+    /// have received had the drain not gated it. Anything else answers the publisher.
+    fn shared_exhausted(
         &mut self,
+        id: u64,
         key: &SharedKey,
         tried: &[(Option<NodeId>, ClientId)],
-        topic: &str,
-        payload: &Bytes,
-        qos: QoS,
-        message_expiry: Option<u32>,
-        app: &AppProperties,
+        last: DurableOutcome,
     ) {
+        if matches!(last, DurableOutcome::Refused(_)) && self.drain_gated.contains(&id) {
+            self.deliver_shared_plain(id, key, tried);
+            self.try_complete_pending(id);
+            return;
+        }
+        match last {
+            DurableOutcome::Refused(r) => self.refuse_pending(id, r),
+            _ => self.drop_pending(id),
+        }
+    }
+
+    /// Deliver pending publish `id` to the first of `tried` still in group `key`,
+    /// unanswered: a peer member gets a plain `SharedDeliver`, a local one an ungated
+    /// delivery (live, a refused durable copy a counted drop). Not counted in
+    /// `publish_forwarded` again: it was counted when first delivered to the group.
+    fn deliver_shared_plain(
+        &mut self,
+        id: u64,
+        key: &SharedKey,
+        tried: &[(Option<NodeId>, ClientId)],
+    ) {
+        let Some(p) = self.pending_publishes.get(id) else {
+            return;
+        };
+        let (topic, payload, qos, message_expiry, app) = (
+            p.topic.clone(),
+            p.payload.clone(),
+            p.qos,
+            p.message_expiry,
+            p.app().clone(),
+        );
         let members = self
-            .shared_candidates(topic)
+            .shared_candidates(&topic)
             .into_iter()
             .find(|(k, _)| k == key)
             .map(|(_, cs)| cs)
@@ -994,22 +1002,22 @@ impl Hub {
                 if let Some(peer) = self.peers.get(node) {
                     let _ = peer.tx.send(PeerMessage::SharedDeliver {
                         client: member.client.0.to_string(),
-                        topic: topic.to_string(),
+                        topic,
                         payload: payload.to_vec(),
                         qos: delivered_qos as u8,
                         message_expiry,
-                        app: app_to_wire(app),
+                        app: app_to_wire(&app),
                     });
                 }
             }
             None => {
                 let _ = self.deliver_to_client(
                     &member.client,
-                    topic,
-                    payload,
+                    &topic,
+                    &payload,
                     delivered_qos,
                     message_expiry,
-                    app,
+                    &app,
                     false,
                     &AppendGate::None,
                 );
