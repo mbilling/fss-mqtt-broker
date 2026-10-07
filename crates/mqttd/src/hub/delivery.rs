@@ -942,9 +942,11 @@ impl Hub {
 
     /// Every member of group `key` was tried for pending publish `id`; `last` is the
     /// final answer. A publish the hub gated itself during the drain (ADR 0083) has
-    /// nobody to retry it: if every member refused it, before any side effect, the
-    /// first one tried still in the group gets it unanswered — what the group would
-    /// have received had the drain not gated it. Anything else answers the publisher.
+    /// nobody to retry it, however the pass ended — members refusing it (their nodes in
+    /// a brownout, before any side effect) or their nodes dying: the first one tried
+    /// still in the group gets it unanswered, as the group would have had the drain not
+    /// gated it. A dead member has left the group already; a copy after a failure is a
+    /// duplicate, which `QoS` 1 allows. Anything else answers the publisher.
     fn shared_exhausted(
         &mut self,
         id: u64,
@@ -952,7 +954,7 @@ impl Hub {
         tried: &[(Option<NodeId>, ClientId)],
         last: DurableOutcome,
     ) {
-        if matches!(last, DurableOutcome::Refused(_)) && self.drain_gated.contains(&id) {
+        if self.drain_gated.contains(&id) {
             self.deliver_shared_plain(id, key, tried);
             self.try_complete_pending(id);
             return;

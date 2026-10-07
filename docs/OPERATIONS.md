@@ -1196,8 +1196,8 @@ operating summary. The engine is unreleased: no release has it yet.
   are routed, and stored where they are owed (a persistent session's queue), before the
   broker exits; what they owe another node is forwarded acked and answered (a node that
   is itself in a brownout refuses such a forward, and is sent it again unacked, which it
-  delivers live; a shared group whose every member refuses gets it unacked at the first
-  member tried). The drain ends with a hub barrier that waits for every durable append
+  delivers live; a shared group that runs out of members to try gets it unacked at the
+  first member tried that is still in the group). The drain ends with a hub barrier that waits for every durable append
   in flight and every publish still awaiting an answer, within `shutdown_grace_secs`; a
   second signal cuts it short. It does not wait for:
   - forwards from a node draining in a brownout, which leaves them ungated (a brownout

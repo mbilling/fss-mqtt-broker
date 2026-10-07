@@ -103,8 +103,8 @@ hub's **data lane is FIFO per connection, bounded by ingress credit** (ADR 0082)
    flight and no publish awaits an answer; while the broker drains, the hub gates what
    rules derive from events itself, so a forward to another node is acked and waited
    for (a peer in a brownout that refuses one is sent it again unacked, which it delivers
-   live, and a shared group whose every member refuses gets it unacked at the first
-   member tried: nobody would retry it). What the drain's own disconnects derive is stored, here
+   live, and a shared group that runs out of members to try gets it unacked at the first
+   member tried that is still in it: nobody would retry it). What the drain's own disconnects derive is stored, here
    and on the nodes it was forwarded to, before exit — except on a node draining in a
    brownout, which does not gate them (a brownout refuses a gated publish owing a durable
    copy outright, live copies and all), past the pending-publish table's bound (the

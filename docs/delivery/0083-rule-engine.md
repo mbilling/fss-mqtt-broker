@@ -78,6 +78,11 @@ tasks:
     status: done
     date: 2026-10-07
     evidence: "The reviewer's re-review of a3d5769: the plain re-send covered ordinary forwards only. A drain-gated message bound for a $share group whose every member refused it (their nodes in a brownout) ended in refuse_pending, so the group got nothing where an ungated delivery would have reached the chosen member live. Now an exhausted re-selection for a drain-gated publish delivers it unanswered to the first member tried that is still in the group: a plain SharedDeliver to a peer member, an ungated delivery to a local one. And the drain's eviction count counted every unanswered entry evicted while draining, client publishes included (withheld, so their publishers retry); it now counts only the publishes the hub gated during the drain, which nobody retries, so the number means what the WARN says. Tests: hub::tests::a_shared_group_refusing_every_drain_gated_delivery_still_gets_it_plainly (mutation-checked: without the fallback it fails); hub::forwarding::zone_fwd_proofs::the_drain_barrier_reports_the_drain_gated_publishes_the_bound_evicted (an answered entry and a client's are not counted; mutation-checked: counting every eviction while draining fails it). Also: the plain re-sends are not counted in mqttd_publish_forwarded_total a second time, and OPERATIONS says the brownout-drop alert firing during a rolling restart is also a sign the restarting node did not wait for its cross-node shutdown messages. The exhausted re-selection moved into its own helpers (shared_exhausted, deliver_shared_plain), which keeps reselect_shared within clippy's line limit. cargo test -p mqtt-rules -p mqtt-config -p mqtt-observability -p mqttd: 64 binaries, 1126 passed, 0 failed (14 ignored, pre-existing); fmt and clippy -D warnings clean."
+  - id: 0083-T16
+    title: "Review round 8 (PR #871): a shared group's fallback holds however the re-selection ends, and its local branch is tested"
+    status: done
+    date: 2026-10-07
+    evidence: "The reviewer's re-review of 5e44777: shared_exhausted took the fallback only when the last answer was a refusal. One member refusing (brownout) and the next member's node dying (peer_dead re-selects with Failed) ended in drop_pending, and the group got nothing though the refusing member was alive. Now any exhausted pass for a drain-gated publish delivers it unanswered to the first member tried that is still in the group (a dead member has already left it; a copy after a failure is a duplicate, which QoS 1 allows), and the doc comment says so. Tests: hub::tests::a_shared_group_whose_last_candidate_died_still_gets_a_drain_gated_message (mutation-checked: falling back only after a refusal fails it); hub::tests::a_local_member_refused_by_a_brownout_after_the_drain_gated_it_still_gets_it_live, the fallback's local branch: the peer member refuses and leaves the group, the local member is back online and refused by a brownout that began after the drain gated the message, and still gets it live (mutation-checked: without the local branch it fails). drain_gated's doc says a drain that could be cancelled would have to clear it. TOTALS"
 ---
 
 # Delivery 0083 — the rule engine
@@ -106,6 +111,7 @@ above; the table below is generated from it.
 | **0083-T13** Review round 5 | What a draining node's disconnects derive for another node is answered by it before the node exits. |
 | **0083-T14** Review round 6 | A drain never sends what it derives to fewer subscribers than an ungated publish would, and says what it did not wait for. |
 | **0083-T15** Review round 7 | A shared group gets a drain-time message even when every member refuses its acked form, and the drain's loss count counts only what nobody retries. |
+| **0083-T16** Review round 8 | A shared group gets a drain-time message however its re-selection ends. |
 
 ## Progress
 
@@ -157,3 +163,5 @@ above; the table below is generated from it.
 - **2026-10-07** — Review round 7 (0083-T15): a shared group whose every member refuses a
   drain-time message gets it unacked at the first member tried, and the drain's eviction
   count counts only the messages it gated itself.
+- **2026-10-07** — Review round 8 (0083-T16): the shared fallback holds however the
+  re-selection ends, a refusal or a member's node dying, and its local branch is tested.

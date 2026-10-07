@@ -628,8 +628,9 @@ persistent session's offline queue, durably where durability applies), before th
 exits. While it drains, what they derive for a subscriber or session on another node is
 forwarded acked, and the drain waits for that node's answer too. A node that is itself
 in a brownout refuses such a forward when it owes a durable copy there; the draining
-node then sends it again unacked, and that node delivers it live. A shared group whose
-every member refuses it this way gets it unacked at the first member tried. That wait is part of
+node then sends it again unacked, and that node delivers it live. A shared group that
+runs out of members to try (each refusing it, or its node dying) gets it unacked at the
+first member tried that is still in the group. That wait is part of
 the drain, bounded by `shutdown_grace_secs`; a second signal ends it. The drain does not
 wait for:
 

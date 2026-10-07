@@ -2413,7 +2413,8 @@ pub struct Hub {
     /// The pending ids of the publishes the hub gated itself during the drain. A peer
     /// that refuses one of their acked forwards (its own brownout) is sent it again as a
     /// plain forward, so it still delivers it live: nobody would retry it. Only grows
-    /// while draining, which ends with the process.
+    /// while draining, which ends with the process (a drain that could be cancelled
+    /// would have to clear it with `draining`).
     drain_gated: HashSet<u64>,
     /// Unanswered publishes the pending-publish bound evicted during the drain, which the
     /// barrier therefore did not wait for; reported with its answer.
@@ -18867,6 +18868,106 @@ mod tests {
             timeout(Duration::from_secs(2), drained(&tx))
                 .await
                 .expect("the refusal settled the delivery")
+                .unwrap(),
+            0
+        );
+    }
+
+    /// The local branch of the fallback above: the group's peer member refuses and
+    /// leaves the group, and its local member, back online, is refused too because this
+    /// node went into a brownout after the drain gated the message. The local member
+    /// still gets it live, ungated, its durable copy a counted drop.
+    #[tokio::test]
+    async fn a_local_member_refused_by_a_brownout_after_the_drain_gated_it_still_gets_it_live() {
+        let tx = start_hub();
+        let mut peer = connect_peer_at_proto(&tx, "n2", 1, 7);
+        remote_shared_interest_qos(&tx, "n2", "g", "presence/#", &[("m1", QoS::AtLeastOnce)]);
+        let (_offline, _) = attach(&tx, "local", 2, false).await;
+        subscribe_qos(&tx, "local", "$share/g/presence/#", QoS::AtLeastOnce);
+        detach(&tx, "local", 2);
+        tx.send(HubCommand::Draining).unwrap();
+        // The online peer member is chosen over the offline local one.
+        tx.send(presence_message("presence/d")).unwrap();
+        let seq = match next_forward_answer(&mut peer).await {
+            PeerMessage::SharedDeliverAcked { seq, client, .. } => {
+                assert_eq!(client, "m1");
+                seq
+            }
+            other => panic!("expected an acked shared delivery, got {other:?}"),
+        };
+        remote_shared_interest_qos(&tx, "n2", "g", "presence/#", &[]);
+        let (mut local, _) = attach(&tx, "local", 3, false).await;
+        tx.send(HubCommand::SetBrownout {
+            axis: BrownoutAxis::Disk,
+            on: true,
+        })
+        .unwrap();
+        tx.send(ordered(HubCommand::RemotePublishVerdict {
+            node: NodeId("n2".into()),
+            seq,
+            verdict: ForwardVerdict::Refused {
+                code: PublishRefusal::Brownout.wire_code(),
+            },
+        }))
+        .unwrap();
+        let delivered = timeout(Duration::from_secs(2), local.recv())
+            .await
+            .expect("the local member gets it live")
+            .expect("its session is open");
+        assert_eq!(payload_of(&delivered), b"shutdown");
+        assert_eq!(
+            timeout(Duration::from_secs(2), drained(&tx))
+                .await
+                .expect("nothing awaits an answer")
+                .unwrap(),
+            0
+        );
+    }
+
+    /// The fallback does not depend on how the last attempt ended: one member refuses
+    /// (its node in a brownout), the next member's node dies (a re-selection with
+    /// `Failed`), and the refusing member, alive and still in the group, gets the
+    /// message plainly.
+    #[tokio::test]
+    async fn a_shared_group_whose_last_candidate_died_still_gets_a_drain_gated_message() {
+        let tx = start_hub();
+        let mut n2 = connect_peer_at_proto(&tx, "n2", 1, 7);
+        let mut n3 = connect_peer_at_proto(&tx, "n3", 2, 7);
+        remote_shared_interest_qos(&tx, "n2", "g", "presence/#", &[("m2", QoS::AtLeastOnce)]);
+        remote_shared_interest_qos(&tx, "n3", "g", "presence/#", &[("m3", QoS::AtLeastOnce)]);
+        tx.send(HubCommand::Draining).unwrap();
+        tx.send(presence_message("presence/e")).unwrap();
+        // Whichever member is chosen first refuses; the other is chosen next and dies.
+        let acked = |msg: PeerMessage| match msg {
+            PeerMessage::SharedDeliverAcked { seq, .. } => seq,
+            other => panic!("expected an acked shared delivery, got {other:?}"),
+        };
+        let (refusing, refuser, survivor_link, mut dying_link, dying) = tokio::select! {
+            m = next_forward_answer(&mut n2) => (acked(m), "n2", n2, n3, "n3"),
+            m = next_forward_answer(&mut n3) => (acked(m), "n3", n3, n2, "n2"),
+        };
+        let mut survivor_link = survivor_link;
+        tx.send(ordered(HubCommand::RemotePublishVerdict {
+            node: NodeId(refuser.into()),
+            seq: refusing,
+            verdict: ForwardVerdict::Refused {
+                code: PublishRefusal::Brownout.wire_code(),
+            },
+        }))
+        .unwrap();
+        let _ = acked(next_forward_answer(&mut dying_link).await);
+        tx.send(HubCommand::PeerDead {
+            node: NodeId(dying.into()),
+        })
+        .unwrap();
+        match next_forward_answer(&mut survivor_link).await {
+            PeerMessage::SharedDeliver { topic, .. } => assert_eq!(topic, "presence/e"),
+            other => panic!("expected a plain shared delivery, got {other:?}"),
+        }
+        assert_eq!(
+            timeout(Duration::from_secs(2), drained(&tx))
+                .await
+                .expect("nothing awaits an answer")
                 .unwrap(),
             0
         );
