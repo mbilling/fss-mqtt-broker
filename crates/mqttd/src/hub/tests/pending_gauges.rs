@@ -168,3 +168,48 @@ async fn the_pending_publish_gauges_report_the_ledger_depth() {
         "{out}"
     );
 }
+
+/// ADR 0083 (review of PR #871): a message a rule derives from an event or a Will
+/// holds NO pending-publish entry, so a burst of them — a load-balancer restart's
+/// worth of disconnect events — cannot fill the ledger and evict a client
+/// publish's entry, withholding its ack. It is counted by the hub as it routes it.
+/// The rig's silent peer would park a gated publish on these topics, which the
+/// control asserts, so the zero is the absence of an entry, not a quick retirement.
+#[tokio::test(start_paused = true)]
+async fn messages_derived_from_events_hold_no_pending_entry() {
+    let rig = Rig::new().await;
+    for i in 0..50 {
+        rig.tx
+            .send(HubCommand::RuleDerived(Box::new(
+                crate::hub::DerivedPublish {
+                    rule: Arc::from("presence"),
+                    publish: HubCommand::Publish {
+                        topic: format!("cap/presence/{i}"),
+                        payload: Bytes::from_static(b"offline"),
+                        qos: QoS::AtLeastOnce,
+                        retain: false,
+                        message_expiry: None,
+                        app: AppProperties::default(),
+                        done: None,
+                        v5: false,
+                        publisher: None,
+                        credit: None,
+                    },
+                    gated: false,
+                },
+            )))
+            .unwrap();
+    }
+    // The control: one gated publish on the same kind of topic does park.
+    let mut held = rig.publish_gated("cap/client/1", "reading", false);
+    ping(&rig.tx).await;
+    assert_eq!(ack(&mut held), Ack::Pending);
+    tokio::time::sleep(SESSION_SWEEP_INTERVAL * 2).await;
+
+    let out = rig.render();
+    assert!(out.contains("mqttd_pending_publishes 1"), "{out}");
+    assert!(
+        out.contains(r#"mqttd_rule_actions_total{rule="presence",result="ok"} 50"#),
+        "{out}"
+    );
+}

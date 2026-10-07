@@ -1097,7 +1097,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 551 test(s)
+## `crates/mqttd/src/lib.rs` — 553 test(s)
 
 - `admin::cli::tests::all_nodes_asks_for_the_cluster_scope_on_the_verbs_that_have_one`
 - `admin::cli::tests::answers_render_as_tables_and_lines`
@@ -1482,6 +1482,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::overlapping_connects_are_last_writer_wins`
 - `hub::tests::overload_then_idle_recovers_to_baseline_without_a_restart`
 - `hub::tests::peer_dead_drops_routing_and_stale_peer_disconnect_is_ignored`
+- `hub::tests::pending_gauges::messages_derived_from_events_hold_no_pending_entry`
 - `hub::tests::pending_gauges::the_pending_publish_gauges_report_the_ledger_depth`
 - `hub::tests::periodic_anti_entropy_says_nothing_when_there_is_nothing_retained`
 - `hub::tests::permanently_unavailable_store_rejects_rather_than_downgrades`
@@ -1574,6 +1575,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::the_apply_path_stays_silent_once_the_window_has_closed`
 - `hub::tests::the_backlog_byte_bound_sheds_acked_entries_and_counts_them`
 - `hub::tests::the_config_packet_limit_matches_the_peer_frame_limit`
+- `hub::tests::the_drain_barrier_waits_for_in_flight_appends`
 - `hub::tests::the_durability_property_is_inert_without_the_operator_opt_in`
 - `hub::tests::the_fanout_and_snapshot_carry_the_deadline`
 - `hub::tests::the_grant_sweep_removes_revoked_subscriptions_without_disconnecting`
@@ -2084,7 +2086,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `a_rule_republishing_into_its_own_from_cannot_loop`
 - `a_rule_that_does_not_select_qos_republishes_a_qos1_publish_at_qos0`
 - `a_will_runs_rules_when_the_hub_publishes_it`
-- `an_event_derived_message_is_counted_by_its_fate`
+- `an_event_derived_message_is_counted_when_routed_and_a_refused_copy_as_a_drop`
 - `an_idle_connection_releases_a_superseded_rule_set_when_it_pings`
 - `client_events_run_rules`
 - `foreach_fans_one_publish_out`

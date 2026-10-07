@@ -1252,6 +1252,11 @@ pub enum HubCommand {
     /// accepted it. A refused publish therefore leaves nothing behind for its resend to
     /// duplicate, and the batch keeps its place in the connection's FIFO data lane.
     PublishBatch(Box<PublishBatch>),
+    /// A message a rule derived from a client/session event or a Will (ADR 0083):
+    /// routed like any publish, but ungated — nobody waits for its answer, so it holds
+    /// no pending-publish entry and can never crowd a client's out — and its action is
+    /// counted by the result: `ok` when the hub routed it, `failed` when it refused it.
+    RuleDerived(Box<DerivedPublish>),
     /// Write one **restored** retained value as retained state (ADR 0062, issue #249):
     /// commit it through the topic's group lease-owner and warm the caches, with **no
     /// ordinary fan-out to subscribers**.
@@ -1686,6 +1691,15 @@ pub enum HubCommand {
         /// Replied to with `()` when the loop reaches this command.
         reply: oneshot::Sender<()>,
     },
+    /// A drain barrier on the DATA lane (ADR 0083): replied to with `()` once every
+    /// command sent before it has been dispatched AND no durable append is in flight.
+    /// A graceful shutdown awaits it once the connections have gone, so what they sent
+    /// last — the messages rules derive from their disconnects included — is routed
+    /// and stored before the process exits.
+    Drained {
+        /// Replied to with `()` when nothing is left in flight.
+        reply: oneshot::Sender<()>,
+    },
     /// Test-only: dispatch the inner command from the DATA lane (ADR 0082 T2). Tests
     /// inject acks and verdicts that, in production, can only exist after the work
     /// they answer was dispatched; on the control lane such a synthetic reply would
@@ -1738,6 +1752,7 @@ impl HubCommand {
             | Self::Admin(_) => Lane::Control,
             Self::Publish { .. }
             | Self::PublishBatch(_)
+            | Self::RuleDerived(_)
             | Self::RemotePublish { .. }
             | Self::RemotePublishAcked { .. }
             | Self::RemoteSharedDeliver { .. }
@@ -1766,7 +1781,8 @@ impl HubCommand {
             | Self::RemoteInterest { .. }
             | Self::RemoteSharedInterest { .. }
             | Self::InheritedSessions { .. }
-            | Self::Flush { .. } => Lane::Data,
+            | Self::Flush { .. }
+            | Self::Drained { .. } => Lane::Data,
             #[cfg(test)]
             Self::Ordered(_) => Lane::Data,
         }
@@ -1777,6 +1793,7 @@ impl HubCommand {
             Self::Attach { .. } | Self::SessionRecovered { .. } => "attach",
             Self::Publish { .. }
             | Self::PublishBatch(_)
+            | Self::RuleDerived(_)
             | Self::AppendDone { .. }
             | Self::PkidBlockReserved { .. } => "publish",
             Self::PubAck { .. }
@@ -1792,7 +1809,8 @@ impl HubCommand {
             | Self::AttachAuthorizer(_)
             | Self::AttachRules(_)
             | Self::Ping { .. }
-            | Self::Flush { .. } => "control",
+            | Self::Flush { .. }
+            | Self::Drained { .. } => "control",
             #[cfg(test)]
             Self::Ordered(inner) => inner.class(),
             _ => "cluster",
@@ -2371,6 +2389,8 @@ pub struct Hub {
     /// group's degraded followers stall only its own sessions' appends — never every
     /// client on the node. Spawned on first submission; reaped by the sweep when idle.
     append_lanes: HashMap<ClientId, AppendLane>,
+    /// [`HubCommand::Drained`] barriers waiting for the in-flight appends to finish.
+    drained_waiters: Vec<oneshot::Sender<()>>,
     /// The lane workers themselves, owned by the hub so their lifetime is the hub's.
     ///
     /// This ownership is load-bearing, not tidiness. A worker holds an `Arc` of the
@@ -2565,6 +2585,7 @@ impl Hub {
                 self_tx: tx.clone(),
                 connecting: HashMap::new(),
                 append_lanes: HashMap::new(),
+                drained_waiters: Vec::new(),
                 owned_tasks: tokio::task::JoinSet::new(),
                 truncate_tx: None,
                 qos2_cleanup: HashSet::new(),
@@ -2944,6 +2965,20 @@ impl Hub {
         if let Some(m) = &self.metrics {
             m.observe_hub_dispatch(class, started.elapsed().as_secs_f64());
         }
+        // An append's completion arrives as a command, so this is where a drain
+        // barrier can come due.
+        if !self.drained_waiters.is_empty() {
+            self.wake_drained();
+        }
+    }
+
+    /// Answer the [`HubCommand::Drained`] barriers once no durable append is in flight.
+    fn wake_drained(&mut self) {
+        if self.append_lanes.values().all(|lane| lane.outstanding == 0) {
+            for reply in self.drained_waiters.drain(..) {
+                let _ = reply.send(());
+            }
+        }
     }
 
     /// The once-a-second sweep: expiry, cleanup, gauges, retransmits, lane reaping.
@@ -3078,6 +3113,16 @@ impl Hub {
                     if routed {
                         self.dispatch_publish(publish).await;
                     }
+                }
+            }
+            HubCommand::RuleDerived(derived) => {
+                let DerivedPublish { rule, publish, .. } = *derived;
+                let routed = self.dispatch_publish(publish).await;
+                if !routed {
+                    debug!(rule = %rule, "a message derived from an event or a Will was refused");
+                }
+                if let Some(m) = &self.metrics {
+                    m.rule_action(&rule, if routed { "ok" } else { "failed" });
                 }
             }
             HubCommand::RestoreRetained {
@@ -3485,6 +3530,8 @@ impl Hub {
             HubCommand::Flush { reply } => {
                 let _ = reply.send(());
             }
+            // Answered by `dispatch_timed` once no append is in flight.
+            HubCommand::Drained { reply } => self.drained_waiters.push(reply),
             #[cfg(test)]
             HubCommand::Ordered(inner) => {
                 Box::pin(self.dispatch(*inner)).await;
@@ -3841,8 +3888,8 @@ impl Hub {
     /// A Will is a publish like any other to the rule engine (EMQX runs its rules on
     /// one, ADR 0083), and the hub is what publishes it, so the hub evaluates it. What
     /// the rules produce is posted back as ordinary publishes — through the same
-    /// dispatch (quota checks included) as any other. Nobody waits for them, as nobody
-    /// waits for the Will, but each is gated so its action is counted by its fate.
+    /// dispatch (quota checks included) as any other, ungated like the Will, each
+    /// counted as it is routed or refused ([`HubCommand::RuleDerived`]).
     async fn publish_will(&mut self, client: &ClientId, will: &Will) {
         let w = &will.message;
         self.publish(
@@ -18578,6 +18625,67 @@ mod tests {
             }
             out
         }
+    }
+
+    /// ADR 0083: the drain barrier answers only once no durable append is in flight,
+    /// so a graceful shutdown that awaits it does not exit with an offline session's
+    /// message dispatched but not yet stored — what lost the presence messages rules
+    /// derive from the drain's own disconnects. On an idle hub it answers at once.
+    #[tokio::test]
+    async fn the_drain_barrier_waits_for_in_flight_appends() {
+        let store = ParkingStore::new();
+        let release = store.park("r");
+        let (hub, tx) = Hub::with_config(NodeId("hub-test".into()), store.clone());
+        tokio::spawn(hub.run());
+
+        let drained = |tx: &HubTx| {
+            let (reply, rx) = oneshot::channel();
+            tx.send(HubCommand::Drained { reply }).unwrap();
+            rx
+        };
+        timeout(Duration::from_secs(2), drained(&tx))
+            .await
+            .expect("an idle hub has nothing in flight")
+            .unwrap();
+
+        let (_rx, _) = attach(&tx, "r", 1, false).await;
+        subscribe_qos(&tx, "r", "rt/t", QoS::AtLeastOnce);
+        detach(&tx, "r", 1);
+        // Ungated, as a rule-derived message is: nobody waits for its answer.
+        tx.send(HubCommand::Publish {
+            topic: "rt/t".into(),
+            payload: Bytes::from_static(b"late"),
+            qos: QoS::AtLeastOnce,
+            retain: false,
+            message_expiry: None,
+            app: AppProperties::default(),
+            done: None,
+            v5: false,
+            publisher: None,
+            credit: None,
+        })
+        .unwrap();
+        let mut waiting = drained(&tx);
+        assert!(
+            timeout(Duration::from_millis(300), &mut waiting)
+                .await
+                .is_err(),
+            "answered while the append is still parked"
+        );
+        assert!(store.ops().iter().all(|(op, _)| op != "enqueue"));
+
+        release.send(true).unwrap();
+        timeout(Duration::from_secs(2), waiting)
+            .await
+            .expect("answered once the append lands")
+            .unwrap();
+        assert!(
+            store
+                .ops()
+                .iter()
+                .any(|(op, d)| op == "enqueue" && d == "r late"),
+            "the barrier answered only after the message was stored"
+        );
     }
 
     /// ADR 0072 — RELAXED tier: with the operator opt-in, a publish carrying

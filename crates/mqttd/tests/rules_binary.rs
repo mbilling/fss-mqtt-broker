@@ -2049,9 +2049,9 @@ actions = [{ function = "republish", args = { topic = "evs/unsub/${clientid}", p
 /// any other reason code a v5 client's DISCONNECT carries (`unspecified_error` for 0x80,
 /// `disconnect_with_will_message` for 0x04). A reason mapped wrongly — every v5 code read
 /// as `normal`, or a dropped socket reported as a DISCONNECT — fails the exact payloads.
-/// RULES.md "Delivery guarantees": each message an event derives "still gets its own gate,
-/// so its action is counted by its fate: `ok` once the broker accepted it" — four
-/// disconnects, four `ok` actions and nothing else. An event action counted `failed`,
+/// RULES.md "Delivery guarantees": each action an event derives "is counted `ok` once
+/// the broker has routed its message" — four disconnects, four `ok` actions and nothing
+/// else. An event action counted `failed`,
 /// twice, or not at all fails the exact series.
 #[tokio::test]
 async fn client_disconnected_reports_normal_tcp_closed_and_a_v5_reason_by_its_emqx_name() {
@@ -2122,8 +2122,8 @@ actions = [{ function = "republish", args = { topic = "wout/${clientid}", payloa
 
 /// RULES.md "Where rules run": "Last Wills run rules too, as in EMQX. The hub publishes a
 /// Will, so the hub evaluates it"; evaluating it at CONNECT instead "would … miss any
-/// reload before the client went away". And "Delivery guarantees": what a Will's rules
-/// derive is "counted by its fate: `ok` once the broker accepted it". A v3.1.1 client
+/// reload before the client went away". And "Delivery guarantees": each action a Will's
+/// rules derive "is counted `ok` once the broker has routed its message". A v3.1.1 client
 /// connects with a `QoS` 1 Will; the rules file is edited and reloaded (`SIGHUP`) while
 /// it stays connected; then its socket drops. A watcher receives the Will, then the
 /// message the reloaded rule derives from it (`v2:`), and the rule counts one `passed`

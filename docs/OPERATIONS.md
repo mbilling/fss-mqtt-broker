@@ -1179,12 +1179,15 @@ operating summary. The engine is unreleased: it lands after `v1.0.18`.
   with the original's own fate. A derived message that needs storage is refused like any
   growth write and counted as a failed action, while its original is still acked; an
   original the hub refuses routes none of its derived messages. Expect
-  `mqttd_rule_actions_total{result="failed"}` to climb during a brownout.
+  `mqttd_rule_actions_total{result="failed"}` to climb during a brownout. What client
+  events and Wills derive is routed ungated, as a Will is: a durable copy the brownout
+  refuses shows in `mqttd_publish_dropped_total{reason="brownout"}` instead, and its
+  action still counts `ok` (it was routed).
 - **Shutdown:** a graceful stop raises `$events/client/disconnected` with reason
   `shutdown` for each connection it drains. The messages rules derive from those events
   are routed, and stored where they are owed (a persistent session's queue), before the
-  broker exits, and each is counted `ok` or `failed` by its fate. The drain waits for them
-  within `shutdown_grace_secs`; a second signal cuts it short.
+  broker exits: the drain ends with a hub barrier that waits for every durable append in
+  flight, within `shutdown_grace_secs`; a second signal cuts it short.
 
 These rule expressions are recommendations; the chart's `PrometheusRule` does not ship
 them.

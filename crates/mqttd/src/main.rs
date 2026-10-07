@@ -769,7 +769,6 @@ async fn main() -> Result<(), StartupError> {
         shutdown.clone(),
         metrics.clone(),
         ingress.clone(),
-        &connections,
     )?;
     let audit_for_shutdown = policy.audit.clone();
     let audit_for_admin = policy.audit.clone();
@@ -1089,6 +1088,7 @@ async fn main() -> Result<(), StartupError> {
     // Earlier than this there is nothing to drain, and the default action keeps a stuck
     // startup killable.
     let (mut stop, mut decommission) = (StopSignals::install(), DecommissionSignal::install());
+    let hub_for_shutdown = hub_tx.clone();
     start_client_listeners(
         &config,
         hub_tx,
@@ -1147,6 +1147,7 @@ async fn main() -> Result<(), StartupError> {
         Duration::from_secs(config.runtime.shutdown_grace_secs),
         &shutdown,
         &connections,
+        &hub_for_shutdown,
         &draining,
         plane_for_shutdown,
         lease_driver,
@@ -1527,8 +1528,6 @@ async fn start_client_listeners(
 /// Build the connection policy — authentication, topic authorization, and
 /// auditing — from the `MQTTD_*` shims (ADR 0004). Everything is deny-by-default;
 /// the insecure fallbacks are explicit and loudly logged.
-// One argument per independent piece of wiring the policy is assembled from.
-#[allow(clippy::too_many_arguments)]
 fn client_policy(
     live: &Arc<RwLock<Config>>,
     // This node's id, passed explicitly rather than read off `proxy`: what this
@@ -1541,7 +1540,6 @@ fn client_policy(
     shutdown: tokio_util::sync::CancellationToken,
     metrics: Arc<mqtt_observability::metrics::Metrics>,
     ingress: Arc<mqttd::ingress::IngressCredit>,
-    connections: &tokio_util::task::TaskTracker,
 ) -> Result<(Arc<conn::ConnPolicy>, reload::Reloader), Box<dyn std::error::Error>> {
     // ADR 0066 T3: with an export endpoint configured, every audit record —
     // genesis and the closing shutdown record included — also ships to the SIEM
@@ -1617,11 +1615,8 @@ fn client_policy(
         );
     }
     let (rules_tx, rules_rx) = tokio::sync::watch::channel(Arc::new(initial_rules));
-    // Event- and Will-derived actions are counted on the connection tracker, so the
-    // graceful drain waits for what a disconnect raises as the broker stops.
     let rules =
-        mqttd::rules::Rules::new(rules_rx, Arc::from(node.0.as_str()), Some(metrics.clone()))
-            .with_tasks(connections.clone());
+        mqttd::rules::Rules::new(rules_rx, Arc::from(node.0.as_str()), Some(metrics.clone()));
     reloader.attach_rules(rules_tx, {
         let live = live.clone();
         move || -> reload::RulesBuildResult {
@@ -5445,6 +5440,7 @@ async fn graceful_shutdown(
     grace: Duration,
     shutdown: &tokio_util::sync::CancellationToken,
     connections: &tokio_util::task::TaskTracker,
+    hub: &mpsc::UnboundedSender<hub::HubCommand>,
     draining: &std::sync::atomic::AtomicBool,
     plane: Option<mqtt_cluster::durable_plane::DurablePlane>,
     lease_driver: Option<tokio::task::JoinHandle<()>>,
@@ -5507,6 +5503,7 @@ async fn graceful_shutdown(
     shutdown.cancel();
     // 3. Wait for connections to drain, bounded by the grace deadline; a second signal
     //    escalates to immediate exit.
+    let drain_started = tokio::time::Instant::now();
     let drain_outcome = tokio::select! {
         () = connections.wait() => {
             info!("all client connections drained");
@@ -5521,6 +5518,23 @@ async fn graceful_shutdown(
             "second-signal"
         }
     };
+    // 3b. What the connections sent last — the messages rules derived from their
+    //     disconnects among it (ADR 0083) — is routed, and its durable appends are
+    //     finished, before the process exits; within what is left of the grace.
+    if drain_outcome == "drained" {
+        let (reply, drained) = tokio::sync::oneshot::channel();
+        if hub.send(hub::HubCommand::Drained { reply }).is_ok() {
+            let left = grace.saturating_sub(drain_started.elapsed());
+            tokio::select! {
+                answered = tokio::time::timeout(left, drained) => {
+                    if answered.is_err() {
+                        warn!("drain grace elapsed with durable appends still in flight");
+                    }
+                }
+                () = stop.recv() => warn!("second signal; forcing immediate shutdown"),
+            }
+        }
+    }
     // 4. Stop the lease-group driver loop, then the consensus core, cleanly (in-flight
     //    durable writes are already fsync'd). Stopping the driver first avoids it issuing
     //    lease RPCs against a raft that is shutting down.

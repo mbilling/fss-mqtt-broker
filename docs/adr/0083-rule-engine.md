@@ -94,8 +94,13 @@ hub's **data lane is FIFO per connection, bounded by ingress credit** (ADR 0082)
    dedup record made each resend a first sighting (review of PR #871). Inbound QoS 2
    deduplication precedes evaluation, so a rule fires once per QoS 2 message. A QoS 0
    original gates nothing. Client/session events and Wills hold back no acknowledgement,
-   because there is none to hold, but each message they derive gets its own gate, so its
-   action is counted by its fate and a graceful shutdown's drain waits for it. A
+   because there is none to hold: the messages they derive are routed ungated, as a
+   Will is, each action counted `ok` once the hub has routed it (a durable copy a
+   brownout refuses is counted as a drop, as a Will's is), and hold no entry in the
+   pending-publish table, so a burst of events cannot evict a client publish's entry
+   and withhold its ack (review of PR #871). A graceful shutdown awaits a hub barrier
+   that answers once everything sent before it is dispatched and no durable append is
+   in flight, so what the drain's own disconnects derive is stored before exit. A
    connection's pipeline of parked acknowledgements is
    bounded in hub gates, not publishes, so a rule that fans a publish out cannot
    multiply what one connection holds in the hub's pending-publish table.
@@ -145,7 +150,9 @@ hub's **data lane is FIFO per connection, bounded by ingress credit** (ADR 0082)
    credit does (reading paused, deliveries and acks flowing, keepalive not enforced); a
    QoS 2 batch waits in place, because its PUBREC already waits there for the hub's
    answer and a parked batch would never be sent, and the keepalive restarts once that
-   wait is over. Under `shed-qos0` a QoS 0 publish's derived messages are dropped and
+   wait is over. In place means the connection sees nothing else meanwhile — no
+   deliveries, no shutdown drain, no hangup — as during the PUBREC's own wait; both
+   waits end as the hub makes progress, so neither can hang the drain past its grace. Under `shed-qos0` a QoS 0 publish's derived messages are dropped and
    counted instead of waited for. The batch holds its credit until it has been
    dispatched. What a client/session event or a Will derives is charged to no
    connection's credit, because no publish carries it: each event and each Will is held

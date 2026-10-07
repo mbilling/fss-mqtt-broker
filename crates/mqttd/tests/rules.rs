@@ -353,27 +353,42 @@ fn brownout(broker: &Broker) {
         .unwrap();
 }
 
-/// What an event derives is counted by its fate, not when it is sent: a presence
-/// message the broker stores is `ok`, one it refuses (a brownout, and it needs storage
-/// for an offline subscriber) is `failed`. Nobody else would ever learn of it — an
-/// event answers no publisher.
+/// What an event derives is routed ungated, as a Will is, so it holds no entry in the
+/// table of publishes awaiting acknowledgement (a burst of events cannot crowd a
+/// client's publish out of it), and its action is counted `ok` once the hub has routed
+/// it. A durable copy a brownout refuses is a drop like a Will's: counted in
+/// `mqttd_publish_dropped_total{reason="brownout"}`, never hidden.
 #[tokio::test]
-async fn an_event_derived_message_is_counted_by_its_fate() {
+async fn an_event_derived_message_is_counted_when_routed_and_a_refused_copy_as_a_drop() {
     const PRESENCE: &str = r#"
 [rules.presence]
 sql = 'SELECT clientid FROM "$events/client/disconnected"'
 actions = [{ function = "republish", args = { topic = "presence/${clientid}", payload = "offline", qos = 1 } }]
 "#;
     let broker = start_broker(PRESENCE).await;
-    let counted = |result: &'static str, n: u64| {
+    let brownout_drops = |broker: &Broker| {
+        broker
+            .metrics
+            .render()
+            .lines()
+            .find_map(|l| l.strip_prefix(r#"mqttd_publish_dropped_total{reason="brownout"} "#))
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(0)
+    };
+    let counted = |n: u64, drops: u64| {
         let broker = &broker;
         async move {
             let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-            while action_count(broker, "presence", result) != n {
+            while (
+                action_count(broker, "presence", "ok"),
+                brownout_drops(broker),
+            ) != (n, drops)
+            {
                 assert!(
                     tokio::time::Instant::now() < deadline,
-                    "presence {result}: expected {n}, have {}",
-                    action_count(broker, "presence", result)
+                    "expected {n} ok and {drops} brownout drops, have {} and {}",
+                    action_count(broker, "presence", "ok"),
+                    brownout_drops(broker)
                 );
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
@@ -381,20 +396,16 @@ actions = [{ function = "republish", args = { topic = "presence/${clientid}", pa
     };
     // The watcher's own disconnect raises one, stored for its now-offline session.
     park_a_sleeper(&broker, "watcher", "presence/#").await;
-    counted("ok", 1).await;
+    counted(1, 0).await;
     let mut a = Client::connect(broker.addr, "dev-a").await;
     a.disconnect().await;
-    counted("ok", 2).await;
+    counted(2, 0).await;
 
     let mut b = Client::connect(broker.addr, "dev-b").await;
     brownout(&broker);
     b.disconnect().await;
-    counted("failed", 1).await;
-    assert_eq!(
-        action_count(&broker, "presence", "ok"),
-        2,
-        "refused, so not ok"
-    );
+    counted(3, 1).await;
+    assert_eq!(action_count(&broker, "presence", "failed"), 0);
 }
 
 /// A derived message the broker refuses (brownout: it needs storage) fails its action;

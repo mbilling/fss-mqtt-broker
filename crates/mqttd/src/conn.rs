@@ -2122,7 +2122,7 @@ where
     // [MQTT-3.1.2-24]: close after 1.5x the keepalive with no inbound traffic.
     let grace = (keep_alive > 0).then(|| {
         // Exactly 1.5x: `Duration` divides in nanoseconds, where whole seconds would
-        // round 1 s down to 1 s and 3 s down to 4 s [MQTT-3.1.2-24].
+        // round 1.5 s down to 1 s and 4.5 s down to 4 s [MQTT-3.1.2-24].
         Duration::from_secs(u64::from(keep_alive)) * KEEPALIVE_GRACE_NUM / KEEPALIVE_GRACE_DEN
     });
     let mut deadline = grace.map(|g| Instant::now() + g);

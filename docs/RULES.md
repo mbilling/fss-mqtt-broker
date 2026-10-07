@@ -1,6 +1,6 @@
 # Rule engine
 
-**Dated 2026-10-07.** Unreleased: lands in the first release after `v1.0.18`
+**Dated 2026-10-07.** Unreleased: no release has the rule engine yet
 ([ADR 0083](adr/0083-rule-engine.md)). Rules filter, transform and re-route messages as
 they pass through the broker. They are written in **EMQX's rule SQL**, with EMQX's
 `republish` and `console` actions. A rule written for EMQX's rule engine runs here
@@ -568,7 +568,10 @@ and its MQTT 5 recipe guards a user property the same way.
   more. It waits the way any publish waiting for credit does: it stops reading its
   socket but keeps delivering to its client, and its keepalive is not enforced. (A QoS
   2 publish, whose PUBREC already waits in place for the hub's answer, waits for this
-  credit in place too; its keepalive restarts when the wait ends.) The charge is
+  credit in place too. While it waits the connection does nothing else: it delivers
+  nothing to its client and notices neither a shutdown drain nor a hangup until the wait
+  ends, which the hub's progress bounds, as it bounds the PUBREC's own wait. Its
+  keepalive restarts when the wait ends.) The charge is
   clamped to the per-connection cap, so a batch larger than the cap still proceeds, as
   the largest single message does. Under `MQTTD_INGRESS_OVERLOAD=shed-qos0` a QoS 0
   publish never waits: if the credit for its derived messages is not there, they are
@@ -612,13 +615,17 @@ for the original publisher (in EMQX the rule is the sender, too), and a retained
 overflow delivers it live without retaining it rather than refusing the original.
 
 **Client/session events and Wills** (below) hold back no acknowledgement, because there
-is no publisher to answer. Each message their rules derive still gets its own gate, so
-its action is counted by its fate: `ok` once the broker accepted it, `failed` if it was
-refused. A graceful shutdown waits for them: the `client/disconnected` events (reason
-`shutdown`) raised as the broker drains its connections are routed, and stored where they
-are owed (a persistent session's offline queue, durably where durability applies), before
-the broker exits. That wait is part of the drain, bounded by `shutdown_grace_secs`; a
-second signal ends it. These messages are not charged to any connection's ingress credit,
+is no publisher to answer. The messages their rules derive are routed ungated, as a
+Will is: each action is counted `ok` once the broker has routed its message, and they
+take no room in the table of publishes awaiting acknowledgement, so a burst of events —
+a load balancer restarting, a partition healing — cannot crowd a client's publish out of
+it. A durable copy one of them loses to a brownout is counted as a drop, as a Will's is,
+in `mqttd_publish_dropped_total{reason="brownout"}`. A graceful
+shutdown waits for them: the `client/disconnected` events (reason `shutdown`) raised as
+the broker drains its connections are routed, and stored where they are owed (a
+persistent session's offline queue, durably where durability applies), before the broker
+exits. That wait is part of the drain, bounded by `shutdown_grace_secs`; a second signal
+ends it. These messages are not charged to any connection's ingress credit,
 because no publish carries them: each event, and each Will, is bounded by the per-message
 limits instead (at most 1,024 derived messages, carrying at most 4 MiB together; a Will's
 budget also grows with four times its payload).

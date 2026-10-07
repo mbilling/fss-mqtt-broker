@@ -53,9 +53,6 @@ pub struct Rules {
     rx: RulesWatch,
     node: Arc<str>,
     metrics: Option<Arc<Metrics>>,
-    /// Where the waits that count event- and Will-derived actions run: the broker's
-    /// connection tracker, so a graceful shutdown waits for those messages too.
-    tasks: Option<tokio_util::task::TaskTracker>,
 }
 
 impl std::fmt::Debug for Rules {
@@ -234,52 +231,20 @@ impl Rules {
     /// The engine over a live rule set.
     #[must_use]
     pub fn new(rx: RulesWatch, node: Arc<str>, metrics: Option<Arc<Metrics>>) -> Self {
-        Self {
-            rx,
-            node,
-            metrics,
-            tasks: None,
-        }
+        Self { rx, node, metrics }
     }
 
-    /// Run the waits that count event- and Will-derived actions on `tasks` — the
-    /// tracker a graceful shutdown waits on — so the messages a disconnect raises as the
-    /// broker drains are routed and stored before it exits.
-    #[must_use]
-    pub fn with_tasks(mut self, tasks: tokio_util::task::TaskTracker) -> Self {
-        self.tasks = Some(tasks);
-        self
-    }
-
-    /// Send what an event or a Will derived — there is no publisher to answer — each
-    /// behind its own gate, and count each action by its fate once the hub has
-    /// answered: `ok` when it was accepted (routed, and stored where owed), `failed`
-    /// otherwise. The wait runs on [`Rules::with_tasks`]'s tracker when there is one.
-    fn send_counted(&self, derived: Vec<Derived>, send: impl Fn(HubCommand)) {
-        if derived.is_empty() {
-            return;
-        }
-        let answers: Vec<DerivedAnswer> = derived
-            .into_iter()
-            .map(|d| {
-                let (tx, rx) = oneshot::channel();
-                send(derived_command(d.msg, Some(tx)));
-                (d.rule, rx)
-            })
-            .collect();
-        let metrics = self.metrics.clone();
-        let count = async move {
-            for (rule, rx) in answers {
-                let result = match rx.await {
-                    Ok(PublishOutcome::Accepted) => "ok",
-                    _ => "failed",
-                };
-                count_action(metrics.as_deref(), &rule, result);
-            }
-        };
-        match &self.tasks {
-            Some(t) => drop(t.spawn(count)),
-            None => drop(tokio::spawn(count)),
+    /// Send what an event or a Will derived — there is no publisher to answer — as
+    /// [`HubCommand::RuleDerived`]: ungated, so it holds no pending-publish entry, and
+    /// counted by the hub as it routes it (`ok`) or refuses it (`failed`). A graceful
+    /// shutdown waits for these to be routed and stored ([`HubCommand::Drained`]).
+    fn send_derived(derived: Vec<Derived>, send: impl Fn(HubCommand)) {
+        for d in derived {
+            send(HubCommand::RuleDerived(Box::new(DerivedPublish {
+                rule: d.rule,
+                publish: derived_command(d.msg, None),
+                gated: false,
+            })));
         }
     }
 
@@ -301,11 +266,10 @@ impl Rules {
     }
 
     /// Evaluate a Will the hub is publishing and hand `send` the commands for what its
-    /// rules produce. Nobody waits for them — there is no publisher to answer — but
-    /// each is gated so its action is counted by its fate ([`Rules::send_counted`]).
+    /// rules produce ([`Rules::send_derived`]).
     pub fn on_will(&self, f: &PublishFacts<'_>, send: impl Fn(HubCommand)) {
         let derived = evaluate(&self.current(), &self.node, self.metrics.as_deref(), f);
-        self.send_counted(derived, send);
+        Self::send_derived(derived, send);
     }
 }
 
@@ -389,10 +353,8 @@ impl ConnRules {
         }
     }
 
-    /// Evaluate a client/session event and publish what its rules produce. An event
-    /// holds back no acknowledgement — there is no publisher to answer — but each
-    /// republish is gated so its action is counted by its fate, and so a graceful
-    /// shutdown waits for it ([`Rules::send_counted`]).
+    /// Evaluate a client/session event and publish what its rules produce
+    /// ([`Rules::send_derived`]).
     pub fn fire_event(&self, input: &EventInput, hub: &mpsc::UnboundedSender<HubCommand>) {
         let metrics = self.engine.metrics.as_deref();
         let derived = self.with_set(|set| {
@@ -400,7 +362,7 @@ impl ConnRules {
             set.on_event(input, &mut |r, o| report(metrics, r, o), &mut effects);
             collect(metrics, effects)
         });
-        self.engine.send_counted(derived, |cmd| {
+        Rules::send_derived(derived, |cmd| {
             let _ = hub.send(cmd);
         });
     }
@@ -533,7 +495,14 @@ async fn combine(
     for (rule, gate) in derived {
         let result = match gate.await {
             Ok(PublishOutcome::Accepted) => "ok",
-            Ok(PublishOutcome::Refused(_)) | Err(_) => "failed",
+            Ok(PublishOutcome::Refused(r)) => {
+                debug!(rule = %rule, refusal = r.as_str(), "a derived message was refused");
+                "failed"
+            }
+            Err(_) => {
+                debug!(rule = %rule, "a derived message's fate is unknown (its gate closed)");
+                "failed"
+            }
         };
         count_action(metrics, &rule, result);
     }
