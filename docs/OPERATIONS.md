@@ -1107,7 +1107,7 @@ That is the design working. The alerts below say a node is **spending real time 
 
 The rule engine's reference is [RULES.md](RULES.md), which starts with a two-minute
 walkthrough; tested recipes are in [RULES-COOKBOOK.md](RULES-COOKBOOK.md). This is the
-operating summary. The engine is unreleased: it lands after `v1.0.18`.
+operating summary. The engine is unreleased: no release has it yet.
 
 - **Configure** with `[rules] file` (`MQTTD_RULES_FILE`). The file is per-node operator
   configuration, like the ACL file: ship the same file to every node. Rules are written in
@@ -1155,7 +1155,12 @@ operating summary. The engine is unreleased: it lands after `v1.0.18`.
   ```promql
   sum by (rule) (rate(mqttd_rule_evaluations_total{result="failed"}[5m])) > 0
   sum by (rule) (rate(mqttd_rule_actions_total{result="failed"}[5m])) > 0
+  rate(mqttd_publish_dropped_total{reason="brownout"}[5m]) > 0
   ```
+
+  The third catches what the first two cannot: a durable copy a brownout refuses to a
+  message derived from an event or a Will, whose action still counts `ok` (it was
+  routed). It counts every brownout-dropped copy, a Will's included, not only a rule's.
 
   These series are on `/metrics`, which is served only on `listeners.health_bind`
   (`MQTTD_HEALTH_BIND`) or `listeners.metrics_bind` (`MQTTD_METRICS_BIND`).
@@ -1186,8 +1191,12 @@ operating summary. The engine is unreleased: it lands after `v1.0.18`.
 - **Shutdown:** a graceful stop raises `$events/client/disconnected` with reason
   `shutdown` for each connection it drains. The messages rules derive from those events
   are routed, and stored where they are owed (a persistent session's queue), before the
-  broker exits: the drain ends with a hub barrier that waits for every durable append in
-  flight, within `shutdown_grace_secs`; a second signal cuts it short.
+  broker exits; what they owe another node is forwarded acked and answered. The drain
+  ends with a hub barrier that waits for every durable append in flight and every
+  publish still awaiting an answer, within `shutdown_grace_secs`; a second signal cuts it
+  short. A peer link down for the whole drain is not redialed: what it owes is lost at
+  the deadline, with the WARN `drain grace elapsed with durable appends or peer answers
+  still outstanding`.
 
 These rule expressions are recommendations; the chart's `PrometheusRule` does not ship
 them.

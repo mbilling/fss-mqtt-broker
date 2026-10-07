@@ -99,8 +99,12 @@ hub's **data lane is FIFO per connection, bounded by ingress credit** (ADR 0082)
    brownout refuses is counted as a drop, as a Will's is), and hold no entry in the
    pending-publish table, so a burst of events cannot evict a client publish's entry
    and withhold its ack (review of PR #871). A graceful shutdown awaits a hub barrier
-   that answers once everything sent before it is dispatched and no durable append is
-   in flight, so what the drain's own disconnects derive is stored before exit. A
+   that answers once everything sent before it is dispatched, no durable append is in
+   flight and no publish awaits an answer; while the broker drains, the hub gates what
+   rules derive from events itself, so a forward to another node is acked and waited
+   for. What the drain's own disconnects derive is stored, here and on the nodes it was
+   forwarded to, before exit — unless a peer link stays down for the whole drain (a
+   draining node does not redial), which loses it at the grace deadline. A
    connection's pipeline of parked acknowledgements is
    bounded in hub gates, not publishes, so a rule that fans a publish out cannot
    multiply what one connection holds in the hub's pending-publish table.
@@ -218,8 +222,10 @@ hub's **data lane is FIFO per connection, bounded by ingress credit** (ADR 0082)
   operator's choice, like the amplification above. Accepted; THREAT-MODEL.md lists it.
 - **A graceful shutdown delivers what its disconnects derive.** Draining raises
   `client/disconnected` with reason `shutdown` for each connection; the messages rules
-  derive from those events are routed, and stored where owed, before the broker exits,
-  within the drain's `shutdown_grace_secs`. A crash raises no events.
+  derive from those events are routed, and stored where owed — on another node too,
+  forwarded acked and answered — before the broker exits, within the drain's
+  `shutdown_grace_secs`. A peer link down for the whole drain loses what it owed there.
+  A crash raises no events.
 - **Rules are node-local configuration.** A node with a different file evaluates its own
   clients' publishes differently. `mqttd_rules_info` makes that visible; nothing prevents
   it, just as nothing prevents ACL drift.

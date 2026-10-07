@@ -62,7 +62,7 @@ needs an enforcing CNI. Details: [chart README](../deploy/helm/mqttd/README.md#n
 ## Rules
 
 The rule engine ([RULES.md](RULES.md)) reads one TOML file, named by `MQTTD_RULES_FILE`.
-It is unreleased (it lands after `v1.0.18`), so the chart's default image does not have it
+It is unreleased (no release has it yet), so the chart's default image does not have it
 yet: until a release does, set `image.repository` and `image.tag` to an image built from
 source ([RULES.md § Get a build](RULES.md#1-get-a-build-that-has-the-rule-engine)).
 

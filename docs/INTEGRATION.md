@@ -6,8 +6,8 @@ does and does not promise while you do it ([ADR 0063](adr/0063-external-consumer
 
 mqttd has no built-in Kafka/HTTP sinks, **by design**: it is a broker, not an
 integration platform, and everything it ships is held to the same durability and
-refusal contracts. Inside the broker it does run EMQX's rule SQL (unreleased, after
-`v1.0.18`; [RULES.md](RULES.md), [ADR 0083](adr/0083-rule-engine.md)): filter,
+refusal contracts. Inside the broker it does run EMQX's rule SQL (unreleased;
+[RULES.md](RULES.md), [ADR 0083](adr/0083-rule-engine.md)): filter,
 reshape and re-route between topics with `republish`. A rule's actions never leave
 the broker, so a rule can prepare a stream (`SELECT … FROM "raw/#" WHERE …` republished
 to `export/…`) but not deliver it. Delivery is a *pattern*, not a plugin — an ordinary

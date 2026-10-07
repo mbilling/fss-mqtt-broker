@@ -1692,14 +1692,21 @@ pub enum HubCommand {
         reply: oneshot::Sender<()>,
     },
     /// A drain barrier on the DATA lane (ADR 0083): replied to with `()` once every
-    /// command sent before it has been dispatched AND no durable append is in flight.
-    /// A graceful shutdown awaits it once the connections have gone, so what they sent
-    /// last — the messages rules derive from their disconnects included — is routed
-    /// and stored before the process exits.
+    /// command sent before it has been dispatched, no durable append is in flight, and
+    /// no publish awaits its acknowledgement. A graceful shutdown awaits it once the
+    /// connections have gone, so what they sent last — the messages rules derive from
+    /// their disconnects included — is routed, stored, and answered by the peers it was
+    /// forwarded to before the process exits.
     Drained {
         /// Replied to with `()` when nothing is left in flight.
         reply: oneshot::Sender<()>,
     },
+    /// The broker has begun a graceful drain (ADR 0083), sent on the CONTROL lane before
+    /// the connections are told to close. From here on the hub gates what rules derive
+    /// from events and Wills itself: its forwards to peers become acked ones, so
+    /// [`HubCommand::Drained`] waits for the peers' answers too, and a presence message
+    /// bound for a subscriber on another node is not left in a link queue at exit.
+    Draining,
     /// Test-only: dispatch the inner command from the DATA lane (ADR 0082 T2). Tests
     /// inject acks and verdicts that, in production, can only exist after the work
     /// they answer was dispatched; on the control lane such a synthetic reply would
@@ -1749,6 +1756,7 @@ impl HubCommand {
             | Self::RetainedCommitDone { .. }
             | Self::DurableFrame { .. }
             | Self::Ping { .. }
+            | Self::Draining
             | Self::Admin(_) => Lane::Control,
             Self::Publish { .. }
             | Self::PublishBatch(_)
@@ -1810,7 +1818,8 @@ impl HubCommand {
             | Self::AttachRules(_)
             | Self::Ping { .. }
             | Self::Flush { .. }
-            | Self::Drained { .. } => "control",
+            | Self::Drained { .. }
+            | Self::Draining => "control",
             #[cfg(test)]
             Self::Ordered(inner) => inner.class(),
             _ => "cluster",
@@ -2389,8 +2398,10 @@ pub struct Hub {
     /// group's degraded followers stall only its own sessions' appends — never every
     /// client on the node. Spawned on first submission; reaped by the sweep when idle.
     append_lanes: HashMap<ClientId, AppendLane>,
-    /// [`HubCommand::Drained`] barriers waiting for the in-flight appends to finish.
+    /// [`HubCommand::Drained`] barriers waiting for the in-flight work to finish.
     drained_waiters: Vec<oneshot::Sender<()>>,
+    /// A graceful drain has begun ([`HubCommand::Draining`]).
+    draining: bool,
     /// The lane workers themselves, owned by the hub so their lifetime is the hub's.
     ///
     /// This ownership is load-bearing, not tidiness. A worker holds an `Arc` of the
@@ -2586,6 +2597,7 @@ impl Hub {
                 connecting: HashMap::new(),
                 append_lanes: HashMap::new(),
                 drained_waiters: Vec::new(),
+                draining: false,
                 owned_tasks: tokio::task::JoinSet::new(),
                 truncate_tx: None,
                 qos2_cleanup: HashSet::new(),
@@ -2972,9 +2984,14 @@ impl Hub {
         }
     }
 
-    /// Answer the [`HubCommand::Drained`] barriers once no durable append is in flight.
+    /// Answer the [`HubCommand::Drained`] barriers once no durable append is in flight
+    /// and no publish awaits its acknowledgement — its own appends, or a peer's answer
+    /// to its acked forward. (An entry kept only for the settle window's replay has been
+    /// answered, and does not hold the barrier.)
     fn wake_drained(&mut self) {
-        if self.append_lanes.values().all(|lane| lane.outstanding == 0) {
+        if self.append_lanes.values().all(|lane| lane.outstanding == 0)
+            && self.pending_publishes.iter().all(|(_, p)| p.ack_released())
+        {
             for reply in self.drained_waiters.drain(..) {
                 let _ = reply.send(());
             }
@@ -3007,6 +3024,10 @@ impl Hub {
         // completed task's slot until polled, so without this the set grows
         // by one per lane ever spawned.
         while self.owned_tasks.try_join_next().is_some() {}
+        // The sweep can settle publishes too (a re-route after a peer died).
+        if !self.drained_waiters.is_empty() {
+            self.wake_drained();
+        }
         if let Some(m) = &self.metrics {
             m.observe_hub_dispatch("sweep", started.elapsed().as_secs_f64());
         }
@@ -3116,7 +3137,17 @@ impl Hub {
                 }
             }
             HubCommand::RuleDerived(derived) => {
-                let DerivedPublish { rule, publish, .. } = *derived;
+                let DerivedPublish {
+                    rule, mut publish, ..
+                } = *derived;
+                // While the broker drains, the hub gates it itself, though nobody waits
+                // for the answer: a gated publish's forward to a peer is an acked one,
+                // and the drain barrier waits for every gated publish to be answered.
+                if self.draining {
+                    if let HubCommand::Publish { done, .. } = &mut publish {
+                        *done = Some(oneshot::channel().0);
+                    }
+                }
                 let routed = self.dispatch_publish(publish).await;
                 if !routed {
                     debug!(rule = %rule, "a message derived from an event or a Will was refused");
@@ -3530,8 +3561,9 @@ impl Hub {
             HubCommand::Flush { reply } => {
                 let _ = reply.send(());
             }
-            // Answered by `dispatch_timed` once no append is in flight.
+            // Answered by `dispatch_timed` once nothing is left in flight.
             HubCommand::Drained { reply } => self.drained_waiters.push(reply),
+            HubCommand::Draining => self.draining = true,
             #[cfg(test)]
             HubCommand::Ordered(inner) => {
                 Box::pin(self.dispatch(*inner)).await;
@@ -18686,6 +18718,91 @@ mod tests {
                 .any(|(op, d)| op == "enqueue" && d == "r late"),
             "the barrier answered only after the message was stored"
         );
+    }
+
+    /// ADR 0083 (review of PR #871): while the broker drains, what rules derive from
+    /// events is forwarded to an interested peer ACKED, and the drain barrier waits for
+    /// the peer's answer — a `shutdown` presence message bound for a subscriber on
+    /// another node is not left in a link queue when the process exits. Outside a
+    /// drain the same message is forwarded ungated and the barrier does not wait.
+    #[tokio::test]
+    async fn while_draining_a_rule_derived_forward_holds_the_barrier_until_the_peer_answers() {
+        let derived = |topic: &str| {
+            HubCommand::RuleDerived(Box::new(super::DerivedPublish {
+                rule: Arc::from("presence"),
+                publish: HubCommand::Publish {
+                    topic: topic.into(),
+                    payload: Bytes::from_static(b"shutdown"),
+                    qos: QoS::AtLeastOnce,
+                    retain: false,
+                    message_expiry: None,
+                    app: AppProperties::default(),
+                    done: None,
+                    v5: false,
+                    publisher: None,
+                    credit: None,
+                },
+                gated: false,
+            }))
+        };
+        let drained = |tx: &HubTx| {
+            let (reply, rx) = oneshot::channel();
+            tx.send(HubCommand::Drained { reply }).unwrap();
+            rx
+        };
+        let tx = start_hub();
+        // Proto 7: its acked forward is the plain `PublishAcked` frame.
+        let mut peer = connect_peer_at_proto(&tx, "n2", 1, 7);
+        remote_interest(&tx, "n2", &["presence/#"]);
+
+        // Not draining: an ungated forward, and the barrier answers at once.
+        tx.send(derived("presence/a")).unwrap();
+        timeout(Duration::from_secs(2), drained(&tx))
+            .await
+            .expect("nothing awaits an answer")
+            .unwrap();
+        loop {
+            match timeout(Duration::from_secs(2), peer.recv())
+                .await
+                .expect("the forward arrives")
+                .expect("the link is open")
+            {
+                PeerMessage::Publish { topic, .. } => {
+                    assert_eq!(topic, "presence/a");
+                    break;
+                }
+                PeerMessage::PublishAcked { .. } => panic!("an ungated message forwarded acked"),
+                _ => {}
+            }
+        }
+
+        // Draining: an acked forward, and the barrier waits for the peer's answer.
+        tx.send(HubCommand::Draining).unwrap();
+        tx.send(derived("presence/b")).unwrap();
+        let seq = match next_forward_answer(&mut peer).await {
+            PeerMessage::PublishAcked { seq, topic, .. } => {
+                assert_eq!(topic, "presence/b");
+                seq
+            }
+            other => panic!("expected an acked forward, got {other:?}"),
+        };
+        let mut waiting = drained(&tx);
+        assert!(
+            timeout(Duration::from_millis(300), &mut waiting)
+                .await
+                .is_err(),
+            "answered before the peer did"
+        );
+        tx.send(ordered(HubCommand::RemotePublishAck {
+            node: NodeId("n2".into()),
+            seq,
+            ok: true,
+        }))
+        .unwrap();
+        timeout(Duration::from_secs(2), waiting)
+            .await
+            .expect("answered once the peer has")
+            .unwrap();
     }
 
     /// ADR 0072 — RELAXED tier: with the operator opt-in, a publish carrying

@@ -2260,6 +2260,121 @@ actions = [{ function = "republish", args = { topic = "presence/${clientid}", pa
 // Cluster
 // ---------------------------------------------------------------------------------------
 
+/// RULES.md "Delivery guarantees": a graceful shutdown keeps what its disconnects derive
+/// for a subscriber on ANOTHER node too — while the broker drains, those messages are
+/// forwarded acked, and the drain waits for the peer's answer before the process exits
+/// (review of PR #871). Two real processes, A's link to B through a relay; the watcher is
+/// live on node B and twelve clients are connected to node A. The link turns slow — the
+/// relay holds each chunk for 1.5 s each way — and A is stopped with `SIGTERM`. The
+/// watcher receives all twelve `shutdown` presence messages, exactly once each.
+///
+/// What this pins is the end-to-end behaviour on a real, slow link. The mechanism — the
+/// forwards are acked while draining, and the drain barrier waits for B's answers — is
+/// pinned by `hub::tests::while_draining_a_rule_derived_forward_holds_the_barrier_until_
+/// the_peer_answers`, which fails without it. This test does not: on a local link a
+/// frame handed to the kernel is still delivered after A's graceful close, so the loss
+/// needs frames queued inside A at exit (a backed-up link), which a test cannot stage
+/// reliably. (A link DOWN for the whole drain is not covered either way: a draining node
+/// does not redial, so what it owes there is lost at the grace deadline, logged.)
+#[tokio::test]
+async fn a_graceful_shutdown_forwards_every_shutdown_event_to_a_watcher_on_another_node() {
+    const N: usize = 12;
+    const PRESENCE: &str = r#"[rules.presence]
+sql = '''
+SELECT clientid, reason FROM "$events/client/disconnected"
+WHERE reason = 'shutdown'
+'''
+actions = [{ function = "republish", args = { topic = "presence/${clientid}", payload = "${reason}", qos = 1 } }]
+"#;
+    let (dir_a, dir_b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    write_rules(dir_a.path(), PRESENCE);
+    write_rules(dir_b.path(), PRESENCE);
+    let node_b = start(
+        dir_b.path(),
+        "node-b",
+        &Setup {
+            peers: Some(vec![]),
+            rules_by_env: true,
+            ..Setup::default()
+        },
+    )
+    .await;
+    let (relay_addr, relay, _relay_task) =
+        proc_common::spawn_relay(node_b.peer.expect("node B's peer listener")).await;
+    let mut node_a = start(
+        dir_a.path(),
+        "node-a",
+        &Setup {
+            peers: Some(vec![relay_addr.parse().unwrap()]),
+            toml: "\n[runtime]\nshutdown_grace_secs = 20\n".to_string(),
+            ..Setup::default()
+        },
+    )
+    .await;
+
+    let mut watcher = Client::connect(node_b.addr, "watcher").await;
+    assert_eq!(
+        subscribe(&mut watcher, 1, "presence/#", QoS::AtLeastOnce).await,
+        vec![1]
+    );
+    // Until the link is up and B's interest has reached A, a publish on A reaches nobody
+    // on B: publish numbered warm-ups until the latest one sent arrives (the link is
+    // FIFO). The warm-up client then leaves with a normal DISCONNECT, which the rule's
+    // WHERE does not select.
+    let mut warm = Client::connect(node_a.addr, "warm").await;
+    let mut sent = 0u16;
+    'warm: loop {
+        sent += 1;
+        assert!(sent <= 100, "node A's publishes never reached node B");
+        let n = sent.to_string();
+        assert_eq!(
+            publish_acked(&mut warm, "presence/warm-up", n.as_bytes(), sent).await,
+            0
+        );
+        loop {
+            match watcher.recv_bounded(Duration::from_millis(300)).await {
+                Recv::Packet(Packet::Publish(p)) => {
+                    if let Some(id) = p.pkid {
+                        watcher.puback(id).await;
+                    }
+                    assert_eq!(p.topic, "presence/warm-up");
+                    if p.payload == n.as_bytes() {
+                        break 'warm;
+                    }
+                }
+                Recv::Quiet => continue 'warm,
+                other => panic!("expected a warm-up PUBLISH, got {other:?}"),
+            }
+        }
+    }
+    warm.disconnect().await;
+
+    let mut devices = Vec::new();
+    for i in 0..N {
+        devices.push(Client::connect(node_a.addr, &format!("dev-{i:02}")).await);
+    }
+    // The link stays up but turns slow: the relay holds every chunk for 1.5 s each way.
+    relay.slow(1500);
+    let status = node_a.terminate().await;
+    assert!(status.success(), "a graceful stop exits 0, got {status:?}");
+    drop(devices);
+
+    let mut delivered = collect(&mut watcher, N).await;
+    delivered.sort();
+    let want: Vec<Got> = (0..N)
+        .map(|i| {
+            got(
+                &format!("presence/dev-{i:02}"),
+                "shutdown",
+                QoS::AtLeastOnce,
+                false,
+            )
+        })
+        .collect();
+    assert_eq!(delivered, want);
+    watcher.expect_silence().await;
+}
+
 /// RULES.md "Where rules run": "Once per message, on the node it arrived at. A message
 /// forwarded to another node is never evaluated again there", and what a rule republishes
 /// reaches "a subscriber on any node". Two real `mqttd` processes in a static-peer mesh,

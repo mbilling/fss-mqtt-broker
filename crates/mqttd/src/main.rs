@@ -5500,6 +5500,9 @@ async fn graceful_shutdown(
     draining.store(true, std::sync::atomic::Ordering::Release);
     // 2. Stop accepting and tell live connections to finish their current packet and
     //    close (without firing wills — the client is not gone, its session is retained).
+    //    The hub hears first, so what rules derive from those closes is forwarded to
+    //    peers acked, and the barrier in 3b waits for the peers' answers (ADR 0083).
+    let _ = hub.send(hub::HubCommand::Draining);
     shutdown.cancel();
     // 3. Wait for connections to drain, bounded by the grace deadline; a second signal
     //    escalates to immediate exit.
@@ -5519,8 +5522,8 @@ async fn graceful_shutdown(
         }
     };
     // 3b. What the connections sent last — the messages rules derived from their
-    //     disconnects among it (ADR 0083) — is routed, and its durable appends are
-    //     finished, before the process exits; within what is left of the grace.
+    //     disconnects among it (ADR 0083) — is routed, stored, and answered by the peers
+    //     it was forwarded to before the process exits; within what is left of the grace.
     if drain_outcome == "drained" {
         let (reply, drained) = tokio::sync::oneshot::channel();
         if hub.send(hub::HubCommand::Drained { reply }).is_ok() {
@@ -5528,7 +5531,7 @@ async fn graceful_shutdown(
             tokio::select! {
                 answered = tokio::time::timeout(left, drained) => {
                     if answered.is_err() {
-                        warn!("drain grace elapsed with durable appends still in flight");
+                        warn!("drain grace elapsed with durable appends or peer answers still outstanding; what they owed is lost");
                     }
                 }
                 () = stop.recv() => warn!("second signal; forcing immediate shutdown"),

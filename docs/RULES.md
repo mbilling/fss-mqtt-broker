@@ -624,8 +624,11 @@ in `mqttd_publish_dropped_total{reason="brownout"}`. A graceful
 shutdown waits for them: the `client/disconnected` events (reason `shutdown`) raised as
 the broker drains its connections are routed, and stored where they are owed (a
 persistent session's offline queue, durably where durability applies), before the broker
-exits. That wait is part of the drain, bounded by `shutdown_grace_secs`; a second signal
-ends it. These messages are not charged to any connection's ingress credit,
+exits. While it drains, what they derive for a subscriber or session on another node is
+forwarded acked, and the drain waits for that node's answer too. That wait is part of
+the drain, bounded by `shutdown_grace_secs`; a second signal ends it. A peer link that is
+down for the whole drain is not waited back: a draining node does not redial, so what it
+owes there is lost at the grace deadline, with a WARN. These messages are not charged to any connection's ingress credit,
 because no publish carries them: each event, and each Will, is bounded by the per-message
 limits instead (at most 1,024 derived messages, carrying at most 4 MiB together; a Will's
 budget also grows with four times its payload).
