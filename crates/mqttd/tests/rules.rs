@@ -558,6 +558,32 @@ async fn client_events_run_rules() {
     );
 }
 
+/// A v5 client that ends with a non-zero DISCONNECT reason is reported with EMQX's name
+/// for that reason code — here `0x04 Disconnect with Will Message` — not `normal`, which
+/// EMQX keeps for `0x00` (`emqx_channel:disconnect_reason/1`).
+#[tokio::test]
+async fn a_disconnect_reason_code_is_reported_by_its_emqx_name() {
+    let broker = start_broker(PRESENCE).await;
+    let mut watcher = Client::connect(broker.addr, "watcher-rc").await;
+    watcher
+        .subscribe(1, "presence/dev10", QoS::AtLeastOnce)
+        .await;
+    let mut dev = Client::connect_v5_ok(broker.addr, "dev10").await;
+    let p = watcher.expect_publish().await;
+    watcher.puback(p.pkid.unwrap()).await;
+    dev.send(&Packet::Disconnect(mqtt_codec::packet::Disconnect {
+        reason: 0x04,
+        properties: mqtt_codec::Properties::default(),
+    }))
+    .await;
+    dev.expect_closed().await;
+    let p = watcher.expect_publish().await;
+    assert_eq!(
+        String::from_utf8(p.payload.to_vec()).unwrap(),
+        r#"{"clientid":"dev10","event":"client.disconnected","reason":"disconnect_with_will_message","topic":"undefined"}"#
+    );
+}
+
 /// A Will is a publish to the rule engine (as in EMQX): the hub publishes it on an
 /// ungraceful end, and evaluates it.
 #[tokio::test]

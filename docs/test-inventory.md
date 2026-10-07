@@ -2042,8 +2042,9 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 
 - `a_rolled_node_disconnects_only_its_own_clients`
 
-## `crates/mqttd/tests/rules.rs` — 11 test(s)
+## `crates/mqttd/tests/rules.rs` — 12 test(s)
 
+- `a_disconnect_reason_code_is_reported_by_its_emqx_name`
 - `a_matching_publish_is_transformed_and_republished_beside_the_original`
 - `a_qos1_publish_acks_and_its_derived_message_is_qos1`
 - `a_qos2_publish_fires_its_rules_once_across_a_dup_resend`

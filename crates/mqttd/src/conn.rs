@@ -313,15 +313,18 @@ enum CloseReason {
     ServerClosed,
     KeepaliveTimeout,
     Shutdown,
+    /// A client DISCONNECT with a non-zero reason code, named as EMQX names it.
+    ClientReason,
 }
 
 impl CloseReason {
-    const ALL: [Self; 5] = [
+    const ALL: [Self; 6] = [
         Self::TcpClosed,
         Self::Normal,
         Self::ServerClosed,
         Self::KeepaliveTimeout,
         Self::Shutdown,
+        Self::ClientReason,
     ];
 
     fn as_str(self) -> &'static str {
@@ -331,7 +334,56 @@ impl CloseReason {
             Self::ServerClosed => "server_closed",
             Self::KeepaliveTimeout => "keepalive_timeout",
             Self::Shutdown => "shutdown",
+            // Named from the code by `disconnect_reason_name`.
+            Self::ClientReason => "unknown_error",
         }
+    }
+}
+
+/// The `reason` EMQX reports for a client DISCONNECT: `normal` for `0x00` and otherwise
+/// the reason code's name (`emqx_channel:disconnect_reason/1` →
+/// `emqx_reason_codes:name/1`, emqx/emqx release-60). Codes a client may not send are
+/// named all the same, as EMQX names them.
+fn disconnect_reason_name(code: u8) -> &'static str {
+    match code {
+        0x00 => "normal",
+        0x04 => "disconnect_with_will_message",
+        0x80 => "unspecified_error",
+        0x81 => "malformed_packet",
+        0x82 => "protocol_error",
+        0x83 => "implementation_specific_error",
+        0x84 => "unsupported_protocol_version",
+        0x85 => "client_identifier_not_valid",
+        0x86 => "bad_username_or_password",
+        0x87 => "not_authorized",
+        0x88 => "server_unavailable",
+        0x89 => "server_busy",
+        0x8A => "banned",
+        0x8B => "server_shutting_down",
+        0x8C => "bad_authentication_method",
+        0x8D => "keepalive_timeout",
+        0x8E => "session_taken_over",
+        0x8F => "topic_filter_invalid",
+        0x90 => "topic_name_invalid",
+        0x91 => "packet_identifier_inuse",
+        0x92 => "packet_identifier_not_found",
+        0x93 => "receive_maximum_exceeded",
+        0x94 => "topic_alias_invalid",
+        0x95 => "packet_too_large",
+        0x96 => "message_rate_too_high",
+        0x97 => "quota_exceeded",
+        0x98 => "administrative_action",
+        0x99 => "payload_format_invalid",
+        0x9A => "retain_not_supported",
+        0x9B => "qos_not_supported",
+        0x9C => "use_another_server",
+        0x9D => "server_moved",
+        0x9E => "shared_subscriptions_not_supported",
+        0x9F => "connection_rate_exceeded",
+        0xA0 => "maximum_connect_time",
+        0xA1 => "subscription_identifiers_not_supported",
+        0xA2 => "wildcard_subscriptions_not_supported",
+        _ => "unknown_error",
     }
 }
 
@@ -342,6 +394,9 @@ impl CloseReason {
 struct RuleConn {
     publisher: crate::rules::Publisher,
     close_reason: std::sync::atomic::AtomicU8,
+    /// The reason code of the client's DISCONNECT, read when `close_reason` is
+    /// [`CloseReason::ClientReason`].
+    client_code: std::sync::atomic::AtomicU8,
     /// This connection's view of the rules; `None` when rules are not wired (tests).
     rules: Option<crate::rules::ConnRules>,
 }
@@ -353,11 +408,16 @@ impl RuleConn {
 
     fn close_reason(&self) -> &'static str {
         let i = usize::from(self.close_reason.load(Ordering::Relaxed));
-        CloseReason::ALL
+        match CloseReason::ALL
             .get(i)
             .copied()
             .unwrap_or(CloseReason::TcpClosed)
-            .as_str()
+        {
+            CloseReason::ClientReason => {
+                disconnect_reason_name(self.client_code.load(Ordering::Relaxed))
+            }
+            other => other.as_str(),
+        }
     }
 
     /// Record why a packet ended the session and return `serve`'s graceful flag: only a
@@ -368,8 +428,9 @@ impl RuleConn {
                 self.closing(CloseReason::Normal);
                 true
             }
-            PacketOutcome::ClientDisconnectWithWill => {
-                self.closing(CloseReason::Normal);
+            PacketOutcome::ClientDisconnectWithWill(code) => {
+                self.client_code.store(code, Ordering::Relaxed);
+                self.closing(CloseReason::ClientReason);
                 false
             }
             PacketOutcome::BrokerClose | PacketOutcome::Continue => {
@@ -823,6 +884,7 @@ where
             peer: if relocated { None } else { peer },
         },
         close_reason: std::sync::atomic::AtomicU8::new(CloseReason::TcpClosed as u8),
+        client_code: std::sync::atomic::AtomicU8::new(0),
         rules: policy
             .rules
             .as_ref()
@@ -2840,7 +2902,7 @@ enum PacketOutcome {
     /// [`ClientDisconnect`](Self::ClientDisconnect)'s, but the detach is
     /// un-graceful so the Will fires. Unreachable on v3.1.1, whose DISCONNECT
     /// has no reason byte and always decodes as `0`.
-    ClientDisconnectWithWill,
+    ClientDisconnectWithWill(u8),
     /// The BROKER is closing: a protocol violation, a refusal this protocol version
     /// cannot say any other way, or a hub that went away. Un-graceful — the Will
     /// fires, exactly as for an EOF or a keepalive expiry.
@@ -3162,7 +3224,7 @@ async fn handle_inbound<W: AsyncWrite + Unpin>(
             return Ok(if d.reason == 0 {
                 PacketOutcome::ClientDisconnect
             } else {
-                PacketOutcome::ClientDisconnectWithWill
+                PacketOutcome::ClientDisconnectWithWill(d.reason)
             });
         }
         other => debug!(packet = ?other.packet_type(), "ignoring unexpected packet"),

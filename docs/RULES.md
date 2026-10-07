@@ -223,7 +223,7 @@ Both EMQX spellings work, for example `$events/client/connected` and
 | Event | Fields beyond `clientid`, `username`, `timestamp`, `node`, `event` |
 |---|---|
 | `$events/client/connected` | `peername`, `proto_name`, `proto_ver`, `keepalive`, `clean_start`, `expiry_interval`, `is_bridge` (always false), `connected_at`, `conn_props` |
-| `$events/client/disconnected` | `peername`, `reason`, `connected_at`, `disconnected_at`, `disconn_props`. `reason` is `normal` (a client DISCONNECT), `keepalive_timeout`, `tcp_closed` (the socket closed or failed), `server_closed` (the broker ended it: a takeover, an eviction, a protocol violation) or `shutdown` (graceful drain). |
+| `$events/client/disconnected` | `peername`, `reason`, `connected_at`, `disconnected_at`, `disconn_props`. `reason` is `normal` (a client DISCONNECT with reason `0x00`), EMQX's name for any other reason code a v5 client's DISCONNECT carries (`disconnect_with_will_message` for `0x04`, `unspecified_error`, `protocol_error`, …), `keepalive_timeout`, `tcp_closed` (the socket closed or failed), `server_closed` (the broker ended it: a takeover, an eviction, a protocol violation) or `shutdown` (graceful drain). |
 | `$events/session/subscribed` | `peerhost`, `topic`, `qos`, `sub_props`. One event per filter the SUBACK granted. |
 | `$events/session/unsubscribed` | `peerhost`, `topic`, `unsub_props`. One event per filter actually removed. |
 
