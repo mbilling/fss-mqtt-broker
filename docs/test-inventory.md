@@ -1098,7 +1098,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 554 test(s)
+## `crates/mqttd/src/lib.rs` — 557 test(s)
 
 - `admin::cli::tests::all_nodes_asks_for_the_cluster_scope_on_the_verbs_that_have_one`
 - `admin::cli::tests::answers_render_as_tables_and_lines`
@@ -1305,6 +1305,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::forwarding::zone_fwd_proofs::releasing_the_ack_hold_does_not_shrink_the_settle_work_set`
 - `hub::forwarding::zone_fwd_proofs::the_ack_hold_clear_is_one_way_and_narrow`
 - `hub::forwarding::zone_fwd_proofs::the_answer_is_at_most_once`
+- `hub::forwarding::zone_fwd_proofs::the_drain_barrier_reports_the_unanswered_publishes_the_bound_evicted`
 - `hub::forwarding::zone_fwd_proofs::the_early_return_does_not_change_who_receives_a_publish`
 - `hub::forwarding::zone_fwd_proofs::the_early_return_never_swallows_a_retained_broadcast`
 - `hub::forwarding::zone_fwd_proofs::the_interest_buffer_is_reused_across_publishes`
@@ -1375,8 +1376,10 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::a_missed_retained_fan_out_is_healed_by_periodic_anti_entropy`
 - `hub::tests::a_moved_lease_owner_nacks_a_routed_commit`
 - `hub::tests::a_nacked_handoff_re_routes_once_placement_catches_up`
+- `hub::tests::a_node_draining_in_a_brownout_still_sends_its_shutdown_events_live`
 - `hub::tests::a_panicking_truncate_flush_does_not_strand_its_session`
 - `hub::tests::a_parked_qos2_truncate_does_not_stall_unrelated_sessions`
+- `hub::tests::a_peer_refusing_a_forward_the_drain_gated_gets_it_again_as_a_plain_forward`
 - `hub::tests::a_peer_refusing_a_stored_derived_message_does_not_withhold_the_original`
 - `hub::tests::a_peer_that_missed_the_last_fanout_converges_from_a_restarted_owners_snapshot`
 - `hub::tests::a_peers_refusal_refuses_the_publisher_instead_of_dropping_the_gate`
