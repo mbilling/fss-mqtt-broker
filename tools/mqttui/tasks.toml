@@ -888,6 +888,15 @@ requires = ["helm"]
 duration = "~5s"
 
 [[task]]
+id = "k8s-operator-rbac-parity"
+group = "Kubernetes"
+name = "Check the operator's RBAC matches between the chart and the dev manifest"
+script = "scripts/k8s/operator-rbac-parity.sh"
+about = "Compares the operator Role's rules in the Helm chart and in deploy/operator/operator.yaml; a rule in one and not the other fails. Pure text, no cluster. Invoked by CI."
+requires = ["bash", "awk"]
+hidden = true
+
+[[task]]
 id = "k8s-render-parity"
 group = "Kubernetes"
 name = "Diff the operator's rendering against the Helm chart"
