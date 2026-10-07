@@ -50,6 +50,7 @@ fn bench_peer_codec(c: &mut Criterion) {
         req_id: 42,
         epoch: 7,
         op: append(1, 256),
+        queued: mqtt_cluster::peer::Queued::default(),
     };
     let mut encoded = Vec::new();
     encode(&frame, &mut encoded).unwrap();

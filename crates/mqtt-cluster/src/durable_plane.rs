@@ -532,7 +532,9 @@ impl DurablePlane {
             // Replication append → hand to the replica-writer, which group-commits a burst
             // of ops into one fsync'd transaction and answers with accept/fence (ADR 0027).
             // A `true` ack still means the op is durably on disk (the batch committed).
-            PeerMessage::Replicate { req_id, epoch, op } => {
+            PeerMessage::Replicate {
+                req_id, epoch, op, ..
+            } => {
                 let (reply_tx, reply_rx) = oneshot::channel();
                 // If the writer is gone (shutdown) or never answers, the op is not durable
                 // → do not ack acceptance.
@@ -552,10 +554,16 @@ impl DurablePlane {
                     wait_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
                     "replicate op served"
                 );
-                Some(PeerMessage::ReplicateAck { req_id, accepted })
+                Some(PeerMessage::ReplicateAck {
+                    req_id,
+                    accepted,
+                    queued: crate::peer::Queued::sampled(),
+                })
             }
             // Replication ack → wake the waiting append.
-            PeerMessage::ReplicateAck { req_id, accepted } => {
+            PeerMessage::ReplicateAck {
+                req_id, accepted, ..
+            } => {
                 tracing::debug!(req_id, accepted, "replication ack received");
                 self.transport.complete_ack(req_id, accepted);
                 None
@@ -1304,6 +1312,7 @@ mod tests {
                         seq: 1,
                         record: vec![i],
                     },
+                    queued: crate::peer::Queued::default(),
                 };
                 match plane.handle(frame).await {
                     Some(PeerMessage::ReplicateAck { accepted, .. }) => accepted,
@@ -1374,6 +1383,7 @@ mod tests {
                         seq: 1,
                         record: vec![i],
                     },
+                    queued: crate::peer::Queued::default(),
                 };
                 match plane.handle(frame).await {
                     Some(PeerMessage::ReplicateAck { accepted, .. }) => accepted,

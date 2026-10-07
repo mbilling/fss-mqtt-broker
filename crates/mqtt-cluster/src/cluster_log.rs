@@ -150,7 +150,11 @@ impl WriteReply {
                     received.elapsed(),
                 );
                 if let Some(lane) = lane.upgrade() {
-                    let _ = lane.send(crate::peer::PeerMessage::ReplicateAck { req_id, accepted });
+                    let _ = lane.send(crate::peer::PeerMessage::ReplicateAck {
+                        req_id,
+                        accepted,
+                        queued: crate::peer::Queued::sampled(),
+                    });
                 }
             }
         }
