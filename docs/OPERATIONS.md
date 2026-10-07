@@ -1161,6 +1161,9 @@ operating summary. The engine is unreleased: no release has it yet.
   The third catches what the first two cannot: a durable copy a brownout refuses to a
   message derived from an event or a Will, whose action still counts `ok` (it was
   routed). It counts every brownout-dropped copy, a Will's included, not only a rule's.
+  A brownout during a rolling restart also means the restarting node does not wait for
+  its `shutdown` presence messages to reach other nodes (see Shutdown below), so this
+  alert firing then is a reason to check that they arrived.
 
   These series are on `/metrics`, which is served only on `listeners.health_bind`
   (`MQTTD_HEALTH_BIND`) or `listeners.metrics_bind` (`MQTTD_METRICS_BIND`).
@@ -1193,7 +1196,8 @@ operating summary. The engine is unreleased: no release has it yet.
   are routed, and stored where they are owed (a persistent session's queue), before the
   broker exits; what they owe another node is forwarded acked and answered (a node that
   is itself in a brownout refuses such a forward, and is sent it again unacked, which it
-  delivers live). The drain ends with a hub barrier that waits for every durable append
+  delivers live; a shared group whose every member refuses gets it unacked at the first
+  member tried). The drain ends with a hub barrier that waits for every durable append
   in flight and every publish still awaiting an answer, within `shutdown_grace_secs`; a
   second signal cuts it short. It does not wait for:
   - forwards from a node draining in a brownout, which leaves them ungated (a brownout

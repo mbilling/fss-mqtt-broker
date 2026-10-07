@@ -628,7 +628,8 @@ persistent session's offline queue, durably where durability applies), before th
 exits. While it drains, what they derive for a subscriber or session on another node is
 forwarded acked, and the drain waits for that node's answer too. A node that is itself
 in a brownout refuses such a forward when it owes a durable copy there; the draining
-node then sends it again unacked, and that node delivers it live. That wait is part of
+node then sends it again unacked, and that node delivers it live. A shared group whose
+every member refuses it this way gets it unacked at the first member tried. That wait is part of
 the drain, bounded by `shutdown_grace_secs`; a second signal ends it. The drain does not
 wait for:
 
@@ -638,7 +639,8 @@ wait for:
   refused durable copy counted as a drop.
 - **more than the table of publishes awaiting acknowledgement holds** (65,536 messages or
   64 MiB, client publishes included). Past that the oldest are evicted and no longer
-  waited for, and the drain logs how many with a WARN. A node draining tens of thousands
+  waited for, and the drain logs how many of these messages it lost that way with a
+  WARN (an evicted client publish is not lost: its publisher retries it). A node draining tens of thousands
   of connections under a presence rule, or fewer under a `FOREACH`, can reach it.
 - **a peer link that is down for the whole drain.** A draining node does not redial, so
   what it owes there is lost at the grace deadline, with a WARN.

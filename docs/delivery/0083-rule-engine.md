@@ -73,6 +73,11 @@ tasks:
     status: done
     date: 2026-10-07
     evidence: "The reviewer's re-review of df948fc: gating during the drain made these messages answerable, and a brownout refuses an answerable publish that owes a durable copy before any live send or forward, so a node draining in a brownout sent its shutdown presence messages to nobody where the ungated path still sent them live. Now the hub gates them only when draining and not in a brownout; in a brownout they go out ungated as at any other time (live everywhere, a refused durable copy a counted drop, their forwards not waited for). The same refusal on the receiving side: a peer in a brownout refuses an acked forward owing a durable copy there, effect-free; for a publish the hub gated itself during the drain, nobody would retry it, so the draining node sends it again to that peer as a plain forward, which the peer delivers live. The pending-publish bound: an unanswered publish evicted during the drain is no longer waited for; the Drained barrier now answers with how many, and the drain logs them in a WARN. Tests: hub::tests::a_node_draining_in_a_brownout_still_sends_its_shutdown_events_live (a live subscriber and the peer get it, a persistent session is owed a refused copy; mutation-checked: gating in a brownout fails it); hub::tests::a_peer_refusing_a_forward_the_drain_gated_gets_it_again_as_a_plain_forward (mutation-checked: refusing it as a client's publish fails it); hub::forwarding::zone_fwd_proofs::the_drain_barrier_reports_the_unanswered_publishes_the_bound_evicted (an eviction before the drain and an answered one are not counted; mutation-checked). RULES.md, OPERATIONS and the ADR list what the drain does not wait for. Also from the review: RULES.md's build section names v1.1.0 and says a build of main reports the last release's version, and INTEGRATION's header names main after v1.1.0. CodeQL flagged two panic messages in the timestamp test that formatted a value read through PublishInput::field (it can return a username); the test's messages are now fixed text. cargo test -p mqtt-rules -p mqtt-config -p mqtt-observability -p mqttd: 64 binaries, 1125 passed, 0 failed (14 ignored, pre-existing); fmt and clippy -D warnings clean."
+  - id: 0083-T15
+    title: "Review round 7 (PR #871): a shared group refusing a drain-gated message still gets it, and the drain counts only its own losses"
+    status: done
+    date: 2026-10-07
+    evidence: "The reviewer's re-review of a3d5769: the plain re-send covered ordinary forwards only. A drain-gated message bound for a $share group whose every member refused it (their nodes in a brownout) ended in refuse_pending, so the group got nothing where an ungated delivery would have reached the chosen member live. Now an exhausted re-selection for a drain-gated publish delivers it unanswered to the first member tried that is still in the group: a plain SharedDeliver to a peer member, an ungated delivery to a local one. And the drain's eviction count counted every unanswered entry evicted while draining, client publishes included (withheld, so their publishers retry); it now counts only the publishes the hub gated during the drain, which nobody retries, so the number means what the WARN says. Tests: hub::tests::a_shared_group_refusing_every_drain_gated_delivery_still_gets_it_plainly (mutation-checked: without the fallback it fails); hub::forwarding::zone_fwd_proofs::the_drain_barrier_reports_the_drain_gated_publishes_the_bound_evicted (an answered entry and a client's are not counted; mutation-checked: counting every eviction while draining fails it). Also: the plain re-sends are not counted in mqttd_publish_forwarded_total a second time, and OPERATIONS says the brownout-drop alert firing during a rolling restart is also a sign the restarting node did not wait for its cross-node shutdown messages. TOTALS"
 ---
 
 # Delivery 0083 — the rule engine
@@ -100,6 +105,7 @@ above; the table below is generated from it.
 | **0083-T12** Review round 4 | Nothing a rule derives from an event or a Will can crowd a client publish out of the pending-publish table, and a graceful shutdown still stores it. |
 | **0083-T13** Review round 5 | What a draining node's disconnects derive for another node is answered by it before the node exits. |
 | **0083-T14** Review round 6 | A drain never sends what it derives to fewer subscribers than an ungated publish would, and says what it did not wait for. |
+| **0083-T15** Review round 7 | A shared group gets a drain-time message even when every member refuses its acked form, and the drain's loss count counts only what nobody retries. |
 
 ## Progress
 
@@ -147,3 +153,6 @@ above; the table below is generated from it.
 - **2026-10-07** — Review round 6 (0083-T14): a node draining in a brownout leaves what it
   derives ungated, a peer's brownout refusal of a drain-time forward is answered with a
   plain forward, and the drain reports what the pending-publish bound evicted.
+- **2026-10-07** — Review round 7 (0083-T15): a shared group whose every member refuses a
+  drain-time message gets it unacked at the first member tried, and the drain's eviction
+  count counts only the messages it gated itself.

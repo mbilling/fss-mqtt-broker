@@ -880,6 +880,23 @@ impl Hub {
                     publish = id, group = %key.0,
                     "shared re-selection exhausted; answering the publisher"
                 );
+                // Gated by the hub itself during the drain (ADR 0083), with nobody to
+                // retry it: every member refused it before any side effect, so the
+                // first one tried still gets it as a plain delivery — what the group
+                // would have received had the drain not gated it.
+                if matches!(last, DurableOutcome::Refused(_)) && self.drain_gated.contains(&id) {
+                    self.deliver_shared_plain(
+                        &key,
+                        &tried,
+                        &topic,
+                        &payload,
+                        qos,
+                        message_expiry,
+                        &app,
+                    );
+                    self.try_complete_pending(id);
+                    return;
+                }
                 match last {
                     DurableOutcome::Refused(r) => self.refuse_pending(id, r),
                     _ => self.drop_pending(id),
@@ -940,6 +957,63 @@ impl Hub {
                 self.try_complete_pending(id);
             }
             return;
+        }
+    }
+
+    /// Deliver to the first of `tried` still in group `key`, unanswered: a peer member
+    /// gets a plain `SharedDeliver`, a local one an ungated delivery (live, a refused
+    /// durable copy a counted drop). Not counted in `publish_forwarded` again: the
+    /// message was counted when it was first delivered to the group.
+    #[allow(clippy::too_many_arguments)]
+    fn deliver_shared_plain(
+        &mut self,
+        key: &SharedKey,
+        tried: &[(Option<NodeId>, ClientId)],
+        topic: &str,
+        payload: &Bytes,
+        qos: QoS,
+        message_expiry: Option<u32>,
+        app: &AppProperties,
+    ) {
+        let members = self
+            .shared_candidates(topic)
+            .into_iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, cs)| cs)
+            .unwrap_or_default();
+        let Some(member) = tried.iter().find_map(|(node, client)| {
+            members
+                .iter()
+                .find(|c| c.node == *node && c.client == *client)
+        }) else {
+            return;
+        };
+        let delivered_qos = min_qos(qos, member.qos);
+        match &member.node {
+            Some(node) => {
+                if let Some(peer) = self.peers.get(node) {
+                    let _ = peer.tx.send(PeerMessage::SharedDeliver {
+                        client: member.client.0.to_string(),
+                        topic: topic.to_string(),
+                        payload: payload.to_vec(),
+                        qos: delivered_qos as u8,
+                        message_expiry,
+                        app: app_to_wire(app),
+                    });
+                }
+            }
+            None => {
+                let _ = self.deliver_to_client(
+                    &member.client,
+                    topic,
+                    payload,
+                    delivered_qos,
+                    message_expiry,
+                    app,
+                    false,
+                    &AppendGate::None,
+                );
+            }
         }
     }
 

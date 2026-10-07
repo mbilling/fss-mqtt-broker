@@ -18832,6 +18832,46 @@ mod tests {
         }))
     }
 
+    /// ADR 0083: a drain-gated message bound for a `$share` group whose every member
+    /// refuses it (their nodes in a brownout) is not lost there: the first member tried
+    /// gets it as a plain `SharedDeliver`, as it would have had the drain not gated it.
+    #[tokio::test]
+    async fn a_shared_group_refusing_every_drain_gated_delivery_still_gets_it_plainly() {
+        let tx = start_hub();
+        let mut peer = connect_peer_at_proto(&tx, "n2", 1, 7);
+        remote_shared_interest_qos(&tx, "n2", "g", "presence/#", &[("m1", QoS::AtLeastOnce)]);
+        tx.send(HubCommand::Draining).unwrap();
+        tx.send(presence_message("presence/c")).unwrap();
+        let seq = match next_forward_answer(&mut peer).await {
+            PeerMessage::SharedDeliverAcked { seq, client, .. } => {
+                assert_eq!(client, "m1");
+                seq
+            }
+            other => panic!("expected an acked shared delivery, got {other:?}"),
+        };
+        tx.send(ordered(HubCommand::RemotePublishVerdict {
+            node: NodeId("n2".into()),
+            seq,
+            verdict: ForwardVerdict::Refused {
+                code: PublishRefusal::Brownout.wire_code(),
+            },
+        }))
+        .unwrap();
+        match next_forward_answer(&mut peer).await {
+            PeerMessage::SharedDeliver { client, topic, .. } => {
+                assert_eq!((client.as_str(), topic.as_str()), ("m1", "presence/c"));
+            }
+            other => panic!("expected a plain shared delivery, got {other:?}"),
+        }
+        assert_eq!(
+            timeout(Duration::from_secs(2), drained(&tx))
+                .await
+                .expect("the refusal settled the delivery")
+                .unwrap(),
+            0
+        );
+    }
+
     /// A drain barrier, sent now; resolves to its answer.
     fn drained(tx: &HubTx) -> oneshot::Receiver<u64> {
         let (reply, rx) = oneshot::channel();

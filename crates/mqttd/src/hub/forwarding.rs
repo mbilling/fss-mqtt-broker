@@ -827,14 +827,12 @@ impl Hub {
         self.observe_fanout(fanout_started, peer_visits);
     }
 
-    /// Send pending publish `id` to `node` as a plain, unanswered forward.
+    /// Send pending publish `id` to `node` as a plain, unanswered forward. Not counted
+    /// in `publish_forwarded` again: it is the same message to the same node.
     fn reforward_plain(&self, id: u64, node: &NodeId) {
         let (Some(p), Some(peer)) = (self.pending_publishes.get(id), self.peers.get(node)) else {
             return;
         };
-        if let Some(m) = &self.metrics {
-            m.publish_forwarded("subscriber-remote");
-        }
         let _ = peer.tx.send(PeerMessage::Publish {
             topic: p.topic.clone(),
             payload: p.payload.to_vec(),
@@ -1003,8 +1001,10 @@ impl Hub {
             if let Some(m) = &self.metrics {
                 m.publish_dropped("pending-cap");
             }
-            // The drain barrier no longer waits for it; the drain reports how many.
-            if self.draining {
+            // A message the hub gated during the drain has nobody to retry it, and the
+            // drain barrier no longer waits for it: the drain reports how many. (A
+            // client's evicted publish is withheld, and its publisher retries.)
+            if self.drain_gated.contains(&old_id) {
                 self.drain_evicted += 1;
             }
         }
@@ -2558,27 +2558,30 @@ mod zone_fwd_proofs {
     }
 
     /// ADR 0083: the drain barrier cannot wait for a publish the pending bound has
-    /// evicted, so it says how many it lost that way. An unanswered publish evicted
-    /// while draining is counted in the barrier's answer; one evicted before the
-    /// drain, or an answered one, is not (neither ever held the barrier).
+    /// evicted, so it says how many of the messages the hub gated during the drain it
+    /// lost that way — nobody retries those. A client's publish evicted while draining is
+    /// not counted (its ack is withheld and its publisher retries), nor is an answered
+    /// entry (it never held the barrier).
     #[test]
-    fn the_drain_barrier_reports_the_unanswered_publishes_the_bound_evicted() {
+    fn the_drain_barrier_reports_the_drain_gated_publishes_the_bound_evicted() {
         let mut h = hub();
-        let _ = register(&mut h, "t/0");
-        let (answered, _answered_rx) = register(&mut h, "t/1");
+        h.draining = true;
+        let (answered, _answered_rx) = register(&mut h, "t/0");
         assert!(h
             .pending_publishes
             .get_mut(answered)
             .unwrap()
             .answer(PublishOutcome::Accepted));
-        for i in 2..PENDING_PUBLISH_CAP {
+        let _client = register(&mut h, "t/1");
+        let (gated, _gated_rx) = register(&mut h, "t/2");
+        h.drain_gated.insert(gated);
+        for i in 3..PENDING_PUBLISH_CAP {
             let _ = register(&mut h, &format!("t/{i}"));
         }
-        let _ = register(&mut h, "t/before-the-drain"); // evicts t/0, unanswered
-        h.draining = true;
-        let _ = register(&mut h, "t/over-1"); // evicts t/1, answered
+        let _ = register(&mut h, "t/over-1"); // evicts t/0, answered
+        let _ = register(&mut h, "t/over-2"); // evicts t/1, a client's
         assert_eq!(h.drain_evicted, 0);
-        let _ = register(&mut h, "t/over-2"); // evicts t/2, unanswered
+        let _ = register(&mut h, "t/over-3"); // evicts t/2, drain-gated
         assert_eq!(h.drain_evicted, 1);
 
         while h.pending_publishes.pop_first().is_some() {}
