@@ -3157,6 +3157,28 @@ print(m.rung_verdict(r))
 PY
 }
 
+# lane_e_fails_after <fails> <verdict>: the ladder's count of consecutive
+# failing rungs once a rung with this verdict is added. GREEN and YELLOW reset
+# it; RED, FAILED and NOT CARRIED count. A NOT CARRIED rung whose ONLY flags
+# are INVALID EVIDENCE says nothing about the knee either way — its
+# measurement is unusable, not failed — so it neither counts nor resets. On
+# 2026-09-26 two such rungs at 39k/node (QoS 1, 10 nodes; every broker
+# received the full offer) stopped a ladder that had not reached its knee.
+lane_e_fails_after() {
+	local fails="$1" verdict="$2" flags flag neutral=yes
+	local -a flag_list
+	flags="${verdict#NOT CARRIED: }"
+	[ "$flags" = "$verdict" ] && neutral=no
+	IFS=';' read -r -a flag_list <<<"$flags"
+	for flag in ${flag_list[@]+"${flag_list[@]}"}; do
+		flag="${flag# }"
+		case "$flag" in "INVALID EVIDENCE"*) ;; *) neutral=no ;; esac
+	done
+	if [[ "$verdict" == GREEN* || "$verdict" == YELLOW* ]]; then echo 0
+	elif [ "$neutral" = yes ]; then echo "$fails"
+	else echo $((fails + 1)); fi
+}
+
 # lane_e_rung_checked: lane_e_rung, then the same judgement on the rung's own
 # CPU samples. A rung that loaded a pinned driver is moved aside (voided-*,
 # outside every sites-* glob, with the reason) and, when drivers can be
@@ -3207,8 +3229,8 @@ lane_e_forward_canary
 lane_e_driver_gate
 lane_e_calibrate
 declare -a e_seen=()
-# Set before the loop: a neutral (INVALID EVIDENCE only) first rung neither
-# counts nor resets, and the stop check below reads it under `set -u`.
+# Set before the loop: a neutral (INVALID EVIDENCE only) first rung carries
+# the count forward unchanged, and under `set -u` an unset one aborts the run.
 e_fails=0
 for e_sites in "${LANE_E_SITES[@]}"; do
 	e_rep=1
@@ -3238,22 +3260,7 @@ for e_sites in "${LANE_E_SITES[@]}"; do
 		[ "$e_rep" -gt 1 ] && e_rdir="$e_rdir-rep$e_rep"
 		e_verdict=$(lane_e_rung_verdict "$e_rdir")
 		echo "$(basename "$e_rdir") $e_verdict" >>"$OUT/laneE/ladder-verdicts.txt"
-		# A NOT CARRIED rung whose ONLY flags are INVALID EVIDENCE says nothing about
-		# the knee either way — its measurement is unusable, not failed — so it
-		# neither counts toward the stop nor resets the count. On 2026-09-26 two such
-		# rungs at 39k/node (QoS 1, 10 nodes; every broker received the full offer)
-		# stopped a ladder that had not reached its knee.
-		e_flags="${e_verdict#NOT CARRIED: }"
-		e_neutral=yes
-		[ "$e_flags" = "$e_verdict" ] && e_neutral=no
-		IFS=';' read -r -a e_flag_list <<<"$e_flags"
-		for e_flag in "${e_flag_list[@]}"; do
-			e_flag="${e_flag# }"
-			case "$e_flag" in "INVALID EVIDENCE"*) ;; *) e_neutral=no ;; esac
-		done
-		if [[ "$e_verdict" == GREEN* || "$e_verdict" == YELLOW* ]]; then e_fails=0
-		elif [ "$e_neutral" = yes ]; then :
-		else e_fails=$((e_fails + 1)); fi
+		e_fails=$(lane_e_fails_after "$e_fails" "$e_verdict")
 		if [ "$e_fails" -ge "$LANE_E_STOP_AFTER_FAILS" ] && [ "${#e_seen[@]}" -lt "${#LANE_E_SITES[@]}" ]; then
 			# Name every rung the ladder would still have run, exactly as the
 			# gate derives them from shape.txt (repeats counted in order).
