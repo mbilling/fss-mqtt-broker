@@ -743,7 +743,7 @@ Tracked on the [delivery dashboard](docs/delivery/STATUS.md).
 ```sh
 cargo build && cargo test && cargo clippy --all-targets && cargo deny check
 ./scripts/interop/run.sh     # foreign-client conformance
-mqttui --list                # There are 119 runnable scripts here: demos, smokes, migrations, benches
+mqttui --list                # There are 120 runnable scripts here: demos, smokes, migrations, benches
 ```
 
 ---
