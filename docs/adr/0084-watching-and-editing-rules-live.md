@@ -66,11 +66,12 @@ facts about the code as it stands make `$SYS` unsafe to start publishing on:
 
 ## Decision
 
-### D1. `$SYS/` is reserved for the broker, always
+### D1. `$SYS/` is reserved for the broker
 
-`$SYS`, and every topic under `$SYS/`, belongs to the broker. One predicate,
-`mqtt_core::is_reserved_topic`, decides it everywhere, case-sensitively (`$sys/x` is an
-ordinary topic):
+`$SYS`, and every topic under `$SYS/`, belongs to the broker, with one exception:
+`$SYS/broker/connection/<id>/state`, where a Mosquitto bridge reports its connection
+state. One predicate, `mqtt_core::is_reserved_topic`, decides it everywhere,
+case-sensitively (`$sys/x` is an ordinary topic):
 
 - **A client publish** to a reserved topic is refused at the ACL step, whatever the ACL
   says, through the ACL's own refusal: MQTT 5 `0x87` on the PUBACK or PUBREC, MQTT 3.1.1
@@ -78,17 +79,32 @@ ordinary topic):
   alias is resolved first, so an alias cannot get around it.
 - **A Will** on a reserved topic refuses the CONNECT (`0x87`, `acl.deny.will`).
 - **A rule's republish** that renders a reserved topic fails that action. The rules loader
-  warns when a republish template's literal prefix is reserved, and when a `FROM` selects
-  `$SYS`: such a rule never fires, because clients cannot publish there and the broker's
-  own `$SYS` messages never run rules.
+  warns when every topic a republish template can render is reserved, and when a `FROM`
+  can match only reserved topics: such a rule never fires, because clients cannot publish
+  there and the broker's own `$SYS` messages never run rules.
 - **The hub** routes a reserved topic only from one command,
   `HubCommand::SysPublish` (QoS 0, never retained, no publisher). Every other path —
-  client and derived publishes, Wills, a retained restore, a peer's forward that would be
-  retained or that names this node — drops it and counts it. At boot, retained messages
-  under `$SYS/` are purged.
+  client and derived publishes, Wills, a retained restore (skipped and answered as done),
+  a peer's forward that would be retained, is QoS 1 or 2, or names this node — drops it
+  and counts it. Retained values under `$SYS/` are cleared by their owner during the first
+  minute after boot, and subscribe-time replay never delivers one.
+- **The broker's own `$SYS` messages are live-only.** They are never queued for an
+  offline session or an offline shared member, on the node that publishes them or on a
+  node a peer forwards them to. Each carries a Message Expiry Interval (the statistics
+  max(2 × `sys_interval_secs`, 10) s, the trace 10 s), so a copy that is queued anyway,
+  by an older node during a rolling upgrade, expires. A persistent subscriber that
+  reconnects gets the next tick, not a backlog.
 - **The authorization dry run** (`GET /admin/v1/authz`) answers a publish to a reserved
   topic `allowed: false`, with the reason `reserved: $SYS/ is the broker's (ADR 0084)`,
   so it never gives a verdict the broker would not.
+
+**The exception.** A Mosquitto bridge with `notifications` on, its default, connects with
+a retained Will on `$SYS/broker/connection/<remote_clientid>/state` and then publishes `1`
+there. Mosquitto allows clients exactly this pattern. Reserving it would refuse the
+bridge's whole CONNECT, so mqttd leaves it to the ACL like any other topic, and a retained
+value there is kept and replayed. It is outside mqttd's own `$SYS/brokers/`, so nothing
+the broker publishes can be forged through it. Every other topic under `$SYS/` is
+reserved, whatever the ACL says.
 
 Subscribing to `$SYS/…` stays a matter for the ACL. A leading wildcard never matches a
 `$`-topic (MQTT-4.7.2-1), so `#` does not include it, and a grant must name it.
@@ -97,18 +113,24 @@ Subscribing to `$SYS/…` stays a matter for the ACL. A leading wildcard never m
 
 A subscribe deny applies to `$share/<group>/<filter>` when it overlaps the whole string
 **or** `<filter>`. A deny on `$SYS/#` therefore refuses `$share/g/$SYS/#`, and a deny on
-`a/#` refuses `$share/g/a/b`. Allow rules are unchanged: a shared subscription still
-needs a grant that covers its `$share/…` form, so nothing is loosened. The authorization
-dry run explains the decision the same way.
+`a/#` refuses `$share/g/a/b`. A shared subscription still needs an allow that covers its
+`$share/…` form, so nothing is loosened, and one allow is tightened: when `<filter>` is
+`$`-rooted, the allow must be a `$share/<g>/<f>` pattern whose own `<f>` covers it, just
+as `#` never covers `$SYS/x`. `$share/+/#` and `$share/#` therefore no longer grant
+`$share/g/$SYS/…`; `$share/+/$SYS/brokers/+/rules/#` does. The authorization dry run
+explains the decision the same way.
 
 ### D3. A rules file has a regex compile budget
 
 Identical regex literals in one rules file are compiled once and shared. A file may hold
 at most 96 distinct ones; the next is a load error at its position, before it is compiled.
-The number is measured: a distinct pattern at the per-pattern limit costs about 7.5 ms and
-1.05 MiB to compile, so 96 parse in about 0.7 s and 107 MiB, and the running rules plus one
-candidate stay under 256 MiB. The budget applies wherever a rules file is parsed: boot,
-reload, `mqttd --check-rules` and the admin API. The per-pattern limits stay.
+The number is measured: a distinct pattern at the per-pattern limit costs about 6-7.5 ms
+and 1.05 MiB to compile, so 96 parse in 0.6-1.1 s and 110-123 MiB on the broker's own
+build, and the running rules plus one candidate stay under 256 MiB. Which patterns reach
+the per-pattern limit depends on the build (the broker admits about `\w{20}`, mqtt-rules
+alone `\w{50}`); the cost at the limit does not. The budget applies wherever a rules
+file is parsed: boot, reload, `mqttd --check-rules` and the admin API. The per-pattern
+limits stay.
 
 ### D4. Opt-in per-rule statistics on `$SYS`
 
@@ -117,25 +139,40 @@ is off) each node publishes, every interval:
 
 - `$SYS/brokers/<node>/rules`: a summary: the rule and enabled counts, the running set's
   digest, the trace settings, how many trace records and statistics ticks were dropped,
-  and the last reload: when, its trigger, whether it applied, and the error's **kind**
-  (`config`, `rules`, `acl`, `tls`, …), never its text;
+  and the last reload: when, its trigger, whether it applied, the error's **kind**
+  (`config`, `rules`, `tls`, `admin tls`, `peer tls`, `client crl`, `gossip crl`,
+  `gossip signer`, or `policy` for the ACL, the authenticators and anything else), never
+  its text, and `repeats`: how many identical rejected attempts came right before it,
+  such as the file watcher retrying a broken file (0 for a success);
 - `$SYS/brokers/<node>/rules/<id>`, one per rule, enabled or not: its counts
   (`matched`, `passed`, `no_result`, `failed`, `actions_ok`, `actions_failed`), their rates
-  over the last interval, when `matched` last grew, a short hash of the rule's definition,
-  and the last error's time and kind.
+  over the last interval, when the statistics last saw the rule run, a short keyed hash of
+  the rule's definition, and the last error's time and kind.
 
 The counts are the Prometheus counters, read without creating a series, so they are
-cumulative since the broker started and keyed by rule id, as `/metrics` has them. Every
-message is JSON, QoS 0 and never retained, published through `SysPublish`. Each one takes
-node-pool ingress credit (ADR 0082); when the pool is short the whole tick is skipped and
-counted. `$SYS` never carries a rule's SQL, description or actions (a rules file can hold
-secrets, such as a pseudonym salt), a file path, the list of writers, or an error's text,
-with one exception under D5. Times are RFC 3339 UTC with milliseconds.
+cumulative since the broker started and keyed by rule id, as `/metrics` has them. The
+last time a rule ran (`last_active_at`) is the tick at which its `matched` grew against a
+baseline the statistics keep per id across reloads: a rule that ran only before the
+statistics were turned on, or that was deleted and added again, shows `null` until it
+runs again. The definition hash (`def`) is an HMAC-SHA256 under a key drawn at random
+when the process starts, cut to 16 hex digits: it changes when the rule does, and after
+a restart, and cannot be used to test guesses of the rule's text. Every message is JSON,
+QoS 0, never retained and live-only (D1), published through `SysPublish`. Each one takes
+node-pool ingress credit (ADR 0082), summary first; when the pool is short, the rest of
+that tick is skipped and counted once in `stats_dropped`, so a tick may publish only its
+summary. `$SYS` never carries a rule's SQL, description or actions (a rules file can hold
+secrets, such as a pseudonym salt), a file path, the list of writers, or an error's
+text, whether or not the trace is on. Times are RFC 3339 UTC with milliseconds.
 
-The interval is live: a reload that changes it applies at once, and only a committed
-reload changes it, never a candidate the reload rejects. With statistics or the trace on,
-`node.id` must be a single topic level (no `/`, `+`, `#` or NUL), or the configuration is
-refused.
+The running digest is the file's unsalted SHA-256, as `/metrics` (`mqttd_rules_info`) and
+`/statusz` publish it too. Whoever knows the rest of the file can test guesses of a secret
+in it, so a secret in a rules file, such as a pseudonym salt, must be high-entropy random
+(`openssl rand -hex 16`), never a name that can be guessed.
+
+The interval and the trace settings are live: a reload that changes them applies at once,
+and only a committed reload changes them, never a candidate the reload rejects. With
+statistics or the trace on, `node.id` must be a single topic level (no `/`, `+`, `#` or
+NUL), or the configuration is refused.
 
 ### D5. An opt-in rule trace, in a subtree of its own
 
@@ -147,21 +184,28 @@ rendered. The outputs are what the rule rendered; whether a derived message was 
 delivered is in the counters.
 
 - **Bounded.** At most `trace_rate` records per rule per second (`MQTTD_RULES_TRACE_RATE`,
-  default 20, 1 to 1,000), with `no_result` records on a window of their own, and at most
-  max(`trace_rate`, 200) per node per second. A record copies at most 1 KiB of each
-  payload (the original length is kept), at most 16 outputs, and at most 256 bytes of a
-  topic, client id or username. Records wait in a queue of 1,024 records and 4 MiB; each
-  publish takes node-pool credit. What does not fit is dropped and counted.
+  default 20, 1 to 1,000), with `no_result` records on a window of their own, twice that
+  in all, and at most max(`trace_rate`, 200) per node per second. A record copies at most
+  1 KiB of each payload (the original length is kept), at most 16 outputs, and at most 256
+  bytes of a topic, client id or username. A `console` output is the selected fields as
+  a JSON object, or past 1 KiB the first 1 KiB as text with `output_bytes` and
+  `truncated: true`. Records wait in a queue of 1,024 records and 4 MiB; each publish
+  takes node-pool credit. What does not fit is dropped and counted. Records still queued
+  when the trace is turned off are discarded, uncounted.
 - **Cheap when off.** One relaxed atomic load per evaluation.
 - **Loud when on.** Turning it on logs a WARN naming the topic it copies payloads onto, and
-  an `INSECURE:` line when there is no ACL file or the ACL's default is `allow`.
+  an `INSECURE:` line when there is no ACL file or the ACL's default is `allow`. The
+  `INSECURE:` line comes again only when that reason changes while the trace is on, not
+  at every reload.
 - **Not under the statistics.** `$SYS/brokers/+/rules/#` does not cover
   `…/trace/rules/…`, so a statistics grant never grants the trace. A subscribe grant on a
   rule's trace topic is a read grant on every message that rule's `FROM` matches, with the
   publishers' client ids and usernames, whatever the subscriber's own ACL says about those
   topics. It is written on purpose or not at all.
-- While the trace is on, `last_error` on `$SYS` also carries the error's text, truncated to
-  256 bytes: an evaluation error can quote a payload value, the trace's disclosure class.
+- **Error text only here.** An evaluation error can quote a payload value, so its text is
+  in the trace and nowhere else on `$SYS`: a SQL failure as the record's `error`, a failed
+  action as its output's `error`. The statistics' `last_error` is a time and a kind,
+  whether or not the trace is on.
 
 ### D6. Rules endpoints on the admin API
 
@@ -170,7 +214,7 @@ on, names that node in its answer, and takes its parameters in the query string.
 
 | Endpoint | Role | Does |
 |---|---|---|
-| `GET /admin/v1/rules` | viewer | The running rules with their counts, last activity and last error; the running digest and the digest of the file on disk; the load warnings; the last reload. A viewer gets no SQL or actions (`redacted: true`), the last error's time and kind only, and the last reload's error kind only. An operator gets all of it. |
+| `GET /admin/v1/rules` | viewer | The running rules with their counts, last activity (while the statistics are on) and last error; the running digest and the digest of the file on disk; the load warnings; the last reload. A viewer gets no SQL, actions or load warnings (`redacted: true`), the last error's time and kind only, and the last reload's error kind only. An operator gets all of it. |
 | `GET /admin/v1/rules/source` | operator | The rules file's text as it is on disk, with its digest and the running one. |
 | `POST /admin/v1/rules/check` | operator | Loads a whole file, or one rule spliced into the file on disk, as the broker would; writes nothing. |
 | `POST /admin/v1/rules/test` | operator | Runs a simulated message through the running rules, a candidate file, or one rule (forced on, so a disabled or unsaved rule can be tried), and returns what each rule rendered. |
@@ -182,13 +226,17 @@ on, names that node in its answer, and takes its parameters in the query string.
   and empty means no writes. A listed writer has the rules file's trust, which is the ACL
   file's (ADR 0083): it can derive messages onto any topic from any accepted publish.
   Kick-and-cordon operators do not get that by holding an operator certificate.
-- **The file stays the single source of truth.** Every write starts from the file on disk,
-  read under the write lock, and `if_match` is compared with that file's digest. A write
-  replaces the file atomically: a new file in the same directory with the old file's mode,
+- **The file stays the single source of truth.** Writes are serialized per node: each one
+  reads the file on disk under one lock, compares `if_match` with that file's digest, and
+  writes and reloads before the next starts, so two writes naming the same digest cannot
+  both win. A write replaces the file atomically: a new file in the same directory with
+  the old file's mode and, where the broker may set it, its group (when it cannot keep the
+  group, the group permission bits are cleared rather than carried to another group),
   fsynced, the old file kept as `<file>.prev`, a rename (the target of a symlink, never the
-  link), and the directory fsynced. Then the ordinary validate-before-swap reload runs,
-  with the trigger `admin-rules`, and the answer reports the digest that is running after
-  it. The write survives a restart, because it is the file. A file that does not load is
+  link), and the directory fsynced. A file that `if_match=*` creates has mode 0600. Then
+  the ordinary validate-before-swap reload runs, with the trigger `admin-rules`, and the
+  answer reports the digest that is running after it. The write survives a restart,
+  because it is the file. A file that does not load is
   refused before anything is written; a reload rejected for another reason (a broken ACL
   file, say) leaves the new file written and says so.
 - **Audited.** A write is a `rules.write` record (the subject, the operation, the rule,
@@ -207,7 +255,9 @@ on, names that node in its answer, and takes its parameters in the query string.
 (the file's text, verbatim, so `> rules.toml` round-trips), `rules-apply <file>`
 (`PUT /admin/v1/rules` with the local file's text) and `rule-delete <id>`. The per-rule
 `PUT` and `test` take structured JSON bodies and have no verb: this amends ADR 0081 §3,
-whose verbs followed the endpoints one to one.
+whose verbs followed the endpoints one to one. The CLI escapes control characters in the
+text the server sends, so a last error that quotes a payload cannot drive the operator's
+terminal.
 
 ### D8. Still no web UI in the broker
 
@@ -227,25 +277,35 @@ content type and a custom header on every change, renders every string with
   and the trace shows what a rule made of a message, without the log. The statistics and
   trace publishes are ordinary QoS 0 publishes to the hub: they count in
   `mqttd_publish_received_total{qos="0"}` and the delivery-latency histogram, and with
-  1,024 rules at a 1 s interval they are 1,025 messages a second. Nothing is published
-  unless an operator turns it on.
-- **Compatibility (ADR 0058).** Two client-visible behaviours change, and the release notes
-  of the first release with them say so. A client publish or Will to `$SYS/…` that an ACL
-  allowed is now refused. MQTT 5 §4.7.2 reserves `$`-topics for the server ("the Server
-  SHOULD prevent Clients from using such Topic Names to exchange messages with other
-  Clients"), so this is the specified behaviour, not a new one. A shared subscription that
-  an allow on `$share/…` admitted past a deny on its inner filter is now refused: the deny
-  always meant it. The rules file's regex budget changes no released behaviour, because no
-  release has the rule engine yet. The new `[rules]` keys are additive; an older binary
-  refuses them unless `config_unknown_keys = "warn"`, as for any new key.
+  1,024 rules at a 1 s interval they are 1,025 messages a second. They are live-only, so
+  a persistent subscriber that is offline costs nothing: no queued copy, no durable
+  append, no backlog on reconnect. Nothing is published unless an operator turns it on.
+- **Compatibility (ADR 0058).** Three client-visible behaviours change, and the release
+  notes of the first release with them say so. A client publish or Will to `$SYS/…` that
+  an ACL allowed is now refused. MQTT 5 §4.7.2 reserves `$`-topics for the server ("the
+  Server SHOULD prevent Clients from using such Topic Names to exchange messages with
+  other Clients"), so this is the specified behaviour, not a new one. The one exception
+  keeps Mosquitto bridges working: with `notifications` on, their default, they write
+  only `$SYS/broker/connection/<id>/state`, which stays the ACL's to decide. A bridge
+  whose `notification_topic` points elsewhere under `$SYS/` is refused at CONNECT, because
+  its Will is there, and must move it out of `$SYS` or set `notifications false`
+  (MIGRATION.md). A shared subscription that an allow on `$share/…` admitted past a deny
+  on its inner filter is now refused: the deny always meant it. A shared subscription to a
+  `$`-rooted filter (`$share/g/$SYS/…`, or any `$share/g/$x/…`) that a broad `$share/+/#`
+  or `$share/#` allow admitted is now refused: the grant must name the `$` level inside
+  its `$share` pattern. The rules file's regex budget changes no released behaviour,
+  because no release has the rule engine yet. The new `[rules]` keys are additive; an
+  older binary refuses them unless `config_unknown_keys = "warn"`, as for any new key.
 - **The rolling-upgrade window.** The reservation is complete only once every node runs a
   version with it. Until then an older node accepts client publishes to `$SYS/…` and
   forwards them. An upgraded node drops a forwarded `$SYS` message that would be retained,
-  or that names it (`$SYS/brokers/<its id>/…`), since no other node speaks for it; a
-  forged message naming an older node, sent live, still reaches subscribers on upgraded
-  nodes during the roll. Retained `$SYS/…` messages a client stored before the upgrade are
-  purged at boot (the count is logged), and a restore skips them, because no client can
-  clear them any more.
+  that is QoS 1 or 2, or that names it (`$SYS/brokers/<its id>/…`), since no other node
+  speaks for it; a forged message naming an older node, sent live at QoS 0, still reaches
+  subscribers on upgraded nodes during the roll. Retained `$SYS/…` messages a client
+  stored before the upgrade are cleared during the first minute after boot (the count is
+  logged), never replayed meanwhile, and skipped by a restore, because no client can
+  clear them any more. An older node may queue the statistics and trace it is forwarded
+  for its offline subscribers; their expiry bounds how long such a copy lives.
 - **Writes are per node.** A rules write changes the node that answered. A cluster needs
   the same write on each node, and `same_rules` in the cluster view shows when they
   differ. Writes and file-managed rules do not mix: a ConfigMap or a GitOps pipeline that
@@ -262,9 +322,9 @@ content type and a custom header on every change, renders every string with
   Host, Origin, content-type and custom-header checks, it is safe enough for a demo; it is
   not a pattern for production, where the admin API and the CLI are the surface.
 - **New disclosure classes on the client listener**, recorded in THREAT-MODEL.md:
-  statistics (rule ids, counts, digests, error kinds) and, with the trace on, payloads,
-  client ids and usernames, under the ACL. A deployment with no ACL file, or with
-  `default = "allow"`, gives both to every client.
+  statistics (rule ids, counts, keyed definition hashes, the file digest, error kinds)
+  and, with the trace on, payloads, client ids and usernames, under the ACL. A deployment
+  with no ACL file, or with `default = "allow"`, gives both to every client.
 - **The dry run is an oracle for operators only.** A rule that pseudonymizes with a salt
   in its SQL computes the pseudonym of any input `test` is given; that is why `source`,
   `check` and `test` need the operator role, and why viewers see no SQL.
@@ -295,10 +355,15 @@ content type and a custom header on every change, renders every string with
   fight a ConfigMap; consensus for a setting the rest of the configuration does without;
   and rules are per-node configuration (ADR 0083 §6). Node-local writes plus a visible
   `same_rules` keep the file model.
+- **Reserving all of `$SYS/`, a Mosquitto bridge's state included.** Rejected: it refuses
+  the whole CONNECT of every Mosquitto bridge with notifications on, its default. Accepting
+  the CONNECT and dropping only the Will would lose the bridge's state for no gain: the
+  topic is outside `$SYS/brokers/`, and Mosquitto allows it too.
 - **Retained statistics**, so a late subscriber gets the last value at once. Rejected: a
   durable write, and with durable retained messages a quorum commit, on every tick; they
   count against the retained quota, are exported in backups, and outlive the node that
-  wrote them.
+  wrote them. Queueing them for an offline persistent subscriber is rejected for the same
+  reason: a durable append per tick per subscriber, then a stale backlog on reconnect.
 - **A trace switch per rule in the rules file.** Rejected: it changes the rules file
   format away from EMQX's `rule_engine.rules.<id>` shape, and a rules file is not where a
   disclosure decision belongs. The trace is a node setting with a per-rule rate limit.
