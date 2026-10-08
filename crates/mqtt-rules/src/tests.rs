@@ -1744,3 +1744,45 @@ fn rules_aimed_at_sys_load_with_a_warning() {
     let w = check_sql("SELECT * FROM \"$SYS/#\"").unwrap();
     assert!(w[0].starts_with("FROM \"$SYS/#\" never matches"), "{w:?}");
 }
+
+/// The trace records at most `per_sec` evaluations of a rule a second; the window is
+/// per rule, resets each second, and `no_result` has its own so it cannot starve the
+/// passed records of a rule whose WHERE rarely passes.
+#[test]
+fn the_trace_rate_window_is_per_rule_per_second() {
+    let set = load(
+        "[rules.a]\nsql = 'SELECT 1 FROM \"t\"'\n[rules.b]\nsql = 'SELECT 1 FROM \"t\"'\n\
+         [rules.c]\nsql = 'SELECT 1 FROM \"t\"'\n",
+    );
+    let (a, b, c) = (
+        set.get("a").unwrap(),
+        set.get("b").unwrap(),
+        set.get("c").unwrap(),
+    );
+    let t = 1_800_000_000;
+    let taken = |r: &Rule, now: u64, n: usize| (0..n).filter(|_| r.trace_due(now, 3)).count();
+    let no_result =
+        |r: &Rule, now: u64, n: usize| (0..n).filter(|_| r.no_result_trace_due(now, 2)).count();
+    assert_eq!(taken(a, t, 10), 3, "three in the second, then none");
+    assert_eq!(taken(b, t, 10), 3, "another rule has its own window");
+    assert_eq!(no_result(a, t, 10), 2, "no_result's window is its own");
+    assert_eq!(taken(a, t + 1, 10), 3, "the next second opens a new window");
+    assert_eq!(no_result(a, t + 1, 10), 2);
+    assert_eq!(
+        taken(a, t, 10),
+        0,
+        "a clock read a second behind counts against the newer, open window"
+    );
+    assert_eq!(
+        taken(a, t - 60, 10),
+        3,
+        "a clock stepped back opens its own"
+    );
+    assert!(!b.trace_due(t + 2, 0), "a rate of zero records nothing");
+    // The second is kept in 32 bits; the window still turns over where they wrap.
+    let wrap = 1 << 32;
+    assert_eq!(taken(c, wrap - 2, 10), 3);
+    assert_eq!(taken(c, wrap - 1, 10), 3);
+    assert_eq!(taken(c, wrap, 10), 3);
+    assert_eq!(taken(c, wrap - 1, 10), 0);
+}

@@ -25,6 +25,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::ops::Range;
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -237,7 +238,11 @@ pub struct Rule {
     events: Vec<EventKind>,
     /// When a failure of this rule was last reported loudly (unix seconds); see
     /// [`Rule::failure_report_due`].
-    last_report: std::sync::atomic::AtomicU64,
+    last_report: AtomicU64,
+    /// The trace's rate window for passed and failed evaluations; see [`Rule::trace_due`].
+    trace_window: AtomicU64,
+    /// The same for `no_result` evaluations; see [`Rule::no_result_trace_due`].
+    no_result_window: AtomicU64,
 }
 
 impl Rule {
@@ -247,13 +252,31 @@ impl Rule {
     /// second failing rule is still logged too.
     #[must_use]
     pub fn failure_report_due(&self, now: u64, interval: u64) -> bool {
-        use std::sync::atomic::Ordering::Relaxed;
         let last = self.last_report.load(Relaxed);
         (last == 0 || now >= last.saturating_add(interval))
             && self
                 .last_report
                 .compare_exchange(last, now.max(1), Relaxed, Relaxed)
                 .is_ok()
+    }
+
+    /// Whether the rule trace (ADR 0084 D5) may record a passed or failed evaluation of
+    /// this rule at `now_s` (unix seconds): at most `per_sec` in each second, per rule.
+    ///
+    /// The window packs (second, count) into one atomic. It is read first, and written
+    /// only while the second still has room, so once a hot rule's second is used up each
+    /// further evaluation costs a load and nothing else.
+    #[must_use]
+    pub fn trace_due(&self, now_s: u64, per_sec: u32) -> bool {
+        window_due(&self.trace_window, now_s, per_sec)
+    }
+
+    /// [`trace_due`](Self::trace_due) for `no_result` evaluations, on a window of their
+    /// own: a hot rule whose `WHERE` rarely passes would otherwise spend its whole budget
+    /// on `no_result` records and starve the passed ones.
+    #[must_use]
+    pub fn no_result_trace_due(&self, now_s: u64, per_sec: u32) -> bool {
+        window_due(&self.no_result_window, now_s, per_sec)
     }
 
     /// The rule's id (its table name in the rules file).
@@ -312,6 +335,36 @@ impl Rule {
     #[must_use]
     pub fn from_mismatch(&self, input: &dyn Input) -> Option<String> {
         from_mismatch(&self.topics, &self.events, input)
+    }
+}
+
+/// One step of a packed (second, count) rate window: whether one more may pass in
+/// `now_s`'s second. The high 32 bits hold the second (its low 32 bits: the window only
+/// has to tell one second from the next), the low 32 the count taken in it.
+fn window_due(window: &AtomicU64, now_s: u64, per_sec: u32) -> bool {
+    const LOW: u64 = 0xFFFF_FFFF;
+    if per_sec == 0 {
+        return false;
+    }
+    let second = now_s & LOW;
+    let mut cur = window.load(Relaxed);
+    loop {
+        let open = cur >> 32;
+        // A caller whose clock read lags by a second, racing one that has already
+        // opened the next, counts against the open window rather than reopening its
+        // own; any other second opens a new window.
+        let next = if second == open || second == open.wrapping_sub(1) & LOW {
+            if cur & LOW >= u64::from(per_sec) {
+                return false;
+            }
+            cur + 1
+        } else {
+            (second << 32) | 1
+        };
+        match window.compare_exchange_weak(cur, next, Relaxed, Relaxed) {
+            Ok(_) => return true,
+            Err(seen) => cur = seen,
+        }
     }
 }
 
@@ -523,7 +576,9 @@ impl RuleSet {
                 action_specs: r.actions,
                 topics,
                 events,
-                last_report: std::sync::atomic::AtomicU64::new(0),
+                last_report: AtomicU64::new(0),
+                trace_window: AtomicU64::new(0),
+                no_result_window: AtomicU64::new(0),
             });
         }
         for (i, rule) in set.rules.iter().enumerate() {
