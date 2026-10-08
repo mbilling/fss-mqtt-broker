@@ -29,8 +29,9 @@
       <h2 id="h-rules">Rules</h2>
       <button type="button" id="new-rule">New rule</button>
     </div>
-    <p class="hint">Counts since the broker started, rates per second, live from
-      <code>$SYS/brokers/+/rules/#</code>. Choose a rule to edit it and watch its trace.</p>
+    <p class="hint">Counts since the broker started (an edited rule keeps its counts), and per
+      second over the last 10 s, live from <code>$SYS/brokers/+/rules/#</code>. Choose a rule to
+      edit it and watch its trace.</p>
     <div class="scroll">
       <table id="rules">
         <caption class="visually-hidden">Rules and their live statistics</caption>
@@ -44,7 +45,8 @@
             <th scope="col" class="num">No result</th>
             <th scope="col" class="num">Failed</th>
             <th scope="col" class="num">Actions failed</th>
-            <th scope="col" class="num">Matched/s</th>
+            <th scope="col" class="num" title="Matched per second, over the last 10 s">Matched/s</th>
+            <th scope="col" class="num" title="Passed per second, over the last 10 s">Passed/s</th>
             <th scope="col">Last active</th>
             <th scope="col">Last error</th>
           </tr>

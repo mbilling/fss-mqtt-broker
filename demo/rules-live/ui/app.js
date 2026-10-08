@@ -10,6 +10,7 @@ const DEVICE_ROOTS = ["plant", "home", "vehicle"];
 const KEEP_DATA = 500; // messages kept for the filter
 const SHOW_DATA = 200; // messages shown
 const KEEP_TRACE = 20; // trace records kept per rule
+const RATE_WINDOW = 10000; // ms of counts a rate is taken over
 
 // New rule's example; its id is demo_rule_<n>, the first one free.
 const NEW_RULE = {
@@ -32,6 +33,7 @@ const NEW_RULE = {
 const state = {
   list: null, // the last GET /api/rules answer
   stats: new Map(), // rule id -> its latest $SYS record
+  history: new Map(), // rule id -> [{t, matched, passed}], the last RATE_WINDOW of its counts
   traces: new Map(), // rule id -> its latest trace records, newest first
   summary: null, // the latest $SYS summary
   summaryAt: 0, // when it arrived (ms)
@@ -178,7 +180,8 @@ function renderHeader() {
   const reload = (s && s.reload) || (l && l.reload);
   if (reload) {
     const outcome = reload.applied ? "applied" : `rejected (${reload.error_kind || "error"})`;
-    const repeats = reload.repeats ? `, ${reload.repeats + 1} times` : "";
+    // Repeats count the same attempt failing again; every success would match the last.
+    const repeats = !reload.applied && reload.repeats ? `, ${reload.repeats + 1} times` : "";
     $("s-reload").textContent = `${reload.trigger}: ${outcome}${repeats}, ${ago(reload.at)}`;
     $("s-reload").title = reload.error || "";
   }
@@ -205,7 +208,7 @@ function ruleRow(rule) {
   tr.append(th);
   const from = [].concat(rule.from || [], rule.events || []).join(", ");
   for (const [key, text] of [["on", ""], ["from", from], ["matched"], ["passed"], ["no_result"],
-    ["failed"], ["actions_failed"], ["rate"], ["active"], ["error"]]) {
+    ["failed"], ["actions_failed"], ["matched_rate"], ["passed_rate"], ["active"], ["error"]]) {
     const td = el("td", text);
     td.dataset.key = key;
     if (!["on", "from", "active", "error"].includes(key)) td.className = "num";
@@ -225,8 +228,9 @@ function fillRow(tr, rule, live) {
     cell(k).textContent = count(counts[k]);
   }
   tr.classList.toggle("failing", (counts.failed || 0) + (counts.actions_failed || 0) > 0);
-  const rate = live && live.rates ? live.rates.matched : undefined;
-  cell("rate").textContent = typeof rate === "number" ? rate.toFixed(1) : "-";
+  const r = rates(rule.id);
+  cell("matched_rate").textContent = r ? r.matched.toFixed(2) : "-";
+  cell("passed_rate").textContent = r ? r.passed.toFixed(2) : "-";
   cell("active").textContent = src.last_active_at ? ago(src.last_active_at) : "never";
   // $SYS leaves the message out while the trace is off; the list has it for an operator.
   let err = src.last_error;
@@ -234,6 +238,30 @@ function fillRow(tr, rule, live) {
   const errCell = cell("error");
   errCell.textContent = err ? `${err.kind}${err.message ? `: ${err.message}` : ""} (${ago(err.at)})` : "";
   errCell.title = err && err.message ? err.message : "";
+}
+
+// The broker's own rates are per tick, so they jump with each tick's luck; the table's
+// come from the counts over the last RATE_WINDOW.
+function sample(id, rec) {
+  const t = Date.parse(rec.at);
+  const c = rec.counts || {};
+  if (!t || typeof c.matched !== "number" || typeof c.passed !== "number") return;
+  let h = state.history.get(id) || [];
+  const last = h[h.length - 1];
+  if (last && t === last.t) return;
+  if (last && (t < last.t || c.matched < last.matched)) h = []; // the broker restarted
+  h.push({ t, matched: c.matched, passed: c.passed });
+  while (h.length > 2 && h[1].t <= t - RATE_WINDOW) h.shift();
+  state.history.set(id, h);
+}
+
+function rates(id) {
+  const h = state.history.get(id);
+  if (!h || h.length < 2) return null;
+  const a = h[0];
+  const b = h[h.length - 1];
+  const secs = (b.t - a.t) / 1000;
+  return { matched: (b.matched - a.matched) / secs, passed: (b.passed - a.passed) / secs };
 }
 
 function updateRow(id) {
@@ -584,7 +612,8 @@ function showWrite(out, r, textarea, conflict) {
 function sawDigest(summary) {
   const { out } = state.awaiting;
   out.textContent = `$SYS/brokers/${summary.node}/rules reports ${short(summary.digest)} at ` +
-    `${clock(Date.parse(summary.at) || Date.now())}: every rule's statistics now count from it.`;
+    `${clock(Date.parse(summary.at) || Date.now())}: the new rules are running (counts keep ` +
+    "adding up since the broker started).";
   out.className = "ok";
   state.awaiting = null;
 }
@@ -752,6 +781,7 @@ function onSummary(s) {
 
 function onRuleStats(id, rec) {
   state.stats.set(id, rec);
+  sample(id, rec);
   updateRow(id);
 }
 
