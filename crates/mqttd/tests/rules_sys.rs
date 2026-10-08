@@ -286,6 +286,50 @@ async fn an_interval_change_applies_at_once() {
     assert_eq!(Instant::now(), off_for, "overdue, so at once");
 }
 
+/// The next `$SYS` message's topic and Message Expiry Interval, within an hour of
+/// (paused) time.
+async fn next_expiry(rx: &mut mpsc::UnboundedReceiver<HubCommand>) -> (String, u32) {
+    match timeout(Duration::from_secs(3600), rx.recv()).await {
+        Ok(Some(HubCommand::SysPublish {
+            topic,
+            message_expiry,
+            ..
+        })) => (topic, message_expiry),
+        other => panic!("expected a SysPublish, got {other:?}"),
+    }
+}
+
+/// ADR 0084: every `$SYS` message carries a Message Expiry Interval, so a copy that is
+/// queued anyway (by a peer that predates live-only delivery) expires: two statistics
+/// intervals, at least 10 seconds, and 10 seconds for a trace record.
+#[tokio::test(start_paused = true)]
+async fn every_sys_message_carries_a_message_expiry() {
+    let w = watched(THREE_RULES, &settings(30, false, 20));
+    let (mut sys, _stop) = spawn_stats(&w, plenty(), Arc::new(LastReload::default()));
+    for (interval, expiry) in [(30, 60), (3, 10), (600, 1200)] {
+        w.observe.apply(&settings(interval, false, 20), None);
+        // A summary and one message per rule.
+        for _ in 0..4 {
+            let (topic, got) = next_expiry(&mut sys).await;
+            assert_eq!(got, expiry, "{topic} every {interval} s");
+        }
+    }
+
+    let mut w = watched(TRACED, &settings(0, true, 20));
+    publish(&w.rules.for_connection(), "t/1", br#"{"v":"x"}"#);
+    let (hub_tx, mut hub_rx) = mpsc::unbounded_channel();
+    tokio::spawn(run_trace(
+        w.trace_rx.take().unwrap(),
+        w.rules.clone(),
+        hub_tx,
+        plenty(),
+        CancellationToken::new(),
+    ));
+    let (topic, expiry) = next_expiry(&mut hub_rx).await;
+    assert_eq!(topic, "$SYS/brokers/n1/trace/rules/pub");
+    assert_eq!(expiry, 10);
+}
+
 /// ADR 0084 / ADR 0082: each statistics message takes node-pool credit first. A pool too
 /// short for the tick skips the rest of it and counts it — here every rule message, since
 /// the summary still holds the pool's only byte until the hub (this test) drops it.
@@ -837,6 +881,13 @@ actions = [{ function = "console" }]
                 |prop| matches!(prop, mqtt_codec::Property::ContentType(c) if c == "application/json")
             ),
             "{:?}",
+            p.properties
+        );
+        assert!(
+            p.properties
+                .0
+                .contains(&mqtt_codec::Property::MessageExpiryInterval(10)),
+            "two intervals of 1 s, at least 10 s: {:?}",
             p.properties
         );
         let doc: Value = serde_json::from_slice(&p.payload).unwrap();

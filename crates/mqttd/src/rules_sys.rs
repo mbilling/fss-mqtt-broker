@@ -17,9 +17,14 @@
 //! Every message is `QoS` 0, never retained, routed by [`HubCommand::SysPublish`], and
 //! takes node-pool ingress credit first (ADR 0082): when the pool is short the rest of a
 //! statistics tick is skipped and a trace record dropped, each counted, so both yield to
-//! clients under pressure. Nothing secret goes on `$SYS`: no SQL, description, actions,
-//! file path, writer or reload error text, and a rule's last error text only while the
-//! trace — which shows payloads anyway — is on.
+//! clients under pressure. They are live only — a session that is not connected gets
+//! none of them — and carry a Message Expiry Interval, so a copy queued anyway (by a
+//! peer that predates live-only delivery) expires: two intervals for the statistics, at
+//! least 10 seconds, and 10 seconds for a trace record.
+//!
+//! Nothing secret goes on `$SYS`: no SQL, description, actions, file path, writer or
+//! reload error text, and a rule's last error text only while the trace — which shows
+//! payloads anyway — is on.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -45,6 +50,19 @@ use crate::rules::{
 /// max(`trace_rate`, this), on top of each rule's own `trace_rate`.
 pub const TRACE_NODE_FLOOR: u32 = 200;
 
+/// The Message Expiry Interval of a trace record, in seconds, and the least one of a
+/// statistics message.
+const SYS_EXPIRY_SECS: u32 = 10;
+
+/// The Message Expiry Interval of a statistics message published every `interval`
+/// seconds: two intervals, so the next tick replaces it first, and at least
+/// [`SYS_EXPIRY_SECS`].
+fn stats_expiry(interval: u64) -> u32 {
+    u32::try_from(interval.saturating_mul(2))
+        .unwrap_or(u32::MAX)
+        .max(SYS_EXPIRY_SECS)
+}
+
 /// RFC 3339 in UTC with milliseconds (`2026-10-08T12:34:56.789Z`), never the host's zone.
 #[must_use]
 pub fn rfc3339_millis(t: SystemTime) -> String {
@@ -64,12 +82,14 @@ pub fn rfc3339_millis(t: SystemTime) -> String {
     )
 }
 
-/// Send one `$SYS` message, charged to the node pool; `false` when the pool is short.
+/// Send one `$SYS` message that expires after `message_expiry` seconds, charged to the
+/// node pool; `false` when the pool is short.
 fn sys_publish(
     hub: &mpsc::UnboundedSender<HubCommand>,
     ingress: &IngressCredit,
     topic: String,
     payload: String,
+    message_expiry: u32,
 ) -> bool {
     let Some(permit) = ingress.try_acquire_pool(ingress.cost(topic.len(), payload.len())) else {
         return false;
@@ -77,6 +97,7 @@ fn sys_publish(
     let _ = hub.send(HubCommand::SysPublish {
         topic,
         payload: Bytes::from(payload),
+        message_expiry,
         credit: Some(permit),
     });
     true
@@ -132,8 +153,9 @@ pub async fn run_stats(
                     last_reload: &last_reload,
                     interval,
                 };
+                let expiry = stats_expiry(interval);
                 for (topic, payload) in stats.tick(&ctx, now, SystemTime::now()) {
-                    if !sys_publish(&hub, &ingress, topic, payload) {
+                    if !sys_publish(&hub, &ingress, topic, payload, expiry) {
                         // The rest of this tick is skipped, and the next is whole.
                         observe.count_stats_dropped();
                         break;
@@ -376,7 +398,7 @@ pub async fn run_trace(
         window.1 += 1;
         let topic = format!("$SYS/brokers/{node}/trace/rules/{}", record.rule);
         let payload = record_json(&node, &record).to_string();
-        if !sys_publish(&hub, &ingress, topic, payload) {
+        if !sys_publish(&hub, &ingress, topic, payload, SYS_EXPIRY_SECS) {
             observe.count_trace_dropped();
         }
     }
