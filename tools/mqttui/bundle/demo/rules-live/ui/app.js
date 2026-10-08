@@ -36,6 +36,7 @@ const state = {
   list: null, // the last GET /api/rules answer
   stats: new Map(), // rule id -> its latest $SYS record
   history: new Map(), // rule id -> [{t, matched, passed}], the last RATE_WINDOW of its counts
+  errorAsked: new Map(), // rule id -> the $SYS last error the list was last fetched for
   traces: new Map(), // rule id -> its latest trace records, newest first
   traceItems: new WeakMap(), // trace record -> its item on the page
   summary: null, // the latest $SYS summary
@@ -272,7 +273,7 @@ function fillRow(tr, rule, live) {
   cell("matched_rate").textContent = r ? r.matched.toFixed(2) : "-";
   cell("passed_rate").textContent = r ? r.passed.toFixed(2) : "-";
   cell("active").textContent = src.last_active_at ? ago(src.last_active_at) : "never";
-  // $SYS leaves the message out while the trace is off; the list has it for an operator.
+  // $SYS never carries the message; the list has it for an operator (onRuleStats asks).
   let err = src.last_error;
   if (err && !err.message && rule.last_error && rule.last_error.at === err.at) err = rule.last_error;
   const errCell = cell("error");
@@ -289,7 +290,9 @@ function sample(id, rec) {
   let h = state.history.get(id) || [];
   const last = h[h.length - 1];
   if (last && t === last.t) return;
-  if (last && (t < last.t || c.matched < last.matched)) h = []; // the broker restarted
+  // The broker restarted, or a gap (a hidden tab, a rule away for a while): a rate taken
+  // across it would average the gap in.
+  if (last && (t < last.t || c.matched < last.matched || t - last.t > RATE_WINDOW)) h = [];
   h.push({ t, matched: c.matched, passed: c.passed });
   while (h.length > 2 && h[1].t <= t - RATE_WINDOW) h.shift();
   state.history.set(id, h);
@@ -329,18 +332,32 @@ function snapshot(rule) {
   return rule ? JSON.stringify([rule.description, rule.enabled, rule.sql, rule.actions_spec]) : "";
 }
 
+// The list shows the running rules. While the file on disk differs, the editor's text is
+// the running version, so its writes name the running digest: the first is refused rather
+// than overwrite what the file says, and a second, after the notice, replaces it.
+function editorStart() {
+  const l = state.list;
+  if (!l) return null;
+  const note = $("r-changed");
+  note.hidden = l.in_sync;
+  if (!l.in_sync) {
+    note.textContent = "The rules file on disk differs from the running rules, and this is the " +
+      "running version. Apply is refused once; a second Apply replaces what the file says.";
+  }
+  return l.in_sync ? l.file_digest : l.digest;
+}
+
 function selectRule(id) {
   const rule = findRule(id);
   if (!rule) return;
   state.selected = id;
-  state.editorDigest = state.list.file_digest;
   state.editorBase = state.list.in_sync ? snapshot(rule) : undefined;
   $("editing").textContent = id;
   $("f-id").readOnly = true;
   $("b-delete").disabled = false;
   fillEditor({ id, description: rule.description, enable: rule.enabled, sql: rule.sql, actions: rule.actions_spec });
   $("r-out").replaceChildren();
-  $("r-changed").hidden = true;
+  state.editorDigest = editorStart();
   if (rule.redacted) say($("r-out"), "error", "The admin API answered as to a viewer: no SQL or actions.");
   resetTestInput();
   markSelected();
@@ -350,7 +367,6 @@ function selectRule(id) {
 
 function newRule() {
   state.selected = null;
-  state.editorDigest = state.list ? state.list.file_digest : null;
   state.editorBase = undefined;
   $("editing").textContent = "(new)";
   $("f-id").readOnly = false;
@@ -360,7 +376,7 @@ function newRule() {
   while (ids.has(`demo_rule_${n}`)) n++;
   fillEditor({ id: `demo_rule_${n}`, ...NEW_RULE });
   $("r-out").replaceChildren();
-  $("r-changed").hidden = true;
+  state.editorDigest = editorStart();
   resetTestInput();
   markSelected();
   renderTrace();
@@ -391,6 +407,11 @@ function followFile() {
     state.editorBase = now;
   } else if (state.editorBase === undefined) {
     // Not known what the rule was: a write is refused, and says why.
+    const note = $("r-changed");
+    if (!note.hidden) {
+      note.textContent = "The rules file changed since you opened this rule. Apply is refused " +
+        "once; a second Apply replaces what the file says.";
+    }
   } else if (now === state.editorBase) {
     state.editorDigest = l.file_digest;
     $("r-changed").hidden = true;
@@ -952,6 +973,15 @@ function onSummary(s) {
 function onRuleStats(id, rec) {
   state.stats.set(id, rec);
   sample(id, rec);
+  // $SYS never carries an error's text: a new last error has the list fetched again, once,
+  // for an operator's copy with the text.
+  const err = rec.last_error;
+  const listed = findRule(id);
+  if (err && listed && !listed.redacted && (listed.last_error || {}).at !== err.at &&
+    state.errorAsked.get(id) !== err.at) {
+    state.errorAsked.set(id, err.at);
+    scheduleRefresh();
+  }
   updateRow(id);
 }
 
