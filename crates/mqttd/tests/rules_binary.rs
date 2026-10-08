@@ -704,12 +704,13 @@ fn a_closed_stdout_neither_panics_a_command_nor_changes_its_exit_status() {
     let config = dir.path().join("mqttd.toml");
     std::fs::write(&config, "[durable]\nenabled = false\n").unwrap();
     let config = config.display().to_string();
-    // What `--decommission` signals: a process that exits on SIGUSR1, as the broker does
-    // once its drain is done.
-    let target = ChildGuard(
+    // What `--decommission` signals: a process that exits a second after SIGUSR1, as the
+    // broker does once its drain is done. The second is what `--decommission` must wait out
+    // with its stdout gone: a command that ended at its first write would return first.
+    let mut target = ChildGuard(
         Command::new("sh")
             .arg("-c")
-            .arg("trap 'exit 0' USR1; for i in $(seq 1 600); do sleep 0.1; done")
+            .arg("trap 'sleep 1; exit 0' USR1; for i in $(seq 1 600); do sleep 0.1; done")
             .stdout(Stdio::null())
             .spawn()
             .expect("spawn the decommission target"),
@@ -751,7 +752,10 @@ fn a_closed_stdout_neither_panics_a_command_nor_changes_its_exit_status() {
             "mqttd {args:?} panicked: {stderr}"
         );
     }
-    drop(target);
+    assert!(
+        target.0.try_wait().expect("try_wait").is_some(),
+        "mqttd --decommission returned with stdout closed before its target had exited"
+    );
 }
 
 /// The same for the modes that talk to a running broker: `--probe` answers from its health
