@@ -323,10 +323,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).expect("base");
 
-        let handles: Vec<_> = (0..8)
-            .map(|_| {
-                let base = base.clone();
-                std::thread::spawn(move || {
+        // Scoped, so every caller borrows the one base; the scope re-raises any caller's
+        // panic when it ends.
+        std::thread::scope(|s| {
+            for _ in 0..8 {
+                s.spawn(|| {
                     let root = unpack_into(&base).expect("unpack");
                     for p in [
                         "deploy/compose/compose.yaml",
@@ -339,12 +340,9 @@ mod tests {
                             root.join(p).display()
                         );
                     }
-                })
-            })
-            .collect();
-        for h in handles {
-            h.join().expect("a concurrent unpack caller panicked");
-        }
+                });
+            }
+        });
         let _ = std::fs::remove_dir_all(&base);
     }
 
