@@ -2427,7 +2427,7 @@ fn b64_value(c: u8) -> Option<u32> {
 }
 
 #[allow(clippy::cast_possible_truncation, clippy::naive_bytecount)]
-fn b64_decode(s: &str) -> Result<Vec<u8>, String> {
+pub(crate) fn b64_decode(s: &str) -> Result<Vec<u8>, String> {
     let raw: Vec<u8> = s.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
     if !raw.len().is_multiple_of(4) {
         return Err(format!(

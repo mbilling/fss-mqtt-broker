@@ -60,6 +60,14 @@ fn every_platform_gated_suite_compiled_on_this_runner() {
          must exercise it"
     );
 
+    // admin_rules.rs has Unix-only rules-file writes: a symlink's target replaced, a
+    // read-only directory refused (ADR 0084).
+    assert!(
+        !in_ci || cfg!(unix),
+        "admin_rules.rs uses #[cfg(unix)] for the symlinked and read-only rules directory \
+         writes; this CI run must exercise them"
+    );
+
     // crates/mqttd/tests/decommission.rs — #![cfg(unix)]
     assert!(
         !in_ci || cfg!(unix),
@@ -85,6 +93,7 @@ fn the_mirrored_predicates_still_describe_the_suites() {
         ("check_config.rs", "#[cfg(unix)]"),
         ("binary_smoke.rs", "#[cfg(unix)]"),
         ("shared_membership.rs", "#[cfg(target_os = \"linux\")]"),
+        ("admin_rules.rs", "#[cfg(unix)]"),
     ] {
         let src = std::fs::read_to_string(dir.join(file))
             .unwrap_or_else(|e| panic!("read tests/{file}: {e}"));

@@ -52,15 +52,22 @@ pub fn resolve(
     cn: Option<&str>,
     chains_to_cluster_ca: bool,
 ) -> Option<Role> {
-    if admin.operators.iter().any(|e| matches(e, subject, cn)) {
+    if listed(&admin.operators, subject, cn) {
         Some(Role::Operator)
-    } else if admin.viewers.iter().any(|e| matches(e, subject, cn)) {
+    } else if listed(&admin.viewers, subject, cn) {
         Some(Role::Viewer)
     } else if chains_to_cluster_ca {
         Some(Role::Peer)
     } else {
         None
     }
+}
+
+/// Whether any entry of a subject list (`admin.viewers`, `admin.operators`,
+/// `rules.admin_writers`) names this subject.
+#[must_use]
+pub fn listed(entries: &[String], subject: &str, cn: Option<&str>) -> bool {
+    entries.iter().any(|e| matches(e, subject, cn))
 }
 
 /// Whether one list entry names this subject. An entry is either the whole subject, or

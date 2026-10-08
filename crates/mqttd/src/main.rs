@@ -776,6 +776,7 @@ async fn main() -> Result<(), StartupError> {
     let audit_for_shutdown = policy.audit.clone();
     let audit_for_admin = policy.audit.clone();
     let admin_authz = policy.authz.clone();
+    let admin_rules = policy.rules.clone();
     let admin_sessions = mqttd::admin::sessions::SessionAccess {
         hub: hub_tx.clone(),
         store: store.clone(),
@@ -1167,6 +1168,7 @@ async fn main() -> Result<(), StartupError> {
             stamp: config_stamp.clone(),
         },
         cordon,
+        admin_rules.map(|rules| mqttd::admin::rules::RulesAccess::new(rules, last_reload)),
     )
     .await?;
 
@@ -2900,6 +2902,7 @@ async fn start_admin(
     authz: mqttd::admin::authz::LiveAuthorizer,
     reload: mqttd::admin::config::ReloadAccess,
     cordon: Arc<std::sync::atomic::AtomicBool>,
+    rules: Option<mqttd::admin::rules::RulesAccess>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let admin = &config.admin;
     let (Some(bind), Some(admin_tls)) = (&admin.bind, admin_tls) else {
@@ -2913,6 +2916,9 @@ async fn start_admin(
             .with_reload(reload)
             .with_cordon(cordon)
             .with_cluster_ca_slot(admin_tls.cluster_ca);
+    if let Some(rules) = rules {
+        state = state.with_rules(rules);
+    }
     if let Some(connector) = admin_tls.connector {
         let port = match admin.peer_port {
             Some(port) => port,
@@ -2931,9 +2937,15 @@ async fn start_admin(
         %bind,
         viewers = admin.viewers.len(),
         operators = admin.operators.len(),
+        rules_writers = config.rules.admin_writers.len(),
         peers,
         "serving the admin API (mTLS; ADR 0081)"
     );
+    // A writer configured for a file the broker cannot replace: say so now, not at the
+    // first write (ADR 0084). A reload says it again (`apply_live_config`).
+    if let Some(line) = mqttd::admin::rules::unwritable_warning(&config.rules) {
+        warn!("{line}");
+    }
     tokio::spawn(mqttd::admin::serve_reloadable(
         listener,
         admin_tls.acceptor,
@@ -4309,6 +4321,11 @@ fn apply_live_config(
     // never from a candidate a reload may still reject.
     if let Some(observe) = rules {
         observe.apply(&new.rules, trace_exposure(new));
+    }
+    // Rules writers for a file the broker cannot replace (ADR 0084): said at boot, and
+    // again on every reload while it lasts.
+    if let Some(line) = mqttd::admin::rules::unwritable_warning(&new.rules) {
+        warn!("{line}");
     }
     // A changed replication factor is a proposal to the running cluster (ADR 0080 §4): the
     // lease leader opens the change when the cluster can take it, and `/statusz` shows its

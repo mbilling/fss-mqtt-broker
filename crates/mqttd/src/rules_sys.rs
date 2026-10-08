@@ -161,8 +161,6 @@ struct Stats {
     /// Each rule's counts at the previous tick, and when it was.
     prev: HashMap<Arc<str>, RuleCounts>,
     prev_at: Option<(Instant, SystemTime)>,
-    /// When each rule's `matched` last grew.
-    last_active: HashMap<Arc<str>, SystemTime>,
     /// The running set's digest and each rule's definition hash, recomputed on a reload.
     defs_of: String,
     defs: HashMap<Arc<str>, String>,
@@ -172,7 +170,9 @@ fn matched(c: &RuleCounts) -> u64 {
     c.passed + c.no_result + c.failed
 }
 
-fn counts_json(c: &RuleCounts) -> Value {
+/// A rule's counts as `$SYS` and the admin API show them, `matched` included.
+#[must_use]
+pub fn counts_json(c: &RuleCounts) -> Value {
     json!({
         "matched": matched(c),
         "passed": c.passed,
@@ -266,8 +266,9 @@ impl Stats {
             let def = self.defs.get(id).cloned().unwrap_or_default();
             let counts = ctx.metrics.map(|m| m.rule_counts(id)).unwrap_or_default();
             let before = self.prev.get(id);
+            // Kept with the rules, where the admin API reads it too.
             if before.map_or(matched(&counts) > 0, |b| matched(&counts) > matched(b)) {
-                self.last_active.insert(id.clone(), at);
+                observe.set_last_active(id, at);
             }
             if let (Some(b), Some((_, prev_tick))) = (before, self.prev_at) {
                 let failed = counts.actions_failed.saturating_sub(b.actions_failed);
@@ -290,7 +291,7 @@ impl Stats {
                 "def": def,
                 "counts": counts_json(&counts),
                 "rates": rates_json(&counts, before, secs),
-                "last_active_at": self.last_active.get(id).map(|t| rfc3339_millis(*t)),
+                "last_active_at": observe.last_active(id).map(rfc3339_millis),
                 "last_error": last_error,
             });
             messages.push((
@@ -300,7 +301,7 @@ impl Stats {
             counted.insert(id.clone(), counts);
         }
         self.prev = counted;
-        self.last_active.retain(|id, _| self.prev.contains_key(id));
+        observe.retain_last_active(|id| self.prev.contains_key(id));
         self.prev_at = Some((now, at));
         messages
     }
@@ -428,7 +429,10 @@ fn trigger_json(t: &TraceTrigger) -> Value {
     }
 }
 
-fn output_json(o: &TraceOutput) -> Value {
+/// One rendered output as a trace record shows it — and as the admin API's dry run
+/// shows what a rule would render.
+#[must_use]
+pub fn output_json(o: &TraceOutput) -> Value {
     match o {
         TraceOutput::Republish {
             topic,

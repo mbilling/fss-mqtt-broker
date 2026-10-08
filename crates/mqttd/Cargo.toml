@@ -49,9 +49,10 @@ tokio-rustls.workspace = true
 # `mqttd --decommission` (ADR 0047 T4) sends SIGUSR1 to the running broker (PID 1 in a
 # distroless container has no shell/`kill`) and waits for the drain. rustix's safe kill wrappers
 # (the crate forbids `unsafe` in first-party code); rustix is already in the tree — this only
-# enables its `process` feature. Unix-gated.
+# enables its `process` feature. Unix-gated. `fs` (already compiled for the tests) asks
+# access(2) whether the rules file's directory is writable (ADR 0084).
 [target.'cfg(unix)'.dependencies]
-rustix = { version = "1", features = ["process"] }
+rustix = { version = "1", features = ["process", "fs"] }
 
 
 [features]

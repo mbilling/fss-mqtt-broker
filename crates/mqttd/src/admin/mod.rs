@@ -14,7 +14,9 @@
 //!   on concurrent connections, and paged lists.
 //!
 //! The configuration itself is never written through this API (ADR 0081 §5): the file
-//! stays the only source.
+//! stays the only source. The one exception is the rules file, and only for the subjects
+//! `[rules] admin_writers` lists (ADR 0084): a write replaces the file and runs the
+//! ordinary reload, so the file stays the only source of the rules too.
 
 pub mod actions;
 pub mod authz;
@@ -25,6 +27,7 @@ pub mod config;
 pub mod http;
 pub mod roles;
 mod routes;
+pub mod rules;
 pub mod scope;
 pub mod sessions;
 
@@ -69,6 +72,8 @@ pub struct AdminState {
     reload: Option<Arc<config::ReloadAccess>>,
     /// The cordon flag the admission gate and `/readyz` read (T8).
     cordon: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// The running rules and the last reload, for the rules endpoints (ADR 0084).
+    rules: Option<Arc<rules::RulesAccess>>,
 }
 
 impl std::fmt::Debug for AdminState {
@@ -101,7 +106,16 @@ impl AdminState {
             authz: None,
             reload: None,
             cordon: None,
+            rules: None,
         }
+    }
+
+    /// Serve the rules endpoints (ADR 0084). Their writes also need
+    /// [`with_reload`](Self::with_reload): a write runs the ordinary reload.
+    #[must_use]
+    pub fn with_rules(mut self, access: rules::RulesAccess) -> Self {
+        self.rules = Some(Arc::new(access));
+        self
     }
 
     /// Serve cordon / uncordon over `flag`, the one the admission gate and health read.
@@ -236,21 +250,27 @@ pub async fn serve_reloadable(
     }
 }
 
-/// One connection: handshake, read the request, authorize, answer, audit, close.
+/// One connection: handshake, identify the caller, read the request, authorize, answer,
+/// audit, close.
 async fn handle(stream: TcpStream, acceptor: TlsAcceptor, state: AdminState) {
     let read = tokio::time::timeout(http::REQUEST_DEADLINE, async {
         let mut tls = acceptor.accept(stream).await.ok()?;
-        let request = http::read_request(&mut tls).await;
-        Some((tls, request))
+        // The caller is known from the handshake, before the body is read: a large body is
+        // read only for a route this caller's role may call (ADR 0084).
+        let caller = {
+            let chain = tls.get_ref().1.peer_certificates().unwrap_or_default();
+            state.caller(chain)
+        };
+        let request = http::read_request(&mut tls, |method, path| {
+            routes::body_limit(caller.role, method, path)
+        })
+        .await;
+        Some((tls, caller, request))
     })
     .await;
-    let Ok(Some((mut tls, request))) = read else {
+    let Ok(Some((mut tls, caller, request))) = read else {
         debug!("admin connection closed before a complete request");
         return;
-    };
-    let caller = {
-        let chain = tls.get_ref().1.peer_certificates().unwrap_or_default();
-        state.caller(chain)
     };
     let (status, body, target) = match request {
         Err(e) => {

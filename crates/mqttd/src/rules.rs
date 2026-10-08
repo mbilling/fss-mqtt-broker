@@ -760,6 +760,8 @@ pub struct RulesObserve {
     trace_dropped: AtomicU64,
     stats_dropped: AtomicU64,
     last_errors: Mutex<HashMap<Arc<str>, LastError>>,
+    /// When each rule's evaluations last grew, as the statistics saw it at a tick.
+    last_active: Mutex<HashMap<Arc<str>, SystemTime>>,
 }
 
 impl RulesObserve {
@@ -778,6 +780,7 @@ impl RulesObserve {
             trace_dropped: AtomicU64::new(0),
             stats_dropped: AtomicU64::new(0),
             last_errors: Mutex::new(HashMap::new()),
+            last_active: Mutex::new(HashMap::new()),
         });
         (observe, trace_rx)
     }
@@ -889,6 +892,29 @@ impl RulesObserve {
     /// Drop the kept errors `keep` refuses: a rule gone, or redefined, by a reload.
     pub(crate) fn retain_errors(&self, keep: impl Fn(&str, &LastError) -> bool) {
         self.errors().retain(|id, e| keep(id, e));
+    }
+
+    /// When `rule` last ran, as of the statistics' last tick: the tick at which its
+    /// evaluation count was seen to grow. `None` before it ran, and while the statistics
+    /// are off.
+    #[must_use]
+    pub fn last_active(&self, rule: &str) -> Option<SystemTime> {
+        self.active().get(rule).copied()
+    }
+
+    fn active(&self) -> std::sync::MutexGuard<'_, HashMap<Arc<str>, SystemTime>> {
+        self.last_active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    pub(crate) fn set_last_active(&self, rule: &Arc<str>, at: SystemTime) {
+        self.active().insert(rule.clone(), at);
+    }
+
+    /// Forget when the rules `keep` refuses last ran: a reload removed them.
+    pub(crate) fn retain_last_active(&self, keep: impl Fn(&str) -> bool) {
+        self.active().retain(|id, _| keep(id));
     }
 
     /// Queue a trace record, or drop and count it when the queue is full or the bytes
