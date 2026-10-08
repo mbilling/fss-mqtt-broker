@@ -172,15 +172,32 @@ todo 'EXACT filter-string'   "$WORK/adv-acl.toml"   # {eq, ...}
 todo 'EMQX_SECURITY_PROFILE' "$WORK/adv-acl.toml"   # {security_profile, legacy}
 # Pin the counts docs/MIGRATION.md quotes, so the document cannot drift away from the
 # tool. SIX TODOs, not four: the third vendor rule contributes three (its $SYS topic and
-# each of its two {eq, ...} entries). ONE rule is emitted — the $SYS deny, kept for the
-# record and reported as inert because mqttd implements no $SYS tree.
+# each of its two {eq, ...} entries). ONE rule is emitted — the $SYS deny, kept, with a TODO
+# saying that mqttd's $SYS holds only the opt-in rule statistics and trace (ADR 0084).
 acl_todos=$(grep -c 'TODO(migrate)' "$WORK/adv-acl.toml" || true)
 acl_rules=$(grep -c '^\[\[rules\]\]' "$WORK/adv-acl.toml" || true)
 [[ "$acl_todos" == "6" ]] \
   || fail "the vendor default ACL produced $acl_todos TODO(migrate) lines, not the 6 the docs state"
 [[ "$acl_rules" == "1" ]] \
   || fail "the vendor default ACL produced $acl_rules rule(s), not the 1 the docs state"
-ok "each of the vendor default ACL's four rules became a TODO, not a drop (6 TODOs, 1 inert rule)"
+ok "each of the vendor default ACL's four rules became a TODO, not a drop (6 TODOs, 1 rule kept)"
+
+# ── 8a. what $SYS is in mqttd, said wherever EMQX's comes up (ADR 0084) ──────────────
+# mqttd's $SYS is reserved for the broker and holds only the opt-in rule statistics and
+# trace. The kept $SYS deny's TODO must say so, and name the statistics-only grant, since a
+# grant on $SYS/# would reach the trace too; and EMQX's sys_topics block must not read as
+# something mqttd publishes. No TODO may still claim there is no $SYS at all.
+todo 'broker-reserved \$SYS tree' "$WORK/adv-acl.toml"
+grep -qF 'grant $SYS/brokers/+/rules/# for the statistics alone' "$WORK/adv-acl.toml" \
+  || fail "the \$SYS deny's TODO does not name the statistics-only grant"
+printf 'sys_topics {\n  sys_msg_interval = 1m\n}\n' >"$WORK/sys.conf"
+python3 "$CONV" "$WORK/sys.conf" --out-config "$WORK/sys.toml" >/dev/null 2>&1 \
+  || fail "the converter failed on a sys_topics block"
+todo "sys_topics.*none of EMQX's .SYS broker topics.*only opt-in rule statistics" "$WORK/sys.toml"
+if grep -qE 'implements no .?\$SYS|SYS.? (topics )?(is|are) not implemented' "$WORK/adv-acl.toml" "$WORK/sys.toml"; then
+  fail "a TODO still says mqttd has no \$SYS"
+fi
+ok "the \$SYS TODOs say what mqttd's \$SYS holds: rule statistics and trace, nothing a client publishes"
 
 # ── 8b. the VERBATIM vendor config: stock defaults, and the refusals they must produce ─
 # emqx-6.2.2.conf is COMPOSED — nine of its values were deliberately changed from the
@@ -652,7 +669,7 @@ todo 'mqtt:my_egress_mqtt_bridge.* is a data-integration sink' "$WORK/rules.toml
 todo 'receive_msgs_from_remote_mqtt_broker is COMMENTED OUT .*data-bridge source' "$WORK/rules.toml"
 todo 'jq_rule is COMMENTED OUT .*jq()' "$WORK/rules.toml"
 todo 'delivered_rule is COMMENTED OUT .*message_delivered' "$WORK/rules.toml"
-todo 'ignore_sys_message' "$WORK/rules.toml"
+todo 'ignore_sys_message = .*own \$SYS messages .* never run rules' "$WORK/rules.toml"
 grep -q '^\[rules.jq_rule\]' "$WORK/rules.toml" && fail "an unsupported rule was left LIVE"
 # A translated statement runs, not merely parses: EMQX's documented example, end to end.
 out="$("$MQTTD_BIN" --rule-test --sql 'SELECT qos, payload.x as y FROM "t/a"' \
