@@ -115,6 +115,12 @@ impl Source {
 /// # Errors
 /// If the cache directory cannot be created or written.
 pub fn unpack() -> Result<PathBuf, String> {
+    unpack_into(&cache_root()?)
+}
+
+/// [`unpack`] beneath `base` rather than the cache root, so a test that must start from an
+/// empty directory gets one of its own instead of emptying the root other tests read.
+fn unpack_into(base: &Path) -> Result<PathBuf, String> {
     // Serialises unpacks within this process. The first version had no lock and wrote the
     // tree IN PLACE after a remove_dir_all — so two callers that both missed the stamp
     // (parallel test threads on a fresh machine) would each delete what the other had just
@@ -126,7 +132,6 @@ pub fn unpack() -> Result<PathBuf, String> {
         .lock()
         .map_err(|_| "an earlier unpack panicked".to_string())?;
 
-    let base = cache_root()?;
     // Version-stamped, so upgrading the binary cannot leave an older example behind — the
     // examples are only trustworthy as the set the binary was tested with.
     let root = base.join(format!("examples-{}", env!("CARGO_PKG_VERSION")));
@@ -308,16 +313,21 @@ mod tests {
     /// fresh runner are — and every returned root must be complete. The in-place scheme
     /// failed this because one caller's `remove_dir_all` could delete a tree another had
     /// just finished; it passed locally purely because earlier runs had left a stamp.
+    ///
+    /// It starts from an empty base of its own. It used to delete the tree in the shared
+    /// cache root, which pulled it out from under sibling tests in this binary that were
+    /// still reading a root `unpack()` had already handed them.
     #[test]
     fn concurrent_unpacks_never_observe_a_half_written_tree() {
-        let base = cache_root().expect("cache root");
-        let _ =
-            std::fs::remove_dir_all(base.join(format!("examples-{}", env!("CARGO_PKG_VERSION"))));
+        let base = std::env::temp_dir().join(format!("mqttui-unpack-race-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).expect("base");
 
         let handles: Vec<_> = (0..8)
             .map(|_| {
-                std::thread::spawn(|| {
-                    let root = unpack().expect("unpack");
+                let base = base.clone();
+                std::thread::spawn(move || {
+                    let root = unpack_into(&base).expect("unpack");
                     for p in [
                         "deploy/compose/compose.yaml",
                         "demo/docker-compose.yml",
@@ -335,6 +345,7 @@ mod tests {
         for h in handles {
             h.join().expect("a concurrent unpack caller panicked");
         }
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// "Needs a clone" and "is not in this bundle" must not collapse into one answer:
