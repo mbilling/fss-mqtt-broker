@@ -2643,7 +2643,8 @@ actions = [{ function = "republish", args = { topic = "alerts/${clientid}", payl
 /// the live demo stack configures them, reach a real subscriber of the real binary — the
 /// summary, the rule's message with its counted evaluation, and the trace record of the
 /// publish that fired it. `#` does not cover `$SYS`, so the subscriber names the trees.
-/// A client publishing into `$SYS` is refused (v5 `0x87`), so it cannot forge them.
+/// A client publishing into `$SYS` is refused (v5 `0x87`), so it cannot forge them. The
+/// log says the trace is on, and — with no ACL file — that any client may read it.
 #[tokio::test]
 async fn env_configured_rule_statistics_and_trace_reach_a_subscriber() {
     let dir = tempfile::tempdir().unwrap();
@@ -2719,6 +2720,17 @@ actions = [{ function = "republish", args = { topic = "w-out/${v}" } }]
     broker
         .wait_log(" WARN mqttd::rules: INSECURE: the rule trace is on and no MQTTD_ACL_FILE is configured: any client can subscribe to $SYS/brokers/+/trace/rules/+ and read what the rules see (ADR 0084)")
         .await;
+    broker.wait_log(&trace_is_on(5)).await;
+}
+
+/// The WARN the broker logs as the trace turns on at `rate` records a second per rule.
+fn trace_is_on(rate: u32) -> String {
+    format!(
+        " WARN mqttd::rules: rule trace is ON: every rule's evaluations — trigger topic, \
+         client id, username, up to 1 KiB of payload, rendered outputs — are copied onto \
+         $SYS/brokers/<node>/trace/rules/<id> (ADR 0084); a subscriber there reads every \
+         topic that rule's FROM matches rate={rate}"
+    )
 }
 
 // ---------------------------------------------------------------------------------------

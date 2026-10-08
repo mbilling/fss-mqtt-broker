@@ -644,13 +644,12 @@ fn drain(rx: &mut mpsc::Receiver<TraceRecord>) -> Vec<TraceRecord> {
     out
 }
 
-/// ADR 0084 D5: with the trace off an evaluation queues nothing.
+/// ADR 0084 D5: with the trace off an evaluation queues nothing, whatever fired it: a
+/// publish, a Will or an event, each of which has its own way to the trace.
 #[tokio::test]
 async fn the_trace_off_records_nothing() {
     let mut w = watched(TRACED, &settings(0, false, 20));
-    let conn = w.rules.for_connection();
-    publish(&conn, "t/1", br#"{"v":"x"}"#);
-    assert!(drain(w.trace_rx.as_mut().unwrap()).is_empty());
+    assert!(fire_every_trigger(&mut w).is_empty());
     assert_eq!(w.observe.trace_dropped(), 0);
 }
 
