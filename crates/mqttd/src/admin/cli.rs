@@ -16,7 +16,12 @@
 //! | `--server-name <name>` | `MQTTD_ADMIN_SERVER_NAME` | the URL's host |
 //!
 //! These variables configure the client, not the broker, so they are not part of the
-//! `MQTTD_*` config surface in `docs/CONFIGURATION.md`.
+//! `MQTTD_*` config surface in `docs/CONFIGURATION.md`; [`CLIENT_ENV_VARS`] lists them.
+//!
+//! Two endpoints take structured JSON bodies and have no verb (ADR 0084, amending ADR
+//! 0081 §3's one verb per endpoint): `PUT /admin/v1/rule` and `POST /admin/v1/rules/test`.
+//! `rules-apply` sends a local file, read when the verb runs — never while the arguments
+//! are validated.
 
 use super::client::{self, Target};
 use super::http::percent_encode;
@@ -29,6 +34,16 @@ use std::time::Duration;
 /// How long the CLI waits for an answer.
 const TIMEOUT: Duration = Duration::from_secs(30);
 
+/// The environment variables the CLI reads to reach a broker. They configure this client,
+/// not a broker, so they are not in `mqtt_config::ENV_VARS`.
+pub const CLIENT_ENV_VARS: &[&str] = &[
+    "MQTTD_ADMIN_URL",
+    "MQTTD_ADMIN_CA",
+    "MQTTD_ADMIN_CLIENT_CERT",
+    "MQTTD_ADMIN_CLIENT_KEY",
+    "MQTTD_ADMIN_SERVER_NAME",
+];
+
 /// One CLI verb: the endpoint it calls, its positional arguments and its optional
 /// `--name value` parameters (both become query parameters).
 struct Verb {
@@ -39,6 +54,10 @@ struct Verb {
     required: &'static [&'static str],
     /// Optional `--<name> <value>` query parameters.
     optional: &'static [&'static str],
+    /// The positional naming a local file whose text is the request body, as
+    /// `{"source": <text>}`, rather than a query parameter. Read by [`run`], never by
+    /// [`validate`].
+    source_file: Option<&'static str>,
     help: &'static str,
 }
 
@@ -49,6 +68,7 @@ const VERBS: &[Verb] = &[
         path: "/admin/v1/whoami",
         required: &[],
         optional: &[],
+        source_file: None,
         help: "the certificate subject and role the broker sees for you",
     },
     Verb {
@@ -57,6 +77,7 @@ const VERBS: &[Verb] = &[
         path: "/admin/v1/node",
         required: &[],
         optional: &[],
+        source_file: None,
         help: "this node's state (the /statusz body)",
     },
     Verb {
@@ -65,6 +86,7 @@ const VERBS: &[Verb] = &[
         path: "/admin/v1/cluster",
         required: &[],
         optional: &[],
+        source_file: None,
         help: "every node's version, readiness, identity and lag, from any node",
     },
     Verb {
@@ -73,6 +95,7 @@ const VERBS: &[Verb] = &[
         path: "/admin/v1/placement",
         required: &[],
         optional: &[],
+        source_file: None,
         help: "this node's membership, replication and lease view; do the others agree",
     },
     Verb {
@@ -81,6 +104,7 @@ const VERBS: &[Verb] = &[
         path: "/admin/v1/config",
         required: &[],
         optional: &[],
+        source_file: None,
         help: "the effective config (secrets fingerprinted) and the file checksum",
     },
     Verb {
@@ -89,6 +113,7 @@ const VERBS: &[Verb] = &[
         path: "/admin/v1/reload",
         required: &[],
         optional: &[],
+        source_file: None,
         help: "operator: reload the config file, as SIGHUP does, and report the outcome",
     },
     Verb {
@@ -97,6 +122,7 @@ const VERBS: &[Verb] = &[
         path: "/admin/v1/log-level",
         required: &[],
         optional: &[],
+        source_file: None,
         help: "the configured log filter and any temporary override",
     },
     Verb {
@@ -105,6 +131,7 @@ const VERBS: &[Verb] = &[
         path: "/admin/v1/log-level",
         required: &["filter"],
         optional: &["ttl"],
+        source_file: None,
         help: "operator: log with <filter> for --ttl seconds (default 600, max 3600)",
     },
     Verb {
@@ -113,6 +140,7 @@ const VERBS: &[Verb] = &[
         path: "/admin/v1/log-level/reset",
         required: &[],
         optional: &[],
+        source_file: None,
         help: "operator: restore the configured log filter now",
     },
     Verb {
@@ -121,6 +149,7 @@ const VERBS: &[Verb] = &[
         path: "/admin/v1/cordon",
         required: &[],
         optional: &[],
+        source_file: None,
         help: "operator: refuse new connections and report not-ready (not persisted)",
     },
     Verb {
@@ -129,6 +158,7 @@ const VERBS: &[Verb] = &[
         path: "/admin/v1/uncordon",
         required: &[],
         optional: &[],
+        source_file: None,
         help: "operator: accept new connections again",
     },
     Verb {
@@ -137,6 +167,7 @@ const VERBS: &[Verb] = &[
         path: "/admin/v1/kick",
         required: &["client"],
         optional: &[],
+        source_file: None,
         help: "operator: disconnect a client (MQTT 5: 0x98); its session stays",
     },
     Verb {
@@ -145,6 +176,7 @@ const VERBS: &[Verb] = &[
         path: "/admin/v1/purge",
         required: &["client"],
         optional: &[],
+        source_file: None,
         help: "operator: disconnect a client and delete its session and queue",
     },
     Verb {
@@ -153,6 +185,7 @@ const VERBS: &[Verb] = &[
         path: "/admin/v1/authz",
         required: &["user", "action", "target"],
         optional: &["groups", "client"],
+        source_file: None,
         help: "dry run: may <user> publish|subscribe|connect <target>, and which rule decides",
     },
     Verb {
@@ -161,6 +194,7 @@ const VERBS: &[Verb] = &[
         path: "/admin/v1/clients",
         required: &[],
         optional: &["prefix", "user", "source", "limit", "cursor"],
+        source_file: None,
         help: "sessions by client id (paged); --all-nodes: on every node",
     },
     Verb {
@@ -169,6 +203,7 @@ const VERBS: &[Verb] = &[
         path: "/admin/v1/session",
         required: &["client"],
         optional: &[],
+        source_file: None,
         help: "one session: subscriptions, in flight, backlog, will, owner; --all-nodes: wherever it is",
     },
     Verb {
@@ -177,6 +212,7 @@ const VERBS: &[Verb] = &[
         path: "/admin/v1/subscribers",
         required: &["topic"],
         optional: &["limit"],
+        source_file: None,
         help: "who would receive a publish to <topic>; --all-nodes: on every node",
     },
     Verb {
@@ -185,6 +221,7 @@ const VERBS: &[Verb] = &[
         path: "/admin/v1/backlog",
         required: &[],
         optional: &["top"],
+        source_file: None,
         help: "the sessions with the most messages waiting",
     },
     Verb {
@@ -193,7 +230,46 @@ const VERBS: &[Verb] = &[
         path: "/admin/v1/retained",
         required: &[],
         optional: &["prefix", "limit", "cursor"],
+        source_file: None,
         help: "retained messages by topic prefix: count, bytes, list (paged)",
+    },
+    Verb {
+        name: "rules",
+        method: "GET",
+        path: "/admin/v1/rules",
+        required: &[],
+        optional: &[],
+        source_file: None,
+        help: "the running rules: counts, last errors, digests (SQL and actions: --json, \
+               operator)",
+    },
+    Verb {
+        name: "rules-source",
+        method: "GET",
+        path: "/admin/v1/rules/source",
+        required: &[],
+        optional: &[],
+        source_file: None,
+        help: "operator: the rules file on disk, verbatim (`> rules.toml` keeps it as it is)",
+    },
+    Verb {
+        name: "rules-apply",
+        method: "PUT",
+        path: "/admin/v1/rules",
+        required: &["file"],
+        optional: &["if_match"],
+        source_file: Some("file"),
+        help: "rules writer: replace the rules file with <file> and reload; --if_match is the \
+               digest of the file it replaces (rules-source --json), or * for whatever is there",
+    },
+    Verb {
+        name: "rule-delete",
+        method: "DELETE",
+        path: "/admin/v1/rule",
+        required: &["id"],
+        optional: &["if_match"],
+        source_file: None,
+        help: "rules writer: remove rule <id> from the rules file and reload",
     },
 ];
 
@@ -407,8 +483,10 @@ fn usage() -> String {
     }
     s.push('\n');
     for line in wrap(
-        "ENVIRONMENT: MQTTD_ADMIN_URL, MQTTD_ADMIN_CA, MQTTD_ADMIN_CLIENT_CERT, \
-         MQTTD_ADMIN_CLIENT_KEY, MQTTD_ADMIN_SERVER_NAME (the options win).",
+        &format!(
+            "ENVIRONMENT: {} (the options win).",
+            CLIENT_ENV_VARS.join(", ")
+        ),
         HELP_WIDTH,
     ) {
         let _ = writeln!(s, "{line}");
@@ -513,14 +591,28 @@ pub async fn run(args: &[String]) -> i32 {
     let Some(verb) = VERBS.iter().find(|v| v.name == inv.verb) else {
         return 2;
     };
+    // The local file a verb sends is read here, now that the invocation is known good.
+    let mut body = None;
     let mut path = verb.path.to_string();
-    for (i, (k, v)) in inv.params.iter().enumerate() {
-        path.push(if i == 0 { '?' } else { '&' });
+    let mut first = true;
+    for (k, v) in &inv.params {
+        if verb.source_file == Some(k.as_str()) {
+            match std::fs::read_to_string(v) {
+                Ok(text) => body = Some(serde_json::json!({ "source": text }).to_string()),
+                Err(e) => {
+                    eprintln!("mqttd: cannot read {v}: {e}");
+                    return 2;
+                }
+            }
+            continue;
+        }
+        path.push(if first { '?' } else { '&' });
+        first = false;
         path.push_str(&percent_encode(k));
         path.push('=');
         path.push_str(&percent_encode(v));
     }
-    match client::call(&target, verb.method, &path, None).await {
+    match client::call(&target, verb.method, &path, body.as_deref()).await {
         Ok((status, body)) => {
             let value: Value = serde_json::from_str(&body).unwrap_or(Value::String(body));
             if (200..300).contains(&status) {
@@ -552,9 +644,7 @@ pub async fn run(args: &[String]) -> i32 {
                     .and_then(Value::as_str)
                     .unwrap_or("");
                 eprintln!("mqttd: {status} {code}: {message}");
-                if let Some(outcome) = value.get("outcome") {
-                    out!("{}", render(outcome));
-                }
+                out!("{}", render_refusal(&value));
                 1
             }
         }
@@ -565,16 +655,165 @@ pub async fn run(args: &[String]) -> i32 {
     }
 }
 
+/// What a refusal says beside its error, for a terminal: a rejected reload's `outcome`,
+/// then any other facts it carries (a rules refusal's digests on disk and running, whether
+/// the file was written).
+fn render_refusal(value: &Value) -> String {
+    let Value::Object(map) = value else {
+        return String::new();
+    };
+    let mut out = map.get("outcome").map(render).unwrap_or_default();
+    let facts: serde_json::Map<String, Value> = map
+        .iter()
+        .filter(|(k, _)| !matches!(k.as_str(), "error" | "outcome" | "node"))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    if !facts.is_empty() {
+        out.push_str(&render(&Value::Object(facts)));
+    }
+    out
+}
+
 /// Render `verb`'s answer for a terminal: the compact cluster view for `cluster`, the
-/// generic [`render`] for the rest. `--json` always has the whole answer.
+/// rules table for `rules`, the file itself for `rules-source`, the generic [`render`] for
+/// the rest. `--json` always has the whole answer.
 #[must_use]
 pub fn render_for(verb: &str, value: &Value) -> String {
-    if verb == "cluster" {
-        if let Some(out) = render_cluster(value) {
-            return out;
-        }
+    let custom = match verb {
+        "cluster" => render_cluster(value),
+        "rules" => render_rules(value),
+        // Verbatim, so `mqttd --admin rules-source > rules.toml` writes the file as it is.
+        "rules-source" => value
+            .get("source")
+            .and_then(Value::as_str)
+            .map(String::from),
+        _ => None,
+    };
+    custom.unwrap_or_else(|| render(value))
+}
+
+/// The widest `LAST_ERROR` cell; the whole text is in `--json`.
+const LAST_ERROR_WIDTH: usize = 40;
+
+/// The running rules in a terminal's width: which set runs and whether it is the file on
+/// disk, the last reload, then one row per rule with its counts and last error.
+fn render_rules(value: &Value) -> Option<String> {
+    let rules = value.get("rules")?.as_array()?;
+    let short = |k: &str| {
+        value
+            .get(k)
+            .and_then(Value::as_str)
+            .map_or_else(|| "-".to_string(), |d| d.chars().take(12).collect())
+    };
+    let enabled = rules
+        .iter()
+        .filter(|r| r.get("enabled") == Some(&Value::Bool(true)))
+        .count();
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "{}: {} rules, {enabled} enabled; running {}, on disk {}",
+        scalar(value.get("node").unwrap_or(&Value::Null)),
+        rules.len(),
+        short("digest"),
+        if value.get("in_sync") == Some(&Value::Bool(true)) {
+            "the same".to_string()
+        } else {
+            short("file_digest")
+        },
+    );
+    if let Some(reload) = value.get("reload").filter(|r| !r.is_null()) {
+        let text = |k: &str| reload.get(k).map_or_else(|| "-".to_string(), scalar);
+        let how = if reload.get("applied") == Some(&Value::Bool(true)) {
+            "applied".to_string()
+        } else {
+            format!("REJECTED ({})", text("error_kind"))
+        };
+        let _ = writeln!(
+            out,
+            "last reload: {} by {}, {how}",
+            text("at"),
+            text("trigger")
+        );
     }
-    render(value)
+    let warnings = value
+        .get("warnings")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
+    if warnings > 0 {
+        let _ = writeln!(out, "{warnings} warning(s): see --json");
+    }
+    out.push('\n');
+    let columns = [
+        "ID",
+        "ENABLED",
+        "FROM",
+        "ACTIONS",
+        "MATCHED",
+        "PASSED",
+        "NO_RESULT",
+        "FAILED",
+        "ACTIONS_FAILED",
+        "LAST_ERROR",
+    ];
+    let cells = rules.iter().map(rules_row).collect::<Vec<_>>();
+    out.push_str(&grid(
+        &columns.iter().map(|c| (*c).to_string()).collect::<Vec<_>>(),
+        &cells,
+    ));
+    Some(out)
+}
+
+/// One rule's row: the filters and events it selects, its cumulative counts, and its last
+/// error cut to [`LAST_ERROR_WIDTH`] characters (the kind alone for a viewer).
+fn rules_row(rule: &Value) -> Vec<String> {
+    let text = |k: &str| rule.get(k).map_or_else(|| "-".to_string(), scalar);
+    let count = |k: &str| {
+        rule.pointer(&format!("/counts/{k}"))
+            .map_or_else(|| "-".to_string(), scalar)
+    };
+    let from: Vec<String> = ["from", "events"]
+        .iter()
+        .filter_map(|k| rule.get(*k)?.as_array())
+        .flatten()
+        .map(scalar)
+        .collect();
+    let last_error = match rule.get("last_error").filter(|e| !e.is_null()) {
+        None => "-".to_string(),
+        Some(e) => {
+            let kind = e.get("kind").map_or_else(|| "-".to_string(), scalar);
+            let whole = match e.get("message").and_then(Value::as_str) {
+                Some(message) => format!("{kind}: {}", message.replace('\n', " ")),
+                None => kind,
+            };
+            if whole.chars().count() > LAST_ERROR_WIDTH {
+                let cut: String = whole.chars().take(LAST_ERROR_WIDTH - 1).collect();
+                format!("{cut}…")
+            } else {
+                whole
+            }
+        }
+    };
+    vec![
+        text("id"),
+        if rule.get("enabled") == Some(&Value::Bool(true)) {
+            "yes".into()
+        } else {
+            "no".into()
+        },
+        if from.is_empty() {
+            "-".into()
+        } else {
+            from.join(", ")
+        },
+        text("actions"),
+        count("matched"),
+        count("passed"),
+        count("no_result"),
+        count("failed"),
+        count("actions_failed"),
+        last_error,
+    ]
 }
 
 /// The cluster view in a terminal's width: a summary line, whether the nodes agree, and
@@ -597,6 +836,7 @@ fn render_cluster(value: &Value) -> Option<String> {
         ("same_cluster_id", "cluster id"),
         ("same_version", "version"),
         ("same_config", "config"),
+        ("same_rules", "rules"),
         ("same_membership", "membership"),
     ]
     .iter()
@@ -604,7 +844,7 @@ fn render_cluster(value: &Value) -> Option<String> {
     .map(|(_, label)| *label)
     .collect();
     if differ.is_empty() {
-        out.push_str("they agree on cluster id, version, config and membership\n");
+        out.push_str("they agree on cluster id, version, config, rules and membership\n");
     } else {
         let _ = writeln!(out, "they DIFFER on: {}", differ.join(", "));
     }
@@ -856,6 +1096,10 @@ mod tests {
                  "error": "connect failed"}
             ]
         });
+        let mut rules_differ = answer.clone();
+        rules_differ["summary"]["same_config"] = json!(true);
+        rules_differ["summary"]["same_rules"] = json!(false);
+        assert!(render_for("cluster", &rules_differ).contains("\nthey DIFFER on: rules\n"));
         let out = render_for("cluster", &answer);
         assert_eq!(
             out,
@@ -918,6 +1162,134 @@ mod tests {
         assert!(validate(&args("clients --all-nodes --all-nodes")).is_err());
         assert!(validate(&args("node --all-nodes")).is_err());
         assert!(validate(&args("kick dev-1 --all-nodes")).is_err());
+    }
+
+    /// The rules verbs: `rules-apply` names a local file that is read only when the verb
+    /// runs, so validating a path that does not exist succeeds; the file is not a query
+    /// parameter.
+    #[test]
+    fn the_rules_verbs_are_validated_without_reading_the_file() {
+        assert!(validate(&args("rules")).is_ok());
+        assert!(validate(&args("rules-source --json")).is_ok());
+        assert!(validate(&args("rules-apply /nonexistent/rules.toml")).is_ok());
+        assert!(validate(&args("rules-apply r.toml --if_match *")).is_ok());
+        assert!(validate(&args("rules-apply")).is_err());
+        assert!(validate(&args("rules-apply r.toml --bogus x")).is_err());
+        assert!(validate(&args("rule-delete door_alarm --if_match abc")).is_ok());
+        assert!(validate(&args("rule-delete")).is_err());
+        assert!(validate(&args("rules extra")).is_err());
+        let inv = parse(&args("rules-apply r.toml --if_match *")).unwrap();
+        assert_eq!(
+            inv.params,
+            [
+                ("file".to_string(), "r.toml".to_string()),
+                ("if_match".to_string(), "*".to_string())
+            ]
+        );
+        let apply = VERBS.iter().find(|v| v.name == "rules-apply").unwrap();
+        assert_eq!((apply.method, apply.source_file), ("PUT", Some("file")));
+        assert!(VERBS
+            .iter()
+            .filter(|v| v.name != "rules-apply")
+            .all(|v| v.source_file.is_none()));
+    }
+
+    /// `rules` is a table of the running rules with their counts; a viewer's answer (no
+    /// message) shows the error's kind alone, an operator's a cut message.
+    #[test]
+    fn the_rules_view_is_a_table_of_counts_and_last_errors() {
+        let answer = json!({
+            "node": "n1",
+            "digest": "550bdb8f0123456789abcdef",
+            "file_digest": "550bdb8f0123456789abcdef",
+            "in_sync": true,
+            "reload": {"at": "2026-10-08T12:00:00.000Z", "trigger": "admin-rules",
+                       "applied": true, "error_kind": null, "repeats": 0},
+            "warnings": ["rule `a`: something"],
+            "rules": [
+                {"id": "a", "enabled": true, "from": ["t/#"], "events": [], "actions": 1,
+                 "counts": {"matched": 3, "passed": 2, "no_result": 1, "failed": 0,
+                            "actions_ok": 2, "actions_failed": 0},
+                 "last_error": null},
+                {"id": "b", "enabled": false, "from": [], "events": ["client.connected"],
+                 "actions": 2,
+                 "counts": {"matched": 0, "passed": 0, "no_result": 0, "failed": 0,
+                            "actions_ok": 0, "actions_failed": 5},
+                 "last_error": {"at": "2026-10-08T12:00:01.000Z", "kind": "action",
+                                "message": "rendered topic \"x/+\" is not a valid topic name"}},
+                {"id": "c", "enabled": true, "from": ["u", "v"], "events": [], "actions": 0,
+                 "counts": {"matched": 1, "passed": 0, "no_result": 0, "failed": 1,
+                            "actions_ok": 0, "actions_failed": 0},
+                 "last_error": {"at": "2026-10-08T12:00:02.000Z", "kind": "sql"}}
+            ]
+        });
+        assert_eq!(
+            render_for("rules", &answer),
+            "n1: 3 rules, 2 enabled; running 550bdb8f0123, on disk the same\n\
+             last reload: 2026-10-08T12:00:00.000Z by admin-rules, applied\n\
+             1 warning(s): see --json\n\
+             \n\
+             ID  ENABLED  FROM              ACTIONS  MATCHED  PASSED  NO_RESULT  FAILED  ACTIONS_FAILED  LAST_ERROR\n\
+             a   yes      t/#               1        3        2       1          0       0               -\n\
+             b   no       client.connected  2        0        0       0          0       5               action: rendered topic \"x/+\" is not a v…\n\
+             c   yes      u, v              0        1        0       0          1       0               sql\n"
+        );
+        let mut drifted = answer.clone();
+        drifted["in_sync"] = json!(false);
+        drifted["file_digest"] = json!("0123456789abcdef");
+        drifted["reload"]["applied"] = json!(false);
+        drifted["reload"]["error_kind"] = json!("rules");
+        let out = render_for("rules", &drifted);
+        assert!(
+            out.starts_with(
+                "n1: 3 rules, 2 enabled; running 550bdb8f0123, on disk 0123456789ab\n\
+                 last reload: 2026-10-08T12:00:00.000Z by admin-rules, REJECTED (rules)\n"
+            ),
+            "{out}"
+        );
+    }
+
+    /// `rules-source` prints the file and nothing else, so redirecting it keeps the file.
+    #[test]
+    fn the_rules_source_prints_the_file_verbatim() {
+        let text = "# header\n[rules.a]\nsql = '''\nSELECT *\nFROM \"t\"'''\n";
+        let answer = json!({"node": "n1", "file": "/etc/r.toml", "source": text, "bytes": 1});
+        assert_eq!(render_for("rules-source", &answer), text);
+    }
+
+    /// A refusal's facts beside its error are shown; a rejected reload's outcome first.
+    #[test]
+    fn a_refusal_shows_what_it_carries() {
+        let refused = json!({
+            "error": {"code": "digest-mismatch", "message": "m"},
+            "node": "n1",
+            "file_digest": "aa",
+            "running_digest": "bb"
+        });
+        assert_eq!(
+            render_refusal(&refused),
+            "file_digest     aa\nrunning_digest  bb\n"
+        );
+        let rejected = json!({
+            "error": {"code": "reload-rejected", "message": "m"},
+            "outcome": {"applied": false, "trigger": "admin"}
+        });
+        assert_eq!(
+            render_refusal(&rejected),
+            "applied  false\ntrigger  admin\n"
+        );
+        assert_eq!(render_refusal(&json!({"error": {"code": "x"}})), "");
+    }
+
+    /// The help names every variable the CLI reads, from the one list of them.
+    #[test]
+    fn the_help_names_the_clients_own_environment() {
+        let flowing = usage().split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            flowing.contains(&format!("ENVIRONMENT: {}", CLIENT_ENV_VARS.join(", "))),
+            "{flowing}"
+        );
+        assert_eq!(CLIENT_ENV_VARS.len(), 5);
     }
 
     #[test]

@@ -202,6 +202,92 @@ impl ConfigStamp {
     }
 }
 
+/// One reload attempt, as the rule statistics and the admin API report it (ADR 0084).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReloadRecord {
+    /// When it ran.
+    pub at: std::time::SystemTime,
+    /// Why (`signal`, `watch`, `admin`, `admin-rules`).
+    pub trigger: String,
+    /// Whether it was applied.
+    pub applied: bool,
+    /// Why not, when not: the full text, which can quote a config line holding a secret.
+    pub error: Option<String>,
+    /// How many attempts before this one in a row had the same trigger and error (a
+    /// rejected file the watcher retries every poll repeats; it does not flood).
+    pub repeats: u32,
+}
+
+impl ReloadRecord {
+    /// The part of the reload that failed, never the text (ADR 0084): the component the
+    /// reloader names in front of its error (`config`, `rules`, `tls`, `admin tls`, …),
+    /// or `policy` for the ACL and authenticator build, whose errors have no such name.
+    #[must_use]
+    pub fn error_kind(&self) -> Option<&'static str> {
+        self.error.as_deref().map(error_kind)
+    }
+}
+
+/// The component names the reloader puts in front of an error, `"<name>: …"`.
+const ERROR_KINDS: [&str; 8] = [
+    "config",
+    "tls",
+    "gossip crl",
+    "client crl",
+    "peer tls",
+    "gossip signer",
+    "admin tls",
+    "rules",
+];
+
+/// See [`ReloadRecord::error_kind`].
+#[must_use]
+pub fn error_kind(error: &str) -> &'static str {
+    let head = error.split_once(':').map_or("", |(head, _)| head);
+    ERROR_KINDS
+        .into_iter()
+        .find(|k| *k == head)
+        .unwrap_or("policy")
+}
+
+/// The last reload attempt (ADR 0084), written by the [`Reloader`] under its reload lock
+/// — so attempts are recorded in the order they ran — and read by the rule statistics and
+/// the admin API.
+#[derive(Debug, Default)]
+pub struct LastReload(std::sync::Mutex<Option<ReloadRecord>>);
+
+impl LastReload {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Option<ReloadRecord>> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Record an attempt.
+    pub fn record(&self, trigger: &str, applied: bool, error: Option<&str>) {
+        let mut last = self.lock();
+        let repeats = match &*last {
+            Some(prev) if prev.trigger == trigger && prev.error.as_deref() == error => {
+                prev.repeats.saturating_add(1)
+            }
+            _ => 0,
+        };
+        *last = Some(ReloadRecord {
+            at: std::time::SystemTime::now(),
+            trigger: trigger.to_string(),
+            applied,
+            error: error.map(String::from),
+            repeats,
+        });
+    }
+
+    /// The last attempt, if any ran since the process started.
+    #[must_use]
+    pub fn get(&self) -> Option<ReloadRecord> {
+        self.lock().clone()
+    }
+}
+
 /// Hex sha-256 of `bytes` (the config-checksum hash, ADR 0054 T3).
 #[must_use]
 pub fn sha256_hex(bytes: &[u8]) -> String {
@@ -218,6 +304,9 @@ pub struct Reloader {
     /// Set by [`attach_config_stamp`](Self::attach_config_stamp): updated (and
     /// mirrored to `config_info`) on every successful reload (ADR 0054 T3).
     config_stamp: Option<Arc<ConfigStamp>>,
+    /// Set by [`attach_last_reload`](Self::attach_last_reload): every attempt, applied
+    /// or rejected (ADR 0084).
+    last_reload: Option<Arc<LastReload>>,
     build: Box<dyn Fn() -> BuildResult + Send + Sync>,
     /// Set by [`attach_tls`](Self::attach_tls) when a TLS listener is active; the acceptor
     /// is rebuilt and swapped as part of the same atomic, validate-before-swap reload.
@@ -293,6 +382,7 @@ impl Reloader {
         (
             Reloader {
                 config_stamp: None,
+                last_reload: None,
                 authz_tx,
                 auth_tx,
                 audit,
@@ -334,6 +424,12 @@ impl Reloader {
     /// reload and mirrored to `config_info{checksum}`.
     pub fn attach_config_stamp(&mut self, stamp: Arc<ConfigStamp>) {
         self.config_stamp = Some(stamp);
+    }
+
+    /// Record every reload attempt in `last` (ADR 0084): the rule statistics and the
+    /// admin API report the last one.
+    pub fn attach_last_reload(&mut self, last: Arc<LastReload>) {
+        self.last_reload = Some(last);
     }
 
     pub fn attach_tls(
@@ -664,6 +760,9 @@ impl Reloader {
                     outcome.requires_restart = (cs.apply)(old, new);
                     outcome.changed_sections = changed_sections(old, new);
                 }
+                if let Some(last) = &self.last_reload {
+                    last.record(trigger, true, None);
+                }
                 outcome
             }
         }
@@ -679,6 +778,9 @@ impl Reloader {
         );
         if let Some(m) = &self.metrics {
             m.security_reload("rejected", trigger);
+        }
+        if let Some(last) = &self.last_reload {
+            last.record(trigger, false, Some(error));
         }
         ReloadOutcome {
             trigger: trigger.to_string(),
@@ -1159,6 +1261,79 @@ mod tests {
         mqtt_auth::Identity {
             subject: "u".to_string(),
             groups: Vec::new(),
+        }
+    }
+
+    /// ADR 0084: every reload attempt is recorded, applied or rejected, with how many
+    /// attempts in a row before it had the same trigger and error — so the watcher
+    /// retrying a broken file every poll reads as one failure repeating.
+    #[test]
+    fn every_reload_attempt_is_recorded_with_its_repeats() {
+        let failing = Arc::new(AtomicBool::new(false));
+        let (mut reloader, _h) = Reloader::new(ok_auth_pair().unwrap(), audit(), ok_auth_pair);
+        let (rules_tx, _rules_rx) = watch::channel(Arc::new(mqtt_rules::RuleSet::empty()));
+        let f = failing.clone();
+        reloader.attach_rules(rules_tx, move || {
+            if f.load(Ordering::SeqCst) {
+                Err("rule `salted`: bad".into())
+            } else {
+                Ok(Arc::new(mqtt_rules::RuleSet::empty()))
+            }
+        });
+        let last = Arc::new(LastReload::default());
+        reloader.attach_last_reload(last.clone());
+        assert_eq!(last.get(), None, "nothing until the first attempt");
+
+        assert!(reloader.reload("signal"));
+        let r = last.get().unwrap();
+        assert_eq!(
+            (r.trigger.as_str(), r.applied, r.repeats),
+            ("signal", true, 0)
+        );
+        assert_eq!((r.error.as_deref(), r.error_kind()), (None, None));
+
+        failing.store(true, Ordering::SeqCst);
+        for repeats in 0..3 {
+            assert!(!reloader.reload("watch"));
+            let r = last.get().unwrap();
+            assert_eq!(
+                (r.trigger.as_str(), r.applied, r.repeats),
+                ("watch", false, repeats)
+            );
+            assert_eq!(r.error.as_deref(), Some("rules: rule `salted`: bad"));
+            assert_eq!(r.error_kind(), Some("rules"));
+        }
+        // Another trigger, or the same one succeeding, is a new run.
+        assert!(!reloader.reload("admin"));
+        assert_eq!(last.get().unwrap().repeats, 0);
+        failing.store(false, Ordering::SeqCst);
+        assert!(reloader.reload("admin"));
+        let r = last.get().unwrap();
+        assert_eq!((r.applied, r.repeats, r.error), (true, 0, None));
+    }
+
+    /// ADR 0084: what a reload failure publishes is the part that failed, never its text:
+    /// a config error quotes the offending line, which can hold a secret.
+    #[test]
+    fn a_reload_error_kind_is_the_failing_part_never_the_text() {
+        for (error, kind) in [
+            (
+                "config: TOML parse error at line 9\n9 | key = \"s3cret",
+                "config",
+            ),
+            ("rules: rule `x`: bad", "rules"),
+            ("admin tls: no such file", "admin tls"),
+            ("gossip crl: expired", "gossip crl"),
+            (
+                "cannot read MQTTD_ACL_FILE (/etc/mqttd/acl.toml): denied",
+                "policy",
+            ),
+            ("no colon at all", "policy"),
+            // Only the exact component name counts: a policy error whose text happens to
+            // start like one is still the policy's.
+            ("config file /etc/mqttd/users.toml: denied", "policy"),
+        ] {
+            assert_eq!(error_kind(error), kind, "{error}");
         }
     }
 

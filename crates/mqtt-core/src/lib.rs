@@ -249,6 +249,18 @@ pub fn valid_topic_name(topic: &str) -> bool {
     !topic.is_empty() && !topic.contains(['+', '#', '\0'])
 }
 
+/// Whether `topic` is in the broker's reserved `$SYS` tree (ADR 0084): `$SYS` itself or
+/// anything below `$SYS/`. Only the broker publishes there — a client PUBLISH, a Will and
+/// a rule republish to such a topic are refused, and the hub drops one on every path but
+/// its own `$SYS` publisher.
+///
+/// The one predicate every one of those checks uses, so they cannot disagree. It is
+/// case-sensitive, as topic names are: `$sys/x` and `$SYSTEM/x` are ordinary topics.
+#[must_use]
+pub fn is_reserved_topic(topic: &str) -> bool {
+    topic == "$SYS" || topic.starts_with("$SYS/")
+}
+
 /// Returns whether a wildcard topic `filter` matches a concrete `topic`.
 ///
 /// Implements MQTT topic-matching rules including `+`/`#` wildcards and the
@@ -359,7 +371,10 @@ pub fn filters_overlap(a: &str, b: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{filter_covers, filters_overlap, topic_matches, valid_filter, valid_topic_name};
+    use super::{
+        filter_covers, filters_overlap, is_reserved_topic, topic_matches, valid_filter,
+        valid_topic_name,
+    };
 
     /// [MQTT-4.7.1]: the structural filter rules. Each invalid case here was
     /// GRANTED by the broker before `valid_filter` existed — and then matched
@@ -409,6 +424,28 @@ mod tests {
             assert!(valid_topic_name(name) && valid_filter(name), "{name:?}");
         }
         assert!(valid_filter("a/#") && !valid_topic_name("a/#"));
+    }
+
+    /// ADR 0084: `$SYS` and everything under `$SYS/` is the broker's. The boundary is a
+    /// whole first level, and the comparison is case-sensitive like every topic match.
+    #[test]
+    fn the_reserved_tree_is_exactly_sys_and_below() {
+        for reserved in [
+            "$SYS",
+            "$SYS/",
+            "$SYS/x",
+            "$SYS/brokers/n1/rules",
+            "$SYS//x",
+        ] {
+            assert!(is_reserved_topic(reserved), "{reserved:?} is reserved");
+        }
+        // Case-sensitive (`$sys`), a whole first level (`$SYSTEM`, `$SYS2`), and the
+        // first level only (`a/$SYS/b`, and the empty first level of `/$SYS/x`).
+        for open in [
+            "$sys/x", "$Sys/x", "$SYSTEM", "$SYSx/y", "$SYS2/a", "a/$SYS/b", "/$SYS/x", "SYS/x", "",
+        ] {
+            assert!(!is_reserved_topic(open), "{open:?} is not reserved");
+        }
     }
 
     #[test]

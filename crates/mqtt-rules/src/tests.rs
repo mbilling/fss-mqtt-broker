@@ -1426,3 +1426,384 @@ fn a_message_has_one_timestamp_however_often_it_is_read() {
         "timestamp is earlier than a later publish_received_at"
     );
 }
+
+// -- ADR 0084: what the admin API, the $SYS reservation and the trace need
+
+/// A rules file with `rules` rules, each matching `regex_match(payload.a, pattern)` for
+/// its share of `patterns`.
+fn regex_file(patterns: &[String], rules: usize) -> String {
+    patterns
+        .chunks(patterns.len().div_ceil(rules).max(1))
+        .enumerate()
+        .map(|(r, chunk)| {
+            let conds: Vec<String> = chunk
+                .iter()
+                .map(|p| format!("regex_match(payload.a, '{p}')"))
+                .collect();
+            format!(
+                "[rules.r{r}]\nsql = '''\nSELECT 1 AS x FROM \"t/#\"\nWHERE {}\n'''\n",
+                conds.join(" OR ")
+            )
+        })
+        .collect::<Vec<_>>()
+        .concat()
+}
+
+/// Every literal pattern used to cost a compile, so a file of a few thousand worst-case
+/// patterns took seconds and gigabytes to parse. The budget is per file, across rules,
+/// and the pattern past it is refused before it is compiled.
+#[test]
+fn a_file_may_compile_only_so_many_distinct_regular_expressions() {
+    let distinct = |n: usize| -> Vec<String> { (0..n).map(|i| format!("^a{i}$")).collect() };
+    let at = RuleSet::parse(&regex_file(&distinct(MAX_REGEX_LITERALS_PER_FILE), 7))
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(at.rules.len(), 7);
+
+    let over = regex_file(&distinct(MAX_REGEX_LITERALS_PER_FILE + 1), 7);
+    let e = RuleSet::parse(&over).unwrap_err();
+    let LoadError::Rule {
+        id,
+        message,
+        sql_line,
+        ..
+    } = &e
+    else {
+        panic!("{e}")
+    };
+    // The last rule holds the pattern past the budget, on its statement's line 2.
+    assert_eq!((id.as_str(), *sql_line), ("r6", Some(2)), "{e}");
+    assert!(
+        message.contains(&format!(
+            "more than {MAX_REGEX_LITERALS_PER_FILE} distinct regular expressions in one rules file"
+        )),
+        "{e}"
+    );
+
+    // Patterns built at run time (from the payload) are not literals: not counted.
+    let mut text = regex_file(&distinct(MAX_REGEX_LITERALS_PER_FILE), 1);
+    text.push_str(
+        "[rules.dyn]\nsql = 'SELECT regex_match(payload.a, payload.p) AS m FROM \"t\"'\n",
+    );
+    RuleSet::parse(&text).unwrap_or_else(|e| panic!("{e}"));
+}
+
+/// The longest `\w{n}` this build compiles within the per-pattern size limit. The limit is
+/// fixed, but what a pattern costs against it depends on the regex features the build
+/// unifies: the broker's graph enables `regex-automata/dfa-build` (through
+/// tracing-subscriber's env filter), and with it a far shorter run is the largest that
+/// fits than in `cargo test -p mqtt-rules` alone.
+fn longest_word_run() -> usize {
+    (1..=64)
+        .rev()
+        .find(|n| funcs::compile_regex(&format!("\\w{{{n}}}")).is_ok())
+        .expect("\\w compiles")
+}
+
+/// An identical pattern is compiled once and counts once, wherever it appears: a file
+/// repeating one pattern at the per-pattern size limit far past the budget loads.
+#[test]
+fn identical_regular_expressions_are_compiled_once() {
+    let n = longest_word_run();
+    assert!(
+        funcs::compile_regex(&format!("\\w{{{}}}", n + 1)).is_err(),
+        "\\w{{{n}}} is at the limit"
+    );
+    let at_limit = format!("\\w{{{n}}}");
+    let mut pool = parser::RegexPool::default();
+    let first = pool.get(&at_limit).unwrap();
+    assert!(Arc::ptr_eq(&first, &pool.get(&at_limit).unwrap()));
+    assert!(!Arc::ptr_eq(
+        &first,
+        &pool.get(&format!("\\w{{{}}}", n - 1)).unwrap()
+    ));
+
+    let worst = vec![at_limit; 4 * MAX_REGEX_LITERALS_PER_FILE];
+    let set = load(&regex_file(&worst, 32));
+    assert_eq!(set.len(), 32);
+    // Each still works, and a second distinct pattern is still accepted beside it.
+    let mut text = regex_file(&worst, 2);
+    text.push_str("[rules.other]\nsql = '''SELECT 1 AS x FROM \"t/#\" WHERE regex_match(payload.a, '^b$')'''\n");
+    let set = load(&text);
+    let payload = Bytes::from(format!(r#"{{"a":"{}"}}"#, "x".repeat(n)));
+    let props = mqtt_core::AppProperties::default();
+    let (_, log) = effects(&set, &msg("t/1", &payload, &props));
+    assert_eq!(log, ["other:no_result", "r0:passed", "r1:passed"]);
+}
+
+/// The structured error keeps the text `mqttd --check-rules` and a rejected reload have
+/// always printed, byte for byte (`crates/mqttd/tests/rules_docs.rs` pins transcripts of
+/// it), and adds where: the TOML span in the file, the line and column in a rule's SQL.
+#[test]
+fn load_errors_say_where_and_print_as_before() {
+    let text = "[rules.r]\nsql = 'SELECT a FROM \"t\"'\nbogus = 1\n";
+    let e = RuleSet::parse(text).unwrap_err();
+    let LoadError::File { message, span } = &e else {
+        panic!("{e}")
+    };
+    assert_eq!(e.to_string(), format!("rules file: {message}"));
+    assert!(message.contains("unknown field `bogus`"), "{e}");
+    assert_eq!(&text[span.clone().expect("a TOML span")], "bogus");
+    assert_eq!(e.file_position(text), Some((3, 1)));
+    // The column counts characters, not bytes.
+    let text = "[rules.r]\nsql = 'é' x\n";
+    assert_eq!(
+        RuleSet::parse(text).unwrap_err().file_position(text),
+        Some((2, 11))
+    );
+
+    let many = (0..=MAX_RULES)
+        .map(|i| format!("[rules.r{i}]\nsql = 'SELECT 1 FROM \"t\"'\n"))
+        .collect::<Vec<_>>()
+        .concat();
+    assert_eq!(
+        RuleSet::parse(&many).unwrap_err(),
+        LoadError::File {
+            message: "1025 rules is more than the 1024 a file may define".into(),
+            span: None
+        }
+    );
+
+    let e = RuleSet::parse("[rules.r]\nsql = '''\nSELECT\n  nope(1) FROM \"t\"'''\n").unwrap_err();
+    assert_eq!(
+        e.to_string(),
+        "rule `r`: unknown function nope() — see docs/RULES.md for the supported functions \
+         (line 2, column 3, near `nope(1) FROM \"t\"`)"
+    );
+    assert!(
+        matches!(
+            &e,
+            LoadError::Rule {
+                sql_line: Some(2),
+                sql_column: Some(3),
+                ..
+            }
+        ),
+        "{e:?}"
+    );
+
+    // A rule error that is not in the SQL has no position.
+    let e = RuleSet::parse(
+        "[rules.r]\nsql = 'SELECT a FROM \"t\"'\nactions = [{ function = \"webhook\" }]\n",
+    )
+    .unwrap_err();
+    assert_eq!(
+        e.to_string(),
+        "rule `r`: unsupported action function \"webhook\" (mqttd supports republish and console)"
+    );
+    assert!(
+        matches!(
+            &e,
+            LoadError::Rule {
+                sql_line: None,
+                sql_column: None,
+                ..
+            }
+        ),
+        "{e:?}"
+    );
+    let e = RuleSet::parse("[rules.1r]\nsql = 'SELECT a FROM \"t\"'\n").unwrap_err();
+    assert_eq!(
+        e.to_string(),
+        "rule `1r`: a rule id is a letter or `_` followed by up to 63 letters, digits, `_` or `-`"
+    );
+    let e = RuleSet::load(std::path::Path::new("/nonexistent/rules.toml")).unwrap_err();
+    assert!(
+        e.to_string()
+            .starts_with("rules file: /nonexistent/rules.toml: "),
+        "{e}"
+    );
+}
+
+/// The running set keeps the actions as written and the load's warnings, so the admin
+/// API can show a rule and its findings without the file.
+#[test]
+fn a_loaded_set_keeps_its_action_specs_and_warnings() {
+    let loaded = RuleSet::parse(
+        r#"
+        [rules.r]
+        sql = 'SELECT a FROM "t" WHERE a = "x"'
+        actions = [
+          { function = "republish", args = { topic = "o/${a}", qos = 1, direct_dispatch = false } },
+          { function = "console" },
+        ]
+        [rules.s]
+        sql = 'SELECT 1 FROM "u"'
+        "#,
+    )
+    .unwrap();
+    assert_eq!(loaded.rules.warnings(), loaded.warnings.as_slice());
+    assert_eq!(loaded.warnings.len(), 2, "{:?}", loaded.warnings);
+    let r = loaded.rules.get("r").expect("rule r");
+    assert_eq!(r.action_specs().len(), 2);
+    assert_eq!(
+        serde_json::to_value(r.action_specs()).unwrap(),
+        serde_json::json!([
+            { "function": "republish", "args": { "topic": "o/${a}", "qos": 1, "direct_dispatch": false } },
+            { "function": "console" }
+        ])
+    );
+    assert!(loaded.rules.get("s").unwrap().action_specs().is_empty());
+    assert!(loaded.rules.get("nope").is_none());
+}
+
+/// A dry run evaluates one rule even when it is disabled (the rule being edited), leaves
+/// FROM matching to the caller, and gives a non-matching input `--rule-test`'s reason.
+#[test]
+fn one_rule_can_be_evaluated_whether_or_not_it_is_enabled() {
+    let set = load(
+        r#"
+        [rules.off]
+        enable = false
+        sql = 'SELECT payload.v AS v FROM "t/+" WHERE v > 1'
+        actions = [{ function = "republish", args = { topic = "o/${v}", qos = 0 } }]
+        [rules.on]
+        sql = 'SELECT clientid FROM "$events/client/connected"'
+        "#,
+    );
+    let payload = Bytes::from_static(br#"{"v":5}"#);
+    let props = mqtt_core::AppProperties::default();
+    let m = msg("t/1", &payload, &props);
+    let (out, _) = effects(&set, &m);
+    assert!(out.is_empty(), "the set does not run a disabled rule");
+
+    let mut out = Vec::new();
+    let mut log = Vec::new();
+    assert!(set.evaluate_one(
+        "off",
+        &m,
+        &mut |r, o| log.push(format!("{}:{}", r.id(), matches!(o, Outcome::Passed))),
+        &mut out
+    ));
+    assert_eq!(log, ["off:true", "off:false"], "passed, then its action");
+    assert_eq!(republished(&out[0].1).topic, "o/5");
+    assert!(!set.evaluate_one("missing", &m, &mut |_, _| {}, &mut Vec::new()));
+
+    let off = set.get("off").unwrap();
+    assert_eq!(off.from_mismatch(&m), None);
+    let elsewhere = msg("x/1", &payload, &props);
+    let why = off.from_mismatch(&elsewhere).expect("x/1 is not selected");
+    let sql = off.sql();
+    assert_eq!(Some(why), test_sql(sql, &elsewhere).err());
+    let why = set
+        .get("on")
+        .unwrap()
+        .from_mismatch(&m)
+        .expect("events only");
+    assert!(
+        why.contains("selects only events (client.connected)"),
+        "{why}"
+    );
+}
+
+/// Only the broker publishes in `$SYS` (ADR 0084): a republish that renders a topic
+/// there fails its action, whatever the template, and the rule's other actions run.
+#[test]
+fn a_republish_into_sys_fails_its_action() {
+    let set = load(
+        r#"
+        [rules.r]
+        sql = 'SELECT payload.t AS t FROM "t"'
+        actions = [
+          { function = "republish", args = { topic = "${t}" } },
+          { function = "republish", args = { topic = "ok/${t}" } },
+        ]
+        "#,
+    );
+    let props = mqtt_core::AppProperties::default();
+    for reserved in ["$SYS/brokers/n1/rules", "$SYS"] {
+        let payload = Bytes::from(format!(r#"{{"t":"{reserved}"}}"#));
+        let (out, log) = effects(&set, &msg("t", &payload, &props));
+        assert_eq!(
+            log[1],
+            format!("r:action_failed(republish topic is reserved for the broker: {reserved})")
+        );
+        assert_eq!(out.len(), 1, "the other action still ran");
+        assert_eq!(republished(&out[0].1).topic, format!("ok/{reserved}"));
+    }
+    // Not reserved: another `$` topic, or a different case.
+    for open in ["$sys/x", "$SYSTEM/x"] {
+        let payload = Bytes::from(format!(r#"{{"t":"{open}"}}"#));
+        let (out, _) = effects(&set, &msg("t", &payload, &props));
+        assert_eq!(out.len(), 2, "{open}");
+    }
+}
+
+/// A rule that can never do what it says is loaded, with a warning saying why: a
+/// republish whose topic is always in `$SYS`, and a `FROM` on `$SYS`, which the broker's
+/// own messages never reach and clients can no longer publish to.
+#[test]
+fn rules_aimed_at_sys_load_with_a_warning() {
+    let warnings = |actions: &str, from: &str| {
+        RuleSet::parse(&format!(
+            "[rules.r]\nsql = 'SELECT * FROM {from}'\nactions = [{actions}]\n"
+        ))
+        .unwrap()
+        .warnings
+    };
+    let republish =
+        |topic: &str| format!("{{ function = \"republish\", args = {{ topic = \"{topic}\" }} }}");
+    for always in ["$SYS/x/${clientid}", "$SYS/", "$SYS"] {
+        let w = warnings(&republish(always), "\"t\"");
+        assert_eq!(w.len(), 1, "{always}: {w:?}");
+        assert!(
+            w[0].starts_with(&format!(
+                "rule `r`: republish topic \"{always}\" is in $SYS"
+            )),
+            "{w:?}"
+        );
+    }
+    // Not always reserved: the warning is for certainties only.
+    for maybe in ["${t}", "$SYS${t}", "$sys/x", "a/$SYS/b"] {
+        assert!(warnings(&republish(maybe), "\"t\"").is_empty(), "{maybe}");
+    }
+    for from in ["\"$SYS/#\"", "\"$SYS\"", "\"a\", \"$SYS/brokers/+/rules\""] {
+        let w = warnings("", from);
+        assert_eq!(w.len(), 1, "{from}: {w:?}");
+        assert!(w[0].contains("never matches"), "{w:?}");
+    }
+    assert!(warnings("", "\"$sys/#\", \"#\"").is_empty());
+    let w = check_sql("SELECT * FROM \"$SYS/#\"").unwrap();
+    assert!(w[0].starts_with("FROM \"$SYS/#\" never matches"), "{w:?}");
+}
+
+/// The trace records at most `per_sec` evaluations of a rule a second; the window is
+/// per rule, resets each second, and `no_result` has its own so it cannot starve the
+/// passed records of a rule whose WHERE rarely passes.
+#[test]
+fn the_trace_rate_window_is_per_rule_per_second() {
+    let set = load(
+        "[rules.a]\nsql = 'SELECT 1 FROM \"t\"'\n[rules.b]\nsql = 'SELECT 1 FROM \"t\"'\n\
+         [rules.c]\nsql = 'SELECT 1 FROM \"t\"'\n",
+    );
+    let (a, b, c) = (
+        set.get("a").unwrap(),
+        set.get("b").unwrap(),
+        set.get("c").unwrap(),
+    );
+    let t = 1_800_000_000;
+    let taken = |r: &Rule, now: u64, n: usize| (0..n).filter(|_| r.trace_due(now, 3)).count();
+    let no_result =
+        |r: &Rule, now: u64, n: usize| (0..n).filter(|_| r.no_result_trace_due(now, 2)).count();
+    assert_eq!(taken(a, t, 10), 3, "three in the second, then none");
+    assert_eq!(taken(b, t, 10), 3, "another rule has its own window");
+    assert_eq!(no_result(a, t, 10), 2, "no_result's window is its own");
+    assert_eq!(taken(a, t + 1, 10), 3, "the next second opens a new window");
+    assert_eq!(no_result(a, t + 1, 10), 2);
+    assert_eq!(
+        taken(a, t, 10),
+        0,
+        "a clock read a second behind counts against the newer, open window"
+    );
+    assert_eq!(
+        taken(a, t - 60, 10),
+        3,
+        "a clock stepped back opens its own"
+    );
+    assert!(!b.trace_due(t + 2, 0), "a rate of zero records nothing");
+    // The second is kept in 32 bits; the window still turns over where they wrap.
+    let wrap = 1 << 32;
+    assert_eq!(taken(c, wrap - 2, 10), 3);
+    assert_eq!(taken(c, wrap - 1, 10), 3);
+    assert_eq!(taken(c, wrap, 10), 3);
+    assert_eq!(taken(c, wrap - 1, 10), 0);
+}

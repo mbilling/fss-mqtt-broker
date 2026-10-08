@@ -143,6 +143,9 @@ pub struct HealthState {
     /// load balancers stop sending new clients, and `/statusz` says why; existing
     /// sessions stay connected.
     cordon: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// The rule engine, for the `/statusz` `rules` block (ADR 0084): filled once the
+    /// rules are loaded, after the health server is already up.
+    rules: Arc<OnceLock<crate::rules::Rules>>,
 }
 
 impl std::fmt::Debug for HealthState {
@@ -250,6 +253,7 @@ impl HealthState {
             stores: None,
             config: None,
             keys: None,
+            rules: Arc::new(OnceLock::new()),
         }
     }
 
@@ -401,6 +405,14 @@ impl HealthState {
     #[must_use]
     pub fn decommission_slot(&self) -> Arc<OnceLock<Arc<DrainStatus>>> {
         self.decommission.clone()
+    }
+
+    /// The slot the rule engine goes in once it is loaded (ADR 0084): `/statusz` then
+    /// reports the running rules' digest and counts, so the cluster view can show a node
+    /// whose rules differ.
+    #[must_use]
+    pub fn rules_slot(&self) -> Arc<OnceLock<crate::rules::Rules>> {
+        self.rules.clone()
     }
 
     /// Whether the hub actor loop is draining: it answers a ping within
@@ -753,6 +765,18 @@ impl HealthState {
                     ",\"config\":{{\"checksum\":\"{sum}\",\"generation\":{generation}}}"
                 );
             }
+        }
+        // The running rules (ADR 0084): per node, so "same digest everywhere" is the
+        // fleet's convergence check after a rules write, which reaches one node only.
+        if let Some(rules) = self.rules.get() {
+            let set = rules.current();
+            let _ = write!(
+                s,
+                ",\"rules\":{{\"digest\":\"{}\",\"rules\":{},\"enabled\":{}}}",
+                json_escape(set.digest()),
+                set.len(),
+                crate::reload::enabled_rules(&set)
+            );
         }
         // Online backup + restore (ADR 0062): the last export's age is the RPO an operator
         // alerts on, and a restore in progress is why this node is NotReady.
@@ -1228,6 +1252,57 @@ mod tests {
         let (rejoined, _) = guarded_state(2, true);
         let (status, _, _) = super::route(&rejoined, "/readyz").await;
         assert_eq!(status, 200, "once it has a peer it is no longer alone");
+    }
+
+    /// ADR 0084: once the rules are loaded, `/statusz` carries the running set's digest
+    /// and counts — the cluster view compares the digest across nodes — and follows a
+    /// reload. Before, there is no block.
+    #[tokio::test]
+    async fn statusz_reports_the_running_rules() {
+        let cluster = Arc::new(
+            mqtt_cluster::cluster_identity::ClusterIdentity::load_or_mint(true, None).unwrap(),
+        );
+        let state = HealthState::new(spawn_live_hub(), Some(placement(1)), None, 1).with_status(
+            "node-a".into(),
+            cluster,
+            Arc::new(super::BrownoutStatus::default()),
+            Arc::new(crate::reload::ConfigStamp::default()),
+            Arc::new(std::sync::OnceLock::new()),
+            None,
+        );
+        let (_, body, _) = super::route(&state, "/statusz").await;
+        assert!(
+            !body.contains("\"rules\""),
+            "no rules block before they load: {body}"
+        );
+
+        let parse = |text: &str| Arc::new(mqtt_rules::RuleSet::parse(text).unwrap().rules);
+        let first = parse(
+            "[rules.a]\nsql = 'SELECT * FROM \"t\"'\nactions = []\n\
+             [rules.b]\nsql = 'SELECT * FROM \"t\"'\nactions = []\nenable = false\n",
+        );
+        let digest = first.digest().to_string();
+        let (tx, rx) = tokio::sync::watch::channel(first);
+        let _ = state
+            .rules_slot()
+            .set(crate::rules::Rules::new(rx, Arc::from("node-a"), None));
+        let (_, body, _) = super::route(&state, "/statusz").await;
+        assert!(
+            body.contains(&format!(
+                "\"rules\":{{\"digest\":\"{digest}\",\"rules\":2,\"enabled\":1}}"
+            )),
+            "{body}"
+        );
+        let next = parse("");
+        let digest = next.digest().to_string();
+        tx.send(next).unwrap();
+        let (_, body, _) = super::route(&state, "/statusz").await;
+        assert!(
+            body.contains(&format!(
+                "\"rules\":{{\"digest\":\"{digest}\",\"rules\":0,\"enabled\":0}}"
+            )),
+            "{body}"
+        );
     }
 
     /// identity, membership view, brownout state (with a since-timestamp while

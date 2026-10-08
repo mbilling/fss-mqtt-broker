@@ -14,6 +14,8 @@ serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 # The rules file is TOML, like every other mqttd policy file (ADR 0046).
 toml.workspace = true
+# `edit`: one rule changed in place, the rest of the file byte for byte (ADR 0084).
+toml_edit.workspace = true
 # regex_match / regex_replace / regex_extract. `regex-automata` and `regex-syntax`
 # already ship in the broker (tracing-subscriber's env filter), and `regex` itself is
 # already in Cargo.lock; default features off keeps aho-corasick out of the binary.

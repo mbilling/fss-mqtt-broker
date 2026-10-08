@@ -619,14 +619,47 @@ pub struct Admin {
 
 /// The rule engine ([ADR 0083](../../../docs/adr/0083-rule-engine.md)): EMQX-compatible
 /// rule SQL evaluated on every publish, with `republish` and `console` actions
-/// (`docs/RULES.md`).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// (`docs/RULES.md`), and how its running rules are watched and edited
+/// ([ADR 0084](../../../docs/adr/0084-watching-and-editing-rules-live.md)).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Rules {
     /// The rules file (`MQTTD_RULES_FILE`), a TOML file of `[rules.<id>]` tables. Unset =
     /// no rules. Hot-reloadable: `SIGHUP` (or the config watch) re-reads it, validating
     /// before the swap — a file that does not load keeps the running rules.
     pub file: Option<String>,
+    /// Seconds between the per-rule statistics this node publishes on
+    /// `$SYS/brokers/<node>/rules` and `$SYS/brokers/<node>/rules/<id>`
+    /// (`MQTTD_RULES_SYS_INTERVAL`): counts, rates, last activity and last error, `QoS`
+    /// 0 and never retained. `0` (the default) = off; otherwise 1..=3600. Hot-reloadable: a
+    /// reload applies a new interval at once.
+    pub sys_interval_secs: u64,
+    /// The opt-in rule trace (`MQTTD_RULES_TRACE`, `1`/`0`): each evaluation's trigger
+    /// (topic, client id, username, up to 1 KiB of payload) and rendered outputs, on
+    /// `$SYS/brokers/<node>/trace/rules/<id>`. Off by default — it copies payloads onto
+    /// `$SYS`, so a subscribe grant on a rule's trace topic is a read grant on everything
+    /// its `FROM` matches. Hot-reloadable.
+    pub trace: bool,
+    /// Trace records per rule per second (`MQTTD_RULES_TRACE_RATE`, default 20,
+    /// 1..=1000); `no_result` evaluations have a budget of their own. Hot-reloadable.
+    pub trace_rate: u32,
+    /// Admin certificate subjects that may write the rules file through the admin API
+    /// (`MQTTD_RULES_ADMIN_WRITERS`, `;`-separated, same syntax as [`Admin::operators`]).
+    /// A writer also needs the `operator` role. Empty (the default) = rules writes off.
+    /// Needs the admin listener. Hot-reloadable.
+    pub admin_writers: Vec<String>,
+}
+
+impl Default for Rules {
+    fn default() -> Self {
+        Self {
+            file: None,
+            sys_interval_secs: 0,
+            trace: false,
+            trace_rate: 20,
+            admin_writers: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1097,8 +1130,9 @@ impl Config {
             return Ok(cfg);
         }
         // A rule written straight into the config (`[rules.<id>]` beside `[rules]`)
-        // is the natural mistake: the two share a name. Say where rules go.
-        let rules_hint = if unknown.iter().any(|k| k.starts_with("rules.")) {
+        // is the natural mistake: the two share a name. Say where rules go — but only
+        // for a table: `[rules] trace_rat = 5` is a typo of a `[rules]` key, not a rule.
+        let rules_hint = if unknown.iter().any(|k| is_rule_table(s, k)) {
             ". Rules are not written in this file: put the [rules.<id>] tables in a \
              rules file of their own and point [rules] file (MQTTD_RULES_FILE) at it \
              (docs/RULES.md)"
@@ -1605,6 +1639,19 @@ impl Config {
         on!("MQTTD_RULES_FILE", v, {
             self.rules.file = Some(v);
         });
+        // -- watching and editing rules live (ADR 0084) --
+        on!("MQTTD_RULES_SYS_INTERVAL", v, {
+            self.rules.sys_interval_secs = num("MQTTD_RULES_SYS_INTERVAL", &v)?;
+        });
+        on!("MQTTD_RULES_TRACE", v, {
+            self.rules.trace = on_off("MQTTD_RULES_TRACE", &v)?;
+        });
+        on!("MQTTD_RULES_TRACE_RATE", v, {
+            self.rules.trace_rate = num("MQTTD_RULES_TRACE_RATE", &v)?;
+        });
+        on!("MQTTD_RULES_ADMIN_WRITERS", v, {
+            self.rules.admin_writers = subject_list(&v);
+        });
         // -- admin API (ADR 0081) --
         on!("MQTTD_ADMIN_BIND", v, {
             self.admin.bind = Some(v);
@@ -1937,6 +1984,8 @@ impl Config {
             ));
         }
         self.refuse_invalid_admin().map_err(ConfigError::Invalid)?;
+        self.refuse_invalid_rules_watch()
+            .map_err(ConfigError::Invalid)?;
         // Ephemeral durability without the explicit opt-in (issue #240, ADR 0029
         // as-delivered): durable ON + no data_dir is quorum-of-RAM — refused rather
         // than warned. Checked last so a config broken in a more specific way is
@@ -2030,6 +2079,47 @@ impl Config {
         }
         Ok(())
     }
+
+    /// Watching and editing rules live (ADR 0084): the ranges of the `$SYS` statistics
+    /// and trace, the node id they put in a topic, and the admin listener a rules writer
+    /// writes through.
+    fn refuse_invalid_rules_watch(&self) -> Result<(), String> {
+        let rules = &self.rules;
+        if rules.sys_interval_secs > 3600 {
+            return Err(format!(
+                "rules.sys_interval_secs (MQTTD_RULES_SYS_INTERVAL) must be 0 (off) or \
+                 1..=3600 seconds, got {}",
+                rules.sys_interval_secs
+            ));
+        }
+        if !(1..=1000).contains(&rules.trace_rate) {
+            return Err(format!(
+                "rules.trace_rate (MQTTD_RULES_TRACE_RATE) must be 1..=1000 records per rule \
+                 per second, got {}",
+                rules.trace_rate
+            ));
+        }
+        // `$SYS/brokers/<node>/…`: a node id that is not one topic level would publish
+        // somewhere else entirely, or nowhere a subscriber's filter can name.
+        let id = &self.node.id;
+        if (rules.sys_interval_secs > 0 || rules.trace)
+            && (id.is_empty() || id.contains(['/', '+', '#', '\0']))
+        {
+            return Err(format!(
+                "node.id (MQTTD_NODE_ID) {id:?} is not a single topic level, and the rule \
+                 statistics and trace publish on $SYS/brokers/<node>/…: use an id without \
+                 '/', '+', '#' or NUL, or turn rules.sys_interval_secs and rules.trace off"
+            ));
+        }
+        if !rules.admin_writers.is_empty() && self.admin.bind.is_none() {
+            return Err(
+                "rules.admin_writers (MQTTD_RULES_ADMIN_WRITERS) is set but admin.bind is \
+                 not: rules are written through the admin API, which is off"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
 }
 
 impl Config {
@@ -2066,6 +2156,23 @@ impl Config {
             *url = redact_url(url, fingerprint);
         }
         c
+    }
+}
+
+/// Whether the unknown config key `key` is a table under `[rules]` in the config `text`
+/// (`[rules.<id>]`, or `[[rules.<id>]]`): the shape of a rule written into the config, as
+/// opposed to a misspelt `[rules]` key such as `trace_rat = 5`.
+fn is_rule_table(text: &str, key: &str) -> bool {
+    let Some(name) = key.strip_prefix("rules.") else {
+        return false;
+    };
+    let Ok(doc) = text.parse::<toml::Table>() else {
+        return false;
+    };
+    match doc.get("rules").and_then(|r| r.get(name)) {
+        Some(toml::Value::Table(_)) => true,
+        Some(toml::Value::Array(a)) => !a.is_empty() && a.iter().all(toml::Value::is_table),
+        _ => false,
     }
 }
 
@@ -2218,6 +2325,11 @@ pub const ENV_VARS: &[&str] = &[
     "MQTTD_AUDIT_SYSLOG",
     // rule engine (ADR 0083)
     "MQTTD_RULES_FILE",
+    // watching and editing rules live (ADR 0084)
+    "MQTTD_RULES_SYS_INTERVAL",
+    "MQTTD_RULES_TRACE",
+    "MQTTD_RULES_TRACE_RATE",
+    "MQTTD_RULES_ADMIN_WRITERS",
     // admin API (ADR 0081)
     "MQTTD_ADMIN_BIND",
     "MQTTD_ADMIN_CERT",
@@ -2387,6 +2499,163 @@ mod tests {
             !typo.contains("rules file"),
             "only a rules key gets the hint: {typo}"
         );
+        // ADR 0084: `[rules]` has keys of its own now, so a misspelt one is a typo, not a
+        // rule: only a table under `[rules]` gets the hint.
+        let typo = Config::from_toml("[rules]\ntrace_rat = 5\n")
+            .expect_err("unknown key")
+            .to_string();
+        assert!(typo.contains("rules.trace_rat"), "{typo}");
+        assert!(
+            !typo.contains("rules file"),
+            "a [rules] key typo is not a rule: {typo}"
+        );
+        let array = Config::from_toml("[[rules.high_temp]]\nsql = 'SELECT 1'\n")
+            .expect_err("a rule is not a config key")
+            .to_string();
+        assert!(array.contains("rules file of their own"), "{array}");
+    }
+
+    /// ADR 0084: the four `[rules]` keys for watching and editing rules live, from the
+    /// file and from the environment, with their defaults.
+    #[test]
+    fn the_rules_watch_keys_load_from_file_and_environment() {
+        let d = Config::default().rules;
+        assert_eq!(
+            (
+                d.sys_interval_secs,
+                d.trace,
+                d.trace_rate,
+                d.admin_writers.len()
+            ),
+            (0, false, 20, 0),
+            "statistics and trace off, 20 records a second, no writers"
+        );
+        let c = Config::from_toml(
+            "[rules]\nsys_interval_secs = 5\ntrace = true\ntrace_rate = 50\n\
+             [durable]\nallow_ephemeral = true\n",
+        )
+        .unwrap();
+        assert_eq!(c.rules.sys_interval_secs, 5);
+        assert!(c.rules.trace);
+        assert_eq!(c.rules.trace_rate, 50);
+
+        let mut c = Config::default();
+        c.overlay_from(getter(&[
+            ("MQTTD_RULES_SYS_INTERVAL", "2"),
+            ("MQTTD_RULES_TRACE", "on"),
+            ("MQTTD_RULES_TRACE_RATE", "5"),
+            // `;` separates subjects, because a subject contains commas.
+            (
+                "MQTTD_RULES_ADMIN_WRITERS",
+                "CN=rules-ui ; CN=ops, O=example ;",
+            ),
+        ]))
+        .unwrap();
+        assert_eq!(c.rules.sys_interval_secs, 2);
+        assert!(c.rules.trace);
+        assert_eq!(c.rules.trace_rate, 5);
+        assert_eq!(
+            c.rules.admin_writers,
+            vec!["CN=rules-ui", "CN=ops, O=example"]
+        );
+        let mut c = Config::default();
+        c.overlay_from(getter(&[("MQTTD_RULES_TRACE", "0")]))
+            .unwrap();
+        assert!(!c.rules.trace);
+
+        // A trace switch is on or off, never a guess; a number is a number.
+        for (var, bad) in [
+            ("MQTTD_RULES_TRACE", "maybe"),
+            ("MQTTD_RULES_SYS_INTERVAL", "soon"),
+            ("MQTTD_RULES_TRACE_RATE", "-1"),
+        ] {
+            let err = Config::default()
+                .overlay_from(getter(&[(var, bad)]))
+                .expect_err("an unparseable value must not be ignored");
+            assert!(err.to_string().contains(var), "{err}");
+        }
+    }
+
+    /// ADR 0084: the statistics interval and the trace rate are refused outside their
+    /// ranges, at startup, in `--check-config` and in a reload's precheck alike.
+    #[test]
+    fn the_rules_watch_ranges_are_refused_outside_their_bounds() {
+        let toml = |key: &str, v: &str| {
+            format!("[rules]\n{key} = {v}\n[durable]\nallow_ephemeral = true\n")
+        };
+        for (key, bad, named) in [
+            ("sys_interval_secs", "3601", "MQTTD_RULES_SYS_INTERVAL"),
+            ("trace_rate", "0", "MQTTD_RULES_TRACE_RATE"),
+            ("trace_rate", "1001", "MQTTD_RULES_TRACE_RATE"),
+        ] {
+            let err = Config::from_toml(&toml(key, bad)).expect_err("must be refused");
+            assert!(err.to_string().contains(named), "{key} = {bad}: {err}");
+        }
+        for (key, good) in [
+            ("sys_interval_secs", "0"),
+            ("sys_interval_secs", "1"),
+            ("sys_interval_secs", "3600"),
+            ("trace_rate", "1"),
+            ("trace_rate", "1000"),
+        ] {
+            assert!(
+                Config::from_toml(&toml(key, good)).is_ok(),
+                "{key} = {good} is inside the range"
+            );
+        }
+    }
+
+    /// ADR 0084: the statistics and the trace publish on `$SYS/brokers/<node>/…`, so with
+    /// either on the node id must be one topic level; with both off any id still boots.
+    #[test]
+    fn rule_statistics_and_trace_need_a_node_id_that_is_one_topic_level() {
+        let mut c = Config::default();
+        c.node.data_dir = Some("/var/lib/mqttd".into());
+        for id in ["a/b", "a+", "#", "a\0b", ""] {
+            c.node.id = id.into();
+            c.rules.sys_interval_secs = 0;
+            c.rules.trace = false;
+            assert!(c.validate().is_ok(), "{id:?} is fine while both are off");
+            c.rules.sys_interval_secs = 2;
+            let err = c.validate().expect_err("statistics need a topic-level id");
+            assert!(err.to_string().contains("node.id"), "{id:?}: {err}");
+            c.rules.sys_interval_secs = 0;
+            c.rules.trace = true;
+            let err = c.validate().expect_err("the trace needs a topic-level id");
+            assert!(
+                err.to_string().contains("single topic level"),
+                "{id:?}: {err}"
+            );
+        }
+        for id in ["node-local", "n1", "$weird but one level"] {
+            c.node.id = id.into();
+            c.rules.sys_interval_secs = 2;
+            c.rules.trace = true;
+            assert!(c.validate().is_ok(), "{id:?} is one topic level");
+        }
+    }
+
+    /// ADR 0084: rules are written through the admin API, so writers without the admin
+    /// listener could never write — refused, like every inert setting.
+    #[test]
+    fn rules_writers_need_the_admin_listener() {
+        let mut c = Config::default();
+        c.node.data_dir = Some("/var/lib/mqttd".into());
+        c.rules.admin_writers = vec!["CN=rules-ui".into()];
+        let err = c.validate().expect_err("writers without an admin API");
+        assert!(
+            err.to_string().contains("MQTTD_RULES_ADMIN_WRITERS"),
+            "{err}"
+        );
+        c.admin.bind = Some("0.0.0.0:9443".into());
+        c.admin.cert = Some("cert.pem".into());
+        c.admin.key = Some("key.pem".into());
+        c.admin.client_ca = Some("ca.pem".into());
+        c.admin.operators = vec!["CN=rules-ui".into()];
+        assert!(c.validate().is_ok());
+        c.rules.admin_writers.clear();
+        c.admin.bind = None;
+        assert!(c.validate().is_ok(), "no writers = writes off, valid");
     }
 
     /// Issue #230 / ADR 0058 T4: the refusal lists EVERY unknown key at once —
@@ -2983,7 +3252,9 @@ mod tests {
             | "MQTTD_ALLOW_EPHEMERAL_DURABILITY"
             | "MQTTD_ALLOW_RELAXED_PUBLISH"
             | "MQTTD_TLS_ALLOW_TLS12"
-            | "MQTTD_TLS_ALLOW_UNSAFE_TLS12_FEATURES" => "1",
+            | "MQTTD_TLS_ALLOW_UNSAFE_TLS12_FEATURES"
+            // An explicit on/off (anything else is refused) whose default is off.
+            | "MQTTD_RULES_TRACE" => "1",
             // Enums: any valid, non-default (default None) member.
             "MQTTD_SWIM_SIGNED" | "MQTTD_SWIM_REPLAY" => "require",
             "MQTTD_QUEUE_OVERFLOW" => "reject-newest",
@@ -3034,7 +3305,9 @@ mod tests {
             | "MQTTD_OIDC_MAX_STALE"
             | "MQTTD_BACKUP_EVERY"
             | "MQTTD_TLS_SESSION_CACHE"
-            | "MQTTD_ADMIN_PEER_PORT" => "7",
+            | "MQTTD_ADMIN_PEER_PORT"
+            | "MQTTD_RULES_SYS_INTERVAL"
+            | "MQTTD_RULES_TRACE_RATE" => "7",
             // The default is already 7 (backup.keep) / 300 (restore timeout), so "7" would
             // change nothing and the totality sweep would read as a missing mapping.
             // MQTTD_REPLICAS (ADR 0080): a valid factor that is not the default (2).
@@ -3184,8 +3457,10 @@ mod tests {
             // plus the seven MQTTD_ADMIN_* variables (ADR 0081).
             // plus MQTTD_HUB_INGRESS_BYTES, MQTTD_CONN_INGRESS_BYTES and
             // MQTTD_INGRESS_OVERLOAD (ADR 0082 T3),
-            // plus MQTTD_RULES_FILE (ADR 0083).
-            113,
+            // plus MQTTD_RULES_FILE (ADR 0083),
+            // plus MQTTD_RULES_SYS_INTERVAL, MQTTD_RULES_TRACE, MQTTD_RULES_TRACE_RATE and
+            // MQTTD_RULES_ADMIN_WRITERS (ADR 0084).
+            117,
             "the MQTTD_* surface changed — update ENV_VARS"
         );
         // Issue #239: MQTTD_MIN_REPLICAS was wired in `overlay_from` but never

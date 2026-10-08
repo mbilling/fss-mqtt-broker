@@ -4,7 +4,9 @@
 //! answer, close. Unlike health, admin requests carry a method, a query string and, for
 //! actions, a small body, so this parses all three — and nothing else. Every size and the
 //! time to send the request are capped, so a slow or oversized client costs a bounded
-//! amount before it is dropped.
+//! amount before it is dropped. The body's cap is the caller's to choose per method and
+//! path, after the head is read and before the body is: a rules file is larger than any
+//! other admin body, and only a caller who may send one is allowed to (ADR 0084).
 
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -13,6 +15,9 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 const MAX_HEAD: usize = 16 * 1024;
 /// Most bytes of request body accepted. Admin bodies are a few fields of JSON.
 pub const MAX_BODY: usize = 64 * 1024;
+/// Most bytes of body a rules route accepts from a caller whose role may call it
+/// (ADR 0084): a whole rules file, escaped as a JSON string.
+pub const MAX_RULES_BODY: usize = 1024 * 1024;
 /// How long a client has to send its whole request after the TLS handshake.
 pub const REQUEST_DEADLINE: Duration = Duration::from_secs(10);
 
@@ -51,12 +56,16 @@ pub enum ReadError {
     Closed,
 }
 
-/// Read one request from `stream`.
+/// Read one request from `stream`. `max_body(method, path)` is the most body bytes this
+/// request may carry, asked once the head is read and before any of the body is.
 ///
 /// # Errors
 /// [`ReadError`] for a malformed, oversized or truncated request; I/O errors are
 /// reported as [`ReadError::Closed`].
-pub async fn read_request<S: AsyncRead + Unpin>(stream: &mut S) -> Result<Request, ReadError> {
+pub async fn read_request<S: AsyncRead + Unpin>(
+    stream: &mut S,
+    max_body: impl Fn(&str, &str) -> usize,
+) -> Result<Request, ReadError> {
     let mut buf = Vec::new();
     let mut chunk = [0u8; 2048];
     let head_end = loop {
@@ -89,7 +98,8 @@ pub async fn read_request<S: AsyncRead + Unpin>(stream: &mut S) -> Result<Reques
             return Err(ReadError::Malformed);
         }
     }
-    if content_length > MAX_BODY {
+    let (path, query) = split_target(target)?;
+    if content_length > max_body(method, &path) {
         return Err(ReadError::TooLarge);
     }
     let mut body = buf[head_end + 4..].to_vec();
@@ -109,7 +119,6 @@ pub async fn read_request<S: AsyncRead + Unpin>(stream: &mut S) -> Result<Reques
             return Err(ReadError::Malformed);
         }
     }
-    let (path, query) = split_target(target)?;
     Ok(Request {
         method: method.to_string(),
         path,
@@ -201,7 +210,11 @@ pub async fn write_response<S: AsyncWrite + Unpin>(
         404 => "Not Found",
         405 => "Method Not Allowed",
         409 => "Conflict",
+        412 => "Precondition Failed",
         413 => "Payload Too Large",
+        422 => "Unprocessable Content",
+        428 => "Precondition Required",
+        500 => "Internal Server Error",
         503 => "Service Unavailable",
         _ => "",
     };
@@ -221,7 +234,7 @@ mod tests {
 
     async fn parse(raw: &[u8]) -> Result<Request, ReadError> {
         let mut input = raw;
-        read_request(&mut input).await
+        read_request(&mut input, |_, _| MAX_BODY).await
     }
 
     #[tokio::test]
@@ -269,6 +282,62 @@ mod tests {
             parse(b"GET /%zz HTTP/1.1\r\n\r\n").await,
             Err(ReadError::Malformed)
         );
+    }
+
+    /// The cap is chosen per request from its method and decoded path, before the body is
+    /// read: a body over it is refused from its `Content-Length` alone.
+    #[tokio::test]
+    async fn the_body_cap_is_chosen_per_method_and_path() {
+        let big = |method: &str, path: &str| {
+            format!(
+                "{method} {path} HTTP/1.1\r\nContent-Length: {}\r\n\r\n{}",
+                MAX_BODY + 1,
+                "x".repeat(MAX_BODY + 1)
+            )
+        };
+        let limit = |method: &str, path: &str| {
+            if (method, path) == ("PUT", "/admin/v1/rules") {
+                MAX_RULES_BODY
+            } else {
+                MAX_BODY
+            }
+        };
+        let read = |raw: String| async move {
+            let mut input = raw.as_bytes();
+            read_request(&mut input, limit).await
+        };
+        let req = read(big("PUT", "/admin/v1/%72ules?if_match=*"))
+            .await
+            .unwrap();
+        assert_eq!(req.body.len(), MAX_BODY + 1);
+        assert_eq!(
+            read(big("POST", "/admin/v1/rules")).await,
+            Err(ReadError::TooLarge)
+        );
+        let over = format!(
+            "PUT /admin/v1/rules HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
+            MAX_RULES_BODY + 1
+        );
+        assert_eq!(read(over).await, Err(ReadError::TooLarge));
+    }
+
+    /// Every status the admin API answers with has its reason phrase.
+    #[tokio::test]
+    async fn every_status_has_its_reason_phrase() {
+        for (status, phrase) in [
+            (412, "Precondition Failed"),
+            (422, "Unprocessable Content"),
+            (428, "Precondition Required"),
+            (500, "Internal Server Error"),
+        ] {
+            let mut out = Vec::new();
+            write_response(&mut out, status, "{}").await.unwrap();
+            let head = String::from_utf8(out).unwrap();
+            assert!(
+                head.starts_with(&format!("HTTP/1.1 {status} {phrase}\r\n")),
+                "{head}"
+            );
+        }
     }
 
     #[test]
