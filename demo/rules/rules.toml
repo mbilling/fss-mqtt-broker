@@ -760,9 +760,13 @@ actions = [
 #
 # The pseudonym is the first 16 hex digits (64 bits) of SHA-256 over a secret salt and the
 # home id: stable, so a consumer can follow one connection over time, and not reversible
-# without the salt. Keep this file as secret as the ACL file, and change the salt (say,
-# each quarter) to stop anyone linking the feed across periods. This is pseudonymisation,
-# not anonymisation: whoever holds the salt can re-identify.
+# without the salt. This is pseudonymisation, not anonymisation: whoever holds the salt can
+# re-identify. The demo's salt is public on purpose. A real deployment needs a high-entropy
+# random one (say, `openssl rand -hex 16`), never a name someone could guess: the rules
+# file's digest, an unsalted SHA-256 of the whole file, is published on /metrics, /statusz
+# and $SYS, so whoever knows the rest of the file can test guesses of the salt offline.
+# Keep this file as secret as the ACL file, and change the salt (for a new random one) to
+# stop anyone linking the feed across periods.
 #
 # In:  home/hh-142/p1  qos=0 retain=0  /XMX5LGBBLB7990718278 ... 0-0:1.0.0(260324170101W)
 #        ... 1-0:1.7.0(00.000*kW) 1-0:2.7.0(00.341*kW) ... 1-0:32.7.0(213.5*V)

@@ -69,6 +69,7 @@ The live rules demo is up.
   UI       http://localhost:$ui_port
   MQTT     $host:$mqtt_port (plaintext, anonymous)
   Health   http://localhost:$health_port/metrics
+  Admin    https://localhost:$admin_port (mTLS; certificates in the pki-client volume)
 
 Point any MQTT client at it. '#' never matches \$SYS topics, so those are named:
 

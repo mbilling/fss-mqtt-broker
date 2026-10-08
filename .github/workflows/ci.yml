@@ -319,6 +319,21 @@ jobs:
       - name: Deployment smoke (compose + systemd reference deployment)
         run: MQTTD_BIN=target/debug/mqttd ./scripts/deploy-smoke.sh
 
+      # ADR 0084 T9: the live rules demo's stack is not brought up here, so its files are
+      # at least read by their own tools: a broken compose file, a shell, Python or
+      # JavaScript syntax error fails this step instead of somebody's first up.sh. The
+      # editor's own refusals and headers are tested in crates/mqttd/tests/rules_demo.rs.
+      # The bytecode goes to the runner's temp dir, not into demo/.
+      - name: Live rules demo files parse (compose, shell, Python, JavaScript)
+        run: |
+          docker compose -f demo/rules-live/compose.yaml config -q
+          docker compose -f demo/rules-live/compose.yaml --profile admin config -q
+          bash -n demo/rules-live/up.sh
+          sh -n demo/rules-live/pki/gen.sh
+          PYTHONPYCACHEPREFIX="$RUNNER_TEMP/pycache" \
+            python3 -m py_compile demo/rules-live/ui/server.py demo/rules/live.py
+          node --check demo/rules-live/ui/app.js
+
       # Issue #263: the compose artifacts default to a PINNED image tag, and every mqttd
       # flag they hand that image must exist in the binary at that tag — the skew that
       # shipped a healthcheck no published image could pass. Tags are fetched explicitly

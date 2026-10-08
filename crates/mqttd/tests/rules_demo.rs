@@ -20,6 +20,10 @@
 //! devices offline where the script has them offline, and, against the real binary, that it
 //! rides out a broker restart and disconnects every device cleanly on SIGTERM.
 //!
+//! The demo stack's rule editor (`demo/rules-live/ui/`) is checked without the stack: its
+//! page renders text, never markup, and its server refuses what another web site could make
+//! a browser send it, and sends a strict Content-Security-Policy.
+//!
 //! The fixture is generated, not stored: it is about a megabyte, and everything under
 //! `demo/` is also copied into the `mqttui` bundle. After changing the simulator or the
 //! rules on purpose, regenerate the expected output and review its diff like any other
@@ -1201,6 +1205,392 @@ fn the_live_player_backs_off_and_keeps_devices_offline_where_the_script_does() {
         "how each connection ended"
     );
     assert_eq!(out["left"], serde_json::json!(["van"]));
+}
+
+/// The rule editor's script and page (`demo/rules-live/ui/`).
+const UI_SCRIPT: &str = "demo/rules-live/ui/app.js";
+const UI_PAGE: &str = "demo/rules-live/ui/index.html";
+
+/// Where each tag of an HTML page starts and ends (past its `>`). A `>` inside a quoted
+/// attribute value does not end the tag.
+fn html_tags(html: &str) -> Vec<(usize, usize)> {
+    let mut tags = Vec::new();
+    let mut from = 0;
+    while let Some(at) = html[from..].find('<') {
+        let start = from + at;
+        let mut quote = None;
+        let mut end = None;
+        for (i, c) in html[start..].char_indices() {
+            match quote {
+                Some(q) if c == q => quote = None,
+                None if c == '"' || c == '\'' => quote = Some(c),
+                None if c == '>' => {
+                    end = Some(start + i + 1);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        let end = end.unwrap_or_else(|| panic!("an unclosed tag: {}", &html[start..]));
+        tags.push((start, end));
+        from = end;
+    }
+    tags
+}
+
+/// A tag, lower-cased, with its quoted attribute values blanked: what is left is the tag
+/// name and the attribute names.
+fn tag_names(tag: &str) -> String {
+    let mut quote = None;
+    tag.chars()
+        .map(|c| match quote {
+            Some(q) => {
+                if c == q {
+                    quote = None;
+                }
+                ' '
+            }
+            None if c == '"' || c == '\'' => {
+                quote = Some(c);
+                ' '
+            }
+            None => c.to_ascii_lowercase(),
+        })
+        .collect()
+}
+
+/// The name of an `on…=` event handler attribute in a tag, if it has one.
+fn handler_attribute(tag: &str) -> Option<String> {
+    let bare = tag_names(tag);
+    let b = bare.as_bytes();
+    (1..b.len()).find_map(|i| {
+        if !b[i - 1].is_ascii_whitespace() || !b[i..].starts_with(b"on") {
+            return None;
+        }
+        let name = 2 + b[i + 2..]
+            .iter()
+            .take_while(|c| c.is_ascii_alphanumeric() || **c == b'_')
+            .count();
+        let after = b[i + name..].iter().find(|c| !c.is_ascii_whitespace());
+        (name > 2 && after == Some(&b'=')).then(|| bare[i..i + name].to_string())
+    })
+}
+
+/// The rule editor shows what anyone on the broker can publish, and holds a certificate
+/// that may rewrite the rules, so text from MQTT or the admin API must never become markup
+/// or code on its page. `app.js` uses none of the DOM's HTML parsers and runs no string as
+/// code: it builds the page from text (`textContent`, or text nodes). `index.html` has no
+/// inline script, no style element and no event handler attribute, so server.py's
+/// Content-Security-Policy can forbid all three (see
+/// [`the_rule_editors_server_refuses_foreign_requests_and_sends_strict_headers`]).
+#[test]
+fn the_rules_editor_renders_text_never_markup() {
+    let script = read(UI_SCRIPT);
+    let page = read(UI_PAGE);
+    for (file, text) in [(UI_SCRIPT, &script), (UI_PAGE, &page)] {
+        for sink in [
+            "innerHTML",
+            "outerHTML",
+            "insertAdjacentHTML",
+            "document.write",
+            "createContextualFragment",
+            "DOMParser",
+            "eval(",
+            "new Function",
+        ] {
+            assert!(
+                !text.contains(sink),
+                "{file} uses {sink}: text from MQTT or the admin API could become markup or \
+                 code there"
+            );
+        }
+    }
+    assert!(
+        script.len() > 1024 && script.contains(".textContent ="),
+        "{UI_SCRIPT} is not the page's script any more: {} bytes, setting textContent: {}",
+        script.len(),
+        script.contains(".textContent =")
+    );
+
+    let tags = html_tags(&page);
+    assert!(tags.len() > 50, "{UI_PAGE}: only {} tags found", tags.len());
+    let mut scripts = Vec::new();
+    for &(start, end) in &tags {
+        let tag = &page[start..end];
+        let bare = tag_names(tag);
+        let name: String = bare[1..]
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '!')
+            .collect();
+        assert_ne!(name, "style", "{UI_PAGE} has a style element: {tag}");
+        if name == "script" {
+            assert!(
+                bare.contains(" src=") && page[end..].starts_with("</script>"),
+                "{UI_PAGE} has an inline script: {tag}"
+            );
+            scripts.push(tag);
+        }
+        assert_eq!(
+            handler_attribute(tag),
+            None,
+            "{UI_PAGE} has an event handler attribute: {tag}"
+        );
+    }
+    assert_eq!(
+        scripts,
+        [r#"<script src="app.js" defer>"#],
+        "{UI_PAGE}'s scripts"
+    );
+    assert_eq!(
+        handler_attribute(r#"<button type="button" onClick = "go()">"#).as_deref(),
+        Some("onclick"),
+        "the event handler check finds a handler"
+    );
+    assert_eq!(
+        handler_attribute(r#"<input title="on=" data-x="1">"#),
+        None,
+        "the event handler check reads attribute names, not values"
+    );
+}
+
+/// Drives `demo/rules-live/ui/server.py` without a broker, for
+/// [`the_rule_editors_server_refuses_foreign_requests_and_sends_strict_headers`]: its pure
+/// `refusal()` on a table of requests, then its real handler on a free loopback port over
+/// raw HTTP. The admin API is unreachable (no certificates, and a port nothing listens
+/// on), and every call to `admin()` is recorded. Prints JSON.
+const UI_SERVER_HARNESS: &str = r#"
+import json, os, socket, sys, tempfile, threading
+from email.message import Message
+
+closed = socket.socket()
+closed.bind(("127.0.0.1", 0))  # held, never listening: a dial is refused
+tmp = tempfile.TemporaryDirectory()
+os.environ["UI_ADMIN"] = "127.0.0.1:%d" % closed.getsockname()[1]
+os.environ["UI_PKI"] = os.path.join(tmp.name, "no-pki")
+sys.path.insert(0, "demo/rules-live/ui")
+import server
+import sim.mqtt
+
+out = {"client": [m for m in ("poll", "drop") if callable(getattr(sim.mqtt.Client, m, None))]}
+
+P = 8070
+L, N = "localhost:%d" % P, "127.0.0.1:%d" % P
+JSON = ("Content-Type", "application/json")
+UI = ("X-Rules-UI", "1")
+
+
+def refusal(method, *headers):
+    h = Message()
+    for k, v in headers:
+        h[k] = v  # a second Host is a second header, as on the wire
+    r = server.refusal(method, h, P)
+    return None if r is None else [r[0], r[1]]
+
+
+out["refusal"] = {
+    "GET without Host": refusal("GET"),
+    "GET with two Hosts": refusal("GET", ("Host", L), ("Host", L)),
+    "GET for another name": refusal("GET", ("Host", "evil.example:%d" % P)),
+    "GET for another port": refusal("GET", ("Host", "localhost:%d" % (P + 1))),
+    "GET without a port": refusal("GET", ("Host", "localhost")),
+    "GET for [::1]": refusal("GET", ("Host", "[::1]:%d" % P)),
+    "GET for localhost": refusal("GET", ("Host", L)),
+    "GET for 127.0.0.1": refusal("GET", ("Host", N)),
+    "PUT without Origin": refusal("PUT", ("Host", L), JSON, UI),
+    "PUT from another site": refusal("PUT", ("Host", L), ("Origin", "http://evil.example"), JSON, UI),
+    "PUT from the other loopback": refusal("PUT", ("Host", L), ("Origin", "http://" + N), JSON, UI),
+    "PUT from https": refusal("PUT", ("Host", L), ("Origin", "https://" + L), JSON, UI),
+    "PUT from an opaque origin": refusal("PUT", ("Host", L), ("Origin", "null"), JSON, UI),
+    "PUT for another name, from it": refusal(
+        "PUT", ("Host", "evil.example:%d" % P), ("Origin", "http://evil.example:%d" % P), JSON, UI),
+    "PUT as a form": refusal(
+        "PUT", ("Host", L), ("Origin", "http://" + L),
+        ("Content-Type", "application/x-www-form-urlencoded"), UI),
+    "PUT as text": refusal("PUT", ("Host", L), ("Origin", "http://" + L), ("Content-Type", "text/plain"), UI),
+    "PUT without Content-Type": refusal("PUT", ("Host", L), ("Origin", "http://" + L), UI),
+    "PUT without X-Rules-UI": refusal("PUT", ("Host", L), ("Origin", "http://" + L), JSON),
+    "PUT with X-Rules-UI: 0": refusal("PUT", ("Host", L), ("Origin", "http://" + L), JSON, ("X-Rules-UI", "0")),
+    "PUT from this page": refusal(
+        "PUT", ("Host", L), ("Origin", "http://" + L), ("Content-Type", "application/json; charset=utf-8"), UI),
+    "POST from this page on 127.0.0.1": refusal("POST", ("Host", N), ("Origin", "http://" + N), JSON, UI),
+    "DELETE without Origin": refusal("DELETE", ("Host", L), JSON, UI),
+    "DELETE from this page": refusal("DELETE", ("Host", L), ("Origin", "http://" + L), JSON, UI),
+}
+
+calls = []
+dial = server.admin
+
+
+def admin(method, path, body):
+    calls.append([method, path])
+    return dial(method, path, body)
+
+
+server.admin = admin
+server.Handler.hub = server.Hub()  # no MQTT connection: no device message seen
+httpd = server.ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
+port = httpd.server_address[1]
+server.UI_PORT = port
+threading.Thread(target=httpd.serve_forever, daemon=True).start()
+HOST = "127.0.0.1:%d" % port
+
+
+def http(method, path, *headers, host=HOST):
+    lines = ["%s %s HTTP/1.1" % (method, path), "Host: " + host]
+    lines += ["%s: %s" % h for h in headers] + ["Connection: close", "", ""]
+    with socket.create_connection(("127.0.0.1", port), timeout=10) as s:
+        s.sendall("\r\n".join(lines).encode())
+        data = b""
+        while True:
+            chunk = s.recv(65536)
+            if not chunk:
+                break
+            data += chunk
+    head, _, body = data.partition(b"\r\n\r\n")
+    status, *fields = head.decode("latin-1").split("\r\n")
+    got = {"status": int(status.split()[1]), "headers": {}, "code": None}
+    for f in fields:
+        k, _, v = f.partition(":")
+        got["headers"][k.strip().lower()] = v.strip()
+    if got["headers"].get("content-type") == "application/json":
+        got["code"] = json.loads(body)["error"]["code"]
+    return got
+
+
+out["page"] = http("GET", "/")
+out["api"] = http("GET", "/api/latest?topic_filter=plant/%2B/poc/grid")
+out["rebound"] = http("GET", "/", host="evil.example:%d" % port)
+out["foreign_reset"] = http("PUT", "/api/reset", ("Origin", "http://evil.example"), JSON, UI)
+out["calls_after_foreign"] = list(calls)
+out["own_reset"] = http("PUT", "/api/reset", ("Origin", "http://" + HOST), JSON, UI)
+out["calls"] = calls
+httpd.shutdown()
+httpd.server_close()
+closed.close()
+tmp.cleanup()
+print(json.dumps(out))
+"#;
+
+/// What `refusal()` answers each request of [`UI_SERVER_HARNESS`]'s table: refused, with
+/// a status and a code, or served (`None`).
+const UI_REFUSALS: [(&str, Option<(u16, &str)>); 23] = [
+    ("GET without Host", Some((403, "bad-host"))),
+    ("GET with two Hosts", Some((403, "bad-host"))),
+    ("GET for another name", Some((403, "bad-host"))),
+    ("GET for another port", Some((403, "bad-host"))),
+    ("GET without a port", Some((403, "bad-host"))),
+    ("GET for [::1]", Some((403, "bad-host"))),
+    ("GET for localhost", None),
+    ("GET for 127.0.0.1", None),
+    ("PUT without Origin", Some((403, "bad-origin"))),
+    ("PUT from another site", Some((403, "bad-origin"))),
+    ("PUT from the other loopback", Some((403, "bad-origin"))),
+    ("PUT from https", Some((403, "bad-origin"))),
+    ("PUT from an opaque origin", Some((403, "bad-origin"))),
+    ("PUT for another name, from it", Some((403, "bad-host"))),
+    ("PUT as a form", Some((415, "bad-content-type"))),
+    ("PUT as text", Some((415, "bad-content-type"))),
+    ("PUT without Content-Type", Some((415, "bad-content-type"))),
+    ("PUT without X-Rules-UI", Some((403, "missing-header"))),
+    ("PUT with X-Rules-UI: 0", Some((403, "missing-header"))),
+    ("PUT from this page", None),
+    ("POST from this page on 127.0.0.1", None),
+    ("DELETE without Origin", Some((403, "bad-origin"))),
+    ("DELETE from this page", None),
+];
+
+/// The rule editor's server holds a certificate that may rewrite the rules and asks
+/// nobody for a password, so it refuses what another web site could make a browser send
+/// it. It serves only `Host: localhost:<port>` or `127.0.0.1:<port>`, one Host, with its
+/// port (a name rebound to 127.0.0.1 is refused). A GET needs nothing more; a request that
+/// changes something needs this page's exact Origin, a JSON body and `X-Rules-UI: 1`.
+/// Over HTTP, every answer carries a Content-Security-Policy that allows only the server's
+/// own script and style, never inline ones, with `nosniff` and `no-referrer`; an /api/
+/// answer is not cached; and "Reset to the shipped rules" from a foreign Origin is refused
+/// before the admin API is called, while the same request from the page calls it. The
+/// server's MQTT client is the simulators' `Client`, which must keep the `poll` and `drop`
+/// the server relies on.
+#[test]
+fn the_rule_editors_server_refuses_foreign_requests_and_sends_strict_headers() {
+    let out: serde_json::Value = serde_json::from_str(&python_out_env(
+        &["-c", UI_SERVER_HARNESS],
+        &[("UI_RULES", "demo/rules")],
+    ))
+    .expect("JSON");
+    assert_eq!(
+        out["client"],
+        serde_json::json!(["poll", "drop"]),
+        "sim.mqtt.Client's methods server.py uses"
+    );
+
+    let refusals = out["refusal"].as_object().expect("the refusal table");
+    for (case, want) in UI_REFUSALS {
+        let want = want.map_or(serde_json::Value::Null, |(status, code)| {
+            serde_json::json!([status, code])
+        });
+        assert_eq!(refusals.get(case), Some(&want), "refusal(): {case}");
+    }
+    assert_eq!(refusals.len(), UI_REFUSALS.len(), "{out}");
+
+    let header_of = |answer: &str, name: &str| {
+        out[answer]["headers"][name]
+            .as_str()
+            .unwrap_or_default()
+            .to_string()
+    };
+    assert_eq!(out["page"]["status"], 200, "{out}");
+    assert!(
+        header_of("page", "content-type").starts_with("text/html"),
+        "{out}"
+    );
+    for answer in ["page", "rebound", "foreign_reset"] {
+        let csp = header_of(answer, "content-security-policy");
+        for directive in [
+            "default-src 'self'",
+            "script-src 'self'",
+            "style-src 'self'",
+            "frame-ancestors 'none'",
+        ] {
+            assert!(
+                csp.contains(directive),
+                "{answer}: the CSP {csp:?} lacks {directive}"
+            );
+        }
+        assert!(
+            !csp.contains("unsafe"),
+            "{answer}: the CSP {csp:?} allows inline or eval'd code"
+        );
+        assert_eq!(
+            header_of(answer, "x-content-type-options"),
+            "nosniff",
+            "{answer}"
+        );
+        assert_eq!(
+            header_of(answer, "referrer-policy"),
+            "no-referrer",
+            "{answer}"
+        );
+    }
+    assert_eq!(out["api"]["status"], 404, "{out}");
+    assert_eq!(out["api"]["code"], "no-input", "{out}");
+    assert_eq!(header_of("api", "cache-control"), "no-store", "{out}");
+    assert_eq!(out["rebound"]["status"], 403, "{out}");
+    assert_eq!(out["rebound"]["code"], "bad-host", "{out}");
+
+    assert_eq!(out["foreign_reset"]["status"], 403, "{out}");
+    assert_eq!(out["foreign_reset"]["code"], "bad-origin", "{out}");
+    assert_eq!(
+        out["calls_after_foreign"],
+        serde_json::json!([]),
+        "a refused reset called the admin API"
+    );
+    assert_eq!(out["own_reset"]["status"], 502, "{out}");
+    assert_eq!(out["own_reset"]["code"], "admin-unreachable", "{out}");
+    assert_eq!(
+        out["calls"],
+        serde_json::json!([["PUT", "/admin/v1/rules?if_match=%2A"]]),
+        "the page's own reset calls the admin API once, to replace whatever is there"
+    );
 }
 
 /// The rules file for [`the_live_simulator_rides_out_a_broker_restart_and_stops_cleanly`]:

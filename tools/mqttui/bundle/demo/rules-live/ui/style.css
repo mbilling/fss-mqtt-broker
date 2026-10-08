@@ -161,6 +161,23 @@ td[data-key="error"] {
   overflow-wrap: anywhere;
 }
 
+td[data-key="from"],
+td[data-key="to"] {
+  min-width: 9rem;
+  max-width: 16rem;
+}
+
+.desc {
+  display: block;
+  max-width: 14rem;
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 0.75rem;
+  font-weight: normal;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 tr.selected {
   background: var(--select);
 }
@@ -238,6 +255,10 @@ input[readonly] {
   font-weight: 600;
 }
 
+.row .hint {
+  margin: 0 0 0.3rem;
+}
+
 .check {
   display: flex;
   align-items: center;
@@ -293,6 +314,12 @@ legend {
   color: var(--bad);
 }
 
+.notice {
+  padding: 0.3rem 0.6rem;
+  border-left: 3px solid var(--bad);
+  background: var(--warn-bg);
+}
+
 .busy,
 .hint {
   color: var(--muted);
@@ -317,6 +344,29 @@ legend {
 .feed > li {
   padding: 0.35rem 0;
   border-bottom: 1px solid var(--line);
+}
+
+.feed.hide-no-result > li.no_result {
+  display: none;
+}
+
+.cmd {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+  margin-bottom: 0.5rem;
+}
+
+.cmd code {
+  flex: 1;
+  min-width: 0;
+  padding: 0.3rem 0.4rem;
+  border-radius: 3px;
+  background: var(--code);
+  font-size: 0.75rem;
+  overflow-wrap: anywhere;
+  user-select: all;
 }
 
 .meta {

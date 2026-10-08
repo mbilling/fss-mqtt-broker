@@ -9,10 +9,13 @@ const RULE_ID = /^[A-Za-z_][A-Za-z0-9_-]{0,63}$/;
 const DEVICE_ROOTS = ["plant", "home", "vehicle"];
 const KEEP_DATA = 500; // messages kept for the filter
 const SHOW_DATA = 200; // messages shown
-const KEEP_TRACE = 20; // trace records kept per rule
+const KEEP_TRACE = 20; // trace records kept per rule, and as many no_result records again
+const RATE_WINDOW = 10000; // ms of counts a rate is taken over
 
+const NO_RESULT = "FROM matched, but WHERE was false (or FOREACH produced nothing): nothing was published.";
+
+// New rule's example; its id is demo_rule_<n>, the first one free.
 const NEW_RULE = {
-  id: "demo_grid_deviation",
   description: "Grid frequency more than 20 mHz off 50 Hz",
   enable: true,
   sql: [
@@ -32,12 +35,16 @@ const NEW_RULE = {
 const state = {
   list: null, // the last GET /api/rules answer
   stats: new Map(), // rule id -> its latest $SYS record
+  history: new Map(), // rule id -> [{t, matched, passed}], the last RATE_WINDOW of its counts
   traces: new Map(), // rule id -> its latest trace records, newest first
+  traceItems: new WeakMap(), // trace record -> its item on the page
   summary: null, // the latest $SYS summary
   summaryAt: 0, // when it arrived (ms)
   interval: 2, // seconds between summaries
   mqttUpSince: 0, // when the server's MQTT connection came up, or 0
   selected: null, // the rule in the editor; null for a new one
+  editorDigest: null, // the rules file the editor's text came from: its writes' if_match
+  editorBase: undefined, // the rule as it was in that file (see followFile); undefined: not known yet
   awaiting: null, // {digest, out}: an Apply waiting to see its digest on $SYS
   fileDigest: null, // the digest the whole-file editor was loaded at
   data: [], // recent device and derived messages, oldest first
@@ -70,6 +77,15 @@ function ago(when) {
   if (s < 60) return `${s} s ago`;
   if (s < 3600) return `${Math.floor(s / 60)} min ago`;
   return clock(ms);
+}
+
+// A topic or filter as text that may wrap after each "/".
+function topicText(parent, text) {
+  text.split("/").forEach((level, i) => {
+    if (i) parent.append("/", document.createElement("wbr"));
+    parent.append(level);
+  });
+  return parent;
 }
 
 function count(n) {
@@ -134,6 +150,7 @@ async function loadRules() {
   state.list = r.body;
   renderHeader();
   renderRules();
+  followFile();
 }
 
 function scheduleRefresh() {
@@ -172,10 +189,12 @@ function renderHeader() {
   } else if (l && Array.isArray(l.rules)) {
     $("s-count").textContent = `${l.rules.filter((r) => r.enabled).length} of ${l.rules.length} enabled`;
   }
+  renderTraceHead();
   const reload = (s && s.reload) || (l && l.reload);
   if (reload) {
     const outcome = reload.applied ? "applied" : `rejected (${reload.error_kind || "error"})`;
-    const repeats = reload.repeats ? `, ${reload.repeats + 1} times` : "";
+    // Repeats count the same attempt failing again; every success would match the last.
+    const repeats = !reload.applied && reload.repeats ? `, ${reload.repeats + 1} times` : "";
     $("s-reload").textContent = `${reload.trigger}: ${outcome}${repeats}, ${ago(reload.at)}`;
     $("s-reload").title = reload.error || "";
   }
@@ -183,7 +202,25 @@ function renderHeader() {
 
 function renderRules() {
   const rules = (state.list && state.list.rules) || [];
-  $("rules").tBodies[0].replaceChildren(...rules.map(ruleRow));
+  const body = $("rules").tBodies[0];
+  // A rebuilt row is a new button: keyboard focus on the old one would fall to <body>.
+  const focused = body.contains(document.activeElement) ? document.activeElement.closest("tr").dataset.id : null;
+  body.replaceChildren(...rules.map(ruleRow));
+  if (focused !== null) {
+    const tr = body.querySelector(`tr[data-id="${CSS.escape(focused)}"]`);
+    if (tr) tr.querySelector("button").focus();
+  }
+}
+
+// Which row is in the editor, without rebuilding the table (which would drop the focus).
+function markSelected() {
+  for (const tr of $("rules").tBodies[0].rows) {
+    const on = tr.dataset.id === state.selected;
+    tr.classList.toggle("selected", on);
+    const pick = tr.querySelector("button");
+    if (on) pick.setAttribute("aria-current", "true");
+    else pick.removeAttribute("aria-current");
+  }
 }
 
 function ruleRow(rule) {
@@ -199,13 +236,22 @@ function ruleRow(rule) {
     pick.setAttribute("aria-current", "true");
   }
   th.append(pick);
+  if (rule.description) {
+    const desc = el("span", rule.description, "desc");
+    desc.title = rule.description;
+    th.append(desc);
+  }
   tr.append(th);
   const from = [].concat(rule.from || [], rule.events || []).join(", ");
-  for (const [key, text] of [["on", ""], ["from", from], ["matched"], ["passed"], ["no_result"],
-    ["failed"], ["actions_failed"], ["rate"], ["active"], ["error"]]) {
-    const td = el("td", text);
+  // Where it publishes: the topic templates of its republish actions.
+  const to = (rule.actions_spec || []).map((a) => (a && a.function === "republish" && a.args
+    ? a.args.topic : a && a.function)).filter((t) => typeof t === "string").join(", ");
+  for (const [key, text] of [["on", ""], ["from", from], ["to", to], ["matched"], ["passed"], ["no_result"],
+    ["failed"], ["actions_failed"], ["matched_rate"], ["passed_rate"], ["active"], ["error"]]) {
+    const td = el("td");
+    if (text) topicText(td, text);
     td.dataset.key = key;
-    if (!["on", "from", "active", "error"].includes(key)) td.className = "num";
+    if (!["on", "from", "to", "active", "error"].includes(key)) td.className = "num";
     tr.append(td);
   }
   fillRow(tr, rule, state.stats.get(rule.id));
@@ -222,8 +268,9 @@ function fillRow(tr, rule, live) {
     cell(k).textContent = count(counts[k]);
   }
   tr.classList.toggle("failing", (counts.failed || 0) + (counts.actions_failed || 0) > 0);
-  const rate = live && live.rates ? live.rates.matched : undefined;
-  cell("rate").textContent = typeof rate === "number" ? rate.toFixed(1) : "-";
+  const r = rates(rule.id);
+  cell("matched_rate").textContent = r ? r.matched.toFixed(2) : "-";
+  cell("passed_rate").textContent = r ? r.passed.toFixed(2) : "-";
   cell("active").textContent = src.last_active_at ? ago(src.last_active_at) : "never";
   // $SYS leaves the message out while the trace is off; the list has it for an operator.
   let err = src.last_error;
@@ -231,6 +278,30 @@ function fillRow(tr, rule, live) {
   const errCell = cell("error");
   errCell.textContent = err ? `${err.kind}${err.message ? `: ${err.message}` : ""} (${ago(err.at)})` : "";
   errCell.title = err && err.message ? err.message : "";
+}
+
+// The broker's own rates are per tick, so they jump with each tick's luck; the table's
+// come from the counts over the last RATE_WINDOW.
+function sample(id, rec) {
+  const t = Date.parse(rec.at);
+  const c = rec.counts || {};
+  if (!t || typeof c.matched !== "number" || typeof c.passed !== "number") return;
+  let h = state.history.get(id) || [];
+  const last = h[h.length - 1];
+  if (last && t === last.t) return;
+  if (last && (t < last.t || c.matched < last.matched)) h = []; // the broker restarted
+  h.push({ t, matched: c.matched, passed: c.passed });
+  while (h.length > 2 && h[1].t <= t - RATE_WINDOW) h.shift();
+  state.history.set(id, h);
+}
+
+function rates(id) {
+  const h = state.history.get(id);
+  if (!h || h.length < 2) return null;
+  const a = h[0];
+  const b = h[h.length - 1];
+  const secs = (b.t - a.t) / 1000;
+  return { matched: (b.matched - a.matched) / secs, passed: (b.passed - a.passed) / secs };
 }
 
 function updateRow(id) {
@@ -249,30 +320,90 @@ function fillEditor(rule) {
   $("f-actions").value = rule.actions ? JSON.stringify(rule.actions, null, 2) : "";
 }
 
+function findRule(id) {
+  return state.list && state.list.rules.find((r) => r.id === id);
+}
+
+// What a write would change of a rule, to tell whether another write changed it.
+function snapshot(rule) {
+  return rule ? JSON.stringify([rule.description, rule.enabled, rule.sql, rule.actions_spec]) : "";
+}
+
 function selectRule(id) {
-  const rule = state.list && state.list.rules.find((r) => r.id === id);
+  const rule = findRule(id);
   if (!rule) return;
   state.selected = id;
+  state.editorDigest = state.list.file_digest;
+  state.editorBase = state.list.in_sync ? snapshot(rule) : undefined;
   $("editing").textContent = id;
   $("f-id").readOnly = true;
   $("b-delete").disabled = false;
   fillEditor({ id, description: rule.description, enable: rule.enabled, sql: rule.sql, actions: rule.actions_spec });
   $("r-out").replaceChildren();
+  $("r-changed").hidden = true;
   if (rule.redacted) say($("r-out"), "error", "The admin API answered as to a viewer: no SQL or actions.");
-  renderRules();
+  resetTestInput();
+  markSelected();
   renderTrace();
+  $("h-editor").focus();
 }
 
 function newRule() {
   state.selected = null;
+  state.editorDigest = state.list ? state.list.file_digest : null;
+  state.editorBase = undefined;
   $("editing").textContent = "(new)";
   $("f-id").readOnly = false;
   $("b-delete").disabled = true;
-  fillEditor(NEW_RULE);
+  const ids = new Set(((state.list && state.list.rules) || []).map((r) => r.id));
+  let n = 1;
+  while (ids.has(`demo_rule_${n}`)) n++;
+  fillEditor({ id: `demo_rule_${n}`, ...NEW_RULE });
   $("r-out").replaceChildren();
-  renderRules();
+  $("r-changed").hidden = true;
+  resetTestInput();
+  markSelected();
   renderTrace();
   $("f-id").focus();
+}
+
+// Another rule's message would only answer no_match.
+function resetTestInput() {
+  $("t-latest").checked = true;
+  $("t-topic").value = "";
+  $("t-payload").value = "";
+}
+
+// After each new rules list. The editor's writes carry the digest of the file its text
+// came from, so a write made over another tab's change is refused. When the file changed
+// but the open rule did not, the editor moves on to the new file: nothing would be lost.
+// The list shows the running rules, which are the file's only while the two are in sync.
+function followFile() {
+  const l = state.list;
+  if (!l || !l.in_sync) return;
+  if (state.selected === null) {
+    // A new rule: Apply asks before it replaces a rule this list has.
+    if (state.editorDigest) state.editorDigest = l.file_digest;
+    return;
+  }
+  const now = snapshot(findRule(state.selected));
+  if (l.file_digest === state.editorDigest) {
+    state.editorBase = now;
+  } else if (state.editorBase === undefined) {
+    // Not known what the rule was: a write is refused, and says why.
+  } else if (now === state.editorBase) {
+    state.editorDigest = l.file_digest;
+    $("r-changed").hidden = true;
+  } else {
+    const note = $("r-changed");
+    note.textContent = now
+      ? `${state.selected} changed since you opened it, in another tab or client. To see the ` +
+        "newer version, choose it in the table (your edit here is lost). Apply is refused once; " +
+        "a second Apply replaces that change."
+      : `${state.selected} was deleted since you opened it, in another tab or client. Apply is ` +
+        "refused once; a second Apply puts it back.";
+    note.hidden = false;
+  }
 }
 
 function ruleFromEditor() {
@@ -299,6 +430,55 @@ function fromFilters(sql) {
   return m ? Array.from(m[1].matchAll(/"([^"]*)"/g), (x) => x[1]) : [];
 }
 
+// Rules do not chain: a rule never runs on a message a rule published. What the other
+// rules publish to, as filters: each republish topic up to its first ${…} level. A topic
+// that starts with one says nothing, and is left out.
+function derivedFilters(exceptId) {
+  const found = [];
+  for (const r of (state.list && state.list.rules) || []) {
+    if (r.id === exceptId) continue;
+    for (const a of r.actions_spec || []) {
+      const topic = a && a.function === "republish" && a.args && a.args.topic;
+      if (typeof topic !== "string") continue;
+      const levels = topic.split("/");
+      const fixed = levels.findIndex((l) => l.includes("${"));
+      if (fixed === 0) continue;
+      found.push({ rule: r.id, topic, filter: fixed < 0 ? topic : [...levels.slice(0, fixed), "#"].join("/") });
+    }
+  }
+  return found;
+}
+
+// Whether some topic matches both filters.
+function filtersOverlap(a, b) {
+  const x = a.split("/");
+  const y = b.split("/");
+  const wild = (l) => l === "+" || l === "#";
+  if ((x[0].startsWith("$") && wild(y[0])) || (y[0].startsWith("$") && wild(x[0]))) return false;
+  for (let i = 0; ; i++) {
+    if (x[i] === "#" || y[i] === "#") return true;
+    if (i === x.length || i === y.length) return x.length === y.length;
+    if (x[i] !== "+" && y[i] !== "+" && x[i] !== y[i]) return false;
+  }
+}
+
+// After Check, Test and Apply: the edited rule's FROM covers what other rules publish.
+function chainWarning(out, rule) {
+  const derived = derivedFilters(rule.id);
+  const hits = new Map(); // other rule id -> a topic it publishes to
+  for (const f of fromFilters(rule.fields.sql)) {
+    if (f.startsWith("$events/")) continue;
+    for (const d of derived) {
+      if (!hits.has(d.rule) && filtersOverlap(f, d.filter)) hits.set(d.rule, d.topic);
+    }
+  }
+  if (!hits.size) return;
+  const named = [...hits].slice(0, 3).map(([id, topic]) => `${id} (${topic})`).join(", ");
+  const more = hits.size > 3 ? `, and ${hits.size - 3} more` : "";
+  out.append(el("p", `Its FROM matches topics other rules publish to: ${named}${more}. Rules do not ` +
+    "chain, so this rule does not run on those messages, only on what clients publish there.", "notice"));
+}
+
 async function testInput(rule) {
   if ($("t-custom").checked) {
     return { body: { topic: $("t-topic").value, payload: $("t-payload").value, payload_encoding: "utf8" } };
@@ -311,12 +491,15 @@ async function testInput(rule) {
     const r = await api("GET", `/api/latest?${q}`);
     if (r.status !== 200) return { error: errorText(r) };
     const m = r.body;
-    // Shown in the custom fields too, so it can be edited and tested again.
+    // Shown in the custom fields too, so it can be edited and tested again. A binary
+    // payload cannot be: a message of your own is sent as text.
+    const binary = m.payload_encoding !== "utf8";
     $("t-topic").value = m.topic;
-    if (m.payload_encoding === "utf8") $("t-payload").value = m.payload;
+    $("t-payload").value = binary ? "" : m.payload;
     return {
       body: { topic: m.topic, payload: m.payload, payload_encoding: m.payload_encoding },
-      note: `the latest ${m.topic} (${count(m.bytes)} bytes, received ${clock(m.at)})`,
+      note: `the latest ${m.topic} (${count(m.bytes)} bytes, received ${clock(m.at)}` +
+        `${binary ? "; binary: tested as received, a message of your own needs a text payload" : ""})`,
     };
   }
   if (filters.length) {
@@ -342,6 +525,10 @@ async function checkRule() {
   }
   say(out, "busy", "Checking…");
   showCheck(out, await api("POST", "/api/check", { rule: { id: rule.id, ...rule.fields } }), $("f-sql"));
+  if (state.selected === null && findRule(rule.id)) {
+    out.append(el("p", `A rule named ${rule.id} already exists: Apply would replace it.`, "notice"));
+  }
+  chainWarning(out, rule);
 }
 
 async function testRule() {
@@ -353,6 +540,11 @@ async function testRule() {
     say(out, "error", e.message);
     return;
   }
+  await showTest(out, rule);
+  chainWarning(out, rule);
+}
+
+async function showTest(out, rule) {
   say(out, "busy", "Testing…");
   const input = await testInput(rule);
   if (input.error) {
@@ -369,10 +561,11 @@ async function testRule() {
   for (const res of r.body.results || []) {
     const box = el("div", undefined, "result");
     const head = el("p");
-    head.append(el("strong", res.rule), " ", el("span", res.result, `badge ${res.result}`));
+    head.append(el("strong", res.rule), " ", badge(res.result));
     if (res.enabled === false) head.append(" (tested as if enabled: it is disabled)");
     box.append(head);
     if (res.reason) box.append(el("p", res.reason));
+    if (res.result === "no_result") box.append(el("p", NO_RESULT, "hint"));
     if (res.error) box.append(el("p", res.error, "error"));
     box.append(outputList(res.outputs));
     out.append(box);
@@ -388,11 +581,19 @@ async function applyRule() {
     say(out, "error", e.message);
     return;
   }
+  if (state.selected === null && findRule(rule.id) &&
+    !confirm(`A rule named ${rule.id} already exists. Replace it?`)) {
+    say(out, "hint", `Nothing written. Choose another id, or choose ${rule.id} in the table to edit it.`);
+    return;
+  }
   const q = new URLSearchParams({ id: rule.id });
-  if (state.list && state.list.file_digest) q.set("if_match", state.list.file_digest);
+  if (state.editorDigest) q.set("if_match", state.editorDigest);
   say(out, "busy", "Applying…");
   const r = await api("PUT", `/api/rule?${q}`, rule.fields);
-  showWrite(out, r, $("f-sql"));
+  showWrite(out, r, $("f-sql"), "The rules list is reloaded now. Your edit is still here: Apply " +
+    "again to write it over the newer file, or choose the rule in the table to load its newer version.");
+  chainWarning(out, rule);
+  wrote(r);
   if (r.status === 200) {
     state.selected = rule.id;
     $("editing").textContent = rule.id;
@@ -404,13 +605,16 @@ async function applyRule() {
 
 async function deleteRule() {
   const id = state.selected;
-  if (!id || !confirm(`Delete ${id} from the rules file? Its statistics go with it.`)) return;
+  if (!id || !confirm(`Delete ${id} from the rules file? Its statistics stop being published ` +
+    "(and resume if a rule with this id comes back).")) return;
   const out = $("r-out");
   const q = new URLSearchParams({ id });
-  if (state.list && state.list.file_digest) q.set("if_match", state.list.file_digest);
+  if (state.editorDigest) q.set("if_match", state.editorDigest);
   say(out, "busy", "Deleting…");
   const r = await api("DELETE", `/api/rule?${q}`);
-  showWrite(out, r, null);
+  showWrite(out, r, null, "The rules list is reloaded now: Delete again to delete it from the " +
+    "newer file, or choose the rule in the table to see its newer version.");
+  wrote(r);
   if (r.status === 200) {
     state.selected = null;
     $("editing").textContent = `(${id} deleted)`;
@@ -418,6 +622,16 @@ async function deleteRule() {
     $("b-delete").disabled = true;
   }
   await loadRules();
+}
+
+// The single-rule editor's next write goes over the file this one wrote, or, after a
+// conflict, over the newer one, so a second Apply does what the answer says it does.
+function wrote(r) {
+  const digest = r.status === 200 ? r.body.digest : r.status === 412 ? errorField(r, "file_digest") : null;
+  if (!digest) return;
+  state.editorDigest = digest;
+  state.editorBase = undefined;
+  $("r-changed").hidden = true;
 }
 
 // ---- the whole file ----------------------------------------------------------------------
@@ -450,8 +664,10 @@ async function applyFile() {
   const q = new URLSearchParams({ if_match: state.fileDigest });
   say(out, "busy", "Applying…");
   const r = await api("PUT", `/api/rules?${q}`, { source: $("f-source").value });
-  showWrite(out, r, $("f-source"));
+  showWrite(out, r, $("f-source"), "The file changed since you loaded it. Apply again to replace " +
+    "it with your text (the newer changes are lost), or copy your text and Load to merge.");
   if (r.status === 200) state.fileDigest = r.body.digest;
+  if (r.status === 412 && errorField(r, "file_digest")) state.fileDigest = errorField(r, "file_digest");
   await loadRules();
 }
 
@@ -485,14 +701,12 @@ function showCheck(out, r, textarea) {
   warnings(out, r.body.warnings);
 }
 
-function showWrite(out, r, textarea) {
+// `conflict` is the advice after a 412: what a second try does.
+function showWrite(out, r, textarea, conflict) {
   out.replaceChildren();
   if (r.status !== 200) {
     showError(out, r, textarea);
-    if (r.status === 412) {
-      out.append(el("p", "The rules list is reloaded now. Your edit is still here: Apply again to " +
-        "write it over the newer file, or load the newer version first."));
-    }
+    if (r.status === 412 && conflict) out.append(el("p", conflict));
     return;
   }
   const b = r.body;
@@ -511,7 +725,8 @@ function showWrite(out, r, textarea) {
 function sawDigest(summary) {
   const { out } = state.awaiting;
   out.textContent = `$SYS/brokers/${summary.node}/rules reports ${short(summary.digest)} at ` +
-    `${clock(Date.parse(summary.at) || Date.now())}: every rule's statistics now count from it.`;
+    `${clock(Date.parse(summary.at) || Date.now())}: the new rules are running (counts keep ` +
+    "adding up since the broker started).";
   out.className = "ok";
   state.awaiting = null;
 }
@@ -580,12 +795,18 @@ function outputList(outputs) {
 
 // ---- trace -----------------------------------------------------------------------------------
 
+function badge(result) {
+  const b = el("span", result, `badge ${result}`);
+  if (result === "no_result") b.title = NO_RESULT;
+  return b;
+}
+
 function traceItem(rec) {
-  const li = el("li", undefined, "record");
+  const li = el("li", undefined, `record ${rec.result}`);
+  state.traceItems.set(rec, li);
   const t = rec.trigger || {};
   const meta = el("div", undefined, "meta");
-  meta.append(el("time", clock(Date.parse(rec.at) || Date.now())), " ",
-    el("span", rec.result, `badge ${rec.result}`), " ");
+  meta.append(el("time", clock(Date.parse(rec.at) || Date.now())), " ", badge(rec.result), " ");
   const about = [t.type === "will" && "a Will", t.qos !== undefined && `qos ${t.qos}`,
     t.retain && "retained", t.clientid && `client ${t.clientid}`, t.username && `user ${t.username}`];
   meta.append(el("span", t.type === "event" ? t.event : t.topic, "topic"),
@@ -604,7 +825,56 @@ function traceItem(rec) {
 function renderTrace() {
   const id = state.selected;
   $("trace-rule").textContent = id ? `of ${id}` : "(choose a rule)";
+  renderTraceHead();
   $("trace").replaceChildren(...(id ? state.traces.get(id) || [] : []).map(traceItem));
+}
+
+// The chosen rule's trace topic, a command to watch it with, and the broker's trace rate.
+// Each summary calls this: text is written only when it changes, so a selection made to
+// copy the command survives.
+function renderTraceHead() {
+  const set = (id, text) => {
+    if ($(id).textContent !== text) $(id).textContent = text;
+  };
+  const id = state.selected;
+  const node = (state.summary && state.summary.node) || (state.list && state.list.node) || "+";
+  const topic = `$SYS/brokers/${node}/trace/rules/${id || "<id>"}`;
+  set("trace-topic", topic);
+  $("trace-sub").hidden = !id;
+  set("trace-cmd", id ? `mosquitto_sub -v -t '${topic.replace(/'/g, "'\\''")}'` : "");
+  const s = state.summary;
+  if (s) {
+    set("trace-rate", s.trace
+      ? `At most ${s.trace_rate} records a second, and up to ${s.trace_rate} no_result records ` +
+        "more: they have a budget of their own."
+      : "The trace is off on this broker.");
+  }
+}
+
+async function copyCommand() {
+  const button = $("b-copy");
+  try {
+    await navigator.clipboard.writeText($("trace-cmd").textContent);
+    button.textContent = "Copied";
+  } catch {
+    // No clipboard here: select the command, to copy by hand.
+    getSelection().selectAllChildren($("trace-cmd"));
+    button.textContent = "Selected";
+  }
+  setTimeout(() => { button.textContent = "Copy"; }, 2000);
+}
+
+// The last KEEP_TRACE no_result records are kept apart from the last KEEP_TRACE others,
+// so the passes of a rule whose WHERE seldom passes stay in view. Returns the record
+// that made room, if one did.
+function keepTrace(list, rec) {
+  list.unshift(rec);
+  const miss = rec.result === "no_result";
+  let n = 0;
+  for (let i = 0; i < list.length; i++) {
+    if ((list[i].result === "no_result") === miss && ++n > KEEP_TRACE) return list.splice(i, 1)[0];
+  }
+  return null;
 }
 
 // ---- live data -----------------------------------------------------------------------------
@@ -679,18 +949,17 @@ function onSummary(s) {
 
 function onRuleStats(id, rec) {
   state.stats.set(id, rec);
+  sample(id, rec);
   updateRow(id);
 }
 
 function onTrace(id, rec) {
   const list = state.traces.get(id) || [];
-  list.unshift(rec);
-  if (list.length > KEEP_TRACE) list.length = KEEP_TRACE;
+  const gone = keepTrace(list, rec);
   state.traces.set(id, list);
-  if (id !== state.selected) return;
-  const ol = $("trace");
-  ol.prepend(traceItem(rec));
-  while (ol.childElementCount > KEEP_TRACE) ol.lastElementChild.remove();
+  if (id !== state.selected || $("tr-pause").checked) return;
+  if (gone && state.traceItems.has(gone)) state.traceItems.get(gone).remove();
+  $("trace").prepend(traceItem(rec));
 }
 
 function setFeed(mqtt) {
@@ -763,6 +1032,11 @@ function init() {
   $("b-reset").addEventListener("click", resetFile);
   $("d-filter").addEventListener("input", renderData);
   $("d-pause").addEventListener("change", renderData);
+  $("tr-pause").addEventListener("change", renderTrace);
+  const hide = () => $("trace").classList.toggle("hide-no-result", $("tr-hide").checked);
+  $("tr-hide").addEventListener("change", hide);
+  hide(); // a reload can bring the box back checked
+  $("b-copy").addEventListener("click", copyCommand);
   $("t-topic").addEventListener("input", () => { $("t-custom").checked = true; });
   $("t-payload").addEventListener("input", () => { $("t-custom").checked = true; });
   $("rule-form").addEventListener("submit", (e) => e.preventDefault());

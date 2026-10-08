@@ -197,7 +197,7 @@ for every rule's input and output. demo/rules-live/README.md walks through it.
 """
 requires = ["docker"]
 duration = "5-15 min for the first build, then seconds"
-caution = "Starts 6 containers and binds 127.0.0.1:1883, 8070, 8080 and 9443 (override with MQTT_PORT, UI_PORT, HEALTH_PORT, ADMIN_PORT)."
+caution = "Starts 7 containers (2 one-shot) and binds 127.0.0.1:1883, 8070, 8080 and 9443 (override with MQTT_PORT, UI_PORT, HEALTH_PORT, ADMIN_PORT)."
 
 [[task]]
 id = "demo-rules-live-sim"
