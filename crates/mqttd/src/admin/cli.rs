@@ -25,8 +25,8 @@
 //!
 //! Text from the broker can quote what a client chose (a payload in a rule's last error,
 //! a client id), so it reaches the terminal [`printable`]: a control character as its
-//! escape, never as itself. `--json` prints JSON, whose strings escape ESC, BEL and CR
-//! themselves; `rules-source` prints the file as it is.
+//! escape, never as itself. `--json` prints JSON with the same characters as `\u` escapes
+//! ([`json_text`]), so it stays valid JSON; `rules-source` prints the file as it is.
 
 use super::client::{self, Target};
 use super::http::percent_encode;
@@ -622,10 +622,7 @@ pub async fn run(args: &[String]) -> i32 {
             let value: Value = serde_json::from_str(&body).unwrap_or(Value::String(body));
             if (200..300).contains(&status) {
                 if inv.json {
-                    outln!(
-                        "{}",
-                        serde_json::to_string_pretty(&value).unwrap_or_default()
-                    );
+                    outln!("{}", json_text(&value));
                 } else {
                     out!("{}", render_for(inv.verb, &value));
                 }
@@ -634,10 +631,7 @@ pub async fn run(args: &[String]) -> i32 {
                 // `--json` gets the whole answer, refusals included (a rejected reload
                 // carries its `outcome`); exit 1 still says it was refused.
                 if inv.json {
-                    outln!(
-                        "{}",
-                        serde_json::to_string_pretty(&value).unwrap_or_default()
-                    );
+                    outln!("{}", json_text(&value));
                     return 1;
                 }
                 eprintln!("{}", refusal_line(status, &value));
@@ -1001,6 +995,23 @@ fn scalar(value: &Value) -> String {
         // JSON escapes only C0 controls; DEL and the C1 set (a one-byte CSI) pass.
         other => printable(&other.to_string()),
     }
+}
+
+/// `value` as pretty JSON that may reach a terminal. JSON's own escaping covers only the C0
+/// controls, so DEL, the C1 set (a one-byte CSI) and the line separators would pass as
+/// themselves; they can stand only inside strings, where a `\u` escape keeps the text the
+/// same JSON. The newlines left are the layout's.
+fn json_text(value: &Value) -> String {
+    let pretty = serde_json::to_string_pretty(value).unwrap_or_default();
+    let mut out = String::with_capacity(pretty.len());
+    for c in pretty.chars() {
+        if c != '\n' && unprintable(c) {
+            let _ = write!(out, "\\u{:04x}", u32::from(c));
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// Whether `c` must not reach a terminal as itself: a control character (ESC, BEL, CR,
@@ -1367,6 +1378,12 @@ mod tests {
             refusal_line(422, &refused),
             format!("mqttd: 422 rules-invalid: line one {escaped}\nline two\\r")
         );
+
+        // `--json`: the same characters as `\u` escapes, and the same JSON read back.
+        let out = json_text(&answer);
+        clean(&out);
+        assert!(out.contains("\\u009b\\u2028"), "{out}");
+        assert_eq!(serde_json::from_str::<Value>(&out).unwrap(), answer);
     }
 
     /// `rules-source` prints the file and nothing else, so redirecting it keeps the file.
