@@ -83,13 +83,14 @@ first, always in this order: `NODE_ID`, `CLIENT_ID`, `NODE`, `TOPIC`, `FILTER`, 
 ([below](#node-cluster-placement)), `rules` a table of its own, and `rules-source` the
 file's text alone ([below](#rules-rules-source-rules-apply-rule-delete)). `--json` prints the API's JSON, for scripts and `jq`,
 refusals included, so a rejected `reload` still shows its outcome. `help` wraps to 100
-columns.
+columns. In the terminal views, a control character in text the broker sends (a rule's last
+error that quotes a payload, say) is printed escaped, never passed to your terminal.
 
 | Exit | Meaning |
 |---|---|
 | `0` | the broker answered and did it |
 | `1` | the broker refused (the message says why: `403 forbidden`, `404 not-found`, `409 reload-rejected`, …) or could not be reached |
-| `2` | a usage error (unknown verb, missing argument, no URL or certificate) — nothing was sent |
+| `2` | a usage error (unknown verb, missing argument, no URL or certificate), or a local file `rules-apply` cannot read — nothing was sent |
 
 A refusal prints the HTTP status, a stable code, and a message:
 
@@ -131,7 +132,8 @@ subject  CN=root, O=example
 `cluster` asks every member's admin listener for its state, in parallel (3 s each), and
 merges the answers. A node that does not answer is a row with `replied: false` and the
 reason — never left out, never shown as healthy. The summary is the split-brain and
-convergence check: `same_cluster_id`, `same_version`, `same_config`, `same_membership`.
+convergence check: `same_cluster_id`, `same_version`, `same_config`, `same_rules`,
+`same_membership`.
 
 The terminal view fits in 100 columns: a summary line, whether the nodes agree (or which
 check differs), and one short row per node.
@@ -139,7 +141,7 @@ check differs), and one short row per node.
 ```text
 $ mqttd --admin cluster
 3 nodes: 3 replied, 3 ready (answered by mqttd-1)
-they agree on cluster id, version, config and membership
+they agree on cluster id, version, config, rules and membership
 
 NODE     STATE  LEADER  EPOCH  MEMBERS  LAG  VERSION  CLUSTER   MS  NOTES
 mqttd-1  ready  *       1      3        0    1.0.18   f8995cf8  0   -
@@ -157,8 +159,9 @@ mqttd-3  ready  -       1      3        0    1.0.18   f8995cf8  39  -
 | `NOTES` | what is wrong: `quarantined`, `brownout`, `swim-isolated`, `under-replicated`, `decommissioning`, `not live`, or why the node did not reply |
 
 `--json` has every field of every row: admin address, full cluster id, config checksum,
-protocol version. For every node to appear, each must run its admin listener and the node
-you ask must have cluster TLS ([ADMIN-API.md § The cluster view](ADMIN-API.md#the-cluster-view)).
+rules digest, protocol version. For every node to appear, each must run its admin listener
+and the node you ask must have cluster TLS
+([ADMIN-API.md § The cluster view](ADMIN-API.md#the-cluster-view)).
 
 ### `clients`, `session`, `subscribers`, `backlog`, `retained`
 
@@ -263,7 +266,8 @@ $ mqttd --admin authz anonymous publish secret/x --json | jq '{allowed, reason}'
 absent and the reason names the policy default. For `connect`, the session-owner guard
 (ADR 0031) still applies on top of the policy. For `publish`, a topic in `$SYS` is
 refused before the policy is asked (`reserved: $SYS/ is the broker's (ADR 0084)`), as
-the broker refuses it whatever the ACL says.
+the broker refuses it whatever the ACL says; a Mosquitto bridge's
+`$SYS/broker/connection/<id>/state` is the one exception, and the policy decides it.
 
 ### `config`, `reload`
 
@@ -390,7 +394,28 @@ configuration: ask, and write to, each node.
 | `ACTIONS_FAILED` | actions that failed: could not render, or the broker refused or did not route what they derived |
 | `LAST_ERROR` | the latest failure, cut short to fit |
 
-<!-- TODO-INTEGRATE: add a captured `mqttd --admin rules` example here. -->
+Captured from [`demo/rules-live`](../demo/rules-live/README.md) (rows cut):
+
+```text
+$ mqttd --admin rules
+node-local: 21 rules, 21 enabled; running f424960486fa, on disk the same
+last reload: 2026-10-08T14:22:44.893Z by admin-rules, applied
+
+ID                     ENABLED  FROM                                    ACTIONS  MATCHED  PASSED  NO_RESULT  FAILED  ACTIONS_FAILED  LAST_ERROR
+car_driving_events     yes      vehicle/+/telemetry                     1        2044     16      2028       0       0               -
+car_mobility_feed      yes      vehicle/+/telemetry, vehicle/+/triplog  1        2047     265     1782       0       0               -
+car_presence           yes      client.connected, client.disconnected   2        145      42      103        0       0               -
+home_grid_feed         yes      home/+/p1                               1        1678     280     1398       0       0               -
+power_grid_frequency   yes      plant/+/poc/grid                        1        1049     49      1000       0       0               -
+power_rtu_csv          yes      plant/+/+/rtu                           2        140      137     3          0       0               -
+```
+
+The header is `<node>: N rules, M enabled; running <the first 12 hex digits of digest>, on
+disk the same` (or the file's first 12 hex digits when it differs), then `last reload: <at>
+by <trigger>, applied` or `REJECTED (<error_kind>)`, and, for an operator,
+`K warning(s): see --json` when there are any. An event rule's `FROM` lists its events.
+`LAST_ERROR` is the kind (an operator also sees `: <message>`), cut to 40 characters with
+`…`.
 
 `--json` prints the whole answer instead: the running digest and the one on disk, the
 loader's warnings, the last reload and, for an operator, every rule's SQL and actions
@@ -412,12 +437,13 @@ mqttd --admin rules-apply rules.toml --if_match "$digest"
 ```
 
 A file that does not load is refused before anything is written (`422 rules-invalid`, with
-where: the line and column in the file, or the rule and the line and column in its SQL),
-exit 1. On success the answer says whether the new rules are running (`applied`) and their
+where: the line and column in the file, the rule and the line and column in its SQL, or
+the rule alone), exit 1. On success the answer says whether the new rules are running (`applied`) and their
 digest. A reload refused for another reason (a broken ACL file) is
 `409 reload-rejected` with `written: true`: the file was written, and the next good reload
-applies it. Every write is audited (`rules.write`), and the previous file is kept beside it
-as `<file>.prev`.
+applies it. Every write that changes the file is audited (`rules.write`), and the previous
+file is kept beside it as `<file>.prev`; a file sent unchanged writes nothing
+(`written: false`).
 
 The per-rule `PUT`, `check` and `test` take JSON bodies and have no verb; call them over
 HTTPS ([ADMIN-API.md § Rules](ADMIN-API.md#rules)).
