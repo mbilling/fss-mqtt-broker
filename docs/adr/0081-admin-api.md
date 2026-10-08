@@ -4,6 +4,9 @@
 - **Date:** 2026-09-29
 - **Deciders:** project maintainers
 - **Delivery:** [docs/delivery/0081-admin-api.md](../delivery/0081-admin-api.md) — plan, progress, and changelog
+- **Revisited by:** [ADR 0084](0084-watching-and-editing-rules-live.md) — §3's one verb
+  per endpoint, §5's "set configuration" (for the rules file only) and the `$SYS`
+  alternative; the rest stands
 - **Related:** [ADR 0020](0020-metrics-and-observability.md) (the ops listener and its trust
   model), [ADR 0032](0032-hot-reloadable-security-policy.md) and
   [ADR 0033](0033-config-file-watch-reload.md) (which rejected an admin endpoint as the reload
@@ -98,6 +101,10 @@ through `kubectl exec`. The URL and the client certificate come from flags or th
 `MQTTD_ADMIN_*` environment. Output is a table on a terminal and JSON with `--json`. The
 verbs follow the endpoints one to one; the CLI has no logic of its own.
 
+> **Revisited by [ADR 0084](0084-watching-and-editing-rules-live.md) (2026-10-08).** The
+> rules endpoints' per-rule `PUT` and `test` take structured JSON bodies and have no verb;
+> `rules-apply` reads a local file. Every other verb still follows its endpoint.
+
 ### 4. Actions: a short, fixed list, each also audited on the node it acts on
 
 Operator role only:
@@ -123,6 +130,12 @@ originally over the peer bus.)
   committed value) cannot change on a running node at all. Changes go through the file,
   then `reload`, and `reload` returns the result. The single exception is the expiring log
   filter (§4), which is diagnostic state rather than configuration.
+
+  > **Revisited by [ADR 0084](0084-watching-and-editing-rules-live.md) (2026-10-08).** One
+  > more exception, off by default: a subject listed in `[rules] admin_writers` may replace
+  > the rules file, or one rule in it, through the API. The write goes to the file itself and
+  > is applied by the ordinary reload, so the file stays the only source. No other
+  > configuration is written, and there is still no admin web UI.
 - **Replace the signals.** `--decommission` and `--backup` stay signal-driven; decommission
   has to block a `preStop` hook until the process exits, which an HTTP call cannot do.
   The API reports their progress.
@@ -166,6 +179,11 @@ originally over the peer bus.)
 - **MQTT `$SYS` topics.** A familiar pattern, but it puts operator data on the client
   listener under the client authorization model, cannot page, and does not answer
   questions such as "who matches topic T" or "is U allowed to publish".
+
+  > **Revisited by [ADR 0084](0084-watching-and-editing-rules-live.md) (2026-10-08).** The
+  > admin data stays here. `$SYS/` is now reserved for the broker, which publishes opt-in
+  > per-rule statistics and an opt-in rule trace there, under the ACL; the admin API serves
+  > the same rule data to its roles.
 - **Bearer tokens (OIDC, ADR 0050) instead of mTLS.** Useful for human operators behind SSO;
   deferred as a second authenticator on the same role model. mTLS comes first because
   it needs no external service and matches how the cluster already authenticates peers.
