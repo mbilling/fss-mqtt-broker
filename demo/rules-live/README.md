@@ -67,29 +67,56 @@ mosquitto_sub -v -t '$SYS/brokers/+/rules/power_grid_frequency' \
 
 Open <http://localhost:8070>. The header shows the digest of the rules that run and of the
 file on disk, how many rules are enabled, the last reload and whether the trace is on; the
-table below it counts every rule's messages as they arrive.
+table below it counts every rule's messages as they arrive, with rates over the last 10 s.
 
-1. Choose **power_grid_frequency**. It alerts on `alerts/power/grid/frequency` whenever the
-   wind farm's PMU measures the grid frequency outside 49.9-50.1 Hz. Its SQL and actions
-   fill the editor, and its trace starts listing each reading it runs on, and each alert
-   it renders.
-2. Narrow the band: in the SQL, change `payload.Hz < 49.9 OR payload.Hz > 50.1` to
-   `payload.Hz < 49.95 OR payload.Hz > 50.05`.
-3. **Check** splices your edit into the rules file and validates the whole file, writing
+1. Press **New rule**. The editor fills with a small example, `demo_rule_1`. It takes the
+   wind farm's grid meter (`plant/+/poc/grid`, a reading every 2 s) and republishes a
+   reading to `kpi/demo/<site>/frequency` when the frequency is more than 20 mHz off 50 Hz:
+   `payload.Hz < 49.98 OR payload.Hz > 50.02`.
+2. **Check** splices the rule into the rules file and validates the whole file, writing
    nothing. An error names the line and column, and selects it in the editor.
-4. **Test** runs your edited rule, as if enabled, on the latest grid reading the page has
-   seen (or on a message of your own: edit the topic and payload under "Test it against"),
-   and shows what it would publish, publishing nothing.
-5. **Apply** writes the rules file (atomically; the previous file is kept as
+3. **Test** runs the rule, as if enabled, on the latest grid reading the page has seen, and
+   shows what it would publish, publishing nothing. Most readings are within 20 mHz, so
+   the answer is often `no_result`: FROM matched, but WHERE was false.
+4. **Apply** writes the rules file (atomically; the previous file is kept as
    `rules.toml.prev` beside it) and reloads it. The answer shows the new digest; a few
-   seconds later the summary on `$SYS` reports it, the header changes with it, and the
-   rule's counts and trace follow the narrower band.
+   seconds later the summary on `$SYS` reports it, the header changes with it, and
+   `demo_rule_1` is in the table. It passes a reading every 7 s or so, in bursts: watch
+   its **Passed** and **Passed/s**, its trace (each `passed` record with the message it
+   published), and **Live messages** with the filter `kpi/demo/#`.
+5. Make it fire less often: in the SQL, change `49.98` to `49.97` and `50.02` to `50.03`
+   (and the description to 30 mHz), and **Apply** again. It now passes about a third as
+   many readings, one every 20 s or so. **Passed** still grows, since the counts add up from
+   the broker's start (an edited rule keeps its counts), but more slowly; **Passed/s**
+   drops, and in the trace (tick **Hide no_result**) the passes come further apart.
+6. **Delete** removes `demo_rule_1` again.
 
-**New rule** starts from a small example, **Delete** removes the chosen rule, and **The
-whole rules file** at the bottom edits the file as text, with **Reset to the shipped
-rules** to put [`demo/rules/rules.toml`](../rules/rules.toml) back. Every write says which
-version of the file it was based on, so if the file changed since the page loaded it (in
-another tab, say), the write is refused instead of overwriting that change.
+The simulated grid also has an excursion: 6 min 45 s into every ten-minute window (at
+hh:06:45, hh:16:45 and so on, UTC), the frequency drops to about 49.75 Hz and stays low
+until the window ends. Meanwhile `demo_rule_1` passes every reading, whatever its band, and
+its **Passed** grows faster. The shipped **power_grid_frequency** alerts only outside
+49.9-50.1 Hz, so it fires only in the first three minutes or so of the excursion. To see
+what it publishes at another time, choose it, choose **this message** under "Test it
+against", and **Test** it with the topic `plant/wf-falster/poc/grid` and this payload:
+
+```json
+{"ts":1791469801000,"Hz":49.8,"ROCOF":-0.03,"U_kV":{"L12":51.4,"L23":51.3,"L31":51.4}}
+```
+
+It passes, and renders the alert it would publish on `alerts/power/grid/frequency`: band
+"FCR-D upward", 25 % FCR-D activation.
+
+Rules do not chain: a rule never runs on a message a rule published, its own or another's.
+A rule with `FROM "kpi/demo/#"` would never see `demo_rule_1`'s output, only what clients
+publish there.
+
+**Delete** removes the chosen rule, and **The whole rules file** at the bottom edits the
+file as text, with **Reset to the shipped rules** to put
+[`demo/rules/rules.toml`](../rules/rules.toml) back. Every write names the version of the
+file its text came from. If the file changed since (in another tab, say) in a way the
+write would undo, the write is refused instead of overwriting that change, and a second
+Apply writes over it on purpose. (Reset to the shipped rules is the exception: it replaces
+whatever is there.)
 
 The edited rules live in the stack's `rules` volume, never in the checkout, and survive
 `docker compose down`.
