@@ -6,7 +6,7 @@ Source of truth: `mqtt_config::ENV_VARS` and `Config::overlay_from` in `crates/m
 
 The annotated template is [`mqttd.example.toml`](mqttd.example.toml). Capacity arithmetic lives in [SIZING.md](SIZING.md); day-2 procedures in [OPERATIONS.md](OPERATIONS.md). This page is the inventory of knobs, not the runbook.
 
-Documented overlay variables: **113** in `ENV_VARS`, plus `MQTTD_CONFIG` (meta) and any experimental side-channel knobs below.
+Documented overlay variables: **117** in `ENV_VARS`, plus `MQTTD_CONFIG` (meta) and any experimental side-channel knobs below.
 
 ## Node identity
 
@@ -185,6 +185,10 @@ Documented overlay variables: **113** in `ENV_VARS`, plus `MQTTD_CONFIG` (meta) 
 | Variable | TOML key | Purpose |
 |---|---|---|
 | `MQTTD_RULES_FILE` | `rules.file` | The rules file (`MQTTD_RULES_FILE`), a TOML file of `[rules.<id>]` tables. Unset = no rules. Hot-reloadable: `SIGHUP` (or the config watch) re-reads it, validating before the swap — a file that does not load keeps the running rules. |
+| `MQTTD_RULES_SYS_INTERVAL` | `rules.sys_interval_secs` | Seconds between the per-rule statistics this node publishes on `$SYS/brokers/<node>/rules` and `$SYS/brokers/<node>/rules/<id>` (`MQTTD_RULES_SYS_INTERVAL`): counts, rates, last activity and last error, `QoS` 0 and never retained. `0` (the default) = off; otherwise 1..=3600. Hot-reloadable: a reload applies a new interval at once. |
+| `MQTTD_RULES_TRACE` | `rules.trace` | The opt-in rule trace (`MQTTD_RULES_TRACE`, `1`/`0`): each evaluation's trigger (topic, client id, username, up to 1 KiB of payload) and rendered outputs, on `$SYS/brokers/<node>/trace/rules/<id>`. Off by default — it copies payloads onto `$SYS`, so a subscribe grant on a rule's trace topic is a read grant on everything its `FROM` matches. Hot-reloadable. |
+| `MQTTD_RULES_TRACE_RATE` | `rules.trace_rate` | Trace records per rule per second (`MQTTD_RULES_TRACE_RATE`, default 20, 1..=1000); `no_result` evaluations have a budget of their own. Hot-reloadable. |
+| `MQTTD_RULES_ADMIN_WRITERS` | `rules.admin_writers` | Admin certificate subjects that may write the rules file through the admin API (`MQTTD_RULES_ADMIN_WRITERS`, `;`-separated, same syntax as `Admin::operators`). A writer also needs the `operator` role. Empty (the default) = rules writes off. Needs the admin listener. Hot-reloadable. |
 
 ## Meta (not a config field)
 
