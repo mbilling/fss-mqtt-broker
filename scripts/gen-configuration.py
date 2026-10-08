@@ -37,6 +37,7 @@ SECTION_ORDER = [
     ("backup", "Online backup and restore"),
     ("audit", "Audit export"),
     ("admin", "Admin API"),
+    ("rules", "Rule engine"),
     ("meta", "Meta (not a config field)"),
     ("experimental", "Experimental store knobs (not in mqtt-config)"),
 ]

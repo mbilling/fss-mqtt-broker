@@ -1,0 +1,33 @@
+# Recipe 07: route one shared topic by a payload field, safely
+#
+# A gateway posts every device's message to the single topic ingest. This rule forwards
+# each one, byte for byte, to devices/<kind>/<device>, where kind comes from the
+# payload's type (door, meter, anything else is "other") and device from its device
+# field.
+#
+# The guard matters. The device id comes from the PUBLISHER, and what a rule publishes
+# is not checked against the publisher's ACL. Without the WHERE, a payload with
+# "device": "x/../admin/cmd" would publish on devices/door/x/../admin/cmd, and one with
+# no device field on devices/door/undefined. The WHERE lets through only an id that is
+# one plain topic level: letters, digits, '_' and '-', at most 64 of them.
+#
+# In:  ingest  qos=1 retain=0  {"type": "door", "device": "d-17", "open": true}
+# Out: devices/door/d-17  qos=1 retain=0  {"type": "door", "device": "d-17", "open": true}
+# In:  ingest  qos=1 retain=0  {"type": "door", "device": "x/../admin/cmd", "open": true}
+# (nothing is published for it)
+#
+# Tested by crates/mqttd/tests/rules_cookbook.rs; explained in docs/RULES-COOKBOOK.md.
+
+[rules.route_by_type]
+description = "Fan the shared ingest topic out to devices/<kind>/<device>"
+sql = '''
+SELECT
+  CASE payload.type WHEN 'door' THEN 'door' WHEN 'meter' THEN 'meter' ELSE 'other' END AS kind,
+  payload.device AS device,
+  payload
+FROM "ingest"
+WHERE is_str(payload.device) AND regex_match(payload.device, '^[A-Za-z0-9_-]{1,64}$')
+'''
+actions = [
+  { function = "republish", args = { topic = "devices/${kind}/${device}", qos = 1, payload = "${payload}" } },
+]

@@ -20,6 +20,7 @@
 
 use super::client::{self, Target};
 use super::http::percent_encode;
+use crate::{out, outln};
 use serde_json::Value;
 use std::fmt::Write;
 use std::path::Path;
@@ -499,7 +500,7 @@ pub async fn run(args: &[String]) -> i32 {
         }
     };
     if inv.verb == "help" {
-        print!("{}", usage());
+        out!("{}", usage());
         return 0;
     }
     let target = match target(&inv) {
@@ -524,19 +525,19 @@ pub async fn run(args: &[String]) -> i32 {
             let value: Value = serde_json::from_str(&body).unwrap_or(Value::String(body));
             if (200..300).contains(&status) {
                 if inv.json {
-                    println!(
+                    outln!(
                         "{}",
                         serde_json::to_string_pretty(&value).unwrap_or_default()
                     );
                 } else {
-                    print!("{}", render_for(inv.verb, &value));
+                    out!("{}", render_for(inv.verb, &value));
                 }
                 0
             } else {
                 // `--json` gets the whole answer, refusals included (a rejected reload
                 // carries its `outcome`); exit 1 still says it was refused.
                 if inv.json {
-                    println!(
+                    outln!(
                         "{}",
                         serde_json::to_string_pretty(&value).unwrap_or_default()
                     );
@@ -552,7 +553,7 @@ pub async fn run(args: &[String]) -> i32 {
                     .unwrap_or("");
                 eprintln!("mqttd: {status} {code}: {message}");
                 if let Some(outcome) = value.get("outcome") {
-                    print!("{}", render(outcome));
+                    out!("{}", render(outcome));
                 }
                 1
             }

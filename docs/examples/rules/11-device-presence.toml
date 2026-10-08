@@ -1,0 +1,48 @@
+# Recipe 11: device presence from connect and disconnect events, as retained status
+#
+# presence/<client id> always holds a device's current status, retained, so a dashboard
+# that connects later gets every device's status at once. presence_online publishes
+# "online" when a device connects; presence_offline publishes "offline" with the reason
+# when it goes away: normal (it sent DISCONNECT), tcp_closed (the connection dropped),
+# keepalive_timeout (it went silent) or shutdown (the broker is stopping).
+#
+# Both WHERE clauses track devices only (client ids starting "sensor-", not your
+# dashboards or services), and keep the client id, which becomes a topic level, to one
+# plain level.
+#
+# presence_offline skips server_closed. When a device reconnects while the broker still
+# holds its old connection (a takeover: say its network changed), the OLD connection
+# ends with server_closed, and that event can arrive after the new connection's
+# "online": publishing it would mark a connected device offline. The cost: a device the
+# broker itself disconnects (evicted, or for a protocol violation) keeps showing online
+# until it connects again.
+#
+# "since" is the time of the event in milliseconds, so it differs on every run.
+#
+# Out:  presence/sensor-a  qos=1 retain=0  {"clientid":"sensor-a","status":"online","since":1791391609588}
+# Out:  presence/sensor-a  qos=1 retain=0  {"clientid":"sensor-a","status":"offline","since":1791391609589,"reason":"normal"}
+# Late: presence/sensor-b  qos=1 retain=1  {"clientid":"sensor-b","status":"offline","since":1791391610989,"reason":"tcp_closed"}
+#
+# Tested by crates/mqttd/tests/rules_cookbook.rs; explained in docs/RULES-COOKBOOK.md.
+
+[rules.presence_online]
+description = "A device connected"
+sql = '''
+SELECT clientid, 'online' AS status, connected_at AS since
+FROM "$events/client/connected"
+WHERE regex_match(clientid, '^sensor-[A-Za-z0-9_-]{1,57}$')
+'''
+actions = [
+  { function = "republish", args = { topic = "presence/${clientid}", qos = 1, retain = true, payload = "${.}" } },
+]
+
+[rules.presence_offline]
+description = "A device went away"
+sql = '''
+SELECT clientid, 'offline' AS status, disconnected_at AS since, reason
+FROM "$events/client/disconnected"
+WHERE regex_match(clientid, '^sensor-[A-Za-z0-9_-]{1,57}$') AND reason <> 'server_closed'
+'''
+actions = [
+  { function = "republish", args = { topic = "presence/${clientid}", qos = 1, retain = true, payload = "${.}" } },
+]

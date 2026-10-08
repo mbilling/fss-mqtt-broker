@@ -296,7 +296,7 @@ mosquitto_sub -h 127.0.0.1 -p 1883 -t 'sensors/+/temp' &
 mosquitto_pub -h 127.0.0.1 -p 1883 -t 'sensors/kitchen/temp' -m '21.5C'
 ```
 
-Plaintext + anonymous: a first look, never a deployment. Secured version (TLS 1.3 + mTLS + ACL, CI-tested): [GUIDE](GUIDE.md#single-node-secured-tls-13--mtls--acl). Windows: [GUIDE](GUIDE.md#try-it-in-two-minutes).
+Plaintext + anonymous: a first look, never a deployment. Secured version (TLS 1.3 + mTLS + ACL, CI-tested): [GUIDE](GUIDE.md#single-node-secured-tls-13--mtls--acl). Windows: [GUIDE](GUIDE.md#try-it-in-two-minutes). A first rule (filter, reshape, re-route; unreleased, so built from source): [RULES.md](docs/RULES.md#try-it-in-two-minutes).
 
 ---
 
@@ -342,7 +342,8 @@ Plaintext + anonymous: a first look, never a deployment. Secured version (TLS 1.
 | Integrations | |
 |---|---|
 | Bridge | `mqtt-bridge`: separate signed binary/image, deny-by-default directional rules, loop prevention, bounded spool, HA pairs |
-| Kafka / webhook / DB | `$share` consumer group on durable sessions ([INTEGRATION.md](docs/INTEGRATION.md)); no rule engine, by design |
+| Rule engine | EMQX-compatible rule SQL: filter, transform and re-route at QoS 0/1/2, evaluated once per message on the node it arrived at; unreleased ([RULES.md](docs/RULES.md), [cookbook](docs/RULES-COOKBOOK.md)) |
+| Kafka / webhook / DB | `$share` consumer group on durable sessions ([INTEGRATION.md](docs/INTEGRATION.md)); the rule engine has no sinks, by design |
 | Migration | converters for Mosquitto, EMQX, HiveMQ configs + ACLs → reviewed draft ([MIGRATION.md](docs/MIGRATION.md)) |
 | Plugins | HTTP auth hook; `Authenticator` / `Authorizer` traits; no dynamic loader |
 
@@ -430,7 +431,7 @@ Other published measurements (dev-grade, single host, never capacity): [DURABLE-
 | Footprint | NanoMQ, Mosquitto | ~4.6 MB image / few-MB daemon vs ~14 MB |
 | Track record | all of them | mqttd: **no production users** |
 | Hard memory cap | Mosquitto | mqttd: watermark + brownout only |
-| Feature surface | EMQX | dashboard, SQL rules, MQTT-SN/CoAP |
+| Feature surface | EMQX | dashboard, rule-engine data sinks, MQTT-SN/CoAP |
 | Linear scale-out, durable path | nobody yet | QoS 0 is flat 3 → 10 nodes; durable QoS 1 still 3 ≈ 1 node; plan [#537](https://github.com/mbilling/fss-mqtt-broker/issues/537) |
 | Connection scale | HiveMQ, EMQX | published 200M / 100M connections; mqttd measured to 50k |
 | Not covered | — | single-node comparison: one instance type, QoS 0, plaintext, no TLS, no cluster; newer Mosquitto 2.1 / EMQX 6.x unmeasured; vendor cluster figures published, not reproduced |
@@ -475,7 +476,7 @@ Other published measurements (dev-grade, single host, never capacity): [DURABLE-
 | Admin dashboard | ✖ by design | ⚠️ 2.1: experimental | ✅ | 💰 | ⚠️ status page | ✖ |
 | **Integration** | | | | | | |
 | Bridge | ✅ | ✅ | ✅ | ✖ | ✅ | ✅ |
-| Rule engine | ✖ by design | ✖ | ✅ | ✖ | ✖ | ✅ |
+| Rule engine | ✅ EMQX rule SQL, no sinks | ✖ | ✅ | ✖ | ✖ | ✅ |
 | **Build & licence** | | | | | | |
 | Signed reproducible builds + SBOM | ✅ | ✖ | n/v | n/v | ✖ | ✖ |
 | FIPS variant | ✅ | ✖ | n/v | 💰 | ✖ | ✖ |
@@ -486,7 +487,7 @@ Other published measurements (dev-grade, single host, never capacity): [DURABLE-
 
 ## Installation
 
-Current release **v1.0.17** · static musl `linux/amd64` + `linux/arm64` · cosign-signed · SLSA · CycloneDX SBOM · verify: [RELEASING.md](RELEASING.md).
+Current release **v1.0.18** · static musl `linux/amd64` + `linux/arm64` · cosign-signed · SLSA · CycloneDX SBOM · verify: [RELEASING.md](RELEASING.md).
 
 **Docker**
 ```sh
@@ -495,8 +496,8 @@ docker run -d --name mqttd --read-only --cap-drop ALL --security-opt no-new-priv
   -p 8883:8883 -p 8080:8080 \
   -e MQTTD_TLS_BIND=0.0.0.0:8883 -e MQTTD_TLS_CERT=/etc/mqttd/tls/server.crt -e MQTTD_TLS_KEY=/etc/mqttd/tls/server.key \
   -e MQTTD_ACL_FILE=/etc/mqttd/acl.toml -e MQTTD_DATA_DIR=/var/lib/mqttd -e MQTTD_HEALTH_BIND=0.0.0.0:8080 \
-  ghcr.io/mbilling/fss-mqtt-broker:1.0.17
-cosign verify ghcr.io/mbilling/fss-mqtt-broker:1.0.17 \
+  ghcr.io/mbilling/fss-mqtt-broker:1.0.18
+cosign verify ghcr.io/mbilling/fss-mqtt-broker:1.0.18 \
   --certificate-identity-regexp 'https://github.com/mbilling/fss-mqtt-broker/.github/workflows/release.yml@.*' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 ```
@@ -659,7 +660,7 @@ endpoint, roles, errors).
 - consensus for control (epochs, ownership), small replica sets for data
 - refuse at the edge: reason code or backpressure, never a silent drop
 - bridge is a separate process and failure domain
-- decisions: [`docs/adr/`](docs/adr/) (82 ADRs, per-task status) · tour: [ARCHITECTURE.md](docs/ARCHITECTURE.md) · [THREAT-MODEL.md](docs/THREAT-MODEL.md)
+- decisions: [`docs/adr/`](docs/adr/) (83 ADRs, per-task status) · tour: [ARCHITECTURE.md](docs/ARCHITECTURE.md) · [THREAT-MODEL.md](docs/THREAT-MODEL.md)
 
 **Workspace layout**
 
@@ -673,6 +674,7 @@ endpoint, roles, errors).
 | `mqtt-cluster` | SWIM, gossip auth, HRW placement, peer wire, durable plane |
 | `mqtt-observability` | Prometheus/OTLP metrics, hash-chained audit |
 | `mqtt-config` | typed config, secure defaults |
+| `mqtt-rules` | rule engine: EMQX-compatible rule SQL, republish/console actions |
 | `mqtt-bridge` | zone-crossing bridge: spool, QoS 1 replay |
 | `mqttd` | the broker binary: hub, connections, peer mesh |
 | `mqttd-operator` | Kubernetes operator for `MqttdCluster` |
@@ -690,6 +692,7 @@ Index: [docs/README.md](docs/README.md)
 | Evaluate | [EVALUATION.md](docs/EVALUATION.md) · [COMPARISON.md](docs/COMPARISON.md) |
 | Deploy | [SECURED-CLUSTER-TUTORIAL.md](docs/SECURED-CLUSTER-TUTORIAL.md) · [KUBERNETES.md](docs/KUBERNETES.md) |
 | Build clients | [CLIENT-GUIDE.md](docs/CLIENT-GUIDE.md) |
+| Filter, transform, re-route messages | [RULES.md](docs/RULES.md) · [RULES-COOKBOOK.md](docs/RULES-COOKBOOK.md) |
 | Operate | [OPERATIONS.md](docs/OPERATIONS.md) · [ADMIN-CLI.md](docs/ADMIN-CLI.md) · [ADMIN-API.md](docs/ADMIN-API.md) · [SIZING.md](docs/SIZING.md) · [TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) |
 | Audit | [THREAT-MODEL.md](docs/THREAT-MODEL.md) · [HARDENING.md](docs/HARDENING.md) · [compliance/](docs/compliance/) |
 | Migrate | [MIGRATION.md](docs/MIGRATION.md) |
@@ -709,7 +712,7 @@ Tracked on the [delivery dashboard](docs/delivery/STATUS.md).
 - **Security:** OSS-Fuzz ([#553](https://github.com/mbilling/fss-mqtt-broker/issues/553)); funded third-party audit ([#554](https://github.com/mbilling/fss-mqtt-broker/issues/554))
 - **Routing:** bloom subscription digests; MQTT 5 Server-Reference redirect
 - **Operator:** CRD promotion from `v1alpha1`
-- **Not planned, by decision:** dashboard, writing config over the network, SQL rule engine, MQTT-SN/CoAP
+- **Not planned, by decision:** dashboard, writing config over the network, rule-engine data sinks (Kafka/HTTP/DB), MQTT-SN/CoAP
 
 ---
 
@@ -728,7 +731,7 @@ Tracked on the [delivery dashboard](docs/delivery/STATUS.md).
 - **Releases:** [GitHub Releases](https://github.com/mbilling/fss-mqtt-broker/releases)
 - **Lifecycle:** three minor lines patched; adjacent-release upgrades ([SUPPORT.md](SUPPORT.md))
 - **Commercial:** model = support, SLAs, certified builds; nothing published yet — open an issue
-- **Status:** `v1.0.17` released and signed; **no production users yet**
+- **Status:** `v1.0.18` released and signed; **no production users yet**
 
 ---
 
@@ -743,7 +746,7 @@ Tracked on the [delivery dashboard](docs/delivery/STATUS.md).
 ```sh
 cargo build && cargo test && cargo clippy --all-targets && cargo deny check
 ./scripts/interop/run.sh     # foreign-client conformance
-mqttui --list                # There are 118 runnable scripts here: demos, smokes, migrations, benches
+mqttui --list                # There are 127 runnable scripts here: demos, smokes, migrations, benches
 ```
 
 ---

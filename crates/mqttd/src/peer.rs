@@ -26,6 +26,7 @@ use crate::ingress::{IngressCredit, IngressPermit};
 use bytes::BytesMut;
 use mqtt_cluster::durable_plane::DurablePlane;
 use mqtt_cluster::peer::{self, PeerMessage};
+use mqtt_cluster::stage_timing;
 use mqtt_cluster::NodeId;
 use mqtt_net::tls;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -727,6 +728,9 @@ where
     let mut out_buf: Vec<u8> = Vec::with_capacity(PEER_WRITE_BUDGET);
     let mut ctl_buf: Vec<u8> = Vec::with_capacity(8 * 1024);
     let (out_buf, ctl_buf) = (&mut out_buf, &mut ctl_buf);
+    // The stamped frames of the batch in hand, timed once it is written (#662).
+    // Reused the same way: they grow to the largest batch's sample and stay.
+    let (mut out_stamps, mut ctl_stamps) = (Vec::new(), Vec::new());
     loop {
         // What the hub's `peer_forwards_in_flight` gauge reads (issue #504).
         // Updated here rather than at the hub's send sites because only the
@@ -752,7 +756,7 @@ where
                     // first, and a batch only ever contains frames already
                     // queued on it.
                     Some(msg) => {
-                        let n = write_batch(wh, ctl_buf, &msg, ctl_rx, remote, stats).await?;
+                        let n = write_batch(wh, ctl_buf, &mut ctl_stamps, &msg, ctl_rx, remote, stats).await?;
                         stats.frames_out.fetch_add(n, Ordering::Relaxed);
                     }
                     None => return Ok(()), // taken over or hub gone
@@ -775,7 +779,7 @@ where
                     // dies on send would die again on every reconnect). Other I/O
                     // errors still end the link as before.
                     Some(msg) => {
-                        let n = write_batch(wh, out_buf, &msg, out_rx, remote, stats).await?;
+                        let n = write_batch(wh, out_buf, &mut out_stamps, &msg, out_rx, remote, stats).await?;
                         stats.frames_out.fetch_add(n, Ordering::Relaxed);
                     }
                     None => return Ok(()), // taken over or hub gone
@@ -832,12 +836,16 @@ fn forward_inbound(
         // durable node paid. A `Replicate` goes straight to its shard's writer,
         // which puts the `ReplicateAck` on the control lane when the batch
         // commits; an ack just wakes the waiting append.
-        PeerMessage::Replicate { req_id, epoch, op } if plane.is_some() => {
+        PeerMessage::Replicate {
+            req_id, epoch, op, ..
+        } if plane.is_some() => {
             if let Some(plane) = plane {
                 plane.submit_replicate(req_id, epoch, op, reply_ctl.clone());
             }
         }
-        PeerMessage::ReplicateAck { req_id, accepted } if plane.is_some() => {
+        PeerMessage::ReplicateAck {
+            req_id, accepted, ..
+        } if plane.is_some() => {
             if let Some(plane) = plane {
                 plane.complete_replicate_ack(req_id, accepted);
             }
@@ -1182,7 +1190,8 @@ const PEER_WRITE_BUDGET: usize = 256 * 1024;
 /// `buf` is owned by the link and only ever `clear()`ed, so steady state is zero
 /// allocations per frame. It is shrunk back after an oversized batch: `MAX_FRAME`
 /// is 16 MiB and a retained snapshot would otherwise leave that capacity
-/// resident on the link for the rest of its life.
+/// resident on the link for the rest of its life. `stamps` is the same kind of
+/// link-owned scratch, for the batch's stamped replication frames.
 ///
 /// Only the `write_all` + `flush` is timed into `stats.write_wait_ns`: the encode
 /// and the yield above are not socket time, and on an idle link that yield is a
@@ -1190,24 +1199,38 @@ const PEER_WRITE_BUDGET: usize = 256 * 1024;
 async fn write_batch<W: AsyncWrite + Unpin>(
     wh: &mut W,
     buf: &mut Vec<u8>,
+    stamps: &mut Vec<(stage_timing::Stage, std::time::Instant)>,
     first: &PeerMessage,
     rx: &mut mpsc::UnboundedReceiver<PeerMessage>,
     remote: &NodeId,
     stats: &LinkStats,
 ) -> Result<u64, std::io::Error> {
     buf.clear();
+    stamps.clear();
     let mut frames = 1u64;
-    let encode_into = |buf: &mut Vec<u8>, msg: &PeerMessage| {
-        if let PeerMessage::Replicate { req_id, .. } = msg {
-            tracing::debug!(req_id, peer = %remote.0, "replicate: writing to wire");
-        }
+    let mut encode_into = |buf: &mut Vec<u8>, msg: &PeerMessage| {
+        let stamped = match msg {
+            PeerMessage::Replicate { req_id, queued, .. } => {
+                tracing::debug!(req_id, peer = %remote.0, "replicate: writing to wire");
+                queued
+                    .stamped_at()
+                    .map(|at| (stage_timing::Stage::ReplicateQueue, at))
+            }
+            PeerMessage::ReplicateAck { queued, .. } => queued
+                .stamped_at()
+                .map(|at| (stage_timing::Stage::AckQueue, at)),
+            _ => None,
+        };
         // An oversized or unencodable frame is skipped, not fatal: losing one
         // best-effort message beats severing every message on the link (and a
         // link-up back-fill that died on send would die again on every
         // reconnect). `encode` truncates its partial write, so the frames
         // already batched here are untouched and still go out.
-        if let Err(e) = peer::encode(msg, buf) {
-            warn!(error = %e, peer = %remote.0, "dropping oversized/unencodable peer frame");
+        match peer::encode(msg, buf) {
+            Ok(()) => stamps.extend(stamped),
+            Err(e) => {
+                warn!(error = %e, peer = %remote.0, "dropping oversized/unencodable peer frame");
+            }
         }
     };
     encode_into(buf, first);
@@ -1231,6 +1254,15 @@ async fn write_batch<W: AsyncWrite + Unpin>(
     wh.flush().await?;
     let waited = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
     stats.write_wait_ns.fetch_add(waited, Ordering::Relaxed);
+    // Replication transit up to the kernel (#662): queued on this link until
+    // the kernel has the bytes. Timed here, not at encode, so the yield,
+    // the rest of the batch and a wait on a full send buffer count too.
+    if !stamps.is_empty() {
+        let written = std::time::Instant::now();
+        for &(stage, queued) in stamps.iter() {
+            stage_timing::record(stage, written.saturating_duration_since(queued));
+        }
+    }
     // Give back the capacity a huge frame forced us to take.
     if buf.capacity() > PEER_WRITE_BUDGET * 2 {
         buf.shrink_to(PEER_WRITE_BUDGET);
@@ -1316,20 +1348,23 @@ mod tests {
         let first = PeerMessage::ReplicateAck {
             req_id: 1,
             accepted: true,
+            queued: mqtt_cluster::peer::Queued::default(),
         };
         // The producer is spawned but cannot run until the writer yields.
         let producer = tokio::spawn(async move {
             tx.send(PeerMessage::ReplicateAck {
                 req_id: 2,
                 accepted: true,
+                queued: mqtt_cluster::peer::Queued::default(),
             })
             .unwrap();
         });
         let mut w = CountingWriter::default();
-        let mut buf = Vec::new();
+        let (mut buf, mut stamps) = (Vec::new(), Vec::new());
         write_batch(
             &mut w,
             &mut buf,
+            &mut stamps,
             &first,
             &mut rx,
             &NodeId("peer".into()),

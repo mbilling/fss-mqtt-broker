@@ -1,0 +1,27 @@
+# Recipe 03: convert units and round them
+#
+# Converts a weather station's metric readings for a US dashboard: Celsius to
+# Fahrenheit with one decimal, pascals to hectopascals, metres per second to whole miles
+# per hour, and millivolts to volts. The result goes to weather/<station>/imperial.
+# `/` always gives a float, and round() takes one argument and gives an integer, so one
+# decimal place is round(x * 10) / 10.
+#
+# In:  weather/oslo/raw  qos=0 retain=0  {"temp_c": 21.37, "pressure_pa": 101325, "wind_ms": 5.2, "battery_mv": 3610}
+# Out: weather/oslo/imperial  qos=0 retain=0  {"station":"oslo","temp_f":70.5,"pressure_hpa":1013.25,"wind_mph":12,"battery_v":3.61}
+#
+# Tested by crates/mqttd/tests/rules_cookbook.rs; explained in docs/RULES-COOKBOOK.md.
+
+[rules.weather_imperial]
+description = "Convert metric weather readings for a US dashboard"
+sql = '''
+SELECT
+  topic(2)                                        AS station,
+  round((payload.temp_c * 9 / 5 + 32) * 10) / 10  AS temp_f,       -- one decimal place
+  payload.pressure_pa / 100                       AS pressure_hpa,
+  round(payload.wind_ms * 2.23694)                AS wind_mph,     -- a whole number
+  payload.battery_mv / 1000                       AS battery_v
+FROM "weather/+/raw"
+'''
+actions = [
+  { function = "republish", args = { topic = "weather/${station}/imperial", payload = "${.}" } },
+]

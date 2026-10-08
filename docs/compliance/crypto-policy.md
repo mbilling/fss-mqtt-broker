@@ -1,6 +1,6 @@
 # Cryptographic policy
 
-**Verified against `v1.0.18` + ADR 0068 (2026-09-26).** What each build variant's
+**Verified against `v1.1.0` + ADR 0068 (2026-10-07).** What each build variant's
 cryptography is, precisely — written so the true claim is quotable and the
 overclaim is impossible.
 
@@ -9,7 +9,7 @@ overclaim is impossible.
 One crypto provider across the entire workspace (ADR 0053): **aws-lc-rs**
 (AWS-LC). TLS 1.3 by default (TLS 1.2 a hardened per-listener opt-in), rustls
 with the aws-lc-rs provider on every plane — client listeners, WS/WSS, QUIC,
-the cluster peer bus — and the same crate for every direct primitive: gossip
+the cluster peer bus, the admin API — and the same crate for every direct primitive: gossip
 HMAC-SHA256, audit-chain SHA-256, backup integrity SHA-256, JWT/OIDC signature
 verification, TLS key handling.
 

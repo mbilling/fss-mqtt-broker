@@ -2067,6 +2067,16 @@ say "[$N nodes] lane E: site ladder ${LANE_E_SITES[*]} x $LANE_E_SITE_RATE msg/s
 # uploaded as a symfs so the reports name functions. Reports and the raw data come
 # back under the rung's perf/.
 PERF_RUNG="${PERF_RUNG:-}"
+# PEER_SOCKETS=on samples every broker's peer-link sockets (`ss -tin` on the peer
+# port, once a second) through each lane E window into the rung's sockets/ (#662).
+# Send-Q / Recv-Q / rtt / cwnd show the kernel's share of replication transit.
+# A full Send-Q also shows up inside the replicate_queue / ack_queue stages (they
+# end when write and flush return), so read the two together: a stage that grows
+# with Send-Q is wire or receiver backpressure, one that grows without it is
+# in-process queueing. Off by default: it is one more process per broker inside
+# the window.
+PEER_SOCKETS="${PEER_SOCKETS:-off}"
+case "$PEER_SOCKETS" in on | off) ;; *) die "PEER_SOCKETS must be on or off, not '$PEER_SOCKETS'" ;; esac
 PERF_SECS="${PERF_SECS:-20}"
 PERF_FREQ="${PERF_FREQ:-199}"
 if [ -n "$PERF_RUNG" ]; then
@@ -2528,8 +2538,25 @@ IMAGES
 	}
 	lane_e_window() {
 		lane_e_window_scrape open
-		local -a perf_pids=()
+		local -a perf_pids=() sock_pids=()
 		local q
+		if [ "$PEER_SOCKETS" = on ]; then
+			mkdir -p "$rdir/sockets"
+			for ((i = 0; i < N; i++)); do
+				# A deadline taken remotely when the sampler starts, not a round
+				# count: each round is ss plus the sleep, so LANE_E_SECS rounds ran
+				# past the window and the last samples landed in the drain.
+				# shellcheck disable=SC2016 # expanded by the REMOTE shell
+				rssh "$(broker_pub_ip "$i")" 'port=$(sed -n "s/^MQTTD_PEER_BIND=.*://p" /etc/mqttd/mqttd.env)
+					end=$(($(date +%s) + '"$LANE_E_SECS"'))
+					while [ "$(date +%s)" -lt "$end" ]; do
+						printf "SAMPLE %s\n" "$(date +%s.%N)"
+						ss -tinH state established "( sport = :$port or dport = :$port )"
+						sleep 1
+					done' >"$rdir/sockets/broker$i.txt" 2>"$rdir/sockets/broker$i.err" &
+				sock_pids+=($!)
+			done
+		fi
 		if [ "$sites" = "$PERF_RUNG" ] && [ ! -d "$rdir/perf" ]; then
 			mkdir -p "$rdir/perf"
 			for ((i = 0; i < N; i++)); do
@@ -2549,6 +2576,8 @@ IMAGES
         done
         fi
 		lane_e_window_scrape close
+		# Named pids, as above; a sampler's failure costs only its own file.
+		for q in "${sock_pids[@]+"${sock_pids[@]}"}"; do wait "$q" || warn "lane E: peer socket sampling failed on a broker — see $rdir/sockets/"; done
 		if [ "${#perf_pids[@]}" -gt 0 ]; then
 			for q in "${perf_pids[@]}"; do wait "$q" || warn "lane E: perf record failed on a broker — see $rdir/perf/"; done
 			# Reports are built after the drain (below), not here: `perf report`

@@ -37,6 +37,16 @@ pub enum Stage {
     /// follower's writer queue wait plus its group commit. `replicate_rtt` minus
     /// this is the network and the two peer-bus queues.
     ReplicaApply,
+    /// Leader side: a `Replicate` queued on the peer link until the link has
+    /// handed it to the kernel (write and flush returned) (#662). The leader's
+    /// part of `replicate_rtt` minus `replica_apply` before the kernel sends:
+    /// in-process queueing plus any wait on a full send buffer, which is wire or
+    /// receiver backpressure. Sampled, about one frame in 16.
+    ReplicateQueue,
+    /// Follower side: a `ReplicateAck` queued on the peer link until the link has
+    /// handed it to the kernel — the follower's part of the same gap, with the
+    /// same send-buffer caveat. Sampled, about one frame in 16.
+    AckQueue,
 }
 
 impl Stage {
@@ -51,6 +61,8 @@ impl Stage {
             Stage::Fsync => "fsync",
             Stage::ReplicateRtt => "replicate_rtt",
             Stage::ReplicaApply => "replica_apply",
+            Stage::ReplicateQueue => "replicate_queue",
+            Stage::AckQueue => "ack_queue",
         }
     }
 }
@@ -112,6 +124,8 @@ mod tests {
             Stage::Fsync,
             Stage::ReplicateRtt,
             Stage::ReplicaApply,
+            Stage::ReplicateQueue,
+            Stage::AckQueue,
         ];
         let labels: Vec<_> = all.iter().map(|s| s.label()).collect();
         assert_eq!(
@@ -123,7 +137,9 @@ mod tests {
                 "commit",
                 "fsync",
                 "replicate_rtt",
-                "replica_apply"
+                "replica_apply",
+                "replicate_queue",
+                "ack_queue"
             ]
         );
     }

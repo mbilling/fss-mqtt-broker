@@ -376,6 +376,7 @@ pub fn permissive_policy(connect_timeout: Duration) -> Arc<ConnPolicy> {
         shutdown: None,
         metrics: None,
         ingress: None,
+        rules: None,
     })
 }
 
@@ -1131,6 +1132,7 @@ pub mod enhanced {
             shutdown: None,
             metrics: None,
             ingress: None,
+            rules: None,
         })
     }
 

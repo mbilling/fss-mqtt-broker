@@ -69,6 +69,7 @@ async fn start_broker() -> Broker {
         shutdown: None,
         metrics: None,
         ingress: None,
+        rules: None,
     });
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

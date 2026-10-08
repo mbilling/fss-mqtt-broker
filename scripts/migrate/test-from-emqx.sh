@@ -617,6 +617,49 @@ boot_on_acl() {  # $1 = acl file, $2 = what it proves
 boot_on_acl "$WORK/acl.toml" "the converted ACL"
 boot_on_acl "$WORK/hostile-acl.toml" \
   "the ACL holding a backslash identity and a quoted topic filter"
+# ── the RULE ENGINE (ADR 0083): EMQX rule SQL becomes an mqttd rules file ──────────────
+# The rules fixture is EMQX's own documented rule examples (rule-configs.md) plus the
+# constructs mqttd's engine lacks. The translated file must LOAD — the broker takes a rules
+# file all-or-nothing, so one unsupported rule left live would refuse every rule — and each
+# untranslatable construct must be a TODO, never a silent drop.
+python3 "$CONV" "$FIX/emqx-rules.conf" \
+  --out-config "$WORK/rules-mqttd.toml" --out-rules "$WORK/rules.toml" >/dev/null 2>&1 \
+  || fail "the converter failed on the rules fixture"
+python3 - "$WORK/rules.toml" <<'PYEOF2' || fail "the translated rules file is not valid TOML"
+import sys, tomllib
+tomllib.load(open(sys.argv[1], "rb"))
+PYEOF2
+"$MQTTD_BIN" --check-rules "$WORK/rules.toml" >"$WORK/rules.out" 2>"$WORK/rules.err" \
+  || { echo "  FAIL — the broker REJECTED the translated rules file:";
+       sed 's/^/         /' "$WORK/rules.err"; exit 1; }
+grep -q 'rules OK: .*: 6 rule(s), 5 enabled' "$WORK/rules.out" \
+  || fail "the translated rules file did not load the 6 live rules (5 enabled): $(cat "$WORK/rules.out")"
+"$MQTTD_BIN" --check-config --config "$WORK/rules-mqttd.toml" >/dev/null 2>"$WORK/check.err" \
+  || { echo "  FAIL — the broker REJECTED the config naming the rules file:";
+       sed 's/^/         /' "$WORK/check.err"; exit 1; }
+grep -q '^file = "/etc/mqttd/rules.toml"' "$WORK/rules-mqttd.toml" \
+  || fail "the converted config does not point [rules] file at the rules file"
+# The SQL is carried verbatim, the republish args with it.
+grep -qF 'sql = "SELECT qos, payload.x as y FROM \"t/a\""' "$WORK/rules.toml" \
+  || fail "a rule's SQL was not carried verbatim"
+grep -qF '{ function = "republish", args = { topic = "t/b", qos = "${qos}", payload = "y: ${y}" } }' \
+  "$WORK/rules.toml" || fail "a republish action's args were not carried"
+grep -qF 'mqtt_properties = { "Content-Type" = "text/plain" }' "$WORK/rules.toml" \
+  || fail "republish mqtt_properties were not carried"
+grep -q '^enable = false' "$WORK/rules.toml" || fail "a disabled rule came out enabled"
+# ... and every construct mqttd's engine lacks is a TODO.
+todo 'mqtt:my_egress_mqtt_bridge.* is a data-integration sink' "$WORK/rules.toml"
+todo 'receive_msgs_from_remote_mqtt_broker is COMMENTED OUT .*data-bridge source' "$WORK/rules.toml"
+todo 'jq_rule is COMMENTED OUT .*jq()' "$WORK/rules.toml"
+todo 'delivered_rule is COMMENTED OUT .*message_delivered' "$WORK/rules.toml"
+todo 'ignore_sys_message' "$WORK/rules.toml"
+grep -q '^\[rules.jq_rule\]' "$WORK/rules.toml" && fail "an unsupported rule was left LIVE"
+# A translated statement runs, not merely parses: EMQX's documented example, end to end.
+out="$("$MQTTD_BIN" --rule-test --sql 'SELECT qos, payload.x as y FROM "t/a"' \
+         --topic t/a --payload '{"x": 1}')"
+[[ "$out" == '{"qos":0,"y":1}' ]] || fail "--rule-test on a translated statement printed: $out"
+ok "EMQX rules translate: the file loads, SQL verbatim, republish carried, every gap a TODO"
+
 # ── the PROPERTY SWEEP ──────────────────────────────────────────────────────────────────
 # Everything above is example-based: one input, a list of greps. That shape catches a
 # regression exactly where a reviewer already looked and is blind everywhere else — which is

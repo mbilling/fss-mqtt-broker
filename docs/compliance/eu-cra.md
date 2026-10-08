@@ -1,6 +1,6 @@
 # EU Cyber Resilience Act — readiness statement
 
-**Verified against `v1.0.18` (2026-09-26).** ADR 0067 T2: the CRA's essential
+**Verified against `v1.1.0` (2026-10-07).** ADR 0067 T2: the CRA's essential
 requirements as a checklist against shipped, checkable facts, plus the
 reporting-duty runbook. **This is not a conformity assessment and confers no CE
 marking**; it is the technical-documentation groundwork a manufacturer or
@@ -36,7 +36,7 @@ begin **September 2026** and its full obligations apply from **December 2027**.
 | 7 | Integrity of data, commands, configuration | Schema-gated stores, epoch fencing, hash-chained audit, backup sha-256 trailers, validate-before-swap config | THREAT-MODEL §2/§4/§5 |
 | 8 | Process only what is **necessary** (data minimisation) | The broker stores payloads it is asked to retain/queue and identity subjects — nothing else; audit records carry **no credentials** by contract | [AUDIT-SCHEMA](../AUDIT-SCHEMA.md); `AuditSink` doc |
 | 9 | Availability of essential functions; resilience to DoS | Admission caps before TLS work, auth penalty box, per-subscriber bounds, watermark **brownout** (refuse growth, keep serving), quorum write floor | THREAT-MODEL §1-DoS; ADR 0041 |
-| 10 | Minimise own attack surface | No HTTP admin API, no dashboard (deliberate absences, recorded); read-only ops endpoints; signals-and-files control plane | ADR 0033/0051; THREAT-MODEL §5 |
+| 10 | Minimise own attack surface | No dashboard (a recorded, deliberate absence); the admin API is off unless configured, mTLS-only from a dedicated admin CA, role-scoped (viewer/operator) and audited per request; read-only health and metrics endpoints; signals and files remain a complete control plane without it | ADR 0033/0051/0081; THREAT-MODEL §5 |
 | 11 | Reduce incident impact; exploitation mitigation | Fail-closed everywhere; effect-free refusals; distroless nonroot images; hardened systemd unit; memory-safe implementation language | HARDENING H-7.5/7.6 |
 | 12 | Security-relevant information recorded (logging/monitoring) | Hash-chained audit trail with SIEM export, boundary-alert invariants, independent verifier | [AUDIT-SCHEMA](../AUDIT-SCHEMA.md); `scripts/audit-verify.py` |
 | 13 | Users can securely remove data / transfer | Session takeover semantics, backup export/restore (documented window semantics), data-dir ownership | ADR 0062; OPERATIONS DR section |

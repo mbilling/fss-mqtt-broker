@@ -1,0 +1,29 @@
+# Recipe 05: flatten nested JSON, and write it as InfluxDB line protocol too
+#
+# Flattens a gateway's nested state into one level of JSON on flat/<gateway>, and
+# publishes the same reading as InfluxDB line protocol text on influx/pumps for a
+# Telegraf MQTT consumer. One rule, two actions: they publish in the order they are
+# listed.
+#
+# In:  gw/edge-1/state  qos=0 retain=0  {"device": {"id": "pump-3", "fw": {"version": "2.1.0"}}, "readings": {"env": {"temp": 40.2, "hum": 31}, "power": {"volts": 229.8, "amps": 3.1}}}
+# Out: flat/edge-1  qos=0 retain=0  {"gateway":"edge-1","device_id":"pump-3","fw_version":"2.1.0","env_temp":40.2,"env_hum":31,"power_w":712}
+# Out: influx/pumps  qos=0 retain=0  pump,gateway=edge-1,device=pump-3,fw=2.1.0 temp=40.2,hum=31,power_w=712
+#
+# Tested by crates/mqttd/tests/rules_cookbook.rs; explained in docs/RULES-COOKBOOK.md.
+
+[rules.flatten_gateway_state]
+description = "Flatten nested gateway state into one level"
+sql = '''
+SELECT
+  topic(2)                  AS gateway,
+  payload.device.id         AS device_id,
+  payload.device.fw.version AS fw_version,
+  payload.readings.env.temp AS env_temp,
+  payload.readings.env.hum  AS env_hum,
+  round(payload.readings.power.volts * payload.readings.power.amps) AS power_w
+FROM "gw/+/state"
+'''
+actions = [
+  { function = "republish", args = { topic = "flat/${gateway}", payload = "${.}" } },
+  { function = "republish", args = { topic = "influx/pumps", payload = "pump,gateway=${gateway},device=${device_id},fw=${fw_version} temp=${env_temp},hum=${env_hum},power_w=${power_w}" } },
+]

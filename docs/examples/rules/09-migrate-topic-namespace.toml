@@ -1,0 +1,33 @@
+# Recipe 09: migrate a topic namespace, keeping QoS and the retain flag
+#
+# Firmware is moving from v1/<site>/<device>/<metric> to
+# sites/<site>/devices/<device>/<metric>. Until every subscriber has moved, this rule
+# mirrors the old tree into the new one for two pilot sites, keeping the payload bytes,
+# the QoS and the retain flag. It must SELECT qos and flags.retain: the republish
+# defaults read the rule's output, so without them the copy would be QoS 0 and never
+# retained (see recipe 13).
+#
+# In:   v1/munich/th-9/state  qos=2 retain=1  ON
+# Out:  sites/munich/devices/th-9/state  qos=2 retain=0  ON
+# In:   v1/paris/th-4/temp  qos=1 retain=0  19.0
+# (nothing: paris is not a pilot site)
+#
+# A subscriber that was already connected sees retain=0 on the copy, as MQTT delivers
+# any live message. One that subscribes later gets the retained copy:
+#
+# Late: sites/munich/devices/th-9/state  qos=2 retain=1  ON
+#
+# Tested by crates/mqttd/tests/rules_cookbook.rs; explained in docs/RULES-COOKBOOK.md.
+
+[rules.v1_to_v2_topics]
+description = "Mirror legacy v1 topics into the v2 tree for berlin and munich"
+sql = '''
+SELECT
+  topic(2) AS site, topic(3) AS device, topic(4) AS metric,
+  payload, qos, flags.retain AS retain
+FROM "v1/+/+/+"
+WHERE topic(2) IN ('berlin', 'munich')
+'''
+actions = [
+  { function = "republish", args = { topic = "sites/${site}/devices/${device}/${metric}", qos = "${qos}", retain = "${retain}", payload = "${payload}" } },
+]

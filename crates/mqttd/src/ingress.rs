@@ -159,6 +159,23 @@ impl IngressCredit {
         self.peer_shed.swap(0, Ordering::Relaxed)
     }
 
+    /// What a publish's derived messages (ADR 0083) cost on top of its own `charged`
+    /// bytes: each costs what a publish of its size would, and together they are
+    /// clamped to what the per-connection cap leaves beside the original — so the
+    /// batch's whole charge fits under the cap and, waited for in one acquire with
+    /// nothing else held, can always eventually be had, as the largest single message
+    /// can. `derived` yields each message's topic length and payload-plus-properties
+    /// length.
+    #[must_use]
+    pub fn derived_cost(&self, charged: u32, derived: impl Iterator<Item = (usize, usize)>) -> u32 {
+        let room = self.conn_bytes.saturating_sub(charged as usize);
+        let total = derived
+            .map(|(t, p)| self.cost(t, p) as usize)
+            .fold(0usize, usize::saturating_add)
+            .min(room);
+        u32::try_from(total).unwrap_or(u32::MAX)
+    }
+
     /// What a publish of `topic_len` and `payload_len` bytes costs, clamped to the
     /// per-connection cap so even the largest message can eventually proceed. The
     /// payload length includes the publish's properties (their `accounted_bytes`):
