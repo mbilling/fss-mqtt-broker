@@ -537,6 +537,22 @@ Mosquitto scopes something per listener and mqttd cannot:
 | A `connection` block and its `address` / `topic` / `bridge_cafile` / `bridge_certfile` / `bridge_keyfile` / `remote_username` / `remote_password` / `remote_clientid` | **reported per key, each naming its `mqtt-bridge` equivalent** (`[[upstreams]] url`, `[[upstreams.rules]]`, `[upstreams.tls] ca`/`cert`/`key`, `username`, `password_file`, `client_id`). No bridge config is written — this converter has no `--out-bridge`. All but `connection` used to be reported as "no direct equivalent — check the mqttd configuration table", which has nothing to find, `bridge_cafile` included |
 | An address the broker cannot bind (`listener 0 /tmp/mosq.sock`, a non-numeric port) | **no live bind**: the candidate is commented with the reason. Until issue #671, `mqttd --check-config` accepted any string in a bind and the broker then failed at startup, so the verification this page points you at did not cover it (invariant **H** does; `--check-config` now refuses a malformed bind too, and `--preflight` resolves each one on the target host). A UNIX-socket listener declares no TCP endpoint at all — mqttd has no unix-socket transport |
 
+### A Mosquitto bridge into mqttd
+
+An edge Mosquitto may bridge into mqttd with its own `connection` block rather than
+`mqtt-bridge`. With `notifications true`, Mosquitto's default, the bridge connects with a
+retained Will on `$SYS/broker/connection/<remote_clientid>/state` and then publishes `1`
+there. mqttd reserves `$SYS/` for the broker
+([ADR 0084](adr/0084-watching-and-editing-rules-live.md)) but leaves this one pattern to
+the ACL, as Mosquitto does, so the bridge connects. Under `default = "deny"`, grant the
+bridge's identity `publish` on `$SYS/broker/connection/%c/state`. A client that watches
+it needs a `subscribe` grant naming it too, since `#` does not cover `$SYS`.
+
+Every other topic under `$SYS/` is refused, whatever the ACL says. A bridge whose
+`notification_topic` is elsewhere under `$SYS/` puts its Will there, so mqttd refuses its
+whole CONNECT (MQTT 5 `0x87`, MQTT 3.1.1 return code 5, audited as `acl.deny.will`). Move
+`notification_topic` out of `$SYS`, or set `notifications false`.
+
 ---
 
 ## EMQX → mqttd
@@ -621,8 +637,10 @@ Every one of these is a `TODO(migrate)` line naming what you must decide:
 - **`$SYS`.** mqttd publishes no broker statistics there (clients, sessions, messages,
   uptime): those are on `/metrics` and `/statusz`, and any client that read EMQX's `$SYS`
   broker topics must be rewritten against them. `$SYS/` is reserved for the broker: no
-  client may publish there, whatever the ACL says. The broker publishes only opt-in
-  rule statistics and an opt-in rule trace under `$SYS/brokers/<node>/`
+  client may publish there, whatever the ACL says, except on a Mosquitto bridge's
+  `$SYS/broker/connection/<id>/state` ([A Mosquitto bridge into
+  mqttd](#a-mosquitto-bridge-into-mqttd)). The broker publishes only opt-in rule
+  statistics and an opt-in rule trace under `$SYS/brokers/<node>/`
   ([RULES.md](RULES.md#watch-and-edit-rules-live)), and they never run rules, as with
   EMQX's default `ignore_sys_message = true`.
 - **`mqtt.max_inflight` — deliberately not mapped, because the nearest-looking setting
