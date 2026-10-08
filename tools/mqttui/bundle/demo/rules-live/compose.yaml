@@ -66,8 +66,9 @@ services:
       MQTTD_HEALTH_BIND: 0.0.0.0:8080      # /livez, /readyz, /metrics; the healthcheck probes it
       MQTTD_RULES_FILE: /rules/rules.toml  # the `rules` volume
       # Per-rule statistics on $SYS/brokers/<node>/rules[/<id>] every 2 s, and the rule
-      # trace on $SYS/brokers/<node>/trace/rules/<id>, at most 5 records per rule per second.
-      # The trace is off by default in the broker: it copies payloads onto $SYS.
+      # trace on $SYS/brokers/<node>/trace/rules/<id>, at most 5 records per rule per second
+      # and 5 more no_result ones (messages its WHERE turned away). The trace is off by
+      # default in the broker: it copies payloads onto $SYS.
       MQTTD_RULES_SYS_INTERVAL: "2"
       MQTTD_RULES_TRACE: "1"
       MQTTD_RULES_TRACE_RATE: "5"
