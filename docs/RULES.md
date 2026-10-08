@@ -860,6 +860,9 @@ Traps that EMQX's reference states only in passing, each checked against this en
 - `regex_extract` returns an array of the groups (`["42"]`), empty when nothing matches,
   and `nth(1, [])` fails the rule.
 - `round` takes one argument: `round(2.567, 2)` fails the load.
+- `unix_ts_to_rfc3339` and `now_rfc3339` write the broker host's local time zone, as EMQX
+  does (`+00:00` on a host or container set to UTC). `format_date` with an explicit offset
+  (`'+01:00'`) gives the same text on every host.
 - `is_empty` of a missing value fails the rule
   (`is_empty(): expected an array or a map, got a undefined`); EMQX documents it as
   `false`. Guard it: `is_not_null(payload.list) AND is_empty(payload.list)`.

@@ -1406,11 +1406,12 @@ fn a_message_has_one_timestamp_however_often_it_is_read() {
     let sql =
         "SELECT timestamp AS ms, unix_ts_to_rfc3339(timestamp, 'millisecond') AS at FROM \"t/#\"";
     let out = test_sql(sql, &input).unwrap();
-    let millis = format!(".{:03}+00:00", first % 1000);
+    // The formatted copy is in the host's time zone, so compare the instant it names.
+    let row: serde_json::Value = serde_json::from_str(&out[0]).expect("a JSON row");
+    let at = chrono::DateTime::parse_from_rfc3339(row["at"].as_str().expect("an RFC 3339 string"))
+        .expect("RFC 3339");
     assert!(
-        out.len() == 1
-            && out[0].starts_with(&format!(r#"{{"ms":{first},"at":""#))
-            && out[0].ends_with(&format!(r#"{millis}"}}"#)),
+        out.len() == 1 && row["ms"].as_i64() == Some(first) && at.timestamp_millis() == first,
         "the raw and formatted timestamps disagree"
     );
     assert!(

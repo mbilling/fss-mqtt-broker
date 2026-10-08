@@ -416,8 +416,11 @@ canonical/th-42  qos=1 retain=0  {"device":{"id":"th-42","vendor":"acme"},"measu
 vendor/acme/uplink  qos=1 retain=0  {"devId": "th-42/cmd", "ts": 1791386000000, "vals": {"t": 21.5, "h": 40}}
 ```
 
-**Gotcha:** `unix_ts_to_rfc3339` writes UTC as `+00:00`, not `Z`. Both are valid RFC 3339,
-but a consumer that compares strings must expect the first.
+**Gotchas:** `unix_ts_to_rfc3339` writes the time in the broker host's local time zone, as
+EMQX does: `+00:00` on a host or container set to UTC, as here, and `+01:00` on one set to
+Danish winter time. For the same text on every host, use `format_date` with an explicit
+offset (recipe 8). It writes UTC as `+00:00`, not `Z`; both are valid RFC 3339, but a
+consumer that compares strings must expect the first.
 
 ---
 
@@ -637,7 +640,7 @@ a message id, and the time it arrived.
 #
 # Stamps each counter reading with the publisher's client id, username, IP address, the
 # broker node that received it, a unique message id, and the time it arrived: in
-# milliseconds, as UTC RFC 3339, and as the plant's local time. The local time uses a
+# milliseconds, as RFC 3339, and as the plant's local time. The local time uses a
 # fixed offset (+02:00); there are no time-zone rules, so daylight saving is not applied.
 # A client that sent no username has none: coalesce() gives it a value, where the JSON
 # would otherwise carry the text "undefined".

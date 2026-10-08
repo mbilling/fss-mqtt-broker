@@ -1893,6 +1893,8 @@ fn mqttd() -> Command {
             cmd.env_remove(k);
         }
     }
+    // `unix_ts_to_rfc3339` writes the host's local time zone; the cookbook shows UTC.
+    cmd.env("TZ", "UTC");
     cmd
 }
 

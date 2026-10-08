@@ -2,7 +2,7 @@
 #
 # Stamps each counter reading with the publisher's client id, username, IP address, the
 # broker node that received it, a unique message id, and the time it arrived: in
-# milliseconds, as UTC RFC 3339, and as the plant's local time. The local time uses a
+# milliseconds, as RFC 3339, and as the plant's local time. The local time uses a
 # fixed offset (+02:00); there are no time-zone rules, so daylight saving is not applied.
 # A client that sent no username has none: coalesce() gives it a value, where the JSON
 # would otherwise carry the text "undefined".
