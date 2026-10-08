@@ -420,8 +420,9 @@ topic or payload.
 - **`FROM` does not match.** `mqttd --rule-test --sql '<statement>' --topic <topic>`
   exits 1 with `matches none of the FROM filters` when it does not. A filter that starts
   with `#` or `+` never matches a topic that starts with `$`, and a `FROM` on `$SYS/…`
-  never matches at all: clients cannot publish there and the broker's own `$SYS`
-  messages never run rules (`--check-rules` warns).
+  matches nothing but a Mosquitto bridge's `$SYS/broker/connection/<id>/state`: clients
+  cannot publish anywhere else there and the broker's own `$SYS` messages never run rules
+  (`--check-rules` warns about a filter that cannot match even that).
 - **`WHERE` is false.** `mqttd_rule_evaluations_total{rule="<id>",result="no_result"}`
   climbs. The usual cause is a double-quoted string, `WHERE name = "x"`, which compares
   with a *field* called `x` (`--check-rules` warns about it); write `'x'`.
@@ -434,8 +435,9 @@ topic or payload.
 - **`undefined` in the output.** A placeholder reads what the rule *selected*, not the
   message: `${topic}` in a rule that did not select `topic` renders `undefined`, and so
   does an event rule's default payload (events have none; use `payload = "${.}"`). A
-  rule that does not select `qos` republishes at QoS 0, which an offline session does
-  not queue.
+  rule that does not select `qos` republishes at QoS 0. That is still queued for an
+  offline persistent session; a session that does not persist misses whatever is
+  published while it is away, at any QoS.
 - **No metrics to look at.** `/metrics` is served only with `MQTTD_HEALTH_BIND` (or
   `MQTTD_METRICS_BIND`) set. The same counts are in `mqttd --admin rules`, and on
   `$SYS/brokers/+/rules/#` with `[rules] sys_interval_secs` set

@@ -1149,16 +1149,20 @@ operating summary. The engine is unreleased: no release has it yet.
   `$SYS/brokers/<node>/rules/<id>`, and a summary on `$SYS/brokers/<node>/rules`: the
   running digest and the last reload's trigger, outcome and error **kind**. A client needs
   an ACL grant for `$SYS/brokers/+/rules/#` (HARDENING.md H-3.5). The messages are QoS 0,
-  never retained, and take node-pool ingress credit: under load a tick is skipped and
+  never retained, and live only: never queued for an offline persistent session or shared
+  subscriber, so they cost no storage write, and each expires after two intervals (10 s at
+  least). They take node-pool ingress credit: under load the rest of a tick is skipped and
   counted in the summary's `stats_dropped`, not queued. With 1,024 rules at a 1 s interval
   that is 1,025 messages a second per node, in `mqttd_publish_received_total{qos="0"}` like
   any publish; 10 s or more is plenty for a dashboard.
 - **The trace** (`[rules] trace`, `MQTTD_RULES_TRACE`) copies the messages rules see —
   payloads up to 1 KiB, client ids, usernames — onto
-  `$SYS/brokers/<node>/trace/rules/<id>`, at most `trace_rate` records per rule per second
-  (default 20) and max(`trace_rate`, 200) per node. It is a debugging tool: turn it on for
-  the minutes you need, through a reload, and off again. On, it logs a WARN, and an
-  `INSECURE:` line with no ACL file or an ACL whose default is `allow`; whoever may
+  `$SYS/brokers/<node>/trace/rules/<id>`, at most `trace_rate` (default 20) records per
+  rule per second, plus as many `no_result` ones, and max(`trace_rate`, 200) per node; like
+  the statistics, they are live only, and expire after 10 s. It is a debugging tool: turn
+  it on for the minutes you need, through a reload, and off again. Turning it on logs a
+  WARN. With no ACL file or an ACL whose default is `allow`, it also logs an `INSECURE:`
+  line, and logs it again only if that reason changes while the trace is on. Whoever may
   subscribe to a rule's trace topic reads what that rule's `FROM` matches. Dropped records
   are counted in the summary's `trace_dropped`.
 - **Change them through the admin API**, optionally. With `[rules] admin_writers`
@@ -1166,8 +1170,9 @@ operating summary. The engine is unreleased: no release has it yet.
   role, `mqttd --admin rules-apply <file> --if_match <digest>` replaces the rules file and
   `rule-delete` removes one rule, and `PUT /admin/v1/rule` inserts or updates one
   ([ADMIN-API.md § Rules](ADMIN-API.md#rules)). The broker writes the file atomically,
-  keeps the previous one as `<file>.prev`, and reloads (trigger `admin-rules`); each write
-  is a `rules.write` audit record. Writes are per node, so apply them to every node and
+  with the old file's mode (a file it creates is `0600`), keeps the previous one as
+  `<file>.prev`, and reloads (trigger `admin-rules`); each write that changes the file is
+  a `rules.write` audit record. Writes are per node, so apply them to every node and
   check `same_rules` in `mqttd --admin cluster --json`. They need a rules file in a
   directory the broker may write, so they do not fit the Helm chart's ConfigMap or a
   GitOps-managed file, which would also overwrite them: keep `admin_writers` empty there.
@@ -1183,9 +1188,25 @@ operating summary. The engine is unreleased: no release has it yet.
   the next reload of any kind will try it again. In the SIEM, notify on every
   `rules.write` record (who, which rule, old and new digest), as on operator actions
   (HARDENING.md H-8.5), and on the log line `rule trace is ON` outside a planned
-  debugging window. <!-- TODO-INTEGRATE: confirm the trace WARN's exact text, and add the
-  hub's reserved-topic drop counter (design: mqttd_publish_dropped_total{reason="reserved"})
-  with "nonzero after a rolling upgrade has finished: a peer is still forwarding $SYS". -->
+  debugging window (the line reads `rule trace is ON: every rule's evaluations — … are
+  copied onto $SYS/brokers/<node>/trace/rules/<id> (ADR 0084) …`, target `mqttd::rules`,
+  logged when the trace turns on). With no ACL file or `default = "allow"`, it is followed
+  by `INSECURE: the rule trace is on and …`, which is logged again only when that reason
+  changes while the trace is on, not at every reload.
+
+  ```promql
+  increase(mqttd_publish_dropped_total{reason="reserved"}[10m]) > 0
+  ```
+
+  A message in the broker-reserved `$SYS/` tree reached the hub on a path other than the
+  broker's own, and was dropped. After a rolling upgrade has finished, that is a peer still
+  forwarding client `$SYS` publishes: an older node, or a forward that is retained, QoS 1
+  or 2, or names this node, logged only at DEBUG. During a restore, it is a retained `$SYS`
+  value from an old backup that was skipped (WARN `restore: skipped a retained value …`).
+  Otherwise it is a bug. Client publishes into `$SYS` are not counted here: they are
+  `acl.deny.publish` audit records. A Mosquitto bridge's
+  `$SYS/broker/connection/<id>/state` is not reserved, so its traffic is never counted
+  here.
 - **Drift:** `mqttd_rules_info{checksum}` is the file's SHA-256 (the same value
   `--check-rules` prints). More than one checksum at 1 across the cluster means nodes
   evaluate their own clients' publishes differently. A checksum replaced by a reload stays
