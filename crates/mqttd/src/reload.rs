@@ -213,8 +213,9 @@ pub struct ReloadRecord {
     pub applied: bool,
     /// Why not, when not: the full text, which can quote a config line holding a secret.
     pub error: Option<String>,
-    /// How many attempts before this one in a row had the same trigger and error (a
-    /// rejected file the watcher retries every poll repeats; it does not flood).
+    /// How many rejected attempts in a row before this one were rejected with the same
+    /// trigger and error (a broken file the watcher retries every poll repeats; it does
+    /// not flood). 0 for an applied one: two applied reloads are two changes.
     pub repeats: u32,
 }
 
@@ -267,7 +268,12 @@ impl LastReload {
     pub fn record(&self, trigger: &str, applied: bool, error: Option<&str>) {
         let mut last = self.lock();
         let repeats = match &*last {
-            Some(prev) if prev.trigger == trigger && prev.error.as_deref() == error => {
+            Some(prev)
+                if !applied
+                    && !prev.applied
+                    && prev.trigger == trigger
+                    && prev.error.as_deref() == error =>
+            {
                 prev.repeats.saturating_add(1)
             }
             _ => 0,
@@ -1265,8 +1271,9 @@ mod tests {
     }
 
     /// ADR 0084: every reload attempt is recorded, applied or rejected, with how many
-    /// attempts in a row before it had the same trigger and error — so the watcher
-    /// retrying a broken file every poll reads as one failure repeating.
+    /// rejected attempts in a row before it had the same trigger and error — so the
+    /// watcher retrying a broken file every poll reads as one failure repeating, and two
+    /// applied writes read as two changes.
     #[test]
     fn every_reload_attempt_is_recorded_with_its_repeats() {
         let failing = Arc::new(AtomicBool::new(false));
@@ -1310,6 +1317,15 @@ mod tests {
         assert!(reloader.reload("admin"));
         let r = last.get().unwrap();
         assert_eq!((r.applied, r.repeats, r.error), (true, 0, None));
+        // Applied attempts in a row with one trigger are each a change of their own.
+        for _ in 0..2 {
+            assert!(reloader.reload("admin-rules"));
+            let r = last.get().unwrap();
+            assert_eq!(
+                (r.trigger.as_str(), r.applied, r.repeats),
+                ("admin-rules", true, 0)
+            );
+        }
     }
 
     /// ADR 0084: what a reload failure publishes is the part that failed, never its text:
