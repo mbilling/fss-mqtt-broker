@@ -430,6 +430,55 @@ function fromFilters(sql) {
   return m ? Array.from(m[1].matchAll(/"([^"]*)"/g), (x) => x[1]) : [];
 }
 
+// Rules do not chain: a rule never runs on a message a rule published. What the other
+// rules publish to, as filters: each republish topic up to its first ${…} level. A topic
+// that starts with one says nothing, and is left out.
+function derivedFilters(exceptId) {
+  const found = [];
+  for (const r of (state.list && state.list.rules) || []) {
+    if (r.id === exceptId) continue;
+    for (const a of r.actions_spec || []) {
+      const topic = a && a.function === "republish" && a.args && a.args.topic;
+      if (typeof topic !== "string") continue;
+      const levels = topic.split("/");
+      const fixed = levels.findIndex((l) => l.includes("${"));
+      if (fixed === 0) continue;
+      found.push({ rule: r.id, topic, filter: fixed < 0 ? topic : [...levels.slice(0, fixed), "#"].join("/") });
+    }
+  }
+  return found;
+}
+
+// Whether some topic matches both filters.
+function filtersOverlap(a, b) {
+  const x = a.split("/");
+  const y = b.split("/");
+  const wild = (l) => l === "+" || l === "#";
+  if ((x[0].startsWith("$") && wild(y[0])) || (y[0].startsWith("$") && wild(x[0]))) return false;
+  for (let i = 0; ; i++) {
+    if (x[i] === "#" || y[i] === "#") return true;
+    if (i === x.length || i === y.length) return x.length === y.length;
+    if (x[i] !== "+" && y[i] !== "+" && x[i] !== y[i]) return false;
+  }
+}
+
+// After Check, Test and Apply: the edited rule's FROM covers what other rules publish.
+function chainWarning(out, rule) {
+  const derived = derivedFilters(rule.id);
+  const hits = new Map(); // other rule id -> a topic it publishes to
+  for (const f of fromFilters(rule.fields.sql)) {
+    if (f.startsWith("$events/")) continue;
+    for (const d of derived) {
+      if (!hits.has(d.rule) && filtersOverlap(f, d.filter)) hits.set(d.rule, d.topic);
+    }
+  }
+  if (!hits.size) return;
+  const named = [...hits].slice(0, 3).map(([id, topic]) => `${id} (${topic})`).join(", ");
+  const more = hits.size > 3 ? `, and ${hits.size - 3} more` : "";
+  out.append(el("p", `Its FROM matches topics other rules publish to: ${named}${more}. Rules do not ` +
+    "chain, so this rule does not run on those messages, only on what clients publish there.", "notice"));
+}
+
 async function testInput(rule) {
   if ($("t-custom").checked) {
     return { body: { topic: $("t-topic").value, payload: $("t-payload").value, payload_encoding: "utf8" } };
@@ -479,6 +528,7 @@ async function checkRule() {
   if (state.selected === null && findRule(rule.id)) {
     out.append(el("p", `A rule named ${rule.id} already exists: Apply would replace it.`, "notice"));
   }
+  chainWarning(out, rule);
 }
 
 async function testRule() {
@@ -490,6 +540,11 @@ async function testRule() {
     say(out, "error", e.message);
     return;
   }
+  await showTest(out, rule);
+  chainWarning(out, rule);
+}
+
+async function showTest(out, rule) {
   say(out, "busy", "Testing…");
   const input = await testInput(rule);
   if (input.error) {
@@ -537,6 +592,7 @@ async function applyRule() {
   const r = await api("PUT", `/api/rule?${q}`, rule.fields);
   showWrite(out, r, $("f-sql"), "The rules list is reloaded now. Your edit is still here: Apply " +
     "again to write it over the newer file, or choose the rule in the table to load its newer version.");
+  chainWarning(out, rule);
   wrote(r);
   if (r.status === 200) {
     state.selected = rule.id;

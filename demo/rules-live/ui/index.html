@@ -76,7 +76,11 @@
       </div>
       <div class="row">
         <label for="f-sql">SQL</label>
-        <textarea id="f-sql" rows="14" spellcheck="false"></textarea>
+        <p id="sql-hint" class="hint">Rules do not chain: a rule never runs on a message a rule
+          published, so a FROM on what the demo's rules write (<code>alerts/</code>,
+          <code>kpi/</code>, <code>normalized/</code>, <code>analytics/</code>, <code>state/</code>,
+          <code>events/</code>) does not fire on those.</p>
+        <textarea id="f-sql" rows="14" spellcheck="false" aria-describedby="sql-hint"></textarea>
       </div>
       <div class="row">
         <label for="f-actions">Actions (JSON, as in the rules file)</label>

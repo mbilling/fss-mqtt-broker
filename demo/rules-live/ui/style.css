@@ -255,6 +255,10 @@ input[readonly] {
   font-weight: 600;
 }
 
+.row .hint {
+  margin: 0 0 0.3rem;
+}
+
 .check {
   display: flex;
   align-items: center;
