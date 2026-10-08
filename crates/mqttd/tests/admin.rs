@@ -918,7 +918,8 @@ async fn the_authorization_dry_run_names_the_deciding_rule_of_the_live_policy() 
 
 /// ADR 0084: `$SYS/` is the broker's. Not even an allow-all policy lets a client
 /// publish there, so the dry run says so without asking the policy, as enforcement
-/// does. `$sys` is an ordinary topic, and subscribing to `$SYS` stays the policy's call.
+/// does. `$sys` is an ordinary topic, a Mosquitto bridge's state is the policy's call as
+/// it is at CONNECT, and so is subscribing to `$SYS`.
 #[tokio::test]
 async fn the_authorization_dry_run_never_allows_a_publish_into_sys() {
     let (_tx, live) = tokio::sync::watch::channel(
@@ -951,7 +952,11 @@ async fn the_authorization_dry_run_never_allows_a_publish_into_sys() {
         assert_eq!(body["rule"], Value::Null);
         assert_eq!(body["reason"], mqttd::admin::authz::RESERVED_REASON);
     }
-    for (action, target) in [("publish", "$sys/x"), ("subscribe", "$SYS/%23")] {
+    for (action, target) in [
+        ("publish", "$sys/x"),
+        ("publish", "$SYS/broker/connection/edge-1/state"),
+        ("subscribe", "$SYS/%23"),
+    ] {
         let (_, body) = h
             .get(
                 &alice,
