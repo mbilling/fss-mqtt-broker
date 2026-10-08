@@ -258,7 +258,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `two_bridge_instances_do_not_duplicate_forwarding`
 - `two_partitioned_instances_deliver_each_inbound_message_exactly_once`
 
-## `crates/mqtt-cluster/src/lib.rs` — 367 test(s)
+## `crates/mqtt-cluster/src/lib.rs` — 368 test(s)
 
 - `cluster_identity::tests::a_founder_mints_once_and_reloads_stably`
 - `cluster_identity::tests::a_joiner_adopts_once_and_persists`
@@ -457,6 +457,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `peer::tests::partial_frame_returns_none`
 - `peer::tests::proto_negotiation_picks_the_newest_common_version_or_rejects`
 - `peer::tests::publish_verdict_and_shared_deliver_acked_roundtrip_at_stable_variant_indices`
+- `peer::tests::queued_sampling_stamps_the_first_then_about_one_in_16_without_a_stride`
 - `peer::tests::roundtrips_all_variants`
 - `peer::tests::the_frozen_frames_encode_byte_for_byte_stably`
 - `peer::tests::the_reached_verdict_is_appended_and_announced_at_proto_11`

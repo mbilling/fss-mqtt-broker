@@ -94,7 +94,7 @@ struct ProbeLabel {
 /// Every `{stage}` value the broker records. Each one's histogram handle is resolved
 /// once and cached ([`Metrics::observe_durable_stage`] runs several times per durable
 /// append); a label outside this set still works, through the family lookup.
-const DURABLE_STAGES: [&str; 8] = [
+const DURABLE_STAGES: [&str; 10] = [
     "lane_queue",
     "local_durable",
     "quorum",
@@ -103,6 +103,8 @@ const DURABLE_STAGES: [&str; 8] = [
     "fsync",
     "replicate_rtt",
     "replica_apply",
+    "replicate_queue",
+    "ack_queue",
 ];
 
 /// `{command}` label for `mqttd_hub_dispatch_seconds` (issue #242) — the COARSE hub
@@ -916,7 +918,10 @@ impl Metrics {
              commit releases it), commit (one group commit on a shard writer, fsync \
              included), fsync (the data sync alone), replicate_rtt (leader, per follower: \
              Replicate queued to the peer link until its ack is back), replica_apply \
-             (follower: Replicate received until its ack is queued). Fine buckets from 20us so a \
+             (follower: Replicate received until its ack is queued), replicate_queue \
+             (leader: Replicate queued on the peer link until the link has handed it to the \
+             kernel, write and flush returned), ack_queue (follower: the same for its \
+             ReplicateAck); both sampled, about one frame in 16. Fine buckets from 20us so a \
              millisecond-scale fsync is resolved, not rounded to the next power of two",
             durable_stage_seconds.clone(),
         );
