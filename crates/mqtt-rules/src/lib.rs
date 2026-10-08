@@ -24,6 +24,7 @@
 //! documented in `docs/RULES.md`.
 
 use std::collections::{BTreeMap, HashMap};
+use std::ops::Range;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -81,12 +82,18 @@ pub struct ParseError {
     pub near: String,
 }
 
+/// The 1-based line and column (in characters) of byte `offset` in `text`.
+fn line_column(text: &str, offset: usize) -> (usize, usize) {
+    let before = &text[..offset];
+    let line = before.matches('\n').count() + 1;
+    let column = before.rsplit('\n').next().map_or(0, |l| l.chars().count()) + 1;
+    (line, column)
+}
+
 impl ParseError {
     pub(crate) fn at(sql: &str, offset: usize, message: impl Into<String>) -> Self {
         let offset = offset.min(sql.len());
-        let before = &sql[..offset];
-        let line = before.matches('\n').count() + 1;
-        let column = before.rsplit('\n').next().map_or(0, |l| l.chars().count()) + 1;
+        let (line, column) = line_column(sql, offset);
         let near: String = sql[offset..].chars().take(24).collect();
         Self {
             message: message.into(),
@@ -119,11 +126,19 @@ impl EvalError {
 
 /// A rules file that cannot be loaded. Loading is all-or-nothing: one bad rule
 /// rejects the file, and a reload keeps the running rules.
+///
+/// The text (`Display`) is what `mqttd --check-rules` and a rejected reload print; the
+/// positions are for a caller that points at the place, such as the admin API.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum LoadError {
     /// The file itself (unreadable, not TOML, an unknown key).
-    #[error("rules file: {0}")]
-    File(String),
+    #[error("rules file: {message}")]
+    File {
+        /// What is wrong.
+        message: String,
+        /// Where in the file text, in bytes, when the TOML parser said.
+        span: Option<Range<usize>>,
+    },
     /// One rule.
     #[error("rule `{id}`: {message}")]
     Rule {
@@ -131,7 +146,34 @@ pub enum LoadError {
         id: String,
         /// What is wrong with it.
         message: String,
+        /// The 1-based line of a SQL error, counted from the start of the rule's `sql`.
+        sql_line: Option<usize>,
+        /// The 1-based column (in characters) of a SQL error.
+        sql_column: Option<usize>,
     },
+}
+
+impl LoadError {
+    fn file(message: impl Into<String>) -> Self {
+        Self::File {
+            message: message.into(),
+            span: None,
+        }
+    }
+
+    /// For a file error with a span, where it starts in `text` (the text that was
+    /// parsed): the 1-based line and column (in characters).
+    #[must_use]
+    pub fn file_position(&self, text: &str) -> Option<(usize, usize)> {
+        match self {
+            Self::File {
+                span: Some(span), ..
+            } => text
+                .is_char_boundary(span.start)
+                .then(|| line_column(text, span.start)),
+            _ => None,
+        }
+    }
 }
 
 /// The fields a rule reads from its trigger.
@@ -300,12 +342,34 @@ struct Compiled {
     warnings: Vec<String>,
 }
 
-/// Compile one statement and its `FROM` list.
-fn compile(sql: &str) -> Result<Compiled, String> {
-    if sql.len() > MAX_SQL_BYTES {
-        return Err(format!("sql is longer than {MAX_SQL_BYTES} bytes"));
+/// Why a statement does not compile, and where in it when the parser said.
+struct CompileError {
+    message: String,
+    /// 1-based (line, column) in the statement.
+    at: Option<(usize, usize)>,
+}
+
+impl From<String> for CompileError {
+    fn from(message: String) -> Self {
+        Self { message, at: None }
     }
-    let (stmt, warnings) = parser::parse(sql).map_err(|e| e.to_string())?;
+}
+
+impl From<&str> for CompileError {
+    fn from(message: &str) -> Self {
+        message.to_string().into()
+    }
+}
+
+/// Compile one statement and its `FROM` list.
+fn compile(sql: &str) -> Result<Compiled, CompileError> {
+    if sql.len() > MAX_SQL_BYTES {
+        return Err(format!("sql is longer than {MAX_SQL_BYTES} bytes").into());
+    }
+    let (stmt, warnings) = parser::parse(sql).map_err(|e| CompileError {
+        message: e.to_string(),
+        at: Some((e.line, e.column)),
+    })?;
     if stmt.foreach && stmt.fields.iter().any(|i| matches!(i, parser::Item::Star)) {
         return Err("FOREACH takes an array expression, not *".into());
     }
@@ -313,25 +377,26 @@ fn compile(sql: &str) -> Result<Compiled, String> {
     for from in &stmt.from {
         if from.starts_with("$events/") {
             let kind = EventKind::from_topic(from).ok_or_else(|| {
-                format!(
+                CompileError::from(format!(
                     "\"{from}\" is not a supported event (supported: $events/client/connected, \
                      $events/client/disconnected, $events/session/subscribed, \
                      $events/session/unsubscribed)"
-                )
+                ))
             })?;
             if !events.contains(&kind) {
                 events.push(kind);
             }
         } else if from.starts_with("$bridges/") {
-            return Err(format!(
-                "\"{from}\": mqttd has no data bridges to select from (ADR 0083)"
-            ));
+            return Err(
+                format!("\"{from}\": mqttd has no data bridges to select from (ADR 0083)").into(),
+            );
         } else if mqtt_core::parse_shared(from).is_some() || from.starts_with("$share/") {
             return Err(format!(
                 "\"{from}\": a rule selects messages by topic filter; $share groups are for subscribers"
-            ));
+            )
+            .into());
         } else if !mqtt_core::valid_filter(from) {
-            return Err(format!("\"{from}\" is not a valid topic filter"));
+            return Err(format!("\"{from}\" is not a valid topic filter").into());
         } else if !topics.contains(from) {
             topics.push(from.clone());
         }
@@ -353,9 +418,12 @@ impl RuleSet {
 
     /// Load a rules file's text. All-or-nothing.
     pub fn parse(text: &str) -> Result<Loaded, LoadError> {
-        let file: FileSchema = toml::from_str(text).map_err(|e| LoadError::File(e.to_string()))?;
+        let file: FileSchema = toml::from_str(text).map_err(|e| LoadError::File {
+            message: e.to_string(),
+            span: e.span(),
+        })?;
         if file.rules.len() > MAX_RULES {
-            return Err(LoadError::File(format!(
+            return Err(LoadError::file(format!(
                 "{} rules is more than the {MAX_RULES} a file may define",
                 file.rules.len()
             )));
@@ -368,9 +436,11 @@ impl RuleSet {
         };
         let mut warnings = Vec::new();
         for (id, r) in file.rules {
-            let fail = |message: String| LoadError::Rule {
+            let fail = |e: CompileError| LoadError::Rule {
                 id: id.clone(),
-                message,
+                message: e.message,
+                sql_line: e.at.map(|(line, _)| line),
+                sql_column: e.at.map(|(_, column)| column),
             };
             if !valid_id(&id) {
                 return Err(fail(
@@ -379,10 +449,13 @@ impl RuleSet {
                 ));
             }
             if r.actions.len() > MAX_ACTIONS_PER_RULE {
-                return Err(fail(format!(
-                    "{} actions is more than the {MAX_ACTIONS_PER_RULE} a rule may run",
-                    r.actions.len()
-                )));
+                return Err(fail(
+                    format!(
+                        "{} actions is more than the {MAX_ACTIONS_PER_RULE} a rule may run",
+                        r.actions.len()
+                    )
+                    .into(),
+                ));
             }
             let Compiled {
                 stmt,
@@ -394,7 +467,7 @@ impl RuleSet {
             let mut actions = Vec::with_capacity(r.actions.len());
             let mut aw = Vec::new();
             for a in &r.actions {
-                actions.push(action::parse_action(a, &mut aw).map_err(fail)?);
+                actions.push(action::parse_action(a, &mut aw).map_err(|e| fail(e.into()))?);
             }
             warnings.extend(aw.into_iter().map(|w| format!("rule `{id}`: {w}")));
             set.rules.push(Rule {
@@ -431,7 +504,7 @@ impl RuleSet {
     /// Load a rules file from disk.
     pub fn load(path: &std::path::Path) -> Result<Loaded, LoadError> {
         let text = std::fs::read_to_string(path)
-            .map_err(|e| LoadError::File(format!("{}: {e}", path.display())))?;
+            .map_err(|e| LoadError::file(format!("{}: {e}", path.display())))?;
         Self::parse(&text)
     }
 
@@ -589,7 +662,12 @@ fn charge_derived(ctx: &EvalCtx<'_>, effect: Effect) -> Result<Effect, EvalError
 
 /// What one statement's `FROM` selects: its topic filters and its events.
 pub fn statement_sources(sql: &str) -> Result<(Vec<String>, Vec<EventKind>), String> {
-    compile(sql).map(|c| (c.topics, c.events))
+    compile_alone(sql).map(|c| (c.topics, c.events))
+}
+
+/// [`compile`] for a statement on its own, its error as text.
+fn compile_alone(sql: &str) -> Result<Compiled, String> {
+    compile(sql).map_err(|e| e.message)
 }
 
 /// Run one statement against one input and return its outputs as JSON — the
@@ -604,7 +682,7 @@ pub fn test_sql(sql: &str, input: &dyn Input) -> Result<Vec<String>, String> {
         topics,
         events,
         ..
-    } = compile(sql)?;
+    } = compile_alone(sql)?;
     let event = input.field("event");
     let event = event.as_str().unwrap_or("message.publish");
     if event == "message.publish" {
@@ -644,7 +722,7 @@ pub fn test_sql(sql: &str, input: &dyn Input) -> Result<Vec<String>, String> {
 
 /// Validate one statement without running it; returns its warnings.
 pub fn check_sql(sql: &str) -> Result<Vec<String>, String> {
-    compile(sql).map(|c| c.warnings)
+    compile_alone(sql).map(|c| c.warnings)
 }
 
 #[cfg(test)]

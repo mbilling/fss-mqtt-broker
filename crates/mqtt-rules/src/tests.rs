@@ -1426,3 +1426,89 @@ fn a_message_has_one_timestamp_however_often_it_is_read() {
         "timestamp is earlier than a later publish_received_at"
     );
 }
+
+// -- ADR 0084: what the admin API, the $SYS reservation and the trace need
+
+/// The structured error keeps the text `mqttd --check-rules` and a rejected reload have
+/// always printed, byte for byte (`crates/mqttd/tests/rules_docs.rs` pins transcripts of
+/// it), and adds where: the TOML span in the file, the line and column in a rule's SQL.
+#[test]
+fn load_errors_say_where_and_print_as_before() {
+    let text = "[rules.r]\nsql = 'SELECT a FROM \"t\"'\nbogus = 1\n";
+    let e = RuleSet::parse(text).unwrap_err();
+    let LoadError::File { message, span } = &e else {
+        panic!("{e}")
+    };
+    assert_eq!(e.to_string(), format!("rules file: {message}"));
+    assert!(message.contains("unknown field `bogus`"), "{e}");
+    assert_eq!(&text[span.clone().expect("a TOML span")], "bogus");
+    assert_eq!(e.file_position(text), Some((3, 1)));
+    // The column counts characters, not bytes.
+    let text = "[rules.r]\nsql = 'é' x\n";
+    assert_eq!(
+        RuleSet::parse(text).unwrap_err().file_position(text),
+        Some((2, 11))
+    );
+
+    let many = (0..=MAX_RULES)
+        .map(|i| format!("[rules.r{i}]\nsql = 'SELECT 1 FROM \"t\"'\n"))
+        .collect::<Vec<_>>()
+        .concat();
+    assert_eq!(
+        RuleSet::parse(&many).unwrap_err(),
+        LoadError::File {
+            message: "1025 rules is more than the 1024 a file may define".into(),
+            span: None
+        }
+    );
+
+    let e = RuleSet::parse("[rules.r]\nsql = '''\nSELECT\n  nope(1) FROM \"t\"'''\n").unwrap_err();
+    assert_eq!(
+        e.to_string(),
+        "rule `r`: unknown function nope() — see docs/RULES.md for the supported functions \
+         (line 2, column 3, near `nope(1) FROM \"t\"`)"
+    );
+    assert!(
+        matches!(
+            &e,
+            LoadError::Rule {
+                sql_line: Some(2),
+                sql_column: Some(3),
+                ..
+            }
+        ),
+        "{e:?}"
+    );
+
+    // A rule error that is not in the SQL has no position.
+    let e = RuleSet::parse(
+        "[rules.r]\nsql = 'SELECT a FROM \"t\"'\nactions = [{ function = \"webhook\" }]\n",
+    )
+    .unwrap_err();
+    assert_eq!(
+        e.to_string(),
+        "rule `r`: unsupported action function \"webhook\" (mqttd supports republish and console)"
+    );
+    assert!(
+        matches!(
+            &e,
+            LoadError::Rule {
+                sql_line: None,
+                sql_column: None,
+                ..
+            }
+        ),
+        "{e:?}"
+    );
+    let e = RuleSet::parse("[rules.1r]\nsql = 'SELECT a FROM \"t\"'\n").unwrap_err();
+    assert_eq!(
+        e.to_string(),
+        "rule `1r`: a rule id is a letter or `_` followed by up to 63 letters, digits, `_` or `-`"
+    );
+    let e = RuleSet::load(std::path::Path::new("/nonexistent/rules.toml")).unwrap_err();
+    assert!(
+        e.to_string()
+            .starts_with("rules file: /nonexistent/rules.toml: "),
+        "{e}"
+    );
+}
