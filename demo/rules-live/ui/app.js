@@ -9,8 +9,10 @@ const RULE_ID = /^[A-Za-z_][A-Za-z0-9_-]{0,63}$/;
 const DEVICE_ROOTS = ["plant", "home", "vehicle"];
 const KEEP_DATA = 500; // messages kept for the filter
 const SHOW_DATA = 200; // messages shown
-const KEEP_TRACE = 20; // trace records kept per rule
+const KEEP_TRACE = 20; // trace records kept per rule, and as many no_result records again
 const RATE_WINDOW = 10000; // ms of counts a rate is taken over
+
+const NO_RESULT = "FROM matched, but WHERE was false (or FOREACH produced nothing): nothing was published.";
 
 // New rule's example; its id is demo_rule_<n>, the first one free.
 const NEW_RULE = {
@@ -35,6 +37,7 @@ const state = {
   stats: new Map(), // rule id -> its latest $SYS record
   history: new Map(), // rule id -> [{t, matched, passed}], the last RATE_WINDOW of its counts
   traces: new Map(), // rule id -> its latest trace records, newest first
+  traceItems: new WeakMap(), // trace record -> its item on the page
   summary: null, // the latest $SYS summary
   summaryAt: 0, // when it arrived (ms)
   interval: 2, // seconds between summaries
@@ -74,6 +77,15 @@ function ago(when) {
   if (s < 60) return `${s} s ago`;
   if (s < 3600) return `${Math.floor(s / 60)} min ago`;
   return clock(ms);
+}
+
+// A topic or filter as text that may wrap after each "/".
+function topicText(parent, text) {
+  text.split("/").forEach((level, i) => {
+    if (i) parent.append("/", document.createElement("wbr"));
+    parent.append(level);
+  });
+  return parent;
 }
 
 function count(n) {
@@ -177,6 +189,7 @@ function renderHeader() {
   } else if (l && Array.isArray(l.rules)) {
     $("s-count").textContent = `${l.rules.filter((r) => r.enabled).length} of ${l.rules.length} enabled`;
   }
+  renderTraceHead();
   const reload = (s && s.reload) || (l && l.reload);
   if (reload) {
     const outcome = reload.applied ? "applied" : `rejected (${reload.error_kind || "error"})`;
@@ -223,13 +236,22 @@ function ruleRow(rule) {
     pick.setAttribute("aria-current", "true");
   }
   th.append(pick);
+  if (rule.description) {
+    const desc = el("span", rule.description, "desc");
+    desc.title = rule.description;
+    th.append(desc);
+  }
   tr.append(th);
   const from = [].concat(rule.from || [], rule.events || []).join(", ");
-  for (const [key, text] of [["on", ""], ["from", from], ["matched"], ["passed"], ["no_result"],
+  // Where it publishes: the topic templates of its republish actions.
+  const to = (rule.actions_spec || []).map((a) => (a && a.function === "republish" && a.args
+    ? a.args.topic : a && a.function)).filter((t) => typeof t === "string").join(", ");
+  for (const [key, text] of [["on", ""], ["from", from], ["to", to], ["matched"], ["passed"], ["no_result"],
     ["failed"], ["actions_failed"], ["matched_rate"], ["passed_rate"], ["active"], ["error"]]) {
-    const td = el("td", text);
+    const td = el("td");
+    if (text) topicText(td, text);
     td.dataset.key = key;
-    if (!["on", "from", "active", "error"].includes(key)) td.className = "num";
+    if (!["on", "from", "to", "active", "error"].includes(key)) td.className = "num";
     tr.append(td);
   }
   fillRow(tr, rule, state.stats.get(rule.id));
@@ -481,10 +503,11 @@ async function testRule() {
   for (const res of r.body.results || []) {
     const box = el("div", undefined, "result");
     const head = el("p");
-    head.append(el("strong", res.rule), " ", el("span", res.result, `badge ${res.result}`));
+    head.append(el("strong", res.rule), " ", badge(res.result));
     if (res.enabled === false) head.append(" (tested as if enabled: it is disabled)");
     box.append(head);
     if (res.reason) box.append(el("p", res.reason));
+    if (res.result === "no_result") box.append(el("p", NO_RESULT, "hint"));
     if (res.error) box.append(el("p", res.error, "error"));
     box.append(outputList(res.outputs));
     out.append(box);
@@ -713,12 +736,18 @@ function outputList(outputs) {
 
 // ---- trace -----------------------------------------------------------------------------------
 
+function badge(result) {
+  const b = el("span", result, `badge ${result}`);
+  if (result === "no_result") b.title = NO_RESULT;
+  return b;
+}
+
 function traceItem(rec) {
-  const li = el("li", undefined, "record");
+  const li = el("li", undefined, `record ${rec.result}`);
+  state.traceItems.set(rec, li);
   const t = rec.trigger || {};
   const meta = el("div", undefined, "meta");
-  meta.append(el("time", clock(Date.parse(rec.at) || Date.now())), " ",
-    el("span", rec.result, `badge ${rec.result}`), " ");
+  meta.append(el("time", clock(Date.parse(rec.at) || Date.now())), " ", badge(rec.result), " ");
   const about = [t.type === "will" && "a Will", t.qos !== undefined && `qos ${t.qos}`,
     t.retain && "retained", t.clientid && `client ${t.clientid}`, t.username && `user ${t.username}`];
   meta.append(el("span", t.type === "event" ? t.event : t.topic, "topic"),
@@ -737,7 +766,51 @@ function traceItem(rec) {
 function renderTrace() {
   const id = state.selected;
   $("trace-rule").textContent = id ? `of ${id}` : "(choose a rule)";
+  renderTraceHead();
   $("trace").replaceChildren(...(id ? state.traces.get(id) || [] : []).map(traceItem));
+}
+
+// The chosen rule's trace topic, a command to watch it with, and the broker's trace rate.
+function renderTraceHead() {
+  const id = state.selected;
+  const node = (state.summary && state.summary.node) || (state.list && state.list.node) || "+";
+  const topic = `$SYS/brokers/${node}/trace/rules/${id || "<id>"}`;
+  $("trace-topic").textContent = topic;
+  $("trace-sub").hidden = !id;
+  $("trace-cmd").textContent = id ? `mosquitto_sub -v -t '${topic.replace(/'/g, "'\\''")}'` : "";
+  const s = state.summary;
+  if (s) {
+    $("trace-rate").textContent = s.trace
+      ? `At most ${s.trace_rate} records a second, and up to ${s.trace_rate} no_result records ` +
+        "more: they have a budget of their own."
+      : "The trace is off on this broker.";
+  }
+}
+
+async function copyCommand() {
+  const button = $("b-copy");
+  try {
+    await navigator.clipboard.writeText($("trace-cmd").textContent);
+    button.textContent = "Copied";
+  } catch {
+    // No clipboard here: select the command, to copy by hand.
+    getSelection().selectAllChildren($("trace-cmd"));
+    button.textContent = "Selected";
+  }
+  setTimeout(() => { button.textContent = "Copy"; }, 2000);
+}
+
+// The last KEEP_TRACE no_result records are kept apart from the last KEEP_TRACE others,
+// so the passes of a rule whose WHERE seldom passes stay in view. Returns the record
+// that made room, if one did.
+function keepTrace(list, rec) {
+  list.unshift(rec);
+  const miss = rec.result === "no_result";
+  let n = 0;
+  for (let i = 0; i < list.length; i++) {
+    if ((list[i].result === "no_result") === miss && ++n > KEEP_TRACE) return list.splice(i, 1)[0];
+  }
+  return null;
 }
 
 // ---- live data -----------------------------------------------------------------------------
@@ -818,13 +891,11 @@ function onRuleStats(id, rec) {
 
 function onTrace(id, rec) {
   const list = state.traces.get(id) || [];
-  list.unshift(rec);
-  if (list.length > KEEP_TRACE) list.length = KEEP_TRACE;
+  const gone = keepTrace(list, rec);
   state.traces.set(id, list);
-  if (id !== state.selected) return;
-  const ol = $("trace");
-  ol.prepend(traceItem(rec));
-  while (ol.childElementCount > KEEP_TRACE) ol.lastElementChild.remove();
+  if (id !== state.selected || $("tr-pause").checked) return;
+  if (gone && state.traceItems.has(gone)) state.traceItems.get(gone).remove();
+  $("trace").prepend(traceItem(rec));
 }
 
 function setFeed(mqtt) {
@@ -897,6 +968,11 @@ function init() {
   $("b-reset").addEventListener("click", resetFile);
   $("d-filter").addEventListener("input", renderData);
   $("d-pause").addEventListener("change", renderData);
+  $("tr-pause").addEventListener("change", renderTrace);
+  const hide = () => $("trace").classList.toggle("hide-no-result", $("tr-hide").checked);
+  $("tr-hide").addEventListener("change", hide);
+  hide(); // a reload can bring the box back checked
+  $("b-copy").addEventListener("click", copyCommand);
   $("t-topic").addEventListener("input", () => { $("t-custom").checked = true; });
   $("t-payload").addEventListener("input", () => { $("t-custom").checked = true; });
   $("rule-form").addEventListener("submit", (e) => e.preventDefault());

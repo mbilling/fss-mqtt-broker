@@ -40,9 +40,11 @@
             <th scope="col">Rule</th>
             <th scope="col">On</th>
             <th scope="col">From</th>
+            <th scope="col" title="The topics its republish actions publish to">To</th>
             <th scope="col" class="num">Matched</th>
             <th scope="col" class="num">Passed</th>
-            <th scope="col" class="num">No result</th>
+            <th scope="col" class="num"
+                title="FROM matched, but WHERE was false (or FOREACH produced nothing): nothing was published">No result</th>
             <th scope="col" class="num">Failed</th>
             <th scope="col" class="num">Actions failed</th>
             <th scope="col" class="num" title="Matched per second, over the last 10 s">Matched/s</th>
@@ -112,7 +114,19 @@
   <section class="trace" aria-labelledby="h-trace">
     <h2 id="h-trace">Trace <span id="trace-rule"></span></h2>
     <p class="hint">What the chosen rule ran on, and what it rendered, from
-      <code>$SYS/brokers/+/trace/rules/&lt;id&gt;</code> (at most 5 records a second).</p>
+      <code id="trace-topic">$SYS/brokers/+/trace/rules/&lt;id&gt;</code>.
+      <span id="trace-rate"></span> A no_result record is a message its FROM matched, but its
+      WHERE was false (or FOREACH produced nothing): nothing was published.</p>
+    <div id="trace-sub" class="cmd" hidden>
+      <code id="trace-cmd"></code>
+      <button type="button" id="b-copy">Copy</button>
+    </div>
+    <div class="controls">
+      <input type="checkbox" id="tr-hide">
+      <label for="tr-hide">Hide no_result</label>
+      <input type="checkbox" id="tr-pause">
+      <label for="tr-pause">Pause</label>
+    </div>
     <ol id="trace" class="feed"></ol>
   </section>
 
