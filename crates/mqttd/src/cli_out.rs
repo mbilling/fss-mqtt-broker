@@ -26,6 +26,7 @@ pub fn write(args: fmt::Arguments<'_>) {
 
 /// `print!` for the command-line modes: a closed stdout ends the output, not the process.
 /// See [`cli_out`](crate::cli_out).
+#[doc(hidden)]
 #[macro_export]
 macro_rules! out {
     ($($arg:tt)*) => {
@@ -34,6 +35,7 @@ macro_rules! out {
 }
 
 /// [`out!`] with a newline, for `println!`.
+#[doc(hidden)]
 #[macro_export]
 macro_rules! outln {
     () => {

@@ -658,10 +658,32 @@ fn check_rules_accepts_a_valid_file_and_lists_every_rule() {
     assert_eq!(ran.stderr, "");
 }
 
+/// Run `cmd` with its stdout closed before it starts and `stdin` written to it; return its
+/// exit code and its stderr.
+fn run_with_stdout_closed(mut cmd: Command, stdin: &str, what: &str) -> (Option<i32>, String) {
+    let mut child = ChildGuard(
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn mqttd"),
+    );
+    // The reader is gone before the command has started, let alone written.
+    drop(child.0.stdout.take());
+    let mut input = child.0.stdin.take().expect("stdin piped");
+    input.write_all(stdin.as_bytes()).expect("write stdin");
+    drop(input);
+    let stderr = read_all(child.0.stderr.take().expect("stderr piped"));
+    let status = wait_bounded(&mut child, what);
+    (status.code(), stderr.join().expect("stderr reader"))
+}
+
 /// A reader that goes away first (`mqttd --check-rules rules.toml | head -1`) neither
 /// panics a command-line mode (exit status 101) nor changes its exit status: every mode
 /// writes stdout through one helper that treats a closed pipe as the end of the output, and
-/// the command finishes as it would have. A failed `--check-tls` still exits 1.
+/// the command finishes as it would have. A failed `--check-tls` still exits 1, and
+/// `--decommission` still waits for its target to exit. `--probe` and `--backup`, which need
+/// a running broker, are in the next test.
 #[test]
 fn a_closed_stdout_neither_panics_a_command_nor_changes_its_exit_status() {
     let dir = tempfile::tempdir().unwrap();
@@ -682,6 +704,17 @@ fn a_closed_stdout_neither_panics_a_command_nor_changes_its_exit_status() {
     let config = dir.path().join("mqttd.toml");
     std::fs::write(&config, "[durable]\nenabled = false\n").unwrap();
     let config = config.display().to_string();
+    // What `--decommission` signals: a process that exits on SIGUSR1, as the broker does
+    // once its drain is done.
+    let target = ChildGuard(
+        Command::new("sh")
+            .arg("-c")
+            .arg("trap 'exit 0' USR1; for i in $(seq 1 600); do sleep 0.1; done")
+            .stdout(Stdio::null())
+            .spawn()
+            .expect("spawn the decommission target"),
+    );
+    let target_pid = target.0.id().to_string();
     let rule_test: &[&str] = &[
         "--rule-test",
         "--sql",
@@ -692,7 +725,7 @@ fn a_closed_stdout_neither_panics_a_command_nor_changes_its_exit_status() {
         "{}",
     ];
     // (arguments, stdin, the exit status the command has with its output read)
-    let commands: [(&[&str], &str, i32); 8] = [
+    let commands: [(&[&str], &str, i32); 10] = [
         (&["--check-rules", &path], "", 0),
         (rule_test, "", 0),
         (&["--help"], "", 0),
@@ -701,30 +734,58 @@ fn a_closed_stdout_neither_panics_a_command_nor_changes_its_exit_status() {
         (&["--print-config", "--config", &config], "", 0),
         (&["--hash-password", "alice"], "correct horse", 0),
         (&["--check-tls", "--config", &broken_tls], "", 1),
+        (&["--admin", "help"], "", 0),
+        (
+            &["--decommission", "--pid", &target_pid, "--timeout", "30"],
+            "",
+            0,
+        ),
     ];
     for (args, stdin, code) in commands {
-        let mut child = ChildGuard(
-            mqttd()
-                .args(args)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .expect("spawn mqttd"),
+        let mut cmd = mqttd();
+        cmd.args(args);
+        let (got, stderr) = run_with_stdout_closed(cmd, stdin, &format!("{args:?}"));
+        assert_eq!(got, Some(code), "mqttd {args:?}, stdout closed: {stderr}");
+        assert!(
+            !stderr.contains("panicked"),
+            "mqttd {args:?} panicked: {stderr}"
         );
-        // The reader is gone before the command has started, let alone written.
-        drop(child.0.stdout.take());
-        let mut input = child.0.stdin.take().expect("stdin piped");
-        input.write_all(stdin.as_bytes()).expect("write stdin");
-        drop(input);
-        let stderr = read_all(child.0.stderr.take().expect("stderr piped"));
-        let status = wait_bounded(&mut child, &format!("{args:?}"));
-        let stderr = stderr.join().expect("stderr reader");
-        assert_eq!(
-            status.code(),
-            Some(code),
-            "mqttd {args:?}, stdout closed: {stderr}"
-        );
+    }
+    drop(target);
+}
+
+/// The same for the modes that talk to a running broker: `--probe` answers from its health
+/// endpoint, and `--backup` signals it and waits for the export, each with stdout closed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_closed_stdout_leaves_probe_and_backup_their_exit_status() {
+    let dir = tempfile::tempdir().unwrap();
+    write_rules(dir.path(), GOOD_RULES);
+    let backups = dir.path().join("backups");
+    std::fs::create_dir_all(&backups).unwrap();
+    let setup = Setup {
+        env: vec![("MQTTD_BACKUP_DIR", backups.display().to_string())],
+        ..Setup::default()
+    };
+    let broker = start(dir.path(), "closed-stdout", &setup).await;
+    let config = dir.path().join("mqttd.toml").display().to_string();
+    let (health, pid) = (broker.health.to_string(), broker.child.0.id().to_string());
+    let commands: [&[&str]; 2] = [
+        &["--probe", "/livez", "--url", &health],
+        &[
+            "--backup",
+            "--pid",
+            &pid,
+            "--config",
+            &config,
+            "--timeout",
+            "30",
+        ],
+    ];
+    for args in commands {
+        let mut cmd = mqttd();
+        cmd.args(args).env("MQTTD_BACKUP_DIR", &backups);
+        let (got, stderr) = run_with_stdout_closed(cmd, "", &format!("{args:?}"));
+        assert_eq!(got, Some(0), "mqttd {args:?}, stdout closed: {stderr}");
         assert!(
             !stderr.contains("panicked"),
             "mqttd {args:?} panicked: {stderr}"

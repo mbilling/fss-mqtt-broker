@@ -2101,8 +2101,9 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `foreach_fans_one_publish_out`
 - `in_a_cluster_each_message_is_evaluated_once_on_its_landing_node`
 
-## `crates/mqttd/tests/rules_binary.rs` — 40 test(s)
+## `crates/mqttd/tests/rules_binary.rs` — 41 test(s)
 
+- `a_closed_stdout_leaves_probe_and_backup_their_exit_status`
 - `a_closed_stdout_neither_panics_a_command_nor_changes_its_exit_status`
 - `a_failing_action_is_counted_failed_and_warned`
 - `a_failing_rule_never_affects_the_original_and_is_counted_failed`
