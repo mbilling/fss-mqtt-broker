@@ -21592,12 +21592,19 @@ mod tests {
     }
 
     /// Retained `$SYS` values written before the reservation are removed at boot, and
-    /// nothing else is (durable retained off: a local delete).
+    /// nothing else is (durable retained off: a local delete) — a Mosquitto bridge's
+    /// state included, which is not reserved.
     #[tokio::test]
     async fn retained_sys_leftovers_are_purged_at_boot() {
         use mqtt_storage::RetainedStore as _;
         let retained = Arc::new(mqtt_storage::MemoryRetainedStore::new());
-        for topic in ["$SYS/brokers/hub-test/rules", "$SYS", "kept/t", "$sys/x"] {
+        for topic in [
+            "$SYS/brokers/hub-test/rules",
+            "$SYS",
+            "kept/t",
+            "$sys/x",
+            "$SYS/broker/connection/edge-1/state",
+        ] {
             retained
                 .set(&Message::new(
                     topic.into(),
@@ -21624,21 +21631,30 @@ mod tests {
                 .map(|m| m.topic)
                 .collect();
             held.sort();
-            if held.len() == 2 || Instant::now() > deadline {
+            if held.len() == 3 || Instant::now() > deadline {
                 break held;
             }
             tokio::task::yield_now().await;
         };
-        assert_eq!(held, ["$sys/x", "kept/t"], "only the reserved values go");
+        assert_eq!(
+            held,
+            ["$SYS/broker/connection/edge-1/state", "$sys/x", "kept/t"],
+            "only the reserved values go"
+        );
         drop(tx);
     }
 
     /// A retained `$SYS` value this node does not own (durable retained: another
-    /// group's, cleared by its owner) is never replayed to a subscriber meanwhile.
+    /// group's, cleared by its owner) is never replayed to a subscriber meanwhile. A
+    /// Mosquitto bridge's state is not reserved, and is.
     #[tokio::test]
     async fn a_retained_sys_value_is_never_replayed() {
         let (tx, _durable, _placement) = start_hub_with_durable_retained(&[]);
-        for (topic, offset) in [("$SYS/brokers/elsewhere/rules", 1), ("plain/t", 2)] {
+        for (topic, offset) in [
+            ("$SYS/brokers/elsewhere/rules", 1),
+            ("plain/t", 2),
+            ("$SYS/broker/connection/edge-1/state", 3),
+        ] {
             tx.send(HubCommand::RemoteRetainedUpdate {
                 topic: topic.into(),
                 payload: Bytes::from_static(b"v"),
@@ -21651,6 +21667,19 @@ mod tests {
             .unwrap();
         }
         assert_eq!(retained_replay(&tx, "c1", "plain/t").await.unwrap(), b"v");
-        assert!(retained_replay(&tx, "c2", "$SYS/#").await.is_none());
+        assert!(retained_replay(&tx, "c2", "$SYS/brokers/#").await.is_none());
+        let (mut rx, _) = attach(&tx, "c3", 99, true).await;
+        subscribe(&tx, "c3", "$SYS/#");
+        match recv_packet(&mut rx).await {
+            Some(Packet::Publish(p)) => {
+                assert_eq!(p.topic, "$SYS/broker/connection/edge-1/state");
+                assert!(p.retain);
+            }
+            other => panic!("expected the bridge's retained state, got {other:?}"),
+        }
+        assert!(
+            recv_packet(&mut rx).await.is_none(),
+            "only the bridge's state"
+        );
     }
 }
