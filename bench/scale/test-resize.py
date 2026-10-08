@@ -760,9 +760,16 @@ open("{self.root}/hook.log", "a").write(" ".join(sys.argv[1:]) + "\\n")
         self.assertFalse((self.root / "out/laneE/bad-brokers.txt").exists())
 
 
+def shell_fn(src, name):
+    """One top-level function, verbatim, from a script's source."""
+    start = src.index(f"\n{name}() {{") + 1
+    return src[start:src.index("\n}\n", start) + 3]
+
+
 class KneeStopTests(Rig):
     """run-curve.sh's ladder loop, extracted verbatim, with the rung and its
-    verdict stubbed: the rung records itself, the verdict comes from a script."""
+    verdict stubbed: the rung records itself, the verdict comes from a script.
+    Under the script's own `set -euo pipefail`: an unset count only aborts there."""
 
     def ladder(self, sites, verdicts, stop_after):
         src = (self.rig / "run-curve.sh").read_text()
@@ -770,6 +777,8 @@ class KneeStopTests(Rig):
         end = src.index("\ndone\n", src.index("for e_sites in", start)) + len("\ndone\n")
         loop = src[start:end]
         body = f'''
+set -euo pipefail
+{shell_fn(src, "lane_e_fails_after")}
 say() {{ echo "$*" >&2; }}
 LANE_E_SITES=({sites})
 lane_e_rung_checked() {{ local d="$OUT/laneE/sites-$1"; [ "$2" -gt 1 ] && d="$d-rep$2"; mkdir -p "$d"; echo "$1 $2" >>"$OUT/ran"; }}
@@ -833,6 +842,14 @@ printf '%s\\n' {" ".join(repr(v) for v in verdicts)} >"$OUT/verdicts"
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(self.ran(), ["1 1", "12 1", "13 1", "13 2", "13 3", "14 1"], "the probe still runs")
         self.assertFalse((self.root / "out/laneE/ladder-stop.txt").exists())
+
+    def test_a_neutral_first_rung_neither_aborts_nor_counts(self):
+        # The live failure: the first rung judged INVALID EVIDENCE left the
+        # count unset, and the stop check aborted the run under `set -u`.
+        r = self.ladder("1 10 11 12", ["NOT CARRIED: INVALID EVIDENCE (x)", "RED", "RED", "x"], 2)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.ran(), ["1 1", "10 1", "11 1"])
+        self.assertIn("stopped_after=sites-11 consecutive_fails=2", (self.root / "out/laneE/ladder-stop.txt").read_text())
 
     def test_a_real_fail_beside_invalid_evidence_still_counts(self):
         (self.root / "out").mkdir(exist_ok=True)
