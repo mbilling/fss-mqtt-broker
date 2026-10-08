@@ -715,7 +715,10 @@ fn no_equivalent(name: &str) -> Option<&'static str> {
              docs/BRIDGE.md"
         }
         "log_dest" => "mqttd logs to stdout for the container/journal to collect",
-        "sys_interval" => "$SYS topics are not implemented; use the Prometheus endpoint",
+        "sys_interval" => {
+            "mqttd publishes no $SYS broker statistics (its $SYS holds only opt-in rule \
+             statistics and trace); use the Prometheus endpoint"
+        }
         "autosave_interval" => "writes are transactional (redb); there is no autosave timer",
         "allow_zero_length_clientid" => {
             "a zero-length client id is accepted with clean session and refused otherwise, \
@@ -3184,6 +3187,12 @@ mod tests {
         assert_eq!(conv.todo_count(), 4);
         assert!(rendered.contains("TODO(migrate): sys_interval 10"));
         assert!(rendered.contains("TODO(migrate): some_future_option 3"));
+        // mqttd's $SYS holds only the opt-in rule statistics and trace (ADR 0084), so a
+        // Mosquitto $SYS interval still points at the Prometheus endpoint.
+        assert!(
+            rendered.contains("sys_interval 10: mqttd publishes no $SYS broker statistics"),
+            "{rendered}"
+        );
     }
 
     /// An `include_dir` is a whole file tree this converter never opened. Reporting it as

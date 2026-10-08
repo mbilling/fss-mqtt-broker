@@ -91,6 +91,7 @@
 | [0081](../adr/0081-admin-api.md) | # 0081. An authenticated admin API: reads cluster-wide, actions audited, config stays in the file | Accepted | [17/19 done](0081-admin-api.md) | 2 deferred |
 | [0082](../adr/0082-bounded-hub-ingress.md) | # 0082. Bounded hub ingress: a control lane that never waits behind data, and byte credits that push back on publishers | Accepted | [6/6 done](0082-bounded-hub-ingress.md) | — |
 | [0083](../adr/0083-rule-engine.md) | A rule engine on the publish path: EMQX rule SQL, evaluated once per message where it lands | Accepted | [17/17 done](0083-rule-engine.md) | — |
+| [0084](../adr/0084-watching-and-editing-rules-live.md) | Watching and editing rules live | Accepted | [10/10 done](0084-watching-and-editing-rules-live.md) | — |
 
 ## Open and deferred work
 

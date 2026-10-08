@@ -70,6 +70,12 @@ grep -q 'default = "deny"' "$WORK/acl.toml" || { echo "  FAIL — translated ACL
 grep -q '%i' "$WORK/acl.toml" || { echo "  FAIL — mosquitto's %u was not translated to %i"; exit 1; }
 echo "  ok   — ACL is deny-by-default and %u became %i"
 
+# Mosquitto's $SYS broker statistics have no mqttd counterpart: mqttd's $SYS holds only its
+# opt-in rule statistics and trace (ADR 0084), so sys_interval still points at /metrics.
+grep -q 'TODO(migrate): sys_interval 10: mqttd publishes no .SYS broker statistics' "$WORK/mqttd.toml" \
+  || { echo "  FAIL — sys_interval's TODO does not say mqttd publishes no \$SYS broker statistics"; exit 1; }
+echo "  ok   — sys_interval is a TODO pointing at the Prometheus endpoint"
+
 # ── hostile STRINGS: a Windows cert path and a domain-qualified username ──────────────
 # The whole-class defect found on 2026-08-14 across all three converters: no value was
 # escaped anywhere. `certfile C:\certs\server.crt` produced `cert = "C:\certs\server.crt"`

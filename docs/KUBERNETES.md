@@ -98,6 +98,12 @@ The chart's `check-config` init container does not read the rules file, so run
 `mqttd --check-rules` before you apply a change, and compare `mqttd_rules_info{checksum}`
 across pods afterwards ([OPERATIONS.md](OPERATIONS.md#rules-adr-0083)).
 
+The ConfigMap is the rules' source, so leave `[rules] admin_writers` empty here: a
+ConfigMap volume is read-only (a rules write through the admin API answers
+`409 rules-file-unwritable`), and the next sync would overwrite a write anyway
+([ADR 0084](adr/0084-watching-and-editing-rules-live.md)). The per-rule statistics and
+trace on `$SYS` work as anywhere else ([RULES.md](RULES.md#watch-and-edit-rules-live)).
+
 The operator path cannot do this yet: the `MqttdCluster` CRD has no field that mounts a
 volume or sets an environment variable beside its fixed secrets, so a rules file needs the
 chart.

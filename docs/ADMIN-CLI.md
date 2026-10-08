@@ -1,7 +1,8 @@
 # The admin command line: `mqttd --admin`
 
 **Verified against `main` after `v1.0.18` (2026-09-30)**, every example below captured from a
-live three-node cluster (`scripts/admin-e2e.sh`). The HTTP interface behind each command is
+live three-node cluster (`scripts/admin-e2e.sh`), except the
+[rules verbs](#rules-rules-source-rules-apply-rule-delete) (2026-10-08). The HTTP interface behind each command is
 [ADMIN-API.md](ADMIN-API.md); the decision record is [ADR 0081](adr/0081-admin-api.md).
 
 `mqttd --admin <verb>` asks a running broker's admin API a question or tells it to act, and
@@ -18,7 +19,8 @@ kubectl exec mqttd-0 -- mqttd --admin cluster
 - [Verbs](#verbs) — [who am I](#whoami) · [the cluster](#node-cluster-placement) ·
   [clients and sessions](#clients-session-subscribers-backlog-retained) ·
   [authorization](#authz) · [config and reload](#config-reload) ·
-  [kick and purge](#kick-purge) · [cordon](#cordon-uncordon) · [logging](#log-level-log-override-log-reset)
+  [kick and purge](#kick-purge) · [cordon](#cordon-uncordon) · [logging](#log-level-log-override-log-reset) ·
+  [rules](#rules-rules-source-rules-apply-rule-delete)
 - [Recipes](#recipes)
 - [Other `mqttd` commands for operators](#other-mqttd-commands-for-operators)
 - [Try it without a deployment](#try-it-without-a-deployment)
@@ -36,8 +38,9 @@ or `admin.operators`. The broker side is in
 
 | Role | Can |
 |---|---|
-| `viewer` | every read: `whoami`, `node`, `cluster`, `placement`, `clients`, `session`, `subscribers`, `backlog`, `retained`, `authz`, `config`, `log-level` |
-| `operator` | everything a viewer can, plus the actions: `reload`, `kick`, `purge`, `cordon`, `uncordon`, `log-override`, `log-reset` |
+| `viewer` | every read: `whoami`, `node`, `cluster`, `placement`, `clients`, `session`, `subscribers`, `backlog`, `retained`, `authz`, `config`, `log-level`, `rules` (without SQL or error text) |
+| `operator` | everything a viewer can, plus the actions: `reload`, `kick`, `purge`, `cordon`, `uncordon`, `log-override`, `log-reset`, and `rules-source` |
+| `operator` listed in `[rules] admin_writers` | also the rules writes: `rules-apply`, `rule-delete` |
 
 Every request is written to the broker's audit log (`admin.request`) with your certificate
 subject, role, the command and its outcome.
@@ -77,7 +80,8 @@ By default the answer is printed for a terminal: `key  value` lines (nested fiel
 with `.`), and each list as a table under its name. A table's identifying columns come
 first, always in this order: `NODE_ID`, `CLIENT_ID`, `NODE`, `TOPIC`, `FILTER`, `REPLIED`,
 `CONNECTED`. The rest follow alphabetically. `cluster` prints a compact view instead
-([below](#node-cluster-placement)). `--json` prints the API's JSON, for scripts and `jq`,
+([below](#node-cluster-placement)), `rules` a table of its own, and `rules-source` the
+file's text alone ([below](#rules-rules-source-rules-apply-rule-delete)). `--json` prints the API's JSON, for scripts and `jq`,
 refusals included, so a rejected `reload` still shows its outcome. `help` wraps to 100
 columns.
 
@@ -257,7 +261,9 @@ $ mqttd --admin authz anonymous publish secret/x --json | jq '{allowed, reason}'
 
 `rule.index` counts the policy file's `[[rules]]` from 0. With no rule matching, `rule` is
 absent and the reason names the policy default. For `connect`, the session-owner guard
-(ADR 0031) still applies on top of the policy.
+(ADR 0031) still applies on top of the policy. For `publish`, a topic in `$SYS` is
+refused before the policy is asked (`reserved: $SYS/ is the broker's (ADR 0084)`), as
+the broker refuses it whatever the ACL says.
 
 ### `config`, `reload`
 
@@ -267,7 +273,8 @@ absent and the reason names the policy default. For `connect`, the session-owner
 | `reload` | operator | the reload `SIGHUP` runs, reporting what happened |
 
 The config file stays the only source of configuration: `reload` takes no input, it re-reads
-the file. A good edit:
+the file. (The rules file can also be written through the API, by a listed writer:
+[`rules-apply`](#rules-rules-source-rules-apply-rule-delete).) A good edit:
 
 ```text
 $ mqttd --admin reload
@@ -361,6 +368,60 @@ override_remaining_secs  59
 The audit trail always keeps logging: every override carries `audit=info`, and a filter that
 names the `audit` target is refused. The override is per node and not persisted.
 
+### `rules`, `rules-source`, `rules-apply`, `rule-delete`
+
+The rules **this node** runs, and the rules file behind them
+([ADR 0084](adr/0084-watching-and-editing-rules-live.md)). Rules are per-node
+configuration: ask, and write to, each node.
+
+| Verb | Role | Does |
+|---|---|---|
+| `rules` | viewer | a table of the running rules and what they have done since the broker started |
+| `rules-source` | operator | the rules file as it is on disk, printed verbatim, so `> rules.toml` saves an exact copy |
+| `rules-apply <file> [--if_match <digest>\|*]` | operator, listed in `[rules] admin_writers` | replace the rules file with the local `<file>`; the broker checks it, writes it atomically and reloads |
+| `rule-delete <id> [--if_match <digest>]` | operator, listed in `[rules] admin_writers` | remove one rule from the file, keeping the rest of it byte for byte, and reload |
+
+`rules` has one row per rule, in the order the rules run:
+
+| Column | Meaning |
+|---|---|
+| `ID`, `ENABLED`, `FROM`, `ACTIONS` | the rule: its id, whether it runs, its `FROM`, how many actions |
+| `MATCHED`, `PASSED`, `NO_RESULT`, `FAILED` | messages its `FROM` selected, and how its statement ended for them |
+| `ACTIONS_FAILED` | actions that failed: could not render, or the broker refused or did not route what they derived |
+| `LAST_ERROR` | the latest failure, cut short to fit |
+
+<!-- TODO-INTEGRATE: add a captured `mqttd --admin rules` example here. -->
+
+`--json` prints the whole answer instead: the running digest and the one on disk, the
+loader's warnings, the last reload and, for an operator, every rule's SQL and actions
+([ADMIN-API.md § `/rules`](ADMIN-API.md#get-adminv1rules)).
+
+**Changing the rules.** `rules-apply` sends the local file's text; the file is read when
+the command runs. A write needs the operator role and a subject listed in
+`[rules] admin_writers`, which is empty, so off, by default
+(`403 rules-read-only`). `--if_match` is the SHA-256 of the file you started from, so a
+change someone else made meanwhile is refused (`412 digest-mismatch`) instead of lost;
+`--if_match '*'` overwrites on purpose. `rules-apply` needs one
+(`428 precondition-required` without it):
+
+```sh
+mqttd --admin rules-source > rules.toml
+digest=$(sha256sum rules.toml | cut -d' ' -f1)
+vi rules.toml
+mqttd --admin rules-apply rules.toml --if_match "$digest"
+```
+
+A file that does not load is refused before anything is written (`422 rules-invalid`, with
+where: the line and column in the file, or the rule and the line and column in its SQL),
+exit 1. On success the answer says whether the new rules are running (`applied`) and their
+digest. A reload refused for another reason (a broken ACL file) is
+`409 reload-rejected` with `written: true`: the file was written, and the next good reload
+applies it. Every write is audited (`rules.write`), and the previous file is kept beside it
+as `<file>.prev`.
+
+The per-rule `PUT`, `check` and `test` take JSON bodies and have no verb; call them over
+HTTPS ([ADMIN-API.md § Rules](ADMIN-API.md#rules)).
+
 ## Recipes
 
 **Is the cluster healthy and converged?**
@@ -374,6 +435,12 @@ mqttd --admin cluster --json | jq '.summary'
 ```sh
 sha256sum mqttd.toml
 mqttd --admin cluster --json | jq -r '.nodes[] | "\(.node_id) \(.config_checksum)"'
+```
+
+**Does every node run the same rules?**
+
+```sh
+mqttd --admin cluster --json | jq '.summary.same_rules, (.nodes[] | "\(.node_id) \(.rules_digest)")'
 ```
 
 **Why can't this device publish?**

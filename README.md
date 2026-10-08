@@ -336,13 +336,13 @@ Plaintext + anonymous: a first look, never a deployment. Secured version (TLS 1.
 | Metrics | Prometheus `GET /metrics` + OTLP push; bounded labels |
 | Health | `/livez` · `/readyz` · `/statusz` · `mqttd --probe` |
 | Governance | connection caps (global, per-IP), auth penalty box, quotas, rate limit by backpressure, retained cap, disk/memory watermarks → brownout (refuse, never silent-drop) |
-| Admin | signals + files + `--check-config`; **no HTTP API or dashboard, by design** |
+| Admin | signals + files + `--check-config`; an mTLS admin API and CLI (`mqttd --admin`); **no dashboard, by design** |
 | Packaging | Helm chart · Kubernetes operator (`MqttdCluster` CRD) · Compose · hardened systemd |
 
 | Integrations | |
 |---|---|
 | Bridge | `mqtt-bridge`: separate signed binary/image, deny-by-default directional rules, loop prevention, bounded spool, HA pairs |
-| Rule engine | EMQX-compatible rule SQL: filter, transform and re-route at QoS 0/1/2, evaluated once per message on the node it arrived at; unreleased ([RULES.md](docs/RULES.md), [cookbook](docs/RULES-COOKBOOK.md)) |
+| Rule engine | EMQX-compatible rule SQL: filter, transform and re-route at QoS 0/1/2, evaluated once per message on the node it arrived at; opt-in per-rule statistics and trace on `$SYS`, rules editable through the admin API; unreleased ([RULES.md](docs/RULES.md), [cookbook](docs/RULES-COOKBOOK.md), [live demo](demo/rules-live/README.md)) |
 | Kafka / webhook / DB | `$share` consumer group on durable sessions ([INTEGRATION.md](docs/INTEGRATION.md)); the rule engine has no sinks, by design |
 | Migration | converters for Mosquitto, EMQX, HiveMQ configs + ACLs → reviewed draft ([MIGRATION.md](docs/MIGRATION.md)) |
 | Plugins | HTTP auth hook; `Authenticator` / `Authorizer` traits; no dynamic loader |
@@ -440,7 +440,7 @@ Other published measurements (dev-grade, single host, never capacity): [DURABLE-
 
 ## Feature Comparison Matrix
 
-✅ open build · 💰 **paid edition only** · ⚠️ partial · ✖ absent · n/v not verified. Sources and notes: [COMPARISON.md](docs/COMPARISON.md) (dated 2026-08-19).
+✅ open build · 💰 **paid edition only** · ⚠️ partial · ✖ absent · n/v not verified. Sources and notes: [COMPARISON.md](docs/COMPARISON.md) (dated 2026-10-08).
 
 | Feature | mqttd | Mosquitto 2.x | EMQX 6.x | HiveMQ CE | VerneMQ 2.1 | NanoMQ 0.25 |
 |---|---|---|---|---|---|---|
@@ -467,7 +467,7 @@ Other published measurements (dev-grade, single host, never capacity): [DURABLE-
 | Data-safe resize | ✅ | n/a | n/v | 💰 | ⚠️ | n/a |
 | Online backup/restore | ✅ | ⚠️ | n/v | 💰 | n/v | n/v |
 | **Operations** | | | | | | |
-| Prometheus metrics | ✅ | ✖ `$SYS` only | ✅ | ✅ free extension | ✅ | ✅ |
+| Prometheus metrics | ✅ (+ opt-in rule stats on `$SYS`) | ✖ `$SYS` only | ✅ | ✅ free extension | ✅ | ✅ |
 | OpenTelemetry export | ✅ | ✖ | ✅ | 💰 | ✖ | ✖ |
 | Helm chart | ✅ | ✖ | ✅ | 💰 | ✅ | ✖ |
 | Kubernetes operator | ✅ | ✖ | ✅ | 💰 | ⚠️ unmaintained | ✖ |
@@ -587,7 +587,7 @@ Memory watermark at 75–85% of the container limit; the container limit is the 
 - grow: start a node · shrink: `SIGUSR1` · replace: grow then shrink · upgrade: one node at a time
 - day 2: [OPERATIONS.md](docs/OPERATIONS.md)
 
-**Hardening** — 34-item baseline with auditor checks: [HARDENING.md](docs/HARDENING.md)
+**Hardening** — 52-item baseline with auditor checks: [HARDENING.md](docs/HARDENING.md)
 - [ ] no `INSECURE:` lines in the startup log
 - [ ] `MQTTD_DATA_DIR` on a volume
 - [ ] no plaintext listener; TLS 1.3; client certs carry `clientAuth` EKU
@@ -596,6 +596,7 @@ Memory watermark at 75–85% of the container limit; the container limit is the 
 - [ ] caps and watermarks set
 - [ ] per-node bus certs; gossip key from file
 - [ ] CRL configured, reload tested
+- [ ] rule trace off; `[rules] admin_writers` empty, or only the ACL file's editors
 - [ ] `--read-only --cap-drop ALL --security-opt no-new-privileges`, or the shipped systemd unit
 
 ---
@@ -608,14 +609,15 @@ Memory watermark at 75–85% of the container limit; the container limit is the 
 | Probes | `/livez` · `/readyz` (members, lease, decommission) · `/statusz` · `mqttd --probe` |
 | Audit | hash-chained JSON; schema + verifier: [AUDIT-SCHEMA.md](docs/AUDIT-SCHEMA.md) |
 | Dashboards | Grafana for broker + bridge: [`deploy/observability/`](deploy/observability/); alert runbooks: [OPERATIONS.md](docs/OPERATIONS.md) |
-| Demo | `cd demo && docker compose up --build` → cluster + Grafana + Prometheus + Alloy at `localhost:3000` |
+| Demo | `cd demo && docker compose up --build` → cluster + Grafana + Prometheus + Alloy at `localhost:3000`; rules live: `demo/rules-live/up.sh` → simulated devices, rule statistics and trace on `$SYS`, a rules editor at `localhost:8070` |
 
 ## Admin API & CLI
 
 An authenticated admin API — its own mTLS listener, `viewer` and `operator` roles, every
 request audited — answers what metrics cannot, and `mqttd --admin` drives it from the same
-binary (so it works in the distroless image). Off until `admin.bind` is set; it never writes
-configuration.
+binary (so it works in the distroless image). Off until `admin.bind` is set. It writes no
+configuration, except the rules file for a subject listed in `[rules] admin_writers` (empty,
+so off, by default; ADR 0084).
 
 ```sh
 mqttd --admin cluster                        # every node, from any node: ready, version, lag, agreement
@@ -625,6 +627,7 @@ mqttd --admin authz device-7 publish plant/7/temp   # allowed? which ACL rule de
 mqttd --admin reload                         # re-read the config file; says what changed or why not
 mqttd --admin kick sensor-7                  # operator: disconnect (MQTT 5 reason 0x98), from any node
 mqttd --admin cordon                         # operator: stop new connections without draining
+mqttd --admin rules                          # every rule on this node: counts, last error
 ```
 
 Try it on a local three-node cluster: `scripts/admin-e2e.sh up`. Reference:
@@ -660,7 +663,7 @@ endpoint, roles, errors).
 - consensus for control (epochs, ownership), small replica sets for data
 - refuse at the edge: reason code or backpressure, never a silent drop
 - bridge is a separate process and failure domain
-- decisions: [`docs/adr/`](docs/adr/) (83 ADRs, per-task status) · tour: [ARCHITECTURE.md](docs/ARCHITECTURE.md) · [THREAT-MODEL.md](docs/THREAT-MODEL.md)
+- decisions: [`docs/adr/`](docs/adr/) (84 ADRs, per-task status) · tour: [ARCHITECTURE.md](docs/ARCHITECTURE.md) · [THREAT-MODEL.md](docs/THREAT-MODEL.md)
 
 **Workspace layout**
 
@@ -712,7 +715,7 @@ Tracked on the [delivery dashboard](docs/delivery/STATUS.md).
 - **Security:** OSS-Fuzz ([#553](https://github.com/mbilling/fss-mqtt-broker/issues/553)); funded third-party audit ([#554](https://github.com/mbilling/fss-mqtt-broker/issues/554))
 - **Routing:** bloom subscription digests; MQTT 5 Server-Reference redirect
 - **Operator:** CRD promotion from `v1alpha1`
-- **Not planned, by decision:** dashboard, writing config over the network, rule-engine data sinks (Kafka/HTTP/DB), MQTT-SN/CoAP
+- **Not planned, by decision:** dashboard, writing config over the network (beyond the opt-in rules-file write), rule-engine data sinks (Kafka/HTTP/DB), MQTT-SN/CoAP
 
 ---
 

@@ -380,7 +380,7 @@ They answer one question: *does an actual shipped config convert?*
 | Fixture | Source, at a pinned tag | What it proves |
 |---|---|---|
 | `fixtures/emqx-6.2.2-vendor-verbatim.conf` | `emqx/emqx` @ `6.2.2` — ten `rel/config/examples/*.conf.example` files concatenated, unmodified | a stock EMQX file converts, passes `--check-config`, and takes the **refusing** branch of every security mapping: `verify_none` on all three TLS listeners does **not** become an mTLS mandate, `max_retained_messages = 0` is read as *unlimited* rather than a cap of zero, and all three TLS listeners are named |
-| `fixtures/emqx-acl-6.2.2.conf` | `emqx/emqx` @ `6.2.2`, `apps/emqx_auth/etc/acl.conf` | the shipped default ACL, whose four rules each land on a different gap: **six** `TODO(migrate)` lines and **one** emitted rule (the `$SYS` deny, kept and reported as inert) |
+| `fixtures/emqx-acl-6.2.2.conf` | `emqx/emqx` @ `6.2.2`, `apps/emqx_auth/etc/acl.conf` | the shipped default ACL, whose four rules each land on a different gap: **six** `TODO(migrate)` lines and **one** emitted rule (the `$SYS` deny, kept, with a TODO saying what `$SYS` holds in mqttd) |
 | `fixtures/hivemq-2026.5-default-config.xml` | `hivemq/hivemq-community-edition` @ `2026.5`, `src/main/resources/config.xml` | the config.xml a stock CE install actually has — one plaintext listener and no auth at all. The conversion must say the deployment was **anonymous** and must warn that the plaintext listener carried over |
 | `fixtures/hivemq-2026.5-tls-client-auth.xml` | same repo/tag, `src/distribution/conf/examples/configuration/tls/config-sample-mqtt-tls-client-auth.xml` | the vendor's own mTLS example — the one shipped file that takes the **mapping** branch of `client-authentication-mode`, so `REQUIRED → client_ca` is tested on vendor bytes rather than only on ours |
 | `fixtures/hivemq-credentials-4.6.16.xml` | `hivemq/hivemq-file-rbac-extension` @ `4.6.16`, `README.adoc`'s example — plus two `<permission>` blocks marked `ADDED` inline | role flattening, and the `<qos>` / `<shared-subscription>` qualifier gaps (which the vendor's example does not contain, hence the two marked additions) |
@@ -618,8 +618,13 @@ Every one of these is a `TODO(migrate)` line naming what you must decide:
   and the founder rule — none of which an EMQX discovery strategy expresses. Walk
   [the secured cluster tutorial](SECURED-CLUSTER-TUTORIAL.md).
 - **OCSP stapling.** Revocation is a CRL file (`[tls] crl`).
-- **`$SYS`.** Not implemented. Any client that subscribed to it must be rewritten
-  against `/metrics`.
+- **`$SYS`.** mqttd publishes no broker statistics there (clients, sessions, messages,
+  uptime): those are on `/metrics` and `/statusz`, and any client that read EMQX's `$SYS`
+  broker topics must be rewritten against them. `$SYS/` is reserved for the broker: no
+  client may publish there, whatever the ACL says. The broker publishes only opt-in
+  rule statistics and an opt-in rule trace under `$SYS/brokers/<node>/`
+  ([RULES.md](RULES.md#watch-and-edit-rules-live)), and they never run rules, as with
+  EMQX's default `ignore_sys_message = true`.
 - **`mqtt.max_inflight` — deliberately not mapped, because the nearest-looking setting
   runs the other way.** EMQX's `max_inflight` bounds messages the **broker sends to a
   client**. mqttd's `[limits] receive_maximum` is the inbound window it **grants clients**
@@ -681,8 +686,10 @@ land on a different one of these gaps. Measured on the verbatim fixture (and pin
 assertion in `test-from-emqx.sh`, so this page cannot drift away from the tool): **six**
 `TODO(migrate)` lines and **one** emitted rule. Six rather than four because the third
 vendor rule contributes three on its own — one for its `$SYS` topic and one for each of
-its two `{eq, …}` entries. The one emitted rule is that same rule's `$SYS/#` deny, kept
-for the record and reported as **inert**, since mqttd implements no `$SYS` tree.
+its two `{eq, …}` entries. The one emitted rule is that same rule's `$SYS/#` deny. It is
+kept, and its TODO says what it now does: mqttd's `$SYS` holds only the opt-in rule
+statistics and trace, so the deny keeps those from the clients it names, and no client
+may publish to `$SYS` whatever the ACL says.
 
 Placeholders that do translate: `${username}` → `%i`, `${clientid}` → `%c`,
 `${cert_common_name}` → `%i` (**only** equal when the client used mTLS and

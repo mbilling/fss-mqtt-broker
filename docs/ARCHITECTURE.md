@@ -40,7 +40,7 @@ source feeding the same hub ([ADR 0001](adr/0001-session-durability.md)).
 | `mqtt-cluster` | SWIM, peer frames, placement, durable plane. |
 | `mqtt-observability` | Prometheus/OTLP metrics, hash-chained audit. |
 | `mqtt-config` | Typed config; `ENV_VARS` is the overlay inventory. |
-| `mqtt-rules` | The rule engine: EMQX rule SQL parser, evaluator, functions, templates, actions. Pure (no I/O, no broker state). Fuzzed (ADR 0083). |
+| `mqtt-rules` | The rule engine: EMQX rule SQL parser, evaluator, functions, templates, actions; `edit` changes one rule of a rules file's text in place (ADR 0084). Pure (no I/O, no broker state). Fuzzed (ADR 0083). |
 | `mqttd` | Binary + hub + conn — this page. |
 | `mqtt-bridge` | Zone-crossing MQTT client (not a cluster member). |
 | `mqttd-operator` | `MqttdCluster` reconciler. |
@@ -62,7 +62,9 @@ source feeding the same hub ([ADR 0001](adr/0001-session-durability.md)).
 | `store_probe` | Boot-time volume self-measurement (ADR 0076 T1). |
 | `oidc` / `http_auth` | Token and remote-hook authenticators. |
 | `cluster` | Binary-side mesh wiring. |
-| `rules` | Rule-engine wiring (ADR 0083): the rules `watch`, evaluation on the connection task, and the derived messages' ack gates joined into the publisher's one ack. |
+| `rules` | Rule-engine wiring (ADR 0083): the rules `watch`, evaluation on the connection task, and the derived messages' ack gates joined into the publisher's one ack; the trace capture and the per-rule last-error store (ADR 0084). |
+| `rules_sys` | The `$SYS` publishers (ADR 0084): the per-rule statistics task and the rule trace task, each paying node-pool ingress credit for what it publishes. |
+| `admin` | The admin API (ADR 0081): mTLS listener, roles, routes, the `mqttd --admin` client; `admin/rules` serves the rules endpoints and their atomic file write (ADR 0084). |
 | `clock` | Time source for tests vs production. |
 
 The binary's own `main.rs` crate docs are the **configuration and signals
