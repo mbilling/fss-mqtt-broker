@@ -8,6 +8,7 @@ pub mod accept;
 pub mod admin;
 pub mod admission;
 pub mod aliases;
+pub mod atomic_file;
 pub mod backpressure;
 pub mod backup;
 pub mod cli_out;

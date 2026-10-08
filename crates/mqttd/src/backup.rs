@@ -2009,25 +2009,16 @@ pub fn write_restored_stamp(
     // A bare `fs::write` leaves a window in which a power loss yields a complete restore with
     // no stamp, and the next boot then meets `require_fresh_data_dir` on a full data dir —
     // whose printed remedy is to delete the very data just recovered.
-    let final_path = dir.join(RESTORED_STAMP);
-    let tmp_path = dir.join(format!("{RESTORED_STAMP}.partial"));
-    {
-        use std::io::Write as _;
-        let mut f = std::fs::File::create(&tmp_path)
-            .map_err(|e| format!("restore: cannot write the {RESTORED_STAMP} stamp: {e}"))?;
-        f.write_all(format!("{body}\n").as_bytes())
-            .map_err(|e| format!("restore: cannot write the {RESTORED_STAMP} stamp: {e}"))?;
-        f.sync_all()
-            .map_err(|e| format!("restore: cannot fsync the {RESTORED_STAMP} stamp: {e}"))?;
-    }
-    std::fs::rename(&tmp_path, &final_path)
-        .map_err(|e| format!("restore: cannot install the {RESTORED_STAMP} stamp: {e}"))?;
-    // The rename itself must be durable, or the stamp can still vanish with the directory
-    // entry unflushed.
-    if let Ok(d) = std::fs::File::open(dir) {
-        let _ = d.sync_all();
-    }
-    Ok(())
+    let how = crate::atomic_file::Replace {
+        new_mode: 0o644,
+        previous: None,
+    };
+    crate::atomic_file::replace(
+        &dir.join(RESTORED_STAMP),
+        format!("{body}\n").as_bytes(),
+        &how,
+    )
+    .map_err(|e| format!("restore: cannot install the {RESTORED_STAMP} stamp: {e}"))
 }
 
 // ---------------------------------------------------------------------------
