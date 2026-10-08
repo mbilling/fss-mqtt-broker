@@ -135,6 +135,30 @@ docker compose run --rm admin rules-source    # the rules file as it is on disk
 docker compose run --rm admin help            # every verb
 ```
 
+To edit the file in your own editor, take a copy (outside the checkout) and the digest of
+the file you copied:
+
+```sh
+work="$(mktemp -d)"
+docker compose run --rm -T admin rules-source > "$work/rules.toml"
+docker compose run --rm -T admin rules-source --json | jq -r .digest
+```
+
+Edit `$work/rules.toml`, then write it back. The `admin` container sees its certificate,
+not your files, so the file goes in on standard input. `--if_match` names the digest you
+took: if the file changed since, the write is refused (`412 digest-mismatch`) instead of
+overwriting that change. `--if_match '*'` replaces whatever is there.
+
+```sh
+docker compose run --rm -T admin rules-apply /dev/stdin --if_match <digest> < "$work/rules.toml"
+```
+
+The answer shows the new file's `digest`, which the next write names. To remove one rule:
+
+```sh
+docker compose run --rm admin rule-delete <id> --if_match <digest>
+```
+
 With curl, copy the certificate out of the stack first, somewhere outside the checkout:
 
 ```sh
