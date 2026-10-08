@@ -490,7 +490,7 @@ The quickstart's `high_temp` rule at the first tick after the two readings, with
 | `counts.actions_ok`, `.actions_failed` | `mqttd_rule_actions_total{rule,result}` (`ok`, `failed`) for this rule |
 | `counts.matched` | `passed + no_result + failed`: the messages and events the rule's `FROM` selected (EMQX's `matched`) |
 | `rates` | the same, per second over the time measured since the previous tick, rounded to 0.001; 0 at a rule's first tick |
-| `last_active_at` | the tick at which `matched` was last seen to grow; `null` until the statistics see the rule run. What it ran before they were turned on, or before it was deleted and added back, does not count |
+| `last_active_at` | the tick at which `matched` was last seen to grow; `null` until the statistics see the rule run. Runs before they were turned on, or while they were off, are not seen. A rule deleted and added back keeps the time they last saw it run until it runs again |
 | `last_error` | `null`, or the latest failure's `at` and `kind`: `sql` (the statement failed), `action` (an action could not render, a republish into `$SYS` included) or `delivery` (derived messages were refused or not routed: `actions_failed` grew). Never the error's text, which can quote a payload: that is in the trace (a failed statement's `error`, a failed action's output) and in an operator's `GET /admin/v1/rules` |
 | `def` | 16 hex digits of a hash of the rule's SQL, actions and `enable`, keyed with a random key each broker process draws: it changes when the rule does and at a restart, and it cannot be used to test a guess at the rule's text |
 
@@ -757,7 +757,10 @@ mosquitto_sub -h 127.0.0.1 -t '$SYS/brokers/+/rules' -v
 - **Rules never chain.** A message a rule publishes never runs rules, its own or another's.
 - **`$SYS` is the broker's.** A republish that renders a `$SYS` topic fails its action,
   and a `FROM` on `$SYS/…` never matches: clients cannot publish there, and the broker's
-  own `$SYS` messages never run rules. `--check-rules` warns about both. The one exception
+  own `$SYS` messages never run rules. `--check-rules` warns about a republish whose fixed
+  start is already reserved (`$SYS/brokers/${x}`) and about a `FROM` that can match only
+  reserved topics (`FROM "$SYS/brokers/#"`; `FROM "$SYS/#"` can match a bridge's state, so
+  it is not warned about). The one exception
   is a Mosquitto bridge's `$SYS/broker/connection/<id>/state`, which clients may publish
   to, as in Mosquitto.
 
@@ -1165,7 +1168,7 @@ cookbook decodes binary payloads without `subbits`
 
 | Arg | Default (EMQX's) | |
 |---|---|---|
-| `topic` | — (required) | A template. A rendered topic that is empty, has a wildcard, NUL or `$share/`, is in `$SYS` (reserved for the broker; a Mosquitto bridge's `$SYS/broker/connection/<id>/state` is not), or is over 65,535 bytes fails the action, not the rule; the loader warns when every topic the template can render is reserved. A topic built from the publisher's values needs a [guard](#security-values-the-publisher-chooses). |
+| `topic` | — (required) | A template. A rendered topic that is empty, has a wildcard, NUL or `$share/`, is in `$SYS` (reserved for the broker; a Mosquitto bridge's `$SYS/broker/connection/<id>/state` is not), or is over 65,535 bytes fails the action, not the rule; the loader warns when the template's fixed start (or the whole topic, for one without placeholders) is already reserved, such as `$SYS/brokers/${x}`; one whose placeholder decides, such as `$SYS/${x}/y`, is not warned about. A topic built from the publisher's values needs a [guard](#security-values-the-publisher-chooses). |
 | `qos` | `"${qos}"` | 0, 1, 2 or one placeholder. **The placeholder reads the rule's output, not the input message**, as in EMQX: a rule that does not select `qos` (or `*`) republishes at **QoS 0**. A literal outside 0 to 2 fails the load; a placeholder that renders one fails the action. |
 | `retain` | `"${retain}"` | A boolean or one placeholder. A publish has no `retain` field (it is `flags.retain`), so this defaults to false unless the SQL selects `flags.retain AS retain`. |
 | `payload` | `"${payload}"` | A template. An empty string is the whole output as JSON (`${.}`). `${payload}` keeps a binary payload's exact bytes. An event has no payload: give an event rule's republish one. |

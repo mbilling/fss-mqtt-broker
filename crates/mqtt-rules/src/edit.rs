@@ -13,7 +13,7 @@
 //!   section banner — so they move onto the next table (or the end of the file) and stay.
 //!   That includes the deleted rule's own comment block, which is left for its author to
 //!   remove. Blank lines that would end the file do not stay, so a delete undoes an
-//!   insert byte for byte.
+//!   insert byte for byte, unless the file already ended with blank lines: those go too.
 //!
 //! Only files written as `[rules.<id>]` tables are edited this way; a rule written with
 //! dotted keys, as an inline table or with `[[rules.<id>.actions]]` is refused

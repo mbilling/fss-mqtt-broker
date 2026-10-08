@@ -83,8 +83,11 @@ first, always in this order: `NODE_ID`, `CLIENT_ID`, `NODE`, `TOPIC`, `FILTER`, 
 ([below](#node-cluster-placement)), `rules` a table of its own, and `rules-source` the
 file's text alone ([below](#rules-rules-source-rules-apply-rule-delete)). `--json` prints the API's JSON, for scripts and `jq`,
 refusals included, so a rejected `reload` still shows its outcome. `help` wraps to 100
-columns. In the terminal views, a control character in text the broker sends (a rule's last
-error that quotes a payload, say) is printed escaped, never passed to your terminal.
+columns. A control character in text the broker sends (a rule's last error that quotes a
+payload, say) is printed as its escape, never passed to your terminal: `\u{1b}` for ESC,
+`\u{7}` for BEL, `\r`, `\u{9b}` in the terminal views (a refusal's message keeps its line
+breaks, and `LAST_ERROR` shows one as a space), and `\u001b`, `\u009b` in `--json`, which
+stays valid JSON. `rules-source` prints the file verbatim.
 
 | Exit | Meaning |
 |---|---|
@@ -383,7 +386,7 @@ configuration: ask, and write to, each node.
 | `rules` | viewer | a table of the running rules and what they have done since the broker started |
 | `rules-source` | operator | the rules file as it is on disk, printed verbatim, so `> rules.toml` saves an exact copy |
 | `rules-apply <file> [--if_match <digest>\|*]` | operator, listed in `[rules] admin_writers` | replace the rules file with the local `<file>`; the broker checks it, writes it atomically and reloads |
-| `rule-delete <id> [--if_match <digest>]` | operator, listed in `[rules] admin_writers` | remove one rule from the file, keeping the rest of it byte for byte, and reload |
+| `rule-delete <id> [--if_match <digest>]` | operator, listed in `[rules] admin_writers` | remove one rule from the file, keeping the rest of it byte for byte (deleting the last rule also drops the blank lines that would then end the file), and reload |
 
 `rules` has one row per rule, in the order the rules run:
 

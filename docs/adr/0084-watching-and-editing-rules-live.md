@@ -79,9 +79,13 @@ case-sensitively (`$sys/x` is an ordinary topic):
   alias is resolved first, so an alias cannot get around it.
 - **A Will** on a reserved topic refuses the CONNECT (`0x87`, `acl.deny.will`).
 - **A rule's republish** that renders a reserved topic fails that action. The rules loader
-  warns when every topic a republish template can render is reserved, and when a `FROM`
-  can match only reserved topics: such a rule never fires, because clients cannot publish
-  there and the broker's own `$SYS` messages never run rules.
+  warns when a republish topic's fixed start (or the whole topic, for one without
+  placeholders) already puts every topic it can render in the reserved tree, such as
+  `$SYS/brokers/${x}`, and when a `FROM` can match only reserved topics (`$SYS/brokers/#`;
+  not `$SYS/#`, which matches a bridge's state): such a rule never fires, because clients
+  cannot publish there and the broker's own `$SYS` messages never run rules. A template
+  whose placeholder decides, such as `$SYS/${x}/y`, is not warned about and fails at run
+  time.
 - **The hub** routes a reserved topic only from one command,
   `HubCommand::SysPublish` (QoS 0, never retained, no publisher). Every other path —
   client and derived publishes, Wills, a retained restore (skipped and answered as done),
@@ -151,10 +155,13 @@ is off) each node publishes, every interval:
 
 The counts are the Prometheus counters, read without creating a series, so they are
 cumulative since the broker started and keyed by rule id, as `/metrics` has them. The
-last time a rule ran (`last_active_at`) is the tick at which its `matched` grew against a
-baseline the statistics keep per id across reloads: a rule that ran only before the
-statistics were turned on, or that was deleted and added again, shows `null` until it
-runs again. The definition hash (`def`) is an HMAC-SHA256 under a key drawn at random
+last time a rule ran (`last_active_at`) is the tick at which its `matched` was seen to
+grow against a baseline the statistics keep per id across reloads. It is `null` until the
+statistics see the rule run: runs from before they were turned on, or while they were off,
+are not seen, and while they are off it keeps the time they last saw. A rule deleted and
+added again keeps that time (`null` if they never saw it run) until it runs again. An id
+they never saw (deleted before the statistics were first on, or past the 4,096 ids they
+keep) reads as active at the first tick after it is added back, if it had run before. The definition hash (`def`) is an HMAC-SHA256 under a key drawn at random
 when the process starts, cut to 16 hex digits: it changes when the rule does, and after
 a restart, and cannot be used to test guesses of the rule's text. Every message is JSON,
 QoS 0, never retained and live-only (D1), published through `SysPublish`. Each one takes
@@ -214,7 +221,7 @@ on, names that node in its answer, and takes its parameters in the query string.
 
 | Endpoint | Role | Does |
 |---|---|---|
-| `GET /admin/v1/rules` | viewer | The running rules with their counts, last activity (while the statistics are on) and last error; the running digest and the digest of the file on disk; the load warnings; the last reload. A viewer gets no SQL, actions or load warnings (`redacted: true`), the last error's time and kind only, and the last reload's error kind only. An operator gets all of it. |
+| `GET /admin/v1/rules` | viewer | The running rules with their counts, last activity (as the statistics last saw it) and last error; the running digest and the digest of the file on disk; the load warnings; the last reload. A viewer gets no SQL, actions or load warnings (`redacted: true`), the last error's time and kind only, and the last reload's error kind only. An operator gets all of it. |
 | `GET /admin/v1/rules/source` | operator | The rules file's text as it is on disk, with its digest and the running one. |
 | `POST /admin/v1/rules/check` | operator | Loads a whole file, or one rule spliced into the file on disk, as the broker would; writes nothing. |
 | `POST /admin/v1/rules/test` | operator | Runs a simulated message through the running rules, a candidate file, or one rule (forced on, so a disabled or unsaved rule can be tried), and returns what each rule rendered. |
@@ -255,9 +262,11 @@ on, names that node in its answer, and takes its parameters in the query string.
 (the file's text, verbatim, so `> rules.toml` round-trips), `rules-apply <file>`
 (`PUT /admin/v1/rules` with the local file's text) and `rule-delete <id>`. The per-rule
 `PUT` and `test` take structured JSON bodies and have no verb: this amends ADR 0081 §3,
-whose verbs followed the endpoints one to one. The CLI escapes control characters in the
-text the server sends, so a last error that quotes a payload cannot drive the operator's
-terminal.
+whose verbs followed the endpoints one to one. The CLI prints each control character in
+the text the server sends (C0, DEL, the C1 set, U+2028 and U+2029) as its escape: `\u{1b}`
+for ESC, `\r`, `\u{9b}` in the terminal views, `\u001b` and `\u009b` in `--json`, which
+stays valid JSON. So a last error that quotes a payload cannot drive the operator's
+terminal. `rules-source` prints the file verbatim.
 
 ### D8. Still no web UI in the broker
 

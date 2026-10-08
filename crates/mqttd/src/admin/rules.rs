@@ -1113,7 +1113,8 @@ fn is_unwritable(kind: std::io::ErrorKind) -> bool {
     )
 }
 
-/// The answer to a replace that failed: nothing was changed.
+/// The answer to a replace that failed: the rules file is as it was (a failure of the
+/// last rename comes after `<file>.prev` was replaced).
 fn unwritable_answer(node: &str, file: &str, e: &atomic_file::ReplaceError) -> Answer {
     let (status, code) = if is_unwritable(e.error.kind()) {
         (409, "rules-file-unwritable")
@@ -1124,7 +1125,7 @@ fn unwritable_answer(node: &str, file: &str, e: &atomic_file::ReplaceError) -> A
         node,
         status,
         code,
-        &format!("the rules file {file} was not written, nothing changed: {e}"),
+        &format!("the rules file {file} was not written, it is as it was: {e}"),
         json!({"os_error": e.error.to_string()}),
     )
 }

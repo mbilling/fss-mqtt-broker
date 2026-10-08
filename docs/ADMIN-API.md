@@ -139,13 +139,13 @@ the refusals it makes itself (all but a `503`). Match on `code`; the message is 
 | 409 | `rules-file-unreadable` | the configured rules file is missing or cannot be read: `rules/source`, a `check` or `test` with `rule`, and a per-rule `PUT` or `DELETE` (a whole-file `PUT` with `if_match=*` creates a missing file instead) |
 | 409 | `rules-file-invalid` | a per-rule check, test or write while the rules file on disk is not TOML or not the rules file's shape |
 | 409 | `rules-layout-unsupported` | a per-rule check, test or write on a file it cannot edit in place: a rule written with dotted keys, inline tables or `[[rules.<id>.actions]]`, or CRLF line ends; replace the whole file instead |
-| 409 | `rules-file-unwritable` | the rules file cannot be replaced: permissions (EACCES, EPERM), a read-only mount (EROFS), a busy file (EBUSY), another filesystem (EXDEV) or a directory that is gone; nothing was changed; the body adds `os_error` |
+| 409 | `rules-file-unwritable` | the rules file cannot be replaced: permissions (EACCES, EPERM), a read-only mount (EROFS), a busy file (EBUSY), another filesystem (EXDEV) or a directory that is gone; the rules file was not changed; the body adds `os_error` |
 | 412 | `digest-mismatch` | a rules write whose `if_match` is not the digest of the file on disk; the body adds `file_digest` and `running_digest` |
 | 413 | `too-large` | the request exceeds the size limits |
 | 422 | `rules-invalid` | rules text that does not load; `error.details` says where |
 | 428 | `precondition-required` | `PUT /admin/v1/rules` without `if_match` |
 | 500 | `rules-edit-failed` | a per-rule edit would have changed more than that rule; nothing was written |
-| 500 | `rules-write-failed` | writing the rules file failed for another reason than those of `rules-file-unwritable` (a full disk, an I/O error); nothing was changed; the body adds `os_error` |
+| 500 | `rules-write-failed` | writing the rules file failed for another reason than those of `rules-file-unwritable` (a full disk, an I/O error); the rules file was not changed; the body adds `os_error` |
 | 503 | `unavailable` | a part of the node the endpoint needs is not running or not wired |
 | 503 | `timeout` | the answer took longer than 30 s |
 
@@ -301,9 +301,11 @@ there, on purpose. It is required on a whole-file `PUT` and optional on a per-ru
    group could read never becomes readable by another. A file that did not exist is
    created with mode `0600`. The old file is kept as `<file>.prev` the same way; the new one
    is renamed over it, and the directory fsynced. Any failure removes the temporary files
-   and changes nothing: permissions, a read-only mount, a busy file, a cross-device link or
-   a missing directory answer `409 rules-file-unwritable`; any other I/O error answers
-   `500 rules-write-failed`; both carry the OS error in `os_error`.
+   and leaves the rules file as it was. A failure of the last step, the rename over the
+   file (EBUSY for a file bind-mounted on its own, say), comes after `<file>.prev` was
+   replaced with a copy of the current file. Permissions, a read-only mount, a busy file, a
+   cross-device link or a missing directory answer `409 rules-file-unwritable`; any other
+   I/O error answers `500 rules-write-failed`; both carry the OS error in `os_error`.
 4. Run the ordinary reload, with the trigger `admin-rules`, and read the digest of the
    rules that are running after it.
 5. Record `rules.write` in the audit log: the operation, the rule, the old and new digests,
@@ -320,7 +322,9 @@ A write whose text is the file on disk byte for byte writes nothing: `written: f
 `.prev`, no `rules.write` record. It reloads only when the running rules differ from the
 file (otherwise `reload: null` and `applied: true`). `if_match=*` on a missing file creates
 it, with mode `0600`: readable by the broker's user alone. To give it a group, create the
-file yourself first with the mode you want; a write keeps it.
+file yourself first with the mode you want and a group the broker's user belongs to; a
+write keeps both. A group the broker is not in cannot be kept: the write drops the group's
+bits (step 3).
 
 Two writes cannot both win on the same file: the node runs them one at a time, from
 reading the file through the reload, so when two name the same `if_match`, the one that
@@ -340,7 +344,8 @@ and nothing else:
 - a delete removes the table's header and keys; the comment lines above its header stay
   where they are, so a file header or a section banner above the first rule survives (and
   so does that rule's own comment block). Inserting a rule and deleting it again gives
-  back the file byte for byte;
+  back the file byte for byte, unless the file ended with blank lines: deleting the last
+  rule drops the blank lines that would then end the file;
 - before anything is written, the old and new text are both loaded and compared: every
   other rule must be unchanged and the edited one exactly as asked, or the answer is
   `500 rules-edit-failed`.
@@ -698,8 +703,9 @@ The rules this node runs, with what they have done.
 | `redacted` | `true` in a viewer's answer |
 
 The counts are the same as on `$SYS` and are served whether or not the `$SYS` statistics
-are on. `last_active_at` is not: the statistics task sets it, so it is `null` while
-`sys_interval_secs = 0`, however often the rule ran. `sql` and `action` last errors are
+are on. `last_active_at` is not: the statistics task sets it, so it is `null` until the
+statistics have been on and seen the rule run, and while `sys_interval_secs = 0` it keeps
+the time they last saw, however often the rule has run since. `sql` and `action` last errors are
 kept either way, but a `delivery` last error is written only by the statistics task. A last
 error about an earlier definition of the rule (another `def`) is not shown. Keys arrive in
 alphabetical order. An operator's answer, statistics off (`def` is per broker process, so
