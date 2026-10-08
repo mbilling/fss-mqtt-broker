@@ -1,6 +1,6 @@
 # Rule engine
 
-**Dated 2026-10-07.** Unreleased: no release has the rule engine yet
+**Dated 2026-10-08.** Unreleased: no release has the rule engine yet
 ([ADR 0083](adr/0083-rule-engine.md)). Rules filter, transform and re-route messages as
 they pass through the broker. They are written in **EMQX's rule SQL**, with EMQX's
 `republish` and `console` actions. A rule written for EMQX's rule engine runs here
@@ -16,7 +16,9 @@ from the **[rule cookbook](RULES-COOKBOOK.md)**: sixteen tested rules (alerts, u
 conversion, routing, device presence, CSV and binary decoding, MQTT 5 properties), each a
 file in [`docs/examples/rules/`](examples/rules/) with the messages to publish and the
 exact output to expect. [Testing and debugging rules](#testing-and-debugging-rules) and
-[Gotchas](#gotchas) cover what goes wrong. The rest of this page is the reference.
+[Gotchas](#gotchas) cover what goes wrong, and [Watch and edit rules
+live](#watch-and-edit-rules-live) shows rules at work over MQTT and changes them through
+the admin API. The rest of this page is the reference.
 
 ---
 
@@ -201,7 +203,9 @@ is the end of the statement, just after the newline that closes its `WHERE` line
 Stop the broker with Ctrl-C (or `docker rm -f mqttd`). Every recipe in the
 [cookbook](RULES-COOKBOOK.md) runs the same way. To see 21 rules at work on realistic
 telemetry from wind turbines, solar inverters, smart meters, heat pumps and a service fleet,
-run [`demo/rules/run.sh`](../demo/rules/README.md).
+run [`demo/rules/run.sh`](../demo/rules/README.md). To watch them run without end, with
+their statistics and trace on `$SYS` and a page in your browser that edits them while they
+run, start [`demo/rules-live/up.sh`](../demo/rules-live/README.md).
 
 ---
 
@@ -209,6 +213,7 @@ run [`demo/rules/run.sh`](../demo/rules/README.md).
 
 - [Try it in two minutes](#try-it-in-two-minutes)
 - [Testing and debugging rules](#testing-and-debugging-rules)
+- [Watch and edit rules live](#watch-and-edit-rules-live)
 - [Gotchas](#gotchas)
 - [Security: values the publisher chooses](#security-values-the-publisher-chooses)
 - [Where rules run, and why it scales](#where-rules-run-and-why-it-scales)
@@ -370,6 +375,10 @@ double-quote one in particular): run `--check-rules` on the file for those, and 
   | `mqttd_rules_loaded` | Enabled rules loaded on this node. |
   | `mqttd_rules_info{checksum}` | The loaded file's SHA-256, at 1. A checksum replaced by a reload stays exported at 0. |
 
+- **Over MQTT, and through the admin API.** Each rule's counts, rates and last error on
+  `$SYS`, a trace of what a rule made of each message, and the rules with their counts
+  through `mqttd --admin rules`: [Watch and edit rules live](#watch-and-edit-rules-live).
+
 - **Alerts.** One for statements that fail, one for actions that fail; a rule whose every
   republish fails passes every evaluation, so the first alone never fires for it:
 
@@ -392,7 +401,8 @@ Work down the list; each step rules out one cause.
 2. **Is the rule enabled?** `mqttd --check-rules` lists it as `(enabled)`.
 3. **Does `FROM` match the topic?** `mqttd --rule-test --sql '…' --topic <the topic>` says
    `matches none of the FROM filters` if it does not. A filter that starts with `#` or
-   `+` does not match a topic that starts with `$`. The filter is in double quotes:
+   `+` does not match a topic that starts with `$`, and a `FROM` on `$SYS/…` matches
+   nothing at all (the loader warns). The filter is in double quotes:
    `FROM "sensors/#"`.
 4. **Was the publish accepted?** Rules run only on publishes the ACL accepts. An MQTT 5
    publisher is told `0x87`; an MQTT 3.1.1 one is not, and the denial is in the audit log.
@@ -414,11 +424,228 @@ Work down the list; each step rules out one cause.
 
 ---
 
+## Watch and edit rules live
+
+Three things, each off until you turn it on
+([ADR 0084](adr/0084-watching-and-editing-rules-live.md)):
+
+- **statistics on `$SYS`**: every rule's counts, rates and last error, published by each
+  node every few seconds, for any MQTT client the ACL lets subscribe;
+- **a trace on `$SYS`**: what a rule made of a message — the message, the result, what each
+  action rendered — rate-limited, for the subscribers you grant it to;
+- **the rules on the admin API**: read them with their counts, check a candidate, try one
+  against a message (actions included, which `--rule-test` does not render) and, for the
+  subjects you name, write the rules file.
+
+The [live demo](#the-live-demo) puts all three together.
+
+| Key | Environment | Default | |
+|---|---|---|---|
+| `rules.sys_interval_secs` | `MQTTD_RULES_SYS_INTERVAL` | `0`, off | Publish the statistics every this many seconds, 1 to 3600. |
+| `rules.trace` | `MQTTD_RULES_TRACE` | `false` | Publish the trace. |
+| `rules.trace_rate` | `MQTTD_RULES_TRACE_RATE` | `20` | At most this many trace records per rule per second, 1 to 1000. |
+| `rules.admin_writers` | `MQTTD_RULES_ADMIN_WRITERS` (`;`-separated) | empty, no writes | Admin certificate subjects, written as in `admin.operators`, that may write the rules file. They need the operator role too. |
+
+All four are live: an applied reload changes them, and a rejected one leaves them as they were.
+With the statistics or the trace on, `node.id` must be a single topic level (no `/`, `+`,
+`#`), or the configuration is refused. `admin_writers` needs the admin listener.
+
+### Statistics on `$SYS`
+
+```toml
+[rules]
+file = "/etc/mqttd/rules/rules.toml"
+sys_interval_secs = 10
+```
+
+Every 10 seconds each node publishes a summary on `$SYS/brokers/<node>/rules` and one
+message per rule, enabled or not, on `$SYS/brokers/<node>/rules/<id>`. Subscribe to the
+`$SYS` filter by name: a filter that starts with `#` or `+` never matches a `$`-topic, so
+`#` alone shows none of it.
+
+```sh
+mosquitto_sub -h 127.0.0.1 -t '$SYS/brokers/+/rules/#' -v
+```
+
+<!-- TODO-INTEGRATE: re-capture the two payloads below from the implementation (field
+order, rate precision, `username`/`null` forms). -->
+
+The quickstart's `high_temp` rule, ten seconds after the two readings (one line, wrapped
+here):
+
+```json
+{"node":"node-local","rule":"high_temp","at":"2026-10-08T12:00:10.000Z","enabled":true,
+ "def":"5f0c2d9a41b7e3c8",
+ "counts":{"matched":2,"passed":1,"no_result":1,"failed":0,"actions_ok":1,"actions_failed":0},
+ "rates":{"matched":0.2,"passed":0.1,"no_result":0.1,"failed":0.0,"actions_ok":0.1,"actions_failed":0.0},
+ "last_active_at":"2026-10-08T12:00:10.000Z","last_error":null}
+```
+
+| Field | Meaning |
+|---|---|
+| `counts.passed`, `.no_result`, `.failed` | `mqttd_rule_evaluations_total{rule,result}` for this rule |
+| `counts.actions_ok`, `.actions_failed` | `mqttd_rule_actions_total{rule,result}` (`ok`, `failed`) for this rule |
+| `counts.matched` | `passed + no_result + failed`: the messages and events the rule's `FROM` selected (EMQX's `matched`) |
+| `rates` | the same, per second, measured over the last interval |
+| `last_active_at` | the tick at which `matched` last grew; `null` when it never has |
+| `last_error` | `null`, or the latest failure's `at` and `kind`: `sql` (the statement failed), `action` (an action could not render, a republish into `$SYS` included) or `delivery` (derived messages were refused or not routed: `actions_failed` grew). While the trace is on it also carries `message`, the error's text truncated to 256 bytes. |
+| `def` | 16 hex digits of a hash of the rule's SQL, actions and `enable`: it changes when the rule does |
+
+The counts are the Prometheus counters, read without creating a series: cumulative since
+the broker started, keyed by rule id, and per node. A rule that never matched shows zeros,
+an edited rule keeps its id's counts, and a removed rule stops being published. The last
+error of a rule that a reload removed or changed is dropped at the next tick.
+
+The summary:
+
+```json
+{"node":"node-local","at":"2026-10-08T12:00:10.000Z","started_at":"2026-10-08T11:58:02.114Z",
+ "interval_secs":10,"rules":1,"enabled":1,
+ "digest":"2f027340235af0b20eafed114c6c36869b05aac8568546125274382b66e892ad",
+ "trace":false,"trace_rate":20,"trace_dropped":0,"stats_dropped":0,
+ "reload":{"at":"2026-10-08T11:59:40.502Z","trigger":"signal","applied":true,"error_kind":null,"repeats":0}}
+```
+
+- `digest` is the running rules file's SHA-256, the value `--check-rules` prints and
+  `mqttd_rules_info{checksum}` exports. Compare it with `sha256sum rules.toml` to confirm
+  that an edit is running.
+- `reload` is the last reload attempt since the broker started (`null` before the first):
+  its trigger (`signal`, `watch`, `admin`, `admin-rules`), whether it applied, and for a
+  rejected one the kind of error (`rules`, `config`, `acl`, `tls`, …, the component that
+  refused it), never the text, which can quote a configuration line. `repeats` counts the
+  identical attempts in a row, such as the file watcher retrying a broken file every poll.
+  The full error is in the log, and in `GET /admin/v1/rules` for an operator.
+- `trace_dropped` and `stats_dropped` count trace records and statistics ticks dropped for
+  lack of room (below).
+
+`$SYS` never carries a rule's SQL, description or actions (a rules file can hold secrets,
+such as the salt of a pseudonym), a file path, or an error's text with the trace off.
+Every message is QoS 0 and never retained, so a new subscriber sees the next tick. Each
+takes ingress credit from the node's pool, like a peer's QoS 0 forward: when the pool is
+short, the tick is skipped and counted in `stats_dropped`, so the statistics yield to
+clients under load. They count in `mqttd_publish_received_total{qos="0"}` and
+`mqttd_deliver_latency_seconds` like any publish.
+
+### The trace
+
+```toml
+[rules]
+file = "/etc/mqttd/rules/rules.toml"
+trace = true
+trace_rate = 5
+```
+
+Each node then publishes, on `$SYS/brokers/<node>/trace/rules/<id>`, a record of what the
+rule did with a message: up to `trace_rate` records per rule per second. The quickstart's
+hot reading:
+
+```sh
+mosquitto_sub -h 127.0.0.1 -t '$SYS/brokers/+/trace/rules/high_temp' -v
+```
+
+```json
+{"node":"node-local","rule":"high_temp","at":"2026-10-08T12:00:03.217Z",
+ "trigger":{"type":"publish","topic":"sensors/kitchen/data","qos":1,"retain":false,
+            "clientid":"kitchen","username":null,"payload":"{\"temp\": 35}",
+            "payload_encoding":"utf8","payload_bytes":12,"truncated":false},
+ "result":"passed","error":null,
+ "outputs":[{"action":"republish","topic":"alerts/kitchen","qos":1,"retain":false,
+             "payload":"{\"temp\":35,\"clientid\":\"kitchen\",\"qos\":1}",
+             "payload_encoding":"utf8","payload_bytes":40,"truncated":false}],
+ "outputs_omitted":0}
+```
+
+- **`trigger`** is a `publish` (topic, QoS, retain flag, client id, username, payload), a
+  `will` (the same, for a Will the broker published) or an `event` (`event`, client id,
+  username). A payload is its first 1 KiB, as text (`utf8`) or, when it is not UTF-8, as
+  `base64`; `payload_bytes` is its full length and `truncated` says whether it was cut.
+  Topics, client ids and usernames are cut at 256 bytes.
+- **`result`** is `passed`, `no_result` or `failed`, with `error` for a failure.
+- **`outputs`** are what the rule's actions rendered, one per action and output row: a
+  `republish` (topic, QoS, retain flag, payload as above), a `console` (its `output`), or an
+  action that could not render (`{"action_index": 0, "error": "…"}`). At most 16; the rest
+  are counted in `outputs_omitted`. They are what was rendered, not what was delivered: a
+  derived message the broker then refused shows in the counts, not here.
+
+The trace is bounded: `trace_rate` records per rule per second, with `no_result` records on
+a window of their own so a rule whose `WHERE` rarely passes still shows its passes; at most
+max(`trace_rate`, 200) records per second for the node; a queue of 1,024 records and 4 MiB;
+and node-pool credit for each publish. What does not fit is dropped and counted in the
+summary's `trace_dropped`. With the trace off, the cost is one atomic load per evaluation.
+
+**The trace discloses data.** A subscriber to a rule's trace topic reads every message
+that rule's `FROM` matches, with the publishers' client ids and usernames, whatever its
+own ACL says about those topics. The trace has its own subtree for that reason:
+`$SYS/brokers/+/rules/#` does not cover it, and `$SYS/#` does. Grant it per rule, to whom
+you mean to ([HARDENING.md](HARDENING.md)). Turning it on logs a WARN, and an `INSECURE:`
+line when there is no ACL file or its default is `allow`. Keep it off in production.
+
+### Through the admin API
+
+With the admin listener on ([ADMIN-API.md](ADMIN-API.md#rules)), the rules have endpoints
+and `mqttd --admin` verbs ([ADMIN-CLI.md](ADMIN-CLI.md#rules-rules-source-rules-apply-rule-delete)):
+
+| Verb | Endpoint | Role | Does |
+|---|---|---|---|
+| `rules` | `GET /admin/v1/rules` | viewer | The running rules with their counts, last activity and last error, the running digest and the one on disk, the load warnings and the last reload. A viewer sees no SQL or actions and no error text. |
+| `rules-source` | `GET /admin/v1/rules/source` | operator | The rules file as it is on disk, verbatim (`> rules.toml` saves it). |
+| — | `POST /admin/v1/rules/check` | operator | Loads a candidate file, or one rule spliced into the file on disk, as the broker would. Writes nothing. |
+| — | `POST /admin/v1/rules/test` | operator | Runs a message through the running rules, a candidate file or one rule (even a disabled one) and returns each rule's result and rendered actions, as the trace shows them. Changes nothing: no counter, no last error, no trace, no log line. |
+| `rules-apply <file>` | `PUT /admin/v1/rules` | operator and writer | Replaces the rules file. `if_match` is required: the digest of the file you edited, or `*`. |
+| — | `PUT /admin/v1/rule?id=<id>` | operator and writer | Inserts or updates one rule, keeping the rest of the file, comments included. |
+| `rule-delete <id>` | `DELETE /admin/v1/rule?id=<id>` | operator and writer | Removes one rule. |
+
+A write needs the operator role **and** a subject in `admin_writers`; with the list empty,
+the default, nothing can write. A write starts from the file on disk, refuses a file that
+does not load before anything is written, and replaces the file atomically: a temporary
+file in the same directory with the old file's mode, the old file kept as `<file>.prev`,
+then a rename. Then the ordinary reload runs (trigger `admin-rules`), and the answer gives
+the digest that is running after it. The next publish runs the new rules, as after a
+`SIGHUP`. Every write is audited (`rules.write`).
+
+```sh
+mqttd --admin rules-source > rules.toml           # the file as it is on disk
+digest=$(sha256sum rules.toml | cut -d' ' -f1)    # the version you are editing
+vi rules.toml
+mqttd --admin rules-apply rules.toml --if_match "$digest"
+```
+
+If someone changed the file in between, the write is refused (`412 digest-mismatch`) and
+nothing is lost: fetch it again. Writes are per node; apply them to each node, and
+`summary.same_rules` in `mqttd --admin cluster --json` says whether every node runs the
+same file.
+
+The broker must be able to write the rules file's directory. None of the layouts in
+[Shipping the rules file](#shipping-the-rules-file) allows that: the systemd file is
+root's, the Compose mount is read-only, and a Kubernetes ConfigMap is read-only and would
+overwrite a write on its next sync. A writable rules file belongs in a directory of its own,
+owned by the broker user, holding nothing else.
+
+### The live demo
+
+[`demo/rules-live`](../demo/rules-live/README.md) runs it all with Docker Compose: a broker
+with [the demo's rules](../demo/rules/README.md), statistics every 2 s and the trace on, a
+simulator per domain publishing power-plant, home and car telemetry without end, and a
+page at `http://localhost:8070` that shows the rules, their counts and traces as they run,
+and edits, checks, tests and applies them through the admin API. Every port is on
+127.0.0.1. Its broker is anonymous with no ACL, and its editor is an operator without a
+login: a demo, never a deployment.
+
+```sh
+demo/rules-live/up.sh
+mosquitto_sub -h 127.0.0.1 -t '$SYS/brokers/+/rules' -v
+```
+
+---
+
 ## Gotchas
 
 - **Rules go in their own file, not in `mqttd.toml`.** The configuration's `[rules]`
-  table takes only `file`. A `[rules.<id>]` table in `mqttd.toml` refuses the boot as an
-  unknown key, with a hint saying where rules go. Do not set
+  table takes `file` and the four settings of
+  [Watch and edit rules live](#watch-and-edit-rules-live) (`sys_interval_secs`, `trace`,
+  `trace_rate`, `admin_writers`), never a rule. A `[rules.<id>]` table in `mqttd.toml`
+  refuses the boot as an unknown key, with a hint saying where rules go; a misspelt
+  setting is an unknown key like any other. Do not set
   `config_unknown_keys = "warn"` to get past it: the broker would then boot and ignore the
   rule.
 - **Write the SQL in a TOML multi-line literal string, `'''…'''`.** SQL writes a quote
@@ -500,6 +727,9 @@ Work down the list; each step rules out one cause.
   `topic(0)` fails the rule. Indexes (`payload.list[1]`) and `nth` count from 1 too, but
   `substr` counts from 0. More function traps are under [Functions](#functions).
 - **Rules never chain.** A message a rule publishes never runs rules, its own or another's.
+- **`$SYS` is the broker's.** A republish that renders a `$SYS` topic fails its action,
+  and a `FROM` on `$SYS/…` never matches: clients cannot publish there, and the broker's
+  own `$SYS` messages never run rules. `--check-rules` warns about both.
 
 ---
 
@@ -512,13 +742,15 @@ message therefore lets the publisher choose where the derived message goes:
 - `topic = "devices/${device}"` with `device` selected from the payload: a payload with
   `"device": "x/../admin/cmd"` publishes on `devices/x/../admin/cmd`, and one with no
   `device` on `devices/undefined`. A template that is all placeholders, such as
-  `${target}`, can reach `$SYS/…`.
+  `${target}`, can reach any topic except `$SYS/…`, which is reserved for the broker: a
+  republish that renders one fails its action
+  (`republish topic is reserved for the broker: $SYS/…`).
 - The client id and the username are chosen by the client too, unless mTLS or the ACL's
   `connect` rules pin them. `alerts/${clientid}`, as in the example above, publishes on
   `alerts/a/../admin` for a client that connects as `a/../admin`.
 
-A rendered topic with a wildcard, NUL or `$share/` fails the action, but `/` and
-`$`-prefixed levels are valid topic names. Let only a plain topic level through, in
+A rendered topic with a wildcard, NUL, `$share/` or `$SYS` fails the action, but `/` and
+other `$`-prefixed levels are valid topic names. Let only a plain topic level through, in
 `WHERE`:
 
 ```sql
@@ -663,7 +895,8 @@ built from the publisher's values needs a guard
 ## The rules file
 
 `[rules] file` in the config (or `MQTTD_RULES_FILE`) names a TOML file. Unset means no
-rules. The configuration's `[rules]` table takes only `file`: rules cannot be written in
+rules. The configuration's `[rules]` table takes `file` and the settings of
+[Watch and edit rules live](#watch-and-edit-rules-live): rules cannot be written in
 `mqttd.toml` itself. Each rule is a table named by its id. EMQX writes the same structure
 as `rule_engine.rules.<id>` in HOCON:
 
@@ -677,8 +910,13 @@ description = ""      # optional
 
 Loading is **all-or-nothing**: one rule that does not parse rejects the file. At
 startup the broker refuses to boot, and on a reload the running rules stay in force.
-Unknown keys are errors. The limits are 1,024 rules per file, 16 actions per rule and
-64 KiB of SQL per rule. An expression may be at most 256 levels deep, a chain of 256
+Unknown keys are errors. The limits are 1,024 rules per file, 16 actions per rule,
+64 KiB of SQL per rule, and 96 distinct regular-expression literals per file (a pattern
+written in `regex_match`, `regex_replace` or `regex_extract`; the same pattern written
+twice is compiled once and counts once; past it:
+`more than 96 distinct regular expressions in one rules file`). Each literal costs a
+compile when the file loads, so the file-wide limit keeps a load, a reload or an admin API
+check under about a second and a few hundred MiB. An expression may be at most 256 levels deep, a chain of 256
 operands such as `1 + 1 + …` (past it: `expression is more than 256 levels deep`), and
 may nest at most 64 levels of parentheses, signs, `NOT`, function calls or array
 literals inside each other (past it: `expression nests more than 64 levels deep`).
@@ -766,7 +1004,9 @@ Within the same meaning, mqttd accepts a little more than EMQX: `AND`/`OR`/`NOT`
 ### Messages: `FROM "<topic filter>"`
 
 `FROM` takes MQTT topic filters. `#` and `+` follow MQTT rules, including that a
-leading wildcard does not match a `$`-topic.
+leading wildcard does not match a `$`-topic. A filter on `$SYS/…` never matches anything:
+clients cannot publish there and the broker's own `$SYS` messages never run rules, so the
+loader warns (`FROM "$SYS/#" never matches: …`).
 
 | Field | Value |
 |---|---|
@@ -892,7 +1132,7 @@ cookbook decodes binary payloads without `subbits`
 
 | Arg | Default (EMQX's) | |
 |---|---|---|
-| `topic` | — (required) | A template. A rendered topic that is empty, has a wildcard, NUL or `$share/`, or is over 65,535 bytes fails the action, not the rule. A topic built from the publisher's values needs a [guard](#security-values-the-publisher-chooses). |
+| `topic` | — (required) | A template. A rendered topic that is empty, has a wildcard, NUL or `$share/`, is in `$SYS` (reserved for the broker), or is over 65,535 bytes fails the action, not the rule; the loader warns when the template's fixed start is already in `$SYS`. A topic built from the publisher's values needs a [guard](#security-values-the-publisher-chooses). |
 | `qos` | `"${qos}"` | 0, 1, 2 or one placeholder. **The placeholder reads the rule's output, not the input message**, as in EMQX: a rule that does not select `qos` (or `*`) republishes at **QoS 0**. A literal outside 0 to 2 fails the load; a placeholder that renders one fails the action. |
 | `retain` | `"${retain}"` | A boolean or one placeholder. A publish has no `retain` field (it is `flags.retain`), so this defaults to false unless the SQL selects `flags.retain AS retain`. |
 | `payload` | `"${payload}"` | A template. An empty string is the whole output as JSON (`${.}`). `${payload}` keeps a binary payload's exact bytes. An event has no payload: give an event rule's republish one. |
@@ -935,9 +1175,9 @@ cookbook's [What rules cannot do](RULES-COOKBOOK.md#what-rules-cannot-do).
 |---|---|
 | Validate a rules file | `mqttd --check-rules <file>` (exit 0 OK, 1 invalid, 2 usage) lists every rule it loaded. With no file it loads the effective configuration and checks its `rules.file`. `mqttd --check-config --preflight` loads it too. See [Check a file](#check-a-file-mqttd---check-rules). |
 | Try a statement | `mqttd --rule-test --sql '<statement>' [--topic t] [--payload p] [--clientid c] [--username u] [--qos n] [--event e]` prints each output as JSON. This is EMQX's "SQL test", offline; a `$events` statement runs against a sample event. See [Try a statement](#try-a-statement-mqttd---rule-test). |
-| Change rules | Edit the file, then `SIGHUP` (`kill -HUP <pid>`; under the shipped systemd unit, `systemctl reload mqttd`; in a container, `docker kill --signal=HUP <container>`). With `MQTTD_CONFIG_WATCH` set, the file watcher picks the edit up on its own; the image has no shell to send a signal from, so the Helm chart turns the watcher on. With the admin API (`admin.bind` and its mTLS certificates), `mqttd --admin reload` or `POST /admin/v1/reload` does the same ([ADMIN-CLI.md](ADMIN-CLI.md#config-reload)). The next publish runs the new rules. A file that does not load is rejected with the reload, keeping the running rules: the **whole** reload, so a broken rules file also holds back an ACL or credential change made at the same time. |
-| Confirm every node runs the same rules | `mqttd_rules_info{checksum}`: the file's SHA-256, one series at 1 per node (a checksum replaced by a reload stays exported at 0). Rules are per-node configuration like the ACL file, so a node with a different file evaluates its own clients' publishes with different rules. |
-| Watch rules work | On `GET /metrics`, served at `MQTTD_HEALTH_BIND` or `MQTTD_METRICS_BIND`: `mqttd_rule_evaluations_total{rule,result}` (`passed`, `no_result`, `failed`) and `mqttd_rule_actions_total{rule,result}` (`ok`, `failed`) are EMQX's per-rule counters. An action is counted once its outcome is known: a republish is `ok` when the broker routed it (accepted it, for a QoS ≥ 1 message behind a QoS ≥ 1 publish and for every message an event or a Will derives; routed it, for anything else) and `failed` when it could not render, when the broker refused it, when the hub refused its original (and so routed none of its derived messages), or when its fate is unknown. `ok` does not follow each copy to its subscribers: a subscriber's own limits can drop one later (a full offline queue), counted in `mqttd_publish_dropped_total` as for any message. `mqttd_rules_loaded` is the number of enabled rules. A rule whose statement or action fails logs one WARN per rule per 10 s with the error; the rest are at DEBUG. |
+| Change rules | Edit the file, then `SIGHUP` (`kill -HUP <pid>`; under the shipped systemd unit, `systemctl reload mqttd`; in a container, `docker kill --signal=HUP <container>`). With `MQTTD_CONFIG_WATCH` set, the file watcher picks the edit up on its own; the image has no shell to send a signal from, so the Helm chart turns the watcher on. With the admin API (`admin.bind` and its mTLS certificates), `mqttd --admin reload` or `POST /admin/v1/reload` does the same ([ADMIN-CLI.md](ADMIN-CLI.md#config-reload)). For a subject in `[rules] admin_writers`, `mqttd --admin rules-apply` and `PUT`/`DELETE /admin/v1/rule` write the file and reload it in one step ([Through the admin API](#through-the-admin-api)). The next publish runs the new rules. A file that does not load is rejected with the reload, keeping the running rules: the **whole** reload, so a broken rules file also holds back an ACL or credential change made at the same time. |
+| Confirm every node runs the same rules | `mqttd_rules_info{checksum}`: the file's SHA-256, one series at 1 per node (a checksum replaced by a reload stays exported at 0). The same digest is in `/statusz` (`rules.digest`), in each node's `$SYS/brokers/<node>/rules` summary, and, compared across nodes, in `summary.same_rules` of `mqttd --admin cluster --json`. Rules are per-node configuration like the ACL file, so a node with a different file evaluates its own clients' publishes with different rules. |
+| Watch rules work | On `GET /metrics`, served at `MQTTD_HEALTH_BIND` or `MQTTD_METRICS_BIND`: `mqttd_rule_evaluations_total{rule,result}` (`passed`, `no_result`, `failed`) and `mqttd_rule_actions_total{rule,result}` (`ok`, `failed`) are EMQX's per-rule counters. An action is counted once its outcome is known: a republish is `ok` when the broker routed it (accepted it, for a QoS ≥ 1 message behind a QoS ≥ 1 publish and for every message an event or a Will derives; routed it, for anything else) and `failed` when it could not render, when the broker refused it, when the hub refused its original (and so routed none of its derived messages), or when its fate is unknown. `ok` does not follow each copy to its subscribers: a subscriber's own limits can drop one later (a full offline queue), counted in `mqttd_publish_dropped_total` as for any message. `mqttd_rules_loaded` is the number of enabled rules. A rule whose statement or action fails logs one WARN per rule per 10 s with the error; the rest are at DEBUG. The same counts, with rates and the last error, are on `$SYS/brokers/<node>/rules/<id>` with `sys_interval_secs` set, and in `mqttd --admin rules` ([Watch and edit rules live](#watch-and-edit-rules-live)). |
 
 Alert on a failing rule, both its statement and its actions:
 
@@ -984,6 +1224,10 @@ a release has the rule engine, each one also needs a binary or image built from 
 - **Kubernetes** (the Helm chart): a ConfigMap mounted through the chart's extra volume
   values ([KUBERNETES.md](KUBERNETES.md#rules)).
 
+Each of these is read-only to the broker, which is right for a file you ship: keep
+`[rules] admin_writers` empty with them. Writing rules through the admin API needs a
+directory the broker owns ([Through the admin API](#through-the-admin-api)).
+
 ## Performance
 
 Measured on one core of the development VM (`cargo bench -p mqtt-rules`, criterion,
@@ -1021,7 +1265,7 @@ notice.
 | Functions | 124 in the built-in reference, plus `jq` | 107 of those 124, plus the 13 legacy accessors EMQX keeps undocumented (120 in all). The rest are refused at load. |
 | `is_empty` of a missing value | Documented as `false` | Fails the rule: `is_empty(): expected an array or a map, got a undefined` |
 | JSON integers | Any size (Erlang integers) | Signed 64-bit. One outside that range decodes as a float, so `12345678901234567890` becomes `1.2345678901234567e+19`. `${payload}` keeps the original bytes. |
-| Regular expressions | PCRE | Rust's `regex`: linear-time, no backreferences or look-around. In `regex_replace`, `\N` and `&` are translated to the same meaning. |
+| Regular expressions | PCRE | Rust's `regex`: linear-time, no backreferences or look-around. In `regex_replace`, `\N` and `&` are translated to the same meaning. A rules file holds at most 96 distinct regular-expression literals. |
 | `''` inside a string literal | Kept as two quotes | One quote (standard SQL) |
 | `sprintf` | Erlang `io_lib:format` | `~s`, `~p`, `~w`, `~n` and `~~` |
 | `strlen`, `substr`, `pad` | Grapheme clusters | Unicode scalar values (the same for text without combining marks) |
@@ -1033,6 +1277,10 @@ notice.
 | A refused publish | Rules ran on it before it was refused downstream | The hub routes none of its derived messages (unless the refusal is a peer's, arriving later) |
 | Limits on payload-driven work | None beyond the Erlang process's memory | A `FOREACH` iterates at most 10,000 elements; a function may build at most 1 MiB beyond its inputs; `map_put`/`mput` paths have at most 64 segments; timestamps must be renderable in every time zone; expressions at most 256 levels deep and nested at most 64 levels ([The rules file](#the-rules-file)) |
 | Where it runs | Every node | Every node, once per message at the node it arrived at, never on a forwarded copy |
+| `$SYS` messages | The broker's own `$SYS` messages run rules only with `rule_engine.ignore_sys_message = false` (default `true`) | Never run rules. Clients cannot publish to `$SYS`, so a `FROM` on it never matches. The broker publishes only opt-in rule statistics and trace there ([above](#watch-and-edit-rules-live)) |
+| Rule statistics | The dashboard and the REST API | `/metrics`; with `sys_interval_secs`, `$SYS/brokers/<node>/rules/<id>`; `GET /admin/v1/rules` |
+| Changing rules | The dashboard and the REST API, applied across the cluster | The rules file, reloaded; for a listed writer, the admin API writes that file, on the node it asks |
+| Testing a rule | The dashboard's SQL test | `mqttd --rule-test` (the statement only), or `POST /admin/v1/rules/test` (the statement and the rendered actions) |
 
 ## Migrating rules from EMQX
 
