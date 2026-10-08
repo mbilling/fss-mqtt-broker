@@ -29,20 +29,25 @@
 //!   Inbound `QoS` 2 dedup means a rule fires exactly once per `QoS` 2 message. A `QoS`
 //!   0 publish has no acknowledgement, so nothing it produces is gated.
 //! - **Watching it** ([ADR 0084](../../../docs/adr/0084-watching-and-editing-rules-live.md)).
-//!   [`RulesObserve`] holds the live `[rules]` settings for the `$SYS` statistics
-//!   ([`crate::rules_sys`]) and each rule's last error.
+//!   [`RulesObserve`] holds the live `[rules]` settings for the `$SYS` statistics and
+//!   the trace, each rule's last error, and the trace's queue. With the trace off an
+//!   evaluation pays one relaxed load for it; on, each rule's evaluations are copied —
+//!   capped, rate-limited per rule — into plain [`TraceRecord`]s, and the trace task
+//!   ([`crate::rules_sys`]) turns them into JSON off the connection tasks and the hub.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
-use std::time::SystemTime;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use mqtt_codec::QoS;
 use mqtt_core::{AppProperties, ClientId};
 use mqtt_observability::metrics::Metrics;
-use mqtt_rules::{ClientInfo, Effect, EventInput, Outcome, PublishInput, Republish, Rule, RuleSet};
+use mqtt_rules::{
+    ClientInfo, Effect, EventInput, Input, Outcome, PublishInput, Republish, Rule, RuleSet,
+};
 use tokio::sync::{mpsc, oneshot, watch};
 use tracing::{debug, info, warn};
 
@@ -228,6 +233,16 @@ fn collect(metrics: Option<&Metrics>, effects: Vec<(Arc<str>, Effect)>) -> Vec<D
         .collect()
 }
 
+/// What a publish evaluation was fired by, so the trace can tell a Will from a client
+/// publish (ADR 0084). Events go through [`ConnRules::fire_event`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TriggerKind {
+    /// A client's PUBLISH.
+    Publish,
+    /// A Will the hub publishes for a client.
+    Will,
+}
+
 /// Evaluate a publish against `set`.
 fn evaluate(
     set: &RuleSet,
@@ -235,6 +250,7 @@ fn evaluate(
     metrics: Option<&Metrics>,
     observe: Option<&RulesObserve>,
     f: &PublishFacts<'_>,
+    trigger: TriggerKind,
 ) -> Vec<Derived> {
     if !set.has_message_rules() {
         return Vec::new();
@@ -247,11 +263,26 @@ fn evaluate(
     input.message_expiry = f.message_expiry;
     input.node = node;
     let mut effects = Vec::new();
-    set.on_publish(
-        &input,
-        &mut |r, o| report(metrics, observe, r, o),
-        &mut effects,
-    );
+    // The trace's gate: one relaxed load, then the plain report or the capturing one.
+    match observe.filter(|o| o.tracing()) {
+        None => set.on_publish(
+            &input,
+            &mut |r, o| report(metrics, observe, r, o),
+            &mut effects,
+        ),
+        Some(o) => {
+            let mut capture = Capture::new(o.trace_rate());
+            set.on_publish(
+                &input,
+                &mut |r, out| {
+                    capture.see(r, out);
+                    report(metrics, observe, r, out);
+                },
+                &mut effects,
+            );
+            capture.finish(o, &effects, || TraceTrigger::message(trigger, f));
+        }
+    }
     collect(metrics, effects)
 }
 
@@ -333,6 +364,7 @@ impl Rules {
             self.metrics.as_deref(),
             self.observe.as_deref(),
             f,
+            TriggerKind::Will,
         );
         Self::send_derived(derived, send);
     }
@@ -391,7 +423,16 @@ impl ConnRules {
     pub fn on_publish(&self, f: &PublishFacts<'_>) -> Vec<Derived> {
         let metrics = self.engine.metrics.as_deref();
         let observe = self.engine.observe.as_deref();
-        self.with_set(|set| evaluate(set, &self.engine.node, metrics, observe, f))
+        self.with_set(|set| {
+            evaluate(
+                set,
+                &self.engine.node,
+                metrics,
+                observe,
+                f,
+                TriggerKind::Publish,
+            )
+        })
     }
 
     /// Pick up a reloaded rule set now, releasing the superseded one this connection
@@ -426,11 +467,27 @@ impl ConnRules {
         let observe = self.engine.observe.as_deref();
         let derived = self.with_set(|set| {
             let mut effects = Vec::new();
-            set.on_event(
-                input,
-                &mut |r, o| report(metrics, observe, r, o),
-                &mut effects,
-            );
+            match observe.filter(|o| o.tracing()) {
+                None => {
+                    set.on_event(
+                        input,
+                        &mut |r, o| report(metrics, observe, r, o),
+                        &mut effects,
+                    );
+                }
+                Some(o) => {
+                    let mut capture = Capture::new(o.trace_rate());
+                    set.on_event(
+                        input,
+                        &mut |r, out| {
+                            capture.see(r, out);
+                            report(metrics, observe, r, out);
+                        },
+                        &mut effects,
+                    );
+                    capture.finish(o, &effects, || TraceTrigger::event(input));
+                }
+            }
             collect(metrics, effects)
         });
         Rules::send_derived(derived, |cmd| {
@@ -610,6 +667,17 @@ impl From<&mqtt_config::Rules> for RulesSysSettings {
 /// The longest error text kept, in bytes (ADR 0084): an error can quote a payload value,
 /// so it is cut, on a character boundary.
 pub const ERROR_TEXT_MAX: usize = 256;
+/// The bytes of a payload a trace record copies.
+pub const TRACE_PAYLOAD_MAX: usize = 1024;
+/// The bytes of a topic, client id or username a trace record keeps.
+pub const TRACE_NAME_MAX: usize = 256;
+/// The outputs a trace record lists; the rest are only counted.
+pub const TRACE_OUTPUTS_MAX: usize = 16;
+/// The trace records queued for the trace task.
+pub const TRACE_QUEUE: usize = 1024;
+/// The bytes the queued trace records may hold between them.
+pub const TRACE_QUEUE_BYTES: usize = 4 << 20;
+
 /// `s` cut to at most `max` bytes, on a character boundary.
 #[must_use]
 pub fn clip(s: &str, max: usize) -> &str {
@@ -686,24 +754,32 @@ pub struct RulesObserve {
     trace: AtomicBool,
     trace_rate: AtomicU32,
     settings: watch::Sender<RulesSysSettings>,
+    trace_tx: mpsc::Sender<TraceRecord>,
+    /// The bytes the queued trace records hold ([`TRACE_QUEUE_BYTES`] at most).
+    trace_bytes: AtomicUsize,
     trace_dropped: AtomicU64,
     stats_dropped: AtomicU64,
     last_errors: Mutex<HashMap<Arc<str>, LastError>>,
 }
 
 impl RulesObserve {
-    /// Everything off.
+    /// Everything off, and the receiving end of the trace queue for
+    /// [`run_trace`](crate::rules_sys::run_trace).
     #[must_use]
-    pub fn new() -> Arc<Self> {
+    pub fn new() -> (Arc<Self>, mpsc::Receiver<TraceRecord>) {
         let settings = RulesSysSettings::default();
-        Arc::new(Self {
+        let (trace_tx, trace_rx) = mpsc::channel(TRACE_QUEUE);
+        let observe = Arc::new(Self {
             trace: AtomicBool::new(settings.trace),
             trace_rate: AtomicU32::new(settings.trace_rate),
             settings: watch::channel(settings).0,
+            trace_tx,
+            trace_bytes: AtomicUsize::new(0),
             trace_dropped: AtomicU64::new(0),
             stats_dropped: AtomicU64::new(0),
             last_errors: Mutex::new(HashMap::new()),
-        })
+        });
+        (observe, trace_rx)
     }
 
     /// Apply the committed `[rules]` settings. `exposed` says why anyone may read the
@@ -749,7 +825,7 @@ impl RulesObserve {
         self.settings.subscribe()
     }
 
-    /// Whether the trace is on.
+    /// Whether the trace is on: the one relaxed load an evaluation pays for it.
     #[must_use]
     pub fn tracing(&self) -> bool {
         self.trace.load(Relaxed)
@@ -772,6 +848,10 @@ impl RulesObserve {
     #[must_use]
     pub fn stats_dropped(&self) -> u64 {
         self.stats_dropped.load(Relaxed)
+    }
+
+    pub(crate) fn count_trace_dropped(&self) {
+        self.trace_dropped.fetch_add(1, Relaxed);
     }
 
     pub(crate) fn count_stats_dropped(&self) {
@@ -809,6 +889,384 @@ impl RulesObserve {
     /// Drop the kept errors `keep` refuses: a rule gone, or redefined, by a reload.
     pub(crate) fn retain_errors(&self, keep: impl Fn(&str, &LastError) -> bool) {
         self.errors().retain(|id, e| keep(id, e));
+    }
+
+    /// Queue a trace record, or drop and count it when the queue is full or the bytes
+    /// queued would pass [`TRACE_QUEUE_BYTES`].
+    fn offer(&self, record: TraceRecord) {
+        let weight = record.weight();
+        if self.trace_bytes.fetch_add(weight, Relaxed) + weight > TRACE_QUEUE_BYTES {
+            self.trace_bytes.fetch_sub(weight, Relaxed);
+            self.count_trace_dropped();
+            return;
+        }
+        if self.trace_tx.try_send(record).is_err() {
+            self.trace_bytes.fetch_sub(weight, Relaxed);
+            self.count_trace_dropped();
+        }
+    }
+
+    /// A record of `weight` left the queue.
+    pub(crate) fn released(&self, weight: usize) {
+        self.trace_bytes.fetch_sub(weight, Relaxed);
+    }
+}
+
+/// How a traced evaluation ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TraceResult {
+    /// Its SQL produced output.
+    Passed,
+    /// Its `WHERE` filtered the message out.
+    NoResult,
+    /// Its SQL failed.
+    Failed,
+}
+
+impl TraceResult {
+    /// The name a trace record gives it.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Passed => "passed",
+            Self::NoResult => "no_result",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+/// A payload as a trace record keeps it: its first [`TRACE_PAYLOAD_MAX`] bytes, COPIED
+/// (a slice would keep the whole message's allocation alive in the queue), and its
+/// length.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TracePayload {
+    /// The copied bytes.
+    pub bytes: Bytes,
+    /// The payload's whole length.
+    pub len: usize,
+}
+
+impl TracePayload {
+    fn copy(payload: &[u8]) -> Self {
+        Self {
+            bytes: Bytes::copy_from_slice(&payload[..payload.len().min(TRACE_PAYLOAD_MAX)]),
+            len: payload.len(),
+        }
+    }
+
+    /// Whether only part of it was kept.
+    #[must_use]
+    pub fn truncated(&self) -> bool {
+        self.bytes.len() < self.len
+    }
+}
+
+/// The message a traced publish or Will evaluation ran on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TracedMessage {
+    /// Its topic, at most [`TRACE_NAME_MAX`] bytes.
+    pub topic: String,
+    /// Its `QoS`.
+    pub qos: u8,
+    /// Its RETAIN flag.
+    pub retain: bool,
+    /// The publishing client, at most [`TRACE_NAME_MAX`] bytes.
+    pub clientid: String,
+    /// Its username, at most [`TRACE_NAME_MAX`] bytes.
+    pub username: Option<String>,
+    /// Its payload.
+    pub payload: TracePayload,
+}
+
+/// What fired a traced evaluation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TraceTrigger {
+    /// A client's publish.
+    Publish(TracedMessage),
+    /// A client's Will.
+    Will(TracedMessage),
+    /// A client or session event.
+    Event {
+        /// The event's name (`client.connected`, …).
+        event: &'static str,
+        /// The client, at most [`TRACE_NAME_MAX`] bytes.
+        clientid: String,
+        /// Its username, at most [`TRACE_NAME_MAX`] bytes.
+        username: Option<String>,
+    },
+}
+
+fn name(s: &str) -> String {
+    clip(s, TRACE_NAME_MAX).to_string()
+}
+
+impl TraceTrigger {
+    fn message(kind: TriggerKind, f: &PublishFacts<'_>) -> Self {
+        let message = TracedMessage {
+            topic: name(f.topic),
+            qos: qos_num(f.qos),
+            retain: f.retain,
+            clientid: name(&f.client.0),
+            username: f.publisher.username.as_deref().map(name),
+            payload: TracePayload::copy(f.payload),
+        };
+        match kind {
+            TriggerKind::Publish => Self::Publish(message),
+            TriggerKind::Will => Self::Will(message),
+        }
+    }
+
+    fn event(input: &EventInput) -> Self {
+        Self::Event {
+            event: input.kind().event_name(),
+            clientid: input
+                .field("clientid")
+                .as_str()
+                .map(name)
+                .unwrap_or_default(),
+            username: input.field("username").as_str().map(name),
+        }
+    }
+
+    fn weight(&self) -> usize {
+        match self {
+            Self::Publish(m) | Self::Will(m) => {
+                m.topic.len()
+                    + m.clientid.len()
+                    + m.username.as_ref().map_or(0, String::len)
+                    + m.payload.bytes.len()
+            }
+            Self::Event {
+                clientid, username, ..
+            } => clientid.len() + username.as_ref().map_or(0, String::len),
+        }
+    }
+}
+
+/// One thing a traced rule rendered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TraceOutput {
+    /// A message to republish.
+    Republish {
+        /// Its topic, at most [`TRACE_NAME_MAX`] bytes.
+        topic: String,
+        /// Its `QoS`.
+        qos: u8,
+        /// Its RETAIN flag.
+        retain: bool,
+        /// Its payload.
+        payload: TracePayload,
+    },
+    /// A `console` line: the selected fields as JSON, at most [`TRACE_PAYLOAD_MAX`]
+    /// bytes of it.
+    Console {
+        /// The JSON (or its first bytes, when `len` is longer).
+        output: String,
+        /// The whole JSON's length.
+        len: usize,
+    },
+    /// An action that failed as it rendered.
+    Failed {
+        /// Which of the rule's actions.
+        action_index: usize,
+        /// Why, at most [`ERROR_TEXT_MAX`] bytes.
+        error: String,
+    },
+}
+
+impl TraceOutput {
+    fn of(effect: &Effect) -> Self {
+        match effect {
+            Effect::Republish(r) => Self::Republish {
+                topic: name(&r.topic),
+                qos: r.qos,
+                retain: r.retain,
+                payload: TracePayload::copy(&r.payload),
+            },
+            Effect::Console(json) => Self::Console {
+                output: clip(json, TRACE_PAYLOAD_MAX).to_string(),
+                len: json.len(),
+            },
+        }
+    }
+
+    fn weight(&self) -> usize {
+        match self {
+            Self::Republish { topic, payload, .. } => topic.len() + payload.bytes.len(),
+            Self::Console { output, .. } => output.len(),
+            Self::Failed { error, .. } => error.len(),
+        }
+    }
+}
+
+/// One traced evaluation of one rule (ADR 0084): a plain struct, built where the rule
+/// ran — the connection task, or the hub for a Will — and turned into JSON only by the
+/// trace task. Outputs are what the rule rendered; their fate is in the counters.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TraceRecord {
+    /// The rule.
+    pub rule: Arc<str>,
+    /// When it ran.
+    pub at: SystemTime,
+    /// What it ran on.
+    pub trigger: TraceTrigger,
+    /// How its SQL ended.
+    pub result: TraceResult,
+    /// Its SQL's error, at most [`ERROR_TEXT_MAX`] bytes.
+    pub error: Option<String>,
+    /// What it rendered, at most [`TRACE_OUTPUTS_MAX`].
+    pub outputs: Vec<TraceOutput>,
+    /// The outputs past [`TRACE_OUTPUTS_MAX`].
+    pub outputs_omitted: u32,
+}
+
+/// What a record costs beyond its texts and payload copies, for the byte budget.
+const TRACE_RECORD_OVERHEAD: usize = 256;
+
+impl TraceRecord {
+    /// The bytes it holds, as the queue's byte budget counts them.
+    #[must_use]
+    pub fn weight(&self) -> usize {
+        TRACE_RECORD_OVERHEAD
+            + self.rule.len()
+            + self.trigger.weight()
+            + self.error.as_ref().map_or(0, String::len)
+            + self.outputs.iter().map(TraceOutput::weight).sum::<usize>()
+    }
+}
+
+/// One rule's slot in an evaluation being traced.
+enum Slot {
+    /// A rendered effect: its index in the evaluation's effects.
+    Effect(usize),
+    /// A failed action: which, and why.
+    Failed(usize, String),
+}
+
+/// A rule whose evaluation is being recorded.
+struct Pending {
+    rule: Arc<str>,
+    result: TraceResult,
+    error: Option<String>,
+    slots: Vec<Slot>,
+    omitted: u32,
+    /// Action reports seen so far (each output runs every action, in order).
+    actions: usize,
+    /// The rule's action count.
+    per_output: usize,
+}
+
+impl Pending {
+    fn add(&mut self, slot: impl FnOnce(usize) -> Slot) {
+        let index = self.actions % self.per_output.max(1);
+        self.actions += 1;
+        if self.slots.len() < TRACE_OUTPUTS_MAX {
+            self.slots.push(slot(index));
+        } else {
+            self.omitted = self.omitted.saturating_add(1);
+        }
+    }
+}
+
+/// The trace's view of one evaluation, fed by the report callback. The evaluation
+/// reports each rule's result, then each action's (an `ActionOk` is followed by its
+/// effect, in order), so the k-th `ActionOk` is the k-th effect.
+struct Capture {
+    at: SystemTime,
+    now_s: u64,
+    per_sec: u32,
+    open: Option<Pending>,
+    due: Vec<Pending>,
+    effects: usize,
+}
+
+impl Capture {
+    fn new(per_sec: u32) -> Self {
+        let at = SystemTime::now();
+        Self {
+            at,
+            now_s: at.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs()),
+            per_sec,
+            open: None,
+            due: Vec::new(),
+            effects: 0,
+        }
+    }
+
+    fn see(&mut self, rule: &Rule, outcome: Outcome<'_>) {
+        let (result, error) = match outcome {
+            Outcome::Passed => (TraceResult::Passed, None),
+            Outcome::NoResult => (TraceResult::NoResult, None),
+            Outcome::Failed(e) => (TraceResult::Failed, Some(e)),
+            Outcome::ActionOk => {
+                let effect = self.effects;
+                self.effects += 1;
+                if let Some(p) = &mut self.open {
+                    p.add(|_| Slot::Effect(effect));
+                }
+                return;
+            }
+            Outcome::ActionFailed(e) => {
+                if let Some(p) = &mut self.open {
+                    p.add(|i| Slot::Failed(i, clip(&e.to_string(), ERROR_TEXT_MAX).to_string()));
+                }
+                return;
+            }
+        };
+        self.due.extend(self.open.take());
+        // Per rule, per second; `no_result` on a window of its own, so a rule whose WHERE
+        // rarely passes does not spend its budget before the passes come.
+        let due = match result {
+            TraceResult::NoResult => rule.no_result_trace_due(self.now_s, self.per_sec),
+            _ => rule.trace_due(self.now_s, self.per_sec),
+        };
+        if due {
+            self.open = Some(Pending {
+                rule: rule.id().clone(),
+                result,
+                error: error.map(|e| clip(&e.to_string(), ERROR_TEXT_MAX).to_string()),
+                slots: Vec::new(),
+                omitted: 0,
+                actions: 0,
+                per_output: rule.action_count(),
+            });
+        }
+    }
+
+    /// Turn what is due into records, with the trigger (built once, only if any is).
+    fn finish(
+        mut self,
+        observe: &RulesObserve,
+        effects: &[(Arc<str>, Effect)],
+        trigger: impl FnOnce() -> TraceTrigger,
+    ) {
+        self.due.extend(self.open.take());
+        if self.due.is_empty() {
+            return;
+        }
+        let trigger = trigger();
+        for p in self.due {
+            let outputs = p
+                .slots
+                .into_iter()
+                .filter_map(|slot| match slot {
+                    Slot::Effect(i) => effects.get(i).map(|(_, e)| TraceOutput::of(e)),
+                    Slot::Failed(action_index, error) => Some(TraceOutput::Failed {
+                        action_index,
+                        error,
+                    }),
+                })
+                .collect();
+            observe.offer(TraceRecord {
+                rule: p.rule,
+                at: self.at,
+                trigger: trigger.clone(),
+                result: p.result,
+                error: p.error,
+                outputs,
+                outputs_omitted: p.omitted,
+            });
+        }
     }
 }
 

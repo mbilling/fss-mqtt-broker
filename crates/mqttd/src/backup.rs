@@ -2399,7 +2399,7 @@ const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz012
 #[allow(clippy::cast_possible_truncation)] // the 6/8-bit repacking IS the algorithm
 /// Standard base64 with padding. Hand-rolled rather than pulled in: payloads are the one
 /// thing an export must not mangle, and this is 20 lines with a round-trip test.
-fn b64_encode(bytes: &[u8]) -> String {
+pub(crate) fn b64_encode(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {
         let b = [

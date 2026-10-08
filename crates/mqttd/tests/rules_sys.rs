@@ -1,6 +1,6 @@
-//! Watching the running rules on `$SYS` (ADR 0084): the per-rule statistics, driven
-//! through the library — the rules a connection evaluates, the task main spawns, the hub
-//! command it publishes with.
+//! Watching the running rules on `$SYS` (ADR 0084): the per-rule statistics and the rule
+//! trace, driven through the library — the rules a connection evaluates, the tasks main
+//! spawns, the hub command they publish with.
 //!
 //! The statistics tests run on tokio's paused clock: a tick is exactly its interval after
 //! the last one, so rates are exact and "an interval change applies at once" is a
@@ -18,13 +18,15 @@ use mqtt_cluster::NodeId;
 use mqtt_codec::QoS;
 use mqtt_core::{AppProperties, ClientId};
 use mqtt_observability::metrics::Metrics;
-use mqtt_rules::RuleSet;
+use mqtt_rules::{ClientInfo, EventInput, RuleSet};
 use mqtt_storage::MemorySessionStore;
 use mqttd::hub::{Hub, HubCommand};
 use mqttd::ingress::{IngressCredit, OverloadMode};
 use mqttd::reload::LastReload;
-use mqttd::rules::{ConnRules, PublishFacts, Publisher, Rules, RulesObserve};
-use mqttd::rules_sys::run_stats;
+use mqttd::rules::{
+    ConnRules, PublishFacts, Publisher, Rules, RulesObserve, TraceRecord, TRACE_QUEUE_BYTES,
+};
+use mqttd::rules_sys::{record_json, run_stats, run_trace};
 use serde_json::Value;
 use tokio::sync::{mpsc, watch};
 use tokio::time::{timeout, Instant};
@@ -34,6 +36,7 @@ use tokio_util::sync::CancellationToken;
 struct Watched {
     rules: Rules,
     observe: Arc<RulesObserve>,
+    trace_rx: Option<mpsc::Receiver<TraceRecord>>,
     metrics: Arc<Metrics>,
     rules_tx: watch::Sender<Arc<RuleSet>>,
 }
@@ -59,13 +62,14 @@ fn settings(interval: u64, trace: bool, rate: u32) -> mqtt_config::Rules {
 fn watched(text: &str, config: &mqtt_config::Rules) -> Watched {
     let metrics = Arc::new(Metrics::new("test"));
     let (rules_tx, rx) = watch::channel(rule_set(text));
-    let observe = RulesObserve::new();
+    let (observe, trace_rx) = RulesObserve::new();
     observe.apply(config, None);
     let rules =
         Rules::new(rx, Arc::from("n1"), Some(metrics.clone())).with_observe(observe.clone());
     Watched {
         rules,
         observe,
+        trace_rx: Some(trace_rx),
         metrics,
         rules_tx,
     }
@@ -463,6 +467,296 @@ actions = [{ function = "console" }]
     }
 }
 
+const TRACED: &str = r#"
+[rules.pub]
+sql = 'SELECT payload.v AS v FROM "t/#"'
+actions = [
+  { function = "republish", args = { topic = "out/${v}", payload = "${v}" } },
+  { function = "console" },
+  { function = "republish", args = { topic = "${v}" } },
+]
+
+[rules.raw]
+sql = 'SELECT payload FROM "bin/#"'
+actions = []
+
+[rules.event]
+sql = 'SELECT clientid FROM "$events/client/connected"'
+actions = []
+"#;
+
+fn drain(rx: &mut mpsc::Receiver<TraceRecord>) -> Vec<TraceRecord> {
+    let mut out = Vec::new();
+    while let Ok(r) = rx.try_recv() {
+        out.push(r);
+    }
+    out
+}
+
+/// ADR 0084 D5: with the trace off an evaluation queues nothing.
+#[tokio::test]
+async fn the_trace_off_records_nothing() {
+    let mut w = watched(TRACED, &settings(0, false, 20));
+    let conn = w.rules.for_connection();
+    publish(&conn, "t/1", br#"{"v":"x"}"#);
+    assert!(drain(w.trace_rx.as_mut().unwrap()).is_empty());
+    assert_eq!(w.observe.trace_dropped(), 0);
+}
+
+/// Fire each kind of trigger at [`TRACED`]'s rules: three publishes (one past 1 KiB, one
+/// not UTF-8), a Will and a client's connect. Returns the records, as published.
+fn fire_every_trigger(w: &mut Watched) -> Vec<Value> {
+    let conn = w.rules.for_connection();
+    publish(&conn, "t/1", br#"{"v":"$SYS/x"}"#);
+    let long = format!("{{\"v\":\"{}\"}}", "a".repeat(3000));
+    publish(&conn, "t/2", long.as_bytes());
+    publish(&conn, "bin/1", b"\xff\x00\xfe");
+    w.rules.on_will(
+        &PublishFacts {
+            client: &ClientId("dying".into()),
+            publisher: &Publisher::default(),
+            topic: "t/will",
+            payload: &Bytes::from_static(br#"{"v":"bye"}"#),
+            qos: QoS::AtMostOnce,
+            retain: true,
+            dup: false,
+            app: &AppProperties::default(),
+            message_expiry: None,
+        },
+        |_| {},
+    );
+    let info = ClientInfo {
+        clientid: "ev1",
+        username: Some("eve"),
+        peer: None,
+        sockname: None,
+        node: "n1",
+    };
+    conn.fire_event(
+        &EventInput::client_connected(&info, 5, 30, true, 0, 0),
+        &mpsc::unbounded_channel().0,
+    );
+    drain(w.trace_rx.as_mut().unwrap())
+        .iter()
+        .map(|r| record_json("n1", r))
+        .collect()
+}
+
+/// ADR 0084 D5: a trace record shows the trigger — a publish, a Will or an event, with
+/// its client, username, topic, `QoS`, retain flag and up to 1 KiB of payload (as text, or
+/// base64 when it is not) — the SQL's result, and what each action rendered, a failed
+/// action as its index and error.
+#[tokio::test]
+async fn trace_records_show_the_trigger_and_what_the_rule_rendered() {
+    let mut w = watched(TRACED, &settings(0, true, 20));
+    let records = fire_every_trigger(&mut w);
+    assert_eq!(records.len(), 5, "{records:#?}");
+
+    let first = &records[0];
+    assert_eq!(
+        (first["node"].as_str(), first["rule"].as_str()),
+        (Some("n1"), Some("pub"))
+    );
+    assert_eq!(first["result"], "passed");
+    assert_eq!(first["error"], Value::Null);
+    let trigger = &first["trigger"];
+    assert_eq!(trigger["type"], "publish");
+    assert_eq!(trigger["topic"], "t/1");
+    assert_eq!(
+        (trigger["qos"].as_u64(), trigger["retain"].as_bool()),
+        (Some(1), Some(false))
+    );
+    assert_eq!(
+        (trigger["clientid"].as_str(), trigger["username"].as_str()),
+        (Some("c1"), Some("u1"))
+    );
+    assert_eq!(trigger["payload"], r#"{"v":"$SYS/x"}"#);
+    assert_eq!(trigger["payload_encoding"], "utf8");
+    assert_eq!(trigger["truncated"], false);
+    let outputs = first["outputs"].as_array().unwrap();
+    assert_eq!(outputs[0]["action"], "republish");
+    assert_eq!(outputs[0]["topic"], "out/$SYS/x");
+    assert_eq!(outputs[0]["payload"], "$SYS/x");
+    assert_eq!(
+        outputs[1],
+        serde_json::json!({"action": "console", "output": {"v": "$SYS/x"}})
+    );
+    assert_eq!(
+        outputs[2]["action_index"], 2,
+        "the third action, refused at render"
+    );
+    assert_eq!(
+        outputs[2]["error"],
+        "republish topic is reserved for the broker: $SYS/x"
+    );
+    assert_eq!(first["outputs_omitted"], 0);
+
+    let long = &records[1]["trigger"];
+    assert_eq!(long["payload_bytes"], 3008);
+    assert_eq!(long["truncated"], true);
+    assert_eq!(
+        long["payload"].as_str().unwrap().len(),
+        1024,
+        "1 KiB is copied"
+    );
+    assert_eq!(
+        records[1]["outputs"][0]["truncated"], true,
+        "an output's payload too"
+    );
+
+    let raw = &records[2]["trigger"];
+    assert_eq!(
+        (raw["payload"].as_str(), raw["payload_encoding"].as_str()),
+        (Some("/wD+"), Some("base64"))
+    );
+
+    let will = &records[3]["trigger"];
+    assert_eq!(
+        (will["type"].as_str(), will["clientid"].as_str()),
+        (Some("will"), Some("dying"))
+    );
+    assert_eq!(will["retain"], true);
+
+    assert_eq!(records[4]["rule"], "event");
+    assert_eq!(
+        records[4]["trigger"],
+        serde_json::json!({"type": "event", "event": "client.connected",
+                           "clientid": "ev1", "username": "eve"})
+    );
+}
+
+/// The `at` second of a record, for counting per second.
+fn second_of(r: &TraceRecord) -> u64 {
+    r.at.duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+/// ADR 0084 D5: at most `trace_rate` records per rule per second, and `no_result` ones on
+/// a budget of their own, so a rule whose WHERE rarely passes is still traced when it does.
+#[tokio::test]
+async fn the_trace_is_rate_limited_per_rule_and_no_result_has_its_own_budget() {
+    let mut w = watched(
+        r#"
+[rules.r]
+sql = 'SELECT * FROM "t/#" WHERE payload.ok = true'
+actions = []
+"#,
+        &settings(0, true, 3),
+    );
+    let conn = w.rules.for_connection();
+    for _ in 0..20 {
+        publish(&conn, "t/1", br#"{"ok":false}"#);
+    }
+    for _ in 0..20 {
+        publish(&conn, "t/1", br#"{"ok":true}"#);
+    }
+    let records = drain(w.trace_rx.as_mut().unwrap());
+    let mut per_second: BTreeMap<(u64, &str), usize> = BTreeMap::new();
+    for r in &records {
+        *per_second
+            .entry((second_of(r), r.result.as_str()))
+            .or_default() += 1;
+    }
+    assert!(per_second.values().all(|n| *n <= 3), "{per_second:?}");
+    for result in ["passed", "no_result"] {
+        assert!(
+            records
+                .iter()
+                .filter(|r| r.result.as_str() == result)
+                .count()
+                >= 3,
+            "{result} records were traced after 20 no_result ones: {per_second:?}"
+        );
+    }
+    assert_eq!(
+        w.observe.trace_dropped(),
+        0,
+        "a rate-limited evaluation is not a drop"
+    );
+}
+
+/// ADR 0084 D5: the trace task publishes at most max(`trace_rate`, 200) records a second
+/// for the node, each on its rule's trace topic, and counts the rest as dropped.
+#[tokio::test(start_paused = true)]
+async fn the_trace_task_holds_the_node_ceiling() {
+    let mut w = watched(
+        r#"
+[rules.a]
+sql = 'SELECT * FROM "t/#"'
+actions = []
+
+[rules.b]
+sql = 'SELECT * FROM "t/#"'
+actions = []
+
+[rules.c]
+sql = 'SELECT * FROM "t/#"'
+actions = []
+"#,
+        &settings(0, true, 100),
+    );
+    let conn = w.rules.for_connection();
+    for _ in 0..100 {
+        publish(&conn, "t/1", b"{}");
+    }
+    assert_eq!(w.observe.trace_dropped(), 0, "all 300 queued");
+    let (hub_tx, mut hub_rx) = mpsc::unbounded_channel();
+    tokio::spawn(run_trace(
+        w.trace_rx.take().unwrap(),
+        w.rules.clone(),
+        hub_tx,
+        plenty(),
+        CancellationToken::new(),
+    ));
+    let mut published = 0;
+    while let Ok(Some(cmd)) = timeout(Duration::from_millis(500), hub_rx.recv()).await {
+        let HubCommand::SysPublish { topic, payload, .. } = cmd else {
+            panic!("expected a SysPublish");
+        };
+        let doc: Value = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(
+            topic,
+            format!(
+                "$SYS/brokers/n1/trace/rules/{}",
+                doc["rule"].as_str().unwrap()
+            )
+        );
+        published += 1;
+    }
+    assert_eq!(published + w.observe.trace_dropped(), 300);
+    assert_eq!(published, 200, "the node ceiling, in one (paused) second");
+}
+
+/// ADR 0084 D5: queued records are bounded in bytes as well as in number: records past
+/// the byte budget are dropped and counted, long before the queue's 1024 slots fill.
+#[tokio::test]
+async fn the_trace_queue_is_bounded_in_bytes() {
+    let actions = (0..16)
+        .map(|i| format!("{{ function = \"republish\", args = {{ topic = \"o/{i}\", payload = \"${{payload}}\" }} }}"))
+        .collect::<Vec<_>>()
+        .join(",\n  ");
+    let mut w = watched(
+        &format!("[rules.big]\nsql = 'SELECT * FROM \"t/#\"'\nactions = [\n  {actions}\n]\n"),
+        &settings(0, true, 1000),
+    );
+    let conn = w.rules.for_connection();
+    let payload = vec![b'x'; 1024];
+    for _ in 0..400 {
+        publish(&conn, "t/1", &payload);
+    }
+    let records = drain(w.trace_rx.as_mut().unwrap());
+    let bytes: usize = records.iter().map(TraceRecord::weight).sum();
+    assert!(
+        records.len() < 400 && records.len() < 1024,
+        "{} queued",
+        records.len()
+    );
+    assert!(bytes <= TRACE_QUEUE_BYTES, "{bytes} bytes queued");
+    assert_eq!(records.len() as u64 + w.observe.trace_dropped(), 400);
+    assert!(records[0].outputs.len() == 16, "16 outputs of 1 KiB each");
+}
+
 /// ADR 0084: the statistics reach a real subscriber through the real hub — `QoS` 0, not
 /// retained, JSON — and never run a rule: the broker's own `$SYS` publishes are not
 /// evaluated, even by a rule whose `FROM` names `$SYS` (it loads with a warning).
@@ -559,5 +853,59 @@ actions = [{ function = "console" }]
     assert!(
         rendered.contains("mqttd_publish_received_total{qos=\"0\"}"),
         "a $SYS publish counts as a received QoS 0 publish:\n{rendered}"
+    );
+}
+
+/// ADR 0084 D5: a record lists at most 16 of what the rule rendered and counts the rest
+/// (a `FOREACH` runs every action once per output).
+#[tokio::test]
+async fn a_trace_record_lists_sixteen_outputs_and_counts_the_rest() {
+    let mut w = watched(
+        r#"
+[rules.many]
+sql = 'FOREACH payload.items DO item AS i FROM "many/#"'
+actions = [{ function = "console" }]
+"#,
+        &settings(0, true, 20),
+    );
+    let items = (0..20).map(|i| i.to_string()).collect::<Vec<_>>().join(",");
+    publish(
+        &w.rules.for_connection(),
+        "many/1",
+        format!("{{\"items\":[{items}]}}").as_bytes(),
+    );
+    let records = drain(w.trace_rx.as_mut().unwrap());
+    assert_eq!(records.len(), 1);
+    assert_eq!(
+        (records[0].outputs.len(), records[0].outputs_omitted),
+        (16, 4)
+    );
+}
+
+/// ADR 0084 D5: what the operator turns off stays off — records queued while the trace
+/// was on are not published once it is off.
+#[tokio::test(start_paused = true)]
+async fn records_queued_before_the_trace_turned_off_are_not_published() {
+    let mut w = watched(TRACED, &settings(0, true, 20));
+    publish(&w.rules.for_connection(), "t/1", br#"{"v":"x"}"#);
+    w.observe.apply(&settings(0, false, 20), None);
+    let (hub_tx, mut hub_rx) = mpsc::unbounded_channel();
+    tokio::spawn(run_trace(
+        w.trace_rx.take().unwrap(),
+        w.rules.clone(),
+        hub_tx,
+        plenty(),
+        CancellationToken::new(),
+    ));
+    assert!(
+        timeout(Duration::from_secs(60), hub_rx.recv())
+            .await
+            .is_err(),
+        "a record was published after the trace was turned off"
+    );
+    assert_eq!(
+        w.observe.trace_dropped(),
+        0,
+        "a discarded record is not a drop"
     );
 }

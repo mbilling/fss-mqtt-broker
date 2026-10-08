@@ -764,7 +764,7 @@ async fn main() -> Result<(), StartupError> {
         placement: placement.clone(),
         connector: peer_tls.as_ref().map(|t| t.connector.clone()),
     };
-    let (policy, mut reloader) = client_policy(
+    let (policy, mut reloader, trace_rx) = client_policy(
         &live_config,
         &node_id,
         Some(proxy),
@@ -785,8 +785,9 @@ async fn main() -> Result<(), StartupError> {
     // Every reload attempt, for the rule statistics (ADR 0084).
     let last_reload = Arc::new(reload::LastReload::default());
     reloader.attach_last_reload(last_reload.clone());
-    // Watching the running rules (ADR 0084): the statistics task publishes on $SYS until
-    // the drain begins, idles while it is off, and follows a reload's settings at once.
+    // Watching the running rules (ADR 0084): the statistics and trace tasks publish on
+    // $SYS. Both run until the drain begins, idle
+    // while their settings are off, and follow a reload's settings at once.
     if let Some(rules) = &policy.rules {
         tokio::spawn(mqttd::rules_sys::run_stats(
             rules.clone(),
@@ -795,6 +796,13 @@ async fn main() -> Result<(), StartupError> {
             ingress.clone(),
             last_reload.clone(),
             started_at,
+            shutdown.clone(),
+        ));
+        tokio::spawn(mqttd::rules_sys::run_trace(
+            trace_rx,
+            rules.clone(),
+            hub_tx.clone(),
+            ingress.clone(),
             shutdown.clone(),
         ));
     }
@@ -1546,6 +1554,14 @@ async fn start_client_listeners(
     Ok(())
 }
 
+/// What [`client_policy`] builds: the connection policy, the reloader that swaps it, and
+/// the receiving end of the rule trace's queue (ADR 0084).
+type ClientPolicy = (
+    Arc<conn::ConnPolicy>,
+    reload::Reloader,
+    tokio::sync::mpsc::Receiver<mqttd::rules::TraceRecord>,
+);
+
 /// Build the connection policy — authentication, topic authorization, and
 /// auditing — from the `MQTTD_*` shims (ADR 0004). Everything is deny-by-default;
 /// the insecure fallbacks are explicit and loudly logged.
@@ -1561,7 +1577,7 @@ fn client_policy(
     shutdown: tokio_util::sync::CancellationToken,
     metrics: Arc<mqtt_observability::metrics::Metrics>,
     ingress: Arc<mqttd::ingress::IngressCredit>,
-) -> Result<(Arc<conn::ConnPolicy>, reload::Reloader), Box<dyn std::error::Error>> {
+) -> Result<ClientPolicy, Box<dyn std::error::Error>> {
     // ADR 0066 T3: with an export endpoint configured, every audit record —
     // genesis and the closing shutdown record included — also ships to the SIEM
     // as RFC 5424 syslog (shed-and-count, never blocking the broker).
@@ -1638,7 +1654,7 @@ fn client_policy(
     let (rules_tx, rules_rx) = tokio::sync::watch::channel(Arc::new(initial_rules));
     // Watched from the start (ADR 0084), with the startup `[rules]` settings; a reload's
     // commit hook applies later ones.
-    let observe = mqttd::rules::RulesObserve::new();
+    let (observe, trace_rx) = mqttd::rules::RulesObserve::new();
     {
         let snap = live
             .read()
@@ -1684,7 +1700,7 @@ fn client_policy(
         ingress: Some(ingress),
         rules: Some(rules),
     });
-    Ok((policy, reloader))
+    Ok((policy, reloader, trace_rx))
 }
 
 /// Why any client may read the rule trace, when one can (ADR 0084): no ACL file, or one

@@ -2634,3 +2634,89 @@ actions = [{ function = "republish", args = { topic = "alerts/${clientid}", payl
         "node B evaluated a forwarded message"
     );
 }
+
+// ---------------------------------------------------------------------------------------
+// Watching the running rules on $SYS (ADR 0084)
+// ---------------------------------------------------------------------------------------
+
+/// ADR 0084: the rule statistics and the trace, configured from the environment the way
+/// the live demo stack configures them, reach a real subscriber of the real binary — the
+/// summary, the rule's message with its counted evaluation, and the trace record of the
+/// publish that fired it. `#` does not cover `$SYS`, so the subscriber names the trees.
+/// A client publishing into `$SYS` is refused (v5 `0x87`), so it cannot forge them.
+#[tokio::test]
+async fn env_configured_rule_statistics_and_trace_reach_a_subscriber() {
+    let dir = tempfile::tempdir().unwrap();
+    write_rules(
+        dir.path(),
+        r#"[rules.watched]
+sql = 'SELECT payload.v AS v FROM "w/#"'
+actions = [{ function = "republish", args = { topic = "w-out/${v}" } }]
+"#,
+    );
+    let setup = Setup {
+        env: vec![
+            ("MQTTD_RULES_SYS_INTERVAL", "1".to_string()),
+            ("MQTTD_RULES_TRACE", "1".to_string()),
+            ("MQTTD_RULES_TRACE_RATE", "5".to_string()),
+        ],
+        ..Setup::default()
+    };
+    let broker = start(dir.path(), "sys-node", &setup).await;
+    let mut sub = Client::connect_v5_ok(broker.addr, "watcher").await;
+    assert_eq!(
+        subscribe(&mut sub, 1, "$SYS/brokers/+/rules/#", QoS::AtMostOnce).await,
+        [0]
+    );
+    assert_eq!(
+        subscribe(&mut sub, 2, "$SYS/brokers/+/trace/rules/+", QoS::AtMostOnce).await,
+        [0]
+    );
+    let mut publ = Client::connect_v5_ok(broker.addr, "publisher").await;
+    assert_eq!(
+        publish_acked(&mut publ, "$SYS/brokers/sys-node/rules", b"{}", 1).await,
+        0x87,
+        "a client cannot publish into $SYS"
+    );
+    assert_eq!(publish_acked(&mut publ, "w/1", br#"{"v":"x"}"#, 2).await, 0);
+
+    let (mut summary, mut counted, mut traced) = (false, false, false);
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !(summary && counted && traced) {
+        assert!(
+            Instant::now() < deadline,
+            "summary {summary}, counted {counted}, traced {traced} after 15 s; log tail:\n{}",
+            broker.log.tail(30)
+        );
+        let Recv::Packet(Packet::Publish(p)) = sub.recv_bounded(Duration::from_secs(5)).await
+        else {
+            continue;
+        };
+        assert_eq!((p.qos, p.retain), (QoS::AtMostOnce, false));
+        let doc: serde_json::Value = serde_json::from_slice(&p.payload).unwrap();
+        match p.topic.as_str() {
+            "$SYS/brokers/sys-node/rules" => {
+                assert_eq!(doc["rules"], 1);
+                assert_eq!(doc["interval_secs"], 1);
+                assert_eq!(
+                    (doc["trace"].as_bool(), doc["trace_rate"].as_u64()),
+                    (Some(true), Some(5))
+                );
+                summary = true;
+            }
+            "$SYS/brokers/sys-node/rules/watched" => {
+                counted |= doc["counts"]["passed"] == 1;
+            }
+            "$SYS/brokers/sys-node/trace/rules/watched" => {
+                assert_eq!(doc["trigger"]["topic"], "w/1");
+                assert_eq!(doc["trigger"]["clientid"], "publisher");
+                assert_eq!(doc["outputs"][0]["topic"], "w-out/x");
+                traced = true;
+            }
+            other => panic!("nothing else is published on $SYS: {other}"),
+        }
+    }
+    broker
+        .wait_log(" WARN mqttd::rules: INSECURE: the rule trace is on and no MQTTD_ACL_FILE is configured: any client can subscribe to $SYS/brokers/+/trace/rules/+ and read what the rules see (ADR 0084)")
+        .await;
+}

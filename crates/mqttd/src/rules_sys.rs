@@ -1,8 +1,8 @@
 //! Watching the running rules on `$SYS` ([ADR 0084](../../../docs/adr/0084-watching-and-editing-rules-live.md)):
-//! the per-rule statistics.
+//! the per-rule statistics and the rule trace.
 //!
-//! Spawned at boot and stopped by the shutdown token, which the broker cancels right
-//! after telling the hub it is draining:
+//! Two tasks, spawned at boot and stopped by the shutdown token, which the broker cancels
+//! right after telling the hub it is draining:
 //!
 //! - [`run_stats`] publishes, every `[rules] sys_interval_secs`, a summary on
 //!   `$SYS/brokers/<node>/rules` and one message per rule — enabled or not — on
@@ -10,13 +10,16 @@
 //!   without creating a series, cumulative since the broker started and keyed by rule
 //!   id; the rates are their growth over the measured time between two ticks. An
 //!   interval change applies at once.
+//! - [`run_trace`] turns the [`TraceRecord`]s evaluations queue into JSON on
+//!   `$SYS/brokers/<node>/trace/rules/<id>`, at most max(`trace_rate`, 200) a second for
+//!   the node.
 //!
 //! Every message is `QoS` 0, never retained, routed by [`HubCommand::SysPublish`], and
 //! takes node-pool ingress credit first (ADR 0082): when the pool is short the rest of a
-//! statistics tick is skipped and counted, so the statistics yield to clients under
-//! pressure. Nothing secret goes on `$SYS`: no SQL, description, actions, file path,
-//! writer or reload error text, and a rule's last error text only while the trace —
-//! which shows payloads anyway — is on.
+//! statistics tick is skipped and a trace record dropped, each counted, so both yield to
+//! clients under pressure. Nothing secret goes on `$SYS`: no SQL, description, actions,
+//! file path, writer or reload error text, and a rule's last error text only while the
+//! trace — which shows payloads anyway — is on.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -25,7 +28,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use bytes::Bytes;
 use mqtt_observability::metrics::{Metrics, RuleCounts};
 use mqtt_rules::RuleSet;
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -34,8 +37,13 @@ use crate::hub::HubCommand;
 use crate::ingress::IngressCredit;
 use crate::reload::LastReload;
 use crate::rules::{
-    rule_def, ErrorKind, LastError, Rules, RulesObserve, FAILURE_WARN_INTERVAL_SECS,
+    rule_def, ErrorKind, LastError, Rules, RulesObserve, TraceOutput, TracePayload, TraceRecord,
+    TraceTrigger, TracedMessage, FAILURE_WARN_INTERVAL_SECS,
 };
+
+/// The node-wide floor of the trace's ceiling, in records a second: the ceiling is
+/// max(`trace_rate`, this), on top of each rule's own `trace_rate`.
+pub const TRACE_NODE_FLOOR: u32 = 200;
 
 /// RFC 3339 in UTC with milliseconds (`2026-10-08T12:34:56.789Z`), never the host's zone.
 #[must_use]
@@ -328,6 +336,149 @@ impl Stats {
     }
 }
 
+/// Publish the trace records `rx` receives until `shutdown` (ADR 0084 D5). Returns at
+/// once when the rules are not watched.
+pub async fn run_trace(
+    mut rx: mpsc::Receiver<TraceRecord>,
+    rules: Rules,
+    hub: mpsc::UnboundedSender<HubCommand>,
+    ingress: Arc<IngressCredit>,
+    shutdown: CancellationToken,
+) {
+    let Some(observe) = rules.observe().cloned() else {
+        return;
+    };
+    let node = rules.node().to_string();
+    // The node-wide ceiling: (start of the current second, records sent in it).
+    let mut window = (Instant::now(), 0u32);
+    loop {
+        let record = tokio::select! {
+            () = shutdown.cancelled() => return,
+            r = rx.recv() => match r {
+                Some(r) => r,
+                None => return,
+            },
+        };
+        observe.released(record.weight());
+        // Turned off since it was queued: what the operator turned off stays off.
+        if !observe.tracing() {
+            continue;
+        }
+        let now = Instant::now();
+        if now.duration_since(window.0) >= Duration::from_secs(1) {
+            window = (now, 0);
+        }
+        if window.1 >= observe.trace_rate().max(TRACE_NODE_FLOOR) {
+            observe.count_trace_dropped();
+            continue;
+        }
+        window.1 += 1;
+        let topic = format!("$SYS/brokers/{node}/trace/rules/{}", record.rule);
+        let payload = record_json(&node, &record).to_string();
+        if !sys_publish(&hub, &ingress, topic, payload) {
+            observe.count_trace_dropped();
+        }
+    }
+}
+
+/// A payload as JSON fields: the kept bytes as UTF-8 text when they are (a character cut
+/// at the end of a kept prefix still is), base64 otherwise, with the whole length and
+/// whether only part was kept.
+fn payload_fields(p: &TracePayload, out: &mut Map<String, Value>) {
+    let (text, encoding) = match std::str::from_utf8(&p.bytes) {
+        Ok(s) => (s.to_string(), "utf8"),
+        Err(e) if p.truncated() && e.error_len().is_none() => (
+            String::from_utf8_lossy(&p.bytes[..e.valid_up_to()]).into_owned(),
+            "utf8",
+        ),
+        Err(_) => (crate::backup::b64_encode(&p.bytes), "base64"),
+    };
+    out.insert("payload".into(), json!(text));
+    out.insert("payload_encoding".into(), json!(encoding));
+    out.insert("payload_bytes".into(), json!(p.len));
+    out.insert("truncated".into(), json!(p.truncated()));
+}
+
+fn message_json(kind: &str, m: &TracedMessage) -> Value {
+    let mut out = Map::new();
+    out.insert("type".into(), json!(kind));
+    out.insert("topic".into(), json!(m.topic));
+    out.insert("qos".into(), json!(m.qos));
+    out.insert("retain".into(), json!(m.retain));
+    out.insert("clientid".into(), json!(m.clientid));
+    out.insert("username".into(), json!(m.username));
+    payload_fields(&m.payload, &mut out);
+    Value::Object(out)
+}
+
+fn trigger_json(t: &TraceTrigger) -> Value {
+    match t {
+        TraceTrigger::Publish(m) => message_json("publish", m),
+        TraceTrigger::Will(m) => message_json("will", m),
+        TraceTrigger::Event {
+            event,
+            clientid,
+            username,
+        } => json!({
+            "type": "event",
+            "event": event,
+            "clientid": clientid,
+            "username": username,
+        }),
+    }
+}
+
+fn output_json(o: &TraceOutput) -> Value {
+    match o {
+        TraceOutput::Republish {
+            topic,
+            qos,
+            retain,
+            payload,
+        } => {
+            let mut out = Map::new();
+            out.insert("action".into(), json!("republish"));
+            out.insert("topic".into(), json!(topic));
+            out.insert("qos".into(), json!(qos));
+            out.insert("retain".into(), json!(retain));
+            payload_fields(payload, &mut out);
+            Value::Object(out)
+        }
+        // The selected fields, as the JSON they are; cut ones (past 1 KiB) as text.
+        TraceOutput::Console { output, len } if output.len() == *len => {
+            match serde_json::from_str::<Value>(output) {
+                Ok(v) => json!({"action": "console", "output": v}),
+                Err(_) => json!({"action": "console", "output": output}),
+            }
+        }
+        TraceOutput::Console { output, len } => json!({
+            "action": "console",
+            "output": output,
+            "output_bytes": len,
+            "truncated": true,
+        }),
+        TraceOutput::Failed {
+            action_index,
+            error,
+        } => json!({"action_index": action_index, "error": error}),
+    }
+}
+
+/// A trace record as the JSON published for it.
+#[must_use]
+pub fn record_json(node: &str, r: &TraceRecord) -> Value {
+    json!({
+        "node": node,
+        "rule": &*r.rule,
+        "at": rfc3339_millis(r.at),
+        "trigger": trigger_json(&r.trigger),
+        "result": r.result.as_str(),
+        "error": r.error,
+        "outputs": r.outputs.iter().map(output_json).collect::<Vec<_>>(),
+        "outputs_omitted": r.outputs_omitted,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -340,5 +491,39 @@ mod tests {
         assert_eq!(rfc3339_millis(t), "2026-03-31T23:33:20.123Z");
         let leap = UNIX_EPOCH + Duration::from_millis(951_782_400_999);
         assert_eq!(rfc3339_millis(leap), "2000-02-29T00:00:00.999Z");
+    }
+
+    /// A kept payload is UTF-8 text when it is, a cut through a character at the end of
+    /// a truncated copy included, and base64 otherwise.
+    #[test]
+    fn a_payload_is_text_when_it_is_and_base64_when_not() {
+        let fields = |bytes: &'static [u8], len: usize| {
+            let mut out = Map::new();
+            payload_fields(
+                &TracePayload {
+                    bytes: Bytes::from_static(bytes),
+                    len,
+                },
+                &mut out,
+            );
+            Value::Object(out)
+        };
+        let v = fields(b"{\"t\":1}", 7);
+        assert_eq!(v["payload"], "{\"t\":1}");
+        assert_eq!(v["payload_encoding"], "utf8");
+        assert_eq!(v["truncated"], false);
+        // "é" is two bytes; a copy that ends between them is still text.
+        let v = fields(b"ab\xC3", 4);
+        assert_eq!(
+            (v["payload"].as_str(), v["payload_encoding"].as_str()),
+            (Some("ab"), Some("utf8"))
+        );
+        assert_eq!(
+            (v["payload_bytes"].as_u64(), v["truncated"].as_bool()),
+            (Some(4), Some(true))
+        );
+        let v = fields(b"\x00\xFF\x10", 3);
+        assert_eq!(v["payload"], "AP8Q");
+        assert_eq!(v["payload_encoding"], "base64");
     }
 }
