@@ -2103,7 +2103,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 
 ## `crates/mqttd/tests/rules_binary.rs` — 40 test(s)
 
-- `a_closed_stdout_ends_the_offline_commands_quietly`
+- `a_closed_stdout_neither_panics_a_command_nor_changes_its_exit_status`
 - `a_failing_action_is_counted_failed_and_warned`
 - `a_failing_rule_never_affects_the_original_and_is_counted_failed`
 - `a_graceful_shutdown_forwards_every_shutdown_event_to_a_watcher_on_another_node`

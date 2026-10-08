@@ -214,6 +214,7 @@ use mqtt_storage::persistent_retained::PersistentRetainedStore;
 use mqtt_storage::{MemorySessionStore, OverflowPolicy, QueueLimits, RetainedStore, SessionStore};
 use mqttd::accept::accept_backoff;
 use mqttd::{admission, cluster, config_watch, conn, hub, peer, reload};
+use mqttd::{out, outln};
 use std::path::Path;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -278,7 +279,7 @@ async fn main() -> Result<(), StartupError> {
         .skip(1)
         .any(|a| a == "--version" || a == "-V")
     {
-        println!("mqttd {}", env!("CARGO_PKG_VERSION"));
+        outln!("mqttd {}", env!("CARGO_PKG_VERSION"));
         std::process::exit(0);
     }
     if std::env::args().skip(1).any(|a| a == "--help" || a == "-h") {
@@ -4447,31 +4448,6 @@ fn reject_invalid_cli() {
     }
 }
 
-/// `print!` for the offline commands, whose output may go to a pipe that closes early
-/// (`mqttd --check-rules rules.toml | head -1`): a closed stdout ends the process quietly,
-/// with exit status 0, where `print!` would panic. The broker itself logs to stderr and
-/// never writes stdout, and SIGPIPE stays ignored, as a server's must.
-macro_rules! out {
-    ($($arg:tt)*) => {{
-        use std::io::Write as _;
-        if let Err(e) = write!(std::io::stdout(), $($arg)*) {
-            if e.kind() == std::io::ErrorKind::BrokenPipe {
-                std::process::exit(0);
-            }
-            eprintln!("error: cannot write to stdout: {e}");
-            std::process::exit(1);
-        }
-    }};
-}
-
-/// [`out!`] with a newline, for `println!`.
-macro_rules! outln {
-    ($($arg:tt)*) => {{
-        out!($($arg)*);
-        out!("\n");
-    }};
-}
-
 /// One-screen usage for `--help`.
 fn print_usage() {
     // A raw string, laid out as printed: a `\` line continuation would strip the
@@ -4745,7 +4721,7 @@ fn check_tls() -> ! {
     let config = load_config_or_exit();
     let findings = mqttd::tls_check::check_config(&config, std::time::SystemTime::now());
     for f in &findings {
-        println!("{f}");
+        outln!("{f}");
     }
     let count = |level| findings.iter().filter(|f| f.level == level).count();
     let (failed, warned) = (
@@ -4753,10 +4729,10 @@ fn check_tls() -> ! {
         count(mqttd::tls_check::Level::Warn),
     );
     if failed > 0 {
-        println!("TLS check FAILED: {failed} failure(s), {warned} warning(s)");
+        outln!("TLS check FAILED: {failed} failure(s), {warned} warning(s)");
         std::process::exit(1);
     }
-    println!("TLS check OK: {warned} warning(s)");
+    outln!("TLS check OK: {warned} warning(s)");
     std::process::exit(0);
 }
 
@@ -4804,7 +4780,7 @@ async fn probe_health() -> ! {
     // than building a nested one (which panics).
     match probe_once(&target, &path).await {
         Ok(200) => {
-            println!("{path} 200");
+            outln!("{path} 200");
             std::process::exit(0);
         }
         Ok(status) => {
@@ -4912,9 +4888,10 @@ fn hash_password_cli() -> ! {
 
     match mqtt_auth::password::hash_password(password) {
         Ok(hash) => {
-            match username {
-                Some(u) => println!("{u}:{hash}"),
-                None => println!("{hash}"),
+            if let Some(u) = username {
+                outln!("{u}:{hash}");
+            } else {
+                outln!("{hash}");
             }
             std::process::exit(0);
         }
@@ -4953,11 +4930,11 @@ fn run_decommission() -> ! {
         eprintln!("decommission: cannot signal pid {raw_pid}: {e}");
         std::process::exit(2);
     }
-    println!("decommission: sent SIGUSR1 to pid {raw_pid}; waiting for drain + graceful shutdown");
+    outln!("decommission: sent SIGUSR1 to pid {raw_pid}; waiting for drain + graceful shutdown");
     let deadline = std::time::Instant::now() + timeout;
     loop {
         if broker_exited(raw_pid) {
-            println!("decommission: pid {raw_pid} exited — drain complete");
+            outln!("decommission: pid {raw_pid} exited — drain complete");
             std::process::exit(0);
         }
         if std::time::Instant::now() >= deadline {
@@ -5032,15 +5009,15 @@ fn run_backup() -> ! {
         eprintln!("backup: cannot signal pid {raw_pid}: {e}");
         std::process::exit(2);
     }
-    println!(
+    outln!(
         "backup: sent SIGUSR2 to pid {raw_pid}; waiting for a new export under {}",
         dir.display()
     );
     let deadline = std::time::Instant::now() + timeout;
     loop {
         if let Some(new) = backup_files(&dir).into_iter().find(|f| !before.contains(f)) {
-            println!("backup: wrote {}", new.display());
-            println!(
+            outln!("backup: wrote {}", new.display());
+            outln!(
                 "backup: this is ONE NODE's readable state, not a cluster snapshot — back up \
                  every node (see docs/OPERATIONS.md)"
             );

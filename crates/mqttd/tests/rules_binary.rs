@@ -9,7 +9,7 @@
 //! directory — and then talks MQTT 3.1.1 and 5 to it over TCP, reads `/metrics` from
 //! `MQTTD_HEALTH_BIND`, signals it, restarts it and reads its log. The offline commands
 //! (`--check-rules`, `--rule-test`) are run as a user runs them, and their output is
-//! compared byte for byte.
+//! compared byte for byte; the other command-line modes are run with stdout closed.
 //!
 //! Each test's doc comment names the documented claim it pins and how it would fail if
 //! the claim broke.
@@ -19,6 +19,7 @@ mod listen_wait;
 mod proc_common;
 
 use std::fmt::Write as _;
+use std::io::Write as _;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::process::{Command, ExitStatus, Stdio};
@@ -657,32 +658,55 @@ fn check_rules_accepts_a_valid_file_and_lists_every_rule() {
     assert_eq!(ran.stderr, "");
 }
 
-/// A reader that goes away first (`mqttd --check-rules rules.toml | head -1`) ends the
-/// offline commands quietly, with exit status 0, not with a panic and exit status 101:
-/// `--check-rules`, `--rule-test` and `--help` write stdout through one helper that treats
-/// a closed pipe as the end of the output.
+/// A reader that goes away first (`mqttd --check-rules rules.toml | head -1`) neither
+/// panics a command-line mode (exit status 101) nor changes its exit status: every mode
+/// writes stdout through one helper that treats a closed pipe as the end of the output, and
+/// the command finishes as it would have. A failed `--check-tls` still exits 1.
 #[test]
-fn a_closed_stdout_ends_the_offline_commands_quietly() {
+fn a_closed_stdout_neither_panics_a_command_nor_changes_its_exit_status() {
     let dir = tempfile::tempdir().unwrap();
     write_rules(dir.path(), GOOD_RULES);
     let path = dir.path().join("rules.toml").display().to_string();
-    let commands: [&[&str]; 3] = [
-        &["--check-rules", &path],
-        &[
-            "--rule-test",
-            "--sql",
-            "SELECT 1 AS x FROM \"t\"",
-            "--topic",
-            "t",
-            "--payload",
-            "{}",
-        ],
-        &["--help"],
+    // TLS material that does not exist: `--check-tls` writes its findings, then fails.
+    let broken_tls = dir.path().join("broken-tls.toml");
+    std::fs::write(
+        &broken_tls,
+        format!(
+            "[durable]\nenabled = false\n\n[tls]\ncert = \"{0}/missing-cert.pem\"\n\
+             key = \"{0}/missing-key.pem\"\n",
+            dir.path().display()
+        ),
+    )
+    .unwrap();
+    let broken_tls = broken_tls.display().to_string();
+    let config = dir.path().join("mqttd.toml");
+    std::fs::write(&config, "[durable]\nenabled = false\n").unwrap();
+    let config = config.display().to_string();
+    let rule_test: &[&str] = &[
+        "--rule-test",
+        "--sql",
+        "SELECT 1 AS x FROM \"t\"",
+        "--topic",
+        "t",
+        "--payload",
+        "{}",
     ];
-    for args in commands {
+    // (arguments, stdin, the exit status the command has with its output read)
+    let commands: [(&[&str], &str, i32); 8] = [
+        (&["--check-rules", &path], "", 0),
+        (rule_test, "", 0),
+        (&["--help"], "", 0),
+        (&["--version"], "", 0),
+        (&["--check-config", "--config", &config], "", 0),
+        (&["--print-config", "--config", &config], "", 0),
+        (&["--hash-password", "alice"], "correct horse", 0),
+        (&["--check-tls", "--config", &broken_tls], "", 1),
+    ];
+    for (args, stdin, code) in commands {
         let mut child = ChildGuard(
             mqttd()
                 .args(args)
+                .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .spawn()
@@ -690,12 +714,15 @@ fn a_closed_stdout_ends_the_offline_commands_quietly() {
         );
         // The reader is gone before the command has started, let alone written.
         drop(child.0.stdout.take());
+        let mut input = child.0.stdin.take().expect("stdin piped");
+        input.write_all(stdin.as_bytes()).expect("write stdin");
+        drop(input);
         let stderr = read_all(child.0.stderr.take().expect("stderr piped"));
         let status = wait_bounded(&mut child, &format!("{args:?}"));
         let stderr = stderr.join().expect("stderr reader");
         assert_eq!(
             status.code(),
-            Some(0),
+            Some(code),
             "mqttd {args:?}, stdout closed: {stderr}"
         );
         assert!(

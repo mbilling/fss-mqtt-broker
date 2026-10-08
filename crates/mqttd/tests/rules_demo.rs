@@ -5,11 +5,11 @@
 //! `simulate.py --dry-run` writes for the README's seed and start time), replays it through
 //! the REAL `mqttd` binary loading `demo/rules/rules.toml`, one connection per simulated
 //! client (a device or its gateway) as the simulator's player makes them, and asserts that
-//! the derived messages a
-//! `QoS` 1 subscriber receives are exactly `rules_demo.expected` beside this file: topic,
-//! `QoS`, retain flag and payload, with nothing missing and nothing extra. It also checks
-//! that the simulator is deterministic, that the rules file passes `--check-rules` with no
-//! warning, and that every derived message the README quotes is one the fixture produces.
+//! the derived messages a `QoS` 1 subscriber receives are exactly `rules_demo.expected`
+//! beside this file: topic, `QoS`, retain flag and payload, with nothing missing and
+//! nothing extra. It also checks that the simulator is deterministic, that the rules file
+//! passes `--check-rules` with no warning, and that every derived message the README quotes
+//! is one the fixture produces.
 //!
 //! The fixture is generated, not stored: it is about a megabyte, and everything under
 //! `demo/` is also copied into the `mqttui` bundle. After changing the simulator or the
@@ -439,8 +439,8 @@ async fn collect(broker: &Broker, watcher: &mut Client, want: Option<usize>) -> 
 // The tests
 // ---------------------------------------------------------------------------------------
 
-/// The fixture replayed through the real broker derives exactly `expected.txt`, and no
-/// rule fails along the way.
+/// The fixture replayed through the real broker derives exactly `rules_demo.expected`, and
+/// no rule fails along the way.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_demo_derives_exactly_what_it_shows() {
     let events = parse_fixture(&fixture());
@@ -480,7 +480,7 @@ async fn the_demo_derives_exactly_what_it_shows() {
 
     assert!(
         got.len() > 1_000,
-        "the demo's ten minutes derive more than {} messages",
+        "the demo's ten minutes derived only {} messages",
         got.len()
     );
     // Blessing writes what the broker derived as the new expected output, then checks it
