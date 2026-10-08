@@ -1480,7 +1480,10 @@ impl Hub {
         app: &AppProperties,
         expires_at: Option<u64>,
     ) {
-        if self.retained_windows.is_empty() {
+        // Nor one in `$SYS/`, as at the subscribe replay: an owner that predates ADR 0084
+        // can still commit a client's retained `$SYS` value, and this path would hand it
+        // to a fresh subscriber the replay just kept it from.
+        if self.retained_windows.is_empty() || mqtt_core::is_reserved_topic(topic) {
             return;
         }
         // An already-expired value is not delivered [MQTT-3.3.2-5]; the remaining

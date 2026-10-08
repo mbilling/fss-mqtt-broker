@@ -15311,6 +15311,44 @@ mod tests {
         );
     }
 
+    /// ADR 0084: a committed retained value in `$SYS/` from an owner that predates the
+    /// reservation does not reach a fresh subscriber through the window either, just as the
+    /// subscribe replay never hands one out. A Mosquitto bridge's state topic is not
+    /// reserved, so its commit is delivered.
+    #[tokio::test]
+    async fn a_windowed_commit_in_sys_is_never_delivered() {
+        let (tx, _durable, _placement) = start_hub_with_durable_retained(&[]);
+        let (mut sub, _) = attach(&tx, "fresh", 1, true).await;
+        subscribe(&tx, "fresh", "$SYS/#");
+        for (topic, payload) in [
+            ("$SYS/brokers/node-a/rules", &b"forged"[..]),
+            ("$SYS/broker/connection/edge-1/state", &b"1"[..]),
+        ] {
+            tx.send(HubCommand::RemoteRetainedUpdate {
+                topic: topic.into(),
+                payload: Bytes::copy_from_slice(payload),
+                qos: 0,
+                epoch: 1,
+                offset: 1,
+                app: AppProperties::default(),
+                expires_at: None,
+            })
+            .unwrap();
+        }
+        let p = recv_packet(&mut sub)
+            .await
+            .expect("the bridge's state is not reserved, so its commit is delivered");
+        assert_eq!(
+            payload_of(&p),
+            b"1",
+            "the reserved commit must not come first"
+        );
+        assert!(
+            recv_packet(&mut sub).await.is_none(),
+            "nothing in the reserved tree is delivered"
+        );
+    }
+
     /// Issue #219 acceptance, case 2: the landing node DID know the fresh
     /// subscriber (interest arrived in time) and forwarded the live copy — the
     /// fan-out applying afterwards must not deliver the same value again. The
