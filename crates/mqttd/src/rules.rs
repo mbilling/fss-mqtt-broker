@@ -762,6 +762,8 @@ pub struct RulesObserve {
     last_errors: Mutex<HashMap<Arc<str>, LastError>>,
     /// When each rule's evaluations last grew, as the statistics saw it at a tick.
     last_active: Mutex<HashMap<Arc<str>, SystemTime>>,
+    /// Why anyone may read the trace, as the last [`apply`](Self::apply) was told.
+    exposed: Mutex<Option<String>>,
 }
 
 impl RulesObserve {
@@ -781,15 +783,24 @@ impl RulesObserve {
             stats_dropped: AtomicU64::new(0),
             last_errors: Mutex::new(HashMap::new()),
             last_active: Mutex::new(HashMap::new()),
+            exposed: Mutex::new(None),
         });
         (observe, trace_rx)
     }
 
     /// Apply the committed `[rules]` settings. `exposed` says why anyone may read the
-    /// trace (no ACL file, an ACL whose default is allow), when that is so: with the
-    /// trace on it is logged as `INSECURE:`.
+    /// trace (no ACL file, an ACL whose default is allow), when that is so: it is logged
+    /// as `INSECURE:` when the trace turns on, and when the reason changes while it is
+    /// on — not again on every reload.
     pub fn apply(&self, config: &mqtt_config::Rules, exposed: Option<&str>) {
         let new = RulesSysSettings::from(config);
+        let was_exposed = std::mem::replace(
+            &mut *self
+                .exposed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            exposed.map(str::to_string),
+        );
         let was_tracing = self.trace.swap(new.trace, Relaxed);
         self.trace_rate.store(new.trace_rate, Relaxed);
         if new.trace && !was_tracing {
@@ -803,7 +814,9 @@ impl RulesObserve {
         } else if !new.trace && was_tracing {
             info!("rule trace is off (ADR 0084)");
         }
-        if let (true, Some(why)) = (new.trace, exposed) {
+        // Said as the trace turns on, and again only when why it is readable changes.
+        let reason_changed = was_exposed.as_deref() != exposed;
+        if let (true, Some(why)) = (new.trace && (!was_tracing || reason_changed), exposed) {
             warn!(
                 "INSECURE: the rule trace is on and {why}: any client can subscribe to \
                  $SYS/brokers/+/trace/rules/+ and read what the rules see (ADR 0084)"
@@ -1372,6 +1385,82 @@ mod tests {
             .and_then(|l| l.rsplit(' ').next())
             .and_then(|v| v.parse().ok())
             .unwrap_or(0)
+    }
+
+    /// The lines `f` logs at WARN and above, as the broker's log shows them less the
+    /// timestamp.
+    fn warnings(f: impl FnOnce()) -> Vec<String> {
+        #[derive(Clone, Default)]
+        struct Captured(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Captured {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let captured = Captured::default();
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .without_time()
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+        let text = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        text.lines().map(str::to_string).collect()
+    }
+
+    /// ADR 0084: the `INSECURE:` line says that anyone may read the trace, and why. It is
+    /// logged when the trace turns on while that is so, and when the reason changes while
+    /// the trace is on — not on every reload, which would teach an operator to skip it.
+    #[test]
+    fn the_insecure_trace_line_is_logged_once_per_change() {
+        const NO_ACL: Option<&str> = Some("no MQTTD_ACL_FILE is configured");
+        const ALLOW: Option<&str> = Some("the ACL's default is allow");
+        let (observe, _rx) = RulesObserve::new();
+        let on = mqtt_config::Rules {
+            trace: true,
+            ..mqtt_config::Rules::default()
+        };
+        let faster = mqtt_config::Rules {
+            trace_rate: on.trace_rate + 1,
+            ..on.clone()
+        };
+        let off = mqtt_config::Rules::default();
+        let said = |config: &mqtt_config::Rules, exposed: Option<&str>| {
+            let lines = warnings(|| observe.apply(config, exposed));
+            let count = |what: &str| lines.iter().filter(|l| l.contains(what)).count();
+            (count("rule trace is ON:"), count("INSECURE:"), lines)
+        };
+
+        let (on_line, insecure, lines) = said(&on, NO_ACL);
+        assert_eq!((on_line, insecure), (1, 1), "at boot: {lines:?}");
+        assert!(
+            lines.iter().any(|l| l.ends_with(
+                " WARN mqttd::rules: INSECURE: the rule trace is on and no MQTTD_ACL_FILE is \
+                 configured: any client can subscribe to $SYS/brokers/+/trace/rules/+ and \
+                 read what the rules see (ADR 0084)"
+            )),
+            "{lines:?}"
+        );
+        for (config, exposed, want, why) in [
+            (&on, NO_ACL, (0, 0), "a reload that changes neither"),
+            (&faster, NO_ACL, (0, 0), "another rate"),
+            (&faster, ALLOW, (0, 1), "another reason"),
+            (&faster, None, (0, 0), "an ACL that denies"),
+            (&faster, ALLOW, (0, 1), "readable again"),
+            (&off, ALLOW, (0, 0), "the trace off"),
+            (&off, NO_ACL, (0, 0), "off, whatever the reason"),
+            (&on, NO_ACL, (1, 1), "on again"),
+            (&on, NO_ACL, (0, 0), "and a reload after it"),
+        ] {
+            let (on_line, insecure, lines) = said(config, exposed);
+            assert_eq!((on_line, insecure), want, "{why}: {lines:?}");
+        }
     }
 
     /// A gated derived action is counted once its gate answers: accepted → `ok`;
