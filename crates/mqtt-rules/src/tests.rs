@@ -1592,3 +1592,74 @@ fn load_errors_say_where_and_print_as_before() {
         "{e}"
     );
 }
+
+/// Only the broker publishes in `$SYS` (ADR 0084): a republish that renders a topic
+/// there fails its action, whatever the template, and the rule's other actions run.
+#[test]
+fn a_republish_into_sys_fails_its_action() {
+    let set = load(
+        r#"
+        [rules.r]
+        sql = 'SELECT payload.t AS t FROM "t"'
+        actions = [
+          { function = "republish", args = { topic = "${t}" } },
+          { function = "republish", args = { topic = "ok/${t}" } },
+        ]
+        "#,
+    );
+    let props = mqtt_core::AppProperties::default();
+    for reserved in ["$SYS/brokers/n1/rules", "$SYS"] {
+        let payload = Bytes::from(format!(r#"{{"t":"{reserved}"}}"#));
+        let (out, log) = effects(&set, &msg("t", &payload, &props));
+        assert_eq!(
+            log[1],
+            format!("r:action_failed(republish topic is reserved for the broker: {reserved})")
+        );
+        assert_eq!(out.len(), 1, "the other action still ran");
+        assert_eq!(republished(&out[0].1).topic, format!("ok/{reserved}"));
+    }
+    // Not reserved: another `$` topic, or a different case.
+    for open in ["$sys/x", "$SYSTEM/x"] {
+        let payload = Bytes::from(format!(r#"{{"t":"{open}"}}"#));
+        let (out, _) = effects(&set, &msg("t", &payload, &props));
+        assert_eq!(out.len(), 2, "{open}");
+    }
+}
+
+/// A rule that can never do what it says is loaded, with a warning saying why: a
+/// republish whose topic is always in `$SYS`, and a `FROM` on `$SYS`, which the broker's
+/// own messages never reach and clients can no longer publish to.
+#[test]
+fn rules_aimed_at_sys_load_with_a_warning() {
+    let warnings = |actions: &str, from: &str| {
+        RuleSet::parse(&format!(
+            "[rules.r]\nsql = 'SELECT * FROM {from}'\nactions = [{actions}]\n"
+        ))
+        .unwrap()
+        .warnings
+    };
+    let republish =
+        |topic: &str| format!("{{ function = \"republish\", args = {{ topic = \"{topic}\" }} }}");
+    for always in ["$SYS/x/${clientid}", "$SYS/", "$SYS"] {
+        let w = warnings(&republish(always), "\"t\"");
+        assert_eq!(w.len(), 1, "{always}: {w:?}");
+        assert!(
+            w[0].starts_with(&format!(
+                "rule `r`: republish topic \"{always}\" is in $SYS"
+            )),
+            "{w:?}"
+        );
+    }
+    // Not always reserved: the warning is for certainties only.
+    for maybe in ["${t}", "$SYS${t}", "$sys/x", "a/$SYS/b"] {
+        assert!(warnings(&republish(maybe), "\"t\"").is_empty(), "{maybe}");
+    }
+    for from in ["\"$SYS/#\"", "\"$SYS\"", "\"a\", \"$SYS/brokers/+/rules\""] {
+        let w = warnings("", from);
+        assert_eq!(w.len(), 1, "{from}: {w:?}");
+        assert!(w[0].contains("never matches"), "{w:?}");
+    }
+    assert!(warnings("", "\"$sys/#\", \"#\"").is_empty());
+    let w = check_sql("SELECT * FROM \"$SYS/#\"").unwrap();
+    assert!(w[0].starts_with("FROM \"$SYS/#\" never matches"), "{w:?}");
+}

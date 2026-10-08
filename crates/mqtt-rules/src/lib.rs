@@ -380,7 +380,7 @@ fn compile(sql: &str, regexes: &mut parser::RegexPool) -> Result<Compiled, Compi
     if sql.len() > MAX_SQL_BYTES {
         return Err(format!("sql is longer than {MAX_SQL_BYTES} bytes").into());
     }
-    let (stmt, warnings) = parser::parse(sql, regexes).map_err(|e| CompileError {
+    let (stmt, mut warnings) = parser::parse(sql, regexes).map_err(|e| CompileError {
         message: e.to_string(),
         at: Some((e.line, e.column)),
     })?;
@@ -412,6 +412,12 @@ fn compile(sql: &str, regexes: &mut parser::RegexPool) -> Result<Compiled, Compi
         } else if !mqtt_core::valid_filter(from) {
             return Err(format!("\"{from}\" is not a valid topic filter").into());
         } else if !topics.contains(from) {
+            if mqtt_core::is_reserved_topic(from) {
+                warnings.push(format!(
+                    "FROM \"{from}\" never matches: the broker's own $SYS messages do not run \
+                     rules and clients cannot publish there (ADR 0084)"
+                ));
+            }
             topics.push(from.clone());
         }
     }
