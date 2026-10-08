@@ -75,12 +75,15 @@ pub const MAX_SQL_BYTES: usize = 64 * 1024;
 ///
 /// Each pattern is already bounded (1 MiB of compiled program, 1 MiB of lazy DFA), but
 /// the file was not: a few thousand worst-case literals took seconds and gigabytes to
-/// parse. Measured on the release build (4-core x86-64, 2026-10): a pattern at the
-/// per-pattern limit (`(\w|\pN|\pS){47}`, `\w{50}`, `\pL{56}`, `.{2471}`) costs about
-/// 7.5 ms and 1.05 MiB to compile, so 128 distinct ones took 0.9-1.1 s and 140 MiB, and
-/// 96 take about 0.7 s and 107 MiB. 96 keeps a worst-case file under a second, and the
-/// running set plus one candidate being checked or reloaded under 256 MiB. A file over
-/// it fails to load, at boot, on reload, in `--check-rules` and in the admin API alike.
+/// parse. Measured on release builds (4-core x86-64, 2026-10): a pattern at the
+/// per-pattern limit costs about 6-7.5 ms and 1.05 MiB to compile, so 128 distinct ones
+/// took 0.9-1.1 s and 140 MiB, and 96 take 0.6-1.1 s and 110-123 MiB. Which patterns
+/// reach the limit depends on the build: mqtt-rules alone admits `\w{50}` or `.{2471}`,
+/// while the broker, whose dependency graph enables regex-automata's `dfa-build`, admits
+/// about `\w{20}` or `.{1048}`; the cost at the limit is the same. 96 keeps a worst-case
+/// file around a second, and the running set plus one candidate being checked or reloaded
+/// under 256 MiB. A file over it fails to load, at boot, on reload, in `--check-rules`
+/// and in the admin API alike.
 pub const MAX_REGEX_LITERALS_PER_FILE: usize = 96;
 
 /// A rule statement that does not parse.
