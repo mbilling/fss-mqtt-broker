@@ -52,7 +52,7 @@ Subscribe to those by name:
 | Topics | What | Try |
 |---|---|---|
 | `$SYS/brokers/+/rules/#` | A summary every 2 s (the running rules' digest, how many are enabled, the last reload, the trace setting), then one message per rule: its counts since the broker started (`matched`, `passed`, `no_result`, `failed`, `actions_ok`, `actions_failed`), rates per second, when it last matched and its last error | `mosquitto_sub -v -t '$SYS/brokers/+/rules/#'` |
-| `$SYS/brokers/+/trace/rules/+` | The rule trace: for each rule, at most 5 records a second of the message it ran on (topic, client id, the first 1 KiB of the payload), the result, and every message it rendered. Not under `rules/#`: a trace subscription must be asked for on purpose | `mosquitto_sub -v -t '$SYS/brokers/+/trace/rules/+'` |
+| `$SYS/brokers/+/trace/rules/+` | The rule trace: for each rule, at most 5 records a second, and 5 more for messages its WHERE turned away (`no_result`), of the message it ran on (topic, client id, the first 1 KiB of the payload), the result, and every message it rendered. Not under `rules/#`: a trace subscription must be asked for on purpose | `mosquitto_sub -v -t '$SYS/brokers/+/trace/rules/+'` |
 | `alerts/#`, `kpi/#`, `normalized/#`, `analytics/#`, `state/#`, `events/#` | What the rules derive: the six roots of [the demo's rules](../rules/README.md#where-the-results-go) | `mosquitto_sub -v -t 'alerts/#' -t 'kpi/#' -t 'state/#'` |
 | `plant/#`, `home/#`, `vehicle/#` | What the devices publish | `mosquitto_sub -v -t 'vehicle/#'` |
 
