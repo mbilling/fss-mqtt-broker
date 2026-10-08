@@ -388,6 +388,8 @@ async fn main() -> Result<(), StartupError> {
     // loops and drains live connections, and a tracker that lets us wait for them.
     let shutdown = tokio_util::sync::CancellationToken::new();
     let connections = tokio_util::task::TaskTracker::new();
+    // When this broker started, as the rule statistics report it (ADR 0084).
+    let started_at = std::time::SystemTime::now();
 
     // Metrics (ADR 0020), built once and shared (Arc) into the hub (publish/deliver
     // counts), the connections, the listeners, the gossip driver, and the health server's
@@ -780,6 +782,22 @@ async fn main() -> Result<(), StartupError> {
         placement: Some(placement_for_backup.clone()),
     };
     reloader.attach_config_stamp(config_stamp.clone());
+    // Every reload attempt, for the rule statistics (ADR 0084).
+    let last_reload = Arc::new(reload::LastReload::default());
+    reloader.attach_last_reload(last_reload.clone());
+    // Watching the running rules (ADR 0084): the statistics task publishes on $SYS until
+    // the drain begins, idles while it is off, and follows a reload's settings at once.
+    if let Some(rules) = &policy.rules {
+        tokio::spawn(mqttd::rules_sys::run_stats(
+            rules.clone(),
+            Some(metrics.clone()),
+            hub_tx.clone(),
+            ingress.clone(),
+            last_reload.clone(),
+            started_at,
+            shutdown.clone(),
+        ));
+    }
 
     // Fold the cluster-bus gossip CRL (ADR 0022 T7) into the same validate-before-swap
     // reload as the client policy: a republished CRL revokes a node's gossip on the next
@@ -890,6 +908,7 @@ async fn main() -> Result<(), StartupError> {
     {
         let hub_for_apply = hub_tx.clone();
         let audit_for_apply = policy.audit.clone();
+        let rules_for_apply = policy.rules.as_ref().and_then(|r| r.observe().cloned());
         let replica_change = durable_plane
             .as_ref()
             .map(mqtt_cluster::durable_plane::DurablePlane::replica_change);
@@ -904,6 +923,7 @@ async fn main() -> Result<(), StartupError> {
                     &hub_for_apply,
                     &audit_for_apply,
                     replica_change.as_deref(),
+                    rules_for_apply.as_deref(),
                 )
             }),
         });
@@ -1616,8 +1636,18 @@ fn client_policy(
         );
     }
     let (rules_tx, rules_rx) = tokio::sync::watch::channel(Arc::new(initial_rules));
+    // Watched from the start (ADR 0084), with the startup `[rules]` settings; a reload's
+    // commit hook applies later ones.
+    let observe = mqttd::rules::RulesObserve::new();
+    {
+        let snap = live
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        observe.apply(&snap.rules, trace_exposure(&snap));
+    }
     let rules =
-        mqttd::rules::Rules::new(rules_rx, Arc::from(node.0.as_str()), Some(metrics.clone()));
+        mqttd::rules::Rules::new(rules_rx, Arc::from(node.0.as_str()), Some(metrics.clone()))
+            .with_observe(observe);
     reloader.attach_rules(rules_tx, {
         let live = live.clone();
         move || -> reload::RulesBuildResult {
@@ -1655,6 +1685,20 @@ fn client_policy(
         rules: Some(rules),
     });
     Ok((policy, reloader))
+}
+
+/// Why any client may read the rule trace, when one can (ADR 0084): no ACL file, or one
+/// whose `default` is allow. `None` when an ACL that denies by default governs `$SYS`.
+fn trace_exposure(config: &Config) -> Option<&'static str> {
+    #[derive(serde::Deserialize)]
+    struct AclDefault {
+        default: Option<String>,
+    }
+    let Some(path) = &config.security.acl_file else {
+        return Some("no MQTTD_ACL_FILE is configured");
+    };
+    let acl: AclDefault = toml::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
+    (acl.default.as_deref() == Some("allow")).then_some("the ACL's default is allow")
 }
 
 /// Which field of a verified client certificate is the identity (ADR 0004 T11).
@@ -4237,11 +4281,17 @@ fn apply_live_config(
     hub: &mpsc::UnboundedSender<hub::HubCommand>,
     audit: &Arc<dyn AuditSink>,
     replica_change: Option<&mqtt_cluster::replica_change::ReplicaChangeControl>,
+    rules: Option<&mqttd::rules::RulesObserve>,
 ) -> Vec<String> {
     // Quotas are live: push the new set (idempotent when unchanged). precheck guaranteed they
     // build, so this does not error.
     if let Ok(quotas) = quotas_from_config(new) {
         let _ = hub.send(hub::HubCommand::SetQuotas(quotas));
+    }
+    // Watching the rules is live (ADR 0084): applied here, from the committed config —
+    // never from a candidate a reload may still reject.
+    if let Some(observe) = rules {
+        observe.apply(&new.rules, trace_exposure(new));
     }
     // A changed replication factor is a proposal to the running cluster (ADR 0080 §4): the
     // lease leader opens the change when the cluster can take it, and `/statusz` shows its
@@ -6073,11 +6123,11 @@ mod tests {
         let recorder = std::sync::Arc::new(mqtt_observability::RecordingAuditSink::new());
         let audit: std::sync::Arc<dyn mqtt_observability::AuditSink> = recorder.clone();
         let control = mqtt_cluster::replica_change::ReplicaChangeControl::new();
-        super::apply_live_config(&base, &base, &hub, &audit, Some(&control));
+        super::apply_live_config(&base, &base, &hub, &audit, Some(&control), None);
         assert_eq!(control.proposed(), None);
         let mut changed = base.clone();
         changed.durable.replicas = 3;
-        super::apply_live_config(&base, &changed, &hub, &audit, Some(&control));
+        super::apply_live_config(&base, &changed, &hub, &audit, Some(&control), None);
         assert_eq!(control.proposed(), Some(3));
         assert_eq!(recorder.kinds(), vec!["config.reload".to_string()]);
     }

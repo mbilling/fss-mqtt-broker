@@ -28,9 +28,15 @@
 //!   every retry for as long as the condition lasts (a brownout, a peer's refusal).
 //!   Inbound `QoS` 2 dedup means a rule fires exactly once per `QoS` 2 message. A `QoS`
 //!   0 publish has no acknowledgement, so nothing it produces is gated.
+//! - **Watching it** ([ADR 0084](../../../docs/adr/0084-watching-and-editing-rules-live.md)).
+//!   [`RulesObserve`] holds the live `[rules]` settings for the `$SYS` statistics
+//!   ([`crate::rules_sys`]) and each rule's last error.
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
 
 use bytes::Bytes;
 use mqtt_codec::QoS;
@@ -46,13 +52,15 @@ use crate::hub::{DerivedPublish, HubCommand, PublishBatch, PublishOutcome};
 pub type RulesWatch = watch::Receiver<Arc<RuleSet>>;
 
 /// The rule engine as the broker uses it: the live rules, this node's id (the `node`
-/// field) and the metrics they report into. Shared by every connection; each one
-/// evaluates through its own [`ConnRules`].
+/// field), the metrics they report into and, when they are watched, the
+/// [`RulesObserve`] (ADR 0084). Shared by every connection; each one evaluates through
+/// its own [`ConnRules`].
 #[derive(Clone)]
 pub struct Rules {
     rx: RulesWatch,
     node: Arc<str>,
     metrics: Option<Arc<Metrics>>,
+    observe: Option<Arc<RulesObserve>>,
 }
 
 impl std::fmt::Debug for Rules {
@@ -134,7 +142,7 @@ fn qos_of(n: u8) -> QoS {
 
 /// A failing rule fails on every message it sees: the metric counts each failure, the
 /// log says so once per interval per rule ([`Rule::failure_report_due`]).
-const FAILURE_WARN_INTERVAL_SECS: u64 = 10;
+pub(crate) const FAILURE_WARN_INTERVAL_SECS: u64 = 10;
 
 /// Whether this failure of `rule` is the one to log at WARN.
 fn warn_due(rule: &Rule) -> bool {
@@ -148,7 +156,16 @@ fn warn_due(rule: &Rule) -> bool {
 /// action is counted when it logs and a republish once its fate is known
 /// ([`count_action`]), so `result="ok"` means the message was routed, not merely
 /// rendered.
-fn report(metrics: Option<&Metrics>, rule: &Rule, outcome: Outcome<'_>) {
+///
+/// The failure logged at WARN is also the rule's last error (ADR 0084): stored at the
+/// same once-per-interval gate, so a failing rule costs one lock and one hash per
+/// interval, not per message.
+fn report(
+    metrics: Option<&Metrics>,
+    observe: Option<&RulesObserve>,
+    rule: &Rule,
+    outcome: Outcome<'_>,
+) {
     let (eval, action) = match outcome {
         Outcome::Passed => (Some("passed"), None),
         Outcome::NoResult => (Some("no_result"), None),
@@ -157,6 +174,9 @@ fn report(metrics: Option<&Metrics>, rule: &Rule, outcome: Outcome<'_>) {
                 warn!(rule = %rule.id(), error = %e,
                       "rule SQL failed (counted in mqttd_rule_evaluations_total{{result=\"failed\"}}; \
                        this rule's further failures within {FAILURE_WARN_INTERVAL_SECS}s are logged at debug)");
+                if let Some(o) = observe {
+                    o.store_error(rule, ErrorKind::Sql, &e.to_string());
+                }
             } else {
                 debug!(rule = %rule.id(), error = %e, "rule SQL failed");
             }
@@ -168,6 +188,9 @@ fn report(metrics: Option<&Metrics>, rule: &Rule, outcome: Outcome<'_>) {
                 warn!(rule = %rule.id(), error = %e,
                       "rule action failed (counted in mqttd_rule_actions_total{{result=\"failed\"}}; \
                        this rule's further failures within {FAILURE_WARN_INTERVAL_SECS}s are logged at debug)");
+                if let Some(o) = observe {
+                    o.store_error(rule, ErrorKind::Action, &e.to_string());
+                }
             } else {
                 debug!(rule = %rule.id(), error = %e, "rule action failed");
             }
@@ -210,6 +233,7 @@ fn evaluate(
     set: &RuleSet,
     node: &str,
     metrics: Option<&Metrics>,
+    observe: Option<&RulesObserve>,
     f: &PublishFacts<'_>,
 ) -> Vec<Derived> {
     if !set.has_message_rules() {
@@ -223,7 +247,11 @@ fn evaluate(
     input.message_expiry = f.message_expiry;
     input.node = node;
     let mut effects = Vec::new();
-    set.on_publish(&input, &mut |r, o| report(metrics, r, o), &mut effects);
+    set.on_publish(
+        &input,
+        &mut |r, o| report(metrics, observe, r, o),
+        &mut effects,
+    );
     collect(metrics, effects)
 }
 
@@ -231,7 +259,38 @@ impl Rules {
     /// The engine over a live rule set.
     #[must_use]
     pub fn new(rx: RulesWatch, node: Arc<str>, metrics: Option<Arc<Metrics>>) -> Self {
-        Self { rx, node, metrics }
+        Self {
+            rx,
+            node,
+            metrics,
+            observe: None,
+        }
+    }
+
+    /// The same engine, watched (ADR 0084): its last errors are kept and, while the
+    /// trace is on, its evaluations are traced into `observe`.
+    #[must_use]
+    pub fn with_observe(mut self, observe: Arc<RulesObserve>) -> Self {
+        self.observe = Some(observe);
+        self
+    }
+
+    /// What watches these rules, if anything does.
+    #[must_use]
+    pub fn observe(&self) -> Option<&Arc<RulesObserve>> {
+        self.observe.as_ref()
+    }
+
+    /// This node's id, as the rules see it (their `node` field) and as `$SYS` names it.
+    #[must_use]
+    pub fn node(&self) -> &str {
+        &self.node
+    }
+
+    /// The metrics the rules report into.
+    #[must_use]
+    pub fn metrics(&self) -> Option<&Arc<Metrics>> {
+        self.metrics.as_ref()
     }
 
     /// Send what an event or a Will derived — there is no publisher to answer — as
@@ -268,7 +327,13 @@ impl Rules {
     /// Evaluate a Will the hub is publishing and hand `send` the commands for what its
     /// rules produce ([`Rules::send_derived`]).
     pub fn on_will(&self, f: &PublishFacts<'_>, send: impl Fn(HubCommand)) {
-        let derived = evaluate(&self.current(), &self.node, self.metrics.as_deref(), f);
+        let derived = evaluate(
+            &self.current(),
+            &self.node,
+            self.metrics.as_deref(),
+            self.observe.as_deref(),
+            f,
+        );
         Self::send_derived(derived, send);
     }
 }
@@ -325,7 +390,8 @@ impl ConnRules {
     #[must_use]
     pub fn on_publish(&self, f: &PublishFacts<'_>) -> Vec<Derived> {
         let metrics = self.engine.metrics.as_deref();
-        self.with_set(|set| evaluate(set, &self.engine.node, metrics, f))
+        let observe = self.engine.observe.as_deref();
+        self.with_set(|set| evaluate(set, &self.engine.node, metrics, observe, f))
     }
 
     /// Pick up a reloaded rule set now, releasing the superseded one this connection
@@ -357,9 +423,14 @@ impl ConnRules {
     /// ([`Rules::send_derived`]).
     pub fn fire_event(&self, input: &EventInput, hub: &mpsc::UnboundedSender<HubCommand>) {
         let metrics = self.engine.metrics.as_deref();
+        let observe = self.engine.observe.as_deref();
         let derived = self.with_set(|set| {
             let mut effects = Vec::new();
-            set.on_event(input, &mut |r, o| report(metrics, r, o), &mut effects);
+            set.on_event(
+                input,
+                &mut |r, o| report(metrics, observe, r, o),
+                &mut effects,
+            );
             collect(metrics, effects)
         });
         Rules::send_derived(derived, |cmd| {
@@ -507,6 +578,238 @@ async fn combine(
         count_action(metrics, &rule, result);
     }
     answer
+}
+
+/// The live `[rules]` settings for watching the running rules (ADR 0084).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RulesSysSettings {
+    /// Seconds between the `$SYS` statistics; 0 = off.
+    pub sys_interval_secs: u64,
+    /// Whether the rule trace is on.
+    pub trace: bool,
+    /// Trace records per rule per second.
+    pub trace_rate: u32,
+}
+
+impl Default for RulesSysSettings {
+    fn default() -> Self {
+        Self::from(&mqtt_config::Rules::default())
+    }
+}
+
+impl From<&mqtt_config::Rules> for RulesSysSettings {
+    fn from(c: &mqtt_config::Rules) -> Self {
+        Self {
+            sys_interval_secs: c.sys_interval_secs,
+            trace: c.trace,
+            trace_rate: c.trace_rate,
+        }
+    }
+}
+
+/// The longest error text kept, in bytes (ADR 0084): an error can quote a payload value,
+/// so it is cut, on a character boundary.
+pub const ERROR_TEXT_MAX: usize = 256;
+/// `s` cut to at most `max` bytes, on a character boundary.
+#[must_use]
+pub fn clip(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+/// A rule definition's short hash (ADR 0084): 16 hex digits of the SHA-256 of its SQL,
+/// its actions as JSON and its `enable` flag — what an edit that changes what the rule
+/// does changes, so a stored error can be told from one about an earlier definition.
+#[must_use]
+pub fn rule_def(rule: &Rule) -> String {
+    let actions = serde_json::to_string(rule.action_specs()).unwrap_or_default();
+    let mut text = String::with_capacity(rule.sql().len() + actions.len() + 4);
+    text.push_str(rule.sql());
+    text.push('\0');
+    text.push_str(&actions);
+    text.push('\0');
+    text.push(if rule.enabled() { '1' } else { '0' });
+    let mut def = crate::reload::sha256_hex(text.as_bytes());
+    def.truncate(16);
+    def
+}
+
+/// What a rule's last error was about (ADR 0084).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErrorKind {
+    /// Its SQL failed.
+    Sql,
+    /// An action failed as it rendered (a bad topic, a `$SYS` topic, a bad `qos`, …).
+    Action,
+    /// Derived messages were refused or not routed: synthesized by the statistics from
+    /// the failed-action count, since those sites carry no error text.
+    Delivery,
+}
+
+impl ErrorKind {
+    /// The name the statistics and the admin API give it.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Sql => "sql",
+            Self::Action => "action",
+            Self::Delivery => "delivery",
+        }
+    }
+}
+
+/// A rule's last error (ADR 0084).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LastError {
+    /// When.
+    pub at: SystemTime,
+    /// What about.
+    pub kind: ErrorKind,
+    /// The error, at most [`ERROR_TEXT_MAX`] bytes.
+    pub message: String,
+    /// The [`rule_def`] it was about: an entry about an earlier definition is dropped.
+    pub def: String,
+}
+
+/// What watches the running rules (ADR 0084), shared by [`Rules`] and its tasks.
+///
+/// The settings are applied from the committed config only — at boot and from the
+/// reload's commit hook, never from a candidate a reload may still reject.
+#[derive(Debug)]
+pub struct RulesObserve {
+    trace: AtomicBool,
+    trace_rate: AtomicU32,
+    settings: watch::Sender<RulesSysSettings>,
+    trace_dropped: AtomicU64,
+    stats_dropped: AtomicU64,
+    last_errors: Mutex<HashMap<Arc<str>, LastError>>,
+}
+
+impl RulesObserve {
+    /// Everything off.
+    #[must_use]
+    pub fn new() -> Arc<Self> {
+        let settings = RulesSysSettings::default();
+        Arc::new(Self {
+            trace: AtomicBool::new(settings.trace),
+            trace_rate: AtomicU32::new(settings.trace_rate),
+            settings: watch::channel(settings).0,
+            trace_dropped: AtomicU64::new(0),
+            stats_dropped: AtomicU64::new(0),
+            last_errors: Mutex::new(HashMap::new()),
+        })
+    }
+
+    /// Apply the committed `[rules]` settings. `exposed` says why anyone may read the
+    /// trace (no ACL file, an ACL whose default is allow), when that is so: with the
+    /// trace on it is logged as `INSECURE:`.
+    pub fn apply(&self, config: &mqtt_config::Rules, exposed: Option<&str>) {
+        let new = RulesSysSettings::from(config);
+        let was_tracing = self.trace.swap(new.trace, Relaxed);
+        self.trace_rate.store(new.trace_rate, Relaxed);
+        if new.trace && !was_tracing {
+            warn!(
+                rate = new.trace_rate,
+                "rule trace is ON: every rule's evaluations — trigger topic, client id, \
+                 username, up to 1 KiB of payload, rendered outputs — are copied onto \
+                 $SYS/brokers/<node>/trace/rules/<id> (ADR 0084); a subscriber there reads \
+                 every topic that rule's FROM matches"
+            );
+        } else if !new.trace && was_tracing {
+            info!("rule trace is off (ADR 0084)");
+        }
+        if let (true, Some(why)) = (new.trace, exposed) {
+            warn!(
+                "INSECURE: the rule trace is on and {why}: any client can subscribe to \
+                 $SYS/brokers/+/trace/rules/+ and read what the rules see (ADR 0084)"
+            );
+        }
+        self.settings.send_if_modified(|s| {
+            let changed = *s != new;
+            *s = new;
+            changed
+        });
+    }
+
+    /// The settings now in force.
+    #[must_use]
+    pub fn settings(&self) -> RulesSysSettings {
+        *self.settings.borrow()
+    }
+
+    /// Follow the settings: a receiver told of each change.
+    #[must_use]
+    pub fn subscribe(&self) -> watch::Receiver<RulesSysSettings> {
+        self.settings.subscribe()
+    }
+
+    /// Whether the trace is on.
+    #[must_use]
+    pub fn tracing(&self) -> bool {
+        self.trace.load(Relaxed)
+    }
+
+    /// Trace records per rule per second.
+    #[must_use]
+    pub fn trace_rate(&self) -> u32 {
+        self.trace_rate.load(Relaxed)
+    }
+
+    /// Trace records dropped: the queue was full or over its byte budget, or the node
+    /// ceiling or the ingress pool had no room to publish them.
+    #[must_use]
+    pub fn trace_dropped(&self) -> u64 {
+        self.trace_dropped.load(Relaxed)
+    }
+
+    /// Statistics ticks skipped because the ingress pool had no room for them.
+    #[must_use]
+    pub fn stats_dropped(&self) -> u64 {
+        self.stats_dropped.load(Relaxed)
+    }
+
+    pub(crate) fn count_stats_dropped(&self) {
+        self.stats_dropped.fetch_add(1, Relaxed);
+    }
+
+    /// `rule`'s last error, if one is kept.
+    #[must_use]
+    pub fn last_error(&self, rule: &str) -> Option<LastError> {
+        self.errors().get(rule).cloned()
+    }
+
+    fn errors(&self) -> std::sync::MutexGuard<'_, HashMap<Arc<str>, LastError>> {
+        self.last_errors
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Keep `message` as `rule`'s last error.
+    fn store_error(&self, rule: &Rule, kind: ErrorKind, message: &str) {
+        let error = LastError {
+            at: SystemTime::now(),
+            kind,
+            message: clip(message, ERROR_TEXT_MAX).to_string(),
+            def: rule_def(rule),
+        };
+        self.errors().insert(rule.id().clone(), error);
+    }
+
+    /// Keep `error` as `rule`'s last error (the statistics' synthesized ones).
+    pub(crate) fn set_last_error(&self, rule: &Arc<str>, error: LastError) {
+        self.errors().insert(rule.clone(), error);
+    }
+
+    /// Drop the kept errors `keep` refuses: a rule gone, or redefined, by a reload.
+    pub(crate) fn retain_errors(&self, keep: impl Fn(&str, &LastError) -> bool) {
+        self.errors().retain(|id, e| keep(id, e));
+    }
 }
 
 /// Load the configured rules file. `None` path = no rules. Warnings are logged.

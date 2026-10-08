@@ -2521,7 +2521,8 @@ fn utc_stamp(unix_secs: u64) -> String {
     )
 }
 
-fn civil_from_days(z: i64) -> (i64, u32, u32) {
+/// The (year, month, day) of `z` days since 1970-01-01 (Howard Hinnant's algorithm).
+pub(crate) fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let z = z + 719_468;
     let era = z.div_euclid(146_097);
     let doe = z.rem_euclid(146_097);
