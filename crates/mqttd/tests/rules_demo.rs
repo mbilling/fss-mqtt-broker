@@ -73,21 +73,39 @@ fn read(rel: &str) -> String {
 
 /// The fixture: what the simulator prints for [`FIXTURE_ARGS`].
 fn fixture() -> String {
-    let out = Command::new("python3")
-        .arg(repo_root().join(SIMULATOR))
-        .args(FIXTURE_ARGS)
-        .output()
-        .expect("python3 runs the simulator");
-    assert!(
-        out.status.success(),
-        "simulate.py failed:\n{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    String::from_utf8(out.stdout).expect("UTF-8")
+    let mut args = vec![SIMULATOR];
+    args.extend(FIXTURE_ARGS);
+    python_out(&args)
 }
 
 fn blessing() -> bool {
     std::env::var_os("MQTTD_DEMO_BLESS").is_some()
+}
+
+/// `python3` run from the repository root, with none of the live simulator's `SIM_*`
+/// settings from the caller's environment and no bytecode written into the checkout.
+fn python3() -> Command {
+    let mut cmd = Command::new("python3");
+    for (k, _) in std::env::vars() {
+        if k.starts_with("SIM_") {
+            cmd.env_remove(k);
+        }
+    }
+    cmd.current_dir(repo_root())
+        .env("PYTHONDONTWRITEBYTECODE", "1");
+    cmd
+}
+
+/// What `python3 <args>` prints; it must succeed.
+fn python_out(args: &[&str]) -> String {
+    let out = python3().args(args).output().expect("python3 runs");
+    assert!(
+        out.status.success(),
+        "python3 {} failed:\n{}",
+        args.join(" "),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8(out.stdout).expect("UTF-8")
 }
 
 struct ChildGuard(std::process::Child);
@@ -589,4 +607,117 @@ fn the_readme_quotes_only_messages_the_fixture_derives() {
             "the README quotes a message the fixture does not derive:\n  {q}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------------------
+// The live simulator
+// ---------------------------------------------------------------------------------------
+
+/// Exercises `sim/mqtt.py`'s `Client` against fake brokers on a local socket, for
+/// [`the_simulators_mqtt_client_bounds_its_waits_and_reads_while_idle`]. Each step runs in
+/// a thread joined with a limit, so a wait that never ends is reported as `hung`, not
+/// waited for. Prints each step's result (its error text, or what it returned) and its
+/// duration, as JSON.
+const MQTT_CLIENT_HARNESS: &str = r#"
+import json, socket, sys, threading, time
+sys.path.insert(0, "demo/rules")
+from sim.mqtt import Client, MqttError
+
+srv = socket.create_server(("127.0.0.1", 0))
+port = srv.getsockname()[1]
+out = {}
+
+
+def step(name, fn, limit=8.0):
+    box = {}
+
+    def run():
+        try:
+            box["result"] = fn()
+        except (MqttError, OSError) as e:
+            box["result"] = str(e)
+
+    t = threading.Thread(target=run, daemon=True)
+    began = time.monotonic()
+    t.start()
+    t.join(limit)
+    out[name] = "hung" if t.is_alive() else box["result"]
+    out[name + "_s"] = time.monotonic() - began
+
+
+def until(client, seen):
+    deadline = time.monotonic() + 5
+    while not seen():
+        if time.monotonic() > deadline:
+            return "not seen"
+        client.drain()
+        time.sleep(0.01)
+    return "seen"
+
+
+# A broker that takes the connection and never answers.
+mute = Client("127.0.0.1", port, "mute", timeout=0.5)
+step("mute", lambda: mute.connect() or "connected")
+out["mute_socket_closed"] = mute.sock is None
+srv.accept()[0].close()
+
+# A broker that answers, sends a PINGRESP and a PUBLISH when told to, and then hangs up.
+go, bye = threading.Event(), threading.Event()
+
+
+def broker():
+    conn, _ = srv.accept()
+    conn.recv(1024)
+    conn.sendall(bytes([0x20, 2, 0, 0]))
+    go.wait(5)
+    conn.sendall(bytes([0xD0, 0, 0x30, 4, 0, 1]) + b"tx")
+    bye.wait(5)
+    conn.close()
+
+
+threading.Thread(target=broker, daemon=True).start()
+quiet = Client("127.0.0.1", port, "quiet", timeout=5)
+quiet.connect()
+step("idle", lambda: quiet.drain() or "nothing")
+go.set()
+step("publish", lambda: until(quiet, lambda: quiet.inbox))
+out["inbox"] = [[m.topic, m.payload.decode()] for m in quiet.inbox]
+bye.set()
+step("closed", lambda: until(quiet, lambda: False))
+print(json.dumps(out))
+"#;
+
+/// The simulators' MQTT client bounds every wait and reads while idle (the live
+/// simulator's player relies on both). A broker that accepts the connection and never sends
+/// CONNACK fails the connect after the client's timeout, with the socket closed, instead of
+/// hanging it. `drain()` returns at once when nothing has arrived, handles what has (a
+/// PINGRESP is read and dropped, a PUBLISH lands in the inbox), and reports a connection
+/// the broker closed.
+#[test]
+fn the_simulators_mqtt_client_bounds_its_waits_and_reads_while_idle() {
+    let out: serde_json::Value =
+        serde_json::from_str(&python_out(&["-c", MQTT_CLIENT_HARNESS])).expect("JSON");
+    let secs = |k: &str| out[k].as_f64().expect("seconds");
+    assert_eq!(out["mute"], "mute: no CONNACK within 0.5 s", "{out}");
+    assert!(
+        (0.4..3.0).contains(&secs("mute_s")),
+        "the CONNACK wait took {} s, not about the 0.5 s timeout",
+        secs("mute_s")
+    );
+    assert_eq!(
+        out["mute_socket_closed"], true,
+        "a failed connect closes its socket"
+    );
+    assert_eq!(out["idle"], "nothing", "{out}");
+    assert!(
+        secs("idle_s") < 1.0,
+        "drain() waited {} s with nothing to read",
+        secs("idle_s")
+    );
+    assert_eq!(out["publish"], "seen", "{out}");
+    assert_eq!(out["inbox"], serde_json::json!([["t", "x"]]), "{out}");
+    assert_eq!(
+        out["closed"], "quiet: connection closed by the broker",
+        "{out}"
+    );
 }
