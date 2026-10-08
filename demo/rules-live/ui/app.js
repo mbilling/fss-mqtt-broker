@@ -11,8 +11,8 @@ const KEEP_DATA = 500; // messages kept for the filter
 const SHOW_DATA = 200; // messages shown
 const KEEP_TRACE = 20; // trace records kept per rule
 
+// New rule's example; its id is demo_rule_<n>, the first one free.
 const NEW_RULE = {
-  id: "demo_grid_deviation",
   description: "Grid frequency more than 20 mHz off 50 Hz",
   enable: true,
   sql: [
@@ -38,6 +38,8 @@ const state = {
   interval: 2, // seconds between summaries
   mqttUpSince: 0, // when the server's MQTT connection came up, or 0
   selected: null, // the rule in the editor; null for a new one
+  editorDigest: null, // the rules file the editor's text came from: its writes' if_match
+  editorBase: undefined, // the rule as it was in that file (see followFile); undefined: not known yet
   awaiting: null, // {digest, out}: an Apply waiting to see its digest on $SYS
   fileDigest: null, // the digest the whole-file editor was loaded at
   data: [], // recent device and derived messages, oldest first
@@ -134,6 +136,7 @@ async function loadRules() {
   state.list = r.body;
   renderHeader();
   renderRules();
+  followFile();
 }
 
 function scheduleRefresh() {
@@ -249,15 +252,27 @@ function fillEditor(rule) {
   $("f-actions").value = rule.actions ? JSON.stringify(rule.actions, null, 2) : "";
 }
 
+function findRule(id) {
+  return state.list && state.list.rules.find((r) => r.id === id);
+}
+
+// What a write would change of a rule, to tell whether another write changed it.
+function snapshot(rule) {
+  return rule ? JSON.stringify([rule.description, rule.enabled, rule.sql, rule.actions_spec]) : "";
+}
+
 function selectRule(id) {
-  const rule = state.list && state.list.rules.find((r) => r.id === id);
+  const rule = findRule(id);
   if (!rule) return;
   state.selected = id;
+  state.editorDigest = state.list.file_digest;
+  state.editorBase = state.list.in_sync ? snapshot(rule) : undefined;
   $("editing").textContent = id;
   $("f-id").readOnly = true;
   $("b-delete").disabled = false;
   fillEditor({ id, description: rule.description, enable: rule.enabled, sql: rule.sql, actions: rule.actions_spec });
   $("r-out").replaceChildren();
+  $("r-changed").hidden = true;
   if (rule.redacted) say($("r-out"), "error", "The admin API answered as to a viewer: no SQL or actions.");
   renderRules();
   renderTrace();
@@ -265,14 +280,49 @@ function selectRule(id) {
 
 function newRule() {
   state.selected = null;
+  state.editorDigest = state.list ? state.list.file_digest : null;
+  state.editorBase = undefined;
   $("editing").textContent = "(new)";
   $("f-id").readOnly = false;
   $("b-delete").disabled = true;
-  fillEditor(NEW_RULE);
+  const ids = new Set(((state.list && state.list.rules) || []).map((r) => r.id));
+  let n = 1;
+  while (ids.has(`demo_rule_${n}`)) n++;
+  fillEditor({ id: `demo_rule_${n}`, ...NEW_RULE });
   $("r-out").replaceChildren();
+  $("r-changed").hidden = true;
   renderRules();
   renderTrace();
   $("f-id").focus();
+}
+
+// After each new rules list. The editor's writes carry the digest of the file its text
+// came from, so a write made over another tab's change is refused. When the file changed
+// but the open rule did not, the editor moves on to the new file: nothing would be lost.
+// The list shows the running rules, which are the file's only while the two are in sync.
+function followFile() {
+  const l = state.list;
+  if (!l || !l.in_sync) return;
+  if (state.selected === null) {
+    // A new rule: Apply asks before it replaces a rule this list has.
+    if (state.editorDigest) state.editorDigest = l.file_digest;
+    return;
+  }
+  const now = snapshot(findRule(state.selected));
+  if (l.file_digest === state.editorDigest) {
+    state.editorBase = now;
+  } else if (state.editorBase === undefined) {
+    // Not known what the rule was: a write is refused, and says why.
+  } else if (now === state.editorBase) {
+    state.editorDigest = l.file_digest;
+    $("r-changed").hidden = true;
+  } else {
+    const note = $("r-changed");
+    note.textContent = `${state.selected} ${now ? "changed" : "was deleted"} since you opened it, ` +
+      "in another tab or client. To see the newer version, choose it in the table (your edit " +
+      "here is lost). Apply is refused once; a second Apply replaces that change.";
+    note.hidden = false;
+  }
 }
 
 function ruleFromEditor() {
@@ -342,6 +392,9 @@ async function checkRule() {
   }
   say(out, "busy", "Checking…");
   showCheck(out, await api("POST", "/api/check", { rule: { id: rule.id, ...rule.fields } }), $("f-sql"));
+  if (state.selected === null && findRule(rule.id)) {
+    out.append(el("p", `A rule named ${rule.id} already exists: Apply would replace it.`, "notice"));
+  }
 }
 
 async function testRule() {
@@ -388,11 +441,18 @@ async function applyRule() {
     say(out, "error", e.message);
     return;
   }
+  if (state.selected === null && findRule(rule.id) &&
+    !confirm(`A rule named ${rule.id} already exists. Replace it?`)) {
+    say(out, "hint", `Nothing written. Choose another id, or choose ${rule.id} in the table to edit it.`);
+    return;
+  }
   const q = new URLSearchParams({ id: rule.id });
-  if (state.list && state.list.file_digest) q.set("if_match", state.list.file_digest);
+  if (state.editorDigest) q.set("if_match", state.editorDigest);
   say(out, "busy", "Applying…");
   const r = await api("PUT", `/api/rule?${q}`, rule.fields);
-  showWrite(out, r, $("f-sql"));
+  showWrite(out, r, $("f-sql"), "The rules list is reloaded now. Your edit is still here: Apply " +
+    "again to write it over the newer file, or choose the rule in the table to load its newer version.");
+  wrote(r);
   if (r.status === 200) {
     state.selected = rule.id;
     $("editing").textContent = rule.id;
@@ -404,13 +464,16 @@ async function applyRule() {
 
 async function deleteRule() {
   const id = state.selected;
-  if (!id || !confirm(`Delete ${id} from the rules file? Its statistics go with it.`)) return;
+  if (!id || !confirm(`Delete ${id} from the rules file? Its statistics stop being published ` +
+    "(and resume if a rule with this id comes back).")) return;
   const out = $("r-out");
   const q = new URLSearchParams({ id });
-  if (state.list && state.list.file_digest) q.set("if_match", state.list.file_digest);
+  if (state.editorDigest) q.set("if_match", state.editorDigest);
   say(out, "busy", "Deleting…");
   const r = await api("DELETE", `/api/rule?${q}`);
-  showWrite(out, r, null);
+  showWrite(out, r, null, "The rules list is reloaded now: Delete again to delete it from the " +
+    "newer file, or choose the rule in the table to see its newer version.");
+  wrote(r);
   if (r.status === 200) {
     state.selected = null;
     $("editing").textContent = `(${id} deleted)`;
@@ -418,6 +481,16 @@ async function deleteRule() {
     $("b-delete").disabled = true;
   }
   await loadRules();
+}
+
+// The single-rule editor's next write goes over the file this one wrote, or, after a
+// conflict, over the newer one, so a second Apply does what the answer says it does.
+function wrote(r) {
+  const digest = r.status === 200 ? r.body.digest : r.status === 412 ? errorField(r, "file_digest") : null;
+  if (!digest) return;
+  state.editorDigest = digest;
+  state.editorBase = undefined;
+  $("r-changed").hidden = true;
 }
 
 // ---- the whole file ----------------------------------------------------------------------
@@ -450,8 +523,10 @@ async function applyFile() {
   const q = new URLSearchParams({ if_match: state.fileDigest });
   say(out, "busy", "Applying…");
   const r = await api("PUT", `/api/rules?${q}`, { source: $("f-source").value });
-  showWrite(out, r, $("f-source"));
+  showWrite(out, r, $("f-source"), "The file changed since you loaded it. Apply again to replace " +
+    "it with your text (the newer changes are lost), or copy your text and Load to merge.");
   if (r.status === 200) state.fileDigest = r.body.digest;
+  if (r.status === 412 && errorField(r, "file_digest")) state.fileDigest = errorField(r, "file_digest");
   await loadRules();
 }
 
@@ -485,14 +560,12 @@ function showCheck(out, r, textarea) {
   warnings(out, r.body.warnings);
 }
 
-function showWrite(out, r, textarea) {
+// `conflict` is the advice after a 412: what a second try does.
+function showWrite(out, r, textarea, conflict) {
   out.replaceChildren();
   if (r.status !== 200) {
     showError(out, r, textarea);
-    if (r.status === 412) {
-      out.append(el("p", "The rules list is reloaded now. Your edit is still here: Apply again to " +
-        "write it over the newer file, or load the newer version first."));
-    }
+    if (r.status === 412 && conflict) out.append(el("p", conflict));
     return;
   }
   const b = r.body;

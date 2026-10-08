@@ -293,6 +293,12 @@ legend {
   color: var(--bad);
 }
 
+.notice {
+  padding: 0.3rem 0.6rem;
+  border-left: 3px solid var(--bad);
+  background: var(--warn-bg);
+}
+
 .busy,
 .hint {
   color: var(--muted);
