@@ -73,7 +73,10 @@
 //!   `devices/+/state` does not admit a `devices/#` subscription;
 //! - **deny** rules use *overlap* ([`mqtt_core::filters_overlap`]): a denied
 //!   pattern blocks any subscription that could receive a matching message,
-//!   so denying `secret/#` also blocks a `#` subscription.
+//!   so denying `secret/#` also blocks a `#` subscription. For a shared
+//!   subscription `$share/<g>/<f>` a deny is matched against `<f>` as well as
+//!   the full string (ADR 0084), so denying `secret/#` also blocks
+//!   `$share/g/secret/x`; an allow still has to cover the full `$share/...` string.
 //!
 //! Publish targets are concrete topics and use plain MQTT filter matching.
 
@@ -246,6 +249,14 @@ impl AclPolicy {
         action: Action,
         target: &str,
     ) -> (bool, Decider) {
+        // A `$share/<g>/<f>` subscription receives what `<f>` matches, so a deny is also
+        // matched against `<f>` (ADR 0084): denying `$SYS/#` must refuse `$share/g/$SYS/#`,
+        // whose first level differs. Allows still see only the full string, so sharing
+        // needs its own `$share/...` grant as before — nothing is loosened.
+        let shared_inner = match action {
+            Action::Subscribe => mqtt_core::parse_shared(target).map(|(_, inner)| inner),
+            Action::Publish => None,
+        };
         let mut first_allow = None;
         for (ri, rule) in self.rules.iter().enumerate() {
             if !rule.applies_to(action) || !rule.matches_principal(identity) {
@@ -300,6 +311,16 @@ impl AclPolicy {
                             });
                         }
                     }
+                } else if rule.effect == Effect::Deny
+                    && shared_inner.is_some_and(|f| mqtt_core::filters_overlap(&pattern, f))
+                {
+                    return (
+                        false,
+                        Decider::SharedDeny {
+                            rule: ri,
+                            pattern: pi,
+                        },
+                    );
                 }
             }
         }
@@ -451,6 +472,19 @@ impl AclPolicy {
                     reason,
                 }
             }
+            Decider::SharedDeny { rule, pattern } => {
+                let r = rule_ref(rule, pattern);
+                let reason = format!(
+                    "rule {} denies the filter inside the $share/ subscription (pattern {:?}); \
+                     a deny wins",
+                    r.index, r.pattern
+                );
+                Explanation {
+                    allowed: false,
+                    rule: Some(r),
+                    reason,
+                }
+            }
             Decider::Default => Explanation {
                 allowed,
                 rule: None,
@@ -480,6 +514,9 @@ enum Decider {
     Hit { rule: usize, pattern: usize },
     /// Rule `rule` is a deny whose pattern could not be substituted safely.
     UnsafeDeny { rule: usize, pattern: usize },
+    /// Rule `rule` is a deny whose pattern overlaps the filter inside a
+    /// `$share/<g>/<f>` subscription (ADR 0084), though not the full string.
+    SharedDeny { rule: usize, pattern: usize },
     /// No rule matched: the policy default (or, for a connect, the connect default).
     Default,
     /// A connect, and the policy has no connect rules.
@@ -724,6 +761,11 @@ mod tests {
         identities = ["tenant-*"]
         actions = ["connect"]
         clients = ["%i-*"]
+
+        [[rules]]
+        actions = ["subscribe"]
+        effect = "deny"
+        topics = ["devices/+/keys"]
     "##;
 
     fn explain(
@@ -852,6 +894,10 @@ mod tests {
             "#",
             "devices/+/firmware",
             "a/b/c",
+            "$share/g/devices/device-7/keys",
+            "$share/g/devices/device-7/#",
+            "$share/g/#",
+            "$share/g/a/b/c",
         ];
         for id in &ids {
             for c in clients {
@@ -1435,6 +1481,113 @@ mod tests {
         let id = ident("alice", &[]);
         assert!(!can_sub(&p, &id, "#"));
         assert!(can_sub(&p, &id, "public/x"));
+    }
+
+    // ----- shared subscriptions and denies (ADR 0084) -----
+
+    /// A `$share/<g>/<f>` subscription receives what `<f>` matches, but its first level
+    /// is `$share`, so on the full string alone a deny on `$SYS/#` (or `a/#`) never
+    /// overlapped it: a broad `$share` grant walked straight past the deny.
+    #[test]
+    fn a_deny_also_refuses_the_same_filter_inside_a_shared_subscription() {
+        let p = AclPolicy::from_toml_str(
+            r##"
+            [[rules]]
+            actions = ["subscribe"]
+            topics = ["$share/#", "$SYS/#", "#"]
+
+            [[rules]]
+            actions = ["subscribe"]
+            effect = "deny"
+            topics = ["$SYS/#", "a/#"]
+            "##,
+        )
+        .unwrap();
+        let id = ident("alice", &[]);
+        for refused in [
+            "$share/g/$SYS/#",
+            "$share/g/$SYS/brokers/+/rules/#",
+            "$share/g/a/b",
+            "$share/g/a/#",
+            "$share/g/#", // `#` overlaps `a/#`, as it does unshared
+            "$share/g/+/b",
+        ] {
+            assert!(!can_sub(&p, &id, refused), "{refused} must be refused");
+            assert!(
+                !explain(&p, &id, ANY_CLIENT, CheckedAction::Subscribe, refused).allowed,
+                "the dry run agrees on {refused}"
+            );
+        }
+        for granted in ["$share/g/b/c", "$share/g/b/#", "$share/a/b/c"] {
+            assert!(can_sub(&p, &id, granted), "{granted} is still granted");
+        }
+        // The deny was already effective without a share, and stays so.
+        assert!(!can_sub(&p, &id, "$SYS/#") && !can_sub(&p, &id, "a/b"));
+
+        // The dry run names the deny and says it matched the shared filter.
+        let e = explain(
+            &p,
+            &id,
+            ANY_CLIENT,
+            CheckedAction::Subscribe,
+            "$share/g/$SYS/#",
+        );
+        let r = e.rule.unwrap();
+        assert_eq!(
+            (r.index, r.effect, r.pattern.as_str()),
+            (1, "deny", "$SYS/#")
+        );
+        assert!(e.reason.contains("$share/"), "{}", e.reason);
+    }
+
+    /// The fix tightens denies only: an allow still has to cover the full `$share/...`
+    /// string, so a plain grant does not start admitting shared subscriptions.
+    #[test]
+    fn an_allow_still_needs_an_explicit_share_grant() {
+        let p = AclPolicy::from_toml_str(
+            r#"
+            [[rules]]
+            actions = ["subscribe"]
+            topics = ["jobs/#"]
+
+            [[rules]]
+            identities = ["worker-*"]
+            actions = ["subscribe"]
+            topics = ["$share/workers/jobs/#"]
+            "#,
+        )
+        .unwrap();
+        assert!(can_sub(&p, &ident("alice", &[]), "jobs/x"));
+        assert!(!can_sub(&p, &ident("alice", &[]), "$share/workers/jobs/x"));
+        assert!(can_sub(
+            &p,
+            &ident("worker-1", &[]),
+            "$share/workers/jobs/x"
+        ));
+        assert!(!can_sub(&p, &ident("worker-1", &[]), "$share/other/jobs/x"));
+    }
+
+    /// Under `default = "allow"` the inner deny is what keeps `$SYS` closed to a
+    /// shared subscription; a deny written on the `$share` form still works.
+    #[test]
+    fn shared_denies_apply_under_default_allow_and_in_their_explicit_form() {
+        let p = AclPolicy::from_toml_str(
+            r#"
+            default = "allow"
+
+            [[rules]]
+            actions = ["subscribe"]
+            effect = "deny"
+            topics = ["$SYS/#", "$share/+/private/#"]
+            "#,
+        )
+        .unwrap();
+        let id = ident("alice", &[]);
+        assert!(!can_sub(&p, &id, "$share/g/$SYS/brokers/n1/trace/rules/r"));
+        assert!(!can_sub(&p, &id, "$share/g/private/x"));
+        // The explicit `$share` deny is not unwrapped into a deny on `private/#`.
+        assert!(can_sub(&p, &id, "private/x"));
+        assert!(can_sub(&p, &id, "$share/g/public/x"));
     }
 
     // ----- action scoping -----
