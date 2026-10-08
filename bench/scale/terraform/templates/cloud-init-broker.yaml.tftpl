@@ -96,6 +96,15 @@ runcmd:
   # cores in software and works even when the device stays single-queue. RFS
   # then keeps a flow on the CPU its socket is read from, which matters here
   # because a broker's sockets are long-lived.
+  #
+  # First, every NIC's boot-time queue count, whatever nic_spread says and
+  # before the ethtool -L below: 482-per-node-knee.sh's RIG_NIC_SPREAD=off
+  # restores it, and must not mistake the spread count for it.
+  - |
+    for IF in $(ls /sys/class/net | grep -v '^lo$'); do
+      CUR=$(ethtool -l "$IF" 2>/dev/null | awk '/^Current/{c=1} c && /^Combined/{print $2; exit}')
+      [ -z "$CUR" ] || echo "$CUR" > /run/nic-combined-"$IF"
+    done
   - |
     if [ "${nic_spread}" = "true" ]; then
       NCPU=$(nproc)

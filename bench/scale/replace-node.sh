@@ -103,6 +103,13 @@ if [ "$ARM_INV" != "$PROV_INV" ]; then
 		jq --argjson e "$entry" ".${plural}[$IDX] = \$e" "$ARM_INV" >"$ARM_INV.tmp" && mv "$ARM_INV.tmp" "$ARM_INV"
 	fi
 fi
+# The apply also reconciled the firewall to firewall.tf, dropping the :7001
+# rule a PEER_NET=public arm runs its peer bus on (the brokers still advertise
+# public addresses). Re-open it at once, for the arm's current brokers. The
+# arm's PKI records the network its peer certificates were minted for.
+if [ "$(cat "$ARM_DIR/pki-$(jq -r '.brokers | length' "$ARM_INV")/peer-net" 2>/dev/null || echo private)" = public ]; then
+	open_public_peer_port "$ARM_DIR"
+fi
 for dir in "$PROV_DIR" "$ARM_DIR"; do
 	[ -f "$dir/known_hosts" ] || continue
 	ssh-keygen -R "$OLD_PUB" -f "$dir/known_hosts" >/dev/null 2>&1 || true

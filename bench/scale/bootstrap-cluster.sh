@@ -47,21 +47,41 @@ mkdir -p "$RUN"
 N=$(broker_count)
 say "bootstrapping a $N-node cluster (mode: $MODE)"
 
+# PEER_NET=private|public picks the network the peer bus (MQTTD_PEER_ADVERTISE,
+# :7001) runs over (#662): replication between brokers is one TCP connection
+# per pair, and the private network is an overlay (MTU 1450) whose path may
+# behave differently from the public one. SWIM, client traffic and scrapes stay
+# private. `public` puts each broker's PUBLIC address in its advertise line and
+# its peer certificate's SAN, and opens :7001 on the cloud firewall to exactly
+# the brokers' own public /32s (the firewall filters only the public side).
+PEER_NET="${PEER_NET:-private}"
+case "$PEER_NET" in private | public) ;; *) die "PEER_NET must be private or public, not '$PEER_NET'" ;; esac
+[ "$PEER_NET" = private ] || [ "${CLOUD:-hcloud}" = hcloud ] || die "PEER_NET=public is only wired for CLOUD=hcloud"
+peer_host() { # peer_host <index> — the address the peer bus advertises
+	if [ "$PEER_NET" = public ]; then broker_pub_ip "$1"; else broker_priv_ip "$1"; fi
+}
+
 # ── 1. Mint per-size secrets locally ─────────────────────────────────────────
 PKI="$RUN/pki-$N"
+# A PKI minted for one PEER_NET has the other network's SANs on its peer certs.
+if [ -d "$PKI" ] && [ "$(cat "$PKI/peer-net" 2>/dev/null || echo private)" != "$PEER_NET" ]; then
+	die "$PKI was minted for PEER_NET=$(cat "$PKI/peer-net" 2>/dev/null || echo private), not $PEER_NET — use a fresh run dir"
+fi
 if [ ! -d "$PKI" ]; then
 	mkdir -p "$PKI"
+	echo "$PEER_NET" >"$PKI/peer-net"
 	OPENSSL_BIN=$(pick_openssl)
 	say "minting cluster PKI with deploy/systemd/gen-certs.sh (OpenSSL: $OPENSSL_BIN)"
 	(cd "$PKI" && OPENSSL="$OPENSSL_BIN" PKI_DIR="$PKI/cluster" \
 		sh "$REPO_ROOT/deploy/systemd/gen-certs.sh" ca >"$PKI/gen-certs.log" 2>&1) ||
 		{ cat "$PKI/gen-certs.log" >&2; die "gen-certs.sh ca failed"; }
 	for ((i = 0; i < N; i++)); do
-		# The private IP is both the peer-advertise host and the address MQTT
-		# clients dial, so it goes in as an extra (client-facing) SAN too.
+		# The peer-advertise host (the private IP unless PEER_NET=public) is the
+		# peer certificate's SAN; the private IP is the address MQTT clients
+		# dial, so it goes in as the extra (client-facing) SAN.
 		(cd "$PKI" && OPENSSL="$OPENSSL_BIN" PKI_DIR="$PKI/cluster" \
 			sh "$REPO_ROOT/deploy/systemd/gen-certs.sh" node \
-			"$(broker_node_id "$i")" "$(broker_priv_ip "$i")" "$(broker_priv_ip "$i")" \
+			"$(broker_node_id "$i")" "$(peer_host "$i")" "$(broker_priv_ip "$i")" \
 			>>"$PKI/gen-certs.log" 2>&1) ||
 			{ cat "$PKI/gen-certs.log" >&2; die "gen-certs.sh node $(broker_node_id "$i") failed"; }
 	done
@@ -99,6 +119,7 @@ render_env() { # render_env <index> <ready-min> <seeds> > file
 	fi
 	sed -e "s|@NODE_ID@|$(broker_node_id "$i")|g" \
 		-e "s|@PRIVATE_IP@|$(broker_priv_ip "$i")|g" \
+		-e "s|@PEER_HOST@|$(peer_host "$i")|g" \
 		-e "s|@SWIM_SEEDS@|$seeds|g" \
 		-e "s|@READY_MIN_MEMBERS@|$ready|g" \
 		-e "s|@DURABLE_LINE@|$durable_line|g" \
@@ -159,6 +180,13 @@ for ((i = 0; i < ND; i++)); do
 		"$PKI/client-tls/certs/client.key" "root@$dip:/opt/bench-certs/"
 	rssh "$dip" "chmod 644 /opt/bench-certs/*"
 done
+
+# ── 3.4 PEER_NET=public: open the peer port to the brokers, and only them ────
+# Done here, after any resize, because the firewall is tofu's: a re-apply drops
+# the rule. replace-node.sh re-opens it after its own apply when the arm's PKI
+# was minted public; the next public arm opens it anyway. Teardown destroys the
+# firewall with it.
+[ "$PEER_NET" = private ] || open_public_peer_port "$RUN"
 
 # ── 3.5 private-net full-mesh gate (issue #393 forensics) ────────────────────
 # After the cloud-init attach retry the fabric can drop a host's OUTBOUND
@@ -249,6 +277,15 @@ if [ "$N" -gt 1 ]; then
 		follower_ready "$i"
 	done
 	say "founder armed; all $N nodes READY at majority floor $MAJORITY"
+	# /readyz is majority-only, so a public peer bus with a pair the cloud
+	# firewall still blocks can come up READY. Name that here, not as a
+	# forwarding-control failure later.
+	if [ "$PEER_NET" = public ]; then
+		mkdir -p "$RUN/formation"
+		await_full_mesh 180 3 "$RUN/formation/peer-mesh-public.txt" ||
+			die "PEER_NET=public: not every broker has its $((N - 1)) peer links within 180s — is :7001 open between the public addresses? Evidence: $RUN/formation/peer-mesh-public.txt"
+		say "public peer bus: full mesh on every broker"
+	fi
 fi
 
 say "cluster is up ($MODE mode)"
