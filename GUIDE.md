@@ -119,7 +119,9 @@ where they matter: a **two-node cluster is worse than one node** for write
 availability ([Resizing](#resizing-the-cluster)), and there is **no dashboard, and
 configuration only changes through files** — operations are signals and files, on purpose
 ([Configuration](#configuration)), with an optional authenticated admin API for questions
-and a few audited actions ([OPERATIONS](docs/OPERATIONS.md#the-admin-api-adr-0081)).
+and a few audited actions ([OPERATIONS](docs/OPERATIONS.md#the-admin-api-adr-0081)). The
+one file the API can write is the rules file, and only for the certificates named in
+`[rules] admin_writers` (none by default).
 
 **Jump to:** [**Start here**](#start-here) ·
 [Try it in two minutes](#try-it-in-two-minutes) ·
@@ -289,7 +291,10 @@ cargo install --locked --git https://github.com/mbilling/fss-mqtt-broker mqttui
 Want to see a real cluster with dashboards? `mqttui --run demo-stack` starts seven
 nodes with Prometheus and Grafana dashboards on `localhost:3000` and a load
 generator so the panels move — it starts 25 containers, and `mqttui` warns you
-before it does.
+before it does. Want to see the rule engine at work? `demo/rules-live/up.sh` (in a
+checkout) runs simulated power plants, homes and cars through 21 rules, with each rule's
+statistics and trace on `$SYS` and a page on `localhost:8070` that edits the rules while
+they run ([demo/rules-live](demo/rules-live/README.md)).
 
 Tasks that need this repository — building it, or the fixtures that will not fit in a
 binary — are marked `-` in the list with the reason, rather than left to fail.
@@ -636,7 +641,8 @@ Standalone and HA topologies, with schematics and what HA does *not* cover:
   The optional **admin API** (ADR 0081) is a separate mTLS listener with viewer and
   operator roles: the cluster view, clients and sessions, an authorization dry run,
   reload-with-outcome, kick/purge, cordon and a temporary log filter, all audited, driven
-  by `mqttd --admin`. It never writes configuration.
+  by `mqttd --admin`. It writes no configuration, except the rules file for a certificate
+  named in `[rules] admin_writers` (ADR 0084; none by default).
 
 ### Assurance
 Continuous, not audited-once ([ADR 0044](docs/adr/0044-release-readiness-assurance.md)):
@@ -1359,7 +1365,10 @@ The broker re-reads the configured files in place and swaps them on **live** con
 - **Rules** (`MQTTD_RULES_FILE`, ADR 0083; unreleased) — the next publish
   on every connection, already-open ones included, runs the new rules. A rules file that
   does not load rejects the **whole** reload, this list included, and the running policy
-  stays ([RULES.md](docs/RULES.md#operating-rules)).
+  stays ([RULES.md](docs/RULES.md#operating-rules)). The `[rules]` settings of ADR 0084
+  (`sys_interval_secs`, `trace`, `trace_rate`, `admin_writers`) are live too, and change
+  only when the reload is applied: an interval change takes effect at once, and the trace
+  switches on or off with it.
 
 **Revocation reaches live state (ADR 0040).** A successful reload also **sweeps** what is
 already connected, with a two-tier rule — *who you are* revoked ends the session; *what you

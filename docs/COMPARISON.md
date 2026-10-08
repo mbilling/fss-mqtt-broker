@@ -1,6 +1,6 @@
 # How mqttd compares — Mosquitto · EMQX · NanoMQ · VerneMQ
 
-**Dated 2026-08-19.** Versions compared: **mqttd** `v1.0.0` (released — signed,
+**Dated 2026-10-08.** Versions compared: **mqttd** `v1.0.0` (released — signed,
 reproducible, SBOM-attested; the [ADR 0039](adr/0039-versioning-and-upgrade-policy.md)
 compatibility promise is **in force** from this tag: adjacent-release version skew,
 migrations shipped with every schema bump, patches for the three most recent minor
@@ -122,11 +122,11 @@ HTTP API pages, VerneMQ's status page and HTTP listener docs).
 
 | | mqttd | Mosquitto | EMQX 6.2 | NanoMQ | VerneMQ 2.1 |
 |---|---|---|---|---|---|
-| Metrics | Prometheus + OTLP push + k8s probes | `$SYS` topics | dashboard + Prometheus + `$SYS` | HTTP API + Prometheus endpoint + limited `$SYS` events | Prometheus + `vmq-admin` |
-| Admin API (HTTP) | ✅ its own mTLS listener, viewer/operator roles, every request audited; the cluster view from any node, clients/sessions/subscribers, an ACL dry run, reload with outcome, kick/purge, cordon; never writes config ([ADR 0081](adr/0081-admin-api.md), [ADMIN-API.md](ADMIN-API.md)) | ⚠️ 2.0: none (dynsec is over MQTT `$CONTROL` topics); 2.1: an **experimental** `http_api` listener with read-only broker-info endpoints and **no authentication** — the manual says to front it with a reverse proxy | ✅ REST API | ✅ HTTP API (stats, clients, subscriptions, config reload) | ✅ HTTP management API |
+| Metrics | Prometheus + OTLP push + k8s probes; opt-in per-rule statistics and an opt-in rule trace on `$SYS` — no broker statistics there ([ADR 0084](adr/0084-watching-and-editing-rules-live.md)) | `$SYS` topics | dashboard + Prometheus + `$SYS` | HTTP API + Prometheus endpoint + limited `$SYS` events | Prometheus + `vmq-admin` |
+| Admin API (HTTP) | ✅ its own mTLS listener, viewer/operator roles, every request audited; the cluster view from any node, clients/sessions/subscribers, an ACL dry run, reload with outcome, kick/purge, cordon, the rules with a check and a dry run; writes no config except the rules file, for a subject listed in `[rules] admin_writers` (off by default, ADR 0084) ([ADR 0081](adr/0081-admin-api.md), [ADMIN-API.md](ADMIN-API.md)) | ⚠️ 2.0: none (dynsec is over MQTT `$CONTROL` topics); 2.1: an **experimental** `http_api` listener with read-only broker-info endpoints and **no authentication** — the manual says to front it with a reverse proxy | ✅ REST API | ✅ HTTP API (stats, clients, subscriptions, config reload) | ✅ HTTP management API |
 | Admin CLI | ✅ `mqttd --admin`, the same binary (works in the distroless image) ([ADMIN-CLI.md](ADMIN-CLI.md)) | ⚠️ `mosquitto_ctrl`: dynamic-security users/roles/ACLs and plugin listing, not runtime inspection | ✅ `emqx ctl` | ⚠️ `nanomq` start/reload; `nanomq_cli` is a client/rules tool | ✅ `vmq-admin` (sessions, cluster, config) |
-| Admin dashboard (web UI) | ✖ **by design** — the admin API and CLI instead; a provisioned Grafana demo for metrics (ADR 0020, 0081) | ⚠️ 2.1: an **experimental** dashboard served by the `http_api` listener | ✅ | ✖ (third-party projects only) | ⚠️ built-in read-only **status page**; full UIs are third-party |
-| Rule engine | ✅ EMQX rule SQL, no sinks — unreleased ([RULES.md](RULES.md), ADR 0083): `SELECT`/`FOREACH` with EMQX's built-in functions, `republish` and `console`, evaluated once per message on its landing node's connection task (scales with the cluster), a QoS 1/2 ack waits for the derived messages; data sinks remain the CI-tested **external-consumer pattern** ([INTEGRATION.md](INTEGRATION.md), ADR 0063) | ✖ | ✅ SQL | ✅ SQL (full build) | ✖ |
+| Admin dashboard (web UI) | ✖ **by design** — the admin API and CLI instead; a provisioned Grafana demo for metrics (ADR 0020, 0081); the live rules demo's editor is a separate container on the admin API, not part of the broker (ADR 0084) | ⚠️ 2.1: an **experimental** dashboard served by the `http_api` listener | ✅ | ✖ (third-party projects only) | ⚠️ built-in read-only **status page**; full UIs are third-party |
+| Rule engine | ✅ EMQX rule SQL, no sinks — unreleased ([RULES.md](RULES.md), ADR 0083): `SELECT`/`FOREACH` with EMQX's built-in functions, `republish` and `console`, evaluated once per message on its landing node's connection task (scales with the cluster), a QoS 1/2 ack waits for the derived messages; opt-in per-rule statistics and trace on `$SYS`, and rules editable through the admin API (ADR 0084); data sinks remain the CI-tested **external-consumer pattern** ([INTEGRATION.md](INTEGRATION.md), ADR 0063) | ✖ | ✅ SQL | ✅ SQL (full build) | ✖ |
 | Bridging | ✅ standalone bridge, deny-by-default directional rules, hop-count loop prevention, spool (ADR 0025) | ✅ built-in (the reference implementation) | ✅ data-integration bridges | ✅ TCP/QUIC/AWS bridges | ✅ basic `vmq_bridge` |
 | MQTT-SN / CoAP gateways | ✖ | ✖ (separate projects) | ✅ (SN, CoAP, LwM2M, …) | ✖ (DDS/SOME-IP/ZMQ instead) | ✖ |
 | Kubernetes | Helm chart: StatefulSet, per-pod PV, decommission-draining scale-down, automatic cert/policy rotation via file-watch, PVC lifecycle on shrink (ADR 0047). A Kubernetes **operator** (`MqttdCluster` CRD, split-brain detection and fencing, brownout PVC expansion — ADR 0055) is end-to-end tested and **packaged**: an install chart (`deploy/helm/mqttd-operator`) plus a signed, SBOM-attested image cut by the release pipeline (first published at v0.9.1). The chart-only path stays fully supported; the CRD is v1alpha1, schema-pinned in CI | — | Operator + Helm | container image only (no official chart or operator) | official Helm chart (`docker-vernemq`); `vmq-operator` sees only dependency bumps |
@@ -223,6 +223,10 @@ not as absent. This file is re-checked at every cross-broker benchmark re-run
 
 ## Changelog
 
+- 2026-10-08 — ADR 0084: the Metrics, Admin API, Admin dashboard and Rule engine rows say
+  what mqttd now publishes on `$SYS` (opt-in rule statistics and trace, no broker
+  statistics) and that the admin API can write the rules file for a listed writer; the
+  date above moves with them.
 - 2026-10-07 — Rule-engine row and the "do not choose mqttd (yet)" paragraph rewritten for
   ADR 0083: mqttd runs EMQX's rule SQL in the broker (`republish`/`console`, no sinks),
   unreleased and so marked; data sinks remain the external-consumer pattern. ADR 0063 §1's

@@ -7,7 +7,8 @@ serving. This page is the rest: the procedures an operator runs *after* day 1. S
 and files are the control surface, and configuration is only ever changed through the file
 ([GUIDE](../GUIDE.md#principles)). The optional, authenticated
 [admin API](#the-admin-api-adr-0081) answers questions about the running cluster and runs a
-short list of audited actions; it never writes configuration.
+short list of audited actions. It writes no configuration, except the rules file for a
+subject listed in `[rules] admin_writers`, which is empty by default ([Rules](#rules-adr-0083)).
 
 ## Certificate / ACL / CRL rotation — automatic
 
@@ -833,6 +834,8 @@ Everything below runs from the `mqttd` binary itself, so it works in the distrol
 | Get a misbehaving client off | `mqttd --admin kick <client>`; delete its session: `purge` |
 | Stop new connections to a node (keep the current ones) | `mqttd --admin cordon` / `uncordon` |
 | More logging for 15 minutes | `mqttd --admin log-override 'mqttd::hub=debug' --ttl 900` |
+| What are the rules doing, and is the file on disk the one running? | `mqttd --admin rules` (`--json`: `digest`, `file_digest`) |
+| Change the rules on this node (a listed writer) | `mqttd --admin rules-apply rules.toml --if_match <digest>` |
 | Remove a node for good | `mqttd --decommission` |
 
 ## The admin API (ADR 0081)
@@ -879,7 +882,8 @@ operators = ["CN=sre-lead, O=example"]    # reads + actions
 - **Audit.** Every request, reads included, is one `admin.request` record:
   `role=viewer GET /admin/v1/node -> 200`, with the certificate subject.
 - **Errors.** `{"error":{"code":"forbidden","message":"…"}}`; scripts match on `code`
-  (`forbidden`, `not-found`, `method-not-allowed`, `bad-request`, `too-large`, `timeout`).
+  (`forbidden`, `not-found`, `method-not-allowed`, `bad-request`, `too-large`, `timeout`;
+  the rules endpoints add their own, listed in [ADMIN-API.md](ADMIN-API.md#errors)).
 
 `mqttd --admin <verb>` is the client, in the same binary, so it works in the distroless
 image (`kubectl exec <pod> -- mqttd --admin node`):
@@ -939,6 +943,9 @@ mqttd --admin retained --prefix plant/            # count and bytes, then topics
 - `--user` and `--source` match connected clients only; `--source` is a prefix of
   `ip:port`, and a relocated session has no source (the address is the relaying node).
 - Payloads are never returned: not for retained messages, not for a Will (its size is).
+  The exceptions are the operator-only rules routes: `rules/test` returns what rules
+  render from the message you send it, and a rule's last error, which an operator sees
+  in full, can quote a value from a payload.
 - Listing and ranking visit every session on the node, once per request, on the hub's
   loop. That is milliseconds for tens of thousands of sessions; on a node with millions,
   prefer `--prefix` and a small `--limit`.
@@ -1135,6 +1142,50 @@ operating summary. The engine is unreleased: no release has it yet.
   a broken rules file holds back an urgent revocation until it is fixed, so check the
   rules file before you reload, and look for `security reload REJECTED` after. At boot, a
   rules file that does not load refuses the start.
+- **Watch them over MQTT** ([ADR 0084](adr/0084-watching-and-editing-rules-live.md);
+  [RULES.md § Watch and edit rules live](RULES.md#watch-and-edit-rules-live)).
+  `[rules] sys_interval_secs` (`MQTTD_RULES_SYS_INTERVAL`, off by default) makes each node
+  publish every rule's counts, rates, last activity and last error kind on
+  `$SYS/brokers/<node>/rules/<id>`, and a summary on `$SYS/brokers/<node>/rules`: the
+  running digest and the last reload's trigger, outcome and error **kind**. A client needs
+  an ACL grant for `$SYS/brokers/+/rules/#` (HARDENING.md H-3.5). The messages are QoS 0,
+  never retained, and take node-pool ingress credit: under load a tick is skipped and
+  counted in the summary's `stats_dropped`, not queued. With 1,024 rules at a 1 s interval
+  that is 1,025 messages a second per node, in `mqttd_publish_received_total{qos="0"}` like
+  any publish; 10 s or more is plenty for a dashboard.
+- **The trace** (`[rules] trace`, `MQTTD_RULES_TRACE`) copies the messages rules see —
+  payloads up to 1 KiB, client ids, usernames — onto
+  `$SYS/brokers/<node>/trace/rules/<id>`, at most `trace_rate` records per rule per second
+  (default 20) and max(`trace_rate`, 200) per node. It is a debugging tool: turn it on for
+  the minutes you need, through a reload, and off again. On, it logs a WARN, and an
+  `INSECURE:` line with no ACL file or an ACL whose default is `allow`; whoever may
+  subscribe to a rule's trace topic reads what that rule's `FROM` matches. Dropped records
+  are counted in the summary's `trace_dropped`.
+- **Change them through the admin API**, optionally. With `[rules] admin_writers`
+  (`MQTTD_RULES_ADMIN_WRITERS`) naming certificate subjects that also hold the operator
+  role, `mqttd --admin rules-apply <file> --if_match <digest>` replaces the rules file and
+  `rule-delete` removes one rule, and `PUT /admin/v1/rule` inserts or updates one
+  ([ADMIN-API.md § Rules](ADMIN-API.md#rules)). The broker writes the file atomically,
+  keeps the previous one as `<file>.prev`, and reloads (trigger `admin-rules`); each write
+  is a `rules.write` audit record. Writes are per node, so apply them to every node and
+  check `same_rules` in `mqttd --admin cluster --json`. They need a rules file in a
+  directory the broker may write, so they do not fit the Helm chart's ConfigMap or a
+  GitOps-managed file, which would also overwrite them: keep `admin_writers` empty there.
+  `<file>.prev`, beside the rules file on the broker's host, is the file before the last
+  write.
+- **Suggested alerts for these:**
+
+  ```promql
+  increase(mqttd_security_reloads_total{outcome="rejected",trigger="admin-rules"}[10m]) > 0
+  ```
+
+  A rules write whose reload was refused: the file on disk is not the one running, and
+  the next reload of any kind will try it again. In the SIEM, notify on every
+  `rules.write` record (who, which rule, old and new digest), as on operator actions
+  (HARDENING.md H-8.5), and on the log line `rule trace is ON` outside a planned
+  debugging window. <!-- TODO-INTEGRATE: confirm the trace WARN's exact text, and add the
+  hub's reserved-topic drop counter (design: mqttd_publish_dropped_total{reason="reserved"})
+  with "nonzero after a rolling upgrade has finished: a peer is still forwarding $SYS". -->
 - **Drift:** `mqttd_rules_info{checksum}` is the file's SHA-256 (the same value
   `--check-rules` prints). More than one checksum at 1 across the cluster means nodes
   evaluate their own clients' publishes differently. A checksum replaced by a reload stays
