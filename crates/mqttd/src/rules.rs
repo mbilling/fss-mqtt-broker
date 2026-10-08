@@ -691,11 +691,25 @@ pub fn clip(s: &str, max: usize) -> &str {
     &s[..end]
 }
 
-/// A rule definition's short hash (ADR 0084): 16 hex digits of the SHA-256 of its SQL,
-/// its actions as JSON and its `enable` flag — what an edit that changes what the rule
-/// does changes, so a stored error can be told from one about an earlier definition.
+/// A rule definition's short hash (ADR 0084): 16 hex digits of an HMAC-SHA256 of its
+/// SQL, its actions as JSON and its `enable` flag — what an edit that changes what the
+/// rule does changes, so a stored error can be told from one about an earlier
+/// definition.
+///
+/// Keyed with [`def_key`], random and made once per process, because `def` is
+/// published on `$SYS` and to admin viewers: a plain hash of the SQL would let a
+/// reader who knows the rest of a rule test guesses at a secret in it (a pseudonym
+/// salt) offline. So the same definition hashes alike within one process only — on
+/// another node, or after a restart, it differs. Nothing compares it across processes.
 #[must_use]
 pub fn rule_def(rule: &Rule) -> String {
+    let tag = aws_lc_rs::hmac::sign(def_key(), def_text(rule).as_bytes());
+    mqtt_core::hex_lower(&tag.as_ref()[..8])
+}
+
+/// What [`rule_def`] hashes: the SQL, the actions as JSON and the `enable` flag, each
+/// after a NUL.
+fn def_text(rule: &Rule) -> String {
     let actions = serde_json::to_string(rule.action_specs()).unwrap_or_default();
     let mut text = String::with_capacity(rule.sql().len() + actions.len() + 4);
     text.push_str(rule.sql());
@@ -703,9 +717,23 @@ pub fn rule_def(rule: &Rule) -> String {
     text.push_str(&actions);
     text.push('\0');
     text.push(if rule.enabled() { '1' } else { '0' });
-    let mut def = crate::reload::sha256_hex(text.as_bytes());
-    def.truncate(16);
-    def
+    text
+}
+
+/// The key of [`rule_def`]: 32 random bytes, drawn once per process (from the clock's
+/// nanoseconds should the system's random source fail).
+fn def_key() -> &'static aws_lc_rs::hmac::Key {
+    static KEY: std::sync::OnceLock<aws_lc_rs::hmac::Key> = std::sync::OnceLock::new();
+    KEY.get_or_init(|| {
+        let mut bytes = [0u8; 32];
+        if aws_lc_rs::rand::fill(&mut bytes).is_err() {
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos());
+            bytes[..16].copy_from_slice(&nanos.to_le_bytes());
+        }
+        aws_lc_rs::hmac::Key::new(aws_lc_rs::hmac::HMAC_SHA256, &bytes)
+    })
 }
 
 /// What a rule's last error was about (ADR 0084).
@@ -742,6 +770,7 @@ pub struct LastError {
     /// The error, at most [`ERROR_TEXT_MAX`] bytes.
     pub message: String,
     /// The [`rule_def`] it was about: an entry about an earlier definition is dropped.
+    /// Keyed per process, so it is compared only within this one.
     pub def: String,
 }
 
@@ -762,6 +791,8 @@ pub struct RulesObserve {
     last_errors: Mutex<HashMap<Arc<str>, LastError>>,
     /// When each rule's evaluations last grew, as the statistics saw it at a tick.
     last_active: Mutex<HashMap<Arc<str>, SystemTime>>,
+    /// Why anyone may read the trace, as the last [`apply`](Self::apply) was told.
+    exposed: Mutex<Option<String>>,
 }
 
 impl RulesObserve {
@@ -781,15 +812,24 @@ impl RulesObserve {
             stats_dropped: AtomicU64::new(0),
             last_errors: Mutex::new(HashMap::new()),
             last_active: Mutex::new(HashMap::new()),
+            exposed: Mutex::new(None),
         });
         (observe, trace_rx)
     }
 
     /// Apply the committed `[rules]` settings. `exposed` says why anyone may read the
-    /// trace (no ACL file, an ACL whose default is allow), when that is so: with the
-    /// trace on it is logged as `INSECURE:`.
+    /// trace (no ACL file, an ACL whose default is allow), when that is so: it is logged
+    /// as `INSECURE:` when the trace turns on, and when the reason changes while it is
+    /// on — not again on every reload.
     pub fn apply(&self, config: &mqtt_config::Rules, exposed: Option<&str>) {
         let new = RulesSysSettings::from(config);
+        let was_exposed = std::mem::replace(
+            &mut *self
+                .exposed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            exposed.map(str::to_string),
+        );
         let was_tracing = self.trace.swap(new.trace, Relaxed);
         self.trace_rate.store(new.trace_rate, Relaxed);
         if new.trace && !was_tracing {
@@ -803,7 +843,9 @@ impl RulesObserve {
         } else if !new.trace && was_tracing {
             info!("rule trace is off (ADR 0084)");
         }
-        if let (true, Some(why)) = (new.trace, exposed) {
+        // Said as the trace turns on, and again only when why it is readable changes.
+        let reason_changed = was_exposed.as_deref() != exposed;
+        if let (true, Some(why)) = (new.trace && (!was_tracing || reason_changed), exposed) {
             warn!(
                 "INSECURE: the rule trace is on and {why}: any client can subscribe to \
                  $SYS/brokers/+/trace/rules/+ and read what the rules see (ADR 0084)"
@@ -894,9 +936,10 @@ impl RulesObserve {
         self.errors().retain(|id, e| keep(id, e));
     }
 
-    /// When `rule` last ran, as of the statistics' last tick: the tick at which its
-    /// evaluation count was seen to grow. `None` before it ran, and while the statistics
-    /// are off.
+    /// When `rule` last ran, as the statistics saw it: the tick at which its evaluation
+    /// count was seen to grow. `None` until they see it grow — runs from before they were
+    /// turned on, or while they were off, are not seen. Kept while a reload removes the
+    /// rule, as its counts are, so a rule put back is not taken for one that ran.
     #[must_use]
     pub fn last_active(&self, rule: &str) -> Option<SystemTime> {
         self.active().get(rule).copied()
@@ -912,7 +955,7 @@ impl RulesObserve {
         self.active().insert(rule.clone(), at);
     }
 
-    /// Forget when the rules `keep` refuses last ran: a reload removed them.
+    /// Forget when the rules `keep` refuses last ran: ids the statistics no longer keep.
     pub(crate) fn retain_last_active(&self, keep: impl Fn(&str) -> bool) {
         self.active().retain(|id, _| keep(id));
     }
@@ -1371,6 +1414,125 @@ mod tests {
             .and_then(|l| l.rsplit(' ').next())
             .and_then(|v| v.parse().ok())
             .unwrap_or(0)
+    }
+
+    /// ADR 0084: a rule's `def` is keyed per process. Rules defined alike hash alike in
+    /// it, and a change to the SQL, the actions or `enable` changes the hash; but it is
+    /// not the plain SHA-256 that a reader of `$SYS` could recompute from a guess at the
+    /// rule — say, at the salt in its SQL.
+    #[test]
+    fn a_rule_definition_hash_is_keyed_per_process() {
+        let set = RuleSet::parse(
+            r#"
+[rules.a]
+sql = '''SELECT sha256(concat('salt-1', clientid)) AS id FROM "t/#"'''
+actions = [{ function = "console" }]
+
+[rules.same]
+sql = '''SELECT sha256(concat('salt-1', clientid)) AS id FROM "t/#"'''
+actions = [{ function = "console" }]
+
+[rules.sql]
+sql = '''SELECT sha256(concat('salt-2', clientid)) AS id FROM "t/#"'''
+actions = [{ function = "console" }]
+
+[rules.actions]
+sql = '''SELECT sha256(concat('salt-1', clientid)) AS id FROM "t/#"'''
+actions = [{ function = "republish", args = { topic = "out/${id}" } }]
+
+[rules.disabled]
+sql = '''SELECT sha256(concat('salt-1', clientid)) AS id FROM "t/#"'''
+actions = [{ function = "console" }]
+enable = false
+"#,
+        )
+        .unwrap()
+        .rules;
+        let def = |id: &str| rule_def(set.get(id).unwrap());
+        assert_eq!(def("a").len(), 16);
+        assert_eq!(def("a"), def("a"), "one key for the process");
+        assert_eq!(def("a"), def("same"), "alike, whatever the id");
+        for changed in ["sql", "actions", "disabled"] {
+            assert_ne!(def(changed), def("a"), "{changed}");
+        }
+        let plain = crate::reload::sha256_hex(def_text(set.get("a").unwrap()).as_bytes());
+        assert_ne!(def("a"), plain[..16], "keyed, not the plain hash");
+    }
+
+    /// The lines `f` logs at WARN and above, as the broker's log shows them less the
+    /// timestamp.
+    fn warnings(f: impl FnOnce()) -> Vec<String> {
+        #[derive(Clone, Default)]
+        struct Captured(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Captured {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let captured = Captured::default();
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .without_time()
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+        let text = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        text.lines().map(str::to_string).collect()
+    }
+
+    /// ADR 0084: the `INSECURE:` line says that anyone may read the trace, and why. It is
+    /// logged when the trace turns on while that is so, and when the reason changes while
+    /// the trace is on — not on every reload, which would teach an operator to skip it.
+    #[test]
+    fn the_insecure_trace_line_is_logged_once_per_change() {
+        const NO_ACL: Option<&str> = Some("no MQTTD_ACL_FILE is configured");
+        const ALLOW: Option<&str> = Some("the ACL's default is allow");
+        let (observe, _rx) = RulesObserve::new();
+        let on = mqtt_config::Rules {
+            trace: true,
+            ..mqtt_config::Rules::default()
+        };
+        let faster = mqtt_config::Rules {
+            trace_rate: on.trace_rate + 1,
+            ..on.clone()
+        };
+        let off = mqtt_config::Rules::default();
+        let said = |config: &mqtt_config::Rules, exposed: Option<&str>| {
+            let lines = warnings(|| observe.apply(config, exposed));
+            let count = |what: &str| lines.iter().filter(|l| l.contains(what)).count();
+            (count("rule trace is ON:"), count("INSECURE:"), lines)
+        };
+
+        let (on_line, insecure, lines) = said(&on, NO_ACL);
+        assert_eq!((on_line, insecure), (1, 1), "at boot: {lines:?}");
+        assert!(
+            lines.iter().any(|l| l.ends_with(
+                " WARN mqttd::rules: INSECURE: the rule trace is on and no MQTTD_ACL_FILE is \
+                 configured: any client can subscribe to $SYS/brokers/+/trace/rules/+ and \
+                 read what the rules see (ADR 0084)"
+            )),
+            "{lines:?}"
+        );
+        for (config, exposed, want, why) in [
+            (&on, NO_ACL, (0, 0), "a reload that changes neither"),
+            (&faster, NO_ACL, (0, 0), "another rate"),
+            (&faster, ALLOW, (0, 1), "another reason"),
+            (&faster, None, (0, 0), "an ACL that denies"),
+            (&faster, ALLOW, (0, 1), "readable again"),
+            (&off, ALLOW, (0, 0), "the trace off"),
+            (&off, NO_ACL, (0, 0), "off, whatever the reason"),
+            (&on, NO_ACL, (1, 1), "on again"),
+            (&on, NO_ACL, (0, 0), "and a reload after it"),
+        ] {
+            let (on_line, insecure, lines) = said(config, exposed);
+            assert_eq!((on_line, insecure), want, "{why}: {lines:?}");
+        }
     }
 
     /// A gated derived action is counted once its gate answers: accepted → `ok`;

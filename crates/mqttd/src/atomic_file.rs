@@ -19,7 +19,8 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone, Copy)]
 pub struct Replace<'a> {
     /// The mode of a file that did not exist before (Unix). A file that did keeps its
-    /// mode, and its group when this process may set it.
+    /// mode, and its group when this process may set it; when it may not, the group's
+    /// permissions are dropped rather than given to another group.
     pub new_mode: u32,
     /// What to keep beside the file as `<name>.prev`, written the same way and with the
     /// same mode: the bytes being replaced, so a change can be investigated and put back.
@@ -167,13 +168,26 @@ fn set_mode(
     new_mode: u32,
 ) -> std::io::Result<()> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
-    if let Some(m) = like {
-        // Best effort: an unprivileged process may only pick a group it is in. The group
-        // first, as a change of owner may clear the set-id bits the mode then restores.
-        let _ = std::os::unix::fs::fchown(file, None, Some(m.gid()));
+    let old = like.map(|m| {
+        // An unprivileged process may only pick a group it is in. The group first, as a
+        // change of owner may clear the set-id bits the mode then restores.
+        let kept = std::os::unix::fs::fchown(file, None, Some(m.gid())).is_ok();
+        (m.mode(), kept)
+    });
+    file.set_permissions(std::fs::Permissions::from_mode(mode_for(old, new_mode)))
+}
+
+/// The mode a replacement gets: `new_mode` for a file that did not exist, else the old
+/// file's (`old`: its mode, and whether its group was kept). The old group's bits are not
+/// given to another group: a replacement that could not keep the group loses them, and
+/// set-group-id with them.
+#[cfg(unix)]
+fn mode_for(old: Option<(u32, bool)>, new_mode: u32) -> u32 {
+    match old {
+        None => new_mode,
+        Some((mode, true)) => mode & 0o7777,
+        Some((mode, false)) => mode & 0o7777 & !0o2070,
     }
-    let mode = like.map_or(new_mode, |m| m.mode() & 0o7777);
-    file.set_permissions(std::fs::Permissions::from_mode(mode))
 }
 
 #[cfg(not(unix))]
@@ -264,6 +278,31 @@ mod tests {
         };
         replace(&fresh, b"x", &how).unwrap();
         assert_eq!(mode(&fresh), 0o604);
+    }
+
+    /// A file that did not exist gets the mode asked for, which can be private. One that
+    /// did keeps its mode, unless its group could not be kept (as when an unprivileged
+    /// process is not in it): then the group's bits go, rather than reach another group.
+    #[cfg(unix)]
+    #[test]
+    fn a_new_file_is_private_and_a_lost_group_loses_its_bits() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = dir("private");
+        let path = d.path().join("rules.toml");
+        let how = Replace {
+            new_mode: 0o600,
+            previous: None,
+        };
+        replace(&path, b"new", &how).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode, 0o600);
+
+        assert_eq!(mode_for(None, 0o600), 0o600);
+        assert_eq!(mode_for(Some((0o100_640, true)), 0o600), 0o640);
+        assert_eq!(mode_for(Some((0o100_640, false)), 0o600), 0o600);
+        assert_eq!(mode_for(Some((0o100_664, false)), 0o600), 0o604);
+        assert_eq!(mode_for(Some((0o102_750, false)), 0o600), 0o700);
+        assert_eq!(mode_for(Some((0o102_750, true)), 0o600), 0o2750);
     }
 
     /// The temporary files' names cannot be guessed: a file or symlink planted at a name

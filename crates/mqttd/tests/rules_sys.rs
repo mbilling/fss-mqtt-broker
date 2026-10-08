@@ -259,6 +259,81 @@ async fn the_statistics_list_every_rule_with_counts_rates_and_last_activity() {
     );
 }
 
+/// [`THREE_RULES`] without `hot`.
+const HOT_REMOVED: &str = r#"
+[rules.cold]
+sql = 'SELECT * FROM "never/#"'
+actions = [{ function = "console" }]
+
+[rules.off]
+sql = 'SELECT * FROM "t/#"'
+actions = [{ function = "console" }]
+enable = false
+"#;
+
+/// ADR 0084 D4: `last_active_at` is the tick at which the statistics saw a rule's
+/// evaluations grow. What ran before they were on, or while they were off, was not seen
+/// to run. A reload that removes a rule and one that puts it back keep its last activity
+/// with its counts, which are kept by rule id: the rule put back is active again only
+/// once it runs.
+#[tokio::test(start_paused = true)]
+async fn last_active_is_kept_across_a_reload_and_set_only_when_a_rule_runs() {
+    let w = watched(THREE_RULES, &settings(0, false, 20));
+    let (mut sys, _stop) = spawn_stats(&w, plenty(), Arc::new(LastReload::default()));
+    let conn = w.rules.for_connection();
+    publish(&conn, "t/1", br#"{"v":5}"#);
+    w.observe.apply(&settings(2, false, 20), None);
+    let (_, per_rule) = next_tick(&mut sys, 3).await;
+    assert_eq!(per_rule["hot"]["counts"]["matched"], 1);
+    assert_eq!(
+        per_rule["hot"]["last_active_at"],
+        Value::Null,
+        "it ran before the statistics were on"
+    );
+
+    publish(&conn, "t/1", br#"{"v":5}"#);
+    let (summary, per_rule) = next_tick(&mut sys, 3).await;
+    let ran = per_rule["hot"]["last_active_at"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(ran, summary["at"].as_str().unwrap(), "seen at this tick");
+
+    w.rules_tx.send(rule_set(HOT_REMOVED)).unwrap();
+    next_tick(&mut sys, 2).await;
+    w.rules_tx.send(rule_set(THREE_RULES)).unwrap();
+    let (_, per_rule) = next_tick(&mut sys, 3).await;
+    assert_eq!(per_rule["hot"]["counts"]["matched"], 2, "kept by rule id");
+    assert_eq!(
+        per_rule["hot"]["last_active_at"],
+        ran.as_str(),
+        "put back, and not run since"
+    );
+
+    publish(&conn, "t/1", br#"{"v":5}"#);
+    let (summary, per_rule) = next_tick(&mut sys, 3).await;
+    assert_eq!(per_rule["hot"]["last_active_at"], summary["at"]);
+    assert_ne!(per_rule["hot"]["last_active_at"], ran.as_str());
+    let active = summary["at"].as_str().unwrap().to_string();
+
+    // Off, a run nobody sees, and on again.
+    w.observe.apply(&settings(0, false, 20), None);
+    assert!(
+        timeout(Duration::from_secs(60), sys.recv()).await.is_err(),
+        "off: no tick"
+    );
+    publish(&conn, "t/1", br#"{"v":5}"#);
+    w.observe.apply(&settings(2, false, 20), None);
+    let (_, per_rule) = next_tick(&mut sys, 3).await;
+    assert_eq!(per_rule["hot"]["counts"]["matched"], 4);
+    assert_eq!(
+        per_rule["hot"]["last_active_at"],
+        active.as_str(),
+        "the run while off was not seen"
+    );
+    assert_eq!(per_rule["cold"]["last_active_at"], Value::Null);
+}
+
 /// ADR 0084: the settings are live. A shorter interval applies at once — the next tick
 /// is the new interval after the last, not after the old one — off stops the ticks, and
 /// on again ticks at once when that is already due.
@@ -284,6 +359,50 @@ async fn an_interval_change_applies_at_once() {
     w.observe.apply(&settings(5, false, 20), None);
     next_tick(&mut sys, 3).await;
     assert_eq!(Instant::now(), off_for, "overdue, so at once");
+}
+
+/// The next `$SYS` message's topic and Message Expiry Interval, within an hour of
+/// (paused) time.
+async fn next_expiry(rx: &mut mpsc::UnboundedReceiver<HubCommand>) -> (String, u32) {
+    match timeout(Duration::from_secs(3600), rx.recv()).await {
+        Ok(Some(HubCommand::SysPublish {
+            topic,
+            message_expiry,
+            ..
+        })) => (topic, message_expiry),
+        other => panic!("expected a SysPublish, got {other:?}"),
+    }
+}
+
+/// ADR 0084: every `$SYS` message carries a Message Expiry Interval, so a copy that is
+/// queued anyway (by a peer that predates live-only delivery) expires: two statistics
+/// intervals, at least 10 seconds, and 10 seconds for a trace record.
+#[tokio::test(start_paused = true)]
+async fn every_sys_message_carries_a_message_expiry() {
+    let w = watched(THREE_RULES, &settings(30, false, 20));
+    let (mut sys, _stop) = spawn_stats(&w, plenty(), Arc::new(LastReload::default()));
+    for (interval, expiry) in [(30, 60), (3, 10), (600, 1200)] {
+        w.observe.apply(&settings(interval, false, 20), None);
+        // A summary and one message per rule.
+        for _ in 0..4 {
+            let (topic, got) = next_expiry(&mut sys).await;
+            assert_eq!(got, expiry, "{topic} every {interval} s");
+        }
+    }
+
+    let mut w = watched(TRACED, &settings(0, true, 20));
+    publish(&w.rules.for_connection(), "t/1", br#"{"v":"x"}"#);
+    let (hub_tx, mut hub_rx) = mpsc::unbounded_channel();
+    tokio::spawn(run_trace(
+        w.trace_rx.take().unwrap(),
+        w.rules.clone(),
+        hub_tx,
+        plenty(),
+        CancellationToken::new(),
+    ));
+    let (topic, expiry) = next_expiry(&mut hub_rx).await;
+    assert_eq!(topic, "$SYS/brokers/n1/trace/rules/pub");
+    assert_eq!(expiry, 10);
 }
 
 /// ADR 0084 / ADR 0082: each statistics message takes node-pool credit first. A pool too
@@ -314,8 +433,9 @@ async fn a_tick_the_pool_cannot_carry_is_skipped_and_counted() {
 
 /// ADR 0084: a rule's last error is kept from the failure the log reports (`sql` or
 /// `action`, a `$SYS` republish refused included) or synthesized from the failed-action
-/// count for a refused or unrouted derived message (`delivery`). Its text is on `$SYS`
-/// only while the trace is on, and a reload that removes or redefines the rule drops it.
+/// count for a refused or unrouted derived message (`delivery`). `$SYS` shows its time and
+/// kind, the admin API its text too, and a reload that removes or redefines the rule
+/// drops it.
 #[tokio::test(start_paused = true)]
 async fn last_errors_by_kind_and_a_synthesized_delivery_entry() {
     let text = r#"
@@ -352,30 +472,21 @@ actions = [{ function = "republish", args = { topic = "out/x" } }]
     for doc in per_rule.values() {
         assert!(
             doc["last_error"].get("message").is_none(),
-            "no error text on $SYS with the trace off: {doc}"
+            "no error text on $SYS: {doc}"
         );
     }
+    // The texts the admin API shows an operator.
+    let message = |id: &str| w.observe.last_error(id).unwrap().message;
     assert_eq!(
-        w.observe.last_error("sqlerr").unwrap().message,
+        message("sqlerr"),
         "int(): cannot convert 'abc' to an integer"
     );
-
-    w.observe.apply(&settings(2, true, 20), None);
-    let (_, per_rule) = next_tick(&mut sys, 3).await;
-    assert!(
-        per_rule["sqlerr"]["last_error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("'abc'"),
-        "{}",
-        per_rule["sqlerr"]
-    );
     assert_eq!(
-        per_rule["actfail"]["last_error"]["message"],
+        message("actfail"),
         "republish topic is reserved for the broker: $SYS/brokers/n1/rules"
     );
     assert_eq!(
-        per_rule["fate"]["last_error"]["message"],
+        message("fate"),
         "3 derived message(s) failed (refused or not routed)"
     );
 
@@ -401,6 +512,46 @@ actions = [{ function = "republish", args = { topic = "${t}" } }]
         "unchanged: kept"
     );
     assert!(w.observe.last_error("fate").is_none());
+}
+
+/// ADR 0084: a rule's last error on `$SYS` is its time and kind, never its text, with
+/// the trace off or on: the text can quote a payload value, and a reader granted the
+/// statistics need not be one granted the trace. The text is kept, for the trace and
+/// the admin API.
+#[tokio::test(start_paused = true)]
+async fn sys_statistics_never_carry_error_text() {
+    let w = watched(
+        r#"
+[rules.sqlerr]
+sql = 'SELECT int(payload.v) AS w FROM "e/#"'
+actions = []
+"#,
+        &settings(2, false, 20),
+    );
+    let (mut sys, _stop) = spawn_stats(&w, plenty(), Arc::new(LastReload::default()));
+    next_tick(&mut sys, 1).await;
+    publish(&w.rules.for_connection(), "e/1", br#"{"v":"s3cret-value"}"#);
+    assert!(
+        w.observe
+            .last_error("sqlerr")
+            .unwrap()
+            .message
+            .contains("'s3cret-value'"),
+        "the kept text quotes the payload"
+    );
+    for trace in [false, true] {
+        w.observe.apply(&settings(2, trace, 20), None);
+        let (summary, per_rule) = next_tick(&mut sys, 1).await;
+        assert_eq!(summary["trace"], trace);
+        let error = &per_rule["sqlerr"]["last_error"];
+        let keys: Vec<&String> = error.as_object().unwrap().keys().collect();
+        assert_eq!(keys, ["at", "kind"], "trace {trace}: {error}");
+        assert_eq!(error["kind"], "sql");
+        for doc in std::iter::once(&summary).chain(per_rule.values()) {
+            let text = doc.to_string();
+            assert!(!text.contains("s3cret"), "trace {trace}: {text}");
+        }
+    }
 }
 
 /// ADR 0084: a reload rejected for a config file whose broken line holds a secret puts
@@ -493,13 +644,12 @@ fn drain(rx: &mut mpsc::Receiver<TraceRecord>) -> Vec<TraceRecord> {
     out
 }
 
-/// ADR 0084 D5: with the trace off an evaluation queues nothing.
+/// ADR 0084 D5: with the trace off an evaluation queues nothing, whatever fired it: a
+/// publish, a Will or an event, each of which has its own way to the trace.
 #[tokio::test]
 async fn the_trace_off_records_nothing() {
     let mut w = watched(TRACED, &settings(0, false, 20));
-    let conn = w.rules.for_connection();
-    publish(&conn, "t/1", br#"{"v":"x"}"#);
-    assert!(drain(w.trace_rx.as_mut().unwrap()).is_empty());
+    assert!(fire_every_trigger(&mut w).is_empty());
     assert_eq!(w.observe.trace_dropped(), 0);
 }
 
@@ -759,7 +909,7 @@ async fn the_trace_queue_is_bounded_in_bytes() {
 
 /// ADR 0084: the statistics reach a real subscriber through the real hub — `QoS` 0, not
 /// retained, JSON — and never run a rule: the broker's own `$SYS` publishes are not
-/// evaluated, even by a rule whose `FROM` names `$SYS` (it loads with a warning).
+/// evaluated, even by a rule whose `FROM` names `$SYS`.
 #[tokio::test]
 async fn sys_publishes_reach_subscribers_and_never_run_rules() {
     let w = watched(
@@ -837,6 +987,13 @@ actions = [{ function = "console" }]
                 |prop| matches!(prop, mqtt_codec::Property::ContentType(c) if c == "application/json")
             ),
             "{:?}",
+            p.properties
+        );
+        assert!(
+            p.properties
+                .0
+                .contains(&mqtt_codec::Property::MessageExpiryInterval(10)),
+            "two intervals of 1 s, at least 10 s: {:?}",
             p.properties
         );
         let doc: Value = serde_json::from_slice(&p.payload).unwrap();

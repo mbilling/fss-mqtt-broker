@@ -763,7 +763,8 @@ fn relocation_target<'a>(
 /// If the CONNECT carries a will whose topic the client may not publish to, send the
 /// rejecting CONNACK and return `true` (the caller must close). `false` when there is
 /// no will or it is authorized. A Will in the broker's reserved `$SYS/` tree is never
-/// authorized, whatever the ACL says (ADR 0084).
+/// authorized, whatever the ACL says (ADR 0084); a Mosquitto bridge's state topic is not
+/// reserved ([`mqtt_core::is_reserved_topic`]), so the ACL decides that one.
 async fn will_rejected<W: AsyncWrite + Unpin>(
     writer: &mut FrameWriter<W>,
     connect: &Connect,
@@ -5519,9 +5520,20 @@ mod tests {
         mpsc::UnboundedReceiver<HubCommand>,
         Arc<mqtt_observability::RecordingAuditSink>,
     ) {
+        let (hub_tx, hub_rx) = mpsc::unbounded_channel();
+        let (reader, writer, audit) = conn_denying_secret_to(hub_tx, version, store);
+        (reader, writer, hub_rx, audit)
+    }
+
+    /// [`conn_denying_secret`] that talks to `hub` — a real one, for a test that follows
+    /// a message from one client to another.
+    fn conn_denying_secret_to(
+        hub_tx: mpsc::UnboundedSender<HubCommand>,
+        version: ProtocolVersion,
+        store: Option<Arc<dyn mqtt_storage::SessionStore>>,
+    ) -> (Reader, Writer, Arc<mqtt_observability::RecordingAuditSink>) {
         let audit = Arc::new(mqtt_observability::RecordingAuditSink::new());
         let (client, server) = tokio::io::duplex(4096);
-        let (hub_tx, hub_rx) = mpsc::unbounded_channel();
         let policy = Arc::new(ConnPolicy {
             anonymous: None,
             auth: auth_handle(Arc::new(BasicAuthenticator {
@@ -5545,7 +5557,6 @@ mod tests {
         (
             FrameReader::new(rh, version),
             FrameWriter::new(wh, version),
-            hub_rx,
             audit,
         )
     }
@@ -5898,7 +5909,8 @@ mod tests {
     }
 
     /// ADR 0084: a Will in `$SYS/` is refused at CONNECT whatever the ACL says — v5
-    /// CONNACK `0x87`, v3.1.1 `0x05` — and audited as `acl.deny.will`.
+    /// CONNACK `0x87`, v3.1.1 `0x05` — and audited as `acl.deny.will`. A Mosquitto
+    /// bridge's state is the one exception (the next test).
     #[tokio::test]
     async fn a_will_in_sys_is_refused_at_connect() {
         for version in [V5, V4] {
@@ -5932,6 +5944,95 @@ mod tests {
                 other => panic!("expected a refusing CONNACK, got {other:?}"),
             }
             assert!(audit.kinds().iter().any(|k| k == "acl.deny.will"));
+        }
+    }
+
+    /// A Mosquitto bridge with notifications on connects with a retained `QoS` 1 Will on
+    /// `$SYS/broker/connection/<id>/state` and then publishes "1" there, retained. That
+    /// one pattern is not reserved, as in Mosquitto: the CONNECT is accepted in both
+    /// versions, and the bridge's state, and then its Will, reach a subscriber of that
+    /// topic through the real hub.
+    #[tokio::test]
+    async fn a_mosquitto_bridge_state_will_is_accepted() {
+        async fn expect_state(watch: &mut Reader, state: &str, payload: &[u8]) {
+            match recv(watch).await {
+                Some(Packet::Publish(p)) => {
+                    assert_eq!((p.topic.as_str(), &p.payload[..]), (state, payload));
+                }
+                other => panic!("expected {payload:?} on {state}, got {other:?}"),
+            }
+        }
+        let (hub, hub_tx) = crate::hub::Hub::new();
+        tokio::spawn(hub.run());
+        let (mut watch_r, mut watch_w, _) = conn_denying_secret_to(hub_tx.clone(), V5, None);
+        watch_w.send(&connect_v5("watch", vec![])).await.unwrap();
+        assert!(matches!(recv(&mut watch_r).await, Some(Packet::ConnAck(_))));
+        for (pkid, (version, bridge)) in (1..).zip([(V4, "edge-4"), (V5, "edge-5")]) {
+            let state = format!("$SYS/broker/connection/{bridge}/state");
+            watch_w
+                .send(&Packet::Subscribe(Subscribe {
+                    pkid,
+                    filters: vec![SubscribeFilter {
+                        path: state.clone(),
+                        qos: QoS::AtLeastOnce,
+                        options: mqtt_codec::SubscriptionOptions::default(),
+                    }],
+                    properties: Properties::new(),
+                }))
+                .await
+                .unwrap();
+            assert!(matches!(recv(&mut watch_r).await, Some(Packet::SubAck(_))));
+
+            let (mut reader, mut writer, audit) =
+                conn_denying_secret_to(hub_tx.clone(), version, None);
+            writer
+                .send(&Packet::Connect(Connect {
+                    properties: Properties::new(),
+                    protocol: version,
+                    clean_session: true,
+                    keep_alive: 30,
+                    client_id: bridge.into(),
+                    last_will: Some(mqtt_codec::packet::LastWill {
+                        topic: state.clone(),
+                        payload: Bytes::from_static(b"0"),
+                        qos: QoS::AtLeastOnce,
+                        retain: true,
+                        properties: Properties::new(),
+                    }),
+                    username: None,
+                    password: None,
+                }))
+                .await
+                .unwrap();
+            match recv(&mut reader).await {
+                Some(Packet::ConnAck(a)) => assert_eq!(a.code, 0, "{version:?}"),
+                other => panic!("expected a CONNACK, got {other:?}"),
+            }
+            writer
+                .send(&Packet::Publish(Publish {
+                    properties: Properties::new(),
+                    dup: false,
+                    qos: QoS::AtLeastOnce,
+                    retain: true,
+                    topic: state.clone(),
+                    pkid: Some(1),
+                    payload: Bytes::from_static(b"1"),
+                }))
+                .await
+                .unwrap();
+            match recv(&mut reader).await {
+                Some(Packet::PubAck(a)) => assert_eq!((a.pkid, a.reason), (1, 0)),
+                other => panic!("expected a success PUBACK, got {other:?}"),
+            }
+            expect_state(&mut watch_r, &state, b"1").await;
+            assert!(
+                !audit.kinds().iter().any(|k| k.starts_with("acl.deny")),
+                "{version:?}: {:?}",
+                audit.kinds()
+            );
+            // The bridge goes away without a DISCONNECT: its Will is published.
+            drop((reader, writer));
+            expect_state(&mut watch_r, &state, b"0").await;
         }
     }
 

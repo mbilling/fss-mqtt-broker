@@ -249,16 +249,67 @@ pub fn valid_topic_name(topic: &str) -> bool {
     !topic.is_empty() && !topic.contains(['+', '#', '\0'])
 }
 
+/// The one pattern in `$SYS/` that is not reserved: a Mosquitto bridge's connection
+/// state. It is outside mqttd's own `$SYS/brokers/`, so nothing the broker publishes can
+/// be forged through it.
+const BRIDGE_STATE: &str = "$SYS/broker/connection/+/state";
+
+/// Whether `topic` is `$SYS` itself or below `$SYS/`.
+fn in_sys(topic: &str) -> bool {
+    topic == "$SYS" || topic.starts_with("$SYS/")
+}
+
 /// Whether `topic` is in the broker's reserved `$SYS` tree (ADR 0084): `$SYS` itself or
-/// anything below `$SYS/`. Only the broker publishes there — a client PUBLISH, a Will and
-/// a rule republish to such a topic are refused, and the hub drops one on every path but
-/// its own `$SYS` publisher.
+/// anything below `$SYS/`, except `$SYS/broker/connection/<id>/state`. Only the broker
+/// publishes there — a client PUBLISH, a Will and a rule republish to such a topic are
+/// refused, and the hub drops one on every path but its own `$SYS` publisher.
 ///
-/// The one predicate every one of those checks uses, so they cannot disagree. It is
-/// case-sensitive, as topic names are: `$sys/x` and `$SYSTEM/x` are ordinary topics.
+/// The exception is where a Mosquitto bridge with notifications on (its default) puts a
+/// retained Will when it connects, and then publishes "1". Mosquitto allows clients
+/// exactly this pattern, so mqttd does too, and the ACL decides it like any other topic.
+/// Reserving it would refuse the bridge's whole CONNECT.
+///
+/// The one predicate every one of those checks uses, so they cannot disagree. A check on
+/// a filter or on a topic prefix uses [`is_reserved_filter`] or [`is_reserved_prefix`],
+/// which keep the same exception. It is case-sensitive, as topic names are: `$sys/x`
+/// and `$SYSTEM/x` are ordinary topics.
 #[must_use]
 pub fn is_reserved_topic(topic: &str) -> bool {
-    topic == "$SYS" || topic.starts_with("$SYS/")
+    in_sys(topic) && !topic_matches(BRIDGE_STATE, topic)
+}
+
+/// Whether every topic `filter` matches is reserved ([`is_reserved_topic`]), so it can
+/// only ever match what the broker itself publishes. `$SYS/#` is not: it also matches a
+/// Mosquitto bridge's connection state.
+#[must_use]
+pub fn is_reserved_filter(filter: &str) -> bool {
+    in_sys(filter) && !filters_overlap(filter, BRIDGE_STATE)
+}
+
+/// Whether every topic that starts with `prefix` is reserved ([`is_reserved_topic`]),
+/// whatever follows it: what a topic template with this literal prefix renders is then
+/// always refused.
+#[must_use]
+pub fn is_reserved_prefix(prefix: &str) -> bool {
+    prefix.starts_with("$SYS/") && !continues_into(BRIDGE_STATE, prefix)
+}
+
+/// Whether some topic that starts with `prefix` matches `filter`. The last level of
+/// `prefix` may go on; every level before it is whole.
+fn continues_into(filter: &str, prefix: &str) -> bool {
+    let mut levels = filter.split('/');
+    let mut given = prefix.split('/').peekable();
+    while let Some(level) = given.next() {
+        let last = given.peek().is_none();
+        match levels.next() {
+            Some("#") => return true,
+            Some("+") => {}
+            Some(f) if last => return f.starts_with(level),
+            Some(f) if f == level => {}
+            _ => return false,
+        }
+    }
+    true
 }
 
 /// Returns whether a wildcard topic `filter` matches a concrete `topic`.
@@ -372,8 +423,8 @@ pub fn filters_overlap(a: &str, b: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        filter_covers, filters_overlap, is_reserved_topic, topic_matches, valid_filter,
-        valid_topic_name,
+        filter_covers, filters_overlap, is_reserved_filter, is_reserved_prefix, is_reserved_topic,
+        topic_matches, valid_filter, valid_topic_name,
     };
 
     /// [MQTT-4.7.1]: the structural filter rules. Each invalid case here was
@@ -426,8 +477,9 @@ mod tests {
         assert!(valid_filter("a/#") && !valid_topic_name("a/#"));
     }
 
-    /// ADR 0084: `$SYS` and everything under `$SYS/` is the broker's. The boundary is a
-    /// whole first level, and the comparison is case-sensitive like every topic match.
+    /// ADR 0084: `$SYS` and everything under `$SYS/` is the broker's, but for a Mosquitto
+    /// bridge's state (the next test). The boundary is a whole first level, and the
+    /// comparison is case-sensitive like every topic match.
     #[test]
     fn the_reserved_tree_is_exactly_sys_and_below() {
         for reserved in [
@@ -445,6 +497,85 @@ mod tests {
             "$sys/x", "$Sys/x", "$SYSTEM", "$SYSx/y", "$SYS2/a", "a/$SYS/b", "/$SYS/x", "SYS/x", "",
         ] {
             assert!(!is_reserved_topic(open), "{open:?} is not reserved");
+        }
+    }
+
+    /// A Mosquitto bridge's connection state is the one pattern in `$SYS/` a client may
+    /// publish to, as Mosquitto allows: `+` is one level, and it is `broker`, singular,
+    /// not mqttd's own `$SYS/brokers/`.
+    #[test]
+    fn a_mosquitto_bridge_state_topic_is_not_reserved() {
+        for open in [
+            "$SYS/broker/connection/edge-1/state",
+            "$SYS/broker/connection//state",
+        ] {
+            assert!(!is_reserved_topic(open), "{open:?} is not reserved");
+        }
+        for reserved in [
+            "$SYS/broker/connection/edge-1/state/x",
+            "$SYS/broker/connection/state",
+            "$SYS/broker/connection/a/b/state",
+            "$SYS/brokers/connection/edge-1/state",
+            "$SYS/broker/connection/edge-1/State",
+            "$SYS/broker/connection/edge-1",
+            "$SYS/broker/uptime",
+        ] {
+            assert!(is_reserved_topic(reserved), "{reserved:?} is reserved");
+        }
+    }
+
+    /// A filter, or a topic prefix, is reserved only when every topic it can reach is:
+    /// the bridge-state exception counts for them too.
+    #[test]
+    fn a_filter_or_a_prefix_is_reserved_only_when_every_topic_under_it_is() {
+        for reserved in [
+            "$SYS",
+            "$SYS/brokers/#",
+            "$SYS/brokers/+/rules",
+            "$SYS/broker/connection/+",
+            "$SYS/+/uptime",
+        ] {
+            assert!(is_reserved_filter(reserved), "{reserved:?}");
+        }
+        for open in [
+            "$SYS/#",
+            "$SYS/+/connection/#",
+            "$SYS/broker/connection/#",
+            "$SYS/broker/connection/+/state",
+            // `#` matches its parent level too [MQTT-4.7.1-2].
+            "$SYS/broker/connection/+/state/#",
+            "$SYS/broker/connection/edge-1/state",
+            "$sys/#",
+            "#",
+            "a/b",
+        ] {
+            assert!(!is_reserved_filter(open), "{open:?}");
+        }
+        for reserved in [
+            "$SYS/x/",
+            "$SYS/brokers/",
+            "$SYS/brokerx",
+            "$SYS/broker/connection/a/state/",
+            "$SYS/broker/connection/a/b/",
+            "$SYS/broker/connection/a/statex",
+        ] {
+            assert!(is_reserved_prefix(reserved), "{reserved:?}");
+        }
+        for open in [
+            "$SYS",
+            "$SYS/",
+            "$SYS/b",
+            "$SYS/broker/",
+            "$SYS/broker/connection/",
+            "$SYS/broker/connection/edge",
+            "$SYS/broker/connection/a/",
+            "$SYS/broker/connection/a/stat",
+            "$SYS/broker/connection/a/state",
+            "$sys/",
+            "a/",
+            "",
+        ] {
+            assert!(!is_reserved_prefix(open), "{open:?}");
         }
     }
 

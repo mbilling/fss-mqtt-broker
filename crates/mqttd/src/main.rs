@@ -6166,6 +6166,35 @@ mod tests {
         assert_eq!(recorder.kinds(), vec!["config.reload".to_string()]);
     }
 
+    /// ADR 0084: the `INSECURE:` line names why any client may read the rule trace — no
+    /// ACL file, or an ACL whose default is allow — and is not said when the ACL denies by
+    /// default, whether it says so or leaves `default` out.
+    #[test]
+    fn the_trace_exposure_names_why_the_trace_is_readable() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        assert_eq!(
+            super::trace_exposure(&config),
+            Some("no MQTTD_ACL_FILE is configured")
+        );
+        let grant =
+            "\n[[rules]]\nactions = [\"subscribe\"]\ntopics = [\"$SYS/brokers/+/rules/#\"]\n";
+        for (name, default, want) in [
+            (
+                "allow.toml",
+                "default = \"allow\"\n",
+                Some("the ACL's default is allow"),
+            ),
+            ("deny.toml", "default = \"deny\"\n", None),
+            ("omitted.toml", "", None),
+        ] {
+            let path = dir.path().join(name);
+            std::fs::write(&path, format!("{default}{grant}")).unwrap();
+            config.security.acl_file = Some(path.display().to_string());
+            assert_eq!(super::trace_exposure(&config), want, "{name}");
+        }
+    }
+
     /// The config crate validates the spelling; `mqtt_auth` decides what it means. The two
     /// lists live in different crates on purpose (mqtt-config has no broker dependencies),
     /// so this is where they are pinned together: a value the config accepts must parse,

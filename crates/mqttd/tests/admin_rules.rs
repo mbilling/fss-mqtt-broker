@@ -391,11 +391,8 @@ fn rule<'a>(answer: &'a Value, id: &str) -> &'a Value {
 #[allow(clippy::too_many_lines)] // one answer read twice, field by field
 async fn the_running_rules_are_read_whole_by_an_operator_and_redacted_for_a_viewer() {
     let n = Node::start(RULES).await;
-    // Live traffic: alpha passes twice, fails fails once and keeps its error.
-    n.publish("a/1", br#"{"v":2}"#);
-    n.publish("a/2", br#"{"v":3}"#);
-    n.publish("e/1", br#"{"v":"s3cret-value"}"#);
-    // One statistics tick sees the activity: when each rule last ran.
+    // The statistics' first tick takes their baseline; the next one sees the activity
+    // since: when each rule last ran.
     let (hub_tx, mut hub_rx) = mpsc::unbounded_channel();
     let stop = tokio_util::sync::CancellationToken::new();
     tokio::spawn(mqttd::rules_sys::run_stats(
@@ -407,13 +404,21 @@ async fn the_running_rules_are_read_whole_by_an_operator_and_redacted_for_a_view
         std::time::SystemTime::now(),
         stop.clone(),
     ));
-    // The tick's summary and five rule messages, then the tick is done.
-    for _ in 0..6 {
-        let sent = tokio::time::timeout(Duration::from_secs(10), hub_rx.recv()).await;
-        assert!(
-            matches!(sent, Ok(Some(HubCommand::SysPublish { .. }))),
-            "a statistics tick within 10 s"
-        );
+    for traffic in [false, true] {
+        if traffic {
+            // Live traffic: alpha passes twice, fails fails once and keeps its error.
+            n.publish("a/1", br#"{"v":2}"#);
+            n.publish("a/2", br#"{"v":3}"#);
+            n.publish("e/1", br#"{"v":"s3cret-value"}"#);
+        }
+        // The tick's summary and five rule messages, then the tick is done.
+        for _ in 0..6 {
+            let sent = tokio::time::timeout(Duration::from_secs(10), hub_rx.recv()).await;
+            assert!(
+                matches!(sent, Ok(Some(HubCommand::SysPublish { .. }))),
+                "a statistics tick within 10 s"
+            );
+        }
     }
     stop.cancel();
     // A reload rejected over a rules file whose text the error quotes, then the file put
@@ -1033,6 +1038,30 @@ async fn a_whole_file_write_is_a_writers_and_replaces_the_file_and_what_runs() {
     assert_eq!(n.on_disk(), new);
 }
 
+/// A rules file written where there was none is private to the broker (mode 0600): a
+/// rules file can hold a secret, and nobody chose a wider mode for it.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_rules_file_written_where_there_was_none_is_private() {
+    use std::os::unix::fs::PermissionsExt;
+    let n = Node::start(RULES).await;
+    std::fs::remove_file(&n.file).unwrap();
+    let new = "[rules.only]\nsql = 'SELECT * FROM \"o/#\"'\nactions = []\n";
+    let (status, body) = n
+        .call(
+            &n.writer,
+            "PUT",
+            "/admin/v1/rules?if_match=*",
+            Some(&json!({"source": new})),
+        )
+        .await;
+    assert_eq!((status, &body["applied"]), (200, &json!(true)), "{body}");
+    assert_eq!(n.on_disk(), new);
+    let mode = std::fs::metadata(&n.file).unwrap().permissions().mode() & 0o7777;
+    assert_eq!(mode, 0o600);
+    assert!(!n.file.with_extension("toml.prev").exists());
+}
+
 /// `PUT /admin/v1/rule` and `DELETE /admin/v1/rule` change one rule and keep every other
 /// byte of the file: an update writes only what differs, an insert is appended, a delete
 /// takes the rule's header and keys and leaves the comments above it. Each applies at
@@ -1173,6 +1202,50 @@ async fn one_rule_is_edited_in_place_and_the_rest_of_the_file_kept_byte_for_byte
         .call(&n.writer, "DELETE", "/admin/v1/rule?id=x", None)
         .await;
     assert_eq!((status, code(&body)), (409, "rules-file-invalid"), "{body}");
+}
+
+/// Two writes naming the same digest, sent at once: one is made, and the other is told
+/// the file is no longer the one it names, with the digest the first wrote. The node
+/// takes one write at a time from reading the file to its reload, so `if_match` is a
+/// compare-and-swap and neither write is lost without a word. Twenty rounds, each on the
+/// file as it started, so a race that only sometimes loses still shows.
+#[tokio::test]
+async fn two_writes_naming_the_same_digest_cannot_both_win() {
+    let n = Node::start(RULES).await;
+    let digest = sha256_hex(RULES);
+    let rule = |topic: &str| {
+        json!({"sql": format!("SELECT * FROM \"{topic}\""), "actions": [],
+               "description": "", "enable": true})
+    };
+    let (one, two) = (rule("one/#"), rule("two/#"));
+    let (path_one, path_two) = (
+        format!("/admin/v1/rule?id=one&if_match={digest}"),
+        format!("/admin/v1/rule?id=two&if_match={digest}"),
+    );
+    for round in 0..20 {
+        std::fs::write(&n.file, RULES).unwrap();
+        let (a, b) = tokio::join!(
+            n.call(&n.writer, "PUT", &path_one, Some(&one)),
+            n.call(&n.writer, "PUT", &path_two, Some(&two)),
+        );
+        let mut answers = [a, b];
+        answers.sort_by_key(|(status, _)| *status);
+        let [(made, winner), (refused, loser)] = answers;
+        assert_eq!(
+            (made, refused, code(&loser)),
+            (200, 412, "digest-mismatch"),
+            "round {round}: {winner} {loser}"
+        );
+        let on_disk = n.on_disk();
+        let has = |id: &str| on_disk.contains(&format!("\n[rules.{id}]\n"));
+        assert!(has("one") != has("two"), "round {round}: {on_disk}");
+        assert_eq!(
+            winner["digest"],
+            json!(sha256_hex(&on_disk)),
+            "round {round}"
+        );
+        assert_eq!(loser["file_digest"], winner["digest"], "round {round}");
+    }
 }
 
 /// Every write is based on the file on disk, not on what runs: `if_match` names the file

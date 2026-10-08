@@ -479,7 +479,8 @@ impl Hub {
     }
 
     /// Deliver one message to a single named recipient: live if online (tracking
-    /// `QoS` > 0 in flight), else queued if the session is persistent, else dropped.
+    /// `QoS` > 0 in flight), else queued if the session is persistent, else dropped. A
+    /// [`AppendGate::LiveOnly`] message is never queued: it goes out live or not at all.
     /// The unit of both ordinary and shared (ADR 0015) delivery; `qos` is the
     /// already-downgraded delivery `QoS`.
     /// Returns [`DurableOutcome::Failed`] when a durable enqueue failed terminally —
@@ -535,7 +536,9 @@ impl Hub {
             app: app.clone(),
             expires_at: message_expiry.map(|s| self.clock.now_epoch_secs() + u64::from(s)),
         };
-        let persistent = self.is_persistent(client);
+        // The broker's own `$SYS` messages are live only (ADR 0084): no durable record,
+        // and nothing for a session that is not connected.
+        let persistent = self.is_persistent(client) && !matches!(gate, AppendGate::LiveOnly);
         if let Some(online) = self.online.get(client) {
             let (conn_id, tx) = (online.conn_id, online.tx.clone());
             // Durability follows the SESSION, not the connection (#124). A persistent
@@ -680,6 +683,7 @@ impl Hub {
     /// is gated by `append_gate`, and a `QoS` >= 1 member on a verdict-capable peer
     /// becomes a `ForwardObligation` the publisher's ack already waits on. The
     /// proto-6 remote case is the documented skew residual, unchanged either way.
+    #[allow(clippy::too_many_arguments)] // the delivery fields, plus the gate and live-only
     pub(super) fn deliver_shared(
         &mut self,
         topic: &str,
@@ -688,9 +692,17 @@ impl Hub {
         message_expiry: Option<u32>,
         app: &AppProperties,
         gate: Option<u64>,
+        live_only: bool,
     ) -> (DurableOutcome, bool) {
         let answerable = gate.is_some();
-        let append_gate = gate.map_or(AppendGate::None, AppendGate::Pending);
+        // A live-only message (the broker's `$SYS`, ADR 0084) reaches an offline member
+        // nowhere: not here, and not on a peer, which treats a forwarded `$SYS` message
+        // the same way.
+        let append_gate = if live_only {
+            AppendGate::LiveOnly
+        } else {
+            gate.map_or(AppendGate::None, AppendGate::Pending)
+        };
         let mut all_durable = DurableOutcome::Ok;
         // Issue #613 item 2.1. See the return site for the full semantics; the one
         // rule is that this may only be set where a member was actually SELECTED.

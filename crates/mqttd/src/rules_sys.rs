@@ -17,9 +17,15 @@
 //! Every message is `QoS` 0, never retained, routed by [`HubCommand::SysPublish`], and
 //! takes node-pool ingress credit first (ADR 0082): when the pool is short the rest of a
 //! statistics tick is skipped and a trace record dropped, each counted, so both yield to
-//! clients under pressure. Nothing secret goes on `$SYS`: no SQL, description, actions,
-//! file path, writer or reload error text, and a rule's last error text only while the
-//! trace — which shows payloads anyway — is on.
+//! clients under pressure. They are live only — a session that is not connected gets
+//! none of them — and carry a Message Expiry Interval, so a copy queued anyway (by a
+//! peer that predates live-only delivery) expires: two intervals for the statistics, at
+//! least 10 seconds, and 10 seconds for a trace record.
+//!
+//! Nothing secret goes on `$SYS`: no SQL, description, actions, file path, writer or
+//! reload error text. A rule's last error is its time and kind only: its text can quote
+//! a payload value, and a statistics reader need not be one the trace's payloads are
+//! for. The trace carries the text, and the admin API shows it to operators.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -45,6 +51,19 @@ use crate::rules::{
 /// max(`trace_rate`, this), on top of each rule's own `trace_rate`.
 pub const TRACE_NODE_FLOOR: u32 = 200;
 
+/// The Message Expiry Interval of a trace record, in seconds, and the least one of a
+/// statistics message.
+const SYS_EXPIRY_SECS: u32 = 10;
+
+/// The Message Expiry Interval of a statistics message published every `interval`
+/// seconds: two intervals, so the next tick replaces it first, and at least
+/// [`SYS_EXPIRY_SECS`].
+fn stats_expiry(interval: u64) -> u32 {
+    u32::try_from(interval.saturating_mul(2))
+        .unwrap_or(u32::MAX)
+        .max(SYS_EXPIRY_SECS)
+}
+
 /// RFC 3339 in UTC with milliseconds (`2026-10-08T12:34:56.789Z`), never the host's zone.
 #[must_use]
 pub fn rfc3339_millis(t: SystemTime) -> String {
@@ -64,12 +83,14 @@ pub fn rfc3339_millis(t: SystemTime) -> String {
     )
 }
 
-/// Send one `$SYS` message, charged to the node pool; `false` when the pool is short.
+/// Send one `$SYS` message that expires after `message_expiry` seconds, charged to the
+/// node pool; `false` when the pool is short.
 fn sys_publish(
     hub: &mpsc::UnboundedSender<HubCommand>,
     ingress: &IngressCredit,
     topic: String,
     payload: String,
+    message_expiry: u32,
 ) -> bool {
     let Some(permit) = ingress.try_acquire_pool(ingress.cost(topic.len(), payload.len())) else {
         return false;
@@ -77,6 +98,7 @@ fn sys_publish(
     let _ = hub.send(HubCommand::SysPublish {
         topic,
         payload: Bytes::from(payload),
+        message_expiry,
         credit: Some(permit),
     });
     true
@@ -113,6 +135,10 @@ pub async fn run_stats(
     let mut last_tick: Option<Instant> = None;
     loop {
         let interval = settings.borrow_and_update().sys_interval_secs;
+        if interval == 0 {
+            // Off: what runs meanwhile is not seen, so the next tick takes a new baseline.
+            stats.seeded = false;
+        }
         // Measured from the last tick, so a shorter interval that is already due fires
         // now rather than after the old one.
         let next = (interval > 0)
@@ -132,8 +158,9 @@ pub async fn run_stats(
                     last_reload: &last_reload,
                     interval,
                 };
+                let expiry = stats_expiry(interval);
                 for (topic, payload) in stats.tick(&ctx, now, SystemTime::now()) {
-                    if !sys_publish(&hub, &ingress, topic, payload) {
+                    if !sys_publish(&hub, &ingress, topic, payload, expiry) {
                         // The rest of this tick is skipped, and the next is whole.
                         observe.count_stats_dropped();
                         break;
@@ -153,6 +180,11 @@ struct Tick<'a> {
     interval: u64,
 }
 
+/// The rule ids whose last activity the statistics remember: four times the rules a
+/// file may hold. Ids a reload removed are kept, so one put back is not taken for one
+/// that ran; past this, only the running set's are.
+const SEEN_MAX: usize = 4 * mqtt_rules::MAX_RULES;
+
 /// What the statistics remember from one tick to the next.
 #[derive(Default)]
 struct Stats {
@@ -161,6 +193,14 @@ struct Stats {
     /// Each rule's counts at the previous tick, and when it was.
     prev: HashMap<Arc<str>, RuleCounts>,
     prev_at: Option<(Instant, SystemTime)>,
+    /// Each rule id's evaluation count when last looked at — what its growth, and so
+    /// its last activity, is measured against. Kept across reloads, at most
+    /// [`SEEN_MAX`] ids.
+    seen: HashMap<Arc<str>, u64>,
+    /// Whether `seen` holds a baseline: not before the first tick, nor after the
+    /// statistics were off. The tick that takes one sets no last activity, since what
+    /// ran before it was not seen to run.
+    seeded: bool,
     /// The running set's digest and each rule's definition hash, recomputed on a reload.
     defs_of: String,
     defs: HashMap<Arc<str>, String>,
@@ -254,7 +294,14 @@ impl Stats {
         let secs = self
             .prev_at
             .map_or(0.0, |(then, _)| now.duration_since(then).as_secs_f64());
-        let tracing = observe.tracing();
+        let seeding = !std::mem::replace(&mut self.seeded, true);
+        if seeding {
+            // The ids kept from before are seen afresh too, so one put back later is
+            // measured from now.
+            for (id, count) in &mut self.seen {
+                *count = ctx.metrics.map_or(0, |m| matched(&m.rule_counts(id)));
+            }
+        }
         let at_s = rfc3339_millis(at);
         let mut messages = vec![(
             format!("$SYS/brokers/{}/rules", self.node),
@@ -266,23 +313,22 @@ impl Stats {
             let def = self.defs.get(id).cloned().unwrap_or_default();
             let counts = ctx.metrics.map(|m| m.rule_counts(id)).unwrap_or_default();
             let before = self.prev.get(id);
-            // Kept with the rules, where the admin API reads it too.
-            if before.map_or(matched(&counts) > 0, |b| matched(&counts) > matched(b)) {
+            // Growth since the rule was last looked at; a rule never looked at (added
+            // since the baseline) is measured from zero. Kept with the rules, where the
+            // admin API reads it too.
+            let now_matched = matched(&counts);
+            let was = self.seen.insert(id.clone(), now_matched);
+            if !seeding && now_matched > was.unwrap_or(0) {
                 observe.set_last_active(id, at);
             }
             if let (Some(b), Some((_, prev_tick))) = (before, self.prev_at) {
                 let failed = counts.actions_failed.saturating_sub(b.actions_failed);
                 note_delivery_failures(observe, id, failed, prev_tick, at, &def);
             }
-            let last_error = observe.last_error(id).map(|e| {
-                let mut v = json!({"at": rfc3339_millis(e.at), "kind": e.kind.as_str()});
-                // The text can quote a payload value: on $SYS only while the trace, which
-                // shows payloads anyway, is on.
-                if tracing {
-                    v["message"] = json!(e.message);
-                }
-                v
-            });
+            // Never the text, which can quote a payload value, trace on or off.
+            let last_error = observe
+                .last_error(id)
+                .map(|e| json!({"at": rfc3339_millis(e.at), "kind": e.kind.as_str()}));
             let doc = json!({
                 "node": self.node,
                 "rule": &**id,
@@ -301,7 +347,10 @@ impl Stats {
             counted.insert(id.clone(), counts);
         }
         self.prev = counted;
-        observe.retain_last_active(|id| self.prev.contains_key(id));
+        if self.seen.len() > SEEN_MAX {
+            self.seen.retain(|id, _| self.prev.contains_key(id));
+        }
+        observe.retain_last_active(|id| self.seen.contains_key(id));
         self.prev_at = Some((now, at));
         messages
     }
@@ -376,7 +425,7 @@ pub async fn run_trace(
         window.1 += 1;
         let topic = format!("$SYS/brokers/{node}/trace/rules/{}", record.rule);
         let payload = record_json(&node, &record).to_string();
-        if !sys_publish(&hub, &ingress, topic, payload) {
+        if !sys_publish(&hub, &ingress, topic, payload, SYS_EXPIRY_SECS) {
             observe.count_trace_dropped();
         }
     }

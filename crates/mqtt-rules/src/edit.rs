@@ -12,7 +12,8 @@
 //!   belong, in TOML, to the table below them — they are often a file header or a
 //!   section banner — so they move onto the next table (or the end of the file) and stay.
 //!   That includes the deleted rule's own comment block, which is left for its author to
-//!   remove.
+//!   remove. Blank lines that would end the file do not stay, so a delete undoes an
+//!   insert byte for byte.
 //!
 //! Only files written as `[rules.<id>]` tables are edited this way; a rule written with
 //! dotted keys, as an inline table or with `[[rules.<id>.actions]]` is refused
@@ -111,7 +112,7 @@ pub fn put_rule(source: &str, id: &str, rule: &RuleEdit) -> Result<String, EditE
             table.decor_mut().set_prefix(prefix);
         }
     }
-    let text = doc.to_string();
+    let text = ending_like(source, doc.to_string());
     check(source, &old, &text, id, Some(rule))?;
     Ok(text)
 }
@@ -149,12 +150,41 @@ pub fn delete_rule(source: &str, id: &str) -> Result<String, EditError> {
             t.decor_mut().set_prefix(above + &below);
         }
     } else {
+        // Nothing follows: the comments end the file, without the blank lines below them
+        // that set the rule apart (an insert put one there).
         let trailing = raw(Some(doc.trailing())).to_string();
-        doc.set_trailing(above + &trailing);
+        let above = if trailing.trim().is_empty() {
+            without_blank_end(&above)
+        } else {
+            &above
+        };
+        doc.set_trailing(format!("{above}{trailing}"));
     }
-    let text = doc.to_string();
+    let text = ending_like(source, doc.to_string());
     check(source, &old, &text, id, None)?;
     Ok(text)
+}
+
+/// `text` less the blank lines it ends with.
+fn without_blank_end(text: &str) -> &str {
+    let mut kept = text;
+    while let Some(rest) = kept.strip_suffix('\n') {
+        let line = rest.rfind('\n').map_or(0, |i| i + 1);
+        if !rest[line..].trim().is_empty() {
+            break;
+        }
+        kept = &rest[..line];
+    }
+    kept
+}
+
+/// The editor's `text`, ending as `source` did: the editor ends the last line with a
+/// newline, which a file that had none does not get.
+fn ending_like(source: &str, mut text: String) -> String {
+    if !source.is_empty() && !source.ends_with('\n') && text.ends_with('\n') {
+        text.pop();
+    }
+    text
 }
 
 /// Parse `source` both ways for an edit of rule `id`: as a rules file (for the
@@ -169,8 +199,8 @@ fn open(source: &str, id: &str) -> Result<(FileSchema, DocumentMut), EditError> 
         .parse()
         .map_err(|e: toml_edit::TomlError| EditError::FileInvalid(e.to_string()))?;
     // An edit promises every other byte unchanged; the editor itself must keep that. It
-    // ends the last line with a newline if the file did not, which is harmless; anything
-    // else (CRLF line endings become LF) would rewrite lines nobody edited.
+    // ends the last line with a newline if the file did not, which [`ending_like`] takes
+    // back; anything else (CRLF line endings become LF) would rewrite lines nobody edited.
     let printed = doc.to_string();
     if printed != source && printed.strip_suffix('\n') != Some(source) {
         return Err(EditError::LayoutUnsupported(
@@ -608,6 +638,29 @@ mod tests {
         );
     }
 
+    /// A delete undoes an insert byte for byte: the blank line the insert put above the
+    /// new rule goes with it, a trailing comment is where it was, and a file that did not
+    /// end with a newline still does not.
+    #[test]
+    fn inserting_then_deleting_a_rule_gives_back_the_same_file() {
+        let one = console("SELECT 1 FROM \"t\"");
+        let a = "# my rules\n\n[rules.a]\nsql = 'SELECT 1 FROM \"t\"'\nactions = []\n";
+        for text in [
+            a.to_string(),
+            format!("{a}\n# the end\n"),
+            format!("{a}# the end"),
+            a.trim_end().to_string(),
+            "[rules]\n".to_string(),
+            "# no rules yet\n".to_string(),
+            String::new(),
+            demo(),
+        ] {
+            let inserted = put_rule(&text, "added", &one).unwrap();
+            assert!(inserted.contains("\n[rules.added]\n") || text.is_empty());
+            assert_eq!(delete_rule(&inserted, "added").unwrap(), text, "{text:?}");
+        }
+    }
+
     /// SQL is written in the plainest form that reads back exactly.
     #[test]
     fn sql_is_written_in_the_plainest_exact_form() {
@@ -653,9 +706,10 @@ mod tests {
         );
         unsupported("[rules.x]\r\nsql = 'SELECT 1 FROM \"t\"'\r\n");
 
-        // A missing final newline is the one change the editor makes, and it is harmless.
+        // A missing final newline is no reason to refuse, and stays missing.
         let edited = put_rule("[rules.x]\nsql = 'SELECT 1 FROM \"t\"'", "a", &one).unwrap();
         assert!(edited.starts_with("[rules.x]\nsql = 'SELECT 1 FROM \"t\"'\n\n[rules.a]\n"));
+        assert!(edited.ends_with(']'), "{edited:?}");
 
         assert!(matches!(
             put_rule("[rules.x]\nsql = 1\n", "a", &one),

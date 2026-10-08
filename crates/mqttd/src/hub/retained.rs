@@ -1251,14 +1251,18 @@ impl Hub {
     /// one, it looks again on the next sweep ticks (ownership settles during boot), for
     /// at most [`RESERVED_PURGE_TICKS`](super::RESERVED_PURGE_TICKS), and subscribe-time
     /// replay skips it meanwhile.
+    ///
+    /// It reads only the `$SYS` subtree (`#` matches its parent too, so `$SYS` itself is
+    /// in it), never the whole store, since it runs on the hub loop. A Mosquitto bridge's
+    /// state is in that subtree but not reserved, so it stays.
     pub(super) async fn purge_reserved_retained(&mut self) {
         self.reserved_purge_ticks = self.reserved_purge_ticks.saturating_sub(1);
-        let Ok(all) = self.retained.all().await else {
+        let Ok(sys) = self.retained.matching("$SYS/#").await else {
             return;
         };
         let mut purged = 0usize;
         let mut left = false;
-        for m in all {
+        for m in sys {
             if !mqtt_core::is_reserved_topic(&m.topic) || m.payload.is_empty() {
                 continue;
             }
