@@ -707,7 +707,8 @@ vendor rule contributes three on its own — one for its `$SYS` topic and one fo
 its two `{eq, …}` entries. The one emitted rule is that same rule's `$SYS/#` deny. It is
 kept, and its TODO says what it now does: mqttd's `$SYS` holds only the opt-in rule
 statistics and trace, so the deny keeps those from the clients it names, and no client
-may publish to `$SYS` whatever the ACL says.
+may publish to `$SYS` whatever the ACL says, but a Mosquitto bridge to its state topic
+`$SYS/broker/connection/<id>/state`.
 
 Placeholders that do translate: `${username}` → `%i`, `${clientid}` → `%c`,
 `${cert_common_name}` → `%i` (**only** equal when the client used mTLS and

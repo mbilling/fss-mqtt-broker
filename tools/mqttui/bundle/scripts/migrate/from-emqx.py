@@ -2736,8 +2736,9 @@ def convert_rules(tree: dict, conv: Conversion) -> None:
             conv.rule_todos.append(
                 f"rule_engine.ignore_sys_message = {value}: mqttd's own $SYS messages (the "
                 "opt-in rule statistics and trace) never run rules, and no client may publish "
-                "to $SYS, so a rule never sees a $SYS message — the same behaviour as EMQX's "
-                "default (true); `false` has no equivalent"
+                "to $SYS but a Mosquitto bridge's $SYS/broker/connection/<id>/state, so a rule "
+                "sees no other $SYS message — EMQX's default (true) apart from that one "
+                "topic; `false` has no equivalent"
             )
         elif key.startswith("jq_"):
             conv.rule_todos.append(
@@ -3639,7 +3640,8 @@ def parse_acl(text: str) -> tuple[list[dict], list[str], str | None]:
                     "$-prefixed topics too. mqttd's `#` does NOT match a $-topic. `#` was "
                     "used; if the rule existed to cover $-topics, it has no equivalent: "
                     "mqttd's $SYS holds only opt-in rule statistics and trace, reached by an "
-                    "explicit $SYS/brokers/+/rules/# grant, and no client may publish there"
+                    "explicit $SYS/brokers/+/rules/# grant, and no client may publish there "
+                    "but a Mosquitto bridge, to $SYS/broker/connection/<id>/state"
                 )
                 converted.append("#")
                 continue
