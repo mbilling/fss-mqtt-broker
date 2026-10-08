@@ -60,6 +60,13 @@ fn every_platform_gated_suite_compiled_on_this_runner() {
          must exercise it"
     );
 
+    // rules_demo.rs stops the live simulator with SIGTERM, which only Unix has.
+    assert!(
+        !in_ci || cfg!(unix),
+        "rules_demo.rs uses #[cfg(unix)] for the live simulator's broker restart and SIGTERM \
+         stop; this CI run must exercise it"
+    );
+
     // crates/mqttd/tests/decommission.rs — #![cfg(unix)]
     assert!(
         !in_ci || cfg!(unix),
@@ -83,6 +90,7 @@ fn the_mirrored_predicates_still_describe_the_suites() {
         ("decommission.rs", "#![cfg(unix)]"),
         ("backup_restore.rs", "#[cfg(unix)]"),
         ("check_config.rs", "#[cfg(unix)]"),
+        ("rules_demo.rs", "#[cfg(unix)]"),
         ("binary_smoke.rs", "#[cfg(unix)]"),
         ("shared_membership.rs", "#[cfg(target_os = \"linux\")]"),
     ] {

@@ -11,6 +11,15 @@
 //! passes `--check-rules` with no warning, and that every derived message the README quotes
 //! is one the fixture produces.
 //!
+//! The live simulator (`live.py`, which the demo stack in `demo/rules-live/` runs) plays the
+//! same ten minutes endlessly, in windows aligned to the wall clock. Its tests here check
+//! where its schedule places a time, that its scheduler keeps to the schedule (joining
+//! mid-window, dropping what is late, rejoining after a long stall), that in fixture mode
+//! every window is the fixture again, byte for byte, that in now mode device clocks run on
+//! from one window into the next, that its player and MQTT client bound every wait and keep
+//! devices offline where the script has them offline, and, against the real binary, that it
+//! rides out a broker restart and disconnects every device cleanly on SIGTERM.
+//!
 //! The fixture is generated, not stored: it is about a megabyte, and everything under
 //! `demo/` is also copied into the `mqttui` bundle. After changing the simulator or the
 //! rules on purpose, regenerate the expected output and review its diff like any other
@@ -24,7 +33,7 @@ mod common;
 mod listen_wait;
 mod proc_common;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -46,6 +55,12 @@ const FIXTURE_ARGS: [&str; 7] = [
     "600",
 ];
 const SIMULATOR: &str = "demo/rules/simulate.py";
+/// The live simulator, which plays the fixture's ten minutes endlessly.
+const LIVE: &str = "demo/rules/live.py";
+/// The simulation's domains; the demo stack runs one live simulator for each.
+const DOMAINS: [&str; 3] = ["power", "homes", "cars"];
+/// The length of one live window, in seconds: the fixture's duration.
+const WINDOW_S: i64 = 600;
 const EXPECTED: &str = "crates/mqttd/tests/rules_demo.expected";
 const RULES: &str = "demo/rules/rules.toml";
 const README: &str = "demo/rules/README.md";
@@ -98,7 +113,16 @@ fn python3() -> Command {
 
 /// What `python3 <args>` prints; it must succeed.
 fn python_out(args: &[&str]) -> String {
-    let out = python3().args(args).output().expect("python3 runs");
+    python_out_env(args, &[])
+}
+
+/// What `python3 <args>` prints with `env` set; it must succeed.
+fn python_out_env(args: &[&str], env: &[(&str, &str)]) -> String {
+    let out = python3()
+        .envs(env.iter().copied())
+        .args(args)
+        .output()
+        .expect("python3 runs");
     assert!(
         out.status.success(),
         "python3 {} failed:\n{}",
@@ -234,16 +258,22 @@ struct Broker {
 }
 
 async fn start_broker() -> Broker {
-    let rules = repo_root().join(RULES);
+    start_broker_with(&repo_root().join(RULES), None).await
+}
+
+/// mqttd loading `rules`, on `addr` (a restart where the broker was) or on a fresh port.
+async fn start_broker_with(rules: &Path, addr: Option<SocketAddr>) -> Broker {
     let (child, log, addr) = listen_wait::spawn_listening_logged(|| {
-        let addr: SocketAddr = format!("127.0.0.1:{}", proc_common::free_tcp_port())
-            .parse()
-            .unwrap();
+        let addr: SocketAddr = addr.unwrap_or_else(|| {
+            format!("127.0.0.1:{}", proc_common::free_tcp_port())
+                .parse()
+                .unwrap()
+        });
         let mut cmd = mqttd();
         cmd.env("MQTTD_PLAINTEXT_BIND", addr.to_string())
             .env("MQTTD_ALLOW_ANONYMOUS", "1")
             .env("MQTTD_DURABLE_SESSIONS", "0")
-            .env("MQTTD_RULES_FILE", &rules)
+            .env("MQTTD_RULES_FILE", rules)
             .env("RUST_LOG", "mqttd=info")
             .env("NO_COLOR", "1")
             .stderr(Stdio::null());
@@ -252,7 +282,8 @@ async fn start_broker() -> Broker {
     .await;
     assert!(
         log.text().contains("rules loaded"),
-        "the broker did not load {RULES}:\n{}",
+        "the broker did not load {}:\n{}",
+        rules.display(),
         log.tail(30)
     );
     Broker {
@@ -613,6 +644,362 @@ fn the_readme_quotes_only_messages_the_fixture_derives() {
 // The live simulator
 // ---------------------------------------------------------------------------------------
 
+/// The first line where `got` and `want` differ, for a failure message.
+fn first_difference(got: &str, want: &str) -> String {
+    let (g, w): (Vec<&str>, Vec<&str>) = (got.lines().collect(), want.lines().collect());
+    match g.iter().zip(&w).position(|(a, b)| a != b) {
+        Some(i) => format!("line {}:\n  got  {}\n  want {}", i + 1, g[i], w[i]),
+        None => format!("{} lines, want {}", g.len(), w.len()),
+    }
+}
+
+/// `anchor()` floors a wall-clock time to the 10-minute grid every live simulator shares,
+/// and `plan(now, s0)` says which window of the schedule anchored at `s0` holds `now` (window
+/// k starts at `s0 + 600 k`) and how many seconds into it `now` is. A clock set back past the
+/// anchor lands in window -1, not in a negative offset.
+#[test]
+fn the_live_schedule_places_a_time_in_its_window() {
+    // 2026-10-08T09:20:00Z, on the grid.
+    const S0: f64 = 1_791_451_200.0;
+    // (now - S0, anchor(now) - S0)
+    let anchors = [
+        (0.0, 0.0),
+        (0.5, 0.0),
+        (599.5, 0.0),
+        (600.0, 600.0),
+        (1_234.5, 1_200.0),
+    ];
+    // (now - S0, k, offset)
+    let plans = [
+        (0.0, 0, 0.0),
+        (0.5, 0, 0.5),
+        (599.5, 0, 599.5),
+        (600.0, 1, 0.0),
+        (3_725.0, 6, 125.0),
+        (-5.0, -1, 595.0),
+    ];
+    let script = r#"
+import json, sys
+sys.path.insert(0, "demo/rules")
+import live
+s0, anchors, plans = json.loads(sys.argv[1])
+print(json.dumps([[live.anchor(s0 + d) - s0 for d in anchors],
+                  [live.plan(s0 + d, s0) for d in plans]]))
+"#;
+    let input = serde_json::json!([S0, anchors.map(|(d, _)| d), plans.map(|(d, _, _)| d)]);
+    let out: serde_json::Value =
+        serde_json::from_str(&python_out(&["-c", script, &input.to_string()])).expect("JSON");
+    let close =
+        |v: &serde_json::Value, want: f64| (v.as_f64().expect("a number") - want).abs() < 1e-6;
+    for (i, (d, want)) in anchors.into_iter().enumerate() {
+        let got = &out[0][i];
+        assert!(
+            close(got, want),
+            "anchor(S0 + {d}) is S0 + {got}, want S0 + {want}"
+        );
+    }
+    for (i, (d, k, offset)) in plans.into_iter().enumerate() {
+        let got = &out[1][i];
+        assert!(
+            got[0].as_i64() == Some(k) && close(&got[1], offset),
+            "plan(S0 + {d}, S0) is {got}, want [{k}, {offset}]"
+        );
+    }
+}
+
+/// Drives `live.Live` with a fake clock and a fake player, for
+/// [`the_live_scheduler_joins_drops_late_events_and_rejoins`]: one device publishing at 0,
+/// 100, ..., 500 s into every window of a schedule anchored at 0; the clock starts at
+/// `start`, advances as the player idles, and jumps by `jumps[n]` seconds while the n-th
+/// event is sent (a send that blocks, a machine that sleeps); the loop stops at `end`.
+/// Prints the player's log, the late and re-plan counts and what the loop said, as JSON.
+const SCHEDULER_HARNESS: &str = r#"
+import json, sys
+sys.path.insert(0, "demo/rules")
+import live
+from sim.core import Event
+
+start, jumps, end = json.loads(sys.argv[1])
+jumps = {int(n): s for n, s in jumps.items()}
+now = [float(start)]
+window = [Event(at=float(at), client="d", topic="t") for at in range(0, 600, 100)]
+
+
+class Schedule(live.Schedule):
+    def events(self, k):
+        return window
+
+    def ready(self, k):
+        return True
+
+
+class Player:
+    host, port, sent, unsent, reconnects, seen = "fake", 0, 0, 0, 0, set()
+
+    def __init__(self):
+        self.log = []
+
+    def tend(self):
+        pass
+
+    def idle(self, seconds):
+        now[0] += seconds
+
+    def send(self, ev):
+        self.log.append(["send", now[0], ev.at])
+        self.sent += 1
+        now[0] += jumps.get(self.sent, 0.0)
+
+    def skip(self, ev):
+        self.log.append(["skip", now[0], ev.at])
+
+    def begin(self, events):
+        self.log.append(["begin", now[0], events[0].at if events else None])
+
+    def connected(self):
+        return 0
+
+    def close(self):
+        self.log.append(["close", now[0], None])
+
+
+player, said = Player(), []
+run = live.Live(Schedule(["power"], 7, "now", 0.0), player, 1000.0, lambda: now[0] >= end,
+                said.append)
+run.run(lambda: now[0])
+print(json.dumps({"log": player.log, "late": run.late, "replans": run.replans, "said": said}))
+"#;
+
+/// The live scheduler keeps to the wall-clock schedule (driven here by a fake clock, so no
+/// real time passes). Started 150 s into a window it skips what came before and sends the
+/// rest on time. An event 5 s late is still sent; one 35 s late is dropped and counted, not
+/// sent. At the window's end the next one begins. And more than a window behind (the clock
+/// jumped 2,000 s, as when a laptop sleeps) it does not send what it missed: it rejoins the
+/// schedule where it is now, window 4 at 300 s, as it would have started there.
+#[test]
+fn the_live_scheduler_joins_drops_late_events_and_rejoins() {
+    let input = serde_json::json!([150, {"1": 105, "2": 130, "5": 2000}, 2850]);
+    let out: serde_json::Value =
+        serde_json::from_str(&python_out(&["-c", SCHEDULER_HARNESS, &input.to_string()]))
+            .expect("JSON");
+    // [what, the clock then, the event's offset into its window]
+    let want = serde_json::json!([
+        // Joins window 0 at 150 s.
+        ["skip", 150.0, 0.0],
+        ["skip", 150.0, 100.0],
+        ["begin", 150.0, 200.0],
+        ["send", 200.0, 200.0],
+        // That send took 105 s: the event at 300 s is 5 s late, and still sent.
+        ["send", 305.0, 300.0],
+        // That one took 130 s: the event at 400 s is 35 s late, and dropped.
+        ["skip", 435.0, 400.0],
+        ["send", 500.0, 500.0],
+        // Window 1.
+        ["begin", 500.0, 0.0],
+        ["send", 600.0, 0.0],
+        ["send", 700.0, 100.0],
+        // 2,000 s lost: window 4 is under way, 300 s in.
+        ["skip", 2700.0, 0.0],
+        ["skip", 2700.0, 100.0],
+        ["skip", 2700.0, 200.0],
+        ["begin", 2700.0, 300.0],
+        ["send", 2700.0, 300.0],
+        ["send", 2800.0, 400.0],
+        ["close", 2850.0, null],
+    ]);
+    assert_eq!(
+        out["log"], want,
+        "the scheduler's moves (left: what it did)"
+    );
+    assert_eq!(out["late"], 1, "one event was dropped for being late");
+    assert_eq!(out["replans"], 1, "one jump of more than a window");
+    let said: Vec<&str> = out["said"]
+        .as_array()
+        .expect("lines")
+        .iter()
+        .map(|l| l.as_str().expect("a line"))
+        .collect();
+    assert_eq!(
+        said.len(),
+        4,
+        "a start line, one heartbeat, the jump, the stop: {said:#?}"
+    );
+    assert!(
+        said[0].contains(
+            "window 0 began 1970-01-01T00:00:00Z, joining it 150 s in; \
+             next window at 1970-01-01T00:10:00Z"
+        ),
+        "the start line: {}",
+        said[0]
+    );
+    assert_eq!(
+        said[1], "window 1 +2100 s: sent 5, late 1, unsent 0, reconnects 0, connected 0 of 0",
+        "the heartbeat, due at 1,150 s and printed when the clock came back"
+    );
+    assert_eq!(
+        said[2],
+        "1900 s behind in window 1: rejoining window 4 at 300 s"
+    );
+    assert_eq!(
+        said[3],
+        "stopped: window 4 +450 s: sent 7, late 1, unsent 0, reconnects 0, connected 0 of 0"
+    );
+}
+
+/// In fixture mode every window of the live simulator is the README's ten minutes again:
+/// `live.py --dry-run --windows 2 --clock fixture` prints exactly what `simulate.py
+/// --dry-run` prints for the fixture, twice, device timestamps included. Checked for each
+/// domain on its own, as the demo stack runs them (each domain has its own seeded
+/// generator), set through the environment as the stack sets it; and for all three
+/// together, as `live.py` runs by default, set by flags, which win over the environment.
+#[test]
+fn the_live_simulator_replays_the_fixture_in_every_window() {
+    let flags = [
+        "--clock",
+        "fixture",
+        "--seed",
+        "7",
+        "--domains",
+        "power,homes,cars",
+    ];
+    let overruled = [
+        ("SIM_CLOCK", "now"),
+        ("SIM_SEED", "8"),
+        ("SIM_DOMAINS", "cars"),
+    ];
+    for domains in DOMAINS.into_iter().chain(["power,homes,cars"]) {
+        let mut args = vec![SIMULATOR];
+        args.extend(FIXTURE_ARGS);
+        args.extend(["--domains", domains]);
+        let once = python_out(&args);
+        assert!(
+            once.lines().count() > 700,
+            "the fixture's {domains} is ten minutes of messages"
+        );
+        let dry_run = [LIVE, "--dry-run", "--windows", "2"];
+        let live = if domains.contains(',') {
+            python_out_env(&[&dry_run[..], &flags].concat(), &overruled)
+        } else {
+            let env = [
+                ("SIM_CLOCK", "fixture"),
+                ("SIM_SEED", "7"),
+                ("SIM_DOMAINS", domains),
+            ];
+            python_out_env(&dry_run, &env)
+        };
+        let twice = once.repeat(2);
+        assert!(
+            live == twice,
+            "live.py --clock fixture --domains {domains}: two windows are not the fixture twice; \
+             {}",
+            first_difference(&live, &twice)
+        );
+    }
+}
+
+/// Each device's own timestamps in a live dry run, in Unix milliseconds, from the payloads
+/// that carry one this can read: a JSON object's `ts`, the RTU's CSV line (Unix seconds
+/// first) and the OBD dongle's binary header (4-byte Unix seconds). The P1 telegrams (local
+/// time) and the OCPP chargers (ISO 8601) are not read.
+fn device_clocks(dry_run: &str) -> BTreeMap<String, Vec<i64>> {
+    let mut clocks: BTreeMap<String, Vec<i64>> = BTreeMap::new();
+    for ev in parse_fixture(dry_run) {
+        let Event::Publish {
+            client,
+            topic,
+            payload,
+            ..
+        } = ev
+        else {
+            continue;
+        };
+        let ms = if let Ok(serde_json::Value::Object(o)) = serde_json::from_slice(&payload) {
+            o.get("ts").and_then(serde_json::Value::as_i64)
+        } else if topic.ends_with("/obd") || topic.ends_with("/dtc") {
+            payload
+                .first_chunk::<4>()
+                .map(|h| i64::from(u32::from_be_bytes(*h)) * 1000)
+        } else {
+            std::str::from_utf8(&payload)
+                .ok()
+                .and_then(|t| t.split_once(','))
+                .and_then(|(first, _)| first.parse::<i64>().ok())
+                .map(|s| s * 1000)
+        };
+        if let Some(ms) = ms {
+            clocks.entry(client).or_default().push(ms);
+        }
+    }
+    clocks
+}
+
+/// In now mode a window's device clocks are its own ten minutes of the wall clock: every
+/// timestamp a device sends in window k lies in [S0 + 600 k, S0 + 600 (k + 1)), where S0 is
+/// the start time floored to ten minutes. So no device's clock goes back from one window to
+/// the next, although each window replays the same script. Window 0 is also the same
+/// whether or not a second window follows. Anchored at the README's hour and at night,
+/// when the sun is down and some faults cannot happen.
+#[test]
+fn the_live_simulators_device_clocks_run_on_from_window_to_window() {
+    // (the time the dry run pretends it is, S0)
+    for (now, s0) in [
+        ("2026-10-08T14:55:00Z", 1_791_471_000_i64),
+        ("2026-10-08T00:23:00Z", 1_791_418_800),
+    ] {
+        let windows = |n: &str| {
+            python_out(&[
+                LIVE,
+                "--dry-run",
+                "--clock",
+                "now",
+                "--now",
+                now,
+                "--windows",
+                n,
+            ])
+        };
+        let (one, two) = (windows("1"), windows("2"));
+        let second = two.strip_prefix(one.as_str()).unwrap_or_else(|| {
+            panic!(
+                "anchored at {now}, window 0 changes when a second window follows; {}",
+                first_difference(&two, &one)
+            )
+        });
+        let (first, next) = (device_clocks(&one), device_clocks(second));
+        for (k, clocks) in [(0_i64, &first), (1, &next)] {
+            let (lo, hi) = ((s0 + k * WINDOW_S) * 1000, (s0 + (k + 1) * WINDOW_S) * 1000);
+            for (client, stamps) in clocks {
+                for &ms in stamps {
+                    assert!(
+                        (lo..hi).contains(&ms),
+                        "anchored at {now}: {client} says {ms} in window {k}, outside \
+                         [{lo}, {hi})"
+                    );
+                }
+            }
+        }
+        let mut across = 0;
+        for (client, before) in &first {
+            let (Some(last), Some(after)) = (
+                before.iter().max(),
+                next.get(client).and_then(|a| a.iter().min()),
+            ) else {
+                continue;
+            };
+            assert!(
+                last < after,
+                "anchored at {now}: {client}'s clock goes back from {last} in window 0 to \
+                 {after} in window 1"
+            );
+            across += 1;
+        }
+        assert!(
+            across >= 35,
+            "anchored at {now}: only {across} devices' clocks were read in both windows"
+        );
+    }
+}
+
 /// Exercises `sim/mqtt.py`'s `Client` against fake brokers on a local socket, for
 /// [`the_simulators_mqtt_client_bounds_its_waits_and_reads_while_idle`]. Each step runs in
 /// a thread joined with a limit, so a wait that never ends is reported as `hung`, not
@@ -719,5 +1106,379 @@ fn the_simulators_mqtt_client_bounds_its_waits_and_reads_while_idle() {
     assert_eq!(
         out["closed"], "quiet: connection closed by the broker",
         "{out}"
+    );
+}
+
+/// Exercises `sim/live.py` without a broker, for
+/// [`the_live_player_backs_off_and_keeps_devices_offline_where_the_script_does`]: its
+/// backoff's delays over twelve failures in a row, and what `begin()` and `skip()` do to
+/// four connected devices (fakes that record how their connection ends). Prints JSON.
+const LIVE_PLAYER_HARNESS: &str = r#"
+import json, random, sys
+sys.path.insert(0, "demo/rules")
+from sim.core import Event
+from sim.live import Backoff, LivePlayer
+
+b = Backoff(rng=random.Random(1))
+delays = [b.failed(100.0) for _ in range(12)]
+waiting = [b.ready(100.0 + delays[-1] - 0.01), b.ready(100.0 + delays[-1])]
+b.reset()
+waiting.append(b.ready(0.0))
+
+ended = []
+
+
+class Fake:
+    def __init__(self, name):
+        self.name = name
+
+    def disconnect(self):
+        ended.append([self.name, "disconnect"])
+
+    def drop(self):
+        ended.append([self.name, "drop"])
+
+
+player = LivePlayer("fake", 0)
+player.clients = {name: Fake(name) for name in ("ev", "van", "car", "meter")}
+player.begin([
+    Event(at=0.0, client="van"),
+    Event(at=10.0, client="car", kind="disconnect"),
+    Event(at=40.0, client="ev", kind="connect"),
+    Event(at=41.0, client="ev"),
+])
+began = sorted(player.clients)
+for ev in (Event(at=50.0, client="car", kind="disconnect"),
+           Event(at=60.0, client="meter", kind="drop"),
+           Event(at=70.0, client="van"),
+           Event(at=80.0, client="nobody", kind="connect")):
+    player.skip(ev)
+print(json.dumps({"delays": delays, "waiting": waiting, "ended": ended, "began": began,
+                  "left": sorted(player.clients)}))
+"#;
+
+/// The live player's backoff and its bookkeeping of connections, without a broker. The
+/// n-th failure in a row waits between half and all of 0.5 s * 2^n, capped at 30 s, and
+/// `reset()` clears it. Where play begins (a new window, or a jump into one), a device
+/// whose next event is an explicit connect is offline until then, as at the start of the
+/// README's run, so its old connection is closed cleanly; the others stay. A skipped
+/// disconnect or drop still ends the connection (without a DISCONNECT for a drop); a
+/// skipped publish or connect sends nothing.
+#[test]
+fn the_live_player_backs_off_and_keeps_devices_offline_where_the_script_does() {
+    let out: serde_json::Value =
+        serde_json::from_str(&python_out(&["-c", LIVE_PLAYER_HARNESS])).expect("JSON");
+    let delays = out["delays"].as_array().expect("delays");
+    assert_eq!(delays.len(), 12);
+    let mut step = 0.5_f64;
+    for (n, d) in delays.iter().enumerate() {
+        let d = d.as_f64().expect("seconds");
+        let cap = step.min(30.0);
+        assert!(
+            (cap / 2.0..=cap).contains(&d),
+            "failure {n} waits {d} s, not within [{}, {cap}]",
+            cap / 2.0
+        );
+        step *= 2.0;
+    }
+    assert_eq!(
+        out["waiting"],
+        serde_json::json!([false, true, true]),
+        "not ready until the delay has passed; ready again after reset()"
+    );
+    assert_eq!(
+        out["began"],
+        serde_json::json!(["car", "meter", "van"]),
+        "begin() closes only the device whose first event is a connect"
+    );
+    assert_eq!(
+        out["ended"],
+        serde_json::json!([
+            ["ev", "disconnect"],
+            ["car", "disconnect"],
+            ["meter", "drop"]
+        ]),
+        "how each connection ended"
+    );
+    assert_eq!(out["left"], serde_json::json!(["van"]));
+}
+
+/// The rules file for [`the_live_simulator_rides_out_a_broker_restart_and_stops_cleanly`]:
+/// each client's connection state, `connected` or the broker's disconnect reason, retained,
+/// so a watcher that subscribes after a device connected still sees it.
+#[cfg(unix)]
+const PRESENCE_RULES: &str = r#"
+[rules.presence]
+sql = '''
+SELECT clientid,
+  CASE WHEN event = 'client.connected' THEN 'connected' ELSE reason END AS state
+FROM "$events/client/connected", "$events/client/disconnected"
+'''
+actions = [
+  { function = "republish", args = { topic = "test/presence/${clientid}", qos = 1, retain = true, payload = "${state}" } },
+]
+"#;
+
+/// A running `live.py`, and every line it has written to stdout or stderr so far.
+#[cfg(unix)]
+struct LiveSim {
+    child: ChildGuard,
+    lines: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+#[cfg(unix)]
+impl LiveSim {
+    fn spawn(args: &[&str], env: &[(&str, &str)]) -> Self {
+        use std::io::BufRead as _;
+        let mut child = python3()
+            .envs(env.iter().copied())
+            .arg(LIVE)
+            .args(args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("python3 runs live.py");
+        let lines = std::sync::Arc::<std::sync::Mutex<Vec<String>>>::default();
+        let out: [Box<dyn std::io::Read + Send>; 2] = [
+            Box::new(child.stdout.take().expect("piped")),
+            Box::new(child.stderr.take().expect("piped")),
+        ];
+        for stream in out {
+            let lines = lines.clone();
+            std::thread::spawn(move || {
+                for line in std::io::BufReader::new(stream)
+                    .lines()
+                    .map_while(Result::ok)
+                {
+                    lines.lock().unwrap().push(line);
+                }
+            });
+        }
+        LiveSim {
+            child: ChildGuard(child),
+            lines,
+        }
+    }
+
+    fn said(&self) -> String {
+        self.lines.lock().unwrap().join("\n")
+    }
+
+    /// Send SIGTERM and wait, at most 15 s, for it to exit.
+    async fn terminate(&mut self) -> std::process::ExitStatus {
+        let pid = self.child.0.id().to_string();
+        let sent = Command::new("kill")
+            .args(["-TERM", &pid])
+            .status()
+            .expect("run kill");
+        assert!(sent.success(), "kill -TERM {pid}");
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            if let Some(status) = self.child.0.try_wait().expect("wait for live.py") {
+                return status;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "live.py did not exit on SIGTERM:\n{}",
+                self.said()
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// The reconnects its latest heartbeat counts.
+    fn reconnects(&self) -> u64 {
+        self.lines
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|l| {
+                l.split_once("reconnects ")?
+                    .1
+                    .split(',')
+                    .next()?
+                    .parse()
+                    .ok()
+            })
+            .max()
+            .unwrap_or(0)
+    }
+}
+
+/// The client id of the restart test's watcher, whose own presence is not a device's.
+#[cfg(unix)]
+const LIVE_WATCHER: &str = "demo-test-live-watch";
+
+/// What a watcher has seen of the live simulator: how many device messages, and each
+/// device's connection state as the presence rule last published it.
+#[cfg(unix)]
+#[derive(Default)]
+struct Seen {
+    device: usize,
+    state: BTreeMap<String, String>,
+}
+
+#[cfg(unix)]
+impl Seen {
+    fn connected(&self) -> Vec<String> {
+        self.state
+            .iter()
+            .filter(|(_, s)| *s == "connected")
+            .map(|(c, _)| c.clone())
+            .collect()
+    }
+}
+
+#[cfg(unix)]
+async fn watch_live(addr: SocketAddr) -> Client {
+    let mut w = Client::connect(addr, LIVE_WATCHER).await;
+    w.subscribe(1, "plant/#", QoS::AtMostOnce).await;
+    w.subscribe(2, "test/presence/#", QoS::AtLeastOnce).await;
+    w
+}
+
+/// Read what `w` receives into `seen` until `done(seen)` holds; fail after `within`.
+#[cfg(unix)]
+async fn watch_until(
+    w: &mut Client,
+    seen: &mut Seen,
+    within: Duration,
+    what: &str,
+    sim: &LiveSim,
+    done: impl Fn(&Seen) -> bool,
+) {
+    let deadline = Instant::now() + within;
+    while !done(seen) {
+        assert!(
+            Instant::now() < deadline,
+            "{what}: not within {within:?}; {} device messages, states {:?}\nlive.py said:\n{}",
+            seen.device,
+            seen.state,
+            sim.said()
+        );
+        match w.recv_bounded(Duration::from_millis(500)).await {
+            Recv::Packet(Packet::Publish(p)) => {
+                if let Some(id) = p.pkid {
+                    w.puback(id).await;
+                }
+                if let Some(client) = p.topic.strip_prefix("test/presence/") {
+                    if client != LIVE_WATCHER {
+                        let state = String::from_utf8_lossy(&p.payload).into_owned();
+                        seen.state.insert(client.to_string(), state);
+                    }
+                } else {
+                    seen.device += 1;
+                }
+            }
+            Recv::Packet(_) | Recv::Quiet => {}
+            Recv::Closed => panic!("{what}: the watcher's connection closed"),
+        }
+    }
+}
+
+/// The live simulator outlives its broker and stops cleanly, against the real binary. It
+/// plays the power domain into a broker (found through `SIM_HOST` and `SIM_PORT`, quiet by
+/// `SIM_QUIET`, as the demo stack configures it), which is killed; a new broker starts on
+/// the same port, and the devices reconnect by themselves: their data flows again and the
+/// heartbeat counts the reconnects. On SIGTERM it exits 0, and every device it had
+/// connected sends a DISCONNECT first: the broker reports `normal`, not `tcp_closed`.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_live_simulator_rides_out_a_broker_restart_and_stops_cleanly() {
+    let dir = common::TempDir::new();
+    let rules = dir.path().join("rules.toml");
+    std::fs::write(&rules, PRESENCE_RULES).expect("write the rules file");
+    let first = start_broker_with(&rules, None).await;
+    let addr = first.addr;
+    let port = addr.port().to_string();
+    let mut sim = LiveSim::spawn(
+        &[
+            "--domains",
+            "power",
+            "--clock",
+            "fixture",
+            "--heartbeat",
+            "1",
+        ],
+        &[
+            ("SIM_HOST", "127.0.0.1"),
+            ("SIM_PORT", &port),
+            ("SIM_QUIET", "1"),
+        ],
+    );
+
+    let mut w = watch_live(addr).await;
+    let mut seen = Seen::default();
+    watch_until(
+        &mut w,
+        &mut seen,
+        Duration::from_secs(30),
+        "device data in the first broker",
+        &sim,
+        |s| s.device >= 5,
+    )
+    .await;
+
+    // Killed: every device's connection ends without a word.
+    drop(w);
+    drop(first);
+    let _second = start_broker_with(&rules, Some(addr)).await;
+    let mut w = watch_live(addr).await;
+    let mut seen = Seen::default();
+    watch_until(
+        &mut w,
+        &mut seen,
+        Duration::from_secs(30),
+        "the devices back on the restarted broker",
+        &sim,
+        |s| s.device >= 5 && s.connected().len() >= 3,
+    )
+    .await;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while sim.reconnects() == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "no heartbeat counts a reconnect:\n{}",
+            sim.said()
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    let online = seen.connected();
+    let status = sim.terminate().await;
+    assert!(
+        status.success(),
+        "live.py exited {status} on SIGTERM:\n{}",
+        sim.said()
+    );
+    watch_until(
+        &mut w,
+        &mut seen,
+        Duration::from_secs(10),
+        "every device connected at SIGTERM disconnected",
+        &sim,
+        |s| online.iter().all(|c| s.state[c] != "connected"),
+    )
+    .await;
+    for client in &online {
+        assert_eq!(
+            seen.state[client], "normal",
+            "{client} went away without a DISCONNECT"
+        );
+    }
+    let said = sim.said();
+    assert!(
+        said.contains(&format!(
+            "live: power to 127.0.0.1:{port}, seed 7, clock fixture"
+        )),
+        "the start line:\n{said}"
+    );
+    assert!(
+        said.lines().any(|l| l.starts_with("live: stopped: ")),
+        "the stop line:\n{said}"
+    );
+    assert!(
+        !said.contains(" → "),
+        "SIM_QUIET=1, yet it printed device messages:\n{said}"
     );
 }
