@@ -29,23 +29,25 @@ if [ ! -f "$CA/ca.key" ] || [ ! -f "$CA/ca.crt" ]; then
   echo "generated the demo CA"
 fi
 
-# issue <dir> <name> <CN> <extensions, one per line>
+# issue <dir> <name> <CN> <extensions, one per line>: a new certificate, unless the one
+# there is good for another day.
 # 825 days: the longest validity macOS accepts for a TLS server certificate, so curl on a
 # Mac trusts the server certificate too.
 issue() {
   if [ -f "$1/$2.key" ] && [ -f "$1/$2.crt" ] \
     && openssl x509 -checkend 86400 -noout -in "$1/$2.crt" >/dev/null 2>&1; then
-    return 0
+    echo "kept $2.crt (CN=$3)"
+  else
+    ext="$(mktemp)"
+    printf '%s\nbasicConstraints=CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\n' \
+      "$4" > "$ext"
+    openssl req -newkey rsa:2048 -nodes -keyout "$1/$2.key" -out "$1/$2.csr" \
+      -subj "/CN=$3" >/dev/null 2>&1
+    openssl x509 -req -in "$1/$2.csr" -CA "$CA/ca.crt" -CAkey "$CA/ca.key" -CAcreateserial \
+      -out "$1/$2.crt" -days 825 -extfile "$ext" >/dev/null 2>&1
+    rm -f "$1/$2.csr" "$ext"
+    echo "issued $2.crt (CN=$3)"
   fi
-  ext="$(mktemp)"
-  printf '%s\nbasicConstraints=CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\n' \
-    "$4" > "$ext"
-  openssl req -newkey rsa:2048 -nodes -keyout "$1/$2.key" -out "$1/$2.csr" \
-    -subj "/CN=$3" >/dev/null 2>&1
-  openssl x509 -req -in "$1/$2.csr" -CA "$CA/ca.crt" -CAkey "$CA/ca.key" -CAcreateserial \
-    -out "$1/$2.crt" -days 825 -extfile "$ext" >/dev/null 2>&1
-  rm -f "$1/$2.csr" "$ext"
-  echo "issued $2.crt (CN=$3)"
 }
 
 issue "$SERVER" server mqttd \
