@@ -37,16 +37,19 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/history-check/src/main.rs` — 0 test(s)
 
 
-## `crates/mqtt-auth/src/lib.rs` — 128 test(s)
+## `crates/mqtt-auth/src/lib.rs` — 132 test(s)
 
 - `acl::tests::a_bad_client_id_does_not_disturb_rules_that_never_use_it`
 - `acl::tests::a_bare_percent_is_literal`
+- `acl::tests::a_broad_share_grant_does_not_reach_sys`
 - `acl::tests::a_connect_deny_rule_wins`
 - `acl::tests::a_connect_rule_bounds_the_client_ids_percent_c_can_expand_to`
 - `acl::tests::a_connect_rule_requires_clients_not_topics`
+- `acl::tests::a_deny_also_refuses_the_same_filter_inside_a_shared_subscription`
 - `acl::tests::a_hostile_client_id_cannot_broaden_a_grant`
 - `acl::tests::a_substituted_value_is_never_rescanned_for_placeholders`
 - `acl::tests::allowed_narrow_subscribe_does_not_cover_broader_request`
+- `acl::tests::an_allow_still_needs_an_explicit_share_grant`
 - `acl::tests::an_unsafe_substitution_in_a_deny_is_explained_as_fail_closed`
 - `acl::tests::an_unsubstitutable_client_id_makes_a_deny_refuse_outright`
 - `acl::tests::clients_is_rejected_on_a_topic_rule`
@@ -78,6 +81,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `acl::tests::percent_i_substitution_fails_closed_for_unsafe_subjects`
 - `acl::tests::publish_only_allow_does_not_grant_subscribe_and_vice_versa`
 - `acl::tests::regex_special_characters_in_globs_are_literal`
+- `acl::tests::shared_denies_apply_under_default_allow_and_in_their_explicit_form`
 - `acl::tests::unknown_action_is_rejected`
 - `acl::tests::unknown_default_is_rejected`
 - `acl::tests::unknown_effect_is_rejected`
@@ -732,7 +736,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 
 - `publish_codec_round_trip_clears_the_floor`
 
-## `crates/mqtt-config/src/lib.rs` — 41 test(s)
+## `crates/mqtt-config/src/lib.rs` — 45 test(s)
 
 - `tests::a_backup_dir_inside_the_data_dir_is_a_config_error`
 - `tests::a_bad_enum_value_is_rejected`
@@ -763,6 +767,8 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::per_var_boolean_conventions_are_honoured`
 - `tests::redacted_config_prints_no_secret`
 - `tests::requiring_both_factors_needs_a_client_ca_and_a_password_verifier`
+- `tests::rule_statistics_and_trace_need_a_node_id_that_is_one_topic_level`
+- `tests::rules_writers_need_the_admin_listener`
 - `tests::the_admin_listener_needs_tls_a_role_and_its_own_bind`
 - `tests::the_env_surface_is_a_deduplicated_curated_list`
 - `tests::the_gossip_key_is_inline_xor_by_reference`
@@ -770,13 +776,15 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::the_refound_guard_defaults_on_and_env_can_disable_it`
 - `tests::the_refusal_lists_all_unknown_keys`
 - `tests::the_replication_factor_is_bounded_and_bounds_the_floor`
+- `tests::the_rules_watch_keys_load_from_file_and_environment`
+- `tests::the_rules_watch_ranges_are_refused_outside_their_bounds`
 - `tests::the_shared_local_bias_is_a_fraction_stored_as_permille`
 - `tests::the_watermark_poll_is_bounded_between_one_second_and_five_minutes`
 - `tests::the_watermark_poll_overlays_from_the_environment`
 - `tests::the_whole_env_surface_overlays_without_collision`
 - `tests::warn_mode_boots_a_newer_config_and_reports_the_ignored_keys`
 
-## `crates/mqtt-core/src/lib.rs` — 53 test(s)
+## `crates/mqtt-core/src/lib.rs` — 54 test(s)
 
 - `retry::tests::delays_ramp_within_jitter_bounds_and_cap`
 - `retry::tests::reset_returns_to_base`
@@ -830,6 +838,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::overlap_system_topics_excluded_from_leading_wildcards`
 - `tests::single_level_wildcard`
 - `tests::system_topics_excluded_from_leading_wildcards`
+- `tests::the_reserved_tree_is_exactly_sys_and_below`
 - `tests::topic_name_validity_rejects_wildcards_and_emptiness`
 
 ## `crates/mqtt-net/src/lib.rs` — 25 test(s)
@@ -860,7 +869,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tls::tls12_hardening_tests::the_tls12_suites_are_exactly_the_allowlist`
 - `tls::tls12_hardening_tests::tls12_session_tickets_are_off`
 
-## `crates/mqtt-observability/src/lib.rs` — 17 test(s)
+## `crates/mqtt-observability/src/lib.rs` — 18 test(s)
 
 - `audit_export::tests::a_full_queue_sheds_and_counts_instead_of_blocking`
 - `audit_export::tests::frames_reach_a_tcp_listener_and_flush_waits`
@@ -871,6 +880,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `metrics::tests::no_unbounded_label_keys_are_used`
 - `metrics::tests::otlp_export_posts_to_the_endpoint`
 - `metrics::tests::render_produces_valid_openmetrics_exposition`
+- `metrics::tests::rule_counts_read_back_without_creating_a_series`
 - `metrics::tests::scaling_metrics_render_with_their_documented_names`
 - `tests::a_restart_is_a_new_chain_not_a_truncation`
 - `tests::audit_log_hash_chains_recorded_events`
@@ -880,8 +890,18 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::sink_records_through_a_trait_object`
 - `tests::tampering_with_any_field_changes_the_head`
 
-## `crates/mqtt-rules/src/lib.rs` — 74 test(s)
+## `crates/mqtt-rules/src/lib.rs` — 93 test(s)
 
+- `edit::tests::a_json_rule_body_is_a_rule_edit`
+- `edit::tests::an_insert_appends_the_rule_at_the_end`
+- `edit::tests::an_update_keeps_comments_and_writes_sql_without_escapes`
+- `edit::tests::an_update_writes_only_the_values_that_differ`
+- `edit::tests::deleting_a_rule_removes_exactly_its_header_and_keys`
+- `edit::tests::deleting_the_last_rule_keeps_what_stood_above_it`
+- `edit::tests::files_an_edit_cannot_keep_intact_are_refused`
+- `edit::tests::sql_is_written_in_the_plainest_exact_form`
+- `edit::tests::the_before_and_after_comparison_catches_any_other_change`
+- `edit::tests::unchanged_values_keep_their_own_form`
 - `funcs::tests::erlang_replacements_translate`
 - `funcs::tests::function_names_are_unique`
 - `funcs::tests::md5_known_answers`
@@ -891,12 +911,16 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `lexer::tests::ranges_numbers_and_comments`
 - `template::tests::quoted_keys`
 - `template::tests::renders_paths_and_missing_values`
+- `template::tests::the_literal_prefix_is_the_text_before_the_first_placeholder`
 - `template::tests::this_is_the_whole_output`
 - `tests::a_bad_rendered_topic_fails_the_action_not_the_rule`
+- `tests::a_file_may_compile_only_so_many_distinct_regular_expressions`
 - `tests::a_literal_qos_or_retain_that_can_never_be_valid_fails_the_load`
+- `tests::a_loaded_set_keeps_its_action_specs_and_warnings`
 - `tests::a_message_has_one_timestamp_however_often_it_is_read`
 - `tests::a_messages_effects_share_one_byte_budget`
 - `tests::a_non_json_payload_fails_only_rules_that_reach_into_it`
+- `tests::a_republish_into_sys_fails_its_action`
 - `tests::arithmetic_follows_erlang`
 - `tests::case_expression_emqx_docs`
 - `tests::comments_and_case_insensitive_keywords`
@@ -914,11 +938,14 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::foreach_over_a_non_array_yields_nothing_and_is_capped`
 - `tests::foreach_with_do_and_incase_emqx_docs`
 - `tests::hashing_encoding_and_bits_emqx_docs`
+- `tests::identical_regular_expressions_are_compiled_once`
 - `tests::indices_and_ranges`
 - `tests::invalid_qos_fails_the_action`
 - `tests::load_errors_are_specific`
+- `tests::load_errors_say_where_and_print_as_before`
 - `tests::map_and_array_functions_emqx_docs`
 - `tests::matching_dedups_orders_and_skips_disabled_rules`
+- `tests::one_rule_can_be_evaluated_whether_or_not_it_is_enabled`
 - `tests::original_user_properties_keep_wire_order_and_duplicates`
 - `tests::payload_regex_patterns_are_cached_per_message_and_stay_distinct`
 - `tests::payload_shapes_cannot_make_evaluation_quadratic`
@@ -927,11 +954,13 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::quadratic_string_growth_is_refused_before_it_is_allocated`
 - `tests::republish_args_render`
 - `tests::republish_defaults_follow_emqx`
+- `tests::rules_aimed_at_sys_load_with_a_warning`
 - `tests::select_fields_and_aliases_emqx_docs`
 - `tests::select_star_has_emqx_fields`
 - `tests::string_functions_emqx_docs`
 - `tests::the_growth_budget_is_per_message`
 - `tests::the_sql_test_simulates_events_and_refuses_inputs_the_rule_never_sees`
+- `tests::the_trace_rate_window_is_per_rule_per_second`
 - `tests::time_functions_emqx_docs`
 - `tests::topic_match_operator_and_topic_function`
 - `tests::type_judgment_functions_emqx_docs`
@@ -1099,14 +1128,19 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 561 test(s)
+## `crates/mqttd/src/lib.rs` — 588 test(s)
 
+- `admin::cli::tests::a_refusal_shows_what_it_carries`
 - `admin::cli::tests::all_nodes_asks_for_the_cluster_scope_on_the_verbs_that_have_one`
 - `admin::cli::tests::answers_render_as_tables_and_lines`
 - `admin::cli::tests::help_wraps_to_the_terminal_width`
 - `admin::cli::tests::identifying_columns_lead_every_table`
 - `admin::cli::tests::invocations_are_validated_before_anything_runs`
 - `admin::cli::tests::the_cluster_view_is_compact_and_says_what_is_wrong`
+- `admin::cli::tests::the_help_names_the_clients_own_environment`
+- `admin::cli::tests::the_rules_source_prints_the_file_verbatim`
+- `admin::cli::tests::the_rules_verbs_are_validated_without_reading_the_file`
+- `admin::cli::tests::the_rules_view_is_a_table_of_counts_and_last_errors`
 - `admin::client::tests::responses_split_into_status_and_body`
 - `admin::client::tests::urls_need_https_and_a_port`
 - `admin::cluster::tests::a_silent_node_is_a_row_with_its_reason_not_a_healthy_one`
@@ -1114,9 +1148,14 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `admin::http::tests::a_get_with_a_query_is_decoded`
 - `admin::http::tests::a_post_body_is_read_to_its_length`
 - `admin::http::tests::encode_and_decode_round_trip`
+- `admin::http::tests::every_status_has_its_reason_phrase`
 - `admin::http::tests::oversized_and_malformed_requests_are_refused`
+- `admin::http::tests::the_body_cap_is_chosen_per_method_and_path`
 - `admin::roles::tests::operator_wins_and_cluster_certificates_are_peers`
 - `admin::roles::tests::subjects_map_to_roles`
+- `admin::rules::tests::a_rule_body_leaves_out_what_the_file_already_says`
+- `admin::rules::tests::a_write_the_filesystem_refuses_is_a_conflict_and_any_other_failure_the_servers`
+- `admin::rules::tests::writers_with_an_unwritable_directory_are_warned_about`
 - `admin::scope::tests::a_session_is_the_connected_copy_else_the_owners_and_a_miss_names_every_node`
 - `admin::scope::tests::client_pages_merge_by_client_id_and_page_across_the_cluster`
 - `admin::scope::tests::only_node_and_cluster_are_scopes_and_a_forward_is_always_node_scope`
@@ -1136,6 +1175,10 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `aliases::tests::outbound_assigns_then_reuses`
 - `aliases::tests::outbound_disabled_when_max_zero`
 - `aliases::tests::outbound_stops_assigning_when_full_but_keeps_existing`
+- `atomic_file::tests::a_failed_replace_changes_nothing_and_cleans_up`
+- `atomic_file::tests::a_file_is_replaced_whole_and_its_previous_bytes_kept`
+- `atomic_file::tests::a_planted_file_at_a_guessable_name_is_never_written_through`
+- `atomic_file::tests::the_mode_is_kept_and_a_new_file_gets_the_one_asked_for`
 - `backpressure::tests::an_entry_larger_than_the_whole_byte_cap_is_kept_so_delivery_progresses`
 - `backpressure::tests::message_bytes_counts_topic_payload_and_forwarded_properties`
 - `backpressure::tests::packet_bytes_matches_message_bytes_for_a_publish`
@@ -1185,13 +1228,16 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `conn::tests::a_protocol_violation_close_detaches_ungracefully_so_the_will_fires`
 - `conn::tests::a_qos2_publish_whose_durable_fan_out_failed_stays_held_unacked_and_is_re_attempted`
 - `conn::tests::a_v311_denied_publish_keeps_its_plain_ack_and_audit_for_both_qos_levels`
+- `conn::tests::a_v311_publish_into_sys_is_acked_and_dropped`
 - `conn::tests::a_v311_publisher_closed_by_a_refusal_detaches_ungracefully_so_its_will_fires`
 - `conn::tests::a_v311_publisher_is_closed_without_a_puback_when_the_hub_refuses_a_brownout_publish`
 - `conn::tests::a_v5_disconnect_with_a_non_zero_reason_detaches_ungracefully_so_the_will_fires`
+- `conn::tests::a_v5_publish_into_sys_is_refused_0x87_whatever_the_acl_says`
 - `conn::tests::a_v5_publisher_is_answered_0x97_when_the_hub_refuses_the_publish`
 - `conn::tests::a_v5_qos1_publish_denied_by_the_acl_is_answered_puback_0x87`
 - `conn::tests::a_v5_qos2_publish_denied_by_the_acl_ends_the_flow_with_pubrec_0x87`
 - `conn::tests::a_v5_qos2_refusal_ends_the_flow_and_frees_the_id_completely`
+- `conn::tests::a_will_in_sys_is_refused_at_connect`
 - `conn::tests::a_withheld_qos2_publish_stays_held_but_unacked_so_its_resend_is_never_answered_as_a_duplicate`
 - `conn::tests::an_accepted_qos2_publish_marks_the_id_acked_before_the_pubrec_so_its_dup_is_answered_from_the_window`
 - `conn::tests::an_assigned_id_is_unique_across_nodes_not_just_within_one`
@@ -1265,6 +1311,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `health::tests::startup_must_finish_before_readiness_but_does_not_override_other_gates`
 - `health::tests::statusz_reports_identity_members_brownout_and_proto`
 - `health::tests::statusz_reports_the_derived_write_floor_and_its_source`
+- `health::tests::statusz_reports_the_running_rules`
 - `health::tests::statusz_reports_the_store_self_measurement`
 - `health::tests::the_healthy_majority_is_not_quarantined_by_foreign_gossip`
 - `health::tests::unknown_paths_are_404`
@@ -1381,6 +1428,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::a_node_draining_in_a_brownout_still_sends_its_shutdown_events_live`
 - `hub::tests::a_panicking_truncate_flush_does_not_strand_its_session`
 - `hub::tests::a_parked_qos2_truncate_does_not_stall_unrelated_sessions`
+- `hub::tests::a_peer_forwards_only_its_own_statistics_into_sys`
 - `hub::tests::a_peer_refusing_a_forward_the_drain_gated_gets_it_again_as_a_plain_forward`
 - `hub::tests::a_peer_refusing_a_stored_derived_message_does_not_withhold_the_original`
 - `hub::tests::a_peer_that_missed_the_last_fanout_converges_from_a_restarted_owners_snapshot`
@@ -1409,11 +1457,13 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::a_restart_after_pubrec_resumes_with_pubrel_under_the_original_id`
 - `hub::tests::a_restart_before_pubrec_republishes_dup_under_the_original_id`
 - `hub::tests::a_restarted_owners_snapshot_exports_committed_tokens_and_readopts_the_record`
+- `hub::tests::a_restore_skips_a_retained_sys_value_and_goes_on`
 - `hub::tests::a_restored_retained_value_is_retained_state_and_never_touches_a_restored_queue`
 - `hub::tests::a_resumed_session_loses_grants_the_current_policy_denies`
 - `hub::tests::a_retained_commit_in_the_interest_window_reaches_the_fresh_subscriber`
 - `hub::tests::a_retained_publish_refused_by_brownout_leaves_the_previous_retained_value_intact`
 - `hub::tests::a_retained_replay_carries_the_remaining_expiry_interval`
+- `hub::tests::a_retained_sys_value_is_never_replayed`
 - `hub::tests::a_session_that_becomes_misplaced_by_attaching_is_rehomed`
 - `hub::tests::a_shared_group_refusing_every_drain_gated_delivery_still_gets_it_plainly`
 - `hub::tests::a_shared_group_whose_last_candidate_died_still_gets_a_drain_gated_message`
@@ -1485,6 +1535,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::offline_queue_is_bounded_and_replays_newest`
 - `hub::tests::one_axis_recovering_does_not_lift_another_axis_brownout`
 - `hub::tests::one_tick_closes_at_most_the_per_tick_cap_and_defers_the_rest`
+- `hub::tests::only_the_brokers_own_publish_routes_a_sys_topic`
 - `hub::tests::ordinary_and_shared_subscriptions_are_independent`
 - `hub::tests::outbound_packet_ids_resume_past_the_durable_high_water`
 - `hub::tests::overlapping_connects_are_last_writer_wins`
@@ -1532,6 +1583,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::retain_handling_controls_the_replay_at_subscribe`
 - `hub::tests::retained_digest_is_offered_and_a_request_pulls_the_snapshot`
 - `hub::tests::retained_snapshot_does_not_overwrite_existing`
+- `hub::tests::retained_sys_leftovers_are_purged_at_boot`
 - `hub::tests::scaling_locality::a_fractional_bias_delivers_the_exact_specified_local_schedule`
 - `hub::tests::scaling_locality::bias_0_reproduces_prefer_local_off`
 - `hub::tests::scaling_locality::bias_1000_reproduces_todays_prefer_local`
@@ -1622,7 +1674,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `memory_watch::tests::a_status_without_vm_rss_yields_none_not_zero`
 - `memory_watch::tests::an_unreadable_rss_stops_the_watcher_instead_of_reporting_zero`
 - `memory_watch::tests::nearing_the_watermark_shortens_the_poll`
-- `memory_watch::tests::the_real_sampler_reports_a_plausible_rss_on_linux` — only when `cfg(target_os = "linux")`
+- `memory_watch::tests::the_real_sampler_reports_a_plausible_rss_on_linux`
 - `memory_watch::tests::the_watcher_drives_brownout_on_watermark_transitions`
 - `memory_watch::tests::vm_rss_is_parsed_in_bytes_from_the_right_line`
 - `memory_watch::tests::without_a_watermark_nothing_is_ever_browned_out`
@@ -1634,6 +1686,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `reload::tests::a_config_reload_swaps_live_and_keeps_it_on_any_failure`
 - `reload::tests::a_failed_reload_keeps_the_running_policy`
 - `reload::tests::a_reload_dispatches_the_identity_sweep_only_on_success`
+- `reload::tests::a_reload_error_kind_is_the_failing_part_never_the_text`
 - `reload::tests::a_reload_into_ephemeral_durability_is_rejected_and_the_running_config_kept`
 - `reload::tests::a_reload_reports_its_outcome`
 - `reload::tests::a_reload_swaps_the_gossip_crl_into_the_live_slot`
@@ -1643,9 +1696,12 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `reload::tests::a_successful_reload_swaps_the_policy`
 - `reload::tests::checksum_is_sha256_lowercase_hex`
 - `reload::tests::committed_config_never_returns_a_rejected_candidate`
+- `reload::tests::every_reload_attempt_is_recorded_with_its_repeats`
 - `reload::tests::reload_increments_the_metric_by_outcome`
 - `rules::tests::gated_derived_actions_are_counted_by_their_fate`
 - `rules::tests::the_publisher_hears_exactly_the_originals_answer`
+- `rules_sys::tests::a_payload_is_text_when_it_is_and_base64_when_not`
+- `rules_sys::tests::times_are_rfc3339_utc_with_milliseconds`
 - `runtime_probe::tests::both_probes_feed_the_wake_histogram`
 - `store_probe::tests::probes_a_volume_and_cleans_up`
 - `store_probe::tests::sharding_pays_only_when_parallel_streams_are_nearly_independent`
@@ -1699,7 +1755,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `narrow_allow_does_not_cover_broad_subscription`
 - `unauthorized_will_topic_is_refused_at_connect`
 
-## `crates/mqttd/tests/admin.rs` — 19 test(s)
+## `crates/mqttd/tests/admin.rs` — 21 test(s)
 
 - `a_certificate_from_another_ca_fails_the_handshake`
 - `a_clean_session_is_kicked_where_it_is_not_where_placement_points`
@@ -1720,6 +1776,24 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `purge_deletes_an_offline_session_and_its_queue`
 - `subscribers_backlog_and_retained_answer_the_day_two_questions`
 - `the_authorization_dry_run_names_the_deciding_rule_of_the_live_policy`
+- `the_authorization_dry_run_never_allows_a_publish_into_sys`
+- `the_cluster_view_compares_every_nodes_rules_digest`
+
+## `crates/mqttd/tests/admin_rules.rs` — 13 test(s)
+
+- `a_last_error_is_shown_only_for_the_definition_it_was_about`
+- `a_rejected_reload_says_the_file_was_written_and_what_still_runs`
+- `a_rules_body_is_read_only_from_a_role_that_may_send_one`
+- `a_symlinked_rules_file_has_its_target_replaced`
+- `a_whole_file_write_is_a_writers_and_replaces_the_file_and_what_runs`
+- `a_write_into_a_read_only_directory_is_refused_and_changes_nothing`
+- `applied_means_the_written_rules_are_the_ones_running`
+- `check_says_whether_text_would_load_and_where_it_would_not`
+- `if_match_and_every_edit_are_about_the_file_on_disk`
+- `one_rule_is_edited_in_place_and_the_rest_of_the_file_kept_byte_for_byte`
+- `the_dry_run_shows_what_the_rules_would_do_and_changes_nothing`
+- `the_rules_file_is_read_verbatim_by_an_operator_only`
+- `the_running_rules_are_read_whole_by_an_operator_and_redacted_for_a_viewer`
 
 ## `crates/mqttd/tests/audit.rs` — 4 test(s)
 
@@ -1853,6 +1927,11 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 
 - `a_rolled_back_binary_reads_a_newer_config_under_warn` — `#[ignore]`d
 - `a_rolling_upgrade_and_rollback_lose_no_acked_fact` — `#[ignore]`d
+
+## `crates/mqttd/tests/compose_env.rs` — 2 test(s)
+
+- `every_mqttd_variable_a_compose_file_sets_is_one_mqttd_reads`
+- `the_scan_reads_environment_keys_and_nothing_else`
 
 ## `crates/mqttd/tests/config_watch.rs` — 2 test(s)
 
@@ -2102,7 +2181,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `foreach_fans_one_publish_out`
 - `in_a_cluster_each_message_is_evaluated_once_on_its_landing_node`
 
-## `crates/mqttd/tests/rules_binary.rs` — 41 test(s)
+## `crates/mqttd/tests/rules_binary.rs` — 44 test(s)
 
 - `a_closed_stdout_leaves_probe_and_backup_their_exit_status`
 - `a_closed_stdout_neither_panics_a_command_nor_changes_its_exit_status`
@@ -2119,6 +2198,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `a_shared_group_receives_derived_messages_balanced_across_members`
 - `a_will_runs_the_rules_in_force_when_the_broker_publishes_it`
 - `an_acl_denied_publish_runs_no_rules`
+- `an_admin_rules_edit_applies_to_the_next_message`
 - `check_rules_accepts_a_valid_file_and_lists_every_rule`
 - `check_rules_exits_2_on_a_usage_error`
 - `check_rules_loads_1024_rules_and_refuses_1025`
@@ -2132,6 +2212,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `check_rules_with_no_file_checks_the_configured_rules_file`
 - `client_connected_carries_the_connects_fields_for_v5_and_v311`
 - `client_disconnected_reports_normal_tcp_closed_and_a_v5_reason_by_its_emqx_name`
+- `env_configured_rule_statistics_and_trace_reach_a_subscriber`
 - `in_a_two_process_cluster_a_publish_is_evaluated_once_on_its_landing_node`
 - `no_local_does_not_suppress_a_derived_message_for_its_publisher`
 - `rule_test_event_picks_among_several_events`
@@ -2145,6 +2226,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `the_broker_refuses_to_boot_on_a_rules_file_that_does_not_load`
 - `two_rules_failing_on_every_message_each_log_one_warn_per_ten_seconds`
 - `with_config_watch_an_edited_rules_file_is_picked_up_without_a_signal`
+- `writers_for_a_rules_directory_the_broker_cannot_write_in_are_warned_about`
 
 ## `crates/mqttd/tests/rules_cookbook.rs` — 11 test(s)
 
@@ -2160,12 +2242,19 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `the_pattern_matcher_checks_rendered_times`
 - `without_their_guards_the_recipes_do_what_the_cookbook_warns`
 
-## `crates/mqttd/tests/rules_demo.rs` — 4 test(s)
+## `crates/mqttd/tests/rules_demo.rs` — 11 test(s)
 
 - `the_demo_derives_exactly_what_it_shows`
 - `the_demo_rules_file_checks_clean`
+- `the_live_player_backs_off_and_keeps_devices_offline_where_the_script_does`
+- `the_live_schedule_places_a_time_in_its_window`
+- `the_live_scheduler_joins_drops_late_events_and_rejoins`
+- `the_live_simulator_replays_the_fixture_in_every_window`
+- `the_live_simulator_rides_out_a_broker_restart_and_stops_cleanly`
+- `the_live_simulators_device_clocks_run_on_from_window_to_window`
 - `the_readme_quotes_only_messages_the_fixture_derives`
 - `the_simulator_is_deterministic`
+- `the_simulators_mqtt_client_bounds_its_waits_and_reads_while_idle`
 
 ## `crates/mqttd/tests/rules_docs.rs` — 5 test(s)
 
@@ -2175,12 +2264,28 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `the_extraction_recognises_every_documented_form`
 - `the_extraction_refuses_what_it_cannot_run`
 
+## `crates/mqttd/tests/rules_sys.rs` — 13 test(s)
+
+- `a_secret_in_a_config_error_or_in_a_rule_never_reaches_sys`
+- `a_tick_the_pool_cannot_carry_is_skipped_and_counted`
+- `a_trace_record_lists_sixteen_outputs_and_counts_the_rest`
+- `an_interval_change_applies_at_once`
+- `last_errors_by_kind_and_a_synthesized_delivery_entry`
+- `records_queued_before_the_trace_turned_off_are_not_published`
+- `sys_publishes_reach_subscribers_and_never_run_rules`
+- `the_statistics_list_every_rule_with_counts_rates_and_last_activity`
+- `the_trace_is_rate_limited_per_rule_and_no_result_has_its_own_budget`
+- `the_trace_off_records_nothing`
+- `the_trace_queue_is_bounded_in_bytes`
+- `the_trace_task_holds_the_node_ceiling`
+- `trace_records_show_the_trigger_and_what_the_rule_rendered`
+
 ## `crates/mqttd/tests/shared_membership.rs` — 6 test(s)
 
 - `membership_cpu_accounting_handles_parentheses_and_excludes_child_time`
 - `membership_fixture_delivers_exactly_once_across_all_arms`
 - `membership_peer_oracle_rejects_forwarding_even_with_local_receipts`
-- `membership_perf_ack_requires_complete_confirmation` — only when `cfg(target_os = "linux")`
+- `membership_perf_ack_requires_complete_confirmation`
 - `membership_receipt_oracle_rejects_loss_duplicates_and_stale_bursts`
 - `membership_tcp_fixture_receives_all_data_before_each_socket_fence`
 

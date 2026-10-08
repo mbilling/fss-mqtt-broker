@@ -46,10 +46,16 @@ def _remaining_length(n: int) -> bytes:
 
 
 class Client:
-    """One MQTT connection. Not thread-safe; the player drives it from one loop."""
+    """One MQTT connection. Not thread-safe; the player drives it from one loop.
 
-    def __init__(self, host: str, port: int, client_id: str, keepalive: int = 60):
+    `timeout` bounds every wait on the broker: the TCP connect, the CONNACK, a send it stops
+    reading, and the PUBACK or SUBACK of a request.
+    """
+
+    def __init__(self, host: str, port: int, client_id: str, keepalive: int = 60,
+                 timeout: float = 10):
         self.host, self.port, self.client_id, self.keepalive = host, port, client_id, keepalive
+        self.timeout = timeout
         self.sock: Optional[socket.socket] = None
         self._buf = b""
         self._next_id = 1
@@ -59,21 +65,30 @@ class Client:
     # ---- connection -------------------------------------------------------------------
 
     def connect(self, clean: bool = True, will: Optional[tuple[str, bytes, int, bool]] = None):
-        """Open the connection; `will` is (topic, payload, qos, retain)."""
-        self.sock = socket.create_connection((self.host, self.port), timeout=10)
-        self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        flags = 0x02 if clean else 0
-        body = _string("MQTT") + bytes([4])
-        tail = _string(self.client_id)
-        if will:
-            topic, payload, qos, retain = will
-            flags |= 0x04 | (qos << 3) | (0x20 if retain else 0)
-            tail += _string(topic) + struct.pack("!H", len(payload)) + payload
-        body += bytes([flags]) + struct.pack("!H", self.keepalive) + tail
-        self._send(CONNECT << 4, body)
-        kind, _, data = self._read_packet()
-        if kind != CONNACK or len(data) < 2 or data[1] != 0:
-            raise MqttError(f"{self.client_id}: CONNECT refused ({data.hex()})")
+        """Open the connection; `will` is (topic, payload, qos, retain). On any failure the
+        socket is closed again."""
+        self.sock = socket.create_connection((self.host, self.port), timeout=self.timeout)
+        try:
+            self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            flags = 0x02 if clean else 0
+            body = _string("MQTT") + bytes([4])
+            tail = _string(self.client_id)
+            if will:
+                topic, payload, qos, retain = will
+                flags |= 0x04 | (qos << 3) | (0x20 if retain else 0)
+                tail += _string(topic) + struct.pack("!H", len(payload)) + payload
+            body += bytes([flags]) + struct.pack("!H", self.keepalive) + tail
+            self._send(CONNECT << 4, body)
+            # A broker that accepts the connection and never answers must not hang the caller.
+            got = self._read_packet(self.timeout)
+            if got is None:
+                raise MqttError(f"{self.client_id}: no CONNACK within {self.timeout:g} s")
+            kind, _, data = got
+            if kind != CONNACK or len(data) < 2 or data[1] != 0:
+                raise MqttError(f"{self.client_id}: CONNECT refused ({data.hex()})")
+        except BaseException:
+            self.drop()
+            raise
 
     def disconnect(self):
         """A clean DISCONNECT: the broker discards the Will. A broker already gone is fine."""
@@ -136,6 +151,34 @@ class Client:
         if self.sock and time.monotonic() - self._last_sent > self.keepalive / 2:
             self._send(PINGREQ << 4, b"")
 
+    def drain(self):
+        """Handle whatever the broker has sent, without waiting for more.
+
+        A client that only publishes at QoS 0 never reads otherwise: its PINGRESPs pile up,
+        and a broker that went away is noticed only when a send fails. Raises MqttError
+        when the broker has closed the connection.
+        """
+        if self.sock is None:
+            raise MqttError(f"{self.client_id}: not connected")
+        self.sock.setblocking(False)
+        try:
+            while True:
+                try:
+                    chunk = self.sock.recv(65536)
+                except (BlockingIOError, InterruptedError):
+                    break
+                if not chunk:
+                    raise MqttError(f"{self.client_id}: connection closed by the broker")
+                self._buf += chunk
+        finally:
+            if self.sock:
+                self.sock.settimeout(self.timeout)
+        while True:
+            got = self._parse()
+            if got is None:
+                return
+            self._handle(*got)
+
     # ---- plumbing ------------------------------------------------------------------------
 
     def _packet_id(self) -> int:
@@ -146,11 +189,12 @@ class Client:
     def _send(self, header: int, body: bytes):
         if not self.sock:
             raise MqttError(f"{self.client_id}: not connected")
+        self.sock.settimeout(self.timeout)
         self.sock.sendall(bytes([header]) + _remaining_length(len(body)) + body)
         self._last_sent = time.monotonic()
 
     def _await(self, kind: int, pid: int):
-        deadline = time.monotonic() + 10
+        deadline = time.monotonic() + self.timeout
         while time.monotonic() < deadline:
             got = self._read_packet(deadline - time.monotonic())
             if got is None:

@@ -430,7 +430,8 @@ NO_EQUIVALENT: dict[str, str] = {
     "bridge": "bridging is a separate process in mqttd (mqtt-bridge) with its own "
     "config; see docs/BRIDGE.md",
     "log_dest": "mqttd logs to stdout for the container/journal to collect",
-    "sys_interval": "$SYS topics are not implemented; use the Prometheus endpoint",
+    "sys_interval": "mqttd publishes no $SYS broker statistics (its $SYS holds only "
+    "opt-in rule statistics and trace); use the Prometheus endpoint",
     "autosave_interval": "writes are transactional (redb); there is no autosave timer",
     "allow_zero_length_clientid": "a zero-length client id is accepted with clean "
     "session and refused otherwise, per spec; not configurable",
