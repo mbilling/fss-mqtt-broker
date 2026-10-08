@@ -199,7 +199,9 @@ Lines and columns count within the rule's `sql` string, not the file: line 4, co
 is the end of the statement, just after the newline that closes its `WHERE` line.
 
 Stop the broker with Ctrl-C (or `docker rm -f mqttd`). Every recipe in the
-[cookbook](RULES-COOKBOOK.md) runs the same way.
+[cookbook](RULES-COOKBOOK.md) runs the same way. To see 21 rules at work on realistic
+telemetry from wind turbines, solar inverters, smart meters, heat pumps and a service fleet,
+run [`demo/rules/run.sh`](../demo/rules/README.md).
 
 ---
 
@@ -863,6 +865,9 @@ Traps that EMQX's reference states only in passing, each checked against this en
 - `unix_ts_to_rfc3339` and `now_rfc3339` write the broker host's local time zone, as EMQX
   does (`+00:00` on a host or container set to UTC). `format_date` with an explicit offset
   (`'+01:00'`) gives the same text on every host.
+- `format_date` (and `date_to_unix_ts`) with the offset `'local'` uses the host's offset
+  *now*, not the one in effect at the instant being formatted: in summer, a winter
+  timestamp comes out an hour off from what `unix_ts_to_rfc3339` writes for it.
 - `is_empty` of a missing value fails the rule
   (`is_empty(): expected an array or a map, got a undefined`); EMQX documents it as
   `false`. Guard it: `is_not_null(payload.list) AND is_empty(payload.list)`.

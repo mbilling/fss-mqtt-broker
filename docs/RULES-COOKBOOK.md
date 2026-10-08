@@ -16,7 +16,9 @@ guarded recipes without their guards and checks that each trap is real. If a rec
 doing what this page says, the build would fail.
 
 For the SQL, the fields, the functions and the actions themselves, see
-[RULES.md](RULES.md).
+[RULES.md](RULES.md). For the recipes put together on realistic data (ten simulated
+minutes of power plants, homes and cars, with 21 rules and the alerts, KPIs and
+privacy-safe feeds they derive), see the [rule-engine demo](../demo/rules/README.md).
 
 ---
 

@@ -82,6 +82,104 @@ rather than editing YAML by hand.
 requires = ["python3"]
 duration = "~1s"
 
+[[task]]
+id = "demo-rules"
+group = "Demo"
+name = "Watch the rule engine turn power-plant, home and car telemetry into alerts and KPIs"
+script = "demo/rules/run.sh"
+# No release has the rule engine yet: the script builds mqttd from the checkout (or uses
+# $MQTTD), because a released binary would ignore the rules file without a word.
+needs_checkout = true
+about = """
+Starts mqttd with demo/rules/rules.toml and plays ten simulated minutes of a Danish utility
+and fleet into it: wind turbines, a solar park's SunSpec inverters, a hydro unit behind a
+CSV RTU and the grid frequency; homes with DSMR P1 smart meters, heat pumps, batteries and
+EV chargers; electric cars and OBD-II vans. It prints every device message and every
+message the rules derive from them (decoded, normalized, alerts, KPIs, privacy-safe
+feeds, last-known state, presence), then the broker's per-rule counters.
+
+The data is seeded and replayable; demo/rules/README.md explains each device and each rule.
+Any argument is passed to the simulator, e.g. `--speed 1` or `--domains cars --quiet`.
+"""
+requires = ["python3"]
+optional = ["cargo"]
+duration = "~1m at the default 10x speed (plus a first build)"
+
+[[task]]
+id = "demo-rules-simulate"
+group = "Demo"
+name = "Play simulated power-plant, home and car telemetry into a running broker"
+script = "demo/rules/simulate.py"
+about = """
+The simulator behind demo-rules, on its own: ten simulated minutes of a Danish utility and
+fleet (wind turbines, SunSpec inverters, a CSV RTU, a PMU; DSMR P1 smart meters, heat
+pumps, PV, batteries, OCPP chargers; telematics and binary OBD-II frames), one MQTT
+connection per device, seeded and replayable. Point it at a broker that loads
+demo/rules/rules.toml to see what the rules derive, or at any broker for realistic load.
+It prints each device message and each message published under the demo's derived
+topics (alerts/, kpi/, normalized/, analytics/, state/, events/).
+"""
+requires = ["python3"]
+duration = "~1m at the default 10x speed"
+args = ["--host", "${HOST}", "--port", "${PORT}"]
+[[task.env]]
+name = "HOST"
+default = "127.0.0.1"
+help = "The broker's host"
+[[task.env]]
+name = "PORT"
+default = "1883"
+help = "The broker's plaintext MQTT port"
+
+# The simulator's package: imported by demo/rules/simulate.py, not run on its own.
+[[task]]
+id = "demo-rules-sim-package"
+group = "Demo"
+name = "The rule-engine demo simulator's package marker (imported, not run)"
+script = "demo/rules/sim/__init__.py"
+hidden = true
+about = "Imported by demo/rules/simulate.py."
+
+[[task]]
+id = "demo-rules-sim-core"
+group = "Demo"
+name = "The rule-engine demo simulator's event model and player (imported, not run)"
+script = "demo/rules/sim/core.py"
+hidden = true
+about = "Imported by demo/rules/simulate.py."
+
+[[task]]
+id = "demo-rules-sim-mqtt"
+group = "Demo"
+name = "The rule-engine demo simulator's MQTT 3.1.1 client (imported, not run)"
+script = "demo/rules/sim/mqtt.py"
+hidden = true
+about = "Imported by demo/rules/simulate.py."
+
+[[task]]
+id = "demo-rules-sim-power"
+group = "Demo"
+name = "The rule-engine demo's simulated power plants (imported, not run)"
+script = "demo/rules/sim/power.py"
+hidden = true
+about = "Imported by demo/rules/simulate.py; its docstring documents the devices and faults."
+
+[[task]]
+id = "demo-rules-sim-homes"
+group = "Demo"
+name = "The rule-engine demo's simulated homes (imported, not run)"
+script = "demo/rules/sim/homes.py"
+hidden = true
+about = "Imported by demo/rules/simulate.py; its docstring documents the devices and faults."
+
+[[task]]
+id = "demo-rules-sim-cars"
+group = "Demo"
+name = "The rule-engine demo's simulated cars (imported, not run)"
+script = "demo/rules/sim/cars.py"
+hidden = true
+about = "Imported by demo/rules/simulate.py; its docstring documents the devices and faults."
+
 # ── Migration ────────────────────────────────────────────────────────────────────────
 [[task]]
 id = "migrate-mosquitto"

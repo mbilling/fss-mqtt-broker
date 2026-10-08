@@ -96,21 +96,27 @@ fn run(mut cmd: Command) -> Ran {
     );
     let stdout = read_all(child.0.stdout.take().expect("stdout piped"));
     let stderr = read_all(child.0.stderr.take().expect("stderr piped"));
+    let status = wait_bounded(&mut child, &what);
+    Ran {
+        code: status.code(),
+        stdout: stdout.join().expect("stdout reader"),
+        stderr: stderr.join().expect("stderr reader"),
+    }
+}
+
+/// Wait for `child` to exit, at most 60 s: a command that hangs, or boots a broker
+/// instead of exiting, fails the test instead of wedging the suite.
+fn wait_bounded(child: &mut ChildGuard, what: &str) -> std::process::ExitStatus {
     let deadline = Instant::now() + Duration::from_secs(60);
-    let status = loop {
+    loop {
         if let Some(status) = child.0.try_wait().expect("try_wait") {
-            break status;
+            return status;
         }
         assert!(
             Instant::now() < deadline,
             "mqttd {what} did not exit within 60 s"
         );
         std::thread::sleep(Duration::from_millis(10));
-    };
-    Ran {
-        code: status.code(),
-        stdout: stdout.join().expect("stdout reader"),
-        stderr: stderr.join().expect("stderr reader"),
     }
 }
 
@@ -649,6 +655,54 @@ fn check_rules_accepts_a_valid_file_and_lists_every_rule() {
     assert_eq!(ran.code, Some(0), "{ran:?}");
     assert_eq!(ran.stdout, good_rules_listing(&path));
     assert_eq!(ran.stderr, "");
+}
+
+/// A reader that goes away first (`mqttd --check-rules rules.toml | head -1`) ends the
+/// offline commands quietly, with exit status 0, not with a panic and exit status 101:
+/// `--check-rules`, `--rule-test` and `--help` write stdout through one helper that treats
+/// a closed pipe as the end of the output.
+#[test]
+fn a_closed_stdout_ends_the_offline_commands_quietly() {
+    let dir = tempfile::tempdir().unwrap();
+    write_rules(dir.path(), GOOD_RULES);
+    let path = dir.path().join("rules.toml").display().to_string();
+    let commands: [&[&str]; 3] = [
+        &["--check-rules", &path],
+        &[
+            "--rule-test",
+            "--sql",
+            "SELECT 1 AS x FROM \"t\"",
+            "--topic",
+            "t",
+            "--payload",
+            "{}",
+        ],
+        &["--help"],
+    ];
+    for args in commands {
+        let mut child = ChildGuard(
+            mqttd()
+                .args(args)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("spawn mqttd"),
+        );
+        // The reader is gone before the command has started, let alone written.
+        drop(child.0.stdout.take());
+        let stderr = read_all(child.0.stderr.take().expect("stderr piped"));
+        let status = wait_bounded(&mut child, &format!("{args:?}"));
+        let stderr = stderr.join().expect("stderr reader");
+        assert_eq!(
+            status.code(),
+            Some(0),
+            "mqttd {args:?}, stdout closed: {stderr}"
+        );
+        assert!(
+            !stderr.contains("panicked"),
+            "mqttd {args:?} panicked: {stderr}"
+        );
+    }
 }
 
 /// RULES.md "Operating rules": "With no file it checks the configured `rules.file`" —

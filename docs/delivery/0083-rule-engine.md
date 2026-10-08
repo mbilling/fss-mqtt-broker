@@ -83,6 +83,11 @@ tasks:
     status: done
     date: 2026-10-07
     evidence: "The reviewer's re-review of 5e44777: shared_exhausted took the fallback only when the last answer was a refusal. One member refusing (brownout) and the next member's node dying (peer_dead re-selects with Failed) ended in drop_pending, and the group got nothing though the refusing member was alive. Now any exhausted pass for a drain-gated publish delivers it unanswered to the first member tried that is still in the group (a dead member has already left it; a member whose node died may have delivered it first, so this path is at least once, even at QoS 2, as the re-selection after a peer's death already is), and the doc comment says so. Tests: hub::tests::a_shared_group_whose_last_candidate_died_still_gets_a_drain_gated_message (mutation-checked: falling back only after a refusal fails it); hub::tests::a_local_member_refused_by_a_brownout_after_the_drain_gated_it_still_gets_it_live, the fallback's local branch: the peer member refuses and leaves the group, the local member is back online and refused by a brownout that began after the drain gated the message, and still gets it live (mutation-checked: without the local branch it fails). drain_gated's doc says a drain that could be cancelled would have to clear it. cargo test -p mqtt-rules -p mqtt-config -p mqtt-observability -p mqttd: 64 binaries, 1128 passed, 0 failed (14 ignored, pre-existing); fmt and clippy -D warnings clean."
+  - id: 0083-T17
+    title: "The rule engine on realistic data: a power-plant, home and car demo, replayed by a test"
+    status: done
+    date: 2026-10-08
+    evidence: "demo/rules: a seeded, stdlib-only Python simulator of a Danish utility and fleet. Power: 6 wind turbines with IEC 61400-25 style JSON and a park controller's minute batch, 4 SunSpec model 103 inverters with scale factors, a gas peaker behind a CSV RTU, a PMU. Homes: 12 households with DSMR 5.0 P1 telegrams, thermostats, heat pumps, PV, batteries and OCPP chargers. Cars: 9 vehicles with telematics JSON, a buffered trip log, binary OBD-II Mode 01/03 frames, ignition as MQTT connects. 21 rules in demo/rules/rules.toml decode, normalize, alert, compute KPIs (power-curve performance, COP, tariff cost), pseudonymize third-party feeds, keep retained state and turn the broker's client events into presence. demo/rules/run.sh runs it (mqttui task demo-rules; the simulator alone is demo-rules-simulate, its modules are declared hidden). Each domain was built by one engineer, reviewed adversarially by running it (realism, correctness, determinism, value), and fixed; the reviews and fixes ran twice for power and homes. In the 10-minute fixture (--seed 7 --start 2026-03-24T15:55:00Z --duration 600): 2,362 device messages in, 1,333 derived out, of which 54 alerts, each an injected fault, none from the look-alikes. crates/mqttd/tests/rules_demo.rs generates the fixture, replays it through the real binary (one connection per device) and asserts the derived messages are exactly crates/mqttd/tests/rules_demo.expected; it also checks the simulator is deterministic, rules.toml passes --check-rules clean, and every derived message demo/rules/README.md quotes is one the fixture produces (mutation-checked: a changed quoted value fails it). Also: unix_ts_to_rfc3339 and now_rfc3339 write the host's time zone, now documented, with the cookbook and docs suites pinning TZ=UTC and the timestamp unit test zone-independent (c5c672c); format_date's 'local' offset is today's offset, now in RULES.md's traps; and mqttd's offline commands (--check-rules, --rule-test, --help, --check-config, --print-config) no longer panic with exit 101 when stdout closes early (`| head -1`): they write stdout through a helper that ends quietly on a broken pipe, while SIGPIPE stays ignored for the server. Test: rules_binary a_closed_stdout_ends_the_offline_commands_quietly (mutation-checked: with print! it fails on exit 101). TOTALS"
 ---
 
 # Delivery 0083 — the rule engine
@@ -112,6 +117,7 @@ above; the table below is generated from it.
 | **0083-T14** Review round 6 | A drain never sends what it derives to fewer subscribers than an ungated publish would, and says what it did not wait for. |
 | **0083-T15** Review round 7 | A shared group gets a drain-time message even when every member refuses its acked form, and the drain's loss count counts only what nobody retries. |
 | **0083-T16** Review round 8 | A shared group gets a drain-time message however its re-selection ends. |
+| **0083-T17** The engine on realistic data | A reader sees what rules make of real-looking power-plant, home and car telemetry, and a test keeps every example true. |
 
 ## Progress
 
@@ -166,3 +172,7 @@ above; the table below is generated from it.
   count counts only the messages it gated itself.
 - **2026-10-07** — Review round 8 (0083-T16): the shared fallback holds however the
   re-selection ends, a refusal or a member's node dying, and its local branch is tested.
+- **2026-10-08** — The engine on realistic data (0083-T17): demo/rules simulates power
+  plants, homes and cars, 21 rules derive alerts, KPIs, normalized records, privacy-safe
+  feeds, state and presence, and a test replays it through mqttd; the offline commands end
+  quietly on a closed pipe.

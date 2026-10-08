@@ -4447,11 +4447,36 @@ fn reject_invalid_cli() {
     }
 }
 
+/// `print!` for the offline commands, whose output may go to a pipe that closes early
+/// (`mqttd --check-rules rules.toml | head -1`): a closed stdout ends the process quietly,
+/// with exit status 0, where `print!` would panic. The broker itself logs to stderr and
+/// never writes stdout, and SIGPIPE stays ignored, as a server's must.
+macro_rules! out {
+    ($($arg:tt)*) => {{
+        use std::io::Write as _;
+        if let Err(e) = write!(std::io::stdout(), $($arg)*) {
+            if e.kind() == std::io::ErrorKind::BrokenPipe {
+                std::process::exit(0);
+            }
+            eprintln!("error: cannot write to stdout: {e}");
+            std::process::exit(1);
+        }
+    }};
+}
+
+/// [`out!`] with a newline, for `println!`.
+macro_rules! outln {
+    ($($arg:tt)*) => {{
+        out!($($arg)*);
+        out!("\n");
+    }};
+}
+
 /// One-screen usage for `--help`.
 fn print_usage() {
     // A raw string, laid out as printed: a `\` line continuation would strip the
     // indentation of every wrapped description line.
-    println!(
+    outln!(
         r"mqttd {} — a security-first, cluster-native MQTT broker
 
 USAGE:
@@ -4499,14 +4524,14 @@ see docs/mqttd.example.toml and the README.",
 fn check_config() -> ! {
     match check_config_inner() {
         Ok(Some(path)) => {
-            println!(
+            outln!(
                 "config OK: {} + MQTTD_* env overlay validates",
                 path.display()
             );
             std::process::exit(0);
         }
         Ok(None) => {
-            println!("config OK: defaults + MQTTD_* env overlay validates (no config file set)");
+            outln!("config OK: defaults + MQTTD_* env overlay validates (no config file set)");
             std::process::exit(0);
         }
         Err(CheckError::Usage(e)) => {
@@ -4546,7 +4571,7 @@ fn check_rules_cli() -> ! {
             for w in &loaded.warnings {
                 eprintln!("warning: {w}");
             }
-            println!(
+            outln!(
                 "rules OK: {file}: {} rule(s), {} enabled, sha256 {}",
                 loaded.rules.len(),
                 reload::enabled_rules(&loaded.rules),
@@ -4564,7 +4589,7 @@ fn check_rules_cli() -> ! {
                             .map(|k| format!("\"$events/{}\"", k.event_name().replace('.', "/"))),
                     )
                     .collect();
-                println!(
+                outln!(
                     "  {} ({}): FROM {}, {} action(s)",
                     rule.id(),
                     if rule.enabled() {
@@ -4654,12 +4679,12 @@ fn rule_test_cli() -> ! {
     };
     match mqtt_rules::test_sql(&sql, input) {
         Ok(outputs) if outputs.is_empty() => {
-            println!("(no output: the statement's WHERE / INCASE did not match this message)");
+            outln!("(no output: the statement's WHERE / INCASE did not match this message)");
             std::process::exit(0);
         }
         Ok(outputs) => {
             for o in outputs {
-                println!("{o}");
+                outln!("{o}");
             }
             std::process::exit(0);
         }
@@ -4703,7 +4728,7 @@ fn print_config() -> ! {
     }
     match mqttd::config_view::redacted_toml(&config) {
         Ok(toml) => {
-            print!("{toml}");
+            out!("{toml}");
             std::process::exit(0);
         }
         Err(e) => {
