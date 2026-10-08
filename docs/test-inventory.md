@@ -545,7 +545,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `segment_log::tests::intact_records_after_a_torn_one_never_come_back`
 - `segment_log::tests::records_past_a_zeroed_first_record_never_come_back`
 - `segment_log::tests::reserved_kinds_and_oversized_payloads_are_refused_unwritten`
-- `segment_log::tests::segments_are_zeroed_not_sparse_even_after_a_torn_tail`
+- `segment_log::tests::segments_are_zeroed_not_sparse_even_after_a_torn_tail` — only when `cfg(unix)`
 - `segment_log::tests::segments_double_from_the_first_size_up_to_the_configured_one`
 - `stage_timing::tests::a_normal_build_never_simulates`
 - `stage_timing::tests::labels_are_the_documented_bounded_set`
@@ -784,7 +784,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::the_whole_env_surface_overlays_without_collision`
 - `tests::warn_mode_boots_a_newer_config_and_reports_the_ignored_keys`
 
-## `crates/mqtt-core/src/lib.rs` — 54 test(s)
+## `crates/mqtt-core/src/lib.rs` — 56 test(s)
 
 - `retry::tests::delays_ramp_within_jitter_bounds_and_cap`
 - `retry::tests::reset_returns_to_base`
@@ -818,6 +818,8 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `subscriptions::tests::the_matching_walk_visits_a_client_once_per_matching_filter`
 - `subscriptions::tests::trie_matches_exactly_what_the_linear_reference_matches`
 - `subscriptions::tests::unsubscribe_and_remove_client`
+- `tests::a_filter_or_a_prefix_is_reserved_only_when_every_topic_under_it_is`
+- `tests::a_mosquitto_bridge_state_topic_is_not_reserved`
 - `tests::covers_dollar_root_does_not_cover_plain_wildcard_request`
 - `tests::covers_empty_levels_consistent_with_topic_matches`
 - `tests::covers_hash_covers_everything_non_system`
@@ -890,7 +892,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::sink_records_through_a_trait_object`
 - `tests::tampering_with_any_field_changes_the_head`
 
-## `crates/mqtt-rules/src/lib.rs` — 93 test(s)
+## `crates/mqtt-rules/src/lib.rs` — 94 test(s)
 
 - `edit::tests::a_json_rule_body_is_a_rule_edit`
 - `edit::tests::an_insert_appends_the_rule_at_the_end`
@@ -899,6 +901,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `edit::tests::deleting_a_rule_removes_exactly_its_header_and_keys`
 - `edit::tests::deleting_the_last_rule_keeps_what_stood_above_it`
 - `edit::tests::files_an_edit_cannot_keep_intact_are_refused`
+- `edit::tests::inserting_then_deleting_a_rule_gives_back_the_same_file`
 - `edit::tests::sql_is_written_in_the_plainest_exact_form`
 - `edit::tests::the_before_and_after_comparison_catches_any_other_change`
 - `edit::tests::unchanged_values_keep_their_own_form`
@@ -1128,7 +1131,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 588 test(s)
+## `crates/mqttd/src/lib.rs` — 595 test(s)
 
 - `admin::cli::tests::a_refusal_shows_what_it_carries`
 - `admin::cli::tests::all_nodes_asks_for_the_cluster_scope_on_the_verbs_that_have_one`
@@ -1136,6 +1139,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `admin::cli::tests::help_wraps_to_the_terminal_width`
 - `admin::cli::tests::identifying_columns_lead_every_table`
 - `admin::cli::tests::invocations_are_validated_before_anything_runs`
+- `admin::cli::tests::server_text_is_escaped_before_it_reaches_the_terminal`
 - `admin::cli::tests::the_cluster_view_is_compact_and_says_what_is_wrong`
 - `admin::cli::tests::the_help_names_the_clients_own_environment`
 - `admin::cli::tests::the_rules_source_prints_the_file_verbatim`
@@ -1175,10 +1179,11 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `aliases::tests::outbound_assigns_then_reuses`
 - `aliases::tests::outbound_disabled_when_max_zero`
 - `aliases::tests::outbound_stops_assigning_when_full_but_keeps_existing`
-- `atomic_file::tests::a_failed_replace_changes_nothing_and_cleans_up`
+- `atomic_file::tests::a_failed_replace_changes_nothing_and_cleans_up` — only when `cfg(unix)`
 - `atomic_file::tests::a_file_is_replaced_whole_and_its_previous_bytes_kept`
-- `atomic_file::tests::a_planted_file_at_a_guessable_name_is_never_written_through`
-- `atomic_file::tests::the_mode_is_kept_and_a_new_file_gets_the_one_asked_for`
+- `atomic_file::tests::a_new_file_is_private_and_a_lost_group_loses_its_bits` — only when `cfg(unix)`
+- `atomic_file::tests::a_planted_file_at_a_guessable_name_is_never_written_through` — only when `cfg(unix)`
+- `atomic_file::tests::the_mode_is_kept_and_a_new_file_gets_the_one_asked_for` — only when `cfg(unix)`
 - `backpressure::tests::an_entry_larger_than_the_whole_byte_cap_is_kept_so_delivery_progresses`
 - `backpressure::tests::message_bytes_counts_topic_payload_and_forwarded_properties`
 - `backpressure::tests::packet_bytes_matches_message_bytes_for_a_publish`
@@ -1225,6 +1230,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `conn::tests::a_denied_qos0_publish_stays_a_silent_drop_in_both_versions`
 - `conn::tests::a_failed_connack_still_detaches_the_attached_session`
 - `conn::tests::a_keepalive_expiry_detaches_ungracefully_so_the_will_fires`
+- `conn::tests::a_mosquitto_bridge_state_will_is_accepted`
 - `conn::tests::a_protocol_violation_close_detaches_ungracefully_so_the_will_fires`
 - `conn::tests::a_qos2_publish_whose_durable_fan_out_failed_stays_held_unacked_and_is_re_attempted`
 - `conn::tests::a_v311_denied_publish_keeps_its_plain_ack_and_audit_for_both_qos_levels`
@@ -1480,6 +1486,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::a_transient_ownership_blip_does_not_close_a_live_session`
 - `hub::tests::a_value_only_digest_difference_triggers_a_pull`
 - `hub::tests::a_will_is_still_delivered_live_under_brownout_and_counted_as_a_drop`
+- `hub::tests::a_windowed_commit_in_sys_is_never_delivered`
 - `hub::tests::a_windowed_commit_reaches_an_offline_durable_subscriber_on_resume`
 - `hub::tests::an_already_durable_append_does_not_overtake_a_waiting_one`
 - `hub::tests::an_expired_retained_value_is_not_replayed_and_is_reaped`
@@ -1631,6 +1638,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::shared_selection_skips_an_offline_remote_member`
 - `hub::tests::shared_subscription_round_robins_one_member`
 - `hub::tests::shared_subscription_skips_retained_messages`
+- `hub::tests::sys_statistics_are_never_queued_for_an_offline_session`
 - `hub::tests::takeover_replaces_connection_and_ignores_stale_detach`
 - `hub::tests::the_apply_path_stays_silent_once_the_window_has_closed`
 - `hub::tests::the_backlog_byte_bound_sheds_acked_entries_and_counts_them`
@@ -1674,7 +1682,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `memory_watch::tests::a_status_without_vm_rss_yields_none_not_zero`
 - `memory_watch::tests::an_unreadable_rss_stops_the_watcher_instead_of_reporting_zero`
 - `memory_watch::tests::nearing_the_watermark_shortens_the_poll`
-- `memory_watch::tests::the_real_sampler_reports_a_plausible_rss_on_linux`
+- `memory_watch::tests::the_real_sampler_reports_a_plausible_rss_on_linux` — only when `cfg(target_os = "linux")`
 - `memory_watch::tests::the_watcher_drives_brownout_on_watermark_transitions`
 - `memory_watch::tests::vm_rss_is_parsed_in_bytes_from_the_right_line`
 - `memory_watch::tests::without_a_watermark_nothing_is_ever_browned_out`
@@ -1698,7 +1706,9 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `reload::tests::committed_config_never_returns_a_rejected_candidate`
 - `reload::tests::every_reload_attempt_is_recorded_with_its_repeats`
 - `reload::tests::reload_increments_the_metric_by_outcome`
+- `rules::tests::a_rule_definition_hash_is_keyed_per_process`
 - `rules::tests::gated_derived_actions_are_counted_by_their_fate`
+- `rules::tests::the_insecure_trace_line_is_logged_once_per_change`
 - `rules::tests::the_publisher_hears_exactly_the_originals_answer`
 - `rules_sys::tests::a_payload_is_text_when_it_is_and_base64_when_not`
 - `rules_sys::tests::times_are_rfc3339_utc_with_milliseconds`
@@ -1719,7 +1729,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tls_check::tests::nothing_configured_is_a_single_ok_line`
 - `tls_check::tests::valid_material_passes_and_reports_names`
 
-## `crates/mqttd/src/main.rs` — 21 test(s)
+## `crates/mqttd/src/main.rs` — 22 test(s)
 
 - `tests::a_non_durable_node_resolves_no_write_floor`
 - `tests::a_reload_proposes_a_changed_replication_factor`
@@ -1739,6 +1749,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::the_config_and_the_authenticator_agree_on_identity_source_spellings`
 - `tests::the_peer_bus_tls_material_is_file_watched`
 - `tests::the_rules_file_is_file_watched`
+- `tests::the_trace_exposure_names_why_the_trace_is_readable`
 - `tests::unknown_flags_are_caught_and_known_ones_pass`
 - `tests::wire_limits_apply_config_and_preserve_floors`
 - `tests::wire_limits_default_config_matches_the_spec_floors`
@@ -1779,14 +1790,15 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `the_authorization_dry_run_never_allows_a_publish_into_sys`
 - `the_cluster_view_compares_every_nodes_rules_digest`
 
-## `crates/mqttd/tests/admin_rules.rs` — 13 test(s)
+## `crates/mqttd/tests/admin_rules.rs` — 15 test(s)
 
 - `a_last_error_is_shown_only_for_the_definition_it_was_about`
 - `a_rejected_reload_says_the_file_was_written_and_what_still_runs`
 - `a_rules_body_is_read_only_from_a_role_that_may_send_one`
-- `a_symlinked_rules_file_has_its_target_replaced`
+- `a_rules_file_written_where_there_was_none_is_private` — only when `cfg(unix)`
+- `a_symlinked_rules_file_has_its_target_replaced` — only when `cfg(unix)`
 - `a_whole_file_write_is_a_writers_and_replaces_the_file_and_what_runs`
-- `a_write_into_a_read_only_directory_is_refused_and_changes_nothing`
+- `a_write_into_a_read_only_directory_is_refused_and_changes_nothing` — only when `cfg(unix)`
 - `applied_means_the_written_rules_are_the_ones_running`
 - `check_says_whether_text_would_load_and_where_it_would_not`
 - `if_match_and_every_edit_are_about_the_file_on_disk`
@@ -1794,6 +1806,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `the_dry_run_shows_what_the_rules_would_do_and_changes_nothing`
 - `the_rules_file_is_read_verbatim_by_an_operator_only`
 - `the_running_rules_are_read_whole_by_an_operator_and_redacted_for_a_viewer`
+- `two_writes_naming_the_same_digest_cannot_both_win`
 
 ## `crates/mqttd/tests/audit.rs` — 4 test(s)
 
@@ -1832,7 +1845,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 
 - `a_bound_line_names_the_exact_address`
 - `a_graceful_stop_closes_the_audit_chain`
-- `a_stop_right_after_the_client_bind_drains_instead_of_killing`
+- `a_stop_right_after_the_client_bind_drains_instead_of_killing` — only when `cfg(unix)`
 - `binary_serves_a_plaintext_pubsub_roundtrip`
 - `durable_on_with_no_data_dir_refuses_to_start`
 - `help_and_version_still_exit_successfully_without_loading_config`
@@ -1859,7 +1872,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `a_complete_secured_config_passes_both_gates`
 - `a_config_flag_without_a_value_is_a_usage_error_exit_2`
 - `a_missing_referenced_file_is_refused_by_the_preflight_only`
-- `a_password_file_without_read_permission_is_refused_by_the_preflight`
+- `a_password_file_without_read_permission_is_refused_by_the_preflight` — only when `cfg(unix)`
 - `a_valid_file_validates_and_reports_the_path`
 - `an_unknown_key_fails_with_a_located_error_and_exit_1`
 - `an_unparseable_bind_is_refused_naming_the_key`
@@ -2181,7 +2194,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `foreach_fans_one_publish_out`
 - `in_a_cluster_each_message_is_evaluated_once_on_its_landing_node`
 
-## `crates/mqttd/tests/rules_binary.rs` — 44 test(s)
+## `crates/mqttd/tests/rules_binary.rs` — 45 test(s)
 
 - `a_closed_stdout_leaves_probe_and_backup_their_exit_status`
 - `a_closed_stdout_neither_panics_a_command_nor_changes_its_exit_status`
@@ -2191,6 +2204,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `a_graceful_shutdown_keeps_every_shutdown_event_for_an_offline_watcher`
 - `a_qos1_derived_message_is_queued_for_an_offline_persistent_session`
 - `a_qos1_puback_is_released_only_once_each_derived_message_is_stored`
+- `a_reload_turns_rule_watching_on_and_off_and_a_rejected_one_changes_nothing`
 - `a_republish_is_not_checked_against_the_publishers_acl`
 - `a_retained_derived_message_reaches_a_late_subscriber`
 - `a_rule_written_into_the_main_config_is_refused_with_where_rules_go`
@@ -2226,7 +2240,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `the_broker_refuses_to_boot_on_a_rules_file_that_does_not_load`
 - `two_rules_failing_on_every_message_each_log_one_warn_per_ten_seconds`
 - `with_config_watch_an_edited_rules_file_is_picked_up_without_a_signal`
-- `writers_for_a_rules_directory_the_broker_cannot_write_in_are_warned_about`
+- `writers_for_a_rules_directory_the_broker_cannot_write_in_are_warned_about` — only when `cfg(unix)`
 
 ## `crates/mqttd/tests/rules_cookbook.rs` — 11 test(s)
 
@@ -2242,7 +2256,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `the_pattern_matcher_checks_rendered_times`
 - `without_their_guards_the_recipes_do_what_the_cookbook_warns`
 
-## `crates/mqttd/tests/rules_demo.rs` — 11 test(s)
+## `crates/mqttd/tests/rules_demo.rs` — 13 test(s)
 
 - `the_demo_derives_exactly_what_it_shows`
 - `the_demo_rules_file_checks_clean`
@@ -2250,9 +2264,11 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `the_live_schedule_places_a_time_in_its_window`
 - `the_live_scheduler_joins_drops_late_events_and_rejoins`
 - `the_live_simulator_replays_the_fixture_in_every_window`
-- `the_live_simulator_rides_out_a_broker_restart_and_stops_cleanly`
+- `the_live_simulator_rides_out_a_broker_restart_and_stops_cleanly` — only when `cfg(unix)`
 - `the_live_simulators_device_clocks_run_on_from_window_to_window`
 - `the_readme_quotes_only_messages_the_fixture_derives`
+- `the_rule_editors_server_refuses_foreign_requests_and_sends_strict_headers`
+- `the_rules_editor_renders_text_never_markup`
 - `the_simulator_is_deterministic`
 - `the_simulators_mqtt_client_bounds_its_waits_and_reads_while_idle`
 
@@ -2264,15 +2280,18 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `the_extraction_recognises_every_documented_form`
 - `the_extraction_refuses_what_it_cannot_run`
 
-## `crates/mqttd/tests/rules_sys.rs` — 13 test(s)
+## `crates/mqttd/tests/rules_sys.rs` — 16 test(s)
 
 - `a_secret_in_a_config_error_or_in_a_rule_never_reaches_sys`
 - `a_tick_the_pool_cannot_carry_is_skipped_and_counted`
 - `a_trace_record_lists_sixteen_outputs_and_counts_the_rest`
 - `an_interval_change_applies_at_once`
+- `every_sys_message_carries_a_message_expiry`
+- `last_active_is_kept_across_a_reload_and_set_only_when_a_rule_runs`
 - `last_errors_by_kind_and_a_synthesized_delivery_entry`
 - `records_queued_before_the_trace_turned_off_are_not_published`
 - `sys_publishes_reach_subscribers_and_never_run_rules`
+- `sys_statistics_never_carry_error_text`
 - `the_statistics_list_every_rule_with_counts_rates_and_last_activity`
 - `the_trace_is_rate_limited_per_rule_and_no_result_has_its_own_budget`
 - `the_trace_off_records_nothing`
@@ -2285,7 +2304,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `membership_cpu_accounting_handles_parentheses_and_excludes_child_time`
 - `membership_fixture_delivers_exactly_once_across_all_arms`
 - `membership_peer_oracle_rejects_forwarding_even_with_local_receipts`
-- `membership_perf_ack_requires_complete_confirmation`
+- `membership_perf_ack_requires_complete_confirmation` — only when `cfg(target_os = "linux")`
 - `membership_receipt_oracle_rejects_loss_duplicates_and_stale_bursts`
 - `membership_tcp_fixture_receives_all_data_before_each_socket_fence`
 
