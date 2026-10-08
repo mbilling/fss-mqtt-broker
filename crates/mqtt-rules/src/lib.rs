@@ -225,6 +225,12 @@ pub enum Outcome<'a> {
     ActionOk,
     /// One action failed (a bad rendered topic, an invalid `qos`, …).
     ActionFailed(&'a EvalError),
+    /// How long the rule took for this trigger, reported once after its last other
+    /// outcome: the SQL, plus rendering and charging its actions' effects. Not what the
+    /// broker does with a derived message afterwards (routing a republish). Reported by
+    /// [`RuleSet::on_publish`] and [`RuleSet::on_event`], never by a dry run
+    /// ([`RuleSet::evaluate_one`]), so it describes live traffic only.
+    Elapsed(std::time::Duration),
 }
 
 /// One loaded rule.
@@ -692,7 +698,7 @@ impl RuleSet {
         hits.dedup();
         let ctx = EvalCtx::new(input);
         for i in hits {
-            apply(&self.rules[i], &ctx, report, out);
+            apply_timed(&self.rules[i], &ctx, report, out);
         }
     }
 
@@ -709,7 +715,7 @@ impl RuleSet {
         }
         let ctx = EvalCtx::new(input);
         for &i in hits {
-            apply(&self.rules[i], &ctx, report, out);
+            apply_timed(&self.rules[i], &ctx, report, out);
         }
     }
 
@@ -733,6 +739,18 @@ impl RuleSet {
         apply(rule, &EvalCtx::new(input), report, out);
         true
     }
+}
+
+/// [`apply`], then its [`Outcome::Elapsed`]: what the rule cost this trigger.
+fn apply_timed(
+    rule: &Rule,
+    ctx: &EvalCtx<'_>,
+    report: &mut dyn FnMut(&Rule, Outcome<'_>),
+    out: &mut Vec<(Arc<str>, Effect)>,
+) {
+    let started = std::time::Instant::now();
+    apply(rule, ctx, report, out);
+    report(rule, Outcome::Elapsed(started.elapsed()));
 }
 
 /// Run one rule against a trigger: the SQL, then each action per output.

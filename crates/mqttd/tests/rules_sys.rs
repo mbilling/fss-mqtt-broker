@@ -224,13 +224,30 @@ async fn the_statistics_list_every_rule_with_counts_rates_and_last_activity() {
         "one interval later"
     );
     let hot = &per_rule["hot"];
+    // Evaluation time varies run to run: checked on its own, then set aside.
+    let (mut counts, mut rates) = (hot["counts"].clone(), hot["rates"].clone());
+    let eval_ns = counts["eval_ns"].as_u64().expect("eval_ns");
+    assert!(eval_ns > 0, "three evaluations took some time: {counts}");
+    let avg =
+        (f64::from(u32::try_from(eval_ns).expect("a few evaluations")) / 3.0).round() / 1000.0;
+    assert_eq!(counts["eval_us_avg"], serde_json::json!(avg), "{counts}");
     assert_eq!(
-        hot["counts"],
+        rates["eval_us_avg"],
+        serde_json::json!(avg),
+        "every evaluation fell in this tick, so its average is the cumulative one: {rates}"
+    );
+    for m in [&mut counts, &mut rates] {
+        let m = m.as_object_mut().unwrap();
+        m.remove("eval_ns");
+        m.remove("eval_us_avg");
+    }
+    assert_eq!(
+        counts,
         serde_json::json!({"matched": 3, "passed": 2, "no_result": 1, "failed": 0,
                            "actions_ok": 2, "actions_failed": 0})
     );
     assert_eq!(
-        hot["rates"],
+        rates,
         serde_json::json!({"matched": 1.5, "passed": 1.0, "no_result": 0.5, "failed": 0.0,
                            "actions_ok": 1.0, "actions_failed": 0.0}),
         "growth over the 2 s measured between ticks"

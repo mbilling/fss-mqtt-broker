@@ -166,6 +166,7 @@ curl -s http://127.0.0.1:8080/metrics | grep '^mqttd_rule' | sort
 
 ```text
 mqttd_rule_actions_total{rule="high_temp",result="ok"} 1
+mqttd_rule_eval_seconds_total{rule="high_temp"} 0.000041
 mqttd_rule_evaluations_total{rule="high_temp",result="no_result"} 1
 mqttd_rule_evaluations_total{rule="high_temp",result="passed"} 1
 mqttd_rules_info{checksum="2f027340235af0b20eafed114c6c36869b05aac8568546125274382b66e892ad"} 1
@@ -372,6 +373,7 @@ double-quote one in particular): run `--check-rules` on the file for those, and 
   |---|---|
   | `mqttd_rule_evaluations_total{rule,result}` | `passed`: the statement produced output and the actions ran. `no_result`: `FROM` matched, but `WHERE` was false or a `FOREACH` produced nothing. `failed`: the statement raised an error. A rule with no series has never matched a message. |
   | `mqttd_rule_actions_total{rule,result}` | `ok`: a console line logged, or a republish the broker accepted and routed. `failed`: see [Operating rules](#operating-rules). |
+  | `mqttd_rule_eval_seconds_total{rule}` | Time spent evaluating the rule, summed over every live evaluation: its statement plus rendering its actions, not routing what it republishes. Dry runs (`POST /admin/v1/rules/test`) are not counted. Divided by the evaluations it is the rule's cost per message, below. |
   | `mqttd_rules_loaded` | Enabled rules loaded on this node. |
   | `mqttd_rules_info{checksum}` | The loaded file's SHA-256, at 1. A checksum replaced by a reload stays exported at 0. |
 
@@ -385,6 +387,14 @@ double-quote one in particular): run `--check-rules` on the file for those, and 
   ```promql
   sum by (rule) (rate(mqttd_rule_evaluations_total{result="failed"}[5m])) > 0
   sum by (rule) (rate(mqttd_rule_actions_total{result="failed"}[5m])) > 0
+  ```
+
+- **Cost per rule.** The average time a rule takes per message, in microseconds, over
+  five minutes (the same figure `$SYS` carries as `eval_us_avg`):
+
+  ```promql
+  1e6 * sum by (rule) (rate(mqttd_rule_eval_seconds_total[5m]))
+      / sum by (rule) (rate(mqttd_rule_evaluations_total[5m]))
   ```
 
 ### My rule does not fire
@@ -477,10 +487,12 @@ The quickstart's `high_temp` rule at the first tick after the two readings, with
 
 ```json
 {"at":"2026-10-08T14:37:30.897Z",
- "counts":{"actions_failed":0,"actions_ok":1,"failed":0,"matched":2,"no_result":1,"passed":1},
+ "counts":{"actions_failed":0,"actions_ok":1,"eval_ns":41208,"eval_us_avg":20.604,"failed":0,
+           "matched":2,"no_result":1,"passed":1},
  "def":"25bb28ee8d743603","enabled":true,"last_active_at":"2026-10-08T14:37:30.897Z",
  "last_error":null,"node":"node-local",
- "rates":{"actions_failed":0.0,"actions_ok":0.1,"failed":0.0,"matched":0.2,"no_result":0.1,"passed":0.1},
+ "rates":{"actions_failed":0.0,"actions_ok":0.1,"eval_us_avg":20.604,"failed":0.0,"matched":0.2,
+          "no_result":0.1,"passed":0.1},
  "rule":"high_temp"}
 ```
 
@@ -489,7 +501,10 @@ The quickstart's `high_temp` rule at the first tick after the two readings, with
 | `counts.passed`, `.no_result`, `.failed` | `mqttd_rule_evaluations_total{rule,result}` for this rule |
 | `counts.actions_ok`, `.actions_failed` | `mqttd_rule_actions_total{rule,result}` (`ok`, `failed`) for this rule |
 | `counts.matched` | `passed + no_result + failed`: the messages and events the rule's `FROM` selected (EMQX's `matched`) |
-| `rates` | the same, per second over the time measured since the previous tick, rounded to 0.001; 0 at a rule's first tick |
+| `counts.eval_ns` | `mqttd_rule_eval_seconds_total{rule}` in nanoseconds: the time spent evaluating the rule since the broker started, its statement plus rendering its actions (not routing what it republishes; dry runs not counted) |
+| `counts.eval_us_avg` | `eval_ns` per evaluation (`matched`), in microseconds to the nanosecond: the rule's average cost per message since the broker started; 0 before it runs |
+| `rates` | the counts, per second over the time measured since the previous tick, rounded to 0.001; 0 at a rule's first tick |
+| `rates.eval_us_avg` | not a rate: the average cost per evaluation over this tick's evaluations, in microseconds; 0 when the rule did not run in it. What to watch when a change to the rule, or to the traffic, changes what it costs |
 | `last_active_at` | the tick at which `matched` was last seen to grow; `null` until the statistics see the rule run. Runs before they were turned on, or while they were off, are not seen. A rule deleted and added back keeps the time they last saw it run until it runs again |
 | `last_error` | `null`, or the latest failure's `at` and `kind`: `sql` (the statement failed), `action` (an action could not render, a republish into `$SYS` included) or `delivery` (derived messages were refused or not routed: `actions_failed` grew). Never the error's text, which can quote a payload: that is in the trace (a failed statement's `error`, a failed action's output) and in an operator's `GET /admin/v1/rules` |
 | `def` | 16 hex digits of a hash of the rule's SQL, actions and `enable`, keyed with a random key each broker process draws: it changes when the rule does and at a restart, and it cannot be used to test a guess at the rule's text |
