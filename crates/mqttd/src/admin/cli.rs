@@ -22,6 +22,11 @@
 //! 0081 §3's one verb per endpoint): `PUT /admin/v1/rule` and `POST /admin/v1/rules/test`.
 //! `rules-apply` sends a local file, read when the verb runs — never while the arguments
 //! are validated.
+//!
+//! Text from the broker can quote what a client chose (a payload in a rule's last error,
+//! a client id), so it reaches the terminal [`printable`]: a control character as its
+//! escape, never as itself. `--json` prints JSON, whose strings escape ESC, BEL and CR
+//! themselves; `rules-source` prints the file as it is.
 
 use super::client::{self, Target};
 use super::http::percent_encode;
@@ -635,15 +640,7 @@ pub async fn run(args: &[String]) -> i32 {
                     );
                     return 1;
                 }
-                let code = value
-                    .pointer("/error/code")
-                    .and_then(Value::as_str)
-                    .unwrap_or("error");
-                let message = value
-                    .pointer("/error/message")
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
-                eprintln!("mqttd: {status} {code}: {message}");
+                eprintln!("{}", refusal_line(status, &value));
                 out!("{}", render_refusal(&value));
                 1
             }
@@ -653,6 +650,20 @@ pub async fn run(args: &[String]) -> i32 {
             1
         }
     }
+}
+
+/// A refusal's status, code and message, for a terminal: a multi-line message (a TOML
+/// error's excerpt) keeps its lines.
+fn refusal_line(status: u16, value: &Value) -> String {
+    let field = |pointer: &str| value.pointer(pointer).and_then(Value::as_str);
+    let message = field("/error/message")
+        .unwrap_or("")
+        .split('\n')
+        .map(printable)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let code = printable(field("/error/code").unwrap_or("error"));
+    format!("mqttd: {status} {code}: {message}")
 }
 
 /// What a refusal says beside its error, for a terminal: a rejected reload's `outcome`,
@@ -700,10 +711,10 @@ const LAST_ERROR_WIDTH: usize = 40;
 fn render_rules(value: &Value) -> Option<String> {
     let rules = value.get("rules")?.as_array()?;
     let short = |k: &str| {
-        value
-            .get(k)
-            .and_then(Value::as_str)
-            .map_or_else(|| "-".to_string(), |d| d.chars().take(12).collect())
+        value.get(k).and_then(Value::as_str).map_or_else(
+            || "-".to_string(),
+            |d| printable(d).chars().take(12).collect(),
+        )
     };
     let enabled = rules
         .iter()
@@ -765,7 +776,8 @@ fn render_rules(value: &Value) -> Option<String> {
 }
 
 /// One rule's row: the filters and events it selects, its cumulative counts, and its last
-/// error cut to [`LAST_ERROR_WIDTH`] characters (the kind alone for a viewer).
+/// error cut to [`LAST_ERROR_WIDTH`] characters (the kind alone for a viewer). The error can
+/// quote a payload, so it is [`printable`] before it is cut.
 fn rules_row(rule: &Value) -> Vec<String> {
     let text = |k: &str| rule.get(k).map_or_else(|| "-".to_string(), scalar);
     let count = |k: &str| {
@@ -786,12 +798,7 @@ fn rules_row(rule: &Value) -> Vec<String> {
                 Some(message) => format!("{kind}: {}", message.replace('\n', " ")),
                 None => kind,
             };
-            if whole.chars().count() > LAST_ERROR_WIDTH {
-                let cut: String = whole.chars().take(LAST_ERROR_WIDTH - 1).collect();
-                format!("{cut}…")
-            } else {
-                whole
-            }
+            printable_cut(&whole, LAST_ERROR_WIDTH)
         }
     };
     vec![
@@ -894,10 +901,10 @@ fn cluster_row(row: &Value) -> Vec<String> {
     } else {
         notes.push(text("error"));
     }
-    let cluster: String = row
-        .get("cluster_id")
-        .and_then(Value::as_str)
-        .map_or_else(|| "-".to_string(), |id| id.chars().take(8).collect());
+    let cluster: String = row.get("cluster_id").and_then(Value::as_str).map_or_else(
+        || "-".to_string(),
+        |id| printable(id).chars().take(8).collect(),
+    );
     let or_dash = |s: String| if replied { s } else { "-".to_string() };
     vec![
         text("node_id"),
@@ -947,9 +954,9 @@ pub fn render(value: &Value) -> String {
                     Value::Array(items)
                         if items.iter().all(Value::is_object) && !items.is_empty() =>
                     {
-                        tables.push((k, table(items)));
+                        tables.push((printable(k), table(items)));
                     }
-                    _ => flatten(k, v, &mut scalars),
+                    _ => flatten(&printable(k), v, &mut scalars),
                 }
             }
             let width = scalars.iter().map(|(k, _)| k.len()).max().unwrap_or(0);
@@ -976,22 +983,72 @@ fn flatten(prefix: &str, value: &Value, out: &mut Vec<(String, String)>) {
     match value {
         Value::Object(map) if !map.is_empty() => {
             for (k, v) in map {
-                flatten(&format!("{prefix}.{k}"), v, out);
+                flatten(&format!("{prefix}.{}", printable(k)), v, out);
             }
         }
         other => out.push((prefix.to_string(), scalar(other))),
     }
 }
 
+/// A value as one terminal cell or line, [`printable`].
 fn scalar(value: &Value) -> String {
     match value {
-        Value::String(s) => s.clone(),
+        Value::String(s) => printable(s),
         Value::Null => "-".to_string(),
         Value::Array(items) if items.iter().all(|i| !i.is_object() && !i.is_array()) => {
             items.iter().map(scalar).collect::<Vec<_>>().join(", ")
         }
-        other => other.to_string(),
+        // JSON escapes only C0 controls; DEL and the C1 set (a one-byte CSI) pass.
+        other => printable(&other.to_string()),
     }
+}
+
+/// Whether `c` must not reach a terminal as itself: a control character (ESC, BEL, CR,
+/// the C1 set) or a Unicode line or paragraph separator.
+fn unprintable(c: char) -> bool {
+    c.is_control() || matches!(c, '\u{2028}' | '\u{2029}')
+}
+
+/// Push `c` onto `out`, or its escape (`\u{1b}` for ESC, `\r` for CR) when it is
+/// [`unprintable`].
+fn push_printable(out: &mut String, c: char) {
+    if unprintable(c) {
+        out.extend(c.escape_default());
+    } else {
+        out.push(c);
+    }
+}
+
+/// Text from the broker as it may reach a terminal: every [`unprintable`] character as
+/// its escape, so text a client chose cannot retitle the window, clear the screen or move
+/// the cursor.
+fn printable(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        push_printable(&mut out, c);
+    }
+    out
+}
+
+/// `text` [`printable`] and at most `width` characters, the last one `…` when it was cut.
+/// The cut falls between escapes, never inside one.
+fn printable_cut(text: &str, width: usize) -> String {
+    let whole = printable(text);
+    if whole.chars().count() <= width {
+        return whole;
+    }
+    let (mut cut, mut piece, mut used) = (String::new(), String::new(), 0);
+    for c in text.chars() {
+        piece.clear();
+        push_printable(&mut piece, c);
+        used += piece.chars().count();
+        if used >= width {
+            break;
+        }
+        cut.push_str(&piece);
+    }
+    cut.push('…');
+    cut
 }
 
 /// A fixed-width table over the union of the rows' keys: the [`LEADING_COLUMNS`] present,
@@ -1018,7 +1075,10 @@ fn table(rows: &[Value]) -> String {
                 .collect()
         })
         .collect();
-    let headers: Vec<String> = columns.iter().map(|c| c.to_uppercase()).collect();
+    let headers: Vec<String> = columns
+        .iter()
+        .map(|c| printable(&c.to_uppercase()))
+        .collect();
     grid(&headers, &cells)
 }
 
@@ -1246,6 +1306,66 @@ mod tests {
                  last reload: 2026-10-08T12:00:00.000Z by admin-rules, REJECTED (rules)\n"
             ),
             "{out}"
+        );
+    }
+
+    /// Text from the broker can quote a payload (a rule's last error) or what a client
+    /// chose: ESC, BEL, CR and the rest reach the terminal as escapes, in the rules table,
+    /// the generic rendering and a refusal's line. The cut to the error column's width
+    /// keeps an escape whole.
+    #[test]
+    fn server_text_is_escaped_before_it_reaches_the_terminal() {
+        let hostile = "\u{1b}]0;PWNED\u{7}\u{1b}[2J\rX\u{9b}\u{2028}";
+        let escaped = "\\u{1b}]0;PWNED\\u{7}\\u{1b}[2J\\rX\\u{9b}\\u{2028}";
+        let counts = json!({"matched": 1, "passed": 0, "no_result": 0, "failed": 1,
+                            "actions_ok": 0, "actions_failed": 0});
+        let answer = json!({
+            "node": "n1", "digest": "d", "file_digest": "d", "in_sync": true,
+            "rules": [
+                {"id": format!("r{hostile}"), "enabled": true, "from": [format!("t/{hostile}")],
+                 "events": [], "actions": 0, "description": hostile, "counts": counts,
+                 "last_error": {"at": "2026-10-08T12:00:00.000Z", "kind": "sql",
+                                "message": format!("'{hostile}'")}},
+                {"id": "cut", "enabled": true, "from": ["t"], "events": [], "actions": 0,
+                 "counts": counts,
+                 "last_error": {"at": "2026-10-08T12:00:00.000Z", "kind": "sql",
+                                "message": format!("{}\u{1b}[2J", "x".repeat(30))}}
+            ]
+        });
+        let clean = |out: &str| {
+            assert!(!out.chars().any(|c| c != '\n' && unprintable(c)), "{out:?}");
+        };
+        let out = render_for("rules", &answer);
+        clean(&out);
+        let row = out.lines().find(|l| l.starts_with("r\\u{1b}")).unwrap();
+        assert!(
+            row.starts_with(&format!("r{escaped}  yes      t/{escaped}  ")),
+            "{row}"
+        );
+        assert!(
+            row.ends_with("  sql: '\\u{1b}]0;PWNED\\u{7}\\u{1b}[2J\\rX…"),
+            "{row}"
+        );
+        let row = out.lines().find(|l| l.starts_with("cut ")).unwrap();
+        assert!(
+            row.ends_with(&format!("  sql: {}…", "x".repeat(30))),
+            "{row}"
+        );
+
+        let out = render(&json!({
+            "description": hostile,
+            "clients": [{"client_id": hostile, "node": "n1"}],
+            "odd": [1, {"k": hostile}],
+        }));
+        clean(&out);
+        assert!(out.contains(&format!("description  {escaped}\n")), "{out}");
+        assert!(out.contains(&format!("\n{escaped}  n1\n")), "{out}");
+
+        let refused = json!({"error": {"code": "rules-invalid",
+                                       "message": format!("line one {hostile}\nline two\r")}});
+        assert_eq!(
+            refusal_line(422, &refused),
+            format!("mqttd: 422 rules-invalid: line one {escaped}\nline two\\r")
         );
     }
 
