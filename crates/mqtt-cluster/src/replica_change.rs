@@ -574,7 +574,9 @@ mod tests {
         tokio::spawn(async move {
             while let Some(msg) = rx.recv().await {
                 match msg {
-                    PeerMessage::Replicate { req_id, epoch, op } => {
+                    PeerMessage::Replicate {
+                        req_id, epoch, op, ..
+                    } => {
                         let accepted = state.lock().unwrap().apply(epoch, &op);
                         transport.complete_ack(req_id, accepted);
                     }

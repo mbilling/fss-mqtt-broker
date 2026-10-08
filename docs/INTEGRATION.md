@@ -1,14 +1,18 @@
 # External consumers: the integration blueprint
 
-**Verified against `v1.0.16` (2026-09-11).** How to get messages out of mqttd and into the rest of your stack — Kafka, a
-webhook, a database, anything — without a rule engine, and what the broker
+**Verified against `v1.0.16` (2026-09-11); the rule-engine paragraphs against `main` after `v1.1.0` (2026-10-07).** How to get messages out of mqttd and into the rest of your stack — Kafka, a
+webhook, a database, anything — and what the broker
 does and does not promise while you do it ([ADR 0063](adr/0063-external-consumer-integration.md)).
 
-mqttd has no SQL rule engine and no built-in Kafka/HTTP sinks, **by design**:
-it is a broker, not an integration platform, and everything it ships is held
-to the same durability and refusal contracts. What replaces the rule engine
-is a *pattern*, not a plugin — an ordinary MQTT consumer group, built on
-three broker features that are already load-bearing elsewhere:
+mqttd has no built-in Kafka/HTTP sinks, **by design**: it is a broker, not an
+integration platform, and everything it ships is held to the same durability and
+refusal contracts. Inside the broker it does run EMQX's rule SQL (unreleased;
+[RULES.md](RULES.md), [ADR 0083](adr/0083-rule-engine.md)): filter,
+reshape and re-route between topics with `republish`. A rule's actions never leave
+the broker, so a rule can prepare a stream (`SELECT … FROM "raw/#" WHERE …` republished
+to `export/…`) but not deliver it. Delivery is a *pattern*, not a plugin — an ordinary
+MQTT consumer group, built on three broker features that are already load-bearing
+elsewhere:
 
 - **cluster-wide shared subscriptions** ([ADR 0010](adr/0010-shared-subscriptions.md),
   [ADR 0015](adr/0015-cluster-shared-subscriptions.md)) — a `$share` group is
@@ -168,7 +172,7 @@ count against the ordering section above: tasks sharing one group interleave
 topics.
 
 **A forwarder you own.** ~40 lines with an MQTT client library and a Kafka
-producer, and you get rule-engine "transform" for free as ordinary code. A
+producer, and any transform a broker rule cannot express is ordinary code. A
 sketch (the *contract* is the numbered rules above and the settings table —
 this shows where each lands; it is not a tested program):
 
@@ -229,25 +233,45 @@ all of them at once.
 
 ## What a rule-engine migrator maps where
 
-For an EMQX/NanoMQ migration, each SQL rule decomposes onto the pattern —
-and the [EMQX converter](MIGRATION.md#emqx--mqttd) names every
-connector/action it could not carry as a `TODO(migrate)` so no pipeline
-vanishes silently:
+For an EMQX migration, a rule's SQL and its `republish`/`console` actions run on
+mqttd unchanged ([RULES.md](RULES.md)); the
+[EMQX converter](MIGRATION.md#emqx--mqttd)'s `--out-rules` writes them to a rules
+file. What a rule did *beyond* the broker — its sink actions — decomposes onto this
+pattern, and the converter names every connector/action it could not carry as a
+`TODO(migrate)` so no pipeline vanishes silently:
 
-| Rule-engine construct | In this pattern |
+| Rule-engine construct | On mqttd |
 |---|---|
-| `FROM "telemetry/#"` (route) | the group's topic filter |
-| `WHERE payload.x > 3` / `SELECT` reshaping (transform) | ordinary code in the consumer (`transform()` above) |
+| `FROM "telemetry/#"` (route) | the same rule ([RULES.md](RULES.md)); for a sink, the group's topic filter |
+| `WHERE payload.x > 3` / `SELECT` reshaping (transform) | the same rule, republishing the result to a topic the sink's group subscribes to; or ordinary code in the consumer (`transform()` above) |
+| Republish action | the same `republish` action, with EMQX's arguments and defaults |
 | Kafka / webhook / DB action (sink) | the consumer's producer / POST / upsert |
 | Rule-engine buffering & retry | the durable session queue + the consumer's ack-after-write |
 | Fan-out to several sinks | one group **per sink** — each group gets its own copy of the stream |
-| Republish action | the consumer publishes back at QoS 1 (as in the DLQ recipe) |
 
-What you own that the rule engine used to own: the consumer processes
+A rule that prepares a stream for a sink group, filtering and reshaping it on the way:
+
+```toml
+[rules.export_raw]
+sql = '''
+SELECT payload.x AS x, topic FROM "raw/#" WHERE payload.x > 3
+'''
+actions = [
+  { function = "republish", args = { topic = "export/${topic}", qos = 1, payload = "${.}" } },
+]
+```
+
+A publish of `{"x": 5}` on `raw/dev1` reaches the group on `$share/sink/export/#` as
+`{"x":5,"topic":"raw/dev1"}` on `export/raw/dev1`, at QoS 1 and so queued for a member
+that is offline; `{"x": 1}` produces nothing. The derived topic is built from the
+original's own topic, so a publisher can reach only `export/` plus a topic the ACL let it
+publish on; a topic built from payload values needs a guard
+([RULES.md](RULES.md#security-values-the-publisher-chooses)).
+
+What you own that the rule engine used to own: the sink consumer processes
 themselves (deploy, restart, monitor — they are stateless; all state is the
-broker's session), and the transform as code instead of SQL. What you gain:
-the transform is testable, versioned, and its failure mode is a stalled,
-alarmed queue instead of a silently-misfiring rule.
+broker's session). What you gain: the sink's failure mode is a stalled, alarmed
+queue instead of a silently-misfiring action.
 
 ## Least privilege and monitoring
 
@@ -271,10 +295,12 @@ above is the loss signal, and sizing the cap is the prevention.
 
 ## What this pattern does not give you
 
-Stated so nobody discovers it in production: no SQL DSL (transforms are
-code), no broker-side schema validation, no per-rule metrics out of the box
-(instrument the consumer), and the broker will not transform payloads in
-flight — a message crosses byte-for-byte, user properties intact
-(ADR 0030). If operating even a small forwarder fleet is the cost that
-matters most to you, a rule-engine broker is the honest recommendation —
+Stated so nobody discovers it in production: no broker-side schema validation,
+no per-consumer metrics out of the box (instrument the consumer), and the broker
+never alters a message in flight — an original crosses byte-for-byte, user
+properties intact (ADR 0030); a rule's transform is a *new* message beside it.
+Broker rules cover filter/reshape/re-route with per-rule metrics
+([RULES.md](RULES.md)); delivery out of the broker is always the consumer. If
+operating even a small forwarder fleet is the cost that matters most to you, a
+broker with built-in sinks is the honest recommendation —
 [COMPARISON.md](COMPARISON.md) says exactly that.

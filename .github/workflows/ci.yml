@@ -302,8 +302,8 @@ jobs:
       - name: Quickstart smoke (the README's own two-node cluster)
         run: MQTTD_BIN=target/debug/mqttd ./scripts/quickstart-smoke.sh
 
-      # ADR 0063 / issue #251: docs/INTEGRATION.md is the rule-engine replacement
-      # story, and its load-bearing claims (`$share` single delivery incl. a 3.1.1
+      # ADR 0063 / issue #251: docs/INTEGRATION.md is the sink story (the ADR 0083
+      # rule engine has no sinks), and its load-bearing claims (`$share` single delivery incl. a 3.1.1
       # member, retained skipping shared subscriptions, in-order queue-while-down
       # replay) are documented recipes — so they are executed, not trusted.
       - name: Integration blueprint smoke (docs/INTEGRATION.md's external-consumer pattern)
@@ -458,6 +458,10 @@ jobs:
       # them for equivalent inputs and fails on any load-bearing divergence.
       - name: Render parity (operator vs chart)
         run: ./scripts/k8s/render-parity.sh
+      # The operator's own RBAC on both install paths (chart vs dev/e2e manifest): the
+      # manifest missing a rule the chart had kept the nightly operator e2e red on a 403.
+      - name: Operator RBAC parity (chart vs dev/e2e manifest)
+        run: ./scripts/k8s/operator-rbac-parity.sh
       # Issue #262 (0047-T10): the chart's CLUSTER BUS, with peerTls actually set. Runs
       # the SHIPPED bootstrap.sh mint, checks every leaf's CN against the pod names the
       # chart renders and its SAN against the advertise host the chart's own init script

@@ -880,10 +880,7 @@ impl Hub {
                     publish = id, group = %key.0,
                     "shared re-selection exhausted; answering the publisher"
                 );
-                match last {
-                    DurableOutcome::Refused(r) => self.refuse_pending(id, r),
-                    _ => self.drop_pending(id),
-                }
+                self.shared_exhausted(id, &key, &tried, last);
                 return;
             };
             let delivered_qos = min_qos(qos, chosen.qos);
@@ -940,6 +937,95 @@ impl Hub {
                 self.try_complete_pending(id);
             }
             return;
+        }
+    }
+
+    /// Every member of group `key` was tried for pending publish `id`; `last` is the
+    /// final answer. A publish the hub gated itself during the drain (ADR 0083) has
+    /// nobody to retry it, however the pass ended — members refusing it (their nodes in
+    /// a brownout, before any side effect) or their nodes dying: the first one tried
+    /// still in the group gets it unanswered, as the group would have had the drain not
+    /// gated it. A dead member has left the group already. A member whose node died may
+    /// have delivered it first, so this path is at least once, even at `QoS` 2 (as the
+    /// re-selection after a peer's death already is). Anything else answers the
+    /// publisher.
+    fn shared_exhausted(
+        &mut self,
+        id: u64,
+        key: &SharedKey,
+        tried: &[(Option<NodeId>, ClientId)],
+        last: DurableOutcome,
+    ) {
+        if self.drain_gated.contains(&id) {
+            self.deliver_shared_plain(id, key, tried);
+            self.try_complete_pending(id);
+            return;
+        }
+        match last {
+            DurableOutcome::Refused(r) => self.refuse_pending(id, r),
+            _ => self.drop_pending(id),
+        }
+    }
+
+    /// Deliver pending publish `id` to the first of `tried` still in group `key`,
+    /// unanswered: a peer member gets a plain `SharedDeliver`, a local one an ungated
+    /// delivery (live, a refused durable copy a counted drop). Not counted in
+    /// `publish_forwarded` again: it was counted when first delivered to the group.
+    fn deliver_shared_plain(
+        &mut self,
+        id: u64,
+        key: &SharedKey,
+        tried: &[(Option<NodeId>, ClientId)],
+    ) {
+        let Some(p) = self.pending_publishes.get(id) else {
+            return;
+        };
+        let (topic, payload, qos, message_expiry, app) = (
+            p.topic.clone(),
+            p.payload.clone(),
+            p.qos,
+            p.message_expiry,
+            p.app().clone(),
+        );
+        let members = self
+            .shared_candidates(&topic)
+            .into_iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, cs)| cs)
+            .unwrap_or_default();
+        let Some(member) = tried.iter().find_map(|(node, client)| {
+            members
+                .iter()
+                .find(|c| c.node == *node && c.client == *client)
+        }) else {
+            return;
+        };
+        let delivered_qos = min_qos(qos, member.qos);
+        match &member.node {
+            Some(node) => {
+                if let Some(peer) = self.peers.get(node) {
+                    let _ = peer.tx.send(PeerMessage::SharedDeliver {
+                        client: member.client.0.to_string(),
+                        topic,
+                        payload: payload.to_vec(),
+                        qos: delivered_qos as u8,
+                        message_expiry,
+                        app: app_to_wire(&app),
+                    });
+                }
+            }
+            None => {
+                let _ = self.deliver_to_client(
+                    &member.client,
+                    &topic,
+                    &payload,
+                    delivered_qos,
+                    message_expiry,
+                    &app,
+                    false,
+                    &AppendGate::None,
+                );
+            }
         }
     }
 

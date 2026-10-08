@@ -1,0 +1,37 @@
+# Fuzz harness for the rule engine (ADR 0083): the rules file (an operator file,
+# hot-reloaded) and rule evaluation over publisher-controlled payloads.
+# Requires nightly + cargo-fuzz:  cargo install cargo-fuzz
+# Run:                            cargo +nightly fuzz run rules_eval
+#
+# The empty [workspace] table detaches this crate from the parent workspace so
+# the stable build/CI never tries to compile the nightly-only libfuzzer harness.
+[package]
+name = "mqtt-rules-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+bytes = "1"
+mqtt-core = { path = "../../mqtt-core" }
+mqtt-rules = { path = ".." }
+
+[[bin]]
+name = "rules_parse"
+path = "fuzz_targets/rules_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rules_eval"
+path = "fuzz_targets/rules_eval.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]

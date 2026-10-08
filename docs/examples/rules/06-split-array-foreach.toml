@@ -1,0 +1,45 @@
+# Recipe 06: split a batch (a JSON array) into one message per element
+#
+# A gateway sends several readings in one message to save bandwidth. split_batch
+# publishes one message per reading on sensors/<sensor>/temp; split_batch_hot publishes
+# an alert for only the readings above 50 (INCASE filters the elements). Rules run in id
+# order, so every per-reading message comes before the alerts. The sensor ids come from
+# the payload and become topic levels, so INCASE lets only plain ids through (see
+# recipe 07).
+#
+# In:  gw/gw-9/batch  qos=1 retain=0  {"gateway": "gw-9", "readings": [{"sensor": "s1", "temp": 21.0}, {"sensor": "s2", "temp": 85.5}, {"sensor": "s3", "temp": 22.4}]}
+# Out: sensors/s1/temp  qos=1 retain=0  {"sensor":"s1","temp":21.0,"gateway":"gw-9"}
+# Out: sensors/s2/temp  qos=1 retain=0  {"sensor":"s2","temp":85.5,"gateway":"gw-9"}
+# Out: sensors/s3/temp  qos=1 retain=0  {"sensor":"s3","temp":22.4,"gateway":"gw-9"}
+# Out: alerts/hot/s2  qos=1 retain=0  {"sensor":"s2","temp":85.5}
+#
+# Tested by crates/mqttd/tests/rules_cookbook.rs; explained in docs/RULES-COOKBOOK.md.
+
+[rules.split_batch]
+description = "One message per reading in a gateway batch"
+sql = '''
+FOREACH payload.readings AS r
+DO
+  r.sensor        AS sensor,
+  r.temp          AS temp,
+  payload.gateway AS gateway
+INCASE is_str(r.sensor) AND regex_match(r.sensor, '^[A-Za-z0-9_-]{1,64}$')
+FROM "gw/+/batch"
+'''
+actions = [
+  { function = "republish", args = { topic = "sensors/${sensor}/temp", qos = 1, payload = "${.}" } },
+]
+
+[rules.split_batch_hot]
+description = "An alert for each reading above 50"
+sql = '''
+FOREACH payload.readings AS r
+DO
+  r.sensor AS sensor,
+  r.temp   AS temp
+INCASE r.temp > 50 AND is_str(r.sensor) AND regex_match(r.sensor, '^[A-Za-z0-9_-]{1,64}$')
+FROM "gw/+/batch"
+'''
+actions = [
+  { function = "republish", args = { topic = "alerts/hot/${sensor}", qos = 1, payload = "${.}" } },
+]

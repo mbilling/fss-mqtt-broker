@@ -16,7 +16,8 @@ read [CONTRIBUTING-agent.md](CONTRIBUTING-agent.md). Live task status is the
 process-default crypto provider, binds listeners, and wires:
 
 - **connection tasks** (`conn.rs`) — one per client socket; they never share
-  mutable session state.
+  mutable session state. A client publish's rules are evaluated here, after the
+  ACL and before the hub (ADR 0083), so rule work runs in parallel with ingress.
 - **the hub actor** (`hub/`) — single-threaded owner of routing, sessions,
   retained, and every outbound channel.
 - **the peer mesh** (`peer.rs`, `mqtt-cluster`) — SWIM membership plus the
@@ -39,6 +40,7 @@ source feeding the same hub ([ADR 0001](adr/0001-session-durability.md)).
 | `mqtt-cluster` | SWIM, peer frames, placement, durable plane. |
 | `mqtt-observability` | Prometheus/OTLP metrics, hash-chained audit. |
 | `mqtt-config` | Typed config; `ENV_VARS` is the overlay inventory. |
+| `mqtt-rules` | The rule engine: EMQX rule SQL parser, evaluator, functions, templates, actions. Pure (no I/O, no broker state). Fuzzed (ADR 0083). |
 | `mqttd` | Binary + hub + conn — this page. |
 | `mqtt-bridge` | Zone-crossing MQTT client (not a cluster member). |
 | `mqttd-operator` | `MqttdCluster` reconciler. |
@@ -60,6 +62,7 @@ source feeding the same hub ([ADR 0001](adr/0001-session-durability.md)).
 | `store_probe` | Boot-time volume self-measurement (ADR 0076 T1). |
 | `oidc` / `http_auth` | Token and remote-hook authenticators. |
 | `cluster` | Binary-side mesh wiring. |
+| `rules` | Rule-engine wiring (ADR 0083): the rules `watch`, evaluation on the connection task, and the derived messages' ack gates joined into the publisher's one ack. |
 | `clock` | Time source for tests vs production. |
 
 The binary's own `main.rs` crate docs are the **configuration and signals
@@ -110,7 +113,8 @@ From `hub/mod.rs`:
 | `SIGUSR2` / `mqttd --backup` | ADR 0062 online export into `[backup] dir`. Handler is installed even with no dir configured (default SIGUSR2 would otherwise *kill* the process). |
 | `SIGHUP` / `MQTTD_CONFIG_WATCH` | Validate-before-swap reload (ADR 0032/0033). |
 | `--check-config` | Validate and exit; bind nothing. Includes startup's pre-bind checks that need nothing from the host (bind syntax, TLS/QUIC/OIDC/cluster prerequisites). |
-| `--check-config --preflight` | Also the host (issue #671): every bind resolved, every referenced file (TLS, password, ACL, JWT, cluster TLS, gossip key) opened and parsed as the invoking user. |
+| `--check-config --preflight` | Also the host (issue #671): every bind resolved, every referenced file (TLS, password, ACL, JWT, cluster TLS, gossip key, rules) opened and parsed as the invoking user. |
+| `--check-rules [file]` / `--rule-test --sql …` | Load a rules file and exit; run one statement over a sample message (ADR 0083). |
 
 ## Where to put a change
 

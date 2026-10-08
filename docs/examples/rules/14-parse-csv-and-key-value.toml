@@ -1,0 +1,53 @@
+# Recipe 14: parse CSV and key=value payloads into JSON
+#
+# Older devices send text, not JSON. Both rules build the JSON they publish under one
+# alias prefix (out.time, out.temp, ...) and publish just that part with "${out}", so
+# the intermediate values (f, kv) stay out of the message.
+#
+# csv_to_json reads "time,device,temp,running". split(..., 'notrim') keeps empty
+# fields, so a missing value never shifts the columns; an empty temp becomes a real
+# JSON null (there is no null literal: json_decode('null') makes one).
+#
+# kv_to_json reads "temp=21.5;state=ON;bat=3.61": it rewrites the text into a JSON
+# object of strings, decodes it once, then converts each value. A key that is missing
+# gives null (or a default), never a failed rule. A value must not contain '"' or '\'.
+#
+# In:  legacy/logger-1/csv  qos=0 retain=0  2026-10-07T12:00:05Z,pump-8,,0
+# Out: parsed/logger-1/csv  qos=0 retain=0  {"time":"2026-10-07T12:00:05Z","device":"pump-8","temp":null,"running":false}
+# In:  legacy/logger-2/kv  qos=0 retain=0  temp=21.5;state=ON;bat=3.61
+# Out: parsed/logger-2/kv  qos=0 retain=0  {"temp":21.5,"battery_v":3.61,"state":"ON"}
+# In:  legacy/logger-2/kv  qos=0 retain=0  state=ON
+# Out: parsed/logger-2/kv  qos=0 retain=0  {"temp":null,"battery_v":null,"state":"ON"}
+#
+# Tested by crates/mqttd/tests/rules_cookbook.rs; explained in docs/RULES-COOKBOOK.md.
+
+[rules.csv_to_json]
+description = "CSV lines to JSON"
+sql = '''
+SELECT
+  split(payload, ',', 'notrim') AS f,
+  topic(2) AS logger,
+  nth(1, f) AS out.time,
+  nth(2, f) AS out.device,
+  CASE WHEN nth(3, f) = '' THEN json_decode('null') ELSE float(nth(3, f)) END AS out.temp,
+  nth(4, f) = '1' AS out.running
+FROM "legacy/+/csv"
+'''
+actions = [
+  { function = "republish", args = { topic = "parsed/${logger}/csv", payload = "${out}" } },
+]
+
+[rules.kv_to_json]
+description = "key=value pairs to JSON"
+sql = '''
+SELECT
+  topic(2) AS logger,
+  json_decode(concat('{', regex_replace(regex_replace(payload, '([^;=]+)=([^;]*)', '"\1":"\2"'), ';', ','), '}')) AS kv,
+  CASE WHEN is_null(kv.temp) THEN json_decode('null') ELSE float(kv.temp) END AS out.temp,
+  CASE WHEN is_null(kv.bat) THEN json_decode('null') ELSE float(kv.bat) END AS out.battery_v,
+  coalesce(kv.state, 'unknown') AS out.state
+FROM "legacy/+/kv"
+'''
+actions = [
+  { function = "republish", args = { topic = "parsed/${logger}/kv", payload = "${out}" } },
+]

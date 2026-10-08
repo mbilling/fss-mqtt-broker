@@ -50,6 +50,7 @@ fn permissive_policy() -> Arc<ConnPolicy> {
         metrics: None,
         enhanced: None,
         ingress: None,
+        rules: None,
     })
 }
 

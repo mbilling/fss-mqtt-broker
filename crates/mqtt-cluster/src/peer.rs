@@ -209,6 +209,84 @@ pub struct ReplicaEntryWire {
     pub record: Vec<u8>,
 }
 
+/// When a frame was put on a link's lane: local to this process, never on the wire
+/// (`#[serde(skip)]`), for the `replicate_queue` / `ack_queue` stages (#662). A
+/// decoded frame carries none. Every stamp equals every other, so frame equality
+/// (tests, codec round trips) ignores it.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Queued(Option<std::time::Instant>);
+
+/// About one frame in this many is stamped (the first on each thread always is).
+/// These are two more histogram records per replicated message on the hottest
+/// path, and a mean needs a sample, not a census.
+const QUEUED_SAMPLE_EVERY: u32 = 16;
+
+impl Queued {
+    /// Stamped now.
+    #[must_use]
+    pub fn now() -> Self {
+        Self(Some(std::time::Instant::now()))
+    }
+
+    /// Stamped now for about one frame in [`QUEUED_SAMPLE_EVERY`], drawn at
+    /// random; the first call on each thread always is. Random rather than every
+    /// Nth: an append's fan-out queues one `Replicate` per follower back to back,
+    /// usually on one worker thread, so a fixed stride could keep landing on the
+    /// same follower's link and describe only that one.
+    #[must_use]
+    pub fn sampled() -> Self {
+        thread_local! {
+            // xorshift32 state; 0 until this thread's first call seeds it.
+            static DRAW: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+        }
+        let stamp = DRAW.with(|draw| {
+            let mut x = draw.get();
+            if x == 0 {
+                draw.set(queued_seed());
+                return true;
+            }
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            draw.set(x);
+            x.is_multiple_of(QUEUED_SAMPLE_EVERY)
+        });
+        if stamp {
+            Self::now()
+        } else {
+            Self(None)
+        }
+    }
+
+    /// When it was stamped; `None` for an unstamped (or decoded) frame.
+    #[must_use]
+    pub fn stamped_at(&self) -> Option<std::time::Instant> {
+        self.0
+    }
+}
+
+/// A distinct, well-spread, nonzero xorshift seed per thread: a Weyl step on a
+/// shared counter through murmur3's 32-bit finalizer (a bijection, so threads
+/// never share a sequence).
+fn queued_seed() -> u32 {
+    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0x9E37_79B9);
+    let mut s = NEXT.fetch_add(0x9E37_79B9, std::sync::atomic::Ordering::Relaxed);
+    s ^= s >> 16;
+    s = s.wrapping_mul(0x85EB_CA6B);
+    s ^= s >> 13;
+    s = s.wrapping_mul(0xC2B2_AE35);
+    s ^= s >> 16;
+    s.max(1) // 0 is xorshift's fixed point
+}
+
+impl PartialEq for Queued {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for Queued {}
+
 /// A message exchanged between broker nodes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PeerMessage {
@@ -357,6 +435,9 @@ pub enum PeerMessage {
         epoch: crate::lease::Epoch,
         /// The operation to apply (append / truncate / remove).
         op: crate::cluster_log::ReplOp,
+        /// When the lease-holder queued it on the link (local, not on the wire).
+        #[serde(skip)]
+        queued: Queued,
     },
     /// A replica's response to a [`Replicate`](PeerMessage::Replicate): whether it
     /// accepted the op (`false` = fenced at a stale epoch). The lease-holder counts
@@ -366,6 +447,9 @@ pub enum PeerMessage {
         req_id: u64,
         /// Whether the replica applied the op (`false` if fenced).
         accepted: bool,
+        /// When the replica queued it on the link (local, not on the wire).
+        #[serde(skip)]
+        queued: Queued,
     },
     /// An ownership-lease consensus (openraft) RPC carried over the peer bus
     /// (ADR 0006 §1, workstream E step 3b-ii mesh network). The codec treats
@@ -1155,10 +1239,12 @@ mod tests {
                 seq: 3,
                 record: b"payload".to_vec(),
             },
+            queued: crate::peer::Queued::default(),
         });
         roundtrip(&PeerMessage::ReplicateAck {
             req_id: 42,
             accepted: true,
+            queued: crate::peer::Queued::default(),
         });
         roundtrip(&PeerMessage::RaftRpc {
             req_id: 7,
@@ -1659,5 +1745,42 @@ mod tests {
             Some(PeerMessage::Publish { .. })
         ));
         assert_eq!(decode(&mut buf).unwrap(), None);
+    }
+
+    /// `Queued::sampled` stamps the first frame on a thread (a lone durable publish
+    /// still feeds both stages), then about one in 16 at random: never a fixed
+    /// stride, which an append's back-to-back per-follower fan-out could alias
+    /// onto the same link every time (#662).
+    #[test]
+    fn queued_sampling_stamps_the_first_then_about_one_in_16_without_a_stride() {
+        // A fresh thread, so this is its first call whatever ran before.
+        std::thread::spawn(|| {
+            assert!(
+                super::Queued::sampled().stamped_at().is_some(),
+                "the first call on a thread must be stamped"
+            );
+            let calls = 16_000u32;
+            let (mut even, mut odd) = (0u32, 0u32);
+            for i in 0..calls {
+                if super::Queued::sampled().stamped_at().is_some() {
+                    if i % 2 == 0 {
+                        even += 1;
+                    } else {
+                        odd += 1;
+                    }
+                }
+            }
+            let stamped = even + odd;
+            assert!(
+                (calls / 32..=calls / 8).contains(&stamped),
+                "{stamped} of {calls} stamped, want about 1 in 16"
+            );
+            assert!(
+                even > 0 && odd > 0,
+                "stamps fell on one parity only (even {even}, odd {odd}): a stride"
+            );
+        })
+        .join()
+        .unwrap();
     }
 }

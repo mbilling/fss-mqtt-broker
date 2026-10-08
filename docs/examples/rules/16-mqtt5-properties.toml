@@ -1,0 +1,56 @@
+# Recipe 16: MQTT 5 user properties and message properties, in and out
+#
+# order_audit_copy keeps an audit copy of every order on audit/orders, carrying every
+#   user property of the original unchanged (in order, repeated keys included) and its
+#   Content-Type. A publisher that sent no Content-Type (an MQTT 3.1.1 client, say)
+#   would otherwise get the literal text "undefined", so coalesce() gives a default.
+# order_router routes an order by its "tenant" user property to tenants/<tenant>/orders,
+#   adds a "processed-by" property, and sets Content-Type and a one-hour expiry. The
+#   tenant comes from the publisher and becomes a topic level, so the WHERE lets only a
+#   plain id through. pub_props.'User-Property' is a map, so it keeps only the LAST
+#   value of a repeated key: here the two "tag" properties become one.
+#
+# In:  orders/new  qos=1 retain=0  {"order": 1001, "sku": "A-7"}
+#      (MQTT 5, user properties tenant=acme, trace-id=abc123, tag=red, tag=fragile,
+#       Content-Type application/vnd.shop+json)
+# Out: audit/orders  qos=1 retain=0  {"order": 1001, "sku": "A-7"}
+#      (user properties tenant=acme, trace-id=abc123, tag=red, tag=fragile,
+#       Content-Type application/vnd.shop+json)
+# Out: tenants/acme/orders  qos=1 retain=0  {"order": 1001, "sku": "A-7"}
+#      (user properties tenant=acme, trace-id=abc123, tag=fragile, processed-by=order_router,
+#       Content-Type application/json, Message-Expiry-Interval 3600)
+#
+# Tested by crates/mqttd/tests/rules_cookbook.rs; explained in docs/RULES-COOKBOOK.md.
+
+[rules.order_audit_copy]
+description = "Audit copy with every original property"
+sql = '''
+SELECT
+  payload,
+  pub_props,
+  coalesce(pub_props.'Content-Type', 'application/octet-stream') AS content_type
+FROM "orders/+"
+'''
+actions = [
+  { function = "republish", args = {
+      topic = "audit/orders", qos = 1, payload = "${payload}",
+      user_properties = "${pub_props.'User-Property'}",
+      mqtt_properties = { "Content-Type" = "${content_type}" } } },
+]
+
+[rules.order_router]
+description = "Route orders by their tenant user property"
+sql = '''
+SELECT
+  pub_props.'User-Property'.tenant AS tenant,
+  payload,
+  map_put('processed-by', 'order_router', pub_props.'User-Property') AS user_properties
+FROM "orders/+"
+WHERE is_str(tenant) AND regex_match(tenant, '^[A-Za-z0-9_-]{1,64}$')
+'''
+actions = [
+  { function = "republish", args = {
+      topic = "tenants/${tenant}/orders", qos = 1, payload = "${payload}",
+      user_properties = "${user_properties}",
+      mqtt_properties = { "Content-Type" = "application/json", "Message-Expiry-Interval" = "3600" } } },
+]

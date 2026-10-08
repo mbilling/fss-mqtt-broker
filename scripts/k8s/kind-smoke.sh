@@ -209,17 +209,19 @@ case "$whoami" in
   *) echo "FAIL: the admin API did not admit CN=smoke-admin as operator"
      cat "$PKI_DIR/port-forward.log"; kill "$PF_PID" 2>/dev/null; exit 1 ;;
 esac
-# Without a client certificate the handshake itself must fail — there is no anonymous mode.
-if curl -sS --max-time 10 --resolve "$ADMIN_HOST:19443:127.0.0.1" \
-     --cacert "$PKI_DIR/ca/cluster-ca.pem" "https://$ADMIN_HOST:19443/admin/v1/whoami" >/dev/null 2>&1; then
-  echo "FAIL: the admin API answered a caller with NO client certificate"; kill "$PF_PID"; exit 1
-fi
 cluster="$(admin_get cluster)"
 echo "cluster: $cluster"
 printf '%s' "$cluster" | grep -Eq '"replied": ?3' \
   || { echo "FAIL: the cluster view did not hear from all 3 pods"; kill "$PF_PID"; exit 1; }
 printf '%s' "$cluster" | grep -Eq '"same_cluster_id": ?true' \
   || { echo "FAIL: the cluster view reports diverging cluster identities"; kill "$PF_PID"; exit 1; }
+# Without a client certificate the handshake itself must fail — there is no anonymous mode.
+# Last through this port-forward: the refused handshake can take the forward down with
+# it, and on 2026-10-07 the cluster call that used to follow got "connection refused".
+if curl -sS --max-time 10 --resolve "$ADMIN_HOST:19443:127.0.0.1" \
+     --cacert "$PKI_DIR/ca/cluster-ca.pem" "https://$ADMIN_HOST:19443/admin/v1/whoami" >/dev/null 2>&1; then
+  echo "FAIL: the admin API answered a caller with NO client certificate"; kill "$PF_PID"; exit 1
+fi
 kill "$PF_PID" 2>/dev/null || true
 echo "admin API: operator admitted, anonymous refused, cluster view 3/3 replied from pod-0"
 
