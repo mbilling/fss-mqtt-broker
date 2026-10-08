@@ -433,8 +433,9 @@ async fn a_tick_the_pool_cannot_carry_is_skipped_and_counted() {
 
 /// ADR 0084: a rule's last error is kept from the failure the log reports (`sql` or
 /// `action`, a `$SYS` republish refused included) or synthesized from the failed-action
-/// count for a refused or unrouted derived message (`delivery`). Its text is on `$SYS`
-/// only while the trace is on, and a reload that removes or redefines the rule drops it.
+/// count for a refused or unrouted derived message (`delivery`). `$SYS` shows its time and
+/// kind, the admin API its text too, and a reload that removes or redefines the rule
+/// drops it.
 #[tokio::test(start_paused = true)]
 async fn last_errors_by_kind_and_a_synthesized_delivery_entry() {
     let text = r#"
@@ -471,30 +472,21 @@ actions = [{ function = "republish", args = { topic = "out/x" } }]
     for doc in per_rule.values() {
         assert!(
             doc["last_error"].get("message").is_none(),
-            "no error text on $SYS with the trace off: {doc}"
+            "no error text on $SYS: {doc}"
         );
     }
+    // The texts the admin API shows an operator.
+    let message = |id: &str| w.observe.last_error(id).unwrap().message;
     assert_eq!(
-        w.observe.last_error("sqlerr").unwrap().message,
+        message("sqlerr"),
         "int(): cannot convert 'abc' to an integer"
     );
-
-    w.observe.apply(&settings(2, true, 20), None);
-    let (_, per_rule) = next_tick(&mut sys, 3).await;
-    assert!(
-        per_rule["sqlerr"]["last_error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("'abc'"),
-        "{}",
-        per_rule["sqlerr"]
-    );
     assert_eq!(
-        per_rule["actfail"]["last_error"]["message"],
+        message("actfail"),
         "republish topic is reserved for the broker: $SYS/brokers/n1/rules"
     );
     assert_eq!(
-        per_rule["fate"]["last_error"]["message"],
+        message("fate"),
         "3 derived message(s) failed (refused or not routed)"
     );
 
@@ -520,6 +512,46 @@ actions = [{ function = "republish", args = { topic = "${t}" } }]
         "unchanged: kept"
     );
     assert!(w.observe.last_error("fate").is_none());
+}
+
+/// ADR 0084: a rule's last error on `$SYS` is its time and kind, never its text, with
+/// the trace off or on: the text can quote a payload value, and a reader granted the
+/// statistics need not be one granted the trace. The text is kept, for the trace and
+/// the admin API.
+#[tokio::test(start_paused = true)]
+async fn sys_statistics_never_carry_error_text() {
+    let w = watched(
+        r#"
+[rules.sqlerr]
+sql = 'SELECT int(payload.v) AS w FROM "e/#"'
+actions = []
+"#,
+        &settings(2, false, 20),
+    );
+    let (mut sys, _stop) = spawn_stats(&w, plenty(), Arc::new(LastReload::default()));
+    next_tick(&mut sys, 1).await;
+    publish(&w.rules.for_connection(), "e/1", br#"{"v":"s3cret-value"}"#);
+    assert!(
+        w.observe
+            .last_error("sqlerr")
+            .unwrap()
+            .message
+            .contains("'s3cret-value'"),
+        "the kept text quotes the payload"
+    );
+    for trace in [false, true] {
+        w.observe.apply(&settings(2, trace, 20), None);
+        let (summary, per_rule) = next_tick(&mut sys, 1).await;
+        assert_eq!(summary["trace"], trace);
+        let error = &per_rule["sqlerr"]["last_error"];
+        let keys: Vec<&String> = error.as_object().unwrap().keys().collect();
+        assert_eq!(keys, ["at", "kind"], "trace {trace}: {error}");
+        assert_eq!(error["kind"], "sql");
+        for doc in std::iter::once(&summary).chain(per_rule.values()) {
+            let text = doc.to_string();
+            assert!(!text.contains("s3cret"), "trace {trace}: {text}");
+        }
+    }
 }
 
 /// ADR 0084: a reload rejected for a config file whose broken line holds a secret puts

@@ -23,8 +23,9 @@
 //! least 10 seconds, and 10 seconds for a trace record.
 //!
 //! Nothing secret goes on `$SYS`: no SQL, description, actions, file path, writer or
-//! reload error text, and a rule's last error text only while the trace — which shows
-//! payloads anyway — is on.
+//! reload error text. A rule's last error is its time and kind only: its text can quote
+//! a payload value, and a statistics reader need not be one the trace's payloads are
+//! for. The trace carries the text, and the admin API shows it to operators.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -301,7 +302,6 @@ impl Stats {
                 *count = ctx.metrics.map_or(0, |m| matched(&m.rule_counts(id)));
             }
         }
-        let tracing = observe.tracing();
         let at_s = rfc3339_millis(at);
         let mut messages = vec![(
             format!("$SYS/brokers/{}/rules", self.node),
@@ -325,15 +325,10 @@ impl Stats {
                 let failed = counts.actions_failed.saturating_sub(b.actions_failed);
                 note_delivery_failures(observe, id, failed, prev_tick, at, &def);
             }
-            let last_error = observe.last_error(id).map(|e| {
-                let mut v = json!({"at": rfc3339_millis(e.at), "kind": e.kind.as_str()});
-                // The text can quote a payload value: on $SYS only while the trace, which
-                // shows payloads anyway, is on.
-                if tracing {
-                    v["message"] = json!(e.message);
-                }
-                v
-            });
+            // Never the text, which can quote a payload value, trace on or off.
+            let last_error = observe
+                .last_error(id)
+                .map(|e| json!({"at": rfc3339_millis(e.at), "kind": e.kind.as_str()}));
             let doc = json!({
                 "node": self.node,
                 "rule": &**id,
