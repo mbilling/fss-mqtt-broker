@@ -388,6 +388,8 @@ async fn main() -> Result<(), StartupError> {
     // loops and drains live connections, and a tracker that lets us wait for them.
     let shutdown = tokio_util::sync::CancellationToken::new();
     let connections = tokio_util::task::TaskTracker::new();
+    // When this broker started, as the rule statistics report it (ADR 0084).
+    let started_at = std::time::SystemTime::now();
 
     // Metrics (ADR 0020), built once and shared (Arc) into the hub (publish/deliver
     // counts), the connections, the listeners, the gossip driver, and the health server's
@@ -762,7 +764,7 @@ async fn main() -> Result<(), StartupError> {
         placement: placement.clone(),
         connector: peer_tls.as_ref().map(|t| t.connector.clone()),
     };
-    let (policy, mut reloader) = client_policy(
+    let (policy, mut reloader, trace_rx) = client_policy(
         &live_config,
         &node_id,
         Some(proxy),
@@ -774,12 +776,38 @@ async fn main() -> Result<(), StartupError> {
     let audit_for_shutdown = policy.audit.clone();
     let audit_for_admin = policy.audit.clone();
     let admin_authz = policy.authz.clone();
+    let admin_rules = policy.rules.clone();
     let admin_sessions = mqttd::admin::sessions::SessionAccess {
         hub: hub_tx.clone(),
         store: store.clone(),
         placement: Some(placement_for_backup.clone()),
     };
     reloader.attach_config_stamp(config_stamp.clone());
+    // Every reload attempt, for the rule statistics (ADR 0084).
+    let last_reload = Arc::new(reload::LastReload::default());
+    reloader.attach_last_reload(last_reload.clone());
+    // Watching the running rules (ADR 0084): /statusz reports their digest, and the
+    // statistics and trace tasks publish on $SYS. Both run until the drain begins, idle
+    // while their settings are off, and follow a reload's settings at once.
+    if let Some(rules) = &policy.rules {
+        let _ = health_state.rules_slot().set(rules.clone());
+        tokio::spawn(mqttd::rules_sys::run_stats(
+            rules.clone(),
+            Some(metrics.clone()),
+            hub_tx.clone(),
+            ingress.clone(),
+            last_reload.clone(),
+            started_at,
+            shutdown.clone(),
+        ));
+        tokio::spawn(mqttd::rules_sys::run_trace(
+            trace_rx,
+            rules.clone(),
+            hub_tx.clone(),
+            ingress.clone(),
+            shutdown.clone(),
+        ));
+    }
 
     // Fold the cluster-bus gossip CRL (ADR 0022 T7) into the same validate-before-swap
     // reload as the client policy: a republished CRL revokes a node's gossip on the next
@@ -890,6 +918,7 @@ async fn main() -> Result<(), StartupError> {
     {
         let hub_for_apply = hub_tx.clone();
         let audit_for_apply = policy.audit.clone();
+        let rules_for_apply = policy.rules.as_ref().and_then(|r| r.observe().cloned());
         let replica_change = durable_plane
             .as_ref()
             .map(mqtt_cluster::durable_plane::DurablePlane::replica_change);
@@ -904,6 +933,7 @@ async fn main() -> Result<(), StartupError> {
                     &hub_for_apply,
                     &audit_for_apply,
                     replica_change.as_deref(),
+                    rules_for_apply.as_deref(),
                 )
             }),
         });
@@ -1138,6 +1168,7 @@ async fn main() -> Result<(), StartupError> {
             stamp: config_stamp.clone(),
         },
         cordon,
+        admin_rules.map(|rules| mqttd::admin::rules::RulesAccess::new(rules, last_reload)),
     )
     .await?;
 
@@ -1526,6 +1557,14 @@ async fn start_client_listeners(
     Ok(())
 }
 
+/// What [`client_policy`] builds: the connection policy, the reloader that swaps it, and
+/// the receiving end of the rule trace's queue (ADR 0084).
+type ClientPolicy = (
+    Arc<conn::ConnPolicy>,
+    reload::Reloader,
+    tokio::sync::mpsc::Receiver<mqttd::rules::TraceRecord>,
+);
+
 /// Build the connection policy — authentication, topic authorization, and
 /// auditing — from the `MQTTD_*` shims (ADR 0004). Everything is deny-by-default;
 /// the insecure fallbacks are explicit and loudly logged.
@@ -1541,7 +1580,7 @@ fn client_policy(
     shutdown: tokio_util::sync::CancellationToken,
     metrics: Arc<mqtt_observability::metrics::Metrics>,
     ingress: Arc<mqttd::ingress::IngressCredit>,
-) -> Result<(Arc<conn::ConnPolicy>, reload::Reloader), Box<dyn std::error::Error>> {
+) -> Result<ClientPolicy, Box<dyn std::error::Error>> {
     // ADR 0066 T3: with an export endpoint configured, every audit record —
     // genesis and the closing shutdown record included — also ships to the SIEM
     // as RFC 5424 syslog (shed-and-count, never blocking the broker).
@@ -1616,8 +1655,18 @@ fn client_policy(
         );
     }
     let (rules_tx, rules_rx) = tokio::sync::watch::channel(Arc::new(initial_rules));
+    // Watched from the start (ADR 0084), with the startup `[rules]` settings; a reload's
+    // commit hook applies later ones.
+    let (observe, trace_rx) = mqttd::rules::RulesObserve::new();
+    {
+        let snap = live
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        observe.apply(&snap.rules, trace_exposure(&snap));
+    }
     let rules =
-        mqttd::rules::Rules::new(rules_rx, Arc::from(node.0.as_str()), Some(metrics.clone()));
+        mqttd::rules::Rules::new(rules_rx, Arc::from(node.0.as_str()), Some(metrics.clone()))
+            .with_observe(observe);
     reloader.attach_rules(rules_tx, {
         let live = live.clone();
         move || -> reload::RulesBuildResult {
@@ -1654,7 +1703,21 @@ fn client_policy(
         ingress: Some(ingress),
         rules: Some(rules),
     });
-    Ok((policy, reloader))
+    Ok((policy, reloader, trace_rx))
+}
+
+/// Why any client may read the rule trace, when one can (ADR 0084): no ACL file, or one
+/// whose `default` is allow. `None` when an ACL that denies by default governs `$SYS`.
+fn trace_exposure(config: &Config) -> Option<&'static str> {
+    #[derive(serde::Deserialize)]
+    struct AclDefault {
+        default: Option<String>,
+    }
+    let Some(path) = &config.security.acl_file else {
+        return Some("no MQTTD_ACL_FILE is configured");
+    };
+    let acl: AclDefault = toml::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
+    (acl.default.as_deref() == Some("allow")).then_some("the ACL's default is allow")
 }
 
 /// Which field of a verified client certificate is the identity (ADR 0004 T11).
@@ -2839,6 +2902,7 @@ async fn start_admin(
     authz: mqttd::admin::authz::LiveAuthorizer,
     reload: mqttd::admin::config::ReloadAccess,
     cordon: Arc<std::sync::atomic::AtomicBool>,
+    rules: Option<mqttd::admin::rules::RulesAccess>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let admin = &config.admin;
     let (Some(bind), Some(admin_tls)) = (&admin.bind, admin_tls) else {
@@ -2852,6 +2916,9 @@ async fn start_admin(
             .with_reload(reload)
             .with_cordon(cordon)
             .with_cluster_ca_slot(admin_tls.cluster_ca);
+    if let Some(rules) = rules {
+        state = state.with_rules(rules);
+    }
     if let Some(connector) = admin_tls.connector {
         let port = match admin.peer_port {
             Some(port) => port,
@@ -2870,9 +2937,15 @@ async fn start_admin(
         %bind,
         viewers = admin.viewers.len(),
         operators = admin.operators.len(),
+        rules_writers = config.rules.admin_writers.len(),
         peers,
         "serving the admin API (mTLS; ADR 0081)"
     );
+    // A writer configured for a file the broker cannot replace: say so now, not at the
+    // first write (ADR 0084). A reload says it again (`apply_live_config`).
+    if let Some(line) = mqttd::admin::rules::unwritable_warning(&config.rules) {
+        warn!("{line}");
+    }
     tokio::spawn(mqttd::admin::serve_reloadable(
         listener,
         admin_tls.acceptor,
@@ -4237,11 +4310,22 @@ fn apply_live_config(
     hub: &mpsc::UnboundedSender<hub::HubCommand>,
     audit: &Arc<dyn AuditSink>,
     replica_change: Option<&mqtt_cluster::replica_change::ReplicaChangeControl>,
+    rules: Option<&mqttd::rules::RulesObserve>,
 ) -> Vec<String> {
     // Quotas are live: push the new set (idempotent when unchanged). precheck guaranteed they
     // build, so this does not error.
     if let Ok(quotas) = quotas_from_config(new) {
         let _ = hub.send(hub::HubCommand::SetQuotas(quotas));
+    }
+    // Watching the rules is live (ADR 0084): applied here, from the committed config —
+    // never from a candidate a reload may still reject.
+    if let Some(observe) = rules {
+        observe.apply(&new.rules, trace_exposure(new));
+    }
+    // Rules writers for a file the broker cannot replace (ADR 0084): said at boot, and
+    // again on every reload while it lasts.
+    if let Some(line) = mqttd::admin::rules::unwritable_warning(&new.rules) {
+        warn!("{line}");
     }
     // A changed replication factor is a proposal to the running cluster (ADR 0080 §4): the
     // lease leader opens the change when the cluster can take it, and `/statusz` shows its
@@ -6073,13 +6157,42 @@ mod tests {
         let recorder = std::sync::Arc::new(mqtt_observability::RecordingAuditSink::new());
         let audit: std::sync::Arc<dyn mqtt_observability::AuditSink> = recorder.clone();
         let control = mqtt_cluster::replica_change::ReplicaChangeControl::new();
-        super::apply_live_config(&base, &base, &hub, &audit, Some(&control));
+        super::apply_live_config(&base, &base, &hub, &audit, Some(&control), None);
         assert_eq!(control.proposed(), None);
         let mut changed = base.clone();
         changed.durable.replicas = 3;
-        super::apply_live_config(&base, &changed, &hub, &audit, Some(&control));
+        super::apply_live_config(&base, &changed, &hub, &audit, Some(&control), None);
         assert_eq!(control.proposed(), Some(3));
         assert_eq!(recorder.kinds(), vec!["config.reload".to_string()]);
+    }
+
+    /// ADR 0084: the `INSECURE:` line names why any client may read the rule trace — no
+    /// ACL file, or an ACL whose default is allow — and is not said when the ACL denies by
+    /// default, whether it says so or leaves `default` out.
+    #[test]
+    fn the_trace_exposure_names_why_the_trace_is_readable() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        assert_eq!(
+            super::trace_exposure(&config),
+            Some("no MQTTD_ACL_FILE is configured")
+        );
+        let grant =
+            "\n[[rules]]\nactions = [\"subscribe\"]\ntopics = [\"$SYS/brokers/+/rules/#\"]\n";
+        for (name, default, want) in [
+            (
+                "allow.toml",
+                "default = \"allow\"\n",
+                Some("the ACL's default is allow"),
+            ),
+            ("deny.toml", "default = \"deny\"\n", None),
+            ("omitted.toml", "", None),
+        ] {
+            let path = dir.path().join(name);
+            std::fs::write(&path, format!("{default}{grant}")).unwrap();
+            config.security.acl_file = Some(path.display().to_string());
+            assert_eq!(super::trace_exposure(&config), want, "{name}");
+        }
     }
 
     /// The config crate validates the spelling; `mqtt_auth` decides what it means. The two

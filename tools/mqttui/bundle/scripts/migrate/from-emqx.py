@@ -664,8 +664,11 @@ SECTION_NO_EQUIVALENT: dict[str, str] = {
     "license": "mqttd is Apache-2.0 with no licence file and no licensed features — "
     "clustering included. Nothing to carry over",
     "psk_authentication": "PSK ciphersuites are not implemented",
-    "sys_topics": "$SYS topics are not implemented; the equivalent data is on /metrics "
-    "and /statusz. Any client that SUBSCRIBES to $SYS must be rewritten",
+    "sys_topics": "mqttd publishes none of EMQX's $SYS broker topics (uptime, clients, "
+    "stats, metrics, client events): the equivalent data is on /metrics and /statusz, and "
+    "any client that SUBSCRIBES to them must be rewritten. mqttd's $SYS holds only opt-in "
+    "rule statistics and an opt-in rule trace ([rules] sys_interval_secs, trace), and no "
+    "client may publish there but a Mosquitto bridge, to $SYS/broker/connection/<id>/state",
     "sysmon": "there is no VM/OS monitor; use node_exporter beside /metrics",
     "alarm": "there is no in-broker alarm table; alert on the Prometheus metrics",
     "conn_congestion": "not implemented; the nearest signals are the queue-overflow "
@@ -2731,8 +2734,11 @@ def convert_rules(tree: dict, conv: Conversion) -> None:
             continue
         if key == "ignore_sys_message":
             conv.rule_todos.append(
-                f"rule_engine.ignore_sys_message = {value}: mqttd publishes no $SYS messages, "
-                "so a rule never sees one — the same behaviour as EMQX's default (true)"
+                f"rule_engine.ignore_sys_message = {value}: mqttd's own $SYS messages (the "
+                "opt-in rule statistics and trace) never run rules, and no client may publish "
+                "to $SYS but a Mosquitto bridge's $SYS/broker/connection/<id>/state, so a rule "
+                "sees no other $SYS message — EMQX's default (true) apart from that one "
+                "topic; `false` has no equivalent"
             )
         elif key.startswith("jq_"):
             conv.rule_todos.append(
@@ -3414,13 +3420,24 @@ def convert_topic(topic: str, todos: list[str], where: str) -> str | None:
             "was NOT emitted. mqttd supports %i (identity) and %c (client id) only"
         )
         return None
-    if out.startswith("$"):
+    if out == "$SYS" or out.startswith("$SYS/"):
         todos.append(
-            f"{where}: the rule covers the $-prefixed topic {out!r}. mqttd implements no "
-            "$SYS tree and no $-namespace of its own (the broker's own telemetry is "
-            "/metrics and /statusz), so the rule is INERT — kept below for the record, "
-            "but nothing publishes or subscribes there. Any client that read $SYS must be "
-            "rewritten against /metrics"
+            f"{where}: the rule covers {out!r}, in mqttd's broker-reserved $SYS tree. No "
+            "client may publish there, whatever the ACL says, but a Mosquitto bridge to its "
+            "state topic $SYS/broker/connection/<id>/state. The broker publishes there "
+            "only opt-in rule statistics ($SYS/brokers/<node>/rules/...) and an opt-in rule "
+            "trace ($SYS/brokers/<node>/trace/rules/..., which carries message payloads), "
+            "not EMQX's broker statistics, which are /metrics and /statusz. The rule is "
+            "kept: a subscribe rule on $SYS/# reaches the rule statistics AND the trace, so "
+            "grant $SYS/brokers/+/rules/# for the statistics alone. Any client that read "
+            "EMQX's $SYS statistics must be rewritten against /metrics"
+        )
+    elif out.startswith("$"):
+        todos.append(
+            f"{where}: the rule covers the $-prefixed topic {out!r}. mqttd has no "
+            "$-namespace of its own besides the broker-reserved $SYS (the broker's own "
+            "telemetry is /metrics and /statusz), so the rule is INERT — kept below for the "
+            "record, but nothing in mqttd publishes or subscribes there"
         )
     if "%i" in out or "%c" in out:
         todos.append(
@@ -3621,9 +3638,11 @@ def parse_acl(text: str) -> tuple[list[dict], list[str], str | None]:
             if isinstance(t, Atom) and str(t) == "all":
                 todos.append(
                     f"{shown}. uses the special topic `all`, which in EMQX matches "
-                    "$-prefixed topics too. mqttd's `#` does NOT match a $-topic, and "
-                    "$SYS is not implemented at all. `#` was used; if the rule existed to "
-                    "cover $-topics, it has no equivalent"
+                    "$-prefixed topics too. mqttd's `#` does NOT match a $-topic. `#` was "
+                    "used; if the rule existed to cover $-topics, it has no equivalent: "
+                    "mqttd's $SYS holds only opt-in rule statistics and trace, reached by an "
+                    "explicit $SYS/brokers/+/rules/# grant, and no client may publish there "
+                    "but a Mosquitto bridge, to $SYS/broker/connection/<id>/state"
                 )
                 converted.append("#")
                 continue

@@ -255,12 +255,17 @@ pub(super) enum AppendGate {
     /// refused durable copy is a counted drop and the live delivery still happens
     /// (issue #238).
     None,
+    /// Nobody is told, and nothing is kept: the broker's own `$SYS` messages (ADR 0084),
+    /// here or forwarded by the peer that published them. They go to the sessions
+    /// connected now; one that is not, a shared group's member included, gets nothing,
+    /// so a statistic is never appended, queued or replayed stale.
+    LiveOnly,
 }
 
 impl AppendGate {
     /// Whether SOMEBODY IS BEING TOLD about a refusal (the old `answerable` flag).
     pub(super) fn answerable(&self) -> bool {
-        !matches!(self, Self::None)
+        !matches!(self, Self::None | Self::LiveOnly)
     }
 
     /// The on-loop continuation a job submitted under this gate carries.
@@ -268,7 +273,7 @@ impl AppendGate {
         match self {
             Self::Pending(id) | Self::Replay(id) => AppendThen::Gate(*id),
             Self::Peer { node, seq, .. } => AppendThen::Peer(node.clone(), *seq),
-            Self::None => AppendThen::Ungated,
+            Self::None | Self::LiveOnly => AppendThen::Ungated,
         }
     }
 
@@ -303,7 +308,7 @@ impl AppendGate {
                 }),
                 *replay,
             ),
-            Self::Peer { origin: None, .. } | Self::None => (None, false),
+            Self::Peer { origin: None, .. } | Self::None | Self::LiveOnly => (None, false),
         }
     }
 }

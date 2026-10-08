@@ -68,7 +68,8 @@ pub(crate) struct RepublishSpec {
 /// A message an action asks the broker to publish.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Republish {
-    /// Destination topic (validated: no wildcards, not empty, not `$share/…`).
+    /// Destination topic (validated: no wildcards, not empty, not `$share/…`, not in the
+    /// broker's reserved `$SYS` tree).
     pub topic: String,
     /// The rendered payload.
     pub payload: Bytes,
@@ -199,6 +200,27 @@ pub(crate) fn parse_action(v: &toml::Value, warnings: &mut Vec<String>) -> Resul
     }
 }
 
+/// A republish's `topic` template, with a warning when every topic it renders is in
+/// `$SYS`: the action would then fail on every message (ADR 0084). A placeholder right
+/// after a bare `$SYS`, or on the way to a Mosquitto bridge's state, may or may not land
+/// on a reserved topic; only a certain refusal is worth one.
+fn republish_topic(s: &str, warnings: &mut Vec<String>) -> Result<Template, String> {
+    let t = Template::parse(s)?;
+    let prefix = t.literal_prefix();
+    let always = if t.is_literal() {
+        mqtt_core::is_reserved_topic(prefix)
+    } else {
+        mqtt_core::is_reserved_prefix(prefix)
+    };
+    if always {
+        warnings.push(format!(
+            "republish topic \"{s}\" is in $SYS, which is reserved for the broker: the \
+             action will fail on every message (ADR 0084)"
+        ));
+    }
+    Ok(t)
+}
+
 fn parse_republish(
     args: &toml::map::Map<String, toml::Value>,
     warnings: &mut Vec<String>,
@@ -218,7 +240,7 @@ fn parse_republish(
         }
     }
     let topic = match args.get("topic") {
-        Some(toml::Value::String(s)) if !s.is_empty() => Template::parse(s)?,
+        Some(toml::Value::String(s)) if !s.is_empty() => republish_topic(s, warnings)?,
         _ => return Err("republish needs a non-empty `topic`".into()),
     };
     let payload = match args.get("payload") {
@@ -312,6 +334,12 @@ impl RepublishSpec {
         if topic.starts_with("$share/") {
             return Err(EvalError::new(format!(
                 "rendered topic \"{topic}\" is a shared-subscription filter, not a topic"
+            )));
+        }
+        // Only the broker publishes in `$SYS` (ADR 0084): a rule cannot forge its stats.
+        if mqtt_core::is_reserved_topic(&topic) {
+            return Err(EvalError::new(format!(
+                "republish topic is reserved for the broker: {topic}"
             )));
         }
         let qos = qos_of(&resolve(&self.qos, out))?;

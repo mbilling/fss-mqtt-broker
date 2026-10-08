@@ -183,6 +183,23 @@ struct RuleResultLabel {
     result: String,
 }
 
+/// One rule's cumulative counts since the process started (ADR 0084), as
+/// `mqttd_rule_evaluations_total` and `mqttd_rule_actions_total` hold them; see
+/// [`Metrics::rule_counts`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RuleCounts {
+    /// Evaluations whose SQL produced output.
+    pub passed: u64,
+    /// Evaluations whose `WHERE` filtered the message out.
+    pub no_result: u64,
+    /// Evaluations whose SQL failed.
+    pub failed: u64,
+    /// Actions that ran: a console line logged, a republish routed.
+    pub actions_ok: u64,
+    /// Actions that failed: at render time, or a republish refused or not routed.
+    pub actions_failed: u64,
+}
+
 /// The OpenTelemetry mirror of every metric, recorded alongside the Prometheus handles
 /// so the same measurement is exported via OTLP (ADR 0020). Built from a real SDK meter
 /// when OTLP is enabled, or a no-op meter otherwise (then every record is a no-op).
@@ -649,7 +666,7 @@ impl Metrics {
         let publish_dropped_total = register_family(
             &mut registry,
             "publish_dropped",
-            "Messages dropped, by reason (no-subscriber, queue-overflow, backlog-overflow, outbound-full, outbound-id-write-failed, pending-cap, pending-cap-replay, settle-replay, settle-replay-refused, append-backlog-full, brownout, too-large, retained-replay-client-offline, retained-replay-read-failed)",
+            "Messages dropped, by reason (no-subscriber, queue-overflow, backlog-overflow, outbound-full, outbound-id-write-failed, pending-cap, pending-cap-replay, settle-replay, settle-replay-refused, append-backlog-full, brownout, too-large, retained-replay-client-offline, retained-replay-read-failed, reserved)",
         );
 
         // Issue #480: the fraction of publishes that cross a node boundary, which
@@ -984,7 +1001,8 @@ impl Metrics {
         let security_reloads_total = register_family(
             &mut registry,
             "security_reloads",
-            "Hot reloads of the security policy, by outcome (ok, rejected) and trigger (signal, watch)",
+            "Hot reloads of the security policy, by outcome (ok, rejected) and trigger (signal, watch, \
+             admin, admin-rules)",
         );
         let revocation_evictions_total = register_family(
             &mut registry,
@@ -2256,6 +2274,30 @@ impl Metrics {
         );
     }
 
+    /// One rule's counts so far (ADR 0084), read back from its two families without
+    /// creating a series: a rule that never matched has none, and still reads zeros.
+    /// Each lookup's read guard is dropped before the next is taken — the family lock
+    /// is not re-entrant while a writer waits, and an evaluation creating a series is
+    /// one.
+    #[must_use]
+    pub fn rule_counts(&self, rule: &str) -> RuleCounts {
+        let get = |family: &Family<RuleResultLabel, Counter>, result: &str| {
+            family
+                .get(&RuleResultLabel {
+                    rule: rule.to_string(),
+                    result: result.to_string(),
+                })
+                .map_or(0, |c| c.get())
+        };
+        RuleCounts {
+            passed: get(&self.rule_evaluations_total, "passed"),
+            no_result: get(&self.rule_evaluations_total, "no_result"),
+            failed: get(&self.rule_evaluations_total, "failed"),
+            actions_ok: get(&self.rule_actions_total, "ok"),
+            actions_failed: get(&self.rule_actions_total, "failed"),
+        }
+    }
+
     /// The rules now loaded (ADR 0083): how many are enabled, and the file's
     /// checksum (empty when no rules file is configured). The previous checksum's
     /// series is zeroed so exactly one reads 1 per node.
@@ -2662,7 +2704,45 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::Metrics;
+    use super::{Metrics, RuleCounts};
+
+    /// ADR 0084: the `$SYS` statistics read a rule's counts back without creating a
+    /// series, so "a rule with no series has never matched" (docs/RULES.md) stays true.
+    #[test]
+    fn rule_counts_read_back_without_creating_a_series() {
+        let m = Metrics::new("test");
+        assert_eq!(m.rule_counts("never"), RuleCounts::default());
+        assert!(
+            !m.render().contains("rule=\"never\""),
+            "reading a never-matched rule created a series:\n{}",
+            m.render()
+        );
+        for _ in 0..3 {
+            m.rule_evaluated("r", "passed");
+        }
+        m.rule_evaluated("r", "no_result");
+        m.rule_evaluated("r", "failed");
+        m.rule_evaluated("r", "failed");
+        for _ in 0..4 {
+            m.rule_action("r", "ok");
+        }
+        m.rule_action("r", "failed");
+        m.rule_evaluated("other", "passed");
+        assert_eq!(
+            m.rule_counts("r"),
+            RuleCounts {
+                passed: 3,
+                no_result: 1,
+                failed: 2,
+                actions_ok: 4,
+                actions_failed: 1,
+            }
+        );
+        assert!(
+            !m.render().contains("rule=\"never\""),
+            "still no series for the never-matched rule"
+        );
+    }
 
     #[test]
     fn render_produces_valid_openmetrics_exposition() {

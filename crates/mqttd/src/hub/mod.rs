@@ -148,6 +148,12 @@ const REHOME_CLOSES_PER_TICK: usize = 32;
 /// issue #92: a transient loss must not become a permanent divergence.
 const RETAINED_ANTIENTROPY_EVERY: u32 = 30;
 
+/// For how many sweep ticks after boot the purge of retained `$SYS/` leftovers (ADR 0084)
+/// looks again for a value it could not act on yet — under durable retained, one whose
+/// group owner this node did not know yet. About a minute; subscribe-time replay skips
+/// whatever is left either way.
+const RESERVED_PURGE_TICKS: u32 = 60;
+
 /// How many sweep ticks between reconciling persisted expiry deadlines from the durable
 /// store (ADR 0009 §3). This inherits deadlines for sessions a takeover handed this node
 /// without seeing their disconnect; takeover is rare and the scan is O(owned sessions), so
@@ -1257,6 +1263,27 @@ pub enum HubCommand {
     /// no pending-publish entry and can never crowd a client's out — and its action is
     /// counted by the result: `ok` when the hub routed it, `failed` when it refused it.
     RuleDerived(Box<DerivedPublish>),
+    /// A message the broker itself publishes in its reserved `$SYS/` tree (ADR 0084): the
+    /// ONLY command allowed to route a topic there. `QoS` 0, never retained, no publisher,
+    /// no acknowledgement gate, content type `application/json`. Every other path that
+    /// could carry a `$SYS` topic in — a client publish, a Will, a rule's republish, a
+    /// restore, a peer's forward of anything but the peer's own statistics — drops it
+    /// (`mqttd_publish_dropped_total{reason="reserved"}`).
+    ///
+    /// Live only: it reaches the sessions connected now, here and on peers, and is never
+    /// queued for one that is not, a shared group's offline member included.
+    SysPublish {
+        /// Destination topic, in `$SYS/`.
+        topic: String,
+        /// The JSON document.
+        payload: Bytes,
+        /// Its Message Expiry Interval, in seconds. Nothing here queues it, but a peer
+        /// that predates live-only `$SYS` delivery (a rolling upgrade) may, and the copy
+        /// then expires instead of replaying stale.
+        message_expiry: u32,
+        /// Node-pool credit taken for it (ADR 0082), held until it is dispatched.
+        credit: Option<crate::ingress::IngressPermit>,
+    },
     /// Write one **restored** retained value as retained state (ADR 0062, issue #249):
     /// commit it through the topic's group lease-owner and warm the caches, with **no
     /// ordinary fan-out to subscribers**.
@@ -1766,6 +1793,7 @@ impl HubCommand {
             Self::Publish { .. }
             | Self::PublishBatch(_)
             | Self::RuleDerived(_)
+            | Self::SysPublish { .. }
             | Self::RemotePublish { .. }
             | Self::RemotePublishAcked { .. }
             | Self::RemoteSharedDeliver { .. }
@@ -1807,6 +1835,7 @@ impl HubCommand {
             Self::Publish { .. }
             | Self::PublishBatch(_)
             | Self::RuleDerived(_)
+            | Self::SysPublish { .. }
             | Self::AppendDone { .. }
             | Self::PkidBlockReserved { .. } => "publish",
             Self::PubAck { .. }
@@ -2248,6 +2277,9 @@ pub struct Hub {
     /// none. Keeps the per-tick reap pay-for-use: a broker with no expiring
     /// retained values (every v3.1.1 deployment) never scans.
     retained_may_expire: bool,
+    /// Sweep ticks left in which the boot purge of retained `$SYS/` leftovers looks
+    /// again (ADR 0084); see [`purge_reserved_retained`](Self::purge_reserved_retained).
+    reserved_purge_ticks: u32,
     /// Retained mutations awaiting their authority commit (ADR 0037 §5), in arrival
     /// order: every mutation passes through here, so commits are **serialized per
     /// node** (one in flight at a time — two rapid publishes to one topic can never
@@ -2510,6 +2542,23 @@ fn qos_num(qos: QoS) -> u8 {
     }
 }
 
+/// Whether `cmd` is a [`HubCommand::Publish`] into the broker's reserved `$SYS/` tree,
+/// which only [`HubCommand::SysPublish`] may route (ADR 0084).
+fn reserved_publish(cmd: &HubCommand) -> bool {
+    matches!(cmd, HubCommand::Publish { topic, .. } if mqtt_core::is_reserved_topic(topic))
+}
+
+/// The gate a peer's plain (unanswered) forward of `topic` is delivered under. One in
+/// `$SYS/` that passed [`Hub::peer_reserved_refused`] is the peer's own statistics or
+/// trace, and is live only here as it is on the peer ([`AppendGate::LiveOnly`]).
+fn peer_plain_gate(topic: &str) -> AppendGate {
+    if mqtt_core::is_reserved_topic(topic) {
+        AppendGate::LiveOnly
+    } else {
+        AppendGate::None
+    }
+}
+
 /// Per-chunk byte budget for a retained-snapshot frame (0014-T8): well under the peer
 /// frame limit (16 MiB, `mqtt_cluster::peer`), with headroom for codec framing — a
 /// frame at the limit would be rejected by the receiver and tear down the link.
@@ -2668,6 +2717,7 @@ impl Hub {
                 retained_digest_matched_at: HashMap::new(),
                 retained_tombstone_observed_at: HashMap::new(),
                 retained_may_expire: false,
+                reserved_purge_ticks: RESERVED_PURGE_TICKS,
                 retained_queue: VecDeque::new(),
                 retained_routed_queue: VecDeque::new(),
                 retained_routed_turn: false,
@@ -3033,6 +3083,10 @@ impl Hub {
         // or quorum returning on links that never dropped. No-ops when idle.
         self.retry_retained_handoff();
         self.kick_retained_queue();
+        // Retained `$SYS/` leftovers go, during the first minute after boot (ADR 0084).
+        if self.reserved_purge_ticks > 0 {
+            self.purge_reserved_retained().await;
+        }
         // Retransmit / re-route acked publish forwards (ADR 0042 T9,
         // exhibit ⑤); no-op when none are pending.
         self.sweep_pending_forwards();
@@ -3143,10 +3197,12 @@ impl Hub {
                 } in derived
                 {
                     // Counted before it is routed, so a subscriber never sees a
-                    // message its action has not counted yet.
+                    // message its action has not counted yet. One in `$SYS` is
+                    // dropped below (ADR 0084), so it counts as failed.
                     if !gated {
+                        let ok = routed && !reserved_publish(&publish);
                         if let Some(m) = &self.metrics {
-                            m.rule_action(&rule, if routed { "ok" } else { "failed" });
+                            m.rule_action(&rule, if ok { "ok" } else { "failed" });
                         }
                     }
                     // Not routed: the command is dropped, its gate (if any) closes, and
@@ -3182,6 +3238,34 @@ impl Hub {
                     m.rule_action(&rule, if routed { "ok" } else { "failed" });
                 }
             }
+            HubCommand::SysPublish {
+                topic,
+                payload,
+                message_expiry,
+                credit,
+            } => {
+                let app = AppProperties {
+                    payload_format: Some(1),
+                    content_type: Some("application/json".to_string()),
+                    ..AppProperties::default()
+                };
+                self.route_publish(
+                    HubCommand::Publish {
+                        topic,
+                        payload,
+                        qos: QoS::AtMostOnce,
+                        retain: false,
+                        message_expiry: Some(message_expiry),
+                        app,
+                        done: None,
+                        v5: false,
+                        publisher: None,
+                        credit,
+                    },
+                    true,
+                )
+                .await;
+            }
             HubCommand::RestoreRetained {
                 topic,
                 payload,
@@ -3190,8 +3274,18 @@ impl Hub {
                 app,
                 done,
             } => {
-                self.restore_retained(topic, payload, qos, message_expiry, app, done)
-                    .await;
+                // A backup taken before ADR 0084 can hold a retained `$SYS` value a client
+                // wrote; restored, it would be a forged statistic no client could clear.
+                // Skipped and answered as done, so the rest of the restore goes on.
+                if mqtt_core::is_reserved_topic(&topic) {
+                    warn!(topic = %topic,
+                          "restore: skipped a retained value in the broker-reserved $SYS/ tree (ADR 0084)");
+                    self.count_reserved_drop();
+                    let _ = done.send(PublishOutcome::Accepted);
+                } else {
+                    self.restore_retained(topic, payload, qos, message_expiry, app, done)
+                        .await;
+                }
             }
             HubCommand::RetainedExportSnapshot { done } => {
                 let snapshot = self.retained_export_snapshot().await;
@@ -3250,11 +3344,61 @@ impl Hub {
     /// Route one publish: a client's, or a message its rules derived. Returns whether
     /// messages derived from it may follow it into the fan-out (ADR 0083).
     ///
+    /// A topic in the broker's reserved `$SYS/` tree is dropped and counted here, on
+    /// every path but [`HubCommand::SysPublish`] (ADR 0084): the connection refuses a
+    /// client's and the rule engine a republish's before they get this far, so one
+    /// reaching the hub is a bug this keeps from becoming a forged statistic. Nothing
+    /// follows it, and a gate it carried closes unanswered.
+    async fn dispatch_publish(&mut self, cmd: HubCommand) -> bool {
+        if reserved_publish(&cmd) {
+            if let HubCommand::Publish { topic, .. } = &cmd {
+                warn!(topic = %topic, "a publish into the broker-reserved $SYS/ tree reached the hub; dropped (ADR 0084)");
+            }
+            self.count_reserved_drop();
+            return false;
+        }
+        self.route_publish(cmd, false).await
+    }
+
+    /// Count a message dropped because its topic is in the broker's reserved `$SYS/`
+    /// tree (ADR 0084).
+    fn count_reserved_drop(&self) {
+        if let Some(m) = &self.metrics {
+            m.publish_dropped("reserved");
+        }
+    }
+
+    /// Whether a peer's forward of `topic` is refused here because it is in `$SYS/` and
+    /// cannot be the peer's own statistics (ADR 0084): those are `QoS` 0, never retained,
+    /// and name the peer — never this node, which speaks for itself. Anything else in
+    /// `$SYS/` is a client's publish accepted by a node that predates the reservation (a
+    /// rolling upgrade's window), and it is dropped and counted.
+    fn peer_reserved_refused(&self, topic: &str, qos: QoS, retain: bool) -> bool {
+        if !mqtt_core::is_reserved_topic(topic) {
+            return false;
+        }
+        let own = topic
+            .strip_prefix("$SYS/brokers/")
+            .and_then(|rest| rest.strip_prefix(self.node_id.0.as_str()))
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'));
+        let refused = retain || qos != QoS::AtMostOnce || own;
+        if refused {
+            debug!(topic = %topic, retain, qos = qos_num(qos),
+                   "a peer forwarded a $SYS/ message that is not its own statistics; dropped (ADR 0084)");
+            self.count_reserved_drop();
+        }
+        refused
+    }
+
+    /// [`dispatch_publish`](Self::dispatch_publish) without the `$SYS/` guard: what every
+    /// publish, and the broker's own [`HubCommand::SysPublish`], is routed through.
+    ///
     /// The body is the `Publish` arm of [`dispatch`](Self::dispatch), moved verbatim so
     /// a [`HubCommand::PublishBatch`] routes its original and its derived messages
-    /// through exactly the same on-loop decision.
+    /// through exactly the same on-loop decision. `live_only` is set for the broker's
+    /// own `$SYS` messages ([`AppendGate::LiveOnly`]).
     #[allow(clippy::too_many_lines)]
-    async fn dispatch_publish(&mut self, cmd: HubCommand) -> bool {
+    async fn route_publish(&mut self, cmd: HubCommand, live_only: bool) -> bool {
         let HubCommand::Publish {
             topic,
             payload,
@@ -3270,7 +3414,7 @@ impl Hub {
             credit: _credit,
         } = cmd
         else {
-            debug_assert!(false, "dispatch_publish routes Publish commands only");
+            debug_assert!(false, "route_publish routes Publish commands only");
             return false;
         };
         if let Some(m) = &self.metrics {
@@ -3343,6 +3487,7 @@ impl Hub {
                 &app,
                 gate,
                 publisher.as_ref(),
+                live_only,
             )
             .await;
         if let Some(m) = &self.metrics {
@@ -3406,6 +3551,13 @@ impl Hub {
                     seq,
                     forwarding::forward_fingerprint(None, &topic, &payload),
                 ) {
+                    return;
+                }
+                // A client's `$SYS/` publish accepted by a node that predates ADR 0084:
+                // delivered nowhere, and answered as stored — as a v3.1.1 publish the ACL
+                // denies is acked — since a retry could never change the answer.
+                if self.peer_reserved_refused(&topic, qos, retain) {
+                    self.finish_peer_verdict(&node, seq, DurableOutcome::Ok, false, false);
                     return;
                 }
                 // An acked forward (ADR 0042 T9, exhibit ⑤): apply locally like
@@ -3492,6 +3644,12 @@ impl Hub {
                 ) {
                     return;
                 }
+                // As for `RemotePublishAcked`: an older node's client publish in `$SYS/`
+                // reaches nobody, and is answered as stored (ADR 0084).
+                if self.peer_reserved_refused(&topic, qos, false) {
+                    self.finish_peer_verdict(&node, seq, DurableOutcome::Ok, false, false);
+                    return;
+                }
                 // The answerable form of `RemoteSharedDeliver` (0041-T12, issue #238):
                 // the outcome is no longer discarded. A gated cross-node shared delivery
                 // is durability-gated on the OWNING node and answered, so the origin can
@@ -3539,6 +3697,12 @@ impl Hub {
                 // Unanswerable: no publisher and no peer awaits an answer to a plain
                 // `Publish` forward, so a refused durable copy must not cost the live
                 // delivery (issue #238).
+                //
+                // In `$SYS/`, only the peer's own statistics are delivered (ADR 0084), and
+                // live only, as on the peer that published them.
+                if self.peer_reserved_refused(&topic, qos, retain) {
+                    return;
+                }
                 let _ = self
                     .deliver(
                         &topic,
@@ -3548,7 +3712,7 @@ impl Hub {
                         message_expiry,
                         &app,
                         None,
-                        &AppendGate::None,
+                        &peer_plain_gate(&topic),
                     )
                     .await;
             }
@@ -3813,6 +3977,12 @@ impl Hub {
                 // truth, and it is what keeps the live send when the durable copy is
                 // refused: nobody will be told and nobody will retry, so suppressing the
                 // delivery would destroy the message rather than defer it.
+                //
+                // In `$SYS/`, only the peer's own statistics are delivered (ADR 0084), and
+                // live only, as on the peer that published them.
+                if self.peer_reserved_refused(&topic, qos, false) {
+                    return;
+                }
                 let _ = self.deliver_to_client(
                     &client,
                     &topic,
@@ -3821,7 +3991,7 @@ impl Hub {
                     message_expiry,
                     &app,
                     false,
-                    &AppendGate::None,
+                    &peer_plain_gate(&topic),
                 );
             }
             // Client/session commands are handled in `dispatch`; they never route here.
@@ -3836,6 +4006,9 @@ impl Hub {
     /// dispatch then withholds the publisher's ack (ADR 0041 T5) — or was refused
     /// under a stated policy, which the dispatch turns into a reason the publisher
     /// is told (0041-T11, issue #238).
+    ///
+    /// `live_only` delivers to connected sessions only ([`AppendGate::LiveOnly`]), for
+    /// the broker's own `$SYS` messages; such a publish is never gated.
     #[allow(clippy::too_many_arguments)]
     async fn publish(
         &mut self,
@@ -3847,6 +4020,7 @@ impl Hub {
         app: &AppProperties,
         gate: Option<u64>,
         publisher: Option<&ClientId>,
+        live_only: bool,
     ) -> DurableOutcome {
         // PLAN, then COMMIT (issue #238). A refusal must be EFFECT-FREE, so it is
         // decided before the first side effect of the whole publish — before
@@ -3854,7 +4028,15 @@ impl Hub {
         // `forward_to_peers`, before `route_retained_commit`. The SHARED half is
         // planned here because `deliver` cannot see it, and it is peeked rather than
         // selected so a refused publish does not consume a group member's turn.
-        let append_gate = gate.map_or(AppendGate::None, AppendGate::Pending);
+        debug_assert!(
+            !live_only || gate.is_none(),
+            "a live-only publish is never gated"
+        );
+        let append_gate = if live_only {
+            AppendGate::LiveOnly
+        } else {
+            gate.map_or(AppendGate::None, AppendGate::Pending)
+        };
         // `plan_refusal(true)` can only ever be Brownout, so the shared peek — a
         // full plan of every matching group, measured at ~26% of the hub loop's
         // publish dispatch with the durable plane OFF — is only worth computing
@@ -3896,7 +4078,7 @@ impl Hub {
         // signature is real; its consumer is item 2.1's `pending_fan_out_reached`
         // call, which Zone HUB adds beside it.
         let (shared_durable, shared_placed) =
-            self.deliver_shared(topic, payload, qos, message_expiry, app, gate);
+            self.deliver_shared(topic, payload, qos, message_expiry, app, gate, live_only);
         durable = durable.and(shared_durable);
         // Issue #613 item 2.1. The settle window's claim on this publish's ACK is
         // decided HERE, against what the fan-out actually found, instead of at
@@ -3951,10 +4133,19 @@ impl Hub {
     /// the rules produce is posted back as ordinary publishes — through the same
     /// dispatch (quota checks included) as any other, ungated like the Will, each
     /// counted as it is routed or refused ([`HubCommand::RuleDerived`]).
+    ///
+    /// A Will in the broker's reserved `$SYS/` tree is refused at CONNECT; one that got
+    /// here anyway is dropped and counted, rules and all (ADR 0084).
     async fn publish_will(&mut self, client: &ClientId, will: &Will) {
         let w = &will.message;
+        if mqtt_core::is_reserved_topic(&w.topic) {
+            warn!(client = %client.0, topic = %w.topic,
+                  "a Will in the broker-reserved $SYS/ tree reached the hub; dropped (ADR 0084)");
+            self.count_reserved_drop();
+            return;
+        }
         self.publish(
-            &w.topic, &w.payload, w.qos, w.retain, None, &w.app, None, None,
+            &w.topic, &w.payload, w.qos, w.retain, None, &w.app, None, None, false,
         )
         .await;
         let Some(rules) = &self.rules else { return };
@@ -4752,8 +4943,12 @@ impl Hub {
                     let now = self.clock.now_epoch_secs();
                     for m in matching {
                         // An expired retained copy is not replayed [MQTT-3.3.2-5];
-                        // the GC sweep reaps it (issue #227).
-                        if m.expires_at.is_some_and(|d| d <= now) {
+                        // the GC sweep reaps it (issue #227). Nor is one in `$SYS/`:
+                        // the broker retains nothing there, so it is a leftover the
+                        // boot purge removes (or another node owns and will) — ADR 0084.
+                        if m.expires_at.is_some_and(|d| d <= now)
+                            || mqtt_core::is_reserved_topic(&m.topic)
+                        {
                             continue;
                         }
                         window_seeds.push((
@@ -15116,6 +15311,44 @@ mod tests {
         );
     }
 
+    /// ADR 0084: a committed retained value in `$SYS/` from an owner that predates the
+    /// reservation does not reach a fresh subscriber through the window either, just as the
+    /// subscribe replay never hands one out. A Mosquitto bridge's state topic is not
+    /// reserved, so its commit is delivered.
+    #[tokio::test]
+    async fn a_windowed_commit_in_sys_is_never_delivered() {
+        let (tx, _durable, _placement) = start_hub_with_durable_retained(&[]);
+        let (mut sub, _) = attach(&tx, "fresh", 1, true).await;
+        subscribe(&tx, "fresh", "$SYS/#");
+        for (topic, payload) in [
+            ("$SYS/brokers/node-a/rules", &b"forged"[..]),
+            ("$SYS/broker/connection/edge-1/state", &b"1"[..]),
+        ] {
+            tx.send(HubCommand::RemoteRetainedUpdate {
+                topic: topic.into(),
+                payload: Bytes::copy_from_slice(payload),
+                qos: 0,
+                epoch: 1,
+                offset: 1,
+                app: AppProperties::default(),
+                expires_at: None,
+            })
+            .unwrap();
+        }
+        let p = recv_packet(&mut sub)
+            .await
+            .expect("the bridge's state is not reserved, so its commit is delivered");
+        assert_eq!(
+            payload_of(&p),
+            b"1",
+            "the reserved commit must not come first"
+        );
+        assert!(
+            recv_packet(&mut sub).await.is_none(),
+            "nothing in the reserved tree is delivered"
+        );
+    }
+
     /// Issue #219 acceptance, case 2: the landing node DID know the fresh
     /// subscriber (interest arrived in time) and forwarded the live copy — the
     /// fan-out applying afterwards must not deliver the same value again. The
@@ -21167,6 +21400,461 @@ mod tests {
         assert!(
             !flag.load(Ordering::Relaxed),
             "a rollback restores the voter domain"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // ADR 0084: `$SYS/` is the broker's. Only `SysPublish` routes a topic there;
+    // every other path drops it and counts it as `reason="reserved"`.
+    // -----------------------------------------------------------------------
+
+    fn reserved_drops(metrics: &mqtt_observability::metrics::Metrics) -> u64 {
+        metrics
+            .render()
+            .lines()
+            .find_map(|l| {
+                l.strip_prefix("mqttd_publish_dropped_total{reason=\"reserved\"} ")?
+                    .parse()
+                    .ok()
+            })
+            .unwrap_or(0)
+    }
+
+    fn plain_publish(topic: &str, qos: QoS, retain: bool) -> HubCommand {
+        HubCommand::Publish {
+            topic: topic.into(),
+            payload: Bytes::from_static(b"forged"),
+            qos,
+            retain,
+            message_expiry: None,
+            app: AppProperties::default(),
+            done: None,
+            v5: false,
+            publisher: None,
+            credit: None,
+        }
+    }
+
+    /// A hub with metrics and a subscriber `watcher` on `$SYS/#`.
+    async fn sys_watching_hub() -> (
+        HubTx,
+        Arc<mqtt_observability::metrics::Metrics>,
+        mpsc::UnboundedReceiver<Box<Packet>>,
+    ) {
+        let metrics = Arc::new(mqtt_observability::metrics::Metrics::new("t"));
+        let (mut hub, tx) = Hub::with_config(
+            NodeId("hub-test".into()),
+            Arc::new(MemorySessionStore::new()),
+        );
+        hub.attach_metrics(metrics.clone());
+        tokio::spawn(hub.run());
+        let (watcher, _) = attach(&tx, "watcher", 1, true).await;
+        subscribe(&tx, "watcher", "$SYS/#");
+        (tx, metrics, watcher)
+    }
+
+    /// The next deliveries to `rx` are exactly `expected` (topic, payload), each `QoS` 0
+    /// and not retained, and then nothing.
+    async fn expect_only(
+        rx: &mut mpsc::UnboundedReceiver<Box<Packet>>,
+        expected: &[(&str, &[u8])],
+    ) {
+        for (topic, payload) in expected {
+            match recv_packet(rx).await {
+                Some(Packet::Publish(p)) => {
+                    assert_eq!((p.topic.as_str(), &p.payload[..]), (*topic, *payload));
+                    assert!(!p.retain);
+                    assert_eq!(p.qos, QoS::AtMostOnce);
+                }
+                other => panic!("expected {topic}, got {other:?}"),
+            }
+        }
+        assert!(recv_packet(rx).await.is_none(), "nothing else reached $SYS");
+    }
+
+    /// On this node, every path but `SysPublish` drops a `$SYS/` topic: a publish, a
+    /// batch's original (and so its derived message) and a batch's derived message, an
+    /// event's derived message, and a Will. The broker's own publish is delivered —
+    /// first, since the data lane is FIFO and everything before it was dropped.
+    #[tokio::test]
+    async fn only_the_brokers_own_publish_routes_a_sys_topic() {
+        let (tx, metrics, mut watcher) = sys_watching_hub().await;
+        let (_dying, _) = attach_with_will(
+            &tx,
+            "dying",
+            2,
+            true,
+            Message::new(
+                "$SYS/brokers/hub-test/rules".into(),
+                Bytes::new(),
+                QoS::AtMostOnce,
+                false,
+            ),
+        )
+        .await;
+        let batch = |original, derived| {
+            HubCommand::PublishBatch(Box::new(super::PublishBatch {
+                original,
+                derived: vec![super::DerivedPublish {
+                    rule: Arc::from("r"),
+                    publish: derived,
+                    gated: false,
+                }],
+                credit: None,
+                derived_credit: None,
+            }))
+        };
+        for cmd in [
+            plain_publish("$SYS/brokers/hub-test/rules", QoS::AtMostOnce, false),
+            // Dropped, and its derived message is not routed behind it.
+            batch(
+                plain_publish("$SYS/x", QoS::AtMostOnce, false),
+                plain_publish("ok/t", QoS::AtMostOnce, false),
+            ),
+            // The original goes; its derived message in `$SYS` does not.
+            batch(
+                plain_publish("ok/t", QoS::AtMostOnce, false),
+                plain_publish("$SYS/y", QoS::AtMostOnce, false),
+            ),
+            HubCommand::RuleDerived(Box::new(super::DerivedPublish {
+                rule: Arc::from("r"),
+                publish: plain_publish("$SYS/z", QoS::AtMostOnce, false),
+                gated: false,
+            })),
+            // The Will fires on an ungraceful end.
+            HubCommand::Detach {
+                client: ClientId("dying".into()),
+                conn_id: 2,
+                graceful: false,
+                session_expiry_override: None,
+            },
+            HubCommand::SysPublish {
+                topic: "$SYS/brokers/hub-test/rules".into(),
+                payload: Bytes::from_static(b"{\"rules\":0}"),
+                message_expiry: 10,
+                credit: None,
+            },
+        ] {
+            tx.send(cmd).unwrap();
+        }
+        expect_only(
+            &mut watcher,
+            &[("$SYS/brokers/hub-test/rules", b"{\"rules\":0}")],
+        )
+        .await;
+        assert_eq!(reserved_drops(&metrics), 5);
+        let rendered = metrics.render();
+        assert!(
+            rendered.contains("mqttd_rule_actions_total{rule=\"r\",result=\"failed\"} 3"),
+            "the derived message behind a dropped original, the one in $SYS and the \
+             event's are failed actions:\n{rendered}"
+        );
+    }
+
+    /// A peer's forward in `$SYS/` is delivered only when it can be the peer's own
+    /// statistics: `QoS` 0, not retained, and not naming THIS node (which speaks for
+    /// itself). Anything else is a client's publish accepted by a node that predates the
+    /// reservation: dropped and counted — an acked one answered as stored, since a
+    /// retry could not change it.
+    #[tokio::test]
+    async fn a_peer_forwards_only_its_own_statistics_into_sys() {
+        let (tx, metrics, mut watcher) = sys_watching_hub().await;
+        let mut origin = connect_peer_at_proto(&tx, "origin", 1, super::PROTO_FORWARD_REACHED);
+        let remote = |topic: &str, qos, retain, payload: &'static [u8]| HubCommand::RemotePublish {
+            topic: topic.into(),
+            payload: Bytes::from_static(payload),
+            qos,
+            retain,
+            message_expiry: None,
+            app: AppProperties::default(),
+            credit: None,
+        };
+        let shared = |topic: &str, payload: &'static [u8]| HubCommand::RemoteSharedDeliver {
+            client: ClientId("watcher".into()),
+            topic: topic.into(),
+            payload: Bytes::from_static(payload),
+            qos: QoS::AtMostOnce,
+            message_expiry: None,
+            app: AppProperties::default(),
+            credit: None,
+        };
+        for cmd in [
+            remote(
+                "$SYS/brokers/origin/rules",
+                QoS::AtMostOnce,
+                true,
+                b"forged",
+            ),
+            remote(
+                "$SYS/brokers/origin/rules",
+                QoS::AtLeastOnce,
+                false,
+                b"forged",
+            ),
+            remote(
+                "$SYS/brokers/hub-test/rules",
+                QoS::AtMostOnce,
+                false,
+                b"forged",
+            ),
+            remote("$SYS/brokers/hub-test", QoS::AtMostOnce, false, b"forged"),
+            shared("$SYS/brokers/hub-test/rules/r", b"forged"),
+            HubCommand::RemotePublishAcked {
+                node: NodeId("origin".into()),
+                seq: 1,
+                topic: "$SYS/brokers/origin/rules".into(),
+                payload: Bytes::from_static(b"forged"),
+                qos: QoS::AtLeastOnce,
+                retain: false,
+                message_expiry: None,
+                app: AppProperties::default(),
+                origin: None,
+                replay: false,
+            },
+            // The peer's own statistics, plainly and to a shared subscriber.
+            remote("$SYS/brokers/origin/rules", QoS::AtMostOnce, false, b"peer"),
+            remote(
+                "$SYS/brokers/hub-testing/rules",
+                QoS::AtMostOnce,
+                false,
+                b"near",
+            ),
+            shared("$SYS/brokers/origin/rules/r", b"peer-shared"),
+        ] {
+            tx.send(cmd).unwrap();
+        }
+        match next_forward_answer(&mut origin).await {
+            PeerMessage::PublishVerdict { seq, verdict } => {
+                assert_eq!((seq, verdict), (1, ForwardVerdict::Stored));
+            }
+            other => panic!("expected a PublishVerdict, got {other:?}"),
+        }
+        expect_only(
+            &mut watcher,
+            &[
+                ("$SYS/brokers/origin/rules", b"peer"),
+                ("$SYS/brokers/hub-testing/rules", b"near"),
+                ("$SYS/brokers/origin/rules/r", b"peer-shared"),
+            ],
+        )
+        .await;
+        assert_eq!(reserved_drops(&metrics), 6);
+    }
+
+    /// The broker's own `$SYS` messages are live only, and so is a peer's forward of its
+    /// own: a persistent session offline across them gets none on reconnect and none is
+    /// appended to its queue, an offline shared-group member gets none either, and a
+    /// connected subscriber gets every one, with its Message Expiry Interval. An ordinary
+    /// message published after them still queues: the barrier that shows nothing in
+    /// `$SYS` was queued before it.
+    #[tokio::test]
+    async fn sys_statistics_are_never_queued_for_an_offline_session() {
+        const TICKS: usize = 5;
+        let store = Arc::new(MemorySessionStore::new());
+        let (hub, tx) = Hub::with_config(NodeId("hub-test".into()), store.clone());
+        tokio::spawn(hub.run());
+        let (mut online, _) = attach(&tx, "online", 1, true).await;
+        subscribe(&tx, "online", "$SYS/#");
+        let (_p, _) = attach_v5(&tx, "persistent", 2, false, 3600).await;
+        subscribe(&tx, "persistent", "$SYS/brokers/+/rules/#");
+        subscribe(&tx, "persistent", "plain/t");
+        let (_m, _) = attach_v5(&tx, "member", 3, false, 3600).await;
+        subscribe(&tx, "member", "$share/g/$SYS/brokers/#");
+        subscribe(&tx, "member", "plain/t");
+        detach(&tx, "persistent", 2);
+        detach(&tx, "member", 3);
+
+        for tick in 0..TICKS {
+            tx.send(HubCommand::SysPublish {
+                topic: format!("$SYS/brokers/hub-test/rules/r{tick}"),
+                payload: Bytes::from_static(b"{}"),
+                message_expiry: 10,
+                credit: None,
+            })
+            .unwrap();
+        }
+        tx.send(HubCommand::RemotePublish {
+            topic: "$SYS/brokers/origin/rules".into(),
+            payload: Bytes::from_static(b"{}"),
+            qos: QoS::AtMostOnce,
+            retain: false,
+            message_expiry: Some(10),
+            app: AppProperties::default(),
+            credit: None,
+        })
+        .unwrap();
+        tx.send(HubCommand::RemoteSharedDeliver {
+            client: ClientId("member".into()),
+            topic: "$SYS/brokers/origin/rules/r".into(),
+            payload: Bytes::from_static(b"{}"),
+            qos: QoS::AtMostOnce,
+            message_expiry: Some(10),
+            app: AppProperties::default(),
+            credit: None,
+        })
+        .unwrap();
+        publish(&tx, "plain/t", b"after");
+
+        for tick in 0..TICKS {
+            let p = recv_packet(&mut online).await.expect("a live $SYS message");
+            let topic = format!("$SYS/brokers/hub-test/rules/r{tick}");
+            assert!(
+                matches!(&p, Packet::Publish(p) if p.topic == topic),
+                "{p:?}"
+            );
+            assert_eq!(message_expiry_of(&p), Some(10));
+        }
+        let p = recv_packet(&mut online).await.expect("the peer's message");
+        assert_eq!(message_expiry_of(&p), Some(10));
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        for client in ["persistent", "member"] {
+            let queued = loop {
+                let queued: Vec<String> = store
+                    .pending(&ClientId(client.into()), 0, 64)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|q| q.message.topic)
+                    .collect();
+                if !queued.is_empty() || Instant::now() > deadline {
+                    break queued;
+                }
+                tokio::task::yield_now().await;
+            };
+            assert_eq!(
+                queued,
+                ["plain/t"],
+                "{client}: nothing in $SYS was appended"
+            );
+        }
+        for (conn_id, client) in [(4, "persistent"), (5, "member")] {
+            let (mut rx, present) = attach_v5(&tx, client, conn_id, false, 3600).await;
+            assert!(present, "{client}");
+            assert_eq!(payload_of(&recv_packet(&mut rx).await.unwrap()), b"after");
+            assert!(
+                recv_packet(&mut rx).await.is_none(),
+                "{client}: nothing stale"
+            );
+        }
+    }
+
+    /// A backup taken before the reservation can hold a client's retained `$SYS` value:
+    /// the restore skips it (counted) and answers as done, so the rest of the import
+    /// goes on.
+    #[tokio::test]
+    async fn a_restore_skips_a_retained_sys_value_and_goes_on() {
+        let metrics = Arc::new(mqtt_observability::metrics::Metrics::new("t"));
+        let (mut hub, tx) = Hub::with_config(
+            NodeId("hub-test".into()),
+            Arc::new(MemorySessionStore::new()),
+        );
+        hub.attach_metrics(metrics.clone());
+        tokio::spawn(hub.run());
+        assert_eq!(
+            restore_retained(&tx, "$SYS/brokers/hub-test/rules", b"forged").await,
+            PublishOutcome::Accepted
+        );
+        assert_eq!(
+            restore_retained(&tx, "kept/t", b"v").await,
+            PublishOutcome::Accepted
+        );
+        assert_eq!(reserved_drops(&metrics), 1);
+        assert!(retained_replay(&tx, "c1", "$SYS/brokers/hub-test/rules")
+            .await
+            .is_none());
+        assert_eq!(retained_replay(&tx, "c2", "kept/t").await.unwrap(), b"v");
+    }
+
+    /// Retained `$SYS` values written before the reservation are removed at boot, and
+    /// nothing else is (durable retained off: a local delete) — a Mosquitto bridge's
+    /// state included, which is not reserved.
+    #[tokio::test]
+    async fn retained_sys_leftovers_are_purged_at_boot() {
+        use mqtt_storage::RetainedStore as _;
+        let retained = Arc::new(mqtt_storage::MemoryRetainedStore::new());
+        for topic in [
+            "$SYS/brokers/hub-test/rules",
+            "$SYS",
+            "kept/t",
+            "$sys/x",
+            "$SYS/broker/connection/edge-1/state",
+        ] {
+            retained
+                .set(&Message::new(
+                    topic.into(),
+                    Bytes::from_static(b"v"),
+                    QoS::AtMostOnce,
+                    true,
+                ))
+                .await
+                .unwrap();
+        }
+        let (mut hub, tx) = Hub::with_config(
+            NodeId("hub-test".into()),
+            Arc::new(MemorySessionStore::new()),
+        );
+        hub.attach_retained_store(retained.clone());
+        tokio::spawn(hub.run());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let held = loop {
+            let mut held: Vec<String> = retained
+                .all()
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|m| m.topic)
+                .collect();
+            held.sort();
+            if held.len() == 3 || Instant::now() > deadline {
+                break held;
+            }
+            tokio::task::yield_now().await;
+        };
+        assert_eq!(
+            held,
+            ["$SYS/broker/connection/edge-1/state", "$sys/x", "kept/t"],
+            "only the reserved values go"
+        );
+        drop(tx);
+    }
+
+    /// A retained `$SYS` value this node does not own (durable retained: another
+    /// group's, cleared by its owner) is never replayed to a subscriber meanwhile. A
+    /// Mosquitto bridge's state is not reserved, and is.
+    #[tokio::test]
+    async fn a_retained_sys_value_is_never_replayed() {
+        let (tx, _durable, _placement) = start_hub_with_durable_retained(&[]);
+        for (topic, offset) in [
+            ("$SYS/brokers/elsewhere/rules", 1),
+            ("plain/t", 2),
+            ("$SYS/broker/connection/edge-1/state", 3),
+        ] {
+            tx.send(HubCommand::RemoteRetainedUpdate {
+                topic: topic.into(),
+                payload: Bytes::from_static(b"v"),
+                qos: 0,
+                epoch: 1,
+                offset,
+                app: AppProperties::default(),
+                expires_at: None,
+            })
+            .unwrap();
+        }
+        assert_eq!(retained_replay(&tx, "c1", "plain/t").await.unwrap(), b"v");
+        assert!(retained_replay(&tx, "c2", "$SYS/brokers/#").await.is_none());
+        let (mut rx, _) = attach(&tx, "c3", 99, true).await;
+        subscribe(&tx, "c3", "$SYS/#");
+        match recv_packet(&mut rx).await {
+            Some(Packet::Publish(p)) => {
+                assert_eq!(p.topic, "$SYS/broker/connection/edge-1/state");
+                assert!(p.retain);
+            }
+            other => panic!("expected the bridge's retained state, got {other:?}"),
+        }
+        assert!(
+            recv_packet(&mut rx).await.is_none(),
+            "only the bridge's state"
         );
     }
 }

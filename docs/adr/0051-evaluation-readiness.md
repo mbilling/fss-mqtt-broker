@@ -290,6 +290,8 @@ semantics (ADR 0039 applies from 1.0.0; ADR 0038's freeze regime until then).
   not-yet) hands competitors a feature checklist — accepted; a security-first brand cannot
   simultaneously argue "trust our disclosures" and hide its own gaps.
 
+  > **Revisited by [ADR 0084](0084-watching-and-editing-rules-live.md) (2026-10-08).** `$SYS/` is now reserved for the broker, which publishes opt-in per-rule statistics and an opt-in rule trace there; it is not a `$SYS` tree of broker statistics, which stay on `/metrics` and `/statusz`. The admin API may write the rules file when `[rules] admin_writers` names the caller, and no other configuration. The dashboard remains absent by decision.
+
 ## Alternatives considered
 
 - **Jump straight to `1.0.0`:** contradicts ADR 0045's recorded `0.x`-first plan; freezes

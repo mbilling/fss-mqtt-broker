@@ -26,6 +26,12 @@ Persistent sessions are **durable by default** (quorum-replicated,
 [ADR 0029](adr/0029-durable-by-default.md)). An acked QoS 1/2 message survives the
 loss of the node that accepted it. A clean session is in-memory and cheaper.
 
+While a persistent session is offline, every message its subscriptions match is queued
+for it, QoS 0 included, up to `MQTTD_MAX_QUEUED_MESSAGES`. The broker's own `$SYS` rule
+statistics and trace are the exception: they are live-only, never queued, and carry a
+Message Expiry Interval, so a monitor that reconnects gets the next tick, not a backlog
+([ADR 0084](adr/0084-watching-and-editing-rules-live.md)).
+
 **Session takeover:** a second CONNECT with the same client id disconnects the
 first and publishes the will. After a placement roll, a v5 session on a node
 that no longer owns it is sent `0x9C Use another server` so it reconnects onto
@@ -80,6 +86,7 @@ MQTT 3.1.1 has no packet to carry a reason):
 | Situation | MQTT 5 | MQTT 3.1.1 |
 |---|---|---|
 | Bad credentials / not authorized | CONNACK/PUBACK/DISCONNECT `0x87` | CONNACK return code 4/5; unauthorized publish is dropped (check the audit log) |
+| Publish or Will to `$SYS` or `$SYS/…`, reserved for the broker whatever the ACL says ([ADR 0084](adr/0084-watching-and-editing-rules-live.md)). The one exception is a Mosquitto bridge's `$SYS/broker/connection/<id>/state`, which the ACL decides like any topic | PUBACK/PUBREC `0x87`; Will: CONNACK `0x87` | publish acknowledged and dropped (audited as `acl.deny.publish`); Will: CONNACK return code 5 |
 | Quota / brownout / session cap | `0x97` | No ack + close for QoS ≥ 1 publishes; CONNACK server-unavailable for a new session |
 | Receive Maximum exceeded | DISCONNECT `0x93` | v3.1.1 has no Receive Maximum; inbound is not disconnected on this path |
 | Packet too large | `0x95` | Connection close |
@@ -131,7 +138,7 @@ production emissions, not the full MQTT 5 catalogue in `mqtt-codec`.
 | `0x81` | `MALFORMED_PACKET` | Malformed packet at decode (CONNACK/DISCONNECT depending on when it is caught). | provoked in integration tests |
 | `0x82` | `PROTOCOL_ERROR` | Protocol violation (illegal packet for the current state). | provoked in integration tests |
 | `0x84` | `UNSUPPORTED_PROTOCOL_VERSION` | Mapped in `conn.rs::codec_reason` for totality; unreachable on the wire (CONNECT with an unsupported protocol level closes silently per [MQTT-3.14.0-1]). | exempt (see `scripts/check-reason-codes.py`) |
-| `0x87` | `NOT_AUTHORIZED` | Authentication or ACL denial (CONNACK, PUBACK/PUBREC, DISCONNECT on revocation sweep). | provoked in integration tests |
+| `0x87` | `NOT_AUTHORIZED` | Authentication or ACL denial (CONNACK, PUBACK/PUBREC, DISCONNECT on revocation sweep), and a publish or Will to the broker-reserved `$SYS/` (ADR 0084). | provoked in integration tests |
 | `0x89` | `SERVER_BUSY` | A resumed session's queue could not be read for replay (its group's log was being rebuilt); reconnect and the replay runs again (issue #762). | exempt (see `scripts/check-reason-codes.py`) |
 | `0x8b` | `SERVER_SHUTTING_DOWN` | Graceful drain of live v5 sessions (ADR 0019 / `SIGTERM`). | exempt (see `scripts/check-reason-codes.py`) |
 | `0x8c` | `BAD_AUTHENTICATION_METHOD` | Enhanced-authentication method the broker does not accept. | provoked in integration tests |

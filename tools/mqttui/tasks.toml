@@ -180,6 +180,74 @@ script = "demo/rules/sim/cars.py"
 hidden = true
 about = "Imported by demo/rules/simulate.py; its docstring documents the devices and faults."
 
+[[task]]
+id = "demo-rules-live"
+group = "Demo"
+name = "Run the live rules demo: simulated publishers, a rules editor, and rule stats on $SYS"
+script = "demo/rules-live/up.sh"
+# The stack builds mqttd from this checkout (demo/Dockerfile): no release has ADR 0084 yet.
+needs_checkout = true
+about = """
+Builds mqttd from this checkout and starts a Docker Compose stack: the broker with the
+demo's 21 rules, three publishers playing simulated power-plant, home and car telemetry
+in real time, and a web page (http://localhost:8070) where you edit, check, test and apply
+rules and watch what each one runs. Point any MQTT client at 127.0.0.1:1883 and subscribe
+to `$SYS/brokers/+/rules/#` for the per-rule statistics and `$SYS/brokers/+/trace/rules/+`
+for every rule's input and output. demo/rules-live/README.md walks through it.
+"""
+requires = ["docker"]
+duration = "5-15 min for the first build, then seconds"
+caution = "Starts 7 containers (2 one-shot) and binds 127.0.0.1:1883, 8070, 8080 and 9443 (override with MQTT_PORT, UI_PORT, HEALTH_PORT, ADMIN_PORT)."
+
+[[task]]
+id = "demo-rules-live-sim"
+group = "Demo"
+name = "Play the rule-engine demo's telemetry into a running broker, endlessly, in real time"
+script = "demo/rules/live.py"
+about = """
+The live publisher behind demo-rules-live, on its own: it loops the demo's ten scripted
+minutes forever at real time, with device clocks on the current time (or, with
+`--clock fixture`, the README's storyline), reconnects when the broker goes away, and stops
+cleanly on Ctrl-C. Point it at a broker that loads demo/rules/rules.toml.
+"""
+requires = ["python3"]
+duration = "runs until stopped"
+args = ["--host", "${HOST}", "--port", "${PORT}"]
+[[task.env]]
+name = "HOST"
+default = "127.0.0.1"
+help = "The broker's host"
+[[task.env]]
+name = "PORT"
+default = "1883"
+help = "The broker's plaintext MQTT port"
+
+[[task]]
+id = "demo-rules-sim-live"
+group = "Demo"
+name = "The rule-engine demo's live player: reconnects and backoff (imported, not run)"
+script = "demo/rules/sim/live.py"
+hidden = true
+about = "Imported by demo/rules/live.py."
+
+[[task]]
+id = "demo-rules-live-pki"
+group = "Demo"
+name = "The live rules demo's certificate maker (runs inside its compose stack)"
+script = "demo/rules-live/pki/gen.sh"
+hidden = true
+about = "Run by the pki service of demo/rules-live/compose.yaml: the admin API's CA and certificates."
+requires = ["openssl"]
+
+[[task]]
+id = "demo-rules-live-ui"
+group = "Demo"
+name = "The live rules demo's web page server (runs inside its compose stack)"
+script = "demo/rules-live/ui/server.py"
+hidden = true
+about = "Run by the ui service of demo/rules-live/compose.yaml; serves the rules editor on loopback."
+requires = ["python3"]
+
 # ── Migration ────────────────────────────────────────────────────────────────────────
 [[task]]
 id = "migrate-mosquitto"

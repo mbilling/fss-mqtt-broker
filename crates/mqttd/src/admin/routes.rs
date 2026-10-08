@@ -1,6 +1,6 @@
 //! The `/admin/v1/` endpoints and the role each needs.
 
-use super::http::Request;
+use super::http::{Request, MAX_BODY, MAX_RULES_BODY};
 use super::{AdminState, Caller, Role};
 use serde_json::{json, Value};
 
@@ -124,7 +124,69 @@ const ENDPOINTS: &[Endpoint] = &[
         path: "/admin/v1/retained",
         min_role: Role::Viewer,
     },
+    Endpoint {
+        method: "GET",
+        path: "/admin/v1/rules",
+        min_role: Role::Viewer,
+    },
+    Endpoint {
+        method: "PUT",
+        path: "/admin/v1/rules",
+        min_role: Role::Operator,
+    },
+    Endpoint {
+        method: "GET",
+        path: "/admin/v1/rules/source",
+        min_role: Role::Operator,
+    },
+    Endpoint {
+        method: "POST",
+        path: "/admin/v1/rules/check",
+        min_role: Role::Operator,
+    },
+    Endpoint {
+        method: "POST",
+        path: "/admin/v1/rules/test",
+        min_role: Role::Operator,
+    },
+    Endpoint {
+        method: "PUT",
+        path: "/admin/v1/rule",
+        min_role: Role::Operator,
+    },
+    Endpoint {
+        method: "DELETE",
+        path: "/admin/v1/rule",
+        min_role: Role::Operator,
+    },
 ];
+
+/// The endpoints whose body can be a whole rules file (ADR 0084): up to
+/// [`MAX_RULES_BODY`] for a caller whose role may call them.
+const RULES_BODIES: &[(&str, &str)] = &[
+    ("PUT", "/admin/v1/rules"),
+    ("POST", "/admin/v1/rules/check"),
+    ("POST", "/admin/v1/rules/test"),
+    ("PUT", "/admin/v1/rule"),
+];
+
+/// The most body bytes a request for `method path` may carry from a caller with `role`,
+/// decided before the body is read: [`MAX_RULES_BODY`] for a rules route the role may
+/// call, [`MAX_BODY`] for everything and everyone else — so a certificate in no list, or
+/// a viewer, never makes the node buffer a rules file.
+#[must_use]
+pub fn body_limit(role: Option<Role>, method: &str, path: &str) -> usize {
+    let may_call = ENDPOINTS
+        .iter()
+        .find(|e| e.method == method && e.path == path)
+        .zip(role)
+        .is_some_and(|(e, role)| role >= e.min_role);
+    if may_call && RULES_BODIES.contains(&(method, path)) {
+        MAX_RULES_BODY
+    } else {
+        MAX_BODY
+    }
+}
 
 /// The actions a node may forward to a session's owner as the `peer` role.
 const FORWARDABLE: &[&str] = &["/admin/v1/kick", "/admin/v1/purge"];
@@ -220,6 +282,13 @@ pub async fn route(state: &AdminState, caller: &Caller, role: Role, req: &Reques
         }
         "/admin/v1/backlog" => super::sessions::backlog(state, req).await,
         "/admin/v1/retained" => super::sessions::retained(state, req).await,
+        "/admin/v1/rules" if req.method == "GET" => super::rules::list(state, caller, role).await,
+        "/admin/v1/rules" => super::rules::put_file(state, caller, req).await,
+        "/admin/v1/rules/source" => super::rules::source(state).await,
+        "/admin/v1/rules/check" => super::rules::check(state, req).await,
+        "/admin/v1/rules/test" => super::rules::test(state, req).await,
+        "/admin/v1/rule" if req.method == "PUT" => super::rules::put_rule(state, caller, req).await,
+        "/admin/v1/rule" => super::rules::delete_rule(state, caller, req).await,
         _ => error(404, "not-found", "no such admin endpoint"),
     }
 }

@@ -79,6 +79,17 @@ impl Template {
         self.parts.iter().all(|p| matches!(p, Part::Lit(_)))
     }
 
+    /// The literal text before the first placeholder (all of it for a literal template,
+    /// empty when it opens with one): what every rendering starts with.
+    pub(crate) fn literal_prefix(&self) -> &str {
+        match self.parts.first() {
+            // Literal parts are cut from the template's text at `${` and `}`, both ASCII,
+            // so they are always whole UTF-8.
+            Some(Part::Lit(b)) => std::str::from_utf8(b).unwrap_or_default(),
+            _ => "",
+        }
+    }
+
     /// Render against the rule output.
     pub(crate) fn render(&self, out: &Map) -> Result<Vec<u8>, EvalError> {
         let mut buf = Vec::new();
@@ -191,6 +202,16 @@ mod tests {
             String::from_utf8(t.render(&out()).unwrap()).unwrap(),
             r#"{"clientid":"c1","payload":"{\"x\":{\"y\":[10,20]}}"}"#
         );
+    }
+
+    #[test]
+    fn the_literal_prefix_is_the_text_before_the_first_placeholder() {
+        let prefix = |s: &str| Template::parse(s).unwrap().literal_prefix().to_string();
+        assert_eq!(prefix("$SYS/brokers/${node}/x"), "$SYS/brokers/");
+        assert_eq!(prefix("a/b"), "a/b");
+        assert_eq!(prefix("${t}/x"), "");
+        assert_eq!(prefix("é/${t}"), "é/");
+        assert_eq!(Template::this().literal_prefix(), "");
     }
 
     #[test]

@@ -24,6 +24,8 @@
 //! documented in `docs/RULES.md`.
 
 use std::collections::{BTreeMap, HashMap};
+use std::ops::Range;
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -32,6 +34,7 @@ use mqtt_core::FilterKey;
 use serde::Deserialize;
 
 mod action;
+pub mod edit;
 mod eval;
 mod funcs;
 mod input;
@@ -67,6 +70,22 @@ pub const MAX_DERIVED_BYTES: usize = 4 << 20;
 /// The longest rule statement accepted.
 pub const MAX_SQL_BYTES: usize = 64 * 1024;
 
+/// The most distinct literal regex patterns one rules file may compile (ADR 0084 D3);
+/// an identical pattern is compiled once however often it appears, and counts once.
+///
+/// Each pattern is already bounded (1 MiB of compiled program, 1 MiB of lazy DFA), but
+/// the file was not: a few thousand worst-case literals took seconds and gigabytes to
+/// parse. Measured on release builds (4-core x86-64, 2026-10): a pattern at the
+/// per-pattern limit costs about 6-7.5 ms and 1.05 MiB to compile, so 128 distinct ones
+/// took 0.9-1.1 s and 140 MiB, and 96 take 0.6-1.1 s and 110-123 MiB. Which patterns
+/// reach the limit depends on the build: mqtt-rules alone admits `\w{50}` or `.{2471}`,
+/// while the broker, whose dependency graph enables regex-automata's `dfa-build`, admits
+/// about `\w{20}` or `.{1048}`; the cost at the limit is the same. 96 keeps a worst-case
+/// file around a second, and the running set plus one candidate being checked or reloaded
+/// under 256 MiB. A file over it fails to load, at boot, on reload, in `--check-rules`
+/// and in the admin API alike.
+pub const MAX_REGEX_LITERALS_PER_FILE: usize = 96;
+
 /// A rule statement that does not parse.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("{message} (line {line}, column {column}, near `{near}`)")]
@@ -81,12 +100,18 @@ pub struct ParseError {
     pub near: String,
 }
 
+/// The 1-based line and column (in characters) of byte `offset` in `text`.
+fn line_column(text: &str, offset: usize) -> (usize, usize) {
+    let before = &text[..offset];
+    let line = before.matches('\n').count() + 1;
+    let column = before.rsplit('\n').next().map_or(0, |l| l.chars().count()) + 1;
+    (line, column)
+}
+
 impl ParseError {
     pub(crate) fn at(sql: &str, offset: usize, message: impl Into<String>) -> Self {
         let offset = offset.min(sql.len());
-        let before = &sql[..offset];
-        let line = before.matches('\n').count() + 1;
-        let column = before.rsplit('\n').next().map_or(0, |l| l.chars().count()) + 1;
+        let (line, column) = line_column(sql, offset);
         let near: String = sql[offset..].chars().take(24).collect();
         Self {
             message: message.into(),
@@ -119,11 +144,19 @@ impl EvalError {
 
 /// A rules file that cannot be loaded. Loading is all-or-nothing: one bad rule
 /// rejects the file, and a reload keeps the running rules.
+///
+/// The text (`Display`) is what `mqttd --check-rules` and a rejected reload print; the
+/// positions are for a caller that points at the place, such as the admin API.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum LoadError {
     /// The file itself (unreadable, not TOML, an unknown key).
-    #[error("rules file: {0}")]
-    File(String),
+    #[error("rules file: {message}")]
+    File {
+        /// What is wrong.
+        message: String,
+        /// Where in the file text, in bytes, when the TOML parser said.
+        span: Option<Range<usize>>,
+    },
     /// One rule.
     #[error("rule `{id}`: {message}")]
     Rule {
@@ -131,7 +164,34 @@ pub enum LoadError {
         id: String,
         /// What is wrong with it.
         message: String,
+        /// The 1-based line of a SQL error, counted from the start of the rule's `sql`.
+        sql_line: Option<usize>,
+        /// The 1-based column (in characters) of a SQL error.
+        sql_column: Option<usize>,
     },
+}
+
+impl LoadError {
+    fn file(message: impl Into<String>) -> Self {
+        Self::File {
+            message: message.into(),
+            span: None,
+        }
+    }
+
+    /// For a file error with a span, where it starts in `text` (the text that was
+    /// parsed): the 1-based line and column (in characters).
+    #[must_use]
+    pub fn file_position(&self, text: &str) -> Option<(usize, usize)> {
+        match self {
+            Self::File {
+                span: Some(span), ..
+            } => text
+                .is_char_boundary(span.start)
+                .then(|| line_column(text, span.start)),
+            _ => None,
+        }
+    }
 }
 
 /// The fields a rule reads from its trigger.
@@ -176,11 +236,17 @@ pub struct Rule {
     sql: String,
     stmt: parser::Statement,
     actions: Vec<action::Action>,
+    /// The `actions` entries as the file wrote them.
+    action_specs: Vec<toml::Value>,
     topics: Vec<String>,
     events: Vec<EventKind>,
     /// When a failure of this rule was last reported loudly (unix seconds); see
     /// [`Rule::failure_report_due`].
-    last_report: std::sync::atomic::AtomicU64,
+    last_report: AtomicU64,
+    /// The trace's rate window for passed and failed evaluations; see [`Rule::trace_due`].
+    trace_window: AtomicU64,
+    /// The same for `no_result` evaluations; see [`Rule::no_result_trace_due`].
+    no_result_window: AtomicU64,
 }
 
 impl Rule {
@@ -190,13 +256,31 @@ impl Rule {
     /// second failing rule is still logged too.
     #[must_use]
     pub fn failure_report_due(&self, now: u64, interval: u64) -> bool {
-        use std::sync::atomic::Ordering::Relaxed;
         let last = self.last_report.load(Relaxed);
         (last == 0 || now >= last.saturating_add(interval))
             && self
                 .last_report
                 .compare_exchange(last, now.max(1), Relaxed, Relaxed)
                 .is_ok()
+    }
+
+    /// Whether the rule trace (ADR 0084 D5) may record a passed or failed evaluation of
+    /// this rule at `now_s` (unix seconds): at most `per_sec` in each second, per rule.
+    ///
+    /// The window packs (second, count) into one atomic. It is read first, and written
+    /// only while the second still has room, so once a hot rule's second is used up each
+    /// further evaluation costs a load and nothing else.
+    #[must_use]
+    pub fn trace_due(&self, now_s: u64, per_sec: u32) -> bool {
+        window_due(&self.trace_window, now_s, per_sec)
+    }
+
+    /// [`trace_due`](Self::trace_due) for `no_result` evaluations, on a window of their
+    /// own: a hot rule whose `WHERE` rarely passes would otherwise spend its whole budget
+    /// on `no_result` records and starve the passed ones.
+    #[must_use]
+    pub fn no_result_trace_due(&self, now_s: u64, per_sec: u32) -> bool {
+        window_due(&self.no_result_window, now_s, per_sec)
     }
 
     /// The rule's id (its table name in the rules file).
@@ -241,6 +325,51 @@ impl Rule {
     pub fn action_count(&self) -> usize {
         self.actions.len()
     }
+
+    /// Its `actions`, as the rules file wrote them (for showing a rule, such as the admin
+    /// API's JSON, without the file at hand).
+    #[must_use]
+    pub fn action_specs(&self) -> &[toml::Value] {
+        &self.action_specs
+    }
+
+    /// Why this rule would never run on `input`, in `mqttd --rule-test`'s words; `None`
+    /// when its `FROM` selects it. A dry run calls this before
+    /// [`RuleSet::evaluate_one`], which does not look at `FROM`.
+    #[must_use]
+    pub fn from_mismatch(&self, input: &dyn Input) -> Option<String> {
+        from_mismatch(&self.topics, &self.events, input)
+    }
+}
+
+/// One step of a packed (second, count) rate window: whether one more may pass in
+/// `now_s`'s second. The high 32 bits hold the second (its low 32 bits: the window only
+/// has to tell one second from the next), the low 32 the count taken in it.
+fn window_due(window: &AtomicU64, now_s: u64, per_sec: u32) -> bool {
+    const LOW: u64 = 0xFFFF_FFFF;
+    if per_sec == 0 {
+        return false;
+    }
+    let second = now_s & LOW;
+    let mut cur = window.load(Relaxed);
+    loop {
+        let open = cur >> 32;
+        // A caller whose clock read lags by a second, racing one that has already
+        // opened the next, counts against the open window rather than reopening its
+        // own; any other second opens a new window.
+        let next = if second == open || second == open.wrapping_sub(1) & LOW {
+            if cur & LOW >= u64::from(per_sec) {
+                return false;
+            }
+            cur + 1
+        } else {
+            (second << 32) | 1
+        };
+        match window.compare_exchange_weak(cur, next, Relaxed, Relaxed) {
+            Ok(_) => return true,
+            Err(seen) => cur = seen,
+        }
+    }
 }
 
 /// A loaded rules file.
@@ -251,6 +380,7 @@ pub struct RuleSet {
     by_filter: HashMap<FilterKey, Vec<usize>>,
     by_event: [Vec<usize>; 4],
     digest: String,
+    warnings: Vec<String>,
 }
 
 /// A successfully loaded rules file and what the author should be told about it.
@@ -273,7 +403,7 @@ fn yes() -> bool {
     true
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 struct RuleSchema {
     sql: String,
@@ -285,7 +415,10 @@ struct RuleSchema {
     description: String,
 }
 
-fn valid_id(id: &str) -> bool {
+/// Whether `id` is a valid rule id: a letter or `_` followed by up to 63 letters, digits,
+/// `_` or `-`. Such an id is also a safe single topic level (no `/`, `+` or `#`).
+#[must_use]
+pub fn valid_rule_id(id: &str) -> bool {
     let mut chars = id.chars();
     matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
         && id.len() <= 64
@@ -300,12 +433,35 @@ struct Compiled {
     warnings: Vec<String>,
 }
 
-/// Compile one statement and its `FROM` list.
-fn compile(sql: &str) -> Result<Compiled, String> {
-    if sql.len() > MAX_SQL_BYTES {
-        return Err(format!("sql is longer than {MAX_SQL_BYTES} bytes"));
+/// Why a statement does not compile, and where in it when the parser said.
+struct CompileError {
+    message: String,
+    /// 1-based (line, column) in the statement.
+    at: Option<(usize, usize)>,
+}
+
+impl From<String> for CompileError {
+    fn from(message: String) -> Self {
+        Self { message, at: None }
     }
-    let (stmt, warnings) = parser::parse(sql).map_err(|e| e.to_string())?;
+}
+
+impl From<&str> for CompileError {
+    fn from(message: &str) -> Self {
+        message.to_string().into()
+    }
+}
+
+/// Compile one statement and its `FROM` list, its literal regex patterns through
+/// `regexes`.
+fn compile(sql: &str, regexes: &mut parser::RegexPool) -> Result<Compiled, CompileError> {
+    if sql.len() > MAX_SQL_BYTES {
+        return Err(format!("sql is longer than {MAX_SQL_BYTES} bytes").into());
+    }
+    let (stmt, mut warnings) = parser::parse(sql, regexes).map_err(|e| CompileError {
+        message: e.to_string(),
+        at: Some((e.line, e.column)),
+    })?;
     if stmt.foreach && stmt.fields.iter().any(|i| matches!(i, parser::Item::Star)) {
         return Err("FOREACH takes an array expression, not *".into());
     }
@@ -313,26 +469,33 @@ fn compile(sql: &str) -> Result<Compiled, String> {
     for from in &stmt.from {
         if from.starts_with("$events/") {
             let kind = EventKind::from_topic(from).ok_or_else(|| {
-                format!(
+                CompileError::from(format!(
                     "\"{from}\" is not a supported event (supported: $events/client/connected, \
                      $events/client/disconnected, $events/session/subscribed, \
                      $events/session/unsubscribed)"
-                )
+                ))
             })?;
             if !events.contains(&kind) {
                 events.push(kind);
             }
         } else if from.starts_with("$bridges/") {
-            return Err(format!(
-                "\"{from}\": mqttd has no data bridges to select from (ADR 0083)"
-            ));
+            return Err(
+                format!("\"{from}\": mqttd has no data bridges to select from (ADR 0083)").into(),
+            );
         } else if mqtt_core::parse_shared(from).is_some() || from.starts_with("$share/") {
             return Err(format!(
                 "\"{from}\": a rule selects messages by topic filter; $share groups are for subscribers"
-            ));
+            )
+            .into());
         } else if !mqtt_core::valid_filter(from) {
-            return Err(format!("\"{from}\" is not a valid topic filter"));
+            return Err(format!("\"{from}\" is not a valid topic filter").into());
         } else if !topics.contains(from) {
+            if mqtt_core::is_reserved_filter(from) {
+                warnings.push(format!(
+                    "FROM \"{from}\" never matches: the broker's own $SYS messages do not run \
+                     rules and clients cannot publish there (ADR 0084)"
+                ));
+            }
             topics.push(from.clone());
         }
     }
@@ -353,9 +516,12 @@ impl RuleSet {
 
     /// Load a rules file's text. All-or-nothing.
     pub fn parse(text: &str) -> Result<Loaded, LoadError> {
-        let file: FileSchema = toml::from_str(text).map_err(|e| LoadError::File(e.to_string()))?;
+        let file: FileSchema = toml::from_str(text).map_err(|e| LoadError::File {
+            message: e.to_string(),
+            span: e.span(),
+        })?;
         if file.rules.len() > MAX_RULES {
-            return Err(LoadError::File(format!(
+            return Err(LoadError::file(format!(
                 "{} rules is more than the {MAX_RULES} a file may define",
                 file.rules.len()
             )));
@@ -367,34 +533,41 @@ impl RuleSet {
             ..RuleSet::default()
         };
         let mut warnings = Vec::new();
+        // One pool for the whole file: the regex budget is file-wide (ADR 0084 D3).
+        let mut regexes = parser::RegexPool::default();
         for (id, r) in file.rules {
-            let fail = |message: String| LoadError::Rule {
+            let fail = |e: CompileError| LoadError::Rule {
                 id: id.clone(),
-                message,
+                message: e.message,
+                sql_line: e.at.map(|(line, _)| line),
+                sql_column: e.at.map(|(_, column)| column),
             };
-            if !valid_id(&id) {
+            if !valid_rule_id(&id) {
                 return Err(fail(
                     "a rule id is a letter or `_` followed by up to 63 letters, digits, `_` or `-`"
                         .into(),
                 ));
             }
             if r.actions.len() > MAX_ACTIONS_PER_RULE {
-                return Err(fail(format!(
-                    "{} actions is more than the {MAX_ACTIONS_PER_RULE} a rule may run",
-                    r.actions.len()
-                )));
+                return Err(fail(
+                    format!(
+                        "{} actions is more than the {MAX_ACTIONS_PER_RULE} a rule may run",
+                        r.actions.len()
+                    )
+                    .into(),
+                ));
             }
             let Compiled {
                 stmt,
                 topics,
                 events,
                 warnings: w,
-            } = compile(&r.sql).map_err(fail)?;
+            } = compile(&r.sql, &mut regexes).map_err(fail)?;
             warnings.extend(w.into_iter().map(|w| format!("rule `{id}`: {w}")));
             let mut actions = Vec::with_capacity(r.actions.len());
             let mut aw = Vec::new();
             for a in &r.actions {
-                actions.push(action::parse_action(a, &mut aw).map_err(fail)?);
+                actions.push(action::parse_action(a, &mut aw).map_err(|e| fail(e.into()))?);
             }
             warnings.extend(aw.into_iter().map(|w| format!("rule `{id}`: {w}")));
             set.rules.push(Rule {
@@ -404,9 +577,12 @@ impl RuleSet {
                 sql: r.sql,
                 stmt,
                 actions,
+                action_specs: r.actions,
                 topics,
                 events,
-                last_report: std::sync::atomic::AtomicU64::new(0),
+                last_report: AtomicU64::new(0),
+                trace_window: AtomicU64::new(0),
+                no_result_window: AtomicU64::new(0),
             });
         }
         for (i, rule) in set.rules.iter().enumerate() {
@@ -422,6 +598,7 @@ impl RuleSet {
                 set.by_event[e.index()].push(i);
             }
         }
+        set.warnings.clone_from(&warnings);
         Ok(Loaded {
             rules: set,
             warnings,
@@ -431,7 +608,7 @@ impl RuleSet {
     /// Load a rules file from disk.
     pub fn load(path: &std::path::Path) -> Result<Loaded, LoadError> {
         let text = std::fs::read_to_string(path)
-            .map_err(|e| LoadError::File(format!("{}: {e}", path.display())))?;
+            .map_err(|e| LoadError::file(format!("{}: {e}", path.display())))?;
         Self::parse(&text)
     }
 
@@ -458,6 +635,22 @@ impl RuleSet {
     #[must_use]
     pub fn digest(&self) -> &str {
         &self.digest
+    }
+
+    /// The load's non-fatal findings (the same as [`Loaded::warnings`]), kept with the set
+    /// so whoever holds the running rules can still show them.
+    #[must_use]
+    pub fn warnings(&self) -> &[String] {
+        &self.warnings
+    }
+
+    /// The rule with this id, enabled or not.
+    #[must_use]
+    pub fn get(&self, id: &str) -> Option<&Rule> {
+        self.rules
+            .binary_search_by(|r| (*r.id).cmp(id))
+            .ok()
+            .map(|i| &self.rules[i])
     }
 
     /// Whether any enabled rule selects messages. The publish path checks this first,
@@ -518,6 +711,27 @@ impl RuleSet {
         for &i in hits {
             apply(&self.rules[i], &ctx, report, out);
         }
+    }
+
+    /// Evaluate the one rule `id` on `input`, whether or not it is enabled, as a dry run
+    /// does (ADR 0084): its SQL, then its actions, reported and collected as
+    /// [`on_publish`](Self::on_publish) would. Its `FROM` is not consulted — the caller
+    /// asks [`Rule::from_mismatch`] first. Returns `false` when there is no such rule.
+    ///
+    /// Nothing about the rule changes: `report` is the caller's, and neither the failure
+    /// report gate nor the trace windows are touched.
+    pub fn evaluate_one(
+        &self,
+        id: &str,
+        input: &dyn Input,
+        report: &mut dyn FnMut(&Rule, Outcome<'_>),
+        out: &mut Vec<(Arc<str>, Effect)>,
+    ) -> bool {
+        let Some(rule) = self.get(id) else {
+            return false;
+        };
+        apply(rule, &EvalCtx::new(input), report, out);
+        true
     }
 }
 
@@ -589,7 +803,47 @@ fn charge_derived(ctx: &EvalCtx<'_>, effect: Effect) -> Result<Effect, EvalError
 
 /// What one statement's `FROM` selects: its topic filters and its events.
 pub fn statement_sources(sql: &str) -> Result<(Vec<String>, Vec<EventKind>), String> {
-    compile(sql).map(|c| (c.topics, c.events))
+    compile_alone(sql).map(|c| (c.topics, c.events))
+}
+
+/// [`compile`] for a statement on its own, with a regex budget of its own.
+fn compile_alone(sql: &str) -> Result<Compiled, String> {
+    compile(sql, &mut parser::RegexPool::default()).map_err(|e| e.message)
+}
+
+/// Why a rule selecting `topics` and `events` would never run on `input`; `None` when
+/// it would. An input the broker would never have run the rule on is reported rather
+/// than evaluated: a message whose topic no `FROM` filter matches, a message given to a
+/// statement that selects only events, or an event its `FROM` does not name.
+fn from_mismatch(topics: &[String], events: &[EventKind], input: &dyn Input) -> Option<String> {
+    let event = input.field("event");
+    let event = event.as_str().unwrap_or("message.publish");
+    if event == "message.publish" {
+        if topics.is_empty() {
+            return Some(format!(
+                "the statement selects only events ({}), so it never runs on a message; \
+                 simulate one of them instead",
+                events
+                    .iter()
+                    .map(|k| k.event_name())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        if let Some(topic) = input.field("topic").as_str() {
+            if !topics.iter().any(|f| mqtt_core::topic_matches(f, topic)) {
+                return Some(format!(
+                    "topic \"{topic}\" matches none of the FROM filters ({})",
+                    topics.join(", ")
+                ));
+            }
+        }
+    } else if !events.iter().any(|k| k.event_name() == event) {
+        return Some(format!(
+            "the statement's FROM does not select the {event} event"
+        ));
+    }
+    None
 }
 
 /// Run one statement against one input and return its outputs as JSON — the
@@ -604,33 +858,9 @@ pub fn test_sql(sql: &str, input: &dyn Input) -> Result<Vec<String>, String> {
         topics,
         events,
         ..
-    } = compile(sql)?;
-    let event = input.field("event");
-    let event = event.as_str().unwrap_or("message.publish");
-    if event == "message.publish" {
-        if topics.is_empty() {
-            return Err(format!(
-                "the statement selects only events ({}), so it never runs on a message; \
-                 simulate one of them instead",
-                events
-                    .iter()
-                    .map(|k| k.event_name())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ));
-        }
-        if let Some(topic) = input.field("topic").as_str() {
-            if !topics.iter().any(|f| mqtt_core::topic_matches(f, topic)) {
-                return Err(format!(
-                    "topic \"{topic}\" matches none of the FROM filters ({})",
-                    topics.join(", ")
-                ));
-            }
-        }
-    } else if !events.iter().any(|k| k.event_name() == event) {
-        return Err(format!(
-            "the statement's FROM does not select the {event} event"
-        ));
+    } = compile_alone(sql)?;
+    if let Some(why) = from_mismatch(&topics, &events, input) {
+        return Err(why);
     }
     let ctx = EvalCtx::new(input);
     *ctx.rule_id.borrow_mut() = Arc::from("test");
@@ -644,7 +874,7 @@ pub fn test_sql(sql: &str, input: &dyn Input) -> Result<Vec<String>, String> {
 
 /// Validate one statement without running it; returns its warnings.
 pub fn check_sql(sql: &str) -> Result<Vec<String>, String> {
-    compile(sql).map(|c| c.warnings)
+    compile_alone(sql).map(|c| c.warnings)
 }
 
 #[cfg(test)]

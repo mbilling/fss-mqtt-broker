@@ -1200,13 +1200,7 @@ impl Hub {
                 continue;
             }
             if self.durable_retained.is_some() {
-                let owned = self.placement.as_ref().is_some_and(|p| {
-                    p.read()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .owner(&m.topic)
-                        == self.node_id
-                });
-                if owned {
+                if self.owns_retained(&m.topic) {
                     debug!(topic = %m.topic, "retained value expired; committing the reap as a clear");
                     self.route_retained_commit(
                         &m.topic,
@@ -1234,6 +1228,78 @@ impl Hub {
         // Under durable, an owner-committed reap lands back through the fan-out
         // (which re-arms the flag if a deadline remains); locally nothing is left.
         self.retained_may_expire = deadlines_remain;
+    }
+
+    /// Whether this node's group owns `topic`'s retained value, so a clear of it is this
+    /// node's to commit (durable retained, ADR 0037).
+    fn owns_retained(&self, topic: &str) -> bool {
+        self.placement.as_ref().is_some_and(|p| {
+            p.read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .owner(topic)
+                == self.node_id
+        })
+    }
+
+    /// Remove the retained values in the broker's reserved `$SYS/` tree, once per boot
+    /// (ADR 0084). The broker retains nothing there, and every path that could retain
+    /// one now drops it, so what is found was retained before the reservation: a
+    /// client's forged statistic that no client could clear any more. It goes the way an
+    /// expired value does ([`reap_expired_retained`](Self::reap_expired_retained)) — an
+    /// owner-committed clear under durable retained, a local delete without. A value
+    /// another node's group owns is that node's to clear; while this node does not own
+    /// one, it looks again on the next sweep ticks (ownership settles during boot), for
+    /// at most [`RESERVED_PURGE_TICKS`](super::RESERVED_PURGE_TICKS), and subscribe-time
+    /// replay skips it meanwhile.
+    ///
+    /// It reads only the `$SYS` subtree (`#` matches its parent too, so `$SYS` itself is
+    /// in it), never the whole store, since it runs on the hub loop. A Mosquitto bridge's
+    /// state is in that subtree but not reserved, so it stays.
+    pub(super) async fn purge_reserved_retained(&mut self) {
+        self.reserved_purge_ticks = self.reserved_purge_ticks.saturating_sub(1);
+        let Ok(sys) = self.retained.matching("$SYS/#").await else {
+            return;
+        };
+        let mut purged = 0usize;
+        let mut left = false;
+        for m in sys {
+            if !mqtt_core::is_reserved_topic(&m.topic) || m.payload.is_empty() {
+                continue;
+            }
+            if self.durable_retained.is_some() {
+                if !self.owns_retained(&m.topic) {
+                    left = true;
+                    continue;
+                }
+                self.route_retained_commit(
+                    &m.topic,
+                    &Bytes::new(),
+                    0,
+                    &AppProperties::default(),
+                    None,
+                    None,
+                    false,
+                );
+            } else {
+                let clear = Message::new(m.topic.clone(), Bytes::new(), QoS::AtMostOnce, true);
+                if let Err(e) = self.retained.set(&clear).await {
+                    warn!(topic = %m.topic, error = %e,
+                          "failed to remove a retained value in the reserved $SYS/ tree");
+                    continue;
+                }
+            }
+            purged += 1;
+        }
+        if !left {
+            self.reserved_purge_ticks = 0;
+        }
+        if purged > 0 {
+            warn!(
+                purged,
+                "removed retained value(s) in the broker-reserved $SYS/ tree, retained before \
+                 the reservation (ADR 0084)"
+            );
+        }
     }
 
     /// Discharge retained tombstones the cluster has observably converged past
@@ -1414,7 +1480,10 @@ impl Hub {
         app: &AppProperties,
         expires_at: Option<u64>,
     ) {
-        if self.retained_windows.is_empty() {
+        // Nor one in `$SYS/`, as at the subscribe replay: an owner that predates ADR 0084
+        // can still commit a client's retained `$SYS` value, and this path would hand it
+        // to a fresh subscriber the replay just kept it from.
+        if self.retained_windows.is_empty() || mqtt_core::is_reserved_topic(topic) {
             return;
         }
         // An already-expired value is not delivered [MQTT-3.3.2-5]; the remaining

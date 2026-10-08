@@ -2009,25 +2009,16 @@ pub fn write_restored_stamp(
     // A bare `fs::write` leaves a window in which a power loss yields a complete restore with
     // no stamp, and the next boot then meets `require_fresh_data_dir` on a full data dir —
     // whose printed remedy is to delete the very data just recovered.
-    let final_path = dir.join(RESTORED_STAMP);
-    let tmp_path = dir.join(format!("{RESTORED_STAMP}.partial"));
-    {
-        use std::io::Write as _;
-        let mut f = std::fs::File::create(&tmp_path)
-            .map_err(|e| format!("restore: cannot write the {RESTORED_STAMP} stamp: {e}"))?;
-        f.write_all(format!("{body}\n").as_bytes())
-            .map_err(|e| format!("restore: cannot write the {RESTORED_STAMP} stamp: {e}"))?;
-        f.sync_all()
-            .map_err(|e| format!("restore: cannot fsync the {RESTORED_STAMP} stamp: {e}"))?;
-    }
-    std::fs::rename(&tmp_path, &final_path)
-        .map_err(|e| format!("restore: cannot install the {RESTORED_STAMP} stamp: {e}"))?;
-    // The rename itself must be durable, or the stamp can still vanish with the directory
-    // entry unflushed.
-    if let Ok(d) = std::fs::File::open(dir) {
-        let _ = d.sync_all();
-    }
-    Ok(())
+    let how = crate::atomic_file::Replace {
+        new_mode: 0o644,
+        previous: None,
+    };
+    crate::atomic_file::replace(
+        &dir.join(RESTORED_STAMP),
+        format!("{body}\n").as_bytes(),
+        &how,
+    )
+    .map_err(|e| format!("restore: cannot install the {RESTORED_STAMP} stamp: {e}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -2399,7 +2390,7 @@ const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz012
 #[allow(clippy::cast_possible_truncation)] // the 6/8-bit repacking IS the algorithm
 /// Standard base64 with padding. Hand-rolled rather than pulled in: payloads are the one
 /// thing an export must not mangle, and this is 20 lines with a round-trip test.
-fn b64_encode(bytes: &[u8]) -> String {
+pub(crate) fn b64_encode(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {
         let b = [
@@ -2436,7 +2427,7 @@ fn b64_value(c: u8) -> Option<u32> {
 }
 
 #[allow(clippy::cast_possible_truncation, clippy::naive_bytecount)]
-fn b64_decode(s: &str) -> Result<Vec<u8>, String> {
+pub(crate) fn b64_decode(s: &str) -> Result<Vec<u8>, String> {
     let raw: Vec<u8> = s.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
     if !raw.len().is_multiple_of(4) {
         return Err(format!(
@@ -2521,7 +2512,8 @@ fn utc_stamp(unix_secs: u64) -> String {
     )
 }
 
-fn civil_from_days(z: i64) -> (i64, u32, u32) {
+/// The (year, month, day) of `z` days since 1970-01-01 (Howard Hinnant's algorithm).
+pub(crate) fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let z = z + 719_468;
     let era = z.div_euclid(146_097);
     let doe = z.rem_euclid(146_097);

@@ -419,23 +419,29 @@ topic or payload.
   Run the broker with `NO_COLOR=1` to get plain text.
 - **`FROM` does not match.** `mqttd --rule-test --sql '<statement>' --topic <topic>`
   exits 1 with `matches none of the FROM filters` when it does not. A filter that starts
-  with `#` or `+` never matches a topic that starts with `$`.
+  with `#` or `+` never matches a topic that starts with `$`, and a `FROM` on `$SYS/…`
+  matches nothing but a Mosquitto bridge's `$SYS/broker/connection/<id>/state`: clients
+  cannot publish anywhere else there and the broker's own `$SYS` messages never run rules
+  (`--check-rules` warns about a filter that cannot match even that).
 - **`WHERE` is false.** `mqttd_rule_evaluations_total{rule="<id>",result="no_result"}`
   climbs. The usual cause is a double-quoted string, `WHERE name = "x"`, which compares
   with a *field* called `x` (`--check-rules` warns about it); write `'x'`.
 - **The rule fails.** `result="failed"` climbs, and the log has one WARN per rule per
   10 s naming the error, typically `payload is not JSON`.
 - **The action fails.** `mqttd_rule_actions_total{rule="<id>",result="failed"}` climbs,
-  with a WARN: a rendered topic with a wildcard, `${.}` of a binary payload (a
+  with a WARN: a rendered topic with a wildcard or in `$SYS`, `${.}` of a binary payload (a
   `SELECT *` rule meets this on any non-UTF-8 payload or Correlation-Data), a
   per-message limit, or a refusal under brownout.
 - **`undefined` in the output.** A placeholder reads what the rule *selected*, not the
   message: `${topic}` in a rule that did not select `topic` renders `undefined`, and so
   does an event rule's default payload (events have none; use `payload = "${.}"`). A
-  rule that does not select `qos` republishes at QoS 0, which an offline session does
-  not queue.
+  rule that does not select `qos` republishes at QoS 0. That is still queued for an
+  offline persistent session; a session that does not persist misses whatever is
+  published while it is away, at any QoS.
 - **No metrics to look at.** `/metrics` is served only with `MQTTD_HEALTH_BIND` (or
-  `MQTTD_METRICS_BIND`) set.
+  `MQTTD_METRICS_BIND`) set. The same counts are in `mqttd --admin rules`, and on
+  `$SYS/brokers/+/rules/#` with `[rules] sys_interval_secs` set
+  ([RULES.md](RULES.md#watch-and-edit-rules-live)).
 
 ## An unrecognised flag or `mqttd --version`
 

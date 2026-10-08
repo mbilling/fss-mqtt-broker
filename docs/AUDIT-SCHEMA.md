@@ -1,6 +1,6 @@
 # Audit export schema
 
-**Verified against `v1.1.0` + ADR 0066 T3 (2026-10-07).** The contract a SIEM
+**Verified against `v1.1.0` + ADR 0066 T3 (2026-10-07), and ADR 0084's additions (2026-10-08).** The contract a SIEM
 parser is written against: the record format, the complete kind vocabulary, the
 boundary invariants, the delivery semantics, and the verification procedure.
 Stability promise: **fields and semantics below are frozen; new `kind` values
@@ -83,9 +83,9 @@ the stream proves itself (the external-anchoring model; see the
 | `auth.reauth` | identity | MQTT 5 re-authentication succeeded |
 | `auth.reauth.failure` | identity | Re-authentication refused (session ends) |
 | `acl.deny.connect` | identity | A `connect` rule refused this client id claim |
-| `acl.deny.publish` | identity | A publish was refused (v5 told `0x87`; v3.1.1 dropped) |
+| `acl.deny.publish` | identity | A publish was refused (v5 told `0x87`; v3.1.1 dropped): by the ACL, or because its topic is in the broker-reserved `$SYS/`, whatever the ACL says (ADR 0084; a Mosquitto bridge's `$SYS/broker/connection/<id>/state` is not reserved, so only the ACL refuses it). `detail` is the topic either way |
 | `acl.deny.subscribe` | identity | A subscription filter was refused (`0x87` in SUBACK) |
-| `acl.deny.will` | identity | A will topic was refused at CONNECT |
+| `acl.deny.will` | identity | A will topic was refused at CONNECT: by the ACL, or because it is in the broker-reserved `$SYS/` (ADR 0084; not a Mosquitto bridge's `$SYS/broker/connection/<id>/state`). `detail` is `will topic <topic>` |
 | `session.bind.mismatch` | identity | A principal tried to resume a session owned by another (ADR 0031) |
 | `security.reload` | — | Policy reload applied (ADR 0032) |
 | `config.reload` | — | Config reload applied |
@@ -93,6 +93,7 @@ the stream proves itself (the external-anchoring model; see the
 | `security.evict` | identity | A live session's grants tightened/evicted on reload |
 | `security.penalty` | source addr | Auth-failure penalty box engaged for a source (ADR 0041 T2) |
 | `admin.request` | certificate subject | An admin API request was answered (ADR 0081); `detail` is `role=<role> <METHOD> <target> -> <status>`, refusals included |
+| `rules.write` | certificate subject | The admin API replaced the rules file (ADR 0084), recorded after the new file is in place and its reload has run; `detail` is `op=<put-file\|put-rule\|delete-rule> rule=<id, or - for put-file> old=<sha256, or - when there was no file> new=<sha256> applied=<true\|false>`. A write refused before the new file is in place leaves only its `admin.request`; one whose reload is refused (`409 reload-rejected`) is recorded with `applied=false`. A write that changes nothing on disk (`written: false`) records no `rules.write` |
 
 ## Verification
 

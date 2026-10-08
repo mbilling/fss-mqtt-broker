@@ -2634,3 +2634,487 @@ actions = [{ function = "republish", args = { topic = "alerts/${clientid}", payl
         "node B evaluated a forwarded message"
     );
 }
+
+// ---------------------------------------------------------------------------------------
+// Watching the running rules on $SYS (ADR 0084)
+// ---------------------------------------------------------------------------------------
+
+/// ADR 0084: the rule statistics and the trace, configured from the environment the way
+/// the live demo stack configures them, reach a real subscriber of the real binary — the
+/// summary, the rule's message with its counted evaluation, and the trace record of the
+/// publish that fired it. `#` does not cover `$SYS`, so the subscriber names the trees.
+/// A client publishing into `$SYS` is refused (v5 `0x87`), so it cannot forge them. The
+/// log says the trace is on, and — with no ACL file — that any client may read it.
+#[tokio::test]
+async fn env_configured_rule_statistics_and_trace_reach_a_subscriber() {
+    let dir = tempfile::tempdir().unwrap();
+    write_rules(
+        dir.path(),
+        r#"[rules.watched]
+sql = 'SELECT payload.v AS v FROM "w/#"'
+actions = [{ function = "republish", args = { topic = "w-out/${v}" } }]
+"#,
+    );
+    let setup = Setup {
+        env: vec![
+            ("MQTTD_RULES_SYS_INTERVAL", "1".to_string()),
+            ("MQTTD_RULES_TRACE", "1".to_string()),
+            ("MQTTD_RULES_TRACE_RATE", "5".to_string()),
+        ],
+        ..Setup::default()
+    };
+    let broker = start(dir.path(), "sys-node", &setup).await;
+    let mut sub = Client::connect_v5_ok(broker.addr, "watcher").await;
+    assert_eq!(
+        subscribe(&mut sub, 1, "$SYS/brokers/+/rules/#", QoS::AtMostOnce).await,
+        [0]
+    );
+    assert_eq!(
+        subscribe(&mut sub, 2, "$SYS/brokers/+/trace/rules/+", QoS::AtMostOnce).await,
+        [0]
+    );
+    let mut publ = Client::connect_v5_ok(broker.addr, "publisher").await;
+    assert_eq!(
+        publish_acked(&mut publ, "$SYS/brokers/sys-node/rules", b"{}", 1).await,
+        0x87,
+        "a client cannot publish into $SYS"
+    );
+    assert_eq!(publish_acked(&mut publ, "w/1", br#"{"v":"x"}"#, 2).await, 0);
+
+    let (mut summary, mut counted, mut traced) = (false, false, false);
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !(summary && counted && traced) {
+        assert!(
+            Instant::now() < deadline,
+            "summary {summary}, counted {counted}, traced {traced} after 15 s; log tail:\n{}",
+            broker.log.tail(30)
+        );
+        let Recv::Packet(Packet::Publish(p)) = sub.recv_bounded(Duration::from_secs(5)).await
+        else {
+            continue;
+        };
+        assert_eq!((p.qos, p.retain), (QoS::AtMostOnce, false));
+        let doc: serde_json::Value = serde_json::from_slice(&p.payload).unwrap();
+        match p.topic.as_str() {
+            "$SYS/brokers/sys-node/rules" => {
+                assert_eq!(doc["rules"], 1);
+                assert_eq!(doc["interval_secs"], 1);
+                assert_eq!(
+                    (doc["trace"].as_bool(), doc["trace_rate"].as_u64()),
+                    (Some(true), Some(5))
+                );
+                summary = true;
+            }
+            "$SYS/brokers/sys-node/rules/watched" => {
+                counted |= doc["counts"]["passed"] == 1;
+            }
+            "$SYS/brokers/sys-node/trace/rules/watched" => {
+                assert_eq!(doc["trigger"]["topic"], "w/1");
+                assert_eq!(doc["trigger"]["clientid"], "publisher");
+                assert_eq!(doc["outputs"][0]["topic"], "w-out/x");
+                traced = true;
+            }
+            other => panic!("nothing else is published on $SYS: {other}"),
+        }
+    }
+    broker
+        .wait_log(" WARN mqttd::rules: INSECURE: the rule trace is on and no MQTTD_ACL_FILE is configured: any client can subscribe to $SYS/brokers/+/trace/rules/+ and read what the rules see (ADR 0084)")
+        .await;
+    broker.wait_log(&trace_is_on(5)).await;
+}
+
+/// The WARN the broker logs as the trace turns on at `rate` records a second per rule.
+fn trace_is_on(rate: u32) -> String {
+    format!(
+        " WARN mqttd::rules: rule trace is ON: every rule's evaluations — trigger topic, \
+         client id, username, up to 1 KiB of payload, rendered outputs — are copied onto \
+         $SYS/brokers/<node>/trace/rules/<id> (ADR 0084); a subscriber there reads every \
+         topic that rule's FROM matches rate={rate}"
+    )
+}
+
+/// The next `$SYS` message `c` receives on `topic` that `want` accepts, read as JSON; the
+/// rest are passed over. Bounded: fails after 15 s, naming the last one on `topic`.
+async fn sys_where(
+    c: &mut Client,
+    topic: &str,
+    want: impl Fn(&serde_json::Value) -> bool,
+) -> serde_json::Value {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut last = serde_json::Value::Null;
+    loop {
+        assert!(
+            Instant::now() < deadline,
+            "nothing as wanted on {topic} after 15 s; the last: {last}"
+        );
+        match c.recv_bounded(Duration::from_secs(5)).await {
+            Recv::Packet(Packet::Publish(p)) if p.topic == topic => {
+                let doc = serde_json::from_slice(&p.payload).expect("JSON on $SYS");
+                if want(&doc) {
+                    return doc;
+                }
+                last = doc;
+            }
+            Recv::Packet(Packet::Publish(_)) | Recv::Quiet => {}
+            other => panic!("expected only $SYS publishes, got {other:?}"),
+        }
+    }
+}
+
+/// RULES.md "Watch and edit rules live": the `[rules]` watch keys are live — an applied
+/// reload changes them, and a rejected one leaves them as they were. With the keys in the
+/// config file and `SIGHUP`: a reload that turns the trace on brings the next publish's
+/// record; one with `trace_rate = 0` is rejected — the summary says so — and the trace
+/// stays on; one that turns the trace off and the interval to 2 s shows both in the
+/// summary, and a publish then has no record across two ticks. A broker that took the
+/// keys at boot only fails the first wait; one that applied a rejected candidate, or kept
+/// the trace on, fails the later ones.
+#[tokio::test]
+async fn a_reload_turns_rule_watching_on_and_off_and_a_rejected_one_changes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    write_rules(
+        dir.path(),
+        r#"[rules.watched]
+sql = 'SELECT payload.v AS v FROM "w/#"'
+actions = []
+"#,
+    );
+    let watch = |keys: &str| format!("\n[rules]\n{keys}");
+    let setup = Setup {
+        toml: watch("sys_interval_secs = 1\ntrace = false\n"),
+        rules_by_env: true,
+        ..Setup::default()
+    };
+    let broker = start(dir.path(), "watch-node", &setup).await;
+    let config = dir.path().join("mqttd.toml");
+    let base = std::fs::read_to_string(&config)
+        .unwrap()
+        .replace(&setup.toml, "");
+    let reload = |keys: &str| {
+        std::fs::write(&config, format!("{base}{}", watch(keys))).unwrap();
+        broker.signal("HUP");
+    };
+    let (summary, trace) = (
+        "$SYS/brokers/watch-node/rules",
+        "$SYS/brokers/watch-node/trace/rules/watched",
+    );
+    let mut sub = Client::connect_v5_ok(broker.addr, "watcher").await;
+    assert_eq!(subscribe(&mut sub, 1, summary, QoS::AtMostOnce).await, [0]);
+    assert_eq!(subscribe(&mut sub, 2, trace, QoS::AtMostOnce).await, [0]);
+    let mut publ = Client::connect_v5_ok(broker.addr, "publisher").await;
+    let first = sys_where(&mut sub, summary, |_| true).await;
+    assert_eq!(first["trace"], false);
+    assert_eq!(first["interval_secs"], 1);
+    assert_eq!(first["reload"], serde_json::Value::Null);
+
+    reload("sys_interval_secs = 1\ntrace = true\n");
+    let on = sys_where(&mut sub, summary, |s| s["trace"] == true).await;
+    assert_eq!(on["reload"]["trigger"], "signal");
+    assert_eq!(on["reload"]["applied"], true);
+    broker.wait_log(&trace_is_on(20)).await;
+    assert_eq!(publish_acked(&mut publ, "w/1", br#"{"v":1}"#, 1).await, 0);
+    let record = sys_where(&mut sub, trace, |_| true).await;
+    assert_eq!(record["trigger"]["payload"], r#"{"v":1}"#);
+
+    reload("sys_interval_secs = 1\ntrace = true\ntrace_rate = 0\n");
+    let rejected = sys_where(&mut sub, summary, |s| s["reload"]["applied"] == false).await;
+    assert_eq!(rejected["reload"]["error_kind"], "config");
+    assert_eq!(rejected["trace"], true, "the trace stays on");
+    assert_eq!(
+        rejected["trace_rate"], 20,
+        "the rejected rate is not applied"
+    );
+    assert_eq!(publish_acked(&mut publ, "w/1", br#"{"v":2}"#, 2).await, 0);
+    let record = sys_where(&mut sub, trace, |_| true).await;
+    assert_eq!(record["trigger"]["payload"], r#"{"v":2}"#, "still tracing");
+
+    reload("sys_interval_secs = 2\ntrace = false\n");
+    let off = sys_where(&mut sub, summary, |s| s["trace"] == false).await;
+    assert_eq!(off["reload"]["applied"], true);
+    assert_eq!(off["interval_secs"], 2);
+    broker
+        .wait_log(" INFO mqttd::rules: rule trace is off (ADR 0084)")
+        .await;
+    assert_eq!(publish_acked(&mut publ, "w/1", br#"{"v":3}"#, 3).await, 0);
+    // Two ticks after the publish, and nothing but the summaries.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut ticks = 0;
+    while ticks < 2 {
+        assert!(
+            Instant::now() < deadline,
+            "{ticks} of two ticks after 15 s at a 2 s interval"
+        );
+        match sub.recv_bounded(Duration::from_secs(5)).await {
+            Recv::Packet(Packet::Publish(p)) => {
+                assert_eq!(p.topic, summary, "a trace record with the trace off");
+                let doc: serde_json::Value = serde_json::from_slice(&p.payload).unwrap();
+                assert_eq!(doc["trace"], false);
+                assert_eq!(doc["interval_secs"], 2);
+                ticks += 1;
+            }
+            Recv::Quiet => {}
+            other => panic!("expected only $SYS publishes, got {other:?}"),
+        }
+    }
+    let watched = broker.sample(&evaluations("watched", "passed")).await;
+    assert_eq!(watched, Some(3), "the untraced publish still ran the rule");
+}
+
+// ---------------------------------------------------------------------------------------
+// Rules edited through the admin API (ADR 0084)
+// ---------------------------------------------------------------------------------------
+
+/// The admin listener's certificates: a CA, the broker's for 127.0.0.1, and the
+/// `CN=rules-ui` client the rules are written as.
+struct AdminPki {
+    ca: std::path::PathBuf,
+    server: (std::path::PathBuf, std::path::PathBuf),
+    client: (std::path::PathBuf, std::path::PathBuf),
+}
+
+fn admin_pki(dir: &Path) -> AdminPki {
+    let key = rcgen::KeyPair::generate().unwrap();
+    let mut params = rcgen::CertificateParams::new(Vec::new()).unwrap();
+    params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "rules admin CA");
+    let ca = rcgen::CertifiedIssuer::self_signed(params, key).unwrap();
+    std::fs::write(dir.join("ca.pem"), ca.pem()).unwrap();
+    let leaf = |name: &str| {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let mut params = rcgen::CertificateParams::new(vec!["127.0.0.1".into()]).unwrap();
+        params.distinguished_name = rcgen::DistinguishedName::new();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, name);
+        params.extended_key_usages = vec![
+            rcgen::ExtendedKeyUsagePurpose::ServerAuth,
+            rcgen::ExtendedKeyUsagePurpose::ClientAuth,
+        ];
+        let cert = params.signed_by(&key, &ca).unwrap();
+        let (cert_path, key_path) = (
+            dir.join(format!("{name}.pem")),
+            dir.join(format!("{name}.key")),
+        );
+        std::fs::write(&cert_path, cert.pem()).unwrap();
+        std::fs::write(&key_path, key.serialize_pem()).unwrap();
+        (cert_path, key_path)
+    };
+    AdminPki {
+        ca: dir.join("ca.pem"),
+        server: leaf("mqttd"),
+        client: leaf("rules-ui"),
+    }
+}
+
+/// `mqttd --admin <args>` against the listener on `admin`, as `CN=rules-ui`.
+fn admin_cli(pki: &AdminPki, admin: SocketAddr, args: &[&str]) -> Ran {
+    let url = format!("https://{admin}");
+    let mut all = vec!["--admin"];
+    all.extend_from_slice(args);
+    let (ca, cert, key) = (
+        pki.ca.display().to_string(),
+        pki.client.0.display().to_string(),
+        pki.client.1.display().to_string(),
+    );
+    all.extend_from_slice(&["--url", &url, "--ca", &ca, "--cert", &cert, "--key", &key]);
+    cli(&all)
+}
+
+/// The environment that opens the admin listener on `admin` with `pki`, `CN=rules-ui` an
+/// operator and its only rules writer.
+fn admin_env(pki: &AdminPki, admin: SocketAddr) -> Vec<(&'static str, String)> {
+    vec![
+        ("MQTTD_ADMIN_BIND", admin.to_string()),
+        ("MQTTD_ADMIN_CERT", pki.server.0.display().to_string()),
+        ("MQTTD_ADMIN_KEY", pki.server.1.display().to_string()),
+        ("MQTTD_ADMIN_CLIENT_CA", pki.ca.display().to_string()),
+        ("MQTTD_ADMIN_OPERATORS", "CN=rules-ui".to_string()),
+        ("MQTTD_RULES_ADMIN_WRITERS", "CN=rules-ui".to_string()),
+    ]
+}
+
+const EDIT_A: &str = r#"# The rules the admin API edits.
+[rules.watched]
+sql = 'SELECT payload.v AS v FROM "w/#"'
+actions = [{ function = "republish", args = { topic = "out/w/${v}", payload = "${v}" } }]
+"#;
+
+const EDIT_B: &str = r#"# The rules the admin API edits.
+[rules.watched]
+sql = 'SELECT payload.v AS v FROM "w/#"'
+actions = [{ function = "republish", args = { topic = "out/w/${v}", payload = "${v}" } }]
+
+[rules.added]
+sql = 'SELECT payload.v AS v FROM "n/#"'
+actions = [{ function = "republish", args = { topic = "out/new/${v}", payload = "${v}" } }]
+"#;
+
+/// ADR 0084: a rules writer edits the running rules through the admin API, from the
+/// operator's own commands — `mqttd --admin rules-source`, `rules-apply`, `rules` and
+/// `rule-delete` — and the next message runs the edited rules, for a client that stayed
+/// connected throughout. `rules-source` prints the file byte for byte; `rules-apply`
+/// without `--if_match` is refused (428) and writes nothing; with it the file is replaced
+/// and reloaded; a delete leaves the rest. A broker that wrote the file but did not
+/// reload, or reloaded only for new connections, fails the first derived message; one
+/// whose delete did not take fails the order of the last two.
+#[tokio::test]
+async fn an_admin_rules_edit_applies_to_the_next_message() {
+    let dir = tempfile::tempdir().unwrap();
+    let pki_dir = tempfile::tempdir().unwrap();
+    write_rules(dir.path(), EDIT_A);
+    let pki = admin_pki(pki_dir.path());
+    let admin = band_addr();
+    let setup = Setup {
+        env: admin_env(&pki, admin),
+        ..Setup::default()
+    };
+    let broker = start(dir.path(), "edit-node", &setup).await;
+    broker
+        .wait_log(&format!(
+            "serving the admin API (mTLS; ADR 0081) bind={admin} viewers=0 operators=1 \
+             rules_writers=1 peers=false"
+        ))
+        .await;
+    let mut sub = Client::connect(broker.addr, "edit-sub").await;
+    assert_eq!(subscribe(&mut sub, 1, "out/#", QoS::AtMostOnce).await, [0]);
+    let mut publ = Client::connect(broker.addr, "edit-pub").await;
+
+    let source = admin_cli(&pki, admin, &["rules-source"]);
+    assert_eq!(
+        (source.code, source.stdout.as_str()),
+        (Some(0), EDIT_A),
+        "{source:?}"
+    );
+
+    let next_file = pki_dir.path().join("next.toml");
+    std::fs::write(&next_file, EDIT_B).unwrap();
+    let next_path = next_file.display().to_string();
+    let refused = admin_cli(&pki, admin, &["rules-apply", &next_path]);
+    assert_eq!(refused.code, Some(1), "{refused:?}");
+    assert!(
+        refused.stderr.contains("428 precondition-required"),
+        "{refused:?}"
+    );
+    let digest = sha256_hex(EDIT_A.as_bytes());
+    let applied = admin_cli(
+        &pki,
+        admin,
+        &["rules-apply", &next_path, "--if_match", &digest],
+    );
+    assert_eq!(applied.code, Some(0), "{applied:?}");
+    assert!(
+        applied
+            .stdout
+            .lines()
+            .any(|l| l.starts_with("applied ") && l.ends_with(" true")),
+        "{applied:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("rules.toml")).unwrap(),
+        EDIT_B
+    );
+
+    // The connection that was open all along runs the new rule on its next message.
+    publ.publish("n/1", br#"{"v":"x"}"#, QoS::AtMostOnce, None, vec![])
+        .await;
+    assert_eq!(
+        next(&mut sub).await,
+        got("out/new/x", "x", QoS::AtMostOnce, false)
+    );
+    let table = admin_cli(&pki, admin, &["rules"]);
+    assert_eq!(table.code, Some(0), "{table:?}");
+    let added: Vec<&str> = table
+        .stdout
+        .lines()
+        .find(|l| l.starts_with("added "))
+        .unwrap_or_else(|| panic!("no row for the new rule: {table:?}"))
+        .split_whitespace()
+        .collect();
+    assert_eq!(added[..5], ["added", "yes", "n/#", "1", "1"], "{table:?}");
+
+    // Deleted, it no longer runs: the message after this one is the first to arrive.
+    let deleted = admin_cli(&pki, admin, &["rule-delete", "added"]);
+    assert_eq!(deleted.code, Some(0), "{deleted:?}");
+    publ.publish("n/2", br#"{"v":"z"}"#, QoS::AtMostOnce, None, vec![])
+        .await;
+    publ.publish("w/1", br#"{"v":"y"}"#, QoS::AtMostOnce, None, vec![])
+        .await;
+    assert_eq!(
+        next(&mut sub).await,
+        got("out/w/y", "y", QoS::AtMostOnce, false)
+    );
+    let on_disk = std::fs::read_to_string(dir.path().join("rules.toml")).unwrap();
+    assert!(
+        on_disk.starts_with(EDIT_A) && !on_disk.contains("[rules.added]"),
+        "{on_disk}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("rules.toml.prev")).unwrap(),
+        EDIT_B,
+        "the replaced file is kept"
+    );
+}
+
+/// ADR 0084: rules writers configured for a rules file whose directory the broker may not
+/// write in — the documented read-only mounts — are a configuration that refuses every
+/// write, and the broker says so at boot and again on each reload, before anyone tries.
+/// A broker that stayed quiet until the first write fails the first wait; one that warned
+/// only at boot fails the second count.
+#[cfg(unix)]
+#[tokio::test]
+async fn writers_for_a_rules_directory_the_broker_cannot_write_in_are_warned_about() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let pki_dir = tempfile::tempdir().unwrap();
+    write_rules(dir.path(), EDIT_A);
+    let read_only = dir.path().join("ro");
+    std::fs::create_dir(&read_only).unwrap();
+    std::fs::write(read_only.join("rules.toml"), EDIT_A).unwrap();
+    std::fs::set_permissions(&read_only, std::fs::Permissions::from_mode(0o555)).unwrap();
+    if std::fs::write(read_only.join("probe"), "").is_ok() {
+        std::fs::set_permissions(&read_only, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::skip_locally_or_fail_in_ci!(
+            "this user can create files in a mode-555 directory (running as root?), so a \
+             rules directory the broker may not write in cannot be made here; run the suite \
+             as an unprivileged user"
+        );
+    }
+    let pki = admin_pki(pki_dir.path());
+    let admin = band_addr();
+    let mut env = admin_env(&pki, admin);
+    env.push((
+        "MQTTD_RULES_FILE",
+        read_only.join("rules.toml").display().to_string(),
+    ));
+    let broker = start(
+        dir.path(),
+        "ro-node",
+        &Setup {
+            env,
+            ..Setup::default()
+        },
+    )
+    .await;
+    let warning = format!(
+        " WARN mqttd: rules.admin_writers is set but the rules file's directory is not \
+         writable by the broker ({}: Permission denied (os error 13)): every admin rules \
+         write will be refused with rules-file-unwritable (ADR 0084)",
+        read_only.display()
+    );
+    broker.wait_log(&warning).await;
+    assert_eq!(broker.log_lines(|l| l.ends_with(&warning)).len(), 1);
+    broker.signal("HUP");
+    // Once at boot, once on the reload.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while broker.log_lines(|l| l.ends_with(&warning)).len() < 2 {
+        assert!(
+            Instant::now() < deadline,
+            "the reload did not warn again within 15 s; log tail:\n{}",
+            broker.log.tail(20)
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    std::fs::set_permissions(&read_only, std::fs::Permissions::from_mode(0o755)).unwrap();
+}

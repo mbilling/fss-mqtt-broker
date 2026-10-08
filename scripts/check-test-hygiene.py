@@ -2146,13 +2146,22 @@ def take_inventory(
 
             here = listed(["--list"])
             skipped = listed(["--list", "--ignored"])
-            names = [(n, None, n in skipped) for n in here]
+            gated = {
+                name: (pred, ign)
+                for src in target_sources(rel)
+                for name, pred, ign in tests_in_file(parse(src), rel)
+                if pred
+            }
+            # A compiled test keeps its source predicate too. Recording it only for the tests
+            # this host could NOT compile made the file depend on where it was generated: a
+            # Linux run erased the `target_os = "linux"` notes a Mac run had written, and the
+            # Mac's check then wanted two tests its binaries cannot contain.
+            names = [(n, gated.get(n, (None, False))[0], n in skipped) for n in here]
             # Tests this host cannot see because a `cfg` excluded them: recorded with the
             # predicate, so the platform that DOES compile them still checks them.
-            for src in target_sources(rel):
-                for name, pred, ign in tests_in_file(parse(src), rel):
-                    if pred and not host_cfg(pred) and name not in here:
-                        names.append((name, pred, ign))
+            for name, (pred, ign) in gated.items():
+                if not host_cfg(pred) and name not in here:
+                    names.append((name, pred, ign))
             inv[rel] = (sorted(names), filecfg)
     return inv
 
@@ -2232,7 +2241,7 @@ def check_inventory(only: str | None) -> list[str]:
             continue
         # Only what this host actually compiled counts as "have": `take_inventory` also
         # reports the tests it knows exist elsewhere, and those are not evidence about here.
-        have = {n for n, p, _ in names if p is None}
+        have = {n for n, p, _ in names if p is None or host_cfg(p)}
         want = {n for n, p, _ in recorded[rel][0] if p is None or host_cfg(p)}
         elsewhere = {n for n, p, _ in recorded[rel][0] if p is not None and not host_cfg(p)}
         # `#[ignore]` is the one edit that removes a test from every run while leaving it in

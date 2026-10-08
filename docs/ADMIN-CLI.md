@@ -1,7 +1,8 @@
 # The admin command line: `mqttd --admin`
 
 **Verified against `main` after `v1.0.18` (2026-09-30)**, every example below captured from a
-live three-node cluster (`scripts/admin-e2e.sh`). The HTTP interface behind each command is
+live three-node cluster (`scripts/admin-e2e.sh`), except the
+[rules verbs](#rules-rules-source-rules-apply-rule-delete) (2026-10-08). The HTTP interface behind each command is
 [ADMIN-API.md](ADMIN-API.md); the decision record is [ADR 0081](adr/0081-admin-api.md).
 
 `mqttd --admin <verb>` asks a running broker's admin API a question or tells it to act, and
@@ -18,7 +19,8 @@ kubectl exec mqttd-0 -- mqttd --admin cluster
 - [Verbs](#verbs) — [who am I](#whoami) · [the cluster](#node-cluster-placement) ·
   [clients and sessions](#clients-session-subscribers-backlog-retained) ·
   [authorization](#authz) · [config and reload](#config-reload) ·
-  [kick and purge](#kick-purge) · [cordon](#cordon-uncordon) · [logging](#log-level-log-override-log-reset)
+  [kick and purge](#kick-purge) · [cordon](#cordon-uncordon) · [logging](#log-level-log-override-log-reset) ·
+  [rules](#rules-rules-source-rules-apply-rule-delete)
 - [Recipes](#recipes)
 - [Other `mqttd` commands for operators](#other-mqttd-commands-for-operators)
 - [Try it without a deployment](#try-it-without-a-deployment)
@@ -36,8 +38,9 @@ or `admin.operators`. The broker side is in
 
 | Role | Can |
 |---|---|
-| `viewer` | every read: `whoami`, `node`, `cluster`, `placement`, `clients`, `session`, `subscribers`, `backlog`, `retained`, `authz`, `config`, `log-level` |
-| `operator` | everything a viewer can, plus the actions: `reload`, `kick`, `purge`, `cordon`, `uncordon`, `log-override`, `log-reset` |
+| `viewer` | every read: `whoami`, `node`, `cluster`, `placement`, `clients`, `session`, `subscribers`, `backlog`, `retained`, `authz`, `config`, `log-level`, `rules` (without SQL or error text) |
+| `operator` | everything a viewer can, plus the actions: `reload`, `kick`, `purge`, `cordon`, `uncordon`, `log-override`, `log-reset`, and `rules-source` |
+| `operator` listed in `[rules] admin_writers` | also the rules writes: `rules-apply`, `rule-delete` |
 
 Every request is written to the broker's audit log (`admin.request`) with your certificate
 subject, role, the command and its outcome.
@@ -77,15 +80,20 @@ By default the answer is printed for a terminal: `key  value` lines (nested fiel
 with `.`), and each list as a table under its name. A table's identifying columns come
 first, always in this order: `NODE_ID`, `CLIENT_ID`, `NODE`, `TOPIC`, `FILTER`, `REPLIED`,
 `CONNECTED`. The rest follow alphabetically. `cluster` prints a compact view instead
-([below](#node-cluster-placement)). `--json` prints the API's JSON, for scripts and `jq`,
+([below](#node-cluster-placement)), `rules` a table of its own, and `rules-source` the
+file's text alone ([below](#rules-rules-source-rules-apply-rule-delete)). `--json` prints the API's JSON, for scripts and `jq`,
 refusals included, so a rejected `reload` still shows its outcome. `help` wraps to 100
-columns.
+columns. A control character in text the broker sends (a rule's last error that quotes a
+payload, say) is printed as its escape, never passed to your terminal: `\u{1b}` for ESC,
+`\u{7}` for BEL, `\r`, `\u{9b}` in the terminal views (a refusal's message keeps its line
+breaks, and `LAST_ERROR` shows one as a space), and `\u001b`, `\u009b` in `--json`, which
+stays valid JSON. `rules-source` prints the file verbatim.
 
 | Exit | Meaning |
 |---|---|
 | `0` | the broker answered and did it |
 | `1` | the broker refused (the message says why: `403 forbidden`, `404 not-found`, `409 reload-rejected`, …) or could not be reached |
-| `2` | a usage error (unknown verb, missing argument, no URL or certificate) — nothing was sent |
+| `2` | a usage error (unknown verb, missing argument, no URL or certificate), or a local file `rules-apply` cannot read — nothing was sent |
 
 A refusal prints the HTTP status, a stable code, and a message:
 
@@ -127,7 +135,8 @@ subject  CN=root, O=example
 `cluster` asks every member's admin listener for its state, in parallel (3 s each), and
 merges the answers. A node that does not answer is a row with `replied: false` and the
 reason — never left out, never shown as healthy. The summary is the split-brain and
-convergence check: `same_cluster_id`, `same_version`, `same_config`, `same_membership`.
+convergence check: `same_cluster_id`, `same_version`, `same_config`, `same_rules`,
+`same_membership`.
 
 The terminal view fits in 100 columns: a summary line, whether the nodes agree (or which
 check differs), and one short row per node.
@@ -135,7 +144,7 @@ check differs), and one short row per node.
 ```text
 $ mqttd --admin cluster
 3 nodes: 3 replied, 3 ready (answered by mqttd-1)
-they agree on cluster id, version, config and membership
+they agree on cluster id, version, config, rules and membership
 
 NODE     STATE  LEADER  EPOCH  MEMBERS  LAG  VERSION  CLUSTER   MS  NOTES
 mqttd-1  ready  *       1      3        0    1.0.18   f8995cf8  0   -
@@ -153,8 +162,9 @@ mqttd-3  ready  -       1      3        0    1.0.18   f8995cf8  39  -
 | `NOTES` | what is wrong: `quarantined`, `brownout`, `swim-isolated`, `under-replicated`, `decommissioning`, `not live`, or why the node did not reply |
 
 `--json` has every field of every row: admin address, full cluster id, config checksum,
-protocol version. For every node to appear, each must run its admin listener and the node
-you ask must have cluster TLS ([ADMIN-API.md § The cluster view](ADMIN-API.md#the-cluster-view)).
+rules digest, protocol version. For every node to appear, each must run its admin listener
+and the node you ask must have cluster TLS
+([ADMIN-API.md § The cluster view](ADMIN-API.md#the-cluster-view)).
 
 ### `clients`, `session`, `subscribers`, `backlog`, `retained`
 
@@ -257,7 +267,10 @@ $ mqttd --admin authz anonymous publish secret/x --json | jq '{allowed, reason}'
 
 `rule.index` counts the policy file's `[[rules]]` from 0. With no rule matching, `rule` is
 absent and the reason names the policy default. For `connect`, the session-owner guard
-(ADR 0031) still applies on top of the policy.
+(ADR 0031) still applies on top of the policy. For `publish`, a topic in `$SYS` is
+refused before the policy is asked (`reserved: $SYS/ is the broker's (ADR 0084)`), as
+the broker refuses it whatever the ACL says; a Mosquitto bridge's
+`$SYS/broker/connection/<id>/state` is the one exception, and the policy decides it.
 
 ### `config`, `reload`
 
@@ -267,7 +280,8 @@ absent and the reason names the policy default. For `connect`, the session-owner
 | `reload` | operator | the reload `SIGHUP` runs, reporting what happened |
 
 The config file stays the only source of configuration: `reload` takes no input, it re-reads
-the file. A good edit:
+the file. (The rules file can also be written through the API, by a listed writer:
+[`rules-apply`](#rules-rules-source-rules-apply-rule-delete).) A good edit:
 
 ```text
 $ mqttd --admin reload
@@ -361,6 +375,82 @@ override_remaining_secs  59
 The audit trail always keeps logging: every override carries `audit=info`, and a filter that
 names the `audit` target is refused. The override is per node and not persisted.
 
+### `rules`, `rules-source`, `rules-apply`, `rule-delete`
+
+The rules **this node** runs, and the rules file behind them
+([ADR 0084](adr/0084-watching-and-editing-rules-live.md)). Rules are per-node
+configuration: ask, and write to, each node.
+
+| Verb | Role | Does |
+|---|---|---|
+| `rules` | viewer | a table of the running rules and what they have done since the broker started |
+| `rules-source` | operator | the rules file as it is on disk, printed verbatim, so `> rules.toml` saves an exact copy |
+| `rules-apply <file> [--if_match <digest>\|*]` | operator, listed in `[rules] admin_writers` | replace the rules file with the local `<file>`; the broker checks it, writes it atomically and reloads |
+| `rule-delete <id> [--if_match <digest>]` | operator, listed in `[rules] admin_writers` | remove one rule from the file, keeping the rest of it byte for byte (deleting the last rule also drops the blank lines that would then end the file), and reload |
+
+`rules` has one row per rule, in the order the rules run:
+
+| Column | Meaning |
+|---|---|
+| `ID`, `ENABLED`, `FROM`, `ACTIONS` | the rule: its id, whether it runs, its `FROM`, how many actions |
+| `MATCHED`, `PASSED`, `NO_RESULT`, `FAILED` | messages its `FROM` selected, and how its statement ended for them |
+| `ACTIONS_FAILED` | actions that failed: could not render, or the broker refused or did not route what they derived |
+| `LAST_ERROR` | the latest failure, cut short to fit |
+
+Captured from [`demo/rules-live`](../demo/rules-live/README.md) (rows cut):
+
+```text
+$ mqttd --admin rules
+node-local: 21 rules, 21 enabled; running f424960486fa, on disk the same
+last reload: 2026-10-08T14:22:44.893Z by admin-rules, applied
+
+ID                     ENABLED  FROM                                    ACTIONS  MATCHED  PASSED  NO_RESULT  FAILED  ACTIONS_FAILED  LAST_ERROR
+car_driving_events     yes      vehicle/+/telemetry                     1        2044     16      2028       0       0               -
+car_mobility_feed      yes      vehicle/+/telemetry, vehicle/+/triplog  1        2047     265     1782       0       0               -
+car_presence           yes      client.connected, client.disconnected   2        145      42      103        0       0               -
+home_grid_feed         yes      home/+/p1                               1        1678     280     1398       0       0               -
+power_grid_frequency   yes      plant/+/poc/grid                        1        1049     49      1000       0       0               -
+power_rtu_csv          yes      plant/+/+/rtu                           2        140      137     3          0       0               -
+```
+
+The header is `<node>: N rules, M enabled; running <the first 12 hex digits of digest>, on
+disk the same` (or the file's first 12 hex digits when it differs), then `last reload: <at>
+by <trigger>, applied` or `REJECTED (<error_kind>)`, and, for an operator,
+`K warning(s): see --json` when there are any. An event rule's `FROM` lists its events.
+`LAST_ERROR` is the kind (an operator also sees `: <message>`), cut to 40 characters with
+`…`.
+
+`--json` prints the whole answer instead: the running digest and the one on disk, the
+loader's warnings, the last reload and, for an operator, every rule's SQL and actions
+([ADMIN-API.md § `/rules`](ADMIN-API.md#get-adminv1rules)).
+
+**Changing the rules.** `rules-apply` sends the local file's text; the file is read when
+the command runs. A write needs the operator role and a subject listed in
+`[rules] admin_writers`, which is empty, so off, by default
+(`403 rules-read-only`). `--if_match` is the SHA-256 of the file you started from, so a
+change someone else made meanwhile is refused (`412 digest-mismatch`) instead of lost;
+`--if_match '*'` overwrites on purpose. `rules-apply` needs one
+(`428 precondition-required` without it):
+
+```sh
+mqttd --admin rules-source > rules.toml
+digest=$(sha256sum rules.toml | cut -d' ' -f1)
+vi rules.toml
+mqttd --admin rules-apply rules.toml --if_match "$digest"
+```
+
+A file that does not load is refused before anything is written (`422 rules-invalid`, with
+where: the line and column in the file, the rule and the line and column in its SQL, or
+the rule alone), exit 1. On success the answer says whether the new rules are running (`applied`) and their
+digest. A reload refused for another reason (a broken ACL file) is
+`409 reload-rejected` with `written: true`: the file was written, and the next good reload
+applies it. Every write that changes the file is audited (`rules.write`), and the previous
+file is kept beside it as `<file>.prev`; a file sent unchanged writes nothing
+(`written: false`).
+
+The per-rule `PUT`, `check` and `test` take JSON bodies and have no verb; call them over
+HTTPS ([ADMIN-API.md § Rules](ADMIN-API.md#rules)).
+
 ## Recipes
 
 **Is the cluster healthy and converged?**
@@ -374,6 +464,12 @@ mqttd --admin cluster --json | jq '.summary'
 ```sh
 sha256sum mqttd.toml
 mqttd --admin cluster --json | jq -r '.nodes[] | "\(.node_id) \(.config_checksum)"'
+```
+
+**Does every node run the same rules?**
+
+```sh
+mqttd --admin cluster --json | jq '.summary.same_rules, (.nodes[] | "\(.node_id) \(.rules_digest)")'
 ```
 
 **Why can't this device publish?**

@@ -44,10 +44,15 @@ Every option goes to the simulator:
 ```sh
 demo/rules/run.sh --speed 1                  # real time: ten minutes
 demo/rules/run.sh --domains cars --quiet     # one domain, derived messages only
-demo/rules/run.sh --start now --duration 3600   # an hour from now: the sun, the tariff and
-                                                # the faults follow the real clock instead
+demo/rules/run.sh --start now --duration 3600   # an hour from now, on the real clock
 demo/rules/run.sh --help                     # everything else
 ```
+
+With `--start now` the sun, the weather, the tariff and the season are the real clock's,
+but the injected faults still come at the same seconds after the start. A fault that needs
+daylight, the evening peak or the heating season does not happen outside them: no PV
+ground fault at night, no EV peak-tariff alert outside 17:00-21:00 Danish time, no heating
+or heat-pump alerts outside the heating season.
 
 To watch it with your own tools, run the broker yourself, from a build that has the rule
 engine ([RULES.md, step 1](../../docs/RULES.md#1-get-a-build-that-has-the-rule-engine); a
@@ -65,6 +70,24 @@ Its log must say `rule engine: rules loaded (ADR 0083) rules=21`. Then, in anoth
 mosquitto_sub -p 1884 -t 'alerts/#' -v &
 python3 demo/rules/simulate.py --port 1884 --no-watch --quiet
 ```
+
+**Live mode.** [`live.py`](live.py) plays the same simulation for as long as it runs, in
+real time: the ten minutes again and again, in windows aligned to the wall clock, so it
+shows a fresh alert every minute or so. With `--clock now` (the default) the devices'
+clocks are the real one, with the time-of-day and season limits above; with
+`--clock fixture` every window replays this page's ten minutes, timestamps included. It
+joins the schedule mid-window, drops what it could not send on time rather than sending it
+late, reconnects when the broker goes away and comes back, and stops cleanly on Ctrl-C.
+Device state starts afresh with each window: odometers, meter registers and charge levels
+jump back.
+
+```sh
+python3 demo/rules/live.py --port 1884 --quiet
+```
+
+[`demo/rules-live`](../rules-live/) runs it as a Docker Compose stack: the broker with
+these rules, one simulator per domain, the rules' own statistics on `$SYS`, and a small
+web page to edit the rules while they run.
 
 ## What is simulated
 
@@ -390,7 +413,8 @@ client, as the devices and their gateways make them. It asserts that the 1,333 d
 [`rules_demo.expected`](../../crates/mqttd/tests/rules_demo.expected): topic, QoS, retain
 flag and payload, with nothing missing and nothing extra. It also checks that the
 simulator is deterministic, that `rules.toml` passes `mqttd --check-rules` with no
-warning, and that every `⇒` line on this page is one of them. After an intended change to
+warning, that every `⇒` line on this page is one of them, and that every window of
+`live.py --clock fixture` is the fixture again. After an intended change to
 the rules or the simulator, regenerate the expected output with
 `MQTTD_DEMO_BLESS=1 cargo test -p mqttd --test rules_demo the_demo_derives`, and review
 its diff like any other change.

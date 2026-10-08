@@ -1,0 +1,165 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>mqttd rules, live</title>
+<link rel="stylesheet" href="style.css">
+<script src="app.js" defer></script>
+</head>
+<body>
+<header class="top">
+  <h1>mqttd rules, live</h1>
+  <dl class="summary">
+    <div><dt>Node</dt><dd id="s-node">-</dd></div>
+    <div><dt>Running rules</dt><dd id="s-digest">-</dd></div>
+    <div><dt>Rules file</dt><dd id="s-file">-</dd></div>
+    <div><dt>Rules</dt><dd id="s-count">-</dd></div>
+    <div><dt>Last reload</dt><dd id="s-reload">-</dd></div>
+    <div><dt>Trace</dt><dd id="s-trace">-</dd></div>
+    <div><dt>Live feed</dt><dd id="s-feed">connecting</dd></div>
+  </dl>
+</header>
+<p id="banner" class="banner" role="alert" hidden></p>
+
+<main>
+  <section class="rules" aria-labelledby="h-rules">
+    <div class="heading">
+      <h2 id="h-rules">Rules</h2>
+      <button type="button" id="new-rule">New rule</button>
+    </div>
+    <p class="hint">Counts since the broker started (an edited rule keeps its counts), and per
+      second over the last 10 s, live from <code>$SYS/brokers/+/rules/#</code>. Choose a rule to
+      edit it and watch its trace.</p>
+    <div class="scroll">
+      <table id="rules">
+        <caption class="visually-hidden">Rules and their live statistics</caption>
+        <thead>
+          <tr>
+            <th scope="col">Rule</th>
+            <th scope="col">On</th>
+            <th scope="col">From</th>
+            <th scope="col" title="The topics its republish actions publish to">To</th>
+            <th scope="col" class="num">Matched</th>
+            <th scope="col" class="num">Passed</th>
+            <th scope="col" class="num"
+                title="FROM matched, but WHERE was false (or FOREACH produced nothing): nothing was published">No result</th>
+            <th scope="col" class="num">Failed</th>
+            <th scope="col" class="num">Actions failed</th>
+            <th scope="col" class="num" title="Matched per second, over the last 10 s">Matched/s</th>
+            <th scope="col" class="num" title="Passed per second, over the last 10 s">Passed/s</th>
+            <th scope="col">Last active</th>
+            <th scope="col">Last error</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="editor" aria-labelledby="h-editor">
+    <h2 id="h-editor" tabindex="-1">Rule <span id="editing">(choose one, or New rule)</span></h2>
+    <p id="r-changed" class="notice" role="status" hidden></p>
+    <form id="rule-form" novalidate>
+      <div class="row">
+        <label for="f-id">Id</label>
+        <input id="f-id" autocomplete="off" spellcheck="false" maxlength="64">
+      </div>
+      <div class="row">
+        <label for="f-description">Description</label>
+        <input id="f-description" autocomplete="off">
+      </div>
+      <div class="row check">
+        <input type="checkbox" id="f-enable">
+        <label for="f-enable">Enabled</label>
+      </div>
+      <div class="row">
+        <label for="f-sql">SQL</label>
+        <p id="sql-hint" class="hint">Rules do not chain: a rule never runs on a message a rule
+          published, so a FROM on what the demo's rules write (<code>alerts/</code>,
+          <code>kpi/</code>, <code>normalized/</code>, <code>analytics/</code>, <code>state/</code>,
+          <code>events/</code>) does not fire on those.</p>
+        <textarea id="f-sql" rows="14" spellcheck="false" aria-describedby="sql-hint"></textarea>
+      </div>
+      <div class="row">
+        <label for="f-actions">Actions (JSON, as in the rules file)</label>
+        <textarea id="f-actions" rows="7" spellcheck="false"></textarea>
+      </div>
+      <fieldset>
+        <legend>Test it against</legend>
+        <div class="check">
+          <input type="radio" name="input" id="t-latest" value="latest" checked>
+          <label for="t-latest">the latest device message its FROM matches</label>
+        </div>
+        <div class="check">
+          <input type="radio" name="input" id="t-custom" value="custom">
+          <label for="t-custom">this message</label>
+        </div>
+        <div class="row">
+          <label for="t-topic">Topic</label>
+          <input id="t-topic" autocomplete="off" spellcheck="false">
+        </div>
+        <div class="row">
+          <label for="t-payload">Payload</label>
+          <textarea id="t-payload" rows="3" spellcheck="false"></textarea>
+        </div>
+      </fieldset>
+      <div class="buttons">
+        <button type="button" id="b-check">Check</button>
+        <button type="button" id="b-test">Test</button>
+        <button type="button" id="b-apply" class="primary">Apply</button>
+        <button type="button" id="b-delete" class="danger">Delete</button>
+      </div>
+    </form>
+    <div id="r-out" class="out" aria-live="polite"></div>
+  </section>
+
+  <section class="trace" aria-labelledby="h-trace">
+    <h2 id="h-trace">Trace <span id="trace-rule"></span></h2>
+    <p class="hint">What the chosen rule ran on, and what it rendered, from
+      <code id="trace-topic">$SYS/brokers/+/trace/rules/&lt;id&gt;</code>.
+      <span id="trace-rate"></span> A no_result record is a message its FROM matched, but its
+      WHERE was false (or FOREACH produced nothing): nothing was published.</p>
+    <div id="trace-sub" class="cmd" hidden>
+      <code id="trace-cmd"></code>
+      <button type="button" id="b-copy">Copy</button>
+    </div>
+    <div class="controls">
+      <input type="checkbox" id="tr-hide">
+      <label for="tr-hide">Hide no_result</label>
+      <input type="checkbox" id="tr-pause">
+      <label for="tr-pause">Pause</label>
+    </div>
+    <ol id="trace" class="feed"></ol>
+  </section>
+
+  <section class="data" aria-labelledby="h-data">
+    <h2 id="h-data">Live messages</h2>
+    <div class="controls">
+      <label for="d-filter">Filter</label>
+      <input id="d-filter" type="search" autocomplete="off" spellcheck="false"
+             placeholder="text in the topic, or a filter such as alerts/#">
+      <input type="checkbox" id="d-pause">
+      <label for="d-pause">Pause</label>
+    </div>
+    <ol id="data" class="feed"></ol>
+  </section>
+
+  <section class="file" aria-labelledby="h-file">
+    <h2 id="h-file">The whole rules file</h2>
+    <p class="hint">What is on disk in the broker. Apply replaces it only if nobody changed it
+      since you loaded it.</p>
+    <div class="buttons">
+      <button type="button" id="b-load">Load</button>
+      <button type="button" id="b-fcheck">Check</button>
+      <button type="button" id="b-fapply" class="primary">Apply</button>
+      <button type="button" id="b-reset" class="danger">Reset to the shipped rules</button>
+    </div>
+    <label for="f-source" class="visually-hidden">Rules file</label>
+    <textarea id="f-source" rows="24" spellcheck="false"></textarea>
+    <div id="f-out" class="out" aria-live="polite"></div>
+  </section>
+</main>
+</body>
+</html>

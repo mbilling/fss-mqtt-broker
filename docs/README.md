@@ -37,6 +37,7 @@ audit it · contribute*.
 | [RULES.md](RULES.md) | Application developer / migrator | The rule engine: EMQX-compatible rule SQL, functions, republish semantics at every QoS, and every difference from EMQX. |
 | [RULES-COOKBOOK.md](RULES-COOKBOOK.md) | Application developer | Sixteen working rule recipes, each a copyable file in `examples/rules/` that a test runs against the real broker. |
 | [../demo/rules/](../demo/rules/README.md) | Application developer / evaluator | The rule engine on realistic data: simulated power plants, homes and cars, 21 rules, and what they derive, replayed by a test. |
+| [../demo/rules-live/](../demo/rules-live/README.md) | Application developer / evaluator | The same rules, live: the simulators running without end, each rule's statistics and trace on `$SYS`, and a local page that edits the rules through the admin API while they run (ADR 0084). |
 | [INTEGRATION.md](INTEGRATION.md) | Application developer | External consumers (Kafka/webhook/DB) as an ordinary `$share` group; the rule engine has no sinks. |
 | [GLOSSARY.md](GLOSSARY.md) | All | MQTT + mqttd clustering/security vocabulary. |
 | [REVIEW-PANEL.md](REVIEW-PANEL.md) | Maintainer | Method for external-style documentation review panels. |

@@ -1,6 +1,6 @@
 # Hardening baseline
 
-**Verified against `v1.1.0` (2026-10-07).** The checkable companion to the
+**Verified against `v1.1.0` (2026-10-07); ADR 0084's items added 2026-10-08.** The checkable companion to the
 [threat model](THREAT-MODEL.md) (ADR 0066 T2): numbered items, each stating the
 control, the knob that enforces it, the shipped default, and a **verification an
 auditor can run**. The [SECURED-CLUSTER-TUTORIAL](SECURED-CLUSTER-TUTORIAL.md)
@@ -54,6 +54,7 @@ configuration before any port binds and is the pre-rollout gate for all of it.
 | H-3.2 | L1 | The ACL defaults to deny | `default = "deny"` in the ACL file | `grep 'default *= *"deny"' <acl file>`; a client publishing outside its grants sees v5 `0x87` on PUBACK (v3.1.1: the message silently drops — **check the audit log**, `acl.deny.publish`) |
 | H-3.3 | L2 | Identity-scoped topics use `%i` (principal), not `%c` (client-chosen id), for tenant boundaries | ACL patterns | review: `grep '%c' <acl file>` hits are each justified or paired with H-3.4 |
 | H-3.4 | L2 | `connect` rules constrain which client ids an identity may claim | `[[connect]]` rules in the ACL file (opt-in; absent = any id) | a client connecting with another identity's id is refused CONNACK `0x87` |
+| H-3.5 | L2 | `$SYS` is granted on purpose, and only the rule statistics: monitoring identities get `subscribe` on `$SYS/brokers/+/rules/#` (counts and error kinds, no error text or payload); nobody gets `$SYS/#`, which includes the rule trace (message payloads); a shared grant on the statistics names them (`$share/+/$SYS/brokers/+/rules/#`): a broad `$share/+/#` does not reach `$SYS` | ACL rules; `#` never covers a `$`-topic, so only `default = "allow"` (H-3.2), an explicit `$SYS` pattern, or a `$share` pattern whose inner filter names `$SYS` grants it | `mqttd --admin authz <monitor> subscribe '$SYS/brokers/+/trace/rules/+'` and `… subscribe '$share/g/$SYS/brokers/+/trace/rules/+'` both answer `allowed: false`; `grep -nE '"\$SYS/#"\|"\$share/[^"]*/\$SYS/#"' <acl file>` finds only deny rules |
 
 ## 4. Cluster planes
 
@@ -101,6 +102,9 @@ Single-node deployments: verify none of the cluster binds are set and skip to §
 | H-7.5 | L2 | systemd deployments use the shipped hardened unit | `deploy/systemd/mqttd.service` | `systemctl show mqttd -p ProtectSystem,NoNewPrivileges,User` → `strict`, `yes`, `mqttd` |
 | H-7.7 | L1 | The admin API, when on, is reachable only from operator networks and its CA issues admin certificates only | `MQTTD_ADMIN_BIND` on an internal interface; a dedicated `MQTTD_ADMIN_CLIENT_CA` (not the client-listener CA, and not the cluster CA — with the cluster CA every unlisted node certificate is admitted as `peer` instead of refused) | external scan: the admin port is unreachable from outside; `openssl x509 -in <admin CA> -noout -subject` names an admin-only CA |
 | H-7.8 | L2 | Admin roles are least-privilege | `MQTTD_ADMIN_OPERATORS` lists only the people/automation that act; everyone else in `MQTTD_ADMIN_VIEWERS` | `mqttd --admin whoami` for each issued certificate shows the intended role; operators list reviewed with access reviews |
+| H-7.9 | L1 | The rule trace is off: it copies message payloads, client ids and usernames onto `$SYS` | `MQTTD_RULES_TRACE` unset (default off); on, it logs a WARN, and `INSECURE:` with no ACL file or `default = "allow"` | `mqttd --print-config` (or `mqttd --admin config --json`) shows `rules.trace = false` |
+| H-7.10 | L1 | Rules writes over the admin API are off, or limited to the people who may edit the ACL file: a rules writer can derive messages onto any topic | `MQTTD_RULES_ADMIN_WRITERS` empty (the default: no writes); a listed subject must also be in `admin.operators` | `mqttd --admin config --json \| jq .config.rules.admin_writers` is `[]`, or each entry is reviewed with the ACL file's editors |
+| H-7.11 | L2 | A rules file the admin API may write sits in a directory of its own, owned by the broker user, never beside the config, ACL, password or key files (making a directory writable lets a compromised broker rewrite whatever is in it) | `rules.file` when `MQTTD_RULES_ADMIN_WRITERS` is set; the broker WARNs at boot when that directory is not writable | `ls -la "$(dirname <rules.file>)"` lists only the rules file and its `.prev`, owned by the broker user, file mode ≤ 640 (a file the API creates is 0600), directory mode ≤ 750 |
 | H-7.6 | L2 | Containers run the shipped image (distroless, nonroot) pinned to a release tag | compose/chart defaults | image ref is `ghcr.io/mbilling/fss-mqtt-broker:<X.Y.Z>` — exact version, never `latest`; cosign verification per [RELEASING](../RELEASING.md) |
 
 ## 8. Audit and monitoring
@@ -110,7 +114,7 @@ Single-node deployments: verify none of the cluster binds are set and skip to §
 | H-8.1 | L1 | The audit chain reaches the SIEM | `MQTTD_AUDIT_SYSLOG` (RFC 5424/TCP, see [AUDIT-SCHEMA](AUDIT-SCHEMA.md)) or a log shipper carrying the `target: audit` lines | the SIEM shows `audit.genesis` at each boot; `scripts/audit-verify.py` over a captured stream exits 0 |
 | H-8.2 | L1 | The chain-boundary invariant is alerted on | SIEM rule | rule exists: a chain ending **without** `audit.shutdown`, or a genesis **not** preceded by one, raises an alert (crash or suppression) |
 | H-8.3 | L2 | Metrics scraped; refusal/drop counters dashboarded | `MQTTD_METRICS_BIND` or `MQTTD_OTLP_ENDPOINT` | dashboards show `publish_dropped_*`, gossip drop counters, brownout state |
-| H-8.5 | L2 | Admin actions are alerted on | SIEM rule over `admin.request` records | rule exists: any `role=operator` record with a non-`GET` target raises a notification |
+| H-8.5 | L2 | Admin actions are alerted on | SIEM rule over `admin.request` records, and over `rules.write` records | rule exists: any `role=operator` record with a non-`GET` target, and any `rules.write` record, raises a notification |
 | H-8.4 | L2 | `/readyz` drives load-balancer membership | orchestrator wiring | draining/browned-out/quorumless nodes leave rotation automatically |
 
 ---
