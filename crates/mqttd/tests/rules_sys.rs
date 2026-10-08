@@ -759,7 +759,7 @@ async fn the_trace_queue_is_bounded_in_bytes() {
 
 /// ADR 0084: the statistics reach a real subscriber through the real hub — `QoS` 0, not
 /// retained, JSON — and never run a rule: the broker's own `$SYS` publishes are not
-/// evaluated, even by a rule whose `FROM` names `$SYS` (it loads with a warning).
+/// evaluated, even by a rule whose `FROM` names `$SYS`.
 #[tokio::test]
 async fn sys_publishes_reach_subscribers_and_never_run_rules() {
     let w = watched(

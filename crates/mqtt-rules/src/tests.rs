@@ -1720,8 +1720,8 @@ fn a_republish_into_sys_fails_its_action() {
         assert_eq!(out.len(), 1, "the other action still ran");
         assert_eq!(republished(&out[0].1).topic, format!("ok/{reserved}"));
     }
-    // Not reserved: another `$` topic, or a different case.
-    for open in ["$sys/x", "$SYSTEM/x"] {
+    // Not reserved: another `$` topic, a different case, or a Mosquitto bridge's state.
+    for open in ["$sys/x", "$SYSTEM/x", "$SYS/broker/connection/edge-1/state"] {
         let payload = Bytes::from(format!(r#"{{"t":"{open}"}}"#));
         let (out, _) = effects(&set, &msg("t", &payload, &props));
         assert_eq!(out.len(), 2, "{open}");
@@ -1730,7 +1730,9 @@ fn a_republish_into_sys_fails_its_action() {
 
 /// A rule that can never do what it says is loaded, with a warning saying why: a
 /// republish whose topic is always in `$SYS`, and a `FROM` on `$SYS`, which the broker's
-/// own messages never reach and clients can no longer publish to.
+/// own messages never reach and clients can no longer publish to. A Mosquitto bridge's
+/// state is the exception on both sides: a rule may republish there, and a `FROM` that
+/// can match it is not warned about.
 #[test]
 fn rules_aimed_at_sys_load_with_a_warning() {
     let warnings = |actions: &str, from: &str| {
@@ -1753,17 +1755,38 @@ fn rules_aimed_at_sys_load_with_a_warning() {
         );
     }
     // Not always reserved: the warning is for certainties only.
-    for maybe in ["${t}", "$SYS${t}", "$sys/x", "a/$SYS/b"] {
+    for maybe in [
+        "${t}",
+        "$SYS${t}",
+        "$SYS/${t}",
+        "$sys/x",
+        "a/$SYS/b",
+        "$SYS/broker/connection/${clientid}/state",
+        "$SYS/broker/connection/edge-1/state",
+    ] {
         assert!(warnings(&republish(maybe), "\"t\"").is_empty(), "{maybe}");
     }
-    for from in ["\"$SYS/#\"", "\"$SYS\"", "\"a\", \"$SYS/brokers/+/rules\""] {
+    for from in [
+        "\"$SYS/brokers/#\"",
+        "\"$SYS\"",
+        "\"a\", \"$SYS/brokers/+/rules\"",
+    ] {
         let w = warnings("", from);
         assert_eq!(w.len(), 1, "{from}: {w:?}");
         assert!(w[0].contains("never matches"), "{w:?}");
     }
-    assert!(warnings("", "\"$sys/#\", \"#\"").is_empty());
-    let w = check_sql("SELECT * FROM \"$SYS/#\"").unwrap();
-    assert!(w[0].starts_with("FROM \"$SYS/#\" never matches"), "{w:?}");
+    for from in [
+        "\"$sys/#\", \"#\"",
+        "\"$SYS/#\"",
+        "\"$SYS/broker/connection/+/state\"",
+    ] {
+        assert!(warnings("", from).is_empty(), "{from}");
+    }
+    let w = check_sql("SELECT * FROM \"$SYS/brokers/#\"").unwrap();
+    assert!(
+        w[0].starts_with("FROM \"$SYS/brokers/#\" never matches"),
+        "{w:?}"
+    );
 }
 
 /// The trace records at most `per_sec` evaluations of a rule a second; the window is

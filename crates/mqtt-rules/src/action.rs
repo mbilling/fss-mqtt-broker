@@ -202,11 +202,17 @@ pub(crate) fn parse_action(v: &toml::Value, warnings: &mut Vec<String>) -> Resul
 
 /// A republish's `topic` template, with a warning when every topic it renders is in
 /// `$SYS`: the action would then fail on every message (ADR 0084). A placeholder right
-/// after a bare `$SYS` may or may not land there; only a certain refusal is worth one.
+/// after a bare `$SYS`, or on the way to a Mosquitto bridge's state, may or may not land
+/// on a reserved topic; only a certain refusal is worth one.
 fn republish_topic(s: &str, warnings: &mut Vec<String>) -> Result<Template, String> {
     let t = Template::parse(s)?;
     let prefix = t.literal_prefix();
-    if prefix.starts_with("$SYS/") || (t.is_literal() && mqtt_core::is_reserved_topic(prefix)) {
+    let always = if t.is_literal() {
+        mqtt_core::is_reserved_topic(prefix)
+    } else {
+        mqtt_core::is_reserved_prefix(prefix)
+    };
+    if always {
         warnings.push(format!(
             "republish topic \"{s}\" is in $SYS, which is reserved for the broker: the \
              action will fail on every message (ADR 0084)"

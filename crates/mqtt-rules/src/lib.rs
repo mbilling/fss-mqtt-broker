@@ -490,7 +490,7 @@ fn compile(sql: &str, regexes: &mut parser::RegexPool) -> Result<Compiled, Compi
         } else if !mqtt_core::valid_filter(from) {
             return Err(format!("\"{from}\" is not a valid topic filter").into());
         } else if !topics.contains(from) {
-            if mqtt_core::is_reserved_topic(from) {
+            if mqtt_core::is_reserved_filter(from) {
                 warnings.push(format!(
                     "FROM \"{from}\" never matches: the broker's own $SYS messages do not run \
                      rules and clients cannot publish there (ADR 0084)"
