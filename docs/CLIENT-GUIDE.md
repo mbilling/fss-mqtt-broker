@@ -80,6 +80,7 @@ MQTT 3.1.1 has no packet to carry a reason):
 | Situation | MQTT 5 | MQTT 3.1.1 |
 |---|---|---|
 | Bad credentials / not authorized | CONNACK/PUBACK/DISCONNECT `0x87` | CONNACK return code 4/5; unauthorized publish is dropped (check the audit log) |
+| Publish or Will to `$SYS` or `$SYS/…`, reserved for the broker whatever the ACL says ([ADR 0084](adr/0084-watching-and-editing-rules-live.md)) | PUBACK/PUBREC `0x87`; Will: CONNACK `0x87` | publish acknowledged and dropped (audited as `acl.deny.publish`); Will: CONNACK return code 5 |
 | Quota / brownout / session cap | `0x97` | No ack + close for QoS ≥ 1 publishes; CONNACK server-unavailable for a new session |
 | Receive Maximum exceeded | DISCONNECT `0x93` | v3.1.1 has no Receive Maximum; inbound is not disconnected on this path |
 | Packet too large | `0x95` | Connection close |
@@ -131,7 +132,7 @@ production emissions, not the full MQTT 5 catalogue in `mqtt-codec`.
 | `0x81` | `MALFORMED_PACKET` | Malformed packet at decode (CONNACK/DISCONNECT depending on when it is caught). | provoked in integration tests |
 | `0x82` | `PROTOCOL_ERROR` | Protocol violation (illegal packet for the current state). | provoked in integration tests |
 | `0x84` | `UNSUPPORTED_PROTOCOL_VERSION` | Mapped in `conn.rs::codec_reason` for totality; unreachable on the wire (CONNECT with an unsupported protocol level closes silently per [MQTT-3.14.0-1]). | exempt (see `scripts/check-reason-codes.py`) |
-| `0x87` | `NOT_AUTHORIZED` | Authentication or ACL denial (CONNACK, PUBACK/PUBREC, DISCONNECT on revocation sweep). | provoked in integration tests |
+| `0x87` | `NOT_AUTHORIZED` | Authentication or ACL denial (CONNACK, PUBACK/PUBREC, DISCONNECT on revocation sweep), and a publish or Will to the broker-reserved `$SYS/` (ADR 0084). | provoked in integration tests |
 | `0x89` | `SERVER_BUSY` | A resumed session's queue could not be read for replay (its group's log was being rebuilt); reconnect and the replay runs again (issue #762). | exempt (see `scripts/check-reason-codes.py`) |
 | `0x8b` | `SERVER_SHUTTING_DOWN` | Graceful drain of live v5 sessions (ADR 0019 / `SIGTERM`). | exempt (see `scripts/check-reason-codes.py`) |
 | `0x8c` | `BAD_AUTHENTICATION_METHOD` | Enhanced-authentication method the broker does not accept. | provoked in integration tests |

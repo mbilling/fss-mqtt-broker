@@ -39,7 +39,7 @@ WHEN_EMITTED: dict[int, str] = {
     0x81: "Malformed packet at decode (CONNACK/DISCONNECT depending on when it is caught).",
     0x82: "Protocol violation (illegal packet for the current state).",
     0x84: "Mapped in `conn.rs::codec_reason` for totality; unreachable on the wire (CONNECT with an unsupported protocol level closes silently per [MQTT-3.14.0-1]).",
-    0x87: "Authentication or ACL denial (CONNACK, PUBACK/PUBREC, DISCONNECT on revocation sweep).",
+    0x87: "Authentication or ACL denial (CONNACK, PUBACK/PUBREC, DISCONNECT on revocation sweep), and a publish or Will to the broker-reserved `$SYS/` (ADR 0084).",
     0x89: "A resumed session's queue could not be read for replay (its group's log was being rebuilt); reconnect and the replay runs again (issue #762).",
     0x8B: "Graceful drain of live v5 sessions (ADR 0019 / `SIGTERM`).",
     0x8C: "Enhanced-authentication method the broker does not accept.",
