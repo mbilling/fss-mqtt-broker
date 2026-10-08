@@ -1040,7 +1040,9 @@ impl RulesWrite<'_> {
         let written = old.as_deref() != Some(text.as_str());
         if written {
             let how = Replace {
-                new_mode: 0o644,
+                // A file written where there was none is the broker's alone: a rules file
+                // can hold a secret. One that existed keeps its mode.
+                new_mode: 0o600,
                 previous: old.as_deref().map(str::as_bytes),
             };
             if let Err(e) = atomic_file::replace(&target, text.as_bytes(), &how) {

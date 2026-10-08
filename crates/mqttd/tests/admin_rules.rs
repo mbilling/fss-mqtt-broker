@@ -1038,6 +1038,30 @@ async fn a_whole_file_write_is_a_writers_and_replaces_the_file_and_what_runs() {
     assert_eq!(n.on_disk(), new);
 }
 
+/// A rules file written where there was none is private to the broker (mode 0600): a
+/// rules file can hold a secret, and nobody chose a wider mode for it.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_rules_file_written_where_there_was_none_is_private() {
+    use std::os::unix::fs::PermissionsExt;
+    let n = Node::start(RULES).await;
+    std::fs::remove_file(&n.file).unwrap();
+    let new = "[rules.only]\nsql = 'SELECT * FROM \"o/#\"'\nactions = []\n";
+    let (status, body) = n
+        .call(
+            &n.writer,
+            "PUT",
+            "/admin/v1/rules?if_match=*",
+            Some(&json!({"source": new})),
+        )
+        .await;
+    assert_eq!((status, &body["applied"]), (200, &json!(true)), "{body}");
+    assert_eq!(n.on_disk(), new);
+    let mode = std::fs::metadata(&n.file).unwrap().permissions().mode() & 0o7777;
+    assert_eq!(mode, 0o600);
+    assert!(!n.file.with_extension("toml.prev").exists());
+}
+
 /// `PUT /admin/v1/rule` and `DELETE /admin/v1/rule` change one rule and keep every other
 /// byte of the file: an update writes only what differs, an insert is appended, a delete
 /// takes the rule's header and keys and leaves the comments above it. Each applies at
