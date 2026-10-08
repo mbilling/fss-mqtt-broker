@@ -2720,3 +2720,262 @@ actions = [{ function = "republish", args = { topic = "w-out/${v}" } }]
         .wait_log(" WARN mqttd::rules: INSECURE: the rule trace is on and no MQTTD_ACL_FILE is configured: any client can subscribe to $SYS/brokers/+/trace/rules/+ and read what the rules see (ADR 0084)")
         .await;
 }
+
+// ---------------------------------------------------------------------------------------
+// Rules edited through the admin API (ADR 0084)
+// ---------------------------------------------------------------------------------------
+
+/// The admin listener's certificates: a CA, the broker's for 127.0.0.1, and the
+/// `CN=rules-ui` client the rules are written as.
+struct AdminPki {
+    ca: std::path::PathBuf,
+    server: (std::path::PathBuf, std::path::PathBuf),
+    client: (std::path::PathBuf, std::path::PathBuf),
+}
+
+fn admin_pki(dir: &Path) -> AdminPki {
+    let key = rcgen::KeyPair::generate().unwrap();
+    let mut params = rcgen::CertificateParams::new(Vec::new()).unwrap();
+    params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "rules admin CA");
+    let ca = rcgen::CertifiedIssuer::self_signed(params, key).unwrap();
+    std::fs::write(dir.join("ca.pem"), ca.pem()).unwrap();
+    let leaf = |name: &str| {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let mut params = rcgen::CertificateParams::new(vec!["127.0.0.1".into()]).unwrap();
+        params.distinguished_name = rcgen::DistinguishedName::new();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, name);
+        params.extended_key_usages = vec![
+            rcgen::ExtendedKeyUsagePurpose::ServerAuth,
+            rcgen::ExtendedKeyUsagePurpose::ClientAuth,
+        ];
+        let cert = params.signed_by(&key, &ca).unwrap();
+        let (cert_path, key_path) = (
+            dir.join(format!("{name}.pem")),
+            dir.join(format!("{name}.key")),
+        );
+        std::fs::write(&cert_path, cert.pem()).unwrap();
+        std::fs::write(&key_path, key.serialize_pem()).unwrap();
+        (cert_path, key_path)
+    };
+    AdminPki {
+        ca: dir.join("ca.pem"),
+        server: leaf("mqttd"),
+        client: leaf("rules-ui"),
+    }
+}
+
+/// `mqttd --admin <args>` against the listener on `admin`, as `CN=rules-ui`.
+fn admin_cli(pki: &AdminPki, admin: SocketAddr, args: &[&str]) -> Ran {
+    let url = format!("https://{admin}");
+    let mut all = vec!["--admin"];
+    all.extend_from_slice(args);
+    let (ca, cert, key) = (
+        pki.ca.display().to_string(),
+        pki.client.0.display().to_string(),
+        pki.client.1.display().to_string(),
+    );
+    all.extend_from_slice(&["--url", &url, "--ca", &ca, "--cert", &cert, "--key", &key]);
+    cli(&all)
+}
+
+/// The environment that opens the admin listener on `admin` with `pki`, `CN=rules-ui` an
+/// operator and its only rules writer.
+fn admin_env(pki: &AdminPki, admin: SocketAddr) -> Vec<(&'static str, String)> {
+    vec![
+        ("MQTTD_ADMIN_BIND", admin.to_string()),
+        ("MQTTD_ADMIN_CERT", pki.server.0.display().to_string()),
+        ("MQTTD_ADMIN_KEY", pki.server.1.display().to_string()),
+        ("MQTTD_ADMIN_CLIENT_CA", pki.ca.display().to_string()),
+        ("MQTTD_ADMIN_OPERATORS", "CN=rules-ui".to_string()),
+        ("MQTTD_RULES_ADMIN_WRITERS", "CN=rules-ui".to_string()),
+    ]
+}
+
+const EDIT_A: &str = r#"# The rules the admin API edits.
+[rules.watched]
+sql = 'SELECT payload.v AS v FROM "w/#"'
+actions = [{ function = "republish", args = { topic = "out/w/${v}", payload = "${v}" } }]
+"#;
+
+const EDIT_B: &str = r#"# The rules the admin API edits.
+[rules.watched]
+sql = 'SELECT payload.v AS v FROM "w/#"'
+actions = [{ function = "republish", args = { topic = "out/w/${v}", payload = "${v}" } }]
+
+[rules.added]
+sql = 'SELECT payload.v AS v FROM "n/#"'
+actions = [{ function = "republish", args = { topic = "out/new/${v}", payload = "${v}" } }]
+"#;
+
+/// ADR 0084: a rules writer edits the running rules through the admin API, from the
+/// operator's own commands — `mqttd --admin rules-source`, `rules-apply`, `rules` and
+/// `rule-delete` — and the next message runs the edited rules, for a client that stayed
+/// connected throughout. `rules-source` prints the file byte for byte; `rules-apply`
+/// without `--if_match` is refused (428) and writes nothing; with it the file is replaced
+/// and reloaded; a delete leaves the rest. A broker that wrote the file but did not
+/// reload, or reloaded only for new connections, fails the first derived message; one
+/// whose delete did not take fails the order of the last two.
+#[tokio::test]
+async fn an_admin_rules_edit_applies_to_the_next_message() {
+    let dir = tempfile::tempdir().unwrap();
+    let pki_dir = tempfile::tempdir().unwrap();
+    write_rules(dir.path(), EDIT_A);
+    let pki = admin_pki(pki_dir.path());
+    let admin = band_addr();
+    let setup = Setup {
+        env: admin_env(&pki, admin),
+        ..Setup::default()
+    };
+    let broker = start(dir.path(), "edit-node", &setup).await;
+    broker
+        .wait_log(&format!(
+            "serving the admin API (mTLS; ADR 0081) bind={admin} viewers=0 operators=1 \
+             rules_writers=1 peers=false"
+        ))
+        .await;
+    let mut sub = Client::connect(broker.addr, "edit-sub").await;
+    assert_eq!(subscribe(&mut sub, 1, "out/#", QoS::AtMostOnce).await, [0]);
+    let mut publ = Client::connect(broker.addr, "edit-pub").await;
+
+    let source = admin_cli(&pki, admin, &["rules-source"]);
+    assert_eq!(
+        (source.code, source.stdout.as_str()),
+        (Some(0), EDIT_A),
+        "{source:?}"
+    );
+
+    let next_file = pki_dir.path().join("next.toml");
+    std::fs::write(&next_file, EDIT_B).unwrap();
+    let next_path = next_file.display().to_string();
+    let refused = admin_cli(&pki, admin, &["rules-apply", &next_path]);
+    assert_eq!(refused.code, Some(1), "{refused:?}");
+    assert!(
+        refused.stderr.contains("428 precondition-required"),
+        "{refused:?}"
+    );
+    let digest = sha256_hex(EDIT_A.as_bytes());
+    let applied = admin_cli(
+        &pki,
+        admin,
+        &["rules-apply", &next_path, "--if_match", &digest],
+    );
+    assert_eq!(applied.code, Some(0), "{applied:?}");
+    assert!(
+        applied
+            .stdout
+            .lines()
+            .any(|l| l.starts_with("applied ") && l.ends_with(" true")),
+        "{applied:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("rules.toml")).unwrap(),
+        EDIT_B
+    );
+
+    // The connection that was open all along runs the new rule on its next message.
+    publ.publish("n/1", br#"{"v":"x"}"#, QoS::AtMostOnce, None, vec![])
+        .await;
+    assert_eq!(
+        next(&mut sub).await,
+        got("out/new/x", "x", QoS::AtMostOnce, false)
+    );
+    let table = admin_cli(&pki, admin, &["rules"]);
+    assert_eq!(table.code, Some(0), "{table:?}");
+    let added: Vec<&str> = table
+        .stdout
+        .lines()
+        .find(|l| l.starts_with("added "))
+        .unwrap_or_else(|| panic!("no row for the new rule: {table:?}"))
+        .split_whitespace()
+        .collect();
+    assert_eq!(added[..5], ["added", "yes", "n/#", "1", "1"], "{table:?}");
+
+    // Deleted, it no longer runs: the message after this one is the first to arrive.
+    let deleted = admin_cli(&pki, admin, &["rule-delete", "added"]);
+    assert_eq!(deleted.code, Some(0), "{deleted:?}");
+    publ.publish("n/2", br#"{"v":"z"}"#, QoS::AtMostOnce, None, vec![])
+        .await;
+    publ.publish("w/1", br#"{"v":"y"}"#, QoS::AtMostOnce, None, vec![])
+        .await;
+    assert_eq!(
+        next(&mut sub).await,
+        got("out/w/y", "y", QoS::AtMostOnce, false)
+    );
+    let on_disk = std::fs::read_to_string(dir.path().join("rules.toml")).unwrap();
+    assert!(
+        on_disk.starts_with(EDIT_A) && !on_disk.contains("[rules.added]"),
+        "{on_disk}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("rules.toml.prev")).unwrap(),
+        EDIT_B,
+        "the replaced file is kept"
+    );
+}
+
+/// ADR 0084: rules writers configured for a rules file whose directory the broker may not
+/// write in — the documented read-only mounts — are a configuration that refuses every
+/// write, and the broker says so at boot and again on each reload, before anyone tries.
+/// A broker that stayed quiet until the first write fails the first wait; one that warned
+/// only at boot fails the second count.
+#[cfg(unix)]
+#[tokio::test]
+async fn writers_for_a_rules_directory_the_broker_cannot_write_in_are_warned_about() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let pki_dir = tempfile::tempdir().unwrap();
+    write_rules(dir.path(), EDIT_A);
+    let read_only = dir.path().join("ro");
+    std::fs::create_dir(&read_only).unwrap();
+    std::fs::write(read_only.join("rules.toml"), EDIT_A).unwrap();
+    std::fs::set_permissions(&read_only, std::fs::Permissions::from_mode(0o555)).unwrap();
+    if std::fs::write(read_only.join("probe"), "").is_ok() {
+        std::fs::set_permissions(&read_only, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::skip_locally_or_fail_in_ci!(
+            "this user can create files in a mode-555 directory (running as root?), so a \
+             rules directory the broker may not write in cannot be made here; run the suite \
+             as an unprivileged user"
+        );
+    }
+    let pki = admin_pki(pki_dir.path());
+    let admin = band_addr();
+    let mut env = admin_env(&pki, admin);
+    env.push((
+        "MQTTD_RULES_FILE",
+        read_only.join("rules.toml").display().to_string(),
+    ));
+    let broker = start(
+        dir.path(),
+        "ro-node",
+        &Setup {
+            env,
+            ..Setup::default()
+        },
+    )
+    .await;
+    let warning = format!(
+        " WARN mqttd: rules.admin_writers is set but the rules file's directory is not \
+         writable by the broker ({}: Permission denied (os error 13)): every admin rules \
+         write will be refused with rules-file-unwritable (ADR 0084)",
+        read_only.display()
+    );
+    broker.wait_log(&warning).await;
+    assert_eq!(broker.log_lines(|l| l.ends_with(&warning)).len(), 1);
+    broker.signal("HUP");
+    // Once at boot, once on the reload.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while broker.log_lines(|l| l.ends_with(&warning)).len() < 2 {
+        assert!(
+            Instant::now() < deadline,
+            "the reload did not warn again within 15 s; log tail:\n{}",
+            broker.log.tail(20)
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    std::fs::set_permissions(&read_only, std::fs::Permissions::from_mode(0o755)).unwrap();
+}

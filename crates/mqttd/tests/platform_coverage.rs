@@ -68,6 +68,14 @@ fn every_platform_gated_suite_compiled_on_this_runner() {
          writes; this CI run must exercise them"
     );
 
+    // rules_binary.rs has a Unix-only boot and reload warning about a rules directory the
+    // broker cannot write in (ADR 0084).
+    assert!(
+        !in_ci || cfg!(unix),
+        "rules_binary.rs uses #[cfg(unix)] for the unwritable rules directory warning; this \
+         CI run must exercise it"
+    );
+
     // crates/mqttd/tests/decommission.rs — #![cfg(unix)]
     assert!(
         !in_ci || cfg!(unix),
@@ -94,6 +102,7 @@ fn the_mirrored_predicates_still_describe_the_suites() {
         ("binary_smoke.rs", "#[cfg(unix)]"),
         ("shared_membership.rs", "#[cfg(target_os = \"linux\")]"),
         ("admin_rules.rs", "#[cfg(unix)]"),
+        ("rules_binary.rs", "#[cfg(unix)]"),
     ] {
         let src = std::fs::read_to_string(dir.join(file))
             .unwrap_or_else(|e| panic!("read tests/{file}: {e}"));
