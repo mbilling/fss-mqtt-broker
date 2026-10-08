@@ -189,7 +189,25 @@ function renderHeader() {
 
 function renderRules() {
   const rules = (state.list && state.list.rules) || [];
-  $("rules").tBodies[0].replaceChildren(...rules.map(ruleRow));
+  const body = $("rules").tBodies[0];
+  // A rebuilt row is a new button: keyboard focus on the old one would fall to <body>.
+  const focused = body.contains(document.activeElement) ? document.activeElement.closest("tr").dataset.id : null;
+  body.replaceChildren(...rules.map(ruleRow));
+  if (focused !== null) {
+    const tr = body.querySelector(`tr[data-id="${CSS.escape(focused)}"]`);
+    if (tr) tr.querySelector("button").focus();
+  }
+}
+
+// Which row is in the editor, without rebuilding the table (which would drop the focus).
+function markSelected() {
+  for (const tr of $("rules").tBodies[0].rows) {
+    const on = tr.dataset.id === state.selected;
+    tr.classList.toggle("selected", on);
+    const pick = tr.querySelector("button");
+    if (on) pick.setAttribute("aria-current", "true");
+    else pick.removeAttribute("aria-current");
+  }
 }
 
 function ruleRow(rule) {
@@ -302,8 +320,10 @@ function selectRule(id) {
   $("r-out").replaceChildren();
   $("r-changed").hidden = true;
   if (rule.redacted) say($("r-out"), "error", "The admin API answered as to a viewer: no SQL or actions.");
-  renderRules();
+  resetTestInput();
+  markSelected();
   renderTrace();
+  $("h-editor").focus();
 }
 
 function newRule() {
@@ -319,9 +339,17 @@ function newRule() {
   fillEditor({ id: `demo_rule_${n}`, ...NEW_RULE });
   $("r-out").replaceChildren();
   $("r-changed").hidden = true;
-  renderRules();
+  resetTestInput();
+  markSelected();
   renderTrace();
   $("f-id").focus();
+}
+
+// Another rule's message would only answer no_match.
+function resetTestInput() {
+  $("t-latest").checked = true;
+  $("t-topic").value = "";
+  $("t-payload").value = "";
 }
 
 // After each new rules list. The editor's writes carry the digest of the file its text
@@ -389,12 +417,15 @@ async function testInput(rule) {
     const r = await api("GET", `/api/latest?${q}`);
     if (r.status !== 200) return { error: errorText(r) };
     const m = r.body;
-    // Shown in the custom fields too, so it can be edited and tested again.
+    // Shown in the custom fields too, so it can be edited and tested again. A binary
+    // payload cannot be: a message of your own is sent as text.
+    const binary = m.payload_encoding !== "utf8";
     $("t-topic").value = m.topic;
-    if (m.payload_encoding === "utf8") $("t-payload").value = m.payload;
+    $("t-payload").value = binary ? "" : m.payload;
     return {
       body: { topic: m.topic, payload: m.payload, payload_encoding: m.payload_encoding },
-      note: `the latest ${m.topic} (${count(m.bytes)} bytes, received ${clock(m.at)})`,
+      note: `the latest ${m.topic} (${count(m.bytes)} bytes, received ${clock(m.at)}` +
+        `${binary ? "; binary: tested as received, a message of your own needs a text payload" : ""})`,
     };
   }
   if (filters.length) {
