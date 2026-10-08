@@ -1204,6 +1204,50 @@ async fn one_rule_is_edited_in_place_and_the_rest_of_the_file_kept_byte_for_byte
     assert_eq!((status, code(&body)), (409, "rules-file-invalid"), "{body}");
 }
 
+/// Two writes naming the same digest, sent at once: one is made, and the other is told
+/// the file is no longer the one it names, with the digest the first wrote. The node
+/// takes one write at a time from reading the file to its reload, so `if_match` is a
+/// compare-and-swap and neither write is lost without a word. Twenty rounds, each on the
+/// file as it started, so a race that only sometimes loses still shows.
+#[tokio::test]
+async fn two_writes_naming_the_same_digest_cannot_both_win() {
+    let n = Node::start(RULES).await;
+    let digest = sha256_hex(RULES);
+    let rule = |topic: &str| {
+        json!({"sql": format!("SELECT * FROM \"{topic}\""), "actions": [],
+               "description": "", "enable": true})
+    };
+    let (one, two) = (rule("one/#"), rule("two/#"));
+    let (path_one, path_two) = (
+        format!("/admin/v1/rule?id=one&if_match={digest}"),
+        format!("/admin/v1/rule?id=two&if_match={digest}"),
+    );
+    for round in 0..20 {
+        std::fs::write(&n.file, RULES).unwrap();
+        let (a, b) = tokio::join!(
+            n.call(&n.writer, "PUT", &path_one, Some(&one)),
+            n.call(&n.writer, "PUT", &path_two, Some(&two)),
+        );
+        let mut answers = [a, b];
+        answers.sort_by_key(|(status, _)| *status);
+        let [(made, winner), (refused, loser)] = answers;
+        assert_eq!(
+            (made, refused, code(&loser)),
+            (200, 412, "digest-mismatch"),
+            "round {round}: {winner} {loser}"
+        );
+        let on_disk = n.on_disk();
+        let has = |id: &str| on_disk.contains(&format!("\n[rules.{id}]\n"));
+        assert!(has("one") != has("two"), "round {round}: {on_disk}");
+        assert_eq!(
+            winner["digest"],
+            json!(sha256_hex(&on_disk)),
+            "round {round}"
+        );
+        assert_eq!(loser["file_digest"], winner["digest"], "round {round}");
+    }
+}
+
 /// Every write is based on the file on disk, not on what runs: `if_match` names the file
 /// as it was read, and an edit made by hand (and never reloaded) is kept by the next
 /// per-rule write — and then runs.
