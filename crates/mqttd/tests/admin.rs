@@ -103,6 +103,8 @@ struct Harness {
     config: Arc<RwLock<mqtt_config::Config>>,
     /// The cordon flag, shared by the admin state and the node's health.
     cordon: Arc<std::sync::atomic::AtomicBool>,
+    /// The node's rules, for its `/statusz` rules block: empty until a test fills it.
+    rules: Arc<std::sync::OnceLock<mqttd::rules::Rules>>,
 }
 
 /// A running admin listener: `viewers`/`operators` are the role lists; `cluster_ca`, when
@@ -189,6 +191,7 @@ fn start_node(node: Node<'_>) -> Harness {
         Arc::new(std::sync::OnceLock::new()),
         None,
     );
+    let rules = health.rules_slot();
     let (reload, config) = match node.reload {
         Some((access, live)) => (Some(access), live),
         None => (None, Arc::new(RwLock::new(mqtt_config::Config::default()))),
@@ -230,6 +233,7 @@ fn start_node(node: Node<'_>) -> Harness {
         audit,
         config,
         cordon,
+        rules,
     }
 }
 
@@ -485,6 +489,53 @@ async fn three_nodes() -> ThreeNodes {
         admin_ca,
         cluster,
     }
+}
+
+/// ADR 0084: rules are per node and a rules write reaches one node only, so the cluster
+/// view shows each node's running rules digest and whether the nodes that replied agree.
+#[tokio::test]
+async fn the_cluster_view_compares_every_nodes_rules_digest() {
+    let c = three_nodes().await;
+    let alice = mint_leaf(&c.admin_ca, "alice", None);
+    let set = |text: &str| Arc::new(mqtt_rules::RuleSet::parse(text).unwrap().rules);
+    let a = set("[rules.a]\nsql = 'SELECT * FROM \"t\"'\nactions = []\n");
+    let digest_a = a.digest().to_string();
+    let mut senders = Vec::new();
+    for (i, id) in ["n1", "n2"].into_iter().enumerate() {
+        let (tx, rx) = tokio::sync::watch::channel(a.clone());
+        let _ = c.harnesses[i]
+            .rules
+            .set(mqttd::rules::Rules::new(rx, Arc::from(id), None));
+        senders.push(tx);
+    }
+    let cluster = || async {
+        let (status, body) = client::call(&c.target(0, &alice), "GET", "/admin/v1/cluster", None)
+            .await
+            .unwrap();
+        assert_eq!(status, 200, "{body}");
+        serde_json::from_str::<Value>(&body).unwrap()
+    };
+    let body = cluster().await;
+    let digest_of = |body: &Value, id: &str| {
+        body["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|n| n["node_id"] == id)
+            .unwrap()["rules_digest"]
+            .clone()
+    };
+    assert_eq!(digest_of(&body, "n1"), digest_a.as_str());
+    assert_eq!(digest_of(&body, "n2"), digest_a.as_str());
+    assert_eq!(body["summary"]["same_rules"], true, "{body}");
+
+    // A write through n2 changed n2's rules only.
+    let b = set("");
+    let digest_b = b.digest().to_string();
+    senders[1].send(b).unwrap();
+    let body = cluster().await;
+    assert_eq!(digest_of(&body, "n2"), digest_b.as_str());
+    assert_eq!(body["summary"]["same_rules"], false, "{body}");
 }
 
 #[tokio::test]

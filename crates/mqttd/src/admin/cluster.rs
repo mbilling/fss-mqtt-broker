@@ -268,6 +268,9 @@ fn row(node_id: &str, admin_addr: Option<&str>, reply: &Reply, is_self: bool) ->
             );
             r.insert("decommissioning".into(), pick("/decommission/active"));
             r.insert("config_checksum".into(), pick("/config/checksum"));
+            // Rules are per node and written per node (ADR 0084): the digest shows a
+            // node whose rules file differs from the rest.
+            r.insert("rules_digest".into(), pick("/rules/digest"));
             r.insert("proto_max".into(), pick("/proto/max"));
         }
     }
@@ -337,6 +340,7 @@ pub async fn cluster(state: &AdminState) -> Answer {
             "same_cluster_id": agree(statuses.iter().copied(), "/cluster_id"),
             "same_version": agree(statuses.iter().copied(), "/version"),
             "same_config": agree(statuses.iter().copied(), "/config/checksum"),
+            "same_rules": agree(statuses.iter().copied(), "/rules/digest"),
             "same_membership": membership_agrees,
         },
         "nodes": nodes,

@@ -785,10 +785,11 @@ async fn main() -> Result<(), StartupError> {
     // Every reload attempt, for the rule statistics (ADR 0084).
     let last_reload = Arc::new(reload::LastReload::default());
     reloader.attach_last_reload(last_reload.clone());
-    // Watching the running rules (ADR 0084): the statistics and trace tasks publish on
-    // $SYS. Both run until the drain begins, idle
+    // Watching the running rules (ADR 0084): /statusz reports their digest, and the
+    // statistics and trace tasks publish on $SYS. Both run until the drain begins, idle
     // while their settings are off, and follow a reload's settings at once.
     if let Some(rules) = &policy.rules {
+        let _ = health_state.rules_slot().set(rules.clone());
         tokio::spawn(mqttd::rules_sys::run_stats(
             rules.clone(),
             Some(metrics.clone()),
