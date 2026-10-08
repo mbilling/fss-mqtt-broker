@@ -668,7 +668,7 @@ SECTION_NO_EQUIVALENT: dict[str, str] = {
     "stats, metrics, client events): the equivalent data is on /metrics and /statusz, and "
     "any client that SUBSCRIBES to them must be rewritten. mqttd's $SYS holds only opt-in "
     "rule statistics and an opt-in rule trace ([rules] sys_interval_secs, trace), and no "
-    "client may publish there",
+    "client may publish there but a Mosquitto bridge, to $SYS/broker/connection/<id>/state",
     "sysmon": "there is no VM/OS monitor; use node_exporter beside /metrics",
     "alarm": "there is no in-broker alarm table; alert on the Prometheus metrics",
     "conn_congestion": "not implemented; the nearest signals are the queue-overflow "
@@ -3423,7 +3423,8 @@ def convert_topic(topic: str, todos: list[str], where: str) -> str | None:
     if out == "$SYS" or out.startswith("$SYS/"):
         todos.append(
             f"{where}: the rule covers {out!r}, in mqttd's broker-reserved $SYS tree. No "
-            "client may publish there, whatever the ACL says. The broker publishes there "
+            "client may publish there, whatever the ACL says, but a Mosquitto bridge to its "
+            "state topic $SYS/broker/connection/<id>/state. The broker publishes there "
             "only opt-in rule statistics ($SYS/brokers/<node>/rules/...) and an opt-in rule "
             "trace ($SYS/brokers/<node>/trace/rules/..., which carries message payloads), "
             "not EMQX's broker statistics, which are /metrics and /statusz. The rule is "
