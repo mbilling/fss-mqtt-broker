@@ -1,0 +1,46 @@
+# Recipe 10: thin out a high-rate stream without state
+#
+# A rule sees one message at a time and remembers nothing, so it can only thin a stream
+# by something in the message itself:
+#
+# - decimate_by_seq keeps every 10th reading, using the device's own sequence counter,
+#   on vib/<device>/1in10.
+# - fleet_sample keeps every reading from a stable ~25% of the devices (the same ones
+#   every time: the hash of the device id decides), on debug/sample/<device>.
+#
+# What needs state is not possible in a rule: an average or a min/max over a window,
+# counting, deduplication, "only when the value changed" (a deadband), a per-device rate
+# limit, or exactly one message per interval. docs/RULES-COOKBOOK.md says what to use.
+#
+# In:  vib/pump-1/raw  qos=0 retain=0  {"seq": 10, "v": 0.42}
+# Out: vib/pump-1/1in10  qos=0 retain=0  {"device":"pump-1","seq":10,"v":0.42}
+# In:  vib/pump-2/raw  qos=0 retain=0  {"seq": 21, "v": 0.37}
+# Out: debug/sample/pump-2  qos=0 retain=0  {"device":"pump-2","bucket":21,"seq":21,"v":0.37}
+#
+# Tested by crates/mqttd/tests/rules_cookbook.rs; explained in docs/RULES-COOKBOOK.md.
+
+[rules.decimate_by_seq]
+description = "Every 10th reading"
+sql = '''
+SELECT topic(2) AS device, payload.seq AS seq, payload.v AS v
+FROM "vib/+/raw"
+WHERE payload.seq mod 10 = 0
+'''
+actions = [
+  { function = "republish", args = { topic = "vib/${device}/1in10", payload = "${.}" } },
+]
+
+[rules.fleet_sample]
+description = "Every reading from a stable quarter of the fleet"
+sql = '''
+SELECT
+  topic(2) AS device,
+  hash_to_range(topic(2), 1, 100) AS bucket,
+  payload.seq AS seq,
+  payload.v AS v
+FROM "vib/+/raw"
+WHERE bucket <= 25
+'''
+actions = [
+  { function = "republish", args = { topic = "debug/sample/${device}", payload = "${.}" } },
+]

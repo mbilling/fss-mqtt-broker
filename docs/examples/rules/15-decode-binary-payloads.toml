@@ -1,0 +1,68 @@
+# Recipe 15: decode base64, hex and raw binary payloads
+#
+# unwrap_base64_json: a cloud service pushes JSON wrapped in base64 inside a JSON
+#   envelope; publish the inner JSON on unwrapped/<device>. The device id comes from
+#   the payload and becomes a topic level, so the WHERE lets only a plain id through.
+# lorawan_uplink: a LoRaWAN network server's uplink carries the device's bytes as base64
+#   frm_payload; publish them as hex, with the port and the signal strength.
+# decode_binary_frame: a constrained device sends 3 raw bytes, [type: u8][temperature in
+#   hundredths of a degree: i16, big-endian]. There is no function that reads bits, so
+#   the rule reads the hex digits: 16 - strlen(find('0123456789ABCDEF', d)) is the value
+#   of hex digit d. It publishes the decoded reading, and archives the raw bytes
+#   unchanged.
+#
+# Payloads that are not text are shown as hex (01 09 c4 is "0109c4").
+#
+# In:  bin/nb-1/up  qos=0 retain=0  02ff9c
+# Out: decoded/nb-1  qos=0 retain=0  {"type":2,"temp_c":-1.0,"raw":"Av+c"}
+# Out: archive/nb-1  qos=0 retain=0  02ff9c
+#
+# Tested by crates/mqttd/tests/rules_cookbook.rs; explained in docs/RULES-COOKBOOK.md.
+
+[rules.unwrap_base64_json]
+description = "JSON wrapped in base64"
+sql = '''
+SELECT payload.deviceId AS device, json_decode(base64_decode(payload.data)) AS data
+FROM "cloud/push"
+WHERE is_str(payload.deviceId) AND regex_match(payload.deviceId, '^[A-Za-z0-9_-]{1,64}$')
+'''
+actions = [
+  { function = "republish", args = { topic = "unwrapped/${device}", payload = "${data}" } },
+]
+
+[rules.lorawan_uplink]
+description = "A LoRaWAN uplink's base64 frm_payload as hex"
+sql = '''
+SELECT
+  topic(5)                                       AS device,
+  payload.uplink_message.f_port                  AS port,
+  bin2hexstr(base64_decode(payload.uplink_message.frm_payload)) AS hex,
+  payload.uplink_message.rx_metadata[1].rssi     AS rssi
+FROM "lora/v3/+/devices/+/up"
+'''
+actions = [
+  { function = "republish", args = { topic = "lora/hex/${device}", payload = "${.}" } },
+]
+
+[rules.decode_binary_frame]
+description = "A 3-byte binary frame: type, then a signed big-endian temperature"
+sql = '''
+SELECT
+  topic(2) AS device,
+  payload,                         -- selected, so ${payload} below is the raw bytes
+  base64_encode(payload) AS raw_b64,
+  bin2hexstr(payload) AS hex,      -- 02 FF 9C -> '02FF9C'
+  (16 - strlen(find('0123456789ABCDEF', substr(hex, 0, 1)))) * 16
+    + (16 - strlen(find('0123456789ABCDEF', substr(hex, 1, 1)))) AS frame_type,
+  (16 - strlen(find('0123456789ABCDEF', substr(hex, 2, 1)))) * 4096
+    + (16 - strlen(find('0123456789ABCDEF', substr(hex, 3, 1)))) * 256
+    + (16 - strlen(find('0123456789ABCDEF', substr(hex, 4, 1)))) * 16
+    + (16 - strlen(find('0123456789ABCDEF', substr(hex, 5, 1)))) AS raw_temp,
+  CASE WHEN raw_temp >= 32768 THEN raw_temp - 65536 ELSE raw_temp END / 100 AS temp_c
+FROM "bin/+/up"
+WHERE strlen(hex) = 6
+'''
+actions = [
+  { function = "republish", args = { topic = "decoded/${device}", payload = '{"type":${frame_type},"temp_c":${temp_c},"raw":"${raw_b64}"}' } },
+  { function = "republish", args = { topic = "archive/${device}", payload = "${payload}" } },
+]

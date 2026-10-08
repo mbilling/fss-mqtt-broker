@@ -673,6 +673,9 @@ pub struct Will {
     pub message: Message,
     /// Will Delay Interval in seconds (§3.1.3.2.2); `0` publishes immediately.
     pub delay_secs: u32,
+    /// Who set it — the CONNECT username and the client's address — for the rule
+    /// engine, which evaluates a Will when the hub publishes it (ADR 0083).
+    pub publisher: crate::rules::Publisher,
 }
 
 /// A currently-online client connection.
@@ -1049,6 +1052,36 @@ pub type RetainedExportCut = Vec<(Message, Option<(u64, u64)>)>;
 /// nothing, so the last-success timestamp does not move and the RPO alert fires.
 pub type RetainedExportAnswer = Result<RetainedExportCut, String>;
 
+/// A publish and what its rules derived, routed together (ADR 0083). See
+/// [`HubCommand::PublishBatch`].
+#[derive(Debug)]
+pub struct PublishBatch {
+    /// The client's publish: a [`HubCommand::Publish`].
+    pub original: HubCommand,
+    /// The rule-produced messages, in rule then action order. Routed only if the
+    /// original was accepted.
+    pub derived: Vec<DerivedPublish>,
+    /// The original's ingress credit (ADR 0082 T3), held until the whole batch has
+    /// been dispatched.
+    pub credit: Option<crate::ingress::IngressPermit>,
+    /// The credit charged for the derived messages, held as long.
+    pub derived_credit: Option<crate::ingress::IngressPermit>,
+}
+
+/// One rule-produced message in a [`PublishBatch`].
+#[derive(Debug)]
+pub struct DerivedPublish {
+    /// The rule that produced it: its action is counted against this rule.
+    pub rule: Arc<str>,
+    /// The message: a [`HubCommand::Publish`].
+    pub publish: HubCommand,
+    /// Whether it carries an acknowledgement gate. A gated message's action is counted
+    /// by the publisher's connection when its gate answers (closed, if the hub never
+    /// routed it); an ungated one's is counted here, by the hub, which alone knows
+    /// whether it routed it.
+    pub gated: bool,
+}
+
 /// A message from a connection task to the hub.
 #[derive(Debug)]
 pub enum HubCommand {
@@ -1214,6 +1247,16 @@ pub enum HubCommand {
         /// a client socket under a credit pool.
         credit: Option<crate::ingress::IngressPermit>,
     },
+    /// A client publish and the messages its rules derived from it (ADR 0083), as ONE
+    /// command: the original is routed first, and its derived messages only if the hub
+    /// accepted it. A refused publish therefore leaves nothing behind for its resend to
+    /// duplicate, and the batch keeps its place in the connection's FIFO data lane.
+    PublishBatch(Box<PublishBatch>),
+    /// A message a rule derived from a client/session event or a Will (ADR 0083):
+    /// routed like any publish, but ungated — nobody waits for its answer, so it holds
+    /// no pending-publish entry and can never crowd a client's out — and its action is
+    /// counted by the result: `ok` when the hub routed it, `failed` when it refused it.
+    RuleDerived(Box<DerivedPublish>),
     /// Write one **restored** retained value as retained state (ADR 0062, issue #249):
     /// commit it through the topic's group lease-owner and warm the caches, with **no
     /// ordinary fan-out to subscribers**.
@@ -1320,6 +1363,10 @@ pub enum HubCommand {
     /// grants are revoked at the moment delivery could resume. Sent once at
     /// startup, before any listener accepts.
     AttachAuthorizer(AuthzWatch),
+    /// Hand the hub the rule engine (ADR 0083), which it runs on the one publish it
+    /// originates for a client: the Will. Client publishes are evaluated on their
+    /// connection tasks, never here. Sent once at startup, before any listener accepts.
+    AttachRules(crate::rules::Rules),
 
     /// A peer node's link came up; register it and send our interest snapshot.
     PeerConnected {
@@ -1644,6 +1691,27 @@ pub enum HubCommand {
         /// Replied to with `()` when the loop reaches this command.
         reply: oneshot::Sender<()>,
     },
+    /// A drain barrier on the DATA lane (ADR 0083): answered once every command sent
+    /// before it has been dispatched, no durable append is in flight, and no publish
+    /// awaits its acknowledgement. A graceful shutdown awaits it once the connections
+    /// have gone, so what they sent last — the messages rules derive from their
+    /// disconnects included — is routed, stored, and answered by the peers it was
+    /// forwarded to before the process exits.
+    Drained {
+        /// Replied to when nothing is left in flight, with the number of messages the
+        /// hub gated during the drain whose pending entries the pending-publish bound
+        /// evicted before they were answered: the barrier did not wait for those.
+        reply: oneshot::Sender<u64>,
+    },
+    /// The broker has begun a graceful drain (ADR 0083), sent on the CONTROL lane before
+    /// the connections are told to close. From here on the hub gates what rules derive
+    /// from events and Wills itself, unless this node is in a brownout: its forwards to
+    /// peers become acked ones, so [`HubCommand::Drained`] waits for the peers' answers
+    /// too, and a presence message bound for a subscriber on another node is not left in
+    /// a link queue at exit. (Under a brownout a gated publish owing a durable copy is
+    /// refused outright, live copies and all; an ungated one still goes out live, its
+    /// durable copy a counted drop, so under a brownout they stay ungated.)
+    Draining,
     /// Test-only: dispatch the inner command from the DATA lane (ADR 0082 T2). Tests
     /// inject acks and verdicts that, in production, can only exist after the work
     /// they answer was dispatched; on the control lane such a synthetic reply would
@@ -1693,8 +1761,11 @@ impl HubCommand {
             | Self::RetainedCommitDone { .. }
             | Self::DurableFrame { .. }
             | Self::Ping { .. }
+            | Self::Draining
             | Self::Admin(_) => Lane::Control,
             Self::Publish { .. }
+            | Self::PublishBatch(_)
+            | Self::RuleDerived(_)
             | Self::RemotePublish { .. }
             | Self::RemotePublishAcked { .. }
             | Self::RemoteSharedDeliver { .. }
@@ -1709,6 +1780,7 @@ impl HubCommand {
             | Self::SetBrownout { .. }
             | Self::SweepIdentities(_)
             | Self::AttachAuthorizer(_)
+            | Self::AttachRules(_)
             | Self::RemoteRetainedUpdate { .. }
             | Self::RemoteRetainedSnapshot { .. }
             | Self::RemoteRetainedDigest { .. }
@@ -1722,7 +1794,8 @@ impl HubCommand {
             | Self::RemoteInterest { .. }
             | Self::RemoteSharedInterest { .. }
             | Self::InheritedSessions { .. }
-            | Self::Flush { .. } => Lane::Data,
+            | Self::Flush { .. }
+            | Self::Drained { .. } => Lane::Data,
             #[cfg(test)]
             Self::Ordered(_) => Lane::Data,
         }
@@ -1731,9 +1804,11 @@ impl HubCommand {
     fn class(&self) -> &'static str {
         match self {
             Self::Attach { .. } | Self::SessionRecovered { .. } => "attach",
-            Self::Publish { .. } | Self::AppendDone { .. } | Self::PkidBlockReserved { .. } => {
-                "publish"
-            }
+            Self::Publish { .. }
+            | Self::PublishBatch(_)
+            | Self::RuleDerived(_)
+            | Self::AppendDone { .. }
+            | Self::PkidBlockReserved { .. } => "publish",
             Self::PubAck { .. }
             | Self::PubRec { .. }
             | Self::PubComp { .. }
@@ -1745,8 +1820,11 @@ impl HubCommand {
             | Self::Evict { .. }
             | Self::SweepIdentities(_)
             | Self::AttachAuthorizer(_)
+            | Self::AttachRules(_)
             | Self::Ping { .. }
-            | Self::Flush { .. } => "control",
+            | Self::Flush { .. }
+            | Self::Drained { .. }
+            | Self::Draining => "control",
             #[cfg(test)]
             Self::Ordered(inner) => inner.class(),
             _ => "cluster",
@@ -2125,6 +2203,8 @@ pub struct Hub {
     /// (no re-check) until [`HubCommand::AttachAuthorizer`] arrives — harnesses
     /// without a reloadable policy keep today's restore-as-persisted behavior.
     authz: Option<AuthzWatch>,
+    /// The rule engine (ADR 0083), for Wills; `None` until [`HubCommand::AttachRules`].
+    rules: Option<crate::rules::Rules>,
     /// Brownout (ADR 0041 T5 disk, T8 memory): set while **any** watched resource is
     /// over its watermark — the stores' on-disk size above `MQTTD_STORE_MAX_BYTES`, or
     /// process RSS above `MQTTD_MEMORY_MAX_BYTES`. Growth writes (new retained topics,
@@ -2323,6 +2403,22 @@ pub struct Hub {
     /// group's degraded followers stall only its own sessions' appends — never every
     /// client on the node. Spawned on first submission; reaped by the sweep when idle.
     append_lanes: HashMap<ClientId, AppendLane>,
+    /// [`HubCommand::Drained`] barriers waiting for the in-flight work to finish.
+    drained_waiters: Vec<oneshot::Sender<u64>>,
+    /// A graceful drain has begun ([`HubCommand::Draining`]).
+    draining: bool,
+    /// Set only while [`HubCommand::RuleDerived`] dispatches a publish the hub gated
+    /// itself during the drain, so `dispatch_publish` records its pending id below.
+    drain_gating: bool,
+    /// The pending ids of the publishes the hub gated itself during the drain. A peer
+    /// that refuses one of their acked forwards (its own brownout) is sent it again as a
+    /// plain forward, so it still delivers it live: nobody would retry it. Only grows
+    /// while draining, which ends with the process (a drain that could be cancelled
+    /// would have to clear it with `draining`).
+    drain_gated: HashSet<u64>,
+    /// Unanswered publishes the pending-publish bound evicted during the drain, which the
+    /// barrier therefore did not wait for; reported with its answer.
+    drain_evicted: u64,
     /// The lane workers themselves, owned by the hub so their lifetime is the hub's.
     ///
     /// This ownership is load-bearing, not tidiness. A worker holds an `Arc` of the
@@ -2517,6 +2613,11 @@ impl Hub {
                 self_tx: tx.clone(),
                 connecting: HashMap::new(),
                 append_lanes: HashMap::new(),
+                drained_waiters: Vec::new(),
+                draining: false,
+                drain_gating: false,
+                drain_gated: HashSet::new(),
+                drain_evicted: 0,
                 owned_tasks: tokio::task::JoinSet::new(),
                 truncate_tx: None,
                 qos2_cleanup: HashSet::new(),
@@ -2557,6 +2658,7 @@ impl Hub {
                 retained: Arc::new(MemoryRetainedStore::new()),
                 durable_retained: None,
                 authz: None,
+                rules: None,
                 brownout: false,
                 brownout_axes: HashSet::new(),
                 brownout_status: None,
@@ -2895,6 +2997,25 @@ impl Hub {
         if let Some(m) = &self.metrics {
             m.observe_hub_dispatch(class, started.elapsed().as_secs_f64());
         }
+        // An append's completion arrives as a command, so this is where a drain
+        // barrier can come due.
+        if !self.drained_waiters.is_empty() {
+            self.wake_drained();
+        }
+    }
+
+    /// Answer the [`HubCommand::Drained`] barriers once no durable append is in flight
+    /// and no publish awaits its acknowledgement — its own appends, or a peer's answer
+    /// to its acked forward. (An entry kept only for the settle window's replay has been
+    /// answered, and does not hold the barrier.)
+    fn wake_drained(&mut self) {
+        if self.append_lanes.values().all(|lane| lane.outstanding == 0)
+            && self.pending_publishes.iter().all(|(_, p)| p.ack_released())
+        {
+            for reply in self.drained_waiters.drain(..) {
+                let _ = reply.send(self.drain_evicted);
+            }
+        }
     }
 
     /// The once-a-second sweep: expiry, cleanup, gauges, retransmits, lane reaping.
@@ -2923,6 +3044,10 @@ impl Hub {
         // completed task's slot until polled, so without this the set grows
         // by one per lane ever spawned.
         while self.owned_tasks.try_join_next().is_some() {}
+        // The sweep can settle publishes too (a re-route after a peer died).
+        if !self.drained_waiters.is_empty() {
+            self.wake_drained();
+        }
         if let Some(m) = &self.metrics {
             m.observe_hub_dispatch("sweep", started.elapsed().as_secs_f64());
         }
@@ -2999,110 +3124,62 @@ impl Hub {
                     let _ = reply.send(existed);
                 }
             }
-            HubCommand::Publish {
-                topic,
-                payload,
-                qos,
-                mut retain,
-                message_expiry,
-                app,
-                done,
-                v5,
-                publisher,
-                // Held to the end of this dispatch, then dropped: the publish's
-                // ingress credit returns to its connection and the pool (ADR 0082 T3).
-                credit: _credit,
-            } => {
-                if let Some(m) = &self.metrics {
-                    m.publish_received(qos_num(qos));
-                }
-                // Retained quota (ADR 0041 T4): a retained publish that would CREATE
-                // a new topic beyond the cap. Growth is refused; overwrite and clear
-                // (empty payload) always work. v5: refuse outright (the publisher is
-                // told 0x97); v3.1.1 has no reason codes: deliver live, retain nothing.
-                if retain && !payload.is_empty() && self.retained_quota_exceeded(&topic).await {
-                    if let Some(m) = &self.metrics {
-                        m.quota_rejected("retained");
-                    }
-                    if v5 {
-                        warn!(topic = %topic, "retained quota exceeded; publish refused 0x97 (ADR 0041)");
-                        if let Some(done) = done {
-                            let _ =
-                                done.send(PublishOutcome::Refused(PublishRefusal::RetainedQuota));
+            cmd @ HubCommand::Publish { .. } => {
+                self.dispatch_publish(cmd).await;
+            }
+            HubCommand::PublishBatch(batch) => {
+                // Held to the end of the whole batch, then dropped (ADR 0082 T3).
+                let PublishBatch {
+                    original,
+                    derived,
+                    credit: _credit,
+                    derived_credit: _derived_credit,
+                } = *batch;
+                let routed = self.dispatch_publish(original).await;
+                for DerivedPublish {
+                    rule,
+                    publish,
+                    gated,
+                } in derived
+                {
+                    // Counted before it is routed, so a subscriber never sees a
+                    // message its action has not counted yet.
+                    if !gated {
+                        if let Some(m) = &self.metrics {
+                            m.rule_action(&rule, if routed { "ok" } else { "failed" });
                         }
-                        return;
                     }
-                    warn!(topic = %topic,
-                          "retained quota exceeded; delivered live, NOT retained (v3.1.1, ADR 0041)");
-                    retain = false;
+                    // Not routed: the command is dropped, its gate (if any) closes, and
+                    // the publisher hears the original's own answer.
+                    if routed {
+                        self.dispatch_publish(publish).await;
+                    }
                 }
-                // A gated publish registers a pending entry FIRST (ADR 0042 T9), so
-                // the fan-out can attach its cluster-wide obligations: acked peer
-                // forwards (exhibit ⑤) and the retained authority commit (exhibit ⑦).
-                let gate = done.map(|done| {
-                    self.register_pending(done, &topic, &payload, qos, retain, message_expiry, &app)
-                });
-                // ADR 0072: the publisher may weaken ITS OWN ack per message via
-                // `mqttd-durability` — only under the operator's opt-in. `relaxed`
-                // releases the ack at local_done (everything still runs); `local`
-                // is honored inside the store's append; v3.1.1 can't carry the
-                // property, so it always gets the full quorum path. The property
-                // itself is forwarded unaltered (MQTT-3.3.2-17).
-                let tier = if self.allow_relaxed_publish {
-                    app.user_properties
-                        .iter()
-                        .rev()
-                        .find(|(k, _)| k == mqtt_storage::repl::DURABILITY_PROPERTY)
-                        .and_then(|(_, v)| mqtt_storage::repl::DurabilityTier::parse(v))
-                        .unwrap_or_default()
-                } else {
-                    mqtt_storage::repl::DurabilityTier::Quorum
-                };
+            }
+            HubCommand::RuleDerived(derived) => {
+                let DerivedPublish {
+                    rule, mut publish, ..
+                } = *derived;
+                // While the broker drains, the hub gates it itself, though nobody waits
+                // for the answer: a gated publish's forward to a peer is an acked one,
+                // and the drain barrier waits for every gated publish to be answered.
+                // Not under a brownout: there a gated publish owing a durable copy is
+                // refused before any live send or forward, where an ungated one still
+                // goes out live and only its durable copy is dropped (counted).
+                let gate = self.draining && !self.brownout;
+                if gate {
+                    if let HubCommand::Publish { done, .. } = &mut publish {
+                        *done = Some(oneshot::channel().0);
+                    }
+                }
+                self.drain_gating = gate;
+                let routed = self.dispatch_publish(publish).await;
+                self.drain_gating = false;
+                if !routed {
+                    debug!(rule = %rule, "a message derived from an event or a Will was refused");
+                }
                 if let Some(m) = &self.metrics {
-                    m.publish_tier(tier.as_str());
-                }
-                if tier == mqtt_storage::repl::DurabilityTier::Relaxed {
-                    if let Some(id) = gate {
-                        self.pending_mark_relaxed(id);
-                    }
-                }
-                // Time the synchronous on-loop fan-out (plan + lane submissions +
-                // peer forward) as the hub's per-publish on-loop latency (ADR
-                // 0020-T4; since issue #242 the durable appends themselves run
-                // off-loop and are timed by `durable_append_latency_seconds`).
-                let started = Instant::now();
-                let durable = self
-                    .publish(
-                        &topic,
-                        &payload,
-                        qos,
-                        retain,
-                        message_expiry,
-                        &app,
-                        gate,
-                        publisher.as_ref(),
-                    )
-                    .await;
-                if let Some(m) = &self.metrics {
-                    m.observe_deliver_latency(started.elapsed().as_secs_f64());
-                }
-                // The LOCAL fan-out pass is complete: every owed durable append is
-                // now SUBMITTED to its session's lane (issue #242), counted in the
-                // gate's `appends_outstanding` — so `pending_local_done` can fire
-                // here while the ack still waits for every append's `AppendDone`
-                // (ADR 0018 + ADR 0042 T9). A submission the lane REJECTED (full)
-                // or a failed retained write WITHHOLDS the ack (drop the entry):
-                // the publisher's connection closes unacked and it retries — fail
-                // closed, never an ack for a message a subscriber will never see
-                // (ADR 0041 T5). A stated-policy REFUSAL (brownout) was decided at
-                // the plan pass, before any submission, and is told to the
-                // publisher instead of withheld (0041-T11, issue #238).
-                if let Some(id) = gate {
-                    match durable {
-                        DurableOutcome::Ok => self.pending_local_done(id),
-                        DurableOutcome::Refused(r) => self.refuse_pending(id, r),
-                        DurableOutcome::Failed => self.drop_pending(id),
-                    }
+                    m.rule_action(&rule, if routed { "ok" } else { "failed" });
                 }
             }
             HubCommand::RestoreRetained {
@@ -3162,9 +3239,144 @@ impl Hub {
             HubCommand::AttachAuthorizer(watch) => {
                 self.authz = Some(watch);
             }
+            HubCommand::AttachRules(rules) => {
+                self.rules = Some(rules);
+            }
             // Peer- and cluster-facing commands.
             other => self.dispatch_cluster(other).await,
         }
+    }
+
+    /// Route one publish: a client's, or a message its rules derived. Returns whether
+    /// messages derived from it may follow it into the fan-out (ADR 0083).
+    ///
+    /// The body is the `Publish` arm of [`dispatch`](Self::dispatch), moved verbatim so
+    /// a [`HubCommand::PublishBatch`] routes its original and its derived messages
+    /// through exactly the same on-loop decision.
+    #[allow(clippy::too_many_lines)]
+    async fn dispatch_publish(&mut self, cmd: HubCommand) -> bool {
+        let HubCommand::Publish {
+            topic,
+            payload,
+            qos,
+            mut retain,
+            message_expiry,
+            app,
+            done,
+            v5,
+            publisher,
+            // Held to the end of this dispatch, then dropped: the publish's
+            // ingress credit returns to its connection and the pool (ADR 0082 T3).
+            credit: _credit,
+        } = cmd
+        else {
+            debug_assert!(false, "dispatch_publish routes Publish commands only");
+            return false;
+        };
+        if let Some(m) = &self.metrics {
+            m.publish_received(qos_num(qos));
+        }
+        // Retained quota (ADR 0041 T4): a retained publish that would CREATE
+        // a new topic beyond the cap. Growth is refused; overwrite and clear
+        // (empty payload) always work. v5: refuse outright (the publisher is
+        // told 0x97); v3.1.1 has no reason codes: deliver live, retain nothing.
+        if retain && !payload.is_empty() && self.retained_quota_exceeded(&topic).await {
+            if let Some(m) = &self.metrics {
+                m.quota_rejected("retained");
+            }
+            if v5 {
+                warn!(topic = %topic, "retained quota exceeded; publish refused 0x97 (ADR 0041)");
+                if let Some(done) = done {
+                    let _ = done.send(PublishOutcome::Refused(PublishRefusal::RetainedQuota));
+                }
+                return false;
+            }
+            warn!(topic = %topic,
+                  "retained quota exceeded; delivered live, NOT retained (v3.1.1, ADR 0041)");
+            retain = false;
+        }
+        // A gated publish registers a pending entry FIRST (ADR 0042 T9), so
+        // the fan-out can attach its cluster-wide obligations: acked peer
+        // forwards (exhibit ⑤) and the retained authority commit (exhibit ⑦).
+        let gate = done.map(|done| {
+            self.register_pending(done, &topic, &payload, qos, retain, message_expiry, &app)
+        });
+        if self.drain_gating {
+            self.drain_gated.extend(gate);
+        }
+        // ADR 0072: the publisher may weaken ITS OWN ack per message via
+        // `mqttd-durability` — only under the operator's opt-in. `relaxed`
+        // releases the ack at local_done (everything still runs); `local`
+        // is honored inside the store's append; v3.1.1 can't carry the
+        // property, so it always gets the full quorum path. The property
+        // itself is forwarded unaltered (MQTT-3.3.2-17).
+        let tier = if self.allow_relaxed_publish {
+            app.user_properties
+                .iter()
+                .rev()
+                .find(|(k, _)| k == mqtt_storage::repl::DURABILITY_PROPERTY)
+                .and_then(|(_, v)| mqtt_storage::repl::DurabilityTier::parse(v))
+                .unwrap_or_default()
+        } else {
+            mqtt_storage::repl::DurabilityTier::Quorum
+        };
+        if let Some(m) = &self.metrics {
+            m.publish_tier(tier.as_str());
+        }
+        if tier == mqtt_storage::repl::DurabilityTier::Relaxed {
+            if let Some(id) = gate {
+                self.pending_mark_relaxed(id);
+            }
+        }
+        // Time the synchronous on-loop fan-out (plan + lane submissions +
+        // peer forward) as the hub's per-publish on-loop latency (ADR
+        // 0020-T4; since issue #242 the durable appends themselves run
+        // off-loop and are timed by `durable_append_latency_seconds`).
+        let started = Instant::now();
+        let durable = self
+            .publish(
+                &topic,
+                &payload,
+                qos,
+                retain,
+                message_expiry,
+                &app,
+                gate,
+                publisher.as_ref(),
+            )
+            .await;
+        if let Some(m) = &self.metrics {
+            m.observe_deliver_latency(started.elapsed().as_secs_f64());
+        }
+        // The LOCAL fan-out pass is complete: every owed durable append is
+        // now SUBMITTED to its session's lane (issue #242), counted in the
+        // gate's `appends_outstanding` — so `pending_local_done` can fire
+        // here while the ack still waits for every append's `AppendDone`
+        // (ADR 0018 + ADR 0042 T9). A submission the lane REJECTED (full)
+        // or a failed retained write WITHHOLDS the ack (drop the entry):
+        // the publisher's connection closes unacked and it retries — fail
+        // closed, never an ack for a message a subscriber will never see
+        // (ADR 0041 T5). A stated-policy REFUSAL (brownout) was decided at
+        // the plan pass, before any submission, and is told to the
+        // publisher instead of withheld (0041-T11, issue #238).
+        // What this publish's rules derived may follow it (ADR 0083) only if it was
+        // accepted here: never behind a refusal, and never behind a gated publish whose
+        // fan-out failed — that one is withheld, its publisher retries, and the retry
+        // derives them again. An ungated publish is never retried, so its derived
+        // messages still follow a failed copy.
+        let derived_may_follow = match &durable {
+            DurableOutcome::Ok => true,
+            DurableOutcome::Refused(_) => false,
+            DurableOutcome::Failed => gate.is_none(),
+        };
+        if let Some(id) = gate {
+            match durable {
+                DurableOutcome::Ok => self.pending_local_done(id),
+                DurableOutcome::Refused(r) => self.refuse_pending(id, r),
+                DurableOutcome::Failed => self.drop_pending(id),
+            }
+        }
+        derived_may_follow
     }
 
     /// Dispatch a peer-/cluster-facing command (forwarded publishes, peer link
@@ -3378,6 +3590,9 @@ impl Hub {
             HubCommand::Flush { reply } => {
                 let _ = reply.send(());
             }
+            // Answered by `dispatch_timed` once nothing is left in flight.
+            HubCommand::Drained { reply } => self.drained_waiters.push(reply),
+            HubCommand::Draining => self.draining = true,
             #[cfg(test)]
             HubCommand::Ordered(inner) => {
                 Box::pin(self.dispatch(*inner)).await;
@@ -3730,11 +3945,36 @@ impl Hub {
     /// still delivered LIVE and counted as a genuine drop — never suppressed. A Will
     /// suppressed under brownout is a device that stays "online" on every dashboard
     /// through exactly the incident [MQTT-3.14.4-3] exists for.
-    async fn publish_will(&mut self, w: &Message) {
+    ///
+    /// A Will is a publish like any other to the rule engine (EMQX runs its rules on
+    /// one, ADR 0083), and the hub is what publishes it, so the hub evaluates it. What
+    /// the rules produce is posted back as ordinary publishes — through the same
+    /// dispatch (quota checks included) as any other, ungated like the Will, each
+    /// counted as it is routed or refused ([`HubCommand::RuleDerived`]).
+    async fn publish_will(&mut self, client: &ClientId, will: &Will) {
+        let w = &will.message;
         self.publish(
             &w.topic, &w.payload, w.qos, w.retain, None, &w.app, None, None,
         )
         .await;
+        let Some(rules) = &self.rules else { return };
+        let self_tx = &self.self_tx;
+        rules.on_will(
+            &crate::rules::PublishFacts {
+                client,
+                publisher: &will.publisher,
+                topic: &w.topic,
+                payload: &w.payload,
+                qos: w.qos,
+                retain: w.retain,
+                dup: false,
+                app: &w.app,
+                message_expiry: None,
+            },
+            |cmd| {
+                let _ = self_tx.send(cmd);
+            },
+        );
     }
 
     /// Log when a persistent session attaches on a node that is not its placement
@@ -4107,7 +4347,7 @@ impl Hub {
         if let Some(old) = self.online.remove(&client) {
             warn!(client = %client.0, "session takeover: replacing existing connection");
             if let Some(w) = old.will {
-                self.publish_will(&w.message).await;
+                self.publish_will(&client, &w).await;
             }
         }
         self.online.insert(
@@ -5171,7 +5411,7 @@ impl Hub {
         let hold = w.delay_secs.min(expiry);
         if hold == 0 {
             info!(client = %client.0, topic = %w.message.topic, "publishing will (ungraceful disconnect)");
-            self.publish_will(&w.message).await;
+            self.publish_will(client, &w).await;
         } else {
             let due = Instant::now() + Duration::from_secs(u64::from(hold));
             info!(
@@ -5459,7 +5699,7 @@ impl Hub {
                 client = %client.0, topic = %will.message.topic,
                 "publishing will (delay elapsed)"
             );
-            self.publish_will(&will.message).await;
+            self.publish_will(&client, &will).await;
         }
 
         // Issue #504: connections_active can hit 0 while sessions linger in
@@ -7944,6 +8184,7 @@ mod tests {
     ) -> (mpsc::UnboundedReceiver<Box<Packet>>, bool) {
         // Delay 0: these predate Will Delay and assert the publish-at-once path.
         let will = Will {
+            publisher: crate::rules::Publisher::default(),
             message: will,
             delay_secs: 0,
         };
@@ -8796,6 +9037,7 @@ mod tests {
             session_expiry: 0,
             receive_maximum: u16::MAX,
             will: Some(Box::new(Will {
+                publisher: crate::rules::Publisher::default(),
                 delay_secs: 0,
                 message: mqtt_core::Message {
                     topic: "wills/victim".into(),
@@ -12141,6 +12383,110 @@ mod tests {
             done.await.is_err(),
             "a publish already stored durably may only be WITHHELD: `Refused` asserts \
              'nothing was stored', and a retry on that basis duplicates it"
+        );
+    }
+
+    /// A derived message stored locally and then refused by a peer (ADR 0083): the hub
+    /// turns that partial store into a withhold of the DERIVED message's gate (the #238
+    /// rule), and the publisher must still hear the ORIGINAL's answer. Withholding the
+    /// original instead re-delivered it on every resend for as long as the peer's
+    /// brownout lasted — and for a `QoS` 2 original as a fresh sighting each time. Found by
+    /// an adversarial review of PR #871; this was its reproduction, with the assertions
+    /// turned around.
+    #[tokio::test]
+    async fn a_peer_refusing_a_stored_derived_message_does_not_withhold_the_original() {
+        let tx = start_hub();
+        let mut peer = connect_peer_at_proto(&tx, "n2", 1, 7);
+        remote_interest(&tx, "n2", &["out/x"]);
+        // The original's only subscriber: local, persistent, QoS 2.
+        let (_r1, _) = attach(&tx, "osub", 2, false).await;
+        subscribe_qos(&tx, "osub", "in/t", QoS::ExactlyOnce);
+        detach(&tx, "osub", 2);
+        // The derived topic: a local persistent subscriber AND interest on n2.
+        let (_r2, _) = attach(&tx, "dsub", 3, false).await;
+        subscribe_qos(&tx, "dsub", "out/x", QoS::AtLeastOnce);
+        detach(&tx, "dsub", 3);
+
+        // Watch each gate's own answer on its way into the join.
+        let relay = |rx: oneshot::Receiver<PublishOutcome>| {
+            let (tx, out) = oneshot::channel();
+            let seen = tokio::spawn(async move {
+                let o = rx.await.ok();
+                if let Some(v) = o {
+                    let _ = tx.send(v);
+                }
+                o
+            });
+            (seen, out)
+        };
+        let (otx, orx) = oneshot::channel();
+        let (dtx, drx) = oneshot::channel();
+        let (orig_seen, orig_rx) = relay(orx);
+        let (derived_seen, derived_rx) = relay(drx);
+        tx.send(HubCommand::PublishBatch(Box::new(super::PublishBatch {
+            original: HubCommand::Publish {
+                topic: "in/t".into(),
+                payload: Bytes::from_static(b"orig"),
+                qos: QoS::ExactlyOnce,
+                retain: false,
+                message_expiry: None,
+                app: AppProperties::default(),
+                done: Some(otx),
+                v5: true,
+                publisher: Some(ClientId("pub".into())),
+                credit: None,
+            },
+            derived: vec![super::DerivedPublish {
+                rule: Arc::from("r"),
+                publish: crate::rules::derived_command(
+                    mqtt_rules::Republish {
+                        topic: "out/x".into(),
+                        payload: Bytes::from_static(b"der"),
+                        qos: 1,
+                        retain: false,
+                        app: AppProperties::default(),
+                        message_expiry: None,
+                    },
+                    Some(dtx),
+                ),
+                gated: true,
+            }],
+            credit: None,
+            derived_credit: None,
+        })))
+        .unwrap();
+        let joined = crate::rules::join_outcomes(orig_rx, vec![(Arc::from("r"), derived_rx)], None);
+
+        let seq = match next_forward_answer(&mut peer).await {
+            PeerMessage::PublishAcked { seq, topic, .. } => {
+                assert_eq!(topic, "out/x", "only the derived message is forwarded");
+                seq
+            }
+            other => panic!("expected the derived forward, got {other:?}"),
+        };
+        tx.send(ordered(HubCommand::RemotePublishVerdict {
+            node: NodeId("n2".into()),
+            seq,
+            verdict: ForwardVerdict::Refused {
+                code: PublishRefusal::Brownout.wire_code(),
+            },
+        }))
+        .unwrap();
+
+        let joined = timeout(Duration::from_secs(5), joined)
+            .await
+            .expect("the join resolves")
+            .ok();
+        assert_eq!(orig_seen.await.unwrap(), Some(PublishOutcome::Accepted));
+        assert_eq!(
+            derived_seen.await.unwrap(),
+            None,
+            "the hub withholds a derived message refused after a local store"
+        );
+        assert_eq!(
+            joined,
+            Some(PublishOutcome::Accepted),
+            "the publisher hears the original's own answer"
         );
     }
 
@@ -17278,6 +17624,7 @@ mod tests {
             1,
             u32::MAX,
             Some(Will {
+                publisher: crate::rules::Publisher::default(),
                 delay_secs: 0,
                 message: Message {
                     topic: "wills/284".into(),
@@ -17315,6 +17662,7 @@ mod tests {
             2,
             u32::MAX,
             Some(Will {
+                publisher: crate::rules::Publisher::default(),
                 delay_secs: 0,
                 message: Message {
                     topic: "wills/284".into(),
@@ -18338,6 +18686,405 @@ mod tests {
             }
             out
         }
+    }
+
+    /// ADR 0083: the drain barrier answers only once no durable append is in flight,
+    /// so a graceful shutdown that awaits it does not exit with an offline session's
+    /// message dispatched but not yet stored — what lost the presence messages rules
+    /// derive from the drain's own disconnects. On an idle hub it answers at once.
+    #[tokio::test]
+    async fn the_drain_barrier_waits_for_in_flight_appends() {
+        let store = ParkingStore::new();
+        let release = store.park("r");
+        let (hub, tx) = Hub::with_config(NodeId("hub-test".into()), store.clone());
+        tokio::spawn(hub.run());
+
+        let drained = |tx: &HubTx| {
+            let (reply, rx) = oneshot::channel();
+            tx.send(HubCommand::Drained { reply }).unwrap();
+            rx
+        };
+        timeout(Duration::from_secs(2), drained(&tx))
+            .await
+            .expect("an idle hub has nothing in flight")
+            .unwrap();
+
+        let (_rx, _) = attach(&tx, "r", 1, false).await;
+        subscribe_qos(&tx, "r", "rt/t", QoS::AtLeastOnce);
+        detach(&tx, "r", 1);
+        // Ungated, as a rule-derived message is: nobody waits for its answer.
+        tx.send(HubCommand::Publish {
+            topic: "rt/t".into(),
+            payload: Bytes::from_static(b"late"),
+            qos: QoS::AtLeastOnce,
+            retain: false,
+            message_expiry: None,
+            app: AppProperties::default(),
+            done: None,
+            v5: false,
+            publisher: None,
+            credit: None,
+        })
+        .unwrap();
+        let mut waiting = drained(&tx);
+        assert!(
+            timeout(Duration::from_millis(300), &mut waiting)
+                .await
+                .is_err(),
+            "answered while the append is still parked"
+        );
+        assert!(store.ops().iter().all(|(op, _)| op != "enqueue"));
+
+        release.send(true).unwrap();
+        timeout(Duration::from_secs(2), waiting)
+            .await
+            .expect("answered once the append lands")
+            .unwrap();
+        assert!(
+            store
+                .ops()
+                .iter()
+                .any(|(op, d)| op == "enqueue" && d == "r late"),
+            "the barrier answered only after the message was stored"
+        );
+    }
+
+    /// ADR 0083 (review of PR #871): while the broker drains, what rules derive from
+    /// events is forwarded to an interested peer ACKED, and the drain barrier waits for
+    /// the peer's answer — a `shutdown` presence message bound for a subscriber on
+    /// another node is not left in a link queue when the process exits. Outside a
+    /// drain the same message is forwarded ungated and the barrier does not wait.
+    #[tokio::test]
+    async fn while_draining_a_rule_derived_forward_holds_the_barrier_until_the_peer_answers() {
+        let derived = presence_message;
+        let tx = start_hub();
+        // Proto 7: its acked forward is the plain `PublishAcked` frame.
+        let mut peer = connect_peer_at_proto(&tx, "n2", 1, 7);
+        remote_interest(&tx, "n2", &["presence/#"]);
+
+        // Not draining: an ungated forward, and the barrier answers at once.
+        tx.send(derived("presence/a")).unwrap();
+        timeout(Duration::from_secs(2), drained(&tx))
+            .await
+            .expect("nothing awaits an answer")
+            .unwrap();
+        loop {
+            match timeout(Duration::from_secs(2), peer.recv())
+                .await
+                .expect("the forward arrives")
+                .expect("the link is open")
+            {
+                PeerMessage::Publish { topic, .. } => {
+                    assert_eq!(topic, "presence/a");
+                    break;
+                }
+                PeerMessage::PublishAcked { .. } => panic!("an ungated message forwarded acked"),
+                _ => {}
+            }
+        }
+
+        // Draining: an acked forward, and the barrier waits for the peer's answer.
+        tx.send(HubCommand::Draining).unwrap();
+        tx.send(derived("presence/b")).unwrap();
+        let seq = match next_forward_answer(&mut peer).await {
+            PeerMessage::PublishAcked { seq, topic, .. } => {
+                assert_eq!(topic, "presence/b");
+                seq
+            }
+            other => panic!("expected an acked forward, got {other:?}"),
+        };
+        let mut waiting = drained(&tx);
+        assert!(
+            timeout(Duration::from_millis(300), &mut waiting)
+                .await
+                .is_err(),
+            "answered before the peer did"
+        );
+        tx.send(ordered(HubCommand::RemotePublishAck {
+            node: NodeId("n2".into()),
+            seq,
+            ok: true,
+        }))
+        .unwrap();
+        timeout(Duration::from_secs(2), waiting)
+            .await
+            .expect("answered once the peer has")
+            .unwrap();
+    }
+
+    /// What a presence rule derives from a client's disconnect: a `QoS` 1 `shutdown`
+    /// message on `topic`, ungated as [`Rules`](crate::rules::Rules) sends it.
+    fn presence_message(topic: &str) -> HubCommand {
+        HubCommand::RuleDerived(Box::new(super::DerivedPublish {
+            rule: Arc::from("presence"),
+            publish: HubCommand::Publish {
+                topic: topic.into(),
+                payload: Bytes::from_static(b"shutdown"),
+                qos: QoS::AtLeastOnce,
+                retain: false,
+                message_expiry: None,
+                app: AppProperties::default(),
+                done: None,
+                v5: false,
+                publisher: None,
+                credit: None,
+            },
+            gated: false,
+        }))
+    }
+
+    /// ADR 0083: a drain-gated message bound for a `$share` group whose every member
+    /// refuses it (their nodes in a brownout) is not lost there: the first member tried
+    /// gets it as a plain `SharedDeliver`, as it would have had the drain not gated it.
+    #[tokio::test]
+    async fn a_shared_group_refusing_every_drain_gated_delivery_still_gets_it_plainly() {
+        let tx = start_hub();
+        let mut peer = connect_peer_at_proto(&tx, "n2", 1, 7);
+        remote_shared_interest_qos(&tx, "n2", "g", "presence/#", &[("m1", QoS::AtLeastOnce)]);
+        tx.send(HubCommand::Draining).unwrap();
+        tx.send(presence_message("presence/c")).unwrap();
+        let seq = match next_forward_answer(&mut peer).await {
+            PeerMessage::SharedDeliverAcked { seq, client, .. } => {
+                assert_eq!(client, "m1");
+                seq
+            }
+            other => panic!("expected an acked shared delivery, got {other:?}"),
+        };
+        tx.send(ordered(HubCommand::RemotePublishVerdict {
+            node: NodeId("n2".into()),
+            seq,
+            verdict: ForwardVerdict::Refused {
+                code: PublishRefusal::Brownout.wire_code(),
+            },
+        }))
+        .unwrap();
+        match next_forward_answer(&mut peer).await {
+            PeerMessage::SharedDeliver { client, topic, .. } => {
+                assert_eq!((client.as_str(), topic.as_str()), ("m1", "presence/c"));
+            }
+            other => panic!("expected a plain shared delivery, got {other:?}"),
+        }
+        assert_eq!(
+            timeout(Duration::from_secs(2), drained(&tx))
+                .await
+                .expect("the refusal settled the delivery")
+                .unwrap(),
+            0
+        );
+    }
+
+    /// The local branch of the fallback above: the group's peer member refuses and
+    /// leaves the group, and its local member, back online, is refused too because this
+    /// node went into a brownout after the drain gated the message. The local member
+    /// still gets it live, ungated, its durable copy a counted drop.
+    #[tokio::test]
+    async fn a_local_member_refused_by_a_brownout_after_the_drain_gated_it_still_gets_it_live() {
+        let tx = start_hub();
+        let mut peer = connect_peer_at_proto(&tx, "n2", 1, 7);
+        remote_shared_interest_qos(&tx, "n2", "g", "presence/#", &[("m1", QoS::AtLeastOnce)]);
+        let (_offline, _) = attach(&tx, "local", 2, false).await;
+        subscribe_qos(&tx, "local", "$share/g/presence/#", QoS::AtLeastOnce);
+        detach(&tx, "local", 2);
+        tx.send(HubCommand::Draining).unwrap();
+        // The online peer member is chosen over the offline local one.
+        tx.send(presence_message("presence/d")).unwrap();
+        let seq = match next_forward_answer(&mut peer).await {
+            PeerMessage::SharedDeliverAcked { seq, client, .. } => {
+                assert_eq!(client, "m1");
+                seq
+            }
+            other => panic!("expected an acked shared delivery, got {other:?}"),
+        };
+        remote_shared_interest_qos(&tx, "n2", "g", "presence/#", &[]);
+        let (mut local, _) = attach(&tx, "local", 3, false).await;
+        tx.send(HubCommand::SetBrownout {
+            axis: BrownoutAxis::Disk,
+            on: true,
+        })
+        .unwrap();
+        tx.send(ordered(HubCommand::RemotePublishVerdict {
+            node: NodeId("n2".into()),
+            seq,
+            verdict: ForwardVerdict::Refused {
+                code: PublishRefusal::Brownout.wire_code(),
+            },
+        }))
+        .unwrap();
+        let delivered = timeout(Duration::from_secs(2), local.recv())
+            .await
+            .expect("the local member gets it live")
+            .expect("its session is open");
+        assert_eq!(payload_of(&delivered), b"shutdown");
+        assert_eq!(
+            timeout(Duration::from_secs(2), drained(&tx))
+                .await
+                .expect("nothing awaits an answer")
+                .unwrap(),
+            0
+        );
+    }
+
+    /// The fallback does not depend on how the last attempt ended: one member refuses
+    /// (its node in a brownout), the next member's node dies (a re-selection with
+    /// `Failed`), and the refusing member, alive and still in the group, gets the
+    /// message plainly.
+    #[tokio::test]
+    async fn a_shared_group_whose_last_candidate_died_still_gets_a_drain_gated_message() {
+        let tx = start_hub();
+        let mut n2 = connect_peer_at_proto(&tx, "n2", 1, 7);
+        let mut n3 = connect_peer_at_proto(&tx, "n3", 2, 7);
+        remote_shared_interest_qos(&tx, "n2", "g", "presence/#", &[("m2", QoS::AtLeastOnce)]);
+        remote_shared_interest_qos(&tx, "n3", "g", "presence/#", &[("m3", QoS::AtLeastOnce)]);
+        tx.send(HubCommand::Draining).unwrap();
+        tx.send(presence_message("presence/e")).unwrap();
+        // Whichever member is chosen first refuses; the other is chosen next and dies.
+        let acked = |msg: PeerMessage| match msg {
+            PeerMessage::SharedDeliverAcked { seq, .. } => seq,
+            other => panic!("expected an acked shared delivery, got {other:?}"),
+        };
+        let (refusing, refuser, survivor_link, mut dying_link, dying) = tokio::select! {
+            m = next_forward_answer(&mut n2) => (acked(m), "n2", n2, n3, "n3"),
+            m = next_forward_answer(&mut n3) => (acked(m), "n3", n3, n2, "n2"),
+        };
+        let mut survivor_link = survivor_link;
+        tx.send(ordered(HubCommand::RemotePublishVerdict {
+            node: NodeId(refuser.into()),
+            seq: refusing,
+            verdict: ForwardVerdict::Refused {
+                code: PublishRefusal::Brownout.wire_code(),
+            },
+        }))
+        .unwrap();
+        let _ = acked(next_forward_answer(&mut dying_link).await);
+        tx.send(HubCommand::PeerDead {
+            node: NodeId(dying.into()),
+        })
+        .unwrap();
+        match next_forward_answer(&mut survivor_link).await {
+            PeerMessage::SharedDeliver { topic, .. } => assert_eq!(topic, "presence/e"),
+            other => panic!("expected a plain shared delivery, got {other:?}"),
+        }
+        assert_eq!(
+            timeout(Duration::from_secs(2), drained(&tx))
+                .await
+                .expect("nothing awaits an answer")
+                .unwrap(),
+            0
+        );
+    }
+
+    /// A drain barrier, sent now; resolves to its answer.
+    fn drained(tx: &HubTx) -> oneshot::Receiver<u64> {
+        let (reply, rx) = oneshot::channel();
+        tx.send(HubCommand::Drained { reply }).unwrap();
+        rx
+    }
+
+    /// ADR 0083: a brownout refuses a gated publish that owes a durable copy outright,
+    /// before any live send or forward, where an ungated one still goes out live with
+    /// its durable copy a counted drop. So a node draining in a brownout leaves what
+    /// rules derive from its disconnects ungated: the live subscriber here and the
+    /// watcher on another node still get the `shutdown` message, though a persistent
+    /// session here is owed a copy the brownout refuses to store.
+    #[tokio::test]
+    async fn a_node_draining_in_a_brownout_still_sends_its_shutdown_events_live() {
+        let tx = start_hub();
+        let (_sleeper, _) = attach(&tx, "sleeper", 1, false).await;
+        subscribe_qos(&tx, "sleeper", "presence/#", QoS::AtLeastOnce);
+        detach(&tx, "sleeper", 1);
+        let (mut watcher, _) = attach(&tx, "watcher", 2, true).await;
+        subscribe_qos(&tx, "watcher", "presence/#", QoS::AtLeastOnce);
+        let mut peer = connect_peer_at_proto(&tx, "n2", 3, 7);
+        remote_interest(&tx, "n2", &["presence/#"]);
+        tx.send(HubCommand::SetBrownout {
+            axis: BrownoutAxis::Disk,
+            on: true,
+        })
+        .unwrap();
+        tx.send(HubCommand::Draining).unwrap();
+
+        tx.send(presence_message("presence/a")).unwrap();
+        let delivered = timeout(Duration::from_secs(2), watcher.recv())
+            .await
+            .expect("the live subscriber gets it, brownout or not")
+            .expect("its session is open");
+        assert_eq!(payload_of(&delivered), b"shutdown");
+        loop {
+            match timeout(Duration::from_secs(2), peer.recv())
+                .await
+                .expect("the watcher's node gets it too")
+                .expect("the link is open")
+            {
+                PeerMessage::Publish { topic, .. } => {
+                    assert_eq!(topic, "presence/a");
+                    break;
+                }
+                PeerMessage::PublishAcked { .. } => {
+                    panic!("gated in a brownout, where a gated publish is refused outright")
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(
+            timeout(Duration::from_secs(2), drained(&tx))
+                .await
+                .expect("nothing awaits an answer")
+                .unwrap(),
+            0
+        );
+    }
+
+    /// ADR 0083: a node that is itself in a brownout refuses an acked forward that owes a
+    /// durable copy there, before any side effect. Nobody would retry what the drain
+    /// gated, so the draining node sends it again as a plain forward, which that node
+    /// delivers live — what it would have done had the drain not gated it. A refusal of
+    /// a client's own gated publish is still the publisher's answer (`refuse_pending`).
+    #[tokio::test]
+    async fn a_peer_refusing_a_forward_the_drain_gated_gets_it_again_as_a_plain_forward() {
+        let tx = start_hub();
+        let mut peer = connect_peer_at_proto(&tx, "n2", 1, 7);
+        remote_interest(&tx, "n2", &["presence/#"]);
+        tx.send(HubCommand::Draining).unwrap();
+        tx.send(presence_message("presence/b")).unwrap();
+        let seq = match next_forward_answer(&mut peer).await {
+            PeerMessage::PublishAcked { seq, topic, .. } => {
+                assert_eq!(topic, "presence/b");
+                seq
+            }
+            other => panic!("expected an acked forward, got {other:?}"),
+        };
+        tx.send(ordered(HubCommand::RemotePublishVerdict {
+            node: NodeId("n2".into()),
+            seq,
+            verdict: ForwardVerdict::Refused {
+                code: PublishRefusal::Brownout.wire_code(),
+            },
+        }))
+        .unwrap();
+        loop {
+            match timeout(Duration::from_secs(2), peer.recv())
+                .await
+                .expect("sent again after the refusal")
+                .expect("the link is open")
+            {
+                PeerMessage::Publish { topic, payload, .. } => {
+                    assert_eq!(
+                        (topic.as_str(), &payload[..]),
+                        ("presence/b", &b"shutdown"[..])
+                    );
+                    break;
+                }
+                PeerMessage::PublishAcked { .. } => panic!("re-sent acked, to be refused again"),
+                _ => {}
+            }
+        }
+        assert_eq!(
+            timeout(Duration::from_secs(2), drained(&tx))
+                .await
+                .expect("the refusal settled the forward")
+                .unwrap(),
+            0
+        );
     }
 
     /// ADR 0072 — RELAXED tier: with the operator opt-in, a publish carrying

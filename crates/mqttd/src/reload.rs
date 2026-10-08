@@ -60,6 +60,12 @@ pub struct ReloadOutcome {
     pub requires_restart: Vec<String>,
 }
 
+/// How many rules in `set` are enabled (the `mqttd_rules_loaded` gauge).
+#[must_use]
+pub fn enabled_rules(set: &mqtt_rules::RuleSet) -> usize {
+    set.rules().iter().filter(|r| r.enabled()).count()
+}
+
 /// The top-level sections of `new` that differ from `old`, by their TOML names.
 fn changed_sections(old: &mqtt_config::Config, new: &mqtt_config::Config) -> Vec<String> {
     let (Ok(serde_json::Value::Object(o)), Ok(serde_json::Value::Object(n))) =
@@ -107,6 +113,11 @@ pub type AdminTlsBuildResult = Result<Box<dyn FnOnce() + Send>, String>;
 /// driver reads per datagram, so a rotated leaf signs — and is embedded in — the next
 /// outgoing gossip datagram.
 pub type GossipSignerBuildResult = Result<Arc<dyn mqtt_cluster::swim_auth::GossipSign>, String>;
+
+/// What a rules `build` closure returns (ADR 0083): the freshly-loaded rule set, or why
+/// the rules file does not load — which aborts the whole reload, keeping the running
+/// rules (and everything else) in force.
+pub type RulesBuildResult = Result<Arc<mqtt_rules::RuleSet>, String>;
 
 /// Whole-config hot reload (ADR 0046 T4). When a [`ConfigSource`] is attached, every
 /// [`Reloader::reload`] first re-loads the config file (defaults < file < `MQTTD_*` env),
@@ -239,6 +250,10 @@ pub struct Reloader {
     /// outgoing gossip datagram instead of surviving as a startup snapshot.
     gossip_signer: Option<Arc<mqtt_cluster::swim_auth::SignerSlot>>,
     gossip_signer_build: Option<Box<dyn Fn() -> GossipSignerBuildResult + Send + Sync>>,
+    /// Set by [`attach_rules`](Self::attach_rules) (ADR 0083): the live rule set the
+    /// connections read per publish, and the closure that re-reads the rules file.
+    rules_tx: Option<watch::Sender<Arc<mqtt_rules::RuleSet>>>,
+    rules_build: Option<Box<dyn Fn() -> RulesBuildResult + Send + Sync>>,
     /// Set by [`attach_config_source`](Self::attach_config_source) (ADR 0046 T4): the whole
     /// config is re-loaded, validated, and swapped ahead of the policy rebuild.
     config_source: Option<ConfigSource>,
@@ -294,6 +309,8 @@ impl Reloader {
                 admin_tls_build: None,
                 gossip_signer: None,
                 gossip_signer_build: None,
+                rules_tx: None,
+                rules_build: None,
                 config_source: None,
                 in_progress: std::sync::Mutex::new(()),
             },
@@ -403,6 +420,20 @@ impl Reloader {
         self.gossip_signer_build = Some(Box::new(build));
     }
 
+    /// Register the rule engine for reload (ADR 0083): `build` re-reads the rules file
+    /// named by the live config, and a clean load is swapped into `tx` — the rule set
+    /// every connection reads per publish — so the next publish runs the new rules. Folded
+    /// into the same atomic validate-before-swap reload: a rules file that does not load
+    /// rejects the whole reload and the running rules stay in force.
+    pub fn attach_rules(
+        &mut self,
+        tx: watch::Sender<Arc<mqtt_rules::RuleSet>>,
+        build: impl Fn() -> RulesBuildResult + Send + Sync + 'static,
+    ) {
+        self.rules_tx = Some(tx);
+        self.rules_build = Some(Box::new(build));
+    }
+
     /// Register the whole-config source for reload (ADR 0046 T4): each [`reload`](Self::reload)
     /// re-loads the config file, validates it, and swaps it into the shared `live` cell before
     /// the policy is rebuilt — so a config-file edit (a new ACL path, a changed quota) takes
@@ -494,6 +525,7 @@ impl Reloader {
         let peer_tls = self.peer_tls_build.as_ref().map(|b| b());
         let gossip_signer = self.gossip_signer_build.as_ref().map(|b| b());
         let admin_tls = self.admin_tls_build.as_ref().map(|b| b());
+        let rules = self.rules_build.as_ref().map(|b| b());
         // A configured TLS or CRL build failed: reject the whole reload, swap nothing.
         if let Some(Err(e)) = &tls {
             rollback();
@@ -518,6 +550,10 @@ impl Reloader {
         if let Some(Err(e)) = &admin_tls {
             rollback();
             return self.reject(trigger, &format!("admin tls: {e}"));
+        }
+        if let Some(Err(e)) = &rules {
+            rollback();
+            return self.reject(trigger, &format!("rules: {e}"));
         }
         match policy {
             // The ACL/authenticator build failed: reject, swap nothing.
@@ -552,6 +588,19 @@ impl Reloader {
                 // The admin listener (ADR 0081 T18): the next admin handshake serves it.
                 if let Some(Ok(commit)) = admin_tls {
                     commit();
+                }
+                // The rule engine (ADR 0083): the next publish runs the new rules.
+                if let (Some(tx), Some(Ok(set))) = (&self.rules_tx, rules) {
+                    if let Some(m) = &self.metrics {
+                        m.set_rules_loaded(enabled_rules(&set), set.digest());
+                    }
+                    info!(
+                        rules = set.len(),
+                        enabled = enabled_rules(&set),
+                        digest = %set.digest(),
+                        "rules reloaded (ADR 0083)"
+                    );
+                    let _ = tx.send(set);
                 }
                 // Revocation reaches live state (ADR 0040 T2/T3/T4): the hub
                 // re-evaluates every online session, subscription grant, and peer
@@ -979,6 +1028,69 @@ mod tests {
             text.contains("security_reloads_total{outcome=\"rejected\",trigger=\"signal\"} 1"),
             "a rejected reload counts under outcome=rejected:\n{text}"
         );
+    }
+
+    /// ADR 0083: a reload swaps a freshly-loaded rule set into the channel the
+    /// connections read, and moves `mqttd_rules_info`; a rules file that does not load
+    /// rejects the WHOLE reload — the running rules, and the running policy, stay.
+    #[test]
+    fn a_reload_swaps_the_rules_and_a_bad_rules_file_keeps_the_running_ones() {
+        let metrics = Arc::new(Metrics::new("test"));
+        let initial: (Arc<dyn Authorizer>, Arc<dyn Authenticator>) = (
+            Arc::new(AllowAll),
+            Arc::new(mqtt_auth::basic::BasicAuthenticator {
+                allow_anonymous: true,
+            }),
+        );
+        let (mut reloader, _handles) =
+            Reloader::with_metrics(initial, audit(), Some(metrics.clone()), || {
+                Ok((
+                    Arc::new(AllowAll) as Arc<dyn Authorizer>,
+                    Arc::new(mqtt_auth::basic::BasicAuthenticator {
+                        allow_anonymous: true,
+                    }) as Arc<dyn Authenticator>,
+                ))
+            });
+        let text = Arc::new(RwLock::new(
+            "[rules.a]\nsql = 'SELECT 1 AS n FROM \"t/#\"'\n".to_string(),
+        ));
+        let (tx, rx) = watch::channel(Arc::new(mqtt_rules::RuleSet::empty()));
+        reloader.attach_rules(tx, {
+            let text = text.clone();
+            move || -> RulesBuildResult {
+                mqtt_rules::RuleSet::parse(&read_lock(&text))
+                    .map(|l| Arc::new(l.rules))
+                    .map_err(|e| e.to_string())
+            }
+        });
+
+        assert!(reloader.reload("signal"));
+        assert_eq!(
+            rx.borrow().len(),
+            1,
+            "the new rules are what connections now read"
+        );
+        let digest = rx.borrow().digest().to_string();
+        assert!(
+            metrics
+                .render()
+                .contains(&format!("mqttd_rules_info{{checksum=\"{digest}\"}} 1")),
+            "{}",
+            metrics.render()
+        );
+
+        *write_lock(&text) = "[rules.a]\nsql = 'SELECT nope( FROM \"t/#\"'\n".to_string();
+        let outcome = reloader.reload_with_outcome("signal");
+        assert!(!outcome.applied);
+        assert!(
+            outcome
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .starts_with("rules: "),
+            "{outcome:?}"
+        );
+        assert_eq!(rx.borrow().digest(), digest, "the running rules are kept");
     }
 
     /// A reload swaps a freshly-built gossip CRL into the shared slot (ADR 0022 T7).

@@ -1,0 +1,28 @@
+# Recipe 04: rename and reshape a vendor's payload into your own schema
+#
+# Maps a vendor's uplink format (devId, vals.t, vals.h, ts in milliseconds) onto a
+# canonical nested schema with an ISO 8601 time, published on canonical/<device id> at
+# QoS 1. A dotted alias (device.id) builds a nested object. The device id comes from the
+# payload and becomes a topic level, so the WHERE lets only a plain id through (see
+# recipe 07): anything else produces nothing.
+#
+# In:  vendor/acme/uplink  qos=1 retain=0  {"devId": "th-42", "ts": 1791386000000, "vals": {"t": 21.5, "h": 40}}
+# Out: canonical/th-42  qos=1 retain=0  {"device":{"id":"th-42","vendor":"acme"},"measurements":{"temperature":21.5,"humidity":40},"time":"2026-10-07T15:13:20.000+00:00"}
+#
+# Tested by crates/mqttd/tests/rules_cookbook.rs; explained in docs/RULES-COOKBOOK.md.
+
+[rules.vendor_to_canonical]
+description = "Map vendor uplinks onto the canonical telemetry schema"
+sql = '''
+SELECT
+  payload.devId  AS device.id,
+  topic(2)       AS device.vendor,
+  payload.vals.t AS measurements.temperature,
+  payload.vals.h AS measurements.humidity,
+  unix_ts_to_rfc3339(payload.ts, 'millisecond') AS time
+FROM "vendor/+/uplink"
+WHERE is_str(payload.devId) AND regex_match(payload.devId, '^[A-Za-z0-9_-]{1,64}$')
+'''
+actions = [
+  { function = "republish", args = { topic = "canonical/${device.id}", qos = 1, payload = "${.}" } },
+]

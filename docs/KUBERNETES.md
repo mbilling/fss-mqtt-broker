@@ -59,6 +59,49 @@ admin ports only between the broker pods. Clients and health/metrics are admitte
 peers you list, or from anywhere when a list is empty. Egress is not restricted, and it
 needs an enforcing CNI. Details: [chart README](../deploy/helm/mqttd/README.md#networkpolicy).
 
+## Rules
+
+The rule engine ([RULES.md](RULES.md)) reads one TOML file, named by `MQTTD_RULES_FILE`.
+It is unreleased (no release has it yet), so the chart's default image does not have it
+yet: until a release does, set `image.repository` and `image.tag` to an image built from
+source ([RULES.md § Get a build](RULES.md#1-get-a-build-that-has-the-rule-engine)).
+
+Ship the file as a ConfigMap, and wire it in with the chart's extension values
+`extraVolumes`, `extraVolumeMounts` and `extraEnv`:
+
+```sh
+mqttd --check-rules rules.toml     # a file that does not load refuses a pod's boot
+kubectl -n mqttd create configmap mqttd-rules --from-file=rules.toml
+```
+
+```yaml
+# rules-values.yaml: add `-f rules-values.yaml` to helm install / helm upgrade
+extraVolumes:
+  - name: rules
+    configMap:
+      name: mqttd-rules
+extraVolumeMounts:
+  - name: rules
+    mountPath: /etc/mqttd/rules
+    readOnly: true
+extraEnv:
+  - name: MQTTD_RULES_FILE
+    value: /etc/mqttd/rules/rules.toml
+```
+
+Mount the ConfigMap as a directory, without `subPath`. The kubelet then updates the file in
+place when the ConfigMap changes, and the chart's `config_watch_secs = 30` reloads the
+rules on every pod without a restart; a `subPath` mount never sees the change. Running pods
+reject a file that does not load, keep their rules and log `security reload REJECTED`
+(holding back any ACL change in the same reload); a pod that starts with it does not boot.
+The chart's `check-config` init container does not read the rules file, so run
+`mqttd --check-rules` before you apply a change, and compare `mqttd_rules_info{checksum}`
+across pods afterwards ([OPERATIONS.md](OPERATIONS.md#rules-adr-0083)).
+
+The operator path cannot do this yet: the `MqttdCluster` CRD has no field that mounts a
+volume or sets an environment variable beside its fixed secrets, so a rules file needs the
+chart.
+
 ## Quick start
 
 ```sh

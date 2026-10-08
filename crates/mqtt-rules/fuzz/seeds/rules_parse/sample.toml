@@ -1,0 +1,7 @@
+[rules.alert]
+sql = '''SELECT payload.temp AS temp, clientid FROM "sensors/+/data" WHERE payload.temp > 30'''
+actions = [{ function = "republish", args = { topic = "alerts/${clientid}", qos = 1, payload = "${.}" } }]
+
+[rules.each]
+sql = '''FOREACH payload.s AS s DO s.id AS id INCASE s.id >= 1 FROM "t/#", "$events/client/connected"'''
+actions = [{ function = "console" }]

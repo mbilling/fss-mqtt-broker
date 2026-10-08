@@ -88,7 +88,8 @@ Security is asserted continuously, not audited once
 - **Fuzzing** (`cargo +nightly fuzz`, one harness per attacker-reachable
   parser): `packet_decode` (MQTT codec), `peer_decode` (peer frames),
   `swim_message` and `gossip_open` (gossip plane), `crl_parse` and `acl_parse`
-  (config/auth). Committed seed corpora live under each crate's `fuzz/seeds/`;
+  (config/auth), `rules_parse` and `rules_eval` (the rule engine's rules file, and
+  its evaluation over publisher-controlled payloads). Committed seed corpora live under each crate's `fuzz/seeds/`;
   the nightly CI tier runs every target and any finding becomes a regression.
 - **The acked-facts oracle** across in-process and out-of-process fault
   schedules, real crashes, partitions, disk-full, and rolling upgrades — a

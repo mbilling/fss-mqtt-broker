@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # The external-consumer blueprint, executed (docs/INTEGRATION.md, ADR 0063 / issue #251).
 #
-# docs/INTEGRATION.md is the rule-engine replacement story: a Kafka/webhook/DB
+# docs/INTEGRATION.md is the sink story (the rule engine, ADR 0083, has no sinks): a Kafka/webhook/DB
 # sink is an ordinary MQTT consumer group — `$share` + QoS 1 + a durable
 # persistent session — and the broker, not the sink, is the buffer. This script
 # runs the document's load-bearing claims against the real binary with stock

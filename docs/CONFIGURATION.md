@@ -6,7 +6,7 @@ Source of truth: `mqtt_config::ENV_VARS` and `Config::overlay_from` in `crates/m
 
 The annotated template is [`mqttd.example.toml`](mqttd.example.toml). Capacity arithmetic lives in [SIZING.md](SIZING.md); day-2 procedures in [OPERATIONS.md](OPERATIONS.md). This page is the inventory of knobs, not the runbook.
 
-Documented overlay variables: **112** in `ENV_VARS`, plus `MQTTD_CONFIG` (meta) and any experimental side-channel knobs below.
+Documented overlay variables: **113** in `ENV_VARS`, plus `MQTTD_CONFIG` (meta) and any experimental side-channel knobs below.
 
 ## Node identity
 
@@ -179,6 +179,12 @@ Documented overlay variables: **112** in `ENV_VARS`, plus `MQTTD_CONFIG` (meta) 
 | `MQTTD_ADMIN_VIEWERS` | `admin.viewers` | Certificate subjects granted the read-only `viewer` role (`MQTTD_ADMIN_VIEWERS`, `;`-separated). An entry is either the full subject (`CN=ops,O=example`) or `CN=<name>`, which matches any subject with that Common Name. Hot-reloadable. |
 | `MQTTD_ADMIN_OPERATORS` | `admin.operators` | Certificate subjects granted the `operator` role, which may also call the actions (`MQTTD_ADMIN_OPERATORS`, `;`-separated, same syntax as `Admin::viewers`). Hot-reloadable. |
 | `MQTTD_ADMIN_PEER_PORT` | `admin.peer_port` | The port other nodes' admin listeners use (`MQTTD_ADMIN_PEER_PORT`), for the cluster view (ADR 0081 §2): a node reaches a peer at the host of that peer's cluster-bus address and this port. Unset = the port of `Admin::bind`, the usual case when every node runs the same config. |
+
+## Rule engine
+
+| Variable | TOML key | Purpose |
+|---|---|---|
+| `MQTTD_RULES_FILE` | `rules.file` | The rules file (`MQTTD_RULES_FILE`), a TOML file of `[rules.<id>]` tables. Unset = no rules. Hot-reloadable: `SIGHUP` (or the config watch) re-reads it, validating before the swap — a file that does not load keeps the running rules. |
 
 ## Meta (not a config field)
 

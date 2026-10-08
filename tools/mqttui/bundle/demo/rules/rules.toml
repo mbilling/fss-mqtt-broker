@@ -1,0 +1,1624 @@
+# The rule-engine demo's rules: power plants, homes and cars
+#
+# demo/rules/README.md explains the demo; demo/rules/run.sh runs it. mqttd loads one rules
+# file, so the three domains share this one, a section each, every section opening with
+# what its devices publish and what its rules derive. Rule names start with power_, home_
+# or car_, and every rule publishes under one of six roots, then the domain:
+#
+#   alerts/<domain>/...       actionable exceptions, QoS 1
+#   kpi/<domain>/...          computed metrics, QoS 0
+#   normalized/<domain>/...   decoded, unit-normalized canonical records, QoS 0
+#   analytics/<domain>/...    privacy-safe feeds for third parties, QoS 0
+#   state/<domain>/...        last-known state, retained, QoS 1
+#   events/<domain>/...       presence and lifecycle events, QoS 1
+#
+# Every time in a derived message comes from the device's own clock, formatted with an
+# explicit offset, so the same input derives the same output on every run and every host:
+# crates/mqttd/tests/rules_demo.rs replays the demo's seeded ten minutes through mqttd and
+# compares every derived message with crates/mqttd/tests/rules_demo.expected.
+#
+# Check it:  mqttd --check-rules demo/rules/rules.toml
+# Run it:    demo/rules/run.sh
+
+#===========================================================================================
+# Power plants
+#===========================================================================================
+
+# Power plants: what the rule engine derives from a Danish generation portfolio
+#
+# demo/rules/sim/power.py simulates four sites in DK2 (the Nordic synchronous area), each
+# publishing the way its real equipment does:
+#
+#   plant/wf-falster/wtg01..06/tele    wind turbines, IEC 61400-25 flavoured JSON, every 10 s
+#   plant/wf-falster/ppc/stats         the wind farm's park controller, a 1-minute batch
+#   plant/wf-falster/poc/grid          a PMU (phasor measurement unit) at the 50 kV connection, every 2 s
+#   plant/pv-lolland/inv01..04/sunspec solar inverters, SunSpec model 103 registers, every 30 s
+#   plant/pk-koge/g1/rtu               a gas-turbine peaker's legacy RTU, a CSV line every 15 s
+#
+# About 790 raw messages in 10 minutes. These seven rules turn them into what each
+# audience needs: canonical records (normalized/), computed KPIs (kpi/), the current state
+# of every unit for a screen that opens late (state/, retained) and a few actionable alerts
+# (alerts/, QoS 1) for exactly the things that went wrong.
+#
+# Every time in a derived message comes from the device's own timestamp, formatted with
+# format_date and an explicit offset. Not the broker's clock (timestamp, now_*), and not
+# unix_ts_to_rfc3339, which renders in the broker host's local time zone: the same input
+# gives the same output on every run and every host.
+#
+
+
+# --- 1. SunSpec registers to engineering units --------------------------------------------
+#
+# Takes: plant/<site>/<inverter>/sunspec, every 30 s: SunSpec model 103 points as raw
+#   register integers, each with its scale factor (value = register x 10^SF).
+# Derives: normalized/power/<site>/<inverter>: kW, kvar, V, A, Hz, kWh and degC as plain
+#   numbers, the operating state by name, and the DC-to-AC conversion efficiency.
+# Why: "W": 5514 means nothing to a dashboard, a historian or an asset manager until it is
+#   multiplied by 10^W_SF (here 10^2 W: 551.4 kW), and every vendor picks its own scale
+#   factors.
+#   Scaling once, at the broker, gives every consumer one canonical record, and the
+#   efficiency is the inverter's health figure (a central inverter runs at 97-98.5 %).
+# The efficiency is null below 10 % load, a DC input under 220 kW for these 2,200 kVA
+#   inverters: there the fixed tare losses dominate, and a healthy inverter reads 96 % at
+#   10 % load and 74 % at 1 %, so a low figure would mean "little sun", not "sick
+#   inverter". (For a fleet of mixed sizes, take the rating from SunSpec model 120, WRtg.)
+# SunSpec Alliance, Information Model 103. A point the inverter does not implement, or
+#   cannot read now, holds its type's "not implemented" value: 0x8000 (-32768) for an int16
+#   point (W, VAr, PF, DCW, the temperatures) and for every scale factor, 0xFFFF (65535) for
+#   a uint16 point (A, the line voltages, Hz, DCA, DCV) and 0 for the acc32 energy counter.
+#   Scaled as a reading, one would publish -3276.8 degC or 655.35 Hz. So each value is null
+#   when its register or its scale factor holds that value, is missing, or is not an
+#   integer (a gateway built on a SunSpec library may send null for such a point), and the
+#   efficiency is null unless both powers are known. TmpTrns and TmpOt, which these
+#   inverters do not implement, are not read. One decimal is round(x * 10) / 10: round()
+#   takes one argument.
+#
+# In:  plant/pv-lolland/inv02/sunspec  qos=0  {"ts":1774367711500,"model":103,"A":4935,"A_SF":-1,"PPVphAB":6452,"PPVphBC":6452,"PPVphCA":6451,"V_SF":-1,"W":5514,"W_SF":2,"Hz":4999,"Hz_SF":-2,"VA":5514,"VA_SF":2,"VAr":0,"VAr_SF":2,"PF":10000,"PF_SF":-2,"WH":17787843,"WH_SF":3,"DCA":5002,"DCA_SF":-1,"DCV":11268,"DCV_SF":-1,"DCW":5636,"DCW_SF":2,"TmpCab":210,"TmpSnk":285,"TmpTrns":-32768,"TmpOt":-32768,"Tmp_SF":-1,"St":4,"StVnd":4001,"Evt1":0,"Evt2":0,"EvtVnd1":0}
+# Out: normalized/power/pv-lolland/inv02  qos=0  {"site":"pv-lolland","inverter":"inv02","at":"2026-03-24T15:55:11Z","state":"MPPT","ac_kw":551.4,"ac_kvar":0.0,"pf":1.0,"ac_v":645.2,"ac_a":493.5,"ac_hz":49.99,"dc_v":1126.8,"dc_a":500.2,"dc_kw":563.6,"efficiency_pct":97.8,"energy_kwh":17787843,"cabinet_c":21.0,"heatsink_c":28.5}
+# The same record from an inverter without a cabinet sensor ("TmpCab":-32768) gives
+#   "cabinet_c":null, and one whose gateway sent "Hz":65535 gives "ac_hz":null.
+
+[rules.power_pv_sunspec]
+description = "SunSpec model 103 registers, scaled to kW, V, A, Hz, kWh and degC"
+sql = '''
+SELECT
+  topic(2) AS site,
+  topic(3) AS inverter,
+  format_date('millisecond', 'Z', '%Y-%m-%dT%H:%M:%SZ', payload.ts) AS at,
+  CASE payload.St
+    WHEN 1 THEN 'OFF' WHEN 2 THEN 'SLEEPING' WHEN 3 THEN 'STARTING' WHEN 4 THEN 'MPPT'
+    WHEN 5 THEN 'THROTTLED' WHEN 6 THEN 'SHUTTING_DOWN' WHEN 7 THEN 'FAULT' WHEN 8 THEN 'STANDBY'
+    ELSE 'UNKNOWN' END                                               AS state,
+  -- int16 points and scale factors: -32768 is "not implemented"
+  CASE WHEN is_int(payload.W) AND payload.W <> -32768
+        AND is_int(payload.W_SF) AND payload.W_SF <> -32768
+       THEN round(payload.W * power(10, payload.W_SF) / 100) / 10
+       ELSE json_decode('null') END                                  AS ac_kw,
+  CASE WHEN is_int(payload.VAr) AND payload.VAr <> -32768
+        AND is_int(payload.VAr_SF) AND payload.VAr_SF <> -32768
+       THEN round(payload.VAr * power(10, payload.VAr_SF) / 100) / 10
+       ELSE json_decode('null') END                                  AS ac_kvar,
+  CASE WHEN is_int(payload.PF) AND payload.PF <> -32768
+        AND is_int(payload.PF_SF) AND payload.PF_SF <> -32768
+       THEN round(payload.PF * power(10, payload.PF_SF) * 100) / 10000
+       ELSE json_decode('null') END                                  AS pf,
+  -- uint16 points: 65535 is "not implemented"
+  CASE WHEN is_int(payload.PPVphAB) AND payload.PPVphAB <> 65535
+        AND is_int(payload.PPVphBC) AND payload.PPVphBC <> 65535
+        AND is_int(payload.PPVphCA) AND payload.PPVphCA <> 65535
+        AND is_int(payload.V_SF) AND payload.V_SF <> -32768
+       THEN round((payload.PPVphAB + payload.PPVphBC + payload.PPVphCA) / 3
+                  * power(10, payload.V_SF) * 10) / 10
+       ELSE json_decode('null') END                                  AS ac_v,
+  CASE WHEN is_int(payload.A) AND payload.A <> 65535
+        AND is_int(payload.A_SF) AND payload.A_SF <> -32768
+       THEN round(payload.A * power(10, payload.A_SF) * 10) / 10
+       ELSE json_decode('null') END                                  AS ac_a,
+  CASE WHEN is_int(payload.Hz) AND payload.Hz <> 65535
+        AND is_int(payload.Hz_SF) AND payload.Hz_SF <> -32768
+       THEN round(payload.Hz * power(10, payload.Hz_SF) * 100) / 100
+       ELSE json_decode('null') END                                  AS ac_hz,
+  CASE WHEN is_int(payload.DCV) AND payload.DCV <> 65535
+        AND is_int(payload.DCV_SF) AND payload.DCV_SF <> -32768
+       THEN round(payload.DCV * power(10, payload.DCV_SF) * 10) / 10
+       ELSE json_decode('null') END                                  AS dc_v,
+  CASE WHEN is_int(payload.DCA) AND payload.DCA <> 65535
+        AND is_int(payload.DCA_SF) AND payload.DCA_SF <> -32768
+       THEN round(payload.DCA * power(10, payload.DCA_SF) * 10) / 10
+       ELSE json_decode('null') END                                  AS dc_a,
+  CASE WHEN is_int(payload.DCW) AND payload.DCW <> -32768
+        AND is_int(payload.DCW_SF) AND payload.DCW_SF <> -32768
+       THEN round(payload.DCW * power(10, payload.DCW_SF) / 100) / 10
+       ELSE json_decode('null') END                                  AS dc_kw,
+  CASE WHEN is_num(ac_kw) AND is_num(dc_kw) AND dc_kw >= 220   -- 10 % of 2,200 kVA
+       THEN round(payload.W * power(10, payload.W_SF)
+                  / (payload.DCW * power(10, payload.DCW_SF)) * 1000) / 10
+       ELSE json_decode('null') END                                  AS efficiency_pct,
+  -- acc32: 0 is "not accumulated"
+  CASE WHEN is_int(payload.WH) AND payload.WH > 0
+        AND is_int(payload.WH_SF) AND payload.WH_SF <> -32768
+       THEN round(payload.WH * power(10, payload.WH_SF) / 1000)
+       ELSE json_decode('null') END                                  AS energy_kwh,
+  CASE WHEN is_int(payload.TmpCab) AND payload.TmpCab <> -32768
+        AND is_int(payload.Tmp_SF) AND payload.Tmp_SF <> -32768
+       THEN round(payload.TmpCab * power(10, payload.Tmp_SF) * 10) / 10
+       ELSE json_decode('null') END                                  AS cabinet_c,
+  CASE WHEN is_int(payload.TmpSnk) AND payload.TmpSnk <> -32768
+        AND is_int(payload.Tmp_SF) AND payload.Tmp_SF <> -32768
+       THEN round(payload.TmpSnk * power(10, payload.Tmp_SF) * 10) / 10
+       ELSE json_decode('null') END                                  AS heatsink_c
+FROM "plant/+/+/sunspec"
+'''
+actions = [
+  { function = "republish", args = { topic = "normalized/power/${site}/${inverter}", qos = 0, payload = "${.}" } },
+]
+
+
+# --- 2. An inverter fault, with its cause decoded -----------------------------------------
+#
+# Takes: the same SunSpec records.
+# Derives: alerts/power/<site>/<inverter>/fault, QoS 1, only while St is 7 (FAULT): the
+#   Evt1 event bits by name, the vendor's event code, and the DC voltage the inverter still
+#   sees on its array.
+# Why: "St 7, Evt1 1" is a register dump; "inv03 FAULT: GROUND_FAULT, array at 1359 V" tells
+#   the operator who to send. A GROUND_FAULT is a leak to earth in the array's cabling,
+#   connectors or modules (IEC 62109-2 makes the inverter test the array's insulation
+#   resistance before it connects and monitor its residual current while it runs). It is
+#   often intermittent, worst on damp evenings, and needs a technician with an insulation
+#   tester: an inverter that passes its next insulation test and reconnects by itself, as
+#   INV03 does here, only hides it until the next time. An OVER_TEMP or a GRID_DISCONNECT
+#   needs someone else. Healthy inverters (St 4, MPPT) produce nothing here.
+# The 16 Evt1 bits are SunSpec model 103's. A bit test is bitand(Evt1, 2^n) > 0; the names of
+#   the bits that are set are joined into one string and split into a JSON list. The alert
+#   goes out whatever else the record lacks: a SELECT computes every field before its
+#   WHERE, so each field is total. Evt1, the vendor codes and the DC voltage are null when
+#   missing or "not implemented" (bitfield32 0xFFFFFFFF, enum16 0xFFFF, uint16 0xFFFF).
+#
+# In:  plant/pv-lolland/inv03/sunspec  qos=0  {"ts":1774367809000,"model":103,"A":0,"A_SF":-1,"PPVphAB":6449,"PPVphBC":6456,"PPVphCA":6446,"V_SF":-1,"W":0,"W_SF":2,"Hz":5000,"Hz_SF":-2,"VA":0,"VA_SF":2,"VAr":0,"VAr_SF":2,"PF":-32768,"PF_SF":-2,"WH":17559358,"WH_SF":3,"DCA":0,"DCA_SF":-1,"DCV":13589,"DCV_SF":-1,"DCW":0,"DCW_SF":2,"TmpCab":216,"TmpSnk":279,"TmpTrns":-32768,"TmpOt":-32768,"Tmp_SF":-1,"St":7,"StVnd":7104,"Evt1":1,"Evt2":0,"EvtVnd1":4096}
+# Out: alerts/power/pv-lolland/inv03/fault  qos=1  {"site":"pv-lolland","inverter":"inv03","at":"2026-03-24T15:56:49Z","state":"FAULT","events":["GROUND_FAULT"],"evt1":1,"vendor_event":4096,"vendor_state":7104,"dc_v":1358.9}
+
+[rules.power_pv_fault]
+description = "Inverter in FAULT: the SunSpec event bits decoded"
+sql = '''
+SELECT
+  topic(2) AS site,
+  topic(3) AS inverter,
+  format_date('millisecond', 'Z', '%Y-%m-%dT%H:%M:%SZ', payload.ts) AS at,
+  'FAULT' AS state,
+  CASE WHEN is_int(payload.Evt1) AND payload.Evt1 <> 4294967295 THEN split(trim(
+      CASE WHEN bitand(payload.Evt1, 1)     > 0 THEN 'GROUND_FAULT '      ELSE '' END
+    + CASE WHEN bitand(payload.Evt1, 2)     > 0 THEN 'DC_OVER_VOLT '      ELSE '' END
+    + CASE WHEN bitand(payload.Evt1, 4)     > 0 THEN 'AC_DISCONNECT '     ELSE '' END
+    + CASE WHEN bitand(payload.Evt1, 8)     > 0 THEN 'DC_DISCONNECT '     ELSE '' END
+    + CASE WHEN bitand(payload.Evt1, 16)    > 0 THEN 'GRID_DISCONNECT '   ELSE '' END
+    + CASE WHEN bitand(payload.Evt1, 32)    > 0 THEN 'CABINET_OPEN '      ELSE '' END
+    + CASE WHEN bitand(payload.Evt1, 64)    > 0 THEN 'MANUAL_SHUTDOWN '   ELSE '' END
+    + CASE WHEN bitand(payload.Evt1, 128)   > 0 THEN 'OVER_TEMP '         ELSE '' END
+    + CASE WHEN bitand(payload.Evt1, 256)   > 0 THEN 'OVER_FREQUENCY '    ELSE '' END
+    + CASE WHEN bitand(payload.Evt1, 512)   > 0 THEN 'UNDER_FREQUENCY '   ELSE '' END
+    + CASE WHEN bitand(payload.Evt1, 1024)  > 0 THEN 'AC_OVER_VOLT '      ELSE '' END
+    + CASE WHEN bitand(payload.Evt1, 2048)  > 0 THEN 'AC_UNDER_VOLT '     ELSE '' END
+    + CASE WHEN bitand(payload.Evt1, 4096)  > 0 THEN 'BLOWN_STRING_FUSE ' ELSE '' END
+    + CASE WHEN bitand(payload.Evt1, 8192)  > 0 THEN 'UNDER_TEMP '        ELSE '' END
+    + CASE WHEN bitand(payload.Evt1, 16384) > 0 THEN 'MEMORY_LOSS '       ELSE '' END
+    + CASE WHEN bitand(payload.Evt1, 32768) > 0 THEN 'HW_TEST_FAILURE '   ELSE '' END
+  ), ' ') ELSE json_decode('null') END                       AS events,
+  CASE WHEN is_int(payload.Evt1) AND payload.Evt1 <> 4294967295
+       THEN payload.Evt1 ELSE json_decode('null') END        AS evt1,
+  CASE WHEN is_int(payload.EvtVnd1) AND payload.EvtVnd1 <> 4294967295
+       THEN payload.EvtVnd1 ELSE json_decode('null') END     AS vendor_event,
+  CASE WHEN is_int(payload.StVnd) AND payload.StVnd <> 65535
+       THEN payload.StVnd ELSE json_decode('null') END       AS vendor_state,
+  CASE WHEN is_int(payload.DCV) AND payload.DCV <> 65535
+        AND is_int(payload.DCV_SF) AND payload.DCV_SF <> -32768
+       THEN round(payload.DCV * power(10, payload.DCV_SF) * 10) / 10
+       ELSE json_decode('null') END                          AS dc_v
+FROM "plant/+/+/sunspec"
+WHERE payload.St = 7
+'''
+actions = [
+  { function = "republish", args = { topic = "alerts/power/${site}/${inverter}/fault", qos = 1, payload = "${.}" } },
+]
+
+
+# --- 3. Turbine condition alerts, from the park controller's minute means ----------------
+#
+# Takes: plant/wf-falster/ppc/stats, every 60 s: one batch with each turbine's 1-minute means.
+# Derives: alerts/power/wf-falster/<turbine>/condition, QoS 1: one alert per turbine whose
+#   gearbox vibration or gearbox oil temperature is out of its normal range, with the
+#   vibration zone, a severity and what to do. FOREACH ... INCASE fans the batch out and
+#   keeps only those turbines; a healthy farm produces nothing.
+# Why: 10 batches with 60 turbine-minutes in 10 minutes come down to a few alerts for the
+#   turbines that need a technician, each saying how urgent it is. Judging 1-minute means, not 10-s
+#   samples, keeps a gust or a single spike from paging anyone. The alert repeats every
+#   minute while the condition lasts, which is how the escalation from warning to critical
+#   shows.
+# Vibration: ISO 10816-21 (after VDI 3834-1) evaluation zones for a wind turbine gearbox,
+#   velocity RMS 10-1000 Hz: up to 3.5 mm/s zones A/B (unrestricted operation), 3.5-5.6
+#   zone C (restricted operation: plan an inspection), above 5.6 zone D (damage likely).
+# Gearbox oil: the sump normally runs at 50-65 degC; warning from 75, critical from 80 degC
+#   (common OEM alarm settings; this turbine's own protection derates it at 82).
+# Each channel is judged on its own: a turbine whose oil sensor reports nothing (a null or a
+#   missing TmpGbxOil, as a park controller sends for a failed PT100) still gets its
+#   vibration alert, with "gearbox_oil": "not reported", and the other way round. Every
+#   comparison is guarded with is_num: in this engine null > 5.6 is true (Erlang term
+#   order), so a null vibration would otherwise read as zone D.
+#
+# In:  plant/wf-falster/ppc/stats  qos=1  {"ts":1774368060000,"site":"wf-falster","period_s":60,"P_kW":12532.6,"Q_kvar":-149.3,"WdSpd":8.98,"running":6,"turbines":[{"id":"wtg01","TurSt":3,"WdSpd":9.07,"W":2265.8,"RotSpd":11.85,"TmpGbxOil":59.8,"TmpStat":75.9,"VibGbx":1.64},{"id":"wtg02",...},{"id":"wtg03","TurSt":3,"WdSpd":8.93,"W":2143.6,"RotSpd":11.67,"TmpGbxOil":76.5,"TmpStat":69.9,"VibGbx":1.7},{"id":"wtg04",...},{"id":"wtg05",...},{"id":"wtg06","TurSt":3,"WdSpd":8.98,"W":2132.4,"RotSpd":11.47,"TmpGbxOil":57.8,"TmpStat":74.2,"VibGbx":5.81}]}
+# Out: alerts/power/wf-falster/wtg03/condition  qos=1  {"site":"wf-falster","turbine":"wtg03","period_end":"2026-03-24T16:01:00Z","severity":"warning","gearbox_oil_c":76.5,"gearbox_oil":"warning","vibration_mm_s":1.7,"vibration_zone":"A/B","action":"check the oil cooler, its fan and the filter today"}
+# Out: alerts/power/wf-falster/wtg06/condition  qos=1  {"site":"wf-falster","turbine":"wtg06","period_end":"2026-03-24T16:01:00Z","severity":"critical","gearbox_oil_c":57.8,"gearbox_oil":"normal","vibration_mm_s":5.81,"vibration_zone":"D","action":"damage likely: stop the turbine and inspect the drivetrain before restarting"}
+# (and nothing for the four healthy turbines)
+
+[rules.power_wtg_condition]
+description = "Gearbox vibration (ISO 10816-21 zones) and oil temperature alerts per turbine"
+sql = '''
+FOREACH payload.turbines AS t
+DO
+  topic(2)                                                       AS site,
+  t.id                                                           AS turbine,
+  format_date('millisecond', 'Z', '%Y-%m-%dT%H:%M:%SZ', payload.ts) AS period_end,
+  CASE WHEN (is_num(t.VibGbx) AND t.VibGbx > 5.6)
+         OR (is_num(t.TmpGbxOil) AND t.TmpGbxOil >= 80) THEN 'critical'
+       ELSE 'warning' END                                        AS severity,
+  CASE WHEN is_num(t.TmpGbxOil) THEN t.TmpGbxOil
+       ELSE json_decode('null') END                              AS gearbox_oil_c,
+  CASE WHEN NOT is_num(t.TmpGbxOil) THEN 'not reported'
+       WHEN t.TmpGbxOil >= 80 THEN 'critical'
+       WHEN t.TmpGbxOil >= 75 THEN 'warning'
+       ELSE 'normal' END                                         AS gearbox_oil,
+  CASE WHEN is_num(t.VibGbx) THEN t.VibGbx
+       ELSE json_decode('null') END                              AS vibration_mm_s,
+  CASE WHEN NOT is_num(t.VibGbx) THEN 'not reported'
+       WHEN t.VibGbx > 5.6 THEN 'D'
+       WHEN t.VibGbx > 3.5 THEN 'C'
+       ELSE 'A/B' END                                            AS vibration_zone,
+  CASE WHEN vibration_zone = 'D'
+         THEN 'damage likely: stop the turbine and inspect the drivetrain before restarting'
+       WHEN gearbox_oil = 'critical'
+         THEN 'limit power and repair the oil cooler before the oil reaches its trip level'
+       WHEN vibration_zone = 'C'
+         THEN 'restricted operation: plan a drivetrain inspection'
+       ELSE 'check the oil cooler, its fan and the filter today' END AS action
+INCASE is_str(t.id) AND regex_match(t.id, '^[A-Za-z0-9_-]{1,32}$')
+   AND ((is_num(t.VibGbx) AND t.VibGbx > 3.5)
+     OR (is_num(t.TmpGbxOil) AND t.TmpGbxOil >= 75))
+FROM "plant/wf-falster/ppc/stats"
+'''
+actions = [
+  { function = "republish", args = { topic = "alerts/power/${site}/${turbine}/condition", qos = 1, payload = "${.}" } },
+]
+
+
+# --- 4. Turbine performance against its power curve: one KPI record per turbine-minute -----
+#
+# Takes: the park controller's 1-minute batch.
+# Derives: kpi/power/wf-falster/<turbine>/performance, for every turbine every minute: the
+#   power the turbine type's power curve promises at the wind the turbine measured, the
+#   performance ratio (actual / expected), the energy lost in that minute and a status.
+#   FOREACH turns one batch into six records a time-series database can store as they are.
+# Why: a turbine that quietly produces 30 % less than its curve says nothing in its own
+#   status. WTG05 here still reports "producing" with its blades pitched 4 degrees off their
+#   optimum; only the comparison with the curve finds it, and lost kWh tell the asset
+#   manager what it costs. The same record says why the others lose energy (derated, fault).
+# The curve is the 3.6 MW / 120 m turbine's at air density 1.225 kg/m3 (the IEC 61400-12-1
+#   reference), at 1 m/s points with straight lines between. Healthy turbines read
+#   0.95-1.08 against it (cold March air is about 3 % denser), so "underperforming" is a
+#   producing turbine below 85 % of the curve at 5 m/s or more, where the curve is steep
+#   enough to tell a fault from scatter. Lost energy is the curve's power minus what the
+#   turbine delivered, for any status but "ok"; the 9 kW a stopped turbine draws for its
+#   auxiliaries is consumption, not lost production, and below cut-in or above cut-out
+#   (25 m/s, "storm stop") the curve promises nothing.
+#
+# In:  plant/wf-falster/ppc/stats  qos=1  (the batch above; WTG05's row:)  {"id":"wtg05","TurSt":3,"WdSpd":8.69,"W":1472.5,"RotSpd":11.36,"TmpGbxOil":56.2,"TmpStat":72.5,"VibGbx":1.4}
+# Out: kpi/power/wf-falster/wtg01/performance  qos=0  {"site":"wf-falster","turbine":"wtg01","period_end":"2026-03-24T16:01:00Z","wind_ms":9.07,"power_kw":2265.8,"expected_kw":2165,"performance_ratio":1.05,"status":"ok","lost_kwh":0.0}
+# Out: ... one per turbine ...
+# Out: kpi/power/wf-falster/wtg05/performance  qos=0  {"site":"wf-falster","turbine":"wtg05","period_end":"2026-03-24T16:01:00Z","wind_ms":8.69,"power_kw":1472.5,"expected_kw":1934,"performance_ratio":0.76,"status":"underperforming","lost_kwh":7.7}
+# Later: kpi/power/wf-falster/wtg06/performance  qos=0  {"site":"wf-falster","turbine":"wtg06","period_end":"2026-03-24T16:03:00Z","wind_ms":8.94,"power_kw":-8.9,"expected_kw":2084,"performance_ratio":0.0,"status":"fault","lost_kwh":34.7}
+# Later: kpi/power/wf-falster/wtg03/performance  qos=0  {"site":"wf-falster","turbine":"wtg03","period_end":"2026-03-24T16:04:00Z","wind_ms":8.61,"power_kw":1430.0,"expected_kw":1886,"performance_ratio":0.76,"status":"derated","lost_kwh":7.6}
+
+[rules.power_wtg_performance]
+description = "Expected power from the power curve, performance ratio and lost energy per turbine-minute"
+sql = '''
+FOREACH payload.turbines AS t
+DO
+  topic(2)                                                       AS site,
+  t.id                                                           AS turbine,
+  format_date('millisecond', 'Z', '%Y-%m-%dT%H:%M:%SZ', payload.ts) AS period_end,
+  t.WdSpd                                                        AS wind_ms,
+  t.W                                                            AS power_kw,
+  round(CASE
+    WHEN t.WdSpd < 3 OR t.WdSpd >= 25 THEN 0
+    WHEN t.WdSpd < 4  THEN   25 + (t.WdSpd - 3)  * 140
+    WHEN t.WdSpd < 5  THEN  165 + (t.WdSpd - 4)  * 195
+    WHEN t.WdSpd < 6  THEN  360 + (t.WdSpd - 5)  * 280
+    WHEN t.WdSpd < 7  THEN  640 + (t.WdSpd - 6)  * 380
+    WHEN t.WdSpd < 8  THEN 1020 + (t.WdSpd - 7)  * 500
+    WHEN t.WdSpd < 9  THEN 1520 + (t.WdSpd - 8)  * 600
+    WHEN t.WdSpd < 10 THEN 2120 + (t.WdSpd - 9)  * 640
+    WHEN t.WdSpd < 11 THEN 2760 + (t.WdSpd - 10) * 500
+    WHEN t.WdSpd < 12 THEN 3260 + (t.WdSpd - 11) * 270
+    WHEN t.WdSpd < 13 THEN 3530 + (t.WdSpd - 12) * 70
+    ELSE 3600 END)                                               AS expected_kw,
+  CASE WHEN expected_kw > 0 THEN round(t.W / expected_kw * 100) / 100
+       ELSE json_decode('null') END                              AS performance_ratio,
+  CASE t.TurSt
+    WHEN 3 THEN CASE WHEN expected_kw >= 360 AND t.W < 0.85 * expected_kw
+                     THEN 'underperforming' ELSE 'ok' END
+    WHEN 4 THEN 'derated'
+    WHEN 6 THEN 'fault'
+    WHEN 1 THEN CASE WHEN t.WdSpd < 3 THEN 'waiting for wind'
+                     WHEN t.WdSpd >= 25 THEN 'storm stop'
+                     ELSE 'ready' END
+    ELSE 'not producing' END                                     AS status,
+  -- what the curve promised and the turbine did not deliver: a stopped turbine's own
+  -- consumption (negative W) is not lost production, and no wind loses nothing
+  CASE WHEN status <> 'ok' AND expected_kw > 0 AND expected_kw > t.W
+       THEN round((expected_kw - CASE WHEN t.W > 0 THEN t.W ELSE 0 END) / 6) / 10
+       ELSE 0.0 END                                              AS lost_kwh   -- kW x 1/60 h
+INCASE is_str(t.id) AND regex_match(t.id, '^[A-Za-z0-9_-]{1,32}$')
+   AND is_num(t.WdSpd) AND is_num(t.W) AND is_int(t.TurSt)
+FROM "plant/wf-falster/ppc/stats"
+'''
+actions = [
+  { function = "republish", args = { topic = "kpi/power/${site}/${turbine}/performance", qos = 0, payload = "${.}" } },
+]
+
+
+# --- 5. System frequency outside the normal band, classified -------------------------------
+#
+# Takes: plant/<site>/poc/grid, every 2 s: the PMU (phasor measurement unit, IEC/IEEE
+#   60255-118-1) at the point of connection: frequency, its rate of change (ROCOF) and the
+#   voltages.
+# Derives: alerts/power/grid/frequency, QoS 1, while the frequency is outside 49.9-50.1 Hz:
+#   the reserve band it is in, how far FCR-D should be activated, the deviation in mHz, the
+#   rate of change and the voltage. Every reading while the frequency is still moving away
+#   from 50 Hz faster than 0.02 Hz/s (the onset of a disturbance, down to its nadir; normal
+#   operation moves a few mHz/s) or is critical; otherwise one alert every 10 s, the reading
+#   whose device time is in the first 2 s of a 10-s window (stateless, and exactly one of
+#   the PMU's 2-s readings).
+# Why: 300 readings close to 50 Hz in 10 minutes carry nothing new. When a large generator
+#   trip pulls the system down, a control room, an FCR-D provider proving its response, or
+#   a peaker's dispatcher needs to know - already classified, so nobody has to remember the
+#   reserve bands - and to keep knowing while it lasts, which after a trip is minutes:
+#   FCR-N and FCR-D are proportional, so they hold the frequency at a quasi-steady
+#   deviation until aFRR restores it. Every 2-s reading of those minutes would be 60-90
+#   alerts; one per 10 s says the same. A disturbance alerts at once, at its first reading
+#   outside the band, because the frequency is then falling (or rising) fast. An excursion
+#   that drifts out slowly alerts within 10 s, and one that drifts out and back within 10 s
+#   may not alert at all, which is the point of the throttle. The nadir itself, where the
+#   rate of change is near zero, is alerted only when it lands on a 10-s slot, so the lowest
+#   alerted value can be a few mHz above the true minimum.
+# Bands, Nordic synchronous area (ENTSO-E SO GL Annex III; the Nordic TSOs' FCR technical
+#   requirements): 49.9-50.1 Hz is the standard frequency range, held by FCR-N. Below it,
+#   FCR-D upward activates linearly from 49.9 Hz to fully at 49.5 Hz; above it, FCR-D
+#   downward from 50.1 to 50.5 Hz. Outside 49.5-50.5 Hz the disturbance reserves are spent:
+#   critical.
+# A reading without a frequency or a timestamp is skipped, not a failure: the statement is a
+#   FOREACH over the one-element list [payload], only because a FOREACH runs its WHERE
+#   before it computes any field and a SELECT does not (rule 6 explains). ROCOF and the
+#   voltages are optional on many meters: null when missing.
+#
+# In:  plant/wf-falster/poc/grid  qos=0  {"ts":1774368105000,"Hz":49.886,"ROCOF":-0.053,"U_kV":{"L12":51.38,"L23":51.33,"L31":51.41},"P_MW":11.44,"Q_Mvar":-0.26}
+# Out: alerts/power/grid/frequency  qos=1  {"measured_at":"wf-falster/poc","at":"2026-03-24T16:01:45Z","hz":49.886,"deviation_mhz":-114,"rocof_hz_s":-0.053,"band":"FCR-D upward","fcr_d_activation_pct":3,"severity":"warning","u_kv":51.37}
+# (2 s after a generator trip: out of the band and falling fast. The next reading, 49.790 Hz
+#   at -0.043 Hz/s, alerts too.)
+# In:  plant/wf-falster/poc/grid  qos=0  {"ts":1774368111000,"Hz":49.749,"ROCOF":-0.001,"U_kV":{"L12":51.32,"L23":51.28,"L31":51.35},"P_MW":11.86,"Q_Mvar":-0.08}
+# Out: alerts/power/grid/frequency  qos=1  {"measured_at":"wf-falster/poc","at":"2026-03-24T16:01:51Z","hz":49.749,"deviation_mhz":-251,"rocof_hz_s":-0.001,"band":"FCR-D upward","fcr_d_activation_pct":38,"severity":"warning","u_kv":51.32}
+# (the nadir, on a 10-s slot.) Then one every 10 s while it stays below 49.9 Hz: 49.809 Hz at
+#   16:02:01, 49.845 at 16:02:11, ... 49.889 at 16:04:01: 15 alerts from 72 readings outside
+#   the band.
+
+[rules.power_grid_frequency]
+description = "Frequency outside 49.9-50.1 Hz, classified by Nordic reserve band: the onset, then one alert per 10 s"
+sql = '''
+FOREACH [payload]
+DO
+  topic(2) + '/' + topic(3)                                   AS measured_at,
+  format_date('millisecond', 'Z', '%Y-%m-%dT%H:%M:%SZ', payload.ts) AS at,
+  payload.Hz                                                  AS hz,
+  round((payload.Hz - 50) * 1000)                             AS deviation_mhz,
+  CASE WHEN is_num(payload.ROCOF) THEN payload.ROCOF
+       ELSE json_decode('null') END                           AS rocof_hz_s,
+  CASE WHEN payload.Hz < 49.5  THEN 'below FCR-D range'
+       WHEN payload.Hz < 49.9  THEN 'FCR-D upward'
+       WHEN payload.Hz <= 50.5 THEN 'FCR-D downward'
+       ELSE 'above FCR-D range' END                           AS band,
+  CASE WHEN payload.Hz <= 49.5 OR payload.Hz >= 50.5 THEN 100
+       WHEN payload.Hz < 50 THEN round((49.9 - payload.Hz) / 0.4 * 100)
+       ELSE round((payload.Hz - 50.1) / 0.4 * 100) END        AS fcr_d_activation_pct,
+  CASE WHEN payload.Hz < 49.5 OR payload.Hz > 50.5 THEN 'critical'
+       ELSE 'warning' END                                     AS severity,
+  CASE WHEN is_num(payload.U_kV.L12) AND is_num(payload.U_kV.L23) AND is_num(payload.U_kV.L31)
+       THEN round((payload.U_kV.L12 + payload.U_kV.L23 + payload.U_kV.L31) / 3 * 100) / 100
+       ELSE json_decode('null') END                           AS u_kv
+FROM "plant/+/poc/grid"
+WHERE is_num(payload.Hz) AND is_int(payload.ts)
+  AND (payload.Hz < 49.9 OR payload.Hz > 50.1)
+  AND (payload.Hz < 49.5 OR payload.Hz > 50.5 OR payload.ts mod 10000 < 2000
+       OR (is_num(payload.ROCOF)
+           AND ((payload.Hz < 50 AND payload.ROCOF <= -0.02)
+             OR (payload.Hz > 50 AND payload.ROCOF >= 0.02))))
+'''
+actions = [
+  { function = "republish", args = { topic = "alerts/power/grid/frequency", qos = 1, payload = "${.}" } },
+]
+
+
+# --- 6. A legacy RTU's CSV line: decoded, put in local time, kept as the unit's state -----
+#
+# Takes: plant/<site>/<unit>/rtu, every 15 s: "ts,unit,MW,MVAr,kV,Hz,breaker" - Unix
+#   seconds, empty fields while a transducer reads invalid, and the generator breaker as an
+#   IEC 60870-5 double point (0 intermediate, 1 open, 2 closed, 3 faulty).
+# Derives: normalized/power/<site>/<unit>: named, typed JSON (null for an empty field, the
+#   breaker by name, the power factor), with the time in UTC and in Danish local time and
+#   the grid tariff period; and the same record, retained, on state/power/<site>/<unit>.
+# Why: nobody downstream should need the RTU's field order or its double-point codes. The
+#   retained copy means a dispatcher's screen shows the unit's MW and breaker position the
+#   moment it opens, not 15 s later. The local time and the tariff period put the reading
+#   in the terms Danish planners use: the period of the DSOs' consumption tariff,
+#   Tarifmodel 3.0 (peak 17-21, low 00-06, high 06-17 and 21-24 local time), marks the
+#   hours when demand and prices peak, which is when a peaker like this one runs. Both
+#   are computed from the RTU's own clock, with EU summer time (from the last
+#   Sunday of March to the last Sunday of October, at 01:00 UTC; the last Sunday of a month
+#   is its 31st minus the 31st's weekday), so the rule is right all year.
+# A truncated or garbled line must not be half-decoded, and must not fail the rule. A
+#   SELECT computes every field before its WHERE, so nth() past the end of a short line
+#   would fail it. A FOREACH checks WHERE first, so the rule iterates over a one-element
+#   list (the split line) and its WHERE validates the whole line with a regular expression.
+#   trim() first drops the CR/LF a serial-to-MQTT gateway may forward with the line, and a
+#   number may come with or without decimals ("20" or "20.0"), so a valid line from a
+#   differently configured gateway is decoded instead of silently skipped.
+# Intermediate values (dst.*, tz, hour) stay out of the message: the record is built under
+#   out.* and published as ${out} (cookbook recipe 14).
+#
+# In:  plant/pk-koge/g1/rtu  qos=0  1774367702,G1,0.0,,0.00,,1
+# Out: normalized/power/pk-koge/g1  qos=0  {"at":"2026-03-24T15:55:02Z","local_time":"2026-03-24T16:55:02+01:00","load_period":"high","unit":"G1","p_mw":0.0,"q_mvar":null,"u_kv":0.0,"hz":null,"breaker":"open","pf":null}
+# Out: state/power/pk-koge/g1  qos=1 retain=1  (the same payload)
+# In:  plant/pk-koge/g1/rtu  qos=0  1774368002,G1,1.6,1.6,10.53,49.983,2
+# Out: normalized/power/pk-koge/g1  qos=0  {"at":"2026-03-24T16:00:02Z","local_time":"2026-03-24T17:00:02+01:00","load_period":"peak","unit":"G1","p_mw":1.6,"q_mvar":1.6,"u_kv":10.53,"hz":49.983,"breaker":"closed","pf":0.707}
+# Out: state/power/pk-koge/g1  qos=1 retain=1  (the same payload)
+# In:  plant/pk-koge/g1/rtu  qos=0  1774368137,G1,19.5,4.
+# Out: nothing: the line is incomplete
+
+[rules.power_rtu_csv]
+description = "RTU CSV to named JSON with local time and tariff period; retained unit state"
+sql = '''
+FOREACH [split(trim(payload), ',', 'notrim')] AS f
+DO
+  topic(2)                                                  AS site,
+  topic(3)                                                  AS asset,
+  int(nth(1, f))                                            AS ts,
+  -- Danish local time: CET, or CEST from the last Sunday of March to that of October
+  format_date('second', 'Z', '%Y', ts)                      AS dst.year,
+  date_to_unix_ts('second', 'Z', '%Y-%m-%d %H:%M:%S', dst.year + '-03-31 01:00:00') AS dst.mar31,
+  date_to_unix_ts('second', 'Z', '%Y-%m-%d %H:%M:%S', dst.year + '-10-31 01:00:00') AS dst.oct31,
+  dst.mar31 - int(format_date('second', 'Z', '%w', dst.mar31)) * 86400 AS dst.starts,
+  dst.oct31 - int(format_date('second', 'Z', '%w', dst.oct31)) * 86400 AS dst.ends,
+  CASE WHEN ts >= dst.starts AND ts < dst.ends THEN '+02:00' ELSE '+01:00' END AS tz,
+  int(format_date('second', tz, '%H', ts))                  AS hour,
+  format_date('second', 'Z', '%Y-%m-%dT%H:%M:%SZ', ts)      AS out.at,
+  format_date('second', tz, '%Y-%m-%dT%H:%M:%S%:z', ts)     AS out.local_time,
+  CASE WHEN hour >= 17 AND hour < 21 THEN 'peak'
+       WHEN hour < 6 THEN 'low'
+       ELSE 'high' END                                      AS out.load_period,
+  nth(2, f)                                                 AS out.unit,
+  CASE WHEN nth(3, f) = '' THEN json_decode('null') ELSE float(nth(3, f)) END AS out.p_mw,
+  CASE WHEN nth(4, f) = '' THEN json_decode('null') ELSE float(nth(4, f)) END AS out.q_mvar,
+  CASE WHEN nth(5, f) = '' THEN json_decode('null') ELSE float(nth(5, f)) END AS out.u_kv,
+  CASE WHEN nth(6, f) = '' THEN json_decode('null') ELSE float(nth(6, f)) END AS out.hz,
+  CASE nth(7, f) WHEN '1' THEN 'open' WHEN '2' THEN 'closed'
+                 WHEN '0' THEN 'intermediate' ELSE 'faulty' END            AS out.breaker,
+  CASE WHEN is_num(out.p_mw) AND is_num(out.q_mvar) AND out.p_mw > 0
+       THEN round(out.p_mw / sqrt(out.p_mw * out.p_mw + out.q_mvar * out.q_mvar) * 1000) / 1000
+       ELSE json_decode('null') END                         AS out.pf
+FROM "plant/+/+/rtu"
+WHERE regex_match(trim(payload),
+  '^[0-9]{9,11},[A-Za-z0-9_-]{1,16},(-?[0-9]+(\.[0-9]+)?)?,(-?[0-9]+(\.[0-9]+)?)?,([0-9]+(\.[0-9]+)?)?,([0-9]+(\.[0-9]+)?)?,[0-3]$')
+'''
+actions = [
+  { function = "republish", args = { topic = "normalized/power/${site}/${asset}", qos = 0, payload = "${out}" } },
+  { function = "republish", args = { topic = "state/power/${site}/${asset}", qos = 1, retain = true, payload = "${out}" } },
+]
+
+
+# --- 7. Turbine operating state, reported by exception ------------------------------------
+#
+# Takes: plant/wf-falster/<turbine>/tele, every 10 s per turbine.
+# Derives: state/power/wf-falster/<turbine>, retained, QoS 1: the operating state by name,
+#   since when and the alarm in words - only when the state changed since the turbine's
+#   previous sample, plus once every 10 minutes.
+# Why: a SCADA screen or a service technician's phone needs every turbine's current state
+#   the moment it opens, and the changes as they happen ("wtg06: fault since 16:01:11 UTC,
+#   drivetrain vibration high-high"); it does not need 360 copies of "producing". A rule
+#   has no memory, but every IEC 61850 / IEC 61400-25 status value carries the time of its
+#   last change (TurSt.t), so "changed within the last 10 s" is a test on one message.
+#   The 10-minute copy ("periodic", what IEC 61850 calls an integrity report) refreshes the
+#   retained state of turbines that never change and tells a late subscriber the state is
+#   still current; any 10-minute demo run crosses one. The record carries no power: a
+#   retained state is read long after it was written, and the 10-s mean in the sample that
+#   reports a change straddles the change (WTG06's reads 840 kW; it has drawn 9 kW ever
+#   since). Live power is on kpi/ every minute. An AlmCd the sample lacks reads
+#   "not reported".
+#
+# In:  plant/wf-falster/wtg05/tele  qos=0  {"ts":1774368006600,"WTUR":{"TurSt":{"stVal":3,"t":1774236794000},"AlmCd":0,"W":1360.9,"VAr":-16.8},"WROT":{"RotSpd":11.61,"PtchAng":4.5},"WNAC":{"WdSpd":8.18,"Dir":246.1,"ExTmp":6.4,"NacTmp":20.1},"WTRM":{"TmpGbxOil":56.3,"VibGbx":1.43},"WGEN":{"Spd":1381,"TmpStat":72.9},"WYAW":{"YwAng":246.1}}
+# Out: state/power/wf-falster/wtg05  qos=1 retain=1  {"site":"wf-falster","turbine":"wtg05","at":"2026-03-24T16:00:06Z","state":"producing","since":"2026-03-23T03:33:14Z","alarm":"none","report":"periodic"}
+# In:  plant/wf-falster/wtg06/tele  qos=0  {"ts":1774368078200,"WTUR":{"TurSt":{"stVal":6,"t":1774368071620},"AlmCd":3420,"W":840.6,"VAr":-11.3},"WROT":{"RotSpd":10.88,"PtchAng":13.1},"WNAC":{"WdSpd":8.48,"Dir":253.0,"ExTmp":6.4,"NacTmp":20.3},"WTRM":{"TmpGbxOil":57.8,"VibGbx":3.06},"WGEN":{"Spd":1295,"TmpStat":73.9},"WYAW":{"YwAng":246.6}}
+# Out: state/power/wf-falster/wtg06  qos=1 retain=1  {"site":"wf-falster","turbine":"wtg06","at":"2026-03-24T16:01:18Z","state":"fault","since":"2026-03-24T16:01:11Z","alarm":"drivetrain vibration high-high: stopped","report":"change"}
+# (the turbines' other 352 samples in these 10 minutes produce nothing)
+
+[rules.power_wtg_state]
+description = "Turbine state on change (IEC 61850 change time) and every 10 minutes, retained"
+sql = '''
+SELECT
+  topic(2)                                                  AS site,
+  topic(3)                                                  AS turbine,
+  format_date('millisecond', 'Z', '%Y-%m-%dT%H:%M:%SZ', payload.ts) AS at,
+  CASE payload.WTUR.TurSt.stVal
+    WHEN 1 THEN 'ready' WHEN 2 THEN 'starting' WHEN 3 THEN 'producing'
+    WHEN 4 THEN 'derated' WHEN 5 THEN 'stopped' WHEN 6 THEN 'fault'
+    WHEN 7 THEN 'maintenance' ELSE 'unknown' END            AS state,
+  format_date('millisecond', 'Z', '%Y-%m-%dT%H:%M:%SZ', payload.WTUR.TurSt.t) AS since,
+  CASE WHEN NOT is_int(payload.WTUR.AlmCd) THEN 'not reported'
+       WHEN payload.WTUR.AlmCd = 0    THEN 'none'
+       WHEN payload.WTUR.AlmCd = 2310 THEN 'gearbox oil temperature high: power limited'
+       WHEN payload.WTUR.AlmCd = 2311 THEN 'gearbox oil temperature high-high: stopped'
+       WHEN payload.WTUR.AlmCd = 3420 THEN 'drivetrain vibration high-high: stopped'
+       ELSE 'vendor alarm ' + str(payload.WTUR.AlmCd) END   AS alarm,
+  CASE WHEN payload.ts - payload.WTUR.TurSt.t < 10000
+       THEN 'change' ELSE 'periodic' END                    AS report
+FROM "plant/wf-falster/+/tele"
+WHERE report = 'change' OR payload.ts mod 600000 < 10000
+'''
+actions = [
+  { function = "republish", args = { topic = "state/power/${site}/${turbine}", qos = 1, retain = true, payload = "${.}" } },
+]
+
+
+#===========================================================================================
+# Homes
+#===========================================================================================
+
+# Homes: what rules make of a dozen Danish households' telemetry
+#
+# The devices, their formats and the faults injected are described in
+# demo/rules/sim/homes.py. Each home publishes on home/<home-id>/<device>: p1 (the smart
+# meter's raw DSMR 5.0 telegram, every 10 s), thermostat (60 s), heatpump (30 s), pv and
+# battery (60 s) and evcharger (OCPP 1.6 events). Seven rules turn that into something a
+# homeowner, an installer, the grid operator or a third party can use:
+#
+#   home_p1_decode         normalized/homes/<home>/meter      every telegram, decoded       QoS 0
+#   home_tariff_rate       kpi/homes/<home>/tariff            once a minute per meter       QoS 0
+#   home_grid_feed         analytics/homes/<pseudonym>/load   once a minute per meter       QoS 0
+#   home_voltage_en50160   alerts/homes/<home>/voltage        a phase out of band, 1/min    QoS 1
+#   home_heating_comfort   alerts/homes/<home>/heating        2 K under a setpoint held 3 h QoS 1
+#   home_heatpump_health   state/homes/<home>/heatpump        every reading, retained       QoS 1
+#                          alerts/homes/<home>/heatpump       a fault code or COP below 2   QoS 1
+#   home_ev_peak_start     alerts/homes/<home>/ev-charging    a session starts 17-21        QoS 1
+#
+# The 600 s fixture (python3 demo/rules/simulate.py --domains homes --seed 7
+# --start 2026-03-24T15:55:00Z --duration 600) sends 823 device messages and derives 771:
+# 480 normalized readings, 80 tariff KPIs, 80 pseudonymous load records, 120 retained
+# heat-pump states and 11 alerts, each from an injected fault (5 voltage, 2 heating, 2 heat
+# pump fault, 1 low COP, 1 EV) and none from the normal data around them.
+#
+# A condition that lasts (an undervoltage, a cold room, a broken heat pump) is re-alerted
+# at most once a minute or once per 5 minutes, by the device's own clock, not on every
+# reading: a rule keeps no state, so it cannot tell the first reading of a condition from
+# the hundredth, but it can thin the reminders. Where the device says when a condition
+# began (a heat pump's fault_since), the first reading alerts at once. The retained state
+# is the idempotent view: a dashboard reads the current health of every heat pump the
+# moment it subscribes.
+#
+# Every time in a derived message comes from the device's own clock, never the broker's,
+# so the same input always derives the same output. Times are rendered with format_date
+# and an explicit offset, not unix_ts_to_rfc3339, which uses the broker host's local
+# offset. format_date has no time-zone rules: the P1 rules read the meter's own summer-time
+# flag, and home_ev_peak_start works the EU summer-time rule out from the date.
+#
+# The grid-tariff figures are illustrative, of the order of a Danish DSO's C-customer
+# tariff under Tarifmodel 3.0 (DKK/kWh, excluding VAT, spot price and taxes): winter
+# (Oct-Mar) 0.15 low / 0.45 high / 1.35 peak, summer (Apr-Sep) 0.15 / 0.23 / 0.60.
+# Replace them with your DSO's published rates.
+#
+# P1 telegrams below are shortened to the lines a rule reads ("..." marks the rest); line
+# ends are CRLF.
+
+# ---------------------------------------------------------------------------------------
+# home_p1_decode: decode the smart meter's P1 telegram into numbers with units
+#
+# Takes: the raw DSMR 5.0 P1 telegram, ~1 KB of OBIS-coded text lines such as
+#   1-0:1.8.1(005977.525*kWh), 1-0:2.7.0(00.343*kW), 1-0:52.7.0(204.7*V) and the meter's
+#   local clock, 0-0:1.0.0(260324170111W).
+# Derives: one JSON reading: UTC time, the meter's equipment id (hex-decoded), energy
+#   delivered and returned (both tariff registers summed, kWh), actual power delivered and
+#   returned and the net (kW, + = importing), and per-phase voltage (V) and current (A).
+# Why: nothing downstream (a home-energy app, a dashboard, a time-series database) should
+#   have to know OBIS codes, DSMR number formats, or that the meter's clock is local time
+#   with a W/S (winter/summer) flag. Decoding once, at the broker, gives every consumer the
+#   same numbers.
+#
+# The meter's clock says whether summer time is in force, so the UTC conversion is right
+# all year. A telegram missing one of these lines fails the rule (nth(1, []) fails), which
+# is counted in mqttd_rule_evaluations_total{result="failed"}. The rule does not check the
+# CRC (there is no CRC function); a reader that does drops a corrupt telegram before it
+# publishes.
+#
+# In:  home/hh-142/p1  qos=0 retain=0  /XMX5LGBBLB7990718278 ... 0-0:1.0.0(260324170111W)
+#        0-0:96.1.1(4530303831313938303339353536333830) 1-0:1.8.1(005977.525*kWh)
+#        1-0:1.8.2(006020.945*kWh) 1-0:2.8.1(000877.862*kWh) 1-0:2.8.2(001704.385*kWh) ...
+#        1-0:1.7.0(00.000*kW) 1-0:2.7.0(00.343*kW) ... 1-0:32.7.0(213.6*V)
+#        1-0:52.7.0(204.7*V) 1-0:72.7.0(214.8*V) 1-0:31.7.0(001*A) 1-0:51.7.0(001*A)
+#        1-0:71.7.0(000*A) ... !C14C
+# Out: normalized/homes/hh-142/meter  qos=0 retain=0  {"home":"hh-142","ts":"2026-03-24T16:01:11Z","meter_id":"E0081198039556380","import_kwh":11998.47,"export_kwh":2582.247,"import_kw":0.0,"export_kw":0.343,"net_kw":-0.343,"voltage_v":[213.6,204.7,214.8],"current_a":[1,1,0]}
+# ---------------------------------------------------------------------------------------
+[rules.home_p1_decode]
+description = "Decode a DSMR 5.0 P1 telegram into normalized JSON"
+sql = '''
+SELECT
+  topic(2) AS home,
+  regex_extract(payload, '0-0:1\.0\.0\((\d{12})([SW])\)') AS clock,
+  date_to_unix_ts('second', CASE WHEN nth(2, clock) = 'S' THEN '+02:00' ELSE '+01:00' END,
+                  '%y%m%d%H%M%S', nth(1, clock)) AS unix_s,
+  home AS out.home,
+  format_date('second', 'Z', '%Y-%m-%dT%H:%M:%SZ', unix_s) AS out.ts,
+  hexstr2bin(nth(1, regex_extract(payload, '0-0:96\.1\.1\(([0-9A-F]+)\)'))) AS out.meter_id,
+  round((float(nth(1, regex_extract(payload, '1-0:1\.8\.1\(([0-9.]+)\*kWh\)')))
+       + float(nth(1, regex_extract(payload, '1-0:1\.8\.2\(([0-9.]+)\*kWh\)')))) * 1000) / 1000 AS out.import_kwh,
+  round((float(nth(1, regex_extract(payload, '1-0:2\.8\.1\(([0-9.]+)\*kWh\)')))
+       + float(nth(1, regex_extract(payload, '1-0:2\.8\.2\(([0-9.]+)\*kWh\)')))) * 1000) / 1000 AS out.export_kwh,
+  float(nth(1, regex_extract(payload, '1-0:1\.7\.0\(([0-9.]+)\*kW\)'))) AS out.import_kw,
+  float(nth(1, regex_extract(payload, '1-0:2\.7\.0\(([0-9.]+)\*kW\)'))) AS out.export_kw,
+  round((out.import_kw - out.export_kw) * 1000) / 1000 AS out.net_kw,
+  [float(nth(1, regex_extract(payload, '1-0:32\.7\.0\(([0-9.]+)\*V\)'))),
+   float(nth(1, regex_extract(payload, '1-0:52\.7\.0\(([0-9.]+)\*V\)'))),
+   float(nth(1, regex_extract(payload, '1-0:72\.7\.0\(([0-9.]+)\*V\)')))] AS out.voltage_v,
+  [int(nth(1, regex_extract(payload, '1-0:31\.7\.0\((\d+)\*A\)'))),
+   int(nth(1, regex_extract(payload, '1-0:51\.7\.0\((\d+)\*A\)'))),
+   int(nth(1, regex_extract(payload, '1-0:71\.7\.0\((\d+)\*A\)')))] AS out.current_a
+FROM "home/+/p1"
+'''
+actions = [
+  { function = "republish", args = { topic = "normalized/homes/${home}/meter", qos = 0, payload = "${out}" } },
+]
+
+# ---------------------------------------------------------------------------------------
+# home_tariff_rate: what the house's draw costs right now in grid tariff
+#
+# Takes: the P1 telegram's local clock (0-0:1.0.0) and actual power delivered (1-0:1.7.0).
+# Derives: once a minute per meter, the Danish grid-tariff period the reading falls in
+#   (Tarifmodel 3.0, every day of the year: low = lavlast 00-06, high = højlast 06-17 and
+#   21-24, peak = spidslast 17-21), when that period ends, its rate (the winter or summer
+#   one, from the month) and what the current import costs per hour at that rate.
+# Why: the homeowner sees "peak tariff until 21:00, and your 11 kW draw costs 15 DKK an
+#   hour in grid tariff alone" while it is happening, not on next month's bill. The
+#   meter's own two registers (1.8.1 / 1.8.2) follow a day/night switch, not the Danish
+#   three periods, so the rule classifies by the clock instead.
+#
+# Once a minute: only the telegram whose seconds are 00-09 passes, by the meter's own
+# clock, so exactly one in six at the 10 s cadence. The clock is local and flags summer
+# time (S), so the periods are right all year. Spot price, taxes and VAT are not included:
+# a rule cannot look up the day-ahead price.
+#
+# In:  home/hh-104/p1  qos=0 retain=0  /XMX5LGBBLB0908932596 ... 0-0:1.0.0(260324170105W)
+#        ... 1-0:1.7.0(11.075*kW) ... !790C
+# Out: kpi/homes/hh-104/tariff  qos=0 retain=0  {"home":"hh-104","local_time":"2026-03-24T17:01:05+01:00","period":"peak","until":"21:00","tariff_dkk_kwh":1.35,"import_kw":11.075,"cost_dkk_h":14.95}
+# ---------------------------------------------------------------------------------------
+[rules.home_tariff_rate]
+description = "Grid-tariff period and cost rate from the meter's local clock"
+sql = '''
+SELECT
+  topic(2) AS home,
+  nth(1, regex_extract(payload, '0-0:1\.0\.0\((\d{12}[SW])\)')) AS clock,
+  CASE WHEN substr(clock, 12, 1) = 'S' THEN '+02:00' ELSE '+01:00' END AS tz,
+  int(substr(clock, 6, 2)) AS hour,
+  substr(clock, 2, 2) IN ('10', '11', '12', '01', '02', '03') AS winter,
+  CASE WHEN hour >= 17 AND hour < 21 THEN 'peak' WHEN hour < 6 THEN 'low' ELSE 'high' END AS period,
+  CASE WHEN period = 'low' THEN 0.15
+       WHEN period = 'peak' AND winter THEN 1.35
+       WHEN period = 'peak' THEN 0.60
+       WHEN winter THEN 0.45
+       ELSE 0.23 END AS rate,
+  float(nth(1, regex_extract(payload, '1-0:1\.7\.0\(([0-9.]+)\*kW\)'))) AS import_kw,
+  home AS out.home,
+  format_date('second', tz, '%Y-%m-%dT%H:%M:%S%:z',
+              date_to_unix_ts('second', tz, '%y%m%d%H%M%S', substr(clock, 0, 12))) AS out.local_time,
+  period AS out.period,
+  CASE WHEN period = 'peak' THEN '21:00' WHEN period = 'low' THEN '06:00'
+       WHEN hour < 17 THEN '17:00' ELSE '24:00' END AS out.until,
+  rate AS out.tariff_dkk_kwh,
+  import_kw AS out.import_kw,
+  round(import_kw * rate * 100) / 100 AS out.cost_dkk_h
+FROM "home/+/p1"
+WHERE substr(clock, 10, 1) = '0'
+'''
+actions = [
+  { function = "republish", args = { topic = "kpi/homes/${home}/tariff", qos = 0, payload = "${out}" } },
+]
+
+# ---------------------------------------------------------------------------------------
+# home_grid_feed: a pseudonymous, coarsened load feed for third parties
+#
+# Takes: the P1 telegram.
+# Derives: once a minute per meter, {id, minute, net_kw, voltage_v}: a pseudonym instead
+#   of the home id, the time truncated to the minute (UTC), net power rounded to 0.1 kW and
+#   phase voltages to whole volts. Nothing else: no meter id, no address, no register
+#   totals (an annual consumption figure is itself identifying), no per-phase currents.
+# Why: a research partner, a flexibility aggregator or the DSO's grid-planning team needs
+#   load and voltage shapes per connection, not who lives there. Pseudonymisation
+#   (GDPR Art. 4(5)) and data minimisation (Art. 5(1)(c)) at the broker mean the meter id
+#   and the home id never leave it, and the partner gets a sixth of the readings, rounded.
+#
+# This is still personal data. One reading a minute shows when a kettle or an oven is on,
+# and so when people are home (GDPR Recital 26: pseudonymised data that can be linked
+# back to a person stays personal data), so the feed goes only to partners under a
+# data-processing agreement. It is a spot sample, the telegram whose seconds are 00-09 by
+# the meter's clock, not a 1-minute mean: a rule keeps no state and cannot average. A
+# partner that needs interval means (grid planning works on 15-minute energy) should take
+# them from metered interval data (in Denmark, the 15- or 60-minute values in Energinet's
+# DataHub), or from the operator's own service that averages
+# normalized/homes/<home>/meter before it pseudonymises, not from this feed.
+#
+# The pseudonym is the first 16 hex digits (64 bits) of SHA-256 over a secret salt and the
+# home id: stable, so a consumer can follow one connection over time, and not reversible
+# without the salt. Keep this file as secret as the ACL file, and change the salt (say,
+# each quarter) to stop anyone linking the feed across periods. This is pseudonymisation,
+# not anonymisation: whoever holds the salt can re-identify.
+#
+# In:  home/hh-142/p1  qos=0 retain=0  /XMX5LGBBLB7990718278 ... 0-0:1.0.0(260324170101W)
+#        ... 1-0:1.7.0(00.000*kW) 1-0:2.7.0(00.341*kW) ... 1-0:32.7.0(213.5*V)
+#        1-0:52.7.0(205.1*V) 1-0:72.7.0(215.0*V) ... !2EE3
+# Out: analytics/homes/ee83478e4f3f50ae/load  qos=0 retain=0  {"id":"ee83478e4f3f50ae","minute":"2026-03-24T16:01Z","net_kw":-0.3,"voltage_v":[214,205,215]}
+# ---------------------------------------------------------------------------------------
+[rules.home_grid_feed]
+description = "Pseudonymous, once-a-minute, rounded load and voltage feed"
+sql = '''
+SELECT
+  substr(sha256(concat('demo-salt-2026q1/', topic(2))), 0, 16) AS pid,
+  regex_extract(payload, '0-0:1\.0\.0\((\d{12})([SW])\)') AS clock,
+  pid AS out.id,
+  format_date('second', 'Z', '%Y-%m-%dT%H:%MZ',
+              date_to_unix_ts('second', CASE WHEN nth(2, clock) = 'S' THEN '+02:00' ELSE '+01:00' END,
+                              '%y%m%d%H%M%S', nth(1, clock))) AS out.minute,
+  round((float(nth(1, regex_extract(payload, '1-0:1\.7\.0\(([0-9.]+)\*kW\)')))
+       - float(nth(1, regex_extract(payload, '1-0:2\.7\.0\(([0-9.]+)\*kW\)')))) * 10) / 10 AS out.net_kw,
+  [round(float(nth(1, regex_extract(payload, '1-0:32\.7\.0\(([0-9.]+)\*V\)')))),
+   round(float(nth(1, regex_extract(payload, '1-0:52\.7\.0\(([0-9.]+)\*V\)')))),
+   round(float(nth(1, regex_extract(payload, '1-0:72\.7\.0\(([0-9.]+)\*V\)'))))] AS out.voltage_v
+FROM "home/+/p1"
+WHERE substr(nth(1, clock), 10, 1) = '0'
+'''
+actions = [
+  { function = "republish", args = { topic = "analytics/homes/${pid}/load", qos = 0, payload = "${out}" } },
+]
+
+# ---------------------------------------------------------------------------------------
+# home_voltage_en50160: a phase voltage outside the EN 50160 band, once a minute
+#
+# Takes: the P1 telegram's three phase voltages (1-0:32.7.0 / 52.7.0 / 72.7.0).
+# Derives: while a phase is outside 207-253 V, one alert a minute for it, with the limit it
+#   crossed, its deviation from the nominal 230 V and a severity: "warning" from -10 % down
+#   to -15 % (195.5 V), "critical" below -15 % or above +10 % (253 V).
+# Why: EN 50160 (voltage characteristics of electricity supplied by public distribution
+#   networks) requires 95 % of the 10-minute mean r.m.s. values of a week within 230 V
+#   +/-10 %, and all of them within +10 % / -15 %. Undervoltage at the end of a long rural
+#   feeder trips heat-pump and EV-charger electronics, and it is the DSO's to fix: a reading
+#   below the band, per phase and timestamped, is the evidence the household or the DSO
+#   needs, picked out of 8,640 normal readings a day per meter.
+#
+# EN 50160 judges 10-minute means of the r.m.s. voltage, and calls a fall below 90 % that
+# lasts 10 ms to 1 min a voltage dip, which it characterises but does not count against
+# the band. A rule keeps no state, so it cannot average; it looks at one reading a minute
+# instead, the telegram whose seconds are 00-09 by the meter's own clock. A sustained
+# undervoltage, which is what the band is about, then alerts once a minute per phase
+# rather than six times, and a dip shorter than a minute alerts only if it happens to
+# cover that reading. An alert is an early warning, not a compliance verdict, and the
+# payload says so ("basis"). FOREACH turns the three phases into three candidates and
+# INCASE keeps those out of the band, so each alert names its phase.
+#
+# In:  home/hh-142/p1  qos=0 retain=0  /XMX5LGBBLB7990718278 ... 0-0:1.0.0(260324170101W)
+#        ... 1-0:32.7.0(213.5*V) 1-0:52.7.0(205.1*V) 1-0:72.7.0(215.0*V) ... !2EE3
+# Out: alerts/homes/hh-142/voltage  qos=1 retain=0  {"home":"hh-142","ts":"2026-03-24T16:01:01Z","phase":"L2","voltage_v":205.1,"limit_v":207,"deviation_pct":-10.8,"severity":"warning","basis":"one reading a minute outside the EN 50160 band of 207-253 V, which the standard applies to 10-min means"}
+# ---------------------------------------------------------------------------------------
+[rules.home_voltage_en50160]
+description = "Alert, once a minute per phase, on a voltage outside EN 50160's 207-253 V band"
+sql = '''
+FOREACH
+  regex_extract(payload, '0-0:1\.0\.0\((\d{12})([SW])\)') AS clock,
+  [['L1', float(nth(1, regex_extract(payload, '1-0:32\.7\.0\(([0-9.]+)\*V\)')))],
+   ['L2', float(nth(1, regex_extract(payload, '1-0:52\.7\.0\(([0-9.]+)\*V\)')))],
+   ['L3', float(nth(1, regex_extract(payload, '1-0:72\.7\.0\(([0-9.]+)\*V\)')))]] AS p
+DO
+  topic(2) AS home,
+  format_date('second', 'Z', '%Y-%m-%dT%H:%M:%SZ',
+              date_to_unix_ts('second', CASE WHEN nth(2, clock) = 'S' THEN '+02:00' ELSE '+01:00' END,
+                              '%y%m%d%H%M%S', nth(1, clock))) AS ts,
+  p[1] AS phase,
+  p[2] AS voltage_v,
+  CASE WHEN p[2] < 207 THEN 207 ELSE 253 END AS limit_v,
+  round((p[2] - 230) / 230 * 1000) / 10 AS deviation_pct,
+  CASE WHEN p[2] < 195.5 OR p[2] > 253 THEN 'critical' ELSE 'warning' END AS severity,
+  'one reading a minute outside the EN 50160 band of 207-253 V, which the standard applies to 10-min means' AS basis
+INCASE p[2] < 207 OR p[2] > 253
+FROM "home/+/p1"
+WHERE substr(nth(1, clock), 10, 1) = '0'
+'''
+actions = [
+  { function = "republish", args = { topic = "alerts/homes/${home}/voltage", qos = 1, payload = "${.}" } },
+]
+
+# ---------------------------------------------------------------------------------------
+# home_heating_comfort: the room is well below its setpoint while the thermostat heats
+#
+# Takes: the thermostat's JSON (ts, temp_c, setpoint_c, setpoint_since, mode).
+# Derives: an alert when, in "heat" mode, the room is more than 2 K below a setpoint that
+#   has been in force for at least 3 hours, with the shortfall and since when the setpoint
+#   has applied; at most one every 5 minutes per home while it lasts.
+# Why: the homeowner, or the installer on a service contract, learns that the heating has
+#   failed while the house is still warm enough to fix it calmly. It works for every home
+#   with a thermostat, district heating included, where the thermostat is the only signal.
+#   2 K is well beyond a thermostat's +/-0.5 K swing, and a 21.5 degC setpoint minus 2 K
+#   is already below EN 16798-1's 20 degC lower limit for living rooms in the heating
+#   season (category II). "away" mode is skipped: a cold house is then what the owner
+#   asked for.
+#
+# A setpoint step is not a failure: after a 3-4 K night setback, common in Danish homes on
+# district heating, a healthy system is more than 2 K short for an hour or more, because a
+# house warms by 0.5-1.5 K an hour. So the rule waits until the setpoint has applied for
+# 3 hours (setpoint_since, which the thermostat reports, is when the schedule slot began or
+# the owner last changed it); a slow heat pump on underfloor heating after a 4 K setback
+# can still be short after that, and wants a longer wait. A thermostat that does not
+# report setpoint_since never alerts.
+#
+# A rule keeps no state, so it cannot alert only on the first cold reading. Instead it
+# thins the reminders by the thermostat's own clock: only a reading in the first minute of
+# each 5-minute block (ts in seconds, mod 300, below 60) can alert, which is one in five
+# at the 60 s cadence. Widen the block (mod 3600 for hourly) for fewer; deduplicating
+# further belongs to the consumer. The shortfall is computed only when both temperatures
+# are numbers in a range a room thermostat can report (a room from -20 to 50 degC, a
+# setpoint from 5 to 30 degC), and a reading without integer ts and setpoint_since is
+# skipped, so a malformed reading, or a sensor's "no reading" value such as -3276.8 (0x8000
+# in tenths), derives nothing instead of failing the rule or raising a false alert.
+#
+# In:  home/hh-117/thermostat  qos=0 retain=0  {"ts":1774368024076,"temp_c":19.4,"setpoint_c":21.5,"setpoint_since":1759334400000,"humidity_pct":32,"mode":"heat","heating":true}
+# Out: alerts/homes/hh-117/heating  qos=1 retain=0  {"home":"hh-117","ts":"2026-03-24T16:00:24Z","temp_c":19.4,"setpoint_c":21.5,"setpoint_since":"2025-10-01T16:00:00Z","shortfall_k":2.1,"problem":"heating not keeping up: check the heat source"}
+# ---------------------------------------------------------------------------------------
+[rules.home_heating_comfort]
+description = "Alert when a heated room is more than 2 K below a setpoint held for 3 h (at most every 5 min)"
+sql = '''
+SELECT
+  topic(2) AS home,
+  CASE WHEN is_int(payload.ts) THEN format_date('millisecond', 'Z', '%Y-%m-%dT%H:%M:%SZ', payload.ts) END AS ts,
+  payload.temp_c AS temp_c,
+  payload.setpoint_c AS setpoint_c,
+  CASE WHEN is_int(payload.setpoint_since)
+       THEN format_date('millisecond', 'Z', '%Y-%m-%dT%H:%M:%SZ', payload.setpoint_since) END AS setpoint_since,
+  CASE WHEN is_num(payload.temp_c) AND is_num(payload.setpoint_c)
+            AND payload.temp_c > -20 AND payload.temp_c < 50
+            AND payload.setpoint_c >= 5 AND payload.setpoint_c <= 30
+       THEN round((payload.setpoint_c - payload.temp_c) * 10) / 10 END AS shortfall_k,
+  'heating not keeping up: check the heat source' AS problem
+FROM "home/+/thermostat"
+WHERE is_int(payload.ts) AND payload.mode = 'heat' AND shortfall_k > 2
+  AND is_int(payload.setpoint_since) AND payload.ts - payload.setpoint_since >= 10800000
+  AND (payload.ts div 1000) mod 300 < 60
+'''
+actions = [
+  { function = "republish", args = { topic = "alerts/homes/${home}/heating", qos = 1, payload = "${.}" } },
+]
+
+# ---------------------------------------------------------------------------------------
+# home_heatpump_health: each heat pump's health, kept as retained state, and an alert
+#
+# Takes: the heat pump's JSON (ts, mode, compressor, defrost, fault, fault_since, elec_w,
+#   heat_w, outdoor_c, flow_c).
+# Derives: on every reading, its COP (heat delivered / electricity drawn) and a verdict:
+#   "fault" when the controller reports a fault code, "bad reading" when the compressor
+#   runs but no electrical input is metered (a metering fault: the COP cannot be judged),
+#   "low COP" when the COP is below 2.0 at 2 degC or more outdoors in space-heating mode,
+#   "ok" otherwise. The verdict, with the readings behind it, when the fault was raised
+#   and, for a low COP, the watts drawn beyond what a healthy unit (COP 3.5) would need
+#   for the same heat and that as kWh a day, is published retained to
+#   state/homes/<home>/heatpump. For a fault or a low COP the same payload also goes to
+#   alerts/homes/<home>/heatpump: a fault at once, then both at most once per 5 minutes.
+# Why: the installer's dashboard shows every heat pump's current health the moment it
+#   opens (retained state is idempotent: the latest reading replaces the last), and a
+#   fault such as "E35 high-pressure lockout" shows there on the reading that reports it.
+#   A low COP is the costly fault nobody notices, because the house stays warm and only
+#   the electricity bill grows: a healthy air-to-water unit rates a COP of 3.5-5 at
+#   EN 14511's A2/W35 and A7/W35 test points, so below 2.0 in mild weather means an iced
+#   evaporator, a refrigerant leak or a failing fan, and the payload says what waiting
+#   costs a day.
+#
+# Not a problem: a defrost cycle (heat flows back out of the water for a few minutes, so
+# the COP is legitimately negative), hot-water heating (mode "dhw": high flow temperature,
+# and the immersion heater of a legionella cycle, lower COP by design), a stopped
+# compressor without a fault (standby), and frost (below 2 degC). FOREACH fans one reading
+# out to two outputs, state and alerts; "retain" is selected per output (true for state)
+# and the action reads it. INCASE keeps the alert only for a fault or a low COP, and only
+# for a fault's first reading (fault_since less than 30 s, one reporting interval, before
+# it) or a reading in the first 30 s of each 5-minute block of the device's clock (one in
+# ten at the 30 s cadence). So a fault alerts at once, then every 5 minutes while it
+# lasts; a controller that does not report fault_since gets only the 5-minute alerts, up
+# to 5 minutes late. A low COP has no start time a rule could read, so it alerts at the
+# next 5-minute mark, and a low COP that lasts less than 5 minutes may never alert: an
+# evaporator ices up over hours, so that is a transient, not the fault this looks for.
+# A reading without the fields the verdict needs, or with one of the wrong type, is
+# skipped and leaves the state as it was. Every comparison in the FOREACH clause is
+# guarded, because those expressions run before WHERE.
+#
+# In:  home/hh-117/heatpump  qos=0 retain=0  {"ts":1774367788452,"mode":"heat","compressor":false,"compressor_hz":0,"elec_w":38,"heat_w":0,"flow_c":41.0,"return_c":41.1,"flow_lpm":4.2,"outdoor_c":5.5,"defrost":false,"fault":"E35 high-pressure lockout","fault_since":1774367788000}
+# Out: state/homes/hh-117/heatpump  qos=1 retain=1  (the same payload as the alert)
+#      alerts/homes/hh-117/heatpump  qos=1 retain=0  {"home":"hh-117","ts":"2026-03-24T15:56:28Z","health":"fault","mode":"heat","compressor":false,"defrost":false,"fault":"E35 high-pressure lockout","fault_since":"2026-03-24T15:56:28Z","cop":0.0,"heat_w":0,"elec_w":38,"outdoor_c":5.5,"flow_c":41.0,"excess_w":0,"excess_kwh_day":0.0,"advice":"the heat pump has stopped on a fault: give the installer the code"}
+# In:  home/hh-123/heatpump  qos=0 retain=0  {"ts":1774368016349,"mode":"heat","compressor":true,"compressor_hz":83,"elec_w":1248,"heat_w":2142,"flow_c":33.3,"return_c":31.5,"flow_lpm":18.1,"outdoor_c":5.8,"defrost":false,"fault":"","fault_since":null}
+# Out: state/homes/hh-123/heatpump  qos=1 retain=1  (the same payload as the alert)
+#      alerts/homes/hh-123/heatpump  qos=1 retain=0  {"home":"hh-123","ts":"2026-03-24T16:00:16Z","health":"low COP","mode":"heat","compressor":true,"defrost":false,"fault":"","fault_since":"","cop":1.72,"heat_w":2142,"elec_w":1248,"outdoor_c":5.8,"flow_c":33.3,"excess_w":636,"excess_kwh_day":15.3,"advice":"COP below 2.0 in mild weather: check for an iced evaporator or low refrigerant"}
+# ---------------------------------------------------------------------------------------
+[rules.home_heatpump_health]
+description = "Retained heat-pump health from every reading; an alert for a fault (at once) or a low COP, then at most every 5 min"
+sql = '''
+FOREACH
+  CASE WHEN is_num(payload.heat_w) AND is_num(payload.elec_w) AND payload.elec_w > 0
+       THEN round(payload.heat_w / payload.elec_w * 100) / 100 ELSE 0.0 END AS cop,
+  CASE WHEN is_str(payload.fault) AND payload.fault != '' THEN 'fault'
+       WHEN payload.compressor = true AND is_num(payload.elec_w) AND payload.elec_w <= 0 THEN 'bad reading'
+       WHEN is_str(payload.mode) AND payload.mode = 'heat' AND payload.compressor = true
+            AND payload.defrost = false AND is_num(payload.outdoor_c) AND payload.outdoor_c >= 2
+            AND cop < 2.0 THEN 'low COP'
+       ELSE 'ok' END AS health,
+  CASE WHEN health = 'fault' AND is_int(payload.ts) AND is_int(payload.fault_since)
+       THEN payload.ts - payload.fault_since END AS fault_age_ms,
+  ['state', 'alerts'] AS root
+DO
+  root,
+  root = 'state' AS retain,
+  topic(2) AS home,
+  home AS out.home,
+  format_date('millisecond', 'Z', '%Y-%m-%dT%H:%M:%SZ', payload.ts) AS out.ts,
+  health AS out.health,
+  payload.mode AS out.mode,
+  payload.compressor AS out.compressor,
+  payload.defrost AS out.defrost,
+  payload.fault AS out.fault,
+  CASE WHEN is_int(fault_age_ms) THEN format_date('millisecond', 'Z', '%Y-%m-%dT%H:%M:%SZ', payload.fault_since)
+       ELSE '' END AS out.fault_since,
+  cop AS out.cop,
+  payload.heat_w AS out.heat_w,
+  payload.elec_w AS out.elec_w,
+  payload.outdoor_c AS out.outdoor_c,
+  payload.flow_c AS out.flow_c,
+  CASE WHEN health = 'low COP' THEN round(payload.elec_w - payload.heat_w / 3.5) ELSE 0 END AS out.excess_w,
+  CASE WHEN health = 'low COP' THEN round((payload.elec_w - payload.heat_w / 3.5) * 24 / 100) / 10
+       ELSE 0.0 END AS out.excess_kwh_day,
+  CASE WHEN health = 'fault' THEN 'the heat pump has stopped on a fault: give the installer the code'
+       WHEN health = 'low COP' THEN 'COP below 2.0 in mild weather: check for an iced evaporator or low refrigerant'
+       WHEN health = 'bad reading' THEN 'the compressor runs but no electrical input is metered: check the energy metering'
+       ELSE 'none' END AS out.advice
+INCASE root = 'state'
+    OR (health IN ('fault', 'low COP') AND (payload.ts div 1000) mod 300 < 30)
+    OR (fault_age_ms >= 0 AND fault_age_ms < 30000)
+FROM "home/+/heatpump"
+WHERE is_int(payload.ts) AND is_str(payload.mode) AND is_bool(payload.compressor)
+  AND is_bool(payload.defrost) AND is_str(payload.fault) AND is_num(payload.elec_w)
+  AND is_num(payload.heat_w) AND is_num(payload.outdoor_c) AND is_num(payload.flow_c)
+'''
+actions = [
+  { function = "republish", args = { topic = "${root}/homes/${home}/heatpump", qos = 1, retain = "${retain}", payload = "${out}" } },
+]
+
+# ---------------------------------------------------------------------------------------
+# home_ev_peak_start: advise moving an EV charge that starts in the peak tariff
+#
+# Takes: the charger's OCPP 1.6 StartTransaction (connectorId, idTag, meterStart and the
+#   RFC 3339 UTC timestamp, which OCPP makes mandatory in this message).
+# Derives: when a session starts between 17:00 and 21:00 Danish local time, an advice to
+#   postpone it, with the local time and the grid tariff it saves per kWh to charge
+#   00:00-06:00 instead (the same illustrative rates as home_tariff_rate).
+# Why: an 11 kW charge is the largest load a house has, and 17-21 is when the Danish grid
+#   is most loaded and its tariff highest (Tarifmodel 3.0). Telling the owner the moment
+#   a charge starts, with what it costs, is the cheapest demand response there is: a car
+#   plugged in on the way home at 17:00 rarely needs to be full before morning.
+#
+# Only StartTransaction counts, because it is sent once, when a session starts. A
+# StatusNotification "Charging" is not a start: the charger's bridge re-announces the
+# current status when it (re)starts, and a session resumes Charging after SuspendedEV or
+# SuspendedEVSE; nor are the MeterValues an open session sends every minute.
+#
+# OCPP times are UTC, so the rule works Danish local time out itself, summer time
+# included: CEST (+02:00) runs from 01:00 UTC on the last Sunday of March to 01:00 UTC on
+# the last Sunday of October (the EU rule). An hour before the timestamp, the day of the
+# month of the latest Sunday ("sunday": the day, minus the ISO weekday mod 7) is 25 or
+# later exactly when that month's last Sunday has passed. Every step is guarded, so a
+# message without a timestamp (a Heartbeat, a StatusNotification, whose timestamp is
+# optional) derives nothing instead of failing the rule.
+#
+# In:  home/hh-104/evcharger  qos=1 retain=0  {"action":"StartTransaction","connectorId":1,"idTag":"04E1A35A7C6B80","meterStart":6184220,"timestamp":"2026-03-24T16:00:04.500Z"}
+# Out: alerts/homes/hh-104/ev-charging  qos=1 retain=0  {"home":"hh-104","ts":"2026-03-24T16:00:04.500Z","local_time":"2026-03-24T17:00:04+01:00","tariff":"peak 17:00-21:00","saving_dkk_per_kwh":1.2,"advice":"Charging started in the peak tariff. Postpone it to after 21:00, or to 00:00-06:00 for the lowest grid tariff."}
+# ---------------------------------------------------------------------------------------
+[rules.home_ev_peak_start]
+description = "Advise postponing an EV session that starts in the 17-21 peak tariff"
+sql = '''
+SELECT
+  topic(2) AS home,
+  CASE WHEN payload.action = 'StartTransaction' AND is_str(payload.timestamp)
+       THEN rfc3339_to_unix_ts(payload.timestamp, 'second') END AS utc_s,
+  CASE WHEN is_int(utc_s) THEN format_date('second', 'Z', '%m', utc_s - 3600) END AS month,
+  CASE WHEN is_int(utc_s) THEN int(format_date('second', 'Z', '%d', utc_s - 3600))
+                               - int(format_date('second', 'Z', '%u', utc_s - 3600)) mod 7 END AS sunday,
+  CASE WHEN month IN ('04', '05', '06', '07', '08', '09') OR (month = '03' AND sunday >= 25)
+            OR (month = '10' AND sunday < 25) THEN '+02:00' ELSE '+01:00' END AS tz,
+  CASE WHEN is_int(utc_s) THEN int(format_date('second', tz, '%H', utc_s)) END AS hour,
+  CASE WHEN is_int(utc_s) THEN format_date('second', tz, '%m', utc_s) END AS local_month,
+  home AS out.home,
+  payload.timestamp AS out.ts,
+  CASE WHEN is_int(utc_s) THEN format_date('second', tz, '%Y-%m-%dT%H:%M:%S%:z', utc_s) END AS out.local_time,
+  'peak 17:00-21:00' AS out.tariff,
+  CASE WHEN local_month IN ('10', '11', '12', '01', '02', '03') THEN 1.2 ELSE 0.45 END AS out.saving_dkk_per_kwh,
+  'Charging started in the peak tariff. Postpone it to after 21:00, or to 00:00-06:00 for the lowest grid tariff.' AS out.advice
+FROM "home/+/evcharger"
+WHERE hour >= 17 AND hour < 21
+'''
+actions = [
+  { function = "republish", args = { topic = "alerts/homes/${home}/ev-charging", qos = 1, payload = "${out}" } },
+]
+
+
+#===========================================================================================
+# Cars
+#===========================================================================================
+
+# Cars: what the rule engine derives from a Copenhagen service fleet's telematics
+#
+# demo/rules/sim/cars.py simulates nine vehicles of a utility's field-service fleet in the
+# evening rush, each publishing the way its real equipment does. Every vehicle's client id
+# is its VIN (made up, but VIN-shaped), and every topic is vehicle/<VIN>/<stream>:
+#
+#   vehicle/<VIN>/telemetry  battery-electric cars and vans: the telematics unit's JSON
+#                            record, every 5 s while online (QoS 1)
+#   vehicle/<VIN>/triplog    a unit that was offline: its buffered records in one message
+#   vehicle/<VIN>/obd        diesel vans: an OBD-II dongle's raw Mode 01 CAN response,
+#                            BINARY, every 10 s
+#   vehicle/<VIN>/dtc        the same dongle's Mode 03 response (stored trouble codes),
+#                            BINARY, when the engine ECU stores a new code
+#   $events/client/...       the broker's own connect and disconnect events: ignition on
+#                            and off, or a lost connection
+#
+# In the 10-minute fixture: 749 raw messages and 22 connects and disconnects in. These
+# seven rules turn them into what each audience needs: engine data a person or a database
+# can read (normalized/, 170), 18 actionable alerts (alerts/, QoS 1) for exactly the things
+# that went wrong, presence (events/ and state/, 22 each), and a privacy-safe mobility feed
+# for the city (analytics/, 79).
+#
+# The VIN's descriptor section is the fleet's own (sim/cars.py): position 4 is the body
+# (C car, V van), 5 the powertrain (E battery-electric, D diesel), 6 the usable battery
+# (4 = 45, 5 = 58, 6 = 68, 7 = 77 kWh). substr() counts from 0, so those are substr(vin,
+# 3, 1), substr(vin, 4, 1) and substr(vin, 5, 1). Every rule that puts the VIN in a topic
+# first checks that it is VIN-shaped: 17 characters, digits and capitals but I, O and Q.
+#
+# Every time in a derived message comes from the device's own clock (the JSON "ts", or the
+# dongle's 4-byte timestamp), formatted with format_date and an explicit offset: never the
+# broker's clock, so the same input gives the same output on every run and every host.
+# Every alert carries the same two times: "at", UTC, for machines and other time zones, and
+# "local_time", Danish time with its offset, for the dispatcher. Denmark is CET (+01:00),
+# and CEST (+02:00) from the last Sunday of March to the last Sunday of October, at 01:00
+# UTC; the last Sunday of a month is its 31st minus the 31st's weekday. The alert rules
+# compute that from the device's clock (the dst.* and tz fields), so they are right all
+# year; those intermediate fields stay out of the message, which is published as ${out}.
+#
+# A field a device may leave out is published as null, never as "undefined".
+#
+
+
+# --- 1. OBD-II binary frames to engineering units -----------------------------------------
+#
+# Takes: vehicle/<VIN>/obd, every 10 s per diesel van: 16 raw bytes, the dongle's header
+#   (4-byte Unix time, 2-byte CAN id) and an ECU's reply to one multi-PID Mode 01 request,
+#   "41 0C A B 0D A 05 A 2F A".
+# Derives: normalized/cars/<VIN>/engine: the time, the answering ECU, engine rpm, speed,
+#   coolant temperature and fuel level as plain numbers.
+# Why: a historian, a dashboard or a fleet manager cannot use 69c2b3d907e8410c...; each
+#   value needs the right bytes and the right formula, and every consumer would otherwise
+#   carry its own decoder. Decoding once, at the broker, gives one canonical record.
+# Formulas: SAE J1979 / ISO 15031-5 Mode 01: PID 0x0C rpm = (256 A + B) / 4; 0x0D speed =
+#   A km/h; 0x05 coolant = A - 40 degC; 0x2F fuel = 100 A / 255 %. There is no function
+#   that reads bytes, so the rule reads hex digits (cookbook recipe 15): a digit d is worth
+#   16 - strlen(find('0123456789ABCDEF', d)). WHERE checks the frame's whole layout: a
+#   reply from any of the eight OBD response ids of ISO 15765-4 (7E8-7EF) is decoded and
+#   labelled with its id; a reply to other PIDs, or a truncated frame, produces nothing.
+#
+# In:  vehicle/XDKVD2T51NH140928/obd  qos=0  16 bytes: 69c2b3d9 07e8 410c1959 0d1c 0582 2f8a
+# Out: normalized/cars/XDKVD2T51NH140928/engine  qos=0  {"vehicle":"XDKVD2T51NH140928","at":"2026-03-24T15:55:05Z","ecu":"7E8","rpm":1622.25,"speed_kmh":28,"coolant_c":90,"fuel_pct":54.1}
+
+[rules.car_obd_decode]
+description = "OBD-II Mode 01 binary frames (rpm, speed, coolant, fuel) to JSON"
+sql = '''
+SELECT
+  bin2hexstr(payload) AS hex,                       -- 16 bytes -> 32 upper-case hex digits
+  topic(2) AS out.vehicle,
+  format_date('second', 'Z', '%Y-%m-%dT%H:%M:%SZ',
+      (16 - strlen(find('0123456789ABCDEF', substr(hex, 0, 1)))) * 268435456
+    + (16 - strlen(find('0123456789ABCDEF', substr(hex, 1, 1)))) * 16777216
+    + (16 - strlen(find('0123456789ABCDEF', substr(hex, 2, 1)))) * 1048576
+    + (16 - strlen(find('0123456789ABCDEF', substr(hex, 3, 1)))) * 65536
+    + (16 - strlen(find('0123456789ABCDEF', substr(hex, 4, 1)))) * 4096
+    + (16 - strlen(find('0123456789ABCDEF', substr(hex, 5, 1)))) * 256
+    + (16 - strlen(find('0123456789ABCDEF', substr(hex, 6, 1)))) * 16
+    + (16 - strlen(find('0123456789ABCDEF', substr(hex, 7, 1))))) AS out.at,
+  substr(hex, 9, 3) AS out.ecu,                     -- 07E8 -> '7E8', the engine ECU
+  ( (16 - strlen(find('0123456789ABCDEF', substr(hex, 16, 1)))) * 4096
+  + (16 - strlen(find('0123456789ABCDEF', substr(hex, 17, 1)))) * 256
+  + (16 - strlen(find('0123456789ABCDEF', substr(hex, 18, 1)))) * 16
+  + (16 - strlen(find('0123456789ABCDEF', substr(hex, 19, 1))))) / 4 AS out.rpm,
+    (16 - strlen(find('0123456789ABCDEF', substr(hex, 22, 1)))) * 16
+  + (16 - strlen(find('0123456789ABCDEF', substr(hex, 23, 1)))) AS out.speed_kmh,
+    (16 - strlen(find('0123456789ABCDEF', substr(hex, 26, 1)))) * 16
+  + (16 - strlen(find('0123456789ABCDEF', substr(hex, 27, 1)))) - 40 AS out.coolant_c,
+  round(( (16 - strlen(find('0123456789ABCDEF', substr(hex, 30, 1)))) * 16
+        + (16 - strlen(find('0123456789ABCDEF', substr(hex, 31, 1))))) * 1000 / 255) / 10 AS out.fuel_pct
+FROM "vehicle/+/obd"
+WHERE regex_match(topic(2), '^[A-HJ-NPR-Z0-9]{17}$')
+  AND regex_match(hex, '^[0-9A-F]{8}07E[8-F]410C[0-9A-F]{4}0D[0-9A-F]{2}05[0-9A-F]{2}2F[0-9A-F]{2}$')
+'''
+actions = [
+  { function = "republish", args = { topic = "normalized/cars/${out.vehicle}/engine", qos = 0, payload = "${out}" } },
+]
+
+
+# --- 2. Diagnostic trouble codes: from two bytes to "what is wrong, and what to do" -------
+#
+# Takes: vehicle/<VIN>/dtc, when the engine ECU stores a code: the dongle's header and the
+#   ECU's Mode 03 reply on CAN, "43 N" and N codes of 2 bytes each.
+# Derives: alerts/cars/<VIN>/dtc, QoS 1, one per code (FOREACH over the code slots): the
+#   code as a mechanic writes it ("P0301"), its system, its meaning, a severity and what
+#   the fleet should do.
+# Why: "03 01" means nothing to a fleet manager, and even "P0301" needs a lookup. "Cylinder
+#   1 misfire: book the workshop, avoid heavy loads" can be acted on at once, and a
+#   thermostat code can wait for the next service. Mode 03 returns stored (confirmed)
+#   codes, the ones that light the engine lamp, so every frame is worth an alert.
+# Decoding, SAE J2012 / ISO 15031-6: of the code's first hex digit d, d div 4 is the system
+#   (0 P powertrain, 1 C chassis, 2 B body, 3 U network) and d mod 4 the code's first
+#   digit; the other three hex digits are the code's last three characters as they are.
+#   Who defines a code (J2012): P0 and P2 are SAE's, P1 the maker's, P3 the maker's from
+#   P3000 to P33FF and SAE's above; B0, C0 and U0 are SAE's, B1-B2, C1-C2 and U1-U2 the
+#   maker's, and B3, C3 and U3 are reserved. The table names the codes this fleet sees
+#   most; any other still decodes, with a pointer to the right list.
+# Robust to the frame: N is one byte, so FOREACH runs over the 255 slots it can count
+#   ([0..254]: a range must be literal), and INCASE keeps a slot only if N counts it AND
+#   the frame really holds it: a dongle that truncates a multi-frame reply publishes the
+#   codes it has, never a half-read one. A slot of 0000 (P0000, "no code") is padding.
+#
+# In:  vehicle/XDKVD2T51NH140928/dtc  qos=1  10 bytes: 69c2b4ab 07e8 43 01 0301
+# Out: alerts/cars/XDKVD2T51NH140928/dtc  qos=1  {"vehicle":"XDKVD2T51NH140928","at":"2026-03-24T15:58:35Z","local_time":"2026-03-24T16:58:35+01:00","ecu":"7E8","code":"P0301","system":"powertrain","description":"Cylinder 1 misfire detected","severity":"warning","action":"book the workshop today (injector or compression on cylinder 1); avoid heavy loads; if the engine lamp flashes, stop"}
+# In:  vehicle/XDKVD2T52PH151374/dtc  qos=1  10 bytes: 69c2b5bc 07e8 43 01 0217
+# Out: alerts/cars/XDKVD2T52PH151374/dtc  qos=1  {"vehicle":"XDKVD2T52PH151374","at":"2026-03-24T16:03:08Z","local_time":"2026-03-24T17:03:08+01:00","ecu":"7E8","code":"P0217","system":"powertrain","description":"Engine coolant over-temperature condition","severity":"critical","action":"stop the engine now and recover the van: running hot destroys the head gasket"}
+
+[rules.car_obd_dtc]
+description = "OBD-II Mode 03 trouble codes decoded, explained and graded"
+sql = '''
+FOREACH
+  bin2hexstr(payload) AS hex,
+    (16 - strlen(find('0123456789ABCDEF', substr(hex, 0, 1)))) * 268435456
+  + (16 - strlen(find('0123456789ABCDEF', substr(hex, 1, 1)))) * 16777216
+  + (16 - strlen(find('0123456789ABCDEF', substr(hex, 2, 1)))) * 1048576
+  + (16 - strlen(find('0123456789ABCDEF', substr(hex, 3, 1)))) * 65536
+  + (16 - strlen(find('0123456789ABCDEF', substr(hex, 4, 1)))) * 4096
+  + (16 - strlen(find('0123456789ABCDEF', substr(hex, 5, 1)))) * 256
+  + (16 - strlen(find('0123456789ABCDEF', substr(hex, 6, 1)))) * 16
+  + (16 - strlen(find('0123456789ABCDEF', substr(hex, 7, 1)))) AS ts,
+    (16 - strlen(find('0123456789ABCDEF', substr(hex, 14, 1)))) * 16
+  + (16 - strlen(find('0123456789ABCDEF', substr(hex, 15, 1)))) AS n,   -- the count byte N
+  [0..254] AS k
+DO
+  topic(2) AS out.vehicle,
+  format_date('second', 'Z', '%Y-%m-%dT%H:%M:%SZ', ts) AS out.at,
+  format_date('second', 'Z', '%Y', ts) AS dst.year,
+  date_to_unix_ts('second', 'Z', '%Y-%m-%d %H:%M:%S', dst.year + '-03-31 01:00:00') AS dst.mar31,
+  date_to_unix_ts('second', 'Z', '%Y-%m-%d %H:%M:%S', dst.year + '-10-31 01:00:00') AS dst.oct31,
+  dst.mar31 - int(format_date('second', 'Z', '%w', dst.mar31)) * 86400 AS dst.starts,
+  dst.oct31 - int(format_date('second', 'Z', '%w', dst.oct31)) * 86400 AS dst.ends,
+  CASE WHEN ts >= dst.starts AND ts < dst.ends THEN '+02:00' ELSE '+01:00' END AS tz,
+  format_date('second', tz, '%Y-%m-%dT%H:%M:%S%:z', ts) AS out.local_time,
+  substr(hex, 9, 3) AS out.ecu,
+  substr(hex, 16 + k * 4, 4) AS raw,                 -- this slot's two bytes, e.g. '0301'
+  16 - strlen(find('0123456789ABCDEF', substr(raw, 0, 1))) AS d,
+  CASE d div 4 WHEN 0 THEN 'P' WHEN 1 THEN 'C' WHEN 2 THEN 'B' ELSE 'U' END
+    + str(d mod 4) + substr(raw, 1, 3)                        AS out.code,
+  CASE d div 4 WHEN 0 THEN 'powertrain' WHEN 1 THEN 'chassis' WHEN 2 THEN 'body'
+       ELSE 'network' END                                     AS out.system,
+  CASE WHEN d div 4 = 0
+         THEN CASE WHEN d mod 4 = 1
+                     OR (d mod 4 = 3 AND substr(raw, 1, 1) IN ('0', '1', '2', '3'))
+                   THEN 'maker' ELSE 'SAE' END
+       WHEN d mod 4 = 0 THEN 'SAE'
+       WHEN d mod 4 = 3 THEN 'reserved'
+       ELSE 'maker' END                                       AS defined_by,
+  CASE out.code
+    WHEN 'P0128' THEN 'Coolant thermostat: coolant below the thermostat regulating temperature'
+    WHEN 'P0217' THEN 'Engine coolant over-temperature condition'
+    WHEN 'P0300' THEN 'Random or multiple cylinder misfire detected'
+    WHEN 'P0301' THEN 'Cylinder 1 misfire detected'
+    WHEN 'P0302' THEN 'Cylinder 2 misfire detected'
+    WHEN 'P0303' THEN 'Cylinder 3 misfire detected'
+    WHEN 'P0304' THEN 'Cylinder 4 misfire detected'
+    WHEN 'P0401' THEN 'Exhaust gas recirculation flow insufficient'
+    WHEN 'P0420' THEN 'Catalyst system efficiency below threshold, bank 1'
+    WHEN 'P2002' THEN 'Diesel particulate filter efficiency below threshold, bank 1'
+    ELSE CASE defined_by
+           WHEN 'maker' THEN 'manufacturer-specific code: see the maker''s list'
+           WHEN 'reserved' THEN 'code in a range SAE J2012 reserves: check the reader and the ECU'
+           ELSE 'generic code: see SAE J2012' END END        AS out.description,
+  CASE out.code
+    WHEN 'P0217' THEN 'critical'
+    WHEN 'P0128' THEN 'info'
+    ELSE 'warning' END                                        AS out.severity,
+  CASE out.code
+    WHEN 'P0217' THEN 'stop the engine now and recover the van: running hot destroys the head gasket'
+    WHEN 'P0128' THEN 'thermostat stuck open: the engine runs cold and uses more fuel; replace it at the next service'
+    WHEN 'P0300' THEN 'book the workshop today; if the engine lamp flashes, stop: a heavy misfire wrecks the catalyst and the particulate filter'
+    WHEN 'P0301' THEN 'book the workshop today (injector or compression on cylinder 1); avoid heavy loads; if the engine lamp flashes, stop'
+    WHEN 'P0302' THEN 'book the workshop today; avoid heavy loads; if the engine lamp flashes, stop'
+    WHEN 'P0303' THEN 'book the workshop today; avoid heavy loads; if the engine lamp flashes, stop'
+    WHEN 'P0304' THEN 'book the workshop today; avoid heavy loads; if the engine lamp flashes, stop'
+    ELSE 'book a diagnosis at the next opportunity' END       AS out.action
+INCASE k < n                                     -- N counts this slot,
+   AND strlen(hex) >= 20 + k * 4                 -- the frame holds it,
+   AND substr(hex, 16 + k * 4, 4) <> '0000'      -- and it is not padding
+FROM "vehicle/+/dtc"
+WHERE regex_match(topic(2), '^[A-HJ-NPR-Z0-9]{17}$')
+  AND regex_match(hex, '^[0-9A-F]{8}07E[8-F]43[0-9A-F]{2}([0-9A-F]{4})+$')
+'''
+actions = [
+  { function = "republish", args = { topic = "alerts/cars/${out.vehicle}/dtc", qos = 1, payload = "${out}" } },
+]
+
+
+# --- 3. Engine overheating, caught from the coolant temperature ---------------------------
+#
+# Takes: the same OBD-II Mode 01 frames as rule 1.
+# Derives: alerts/cars/<VIN>/engine, QoS 1, while the coolant is at 105 degC or more:
+#   the temperature, a severity, what the van is doing (speed, rpm) and what to do.
+# Why: a failed radiator fan or water pump shows in the coolant minutes before the ECU's
+#   own overheat code (P0217, typically from 115-120 degC) and the warning lamp, and long
+#   before a head gasket fails. A dispatcher who sees "105 degC, crawling at 17 km/h" can
+#   call the driver to pull over while it is still cheap.
+# Thresholds: a warm diesel runs its coolant at 85-95 degC (the thermostat opens at about
+#   88). 105 is a common fleet-telematics warning; 115 is where engine ECUs start setting
+#   P0217 and lighting the lamp, and a 50/50 glycol mix under a 1.0-1.4 bar radiator cap
+#   boils at about 125-130 degC. No liquid coolant reads above 140: such a reading (0xFF
+#   decodes to 215) is a failed sensor or its wiring, reported as such, because a stop-now
+#   alarm on a dead sensor teaches dispatchers to ignore the real one.
+# How often: a rule keeps nothing between messages, so it cannot know which frame is the
+#   first one over the line. It alerts on every frame at exactly 105 degC, the warning
+#   threshold itself (at the dongle's 10-s cadence a temperature rising up to 6 degC a
+#   minute reads 105 in at least one frame, so the first alert comes at the crossing);
+#   then once a minute while it stays at 105 or more (the frame in the first 10 s of each
+#   minute of the dongle's clock: the window must be as long as the reporting interval);
+#   and on every frame from 115. A faster rise that skips 105 is caught by the next
+#   minute's frame. An alert stream a dispatcher can read: alarm floods are what IEC 62682
+#   / ISA-18.2 alarm management warns about.
+#
+# In:  vehicle/XDKVD2T52PH151374/obd  qos=0  16 bytes: 69c2b537 07e8 410c1c07 0d11 0591 2f50
+# Out: alerts/cars/XDKVD2T52PH151374/engine  qos=1  {"vehicle":"XDKVD2T52PH151374","alert":"coolant over-temperature","severity":"warning","at":"2026-03-24T16:00:55Z","local_time":"2026-03-24T17:00:55+01:00","coolant_c":105,"speed_kmh":17,"rpm":1794,"action":"call the driver: stop at the next safe place, check the coolant level and the radiator fan"}
+# In:  vehicle/XDKVD2T52PH151374/obd  qos=0  16 bytes: 69c2b5b9 07e8 410c10f0 0d04 059b 2f50
+# Out: alerts/cars/XDKVD2T52PH151374/engine  qos=1  {"vehicle":"XDKVD2T52PH151374","alert":"coolant over-temperature","severity":"critical","at":"2026-03-24T16:03:05Z","local_time":"2026-03-24T17:03:05+01:00","coolant_c":115,"speed_kmh":4,"rpm":1084,"action":"stop at the kerb now and switch the engine off; do not open the radiator cap hot"}
+
+[rules.car_engine_overheat]
+description = "Coolant at or above 105 degC (critical from 115; a sensor fault above 140), from the OBD-II frames"
+sql = '''
+SELECT
+  bin2hexstr(payload) AS hex,
+    (16 - strlen(find('0123456789ABCDEF', substr(hex, 0, 1)))) * 268435456
+  + (16 - strlen(find('0123456789ABCDEF', substr(hex, 1, 1)))) * 16777216
+  + (16 - strlen(find('0123456789ABCDEF', substr(hex, 2, 1)))) * 1048576
+  + (16 - strlen(find('0123456789ABCDEF', substr(hex, 3, 1)))) * 65536
+  + (16 - strlen(find('0123456789ABCDEF', substr(hex, 4, 1)))) * 4096
+  + (16 - strlen(find('0123456789ABCDEF', substr(hex, 5, 1)))) * 256
+  + (16 - strlen(find('0123456789ABCDEF', substr(hex, 6, 1)))) * 16
+  + (16 - strlen(find('0123456789ABCDEF', substr(hex, 7, 1)))) AS ts,
+    (16 - strlen(find('0123456789ABCDEF', substr(hex, 26, 1)))) * 16
+  + (16 - strlen(find('0123456789ABCDEF', substr(hex, 27, 1)))) - 40 AS coolant,
+  topic(2) AS out.vehicle,
+  CASE WHEN coolant > 140 THEN 'coolant sensor implausible'
+       ELSE 'coolant over-temperature' END AS out.alert,
+  CASE WHEN coolant >= 115 AND coolant <= 140 THEN 'critical' ELSE 'warning' END AS out.severity,
+  format_date('second', 'Z', '%Y-%m-%dT%H:%M:%SZ', ts) AS out.at,
+  format_date('second', 'Z', '%Y', ts) AS dst.year,
+  date_to_unix_ts('second', 'Z', '%Y-%m-%d %H:%M:%S', dst.year + '-03-31 01:00:00') AS dst.mar31,
+  date_to_unix_ts('second', 'Z', '%Y-%m-%d %H:%M:%S', dst.year + '-10-31 01:00:00') AS dst.oct31,
+  dst.mar31 - int(format_date('second', 'Z', '%w', dst.mar31)) * 86400 AS dst.starts,
+  dst.oct31 - int(format_date('second', 'Z', '%w', dst.oct31)) * 86400 AS dst.ends,
+  CASE WHEN ts >= dst.starts AND ts < dst.ends THEN '+02:00' ELSE '+01:00' END AS tz,
+  format_date('second', tz, '%Y-%m-%dT%H:%M:%S%:z', ts) AS out.local_time,
+  coolant AS out.coolant_c,
+    (16 - strlen(find('0123456789ABCDEF', substr(hex, 22, 1)))) * 16
+  + (16 - strlen(find('0123456789ABCDEF', substr(hex, 23, 1)))) AS out.speed_kmh,
+  round(( (16 - strlen(find('0123456789ABCDEF', substr(hex, 16, 1)))) * 4096
+        + (16 - strlen(find('0123456789ABCDEF', substr(hex, 17, 1)))) * 256
+        + (16 - strlen(find('0123456789ABCDEF', substr(hex, 18, 1)))) * 16
+        + (16 - strlen(find('0123456789ABCDEF', substr(hex, 19, 1))))) / 4) AS out.rpm,
+  CASE WHEN coolant > 140
+         THEN 'book a diagnosis: no liquid coolant reads this hot, so the sensor or its wiring has failed and overheating cannot be watched; until then the driver watches the dashboard gauge'
+       WHEN coolant >= 115
+         THEN 'stop at the kerb now and switch the engine off; do not open the radiator cap hot'
+       ELSE 'call the driver: stop at the next safe place, check the coolant level and the radiator fan'
+  END AS out.action
+FROM "vehicle/+/obd"
+WHERE regex_match(topic(2), '^[A-HJ-NPR-Z0-9]{17}$')
+  AND regex_match(hex, '^[0-9A-F]{8}07E[8-F]410C[0-9A-F]{4}0D[0-9A-F]{2}05[0-9A-F]{2}2F[0-9A-F]{2}$')
+  AND coolant >= 105
+  AND ((coolant >= 115 AND coolant <= 140)       -- critical: every frame
+       OR coolant = 105                          -- the warning threshold: at once
+       OR ts mod 60 < 10)                        -- otherwise once a minute
+'''
+actions = [
+  { function = "republish", args = { topic = "alerts/cars/${out.vehicle}/engine", qos = 1, payload = "${out}" } },
+]
+
+
+# --- 4. Driver safety: harsh braking, and speeding against the posted limit ----------------
+#
+# Takes: vehicle/<VIN>/telemetry, every 5 s per electric vehicle: position, speed, the
+#   posted limit where the vehicle is, and the strongest longitudinal acceleration of the
+#   last 5 s with the speed it was measured at.
+# Derives: alerts/cars/<VIN>/driving, QoS 1, for a harsh braking (stronger than 0.4 g, from
+#   10 km/h or more) or for more than 10 % over the posted limit: what happened, how bad,
+#   where, the speed, and when (UTC and Danish local time).
+# Why: 600 position records in 10 minutes say nothing a fleet manager can watch; these few
+#   events are what driver coaching, an insurer and an accident review start from. Local
+#   time and the exact position make each one checkable against the route and a dashcam.
+# Braking: ordinary city braking stays below about 0.3 g (3 m/s2), and ISO 15622 lets an
+#   adaptive cruise control brake on its own at no more than 3.5 m/s2 at speed; 0.4 g
+#   (3.9 m/s2) is the usual fleet-telematics threshold for a harsh braking, and from 0.6 g
+#   it is an emergency stop: check on the driver and the vehicle. The TCU reports the
+#   speed at the start of its hardest second ("ax_spd"): below 10 km/h a jolt is a pothole,
+#   a kerb or a door, not a braking, and that speed is the one the alert shows (the
+#   record's own "spd" is the speed after the stop, often 0).
+# Speeding: the limit is the one the TCU's map gives for where the vehicle is ("lim", the
+#   map-matched limit of Intelligent Speed Assistance, required in new EU vehicles since
+#   July 2024 by Regulation (EU) 2019/2144), not a fixed number for the city: Copenhagen's
+#   "København Ned i Fart" programme takes Indre By and the inner districts to 30 km/h and
+#   the roads between them to 40 (2024-2026), so a flat 50 would understate every
+#   overspeed. Wheel speed reads within about 3 % (tyre wear and pressure); a fleet policy
+#   allows 10 % over before it scores an event. More than 30 % over costs a Danish driver
+#   a "klip" (a penalty point): critical. A record without a limit (off the road network)
+#   is not judged.
+#
+# In:  vehicle/XDKVE6T79SH090233/telemetry  qos=1  {"ts":1774367874100,"lat":55.673188,"lon":12.557336,"hdg":74,"spd":0.0,"lim":40,"gear":"D","ax":-5.47,"ax_spd":19.5,"soc":63.1,"bat_t":15.2,"odo":51208.9,"chg":"off","chg_kw":0.0}
+# Out: alerts/cars/XDKVE6T79SH090233/driving  qos=1  {"vehicle":"XDKVE6T79SH090233","event":"harsh braking","severity":"warning","at":"2026-03-24T15:57:54Z","local_time":"2026-03-24T16:57:54+01:00","lat":55.67319,"lon":12.55734,"heading":74,"speed_kmh":19.5,"limit_kmh":null,"over_pct":null,"accel_g":-0.56}
+# In:  vehicle/XDKCE5K39PH311806/telemetry  qos=1  {"ts":1774368107090,"lat":55.685162,"lon":12.574328,"hdg":45,"spd":66.8,"lim":40,"gear":"D","ax":1.63,"ax_spd":49.5,"soc":71.1,"bat_t":13.6,"odo":9383.2,"chg":"off","chg_kw":0.0}
+# Out: alerts/cars/XDKCE5K39PH311806/driving  qos=1  {"vehicle":"XDKCE5K39PH311806","event":"speeding","severity":"critical","at":"2026-03-24T16:01:47Z","local_time":"2026-03-24T17:01:47+01:00","lat":55.68516,"lon":12.57433,"heading":45,"speed_kmh":66.8,"limit_kmh":40,"over_pct":67,"accel_g":0.17}
+
+[rules.car_driving_events]
+description = "Harsh braking (over 0.4 g, from 10 km/h) and speeding (over 10 % above the posted limit), in UTC and local time"
+sql = '''
+SELECT
+  topic(2) AS out.vehicle,
+  CASE WHEN is_int(payload.ts) THEN payload.ts ELSE 0 END AS ts,   -- WHERE drops a record without one
+  CASE WHEN is_num(payload.ax) AND is_num(payload.ax_spd)
+            AND payload.ax <= -3.9 AND payload.ax_spd >= 10
+       THEN true ELSE false END AS braked,
+  CASE WHEN braked THEN false
+       WHEN is_num(payload.spd) AND is_num(payload.lim) AND payload.lim > 0
+            AND payload.spd > payload.lim * 1.1
+       THEN true ELSE false END AS speeding,
+  CASE WHEN speeding THEN round((payload.spd - payload.lim) * 100 / payload.lim)
+       ELSE json_decode('null') END AS over,
+  CASE WHEN braked THEN 'harsh braking' ELSE 'speeding' END AS out.event,
+  CASE WHEN braked THEN CASE WHEN payload.ax <= -5.9 THEN 'critical' ELSE 'warning' END
+       WHEN over > 30 THEN 'critical' ELSE 'warning' END AS out.severity,
+  format_date('millisecond', 'Z', '%Y-%m-%dT%H:%M:%SZ', ts) AS out.at,
+  format_date('millisecond', 'Z', '%Y', ts) AS dst.year,
+  date_to_unix_ts('second', 'Z', '%Y-%m-%d %H:%M:%S', dst.year + '-03-31 01:00:00') AS dst.mar31,
+  date_to_unix_ts('second', 'Z', '%Y-%m-%d %H:%M:%S', dst.year + '-10-31 01:00:00') AS dst.oct31,
+  dst.mar31 - int(format_date('second', 'Z', '%w', dst.mar31)) * 86400 AS dst.starts,
+  dst.oct31 - int(format_date('second', 'Z', '%w', dst.oct31)) * 86400 AS dst.ends,
+  CASE WHEN ts div 1000 >= dst.starts AND ts div 1000 < dst.ends
+       THEN '+02:00' ELSE '+01:00' END AS tz,
+  format_date('millisecond', tz, '%Y-%m-%dT%H:%M:%S%:z', ts) AS out.local_time,
+  CASE WHEN is_num(payload.lat) THEN round(payload.lat * 100000) / 100000
+       ELSE json_decode('null') END AS out.lat,
+  CASE WHEN is_num(payload.lon) THEN round(payload.lon * 100000) / 100000
+       ELSE json_decode('null') END AS out.lon,
+  CASE WHEN is_num(payload.hdg) THEN payload.hdg ELSE json_decode('null') END AS out.heading,
+  CASE WHEN braked THEN payload.ax_spd ELSE payload.spd END AS out.speed_kmh,
+  CASE WHEN speeding THEN payload.lim ELSE json_decode('null') END AS out.limit_kmh,
+  over AS out.over_pct,
+  CASE WHEN is_num(payload.ax) THEN round(payload.ax / 9.80665 * 100) / 100
+       ELSE json_decode('null') END AS out.accel_g
+FROM "vehicle/+/telemetry"
+WHERE regex_match(topic(2), '^[A-HJ-NPR-Z0-9]{17}$')
+  AND is_int(payload.ts)
+  AND (braked OR speeding)
+'''
+actions = [
+  { function = "republish", args = { topic = "alerts/cars/${out.vehicle}/driving", qos = 1, payload = "${out}" } },
+]
+
+
+# --- 5. EV battery: low charge with the range left, and a pack overheating on a DC charger -
+#
+# Takes: the same telemetry records.
+# Derives: alerts/cars/<VIN>/battery, QoS 1, when a vehicle is below 15 % state of charge,
+#   or when its pack is above 50 degC while DC fast charging: the state of charge, the
+#   range it has left, how far the depot is, the pack temperature, the charging power,
+#   a severity and what to do.
+# Why: "soc 14.9" is a number; "27 km left, depot 2 km away: finish the job and return"
+#   is a decision a dispatcher can make at a glance, and a pack at 51 degC on a 150 kW
+#   charger is a cooling fault to stop before it ages the battery (or worse). The VIN says
+#   what battery the vehicle has (position 6), so the rule needs no lookup table.
+# Range: SoC x usable capacity / consumption, at planning values for Copenhagen city
+#   driving in early spring with the cabin heated: 19 kWh/100 km for a car, 25 for a van
+#   (a margin over what these vehicles use). The depot (55.6618 N, 12.5528 E) distance is
+#   a straight line; streets add about 30-40 %. 15 % is the fleet's policy threshold;
+#   below 10 % it is critical.
+# Pack temperature: cell makers rate NMC cells for charging up to about 45-55 degC; these
+#   packs are liquid-cooled with a chiller and hold DC charging below about 45 degC, and
+#   their BMS starts cutting the current at 48. Above 50 the cooling has failed; from 55
+#   it is critical.
+# How often: a warning alerts once a minute while it lasts (the record in the first 5 s of
+#   each minute of the vehicle's clock: one per minute at the TCU's 5-s cadence; a unit
+#   that reports less often needs a window as long as its interval), and every record once
+#   critical. The first warning therefore comes up to a minute after the crossing. Unlike
+#   the coolant's, these two cannot alert "at the threshold": the state of charge falls
+#   0.1 % in about 40 s, and a derating BMS holds the pack right at 50-51 degC, so a
+#   threshold band would repeat every 5 s. A minute is soon enough for both: a van at
+#   14.9 % still has some 25 km, and the BMS is already protecting the cells.
+#
+# In:  vehicle/XDKVE4T25RH204117/telemetry  qos=1  {"ts":1774368183080,"lat":55.674449,"lon":12.571961,"hdg":143,"spd":22.5,"lim":40,"gear":"D","ax":-0.33,"ax_spd":23.2,"soc":14.8,"bat_t":17.9,"odo":38415.2,"chg":"off","chg_kw":0.0}
+# Out: alerts/cars/XDKVE4T25RH204117/battery  qos=1  {"vehicle":"XDKVE4T25RH204117","alert":"low charge","severity":"warning","at":"2026-03-24T16:03:03Z","local_time":"2026-03-24T17:03:03+01:00","soc_pct":14.8,"range_km":27,"depot_km":1.9,"pack_temp_c":17.9,"charging":"off","charge_kw":0.0,"action":"finish the current job, then return to the depot to charge"}
+# In:  vehicle/XDKCE7K30SH118402/telemetry  qos=1  {"ts":1774368121000,"lat":55.663078,"lon":12.561353,"hdg":217,"spd":0.0,"lim":null,"gear":"P","ax":-0.05,"ax_spd":0.0,"soc":49.8,"bat_t":50.4,"odo":22874.3,"chg":"dc","chg_kw":94.1}
+# Out: alerts/cars/XDKCE7K30SH118402/battery  qos=1  {"vehicle":"XDKCE7K30SH118402","alert":"pack overheating while DC charging","severity":"warning","at":"2026-03-24T16:02:01Z","local_time":"2026-03-24T17:02:01+01:00","soc_pct":49.8,"range_km":202,"depot_km":0.6,"pack_temp_c":50.4,"charging":"dc","charge_kw":94.1,"action":"stop the DC session and let the pack cool; book a battery-cooling check before the next fast charge"}
+
+[rules.car_ev_battery]
+description = "EV below 15 % (with range and depot distance), or a pack above 50 degC while DC charging"
+sql = '''
+SELECT
+  topic(2) AS out.vehicle,
+  CASE WHEN is_int(payload.ts) THEN payload.ts ELSE 0 END AS ts,   -- WHERE drops a record without one
+  CASE WHEN is_num(payload.soc) AND payload.soc < 15 THEN true ELSE false END AS low,
+  CASE WHEN payload.chg = 'dc' AND is_num(payload.bat_t) AND payload.bat_t > 50
+       THEN true ELSE false END AS hot,
+  CASE WHEN hot THEN 'pack overheating while DC charging' ELSE 'low charge' END AS out.alert,
+  CASE WHEN hot THEN CASE WHEN payload.bat_t >= 55 THEN 'critical' ELSE 'warning' END
+       WHEN low AND payload.soc < 10 THEN 'critical' ELSE 'warning' END AS out.severity,
+  format_date('millisecond', 'Z', '%Y-%m-%dT%H:%M:%SZ', ts) AS out.at,
+  format_date('millisecond', 'Z', '%Y', ts) AS dst.year,
+  date_to_unix_ts('second', 'Z', '%Y-%m-%d %H:%M:%S', dst.year + '-03-31 01:00:00') AS dst.mar31,
+  date_to_unix_ts('second', 'Z', '%Y-%m-%d %H:%M:%S', dst.year + '-10-31 01:00:00') AS dst.oct31,
+  dst.mar31 - int(format_date('second', 'Z', '%w', dst.mar31)) * 86400 AS dst.starts,
+  dst.oct31 - int(format_date('second', 'Z', '%w', dst.oct31)) * 86400 AS dst.ends,
+  CASE WHEN ts div 1000 >= dst.starts AND ts div 1000 < dst.ends
+       THEN '+02:00' ELSE '+01:00' END AS tz,
+  format_date('millisecond', tz, '%Y-%m-%dT%H:%M:%S%:z', ts) AS out.local_time,
+  CASE WHEN is_num(payload.soc) THEN payload.soc ELSE json_decode('null') END AS out.soc_pct,
+  CASE substr(topic(2), 5, 1) WHEN '4' THEN 45 WHEN '5' THEN 58 WHEN '6' THEN 68
+       WHEN '7' THEN 77 ELSE 0 END AS usable_kwh,
+  CASE substr(topic(2), 3, 1) WHEN 'V' THEN 25 ELSE 19 END AS kwh_per_100km,
+  CASE WHEN usable_kwh > 0 AND is_num(payload.soc)
+       THEN round(payload.soc * usable_kwh / kwh_per_100km)
+       ELSE json_decode('null') END AS out.range_km,
+  CASE WHEN is_num(payload.lat) AND is_num(payload.lon) THEN true ELSE false END AS fix,
+  CASE WHEN fix THEN (payload.lat - 55.6618) * 111.22 ELSE 0 END AS north_km,
+  CASE WHEN fix THEN (payload.lon - 12.5528) * 62.75 ELSE 0 END AS east_km,
+  CASE WHEN fix THEN round(sqrt(north_km * north_km + east_km * east_km) * 10) / 10
+       ELSE json_decode('null') END AS out.depot_km,             -- null without a GNSS fix
+  CASE WHEN is_num(payload.bat_t) THEN payload.bat_t ELSE json_decode('null') END AS out.pack_temp_c,
+  CASE WHEN is_str(payload.chg) THEN payload.chg ELSE json_decode('null') END AS out.charging,
+  CASE WHEN is_num(payload.chg_kw) THEN payload.chg_kw ELSE json_decode('null') END AS out.charge_kw,
+  CASE WHEN hot
+         THEN 'stop the DC session and let the pack cool; book a battery-cooling check before the next fast charge'
+       WHEN is_num(out.range_km) AND is_num(out.depot_km) AND out.range_km < out.depot_km * 1.4 + 5
+         THEN 'charge now at the nearest public charger: the depot may be out of reach'
+       ELSE 'finish the current job, then return to the depot to charge' END AS out.action
+FROM "vehicle/+/telemetry"
+WHERE regex_match(topic(2), '^[A-HJ-NPR-Z0-9]{3}[CV]E[A-HJ-NPR-Z0-9]{12}$')
+  AND is_int(payload.ts)
+  AND (low OR hot)
+  AND (ts mod 60000 < 5000                      -- a warning: once a minute
+       OR (low AND payload.soc < 10)            -- critical: every record
+       OR (hot AND payload.bat_t >= 55))
+'''
+actions = [
+  { function = "republish", args = { topic = "alerts/cars/${out.vehicle}/battery", qos = 1, payload = "${out}" } },
+]
+
+
+# --- 6. Presence: ignition on and off, and a lost connection, from the broker's events ----
+#
+# Takes: $events/client/connected and $events/client/disconnected, for client ids that
+#   are VINs (the vehicles, not the dashboards or the other demo devices).
+# Derives: events/cars/<VIN>/presence, QoS 1: online or offline, the vehicle's body and
+#   powertrain (from its VIN), the broker's reason and what it means; and
+#   state/cars/<VIN>/online, retained, QoS 1: true or false.
+# Why: a vehicle's own data cannot say it went away. A dispatcher's map needs "offline:
+#   ignition off" told apart from "offline: connection lost" (the second one is a
+#   vehicle that is still driving, or a dead modem), and the retained flag gives a screen
+#   that opens later every vehicle's state at once (cookbook recipes 11 and 12). Its
+#   timestamps are left out: an event's are the broker's clock, and they differ per run.
+# The reason: normal is a clean DISCONNECT (the unit's ignition-off sequence); tcp_closed
+#   is a connection that ended without one; keepalive_timeout one that went silent for
+#   1.5 keepalive intervals. server_closed is skipped: it is the OLD connection of a
+#   vehicle that has just reconnected (a takeover), and would mark it offline (recipe 11).
+#
+# In:  XDKCE5K38RH287145's connection closes without a DISCONNECT ($events/client/disconnected, reason tcp_closed)
+# Out: events/cars/XDKCE5K38RH287145/presence  qos=1  {"vehicle":"XDKCE5K38RH287145","body":"car","powertrain":"battery-electric","online":false,"reason":"tcp_closed","meaning":"offline: connection lost without a goodbye (coverage, power or modem); the vehicle may still be moving"}
+# Out: state/cars/XDKCE5K38RH287145/online  qos=1 retain=1  false
+
+[rules.car_presence]
+description = "Vehicle online / offline with the reason, and a retained online flag"
+sql = '''
+SELECT
+  clientid AS vehicle,
+  CASE substr(clientid, 3, 1) WHEN 'V' THEN 'van' ELSE 'car' END AS body,
+  CASE substr(clientid, 4, 1) WHEN 'E' THEN 'battery-electric' WHEN 'D' THEN 'diesel'
+       ELSE 'other' END AS powertrain,
+  event = 'client.connected' AS online,
+  CASE WHEN online THEN 'connected' ELSE reason END AS reason,
+  CASE WHEN online THEN 'online: ignition on, or back in coverage'
+       WHEN reason = 'normal' THEN 'offline: ignition off'
+       WHEN reason = 'tcp_closed' THEN 'offline: connection lost without a goodbye (coverage, power or modem); the vehicle may still be moving'
+       WHEN reason = 'keepalive_timeout' THEN 'offline: went silent'
+       WHEN reason = 'shutdown' THEN 'offline: the broker is restarting'
+       ELSE 'offline: ' + reason END AS meaning
+FROM "$events/client/connected", "$events/client/disconnected"
+WHERE regex_match(clientid, '^[A-HJ-NPR-Z0-9]{17}$')
+  AND (event = 'client.connected' OR reason <> 'server_closed')
+'''
+actions = [
+  { function = "republish", args = { topic = "events/cars/${vehicle}/presence", qos = 1, payload = "${.}" } },
+  { function = "republish", args = { topic = "state/cars/${vehicle}/online", qos = 1, retain = true, payload = "${online}" } },
+]
+
+
+# --- 7. A privacy-safe mobility feed for the city, live and backfilled --------------------
+#
+# Takes: the telemetry records, and the trip log a vehicle uploads when it comes back
+#   online (its buffered records in one message).
+# Derives: analytics/cars/mobility: floating-car data for the municipality's traffic
+#   analytics: one point per vehicle per 30 s while it is in drive, with a pseudonym
+#   instead of the VIN, the time to the 30-s slot, the position to 3 decimals (about 110 m
+#   north-south, 60 m east-west), the heading to 45 degrees, the speed to 5 km/h, and car
+#   or van. FOREACH runs over the trip log's records (or over the one live record), so a
+#   vehicle that was offline leaves no gap, and the city's consumer sees one kind of point.
+# Why: the city wants travel times and congestion, not who drove where. A VIN is personal
+#   data under the GDPR (it leads to the vehicle's keeper, and a fleet's roster to its
+#   driver); precise positions, battery and odometer readings identify too. The feed keeps
+#   what traffic analysis needs and nothing more. A vehicle in P (parked at a job, at the
+#   depot, charging) is not traffic, and where it stands is where its driver works: for a
+#   utility, a customer's address. So only records in D are published (the selector
+#   position the TCU reads from CAN); a queue at a red light is in D, and is traffic.
+#   Floating-car-data practice also trims the first and last minutes of each trip; that
+#   needs state across messages, which a rule does not keep, so the approach to a stop is
+#   still in the feed, at 110 m.
+# Pseudonym: the first 16 hex digits of sha256(secret salt : VIN : UTC date). It is stable
+#   for a day, so the city can follow a trip, and changes at midnight UTC, so days cannot
+#   be linked. The salt is the operator's secret: whoever has it can re-identify every
+#   vehicle by hashing the fleet's VINs; change it to rotate every pseudonym.
+#
+# In:  vehicle/XDKCE5K38RH287145/telemetry  qos=1  {"ts":1774367701790,"lat":55.686986,"lon":12.564506,"hdg":128,"spd":21.4,"lim":40,"gear":"D","ax":1.63,"ax_spd":10.7,"soc":48.6,"bat_t":16.2,"odo":27655.0,"chg":"off","chg_kw":0.0}
+# Out: analytics/cars/mobility  qos=0  {"id":"0929ff0e6cb95584","class":"car","slot":"2026-03-24T15:55:00Z","lat":55.687,"lon":12.565,"heading":135,"speed_kmh":20,"source":"live"}
+# In:  vehicle/XDKCE5K38RH287145/triplog  qos=1  {"ts":1774368005600,"reason":"backlog","from":1774367841790,"to":1774368001790,"n":33,"records":[...33 records...]}
+# Out: analytics/cars/mobility  qos=0  {"id":"0929ff0e6cb95584","class":"car","slot":"2026-03-24T15:57:30Z","lat":55.682,"lon":12.577,"heading":135,"speed_kmh":25,"source":"backfill"}
+#      (and 5 more points, 15:58:00 to 16:00:00, the gap the lost connection left)
+
+[rules.car_mobility_feed]
+description = "Pseudonymous, coarsened floating-car data for city traffic analytics (live and backfilled)"
+sql = '''
+FOREACH CASE WHEN topic(3) = 'triplog' THEN payload.records ELSE [payload] END AS r
+DO
+  substr(sha256('cph-fleet-fcd-2026-a7f3:' + topic(2) + ':'
+                + format_date('millisecond', 'Z', '%Y-%m-%d', r.ts)), 0, 16) AS id,
+  CASE substr(topic(2), 3, 1) WHEN 'V' THEN 'van' ELSE 'car' END AS class,
+  format_date('millisecond', 'Z', '%Y-%m-%dT%H:%M:%SZ', r.ts - (r.ts mod 30000)) AS slot,
+  round(r.lat * 1000) / 1000 AS lat,
+  round(r.lon * 1000) / 1000 AS lon,
+  (round(r.hdg / 45) mod 8) * 45 AS heading,
+  round(r.spd / 5) * 5 AS speed_kmh,
+  CASE WHEN topic(3) = 'triplog' THEN 'backfill' ELSE 'live' END AS source
+INCASE is_int(r.ts) AND is_num(r.lat) AND is_num(r.lon) AND is_num(r.hdg) AND is_num(r.spd)
+   AND r.ts mod 30000 < 5000 AND r.gear = 'D'
+FROM "vehicle/+/telemetry", "vehicle/+/triplog"
+WHERE regex_match(topic(2), '^[A-HJ-NPR-Z0-9]{17}$')
+'''
+actions = [
+  { function = "republish", args = { topic = "analytics/cars/mobility", qos = 0, payload = "${.}" } },
+]

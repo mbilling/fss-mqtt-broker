@@ -382,6 +382,10 @@ stages inside it are exported separately, on finer buckets (20µs to ~5s, ×1.5)
 | `fsync` | one segment-log data sync (one sample per batch) |
 | `replicate_rtt` | leader, per follower: Replicate queued to the peer link → its ack back |
 | `replica_apply` | follower: Replicate received → its ack put on the link (writer queue + commit) |
+| `replicate_queue` | leader: Replicate queued on the peer link → the link has handed it to the kernel (write and flush returned): in-process queueing plus any wait on a full send buffer |
+| `ack_queue` | follower: ReplicateAck queued on the peer link → the link has handed it to the kernel (write and flush returned) |
+
+`replicate_queue` and `ack_queue` are sampled (about one frame in 16, drawn at random so no follower's link is favoured), so their counts are roughly a sixteenth of the others' and the rate per stage is approximate; the sample does not bias their means. Compare them with `replicate_rtt` in steady state, or by medians: `replicate_rtt` only records acks accepted within the 5 s RPC timeout, while under a backlog `replicate_queue` also carries frames whose append had already given up on them, which inflates its mean and upper quantiles against the round trip it is meant to be a part of. Because both stages end when write and flush return, a full TCP send buffer (wire or receiver backpressure) lands inside them, not outside: read them next to the peer sockets' Send-Q (`PEER_SOCKETS=on` on the rig) to tell that apart from in-process queueing.
 
 `mqttd_publish_ack_seconds` is the server-side publish → PUBACK release for QoS 1
 publishes that went through the pending table: the broker's own share of the client's

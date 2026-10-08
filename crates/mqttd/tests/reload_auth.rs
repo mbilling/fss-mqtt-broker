@@ -117,6 +117,7 @@ async fn start_reloadable_node(pw_path: PathBuf) -> (SocketAddr, reload::Reloade
                 metrics: None,
                 enhanced: None,
                 ingress: None,
+                rules: None,
             });
             let hub = hub_tx.clone();
             tokio::spawn(async move {

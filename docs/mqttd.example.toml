@@ -302,6 +302,17 @@ queue_overflow = "drop-oldest"       # or "reject-newest"
 # [limits] section as requires-restart).
 # watermark_poll_secs = 10
 
+[rules]
+# The rule engine (ADR 0083, docs/RULES.md; unreleased, after v1.0.18): a TOML file of
+# [rules.<id>] tables, each an EMQX rule SQL statement and its republish/console actions.
+# Unset = no rules. `file` is the only key here: the rules themselves go in that file, and a
+# [rules.<id>] table in THIS file refuses the boot as an unknown key. Per-node operator
+# configuration like the ACL file; a file that does not load refuses the boot and rejects a
+# reload (the running rules stay). Check it offline with `mqttd --check-rules <file>`, and
+# try a statement with `mqttd --rule-test --sql '...'`. A first rule in two minutes:
+# docs/RULES.md; tested recipes to copy: docs/RULES-COOKBOOK.md and docs/examples/rules/.
+# file = "/etc/mqttd/rules.toml"
+
 [observability]
 # OTLP/HTTP push export (ADR 0020). Unset = Prometheus /metrics endpoint only.
 # otlp_endpoint = "http://collector:4318"
