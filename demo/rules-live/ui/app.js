@@ -599,6 +599,7 @@ async function applyRule() {
     $("editing").textContent = rule.id;
     $("f-id").readOnly = true;
     $("b-delete").disabled = false;
+    renderTrace();
   }
   await loadRules();
 }
@@ -620,6 +621,7 @@ async function deleteRule() {
     $("editing").textContent = `(${id} deleted)`;
     $("f-id").readOnly = false;
     $("b-delete").disabled = true;
+    renderTrace();
   }
   await loadRules();
 }

@@ -350,6 +350,12 @@ legend {
   display: none;
 }
 
+/* Hiding no_result can leave nothing to show: say so rather than look broken. */
+.feed.hide-no-result:not(:has(> li:not(.no_result)))::before {
+  content: "No passed or failed records yet: only no_result ones, which are hidden.";
+  color: var(--muted);
+}
+
 .cmd {
   display: flex;
   flex-wrap: wrap;
