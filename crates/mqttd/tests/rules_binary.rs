@@ -2733,6 +2733,133 @@ fn trace_is_on(rate: u32) -> String {
     )
 }
 
+/// The next `$SYS` message `c` receives on `topic` that `want` accepts, read as JSON; the
+/// rest are passed over. Bounded: fails after 15 s, naming the last one on `topic`.
+async fn sys_where(
+    c: &mut Client,
+    topic: &str,
+    want: impl Fn(&serde_json::Value) -> bool,
+) -> serde_json::Value {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut last = serde_json::Value::Null;
+    loop {
+        assert!(
+            Instant::now() < deadline,
+            "nothing as wanted on {topic} after 15 s; the last: {last}"
+        );
+        match c.recv_bounded(Duration::from_secs(5)).await {
+            Recv::Packet(Packet::Publish(p)) if p.topic == topic => {
+                let doc = serde_json::from_slice(&p.payload).expect("JSON on $SYS");
+                if want(&doc) {
+                    return doc;
+                }
+                last = doc;
+            }
+            Recv::Packet(Packet::Publish(_)) | Recv::Quiet => {}
+            other => panic!("expected only $SYS publishes, got {other:?}"),
+        }
+    }
+}
+
+/// RULES.md "Watch and edit rules live": the `[rules]` watch keys are live — an applied
+/// reload changes them, and a rejected one leaves them as they were. With the keys in the
+/// config file and `SIGHUP`: a reload that turns the trace on brings the next publish's
+/// record; one with `trace_rate = 0` is rejected — the summary says so — and the trace
+/// stays on; one that turns the trace off and the interval to 2 s shows both in the
+/// summary, and a publish then has no record across two ticks. A broker that took the
+/// keys at boot only fails the first wait; one that applied a rejected candidate, or kept
+/// the trace on, fails the later ones.
+#[tokio::test]
+async fn a_reload_turns_rule_watching_on_and_off_and_a_rejected_one_changes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    write_rules(
+        dir.path(),
+        r#"[rules.watched]
+sql = 'SELECT payload.v AS v FROM "w/#"'
+actions = []
+"#,
+    );
+    let watch = |keys: &str| format!("\n[rules]\n{keys}");
+    let setup = Setup {
+        toml: watch("sys_interval_secs = 1\ntrace = false\n"),
+        rules_by_env: true,
+        ..Setup::default()
+    };
+    let broker = start(dir.path(), "watch-node", &setup).await;
+    let config = dir.path().join("mqttd.toml");
+    let base = std::fs::read_to_string(&config)
+        .unwrap()
+        .replace(&setup.toml, "");
+    let reload = |keys: &str| {
+        std::fs::write(&config, format!("{base}{}", watch(keys))).unwrap();
+        broker.signal("HUP");
+    };
+    let (summary, trace) = (
+        "$SYS/brokers/watch-node/rules",
+        "$SYS/brokers/watch-node/trace/rules/watched",
+    );
+    let mut sub = Client::connect_v5_ok(broker.addr, "watcher").await;
+    assert_eq!(subscribe(&mut sub, 1, summary, QoS::AtMostOnce).await, [0]);
+    assert_eq!(subscribe(&mut sub, 2, trace, QoS::AtMostOnce).await, [0]);
+    let mut publ = Client::connect_v5_ok(broker.addr, "publisher").await;
+    let first = sys_where(&mut sub, summary, |_| true).await;
+    assert_eq!(first["trace"], false);
+    assert_eq!(first["interval_secs"], 1);
+    assert_eq!(first["reload"], serde_json::Value::Null);
+
+    reload("sys_interval_secs = 1\ntrace = true\n");
+    let on = sys_where(&mut sub, summary, |s| s["trace"] == true).await;
+    assert_eq!(on["reload"]["trigger"], "signal");
+    assert_eq!(on["reload"]["applied"], true);
+    broker.wait_log(&trace_is_on(20)).await;
+    assert_eq!(publish_acked(&mut publ, "w/1", br#"{"v":1}"#, 1).await, 0);
+    let record = sys_where(&mut sub, trace, |_| true).await;
+    assert_eq!(record["trigger"]["payload"], r#"{"v":1}"#);
+
+    reload("sys_interval_secs = 1\ntrace = true\ntrace_rate = 0\n");
+    let rejected = sys_where(&mut sub, summary, |s| s["reload"]["applied"] == false).await;
+    assert_eq!(rejected["reload"]["error_kind"], "config");
+    assert_eq!(rejected["trace"], true, "the trace stays on");
+    assert_eq!(
+        rejected["trace_rate"], 20,
+        "the rejected rate is not applied"
+    );
+    assert_eq!(publish_acked(&mut publ, "w/1", br#"{"v":2}"#, 2).await, 0);
+    let record = sys_where(&mut sub, trace, |_| true).await;
+    assert_eq!(record["trigger"]["payload"], r#"{"v":2}"#, "still tracing");
+
+    reload("sys_interval_secs = 2\ntrace = false\n");
+    let off = sys_where(&mut sub, summary, |s| s["trace"] == false).await;
+    assert_eq!(off["reload"]["applied"], true);
+    assert_eq!(off["interval_secs"], 2);
+    broker
+        .wait_log(" INFO mqttd::rules: rule trace is off (ADR 0084)")
+        .await;
+    assert_eq!(publish_acked(&mut publ, "w/1", br#"{"v":3}"#, 3).await, 0);
+    // Two ticks after the publish, and nothing but the summaries.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut ticks = 0;
+    while ticks < 2 {
+        assert!(
+            Instant::now() < deadline,
+            "{ticks} of two ticks after 15 s at a 2 s interval"
+        );
+        match sub.recv_bounded(Duration::from_secs(5)).await {
+            Recv::Packet(Packet::Publish(p)) => {
+                assert_eq!(p.topic, summary, "a trace record with the trace off");
+                let doc: serde_json::Value = serde_json::from_slice(&p.payload).unwrap();
+                assert_eq!(doc["trace"], false);
+                assert_eq!(doc["interval_secs"], 2);
+                ticks += 1;
+            }
+            Recv::Quiet => {}
+            other => panic!("expected only $SYS publishes, got {other:?}"),
+        }
+    }
+    let watched = broker.sample(&evaluations("watched", "passed")).await;
+    assert_eq!(watched, Some(3), "the untraced publish still ran the rule");
+}
+
 // ---------------------------------------------------------------------------------------
 // Rules edited through the admin API (ADR 0084)
 // ---------------------------------------------------------------------------------------
