@@ -691,11 +691,25 @@ pub fn clip(s: &str, max: usize) -> &str {
     &s[..end]
 }
 
-/// A rule definition's short hash (ADR 0084): 16 hex digits of the SHA-256 of its SQL,
-/// its actions as JSON and its `enable` flag — what an edit that changes what the rule
-/// does changes, so a stored error can be told from one about an earlier definition.
+/// A rule definition's short hash (ADR 0084): 16 hex digits of an HMAC-SHA256 of its
+/// SQL, its actions as JSON and its `enable` flag — what an edit that changes what the
+/// rule does changes, so a stored error can be told from one about an earlier
+/// definition.
+///
+/// Keyed with [`def_key`], random and made once per process, because `def` is
+/// published on `$SYS` and to admin viewers: a plain hash of the SQL would let a
+/// reader who knows the rest of a rule test guesses at a secret in it (a pseudonym
+/// salt) offline. So the same definition hashes alike within one process only — on
+/// another node, or after a restart, it differs. Nothing compares it across processes.
 #[must_use]
 pub fn rule_def(rule: &Rule) -> String {
+    let tag = aws_lc_rs::hmac::sign(def_key(), def_text(rule).as_bytes());
+    mqtt_core::hex_lower(&tag.as_ref()[..8])
+}
+
+/// What [`rule_def`] hashes: the SQL, the actions as JSON and the `enable` flag, each
+/// after a NUL.
+fn def_text(rule: &Rule) -> String {
     let actions = serde_json::to_string(rule.action_specs()).unwrap_or_default();
     let mut text = String::with_capacity(rule.sql().len() + actions.len() + 4);
     text.push_str(rule.sql());
@@ -703,9 +717,23 @@ pub fn rule_def(rule: &Rule) -> String {
     text.push_str(&actions);
     text.push('\0');
     text.push(if rule.enabled() { '1' } else { '0' });
-    let mut def = crate::reload::sha256_hex(text.as_bytes());
-    def.truncate(16);
-    def
+    text
+}
+
+/// The key of [`rule_def`]: 32 random bytes, drawn once per process (from the clock's
+/// nanoseconds should the system's random source fail).
+fn def_key() -> &'static aws_lc_rs::hmac::Key {
+    static KEY: std::sync::OnceLock<aws_lc_rs::hmac::Key> = std::sync::OnceLock::new();
+    KEY.get_or_init(|| {
+        let mut bytes = [0u8; 32];
+        if aws_lc_rs::rand::fill(&mut bytes).is_err() {
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos());
+            bytes[..16].copy_from_slice(&nanos.to_le_bytes());
+        }
+        aws_lc_rs::hmac::Key::new(aws_lc_rs::hmac::HMAC_SHA256, &bytes)
+    })
 }
 
 /// What a rule's last error was about (ADR 0084).
@@ -742,6 +770,7 @@ pub struct LastError {
     /// The error, at most [`ERROR_TEXT_MAX`] bytes.
     pub message: String,
     /// The [`rule_def`] it was about: an entry about an earlier definition is dropped.
+    /// Keyed per process, so it is compared only within this one.
     pub def: String,
 }
 
@@ -1385,6 +1414,49 @@ mod tests {
             .and_then(|l| l.rsplit(' ').next())
             .and_then(|v| v.parse().ok())
             .unwrap_or(0)
+    }
+
+    /// ADR 0084: a rule's `def` is keyed per process. Rules defined alike hash alike in
+    /// it, and a change to the SQL, the actions or `enable` changes the hash; but it is
+    /// not the plain SHA-256 that a reader of `$SYS` could recompute from a guess at the
+    /// rule — say, at the salt in its SQL.
+    #[test]
+    fn a_rule_definition_hash_is_keyed_per_process() {
+        let set = RuleSet::parse(
+            r#"
+[rules.a]
+sql = '''SELECT sha256(concat('salt-1', clientid)) AS id FROM "t/#"'''
+actions = [{ function = "console" }]
+
+[rules.same]
+sql = '''SELECT sha256(concat('salt-1', clientid)) AS id FROM "t/#"'''
+actions = [{ function = "console" }]
+
+[rules.sql]
+sql = '''SELECT sha256(concat('salt-2', clientid)) AS id FROM "t/#"'''
+actions = [{ function = "console" }]
+
+[rules.actions]
+sql = '''SELECT sha256(concat('salt-1', clientid)) AS id FROM "t/#"'''
+actions = [{ function = "republish", args = { topic = "out/${id}" } }]
+
+[rules.disabled]
+sql = '''SELECT sha256(concat('salt-1', clientid)) AS id FROM "t/#"'''
+actions = [{ function = "console" }]
+enable = false
+"#,
+        )
+        .unwrap()
+        .rules;
+        let def = |id: &str| rule_def(set.get(id).unwrap());
+        assert_eq!(def("a").len(), 16);
+        assert_eq!(def("a"), def("a"), "one key for the process");
+        assert_eq!(def("a"), def("same"), "alike, whatever the id");
+        for changed in ["sql", "actions", "disabled"] {
+            assert_ne!(def(changed), def("a"), "{changed}");
+        }
+        let plain = crate::reload::sha256_hex(def_text(set.get("a").unwrap()).as_bytes());
+        assert_ne!(def("a"), plain[..16], "keyed, not the plain hash");
     }
 
     /// The lines `f` logs at WARN and above, as the broker's log shows them less the
