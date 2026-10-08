@@ -830,19 +830,24 @@ function renderTrace() {
 }
 
 // The chosen rule's trace topic, a command to watch it with, and the broker's trace rate.
+// Each summary calls this: text is written only when it changes, so a selection made to
+// copy the command survives.
 function renderTraceHead() {
+  const set = (id, text) => {
+    if ($(id).textContent !== text) $(id).textContent = text;
+  };
   const id = state.selected;
   const node = (state.summary && state.summary.node) || (state.list && state.list.node) || "+";
   const topic = `$SYS/brokers/${node}/trace/rules/${id || "<id>"}`;
-  $("trace-topic").textContent = topic;
+  set("trace-topic", topic);
   $("trace-sub").hidden = !id;
-  $("trace-cmd").textContent = id ? `mosquitto_sub -v -t '${topic.replace(/'/g, "'\\''")}'` : "";
+  set("trace-cmd", id ? `mosquitto_sub -v -t '${topic.replace(/'/g, "'\\''")}'` : "");
   const s = state.summary;
   if (s) {
-    $("trace-rate").textContent = s.trace
+    set("trace-rate", s.trace
       ? `At most ${s.trace_rate} records a second, and up to ${s.trace_rate} no_result records ` +
         "more: they have a budget of their own."
-      : "The trace is off on this broker.";
+      : "The trace is off on this broker.");
   }
 }
 
