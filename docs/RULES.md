@@ -402,7 +402,8 @@ Work down the list; each step rules out one cause.
 3. **Does `FROM` match the topic?** `mqttd --rule-test --sql '…' --topic <the topic>` says
    `matches none of the FROM filters` if it does not. A filter that starts with `#` or
    `+` does not match a topic that starts with `$`, and a `FROM` on `$SYS/…` matches
-   nothing at all (the loader warns). The filter is in double quotes:
+   nothing but a Mosquitto bridge's `$SYS/broker/connection/<id>/state` (the loader warns
+   about one that cannot match even that). The filter is in double quotes:
    `FROM "sensors/#"`.
 4. **Was the publish accepted?** Rules run only on publishes the ACL accepts. An MQTT 5
    publisher is told `0x87`; an MQTT 3.1.1 one is not, and the denial is in the audit log.
@@ -417,8 +418,11 @@ Work down the list; each step rules out one cause.
      wildcard or empty, `${.}` met binary data, or the broker refused the message.
    - `ok`: the message was routed. Subscribe to `#` to see the topic it really went to: a
      placeholder for a field the statement did not select renders as `undefined`
-     (`alerts/undefined`). Check the subscriber's filter and ACL, and that a QoS 0
-     republish was not meant for an offline session (QoS 0 is not queued).
+     (`alerts/undefined`). Check the subscriber's filter and ACL, and whether it was
+     connected: a session that does not persist (MQTT 5 Session Expiry 0, or a v3.1.1
+     clean session) gets nothing published while it is away. A persistent one has the
+     message queued, QoS 0 included, up to `limits.max_queued_messages`, and gets it when
+     it reconnects.
 7. **It fires on a republished message?** It never does: a message a rule publishes
    never runs rules. Write the second rule against the original topic.
 
@@ -443,7 +447,7 @@ The [live demo](#the-live-demo) puts all three together.
 |---|---|---|---|
 | `rules.sys_interval_secs` | `MQTTD_RULES_SYS_INTERVAL` | `0`, off | Publish the statistics every this many seconds, 1 to 3600. |
 | `rules.trace` | `MQTTD_RULES_TRACE` | `false` | Publish the trace. |
-| `rules.trace_rate` | `MQTTD_RULES_TRACE_RATE` | `20` | At most this many trace records per rule per second, 1 to 1000. |
+| `rules.trace_rate` | `MQTTD_RULES_TRACE_RATE` | `20` | At most this many passed or failed records per rule per second, and as many again for `no_result`; 1 to 1000. |
 | `rules.admin_writers` | `MQTTD_RULES_ADMIN_WRITERS` (`;`-separated) | empty, no writes | Admin certificate subjects, written as in `admin.operators`, that may write the rules file. They need the operator role too. |
 
 All four are live: an applied reload changes them, and a rejected one leaves them as they were.
@@ -467,18 +471,17 @@ message per rule, enabled or not, on `$SYS/brokers/<node>/rules/<id>`. Subscribe
 mosquitto_sub -h 127.0.0.1 -t '$SYS/brokers/+/rules/#' -v
 ```
 
-<!-- TODO-INTEGRATE: re-capture the two payloads below from the implementation (field
-order, the rates' unit and precision, `username`/`null` forms). -->
-
-The quickstart's `high_temp` rule, ten seconds after the two readings (one line, wrapped
-here):
+The quickstart's `high_temp` rule at the first tick after the two readings, with
+`sys_interval_secs = 10` (one line, wrapped here). Keys arrive in alphabetical order, and
+`def` is per broker process, so yours differs:
 
 ```json
-{"node":"node-local","rule":"high_temp","at":"2026-10-08T12:00:10.000Z","enabled":true,
- "def":"5f0c2d9a41b7e3c8",
- "counts":{"matched":2,"passed":1,"no_result":1,"failed":0,"actions_ok":1,"actions_failed":0},
- "rates":{"matched":0.2,"passed":0.1,"no_result":0.1,"failed":0.0,"actions_ok":0.1,"actions_failed":0.0},
- "last_active_at":"2026-10-08T12:00:10.000Z","last_error":null}
+{"at":"2026-10-08T14:37:30.897Z",
+ "counts":{"actions_failed":0,"actions_ok":1,"failed":0,"matched":2,"no_result":1,"passed":1},
+ "def":"25bb28ee8d743603","enabled":true,"last_active_at":"2026-10-08T14:37:30.897Z",
+ "last_error":null,"node":"node-local",
+ "rates":{"actions_failed":0.0,"actions_ok":0.1,"failed":0.0,"matched":0.2,"no_result":0.1,"passed":0.1},
+ "rule":"high_temp"}
 ```
 
 | Field | Meaning |
@@ -486,24 +489,26 @@ here):
 | `counts.passed`, `.no_result`, `.failed` | `mqttd_rule_evaluations_total{rule,result}` for this rule |
 | `counts.actions_ok`, `.actions_failed` | `mqttd_rule_actions_total{rule,result}` (`ok`, `failed`) for this rule |
 | `counts.matched` | `passed + no_result + failed`: the messages and events the rule's `FROM` selected (EMQX's `matched`) |
-| `rates` | the same, per second, measured over the last interval |
-| `last_active_at` | the tick at which `matched` last grew; `null` when it never has |
-| `last_error` | `null`, or the latest failure's `at` and `kind`: `sql` (the statement failed), `action` (an action could not render, a republish into `$SYS` included) or `delivery` (derived messages were refused or not routed: `actions_failed` grew). While the trace is on it also carries `message`, the error's text truncated to 256 bytes. |
-| `def` | 16 hex digits of a hash of the rule's SQL, actions and `enable`: it changes when the rule does |
+| `rates` | the same, per second over the time measured since the previous tick, rounded to 0.001; 0 at a rule's first tick |
+| `last_active_at` | the tick at which `matched` was last seen to grow; `null` until the statistics see the rule run. What it ran before they were turned on, or before it was deleted and added back, does not count |
+| `last_error` | `null`, or the latest failure's `at` and `kind`: `sql` (the statement failed), `action` (an action could not render, a republish into `$SYS` included) or `delivery` (derived messages were refused or not routed: `actions_failed` grew). Never the error's text, which can quote a payload: that is in the trace (a failed statement's `error`, a failed action's output) and in an operator's `GET /admin/v1/rules` |
+| `def` | 16 hex digits of a hash of the rule's SQL, actions and `enable`, keyed with a random key each broker process draws: it changes when the rule does and at a restart, and it cannot be used to test a guess at the rule's text |
 
 The counts are the Prometheus counters, read without creating a series: cumulative since
 the broker started, keyed by rule id, and per node. A rule that never matched shows zeros,
 an edited rule keeps its id's counts, and a removed rule stops being published. The last
 error of a rule that a reload removed or changed is dropped at the next tick.
 
-The summary:
+The summary, from a broker with the trace on at a rate of 5, after two `SIGHUP`s in a row
+that refused the same broken rules file:
 
 ```json
-{"node":"node-local","at":"2026-10-08T12:00:10.000Z","started_at":"2026-10-08T11:58:02.114Z",
- "interval_secs":10,"rules":1,"enabled":1,
+{"at":"2026-10-08T14:38:00.900Z",
  "digest":"2f027340235af0b20eafed114c6c36869b05aac8568546125274382b66e892ad",
- "trace":false,"trace_rate":20,"trace_dropped":0,"stats_dropped":0,
- "reload":{"at":"2026-10-08T11:59:40.502Z","trigger":"signal","applied":true,"error_kind":null,"repeats":0}}
+ "enabled":1,"interval_secs":10,"node":"node-local",
+ "reload":{"applied":false,"at":"2026-10-08T14:37:59.562Z","error_kind":"rules","repeats":1,"trigger":"signal"},
+ "rules":1,"started_at":"2026-10-08T14:37:20.839Z","stats_dropped":0,"trace":true,
+ "trace_dropped":0,"trace_rate":5}
 ```
 
 - `digest` is the running rules file's SHA-256, the value `--check-rules` prints and
@@ -511,20 +516,34 @@ The summary:
   that an edit is running.
 - `reload` is the last reload attempt since the broker started (`null` before the first):
   its trigger (`signal`, `watch`, `admin`, `admin-rules`), whether it applied, and for a
-  rejected one the kind of error (`rules`, `config`, `acl`, `tls`, …, the component that
-  refused it), never the text, which can quote a configuration line. `repeats` counts the
-  identical attempts in a row, such as the file watcher retrying a broken file every poll.
-  The full error is in the log, and in `GET /admin/v1/rules` for an operator.
+  rejected one the kind of error: the component that refused it (`rules`, `config`, `tls`,
+  `admin tls`, `peer tls`, `client crl`, `gossip crl`, `gossip signer`), or `policy` for
+  an ACL or authenticator error, never the text, which can quote a configuration line.
+  `repeats` counts the rejected attempts in a row that failed the same way (the same
+  trigger and error), such as the file watcher retrying a broken file every poll; an
+  applied reload has 0. The full error is in the log, and in `GET /admin/v1/rules` for an
+  operator.
 - `trace_dropped` and `stats_dropped` count trace records and statistics ticks dropped for
   lack of room (below).
 
-`$SYS` never carries a rule's SQL, description or actions (a rules file can hold secrets,
-such as the salt of a pseudonym), a file path, or an error's text with the trace off.
-Every message is QoS 0 and never retained, so a new subscriber sees the next tick. Each
-takes ingress credit from the node's pool, like a peer's QoS 0 forward: when the pool is
-short, the tick is skipped and counted in `stats_dropped`, so the statistics yield to
-clients under load. They count in `mqttd_publish_received_total{qos="0"}` and
-`mqttd_deliver_latency_seconds` like any publish.
+`$SYS` never carries a rule's SQL, description or actions, a file path, or an error's
+text. A rules file can hold a secret, such as the salt of a pseudonym, and the `digest`
+above is the file's plain SHA-256, which `/statusz` and `mqttd_rules_info` publish too:
+whoever knows the rest of the file can test guesses of the secret against it offline.
+Make a secret in a rules file long and random (`openssl rand -hex 16`), never a name or a
+date.
+
+Every message is QoS 0, never retained, and live only: it reaches the subscribers
+connected when it is published, and is never queued for a persistent session or a shared
+subscription's member that is offline, here or on a node it is forwarded to. A new
+subscriber sees the next tick. Each also carries a Message Expiry Interval of two
+intervals, 10 s at least, so a copy that still waits somewhere (an older node queues one
+during a rolling upgrade) expires. Each takes ingress credit from the node's pool, like a
+peer's QoS 0 forward, summary first: when the pool is short, the rest of the tick is
+skipped (the summary, sent first, may go out alone) and counted in `stats_dropped`, so the
+statistics yield to clients under load. They count in
+`mqttd_publish_received_total{qos="0"}` and `mqttd_deliver_latency_seconds` like any
+publish.
 
 ### The trace
 
@@ -536,23 +555,21 @@ trace_rate = 5
 ```
 
 Each node then publishes, on `$SYS/brokers/<node>/trace/rules/<id>`, a record of what the
-rule did with a message: up to `trace_rate` records per rule per second. The quickstart's
-hot reading:
+rule did with a message: up to `trace_rate` records per rule per second, and as many
+`no_result` ones. The quickstart's hot reading (one line, wrapped here; keys arrive in
+alphabetical order):
 
 ```sh
 mosquitto_sub -h 127.0.0.1 -t '$SYS/brokers/+/trace/rules/high_temp' -v
 ```
 
 ```json
-{"node":"node-local","rule":"high_temp","at":"2026-10-08T12:00:03.217Z",
- "trigger":{"type":"publish","topic":"sensors/kitchen/data","qos":1,"retain":false,
-            "clientid":"kitchen","username":null,"payload":"{\"temp\": 35}",
-            "payload_encoding":"utf8","payload_bytes":12,"truncated":false},
- "result":"passed","error":null,
- "outputs":[{"action":"republish","topic":"alerts/kitchen","qos":1,"retain":false,
-             "payload":"{\"temp\":35,\"clientid\":\"kitchen\",\"qos\":1}",
-             "payload_encoding":"utf8","payload_bytes":40,"truncated":false}],
- "outputs_omitted":0}
+{"at":"2026-10-08T14:37:26.154Z","error":null,"node":"node-local",
+ "outputs":[{"action":"republish","payload":"{\"temp\":35,\"clientid\":\"kitchen\",\"qos\":1}",
+ "payload_bytes":40,"payload_encoding":"utf8","qos":1,"retain":false,"topic":"alerts/kitchen","truncated":false}],
+ "outputs_omitted":0,"result":"passed","rule":"high_temp",
+ "trigger":{"clientid":"kitchen","payload":"{\"temp\": 35}","payload_bytes":12,"payload_encoding":"utf8",
+ "qos":1,"retain":false,"topic":"sensors/kitchen/data","truncated":false,"type":"publish","username":null}}
 ```
 
 - **`trigger`** is a `publish` (topic, QoS, retain flag, client id, username, payload), a
@@ -562,23 +579,30 @@ mosquitto_sub -h 127.0.0.1 -t '$SYS/brokers/+/trace/rules/high_temp' -v
   Topics, client ids and usernames are cut at 256 bytes.
 - **`result`** is `passed`, `no_result` or `failed`, with `error` for a failure.
 - **`outputs`** are what the rule's actions rendered, one per action and output row: a
-  `republish` (topic, QoS, retain flag, payload as above), a `console` (its `output`), or an
-  action that could not render (`{"action_index": 0, "error": "…"}`). At most 16; the rest
-  are counted in `outputs_omitted`. They are what was rendered, not what was delivered: a
-  derived message the broker then refused shows in the counts, not here.
+  `republish` (topic, QoS, retain flag, payload as above), a `console`, whose `output` is
+  the selected fields as a JSON object, or past 1 KiB the first 1 KiB as text with
+  `"output_bytes": <full length>, "truncated": true`, or an action that could not render
+  (`{"action_index": 0, "error": "…"}`). At most 16; the rest are counted in
+  `outputs_omitted`. They are what was rendered, not what was delivered: a derived message
+  the broker then refused shows in the counts, not here.
 
 The trace is bounded: `trace_rate` records per rule per second, with `no_result` records on
-a window of their own so a rule whose `WHERE` rarely passes still shows its passes; at most
-max(`trace_rate`, 200) records per second for the node; a queue of 1,024 records and 4 MiB;
-and node-pool credit for each publish. What does not fit is dropped and counted in the
-summary's `trace_dropped`. With the trace off, the cost is one atomic load per evaluation.
+a window of their own so a rule whose `WHERE` rarely passes still shows its passes (so up
+to twice `trace_rate` in all); at most max(`trace_rate`, 200) records per second for the
+node; a queue of 1,024 records and 4 MiB; and node-pool credit for each publish. What does
+not fit is dropped and counted in the summary's `trace_dropped`. Records still queued when
+the trace is turned off are discarded, uncounted. A record is QoS 0, never retained and
+live only, like the statistics, with a Message Expiry Interval of 10 s. With the trace off,
+the cost is one atomic load per evaluation.
 
 **The trace discloses data.** A subscriber to a rule's trace topic reads every message
 that rule's `FROM` matches, with the publishers' client ids and usernames, whatever its
 own ACL says about those topics. The trace has its own subtree for that reason:
 `$SYS/brokers/+/rules/#` does not cover it, and `$SYS/#` does. Grant it per rule, to whom
-you mean to ([HARDENING.md](HARDENING.md)). Turning it on logs a WARN, and an `INSECURE:`
-line when there is no ACL file or its default is `allow`. Keep it off in production.
+you mean to ([HARDENING.md](HARDENING.md)). Turning it on logs a WARN (`rule trace is ON:
+…`). With no ACL file, or an ACL whose default is `allow`, it also logs an `INSECURE:`
+line, when the trace turns on and again if the reason changes while it is on; a reload that
+changes neither does not repeat it. Keep it off in production.
 
 ### Through the admin API
 
@@ -587,7 +611,7 @@ and `mqttd --admin` verbs ([ADMIN-CLI.md](ADMIN-CLI.md#rules-rules-source-rules-
 
 | Verb | Endpoint | Role | Does |
 |---|---|---|---|
-| `rules` | `GET /admin/v1/rules` | viewer | The running rules with their counts, last activity and last error, the running digest and the one on disk, the load warnings and the last reload. A viewer sees no SQL or actions and no error text. |
+| `rules` | `GET /admin/v1/rules` | viewer | The running rules with their counts, last activity and last error, the running digest and the one on disk, the load warnings and the last reload. A viewer sees no SQL, actions, load warnings or error text. |
 | `rules-source` | `GET /admin/v1/rules/source` | operator | The rules file as it is on disk, verbatim (`> rules.toml` saves it). |
 | — | `POST /admin/v1/rules/check` | operator | Loads a candidate file, or one rule spliced into the file on disk, as the broker would. Writes nothing. |
 | — | `POST /admin/v1/rules/test` | operator | Runs a message through the running rules, a candidate file or one rule (even a disabled one) and returns each rule's result and rendered actions, as the trace shows them. Changes nothing: no counter, no last error, no trace, no log line. |
@@ -598,10 +622,14 @@ and `mqttd --admin` verbs ([ADMIN-CLI.md](ADMIN-CLI.md#rules-rules-source-rules-
 A write needs the operator role **and** a subject in `admin_writers`; with the list empty,
 the default, nothing can write. A write starts from the file on disk, refuses a file that
 does not load before anything is written, and replaces the file atomically: a temporary
-file in the same directory with the old file's mode, the old file kept as `<file>.prev`,
-then a rename. Then the ordinary reload runs (trigger `admin-rules`), and the answer gives
-the digest that is running after it. The next publish runs the new rules, as after a
-`SIGHUP`. Every write is audited (`rules.write`).
+file in the same directory with the old file's mode and group, the old file kept as
+`<file>.prev`, then a rename. When the broker cannot keep the group, the new file loses the
+group bits rather than carry them to another group, and a file the API creates is `0600`.
+Then the ordinary reload runs (trigger `admin-rules`), and the answer gives the digest that
+is running after it. The next publish runs the new rules, as after a `SIGHUP`. Every write
+that changes the file is audited (`rules.write`); one that sends the file as it is writes
+nothing. Writes run one at a time on a node, so two that name the same `if_match` cannot
+both win.
 
 ```sh
 mqttd --admin rules-source > rules.toml           # the file as it is on disk
@@ -729,7 +757,9 @@ mosquitto_sub -h 127.0.0.1 -t '$SYS/brokers/+/rules' -v
 - **Rules never chain.** A message a rule publishes never runs rules, its own or another's.
 - **`$SYS` is the broker's.** A republish that renders a `$SYS` topic fails its action,
   and a `FROM` on `$SYS/…` never matches: clients cannot publish there, and the broker's
-  own `$SYS` messages never run rules. `--check-rules` warns about both.
+  own `$SYS` messages never run rules. `--check-rules` warns about both. The one exception
+  is a Mosquitto bridge's `$SYS/broker/connection/<id>/state`, which clients may publish
+  to, as in Mosquitto.
 
 ---
 
@@ -744,14 +774,15 @@ message therefore lets the publisher choose where the derived message goes:
   `device` on `devices/undefined`. A template that is all placeholders, such as
   `${target}`, can reach any topic except `$SYS/…`, which is reserved for the broker: a
   republish that renders one fails its action
-  (`republish topic is reserved for the broker: $SYS/…`).
+  (`republish topic is reserved for the broker: $SYS/…`). A Mosquitto bridge's
+  `$SYS/broker/connection/<id>/state` is not reserved, so such a template can reach it.
 - The client id and the username are chosen by the client too, unless mTLS or the ACL's
   `connect` rules pin them. `alerts/${clientid}`, as in the example above, publishes on
   `alerts/a/../admin` for a client that connects as `a/../admin`.
 
-A rendered topic with a wildcard, NUL, `$share/` or `$SYS` fails the action, but `/` and
-other `$`-prefixed levels are valid topic names. Let only a plain topic level through, in
-`WHERE`:
+A rendered topic with a wildcard, NUL or `$share/`, or in the reserved `$SYS` tree, fails
+the action, but `/` and other `$`-prefixed levels are valid topic names. Let only a plain
+topic level through, in `WHERE`:
 
 ```sql
 SELECT payload.device AS device, payload
@@ -915,8 +946,9 @@ Unknown keys are errors. The limits are 1,024 rules per file, 16 actions per rul
 written in `regex_match`, `regex_replace` or `regex_extract`; the same pattern written
 twice is compiled once and counts once; past it:
 `more than 96 distinct regular expressions in one rules file`). Each literal costs a
-compile when the file loads, so the file-wide limit keeps a load, a reload or an admin API
-check under about a second and a few hundred MiB. An expression may be at most 256 levels deep, a chain of 256
+compile when the file loads, so the file-wide limit keeps a worst-case load, reload or
+admin API check to about a second and about 120 MiB (measured 0.6-1.1 s, 110-123 MiB).
+An expression may be at most 256 levels deep, a chain of 256
 operands such as `1 + 1 + …` (past it: `expression is more than 256 levels deep`), and
 may nest at most 64 levels of parentheses, signs, `NOT`, function calls or array
 literals inside each other (past it: `expression nests more than 64 levels deep`).
@@ -1004,9 +1036,10 @@ Within the same meaning, mqttd accepts a little more than EMQX: `AND`/`OR`/`NOT`
 ### Messages: `FROM "<topic filter>"`
 
 `FROM` takes MQTT topic filters. `#` and `+` follow MQTT rules, including that a
-leading wildcard does not match a `$`-topic. A filter on `$SYS/…` never matches anything:
-clients cannot publish there and the broker's own `$SYS` messages never run rules, so the
-loader warns (`FROM "$SYS/#" never matches: …`).
+leading wildcard does not match a `$`-topic. A filter on `$SYS/…` matches only a Mosquitto
+bridge's `$SYS/broker/connection/<id>/state`, the one `$SYS` topic clients may publish to:
+the broker's own `$SYS` messages never run rules. A filter that cannot match even that
+never matches anything, and the loader warns (`FROM "$SYS/brokers/#" never matches: …`).
 
 | Field | Value |
 |---|---|
@@ -1132,7 +1165,7 @@ cookbook decodes binary payloads without `subbits`
 
 | Arg | Default (EMQX's) | |
 |---|---|---|
-| `topic` | — (required) | A template. A rendered topic that is empty, has a wildcard, NUL or `$share/`, is in `$SYS` (reserved for the broker), or is over 65,535 bytes fails the action, not the rule; the loader warns when the template's fixed start is already in `$SYS`. A topic built from the publisher's values needs a [guard](#security-values-the-publisher-chooses). |
+| `topic` | — (required) | A template. A rendered topic that is empty, has a wildcard, NUL or `$share/`, is in `$SYS` (reserved for the broker; a Mosquitto bridge's `$SYS/broker/connection/<id>/state` is not), or is over 65,535 bytes fails the action, not the rule; the loader warns when every topic the template can render is reserved. A topic built from the publisher's values needs a [guard](#security-values-the-publisher-chooses). |
 | `qos` | `"${qos}"` | 0, 1, 2 or one placeholder. **The placeholder reads the rule's output, not the input message**, as in EMQX: a rule that does not select `qos` (or `*`) republishes at **QoS 0**. A literal outside 0 to 2 fails the load; a placeholder that renders one fails the action. |
 | `retain` | `"${retain}"` | A boolean or one placeholder. A publish has no `retain` field (it is `flags.retain`), so this defaults to false unless the SQL selects `flags.retain AS retain`. |
 | `payload` | `"${payload}"` | A template. An empty string is the whole output as JSON (`${.}`). `${payload}` keeps a binary payload's exact bytes. An event has no payload: give an event rule's republish one. |
@@ -1277,7 +1310,7 @@ notice.
 | A refused publish | Rules ran on it before it was refused downstream | The hub routes none of its derived messages (unless the refusal is a peer's, arriving later) |
 | Limits on payload-driven work | None beyond the Erlang process's memory | A `FOREACH` iterates at most 10,000 elements; a function may build at most 1 MiB beyond its inputs; `map_put`/`mput` paths have at most 64 segments; timestamps must be renderable in every time zone; expressions at most 256 levels deep and nested at most 64 levels ([The rules file](#the-rules-file)) |
 | Where it runs | Every node | Every node, once per message at the node it arrived at, never on a forwarded copy |
-| `$SYS` messages | The broker's own `$SYS` messages run rules only with `rule_engine.ignore_sys_message = false` (default `true`) | Never run rules. Clients cannot publish to `$SYS`, so a `FROM` on it never matches. The broker publishes only opt-in rule statistics and trace there ([above](#watch-and-edit-rules-live)) |
+| `$SYS` messages | The broker's own `$SYS` messages run rules only with `rule_engine.ignore_sys_message = false` (default `true`) | Never run rules. Clients cannot publish to `$SYS`, except a Mosquitto bridge's `$SYS/broker/connection/<id>/state`, so a `FROM` on any other `$SYS` topic never matches. The broker publishes only opt-in rule statistics and trace there ([above](#watch-and-edit-rules-live)) |
 | Rule statistics | The dashboard and the REST API | `/metrics`; with `sys_interval_secs`, `$SYS/brokers/<node>/rules/<id>`; `GET /admin/v1/rules` |
 | Changing rules | The dashboard and the REST API, applied across the cluster | The rules file, reloaded; for a listed writer, the admin API writes that file, on the node it asks |
 | Testing a rule | The dashboard's SQL test | `mqttd --rule-test` (the statement only), or `POST /admin/v1/rules/test` (the statement and the rendered actions) |

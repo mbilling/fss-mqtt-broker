@@ -122,28 +122,30 @@ Connection: close
 
 ## Errors
 
-Every refusal is `{"error":{"code":"…","message":"…"}}`. Match on `code`; the message is for
-people.
+Every refusal is `{"error":{"code":"…","message":"…"}}`; a rules endpoint adds the `node` to
+the refusals it makes itself (all but a `503`). Match on `code`; the message is for people.
 
 | Status | `code` | When |
 |---|---|---|
 | 400 | `bad-request` | a missing or malformed parameter, a wildcard where a topic name is needed, an invalid filter, an unreadable request |
 | 403 | `forbidden` | the certificate's subject is in no role list, or its role is below the endpoint's |
-| 404 | `not-found` | no such endpoint, or no such session / connection |
+| 404 | `not-found` | no such endpoint, no such session / connection, or no such rule (`DELETE /admin/v1/rule`, `rules/test`'s `only`) |
 | 405 | `method-not-allowed` | a known path with the wrong method |
-| 400 | `topic-reserved` | `rules/test` was given a `$SYS` topic, which no client can publish to |
+| 400 | `topic-reserved` | `rules/test` was given a topic in the broker-reserved `$SYS` tree, which no client can publish to |
 | 403 | `rules-read-only` | a rules write while `[rules] admin_writers` is empty |
 | 403 | `not-a-rules-writer` | a rules write by an operator whose subject is not in `[rules] admin_writers` |
 | 409 | `reload-rejected` | the reloaded config or policy was refused; the running one is kept (the body also carries `outcome`). After a rules write, the file **was** written (`written: true`) and the reload was refused for another reason |
-| 409 | `rules-file-unset` | a rules write on a node with no rules file configured |
-| 409 | `rules-file-invalid` | a per-rule check or write, while the rules file on disk does not load |
-| 409 | `rules-layout-unsupported` | a per-rule write to a file it cannot edit in place: a rule written with dotted keys, inline tables or `[[rules.<id>.actions]]`, or CRLF line ends; replace the whole file instead |
-| 409 | `rules-file-unwritable` | the rules file cannot be replaced: a read-only mount, permissions, another filesystem; the message carries the OS error |
+| 409 | `rules-file-unset` | no rules file is configured (`rules.file` / `MQTTD_RULES_FILE`): `rules/source`, a `check` or `test` with `rule`, and every write |
+| 409 | `rules-file-unreadable` | the configured rules file is missing or cannot be read: `rules/source`, a `check` or `test` with `rule`, and a per-rule `PUT` or `DELETE` (a whole-file `PUT` with `if_match=*` creates a missing file instead) |
+| 409 | `rules-file-invalid` | a per-rule check, test or write while the rules file on disk is not TOML or not the rules file's shape |
+| 409 | `rules-layout-unsupported` | a per-rule check, test or write on a file it cannot edit in place: a rule written with dotted keys, inline tables or `[[rules.<id>.actions]]`, or CRLF line ends; replace the whole file instead |
+| 409 | `rules-file-unwritable` | the rules file cannot be replaced: permissions (EACCES, EPERM), a read-only mount (EROFS), a busy file (EBUSY), another filesystem (EXDEV) or a directory that is gone; nothing was changed; the body adds `os_error` |
 | 412 | `digest-mismatch` | a rules write whose `if_match` is not the digest of the file on disk; the body adds `file_digest` and `running_digest` |
 | 413 | `too-large` | the request exceeds the size limits |
 | 422 | `rules-invalid` | rules text that does not load; `error.details` says where |
 | 428 | `precondition-required` | `PUT /admin/v1/rules` without `if_match` |
 | 500 | `rules-edit-failed` | a per-rule edit would have changed more than that rule; nothing was written |
+| 500 | `rules-write-failed` | writing the rules file failed for another reason than those of `rules-file-unwritable` (a full disk, an I/O error); nothing was changed; the body adds `os_error` |
 | 503 | `unavailable` | a part of the node the endpoint needs is not running or not wired |
 | 503 | `timeout` | the answer took longer than 30 s |
 
@@ -261,9 +263,16 @@ user's view of them.
 
 | Who | May |
 |---|---|
-| viewer | `GET /admin/v1/rules`, without SQL, actions or error text (`redacted: true`) |
+| viewer | `GET /admin/v1/rules`, without SQL, actions, load warnings or error text (`redacted: true`) |
 | operator | everything else that reads or dry-runs: the source, `check`, `test`, and the full `GET` |
 | operator **and** a subject in `[rules] admin_writers` | the writes |
+
+A viewer never gets the SQL or the actions, because a rules file can hold a secret, such as
+a pseudonym's salt. A rule's `def` cannot give one away: it is a hash keyed per broker
+process. The running `digest` is the file's plain SHA-256, though, and `/statusz`,
+`/metrics` and `$SYS` publish it too, so whoever knows the rest of the file can test
+guesses of a secret in it offline. Make a secret in a rules file long and random
+(`openssl rand -hex 16`), never a name or a date.
 
 `admin_writers` (`MQTTD_RULES_ADMIN_WRITERS`, `;`-separated) lists subjects the way
 `admin.operators` does. It is empty by default, and empty means no writes
@@ -287,10 +296,14 @@ there, on purpose. It is required on a whole-file `PUT` and optional on a per-ru
    and stop, having written nothing.
 3. Replace the file atomically. The configured path is resolved first, so a symlink's
    target is replaced, not the link. A new file `.<name>.<pid>.<random>.tmp` is created in
-   the same directory with the old file's mode (and group, when it can), written and
-   fsynced; the old file is kept as `<file>.prev`, with the same mode; the new one is
-   renamed over it, and the directory fsynced. Any failure removes the temporary file and
-   answers `409 rules-file-unwritable` with the OS error.
+   the same directory, written and fsynced, with the old file's mode and group. When the
+   broker cannot give it that group, it keeps the mode without the group bits, so what one
+   group could read never becomes readable by another. A file that did not exist is
+   created with mode `0600`. The old file is kept as `<file>.prev` the same way; the new one
+   is renamed over it, and the directory fsynced. Any failure removes the temporary files
+   and changes nothing: permissions, a read-only mount, a busy file, a cross-device link or
+   a missing directory answer `409 rules-file-unwritable`; any other I/O error answers
+   `500 rules-write-failed`; both carry the OS error in `os_error`.
 4. Run the ordinary reload, with the trigger `admin-rules`, and read the digest of the
    rules that are running after it.
 5. Record `rules.write` in the audit log: the operation, the rule, the old and new digests,
@@ -302,6 +315,16 @@ one written. A reload refused for another reason (a broken ACL file, say) answer
 and fixing the other file and reloading applies it. A `503 timeout` on a write does not
 mean nothing was written: read the file again before retrying. With
 `MQTTD_CONFIG_WATCH` on, the watcher reloads the same file again within one poll, harmlessly.
+
+A write whose text is the file on disk byte for byte writes nothing: `written: false`, no
+`.prev`, no `rules.write` record. It reloads only when the running rules differ from the
+file (otherwise `reload: null` and `applied: true`). `if_match=*` on a missing file creates
+it, with mode `0600`: readable by the broker's user alone. To give it a group, create the
+file yourself first with the mode you want; a write keeps it.
+
+Two writes cannot both win on the same file: the node runs them one at a time, from
+reading the file through the reload, so when two name the same `if_match`, the one that
+runs second gets `412 digest-mismatch` if the first changed the file.
 
 At startup and on every reload the broker logs a WARN when `admin_writers` names someone
 but the rules file's directory is not writable. None of the shipped layouts lets the broker
@@ -316,7 +339,8 @@ and nothing else:
 - a new rule is appended at the end of the file;
 - a delete removes the table's header and keys; the comment lines above its header stay
   where they are, so a file header or a section banner above the first rule survives (and
-  so does that rule's own comment block);
+  so does that rule's own comment block). Inserting a rule and deleting it again gives
+  back the file byte for byte;
 - before anything is written, the old and new text are both loaded and compared: every
   other rule must be unchanged and the edited one exactly as asked, or the answer is
   `500 rules-edit-failed`.
@@ -405,13 +429,14 @@ A row: `node_id`, `replied` (and `error` when not), `admin_addr`, `elapsed_ms`, 
 {
   "answered_by": "mqttd-1",
   "summary": {"nodes": 3, "replied": 3, "ready": 3, "same_cluster_id": true,
-              "same_config": true, "same_membership": true, "same_version": true},
+              "same_config": true, "same_membership": true, "same_rules": true,
+              "same_version": true},
   "nodes": [
     {"node_id": "mqttd-1", "replied": true, "elapsed_ms": 0, "version": "1.0.18", "ready": true,
      "live": true, "cluster_id": "f8995cf8f6cd90e4ab4a321e17c07585", "members": 3,
      "lease_leader": true, "lease_epoch": 1, "replica_lag_groups": 0, "under_replicated": false,
      "brownout": false, "quarantined": false, "swim_isolated": false, "decommissioning": null,
-     "config_checksum": "545674d7…", "proto_max": 9},
+     "config_checksum": "545674d7…", "rules_digest": "2f027340…", "proto_max": 9},
     {"node_id": "mqttd-2", "admin_addr": "mqttd-2:9443", "replied": true, "elapsed_ms": 44, "…": "…"}
   ]
 }
@@ -551,14 +576,17 @@ and the inputs echoed back with `notes`.
 
 The dry run and enforcement share one evaluator, so they cannot disagree. A publish to
 `$SYS` or under `$SYS/` is answered before the ACL is asked, because the broker refuses it
-whatever the ACL says ([ADR 0084](adr/0084-watching-and-editing-rules-live.md) D1):
+whatever the ACL says ([ADR 0084](adr/0084-watching-and-editing-rules-live.md) D1). The
+one exception is a Mosquitto bridge's `$SYS/broker/connection/<id>/state`, which the ACL
+decides like any topic:
 
 ```json
 {"allowed": false, "reason": "reserved: $SYS/ is the broker's (ADR 0084)", "…": "…"}
 ```
 
 A subscribe deny also matches the filter inside `$share/<group>/<filter>`, and the reason
-says so.
+says so. An allow reaches a `$`-rooted `<filter>` only when the pattern's own inner filter
+covers it: `$share/+/#` does not grant `$share/g/$SYS/…`.
 
 ### `GET /admin/v1/config`
 
@@ -658,41 +686,36 @@ Restores the configured filter now. Returns the [`log-level`](#get-adminv1log-le
 
 ### `GET /admin/v1/rules`
 
-<!-- TODO-INTEGRATE: re-capture the rules examples in this section from the implementation
-(field order, `username` and `null` forms, `writable`'s exact meaning). -->
-
 The rules this node runs, with what they have done.
 
 | Field | Meaning |
 |---|---|
 | `digest`, `file_digest`, `in_sync` | the running rules' SHA-256, the SHA-256 of the file on disk now, and whether they are equal |
-| `writable` | whether this node accepts rules writes: `[rules] admin_writers` names someone and a rules file is configured |
-| `rules[]` | in evaluation order (by id): `id`, `enabled`, `description`, `from` (topic filters), `events`, `actions` (how many), `def`, `counts`, `last_active_at`, `last_error`, as on [`$SYS`](RULES.md#statistics-on-sys); for an operator also `sql`, `actions_spec` (the actions as the file writes them, as JSON) and `last_error.message` |
-| `warnings` | the loader's warnings for the running rules |
+| `writable` | `true` only for an operator listed in `[rules] admin_writers`, when a rules file is configured and the broker may write the directory it resolves to (`access(2)`, write and search). Always `false` for a viewer or an operator who is not a writer |
+| `rules[]` | in evaluation order (by id): `id`, `enabled`, `description`, `from` (topic filters), `events`, `actions` (how many), `def`, `counts`, `last_active_at`, `last_error`, as on [`$SYS`](RULES.md#statistics-on-sys); for an operator also `sql`, `actions_spec` (the actions as the file writes them, as JSON) and `last_error.message` (the error's text, at most 256 bytes); for a viewer `redacted: true` |
+| `warnings` | operator only: the loader's warnings for the running rules (a warning can quote SQL text, so a viewer's answer has none) |
 | `reload` | the last reload attempt: `at`, `trigger`, `applied`, `error_kind`, `repeats`, and for an operator `error` (the full text); `null` before the first |
 | `redacted` | `true` in a viewer's answer |
 
-The counts are the same as on `$SYS`, and they are served whether or not the `$SYS`
-statistics are on. An operator's answer:
+The counts are the same as on `$SYS` and are served whether or not the `$SYS` statistics
+are on. `last_active_at` is not: the statistics task sets it, so it is `null` while
+`sys_interval_secs = 0`, however often the rule ran. `sql` and `action` last errors are
+kept either way, but a `delivery` last error is written only by the statistics task. A last
+error about an earlier definition of the rule (another `def`) is not shown. Keys arrive in
+alphabetical order. An operator's answer, statistics off (`def` is per broker process, so
+yours differs):
 
 ```json
-{
-  "node": "mqttd-1", "digest": "2f027340…", "file_digest": "2f027340…", "in_sync": true,
-  "writable": true,
-  "rules": [
-    {"id": "high_temp", "enabled": true, "description": "Alert on hot sensors",
-     "from": ["sensors/+/data"], "events": [], "actions": 1, "def": "5f0c2d9a41b7e3c8",
-     "counts": {"matched": 2, "passed": 1, "no_result": 1, "failed": 0,
-                "actions_ok": 1, "actions_failed": 0},
-     "last_active_at": "2026-10-08T12:00:10.000Z", "last_error": null,
-     "sql": "SELECT payload.temp AS temp, clientid, qos\nFROM \"sensors/+/data\"\nWHERE payload.temp > 30\n",
-     "actions_spec": [{"function": "republish",
-                       "args": {"topic": "alerts/${clientid}", "payload": "${.}"}}]}
-  ],
-  "warnings": [],
-  "reload": {"at": "2026-10-08T11:59:40.502Z", "trigger": "signal", "applied": true,
-             "error_kind": null, "error": null, "repeats": 0}
-}
+{"digest":"2f027340235af0b20eafed114c6c36869b05aac8568546125274382b66e892ad",
+ "file_digest":"2f027340235af0b20eafed114c6c36869b05aac8568546125274382b66e892ad",
+ "in_sync":true,"node":"node-local","reload":null,
+ "rules":[{"actions":1,
+   "actions_spec":[{"args":{"payload":"${.}","topic":"alerts/${clientid}"},"function":"republish"}],
+   "counts":{"actions_failed":0,"actions_ok":1,"failed":0,"matched":2,"no_result":1,"passed":1},
+   "def":"25bb28ee8d743603","description":"Alert on hot sensors","enabled":true,"events":[],
+   "from":["sensors/+/data"],"id":"high_temp","last_active_at":null,"last_error":null,
+   "sql":"SELECT payload.temp AS temp, clientid, qos\nFROM \"sensors/+/data\"\nWHERE payload.temp > 30\n"}],
+ "warnings":[],"writable":true}
 ```
 
 ### `GET /admin/v1/rules/source`
@@ -717,13 +740,17 @@ would say.
 
 `200` when it loads: `{"node", "valid": true, "rules", "enabled", "digest", "warnings"}`,
 the digest being that of the checked text. `422 rules-invalid` when it does not, with the
-body a write would get. `details.scope` is `toml` (the line and column in the file) or
-`sql` (the rule, and the line and column within its `sql` string):
+body a write would get. `details.scope` is `toml` (the line and column in the file), `sql`
+(the rule, and the line and column within its `sql` string), or `rule` (the rule alone: an
+error about its id, its actions or how many it has). A `rule` body's left-out
+`description` and `enable` take the on-disk rule's values, or `""` and `true` for a new
+rule.
 
 ```json
 {"error": {"code": "rules-invalid",
            "message": "rule `high_temp`: expected an expression (line 4, column 1, near `end of statement`)",
-           "details": {"scope": "sql", "rule": "high_temp", "line": 4, "column": 1}}}
+           "details": {"scope": "sql", "rule": "high_temp", "line": 4, "column": 1}},
+ "node": "mqttd-1"}
 ```
 
 ### `POST /admin/v1/rules/test`
@@ -739,13 +766,21 @@ actions included. Nothing changes: no counter, last error, trace or log line.
 | `qos`, `retain`, `clientid`, `username` | the rest of the message |
 | `event` | run against a sample client or session event instead of a publish, as `mqttd --rule-test --event` does |
 
-<!-- TODO-INTEGRATE: state the defaults of qos, retain, clientid and username. -->
+Defaults: `qos` 0, `retain` false, `clientid` `"test-client"`, no `username` (the SQL sees
+`undefined`), `payload_encoding` `utf8`. `topic` and `payload` are required strings even
+with `event`. There, `topic` is a `session.*` sample's filter and may be `""` for a
+`client.*` event, and `event` is `client.connected`, `client.disconnected`,
+`session.subscribed`, `session.unsubscribed` or its `$events/…` topic. An event sample
+carries no peer address (`peername` and `peerhost` are `undefined`); `mqttd --rule-test
+--event` uses 127.0.0.1:52345. Without `rule` or `only`, `results` lists the enabled rules
+whose `FROM` selects the message or event, and leaves the rest out; `no_match` appears
+only for the rule `rule` or `only` names.
 
 Returns `results[]`, one per rule run: `rule`, `enabled` (`false` for a disabled rule run
 anyway), `result` (`passed`, `no_result`, `failed`, or `no_match` with a `reason` when the
 topic matches none of the rule's `FROM` filters), `error`, and `outputs[]` in the trace's
-shape ([RULES.md](RULES.md#the-trace)), with payloads up to 64 KiB. A `$SYS` topic is
-`400 topic-reserved`: no client can publish there.
+shape ([RULES.md](RULES.md#the-trace)), with payloads up to 64 KiB. A topic in the
+broker-reserved `$SYS` tree is `400 topic-reserved`: no client can publish there.
 
 ```json
 {"node": "mqttd-1",
@@ -761,6 +796,7 @@ shape ([RULES.md](RULES.md#the-trace)), with payloads up to 64 KiB. A `$SYS` top
 
 Operator and writer. Replaces the whole rules file ([what a write does](#rules)). Parameter:
 `if_match` (required: the digest of the file on disk, or `*`). Body: `{"source": "…"}`.
+With `*` and no file on disk, it creates the file, with mode `0600`.
 
 ```json
 {"node": "mqttd-1", "written": true, "digest": "8c1d55e0…", "running_digest": "8c1d55e0…",
@@ -773,8 +809,8 @@ A stale `if_match`:
 
 ```json
 {"error": {"code": "digest-mismatch",
-           "message": "the rules file on disk is not the one if_match names; read it again"},
- "file_digest": "8c1d55e0…", "running_digest": "8c1d55e0…"}
+           "message": "the rules file on disk is not the one if_match names: read it again (GET /admin/v1/rules/source) and redo the change"},
+ "node": "mqttd-1", "file_digest": "8c1d55e0…", "running_digest": "8c1d55e0…"}
 ```
 
 ### `PUT /admin/v1/rule`, `DELETE /admin/v1/rule`

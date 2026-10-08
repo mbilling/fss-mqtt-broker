@@ -587,7 +587,7 @@ Memory watermark at 75–85% of the container limit; the container limit is the 
 - grow: start a node · shrink: `SIGUSR1` · replace: grow then shrink · upgrade: one node at a time
 - day 2: [OPERATIONS.md](docs/OPERATIONS.md)
 
-**Hardening** — 52-item baseline with auditor checks: [HARDENING.md](docs/HARDENING.md)
+**Hardening** — 51-item baseline with auditor checks: [HARDENING.md](docs/HARDENING.md)
 - [ ] no `INSECURE:` lines in the startup log
 - [ ] `MQTTD_DATA_DIR` on a volume
 - [ ] no plaintext listener; TLS 1.3; client certs carry `clientAuth` EKU
