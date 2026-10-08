@@ -702,7 +702,7 @@ text), `digest` (its SHA-256: send it back as `if_match`), `running_digest`, `in
 `bytes`.
 
 ```json
-{"node": "mqttd-1", "file": "/etc/mqttd/rules/rules.toml", "bytes": 233,
+{"node": "mqttd-1", "file": "/etc/mqttd/rules/rules.toml", "bytes": 261,
  "digest": "2f027340…", "running_digest": "2f027340…", "in_sync": true,
  "source": "[rules.high_temp]\ndescription = \"Alert on hot sensors\"\nsql = '''\n…"}
 ```

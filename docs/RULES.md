@@ -468,7 +468,7 @@ mosquitto_sub -h 127.0.0.1 -t '$SYS/brokers/+/rules/#' -v
 ```
 
 <!-- TODO-INTEGRATE: re-capture the two payloads below from the implementation (field
-order, rate precision, `username`/`null` forms). -->
+order, the rates' unit and precision, `username`/`null` forms). -->
 
 The quickstart's `high_temp` rule, ten seconds after the two readings (one line, wrapped
 here):
