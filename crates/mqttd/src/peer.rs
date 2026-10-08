@@ -158,6 +158,12 @@ static PEER_CONN_ID: AtomicU64 = AtomicU64::new(1);
 #[derive(Debug, Default)]
 pub struct LinkStats {
     pub busy_ns: AtomicU64,
+    /// Wall time inside each batch's socket `write_all` + `flush`, pending included,
+    /// and nothing else (not the encode, not the batching yield): a write blocked on
+    /// TCP backpressure shows here and not in `busy_ns`, while the write's own CPU
+    /// (TLS, syscall) is in both. Added when the write completes, so a write still
+    /// pending is not counted yet.
+    pub write_wait_ns: AtomicU64,
     pub polls: AtomicU64,
     pub frames_out: AtomicU64,
     pub writes: AtomicU64,
@@ -750,7 +756,7 @@ where
                     // first, and a batch only ever contains frames already
                     // queued on it.
                     Some(msg) => {
-                        let n = write_batch(wh, ctl_buf, &mut ctl_stamps, &msg, ctl_rx, remote).await?;
+                        let n = write_batch(wh, ctl_buf, &mut ctl_stamps, &msg, ctl_rx, remote, stats).await?;
                         stats.frames_out.fetch_add(n, Ordering::Relaxed);
                     }
                     None => return Ok(()), // taken over or hub gone
@@ -773,7 +779,7 @@ where
                     // dies on send would die again on every reconnect). Other I/O
                     // errors still end the link as before.
                     Some(msg) => {
-                        let n = write_batch(wh, out_buf, &mut out_stamps, &msg, out_rx, remote).await?;
+                        let n = write_batch(wh, out_buf, &mut out_stamps, &msg, out_rx, remote, stats).await?;
                         stats.frames_out.fetch_add(n, Ordering::Relaxed);
                     }
                     None => return Ok(()), // taken over or hub gone
@@ -1186,6 +1192,10 @@ const PEER_WRITE_BUDGET: usize = 256 * 1024;
 /// is 16 MiB and a retained snapshot would otherwise leave that capacity
 /// resident on the link for the rest of its life. `stamps` is the same kind of
 /// link-owned scratch, for the batch's stamped replication frames.
+///
+/// Only the `write_all` + `flush` is timed into `stats.write_wait_ns`: the encode
+/// and the yield above are not socket time, and on an idle link that yield is a
+/// run-queue trip per batch that would read as backpressure that is not there.
 async fn write_batch<W: AsyncWrite + Unpin>(
     wh: &mut W,
     buf: &mut Vec<u8>,
@@ -1193,6 +1203,7 @@ async fn write_batch<W: AsyncWrite + Unpin>(
     first: &PeerMessage,
     rx: &mut mpsc::UnboundedReceiver<PeerMessage>,
     remote: &NodeId,
+    stats: &LinkStats,
 ) -> Result<u64, std::io::Error> {
     buf.clear();
     stamps.clear();
@@ -1238,8 +1249,11 @@ async fn write_batch<W: AsyncWrite + Unpin>(
     if buf.is_empty() {
         return Ok(0); // every frame in the batch was refused
     }
+    let started = std::time::Instant::now();
     wh.write_all(buf).await?;
     wh.flush().await?;
+    let waited = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    stats.write_wait_ns.fetch_add(waited, Ordering::Relaxed);
     // Replication transit up to the kernel (#662): queued on this link until
     // the kernel has the bytes. Timed here, not at encode, so the yield,
     // the rest of the batch and a wait on a full send buffer count too.
@@ -1354,6 +1368,7 @@ mod tests {
             &first,
             &mut rx,
             &NodeId("peer".into()),
+            &LinkStats::default(),
         )
         .await
         .unwrap();
@@ -1443,6 +1458,89 @@ mod tests {
         drop(ctl_tx);
         drop(out_tx);
         pump_task.await.expect("pump task").expect("pump exits Ok");
+    }
+
+    /// `write_wait_ns` measures socket pushback: a write held by a peer that does not
+    /// read accrues the hold, a write the peer drains at once accrues next to nothing.
+    #[tokio::test]
+    async fn write_wait_counts_pushback_and_not_a_prompt_write() {
+        /// Writes one bulk frame with `filter` over a duplex of `capacity`, holds the
+        /// reader off for `hold`, then drains it. Returns the link's `write_wait_ns`.
+        async fn wait_ns(capacity: usize, filter: String, hold: Duration) -> u64 {
+            let (mut ours, theirs) = tokio::io::duplex(capacity);
+            let (hub_tx, _hub_rx) = mpsc::unbounded_channel();
+            let (ctl_tx, mut ctl_rx) = mpsc::unbounded_channel::<PeerMessage>();
+            let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+            out_tx
+                .send(PeerMessage::Interest {
+                    filters: vec![filter],
+                })
+                .unwrap();
+            let stats = Arc::new(LinkStats::default());
+            let pump_stats = Arc::clone(&stats);
+            let reply_ctl = ctl_tx.downgrade();
+            let reply_bulk = out_tx.downgrade();
+            let pump_task = tokio::spawn(async move {
+                let (mut rh, mut wh) = tokio::io::split(theirs);
+                let mut buf = BytesMut::new();
+                pump(
+                    &mut rh,
+                    &mut wh,
+                    &mut buf,
+                    &hub_tx,
+                    &NodeId("peer-under-test".into()),
+                    &mut ctl_rx,
+                    &mut out_rx,
+                    &reply_ctl,
+                    &reply_bulk,
+                    &std::sync::atomic::AtomicUsize::new(0),
+                    &pump_stats,
+                    None,
+                    None,
+                )
+                .await
+            });
+            if !hold.is_zero() {
+                // SETTLE(peer-write-wait-hold): the hold IS the pushback under test —
+                // the pump's write sits blocked on a full duplex for this long, and the
+                // assertion is that write_wait_ns accrued it.
+                tokio::time::sleep(hold).await;
+            }
+            let mut buf = BytesMut::new();
+            read_frame(&mut ours, &mut buf)
+                .await
+                .expect("read")
+                .expect("frame");
+            // frames_out is bumped after write_wait_ns, so once it shows the batch the
+            // wait is recorded too.
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while stats.frames_out.load(Ordering::Relaxed) == 0 {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .expect("pump records the batch");
+            drop(ctl_tx);
+            drop(out_tx);
+            pump_task.await.expect("pump task").expect("pump exits Ok");
+            stats.write_wait_ns.load(Ordering::Relaxed)
+        }
+
+        let hold = Duration::from_millis(300);
+        // Case A: a 4 KiB frame into a 64-byte pipe nobody reads until `hold` is over.
+        let blocked = wait_ns(64, "x".repeat(4096), hold).await;
+        // Case B: a small frame into a roomy pipe, read at once.
+        let prompt = wait_ns(1 << 20, "t".into(), Duration::ZERO).await;
+
+        let hold_ns = u64::try_from(hold.as_nanos()).unwrap();
+        assert!(
+            blocked >= hold_ns / 2,
+            "a write held for {hold:?} must accrue most of it, got {blocked} ns"
+        );
+        assert!(
+            prompt < blocked / 4,
+            "a prompt write must accrue far less than a blocked one: {prompt} ns vs {blocked} ns"
+        );
     }
 
     /// ADR 0082 T4 (§3): with the node pool exhausted, an inbound peer `QoS` 0 publish
