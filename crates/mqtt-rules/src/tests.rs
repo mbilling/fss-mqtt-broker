@@ -1487,23 +1487,44 @@ fn a_file_may_compile_only_so_many_distinct_regular_expressions() {
     RuleSet::parse(&text).unwrap_or_else(|e| panic!("{e}"));
 }
 
+/// The longest `\w{n}` this build compiles within the per-pattern size limit. The limit is
+/// fixed, but what a pattern costs against it depends on the regex features the build
+/// unifies: the broker's graph enables `regex-automata/dfa-build` (through
+/// tracing-subscriber's env filter), and with it a far shorter run is the largest that
+/// fits than in `cargo test -p mqtt-rules` alone.
+fn longest_word_run() -> usize {
+    (1..=64)
+        .rev()
+        .find(|n| funcs::compile_regex(&format!("\\w{{{n}}}")).is_ok())
+        .expect("\\w compiles")
+}
+
 /// An identical pattern is compiled once and counts once, wherever it appears: a file
 /// repeating one pattern at the per-pattern size limit far past the budget loads.
 #[test]
 fn identical_regular_expressions_are_compiled_once() {
+    let n = longest_word_run();
+    assert!(
+        funcs::compile_regex(&format!("\\w{{{}}}", n + 1)).is_err(),
+        "\\w{{{n}}} is at the limit"
+    );
+    let at_limit = format!("\\w{{{n}}}");
     let mut pool = parser::RegexPool::default();
-    let first = pool.get("\\w{50}").unwrap();
-    assert!(Arc::ptr_eq(&first, &pool.get("\\w{50}").unwrap()));
-    assert!(!Arc::ptr_eq(&first, &pool.get("\\w{49}").unwrap()));
+    let first = pool.get(&at_limit).unwrap();
+    assert!(Arc::ptr_eq(&first, &pool.get(&at_limit).unwrap()));
+    assert!(!Arc::ptr_eq(
+        &first,
+        &pool.get(&format!("\\w{{{}}}", n - 1)).unwrap()
+    ));
 
-    let worst = vec!["\\w{50}".to_string(); 4 * MAX_REGEX_LITERALS_PER_FILE];
+    let worst = vec![at_limit; 4 * MAX_REGEX_LITERALS_PER_FILE];
     let set = load(&regex_file(&worst, 32));
     assert_eq!(set.len(), 32);
     // Each still works, and a second distinct pattern is still accepted beside it.
     let mut text = regex_file(&worst, 2);
     text.push_str("[rules.other]\nsql = '''SELECT 1 AS x FROM \"t/#\" WHERE regex_match(payload.a, '^b$')'''\n");
     let set = load(&text);
-    let payload = Bytes::from(format!(r#"{{"a":"{}"}}"#, "x".repeat(50)));
+    let payload = Bytes::from(format!(r#"{{"a":"{}"}}"#, "x".repeat(n)));
     let props = mqtt_core::AppProperties::default();
     let (_, log) = effects(&set, &msg("t/1", &payload, &props));
     assert_eq!(log, ["other:no_result", "r0:passed", "r1:passed"]);
