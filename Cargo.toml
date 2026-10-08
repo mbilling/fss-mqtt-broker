@@ -72,6 +72,10 @@ aws-lc-rs = "1"
 x509-parser = "0.18"
 # ACL policy files (ADR 0004 step 3)
 toml = "1.1"
+# Per-rule edits of the rules file through the admin API (ADR 0084): changes one
+# `[rules.<id>]` table and keeps every other byte, comments included. The parser and
+# printer `toml` itself is built on; already in Cargo.lock (via proc-macro-crate).
+toml_edit = "0.25"
 # Collects the PATHS of config keys the strict structs do not know (issue #230 /
 # ADR 0058 T4): one tolerant pass reports every unknown key at once, and the
 # refuse/warn policy is applied to the complete list — replacing the 17 per-struct

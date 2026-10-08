@@ -34,6 +34,7 @@ use mqtt_core::FilterKey;
 use serde::Deserialize;
 
 mod action;
+pub mod edit;
 mod eval;
 mod funcs;
 mod input;
@@ -399,7 +400,7 @@ fn yes() -> bool {
     true
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 struct RuleSchema {
     sql: String,
