@@ -302,8 +302,8 @@ jobs:
       - name: Quickstart smoke (the README's own two-node cluster)
         run: MQTTD_BIN=target/debug/mqttd ./scripts/quickstart-smoke.sh
 
-      # ADR 0063 / issue #251: docs/INTEGRATION.md is the rule-engine replacement
-      # story, and its load-bearing claims (`$share` single delivery incl. a 3.1.1
+      # ADR 0063 / issue #251: docs/INTEGRATION.md is the sink story (the ADR 0083
+      # rule engine has no sinks), and its load-bearing claims (`$share` single delivery incl. a 3.1.1
       # member, retained skipping shared subscriptions, in-order queue-while-down
       # replay) are documented recipes — so they are executed, not trusted.
       - name: Integration blueprint smoke (docs/INTEGRATION.md's external-consumer pattern)

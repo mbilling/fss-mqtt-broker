@@ -173,6 +173,16 @@ struct ChecksumLabel {
     checksum: String,
 }
 
+/// `{rule, result}` for `mqttd_rule_evaluations_total` and `mqttd_rule_actions_total`
+/// (ADR 0083). The one label here that is not a fixed vocabulary, and still bounded:
+/// `rule` is a rule id from the operator's rules file (at most 1024 of them), never a
+/// value a client or a topic can mint. `result` is a fixed set per family.
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct RuleResultLabel {
+    rule: String,
+    result: String,
+}
+
 /// The OpenTelemetry mirror of every metric, recorded alongside the Prometheus handles
 /// so the same measurement is exported via OTLP (ADR 0020). Built from a real SDK meter
 /// when OTLP is enabled, or a no-op meter otherwise (then every record is a no-op).
@@ -255,6 +265,10 @@ struct OtelInstruments {
     restore_state: OtelGauge<i64>,
     foundings: OtelCounter<u64>,
     config_info: OtelGauge<i64>,
+    rule_evaluations: OtelCounter<u64>,
+    rule_actions: OtelCounter<u64>,
+    rules_loaded: OtelGauge<i64>,
+    rules_info: OtelGauge<i64>,
     swim_keys_accepted: OtelGauge<i64>,
     swim_isolated: OtelGauge<i64>,
     peer_proto_min: OtelGauge<i64>,
@@ -350,6 +364,10 @@ impl OtelInstruments {
             restore_state: meter.i64_gauge("restore_state").build(),
             foundings: meter.u64_counter("foundings").build(),
             config_info: meter.i64_gauge("config_info").build(),
+            rule_evaluations: meter.u64_counter("rule_evaluations").build(),
+            rule_actions: meter.u64_counter("rule_actions").build(),
+            rules_loaded: meter.i64_gauge("rules_loaded").build(),
+            rules_info: meter.i64_gauge("rules_info").build(),
             swim_keys_accepted: meter.i64_gauge("swim_keys_accepted").build(),
             swim_isolated: meter.i64_gauge("swim_isolated").build(),
             peer_proto_min: meter.i64_gauge("peer_proto_min").build(),
@@ -531,6 +549,17 @@ pub struct Metrics {
     /// The previously exported checksum label, zeroed when a reload changes it
     /// (so exactly one series is ever at 1).
     config_info_prev: std::sync::Mutex<Option<String>>,
+    /// Rule-engine evaluations (ADR 0083), by rule and result: `passed`, `no_result`
+    /// (the FROM matched, the WHERE did not), `failed` (the SQL raised an error).
+    rule_evaluations_total: Family<RuleResultLabel, Counter>,
+    /// Rule actions run (ADR 0083), by rule and result (`ok`, `failed`).
+    rule_actions_total: Family<RuleResultLabel, Counter>,
+    /// Enabled rules loaded on this node (ADR 0083).
+    rules_loaded: Gauge,
+    /// The loaded rules file's checksum (ADR 0083), `config_info`-style: after a
+    /// rules roll every node must report the same value.
+    rules_info: Family<ChecksumLabel, Gauge>,
+    rules_info_prev: std::sync::Mutex<Option<String>>,
     /// How many SWIM gossip keys this node currently accepts (ADR 0054 T3):
     /// 1 = steady state, 2 = a rotation window is open. Alert when it stays > 1
     /// longer than a rotation should take.
@@ -1215,6 +1244,35 @@ impl Metrics {
             "Checksum of the loaded config file (ADR 0054 T3), build_info-style; \
              after a config roll every node must report the same value",
         );
+        let rule_evaluations_total = register_family(
+            &mut registry,
+            "rule_evaluations",
+            "Rule-engine evaluations (ADR 0083), by rule id and result: passed (the SQL \
+             produced output and the actions ran), no_result (FROM matched, WHERE or an \
+             empty FOREACH produced nothing), failed (the SQL raised an error — the \
+             triggering message is unaffected)",
+        );
+        let rule_actions_total = register_family(
+            &mut registry,
+            "rule_actions",
+            "Rule actions run (ADR 0083), by rule id and result: ok (a console action \
+             logged; a republish the broker accepted and routed), failed (the action could \
+             not render — a bad topic, qos or retain, a payload that is not text — or went \
+             over a message's limits, or the broker refused or dropped its message — a \
+             brownout, a refused original, an ingress shed, a failed durable write; the \
+             triggering message is unaffected)",
+        );
+        let rules_loaded = register_gauge(
+            &mut registry,
+            "rules_loaded",
+            "Enabled rules loaded on this node (ADR 0083)",
+        );
+        let rules_info = register_gauge_family(
+            &mut registry,
+            "rules_info",
+            "Checksum of the loaded rules file (ADR 0083), config_info-style; after a \
+             rules roll every node must report the same value",
+        );
         let swim_keys_accepted = register_gauge(
             &mut registry,
             "swim_keys_accepted",
@@ -1353,6 +1411,11 @@ impl Metrics {
             foundings_total,
             config_info,
             config_info_prev: std::sync::Mutex::new(None),
+            rule_evaluations_total,
+            rule_actions_total,
+            rules_loaded,
+            rules_info,
+            rules_info_prev: std::sync::Mutex::new(None),
             swim_keys_accepted,
             swim_isolated,
             peer_proto_min,
@@ -2152,6 +2215,74 @@ impl Metrics {
             .set(1);
         self.otel
             .config_info
+            .record(1, &[KeyValue::new("checksum", checksum.to_string())]);
+    }
+
+    /// One rule evaluation (ADR 0083): `result` is `passed`, `no_result` or `failed`.
+    /// `rule` is an id from the operator's rules file — bounded by that file.
+    pub fn rule_evaluated(&self, rule: &str, result: &'static str) {
+        self.rule_evaluations_total
+            .get_or_create(&RuleResultLabel {
+                rule: rule.to_string(),
+                result: result.to_string(),
+            })
+            .inc();
+        self.otel.rule_evaluations.add(
+            1,
+            &[
+                KeyValue::new("rule", rule.to_string()),
+                KeyValue::new("result", result),
+            ],
+        );
+    }
+
+    /// One rule action run (ADR 0083): `result` is `ok` or `failed`.
+    pub fn rule_action(&self, rule: &str, result: &'static str) {
+        self.rule_actions_total
+            .get_or_create(&RuleResultLabel {
+                rule: rule.to_string(),
+                result: result.to_string(),
+            })
+            .inc();
+        self.otel.rule_actions.add(
+            1,
+            &[
+                KeyValue::new("rule", rule.to_string()),
+                KeyValue::new("result", result),
+            ],
+        );
+    }
+
+    /// The rules now loaded (ADR 0083): how many are enabled, and the file's
+    /// checksum (empty when no rules file is configured). The previous checksum's
+    /// series is zeroed so exactly one reads 1 per node.
+    ///
+    /// # Panics
+    /// Never in practice: the internal mutex is only held for these few lines.
+    pub fn set_rules_loaded(&self, enabled: usize, checksum: &str) {
+        let n = i64::try_from(enabled).unwrap_or(i64::MAX);
+        self.rules_loaded.set(n);
+        self.otel.rules_loaded.record(n, &[]);
+        let mut prev = self
+            .rules_info_prev
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if prev.as_deref() == Some(checksum) {
+            return;
+        }
+        if let Some(old) = prev.replace(checksum.to_string()) {
+            self.rules_info
+                .get_or_create(&ChecksumLabel { checksum: old })
+                .set(0);
+        }
+        drop(prev);
+        self.rules_info
+            .get_or_create(&ChecksumLabel {
+                checksum: checksum.to_string(),
+            })
+            .set(1);
+        self.otel
+            .rules_info
             .record(1, &[KeyValue::new("checksum", checksum.to_string())]);
     }
 

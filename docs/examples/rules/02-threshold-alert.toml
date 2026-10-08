@@ -1,0 +1,28 @@
+# Recipe 02: a threshold alert with a severity level
+#
+# When a machine reports 75 degrees or more on machines/<machine>/telemetry, publish an
+# alert on alerts/<severity>/<machine> at QoS 1: "critical" from 90, "warning" below
+# that. A reading under 75 produces nothing. The machine id is a level of the topic the
+# device published on (topic(2)), so it is always exactly one topic level.
+#
+# In:  machines/m-7/telemetry  qos=0 retain=0  {"temp": 80.5}
+# Out: alerts/warning/m-7  qos=1 retain=0  {"machine":"m-7","temp":80.5,"alarm":"overheat","severity":"warning"}
+# In:  machines/m-7/telemetry  qos=0 retain=0  {"temp": 95}
+# Out: alerts/critical/m-7  qos=1 retain=0  {"machine":"m-7","temp":95,"alarm":"overheat","severity":"critical"}
+#
+# Tested by crates/mqttd/tests/rules_cookbook.rs; explained in docs/RULES-COOKBOOK.md.
+
+[rules.overheat_alert]
+description = "Alert when a machine runs hot"
+sql = '''
+SELECT
+  topic(2)     AS machine,
+  payload.temp AS temp,
+  'overheat'   AS alarm,
+  CASE WHEN payload.temp >= 90 THEN 'critical' ELSE 'warning' END AS severity
+FROM "machines/+/telemetry"
+WHERE payload.temp >= 75
+'''
+actions = [
+  { function = "republish", args = { topic = "alerts/${severity}/${machine}", qos = 1, payload = "${.}" } },
+]

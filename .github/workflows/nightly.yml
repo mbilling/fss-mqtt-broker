@@ -147,6 +147,10 @@ jobs:
             target: crl_parse # CRL DER (operator file, hot-reloaded)
           - crate: crates/mqtt-auth
             target: acl_parse # ACL TOML (operator file, hot-reloaded)
+          - crate: crates/mqtt-rules
+            target: rules_parse # rules TOML + SQL (operator file, hot-reloaded; ADR 0083)
+          - crate: crates/mqtt-rules
+            target: rules_eval # rule evaluation over publisher-controlled payloads
     # libFuzzer needs nightly rustc. PINNED (not floating @nightly): the 2026-07-24+
     # nightlies ICE in codegen ("not immediate: OperandRef(Uninit ...)", a
     # rustc_codegen_ssa bug) while compiling the tokio-runtime types the mqtt-cluster

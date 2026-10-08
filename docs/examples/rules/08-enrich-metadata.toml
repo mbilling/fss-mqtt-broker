@@ -1,0 +1,35 @@
+# Recipe 08: enrich a reading with who sent it, from where, and when
+#
+# Stamps each counter reading with the publisher's client id, username, IP address, the
+# broker node that received it, a unique message id, and the time it arrived: in
+# milliseconds, as RFC 3339, and as the plant's local time. The local time uses a
+# fixed offset (+02:00); there are no time-zone rules, so daylight saving is not applied.
+# A client that sent no username has none: coalesce() gives it a value, where the JSON
+# would otherwise carry the text "undefined".
+#
+# The id and the times differ on every message.
+#
+# In:  plant/line-a/counter  qos=0 retain=0  {"count": 1042}
+# Out: enriched/line-a/counter  qos=0 retain=0  {"line":"line-a","count":1042,"meta":{"clientid":"plc-12","username":"anonymous","ip":"127.0.0.1","broker":"node-local","msg_id":"00065D42D9C3E9B22670C4A000000000","received_ms":1791391562983,"received_at":"2026-10-07T16:46:02.983+00:00","plant_time":"2026-10-07 18:46:02"}}
+#
+# Tested by crates/mqttd/tests/rules_cookbook.rs; explained in docs/RULES-COOKBOOK.md.
+
+[rules.enrich_counter]
+description = "Attach client, network and time metadata"
+sql = '''
+SELECT
+  topic(2)      AS line,
+  payload.count AS count,
+  clientid      AS meta.clientid,
+  coalesce(username, 'anonymous') AS meta.username,
+  peerhost      AS meta.ip,
+  node          AS meta.broker,
+  id            AS meta.msg_id,
+  timestamp     AS meta.received_ms,
+  unix_ts_to_rfc3339(timestamp, 'millisecond') AS meta.received_at,
+  format_date('millisecond', '+02:00', '%Y-%m-%d %H:%M:%S', timestamp) AS meta.plant_time
+FROM "plant/+/counter"
+'''
+actions = [
+  { function = "republish", args = { topic = "enriched/${line}/counter", payload = "${.}" } },
+]

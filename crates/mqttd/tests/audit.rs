@@ -50,6 +50,7 @@ async fn start_node(
         metrics: None,
         enhanced: None,
         ingress: None,
+        rules: None,
     });
 
     let (hub, hub_tx) = Hub::with_config(

@@ -3,8 +3,9 @@
 
 Reads EMQX's HOCON configuration (`emqx.conf`, or the dashboard-managed
 `data/configs/cluster.hocon`) and, with `--acl-file`, the Erlang-term `acl.conf`.
-Emits an mqttd TOML config, an mqttd ACL policy, and — with `--out-bridge` — an
-`mqtt-bridge` config for the MQTT bridges it can express.
+Emits an mqttd TOML config, an mqttd ACL policy, — with `--out-bridge` — an
+`mqtt-bridge` config for the MQTT bridges it can express, and — with `--out-rules` — an
+mqttd rules file for the rule engine's rules (ADR 0083).
 
 ## What it is: a DRAFT, where anything undecidable is INERT and named
 
@@ -16,9 +17,12 @@ believing the policy came across.
 Anything not translated is emitted as a `# TODO(migrate):` comment at the point
 it belongs, so the gap is visible in the file you are about to deploy rather than
 in a report you read once. EMQX has a great deal that mqttd deliberately does not
-have — the SQL rule engine, data integration, gateways, exhook, plugins, zones,
-the dashboard and REST API — and every one of those becomes a TODO naming what you
-must decide, not an omission.
+have — data integration sinks, gateways, exhook, plugins, zones, the dashboard and
+REST API — and every one of those becomes a TODO naming what you must decide, not an
+omission. The SQL rule engine is the exception that DOES map: mqttd's rule engine
+speaks EMQX's rule SQL (ADR 0083, docs/RULES.md), so `--out-rules` carries each rule's
+SQL verbatim with its `republish` / `console` actions, and turns everything else — a
+sink action, a construct mqttd's engine lacks — into a TODO.
 
 **Every security-relevant value goes through one gate.** Three adversarial review
 rounds each fixed what they were shown and the count went up, because "every input
@@ -53,7 +57,8 @@ and silence there means "look in cluster.hocon", never "there was no auth".
 
     scripts/migrate/from-emqx.py /etc/emqx/emqx.conf \\
         --acl-file /etc/emqx/acl.conf \\
-        --out-config mqttd.toml --out-acl acl.toml --out-bridge bridge.toml
+        --out-config mqttd.toml --out-acl acl.toml --out-bridge bridge.toml \\
+        --out-rules rules.toml
 
     # Review, then validate before deploying — this never writes a config the
     # broker has not been asked to check:
@@ -66,6 +71,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -617,11 +623,6 @@ DIRECT: dict[str, tuple[str, str, str]] = {
 # Whole EMQX sections with no mqttd equivalent. Reported once per section, with the
 # key count, so a 400-line rule_engine block is one honest TODO instead of 400.
 SECTION_NO_EQUIVALENT: dict[str, str] = {
-    "rule_engine": "EMQX's SQL rule engine has no mqttd equivalent — mqttd is a "
-    "broker, not an integration platform. Each rule must be reproduced OUTSIDE the "
-    "broker (an ordinary MQTT client that subscribes, transforms and republishes), or "
-    "keep EMQX for that path. Decide per rule before cutover; a rule you forget is a "
-    "data pipeline that silently stops",
     "connectors": "EMQX data integration (connectors). Only MQTT-type connectors have "
     "an mqttd analogue (mqtt-bridge, see --out-bridge); Kafka/HTTP/JDBC/S3/... sinks "
     "must move to a client-side consumer you own",
@@ -984,6 +985,9 @@ class Conversion:
     acl_default_source: str | None = None
     acl_default_todo: str | None = None
     bridges: list[BridgeUpstream] = field(default_factory=list)
+    rules: list["RuleDraft"] = field(default_factory=list)
+    # Notes and TODOs for the rules FILE (they belong where the rules are deployed).
+    rule_todos: list[str] = field(default_factory=list)
     saw_auth: bool = False
     saw_authz: bool = False
     prov: Provenance = field(default_factory=Provenance)
@@ -2298,6 +2302,7 @@ def convert_mqtt_and_misc(tree: dict, conv: Conversion) -> None:
         "authentication",
         "authorization",
         "cluster",
+        "rule_engine",
         "bridges",
         "connectors",
         "actions",
@@ -2612,6 +2617,247 @@ def collect_bridge_tls(up: BridgeUpstream, body: dict, where: str) -> None:
             "connecting in the clear already — check before you uncomment"
         )
     )
+
+
+# ---------------------------------------------------------------------------
+# The rule engine (ADR 0083): EMQX rule SQL is mqttd rule SQL.
+# ---------------------------------------------------------------------------
+
+# EMQX built-in functions mqttd's rule engine does not implement (docs/RULES.md lists the
+# same set, and `mqttd --check-rules` refuses a rule calling one). A rule using one is
+# emitted COMMENTED OUT with a TODO rather than live: a rules file loads all-or-nothing,
+# so one unsupported call would otherwise make the broker refuse every rule.
+RULE_FUNCS_UNSUPPORTED = (
+    "jq", "gzip", "gunzip", "zip", "unzip", "zip_compress", "zip_uncompress",
+    "lz4_compress", "lz4_uncompress", "subbits", "bitsize", "bytesize", "byteszie",
+    "schema_encode", "schema_decode", "schema_check", "sparkplug_encode",
+    "sparkplug_decode", "maptab_lookup", "mongo_date", "getenv",
+    "map_to_redis_hset_args", "join_to_sql_values_string", "contains_topic",
+    "contains_topic_match", "str_utf16_le_decode",
+)
+
+# The `$events/...` topics mqttd's engine selects, in both EMQX spellings.
+RULE_EVENTS_SUPPORTED = (
+    "client/connected", "client_connected", "client/disconnected", "client_disconnected",
+    "session/subscribed", "session_subscribed", "session/unsubscribed",
+    "session_unsubscribed",
+)
+
+REPUBLISH_ARGS = (
+    "topic", "qos", "retain", "payload", "user_properties", "mqtt_properties",
+    "direct_dispatch",
+)
+
+
+@dataclass
+class RuleDraft:
+    """One EMQX rule on its way into an mqttd rules file."""
+
+    rid: str
+    sql: str
+    enable: bool
+    description: str
+    actions: list[str]
+    todos: list[str]
+    # Why the rule is emitted commented out, when it is.
+    blocked: str | None = None
+
+
+def _toml_inline_value(v: object) -> str:
+    """A HOCON value (the reader yields strings, lists and dicts) as a TOML inline value."""
+    if isinstance(v, dict):
+        return "{ " + ", ".join(f"{toml_str(k)} = {_toml_inline_value(x)}" for k, x in v.items()) + " }"
+    if isinstance(v, list):
+        return "[" + ", ".join(_toml_inline_value(x) for x in v) + "]"
+    return toml_str(v)
+
+
+def _rule_sql_blockers(sql: str) -> str | None:
+    """Why mqttd's engine would refuse this statement, for the constructs it lacks."""
+    for m in re.finditer(r'["\'](\$(?:events|bridges)/[^"\']*)["\']', sql):
+        topic = m.group(1)
+        if topic.startswith("$bridges/"):
+            return (
+                f"it selects FROM {topic!r}, an EMQX data-bridge source; mqttd has no data "
+                "bridges. An MQTT source maps onto mqtt-bridge (--out-bridge) delivering into "
+                "a topic this rule can select instead"
+            )
+        if topic[len("$events/"):] not in RULE_EVENTS_SUPPORTED:
+            return (
+                f"it selects FROM the event {topic!r}, which mqttd's rule engine does not "
+                "raise (it raises client/connected, client/disconnected, session/subscribed "
+                "and session/unsubscribed)"
+            )
+    for fn in RULE_FUNCS_UNSUPPORTED:
+        if re.search(rf"\b{fn}\s*\(", sql):
+            return f"it calls {fn}(), which mqttd's rule engine does not implement"
+    return None
+
+
+def _republish_args(args: object, rid: str, todos: list[str]) -> str:
+    """EMQX republish args as an mqttd inline table; unknown args become TODOs."""
+    if not isinstance(args, dict):
+        todos.append(f"rule {rid}: a republish action without an `args` block has no topic")
+        return "{ }"
+    out: list[str] = []
+    for k, v in args.items():
+        if k not in REPUBLISH_ARGS:
+            todos.append(
+                f"rule {rid}: republish argument {k} = {v!r} has no mqttd equivalent and was "
+                "not carried"
+            )
+            continue
+        if k == "qos" and isinstance(v, str) and v.strip() in ("0", "1", "2"):
+            out.append(f"qos = {v.strip()}")
+        elif k in ("retain", "direct_dispatch") and isinstance(v, str) and v.strip() in (
+            "true",
+            "false",
+        ):
+            out.append(f"{k} = {v.strip()}")
+        elif k == "mqtt_properties" and isinstance(v, dict):
+            out.append(f"mqtt_properties = {_toml_inline_value(v)}")
+        else:
+            out.append(f"{k} = {_toml_inline_value(v)}")
+    return "{ " + ", ".join(out) + " }"
+
+
+def convert_rules(tree: dict, conv: Conversion) -> None:
+    """EMQX's `rule_engine` block into mqttd rules (ADR 0083; rendered with --out-rules)."""
+    root = tree.get("rule_engine")
+    if not isinstance(root, dict):
+        return
+    for key, value in root.items():
+        if key == "rules":
+            continue
+        if key == "ignore_sys_message":
+            conv.rule_todos.append(
+                f"rule_engine.ignore_sys_message = {value}: mqttd publishes no $SYS messages, "
+                "so a rule never sees one — the same behaviour as EMQX's default (true)"
+            )
+        elif key.startswith("jq_"):
+            conv.rule_todos.append(
+                f"rule_engine.{key}: mqttd's rule engine has no jq() function, so there is "
+                "nothing to configure"
+            )
+        else:
+            conv.rule_todos.append(f"rule_engine.{key} = {value!r}: no mqttd equivalent")
+    rules = root.get("rules")
+    if not isinstance(rules, dict):
+        return
+    for rid, body in rules.items():
+        todos: list[str] = []
+        if not isinstance(body, dict):
+            conv.rule_todos.append(f"rule {rid}: not a rule definition, skipped")
+            continue
+        sql = body.get("sql")
+        sql = sql.strip() if isinstance(sql, str) else ""
+        blocked: str | None = None
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_-]{0,63}", str(rid)):
+            blocked = (
+                "its id is not an mqttd rule id (a letter or `_`, then up to 63 letters, "
+                "digits, `_` or `-`) — rename it"
+            )
+        elif not sql:
+            blocked = (
+                "its `sql` could not be read (this converter's HOCON reader does not take "
+                "triple-quoted strings) — copy the statement from EMQX by hand"
+            )
+        else:
+            blocked = _rule_sql_blockers(sql)
+        for k, v in body.items():
+            if k not in ("sql", "actions", "enable", "description", "metadata", "name"):
+                todos.append(f"rule {rid}: {k} = {v!r} has no mqttd equivalent and was not carried")
+        actions: list[str] = []
+        raw_actions = body.get("actions", [])
+        if not isinstance(raw_actions, list):
+            raw_actions = [raw_actions]
+        for a in raw_actions:
+            if isinstance(a, str):
+                todos.append(
+                    f"rule {rid}: action {a!r} is a data-integration sink; mqttd has no sinks "
+                    "(ADR 0083). Republish to a topic and consume it with a $share consumer "
+                    "group (docs/INTEGRATION.md) — or, for an MQTT sink, carry it with "
+                    "mqtt-bridge (--out-bridge)"
+                )
+                continue
+            if not isinstance(a, dict):
+                todos.append(f"rule {rid}: action {a!r} not understood, not carried")
+                continue
+            fn = str(a.get("function", "")).strip()
+            if fn.endswith("republish"):
+                actions.append(
+                    '{ function = "republish", args = '
+                    + _republish_args(a.get("args"), str(rid), todos)
+                    + " }"
+                )
+            elif fn.endswith("console"):
+                actions.append('{ function = "console" }')
+            else:
+                todos.append(
+                    f"rule {rid}: action function {fn!r} is not a built-in mqttd supports "
+                    "(republish, console) — not carried"
+                )
+        conv.rules.append(
+            RuleDraft(
+                rid=str(rid),
+                sql=sql,
+                enable=str(body.get("enable", "true")).strip() != "false",
+                description=str(body.get("description", "")),
+                actions=actions,
+                todos=todos,
+                blocked=blocked,
+            )
+        )
+
+
+def render_rules(conv: Conversion) -> str:
+    out = [
+        "# Translated from EMQX's rule engine by the mqttd EMQX converter",
+        "# (scripts/migrate/from-emqx.py). " + VERSIONS + ".",
+        "#",
+        *DRAFT_HEADER,
+        "#",
+        "# mqttd's rule engine speaks EMQX's rule SQL (ADR 0083, docs/RULES.md): each",
+        "# statement below is carried VERBATIM. Validate before deploying — the broker loads",
+        "# a rules file all-or-nothing:",
+        "#     mqttd --check-rules this-file.toml",
+        "# and try a statement against a sample message with `mqttd --rule-test`.",
+        "#",
+        "# Differences worth knowing before cutover (docs/RULES.md has the full list): a",
+        "# republished message never re-triggers a rule (EMQX's direct_dispatch, always on);",
+        "# there are no data-integration sinks; a rule that calls a function or selects an",
+        "# event mqttd lacks is emitted COMMENTED OUT below with the reason.",
+        "",
+    ]
+    for t in conv.rule_todos:
+        out.append(f"# TODO(migrate): {comment_safe(t)}")
+    if conv.rule_todos:
+        out.append("")
+    for r in conv.rules:
+        for t in r.todos:
+            out.append(f"# TODO(migrate): {comment_safe(t)}")
+        lines = [f"[rules.{r.rid}]"]
+        if r.description:
+            lines.append(f"description = {toml_str(r.description)}")
+        if not r.enable:
+            lines.append("enable = false")
+        lines.append(f"sql = {toml_str(r.sql)}")
+        if r.actions:
+            lines.append("actions = [")
+            lines.extend(f"  {a}," for a in r.actions)
+            lines.append("]")
+        if r.blocked:
+            out.append(
+                f"# TODO(migrate): rule {comment_safe(r.rid)} is COMMENTED OUT because "
+                f"{comment_safe(r.blocked)}"
+            )
+            out.extend("# " + comment_safe(ln) for ln in lines)
+        else:
+            out.extend(lines)
+        out.append("")
+    if not conv.rules:
+        out.append("# (the input defined no rules)")
+    return "\n".join(out) + "\n"
 
 
 def convert_bridges(tree: dict, conv: Conversion) -> None:
@@ -3563,6 +3809,11 @@ def render_config(conv: Conversion, tls_lines: list[str]) -> str:
     if tls_lines:
         out.extend(tls_lines)
         out.append("")
+    rules = conv.config.get("rules") or {}
+    if rules:
+        out.append("[rules]")
+        out.extend(_table(rules))
+        out.append("")
     return "\n".join(out) + "\n"
 
 
@@ -3696,6 +3947,11 @@ def main() -> int:
         "--out-bridge", type=Path, help="write an mqtt-bridge config for MQTT bridges here"
     )
     ap.add_argument(
+        "--out-rules",
+        type=Path,
+        help="write an mqttd rules file (ADR 0083) for the rule engine's rules here",
+    )
+    ap.add_argument(
         "--acl-file",
         type=Path,
         help="the Erlang-term acl.conf (overrides authorization.sources[].path)",
@@ -3769,10 +4025,30 @@ def main() -> int:
     convert_authz(tree, conv)
     convert_cluster(tree, conv)
     convert_bridges(tree, conv)
+    convert_rules(tree, conv)
     convert_mqtt_and_misc(tree, conv)
     tls_lines, tls_todos = convert_tls(conv)
     for t in tls_todos:
         conv.todo(t)
+    if conv.rules and not args.out_rules:
+        conv.todo(
+            f"[rule_engine] ({len(conv.rules)} rule(s) found): mqttd's rule engine speaks "
+            "EMQX's rule SQL (ADR 0083, docs/RULES.md), but NOTHING about these rules is in "
+            "this file — rules live in their own file. Re-run with --out-rules <path> to get "
+            "it: each statement carried verbatim with its republish/console actions, and a "
+            "TODO for every sink action and every construct mqttd's engine lacks"
+        )
+    elif conv.rules:
+        conv.config.setdefault("rules", {})["file"] = Emitted(
+            "file", toml_str("/etc/mqttd/rules.toml"), None, None, live=True
+        )
+        live = sum(1 for r in conv.rules if not r.blocked)
+        conv.note(
+            f"{len(conv.rules)} EMQX rule(s) were written to {args.out_rules}: {live} live, "
+            f"{len(conv.rules) - live} commented out with the reason (read its TODOs). "
+            "[rules] file below names the converter's deployment default for it — install "
+            "it there (or change the path), and run `mqttd --check-rules` on it before cutover"
+        )
     if conv.bridges and not args.out_bridge:
         conv.todo(
             f"{len(conv.bridges)} MQTT bridge(s) were found in this configuration and "
@@ -3946,6 +4222,11 @@ def main() -> int:
     if args.out_bridge:
         args.out_bridge.write_text(render_bridge(conv), encoding="utf-8")
         print(f"wrote {args.out_bridge} ({len(conv.bridges)} upstreams)")
+
+    if args.out_rules:
+        args.out_rules.write_text(render_rules(conv), encoding="utf-8")
+        live = sum(1 for r in conv.rules if not r.blocked)
+        print(f"wrote {args.out_rules} ({live} rules live, {len(conv.rules) - live} commented out)")
 
     if args.provenance_json:
         args.provenance_json.write_text(

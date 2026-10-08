@@ -4,6 +4,7 @@
 - **Date:** 2026-08-18
 - **Deciders:** project maintainers
 - **Delivery:** [docs/delivery/0063-external-consumer-integration.md](../delivery/0063-external-consumer-integration.md) — plan, progress, and changelog
+- **Superseded in part by:** [ADR 0083](0083-rule-engine.md) — §1's "no built-in rule engine" clause; the no-sinks clause and §2's consumer-group pattern stand
 - **Related:** [ADR 0010](0010-shared-subscriptions.md) / [ADR 0015](0015-cluster-shared-subscriptions.md)
   (the shared-subscription selection and cluster-wide single delivery the pattern rides on),
   [ADR 0029](0029-durable-by-default.md) (the durable session queue that is the pattern's
@@ -38,6 +39,12 @@ substantiation.
    its durability, refusal and audit contracts; a sink half-owned by the broker would
    either dilute those contracts or grow a second product inside this one — during the
    pre-1.0 surface freeze (ADR 0058), the wrong trade in both directions.
+
+   > **Superseded in part by [ADR 0083](0083-rule-engine.md) (2026-10-07).** mqttd now
+   > has a rule engine: EMQX's rule SQL, evaluated in the broker, with `republish` and
+   > `console` as its only actions. The rest of this decision stands: no built-in
+   > Kafka/webhook sinks, for the reasons above, and §2's consumer group is the way a
+   > rule's output, like any message, leaves the broker.
 
 2. **The supported integration path is the external-consumer pattern, and it is a
    committed, tested deliverable — not a shrug.** A sink (Kafka, webhook, DB, anything)

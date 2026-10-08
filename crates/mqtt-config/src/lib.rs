@@ -47,6 +47,8 @@ pub struct Config {
     pub audit: Audit,
     /// The authenticated admin API (ADR 0081).
     pub admin: Admin,
+    /// The rule engine (ADR 0083).
+    pub rules: Rules,
     /// The unknown key paths the last parse IGNORED under
     /// [`UnknownConfigKeys::Warn`] (issue #230) — carried here so the caller can
     /// log them loudly without a signature change. Never serialized; empty under
@@ -615,6 +617,18 @@ pub struct Admin {
     pub peer_port: Option<u16>,
 }
 
+/// The rule engine ([ADR 0083](../../../docs/adr/0083-rule-engine.md)): EMQX-compatible
+/// rule SQL evaluated on every publish, with `republish` and `console` actions
+/// (`docs/RULES.md`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Rules {
+    /// The rules file (`MQTTD_RULES_FILE`), a TOML file of `[rules.<id>]` tables. Unset =
+    /// no rules. Hot-reloadable: `SIGHUP` (or the config watch) re-reads it, validating
+    /// before the swap — a file that does not load keeps the running rules.
+    pub file: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Backup {
@@ -1082,12 +1096,21 @@ impl Config {
         if unknown.is_empty() {
             return Ok(cfg);
         }
+        // A rule written straight into the config (`[rules.<id>]` beside `[rules]`)
+        // is the natural mistake: the two share a name. Say where rules go.
+        let rules_hint = if unknown.iter().any(|k| k.starts_with("rules.")) {
+            ". Rules are not written in this file: put the [rules.<id>] tables in a \
+             rules file of their own and point [rules] file (MQTTD_RULES_FILE) at it \
+             (docs/RULES.md)"
+        } else {
+            ""
+        };
         match env_policy.unwrap_or(cfg.runtime.config_unknown_keys) {
             UnknownConfigKeys::Refuse => Err(ConfigError::Parse(format!(
                 "unknown config key(s): {} — a typo, or a config written for a NEWER \
                  broker version; set runtime.config_unknown_keys = \"warn\" (or \
                  MQTTD_CONFIG_UNKNOWN_KEYS=warn) to boot anyway during a rollback or \
-                 mixed-version window, ignored keys logged (ADR 0058 T4)",
+                 mixed-version window, ignored keys logged (ADR 0058 T4){rules_hint}",
                 unknown.join(", ")
             ))),
             UnknownConfigKeys::Warn => {
@@ -1577,6 +1600,10 @@ impl Config {
         // -- backup (ADR 0062) --
         on!("MQTTD_AUDIT_SYSLOG", v, {
             self.audit.syslog = Some(v);
+        });
+        // -- rule engine (ADR 0083) --
+        on!("MQTTD_RULES_FILE", v, {
+            self.rules.file = Some(v);
         });
         // -- admin API (ADR 0081) --
         on!("MQTTD_ADMIN_BIND", v, {
@@ -2189,6 +2216,8 @@ pub const ENV_VARS: &[&str] = &[
     "MQTTD_CONFIG_UNKNOWN_KEYS",
     // audit (ADR 0066 T3)
     "MQTTD_AUDIT_SYSLOG",
+    // rule engine (ADR 0083)
+    "MQTTD_RULES_FILE",
     // admin API (ADR 0081)
     "MQTTD_ADMIN_BIND",
     "MQTTD_ADMIN_CERT",
@@ -2340,6 +2369,24 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("security.allow_anonymus"), "{msg}");
         assert!(msg.contains("config_unknown_keys"), "{msg}");
+    }
+
+    /// ADR 0083: a rule written straight into the config — `[rules.<id>]` beside
+    /// `[rules]`, which share a name — is refused with where rules go instead.
+    #[test]
+    fn a_rule_written_into_the_config_is_refused_with_where_rules_go() {
+        let err = Config::from_toml("[rules.high_temp]\nsql = 'SELECT * FROM \"t\"'\n")
+            .expect_err("a rule is not a config key");
+        let msg = err.to_string();
+        assert!(msg.contains("rules.high_temp"), "{msg}");
+        assert!(msg.contains("rules file of their own"), "{msg}");
+        let typo = Config::from_toml("[security]\nallow_anonymus = true\n")
+            .expect_err("unknown key")
+            .to_string();
+        assert!(
+            !typo.contains("rules file"),
+            "only a rules key gets the hint: {typo}"
+        );
     }
 
     /// Issue #230 / ADR 0058 T4: the refusal lists EVERY unknown key at once —
@@ -3136,8 +3183,9 @@ mod tests {
             // plus MQTTD_REPLICAS (ADR 0080),
             // plus the seven MQTTD_ADMIN_* variables (ADR 0081).
             // plus MQTTD_HUB_INGRESS_BYTES, MQTTD_CONN_INGRESS_BYTES and
-            // MQTTD_INGRESS_OVERLOAD (ADR 0082 T3).
-            112,
+            // MQTTD_INGRESS_OVERLOAD (ADR 0082 T3),
+            // plus MQTTD_RULES_FILE (ADR 0083).
+            113,
             "the MQTTD_* surface changed — update ENV_VARS"
         );
         // Issue #239: MQTTD_MIN_REPLICAS was wired in `overlay_from` but never

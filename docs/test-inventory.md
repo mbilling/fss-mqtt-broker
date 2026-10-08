@@ -732,7 +732,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 
 - `publish_codec_round_trip_clears_the_floor`
 
-## `crates/mqtt-config/src/lib.rs` — 40 test(s)
+## `crates/mqtt-config/src/lib.rs` — 41 test(s)
 
 - `tests::a_backup_dir_inside_the_data_dir_is_a_config_error`
 - `tests::a_bad_enum_value_is_rejected`
@@ -740,6 +740,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::a_clustered_node_refuses_a_packet_size_it_cannot_forward`
 - `tests::a_crl_without_its_ca_is_rejected`
 - `tests::a_full_toml_round_trips`
+- `tests::a_rule_written_into_the_config_is_refused_with_where_rules_go`
 - `tests::a_swim_bind_requires_a_peer_bind`
 - `tests::a_type_mismatch_is_rejected`
 - `tests::an_unknown_key_is_rejected`
@@ -878,6 +879,83 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::recording_sink_captures_events_in_order`
 - `tests::sink_records_through_a_trait_object`
 - `tests::tampering_with_any_field_changes_the_head`
+
+## `crates/mqtt-rules/src/lib.rs` — 74 test(s)
+
+- `funcs::tests::erlang_replacements_translate`
+- `funcs::tests::function_names_are_unique`
+- `funcs::tests::md5_known_answers`
+- `funcs::tests::offsets_parse`
+- `lexer::tests::operators`
+- `lexer::tests::quotes_follow_emqx`
+- `lexer::tests::ranges_numbers_and_comments`
+- `template::tests::quoted_keys`
+- `template::tests::renders_paths_and_missing_values`
+- `template::tests::this_is_the_whole_output`
+- `tests::a_bad_rendered_topic_fails_the_action_not_the_rule`
+- `tests::a_literal_qos_or_retain_that_can_never_be_valid_fails_the_load`
+- `tests::a_message_has_one_timestamp_however_often_it_is_read`
+- `tests::a_messages_effects_share_one_byte_budget`
+- `tests::a_non_json_payload_fails_only_rules_that_reach_into_it`
+- `tests::arithmetic_follows_erlang`
+- `tests::case_expression_emqx_docs`
+- `tests::comments_and_case_insensitive_keywords`
+- `tests::comparison_semantics_follow_emqx`
+- `tests::conditional_functions`
+- `tests::conversion_functions_emqx_docs`
+- `tests::double_quoted_comparisons_warn_but_parse_as_fields`
+- `tests::events_are_selected_by_either_emqx_spelling`
+- `tests::every_function_is_documented_in_rules_md`
+- `tests::expressions_emqx_docs`
+- `tests::expressions_too_deep_to_evaluate_safely_fail_the_load`
+- `tests::failures_are_reported_once_per_interval_per_rule`
+- `tests::file_level_validation`
+- `tests::foreach_default_item_and_chained_aliases_emqx_docs`
+- `tests::foreach_over_a_non_array_yields_nothing_and_is_capped`
+- `tests::foreach_with_do_and_incase_emqx_docs`
+- `tests::hashing_encoding_and_bits_emqx_docs`
+- `tests::indices_and_ranges`
+- `tests::invalid_qos_fails_the_action`
+- `tests::load_errors_are_specific`
+- `tests::map_and_array_functions_emqx_docs`
+- `tests::matching_dedups_orders_and_skips_disabled_rules`
+- `tests::original_user_properties_keep_wire_order_and_duplicates`
+- `tests::payload_regex_patterns_are_cached_per_message_and_stay_distinct`
+- `tests::payload_shapes_cannot_make_evaluation_quadratic`
+- `tests::payload_supplied_sizes_are_bounded`
+- `tests::payload_values_cannot_crash_the_evaluator`
+- `tests::quadratic_string_growth_is_refused_before_it_is_allocated`
+- `tests::republish_args_render`
+- `tests::republish_defaults_follow_emqx`
+- `tests::select_fields_and_aliases_emqx_docs`
+- `tests::select_star_has_emqx_fields`
+- `tests::string_functions_emqx_docs`
+- `tests::the_growth_budget_is_per_message`
+- `tests::the_sql_test_simulates_events_and_refuses_inputs_the_rule_never_sees`
+- `tests::time_functions_emqx_docs`
+- `tests::topic_match_operator_and_topic_function`
+- `tests::type_judgment_functions_emqx_docs`
+- `tests::unaliased_payload_path_nests_under_payload`
+- `tests::user_properties_and_pub_props_emqx_docs`
+- `tests::where_filters_and_can_use_select_aliases`
+- `tests_emqx_examples::array_functions_match_emqx_examples`
+- `tests_emqx_examples::bit_functions_match_emqx_examples`
+- `tests_emqx_examples::conditional_functions_match_emqx_examples`
+- `tests_emqx_examples::conversion_functions_match_emqx_examples`
+- `tests_emqx_examples::encoding_functions_match_emqx_examples`
+- `tests_emqx_examples::every_implemented_function_has_an_example`
+- `tests_emqx_examples::hashing_functions_match_emqx_examples`
+- `tests_emqx_examples::legacy_accessors_match_emqx_source`
+- `tests_emqx_examples::map_functions_match_emqx_examples`
+- `tests_emqx_examples::math_functions_match_emqx_examples`
+- `tests_emqx_examples::string_functions_match_emqx_examples`
+- `tests_emqx_examples::time_functions_match_emqx_examples`
+- `tests_emqx_examples::type_judgment_functions_match_emqx_examples`
+- `tests_emqx_examples::uuid_functions_match_emqx_examples`
+- `value::tests::binary_is_never_silently_json_encoded`
+- `value::tests::floats_render_like_emqx_str`
+- `value::tests::json_round_trip_keeps_key_order_and_types`
+- `value::tests::numbers_compare_across_int_and_float`
 
 ## `crates/mqtt-storage/src/lib.rs` — 91 test(s)
 
@@ -1021,7 +1099,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 538 test(s)
+## `crates/mqttd/src/lib.rs` — 560 test(s)
 
 - `admin::cli::tests::all_nodes_asks_for_the_cluster_scope_on_the_verbs_that_have_one`
 - `admin::cli::tests::answers_render_as_tables_and_lines`
@@ -1127,7 +1205,14 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `conn::tests::graceful_shutdown_drains_an_established_connection`
 - `conn::tests::graceful_shutdown_sends_v5_server_shutting_down_disconnect`
 - `conn::tests::idle_connection_is_closed_after_keepalive_grace`
+- `conn::tests::ingress_credit::a_batch_waiting_for_credit_releases_its_originals_credit_first`
+- `conn::tests::ingress_credit::a_batch_waiting_for_derived_credit_waits_parked_and_keeps_delivering`
+- `conn::tests::ingress_credit::a_derived_charge_beyond_the_connection_cap_is_clamped_and_proceeds`
+- `conn::tests::ingress_credit::a_parked_batch_keeps_its_place_in_the_puback_order`
 - `conn::tests::ingress_credit::a_paused_publisher_resumes_and_still_receives_while_paused`
+- `conn::tests::ingress_credit::a_publishs_derived_messages_are_charged_to_its_credit`
+- `conn::tests::ingress_credit::a_qos2_batch_waiting_for_credit_is_not_closed_for_the_brokers_wait`
+- `conn::tests::ingress_credit::a_resumed_qos2_publish_waiting_for_derived_credit_is_not_closed_for_it`
 - `conn::tests::ingress_credit::an_alias_only_publish_pays_for_its_topic_and_its_properties`
 - `conn::tests::ingress_credit::keepalive_is_not_enforced_while_the_broker_pauses_the_connection`
 - `conn::tests::ingress_credit::under_pause_qos0_waits_rather_than_drops`
@@ -1143,6 +1228,8 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `conn::tests::qos0_publish_is_not_durability_gated`
 - `conn::tests::rejected_auth_increments_the_error_counter`
 - `conn::tests::splice_relays_owner_bytes_after_client_half_close`
+- `conn::tests::the_ack_pipeline_counts_hub_gates_not_entries`
+- `conn::tests::the_keepalive_grace_is_one_and_a_half_periods_exactly`
 - `conn::tests::unknown_protocol_version_closes_without_connack`
 - `conn::tests::v311_connack_carries_no_properties`
 - `conn::tests::v311_receive_maximum_defaults_to_unlimited`
@@ -1219,6 +1306,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::forwarding::zone_fwd_proofs::releasing_the_ack_hold_does_not_shrink_the_settle_work_set`
 - `hub::forwarding::zone_fwd_proofs::the_ack_hold_clear_is_one_way_and_narrow`
 - `hub::forwarding::zone_fwd_proofs::the_answer_is_at_most_once`
+- `hub::forwarding::zone_fwd_proofs::the_drain_barrier_reports_the_drain_gated_publishes_the_bound_evicted`
 - `hub::forwarding::zone_fwd_proofs::the_early_return_does_not_change_who_receives_a_publish`
 - `hub::forwarding::zone_fwd_proofs::the_early_return_never_swallows_a_retained_broadcast`
 - `hub::forwarding::zone_fwd_proofs::the_interest_buffer_is_reused_across_publishes`
@@ -1281,6 +1369,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::a_live_qos1_delivery_to_a_clean_session_writes_nothing`
 - `hub::tests::a_live_qos1_delivery_to_a_persistent_subscriber_is_durable_until_acked`
 - `hub::tests::a_live_qos2_delivery_records_its_packet_id_until_pubcomp`
+- `hub::tests::a_local_member_refused_by_a_brownout_after_the_drain_gated_it_still_gets_it_live`
 - `hub::tests::a_local_retained_publish_commits_to_the_durable_keyspace`
 - `hub::tests::a_local_shared_member_under_brownout_refuses_the_publisher`
 - `hub::tests::a_lost_link_reclaims_the_handoff_and_the_next_link_resends`
@@ -1289,8 +1378,11 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::a_missed_retained_fan_out_is_healed_by_periodic_anti_entropy`
 - `hub::tests::a_moved_lease_owner_nacks_a_routed_commit`
 - `hub::tests::a_nacked_handoff_re_routes_once_placement_catches_up`
+- `hub::tests::a_node_draining_in_a_brownout_still_sends_its_shutdown_events_live`
 - `hub::tests::a_panicking_truncate_flush_does_not_strand_its_session`
 - `hub::tests::a_parked_qos2_truncate_does_not_stall_unrelated_sessions`
+- `hub::tests::a_peer_refusing_a_forward_the_drain_gated_gets_it_again_as_a_plain_forward`
+- `hub::tests::a_peer_refusing_a_stored_derived_message_does_not_withhold_the_original`
 - `hub::tests::a_peer_that_missed_the_last_fanout_converges_from_a_restarted_owners_snapshot`
 - `hub::tests::a_peers_refusal_refuses_the_publisher_instead_of_dropping_the_gate`
 - `hub::tests::a_proto_6_peer_is_answered_with_the_boolean_and_a_proto_7_peer_with_the_verdict`
@@ -1323,6 +1415,8 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::a_retained_publish_refused_by_brownout_leaves_the_previous_retained_value_intact`
 - `hub::tests::a_retained_replay_carries_the_remaining_expiry_interval`
 - `hub::tests::a_session_that_becomes_misplaced_by_attaching_is_rehomed`
+- `hub::tests::a_shared_group_refusing_every_drain_gated_delivery_still_gets_it_plainly`
+- `hub::tests::a_shared_group_whose_last_candidate_died_still_gets_a_drain_gated_message`
 - `hub::tests::a_single_axis_still_toggles_brownout_on_its_own`
 - `hub::tests::a_stale_value_cannot_resurrect_a_committed_clear`
 - `hub::tests::a_stalled_group_a_append_does_not_delay_a_group_b_publish`
@@ -1396,6 +1490,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::overlapping_connects_are_last_writer_wins`
 - `hub::tests::overload_then_idle_recovers_to_baseline_without_a_restart`
 - `hub::tests::peer_dead_drops_routing_and_stale_peer_disconnect_is_ignored`
+- `hub::tests::pending_gauges::messages_derived_from_events_hold_no_pending_entry`
 - `hub::tests::pending_gauges::the_pending_publish_gauges_report_the_ledger_depth`
 - `hub::tests::periodic_anti_entropy_says_nothing_when_there_is_nothing_retained`
 - `hub::tests::permanently_unavailable_store_rejects_rather_than_downgrades`
@@ -1488,6 +1583,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::the_apply_path_stays_silent_once_the_window_has_closed`
 - `hub::tests::the_backlog_byte_bound_sheds_acked_entries_and_counts_them`
 - `hub::tests::the_config_packet_limit_matches_the_peer_frame_limit`
+- `hub::tests::the_drain_barrier_waits_for_in_flight_appends`
 - `hub::tests::the_durability_property_is_inert_without_the_operator_opt_in`
 - `hub::tests::the_fanout_and_snapshot_carry_the_deadline`
 - `hub::tests::the_grant_sweep_removes_revoked_subscriptions_without_disconnecting`
@@ -1513,6 +1609,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::truncate_flusher::every_busy_session_is_flushed_in_turn`
 - `hub::tests::two_groups_on_one_filter_rotate_independently`
 - `hub::tests::two_publishes_to_one_offline_subscriber_append_in_arrival_order`
+- `hub::tests::while_draining_a_rule_derived_forward_holds_the_barrier_until_the_peer_answers`
 - `hub::tests::without_no_local_a_publisher_receives_its_own_delivery`
 - `ingress::tests::credit_is_returned_when_the_permit_drops_and_the_cap_bounds_one_connection`
 - `ingress::tests::peer_credit_draws_on_the_pool_alone_and_counts_what_it_sheds`
@@ -1525,7 +1622,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `memory_watch::tests::a_status_without_vm_rss_yields_none_not_zero`
 - `memory_watch::tests::an_unreadable_rss_stops_the_watcher_instead_of_reporting_zero`
 - `memory_watch::tests::nearing_the_watermark_shortens_the_poll`
-- `memory_watch::tests::the_real_sampler_reports_a_plausible_rss_on_linux` — only when `cfg(target_os = "linux")`
+- `memory_watch::tests::the_real_sampler_reports_a_plausible_rss_on_linux`
 - `memory_watch::tests::the_watcher_drives_brownout_on_watermark_transitions`
 - `memory_watch::tests::vm_rss_is_parsed_in_bytes_from_the_right_line`
 - `memory_watch::tests::without_a_watermark_nothing_is_ever_browned_out`
@@ -1541,10 +1638,13 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `reload::tests::a_reload_swaps_the_gossip_crl_into_the_live_slot`
 - `reload::tests::a_reload_swaps_the_gossip_signer_and_a_bad_build_rejects_everything`
 - `reload::tests::a_reload_swaps_the_peer_bus_tls_material`
+- `reload::tests::a_reload_swaps_the_rules_and_a_bad_rules_file_keeps_the_running_ones`
 - `reload::tests::a_successful_reload_swaps_the_policy`
 - `reload::tests::checksum_is_sha256_lowercase_hex`
 - `reload::tests::committed_config_never_returns_a_rejected_candidate`
 - `reload::tests::reload_increments_the_metric_by_outcome`
+- `rules::tests::gated_derived_actions_are_counted_by_their_fate`
+- `rules::tests::the_publisher_hears_exactly_the_originals_answer`
 - `runtime_probe::tests::both_probes_feed_the_wake_histogram`
 - `store_probe::tests::probes_a_volume_and_cleans_up`
 - `store_probe::tests::sharding_pays_only_when_parallel_streams_are_nearly_independent`
@@ -1562,7 +1662,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tls_check::tests::nothing_configured_is_a_single_ok_line`
 - `tls_check::tests::valid_material_passes_and_reports_names`
 
-## `crates/mqttd/src/main.rs` — 20 test(s)
+## `crates/mqttd/src/main.rs` — 21 test(s)
 
 - `tests::a_non_durable_node_resolves_no_write_floor`
 - `tests::a_reload_proposes_a_changed_replication_factor`
@@ -1581,6 +1681,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::subscriber_limits_from_config_maps_every_knob`
 - `tests::the_config_and_the_authenticator_agree_on_identity_source_spellings`
 - `tests::the_peer_bus_tls_material_is_file_watched`
+- `tests::the_rules_file_is_file_watched`
 - `tests::unknown_flags_are_caught_and_known_ones_pass`
 - `tests::wire_limits_apply_config_and_preserve_floors`
 - `tests::wire_limits_default_config_matches_the_spec_floors`
@@ -1982,12 +2083,103 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 
 - `a_rolled_node_disconnects_only_its_own_clients`
 
+## `crates/mqttd/tests/rules.rs` — 15 test(s)
+
+- `a_disconnect_reason_code_is_reported_by_its_emqx_name`
+- `a_matching_publish_is_transformed_and_republished_beside_the_original`
+- `a_qos1_publish_acks_and_its_derived_message_is_qos1`
+- `a_qos2_publish_fires_its_rules_once_across_a_dup_resend`
+- `a_refused_derived_message_fails_its_action_and_the_original_is_still_acked`
+- `a_refused_original_routes_none_of_its_derived_messages`
+- `a_reload_reaches_connections_that_were_already_open`
+- `a_rule_republishing_into_its_own_from_cannot_loop`
+- `a_rule_that_does_not_select_qos_republishes_a_qos1_publish_at_qos0`
+- `a_will_runs_rules_when_the_hub_publishes_it`
+- `an_event_derived_message_is_counted_when_routed_and_a_refused_copy_as_a_drop`
+- `an_idle_connection_releases_a_superseded_rule_set_when_it_pings`
+- `client_events_run_rules`
+- `foreach_fans_one_publish_out`
+- `in_a_cluster_each_message_is_evaluated_once_on_its_landing_node`
+
+## `crates/mqttd/tests/rules_binary.rs` — 41 test(s)
+
+- `a_closed_stdout_leaves_probe_and_backup_their_exit_status`
+- `a_closed_stdout_neither_panics_a_command_nor_changes_its_exit_status`
+- `a_failing_action_is_counted_failed_and_warned`
+- `a_failing_rule_never_affects_the_original_and_is_counted_failed`
+- `a_graceful_shutdown_forwards_every_shutdown_event_to_a_watcher_on_another_node`
+- `a_graceful_shutdown_keeps_every_shutdown_event_for_an_offline_watcher`
+- `a_qos1_derived_message_is_queued_for_an_offline_persistent_session`
+- `a_qos1_puback_is_released_only_once_each_derived_message_is_stored`
+- `a_republish_is_not_checked_against_the_publishers_acl`
+- `a_retained_derived_message_reaches_a_late_subscriber`
+- `a_rule_written_into_the_main_config_is_refused_with_where_rules_go`
+- `a_rules_file_that_does_not_load_on_sighup_is_rejected_and_the_old_rules_keep_working`
+- `a_shared_group_receives_derived_messages_balanced_across_members`
+- `a_will_runs_the_rules_in_force_when_the_broker_publishes_it`
+- `an_acl_denied_publish_runs_no_rules`
+- `check_rules_accepts_a_valid_file_and_lists_every_rule`
+- `check_rules_exits_2_on_a_usage_error`
+- `check_rules_loads_1024_rules_and_refuses_1025`
+- `check_rules_loads_16_actions_and_refuses_17`
+- `check_rules_loads_64_kib_of_sql_and_refuses_more`
+- `check_rules_refuses_a_literal_qos_of_3`
+- `check_rules_refuses_a_sink_action`
+- `check_rules_refuses_a_sql_syntax_error_with_its_position`
+- `check_rules_refuses_an_event_mqttd_does_not_raise`
+- `check_rules_refuses_an_unknown_function`
+- `check_rules_with_no_file_checks_the_configured_rules_file`
+- `client_connected_carries_the_connects_fields_for_v5_and_v311`
+- `client_disconnected_reports_normal_tcp_closed_and_a_v5_reason_by_its_emqx_name`
+- `in_a_two_process_cluster_a_publish_is_evaluated_once_on_its_landing_node`
+- `no_local_does_not_suppress_a_derived_message_for_its_publisher`
+- `rule_test_event_picks_among_several_events`
+- `rule_test_prints_each_output_of_a_publish_statement_as_json`
+- `rule_test_refuses_an_input_the_rule_would_never_see`
+- `rule_test_runs_a_topics_and_events_statement_against_a_publish_unless_event_is_given`
+- `rule_test_runs_an_events_statement_against_a_sample_event`
+- `session_subscribed_fires_once_per_granted_filter`
+- `session_unsubscribed_fires_once_per_filter_actually_removed`
+- `sighup_swaps_the_rules_for_a_client_that_stays_connected`
+- `the_broker_refuses_to_boot_on_a_rules_file_that_does_not_load`
+- `two_rules_failing_on_every_message_each_log_one_warn_per_ten_seconds`
+- `with_config_watch_an_edited_rules_file_is_picked_up_without_a_signal`
+
+## `crates/mqttd/tests/rules_cookbook.rs` — 11 test(s)
+
+- `every_recipe_does_on_the_real_broker_what_the_cookbook_shows`
+- `every_recipe_file_has_a_case_and_every_case_a_file`
+- `every_recipe_header_shows_what_the_recipe_does`
+- `every_recipe_passes_check_rules_with_no_warning`
+- `recipe_01_binary_payloads_warn_and_the_hex_variant_logs_them`
+- `recipe_01_rule_test_runs_a_statement_offline`
+- `the_gotchas_the_cookbook_states_hold`
+- `the_header_check_rejects_a_header_that_does_not_match`
+- `the_page_shows_exactly_the_blocks_this_suite_runs`
+- `the_pattern_matcher_checks_rendered_times`
+- `without_their_guards_the_recipes_do_what_the_cookbook_warns`
+
+## `crates/mqttd/tests/rules_demo.rs` — 4 test(s)
+
+- `the_demo_derives_exactly_what_it_shows`
+- `the_demo_rules_file_checks_clean`
+- `the_readme_quotes_only_messages_the_fixture_derives`
+- `the_simulator_is_deterministic`
+
+## `crates/mqttd/tests/rules_docs.rs` — 5 test(s)
+
+- `documented_rule_test_and_check_rules_transcripts_match_the_binary`
+- `documented_rules_snippets_load`
+- `the_extraction_finds_every_documented_rules_file_and_snippet`
+- `the_extraction_recognises_every_documented_form`
+- `the_extraction_refuses_what_it_cannot_run`
+
 ## `crates/mqttd/tests/shared_membership.rs` — 6 test(s)
 
 - `membership_cpu_accounting_handles_parentheses_and_excludes_child_time`
 - `membership_fixture_delivers_exactly_once_across_all_arms`
 - `membership_peer_oracle_rejects_forwarding_even_with_local_receipts`
-- `membership_perf_ack_requires_complete_confirmation` — only when `cfg(target_os = "linux")`
+- `membership_perf_ack_requires_complete_confirmation`
 - `membership_receipt_oracle_rejects_loss_duplicates_and_stale_bursts`
 - `membership_tcp_fixture_receives_all_data_before_each_socket_fence`
 

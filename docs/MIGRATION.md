@@ -395,6 +395,7 @@ value that differs from the vendor's, and why it differs**.
 |---|---|---|
 | `fixtures/emqx-6.2.2.conf` | nine of those same example files (no `listeners.wss`), with **nine values changed** (`verify` → `verify_peer`, `fail_if_no_peer_cert` → `true`, `peer_cert_as_username` → `cn`, `max_retained_messages` → `100000`, two `max_connections` → finite and **unequal** (1000000 and 500000), `enable_ocsp_stapling` → `true`, two cipher strings shortened) and six blocks the vendor ships no example for at all (`authentication`, `authorization`, `rule_engine`, `bridges.mqtt`, `exhook`, `dashboard`) | `mtls_identity_source`, `max_retained_messages`, smallest-wins `max_connections` (500000 wins, with a TODO naming both), the authn/authz chain, the bridge translation — **and the mixed-posture refusal**: its `ssl` listener requires client certificates while its `quic` listener does not, so `client_ca` comes out **commented** with a TODO. The *positive* `client_ca` mapping needs a single-TLS-listener input, and is proven on `emqx-hostile-strings.conf` (and, on vendor bytes, by `hivemq-2026.5-tls-client-auth.xml`) |
 | `fixtures/emqx-acl-documented-examples.conf` | six rules: **three copied** from the vendor `acl.conf`'s own documentation examples (cited by line), **three written here** and marked as such inline | rules that genuinely translate, plus the `{qos,retain}` qualifier gap and the first-match-wins → deny-wins ordering warning |
+| `fixtures/emqx-rules.conf` | five rules **copied** from EMQX's `rule-configs.md` (emqx-docs @ `release-6.2`) in its `rule_engine { rules.<id> { sql, actions } }` shape, one `FOREACH` statement from `rule-sql-syntax.md`, and three rules plus `ignore_sys_message` **written here** and marked as such inline | `--out-rules`: SQL and republish args carried verbatim; the bridge (sink) action dropped with a `TODO(migrate)` while its rule stays live; the data-bridge source, the jq function and the message-delivered event each a commented-out rule with its `TODO(migrate)`; the disabled rule kept disabled; the output passes `mqttd --check-rules` and runs under `--rule-test` (ADR 0083 T5) |
 | `fixtures/hivemq-2026.5-config.xml` | a **merge** of five vendor files — four samples plus the default `config.xml` for `<anonymous-usage-statistics>` (a real `config.xml` holds one `<listeners>`, one `<mqtt>`, one `<restrictions>`, and the vendor ships those in separate samples) — plus `<security>` and `<persistence>` written from the shipped `config.xsd`'s element set and its documented defaults | the whole CE mapping surface in one document |
 
 **3. Adversarial and hostile-input fixtures written for this repository**, not vendor
@@ -581,6 +582,7 @@ implying there was nothing there.
 | listener `enable_authn = false` | **nothing** — authentication is node-wide in mqttd. A TODO says that listener accepted clients without authenticating them and that they now need credentials or a separate deployment; `enable_authn = true` gets a one-line "matches mqttd's posture" TODO instead of the same sentence |
 | `authorization.sources [file] path` | the ACL file to translate |
 | `bridges.mqtt.*` ingress/egress (the **v1** shape) | `mqtt-bridge` `in` / `out` rules (`--out-bridge`) |
+| `rule_engine.rules.<id>` (`sql`, `actions`, `enable`, `description`) | a rules file (`--out-rules`, named by `[rules] file`; [RULES.md](RULES.md)): the SQL **verbatim**, `republish` with its `args` (topic, payload, qos, retain, `mqtt_properties`, `user_properties`) and `console`. A sink action is dropped with a `TODO(migrate)` and its rule stays live with its other actions (a rule left with none runs and produces nothing: give it a `republish` or delete it). A `FROM` mqttd does not raise (`$bridges/…`, a message or delivery event) or a function mqttd lacks (jq, schema registry, `getenv`, …) comments the rule out with the reason as a `TODO(migrate)`, so the file still passes `mqttd --check-rules`. The engine is unreleased; [RULES.md](RULES.md#try-it-in-two-minutes) says how to get a build with it. Engine-level keys (`ignore_sys_message`, `jq_function_default_timeout`, …) are reported. Without `--out-rules`, a TODO says the rules were not written |
 | a bridge/connector `ssl { enable = true, … }` | `[upstreams.tls]` is emitted **commented out**, naming every path the EMQX side held (they are paths on the EMQX host, and `mqtt-bridge` runs elsewhere) — **and so is that upstream's `url`**. `mqtt-bridge`'s `tls` block is optional and **absent means plaintext**, so a live `url` beside a commented `tls` block was a live posture downgrade: completing the draft exactly as the file instructs sent the bridge's CONNECT, username included, in the clear to a peer that expected TLS. Both lines are now inert, and `mqtt-bridge` refuses to start without a `url` |
 | `connectors.mqtt.*` + `actions.mqtt.*` / `sources.mqtt.*` (the **v2** shape, which is what `6.2.2` actually ships) | the connector becomes the `[[upstreams]]` address and credentials; each action's `local_topic` + `parameters.topic` becomes an `out` rule, each source's `parameters.topic` + `local_topic` an `in` rule. `bridges` is **not a root in 6.2.2's schema at all** (`emqx_conf_schema:roots/0`, `emqx_bridge_v2_schema:roots/0`) and survives only through the vendor's v1 upgrade path — so a row naming only `bridges.*` described a shape a current EMQX does not write. `parameters.retain` and `parameters.payload` are still per-key TODOs: `mqtt-bridge` forwards the payload byte for byte and preserves the source retain bit |
 
@@ -588,13 +590,14 @@ implying there was nothing there.
 
 Every one of these is a `TODO(migrate)` line naming what you must decide:
 
-- **The SQL rule engine, and data integration** (`connectors` / `actions` / `sources`,
-  ex-`bridges.*`). mqttd is a broker, not an integration platform. Only *MQTT-type*
-  connectors have an analogue (`mqtt-bridge`); every Kafka / HTTP / JDBC / S3 sink must
-  become a client-side consumer you own — and that consumer has a designed, CI-tested
-  shape: the external-consumer blueprint in [INTEGRATION.md](INTEGRATION.md) (ADR 0063),
-  including the rule-construct-by-construct mapping table. **A rule you forget is a
-  data pipeline that silently stops.**
+- **Data integration** (`connectors` / `actions` / `sources`, ex-`bridges.*`), and the
+  rule actions that feed it. mqttd is a broker, not an integration platform. A rule's
+  SQL and its `republish`/`console` actions carry over (above, `--out-rules`); its sink
+  actions do not. Only *MQTT-type* connectors have an analogue (`mqtt-bridge`); every
+  Kafka / HTTP / JDBC / S3 sink must become a client-side consumer you own — and that
+  consumer has a designed, CI-tested shape: the external-consumer blueprint in
+  [INTEGRATION.md](INTEGRATION.md) (ADR 0063), including the rule-construct-by-construct
+  mapping table. **A sink you forget is a data pipeline that silently stops.**
 - **Gateways** (CoAP, LwM2M, MQTT-SN, STOMP, ExProto, GBT32960, OCPP). mqttd speaks
   MQTT 3.1.1/5 over TCP, TLS, WS, WSS and QUIC only.
 - **`exhook` and `plugins`.** There is no hook API and no plugin ABI. An

@@ -309,6 +309,7 @@ async fn start_proxy_node(
         metrics: None,
         enhanced: None,
         ingress: None,
+        rules: None,
     });
     let (hub, hub_tx) = Hub::with_config(
         node_id.clone(),

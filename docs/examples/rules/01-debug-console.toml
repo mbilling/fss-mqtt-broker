@@ -1,0 +1,22 @@
+# Recipe 01: see exactly what a rule sees (the console action)
+#
+# Logs every message published under factory/ to the broker's log at INFO, with every
+# field a rule can read: clientid, payload, topic, qos, flags, timestamps and the MQTT 5
+# properties. Use it to learn the field names before you write a real rule, then delete
+# it: it is a debugging aid, not a data path. It publishes nothing, and the original
+# message is delivered as usual.
+#
+# The log line is JSON, and JSON cannot hold raw bytes: for a message whose payload (or
+# MQTT 5 Correlation-Data) is not UTF-8 text, the broker logs a WARN instead of the
+# line. To see such payloads, log them as hex: docs/RULES-COOKBOOK.md shows the rule.
+#
+# In:  factory/line1/temp  qos=1 retain=0  {"t": 20.5}
+# The broker logs one line for it:
+#   INFO mqttd::rules: rule console action rule=debug_factory output={"id":"...","clientid":"plc-1",...}
+#
+# Tested by crates/mqttd/tests/rules_cookbook.rs; explained in docs/RULES-COOKBOOK.md.
+
+[rules.debug_factory]
+description = "Log every message under factory/ (remove when done)"
+sql = 'SELECT * FROM "factory/#"'
+actions = [{ function = "console" }]
