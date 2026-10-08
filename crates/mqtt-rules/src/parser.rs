@@ -19,6 +19,7 @@
 //! Function names are resolved here, so an unknown function or a wrong argument count
 //! fails when the rules file is loaded, not on the first matching message.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use regex::Regex;
@@ -26,7 +27,7 @@ use regex::Regex;
 use crate::funcs::{self, Func};
 use crate::lexer::{lex, Kw, Spanned, Tok};
 use crate::value::Value;
-use crate::ParseError;
+use crate::{ParseError, MAX_REGEX_LITERALS_PER_FILE};
 
 /// One step of a field path.
 #[derive(Debug, Clone)]
@@ -137,8 +138,12 @@ pub(crate) struct Statement {
     pub where_: Option<Expr>,
 }
 
-/// Parse one statement. Returns it with any warnings worth showing the author.
-pub(crate) fn parse(sql: &str) -> Result<(Statement, Vec<String>), ParseError> {
+/// Parse one statement. Returns it with any warnings worth showing the author. Its
+/// literal regex patterns are compiled through `regexes`, which a whole rules file shares.
+pub(crate) fn parse(
+    sql: &str,
+    regexes: &mut RegexPool,
+) -> Result<(Statement, Vec<String>), ParseError> {
     let toks = lex(sql)?;
     let mut p = Parser {
         sql,
@@ -146,9 +151,40 @@ pub(crate) fn parse(sql: &str) -> Result<(Statement, Vec<String>), ParseError> {
         pos: 0,
         warnings: Vec::new(),
         nest: 0,
+        regexes,
     };
     let stmt = p.statement()?;
     Ok((stmt, p.warnings))
+}
+
+/// The literal regex patterns one rules file has compiled (ADR 0084 D3), each once.
+///
+/// A pattern is bounded on its own (`funcs::compile_regex`), but a file was not: every
+/// literal cost a compile, so a file of a few thousand worst-case patterns took seconds
+/// and gigabytes to parse. An identical literal now shares one compiled regex wherever
+/// it appears, and a file may hold at most [`MAX_REGEX_LITERALS_PER_FILE`] distinct
+/// ones; the next is refused before it is compiled.
+#[derive(Debug, Default)]
+pub(crate) struct RegexPool {
+    compiled: HashMap<String, Arc<Regex>>,
+}
+
+impl RegexPool {
+    /// `pattern` compiled: the file's earlier copy, or a new one while the budget lasts.
+    pub(crate) fn get(&mut self, pattern: &str) -> Result<Arc<Regex>, String> {
+        if let Some(re) = self.compiled.get(pattern) {
+            return Ok(re.clone());
+        }
+        if self.compiled.len() >= MAX_REGEX_LITERALS_PER_FILE {
+            return Err(format!(
+                "more than {MAX_REGEX_LITERALS_PER_FILE} distinct regular expressions in one \
+                 rules file (an identical pattern is compiled once and counts once)"
+            ));
+        }
+        let re = Arc::new(funcs::compile_regex(pattern).map_err(|e| e.0)?);
+        self.compiled.insert(pattern.to_string(), re.clone());
+        Ok(re)
+    }
 }
 
 /// The tallest expression a statement may hold. Evaluating an expression — and dropping
@@ -170,6 +206,8 @@ struct Parser<'a> {
     warnings: Vec<String>,
     /// Current recursion depth (see [`MAX_NESTING`]).
     nest: usize,
+    /// Where literal regex patterns are compiled (see [`RegexPool`]).
+    regexes: &'a mut RegexPool,
 }
 
 impl Parser<'_> {
@@ -764,9 +802,11 @@ impl Parser<'_> {
             ));
         }
         let regex = match func.regex_arg.and_then(|i| args.get(i)) {
-            Some(Expr::Const(Value::Str(pattern))) => Some(Arc::new(
-                funcs::compile_regex(pattern).map_err(|e| ParseError::at(self.sql, start, e.0))?,
-            )),
+            Some(Expr::Const(Value::Str(pattern))) => Some(
+                self.regexes
+                    .get(pattern)
+                    .map_err(|e| ParseError::at(self.sql, start, e))?,
+            ),
             _ => None,
         };
         let h = self.node(h)?;

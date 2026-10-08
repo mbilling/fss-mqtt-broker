@@ -68,6 +68,19 @@ pub const MAX_DERIVED_BYTES: usize = 4 << 20;
 /// The longest rule statement accepted.
 pub const MAX_SQL_BYTES: usize = 64 * 1024;
 
+/// The most distinct literal regex patterns one rules file may compile (ADR 0084 D3);
+/// an identical pattern is compiled once however often it appears, and counts once.
+///
+/// Each pattern is already bounded (1 MiB of compiled program, 1 MiB of lazy DFA), but
+/// the file was not: a few thousand worst-case literals took seconds and gigabytes to
+/// parse. Measured on the release build (4-core x86-64, 2026-10): a pattern at the
+/// per-pattern limit (`(\w|\pN|\pS){47}`, `\w{50}`, `\pL{56}`, `.{2471}`) costs about
+/// 7.5 ms and 1.05 MiB to compile, so 128 distinct ones took 0.9-1.1 s and 140 MiB, and
+/// 96 take about 0.7 s and 107 MiB. 96 keeps a worst-case file under a second, and the
+/// running set plus one candidate being checked or reloaded under 256 MiB. A file over
+/// it fails to load, at boot, on reload, in `--check-rules` and in the admin API alike.
+pub const MAX_REGEX_LITERALS_PER_FILE: usize = 96;
+
 /// A rule statement that does not parse.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("{message} (line {line}, column {column}, near `{near}`)")]
@@ -361,12 +374,13 @@ impl From<&str> for CompileError {
     }
 }
 
-/// Compile one statement and its `FROM` list.
-fn compile(sql: &str) -> Result<Compiled, CompileError> {
+/// Compile one statement and its `FROM` list, its literal regex patterns through
+/// `regexes`.
+fn compile(sql: &str, regexes: &mut parser::RegexPool) -> Result<Compiled, CompileError> {
     if sql.len() > MAX_SQL_BYTES {
         return Err(format!("sql is longer than {MAX_SQL_BYTES} bytes").into());
     }
-    let (stmt, warnings) = parser::parse(sql).map_err(|e| CompileError {
+    let (stmt, warnings) = parser::parse(sql, regexes).map_err(|e| CompileError {
         message: e.to_string(),
         at: Some((e.line, e.column)),
     })?;
@@ -435,6 +449,8 @@ impl RuleSet {
             ..RuleSet::default()
         };
         let mut warnings = Vec::new();
+        // One pool for the whole file: the regex budget is file-wide (ADR 0084 D3).
+        let mut regexes = parser::RegexPool::default();
         for (id, r) in file.rules {
             let fail = |e: CompileError| LoadError::Rule {
                 id: id.clone(),
@@ -462,7 +478,7 @@ impl RuleSet {
                 topics,
                 events,
                 warnings: w,
-            } = compile(&r.sql).map_err(fail)?;
+            } = compile(&r.sql, &mut regexes).map_err(fail)?;
             warnings.extend(w.into_iter().map(|w| format!("rule `{id}`: {w}")));
             let mut actions = Vec::with_capacity(r.actions.len());
             let mut aw = Vec::new();
@@ -665,9 +681,9 @@ pub fn statement_sources(sql: &str) -> Result<(Vec<String>, Vec<EventKind>), Str
     compile_alone(sql).map(|c| (c.topics, c.events))
 }
 
-/// [`compile`] for a statement on its own, its error as text.
+/// [`compile`] for a statement on its own, with a regex budget of its own.
 fn compile_alone(sql: &str) -> Result<Compiled, String> {
-    compile(sql).map_err(|e| e.message)
+    compile(sql, &mut parser::RegexPool::default()).map_err(|e| e.message)
 }
 
 /// Run one statement against one input and return its outputs as JSON — the

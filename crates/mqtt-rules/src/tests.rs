@@ -1429,6 +1429,86 @@ fn a_message_has_one_timestamp_however_often_it_is_read() {
 
 // -- ADR 0084: what the admin API, the $SYS reservation and the trace need
 
+/// A rules file with `rules` rules, each matching `regex_match(payload.a, pattern)` for
+/// its share of `patterns`.
+fn regex_file(patterns: &[String], rules: usize) -> String {
+    patterns
+        .chunks(patterns.len().div_ceil(rules).max(1))
+        .enumerate()
+        .map(|(r, chunk)| {
+            let conds: Vec<String> = chunk
+                .iter()
+                .map(|p| format!("regex_match(payload.a, '{p}')"))
+                .collect();
+            format!(
+                "[rules.r{r}]\nsql = '''\nSELECT 1 AS x FROM \"t/#\"\nWHERE {}\n'''\n",
+                conds.join(" OR ")
+            )
+        })
+        .collect::<Vec<_>>()
+        .concat()
+}
+
+/// Every literal pattern used to cost a compile, so a file of a few thousand worst-case
+/// patterns took seconds and gigabytes to parse. The budget is per file, across rules,
+/// and the pattern past it is refused before it is compiled.
+#[test]
+fn a_file_may_compile_only_so_many_distinct_regular_expressions() {
+    let distinct = |n: usize| -> Vec<String> { (0..n).map(|i| format!("^a{i}$")).collect() };
+    let at = RuleSet::parse(&regex_file(&distinct(MAX_REGEX_LITERALS_PER_FILE), 7))
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(at.rules.len(), 7);
+
+    let over = regex_file(&distinct(MAX_REGEX_LITERALS_PER_FILE + 1), 7);
+    let e = RuleSet::parse(&over).unwrap_err();
+    let LoadError::Rule {
+        id,
+        message,
+        sql_line,
+        ..
+    } = &e
+    else {
+        panic!("{e}")
+    };
+    // The last rule holds the pattern past the budget, on its statement's line 2.
+    assert_eq!((id.as_str(), *sql_line), ("r6", Some(2)), "{e}");
+    assert!(
+        message.contains(&format!(
+            "more than {MAX_REGEX_LITERALS_PER_FILE} distinct regular expressions in one rules file"
+        )),
+        "{e}"
+    );
+
+    // Patterns built at run time (from the payload) are not literals: not counted.
+    let mut text = regex_file(&distinct(MAX_REGEX_LITERALS_PER_FILE), 1);
+    text.push_str(
+        "[rules.dyn]\nsql = 'SELECT regex_match(payload.a, payload.p) AS m FROM \"t\"'\n",
+    );
+    RuleSet::parse(&text).unwrap_or_else(|e| panic!("{e}"));
+}
+
+/// An identical pattern is compiled once and counts once, wherever it appears: a file
+/// repeating one pattern at the per-pattern size limit far past the budget loads.
+#[test]
+fn identical_regular_expressions_are_compiled_once() {
+    let mut pool = parser::RegexPool::default();
+    let first = pool.get("\\w{50}").unwrap();
+    assert!(Arc::ptr_eq(&first, &pool.get("\\w{50}").unwrap()));
+    assert!(!Arc::ptr_eq(&first, &pool.get("\\w{49}").unwrap()));
+
+    let worst = vec!["\\w{50}".to_string(); 4 * MAX_REGEX_LITERALS_PER_FILE];
+    let set = load(&regex_file(&worst, 32));
+    assert_eq!(set.len(), 32);
+    // Each still works, and a second distinct pattern is still accepted beside it.
+    let mut text = regex_file(&worst, 2);
+    text.push_str("[rules.other]\nsql = '''SELECT 1 AS x FROM \"t/#\" WHERE regex_match(payload.a, '^b$')'''\n");
+    let set = load(&text);
+    let payload = Bytes::from(format!(r#"{{"a":"{}"}}"#, "x".repeat(50)));
+    let props = mqtt_core::AppProperties::default();
+    let (_, log) = effects(&set, &msg("t/1", &payload, &props));
+    assert_eq!(log, ["other:no_result", "r0:passed", "r1:passed"]);
+}
+
 /// The structured error keeps the text `mqttd --check-rules` and a rejected reload have
 /// always printed, byte for byte (`crates/mqttd/tests/rules_docs.rs` pins transcripts of
 /// it), and adds where: the TOML span in the file, the line and column in a rule's SQL.
