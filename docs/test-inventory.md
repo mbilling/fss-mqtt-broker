@@ -2101,8 +2101,9 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `foreach_fans_one_publish_out`
 - `in_a_cluster_each_message_is_evaluated_once_on_its_landing_node`
 
-## `crates/mqttd/tests/rules_binary.rs` — 39 test(s)
+## `crates/mqttd/tests/rules_binary.rs` — 40 test(s)
 
+- `a_closed_stdout_ends_the_offline_commands_quietly`
 - `a_failing_action_is_counted_failed_and_warned`
 - `a_failing_rule_never_affects_the_original_and_is_counted_failed`
 - `a_graceful_shutdown_forwards_every_shutdown_event_to_a_watcher_on_another_node`
@@ -2156,6 +2157,13 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `the_page_shows_exactly_the_blocks_this_suite_runs`
 - `the_pattern_matcher_checks_rendered_times`
 - `without_their_guards_the_recipes_do_what_the_cookbook_warns`
+
+## `crates/mqttd/tests/rules_demo.rs` — 4 test(s)
+
+- `the_demo_derives_exactly_what_it_shows`
+- `the_demo_rules_file_checks_clean`
+- `the_readme_quotes_only_messages_the_fixture_derives`
+- `the_simulator_is_deterministic`
 
 ## `crates/mqttd/tests/rules_docs.rs` — 5 test(s)
 

@@ -477,12 +477,21 @@ async fn the_demo_derives_exactly_what_it_shows() {
         failures.join("\n")
     );
 
-    if blessing() {
+    assert!(
+        got.len() > 1_000,
+        "the demo's ten minutes derive more than {} messages",
+        got.len()
+    );
+    // Blessing writes what the broker derived as the new expected output, then checks it
+    // like any other run.
+    let expected: Vec<String> = if blessing() {
         let mut text = got.join("\n");
         text.push('\n');
-        std::fs::write(repo_root().join(EXPECTED), text).expect("write expected.txt");
-        return;
-    }
+        std::fs::write(repo_root().join(EXPECTED), text).expect("write the expected output");
+        read(EXPECTED).lines().map(str::to_string).collect()
+    } else {
+        expected
+    };
     if got != expected {
         let missing: Vec<_> = expected.iter().filter(|l| !got.contains(l)).collect();
         let extra: Vec<_> = got.iter().filter(|l| !expected.contains(l)).collect();
