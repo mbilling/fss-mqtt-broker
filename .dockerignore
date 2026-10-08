@@ -1,5 +1,9 @@
 # Keep the Docker build context small: never ship build artifacts or VCS state.
-target/
+# Every target/, not only the root's: tools/mqttui is its own workspace and builds into
+# tools/mqttui/target, which alone was ~570 MB of a ~600 MB context (now ~24 MB).
+**/target/
 .git/
 **/*.redb
 demo/grafana/data/
+# Operator scratch (gitignored); never part of an image.
+astra/

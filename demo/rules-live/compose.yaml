@@ -1,0 +1,208 @@
+name: mqttd-rules-live
+
+# The rule engine, live (ADR 0084): devices publishing without end, the rules' own
+# statistics and trace on $SYS, and a small web page that edits the rules and applies them
+# while everything runs. README.md beside this file is the guide.
+#
+#   demo/rules-live/up.sh        # builds mqttd from this checkout, waits until it is healthy
+#   UI:      http://localhost:8070
+#   MQTT:    localhost:1883, anonymous      mosquitto_sub -v -t '$SYS/brokers/+/rules/#'
+#   Health:  http://localhost:8080/metrics
+#   Admin:   docker compose run --rm admin rules
+#   Reset:   docker compose down -v         # the edited rules and the PKI go with the volumes
+#
+# DEMO ONLY. The broker is anonymous with no ACL file, so anyone who reaches it may publish
+# and subscribe anywhere, and its rule trace copies payloads onto $SYS. The UI holds an
+# admin-API operator certificate and asks nobody for a password. So every port is published
+# on 127.0.0.1, and there is no WebSocket listener (it has no Origin check: any web page
+# could reach it). MQTT_BIND=0.0.0.0 exposes the anonymous broker to your network, on
+# purpose (README.md, "Ports").
+#
+# Every third-party image is digest-pinned (OpenSSF Pinned-Dependencies); Dependabot's
+# docker-compose entry for /demo/rules-live proposes the bumps.
+
+services:
+  # One-shot: a CA, the admin listener's certificate and the CN=rules-ui operator
+  # certificate (pki/gen.sh). The CA key stays in `pki-ca`, which nothing else mounts.
+  pki:
+    image: python:3.12-slim@sha256:05cda9777409a9c3ffddd94a4c476b79f0769a0b4857f0c7ed9226b6800b0d6f
+    network_mode: none
+    command: ["sh", "/gen.sh"]
+    volumes:
+      - ./pki/gen.sh:/gen.sh:ro
+      - pki-ca:/pki/ca
+      - pki-server:/pki/server
+      - pki-client:/pki/client
+
+  # One-shot: the shipped rules into the `rules` volume, the first time only. Edits made
+  # through the admin API live in the volume, so they survive `down` (and `down -v` resets
+  # them); the tracked demo/rules/rules.toml is never written.
+  rules-seed:
+    image: python:3.12-slim@sha256:05cda9777409a9c3ffddd94a4c476b79f0769a0b4857f0c7ed9226b6800b0d6f
+    network_mode: none
+    command:
+      - sh
+      - -c
+      - >-
+        if [ -e /rules/rules.toml ]; then echo "keeping the rules in the rules volume";
+        else cp /shipped/rules.toml /rules/rules.toml && echo "seeded the shipped rules"; fi
+    volumes:
+      - ../rules/rules.toml:/shipped/rules.toml:ro
+      - rules:/rules
+
+  mqttd:
+    build:
+      context: ../..
+      dockerfile: demo/Dockerfile
+    # Its own tag: an image from another stack, or from before a `git pull`, may predate
+    # ADR 0084 and would ignore the MQTTD_RULES_* settings below without a word. up.sh
+    # always builds.
+    image: mqttd-rules-live:local
+    init: true
+    environment:
+      MQTTD_PLAINTEXT_BIND: 0.0.0.0:1883   # demo only: plaintext, loudly logged insecure
+      MQTTD_ALLOW_ANONYMOUS: "1"           # demo only: no authentication, and no ACL file
+      MQTTD_DURABLE_SESSIONS: "0"          # in-memory sessions: nothing here needs to persist
+      MQTTD_HEALTH_BIND: 0.0.0.0:8080      # /livez, /readyz, /metrics; the healthcheck probes it
+      MQTTD_RULES_FILE: /rules/rules.toml  # the `rules` volume
+      # Per-rule statistics on $SYS/brokers/<node>/rules[/<id>] every 2 s, and the rule
+      # trace on $SYS/brokers/<node>/trace/rules/<id>, at most 5 records per rule per second.
+      # The trace is off by default in the broker: it copies payloads onto $SYS.
+      MQTTD_RULES_SYS_INTERVAL: "2"
+      MQTTD_RULES_TRACE: "1"
+      MQTTD_RULES_TRACE_RATE: "5"
+      # The admin API, mTLS only (ADR 0081). CN=rules-ui (the UI's certificate) is an
+      # operator, and may write the rules file (ADR 0084).
+      MQTTD_ADMIN_BIND: 0.0.0.0:9443
+      MQTTD_ADMIN_CERT: /pki/server.crt
+      MQTTD_ADMIN_KEY: /pki/server.key
+      MQTTD_ADMIN_CLIENT_CA: /pki/ca.crt
+      MQTTD_ADMIN_OPERATORS: CN=rules-ui
+      MQTTD_RULES_ADMIN_WRITERS: CN=rules-ui
+      # No MQTTD_CONFIG_WATCH: an admin write already runs the reload, and the watcher would
+      # notice the new file and reload a second time after every Apply.
+    ports:
+      - "${MQTT_BIND:-127.0.0.1}:${MQTT_PORT:-1883}:1883"
+      - "127.0.0.1:${HEALTH_PORT:-8080}:8080"
+      - "127.0.0.1:${ADMIN_PORT:-9443}:9443"
+    volumes:
+      - rules:/rules           # read-write: an admin write replaces rules.toml, keeping rules.toml.prev
+      - pki-server:/pki:ro
+    healthcheck:
+      test: ["CMD", "mqttd", "--probe", "/readyz"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+    depends_on:
+      pki:
+        condition: service_completed_successfully
+      rules-seed:
+        condition: service_completed_successfully
+
+  # The devices: demo/rules/live.py plays demo/rules/README.md's ten minutes over and over,
+  # on the wall clock, one simulator per domain. SIM_CLOCK=fixture makes the devices' clocks
+  # replay the README's window too, so the time-of-day alerts fire at any hour.
+  sim-power:
+    image: python:3.12-slim@sha256:05cda9777409a9c3ffddd94a4c476b79f0769a0b4857f0c7ed9226b6800b0d6f
+    init: true
+    restart: unless-stopped
+    command: ["python3", "/opt/rules/live.py"]
+    environment:
+      SIM_HOST: mqttd
+      SIM_DOMAINS: power
+      SIM_CLOCK: ${SIM_CLOCK:-now}
+      SIM_QUIET: "1"
+      PYTHONDONTWRITEBYTECODE: "1"   # no __pycache__: ../rules is the checkout, read-only
+    volumes:
+      - ../rules:/opt/rules:ro
+    depends_on:
+      mqttd:
+        condition: service_healthy
+
+  sim-homes:
+    image: python:3.12-slim@sha256:05cda9777409a9c3ffddd94a4c476b79f0769a0b4857f0c7ed9226b6800b0d6f
+    init: true
+    restart: unless-stopped
+    command: ["python3", "/opt/rules/live.py"]
+    environment:
+      SIM_HOST: mqttd
+      SIM_DOMAINS: homes
+      SIM_CLOCK: ${SIM_CLOCK:-now}
+      SIM_QUIET: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
+    volumes:
+      - ../rules:/opt/rules:ro
+    depends_on:
+      mqttd:
+        condition: service_healthy
+
+  sim-cars:
+    image: python:3.12-slim@sha256:05cda9777409a9c3ffddd94a4c476b79f0769a0b4857f0c7ed9226b6800b0d6f
+    init: true
+    restart: unless-stopped
+    command: ["python3", "/opt/rules/live.py"]
+    environment:
+      SIM_HOST: mqttd
+      SIM_DOMAINS: cars
+      SIM_CLOCK: ${SIM_CLOCK:-now}
+      SIM_QUIET: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
+    volumes:
+      - ../rules:/opt/rules:ro
+    depends_on:
+      mqttd:
+        condition: service_healthy
+
+  # The rule editor (ui/server.py, standard library only): the page, the admin API behind
+  # it over mTLS, and MQTT as server-sent events. It accepts only requests for
+  # localhost:<UI_PORT> or 127.0.0.1:<UI_PORT>, so it must know the published port.
+  ui:
+    image: python:3.12-slim@sha256:05cda9777409a9c3ffddd94a4c476b79f0769a0b4857f0c7ed9226b6800b0d6f
+    init: true
+    restart: unless-stopped
+    command: ["python3", "/opt/ui/server.py"]
+    environment:
+      UI_PORT: ${UI_PORT:-8070}
+      UI_LISTEN: 0.0.0.0:8070
+      UI_BROKER: mqttd:1883
+      UI_ADMIN: mqttd:9443
+      UI_PKI: /pki
+      UI_RULES: /opt/rules
+      UI_SYS_INTERVAL: "2"           # MQTTD_RULES_SYS_INTERVAL, until a summary says otherwise
+      PYTHONDONTWRITEBYTECODE: "1"
+    ports:
+      - "127.0.0.1:${UI_PORT:-8070}:8070"
+    volumes:
+      - ./ui:/opt/ui:ro
+      - ../rules:/opt/rules:ro       # sim/mqtt.py, and rules.toml for "Reset to shipped rules"
+      - pki-client:/pki:ro
+    depends_on:
+      pki:
+        condition: service_completed_successfully
+      mqttd:
+        condition: service_healthy
+
+  # `docker compose run --rm admin <verb>`: the mqttd CLI against the admin API, with the
+  # UI's certificate (`run --rm admin help` lists the verbs). Not started by `up`. No
+  # depends_on, on purpose: `run` would otherwise recreate a running mqttd whenever the
+  # shell's port overrides differ from the ones `up` saw.
+  admin:
+    profiles: [admin]
+    image: mqttd-rules-live:local
+    pull_policy: never
+    entrypoint: ["mqttd", "--admin"]
+    command: ["help"]
+    environment:
+      MQTTD_ADMIN_URL: https://mqttd:9443
+      MQTTD_ADMIN_CA: /pki/ca.crt
+      MQTTD_ADMIN_CLIENT_CERT: /pki/rules-ui.crt
+      MQTTD_ADMIN_CLIENT_KEY: /pki/rules-ui.key
+      MQTTD_ADMIN_SERVER_NAME: mqttd
+    volumes:
+      - pki-client:/pki:ro
+
+volumes:
+  rules:        # the running rules file and its .prev
+  pki-ca:       # the CA key: the `pki` service only
+  pki-server:   # the admin listener's key: mqttd only
+  pki-client:   # the CN=rules-ui operator key: ui and admin only
