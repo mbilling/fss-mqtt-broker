@@ -12,7 +12,8 @@ fleet into mqttd and shows what its [rule engine](../../docs/RULES.md) makes of 
 - **Picks out** the 54 messages that need a person.
 - **Computes** the figures behind them: power-curve performance, heat-pump COP, the cost of
   this minute's draw in the peak tariff.
-- **Keeps** each asset's last-known state, retained, for a screen that opens late.
+- **Keeps** the last-known state of the turbines, the peaker, the heat pumps and every
+  vehicle's online flag, retained, for a screen that opens late.
 - **Pseudonymizes** a feed for a third party.
 
 All of it runs in the broker, as you see it here: 21 rules in
@@ -31,8 +32,8 @@ around them raises none.
 demo/rules/run.sh
 ```
 
-It starts mqttd on free localhost ports with `rules.toml` and plays the ten minutes at ten
-times real time (about a minute). It prints each device message (`→`) and each message
+It starts mqttd on free localhost ports with `rules.toml` and plays this page's ten minutes
+at ten times real time (about a minute): the numbers and alerts below are what it prints. It prints each device message (`→`) and each message
 the rules derive (`⇒`), then the broker's own per-rule counters. It needs Python 3
 (standard library only) and a build of mqttd with the rule engine: no release has it yet,
 so `run.sh` uses this checkout's `target/` build, or runs `cargo build --release -p mqttd`
@@ -43,27 +44,37 @@ Every option goes to the simulator:
 ```sh
 demo/rules/run.sh --speed 1                  # real time: ten minutes
 demo/rules/run.sh --domains cars --quiet     # one domain, derived messages only
-demo/rules/run.sh --start now --duration 3600
-python3 demo/rules/simulate.py --help        # everything else
+demo/rules/run.sh --start now --duration 3600   # an hour from now: the sun, the tariff and
+                                                # the faults follow the real clock instead
+demo/rules/run.sh --help                     # everything else
 ```
 
-To watch it with your own tools, run mqttd yourself and point the simulator at it:
+To watch it with your own tools, run the broker yourself, from a build that has the rule
+engine ([RULES.md, step 1](../../docs/RULES.md#1-get-a-build-that-has-the-rule-engine); a
+released `mqttd` would ignore the rules file without a word). In one terminal:
 
 ```sh
-MQTTD_PLAINTEXT_BIND=127.0.0.1:1883 MQTTD_ALLOW_ANONYMOUS=1 MQTTD_DURABLE_SESSIONS=0 \
-  MQTTD_RULES_FILE=demo/rules/rules.toml mqttd
-python3 demo/rules/simulate.py --no-watch &
-mosquitto_sub -t 'alerts/#' -v
+cargo build --release -p mqttd
+MQTTD_PLAINTEXT_BIND=127.0.0.1:1884 MQTTD_ALLOW_ANONYMOUS=1 MQTTD_DURABLE_SESSIONS=0 \
+  MQTTD_RULES_FILE=demo/rules/rules.toml target/release/mqttd
+```
+
+Its log must say `rule engine: rules loaded (ADR 0083) rules=21`. Then, in another:
+
+```sh
+mosquitto_sub -p 1884 -t 'alerts/#' -v &
+python3 demo/rules/simulate.py --port 1884 --no-watch --quiet
 ```
 
 ## What is simulated
 
 The simulation is seeded: the same `--seed`, `--start` and `--duration` give the same
-messages, byte for byte. The numbers on this page come from the demo's fixture,
-`--seed 7 --start 2026-03-24T15:55:00Z --duration 600`. That is 16:55 to 17:05 Danish
-time on a Tuesday in late March: dusk, heating on, and the grid tariff's evening peak
-starting five minutes in. Each device publishes the way its real equipment does, and each
-domain's module documents its formats, physics and injected faults in detail:
+messages, byte for byte. The numbers on this page come from the demo's fixture, which is
+also what `run.sh` plays by default: `--seed 7 --start 2026-03-24T15:55:00Z --duration 600`.
+That is 16:55 to 17:05 Danish time on a Tuesday in late March: late afternoon with the sun
+low and falling, heating on, and the grid tariff's evening peak starting five minutes in.
+Each device publishes the way its real equipment does, and each domain's module documents
+its formats, physics and injected faults in detail:
 [`power.py`](sim/power.py), [`homes.py`](sim/homes.py), [`cars.py`](sim/cars.py).
 
 | Domain | Devices | Formats | Messages in 10 min |
@@ -84,10 +95,10 @@ The injected faults, in the order the rules first report them (seconds after
 | 174 | An electric van brakes at 0.56 g | `car_driving_events` |
 | 180 | Turbine WTG05's blade pitch is 4° off optimum (from 125 s): 75-79 % of its power curve, while it reports "producing" | `power_wtg_performance` (a KPI, not an alert) |
 | 215 | A diesel van stores trouble code P0301 (cylinder 1 misfire) | `car_obd_dtc` |
-| 240 | Turbine WTG06's gearbox starts to fail (from 150 s): vibration in ISO 10816-21 zone C, then D | `power_wtg_condition` |
+| 240 | Turbine WTG06's gearbox starts to fail (from 150 s): vibration in ISO 10816-21 zone C, then D; at 372 s the turbine stops on its vibration trip | `power_wtg_condition`, `power_wtg_state`, `power_wtg_performance` |
 | 301 | Home hh-142, at the end of a rural feeder, sees its L2 phase fall to 205 V (from 290 s) | `home_voltage_en50160` |
-| 304 | Home hh-104 plugs in its EV as the 17:00 peak tariff starts | `home_ev_peak_start`, `home_tariff_rate` |
-| 316 | Home hh-123's heat pump runs below a COP of 2.0 in mild weather (an iced evaporator, from 195 s; the rule re-checks every 5 minutes) | `home_heatpump_health` |
+| 304 | Home hh-104's EV starts charging as the 17:00 peak tariff starts (plugged in at 281 s) | `home_ev_peak_start`, `home_tariff_rate` |
+| 316 | Home hh-123's heat pump runs below a COP of 2.0 in mild weather (an iced evaporator, from 195 s: its retained state says so at once, the alert comes at the next 5-minute mark) | `home_heatpump_health` |
 | 330 | Another diesel van stores P0128 (thermostat stuck open) | `car_obd_dtc` |
 | 355 | A third van's coolant passes 105 °C, and 115 °C at 485 s, when its engine ECU stores P0217 | `car_engine_overheat`, `car_obd_dtc` |
 | 360 | Turbine WTG03's gearbox oil cooler fan failed at 5 s: the oil reaches 75 °C, then 80 °C, and at 82 °C (496 s) the turbine derates itself | `power_wtg_condition`, `power_wtg_performance`, `power_wtg_state` |
@@ -103,7 +114,7 @@ exactly the kind of data it wants:
 
 | Root | What | QoS | In 10 min |
 |---|---|---|---|
-| `alerts/<domain>/…` | an exception a person should act on, with what to do | 1 | 54 |
+| `alerts/<domain>/…` | an exception a person should act on, most with what to do | 1 | 54 |
 | `kpi/<domain>/…` | a computed figure: performance, cost | 0 | 140 |
 | `normalized/<domain>/…` | a decoded, unit-normalized canonical record | 0 | 769 |
 | `analytics/<domain>/…` | a privacy-safe feed for third parties | 0 | 159 |
@@ -166,8 +177,9 @@ pitch fault costs it 8 to 11 kWh a minute.
 
 **`power_grid_frequency`: the grid event, classified.** The PMU at the 50 kV connection
 reports every 2 s. Only readings outside the Nordic normal band (49.9-50.1 Hz) produce an
-alert, at most one per 10 s. Each is classified by reserve band, with the FCR-D
-activation it calls for.
+alert: every reading while the frequency is still moving fast (the onset of a disturbance)
+or outside 49.5-50.5 Hz, otherwise one every 10 s while the excursion lasts. Each is
+classified by reserve band, with the FCR-D activation it calls for.
 
 ```text
 → plant/wf-falster/poc/grid  {"ts":1774368111000,"Hz":49.749,"ROCOF":-0.001,"U_kV":{"L12":51.32,"L23":51.28,"L31":51.35},"P_MW":11.86,"Q_Mvar":-0.08}
@@ -232,9 +244,10 @@ between 17:00 and 21:00 (OCPP `StartTransaction`), the owner hears what moving i
 ```
 
 **`home_heatpump_health`: health, not just numbers.** Every heat-pump reading becomes a
-retained health state: ok, a fault, or a low COP (heat out ÷ electricity in) below 2.0 in
-mild weather. It carries what the inefficiency costs. A fault or a low COP is also an
-alert.
+retained health state: ok, a fault, a low COP (heat out ÷ electricity in) below 2.0 in
+mild weather, or a bad reading (the compressor runs but no power is metered). It carries
+what the inefficiency costs. A fault is also an alert at once and then every 5 minutes; a
+low COP, at the next 5-minute mark.
 
 ```text
 → home/hh-123/heatpump  {"ts":1774368016349,"mode":"heat","compressor":true,"compressor_hz":83,"elec_w":1248,"heat_w":2142,"flow_c":33.3,"return_c":31.5,"flow_lpm":18.1,"outdoor_c":5.8,"defrost":false,"fault":"","fault_since":null}
@@ -243,8 +256,10 @@ alert.
 ```
 
 **`home_heating_comfort`: the room, not the machine.** A room in heat mode more than 2 K
-under its setpoint, and below EN 16798-1's 20 °C, means the heating is failing. It works
-for district-heated homes too, where the thermostat is the only signal.
+under a setpoint it has had for at least 3 hours means the heating is failing (with a
+21.5 °C setpoint, that is already below EN 16798-1's 20 °C). The wait keeps the recovery
+from a night setback quiet. It alerts at most every 5 minutes, and works for
+district-heated homes too, where the thermostat is the only signal.
 
 ```text
 ⇒ alerts/homes/hh-117/heating  {"home":"hh-117","ts":"2026-03-24T15:55:24Z","temp_c":19.4,"setpoint_c":21.5,"setpoint_since":"2025-10-01T16:00:00Z","shortfall_k":2.1,"problem":"heating not keeping up: check the heat source"}
@@ -298,8 +313,8 @@ is a warning and 115 °C is critical, each with an action.
 ```
 
 **`car_driving_events`: safety, not surveillance.** Out of a telemetry record every 5 s,
-only harsh braking (beyond 0.4 g) and speeding against the map-matched limit (`lim`)
-become events.
+only harsh braking (beyond 0.4 g, from 10 km/h or more) and speeding more than 10 % over
+the map-matched limit (`lim`) become events.
 
 ```text
 → vehicle/XDKVE6T79SH090233/telemetry  {"ts":1774367874100,"lat":55.673188,"lon":12.557336,"hdg":74,"spd":0.0,"lim":40,"gear":"D","ax":-5.47,"ax_spd":19.5,"soc":63.1,"bat_t":15.2,"odo":51208.9,"chg":"off","chg_kw":0.0}
@@ -356,19 +371,22 @@ flag:
 - a heat pump's defrost cycle and another's legionella run, where a low COP is normal;
 - a degraded heat pump before it locks out (a COP of 2.2 is poor, not failing);
 - a 1 K setpoint step, and a cold house in "away" mode;
-- EV sessions that began before the peak, re-announced when their chargers' bridges start;
-- healthy turbines and inverters around the faulty ones, at dusk and at low load.
+- EV sessions that began before the peak and run or pause through it (hh-158's meter
+  values, hh-131's pause at 17:00);
+- healthy turbines and inverters around the faulty ones, and INV03's own low-power restart.
 
 ## Reproduce it, and test it
 
 ```sh
-python3 demo/rules/simulate.py --dry-run --seed 7 --start 2026-03-24T15:55:00Z --duration 600 > fixture.jsonl
+python3 demo/rules/simulate.py --dry-run --seed 7 --start 2026-03-24T15:55:00Z --duration 600 > /tmp/fixture.jsonl
+demo/rules/run.sh --replay /tmp/fixture.jsonl --speed 0
 cargo test -p mqttd --test rules_demo
 ```
 
-The first command writes the fixture, one JSON line per device event. The test generates
-the same fixture and replays it through the real mqttd binary with `rules.toml`, one MQTT
-connection per device. It asserts that the 1,333 derived messages are exactly
+The first command writes the fixture, one JSON line per device event; the second plays a
+fixture file as fast as the broker takes it. The test generates the same fixture and
+replays it through the real mqttd binary with `rules.toml`, one MQTT connection per
+client, as the devices and their gateways make them. It asserts that the 1,333 derived messages are exactly
 [`rules_demo.expected`](../../crates/mqttd/tests/rules_demo.expected): topic, QoS, retain
 flag and payload, with nothing missing and nothing extra. It also checks that the
 simulator is deterministic, that `rules.toml` passes `mqttd --check-rules` with no
@@ -382,14 +400,17 @@ its diff like any other change.
 - Thresholds, tariffs and advice text are in the rules' SQL; each rule's comment says
   where its numbers come from. The tariff figures are illustrative: use your grid
   operator's.
-- The rules are stateless, like EMQX's. A lasting condition is re-alerted at most once a
-  minute or every few minutes, by the device's own clock. The first alert can come that
-  long after the condition began, unless the device says when it began, as the heat
-  pump's `fault_since` does. Windows and aggregation across messages belong in the
-  consumer.
+- The rules are stateless, like EMQX's: each sees one message. A lasting condition is
+  re-alerted on a schedule by the device's own clock: the home rules once a minute or
+  every 5 minutes, the coolant and battery warnings once a minute, the grid frequency
+  every 10 s. An inverter fault, a speeding record and a critical coolant or battery
+  reading alert every time they are reported. A scheduled alert can come that long after
+  the condition began, unless the device says when it began, as the heat pump's
+  `fault_since` does. Windows and aggregation across messages belong in the consumer.
 - Times are formatted from the device's clock with explicit offsets. `format_date` has
-  no time-zone rules, so the rules that need Danish summer time compute it from the date.
-  `unix_ts_to_rfc3339` would use the broker host's time zone.
+  no time-zone rules, so the rules that need Danish summer time read it from the device
+  (the P1 meter's summer/winter flag) or compute it from the date. `unix_ts_to_rfc3339`
+  would use the broker host's time zone.
 - Domain details are in the simulator modules' docstrings and the comments in
   `rules.toml`. Every rule and value in this file is the kind of thing you would write for
   your own fleet, in the [rule SQL](../../docs/RULES.md#sql) EMQX also runs.

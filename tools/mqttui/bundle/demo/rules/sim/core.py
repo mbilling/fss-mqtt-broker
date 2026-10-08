@@ -91,7 +91,11 @@ def from_json_line(text: str) -> Event:
 
 
 class Player:
-    """Sends events to a broker at `speed` times real time (0 = as fast as possible)."""
+    """Sends events to a broker at `speed` times real time (0 = as fast as possible).
+
+    `on_send(event)` is called just before each event is sent, so a device message is
+    reported before anything the broker derives from it.
+    """
 
     def __init__(self, host: str, port: int, speed: float, on_send=None):
         self.host, self.port, self.speed, self.on_send = host, port, speed, on_send
@@ -104,9 +108,9 @@ class Player:
                 wait = start + ev.at / self.speed - time.monotonic()
                 if wait > 0:
                     self._idle(wait)
-            self._apply(ev)
             if self.on_send:
                 self.on_send(ev)
+            self._apply(ev)
 
     def close(self):
         for c in list(self.clients.values()):

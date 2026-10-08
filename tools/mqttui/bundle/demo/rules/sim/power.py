@@ -651,7 +651,7 @@ def _solar_events(rng: random.Random, t0: float, duration: float, grid: _Grid) -
             v_dc += rng.gauss(0.0, 1.5) if p_dc > 0 else rng.gauss(0.0, 0.5)
             p_ac = min(INV_RATED_KVA, _inverter_ac_kw(p_dc) * (1 + rng.gauss(0.0, 0.0015))) if p_dc > 0 else 0.0
             q_kvar = rng.gauss(0.0, 1.5) if p_ac > 0 else 0.0
-            s_kva = math.hypot(p_ac, q_kvar)
+            s_kva = math.sqrt(p_ac * p_ac + q_kvar * q_kvar)
             v_ll = 645.0 * (1 + v_ac_off) * grid.u(at) / 51.35
             hz = grid.f(at) + rng.gauss(0.0, 0.002)
             energy_kwh += p_ac * 30.0 / 3600.0

@@ -4,7 +4,8 @@
 //! its rules derive. This suite takes the demo's seeded fixture (the ten simulated minutes
 //! `simulate.py --dry-run` writes for the README's seed and start time), replays it through
 //! the REAL `mqttd` binary loading `demo/rules/rules.toml`, one connection per simulated
-//! device as the simulator's player makes them, and asserts that the derived messages a
+//! client (a device or its gateway) as the simulator's player makes them, and asserts that
+//! the derived messages a
 //! `QoS` 1 subscriber receives are exactly `rules_demo.expected` beside this file: topic,
 //! `QoS`, retain flag and payload, with nothing missing and nothing extra. It also checks
 //! that the simulator is deterministic, that the rules file passes `--check-rules` with no

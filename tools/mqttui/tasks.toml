@@ -92,7 +92,7 @@ script = "demo/rules/run.sh"
 needs_checkout = true
 about = """
 Starts mqttd with demo/rules/rules.toml and plays ten simulated minutes of a Danish utility
-and fleet into it: wind turbines, a solar park's SunSpec inverters, a hydro unit behind a
+and fleet into it: wind turbines, a solar park's SunSpec inverters, a gas peaker behind a
 CSV RTU and the grid frequency; homes with DSMR P1 smart meters, heat pumps, batteries and
 EV chargers; electric cars and OBD-II vans. It prints every device message and every
 message the rules derive from them (decoded, normalized, alerts, KPIs, privacy-safe

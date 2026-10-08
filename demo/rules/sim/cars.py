@@ -285,7 +285,7 @@ class _Route:
         for (la0, lo0, *_), (la1, lo1, *_) in zip(self.pts, self.pts[1:]):
             dy = (la1 - la0) * M_PER_DEG_LAT
             dx = (lo1 - lo0) * M_PER_DEG_LON
-            self.cum.append(self.cum[-1] + math.hypot(dx, dy))
+            self.cum.append(self.cum[-1] + math.sqrt(dx * dx + dy * dy))
             self.brg.append(math.degrees(math.atan2(dx, dy)) % 360.0)
         self.length = self.cum[-1]
         self.signals = [self.cum[i] for i, p in enumerate(self.pts) if p[3] and i > 0]

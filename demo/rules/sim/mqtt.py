@@ -76,10 +76,12 @@ class Client:
             raise MqttError(f"{self.client_id}: CONNECT refused ({data.hex()})")
 
     def disconnect(self):
-        """A clean DISCONNECT: the broker discards the Will."""
+        """A clean DISCONNECT: the broker discards the Will. A broker already gone is fine."""
         if self.sock:
             try:
                 self._send(DISCONNECT << 4, b"")
+            except OSError:
+                pass
             finally:
                 self.drop()
 
