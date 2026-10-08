@@ -649,7 +649,7 @@ impl Metrics {
         let publish_dropped_total = register_family(
             &mut registry,
             "publish_dropped",
-            "Messages dropped, by reason (no-subscriber, queue-overflow, backlog-overflow, outbound-full, outbound-id-write-failed, pending-cap, pending-cap-replay, settle-replay, settle-replay-refused, append-backlog-full, brownout, too-large, retained-replay-client-offline, retained-replay-read-failed)",
+            "Messages dropped, by reason (no-subscriber, queue-overflow, backlog-overflow, outbound-full, outbound-id-write-failed, pending-cap, pending-cap-replay, settle-replay, settle-replay-refused, append-backlog-full, brownout, too-large, retained-replay-client-offline, retained-replay-read-failed, reserved)",
         );
 
         // Issue #480: the fraction of publishes that cross a node boundary, which

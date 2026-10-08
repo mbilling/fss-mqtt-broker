@@ -762,7 +762,8 @@ fn relocation_target<'a>(
 
 /// If the CONNECT carries a will whose topic the client may not publish to, send the
 /// rejecting CONNACK and return `true` (the caller must close). `false` when there is
-/// no will or it is authorized.
+/// no will or it is authorized. A Will in the broker's reserved `$SYS/` tree is never
+/// authorized, whatever the ACL says (ADR 0084).
 async fn will_rejected<W: AsyncWrite + Unpin>(
     writer: &mut FrameWriter<W>,
     connect: &Connect,
@@ -773,13 +774,16 @@ async fn will_rejected<W: AsyncWrite + Unpin>(
     let Some(w) = &connect.last_will else {
         return Ok(false);
     };
-    if policy
-        .authorizer()
-        .authorize_publish(principal, client, &w.topic)
+    let reserved = mqtt_core::is_reserved_topic(&w.topic);
+    if !reserved
+        && policy
+            .authorizer()
+            .authorize_publish(principal, client, &w.topic)
     {
         return Ok(false);
     }
-    warn!(client = %client.0, topic = %w.topic, "CONNECT rejected: will topic not authorized");
+    warn!(client = %client.0, topic = %w.topic, reserved,
+          "CONNECT rejected: will topic not authorized");
     count_connection_error(policy, "acl");
     policy.audit.record(
         "acl.deny.will",
@@ -2694,11 +2698,18 @@ async fn handle_publish<W: AsyncWrite + Unpin>(
     // refusal vocabulary and travels the peer bus under a wire code, while the ACL
     // decision is made right here, before `forward` — it never crosses the hub or
     // the bus, so a variant there would be dead weight in both.
-    let authorized = policy
-        .authorizer()
-        .authorize_publish(principal, client, &topic);
+    //
+    // `$SYS/` is the broker's (ADR 0084): a client publish there is refused whatever
+    // the ACL says, through these same arms — answered, audited and kept from the
+    // rules exactly like an ACL denial. It is checked on the resolved topic, so an
+    // alias-only publish cannot slip past it.
+    let reserved = mqtt_core::is_reserved_topic(&topic);
+    let authorized = !reserved
+        && policy
+            .authorizer()
+            .authorize_publish(principal, client, &topic);
     if !authorized {
-        debug!(client = %client.0, identity = %principal.subject, topic = %topic,
+        debug!(client = %client.0, identity = %principal.subject, topic = %topic, reserved,
                "publish denied by ACL; dropping");
         policy
             .audit
@@ -5776,6 +5787,151 @@ mod tests {
             assert_eq!(next_topic(&mut topics).await.as_deref(), Some("t"));
             assert_eq!(next_topic(&mut topics).await, None);
             assert!(audit.kinds().iter().any(|k| k == "acl.deny.publish"));
+        }
+    }
+
+    /// ADR 0084: `$SYS/` is the broker's. A client publish there is refused whatever
+    /// the ACL says — this policy allows every topic but `"secret"` — through the ACL
+    /// denial's own arms: v5 `QoS` 1 PUBACK `0x87`, also when the topic comes through a
+    /// topic alias (registered with the reserved name, then used alone), v5 `QoS` 2
+    /// PUBREC `0x87`, each audited as `acl.deny.publish`, and none reaching the hub. The
+    /// match is case-sensitive: `$sys/x` is an ordinary topic.
+    #[tokio::test]
+    async fn a_v5_publish_into_sys_is_refused_0x87_whatever_the_acl_says() {
+        let (mut reader, mut writer, hub_rx, audit) = conn_denying_secret(V5, None);
+        let (mut topics, _detach) = stub_hub_refusing_watching_detach(hub_rx, None);
+        writer.send(&connect_v5("sys5", vec![])).await.unwrap();
+        assert!(matches!(recv(&mut reader).await, Some(Packet::ConnAck(_))));
+
+        let aliased = |topic: &str, id: u16| {
+            Packet::Publish(Publish {
+                properties: Properties(vec![Property::TopicAlias(2)]),
+                dup: false,
+                qos: QoS::AtLeastOnce,
+                retain: false,
+                topic: topic.into(),
+                pkid: Some(id),
+                payload: Bytes::from_static(b"forged"),
+            })
+        };
+        for (packet, id) in [
+            (
+                publish_to("$SYS/brokers/n1/rules", QoS::AtLeastOnce, Some(1), false),
+                1,
+            ),
+            (aliased("$SYS/brokers/n1/rules/r", 2), 2),
+            (aliased("", 3), 3),
+        ] {
+            writer.send(&packet).await.unwrap();
+            match recv(&mut reader).await {
+                Some(Packet::PubAck(a)) => {
+                    assert_eq!(a.pkid, id);
+                    assert_eq!(a.reason, mqtt_codec::reason::NOT_AUTHORIZED, "packet {id}");
+                }
+                other => panic!("expected PUBACK 0x87 for packet {id}, got {other:?}"),
+            }
+        }
+        writer
+            .send(&publish_to("$SYS", QoS::ExactlyOnce, Some(4), false))
+            .await
+            .unwrap();
+        match recv(&mut reader).await {
+            Some(Packet::PubRec(a)) => {
+                assert_eq!(a.pkid, 4);
+                assert_eq!(a.reason, mqtt_codec::reason::NOT_AUTHORIZED);
+            }
+            other => panic!("expected PUBREC 0x87, got {other:?}"),
+        }
+        // Still open; the lowercase look-alike is an ordinary topic and is routed.
+        writer
+            .send(&publish_to("$sys/x", QoS::AtLeastOnce, Some(5), false))
+            .await
+            .unwrap();
+        match recv(&mut reader).await {
+            Some(Packet::PubAck(a)) => assert_eq!((a.pkid, a.reason), (5, 0)),
+            other => panic!("expected a success PUBACK, got {other:?}"),
+        }
+        assert_eq!(next_topic(&mut topics).await.as_deref(), Some("$sys/x"));
+        assert_eq!(
+            next_topic(&mut topics).await,
+            None,
+            "nothing in $SYS reached the hub"
+        );
+        assert_eq!(
+            audit
+                .kinds()
+                .iter()
+                .filter(|k| k.as_str() == "acl.deny.publish")
+                .count(),
+            4,
+            "each refusal is audited as an ACL denial"
+        );
+    }
+
+    /// ADR 0084, v3.1.1: no reason byte, so a publish into `$SYS/` is acked plainly and
+    /// dropped, exactly as an ACL denial is — and audited.
+    #[tokio::test]
+    async fn a_v311_publish_into_sys_is_acked_and_dropped() {
+        let (mut reader, mut writer, hub_rx, audit) = conn_denying_secret(V4, None);
+        let (mut topics, _detach) = stub_hub_refusing_watching_detach(hub_rx, None);
+        writer.send(&connect_packet("sys4", true)).await.unwrap();
+        assert!(matches!(recv(&mut reader).await, Some(Packet::ConnAck(_))));
+        writer
+            .send(&publish_to(
+                "$SYS/brokers/n1/rules",
+                QoS::AtLeastOnce,
+                Some(1),
+                false,
+            ))
+            .await
+            .unwrap();
+        match recv(&mut reader).await {
+            Some(Packet::PubAck(a)) => assert_eq!((a.pkid, a.reason), (1, 0)),
+            other => panic!("expected a plain PUBACK, got {other:?}"),
+        }
+        assert_eq!(
+            next_topic(&mut topics).await,
+            None,
+            "dropped before the hub"
+        );
+        assert!(audit.kinds().iter().any(|k| k == "acl.deny.publish"));
+    }
+
+    /// ADR 0084: a Will in `$SYS/` is refused at CONNECT whatever the ACL says — v5
+    /// CONNACK `0x87`, v3.1.1 `0x05` — and audited as `acl.deny.will`.
+    #[tokio::test]
+    async fn a_will_in_sys_is_refused_at_connect() {
+        for version in [V5, V4] {
+            let (mut reader, mut writer, _hub_rx, audit) = conn_denying_secret(version, None);
+            writer
+                .send(&Packet::Connect(Connect {
+                    properties: Properties::new(),
+                    protocol: version,
+                    clean_session: true,
+                    keep_alive: 30,
+                    client_id: "willsys".into(),
+                    last_will: Some(mqtt_codec::packet::LastWill {
+                        topic: "$SYS/brokers/n1/rules".into(),
+                        payload: Bytes::from_static(b"forged"),
+                        qos: QoS::AtMostOnce,
+                        retain: false,
+                        properties: Properties::new(),
+                    }),
+                    username: None,
+                    password: None,
+                }))
+                .await
+                .unwrap();
+            let expected = if version == V5 {
+                mqtt_codec::reason::NOT_AUTHORIZED
+            } else {
+                0x05
+            };
+            match recv(&mut reader).await {
+                Some(Packet::ConnAck(a)) => assert_eq!(a.code, expected, "{version:?}"),
+                other => panic!("expected a refusing CONNACK, got {other:?}"),
+            }
+            assert!(audit.kinds().iter().any(|k| k == "acl.deny.will"));
         }
     }
 

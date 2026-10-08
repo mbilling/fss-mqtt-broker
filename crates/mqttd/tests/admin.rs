@@ -865,6 +865,52 @@ async fn the_authorization_dry_run_names_the_deciding_rule_of_the_live_policy() 
     assert_eq!((status, code(&body)), (400, "bad-request"));
 }
 
+/// ADR 0084: `$SYS/` is the broker's. Not even an allow-all policy lets a client
+/// publish there, so the dry run says so without asking the policy, as enforcement
+/// does. `$sys` is an ordinary topic, and subscribing to `$SYS` stays the policy's call.
+#[tokio::test]
+async fn the_authorization_dry_run_never_allows_a_publish_into_sys() {
+    let (_tx, live) = tokio::sync::watch::channel(
+        Arc::new(mqtt_auth::AllowAll) as Arc<dyn mqtt_auth::Authorizer>
+    );
+    let h = start_node(Node {
+        id: "authz-sys",
+        listener: TcpListener::bind("127.0.0.1:0").await.unwrap(),
+        admin_ca: Arc::new(mint_ca("admin")),
+        server_ca: None,
+        cluster_ca: None,
+        viewers: &["CN=alice"],
+        operators: &[],
+        placement: None,
+        peers: None,
+        hub: None,
+        authz: Some(live),
+        reload: None,
+    });
+    let alice = mint_leaf(&h.admin_ca, "alice", None);
+    for target in ["$SYS/brokers/n1/rules", "%24SYS", "$SYS/"] {
+        let (status, body) = h
+            .get(
+                &alice,
+                &format!("/admin/v1/authz?user=x&action=publish&target={target}"),
+            )
+            .await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["allowed"], false, "{target}: {body}");
+        assert_eq!(body["rule"], Value::Null);
+        assert_eq!(body["reason"], mqttd::admin::authz::RESERVED_REASON);
+    }
+    for (action, target) in [("publish", "$sys/x"), ("subscribe", "$SYS/%23")] {
+        let (_, body) = h
+            .get(
+                &alice,
+                &format!("/admin/v1/authz?user=x&action={action}&target={target}"),
+            )
+            .await;
+        assert_eq!(body["allowed"], true, "{action} {target}: {body}");
+    }
+}
+
 /// A reloader over `path` into `live`, with an allow-all policy build — the config swap
 /// is what the reload tests are about.
 fn allow_all_reloader(

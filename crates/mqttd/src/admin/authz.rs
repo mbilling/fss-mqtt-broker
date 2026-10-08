@@ -4,11 +4,14 @@
 //! It asks the **live** authorizer — the policy the last reload published, the one every
 //! connection consults — through [`mqtt_auth::Authorizer::explain`], which shares its
 //! evaluator with enforcement. It changes nothing.
+//!
+//! A publish into the broker's reserved `$SYS/` tree is refused before the policy is
+//! asked (ADR 0084), and so is it here: the dry run never says allowed for one.
 
 use super::http::Request;
 use super::routes::{error, Answer};
 use super::AdminState;
-use mqtt_auth::{Authorizer, CheckedAction, Identity};
+use mqtt_auth::{Authorizer, CheckedAction, Explanation, Identity};
 use mqtt_core::ClientId;
 use serde_json::json;
 use std::sync::Arc;
@@ -16,6 +19,9 @@ use tokio::sync::watch;
 
 /// The live authorizer (the reloadable policy's receiver).
 pub type LiveAuthorizer = watch::Receiver<Arc<dyn Authorizer>>;
+
+/// Why a publish into `$SYS/` is refused whatever the policy says (ADR 0084).
+pub const RESERVED_REASON: &str = "reserved: $SYS/ is the broker's (ADR 0084)";
 
 /// `GET /admin/v1/authz?user=&action=publish|subscribe|connect&target=&groups=&client=`
 ///
@@ -86,9 +92,16 @@ pub fn check(state: &AdminState, req: &Request) -> Answer {
         subject: user.to_string(),
         groups,
     };
-    let authorizer = live.borrow().clone();
-    let explanation =
-        authorizer.explain(&identity, &ClientId(client.as_str().into()), action, target);
+    let explanation = if action == CheckedAction::Publish && mqtt_core::is_reserved_topic(target) {
+        Explanation {
+            allowed: false,
+            rule: None,
+            reason: RESERVED_REASON.to_string(),
+        }
+    } else {
+        let authorizer = live.borrow().clone();
+        authorizer.explain(&identity, &ClientId(client.as_str().into()), action, target)
+    };
     let mut notes = vec![
         "groups are as given here; at runtime they come from the authenticator (token claims, \
          the HTTP hook)",
