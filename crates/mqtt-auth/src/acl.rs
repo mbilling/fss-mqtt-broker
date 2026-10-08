@@ -76,7 +76,9 @@
 //!   so denying `secret/#` also blocks a `#` subscription. For a shared
 //!   subscription `$share/<g>/<f>` a deny is matched against `<f>` as well as
 //!   the full string (ADR 0084), so denying `secret/#` also blocks
-//!   `$share/g/secret/x`; an allow still has to cover the full `$share/...` string.
+//!   `$share/g/secret/x`; an allow still has to cover the full `$share/...` string,
+//!   and when `<f>` is `$`-rooted the allow's own inner filter must cover `<f>`, so
+//!   `$share/+/#` does not grant `$share/g/$SYS/x` any more than `#` grants `$SYS/x`.
 //!
 //! Publish targets are concrete topics and use plain MQTT filter matching.
 
@@ -251,8 +253,8 @@ impl AclPolicy {
     ) -> (bool, Decider) {
         // A `$share/<g>/<f>` subscription receives what `<f>` matches, so a deny is also
         // matched against `<f>` (ADR 0084): denying `$SYS/#` must refuse `$share/g/$SYS/#`,
-        // whose first level differs. Allows still see only the full string, so sharing
-        // needs its own `$share/...` grant as before — nothing is loosened.
+        // whose first level differs. Allows still need their own `$share/...` grant as
+        // before — nothing is loosened — and one is tightened: see the allow arm below.
         let shared_inner = match action {
             Action::Subscribe => mqtt_core::parse_shared(target).map(|(_, inner)| inner),
             Action::Publish => None,
@@ -284,9 +286,17 @@ impl AclPolicy {
                 let hit = match (action, rule.effect) {
                     // Publish targets are concrete topics: plain matching.
                     (Action::Publish, _) => mqtt_core::topic_matches(&pattern, target),
-                    // An allow must subsume the requested subscription...
+                    // An allow must subsume the requested subscription. For a shared
+                    // subscription whose inner filter is `$`-rooted, the `$` rule must hold
+                    // where it means something — at the inner filter's first level — so
+                    // `$share/+/#` or `$share/#` never grants `$share/g/$SYS/…`; only a
+                    // pattern whose own inner filter covers it does (ADR 0084).
                     (Action::Subscribe, Effect::Allow) => {
                         mqtt_core::filter_covers(&pattern, target)
+                            && shared_inner.filter(|f| f.starts_with('$')).is_none_or(|f| {
+                                share_inner_pattern(&pattern)
+                                    .is_some_and(|pf| mqtt_core::filter_covers(pf, f))
+                            })
                     }
                     // ...while a deny blocks anything that could touch it.
                     (Action::Subscribe, Effect::Deny) => {
@@ -521,6 +531,17 @@ enum Decider {
     Default,
     /// A connect, and the policy has no connect rules.
     NoConnectRules,
+}
+
+/// The inner filter of an ACL pattern written as `$share/<group>/<inner>`. The group is
+/// not validated: a pattern's group may be a wildcard (`$share/+/jobs/#`), which a
+/// subscription's group may not, so [`mqtt_core::parse_shared`] would refuse it. A pattern
+/// with no inner filter (`$share/#`) has none.
+fn share_inner_pattern(pattern: &str) -> Option<&str> {
+    pattern
+        .strip_prefix("$share/")?
+        .split_once('/')
+        .map(|(_, inner)| inner)
 }
 
 /// Expand `%i` (identity subject) and `%c` (client id) in a pattern, or `None` if the
@@ -1565,6 +1586,39 @@ mod tests {
             "$share/workers/jobs/x"
         ));
         assert!(!can_sub(&p, &ident("worker-1", &[]), "$share/other/jobs/x"));
+    }
+
+    /// A broad `$share` grant does not reach a `$`-rooted inner filter: the `$` rule holds
+    /// at the inner filter's first level, as it does for `#` against `$SYS/x`. A grant
+    /// that names `$SYS` inside its own inner filter still works, and the explanation
+    /// agrees with enforcement.
+    #[test]
+    fn a_broad_share_grant_does_not_reach_sys() {
+        let p = AclPolicy::from_toml_str(
+            r#"
+            [[rules]]
+            identities = ["fleet"]
+            actions = ["subscribe"]
+            topics = ["$share/+/#", "$share/#"]
+
+            [[rules]]
+            identities = ["monitor"]
+            actions = ["subscribe"]
+            topics = ["$share/+/$SYS/brokers/+/rules/#"]
+            "#,
+        )
+        .unwrap();
+        let fleet = ident("fleet", &[]);
+        assert!(can_sub(&p, &fleet, "$share/g/jobs/x"));
+        assert!(!can_sub(&p, &fleet, "$share/g/$SYS/brokers/n1/rules/r"));
+        assert!(!can_sub(&p, &fleet, "$share/g/$SYS/#"));
+        let target = "$share/g/$SYS/brokers/n1/trace/rules/r";
+        assert!(!can_sub(&p, &fleet, target));
+        let why = explain(&p, &fleet, ANY_CLIENT, CheckedAction::Subscribe, target);
+        assert!(!why.allowed, "{why:?}");
+        let monitor = ident("monitor", &[]);
+        assert!(can_sub(&p, &monitor, "$share/g/$SYS/brokers/n1/rules/r"));
+        assert!(!can_sub(&p, &monitor, target));
     }
 
     /// Under `default = "allow"` the inner deny is what keeps `$SYS` closed to a
