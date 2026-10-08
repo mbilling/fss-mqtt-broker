@@ -231,6 +231,8 @@ pub struct Rule {
     sql: String,
     stmt: parser::Statement,
     actions: Vec<action::Action>,
+    /// The `actions` entries as the file wrote them.
+    action_specs: Vec<toml::Value>,
     topics: Vec<String>,
     events: Vec<EventKind>,
     /// When a failure of this rule was last reported loudly (unix seconds); see
@@ -296,6 +298,21 @@ impl Rule {
     pub fn action_count(&self) -> usize {
         self.actions.len()
     }
+
+    /// Its `actions`, as the rules file wrote them (for showing a rule, such as the admin
+    /// API's JSON, without the file at hand).
+    #[must_use]
+    pub fn action_specs(&self) -> &[toml::Value] {
+        &self.action_specs
+    }
+
+    /// Why this rule would never run on `input`, in `mqttd --rule-test`'s words; `None`
+    /// when its `FROM` selects it. A dry run calls this before
+    /// [`RuleSet::evaluate_one`], which does not look at `FROM`.
+    #[must_use]
+    pub fn from_mismatch(&self, input: &dyn Input) -> Option<String> {
+        from_mismatch(&self.topics, &self.events, input)
+    }
 }
 
 /// A loaded rules file.
@@ -306,6 +323,7 @@ pub struct RuleSet {
     by_filter: HashMap<FilterKey, Vec<usize>>,
     by_event: [Vec<usize>; 4],
     digest: String,
+    warnings: Vec<String>,
 }
 
 /// A successfully loaded rules file and what the author should be told about it.
@@ -340,7 +358,10 @@ struct RuleSchema {
     description: String,
 }
 
-fn valid_id(id: &str) -> bool {
+/// Whether `id` is a valid rule id: a letter or `_` followed by up to 63 letters, digits,
+/// `_` or `-`. Such an id is also a safe single topic level (no `/`, `+` or `#`).
+#[must_use]
+pub fn valid_rule_id(id: &str) -> bool {
     let mut chars = id.chars();
     matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
         && id.len() <= 64
@@ -464,7 +485,7 @@ impl RuleSet {
                 sql_line: e.at.map(|(line, _)| line),
                 sql_column: e.at.map(|(_, column)| column),
             };
-            if !valid_id(&id) {
+            if !valid_rule_id(&id) {
                 return Err(fail(
                     "a rule id is a letter or `_` followed by up to 63 letters, digits, `_` or `-`"
                         .into(),
@@ -499,6 +520,7 @@ impl RuleSet {
                 sql: r.sql,
                 stmt,
                 actions,
+                action_specs: r.actions,
                 topics,
                 events,
                 last_report: std::sync::atomic::AtomicU64::new(0),
@@ -517,6 +539,7 @@ impl RuleSet {
                 set.by_event[e.index()].push(i);
             }
         }
+        set.warnings.clone_from(&warnings);
         Ok(Loaded {
             rules: set,
             warnings,
@@ -553,6 +576,22 @@ impl RuleSet {
     #[must_use]
     pub fn digest(&self) -> &str {
         &self.digest
+    }
+
+    /// The load's non-fatal findings (the same as [`Loaded::warnings`]), kept with the set
+    /// so whoever holds the running rules can still show them.
+    #[must_use]
+    pub fn warnings(&self) -> &[String] {
+        &self.warnings
+    }
+
+    /// The rule with this id, enabled or not.
+    #[must_use]
+    pub fn get(&self, id: &str) -> Option<&Rule> {
+        self.rules
+            .binary_search_by(|r| (*r.id).cmp(id))
+            .ok()
+            .map(|i| &self.rules[i])
     }
 
     /// Whether any enabled rule selects messages. The publish path checks this first,
@@ -613,6 +652,27 @@ impl RuleSet {
         for &i in hits {
             apply(&self.rules[i], &ctx, report, out);
         }
+    }
+
+    /// Evaluate the one rule `id` on `input`, whether or not it is enabled, as a dry run
+    /// does (ADR 0084): its SQL, then its actions, reported and collected as
+    /// [`on_publish`](Self::on_publish) would. Its `FROM` is not consulted — the caller
+    /// asks [`Rule::from_mismatch`] first. Returns `false` when there is no such rule.
+    ///
+    /// Nothing about the rule changes: `report` is the caller's, and neither the failure
+    /// report gate nor the trace windows are touched.
+    pub fn evaluate_one(
+        &self,
+        id: &str,
+        input: &dyn Input,
+        report: &mut dyn FnMut(&Rule, Outcome<'_>),
+        out: &mut Vec<(Arc<str>, Effect)>,
+    ) -> bool {
+        let Some(rule) = self.get(id) else {
+            return false;
+        };
+        apply(rule, &EvalCtx::new(input), report, out);
+        true
     }
 }
 
@@ -692,6 +752,41 @@ fn compile_alone(sql: &str) -> Result<Compiled, String> {
     compile(sql, &mut parser::RegexPool::default()).map_err(|e| e.message)
 }
 
+/// Why a rule selecting `topics` and `events` would never run on `input`; `None` when
+/// it would. An input the broker would never have run the rule on is reported rather
+/// than evaluated: a message whose topic no `FROM` filter matches, a message given to a
+/// statement that selects only events, or an event its `FROM` does not name.
+fn from_mismatch(topics: &[String], events: &[EventKind], input: &dyn Input) -> Option<String> {
+    let event = input.field("event");
+    let event = event.as_str().unwrap_or("message.publish");
+    if event == "message.publish" {
+        if topics.is_empty() {
+            return Some(format!(
+                "the statement selects only events ({}), so it never runs on a message; \
+                 simulate one of them instead",
+                events
+                    .iter()
+                    .map(|k| k.event_name())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        if let Some(topic) = input.field("topic").as_str() {
+            if !topics.iter().any(|f| mqtt_core::topic_matches(f, topic)) {
+                return Some(format!(
+                    "topic \"{topic}\" matches none of the FROM filters ({})",
+                    topics.join(", ")
+                ));
+            }
+        }
+    } else if !events.iter().any(|k| k.event_name() == event) {
+        return Some(format!(
+            "the statement's FROM does not select the {event} event"
+        ));
+    }
+    None
+}
+
 /// Run one statement against one input and return its outputs as JSON — the
 /// `mqttd --rule-test` backend, EMQX's "SQL test".
 ///
@@ -705,32 +800,8 @@ pub fn test_sql(sql: &str, input: &dyn Input) -> Result<Vec<String>, String> {
         events,
         ..
     } = compile_alone(sql)?;
-    let event = input.field("event");
-    let event = event.as_str().unwrap_or("message.publish");
-    if event == "message.publish" {
-        if topics.is_empty() {
-            return Err(format!(
-                "the statement selects only events ({}), so it never runs on a message; \
-                 simulate one of them instead",
-                events
-                    .iter()
-                    .map(|k| k.event_name())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ));
-        }
-        if let Some(topic) = input.field("topic").as_str() {
-            if !topics.iter().any(|f| mqtt_core::topic_matches(f, topic)) {
-                return Err(format!(
-                    "topic \"{topic}\" matches none of the FROM filters ({})",
-                    topics.join(", ")
-                ));
-            }
-        }
-    } else if !events.iter().any(|k| k.event_name() == event) {
-        return Err(format!(
-            "the statement's FROM does not select the {event} event"
-        ));
+    if let Some(why) = from_mismatch(&topics, &events, input) {
+        return Err(why);
     }
     let ctx = EvalCtx::new(input);
     *ctx.rule_id.borrow_mut() = Arc::from("test");

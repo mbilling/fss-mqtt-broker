@@ -1593,6 +1593,87 @@ fn load_errors_say_where_and_print_as_before() {
     );
 }
 
+/// The running set keeps the actions as written and the load's warnings, so the admin
+/// API can show a rule and its findings without the file.
+#[test]
+fn a_loaded_set_keeps_its_action_specs_and_warnings() {
+    let loaded = RuleSet::parse(
+        r#"
+        [rules.r]
+        sql = 'SELECT a FROM "t" WHERE a = "x"'
+        actions = [
+          { function = "republish", args = { topic = "o/${a}", qos = 1, direct_dispatch = false } },
+          { function = "console" },
+        ]
+        [rules.s]
+        sql = 'SELECT 1 FROM "u"'
+        "#,
+    )
+    .unwrap();
+    assert_eq!(loaded.rules.warnings(), loaded.warnings.as_slice());
+    assert_eq!(loaded.warnings.len(), 2, "{:?}", loaded.warnings);
+    let r = loaded.rules.get("r").expect("rule r");
+    assert_eq!(r.action_specs().len(), 2);
+    assert_eq!(
+        serde_json::to_value(r.action_specs()).unwrap(),
+        serde_json::json!([
+            { "function": "republish", "args": { "topic": "o/${a}", "qos": 1, "direct_dispatch": false } },
+            { "function": "console" }
+        ])
+    );
+    assert!(loaded.rules.get("s").unwrap().action_specs().is_empty());
+    assert!(loaded.rules.get("nope").is_none());
+}
+
+/// A dry run evaluates one rule even when it is disabled (the rule being edited), leaves
+/// FROM matching to the caller, and gives a non-matching input `--rule-test`'s reason.
+#[test]
+fn one_rule_can_be_evaluated_whether_or_not_it_is_enabled() {
+    let set = load(
+        r#"
+        [rules.off]
+        enable = false
+        sql = 'SELECT payload.v AS v FROM "t/+" WHERE v > 1'
+        actions = [{ function = "republish", args = { topic = "o/${v}", qos = 0 } }]
+        [rules.on]
+        sql = 'SELECT clientid FROM "$events/client/connected"'
+        "#,
+    );
+    let payload = Bytes::from_static(br#"{"v":5}"#);
+    let props = mqtt_core::AppProperties::default();
+    let m = msg("t/1", &payload, &props);
+    let (out, _) = effects(&set, &m);
+    assert!(out.is_empty(), "the set does not run a disabled rule");
+
+    let mut out = Vec::new();
+    let mut log = Vec::new();
+    assert!(set.evaluate_one(
+        "off",
+        &m,
+        &mut |r, o| log.push(format!("{}:{}", r.id(), matches!(o, Outcome::Passed))),
+        &mut out
+    ));
+    assert_eq!(log, ["off:true", "off:false"], "passed, then its action");
+    assert_eq!(republished(&out[0].1).topic, "o/5");
+    assert!(!set.evaluate_one("missing", &m, &mut |_, _| {}, &mut Vec::new()));
+
+    let off = set.get("off").unwrap();
+    assert_eq!(off.from_mismatch(&m), None);
+    let elsewhere = msg("x/1", &payload, &props);
+    let why = off.from_mismatch(&elsewhere).expect("x/1 is not selected");
+    let sql = off.sql();
+    assert_eq!(Some(why), test_sql(sql, &elsewhere).err());
+    let why = set
+        .get("on")
+        .unwrap()
+        .from_mismatch(&m)
+        .expect("events only");
+    assert!(
+        why.contains("selects only events (client.connected)"),
+        "{why}"
+    );
+}
+
 /// Only the broker publishes in `$SYS` (ADR 0084): a republish that renders a topic
 /// there fails its action, whatever the template, and the rule's other actions run.
 #[test]
