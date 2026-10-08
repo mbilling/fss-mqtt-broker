@@ -391,11 +391,8 @@ fn rule<'a>(answer: &'a Value, id: &str) -> &'a Value {
 #[allow(clippy::too_many_lines)] // one answer read twice, field by field
 async fn the_running_rules_are_read_whole_by_an_operator_and_redacted_for_a_viewer() {
     let n = Node::start(RULES).await;
-    // Live traffic: alpha passes twice, fails fails once and keeps its error.
-    n.publish("a/1", br#"{"v":2}"#);
-    n.publish("a/2", br#"{"v":3}"#);
-    n.publish("e/1", br#"{"v":"s3cret-value"}"#);
-    // One statistics tick sees the activity: when each rule last ran.
+    // The statistics' first tick takes their baseline; the next one sees the activity
+    // since: when each rule last ran.
     let (hub_tx, mut hub_rx) = mpsc::unbounded_channel();
     let stop = tokio_util::sync::CancellationToken::new();
     tokio::spawn(mqttd::rules_sys::run_stats(
@@ -407,13 +404,21 @@ async fn the_running_rules_are_read_whole_by_an_operator_and_redacted_for_a_view
         std::time::SystemTime::now(),
         stop.clone(),
     ));
-    // The tick's summary and five rule messages, then the tick is done.
-    for _ in 0..6 {
-        let sent = tokio::time::timeout(Duration::from_secs(10), hub_rx.recv()).await;
-        assert!(
-            matches!(sent, Ok(Some(HubCommand::SysPublish { .. }))),
-            "a statistics tick within 10 s"
-        );
+    for traffic in [false, true] {
+        if traffic {
+            // Live traffic: alpha passes twice, fails fails once and keeps its error.
+            n.publish("a/1", br#"{"v":2}"#);
+            n.publish("a/2", br#"{"v":3}"#);
+            n.publish("e/1", br#"{"v":"s3cret-value"}"#);
+        }
+        // The tick's summary and five rule messages, then the tick is done.
+        for _ in 0..6 {
+            let sent = tokio::time::timeout(Duration::from_secs(10), hub_rx.recv()).await;
+            assert!(
+                matches!(sent, Ok(Some(HubCommand::SysPublish { .. }))),
+                "a statistics tick within 10 s"
+            );
+        }
     }
     stop.cancel();
     // A reload rejected over a rules file whose text the error quotes, then the file put

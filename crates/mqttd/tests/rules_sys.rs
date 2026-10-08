@@ -259,6 +259,81 @@ async fn the_statistics_list_every_rule_with_counts_rates_and_last_activity() {
     );
 }
 
+/// [`THREE_RULES`] without `hot`.
+const HOT_REMOVED: &str = r#"
+[rules.cold]
+sql = 'SELECT * FROM "never/#"'
+actions = [{ function = "console" }]
+
+[rules.off]
+sql = 'SELECT * FROM "t/#"'
+actions = [{ function = "console" }]
+enable = false
+"#;
+
+/// ADR 0084 D4: `last_active_at` is the tick at which the statistics saw a rule's
+/// evaluations grow. What ran before they were on, or while they were off, was not seen
+/// to run. A reload that removes a rule and one that puts it back keep its last activity
+/// with its counts, which are kept by rule id: the rule put back is active again only
+/// once it runs.
+#[tokio::test(start_paused = true)]
+async fn last_active_is_kept_across_a_reload_and_set_only_when_a_rule_runs() {
+    let w = watched(THREE_RULES, &settings(0, false, 20));
+    let (mut sys, _stop) = spawn_stats(&w, plenty(), Arc::new(LastReload::default()));
+    let conn = w.rules.for_connection();
+    publish(&conn, "t/1", br#"{"v":5}"#);
+    w.observe.apply(&settings(2, false, 20), None);
+    let (_, per_rule) = next_tick(&mut sys, 3).await;
+    assert_eq!(per_rule["hot"]["counts"]["matched"], 1);
+    assert_eq!(
+        per_rule["hot"]["last_active_at"],
+        Value::Null,
+        "it ran before the statistics were on"
+    );
+
+    publish(&conn, "t/1", br#"{"v":5}"#);
+    let (summary, per_rule) = next_tick(&mut sys, 3).await;
+    let ran = per_rule["hot"]["last_active_at"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(ran, summary["at"].as_str().unwrap(), "seen at this tick");
+
+    w.rules_tx.send(rule_set(HOT_REMOVED)).unwrap();
+    next_tick(&mut sys, 2).await;
+    w.rules_tx.send(rule_set(THREE_RULES)).unwrap();
+    let (_, per_rule) = next_tick(&mut sys, 3).await;
+    assert_eq!(per_rule["hot"]["counts"]["matched"], 2, "kept by rule id");
+    assert_eq!(
+        per_rule["hot"]["last_active_at"],
+        ran.as_str(),
+        "put back, and not run since"
+    );
+
+    publish(&conn, "t/1", br#"{"v":5}"#);
+    let (summary, per_rule) = next_tick(&mut sys, 3).await;
+    assert_eq!(per_rule["hot"]["last_active_at"], summary["at"]);
+    assert_ne!(per_rule["hot"]["last_active_at"], ran.as_str());
+    let active = summary["at"].as_str().unwrap().to_string();
+
+    // Off, a run nobody sees, and on again.
+    w.observe.apply(&settings(0, false, 20), None);
+    assert!(
+        timeout(Duration::from_secs(60), sys.recv()).await.is_err(),
+        "off: no tick"
+    );
+    publish(&conn, "t/1", br#"{"v":5}"#);
+    w.observe.apply(&settings(2, false, 20), None);
+    let (_, per_rule) = next_tick(&mut sys, 3).await;
+    assert_eq!(per_rule["hot"]["counts"]["matched"], 4);
+    assert_eq!(
+        per_rule["hot"]["last_active_at"],
+        active.as_str(),
+        "the run while off was not seen"
+    );
+    assert_eq!(per_rule["cold"]["last_active_at"], Value::Null);
+}
+
 /// ADR 0084: the settings are live. A shorter interval applies at once — the next tick
 /// is the new interval after the last, not after the old one — off stops the ticks, and
 /// on again ticks at once when that is already due.

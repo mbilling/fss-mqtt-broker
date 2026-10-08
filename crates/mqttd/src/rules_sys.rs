@@ -134,6 +134,10 @@ pub async fn run_stats(
     let mut last_tick: Option<Instant> = None;
     loop {
         let interval = settings.borrow_and_update().sys_interval_secs;
+        if interval == 0 {
+            // Off: what runs meanwhile is not seen, so the next tick takes a new baseline.
+            stats.seeded = false;
+        }
         // Measured from the last tick, so a shorter interval that is already due fires
         // now rather than after the old one.
         let next = (interval > 0)
@@ -175,6 +179,11 @@ struct Tick<'a> {
     interval: u64,
 }
 
+/// The rule ids whose last activity the statistics remember: four times the rules a
+/// file may hold. Ids a reload removed are kept, so one put back is not taken for one
+/// that ran; past this, only the running set's are.
+const SEEN_MAX: usize = 4 * mqtt_rules::MAX_RULES;
+
 /// What the statistics remember from one tick to the next.
 #[derive(Default)]
 struct Stats {
@@ -183,6 +192,14 @@ struct Stats {
     /// Each rule's counts at the previous tick, and when it was.
     prev: HashMap<Arc<str>, RuleCounts>,
     prev_at: Option<(Instant, SystemTime)>,
+    /// Each rule id's evaluation count when last looked at — what its growth, and so
+    /// its last activity, is measured against. Kept across reloads, at most
+    /// [`SEEN_MAX`] ids.
+    seen: HashMap<Arc<str>, u64>,
+    /// Whether `seen` holds a baseline: not before the first tick, nor after the
+    /// statistics were off. The tick that takes one sets no last activity, since what
+    /// ran before it was not seen to run.
+    seeded: bool,
     /// The running set's digest and each rule's definition hash, recomputed on a reload.
     defs_of: String,
     defs: HashMap<Arc<str>, String>,
@@ -276,6 +293,14 @@ impl Stats {
         let secs = self
             .prev_at
             .map_or(0.0, |(then, _)| now.duration_since(then).as_secs_f64());
+        let seeding = !std::mem::replace(&mut self.seeded, true);
+        if seeding {
+            // The ids kept from before are seen afresh too, so one put back later is
+            // measured from now.
+            for (id, count) in &mut self.seen {
+                *count = ctx.metrics.map_or(0, |m| matched(&m.rule_counts(id)));
+            }
+        }
         let tracing = observe.tracing();
         let at_s = rfc3339_millis(at);
         let mut messages = vec![(
@@ -288,8 +313,12 @@ impl Stats {
             let def = self.defs.get(id).cloned().unwrap_or_default();
             let counts = ctx.metrics.map(|m| m.rule_counts(id)).unwrap_or_default();
             let before = self.prev.get(id);
-            // Kept with the rules, where the admin API reads it too.
-            if before.map_or(matched(&counts) > 0, |b| matched(&counts) > matched(b)) {
+            // Growth since the rule was last looked at; a rule never looked at (added
+            // since the baseline) is measured from zero. Kept with the rules, where the
+            // admin API reads it too.
+            let now_matched = matched(&counts);
+            let was = self.seen.insert(id.clone(), now_matched);
+            if !seeding && now_matched > was.unwrap_or(0) {
                 observe.set_last_active(id, at);
             }
             if let (Some(b), Some((_, prev_tick))) = (before, self.prev_at) {
@@ -323,7 +352,10 @@ impl Stats {
             counted.insert(id.clone(), counts);
         }
         self.prev = counted;
-        observe.retain_last_active(|id| self.prev.contains_key(id));
+        if self.seen.len() > SEEN_MAX {
+            self.seen.retain(|id, _| self.prev.contains_key(id));
+        }
+        observe.retain_last_active(|id| self.seen.contains_key(id));
         self.prev_at = Some((now, at));
         messages
     }

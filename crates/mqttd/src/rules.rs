@@ -894,9 +894,10 @@ impl RulesObserve {
         self.errors().retain(|id, e| keep(id, e));
     }
 
-    /// When `rule` last ran, as of the statistics' last tick: the tick at which its
-    /// evaluation count was seen to grow. `None` before it ran, and while the statistics
-    /// are off.
+    /// When `rule` last ran, as the statistics saw it: the tick at which its evaluation
+    /// count was seen to grow. `None` until they see it grow — runs from before they were
+    /// turned on, or while they were off, are not seen. Kept while a reload removes the
+    /// rule, as its counts are, so a rule put back is not taken for one that ran.
     #[must_use]
     pub fn last_active(&self, rule: &str) -> Option<SystemTime> {
         self.active().get(rule).copied()
@@ -912,7 +913,7 @@ impl RulesObserve {
         self.active().insert(rule.clone(), at);
     }
 
-    /// Forget when the rules `keep` refuses last ran: a reload removed them.
+    /// Forget when the rules `keep` refuses last ran: ids the statistics no longer keep.
     pub(crate) fn retain_last_active(&self, keep: impl Fn(&str) -> bool) {
         self.active().retain(|id, _| keep(id));
     }
