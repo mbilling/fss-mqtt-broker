@@ -396,9 +396,12 @@ function followFile() {
     $("r-changed").hidden = true;
   } else {
     const note = $("r-changed");
-    note.textContent = `${state.selected} ${now ? "changed" : "was deleted"} since you opened it, ` +
-      "in another tab or client. To see the newer version, choose it in the table (your edit " +
-      "here is lost). Apply is refused once; a second Apply replaces that change.";
+    note.textContent = now
+      ? `${state.selected} changed since you opened it, in another tab or client. To see the ` +
+        "newer version, choose it in the table (your edit here is lost). Apply is refused once; " +
+        "a second Apply replaces that change."
+      : `${state.selected} was deleted since you opened it, in another tab or client. Apply is ` +
+        "refused once; a second Apply puts it back.";
     note.hidden = false;
   }
 }
