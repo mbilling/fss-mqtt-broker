@@ -172,6 +172,12 @@ fn report(
     outcome: Outcome<'_>,
 ) {
     let (eval, action) = match outcome {
+        Outcome::Elapsed(d) => {
+            if let Some(m) = metrics {
+                m.rule_eval_time(rule.id(), d);
+            }
+            return;
+        }
         Outcome::Passed => (Some("passed"), None),
         Outcome::NoResult => (Some("no_result"), None),
         Outcome::Failed(e) => {
@@ -1264,6 +1270,8 @@ impl Capture {
 
     fn see(&mut self, rule: &Rule, outcome: Outcome<'_>) {
         let (result, error) = match outcome {
+            // The rule's cost is in its statistics, not in each trace record.
+            Outcome::Elapsed(_) => return,
             Outcome::Passed => (TraceResult::Passed, None),
             Outcome::NoResult => (TraceResult::NoResult, None),
             Outcome::Failed(e) => (TraceResult::Failed, Some(e)),

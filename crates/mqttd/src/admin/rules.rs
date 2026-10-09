@@ -803,6 +803,8 @@ fn evaluate(set: &RuleSet, rule: &Rule, input: &dyn Input) -> Value {
                 slots.push(Slot::Failed(actions % per_output, e.to_string()));
                 actions += 1;
             }
+            // A dry run is not timed (`evaluate_one` never reports it).
+            Outcome::Elapsed(_) => {}
         },
         &mut effects,
     );

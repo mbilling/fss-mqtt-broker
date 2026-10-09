@@ -150,7 +150,9 @@ is off) each node publishes, every interval:
   such as the file watcher retrying a broken file (0 for a success);
 - `$SYS/brokers/<node>/rules/<id>`, one per rule, enabled or not: its counts
   (`matched`, `passed`, `no_result`, `failed`, `actions_ok`, `actions_failed`), their rates
-  over the last interval, when the statistics last saw the rule run, a short keyed hash of
+  over the last interval, the time spent evaluating it (`eval_ns`, added 2026-10-09 with
+  `mqttd_rule_eval_seconds_total`) and its average per evaluation, since start and over
+  the last interval (`eval_us_avg`), when the statistics last saw the rule run, a short keyed hash of
   the rule's definition, and the last error's time and kind.
 
 The counts are the Prometheus counters, read without creating a series, so they are

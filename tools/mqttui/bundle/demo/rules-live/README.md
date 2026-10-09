@@ -51,7 +51,7 @@ Subscribe to those by name:
 
 | Topics | What | Try |
 |---|---|---|
-| `$SYS/brokers/+/rules/#` | A summary every 2 s (the running rules' digest, how many are enabled, the last reload, the trace setting), then one message per rule: its counts since the broker started (`matched`, `passed`, `no_result`, `failed`, `actions_ok`, `actions_failed`), rates per second, when it last matched and its last error | `mosquitto_sub -v -t '$SYS/brokers/+/rules/#'` |
+| `$SYS/brokers/+/rules/#` | A summary every 2 s (the running rules' digest, how many are enabled, the last reload, the trace setting), then one message per rule: its counts since the broker started (`matched`, `passed`, `no_result`, `failed`, `actions_ok`, `actions_failed`), the time spent evaluating it (`eval_ns`, and `eval_us_avg` per message), rates per second, when it last matched and its last error | `mosquitto_sub -v -t '$SYS/brokers/+/rules/#'` |
 | `$SYS/brokers/+/trace/rules/+` | The rule trace: for each rule, at most 5 records a second, and 5 more for messages its WHERE turned away (`no_result`), of the message it ran on (topic, client id, the first 1 KiB of the payload), the result, and every message it rendered. Not under `rules/#`: a trace subscription must be asked for on purpose | `mosquitto_sub -v -t '$SYS/brokers/+/trace/rules/+'` |
 | `alerts/#`, `kpi/#`, `normalized/#`, `analytics/#`, `state/#`, `events/#` | What the rules derive: the six roots of [the demo's rules](../rules/README.md#where-the-results-go) | `mosquitto_sub -v -t 'alerts/#' -t 'kpi/#' -t 'state/#'` |
 | `plant/#`, `home/#`, `vehicle/#` | What the devices publish | `mosquitto_sub -v -t 'vehicle/#'` |
@@ -89,6 +89,9 @@ table below it counts every rule's messages as they arrive, with rates over the 
    many readings, one every 20 s or so. **Passed** still grows, since the counts add up from
    the broker's start (an edited rule keeps its counts), but more slowly; **Passed/s**
    drops, and in the trace (tick **Hide no_result**) the passes come further apart.
+   **Avg µs** is what the rule costs per message over the last 10 s: its SQL plus
+   rendering its actions (not routing what it republishes). Compare rules side by side,
+   or watch it while you edit one: a heavier `WHERE` or a `FOREACH` shows up there first.
 6. **Delete** removes `demo_rule_1` again.
 
 The simulated grid also has an excursion: 6 min 45 s into every ten-minute window (at

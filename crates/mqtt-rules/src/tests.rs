@@ -951,10 +951,14 @@ fn effects(set: &RuleSet, input: &PublishInput) -> (Vec<(Arc<str>, Effect)>, Vec
     set.on_publish(
         input,
         &mut |r, o| {
+            if matches!(o, Outcome::Elapsed(_)) {
+                return; // timing, checked on its own
+            }
             log.push(format!(
                 "{}:{}",
                 r.id(),
                 match o {
+                    Outcome::Elapsed(_) => unreachable!(),
                     Outcome::Passed => "passed".to_string(),
                     Outcome::NoResult => "no_result".to_string(),
                     Outcome::Failed(e) => format!("failed({e})"),
@@ -1829,6 +1833,69 @@ fn the_trace_rate_window_is_per_rule_per_second() {
     assert_eq!(taken(c, wrap - 1, 10), 3);
     assert_eq!(taken(c, wrap, 10), 3);
     assert_eq!(taken(c, wrap - 1, 10), 0);
+}
+
+/// An [`Outcome`]'s name, for asserting on a sequence of them.
+fn outcome_kind(o: Outcome<'_>) -> &'static str {
+    match o {
+        Outcome::Passed => "passed",
+        Outcome::NoResult => "no_result",
+        Outcome::Failed(_) => "failed",
+        Outcome::ActionOk => "action_ok",
+        Outcome::ActionFailed(_) => "action_failed",
+        Outcome::Elapsed(_) => "elapsed",
+    }
+}
+
+/// Each rule a message reaches reports how long it took (ADR 0084), once and last, after
+/// its other outcomes, whether it passed, filtered or failed; a rule it does not reach,
+/// and a dry run, report none.
+#[test]
+fn every_evaluated_rule_reports_its_time_once_after_its_outcomes() {
+    let set = load(
+        r#"
+        [rules.pass]
+        sql = 'SELECT payload.v AS v FROM "t/+"'
+        actions = [{ function = "republish", args = { topic = "o/${v}", qos = 0 } }]
+        [rules.filter]
+        sql = 'SELECT payload.v AS v FROM "t/+" WHERE v > 100'
+        [rules.fail]
+        sql = 'SELECT payload.v + "x" AS v FROM "t/+"'
+        [rules.elsewhere]
+        sql = 'SELECT payload FROM "x/+"'
+        "#,
+    );
+    let payload = Bytes::from_static(br#"{"v":5}"#);
+    let props = mqtt_core::AppProperties::default();
+    let m = msg("t/1", &payload, &props);
+    let mut log: Vec<(String, &'static str)> = Vec::new();
+    set.on_publish(
+        &m,
+        &mut |r, o| log.push((r.id().to_string(), outcome_kind(o))),
+        &mut Vec::new(),
+    );
+    let mut per_rule: BTreeMap<String, Vec<&str>> = BTreeMap::new();
+    for (id, kind) in &log {
+        per_rule.entry(id.clone()).or_default().push(kind);
+    }
+    assert_eq!(
+        per_rule,
+        BTreeMap::from([
+            ("fail".to_string(), vec!["failed", "elapsed"]),
+            ("filter".to_string(), vec!["no_result", "elapsed"]),
+            ("pass".to_string(), vec!["passed", "action_ok", "elapsed"]),
+        ]),
+        "{log:?}"
+    );
+
+    let mut dry = Vec::new();
+    assert!(set.evaluate_one(
+        "pass",
+        &m,
+        &mut |_, o| dry.push(outcome_kind(o)),
+        &mut Vec::new()
+    ));
+    assert!(!dry.contains(&"elapsed"), "a dry run is not timed: {dry:?}");
 }
 
 /// `statement`'s outputs on a message, evaluated as [`eval::run`] does and as EMQX's
