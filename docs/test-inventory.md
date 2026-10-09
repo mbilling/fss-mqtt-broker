@@ -892,7 +892,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::sink_records_through_a_trait_object`
 - `tests::tampering_with_any_field_changes_the_head`
 
-## `crates/mqtt-rules/src/lib.rs` — 94 test(s)
+## `crates/mqtt-rules/src/lib.rs` — 95 test(s)
 
 - `edit::tests::a_json_rule_body_is_a_rule_edit`
 - `edit::tests::an_insert_appends_the_rule_at_the_end`
@@ -932,6 +932,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::conversion_functions_emqx_docs`
 - `tests::double_quoted_comparisons_warn_but_parse_as_fields`
 - `tests::events_are_selected_by_either_emqx_spelling`
+- `tests::every_evaluated_rule_reports_its_time_once_after_its_outcomes`
 - `tests::every_function_is_documented_in_rules_md`
 - `tests::expressions_emqx_docs`
 - `tests::expressions_too_deep_to_evaluate_safely_fail_the_load`

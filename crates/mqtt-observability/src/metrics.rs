@@ -183,6 +183,13 @@ struct RuleResultLabel {
     result: String,
 }
 
+/// `{rule}` for `mqttd_rule_eval_seconds_total`: a rule id from the operator's rules
+/// file, bounded as in [`RuleResultLabel`].
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct RuleLabel {
+    rule: String,
+}
+
 /// One rule's cumulative counts since the process started (ADR 0084), as
 /// `mqttd_rule_evaluations_total` and `mqttd_rule_actions_total` hold them; see
 /// [`Metrics::rule_counts`].
@@ -198,6 +205,9 @@ pub struct RuleCounts {
     pub actions_ok: u64,
     /// Actions that failed: at render time, or a republish refused or not routed.
     pub actions_failed: u64,
+    /// Time spent evaluating it, in nanoseconds: its SQL and its actions' rendering,
+    /// summed over every live evaluation (`mqttd_rule_eval_seconds_total`).
+    pub eval_ns: u64,
 }
 
 /// The OpenTelemetry mirror of every metric, recorded alongside the Prometheus handles
@@ -284,6 +294,7 @@ struct OtelInstruments {
     config_info: OtelGauge<i64>,
     rule_evaluations: OtelCounter<u64>,
     rule_actions: OtelCounter<u64>,
+    rule_eval_seconds: OtelCounter<f64>,
     rules_loaded: OtelGauge<i64>,
     rules_info: OtelGauge<i64>,
     swim_keys_accepted: OtelGauge<i64>,
@@ -383,6 +394,7 @@ impl OtelInstruments {
             config_info: meter.i64_gauge("config_info").build(),
             rule_evaluations: meter.u64_counter("rule_evaluations").build(),
             rule_actions: meter.u64_counter("rule_actions").build(),
+            rule_eval_seconds: meter.f64_counter("rule_eval_seconds").build(),
             rules_loaded: meter.i64_gauge("rules_loaded").build(),
             rules_info: meter.i64_gauge("rules_info").build(),
             swim_keys_accepted: meter.i64_gauge("swim_keys_accepted").build(),
@@ -571,6 +583,8 @@ pub struct Metrics {
     rule_evaluations_total: Family<RuleResultLabel, Counter>,
     /// Rule actions run (ADR 0083), by rule and result (`ok`, `failed`).
     rule_actions_total: Family<RuleResultLabel, Counter>,
+    /// Time spent evaluating each rule, in seconds (ADR 0084).
+    rule_eval_seconds_total: Family<RuleLabel, Counter<f64, std::sync::atomic::AtomicU64>>,
     /// Enabled rules loaded on this node (ADR 0083).
     rules_loaded: Gauge,
     /// The loaded rules file's checksum (ADR 0083), `config_info`-style: after a
@@ -1284,6 +1298,16 @@ impl Metrics {
              brownout, a refused original, an ingress shed, a failed durable write; the \
              triggering message is unaffected)",
         );
+        let rule_eval_seconds_total =
+            Family::<RuleLabel, Counter<f64, std::sync::atomic::AtomicU64>>::default();
+        registry.register(
+            "rule_eval_seconds",
+            "Time spent evaluating each rule (ADR 0084), in seconds, by rule id: its SQL \
+             plus rendering its actions' effects, summed over live evaluations (dry runs \
+             excluded). Divided by the growth of mqttd_rule_evaluations_total it is the \
+             rule's average cost per message; routing a republished message is not in it",
+            rule_eval_seconds_total.clone(),
+        );
         let rules_loaded = register_gauge(
             &mut registry,
             "rules_loaded",
@@ -1435,6 +1459,7 @@ impl Metrics {
             config_info_prev: std::sync::Mutex::new(None),
             rule_evaluations_total,
             rule_actions_total,
+            rule_eval_seconds_total,
             rules_loaded,
             rules_info,
             rules_info_prev: std::sync::Mutex::new(None),
@@ -2274,7 +2299,21 @@ impl Metrics {
         );
     }
 
-    /// One rule's counts so far (ADR 0084), read back from its two families without
+    /// The time one live evaluation of `rule` took (ADR 0084): its SQL and its actions'
+    /// rendering.
+    pub fn rule_eval_time(&self, rule: &str, elapsed: std::time::Duration) {
+        let secs = elapsed.as_secs_f64();
+        self.rule_eval_seconds_total
+            .get_or_create(&RuleLabel {
+                rule: rule.to_string(),
+            })
+            .inc_by(secs);
+        self.otel
+            .rule_eval_seconds
+            .add(secs, &[KeyValue::new("rule", rule.to_string())]);
+    }
+
+    /// One rule's counts so far (ADR 0084), read back from its three families without
     /// creating a series: a rule that never matched has none, and still reads zeros.
     /// Each lookup's read guard is dropped before the next is taken — the family lock
     /// is not re-entrant while a writer waits, and an evaluation creating a series is
@@ -2295,6 +2334,12 @@ impl Metrics {
             failed: get(&self.rule_evaluations_total, "failed"),
             actions_ok: get(&self.rule_actions_total, "ok"),
             actions_failed: get(&self.rule_actions_total, "failed"),
+            eval_ns: self
+                .rule_eval_seconds_total
+                .get(&RuleLabel {
+                    rule: rule.to_string(),
+                })
+                .map_or(0, |c| secs_to_ns(c.get())),
         }
     }
 
@@ -2619,6 +2664,13 @@ fn register_counter(registry: &mut Registry, name: &'static str, help: &'static 
 }
 
 /// Register a fresh labelled counter family under `name`/`help` and return a handle.
+/// Whole nanoseconds in `secs` of a seconds counter. A float-to-int `as` saturates
+/// (negative and NaN to 0), and a counter is never negative anyway.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn secs_to_ns(secs: f64) -> u64 {
+    (secs * 1e9).round() as u64
+}
+
 fn register_family<L>(
     registry: &mut Registry,
     name: &'static str,
@@ -2728,6 +2780,8 @@ mod tests {
         }
         m.rule_action("r", "failed");
         m.rule_evaluated("other", "passed");
+        m.rule_eval_time("r", std::time::Duration::from_micros(150));
+        m.rule_eval_time("r", std::time::Duration::from_nanos(2_500));
         assert_eq!(
             m.rule_counts("r"),
             RuleCounts {
@@ -2736,7 +2790,14 @@ mod tests {
                 failed: 2,
                 actions_ok: 4,
                 actions_failed: 1,
+                eval_ns: 152_500,
             }
+        );
+        assert!(
+            m.render()
+                .contains("mqttd_rule_eval_seconds_total{rule=\"r\"} 0.0001525"),
+            "the time is exported in seconds:\n{}",
+            m.render()
         );
         assert!(
             !m.render().contains("rule=\"never\""),

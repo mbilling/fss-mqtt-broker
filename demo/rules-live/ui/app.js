@@ -248,7 +248,7 @@ function ruleRow(rule) {
   const to = (rule.actions_spec || []).map((a) => (a && a.function === "republish" && a.args
     ? a.args.topic : a && a.function)).filter((t) => typeof t === "string").join(", ");
   for (const [key, text] of [["on", ""], ["from", from], ["to", to], ["matched"], ["passed"], ["no_result"],
-    ["failed"], ["actions_failed"], ["matched_rate"], ["passed_rate"], ["active"], ["error"]]) {
+    ["failed"], ["actions_failed"], ["matched_rate"], ["passed_rate"], ["avg_us"], ["active"], ["error"]]) {
     const td = el("td");
     if (text) topicText(td, text);
     td.dataset.key = key;
@@ -272,6 +272,8 @@ function fillRow(tr, rule, live) {
   const r = rates(rule.id);
   cell("matched_rate").textContent = r ? r.matched.toFixed(2) : "-";
   cell("passed_rate").textContent = r ? r.passed.toFixed(2) : "-";
+  // Over the window when the rule ran in it; "-" when it did not, or a broker predates it.
+  cell("avg_us").textContent = r && r.avgUs !== null ? r.avgUs.toFixed(1) : "-";
   cell("active").textContent = src.last_active_at ? ago(src.last_active_at) : "never";
   // $SYS never carries the message; the list has it for an operator (onRuleStats asks).
   let err = src.last_error;
@@ -293,7 +295,7 @@ function sample(id, rec) {
   // The broker restarted, or a gap (a hidden tab, a rule away for a while): a rate taken
   // across it would average the gap in.
   if (last && (t < last.t || c.matched < last.matched || t - last.t > RATE_WINDOW)) h = [];
-  h.push({ t, matched: c.matched, passed: c.passed });
+  h.push({ t, matched: c.matched, passed: c.passed, evalNs: c.eval_ns });
   while (h.length > 2 && h[1].t <= t - RATE_WINDOW) h.shift();
   state.history.set(id, h);
 }
@@ -304,7 +306,11 @@ function rates(id) {
   const a = h[0];
   const b = h[h.length - 1];
   const secs = (b.t - a.t) / 1000;
-  return { matched: (b.matched - a.matched) / secs, passed: (b.passed - a.passed) / secs };
+  const evals = b.matched - a.matched;
+  // Time per evaluation over the window, from the broker's cumulative eval_ns (ADR 0084).
+  const avgUs = evals > 0 && typeof a.evalNs === "number" && typeof b.evalNs === "number"
+    ? (b.evalNs - a.evalNs) / evals / 1000 : null;
+  return { matched: evals / secs, passed: (b.passed - a.passed) / secs, avgUs };
 }
 
 function updateRow(id) {

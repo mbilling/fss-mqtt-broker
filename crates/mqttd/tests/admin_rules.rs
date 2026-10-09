@@ -453,8 +453,22 @@ async fn the_running_rules_are_read_whole_by_an_operator_and_redacted_for_a_view
     );
     assert_eq!(alpha["actions"], 1);
     assert_eq!(alpha["def"].as_str().unwrap().len(), 16);
+    // The evaluation time varies run to run: there is some, and the average is its share.
+    let mut counts = alpha["counts"].clone();
+    let eval_ns = counts["eval_ns"].as_u64().expect("eval_ns");
+    assert!(eval_ns > 0, "{counts}");
     assert_eq!(
-        alpha["counts"],
+        counts["eval_us_avg"],
+        json!(
+            (f64::from(u32::try_from(eval_ns).expect("a few evaluations")) / 2.0).round() / 1000.0
+        ),
+        "the average over its 2 evaluations, in microseconds: {counts}"
+    );
+    let map = counts.as_object_mut().unwrap();
+    map.remove("eval_ns");
+    map.remove("eval_us_avg");
+    assert_eq!(
+        counts,
         json!({"matched": 2, "passed": 2, "no_result": 0, "failed": 0, "actions_ok": 0,
                "actions_failed": 0}),
         "a derived message's action is counted when the hub routes it; none was sent here"
@@ -907,7 +921,14 @@ async fn the_dry_run_shows_what_the_rules_would_do_and_changes_nothing() {
         .expect("the live failure is reported");
     assert!(kept.message.contains("live"), "{kept:?}");
     assert_eq!(n.trace_rx.try_recv().unwrap().rule.as_ref(), "fails");
-    assert_eq!(n.series_of("fails").len(), 1, "{:?}", n.series_of("fails"));
+    // One live failure: its evaluation, and the time it took (ADR 0084).
+    let series = n.series_of("fails");
+    assert_eq!(series.len(), 2, "{series:?}");
+    assert!(
+        series[0].starts_with("mqttd_rule_evaluations_total{rule=\"fails\",result=\"failed\"} 1")
+            && series[1].starts_with("mqttd_rule_eval_seconds_total{rule=\"fails\"} "),
+        "{series:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------------------

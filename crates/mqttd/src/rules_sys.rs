@@ -210,7 +210,20 @@ fn matched(c: &RuleCounts) -> u64 {
     c.passed + c.no_result + c.failed
 }
 
-/// A rule's counts as `$SYS` and the admin API show them, `matched` included.
+/// The average evaluation time in microseconds, to the thousandth (whole nanoseconds):
+/// `ns` spent over `evals` evaluations, 0 when there were none.
+#[allow(clippy::cast_precision_loss)] // nanosecond totals far below 2^52 per average
+fn avg_us(ns: u64, evals: u64) -> f64 {
+    if evals == 0 {
+        0.0
+    } else {
+        (ns as f64 / evals as f64).round() / 1000.0
+    }
+}
+
+/// A rule's counts as `$SYS` and the admin API show them, `matched` included, with the
+/// time spent evaluating it: `eval_ns` in total and `eval_us_avg` per evaluation, both
+/// since the broker started.
 #[must_use]
 pub fn counts_json(c: &RuleCounts) -> Value {
     json!({
@@ -220,6 +233,8 @@ pub fn counts_json(c: &RuleCounts) -> Value {
         "failed": c.failed,
         "actions_ok": c.actions_ok,
         "actions_failed": c.actions_failed,
+        "eval_ns": c.eval_ns,
+        "eval_us_avg": avg_us(c.eval_ns, matched(c)),
     })
 }
 
@@ -241,6 +256,15 @@ fn rates_json(now: &RuleCounts, before: Option<&RuleCounts>, secs: f64) -> Value
         "failed": rate(now.failed, b.failed),
         "actions_ok": rate(now.actions_ok, b.actions_ok),
         "actions_failed": rate(now.actions_failed, b.actions_failed),
+        // Not a rate: the average evaluation time over this tick's evaluations.
+        "eval_us_avg": if before.is_some() {
+            avg_us(
+                now.eval_ns.saturating_sub(b.eval_ns),
+                matched(now).saturating_sub(matched(&b)),
+            )
+        } else {
+            0.0
+        },
     })
 }
 
