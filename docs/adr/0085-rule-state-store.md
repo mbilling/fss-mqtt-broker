@@ -98,12 +98,14 @@ to the rule's namespace, or to another with `ns:key` syntax for a declared share
 TTLs are seconds or a duration string, capped by the namespace. These functions are an
 mqttd extension and are listed among the departures from EMQX.
 
-**A state call runs where it is written, and `SELECT` runs before `WHERE`** (a `WHERE`
-reads `SELECT` aliases). So a write in `SELECT` happens for every message the `FROM`
-selects, whatever the `WHERE` then decides; a write meant for some messages only is
-guarded with `CASE`, or uses `kv_held` / `kv_changed`, which encode the two most common
-patterns and their reset. `--rule-test --sequence` (D11) shows the store after each step,
-so this is visible before a rule runs.
+**When a state call runs.** A rule decides its `WHERE` first, on only the `SELECT` fields
+the `WHERE` reads (#882, which amends ADR 0083 §1). So a state call in a `SELECT` field
+the `WHERE` does not read runs only for messages that pass, as a reader expects; one in a
+field the `WHERE` reads (directly or through an alias) runs for every message the `FROM`
+selects, because the `WHERE` needs its value. `kv_held` and `kv_changed` are built for that
+second case: they encode the two most common patterns and their own reset, so they are
+right to run on every message. `--rule-test --sequence` (D11) shows the store after each
+step, so either case is visible before a rule runs.
 
 "Above 30 for 5 minutes":
 
