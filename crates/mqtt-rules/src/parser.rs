@@ -136,6 +136,85 @@ pub(crate) struct Statement {
     pub incase: Option<Expr>,
     pub from: Vec<String>,
     pub where_: Option<Expr>,
+    /// For a `SELECT … WHERE` statement: which `SELECT` items the `WHERE` reads, directly
+    /// or through an alias an item it reads reads. Evaluation computes those, decides the
+    /// `WHERE`, and computes the rest only for a message that passes ([`where_needs`]).
+    /// `None` for a `FOREACH` or a statement without `WHERE`.
+    pub where_needs: Option<Vec<bool>>,
+}
+
+/// Which of `fields` a `WHERE` of `cond` can read. A name resolves against what the
+/// statement has selected before it, then against the trigger's fields (`eval`'s lookup
+/// order), so the `WHERE` reads an item exactly when the item's key starts with a name the
+/// `WHERE` uses; and a needed item reads only items before it, through the names its own
+/// expression uses. Matching on the first key segment alone over-approximates (`payload.a`
+/// and `payload.b` are one name), which only computes an item early, never changes a result.
+fn where_needs(fields: &[Item], cond: &Expr) -> Vec<bool> {
+    let mut names = std::collections::HashSet::new();
+    names_in(cond, &mut names);
+    let mut needed = vec![false; fields.len()];
+    // Last to first: an item adds the names it reads only for the items before it.
+    for (i, item) in fields.iter().enumerate().rev() {
+        let Item::Field { expr, key, .. } = item else {
+            continue; // `*` copies the trigger's fields, which the WHERE reads the same anyway
+        };
+        if matches!(key.first(), Some(Seg::Key(head)) if names.contains(head)) {
+            needed[i] = true;
+            names_in(expr, &mut names);
+        }
+    }
+    needed
+}
+
+/// Every name `e` looks up: the head of each field path in it.
+fn names_in(e: &Expr, out: &mut std::collections::HashSet<Arc<str>>) {
+    let segs_in = |segs: &[Seg], out: &mut std::collections::HashSet<Arc<str>>| {
+        for s in segs {
+            if let Seg::IndexExpr(x) = s {
+                names_in(x, out);
+            }
+        }
+    };
+    match e {
+        Expr::Const(_) | Expr::RangeLit(..) => {}
+        Expr::Path { head, segs } => {
+            out.insert(head.clone());
+            segs_in(segs, out);
+        }
+        Expr::Get { base, segs } => {
+            names_in(base, out);
+            segs_in(segs, out);
+        }
+        Expr::GetRange { base, .. } | Expr::Neg(base) | Expr::Not(base) => names_in(base, out),
+        Expr::List(xs) | Expr::Call { args: xs, .. } => {
+            for x in xs {
+                names_in(x, out);
+            }
+        }
+        Expr::Arith(_, a, b) | Expr::Cmp(_, a, b) | Expr::And(a, b) | Expr::Or(a, b) => {
+            names_in(a, out);
+            names_in(b, out);
+        }
+        Expr::In { expr, list, .. } => {
+            names_in(expr, out);
+            for x in list {
+                names_in(x, out);
+            }
+        }
+        Expr::Case {
+            on,
+            whens,
+            otherwise,
+        } => {
+            for x in on.iter().chain(otherwise.iter()) {
+                names_in(x, out);
+            }
+            for (w, t) in whens {
+                names_in(w, out);
+                names_in(t, out);
+            }
+        }
+    }
 }
 
 /// Parse one statement. Returns it with any warnings worth showing the author. Its
@@ -308,6 +387,10 @@ impl Parser<'_> {
         if *self.peek() != Tok::Eof {
             return Err(self.err("unexpected text after the end of the statement"));
         }
+        let where_needs = match (&where_, foreach) {
+            (Some(cond), false) => Some(where_needs(&fields, cond)),
+            _ => None,
+        };
         Ok(Statement {
             foreach,
             fields,
@@ -315,6 +398,7 @@ impl Parser<'_> {
             incase,
             from,
             where_,
+            where_needs,
         })
     }
 
