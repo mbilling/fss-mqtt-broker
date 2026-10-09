@@ -7,6 +7,10 @@
 - **Supersedes in part:** [ADR 0063](0063-external-consumer-integration.md) §1, its "no
   built-in rule engine" clause. Its "no built-in Kafka/webhook sinks" clause and §2's
   consumer-group pattern for sinks stand.
+- **Amended 2026-10-09:** §1's "evaluation follows `emqx_rule_runtime`" now decides the
+  `WHERE` before the `SELECT` fields it does not read (same outputs; a field that would
+  fail on a rejected message is not evaluated, so that message counts as `no_result`).
+  Listed in [docs/RULES.md](../RULES.md#differences-from-emqx).
 - **Related:** [ADR 0018](0018-on-disk-persistence.md) / [ADR 0042](0042-durable-plane-stress-harness.md)
   T9 (an acknowledgement is released only for a message the broker owns; the pending-publish
   gate), [ADR 0082](0082-bounded-hub-ingress.md) (ingress credit and the FIFO data lane),
@@ -62,6 +66,15 @@ hub's **data lane is FIFO per connection, bounded by ingress credit** (ADR 0082)
    keywords as path segments) only where the meaning is unambiguous. The engine is the
    `mqtt-rules` crate, which holds no broker state and does no network I/O: it reads only
    its rules file, the clock and a random source.
+
+   > **Amended 2026-10-09:** one departure in evaluation order. EMQX computes every
+   > `SELECT` field, then the `WHERE`; mqttd works out at load which fields the `WHERE`
+   > reads (directly or through aliases they read), computes those, decides the `WHERE`,
+   > and computes the rest only for a message that passes. Outputs are identical; a field
+   > the `WHERE` does not read can no longer fail a message it turns away (that message
+   > is `no_result`, not `failed`). A rejecting rule with six computed fields went from
+   > 2.58 µs to 0.68 µs per message. Listed in
+   > [docs/RULES.md](../RULES.md#differences-from-emqx).
 
 2. **A client publish is evaluated on its connection task, after the ACL and before the
    hub, once, on the node it arrived at.** Connection tasks run in parallel on every core,
