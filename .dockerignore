@@ -7,3 +7,7 @@
 demo/grafana/data/
 # Operator scratch (gitignored); never part of an image.
 astra/
+# Scale-rig results (gitignored, local only) and session worktrees: tens of GB that no
+# image needs. Sending bench/scale/.runs (~20 GB) filled Docker's disk mid-build.
+bench/scale/.runs/
+.claude/
