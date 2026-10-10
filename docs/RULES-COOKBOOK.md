@@ -183,7 +183,7 @@ factory/line1/temp  qos=1 retain=0  {"t": 20.5}
 The broker's log has one line for it. The id, the port and the times differ on every run:
 
 ```text
-2026-10-07T16:35:42.937873Z  INFO mqttd::rules: rule console action rule=debug_factory output={"id":"00065D42B4CEC1F9F092834900000000","clientid":"plc-1","payload":"{\"t\": 20.5}","peerhost":"127.0.0.1","peername":"127.0.0.1:54475","topic":"factory/line1/temp","qos":1,"flags":{"dup":false,"retain":false},"pub_props":{"User-Property":{}},"publish_received_at":1791390942937,"client_attrs":{},"event":"message.publish","timestamp":1791390942937,"node":"node-local","metadata":{"rule_id":"debug_factory"}}
+2026-10-07T16:35:42.937873Z  INFO mqttd::rules: rule console action rule=debug_factory output={"id":"00065D42B4CEC1F9F092834900000000","clientid":"plc-1","username":"undefined","payload":"{\"t\": 20.5}","peerhost":"127.0.0.1","peername":"127.0.0.1:54475","topic":"factory/line1/temp","qos":1,"flags":{"dup":false,"retain":false},"pub_props":{"User-Property":{}},"publish_received_at":1791390942937,"client_attrs":{},"event":"message.publish","timestamp":1791390942937,"node":"node-local","metadata":{"rule_id":"debug_factory"}}
 ```
 
 **Try a statement without a broker.** `mqttd --rule-test` runs one statement against a
@@ -1471,5 +1471,4 @@ else:
 | Sending to Kafka, HTTP, a database or another system | There are no sink actions ([ADR 0083](adr/0083-rule-engine.md)) | Republish to a topic and consume it with a `$share` group ([INTEGRATION.md](INTEGRATION.md)); to another MQTT broker, [mqtt-bridge](BRIDGE.md) |
 | Calling out: an HTTP request, a script, a file or an environment variable | Rules do no I/O; `getenv` reads only `EMQXVAR_…` variables, fixed while the broker runs | A consumer service |
 | Dropping or changing the original message | A rule only adds messages | Have devices publish to a raw topic that subscribers cannot read (the ACL), and let a rule republish the cleaned message to the topic they do read |
-| One rule triggering another | A republished message never re-enters the rule engine, so rules cannot loop | Write the second rule against the original topic |
 | Protobuf, Sparkplug B or a schema registry | Those functions are not implemented ([RULES.md](RULES.md)) | A consumer that decodes and republishes |

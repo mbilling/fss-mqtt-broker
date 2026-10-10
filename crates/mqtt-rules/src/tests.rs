@@ -1029,6 +1029,7 @@ fn effects(set: &RuleSet, input: &PublishInput) -> (Vec<(Arc<str>, Effect)>, Vec
                     Outcome::Failed(e) => format!("failed({e})"),
                     Outcome::ActionOk => "action_ok".to_string(),
                     Outcome::ActionFailed(e) => format!("action_failed({e})"),
+                    Outcome::Recursive(g) => format!("recursive({})", g.as_str()),
                 }
             ));
         },
@@ -1313,16 +1314,42 @@ fn file_level_validation() {
         "unsupported action function",
     );
     bad("[rules.r]\nsql = 'SELECT a FROM \"$share/g/t\"'", "$share");
+    // EMQX's `union([boolean(), template()])`: a boolean, its text, an empty string (the
+    // default) or one placeholder load quietly; another literal loads with a warning,
+    // since it is false on every message; anything else is refused.
+    for dd in [
+        "false",
+        "true",
+        "\"true\"",
+        "\"false\"",
+        "\"\"",
+        "\"${payload.dd}\"",
+    ] {
+        let loaded = RuleSet::parse(&format!(
+            "[rules.r]\nsql = 'SELECT a FROM \"t\"'\nactions = [{{ function = \"republish\", args = {{ topic = \"x\", direct_dispatch = {dd} }} }}]"
+        ))
+        .unwrap();
+        assert!(loaded.warnings.is_empty(), "{dd}: {:?}", loaded.warnings);
+        assert_eq!(loaded.rules.digest().len(), 64);
+    }
     let loaded = RuleSet::parse(
-        "[rules.r]\nsql = 'SELECT a FROM \"t\"'\nactions = [{ function = \"republish\", args = { topic = \"x\", direct_dispatch = false } }]",
+        "[rules.r]\nsql = 'SELECT a FROM \"t\"'\nactions = [{ function = \"republish\", args = { topic = \"x\", direct_dispatch = \"yes\" } }]",
     )
     .unwrap();
     assert!(
-        loaded.warnings[0].contains("direct_dispatch"),
+        loaded.warnings[0]
+            .contains("direct_dispatch \"yes\" is neither a boolean nor a placeholder"),
         "{:?}",
         loaded.warnings
     );
-    assert_eq!(loaded.rules.digest().len(), 64);
+    bad(
+        "[rules.r]\nsql = 'SELECT a FROM \"t\"'\nactions = [{ function = \"republish\", args = { topic = \"x\", direct_dispatch = 1 } }]",
+        "`direct_dispatch` must be a boolean or a placeholder",
+    );
+    bad(
+        "[rules.r]\nsql = 'SELECT a FROM \"t\"'\nactions = [{ function = \"republish\", args = { topic = \"x\", direct_dispatch = \"a${b}\" } }]",
+        "direct_dispatch must be a literal or exactly one placeholder",
+    );
 }
 
 /// docs/RULES.md is the function reference operators read: every built-in must be in it,
@@ -1725,7 +1752,7 @@ fn a_loaded_set_keeps_its_action_specs_and_warnings() {
     )
     .unwrap();
     assert_eq!(loaded.rules.warnings(), loaded.warnings.as_slice());
-    assert_eq!(loaded.warnings.len(), 2, "{:?}", loaded.warnings);
+    assert_eq!(loaded.warnings.len(), 1, "{:?}", loaded.warnings);
     let r = loaded.rules.get("r").expect("rule r");
     assert_eq!(r.action_specs().len(), 2);
     assert_eq!(
@@ -1933,6 +1960,8 @@ fn outcome_kind(o: Outcome<'_>) -> &'static str {
         Outcome::ActionOk => "action_ok",
         Outcome::ActionFailed(_) => "action_failed",
         Outcome::Elapsed(_) => "elapsed",
+        Outcome::Recursive(Recursion::SameRule) => "recursive_same_rule",
+        Outcome::Recursive(Recursion::Depth) => "recursive_depth",
     }
 }
 

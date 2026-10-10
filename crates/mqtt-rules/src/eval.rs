@@ -56,8 +56,6 @@ pub struct EvalCtx<'a> {
     /// Bytes this message's functions have built beyond their inputs so far (see
     /// `funcs::MAX_BUILT_BYTES`).
     pub(crate) built: std::cell::Cell<usize>,
-    /// Bytes this message's effects carry so far (see [`crate::MAX_DERIVED_BYTES`]).
-    pub(crate) derived: std::cell::Cell<usize>,
     /// Where name lookup stops falling through ([`lookup`]): frames from this index on,
     /// with the input after them, are one merged map. `usize::MAX` (a `SELECT`): every
     /// frame and the input fall through in turn. Set per clause by [`merged_from`].
@@ -84,7 +82,6 @@ impl<'a> EvalCtx<'a> {
             rule_id: std::cell::RefCell::new(Arc::from("")),
             regex_cache: std::cell::RefCell::new(Vec::new()),
             built: std::cell::Cell::new(0),
-            derived: std::cell::Cell::new(0),
             merged_from: std::cell::Cell::new(usize::MAX),
         }
     }

@@ -892,7 +892,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::sink_records_through_a_trait_object`
 - `tests::tampering_with_any_field_changes_the_head`
 
-## `crates/mqtt-rules/src/lib.rs` — 132 test(s)
+## `crates/mqtt-rules/src/lib.rs` — 139 test(s)
 
 - `edit::tests::a_json_rule_body_is_a_rule_edit`
 - `edit::tests::an_insert_appends_the_rule_at_the_end`
@@ -1022,6 +1022,13 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests_emqx_examples::type_judgment_functions_match_emqx_examples`
 - `tests_emqx_examples::undocumented_emqx_functions_match_emqx_source`
 - `tests_emqx_examples::uuid_functions_match_emqx_examples`
+- `tests_republish::a_message_republished_from_an_event_has_no_dup_flag`
+- `tests_republish::a_republished_message_is_seen_as_emqx_shows_it`
+- `tests_republish::a_rule_does_not_republish_its_own_republished_message`
+- `tests_republish::direct_dispatch_renders_per_message`
+- `tests_republish::republishing_stops_at_the_depth_cap`
+- `tests_republish::select_star_shows_an_undefined_username`
+- `tests_republish::the_budget_spans_every_reentry`
 - `value::tests::binary_is_never_silently_json_encoded`
 - `value::tests::floats_render_like_emqx_str`
 - `value::tests::json_round_trip_keeps_key_order_and_types`
@@ -2214,28 +2221,34 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 
 - `a_rolled_node_disconnects_only_its_own_clients`
 
-## `crates/mqttd/tests/rules.rs` — 20 test(s)
+## `crates/mqttd/tests/rules.rs` — 26 test(s)
 
 - `a_closed_connection_reports_emqx_s_reason`
 - `a_connection_s_events_carry_emqx_s_fields_end_to_end`
 - `a_disconnect_reason_code_is_reported_by_its_emqx_name`
 - `a_matching_publish_is_transformed_and_republished_beside_the_original`
+- `a_message_republished_from_an_event_runs_the_rules`
 - `a_qos1_publish_acks_and_its_derived_message_is_qos1`
 - `a_qos2_publish_fires_its_rules_once_across_a_dup_resend`
 - `a_refused_connect_raises_its_connack_and_authentication_events`
 - `a_refused_derived_message_fails_its_action_and_the_original_is_still_acked`
 - `a_refused_original_routes_none_of_its_derived_messages`
 - `a_reload_reaches_connections_that_were_already_open`
+- `a_republished_message_runs_the_rules_that_select_it`
 - `a_rule_reads_the_dup_flag_as_false`
 - `a_rule_republishing_into_its_own_from_cannot_loop`
 - `a_rule_that_does_not_select_qos_republishes_a_qos1_publish_at_qos0`
+- `a_templated_direct_dispatch_is_rendered_per_message`
 - `a_will_runs_rules_when_the_hub_publishes_it`
 - `an_event_derived_message_is_counted_when_routed_and_a_refused_copy_as_a_drop`
 - `an_idle_connection_releases_a_superseded_rule_set_when_it_pings`
 - `authorization_events_name_the_acl_file_or_the_default`
 - `client_events_run_rules`
+- `direct_dispatch_skips_the_rules_and_the_retained_store`
 - `foreach_fans_one_publish_out`
 - `in_a_cluster_each_message_is_evaluated_once_on_its_landing_node`
+- `rules_republishing_into_each_other_stop_at_the_depth_cap`
+- `the_original_s_limits_cover_the_whole_chain`
 
 ## `crates/mqttd/tests/rules_binary.rs` — 46 test(s)
 

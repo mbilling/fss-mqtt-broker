@@ -12733,6 +12733,8 @@ mod tests {
                         retain: false,
                         app: AppProperties::default(),
                         message_expiry: None,
+                        direct_dispatch: false,
+                        dup_flag: true,
                     },
                     Some(dtx),
                 ),

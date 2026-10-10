@@ -249,8 +249,9 @@ quickstart's file with the number after `>` deleted:
 rules INVALID (rules.toml): rule `high_temp`: expected an expression (line 4, column 1, near `end of statement`)
 ```
 
-A warning — a [double-quoted string](#gotchas) compared with `=`, or
-`direct_dispatch = false` — goes to stderr and does not fail the check.
+A warning — a [double-quoted string](#gotchas) compared with `=`, or a
+`direct_dispatch` that is neither a boolean nor a placeholder — goes to stderr and does
+not fail the check.
 
 With no file argument, `mqttd --check-rules` checks the `rules.file` of the effective
 configuration (`--config` and `MQTTD_*`). It loads that configuration first, as the broker
@@ -376,6 +377,7 @@ double-quote one in particular): run `--check-rules` on the file for those, and 
   |---|---|
   | `mqttd_rule_evaluations_total{rule,result}` | `passed`: the statement produced output and the actions ran. `no_result`: `FROM` matched, but `WHERE` was false or a `FOREACH` produced nothing. `failed`: the statement raised an error. A rule with no series has never matched a message. |
   | `mqttd_rule_actions_total{rule,result}` | `ok`: a console line logged, or a republish the broker accepted and routed. `failed`: see [Operating rules](#operating-rules). |
+  | `mqttd_rule_recursive_republish_total{rule,guard}` | `republish` actions not run because their message would loop: `same_rule`, the message is one the rule republished itself (EMQX's `recursive_republish_detected`; counted `ok` in `mqttd_rule_actions_total`, as EMQX counts it); `depth`, it is 32 republishes from its original (counted `failed`). See [Republished messages](#republished-messages). |
   | `mqttd_rule_eval_seconds_total{rule}` | Time spent evaluating the rule, summed over every live evaluation: its statement plus rendering its actions, not routing what it republishes. Dry runs (`POST /admin/v1/rules/test`) are not counted. Divided by the evaluations it is the rule's cost per message, below. |
   | `mqttd_rules_loaded` | Enabled rules loaded on this node. |
   | `mqttd_rules_info{checksum}` | The loaded file's SHA-256, at 1. A checksum replaced by a reload stays exported at 0. |
@@ -833,8 +835,10 @@ and its MQTT 5 recipe guards a user property the same way.
   nodes, shared-subscription balanced, retained, queued for offline persistent sessions
   and quorum-replicated like a message a client sent. A subscriber on any node receives
   it.
-- **A republished message never re-enters the rule engine**, so no rule can loop. EMQX
-  calls this `direct_dispatch`; in mqttd it is always on.
+- **A republished message re-enters the rule engine, as in EMQX**: it is a new message,
+  and every rule whose `FROM` matches it runs on it, so rules chain ([Republished
+  messages](#republished-messages)). It is evaluated on the same connection task as the
+  message it came from, never on the hub loop.
 - **Last Wills run rules too**, as in EMQX. The hub publishes a Will, so the hub
   evaluates it; this is the one place rule SQL runs on the hub. Evaluating a Will at
   CONNECT instead, on the connection task, would give it the wrong timestamps and miss
@@ -843,12 +847,12 @@ and its MQTT 5 recipe guards a user property the same way.
   [Performance](#performance)), on top of the Will's own routing. A mass disconnect
   (a partition, a load-balancer restart) brings the Wills at once, so rules that match
   Will topics add to that burst.
-- **A publish and its derived messages reach the hub as one command.** The hub routes
-  the original first, then its derived messages, and only if it accepted the original:
-  a refused publish produces nothing, so a resend cannot duplicate what its rules
-  derived. The batch keeps the connection's place in the hub's FIFO data lane; it is
-  bounded by the per-message limits below, so it holds the hub loop for at most the
-  routing of 1,025 messages.
+- **A publish and its derived messages reach the hub as one command**, with every
+  message they lead to through other rules. The hub routes the original first, then its
+  derived messages, and only if it accepted the original: a refused publish produces
+  nothing, so a resend cannot duplicate what its rules derived. The batch keeps the
+  connection's place in the hub's FIFO data lane; it is bounded by the per-message
+  limits below, so it holds the hub loop for at most the routing of 1,025 messages.
 - **Derived messages are charged to the publisher's ingress credit** (ADR 0082), like
   the publish itself, before the batch is queued, so a rule that multiplies a publish
   cannot multiply what one connection may hold in the hub's queue. If the credit is
@@ -993,7 +997,8 @@ rule, every `FOREACH` output — not to each call:
 - a `FOREACH` iterates at most 10,000 elements and produces at most 256 outputs;
 - all of a message's rules produce at most 1,024 effects, which together carry at most
   4 MiB plus four times the message's payload (topics, payloads and properties of the
-  derived messages, and console lines); past it, further actions fail;
+  derived messages, and console lines) — counting the rules its republished messages
+  run, at any depth; past it, further actions fail;
 - its functions build at most 1 MiB beyond their inputs, together (`pad`'s length, a
   `replace` or `regex_replace` that substitutes a longer string at every match, a
   `join_to_string` separator);
@@ -1094,13 +1099,13 @@ never matches anything, and the loader warns (`FROM "$SYS/brokers/#" never match
 | Field | Value |
 |---|---|
 | `id` | A unique message id (32 upper-case hex digits) |
-| `clientid` | The publisher's client id |
-| `username` | Its CONNECT username, if it sent one (`undefined` otherwise) |
+| `clientid` | The publisher's client id; for a message a rule republished, that rule's id ([Republished messages](#republished-messages)) |
+| `username` | Its CONNECT username, if it sent one (`undefined` otherwise, which `SELECT *` shows as `"username":"undefined"`, as EMQX's does) |
 | `payload` | The payload: text if it is UTF-8, bytes otherwise |
-| `peerhost` / `peername` | The publisher's IP / `ip:port`, as EMQX prints them (an IPv6 address unbracketed, an IPv4-mapped one as its IPv4 address); absent for a session relocated from another node, whose socket is the relaying node |
+| `peerhost` / `peername` | The publisher's IP / `ip:port`, as EMQX prints them (an IPv6 address unbracketed, an IPv4-mapped one as its IPv4 address); `undefined` for a session relocated from another node, whose socket is the relaying node |
 | `topic` | The topic, with aliases resolved |
 | `qos` | 0, 1 or 2 |
-| `flags` | `{"dup": false, "retain": …}`. `dup` is always `false`, as in EMQX, which runs the rules on the message with its DUP flag cleared (`emqx_message:clean_dup/1`) |
+| `flags` | `{"dup": false, "retain": …}`. `dup` is always `false`, as in EMQX, which runs the rules on the message with its DUP flag cleared (`emqx_message:clean_dup/1`). A message republished in a chain an event started has `{"retain": …}` alone ([Republished messages](#republished-messages)) |
 | `pub_props` | MQTT 5 properties under their spec names: `User-Property` (a map; a repeated key keeps its last value), `User-Property-Pairs` (every pair, in order), `Content-Type`, `Response-Topic`, `Correlation-Data`, `Payload-Format-Indicator`, `Message-Expiry-Interval`. A publish that carried none (every MQTT 3.1.1 publish) has only an empty `User-Property` map, so `${pub_props.'Content-Type'}` renders `undefined`. |
 | `publish_received_at` / `timestamp` | Milliseconds since the epoch: when the broker received the message / when the rules looked at it. Each is read once per message, so every reference in every rule sees the same value, and `timestamp` is never earlier than `publish_received_at` |
 | `node` | This node's id |
@@ -1338,7 +1343,7 @@ Traps that EMQX's reference states only in passing, each checked against this en
 | `payload` | `"${payload}"` | A template. An empty string is the whole output as JSON (`${.}`). `${payload}` keeps a binary payload's exact bytes. An event has no payload: give an event rule's republish one. |
 | `user_properties` | `"${user_properties}"` | One placeholder naming a map (or EMQX's `[{key, value}]` list) in the output. `"${pub_props.'User-Property'}"` carries the publisher's properties in wire order, duplicates included. If absent, none are sent. |
 | `mqtt_properties` | none | `Payload-Format-Indicator`, `Message-Expiry-Interval`, `Content-Type`, `Response-Topic`, `Correlation-Data`; each value is a template. A `Payload-Format-Indicator` or `Message-Expiry-Interval` that does not render as a valid number, or a `Response-Topic` that is not a valid topic name, is dropped, as in EMQX, and the message still goes out. A placeholder for a value the publisher did not send renders as `undefined` like any other, so `"Content-Type" = "${pub_props.'Content-Type'}"` sends `Content-Type: undefined` for a publish without one: give it a default with `coalesce()` ([recipe 16](RULES-COOKBOOK.md#16-mqtt-5-user-properties-in-and-out)). |
-| `direct_dispatch` | — | Accepted for compatibility. mqttd always dispatches directly, so `false` gets a load warning and changes nothing. |
+| `direct_dispatch` | `false` | A boolean or one placeholder, rendered per message. `false`: the message re-enters the rule engine ([Republished messages](#republished-messages)). `true`: it goes straight to subscribers, as in EMQX: no rule runs on it and it is **not retained**, whatever `retain` says (it is delivered live, with the retain flag clear). Only a boolean `true` is true: a placeholder that renders anything else, or nothing, is `false`, as in EMQX (which logs `bad_direct_dispatch_resolved_value`). A literal string other than `"true"`, `"false"` or `""` is `false` on every message, with a load warning. |
 
 **Templates.** `${path}` reads the rule's **output** (what `SELECT` produced), with the
 path syntax of the SQL: `${payload.a.b}`, `${pub_props.'User-Property'.k}`,
@@ -1350,6 +1355,59 @@ conversion: select `base64_encode(payload)` instead.
 **Size.** A derived message is not bounded by `limits.max_packet_size`, which limits what
 clients send. A subscriber whose MQTT 5 Maximum Packet Size it exceeds does not get its
 copy (`mqttd_publish_dropped_total{reason="too-large"}`), as for any message.
+
+### Republished messages
+
+A republished message is a new message, and the rules see it as they see any other:
+every rule whose `FROM` matches its topic runs on it, so one rule's output can be
+another's input. This is EMQX's behaviour with `direct_dispatch = false`, its default.
+The rules see it as EMQX shows it (`emqx_rule_actions:republish_clientinfo/1`):
+
+| Field | Value |
+|---|---|
+| `clientid` | The id of the rule that republished it |
+| `username`, `peerhost`, `peername` | `undefined` (`SELECT *` shows `"undefined"`) |
+| `topic`, `qos`, `payload`, `pub_props` | What the action set; `pub_props` has `User-Property` (and `User-Property-Pairs` when it has any) and the `mqtt_properties` it set |
+| `flags` | The trigger's, with the action's `retain`: `{"dup": false, "retain": …}`, or `{"retain": …}` alone in a chain an event started, since an event has no `flags` |
+| `publish_received_at`, `timestamp`, `id` | When it was republished, and a new id |
+
+**Loops.** As in EMQX, a rule does not republish a message it republished itself: it
+still runs on it — its `WHERE`, its other actions — but its `republish` actions are
+skipped (EMQX logs this as `recursive_republish_detected`). EMQX counts the skipped
+action as a success, and so does mqttd; it is also counted in
+`mqttd_rule_recursive_republish_total{rule,guard="same_rule"}` and logged at DEBUG.
+A rule republishing into its own `FROM` therefore publishes once, not forever.
+
+Two rules republishing into each other's `FROM` are not caught by that guard. EMQX
+recurses until the publisher's connection process reaches its heap limit and is killed
+(EMQX 6.3.1 ran about 1,500 rounds, then dropped the connection and delivered nothing).
+mqttd stops the chain **32 republishes** from the message that started it: the message
+32 deep is still evaluated, but its rules' `republish` actions fail, counted as failed
+actions and in `mqttd_rule_recursive_republish_total{rule,guard="depth"}`, with the
+rule's WARN and last error. No working EMQX configuration chains that deep; real
+pipelines are a few rules long. The whole chain shares the original message's
+[limits](#the-rules-file) — 1,024 effects and 4 MiB plus four times its payload — so a
+chain or a loop multiplies a publish no more than one rule can.
+
+**Order.** EMQX publishes a republished message from inside the hook that evaluates the
+message it came from, so a subscriber to everything sees the deepest message first: for
+`t/a` → rule A → `t/b` → rule B → `out/b`, EMQX delivers `out/b`, `t/b`, `t/a`. mqttd
+routes the original first — the hub routes derived messages only once it has accepted
+the original, so a refused publish leaves nothing behind — then the derived messages in
+EMQX's order: `t/a`, `out/b`, `t/b`.
+
+**Acknowledgement.** Everything a publish leads to, through any number of rules, is
+part of its batch: charged to its ingress credit, and at QoS ≥ 1 behind a QoS ≥ 1
+publish, gated, so the PUBACK or PUBREC waits for all of it
+([Delivery guarantees](#delivery-guarantees-qos-0-1-and-2)).
+
+`direct_dispatch = true` opts a message out: no rule runs on it and it is not retained.
+
+**Upgrading from an earlier mqttd.** In mqttd 1.1.0 and earlier a republished message
+never re-entered the rules. A rules file written for that starts chaining when upgraded: a
+rule whose output topic another rule's `FROM` matches now triggers that rule too. Check
+each `republish` topic against every `FROM` (`mqttd --check-rules` lists them), and set
+`direct_dispatch = true` on the actions that must not trigger anything.
 
 ### `console`
 
@@ -1456,7 +1514,7 @@ notice.
 
 | | EMQX | mqttd |
 |---|---|---|
-| Republished messages | Re-enter the rule engine unless `direct_dispatch = true` | Never re-enter it. A rule cannot loop, and a rule chain that relied on re-triggering needs a second rule on the original topic. |
+| Republished messages | Re-enter the rule engine unless `direct_dispatch = true`; only a rule's own output is guarded, so two rules republishing into each other recurse until the publisher's process is killed; a republished message is routed before the message it came from | Re-enter it unless `direct_dispatch = true`, with the same guard, but a chain stops 32 republishes deep and shares the original's limits; the original is routed first, then the derived messages in EMQX's order ([Republished messages](#republished-messages)) |
 | Actions | `republish`, `console`, data-integration sinks | `republish`, `console`. A sink reference is refused at load. |
 | Events | 16 event topics (6.2+): `sys/alarm_activated`, `sys/alarm_deactivated`, `client/connected`, `client/disconnected`, `client/connack`, `client/ping`, `auth/check_authn_complete`, `auth/check_authz_complete`, `session/subscribed`, `session/unsubscribed`, `message/delivered`, `message/acked`, `message/dropped`, `message/delivery_dropped`, `message_transformation/failed`, `schema_validation/failed`; a wildcard filter such as `$events/client/+` selects every event it matches | The 8 client, session and authentication events (`client/connected`, `client/disconnected`, `client/connack`, `client/ping`, `auth/check_authn_complete`, `auth/check_authz_complete`, `session/subscribed`, `session/unsubscribed`), with EMQX's fields. A wildcard filter selects the ones it matches; one that matches none of them is refused at load. Not the message, alarm, schema validation or message transformation events |
 | `authz_source` | The source that decided: `file`, `built_in_database`, `http`, …, `superuser`, `default`, and `cache` for a decision its authorization cache answered | `file` or `default`: mqttd has the ACL file only, no superusers and no authorization cache |

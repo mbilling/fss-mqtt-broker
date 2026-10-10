@@ -999,7 +999,7 @@ const RULE_TESTS: [(&str, &str, &str, i32, &str); 3] = [
 ];
 
 /// The broker's log line for recipe 01's console action.
-const CONSOLE_LINE: &str = r#"<logtime>  INFO mqttd::rules: rule console action rule=debug_factory output={"id":"<id>","clientid":"plc-1","payload":"{\"t\": 20.5}","peerhost":"127.0.0.1","peername":"127.0.0.1:<port>","topic":"factory/line1/temp","qos":1,"flags":{"dup":false,"retain":false},"pub_props":{"User-Property":{}},"publish_received_at":<ms>,"client_attrs":{},"event":"message.publish","timestamp":<ms>,"node":"node-local","metadata":{"rule_id":"debug_factory"}}"#;
+const CONSOLE_LINE: &str = r#"<logtime>  INFO mqttd::rules: rule console action rule=debug_factory output={"id":"<id>","clientid":"plc-1","username":"undefined","payload":"{\"t\": 20.5}","peerhost":"127.0.0.1","peername":"127.0.0.1:<port>","topic":"factory/line1/temp","qos":1,"flags":{"dup":false,"retain":false},"pub_props":{"User-Property":{}},"publish_received_at":<ms>,"client_attrs":{},"event":"message.publish","timestamp":<ms>,"node":"node-local","metadata":{"rule_id":"debug_factory"}}"#;
 
 /// Recipe 01's gotcha: a device that sends bytes that are not text.
 const BINARY_PUB: Pub = Pub {

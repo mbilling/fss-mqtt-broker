@@ -12,12 +12,22 @@
 //! - **What a republish is.** An ordinary publish into the hub — routed, forwarded,
 //!   retained, queued for offline sessions and quorum-replicated exactly like a client
 //!   one — but with **no publisher** (so No Local does not apply, as in EMQX where the
-//!   rule is the sender) and **never re-evaluated** by the rule engine, so no rule can
-//!   loop (EMQX's `direct_dispatch`, always on).
-//! - **When it is published.** A publish and what its rules derived travel to the hub
-//!   as ONE command ([`HubCommand::PublishBatch`]). The hub routes the original first
-//!   and routes the derived messages only if it accepted the original, so a refused
-//!   publish leaves nothing behind for its resend to duplicate.
+//!   rule is the sender).
+//! - **Re-entry.** As in EMQX, a republished message is a new message the rules see in
+//!   turn (`direct_dispatch = false`, the default): it is evaluated right here, on the
+//!   task that evaluated the message it came from, as a message from the client named
+//!   after the rule ([`PublishInput::republished`]). A rule does not republish its own
+//!   output again (EMQX's `recursive_republish_detected`), a chain stops
+//!   [`mqtt_rules::MAX_REPUBLISH_DEPTH`] republishes deep, and the whole tree shares the
+//!   original's [`Budget`]. `direct_dispatch = true` skips the rules, and the retained
+//!   store, as EMQX's skips its `message.publish` hook.
+//! - **When it is published.** A publish and what its rules derived — the whole tree —
+//!   travel to the hub as ONE command ([`HubCommand::PublishBatch`]). The hub routes the
+//!   original first and routes the derived messages only if it accepted the original,
+//!   so a refused publish leaves nothing behind for its resend to duplicate. The derived
+//!   messages go in EMQX's order — each after the messages it caused in turn — but
+//!   after the original, where EMQX routes them before it (its rules run inside the
+//!   original's publish hook).
 //! - **`QoS`.** For an inbound `QoS` 1/2 publish, every `QoS` ≥ 1 message its rules
 //!   produce gets its own acknowledgement gate, and the publisher's PUBACK/PUBREC waits
 //!   for all of them ([`join_outcomes`]) — when it is released, each derived message
@@ -45,7 +55,9 @@ use bytes::Bytes;
 use mqtt_codec::QoS;
 use mqtt_core::{AppProperties, ClientId};
 use mqtt_observability::metrics::Metrics;
-use mqtt_rules::{Effect, EventInput, Input, Outcome, PublishInput, Republish, Rule, RuleSet};
+use mqtt_rules::{
+    Budget, Effect, EventInput, Input, Outcome, PublishInput, Recursion, Republish, Rule, RuleSet,
+};
 use tokio::sync::{mpsc, oneshot, watch};
 use tracing::{debug, info, warn};
 
@@ -191,6 +203,10 @@ fn report(
             (Some("failed"), None)
         }
         Outcome::ActionOk => (None, None),
+        Outcome::Recursive(guard) => {
+            report_recursion(metrics, observe, rule, guard);
+            return;
+        }
         Outcome::ActionFailed(e) => {
             if warn_due(rule) {
                 warn!(rule = %rule.id(), error = %e,
@@ -213,6 +229,51 @@ fn report(
             m.rule_action(rule.id(), r);
         }
     }
+}
+
+/// A republish not run because its message would loop: counted, and for the depth guard
+/// reported as the action failure it is.
+fn report_recursion(
+    metrics: Option<&Metrics>,
+    observe: Option<&RulesObserve>,
+    rule: &Rule,
+    guard: Recursion,
+) {
+    if let Some(m) = metrics {
+        m.rule_recursive_republish(rule.id(), guard.as_str());
+    }
+    match guard {
+        // EMQX logs `recursive_republish_detected` and counts the action a success.
+        Recursion::SameRule => {
+            debug!(rule = %rule.id(), "recursive_republish_detected: a rule does not republish \
+                   its own republished message");
+            count_action(metrics, rule.id(), "ok");
+        }
+        Recursion::Depth => {
+            let e = depth_error();
+            if warn_due(rule) {
+                warn!(rule = %rule.id(), error = %e,
+                      "rule action failed (counted in mqttd_rule_actions_total{{result=\"failed\"}} \
+                       and mqttd_rule_recursive_republish_total{{guard=\"depth\"}}; this rule's \
+                       further failures within {FAILURE_WARN_INTERVAL_SECS}s are logged at debug)");
+                if let Some(o) = observe {
+                    o.store_error(rule, ErrorKind::Action, &e);
+                }
+            } else {
+                debug!(rule = %rule.id(), error = %e, "rule action failed");
+            }
+            count_action(metrics, rule.id(), "failed");
+        }
+    }
+}
+
+/// What a republish stopped by the depth guard is told.
+fn depth_error() -> String {
+    format!(
+        "not republished: the message is {} republishes from the one that started the chain \
+         (rules republishing into each other's FROM?)",
+        mqtt_rules::MAX_REPUBLISH_DEPTH
+    )
 }
 
 fn count_action(metrics: Option<&Metrics>, rule: &str, result: &'static str) {
@@ -246,7 +307,85 @@ pub enum TriggerKind {
     Will,
 }
 
-/// Evaluate a publish against `set`.
+/// One evaluation's view of the engine: the rules, this node, and what they report into.
+#[derive(Clone, Copy)]
+struct Engine<'a> {
+    set: &'a RuleSet,
+    node: &'a str,
+    metrics: Option<&'a Metrics>,
+    observe: Option<&'a RulesObserve>,
+}
+
+impl Engine<'_> {
+    /// Evaluate one message, charging its effects to `budget`. With the trace on, its
+    /// records name `trigger`.
+    fn publish(
+        self,
+        input: &PublishInput<'_>,
+        budget: &Budget,
+        trigger: impl FnOnce() -> TraceTrigger,
+    ) -> Vec<(Arc<str>, Effect)> {
+        let Self {
+            set,
+            metrics,
+            observe,
+            ..
+        } = self;
+        let mut effects = Vec::new();
+        // The trace's gate: one relaxed load, then the plain report or the capturing one.
+        match observe.filter(|o| o.tracing()) {
+            None => set.on_publish_within(
+                input,
+                budget,
+                &mut |r, o| report(metrics, observe, r, o),
+                &mut effects,
+            ),
+            Some(o) => {
+                let mut capture = Capture::new(o.trace_rate());
+                set.on_publish_within(
+                    input,
+                    budget,
+                    &mut |r, out| {
+                        capture.see(r, out);
+                        report(metrics, observe, r, out);
+                    },
+                    &mut effects,
+                );
+                capture.finish(o, &effects, trigger);
+            }
+        }
+        effects
+    }
+
+    /// The messages `effects` republish, each one re-entering the rules first unless
+    /// its action dispatched it directly. `depth` is how many republishes the message
+    /// that produced `effects` is from its original.
+    ///
+    /// In EMQX's order: a republished message is published from inside the hook that
+    /// evaluates the message it came from, so the messages its own rules republish are
+    /// routed before it is. The list is that: each message after what it caused.
+    fn reenter(
+        self,
+        effects: Vec<(Arc<str>, Effect)>,
+        depth: u32,
+        budget: &Budget,
+    ) -> Vec<Derived> {
+        let mut out = Vec::new();
+        for d in collect(self.metrics, effects) {
+            if !d.msg.direct_dispatch && self.set.has_message_rules() {
+                let depth = depth + 1;
+                let mut input = PublishInput::republished(&d.rule, &d.msg, depth);
+                input.node = self.node;
+                let effects = self.publish(&input, budget, || TraceTrigger::republished(&d));
+                out.extend(self.reenter(effects, depth, budget));
+            }
+            out.push(d);
+        }
+        out
+    }
+}
+
+/// Evaluate a publish against `set`, and what it republishes in turn.
 fn evaluate(
     set: &RuleSet,
     node: &str,
@@ -264,28 +403,15 @@ fn evaluate(
     input.retain = f.retain;
     input.message_expiry = f.message_expiry;
     input.node = node;
-    let mut effects = Vec::new();
-    // The trace's gate: one relaxed load, then the plain report or the capturing one.
-    match observe.filter(|o| o.tracing()) {
-        None => set.on_publish(
-            &input,
-            &mut |r, o| report(metrics, observe, r, o),
-            &mut effects,
-        ),
-        Some(o) => {
-            let mut capture = Capture::new(o.trace_rate());
-            set.on_publish(
-                &input,
-                &mut |r, out| {
-                    capture.see(r, out);
-                    report(metrics, observe, r, out);
-                },
-                &mut effects,
-            );
-            capture.finish(o, &effects, || TraceTrigger::message(trigger, f));
-        }
-    }
-    collect(metrics, effects)
+    let engine = Engine {
+        set,
+        node,
+        metrics,
+        observe,
+    };
+    let budget = Budget::new(f.payload.len());
+    let effects = engine.publish(&input, &budget, || TraceTrigger::message(trigger, f));
+    engine.reenter(effects, 0, &budget)
 }
 
 impl Rules {
@@ -461,20 +587,24 @@ impl ConnRules {
     pub fn fire_event(&self, input: &EventInput, hub: &mpsc::UnboundedSender<HubCommand>) {
         let metrics = self.engine.metrics.as_deref();
         let observe = self.engine.observe.as_deref();
+        let node = &self.engine.node;
         let derived = self.with_set(|set| {
+            let budget = Budget::new(0);
             let mut effects = Vec::new();
             match observe.filter(|o| o.tracing()) {
                 None => {
-                    set.on_event(
+                    set.on_event_within(
                         input,
+                        &budget,
                         &mut |r, o| report(metrics, observe, r, o),
                         &mut effects,
                     );
                 }
                 Some(o) => {
                     let mut capture = Capture::new(o.trace_rate());
-                    set.on_event(
+                    set.on_event_within(
                         input,
+                        &budget,
                         &mut |r, out| {
                             capture.see(r, out);
                             report(metrics, observe, r, out);
@@ -484,7 +614,13 @@ impl ConnRules {
                     capture.finish(o, &effects, || TraceTrigger::event(input));
                 }
             }
-            collect(metrics, effects)
+            let engine = Engine {
+                set,
+                node,
+                metrics,
+                observe,
+            };
+            engine.reenter(effects, 0, &budget)
         });
         Rules::send_derived(derived, |cmd| {
             let _ = hub.send(cmd);
@@ -619,13 +755,17 @@ pub fn printable_props(props: &mqtt_codec::Properties) -> mqtt_rules::Map {
 /// the publish, which for a derived message would refuse the *original's*
 /// acknowledgement over a rule's retain flag; the v3.1.1 answer — deliver it live,
 /// retain nothing — is the right one for a message no client sent.
+///
+/// A `direct_dispatch = true` message is not retained, as in EMQX, whose retainer is a
+/// `message.publish` hook that direct dispatch skips; it is delivered live like the
+/// over-quota one above.
 #[must_use]
 pub fn derived_command(r: Republish, done: Option<oneshot::Sender<PublishOutcome>>) -> HubCommand {
     HubCommand::Publish {
         topic: r.topic,
         payload: r.payload,
         qos: qos_of(r.qos),
-        retain: r.retain,
+        retain: r.retain && !r.direct_dispatch,
         message_expiry: r.message_expiry,
         app: r.app,
         done,
@@ -1139,6 +1279,19 @@ impl TraceTrigger {
         }
     }
 
+    /// A republished message re-entering the rules, as they see it: from the client
+    /// named after the rule, with no username.
+    fn republished(d: &Derived) -> Self {
+        Self::Publish(TracedMessage {
+            topic: name(&d.msg.topic),
+            qos: d.msg.qos,
+            retain: d.msg.retain,
+            clientid: name(&d.rule),
+            username: None,
+            payload: TracePayload::copy(&d.msg.payload),
+        })
+    }
+
     fn event(input: &EventInput) -> Self {
         Self::Event {
             event: input.kind().event_name(),
@@ -1280,6 +1433,11 @@ struct Pending {
 }
 
 impl Pending {
+    /// An action that ran without an output or a failure to show.
+    fn skip(&mut self) {
+        self.actions += 1;
+    }
+
     fn add(&mut self, slot: impl FnOnce(usize) -> Slot) {
         let index = self.actions % self.per_output.max(1);
         self.actions += 1;
@@ -1334,6 +1492,19 @@ impl Capture {
             Outcome::ActionFailed(e) => {
                 if let Some(p) = &mut self.open {
                     p.add(|i| Slot::Failed(i, clip(&e.to_string(), ERROR_TEXT_MAX).to_string()));
+                }
+                return;
+            }
+            // EMQX's guard is no failure and renders nothing: the action is passed over.
+            Outcome::Recursive(Recursion::SameRule) => {
+                if let Some(p) = &mut self.open {
+                    p.skip();
+                }
+                return;
+            }
+            Outcome::Recursive(Recursion::Depth) => {
+                if let Some(p) = &mut self.open {
+                    p.add(|i| Slot::Failed(i, depth_error()));
                 }
                 return;
             }
