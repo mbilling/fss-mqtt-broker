@@ -7,10 +7,6 @@
 - **Supersedes in part:** [ADR 0063](0063-external-consumer-integration.md) §1, its "no
   built-in rule engine" clause. Its "no built-in Kafka/webhook sinks" clause and §2's
   consumer-group pattern for sinks stand.
-- **Amended 2026-10-09:** §1's "evaluation follows `emqx_rule_runtime`" now decides the
-  `WHERE` before the `SELECT` fields it does not read (same outputs; a field that would
-  fail on a rejected message is not evaluated, so that message counts as `no_result`).
-  Listed in [docs/RULES.md](../RULES.md#differences-from-emqx).
 - **Related:** [ADR 0018](0018-on-disk-persistence.md) / [ADR 0042](0042-durable-plane-stress-harness.md)
   T9 (an acknowledgement is released only for a message the broker owns; the pending-publish
   gate), [ADR 0082](0082-bounded-hub-ingress.md) (ingress credit and the FIFO data lane),
@@ -66,15 +62,6 @@ hub's **data lane is FIFO per connection, bounded by ingress credit** (ADR 0082)
    keywords as path segments) only where the meaning is unambiguous. The engine is the
    `mqtt-rules` crate, which holds no broker state and does no network I/O: it reads only
    its rules file, the clock and a random source.
-
-   > **Amended 2026-10-09:** one departure in evaluation order. EMQX computes every
-   > `SELECT` field, then the `WHERE`; mqttd works out at load which fields the `WHERE`
-   > reads (directly or through aliases they read), computes those, decides the `WHERE`,
-   > and computes the rest only for a message that passes. Outputs are identical; a field
-   > the `WHERE` does not read can no longer fail a message it turns away (that message
-   > is `no_result`, not `failed`). A rejecting rule with six computed fields went from
-   > 2.58 µs to 0.68 µs per message. Listed in
-   > [docs/RULES.md](../RULES.md#differences-from-emqx).
 
 2. **A client publish is evaluated on its connection task, after the ACL and before the
    hub, once, on the node it arrived at.** Connection tasks run in parallel on every core,
@@ -272,3 +259,46 @@ hub's **data lane is FIFO per connection, bounded by ingress credit** (ADR 0082)
   broker, held to weaker contracts.
 - **A bespoke SQL dialect.** Rejected: compatibility is what makes migrating rules and
   reusing rule knowledge possible.
+
+## Amendment (2026-10-10): evaluation is EMQX's, clause by clause
+
+Decided 2026-10-10: rule evaluation is to be EMQX-compatible without exception, so no
+optimisation may change an outcome. Two changes follow, checked against EMQX's
+`emqx_rule_runtime.erl` (`evaluate_select`, `evaluate_foreach`, `filter_collection`,
+`eval/2`).
+
+**The order is EMQX's again.** #882 evaluated the `WHERE` first, on only the `SELECT`
+fields it reads, which made a rejected message with computed fields about 3.8x cheaper
+(2.58 µs to 0.68 µs). It is reverted, for two reasons:
+
+- **It differed by design.** A field that would fail on a message the `WHERE` rejects was
+  never evaluated, so that message counted `no_result` where EMQX counts `failed`. That
+  changes the metrics, the last error and the trace.
+- **It had a bug.** Its planner skipped `*`, so in `SELECT 'x' AS clientid, * … WHERE
+  clientid = 'c'` the `WHERE` read the alias where EMQX reads the input's `clientid`, and
+  the rule silently produced nothing.
+
+Every `SELECT` field again runs before the `WHERE`.
+
+**Lookup follows EMQX's layering.** Until now every clause looked a name up the way a
+`SELECT` field does: in what had been selected, then, if the path was `undefined`, in the
+input. In EMQX the layering depends on the clause:
+
+| Clause | EMQX evaluates it against |
+|---|---|
+| `SELECT`, `DO` fields | `[SelectedSoFar, Columns]`. A path `undefined` in the first falls through. |
+| `WHERE` | `maps:merge(Columns, Selected)`, one map. A selected top-level key hides the input's. |
+| `INCASE` | `maps:merge(ColumnsAndSelected, #{Item => Element})`, one map. |
+
+So `SELECT payload.x … WHERE payload.y = 1` was true in mqttd and is false in EMQX, because
+the selected `payload` is `{"x": …}`. `EvalCtx::merged_from` now marks, per clause, where
+lookup stops falling through. The `WHERE` and `INCASE` read the merged map, and a `DO`
+field reads its own selection, then the merged map. Pinned by
+`the_where_reads_the_input_with_the_selection_merged_over_it`,
+`a_failing_select_field_fails_the_rule_even_when_the_where_is_false` and
+`incase_and_do_read_the_merged_scope_like_emqx` (the first and the last fail on the old
+lookup).
+
+Rule cost is to be lowered only by changes that keep every output, error and counter
+EMQX's. One candidate: evaluating the `WHERE` first only when no field can fail and none
+is hidden by a later `*`.

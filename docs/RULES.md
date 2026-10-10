@@ -1039,15 +1039,26 @@ belongs in a TOML `'''…'''` string ([Gotchas](#gotchas)).
 `WHERE` sees what `SELECT` selected: `SELECT payload.x AS y FROM "t" WHERE y = 1`. A
 later `SELECT` field can read an earlier alias.
 
-**The `WHERE` is decided first.** When a rule loads, mqttd works out which `SELECT`
-fields its `WHERE` reads, directly or through aliases those fields read. For each message
-it computes only those, decides the `WHERE`, and computes the other fields only when the
-message passes, reusing what it already has. The output is the same as computing every
-field first, as EMQX does, and a rule that turns most messages away does far less work
-(see [Performance](#performance)). The one visible difference is in the counts: a field
-the `WHERE` does not read is never evaluated for a message it turns away, so a field that
-would fail there (say `payload.v + 1` on a message without `v`) leaves that message
-`no_result` instead of `failed` (see [Differences from EMQX](#differences-from-emqx)).
+How a name resolves depends on the clause, exactly as in EMQX's runtime:
+
+- **Order.** Every `SELECT` field runs, left to right, before the `WHERE`. A field that
+  fails fails the rule even when the `WHERE` would have turned the message away:
+  `SELECT int(payload.x) AS y … WHERE 1 = 2` on `{"x":"abc"}` counts as `failed`.
+- **A `SELECT` or `DO` field** reads what has been selected so far, then the input
+  fields. A path that is `undefined` in the first is looked up in the second.
+- **A `WHERE`** reads one map: the input fields with the selected ones merged over them.
+  A selected top-level key hides the input's whole key, with no fall-through into it:
+  - `SELECT payload.x … WHERE payload.y = 1` is false, because the selected `payload` is
+    `{"x": …}`;
+  - `SELECT payload.missing AS clientid … WHERE clientid = 'c1'` is false;
+  - `SELECT 1 AS flags.custom … WHERE flags.retain = false` is false.
+- **A `*`** copies the input fields over what has been selected before it:
+  `SELECT 1 AS clientid, *` keeps the input's `clientid`, while `SELECT *, 1 AS clientid`
+  keeps the alias.
+- **In a `FOREACH`,** the `INCASE` reads that merged map with the element merged over it,
+  before `DO` runs, so it cannot see `DO`'s aliases: write `INCASE s.t > 30`, not
+  `INCASE t > 30`. A `DO` field reads what the `DO` has selected so far, then that
+  merged map.
 
 **`FOREACH`** produces one output per element of the array its last expression
 evaluates to. Each output runs the rule's actions once. The element is `item` unless the
@@ -1303,14 +1314,6 @@ adds to one publish, paid on the connection task:
 | `SELECT *` with a `${.}` JSON republish | 6.3 µs |
 | `FOREACH` over 10 elements, 10 republishes | 15.8 µs |
 
-Deciding the `WHERE` first (above) matters most for a rule whose `SELECT` does real work
-and whose `WHERE` turns most messages away. Six computed fields (`upper`, `concat`,
-`round`, `format_date`, `regex_replace`), a `WHERE` on one of them, the message rejected:
-2.58 µs computing every field first, 0.68 µs deciding the `WHERE` first (3.8x). A message
-that passes costs the same either way (1.25 µs and 1.22 µs). Measured 2026-10-09 with the
-`computed_reject`, `filter_reject` and `filter_republish` cases of the same benchmark, one
-build each, on an Apple M-series laptop.
-
 The single-node knee is 75,000 msg/s, measured across 4 vCPUs. At 1.8 µs per matching
 publish, rule work on every one of those messages would take about 0.14 core, spread
 across the connection tasks. These are microbenchmarks of the engine, not a cluster
@@ -1331,7 +1334,6 @@ notice.
 | Event property maps (`conn_props`, `disconn_props`, `sub_props`, `unsub_props`) | The properties of the CONNECT, DISCONNECT, SUBSCRIBE or UNSUBSCRIBE | Always `{}` |
 | `sockname` in `client/connected` and `client/disconnected` | The listener's address | Absent, so `undefined` |
 | Data-bridge sources (`$bridges/…`) | Yes | No |
-| Evaluation order | Every `SELECT` field, then the `WHERE` | The `WHERE` first, on only the fields it reads; the rest when the message passes. Same outputs; a field that would fail on a message the `WHERE` turns away is never evaluated, so that message counts as `no_result`, not `failed`. |
 | Functions | 124 in the built-in reference, plus `jq` | 107 of those 124, plus the 13 legacy accessors EMQX keeps undocumented (120 in all). The rest are refused at load. |
 | `is_empty` of a missing value | Documented as `false` | Fails the rule: `is_empty(): expected an array or a map, got a undefined` |
 | JSON integers | Any size (Erlang integers) | Signed 64-bit. One outside that range decodes as a float, so `12345678901234567890` becomes `1.2345678901234567e+19`. `${payload}` keeps the original bytes. |

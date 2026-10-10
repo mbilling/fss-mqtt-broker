@@ -917,6 +917,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `template::tests::the_literal_prefix_is_the_text_before_the_first_placeholder`
 - `template::tests::this_is_the_whole_output`
 - `tests::a_bad_rendered_topic_fails_the_action_not_the_rule`
+- `tests::a_failing_select_field_fails_the_rule_even_when_the_where_is_false`
 - `tests::a_file_may_compile_only_so_many_distinct_regular_expressions`
 - `tests::a_literal_qos_or_retain_that_can_never_be_valid_fails_the_load`
 - `tests::a_loaded_set_keeps_its_action_specs_and_warnings`
@@ -924,7 +925,6 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::a_messages_effects_share_one_byte_budget`
 - `tests::a_non_json_payload_fails_only_rules_that_reach_into_it`
 - `tests::a_republish_into_sys_fails_its_action`
-- `tests::an_item_the_where_does_not_read_cannot_fail_a_message_it_turns_away`
 - `tests::arithmetic_follows_erlang`
 - `tests::case_expression_emqx_docs`
 - `tests::comments_and_case_insensitive_keywords`
@@ -944,6 +944,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::foreach_with_do_and_incase_emqx_docs`
 - `tests::hashing_encoding_and_bits_emqx_docs`
 - `tests::identical_regular_expressions_are_compiled_once`
+- `tests::incase_and_do_read_the_merged_scope_like_emqx`
 - `tests::indices_and_ranges`
 - `tests::invalid_qos_fails_the_action`
 - `tests::load_errors_are_specific`
@@ -966,14 +967,13 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::the_growth_budget_is_per_message`
 - `tests::the_sql_test_simulates_events_and_refuses_inputs_the_rule_never_sees`
 - `tests::the_trace_rate_window_is_per_rule_per_second`
-- `tests::the_where_plan_follows_alias_chains_backwards_only`
+- `tests::the_where_reads_the_input_with_the_selection_merged_over_it`
 - `tests::time_functions_emqx_docs`
 - `tests::topic_match_operator_and_topic_function`
 - `tests::type_judgment_functions_emqx_docs`
 - `tests::unaliased_payload_path_nests_under_payload`
 - `tests::user_properties_and_pub_props_emqx_docs`
 - `tests::where_filters_and_can_use_select_aliases`
-- `tests::where_first_gives_the_select_first_outputs`
 - `tests_emqx_examples::array_functions_match_emqx_examples`
 - `tests_emqx_examples::bit_functions_match_emqx_examples`
 - `tests_emqx_examples::conditional_functions_match_emqx_examples`

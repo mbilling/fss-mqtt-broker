@@ -76,6 +76,73 @@ fn where_filters_and_can_use_select_aliases() {
     );
 }
 
+/// EMQX's `evaluate_select`: the WHERE reads `maps:merge(Columns, Selected)`, one map. A
+/// selected top-level key hides the input's whole key; nothing falls through into it.
+#[test]
+fn the_where_reads_the_input_with_the_selection_merged_over_it() {
+    // An unaliased `payload.x` selects `payload` as `{"x": 1}`, which hides the input's
+    // `payload` from the WHERE: `payload.y` is undefined there.
+    let sql = r#"SELECT payload.x FROM "t/#" WHERE payload.y = 1"#;
+    assert!(run_on(sql, "t/a", r#"{"x":1,"y":1}"#).unwrap().is_empty());
+    // An alias that shadows an input name hides it, even when the value is undefined.
+    let sql = r#"SELECT payload.missing AS clientid FROM "t/#" WHERE clientid = 'c_emqx'"#;
+    assert!(run_on(sql, "t/a", "{}").unwrap().is_empty());
+    // A dotted alias replaces the whole top-level map, not one key in it.
+    let sql = r#"SELECT 1 AS flags.custom FROM "t/#" WHERE flags.retain = false"#;
+    assert!(run_on(sql, "t/a", "{}").unwrap().is_empty());
+    // A `*` after an alias overwrites it, so the WHERE sees the input's value.
+    let sql = r#"SELECT 'shadow' AS clientid, * FROM "t/#" WHERE clientid = 'c_emqx'"#;
+    assert_eq!(run_on(sql, "t/a", "{}").unwrap().len(), 1);
+    // A name the selection does not write still reads the input.
+    let sql = r#"SELECT payload.x AS x FROM "t/#" WHERE topic = 't/a' AND x = 1"#;
+    assert_eq!(run_on(sql, "t/a", r#"{"x":1}"#).unwrap().len(), 1);
+}
+
+/// EMQX evaluates every SELECT field before the WHERE, so a field that fails fails the
+/// rule even for a message the WHERE would turn away.
+#[test]
+fn a_failing_select_field_fails_the_rule_even_when_the_where_is_false() {
+    fails(
+        r#"SELECT int(payload.x) AS y FROM "t/#" WHERE 1 = 2"#,
+        r#"{"x":"abc"}"#,
+    );
+    fails(
+        r##"SELECT payload.x AS x FROM "#" WHERE topic = 'other'"##,
+        "not json",
+    );
+}
+
+/// INCASE runs before DO for each element, against the input, the selection and the
+/// element merged into one map: it cannot see DO's aliases, and a selected key hides the
+/// input's.
+#[test]
+fn incase_and_do_read_the_merged_scope_like_emqx() {
+    let p = r#"{"s":[{"t":20},{"t":40}],"y":7,"a":{"z":1}}"#;
+    // DO's alias `t` is not visible to INCASE.
+    let out = run_on(
+        r#"FOREACH payload.s AS s DO s.t AS t INCASE t > 30 FROM "t/#""#,
+        "t/a",
+        p,
+    );
+    assert!(out.unwrap().is_empty());
+    let out = run_on(
+        r#"FOREACH payload.s AS s DO s.t AS t INCASE s.t > 30 FROM "t/#""#,
+        "t/a",
+        p,
+    );
+    assert_eq!(out.unwrap(), [r#"{"t":40}"#]);
+    // A leading FOREACH field selected as `payload` hides the input's payload from DO,
+    // which reads `[DoSelected, merge(Columns, Selected, Item)]`.
+    let out = run_on(
+        r#"FOREACH payload.a AS payload, payload.s AS s DO payload.y AS py, payload.z AS pz FROM "t/#""#,
+        "t/a",
+        p,
+    );
+    // `py` is undefined, not the input's `"y": 7`: the selected `payload` hides it.
+    let row = r#"{"py":"undefined","pz":1}"#;
+    assert_eq!(out.unwrap(), [row, row]);
+}
+
 #[test]
 fn expressions_emqx_docs() {
     assert_eq!(
@@ -1896,135 +1963,4 @@ fn every_evaluated_rule_reports_its_time_once_after_its_outcomes() {
         &mut Vec::new()
     ));
     assert!(!dry.contains(&"elapsed"), "a dry run is not timed: {dry:?}");
-}
-
-/// `statement`'s outputs on a message, evaluated as [`eval::run`] does and as EMQX's
-/// SELECT-first order does: `(where_first, select_first)`.
-fn both_orders(
-    sql: &str,
-    topic: &str,
-    payload: &str,
-) -> (Result<Vec<String>, String>, Result<Vec<String>, String>) {
-    let payload = Bytes::from(payload.to_string());
-    let props = mqtt_core::AppProperties::default();
-    let m = msg(topic, &payload, &props);
-    let stmt = compile_alone(sql)
-        .unwrap_or_else(|e| panic!("{sql}: {e}"))
-        .stmt;
-    let render = |outs: Vec<Map>| -> Vec<String> {
-        outs.into_iter()
-            .map(|o| Value::from(o).to_json().unwrap())
-            .collect()
-    };
-    let mut a = Vec::new();
-    let where_first = eval::run(&stmt, &EvalCtx::new(&m), &mut a)
-        .map(|()| render(a))
-        .map_err(|e| e.to_string());
-    let mut b = Vec::new();
-    let select_first = eval::run_select_first(&stmt, &EvalCtx::new(&m), &mut b)
-        .map(|()| render(b))
-        .map_err(|e| e.to_string());
-    (where_first, select_first)
-}
-
-/// Evaluating the WHERE first, on only the items it reads, gives exactly the outputs (keys,
-/// order and values) of EMQX's SELECT-first order on every message that does not fail
-/// there; one that does either fails the same way or was turned away first:
-/// aliases read by the WHERE, alias chains, dotted aliases, `*`, a WHERE on input fields
-/// only, shadowing, and a statement without WHERE.
-#[test]
-fn where_first_gives_the_select_first_outputs() {
-    let statements = [
-        r#"SELECT payload.v AS v, clientid FROM "t/#" WHERE v > 2"#,
-        r#"SELECT payload.v AS a, a * 2 AS b, b + 1 AS c, upper(clientid) AS who FROM "t/#" WHERE c > 7"#,
-        r#"SELECT payload.v AS m.v, payload.w AS m.w, topic FROM "t/#" WHERE m.v > 2"#,
-        r#"SELECT *, payload.v AS v FROM "t/#" WHERE v > 2"#,
-        r#"SELECT payload.v AS v, *, payload.w AS w FROM "t/#" WHERE w = 'x'"#,
-        r#"SELECT payload.v AS v, payload.w AS w FROM "t/#" WHERE clientid = 'c_emqx' AND payload.v > 2"#,
-        r#"SELECT payload.v AS clientid FROM "t/#" WHERE clientid > 2"#,
-        r#"SELECT payload.v AS v, v AS v FROM "t/#" WHERE v > 2"#,
-        r#"SELECT payload.v AS v, CASE WHEN v > 3 THEN 'big' ELSE 'small' END AS size FROM "t/#" WHERE size = 'big'"#,
-        r#"SELECT payload.list AS l, nth(2, l) AS second FROM "t/#" WHERE second > 1"#,
-        r#"SELECT payload.v AS v, payload FROM "t/#""#,
-        r#"SELECT payload.v + 1 FROM "t/#" WHERE payload.v > 2"#,
-    ];
-    let payloads = [
-        r#"{"v": 1, "w": "x", "list": [1, 2, 3]}"#,
-        r#"{"v": 5, "w": "y", "list": [4, 0]}"#,
-        r#"{"v": 3, "w": "x", "list": [9, 9]}"#,
-        r#"{"w": "x"}"#,
-    ];
-    for sql in statements {
-        for p in payloads {
-            let (where_first, select_first) = both_orders(sql, "t/a", p);
-            match &select_first {
-                Ok(_) => assert_eq!(where_first, select_first, "{sql} on {p}"),
-                // Where SELECT-first fails, WHERE-first fails the same way, or never
-                // evaluated the failing item because the WHERE turned the message away.
-                Err(_) => assert!(
-                    where_first == select_first || where_first == Ok(Vec::new()),
-                    "{sql} on {p}: {where_first:?} vs {select_first:?}"
-                ),
-            }
-        }
-    }
-}
-
-/// The one difference from EMQX's order: a SELECT item the WHERE does not read is never
-/// evaluated for a message the WHERE turns away, so an item that would fail makes that
-/// message `no_result` rather than `failed`. A message that passes still fails on it.
-#[test]
-fn an_item_the_where_does_not_read_cannot_fail_a_message_it_turns_away() {
-    let sql = r#"SELECT payload.v AS v FROM "t/#" WHERE clientid = 'someone-else'"#;
-    let (where_first, select_first) = both_orders(sql, "t/a", "not json");
-    assert_eq!(
-        where_first,
-        Ok(Vec::new()),
-        "turned away, never decoding the payload"
-    );
-    assert!(
-        select_first.is_err(),
-        "SELECT-first decodes it and fails: {select_first:?}"
-    );
-
-    let sql = r#"SELECT payload.v AS v FROM "t/#" WHERE clientid = 'c_emqx'"#;
-    let (where_first, _) = both_orders(sql, "t/a", "not json");
-    assert!(
-        where_first.is_err(),
-        "a message that passes still fails on it: {where_first:?}"
-    );
-}
-
-/// The plan names exactly the items the WHERE reads, through alias chains, and only items
-/// before the one that reads them.
-#[test]
-fn the_where_plan_follows_alias_chains_backwards_only() {
-    let plan = |sql: &str| compile_alone(sql).unwrap().stmt.where_needs;
-    assert_eq!(
-        plan(
-            r#"SELECT payload.v AS a, a * 2 AS b, clientid, b + 1 AS c, payload.x AS d FROM "t/#" WHERE c > 7"#
-        ),
-        // `payload.x AS d` starts with `payload`, a name `a` reads: computed early, harmlessly.
-        Some(vec![true, true, false, true, false]),
-    );
-    assert_eq!(
-        plan(r#"SELECT c * 2 AS b, payload.v AS c FROM "t/#" WHERE b > 1"#),
-        Some(vec![true, false]),
-        "`b` reads `c` before `c` is selected, so from the trigger: `c` is not needed"
-    );
-    assert_eq!(
-        plan(r#"SELECT payload.v AS v FROM "t/#""#),
-        None,
-        "no WHERE"
-    );
-    assert_eq!(
-        plan(r#"FOREACH payload.l AS x FROM "t/#" WHERE true"#),
-        None,
-        "FOREACH keeps its order"
-    );
-    assert_eq!(
-        plan(r#"SELECT payload.v AS v, upper(clientid) AS who FROM "t/#" WHERE topic = 't/a'"#),
-        Some(vec![false, false]),
-        "a WHERE on the trigger alone computes nothing early"
-    );
 }
