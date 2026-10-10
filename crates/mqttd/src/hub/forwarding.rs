@@ -29,6 +29,7 @@ static NO_APP_PROPERTIES: AppProperties = AppProperties {
     response_topic: None,
     correlation_data: None,
     user_properties: Vec::new(),
+    origin: None,
 };
 
 #[cfg(test)]
@@ -720,6 +721,9 @@ impl Hub {
     /// broadcast: caches are warmed by the owner's post-commit fan-out instead, so a
     /// retained publish forwards like any other — to interested peers, for live
     /// delivery only.
+    ///
+    /// Returns whether any peer has a subscriber for the topic — whether the publish
+    /// was owed to a remote subscriber, sent or not.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn forward_to_peers(
         &mut self,
@@ -730,7 +734,7 @@ impl Hub {
         message_expiry: Option<u32>,
         app: &AppProperties,
         gate: Option<u64>,
-    ) {
+    ) -> bool {
         let retain_broadcasts = retain && self.durable_retained.is_none();
         // A gated QoS ≥ 1 forward is ACKED (ADR 0042 T9, exhibit ⑤): the
         // publisher's ack waits for each target's durability-gated answer, and
@@ -752,6 +756,10 @@ impl Hub {
         // disjoint. EVERY exit below must restore it.
         let mut interested_nodes = std::mem::take(&mut self.interest_scratch);
         self.interest.matching_into(topic, &mut interested_nodes);
+        // Whether a peer has a subscriber for it: what "reached somebody" means for
+        // `$events/message/dropped` (a retained broadcast to an uninterested peer
+        // reaches nobody).
+        let wanted_remotely = !interested_nodes.is_empty();
         // Issue #613 item 1.6: the O(peers) term, timed on its own rather than
         // folded into `hub_dispatch_seconds`. The clock is read only when metrics
         // are attached, so a bench or unit-test hub pays nothing, and EVERY exit
@@ -773,7 +781,7 @@ impl Hub {
             if !retain_broadcasts {
                 self.interest_scratch = interested_nodes;
                 self.observe_fanout(fanout_started, peer_visits);
-                return;
+                return wanted_remotely;
             }
         }
         // Nothing to forward, so do not walk the peer map to discover that
@@ -789,7 +797,7 @@ impl Hub {
         if interested_nodes.is_empty() && !retain_broadcasts {
             self.interest_scratch = interested_nodes;
             self.observe_fanout(fanout_started, peer_visits);
-            return;
+            return wanted_remotely;
         }
         for (node, peer) in &self.peers {
             peer_visits += 1;
@@ -814,17 +822,22 @@ impl Hub {
             if let Some(m) = &self.metrics {
                 m.publish_forwarded("subscriber-remote");
             }
-            let _ = peer.tx.send(PeerMessage::Publish {
-                topic: topic.to_string(),
-                payload: payload.to_vec(),
-                qos: qos as u8,
-                retain,
-                message_expiry,
-                app: app_to_wire(app),
-            });
+            let _ = peer.tx.send(events::origin_frame(
+                peer,
+                PeerMessage::Publish {
+                    topic: topic.to_string(),
+                    payload: payload.to_vec(),
+                    qos: qos as u8,
+                    retain,
+                    message_expiry,
+                    app: app_to_wire(app),
+                },
+                app,
+            ));
         }
         self.interest_scratch = interested_nodes;
         self.observe_fanout(fanout_started, peer_visits);
+        wanted_remotely
     }
 
     /// Send pending publish `id` to `node` as a plain, unanswered forward. Not counted
@@ -833,14 +846,18 @@ impl Hub {
         let (Some(p), Some(peer)) = (self.pending_publishes.get(id), self.peers.get(node)) else {
             return;
         };
-        let _ = peer.tx.send(PeerMessage::Publish {
-            topic: p.topic.clone(),
-            payload: p.payload.to_vec(),
-            qos: p.qos as u8,
-            retain: p.retain,
-            message_expiry: p.message_expiry,
-            app: app_to_wire(p.app()),
-        });
+        let _ = peer.tx.send(events::origin_frame(
+            peer,
+            PeerMessage::Publish {
+                topic: p.topic.clone(),
+                payload: p.payload.to_vec(),
+                qos: p.qos as u8,
+                retain: p.retain,
+                message_expiry: p.message_expiry,
+                app: app_to_wire(p.app()),
+            },
+            p.app(),
+        ));
     }
 
     /// Record one peer fan-out's own time and link count (issue #613 item 1.6).
@@ -909,8 +926,11 @@ impl Hub {
         let Some(p) = self.pending_publishes.get_mut(id) else {
             return;
         };
-        let proto = self.peers.get(&node).map_or(0, |peer| peer.proto);
-        let frame = forward_frame(id, p, seq, &obligation, proto);
+        let (proto, with_origin) = self
+            .peers
+            .get(&node)
+            .map_or((0, false), |peer| (peer.proto, peer.wants_origin));
+        let frame = forward_frame(id, p, seq, &obligation, proto, with_origin);
         // Issue #480. Counted where the obligation is RECORDED rather than where
         // the frame is written, so a forward to a link that is momentarily down
         // still counts: the sweep will send it when the link returns, and it
@@ -1444,9 +1464,14 @@ impl Hub {
                 // from the first send — and, since 0041-T12, so a SHARED obligation
                 // retransmits `SharedDeliverAcked` rather than a fan-out
                 // `PublishAcked` that would deliver to the wrong subscribers.
-                let _ = peer
-                    .tx
-                    .send(forward_frame(id, p, *seq, obligation, peer.proto));
+                let _ = peer.tx.send(forward_frame(
+                    id,
+                    p,
+                    *seq,
+                    obligation,
+                    peer.proto,
+                    peer.wants_origin,
+                ));
             }
             // Re-route after a target death (grace engaged by peer_dead).
             let Some(p) = self.pending_publishes.get(id) else {

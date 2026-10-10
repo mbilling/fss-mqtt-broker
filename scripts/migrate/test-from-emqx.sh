@@ -649,8 +649,8 @@ PYEOF2
 "$MQTTD_BIN" --check-rules "$WORK/rules.toml" >"$WORK/rules.out" 2>"$WORK/rules.err" \
   || { echo "  FAIL — the broker REJECTED the translated rules file:";
        sed 's/^/         /' "$WORK/rules.err"; exit 1; }
-grep -q 'rules OK: .*: 7 rule(s), 6 enabled' "$WORK/rules.out" \
-  || fail "the translated rules file did not load the 7 live rules (6 enabled): $(cat "$WORK/rules.out")"
+grep -q 'rules OK: .*: 8 rule(s), 7 enabled' "$WORK/rules.out" \
+  || fail "the translated rules file did not load the 8 live rules (7 enabled): $(cat "$WORK/rules.out")"
 "$MQTTD_BIN" --check-config --config "$WORK/rules-mqttd.toml" >/dev/null 2>"$WORK/check.err" \
   || { echo "  FAIL — the broker REJECTED the config naming the rules file:";
        sed 's/^/         /' "$WORK/check.err"; exit 1; }
@@ -671,9 +671,15 @@ grep -qF '{ function = "republish", args = { topic = "d/out", direct_dispatch = 
 todo 'mqtt:my_egress_mqtt_bridge.* is a data-integration sink' "$WORK/rules.toml"
 todo 'receive_msgs_from_remote_mqtt_broker is COMMENTED OUT .*data-bridge source' "$WORK/rules.toml"
 todo 'jq_rule is COMMENTED OUT .*jq()' "$WORK/rules.toml"
-todo 'delivered_rule is COMMENTED OUT .*message_delivered' "$WORK/rules.toml"
+todo 'alarm_rule is COMMENTED OUT .*sys/alarm_activated' "$WORK/rules.toml"
 todo 'ignore_sys_message = .*own \$SYS messages .* never run rules' "$WORK/rules.toml"
 grep -q '^\[rules.jq_rule\]' "$WORK/rules.toml" && fail "an unsupported rule was left LIVE"
+grep -q '^\[rules.alarm_rule\]' "$WORK/rules.toml" && fail "a rule on an event mqttd does not raise was left LIVE"
+# The message events are raised (ADR 0083): a rule on one, in either spelling, is live.
+grep -q '^\[rules.delivered_rule\]' "$WORK/rules.toml" \
+  || fail "a rule on \$events/message_delivered was not carried live"
+grep -qF 'sql = "SELECT from_clientid, topic FROM \"$events/message_delivered\""' "$WORK/rules.toml" \
+  || fail "the message-event rule's SQL was not carried verbatim"
 # A translated statement runs, not merely parses: EMQX's documented example, end to end.
 out="$("$MQTTD_BIN" --rule-test --sql 'SELECT qos, payload.x as y FROM "t/a"' \
          --topic t/a --payload '{"x": 1}')"

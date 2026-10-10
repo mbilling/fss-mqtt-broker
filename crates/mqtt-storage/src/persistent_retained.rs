@@ -259,6 +259,7 @@ mod tests {
                 response_topic: Some("replies/a".into()),
                 correlation_data: Some(Bytes::from_static(&[9, 9])),
                 user_properties: vec![("origin".into(), "sensor-7".into())],
+                origin: None,
             };
             store.set(&with_props).await.unwrap();
             store.set(&msg("home/b", b"2")).await.unwrap();

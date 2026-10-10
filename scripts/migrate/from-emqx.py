@@ -2644,13 +2644,13 @@ RULE_EVENT_TOPICS = {
     "client/connected": True, "client/disconnected": True, "client/connack": True,
     "client/ping": True, "auth/check_authn_complete": True,
     "auth/check_authz_complete": True, "session/subscribed": True,
-    "session/unsubscribed": True, "message/delivered": False, "message/acked": False,
-    "message/dropped": False, "message/delivery_dropped": False,
+    "session/unsubscribed": True, "message/delivered": True, "message/acked": True,
+    "message/dropped": True, "message/delivery_dropped": True,
     "message_transformation/failed": False, "schema_validation/failed": False,
     "client_connected": True, "client_disconnected": True, "client_connack": True,
     "client_check_authn_complete": True, "client_check_authz_complete": True,
-    "session_subscribed": True, "session_unsubscribed": True, "message_delivered": False,
-    "message_acked": False, "message_dropped": False, "delivery_dropped": False,
+    "session_subscribed": True, "session_unsubscribed": True, "message_delivered": True,
+    "message_acked": True, "message_dropped": True, "delivery_dropped": True,
     "message_transformation_failed": False, "schema_validation_failed": False,
 }
 
