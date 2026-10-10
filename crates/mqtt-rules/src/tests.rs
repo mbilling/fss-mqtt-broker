@@ -2807,6 +2807,10 @@ fn string_functions_work_on_grapheme_clusters_like_emqx() {
     assert_eq!(val("strlen('\u{1100}\u{1161}\u{11A8}')"), "1");
     assert_eq!(val("strlen('👨\u{200D}👩\u{200D}👧')"), "1");
     assert_eq!(val("strlen('क्षि')"), "1");
+    // The tables are Unicode 16's, as OTP 28's are. U+1ACF is unassigned there, so it is a
+    // cluster of its own after `a`; Unicode 17 makes it a combining mark and the pair one
+    // cluster. This fails if `unicode-segmentation` moves past 1.12 (see Cargo.toml).
+    assert_eq!(val("strlen('a\u{1ACF}')"), "2");
     assert_eq!(val("pad('🇪🇸', 4)"), r#""🇪🇸   ""#);
     assert_eq!(val("pad('ab', 7, 'both', 'xy')"), r#""xyxyabxyxyxy""#);
     assert_eq!(val("pad('ab', -1)"), r#""ab""#);

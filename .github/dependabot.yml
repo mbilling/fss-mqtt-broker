@@ -33,6 +33,12 @@ updates:
       # ADR-backed PR — never by sweep. Minors/patches within the major flow.
       - dependency-name: redb
         update-types: ["version-update:semver-major"]
+      # Rule string functions count grapheme clusters by Unicode 16, the version
+      # EMQX's OTP 28 segments by (crates/mqtt-rules/Cargo.toml pins ~1.12). 1.13
+      # moved to Unicode 17, which changes results a rule can see. Move it only
+      # together with the EMQX/OTP version the rule engine tracks.
+      - dependency-name: unicode-segmentation
+        versions: [">=1.13"]
     open-pull-requests-limit: 5
 
   - package-ecosystem: cargo
