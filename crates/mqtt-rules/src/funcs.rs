@@ -213,7 +213,11 @@ funcs! {
         v => Err(type_err("a float", v)),
     };
     "int" 1..=1 => |a, cx| built(cx, to_int(&a[0]));
-    "str" 1..=1 => |a, _| Ok(Value::from(a[0].to_text()?));
+    // `emqx_utils_conv:bin/1`: a binary is itself, whatever its bytes.
+    "str" 1..=1 => |a, _| match &a[0] {
+        bytes @ Value::Bin(_) => Ok(bytes.clone()),
+        v => Ok(Value::from(v.to_text()?)),
+    };
     "str_utf8" 1..=1 => |a, _| Ok(Value::from(a[0].to_text()?));
     "str_utf16_le" 1..=1 => |a, _| {
         let s = a[0].to_text()?;
@@ -578,11 +582,13 @@ funcs! {
     "contains_topic_match" 2..=3 => |a, _| array(&a[0]).map(|_| Value::Bool(false));
 
     // -- conditional
-    "coalesce" 1..=MANY => |a, _| Ok(candidates(a).into_iter().find(|v| !v.is_undefined()).unwrap_or(Value::Null));
-    "coalesce_ne" 1..=MANY => |a, _| Ok(candidates(a)
-        .into_iter()
-        .find(|v| !v.is_undefined() && v.as_bytes().is_none_or(|b| !b.is_empty()))
-        .unwrap_or(Value::Null));
+    // EMQX exports `coalesce/1` over a list and `coalesce/2`, nothing wider.
+    "coalesce" 1..=2 => |a, _| first_candidate(a, |_| false);
+    // `undefined`, `""` and `<<>>` are empty there; `""` is the empty list.
+    "coalesce_ne" 1..=2 => |a, _| first_candidate(a, |v| match v {
+        Value::Array(list) => list.is_empty(),
+        v => v.as_bytes().is_some_and(<[u8]>::is_empty),
+    });
 
     // -- legacy accessors (EMQX keeps these for 4.x-era rules)
     "topic" 0..=1 => |a, cx| {
@@ -1044,11 +1050,20 @@ fn same(a: &Value, b: &Value) -> bool {
     a.exact_eq(b)
 }
 
-fn candidates(a: &[Value]) -> Vec<Value> {
-    match a {
-        [Value::Array(list)] => list.as_ref().clone(),
-        _ => a.to_vec(),
-    }
+/// EMQX's `coalesce`: the first candidate that is neither `undefined` nor `empty`, or
+/// `undefined` when there is none. One argument is the list of candidates and anything
+/// else fails (EMQX has no clause for it: `bad_sql_function_argument`); two are the
+/// candidates.
+fn first_candidate(a: &[Value], empty: fn(&Value) -> bool) -> Result<Value, EvalError> {
+    let candidates = match a {
+        [list] => array(list)?,
+        _ => a,
+    };
+    Ok(candidates
+        .iter()
+        .find(|v| !v.is_undefined() && !empty(v))
+        .cloned()
+        .unwrap_or(Value::Undefined))
 }
 
 fn digest(alg: &'static aws_lc_rs::digest::Algorithm, data: &[u8]) -> String {

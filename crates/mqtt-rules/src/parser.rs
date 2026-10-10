@@ -10,11 +10,15 @@
 //! It accepts a small, deliberate superset — every statement EMQX accepts parses to the
 //! same meaning here; a few it rejects are accepted:
 //!
-//! - `AND` / `OR` / `NOT` anywhere an expression may appear (EMQX allows them only in
-//!   `WHERE`/`INCASE`/`WHEN`), so `SELECT a > 1 and b < 2 AS ok` works;
+//! - `AND` / `OR` / `NOT` / `IN` anywhere an expression may appear (EMQX allows them
+//!   only in `WHERE`/`INCASE`/`WHEN`), so `SELECT a > 1 and b < 2 AS ok` works, and with
+//!   them a parenthesised comparison and `CASE` inside a larger expression;
 //! - keywords as path segments after a dot (`payload.from`);
 //! - field access on a computed value (`json_decode(payload).a`);
-//! - identifiers starting with `_`, and `1e5`-style float literals.
+//! - identifiers starting with `_`, `1e5`-style float literals, and the `f`/`d` suffix
+//!   EMQX's lexer passes and its parser then fails on.
+//!
+//! `docs/RULES.md` lists them under "Differences from EMQX".
 //!
 //! Function names are resolved here, so an unknown function or a wrong argument count
 //! fails when the rules file is loaded, not on the first matching message.

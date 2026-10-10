@@ -152,9 +152,10 @@ of the message.
 # it: it is a debugging aid, not a data path. It publishes nothing, and the original
 # message is delivered as usual.
 #
-# The log line is JSON, and JSON cannot hold raw bytes: for a message whose payload (or
-# MQTT 5 Correlation-Data) is not UTF-8 text, the broker logs a WARN instead of the
-# line. To see such payloads, log them as hex: docs/RULES-COOKBOOK.md shows the rule.
+# The log line is JSON, and JSON holds text, not raw bytes: in a payload (or MQTT 5
+# Correlation-Data) that is not UTF-8 text, each byte sequence that is not text is
+# logged as U+FFFD. To see such payloads, log them as hex: docs/RULES-COOKBOOK.md shows
+# the rule.
 #
 # In:  factory/line1/temp  qos=1 retain=0  {"t": 20.5}
 # The broker logs one line for it:
@@ -218,20 +219,21 @@ mqttd --rule-test --sql 'SELECT topic(2) AS machine, payload.temp AS temp FROM "
 rule test FAILED: payload is not JSON, so payload.<field> is unreadable (invalid JSON: expected value at line 1 column 1)
 ```
 
-**Gotcha: binary payloads.** The console action logs its output as JSON, and JSON cannot
-hold raw bytes. For a message whose payload, or MQTT 5 Correlation-Data, is not UTF-8 text,
-the broker logs a WARN instead of the line (at most once every 10 seconds per rule, as for
-any failure), and the message itself is still delivered:
+**Gotcha: binary payloads.** The console action logs its output as JSON, and JSON holds
+text, not raw bytes. In a payload, or MQTT 5 Correlation-Data, that is not UTF-8 text,
+each byte sequence that is not text is logged as U+FFFD (`�`), the replacement
+character, as EMQX's JSON encoder writes it. The message itself is delivered byte for
+byte:
 
 ```sh
 printf '\001\377\304' | mosquitto_pub -i plc-2 -t factory/line1/raw -s
 ```
 
 ```text
-2026-10-07T18:04:25.216456Z  WARN mqttd::rules: rule action failed (counted in mqttd_rule_actions_total{result="failed"}; this rule's further failures within 10s are logged at debug) rule=debug_factory error=cannot JSON-encode binary (non-UTF-8) data; select base64_encode(...) or bin2hexstr(...) of it instead
+2026-10-10T17:41:07.512204Z  INFO mqttd::rules: rule console action rule=debug_factory output={"id":"00065D7FA2C1A3B8F092834900000001","clientid":"plc-2","username":"undefined","payload":"\u0001��","peerhost":"127.0.0.1","peername":"127.0.0.1:54519","topic":"factory/line1/raw","qos":0,"flags":{"dup":false,"retain":false},"pub_props":{"User-Property":{}},"publish_received_at":1791654067512,"client_attrs":{},"event":"message.publish","timestamp":1791654067512,"node":"node-local","metadata":{"rule_id":"debug_factory"}}
 ```
 
-To see a device that sends bytes, use this rule in place of the recipe's. It logs the
+To see the bytes a device sends, use this rule in place of the recipe's. It logs the
 payload as hex, so it works for text and bytes alike:
 
 ```toml
@@ -1349,9 +1351,9 @@ archive/nb-1  qos=0 retain=0  02ff9c
 
 **Gotchas:** a `${...}` placeholder reads the rule's output, so `decode_binary_frame`
 selects `payload` for the archive copy; without it, the archive would contain the text
-`undefined`. `bin2hexstr` gives upper-case hex. JSON cannot hold raw bytes, so `${.}` on
-an output with a binary value is an error, not a lossy conversion: encode the bytes first,
-as `raw_b64` does.
+`undefined`. `bin2hexstr` gives upper-case hex. JSON holds text, not raw bytes, so `${.}`
+on an output with a binary value writes U+FFFD for each byte sequence that is not UTF-8,
+as EMQX does: encode the bytes first, as `raw_b64` does.
 
 ---
 

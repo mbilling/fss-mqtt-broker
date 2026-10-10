@@ -1026,8 +1026,9 @@ const CORRELATION_PUB: Pub = Pub {
     derived: &[],
 };
 
-/// What recipe 01 logs, in place of its console line, for a message it cannot encode.
-const BINARY_WARN: &str = r#"<logtime>  WARN mqttd::rules: rule action failed (counted in mqttd_rule_actions_total{result="failed"}; this rule's further failures within 10s are logged at debug) rule=debug_factory error=cannot JSON-encode binary (non-UTF-8) data; select base64_encode(...) or bin2hexstr(...) of it instead"#;
+/// What recipe 01 logs for [`BINARY_PUB`]: its console line, each byte sequence that is
+/// not UTF-8 as U+FFFD, the way EMQX's JSON encoder writes it (jiffy's `force_utf8`).
+const BINARY_CONSOLE_LINE: &str = "<logtime>  INFO mqttd::rules: rule console action rule=debug_factory output={\"id\":\"<id>\",\"clientid\":\"plc-2\",\"username\":\"undefined\",\"payload\":\"\\u0001\u{FFFD}\u{FFFD}\",\"peerhost\":\"127.0.0.1\",\"peername\":\"127.0.0.1:<port>\",\"topic\":\"factory/line1/raw\",\"qos\":0,\"flags\":{\"dup\":false,\"retain\":false},\"pub_props\":{\"User-Property\":{}},\"publish_received_at\":<ms>,\"client_attrs\":{},\"event\":\"message.publish\",\"timestamp\":<ms>,\"node\":\"node-local\",\"metadata\":{\"rule_id\":\"debug_factory\"}}";
 
 /// The rule the cookbook gives in recipe 01's place for a device that sends bytes, as the
 /// page quotes it.
@@ -1687,7 +1688,7 @@ fn recipe_blocks(r: &Recipe) -> Vec<WantBlock> {
             want.push(WantBlock::exact("text", [shown.to_string()]));
         }
         want.push(WantBlock::exact("sh", [pub_cmd(&BINARY_PUB)]));
-        want.push(WantBlock::pattern(BINARY_WARN));
+        want.push(WantBlock::pattern(BINARY_CONSOLE_LINE));
         want.push(WantBlock::exact(
             "toml",
             HEX_DEBUG.lines().map(String::from),
@@ -2723,28 +2724,30 @@ async fn every_recipe_does_on_the_real_broker_what_the_cookbook_shows() {
 }
 
 /// Recipe 01's gotcha, as the cookbook shows it: the console action logs JSON, which
-/// cannot hold raw bytes, so for a payload that is not UTF-8 text the broker logs the
-/// WARN the page shows instead of a console line, and still delivers the message; binary
-/// MQTT 5 Correlation-Data does the same, as the page says; and the hex rule the page
-/// gives in the recipe's place logs text and bytes alike, with the console line the page
-/// shows for the bytes. If the console action learned to log bytes, or the hex rule
-/// stopped working, the page's advice would be wrong.
+/// holds text, so for a payload that is not UTF-8 text the broker logs the console line
+/// the page shows, with U+FFFD for each byte sequence that is not text (as EMQX encodes
+/// it), and still delivers the message; binary MQTT 5 Correlation-Data is logged the same
+/// way, as the page says; and the hex rule the page gives in the recipe's place logs text
+/// and bytes alike, with the console line the page shows for the bytes. If the console
+/// action logged the bytes another way, or the hex rule stopped working, the page's
+/// advice would be wrong.
 #[tokio::test]
-async fn recipe_01_binary_payloads_warn_and_the_hex_variant_logs_them() {
-    for p in [&BINARY_PUB, &CORRELATION_PUB] {
-        // A broker each: the WARN is logged once per rule in 10 s.
-        let broker = start(&R01).await;
-        let since = now_ms();
-        run_pubs(broker.addr, std::slice::from_ref(p), since).await;
-        let warned = logged(&broker, "WARN mqttd::rules:", 1).await;
-        assert_log_line(BINARY_WARN, &warned[0], since);
-        assert!(
-            !broker.log.text().contains("rule console action"),
-            "{}: a console line as well as the WARN:\n{}",
-            p.client,
-            broker.log.tail(5)
-        );
-    }
+async fn recipe_01_binary_payloads_log_replacement_characters_and_the_hex_variant_logs_the_bytes() {
+    let broker = start(&R01).await;
+    let since = now_ms();
+    run_pubs(broker.addr, &[BINARY_PUB, CORRELATION_PUB], since).await;
+    let lines = logged(&broker, "rule console action", 2).await;
+    assert_log_line(BINARY_CONSOLE_LINE, &lines[0], since);
+    assert!(
+        lines[1].contains("\"Correlation-Data\":\"\\u0001\u{FFFD}\u{FFFD}\""),
+        "{}",
+        lines[1]
+    );
+    assert!(
+        !broker.log.text().contains("WARN mqttd::rules:"),
+        "a failure as well as the console lines:\n{}",
+        broker.log.tail(5)
+    );
 
     let file = tempfile::NamedTempFile::new().expect("a temp rules file");
     std::fs::write(file.path(), HEX_DEBUG).expect("write the rules");

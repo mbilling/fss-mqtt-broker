@@ -757,6 +757,57 @@ async fn check_says_whether_text_would_load_and_where_it_would_not() {
     assert!(n.audit.of_kind("rules.write").is_empty());
 }
 
+/// A rule whose output a 64-bit JSON reader would change: integers past 64 bits, a float
+/// in jiffy's form, keys out of alphabetical order, and bytes that are not UTF-8.
+const EXACT: &str = r#"
+[rules.exact]
+sql = '''SELECT payload.z AS z, payload.z + 1 AS next, payload.f AS f, payload.m AS m, sprintf('~c', 210) AS c FROM "t/#"'''
+actions = [{ function = "console" }]
+"#;
+
+/// The payload [`EXACT`] reads, and its output as the rule renders it (and EMQX 6.3.1
+/// does: `emqx_utils_json:encode/1` of the same map's values).
+const EXACT_PAYLOAD: &str = r#"{"z":123456789012345678901234567890,"f":1e20,"m":{"b":1,"a":2}}"#;
+const EXACT_OUTPUT: &str = "{\"z\":123456789012345678901234567890,\
+     \"next\":123456789012345678901234567891,\"f\":1.0e20,\"m\":{\"b\":1,\"a\":2},\
+     \"c\":\"\u{FFFD}\"}";
+
+/// `POST /admin/v1/rules/test` answers a console output as the JSON text the rule
+/// rendered: every digit of an integer past 64 bits, the float as written, the keys in
+/// the statement's order. A 64-bit JSON reader on the way showed `1.2345678901234568e29`
+/// and sorted the keys.
+#[tokio::test]
+async fn the_dry_run_answers_a_console_output_as_the_rule_rendered_it() {
+    let n = Node::start(RULES).await;
+    let body = json!({"source": EXACT, "topic": "t/1", "payload": EXACT_PAYLOAD}).to_string();
+    let (status, text) = client::call(
+        &n.target(&n.operator),
+        "POST",
+        "/admin/v1/rules/test",
+        Some(&body),
+    )
+    .await
+    .unwrap();
+    assert_eq!(status, 200, "{text}");
+    assert!(
+        text.contains(&format!(
+            "\"outputs\":[{{\"action\":\"console\",\"output\":{EXACT_OUTPUT}}}],"
+        )),
+        "{text}"
+    );
+    let doc: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(
+        (
+            &doc["node"],
+            &doc["results"][0]["rule"],
+            &doc["results"][0]["result"]
+        ),
+        (&json!("rules-node"), &json!("exact"), &json!("passed")),
+        "{text}"
+    );
+    assert!(doc["results"][0].get("reason").is_none(), "{text}");
+}
+
 /// `POST /admin/v1/rules/test`: what the running set, a `source` or one `rule` would do with
 /// a message or an event — rendered outputs, a failed action's index, a SQL error, why a
 /// rule would not run — while changing nothing: no Prometheus series, no last error, no

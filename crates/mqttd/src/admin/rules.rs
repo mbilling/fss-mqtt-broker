@@ -26,11 +26,11 @@ use super::{AdminState, Caller, Role};
 use crate::atomic_file::{self, Replace};
 use crate::reload::{enabled_rules, sha256_hex, LastReload, ReloadOutcome};
 use crate::rules::{rule_def, TraceOutput, TracePayload};
-use crate::rules_sys::{counts_json, output_json, rfc3339_millis};
+use crate::rules_sys::{counts_json, output_json, rfc3339_millis, ShownOutput};
 use bytes::Bytes;
 use mqtt_rules::edit::{EditError, RuleEdit};
 use mqtt_rules::{Effect, EventKind, Input, LoadError, Loaded, Outcome, Rule, RuleSet};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -706,14 +706,18 @@ pub async fn test(state: &AdminState, req: &Request) -> Answer {
             );
         }
         let results = dry_run(&set, alone.as_deref(), &trigger, &node);
-        (200, json!({"node": node, "results": results}).to_string())
+        let answer = TestAnswer {
+            node: &node,
+            results,
+        };
+        (200, serde_json::to_string(&answer).unwrap_or_default())
     })
     .await
 }
 
 /// Evaluate `trigger` against `alone`, or every enabled rule of `set` whose `FROM`
 /// selects it, with a report of its own: nothing outside this function sees it.
-fn dry_run(set: &RuleSet, alone: Option<&str>, trigger: &Trigger, node: &str) -> Vec<Value> {
+fn dry_run(set: &RuleSet, alone: Option<&str>, trigger: &Trigger, node: &str) -> Vec<Tested> {
     let props = mqtt_core::AppProperties::default();
     let mut message = mqtt_rules::PublishInput::new(
         &trigger.clientid,
@@ -763,13 +767,38 @@ enum Slot {
     Failed(usize, String),
 }
 
-fn evaluate(set: &RuleSet, rule: &Rule, input: &dyn Input) -> Value {
+/// A dry run's answer. Structs rather than `json!`, so a console output stays the text
+/// the rule rendered ([`ShownOutput`]).
+#[derive(Serialize)]
+struct TestAnswer<'a> {
+    node: &'a str,
+    results: Vec<Tested>,
+}
+
+/// What one rule did in a dry run.
+#[derive(Serialize)]
+struct Tested {
+    enabled: bool,
+    error: Option<String>,
+    outputs: Vec<ShownOutput>,
+    /// Why the rule would never run on this trigger, with `result` `no_match`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+    result: &'static str,
+    rule: String,
+}
+
+fn evaluate(set: &RuleSet, rule: &Rule, input: &dyn Input) -> Tested {
     let id = &**rule.id();
     if let Some(reason) = rule.from_mismatch(input) {
-        return json!({
-            "rule": id, "enabled": rule.enabled(), "result": "no_match", "error": null,
-            "outputs": [], "reason": reason,
-        });
+        return Tested {
+            enabled: rule.enabled(),
+            error: None,
+            outputs: Vec::new(),
+            reason: Some(reason),
+            result: "no_match",
+            rule: id.to_string(),
+        };
     }
     let (mut result, mut error, mut slots) = ("no_result", None, Vec::new());
     // Each output runs every action in order; an `ActionOk` is followed by its effect.
@@ -802,7 +831,7 @@ fn evaluate(set: &RuleSet, rule: &Rule, input: &dyn Input) -> Value {
         },
         &mut effects,
     );
-    let outputs: Vec<Value> = slots
+    let outputs: Vec<ShownOutput> = slots
         .into_iter()
         .filter_map(|slot| match slot {
             Slot::Effect(n) => effects.get(n).map(|(_, e)| output_json(&shown(e))),
@@ -812,10 +841,14 @@ fn evaluate(set: &RuleSet, rule: &Rule, input: &dyn Input) -> Value {
             })),
         })
         .collect();
-    json!({
-        "rule": id, "enabled": rule.enabled(), "result": result, "error": error,
-        "outputs": outputs,
-    })
+    Tested {
+        enabled: rule.enabled(),
+        error,
+        outputs,
+        reason: None,
+        result,
+        rule: id.to_string(),
+    }
 }
 
 /// A rendered effect as a dry run shows it: the trace's shape, payloads and console

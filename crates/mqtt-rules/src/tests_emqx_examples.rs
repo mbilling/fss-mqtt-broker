@@ -664,7 +664,7 @@ const STRINGS: &[Ex] = &[
     eq(
         "unescape/1",
         r"unescape('\a\b\f\v\?\x41\x1F600')",
-        "\"\\u0007\\b\\f\\u000b?A\u{1F600}\"",
+        "\"\\u0007\\b\\f\\u000B?A\u{1F600}\"",
     ),
     // `\'` cannot be written inside a SQL literal (the quote ends it), so the escapes
     // that name quotes and the backslash come from the payload.
@@ -1347,7 +1347,7 @@ const CONDITIONAL: &[Ex] = &[
     // More than two candidates go in one array: EMQX's source defines `coalesce/1` and
     // `coalesce_ne/1` over a list (`coalesce([undefined | T]) -> coalesce(T);
     // coalesce([H | _T]) -> H.`, `coalesce_ne` also skipping `""`), and the
-    // two-argument forms as `coalesce([A, B])`.
+    // two-argument forms as `coalesce([A, B])`. It has no wider form.
     eq(
         "emqx_rule_funcs.erl coalesce/1",
         "coalesce([payload.x, payload.y, 3])",

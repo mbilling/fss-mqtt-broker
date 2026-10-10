@@ -34,6 +34,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use bytes::Bytes;
 use mqtt_observability::metrics::{Metrics, RuleCounts};
 use mqtt_rules::RuleSet;
+use serde::Serialize;
+use serde_json::value::RawValue;
 use serde_json::{json, Map, Value};
 use tokio::sync::mpsc;
 use tokio::time::Instant;
@@ -448,7 +450,7 @@ pub async fn run_trace(
         }
         window.1 += 1;
         let topic = format!("$SYS/brokers/{node}/trace/rules/{}", record.rule);
-        let payload = record_json(&node, &record).to_string();
+        let payload = record_json(&node, &record);
         if !sys_publish(&hub, &ingress, topic, payload, SYS_EXPIRY_SECS) {
             observe.count_trace_dropped();
         }
@@ -502,11 +504,31 @@ fn trigger_json(t: &TraceTrigger) -> Value {
     }
 }
 
+/// One rendered output as shown: plain JSON, or a `console` line whose `output` is the
+/// JSON text the rule rendered.
+///
+/// That text is passed through, never read back: a reader of JSON numbers into 64 bits
+/// would show an integer past them as a float, and one without ordered maps would sort
+/// the keys the statement put in order.
+#[derive(Debug, Clone, Serialize)]
+#[serde(untagged)]
+pub enum ShownOutput {
+    /// A republish, a failed action, or a console line cut short.
+    Json(Value),
+    /// A whole console line.
+    Console {
+        /// `console`.
+        action: &'static str,
+        /// The selected fields, as the rule rendered them.
+        output: Box<RawValue>,
+    },
+}
+
 /// One rendered output as a trace record shows it — and as the admin API's dry run
 /// shows what a rule would render.
 #[must_use]
-pub fn output_json(o: &TraceOutput) -> Value {
-    match o {
+pub fn output_json(o: &TraceOutput) -> ShownOutput {
+    ShownOutput::Json(match o {
         TraceOutput::Republish {
             topic,
             qos,
@@ -523,8 +545,14 @@ pub fn output_json(o: &TraceOutput) -> Value {
         }
         // The selected fields, as the JSON they are; cut ones (past 1 KiB) as text.
         TraceOutput::Console { output, len } if output.len() == *len => {
-            match serde_json::from_str::<Value>(output) {
-                Ok(v) => json!({"action": "console", "output": v}),
+            match RawValue::from_string(output.clone()) {
+                Ok(output) => {
+                    return ShownOutput::Console {
+                        action: "console",
+                        output,
+                    }
+                }
+                // Not JSON this writer can carry (nested past its depth limit): as text.
                 Err(_) => json!({"action": "console", "output": output}),
             }
         }
@@ -538,22 +566,36 @@ pub fn output_json(o: &TraceOutput) -> Value {
             action_index,
             error,
         } => json!({"action_index": action_index, "error": error}),
-    }
+    })
 }
 
-/// A trace record as the JSON published for it.
+/// A trace record as published; the fields in the order a JSON object sorted by key has.
+#[derive(Serialize)]
+struct ShownRecord<'a> {
+    at: String,
+    error: Option<&'a str>,
+    node: &'a str,
+    outputs: Vec<ShownOutput>,
+    outputs_omitted: u32,
+    result: &'a str,
+    rule: &'a str,
+    trigger: Value,
+}
+
+/// A trace record as the JSON text published for it.
 #[must_use]
-pub fn record_json(node: &str, r: &TraceRecord) -> Value {
-    json!({
-        "node": node,
-        "rule": &*r.rule,
-        "at": rfc3339_millis(r.at),
-        "trigger": trigger_json(&r.trigger),
-        "result": r.result.as_str(),
-        "error": r.error,
-        "outputs": r.outputs.iter().map(output_json).collect::<Vec<_>>(),
-        "outputs_omitted": r.outputs_omitted,
+pub fn record_json(node: &str, r: &TraceRecord) -> String {
+    serde_json::to_string(&ShownRecord {
+        at: rfc3339_millis(r.at),
+        error: r.error.as_deref(),
+        node,
+        outputs: r.outputs.iter().map(output_json).collect(),
+        outputs_omitted: r.outputs_omitted,
+        result: r.result.as_str(),
+        rule: &r.rule,
+        trigger: trigger_json(&r.trigger),
     })
+    .unwrap_or_default()
 }
 
 #[cfg(test)]

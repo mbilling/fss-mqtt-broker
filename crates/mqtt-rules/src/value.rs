@@ -7,9 +7,10 @@
 //!   from JSON `null` ([`Value::Null`]): `is_null(x)` is true only for the first, and
 //!   `is_null_var(x)` for both.
 //! - Text is [`Value::Str`]; a payload that is not valid UTF-8 is [`Value::Bin`]. Both
-//!   are "binaries" to the SQL (they compare and concatenate byte-wise), but only text
-//!   can be JSON-encoded — a template that renders `${payload}` keeps arbitrary bytes
-//!   exact, while one that JSON-encodes them fails loudly instead of corrupting them.
+//!   are "binaries" to the SQL (they compare and concatenate byte-wise). A template that
+//!   renders `${payload}` keeps arbitrary bytes exact; JSON can only hold text, so
+//!   JSON-encoding bytes that are not UTF-8 writes U+FFFD for each broken sequence, as
+//!   EMQX's encoder does ([`Value::to_json`]).
 //! - Arrays and maps are reference counted, so selecting a decoded payload into several
 //!   outputs clones a pointer, not the document. Maps keep insertion order, so
 //!   `SELECT a, b` renders as `{"a":…,"b":…}`.
@@ -472,10 +473,18 @@ impl Value {
         Ok(())
     }
 
-    /// JSON text of this value.
+    /// JSON text of this value, as EMQX's encoder (jiffy with `force_utf8`) writes it.
+    ///
+    /// Text is written as it is. When any string in the value is not valid UTF-8, jiffy
+    /// repairs the whole value first (`jiffy_utf8:fix/1`) and so does this: each broken
+    /// sequence becomes one U+FFFD ([`fix_utf8`]). It never fails; the `Result` is kept
+    /// for its callers.
     pub fn to_json(&self) -> Result<String, EvalError> {
         let mut out = String::new();
-        write_json(self, &mut out)?;
+        if !write_json(self, false, &mut out) {
+            out.clear();
+            write_json(self, true, &mut out);
+        }
         Ok(out)
     }
 }
@@ -487,6 +496,9 @@ pub fn format_float(f: f64) -> Result<String, EvalError> {
     num::float_to_decimals(f, 10, true)
 }
 
+/// A JSON string as jiffy writes one: `\"`, `\\`, `\b`, `\f`, `\n`, `\r`, `\t`, any other
+/// character below U+0020 as `\u00XX` with upper-case hex digits, and everything else —
+/// `/`, DEL, U+2028 — as itself.
 fn write_json_str(s: &str, out: &mut String) {
     out.push('"');
     for c in s.chars() {
@@ -499,7 +511,7 @@ fn write_json_str(s: &str, out: &mut String) {
             '\u{08}' => out.push_str("\\b"),
             '\u{0c}' => out.push_str("\\f"),
             c if (c as u32) < 0x20 => {
-                let _ = write!(out, "\\u{:04x}", c as u32);
+                let _ = write!(out, "\\u{:04X}", c as u32);
             }
             c => out.push(c),
         }
@@ -507,7 +519,90 @@ fn write_json_str(s: &str, out: &mut String) {
     out.push('"');
 }
 
-fn write_json(v: &Value, out: &mut String) -> Result<(), EvalError> {
+/// Whether jiffy's repair keeps code point `c` (`xmerl_ucs:is_unicode/1`): not a
+/// surrogate, not U+FFFE or U+FFFF, not past U+10FFFF.
+fn is_unicode(c: u32) -> bool {
+    !matches!(c, 0xD800..=0xDFFF | 0xFFFE | 0xFFFF) && c < 0x11_0000
+}
+
+/// Bytes as the text jiffy's `force_utf8` repair (`jiffy_utf8:fix_bin/1`) makes of them.
+///
+/// It decodes loosely — a lead byte with all its continuation bytes is a code point,
+/// overlong forms included (`C0 80` is U+0000) — and replaces any other byte, together
+/// with every continuation byte that follows it, by one U+FFFD. Two adjacent surrogates
+/// that form a UTF-16 pair are joined (CESU-8), taken two at a time from the left. A
+/// code point that is not a character (a lone surrogate, U+FFFE, U+FFFF, past U+10FFFF)
+/// becomes U+FFFD. Valid UTF-8 comes back unchanged, except U+FFFE and U+FFFF.
+fn fix_utf8(bytes: &[u8]) -> String {
+    const REPLACEMENT: u32 = 0xFFFD;
+    let cont = |i: usize| {
+        bytes
+            .get(i)
+            .filter(|c| **c & 0xC0 == 0x80)
+            .map(|c| u32::from(c & 0x3F))
+    };
+    let mut points: Vec<u32> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while let Some(&c) = bytes.get(i) {
+        let lead = u32::from(c);
+        let (point, len) = match (c, cont(i + 1), cont(i + 2), cont(i + 3)) {
+            (0..=0x7F, ..) => (lead, 1),
+            (0xC0..=0xDF, Some(c1), ..) => ((lead & 0x1F) << 6 | c1, 2),
+            (0xE0..=0xEF, Some(c1), Some(c2), _) => ((lead & 0x0F) << 12 | c1 << 6 | c2, 3),
+            (0xF0..=0xF7, Some(c1), Some(c2), Some(c3)) => {
+                ((lead & 0x07) << 18 | c1 << 12 | c2 << 6 | c3, 4)
+            }
+            _ => {
+                let mut len = 1;
+                while cont(i + len).is_some() {
+                    len += 1;
+                }
+                (REPLACEMENT, len)
+            }
+        };
+        points.push(point);
+        i += len;
+    }
+    let surrogate = |c: u32| (0xD800..=0xDFFF).contains(&c);
+    let mut out = String::with_capacity(bytes.len());
+    let mut i = 0;
+    while let Some(&c) = points.get(i) {
+        i += 1;
+        let c = match points.get(i) {
+            Some(&low) if surrogate(c) && surrogate(low) => {
+                // The pair is consumed whether or not it joins.
+                i += 1;
+                if c < 0xDC00 && low >= 0xDC00 {
+                    0x1_0000 + ((c - 0xD800) << 10) + (low - 0xDC00)
+                } else {
+                    out.push(char::REPLACEMENT_CHARACTER);
+                    REPLACEMENT
+                }
+            }
+            _ => c,
+        };
+        out.push(
+            char::from_u32(c)
+                .filter(|_| is_unicode(c))
+                .unwrap_or(char::REPLACEMENT_CHARACTER),
+        );
+    }
+    out
+}
+
+/// Write `s`, a string or a key, as JSON; repaired first when `fix` is set.
+fn write_json_text(s: &str, fix: bool, out: &mut String) {
+    if fix && s.contains(['\u{FFFE}', '\u{FFFF}']) {
+        write_json_str(&fix_utf8(s.as_bytes()), out);
+    } else {
+        write_json_str(s, out);
+    }
+}
+
+/// Write `v` as JSON. Without `fix`, `false` as soon as a string that is not UTF-8 is
+/// met (jiffy's `invalid_string`), with `out` left partly written; with `fix`, every
+/// string is written repaired ([`fix_utf8`]) and the answer is always `true`.
+fn write_json(v: &Value, fix: bool, out: &mut String) -> bool {
     match v {
         Value::Undefined => write_json_str("undefined", out),
         Value::Null => out.push_str("null"),
@@ -520,15 +615,11 @@ fn write_json(v: &Value, out: &mut String) -> Result<(), EvalError> {
         }
         // jiffy's float: Erlang's shortest form (`1.0e20`, `0.1`), and `-0.0` as `0.0`.
         Value::Float(f) => out.push_str(&num::short_float(if *f == 0.0 { 0.0 } else { *f })),
-        Value::Str(s) => write_json_str(s, out),
+        Value::Str(s) => write_json_text(s, fix, out),
         Value::Bin(b) => match std::str::from_utf8(b) {
-            Ok(s) => write_json_str(s, out),
-            Err(_) => {
-                return Err(EvalError::new(
-                    "cannot JSON-encode binary (non-UTF-8) data; select base64_encode(...) or \
-                     bin2hexstr(...) of it instead",
-                ))
-            }
+            Ok(s) => write_json_text(s, fix, out),
+            Err(_) if fix => write_json_str(&fix_utf8(b), out),
+            Err(_) => return false,
         },
         Value::Array(a) => {
             out.push('[');
@@ -536,7 +627,9 @@ fn write_json(v: &Value, out: &mut String) -> Result<(), EvalError> {
                 if i > 0 {
                     out.push(',');
                 }
-                write_json(x, out)?;
+                if !write_json(x, fix, out) {
+                    return false;
+                }
             }
             out.push(']');
         }
@@ -546,14 +639,16 @@ fn write_json(v: &Value, out: &mut String) -> Result<(), EvalError> {
                 if i > 0 {
                     out.push(',');
                 }
-                write_json_str(k, out);
+                write_json_text(k, fix, out);
                 out.push(':');
-                write_json(x, out)?;
+                if !write_json(x, fix, out) {
+                    return false;
+                }
             }
             out.push('}');
         }
     }
-    Ok(())
+    true
 }
 
 /// Decode JSON text into a [`Value`] as EMQX (jiffy) does, preserving object key order:
@@ -591,13 +686,108 @@ mod tests {
         );
     }
 
+    /// EMQX 6.3.1, `emqx_utils_json:encode/1` (jiffy 2.0.1 with `force_utf8`) of each
+    /// binary: one U+FFFD per broken sequence, by `jiffy_utf8:fix_bin/1`'s loose decoding.
+    /// A template still renders the bytes themselves.
     #[test]
-    fn binary_is_never_silently_json_encoded() {
-        let v = Value::Bin(Bytes::from_static(&[0xff, 0x00]));
-        assert!(v.to_json().is_err());
+    fn json_of_bytes_that_are_not_utf8_is_repaired_as_jiffy_repairs_it() {
+        let json = |b: &[u8]| Value::Bin(Bytes::copy_from_slice(b)).to_json().unwrap();
+        for (bytes, want) in [
+            // `sprintf('~c', 210)`.
+            (&[0xD2][..], "\"\u{FFFD}\""),
+            (&[b'a', 0xD2, b'b'], "\"a\u{FFFD}b\""),
+            (&[0xD2, 0xD2], "\"\u{FFFD}\u{FFFD}\""),
+            // A sequence cut short is one replacement, with or without more text.
+            (&[0xE2, 0x82], "\"\u{FFFD}\""),
+            (&[0xE2, 0x82, b'a'], "\"\u{FFFD}a\""),
+            (&[0xF0, 0x9F, 0x98], "\"\u{FFFD}\""),
+            (&[0xF0, 0x9F, 0x98, b'a'], "\"\u{FFFD}a\""),
+            (&[b'a', 0xC3], "\"a\u{FFFD}\""),
+            (&[0xC3, b'a'], "\"\u{FFFD}a\""),
+            (&[0xE2, 0x28, 0xA1], "\"\u{FFFD}(\u{FFFD}\""),
+            // A stray byte takes every continuation byte after it along.
+            (&[0x80], "\"\u{FFFD}\""),
+            (&[0x80, 0x80, 0x80, 0x80, b'a'], "\"\u{FFFD}a\""),
+            (&[0xF8, 0x88, 0x80, 0x80, 0x80], "\"\u{FFFD}\""),
+            (&[0xFF, 0xFE], "\"\u{FFFD}\u{FFFD}\""),
+            // Overlong forms decode: to U+0000, `A` and `/`.
+            (&[0xC0, 0x80], "\"\\u0000\""),
+            (&[0xE0, 0x80, 0x80], "\"\\u0000\""),
+            (&[0xC1, 0x81], "\"A\""),
+            (&[0xF0, 0x80, 0x80, 0xAF], "\"/\""),
+            // Past U+10FFFF, and surrogates: alone, as a CESU-8 pair, and out of step.
+            (&[0xF4, 0x90, 0x80, 0x80], "\"\u{FFFD}\""),
+            (&[0xF7, 0xBF, 0xBF, 0xBF], "\"\u{FFFD}\""),
+            (&[0xED, 0xA0, 0x80], "\"\u{FFFD}\""),
+            (&[0xED, 0xA0, 0xBD, 0xED, 0xB8, 0x80], "\"\u{1F600}\""),
+            (
+                &[0xED, 0xB8, 0x80, 0xED, 0xA0, 0xBD, 0xED, 0xB8, 0x80],
+                "\"\u{FFFD}\u{FFFD}\u{FFFD}\"",
+            ),
+            (
+                &[0xED, 0xA0, 0xBD, 0xED, 0xA0, 0xBD, 0xED, 0xB8, 0x80],
+                "\"\u{FFFD}\u{FFFD}\u{FFFD}\"",
+            ),
+            // Escapes are the same after a repair.
+            (
+                &[8, 12, 10, 27, 31, 34, 47, 92, 127, 0xD2],
+                "\"\\b\\f\\n\\u001B\\u001F\\\"/\\\\\u{7F}\u{FFFD}\"",
+            ),
+        ] {
+            assert_eq!(json(bytes), want, "{bytes:02X?}");
+        }
+        // A template renders the bytes, not their JSON (`emqx_template:render/2`).
         let mut out = Vec::new();
-        v.render_into(&mut out).unwrap();
-        assert_eq!(out, [0xff, 0x00]);
+        Value::Bin(Bytes::from_static(&[0xD2]))
+            .render_into(&mut out)
+            .unwrap();
+        assert_eq!(out, [0xD2]);
+    }
+
+    /// EMQX 6.3.1: jiffy repairs the whole value once any string in it is not UTF-8, and
+    /// the repair also replaces U+FFFE and U+FFFF, which are written as themselves
+    /// otherwise: `encode([<<"\xEF\xBF\xBE">>, <<"\xEF\xBF\xBF">>, <<210>>])` is three
+    /// U+FFFD, `encode(<<"\xEF\xBF\xBE">>)` is U+FFFE. Other non-characters (U+FDD0,
+    /// U+1FFFE) and numbers are untouched.
+    #[test]
+    fn a_json_repair_covers_the_whole_value() {
+        let bad = Value::Bin(Bytes::from_static(&[0xD2]));
+        assert_eq!(
+            Value::from("\u{FFFE}\u{FFFF}").to_json().unwrap(),
+            "\"\u{FFFE}\u{FFFF}\""
+        );
+        let all = Value::from(vec![
+            Value::from("\u{FFFE}"),
+            Value::from("\u{FFFF}"),
+            Value::from("\u{FDD0}\u{1FFFE}"),
+            Value::Float(1e20),
+            json_decode(b"12345678901234567890").unwrap(),
+            bad,
+        ]);
+        assert_eq!(
+            all.to_json().unwrap(),
+            "[\"\u{FFFD}\",\"\u{FFFD}\",\"\u{FDD0}\u{1FFFE}\",1.0e20,12345678901234567890,\"\u{FFFD}\"]"
+        );
+        // Keys too, and a map after the string that needed the repair.
+        let mut m = Map::new();
+        m.insert("k", Value::Bin(Bytes::from_static(&[1, 0xFF, 0xC4])));
+        m.insert("\u{FFFF}", Value::Undefined);
+        assert_eq!(
+            Value::from(m).to_json().unwrap(),
+            "{\"k\":\"\\u0001\u{FFFD}\u{FFFD}\",\"\u{FFFD}\":\"undefined\"}"
+        );
+    }
+
+    /// EMQX 6.3.1, `emqx_utils_json:encode(<<0,1,7,8,9,10,11,12,13,14,27,31,32,34,47,92,
+    /// 127>>)`: the short escapes, `\u00XX` in upper case for the other controls, and
+    /// `/`, DEL and U+2028 as themselves.
+    #[test]
+    fn json_strings_escape_as_jiffy_escapes_them() {
+        let s = "\0\u{1}\u{7}\u{8}\t\n\u{b}\u{c}\r\u{e}\u{1b}\u{1f} \"/\\\u{7f}\u{2028}";
+        assert_eq!(
+            Value::from(s).to_json().unwrap(),
+            "\"\\u0000\\u0001\\u0007\\b\\t\\n\\u000B\\f\\r\\u000E\\u001B\\u001F \\\"/\\\\\u{7f}\u{2028}\""
+        );
     }
 
     #[test]

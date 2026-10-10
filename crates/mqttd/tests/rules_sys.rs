@@ -27,7 +27,7 @@ use mqttd::rules::{
     ConnRules, PublishFacts, Publisher, Rules, RulesObserve, TraceRecord, TRACE_QUEUE_BYTES,
 };
 use mqttd::rules_sys::{record_json, run_stats, run_trace};
-use serde_json::Value;
+use serde_json::{json, Value};
 use tokio::sync::{mpsc, watch};
 use tokio::time::{timeout, Instant};
 use tokio_util::sync::CancellationToken;
@@ -288,6 +288,21 @@ actions = [{ function = "console" }]
 enable = false
 "#;
 
+/// Wait until the wall clock reads a later millisecond than `at`, a time the statistics
+/// published. Their times are the wall clock's, to the millisecond, and paused tokio
+/// time does not move it: ticks two (paused) seconds apart can carry the same `at`, so
+/// a test that tells one tick's time from another's has to let a real millisecond pass.
+fn wall_clock_past(at: &str) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while mqttd::rules_sys::rfc3339_millis(std::time::SystemTime::now()).as_str() <= at {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the wall clock did not pass {at} in 10 s"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
 /// ADR 0084 D4: `last_active_at` is the tick at which the statistics saw a rule's
 /// evaluations grow. What ran before they were on, or while they were off, was not seen
 /// to run. A reload that removes a rule and one that puts it back keep its last activity
@@ -328,6 +343,8 @@ async fn last_active_is_kept_across_a_reload_and_set_only_when_a_rule_runs() {
     );
 
     publish(&conn, "t/1", br#"{"v":5}"#);
+    // A later millisecond than `ran`, or this tick's time could not be told from it.
+    wall_clock_past(&ran);
     let (summary, per_rule) = next_tick(&mut sys, 3).await;
     assert_eq!(per_rule["hot"]["last_active_at"], summary["at"]);
     assert_ne!(per_rule["hot"]["last_active_at"], ran.as_str());
@@ -340,6 +357,7 @@ async fn last_active_is_kept_across_a_reload_and_set_only_when_a_rule_runs() {
         "off: no tick"
     );
     publish(&conn, "t/1", br#"{"v":5}"#);
+    wall_clock_past(&active);
     w.observe.apply(&settings(2, false, 20), None);
     let (_, per_rule) = next_tick(&mut sys, 3).await;
     assert_eq!(per_rule["hot"]["counts"]["matched"], 4);
@@ -661,6 +679,51 @@ fn drain(rx: &mut mpsc::Receiver<TraceRecord>) -> Vec<TraceRecord> {
     out
 }
 
+/// A rule whose output a 64-bit JSON reader would change: integers past 64 bits, a float
+/// in jiffy's form, keys out of alphabetical order, and bytes that are not UTF-8.
+const EXACT: &str = r#"
+[rules.exact]
+sql = '''SELECT payload.z AS z, payload.z + 1 AS next, payload.f AS f, payload.m AS m, sprintf('~c', 210) AS c FROM "t/#"'''
+actions = [{ function = "console" }]
+"#;
+
+/// The payload [`EXACT`] reads, and its output as the rule renders it (and EMQX 6.3.1
+/// does: `emqx_utils_json:encode/1` of the same map's values).
+const EXACT_PAYLOAD: &str = r#"{"z":123456789012345678901234567890,"f":1e20,"m":{"b":1,"a":2}}"#;
+const EXACT_OUTPUT: &str = "{\"z\":123456789012345678901234567890,\
+     \"next\":123456789012345678901234567891,\"f\":1.0e20,\"m\":{\"b\":1,\"a\":2},\
+     \"c\":\"\u{FFFD}\"}";
+
+/// ADR 0084 D5: a trace record carries a console output as the JSON text the rule
+/// rendered — every digit of an integer past 64 bits, the float as written, the keys in
+/// the statement's order — not that text read back by a 64-bit JSON reader, which showed
+/// `1.2345678901234568e29` and sorted the keys.
+#[tokio::test]
+async fn a_trace_record_carries_a_console_output_as_the_rule_rendered_it() {
+    let mut w = watched(EXACT, &settings(0, true, 20));
+    publish(&w.rules.for_connection(), "t/1", EXACT_PAYLOAD.as_bytes());
+    let records = drain(w.trace_rx.as_mut().unwrap());
+    assert_eq!(records.len(), 1, "{records:#?}");
+    let text = record_json("n1", &records[0]);
+    assert!(
+        text.contains(&format!(
+            "\"outputs\":[{{\"action\":\"console\",\"output\":{EXACT_OUTPUT}}}],"
+        )),
+        "{text}"
+    );
+    // Still one JSON document, with the fields a reader expects.
+    let doc: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(
+        (
+            &doc["rule"],
+            &doc["result"],
+            &doc["outputs"][0]["output"]["m"]
+        ),
+        (&json!("exact"), &json!("passed"), &json!({"a": 2, "b": 1})),
+        "{text}"
+    );
+}
+
 /// ADR 0084 D5: with the trace off an evaluation queues nothing, whatever fired it: a
 /// publish, a Will or an event, each of which has its own way to the trace.
 #[tokio::test]
@@ -712,7 +775,7 @@ fn fire_every_trigger(w: &mut Watched) -> Vec<Value> {
     );
     drain(w.trace_rx.as_mut().unwrap())
         .iter()
-        .map(|r| record_json("n1", r))
+        .map(|r| serde_json::from_str(&record_json("n1", r)).unwrap())
         .collect()
 }
 
