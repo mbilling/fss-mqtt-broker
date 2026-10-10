@@ -76,6 +76,73 @@ fn where_filters_and_can_use_select_aliases() {
     );
 }
 
+/// EMQX's `evaluate_select`: the WHERE reads `maps:merge(Columns, Selected)`, one map. A
+/// selected top-level key hides the input's whole key; nothing falls through into it.
+#[test]
+fn the_where_reads_the_input_with_the_selection_merged_over_it() {
+    // An unaliased `payload.x` selects `payload` as `{"x": 1}`, which hides the input's
+    // `payload` from the WHERE: `payload.y` is undefined there.
+    let sql = r#"SELECT payload.x FROM "t/#" WHERE payload.y = 1"#;
+    assert!(run_on(sql, "t/a", r#"{"x":1,"y":1}"#).unwrap().is_empty());
+    // An alias that shadows an input name hides it, even when the value is undefined.
+    let sql = r#"SELECT payload.missing AS clientid FROM "t/#" WHERE clientid = 'c_emqx'"#;
+    assert!(run_on(sql, "t/a", "{}").unwrap().is_empty());
+    // A dotted alias replaces the whole top-level map, not one key in it.
+    let sql = r#"SELECT 1 AS flags.custom FROM "t/#" WHERE flags.retain = false"#;
+    assert!(run_on(sql, "t/a", "{}").unwrap().is_empty());
+    // A `*` after an alias overwrites it, so the WHERE sees the input's value.
+    let sql = r#"SELECT 'shadow' AS clientid, * FROM "t/#" WHERE clientid = 'c_emqx'"#;
+    assert_eq!(run_on(sql, "t/a", "{}").unwrap().len(), 1);
+    // A name the selection does not write still reads the input.
+    let sql = r#"SELECT payload.x AS x FROM "t/#" WHERE topic = 't/a' AND x = 1"#;
+    assert_eq!(run_on(sql, "t/a", r#"{"x":1}"#).unwrap().len(), 1);
+}
+
+/// EMQX evaluates every SELECT field before the WHERE, so a field that fails fails the
+/// rule even for a message the WHERE would turn away.
+#[test]
+fn a_failing_select_field_fails_the_rule_even_when_the_where_is_false() {
+    fails(
+        r#"SELECT int(payload.x) AS y FROM "t/#" WHERE 1 = 2"#,
+        r#"{"x":"abc"}"#,
+    );
+    fails(
+        r##"SELECT payload.x AS x FROM "#" WHERE topic = 'other'"##,
+        "not json",
+    );
+}
+
+/// INCASE runs before DO for each element, against the input, the selection and the
+/// element merged into one map: it cannot see DO's aliases, and a selected key hides the
+/// input's.
+#[test]
+fn incase_and_do_read_the_merged_scope_like_emqx() {
+    let p = r#"{"s":[{"t":20},{"t":40}],"y":7,"a":{"z":1}}"#;
+    // DO's alias `t` is not visible to INCASE.
+    let out = run_on(
+        r#"FOREACH payload.s AS s DO s.t AS t INCASE t > 30 FROM "t/#""#,
+        "t/a",
+        p,
+    );
+    assert!(out.unwrap().is_empty());
+    let out = run_on(
+        r#"FOREACH payload.s AS s DO s.t AS t INCASE s.t > 30 FROM "t/#""#,
+        "t/a",
+        p,
+    );
+    assert_eq!(out.unwrap(), [r#"{"t":40}"#]);
+    // A leading FOREACH field selected as `payload` hides the input's payload from DO,
+    // which reads `[DoSelected, merge(Columns, Selected, Item)]`.
+    let out = run_on(
+        r#"FOREACH payload.a AS payload, payload.s AS s DO payload.y AS py, payload.z AS pz FROM "t/#""#,
+        "t/a",
+        p,
+    );
+    // `py` is undefined, not the input's `"y": 7`: the selected `payload` hides it.
+    let row = r#"{"py":"undefined","pz":1}"#;
+    assert_eq!(out.unwrap(), [row, row]);
+}
+
 #[test]
 fn expressions_emqx_docs() {
     assert_eq!(

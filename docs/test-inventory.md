@@ -892,7 +892,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::sink_records_through_a_trait_object`
 - `tests::tampering_with_any_field_changes_the_head`
 
-## `crates/mqtt-rules/src/lib.rs` — 95 test(s)
+## `crates/mqtt-rules/src/lib.rs` — 98 test(s)
 
 - `edit::tests::a_json_rule_body_is_a_rule_edit`
 - `edit::tests::an_insert_appends_the_rule_at_the_end`
@@ -917,6 +917,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `template::tests::the_literal_prefix_is_the_text_before_the_first_placeholder`
 - `template::tests::this_is_the_whole_output`
 - `tests::a_bad_rendered_topic_fails_the_action_not_the_rule`
+- `tests::a_failing_select_field_fails_the_rule_even_when_the_where_is_false`
 - `tests::a_file_may_compile_only_so_many_distinct_regular_expressions`
 - `tests::a_literal_qos_or_retain_that_can_never_be_valid_fails_the_load`
 - `tests::a_loaded_set_keeps_its_action_specs_and_warnings`
@@ -943,6 +944,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::foreach_with_do_and_incase_emqx_docs`
 - `tests::hashing_encoding_and_bits_emqx_docs`
 - `tests::identical_regular_expressions_are_compiled_once`
+- `tests::incase_and_do_read_the_merged_scope_like_emqx`
 - `tests::indices_and_ranges`
 - `tests::invalid_qos_fails_the_action`
 - `tests::load_errors_are_specific`
@@ -965,6 +967,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::the_growth_budget_is_per_message`
 - `tests::the_sql_test_simulates_events_and_refuses_inputs_the_rule_never_sees`
 - `tests::the_trace_rate_window_is_per_rule_per_second`
+- `tests::the_where_reads_the_input_with_the_selection_merged_over_it`
 - `tests::time_functions_emqx_docs`
 - `tests::topic_match_operator_and_topic_function`
 - `tests::type_judgment_functions_emqx_docs`

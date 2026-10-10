@@ -1039,6 +1039,27 @@ belongs in a TOML `'''…'''` string ([Gotchas](#gotchas)).
 `WHERE` sees what `SELECT` selected: `SELECT payload.x AS y FROM "t" WHERE y = 1`. A
 later `SELECT` field can read an earlier alias.
 
+How a name resolves depends on the clause, exactly as in EMQX's runtime:
+
+- **Order.** Every `SELECT` field runs, left to right, before the `WHERE`. A field that
+  fails fails the rule even when the `WHERE` would have turned the message away:
+  `SELECT int(payload.x) AS y … WHERE 1 = 2` on `{"x":"abc"}` counts as `failed`.
+- **A `SELECT` or `DO` field** reads what has been selected so far, then the input
+  fields. A path that is `undefined` in the first is looked up in the second.
+- **A `WHERE`** reads one map: the input fields with the selected ones merged over them.
+  A selected top-level key hides the input's whole key, with no fall-through into it:
+  - `SELECT payload.x … WHERE payload.y = 1` is false, because the selected `payload` is
+    `{"x": …}`;
+  - `SELECT payload.missing AS clientid … WHERE clientid = 'c1'` is false;
+  - `SELECT 1 AS flags.custom … WHERE flags.retain = false` is false.
+- **A `*`** copies the input fields over what has been selected before it:
+  `SELECT 1 AS clientid, *` keeps the input's `clientid`, while `SELECT *, 1 AS clientid`
+  keeps the alias.
+- **In a `FOREACH`,** the `INCASE` reads that merged map with the element merged over it,
+  before `DO` runs, so it cannot see `DO`'s aliases: write `INCASE s.t > 30`, not
+  `INCASE t > 30`. A `DO` field reads what the `DO` has selected so far, then that
+  merged map.
+
 **`FOREACH`** produces one output per element of the array its last expression
 evaluates to. Each output runs the rule's actions once. The element is `item` unless the
 expression has an alias. Without `DO`, an output is every field plus the element, as in

@@ -1,9 +1,18 @@
 //! Statement and expression evaluation, following EMQX's `emqx_rule_runtime`:
 //!
-//! - **Lookup order.** A name resolves against what the statement has selected so far,
-//!   then against the trigger's input fields; a path that resolves to `undefined` in
-//!   one place falls through to the next. So a `WHERE` can use a `SELECT` alias, and a
-//!   later `SELECT` field can read an earlier one.
+//! - **Order.** Every `SELECT` field, left to right, then the `WHERE`: a field that
+//!   fails fails the rule even when the `WHERE` would have turned the message away. In a
+//!   `FOREACH`, the collection, the `WHERE`, then per element the `INCASE` and the `DO`.
+//! - **Lookup, by clause** (EMQX's `[Selected, Columns]` list versus a single merged map):
+//!   - A `SELECT` field reads what the statement has selected so far, then the trigger's
+//!     input fields; a path that is `undefined` in the first falls through to the second.
+//!   - A `WHERE` reads one map, the input fields with the selected ones merged over them
+//!     (`maps:merge(Columns, Selected)`): a selected top-level key hides the input's
+//!     whole key, with no fall-through into it. `SELECT payload.x … WHERE payload.y = 1`
+//!     is therefore false: the selected `payload` is `{"x": …}`.
+//!   - An `INCASE` reads the same map with the element merged over it.
+//!   - A `DO` field reads what the `DO` has selected so far, then falls through to that
+//!     merged map (element included).
 //! - **`payload.…` decodes JSON lazily**, once per message (shared by every rule the
 //!   message matches). A payload that is not JSON makes a rule that reaches into it
 //!   *fail* (counted), exactly as in EMQX; a rule that never looks inside the payload
@@ -49,6 +58,10 @@ pub struct EvalCtx<'a> {
     pub(crate) built: std::cell::Cell<usize>,
     /// Bytes this message's effects carry so far (see [`crate::MAX_DERIVED_BYTES`]).
     pub(crate) derived: std::cell::Cell<usize>,
+    /// Where name lookup stops falling through ([`lookup`]): frames from this index on,
+    /// with the input after them, are one merged map. `usize::MAX` (a `SELECT`): every
+    /// frame and the input fall through in turn. Set per clause by [`merged_from`].
+    merged_from: std::cell::Cell<usize>,
 }
 
 /// Patterns and the result of compiling each, most recent first.
@@ -72,6 +85,7 @@ impl<'a> EvalCtx<'a> {
             regex_cache: std::cell::RefCell::new(Vec::new()),
             built: std::cell::Cell::new(0),
             derived: std::cell::Cell::new(0),
+            merged_from: std::cell::Cell::new(usize::MAX),
         }
     }
 
@@ -123,11 +137,22 @@ pub(crate) fn run(stmt: &Statement, ctx: &EvalCtx, out: &mut Vec<Map>) -> Result
         run_foreach(stmt, ctx, out)
     } else {
         let selected = select(&stmt.fields, ctx, &[])?;
-        if condition(stmt.where_.as_ref(), ctx, &[&selected])? {
+        if merged_from(ctx, 0, || {
+            condition(stmt.where_.as_ref(), ctx, &[&selected])
+        })? {
             out.push(selected);
         }
         Ok(())
     }
+}
+
+/// Evaluate `f` with lookup treating frames from `from` on, and the input, as one merged
+/// map ([`EvalCtx::merged_from`]), restoring the previous setting even if `f` fails.
+fn merged_from<T>(ctx: &EvalCtx, from: usize, f: impl FnOnce() -> T) -> T {
+    let before = ctx.merged_from.replace(from);
+    let result = f();
+    ctx.merged_from.set(before);
+    result
 }
 
 fn run_foreach(stmt: &Statement, ctx: &EvalCtx, out: &mut Vec<Map>) -> Result<(), EvalError> {
@@ -175,7 +200,9 @@ fn run_foreach(stmt: &Statement, ctx: &EvalCtx, out: &mut Vec<Map>) -> Result<()
         };
         put(&mut selected, key, v);
     }
-    if !condition(stmt.where_.as_ref(), ctx, &[&selected, &aliases])? {
+    if !merged_from(ctx, 0, || {
+        condition(stmt.where_.as_ref(), ctx, &[&selected, &aliases])
+    })? {
         return Ok(());
     }
     if collection.len() > MAX_FOREACH_ELEMENTS {
@@ -187,7 +214,9 @@ fn run_foreach(stmt: &Statement, ctx: &EvalCtx, out: &mut Vec<Map>) -> Result<()
     for element in collection {
         let mut item = Map::with_capacity(1);
         item.insert(item_name.clone(), element);
-        if !condition(stmt.incase.as_ref(), ctx, &[&item, &selected, &aliases])? {
+        if !merged_from(ctx, 0, || {
+            condition(stmt.incase.as_ref(), ctx, &[&item, &selected, &aliases])
+        })? {
             continue;
         }
         if out.len() >= MAX_OUTPUTS_PER_TRIGGER {
@@ -203,7 +232,12 @@ fn run_foreach(stmt: &Statement, ctx: &EvalCtx, out: &mut Vec<Map>) -> Result<()
             all.merge_from(&item);
             all
         } else {
-            select(&stmt.do_fields, ctx, &[&item, &selected, &aliases])?
+            // EMQX evaluates DO against `[DoSelected, ColumnsAndItem]`: the DO's own
+            // fields fall through to one merged map of the input, the selection and the
+            // element. `select` puts the DO's fields first, so the merged map starts at 1.
+            merged_from(ctx, 1, || {
+                select(&stmt.do_fields, ctx, &[&item, &selected, &aliases])
+            })?
         };
         out.push(output);
     }
@@ -351,12 +385,16 @@ fn walk(mut cur: Value, segs: &[Seg], ctx: &EvalCtx, frames: Frames) -> Result<V
     Ok(cur)
 }
 
-/// Resolve `head.segs…` against the frames, then the input.
+/// Resolve `head.segs…` against the frames, then the input. A frame before
+/// [`EvalCtx::merged_from`] is its own scope: a path that is `undefined` there falls
+/// through. From that index on, the frames and the input are one merged map: the first
+/// that has the top-level `head` decides, even if the rest of the path is `undefined`.
 fn lookup(head: &str, segs: &[Seg], ctx: &EvalCtx, frames: Frames) -> Result<Value, EvalError> {
-    for frame in frames {
+    let merged_from = ctx.merged_from.get();
+    for (i, frame) in frames.iter().enumerate() {
         if let Some(v) = frame.get(head) {
             let v = walk(v.clone(), segs, ctx, frames)?;
-            if !v.is_undefined() {
+            if i >= merged_from || !v.is_undefined() {
                 return Ok(v);
             }
         }
