@@ -2145,7 +2145,7 @@ name = "mqtt-rules"
 version = "1.1.0"
 dependencies = [
  "aws-lc-rs",
- "base64 0.22.1",
+ "base64 0.23.1",
  "blake2",
  "bytes",
  "chrono",
