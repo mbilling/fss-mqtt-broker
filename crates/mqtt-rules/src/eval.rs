@@ -65,7 +65,7 @@ pub struct EvalCtx<'a> {
 }
 
 /// Patterns and the result of compiling each, most recent first.
-pub(crate) type RegexCache = std::cell::RefCell<Vec<(String, Result<Arc<regex::Regex>, String>)>>;
+pub(crate) type RegexCache = std::cell::RefCell<Vec<(Vec<u8>, crate::funcs::Compiled)>>;
 
 impl std::fmt::Debug for EvalCtx<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

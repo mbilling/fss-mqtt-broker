@@ -136,6 +136,12 @@ alone `\w{50}`); the cost at the limit does not. The budget applies wherever a r
 file is parsed: boot, reload, `mqttd --check-rules` and the admin API. The per-pattern
 limits stay.
 
+*Amended 2026-10-10* (ADR 0083's amendment "regular expressions are PCRE2 in byte mode,
+as in EMQX"): the engine is PCRE2, whose compiled patterns are bounded by PCRE2 itself and
+cost at most about 0.9 ms and 190 KiB, so the budget is 512 distinct literals and 256 KiB
+of them together (named groups compile in quadratic time). A literal that does not
+compile is a load warning, no longer an error.
+
 ### D4. Opt-in per-rule statistics on `$SYS`
 
 With `[rules] sys_interval_secs` (`MQTTD_RULES_SYS_INTERVAL`, 1 to 3600; 0, the default,

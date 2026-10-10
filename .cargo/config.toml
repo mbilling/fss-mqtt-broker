@@ -1,0 +1,8 @@
+# Environment for every build of the workspace.
+[env]
+# Build PCRE2 (the rule engine's regular expressions, crates/mqtt-rules) from the source
+# bundled in pcre2-sys and link it statically, on every target — not only musl, where
+# pcre2-sys does so by itself. Otherwise a host with a libpcre2-8 pkg-config entry links
+# that system library instead, a different PCRE2 version than the one the rule engine's
+# EMQX-pinned tests were run against, and a dynamic dependency the release images lack.
+PCRE2_SYS_STATIC = "1"

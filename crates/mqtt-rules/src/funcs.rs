@@ -15,11 +15,13 @@
 mod compress;
 mod erl_string;
 mod io_format;
+pub(crate) mod re;
 
 use std::sync::Arc;
 
 use base64::Engine as _;
-use regex::Regex;
+
+use self::re::{Groups, Regex};
 
 use crate::eval::{resolve_index, EvalCtx};
 use crate::value::{json_decode, Map, Value};
@@ -28,8 +30,9 @@ use crate::EvalError;
 /// What a function sees beyond its arguments.
 pub(crate) struct FnCtx<'a> {
     pub ctx: &'a EvalCtx<'a>,
-    /// The load-time-compiled pattern when the function's regex argument is a literal.
-    pub regex: Option<&'a Arc<Regex>>,
+    /// The load-time-compiled pattern (or why it does not compile) when the function's
+    /// regex argument is a literal.
+    pub regex: Option<&'a Compiled>,
 }
 
 /// A built-in function.
@@ -276,18 +279,25 @@ funcs! {
         };
         Ok(Value::from(format!("{}{s}{}", ch.repeat(left), ch.repeat(right))))
     };
-    "regex_match" 2..=2 => |a, cx| Ok(Value::Bool(regex(cx, &a[1])?.is_match(s_arg(&a[0])?))), regex 1;
+    // `re:run(Str, RE, [global, {capture, none}])`: whether there is a first match.
+    "regex_match" 2..=2 => |a, cx| {
+        let s = s_bytes(&a[0])?;
+        Ok(Value::Bool(regex(cx, &a[1])?.first(s).map_err(EvalError::new)?.is_some()))
+    }, regex 1;
+    // `re:replace(Str, RE, Rep, [global, {return, binary}])`.
     "regex_replace" 3..=3 => |a, cx| {
+        let (s, rep) = (s_bytes(&a[0])?, bin(&a[2])?);
         let re = regex(cx, &a[1])?;
-        let (s, rep) = (s_arg(&a[0])?, bin(&a[2])?);
         bounded_replace_all(cx, &re, s, &erlang_replacement(rep)?)
     }, regex 1;
+    // `re:run(Str, RE, [{capture, all_but_first, binary}])`: the first match's groups,
+    // up to the last that took part, one that did not as `''`.
     "regex_extract" 2..=2 => |a, cx| {
-        let re = regex(cx, &a[1])?;
-        let groups = re.captures(s_arg(&a[0])?).map_or_else(Vec::new, |c| {
-            c.iter().skip(1).flatten().map(|m| Value::from(m.as_str())).collect()
-        });
-        Ok(Value::from(groups))
+        let s = s_bytes(&a[0])?;
+        let groups = regex(cx, &a[1])?.first(s).map_err(EvalError::new)?.unwrap_or_default();
+        Ok(Value::from(
+            groups.iter().skip(1).map(|g| group_value(s, *g)).collect::<Vec<_>>(),
+        ))
     }, regex 1;
     "replace" 3..=4 => |a, cx| {
         let (s, p, r) = (s_arg(&a[0])?, text(&a[1])?, text(&a[2])?);
@@ -642,51 +652,61 @@ pub fn names() -> Vec<&'static str> {
     FUNCS.iter().map(|f| f.name).collect()
 }
 
-/// A rule-supplied regular expression, compiled with bounded size: patterns can come
-/// from a payload, and the engine's linear-time guarantee only holds if a pattern
-/// cannot balloon its automaton.
-pub(crate) fn compile_regex(pattern: &str) -> Result<Regex, EvalError> {
-    regex::RegexBuilder::new(pattern)
-        .size_limit(1 << 20)
-        .dfa_size_limit(1 << 20)
-        .build()
-        .map_err(|e| EvalError::new(format!("invalid regular expression: {e}")))
+/// A pattern compiled, or why it does not compile.
+pub(crate) type Compiled = Result<Arc<Regex>, String>;
+
+/// A rule-supplied regular expression, compiled as Erlang's `re` compiles it (see
+/// [`re`]). Its size is bounded by PCRE2 itself, as in OTP: a compiled pattern holds at
+/// most 64K code units (`LINK_SIZE` 2), past which it is `regular expression is too
+/// large`.
+pub(crate) fn compile_regex(pattern: &[u8]) -> Compiled {
+    Regex::new(pattern).map(Arc::new)
 }
 
-/// How many patterns taken from payloads one message remembers compiled. Each may be
-/// as large as the compile limits allow, so the cache is small; four covers rules that
-/// apply a couple of payload patterns per `FOREACH` element.
+/// How many patterns taken from payloads one message remembers compiled. Four covers
+/// rules that apply a couple of payload patterns per `FOREACH` element.
 const REGEX_CACHE: usize = 4;
 
 /// The function's pattern: compiled at load when it is a literal; otherwise compiled
 /// here and remembered for the rest of the message, so a pattern taken from the payload
-/// and applied per `FOREACH` element is compiled once, not once per element.
+/// and applied per `FOREACH` element is compiled once, not once per element. A pattern
+/// that does not compile fails the call, as `re:run` raises `badarg` in EMQX.
 fn regex(cx: &FnCtx, pattern: &Value) -> Result<Arc<Regex>, EvalError> {
     if let Some(re) = cx.regex {
-        return Ok(re.clone());
+        return re.clone().map_err(EvalError::new);
     }
-    let p = text(pattern)?;
+    let p = bin(pattern)?;
     let mut cache = cx.ctx.regex_cache.borrow_mut();
-    if let Some(i) = cache.iter().position(|(cached, _)| cached.as_str() == p) {
+    if let Some(i) = cache.iter().position(|(cached, _)| cached.as_slice() == p) {
         let hit = cache.remove(i);
         let compiled = hit.1.clone();
         cache.insert(0, hit);
         return compiled.map_err(EvalError::new);
     }
-    let compiled = compile_regex(p).map(Arc::new).map_err(|e| e.0);
-    cache.insert(0, (p.to_string(), compiled.clone()));
+    let compiled = compile_regex(p);
+    cache.insert(0, (p.to_vec(), compiled.clone()));
     cache.truncate(REGEX_CACHE);
     compiled.map_err(EvalError::new)
 }
 
-/// `replace_all`, refused once the output would take the message past its
+/// A group of a match as a value: its bytes, or `''` when it did not take part.
+fn group_value(s: &[u8], group: Option<(usize, usize)>) -> Value {
+    group.map_or_else(
+        || Value::from(""),
+        |(start, end)| Value::from_bytes(&bytes::Bytes::copy_from_slice(&s[start..end])),
+    )
+}
+
+/// `re:replace` with `global`: every match `re:run` reports, replaced in order
+/// (`do_mlist/5`), refused once the output would take the message past its
 /// [`MAX_BUILT_BYTES`] budget. Checked before each expansion, against an upper bound on
 /// it: the replacement's literal text plus, for every group reference in it, the whole
-/// match.
+/// match. A match reported before the end of the previous one fails the call, as it
+/// fails `do_mlist/5`.
 fn bounded_replace_all(
     cx: &FnCtx,
     re: &Regex,
-    s: &str,
+    s: &[u8],
     rep: &[RepPart],
 ) -> Result<Value, EvalError> {
     let literal: usize = rep
@@ -703,28 +723,36 @@ fn bounded_replace_all(
     let limit = input.saturating_add(MAX_BUILT_BYTES.saturating_sub(cx.ctx.built.get()));
     let mut out: Vec<u8> = Vec::new();
     let mut last = 0;
-    for caps in re.captures_iter(s) {
-        let Some(m) = caps.get(0) else { continue };
+    re.each(s, |m: &Groups| -> Result<(), EvalError> {
+        let Some((start, end)) = m[0] else {
+            return Ok(());
+        };
+        if start < last {
+            return Err(EvalError::new(
+                "a match starts before the previous one ends",
+            ));
+        }
         let worst = refs
-            .checked_mul(m.len())
-            .and_then(|n| n.checked_add(literal + (m.start() - last) + out.len()));
+            .checked_mul(end - start)
+            .and_then(|n| n.checked_add(literal + (start - last) + out.len()));
         if worst.is_none_or(|n| n > limit) {
             bounded_growth(cx, "regex_replace", input, None)?;
         }
-        out.extend_from_slice(&s.as_bytes()[last..m.start()]);
+        out.extend_from_slice(&s[last..start]);
         for part in rep {
             match part {
                 RepPart::Lit(l) => out.extend_from_slice(l),
                 RepPart::Group(n) => {
-                    if let Some(g) = caps.get(*n) {
-                        out.extend_from_slice(g.as_str().as_bytes());
+                    if let Some(Some((gs, ge))) = m.get(*n) {
+                        out.extend_from_slice(&s[*gs..*ge]);
                     }
                 }
             }
         }
-        last = m.end();
-    }
-    out.extend_from_slice(&s.as_bytes()[last..]);
+        last = end;
+        Ok(())
+    })?;
+    out.extend_from_slice(&s[last..]);
     bounded_growth(cx, "regex_replace", input, Some(out.len()))?;
     Ok(Value::from_bytes(&out.into()))
 }
