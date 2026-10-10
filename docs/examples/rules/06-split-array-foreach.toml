@@ -23,7 +23,7 @@ DO
   r.sensor        AS sensor,
   r.temp          AS temp,
   payload.gateway AS gateway
-INCASE is_str(r.sensor) AND regex_match(r.sensor, '^[A-Za-z0-9_-]{1,64}$')
+INCASE is_str(r.sensor) AND regex_match(r.sensor, '^[A-Za-z0-9_-]{1,64}\z')
 FROM "gw/+/batch"
 '''
 actions = [
@@ -37,7 +37,7 @@ FOREACH payload.readings AS r
 DO
   r.sensor AS sensor,
   r.temp   AS temp
-INCASE r.temp > 50 AND is_str(r.sensor) AND regex_match(r.sensor, '^[A-Za-z0-9_-]{1,64}$')
+INCASE r.temp > 50 AND is_str(r.sensor) AND regex_match(r.sensor, '^[A-Za-z0-9_-]{1,64}\z')
 FROM "gw/+/batch"
 '''
 actions = [

@@ -46,7 +46,7 @@ SELECT
   payload,
   map_put('processed-by', 'order_router', pub_props.'User-Property') AS user_properties
 FROM "orders/+"
-WHERE is_str(tenant) AND regex_match(tenant, '^[A-Za-z0-9_-]{1,64}$')
+WHERE is_str(tenant) AND regex_match(tenant, '^[A-Za-z0-9_-]{1,64}\z')
 '''
 actions = [
   { function = "republish", args = {

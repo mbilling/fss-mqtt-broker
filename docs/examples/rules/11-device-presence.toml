@@ -31,7 +31,7 @@ description = "A device connected"
 sql = '''
 SELECT clientid, 'online' AS status, connected_at AS since
 FROM "$events/client/connected"
-WHERE regex_match(clientid, '^sensor-[A-Za-z0-9_-]{1,57}$')
+WHERE regex_match(clientid, '^sensor-[A-Za-z0-9_-]{1,57}\z')
 '''
 actions = [
   { function = "republish", args = { topic = "presence/${clientid}", qos = 1, retain = true, payload = "${.}" } },
@@ -42,7 +42,7 @@ description = "A device went away"
 sql = '''
 SELECT clientid, 'offline' AS status, disconnected_at AS since, reason
 FROM "$events/client/disconnected"
-WHERE regex_match(clientid, '^sensor-[A-Za-z0-9_-]{1,57}$') AND reason <> 'takenover' AND reason <> 'discarded'
+WHERE regex_match(clientid, '^sensor-[A-Za-z0-9_-]{1,57}\z') AND reason <> 'takenover' AND reason <> 'discarded'
 '''
 actions = [
   { function = "republish", args = { topic = "presence/${clientid}", qos = 1, retain = true, payload = "${.}" } },
