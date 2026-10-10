@@ -862,18 +862,20 @@ fn check_rules_refuses_an_unknown_function() {
     );
 }
 
-/// RULES.md "Events": message, connack, auth, ping and alarm events "are not raised. A
-/// rule that selects one is refused at load." A rule on `message/delivered` that loaded
-/// would never fire, silently.
+/// RULES.md "Events": the alarm, schema validation and message transformation events
+/// "are not raised. A rule that selects one is refused at load." A rule on
+/// `sys/alarm_activated` that loaded would never fire, silently. The message events are
+/// raised, and listed.
 #[test]
 fn check_rules_refuses_an_event_mqttd_does_not_raise() {
     assert_check_rules_refuses(
-        "[rules.ev]\nsql = 'SELECT * FROM \"$events/message/delivered\"'\n",
-        "rule `ev`: \"$events/message/delivered\" is not a supported event (supported: \
+        "[rules.ev]\nsql = 'SELECT * FROM \"$events/sys/alarm_activated\"'\n",
+        "rule `ev`: \"$events/sys/alarm_activated\" is not a supported event (supported: \
          $events/client/connected, $events/client/disconnected, $events/client/connack, \
          $events/client/ping, $events/auth/check_authn_complete, \
          $events/auth/check_authz_complete, $events/session/subscribed, \
-         $events/session/unsubscribed)",
+         $events/session/unsubscribed, $events/message/delivered, $events/message/acked, \
+         $events/message/dropped, $events/message/delivery_dropped)",
     );
 }
 
@@ -884,12 +886,13 @@ fn check_rules_refuses_an_event_mqttd_does_not_raise() {
 #[test]
 fn check_rules_refuses_wildcards_matching_no_raised_event_and_sources() {
     assert_check_rules_refuses(
-        "[rules.ev]\nsql = 'SELECT * FROM \"$events/message/+\"'\n",
-        "rule `ev`: \"$events/message/+\" matches no event mqttd raises (supported: \
+        "[rules.ev]\nsql = 'SELECT * FROM \"$events/sys/+\"'\n",
+        "rule `ev`: \"$events/sys/+\" matches no event mqttd raises (supported: \
          $events/client/connected, $events/client/disconnected, $events/client/connack, \
          $events/client/ping, $events/auth/check_authn_complete, \
          $events/auth/check_authz_complete, $events/session/subscribed, \
-         $events/session/unsubscribed)",
+         $events/session/unsubscribed, $events/message/delivered, $events/message/acked, \
+         $events/message/dropped, $events/message/delivery_dropped)",
     );
     assert_check_rules_refuses(
         "[rules.src]\nsql = 'SELECT * FROM \"$sources/mqtt:in\"'\n",

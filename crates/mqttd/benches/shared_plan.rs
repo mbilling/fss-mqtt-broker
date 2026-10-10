@@ -54,8 +54,8 @@
 use bytes::Bytes;
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use mqtt_cluster::NodeId;
+use mqtt_codec::ProtocolVersion;
 use mqtt_codec::QoS;
-use mqtt_codec::{Packet, ProtocolVersion};
 use mqtt_core::{AppProperties, ClientId};
 use mqtt_storage::MemorySessionStore;
 use mqttd::hub::{Admission, AuthMethod, Hub, Outbound, RemoteSharedGroup};
@@ -133,7 +133,7 @@ fn hub_with_subscribers(
     rt.block_on(async {
         for i in 0..subs {
             let client = ClientId(Arc::from(format!("sub{i}").as_str()));
-            let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Box<Packet>>();
+            let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Box<mqttd::hub::Outgoing>>();
             let (outbound, meter) = Outbound::new(out_tx);
             drain.spawn(async move {
                 while let Some(packet) = out_rx.recv().await {

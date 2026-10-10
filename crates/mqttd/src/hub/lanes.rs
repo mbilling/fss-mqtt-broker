@@ -941,6 +941,9 @@ impl Hub {
     /// half of a durable append. Runs on the single-threaded loop like every dispatch,
     /// so all pending-publish, in-flight, and lane mutation stays race-free —
     /// ADR 0017's argument, applied to appends.
+    // One completion, decided in one place: splitting it would separate the send
+    // decision from the gate bookkeeping that depends on it.
+    #[allow(clippy::too_many_lines)]
     pub(super) fn append_done(&mut self, job: AppendJob, outcome: LaneOutcome) {
         if let Some(lane) = self.append_lanes.get_mut(&job.client) {
             lane.outstanding = lane.outstanding.saturating_sub(1);
@@ -995,6 +998,7 @@ impl Hub {
                     }
                 },
             };
+        self.note_queue_rejected(&job, outcome, send);
         if send && self.park_ordering_gated_qos0(&job) {
             send = false;
         }
@@ -1109,6 +1113,15 @@ impl Hub {
                 }
             }
             warn_backlog_eviction(&job.client, &evicted, bytes, &limits);
+            for (e, _) in &evicted {
+                self.note_delivery_dropped(
+                    &job.client,
+                    "queue_full",
+                    &e.message,
+                    e.retain,
+                    e.message_expiry,
+                );
+            }
             self.truncate_acked(&job.client);
         }
         true
@@ -1148,17 +1161,20 @@ impl Hub {
                     p.state = OutState::AwaitingPubRec;
                 }
                 if let Some(tx) = self.online.get(&job.client).map(|o| o.tx.clone()) {
-                    let _ = tx.send(publish_packet(
-                        &job.message.topic,
-                        job.message.payload.clone(),
-                        job.message.qos,
-                        Some(pkid),
-                        false,
-                        job.retain,
-                        job.message_expiry,
-                        &job.message.app,
-                        &self.matching_sub_ids(&job.client, &job.message.topic),
-                    ));
+                    let _ = tx.send_from(
+                        publish_packet(
+                            &job.message.topic,
+                            job.message.payload.clone(),
+                            job.message.qos,
+                            Some(pkid),
+                            false,
+                            job.retain,
+                            job.message_expiry,
+                            &job.message.app,
+                            &self.matching_sub_ids(&job.client, &job.message.topic),
+                        ),
+                        self.delivery_origin(&job.message.app),
+                    );
                     if let Some(m) = &self.metrics {
                         m.publish_delivered(qos_num(job.message.qos));
                     }

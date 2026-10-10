@@ -410,6 +410,64 @@ struct RuleConn<'c> {
     /// A publish batch waiting for its ingress credit, for `serve` to park (see
     /// `send_forwarded`).
     parked_batch: std::sync::Mutex<Option<ParkedBatch>>,
+    /// The `QoS` 1/2 deliveries this connection sent and has not seen acknowledged, by
+    /// packet id — kept only while a rule selects `$events/message/acked`, which is
+    /// raised from here when the PUBACK or PUBREC arrives. `unacked_len` mirrors its
+    /// size so an acknowledgement on a connection that holds none costs one load.
+    unacked: std::sync::Mutex<HashMap<u16, Sent>>,
+    unacked_len: std::sync::atomic::AtomicUsize,
+}
+
+/// A PUBLISH this connection wrote to its client, as the message events describe it
+/// (ADR 0083): captured as it is written — before the topic-alias rewrite, which
+/// empties the topic — and only while a rule selects an event it feeds.
+#[derive(Debug)]
+struct Sent {
+    /// Who published the message, when the delivery carried that.
+    origin: Option<Arc<mqtt_core::Origin>>,
+    topic: String,
+    payload: bytes::Bytes,
+    qos: QoS,
+    retain: bool,
+    dup: bool,
+    /// The PUBLISH's properties as sent, printed (`pub_props`).
+    pub_props: mqtt_rules::Map,
+    user_properties: Vec<(String, String)>,
+}
+
+impl Sent {
+    fn capture(p: &Publish, origin: Option<Arc<mqtt_core::Origin>>) -> Self {
+        Self {
+            origin,
+            topic: p.topic.clone(),
+            payload: p.payload.clone(),
+            qos: p.qos,
+            retain: p.retain,
+            dup: p.dup,
+            pub_props: crate::rules::printable_props(&p.properties),
+            user_properties: p
+                .properties
+                .0
+                .iter()
+                .filter_map(|prop| match prop {
+                    mqtt_codec::Property::UserProperty(k, v) => Some((k.clone(), v.clone())),
+                    _ => None,
+                })
+                .collect(),
+        }
+    }
+
+    fn message(&self) -> mqtt_rules::EventMessage<'_> {
+        mqtt_rules::EventMessage {
+            origin: self.origin.as_deref(),
+            topic: &self.topic,
+            payload: &self.payload,
+            qos: self.qos as u8,
+            retain: self.retain,
+            dup: self.dup,
+            user_properties: &self.user_properties,
+        }
+    }
 }
 
 /// A batch and the wait for the credit it needs.
@@ -461,6 +519,8 @@ impl<'c> RuleConn<'c> {
                 .rules
                 .as_ref()
                 .map(crate::rules::Rules::for_connection),
+            unacked: std::sync::Mutex::new(HashMap::new()),
+            unacked_len: std::sync::atomic::AtomicUsize::new(0),
             parked_batch: std::sync::Mutex::new(None),
         }
     }
@@ -523,6 +583,125 @@ impl<'c> RuleConn<'c> {
     /// so an event no rule selects costs one uncontended lock and builds nothing.
     fn wants(&self, kind: mqtt_rules::EventKind) -> Option<&crate::rules::ConnRules> {
         self.rules.as_ref().filter(|r| r.wants(kind))
+    }
+
+    /// Which message events a rule selects (none without rules): read once per batch
+    /// of deliveries.
+    fn message_wants(&self) -> crate::rules::MessageWants {
+        self.rules
+            .as_ref()
+            .map(crate::rules::ConnRules::message_wants)
+            .unwrap_or_default()
+    }
+
+    /// A PUBLISH was written to this client — or, `too_large`, dropped for it because
+    /// it exceeds the client's Maximum Packet Size. Raises
+    /// `$events/message/delivered`, or `delivery_dropped` with mqttd's own reason
+    /// `too_large` (EMQX counts that drop but raises no event for it), and remembers a
+    /// `QoS` 1/2 delivery for `$events/message/acked`.
+    fn sent(
+        &self,
+        sent: Sent,
+        pkid: Option<u16>,
+        too_large: bool,
+        wants: crate::rules::MessageWants,
+        client: &ClientId,
+        hub: &mpsc::UnboundedSender<HubCommand>,
+    ) {
+        let Some(rules) = &self.rules else { return };
+        let info = self.client(rules, &client.0);
+        if too_large {
+            if wants.delivery_dropped {
+                rules.fire_event(
+                    &mqtt_rules::EventInput::delivery_dropped(
+                        &info,
+                        &sent.message(),
+                        sent.pub_props.clone(),
+                        "too_large",
+                    ),
+                    hub,
+                );
+            }
+            return;
+        }
+        if wants.delivered {
+            rules.fire_event(
+                &mqtt_rules::EventInput::message_delivered(
+                    &info,
+                    &sent.message(),
+                    sent.pub_props.clone(),
+                ),
+                hub,
+            );
+        }
+        if let (true, Some(pkid)) = (wants.acked, pkid) {
+            let mut unacked = self
+                .unacked
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            unacked.insert(pkid, sent);
+            self.unacked_len
+                .store(unacked.len(), std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// The client acknowledged the delivery under `pkid` with a PUBACK (`qos` 1) or a
+    /// PUBREC (`qos` 2): raises `$events/message/acked` for a delivery this connection
+    /// remembered ([`sent`](Self::sent)). EMQX raises it at the PUBREC for `QoS` 2, and
+    /// not again at the PUBCOMP. An acknowledgement of the other kind than the
+    /// delivery's `QoS` calls for is not one, and raises nothing.
+    fn acked(
+        &self,
+        ack: &mqtt_codec::packet::Ack,
+        qos: QoS,
+        client: &ClientId,
+        hub: &mpsc::UnboundedSender<HubCommand>,
+    ) {
+        if self.unacked_len.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+            return;
+        }
+        let sent = {
+            let mut unacked = self
+                .unacked
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if unacked.get(&ack.pkid).is_none_or(|s| s.qos != qos) {
+                return;
+            }
+            let sent = unacked.remove(&ack.pkid);
+            self.unacked_len
+                .store(unacked.len(), std::sync::atomic::Ordering::Relaxed);
+            sent
+        };
+        let (Some(sent), Some(rules)) = (sent, self.wants(mqtt_rules::EventKind::MessageAcked))
+        else {
+            return;
+        };
+        rules.fire_event(
+            &mqtt_rules::EventInput::message_acked(
+                &self.client(rules, &client.0),
+                &sent.message(),
+                sent.pub_props.clone(),
+                crate::rules::printable_props(&ack.properties),
+            ),
+            hub,
+        );
+    }
+
+    /// Raise a message event the hub decided ([`crate::rules::MessageNote`]): about a
+    /// publish of this client's, or a delivery to it — then it is the subscriber, and
+    /// the event names its username and address.
+    fn note(
+        &self,
+        note: &crate::rules::MessageNote,
+        client: &ClientId,
+        hub: &mpsc::UnboundedSender<HubCommand>,
+    ) {
+        let Some(rules) = &self.rules else { return };
+        let info = self.client(rules, &client.0);
+        let own = matches!(&note.event,
+            crate::rules::NoteEvent::DeliveryDropped { receiver, .. } if receiver == client);
+        rules.fire_note(note, own.then_some(&info), hub);
     }
 
     /// Who an event is about.
@@ -2397,7 +2576,7 @@ async fn serve<R, W>(
     mut principal: Identity,
     auth_method: Option<String>,
     policy: &ConnPolicy,
-    out_rx: &mut mpsc::UnboundedReceiver<Box<Packet>>,
+    out_rx: &mut crate::hub::OutboundRx,
     // Called as packets are drained (packets AND accounted bytes, issue #241), so the
     // hub can see this client's backlog and shed `QoS 0` rather than queue it without
     // limit (#123).
@@ -2630,31 +2809,61 @@ where
                 // message and one per drain. Bounded so a client that can never
                 // keep up cannot hold this loop or grow the buffer without limit;
                 // the single writer task still guarantees per-connection order.
-                let Some(mut pkt) = maybe_out else {
+                let Some(mut out) = maybe_out else {
                     // The hub dropped our sender: it closed this connection — a
                     // takeover, a kick, an eviction, … — and said why on the meter
                     // (EMQX's `takenover`, `discarded`, `kicked`, …), or it shut down.
                     rule_conn.closing(out_meter.close_reason().map_or("shutdown", crate::hub::HubClose::reason));
                     return Ok(false);
                 };
+                // The rule engine's message events (ADR 0083) are raised HERE for a
+                // delivery, on the subscriber's connection task. Which of them a rule
+                // selects is read once per batch; with none, a PUBLISH is written
+                // exactly as before.
+                let events = rule_conn.message_wants();
                 for _ in 0..OUTBOUND_BATCH_MAX {
                     // Metered on the packet AS RECEIVED — before the topic-alias
                     // rewrite below, which only shrinks it: add and subtract are
                     // then the same pure function of the same packet, which is
                     // what keeps the byte counter from drifting (issue #241).
-                    out_meter.drained(&pkt);
+                    out_meter.drained(&out);
+                    let (pkt, origin) = match &mut *out {
+                        crate::hub::Outgoing::Packet { packet, origin } => (packet, origin.take()),
+                        // A drop the hub decided, for this task to raise: nothing to
+                        // write.
+                        crate::hub::Outgoing::Note(note) => {
+                            rule_conn.note(note, client, hub);
+                            match out_rx.try_recv() {
+                                Ok(next) => out = next,
+                                Err(_) => break,
+                            }
+                            continue;
+                        }
+                    };
                     // Rewrite outbound PUBLISHes to use topic aliases where the
                     // client allowed them (ADR 0011 §3); other packets pass through.
+                    // The delivery is captured for the message events first — the
+                    // rewrite empties the topic — and only for an event this PUBLISH
+                    // can raise: its delivery, its acknowledgement (it has a packet
+                    // id), or its being too large (the client set a maximum).
+                    let mut sent = None;
                     if let Packet::Publish(p) = &mut *pkt {
+                        if events.delivered
+                            || (events.acked && p.pkid.is_some())
+                            || (events.delivery_dropped && client_max_packet.is_some())
+                        {
+                            sent = Some((Sent::capture(p, origin), p.pkid));
+                        }
                         outbound_aliases.apply(p);
                     }
                     let start = writer.queued_len();
-                    writer.queue(&pkt)?;
+                    writer.queue(pkt)?;
                     // The client's Maximum Packet Size (ADR 0041 T4): a message
                     // too large for THIS subscriber is dropped for it alone, per
                     // spec — measured from the bytes just queued (one encode, no
                     // throwaway second pass — issue #443 5b), counted, never a
                     // connection error. Un-queue it and carry on with the batch.
+                    let mut too_large = false;
                     if let (Some(max), Packet::Publish(_)) = (client_max_packet, &*pkt) {
                         if writer.queued_len() - start > max as usize {
                             debug!(client = %client.0, size = writer.queued_len() - start, max,
@@ -2663,10 +2872,14 @@ where
                             if let Some(m) = &policy.metrics {
                                 m.publish_dropped("too-large");
                             }
+                            too_large = true;
                         }
                     }
+                    if let Some((sent, pkid)) = sent {
+                        rule_conn.sent(sent, pkid, too_large, events, client, hub);
+                    }
                     match out_rx.try_recv() {
-                        Ok(next) => pkt = next,
+                        Ok(next) => out = next,
                         Err(_) => break,
                     }
                 }
@@ -2981,6 +3194,7 @@ async fn handle_publish<W: AsyncWrite + Unpin>(
         pkid,
         payload,
         retain,
+        dup,
         ..
     } = publish;
     // [MQTT-3.3.2-2] / [MQTT-4.7.3-1]: a PUBLISH topic name MUST NOT contain
@@ -3047,6 +3261,35 @@ async fn handle_publish<W: AsyncWrite + Unpin>(
     // Skipping the channel also skips a `oneshot::channel` allocation per QoS 0
     // publish, on a path already measured at ~31% of its cycles in malloc (#490).
     let gated = !matches!(qos, QoS::AtMostOnce);
+    // EMQX raises `message.dropped` for an inbound QoS 2 publish its session refuses
+    // (`emqx_session:on_dropped_qos2_msg/3`): one reusing, without the DUP flag, a
+    // packet id still awaiting its PUBREL (`packet_identifier_inuse`), and one beyond
+    // the Receive Maximum (`receive_maximum_exceeded`). Neither reaches the hub here, so
+    // the connection raises the event — and keeps the message for it only while a rule
+    // selects it.
+    let refused_qos2 = (qos == QoS::ExactlyOnce && authorized)
+        .then(|| rule_conn.wants(mqtt_rules::EventKind::MessageDropped))
+        .flatten()
+        .map(|rules| (rules, topic.clone(), payload.clone(), app.clone()));
+    let drop_qos2 = |reason: &str| {
+        if let Some((rules, topic, payload, app)) = &refused_qos2 {
+            rules.fire_dropped(
+                &crate::rules::PublishFacts {
+                    client,
+                    publisher: &rule_conn.publisher,
+                    topic,
+                    payload,
+                    qos,
+                    retain,
+                    app,
+                    message_expiry,
+                },
+                dup,
+                reason,
+                hub,
+            );
+        }
+    };
     //
     // Returns the receiver and how many hub acknowledgement gates the publish holds
     // (its own, plus one per gated message its rules derived — ADR 0083).
@@ -3070,7 +3313,7 @@ async fn handle_publish<W: AsyncWrite + Unpin>(
         // connections and nodes and never runs on the hub loop. What the rules
         // republish travels with the original to the hub, which routes it only if it
         // accepts the original, and a gated original's ack waits for it too.
-        let derived = match &rule_conn.rules {
+        let (derived, origin) = match &rule_conn.rules {
             Some(rules) => rules.on_publish(&crate::rules::PublishFacts {
                 client,
                 publisher: &rule_conn.publisher,
@@ -3081,8 +3324,13 @@ async fn handle_publish<W: AsyncWrite + Unpin>(
                 app: &app,
                 message_expiry,
             }),
-            None => Vec::new(),
+            None => (Vec::new(), None),
         };
+        // Who published it travels with the message — to its subscribers' connection
+        // tasks, on this node and on peers — while a rule somewhere selects a message
+        // event; `None`, and nothing allocated, otherwise.
+        let mut app = app;
+        app.origin = origin;
         let (done, rx) = if gated {
             let (tx, rx) = oneshot::channel();
             (Some(tx), Some(rx))
@@ -3264,6 +3512,7 @@ async fn handle_publish<W: AsyncWrite + Unpin>(
                 if is_v5 && *qos2_inflight >= wire_limits().receive_maximum as usize {
                     warn!(client = %client.0, limit = wire_limits().receive_maximum,
                           "client exceeded Receive Maximum; DISCONNECT 0x93");
+                    drop_qos2("receive_maximum_exceeded");
                     disconnect(writer, DISCONNECT_RECEIVE_MAXIMUM_EXCEEDED).await?;
                     return Ok(PacketOutcome::closed_by(
                         DISCONNECT_RECEIVE_MAXIMUM_EXCEEDED,
@@ -3348,6 +3597,14 @@ async fn handle_publish<W: AsyncWrite + Unpin>(
                 }
                 writer.send(&Packet::PubRec(rec)).await?;
                 return Ok(PacketOutcome::Continue);
+            }
+            // A publish already acknowledged and not yet released is not delivered
+            // again. With the DUP flag it is the client's retransmission, and nothing
+            // to the rule engine; WITHOUT it the client reused a packet id still in
+            // use, which EMQX reports as a dropped message
+            // (`emqx_session_mem:publish/3`).
+            if !dup {
+                drop_qos2("packet_identifier_inuse");
             }
             writer.send(&Packet::PubRec(id.into())).await?;
         }
@@ -3555,12 +3812,17 @@ async fn handle_inbound<W: AsyncWrite + Unpin>(
         }
         // Subscriber-side acknowledgements for our downstream deliveries.
         Packet::PubAck(ack) => {
+            // `$events/message/acked` (ADR 0083), when a rule selects it: raised here,
+            // on the subscriber's connection task, from the delivery it remembered.
+            rule_conn.acked(&ack, QoS::AtLeastOnce, client, hub);
             let _ = hub.send(HubCommand::PubAck {
                 client: client.clone(),
                 pkid: ack.pkid,
             });
         }
         Packet::PubRec(ack) => {
+            // A `QoS` 2 delivery is acked at its PUBREC, as in EMQX.
+            rule_conn.acked(&ack, QoS::ExactlyOnce, client, hub);
             let _ = hub.send(HubCommand::PubRec {
                 client: client.clone(),
                 pkid: ack.pkid,

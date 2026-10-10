@@ -95,6 +95,8 @@ impl From<AppProps> for mqtt_core::AppProperties {
             response_topic: p.response_topic,
             correlation_data: p.correlation_data.map(bytes::Bytes::from),
             user_properties: p.user_properties,
+            // Who published a message is not part of its stored record.
+            origin: None,
         }
     }
 }

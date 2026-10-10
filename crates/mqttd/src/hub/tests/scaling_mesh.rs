@@ -691,7 +691,7 @@ async fn a_fan_out_that_walks_no_peers_still_reports_itself() {
         .await
         .expect("delivery")
         .expect("a packet");
-    assert!(matches!(*pkt, Packet::Publish(_)));
+    assert!(matches!(pkt.packet(), Some(Packet::Publish(_))));
 
     let out = metrics.render();
     assert!(

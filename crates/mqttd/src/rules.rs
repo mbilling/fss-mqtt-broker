@@ -38,6 +38,15 @@
 //!   every retry for as long as the condition lasts (a brownout, a peer's refusal).
 //!   Inbound `QoS` 2 dedup means a rule fires exactly once per `QoS` 2 message. A `QoS`
 //!   0 publish has no acknowledgement, so nothing it produces is gated.
+//! - **Message events.** `$events/message/delivered` and `acked` are raised by the
+//!   subscriber's connection task, as it writes the PUBLISH and reads the PUBACK/PUBREC;
+//!   `dropped` and `delivery_dropped` are decided by the hub, which hands them, as a
+//!   [`MessageNote`], to the connection task of the client they are about — or, when
+//!   that client has no connection, to one task that exists for them
+//!   ([`Rules::spawn_notes`]). Either way the SQL runs off the hub loop. What these
+//!   events say about a message's publisher travels with the message as its
+//!   [`Origin`], stamped at the publish only while a rule here or on a peer selects one
+//!   of them ([`Rules::origin_wanted`]).
 //! - **Watching it** ([ADR 0084](../../../docs/adr/0084-watching-and-editing-rules-live.md)).
 //!   [`RulesObserve`] holds the live `[rules]` settings for the `$SYS` statistics and
 //!   the trace, each rule's last error, and the trace's queue. With the trace off an
@@ -53,10 +62,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use mqtt_codec::QoS;
-use mqtt_core::{AppProperties, ClientId};
+use mqtt_core::{AppProperties, ClientId, Origin};
 use mqtt_observability::metrics::Metrics;
 use mqtt_rules::{
-    Budget, Effect, EventInput, Input, Outcome, PublishInput, Recursion, Republish, Rule, RuleSet,
+    Budget, Effect, EventInput, EventKind, EventMessage, Input, Outcome, PublishInput, Recursion,
+    Republish, Rule, RuleSet,
 };
 use tokio::sync::{mpsc, oneshot, watch};
 use tracing::{debug, info, warn};
@@ -76,6 +86,10 @@ pub struct Rules {
     node: Arc<str>,
     metrics: Option<Arc<Metrics>>,
     observe: Option<Arc<RulesObserve>>,
+    /// Whether a peer's rules select a message event (it said so on its link): every
+    /// publish here then carries its [`Origin`], for that peer's rules. Written by the
+    /// hub when a peer's answer changes, read by every publish.
+    peers_want_origin: Arc<AtomicBool>,
 }
 
 impl std::fmt::Debug for Rules {
@@ -124,7 +138,138 @@ pub struct PublishFacts<'a> {
 pub struct Derived {
     rule: Arc<str>,
     msg: Republish,
+    /// Its [`Origin`] — the rule, as EMQX's republish is a message from the rule's id —
+    /// while a message event is selected somewhere.
+    origin: Option<Arc<Origin>>,
 }
+
+/// The [`Origin`] of a client's publish: stamped on the connection task that read it.
+fn client_origin(f: &PublishFacts<'_>) -> Arc<Origin> {
+    Arc::new(Origin {
+        id: mqtt_rules::new_message_id(),
+        clientid: f.client.0.to_string(),
+        username: f.publisher.username.clone(),
+        peer: f.publisher.peer,
+        received_at_ms: mqtt_rules::now_ms(),
+        republished: false,
+        republish_depth: 0,
+    })
+}
+
+/// The [`Origin`] of a message `rule` republished, `depth` republishes into its chain.
+fn rule_origin(rule: &str, depth: u32) -> Arc<Origin> {
+    Arc::new(Origin {
+        id: mqtt_rules::new_message_id(),
+        clientid: rule.to_string(),
+        username: None,
+        peer: None,
+        received_at_ms: mqtt_rules::now_ms(),
+        republished: true,
+        republish_depth: depth,
+    })
+}
+
+/// Which message events the loaded rules select: what the hub checks before it
+/// reports a drop, and what decides whether deliveries carry their [`Origin`].
+// One flag per event: a set of independent facts, not a state.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MessageWants {
+    /// `$events/message/delivered`.
+    pub delivered: bool,
+    /// `$events/message/acked`.
+    pub acked: bool,
+    /// `$events/message/dropped`.
+    pub dropped: bool,
+    /// `$events/message/delivery_dropped`.
+    pub delivery_dropped: bool,
+}
+
+impl MessageWants {
+    fn of(set: &RuleSet) -> Self {
+        Self {
+            delivered: set.wants_event(EventKind::MessageDelivered),
+            acked: set.wants_event(EventKind::MessageAcked),
+            dropped: set.wants_event(EventKind::MessageDropped),
+            delivery_dropped: set.wants_event(EventKind::DeliveryDropped),
+        }
+    }
+
+    /// Whether any message event is selected.
+    #[must_use]
+    pub fn any(self) -> bool {
+        self.delivered || self.acked || self.dropped || self.delivery_dropped
+    }
+
+    /// Whether an event raised on the subscriber's connection is selected, so a
+    /// delivery must carry its [`Origin`] there (`too_large` is decided on it).
+    #[must_use]
+    pub fn on_delivery(self) -> bool {
+        self.delivered || self.acked || self.delivery_dropped
+    }
+}
+
+/// The hub's view of [`MessageWants`]: recomputed only when a reload swapped the rules,
+/// so asking costs one load of the watch's version.
+#[derive(Debug)]
+pub struct MessageWatch {
+    rx: RulesWatch,
+    wants: MessageWants,
+}
+
+impl MessageWatch {
+    /// What the rules in force select.
+    pub fn wants(&mut self) -> MessageWants {
+        if self.rx.has_changed().unwrap_or(false) {
+            self.wants = MessageWants::of(&self.rx.borrow_and_update());
+        }
+        self.wants
+    }
+}
+
+/// What a [`MessageNote`] reports.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NoteEvent {
+    /// `$events/message/dropped`: the publish reached nobody.
+    Dropped {
+        /// EMQX's reason: `no_subscribers`.
+        reason: &'static str,
+    },
+    /// `$events/message/delivery_dropped`: the message was dropped on its way to
+    /// `receiver`.
+    DeliveryDropped {
+        /// The subscriber it was for.
+        receiver: ClientId,
+        /// EMQX's reason (`no_local`, `expired`, `queue_full`), or mqttd's `too_large`.
+        reason: &'static str,
+    },
+}
+
+/// A message event the hub decided — a publish that reached nobody, a message dropped
+/// on its way to a subscriber — for a task off the hub loop to raise
+/// ([`ConnRules::fire_note`]): the hub never runs rule SQL for it.
+#[derive(Debug)]
+pub struct MessageNote {
+    /// Which event, and why.
+    pub event: NoteEvent,
+    /// The message's topic.
+    pub topic: String,
+    /// Its payload.
+    pub payload: Bytes,
+    /// Its `QoS`.
+    pub qos: QoS,
+    /// Its RETAIN flag.
+    pub retain: bool,
+    /// Its Message Expiry Interval, seconds.
+    pub message_expiry: Option<u32>,
+    /// Its application properties, with its [`Origin`] when it has one.
+    pub app: AppProperties,
+}
+
+/// How many [`MessageNote`]s may wait for the task that raises them for clients
+/// without a connection ([`Rules::spawn_notes`]). Past it the hub drops the note — the
+/// event is not raised — and says so in the log.
+pub const NOTE_QUEUE: usize = 8192;
 
 impl Derived {
     /// Its topic length, and its payload-plus-properties length: what its ingress
@@ -287,7 +432,11 @@ fn collect(metrics: Option<&Metrics>, effects: Vec<(Arc<str>, Effect)>) -> Vec<D
     effects
         .into_iter()
         .filter_map(|(rule, e)| match e {
-            Effect::Republish(msg) => Some(Derived { rule, msg }),
+            Effect::Republish(msg) => Some(Derived {
+                rule,
+                msg,
+                origin: None,
+            }),
             Effect::Console(json) => {
                 info!(rule = %rule, output = %json, "rule console action");
                 count_action(metrics, &rule, "ok");
@@ -314,6 +463,8 @@ struct Engine<'a> {
     node: &'a str,
     metrics: Option<&'a Metrics>,
     observe: Option<&'a RulesObserve>,
+    /// Whether the messages it derives carry an [`Origin`].
+    origin_wanted: bool,
 }
 
 impl Engine<'_> {
@@ -371,11 +522,18 @@ impl Engine<'_> {
         budget: &Budget,
     ) -> Vec<Derived> {
         let mut out = Vec::new();
-        for d in collect(self.metrics, effects) {
+        let depth = depth + 1;
+        for mut d in collect(self.metrics, effects) {
+            if self.origin_wanted {
+                d.origin = Some(rule_origin(&d.rule, depth));
+            }
             if !d.msg.direct_dispatch && self.set.has_message_rules() {
-                let depth = depth + 1;
                 let mut input = PublishInput::republished(&d.rule, &d.msg, depth);
                 input.node = self.node;
+                if let Some(o) = &d.origin {
+                    input.message_id = Some(o.id);
+                    input.received_at_ms = Some(o.received_at_ms);
+                }
                 let effects = self.publish(&input, budget, || TraceTrigger::republished(&d));
                 out.extend(self.reenter(effects, depth, budget));
             }
@@ -385,13 +543,17 @@ impl Engine<'_> {
     }
 }
 
-/// Evaluate a publish against `set`, and what it republishes in turn.
+/// Evaluate a publish against `set`, and what it republishes in turn. `origin` is the
+/// publish's own, when it carries one: its rules then see the `id` and
+/// `publish_received_at` the message events will report for it, and what they
+/// republish carries an origin too.
 fn evaluate(
     set: &RuleSet,
     node: &str,
     metrics: Option<&Metrics>,
     observe: Option<&RulesObserve>,
     f: &PublishFacts<'_>,
+    origin: Option<&Origin>,
     trigger: TriggerKind,
 ) -> Vec<Derived> {
     if !set.has_message_rules() {
@@ -403,11 +565,16 @@ fn evaluate(
     input.retain = f.retain;
     input.message_expiry = f.message_expiry;
     input.node = node;
+    if let Some(o) = origin {
+        input.message_id = Some(o.id);
+        input.received_at_ms = Some(o.received_at_ms);
+    }
     let engine = Engine {
         set,
         node,
         metrics,
         observe,
+        origin_wanted: origin.is_some(),
     };
     let budget = Budget::new(f.payload.len());
     let effects = engine.publish(&input, &budget, || TraceTrigger::message(trigger, f));
@@ -423,7 +590,64 @@ impl Rules {
             node,
             metrics,
             observe: None,
+            peers_want_origin: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Record whether any linked peer's rules select a message event (the hub's call,
+    /// as peers say so): while one does, every publish here carries its [`Origin`].
+    pub fn set_peers_want_origin(&self, wanted: bool) {
+        self.peers_want_origin.store(wanted, Relaxed);
+    }
+
+    /// Whether a message published now must carry its [`Origin`]: a rule here, or on a
+    /// linked peer, selects a message event.
+    #[must_use]
+    pub fn origin_wanted(&self) -> bool {
+        self.peers_want_origin.load(Relaxed) || self.rx.borrow().wants_message_events()
+    }
+
+    /// The hub's view of which message events the rules select.
+    #[must_use]
+    pub fn message_watch(&self) -> MessageWatch {
+        let mut rx = self.rx.clone();
+        let wants = MessageWants::of(&rx.borrow_and_update());
+        MessageWatch { rx, wants }
+    }
+
+    /// Start the task that raises the hub's [`MessageNote`]s about clients that have no
+    /// connection to raise them on — a message dropped for an offline session, a
+    /// forwarded publish that reached nobody here — and return its queue. The task ends
+    /// when the sender is dropped. It evaluates like a connection does, off the hub
+    /// loop, and posts what the rules derive to `hub`.
+    #[must_use]
+    pub fn spawn_notes(
+        &self,
+        hub: mpsc::UnboundedSender<HubCommand>,
+    ) -> mpsc::Sender<Box<MessageNote>> {
+        let (tx, mut rx) = mpsc::channel::<Box<MessageNote>>(NOTE_QUEUE);
+        let rules = self.for_connection();
+        let mut reloaded = self.rx.clone();
+        reloaded.mark_unchanged();
+        tokio::spawn(async move {
+            // Like an idle connection at its PINGREQ, the task lets go of a superseded
+            // rule set when the rules are reloaded, not when its next note arrives.
+            let mut reloads = true;
+            loop {
+                tokio::select! {
+                    note = rx.recv() => match note {
+                        Some(note) => rules.fire_note(&note, None, &hub),
+                        None => break,
+                    },
+                    changed = reloaded.changed(), if reloads => match changed {
+                        Ok(()) => rules.refresh(),
+                        // Nothing can reload the rules any more.
+                        Err(_) => reloads = false,
+                    },
+                }
+            }
+        });
+        tx
     }
 
     /// The same engine, watched (ADR 0084): its last errors are kept and, while the
@@ -460,7 +684,7 @@ impl Rules {
         for d in derived {
             send(HubCommand::RuleDerived(Box::new(DerivedPublish {
                 rule: d.rule,
-                publish: derived_command(d.msg, None),
+                publish: derived_command(d.msg, d.origin, None),
                 gated: false,
             })));
         }
@@ -483,15 +707,34 @@ impl Rules {
         }
     }
 
+    /// The [`Origin`] of a message `f` that the hub publishes itself (a Will), when one
+    /// is wanted now ([`Rules::origin_wanted`]).
+    #[must_use]
+    pub fn hub_origin(&self, f: &PublishFacts<'_>) -> Option<Arc<Origin>> {
+        self.origin_wanted().then(|| client_origin(f))
+    }
+
     /// Evaluate a Will the hub is publishing and hand `send` the commands for what its
     /// rules produce ([`Rules::send_derived`]).
     pub fn on_will(&self, f: &PublishFacts<'_>, send: impl Fn(HubCommand)) {
+        self.on_will_from(f, None, send);
+    }
+
+    /// [`on_will`](Self::on_will) for a Will that carries `origin`
+    /// ([`Rules::hub_origin`]).
+    pub fn on_will_from(
+        &self,
+        f: &PublishFacts<'_>,
+        origin: Option<&Origin>,
+        send: impl Fn(HubCommand),
+    ) {
         let derived = evaluate(
             &self.current(),
             &self.node,
             self.metrics.as_deref(),
             self.observe.as_deref(),
             f,
+            origin,
             TriggerKind::Will,
         );
         Self::send_derived(derived, send);
@@ -546,20 +789,26 @@ impl ConnRules {
     }
 
     /// Evaluate a client publish. Returns the messages its rules republish, in rule
-    /// then action order. Empty — and nearly free — when no rule selects messages.
+    /// then action order — empty, and nearly free, when no rule selects messages — and
+    /// the publish's [`Origin`], to travel with it, when a rule here or on a peer
+    /// selects a message event (`None`, and one relaxed load, otherwise).
     #[must_use]
-    pub fn on_publish(&self, f: &PublishFacts<'_>) -> Vec<Derived> {
+    pub fn on_publish(&self, f: &PublishFacts<'_>) -> (Vec<Derived>, Option<Arc<Origin>>) {
         let metrics = self.engine.metrics.as_deref();
         let observe = self.engine.observe.as_deref();
+        let peers = self.engine.peers_want_origin.load(Relaxed);
         self.with_set(|set| {
-            evaluate(
+            let origin = (peers || set.wants_message_events()).then(|| client_origin(f));
+            let derived = evaluate(
                 set,
                 &self.engine.node,
                 metrics,
                 observe,
                 f,
+                origin.as_deref(),
                 TriggerKind::Publish,
-            )
+            );
+            (derived, origin)
         })
     }
 
@@ -576,20 +825,108 @@ impl ConnRules {
         self.with_set(|set| set.wants_event(kind))
     }
 
+    /// Which message events the rules select: what a connection reads once per batch
+    /// of deliveries it writes, so a batch no rule watches costs one uncontended lock.
+    #[must_use]
+    pub fn message_wants(&self) -> MessageWants {
+        self.with_set(MessageWants::of)
+    }
+
     /// This node's id, the `node` of every event.
     #[must_use]
     pub fn node(&self) -> &str {
         &self.engine.node
     }
 
-    /// Evaluate a client/session event and publish what its rules produce
-    /// ([`Rules::send_derived`]).
+    /// Raise the event a [`MessageNote`] reports, when a rule selects it. `receiver` is
+    /// the connection's own client, when the note is about a delivery to it; without
+    /// one, a `delivery_dropped` knows its subscriber's client id only.
+    pub fn fire_note(
+        &self,
+        note: &MessageNote,
+        receiver: Option<&mqtt_rules::ClientInfo<'_>>,
+        hub: &mpsc::UnboundedSender<HubCommand>,
+    ) {
+        let kind = match note.event {
+            NoteEvent::Dropped { .. } => EventKind::MessageDropped,
+            NoteEvent::DeliveryDropped { .. } => EventKind::DeliveryDropped,
+        };
+        if !self.wants(kind) {
+            return;
+        }
+        let msg = EventMessage {
+            origin: note.app.origin.as_deref(),
+            topic: &note.topic,
+            payload: &note.payload,
+            qos: qos_num(note.qos),
+            retain: note.retain,
+            dup: false,
+            user_properties: &note.app.user_properties,
+        };
+        let props = mqtt_rules::pub_props(&note.app, note.message_expiry);
+        let event = match &note.event {
+            NoteEvent::Dropped { reason } => {
+                EventInput::message_dropped(self.node(), &msg, props, reason)
+            }
+            NoteEvent::DeliveryDropped {
+                receiver: id,
+                reason,
+            } => {
+                let offline = mqtt_rules::ClientInfo {
+                    clientid: &id.0,
+                    username: None,
+                    peer: None,
+                    sockname: None,
+                    node: self.node(),
+                };
+                EventInput::delivery_dropped(receiver.unwrap_or(&offline), &msg, props, reason)
+            }
+        };
+        self.fire_event(&event, hub);
+    }
+
+    /// Raise `$events/message/dropped` for a publish this connection read and did not
+    /// hand to the hub, when a rule selects it: EMQX's two reasons for an inbound `QoS` 2
+    /// publish its session refuses (`emqx_session:on_dropped_qos2_msg/3`),
+    /// `packet_identifier_inuse` and `receive_maximum_exceeded`. `dup` is the packet's
+    /// DUP flag.
+    pub fn fire_dropped(
+        &self,
+        f: &PublishFacts<'_>,
+        dup: bool,
+        reason: &str,
+        hub: &mpsc::UnboundedSender<HubCommand>,
+    ) {
+        if !self.wants(EventKind::MessageDropped) {
+            return;
+        }
+        let origin = client_origin(f);
+        let msg = EventMessage {
+            origin: Some(&origin),
+            topic: f.topic,
+            payload: f.payload,
+            qos: qos_num(f.qos),
+            retain: f.retain,
+            dup,
+            user_properties: &f.app.user_properties,
+        };
+        let props = mqtt_rules::pub_props(f.app, f.message_expiry);
+        self.fire_event(
+            &EventInput::message_dropped(self.node(), &msg, props, reason),
+            hub,
+        );
+    }
+
+    /// Evaluate a client, session or message event and publish what its rules produce
+    /// ([`Rules::send_derived`]). A message event's rules get the budget its message's
+    /// payload earns, and what they republish continues the message's republish chain.
     pub fn fire_event(&self, input: &EventInput, hub: &mpsc::UnboundedSender<HubCommand>) {
         let metrics = self.engine.metrics.as_deref();
         let observe = self.engine.observe.as_deref();
         let node = &self.engine.node;
+        let peers = self.engine.peers_want_origin.load(Relaxed);
         let derived = self.with_set(|set| {
-            let budget = Budget::new(0);
+            let budget = Budget::new(input.payload().map_or(0, Bytes::len));
             let mut effects = Vec::new();
             match observe.filter(|o| o.tracing()) {
                 None => {
@@ -619,8 +956,9 @@ impl ConnRules {
                 node,
                 metrics,
                 observe,
+                origin_wanted: peers || set.wants_message_events(),
             };
-            engine.reenter(effects, 0, &budget)
+            engine.reenter(effects, input.republish_depth(), &budget)
         });
         Rules::send_derived(derived, |cmd| {
             let _ = hub.send(cmd);
@@ -672,7 +1010,7 @@ impl ConnRules {
             commands.push(DerivedPublish {
                 rule: d.rule,
                 gated: gate.is_some(),
-                publish: derived_command(d.msg, gate),
+                publish: derived_command(d.msg, d.origin, gate),
             });
         }
         let holds = answers.len() + usize::from(gated);
@@ -759,15 +1097,24 @@ pub fn printable_props(props: &mqtt_codec::Properties) -> mqtt_rules::Map {
 /// A `direct_dispatch = true` message is not retained, as in EMQX, whose retainer is a
 /// `message.publish` hook that direct dispatch skips; it is delivered live like the
 /// over-quota one above.
+///
+/// `origin` is the message's [`Origin`] — the rule — when a message event is selected
+/// somewhere; it travels in the message's application properties like a client's.
 #[must_use]
-pub fn derived_command(r: Republish, done: Option<oneshot::Sender<PublishOutcome>>) -> HubCommand {
+pub fn derived_command(
+    r: Republish,
+    origin: Option<Arc<Origin>>,
+    done: Option<oneshot::Sender<PublishOutcome>>,
+) -> HubCommand {
+    let mut app = r.app;
+    app.origin = origin;
     HubCommand::Publish {
         topic: r.topic,
         payload: r.payload,
         qos: qos_of(r.qos),
         retain: r.retain && !r.direct_dispatch,
         message_expiry: r.message_expiry,
-        app: r.app,
+        app,
         done,
         v5: false,
         publisher: None,
@@ -1605,6 +1952,120 @@ mod tests {
     const OK: Option<PublishOutcome> = Some(PublishOutcome::Accepted);
     const REFUSED: Option<PublishOutcome> = Some(PublishOutcome::Refused(PublishRefusal::Brownout));
     const WITHHELD: Option<PublishOutcome> = None;
+
+    fn rules_of(text: &str) -> (Rules, watch::Sender<Arc<RuleSet>>) {
+        let set = Arc::new(RuleSet::parse(text).unwrap().rules);
+        let (tx, rx) = watch::channel(set);
+        (Rules::new(rx, Arc::from("n1"), None), tx)
+    }
+
+    /// A publish is stamped with its origin only while it is wanted — a rule here
+    /// selects a message event, or a peer said its rules do — so a broker without such
+    /// rules allocates nothing per publish. The origin names the publisher as the
+    /// connection knows it, and a message a rule republishes gets the RULE as its own.
+    #[test]
+    fn a_publish_carries_an_origin_only_while_a_message_event_is_wanted() {
+        let client = ClientId("pub1".into());
+        let publisher = Publisher {
+            username: Some("pubuser".into()),
+            peer: Some("10.0.0.9:50000".parse().unwrap()),
+        };
+        let payload = Bytes::from_static(b"p");
+        let app = AppProperties::default();
+        let facts = PublishFacts {
+            client: &client,
+            publisher: &publisher,
+            topic: "t/a",
+            payload: &payload,
+            qos: QoS::AtLeastOnce,
+            retain: false,
+            app: &app,
+            message_expiry: None,
+        };
+        let copy = r#"
+[rules.copy]
+sql = 'SELECT payload FROM "t/#"'
+actions = [{ function = "republish", args = { topic = "out/x", payload = "${payload}" } }]
+"#;
+        let on_client_events = format!(
+            "{copy}\n[rules.c]\nsql = 'SELECT clientid FROM \"$events/client/connected\"'\n"
+        );
+        let derived_origin = |d: Vec<Derived>| {
+            let [d] = <[Derived; 1]>::try_from(d).expect("one republish");
+            let HubCommand::Publish { app, .. } = derived_command(d.msg, d.origin, None) else {
+                unreachable!()
+            };
+            app.origin
+        };
+
+        // No rule on a message event, no peer asking: nothing.
+        let (rules, reload) = rules_of(&on_client_events);
+        let conn = rules.for_connection();
+        let (derived, origin) = conn.on_publish(&facts);
+        assert!(origin.is_none());
+        assert!(derived_origin(derived).is_none());
+        assert!(!rules.origin_wanted());
+
+        // A peer asks: stamped, though no rule here selects a message event.
+        rules.set_peers_want_origin(true);
+        assert!(rules.origin_wanted());
+        let (derived, origin) = conn.on_publish(&facts);
+        let origin = origin.expect("a peer asked");
+        assert_eq!(
+            (
+                origin.clientid.as_str(),
+                origin.username.as_deref(),
+                origin.peer,
+                origin.republished,
+                origin.republish_depth,
+            ),
+            ("pub1", Some("pubuser"), publisher.peer, false, 0)
+        );
+        assert!(origin.received_at_ms > 1_600_000_000_000);
+        // What its rule republished is the rule's message, one republish deep.
+        let derived = derived_origin(derived).expect("a derived message has one too");
+        assert_eq!(
+            (
+                derived.clientid.as_str(),
+                derived.username.as_deref(),
+                derived.peer,
+                derived.republished,
+                derived.republish_depth,
+            ),
+            ("copy", None, None, true, 1)
+        );
+        assert_ne!(derived.id, origin.id, "a republish is a new message");
+        // Each publish is its own message.
+        assert_ne!(conn.on_publish(&facts).1.unwrap().id, origin.id);
+
+        rules.set_peers_want_origin(false);
+        assert!(conn.on_publish(&facts).1.is_none());
+
+        // A rule on any of the four message events: stamped; and no longer once a
+        // reload has removed it — on a connection that was already open.
+        for event in EventKind::MESSAGE {
+            reload
+                .send(Arc::new(
+                    RuleSet::parse(&format!(
+                        "[rules.e]\nsql = 'SELECT event FROM \"{}\"'\n",
+                        event.topic()
+                    ))
+                    .unwrap()
+                    .rules,
+                ))
+                .unwrap();
+            assert!(conn.on_publish(&facts).1.is_some(), "{event:?}");
+            assert!(rules.origin_wanted());
+            let wants = conn.message_wants();
+            assert!(wants.any());
+            assert_eq!(wants.on_delivery(), event != EventKind::MessageDropped);
+        }
+        reload
+            .send(Arc::new(RuleSet::parse(&on_client_events).unwrap().rules))
+            .unwrap();
+        assert!(conn.on_publish(&facts).1.is_none());
+        assert_eq!(conn.message_wants(), MessageWants::default());
+    }
 
     /// The publisher hears exactly the original's answer, whatever its derived messages
     /// met: a derived failure is counted, never turned into a withhold that would have
