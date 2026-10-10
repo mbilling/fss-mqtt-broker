@@ -1,18 +1,22 @@
 //! The built-in SQL functions, by EMQX name and EMQX semantics.
 //!
 //! Every function here is named, typed and behaves as in EMQX's
-//! `rule-sql-builtin-functions` reference; the examples in that reference are this
-//! module's tests. A call with an argument of the wrong type fails the rule's SQL
-//! (counted as a failure), as EMQX's does.
+//! `rule-sql-builtin-functions` reference — and where the reference and EMQX's source
+//! (`emqx_rule_funcs.erl`, `emqx_variform_bif.erl`) differ, as the source runs; the
+//! reference's examples are this module's tests, and probes of EMQX 6.3.1 pin the rest.
+//! A call with an argument of the wrong type fails the rule's SQL (counted as a
+//! failure), as EMQX's does.
 //!
-//! Deliberately absent (docs/RULES.md lists them): `jq`, the compression family
-//! (`gzip`/`zip`/`lz4_*`), the bit-sequence family (`subbits`, `bitsize`), schema
-//! registry and Sparkplug functions, `maptab_lookup`, the `MongoDB` date helpers, and
-//! `getenv` — a rule reading the broker's environment is a secret-exfiltration path.
+//! Deliberately absent (docs/RULES.md lists them): `jq`, schema registry and Sparkplug
+//! functions, `maptab_lookup`, the `MongoDB` date helpers, the process-dictionary and
+//! `kv_store_*` state functions (ADR 0085 designs rule state), and `term_encode` /
+//! `term_decode`.
+
+mod compress;
+mod erl_string;
+mod io_format;
 
 use std::sync::Arc;
-
-use std::fmt::Write as _;
 
 use base64::Engine as _;
 use regex::Regex;
@@ -155,16 +159,25 @@ funcs! {
     "is_not_null_var" 1..=1 => |a, _| Ok(Value::Bool(!matches!(a[0], Value::Undefined | Value::Null)));
     "is_num" 1..=1 => |a, _| Ok(Value::Bool(a[0].is_number()));
     "is_str" 1..=1 => |a, _| Ok(Value::Bool(a[0].is_binary()));
-    "is_empty" 1..=1 => |a, _| {
-        let v = decode_if_text(&a[0]);
-        Ok(Value::Bool(match &v {
-            Value::Array(x) => x.is_empty(),
-            Value::Map(m) => m.is_empty(),
-            Value::Str(s) => s.is_empty(),
-            Value::Bin(b) => b.is_empty(),
-            other => return Err(type_err("an array or a map", other)),
-        }))
-    };
+    // EMQX: `[]` and `<<>>` are empty, any other list is not, and everything else goes
+    // through `map/1` — so a non-empty string must be a JSON *object*; other JSON (an
+    // array, `null`) or text that is not JSON fails the rule.
+    "is_empty" 1..=1 => |a, _| Ok(Value::Bool(match &a[0] {
+        Value::Array(x) => x.is_empty(),
+        Value::Map(m) => m.is_empty(),
+        v @ (Value::Str(_) | Value::Bin(_)) => {
+            let b = v.as_bytes().unwrap_or_default();
+            if b.is_empty() {
+                true
+            } else {
+                match json_decode(b)? {
+                    Value::Map(m) => m.is_empty(),
+                    other => return Err(type_err("a map or a JSON object", &other)),
+                }
+            }
+        }
+        other => return Err(type_err("an array or a map", other)),
+    }));
 
     // -- data type conversion
     "bool" 1..=1 => |a, _| match &a[0] {
@@ -213,7 +226,11 @@ funcs! {
     };
 
     // -- string operations
-    "ascii" 1..=1 => |a, _| Ok(Value::Int(text(&a[0])?.chars().next().map_or(0, |c| i64::from(u32::from(c)))));
+    // EMQX's `ascii(<<Char:8, _/binary>>) -> Char`: the first BYTE, not character.
+    "ascii" 1..=1 => |a, _| s_bytes(&a[0])?
+        .first()
+        .map(|b| Value::Int(i64::from(*b)))
+        .ok_or_else(|| EvalError::new("an empty string has no first byte"));
     "concat" 1..=MANY => |a, _| {
         let parts: Vec<Value> = match a {
             [Value::Array(list)] => list.as_ref().clone(),
@@ -226,12 +243,9 @@ funcs! {
         Ok(Value::from(s))
     };
     "find" 2..=3 => |a, _| {
-        let (s, p) = (text(&a[0])?, text(&a[1])?);
-        let at = match direction(a.get(2), &["leading", "trailing"])? {
-            "trailing" => s.rfind(p),
-            _ => s.find(p),
-        };
-        Ok(Value::from(at.map_or("", |i| &s[i..])))
+        let (s, p) = (s_arg(&a[0])?, text(&a[1])?);
+        let trailing = direction(a.get(2), &["leading", "trailing"])? == "trailing";
+        Ok(Value::from(erl_string::find(s, p, trailing).unwrap_or("")))
     };
     "join_to_string" 1..=2 => |a, cx| {
         let (sep, list) = match a {
@@ -246,14 +260,14 @@ funcs! {
         bounded_growth(cx, "join_to_string", text_len + sep.len(), seps.and_then(|n| n.checked_add(text_len)))?;
         Ok(Value::from(parts.join(&sep)))
     };
-    "lower" 1..=1 => |a, _| Ok(Value::from(text(&a[0])?.to_lowercase()));
-    "ltrim" 1..=1 => |a, _| Ok(Value::from(text(&a[0])?.trim_start()));
+    "lower" 1..=1 => |a, _| Ok(Value::from(erl_string::lowercase(s_arg(&a[0])?)));
+    "ltrim" 1..=1 => |a, _| Ok(Value::from(erl_string::trim_leading(s_arg(&a[0])?, erl_string::WHITESPACE)));
     "pad" 2..=4 => |a, cx| {
-        let s = text(&a[0])?;
+        let s = s_arg(&a[0])?;
         let len = usize::try_from(int(&a[1])?).unwrap_or(0);
         let dir = direction(a.get(2), &["trailing", "leading", "both"])?;
         let ch = a.get(3).map(text).transpose()?.unwrap_or(" ");
-        let missing = len.saturating_sub(s.chars().count());
+        let missing = len.saturating_sub(erl_string::length(s));
         bounded_growth(cx, "pad", s.len(), missing.checked_mul(ch.len()).and_then(|n| n.checked_add(s.len())))?;
         let (left, right) = match dir {
             "leading" => (missing, 0),
@@ -262,91 +276,98 @@ funcs! {
         };
         Ok(Value::from(format!("{}{s}{}", ch.repeat(left), ch.repeat(right))))
     };
-    "regex_match" 2..=2 => |a, cx| Ok(Value::Bool(regex(cx, &a[1])?.is_match(text(&a[0])?))), regex 1;
+    "regex_match" 2..=2 => |a, cx| Ok(Value::Bool(regex(cx, &a[1])?.is_match(s_arg(&a[0])?))), regex 1;
     "regex_replace" 3..=3 => |a, cx| {
         let re = regex(cx, &a[1])?;
-        let (s, rep) = (text(&a[0])?, text(&a[2])?);
-        bounded_replace_all(cx, &re, s, &erlang_replacement(rep))
+        let (s, rep) = (s_arg(&a[0])?, bin(&a[2])?);
+        bounded_replace_all(cx, &re, s, &erlang_replacement(rep)?)
     }, regex 1;
     "regex_extract" 2..=2 => |a, cx| {
         let re = regex(cx, &a[1])?;
-        let groups = re.captures(text(&a[0])?).map_or_else(Vec::new, |c| {
+        let groups = re.captures(s_arg(&a[0])?).map_or_else(Vec::new, |c| {
             c.iter().skip(1).flatten().map(|m| Value::from(m.as_str())).collect()
         });
         Ok(Value::from(groups))
     }, regex 1;
     "replace" 3..=4 => |a, cx| {
-        let (s, p, r) = (text(&a[0])?, text(&a[1])?, text(&a[2])?);
-        if p.is_empty() {
-            return Ok(Value::from(s));
-        }
-        Ok(Value::from(match direction(a.get(3), &["all", "leading", "trailing"])? {
-            "leading" => s.replacen(p, r, 1),
-            "trailing" => match s.rfind(p) {
-                Some(i) => format!("{}{r}{}", &s[..i], &s[i + p.len()..]),
-                None => s.to_string(),
-            },
-            _ => {
-                if r.len() > p.len() {
-                    let grown = s.matches(p).count().checked_mul(r.len() - p.len());
-                    bounded_growth(cx, "replace", s.len() + r.len(), grown.and_then(|g| g.checked_add(s.len())))?;
-                }
-                s.replace(p, r)
-            }
+        let (s, p, r) = (s_arg(&a[0])?, text(&a[1])?, text(&a[2])?);
+        let at = match direction(a.get(3), &["all", "leading", "trailing"])? {
+            "leading" => erl_string::Where::Leading,
+            "trailing" => erl_string::Where::Trailing,
+            _ => erl_string::Where::All,
+        };
+        // `lists:join(Replacement, string:split(S, Pattern, Where))`.
+        let parts = erl_string::split(s, p, at);
+        let kept: usize = parts.iter().map(|x| x.len()).sum();
+        let out = parts.len().saturating_sub(1).checked_mul(r.len()).and_then(|n| n.checked_add(kept));
+        bounded_growth(cx, "replace", s.len() + r.len(), out)?;
+        Ok(Value::from(parts.join(r)))
+    };
+    "reverse" 1..=1 => |a, _| erl_string::reverse_latin1(s_arg(&a[0])?)
+        .map(|b| Value::from_bytes(&b.into()))
+        .ok_or_else(|| EvalError::new(
+            "reverse() of a string with a character above U+00FF (EMQX writes each \
+             character as one byte, and fails on these)",
+        ));
+    "rm_prefix" 2..=2 => |a, _| {
+        let (s, p) = (s_bytes(&a[0])?, bin(&a[1])?);
+        Ok(Value::from_bytes(&s.strip_prefix(p).unwrap_or(s).to_vec().into()))
+    };
+    "rtrim" 1..=2 => |a, _| {
+        let s = s_arg(&a[0])?;
+        Ok(Value::from(match a.get(1) {
+            None => erl_string::trim_trailing(s, erl_string::WHITESPACE),
+            Some(chars) => erl_string::trim_trailing(s, &code_points(text(chars)?)),
         }))
     };
-    "reverse" 1..=1 => |a, _| Ok(Value::from(text(&a[0])?.chars().rev().collect::<String>()));
-    "rm_prefix" 2..=2 => |a, _| {
-        let (s, p) = (text(&a[0])?, text(&a[1])?);
-        Ok(Value::from(s.strip_prefix(p).unwrap_or(s)))
-    };
-    "rtrim" 1..=1 => |a, _| Ok(Value::from(text(&a[0])?.trim_end()));
     "split" 2..=3 => |a, _| {
-        let (s, sep) = (text(&a[0])?, text(&a[1])?);
+        let (s, sep) = (s_arg(&a[0])?, text(&a[1])?);
         let opt = direction(
             a.get(2),
             &["trim", "notrim", "leading", "leading_notrim", "trailing", "trailing_notrim"],
         )?;
-        let mut parts: Vec<&str> = if sep.is_empty() {
-            vec![s]
-        } else if opt.starts_with("leading") {
-            s.splitn(2, sep).collect()
+        let at = if opt.starts_with("leading") {
+            erl_string::Where::Leading
         } else if opt.starts_with("trailing") {
-            let mut v: Vec<&str> = s.rsplitn(2, sep).collect();
-            v.reverse();
-            v
+            erl_string::Where::Trailing
         } else {
-            s.split(sep).collect()
+            erl_string::Where::All
         };
+        let mut parts = erl_string::split(s, sep, at);
         if !opt.ends_with("notrim") {
             parts.retain(|p| !p.is_empty());
         }
         Ok(Value::from(parts.into_iter().map(Value::from).collect::<Vec<_>>()))
     };
-    "sprintf" 1..=MANY => |a, _| sprintf(text(&a[0])?, &a[1..]);
-    "strlen" 1..=1 => |a, _| Ok(Value::Int(i64::try_from(text(&a[0])?.chars().count()).unwrap_or(i64::MAX)));
+    "sprintf" 1..=MANY => |a, cx| sprintf(cx, &a[0], &a[1..]);
+    "sprintf_s" 2..=2 => |a, cx| sprintf(cx, &a[0], array(&a[1])?);
+    "strlen" 1..=1 => |a, _| Ok(Value::Int(i64::try_from(erl_string::length(s_arg(&a[0])?)).unwrap_or(i64::MAX)));
     "substr" 2..=3 => |a, _| {
-        let s = text(&a[0])?;
-        let start = usize::try_from(int(&a[1])?).map_err(|_| EvalError::new("start must be >= 0"))?;
-        let it = s.chars().skip(start);
-        Ok(Value::from(match a.get(2) {
-            Some(l) => it.take(usize::try_from(int(l)?).unwrap_or(0)).collect::<String>(),
-            None => it.collect::<String>(),
-        }))
+        let s = s_arg(&a[0])?;
+        let count = |v: &Value, what: &str| {
+            usize::try_from(int(v)?).map_err(|_| EvalError::new(format!("substr() {what} must be >= 0")))
+        };
+        let start = count(&a[1], "start")?;
+        let len = a.get(2).map(|l| count(l, "length")).transpose()?;
+        Ok(Value::from(erl_string::slice(s, start, len)))
     };
     "tokens" 2..=3 => |a, _| {
-        let s = text(&a[0])?;
-        let mut seps: Vec<char> = text(&a[1])?.chars().collect();
-        if direction(a.get(2), &["", "nocrlf"])? == "nocrlf" {
-            seps.extend(['\r', '\n']);
-        }
+        let (s, seps) = (s_bytes(&a[0])?, bin(&a[1])?);
+        let extra: &[&[u8]] = if direction(a.get(2), &["", "nocrlf"])? == "nocrlf" {
+            &[b"\r", b"\n", b"\r\n"]
+        } else {
+            &[]
+        };
         Ok(Value::from(
-            s.split(|c| seps.contains(&c)).filter(|p| !p.is_empty()).map(Value::from).collect::<Vec<_>>(),
+            erl_string::lexemes_latin1(s, seps, extra)
+                .into_iter()
+                .map(|t| Value::from_bytes(&t.to_vec().into()))
+                .collect::<Vec<_>>(),
         ))
     };
-    "trim" 1..=1 => |a, _| Ok(Value::from(text(&a[0])?.trim()));
-    "unescape" 1..=1 => |a, _| unescape(text(&a[0])?).map(Value::from);
-    "upper" 1..=1 => |a, _| Ok(Value::from(text(&a[0])?.to_uppercase()));
+    "trim" 1..=1 => |a, _| Ok(Value::from(erl_string::trim(s_arg(&a[0])?, erl_string::WHITESPACE)));
+    "unescape" 1..=1 => |a, _| unescape(s_arg(&a[0])?).map(Value::from);
+    "upper" 1..=1 => |a, _| Ok(Value::from(s_arg(&a[0])?.to_uppercase()));
 
     // -- map operations
     "map_new" 0..=0 => |_, _| Ok(Value::from(Map::new()));
@@ -463,8 +484,23 @@ funcs! {
     };
     "json_decode" 1..=1 => |a, _| json_decode(bin(&a[0])?);
     "json_encode" 1..=1 => |a, _| Ok(Value::from(a[0].to_json()?));
-    "bin2hexstr" 1..=1 => |a, _| Ok(Value::from(mqtt_core::hex_lower(bin(&a[0])?).to_uppercase()));
-    "hexstr2bin" 1..=1 => |a, _| Ok(Value::from_bytes(&hex_decode(text(&a[0])?)?.into()));
+    "bin2hexstr" 1..=2 => |a, _| {
+        let hex = mqtt_core::hex_lower(bin(&a[0])?).to_uppercase();
+        Ok(Value::from(match hex_prefix(a.get(1))? {
+            Some(p) => format!("{p}{hex}"),
+            None => hex,
+        }))
+    };
+    "hexstr2bin" 1..=2 => |a, _| {
+        let s = bin(&a[0])?;
+        let digits = match hex_prefix(a.get(1))? {
+            None => s,
+            Some(p) => s
+                .strip_prefix(p.as_bytes())
+                .ok_or_else(|| EvalError::new(format!("the string does not start with '{p}'")))?,
+        };
+        Ok(Value::from_bytes(&hex_decode(digits)?.into()))
+    };
     "sqlserver_bin2hexstr" 1..=1 => |a, _| Ok(Value::from(format!("0x{}", mqtt_core::hex_lower(bin(&a[0])?).to_uppercase())));
 
     // -- date and time
@@ -480,11 +516,18 @@ funcs! {
         Ok(Value::Int(scale_from_nanos(datetime_nanos(&t), unit(a.get(1))?)))
     };
     "timezone_to_offset_seconds" 1..=1 => |a, _| Ok(Value::Int(i64::from(offset_seconds(&a[0])?)));
-    "format_date" 4..=4 => |a, _| {
+    // EMQX keeps the older name as an alias.
+    "timezone_to_second" 1..=1 => |a, _| Ok(Value::Int(i64::from(offset_seconds(&a[0])?)));
+    // Without the time, `format_date/3` formats now.
+    "format_date" 3..=4 => |a, _| {
         let u = unit(Some(&a[0]))?;
         let offset = chrono::FixedOffset::east_opt(offset_seconds(&a[1])?)
             .ok_or_else(|| EvalError::new("time zone offset out of range"))?;
-        let t = utc_from_nanos(i128::from(int(&a[3])?) * nanos_per(u))?.with_timezone(&offset);
+        let nanos = match a.get(3) {
+            Some(t) => i128::from(int(t)?) * nanos_per(u),
+            None => i128::from(scale_from_nanos(now_nanos(), u)) * nanos_per(u),
+        };
+        let t = utc_from_nanos(nanos)?.with_timezone(&offset);
         format_time(&t, text(&a[2])?).map(Value::from)
     };
     "date_to_unix_ts" 3..=4 => |a, _| {
@@ -500,6 +543,53 @@ funcs! {
     // -- uuid
     "uuid_v4" 0..=0 => |_, _| uuid_v4(true).map(Value::from);
     "uuid_v4_no_hyphen" 0..=0 => |_, _| uuid_v4(false).map(Value::from);
+
+    // -- bit sequences
+    "bitsize" 1..=1 => |a, _| Ok(Value::Int(
+        i64::try_from(bin(&a[0])?.len()).ok().and_then(|n| n.checked_mul(8)).ok_or_else(overflow)?,
+    ));
+    "bytesize" 1..=1 => |a, _| bytesize(&a[0]);
+    "subbits" 2..=6 => |a, _| subbits(a);
+
+    // -- compression
+    "gzip" 1..=1 => |a, cx| compress::deflate(cx, "gzip", bin(&a[0])?, compress::Wrap::Gzip);
+    "gunzip" 1..=1 => |a, cx| compress::inflate(cx, "gunzip", bin(&a[0])?, compress::Wrap::Gzip);
+    "zip" 1..=1 => |a, cx| compress::deflate(cx, "zip", bin(&a[0])?, compress::Wrap::Raw);
+    "unzip" 1..=1 => |a, cx| compress::inflate(cx, "unzip", bin(&a[0])?, compress::Wrap::Raw);
+    "zip_compress" 1..=1 => |a, cx| compress::deflate(cx, "zip_compress", bin(&a[0])?, compress::Wrap::Zlib);
+    "zip_uncompress" 1..=1 => |a, cx| compress::inflate(cx, "zip_uncompress", bin(&a[0])?, compress::Wrap::Zlib);
+    "lz4_compress" 1..=1 => |a, cx| compress::lz4_compress(cx, bin(&a[0])?);
+    "lz4_uncompress" 1..=1 => |a, cx| compress::lz4_uncompress(cx, bin(&a[0])?);
+
+    // -- callable in EMQX though its reference does not list them: every export of
+    //    emqx_rule_funcs is a SQL function there.
+    // `div(a, b)` / `mod(a, b)`: the integer operators in call form (`mod` is `rem`).
+    "div" 2..=2 => |a, _| {
+        let (x, y) = (int(&a[0])?, int(&a[1])?);
+        if y == 0 {
+            return Err(EvalError::new("division by zero"));
+        }
+        x.checked_div(y).map(Value::Int).ok_or_else(overflow)
+    };
+    "mod" 2..=2 => |a, _| {
+        let (x, y) = (int(&a[0])?, int(&a[1])?);
+        if y == 0 {
+            return Err(EvalError::new("division by zero"));
+        }
+        x.checked_rem(y).map(Value::Int).ok_or_else(overflow)
+    };
+    // Erlang `==`.
+    "eq" 2..=2 => |a, _| Ok(Value::Bool(a[0].loose_eq(&a[1])));
+    "null" 0..=0 => |_, _| Ok(Value::Undefined);
+    "hash" 2..=2 => |a, _| hash(&a[0], &a[1]);
+    "getenv" 1..=1 => |a, _| getenv(bin(&a[0])?);
+    "map_to_redis_hset_args" 1..=1 => |a, _| Ok(redis_hset_args(&a[0]));
+    "join_to_sql_values_string" 1..=1 => |a, _| sql_values(array(&a[0])?);
+    // EMQX matches topic filters given as maps with the ATOM key `topic`, which no rule
+    // value has (a decoded JSON object's keys are strings): every list gives `false`, and
+    // anything else fails.
+    "contains_topic" 2..=3 => |a, _| array(&a[0]).map(|_| Value::Bool(false));
+    "contains_topic_match" 2..=3 => |a, _| array(&a[0]).map(|_| Value::Bool(false));
 
     // -- conditional
     "coalesce" 1..=MANY => |a, _| Ok(candidates(a).into_iter().find(|v| !v.is_undefined()).unwrap_or(Value::Null));
@@ -591,59 +681,124 @@ fn regex(cx: &FnCtx, pattern: &Value) -> Result<Arc<Regex>, EvalError> {
 
 /// `replace_all`, refused once the output would take the message past its
 /// [`MAX_BUILT_BYTES`] budget. Checked before each expansion, against an upper bound on
-/// it: the replacement's own length plus, for every `$` reference in it, the whole
+/// it: the replacement's literal text plus, for every group reference in it, the whole
 /// match.
-fn bounded_replace_all(cx: &FnCtx, re: &Regex, s: &str, rep: &str) -> Result<Value, EvalError> {
-    let input = s.len().saturating_add(rep.len());
+fn bounded_replace_all(
+    cx: &FnCtx,
+    re: &Regex,
+    s: &str,
+    rep: &[RepPart],
+) -> Result<Value, EvalError> {
+    let literal: usize = rep
+        .iter()
+        .map(|p| match p {
+            RepPart::Lit(l) => l.len(),
+            RepPart::Group(_) => 0,
+        })
+        .sum();
+    let refs = rep
+        .len()
+        .saturating_sub(rep.iter().filter(|p| matches!(p, RepPart::Lit(_))).count());
+    let input = s.len().saturating_add(literal);
     let limit = input.saturating_add(MAX_BUILT_BYTES.saturating_sub(cx.ctx.built.get()));
-    let refs = rep.bytes().filter(|b| *b == b'$').count();
-    let mut out = String::new();
+    let mut out: Vec<u8> = Vec::new();
     let mut last = 0;
     for caps in re.captures_iter(s) {
         let Some(m) = caps.get(0) else { continue };
         let worst = refs
             .checked_mul(m.len())
-            .and_then(|n| n.checked_add(rep.len() + (m.start() - last) + out.len()));
+            .and_then(|n| n.checked_add(literal + (m.start() - last) + out.len()));
         if worst.is_none_or(|n| n > limit) {
             bounded_growth(cx, "regex_replace", input, None)?;
         }
-        out.push_str(&s[last..m.start()]);
-        caps.expand(rep, &mut out);
+        out.extend_from_slice(&s.as_bytes()[last..m.start()]);
+        for part in rep {
+            match part {
+                RepPart::Lit(l) => out.extend_from_slice(l),
+                RepPart::Group(n) => {
+                    if let Some(g) = caps.get(*n) {
+                        out.extend_from_slice(g.as_str().as_bytes());
+                    }
+                }
+            }
+        }
         last = m.end();
     }
-    out.push_str(&s[last..]);
+    out.extend_from_slice(&s.as_bytes()[last..]);
     bounded_growth(cx, "regex_replace", input, Some(out.len()))?;
-    Ok(Value::from(out))
+    Ok(Value::from_bytes(&out.into()))
 }
 
-/// Erlang `re:replace` replacement syntax (`&` = whole match, `\N` = group N) in the
-/// regex crate's (`${N}`), with any literal `$` escaped.
-fn erlang_replacement(rep: &str) -> String {
-    let mut out = String::with_capacity(rep.len());
-    let mut chars = rep.chars().peekable();
-    while let Some(c) = chars.next() {
-        match c {
-            '$' => out.push_str("$$"),
-            '&' => out.push_str("${0}"),
-            '\\' => match chars.peek() {
-                Some(d) if d.is_ascii_digit() => {
-                    let mut n = String::new();
-                    while let Some(d) = chars.peek().filter(|d| d.is_ascii_digit()) {
-                        n.push(*d);
-                        chars.next();
-                    }
-                    let _ = write!(out, "${{{n}}}");
+/// One piece of an `re:replace` replacement.
+#[derive(Debug, PartialEq, Eq)]
+enum RepPart {
+    /// Bytes copied as they are.
+    Lit(Vec<u8>),
+    /// A group's text; nothing when the group did not take part or does not exist.
+    Group(usize),
+}
+
+/// Erlang `re:replace`'s replacement syntax, exactly as OTP's `re:precomp_repl/1` reads
+/// it: `&` and `\g{0}` are the whole match; `\N`, `\gN` and `\g{N}` are group N (`\N`
+/// needs N to start 1-9, and takes every digit that follows); a backslash before anything
+/// else is that character itself (`\0` is `0`, `\&` is `&`, `\\` is `\`); a backslash at
+/// the end is itself; and `\g` before a non-digit, or `\g{` without digits and a closing
+/// brace, is an error. `$` means nothing.
+fn erlang_replacement(rep: &[u8]) -> Result<Vec<RepPart>, EvalError> {
+    let bad = || EvalError::new("bad \\g reference in the replacement");
+    let mut parts: Vec<RepPart> = Vec::new();
+    let lit = |parts: &mut Vec<RepPart>, b: u8| match parts.last_mut() {
+        Some(RepPart::Lit(l)) => l.push(b),
+        _ => parts.push(RepPart::Lit(vec![b])),
+    };
+    // Digits from `at`, as a group number (one too large to exist reads as no group).
+    let digits = |at: usize| -> (usize, usize) {
+        let n = rep[at..].iter().take_while(|b| b.is_ascii_digit()).count();
+        let num = std::str::from_utf8(&rep[at..at + n])
+            .ok()
+            .and_then(|d| d.parse().ok())
+            .unwrap_or(usize::MAX);
+        (num, n)
+    };
+    let mut at = 0;
+    while at < rep.len() {
+        match (rep[at], rep.get(at + 1), rep.get(at + 2)) {
+            (b'\\', Some(b'g'), Some(b'{')) if rep.len() > at + 3 => {
+                let (num, n) = digits(at + 3);
+                if n == 0 || rep.get(at + 3 + n) != Some(&b'}') {
+                    return Err(bad());
                 }
-                Some(&x @ ('&' | '\\')) => {
-                    out.push(x);
-                    chars.next();
+                parts.push(RepPart::Group(num));
+                at += 4 + n;
+            }
+            (b'\\', Some(b'g'), Some(_)) => {
+                let (num, n) = digits(at + 2);
+                if n == 0 {
+                    return Err(bad());
                 }
-                _ => out.push('\\'),
-            },
-            c => out.push(c),
+                parts.push(RepPart::Group(num));
+                at += 2 + n;
+            }
+            (b'\\', Some(&d), _) if (b'1'..=b'9').contains(&d) => {
+                let (num, n) = digits(at + 1);
+                parts.push(RepPart::Group(num));
+                at += 1 + n;
+            }
+            (b'\\', Some(&x), _) => {
+                lit(&mut parts, x);
+                at += 2;
+            }
+            (b'&', _, _) => {
+                parts.push(RepPart::Group(0));
+                at += 1;
+            }
+            (b, _, _) => {
+                lit(&mut parts, b);
+                at += 1;
+            }
         }
     }
-    out
+    Ok(parts)
 }
 
 fn overflow() -> EvalError {
@@ -868,15 +1023,36 @@ fn range_map(bytes: &[u8], lo: &Value, hi: &Value) -> Result<Value, EvalError> {
     Ok(Value::Int(i64::try_from(v).map_err(|_| overflow())?))
 }
 
-fn hex_decode(s: &str) -> Result<Vec<u8>, EvalError> {
-    if !s.len().is_multiple_of(2) {
-        return Err(EvalError::new("hex string has an odd number of digits"));
+/// `emqx_utils:hexstr_to_bin/1`: two digits per byte, an odd count read as if it had a
+/// leading `0` (`abc` is `0A BC`).
+fn hex_decode(s: &[u8]) -> Result<Vec<u8>, EvalError> {
+    let digit = |c: u8| {
+        char::from(c)
+            .to_digit(16)
+            .and_then(|d| u8::try_from(d).ok())
+            .ok_or_else(|| EvalError::new("not a hex string"))
+    };
+    let (head, rest) = if s.len().is_multiple_of(2) {
+        (None, s)
+    } else {
+        (Some(digit(s[0])?), &s[1..])
+    };
+    head.into_iter()
+        .map(Ok)
+        .chain(
+            rest.chunks_exact(2)
+                .map(|p| Ok(digit(p[0])? * 16 + digit(p[1])?)),
+        )
+        .collect()
+}
+
+/// The prefix argument of `bin2hexstr/2` and `hexstr2bin/2`: a binary, or `undefined`
+/// for none.
+fn hex_prefix(v: Option<&Value>) -> Result<Option<&str>, EvalError> {
+    match v {
+        None | Some(Value::Undefined) => Ok(None),
+        Some(v) => text(v).map(Some),
     }
-    (0..s.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(s.get(i..i + 2).unwrap_or("zz"), 16))
-        .collect::<Result<_, _>>()
-        .map_err(|_| EvalError::new("not a hex string"))
 }
 
 fn base64_engine(opts: &[Value]) -> Result<base64::engine::GeneralPurpose, EvalError> {
@@ -921,38 +1097,378 @@ fn uuid_v4(hyphens: bool) -> Result<String, EvalError> {
     })
 }
 
-/// Erlang `io_lib:format` for the control sequences rules use: `~s`, `~p`, `~w`
-/// (any value as text), `~n` (newline) and `~~`.
-fn sprintf(fmt: &str, args: &[Value]) -> Result<Value, EvalError> {
-    let mut out = String::new();
-    let mut args = args.iter();
-    let mut chars = fmt.chars();
-    while let Some(c) = chars.next() {
-        if c != '~' {
-            out.push(c);
-            continue;
-        }
-        match chars.next() {
-            Some('~') => out.push('~'),
-            Some('n') => out.push('\n'),
-            Some('s' | 'p' | 'w') => {
-                let v = args
-                    .next()
-                    .ok_or_else(|| EvalError::new("sprintf: more ~ directives than arguments"))?;
-                out.push_str(&v.to_text()?);
+/// `sprintf(Format, Args...)` and `sprintf_s(Format, [Args])`: Erlang's `io_lib:format`
+/// ([`io_format`]), its output charged to the message's growth budget.
+fn sprintf(cx: &FnCtx, fmt: &Value, args: &[Value]) -> Result<Value, EvalError> {
+    let fmt = bin(fmt)?;
+    let input = args
+        .iter()
+        .filter_map(Value::as_bytes)
+        .map(<[u8]>::len)
+        .fold(fmt.len(), usize::saturating_add);
+    let limit = input.saturating_add(MAX_BUILT_BYTES.saturating_sub(cx.ctx.built.get()));
+    let out = io_format::format(fmt, args, limit)?;
+    bounded_growth(cx, "sprintf", input, Some(out.len()))?;
+    Ok(Value::from_bytes(&out.into()))
+}
+
+/// The first argument of EMQX's string functions (`emqx_variform_bif`): a string, or an
+/// atom read as its name, so `lower(true)` is `true`; `null` and a missing value fail.
+fn s_arg(v: &Value) -> Result<&str, EvalError> {
+    match v {
+        Value::Bool(true) => Ok("true"),
+        Value::Bool(false) => Ok("false"),
+        v => text(v),
+    }
+}
+
+/// [`s_arg`] for the functions that work on bytes.
+fn s_bytes(v: &Value) -> Result<&[u8], EvalError> {
+    match v {
+        Value::Bool(true) => Ok(b"true"),
+        Value::Bool(false) => Ok(b"false"),
+        v => bin(v),
+    }
+}
+
+/// Each code point of `s` as a separator (`unicode:characters_to_list/2`).
+fn code_points(s: &str) -> Vec<&str> {
+    s.char_indices()
+        .map(|(i, c)| &s[i..i + c.len_utf8()])
+        .collect()
+}
+
+/// `erlang:iolist_size/1` and the data `crypto:hash/2` takes: a string, or an array of
+/// strings, bytes (integers 0..=255) and such arrays.
+fn iolist(v: &Value, out: &mut Vec<u8>) -> Result<(), EvalError> {
+    match v {
+        Value::Str(_) | Value::Bin(_) => out.extend_from_slice(v.as_bytes().unwrap_or_default()),
+        Value::Int(b) => out.push(u8::try_from(*b).map_err(|_| type_err("a byte (0..255)", v))?),
+        Value::Array(a) => {
+            for x in a.iter() {
+                iolist(x, out)?;
             }
-            other => {
+        }
+        other => return Err(type_err("a string or an array of strings and bytes", other)),
+    }
+    Ok(())
+}
+
+/// `hash(Algorithm, Data)`: any digest Erlang's `crypto:hash/2` offers, as lower-case hex.
+/// `sha1` is an alias of `sha`; `shake128`/`shake256` give their default 128/256 bits.
+fn hash(alg: &Value, data: &Value) -> Result<Value, EvalError> {
+    use sha2::Digest as _;
+    use shake::ExtendableOutput as _;
+    let data = match data {
+        Value::Null | Value::Undefined | Value::Int(_) => return Err(type_err("a string", data)),
+        Value::Bool(b) => b.to_string().into_bytes(),
+        v => {
+            let mut out = Vec::new();
+            iolist(v, &mut out)?;
+            out
+        }
+    };
+    let aws = |a: &'static aws_lc_rs::digest::Algorithm| {
+        aws_lc_rs::digest::digest(a, &data).as_ref().to_vec()
+    };
+    let alg_name = text(alg)?;
+    let digest: Vec<u8> = match alg_name {
+        "md4" => md4::Md4::digest(&data).to_vec(),
+        "md5" => md5(&data).to_vec(),
+        "sha" | "sha1" => aws(&aws_lc_rs::digest::SHA1_FOR_LEGACY_USE_ONLY),
+        "sha224" => aws(&aws_lc_rs::digest::SHA224),
+        "sha256" => aws(&aws_lc_rs::digest::SHA256),
+        "sha384" => aws(&aws_lc_rs::digest::SHA384),
+        "sha512" => aws(&aws_lc_rs::digest::SHA512),
+        "sha512_224" => sha2::Sha512_224::digest(&data).to_vec(),
+        "sha512_256" => aws(&aws_lc_rs::digest::SHA512_256),
+        "sha3_224" => sha3::Sha3_224::digest(&data).to_vec(),
+        "sha3_256" => sha3::Sha3_256::digest(&data).to_vec(),
+        "sha3_384" => sha3::Sha3_384::digest(&data).to_vec(),
+        "sha3_512" => sha3::Sha3_512::digest(&data).to_vec(),
+        "shake128" => {
+            let mut out = vec![0u8; 16];
+            shake::Shake128::digest_xof(&data, &mut out);
+            out
+        }
+        "shake256" => {
+            let mut out = vec![0u8; 32];
+            shake::Shake256::digest_xof(&data, &mut out);
+            out
+        }
+        "blake2b" => blake2::Blake2b512::digest(&data).to_vec(),
+        "blake2s" => blake2::Blake2s256::digest(&data).to_vec(),
+        "ripemd160" => ripemd::Ripemd160::digest(&data).to_vec(),
+        "sm3" => sm3::Sm3::digest(&data).to_vec(),
+        other => return Err(EvalError::new(format!("unknown hash algorithm '{other}'"))),
+    };
+    Ok(Value::from(mqtt_core::hex_lower(&digest)))
+}
+
+/// How many `getenv` results are remembered (EMQX keeps every one for the life of the
+/// node; a name taken from the payload must not grow this without bound).
+const GETENV_CACHE: usize = 1024;
+
+/// `getenv(Name)`: the environment variable `EMQXVAR_<Name>`, `''` when unset. Only the
+/// `EMQXVAR_` namespace is readable, so an operator exposes a value to rules by naming it
+/// so, and nothing else in the broker's environment is reachable. As in EMQX, the name's
+/// bytes are read as Latin-1 characters, the value's characters must each fit in a byte
+/// (a Latin-1 byte for U+0080..U+00FF), and a value once read does not change.
+fn getenv(name: &[u8]) -> Result<Value, EvalError> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<HashMap<Vec<u8>, Vec<u8>>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(v) = cache.lock().ok().and_then(|c| c.get(name).cloned()) {
+        return Ok(Value::from_bytes(&v.into()));
+    }
+    let key: String = "EMQXVAR_"
+        .chars()
+        .chain(name.iter().map(|b| char::from(*b)))
+        .collect();
+    if name.contains(&b'=') || name.contains(&0) {
+        return Err(EvalError::new("a name cannot contain '=' or NUL"));
+    }
+    let value: Vec<u8> = match std::env::var_os(&key) {
+        None => Vec::new(),
+        Some(v) => match v.into_string() {
+            Ok(s) => s
+                .chars()
+                .map(|c| u8::try_from(u32::from(c)))
+                .collect::<Result<_, _>>()
+                .map_err(|_| {
+                    EvalError::new(format!(
+                        "{key} holds a character above U+00FF, which EMQX cannot return"
+                    ))
+                })?,
+            Err(raw) => raw.into_encoded_bytes(),
+        },
+    };
+    if let Ok(mut c) = cache.lock() {
+        if c.len() < GETENV_CACHE {
+            c.insert(name.to_vec(), value.clone());
+        }
+    }
+    Ok(Value::from_bytes(&value.into()))
+}
+
+/// `map_to_redis_hset_args(Map)`: `[map_to_redis_hset_args, K1, V1, ...]` — the marker
+/// atom (a string here) first, then each pair whose value is a string, integer, float
+/// (`float2str(V, 6)`) or boolean; others are dropped. A string is read as JSON; one that
+/// is not a JSON object, or any other value, gives the marker alone. The pairs come in
+/// the order EMQX's `maps:fold` leaves them: keys descending.
+fn redis_hset_args(v: &Value) -> Value {
+    let decoded;
+    let map = match v {
+        Value::Map(m) => Some(m),
+        Value::Str(_) | Value::Bin(_) => {
+            decoded = json_decode(v.as_bytes().unwrap_or_default()).ok();
+            match &decoded {
+                Some(Value::Map(m)) => Some(m),
+                _ => None,
+            }
+        }
+        _ => None,
+    };
+    let mut out = vec![Value::from("map_to_redis_hset_args")];
+    if let Some(m) = map {
+        let mut entries: Vec<_> = m.iter().collect();
+        entries.sort_by(|a, b| b.0.as_bytes().cmp(a.0.as_bytes()));
+        for (k, x) in entries {
+            let field = match x {
+                Value::Str(_) | Value::Bin(_) => x.clone(),
+                Value::Int(n) => Value::from(n.to_string()),
+                Value::Float(f) => Value::from(compact_decimals(&format!("{f:.6}"))),
+                Value::Bool(b) => Value::from(b.to_string()),
+                _ => continue,
+            };
+            out.push(Value::Str(k.clone()));
+            out.push(field);
+        }
+    }
+    Value::from(out)
+}
+
+/// `join_to_sql_values_string(List)`: each item as an SQL literal, joined by `, `. A
+/// string, atom (`true`, `null`), map or array is quoted (maps and arrays as JSON) with
+/// `\` and `'` backslash-escaped; a number is written bare; a missing value is `NULL`.
+fn sql_values(list: &[Value]) -> Result<Value, EvalError> {
+    let mut out: Vec<u8> = Vec::new();
+    for (n, item) in list.iter().enumerate() {
+        if n > 0 {
+            out.extend_from_slice(b", ");
+        }
+        let quoted: Vec<u8> = match item {
+            Value::Undefined => {
+                out.extend_from_slice(b"NULL");
+                continue;
+            }
+            Value::Int(_) | Value::Float(_) => {
+                out.extend_from_slice(item.to_text()?.as_bytes());
+                continue;
+            }
+            Value::Str(_) | Value::Bin(_) => item.as_bytes().unwrap_or_default().to_vec(),
+            Value::Array(_) | Value::Map(_) => item.to_json()?.into_bytes(),
+            other => other.to_text()?.into_bytes(),
+        };
+        out.push(b'\'');
+        for b in quoted {
+            if matches!(b, b'\\' | b'\'') {
+                out.push(b'\\');
+            }
+            out.push(b);
+        }
+        out.push(b'\'');
+    }
+    Ok(Value::from_bytes(&out.into()))
+}
+
+/// `bytesize(Data)`: `erlang:iolist_size/1`.
+fn bytesize(v: &Value) -> Result<Value, EvalError> {
+    fn size(v: &Value) -> Result<usize, EvalError> {
+        match v {
+            Value::Str(_) | Value::Bin(_) => Ok(v.as_bytes().unwrap_or_default().len()),
+            Value::Int(0..=255) => Ok(1),
+            Value::Array(a) => a
+                .iter()
+                .map(size)
+                .try_fold(0usize, |t, n| Ok(t.saturating_add(n?))),
+            other => Err(type_err("a string or an array of strings and bytes", other)),
+        }
+    }
+    if let Value::Int(_) = v {
+        return Err(type_err("a string or an array of strings and bytes", v));
+    }
+    Ok(Value::Int(i64::try_from(size(v)?).unwrap_or(i64::MAX)))
+}
+
+/// `subbits(Bin, [Start,] Len[, Type[, Signedness[, Endianness]]])`: `Len` bits from bit
+/// `Start` (1-based) as an integer, float or bit string, as EMQX's `get_subbits/6`. A
+/// `Len` that is negative or runs past the end takes the bits to the end instead; a
+/// `Start` outside the binary gives `undefined`. A float is 16, 32 or 64 bits and finite,
+/// or the call fails.
+///
+/// Two results Erlang has cannot be represented and fail instead: an integer outside
+/// 64-bit range, and a bit string whose length is not a whole number of bytes.
+fn subbits(a: &[Value]) -> Result<Value, EvalError> {
+    let data = bin(&a[0])?;
+    let (start, len) = match a {
+        [_, len] => (1, int(len)?),
+        [_, start, len, ..] => (int(start)?, int(len)?),
+        _ => unreachable!("arity checked at load"),
+    };
+    let total = i64::try_from(data.len())
+        .unwrap_or(i64::MAX / 8)
+        .saturating_mul(8);
+    let begin = start.saturating_sub(1);
+    if begin < 0 || begin >= total {
+        return Ok(Value::Undefined);
+    }
+    let rest = total - begin;
+    let ty = a.get(3).map(text).transpose()?.unwrap_or("integer");
+    let signed = match a.get(4).map(text).transpose()?.unwrap_or("unsigned") {
+        "unsigned" => false,
+        "signed" => true,
+        other => {
+            return Err(EvalError::new(format!(
+                "'{other}' is not signed or unsigned"
+            )))
+        }
+    };
+    let little = match a.get(5).map(text).transpose()?.unwrap_or("big") {
+        "big" => false,
+        "little" => true,
+        other => return Err(EvalError::new(format!("'{other}' is not big or little"))),
+    };
+    let bit = |i: i64| -> u8 {
+        let i = usize::try_from(begin + i).unwrap_or(0);
+        (data[i / 8] >> (7 - i % 8)) & 1
+    };
+    // The bits in the order the value reads them, most significant first: a little-endian
+    // field's bytes reversed, its final partial byte (if any) first.
+    let ordered = |n: i64| -> Vec<u8> {
+        let bits: Vec<u8> = (0..n).map(bit).collect();
+        if !little {
+            return bits;
+        }
+        let chunks: Vec<&[u8]> = bits.chunks(8).collect();
+        chunks.into_iter().rev().flatten().copied().collect()
+    };
+    match ty {
+        "integer" => {
+            let n = if (0..=rest).contains(&len) { len } else { rest };
+            int_from_bits(&ordered(n), signed)
+        }
+        "float" => {
+            let try_float = |n: i64| -> Option<f64> {
+                if !matches!(n, 16 | 32 | 64) || n > rest {
+                    return None;
+                }
+                let raw = ordered(n)
+                    .iter()
+                    .fold(0u64, |acc, b| (acc << 1) | u64::from(*b));
+                let f = match n {
+                    16 => f16_to_f64(u16::try_from(raw).ok()?),
+                    32 => f64::from(f32::from_bits(u32::try_from(raw).ok()?)),
+                    _ => f64::from_bits(raw),
+                };
+                f.is_finite().then_some(f)
+            };
+            try_float(len)
+                .or_else(|| try_float(rest))
+                .map(Value::Float)
+                .ok_or_else(|| EvalError::new("the bits are not a finite 16, 32 or 64-bit float"))
+        }
+        "bits" => {
+            let n = if (0..=rest).contains(&len) { len } else { rest };
+            if n % 8 != 0 {
                 return Err(EvalError::new(format!(
-                    "sprintf: unsupported directive ~{}",
-                    other.map(String::from).unwrap_or_default()
-                )))
+                    "a {n}-bit string is not a whole number of bytes, which mqttd cannot represent"
+                )));
+            }
+            let bytes: Vec<u8> = (0..n / 8)
+                .map(|k| (0..8).fold(0u8, |acc, i| (acc << 1) | bit(k * 8 + i)))
+                .collect();
+            Ok(Value::from_bytes(&bytes.into()))
+        }
+        other => Err(EvalError::new(format!(
+            "'{other}' is not integer, float or bits"
+        ))),
+    }
+}
+
+/// An integer from its bits, most significant first.
+fn int_from_bits(bits: &[u8], signed: bool) -> Result<Value, EvalError> {
+    let negative = signed && bits.first() == Some(&1);
+    // A negative two's-complement value is -(inverted bits) - 1.
+    let magnitude = bits.iter().try_fold(0u64, |acc, b| {
+        let b = if negative { 1 - b } else { *b };
+        acc.checked_mul(2).and_then(|a| a.checked_add(u64::from(b)))
+    });
+    let range =
+        || EvalError::new("the integer is outside 64-bit range, which mqttd cannot represent");
+    let m = i64::try_from(magnitude.ok_or_else(range)?).map_err(|_| range())?;
+    Ok(Value::Int(if negative { -m - 1 } else { m }))
+}
+
+/// An IEEE 754 half-precision float.
+fn f16_to_f64(h: u16) -> f64 {
+    // Exact: a half's every value is a double, and these are products of powers of two.
+    let pow2 = |e: i32| f64::from_bits(u64::try_from(1023 + e).unwrap_or(0) << 52);
+    let sign = if h & 0x8000 == 0 { 1.0 } else { -1.0 };
+    let exp = i32::from((h >> 10) & 0x1f);
+    let frac = f64::from(h & 0x3ff);
+    match exp {
+        0 => sign * frac * pow2(-24),
+        31 => {
+            if frac == 0.0 {
+                sign * f64::INFINITY
+            } else {
+                f64::NAN
             }
         }
+        e => sign * (1.0 + frac / 1024.0) * pow2(e - 15),
     }
-    if args.next().is_some() {
-        return Err(EvalError::new("sprintf: more arguments than ~ directives"));
-    }
-    Ok(Value::from(out))
 }
 
 /// C escapes and `\xH…` hex escapes, as EMQX's `unescape/1`.
@@ -964,9 +1480,11 @@ fn unescape(s: &str) -> Result<String, EvalError> {
             out.push(c);
             continue;
         }
-        let e = chars
-            .next()
-            .ok_or_else(|| EvalError::new("unescape: dangling backslash"))?;
+        // A backslash ending the string is kept, as EMQX's `unescape_string/2` keeps it.
+        let Some(e) = chars.next() else {
+            out.push('\\');
+            break;
+        };
         out.push(match e {
             'n' => '\n',
             't' => '\t',
@@ -1256,7 +1774,18 @@ mod tests {
 
     #[test]
     fn erlang_replacements_translate() {
-        assert_eq!(erlang_replacement(r"<\1>&$"), "<${1}>${0}$$");
+        assert_eq!(
+            erlang_replacement(br"<\1>&$\g{12}\0").unwrap(),
+            [
+                RepPart::Lit(b"<".to_vec()),
+                RepPart::Group(1),
+                RepPart::Lit(b">".to_vec()),
+                RepPart::Group(0),
+                RepPart::Lit(b"$".to_vec()),
+                RepPart::Group(12),
+                RepPart::Lit(b"0".to_vec()),
+            ]
+        );
     }
 
     #[test]

@@ -1469,7 +1469,7 @@ else:
 | Deduplication, or "only when the value changed" | Needs the previous value | The same consumer, or report on change at the device |
 | Joining two topics, or looking a value up in a table | A rule sees one message; `maptab_lookup` is not implemented | A consumer with a cache, or put the static data in the topic or the payload at the source |
 | Sending to Kafka, HTTP, a database or another system | There are no sink actions ([ADR 0083](adr/0083-rule-engine.md)) | Republish to a topic and consume it with a `$share` group ([INTEGRATION.md](INTEGRATION.md)); to another MQTT broker, [mqtt-bridge](BRIDGE.md) |
-| Calling out: an HTTP request, a script, a file or an environment variable | Rules do no I/O, and `getenv` is not provided | A consumer service |
+| Calling out: an HTTP request, a script, a file or an environment variable | Rules do no I/O; `getenv` reads only `EMQXVAR_…` variables, fixed while the broker runs | A consumer service |
 | Dropping or changing the original message | A rule only adds messages | Have devices publish to a raw topic that subscribers cannot read (the ACL), and let a rule republish the cleaned message to the topic they do read |
 | One rule triggering another | A republished message never re-enters the rule engine, so rules cannot loop | Write the second rule against the original topic |
-| gzip, Protobuf, Sparkplug B or a schema registry | Those functions are not implemented ([RULES.md](RULES.md)) | A consumer that decodes and republishes |
+| Protobuf, Sparkplug B or a schema registry | Those functions are not implemented ([RULES.md](RULES.md)) | A consumer that decodes and republishes |
