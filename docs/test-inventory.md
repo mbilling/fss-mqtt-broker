@@ -892,7 +892,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::sink_records_through_a_trait_object`
 - `tests::tampering_with_any_field_changes_the_head`
 
-## `crates/mqtt-rules/src/lib.rs` — 125 test(s)
+## `crates/mqtt-rules/src/lib.rs` — 132 test(s)
 
 - `edit::tests::a_json_rule_body_is_a_rule_edit`
 - `edit::tests::an_insert_appends_the_rule_at_the_end`
@@ -921,15 +921,19 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::a_file_may_compile_only_so_many_distinct_regular_expressions`
 - `tests::a_literal_qos_or_retain_that_can_never_be_valid_fails_the_load`
 - `tests::a_loaded_set_keeps_its_action_specs_and_warnings`
+- `tests::a_matchs_backtracking_heap_is_bounded`
 - `tests::a_message_has_one_timestamp_however_often_it_is_read`
 - `tests::a_messages_effects_share_one_byte_budget`
 - `tests::a_non_json_payload_fails_only_rules_that_reach_into_it`
+- `tests::a_pattern_that_is_not_utf8_means_its_own_bytes`
 - `tests::a_republish_into_sys_fails_its_action`
 - `tests::a_rule_never_sees_the_dup_flag`
 - `tests::addresses_print_as_emqx_prints_them`
+- `tests::an_invalid_pattern_loads_with_a_warning_and_fails_each_call`
 - `tests::arithmetic_follows_erlang`
 - `tests::bit_sequence_functions_follow_emqx`
 - `tests::case_expression_emqx_docs`
+- `tests::catastrophic_backtracking_is_bounded_and_no_match`
 - `tests::comments_and_case_insensitive_keywords`
 - `tests::comparison_semantics_follow_emqx`
 - `tests::compression_matches_emqx_byte_for_byte`
@@ -973,7 +977,9 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::property_maps_print_as_emqx_prints_them`
 - `tests::quadratic_string_growth_is_refused_before_it_is_allocated`
 - `tests::reason_codes_are_named_as_emqx_names_them`
+- `tests::regex_functions_match_emqx_row_for_row`
 - `tests::regex_replace_reads_its_replacement_as_erlang_re_does`
+- `tests::regular_expressions_are_pcre2_on_bytes_as_in_emqx`
 - `tests::republish_args_render`
 - `tests::republish_defaults_follow_emqx`
 - `tests::rules_aimed_at_sys_load_with_a_warning`
@@ -985,6 +991,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::string_functions_emqx_docs`
 - `tests::string_functions_work_on_grapheme_clusters_like_emqx`
 - `tests::the_growth_budget_is_per_message`
+- `tests::the_match_limit_is_otps_and_reaching_it_is_no_match`
 - `tests::the_new_events_are_named_as_emqx_names_them`
 - `tests::the_new_events_run_the_rules_that_select_them`
 - `tests::the_sql_test_simulates_events_and_refuses_inputs_the_rule_never_sees`

@@ -22,12 +22,10 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use regex::Regex;
-
-use crate::funcs::{self, Func};
+use crate::funcs::{self, Compiled, Func};
 use crate::lexer::{lex, Kw, Spanned, Tok};
 use crate::value::Value;
-use crate::{ParseError, MAX_REGEX_LITERALS_PER_FILE};
+use crate::{ParseError, MAX_REGEX_LITERALS_PER_FILE, MAX_REGEX_LITERAL_BYTES_PER_FILE};
 
 /// One step of a field path.
 #[derive(Debug, Clone)]
@@ -106,8 +104,9 @@ pub(crate) enum Expr {
     Call {
         func: &'static Func,
         args: Vec<Expr>,
-        /// The pattern of a regex function, compiled at load time when it is a literal.
-        regex: Option<Arc<Regex>>,
+        /// The pattern of a regex function, compiled at load time when it is a literal
+        /// (or why it does not compile: the call fails, as in EMQX).
+        regex: Option<Compiled>,
     },
 }
 
@@ -159,19 +158,23 @@ pub(crate) fn parse(
 
 /// The literal regex patterns one rules file has compiled (ADR 0084 D3), each once.
 ///
-/// A pattern is bounded on its own (`funcs::compile_regex`), but a file was not: every
-/// literal cost a compile, so a file of a few thousand worst-case patterns took seconds
-/// and gigabytes to parse. An identical literal now shares one compiled regex wherever
-/// it appears, and a file may hold at most [`MAX_REGEX_LITERALS_PER_FILE`] distinct
-/// ones; the next is refused before it is compiled.
+/// A pattern is bounded on its own (`funcs::compile_regex`), but a file is not: every
+/// literal costs a compile, and the compiled patterns live as long as the rules. An
+/// identical literal shares one compiled pattern wherever it appears, and a file may
+/// hold at most [`MAX_REGEX_LITERALS_PER_FILE`] distinct ones; the next is refused
+/// before it is compiled. A pattern that does not compile is kept as its error (the
+/// rule loads, and the call fails when it runs, as in EMQX).
 #[derive(Debug, Default)]
 pub(crate) struct RegexPool {
-    compiled: HashMap<String, Arc<Regex>>,
+    compiled: HashMap<String, Compiled>,
+    /// The bytes of the patterns in `compiled`, together.
+    bytes: usize,
 }
 
 impl RegexPool {
-    /// `pattern` compiled: the file's earlier copy, or a new one while the budget lasts.
-    pub(crate) fn get(&mut self, pattern: &str) -> Result<Arc<Regex>, String> {
+    /// `pattern` compiled (or its compile error): the file's earlier copy, or a new one
+    /// while the budget lasts.
+    pub(crate) fn get(&mut self, pattern: &str) -> Result<Compiled, String> {
         if let Some(re) = self.compiled.get(pattern) {
             return Ok(re.clone());
         }
@@ -181,7 +184,15 @@ impl RegexPool {
                  rules file (an identical pattern is compiled once and counts once)"
             ));
         }
-        let re = Arc::new(funcs::compile_regex(pattern).map_err(|e| e.0)?);
+        if self.bytes + pattern.len() > MAX_REGEX_LITERAL_BYTES_PER_FILE {
+            return Err(format!(
+                "more than {MAX_REGEX_LITERAL_BYTES_PER_FILE} bytes of distinct regular \
+                 expressions in one rules file (an identical pattern is compiled once and \
+                 counts once)"
+            ));
+        }
+        let re = funcs::compile_regex(pattern.as_bytes());
+        self.bytes += pattern.len();
         self.compiled.insert(pattern.to_string(), re.clone());
         Ok(re)
     }
@@ -809,11 +820,20 @@ impl Parser<'_> {
             ));
         }
         let regex = match func.regex_arg.and_then(|i| args.get(i)) {
-            Some(Expr::Const(Value::Str(pattern))) => Some(
-                self.regexes
+            Some(Expr::Const(Value::Str(pattern))) => {
+                let re = self
+                    .regexes
                     .get(pattern)
-                    .map_err(|e| ParseError::at(self.sql, start, e))?,
-            ),
+                    .map_err(|e| ParseError::at(self.sql, start, e))?;
+                if let Err(e) = &re {
+                    // EMQX accepts the rule and fails it on every message; so does this
+                    // engine, but says so when the file loads.
+                    self.warnings.push(format!(
+                        "{name}(): {e}; every call fails the rule, as in EMQX"
+                    ));
+                }
+                Some(re)
+            }
             _ => None,
         };
         let h = self.node(h)?;
