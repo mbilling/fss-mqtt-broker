@@ -87,7 +87,7 @@ impl Rig {
     }
 
     async fn offline_persistent_subscriber(&mut self) {
-        let (otx, _orx) = mpsc::unbounded_channel::<Box<Packet>>();
+        let (otx, _orx) = mpsc::unbounded_channel::<Box<crate::hub::Outgoing>>();
         let (reply, wait) = oneshot::channel();
         self.dispatch(HubCommand::Attach {
             client: ClientId(SUB.into()),

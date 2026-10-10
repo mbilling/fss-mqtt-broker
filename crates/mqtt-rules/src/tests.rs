@@ -853,7 +853,7 @@ fn load_errors_are_specific() {
     assert!(e.contains("takes 1 argument"), "{e}");
     let e = check_sql("SELECT a FROM \"t/#/x\"").unwrap_err();
     assert!(e.contains("not a valid topic filter"), "{e}");
-    let e = check_sql("SELECT a FROM \"$events/message/delivered\"").unwrap_err();
+    let e = check_sql("SELECT a FROM \"$events/sys/alarm_activated\"").unwrap_err();
     assert!(e.contains("not a supported event"), "{e}");
     let e = check_sql("SELECT a").unwrap_err();
     assert!(e.contains("expected FROM"), "{e}");
@@ -2684,13 +2684,25 @@ fn wildcard_event_filters_select_what_emqx_s_match_selects() {
             EventKind::CheckAuthnComplete,
             EventKind::CheckAuthzComplete,
             EventKind::SessionSubscribed,
-            EventKind::SessionUnsubscribed
+            EventKind::SessionUnsubscribed,
+            EventKind::MessageDelivered,
+            EventKind::MessageAcked,
+            EventKind::MessageDropped,
+            EventKind::DeliveryDropped
         ],
         "the underscore spellings are one level; ping has none"
     );
+    assert_eq!(
+        EventKind::matching("$events/message/+").kinds,
+        EventKind::MESSAGE,
+        "the four message events, and nothing mqttd does not raise"
+    );
+    assert!(EventKind::matching("$events/message/+")
+        .unsupported
+        .is_empty());
     let all = EventKind::matching("$events/#");
     assert_eq!(all.kinds, EventKind::ALL);
-    assert!(all.unsupported.contains(&"$events/message/delivered"));
+    assert!(all.unsupported.contains(&"$events/sys/alarm_activated"));
 
     let set = load(
         r#"
@@ -2711,15 +2723,20 @@ fn wildcard_event_filters_select_what_emqx_s_match_selects() {
     )
     .unwrap();
     assert!(EventKind::ALL.iter().all(|k| loaded.rules.wants_event(*k)));
+    let (unraised, selected) = loaded.warnings[0]
+        .split_once("; it selects")
+        .expect("the warning names both lists");
     assert!(
-        loaded.warnings[0].contains("also matches events mqttd does not raise")
-            && loaded.warnings[0].contains("$events/message/delivered"),
+        unraised.contains("also matches events mqttd does not raise")
+            && unraised.contains("$events/sys/alarm_activated")
+            && !unraised.contains("$events/message/"),
         "{:?}",
         loaded.warnings
     );
+    assert!(selected.contains("$events/message/delivered"), "{selected}");
     for (sql, needle) in [
         (
-            "SELECT * FROM \"$events/message/+\"",
+            "SELECT * FROM \"$events/sys/+\"",
             "matches no event mqttd raises",
         ),
         (

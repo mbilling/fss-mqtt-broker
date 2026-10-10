@@ -18,7 +18,7 @@ serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true, features = ["float_roundtrip"] }
 # Integers of any size, as Erlang has them (src/num.rs). Both already ship in the
 # broker (x509-parser and jsonwebtoken pull them in).
-num-bigint = { version = "0.4", default-features = false, features = ["std"] }
+num-bigint = { version = "0.5", default-features = false, features = ["std"] }
 num-traits = { version = "0.2", default-features = false, features = ["std"] }
 # The rules file is TOML, like every other mqttd policy file (ADR 0046).
 toml.workspace = true

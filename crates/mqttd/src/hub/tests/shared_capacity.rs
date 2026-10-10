@@ -35,7 +35,7 @@ impl Rig {
         }
     }
 
-    async fn member(&self, name: &str) -> (mpsc::UnboundedReceiver<Box<Packet>>, OutboundMeter) {
+    async fn member(&self, name: &str) -> (crate::hub::OutboundRx, OutboundMeter) {
         let (tx, rx) = mpsc::unbounded_channel();
         let (outbound, meter) = Outbound::new(tx);
         let (reply, wait) = oneshot::channel();
@@ -84,11 +84,11 @@ impl Rig {
 
 const MESSAGE_BYTES: usize = ENTRY_OVERHEAD + 1 + 8;
 
-fn drain(rx: &mut mpsc::UnboundedReceiver<Box<Packet>>, meter: &OutboundMeter) -> Vec<u64> {
+fn drain(rx: &mut crate::hub::OutboundRx, meter: &OutboundMeter) -> Vec<u64> {
     let mut seen = Vec::new();
     while let Ok(packet) = rx.try_recv() {
         meter.drained(&packet);
-        let Packet::Publish(p) = *packet else {
+        let Some(Packet::Publish(p)) = packet.into_packet() else {
             panic!("unexpected packet")
         };
         assert_eq!(p.qos, QoS::AtMostOnce);

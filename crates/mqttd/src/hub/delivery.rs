@@ -1016,14 +1016,18 @@ impl Hub {
         match &member.node {
             Some(node) => {
                 if let Some(peer) = self.peers.get(node) {
-                    let _ = peer.tx.send(PeerMessage::SharedDeliver {
-                        client: member.client.0.to_string(),
-                        topic,
-                        payload: payload.to_vec(),
-                        qos: delivered_qos as u8,
-                        message_expiry,
-                        app: app_to_wire(&app),
-                    });
+                    let _ = peer.tx.send(events::origin_frame(
+                        peer,
+                        PeerMessage::SharedDeliver {
+                            client: member.client.0.to_string(),
+                            topic,
+                            payload: payload.to_vec(),
+                            qos: delivered_qos as u8,
+                            message_expiry,
+                            app: app_to_wire(&app),
+                        },
+                        &app,
+                    ));
                 }
             }
             None => {
@@ -1625,19 +1629,23 @@ impl Hub {
                     topic = %message.topic,
                     "outbound queue full: shedding QoS 0 for a subscriber that is not reading"
                 );
+                self.note_delivery_dropped(client, "queue_full", message, retain, message_expiry);
                 return false;
             }
-            if !tx.send(publish_packet(
-                &message.topic,
-                message.payload.clone(),
-                QoS::AtMostOnce,
-                None,
-                false,
-                retain,
-                message_expiry,
-                &message.app,
-                &self.matching_sub_ids(client, &message.topic),
-            )) {
+            if !tx.send_from(
+                publish_packet(
+                    &message.topic,
+                    message.payload.clone(),
+                    QoS::AtMostOnce,
+                    None,
+                    false,
+                    retain,
+                    message_expiry,
+                    &message.app,
+                    &self.matching_sub_ids(client, &message.topic),
+                ),
+                self.delivery_origin(&message.app),
+            ) {
                 self.reap_closed_connection(client, true);
                 return false;
             }
@@ -1678,6 +1686,15 @@ impl Hub {
                     }
                 }
                 warn_backlog_eviction(client, &evicted, bytes, &limits);
+                for (e, _) in &evicted {
+                    self.note_delivery_dropped(
+                        client,
+                        "queue_full",
+                        &e.message,
+                        e.retain,
+                        e.message_expiry,
+                    );
+                }
                 // Nothing will deliver the evicted messages, so their offsets no longer
                 // hold the truncation point back.
                 self.truncate_acked(client);
@@ -1755,17 +1772,20 @@ impl Hub {
         // finding A — reachable only from the drain): no packet id, no pending
         // entry, no quota — it goes straight out in its FIFO slot.
         if message.qos == QoS::AtMostOnce {
-            if !tx.send(publish_packet(
-                &message.topic,
-                message.payload.clone(),
-                QoS::AtMostOnce,
-                None,
-                false,
-                retain,
-                message_expiry,
-                &message.app,
-                &self.matching_sub_ids(client, &message.topic),
-            )) {
+            if !tx.send_from(
+                publish_packet(
+                    &message.topic,
+                    message.payload.clone(),
+                    QoS::AtMostOnce,
+                    None,
+                    false,
+                    retain,
+                    message_expiry,
+                    &message.app,
+                    &self.matching_sub_ids(client, &message.topic),
+                ),
+                self.delivery_origin(&message.app),
+            ) {
                 self.reap_closed_connection(client, true);
                 return QosSend::Sent;
             }
@@ -1820,17 +1840,20 @@ impl Hub {
                 offset,
             },
         );
-        let _ = tx.send(publish_packet(
-            &message.topic,
-            message.payload.clone(),
-            message.qos,
-            Some(pkid),
-            false,
-            retain,
-            message_expiry,
-            &message.app,
-            &self.matching_sub_ids(client, &message.topic),
-        ));
+        let _ = tx.send_from(
+            publish_packet(
+                &message.topic,
+                message.payload.clone(),
+                message.qos,
+                Some(pkid),
+                false,
+                retain,
+                message_expiry,
+                &message.app,
+                &self.matching_sub_ids(client, &message.topic),
+            ),
+            self.delivery_origin(&message.app),
+        );
         QosSend::Sent
     }
 

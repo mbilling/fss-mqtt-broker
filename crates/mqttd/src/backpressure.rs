@@ -557,6 +557,7 @@ mod tests {
                 ("k1".to_string(), "value-one".to_string()), // 2 + 9
                 ("k2".to_string(), "v2".to_string()),        // 2 + 2
             ],
+            origin: None,
         };
         let props = 1 + 16 + (2 + 9) + (2 + 2);
         assert_eq!(message_bytes(&m), ENTRY_OVERHEAD + 5 + 100 + props);
@@ -603,6 +604,8 @@ mod tests {
             response_topic: Some("reply/here".into()),
             correlation_data: Some(bytes::Bytes::from_static(b"corr-id")),
             user_properties: vec![("tenant".into(), "acme".into())],
+            // Not a property and never on a client's wire: no bytes in either definition.
+            origin: None,
         };
         // Note there is no `..default()`: every field of `AppProperties` is set above, so
         // this identity covers EVERY forwardable property. If a field is added later this

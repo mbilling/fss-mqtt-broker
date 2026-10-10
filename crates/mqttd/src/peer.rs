@@ -828,6 +828,20 @@ fn forward_inbound(
     reply_ctl: &mpsc::WeakUnboundedSender<PeerMessage>,
     reply_bulk: &mpsc::WeakUnboundedSender<PeerMessage>,
 ) {
+    // A publish carrying its origin (ADR 0083; proto 13) is handled as the frame it
+    // stands for; the origin joins the message's properties, which is how it travels
+    // with the message from here on.
+    let (msg, origin) = if matches!(msg, PeerMessage::OriginPublish(_)) {
+        let (plain, origin) = msg.into_plain();
+        (plain, origin.map(crate::hub::origin_from_wire))
+    } else {
+        (msg, None)
+    };
+    let app_of = |app| {
+        let mut app = crate::hub::app_from_wire(app);
+        app.origin.clone_from(&origin);
+        app
+    };
     match msg {
         // The replication data path, with no task per frame. It carries every
         // durable message twice per node — a `Replicate` in and its ack out as a
@@ -905,6 +919,14 @@ fn forward_inbound(
                 filters,
             });
         }
+        PeerMessage::MessageEvents { wanted } => {
+            let _ = hub.send(HubCommand::RemoteMessageEvents {
+                node: remote.clone(),
+                wanted,
+            });
+        }
+        // Unwrapped above: `into_plain` never returns one.
+        PeerMessage::OriginPublish(_) => {}
         PeerMessage::Publish {
             topic,
             payload,
@@ -914,7 +936,7 @@ fn forward_inbound(
             app,
         } => {
             let qos = mqtt_codec::QoS::from_u8(qos).unwrap_or(mqtt_codec::QoS::AtMostOnce);
-            let app = crate::hub::app_from_wire(app);
+            let app = app_of(app);
             let body = payload.len() + app.accounted_bytes();
             let Ok(credit) = peer_credit(ingress, qos, retain, topic.len(), body) else {
                 return;
@@ -946,7 +968,7 @@ fn forward_inbound(
                 qos: mqtt_codec::QoS::from_u8(qos).unwrap_or(mqtt_codec::QoS::AtMostOnce),
                 retain,
                 message_expiry,
-                app: crate::hub::app_from_wire(app),
+                app: app_of(app),
                 origin: None,
                 replay: false,
             });
@@ -970,7 +992,7 @@ fn forward_inbound(
                 qos: mqtt_codec::QoS::from_u8(qos).unwrap_or(mqtt_codec::QoS::AtMostOnce),
                 retain,
                 message_expiry,
-                app: crate::hub::app_from_wire(app),
+                app: app_of(app),
                 origin: Some(origin),
                 replay,
             });
@@ -1006,7 +1028,7 @@ fn forward_inbound(
                 payload: payload.into(),
                 qos: mqtt_codec::QoS::from_u8(qos).unwrap_or(mqtt_codec::QoS::AtMostOnce),
                 message_expiry,
-                app: crate::hub::app_from_wire(app),
+                app: app_of(app),
             });
         }
         PeerMessage::SharedInterest { groups } => {
@@ -1043,7 +1065,7 @@ fn forward_inbound(
             app,
         } => {
             let qos = mqtt_codec::QoS::from_u8(qos).unwrap_or(mqtt_codec::QoS::AtMostOnce);
-            let app = crate::hub::app_from_wire(app);
+            let app = app_of(app);
             let body = payload.len() + app.accounted_bytes();
             let Ok(credit) = peer_credit(ingress, qos, false, topic.len(), body) else {
                 return;

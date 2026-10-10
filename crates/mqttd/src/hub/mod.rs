@@ -47,7 +47,7 @@ use mqtt_codec::{
 };
 use mqtt_core::filter_index::FilterIndex;
 use mqtt_core::{
-    parse_shared, topic_matches, AppProperties, ClientId, FilterKey, Message,
+    parse_shared, topic_matches, AppProperties, ClientId, FilterKey, Message, Origin,
     SharedSubscriptionTable, Subscription, SubscriptionTable,
 };
 use mqtt_storage::app_props::AppProps;
@@ -70,6 +70,9 @@ pub mod admin;
 mod forwarding;
 use forwarding::{ForwardKind, ForwardObligation, InterestIndex, PendingPublish};
 mod delivery;
+/// The rule engine's message events, as far as the hub decides them (ADR 0083).
+mod events;
+pub(crate) use events::origin_from_wire;
 mod lanes;
 mod qos2;
 #[allow(clippy::wildcard_imports)] // an intra-hub module split (#258): the five
@@ -277,9 +280,61 @@ pub struct RemoteSharedGroup {
 /// single-owner exactness of [`BacklogQueue::bytes`].
 #[derive(Clone, Debug)]
 pub struct Outbound {
-    tx: mpsc::UnboundedSender<Box<Packet>>,
+    tx: mpsc::UnboundedSender<Box<Outgoing>>,
     shared: Arc<OutboundShared>,
 }
+
+/// What the hub queues for one client's connection task.
+#[derive(Debug)]
+pub enum Outgoing {
+    /// A packet to write.
+    Packet {
+        /// The packet.
+        packet: Packet,
+        /// For a PUBLISH, who published its message ([`Origin`]) — set only while a
+        /// rule selects a message event the connection raises at the delivery
+        /// (`$events/message/delivered`, `acked`, a `too_large` `delivery_dropped`;
+        /// ADR 0083), and only for a message that still carries one.
+        origin: Option<Arc<Origin>>,
+    },
+    /// A message event the hub decided, for this connection's task to raise (ADR
+    /// 0083): nothing is written to the client.
+    Note(Box<crate::rules::MessageNote>),
+}
+
+impl Outgoing {
+    /// The packet to write, when this is one.
+    #[must_use]
+    pub fn packet(&self) -> Option<&Packet> {
+        match self {
+            Self::Packet { packet, .. } => Some(packet),
+            Self::Note(_) => None,
+        }
+    }
+
+    /// The packet to write, when this is one.
+    #[must_use]
+    pub fn into_packet(self) -> Option<Packet> {
+        match self {
+            Self::Packet { packet, .. } => Some(packet),
+            Self::Note(_) => None,
+        }
+    }
+}
+
+/// The hub's own tests read what it queued as the packets they are.
+#[cfg(test)]
+impl std::ops::Deref for Outgoing {
+    type Target = Packet;
+
+    fn deref(&self) -> &Packet {
+        self.packet()
+            .expect("a test read a message note as a packet")
+    }
+}
+
+/// The connection's end of an [`Outbound`].
+pub type OutboundRx = mpsc::UnboundedReceiver<Box<Outgoing>>;
 
 /// What the hub and a connection's writer share about one outbound channel: the
 /// queue's depth and bytes, and why the hub closed it. One allocation per connection.
@@ -350,12 +405,16 @@ pub struct OutboundMeter {
 }
 
 impl OutboundMeter {
-    /// One packet left the channel for the socket. Call it with the packet **as
-    /// received**, before any outbound rewrite: add and subtract are then the same pure
-    /// function of the same immutable packet, which is what makes the counter return to
-    /// zero rather than drift.
-    pub fn drained(&self, packet: &Packet) {
+    /// One item left the channel — a packet for the socket, or a note. Call it with
+    /// the packet **as received**, before any outbound rewrite: add and subtract are
+    /// then the same pure function of the same immutable packet, which is what makes
+    /// the counter return to zero rather than drift. A note counted toward the depth
+    /// and has no bytes.
+    pub fn drained(&self, out: &Outgoing) {
         self.shared.depth.fetch_sub(1, Ordering::Relaxed);
+        let Outgoing::Packet { packet, .. } = out else {
+            return;
+        };
         let n = packet_bytes(packet);
         // Saturating rather than wrapping: a counter that went momentarily negative
         // would read as ~18 EiB and pin the `QoS` 0 gate shut forever.
@@ -379,7 +438,7 @@ impl Outbound {
     /// Wrap a channel, returning the sender and the meter its reader must call as it
     /// drains.
     #[must_use]
-    pub fn new(tx: mpsc::UnboundedSender<Box<Packet>>) -> (Self, OutboundMeter) {
+    pub fn new(tx: mpsc::UnboundedSender<Box<Outgoing>>) -> (Self, OutboundMeter) {
         let shared = Arc::new(OutboundShared::default());
         (
             Self {
@@ -401,6 +460,12 @@ impl Outbound {
     /// the same way — the packet is dropped and a Detach is already in flight — so
     /// this is a plain bool rather than a `Result` carrying a whole `Packet` back.
     pub fn send(&self, packet: Packet) -> bool {
+        self.send_from(packet, None)
+    }
+
+    /// [`send`](Self::send) a PUBLISH with who published its message, for the message
+    /// events the connection raises (see [`Outgoing::Packet`]).
+    pub fn send_from(&self, packet: Packet, origin: Option<Arc<Origin>>) -> bool {
         let n = packet_bytes(&packet);
         self.shared.depth.fetch_add(1, Ordering::Relaxed);
         self.shared.bytes.fetch_add(n, Ordering::Relaxed);
@@ -412,13 +477,41 @@ impl Outbound {
         // its CONNECT variant, which cannot travel this hub-to-client channel at
         // all. The box costs one allocation per QUEUED packet, so a connection
         // that only publishes never pays it.
-        if self.tx.send(Box::new(packet)).is_err() {
+        if self
+            .tx
+            .send(Box::new(Outgoing::Packet { packet, origin }))
+            .is_err()
+        {
             // Never queued, so never drained: keep both counts honest.
             self.shared.depth.fetch_sub(1, Ordering::Relaxed);
             self.shared.bytes.fetch_sub(n, Ordering::Relaxed);
             return false;
         }
         true
+    }
+
+    /// Queue a message event for the connection's task to raise. It counts toward the
+    /// depth like a packet, so a client that has stopped reading sheds notes exactly
+    /// where it sheds `QoS` 0: when the queue is at [`MAX_OUTBOUND_QUEUE`], or
+    /// the connection is gone, the note is handed back unqueued.
+    ///
+    /// # Errors
+    /// The note itself, when it was not queued.
+    pub fn note(
+        &self,
+        note: Box<crate::rules::MessageNote>,
+    ) -> Result<(), Box<crate::rules::MessageNote>> {
+        if self.depth() >= MAX_OUTBOUND_QUEUE {
+            return Err(note);
+        }
+        self.shared.depth.fetch_add(1, Ordering::Relaxed);
+        self.tx.send(Box::new(Outgoing::Note(note))).map_err(|e| {
+            self.shared.depth.fetch_sub(1, Ordering::Relaxed);
+            match *e.0 {
+                Outgoing::Note(note) => note,
+                Outgoing::Packet { .. } => unreachable!("a note was sent"),
+            }
+        })
     }
 
     /// Packets queued for this client but not yet written to its socket.
@@ -1498,6 +1591,15 @@ pub enum HubCommand {
         /// The dead node.
         node: NodeId,
     },
+    /// A peer said whether its rules select a message event (ADR 0083; proto 13):
+    /// while they do, publishes forwarded to it carry their origin
+    /// ([`PeerMessage::OriginPublish`]), and every publish here is stamped with one.
+    RemoteMessageEvents {
+        /// The announcing node.
+        node: NodeId,
+        /// Whether it wants origins.
+        wanted: bool,
+    },
     /// A peer announced its current subscription interest (full snapshot).
     RemoteInterest {
         /// The announcing node.
@@ -1887,6 +1989,7 @@ impl HubCommand {
             | Self::PeerDisconnected { .. }
             | Self::PeerDead { .. }
             | Self::RemoteInterest { .. }
+            | Self::RemoteMessageEvents { .. }
             | Self::RemoteSharedInterest { .. }
             | Self::InheritedSessions { .. }
             | Self::Flush { .. }
@@ -1993,6 +2096,11 @@ struct Peer {
     /// index → `PeerCodecError::Serde` → `io::Error` → link teardown and redial, i.e.
     /// a flap loop. See [`Hub::peer_proto`].
     proto: u32,
+    /// Whether the peer's rules select a message event — it said so on this link
+    /// ([`PeerMessage::MessageEvents`]) — so publishes forwarded to it carry their
+    /// origin ([`PeerMessage::OriginPublish`]). `false` until it says otherwise, and
+    /// always for a link below proto 13.
+    wants_origin: bool,
     /// The remote leaf certificate's serial (big-endian bytes) from the link's
     /// mTLS handshake — the fact a cluster-CRL revocation sweep re-checks
     /// (ADR 0040 T4). `None` on a plaintext mesh.
@@ -2301,6 +2409,9 @@ pub struct Hub {
     authz: Option<AuthzWatch>,
     /// The rule engine (ADR 0083), for Wills; `None` until [`HubCommand::AttachRules`].
     rules: Option<crate::rules::Rules>,
+    /// What the hub keeps for the rule engine's message events (ADR 0083): which of
+    /// them the loaded rules select, and where it hands the drops it notices.
+    events: events::State,
     /// Brownout (ADR 0041 T5 disk, T8 memory): set while **any** watched resource is
     /// over its watermark — the stores' on-disk size above `MQTTD_STORE_MAX_BYTES`, or
     /// process RSS above `MQTTD_MEMORY_MAX_BYTES`. Growth writes (new retained topics,
@@ -2775,6 +2886,7 @@ impl Hub {
                 durable_retained: None,
                 authz: None,
                 rules: None,
+                events: events::State::default(),
                 brownout: false,
                 brownout_axes: HashSet::new(),
                 brownout_status: None,
@@ -3138,6 +3250,9 @@ impl Hub {
     /// The once-a-second sweep: expiry, cleanup, gauges, retransmits, lane reaping.
     async fn run_sweep(&mut self) {
         let started = Instant::now();
+        // An idle hub still tells its peers, within a tick, that a reload changed
+        // whether its rules select a message event (ADR 0083).
+        self.refresh_message_wants();
         self.sweep_expired_sessions().await;
         self.submit_pending_qos2_cleanup();
         self.refresh_gauges().await;
@@ -3178,6 +3293,7 @@ impl Hub {
     // One arm per command; a flat dispatch table, not a refactor smell.
     #[allow(clippy::too_many_lines)]
     async fn dispatch(&mut self, cmd: HubCommand) {
+        self.refresh_message_wants();
         match cmd {
             HubCommand::Attach {
                 client,
@@ -3416,7 +3532,7 @@ impl Hub {
                 self.authz = Some(watch);
             }
             HubCommand::AttachRules(rules) => {
-                self.rules = Some(rules);
+                self.attach_rules(rules);
             }
             // Peer- and cluster-facing commands.
             other => self.dispatch_cluster(other).await,
@@ -3683,6 +3799,18 @@ impl Hub {
                 let sync = if matched == 0 && self.routing_unsettled() {
                     DurableOutcome::Failed
                 } else {
+                    // Settled, and nobody here wanted it after all: the route the
+                    // origin forwarded on was stale.
+                    if matched == 0 && matches!(durable, DurableOutcome::Ok) {
+                        self.note_unrouted_forward(
+                            &topic,
+                            &payload,
+                            qos,
+                            retain,
+                            message_expiry,
+                            &app,
+                        );
+                    }
                     durable
                 };
                 // Answered now if no lane job was submitted; otherwise folded into
@@ -3785,7 +3913,7 @@ impl Hub {
                 if self.peer_reserved_refused(&topic, qos, retain) {
                     return;
                 }
-                let _ = self
+                let (_, matched) = self
                     .deliver(
                         &topic,
                         &payload,
@@ -3797,6 +3925,9 @@ impl Hub {
                         &peer_plain_gate(&topic),
                     )
                     .await;
+                if matched == 0 {
+                    self.note_unrouted_forward(&topic, &payload, qos, retain, message_expiry, &app);
+                }
             }
             HubCommand::PeerConnected {
                 node,
@@ -3849,6 +3980,9 @@ impl Hub {
                 let _ = reply.send(());
             }
             HubCommand::Admin(request) => self.admin(request).await,
+            HubCommand::RemoteMessageEvents { node, wanted } => {
+                self.remote_message_events(&node, wanted);
+            }
             HubCommand::RemoteInterest { node, filters } => {
                 debug!(node = %node.0, filters = filters.len(), "remote interest updated");
                 // The peer's view is AUTHORITATIVE (it never gossips before it
@@ -4119,6 +4253,14 @@ impl Hub {
         } else {
             gate.map_or(AppendGate::None, AppendGate::Pending)
         };
+        // The rule engine's drop events (ADR 0083), when a rule selects one: whether
+        // the publisher's own No Local subscription matches — `ordinary_targets`
+        // leaves it out, and EMQX counts that session as reached — is read here,
+        // before the fan-out; the rest is what the fan-out finds.
+        let wants = self.events.wants;
+        let reportable = (wants.dropped || wants.delivery_dropped) && !live_only;
+        let no_local =
+            reportable && publisher.is_some_and(|p| self.delivery_terms(p, topic).no_local);
         // `plan_refusal(true)` can only ever be Brownout, so the shared peek — a
         // full plan of every matching group, measured at ~26% of the hub loop's
         // publish dispatch with the durable plane OFF — is only worth computing
@@ -4184,7 +4326,29 @@ impl Hub {
                 self.pending_fan_out_reached(id);
             }
         }
-        self.forward_to_peers(topic, payload, qos, retain, message_expiry, app, gate);
+        let wanted_remotely =
+            self.forward_to_peers(topic, payload, qos, retain, message_expiry, app, gate);
+        if reportable {
+            let message = events::Published {
+                topic,
+                payload,
+                qos,
+                retain,
+                message_expiry,
+                app,
+            };
+            if no_local {
+                if let Some(p) = publisher {
+                    self.note_no_local(p, &message);
+                }
+            }
+            // Reached nobody, on any node: no ordinary subscriber here (the
+            // publisher's own No Local one counts, as in EMQX), no shared group
+            // that placed it, and no peer with a subscriber for it.
+            if matched == 0 && !no_local && !shared_placed && !wanted_remotely {
+                self.note_no_subscribers(publisher, &message);
+            }
+        }
         // Durable retained (ADR 0037): after the live fan-out — which stays undelayed —
         // route the retained mutation to its topic's group lease-owner for the
         // quorum-committed authority write. Only the **landing** node routes (a
@@ -4226,27 +4390,40 @@ impl Hub {
             self.count_reserved_drop();
             return;
         }
+        let facts = crate::rules::PublishFacts {
+            client,
+            publisher: &will.publisher,
+            topic: &w.topic,
+            payload: &w.payload,
+            qos: w.qos,
+            retain: w.retain,
+            app: &w.app,
+            message_expiry: None,
+        };
+        // A Will is a message from its client to the message events too: it carries
+        // an origin while a rule here or on a peer selects one of them.
+        let origin = self.rules.as_ref().and_then(|r| r.hub_origin(&facts));
+        let stamped = origin.clone().map(|origin| AppProperties {
+            origin: Some(origin),
+            ..w.app.clone()
+        });
         self.publish(
-            &w.topic, &w.payload, w.qos, w.retain, None, &w.app, None, None, false,
+            &w.topic,
+            &w.payload,
+            w.qos,
+            w.retain,
+            None,
+            stamped.as_ref().unwrap_or(&w.app),
+            None,
+            None,
+            false,
         )
         .await;
         let Some(rules) = &self.rules else { return };
         let self_tx = &self.self_tx;
-        rules.on_will(
-            &crate::rules::PublishFacts {
-                client,
-                publisher: &will.publisher,
-                topic: &w.topic,
-                payload: &w.payload,
-                qos: w.qos,
-                retain: w.retain,
-                app: &w.app,
-                message_expiry: None,
-            },
-            |cmd| {
-                let _ = self_tx.send(cmd);
-            },
-        );
+        rules.on_will_from(&facts, origin.as_deref(), |cmd| {
+            let _ = self_tx.send(cmd);
+        });
     }
 
     /// Log when a persistent session attaches on a node that is not its placement
@@ -4708,7 +4885,7 @@ impl Hub {
                         Packet::PubRel((*pkid).into())
                     }
                 };
-                let _ = outbound.send(packet);
+                let _ = outbound.send_from(packet, self.delivery_origin(&p.message.app));
             }
         }
 
@@ -4823,7 +5000,7 @@ impl Hub {
                             &self.matching_sub_ids(&client, &qm.message.topic),
                         )
                     };
-                    let _ = outbound.send(packet);
+                    let _ = outbound.send_from(packet, self.delivery_origin(&qm.message.app));
                     continue;
                 }
                 // A queued message that only a revoked grant admits is dropped
@@ -4848,6 +5025,8 @@ impl Hub {
                 match qm.expiry_at {
                     Some(deadline) if deadline <= now => {
                         debug!(client = %client.0, offset = qm.offset, "dropping expired queued message");
+                        // EMQX's `expired`. Its interval has run out: none is left.
+                        self.note_delivery_dropped(&client, "expired", &qm.message, false, Some(0));
                     }
                     Some(deadline) => {
                         let remaining = u32::try_from(deadline - now).unwrap_or(u32::MAX);
@@ -7327,6 +7506,7 @@ impl Hub {
         // ADR 0073: remember the negotiated proto across link flaps (removed only
         // on confirmed death) — the ownership-domain capability check reads this.
         self.known_peer_protos.insert(node.clone(), proto);
+        let node_for_events = node.clone();
         self.peers.insert(
             node,
             Peer {
@@ -7337,8 +7517,10 @@ impl Hub {
                 cert_serial,
                 interest_synced: false,
                 proto,
+                wants_origin: false,
             },
         );
+        self.tell_message_events(Some(&node_for_events));
         // A link (re)forming while gated publishes are held: schedule a scan so
         // the settle pass re-runs against the now-visible peer state (its
         // Interest snapshot arrives with the link) and releases what it can.
@@ -7359,6 +7541,7 @@ impl Hub {
         }
         info!(peer = %node.0, "peer link lost");
         self.peers.remove(node);
+        self.recompute_peers_want_origin();
         // The peer's INTEREST is kept (ADR 0042 T9): a link-down peer is not a
         // dead peer, and its subscribers are still owed matching publishes — a
         // gated forward to it becomes a held obligation that retransmits when the
@@ -7383,6 +7566,7 @@ impl Hub {
     /// link's pump on whichever side still holds the socket open.
     fn peer_dead(&mut self, node: &NodeId) {
         let had_link = self.peers.remove(node).is_some();
+        self.recompute_peers_want_origin();
         // A dead origin retransmits nothing: its forwards died with it, and a
         // successor sends under its own seqs (issue #648).
         self.forward_windows.remove(node);
@@ -7559,14 +7743,18 @@ impl Hub {
             if let Some(m) = &self.metrics {
                 m.publish_forwarded("shared-remote");
             }
-            let _ = peer.tx.send(PeerMessage::SharedDeliver {
-                client: client.0.to_string(),
-                topic: topic.to_string(),
-                payload: payload.to_vec(),
-                qos: qos as u8,
-                message_expiry,
-                app: app_to_wire(app),
-            });
+            let _ = peer.tx.send(events::origin_frame(
+                peer,
+                PeerMessage::SharedDeliver {
+                    client: client.0.to_string(),
+                    topic: topic.to_string(),
+                    payload: payload.to_vec(),
+                    qos: qos as u8,
+                    message_expiry,
+                    app: app_to_wire(app),
+                },
+                app,
+            ));
         }
     }
 }
@@ -7581,7 +7769,26 @@ impl Hub {
 /// KIND: a shared obligation must retransmit `SharedDeliverAcked` targeted at its
 /// chosen member, never a fan-out `PublishAcked` (which the receiver would deliver to
 /// every matching ordinary subscriber instead).
+///
+/// `with_origin` is whether the link's far end asked for origins (ADR 0083): the frame
+/// then carries the publish's, when it has one, as [`PeerMessage::OriginPublish`].
 fn forward_frame(
+    id: u64,
+    p: &PendingPublish,
+    seq: u64,
+    obligation: &ForwardObligation,
+    proto: u32,
+    with_origin: bool,
+) -> PeerMessage {
+    let frame = plain_forward_frame(id, p, seq, obligation, proto);
+    match &p.app().origin {
+        Some(origin) if with_origin => frame.with_origin(events::origin_to_wire(origin)),
+        _ => frame,
+    }
+}
+
+/// [`forward_frame`], before its origin.
+fn plain_forward_frame(
     id: u64,
     p: &PendingPublish,
     seq: u64,
@@ -7657,6 +7864,8 @@ pub(crate) fn app_from_wire(w: mqtt_cluster::peer::WireAppProps) -> AppPropertie
         response_topic: w.response_topic,
         correlation_data: w.correlation_data.map(Bytes::from),
         user_properties: w.user_properties,
+        // Carried beside the properties, by `PeerMessage::OriginPublish`.
+        origin: None,
     }
 }
 
@@ -7930,6 +8139,7 @@ async fn recover_once(
 #[cfg(test)]
 mod tests {
     mod forward_repeat;
+    mod message_events;
     mod pending_gauges;
     mod qos2_retirement;
     mod remote_group_index;
@@ -8403,7 +8613,7 @@ mod tests {
         client: &str,
         conn_id: u64,
         clean_session: bool,
-    ) -> (mpsc::UnboundedReceiver<Box<Packet>>, bool) {
+    ) -> (crate::hub::OutboundRx, bool) {
         let expiry = if clean_session { 0 } else { u32::MAX };
         attach_v5(tx, client, conn_id, clean_session, expiry).await
     }
@@ -8416,7 +8626,7 @@ mod tests {
         conn_id: u64,
         clean_start: bool,
         session_expiry: u32,
-    ) -> (mpsc::UnboundedReceiver<Box<Packet>>, bool) {
+    ) -> (crate::hub::OutboundRx, bool) {
         attach_full(tx, client, conn_id, clean_start, session_expiry, u16::MAX).await
     }
 
@@ -8428,7 +8638,7 @@ mod tests {
         clean_start: bool,
         session_expiry: u32,
         receive_maximum: u16,
-    ) -> (mpsc::UnboundedReceiver<Box<Packet>>, bool) {
+    ) -> (crate::hub::OutboundRx, bool) {
         let (out_tx, out_rx) = {
             let (t, r) = mpsc::unbounded_channel();
             (Outbound::new(t).0, r)
@@ -8468,7 +8678,7 @@ mod tests {
         conn_id: u64,
         clean_start: bool,
         will: Message,
-    ) -> (mpsc::UnboundedReceiver<Box<Packet>>, bool) {
+    ) -> (crate::hub::OutboundRx, bool) {
         // Delay 0: these predate Will Delay and assert the publish-at-once path.
         let will = Will {
             publisher: crate::rules::Publisher::default(),
@@ -8784,7 +8994,7 @@ mod tests {
             .await
             .expect("delivery")
             .expect("a packet");
-        assert!(matches!(*pkt, Packet::Publish(_)));
+        assert!(matches!(pkt.packet(), Some(Packet::Publish(_))));
 
         let out = metrics.render();
         assert!(
@@ -9164,11 +9374,11 @@ mod tests {
         }
     }
 
-    async fn recv_packet(rx: &mut mpsc::UnboundedReceiver<Box<Packet>>) -> Option<Packet> {
+    async fn recv_packet(rx: &mut crate::hub::OutboundRx) -> Option<Packet> {
         let boxed = timeout(Duration::from_millis(300), rx.recv())
             .await
             .ok()??;
-        Some(*boxed)
+        boxed.into_packet()
     }
 
     /// How long [`recv_peer`] waits for a frame it EXPECTS. A bounded poll, so a passing
@@ -10164,7 +10374,7 @@ mod tests {
     /// label once across the whole shared group. Bounded by `deadline` — a phase
     /// that cannot finish inside it has failed, not "not recovered yet".
     async fn drain_shared(
-        rxs: &mut [mpsc::UnboundedReceiver<Box<Packet>>],
+        rxs: &mut [crate::hub::OutboundRx],
         want: usize,
         deadline: Instant,
     ) -> HashSet<String> {
@@ -10335,10 +10545,10 @@ mod tests {
     /// and each must rotate over its own members on its own schedule.
     #[tokio::test]
     async fn two_groups_on_one_filter_rotate_independently() {
-        async fn count(rx: &mut mpsc::UnboundedReceiver<Box<Packet>>) -> usize {
+        async fn count(rx: &mut crate::hub::OutboundRx) -> usize {
             let mut n = 0;
             while let Ok(Some(pkt)) = timeout(Duration::from_millis(200), rx.recv()).await {
-                if !matches!(*pkt, Packet::Publish(_)) {
+                if !matches!(pkt.packet(), Some(Packet::Publish(_))) {
                     break;
                 }
                 n += 1;
@@ -12736,6 +12946,7 @@ mod tests {
                         direct_dispatch: false,
                         dup_flag: true,
                     },
+                    None,
                     Some(dtx),
                 ),
                 gated: true,
@@ -13542,7 +13753,7 @@ mod tests {
         .await
         .expect("the connection must be closed, not left attached with an unread queue");
         assert!(
-            matches!(closed.as_deref(), Some(Packet::Disconnect(d)) if d.reason == mqtt_codec::reason::SERVER_BUSY),
+            matches!(closed.as_deref().and_then(crate::hub::Outgoing::packet), Some(Packet::Disconnect(d)) if d.reason == mqtt_codec::reason::SERVER_BUSY),
             "a v5 client is told the server is busy (0x89) before the close; got {closed:?}"
         );
 
@@ -17285,7 +17496,7 @@ mod tests {
     }
 
     /// Wait for the rehome close (`0x9C` Use another server) on a v5 client's socket.
-    async fn await_rehome_disconnect(out: &mut mpsc::UnboundedReceiver<Box<Packet>>) {
+    async fn await_rehome_disconnect(out: &mut crate::hub::OutboundRx) {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
         loop {
             match recv_packet(out).await {
@@ -17310,7 +17521,7 @@ mod tests {
         tx: &HubTx,
         client: &str,
         conn_id: u64,
-    ) -> mpsc::UnboundedReceiver<Box<Packet>> {
+    ) -> crate::hub::OutboundRx {
         attach_persistent_v5_full(tx, client, conn_id, u32::MAX, None).await
     }
 
@@ -17323,7 +17534,7 @@ mod tests {
         conn_id: u64,
         session_expiry: u32,
         will: Option<Will>,
-    ) -> mpsc::UnboundedReceiver<Box<Packet>> {
+    ) -> crate::hub::OutboundRx {
         let (out_tx, out_rx) = {
             let (t, r) = mpsc::unbounded_channel();
             (Outbound::new(t).0, r)
@@ -19973,7 +20184,7 @@ mod tests {
         // retransmission. That is a duplicate at QoS 2.
         match timeout(Duration::from_millis(750), rx2.recv()).await {
             Err(_) | Ok(None) => {}
-            Ok(Some(packet)) => match *packet {
+            Ok(Some(packet)) => match **packet {
                 Packet::PubRel(_) => {}
                 Packet::Publish(ref pub_) => {
                     assert_eq!(
@@ -21532,7 +21743,7 @@ mod tests {
     async fn sys_watching_hub() -> (
         HubTx,
         Arc<mqtt_observability::metrics::Metrics>,
-        mpsc::UnboundedReceiver<Box<Packet>>,
+        crate::hub::OutboundRx,
     ) {
         let metrics = Arc::new(mqtt_observability::metrics::Metrics::new("t"));
         let (mut hub, tx) = Hub::with_config(
@@ -21548,10 +21759,7 @@ mod tests {
 
     /// The next deliveries to `rx` are exactly `expected` (topic, payload), each `QoS` 0
     /// and not retained, and then nothing.
-    async fn expect_only(
-        rx: &mut mpsc::UnboundedReceiver<Box<Packet>>,
-        expected: &[(&str, &[u8])],
-    ) {
+    async fn expect_only(rx: &mut crate::hub::OutboundRx, expected: &[(&str, &[u8])]) {
         for (topic, payload) in expected {
             match recv_packet(rx).await {
                 Some(Packet::Publish(p)) => {

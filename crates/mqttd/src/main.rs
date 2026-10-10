@@ -4772,7 +4772,7 @@ fn rule_test_cli() -> ! {
                 sockname: "127.0.0.1:1883".parse().ok(),
                 node: "rule-test",
             };
-            sample = mqtt_rules::EventInput::sample(kind, &client, &topic, qos);
+            sample = mqtt_rules::EventInput::sample_message(kind, &client, &topic, qos, &payload);
             eprintln!("(a sample {} event)", kind.event_name());
             &sample
         }

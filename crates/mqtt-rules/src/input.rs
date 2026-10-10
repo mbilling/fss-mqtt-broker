@@ -19,7 +19,7 @@ use mqtt_core::AppProperties;
 use crate::value::{Map, Value};
 use crate::{Input, Republish};
 
-/// A client/session event a rule can select `FROM` (`"$events/…"`).
+/// A client, session or message event a rule can select `FROM` (`"$events/…"`).
 ///
 /// The set, names and topics are EMQX's (`emqx_rule_events:event_names/0`,
 /// `event_topics_enum/0`, `event_name/1`). The events EMQX raises that mqttd does not
@@ -45,6 +45,18 @@ pub enum EventKind {
     SessionSubscribed,
     /// `$events/session/unsubscribed` (also `$events/session_unsubscribed`).
     SessionUnsubscribed,
+    /// `$events/message/delivered` (also `$events/message_delivered`): a PUBLISH sent
+    /// to a subscriber, once per subscriber per send (a resend fires again).
+    MessageDelivered,
+    /// `$events/message/acked` (also `$events/message_acked`): a subscriber's PUBACK
+    /// (`QoS` 1) or PUBREC (`QoS` 2) for a message delivered to it.
+    MessageAcked,
+    /// `$events/message/dropped` (also `$events/message_dropped`): a publish that
+    /// reached no subscriber.
+    MessageDropped,
+    /// `$events/message/delivery_dropped` (also `$events/delivery_dropped`): a
+    /// message dropped on its way to one subscriber.
+    DeliveryDropped,
 }
 
 /// Every event topic EMQX accepts in a `FROM` — `emqx_rule_events:event_topics_enum/0`,
@@ -78,10 +90,16 @@ pub const EMQX_EVENT_TOPICS: &[(&str, Option<EventKind>)] = &[
         "$events/session/unsubscribed",
         Some(EventKind::SessionUnsubscribed),
     ),
-    ("$events/message/delivered", None),
-    ("$events/message/acked", None),
-    ("$events/message/dropped", None),
-    ("$events/message/delivery_dropped", None),
+    (
+        "$events/message/delivered",
+        Some(EventKind::MessageDelivered),
+    ),
+    ("$events/message/acked", Some(EventKind::MessageAcked)),
+    ("$events/message/dropped", Some(EventKind::MessageDropped)),
+    (
+        "$events/message/delivery_dropped",
+        Some(EventKind::DeliveryDropped),
+    ),
     ("$events/message_transformation/failed", None),
     ("$events/schema_validation/failed", None),
     ("$events/client_connected", Some(EventKind::ClientConnected)),
@@ -106,10 +124,13 @@ pub const EMQX_EVENT_TOPICS: &[(&str, Option<EventKind>)] = &[
         "$events/session_unsubscribed",
         Some(EventKind::SessionUnsubscribed),
     ),
-    ("$events/message_delivered", None),
-    ("$events/message_acked", None),
-    ("$events/message_dropped", None),
-    ("$events/delivery_dropped", None),
+    (
+        "$events/message_delivered",
+        Some(EventKind::MessageDelivered),
+    ),
+    ("$events/message_acked", Some(EventKind::MessageAcked)),
+    ("$events/message_dropped", Some(EventKind::MessageDropped)),
+    ("$events/delivery_dropped", Some(EventKind::DeliveryDropped)),
     ("$events/message_transformation_failed", None),
     ("$events/schema_validation_failed", None),
 ];
@@ -125,7 +146,16 @@ pub struct EventMatch {
 
 impl EventKind {
     /// How many kinds there are.
-    pub const COUNT: usize = 8;
+    pub const COUNT: usize = 12;
+
+    /// The four message events: the ones a message's [`mqtt_core::Origin`] is carried
+    /// for.
+    pub const MESSAGE: [EventKind; 4] = [
+        EventKind::MessageDelivered,
+        EventKind::MessageAcked,
+        EventKind::MessageDropped,
+        EventKind::DeliveryDropped,
+    ];
 
     /// Every kind, in a fixed order (the index into per-kind tables).
     pub const ALL: [EventKind; Self::COUNT] = [
@@ -137,6 +167,10 @@ impl EventKind {
         EventKind::CheckAuthzComplete,
         EventKind::SessionSubscribed,
         EventKind::SessionUnsubscribed,
+        EventKind::MessageDelivered,
+        EventKind::MessageAcked,
+        EventKind::MessageDropped,
+        EventKind::DeliveryDropped,
     ];
 
     /// Parse a `FROM` entry naming one event. Both EMQX spellings (5.10+ namespaced and
@@ -193,6 +227,10 @@ impl EventKind {
             Self::CheckAuthzComplete => "$events/auth/check_authz_complete",
             Self::SessionSubscribed => "$events/session/subscribed",
             Self::SessionUnsubscribed => "$events/session/unsubscribed",
+            Self::MessageDelivered => "$events/message/delivered",
+            Self::MessageAcked => "$events/message/acked",
+            Self::MessageDropped => "$events/message/dropped",
+            Self::DeliveryDropped => "$events/message/delivery_dropped",
         }
     }
 
@@ -208,6 +246,10 @@ impl EventKind {
             Self::CheckAuthzComplete => "client.check_authz_complete",
             Self::SessionSubscribed => "session.subscribed",
             Self::SessionUnsubscribed => "session.unsubscribed",
+            Self::MessageDelivered => "message.delivered",
+            Self::MessageAcked => "message.acked",
+            Self::MessageDropped => "message.dropped",
+            Self::DeliveryDropped => "delivery.dropped",
         }
     }
 
@@ -221,6 +263,10 @@ impl EventKind {
             Self::CheckAuthzComplete => 5,
             Self::SessionSubscribed => 6,
             Self::SessionUnsubscribed => 7,
+            Self::MessageDelivered => 8,
+            Self::MessageAcked => 9,
+            Self::MessageDropped => 10,
+            Self::DeliveryDropped => 11,
         }
     }
 }
@@ -302,8 +348,10 @@ pub fn now_ms() -> i64 {
 
 /// EMQX's message `id`: 128 bits rendered as 32 upper-case hex digits — here the
 /// microsecond clock, a per-process salt and a counter, so ids are unique per node
-/// without a random draw per message. Generated only when a rule reads `id`.
-fn message_id() -> Arc<str> {
+/// without a random draw per message. Generated only when a rule reads `id`, or when
+/// the message carries a [`mqtt_core::Origin`] for the message events.
+#[must_use]
+pub fn new_message_id() -> u128 {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     static SALT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     let salt = *SALT.get_or_init(|| {
@@ -317,7 +365,12 @@ fn message_id() -> Arc<str> {
     // Wrapping is fine: uniqueness comes from the clock + counter together.
     #[allow(clippy::cast_possible_truncation)]
     let seq = COUNTER.fetch_add(1, Ordering::Relaxed) as u32;
-    Arc::from(format!("{micros:016X}{salt:08X}{seq:08X}"))
+    (u128::from(micros) << 64) | (u128::from(salt) << 32) | u128::from(seq)
+}
+
+/// A message id as the `id` field shows it.
+fn id_text(id: u128) -> Arc<str> {
+    Arc::from(format!("{id:032X}"))
 }
 
 fn opt_str(s: Option<&str>) -> Value {
@@ -445,6 +498,10 @@ pub struct PublishInput<'a> {
     /// Whether `flags` has `dup` (always `false`): every message but one republished
     /// from an event, or from a message that was ([`Republish::dup_flag`]).
     pub dup_flag: bool,
+    /// The message's id when it already has one — its [`mqtt_core::Origin`]'s, so the
+    /// message events report the `id` this publish's rules saw; `None` draws one when
+    /// a rule first reads `id`.
+    pub message_id: Option<u128>,
     id: OnceCell<Arc<str>>,
     received: OnceCell<i64>,
     /// `timestamp`, read once per message so every reference agrees.
@@ -479,6 +536,7 @@ impl<'a> PublishInput<'a> {
             republished_by: None,
             republish_depth: 0,
             dup_flag: true,
+            message_id: None,
             id: OnceCell::new(),
             received: OnceCell::new(),
             stamped: OnceCell::new(),
@@ -544,7 +602,11 @@ const PUBLISH_FIELDS: &[&str] = &[
 impl Input for PublishInput<'_> {
     fn field(&self, name: &str) -> Value {
         match name {
-            "id" => Value::Str(self.id.get_or_init(message_id).clone()),
+            "id" => Value::Str(
+                self.id
+                    .get_or_init(|| id_text(self.message_id.unwrap_or_else(new_message_id)))
+                    .clone(),
+            ),
             "clientid" => Value::from(self.clientid),
             "username" => opt_str(self.username),
             "payload" => Value::from_bytes(self.payload),
@@ -655,11 +717,49 @@ impl ConnInfo {
     }
 }
 
-/// A client/session event, as a rule's `FROM "$events/…"` sees it.
+/// A client, session or message event, as a rule's `FROM "$events/…"` sees it.
 #[derive(Debug, Clone)]
 pub struct EventInput {
     kind: EventKind,
     fields: Map,
+    /// For a message event, what of its message is not a field.
+    message: Option<MessagePart>,
+}
+
+/// What a message event keeps of its message beside its fields: the raw payload
+/// (`payload.<field>`), the user properties a republish may copy, and EMQX's
+/// `republish_by` header — a rule does not republish from an event about a message it
+/// republished itself.
+#[derive(Debug, Clone)]
+struct MessagePart {
+    payload: Bytes,
+    user_properties: Vec<(String, String)>,
+    republished_by: Option<String>,
+    republish_depth: u32,
+}
+
+/// The message a message event is about (`$events/message/delivered`, `acked`,
+/// `dropped`, `delivery_dropped`).
+#[derive(Debug, Clone, Copy)]
+pub struct EventMessage<'a> {
+    /// Who published it, when the message still carries that. `None` shows
+    /// `from_clientid` and `from_username` (for `message.dropped`: `clientid`,
+    /// `username`, `peerhost` and `peername`) as `undefined`, a fresh `id`, and the
+    /// event's own time as `publish_received_at`.
+    pub origin: Option<&'a mqtt_core::Origin>,
+    /// The topic.
+    pub topic: &'a str,
+    /// The payload.
+    pub payload: &'a Bytes,
+    /// The `QoS`: the delivery's for `delivered` and `acked`, the message's otherwise.
+    pub qos: u8,
+    /// `flags.retain`.
+    pub retain: bool,
+    /// `flags.dup`.
+    pub dup: bool,
+    /// The user properties, in wire order: what a republish asking for the publisher's
+    /// (`user_properties = "${pub_props.'User-Property'}"`) copies.
+    pub user_properties: &'a [(String, String)],
 }
 
 fn int(n: impl Into<i64>) -> Value {
@@ -704,6 +804,148 @@ impl EventInput {
         self.kind
     }
 
+    fn of(kind: EventKind, fields: Map) -> Self {
+        Self {
+            kind,
+            fields,
+            message: None,
+        }
+    }
+
+    /// What the four message events share (`eventmsg_delivered/2`, `eventmsg_acked/2`,
+    /// `eventmsg_dropped/2`, `eventmsg_delivery_dropped/3`): `id`, `payload`, `topic`,
+    /// `qos`, `flags`, `pub_props`, `publish_received_at` and `with_basic_columns/3`.
+    /// `pub_props` is the message's properties as it stood when the event fired,
+    /// printed ([`printable_props`]).
+    fn message(kind: EventKind, node: &str, msg: &EventMessage<'_>, pub_props: Map) -> Self {
+        let now = now_ms();
+        let mut m = Map::with_capacity(20);
+        m.insert("event", Value::from(kind.event_name()));
+        m.insert(
+            "id",
+            Value::Str(id_text(msg.origin.map_or_else(new_message_id, |o| o.id))),
+        );
+        m.insert("payload", Value::from_bytes(msg.payload));
+        m.insert("topic", Value::from(msg.topic));
+        m.insert("qos", int(msg.qos));
+        let mut flags = Map::with_capacity(2);
+        flags.insert("dup", Value::Bool(msg.dup));
+        flags.insert("retain", Value::Bool(msg.retain));
+        m.insert("flags", Value::from(flags));
+        m.insert("pub_props", Value::from(pub_props));
+        m.insert(
+            "publish_received_at",
+            Value::Int(msg.origin.map_or(now, |o| o.received_at_ms)),
+        );
+        m.insert("timestamp", Value::Int(now));
+        m.insert("node", Value::from(node));
+        Self {
+            kind,
+            fields: m,
+            message: Some(MessagePart {
+                payload: msg.payload.clone(),
+                user_properties: msg.user_properties.to_vec(),
+                republished_by: msg
+                    .origin
+                    .filter(|o| o.republished)
+                    .map(|o| o.clientid.clone()),
+                republish_depth: msg.origin.map_or(0, |o| o.republish_depth),
+            }),
+        }
+    }
+
+    /// The sender and the receiver of a delivery: `from_clientid` and `from_username`
+    /// (the publisher), `clientid`, `username`, `peerhost` and `peername` (the
+    /// subscriber). All six are always present, `undefined` where unknown, as EMQX's
+    /// builders set them.
+    fn delivery(mut self, receiver: &ClientInfo, msg: &EventMessage<'_>) -> Self {
+        let m = &mut self.fields;
+        m.insert(
+            "from_clientid",
+            opt_str(msg.origin.map(|o| o.clientid.as_str())),
+        );
+        m.insert(
+            "from_username",
+            opt_str(msg.origin.and_then(|o| o.username.as_deref())),
+        );
+        m.insert("clientid", Value::from(receiver.clientid));
+        m.insert("username", opt_str(receiver.username));
+        m.insert("peerhost", host(receiver.peer));
+        m.insert("peername", sock_name(receiver.peer));
+        self
+    }
+
+    /// `$events/message/delivered` (`eventmsg_delivered/2`): a PUBLISH sent to
+    /// `receiver`. `qos` is the delivery's, `flags.dup` set on a resend, and
+    /// `pub_props` the properties of the PUBLISH as sent — the publisher's, with the
+    /// subscription's `Subscription-Identifier` and the remaining
+    /// `Message-Expiry-Interval`.
+    #[must_use]
+    pub fn message_delivered(
+        receiver: &ClientInfo,
+        msg: &EventMessage<'_>,
+        pub_props: Map,
+    ) -> Self {
+        Self::message(EventKind::MessageDelivered, receiver.node, msg, pub_props)
+            .delivery(receiver, msg)
+    }
+
+    /// `$events/message/acked` (`eventmsg_acked/2`): `receiver`'s PUBACK or PUBREC for
+    /// a delivery — [`message_delivered`](Self::message_delivered)'s fields, plus
+    /// `puback_props`, the acknowledgement's properties, printed.
+    #[must_use]
+    pub fn message_acked(
+        receiver: &ClientInfo,
+        msg: &EventMessage<'_>,
+        pub_props: Map,
+        puback_props: Map,
+    ) -> Self {
+        let mut ev = Self::message(EventKind::MessageAcked, receiver.node, msg, pub_props)
+            .delivery(receiver, msg);
+        ev.fields.insert("puback_props", Value::from(puback_props));
+        ev
+    }
+
+    /// `$events/message/dropped` (`eventmsg_dropped/2`): a publish that reached no
+    /// subscriber (`reason`: `no_subscribers`). `clientid`, `username`, `peerhost` and
+    /// `peername` are the PUBLISHER's, from the message's origin.
+    #[must_use]
+    pub fn message_dropped(
+        node: &str,
+        msg: &EventMessage<'_>,
+        pub_props: Map,
+        reason: &str,
+    ) -> Self {
+        let mut ev = Self::message(EventKind::MessageDropped, node, msg, pub_props);
+        let m = &mut ev.fields;
+        m.insert("reason", Value::from(reason));
+        m.insert("clientid", opt_str(msg.origin.map(|o| o.clientid.as_str())));
+        m.insert(
+            "username",
+            opt_str(msg.origin.and_then(|o| o.username.as_deref())),
+        );
+        m.insert("peerhost", host(msg.origin.and_then(|o| o.peer)));
+        m.insert("peername", sock_name(msg.origin.and_then(|o| o.peer)));
+        ev
+    }
+
+    /// `$events/message/delivery_dropped` (`eventmsg_delivery_dropped/3`): a message
+    /// dropped on its way to `receiver` — [`message_delivered`](Self::message_delivered)'s
+    /// fields, plus `reason`: EMQX's `no_local`, `expired`, `queue_full` or `qos0_msg`,
+    /// or mqttd's own `too_large`.
+    #[must_use]
+    pub fn delivery_dropped(
+        receiver: &ClientInfo,
+        msg: &EventMessage<'_>,
+        pub_props: Map,
+        reason: &str,
+    ) -> Self {
+        let mut ev = Self::message(EventKind::DeliveryDropped, receiver.node, msg, pub_props)
+            .delivery(receiver, msg);
+        ev.fields.insert("reason", Value::from(reason));
+        ev
+    }
+
     /// `$events/client/connected` (`eventmsg_connected/2`). `expiry_interval` is in
     /// seconds here (EMQX divides its milliseconds by 1000 for this event only).
     #[must_use]
@@ -721,7 +963,7 @@ impl EventInput {
         m.insert("conn_props", Value::from(conn.conn_props.clone()));
         m.insert("connected_at", Value::Int(connected_at_ms));
         Self::attrs(&mut m);
-        Self { kind, fields: m }
+        Self::of(kind, m)
     }
 
     /// `$events/client/disconnected` (`eventmsg_disconnected/3`). `reason` uses
@@ -745,7 +987,7 @@ impl EventInput {
         let at = m.get("timestamp").cloned().unwrap_or_default();
         m.insert("disconnected_at", at);
         Self::attrs(&mut m);
-        Self { kind, fields: m }
+        Self::of(kind, m)
     }
 
     /// `$events/client/connack` (`eventmsg_connack/2`). `reason_code` is EMQX's name for
@@ -774,7 +1016,7 @@ impl EventInput {
             m.insert("connected_at", Value::Int(at));
         }
         m.insert("conn_props", Value::from(conn.conn_props.clone()));
-        Self { kind, fields: m }
+        Self::of(kind, m)
     }
 
     /// `$events/client/ping` (`eventmsg_ping/2`): the connection's facts, with
@@ -792,7 +1034,7 @@ impl EventInput {
             Value::Int(i64::from(conn.expiry_interval) * 1000),
         );
         m.insert("conn_props", Value::from(conn.conn_props.clone()));
-        Self { kind, fields: m }
+        Self::of(kind, m)
     }
 
     /// `$events/auth/check_authn_complete` (`eventmsg_check_authn_complete/2`):
@@ -808,7 +1050,7 @@ impl EventInput {
         m.insert("is_anonymous", Value::Bool(is_anonymous));
         m.insert("is_superuser", Value::Bool(false));
         Self::attrs(&mut m);
-        Self { kind, fields: m }
+        Self::of(kind, m)
     }
 
     /// `$events/auth/check_authz_complete` (`eventmsg_check_authz_complete/5`):
@@ -837,7 +1079,7 @@ impl EventInput {
             Value::from(if allowed { "allow" } else { "deny" }),
         );
         Self::attrs(&mut m);
-        Self { kind, fields: m }
+        Self::of(kind, m)
     }
 
     /// `session.subscribed` and `session.unsubscribed` (`eventmsg_sub_or_unsub/4`).
@@ -858,7 +1100,7 @@ impl EventInput {
         m.insert("qos", int(qos));
         m.insert(props_key, Value::from(props));
         Self::attrs(&mut m);
-        Self { kind, fields: m }
+        Self::of(kind, m)
     }
 
     /// `$events/session/subscribed`, one per granted filter: `qos` is the granted
@@ -892,12 +1134,53 @@ impl EventInput {
 
     /// A sample of `kind` for a dry run (`mqttd --rule-test`, the admin API), EMQX's
     /// "SQL test" for event rules: the client's own fields, the given `topic` and `qos`
-    /// for the subscribe and authorization events, and plausible values for the rest
-    /// ([`ConnInfo::sample`], a `normal` disconnect one second after connecting, a
-    /// `success` CONNACK and authentication, a publish the ACL file allowed).
+    /// for the subscribe, authorization and message events, and plausible values for
+    /// the rest ([`ConnInfo::sample`], a `normal` disconnect one second after
+    /// connecting, a `success` CONNACK and authentication, a publish the ACL file
+    /// allowed). A message event's message has the payload `{"msg": "hello"}`
+    /// ([`sample_message`](Self::sample_message) takes one).
     #[must_use]
     pub fn sample(kind: EventKind, c: &ClientInfo, topic: &str, qos: u8) -> Self {
+        Self::sample_message(
+            kind,
+            c,
+            topic,
+            qos,
+            &Bytes::from_static(br#"{"msg": "hello"}"#),
+        )
+    }
+
+    /// [`sample`](Self::sample), with the payload of a message event's message: one
+    /// the client published itself just now, and — for `delivered`, `acked` and
+    /// `delivery_dropped` — was the subscriber of. The drop reasons are the ones EMQX's
+    /// SQL test starts from: `no_subscribers` and `queue_full`.
+    #[must_use]
+    pub fn sample_message(
+        kind: EventKind,
+        c: &ClientInfo,
+        topic: &str,
+        qos: u8,
+        payload: &Bytes,
+    ) -> Self {
         let now = now_ms();
+        let origin = mqtt_core::Origin {
+            id: new_message_id(),
+            clientid: c.clientid.to_string(),
+            username: c.username.map(str::to_string),
+            peer: c.peer,
+            received_at_ms: now,
+            republished: false,
+            republish_depth: 0,
+        };
+        let msg = EventMessage {
+            origin: Some(&origin),
+            topic,
+            payload,
+            qos,
+            retain: false,
+            dup: false,
+            user_properties: &[],
+        };
         let conn = ConnInfo::sample();
         let no_props = || printable_props::<&str, &str>(&[], []);
         match kind {
@@ -913,6 +1196,12 @@ impl EventInput {
             }
             EventKind::SessionSubscribed => Self::session_subscribed(c, topic, qos, no_props()),
             EventKind::SessionUnsubscribed => Self::session_unsubscribed(c, topic, qos, no_props()),
+            EventKind::MessageDelivered => Self::message_delivered(c, &msg, no_props()),
+            EventKind::MessageAcked => Self::message_acked(c, &msg, no_props(), no_props()),
+            EventKind::MessageDropped => {
+                Self::message_dropped(c.node, &msg, no_props(), "no_subscribers")
+            }
+            EventKind::DeliveryDropped => Self::delivery_dropped(c, &msg, no_props(), "queue_full"),
         }
     }
 }
@@ -930,5 +1219,26 @@ impl Input for EventInput {
 
     fn all_fields(&self) -> Map {
         self.fields.clone()
+    }
+
+    fn payload(&self) -> Option<&Bytes> {
+        self.message.as_ref().map(|m| &m.payload)
+    }
+
+    fn user_properties(&self) -> &[(String, String)] {
+        self.message.as_ref().map_or(&[], |m| &m.user_properties)
+    }
+
+    fn republished_by(&self) -> Option<&str> {
+        self.message.as_ref()?.republished_by.as_deref()
+    }
+
+    fn republish_depth(&self) -> u32 {
+        self.message.as_ref().map_or(0, |m| m.republish_depth)
+    }
+
+    /// A message event has `flags`, `dup` included.
+    fn has_dup_flag(&self) -> bool {
+        self.message.is_some()
     }
 }

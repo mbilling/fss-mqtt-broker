@@ -123,6 +123,43 @@ pub struct AppProperties {
     pub correlation_data: Option<bytes::Bytes>,
     /// User Properties, in wire order (`0x26`, repeatable).
     pub user_properties: Vec<(String, String)>,
+    /// Who published the message ([`Origin`]), carried with it for the rule engine's
+    /// message events (ADR 0083). Not an MQTT property and never on a client's wire:
+    /// it rides here because this block is what travels with a message through every
+    /// delivery path. `None` unless a rule somewhere in the cluster selects a message
+    /// event, so a broker without such rules never allocates one.
+    pub origin: Option<std::sync::Arc<Origin>>,
+}
+
+/// Who published a message and when, as the rule engine's message events report it
+/// (`$events/message/delivered`, `acked`, `dropped`, `delivery_dropped`; ADR 0083):
+/// EMQX's message `id`, `from`, and its `username`/`peerhost` headers and `timestamp`.
+///
+/// One allocation per publish, shared by every delivery of it, made only while a rule
+/// selects one of those events on this node or a peer asked for it. It is kept in
+/// memory with the message — in the in-flight table, the flow-control backlog, the
+/// in-memory offline queue and retained store — but is not part of the durable record:
+/// a message read back from disk has none.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Origin {
+    /// The message id: 128 bits, unique per publish. Rendered as 32 hex digits.
+    pub id: u128,
+    /// The publisher's client id (for a rule's republish, the rule's id).
+    pub clientid: String,
+    /// The publisher's CONNECT username, when it sent one.
+    pub username: Option<String>,
+    /// The publisher's address, when its listener knew it.
+    pub peer: Option<std::net::SocketAddr>,
+    /// When the broker received the publish, milliseconds since the Unix epoch.
+    pub received_at_ms: i64,
+    /// Whether a rule republished it: `clientid` is then that rule's id (EMQX's
+    /// `republish_by` header), and that rule does not republish again from an event
+    /// about it.
+    pub republished: bool,
+    /// How many republishes the message is from the publish, Will or event that
+    /// started its chain, events about it included: what stops rules that republish
+    /// into each other through the message events.
+    pub republish_depth: u32,
 }
 
 impl AppProperties {
@@ -152,7 +189,8 @@ impl AppProperties {
                 .sum::<usize>()
     }
 
-    /// Whether no forwardable application property is present (the common case).
+    /// Whether there is nothing here to carry: no forwardable application property (the
+    /// common case) and no [`Origin`].
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.payload_format.is_none()
@@ -160,6 +198,7 @@ impl AppProperties {
             && self.response_topic.is_none()
             && self.correlation_data.is_none()
             && self.user_properties.is_empty()
+            && self.origin.is_none()
     }
 }
 
