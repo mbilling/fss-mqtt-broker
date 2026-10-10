@@ -22,7 +22,7 @@ struct Rig {
     received: Arc<AtomicUsize>,
     changed: Arc<Notify>,
     tasks: Vec<tokio::task::JoinHandle<()>>,
-    held: Vec<mpsc::UnboundedReceiver<Box<Packet>>>,
+    held: Vec<mqttd::hub::OutboundRx>,
 }
 
 impl Drop for Rig {
@@ -57,7 +57,7 @@ impl Rig {
     }
 
     async fn attach(&mut self, name: &str, draining: bool) {
-        let (tx, mut rx) = mpsc::unbounded_channel::<Box<Packet>>();
+        let (tx, mut rx) = mpsc::unbounded_channel::<Box<mqttd::hub::Outgoing>>();
         let (outbound, meter) = Outbound::new(tx);
         if draining {
             let received = self.received.clone();
@@ -65,7 +65,7 @@ impl Rig {
             self.tasks.push(tokio::spawn(async move {
                 while let Some(packet) = rx.recv().await {
                     meter.drained(&packet);
-                    assert!(matches!(*packet, Packet::Publish(ref p) if p.qos == QoS::AtMostOnce));
+                    assert!(matches!(packet.packet(), Some(Packet::Publish(p)) if p.qos == QoS::AtMostOnce));
                     received.fetch_add(1, Ordering::Relaxed);
                     changed.notify_one();
                 }

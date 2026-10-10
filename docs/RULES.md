@@ -310,7 +310,11 @@ from `--clientid`, `--username`, and for `session/subscribed`, `session/unsubscr
 `127.0.0.1:52345`, `sockname` `127.0.0.1:1883`, `node` `rule-test`; a connect is MQTT 5
 with keepalive 60, clean start, expiry 0 and no properties; a disconnect's `reason` is
 `normal`; a CONNACK and an authentication succeed; an authorization is a publish the ACL
-file allowed ([Events](#events-from-events)). It names the sample on stderr, as
+file allowed ([Events](#events-from-events)). A message event's sample is a message the
+client published just now on `--topic`, at `--qos`, with `--payload`, and — for
+`message/delivered`, `message/acked` and `message/delivery_dropped` — was itself the
+subscriber of; a dropped one's `reason` is `no_subscribers`, a dropped delivery's
+`queue_full` (the values EMQX's SQL test starts from). It names the sample on stderr, as
 `(a sample client.connected event)`, and prints the outputs on stdout:
 
 ```console
@@ -321,8 +325,9 @@ $ mqttd --rule-test --sql 'SELECT clientid, event, proto_ver, keepalive FROM "$e
 When the statement names more than one event, it runs against the first one named;
 `--event` picks another (`client.connected`, `client.disconnected`, `client.connack`,
 `client.ping`, `client.check_authn_complete`, `client.check_authz_complete`,
-`session.subscribed` or `session.unsubscribed`, or their topic forms, such as
-`client/disconnected` or `auth/check_authz_complete`):
+`session.subscribed`, `session.unsubscribed`, `message.delivered`, `message.acked`,
+`message.dropped` or `delivery.dropped`, or their topic forms, such as
+`client/disconnected` or `message/delivery_dropped`):
 
 ```console
 $ mqttd --rule-test --sql 'SELECT clientid, event, reason FROM "$events/client/connected", "$events/client/disconnected"' --event client.disconnected --clientid sensor-7
@@ -1129,9 +1134,15 @@ Both EMQX spellings work, for example `$events/client/connected` and
 `$events/client_connected` (`client/ping` has only the one, as in EMQX). A `FROM` filter
 with a wildcard selects every event whose topic it matches, as EMQX's does:
 `"$events/client/+"` selects the four client events, `"$events/auth/#"` the two
-authentication and authorization events, `"$events/#"` all of them. A filter that matches
-only events mqttd does not raise (`"$events/message/+"`) is refused at load; one that
-also matches some (`"$events/#"`) loads, with a warning that names them.
+authentication and authorization events, `"$events/message/+"` the four
+[message events](#message-events), `"$events/#"` all of them. A filter that matches only
+events mqttd does not raise (`"$events/sys/+"`, the alarms) is refused at load; one that
+also matches some it does (`"$events/#"`) loads, with a warning that names the ones it
+does not.
+
+`"$events/#"` includes the message events, which are raised per delivery: a rule that
+selects them is evaluated for every message every subscriber is sent
+([what they cost](#message-events)). Select the events you mean.
 
 Every event has `event` (EMQX's hook name, such as `client.connected`), `timestamp` (when
 it was raised, in milliseconds), `node`, `clientid` and `username` (`undefined` when the
@@ -1204,8 +1215,8 @@ What the values are:
 
 An event no rule selects costs nothing: the broker checks for a rule before it builds the
 event, which matters for `client/ping` and `auth/check_authz_complete`, raised on every
-PINGREQ and every publish. An event has no `payload`, so a republish from an event rule
-needs one of its own:
+PINGREQ and every publish. A client, session or authorization event has no `payload`, so
+a republish from a rule on one needs one of its own:
 
 ```toml
 [rules.presence]
@@ -1226,9 +1237,121 @@ reason.)
 The cookbook's [presence recipe](RULES-COOKBOOK.md#11-device-presence-from-connect-and-disconnect-events)
 keeps one retained status per device.
 
-The message events (`message/delivered`, `message/acked`, `message/dropped`,
-`message/delivery_dropped`), the alarm events and the schema validation and message
-transformation events are not raised. A rule that selects one by name is refused at load.
+The alarm events (`sys/alarm_activated`, `sys/alarm_deactivated`) and the schema
+validation and message transformation events are not raised: mqttd has no alarms, schema
+registry or message transformations. A rule that selects one by name is refused at load.
+
+### Message events
+
+Four events follow a message after its publish, as in EMQX
+(`emqx_rule_events:eventmsg_delivered/2`, `eventmsg_acked/2`, `eventmsg_dropped/2`,
+`eventmsg_delivery_dropped/3`), each also under its older spelling:
+
+| Event | Also | Raised |
+|---|---|---|
+| `$events/message/delivered` | `$events/message_delivered` | For every PUBLISH the broker sends a subscriber, at any QoS: once per subscriber per send. A resend when a session resumes is a delivery again, with `flags.dup` `true`. A queued message is delivered when it is sent, not when it is queued. |
+| `$events/message/acked` | `$events/message_acked` | When the subscriber acknowledges a delivery: its PUBACK at QoS 1, its PUBREC at QoS 2 (not again at the PUBCOMP). Never at QoS 0. |
+| `$events/message/dropped` | `$events/message_dropped` | When a publish reaches no subscriber: `reason` is `no_subscribers`. |
+| `$events/message/delivery_dropped` | `$events/delivery_dropped` | When a message is dropped on its way to one subscriber; `reason` says why. |
+
+Their fields are EMQX's, with its names, types and values (checked against EMQX 6.3.1's
+output for the same exchanges):
+
+| Field | Value |
+|---|---|
+| `id` | The message's id: the one its publish's rules saw, and the same on every event about it |
+| `from_clientid`, `from_username` | The publisher's client id and username (`delivered`, `acked`, `delivery_dropped`). For a message a rule republished, the rule's id and `undefined` |
+| `clientid`, `username`, `peerhost`, `peername` | The **subscriber's** on `delivered`, `acked` and `delivery_dropped`; the **publisher's** on `dropped`. Always present, `undefined` where there is none |
+| `topic`, `payload` | The message's. `payload.<field>` reads it as JSON, as on a publish |
+| `qos` | The delivery's QoS on `delivered` and `acked` (a QoS 1 publish to a QoS 0 subscription is delivered, and reported, at 0); the message's on the two drop events |
+| `flags` | `{"dup": …, "retain": …}` as sent: `dup` on a resend, `retain` on a retained message sent at subscribe (or to a Retain As Published subscription) |
+| `pub_props` | The PUBLISH's properties as sent: the publisher's, the subscription's `Subscription-Identifier` (when several of the client's subscriptions match, mqttd sends one PUBLISH carrying each identifier, and this shows one of them), and what is left of its `Message-Expiry-Interval`; on the drop events, the publisher's |
+| `puback_props` | `acked` only: the PUBACK's or PUBREC's properties (`Reason-String`, user properties), `{"User-Property": {}}` when it carried none |
+| `reason` | The two drop events: see below |
+| `publish_received_at` | When the broker received the publish |
+| `event`, `timestamp`, `node` | `message.delivered`, `message.acked`, `message.dropped` or `delivery.dropped`; when the event was raised; the node that raised it |
+
+```toml
+[rules.undelivered]
+sql = '''
+SELECT clientid, from_clientid, topic, reason
+FROM "$events/message/delivery_dropped"
+'''
+actions = [
+  { function = "republish", args = { topic = "ops/undelivered/${clientid}", payload = "${.}", qos = 0 } },
+]
+```
+
+**Why a delivery was dropped** (`delivery_dropped`'s `reason`):
+
+| `reason` | When |
+|---|---|
+| `no_local` | The subscriber published the message itself, to a topic it subscribes with No Local. It is both parties of the event. |
+| `expired` | A message queued for an offline session outlived its Message Expiry Interval; raised when the session resumes. Its `Message-Expiry-Interval` reads `0` (EMQX shows the interval it was published with). |
+| `queue_full` | The subscriber's queue had no room: an offline session's queue under `reject-newest` refused the message; a slow subscriber's flow-control backlog evicted its oldest; or a QoS 0 message was shed for a subscriber that has stopped reading. |
+| `too_large` | The message exceeds the subscriber's Maximum Packet Size. **mqttd only**: EMQX counts this drop and raises no event for it. No `delivered` is raised for the packet that was not sent. |
+
+EMQX's other reasons do not occur: `qos0_msg` (its `mqueue_store_qos0 = false`; mqttd
+queues QoS 0 for an offline persistent session) and `subscription_filter` (mqttd has no
+subscription filters). Not every mqttd drop raises the event: an offline session's queue
+under the default `drop-oldest` evicts its oldest message without reading it back, so it
+raises none for it (EMQX reports the evicted message), and the broker's own overload
+sheds (`mqttd_publish_dropped_total` reasons `append-backlog-full`,
+`outbound-id-write-failed`, `retained-replay-client-offline`, `peer-backlog`) raise none
+either.
+
+`message/dropped` is raised for a publish with no subscriber on any node — no
+subscription matches, no shared group takes it, and no peer has a subscriber for it.
+A queue for an offline session is a subscriber, and so is the publisher's own No Local
+subscription (that is a dropped *delivery*, as in EMQX). A retained publish nobody
+subscribes to is dropped too: keeping it for later subscribers is not delivering it. A
+publish the broker refuses (the ACL, a quota) is not a drop. EMQX's other two reasons,
+`packet_identifier_inuse` and `receive_maximum_exceeded`, are raised for an inbound QoS 2
+publish as EMQX raises them: one that reuses, without the DUP flag, a packet id still
+waiting for its PUBREL (a resend *with* DUP is a retransmission and raises nothing), and
+one beyond the Receive Maximum (which mqttd then disconnects for).
+
+**Where they are raised.** `delivered`, `acked` and `delivery_dropped` on the
+subscriber's node, `dropped` on the node the publish arrived at — and, as in EMQX, on a
+node a publish was forwarded to when its subscriber there has just gone. Rules are a
+per-node file, so each node raises them for its own rules. A session that is offline has
+no connection to ask: a `delivery_dropped` for it knows its `clientid` only, and
+`username`, `peerhost` and `peername` are `undefined` (EMQX's session remembers them).
+
+**Who published it.** What these events say about the publisher — `id`,
+`from_clientid`, `from_username`, `publish_received_at`, and `message/dropped`'s client
+fields — travels with the message from the node it was published on, including across
+the cluster. It is not part of the durable record. When a message no longer carries it
+the events are still raised: the publisher's fields are `undefined`, `id` is a fresh one,
+and `publish_received_at` is the event's own time. That is the case for
+
+- a message read back from disk: one replayed from a persistent session's queue when
+  the session resumes, or a retained message sent at subscribe, on a node with a
+  persistent store (the in-memory stores keep it);
+- a message forwarded by a node running a release before these events (a rolling
+  upgrade), or published elsewhere in the second before that node learned this node's
+  rules select them.
+
+**Loops.** A rule that republishes from a message event does not republish again from
+the event about its own republished message, so a subscriber of what the rule publishes
+cannot drive it in a circle (EMQX's `republish_by` guard). Rules republishing into each
+other through these events stop 32 republishes deep, as rules republishing into each
+other's `FROM` do ([Republished messages](#republished-messages)); in EMQX they do not
+stop. A message that no longer carries its publisher has lost both guards: give such a
+rule a `WHERE` on `topic` that its own output does not match.
+
+**What they cost.** Nothing while no rule selects one: a publish, a delivery and an
+acknowledgement cost what they did before. While a rule here — or on another node of the
+cluster — selects one, each publish allocates one small record of its publisher, shared
+by all its deliveries, and nodes forward it to the nodes that asked. A rule on
+`message/delivered` or `message/acked` is then evaluated on the subscriber's connection
+task for every delivery, so it scales with connections as publish rules do
+([Where rules run](#where-rules-run-and-why-it-scales)), and a rule on
+`message/acked` keeps each unacknowledged delivery's message until its acknowledgement.
+The two drop events are noticed by the broker's routing task and evaluated elsewhere:
+on the connection of the client they are about, or, for a client that is not connected,
+on one task of their own — which sheds events, and says so in the log, if a flood of
+drops outruns it. The broker's own `$SYS` messages raise none of the four.
 
 ## Functions
 
@@ -1534,7 +1657,8 @@ mqttd accepts.
 |---|---|---|
 | Republished messages | Re-enter the rule engine unless `direct_dispatch = true`; only a rule's own output is guarded, so two rules republishing into each other recurse until the publisher's process is killed; a republished message is routed before the message it came from | Re-enter it unless `direct_dispatch = true`, with the same guard, but a chain stops 32 republishes deep and shares the original's limits; the original is routed first, then the derived messages in EMQX's order ([Republished messages](#republished-messages)) |
 | Actions | `republish`, `console`, data-integration sinks | `republish`, `console`. A sink reference is refused at load. |
-| Events | 16 event topics (6.2+): `sys/alarm_activated`, `sys/alarm_deactivated`, `client/connected`, `client/disconnected`, `client/connack`, `client/ping`, `auth/check_authn_complete`, `auth/check_authz_complete`, `session/subscribed`, `session/unsubscribed`, `message/delivered`, `message/acked`, `message/dropped`, `message/delivery_dropped`, `message_transformation/failed`, `schema_validation/failed`; a wildcard filter such as `$events/client/+` selects every event it matches | The 8 client, session and authentication events (`client/connected`, `client/disconnected`, `client/connack`, `client/ping`, `auth/check_authn_complete`, `auth/check_authz_complete`, `session/subscribed`, `session/unsubscribed`), with EMQX's fields. A wildcard filter selects the ones it matches; one that matches none of them is refused at load. Not the message, alarm, schema validation or message transformation events |
+| Events | 16 event topics (6.2+): `sys/alarm_activated`, `sys/alarm_deactivated`, `client/connected`, `client/disconnected`, `client/connack`, `client/ping`, `auth/check_authn_complete`, `auth/check_authz_complete`, `session/subscribed`, `session/unsubscribed`, `message/delivered`, `message/acked`, `message/dropped`, `message/delivery_dropped`, `message_transformation/failed`, `schema_validation/failed`; a wildcard filter such as `$events/client/+` selects every event it matches | The 12 client, session, authentication and message events (those, less the two alarm events and `message_transformation/failed` and `schema_validation/failed`), with EMQX's fields. A wildcard filter selects the ones it matches; one that matches none of them is refused at load |
+| Message events | Raised by the subscriber's session (`delivered`, `acked`, `delivery_dropped`) and by the broker on the node that found no subscriber (`dropped`). The message keeps its publisher everywhere, on disk included. A session keeps its client's username and address while offline. `delivery_dropped` reasons `expired`, `no_local`, `subscription_filter`, `qos0_msg`, `queue_full`; nothing for a packet too large for its subscriber | The same events, fields and nodes ([Message events](#message-events)). A message read back from disk, or forwarded by a node running an older release, has lost its publisher: `from_clientid` and `from_username` are `undefined`. An offline session's `delivery_dropped` has no `username` or address. Reasons `expired`, `no_local`, `queue_full`, and mqttd's own `too_large`; an offline queue's `drop-oldest` eviction raises none. Rules chained through these events stop 32 republishes deep |
 | `authz_source` | The source that decided: `file`, `built_in_database`, `http`, …, `superuser`, `default`, and `cache` for a decision its authorization cache answered | `file` or `default`: mqttd has the ACL file only, no superusers and no authorization cache |
 | Data-integration sources (`$bridges/…`, `$sources/…`) | Yes | No: refused at load |
 | Functions | 124 in the built-in reference, plus `jq`; every other export of `emqx_rule_funcs` is callable too | 120 of those 124, plus 23 EMQX exports without documenting (143 in all). `maptab_lookup`, `mongo_date`, `schema_encode`, `schema_decode`, `jq`, `term_encode`/`term_decode` and the state functions (`kv_store_*`, `proc_dict_*`; [ADR 0085](adr/0085-rule-state-store.md)) are refused at load. |

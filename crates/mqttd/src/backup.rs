@@ -1774,6 +1774,7 @@ fn app_props(p: &PropsRecord) -> Result<AppProperties, String> {
             None => None,
         },
         user_properties: p.user_properties.clone(),
+        origin: None,
     })
 }
 

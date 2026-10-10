@@ -632,3 +632,118 @@ Leftovers from verifying against EMQX 6.3.1, each probed there
 Not matched: `+`, `concat` and `str_utf8` of bytes that are not UTF-8 give EMQX the
 Erlang tuple `{incomplete, …}` (what `unicode:characters_to_binary/1` returns), which
 nothing downstream accepts; mqttd gives the text with replacement characters.
+
+## Amendment (2026-10-10): the message events
+
+Rules are to be EMQX-compatible without exception, and the four message events were the
+events mqttd still refused. Checked against `emqx_rule_events.erl` (`eventmsg_delivered/2`,
+`eventmsg_acked/2`, `eventmsg_dropped/2`, `eventmsg_delivery_dropped/3`, the hooks they
+attach to and `ignore_sys_message/1`), `emqx_channel.erl` (`do_deliver/2`,
+`process_puback/2`, `process_pubrec/2`, `after_message_acked/3`), `emqx_broker.erl`
+(`do_route/3`, `do_dispatch2/2`), `emqx_session.erl` (`enrich_message/4`,
+`on_dropped_qos2_msg/3`) and `emqx_session_events.erl` (emqx/emqx master), and probed on
+EMQX 6.3.1 with real clients and a `SELECT *` rule per event: every field set, and every
+value a test expects, is that broker's output.
+
+- **The events.** `$events/message/delivered` (`message.delivered`) for every PUBLISH
+  sent to a subscriber, a resend included; `message/acked` at the subscriber's PUBACK or
+  PUBREC (EMQX runs the hook in `process_pubrec`, not at the PUBCOMP), with
+  `puback_props`; `message/dropped` (`no_subscribers`, and for an inbound QoS 2 publish
+  EMQX's `packet_identifier_inuse` — a packet id reused without the DUP flag while it
+  awaits its PUBREL; a resend with DUP raises nothing, on 6.3.1 as here — and
+  `receive_maximum_exceeded`);
+  `message/delivery_dropped` (`delivery.dropped`: `no_local`, `expired`, `queue_full`).
+  Both spellings of each (`$events/message_delivered`, `$events/message_acked`,
+  `$events/message_dropped`, `$events/delivery_dropped`), and `"$events/message/+"` and
+  `"$events/#"` select them: EMQX's sixteen event topics less the four mqttd has no source
+  for (alarms, schema validation, message transformation).
+- **Where the SQL runs: never on the hub loop** (decision 1 stands). `delivered` and
+  `acked` are raised by the subscriber's connection task, where the PUBLISH is written and
+  the PUBACK/PUBREC read; it remembers an unacknowledged delivery by packet id only while
+  a rule selects `acked`. The two drop events are *decided* by the hub — it alone knows a
+  fan-out reached nobody, that a No Local subscription suppressed a copy, that a queue
+  refused or evicted a message — and it only hands what it noticed, as a `MessageNote`,
+  to a task: the connection task of the client the note is about (the publisher for
+  `dropped`, the subscriber for `delivery_dropped`), through that client's outbound
+  queue, or, for a client with no connection (an offline session, a Will, a rule's
+  republish, a forward from a peer), one notes task with a bounded queue that sheds, and
+  logs, when drops outrun it. The outbound queue's element is now `Outgoing`: a packet,
+  with its origin for a PUBLISH, or a note.
+- **Who published it travels with the message** as its `Origin` (the message id, the
+  publisher's client id, username and address, when it was received, and — for EMQX's
+  `republish_by` guard — whether a rule republished it and how deep in a chain), one
+  allocation per publish shared by every delivery, held in the message's application
+  properties because that block already rides every delivery path: the fan-out, the
+  in-flight table, the flow-control backlog, the lanes, the in-memory queue and retained
+  store. It is **not** in the durable record: a message read back from disk — a
+  persistent session's queue replayed at resume, a persistent retained value — has none,
+  and its events show `from_clientid` and `from_username` as `undefined`, a fresh `id`,
+  and the event's own time as `publish_received_at`. Persisting it is a storage-format
+  change (the stored property block is shared with the peer frames, ADR 0038 T3) and is
+  left for a change of its own.
+- **It costs nothing unasked.** A publish is stamped only while a rule on this node, or
+  on a linked peer, selects a message event (`ConnRules::on_publish`: one relaxed load
+  beside the lock the publish already takes); a delivery carries its origin to the
+  connection only while a rule here selects an event raised there; the hub's drop sites
+  read one plain field, refreshed from the rules' watch at each dispatch. The publish
+  dispatch benchmark (`cargo bench -p mqttd --bench shared_plan`, no rules attached)
+  does not move outside its run-to-run spread on a shared machine (two alternating runs each of `origin/main` and this change, the better of each: 668 → 659 ns per publish with no recipient, 2,056 → 2,015 ns with one, 6,522 → 6,320 ns with six, 48.8 → 45.8 µs with sixty; the same binary's two runs differ by up to 28%). One cost is unconditional: the property block
+  grows by a pointer, so a queued publish command is 256 B where it was 248 B (the pin in
+  `a_hub_command_slot_stays_publish_sized` is 256 B).
+- **The wire: peer proto 13, additive** (ADR 0038, ADR 0039: a minor may raise
+  `PROTO_MAX`; `PROTO_MIN` stays 6). Two frames, appended: `MessageEvents { wanted }`, by
+  which a node tells each proto-13 peer whether its rules select a message event (on
+  link-up when they do, and when a reload changes the answer; a link starts at "no"), and
+  `OriginPublish`, any of the five publish-carrying frames (`Publish`, `PublishAcked`,
+  `PublishAckedTagged`, `SharedDeliver`, `SharedDeliverAcked`) plus the origin, handled,
+  answered and retransmitted exactly as the frame it stands for. A node sends
+  `OriginPublish` only on a link that negotiated 13 **and** whose far end asked, for a
+  message that has an origin; every other frame it sends is byte for byte proto 12's, so a
+  cluster without message-event rules puts nothing new on the wire. In a rolling upgrade a
+  proto-12 link carries neither frame: the old node never learns that its neighbour wants
+  origins, so the new node's events about messages the old node forwards show an
+  `undefined` publisher until that node is upgraded, and nothing else changes.
+  `cluster_upgrade.rs`'s `BASELINE_REF` needs no bump: the baseline negotiates 12 with this
+  build, which is the configuration the gate exercises.
+- **Which node.** As in EMQX: `delivered`, `acked` and `delivery_dropped` on the
+  subscriber's node; `dropped` on the node the publish arrived at when no node has a
+  subscriber for it (an offline session's queue and the publisher's own No Local
+  subscription count as reached), and on a node a publish was forwarded to that finds its
+  subscriber gone (`do_dispatch2/2`'s zero) — not for a retained forward, which without
+  durable retained goes to every node. Each node raises them for its own rules file.
+- **Loops.** EMQX's builders pass the message's headers to the rule runtime so that its
+  `republish_by` guard also holds on these events; here the origin carries that fact, and
+  the chain depth with it, so the same-rule guard and the 32-deep cap of the previous
+  amendment hold across events as well. A message that lost its origin lost both.
+- **What differs from EMQX**, each listed in RULES.md: the lost origin above; an offline
+  session's `delivery_dropped` has no `username`, `peerhost` or `peername` (EMQX's session
+  process keeps its client info; the hub keeps none); an offline queue's default
+  `drop-oldest` eviction raises no event (the store evicts without reading the message
+  back; EMQX reports the evicted message), and neither do the broker's own overload sheds;
+  `expired` reports `Message-Expiry-Interval: 0` (the stored deadline is absolute; EMQX
+  shows the published interval); a message too large for its subscriber raises
+  `delivery_dropped` with mqttd's own `too_large` (EMQX counts it and raises nothing);
+  `qos0_msg` and `subscription_filter` cannot occur; the broker's own `$SYS` messages raise
+  none (EMQX's default `ignore_sys_message = true`, not configurable here).
+
+Pinned by `each_message_event_has_exactly_emqx_s_columns`,
+`a_delivery_reads_as_emqx_printed_it`, `an_acknowledgement_adds_its_properties`,
+`a_dropped_publish_names_its_publisher`,
+`a_message_without_its_origin_shows_its_publisher_as_undefined`,
+`a_rule_does_not_republish_from_an_event_about_its_own_message` and
+`a_chain_through_the_message_events_stops_at_the_depth_guard` (mqtt-rules);
+`the_message_event_frames_are_appended_and_announced_at_proto_13` and
+`a_frame_carrying_its_origin_unwraps_to_the_same_frame` (mqtt-cluster);
+`a_publish_carries_an_origin_only_while_a_message_event_is_wanted`,
+`without_a_message_event_rule_nothing_is_carried_or_noted`,
+`a_delivery_carries_its_origin_only_while_a_delivery_event_is_selected`,
+`only_a_proto_13_link_that_asked_is_sent_origins` and
+`publishes_are_stamped_while_a_linked_peer_asks` (mqttd, the hub and the engine); and end
+to end, against EMQX 6.3.1's outputs, by `tests/rules_message_events.rs`
+(`a_qos1_delivery_and_its_acknowledgement_read_as_emqx_s`,
+`a_qos2_delivery_is_acked_at_its_pubrec_and_only_there`,
+`a_publish_nobody_subscribes_to_is_reported_dropped`,
+`a_no_local_subscriber_s_own_publish_is_a_dropped_delivery`,
+`a_queued_message_that_expired_is_a_dropped_delivery_at_the_resume`,
+`a_delivery_on_another_node_names_its_publisher`,
+`an_unrouted_publish_is_dropped_on_the_node_it_arrived_at`, …).

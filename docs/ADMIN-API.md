@@ -771,15 +771,17 @@ actions included. Nothing changes: no counter, last error, trace or log line.
 | `only` | with the running rules or a `source`, run only this rule id |
 | `topic`, `payload` | the message (required); `payload_encoding` is `utf8` (default) or `base64` |
 | `qos`, `retain`, `clientid`, `username` | the rest of the message |
-| `event` | run against a sample client or session event instead of a publish, as `mqttd --rule-test --event` does |
+| `event` | run against a sample client, session or message event instead of a publish, as `mqttd --rule-test --event` does |
 
 Defaults: `qos` 0, `retain` false, `clientid` `"test-client"`, no `username` (the SQL sees
 `undefined`), `payload_encoding` `utf8`. `topic` and `payload` are required strings even
-with `event`. There, `topic` is a `session.*` sample's filter or a
-`client.check_authz_complete` sample's topic and may be `""` for another event, and `event`
+with `event`. There, `topic` is a `session.*` sample's filter, a
+`client.check_authz_complete` sample's topic or a message event's message's topic (its
+`payload` and `qos` are that message's too) and may be `""` for another event, and `event`
 is `client.connected`, `client.disconnected`, `client.connack`, `client.ping`,
 `client.check_authn_complete`, `client.check_authz_complete`, `session.subscribed`,
-`session.unsubscribed` or its `$events/…` topic. An event sample carries no addresses
+`session.unsubscribed`, `message.delivered`, `message.acked`, `message.dropped`,
+`delivery.dropped` or its `$events/…` topic. An event sample carries no addresses
 (`peername`, `peerhost` and `sockname` are `undefined`); `mqttd --rule-test --event` uses
 127.0.0.1:52345 and 127.0.0.1:1883. Without `rule` or `only`, `results` lists the enabled rules
 whose `FROM` selects the message or event, and leaves the rest out; `no_match` appears
