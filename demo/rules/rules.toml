@@ -1540,8 +1540,9 @@ actions = [
 #   timestamps are left out: an event's are the broker's clock, and they differ per run.
 # The reason: normal is a clean DISCONNECT (the unit's ignition-off sequence); tcp_closed
 #   is a connection that ended without one; keepalive_timeout one that went silent for
-#   1.5 keepalive intervals. server_closed is skipped: it is the OLD connection of a
-#   vehicle that has just reconnected (a takeover), and would mark it offline (recipe 11).
+#   1.5 keepalive intervals. takenover and discarded are skipped: they end the OLD
+#   connection of a vehicle that has just reconnected (a takeover), and would mark it
+#   offline (recipe 11).
 #
 # In:  XDKCE5K38RH287145's connection closes without a DISCONNECT ($events/client/disconnected, reason tcp_closed)
 # Out: events/cars/XDKCE5K38RH287145/presence  qos=1  {"vehicle":"XDKCE5K38RH287145","body":"car","powertrain":"battery-electric","online":false,"reason":"tcp_closed","meaning":"offline: connection lost without a goodbye (coverage, power or modem); the vehicle may still be moving"}
@@ -1565,7 +1566,7 @@ SELECT
        ELSE 'offline: ' + reason END AS meaning
 FROM "$events/client/connected", "$events/client/disconnected"
 WHERE regex_match(clientid, '^[A-HJ-NPR-Z0-9]{17}$')
-  AND (event = 'client.connected' OR reason <> 'server_closed')
+  AND (event = 'client.connected' OR (reason <> 'takenover' AND reason <> 'discarded'))
 '''
 actions = [
   { function = "republish", args = { topic = "events/cars/${vehicle}/presence", qos = 1, payload = "${.}" } },

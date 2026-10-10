@@ -775,11 +775,13 @@ actions included. Nothing changes: no counter, last error, trace or log line.
 
 Defaults: `qos` 0, `retain` false, `clientid` `"test-client"`, no `username` (the SQL sees
 `undefined`), `payload_encoding` `utf8`. `topic` and `payload` are required strings even
-with `event`. There, `topic` is a `session.*` sample's filter and may be `""` for a
-`client.*` event, and `event` is `client.connected`, `client.disconnected`,
-`session.subscribed`, `session.unsubscribed` or its `$events/…` topic. An event sample
-carries no peer address (`peername` and `peerhost` are `undefined`); `mqttd --rule-test
---event` uses 127.0.0.1:52345. Without `rule` or `only`, `results` lists the enabled rules
+with `event`. There, `topic` is a `session.*` sample's filter or a
+`client.check_authz_complete` sample's topic and may be `""` for another event, and `event`
+is `client.connected`, `client.disconnected`, `client.connack`, `client.ping`,
+`client.check_authn_complete`, `client.check_authz_complete`, `session.subscribed`,
+`session.unsubscribed` or its `$events/…` topic. An event sample carries no addresses
+(`peername`, `peerhost` and `sockname` are `undefined`); `mqttd --rule-test --event` uses
+127.0.0.1:52345 and 127.0.0.1:1883. Without `rule` or `only`, `results` lists the enabled rules
 whose `FROM` selects the message or event, and leaves the rest out; `no_match` appears
 only for the rule `rule` or `only` names.
 

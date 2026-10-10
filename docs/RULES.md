@@ -304,11 +304,12 @@ would never see: `topic "other/kitchen" matches none of the FROM filters
 (sensors/+/data)`. It exits `2` on a usage error, such as `--qos 3`.
 
 **Events.** A statement that selects `$events/…` runs against a sample of the event, built
-from `--clientid`, `--username`, and for `session/subscribed` and `session/unsubscribed`,
-`--topic` and `--qos`. The rest is fixed: `peername` `127.0.0.1:52345`, `node`
-`rule-test`; a connect is MQTT 5 with keepalive 60, clean start and expiry 0; a
-disconnect's `reason` is `normal`. Like a real event, a sample has no `sockname`
-([Events](#events-from-events)). It names the sample on stderr, as
+from `--clientid`, `--username`, and for `session/subscribed`, `session/unsubscribed` and
+`auth/check_authz_complete`, `--topic` and `--qos`. The rest is fixed: `peername`
+`127.0.0.1:52345`, `sockname` `127.0.0.1:1883`, `node` `rule-test`; a connect is MQTT 5
+with keepalive 60, clean start, expiry 0 and no properties; a disconnect's `reason` is
+`normal`; a CONNACK and an authentication succeed; an authorization is a publish the ACL
+file allowed ([Events](#events-from-events)). It names the sample on stderr, as
 `(a sample client.connected event)`, and prints the outputs on stdout:
 
 ```console
@@ -317,8 +318,10 @@ $ mqttd --rule-test --sql 'SELECT clientid, event, proto_ver, keepalive FROM "$e
 ```
 
 When the statement names more than one event, it runs against the first one named;
-`--event` picks another (`client.connected`, `client.disconnected`, `session.subscribed`
-or `session.unsubscribed`, or their topic forms, such as `client/disconnected`):
+`--event` picks another (`client.connected`, `client.disconnected`, `client.connack`,
+`client.ping`, `client.check_authn_complete`, `client.check_authz_complete`,
+`session.subscribed` or `session.unsubscribed`, or their topic forms, such as
+`client/disconnected` or `auth/check_authz_complete`):
 
 ```console
 $ mqttd --rule-test --sql 'SELECT clientid, event, reason FROM "$events/client/connected", "$events/client/disconnected"' --event client.disconnected --clientid sensor-7
@@ -1086,10 +1089,10 @@ never matches anything, and the loader warns (`FROM "$SYS/brokers/#" never match
 | `clientid` | The publisher's client id |
 | `username` | Its CONNECT username, if it sent one (`undefined` otherwise) |
 | `payload` | The payload: text if it is UTF-8, bytes otherwise |
-| `peerhost` / `peername` | The publisher's IP / `ip:port` (absent for a session relocated from another node, whose socket is the relaying node) |
+| `peerhost` / `peername` | The publisher's IP / `ip:port`, as EMQX prints them (an IPv6 address unbracketed, an IPv4-mapped one as its IPv4 address); absent for a session relocated from another node, whose socket is the relaying node |
 | `topic` | The topic, with aliases resolved |
 | `qos` | 0, 1 or 2 |
-| `flags` | `{"dup": …, "retain": …}` |
+| `flags` | `{"dup": false, "retain": …}`. `dup` is always `false`, as in EMQX, which runs the rules on the message with its DUP flag cleared (`emqx_message:clean_dup/1`) |
 | `pub_props` | MQTT 5 properties under their spec names: `User-Property` (a map; a repeated key keeps its last value), `User-Property-Pairs` (every pair, in order), `Content-Type`, `Response-Topic`, `Correlation-Data`, `Payload-Format-Indicator`, `Message-Expiry-Interval`. A publish that carried none (every MQTT 3.1.1 publish) has only an empty `User-Property` map, so `${pub_props.'Content-Type'}` renders `undefined`. |
 | `publish_received_at` / `timestamp` | Milliseconds since the epoch: when the broker received the message / when the rules looked at it. Each is read once per message, so every reference in every rule sees the same value, and `timestamp` is never earlier than `publish_received_at` |
 | `node` | This node's id |
@@ -1100,20 +1103,86 @@ never matches anything, and the loader warns (`FROM "$SYS/brokers/#" never match
 ### Events: `FROM "$events/…"`
 
 Both EMQX spellings work, for example `$events/client/connected` and
-`$events/client_connected`.
+`$events/client_connected` (`client/ping` has only the one, as in EMQX). A `FROM` filter
+with a wildcard selects every event whose topic it matches, as EMQX's does:
+`"$events/client/+"` selects the four client events, `"$events/auth/#"` the two
+authentication and authorization events, `"$events/#"` all of them. A filter that matches
+only events mqttd does not raise (`"$events/message/+"`) is refused at load; one that
+also matches some (`"$events/#"`) loads, with a warning that names them.
 
-| Event | Fields beyond `clientid`, `username`, `timestamp`, `node`, `event` |
+Every event has `event` (EMQX's hook name, such as `client.connected`), `timestamp` (when
+it was raised, in milliseconds), `node`, `clientid` and `username` (`undefined` when the
+client sent none, which `SELECT *` shows as `"username":"undefined"`, as EMQX's does). Each event's other fields are exactly the ones EMQX's builder for it sets
+(`emqx_rule_events:eventmsg_*`), with the same names, types and values:
+
+| Event | Its other fields |
 |---|---|
-| `$events/client/connected` | `peername`, `proto_name`, `proto_ver`, `keepalive`, `clean_start`, `expiry_interval`, `is_bridge` (always false), `connected_at`, `conn_props`. No `sockname`. |
-| `$events/client/disconnected` | `peername`, `reason`, `connected_at`, `disconnected_at`, `disconn_props`; no `sockname`. `reason` is `normal` (a client DISCONNECT with reason `0x00`), EMQX's name for any other reason code a v5 client's DISCONNECT carries (`disconnect_with_will_message` for `0x04`, `unspecified_error`, `protocol_error`, …), `keepalive_timeout`, `tcp_closed` (the socket closed or failed), `server_closed` (the broker ended it: a takeover, an eviction, a protocol violation) or `shutdown` (graceful drain). |
-| `$events/session/subscribed` | `peerhost`, `topic`, `qos`, `sub_props`. One event per filter the SUBACK granted. |
-| `$events/session/unsubscribed` | `peerhost`, `topic`, `unsub_props`. One event per filter actually removed. |
+| `$events/client/connected` | `peername`, `sockname`, `proto_name` (`MQTT`), `proto_ver` (4 or 5), `keepalive`, `clean_start`, `receive_maximum`, `expiry_interval` (**seconds**), `is_bridge`, `conn_props`, `connected_at`, `client_attrs` |
+| `$events/client/disconnected` | `reason`, `peername`, `sockname`, `proto_name`, `proto_ver`, `disconn_props`, `connected_at`, `disconnected_at`, `client_attrs` |
+| `$events/client/connack` | `reason_code`, `peername`, `sockname`, `proto_name`, `proto_ver`, `keepalive`, `clean_start`, `expiry_interval` (**milliseconds**), `conn_props`, and `connected_at` for a success |
+| `$events/client/ping` | `peername`, `sockname`, `proto_name`, `proto_ver`, `keepalive`, `clean_start`, `expiry_interval` (**milliseconds**), `conn_props` |
+| `$events/auth/check_authn_complete` | `peername`, `reason_code`, `is_anonymous`, `is_superuser`, `client_attrs` |
+| `$events/auth/check_authz_complete` | `peername`, `peerhost`, `topic`, `action`, `authz_source`, `result`, `client_attrs` |
+| `$events/session/subscribed` | `peerhost`, `peername`, `topic`, `qos` (as granted), `sub_props`, `client_attrs`. One event per filter the SUBACK granted. |
+| `$events/session/unsubscribed` | `peerhost`, `peername`, `topic`, `qos` (as the removed subscription had been granted), `unsub_props`, `client_attrs`. One event per filter actually removed. |
 
-`conn_props`, `disconn_props`, `sub_props` and `unsub_props` are always `{}`: the
-properties the CONNECT, DISCONNECT, SUBSCRIBE or UNSUBSCRIBE carried are not passed to
-rules. The client events carry no `sockname` (the listener address)
-([Differences from EMQX](#differences-from-emqx)). An event has
-no `payload`, so a republish from an event rule needs one of its own:
+What the values are:
+
+- **Addresses.** `peername` and `sockname` are `ip:port`, `peerhost` the IP, as EMQX prints
+  them: an IPv6 address unbracketed (`::1:1883`), an IPv4-mapped one as its IPv4 address.
+  `sockname` is the listener's address the client connected to. A session relocated from
+  another node has none of them: its socket is the relaying node's.
+- **`expiry_interval`** is the Session Expiry Interval agreed at CONNECT: in seconds on
+  `client/connected`, in milliseconds on `client/connack` and `client/ping`, as EMQX has it
+  (its connected event divides by 1000; the other two do not). An MQTT 3.1.1 client without
+  clean session keeps its session for as long as mqttd keeps one, 4294967295 seconds.
+- **`receive_maximum`** is the client's Receive Maximum (65535 when it sent none) capped by
+  `limits.max_inflight_messages`, as the broker applies it.
+- **`is_bridge`** is `false`: mqttd refuses the bridge-mode protocol levels, so no client
+  it serves set the bit.
+- **Property maps** (`conn_props`, `disconn_props`, `sub_props`, `unsub_props`) are the
+  properties of the CONNECT, the client's DISCONNECT, the SUBSCRIBE or the UNSUBSCRIBE,
+  under their MQTT 5 names, as `pub_props` prints them: `User-Property` is always there
+  (an empty map when there were none, and for every MQTT 3.1.1 packet),
+  `User-Property-Pairs` lists every pair in order when there was one, and the rest keep
+  their names (`Session-Expiry-Interval`, `Receive-Maximum`, `Subscription-Identifier`,
+  `Reason-String`, …). `disconn_props` is only `{"User-Property": {}}` when the client sent
+  no DISCONNECT.
+- **`reason`** (`client/disconnected`) is EMQX's: `normal` for a client DISCONNECT with
+  reason `0x00`, and EMQX's name for any other code it carries
+  (`disconnect_with_will_message` for `0x04`, `unspecified_error`, …); `takenover` when the
+  same client id connected again without clean start, `discarded` when it did with clean
+  start; `kicked` for an operator's kick or purge; `not_authorized` when its identity was
+  revoked; `keepalive_timeout`; the reason code's name when the broker closed it for a
+  protocol violation (`protocol_error`, `topic_alias_invalid`, `topic_name_invalid`,
+  `receive_maximum_exceeded`, …) or because it could not serve it (`server_busy`,
+  `use_another_server`, `quota_exceeded`, …), whether it could tell an MQTT 3.1.1 client
+  so or not; `frame_error` (`frame_too_large` over the packet ceiling) for a packet it
+  could not decode; `tcp_closed` (`ssl_closed` over TLS) when the client closed the socket,
+  or the socket error (`econnreset`, `etimedout`, …); `shutdown` when the broker is
+  stopping.
+- **`reason_code`** (`client/connack`) is EMQX's name for the CONNACK's code: `success`,
+  `client_identifier_not_valid`, `bad_username_or_password`, `not_authorized`,
+  `bad_authentication_method`, `server_unavailable`, `quota_exceeded`, …, the MQTT 5 name
+  for an MQTT 3.1.1 client too (as EMQX decides in MQTT 5 codes). A refused CONNECT raises
+  it, and so does a success, right after `client/connected` (EMQX's order).
+- **`reason_code`** (`auth/check_authn_complete`) is `success` or why authentication
+  failed (`bad_username_or_password`, `not_authorized`, `bad_authentication_method`).
+  `is_anonymous` is `true` for a client admitted without credentials (EMQX sets it when
+  it admits a client without authenticating it, on a listener with authentication off);
+  `is_superuser` is `false`, since mqttd has no superusers. It is raised for every CONNECT that reaches
+  authentication, and for an MQTT 5 re-authentication.
+- **`check_authz_complete`** is raised for every publish (a Will's, at CONNECT, included)
+  and every SUBSCRIBE filter: `action` is `publish` or `subscribe`, `result` `allow` or
+  `deny`, and `authz_source` is `file` when a rule of the ACL file decided and `default`
+  when none did (or there is no ACL), EMQX's names for its file source and for
+  `authorization.no_match`. A publish to `$SYS`, which the broker refuses whatever the ACL
+  says, is a `default` denial.
+
+An event no rule selects costs nothing: the broker checks for a rule before it builds the
+event, which matters for `client/ping` and `auth/check_authz_complete`, raised on every
+PINGREQ and every publish. An event has no `payload`, so a republish from an event rule
+needs one of its own:
 
 ```toml
 [rules.presence]
@@ -1135,9 +1204,8 @@ The cookbook's [presence recipe](RULES-COOKBOOK.md#11-device-presence-from-conne
 keeps one retained status per device.
 
 The message events (`message/delivered`, `message/acked`, `message/dropped`,
-`message/delivery_dropped`), `client/connack`, the authentication and authorization
-events, `client/ping` and the alarm events are not raised. A rule that selects one is
-refused at load.
+`message/delivery_dropped`), the alarm events and the schema validation and message
+transformation events are not raised. A rule that selects one by name is refused at load.
 
 ## Functions
 
@@ -1330,11 +1398,9 @@ notice.
 |---|---|---|
 | Republished messages | Re-enter the rule engine unless `direct_dispatch = true` | Never re-enter it. A rule cannot loop, and a rule chain that relied on re-triggering needs a second rule on the original topic. |
 | Actions | `republish`, `console`, data-integration sinks | `republish`, `console`. A sink reference is refused at load. |
-| Events | 16 event topics (6.2+): `sys/alarm_activated`, `sys/alarm_deactivated`, `client/connected`, `client/disconnected`, `client/connack`, `client/ping`, `auth/check_authn_complete`, `auth/check_authz_complete`, `session/subscribed`, `session/unsubscribed`, `message/delivered`, `message/acked`, `message/dropped`, `message/delivery_dropped`, `message_transformation/failed`, `schema_validation/failed`; a wildcard filter such as `$events/client/+` selects every event it matches | `client/connected`, `client/disconnected`, `session/subscribed`, `session/unsubscribed`. Any other `$events/…`, a wildcard one included, is refused at load. |
-| Event property maps (`conn_props`, `disconn_props`, `sub_props`, `unsub_props`) | The properties of the CONNECT, DISCONNECT, SUBSCRIBE or UNSUBSCRIBE | Always `{}` |
-| `sockname` in `client/connected` and `client/disconnected` | The listener's address | Absent, so `undefined` |
-| Data-bridge sources (`$bridges/…`) | Yes | No |
-| Data-integration sources (`$sources/…`) | Yes | No source hookpoint: loads as a plain topic filter, so it matches only messages published to that topic |
+| Events | 16 event topics (6.2+): `sys/alarm_activated`, `sys/alarm_deactivated`, `client/connected`, `client/disconnected`, `client/connack`, `client/ping`, `auth/check_authn_complete`, `auth/check_authz_complete`, `session/subscribed`, `session/unsubscribed`, `message/delivered`, `message/acked`, `message/dropped`, `message/delivery_dropped`, `message_transformation/failed`, `schema_validation/failed`; a wildcard filter such as `$events/client/+` selects every event it matches | The 8 client, session and authentication events (`client/connected`, `client/disconnected`, `client/connack`, `client/ping`, `auth/check_authn_complete`, `auth/check_authz_complete`, `session/subscribed`, `session/unsubscribed`), with EMQX's fields. A wildcard filter selects the ones it matches; one that matches none of them is refused at load. Not the message, alarm, schema validation or message transformation events |
+| `authz_source` | The source that decided: `file`, `built_in_database`, `http`, …, `superuser`, `default`, and `cache` for a decision its authorization cache answered | `file` or `default`: mqttd has the ACL file only, no superusers and no authorization cache |
+| Data-integration sources (`$bridges/…`, `$sources/…`) | Yes | No: refused at load |
 | Functions | 124 in the built-in reference, plus `jq` | 107 of those 124, plus the 13 legacy accessors EMQX keeps undocumented (120 in all). The rest are refused at load. |
 | `is_empty` of text that is not a JSON object | Fails the rule for `'abc'` and for `'[]'` (`map/1` raises `badarg`) | `false` for `'abc'`, `true` for `'[]'`. A missing value fails the rule in both, though EMQX's docs say `false`. |
 | JSON integers | Any size (Erlang integers) | Signed 64-bit. One outside that range decodes as a float, so `12345678901234567890` becomes `1.2345678901234567e+19`. `${payload}` keeps the original bytes. |
@@ -1345,7 +1411,6 @@ notice.
 | `id` | 32 upper-case hex digits, the first 16 the microsecond clock | The same format; only how the low 64 bits are built differs (per-process salt and counter), which no rule can observe |
 | `client_attrs`, `mountpoint` | Client attributes, mountpoints | Always empty / absent |
 | Namespaces (6.x) | Rules can be confined to a namespace | No namespaces |
-| `flags.dup` | Always `false`: hooks run on the message with DUP cleared | The publish's DUP flag |
 | Unaliased computed field | Stored under a generated `_v_…` key | Stored under the expression's source text |
 | Ack semantics | Rules run synchronously in the publisher's channel, in the `message.publish` hook, before the original is routed; a republish is routed inside that call. The PUBACK follows, but never waits for delivery or durability, and a republish's outcome never changes its reason code | A QoS ≥ 1 republish holds the publisher's PUBACK/PUBREC until its fate is known; the answer is still the original's own, and a failed republish is a failed action ([above](#delivery-guarantees-qos-0-1-and-2)) |
 | A refused publish | Rules do not run on a publish refused by authorization, quota, publish caps, schema validation or message transformation. Only a hook running after the rule engine (ExHook, node rebalance) can refuse it afterwards, and then the republish has already been routed | The hub routes none of its derived messages (unless the refusal is a peer's, arriving later) |

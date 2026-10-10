@@ -43,6 +43,25 @@ fn rule_set(text: &str) -> Arc<mqtt_rules::RuleSet> {
 /// (so `QoS` 2 dedup is the durable window), the rule engine on every connection and in
 /// the hub (for Wills), metrics recorded.
 async fn start_node(name: &str, rules: &str) -> (Broker, TcpListener, NodeId) {
+    start_node_with(
+        name,
+        rules,
+        Arc::new(mqtt_auth::basic::BasicAuthenticator {
+            allow_anonymous: true,
+        }),
+        Arc::new(mqtt_auth::AllowAll),
+    )
+    .await
+}
+
+/// [`start_node`] with the given authenticator and authorizer, the listener's address
+/// passed on as production's listeners pass it (ADR 0083's `sockname`).
+async fn start_node_with(
+    name: &str,
+    rules: &str,
+    auth: Arc<dyn mqtt_auth::Authenticator>,
+    authz: Arc<dyn mqtt_auth::Authorizer>,
+) -> (Broker, TcpListener, NodeId) {
     let store = Arc::new(MemorySessionStore::new());
     let id = NodeId(name.into());
     let (mut hub, hub_tx) = Hub::with_config(id.clone(), store.clone());
@@ -56,10 +75,8 @@ async fn start_node(name: &str, rules: &str) -> (Broker, TcpListener, NodeId) {
         .unwrap();
     let policy = Arc::new(mqttd::conn::ConnPolicy {
         anonymous: None,
-        auth: mqttd::conn::auth_handle(Arc::new(mqtt_auth::basic::BasicAuthenticator {
-            allow_anonymous: true,
-        })),
-        authz: mqttd::conn::authz_handle(Arc::new(mqtt_auth::AllowAll)),
+        auth: mqttd::conn::auth_handle(auth),
+        authz: mqttd::conn::authz_handle(authz),
         identity_source: mqtt_auth::mtls::IdentitySource::default(),
         audit: Arc::new(mqtt_observability::AuditLog::new()),
         proxy: None,
@@ -78,12 +95,18 @@ async fn start_node(name: &str, rules: &str) -> (Broker, TcpListener, NodeId) {
     tokio::spawn(async move {
         loop {
             let (stream, peer) = listener.accept().await.unwrap();
-            tokio::spawn(mqttd::conn::handle_stream(
+            let arrival = mqttd::conn::Arrival {
+                sockname: stream.local_addr().ok(),
+                transport: mqtt_net::Transport::PlainTcp,
+            };
+            tokio::spawn(mqttd::conn::handle_stream_watched(
                 stream,
                 Some(peer),
+                arrival,
                 None,
                 policy.clone(),
                 accept_tx.clone(),
+                None,
             ));
         }
     });
@@ -778,5 +801,502 @@ async fn in_a_cluster_each_message_is_evaluated_once_on_its_landing_node() {
     assert!(
         !b_metrics.contains(r#"mqttd_rule_evaluations_total{rule="alert""#),
         "node B never evaluated a forwarded copy: {b_metrics}"
+    );
+}
+
+/// Admits a username with the password `pw`, or no credentials; refuses the rest.
+struct Passwords;
+
+#[async_trait::async_trait]
+impl mqtt_auth::Authenticator for Passwords {
+    async fn authenticate(
+        &self,
+        _client: &mqtt_core::ClientId,
+        creds: &mqtt_auth::Credentials<'_>,
+    ) -> Result<mqtt_auth::Identity, mqtt_auth::AuthError> {
+        let subject = match creds {
+            mqtt_auth::Credentials::Password { username, password } if *password == b"pw" => {
+                (*username).to_string()
+            }
+            mqtt_auth::Credentials::Anonymous => "anonymous".into(),
+            _ => return Err(mqtt_auth::AuthError::Rejected),
+        };
+        Ok(mqtt_auth::Identity {
+            subject,
+            groups: vec![],
+        })
+    }
+}
+
+/// Every event a client named `dev-…` raises, republished to `ev/<event>` as JSON.
+/// (`$events/#` also matches events mqttd does not raise, which the load warns about.)
+const EVERY_EVENT: &str = r#"
+[rules.events]
+sql = '''SELECT * FROM "$events/#" WHERE regex_match(clientid, '^dev-')'''
+actions = [{ function = "republish", args = { topic = "ev/${event}", payload = "${.}" } }]
+"#;
+
+/// The next event the watcher hears, as JSON, checked against its topic.
+async fn next_event(watcher: &mut Client) -> serde_json::Value {
+    let p = watcher.expect_publish().await;
+    let v: serde_json::Value = serde_json::from_slice(&p.payload).unwrap();
+    assert_eq!(
+        p.topic,
+        format!("ev/{}", v["event"].as_str().unwrap()),
+        "{v}"
+    );
+    v
+}
+
+/// An event's field names, sorted. (`SELECT *` adds `metadata`, as EMQX's does.)
+fn field_names(v: &serde_json::Value) -> Vec<&str> {
+    let mut names: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+    names.sort_unstable();
+    names
+}
+
+fn props(p: Vec<mqtt_codec::Property>) -> mqtt_codec::Properties {
+    mqtt_codec::Properties(p)
+}
+
+/// A connection's whole life, as EMQX's rule events show it (`emqx_rule_events`
+/// `eventmsg_*`): authentication, `client.connected` then `client.connack` (EMQX's
+/// order), the subscription's authorization and `session.subscribed`, a PINGREQ, an
+/// unsubscribe and a DISCONNECT — each with the properties its packet carried, printed
+/// as `printable_props/1` prints them, the listener's address as `sockname`, and the
+/// connection's own Receive Maximum and Session Expiry Interval (seconds on
+/// `client.connected`, milliseconds on `client.connack` and `client.ping`).
+// One connection's whole life, one packet and its events after another.
+#[allow(clippy::too_many_lines)]
+#[tokio::test]
+async fn a_connection_s_events_carry_emqx_s_fields_end_to_end() {
+    use mqtt_codec::Property as P;
+    let broker = start_node_with(
+        "rules-test",
+        EVERY_EVENT,
+        Arc::new(Passwords),
+        Arc::new(mqtt_auth::AllowAll),
+    )
+    .await
+    .0;
+    let mut watcher = Client::connect(broker.addr, "watcher").await;
+    watcher.subscribe(1, "ev/#", QoS::AtMostOnce).await;
+
+    let mut dev = Client::open(broker.addr, mqtt_codec::ProtocolVersion::V5).await;
+    dev.send(&Packet::Connect(mqtt_codec::packet::Connect {
+        protocol: mqtt_codec::ProtocolVersion::V5,
+        clean_session: true,
+        keep_alive: 30,
+        client_id: "dev-1".into(),
+        last_will: None,
+        username: Some("u".into()),
+        password: Some(bytes::Bytes::from_static(b"pw")),
+        properties: props(vec![
+            P::SessionExpiryInterval(7200),
+            P::ReceiveMaximum(10),
+            P::UserProperty("k".into(), "v".into()),
+        ]),
+    }))
+    .await;
+    assert!(matches!(dev.recv().await, Packet::ConnAck(a) if a.code == 0));
+    let sockname = serde_json::json!(broker.addr.to_string());
+    let conn_props = serde_json::json!({
+        "Session-Expiry-Interval": 7200,
+        "Receive-Maximum": 10,
+        "User-Property": {"k": "v"},
+        "User-Property-Pairs": [{"key": "k", "value": "v"}],
+    });
+
+    let authentication = next_event(&mut watcher).await;
+    assert_eq!(authentication["event"], "client.check_authn_complete");
+    assert_eq!(
+        (
+            &authentication["reason_code"],
+            &authentication["is_anonymous"],
+            &authentication["is_superuser"]
+        ),
+        (&"success".into(), &false.into(), &false.into())
+    );
+    assert_eq!(authentication["username"], "u");
+
+    let connected = next_event(&mut watcher).await;
+    assert_eq!(connected["event"], "client.connected");
+    assert_eq!(
+        field_names(&connected),
+        [
+            "clean_start",
+            "client_attrs",
+            "clientid",
+            "conn_props",
+            "connected_at",
+            "event",
+            "expiry_interval",
+            "is_bridge",
+            "keepalive",
+            "metadata",
+            "node",
+            "peername",
+            "proto_name",
+            "proto_ver",
+            "receive_maximum",
+            "sockname",
+            "timestamp",
+            "username"
+        ]
+    );
+    assert_eq!(connected["sockname"], sockname);
+    assert_eq!(connected["conn_props"], conn_props);
+    assert_eq!(connected["receive_maximum"], 10);
+    assert_eq!(connected["expiry_interval"], 7200);
+    assert_eq!(connected["keepalive"], 30);
+    assert_eq!(
+        (&connected["proto_name"], &connected["proto_ver"]),
+        (&"MQTT".into(), &5.into())
+    );
+    assert_eq!(connected["is_bridge"], false);
+
+    let connack = next_event(&mut watcher).await;
+    assert_eq!(connack["event"], "client.connack");
+    assert_eq!(connack["reason_code"], "success");
+    assert_eq!(connack["expiry_interval"], 7_200_000, "EMQX's milliseconds");
+    assert_eq!(connack["connected_at"], connected["connected_at"]);
+    assert_eq!(connack["conn_props"], conn_props);
+    assert_eq!(connack["sockname"], sockname);
+
+    dev.send(&Packet::Subscribe(mqtt_codec::packet::Subscribe {
+        pkid: 1,
+        filters: vec![mqtt_codec::packet::SubscribeFilter {
+            path: "cmd/dev-1".into(),
+            qos: QoS::AtLeastOnce,
+            options: mqtt_codec::SubscriptionOptions::default(),
+        }],
+        properties: props(vec![
+            P::SubscriptionIdentifier(5),
+            P::UserProperty("s".into(), "1".into()),
+        ]),
+    }))
+    .await;
+    assert!(matches!(dev.recv().await, Packet::SubAck(_)));
+    let authz = next_event(&mut watcher).await;
+    assert_eq!(authz["event"], "client.check_authz_complete");
+    assert_eq!(
+        (
+            &authz["topic"],
+            &authz["action"],
+            &authz["result"],
+            &authz["authz_source"]
+        ),
+        (
+            &"cmd/dev-1".into(),
+            &"subscribe".into(),
+            &"allow".into(),
+            &"default".into()
+        ),
+        "no ACL file: authorization.no_match decided"
+    );
+    let subscribed = next_event(&mut watcher).await;
+    assert_eq!(subscribed["event"], "session.subscribed");
+    assert_eq!(subscribed["qos"], 1);
+    assert_eq!(
+        subscribed["sub_props"],
+        serde_json::json!({
+            "Subscription-Identifier": 5,
+            "User-Property": {"s": "1"},
+            "User-Property-Pairs": [{"key": "s", "value": "1"}],
+        })
+    );
+    assert_eq!(subscribed["peerhost"], "127.0.0.1");
+
+    dev.send(&Packet::PingReq).await;
+    assert_eq!(dev.recv().await, Packet::PingResp);
+    let ping = next_event(&mut watcher).await;
+    assert_eq!(ping["event"], "client.ping");
+    assert_eq!(
+        field_names(&ping),
+        [
+            "clean_start",
+            "clientid",
+            "conn_props",
+            "event",
+            "expiry_interval",
+            "keepalive",
+            "metadata",
+            "node",
+            "peername",
+            "proto_name",
+            "proto_ver",
+            "sockname",
+            "timestamp",
+            "username"
+        ]
+    );
+    assert_eq!(ping["expiry_interval"], 7_200_000);
+
+    dev.send(&Packet::Unsubscribe(mqtt_codec::packet::Unsubscribe {
+        pkid: 2,
+        filters: vec!["cmd/dev-1".into()],
+        properties: props(vec![P::UserProperty("u".into(), "2".into())]),
+    }))
+    .await;
+    assert!(matches!(dev.recv().await, Packet::UnsubAck(_)));
+    let unsubscribed = next_event(&mut watcher).await;
+    assert_eq!(unsubscribed["event"], "session.unsubscribed");
+    assert_eq!(unsubscribed["qos"], 1, "the QoS the subscription had");
+    assert_eq!(
+        unsubscribed["unsub_props"],
+        serde_json::json!({
+            "User-Property": {"u": "2"},
+            "User-Property-Pairs": [{"key": "u", "value": "2"}],
+        })
+    );
+
+    dev.disconnect_with(vec![
+        P::ReasonString("bye".into()),
+        P::UserProperty("d".into(), "3".into()),
+    ])
+    .await;
+    let disconnected = next_event(&mut watcher).await;
+    assert_eq!(disconnected["event"], "client.disconnected");
+    assert_eq!(disconnected["reason"], "normal");
+    assert_eq!(
+        disconnected["disconn_props"],
+        serde_json::json!({
+            "Reason-String": "bye",
+            "User-Property": {"d": "3"},
+            "User-Property-Pairs": [{"key": "d", "value": "3"}],
+        })
+    );
+    assert_eq!(
+        (
+            &disconnected["proto_name"],
+            &disconnected["proto_ver"],
+            &disconnected["sockname"]
+        ),
+        (&"MQTT".into(), &5.into(), &sockname)
+    );
+    watcher.expect_silence().await;
+}
+
+/// A refused CONNECT raises `client.connack` with EMQX's name for the reason
+/// (`emqx_reason_codes:name/1`, the MQTT 5 name for an MQTT 3.1.1 client too), and a
+/// refused authentication `client.check_authn_complete` before it; a client id refused
+/// before authentication raises no authentication event, as in EMQX's
+/// `process_connect/2` pipeline.
+#[tokio::test]
+async fn a_refused_connect_raises_its_connack_and_authentication_events() {
+    let broker = start_node_with(
+        "rules-test",
+        r#"
+        [rules.refused]
+        sql = '''SELECT event, clientid, reason_code, is_anonymous FROM "$events/client/connack", "$events/auth/check_authn_complete" WHERE reason_code <> 'success' '''
+        actions = [{ function = "republish", args = { topic = "ev/${event}", payload = "${.}" } }]
+        "#,
+        Arc::new(Passwords),
+        Arc::new(mqtt_auth::AllowAll),
+    )
+    .await
+    .0;
+    let mut watcher = Client::connect(broker.addr, "watcher").await;
+    watcher.subscribe(1, "ev/#", QoS::AtMostOnce).await;
+
+    let mut dev = Client::open(broker.addr, mqtt_codec::ProtocolVersion::V311).await;
+    dev.send(&Packet::Connect(mqtt_codec::packet::Connect {
+        protocol: mqtt_codec::ProtocolVersion::V311,
+        clean_session: true,
+        keep_alive: 0,
+        client_id: "dev-2".into(),
+        last_will: None,
+        username: Some("u".into()),
+        password: Some(bytes::Bytes::from_static(b"wrong")),
+        properties: mqtt_codec::Properties::new(),
+    }))
+    .await;
+    assert!(matches!(dev.recv().await, Packet::ConnAck(a) if a.code == 0x04));
+    assert_eq!(
+        next_event(&mut watcher).await,
+        serde_json::json!({"event": "client.check_authn_complete", "clientid": "dev-2",
+            "reason_code": "bad_username_or_password", "is_anonymous": false})
+    );
+    assert_eq!(
+        next_event(&mut watcher).await,
+        serde_json::json!({"event": "client.connack", "clientid": "dev-2",
+            "reason_code": "bad_username_or_password", "is_anonymous": "undefined"})
+    );
+
+    let (_, ack) = Client::connect_v5(broker.addr, "", false, vec![]).await;
+    assert_eq!(ack.code, 0x85);
+    assert_eq!(
+        next_event(&mut watcher).await,
+        serde_json::json!({"event": "client.connack", "clientid": "",
+            "reason_code": "client_identifier_not_valid", "is_anonymous": "undefined"})
+    );
+    watcher.expect_silence().await;
+}
+
+/// The next `gone/<client id>` and its reason.
+async fn gone(watcher: &mut Client) -> (String, String) {
+    let p = watcher.expect_publish().await;
+    (p.topic, String::from_utf8(p.payload.to_vec()).unwrap())
+}
+
+/// How a connection ended, in EMQX's words (`emqx_channel`): `takenover` when the same
+/// client id connects again without clean start, `discarded` when it does with one,
+/// `kicked` for an operator's kick, the reason code's name for a protocol violation
+/// (`topic_alias_invalid`), `tcp_closed` for a socket the client closed.
+#[tokio::test]
+async fn a_closed_connection_reports_emqx_s_reason() {
+    let broker = start_broker(
+        r#"
+        [rules.gone]
+        sql = 'SELECT clientid, reason FROM "$events/client/disconnected"'
+        actions = [{ function = "republish", args = { topic = "gone/${clientid}", payload = "${reason}" } }]
+        "#,
+    )
+    .await;
+    let mut watcher = Client::connect(broker.addr, "watcher").await;
+    watcher.subscribe(1, "gone/#", QoS::AtMostOnce).await;
+
+    let (mut first, _) = Client::connect_v311(broker.addr, "dev-t", false).await;
+    let (mut second, _) = Client::connect_v311(broker.addr, "dev-t", false).await;
+    first.expect_closed().await;
+    assert_eq!(
+        gone(&mut watcher).await,
+        ("gone/dev-t".into(), "takenover".into())
+    );
+    let _third = Client::connect(broker.addr, "dev-t").await;
+    second.expect_closed().await;
+    assert_eq!(
+        gone(&mut watcher).await,
+        ("gone/dev-t".into(), "discarded".into())
+    );
+
+    let mut kicked = Client::connect(broker.addr, "dev-k").await;
+    let (reply, outcome) = tokio::sync::oneshot::channel();
+    broker
+        .hub_tx
+        .send(HubCommand::Admin(mqttd::hub::admin::AdminRequest::Kick {
+            client: "dev-k".into(),
+            reply,
+        }))
+        .unwrap();
+    assert!(outcome.await.unwrap().disconnected);
+    kicked.expect_closed().await;
+    assert_eq!(
+        gone(&mut watcher).await,
+        ("gone/dev-k".into(), "kicked".into())
+    );
+
+    let mut bad = Client::connect_v5_ok(broker.addr, "dev-p").await;
+    bad.publish(
+        "",
+        b"x",
+        QoS::AtMostOnce,
+        None,
+        vec![mqtt_codec::Property::TopicAlias(9999)],
+    )
+    .await;
+    bad.expect_disconnect(0x94).await;
+    assert_eq!(
+        gone(&mut watcher).await,
+        ("gone/dev-p".into(), "topic_alias_invalid".into())
+    );
+
+    let dropped = Client::connect(broker.addr, "dev-e").await;
+    drop(dropped);
+    assert_eq!(
+        gone(&mut watcher).await,
+        ("gone/dev-e".into(), "tcp_closed".into())
+    );
+}
+
+/// EMQX evaluates a publish's rules on `emqx_message:clean_dup(Msg)`, so a rule reads
+/// `flags.dup` as `false` even for a PUBLISH that set it.
+#[tokio::test]
+async fn a_rule_reads_the_dup_flag_as_false() {
+    let broker = start_broker(
+        r#"
+        [rules.flags]
+        sql = 'SELECT flags FROM "d/#"'
+        actions = [{ function = "republish", args = { topic = "flags", payload = "${.}" } }]
+        "#,
+    )
+    .await;
+    let mut sub = Client::connect(broker.addr, "sub-dup").await;
+    sub.subscribe(1, "flags", QoS::AtMostOnce).await;
+    let mut publ = Client::connect(broker.addr, "pub-dup").await;
+    publ.send(&Packet::Publish(mqtt_codec::packet::Publish {
+        dup: true,
+        qos: QoS::AtLeastOnce,
+        retain: false,
+        topic: "d/1".into(),
+        pkid: Some(7),
+        payload: bytes::Bytes::from_static(b"x"),
+        properties: mqtt_codec::Properties::new(),
+    }))
+    .await;
+    assert_eq!(publ.recv().await, Packet::PubAck(7.into()));
+    assert_eq!(
+        next_publish(&mut sub).await,
+        (
+            "flags".into(),
+            br#"{"flags":{"dup":false,"retain":false}}"#.to_vec(),
+            QoS::AtMostOnce
+        )
+    );
+}
+
+/// `client.check_authz_complete` for every publish (the Will's, at CONNECT, included) and
+/// subscribe: `authz_source` is `file` when a rule of the ACL file decided and `default`
+/// when none matched (EMQX's `authorization.no_match`); a `$SYS` publish, which the broker
+/// refuses whatever the ACL says, is a `default` denial.
+#[tokio::test]
+async fn authorization_events_name_the_acl_file_or_the_default() {
+    let acl = mqtt_auth::acl::AclPolicy::from_toml_str(
+        r#"
+        [[rules]]
+        actions = ["publish", "subscribe"]
+        topics = ["ok/#", "authz/#"]
+        "#,
+    )
+    .unwrap();
+    let broker = start_node_with(
+        "rules-test",
+        r#"
+        [rules.authz]
+        sql = '''SELECT topic, action, authz_source, result FROM "$events/auth/check_authz_complete" WHERE clientid = 'dev-z' '''
+        actions = [{ function = "republish", args = { topic = "authz/x", payload = "${.}" } }]
+        "#,
+        Arc::new(mqtt_auth::basic::BasicAuthenticator {
+            allow_anonymous: true,
+        }),
+        Arc::new(acl),
+    )
+    .await
+    .0;
+    let mut watcher = Client::connect(broker.addr, "watcher").await;
+    watcher.subscribe(1, "authz/#", QoS::AtMostOnce).await;
+    let mut dev = Client::open(broker.addr, mqtt_codec::ProtocolVersion::V311).await;
+    dev.connect_with_will("dev-z", "ok/will", b"bye").await;
+    dev.publish("ok/1", b"x", QoS::AtMostOnce, None, vec![])
+        .await;
+    dev.publish("no/1", b"x", QoS::AtMostOnce, None, vec![])
+        .await;
+    dev.publish("$SYS/x", b"x", QoS::AtMostOnce, None, vec![])
+        .await;
+    dev.subscribe(1, "no/#", QoS::AtMostOnce).await;
+    let mut seen = Vec::new();
+    for _ in 0..5 {
+        let p = watcher.expect_publish().await;
+        seen.push(String::from_utf8(p.payload.to_vec()).unwrap());
+    }
+    assert_eq!(
+        seen,
+        [
+            r#"{"topic":"ok/will","action":"publish","authz_source":"file","result":"allow"}"#,
+            r#"{"topic":"ok/1","action":"publish","authz_source":"file","result":"allow"}"#,
+            r#"{"topic":"no/1","action":"publish","authz_source":"default","result":"deny"}"#,
+            r#"{"topic":"$SYS/x","action":"publish","authz_source":"default","result":"deny"}"#,
+            r#"{"topic":"no/#","action":"subscribe","authz_source":"default","result":"deny"}"#,
+        ]
     );
 }

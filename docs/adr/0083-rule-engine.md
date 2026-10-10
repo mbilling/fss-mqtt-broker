@@ -302,3 +302,54 @@ lookup).
 Rule cost is to be lowered only by changes that keep every output, error and counter
 EMQX's. One candidate: evaluating the `WHERE` first only when no field can fail and none
 is hidden by a later `*`.
+
+## Amendment (2026-10-10): events are EMQX's, field by field
+
+The same decision reaches the events. Checked against EMQX's
+`apps/emqx_rule_engine/src/emqx_rule_events.erl` (`event_topics_enum/0`, `eventmsg_*`,
+`match_event_names/1`), `emqx_channel.erl`, `emqx_access_control.erl` and
+`emqx_utils_maps:printable_props/1`:
+
+- **Fields.** Each event carries exactly its EMQX builder's fields, `mountpoint` aside (no
+  such feature). New: `sockname` (the accepted socket's local address, passed from the
+  listener as an `Arrival`), `receive_maximum`, `proto_name`/`proto_ver` on
+  `client.disconnected`, `peername` on the session events and `qos` on
+  `session.unsubscribed` (the hub's UNSUBSCRIBE answer now carries the removed grant's
+  QoS). `expiry_interval` is seconds on `client.connected` and milliseconds on
+  `client.connack` and `client.ping`, as EMQX's builders have it. Addresses print as
+  `emqx_utils:ntoa/1` prints them. `client_attrs` is set only where EMQX sets it, and
+  `username` always (`undefined` when none was sent). A live EMQX 6.3.1 was probed with
+  the same connections and agreed on each of these, `metadata.namespace` aside.
+- **Property maps.** `conn_props`, `disconn_props`, `sub_props` and `unsub_props` carry the
+  packet's properties, printed as `printable_props/1` prints them (`User-Property` always
+  present); `pub_props` shares the printer.
+- **Disconnect reasons.** The hub records why it closed a connection on the outbound
+  channel's shared state before dropping it (`HubClose`): `takenover` (the same client id
+  without clean start), `discarded` (with clean start), `kicked`, `not_authorized`
+  (revocation), `server_busy`, `use_another_server`. A broker close names the reason code
+  it sends (or would send, to an MQTT 3.1.1 client), as `handle_out(disconnect, …)` does;
+  an undecodable packet is `frame_error`/`frame_too_large`; a client close is `tcp_closed`
+  or `ssl_closed` by transport, a socket error its `inet` name. `server_closed`, which
+  EMQX never says, is gone.
+- **New events.** `client.connack` (every CONNACK, refusals included, after
+  `client.connected` as in EMQX), `client.ping`, `client.check_authn_complete` (every
+  authentication and re-authentication) and `client.check_authz_complete` (every publish,
+  the Will's included, and every SUBSCRIBE filter; `authz_source` is `file` when an ACL
+  rule decided, else `default`, read from `Authorizer::explain` only when a rule selects the
+  event). Each is built only after `wants()` says a rule selects it, so the per-publish and
+  per-PINGREQ events cost one uncontended lock when nothing selects them. All run on the
+  connection task, never on the hub loop.
+- **`FROM`.** A wildcard `$events/…` filter selects every event whose EMQX topic it
+  matches; one matching only events mqttd does not raise is refused, one also matching
+  some is warned about. `$sources/…` is refused like `$bridges/…`.
+- **`flags.dup`** is always `false`: EMQX evaluates `emqx_message:clean_dup(Msg)`.
+
+Pinned by `every_event_carries_exactly_emqx_s_fields`,
+`event_values_follow_emqx_s_builders`,
+`wildcard_event_filters_select_what_emqx_s_match_selects` and
+`a_rule_never_sees_the_dup_flag` (mqtt-rules), and end to end by
+`a_connection_s_events_carry_emqx_s_fields_end_to_end`,
+`a_refused_connect_raises_its_connack_and_authentication_events`,
+`a_closed_connection_reports_emqx_s_reason`, `a_rule_reads_the_dup_flag_as_false` and
+`authorization_events_name_the_acl_file_or_the_default` (`tests/rules.rs`). The message
+events stay out of this amendment.

@@ -1271,7 +1271,7 @@ fn events_are_selected_by_either_emqx_spelling() {
         sockname: None,
         node: "n0",
     };
-    let ev = EventInput::client_connected(&info, 5, 60, true, 0, 1);
+    let ev = EventInput::client_connected(&info, &ConnInfo::sample(), 1);
     let mut out = Vec::new();
     set.on_event(&ev, &mut |_, _| {}, &mut out);
     assert_eq!(
@@ -1963,4 +1963,505 @@ fn every_evaluated_rule_reports_its_time_once_after_its_outcomes() {
         &mut Vec::new()
     ));
     assert!(!dry.contains(&"elapsed"), "a dry run is not timed: {dry:?}");
+}
+
+/// The client every event below is about: one with a username, an address and a
+/// listener, so every field EMQX's builder can set is set.
+fn event_client() -> ClientInfo<'static> {
+    ClientInfo {
+        clientid: "c_emqx",
+        username: Some("u_emqx"),
+        peer: Some("192.168.0.10:56431".parse().unwrap()),
+        sockname: Some("10.0.0.1:1883".parse().unwrap()),
+        node: "n0",
+    }
+}
+
+/// An event's field names, sorted.
+fn field_names(ev: &EventInput) -> Vec<String> {
+    let mut names: Vec<String> = ev.all_fields().iter().map(|(k, _)| k.to_string()).collect();
+    names.sort();
+    names
+}
+
+fn json_of(ev: &EventInput, field: &str) -> String {
+    ev.field(field).to_json().unwrap()
+}
+
+fn no_props() -> Map {
+    printable_props::<&str, &str>(&[], [])
+}
+
+/// Every event carries exactly the fields EMQX's builder for it sets
+/// (`emqx_rule_events:eventmsg_*` plus `with_basic_columns/3`'s `event`, `timestamp` and
+/// `node`; emqx/emqx `apps/emqx_rule_engine/src/emqx_rule_events.erl`) — no more, and
+/// none missing but `mountpoint`, which mqttd has no feature for. A field dropped from a
+/// builder, or added to the wrong event, fails here.
+// One table row per event: long by the number of fields EMQX's builders set.
+#[allow(clippy::too_many_lines)]
+#[test]
+fn every_event_carries_exactly_emqx_s_fields() {
+    let c = event_client();
+    let conn = ConnInfo::sample();
+    let cases: Vec<(EventInput, &[&str])> = vec![
+        (
+            // eventmsg_connected/2
+            EventInput::client_connected(&c, &conn, 1),
+            &[
+                "clean_start",
+                "client_attrs",
+                "clientid",
+                "conn_props",
+                "connected_at",
+                "event",
+                "expiry_interval",
+                "is_bridge",
+                "keepalive",
+                "node",
+                "peername",
+                "proto_name",
+                "proto_ver",
+                "receive_maximum",
+                "sockname",
+                "timestamp",
+                "username",
+            ],
+        ),
+        (
+            // eventmsg_disconnected/3
+            EventInput::client_disconnected(&c, 5, "normal", no_props(), 1),
+            &[
+                "client_attrs",
+                "clientid",
+                "connected_at",
+                "disconn_props",
+                "disconnected_at",
+                "event",
+                "node",
+                "peername",
+                "proto_name",
+                "proto_ver",
+                "reason",
+                "sockname",
+                "timestamp",
+                "username",
+            ],
+        ),
+        (
+            // eventmsg_connack/2
+            EventInput::client_connack(&c, &conn, "success", Some(1)),
+            &[
+                "clean_start",
+                "clientid",
+                "conn_props",
+                "connected_at",
+                "event",
+                "expiry_interval",
+                "keepalive",
+                "node",
+                "peername",
+                "proto_name",
+                "proto_ver",
+                "reason_code",
+                "sockname",
+                "timestamp",
+                "username",
+            ],
+        ),
+        (
+            // eventmsg_ping/2
+            EventInput::client_ping(&c, &conn),
+            &[
+                "clean_start",
+                "clientid",
+                "conn_props",
+                "event",
+                "expiry_interval",
+                "keepalive",
+                "node",
+                "peername",
+                "proto_name",
+                "proto_ver",
+                "sockname",
+                "timestamp",
+                "username",
+            ],
+        ),
+        (
+            // eventmsg_check_authn_complete/2
+            EventInput::check_authn_complete(&c, "success", false),
+            &[
+                "client_attrs",
+                "clientid",
+                "event",
+                "is_anonymous",
+                "is_superuser",
+                "node",
+                "peername",
+                "reason_code",
+                "timestamp",
+                "username",
+            ],
+        ),
+        (
+            // eventmsg_check_authz_complete/5
+            EventInput::check_authz_complete(&c, "t/1", "publish", "file", true),
+            &[
+                "action",
+                "authz_source",
+                "client_attrs",
+                "clientid",
+                "event",
+                "node",
+                "peerhost",
+                "peername",
+                "result",
+                "timestamp",
+                "topic",
+                "username",
+            ],
+        ),
+        (
+            // eventmsg_sub_or_unsub/4, session.subscribed
+            EventInput::session_subscribed(&c, "t/#", 1, no_props()),
+            &[
+                "client_attrs",
+                "clientid",
+                "event",
+                "node",
+                "peerhost",
+                "peername",
+                "qos",
+                "sub_props",
+                "timestamp",
+                "topic",
+                "username",
+            ],
+        ),
+        (
+            // eventmsg_sub_or_unsub/4, session.unsubscribed
+            EventInput::session_unsubscribed(&c, "t/#", 1, no_props()),
+            &[
+                "client_attrs",
+                "clientid",
+                "event",
+                "node",
+                "peerhost",
+                "peername",
+                "qos",
+                "timestamp",
+                "topic",
+                "unsub_props",
+                "username",
+            ],
+        ),
+    ];
+    for (ev, want) in cases {
+        assert_eq!(field_names(&ev), want, "{}", ev.kind().event_name());
+        assert_eq!(
+            ev.field("event").as_str(),
+            Some(ev.kind().event_name()),
+            "the event field names the hook"
+        );
+    }
+}
+
+/// The values EMQX's builders put in those fields where its builders differ from one
+/// another: `expiry_interval` is seconds on `client.connected` (EMQX divides its
+/// milliseconds by 1000 there) but milliseconds on `client.connack` and `client.ping`;
+/// addresses print as `emqx_utils:ntoa/1` does; `result`, `action` and `reason_code` are
+/// strings; `is_superuser` is always false in mqttd.
+#[test]
+fn event_values_follow_emqx_s_builders() {
+    let c = event_client();
+    let conn = ConnInfo {
+        proto_ver: 4,
+        keepalive: 30,
+        clean_start: false,
+        expiry_interval: 7200,
+        receive_maximum: 32,
+        conn_props: no_props(),
+    };
+    let connected = EventInput::client_connected(&c, &conn, 7);
+    assert_eq!(json_of(&connected, "expiry_interval"), "7200");
+    assert_eq!(json_of(&connected, "receive_maximum"), "32");
+    assert_eq!(json_of(&connected, "proto_name"), r#""MQTT""#);
+    assert_eq!(json_of(&connected, "proto_ver"), "4");
+    assert_eq!(json_of(&connected, "is_bridge"), "false");
+    assert_eq!(json_of(&connected, "peername"), r#""192.168.0.10:56431""#);
+    assert_eq!(json_of(&connected, "sockname"), r#""10.0.0.1:1883""#);
+    assert_eq!(json_of(&connected, "conn_props"), r#"{"User-Property":{}}"#);
+    assert_eq!(json_of(&connected, "client_attrs"), "{}");
+    for ev in [
+        EventInput::client_connack(&c, &conn, "success", Some(7)),
+        EventInput::client_ping(&c, &conn),
+    ] {
+        assert_eq!(
+            json_of(&ev, "expiry_interval"),
+            "7200000",
+            "{:?}",
+            ev.kind()
+        );
+        assert_eq!(json_of(&ev, "clean_start"), "false");
+    }
+    let refused = EventInput::client_connack(&c, &conn, "not_authorized", None);
+    assert_eq!(json_of(&refused, "reason_code"), r#""not_authorized""#);
+    assert!(
+        refused.field("connected_at").is_undefined(),
+        "only a success connected"
+    );
+
+    let authz = EventInput::check_authz_complete(&c, "t/1", "subscribe", "default", false);
+    assert_eq!(json_of(&authz, "result"), r#""deny""#);
+    assert_eq!(json_of(&authz, "action"), r#""subscribe""#);
+    assert_eq!(json_of(&authz, "authz_source"), r#""default""#);
+    assert_eq!(json_of(&authz, "peerhost"), r#""192.168.0.10""#);
+    let failed = EventInput::check_authn_complete(&c, "bad_username_or_password", true);
+    assert_eq!(
+        json_of(&failed, "reason_code"),
+        r#""bad_username_or_password""#
+    );
+    assert_eq!(json_of(&failed, "is_anonymous"), "true");
+    assert_eq!(json_of(&failed, "is_superuser"), "false");
+
+    let unsub = EventInput::session_unsubscribed(&c, "t/#", 2, no_props());
+    assert_eq!(json_of(&unsub, "qos"), "2");
+    assert_eq!(json_of(&unsub, "unsub_props"), r#"{"User-Property":{}}"#);
+
+    // A client that sent no username: EMQX's builders still set the key, to `undefined`.
+    let anonymous = ClientInfo {
+        username: None,
+        ..c
+    };
+    let ev = EventInput::check_authn_complete(&anonymous, "success", true);
+    assert!(field_names(&ev).contains(&"username".to_string()));
+    assert_eq!(json_of(&ev, "username"), r#""undefined""#);
+}
+
+/// `emqx_utils:ntoa/1`: an IPv6 peer prints unbracketed, and an IPv4-mapped one as the
+/// IPv4 address it carries — on events and on messages alike.
+#[test]
+fn addresses_print_as_emqx_prints_them() {
+    assert_eq!(ntoa("[::1]:1883".parse().unwrap()), "::1:1883");
+    assert_eq!(
+        ntoa("[::ffff:10.1.2.3]:5000".parse().unwrap()),
+        "10.1.2.3:5000"
+    );
+    assert_eq!(ntoa("127.0.0.1:1883".parse().unwrap()), "127.0.0.1:1883");
+    let props = mqtt_core::AppProperties::default();
+    let payload = Bytes::new();
+    let mut m = PublishInput::new("c", "t", &payload, 0, &props);
+    m.peer = Some("[::ffff:10.1.2.3]:5000".parse().unwrap());
+    assert_eq!(m.field("peerhost").as_str(), Some("10.1.2.3"));
+    assert_eq!(m.field("peername").as_str(), Some("10.1.2.3:5000"));
+}
+
+/// `emqx_utils_maps:printable_props/1`: `User-Property` is always there (a map, the last
+/// value of a repeated key), `User-Property-Pairs` keeps every pair in order when there
+/// was one, and the other properties keep their names.
+#[test]
+fn property_maps_print_as_emqx_prints_them() {
+    assert_eq!(
+        Value::from(no_props()).to_json().unwrap(),
+        r#"{"User-Property":{}}"#
+    );
+    let m = printable_props(
+        &[("k", "1"), ("k", "2")],
+        [("Session-Expiry-Interval", Value::Int(7200))],
+    );
+    assert_eq!(
+        Value::from(m).to_json().unwrap(),
+        r#"{"User-Property":{"k":"2"},"User-Property-Pairs":[{"key":"k","value":"1"},{"key":"k","value":"2"}],"Session-Expiry-Interval":7200}"#
+    );
+}
+
+/// EMQX evaluates the publish hook on `emqx_message:clean_dup(Msg)`
+/// (`emqx_broker:publish/1`), so a rule always reads `flags.dup` as `false`.
+#[test]
+fn a_rule_never_sees_the_dup_flag() {
+    assert_eq!(
+        one("SELECT flags FROM \"t/#\"", "{}"),
+        r#"{"flags":{"dup":false,"retain":false}}"#
+    );
+}
+
+/// EMQX's reason-code vocabulary (`emqx_reason_codes:name/1`) and its disconnect reason
+/// (`emqx_channel:disconnect_reason/1`: `normal` for `0x00`, the name otherwise).
+#[test]
+fn reason_codes_are_named_as_emqx_names_them() {
+    assert_eq!(reason_code_name(0x00), "success");
+    assert_eq!(disconnect_reason(0x00), "normal");
+    for (code, name) in [
+        (0x04, "disconnect_with_will_message"),
+        (0x82, "protocol_error"),
+        (0x85, "client_identifier_not_valid"),
+        (0x86, "bad_username_or_password"),
+        (0x87, "not_authorized"),
+        (0x8C, "bad_authentication_method"),
+        (0x8D, "keepalive_timeout"),
+        (0x90, "topic_name_invalid"),
+        (0x93, "receive_maximum_exceeded"),
+        (0x94, "topic_alias_invalid"),
+        (0x97, "quota_exceeded"),
+        (0x9C, "use_another_server"),
+        (0x03, "unknown_error"),
+    ] {
+        assert_eq!(reason_code_name(code), name, "{code:#04x}");
+        assert_eq!(disconnect_reason(code), name, "{code:#04x}");
+    }
+}
+
+/// EMQX's event topics (`emqx_rule_events:event_topics_enum/0`): each new event in both
+/// spellings where EMQX has both, and `client/ping` only namespaced; a `FROM` names it by
+/// either, and `EventKind::parse` by its hook name too.
+#[test]
+fn the_new_events_are_named_as_emqx_names_them() {
+    for (topic, kind) in [
+        ("$events/client/connack", EventKind::ClientConnack),
+        ("$events/client_connack", EventKind::ClientConnack),
+        ("$events/client/ping", EventKind::ClientPing),
+        (
+            "$events/auth/check_authn_complete",
+            EventKind::CheckAuthnComplete,
+        ),
+        (
+            "$events/client_check_authn_complete",
+            EventKind::CheckAuthnComplete,
+        ),
+        (
+            "$events/auth/check_authz_complete",
+            EventKind::CheckAuthzComplete,
+        ),
+        (
+            "$events/client_check_authz_complete",
+            EventKind::CheckAuthzComplete,
+        ),
+    ] {
+        assert_eq!(EventKind::from_topic(topic), Some(kind), "{topic}");
+        assert_eq!(EventKind::parse(topic), Some(kind), "{topic}");
+        assert_eq!(EventKind::parse(kind.event_name()), Some(kind));
+        assert_eq!(EventKind::from_topic(kind.topic()), Some(kind));
+    }
+    assert_eq!(
+        EventKind::from_topic("$events/client_ping"),
+        None,
+        "EMQX has no alias"
+    );
+    assert_eq!(EventKind::ALL.len(), EventKind::COUNT);
+    for (i, k) in EventKind::ALL.iter().enumerate() {
+        assert_eq!(k.index(), i);
+    }
+}
+
+/// EMQX matches a `FROM "$events/…"` filter against its event topics with
+/// `emqx_topic:match/2` (`match_event_names/1`): a wildcard selects every event it
+/// matches, in either spelling, once. One matching only events mqttd does not raise is
+/// refused; one also matching those loads, with a warning naming them.
+#[test]
+fn wildcard_event_filters_select_what_emqx_s_match_selects() {
+    let m = EventKind::matching("$events/client/+");
+    assert_eq!(
+        m.kinds,
+        [
+            EventKind::ClientConnected,
+            EventKind::ClientDisconnected,
+            EventKind::ClientConnack,
+            EventKind::ClientPing
+        ]
+    );
+    assert!(m.unsupported.is_empty());
+    assert_eq!(
+        EventKind::matching("$events/auth/#").kinds,
+        [EventKind::CheckAuthnComplete, EventKind::CheckAuthzComplete]
+    );
+    assert_eq!(
+        EventKind::matching("$events/+").kinds,
+        [
+            EventKind::ClientConnected,
+            EventKind::ClientDisconnected,
+            EventKind::ClientConnack,
+            EventKind::CheckAuthnComplete,
+            EventKind::CheckAuthzComplete,
+            EventKind::SessionSubscribed,
+            EventKind::SessionUnsubscribed
+        ],
+        "the underscore spellings are one level; ping has none"
+    );
+    let all = EventKind::matching("$events/#");
+    assert_eq!(all.kinds, EventKind::ALL);
+    assert!(all.unsupported.contains(&"$events/message/delivered"));
+
+    let set = load(
+        r#"
+        [rules.clients]
+        sql = 'SELECT clientid FROM "$events/client/+"'
+        actions = [{ function = "console" }]
+        "#,
+    );
+    for k in EventKind::ALL {
+        assert_eq!(
+            set.wants_event(k),
+            k.topic().starts_with("$events/client/"),
+            "{k:?}"
+        );
+    }
+    let loaded = RuleSet::parse(
+        "[rules.all]\nsql = 'SELECT clientid FROM \"$events/#\"'\nactions = [{ function = \"console\" }]\n",
+    )
+    .unwrap();
+    assert!(EventKind::ALL.iter().all(|k| loaded.rules.wants_event(*k)));
+    assert!(
+        loaded.warnings[0].contains("also matches events mqttd does not raise")
+            && loaded.warnings[0].contains("$events/message/delivered"),
+        "{:?}",
+        loaded.warnings
+    );
+    for (sql, needle) in [
+        (
+            "SELECT * FROM \"$events/message/+\"",
+            "matches no event mqttd raises",
+        ),
+        (
+            "SELECT * FROM \"$events/client/#/x\"",
+            "is not a valid topic filter",
+        ),
+        (
+            "SELECT * FROM \"$sources/mqtt:in\"",
+            "no data integration sources",
+        ),
+        (
+            "SELECT * FROM \"$events/client/pong\"",
+            "is not a supported event",
+        ),
+    ] {
+        let e = RuleSet::parse(&format!("[rules.r]\nsql = '{sql}'\n"))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains(needle), "{sql}: {e}");
+    }
+}
+
+/// A rule selecting one of the new events runs on it, and only on it.
+#[test]
+fn the_new_events_run_the_rules_that_select_them() {
+    let set = load(
+        r#"
+        [rules.denied]
+        sql = '''SELECT clientid, topic, action FROM "$events/auth/check_authz_complete" WHERE result = 'deny' '''
+        actions = [{ function = "console" }]
+        "#,
+    );
+    assert!(set.wants_event(EventKind::CheckAuthzComplete));
+    assert!(!set.wants_event(EventKind::ClientPing));
+    let c = event_client();
+    let mut out = Vec::new();
+    for allowed in [true, false] {
+        let ev = EventInput::check_authz_complete(&c, "t/1", "publish", "file", allowed);
+        set.on_event(&ev, &mut |_, _| {}, &mut out);
+    }
+    assert_eq!(out.len(), 1, "only the denial passes the WHERE");
+    assert!(matches!(
+        &out[0].1,
+        Effect::Console(json) if json == r#"{"clientid":"c_emqx","topic":"t/1","action":"publish"}"#
+    ));
 }

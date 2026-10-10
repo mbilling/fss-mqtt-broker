@@ -3860,6 +3860,10 @@ async fn serve_tls_clients(
             async move {
                 // Built from the raw socket before TLS wraps it (#825).
                 let watch = conn::PeerClosedWatch::new(&stream);
+                let arrival = conn::Arrival {
+                    sockname: stream.local_addr().ok(),
+                    transport: mqtt_net::Transport::Tls,
+                };
                 match acceptor.accept(stream).await {
                     Ok(tls_stream) => {
                         // mTLS admission (ADR 0004/0040): the verified leaf cert's CN + serial.
@@ -3868,6 +3872,7 @@ async fn serve_tls_clients(
                             conn::handle_stream_watched(
                                 tls_stream,
                                 Some(peer),
+                                arrival,
                                 cert,
                                 policy,
                                 hub,
@@ -3912,8 +3917,21 @@ async fn serve_plaintext_clients(
             let policy = per_conn_policy.clone();
             async move {
                 let watch = conn::PeerClosedWatch::new(&stream);
+                let arrival = conn::Arrival {
+                    sockname: stream.local_addr().ok(),
+                    transport: mqtt_net::Transport::PlainTcp,
+                };
                 Some(
-                    conn::handle_stream_watched(stream, Some(peer), None, policy, hub, watch).await,
+                    conn::handle_stream_watched(
+                        stream,
+                        Some(peer),
+                        arrival,
+                        None,
+                        policy,
+                        hub,
+                        watch,
+                    )
+                    .await,
                 )
             }
         },
@@ -3946,9 +3964,22 @@ async fn serve_ws_clients(
             async move {
                 // Built from the raw socket before WebSocket wraps it (#825).
                 let watch = conn::PeerClosedWatch::new(&stream);
+                let arrival = conn::Arrival {
+                    sockname: stream.local_addr().ok(),
+                    transport: mqtt_net::Transport::WebSocket,
+                };
                 match mqtt_net::ws::accept(stream).await {
                     Ok(ws) => Some(
-                        conn::handle_stream_watched(ws, Some(peer), None, policy, hub, watch).await,
+                        conn::handle_stream_watched(
+                            ws,
+                            Some(peer),
+                            arrival,
+                            None,
+                            policy,
+                            hub,
+                            watch,
+                        )
+                        .await,
                     ),
                     Err(e) => {
                         debug!(%peer, error = %e, "websocket handshake failed");
@@ -3994,6 +4025,10 @@ async fn serve_wss_clients(
             async move {
                 // Built from the raw socket before TLS and WebSocket wrap it (#825).
                 let watch = conn::PeerClosedWatch::new(&stream);
+                let arrival = conn::Arrival {
+                    sockname: stream.local_addr().ok(),
+                    transport: mqtt_net::Transport::WebSocketTls,
+                };
                 match acceptor.accept(stream).await {
                     Ok(tls) => {
                         // mTLS admission (ADR 0004/0040): the verified leaf cert's CN + serial —
@@ -4004,6 +4039,7 @@ async fn serve_wss_clients(
                                 conn::handle_stream_watched(
                                     ws,
                                     Some(peer),
+                                    arrival,
                                     cert,
                                     policy,
                                     hub,
@@ -4066,6 +4102,8 @@ async fn serve_quic_clients(
         let hub = hub_tx.clone();
         let policy = policy.clone();
         let gate = gate.clone();
+        // The listener's address, the `sockname` rules see (ADR 0083).
+        let sockname = endpoint.local_addr();
         connections.spawn(async move {
             let _permit = permit; // slot freed when the connection task ends
             let conn = match incoming.await {
@@ -4097,11 +4135,16 @@ async fn serve_quic_clients(
             // streams the client opens feed PUBLISH into the same session, no HoL blocking.
             // A paused session still sees the connection close (#825).
             let watch = conn::PeerClosedWatch::quic(&conn);
+            let arrival = conn::Arrival {
+                sockname: sockname.ok(),
+                transport: mqtt_net::Transport::Quic,
+            };
             match mqtt_net::quic::accept_mux(conn).await {
                 Ok(mux) => {
                     let outcome = conn::handle_stream_watched(
                         mux,
                         Some(peer),
+                        arrival,
                         cert,
                         policy,
                         hub,
@@ -4702,15 +4745,14 @@ fn rule_test_cli() -> ! {
             std::process::exit(1);
         }
         (Ok(_), Some(name)) => {
-            let kind = mqtt_rules::EventKind::ALL.into_iter().find(|k| {
-                let topic = name.trim_start_matches("$events/");
-                k.event_name() == name
-                    || mqtt_rules::EventKind::from_topic(&format!("$events/{topic}")) == Some(*k)
-            });
-            let Some(kind) = kind else {
+            let Some(kind) = mqtt_rules::EventKind::parse(&name) else {
+                let names: Vec<&str> = mqtt_rules::EventKind::ALL
+                    .iter()
+                    .map(|k| k.event_name())
+                    .collect();
                 eprintln!(
-                    "error: --event takes client.connected, client.disconnected, \
-                     session.subscribed or session.unsubscribed, not {name:?}"
+                    "error: --event takes one of {}, not {name:?}",
+                    names.join(", ")
                 );
                 std::process::exit(2);
             };
@@ -4722,13 +4764,12 @@ fn rule_test_cli() -> ! {
     let sample;
     let input: &dyn mqtt_rules::Input = match event {
         Some(kind) => {
-            // No `sockname`: the broker's own events do not carry one, and a sample
-            // must show what a rule will really see.
+            // A client of the default plaintext listener, as a real event would show it.
             let client = mqtt_rules::ClientInfo {
                 clientid: &clientid,
                 username: username.as_deref(),
                 peer: "127.0.0.1:52345".parse().ok(),
-                sockname: None,
+                sockname: "127.0.0.1:1883".parse().ok(),
                 node: "rule-test",
             };
             sample = mqtt_rules::EventInput::sample(kind, &client, &topic, qos);
@@ -5506,6 +5547,8 @@ fn wire_limits_from_config(
         max_packet_size,
         // Per-connection publish-rate throttle (ADR 0041 T3); unset = unlimited.
         publish_rate,
+        // The hub's outbound in-flight cap, for the `receive_maximum` rules see.
+        max_inflight_messages: l.max_inflight_messages,
     })
 }
 

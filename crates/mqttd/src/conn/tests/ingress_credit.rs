@@ -961,15 +961,22 @@ async fn a_batch_waiting_for_credit_releases_its_originals_credit_first() {
         payload: &payload,
         qos: QoS::AtLeastOnce,
         retain: false,
-        dup: false,
         app: &app,
         message_expiry: None,
     });
     assert_eq!(derived.len(), 1);
+    let no_props = mqtt_codec::Properties::new();
     let rule_conn = RuleConn {
         publisher,
-        close_reason: std::sync::atomic::AtomicU8::new(0),
-        client_code: std::sync::atomic::AtomicU8::new(0),
+        arrival: crate::conn::Arrival::default(),
+        close_reason: std::sync::Mutex::new(None),
+        disconn_props: std::sync::Mutex::new(None),
+        conn_props: &no_props,
+        proto_ver: 5,
+        keepalive: 0,
+        clean_start: true,
+        expiry_interval: 0,
+        receive_maximum: u16::MAX,
         rules: Some(rules),
         parked_batch: std::sync::Mutex::new(None),
     };

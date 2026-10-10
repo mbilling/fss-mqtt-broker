@@ -892,7 +892,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::sink_records_through_a_trait_object`
 - `tests::tampering_with_any_field_changes_the_head`
 
-## `crates/mqtt-rules/src/lib.rs` — 98 test(s)
+## `crates/mqtt-rules/src/lib.rs` — 107 test(s)
 
 - `edit::tests::a_json_rule_body_is_a_rule_edit`
 - `edit::tests::an_insert_appends_the_rule_at_the_end`
@@ -925,6 +925,8 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::a_messages_effects_share_one_byte_budget`
 - `tests::a_non_json_payload_fails_only_rules_that_reach_into_it`
 - `tests::a_republish_into_sys_fails_its_action`
+- `tests::a_rule_never_sees_the_dup_flag`
+- `tests::addresses_print_as_emqx_prints_them`
 - `tests::arithmetic_follows_erlang`
 - `tests::case_expression_emqx_docs`
 - `tests::comments_and_case_insensitive_keywords`
@@ -932,8 +934,10 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::conditional_functions`
 - `tests::conversion_functions_emqx_docs`
 - `tests::double_quoted_comparisons_warn_but_parse_as_fields`
+- `tests::event_values_follow_emqx_s_builders`
 - `tests::events_are_selected_by_either_emqx_spelling`
 - `tests::every_evaluated_rule_reports_its_time_once_after_its_outcomes`
+- `tests::every_event_carries_exactly_emqx_s_fields`
 - `tests::every_function_is_documented_in_rules_md`
 - `tests::expressions_emqx_docs`
 - `tests::expressions_too_deep_to_evaluate_safely_fail_the_load`
@@ -957,7 +961,9 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::payload_shapes_cannot_make_evaluation_quadratic`
 - `tests::payload_supplied_sizes_are_bounded`
 - `tests::payload_values_cannot_crash_the_evaluator`
+- `tests::property_maps_print_as_emqx_prints_them`
 - `tests::quadratic_string_growth_is_refused_before_it_is_allocated`
+- `tests::reason_codes_are_named_as_emqx_names_them`
 - `tests::republish_args_render`
 - `tests::republish_defaults_follow_emqx`
 - `tests::rules_aimed_at_sys_load_with_a_warning`
@@ -965,6 +971,8 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::select_star_has_emqx_fields`
 - `tests::string_functions_emqx_docs`
 - `tests::the_growth_budget_is_per_message`
+- `tests::the_new_events_are_named_as_emqx_names_them`
+- `tests::the_new_events_run_the_rules_that_select_them`
 - `tests::the_sql_test_simulates_events_and_refuses_inputs_the_rule_never_sees`
 - `tests::the_trace_rate_window_is_per_rule_per_second`
 - `tests::the_where_reads_the_input_with_the_selection_merged_over_it`
@@ -974,6 +982,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::unaliased_payload_path_nests_under_payload`
 - `tests::user_properties_and_pub_props_emqx_docs`
 - `tests::where_filters_and_can_use_select_aliases`
+- `tests::wildcard_event_filters_select_what_emqx_s_match_selects`
 - `tests_emqx_examples::array_functions_match_emqx_examples`
 - `tests_emqx_examples::bit_functions_match_emqx_examples`
 - `tests_emqx_examples::conditional_functions_match_emqx_examples`
@@ -2180,25 +2189,30 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 
 - `a_rolled_node_disconnects_only_its_own_clients`
 
-## `crates/mqttd/tests/rules.rs` — 15 test(s)
+## `crates/mqttd/tests/rules.rs` — 20 test(s)
 
+- `a_closed_connection_reports_emqx_s_reason`
+- `a_connection_s_events_carry_emqx_s_fields_end_to_end`
 - `a_disconnect_reason_code_is_reported_by_its_emqx_name`
 - `a_matching_publish_is_transformed_and_republished_beside_the_original`
 - `a_qos1_publish_acks_and_its_derived_message_is_qos1`
 - `a_qos2_publish_fires_its_rules_once_across_a_dup_resend`
+- `a_refused_connect_raises_its_connack_and_authentication_events`
 - `a_refused_derived_message_fails_its_action_and_the_original_is_still_acked`
 - `a_refused_original_routes_none_of_its_derived_messages`
 - `a_reload_reaches_connections_that_were_already_open`
+- `a_rule_reads_the_dup_flag_as_false`
 - `a_rule_republishing_into_its_own_from_cannot_loop`
 - `a_rule_that_does_not_select_qos_republishes_a_qos1_publish_at_qos0`
 - `a_will_runs_rules_when_the_hub_publishes_it`
 - `an_event_derived_message_is_counted_when_routed_and_a_refused_copy_as_a_drop`
 - `an_idle_connection_releases_a_superseded_rule_set_when_it_pings`
+- `authorization_events_name_the_acl_file_or_the_default`
 - `client_events_run_rules`
 - `foreach_fans_one_publish_out`
 - `in_a_cluster_each_message_is_evaluated_once_on_its_landing_node`
 
-## `crates/mqttd/tests/rules_binary.rs` — 45 test(s)
+## `crates/mqttd/tests/rules_binary.rs` — 46 test(s)
 
 - `a_closed_stdout_leaves_probe_and_backup_their_exit_status`
 - `a_closed_stdout_neither_panics_a_command_nor_changes_its_exit_status`
@@ -2227,6 +2241,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `check_rules_refuses_a_sql_syntax_error_with_its_position`
 - `check_rules_refuses_an_event_mqttd_does_not_raise`
 - `check_rules_refuses_an_unknown_function`
+- `check_rules_refuses_wildcards_matching_no_raised_event_and_sources`
 - `check_rules_with_no_file_checks_the_configured_rules_file`
 - `client_connected_carries_the_connects_fields_for_v5_and_v311`
 - `client_disconnected_reports_normal_tcp_closed_and_a_v5_reason_by_its_emqx_name`

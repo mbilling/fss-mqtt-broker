@@ -2639,12 +2639,36 @@ RULE_FUNCS_UNSUPPORTED = (
     "contains_topic_match", "str_utf16_le_decode",
 )
 
-# The `$events/...` topics mqttd's engine selects, in both EMQX spellings.
-RULE_EVENTS_SUPPORTED = (
-    "client/connected", "client_connected", "client/disconnected", "client_disconnected",
-    "session/subscribed", "session_subscribed", "session/unsubscribed",
-    "session_unsubscribed",
-)
+# Every `$events/...` topic EMQX accepts in a FROM (emqx_rule_events:event_topics_enum/0,
+# both spellings), and whether mqttd's engine raises that event.
+RULE_EVENT_TOPICS = {
+    "sys/alarm_activated": False, "sys/alarm_deactivated": False,
+    "client/connected": True, "client/disconnected": True, "client/connack": True,
+    "client/ping": True, "auth/check_authn_complete": True,
+    "auth/check_authz_complete": True, "session/subscribed": True,
+    "session/unsubscribed": True, "message/delivered": False, "message/acked": False,
+    "message/dropped": False, "message/delivery_dropped": False,
+    "message_transformation/failed": False, "schema_validation/failed": False,
+    "client_connected": True, "client_disconnected": True, "client_connack": True,
+    "client_check_authn_complete": True, "client_check_authz_complete": True,
+    "session_subscribed": True, "session_unsubscribed": True, "message_delivered": False,
+    "message_acked": False, "message_dropped": False, "delivery_dropped": False,
+    "message_transformation_failed": False, "schema_validation_failed": False,
+}
+
+# The `$events/...` topics mqttd's engine selects.
+RULE_EVENTS_SUPPORTED = tuple(t for t, raised in RULE_EVENT_TOPICS.items() if raised)
+
+
+def _topic_filter_matches(flt: str, topic: str) -> bool:
+    """MQTT topic-filter matching (`+` one level, `#` the rest), as emqx_topic:match/2."""
+    fl, tl = flt.split("/"), topic.split("/")
+    for i, part in enumerate(fl):
+        if part == "#":
+            return True
+        if i >= len(tl) or (part != "+" and part != tl[i]):
+            return False
+    return len(fl) == len(tl)
 
 REPUBLISH_ARGS = (
     "topic", "qos", "retain", "payload", "user_properties", "mqtt_properties",
@@ -2677,19 +2701,28 @@ def _toml_inline_value(v: object) -> str:
 
 def _rule_sql_blockers(sql: str) -> str | None:
     """Why mqttd's engine would refuse this statement, for the constructs it lacks."""
-    for m in re.finditer(r'["\'](\$(?:events|bridges)/[^"\']*)["\']', sql):
+    raised = ", ".join(t for t in RULE_EVENTS_SUPPORTED if "/" in t)
+    for m in re.finditer(r'["\'](\$(?:events|bridges|sources)/[^"\']*)["\']', sql):
         topic = m.group(1)
-        if topic.startswith("$bridges/"):
+        if topic.startswith(("$bridges/", "$sources/")):
             return (
                 f"it selects FROM {topic!r}, an EMQX data-bridge source; mqttd has no data "
                 "bridges. An MQTT source maps onto mqtt-bridge (--out-bridge) delivering into "
                 "a topic this rule can select instead"
             )
-        if topic[len("$events/"):] not in RULE_EVENTS_SUPPORTED:
+        event = topic[len("$events/"):]
+        if "+" in event or "#" in event:
+            # A wildcard selects every event it matches (emqx_rule_events:match_event_names/1);
+            # mqttd loads it when it matches at least one event mqttd raises.
+            if not any(_topic_filter_matches(event, t) for t in RULE_EVENTS_SUPPORTED):
+                return (
+                    f"it selects FROM {topic!r}, which matches no event mqttd's rule engine "
+                    f"raises (it raises {raised})"
+                )
+        elif event not in RULE_EVENTS_SUPPORTED:
             return (
                 f"it selects FROM the event {topic!r}, which mqttd's rule engine does not "
-                "raise (it raises client/connected, client/disconnected, session/subscribed "
-                "and session/unsubscribed)"
+                f"raise (it raises {raised})"
             )
     for fn in RULE_FUNCS_UNSUPPORTED:
         if re.search(rf"\b{fn}\s*\(", sql):

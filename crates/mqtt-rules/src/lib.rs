@@ -46,7 +46,10 @@ mod value;
 pub use action::{Effect, Republish};
 pub use eval::{EvalCtx, MAX_OUTPUTS_PER_TRIGGER};
 pub use funcs::names as function_names;
-pub use input::{now_ms, pub_props, ClientInfo, EventInput, EventKind, PublishInput};
+pub use input::{
+    disconnect_reason, now_ms, ntoa, ntoa_ip, printable_props, pub_props, reason_code_name,
+    ClientInfo, ConnInfo, EventInput, EventKind, EventMatch, PublishInput, EMQX_EVENT_TOPICS,
+};
 pub use value::{json_decode, Map, Value};
 
 /// The most rules one file may define.
@@ -384,7 +387,7 @@ pub struct RuleSet {
     rules: Vec<Rule>,
     topic_index: FilterIndex,
     by_filter: HashMap<FilterKey, Vec<usize>>,
-    by_event: [Vec<usize>; 4],
+    by_event: [Vec<usize>; EventKind::COUNT],
     digest: String,
     warnings: Vec<String>,
 }
@@ -458,6 +461,53 @@ impl From<&str> for CompileError {
     }
 }
 
+/// The events one `FROM "$events/…"` entry selects. A wildcard filter selects every
+/// event whose EMQX topic it matches, as EMQX's `emqx_rule_events:match_event_names/1`
+/// does with `emqx_topic:match/2`, so `"$events/client/+"` selects the client events and
+/// `"$events/#"` all of them; one that matches only events mqttd does not raise is
+/// refused, and one that also matches such events is warned about.
+fn event_sources(from: &str, warnings: &mut Vec<String>) -> Result<Vec<EventKind>, CompileError> {
+    let supported = || {
+        EventKind::ALL
+            .iter()
+            .map(|k| k.topic())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    if !from.contains(['+', '#']) {
+        return EventKind::from_topic(from).map(|k| vec![k]).ok_or_else(|| {
+            format!(
+                "\"{from}\" is not a supported event (supported: {})",
+                supported()
+            )
+            .into()
+        });
+    }
+    if !mqtt_core::valid_filter(from) {
+        return Err(format!("\"{from}\" is not a valid topic filter").into());
+    }
+    let m = EventKind::matching(from);
+    if m.kinds.is_empty() {
+        return Err(format!(
+            "\"{from}\" matches no event mqttd raises (supported: {})",
+            supported()
+        )
+        .into());
+    }
+    if !m.unsupported.is_empty() {
+        warnings.push(format!(
+            "FROM \"{from}\" also matches events mqttd does not raise ({}); it selects {}",
+            m.unsupported.join(", "),
+            m.kinds
+                .iter()
+                .map(|k| k.topic())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    Ok(m.kinds)
+}
+
 /// Compile one statement and its `FROM` list, its literal regex patterns through
 /// `regexes`.
 fn compile(sql: &str, regexes: &mut parser::RegexPool) -> Result<Compiled, CompileError> {
@@ -474,20 +524,22 @@ fn compile(sql: &str, regexes: &mut parser::RegexPool) -> Result<Compiled, Compi
     let (mut topics, mut events) = (Vec::new(), Vec::new());
     for from in &stmt.from {
         if from.starts_with("$events/") {
-            let kind = EventKind::from_topic(from).ok_or_else(|| {
-                CompileError::from(format!(
-                    "\"{from}\" is not a supported event (supported: $events/client/connected, \
-                     $events/client/disconnected, $events/session/subscribed, \
-                     $events/session/unsubscribed)"
-                ))
-            })?;
-            if !events.contains(&kind) {
-                events.push(kind);
+            for kind in event_sources(from, &mut warnings)? {
+                if !events.contains(&kind) {
+                    events.push(kind);
+                }
             }
         } else if from.starts_with("$bridges/") {
             return Err(
                 format!("\"{from}\": mqttd has no data bridges to select from (ADR 0083)").into(),
             );
+        } else if from.starts_with("$sources/") {
+            // EMQX's `$sources/<type>:<name>` is a data integration's ingress (its
+            // `?SOURCE_HOOKPOINT`), a sibling of `$bridges/`.
+            return Err(format!(
+                "\"{from}\": mqttd has no data integration sources to select from (ADR 0083)"
+            )
+            .into());
         } else if mqtt_core::parse_shared(from).is_some() || from.starts_with("$share/") {
             return Err(format!(
                 "\"{from}\": a rule selects messages by topic filter; $share groups are for subscribers"

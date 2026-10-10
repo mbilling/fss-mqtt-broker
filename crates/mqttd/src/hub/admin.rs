@@ -342,6 +342,7 @@ impl Hub {
             return false;
         };
         warn!(client = %client.0, "disconnecting a client by admin action");
+        online.tx.closing(super::HubClose::Kicked);
         if online.admission.protocol == ProtocolVersion::V5 {
             let _ = online.tx.send(Packet::Disconnect(Disconnect {
                 reason: mqtt_codec::reason::ADMINISTRATIVE_ACTION,

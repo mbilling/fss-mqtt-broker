@@ -45,9 +45,7 @@ use bytes::Bytes;
 use mqtt_codec::QoS;
 use mqtt_core::{AppProperties, ClientId};
 use mqtt_observability::metrics::Metrics;
-use mqtt_rules::{
-    ClientInfo, Effect, EventInput, Input, Outcome, PublishInput, Republish, Rule, RuleSet,
-};
+use mqtt_rules::{Effect, EventInput, Input, Outcome, PublishInput, Republish, Rule, RuleSet};
 use tokio::sync::{mpsc, oneshot, watch};
 use tracing::{debug, info, warn};
 
@@ -99,10 +97,9 @@ pub struct PublishFacts<'a> {
     pub payload: &'a Bytes,
     /// Publish `QoS`.
     pub qos: QoS,
-    /// RETAIN flag.
+    /// RETAIN flag. (No DUP flag: a rule never sees one — EMQX evaluates
+    /// `emqx_message:clean_dup(Msg)`, so `flags.dup` is always `false`.)
     pub retain: bool,
-    /// DUP flag.
-    pub dup: bool,
     /// MQTT 5 application properties.
     pub app: &'a AppProperties,
     /// MQTT 5 Message Expiry Interval.
@@ -265,7 +262,6 @@ fn evaluate(
     input.username = f.publisher.username.as_deref();
     input.peer = f.publisher.peer;
     input.retain = f.retain;
-    input.dup = f.dup;
     input.message_expiry = f.message_expiry;
     input.node = node;
     let mut effects = Vec::new();
@@ -454,16 +450,10 @@ impl ConnRules {
         self.with_set(|set| set.wants_event(kind))
     }
 
-    /// The `ClientInfo` a client/session event is built from.
+    /// This node's id, the `node` of every event.
     #[must_use]
-    pub fn client_info<'a>(&'a self, client: &'a ClientId, p: &'a Publisher) -> ClientInfo<'a> {
-        ClientInfo {
-            clientid: &client.0,
-            username: p.username.as_deref(),
-            peer: p.peer,
-            sockname: None,
-            node: &self.engine.node,
-        }
+    pub fn node(&self) -> &str {
+        &self.engine.node
     }
 
     /// Evaluate a client/session event and publish what its rules produce
@@ -563,6 +553,64 @@ impl ConnRules {
             holds,
         )
     }
+}
+
+/// A packet's MQTT 5 properties as an event shows them (`conn_props`, `disconn_props`,
+/// `sub_props`, `unsub_props`): EMQX's `emqx_utils_maps:printable_props/1` over the
+/// property map `emqx_frame` decodes, each property under the name `emqx_frame` gives it
+/// — `User-Property` a map plus `User-Property-Pairs`, the rest as decoded. An MQTT
+/// 3.1.1 packet has none, so it prints as `{"User-Property": {}}`.
+#[must_use]
+pub fn printable_props(props: &mqtt_codec::Properties) -> mqtt_rules::Map {
+    use mqtt_codec::Property as P;
+    use mqtt_rules::Value;
+    let int = |n: u32| Value::Int(i64::from(n));
+    let mut user: Vec<(&str, &str)> = Vec::new();
+    let mut rest: Vec<(&'static str, Value)> = Vec::new();
+    for p in &props.0 {
+        let (name, value) = match p {
+            P::UserProperty(k, v) => {
+                user.push((k, v));
+                continue;
+            }
+            P::PayloadFormatIndicator(n) => ("Payload-Format-Indicator", int((*n).into())),
+            P::MessageExpiryInterval(n) => ("Message-Expiry-Interval", int(*n)),
+            P::ContentType(s) => ("Content-Type", Value::from(s.as_str())),
+            P::ResponseTopic(s) => ("Response-Topic", Value::from(s.as_str())),
+            P::CorrelationData(b) => ("Correlation-Data", Value::from_bytes(b)),
+            P::SubscriptionIdentifier(n) => ("Subscription-Identifier", int(*n)),
+            P::SessionExpiryInterval(n) => ("Session-Expiry-Interval", int(*n)),
+            P::AssignedClientIdentifier(s) => {
+                ("Assigned-Client-Identifier", Value::from(s.as_str()))
+            }
+            P::ServerKeepAlive(n) => ("Server-Keep-Alive", int((*n).into())),
+            P::AuthenticationMethod(s) => ("Authentication-Method", Value::from(s.as_str())),
+            P::AuthenticationData(b) => ("Authentication-Data", Value::from_bytes(b)),
+            P::RequestProblemInformation(n) => ("Request-Problem-Information", int((*n).into())),
+            P::WillDelayInterval(n) => ("Will-Delay-Interval", int(*n)),
+            P::RequestResponseInformation(n) => ("Request-Response-Information", int((*n).into())),
+            P::ResponseInformation(s) => ("Response-Information", Value::from(s.as_str())),
+            P::ServerReference(s) => ("Server-Reference", Value::from(s.as_str())),
+            P::ReasonString(s) => ("Reason-String", Value::from(s.as_str())),
+            P::ReceiveMaximum(n) => ("Receive-Maximum", int((*n).into())),
+            P::TopicAliasMaximum(n) => ("Topic-Alias-Maximum", int((*n).into())),
+            P::TopicAlias(n) => ("Topic-Alias", int((*n).into())),
+            P::MaximumQoS(n) => ("Maximum-QoS", int((*n).into())),
+            P::RetainAvailable(n) => ("Retain-Available", int((*n).into())),
+            P::MaximumPacketSize(n) => ("Maximum-Packet-Size", int(*n)),
+            P::WildcardSubscriptionAvailable(n) => {
+                ("Wildcard-Subscription-Available", int((*n).into()))
+            }
+            P::SubscriptionIdentifierAvailable(n) => {
+                ("Subscription-Identifier-Available", int((*n).into()))
+            }
+            P::SharedSubscriptionAvailable(n) => {
+                ("Shared-Subscription-Available", int((*n).into()))
+            }
+        };
+        rest.push((name, value));
+    }
+    mqtt_rules::printable_props(&user, rest)
 }
 
 /// The hub command for one rule-produced message.

@@ -31,7 +31,7 @@
 //! ([`Outbound`]) so `QoS 0`, which nothing else bounds, is shed rather than
 //! accumulated (#123).
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
 /// Re-exported so the binary wires the hub's own bounds type (issue #241).
 pub use crate::backpressure::SubscriberLimits;
@@ -278,8 +278,64 @@ pub struct RemoteSharedGroup {
 #[derive(Clone, Debug)]
 pub struct Outbound {
     tx: mpsc::UnboundedSender<Box<Packet>>,
-    depth: Arc<AtomicUsize>,
-    bytes: Arc<AtomicUsize>,
+    shared: Arc<OutboundShared>,
+}
+
+/// What the hub and a connection's writer share about one outbound channel: the
+/// queue's depth and bytes, and why the hub closed it. One allocation per connection.
+#[derive(Debug, Default)]
+struct OutboundShared {
+    depth: AtomicUsize,
+    bytes: AtomicUsize,
+    /// A [`HubClose`] as `u8`; 0 while the hub has not closed it.
+    close: AtomicU8,
+}
+
+/// Why the hub ended a client's connection — what `$events/client/disconnected` says
+/// as its `reason`, in EMQX's terms (ADR 0083). Recorded on the [`Outbound`] before the
+/// hub drops it, read by the connection once its channel closes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum HubClose {
+    /// A connection for the same client id without clean start took the session over
+    /// (EMQX `takenover`, `emqx_channel:handle_call({takeover, …})`).
+    TakenOver = 1,
+    /// A connection for the same client id with clean start discarded the session
+    /// (EMQX `discarded`, `emqx_channel:handle_call(discard, …)`).
+    Discarded,
+    /// An operator's kick or purge (EMQX `kicked`, `emqx_channel:process_kick/1`).
+    Kicked,
+    /// A revoked identity's eviction (ADR 0040): DISCONNECT `0x87`, EMQX's
+    /// `not_authorized`, as for its expired-authentication close.
+    NotAuthorized,
+    /// The hub could not serve it right now: DISCONNECT `0x89`, `server_busy`.
+    ServerBusy,
+    /// Its session belongs on another node: DISCONNECT `0x9C`, `use_another_server`.
+    UseAnotherServer,
+}
+
+impl HubClose {
+    const ALL: [Self; 6] = [
+        Self::TakenOver,
+        Self::Discarded,
+        Self::Kicked,
+        Self::NotAuthorized,
+        Self::ServerBusy,
+        Self::UseAnotherServer,
+    ];
+
+    /// EMQX's `reason` for it.
+    #[must_use]
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::TakenOver => "takenover",
+            Self::Discarded => "discarded",
+            Self::Kicked => "kicked",
+            Self::NotAuthorized => "not_authorized",
+            Self::ServerBusy => "server_busy",
+            Self::UseAnotherServer => "use_another_server",
+        }
+    }
 }
 
 /// The reader half of the outbound accounting: what a connection's writer calls for each
@@ -290,8 +346,7 @@ pub struct Outbound {
 /// forgotten.
 #[derive(Clone, Debug)]
 pub struct OutboundMeter {
-    depth: Arc<AtomicUsize>,
-    bytes: Arc<AtomicUsize>,
+    shared: Arc<OutboundShared>,
 }
 
 impl OutboundMeter {
@@ -300,15 +355,23 @@ impl OutboundMeter {
     /// function of the same immutable packet, which is what makes the counter return to
     /// zero rather than drift.
     pub fn drained(&self, packet: &Packet) {
-        self.depth.fetch_sub(1, Ordering::Relaxed);
+        self.shared.depth.fetch_sub(1, Ordering::Relaxed);
         let n = packet_bytes(packet);
         // Saturating rather than wrapping: a counter that went momentarily negative
         // would read as ~18 EiB and pin the `QoS` 0 gate shut forever.
         let _ = self
+            .shared
             .bytes
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |b| {
                 Some(b.saturating_sub(n))
             });
+    }
+
+    /// Why the hub closed this channel, when it said ([`Outbound::closing`]).
+    #[must_use]
+    pub fn close_reason(&self) -> Option<HubClose> {
+        let n = self.shared.close.load(Ordering::Relaxed);
+        HubClose::ALL.into_iter().find(|c| *c as u8 == n)
     }
 }
 
@@ -317,16 +380,19 @@ impl Outbound {
     /// drains.
     #[must_use]
     pub fn new(tx: mpsc::UnboundedSender<Box<Packet>>) -> (Self, OutboundMeter) {
-        let depth = Arc::new(AtomicUsize::new(0));
-        let bytes = Arc::new(AtomicUsize::new(0));
+        let shared = Arc::new(OutboundShared::default());
         (
             Self {
                 tx,
-                depth: depth.clone(),
-                bytes: bytes.clone(),
+                shared: shared.clone(),
             },
-            OutboundMeter { depth, bytes },
+            OutboundMeter { shared },
         )
+    }
+
+    /// Record why the hub is closing this connection, before it drops the channel.
+    pub fn closing(&self, why: HubClose) {
+        self.shared.close.store(why as u8, Ordering::Relaxed);
     }
 
     /// Queue a packet.
@@ -336,8 +402,8 @@ impl Outbound {
     /// this is a plain bool rather than a `Result` carrying a whole `Packet` back.
     pub fn send(&self, packet: Packet) -> bool {
         let n = packet_bytes(&packet);
-        self.depth.fetch_add(1, Ordering::Relaxed);
-        self.bytes.fetch_add(n, Ordering::Relaxed);
+        self.shared.depth.fetch_add(1, Ordering::Relaxed);
+        self.shared.bytes.fetch_add(n, Ordering::Relaxed);
         // Boxed so the channel's element is a pointer, not a `Packet`. Tokio
         // allocates the first 32-slot block eagerly at channel creation — one
         // channel per connection — so the element size is a per-connection cost
@@ -348,8 +414,8 @@ impl Outbound {
         // that only publishes never pays it.
         if self.tx.send(Box::new(packet)).is_err() {
             // Never queued, so never drained: keep both counts honest.
-            self.depth.fetch_sub(1, Ordering::Relaxed);
-            self.bytes.fetch_sub(n, Ordering::Relaxed);
+            self.shared.depth.fetch_sub(1, Ordering::Relaxed);
+            self.shared.bytes.fetch_sub(n, Ordering::Relaxed);
             return false;
         }
         true
@@ -358,7 +424,7 @@ impl Outbound {
     /// Packets queued for this client but not yet written to its socket.
     #[must_use]
     pub fn depth(&self) -> usize {
-        self.depth.load(Ordering::Relaxed)
+        self.shared.depth.load(Ordering::Relaxed)
     }
 
     /// Accounted bytes queued for this client but not yet written to its socket
@@ -366,7 +432,7 @@ impl Outbound {
     /// weaker exactness class than the backlog's.
     #[must_use]
     pub fn bytes(&self) -> usize {
-        self.bytes.load(Ordering::Relaxed)
+        self.shared.bytes.load(Ordering::Relaxed)
     }
 
     /// Whether the connection's reader half is gone (issue #504).
@@ -1212,12 +1278,13 @@ pub enum HubCommand {
         client: ClientId,
         /// Topic filters being removed.
         filters: Vec<String>,
-        /// One answer per filter, in request order: `true` when a subscription
-        /// existed and was removed, `false` when there was nothing to remove —
-        /// the v5 UNSUBACK's `0x00` / `0x11 No subscription existed` split
-        /// ([MQTT-3.11.3-1], issue #290). `None` for callers that do not answer
-        /// a client (tests, internal sweeps).
-        reply: Option<oneshot::Sender<Vec<bool>>>,
+        /// One answer per filter, in request order: the `QoS` the removed
+        /// subscription had been granted when one existed, `None` when there was
+        /// nothing to remove — the v5 UNSUBACK's `0x00` / `0x11 No subscription
+        /// existed` split ([MQTT-3.11.3-1], issue #290), and the `qos` of
+        /// `$events/session/unsubscribed` (ADR 0083). `None` for callers that do not
+        /// answer a client (tests, internal sweeps).
+        reply: Option<oneshot::Sender<Vec<Option<QoS>>>>,
     },
     /// Route an application message to matching subscribers.
     Publish {
@@ -3171,11 +3238,26 @@ impl Hub {
                 filters,
                 reply,
             } => {
+                // What each filter had been granted, read before the removal.
+                let granted: Vec<Option<QoS>> = filters
+                    .iter()
+                    .map(|f| {
+                        self.subs
+                            .get(&client)
+                            .and_then(|s| s.find(f))
+                            .map(|e| e.qos)
+                    })
+                    .collect();
                 let existed = self.unsubscribe(&client, &filters).await;
                 if let Some(reply) = reply {
                     // A dropped receiver means the connection died mid-unsubscribe;
                     // the removal itself already happened either way.
-                    let _ = reply.send(existed);
+                    let answer = existed
+                        .into_iter()
+                        .zip(granted)
+                        .map(|(removed, qos)| removed.then(|| qos.unwrap_or(QoS::AtMostOnce)))
+                        .collect();
+                    let _ = reply.send(answer);
                 }
             }
             cmd @ HubCommand::Publish { .. } => {
@@ -4158,7 +4240,6 @@ impl Hub {
                 payload: &w.payload,
                 qos: w.qos,
                 retain: w.retain,
-                dup: false,
                 app: &w.app,
                 message_expiry: None,
             },
@@ -4537,6 +4618,13 @@ impl Hub {
         // comes first.
         if let Some(old) = self.online.remove(&client) {
             warn!(client = %client.0, "session takeover: replacing existing connection");
+            // EMQX's terms for the old connection's end (ADR 0083): a clean start
+            // discards the session it held, otherwise the new connection takes it over.
+            old.tx.closing(if clean_start {
+                HubClose::Discarded
+            } else {
+                HubClose::TakenOver
+            });
             if let Some(w) = old.will {
                 self.publish_will(&client, &w).await;
             }
@@ -5456,6 +5544,7 @@ impl Hub {
             return;
         };
         warn!(client = %client.0, reason, "evicting live session");
+        online.tx.closing(HubClose::NotAuthorized);
         if online.admission.protocol == ProtocolVersion::V5 {
             let _ = online.tx.send(Packet::Disconnect(Disconnect {
                 reason: mqtt_codec::reason::NOT_AUTHORIZED,
@@ -5475,6 +5564,7 @@ impl Hub {
         let Some(online) = self.online.get(client).filter(|o| o.conn_id == conn_id) else {
             return;
         };
+        online.tx.closing(HubClose::ServerBusy);
         if online.admission.protocol == ProtocolVersion::V5 {
             let _ = online.tx.send(Packet::Disconnect(Disconnect {
                 reason: mqtt_codec::reason::SERVER_BUSY,
@@ -6579,6 +6669,7 @@ impl Hub {
             // one would point it at the cluster's internal listener. `0x9C` is the
             // honest code — "temporarily use another server" — where `0x8E`
             // (session taken over) would be a lie: nothing took this session over.
+            online.tx.closing(HubClose::UseAnotherServer);
             if online.admission.protocol == ProtocolVersion::V5 {
                 let _ = online.tx.send(Packet::Disconnect(Disconnect {
                     reason: mqtt_codec::reason::USE_ANOTHER_SERVER,
