@@ -892,7 +892,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::sink_records_through_a_trait_object`
 - `tests::tampering_with_any_field_changes_the_head`
 
-## `crates/mqtt-rules/src/lib.rs` — 98 test(s)
+## `crates/mqtt-rules/src/lib.rs` — 95 test(s)
 
 - `edit::tests::a_json_rule_body_is_a_rule_edit`
 - `edit::tests::an_insert_appends_the_rule_at_the_end`
@@ -924,7 +924,6 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::a_messages_effects_share_one_byte_budget`
 - `tests::a_non_json_payload_fails_only_rules_that_reach_into_it`
 - `tests::a_republish_into_sys_fails_its_action`
-- `tests::an_item_the_where_does_not_read_cannot_fail_a_message_it_turns_away`
 - `tests::arithmetic_follows_erlang`
 - `tests::case_expression_emqx_docs`
 - `tests::comments_and_case_insensitive_keywords`
@@ -966,14 +965,12 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::the_growth_budget_is_per_message`
 - `tests::the_sql_test_simulates_events_and_refuses_inputs_the_rule_never_sees`
 - `tests::the_trace_rate_window_is_per_rule_per_second`
-- `tests::the_where_plan_follows_alias_chains_backwards_only`
 - `tests::time_functions_emqx_docs`
 - `tests::topic_match_operator_and_topic_function`
 - `tests::type_judgment_functions_emqx_docs`
 - `tests::unaliased_payload_path_nests_under_payload`
 - `tests::user_properties_and_pub_props_emqx_docs`
 - `tests::where_filters_and_can_use_select_aliases`
-- `tests::where_first_gives_the_select_first_outputs`
 - `tests_emqx_examples::array_functions_match_emqx_examples`
 - `tests_emqx_examples::bit_functions_match_emqx_examples`
 - `tests_emqx_examples::conditional_functions_match_emqx_examples`

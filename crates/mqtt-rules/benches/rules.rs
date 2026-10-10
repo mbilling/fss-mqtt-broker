@@ -10,9 +10,6 @@
 //! - `select_star_republish` — `SELECT *` with a JSON-template republish: the most
 //!   expensive common shape.
 //! - `foreach_10` — a `FOREACH` over a 10-element array, one republish per element.
-//! - `computed_reject` — a `SELECT` of several computed fields whose `WHERE` reads one
-//!   alias and rejects the message: the shape the WHERE-first evaluation is for (only the
-//!   alias the `WHERE` reads is computed).
 
 use bytes::Bytes;
 use criterion::{criterion_group, criterion_main, Criterion};
@@ -28,13 +25,6 @@ actions = [{ function = "republish", args = { topic = "alerts/${clientid}", qos 
 [rules.audit]
 sql = '''SELECT * FROM "audit/#"'''
 actions = [{ function = "republish", args = { topic = "archive/${topic}", payload = "${.}" } }]
-
-[rules.enrich]
-sql = '''SELECT payload.temp AS temp, upper(payload.site) AS site, concat(clientid, '/', payload.site) AS path,
-                round(payload.humidity / 3.0) AS hum, format_date('second', '+00:00', '%Y-%m-%d', payload.seq) AS day,
-                regex_replace(clientid, '[0-9]+', 'N') AS kind
-         FROM "enrich/+" WHERE temp > 30'''
-actions = [{ function = "republish", args = { topic = "enriched/${site}", payload = "${.}" } }]
 
 [rules.fanout]
 sql = '''FOREACH payload.readings AS r DO r.id AS id, r.v AS v FROM "batch/+"'''
@@ -81,7 +71,6 @@ fn bench(c: &mut Criterion) {
         &hot,
     );
     run(c, "foreach_10", &set, "batch/device-0042", &batch);
-    run(c, "computed_reject", &set, "enrich/device-0042", &cold);
 }
 
 criterion_group!(benches, bench);

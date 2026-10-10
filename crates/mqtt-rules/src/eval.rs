@@ -120,74 +120,14 @@ type Frames<'f> = &'f [&'f Map];
 /// the `WHERE` matched (an empty `FOREACH` collection still counts as no result).
 pub(crate) fn run(stmt: &Statement, ctx: &EvalCtx, out: &mut Vec<Map>) -> Result<(), EvalError> {
     if stmt.foreach {
-        return run_foreach(stmt, ctx, out);
-    }
-    let (Some(cond), Some(needs)) = (stmt.where_.as_ref(), stmt.where_needs.as_deref()) else {
-        out.push(select(&stmt.fields, ctx, &[])?);
-        return Ok(());
-    };
-    // The WHERE first, on only the SELECT items it reads ([`Statement::where_needs`]): a
-    // message it turns away costs those, not the whole SELECT. They are the items the
-    // WHERE would read in the full scope, so it decides the same; the rest are computed
-    // only for a message that passes, reusing the early values, so the output is the one
-    // a SELECT-first evaluation gives. What differs from EMQX: an item the WHERE does not
-    // read is never evaluated for a message it turns away, so one that would fail there
-    // makes that message `no_result`, not `failed` (docs/RULES.md, Differences from EMQX).
-    let mut early: Vec<Option<Value>> = vec![None; stmt.fields.len()];
-    let mut scope = Map::new();
-    for (i, item) in stmt.fields.iter().enumerate() {
-        if let (true, Item::Field { expr, key, .. }) = (needs[i], item) {
-            let v = eval(expr, ctx, &[&scope])?;
-            put(&mut scope, key, v.clone());
-            early[i] = Some(v);
+        run_foreach(stmt, ctx, out)
+    } else {
+        let selected = select(&stmt.fields, ctx, &[])?;
+        if condition(stmt.where_.as_ref(), ctx, &[&selected])? {
+            out.push(selected);
         }
+        Ok(())
     }
-    if !condition(Some(cond), ctx, &[&scope])? {
-        return Ok(());
-    }
-    out.push(select_reusing(&stmt.fields, ctx, early)?);
-    Ok(())
-}
-
-/// The reference [`run`] is held to: EMQX's order, every `SELECT` item first, then the
-/// `WHERE`. For differential tests only.
-#[cfg(test)]
-pub(crate) fn run_select_first(
-    stmt: &Statement,
-    ctx: &EvalCtx,
-    out: &mut Vec<Map>,
-) -> Result<(), EvalError> {
-    if stmt.foreach {
-        return run_foreach(stmt, ctx, out);
-    }
-    let selected = select(&stmt.fields, ctx, &[])?;
-    if condition(stmt.where_.as_ref(), ctx, &[&selected])? {
-        out.push(selected);
-    }
-    Ok(())
-}
-
-/// [`select`] over a plain `SELECT` list, taking each item's value from `early` where the
-/// WHERE already computed it: each item is evaluated once.
-fn select_reusing(
-    items: &[Item],
-    ctx: &EvalCtx,
-    mut early: Vec<Option<Value>>,
-) -> Result<Map, EvalError> {
-    let mut selected = Map::with_capacity(items.len());
-    for (item, known) in items.iter().zip(early.iter_mut()) {
-        match item {
-            Item::Star => selected.merge_from(&ctx.all_fields()),
-            Item::Field { expr, key, .. } => {
-                let v = match known.take() {
-                    Some(v) => v,
-                    None => eval(expr, ctx, &[&selected])?,
-                };
-                put(&mut selected, key, v);
-            }
-        }
-    }
-    Ok(selected)
 }
 
 fn run_foreach(stmt: &Statement, ctx: &EvalCtx, out: &mut Vec<Map>) -> Result<(), EvalError> {
