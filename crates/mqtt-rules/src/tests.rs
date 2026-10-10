@@ -610,8 +610,6 @@ fn load_errors_are_specific() {
     assert!(e.contains("expected FROM"), "{e}");
     let e = check_sql("SELECT a FROM \"t\" WHERE a = b = c").unwrap_err();
     assert!(e.contains("do not chain"), "{e}");
-    let e = check_sql("SELECT regex_match(a, '(') FROM \"t\"").unwrap_err();
-    assert!(e.contains("invalid regular expression"), "{e}");
     let e = check_sql("SELECT a\nFROM \"t\" WHERE a = 'x").unwrap_err();
     assert!(e.contains("line 2"), "{e}");
 }
@@ -1551,54 +1549,78 @@ fn a_file_may_compile_only_so_many_distinct_regular_expressions() {
     );
 
     // Patterns built at run time (from the payload) are not literals: not counted.
-    let mut text = regex_file(&distinct(MAX_REGEX_LITERALS_PER_FILE), 1);
+    let mut text = regex_file(&distinct(MAX_REGEX_LITERALS_PER_FILE), 7);
     text.push_str(
         "[rules.dyn]\nsql = 'SELECT regex_match(payload.a, payload.p) AS m FROM \"t\"'\n",
     );
     RuleSet::parse(&text).unwrap_or_else(|e| panic!("{e}"));
+
+    // The patterns' bytes are budgeted too: 1 KiB patterns fill it before their count.
+    let kib = |n: usize| -> Vec<String> {
+        (0..n)
+            .map(|i| format!("^{i:04}{}", "b".repeat(1019)))
+            .collect()
+    };
+    let fit = MAX_REGEX_LITERAL_BYTES_PER_FILE / 1024;
+    assert!(fit < MAX_REGEX_LITERALS_PER_FILE);
+    RuleSet::parse(&regex_file(&kib(fit), 8)).unwrap_or_else(|e| panic!("{e}"));
+    let e = RuleSet::parse(&regex_file(&kib(fit + 1), 8)).unwrap_err();
+    assert!(
+        e.to_string().contains(&format!(
+            "more than {MAX_REGEX_LITERAL_BYTES_PER_FILE} bytes of distinct regular expressions"
+        )),
+        "{e}"
+    );
 }
 
-/// The longest `\w{n}` this build compiles within the per-pattern size limit. The limit is
-/// fixed, but what a pattern costs against it depends on the regex features the build
-/// unifies: the broker's graph enables `regex-automata/dfa-build` (through
-/// tracing-subscriber's env filter), and with it a far shorter run is the largest that
-/// fits than in `cargo test -p mqtt-rules` alone.
-fn longest_word_run() -> usize {
-    (1..=64)
-        .rev()
-        .find(|n| funcs::compile_regex(&format!("\\w{{{n}}}")).is_ok())
-        .expect("\\w compiles")
+/// The most repetitions of `(?:\w\w)` PCRE2 compiles: a repeated group is copied once
+/// per repetition, and a compiled pattern holds at most 64K code units (`LINK_SIZE` 2,
+/// as in OTP), past which it is `regular expression is too large`.
+fn longest_group_run() -> usize {
+    let (mut lo, mut hi) = (1_usize, 65_535);
+    while lo < hi {
+        let mid = (lo + hi).div_ceil(2);
+        if funcs::compile_regex(format!("(?:\\w\\w){{{mid}}}").as_bytes()).is_ok() {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    lo
 }
 
 /// An identical pattern is compiled once and counts once, wherever it appears: a file
-/// repeating one pattern at the per-pattern size limit far past the budget loads.
+/// repeating one pattern at PCRE2's size limit far past the budget loads.
 #[test]
 fn identical_regular_expressions_are_compiled_once() {
-    let n = longest_word_run();
-    assert!(
-        funcs::compile_regex(&format!("\\w{{{}}}", n + 1)).is_err(),
-        "\\w{{{n}}} is at the limit"
-    );
-    let at_limit = format!("\\w{{{n}}}");
+    let n = longest_group_run();
+    let over = funcs::compile_regex(format!("(?:\\w\\w){{{}}}", n + 1).as_bytes()).unwrap_err();
+    assert!(over.contains("regular expression is too large"), "{over}");
+    let at_limit = format!("(?:\\w\\w){{{n}}}");
     let mut pool = parser::RegexPool::default();
-    let first = pool.get(&at_limit).unwrap();
-    assert!(Arc::ptr_eq(&first, &pool.get(&at_limit).unwrap()));
+    let first = pool.get(&at_limit).unwrap().unwrap();
+    assert!(Arc::ptr_eq(&first, &pool.get(&at_limit).unwrap().unwrap()));
     assert!(!Arc::ptr_eq(
         &first,
-        &pool.get(&format!("\\w{{{}}}", n - 1)).unwrap()
+        &pool
+            .get(&format!("(?:\\w\\w){{{}}}", n - 1))
+            .unwrap()
+            .unwrap()
     ));
 
-    let worst = vec![at_limit; 4 * MAX_REGEX_LITERALS_PER_FILE];
+    let worst = vec![at_limit; 2 * MAX_REGEX_LITERALS_PER_FILE];
     let set = load(&regex_file(&worst, 32));
     assert_eq!(set.len(), 32);
     // Each still works, and a second distinct pattern is still accepted beside it.
-    let mut text = regex_file(&worst, 2);
+    let mut text = regex_file(&worst, 8);
     text.push_str("[rules.other]\nsql = '''SELECT 1 AS x FROM \"t/#\" WHERE regex_match(payload.a, '^b$')'''\n");
     let set = load(&text);
-    let payload = Bytes::from(format!(r#"{{"a":"{}"}}"#, "x".repeat(n)));
+    let payload = Bytes::from(format!(r#"{{"a":"{}"}}"#, "x".repeat(2 * n)));
     let props = mqtt_core::AppProperties::default();
     let (_, log) = effects(&set, &msg("t/1", &payload, &props));
-    assert_eq!(log, ["other:no_result", "r0:passed", "r1:passed"]);
+    let mut want = vec!["other:no_result".to_string()];
+    want.extend((0..8).map(|r| format!("r{r}:passed")));
+    assert_eq!(log, want);
 }
 
 /// The structured error keeps the text `mqttd --check-rules` and a rejected reload have
@@ -2610,6 +2632,682 @@ fn regex_replace_reads_its_replacement_as_erlang_re_does() {
     refused(r"regex_replace('abc', '(b)', '\gx')");
     refused(r"regex_replace('abc', '(b)', '\g{x}')");
 }
+
+/// What EMQX 6.3.1 (OTP 28, PCRE2 10.47) gives for one subject and pattern:
+/// `regex_match`, `regex_replace` with `<&>`, and `regex_extract`; `Err` where the call
+/// raises (`badarg`), which fails the rule.
+type RegexRow = (
+    &'static [u8],
+    &'static [u8],
+    Result<bool, ()>,
+    Result<&'static [u8], ()>,
+    Result<&'static [&'static [u8]], ()>,
+);
+
+/// What this engine gives for the calls of a [`RegexRow`].
+type RegexResults = (
+    Result<bool, ()>,
+    Result<Vec<u8>, ()>,
+    Result<Vec<Vec<u8>>, ()>,
+);
+
+/// `regex_match`, `regex_replace(S, P, '<&>')` and `regex_extract` of `subject` and
+/// `pattern` as values, called with the pattern compiled per call (as from a payload)
+/// or, with `literal`, compiled once beforehand (as a literal in the rule is when the
+/// file loads).
+fn regex_calls(subject: &[u8], pattern: &[u8], literal: bool) -> RegexResults {
+    let payload = Bytes::new();
+    let props = mqtt_core::AppProperties::default();
+    let input = msg("t/a", &payload, &props);
+    let ctx = EvalCtx::new(&input);
+    let compiled = funcs::compile_regex(pattern);
+    let call = |name: &str, args: &[Value]| {
+        let func = funcs::lookup(name).unwrap();
+        let regex = literal.then_some(&compiled);
+        (func.f)(args, &funcs::FnCtx { ctx: &ctx, regex }).map_err(|_| ())
+    };
+    let bytes = |b: &[u8]| Value::from_bytes(&Bytes::copy_from_slice(b));
+    let (subject, pattern) = (bytes(subject), bytes(pattern));
+    let matched = call("regex_match", &[subject.clone(), pattern.clone()])
+        .map(|v| matches!(v, Value::Bool(true)));
+    let replaced = call(
+        "regex_replace",
+        &[subject.clone(), pattern.clone(), Value::from("<&>")],
+    )
+    .map(|v| v.as_bytes().unwrap().to_vec());
+    let extracted = call("regex_extract", &[subject, pattern]).map(|v| match v {
+        Value::Array(groups) => groups
+            .iter()
+            .map(|g| g.as_bytes().unwrap().to_vec())
+            .collect(),
+        v => panic!("{v:?}"),
+    });
+    (matched, replaced, extracted)
+}
+
+/// EMQX's regex functions run Erlang's `re`: PCRE2 on bytes, not characters. The
+/// probes that told the engines apart, each with EMQX 6.3.1's answer.
+#[test]
+fn regular_expressions_are_pcre2_on_bytes_as_in_emqx() {
+    let on = |s: &str, sql_expr: &str| -> String {
+        let out = one(
+            &format!("SELECT {sql_expr} AS r FROM \"t/#\""),
+            &format!(r#"{{"s":{}}}"#, serde_json::to_string(s).unwrap()),
+        );
+        let Value::Map(m) = json_decode(out.as_bytes()).unwrap() else {
+            panic!("{out}")
+        };
+        m.get("r").unwrap().to_json().unwrap()
+    };
+    // `$` matches before a final newline.
+    assert_eq!(on("abc\n", "regex_match(payload.s, 'abc$')"), "true");
+    // `.` is one byte: `é` is two.
+    assert_eq!(on("é", "regex_replace(payload.s, '.', 'x')"), r#""xx""#);
+    assert_eq!(on("é", "regex_match(payload.s, '^.$')"), "false");
+    // `\d` and `\w` are ASCII.
+    assert_eq!(on("٣", "regex_match(payload.s, '^\\d$')"), "false");
+    assert_eq!(on("é", "regex_match(payload.s, '\\w')"), "false");
+    // Backreferences, look-around and possessive quantifiers compile.
+    assert_eq!(on("aa", "regex_match(payload.s, '(a)\\1')"), "true");
+    assert_eq!(
+        on("foobar", "regex_extract(payload.s, 'foo(?=(bar))')"),
+        r#"["bar"]"#
+    );
+    assert_eq!(on("aaa", "regex_match(payload.s, '^a++a')"), "false");
+}
+
+/// A broad differential set: every row is EMQX 6.3.1's own output for the same call
+/// (`emqx_rule_funcs:regex_match/2`, `regex_replace/3`, `regex_extract/2`), run on the
+/// EMQX container — line ends and newline conventions, bytes against characters,
+/// PCRE2-only syntax, OTP's global-match loop around empty matches, the match limit as
+/// no match, invalid patterns as `badarg`, and patterns that are not UTF-8. Each row is
+/// checked with the pattern compiled per call and compiled once beforehand.
+#[test]
+fn regex_functions_match_emqx_row_for_row() {
+    let mut differ = Vec::new();
+    for (s, p, m, r, x) in EMQX_REGEX_ROWS {
+        let want = (
+            *m,
+            r.map(<[u8]>::to_vec),
+            x.map(|g| g.iter().map(|b| b.to_vec()).collect()),
+        );
+        for literal in [false, true] {
+            let got = regex_calls(s, p, literal);
+            if got != want {
+                differ.push(format!(
+                    "{:?} on {:?} (literal: {literal}): got {got:?}, EMQX {want:?}",
+                    String::from_utf8_lossy(p),
+                    String::from_utf8_lossy(s),
+                ));
+            }
+        }
+    }
+    assert!(differ.is_empty(), "{}", differ.join("\n"));
+}
+
+/// OTP's `re` runs PCRE2 with its build's match and depth limits (10,000,000 each, per
+/// start position) and reports reaching one as no match. `(a+)+b|z` on `a…az` tries
+/// `(a+)+b` from the first `a` in time exponential in the run: EMQX finds the `z` after
+/// 21 `a`s and gives up after 22. The same threshold here pins the same limits.
+#[test]
+fn the_match_limit_is_otps_and_reaching_it_is_no_match() {
+    let at = |n: usize| regex_calls(format!("{}z", "a".repeat(n)).as_bytes(), b"(a+)+b|z", false).0;
+    assert_eq!(at(21), Ok(true));
+    assert_eq!(at(22), Ok(false));
+    // A limit the pattern sets lower applies; reaching it is no match too (EMQX's
+    // answers).
+    let heap1 = b"(*LIMIT_HEAP=1)^(?:a|b)*$";
+    assert_eq!(regex_calls(b"ab", heap1, false).0, Ok(true));
+    assert_eq!(
+        regex_calls("ab".repeat(50).as_bytes(), heap1, false).0,
+        Ok(false)
+    );
+}
+
+/// Catastrophic backtracking stops at the match limit, so a hostile pattern from a
+/// payload costs one bounded match: the call is no match, as in EMQX — not an error —
+/// and the rule, the message and the next message carry on.
+#[test]
+fn catastrophic_backtracking_is_bounded_and_no_match() {
+    let sql = "SELECT regex_match(payload.s, payload.p) AS m, regex_replace(payload.s, payload.p, 'X') AS r, regex_extract(payload.s, payload.p) AS x FROM \"t/#\"";
+    let hostile = format!(r#"{{"s":"{}b","p":"^(a+)+$"}}"#, "a".repeat(64));
+    let started = std::time::Instant::now();
+    assert_eq!(
+        one(sql, &hostile),
+        format!(r#"{{"m":false,"r":"{}b","x":[]}}"#, "a".repeat(64))
+    );
+    assert!(started.elapsed() < std::time::Duration::from_secs(30));
+    assert_eq!(
+        one(sql, r#"{"s":"aaa","p":"^(a+)+$"}"#),
+        r#"{"m":true,"r":"X","x":["aaa"]}"#
+    );
+}
+
+/// The heap a match may take for its backtracking frames is bounded here, where OTP's
+/// 20,000,000 KiB is in effect no bound: `(?:a|b)*` over a long subject needs a frame per
+/// character. Past [`funcs::re::HEAP_LIMIT_KIB`] the match is no match — EMQX matches this
+/// 1 MB subject — and a pattern cannot raise the bound with its own `(*LIMIT_HEAP=…)`.
+#[test]
+fn a_matchs_backtracking_heap_is_bounded() {
+    let long = "ab".repeat(500_000);
+    let short = "ab".repeat(1_000);
+    assert_eq!(
+        regex_calls(short.as_bytes(), b"^(?:a|b)*$", false).0,
+        Ok(true)
+    );
+    assert_eq!(
+        regex_calls(long.as_bytes(), b"^(?:a|b)*$", false).0,
+        Ok(false)
+    );
+    assert_eq!(
+        regex_calls(long.as_bytes(), b"(*LIMIT_HEAP=100000000)^(?:a|b)*$", false).0,
+        Ok(false)
+    );
+    // Start-of-pattern items still read as the pattern's own, before the bound.
+    assert_eq!(
+        regex_calls(b"a\r\nb", b"(*CRLF)(*LIMIT_MATCH=100)(?m)a$", false).0,
+        Ok(true)
+    );
+}
+
+/// A literal pattern that does not compile no longer fails the load: EMQX accepts the
+/// rule (its parser does not compile patterns) and every call raises `badarg`. The load
+/// says so as a warning, and each message fails the rule with PCRE2's message.
+#[test]
+fn an_invalid_pattern_loads_with_a_warning_and_fails_each_call() {
+    let sql = "SELECT regex_match(payload.s, '(') AS m FROM \"t/#\"";
+    let warnings = check_sql(sql).unwrap();
+    assert!(
+        warnings.iter().any(|w| w.contains(
+            "regex_match(): invalid regular expression: missing closing parenthesis at position 1"
+        )),
+        "{warnings:?}"
+    );
+    let e = fails(sql, r#"{"s":"abc"}"#);
+    assert!(e.contains("missing closing parenthesis"), "{e}");
+    // The same from a payload.
+    let e = fails(
+        "SELECT regex_match(payload.s, payload.p) AS m FROM \"t/#\"",
+        r#"{"s":"abc","p":"a{2,1}"}"#,
+    );
+    assert!(e.contains("numbers out of order in {} quantifier"), "{e}");
+    // Positions are in the pattern as written (EMQX: `{"length of lookbehind assertion is not limited",6}`).
+    let e = funcs::compile_regex(b"(*UTF)(?<=a+)b").unwrap_err();
+    assert!(e.ends_with("at position 6"), "{e}");
+}
+
+/// A pattern that is not UTF-8 (from a binary payload) still means its own bytes:
+/// written for the `pcre2` crate's `&str` as `\xHH` escapes, closing and reopening a
+/// `\Q…\E` around them and keeping an escaping backslash.
+#[test]
+fn a_pattern_that_is_not_utf8_means_its_own_bytes() {
+    for (pattern, subject, want) in [
+        (&b"\xe9"[..], &b"\xe9"[..], true),
+        (b"\\\xe9", b"\xe9", true),
+        (b"\\Q.\xe9\\E", b".\xe9", true),
+        (b"\\Q.\xe9\\E", b"x\xe9", false),
+        (b"\\Q\\\xe9\\E", b"\\\xe9", true),
+        (b"\\Q\\\\E\xe9", b"\\\xe9", true),
+        (b"[\xe0-\xef]", b"\xe9", true),
+        (b"(?#\xff)a", b"a", true),
+    ] {
+        assert_eq!(
+            regex_calls(subject, pattern, false).0,
+            Ok(want),
+            "{pattern:?} on {subject:?}"
+        );
+    }
+}
+
+const EMQX_REGEX_ROWS: &[RegexRow] = &[
+    (b"abc\n", b"abc$", Ok(true), Ok(b"<abc>\n"), Ok(&[])),
+    (b"abc\n", b"abc\\z", Ok(false), Ok(b"abc\n"), Ok(&[])),
+    (b"abc\n", b"abc\\Z", Ok(true), Ok(b"<abc>\n"), Ok(&[])),
+    (b"abc\n\n", b"abc$", Ok(false), Ok(b"abc\n\n"), Ok(&[])),
+    (b"abc\n", b"(?m)abc$", Ok(true), Ok(b"<abc>\n"), Ok(&[])),
+    (b"a\nb", b"^b", Ok(false), Ok(b"a\nb"), Ok(&[])),
+    (b"a\nb", b"(?m)^b", Ok(true), Ok(b"a\n<b>"), Ok(&[])),
+    (b"a\nb", b"a.b", Ok(false), Ok(b"a\nb"), Ok(&[])),
+    (b"a\nb", b"(?s)a.b", Ok(true), Ok(b"<a\nb>"), Ok(&[])),
+    (b"a\r\nb", b"a$", Ok(false), Ok(b"a\r\nb"), Ok(&[])),
+    (b"a\r\nb", b"(?m)a$", Ok(false), Ok(b"a\r\nb"), Ok(&[])),
+    (b"a\rb", b"(?m)a$", Ok(false), Ok(b"a\rb"), Ok(&[])),
+    (b"a\r\nb", b"a\\Rb", Ok(true), Ok(b"<a\r\nb>"), Ok(&[])),
+    (b"a\rb", b"(*CR)(?m)a$", Ok(true), Ok(b"<a>\rb"), Ok(&[])),
+    (
+        b"a\r\nb",
+        b"(*CRLF)(?m)a$",
+        Ok(true),
+        Ok(b"<a>\r\nb"),
+        Ok(&[]),
+    ),
+    (
+        b"a\r\nb",
+        b"(*ANYCRLF)(?m)^b",
+        Ok(true),
+        Ok(b"a\r\n<b>"),
+        Ok(&[]),
+    ),
+    (
+        b"a\x85b",
+        b"(*ANY)(?m)a$",
+        Ok(true),
+        Ok(b"<a>\x85b"),
+        Ok(&[]),
+    ),
+    (b"\n", b"^$", Ok(true), Ok(b"<>\n"), Ok(&[])),
+    (b"\n\n", b"(?m)^$", Ok(true), Ok(b"<>\n<>\n"), Ok(&[])),
+    (
+        b"a\r\nb\r\n",
+        b"(*CRLF)(?m)$",
+        Ok(true),
+        Ok(b"a<>\r\nb<>\r\n<>"),
+        Ok(&[]),
+    ),
+    (
+        b"a\r\nb",
+        b"(*CRLF)",
+        Ok(true),
+        Ok(b"<>a<>\r\n<>b<>"),
+        Ok(&[]),
+    ),
+    (
+        b"a\r\nb",
+        b"(*LF)x*",
+        Ok(true),
+        Ok(b"<>a<>\r<>\n<>b<>"),
+        Ok(&[]),
+    ),
+    (b"\xc3\xa9", b"^.$", Ok(false), Ok(b"\xc3\xa9"), Ok(&[])),
+    (b"\xc3\xa9", b"^..$", Ok(true), Ok(b"<\xc3\xa9>"), Ok(&[])),
+    (b"\xc3\xa9", b"\\w", Ok(false), Ok(b"\xc3\xa9"), Ok(&[])),
+    (
+        b"\xc3\xa9",
+        b"^\\W\\W$",
+        Ok(true),
+        Ok(b"<\xc3\xa9>"),
+        Ok(&[]),
+    ),
+    (b"\xd9\xa3", b"^\\d$", Ok(false), Ok(b"\xd9\xa3"), Ok(&[])),
+    (b"\xd9\xa3", b"\\d", Ok(false), Ok(b"\xd9\xa3"), Ok(&[])),
+    (
+        b"\xc3\x89",
+        b"(?i)\xc3\xa9",
+        Ok(false),
+        Ok(b"\xc3\x89"),
+        Ok(&[]),
+    ),
+    (
+        b"\xc3\xa9",
+        b"(.)",
+        Ok(true),
+        Ok(b"<\xc3><\xa9>"),
+        Ok(&[b"\xc3"]),
+    ),
+    (b"\xc3\xa9", b".", Ok(true), Ok(b"<\xc3><\xa9>"), Ok(&[])),
+    (
+        b"\xc3\xa9a",
+        b"\\W",
+        Ok(true),
+        Ok(b"<\xc3><\xa9>a"),
+        Ok(&[]),
+    ),
+    (
+        b"\xe2\x82\xac",
+        b"[^a]",
+        Ok(true),
+        Ok(b"<\xe2><\x82><\xac>"),
+        Ok(&[]),
+    ),
+    (
+        b"\xc3\xbc",
+        b"\\xc3\\xbc",
+        Ok(true),
+        Ok(b"<\xc3\xbc>"),
+        Ok(&[]),
+    ),
+    (b"\xc3\xa9", b"\\x{e9}", Ok(false), Ok(b"\xc3\xa9"), Ok(&[])),
+    (
+        b"\xc3\xa9",
+        b"[\\x80-\\xff]+",
+        Ok(true),
+        Ok(b"<\xc3\xa9>"),
+        Ok(&[]),
+    ),
+    (b"\xc3\xa9", b"\\p{L}", Ok(true), Ok(b"<\xc3>\xa9"), Ok(&[])),
+    (
+        b"\xc3\xa9",
+        b"[[:alpha:]]",
+        Ok(false),
+        Ok(b"\xc3\xa9"),
+        Ok(&[]),
+    ),
+    (
+        b"\xc3\xa9",
+        b"[[:^ascii:]]+",
+        Ok(true),
+        Ok(b"<\xc3\xa9>"),
+        Ok(&[]),
+    ),
+    (
+        b"Stra\xc3\x9fe",
+        b"(?i)STRASSE",
+        Ok(false),
+        Ok(b"Stra\xc3\x9fe"),
+        Ok(&[]),
+    ),
+    (
+        b"\xc3\x80B",
+        b"(?i)\xc3\xa0b",
+        Ok(false),
+        Ok(b"\xc3\x80B"),
+        Ok(&[]),
+    ),
+    (b"ABC", b"(?i)abc", Ok(true), Ok(b"<ABC>"), Ok(&[])),
+    (
+        b"\xc3\xa9",
+        b"(*UTF)^.$",
+        Ok(true),
+        Ok(b"<\xc3\xa9>"),
+        Ok(&[]),
+    ),
+    (
+        b"\xc3\xa9",
+        b"(*UTF)(*UCP)^\\w$",
+        Ok(true),
+        Ok(b"<\xc3\xa9>"),
+        Ok(&[]),
+    ),
+    (
+        b"\xc3\xa9",
+        b"(*UCP)\\w",
+        Ok(true),
+        Ok(b"<\xc3>\xa9"),
+        Ok(&[]),
+    ),
+    (
+        b"x\xc2\xa0y",
+        b"x\\sy",
+        Ok(false),
+        Ok(b"x\xc2\xa0y"),
+        Ok(&[]),
+    ),
+    (b"a\x0bb", b"a\\sb", Ok(true), Ok(b"<a\x0bb>"), Ok(&[])),
+    (b"a\x0cb", b"a\\sb", Ok(true), Ok(b"<a\x0cb>"), Ok(&[])),
+    (b"a_1", b"^\\w+$", Ok(true), Ok(b"<a_1>"), Ok(&[])),
+    (b"\t", b"\\h", Ok(true), Ok(b"<\t>"), Ok(&[])),
+    (b"\x0b", b"\\v", Ok(true), Ok(b"<\x0b>"), Ok(&[])),
+    (b"a b", b"\\bb", Ok(true), Ok(b"a <b>"), Ok(&[])),
+    (b"\xc3\xa9a", b"\\ba", Ok(true), Ok(b"\xc3\xa9<a>"), Ok(&[])),
+    (b"aa", b"(a)\\1", Ok(true), Ok(b"<aa>"), Ok(&[b"a"])),
+    (b"ab", b"(a)\\1", Ok(false), Ok(b"ab"), Ok(&[])),
+    (
+        b"abab",
+        b"(?<x>ab)\\k<x>",
+        Ok(true),
+        Ok(b"<abab>"),
+        Ok(&[b"ab"]),
+    ),
+    (
+        b"abcabc",
+        b"(abc)\\g1",
+        Ok(true),
+        Ok(b"<abcabc>"),
+        Ok(&[b"abc"]),
+    ),
+    (
+        b"abab",
+        b"(ab)\\g{-1}",
+        Ok(true),
+        Ok(b"<abab>"),
+        Ok(&[b"ab"]),
+    ),
+    (b"foobar", b"foo(?=bar)", Ok(true), Ok(b"<foo>bar"), Ok(&[])),
+    (b"foobaz", b"foo(?=bar)", Ok(false), Ok(b"foobaz"), Ok(&[])),
+    (b"foobaz", b"foo(?!bar)", Ok(true), Ok(b"<foo>baz"), Ok(&[])),
+    (b"xbar", b"(?<=x)bar", Ok(true), Ok(b"x<bar>"), Ok(&[])),
+    (b"ybar", b"(?<!x)bar", Ok(true), Ok(b"y<bar>"), Ok(&[])),
+    (b"aaa", b"^a++a", Ok(false), Ok(b"aaa"), Ok(&[])),
+    (b"aaa", b"^(?>a+)a", Ok(false), Ok(b"aaa"), Ok(&[])),
+    (b"aaa", b"^a*+$", Ok(true), Ok(b"<aaa>"), Ok(&[])),
+    (
+        b"((()))",
+        b"^(\\((?1)*\\))$",
+        Ok(true),
+        Ok(b"<((()))>"),
+        Ok(&[b"((()))"]),
+    ),
+    (b"(()", b"^(\\((?1)*\\))$", Ok(false), Ok(b"(()"), Ok(&[])),
+    (
+        b"abba",
+        b"^((.)(?1)\\2|.?)$",
+        Ok(true),
+        Ok(b"<abba>"),
+        Ok(&[b"abba", b"a"]),
+    ),
+    (
+        b"ab",
+        b"^(a)?(?(1)b|c)$",
+        Ok(true),
+        Ok(b"<ab>"),
+        Ok(&[b"a"]),
+    ),
+    (b"c", b"^(a)?(?(1)b|c)$", Ok(true), Ok(b"<c>"), Ok(&[])),
+    (b"xyz", b"(?|(x)|(y))z", Ok(true), Ok(b"x<yz>"), Ok(&[b"y"])),
+    (b"abc", b"(?<=\\Ga)b", Ok(true), Ok(b"a<b>c"), Ok(&[])),
+    (
+        b"abc",
+        b"a(*SKIP)(*FAIL)|c",
+        Ok(true),
+        Ok(b"ab<c>"),
+        Ok(&[]),
+    ),
+    (b"abc", b"(*COMMIT)b", Ok(true), Ok(b"a<b>c"), Ok(&[])),
+    (b"abc", b"a(*ACCEPT)x", Ok(true), Ok(b"<a>bc"), Ok(&[])),
+    (b"aaab", b"a+(*PRUNE)b", Ok(true), Ok(b"<aaab>"), Ok(&[])),
+    (b"abc", b"(?C1)abc", Ok(true), Ok(b"<abc>"), Ok(&[])),
+    (
+        b"abc",
+        b"(*LIMIT_MATCH=10)a",
+        Ok(true),
+        Ok(b"<a>bc"),
+        Ok(&[]),
+    ),
+    (b"abc", b"(*NOTEMPTY)x*", Ok(false), Ok(b"abc"), Ok(&[])),
+    (b"abc", b"(*NO_START_OPT)b", Ok(true), Ok(b"a<b>c"), Ok(&[])),
+    (b"abc", b"[[:alpha:]]+", Ok(true), Ok(b"<abc>"), Ok(&[])),
+    (b"a.c", b"a\\.c", Ok(true), Ok(b"<a.c>"), Ok(&[])),
+    (b"abc", b"a\\Qb\\Ec", Ok(true), Ok(b"<abc>"), Ok(&[])),
+    (b"a.c", b"\\Qa.c\\E", Ok(true), Ok(b"<a.c>"), Ok(&[])),
+    (b"ab", b"(?x) a b # comment", Ok(true), Ok(b"<ab>"), Ok(&[])),
+    (b"ab", b"a(?#comment)b", Ok(true), Ok(b"<ab>"), Ok(&[])),
+    (b"aXb", b"a\\Cb", Ok(true), Ok(b"<aXb>"), Ok(&[])),
+    (b"abc", b"\\Aabc\\z", Ok(true), Ok(b"<abc>"), Ok(&[])),
+    (b"x\x00y", b"x\\x00y", Ok(true), Ok(b"<x\x00y>"), Ok(&[])),
+    (b"x\x00y", b"x.y", Ok(true), Ok(b"<x\x00y>"), Ok(&[])),
+    (b"x\x00y", b"x\\0y", Ok(true), Ok(b"<x\x00y>"), Ok(&[])),
+    (b"aaa", b"a{2}", Ok(true), Ok(b"<aa>a"), Ok(&[])),
+    (b"aaa", b"^a{,2}", Ok(true), Ok(b"<aa>a"), Ok(&[])),
+    (b"a{,2}", b"^a{,2}$", Ok(false), Ok(b"a{,2}"), Ok(&[])),
+    (b"abc", b"\\N", Ok(true), Ok(b"<a><b><c>"), Ok(&[])),
+    (b"a\nb", b"a\\Nb", Ok(false), Ok(b"a\nb"), Ok(&[])),
+    (b"ab12", b"(?i:A)B\\d+", Ok(false), Ok(b"ab12"), Ok(&[])),
+    (b"abc", b"[^\\w]", Ok(false), Ok(b"abc"), Ok(&[])),
+    (b"a-z", b"[a\\-z]+", Ok(true), Ok(b"<a-z>"), Ok(&[])),
+    (b"]", b"[]]", Ok(true), Ok(b"<]>"), Ok(&[])),
+    (b"abc", b"", Ok(true), Ok(b"<>a<>b<>c<>"), Ok(&[])),
+    (b"", b"", Ok(true), Ok(b"<>"), Ok(&[])),
+    (b"", b"^$", Ok(true), Ok(b"<>"), Ok(&[])),
+    (b"", b"a*", Ok(true), Ok(b"<>"), Ok(&[])),
+    (b"abc", b"x*", Ok(true), Ok(b"<>a<>b<>c<>"), Ok(&[])),
+    (b"aaa", b"a*", Ok(true), Ok(b"<aaa><>"), Ok(&[])),
+    (b"aaa", b"a*?", Ok(true), Ok(b"<><a><><a><><a><>"), Ok(&[])),
+    (b"abc", b"(?=a)", Ok(true), Ok(b"<>abc"), Ok(&[])),
+    (b"abc", b"\\b", Ok(true), Ok(b"<>abc<>"), Ok(&[])),
+    (
+        b"hello world",
+        b"(\\w+) (\\w+)",
+        Ok(true),
+        Ok(b"<hello world>"),
+        Ok(&[b"hello", b"world"]),
+    ),
+    (b"abc", b"(x)?b", Ok(true), Ok(b"a<b>c"), Ok(&[])),
+    (b"abc", b"(x)?(b)", Ok(true), Ok(b"a<b>c"), Ok(&[b"", b"b"])),
+    (b"abc", b"(b)(x)?", Ok(true), Ok(b"a<b>c"), Ok(&[b"b"])),
+    (
+        b"abc",
+        b"(b)(x)?(c)",
+        Ok(true),
+        Ok(b"a<bc>"),
+        Ok(&[b"b", b"", b"c"]),
+    ),
+    (b"abc", b"b", Ok(true), Ok(b"a<b>c"), Ok(&[])),
+    (b"abc", b"(?<n>b)", Ok(true), Ok(b"a<b>c"), Ok(&[b"b"])),
+    (b"abcabc", b"(b)", Ok(true), Ok(b"a<b>ca<b>c"), Ok(&[b"b"])),
+    (b"abc", b"()", Ok(true), Ok(b"<>a<>b<>c<>"), Ok(&[b""])),
+    (b"abc", b"\\Kb", Ok(true), Ok(b"a<b>c"), Ok(&[])),
+    (b"abc", b"a\\K", Ok(true), Ok(b"a<>bc"), Ok(&[])),
+    (b"abc", b"a\\K(b)", Ok(true), Ok(b"a<b>c"), Ok(&[b"b"])),
+    (
+        b"aaa",
+        b"(?=a)|a",
+        Ok(true),
+        Ok(b"<><a><><a><><a>"),
+        Ok(&[]),
+    ),
+    (b"abcabc", b"(?<=a)b", Ok(true), Ok(b"a<b>ca<b>c"), Ok(&[])),
+    (
+        b"1,22,,333",
+        b"\\d*",
+        Ok(true),
+        Ok(b"<1><>,<22><>,<>,<333><>"),
+        Ok(&[]),
+    ),
+    (
+        b"one two  three",
+        b"\\s*",
+        Ok(true),
+        Ok(b"<>o<>n<>e< ><>t<>w<>o<  ><>t<>h<>r<>e<>e<>"),
+        Ok(&[]),
+    ),
+    (b"ab", b"(?=b)|b", Ok(true), Ok(b"a<><b>"), Ok(&[])),
+    (b"ab", b"\\B", Ok(true), Ok(b"a<>b"), Ok(&[])),
+    (b"a.b.c", b"\\.", Ok(true), Ok(b"a<.>b<.>c"), Ok(&[])),
+    (
+        b"192.168.0.1",
+        b"^(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})$",
+        Ok(true),
+        Ok(b"<192.168.0.1>"),
+        Ok(&[b"192", b"168", b"0", b"1"]),
+    ),
+    (
+        b"temp=21.5C",
+        b"temp=(?<v>[0-9.]+)(?<u>[CF])",
+        Ok(true),
+        Ok(b"<temp=21.5C>"),
+        Ok(&[b"21.5", b"C"]),
+    ),
+    (
+        b"Date: 2021-05-20",
+        b"(\\d{4})-(\\d{2})-(\\d{2})",
+        Ok(true),
+        Ok(b"Date: <2021-05-20>"),
+        Ok(&[b"2021", b"05", b"20"]),
+    ),
+    (
+        b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab",
+        b"^(a+)+$",
+        Ok(false),
+        Ok(b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab"),
+        Ok(&[]),
+    ),
+    (
+        b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        b"^(a+)+$",
+        Ok(true),
+        Ok(b"<aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa>"),
+        Ok(&[b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]),
+    ),
+    (
+        b"xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab",
+        b"x|^(a+)+$",
+        Ok(true),
+        Ok(b"<x>aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab"),
+        Ok(&[]),
+    ),
+    (
+        b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab",
+        b"(a+)+$|b",
+        Ok(false),
+        Ok(b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab"),
+        Ok(&[]),
+    ),
+    (
+        b"xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab",
+        b"x|(a+)+$",
+        Ok(true),
+        Ok(b"<x>aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab"),
+        Ok(&[]),
+    ),
+    (
+        b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa!",
+        b"(a|aa)+$",
+        Ok(false),
+        Ok(b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa!"),
+        Ok(&[]),
+    ),
+    (
+        b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa!",
+        b"(?:a|a)*$",
+        Ok(false),
+        Ok(b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa!"),
+        Ok(&[]),
+    ),
+    (
+        b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab",
+        b"(*LIMIT_MATCH=1000)^(a+)+b",
+        Ok(true),
+        Ok(b"<aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab>"),
+        Ok(&[b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]),
+    ),
+    (b"abc", b"(", Err(()), Err(()), Err(())),
+    (b"abc", b"[a", Err(()), Err(()), Err(())),
+    (b"abc", b"a{2,1}", Err(()), Err(()), Err(())),
+    (b"abc", b"\\", Err(()), Err(()), Err(())),
+    (b"abc", b"(?<=a+)b", Err(()), Err(()), Err(())),
+    (b"abc", b"\\p{Foo}", Err(()), Err(()), Err(())),
+    (b"abc", b"x{70000}", Err(()), Err(()), Err(())),
+    (b"abc", b"\\k<zz>", Err(()), Err(()), Err(())),
+    (b"abc", b"*", Err(()), Err(()), Err(())),
+    (b"abc", b"\\8", Err(()), Err(()), Err(())),
+    (b"abc", b"(?P<1>a)", Err(()), Err(()), Err(())),
+    (b"abc", b"(*FOO)a", Err(()), Err(()), Err(())),
+    (b"abc", b"(*LIMIT_HEAP=x)a", Err(()), Err(()), Err(())),
+    (b"abc", b"a)", Err(()), Err(()), Err(())),
+    (b"abc", b"(?z)", Err(()), Err(()), Err(())),
+    (b"abc", b"\\c", Err(()), Err(()), Err(())),
+    (b"abc", b"[z-a]", Err(()), Err(()), Err(())),
+    (b"abc", b"(?<=a(?1))(b)", Ok(false), Ok(b"abc"), Ok(&[])),
+    (b"abc", b"(?(?{1})a)", Err(()), Err(()), Err(())),
+    (b"abc", b"\\g", Err(()), Err(()), Err(())),
+    (b"abc", b"a**", Err(()), Err(()), Err(())),
+    (b"\xe9", b"(*UTF).", Err(()), Err(()), Err(())),
+    (b"\xff\xfe", b"(*UTF)x", Err(()), Err(()), Err(())),
+    (b"x\xffy", b"x\\xffy", Ok(true), Ok(b"<x\xffy>"), Ok(&[])),
+    (b"x\xffy", b"x.y", Ok(true), Ok(b"<x\xffy>"), Ok(&[])),
+    (b"x\xe9", b"x\xe9", Ok(true), Ok(b"<x\xe9>"), Ok(&[])),
+    (b"\xe9", b"^\xe9$", Ok(true), Ok(b"<\xe9>"), Ok(&[])),
+    (b"a\xe9b", b"[\xe9]", Ok(true), Ok(b"a<\xe9>b"), Ok(&[])),
+    (b"a\xe9b", b"\\Q\xe9\\E", Ok(true), Ok(b"a<\xe9>b"), Ok(&[])),
+    (b"a\xe9b", b"\\\xe9", Ok(true), Ok(b"a<\xe9>b"), Ok(&[])),
+    (
+        b"\\\xe9",
+        b"\\Q\\\xe9\\E",
+        Ok(true),
+        Ok(b"<\\\xe9>"),
+        Ok(&[]),
+    ),
+];
 
 /// EMQX's lexer keeps a quoted token whole and its parser unquotes it with
 /// `string:trim(Text, both, "'")`: a doubled quote inside stays doubled and every quote

@@ -73,21 +73,25 @@ pub const MAX_DERIVED_BYTES: usize = 4 << 20;
 /// The longest rule statement accepted.
 pub const MAX_SQL_BYTES: usize = 64 * 1024;
 
-/// The most distinct literal regex patterns one rules file may compile (ADR 0084 D3);
-/// an identical pattern is compiled once however often it appears, and counts once.
+/// The most distinct literal regex patterns one rules file may compile (ADR 0084 D3,
+/// amended by ADR 0083's 2026-10-10 PCRE2 amendment); an identical pattern is compiled
+/// once however often it appears, and counts once.
 ///
-/// Each pattern is already bounded (1 MiB of compiled program, 1 MiB of lazy DFA), but
-/// the file was not: a few thousand worst-case literals took seconds and gigabytes to
-/// parse. Measured on release builds (4-core x86-64, 2026-10): a pattern at the
-/// per-pattern limit costs about 6-7.5 ms and 1.05 MiB to compile, so 128 distinct ones
-/// took 0.9-1.1 s and 140 MiB, and 96 take 0.6-1.1 s and 110-123 MiB. Which patterns
-/// reach the limit depends on the build: mqtt-rules alone admits `\w{50}` or `.{2471}`,
-/// while the broker, whose dependency graph enables regex-automata's `dfa-build`, admits
-/// about `\w{20}` or `.{1048}`; the cost at the limit is the same. 96 keeps a worst-case
-/// file around a second, and the running set plus one candidate being checked or reloaded
-/// under 256 MiB. A file over it fails to load, at boot, on reload, in `--check-rules`
-/// and in the admin API alike.
-pub const MAX_REGEX_LITERALS_PER_FILE: usize = 96;
+/// EMQX compiles a pattern on every call and keeps none; this engine compiles each
+/// literal once, when the file loads, and keeps it while the rules run. PCRE2 bounds a
+/// compiled pattern itself (64K code units, `LINK_SIZE` 2, as in OTP), so the most a
+/// pattern costs is fixed: measured on a release build (Apple M-series, 2026-10), at
+/// most about 0.9 ms and 190 KiB for a short pattern at that limit (`()` repeated, each
+/// group also a capture-name slot); 512 of them are under 0.5 s and 100 MiB. Named
+/// groups compile in time quadratic in their count — about 0.1 s for one 64 KiB
+/// pattern of them — which [`MAX_REGEX_LITERAL_BYTES_PER_FILE`] bounds. A file over
+/// either fails to load, at boot, on reload, in `--check-rules` and in the admin API
+/// alike.
+pub const MAX_REGEX_LITERALS_PER_FILE: usize = 512;
+
+/// The most bytes of distinct literal regex patterns one rules file may compile,
+/// together (see [`MAX_REGEX_LITERALS_PER_FILE`]).
+pub const MAX_REGEX_LITERAL_BYTES_PER_FILE: usize = 256 * 1024;
 
 /// A rule statement that does not parse.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -142,6 +146,12 @@ impl EvalError {
 
     pub(crate) fn in_fn(self, name: &str) -> Self {
         Self(format!("{name}(): {}", self.0))
+    }
+}
+
+impl From<String> for EvalError {
+    fn from(msg: String) -> Self {
+        Self(msg)
     }
 }
 

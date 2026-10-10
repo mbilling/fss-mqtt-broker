@@ -811,8 +811,10 @@ FROM "ingest"
 WHERE is_str(payload.device) AND regex_match(payload.device, '^[A-Za-z0-9_-]{1,64}$')
 ```
 
-`is_str` keeps a missing or non-string value from failing the rule. A message that does not
-pass produces nothing. The cookbook's
+`is_str` keeps a missing or non-string value from failing the rule. As in EMQX, `$` also
+matches before a final newline, so a value ending in one passes this guard with it; end
+the pattern with `\z` instead to refuse that too ([regular expressions](#functions)). A
+message that does not pass produces nothing. The cookbook's
 [routing recipe](RULES-COOKBOOK.md#7-route-by-a-payload-field-safely) is the complete rule,
 and its MQTT 5 recipe guards a user property the same way.
 
@@ -963,13 +965,19 @@ description = ""      # optional
 Loading is **all-or-nothing**: one rule that does not parse rejects the file. At
 startup the broker refuses to boot, and on a reload the running rules stay in force.
 Unknown keys are errors. The limits are 1,024 rules per file, 16 actions per rule,
-64 KiB of SQL per rule, and 96 distinct regular-expression literals per file (a pattern
-written in `regex_match`, `regex_replace` or `regex_extract`; the same pattern written
-twice is compiled once and counts once; past it:
-`more than 96 distinct regular expressions in one rules file`). Each literal costs a
-compile when the file loads, so the file-wide limit keeps a worst-case load, reload or
-admin API check to about a second and about 120 MiB (measured 0.6-1.1 s, 110-123 MiB).
-An expression may be at most 256 levels deep, a chain of 256
+64 KiB of SQL per rule, and 512 distinct regular-expression literals per file, of at
+most 256 KiB together (a pattern written in `regex_match`, `regex_replace` or
+`regex_extract`; the same pattern written twice is compiled once and counts once; past
+them: `more than 512 distinct regular expressions in one rules file`, `more than 262144
+bytes of distinct regular expressions in one rules file`). Each literal is compiled when
+the file loads and kept while the rules run, so the file-wide limits keep a worst-case
+load, reload or admin API check under a second and about 100 MiB (measured: 512 patterns
+at PCRE2's size limit, 0.1 s and 14 MiB; four 61 KiB patterns of named groups, whose
+compile time is quadratic, 0.6 s). A literal pattern that does not compile does not fail
+the load — EMQX accepts such a rule too — but warns
+(`regex_match(): invalid regular expression: missing closing parenthesis at position 1;
+every call fails the rule, as in EMQX`), and the rule fails on every message that
+reaches the call. An expression may be at most 256 levels deep, a chain of 256
 operands such as `1 + 1 + …` (past it: `expression is more than 256 levels deep`), and
 may nest at most 64 levels of parentheses, signs, `NOT`, function calls or array
 literals inside each other (past it: `expression nests more than 64 levels deep`).
@@ -1245,7 +1253,28 @@ Traps that EMQX's reference states only in passing, each checked against this en
 - `substr('hello', 1, 3)` is `ell`: `substr` counts from 0, while `nth` and indexes count
   from 1.
 - `regex_extract` returns an array of the groups (`["42"]`), empty when nothing matches,
-  and `nth(1, [])` fails the rule.
+  and `nth(1, [])` fails the rule. A group that did not take part is `""`, except after
+  the last one that did: `regex_extract('abc', '(x)?(b)')` is `["","b"]`, but
+  `regex_extract('abc', '(b)(x)?')` is `["b"]`.
+- Regular expressions are Erlang's `re`, as in EMQX: **PCRE2 on bytes**. `.` is one
+  byte, so `regex_replace('é', '.', 'x')` is `xx` and `'^.$'` does not match `é`; `\d`,
+  `\w`, `\s` and `[[:alpha:]]` are ASCII (`'^\d$'` does not match `٣`), and `(?i)` folds
+  ASCII letters only. `(*UTF)` at the start of a pattern makes it match characters, and
+  fails the rule on a subject that is not UTF-8. Backreferences, look-around, atomic
+  groups, possessive quantifiers, recursion, conditionals and backtracking verbs all
+  work. A pattern that does not compile fails the rule when the call runs.
+- `$` also matches before a newline that ends the subject: `regex_match` of `abc` plus a
+  newline against `'abc$'` is `true`. `\z` is the very end; use it where a trailing
+  newline must not pass, as in a guard on a value that becomes a topic level.
+- Backtracking is bounded as OTP bounds it: a match gives up after 10,000,000 steps, or
+  10,000,000 levels deep, from one start position, and a match that gives up is **no
+  match** — `false`, no further replacement, `[]` — not a failed rule, as in EMQX. The
+  bound is per start position, so a pattern that fails slowly at every position of a long
+  subject costs that at each, here as in EMQX.
+  `'^(a+)+$'` against 40 `a`s and a `b` gives up after about 0.15 s (0.4 s in EMQX).
+  The memory a match may take for backtracking is bounded too, at 64 MiB where OTP's
+  bound is 20 GB: `'^(a|b)*$'` gives up (no match) past about 220 KB of
+  subject, `'^(?:a|b)*$'` past about 330 KB, where EMQX matches up to several MB.
 - `round` takes one argument: `round(2.567, 2)` fails the load.
 - `unix_ts_to_rfc3339` and `now_rfc3339` write the broker host's local time zone, as EMQX
   does (`+00:00` on a host or container set to UTC). `format_date` with an explicit offset
@@ -1434,7 +1463,7 @@ notice.
 | Data-integration sources (`$bridges/…`, `$sources/…`) | Yes | No: refused at load |
 | Functions | 124 in the built-in reference, plus `jq`; every other export of `emqx_rule_funcs` is callable too | 120 of those 124, plus 23 EMQX exports without documenting (143 in all). `maptab_lookup`, `mongo_date`, `schema_encode`, `schema_decode`, `jq`, `term_encode`/`term_decode` and the state functions (`kv_store_*`, `proc_dict_*`; [ADR 0085](adr/0085-rule-state-store.md)) are refused at load. |
 | JSON integers | Any size (Erlang integers) | Signed 64-bit. One outside that range decodes as a float, so `12345678901234567890` becomes `1.2345678901234567e+19`. `${payload}` keeps the original bytes. |
-| Regular expressions | PCRE | Rust's `regex`: linear-time, no backreferences or look-around. `regex_replace`'s replacement syntax is `re:replace`'s, exactly. A rules file holds at most 96 distinct regular-expression literals. |
+| Regular expressions | Erlang `re`: PCRE2 10.47 (OTP 28) on bytes, compiled per call | PCRE2 10.46 on bytes, with OTP's compile options, match and depth limits and global-match loop: the same syntax and results ([above](#functions)). A match needing more than 64 MiB of backtracking memory is no match (OTP allows 20 GB); a pattern nesting parentheses more than 250 deep does not compile (OTP's limit is 10,000, though PCRE2's own workspace stops most such patterns below 2,000). A literal pattern is compiled once, when the file loads (one that does not compile warns), and a rules file holds at most 512 distinct ones, 256 KiB together. |
 | `sprintf` `~p` / `~P` of a long list, map or non-printable binary | `io_lib_pretty` breaks it across lines once it reaches the line width (80 columns, or the field width) | Printed on one line (`~0p`, which never breaks, is the same in both) |
 | `subbits` results Erlang has and this engine cannot hold | An integer of any size; a bit string of any length | Fail the rule: an integer outside 64 bits, a bit string that is not whole bytes |
 | `id` | 32 upper-case hex digits, the first 16 the microsecond clock | The same format; only how the low 64 bits are built differs (per-process salt and counter), which no rule can observe |

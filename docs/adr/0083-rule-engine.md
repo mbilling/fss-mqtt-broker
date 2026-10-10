@@ -147,7 +147,8 @@ hub's **data lane is FIFO per connection, bounded by ingress credit** (ADR 0082)
    every offset; decoding a payload object is linear in its keys; regular expressions
    compiled from a payload are remembered for the message (four of them), so a
    `FOREACH` compiles each once. Regular expressions use a
-   linear-time engine with a bounded automaton. Past a bound the function fails, so the
+   linear-time engine with a bounded automaton (amended 2026-10-10: PCRE2 in byte mode
+   with OTP's limits, as in EMQX; see the amendment below). Past a bound the function fails, so the
    rule fails and is counted, and the message is still routed. Unknown functions and
    wrong argument counts fail at load. `getenv` reads only `EMQXVAR_…` variables (amended
    2026-10-10; it was not provided), so a rule cannot read the rest of the broker's
@@ -413,3 +414,69 @@ lexer and parser, and the OTP 28 modules they call. Each value below was probed 
   messages in a node-local table. That is the state ADR 0085 designs as a replicated,
   namespaced store behind a trait; implementing EMQX's unreplicated table now would
   preempt it, so they stay refused at load and ADR 0085 decides their mapping.
+
+## Amendment (2026-10-10): regular expressions are PCRE2 in byte mode, as in EMQX
+
+§8 chose a linear-time engine (Rust's `regex`) so that a pattern could never make a
+message expensive: no backtracking, no backreferences, no look-around. On 2026-10-10 the
+user decided that rules must be 100% EMQX-compatible, and the regex functions were where
+the engines visibly disagreed. EMQX's `regex_match`, `regex_replace` and
+`regex_extract` (`emqx_variform_bif.erl`) call `re:run(S, RE, [global, {capture,
+none}])`, `re:replace(S, RE, Rep, [global, {return, binary}])` and `re:run(S, RE,
+[{capture, all_but_first, binary}])` with the pattern uncompiled and without `unicode`:
+Erlang's `re`, which is PCRE2 in **byte mode**. Probed on EMQX 6.3.1 (OTP 28, PCRE2
+10.47) against the old engine: `'abc$'` matches `abc` plus a newline (old: no); `.`
+matches one byte of `é`, so `regex_replace('é', '.', 'x')` is `xx` (old: `x`); `\d` and
+`\w` are ASCII (old: Unicode); `(a)\1` matches `aa` (old: refused at load).
+
+**The engine is PCRE2.** `crates/mqtt-rules/src/funcs/re.rs` compiles with the `pcre2`
+crate (a safe wrapper; the workspace forbids `unsafe`) over `pcre2-sys`, which builds
+PCRE2 10.46 from source and links it statically — on musl by itself, everywhere through
+`PCRE2_SYS_STATIC` in `.cargo/config.toml`, so no build links a system PCRE2. The compile
+options are OTP's defaults: none — no UTF, no UCP, newline LF, the C-locale tables, no
+JIT. Around `pcre2_match` it repeats what `re.erl` does: `loopexec/8`'s global loop, its
+anchored `notempty_atstart` retry after an empty match (run unanchored and kept only when
+it starts at the same offset — the crate cannot pass `anchored`, and the unanchored
+search tries that offset first, exactly as the anchored one would), its CRLF-aware step,
+its suppression of a repeated match, `do_mlist/5`'s replacement, and the capture count
+`re` reports (groups up to the last that took part). A pattern that is not UTF-8 is
+passed as `\xHH` escapes for the crate's `&str`. A differential set of 171 subjects and
+patterns, each run on the EMQX container, is pinned row for row
+(`regex_functions_match_emqx_row_for_row`).
+
+**What replaces linear-time safety is OTP's bounds, plus one.** OTP builds PCRE2 with a
+match limit and a depth limit of 10,000,000 (`erts/emulator/pcre/local_config.h`, PCRE2's
+defaults too) and turns reaching either into `nomatch` (`erl_bif_re.c`), so a
+catastrophic pattern is *no match* in EMQX, not an error; it is here too, and
+`(a+)+b|z` turning from match to no match between 21 and 22 `a`s in both engines pins the
+limits as equal. OTP's heap limit is 20,000,000 KiB — in effect none — and EMQX's
+matches yield to the scheduler; here a match runs on the publisher's connection task, so
+its backtracking frames are bounded at 64 MiB, set as a `(*LIMIT_HEAP=…)` item after the
+pattern's own start-of-pattern items so a pattern cannot raise it. A match needing more
+is no match, where EMQX goes on: `'^(a|b)*$'` past about 220 KB of subject. Compiled
+size is PCRE2's own bound, 64K code units (`LINK_SIZE` 2, as in OTP).
+
+What remains is CPU: the match limit applies per start position, so a pattern that fails
+slowly at every position of a long subject costs up to the limit (about 0.15 s) at each.
+That is EMQX's exposure too, and it needs a pattern written by the operator or taken from
+the payload by the operator's rule; it is recorded as an accepted risk in
+`docs/THREAT-MODEL.md`. A per-message regex budget was not built: PCRE2 reports no step
+count to charge one with, and any bound short of OTP's would change results.
+
+**Literal patterns.** EMQX compiles a pattern on every call; this engine compiles a
+literal once when the file loads and keeps it, and remembers a payload pattern for the
+rest of the message (four of them). A literal that does not compile no longer fails the
+load — EMQX's parser accepts it and every call raises `badarg` — but warns, and the call
+fails the rule. ADR 0084 D3's cap of 96 distinct literals existed for the linear-time
+engine's automata (1 MiB each); a PCRE2 pattern costs at most about 0.9 ms and 190 KiB, so
+the cap is 512 distinct literals, plus 256 KiB of them together for named groups, whose
+compile time is quadratic (about 0.15 s for a 64 KiB pattern): a worst-case file loads in
+under a second and about 100 MiB.
+
+**Still different from EMQX:** the 64 MiB heap bound above; PCRE2's default nesting limit
+of 250 parentheses (OTP raises it to 10,000; the `pcre2` crate cannot set it, and PCRE2's
+own workspace stops most such patterns below 2,000 anyway); PCRE2 10.46 against OTP 28's
+10.47 (bug fixes only); a literal that does not compile warns at load. Pinned by the
+tests named above and `the_match_limit_is_otps_and_reaching_it_is_no_match`,
+`a_matchs_backtracking_heap_is_bounded`,
+`an_invalid_pattern_loads_with_a_warning_and_fails_each_call`.
