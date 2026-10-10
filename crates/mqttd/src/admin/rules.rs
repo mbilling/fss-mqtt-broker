@@ -739,7 +739,13 @@ fn dry_run(set: &RuleSet, alone: Option<&str>, trigger: &Trigger, node: &str) ->
                 sockname: None,
                 node,
             };
-            sample = mqtt_rules::EventInput::sample(kind, &client, &trigger.topic, trigger.qos);
+            sample = mqtt_rules::EventInput::sample_message(
+                kind,
+                &client,
+                &trigger.topic,
+                trigger.qos,
+                &trigger.payload,
+            );
             &sample
         }
         None => &message,

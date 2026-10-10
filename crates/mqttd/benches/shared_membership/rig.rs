@@ -297,11 +297,11 @@ impl Rig {
 
     async fn attach(&mut self, drain: &Runtime, i: usize) {
         let name = format!("local-{i}");
-        let (tx, rx) = mpsc::unbounded_channel::<Box<Packet>>();
+        let (tx, rx) = mpsc::unbounded_channel::<Box<mqttd::hub::Outgoing>>();
         let (outbound, meter) = Outbound::new(tx);
         let (collector, task) = Collector::spawn(drain, rx, move |packet| {
             meter.drained(&packet);
-            let Packet::Publish(p) = *packet else {
+            let Some(Packet::Publish(p)) = packet.into_packet() else {
                 panic!("unexpected local packet")
             };
             assert_eq!(p.qos, QoS::AtMostOnce);
