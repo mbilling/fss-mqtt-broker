@@ -19,7 +19,9 @@
 > (§3, §8); `$ENV` and `env` inside jq are **empty unless the operator lists variables**
 > (D8); the jq module is **built in the pipeline from pinned sources** and compared with a
 > recorded hash, not committed (D11); the last-digit differences of libm are **documented,
-> not chased** (§7).
+> not chased** (§7); `jq` is **off unless the operator switches it on** (`rules.jq`), and
+> the shipped systemd unit keeps `MemoryDenyWriteExecute=true`, which the operator who
+> switches `jq` on sets to `false` (D13).
 
 ## Context
 
@@ -365,8 +367,8 @@ be 2.8× faster than Pulley on the hosts that need a fallback. It would also be 
 runtime with its own `unsafe`, its own limits code (fuel slices instead of epochs), its own
 ten crates, and a second column in every test: two sandboxes to keep sound instead of
 one. Pulley comes with wasmtime (the runtime links it regardless), shares every line of the
-host code, and its slowness is confined to operators who chose both jq and
-`MemoryDenyWriteExecute`.
+host code. (D13 in the end offers operators neither: `jq` is a switch, and switching it
+on means compiled code.)
 
 **Signals.** In compiled mode wasmtime installs process-wide handlers for `SIGSEGV`,
 `SIGBUS`, `SIGILL` and `SIGFPE` when the engine is first made (out-of-bounds accesses and
@@ -476,8 +478,10 @@ to a 16.8 MB image; §8) and provides `jq/2` and `jq/3` with EMQX's semantics:
   looked at while a program runs), and bounded by a deadline of its own instead (5 s; one
   compilation takes a millisecond).
 
-A cargo feature leaves the module and the runtime out of a build that does not want them;
-`jq` is then refused at load as today.
+`jq` is off unless the operator switches it on (`rules.jq = true`, D13); while it is off,
+`jq` is refused at load as today. A cargo feature leaves the module and the runtime out of
+a build that does not want them at all; the switch then has nothing to turn on, and says
+so.
 
 ### D5. The module is compiled when rules first name `jq`; instances are pooled per node
 
@@ -578,7 +582,7 @@ fresh_instance = false          # true: no state survives a call, at 52 µs each
 Per function: calls, errors by kind (`timeout`, `memory`, `output`, `stack`, `trap`, the
 module's own), time (`mqttd_rule_function_seconds_total{function}` beside
 `mqttd_rule_eval_seconds_total`); per module: instances, instance memory, instances
-replaced, and how it runs (compiled or interpreted). The rule trace records a failed call's kind, and for jq EMQX's message.
+replaced. The rule trace records a failed call's kind, and for jq EMQX's message.
 
 ### D11. Trust model
 
@@ -630,29 +634,46 @@ functions). `[functions.*]` is mqttd's own and is listed under "Differences from
 a rules file that uses it does not port back. `jq` itself is EMQX's function with EMQX's
 results, within the limits of D7 and the differences of spike §7.
 
-### D13. Compiled by default; interpreted by the operator's choice; never a crash
+### D13. Off by default; compiled when switched on; never a crash
 
-`rules.jq_engine` (and `engine` on a plugin) is `"compiled"` (default) or `"interpreted"`.
+`rules.jq` is `false` by default (decided 2026-10-11).
 
-- **Compiled** is Cranelift's machine code. On a host that forbids executable memory the
-  module cannot be loaded, and that is reported where the operator is looking: the rules
-  file that calls `jq` **fails to load**, at boot, on reload, through the admin API and in
-  `--check-rules`, with "jq is not available: the WebAssembly compiler cannot run on this
-  host (it needs memory it may map executable): …", and the message names
-  `rules.jq_engine = "interpreted"` and `MemoryDenyWriteExecute` as the two ways out. The
-  running rule set stays as it was (ADR 0084). Rules that do not call `jq` are untouched.
-  Nothing panics and no signal is raised: wasmtime returns the failed `mprotect` as an
-  error, which CI checks under the shipped unit's hardening (§8).
-- **Interpreted** is the same module in Pulley: 25× slower, no executable memory, no
-  signal handlers. It is never chosen silently. A broker that fell back by itself would
-  turn "my rules are 25× slower than on the other node" into something to be discovered
-  in production.
-- `mqttd --check-config` reports which of the two the host allows (`Execution::probe`).
+- **Off.** A rules file that calls `jq` fails to load, as it does today, and the message
+  names the switch: "jq is switched off: set `rules.jq = true` to use it (see RULES.md for
+  what it needs from the host)". Nothing of the runtime is created: no engine, no thread,
+  no handler, no executable page. An installation that does not use `jq` is exactly as
+  hardened as it is today, and the shipped systemd unit keeps
+  `MemoryDenyWriteExecute=true`.
+- **On.** `jq` runs as Cranelift's machine code, which needs memory the process may map
+  executable. The operator who switches `jq` on under the shipped unit therefore also sets
+  `MemoryDenyWriteExecute=false`, in a drop-in
+  (`systemctl edit mqttd` → `[Service]` / `MemoryDenyWriteExecute=false`); the unit file
+  carries a comment saying so next to the line. Two settings, on purpose: the broker cannot
+  lift a restriction its service manager imposed, and the operator should see that they
+  are trading that restriction for `jq`.
+- **On, on a host that still forbids executable memory.** The module cannot be loaded, and
+  that is reported where the operator is looking: the rules file that calls `jq` **fails
+  to load**, at boot, on reload, through the admin API and in `--check-rules`, with "jq is
+  not available: the WebAssembly compiler cannot run on this host (it needs memory it may
+  map executable): …", and the message names `MemoryDenyWriteExecute=false` as the way
+  out. The running rule set stays as it was (ADR 0084). Rules that do not call `jq` are
+  untouched. Nothing panics and no signal is raised: wasmtime returns the failed
+  `mprotect` as an error, which CI checks under the shipped unit's hardening (§8).
+- `mqttd --check-config` reports, when the switch is on, whether the host allows compiled
+  code (`Execution::probe`).
 
-For the operator of the shipped systemd unit the choice is explicit: keep
-`MemoryDenyWriteExecute=true` and run jq interpreted, or drop that one line in a drop-in
-and run it compiled. `deploy/systemd/README.md` and HARDENING.md say so when the function
-ships (T2, T4); until then `jq` is refused at load and the unit is right as it is.
+The switch is per node, like the rest of the configuration. A cluster whose nodes disagree
+has rules that load on some nodes and not on others; the rules-file load error says which
+node refused and why, and RULES.md says to set it on all of them.
+
+**The interpreter is not offered to operators.** The prototype can run the same module in
+wasmtime's Pulley interpreter (`Execution::Interpreted`: no executable memory, 25× slower,
+§8), and an earlier draft of this decision exposed it as `rules.jq_engine`. With the
+switch, the operator who wants `jq` under `MemoryDenyWriteExecute=true` has a clear answer
+(they cannot have both), and one mode is one thing to test and to explain. The code path
+stays in the crate, where the tests use it to show the answers do not depend on the
+compiler; exposing it later is additive. A plugin (D9) follows the same rule: it loads
+only where `rules.jq`'s requirement is met, under its own `[functions.*]` declaration.
 
 ## Phasing
 
@@ -665,7 +686,7 @@ ships (T2, T4); until then `jq` is refused at load and the unit is right as it i
    fixed inputs, not a fuzzer).
 2. **T2 — `jq/2` and `jq/3` in the rule engine**, behind the ABI: the pool (D5), the
    worker hand-off (D6), the budget (D7), the grants (D8), metrics and trace (D10), the
-   engine choice and its load error (D13), the module embedded by the release build,
+   switch and its load errors (D13), the comment in the systemd unit, the module embedded by the release build,
    `--rule-test` support, the workspace's declared Rust version (§8), and the remaining
    differences closed where they can be (`strptime %z`, `%Z`).
 3. **T3 — operator plugins** (D9), with a worked example in Rust and one in C.
@@ -688,8 +709,9 @@ delivers `jq`.
 - The broker's memory safety now also rests on wasmtime and on the machine code Cranelift
   generates (D11). Its security advisories become ours to follow, and its minimum Rust
   version moves ours (§8).
-- Compiled `jq` and the shipped systemd unit's `MemoryDenyWriteExecute=true` exclude each
-  other; the operator chooses (D13).
+- `jq` and the shipped systemd unit's `MemoryDenyWriteExecute=true` exclude each other.
+  `jq` is off by default and the unit stays as it is; the operator who switches `jq` on
+  gives up that one restriction, knowingly (D13).
 - The broker gains a general, bounded extension point. It also gains the obligation to keep
   an ABI stable.
 - Transcendental functions in jq can differ from EMQX in the last digit, and two time
@@ -722,23 +744,21 @@ delivers `jq`.
 ## Open questions
 
 Decided on 2026-10-11 and no longer open: the runtime (wasmtime), `$ENV` (empty unless
-listed), the module's place in a release (built in the pipeline), libm (documented).
+listed), the module's place in a release (built in the pipeline), libm (documented), and the
+shipped systemd unit (`jq` is off by default, the unit keeps `MemoryDenyWriteExecute=true`,
+and the operator who switches `jq` on sets it to `false`; D13).
 
-1. **The shipped systemd unit and compiled jq** (D13). Proposed: the unit keeps
-   `MemoryDenyWriteExecute=true`, and an operator who wants jq compiled removes it in a
-   drop-in. The alternative is to ship the unit without it once `jq` exists, which weakens
-   the default for every installation to speed up the ones that use `jq`.
-2. **The compiler in the trust base** (D11). Accepted with the runtime decision; recorded
+1. **The compiler in the trust base** (D11). Accepted with the runtime decision; recorded
    here because it is the part of that decision that cannot be measured.
-3. **The workspace's Rust version** has to go from 1.88 to 1.96 when the broker links the
+2. **The workspace's Rust version** has to go from 1.88 to 1.96 when the broker links the
    crate, and will follow wasmtime's from then on (§8).
-4. **The worker hand-off (D6)** is designed, not measured, and now rests on wasmtime's
+3. **The worker hand-off (D6)** is designed, not measured, and now rests on wasmtime's
    fibers.
-5. **`OptLevel::None`** would take a quarter off the half-second load at no measured cost
+4. **`OptLevel::None`** would take a quarter off the half-second load at no measured cost
    (§6). Left at the default.
-6. **Program cache size.** 32 per instance in the prototype against EMQX's 500 per thread;
+5. **Program cache size.** 32 per instance in the prototype against EMQX's 500 per thread;
    at 15 KiB per program 500 would cost about 7 MiB per instance.
-7. **Operator plugins now or later** (T3), and whether ABI 1 should already carry a way to
+6. **Operator plugins now or later** (T3), and whether ABI 1 should already carry a way to
    declare argument types so that arity and type errors are load errors.
 8. The pinned source tarballs come from GitHub's archive endpoint, whose bytes are stable
    in practice but not by contract; a mirror of the tarballs as a release asset would
