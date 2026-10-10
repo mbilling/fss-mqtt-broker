@@ -540,3 +540,59 @@ Pinned by `a_republished_message_is_seen_as_emqx_shows_it`,
 `direct_dispatch_skips_the_rules_and_the_retained_store`,
 `a_templated_direct_dispatch_is_rendered_per_message` and
 `a_message_republished_from_an_event_runs_the_rules` (`tests/rules.rs`).
+
+## Amendment (2026-10-10): numbers are Erlang's
+
+A rule's numbers were `i64` and `f64` as Rust has them; EMQX's are Erlang integers (no
+width) and doubles, decoded and encoded by jiffy (`emqx_utils_json` →
+`jiffy:decode(Json, [return_maps])`, jiffy 2.0.1, whose `finish_decode({bignum, V})` is
+`binary_to_integer(V)`). Probed on EMQX 6.3.1, `12345678901234567890 + 1` is
+`12345678901234567891` and `9223372036854775807 + 1` is `9223372036854775808`; mqttd
+decoded the first as `1.2345678901234567e19` and failed the second with `integer
+overflow`. Numbers now behave as EMQX's do, each point pinned by tests whose values were
+probed on 6.3.1:
+
+- **Integers of any size.** `Value::Big` holds an integer outside `i64` (never one inside,
+  so the `i64` path is unchanged and two equal integers have one shape), through the SQL
+  lexer (`list_to_integer`), JSON decode and encode, `+ - * div mod` (`div` truncates,
+  `mod` is `rem`), unary minus, comparisons, `${…}` templates and every function that
+  takes or makes an integer: `abs`, `ceil`/`floor`/`round` of a float (`ceil(1.0e20)` is
+  `100000000000000000000`), `int`, the `bit*` functions (two's complement of unbounded
+  width; a negative shift goes the other way), `div`/`mod`, `map_to_range` and
+  `hash_to_range` (`Min + (N rem Span)`, so a negative `N` can land below `Min`, as in
+  EMQX), `subbits` (an integer of any width), `sprintf` (`~p ~w ~b ~x ~c …`).
+  `num-bigint` (already shipped through `x509-parser` and `jsonwebtoken`) does the
+  arithmetic.
+- **One bound Erlang lacks.** Printing, parsing and dividing a big integer cost the square
+  of its size, and a payload chooses the size. An integer is at most 8192 bits (2,466
+  digits): text with more digits is refused before it is parsed, a shift or product past
+  it before it is computed. Every integer past 64 bits a rule computes is also charged, by
+  size, to the per-message 1 MiB budget functions already share. No device payload comes
+  near the bound, so it is listed with the other payload limits, not as a difference.
+- **An integer meets a float the Erlang way.** Comparisons are by exact value
+  (`9007199254740993 > 9007199254740992.0`); `=:=` (`IN`, `CASE x WHEN`, `contains`) keeps
+  integers and floats apart at any depth and tells `-0.0` from `0.0`. Arithmetic converts
+  the integer as the VM's `big_to_double` does, 64-bit digit by digit with a rounding at
+  each step — not always to the nearest double — and fails when that is not finite.
+- **JSON is read by mqttd's own reader** (`src/json.rs`), because serde_json can carry an
+  integer past 64 bits only as a float, and its `arbitrary_precision` would change
+  `serde_json::Number` for every crate in the build. It accepts exactly what serde_json
+  does (a differential test over mutated documents), keeps its error messages, and reads a
+  float as the nearest double, as jiffy does (`5.960464477539063e-8` was one ulp off
+  without serde's `float_roundtrip`, which is now on for the JSON the broker still reads
+  with serde).
+- **Floats print as EMQX prints them.** JSON writes jiffy's form, Erlang's shortest
+  (`1.0e20`, `3.14e4`, `1.0e-5`, `100.0`, Ryu's tie to even), with `-0.0` as `0.0`. Text
+  (`str`, `${x}`, `+` with a string, `float2str`, `float/2`) follows the VM's
+  `float_to_binary(F, [{decimals, D}, compact])` step by step: the fraction scaled in
+  floating point and rounded half away from zero (`float2str(0.125, 2)` is `0.13`,
+  `str(1.5e-10)` is `0.0000000002`), `-0.0` keeping its sign, `compact` trimming an
+  integer's zeros past 2^53 (`float2str(1.0e20, 0)` is `"1"`), and a text over 255
+  characters failing (`str(1.0e250)`).
+- **Strings convert by Erlang's syntax.** `int`, `float` and a number compared with a
+  string use `binary_to_integer` then `binary_to_float`: `'5'`, `'+5'`, `'1.5e3'`, but not
+  `' 5'`, `'1e3'`, `'.5'` or `'1_000'`. `abs` takes an integer only and `float2str` a
+  float only, as their EMQX clauses do.
+
+This supersedes the previous amendment's `subbits` note: an integer outside 64 bits is
+now returned, and only a bit string that is not whole bytes fails.

@@ -17,6 +17,8 @@
 //! single-line text reaches the line width (80 columns by default, or the field width;
 //! `~0p` never breaks).
 
+use num_traits::ToPrimitive as _;
+
 use crate::value::Value;
 use crate::EvalError;
 
@@ -82,12 +84,23 @@ fn field_value(
         Some(b'*') => {
             // `field_value([$*|Fmt], [A|Args]) when is_integer(A)`; otherwise the `*` is
             // left in place and later read as an (unknown) control character.
-            if let Some(Value::Int(n)) = args.as_slice().first() {
-                args.next();
-                *i += 1;
-                Ok(Some(*n))
-            } else {
-                Ok(None)
+            match args.as_slice().first() {
+                Some(Value::Int(n)) => {
+                    args.next();
+                    *i += 1;
+                    Ok(Some(*n))
+                }
+                // Wider than 64 bits: no field is that wide; the output limit refuses it.
+                Some(Value::Big(n)) => {
+                    args.next();
+                    *i += 1;
+                    Ok(Some(if n.sign() == num_bigint::Sign::Minus {
+                        i64::MIN
+                    } else {
+                        i64::MAX
+                    }))
+                }
+                _ => Ok(None),
             }
         }
         Some(d) if d.is_ascii_digit() => {
@@ -272,7 +285,7 @@ fn control(s: &Spec, limit: usize, out: &mut Chars) -> Result<(), EvalError> {
             }
         }
         b'b' | b'B' | b'x' | b'X' | b'+' | b'#' => {
-            let Value::Int(n) = s.args[0] else {
+            let Some(n) = crate::num::big(s.args[0]) else {
                 return Err(err(format!("~{} takes an integer", char::from(s.ctrl))));
             };
             let base = match p {
@@ -287,22 +300,33 @@ fn control(s: &Spec, limit: usize, out: &mut Chars) -> Result<(), EvalError> {
                 _ => Chars::new(),
             };
             let mut t = Chars::new();
-            if *n < 0 {
+            if n.sign() == num_bigint::Sign::Minus {
                 t.push(u32::from(b'-'));
             }
             t.extend(prefix);
-            push_str(&mut t, &radix(n.unsigned_abs(), base, lower));
+            let digits = n.magnitude().to_str_radix(base);
+            push_str(
+                &mut t,
+                &if lower {
+                    digits
+                } else {
+                    digits.to_ascii_uppercase()
+                },
+            );
             term(t, f, s.left, None, &s.pad, limit)?
         }
         b'c' => {
-            let Value::Int(n) = s.args[0] else {
+            let Some(n) = crate::num::big(s.args[0]) else {
                 return Err(err("~c takes an integer"));
             };
             let c = if s.unicode {
-                u32::try_from(*n).map_err(|_| err("~tc takes a character code"))?
+                n.to_u32()
+                    .ok_or_else(|| err("~tc takes a character code"))?
             } else {
-                // `A band 255`, two's complement for a negative code.
-                u32::from(n.to_le_bytes()[0])
+                // `A band 255`, two's complement for a negative code (of any width).
+                (n.as_ref() & num_bigint::BigInt::from(255))
+                    .to_u32()
+                    .unwrap_or(0)
             };
             char_field(c, f, s.left, p, &s.pad, limit)?
         }
@@ -328,20 +352,6 @@ fn depth(v: &Value) -> Result<i64, EvalError> {
 
 fn push_str(out: &mut Chars, s: &str) {
     out.extend(s.chars().map(u32::from));
-}
-
-fn radix(mut n: u64, base: u32, lower: bool) -> String {
-    if n == 0 {
-        return "0".to_string();
-    }
-    let mut digits = Vec::new();
-    while n > 0 {
-        let d = u32::try_from(n % u64::from(base)).unwrap_or(0);
-        let c = char::from_digit(d, base).unwrap_or('?');
-        digits.push(if lower { c } else { c.to_ascii_uppercase() });
-        n /= u64::from(base);
-    }
-    digits.iter().rev().collect()
 }
 
 /// The prefix of `~x`/`~X`: an atom's name or a (deep) character list; a binary is not
@@ -712,39 +722,6 @@ fn fwrite_g(
     }
 }
 
-/// `float_to_list(F, [short])`: the shortest digits that read back as `x`, in decimal
-/// or scientific notation, whichever is shorter (decimal on a tie), and always
-/// scientific from 2^53 up.
-pub(crate) fn short_float(x: f64) -> String {
-    let s = format!("{:e}", x.abs());
-    let (mant, exp) = s.split_once('e').unwrap_or((&s, "0"));
-    let digits: String = mant.chars().filter(char::is_ascii_digit).collect();
-    let exp: i64 = exp.parse().unwrap_or(0);
-    let n = i64::try_from(digits.len()).unwrap_or(1);
-    let sci = format!(
-        "{}.{}e{exp}",
-        &digits[..1],
-        if digits.len() > 1 { &digits[1..] } else { "0" }
-    );
-    let dec = if exp >= n - 1 {
-        let zeros = usize::try_from(exp - (n - 1)).unwrap_or(0);
-        format!("{digits}{}.0", "0".repeat(zeros))
-    } else if exp >= 0 {
-        let at = usize::try_from(exp + 1).unwrap_or(1);
-        format!("{}.{}", &digits[..at], &digits[at..])
-    } else {
-        let zeros = usize::try_from(-exp - 1).unwrap_or(0);
-        format!("0.{}{digits}", "0".repeat(zeros))
-    };
-    // 2^53: from here on, Erlang always writes scientific notation.
-    let body = if x.abs() >= 9_007_199_254_740_992.0 || sci.len() < dec.len() {
-        sci
-    } else {
-        dec
-    };
-    format!("{}{body}", sign(x))
-}
-
 // -- terms
 
 /// The keys of a map in Erlang's order for binary keys (byte-wise), which is the order
@@ -763,7 +740,8 @@ fn write_term(v: &Value, d: i64, out: &mut Chars) {
     }
     match v {
         Value::Int(n) => push_str(out, &n.to_string()),
-        Value::Float(x) => push_str(out, &short_float(*x)),
+        Value::Big(n) => push_str(out, &n.to_string()),
+        Value::Float(x) => push_str(out, &crate::num::short_float(*x)),
         Value::Str(_) | Value::Bin(_) => write_binary(v.as_bytes().unwrap_or_default(), d, out),
         Value::Array(a) if a.is_empty() => push_str(out, "[]"),
         Value::Array(_) if d == 1 => push_str(out, "[...]"),

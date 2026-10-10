@@ -892,7 +892,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::sink_records_through_a_trait_object`
 - `tests::tampering_with_any_field_changes_the_head`
 
-## `crates/mqtt-rules/src/lib.rs` — 139 test(s)
+## `crates/mqtt-rules/src/lib.rs` — 151 test(s)
 
 - `edit::tests::a_json_rule_body_is_a_rule_edit`
 - `edit::tests::an_insert_appends_the_rule_at_the_end`
@@ -912,6 +912,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `lexer::tests::operators`
 - `lexer::tests::quotes_follow_emqx`
 - `lexer::tests::ranges_numbers_and_comments`
+- `num::tests::decimals_round_as_the_erlang_vm_does`
 - `template::tests::quoted_keys`
 - `template::tests::renders_paths_and_missing_values`
 - `template::tests::the_literal_prefix_is_the_text_before_the_first_placeholder`
@@ -931,6 +932,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::addresses_print_as_emqx_prints_them`
 - `tests::an_invalid_pattern_loads_with_a_warning_and_fails_each_call`
 - `tests::arithmetic_follows_erlang`
+- `tests::big_arithmetic_is_charged_to_the_message_budget`
 - `tests::bit_sequence_functions_follow_emqx`
 - `tests::case_expression_emqx_docs`
 - `tests::catastrophic_backtracking_is_bounded_and_no_match`
@@ -952,6 +954,9 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::expressions_too_deep_to_evaluate_safely_fail_the_load`
 - `tests::failures_are_reported_once_per_interval_per_rule`
 - `tests::file_level_validation`
+- `tests::float_text_is_erlangs`
+- `tests::floats_parse_and_convert_as_erlang_does`
+- `tests::floats_print_as_erlang_does_bit_for_bit`
 - `tests::foreach_default_item_and_chained_aliases_emqx_docs`
 - `tests::foreach_over_a_non_array_yields_nothing_and_is_capped`
 - `tests::foreach_with_do_and_incase_emqx_docs`
@@ -959,15 +964,22 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::hash_offers_every_digest_erlang_crypto_does`
 - `tests::hashing_encoding_and_bits_emqx_docs`
 - `tests::hex_prefix_and_alias_functions_follow_emqx`
+- `tests::huge_integers_are_refused_before_they_cost_anything`
 - `tests::identical_regular_expressions_are_compiled_once`
+- `tests::in_is_exact_membership`
 - `tests::incase_and_do_read_the_merged_scope_like_emqx`
 - `tests::indices_and_ranges`
+- `tests::integer_literals_and_arithmetic_never_overflow`
 - `tests::invalid_qos_fails_the_action`
 - `tests::is_empty_reads_a_string_only_as_a_json_object`
+- `tests::json_numbers_decode_and_encode_as_jiffy_does`
+- `tests::json_reader_accepts_what_serde_json_accepts`
 - `tests::load_errors_are_specific`
 - `tests::load_errors_say_where_and_print_as_before`
 - `tests::map_and_array_functions_emqx_docs`
 - `tests::matching_dedups_orders_and_skips_disabled_rules`
+- `tests::numbers_compare_by_value_as_erlang_does`
+- `tests::numeric_functions_take_integers_of_any_size`
 - `tests::one_rule_can_be_evaluated_whether_or_not_it_is_enabled`
 - `tests::original_user_properties_keep_wire_order_and_duplicates`
 - `tests::payload_regex_patterns_are_cached_per_message_and_stay_distinct`

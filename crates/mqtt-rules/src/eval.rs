@@ -27,6 +27,7 @@ use std::cell::OnceCell;
 use std::sync::Arc;
 
 use crate::funcs::FnCtx;
+use crate::num;
 use crate::parser::{ArithOp, CmpOp, Expr, Item, KeyPath, Seg, Statement};
 use crate::value::{json_decode, Map, Value};
 use crate::{EvalError, Input};
@@ -424,14 +425,14 @@ pub(crate) fn eval(e: &Expr, ctx: &EvalCtx, frames: Frames) -> Result<Value, Eva
                 .collect::<Result<Vec<_>, _>>()?,
         ),
         Expr::Neg(x) => match eval(x, ctx, frames)? {
-            Value::Int(n) => Value::Int(
-                n.checked_neg()
-                    .ok_or_else(|| EvalError::new("integer overflow"))?,
-            ),
+            n @ (Value::Int(_) | Value::Big(_)) => charge_int(ctx, num::int_neg(&n)?)?,
             Value::Float(f) => Value::Float(-f),
             v => return Err(EvalError::new(format!("cannot negate a {}", v.type_name()))),
         },
-        Expr::Arith(op, l, r) => arith(*op, &eval(l, ctx, frames)?, &eval(r, ctx, frames)?)?,
+        Expr::Arith(op, l, r) => charge_int(
+            ctx,
+            arith(*op, &eval(l, ctx, frames)?, &eval(r, ctx, frames)?)?,
+        )?,
         Expr::Cmp(op, l, r) => Value::Bool(compare(
             *op,
             &eval(l, ctx, frames)?,
@@ -500,10 +501,30 @@ pub(crate) fn eval(e: &Expr, ctx: &EvalCtx, frames: Frames) -> Result<Value, Eva
 
 /// Exact term equality (Erlang `=:=`): like `==` except an integer never equals a float.
 fn strict_eq(a: &Value, b: &Value) -> bool {
-    match (a, b) {
-        (Value::Int(_), Value::Float(_)) | (Value::Float(_), Value::Int(_)) => false,
-        _ => a.loose_eq(b),
+    a.exact_eq(b)
+}
+
+/// Charge an integer a rule computed beyond 64 bits to the message's build budget
+/// ([`MAX_BUILT_BYTES`](crate::funcs::MAX_BUILT_BYTES)), by its size: the budget that
+/// bounds every string a message's functions build bounds its big arithmetic too.
+pub(crate) fn charge_int(ctx: &EvalCtx, v: Value) -> Result<Value, EvalError> {
+    if let Value::Big(b) = &v {
+        let bytes = usize::try_from(b.bits().div_ceil(8)).unwrap_or(usize::MAX);
+        let total = ctx
+            .built
+            .get()
+            .checked_add(bytes)
+            .filter(|&t| t <= crate::funcs::MAX_BUILT_BYTES)
+            .ok_or_else(|| {
+                EvalError::new(format!(
+                    "the integers this message's rules computed would pass {} bytes \
+                     (the budget is per message, shared with every function call)",
+                    crate::funcs::MAX_BUILT_BYTES
+                ))
+            })?;
+        ctx.built.set(total);
     }
+    Ok(v)
 }
 
 fn range_get(v: &Value, lo: i64, hi: i64) -> Result<Value, EvalError> {
@@ -528,17 +549,19 @@ fn range_get(v: &Value, lo: i64, hi: i64) -> Result<Value, EvalError> {
     Ok(Value::from(out))
 }
 
-/// A string read as a number for a comparison against one.
+/// A string read as a number for a comparison against one: EMQX's `number/1`,
+/// `binary_to_integer` and then `binary_to_float` — Erlang's syntax exactly, so `' 5'`,
+/// `'1e5'` and `'.5'` are not numbers.
 fn to_number(s: &[u8]) -> Result<Value, EvalError> {
-    let text = std::str::from_utf8(s).unwrap_or_default().trim();
-    if let Ok(n) = text.parse::<i64>() {
-        return Ok(Value::Int(n));
+    if let Some(n) = num::parse_int(s)? {
+        return Ok(n);
     }
-    text.parse::<f64>()
-        .ok()
-        .filter(|f| f.is_finite())
-        .map(Value::Float)
-        .ok_or_else(|| EvalError::new(format!("cannot compare a number with the string '{text}'")))
+    num::parse_float(s).map(Value::Float).ok_or_else(|| {
+        EvalError::new(format!(
+            "cannot compare a number with the string '{}'",
+            String::from_utf8_lossy(s)
+        ))
+    })
 }
 
 /// EMQX's `compare/3`.
@@ -580,13 +603,10 @@ pub(crate) fn compare(op: CmpOp, l: &Value, r: &Value) -> Result<bool, EvalError
     })
 }
 
-fn overflow() -> EvalError {
-    EvalError::new("integer overflow")
-}
-
 /// EMQX's arithmetic: `+` adds numbers or concatenates when either side is a string;
-/// `/` always yields a float; `div` / `mod` are integer-only.
-// `l`/`r` are the operands, `a`/`b` their integer forms, `x`/`y` their float forms.
+/// `/` always yields a float; `div` / `mod` are integer-only. Integers never overflow
+/// (Erlang's have no width); an integer meeting a float is converted to one.
+// `l`/`r` are the operands, `a`/`b` the same in a guarded arm, `x`/`y` their float forms.
 #[allow(clippy::many_single_char_names)]
 pub(crate) fn arith(op: ArithOp, l: &Value, r: &Value) -> Result<Value, EvalError> {
     if op == ArithOp::Add && (l.is_binary() || r.is_binary()) {
@@ -594,32 +614,22 @@ pub(crate) fn arith(op: ArithOp, l: &Value, r: &Value) -> Result<Value, EvalErro
         s.push_str(&r.to_text()?);
         return Ok(Value::from(s));
     }
-    match (op, l, r) {
-        (ArithOp::IntDiv | ArithOp::Mod, Value::Int(_), Value::Int(0))
-        | (ArithOp::Div, _, Value::Int(0)) => return Err(EvalError::new("division by zero")),
-        (ArithOp::Div, _, Value::Float(f)) if *f == 0.0 => {
-            return Err(EvalError::new("division by zero"))
-        }
-        _ => {}
-    }
+    let int_op = match op {
+        ArithOp::Add => num::IntOp::Add,
+        ArithOp::Sub => num::IntOp::Sub,
+        ArithOp::Mul => num::IntOp::Mul,
+        ArithOp::IntDiv | ArithOp::Div => num::IntOp::Div,
+        ArithOp::Mod => num::IntOp::Rem,
+    };
     Ok(match (op, l, r) {
-        (ArithOp::Add, Value::Int(a), Value::Int(b)) => {
-            Value::Int(a.checked_add(*b).ok_or_else(overflow)?)
+        (ArithOp::Div, _, _) if l.is_number() && r.is_number() => {
+            let (x, y) = (float_operand(l)?, float_operand(r)?);
+            if y == 0.0 {
+                return Err(EvalError::new("division by zero"));
+            }
+            Value::float(x / y)?
         }
-        (ArithOp::Sub, Value::Int(a), Value::Int(b)) => {
-            Value::Int(a.checked_sub(*b).ok_or_else(overflow)?)
-        }
-        (ArithOp::Mul, Value::Int(a), Value::Int(b)) => {
-            Value::Int(a.checked_mul(*b).ok_or_else(overflow)?)
-        }
-        // Erlang `div` truncates toward zero and `rem` takes the dividend's sign —
-        // exactly Rust's `/` and `%` on integers.
-        (ArithOp::IntDiv, Value::Int(a), Value::Int(b)) => {
-            Value::Int(a.checked_div(*b).ok_or_else(overflow)?)
-        }
-        (ArithOp::Mod, Value::Int(a), Value::Int(b)) => {
-            Value::Int(a.checked_rem(*b).ok_or_else(overflow)?)
-        }
+        (_, a, b) if num::is_int(a) && num::is_int(b) => num::int_arith(int_op, a, b)?,
         (ArithOp::IntDiv | ArithOp::Mod, _, _) => {
             return Err(EvalError::new(format!(
                 "div and mod take integers, got {} and {}",
@@ -628,12 +638,11 @@ pub(crate) fn arith(op: ArithOp, l: &Value, r: &Value) -> Result<Value, EvalErro
             )))
         }
         (op, a, b) if a.is_number() && b.is_number() => {
-            let (x, y) = (a.as_f64().unwrap_or(0.0), b.as_f64().unwrap_or(0.0));
+            let (x, y) = (float_operand(a)?, float_operand(b)?);
             Value::float(match op {
                 ArithOp::Add => x + y,
                 ArithOp::Sub => x - y,
-                ArithOp::Mul => x * y,
-                _ => x / y,
+                _ => x * y,
             })?
         }
         _ => {
@@ -644,4 +653,10 @@ pub(crate) fn arith(op: ArithOp, l: &Value, r: &Value) -> Result<Value, EvalErro
             )))
         }
     })
+}
+
+/// A number as a float operand, as Erlang converts an integer that meets a float.
+fn float_operand(v: &Value) -> Result<f64, EvalError> {
+    v.as_f64()
+        .ok_or_else(|| EvalError::new("arithmetic produced a non-finite number"))
 }
