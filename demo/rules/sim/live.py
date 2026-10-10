@@ -21,6 +21,7 @@ thread-safe.
 
 from __future__ import annotations
 
+import dataclasses
 import random
 import sys
 import time
@@ -66,7 +67,8 @@ class Backoff:
 
 
 class LivePlayer:
-    """Applies events as they fall due. `on_send(event)` is called after each event sent."""
+    """Applies events as they fall due. `on_send(event)` is called after each event sent,
+    with the payload it sent (one built when sent included)."""
 
     def __init__(self, host: str, port: int, on_send: Optional[Callable[[Event], None]] = None):
         self.host, self.port, self.on_send = host, port, on_send
@@ -92,19 +94,21 @@ class LivePlayer:
                 old.disconnect()
             self._connect(ev.client, ev.will)
         elif ev.kind == "publish":
-            c = self.clients.get(ev.client) or self._connect(ev.client)
+            c = self.clients.get(ev.client) or self._connect(
+                ev.client, version=5 if ev.props is not None else 4)
             if c is None:
                 self.unsent += 1
                 return
+            payload = ev.body()
             try:
-                c.publish(ev.topic, ev.payload, ev.qos, ev.retain)
+                c.publish(ev.topic, payload, ev.qos, ev.retain, ev.props)
             except (MqttError, OSError) as e:
                 self._lose(ev.client, e)
                 self.unsent += 1
                 return
             self.sent += 1
             if self.on_send:
-                self.on_send(ev)
+                self.on_send(dataclasses.replace(ev, payload=payload, make=None) if ev.make else ev)
         else:
             # A disconnect or a drop ends the connection whether it is due or skipped.
             self.skip(ev)
@@ -170,11 +174,11 @@ class LivePlayer:
             c.disconnect()
         self.clients.clear()
 
-    def _connect(self, client: str, will=None) -> Optional[Client]:
+    def _connect(self, client: str, will=None, version: int = 4) -> Optional[Client]:
         now = time.monotonic()
         if not self.backoff.ready(now):
             return None
-        c = Client(self.host, self.port, client, timeout=CONNECT_TIMEOUT)
+        c = Client(self.host, self.port, client, timeout=CONNECT_TIMEOUT, version=version)
         try:
             c.connect(will=will)
         except (MqttError, OSError) as e:

@@ -63,6 +63,26 @@ variable rotor speed (5-13 rpm, tip-speed ratio 8.2) and pitch.
     value and no ROCOF.) Nordic frequency: 50 Hz with slow FCR-N-scale wander, inside
     49.93-50.06 Hz.
 
+  plant/wf-falster/wtg01..wtg06/fastlog  every 60 s per turbine, QoS 1, ONLY with
+    `fastlog` (live.py --fastlog; never in the fixture), from client wf-falster-<turbine>
+    over MQTT 5. The turbine controller's fast log of the minute just ended,
+    [start_ms, end_ms) on whole minutes, uploaded 2.0 s (wtg01) to 9.5 s (wtg06) into the
+    next one: an Apache Parquet file (sim/parquet.py: one row group, PLAIN, uncompressed)
+    of 3,000 rows, 50 Hz, 531,398 bytes. Columns: `ts`, INT64 TIMESTAMP(MILLIS, UTC), every
+    20 ms, then the 21 DOUBLE channels of FASTLOG_COLUMNS (name, unit, meaning). The 1-s
+    physics above, interpolated, plus what a 1-s model leaves out: turbulence within the
+    second, the drivetrain's torsional mode (about 1.65 Hz) in the generator speed, the
+    tower's first bending mode (about 0.3 Hz) in the nacelle accelerations, 3P ripple in
+    power and tower, 1P cyclic pitch, and sensor noise. Torque is power over generator
+    speed; currents are apparent power over three phase voltages of the 690 V side; the
+    frequency is the PMU's grid model (so the 403-s trip shows). MQTT 5 properties:
+    content type application/vnd.apache.parquet, payload format indicator 0 and user
+    properties schema=fastlog/v1, site, turbine, rows=3000, rate_hz=50, start_ms, end_ms
+    (the same pairs, with `units`, are the file's key-value metadata). A file is built
+    when it is sent (Event.make), seeded by the turbine and its start, so the same seed
+    and minute give the same bytes; drawing its seed comes after every other draw, so
+    the rest of the output is the same with or without fast logs.
+
 pv-lolland: a solar park, 4 central inverters of 2,200 kVA, each 2.75 MWp (11 MWp)
 -----------------------------------------------------------------------------------
 Fixed-tilt modules (30 deg, facing south) at 54.8 N 11.6 E. The irradiance on the panels
@@ -171,10 +191,12 @@ so the exact values, is not):
 
 from __future__ import annotations
 
+import json
 import math
 import random
 from typing import Dict, Iterable, List, Optional, Tuple
 
+from . import parquet
 from .core import Event, jbytes, ts_ms
 
 WARMUP = 180  # seconds of physics simulated before the first message
@@ -218,8 +240,9 @@ PEAKER_RAMP_MW_PER_S, PEAKER_TARGET_MW = 8.0 / 60.0, 40.0
 RTU_GLITCH_AT = 437.0
 
 
-def events(rng: random.Random, t0: float, duration: float) -> Iterable[Event]:
-    """The portfolio's messages for `duration` seconds from `t0` (Unix seconds)."""
+def events(rng: random.Random, t0: float, duration: float, fastlog: bool = False) -> Iterable[Event]:
+    """The portfolio's messages for `duration` seconds from `t0` (Unix seconds); with
+    `fastlog`, the turbines' fast logs too (the live demo's, not the fixture's)."""
     # One generator per subsystem, seeded from `rng` in a fixed order, and inside each one
     # generator per process, drawn second by second: the sites stay independent of each
     # other's draws, and the first N seconds are the same whatever the duration.
@@ -232,6 +255,9 @@ def events(rng: random.Random, t0: float, duration: float) -> Iterable[Event]:
     out += grid.events(t0, duration, farm)
     out += _solar_events(random.Random(seeds["solar"]), t0, duration, grid)
     out += _peaker_events(random.Random(seeds["peaker"]), t0, duration, grid)
+    if fastlog:
+        # Drawn after the others, so the rest of the output is the same with or without.
+        out += _fastlog_events(farm, grid, rng.getrandbits(64), t0, duration)
     return out
 
 
@@ -545,6 +571,173 @@ class _WindFarm:
                 "turbines": rows,
             })))
         return out
+
+
+# --------------------------------------------------------------------------- fast log
+
+# The fast log's channels: (column, unit, what). The Parquet file has these after `ts`.
+FASTLOG_COLUMNS = [
+    ("rotor_speed_rpm", "rpm", "rotor speed, low-speed shaft"),
+    ("generator_speed_rpm", "rpm", "generator speed, high-speed shaft (gear ratio 1:119)"),
+    ("pitch_angle_a_deg", "deg", "blade A pitch angle"),
+    ("pitch_angle_b_deg", "deg", "blade B pitch angle"),
+    ("pitch_angle_c_deg", "deg", "blade C pitch angle"),
+    ("active_power_kw", "kW", "active power at the generator terminals"),
+    ("reactive_power_kvar", "kvar", "reactive power at the generator terminals"),
+    ("generator_torque_knm", "kNm", "generator air-gap torque"),
+    ("wind_speed_ms", "m/s", "nacelle anemometer wind speed"),
+    ("wind_direction_deg", "deg", "wind direction, from north"),
+    ("yaw_angle_deg", "deg", "nacelle position, from north"),
+    ("tower_acc_fa_ms2", "m/s2", "nacelle acceleration, fore-aft"),
+    ("tower_acc_ss_ms2", "m/s2", "nacelle acceleration, side-side"),
+    ("gearbox_vibration_mms", "mm/s", "gearbox vibration velocity, RMS 10-1000 Hz"),
+    ("voltage_l1_v", "V", "phase voltage L1-N, 690 V system"),
+    ("voltage_l2_v", "V", "phase voltage L2-N"),
+    ("voltage_l3_v", "V", "phase voltage L3-N"),
+    ("current_l1_a", "A", "phase current L1"),
+    ("current_l2_a", "A", "phase current L2"),
+    ("current_l3_a", "A", "phase current L3"),
+    ("grid_frequency_hz", "Hz", "grid frequency"),
+]
+FASTLOG_HZ = 50
+FASTLOG_PERIOD = 60  # seconds per file
+FASTLOG_SCHEMA = "fastlog/v1"
+PARQUET_TYPE = "application/vnd.apache.parquet"
+# Each turbine uploads the minute just ended this many seconds into the next one.
+FASTLOG_UPLOAD = (2.0, 3.5, 5.0, 6.5, 8.0, 9.5)
+GEAR_RATIO = 119.0
+V_PHASE = 690.0 / math.sqrt(3.0)  # the turbine's 690 V low-voltage side, line to neutral
+
+
+def _fastlog_events(farm: "_WindFarm", grid: _Grid, seed: int, t0: float,
+                    duration: float) -> List[Event]:
+    """Every minute, each turbine's fast log of the minute before (see the module doc),
+    built when it is sent."""
+    out = []
+    for idx, (t, s) in enumerate(zip(farm.turbines, farm.series)):
+        for m in range(int(duration // FASTLOG_PERIOD) + 1):
+            at = m * FASTLOG_PERIOD + FASTLOG_UPLOAD[idx]
+            if at >= duration:
+                break
+            start = (m - 1) * FASTLOG_PERIOD  # the minute just ended
+            start_ms = ts_ms(t0, start)
+            end_ms = start_ms + FASTLOG_PERIOD * 1000
+            rows = FASTLOG_PERIOD * FASTLOG_HZ
+            props = {"payload_format": 0, "content_type": PARQUET_TYPE, "user": [
+                ("schema", FASTLOG_SCHEMA), ("site", WF), ("turbine", t.id),
+                ("rows", str(rows)), ("rate_hz", str(FASTLOG_HZ)),
+                ("start_ms", str(start_ms)), ("end_ms", str(end_ms)),
+            ]}
+
+            def make(t=t, s=s, start=start, start_ms=start_ms, end_ms=end_ms) -> bytes:
+                return _fastlog_file(t, s, grid, seed, start, start_ms, end_ms)
+
+            out.append(Event(at=at, client=f"{WF}-{t.id}", topic=f"plant/{WF}/{t.id}/fastlog",
+                             qos=1, props=props, make=make))
+    return out
+
+
+def _fastlog_file(t: _Turbine, s: Dict[str, list], grid: _Grid, seed: int, start: int,
+                  start_ms: int, end_ms: int) -> bytes:
+    """The turbine's fast log of [start, start + 60 s) as a Parquet file.
+
+    The 1-s physics, interpolated to 50 Hz, with what a 1-s model leaves out: the wind's
+    turbulence within a second, the drivetrain's torsional mode in the generator speed,
+    the tower's first bending mode in the nacelle accelerations, the 3P (blade passing)
+    ripple in power and tower, 1P cyclic pitch, and each sensor's noise."""
+
+    const = random.Random(f"{seed}:{t.id}")  # this turbine's, the same in every file
+    blade_off = [const.uniform(-0.08, 0.08) for _ in range(3)]
+    f_fa, f_ss = const.uniform(0.29, 0.31), const.uniform(0.29, 0.31)
+    ph_fa, ph_ss, ph_dt = (const.uniform(0, 2 * math.pi) for _ in range(3))
+    f_dt = const.uniform(1.55, 1.75)  # the drivetrain's first torsional mode, Hz
+    v_off = [const.uniform(-0.004, 0.004) for _ in range(3)]
+    i_off = [const.uniform(-0.006, 0.006) for _ in range(3)]
+    psi = const.uniform(0, 2 * math.pi)  # rotor azimuth at the series' start
+    rng = random.Random(f"{seed}:{t.id}:{start_ms}")  # this file's noise
+
+    base = start + WARMUP  # index of the file's first second in the 1-s series
+    for i in range(base):
+        psi += s["rpm"][i] * math.pi / 30.0
+    psi %= 2 * math.pi
+    dt = 1.0 / FASTLOG_HZ
+    n = FASTLOG_PERIOD * FASTLOG_HZ
+    k_ws = math.sqrt(2.0 * dt / 1.5)  # wind: turbulence within the second, tau 1.5 s
+    k_amp = math.sqrt(2.0 * dt / 8.0)  # tower: amplitude wander, tau 8 s
+    gust, amp_fa, amp_ss = 0.0, rng.gauss(0, 0.3), rng.gauss(0, 0.3)
+    cols: List[list] = [[] for _ in FASTLOG_COLUMNS]
+    (rot_c, gen_c, pa_c, pb_c, pc_c, p_c, q_c, trq_c, ws_c, dir_c, yaw_c, fa_c, ss_c, vib_c,
+     v1_c, v2_c, v3_c, i1_c, i2_c, i3_c, hz_c) = cols
+    stamps = []
+    for j in range(n):
+        tt = start + j * dt
+        i0 = base + j // FASTLOG_HZ
+        f = (j % FASTLOG_HZ) * dt
+
+        def lerp(key: str) -> float:
+            a = s[key][i0]
+            return a + (s[key][i0 + 1] - a) * f
+
+        stopped = s["st"][i0][0] == 6
+        rpm, p, q, pitch = lerp("rpm"), lerp("w"), lerp("var"), lerp("pitch")
+        ws, wdir, yaw = lerp("ws"), lerp("dir"), lerp("yaw")
+        p_frac = max(0.0, p) / RATED_KW
+        psi = (psi + rpm * math.pi / 30.0 * dt) % (2 * math.pi)
+        gust += -gust * dt / 1.5 + k_ws * 0.35 * rng.gauss(0.0, 1.0)
+        amp_fa += -amp_fa * dt / 8.0 + k_amp * 0.3 * rng.gauss(0.0, 1.0)
+        amp_ss += -amp_ss * dt / 8.0 + k_amp * 0.3 * rng.gauss(0.0, 1.0)
+
+        osc = 0.0 if stopped else (2.0 + 6.0 * p_frac) * math.sin(2 * math.pi * f_dt * tt + ph_dt)
+        gen = rpm * GEAR_RATIO + osc + rng.gauss(0.0, 0.4)
+        p_now = p if stopped else p * (1.0 + 0.004 * math.sin(3 * psi) + 0.0015 * osc / 8.0
+                                       + rng.gauss(0.0, 0.002))
+        p_now += rng.gauss(0.0, 1.0)
+        q_now = q + rng.gauss(0.0, 1.5)
+        omega = gen * math.pi / 30.0
+        trq = p_now / omega if not stopped and p_now > 0 and gen > 300 else 0.0
+        ipc = 0.0 if stopped else 0.15 * p_frac
+        thrust = 0.02 if stopped else 0.03 + 0.011 * ws
+        fa = (thrust * (1.0 + 0.5 * amp_fa) * math.sin(2 * math.pi * f_fa * tt + ph_fa)
+              + (0.0 if stopped else 0.012 * math.sin(3 * psi)) + rng.gauss(0.0, 0.008))
+        ss = (0.45 * thrust * (1.0 + 0.5 * amp_ss) * math.sin(2 * math.pi * f_ss * tt + ph_ss)
+              + (0.0 if stopped else 0.006 * math.sin(psi)) + rng.gauss(0.0, 0.006))
+        u = V_PHASE * grid.u(tt) / 51.35
+        s_kva = math.sqrt(p_now * p_now + q_now * q_now)
+
+        stamps.append(start_ms + j * 1000 // FASTLOG_HZ)
+        rot_c.append(round(rpm + rng.gauss(0.0, 0.01), 3))
+        gen_c.append(round(gen, 1))
+        for b, col in enumerate((pa_c, pb_c, pc_c)):
+            col.append(round(pitch + blade_off[b] + ipc * math.sin(psi + b * 2 * math.pi / 3)
+                             + rng.gauss(0.0, 0.01), 3))
+        p_c.append(round(p_now, 1))
+        q_c.append(round(q_now, 1))
+        trq_c.append(round(trq, 3))
+        ws_c.append(round(max(0.0, ws + gust), 2))
+        dir_c.append(round((wdir + 1.5 * gust + rng.gauss(0.0, 0.5)) % 360.0, 1))
+        yaw_c.append(round(yaw % 360.0, 2))
+        fa_c.append(round(fa, 4))
+        ss_c.append(round(ss, 4))
+        vib_c.append(round(lerp("vib") * math.exp(rng.gauss(0.0, 0.06)), 3))
+        volts = []
+        for col, off in zip((v1_c, v2_c, v3_c), v_off):
+            v = u * (1.0 + off) + rng.gauss(0.0, 0.3)
+            volts.append(v)
+            col.append(round(v, 1))
+        for col, off, v in zip((i1_c, i2_c, i3_c), i_off, volts):
+            col.append(round(s_kva * 1000.0 / (3.0 * v) * (1.0 + off) + rng.gauss(0.0, 1.5), 1))
+        hz_c.append(round(grid.f(tt) + rng.gauss(0.0, 0.001), 4))
+
+    units = {"ts": "ms since 1970-01-01T00:00:00Z"}
+    units.update((name, unit) for name, unit, _ in FASTLOG_COLUMNS)
+    columns = [("ts", "timestamp_ms", stamps)]
+    columns += [(name, "double", col) for (name, _, _), col in zip(FASTLOG_COLUMNS, cols)]
+    return parquet.write(columns, [
+        ("schema", FASTLOG_SCHEMA), ("site", WF), ("turbine", t.id),
+        ("rate_hz", str(FASTLOG_HZ)), ("rows", str(n)),
+        ("start_ms", str(start_ms)), ("end_ms", str(end_ms)),
+        ("units", json.dumps(units, separators=(",", ":"))),
+    ], created_by="mqttd demo/rules/sim/power.py fastlog (sim/parquet.py)")
 
 
 # --------------------------------------------------------------------------- solar

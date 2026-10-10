@@ -151,7 +151,7 @@ about = "Imported by demo/rules/simulate.py."
 [[task]]
 id = "demo-rules-sim-mqtt"
 group = "Demo"
-name = "The rule-engine demo simulator's MQTT 3.1.1 client (imported, not run)"
+name = "The rule-engine demo simulator's MQTT 3.1.1 / 5 client (imported, not run)"
 script = "demo/rules/sim/mqtt.py"
 hidden = true
 about = "Imported by demo/rules/simulate.py."
@@ -163,6 +163,14 @@ name = "The rule-engine demo's simulated power plants (imported, not run)"
 script = "demo/rules/sim/power.py"
 hidden = true
 about = "Imported by demo/rules/simulate.py; its docstring documents the devices and faults."
+
+[[task]]
+id = "demo-rules-sim-parquet"
+group = "Demo"
+name = "The rule-engine demo's small Parquet writer, for the turbines' fast logs (imported, not run)"
+script = "demo/rules/sim/parquet.py"
+hidden = true
+about = "Imported by demo/rules/sim/power.py."
 
 [[task]]
 id = "demo-rules-sim-homes"
@@ -189,7 +197,7 @@ script = "demo/rules-live/up.sh"
 needs_checkout = true
 about = """
 Builds mqttd from this checkout and starts a Docker Compose stack: the broker with the
-demo's 21 rules, three publishers playing simulated power-plant, home and car telemetry
+demo's 22 rules, three publishers playing simulated power-plant, home and car telemetry
 in real time, and a web page (http://localhost:8070) where you edit, check, test and apply
 rules and watch what each one runs. Point any MQTT client at 127.0.0.1:1883 and subscribe
 to `$SYS/brokers/+/rules/#` for the per-rule statistics and `$SYS/brokers/+/trace/rules/+`

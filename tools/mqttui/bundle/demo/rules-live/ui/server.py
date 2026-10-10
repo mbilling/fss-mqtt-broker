@@ -6,7 +6,9 @@ Runs in compose.yaml's `ui` service, standard library only:
 - passes /api/* on to the broker's admin API over mTLS with the CN=rules-ui operator
   certificate (ADR 0081, ADR 0084), one request per connection;
 - streams the rules' statistics and trace from $SYS, and the device and derived messages,
-  to each open page as server-sent events, from one MQTT connection (demo/rules/sim/mqtt.py);
+  to each open page as server-sent events, from one MQTT 5 connection (demo/rules/sim/mqtt.py);
+  a binary payload (a turbine's half-megabyte Parquet fast log) goes to the page as its
+  size, content type and first bytes only;
 - keeps the latest device payload per topic, untruncated, for "Test" against the latest
   input (/api/latest).
 
@@ -71,6 +73,7 @@ QUEUE = 1024            # events waiting per page; when full, the oldest goes
 PING_SECS = 15
 SHOW = 4096             # a device or derived payload is cut here for display...
 SHOW_SYS = 64 * 1024    # ...a $SYS record, which the page parses as JSON, only past this
+BINARY_HEAD = 16        # a binary payload is shown as its size and first bytes, in hex
 MAX_BODY = 1 << 20      # the admin API's cap on the rules routes' bodies
 MAX_ANSWER = 8 << 20
 LATEST_TOPICS = 4096    # /api/latest keeps this many topics,
@@ -149,14 +152,22 @@ def topic_matches(filt: str, topic: str) -> bool:
     return len(f) == len(t)
 
 
-def shown(payload: bytes, cap: int) -> dict:
-    """A payload as the page shows it: text when it is UTF-8, else base64, cut at `cap`."""
+def shown(payload: bytes, cap: int, props: Optional[dict] = None) -> dict:
+    """A payload as the page shows it: text when it is UTF-8, cut at `cap`. A binary one
+    (a turbine's half-megabyte Parquet fast log, an OBD frame) is not sent at all: the page
+    gets its size, its MQTT 5 content type and its first BINARY_HEAD bytes as hex."""
+    props = props or {}
     truncated = len(payload) > cap
-    try:
-        payload.decode("utf-8")
-    except UnicodeDecodeError:
-        cut = base64.b64encode(payload[:cap]).decode("ascii")
-        return {"payload": cut, "encoding": "base64", "bytes": len(payload), "truncated": truncated}
+    binary = props.get("payload_format") == 0  # the publisher says so (MQTT 5)
+    if not binary:
+        try:
+            payload.decode("utf-8")
+        except UnicodeDecodeError:
+            binary = True
+    if binary:
+        return {"payload": "", "encoding": "binary", "bytes": len(payload),
+                "head": payload[:BINARY_HEAD].hex(), "content_type": props.get("content_type"),
+                "truncated": len(payload) > BINARY_HEAD}
     # The payload is UTF-8, so "ignore" drops only a character the cut split.
     text = payload[:cap].decode("utf-8", "ignore")
     return {"payload": text, "encoding": "utf8", "bytes": len(payload), "truncated": truncated}
@@ -241,7 +252,7 @@ class Hub:
         if m.topic.startswith(DEVICE_ROOTS):
             self.remember(m.topic, m.payload, now)
         cap = SHOW_SYS if m.topic.startswith("$SYS/") else SHOW
-        self.send(sse("msg", {"topic": m.topic, **shown(m.payload, cap), "retain": m.retain,
+        self.send(sse("msg", {"topic": m.topic, **shown(m.payload, cap, m.props), "retain": m.retain,
                               "at": int(now * 1000)}))
 
     def remember(self, topic: str, payload: bytes, now: float):
@@ -273,7 +284,8 @@ def read_mqtt(hub: Hub):
     host, port = host_port(BROKER)
     backoff = 1.0
     while True:
-        client = Client(host, port, f"rules-ui-{os.getpid()}", keepalive=30)
+        # MQTT 5, to read a publish's content type and payload format indicator.
+        client = Client(host, port, f"rules-ui-{os.getpid()}", keepalive=30, version=5)
         try:
             client.connect()
             client.subscribe([(f, 0) for f in FILTERS])
