@@ -85,7 +85,8 @@ Since 2026-10-11 CI does this on every change that touches the crate (the `wasm 
 job of `ci.yml`): `jq-module/fetch-zig.sh` downloads zig 0.16.0 and refuses an archive whose
 sha256 is not the recorded one (one hash per platform, from ziglang.org's index),
 `build.sh` builds from the two source tarballs it checks the same way, and
-`sha256sum --check` compares the result with `jq.wasm.sha256`.
+`sha256sum --check` compares the result with `jq.wasm.sha256`. The first run built
+`728129fa…c8c57` on GitHub's amd64 runner: the fourth host to give those bytes.
 
 ### 3. Runtime: wasmtime (decided 2026-10-11), with wasmi measured as the alternative
 
@@ -100,7 +101,7 @@ alternative considered, and the price of the choice in both directions.
 |---|---|---|
 | Kind | compiler (Cranelift) to machine code; also an interpreter (Pulley), used here as the fallback of §8 | interpreter, pure Rust |
 | jq speed against native (§6) | **1.9–3.1× slower** | 15–26× slower |
-| Module load | **0.56 s** on an Apple M1 Pro, 0.78 s as a static musl binary on Linux arm64 (§8): the whole module is compiled, once per process | 11–12 ms (validation and translation) |
+| Module load | **0.56 s** on an Apple M1 Pro, 0.78 s on Linux, arm64 and amd64 (§8): the whole module is compiled, once per process | 11–12 ms (validation and translation) |
 | Instantiate | 52 µs | 130–190 µs |
 | Compile one jq program | 1.0–1.1 ms | 6.5–7.6 ms |
 | License | Apache-2.0 WITH LLVM-exception: **added to `deny.toml`'s allow list** (29 crates carry it; a permissive license, and the exception only removes obligations) | MIT OR Apache-2.0: passes as it is |
@@ -140,8 +141,8 @@ Measured on wasmtime; wasmi's figures from the first round in the last column.
 
 | Limit | Mechanism | Measured | wasmi |
 |---|---|---|---|
-| Time (`jq/3`'s timeout) | Epoch interruption: compiled code looks at a counter in every loop and at every function entry. One timer thread per loaded module sleeps until the earliest deadline among the calls now running and then advances the counter; while no call with a deadline runs it waits on a condition variable and does not tick. At its deadline a call's module is asked to stop (`mqttd_cancel`, which is `jq_cancel`: the program ends at its next step) and given 2 ms; a module still running after that is stopped by a trap and its instance dropped. A call always gets 1 ms, so a timeout of 0 still runs what is quick, as in EMQX | Never early. `def f: f; f` at 100 ms: stopped after 100.1–100.8 ms on macOS, 101.0–102.0 on Linux arm64. `repeat(.)` at 100 ms: 100.1–100.9 and 100.3–100.8. `last(range(1e12))` at 150 ms: 151.3 and 150.2–150.9. `[repeat(.)]` at 50 ms: 52.4 and 53.2–54.2 (it first frees what it built). At 10 ms: 10.9 and 10.7–11.0; at 1 ms: 1.3 and 1.8–2.1. The lateness is the timer thread waking up: a fraction of a millisecond to two. The next call on the same caller: 0.01–0.02 ms, same instance, compiled programs intact | 100.02, 100.02, 150.02, 10.01, 1.01 ms (the clock was read every 200,000 instructions) |
-| Time, inside one C call | The 2 ms run out and the call is trapped. EMQX cannot stop such a program at all: its cancel flag is only looked at between jq's steps | `"a" * 8000000 \| test("a+b")` with a 30 ms timeout: EMQX's timeout error after 32.5–32.9 ms (the deadline, the 2 ms, one tick); the next call is served by a fresh instance (52 µs to make, 1 ms to compile the program again) | within the test's 2 s bound |
+| Time (`jq/3`'s timeout) | Epoch interruption: compiled code looks at a counter in every loop and at every function entry. One timer thread per loaded module sleeps until the earliest deadline among the calls now running and then advances the counter; while no call with a deadline runs it waits on a condition variable and does not tick. At its deadline a call's module is asked to stop (`mqttd_cancel`, which is `jq_cancel`: the program ends at its next step) and given 2 ms; a module still running after that is stopped by a trap and its instance dropped. A call always gets 1 ms, so a timeout of 0 still runs what is quick, as in EMQX | Never early. On Linux amd64 (GitHub's runner): `def f: f; f` at 100 ms stopped after 100.11 ms, `repeat(.)` at 100 ms after 100.09, `last(range(1e12))` at 150 ms after 150.10, at 10 ms after 10.08, at 1 ms after 1.08; `[repeat(.)]` at 50 ms after 51.96 (it first frees what it built). On macOS and in a Linux VM on it the timer thread wakes later: 100.1–102.0, 150.2–151.3, 10.7–11.0, 1.3–2.1 ms. The next call on the same caller: 0.01–0.02 ms, same instance, compiled programs intact | 100.02, 100.02, 150.02, 10.01, 1.01 ms (the clock was read every 200,000 instructions) |
+| Time, inside one C call | The 2 ms run out and the call is trapped. EMQX cannot stop such a program at all: its cancel flag is only looked at between jq's steps | `"a" * 8000000 \| test("a+b")` with a 30 ms timeout: EMQX's timeout error after 32.5–32.9 ms (the deadline, the 2 ms, one tick; 32.6 on the runner); the next call is served by a fresh instance (52 µs to make, 1 ms to compile the program again) | within the test's 2 s bound |
 | Time to compile a jq program | A deadline of its own, 5 s (compiling is outside `jq/3`'s timeout, as in EMQX). A fixed amount of fuel is available instead (`Limits::max_fuel`) where a bound must not depend on the machine: it costs 27% in speed and is off for jq | one compilation takes 1.0–1.1 ms. With fuel on, the same loop stops at the same count on every run (test) | 20,000,000,000 fuel; one compilation burnt 73,000,000 |
 | Memory | 64 MiB of linear memory per instance; the `memory.grow` that would pass it traps (a `ResourceLimiter`) | `[range(1e9)]`: stopped after 100–120 ms. `"x" * 1e9`: 0.1 ms. `"a" * 8000000 \| explode`: stopped. Next call unaffected | 955 ms, 0.2 ms |
 | Output | The module stops producing once the outputs pass the caller's bound (1 MiB in the prototype; D7 ties it to the message's budget), and the host refuses to read a larger result | `[range(300000)]`, `range(1e7)`, `"x" * 2e6`: refused; `"x" * 1000000`: passes | the same |
@@ -178,7 +179,7 @@ outputs or one of EMQX's error kinds, and the caller's next call is served.
 - **Memory.** An instance's linear memory is 3.4 MiB with one program and 3.8 MiB with 32,
   as under wasmi (the module is the same). Of that the operating system has given a warm
   instance about 1.1 MiB on Linux and 1.5 MiB on macOS (untouched pages of the image and of the fiber's stack are
-  not resident). Loading the module adds 7 MiB on Linux arm64 with musl's allocator (20 MiB under amd64 emulation, 42 MiB on macOS, whose allocator keeps more of what the compiler freed) to the process once: the machine
+  not resident). Loading the module adds 7 MiB on Linux arm64 with musl's allocator (28 MiB with glibc on GitHub's amd64 runner, 42 MiB on macOS: allocators that keep more of what the compiler freed) to the process once: the machine
   code and what the allocator keeps of the compiler's working memory.
 - A warm instance keeps compiled programs and nothing else. The test runs fourteen calls
   (`halt`, `first(range(10))`, `limit`, errors, `input`) on one instance and each on an
@@ -304,7 +305,7 @@ functions with Cranelift on one thread:
 | Apple M1 Pro, macOS | 562 ms |
 | The same machine, Linux arm64 container, static musl binary | 777–807 ms |
 | The same machine, Linux amd64 container under emulation, static musl binary | 1,054 ms (emulated: an upper bound, not a measurement of an amd64 server) |
-| GitHub's `ubuntu-latest` runner (amd64), glibc | printed by the last step of the `wasm sandbox` job |
+| GitHub's `ubuntu-latest` runner (amd64), glibc | 779–782 ms |
 
 The broker pays this **once per process, and only if its rules call `jq`**: the module is
 compiled when a rules file that names `jq` is first loaded (boot, reload, the admin API,
@@ -312,7 +313,7 @@ compiled when a rules file that names `jq` is first loaded (boot, reload, the ad
 never at the first message. A broker without `jq` rules never constructs the engine, starts
 no timer thread, installs no signal handler and maps nothing executable (`jq::Pool` in the
 prototype: making one costs nothing, `load()` compiles). During the load the process
-allocates about 7 MiB on Linux arm64 with musl's allocator (20 MiB under amd64 emulation, 42 MiB on macOS, whose allocator keeps more of what the compiler freed) that it keeps.
+allocates about 7 MiB on Linux arm64 with musl's allocator (28 MiB with glibc on GitHub's amd64 runner, 42 MiB on macOS: allocators that keep more of what the compiler freed) that it keeps.
 
 The ways to shorten it, and why none is taken:
 
