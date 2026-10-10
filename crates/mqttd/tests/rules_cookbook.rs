@@ -600,7 +600,7 @@ const R11: Recipe = Recipe {
     proves: "connecting, a clean DISCONNECT and a dropped connection each publish the \
              device's retained status, a dashboard that connects later gets every device's \
              current status, and a takeover (the same client id connecting again) leaves \
-             the device online rather than publishing the old connection's server_closed as \
+             the device online rather than publishing the old connection's discarded as \
              \"offline\"",
     pubs: &[SENSOR_A],
     events: &[ONLINE_B, ONLINE_C, ONLINE_A, OFFLINE_A, OFFLINE_B],
@@ -2387,7 +2387,8 @@ async fn run_presence(r: &Recipe) {
 
     // The takeover the recipe guards against: the device still connected connects again
     // while its first connection is open. The new connection is online; the old one ends
-    // with server_closed, which the recipe does not publish.
+    // with discarded (the new one asks for a clean start), which the recipe does not
+    // publish.
     let (id, mut first) = (STAYS[1], stays.remove(0));
     let takeover = now_ms();
     let _again = Client::connect(addr, id).await;

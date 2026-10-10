@@ -90,6 +90,7 @@ async fn start(
                 tokio::spawn(mqttd::conn::handle_stream_watched(
                     stream,
                     Some(peer),
+                    mqttd::conn::Arrival::default(),
                     None,
                     policy.clone(),
                     hub_tx.clone(),

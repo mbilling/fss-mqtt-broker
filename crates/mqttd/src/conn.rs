@@ -122,6 +122,10 @@ pub struct WireLimits {
     /// Maximum Packet Size (ADR 0041 T4). Also installed as the transport frame
     /// cap (`mqtt_net::set_max_packet_bytes`) by the binary.
     pub max_packet_size: u32,
+    /// `limits.max_inflight_messages`: the hub's cap on a client's outbound Receive
+    /// Maximum (issue #241). Read here only for the `receive_maximum` a rule sees on
+    /// `$events/client/connected` (ADR 0083); the hub applies the cap itself.
+    pub max_inflight_messages: Option<u16>,
 }
 
 impl Default for WireLimits {
@@ -132,6 +136,7 @@ impl Default for WireLimits {
             auth_round_timeout: Duration::from_secs(10),
             publish_rate: None,
             max_packet_size: 1024 * 1024,
+            max_inflight_messages: None,
         }
     }
 }
@@ -301,108 +306,105 @@ pub struct ConnPolicy {
     pub rules: Option<crate::rules::Rules>,
 }
 
-/// Why a connection ended, as `$events/client/disconnected` reports it (ADR 0083).
-/// EMQX's names where mqttd can tell the same thing apart; `server_closed` covers the
-/// broker ending the session (a takeover, an eviction, a protocol violation) and
-/// `shutdown` the ADR 0019 drain.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-enum CloseReason {
-    TcpClosed,
-    Normal,
-    ServerClosed,
-    KeepaliveTimeout,
-    Shutdown,
-    /// A client DISCONNECT with a non-zero reason code, named as EMQX names it.
-    ClientReason,
+/// Where an accepted connection arrived: the listener's own address (`sockname` on the
+/// client events, ADR 0083) and the transport, which names a closed socket the way EMQX
+/// does (`tcp_closed`, `ssl_closed`).
+#[derive(Debug, Clone, Copy)]
+pub struct Arrival {
+    /// The listener's address, as the accepted socket's local address.
+    pub sockname: Option<SocketAddr>,
+    /// The transport it arrived over.
+    pub transport: mqtt_net::Transport,
 }
 
-impl CloseReason {
-    const ALL: [Self; 6] = [
-        Self::TcpClosed,
-        Self::Normal,
-        Self::ServerClosed,
-        Self::KeepaliveTimeout,
-        Self::Shutdown,
-        Self::ClientReason,
-    ];
-
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::TcpClosed => "tcp_closed",
-            Self::Normal => "normal",
-            Self::ServerClosed => "server_closed",
-            Self::KeepaliveTimeout => "keepalive_timeout",
-            Self::Shutdown => "shutdown",
-            // Named from the code by `disconnect_reason_name`.
-            Self::ClientReason => "unknown_error",
+impl Default for Arrival {
+    fn default() -> Self {
+        Self {
+            sockname: None,
+            transport: mqtt_net::Transport::PlainTcp,
         }
     }
 }
 
-/// The `reason` EMQX reports for a client DISCONNECT: `normal` for `0x00` and otherwise
-/// the reason code's name (`emqx_channel:disconnect_reason/1` →
-/// `emqx_reason_codes:name/1`, emqx/emqx release-60). Every code EMQX names is named
-/// the same here, including ones a client may not send in a DISCONNECT; the rest are
-/// `unknown_error`, as in EMQX.
-fn disconnect_reason_name(code: u8) -> &'static str {
-    match code {
-        0x00 => "normal",
-        0x01 => "granted_qos1",
-        0x02 => "granted_qos2",
-        0x04 => "disconnect_with_will_message",
-        0x10 => "no_matching_subscribers",
-        0x11 => "no_subscription_existed",
-        0x18 => "continue_authentication",
-        0x19 => "re_authenticate",
-        0x80 => "unspecified_error",
-        0x81 => "malformed_packet",
-        0x82 => "protocol_error",
-        0x83 => "implementation_specific_error",
-        0x84 => "unsupported_protocol_version",
-        0x85 => "client_identifier_not_valid",
-        0x86 => "bad_username_or_password",
-        0x87 => "not_authorized",
-        0x88 => "server_unavailable",
-        0x89 => "server_busy",
-        0x8A => "banned",
-        0x8B => "server_shutting_down",
-        0x8C => "bad_authentication_method",
-        0x8D => "keepalive_timeout",
-        0x8E => "session_taken_over",
-        0x8F => "topic_filter_invalid",
-        0x90 => "topic_name_invalid",
-        0x91 => "packet_identifier_inuse",
-        0x92 => "packet_identifier_not_found",
-        0x93 => "receive_maximum_exceeded",
-        0x94 => "topic_alias_invalid",
-        0x95 => "packet_too_large",
-        0x96 => "message_rate_too_high",
-        0x97 => "quota_exceeded",
-        0x98 => "administrative_action",
-        0x99 => "payload_format_invalid",
-        0x9A => "retain_not_supported",
-        0x9B => "qos_not_supported",
-        0x9C => "use_another_server",
-        0x9D => "server_moved",
-        0x9E => "shared_subscriptions_not_supported",
-        0x9F => "connection_rate_exceeded",
-        0xA0 => "maximum_connect_time",
-        0xA1 => "subscription_identifiers_not_supported",
-        0xA2 => "wildcard_subscriptions_not_supported",
-        _ => "unknown_error",
+impl Arrival {
+    /// EMQX's `reason` for the client closing the socket: `ssl_closed` over TLS,
+    /// `tcp_closed` otherwise (`emqx_connection`: `{tcp_closed, _}` / `{ssl_closed, _}`).
+    /// WebSocket and QUIC closes are named as their underlying TCP or TLS close.
+    fn closed(self) -> &'static str {
+        match self.transport {
+            mqtt_net::Transport::Tls | mqtt_net::Transport::WebSocketTls => "ssl_closed",
+            mqtt_net::Transport::PlainTcp
+            | mqtt_net::Transport::WebSocket
+            | mqtt_net::Transport::Quic => "tcp_closed",
+        }
+    }
+
+    /// EMQX's `reason` for a connection ended by a socket error: the error's `inet`
+    /// name, as `emqx_connection` passes `{sock_error, Reason}` on, and a close for
+    /// anything that is just the peer gone.
+    fn socket_error(self, e: &NetError) -> &'static str {
+        use std::io::ErrorKind as K;
+        match e {
+            NetError::Io(io) => match io.kind() {
+                K::ConnectionReset => "econnreset",
+                K::ConnectionAborted => "econnaborted",
+                K::BrokenPipe => "epipe",
+                K::TimedOut => "etimedout",
+                K::NotConnected => "enotconn",
+                _ => self.closed(),
+            },
+            NetError::Codec(c) => frame_error_reason(c),
+            NetError::UnexpectedEof | NetError::Tls(_) | NetError::Bind(_) => self.closed(),
+        }
     }
 }
 
-/// What the rule engine knows about one connection (ADR 0083): who the client is, as
-/// a rule sees it, and why the connection ended, recorded by `serve` at each exit.
-/// Shared by reference across `serve`'s awaits, hence the atomic.
-struct RuleConn {
+/// EMQX's `reason` for a connection closed over a frame it could not accept
+/// (`emqx_channel:handle_frame_error/2` closes with `frame_error_kind/2`):
+/// `frame_too_large` for one over the packet ceiling, `frame_error` for the rest.
+fn frame_error_reason(e: &mqtt_codec::CodecError) -> &'static str {
+    match e {
+        mqtt_codec::CodecError::PacketTooLarge => "frame_too_large",
+        _ => "frame_error",
+    }
+}
+
+/// EMQX's name for the CONNACK code `code` sent to a client speaking `protocol`: an MQTT
+/// 3.1.1 return code is named as the MQTT 5 reason code it stands for, since EMQX
+/// decides in MQTT 5 codes and only translates on the wire
+/// (`emqx_reason_codes:compat(connack, _)`).
+fn connack_reason(code: u8, protocol: ProtocolVersion) -> &'static str {
+    let v5 = if protocol == ProtocolVersion::V5 {
+        code
+    } else {
+        connack_code(code, ProtocolVersion::V5)
+    };
+    mqtt_rules::reason_code_name(v5)
+}
+
+/// What the rule engine knows about one connection (ADR 0083): who the client is and
+/// what its CONNECT established, as a rule sees them, why the connection ended (recorded
+/// by `serve` at each exit), and the properties of the client's DISCONNECT. Shared by
+/// reference across `serve`'s awaits, hence the locks; each is taken at most once per
+/// connection, or per packet when a rule selects the event it feeds.
+struct RuleConn<'c> {
     publisher: crate::rules::Publisher,
-    close_reason: std::sync::atomic::AtomicU8,
-    /// The reason code of the client's DISCONNECT, read when `close_reason` is
-    /// [`CloseReason::ClientReason`].
-    client_code: std::sync::atomic::AtomicU8,
+    arrival: Arrival,
+    /// EMQX's `reason` for how the connection ended, once `serve` knows it; until then a
+    /// closed socket ([`Arrival::closed`]).
+    close_reason: std::sync::Mutex<Option<&'static str>>,
+    /// The client's DISCONNECT properties, printed, when a rule selecting
+    /// `client.disconnected` was loaded as it arrived.
+    disconn_props: std::sync::Mutex<Option<mqtt_rules::Map>>,
+    /// The CONNECT's properties, printed only when an event carrying `conn_props` fires.
+    conn_props: &'c mqtt_codec::Properties,
+    proto_ver: u8,
+    keepalive: u16,
+    clean_start: bool,
+    /// The Session Expiry Interval agreed at CONNECT, seconds.
+    expiry_interval: u32,
+    /// The client's Receive Maximum as the hub will apply it.
+    receive_maximum: u16,
     /// This connection's view of the rules; `None` when rules are not wired (tests).
     rules: Option<crate::rules::ConnRules>,
     /// A publish batch waiting for its ingress credit, for `serve` to park (see
@@ -416,7 +418,7 @@ type ParkedBatch = (
     futures_util::future::BoxFuture<'static, crate::ingress::IngressPermit>,
 );
 
-impl std::fmt::Debug for RuleConn {
+impl std::fmt::Debug for RuleConn<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RuleConn")
             .field("publisher", &self.publisher)
@@ -425,7 +427,44 @@ impl std::fmt::Debug for RuleConn {
     }
 }
 
-impl RuleConn {
+impl<'c> RuleConn<'c> {
+    /// The rule engine's view of a connection that sent `connect`. A relocated
+    /// session's socket peer is the relaying node, not the client (ADR 0005), so the
+    /// rules are told neither address.
+    /// `conn_props` is `connect.properties`, borrowed on its own so the CONNECT's Will
+    /// can still be moved out.
+    fn new(
+        connect: &Connect,
+        conn_props: &'c mqtt_codec::Properties,
+        peer: Option<SocketAddr>,
+        arrival: Arrival,
+        policy: &ConnPolicy,
+    ) -> Self {
+        let (clean_start, expiry_interval) = session_policy(connect);
+        let receive_maximum = client_receive_maximum(connect.protocol, &connect.properties)
+            .min(wire_limits().max_inflight_messages.unwrap_or(u16::MAX));
+        Self {
+            publisher: crate::rules::Publisher {
+                username: connect.username.clone(),
+                peer,
+            },
+            arrival,
+            close_reason: std::sync::Mutex::new(None),
+            disconn_props: std::sync::Mutex::new(None),
+            conn_props,
+            proto_ver: connect.protocol.level(),
+            keepalive: connect.keep_alive,
+            clean_start,
+            expiry_interval,
+            receive_maximum,
+            rules: policy
+                .rules
+                .as_ref()
+                .map(crate::rules::Rules::for_connection),
+            parked_batch: std::sync::Mutex::new(None),
+        }
+    }
+
     /// Leave a batch for `serve` to send once its credit has been acquired.
     fn park(
         &self,
@@ -445,22 +484,19 @@ impl RuleConn {
             .take()
     }
 
-    fn closing(&self, reason: CloseReason) {
-        self.close_reason.store(reason as u8, Ordering::Relaxed);
+    /// Record why the connection is ending, in EMQX's terms.
+    fn closing(&self, reason: &'static str) {
+        *self
+            .close_reason
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(reason);
     }
 
     fn close_reason(&self) -> &'static str {
-        let i = usize::from(self.close_reason.load(Ordering::Relaxed));
-        match CloseReason::ALL
-            .get(i)
-            .copied()
-            .unwrap_or(CloseReason::TcpClosed)
-        {
-            CloseReason::ClientReason => {
-                disconnect_reason_name(self.client_code.load(Ordering::Relaxed))
-            }
-            other => other.as_str(),
-        }
+        self.close_reason
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(|| self.arrival.closed())
     }
 
     /// Record why a packet ended the session and return `serve`'s graceful flag: only a
@@ -468,19 +504,200 @@ impl RuleConn {
     fn ended(&self, end: PacketOutcome) -> bool {
         match end {
             PacketOutcome::ClientDisconnect => {
-                self.closing(CloseReason::Normal);
+                self.closing("normal");
                 true
             }
             PacketOutcome::ClientDisconnectWithWill(code) => {
-                self.client_code.store(code, Ordering::Relaxed);
-                self.closing(CloseReason::ClientReason);
+                self.closing(mqtt_rules::disconnect_reason(code));
                 false
             }
-            PacketOutcome::BrokerClose | PacketOutcome::Continue => {
-                self.closing(CloseReason::ServerClosed);
+            PacketOutcome::BrokerClose(reason) => {
+                self.closing(reason);
                 false
             }
+            PacketOutcome::Continue => false,
         }
+    }
+
+    /// The rules, when one of them selects `kind`: the gate every event passes first,
+    /// so an event no rule selects costs one uncontended lock and builds nothing.
+    fn wants(&self, kind: mqtt_rules::EventKind) -> Option<&crate::rules::ConnRules> {
+        self.rules.as_ref().filter(|r| r.wants(kind))
+    }
+
+    /// Who an event is about.
+    fn client<'a>(
+        &'a self,
+        rules: &'a crate::rules::ConnRules,
+        clientid: &'a str,
+    ) -> mqtt_rules::ClientInfo<'a> {
+        mqtt_rules::ClientInfo {
+            clientid,
+            username: self.publisher.username.as_deref(),
+            peer: self.publisher.peer,
+            sockname: self.arrival.sockname,
+            node: rules.node(),
+        }
+    }
+
+    /// What the CONNECT established, as the connection events carry it.
+    fn conn_info(&self) -> mqtt_rules::ConnInfo {
+        mqtt_rules::ConnInfo {
+            proto_ver: self.proto_ver,
+            keepalive: self.keepalive,
+            clean_start: self.clean_start,
+            expiry_interval: self.expiry_interval,
+            receive_maximum: self.receive_maximum,
+            conn_props: crate::rules::printable_props(self.conn_props),
+        }
+    }
+
+    /// `$events/client/connack` for a CONNACK carrying `reason_code` (EMQX's name);
+    /// `connected_at` only for a success.
+    fn connack(
+        &self,
+        hub: &mpsc::UnboundedSender<HubCommand>,
+        clientid: &str,
+        reason_code: &str,
+        connected_at: Option<i64>,
+    ) {
+        if let Some(rules) = self.wants(mqtt_rules::EventKind::ClientConnack) {
+            let ev = mqtt_rules::EventInput::client_connack(
+                &self.client(rules, clientid),
+                &self.conn_info(),
+                reason_code,
+                connected_at,
+            );
+            rules.fire_event(&ev, hub);
+        }
+    }
+
+    /// `$events/auth/check_authn_complete`: `reason_code` is `success` or EMQX's name
+    /// for why authentication failed.
+    fn authn_complete(
+        &self,
+        hub: &mpsc::UnboundedSender<HubCommand>,
+        clientid: &str,
+        reason_code: &str,
+        is_anonymous: bool,
+    ) {
+        if let Some(rules) = self.wants(mqtt_rules::EventKind::CheckAuthnComplete) {
+            let ev = mqtt_rules::EventInput::check_authn_complete(
+                &self.client(rules, clientid),
+                reason_code,
+                is_anonymous,
+            );
+            rules.fire_event(&ev, hub);
+        }
+    }
+
+    /// Authorize a publish to `topic` — a `$SYS/` topic is the broker's and refused
+    /// whatever the ACL says (ADR 0084) — raising `$events/auth/check_authz_complete`
+    /// when a rule selects it. Only then is the ACL asked which rule decided
+    /// ([`Authorizer::explain`], which agrees with `authorize_publish`): `file` when one
+    /// of its rules did, `default` when none matched (EMQX's `authorization.no_match`).
+    fn authorize_publish(
+        &self,
+        hub: &mpsc::UnboundedSender<HubCommand>,
+        policy: &ConnPolicy,
+        principal: &Identity,
+        client: &ClientId,
+        topic: &str,
+    ) -> bool {
+        let reserved = mqtt_core::is_reserved_topic(topic);
+        let Some(rules) = self.wants(mqtt_rules::EventKind::CheckAuthzComplete) else {
+            return !reserved
+                && policy
+                    .authorizer()
+                    .authorize_publish(principal, client, &topic.to_string());
+        };
+        let (allowed, source) = if reserved {
+            (false, "default")
+        } else {
+            let e = policy.authorizer().explain(
+                principal,
+                client,
+                mqtt_auth::CheckedAction::Publish,
+                topic,
+            );
+            (e.allowed, authz_source(&e))
+        };
+        let ev = mqtt_rules::EventInput::check_authz_complete(
+            &self.client(rules, &client.0),
+            topic,
+            "publish",
+            source,
+            allowed,
+        );
+        rules.fire_event(&ev, hub);
+        allowed
+    }
+
+    /// [`authorize_publish`](Self::authorize_publish) for a SUBSCRIBE filter.
+    fn authorize_subscribe(
+        &self,
+        hub: &mpsc::UnboundedSender<HubCommand>,
+        policy: &ConnPolicy,
+        principal: &Identity,
+        client: &ClientId,
+        filter: &str,
+    ) -> bool {
+        let Some(rules) = self.wants(mqtt_rules::EventKind::CheckAuthzComplete) else {
+            return policy
+                .authorizer()
+                .authorize_subscribe(principal, client, filter);
+        };
+        let e = policy.authorizer().explain(
+            principal,
+            client,
+            mqtt_auth::CheckedAction::Subscribe,
+            filter,
+        );
+        let ev = mqtt_rules::EventInput::check_authz_complete(
+            &self.client(rules, &client.0),
+            filter,
+            "subscribe",
+            authz_source(&e),
+            e.allowed,
+        );
+        rules.fire_event(&ev, hub);
+        e.allowed
+    }
+
+    /// Keep the client's DISCONNECT properties for `client.disconnected`, when a rule
+    /// selects it.
+    fn client_disconnect(&self, props: &mqtt_codec::Properties) {
+        if self
+            .wants(mqtt_rules::EventKind::ClientDisconnected)
+            .is_some()
+        {
+            *self
+                .disconn_props
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                Some(crate::rules::printable_props(props));
+        }
+    }
+
+    /// The DISCONNECT properties [`client_disconnect`](Self::client_disconnect) kept,
+    /// or none (EMQX prints a missing map as `{"User-Property": {}}`).
+    fn take_disconn_props(&self) -> mqtt_rules::Map {
+        self.disconn_props
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .unwrap_or_else(|| crate::rules::printable_props(&mqtt_codec::Properties::new()))
+    }
+}
+
+/// EMQX's `authz_source` for what decided an authorization: `file` for a rule of the
+/// ACL file (EMQX's file source), `default` when none matched (or no ACL is configured)
+/// and `authorization.no_match` decided.
+fn authz_source(e: &mqtt_auth::Explanation) -> &'static str {
+    if e.rule.is_some() {
+        "file"
+    } else {
+        "default"
     }
 }
 
@@ -589,16 +806,17 @@ pub async fn handle_stream<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    handle_stream_watched(stream, peer, cert, policy, hub, None).await
+    handle_stream_watched(stream, peer, Arrival::default(), cert, policy, hub, None).await
 }
 
 /// [`handle_stream`] with a [`PeerClosedWatch`] on the underlying TCP socket, so a
 /// connection paused for ingress credit still notices its client hanging up
-/// (ADR 0082 T3, #825). The production listeners build the watch from the raw
-/// socket before wrapping it in TLS or WebSocket.
+/// (ADR 0082 T3, #825), and with where it [`Arrival`]ed. The production listeners build
+/// the watch from the raw socket before wrapping it in TLS or WebSocket.
 pub async fn handle_stream_watched<S>(
     stream: S,
     peer: Option<SocketAddr>,
+    arrival: Arrival,
     cert: Option<CertAdmission>,
     policy: Arc<ConnPolicy>,
     hub: mpsc::UnboundedSender<HubCommand>,
@@ -611,6 +829,7 @@ where
     if let Err(e) = run(
         stream,
         peer,
+        arrival,
         cert,
         &policy,
         hub,
@@ -626,9 +845,11 @@ where
     }
 }
 
+#[allow(clippy::too_many_arguments)] // the accepted stream and everything about it
 async fn run<S>(
     stream: S,
     peer: Option<SocketAddr>,
+    arrival: Arrival,
     cert: Option<CertAdmission>,
     policy: &ConnPolicy,
     hub: mpsc::UnboundedSender<HubCommand>,
@@ -647,6 +868,7 @@ where
         reader,
         writer,
         peer,
+        arrival,
         cert,
         policy,
         hub,
@@ -764,23 +986,23 @@ fn relocation_target<'a>(
 /// rejecting CONNACK and return `true` (the caller must close). `false` when there is
 /// no will or it is authorized. A Will in the broker's reserved `$SYS/` tree is never
 /// authorized, whatever the ACL says (ADR 0084); a Mosquitto bridge's state topic is not
-/// reserved ([`mqtt_core::is_reserved_topic`]), so the ACL decides that one.
+/// reserved ([`mqtt_core::is_reserved_topic`]), so the ACL decides that one. The check
+/// raises `$events/auth/check_authz_complete` like any publish's (ADR 0083).
+#[allow(clippy::too_many_arguments)] // the will, who asks, and where to report it
 async fn will_rejected<W: AsyncWrite + Unpin>(
     writer: &mut FrameWriter<W>,
     connect: &Connect,
     client: &ClientId,
     principal: &Identity,
     policy: &ConnPolicy,
+    rule_conn: &RuleConn<'_>,
+    hub: &mpsc::UnboundedSender<HubCommand>,
 ) -> Result<bool, NetError> {
     let Some(w) = &connect.last_will else {
         return Ok(false);
     };
     let reserved = mqtt_core::is_reserved_topic(&w.topic);
-    if !reserved
-        && policy
-            .authorizer()
-            .authorize_publish(principal, client, &w.topic)
-    {
+    if rule_conn.authorize_publish(hub, policy, principal, client, &w.topic) {
         return Ok(false);
     }
     warn!(client = %client.0, topic = %w.topic, reserved,
@@ -833,6 +1055,7 @@ async fn run_framed<R, W>(
     mut reader: FrameReader<R>,
     mut writer: FrameWriter<W>,
     peer: Option<SocketAddr>,
+    arrival: Arrival,
     cert: Option<CertAdmission>,
     policy: &ConnPolicy,
     hub: mpsc::UnboundedSender<HubCommand>,
@@ -858,19 +1081,37 @@ where
     reader.set_version(connect.protocol);
     writer.set_version(connect.protocol);
 
+    // Who this client is to the rule engine (ADR 0083) — its connack and
+    // authentication events (a refused CONNECT's included), its publishes and events,
+    // and its Will, which the hub publishes (and evaluates) after it has gone. A
+    // relocated session's socket peer is the relaying node, not the client (ADR 0005),
+    // so the rule engine is not told it.
+    let relocated = via.is_some();
+    let rule_conn = RuleConn::new(
+        &connect,
+        &connect.properties,
+        if relocated { None } else { peer },
+        arrival,
+        policy,
+    );
+
     // Client-id validation may already reject the CONNECT.
     let Some((client, server_assigned_id)) =
         validate_connect(&mut writer, &connect, policy.node.as_ref()).await?
     else {
+        // Its only refusal: a zero-length id without clean start.
+        rule_conn.connack(
+            &hub,
+            &connect.client_id,
+            connack_reason(CONNACK_IDENTIFIER_REJECTED, ProtocolVersion::V311),
+            None,
+        );
         return Ok(());
     };
 
-    // A relocated session's socket peer is the relaying node, not the client
-    // (ADR 0005), so the rule engine is not told it.
-    let relocated = via.is_some();
     // Authentication gate: verify credentials BEFORE attaching to the hub, so a
     // rejected client never touches session state (enhanced exchange or single-shot).
-    let Some((principal, auth_method)) = authenticate(
+    let (principal, auth_method) = match authenticate(
         &mut reader,
         &mut writer,
         &client,
@@ -880,11 +1121,30 @@ where
         via,
     )
     .await?
-    else {
-        // The penalty box (ADR 0041 T2) keys on this: authentication failed —
-        // authorization denials below never set it.
-        auth_failed.store(true, Ordering::Relaxed);
-        return Ok(()); // rejected; CONNACK/close already handled
+    {
+        Ok((principal, method)) => {
+            rule_conn.authn_complete(
+                &hub,
+                &client.0,
+                "success",
+                matches!(method, AuthMethod::Anonymous),
+            );
+            (principal, method)
+        }
+        Err(refused) => {
+            // The penalty box (ADR 0041 T2) keys on this: authentication failed —
+            // authorization denials below never set it.
+            auth_failed.store(true, Ordering::Relaxed);
+            // Rejected with a CONNACK (EMQX's `client.check_authn_complete` with the
+            // error, then `client.connack`); an exchange that was abandoned answered
+            // nothing, and raises nothing.
+            if let Some(code) = refused {
+                let reason = connack_reason(code, connect.protocol);
+                rule_conn.authn_complete(&hub, &client.0, reason, false);
+                rule_conn.connack(&hub, &client.0, reason, None);
+            }
+            return Ok(());
+        }
     };
 
     // Optional connect ACL (ADR 0031 option B): the policy may constrain which client ids this
@@ -901,6 +1161,12 @@ where
             &format!("client {}", client.0),
         );
         let code = connack_code(CONNACK_NOT_AUTHORIZED, connect.protocol);
+        rule_conn.connack(
+            &hub,
+            &client.0,
+            connack_reason(code, connect.protocol),
+            None,
+        );
         return reject_connack(&mut writer, code).await;
     }
 
@@ -919,26 +1185,28 @@ where
 
     // A will is a deferred publish: authorize it at CONNECT, not at the moment of
     // death (ADR 0004 step 3). An unauthorized will closes with a rejecting CONNACK.
-    if will_rejected(&mut writer, &connect, &client, &principal, policy).await? {
+    if will_rejected(
+        &mut writer,
+        &connect,
+        &client,
+        &principal,
+        policy,
+        &rule_conn,
+        &hub,
+    )
+    .await?
+    {
+        let code = connack_code(CONNACK_NOT_AUTHORIZED, connect.protocol);
+        rule_conn.connack(
+            &hub,
+            &client.0,
+            connack_reason(code, connect.protocol),
+            None,
+        );
         return Ok(());
     }
 
     let conn_id = CONN_ID.fetch_add(1, Ordering::Relaxed);
-    // Who this client is to the rule engine (ADR 0083) — its publishes, its events,
-    // and its Will, which the hub publishes (and evaluates) after it has gone.
-    let rule_conn = RuleConn {
-        publisher: crate::rules::Publisher {
-            username: connect.username.clone(),
-            peer: if relocated { None } else { peer },
-        },
-        close_reason: std::sync::atomic::AtomicU8::new(CloseReason::TcpClosed as u8),
-        client_code: std::sync::atomic::AtomicU8::new(0),
-        parked_batch: std::sync::Mutex::new(None),
-        rules: policy
-            .rules
-            .as_ref()
-            .map(crate::rules::Rules::for_connection),
-    };
     let will = connect
         .last_will
         .map(|w| into_will(w, rule_conn.publisher.clone()));
@@ -983,6 +1251,12 @@ where
             // clean session over a recoverable one (ADR 0017).
             info!(client = %client.0, "rejecting CONNECT: durable session unavailable, retry");
             let code = connack_code(CONNACK_SERVER_UNAVAILABLE, connect.protocol);
+            rule_conn.connack(
+                &hub,
+                &client.0,
+                connack_reason(code, connect.protocol),
+                None,
+            );
             return reject_connack(&mut writer, code).await;
         }
         Ok(AttachOutcome::QuotaExceeded) => {
@@ -996,6 +1270,12 @@ where
             } else {
                 CONNACK_SERVER_UNAVAILABLE
             };
+            rule_conn.connack(
+                &hub,
+                &client.0,
+                connack_reason(code, connect.protocol),
+                None,
+            );
             return reject_connack(&mut writer, code).await;
         }
         Ok(AttachOutcome::OwnerMismatch) => {
@@ -1012,6 +1292,12 @@ where
                 &format!("client {} is owned by another identity", client.0),
             );
             let code = connack_code(CONNACK_NOT_AUTHORIZED, connect.protocol);
+            rule_conn.connack(
+                &hub,
+                &client.0,
+                connack_reason(code, connect.protocol),
+                None,
+            );
             return reject_connack(&mut writer, code).await;
         }
         Err(_) => return Ok(()), // hub dropped the reply (shutdown or superseded)
@@ -1073,27 +1359,19 @@ where
     debug!(client = %client.0, session_present, "CONNECT accepted");
     count_connection_opened(policy, connect.protocol);
     let connected_at = mqtt_rules::now_ms();
-    if let Some(rules) = &rule_conn.rules {
-        if rules.wants(mqtt_rules::EventKind::ClientConnected) {
-            let info = rules.client_info(&client, &rule_conn.publisher);
-            let proto_ver = if connect.protocol == ProtocolVersion::V5 {
-                5
-            } else {
-                4
-            };
-            rules.fire_event(
-                &mqtt_rules::EventInput::client_connected(
-                    &info,
-                    proto_ver,
-                    connect.keep_alive,
-                    clean_start,
-                    session_expiry,
-                    connected_at,
-                ),
-                &hub,
-            );
-        }
+    // EMQX's order: `client.connected` (its `ensure_connected/1`), then
+    // `client.connack` (`handle_out(connack, …)` on the connected channel).
+    if let Some(rules) = rule_conn.wants(mqtt_rules::EventKind::ClientConnected) {
+        rules.fire_event(
+            &mqtt_rules::EventInput::client_connected(
+                &rule_conn.client(rules, &client.0),
+                &rule_conn.conn_info(),
+                connected_at,
+            ),
+            &hub,
+        );
     }
+    rule_conn.connack(&hub, &client.0, "success", Some(connected_at));
 
     // The connect Authentication Method (if any) bounds a later re-auth (ADR 0013 §4).
     let auth_method = connect
@@ -1140,21 +1418,23 @@ where
         graceful,
         session_expiry_override,
     });
-    if let Some(rules) = &rule_conn.rules {
-        if rules.wants(mqtt_rules::EventKind::ClientDisconnected) {
-            // A socket error ends the session as a closed connection, whatever `serve`
-            // was doing when it hit it.
-            let reason = if result.is_err() {
-                "tcp_closed"
-            } else {
-                rule_conn.close_reason()
-            };
-            let info = rules.client_info(&client, &rule_conn.publisher);
-            rules.fire_event(
-                &mqtt_rules::EventInput::client_disconnected(&info, reason, connected_at),
-                &hub,
-            );
-        }
+    if let Some(rules) = rule_conn.wants(mqtt_rules::EventKind::ClientDisconnected) {
+        // A socket error ends the session as EMQX names the error, whatever `serve`
+        // was doing when it hit it.
+        let reason = match &result {
+            Err(e) => rule_conn.arrival.socket_error(e),
+            Ok(_) => rule_conn.close_reason(),
+        };
+        rules.fire_event(
+            &mqtt_rules::EventInput::client_disconnected(
+                &rule_conn.client(rules, &client.0),
+                rule_conn.proto_ver,
+                reason,
+                rule_conn.take_disconn_props(),
+                connected_at,
+            ),
+            &hub,
+        );
     }
     result.map(|_| ())
 }
@@ -1278,6 +1558,8 @@ pub async fn serve_proxied<R, W>(
         reader,
         writer,
         None,
+        // Nor the listener: this node's own one is not where the client connected.
+        Arrival::default(),
         cert,
         &policy,
         hub,
@@ -1405,8 +1687,9 @@ where
 
 /// The authentication gate: run the MQTT 5.0 enhanced (AUTH) exchange when the
 /// CONNECT names an Authentication Method (ADR 0013), otherwise the single-shot
-/// credential check. Returns `None` (with the rejecting CONNACK/close already sent)
-/// when the client is refused.
+/// credential check. Returns `Err` (with the rejecting CONNACK/close already sent)
+/// when the client is refused: `Err(Some(code))` with the CONNACK code it was sent,
+/// `Err(None)` when an exchange was abandoned without one.
 #[allow(clippy::too_many_arguments)] // the full authentication context
 async fn authenticate<R, W>(
     reader: &mut FrameReader<R>,
@@ -1416,7 +1699,7 @@ async fn authenticate<R, W>(
     identity: Option<&Identity>,
     policy: &ConnPolicy,
     via: Option<String>,
-) -> Result<Option<(Identity, AuthMethod)>, NetError>
+) -> Result<Result<(Identity, AuthMethod), Option<u8>>, NetError>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
@@ -1458,8 +1741,8 @@ fn jwt_password_str(password: &[u8]) -> Option<&str> {
 /// token verifier is configured (ADR 0050); otherwise CONNECT username/password;
 /// otherwise anonymous (only honored when the policy opts in). On failure this sends
 /// the rejecting CONNACK — 0x04 (bad user name or password) for password credentials,
-/// 0x05 (not authorized) otherwise — and returns `Ok(None)`: the caller must close
-/// without attaching to the hub.
+/// 0x05 (not authorized) otherwise — and returns `Ok(Err(Some(code)))` with the code
+/// sent: the caller must close without attaching to the hub.
 async fn authenticate_connect<W>(
     writer: &mut FrameWriter<W>,
     client: &ClientId,
@@ -1467,7 +1750,7 @@ async fn authenticate_connect<W>(
     identity: Option<&Identity>,
     policy: &ConnPolicy,
     via: Option<String>,
-) -> Result<Option<(Identity, AuthMethod)>, NetError>
+) -> Result<Result<(Identity, AuthMethod), Option<u8>>, NetError>
 where
     W: AsyncWrite + Unpin,
 {
@@ -1554,7 +1837,7 @@ where
                 Some(&id.subject),
                 &format!("client {} via {method}{relayed}", client.0),
             );
-            Ok(Some((id, auth_method)))
+            Ok(Ok((id, auth_method)))
         }
         Err(e) => {
             let code = if both_factors || matches!(creds, Some(Credentials::Password { .. })) {
@@ -1570,14 +1853,15 @@ where
                 Some(&client.0),
                 &format!("rejected {method} credentials"),
             );
+            let code = connack_code(code, connect.protocol);
             writer
                 .send(&Packet::ConnAck(ConnAck {
                     properties: mqtt_codec::Properties::new(),
                     session_present: false,
-                    code: connack_code(code, connect.protocol),
+                    code,
                 }))
                 .await?;
-            Ok(None)
+            Ok(Err(Some(code)))
         }
     }
 }
@@ -1598,8 +1882,9 @@ async fn reject_connack<W: AsyncWrite + Unpin>(
 
 /// Run the MQTT 5.0 enhanced-authentication (AUTH) exchange for a CONNECT that named
 /// an Authentication Method (ADR 0013). Returns the authenticated [`Identity`], or
-/// `None` when the connection was rejected/closed (the CONNACK or close is handled
-/// here). The exchange runs before the CONNACK, so a failure never attaches a session.
+/// `Err` when the connection was rejected (`Some` of the CONNACK code sent) or closed
+/// (`None`); the CONNACK or close is handled here. The exchange runs before the
+/// CONNACK, so a failure never attaches a session.
 async fn enhanced_auth<R, W>(
     reader: &mut FrameReader<R>,
     writer: &mut FrameWriter<W>,
@@ -1607,7 +1892,7 @@ async fn enhanced_auth<R, W>(
     connect: &Connect,
     method: &str,
     policy: &ConnPolicy,
-) -> Result<Option<Identity>, NetError>
+) -> Result<Result<Identity, Option<u8>>, NetError>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
@@ -1616,7 +1901,7 @@ where
     let Some(authenticator) = policy.enhanced.as_ref().filter(|a| a.method() == method) else {
         warn!(client = %client.0, method, "unsupported authentication method");
         reject_connack(writer, CONNACK_V5_BAD_AUTH_METHOD).await?;
-        return Ok(None);
+        return Ok(Err(Some(CONNACK_V5_BAD_AUTH_METHOD)));
     };
 
     let mut session = authenticator.start();
@@ -1632,7 +1917,7 @@ where
                 Some(&id.subject),
                 &format!("client {} via enhanced:{method}", client.0),
             );
-            Ok(Some(id))
+            Ok(Ok(id))
         }
         ExchangeResult::Failed => {
             warn!(client = %client.0, method, "enhanced authentication failed");
@@ -1643,9 +1928,9 @@ where
                 &format!("rejected enhanced:{method}"),
             );
             reject_connack(writer, CONNACK_V5_NOT_AUTHORIZED).await?;
-            Ok(None)
+            Ok(Err(Some(CONNACK_V5_NOT_AUTHORIZED)))
         }
-        ExchangeResult::Aborted => Ok(None),
+        ExchangeResult::Aborted => Ok(Err(None)),
     }
 }
 
@@ -1804,7 +2089,10 @@ async fn disconnect<W: AsyncWrite + Unpin>(
 /// Handle a client-initiated re-authentication (AUTH `0x19`) on an established
 /// session (ADR 0013 §4). On success, updates `principal` and answers AUTH(Success);
 /// on failure or protocol violation, sends DISCONNECT. Returns `Ok(true)` to keep
-/// serving, `Ok(false)` to close.
+/// serving, `Ok(false)` to close, with why recorded on `rule_conn` in EMQX's terms;
+/// the outcome raises `$events/auth/check_authn_complete`, as EMQX's re-authentication
+/// does (ADR 0083).
+#[allow(clippy::too_many_arguments)] // the exchange, and where to report it
 async fn reauthenticate<R, W>(
     reader: &mut FrameReader<R>,
     writer: &mut FrameWriter<W>,
@@ -1813,15 +2101,19 @@ async fn reauthenticate<R, W>(
     connect_method: Option<&str>,
     principal: &mut Identity,
     policy: &ConnPolicy,
+    rule_conn: &RuleConn<'_>,
+    hub: &mpsc::UnboundedSender<HubCommand>,
 ) -> Result<bool, NetError>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
+    let protocol_error = mqtt_rules::disconnect_reason(DISCONNECT_PROTOCOL_ERROR);
     // Only a Re-authenticate (0x19) initiates an exchange in the serve loop; any
     // other AUTH is a protocol error.
     if auth.reason != AUTH_REAUTH {
         warn!(client = %client.0, reason = auth.reason, "unexpected AUTH on established session");
+        rule_conn.closing(protocol_error);
         disconnect(writer, DISCONNECT_PROTOCOL_ERROR).await?;
         return Ok(false);
     }
@@ -1833,10 +2125,12 @@ where
         .filter(|m| connect_method == Some(*m))
     else {
         warn!(client = %client.0, "re-auth method missing or changed; disconnecting");
+        rule_conn.closing(protocol_error);
         disconnect(writer, DISCONNECT_PROTOCOL_ERROR).await?;
         return Ok(false);
     };
     let Some(authenticator) = policy.enhanced.as_ref().filter(|a| a.method() == method) else {
+        rule_conn.closing(protocol_error);
         disconnect(writer, DISCONNECT_PROTOCOL_ERROR).await?;
         return Ok(false);
     };
@@ -1854,6 +2148,7 @@ where
                 Some(&id.subject),
                 &format!("client {} via enhanced:{method}", client.0),
             );
+            rule_conn.authn_complete(hub, &client.0, "success", false);
             *principal = id;
             let mut props = mqtt_codec::Properties::new();
             props.0.push(mqtt_codec::Property::AuthenticationMethod(
@@ -1874,6 +2169,9 @@ where
                 Some(&client.0),
                 &format!("rejected enhanced:{method}"),
             );
+            let reason = mqtt_rules::disconnect_reason(DISCONNECT_NOT_AUTHORIZED);
+            rule_conn.authn_complete(hub, &client.0, reason, false);
+            rule_conn.closing(reason);
             disconnect(writer, DISCONNECT_NOT_AUTHORIZED).await?;
             Ok(false)
         }
@@ -2025,24 +2323,25 @@ fn apply_publish_outcome(
     outcome: Result<crate::hub::PublishOutcome, ()>,
     is_v5: bool,
     client: &ClientId,
-) -> bool {
+) -> Result<(), &'static str> {
     match outcome {
         // The hub disappearing mid-shutdown means the message may never be
         // stored: close without a PUBACK rather than acknowledge a message
         // that could be lost.
-        Err(()) => false,
-        Ok(crate::hub::PublishOutcome::Accepted) => true,
+        Err(()) => Err("shutdown"),
+        Ok(crate::hub::PublishOutcome::Accepted) => Ok(()),
         Ok(crate::hub::PublishOutcome::Refused(r)) => {
             if is_v5 {
                 entry.ack.reason = r.v5_reason();
-                true
+                Ok(())
             } else if r.v311() == crate::hub::Refusal311::CloseNoAck {
                 warn!(client = %client.0, refusal = r.as_str(),
                       "publish refused and v3.1.1 cannot say so; closing \
                        without a PUBACK (the publisher retries)");
-                false
+                // Named as the reason a v5 client would have been told.
+                Err(mqtt_rules::disconnect_reason(r.v5_reason()))
             } else {
-                true
+                Ok(())
             }
         }
     }
@@ -2052,8 +2351,8 @@ fn apply_publish_outcome(
 /// waiting. Called before any outbound packet is written: the hub releases a
 /// publish's ack before it queues the fan-out deliveries, so flushing here
 /// keeps the old observable order — a message's own PUBACK still precedes any
-/// delivery that followed from it. Returns `false` when the connection must
-/// close (hub gone / v3.1.1 close-no-ack).
+/// delivery that followed from it. Returns `Err` of EMQX's `reason` when the
+/// connection must close (hub gone / v3.1.1 close-no-ack).
 async fn flush_ready_pubacks<W: AsyncWrite + Unpin>(
     writer: &mut FrameWriter<W>,
     current: &mut Option<PendingPuback>,
@@ -2061,26 +2360,26 @@ async fn flush_ready_pubacks<W: AsyncWrite + Unpin>(
     qos2_inflight: &mut usize,
     is_v5: bool,
     client: &ClientId,
-) -> Result<bool, NetError> {
+) -> Result<Result<(), &'static str>, NetError> {
     loop {
         if current.is_none() {
             *current = pending.pop_front();
         }
         let Some(entry) = current.as_mut() else {
-            return Ok(true);
+            return Ok(Ok(()));
         };
         let outcome = match &mut entry.done {
             None => Ok(crate::hub::PublishOutcome::Accepted),
             Some(rx) => match rx.try_recv() {
                 Ok(v) => Ok(v),
-                Err(oneshot::error::TryRecvError::Empty) => return Ok(true),
+                Err(oneshot::error::TryRecvError::Empty) => return Ok(Ok(())),
                 Err(oneshot::error::TryRecvError::Closed) => Err(()),
             },
         };
         let mut entry = current.take().expect("checked above");
         *qos2_inflight = qos2_inflight.saturating_sub(1);
-        if !apply_publish_outcome(&mut entry, outcome, is_v5, client) {
-            return Ok(false);
+        if let Err(reason) = apply_publish_outcome(&mut entry, outcome, is_v5, client) {
+            return Ok(Err(reason));
         }
         writer.send(&Packet::PubAck(entry.ack)).await?;
     }
@@ -2118,7 +2417,7 @@ async fn serve<R, W>(
     watch: Option<&PeerClosedWatch>,
     // The rule engine's view of this connection (ADR 0083); `serve` records why it
     // ended.
-    rule_conn: &RuleConn,
+    rule_conn: &RuleConn<'_>,
 ) -> Result<bool, NetError>
 where
     R: AsyncRead + Unpin,
@@ -2199,7 +2498,9 @@ where
                     if is_v5 {
                         let _ = disconnect(writer, reason).await;
                     }
-                    rule_conn.closing(CloseReason::ServerClosed);
+                    // EMQX's `handle_frame_error/2` closes with the frame error's
+                    // kind: `frame_too_large`, else `frame_error`.
+                    rule_conn.closing(frame_error_reason(e));
                     return Ok(false);
                 }
                 match inbound? {
@@ -2207,7 +2508,7 @@ where
                     // An AUTH on an established session is a re-authentication
                     // (ADR 0013 §4); it may update the principal used for ACL checks.
                     Some(Packet::Auth(auth)) => {
-                        if !reauthenticate(reader, writer, client, &auth, auth_method.as_deref(), &mut principal, policy).await? {
+                        if !reauthenticate(reader, writer, client, &auth, auth_method.as_deref(), &mut principal, policy, rule_conn, hub).await? {
                             return Ok(false);
                         }
                     }
@@ -2293,8 +2594,8 @@ where
             }, if current.is_some() => {
                 let mut entry = current.take().expect("guarded");
                 qos2_inflight = qos2_inflight.saturating_sub(1);
-                if !apply_publish_outcome(&mut entry, outcome, is_v5, client) {
-                    rule_conn.closing(CloseReason::ServerClosed);
+                if let Err(reason) = apply_publish_outcome(&mut entry, outcome, is_v5, client) {
+                    rule_conn.closing(reason);
                     return Ok(false);
                 }
                 writer.send(&Packet::PubAck(entry.ack)).await?;
@@ -2308,7 +2609,7 @@ where
                 // 0075): the hub releases a publish's ack before queueing its
                 // fan-out, so this preserves the old order — a message's own
                 // PUBACK precedes any delivery that followed from it.
-                if !flush_ready_pubacks(
+                if let Err(reason) = flush_ready_pubacks(
                     writer,
                     &mut current,
                     &mut pending_pubacks,
@@ -2318,7 +2619,7 @@ where
                 )
                 .await?
                 {
-                    rule_conn.closing(CloseReason::ServerClosed);
+                    rule_conn.closing(reason);
                     return Ok(false);
                 }
                 // Batch the whole current backlog into one write + flush (issue
@@ -2330,9 +2631,10 @@ where
                 // keep up cannot hold this loop or grow the buffer without limit;
                 // the single writer task still guarantees per-connection order.
                 let Some(mut pkt) = maybe_out else {
-                    // The hub dropped our sender: taken over by a new connection
-                    // for this client id, or the hub shut down.
-                    rule_conn.closing(CloseReason::ServerClosed);
+                    // The hub dropped our sender: it closed this connection — a
+                    // takeover, a kick, an eviction, … — and said why on the meter
+                    // (EMQX's `takenover`, `discarded`, `kicked`, …), or it shut down.
+                    rule_conn.closing(out_meter.close_reason().map_or("shutdown", crate::hub::HubClose::reason));
                     return Ok(false);
                 };
                 for _ in 0..OUTBOUND_BATCH_MAX {
@@ -2392,7 +2694,10 @@ where
                     _ => {
                         debug!(client = %client.0, keep_alive, "keepalive expired; closing connection");
                         count_connection_error(policy, "keepalive");
-                        rule_conn.closing(CloseReason::KeepaliveTimeout);
+                        // EMQX's name for 0x8D. Spelled out, not looked up from `reason::`: nothing is
+                        // sent on the wire here, and scripts/check-reason-codes.py counts every
+                        // `reason::` constant in conn.rs as a code the broker emits.
+                        rule_conn.closing("keepalive_timeout");
                         return Ok(false);
                     }
                 }
@@ -2409,7 +2714,9 @@ where
                     // gone, which the graceful close handles anyway.
                     let _ = disconnect(writer, DISCONNECT_SERVER_SHUTTING_DOWN).await;
                 }
-                rule_conn.closing(CloseReason::Shutdown);
+                // EMQX's word for a connection ended by the node going down: its
+                // channel exits `shutdown` (`emqx_rule_events:reason/1`).
+                rule_conn.closing("shutdown");
                 return Ok(true);
             }
         }
@@ -2433,7 +2740,7 @@ enum Resume {
 
 impl Parked {
     /// Park the batch `send_forwarded` left, if it left one.
-    fn batch(rule_conn: &RuleConn, policy: &ConnPolicy) -> Option<Self> {
+    fn batch(rule_conn: &RuleConn<'_>, policy: &ConnPolicy) -> Option<Self> {
         let (batch, wait) = rule_conn.take_parked()?;
         if let Some(m) = &policy.metrics {
             m.ingress_paused();
@@ -2539,7 +2846,7 @@ async fn send_forwarded(
     forwarded: Forwarded,
     hub: &mpsc::UnboundedSender<HubCommand>,
     conn_credit: Option<&crate::ingress::ConnCredit>,
-    rule_conn: &RuleConn,
+    rule_conn: &RuleConn<'_>,
     qos: QoS,
     metrics: Option<&mqtt_observability::metrics::Metrics>,
 ) -> (Option<oneshot::Receiver<crate::hub::PublishOutcome>>, usize) {
@@ -2634,7 +2941,7 @@ async fn handle_publish<W: AsyncWrite + Unpin>(
     inbound_aliases: &mut InboundAliases,
     admission: IngressAdmit,
     conn_credit: Option<&crate::ingress::ConnCredit>,
-    rule_conn: &RuleConn,
+    rule_conn: &RuleConn<'_>,
 ) -> Result<PacketOutcome, NetError> {
     // The MQTT 5.0 Message Expiry Interval (if the publisher set one) bounds how long
     // a queued copy is deliverable (ADR 0009 §3).
@@ -2656,7 +2963,7 @@ async fn handle_publish<W: AsyncWrite + Unpin>(
               "client PUBLISH carries a Subscription Identifier [MQTT-3.3.4-6]; DISCONNECT 0x82");
         disconnect(writer, DISCONNECT_PROTOCOL_ERROR).await?;
         // A broker-initiated close (the client did not DISCONNECT): the Will fires.
-        return Ok(PacketOutcome::BrokerClose);
+        return Ok(PacketOutcome::closed_by(DISCONNECT_PROTOCOL_ERROR));
     }
     // Resolve any topic alias to the full topic name before anything else sees it
     // (ADR 0011 §2). An invalid alias is a protocol violation: close the connection.
@@ -2667,14 +2974,13 @@ async fn handle_publish<W: AsyncWrite + Unpin>(
         // alias property is v5-only, so reaching here implies a v5 connection.
         warn!(client = %client.0, alias = ?alias, "invalid topic alias; DISCONNECT 0x94");
         disconnect(writer, DISCONNECT_TOPIC_ALIAS_INVALID).await?;
-        return Ok(PacketOutcome::BrokerClose);
+        return Ok(PacketOutcome::closed_by(DISCONNECT_TOPIC_ALIAS_INVALID));
     };
     let Publish {
         qos,
         pkid,
         payload,
         retain,
-        dup,
         ..
     } = publish;
     // [MQTT-3.3.2-2] / [MQTT-4.7.3-1]: a PUBLISH topic name MUST NOT contain
@@ -2684,7 +2990,9 @@ async fn handle_publish<W: AsyncWrite + Unpin>(
     // layer earlier, by the string decoder.)
     if !mqtt_core::valid_topic_name(&topic) {
         warn!(client = %client.0, topic = %topic, "invalid PUBLISH topic name; closing connection");
-        return Ok(PacketOutcome::BrokerClose);
+        // EMQX closes such a publish with `topic_name_invalid` (`emqx_packet:check/1`).
+        // Spelled out: the connection closes without sending 0x90 (see the keepalive arm).
+        return Ok(PacketOutcome::BrokerClose("topic_name_invalid"));
     }
     // ACL gate (ADR 0004 step 3): an unauthorized publish is dropped before the
     // hub ever sees it, and the denial is audited. What the publisher is TOLD is
@@ -2704,11 +3012,11 @@ async fn handle_publish<W: AsyncWrite + Unpin>(
     // the ACL says, through these same arms — answered, audited and kept from the
     // rules exactly like an ACL denial. It is checked on the resolved topic, so an
     // alias-only publish cannot slip past it.
+    //
+    // The decision raises `$events/auth/check_authz_complete` when a rule selects it
+    // (ADR 0083); otherwise it costs what it always did.
     let reserved = mqtt_core::is_reserved_topic(&topic);
-    let authorized = !reserved
-        && policy
-            .authorizer()
-            .authorize_publish(principal, client, &topic);
+    let authorized = rule_conn.authorize_publish(hub, policy, principal, client, &topic);
     if !authorized {
         debug!(client = %client.0, identity = %principal.subject, topic = %topic, reserved,
                "publish denied by ACL; dropping");
@@ -2770,7 +3078,6 @@ async fn handle_publish<W: AsyncWrite + Unpin>(
                 payload: &payload,
                 qos,
                 retain,
-                dup,
                 app: &app,
                 message_expiry,
             }),
@@ -2842,7 +3149,9 @@ async fn handle_publish<W: AsyncWrite + Unpin>(
                 warn!(client = %client.0, limit = wire_limits().receive_maximum,
                       "QoS 1 publish beyond Receive Maximum; DISCONNECT 0x93");
                 disconnect(writer, DISCONNECT_RECEIVE_MAXIMUM_EXCEEDED).await?;
-                return Ok(PacketOutcome::BrokerClose);
+                return Ok(PacketOutcome::closed_by(
+                    DISCONNECT_RECEIVE_MAXIMUM_EXCEEDED,
+                ));
             }
             let mut ack = mqtt_codec::packet::Ack::from(id);
             // ADR 0075: park the ack and keep reading, so the publisher's whole
@@ -2885,8 +3194,8 @@ async fn handle_publish<W: AsyncWrite + Unpin>(
                     Some(rx) => rx.await.map_err(|_| ()),
                 };
                 *qos2_inflight = qos2_inflight.saturating_sub(1);
-                if !apply_publish_outcome(&mut entry, outcome, is_v5, client) {
-                    return Ok(PacketOutcome::BrokerClose);
+                if let Err(reason) = apply_publish_outcome(&mut entry, outcome, is_v5, client) {
+                    return Ok(PacketOutcome::BrokerClose(reason));
                 }
                 writer.send(&Packet::PubAck(entry.ack)).await?;
             }
@@ -2927,7 +3236,11 @@ async fn handle_publish<W: AsyncWrite + Unpin>(
                     Err(e) => {
                         warn!(client = %client.0, id, error = %e,
                               "QoS2 dedup store write failed; withholding PUBREC (fail closed)");
-                        return Ok(PacketOutcome::BrokerClose);
+                        // EMQX closes on a publish its session failed to take with
+                        // `implementation_specific_error`.
+                        // EMQX's name for 0x83, spelled out: nothing is sent (see the
+                        // keepalive arm on why not `reason::`).
+                        return Ok(PacketOutcome::BrokerClose("implementation_specific_error"));
                     }
                 },
                 // Read first, insert only when fresh: a blind insert would
@@ -2952,7 +3265,9 @@ async fn handle_publish<W: AsyncWrite + Unpin>(
                     warn!(client = %client.0, limit = wire_limits().receive_maximum,
                           "client exceeded Receive Maximum; DISCONNECT 0x93");
                     disconnect(writer, DISCONNECT_RECEIVE_MAXIMUM_EXCEEDED).await?;
-                    return Ok(PacketOutcome::BrokerClose);
+                    return Ok(PacketOutcome::closed_by(
+                        DISCONNECT_RECEIVE_MAXIMUM_EXCEEDED,
+                    ));
                 }
                 let mut rec = mqtt_codec::packet::Ack::from(id);
                 if let Some(done) = send_forwarded(
@@ -2979,7 +3294,7 @@ async fn handle_publish<W: AsyncWrite + Unpin>(
                     match done.await {
                         // Hub gone mid-shutdown: nothing was said, so nothing is acked.
                         // The record stays held-unacked and the resend re-attempts.
-                        Err(_) => return Ok(PacketOutcome::BrokerClose),
+                        Err(_) => return Ok(PacketOutcome::BrokerClose("shutdown")),
                         Ok(crate::hub::PublishOutcome::Accepted) => {}
                         // Refused under a stated policy (ADR 0041 T4 retained quota,
                         // T11 brownout). v5: a PUBREC >= 0x80 ends the flow — no slot
@@ -2992,7 +3307,7 @@ async fn handle_publish<W: AsyncWrite + Unpin>(
                                 warn!(client = %client.0, id, refusal = r.as_str(),
                                       "QoS 2 publish refused and v3.1.1 cannot say so; \
                                        closing without a PUBREC (the publisher retries)");
-                                return Ok(PacketOutcome::BrokerClose);
+                                return Ok(PacketOutcome::closed_by(r.v5_reason()));
                             }
                         }
                     }
@@ -3020,7 +3335,9 @@ async fn handle_publish<W: AsyncWrite + Unpin>(
                     if !ack_qos2_dedup(policy, qos2_inbound, client, id).await {
                         warn!(client = %client.0, id,
                               "QoS2 dedup ack write failed; withholding PUBREC (fail closed)");
-                        return Ok(PacketOutcome::BrokerClose);
+                        // EMQX's name for 0x83, spelled out: nothing is sent (see the
+                        // keepalive arm on why not `reason::`).
+                        return Ok(PacketOutcome::BrokerClose("implementation_specific_error"));
                     }
                 } else {
                     // A v5 PUBREC >= 0x80 ends the flow BY SPEC — both sides agree the id
@@ -3151,8 +3468,18 @@ enum PacketOutcome {
     ClientDisconnectWithWill(u8),
     /// The BROKER is closing: a protocol violation, a refusal this protocol version
     /// cannot say any other way, or a hub that went away. Un-graceful — the Will
-    /// fires, exactly as for an EOF or a keepalive expiry.
-    BrokerClose,
+    /// fires, exactly as for an EOF or a keepalive expiry. Carries EMQX's `reason`
+    /// for it, which `$events/client/disconnected` reports (ADR 0083).
+    BrokerClose(&'static str),
+}
+
+impl PacketOutcome {
+    /// The broker closes as it would with a DISCONNECT carrying `code` — sent to a v5
+    /// client, the reason for a v3.1.1 one — which EMQX names by the code
+    /// (`emqx_channel:handle_out(disconnect, …)`).
+    fn closed_by(code: u8) -> Self {
+        Self::BrokerClose(mqtt_rules::disconnect_reason(code))
+    }
 }
 
 /// Handle one inbound packet.
@@ -3184,7 +3511,7 @@ async fn handle_inbound<W: AsyncWrite + Unpin>(
     // to (ADR 0083); `None` without a credit pool.
     conn_credit: Option<&crate::ingress::ConnCredit>,
     // The rule engine's view of this connection (ADR 0083).
-    rule_conn: &RuleConn,
+    rule_conn: &RuleConn<'_>,
 ) -> Result<PacketOutcome, NetError> {
     match packet {
         Packet::Publish(publish) => {
@@ -3281,10 +3608,7 @@ async fn handle_inbound<W: AsyncWrite + Unpin>(
                     // silently inert, which is the worst of both answers.
                     debug!(client = %client.0, filter = %f.path, "invalid topic filter");
                     return_codes.push(mqtt_codec::reason::TOPIC_FILTER_INVALID);
-                } else if policy
-                    .authorizer()
-                    .authorize_subscribe(principal, client, &f.path)
-                {
+                } else if rule_conn.authorize_subscribe(hub, policy, principal, client, &f.path) {
                     granted.push((f.path.clone(), f.qos));
                     if f.options.no_local {
                         no_local_filters.push(f.path.clone()); // #198
@@ -3326,7 +3650,7 @@ async fn handle_inbound<W: AsyncWrite + Unpin>(
                 let Ok(verdicts) = reply_rx.await else {
                     // Hub shut down mid-subscribe: the BROKER closes, so this is
                     // not a graceful client end.
-                    return Ok(PacketOutcome::BrokerClose);
+                    return Ok(PacketOutcome::BrokerClose("shutdown"));
                 };
                 let denied_code = if is_v5 {
                     reason::QUOTA_EXCEEDED
@@ -3358,15 +3682,18 @@ async fn handle_inbound<W: AsyncWrite + Unpin>(
                     properties: mqtt_codec::Properties::new(),
                 }))
                 .await?;
-            if let Some(rules) = &rule_conn.rules {
-                if rules.wants(mqtt_rules::EventKind::SessionSubscribed) {
-                    let info = rules.client_info(client, &rule_conn.publisher);
-                    for (filter, qos) in subscribed {
-                        rules.fire_event(
-                            &mqtt_rules::EventInput::session_subscribed(&info, &filter, qos),
-                            hub,
-                        );
-                    }
+            if let Some(rules) = rule_conn.wants(mqtt_rules::EventKind::SessionSubscribed) {
+                let info = rule_conn.client(rules, &client.0);
+                for (filter, qos) in subscribed {
+                    rules.fire_event(
+                        &mqtt_rules::EventInput::session_subscribed(
+                            &info,
+                            &filter,
+                            qos,
+                            crate::rules::printable_props(&s.properties),
+                        ),
+                        hub,
+                    );
                 }
             }
         }
@@ -3381,6 +3708,8 @@ async fn handle_inbound<W: AsyncWrite + Unpin>(
             // still computed (the removal logic is shared) and the encoder
             // drops them for anything below v5.
             let mut reason_codes: Vec<u8> = Vec::with_capacity(u.filters.len());
+            // Parallel to `reason_codes`: the `QoS` each removed subscription had.
+            let mut removed_qos: Vec<Option<QoS>> = vec![None; u.filters.len()];
             let mut asked: Vec<String> = Vec::new();
             for f in &u.filters {
                 if subscribable_filter(f) {
@@ -3405,25 +3734,30 @@ async fn handle_inbound<W: AsyncWrite + Unpin>(
                 let Ok(existed) = reply_rx.await else {
                     // Hub gone mid-unsubscribe: the BROKER closes — not a
                     // graceful client end, exactly as on the SUBSCRIBE path.
-                    return Ok(PacketOutcome::BrokerClose);
+                    return Ok(PacketOutcome::BrokerClose("shutdown"));
                 };
                 // Walk the slots that reached the hub (the 0x00 placeholders),
                 // in order, and mark the ones where nothing was removed.
                 let mut v = existed.iter();
-                for code in &mut reason_codes {
-                    if *code == 0x00 && !v.next().copied().unwrap_or(true) {
-                        *code = mqtt_codec::reason::NO_SUBSCRIPTION_EXISTED;
+                for (code, qos) in reason_codes.iter_mut().zip(&mut removed_qos) {
+                    if *code == 0x00 {
+                        match v.next().copied() {
+                            Some(None) => *code = mqtt_codec::reason::NO_SUBSCRIPTION_EXISTED,
+                            Some(granted) => *qos = granted,
+                            None => {}
+                        }
                     }
                 }
             }
             // `$events/session/unsubscribed` (ADR 0083): one per filter that was
-            // actually removed.
-            let removed: Vec<String> = u
+            // actually removed, with the `QoS` it had been granted.
+            let removed: Vec<(String, QoS)> = u
                 .filters
                 .iter()
                 .zip(&reason_codes)
-                .filter(|(_, code)| **code == 0x00)
-                .map(|(f, _)| f.clone())
+                .zip(&removed_qos)
+                .filter(|((_, code), _)| **code == 0x00)
+                .filter_map(|((f, _), qos)| qos.map(|q| (f.clone(), q)))
                 .collect();
             writer
                 .send(&Packet::UnsubAck(mqtt_codec::packet::UnsubAck {
@@ -3432,15 +3766,18 @@ async fn handle_inbound<W: AsyncWrite + Unpin>(
                     properties: mqtt_codec::Properties::new(),
                 }))
                 .await?;
-            if let Some(rules) = &rule_conn.rules {
-                if rules.wants(mqtt_rules::EventKind::SessionUnsubscribed) {
-                    let info = rules.client_info(client, &rule_conn.publisher);
-                    for filter in removed {
-                        rules.fire_event(
-                            &mqtt_rules::EventInput::session_unsubscribed(&info, &filter),
-                            hub,
-                        );
-                    }
+            if let Some(rules) = rule_conn.wants(mqtt_rules::EventKind::SessionUnsubscribed) {
+                let info = rule_conn.client(rules, &client.0);
+                for (filter, qos) in removed {
+                    rules.fire_event(
+                        &mqtt_rules::EventInput::session_unsubscribed(
+                            &info,
+                            &filter,
+                            qos as u8,
+                            crate::rules::printable_props(&u.properties),
+                        ),
+                        hub,
+                    );
                 }
             }
         }
@@ -3450,9 +3787,22 @@ async fn handle_inbound<W: AsyncWrite + Unpin>(
             if let Some(rules) = &rule_conn.rules {
                 rules.refresh();
             }
+            // `$events/client/ping`, before the PINGRESP as EMQX runs `client.ping`.
+            if let Some(rules) = rule_conn.wants(mqtt_rules::EventKind::ClientPing) {
+                rules.fire_event(
+                    &mqtt_rules::EventInput::client_ping(
+                        &rule_conn.client(rules, &client.0),
+                        &rule_conn.conn_info(),
+                    ),
+                    hub,
+                );
+            }
             writer.send(&Packet::PingResp).await?;
         }
         Packet::Disconnect(d) => {
+            // Its properties are `disconn_props` on `client.disconnected`, however the
+            // connection then ends (EMQX's `process_disconnect/2` keeps them first).
+            rule_conn.client_disconnect(&d.properties);
             // §3.14.2.2.2: a Session Expiry Interval HERE overrides the one agreed
             // at CONNECT — the documented way to say "hold my session, I'll be
             // back" (issue #298). Two rules, and the second is the one that is easy
@@ -3469,7 +3819,7 @@ async fn handle_inbound<W: AsyncWrite + Unpin>(
                     if is_v5 {
                         let _ = disconnect(writer, reason::PROTOCOL_ERROR).await;
                     }
-                    return Ok(PacketOutcome::BrokerClose);
+                    return Ok(PacketOutcome::closed_by(reason::PROTOCOL_ERROR));
                 }
                 *session_expiry_override = Some(requested);
             }

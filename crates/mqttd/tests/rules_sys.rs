@@ -94,7 +94,7 @@ fn publish(conn: &ConnRules, topic: &str, payload: &[u8]) {
         payload: &Bytes::copy_from_slice(payload),
         qos: QoS::AtLeastOnce,
         retain: false,
-        dup: false,
+
         app: &AppProperties::default(),
         message_expiry: None,
     });
@@ -686,7 +686,7 @@ fn fire_every_trigger(w: &mut Watched) -> Vec<Value> {
             payload: &Bytes::from_static(br#"{"v":"bye"}"#),
             qos: QoS::AtMostOnce,
             retain: true,
-            dup: false,
+
             app: &AppProperties::default(),
             message_expiry: None,
         },
@@ -700,7 +700,14 @@ fn fire_every_trigger(w: &mut Watched) -> Vec<Value> {
         node: "n1",
     };
     conn.fire_event(
-        &EventInput::client_connected(&info, 5, 30, true, 0, 0),
+        &EventInput::client_connected(
+            &info,
+            &mqtt_rules::ConnInfo {
+                keepalive: 30,
+                ..mqtt_rules::ConnInfo::sample()
+            },
+            0,
+        ),
         &mpsc::unbounded_channel().0,
     );
     drain(w.trace_rx.as_mut().unwrap())

@@ -878,12 +878,13 @@ including when it connects after the devices did.
 # dashboards or services), and keep the client id, which becomes a topic level, to one
 # plain level.
 #
-# presence_offline skips server_closed. When a device reconnects while the broker still
-# holds its old connection (a takeover: say its network changed), the OLD connection
-# ends with server_closed, and that event can arrive after the new connection's
-# "online": publishing it would mark a connected device offline. The cost: a device the
-# broker itself disconnects (evicted, or for a protocol violation) keeps showing online
-# until it connects again.
+# presence_offline skips takenover and discarded. When a device reconnects while the
+# broker still holds its old connection (a takeover: say its network changed), the OLD
+# connection ends with takenover (discarded when the new one asks for a clean start),
+# and that event can arrive after the new connection's "online": publishing it would
+# mark a connected device offline. Every other end is published with its reason, as
+# EMQX names it: kicked (an operator disconnected it), not_authorized (its credentials
+# were revoked), protocol_error and the like (it broke the protocol).
 #
 # "since" is the time of the event in milliseconds, so it differs on every run.
 #
@@ -909,7 +910,7 @@ description = "A device went away"
 sql = '''
 SELECT clientid, 'offline' AS status, disconnected_at AS since, reason
 FROM "$events/client/disconnected"
-WHERE regex_match(clientid, '^sensor-[A-Za-z0-9_-]{1,57}$') AND reason <> 'server_closed'
+WHERE regex_match(clientid, '^sensor-[A-Za-z0-9_-]{1,57}$') AND reason <> 'takenover' AND reason <> 'discarded'
 '''
 actions = [
   { function = "republish", args = { topic = "presence/${clientid}", qos = 1, retain = true, payload = "${.}" } },
@@ -958,11 +959,13 @@ presence/sensor-c  qos=1 retain=1  {"clientid":"sensor-c","status":"online","sin
 
 **Gotcha: takeovers.** When a device connects again while the broker still holds its old
 connection (its network changed, say), the old connection ends with the reason
-`server_closed`, and that event can arrive after the new connection's "online". A rule that
-published it would mark a connected device offline. This recipe skips `server_closed`, and
-the test proves that a takeover leaves the device online. The price: a device the broker
-itself disconnects (evicted, or for a protocol violation) shows online until it connects
-again. A device that goes silent is marked offline with `keepalive_timeout` once one and a
+`takenover` (`discarded` when the new connection asks for a clean start), and that event
+can arrive after the new connection's "online". A rule that published it would mark a
+connected device offline. This recipe skips both, as an EMQX presence rule does, and the
+test proves that a takeover leaves the device online. Every other end is published with
+EMQX's reason: `kicked` when an operator disconnects it, `not_authorized` when its
+credentials are revoked, `protocol_error` and the like when it breaks the protocol. A
+device that goes silent is marked offline with `keepalive_timeout` once one and a
 half keepalive intervals pass without a packet from it.
 
 ---

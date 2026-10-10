@@ -345,7 +345,7 @@ impl Node {
             payload: &Bytes::copy_from_slice(payload),
             qos: QoS::AtMostOnce,
             retain: false,
-            dup: false,
+
             app: &AppProperties::default(),
             message_expiry: None,
         });

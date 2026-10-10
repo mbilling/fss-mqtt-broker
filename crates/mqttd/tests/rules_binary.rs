@@ -870,8 +870,31 @@ fn check_rules_refuses_an_event_mqttd_does_not_raise() {
     assert_check_rules_refuses(
         "[rules.ev]\nsql = 'SELECT * FROM \"$events/message/delivered\"'\n",
         "rule `ev`: \"$events/message/delivered\" is not a supported event (supported: \
-         $events/client/connected, $events/client/disconnected, $events/session/subscribed, \
+         $events/client/connected, $events/client/disconnected, $events/client/connack, \
+         $events/client/ping, $events/auth/check_authn_complete, \
+         $events/auth/check_authz_complete, $events/session/subscribed, \
          $events/session/unsubscribed)",
+    );
+}
+
+/// RULES.md "Events": EMQX matches a `FROM "$events/…"` filter against its event topics
+/// (`emqx_rule_events:match_event_names/1`), so a wildcard selects every event it
+/// matches; one matching only events mqttd does not raise is refused, and `$sources/`,
+/// EMQX's data-integration sources, is refused like `$bridges/`.
+#[test]
+fn check_rules_refuses_wildcards_matching_no_raised_event_and_sources() {
+    assert_check_rules_refuses(
+        "[rules.ev]\nsql = 'SELECT * FROM \"$events/message/+\"'\n",
+        "rule `ev`: \"$events/message/+\" matches no event mqttd raises (supported: \
+         $events/client/connected, $events/client/disconnected, $events/client/connack, \
+         $events/client/ping, $events/auth/check_authn_complete, \
+         $events/auth/check_authz_complete, $events/session/subscribed, \
+         $events/session/unsubscribed)",
+    );
+    assert_check_rules_refuses(
+        "[rules.src]\nsql = 'SELECT * FROM \"$sources/mqtt:in\"'\n",
+        "rule `src`: \"$sources/mqtt:in\": mqttd has no data integration sources to select \
+         from (ADR 0083)",
     );
 }
 

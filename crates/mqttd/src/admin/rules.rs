@@ -608,22 +608,13 @@ impl Trigger {
         }
         let event = match t.event.as_deref() {
             None => None,
-            Some(name) => {
-                let short = name.trim_start_matches("$events/");
-                let kind = EventKind::ALL.into_iter().find(|k| {
-                    k.event_name() == name
-                        || EventKind::from_topic(&format!("$events/{short}")) == Some(*k)
-                });
-                Some(kind.ok_or_else(|| {
-                    bad_request(
-                        node,
-                        &format!(
-                            "event is client.connected, client.disconnected, \
-                             session.subscribed or session.unsubscribed, not {name:?}"
-                        ),
-                    )
-                })?)
-            }
+            Some(name) => Some(EventKind::parse(name).ok_or_else(|| {
+                let names: Vec<&str> = EventKind::ALL.iter().map(|k| k.event_name()).collect();
+                bad_request(
+                    node,
+                    &format!("event is one of {}, not {name:?}", names.join(", ")),
+                )
+            })?),
         };
         if event.is_none() {
             if !mqtt_core::valid_topic_name(&t.topic) {
