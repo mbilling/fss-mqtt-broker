@@ -1161,6 +1161,24 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::the_no_wildcard_fast_path_returns_exactly_the_named_topic`
 - `tests::unacked_messages_survive_for_replay`
 
+## `crates/mqtt-wasm-sandbox/src/lib.rs` — 15 test(s)
+
+- `tests::a_call_returns_the_modules_value`
+- `tests::a_fuel_bound_stops_the_same_work_at_the_same_point_every_time`
+- `tests::a_module_without_the_abi_is_refused_at_load`
+- `tests::a_modules_own_error_is_its_status_and_message_and_the_instance_lives_on`
+- `tests::a_result_larger_than_the_limit_is_refused_unread`
+- `tests::a_trap_ends_the_call`
+- `tests::an_endless_loop_stops_at_the_deadline_and_poisons_only_its_instance`
+- `tests::an_import_on_the_list_is_provided`
+- `tests::an_import_outside_the_list_is_refused_at_load`
+- `tests::another_abi_version_is_refused_at_load`
+- `tests::bytes_that_are_not_a_module_are_refused_at_load`
+- `tests::endless_recursion_overflows_the_modules_stack_and_not_the_hosts`
+- `tests::instances_share_no_state`
+- `tests::memory_growth_stops_at_the_cap`
+- `tests::the_arguments_arrive_as_one_counted_frame`
+
 ## `crates/mqttd-operator/src/bin/gen_crd.rs` — 0 test(s)
 
 

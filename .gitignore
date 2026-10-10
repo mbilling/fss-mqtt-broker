@@ -16,6 +16,10 @@ Cargo.lock.orig
 !crates/mqtt-auth/src/testdata/
 !crates/mqtt-auth/src/testdata/*.pem
 
+# The jq WebAssembly module of the ADR 0086 spike: built by
+# crates/mqtt-wasm-sandbox/jq-module/build.sh, identified by jq.wasm.sha256 beside it.
+/crates/mqtt-wasm-sandbox/jq-module/jq.wasm
+
 # Python bytecode cache (scripts/)
 __pycache__/
 *.pyc
