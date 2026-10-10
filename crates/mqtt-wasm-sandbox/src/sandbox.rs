@@ -1,20 +1,50 @@
 //! Loading a module, making instances of it, and calling a function in one under
-//! limits: time (fuel in slices, the clock read between slices), memory, stack and
-//! output size.
+//! limits: time (an epoch deadline, raised by a timer thread that sleeps until the
+//! next deadline), memory, stack and output size.
+//!
+//! The module is compiled by Cranelift when it is loaded ([`Sandbox::load`]), with the
+//! safe API only: nothing is ever read back from disk as code. [`Execution`] chooses
+//! what it is compiled to: machine code, or bytecode for the runtime's own
+//! interpreter where the host forbids executable memory. A host that cannot map
+//! memory executable gets [`LoadError::Engine`] for the first, never a crash.
 
 use std::fmt;
-use std::time::Instant;
+use std::future::Future;
+use std::pin::pin;
+use std::sync::Arc;
+use std::task::{Context, Poll, Waker};
+use std::time::{Duration, Instant};
 
-use wasmi::{
-    CompilationMode, Config, Engine, ExternType, Linker, Memory, Module, ResourceLimiter, Store,
-    TrapCode, TypedFunc, TypedResumableCall, WasmParams, WasmResults,
+use wasmtime::{
+    Config, Engine, ExternType, Linker, Memory, Module, OptLevel, ResourceLimiter, Store, Strategy,
+    Trap, TypedFunc, UpdateDeadline, WasmParams, WasmResults,
 };
-use wasmi_core::LimiterError;
 
+use crate::timer::Timer;
 use crate::wasi::{self, Grants};
 
 /// The ABI version this host speaks (`mqttd_abi_version`).
 pub const ABI_VERSION: u32 = 1;
+
+/// The stack a call has beyond [`Limits::max_stack_bytes`]: room for the host's own
+/// frames (the imports, the deadline callback) under the module's deepest call.
+const HOST_STACK_HEADROOM: usize = 256 * 1024;
+
+/// What a module's code is compiled to when it is loaded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Execution {
+    /// Machine code for this processor (Cranelift). The fast one, and the default. It
+    /// needs memory the process may map executable: under systemd's
+    /// `MemoryDenyWriteExecute=yes`, an `SELinux` policy denying `execmem`, or a
+    /// seccomp profile refusing `mprotect(PROT_EXEC)`, loading fails with
+    /// [`LoadError::Engine`].
+    #[default]
+    Compiled,
+    /// Bytecode for the runtime's portable interpreter (Pulley). No executable memory
+    /// and no signal handlers; the same module, limits and answers, at a small
+    /// fraction of the speed.
+    Interpreted,
+}
 
 /// The bounds one instance and one call run under.
 #[derive(Debug, Clone)]
@@ -23,21 +53,24 @@ pub struct Limits {
     pub memory_bytes: usize,
     /// Largest result a call may return, in bytes.
     pub max_output_bytes: u32,
-    /// Fuel (about one unit per executed instruction) between two looks at the
-    /// clock. Smaller is a tighter timeout and more overhead.
-    pub fuel_slice: u64,
-    /// Most fuel one call may burn, whatever the clock says: a bound that does not
-    /// depend on how fast the machine is. `None` leaves the deadline as the only one.
-    pub max_fuel: Option<u64>,
-    /// Fuel a call may still burn after the deadline when the module can be asked
-    /// to stop (`mqttd_cancel`): the time it has to end by itself and stay usable.
-    pub cancel_grace_fuel: u64,
-    /// Fuel for instantiation (data segments, constructors).
-    pub init_fuel: u64,
-    /// Deepest chain of calls inside the module.
-    pub max_call_depth: usize,
-    /// Largest interpreter value stack, in bytes.
+    /// Most stack the module's own calls may use, in bytes. A call runs on a stack of
+    /// its own of this size (and a little more for the host's frames), not on the
+    /// calling thread's.
     pub max_stack_bytes: usize,
+    /// How long a call always gets, whatever its deadline: a timeout of zero still
+    /// runs what is quick, as in EMQX.
+    pub min_run: Duration,
+    /// How long a call may still run after its deadline when the module can be asked
+    /// to stop (`mqttd_cancel`): the time it has to end by itself and stay usable.
+    pub cancel_grace: Duration,
+    /// The deadline of instantiation (data segments, constructors) and of the calls
+    /// that read a module's description.
+    pub init_timeout: Duration,
+    /// Most fuel (about one unit per executed instruction) one call may burn,
+    /// whatever the clock says: a bound that does not depend on how fast the machine
+    /// is. `None` compiles the module without fuel accounting, which is faster, and
+    /// leaves the deadline as the only bound on time.
+    pub max_fuel: Option<u64>,
 }
 
 impl Default for Limits {
@@ -45,12 +78,42 @@ impl Default for Limits {
         Self {
             memory_bytes: 64 << 20,
             max_output_bytes: 1 << 20,
-            fuel_slice: 200_000,
+            max_stack_bytes: 4 << 20,
+            min_run: Duration::from_millis(1),
+            cancel_grace: Duration::from_millis(2),
+            init_timeout: Duration::from_secs(5),
             max_fuel: None,
-            cancel_grace_fuel: 2_000_000,
-            init_fuel: 50_000_000,
-            max_call_depth: 100_000,
-            max_stack_bytes: 8 << 20,
+        }
+    }
+}
+
+impl Execution {
+    /// Whether this host can run a module compiled this way: compiles a module of one
+    /// function that returns 1, and calls it. What a broker asks before it promises
+    /// `jq` to a rules file, so the answer is a line in a log and not a failed rule.
+    pub fn probe(self) -> Result<(), LoadError> {
+        // (module (func (export "f") (result i32) (i32.const 1)))
+        const ONE: [u8; 31] = [
+            0, 0x61, 0x73, 0x6d, 1, 0, 0, 0, 1, 5, 1, 0x60, 0, 1, 0x7f, 3, 2, 1, 0, 7, 5, 1, 1,
+            0x66, 0, 0, 0x0a, 6, 1, 4, 0,
+        ];
+        let answer = || -> wasmtime::Result<i32> {
+            let mut wasm = ONE.to_vec();
+            wasm.extend_from_slice(&[0x41, 1, 0x0b]);
+            let engine = Engine::new(&config(self, &Limits::default())?)?;
+            let module = Module::new(&engine, &wasm)?;
+            let mut store = Store::new(&engine, ());
+            store.set_epoch_deadline(1);
+            let instance = on_fiber(wasmtime::Instance::new_async(&mut store, &module, &[]))?;
+            let one = instance.get_typed_func::<(), i32>(&mut store, "f")?;
+            on_fiber(one.call_async(&mut store, ()))
+        };
+        match answer() {
+            Ok(1) => Ok(()),
+            Ok(other) => Err(LoadError::Engine(format!(
+                "the probe returned {other}, not 1"
+            ))),
+            Err(e) => Err(LoadError::Engine(chain(&e))),
         }
     }
 }
@@ -58,6 +121,10 @@ impl Default for Limits {
 /// Why a module was not loaded.
 #[derive(Debug)]
 pub enum LoadError {
+    /// The compiler or its timer thread could not start on this host: no
+    /// executable memory (a `MemoryDenyWriteExecute`, `SELinux` `execmem` or seccomp
+    /// policy), or no thread.
+    Engine(String),
     /// Not a valid WebAssembly module (or one using a feature that is off).
     Invalid(String),
     /// It imports something the host does not provide.
@@ -78,6 +145,11 @@ pub enum LoadError {
 impl fmt::Display for LoadError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Engine(e) => write!(
+                f,
+                "the WebAssembly compiler cannot run on this host (it needs memory it may \
+                 map executable): {e}"
+            ),
             Self::Invalid(e) => write!(f, "not a usable WebAssembly module: {e}"),
             Self::Import { module, name } => {
                 write!(
@@ -115,7 +187,7 @@ pub enum CallError {
     Fuel,
     /// The instance asked for more memory than [`Limits::memory_bytes`].
     Memory,
-    /// The call chain or the value stack outgrew its limit.
+    /// The module's calls outgrew [`Limits::max_stack_bytes`].
     Stack,
     /// The result is larger than [`Limits::max_output_bytes`].
     OutputTooLarge,
@@ -162,18 +234,46 @@ pub enum Reply {
     Json(Vec<u8>),
 }
 
-/// The state the host keeps per instance, reachable from the imports.
+/// The host's reason for ending a call, carried through the runtime as the error of
+/// the import, limiter or deadline callback that raised it.
 #[derive(Debug)]
+pub(crate) enum Stop {
+    /// The deadline, and the grace after it.
+    Timeout,
+    /// The memory cap.
+    Memory,
+    /// `proc_exit`: the module's `exit` or `abort`.
+    Exit(i32),
+}
+
+impl fmt::Display for Stop {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Timeout => f.write_str("deadline"),
+            Self::Memory => f.write_str("memory limit"),
+            Self::Exit(code) => write!(f, "the module exited with status {code}"),
+        }
+    }
+}
+
+impl std::error::Error for Stop {}
+
+/// The state the host keeps per instance, reachable from the imports.
 pub(crate) struct Host {
     pub(crate) grants: Grants,
     pub(crate) discarded_output: u64,
     limiter: MemoryCap,
+    timer: Arc<Timer>,
+    /// When the running call is to be stopped. `None`: never.
+    deadline: Option<Instant>,
+    /// `mqttd_cancel`, when the module has it and has not been asked yet in this call.
+    cancel: Option<TypedFunc<(), ()>>,
+    cancel_grace: Duration,
 }
 
 /// Refuses linear memory beyond a cap, by a trap at the `memory.grow` that asks for
 /// it — rather than by handing the module's allocator a failure it may or may not
-/// survive. (wasmi's own `StoreLimits` can trap too, but then it also turns a
-/// `memory.grow` that merely has to wait for its fuel into that trap.)
+/// survive.
 #[derive(Debug)]
 struct MemoryCap {
     max_bytes: usize,
@@ -185,9 +285,9 @@ impl ResourceLimiter for MemoryCap {
         _current: usize,
         desired: usize,
         maximum: Option<usize>,
-    ) -> Result<bool, LimiterError> {
+    ) -> wasmtime::Result<bool> {
         if desired > self.max_bytes {
-            return Err(LimiterError::ResourceLimiterDeniedAllocation);
+            return Err(Stop::Memory.into());
         }
         Ok(maximum.is_none_or(|max| desired <= max))
     }
@@ -197,7 +297,7 @@ impl ResourceLimiter for MemoryCap {
         _current: usize,
         desired: usize,
         maximum: Option<usize>,
-    ) -> Result<bool, LimiterError> {
+    ) -> wasmtime::Result<bool> {
         Ok(desired <= 65_536 && maximum.is_none_or(|max| desired <= max))
     }
 
@@ -214,12 +314,13 @@ impl ResourceLimiter for MemoryCap {
     }
 }
 
-/// A validated, translated module: made once, shared by every instance of it.
+/// A validated, compiled module: made once, shared by every instance of it.
 #[derive(Clone)]
 pub struct Sandbox {
     engine: Engine,
     module: Module,
-    linker: Linker<Host>,
+    linker: Arc<Linker<Host>>,
+    timer: Arc<Timer>,
     limits: Limits,
     grants: Grants,
     description: Vec<u8>,
@@ -234,24 +335,73 @@ impl fmt::Debug for Sandbox {
     }
 }
 
+/// The runtime's configuration: one compiler, the WebAssembly features a C module
+/// built for `wasm32-wasi` uses, and nothing else switched on.
+fn config(execution: Execution, limits: &Limits) -> wasmtime::Result<Config> {
+    let mut config = Config::new();
+    if execution == Execution::Interpreted {
+        config.target(if cfg!(target_pointer_width = "32") {
+            "pulley32"
+        } else {
+            "pulley64"
+        })?;
+        // Bounds are checked by the interpreter; no fault handler is installed.
+        config.signals_based_traps(false);
+    }
+    config
+        .strategy(Strategy::Cranelift)
+        .cranelift_opt_level(OptLevel::Speed)
+        // The same bits for a NaN on every processor: a module's answers do not
+        // depend on the machine.
+        .cranelift_nan_canonicalization(true)
+        .epoch_interruption(true)
+        .consume_fuel(limits.max_fuel.is_some())
+        .max_wasm_stack(limits.max_stack_bytes)
+        .async_stack_size(limits.max_stack_bytes + HOST_STACK_HEADROOM)
+        // A trap is reported by its kind; nobody reads a module's stack trace.
+        .wasm_backtrace_max_frames(None)
+        .wasm_bulk_memory(true)
+        .wasm_multi_value(true)
+        .wasm_multi_memory(false)
+        .wasm_memory64(false)
+        .wasm_tail_call(false)
+        .wasm_custom_page_sizes(false)
+        .wasm_relaxed_simd(false)
+        .wasm_simd(false)
+        .wasm_wide_arithmetic(false)
+        .wasm_extended_const(false);
+    Ok(config)
+}
+
 impl Sandbox {
-    /// Validates `wasm`, checks its imports against the allowed list and its exports
-    /// against the ABI, and starts one instance to read its description.
+    /// [`load_as`](Self::load_as) with [`Execution::Compiled`].
     pub fn load(wasm: &[u8], limits: Limits, grants: Grants) -> Result<Self, LoadError> {
-        let mut config = Config::default();
-        config
-            .consume_fuel(true)
-            // Everything is translated here, once, when the module is loaded: a call
-            // never pays for translation, in time or in fuel, so the same call burns
-            // the same fuel every time.
-            .compilation_mode(CompilationMode::Eager)
-            .set_max_recursion_depth(limits.max_call_depth)
-            .set_max_stack_height(limits.max_stack_bytes)
-            .wasm_multi_memory(false)
-            .wasm_tail_call(false)
-            .wasm_custom_page_sizes(false);
-        let engine = Engine::new(&config);
-        let module = Module::new(&engine, wasm).map_err(|e| LoadError::Invalid(e.to_string()))?;
+        Self::load_as(wasm, Execution::Compiled, limits, grants)
+    }
+
+    /// Validates and compiles `wasm`, checks its imports against the allowed list and
+    /// its exports against the ABI, and starts one instance to read its description.
+    ///
+    /// This is where the module's code is generated: about half a second for the jq
+    /// module, once per process. Nothing is compiled later, in a call.
+    pub fn load_as(
+        wasm: &[u8],
+        execution: Execution,
+        limits: Limits,
+        grants: Grants,
+    ) -> Result<Self, LoadError> {
+        let engine = config(execution, &limits)
+            .and_then(|config| Engine::new(&config))
+            .map_err(|e| LoadError::Engine(chain(&e)))?;
+        let module = Module::new(&engine, wasm).map_err(|e| {
+            // A module that is not valid is the module's fault; anything else at this
+            // point is the host refusing the compiler its memory.
+            if Module::validate(&engine, wasm).is_err() {
+                LoadError::Invalid(chain(&e))
+            } else {
+                LoadError::Engine(chain(&e))
+            }
+        })?;
         for import in module.imports() {
             let known = import.module() == wasi::MODULE
                 && wasi::ALLOWED.contains(&import.name())
@@ -267,24 +417,28 @@ impl Sandbox {
             return Err(LoadError::Export("no exported memory".to_owned()));
         }
         let mut linker = Linker::new(&engine);
-        wasi::define(&mut linker).map_err(|e| LoadError::Invalid(e.to_string()))?;
+        wasi::define(&mut linker).map_err(|e| LoadError::Invalid(chain(&e)))?;
+        let ticked = engine.clone();
+        let timer = Timer::start(move || ticked.increment_epoch())
+            .map_err(|e| LoadError::Engine(format!("no timer thread: {e}")))?;
         let mut sandbox = Self {
             engine,
             module,
-            linker,
+            linker: Arc::new(linker),
+            timer: Arc::new(timer),
             limits,
             grants,
             description: Vec::new(),
         };
         let mut first = sandbox.instantiate()?;
-        let deadline = None;
+        let within = Some(Instant::now() + first.limits.init_timeout);
         let version = first
-            .run(first.abi_version, (), deadline)
+            .run(first.abi_version.clone(), (), within)
             .map_err(LoadError::Start)?;
         if version != ABI_VERSION {
             return Err(LoadError::AbiVersion(version));
         }
-        sandbox.description = first.describe().map_err(LoadError::Start)?;
+        sandbox.description = first.describe(within).map_err(LoadError::Start)?;
         Ok(sandbox)
     }
 
@@ -308,36 +462,53 @@ impl Sandbox {
             limiter: MemoryCap {
                 max_bytes: self.limits.memory_bytes,
             },
+            timer: Arc::clone(&self.timer),
+            deadline: None,
+            cancel: None,
+            cancel_grace: self.limits.cancel_grace,
         };
         let mut store = Store::new(&self.engine, host);
         store.limiter(|host| &mut host.limiter);
-        let start = |e: wasmi::Error| LoadError::Start(CallError::Trap(e.to_string()));
-        store.set_fuel(self.limits.init_fuel).map_err(start)?;
-        let instance = self
-            .linker
-            .instantiate_and_start(&mut store, &self.module)
-            .map_err(start)?;
-        let export = |e: wasmi::Error| LoadError::Export(e.to_string());
+        store.epoch_deadline_callback(at_epoch);
+        let within = Instant::now() + self.limits.init_timeout;
+        let start = |e: wasmtime::Error| LoadError::Start(classify(&e));
+        // Data segments and a start function, when the module has one.
+        let instance = {
+            let _armed = arm(&mut store, Some(within), None, &self.limits).map_err(start)?;
+            on_fiber(self.linker.instantiate_async(&mut store, &self.module))
+        }
+        .map_err(start)?;
+        let export = |e: wasmtime::Error| LoadError::Export(chain(&e));
         let memory = instance
-            .get_memory(&store, "memory")
+            .get_memory(&mut store, "memory")
             .ok_or_else(|| LoadError::Export("no exported memory".to_owned()))?;
+        let abi_version = instance
+            .get_typed_func(&mut store, "mqttd_abi_version")
+            .map_err(export)?;
+        let alloc = instance
+            .get_typed_func(&mut store, "mqttd_alloc")
+            .map_err(export)?;
+        let free = instance
+            .get_typed_func(&mut store, "mqttd_free")
+            .map_err(export)?;
+        let describe = instance
+            .get_typed_func(&mut store, "mqttd_describe")
+            .map_err(export)?;
+        let call = instance
+            .get_typed_func(&mut store, "mqttd_call")
+            .map_err(export)?;
+        let cancel = instance.get_typed_func(&mut store, "mqttd_cancel").ok();
+        // A reactor's constructors (libc start-up), when it has them.
+        let initialize = instance
+            .get_typed_func::<(), ()>(&mut store, "_initialize")
+            .ok();
         let mut made = Instance {
-            abi_version: instance
-                .get_typed_func(&store, "mqttd_abi_version")
-                .map_err(export)?,
-            alloc: instance
-                .get_typed_func(&store, "mqttd_alloc")
-                .map_err(export)?,
-            free: instance
-                .get_typed_func(&store, "mqttd_free")
-                .map_err(export)?,
-            describe: instance
-                .get_typed_func(&store, "mqttd_describe")
-                .map_err(export)?,
-            call: instance
-                .get_typed_func(&store, "mqttd_call")
-                .map_err(export)?,
-            cancel: instance.get_typed_func(&store, "mqttd_cancel").ok(),
+            abi_version,
+            alloc,
+            free,
+            describe,
+            call,
+            cancel,
             memory,
             module: instance,
             store,
@@ -345,20 +516,101 @@ impl Sandbox {
             poisoned: false,
             fuel_used: 0,
         };
-        // A reactor's constructors (libc start-up), when it has them.
-        if let Ok(init) = instance.get_typed_func::<(), ()>(&made.store, "_initialize") {
-            let budget = made.limits.init_fuel;
-            made.run_within(init, (), None, Some(budget))
+        if let Some(initialize) = initialize {
+            made.run(initialize, (), Some(within))
                 .map_err(LoadError::Start)?;
         }
         Ok(made)
     }
 }
 
+/// Runs a call into a module to its end. The runtime gives such a call a stack of
+/// its own (a fiber, with a guard page below it), so how deep a module may go never
+/// depends on how much stack the calling thread happens to have left. Nothing here
+/// ever suspends: the host's imports are all synchronous and the deadline callback
+/// never yields, so the first poll finishes the call.
+fn on_fiber<F: Future>(call: F) -> F::Output {
+    let mut call = pin!(call);
+    let mut context = Context::from_waker(Waker::noop());
+    loop {
+        if let Poll::Ready(output) = call.as_mut().poll(&mut context) {
+            return output;
+        }
+        std::thread::yield_now();
+    }
+}
+
+/// An error and what caused it, on one line.
+fn chain(error: &wasmtime::Error) -> String {
+    format!("{error:#}")
+}
+
+/// Names the limit behind a failed call, when a limit is behind it.
+fn classify(error: &wasmtime::Error) -> CallError {
+    match error.downcast_ref::<Stop>() {
+        Some(Stop::Timeout) => return CallError::Timeout,
+        Some(Stop::Memory) => return CallError::Memory,
+        Some(exit @ Stop::Exit(_)) => return CallError::Trap(exit.to_string()),
+        None => {}
+    }
+    match error.downcast_ref::<Trap>() {
+        Some(Trap::StackOverflow) => CallError::Stack,
+        Some(Trap::OutOfFuel) => CallError::Fuel,
+        Some(Trap::Interrupt) => CallError::Timeout,
+        _ => CallError::Trap(chain(error)),
+    }
+}
+
+/// The store's answer to a tick of the timer. A tick that is not this call's (another
+/// instance's deadline) is passed over. At this call's deadline a module that can be
+/// asked to stop is asked, once, and given the grace; after that the call is ended.
+fn at_epoch(mut store: wasmtime::StoreContextMut<'_, Host>) -> wasmtime::Result<UpdateDeadline> {
+    let host = store.data_mut();
+    let Some(deadline) = host.deadline else {
+        return Ok(UpdateDeadline::Continue(1));
+    };
+    let now = Instant::now();
+    if now < deadline {
+        return Ok(UpdateDeadline::Continue(1));
+    }
+    let Some(cancel) = host.cancel.take() else {
+        return Err(Stop::Timeout.into());
+    };
+    // The timer keeps ticking while this call is overdue: the first tick after the
+    // grace ends it.
+    host.deadline = Some(now + host.cancel_grace);
+    // `mqttd_cancel` is a call into the module like any other and would meet this
+    // same expired epoch at its first instruction: it gets its own, far away.
+    store.set_epoch_deadline(u64::MAX / 2);
+    cancel.call(&mut store, ()).map_err(|_| Stop::Timeout)?;
+    Ok(UpdateDeadline::Continue(1))
+}
+
+/// Sets a store up for one call: its deadline with the timer, its `mqttd_cancel`, its
+/// fuel. The returned guard takes the deadline off the timer again.
+fn arm(
+    store: &mut Store<Host>,
+    deadline: Option<Instant>,
+    cancel: Option<&TypedFunc<(), ()>>,
+    limits: &Limits,
+) -> wasmtime::Result<crate::timer::Armed> {
+    let deadline = deadline.map(|at| at.max(Instant::now() + limits.min_run));
+    // The epoch first, the timer second: a tick between the two is then seen.
+    store.set_epoch_deadline(1);
+    let host = store.data_mut();
+    host.deadline = deadline;
+    host.cancel = cancel.cloned();
+    let armed = host.timer.arm(deadline);
+    if let Some(fuel) = limits.max_fuel {
+        store.set_fuel(fuel)?;
+    }
+    Ok(armed)
+}
+
 /// One instance of a module: one linear memory, used by one caller at a time.
 pub struct Instance {
     store: Store<Host>,
-    module: wasmi::Instance,
+    module: wasmtime::Instance,
     memory: Memory,
     abi_version: TypedFunc<(), u32>,
     alloc: TypedFunc<u32, u32>,
@@ -394,7 +646,8 @@ impl Instance {
         self.poisoned
     }
 
-    /// Fuel burnt by every call on this instance so far.
+    /// Fuel burnt by every call on this instance so far. Zero unless the module was
+    /// loaded with [`Limits::max_fuel`].
     #[must_use]
     pub fn fuel_used(&self) -> u64 {
         self.fuel_used
@@ -408,120 +661,73 @@ impl Instance {
 
     /// Calls an exported function that is not part of the ABI and takes no
     /// arguments (a module's own measurement hooks).
-    pub fn call_extra<R: WasmResults>(&mut self, name: &str) -> Result<R, CallError> {
+    pub fn call_extra<R: WasmResults + Sync>(&mut self, name: &str) -> Result<R, CallError> {
         let func = self
             .module
-            .get_typed_func::<(), R>(&self.store, name)
-            .map_err(|e| CallError::Trap(e.to_string()))?;
-        self.run(func, (), None)
+            .get_typed_func::<(), R>(&mut self.store, name)
+            .map_err(|e| CallError::Trap(chain(&e)))?;
+        let within = Some(Instant::now() + self.limits.init_timeout);
+        self.run(func, (), within)
     }
 
-    /// Runs `func` in fuel slices until it returns, traps, or the deadline passes.
-    fn run<P: WasmParams, R: WasmResults>(
+    /// Runs `func` until it returns, traps, or is stopped at the deadline. Anything
+    /// but a return poisons the instance.
+    // `func` is a handle cloned out of a field of `self`, which `&mut self` cannot
+    // lend at the same time.
+    #[allow(clippy::needless_pass_by_value)]
+    fn run<P: WasmParams + Sync, R: WasmResults + Sync>(
         &mut self,
         func: TypedFunc<P, R>,
         params: P,
         deadline: Option<Instant>,
-    ) -> Result<R, CallError> {
-        let max_fuel = self.limits.max_fuel;
-        self.run_within(func, params, deadline, max_fuel)
-    }
-
-    fn run_within<P: WasmParams, R: WasmResults>(
-        &mut self,
-        func: TypedFunc<P, R>,
-        params: P,
-        deadline: Option<Instant>,
-        max_fuel: Option<u64>,
     ) -> Result<R, CallError> {
         if self.poisoned {
             return Err(CallError::Poisoned);
         }
-        let result = self.slices(func, params, deadline, max_fuel);
+        let result = self.run_armed(&func, params, deadline);
         if result.is_err() {
             self.poisoned = true;
         }
         result
     }
 
-    fn slices<P: WasmParams, R: WasmResults>(
+    fn run_armed<P: WasmParams + Sync, R: WasmResults + Sync>(
         &mut self,
-        func: TypedFunc<P, R>,
+        func: &TypedFunc<P, R>,
         params: P,
         deadline: Option<Instant>,
-        max_fuel: Option<u64>,
     ) -> Result<R, CallError> {
-        let slice = self.limits.fuel_slice.max(1);
-        let mut granted = slice;
-        let mut burnt = 0u64;
-        // Once the module has been asked to stop: the fuel it has left to do so.
-        let mut grace: Option<u64> = None;
-        self.set_fuel(granted)?;
-        let mut state = func.call_resumable(&mut self.store, params);
-        loop {
-            match state {
-                Ok(TypedResumableCall::Finished(results)) => {
-                    let left = self.store.get_fuel().unwrap_or(0);
-                    self.fuel_used += granted.saturating_sub(left);
-                    return Ok(results);
-                }
-                Ok(TypedResumableCall::OutOfFuel(paused)) => {
-                    burnt += granted;
-                    self.fuel_used += granted;
-                    if max_fuel.is_some_and(|max| burnt >= max) {
-                        return Err(CallError::Fuel);
-                    }
-                    if let Some(left) = grace {
-                        if left == 0 {
-                            return Err(CallError::Timeout);
-                        }
-                        grace = Some(left.saturating_sub(granted));
-                    } else if deadline.is_some_and(|d| Instant::now() >= d) {
-                        // The paused call keeps its own stack; this one runs beside it.
-                        let Some(cancel) = self.cancel else {
-                            return Err(CallError::Timeout);
-                        };
-                        self.set_fuel(slice)?;
-                        cancel
-                            .call(&mut self.store, ())
-                            .map_err(|e| Self::classify(&e))?;
-                        grace = Some(self.limits.cancel_grace_fuel);
-                    }
-                    granted = slice.max(paused.required_fuel());
-                    self.set_fuel(granted)?;
-                    state = paused.resume(&mut self.store);
-                }
-                Ok(TypedResumableCall::HostTrap(trap)) => {
-                    return Err(CallError::Trap(trap.host_error().to_string()));
-                }
-                Err(error) => return Err(Self::classify(&error)),
-            }
+        let armed = arm(
+            &mut self.store,
+            deadline,
+            self.cancel.as_ref(),
+            &self.limits,
+        )
+        .map_err(|e| CallError::Trap(chain(&e)))?;
+        let result = on_fiber(func.call_async(&mut self.store, params));
+        drop(armed);
+        if let Some(granted) = self.limits.max_fuel {
+            let left = self.store.get_fuel().unwrap_or(0);
+            self.fuel_used = self.fuel_used.saturating_add(granted.saturating_sub(left));
         }
-    }
-
-    fn set_fuel(&mut self, fuel: u64) -> Result<(), CallError> {
-        self.store
-            .set_fuel(fuel)
-            .map_err(|e| CallError::Trap(e.to_string()))
-    }
-
-    /// Names the limit behind a trap, when a limit is behind it.
-    fn classify(error: &wasmi::Error) -> CallError {
-        match error.as_trap_code() {
-            Some(TrapCode::GrowthOperationLimited) => CallError::Memory,
-            Some(TrapCode::StackOverflow) => CallError::Stack,
-            Some(TrapCode::OutOfFuel) => CallError::Fuel,
-            _ => CallError::Trap(error.to_string()),
-        }
+        result.map_err(|e| classify(&e))
     }
 
     fn read(&self, at: u32, len: u32) -> Result<Vec<u8>, CallError> {
+        let outside =
+            || CallError::Trap("the module returned an address outside its memory".into());
+        // Looked at before anything is allocated: a length the memory cannot hold is
+        // refused without a buffer of that length being made for it.
+        let end = (at as usize)
+            .checked_add(len as usize)
+            .ok_or_else(outside)?;
+        if end > self.memory.data_size(&self.store) {
+            return Err(outside());
+        }
         let mut bytes = vec![0u8; len as usize];
         self.memory
             .read(&self.store, at as usize, &mut bytes)
-            .map_err(|_| {
-                CallError::Trap("the module returned an address outside its memory".into())
-            })?;
+            .map_err(|_| outside())?;
         Ok(bytes)
     }
 
@@ -546,50 +752,29 @@ impl Instance {
             self.read(at, len)?
         };
         if at != 0 {
-            self.run(self.free, at, deadline)?;
+            self.run(self.free.clone(), at, deadline)?;
         }
         Ok(bytes)
     }
 
-    fn describe(&mut self) -> Result<Vec<u8>, CallError> {
-        let ret = self.run(self.alloc, 8, None)?;
-        self.run(self.describe, ret, None)?;
-        let text = self.take_result(ret, None)?;
-        self.run(self.free, ret, None)?;
+    fn describe(&mut self, deadline: Option<Instant>) -> Result<Vec<u8>, CallError> {
+        let ret = self.run(self.alloc.clone(), 8, deadline)?;
+        self.run(self.describe.clone(), ret, deadline)?;
+        let text = self.take_result(ret, deadline)?;
+        self.run(self.free.clone(), ret, deadline)?;
         Ok(text)
     }
 
-    /// Calls the function `name` with `args`. A call that ends in anything but a
-    /// result or [`CallError::Module`] leaves the instance poisoned.
+    /// Calls the function `name` with `args`. `deadline` is when the call is stopped
+    /// (`None`: never, EMQX's `infinity`). A call that ends in anything but a result
+    /// or [`CallError::Module`] leaves the instance poisoned.
     pub fn call(
         &mut self,
         name: &str,
         args: &[Arg<'_>],
         deadline: Option<Instant>,
     ) -> Result<Reply, CallError> {
-        let max_fuel = self.limits.max_fuel;
-        self.call_bounded(name, args, deadline, max_fuel)
-    }
-
-    /// [`call`](Self::call) with no deadline and `max_fuel` as the bound: the same
-    /// work stops at the same point on any machine.
-    pub fn call_with_fuel(
-        &mut self,
-        name: &str,
-        args: &[Arg<'_>],
-        max_fuel: u64,
-    ) -> Result<Reply, CallError> {
-        self.call_bounded(name, args, None, Some(max_fuel))
-    }
-
-    fn call_bounded(
-        &mut self,
-        name: &str,
-        args: &[Arg<'_>],
-        deadline: Option<Instant>,
-        max_fuel: Option<u64>,
-    ) -> Result<Reply, CallError> {
-        let result = self.call_inner(name, args, deadline, max_fuel);
+        let result = self.call_inner(name, args, deadline);
         // Whatever went wrong outside the function's own refusal, the instance's
         // memory is not to be relied on any more.
         if !matches!(result, Ok(_) | Err(CallError::Module { .. })) {
@@ -603,8 +788,10 @@ impl Instance {
         name: &str,
         args: &[Arg<'_>],
         deadline: Option<Instant>,
-        max_fuel: Option<u64>,
     ) -> Result<Reply, CallError> {
+        if self.poisoned {
+            return Err(CallError::Poisoned);
+        }
         let too_large = |_| CallError::Trap("the arguments do not fit a module's memory".into());
         // One buffer in the module: the result pair, the name, the argument frame.
         let mut buffer = vec![0u8; 8];
@@ -627,15 +814,15 @@ impl Instance {
         let frame_len = total - 8 - name_len;
         debug_assert_eq!(frame_at, 8 + name.len());
 
-        let base = self.run(self.alloc, total, deadline)?;
+        let base = self.run(self.alloc.clone(), total, deadline)?;
         if base == 0 {
             return Err(CallError::Memory);
         }
         self.write(base, &buffer)?;
         // An address near the top of memory wraps; the module then faults on it.
         let name_at = base.wrapping_add(8);
-        let status = self.run_within(
-            self.call,
+        let status = self.run(
+            self.call.clone(),
             (
                 name_at,
                 name_len,
@@ -645,10 +832,9 @@ impl Instance {
                 base,
             ),
             deadline,
-            max_fuel,
         )?;
         let bytes = self.take_result(base, deadline)?;
-        self.run(self.free, base, deadline)?;
+        self.run(self.free.clone(), base, deadline)?;
         if status != 0 {
             return Err(CallError::Module {
                 status,

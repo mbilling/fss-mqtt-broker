@@ -5,8 +5,9 @@
 #   crates/mqtt-wasm-sandbox/jq-module/build.sh [OUT.wasm]
 #
 # Needs: zig 0.16.0 (its clang and its bundled wasi-libc are the whole toolchain),
-# curl, tar, shasum/sha256sum. Sources are fetched as tarballs of pinned commits and
-# checked against the hashes below. The build is byte-reproducible: same zig version,
+# curl, tar, shasum/sha256sum. `fetch-zig.sh` fetches that zig checked against its
+# archive's sha256 (`ZIG=…` names the binary to use); CI builds with it. Sources are
+# fetched as tarballs of pinned commits and checked against the hashes below. The build is byte-reproducible: same zig version,
 # same sources, same flags give the same file on any host (measured: macOS arm64, and
 # Linux arm64 and amd64 in a container; see the ADR). The last line printed is the
 # file's sha256; `jq-module/jq.wasm.sha256` records the one this revision must give.

@@ -7,9 +7,9 @@
 //! clock, and a list of environment entries. A module importing anything outside
 //! [`ALLOWED`] does not load.
 
-use wasmi::{Caller, Error, Extern, Linker, Memory};
+use wasmtime::{Caller, Extern, Linker, Memory};
 
-use crate::sandbox::Host;
+use crate::sandbox::{Host, Stop};
 
 /// The import module every allowed function lives in.
 pub(crate) const MODULE: &str = "wasi_snapshot_preview1";
@@ -51,7 +51,7 @@ const EINVAL: i32 = 28;
 const ENOENT: i32 = 44;
 const ESPIPE: i32 = 70;
 
-fn memory(caller: &Caller<'_, Host>) -> Option<Memory> {
+fn memory(caller: &mut Caller<'_, Host>) -> Option<Memory> {
     caller.get_export("memory").and_then(Extern::into_memory)
 }
 
@@ -66,9 +66,9 @@ fn put(caller: &mut Caller<'_, Host>, at: i32, bytes: &[u8]) -> i32 {
     }
 }
 
-fn get_u32(caller: &Caller<'_, Host>, at: u32) -> Option<u32> {
+fn get_u32(caller: &mut Caller<'_, Host>, at: u32) -> Option<u32> {
     let mut b = [0u8; 4];
-    memory(caller)?.read(caller, at as usize, &mut b).ok()?;
+    memory(caller)?.read(&*caller, at as usize, &mut b).ok()?;
     Some(u32::from_le_bytes(b))
 }
 
@@ -78,7 +78,7 @@ fn std_stream(fd: i32) -> bool {
 
 /// Defines every function of [`ALLOWED`] on `linker`.
 #[allow(clippy::too_many_lines)] // one short closure per import
-pub(crate) fn define(linker: &mut Linker<Host>) -> Result<(), Error> {
+pub(crate) fn define(linker: &mut Linker<Host>) -> wasmtime::Result<()> {
     linker.func_wrap(
         MODULE,
         "clock_time_get",
@@ -201,7 +201,7 @@ pub(crate) fn define(linker: &mut Linker<Host>) -> Result<(), Error> {
             let mut total = 0u32;
             let mut at = iovs.cast_unsigned();
             for _ in 0..n.cast_unsigned().min(1024) {
-                let Some(len) = get_u32(&caller, at.wrapping_add(4)) else {
+                let Some(len) = get_u32(&mut caller, at.wrapping_add(4)) else {
                     return EFAULT;
                 };
                 total = total.saturating_add(len);
@@ -237,8 +237,8 @@ pub(crate) fn define(linker: &mut Linker<Host>) -> Result<(), Error> {
         |_fd: i32, _path: i32, _len: i32, _buf: i32, _buf_len: i32, _used: i32| -> i32 { ENOENT },
     )?;
     // `exit` and `abort` end the call and the instance, never the broker.
-    linker.func_wrap(MODULE, "proc_exit", |code: i32| -> Result<(), Error> {
-        Err(Error::i32_exit(code))
+    linker.func_wrap(MODULE, "proc_exit", |code: i32| -> wasmtime::Result<()> {
+        Err(Stop::Exit(code).into())
     })?;
     Ok(())
 }

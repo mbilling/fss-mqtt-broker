@@ -678,7 +678,7 @@ endpoint, roles, errors).
 | `mqtt-observability` | Prometheus/OTLP metrics, hash-chained audit |
 | `mqtt-config` | typed config, secure defaults |
 | `mqtt-rules` | rule engine: EMQX-compatible rule SQL, republish/console actions |
-| `mqtt-wasm-sandbox` | spike (ADR 0086, Proposed): rule functions as WebAssembly modules in an interpreter; not linked into the broker |
+| `mqtt-wasm-sandbox` | ADR 0086 (Proposed): rule functions as WebAssembly modules in a sandbox (wasmtime), the real jq first; not linked into the broker |
 | `mqtt-bridge` | zone-crossing bridge: spool, QoS 1 replay |
 | `mqttd` | the broker binary: hub, connections, peer mesh |
 | `mqttd-operator` | Kubernetes operator for `MqttdCluster` |

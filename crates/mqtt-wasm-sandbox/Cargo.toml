@@ -1,20 +1,25 @@
 [package]
 name = "mqtt-wasm-sandbox"
-description = "Spike (ADR 0086, Proposed): rule functions run as WebAssembly modules in an interpreter — the real jq first"
+description = "ADR 0086 (Proposed): rule functions run as WebAssembly modules in a sandbox — the real jq first"
 version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
+# wasmtime 49 needs 1.96; the workspace as a whole still declares 1.88 (ADR 0086).
+rust-version = "1.96"
 license.workspace = true
 publish = false
 
 [dependencies]
-# The interpreter (MIT OR Apache-2.0, pure Rust, MSRV 1.86). Not the defaults: no `wat`
-# (text-format parsing; its crates are Apache-2.0 WITH LLVM-exception only) and no
-# memory64. `validate` is what makes `Module::new` check a module before running it.
-wasmi = { version = "2.0.0", default-features = false, features = ["std", "validate", "stable", "auto-dispatch"] }
-# Named only for `LimiterError`, the error type of wasmi's `ResourceLimiter` trait,
-# which `wasmi` does not re-export. The same crate `wasmi` itself builds on.
-wasmi_core = { version = "2.0.0", default-features = false, features = ["std"] }
+# The runtime (Apache-2.0 WITH LLVM-exception, MSRV 1.96): Cranelift compiles a module
+# to machine code when it is loaded. Not the defaults, only:
+#   runtime, cranelift, std  the runtime and its compiler;
+#   async                    a call runs on a stack of its own (a fiber), so a module's
+#                            recursion can never reach the end of the caller's stack;
+#   pulley                   the runtime's interpreter, for hosts that forbid
+#                            executable memory (`Execution::Interpreted`).
+# No component model, no WASI, no garbage collector, no threads, no on-disk code cache,
+# no profiling or debugger hooks, no text format, no parallel compilation (rayon), no
+# backtraces.
+wasmtime = { version = "49.0.2", default-features = false, features = ["runtime", "cranelift", "async", "pulley", "std"] }
 
 [dev-dependencies]
 # The rule engine's exact JSON writer and reader: the jq tests marshal as a rule would.

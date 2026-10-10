@@ -1,14 +1,18 @@
-//! The spike's measurements (ADR 0086): what loading, instantiating, compiling and
-//! running cost, and how the limits behave. Build with `--release`.
+//! The measurements of ADR 0086: what loading, instantiating, compiling and running
+//! cost, what a warm instance holds, and how the limits behave. Build with `--release`.
 //!
 //! ```text
 //! cargo run --release -p mqtt-wasm-sandbox --example measure -- jq.wasm payload-1k.json payload-100k.json
 //! ```
+//!
+//! `MEASURE_EXECUTION=interpreted` measures the interpreter instead of machine code,
+//! `MEASURE_FUEL=1` compiles with fuel accounting, `MEASURE_LOADS=n` loads the module
+//! `n` times (5).
 
 use std::time::{Duration, Instant};
 
 use mqtt_wasm_sandbox::jq::{Jq, Tag};
-use mqtt_wasm_sandbox::{Arg, Grants, Limits, Sandbox};
+use mqtt_wasm_sandbox::{Arg, Execution, Grants, Limits, Sandbox};
 
 const FILTERS: [&str; 6] = [
     ".",
@@ -28,6 +32,24 @@ fn micros(d: Duration) -> f64 {
     d.as_secs_f64() * 1e6
 }
 
+/// The resident memory of this process in KiB, as the operating system counts it.
+fn resident_kib() -> u64 {
+    if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
+        return status
+            .lines()
+            .find_map(|line| line.strip_prefix("VmRSS:"))
+            .and_then(|rest| rest.split_whitespace().next()?.parse().ok())
+            .unwrap_or(0);
+    }
+    std::process::Command::new("ps")
+        .args(["-o", "rss=", "-p", &std::process::id().to_string()])
+        .output()
+        .ok()
+        .and_then(|out| String::from_utf8(out.stdout).ok()?.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+#[allow(clippy::too_many_lines)] // one measurement after another
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let [wasm, payloads @ ..] = args.as_slice() else {
@@ -39,22 +61,56 @@ fn main() {
         clock: true,
         environment: Vec::new(),
     };
+    let execution = match std::env::var("MEASURE_EXECUTION").as_deref() {
+        Ok("interpreted") => Execution::Interpreted,
+        _ => Execution::Compiled,
+    };
+    let bounds = Limits {
+        max_fuel: std::env::var_os("MEASURE_FUEL").map(|_| u64::MAX / 2),
+        ..Limits::default()
+    };
+    let count = std::env::var("MEASURE_LOADS")
+        .ok()
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(5);
 
-    // Loading: validation and translation of the whole module, once per process.
-    let loads: Vec<Duration> = (0..5)
-        .map(|_| {
-            let at = Instant::now();
-            Sandbox::load(&wasm, Limits::default(), grants.clone()).expect("the module loads");
-            at.elapsed()
-        })
-        .collect();
+    // Loading: validation and compilation of the whole module, once per process. The
+    // first load is the one a broker pays; the others give a median.
+    let before = resident_kib();
+    let at = Instant::now();
+    let sandbox = Sandbox::load_as(&wasm, execution, bounds.clone(), grants.clone())
+        .expect("the module loads");
+    let first = at.elapsed();
+    let loaded = resident_kib();
+    let mut loads = vec![first];
+    for _ in 1..count {
+        let at = Instant::now();
+        Sandbox::load_as(&wasm, execution, bounds.clone(), grants.clone())
+            .expect("the module loads");
+        loads.push(at.elapsed());
+    }
     println!(
-        "module\t{} bytes\tload_ms={:.1}",
+        "module\t{} bytes\t{execution:?}\tload_ms={:.1}\tfirst_load_ms={:.1}",
         wasm.len(),
-        micros(median(loads)) / 1e3
+        micros(median(loads)) / 1e3,
+        micros(first) / 1e3,
     );
-
-    let sandbox = Sandbox::load(&wasm, Limits::default(), grants).expect("the module loads");
+    let settled = resident_kib();
+    // What warm instances hold, as the operating system sees it: each has run one
+    // call on a 1 KB payload.
+    let mut instances: Vec<Jq> = Vec::new();
+    for _ in 0..16 {
+        let mut jq = Jq::from_sandbox(sandbox.clone());
+        jq.eval(b".a", Arg::Binary(br#"{"a":[1,2,3]}"#), None)
+            .expect("it runs");
+        instances.push(jq);
+    }
+    println!(
+        "resident\tbefore_load_kib={before}\tafter_first_load_kib={loaded}\t\
+         per_warm_instance_kib={}",
+        (resident_kib().saturating_sub(settled)) / 16
+    );
+    drop(instances);
     println!(
         "describe\t{}",
         String::from_utf8_lossy(sandbox.description())
@@ -160,11 +216,14 @@ fn limits(sandbox: &Sandbox) {
     for (program, ms) in [
         ("def f: f; f", 100),
         ("repeat(.)", 100),
-        ("[repeat(.)]", 200),
+        ("[repeat(.)]", 50),
         ("last(range(1e12))", 150),
         ("def f: f; f", 10),
         ("def f: f; f", 1),
         ("\"a\" * 40 | test(\"(a*)*b\")", 100),
+        // One regex match over eight megabytes: a single C call, which cannot be asked
+        // to stop and is cut off after the grace.
+        ("\"a\" * 8000000 | test(\"a+b\")", 30),
     ] {
         let made = jq.instances;
         let at = Instant::now();
@@ -203,7 +262,7 @@ fn limits(sandbox: &Sandbox) {
         let outcome = jq.eval(
             program.as_bytes(),
             Arg::Binary(b"1"),
-            Some(Duration::from_secs(60)),
+            Some(Duration::from_mins(1)),
         );
         let took = at.elapsed();
         let stopped = matches!(&outcome, Err(e) if e.tag == Tag::Limit);

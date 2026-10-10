@@ -4,7 +4,8 @@
 
 use std::time::{Duration, Instant};
 
-use crate::{Arg, CallError, Grants, Limits, LoadError, Reply, Sandbox, ABI_VERSION};
+use crate::jq::{Pool, Tag};
+use crate::{Arg, CallError, Execution, Grants, Limits, LoadError, Reply, Sandbox, ABI_VERSION};
 
 fn uleb(mut n: u32, out: &mut Vec<u8>) {
     loop {
@@ -217,7 +218,8 @@ fn a_call_returns_the_modules_value() {
     let reply = instance.call("true", &[Arg::Json("1"), Arg::Binary(b"\xff\0")], soon());
     assert_eq!(reply, Ok(Reply::Json(b"true".to_vec())));
     assert!(!instance.is_poisoned());
-    assert!(instance.fuel_used() > 0);
+    // No fuel is counted unless a fuel bound was asked for.
+    assert_eq!(instance.fuel_used(), 0);
 }
 
 #[test]
@@ -310,18 +312,33 @@ fn memory_growth_stops_at_the_cap() {
 
 #[test]
 fn endless_recursion_overflows_the_modules_stack_and_not_the_hosts() {
-    // The call runs on a thread with a small stack: the module's calls are frames on
-    // the interpreter's own heap-allocated stack, a hundred thousand deep here, and
-    // not one of them is a frame on this one.
-    let mut instance = sandbox(Limits::default()).instantiate().unwrap();
-    assert_eq!(Limits::default().max_call_depth, 100_000);
-    let outcome = std::thread::Builder::new()
-        .stack_size(256 * 1024)
-        .spawn(move || instance.call("recurse", &[], soon()))
-        .unwrap()
-        .join()
-        .expect("the host thread survives");
-    assert_eq!(outcome, Err(CallError::Stack));
+    // A call runs on a stack of its own, as large as the limit: the thread calling
+    // here has a quarter of a mebibyte, and the module recurses through four
+    // mebibytes before it is stopped. Not one of its frames is on this thread's stack.
+    for execution in [Execution::Compiled, Execution::Interpreted] {
+        let limits = Limits::default();
+        assert_eq!(limits.max_stack_bytes, 4 << 20);
+        let sandbox =
+            Sandbox::load_as(&module(PLAIN), execution, limits, Grants::default()).unwrap();
+        let outcome = std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(move || {
+                let mut instance = sandbox.instantiate().unwrap();
+                let outcome = instance.call("recurse", &[], soon());
+                assert!(instance.is_poisoned());
+                // The module is whole: the next instance answers, on the same thread.
+                let mut next = sandbox.instantiate().unwrap();
+                assert_eq!(
+                    next.call("t", &[], soon()),
+                    Ok(Reply::Json(b"true".to_vec()))
+                );
+                outcome
+            })
+            .unwrap()
+            .join()
+            .expect("the host thread survives");
+        assert_eq!(outcome, Err(CallError::Stack), "{execution:?}");
+    }
 }
 
 #[test]
@@ -423,4 +440,223 @@ fn bytes_that_are_not_a_module_are_refused_at_load() {
         let error = Sandbox::load(bytes, Limits::default(), Grants::default());
         assert!(matches!(error, Err(LoadError::Invalid(_))), "{error:?}");
     }
+}
+
+#[test]
+fn a_call_runs_the_same_interpreted() {
+    let sandbox = Sandbox::load_as(
+        &module(PLAIN),
+        Execution::Interpreted,
+        Limits::default(),
+        Grants::default(),
+    )
+    .unwrap();
+    let mut instance = sandbox.instantiate().unwrap();
+    assert_eq!(
+        instance.call("t", &[Arg::Json("1")], soon()),
+        Ok(Reply::Json(b"true".to_vec()))
+    );
+    assert_eq!(
+        instance.call("error", &[], soon()),
+        Err(CallError::Module {
+            status: 7,
+            message: b"nope".to_vec()
+        })
+    );
+    let started = Instant::now();
+    let stopped = instance.call("loop", &[], Some(started + Duration::from_millis(30)));
+    assert_eq!(stopped, Err(CallError::Timeout));
+    assert!(started.elapsed() >= Duration::from_millis(30));
+    let mut grower = sandbox.instantiate().unwrap();
+    assert_eq!(grower.call("grow", &[], soon()), Err(CallError::Memory));
+}
+
+#[test]
+fn this_host_runs_both_kinds_of_code() {
+    // The test hosts allow executable memory. One that does not gets
+    // `LoadError::Engine` here for the first, which `examples/probe.rs` checks under
+    // systemd's MemoryDenyWriteExecute in CI.
+    Execution::Compiled.probe().expect("compiled code runs");
+    Execution::Interpreted
+        .probe()
+        .expect("the interpreter runs");
+}
+
+#[test]
+fn every_call_stops_at_its_own_deadline_and_a_call_without_one_is_left_alone() {
+    let sandbox = sandbox(Limits::default());
+    std::thread::scope(|scope| {
+        let quiet = scope.spawn(|| {
+            // No deadline: the other calls' ticks pass this one by, and it runs on.
+            // (A new instance now and then: the test module's allocator never frees.)
+            let until = Instant::now() + Duration::from_millis(200);
+            let mut calls = 0u32;
+            while Instant::now() < until {
+                let mut instance = sandbox.instantiate().unwrap();
+                for _ in 0..500 {
+                    assert_eq!(
+                        instance.call("t", &[], None),
+                        Ok(Reply::Json(b"true".to_vec()))
+                    );
+                    calls += 1;
+                }
+            }
+            calls
+        });
+        let loops: Vec<_> = [20u64, 60, 100, 140, 180]
+            .into_iter()
+            .map(|ms| {
+                let sandbox = &sandbox;
+                scope.spawn(move || {
+                    let mut instance = sandbox.instantiate().unwrap();
+                    let started = Instant::now();
+                    let timeout = Duration::from_millis(ms);
+                    let outcome = instance.call("loop", &[], Some(started + timeout));
+                    (outcome, started.elapsed(), timeout)
+                })
+            })
+            .collect();
+        for looping in loops {
+            let (outcome, took, timeout) = looping.join().unwrap();
+            assert_eq!(outcome, Err(CallError::Timeout));
+            assert!(took >= timeout, "{timeout:?} stopped early, after {took:?}");
+            assert!(
+                took < timeout + Duration::from_secs(5),
+                "{timeout:?} stopped late, after {took:?}"
+            );
+        }
+        assert!(quiet.join().unwrap() > 0);
+    });
+}
+
+/// A small generator of the same numbers every run.
+struct Numbers(u64);
+
+impl Numbers {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+
+    fn below(&mut self, n: usize) -> usize {
+        usize::try_from(self.next() % u64::try_from(n).unwrap()).unwrap()
+    }
+}
+
+/// Whatever bytes are handed to the loader, it answers: a module or a reason. And a
+/// module it accepts can be instantiated and called under the limits, whatever its
+/// code now does, without the host panicking or hanging.
+#[test]
+fn damaged_modules_are_refused_or_run_under_the_limits() {
+    let whole = module(PLAIN);
+    let limits = Limits {
+        memory_bytes: 1 << 20,
+        max_stack_bytes: 256 * 1024,
+        init_timeout: Duration::from_millis(200),
+        ..Limits::default()
+    };
+    let mut numbers = Numbers(0x9e37_79b9_7f4a_7c15);
+    let mut damaged: Vec<Vec<u8>> = (0..whole.len()).map(|cut| whole[..cut].to_vec()).collect();
+    for _ in 0..600 {
+        let mut bytes = whole.clone();
+        for _ in 0..=numbers.below(3) {
+            let at = numbers.below(bytes.len());
+            match numbers.below(4) {
+                0 => bytes[at] ^= 1 << numbers.below(8),
+                1 => bytes[at] = u8::try_from(numbers.below(256)).unwrap(),
+                2 => {
+                    bytes.remove(at);
+                }
+                _ => bytes.insert(at, u8::try_from(numbers.below(256)).unwrap()),
+            }
+        }
+        damaged.push(bytes);
+    }
+    for _ in 0..50 {
+        let len = numbers.below(200);
+        let mut bytes = b"\0asm\x01\0\0\0".to_vec();
+        bytes.extend((0..len).map(|_| u8::try_from(numbers.below(256)).unwrap()));
+        damaged.push(bytes);
+    }
+    let (mut loaded, mut refused) = (0u32, 0u32);
+    for bytes in &damaged {
+        match Sandbox::load(bytes, limits.clone(), Grants::default()) {
+            Err(_) => refused += 1,
+            Ok(sandbox) => {
+                loaded += 1;
+                let Ok(mut instance) = sandbox.instantiate() else {
+                    continue;
+                };
+                for name in ["t", "error", "n", "big", "x", "grow", "recurse", "loop"] {
+                    let deadline = Some(Instant::now() + Duration::from_millis(5));
+                    let outcome = instance.call(name, &[Arg::Json("1")], deadline);
+                    // A failure that is not the function's own ends the instance.
+                    let own = matches!(outcome, Ok(_) | Err(CallError::Module { .. }));
+                    assert_eq!(instance.is_poisoned(), !own, "{name}: {outcome:?}");
+                    if !own {
+                        break;
+                    }
+                }
+                assert!(instance.memory_bytes() <= 1 << 20);
+            }
+        }
+    }
+    // Every truncation is refused; among the edits both outcomes occur.
+    assert!(refused as usize >= whole.len(), "{refused} refused");
+    assert!(loaded >= 5, "{loaded} loaded");
+}
+
+/// The module `jq::Pool` is given here is the hand-written one: its one function
+/// answers `true` to any name, `jq` included, which is all the pool needs.
+#[test]
+fn a_pool_compiles_on_first_use_and_shares_warm_instances() {
+    let pool = Pool::new(
+        module(PLAIN),
+        Execution::Compiled,
+        Limits::default(),
+        Grants::default(),
+        2,
+    );
+    assert!(!pool.is_loaded());
+    assert_eq!(pool.idle(), 0);
+    assert_eq!(pool.eval(b".", Arg::Json("1"), None), Ok(b"true".to_vec()));
+    assert!(pool.is_loaded());
+    assert_eq!(pool.idle(), 1);
+    // Eight callers at once: each gets an instance, and two are kept afterwards.
+    std::thread::scope(|scope| {
+        for _ in 0..8 {
+            scope.spawn(|| {
+                for _ in 0..50 {
+                    assert_eq!(pool.eval(b".", Arg::Json("1"), None), Ok(b"true".to_vec()));
+                }
+            });
+        }
+    });
+    assert!((1..=2).contains(&pool.idle()), "{} idle", pool.idle());
+    assert!(pool.load().is_ok());
+}
+
+#[test]
+fn a_pool_whose_module_cannot_load_says_why_on_every_call() {
+    let pool = Pool::new(
+        b"not a module".to_vec(),
+        Execution::Compiled,
+        Limits::default(),
+        Grants::default(),
+        2,
+    );
+    for _ in 0..2 {
+        let error = pool.eval(b".", Arg::Json("1"), None).unwrap_err();
+        assert_eq!(error.tag, Tag::System);
+        let text = error.to_string();
+        assert!(
+            text.starts_with("jq_err_system: jq is not available: not a usable WebAssembly module"),
+            "{text}"
+        );
+    }
+    assert!(!pool.is_loaded());
+    assert!(pool.load().is_err());
+    assert_eq!(pool.idle(), 0);
 }

@@ -10,20 +10,25 @@
 //! * an error fails the call, and outputs produced before it are gone;
 //! * the timeout stops a running program. It does not cover compiling one: EMQX
 //!   looks at the cancel flag only between a program's steps. Here compiling runs
-//!   under a fuel bound instead ([`COMPILE_FUEL`]).
+//!   under a bound of its own instead ([`COMPILE_TIMEOUT`]).
+//!
+//! [`Jq`] is the function for one caller, with one warm instance. [`Pool`] is what a
+//! broker holds: the module, compiled on first use, and the warm instances its
+//! callers take turns on.
 
 use std::fmt;
+use std::sync::{Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
-use crate::sandbox::{Arg, CallError, Instance, Limits, LoadError, Reply, Sandbox};
+use crate::sandbox::{Arg, CallError, Execution, Instance, Limits, LoadError, Reply, Sandbox};
 use crate::wasi::Grants;
 
 /// `rule_engine.jq_function_default_timeout`: what `jq/2` runs under.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// The most fuel compiling one program may burn. The longest rule SQL (64 KiB of
+/// The longest compiling one program may take. The longest rule SQL (64 KiB of
 /// program text) compiles in a small fraction of it.
-pub const COMPILE_FUEL: u64 = 20_000_000_000;
+pub const COMPILE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// An instance holding more memory than this after a call is replaced: an
 /// instance's memory never shrinks, and one large payload should not pin it.
@@ -43,9 +48,10 @@ pub enum Tag {
     Process,
     /// `timeout`: the program ran past the timeout.
     Timeout,
-    /// `jq_err_system`: jq could not start.
+    /// `jq_err_system`: jq could not start, or its instance broke.
     System,
-    /// Not in EMQX: the memory, stack, fuel or output limit of the sandbox.
+    /// Not in EMQX: the memory, stack, fuel, output or compile-time limit of the
+    /// sandbox.
     Limit,
 }
 
@@ -110,18 +116,24 @@ pub struct Jq {
 }
 
 impl Jq {
-    /// Loads the jq module with the default limits. `grants` is what jq's `now` and
-    /// `$ENV` see.
+    /// Loads the jq module with the default limits, compiled to machine code.
+    /// `grants` is what jq's `now` and `$ENV` see.
     pub fn new(wasm: &[u8], grants: Grants) -> Result<Self, LoadError> {
-        Ok(Self::from_sandbox(Sandbox::load(
+        Self::new_as(wasm, Execution::Compiled, grants)
+    }
+
+    /// [`new`](Self::new), compiled as `execution` says.
+    pub fn new_as(wasm: &[u8], execution: Execution, grants: Grants) -> Result<Self, LoadError> {
+        Ok(Self::from_sandbox(Sandbox::load_as(
             wasm,
+            execution,
             Limits::default(),
             grants,
         )?))
     }
 
     /// The function on an already loaded module (a [`Sandbox`] is cheap to clone:
-    /// every caller shares the translated code and owns only its instance).
+    /// every caller shares the compiled code and owns only its instance).
     #[must_use]
     pub fn from_sandbox(sandbox: Sandbox) -> Self {
         Self {
@@ -137,7 +149,8 @@ impl Jq {
         self.instance = None;
     }
 
-    /// Fuel burnt by the warm instance so far.
+    /// Fuel burnt by the warm instance so far (zero unless the module was loaded
+    /// with a fuel bound).
     #[must_use]
     pub fn fuel_used(&self) -> u64 {
         self.instance.as_ref().map_or(0, Instance::fuel_used)
@@ -213,9 +226,19 @@ impl Jq {
                 ..
             })
         ) {
-            let compiled = instance.call_with_fuel("jq_compile", &args[..1], COMPILE_FUEL);
+            let compiled = instance.call("jq_compile", &args[..1], Some(at + COMPILE_TIMEOUT));
             self.last.compile = at.elapsed();
-            compiled.map_err(|e| error(e, timeout))?;
+            compiled.map_err(|e| match e {
+                CallError::Timeout => JqError {
+                    tag: Tag::Limit,
+                    message: format!(
+                        "jq stopped: compiling the program took longer than {} ms",
+                        COMPILE_TIMEOUT.as_millis()
+                    )
+                    .into_bytes(),
+                },
+                e => error(e, timeout),
+            })?;
             let at = Instant::now();
             reply = instance.call("jq", &args, deadline);
             self.last.run = at.elapsed();
@@ -263,4 +286,103 @@ fn error(e: CallError, timeout: Option<Duration>) -> JqError {
         CallError::Trap(_) | CallError::Poisoned => (Tag::System, e.to_string().into_bytes()),
     };
     JqError { tag, message }
+}
+
+/// The `jq` function for a whole broker: the module's bytes, compiled when first
+/// needed, and the warm instances callers take turns on.
+///
+/// Making a pool costs nothing. The first [`load`](Self::load) (or the first
+/// [`eval`](Self::eval)) compiles the module to machine code, once: a broker whose
+/// rules never call `jq` never pays for it, and one whose rules do pays when the rules
+/// are loaded, not when a message arrives.
+#[derive(Debug)]
+pub struct Pool {
+    wasm: Vec<u8>,
+    execution: Execution,
+    limits: Limits,
+    grants: Grants,
+    loaded: OnceLock<Result<Sandbox, String>>,
+    idle: Mutex<Vec<Jq>>,
+    max_idle: usize,
+}
+
+impl Pool {
+    /// A pool over the module `wasm`, keeping at most `max_idle` warm instances
+    /// between calls (a broker's number of worker threads). Nothing is compiled yet.
+    #[must_use]
+    pub fn new(
+        wasm: Vec<u8>,
+        execution: Execution,
+        limits: Limits,
+        grants: Grants,
+        max_idle: usize,
+    ) -> Self {
+        Self {
+            wasm,
+            execution,
+            limits,
+            grants,
+            loaded: OnceLock::new(),
+            idle: Mutex::new(Vec::new()),
+            max_idle,
+        }
+    }
+
+    /// Compiles the module if no call has yet, and says why it cannot be: the reason
+    /// a rule calling `jq` is refused when the rules are loaded. A failure is kept;
+    /// it is not tried again.
+    pub fn load(&self) -> Result<&Sandbox, JqError> {
+        self.loaded
+            .get_or_init(|| {
+                Sandbox::load_as(
+                    &self.wasm,
+                    self.execution,
+                    self.limits.clone(),
+                    self.grants.clone(),
+                )
+                .map_err(|e| e.to_string())
+            })
+            .as_ref()
+            .map_err(|reason| JqError {
+                tag: Tag::System,
+                message: format!("jq is not available: {reason}").into_bytes(),
+            })
+    }
+
+    /// Whether the module has been compiled (by [`load`](Self::load) or a call).
+    #[must_use]
+    pub fn is_loaded(&self) -> bool {
+        matches!(self.loaded.get(), Some(Ok(_)))
+    }
+
+    /// Warm instances waiting for a caller.
+    #[must_use]
+    pub fn idle(&self) -> usize {
+        self.idle_instances().len()
+    }
+
+    fn idle_instances(&self) -> std::sync::MutexGuard<'_, Vec<Jq>> {
+        self.idle.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// [`Jq::eval`] on a warm instance of the pool, or on a new one when every one is
+    /// in use. The instance goes back to the pool afterwards.
+    pub fn eval(
+        &self,
+        program: &[u8],
+        input: Arg<'_>,
+        timeout: Option<Duration>,
+    ) -> Result<Vec<u8>, JqError> {
+        let taken = self.idle_instances().pop();
+        let mut jq = match taken {
+            Some(jq) => jq,
+            None => Jq::from_sandbox(self.load()?.clone()),
+        };
+        let result = jq.eval(program, input, timeout);
+        let mut idle = self.idle_instances();
+        if idle.len() < self.max_idle {
+            idle.push(jq);
+        }
+        result
+    }
 }

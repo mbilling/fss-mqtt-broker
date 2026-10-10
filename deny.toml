@@ -43,6 +43,14 @@ allow = [
     # A permissive *data* license for the cert set, not code; standard across the
     # rustls ecosystem.
     "CDLA-Permissive-2.0",
+    # wasmtime, Cranelift (cranelift-*, regalloc2, target-lexicon) and the Pulley
+    # interpreter — the WebAssembly runtime under mqtt-wasm-sandbox (ADR 0086). The
+    # Apache License 2.0 with the LLVM project's exception: a standard permissive
+    # license, and the exception only *removes* obligations (no attribution duty
+    # for code a compiler embeds into what it compiles; an explicit grant for
+    # combining with GPLv2 code). Exactly this expression is allowed, no other
+    # `WITH` exception.
+    "Apache-2.0 WITH LLVM-exception",
 ]
 
 [sources]

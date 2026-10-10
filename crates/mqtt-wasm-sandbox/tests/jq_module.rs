@@ -8,19 +8,20 @@
 //! cargo test --release -p mqtt-wasm-sandbox --features jq-module
 //! ```
 //!
-//! `--release`: the interpreter is an order of magnitude slower without optimisation,
-//! and two of the oracle's cases run into EMQX's ten-second timeout on purpose.
+//! `--release`: the host's own share (and the whole of the interpreted variant) is an
+//! order of magnitude slower without optimisation, and two of the oracle's cases run
+//! into EMQX's ten-second timeout on purpose.
 //! `MQTTD_JQ_WASM` names another module file than `jq-module/jq.wasm`.
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use mqtt_rules::{json_decode, Value};
-use mqtt_wasm_sandbox::jq::{Jq, JqError, Tag, COMPILE_FUEL, DEFAULT_TIMEOUT};
-use mqtt_wasm_sandbox::{Arg, CallError, Grants, Limits, Sandbox};
+use mqtt_wasm_sandbox::jq::{Jq, JqError, Pool, Tag, DEFAULT_TIMEOUT};
+use mqtt_wasm_sandbox::{Arg, CallError, Execution, Grants, Limits, Sandbox};
 
 mod oracle;
-use oracle::Verdict;
+use oracle::{Expected, Verdict};
 
 fn module_path() -> PathBuf {
     std::env::var_os("MQTTD_JQ_WASM").map_or_else(
@@ -324,12 +325,25 @@ fn values_cross_as_a_rule_passes_them() {
 /// had happened.
 #[test]
 fn a_runaway_program_stops_at_the_timeout_and_the_next_call_is_unaffected() {
-    let mut jq = jq();
+    // The grace a program has to end by itself once asked is two milliseconds by
+    // default, which a thread that loses its processor on a busy machine can sleep
+    // through. Here it is long, so that what is counted below (which programs cost
+    // their instance) does not depend on the machine's load.
+    let patient = Limits {
+        cancel_grace: Duration::from_secs(30),
+        ..Limits::default()
+    };
+    let grants = Grants {
+        clock: true,
+        environment: oracle::environment(),
+    };
+    let mut jq =
+        Jq::from_sandbox(Sandbox::load(&module(), patient, grants).expect("the module loads"));
     assert_eq!(text(jq.eval(b". + 1", Arg::Binary(b"1"), None)), "[2]");
     for (program, ms) in [
         ("def f: f; f", 100),
         ("repeat(.)", 100),
-        ("[repeat(.)]", 200),
+        ("[repeat(.)]", 50),
         ("last(range(1e12))", 150),
         ("def f: f; f", 5),
     ] {
@@ -375,12 +389,17 @@ fn a_runaway_program_stops_at_the_timeout_and_the_next_call_is_unaffected() {
 /// the instance is gone.
 #[test]
 fn a_program_that_cannot_be_asked_to_stop_is_stopped_anyway() {
-    let sandbox =
-        Sandbox::load(&module(), Limits::default(), Grants::default()).expect("the module loads");
-    let run = |program: &[u8]| {
+    let load = |limits| Sandbox::load(&module(), limits, Grants::default()).expect("it loads");
+    let hasty = load(Limits::default());
+    // For the program that does end by itself, a grace no busy machine outlasts.
+    let patient = load(Limits {
+        cancel_grace: Duration::from_secs(30),
+        ..Limits::default()
+    });
+    let run = |sandbox: &Sandbox, program: &[u8]| {
         let mut instance = sandbox.instantiate().expect("an instance");
         instance
-            .call_with_fuel("jq_compile", &[Arg::Binary(program)], COMPILE_FUEL)
+            .call("jq_compile", &[Arg::Binary(program)], None)
             .expect("it compiles");
         let deadline = Instant::now() + Duration::from_millis(30);
         let outcome = instance.call(
@@ -390,14 +409,14 @@ fn a_program_that_cannot_be_asked_to_stop_is_stopped_anyway() {
         );
         (outcome, instance.is_poisoned())
     };
-    let (outcome, poisoned) = run(b"def f: f; f");
+    let (outcome, poisoned) = run(&patient, b"def f: f; f");
     assert!(
         matches!(outcome, Err(CallError::Module { status: 7, .. })),
         "{outcome:?}"
     );
     assert!(!poisoned);
     let stuck = br#""a" * 8000000 | test("a+b")"#;
-    let (outcome, poisoned) = run(stuck);
+    let (outcome, poisoned) = run(&hasty, stuck);
     assert_eq!(outcome, Err(CallError::Timeout));
     assert!(poisoned);
     // Through the function it is EMQX's timeout either way, and the next call is served.
@@ -571,4 +590,219 @@ fn the_module_sees_only_what_it_is_granted() {
         assert_eq!(error.tag, Tag::Compile);
         assert!(error.to_string().contains("module not found"), "{error}");
     }
+}
+
+/// The interpreter (for hosts that forbid executable memory) runs the same module to
+/// the same answers as the compiled code, byte for byte: every case of the oracle
+/// that EMQX answered within its timeout.
+#[test]
+fn interpreted_the_module_answers_exactly_as_compiled() {
+    let grants = || Grants {
+        clock: true,
+        environment: oracle::environment(),
+    };
+    let mut compiled = jq();
+    let mut interpreted =
+        Jq::new_as(&module(), Execution::Interpreted, grants()).expect("the jq module loads");
+    let show = |r: Result<Vec<u8>, JqError>| match r {
+        Ok(o) => String::from_utf8_lossy(&o).into_owned(),
+        Err(e) => e.to_string(),
+    };
+    let mut cases = 0;
+    for case in oracle::parse(include_str!("emqx-jq-oracle.txt")) {
+        let timed_out = matches!(&case.expected, Expected::Error { tag, .. } if tag == "timeout");
+        // `now` reads the clock, and `input_line_number` nothing either run controls.
+        let clock = String::from_utf8_lossy(&case.program).contains("now");
+        if timed_out || clock {
+            continue;
+        }
+        let timeout = Some(Duration::from_mins(2));
+        let native = show(compiled.eval(&case.program, case.input_arg(), timeout));
+        let portable = show(interpreted.eval(&case.program, case.input_arg(), timeout));
+        assert_eq!(native, portable, "{}", case.describe());
+        cases += 1;
+    }
+    assert!(cases >= 270, "{cases} cases compared");
+    // And the limits hold there too.
+    let started = Instant::now();
+    let error = interpreted
+        .eval(
+            b"def f: f; f",
+            Arg::Binary(b"1"),
+            Some(Duration::from_millis(50)),
+        )
+        .expect_err("endless");
+    assert_eq!(error.tag, Tag::Timeout);
+    assert!(started.elapsed() >= Duration::from_millis(50));
+    assert!(started.elapsed() < Duration::from_secs(5));
+    let error = interpreted
+        .eval(b"\"x\" * 1e9", Arg::Binary(b"1"), Some(DEFAULT_TIMEOUT))
+        .expect_err("too large");
+    assert_eq!(error.tag, Tag::Limit);
+    assert_eq!(
+        text(interpreted.eval(b". + 1", Arg::Binary(b"1"), None)),
+        "[2]"
+    );
+}
+
+/// Programs and inputs nobody wrote: bytes and jq fragments drawn at random, the same
+/// ones every run. Whatever they are, a call ends with outputs or one of the error
+/// kinds within its timeout, and the caller's next call is served.
+#[test]
+#[allow(clippy::too_many_lines)] // the tables the programs are drawn from
+fn garbage_programs_and_inputs_end_in_an_answer_or_an_error() {
+    // Whole filters, which compile when joined, and pieces, which mostly do not.
+    const FILTERS: [&str; 30] = [
+        ".",
+        ".a",
+        ".[]",
+        "..",
+        ".[0]",
+        "[.]",
+        "{a: .}",
+        "length",
+        "keys",
+        "add",
+        "tostring",
+        "tojson",
+        "fromjson",
+        "range(1e6)",
+        "last(range(1e9))",
+        "repeat(.)",
+        "[repeat(.)]",
+        "recurse",
+        "def f: f; f",
+        "test(\"(a*)*b\")",
+        "\"a\" * 100000",
+        "error",
+        "try error catch .",
+        "input",
+        "$ENV",
+        "now",
+        "@base64",
+        "1e1000",
+        "nan",
+        "limit(3; .[])",
+    ];
+    const JOINTS: [&str; 5] = [" | ", ", ", " + ", " // ", " as $x | "];
+    const PIECES: [&str; 16] = [
+        "|", ",", "[", "]", "{", "}", "(", ")", "\"", "\\", "$x", "reduce ", "foreach ", "try ",
+        "catch ", "?",
+    ];
+    const INPUTS: [&str; 8] = [
+        "1",
+        "null",
+        "\"x\"",
+        "[1,[2,[3]]]",
+        "{\"a\":{\"b\":[1,2,3]}}",
+        "[[[[[[[[",
+        "1e999",
+        "\"\\ud800\"",
+    ];
+    let mut state = 0x2545_f491_4f6c_dd1du64;
+    let mut next = move |below: usize| {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        usize::try_from(state % u64::try_from(below).expect("small")).expect("small")
+    };
+    let mut jq = jq();
+    let mut kinds = std::collections::BTreeMap::new();
+    for round in 0..400 {
+        let mut program = Vec::new();
+        let mut input = INPUTS[next(INPUTS.len())].as_bytes().to_vec();
+        match round % 4 {
+            0 => {
+                // Bytes of any value, in the program and in the input.
+                program.extend((0..next(40)).map(|_| u8::try_from(next(256)).expect("a byte")));
+                input = (0..next(40))
+                    .map(|_| u8::try_from(next(256)).expect("a byte"))
+                    .collect();
+            }
+            1 => {
+                for _ in 0..=next(8) {
+                    let piece = if next(2) == 0 {
+                        PIECES[next(PIECES.len())]
+                    } else {
+                        FILTERS[next(FILTERS.len())]
+                    };
+                    program.extend_from_slice(piece.as_bytes());
+                }
+            }
+            _ => {
+                program.extend_from_slice(FILTERS[next(FILTERS.len())].as_bytes());
+                for _ in 0..next(4) {
+                    program.extend_from_slice(JOINTS[next(JOINTS.len())].as_bytes());
+                    program.extend_from_slice(FILTERS[next(FILTERS.len())].as_bytes());
+                }
+            }
+        }
+        let timeout = Duration::from_millis(10);
+        let started = Instant::now();
+        let outcome = jq.eval(&program, Arg::Binary(&input), Some(timeout));
+        let took = started.elapsed();
+        let shown = String::from_utf8_lossy(&program).into_owned();
+        // Compiling a program is outside the timeout, as in EMQX, and takes a
+        // millisecond or two; ten seconds is far beyond both.
+        assert!(took < Duration::from_secs(10), "{shown:?} took {took:?}");
+        let kind = match &outcome {
+            Ok(_) => "outputs",
+            Err(e) => e.tag.as_str(),
+        };
+        *kinds.entry(kind).or_insert(0u32) += 1;
+        assert_eq!(
+            text(jq.eval(b". + 1", Arg::Binary(b"1"), None)),
+            "[2]",
+            "after {shown:?}"
+        );
+    }
+    // The run met every way a call ends but the one that means jq itself broke.
+    for kind in [
+        "outputs",
+        "jq_err_compile",
+        "jq_err_parse",
+        "jq_err_process",
+        "timeout",
+    ] {
+        assert!(kinds.contains_key(kind), "no {kind} among {kinds:?}");
+    }
+    assert!(!kinds.contains_key("jq_err_system"), "{kinds:?}");
+}
+
+/// What one of the pool test's threads does: twenty-five answers of its own, and one
+/// program that never ends.
+fn pool_caller(pool: &Pool, thread: u32) {
+    for n in 0..25u32 {
+        let input = format!("{}", thread * 1000 + n);
+        let outputs = pool.eval(b". * 2", Arg::Binary(input.as_bytes()), None);
+        assert_eq!(text(outputs), format!("[{}]", (thread * 1000 + n) * 2));
+    }
+    let endless = pool.eval(
+        b"def f: f; f",
+        Arg::Binary(b"1"),
+        Some(Duration::from_millis(20)),
+    );
+    assert_eq!(endless.expect_err("endless").tag, Tag::Timeout);
+}
+
+/// The pool a broker holds: nothing is compiled until the first call, callers on
+/// several threads share warm instances, and each gets its own answer.
+#[test]
+fn a_pool_serves_callers_on_several_threads() {
+    let pool = Pool::new(
+        module(),
+        Execution::Compiled,
+        Limits::default(),
+        Grants::default(),
+        4,
+    );
+    assert!(!pool.is_loaded());
+    std::thread::scope(|scope| {
+        for thread in 0..8u32 {
+            let pool = &pool;
+            scope.spawn(move || pool_caller(pool, thread));
+        }
+    });
+    assert!(pool.is_loaded());
+    assert!((1..=4).contains(&pool.idle()), "{} idle", pool.idle());
 }
