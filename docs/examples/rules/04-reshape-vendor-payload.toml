@@ -21,7 +21,7 @@ SELECT
   payload.vals.h AS measurements.humidity,
   unix_ts_to_rfc3339(payload.ts, 'millisecond') AS time
 FROM "vendor/+/uplink"
-WHERE is_str(payload.devId) AND regex_match(payload.devId, '^[A-Za-z0-9_-]{1,64}$')
+WHERE is_str(payload.devId) AND regex_match(payload.devId, '^[A-Za-z0-9_-]{1,64}\z')
 '''
 actions = [
   { function = "republish", args = { topic = "canonical/${device.id}", qos = 1, payload = "${.}" } },

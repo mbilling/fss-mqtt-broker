@@ -797,8 +797,48 @@ function selectAt(textarea, line, column) {
   textarea.setSelectionRange(at, Math.min(at + 1, textarea.value.length));
 }
 
-function payloadText(p, encoding) {
-  return encoding === "base64" ? `(base64) ${p}` : p;
+// Known binary formats, by their first bytes (hex).
+const MAGIC = [["50415231", "Apache Parquet"], ["1f8b", "gzip"], ["504b0304", "zip"]];
+
+// A binary payload as its size, its content type and its first bytes, never as the bytes
+// themselves: a turbine's fast log is half a megabyte of Parquet. `head` is hex; a trace
+// record carries base64 instead (the first 1 KiB), of which the first 16 bytes are shown.
+function binarySummary(bytes, head, contentType) {
+  const hex = (head || "").slice(0, 32);
+  const kind = (MAGIC.find(([m]) => hex.startsWith(m)) || [])[1];
+  const ascii = hex.match(/../g)?.map((h) => {
+    const c = parseInt(h, 16);
+    return c >= 0x20 && c < 0x7f ? String.fromCharCode(c) : ".";
+  }).join("") || "";
+  const spaced = hex.match(/../g)?.join(" ") || "";
+  return `binary, ${count(bytes)} bytes${contentType ? `, ${contentType}` : ""}` +
+    `${kind ? ` (${kind})` : ""}\n${spaced}${bytes > hex.length / 2 ? " …" : ""}  ${ascii}`;
+}
+
+function base64Head(p) {
+  try {
+    const raw = atob((p || "").slice(0, 24));
+    return Array.from(raw, (c) => c.charCodeAt(0).toString(16).padStart(2, "0")).join("");
+  } catch {
+    return "";
+  }
+}
+
+// `o` is a message, a trace trigger or a rendered output: its payload, its encoding
+// (`encoding` or `payload_encoding`) and its size (`bytes` or `payload_bytes`).
+function payloadText(o) {
+  const encoding = o.encoding || o.payload_encoding;
+  const bytes = o.bytes !== undefined ? o.bytes : o.payload_bytes;
+  if (encoding === "binary") return binarySummary(bytes, o.head, o.content_type);
+  if (encoding === "base64") return binarySummary(bytes, base64Head(o.payload));
+  return o.payload;
+}
+
+// The "first part of N bytes" hint, for text cut short; a binary summary says its size.
+function cutHint(o) {
+  const encoding = o.encoding || o.payload_encoding;
+  if (!o.truncated || encoding === "binary" || encoding === "base64") return null;
+  return el("span", `first part of ${count(o.bytes !== undefined ? o.bytes : o.payload_bytes)} bytes`, "hint");
 }
 
 function outputList(outputs) {
@@ -810,8 +850,9 @@ function outputList(outputs) {
     } else if (o.action === "republish") {
       li.append(el("span", "→ ", "arrow"), el("span", o.topic, "topic"),
         el("span", ` qos ${o.qos}${o.retain ? ", retained" : ""}`, "hint"));
-      li.append(el("pre", payloadText(o.payload, o.payload_encoding), "payload"));
-      if (o.truncated) li.append(el("span", `first part of ${count(o.payload_bytes)} bytes`, "hint"));
+      li.append(el("pre", payloadText(o), "payload"));
+      const hint = cutHint(o);
+      if (hint) li.append(hint);
     } else {
       li.append(el("span", `${o.action || "output"}: `, "arrow"),
         el("pre", JSON.stringify(o.output === undefined ? o : o.output), "payload"));
@@ -842,8 +883,9 @@ function traceItem(rec) {
     el("span", ` ${about.filter(Boolean).join(", ")}`, "hint"));
   li.append(meta);
   if (t.payload !== undefined) {
-    li.append(el("pre", payloadText(t.payload, t.payload_encoding), "payload"));
-    if (t.truncated) li.append(el("span", `first part of ${count(t.payload_bytes)} bytes`, "hint"));
+    li.append(el("pre", payloadText(t), "payload"));
+    const hint = cutHint(t);
+    if (hint) li.append(hint);
   }
   if (rec.error) li.append(el("p", rec.error, "error"));
   li.append(outputList(rec.outputs));
@@ -922,8 +964,9 @@ function dataItem(m) {
   const meta = el("div", undefined, "meta");
   meta.append(el("time", clock(m.at)), " ", el("span", kind, `badge ${kind}`), " ", el("span", m.topic, "topic"));
   if (m.retain) meta.append(" ", el("span", "retained", "badge"));
-  li.append(meta, el("pre", payloadText(m.payload, m.encoding), "payload"));
-  if (m.truncated) li.append(el("span", `first part of ${count(m.bytes)} bytes`, "hint"));
+  li.append(meta, el("pre", payloadText(m), "payload"));
+  const hint = cutHint(m);
+  if (hint) li.append(hint);
   return li;
 }
 

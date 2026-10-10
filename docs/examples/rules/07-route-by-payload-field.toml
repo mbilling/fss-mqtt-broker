@@ -26,7 +26,7 @@ SELECT
   payload.device AS device,
   payload
 FROM "ingest"
-WHERE is_str(payload.device) AND regex_match(payload.device, '^[A-Za-z0-9_-]{1,64}$')
+WHERE is_str(payload.device) AND regex_match(payload.device, '^[A-Za-z0-9_-]{1,64}\z')
 '''
 actions = [
   { function = "republish", args = { topic = "devices/${kind}/${device}", qos = 1, payload = "${payload}" } },

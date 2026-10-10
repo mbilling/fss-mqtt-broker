@@ -17,7 +17,7 @@ doing what this page says, the build would fail.
 
 For the SQL, the fields, the functions and the actions themselves, see
 [RULES.md](RULES.md). For the recipes put together on realistic data (ten simulated
-minutes of power plants, homes and cars, with 21 rules and the alerts, KPIs and
+minutes of power plants, homes and cars, with 22 rules and the alerts, KPIs and
 privacy-safe feeds they derive), see the [rule-engine demo](../demo/rules/README.md).
 
 ---
@@ -398,7 +398,7 @@ SELECT
   payload.vals.h AS measurements.humidity,
   unix_ts_to_rfc3339(payload.ts, 'millisecond') AS time
 FROM "vendor/+/uplink"
-WHERE is_str(payload.devId) AND regex_match(payload.devId, '^[A-Za-z0-9_-]{1,64}$')
+WHERE is_str(payload.devId) AND regex_match(payload.devId, '^[A-Za-z0-9_-]{1,64}\z')
 '''
 actions = [
   { function = "republish", args = { topic = "canonical/${device.id}", qos = 1, payload = "${.}" } },
@@ -515,7 +515,7 @@ DO
   r.sensor        AS sensor,
   r.temp          AS temp,
   payload.gateway AS gateway
-INCASE is_str(r.sensor) AND regex_match(r.sensor, '^[A-Za-z0-9_-]{1,64}$')
+INCASE is_str(r.sensor) AND regex_match(r.sensor, '^[A-Za-z0-9_-]{1,64}\z')
 FROM "gw/+/batch"
 '''
 actions = [
@@ -529,7 +529,7 @@ FOREACH payload.readings AS r
 DO
   r.sensor AS sensor,
   r.temp   AS temp
-INCASE r.temp > 50 AND is_str(r.sensor) AND regex_match(r.sensor, '^[A-Za-z0-9_-]{1,64}$')
+INCASE r.temp > 50 AND is_str(r.sensor) AND regex_match(r.sensor, '^[A-Za-z0-9_-]{1,64}\z')
 FROM "gw/+/batch"
 '''
 actions = [
@@ -595,7 +595,7 @@ SELECT
   payload.device AS device,
   payload
 FROM "ingest"
-WHERE is_str(payload.device) AND regex_match(payload.device, '^[A-Za-z0-9_-]{1,64}$')
+WHERE is_str(payload.device) AND regex_match(payload.device, '^[A-Za-z0-9_-]{1,64}\z')
 '''
 actions = [
   { function = "republish", args = { topic = "devices/${kind}/${device}", qos = 1, payload = "${payload}" } },
@@ -901,7 +901,7 @@ description = "A device connected"
 sql = '''
 SELECT clientid, 'online' AS status, connected_at AS since
 FROM "$events/client/connected"
-WHERE regex_match(clientid, '^sensor-[A-Za-z0-9_-]{1,57}$')
+WHERE regex_match(clientid, '^sensor-[A-Za-z0-9_-]{1,57}\z')
 '''
 actions = [
   { function = "republish", args = { topic = "presence/${clientid}", qos = 1, retain = true, payload = "${.}" } },
@@ -912,7 +912,7 @@ description = "A device went away"
 sql = '''
 SELECT clientid, 'offline' AS status, disconnected_at AS since, reason
 FROM "$events/client/disconnected"
-WHERE regex_match(clientid, '^sensor-[A-Za-z0-9_-]{1,57}$') AND reason <> 'takenover' AND reason <> 'discarded'
+WHERE regex_match(clientid, '^sensor-[A-Za-z0-9_-]{1,57}\z') AND reason <> 'takenover' AND reason <> 'discarded'
 '''
 actions = [
   { function = "republish", args = { topic = "presence/${clientid}", qos = 1, retain = true, payload = "${.}" } },
@@ -1279,7 +1279,7 @@ description = "JSON wrapped in base64"
 sql = '''
 SELECT payload.deviceId AS device, json_decode(base64_decode(payload.data)) AS data
 FROM "cloud/push"
-WHERE is_str(payload.deviceId) AND regex_match(payload.deviceId, '^[A-Za-z0-9_-]{1,64}$')
+WHERE is_str(payload.deviceId) AND regex_match(payload.deviceId, '^[A-Za-z0-9_-]{1,64}\z')
 '''
 actions = [
   { function = "republish", args = { topic = "unwrapped/${device}", payload = "${data}" } },
@@ -1411,7 +1411,7 @@ SELECT
   payload,
   map_put('processed-by', 'order_router', pub_props.'User-Property') AS user_properties
 FROM "orders/+"
-WHERE is_str(tenant) AND regex_match(tenant, '^[A-Za-z0-9_-]{1,64}$')
+WHERE is_str(tenant) AND regex_match(tenant, '^[A-Za-z0-9_-]{1,64}\z')
 '''
 actions = [
   { function = "republish", args = {

@@ -5,14 +5,15 @@ fleet into mqttd and stops. This stack keeps them playing, and opens the broker 
 can watch what its [rule engine](../../docs/RULES.md) does with each message, and change
 the rules while it runs ([ADR 0084](../../docs/adr/0084-watching-and-editing-rules-live.md)):
 
-- **mqttd**, built from this checkout, running the demo's 21 rules. Every 2 s it publishes
+- **mqttd**, built from this checkout, running the demo's 22 rules. Every 2 s it publishes
   each rule's statistics on `$SYS/brokers/<node>/rules/<id>`, and with the rule trace on it
   publishes what each rule ran on and what it rendered on
   `$SYS/brokers/<node>/trace/rules/<id>`.
 - **Three simulators**, power plants, homes and cars
   ([`live.py`](../rules/live.py)), playing the demo's ten minutes over and over on the wall
   clock: wind turbines, SunSpec inverters, DSMR smart meters, heat pumps, EV chargers,
-  telematics and OBD-II frames, about four messages a second.
+  telematics and OBD-II frames, about four messages a second; and every minute each
+  turbine's 50 Hz fast log, a [Parquet file](#turbine-fast-log-parquet) of 0.53 MB.
 - **A rule editor** at <http://localhost:8070>: the rules with their live counts, each
   rule's trace, the live messages, and an editor that checks, tests and applies a rule
   through the broker's admin API, then shows the new rules arriving on `$SYS`.
@@ -56,12 +57,79 @@ Subscribe to those by name:
 | `alerts/#`, `kpi/#`, `normalized/#`, `analytics/#`, `state/#`, `events/#` | What the rules derive: the six roots of [the demo's rules](../rules/README.md#where-the-results-go) | `mosquitto_sub -v -t 'alerts/#' -t 'kpi/#' -t 'state/#'` |
 | `plant/#`, `home/#`, `vehicle/#` | What the devices publish | `mosquitto_sub -v -t 'vehicle/#'` |
 
+The turbines' fast logs are binary (next section), so `-v` on `plant/#` prints half a
+megabyte of Parquet a minute per turbine. Leave them out with `-T 'plant/+/+/fastlog'`.
+
 One rule's statistics and trace only, here the grid-frequency alert:
 
 ```sh
 mosquitto_sub -v -t '$SYS/brokers/+/rules/power_grid_frequency' \
   -t '$SYS/brokers/+/trace/rules/power_grid_frequency'
 ```
+
+## Turbine fast log (Parquet)
+
+A turbine controller records its fast signals many times a second and uploads them in
+files, for the engineers who look into a trip or tune the controller. Here, every minute
+each of wf-falster's six turbines uploads the minute just ended:
+
+| | |
+|---|---|
+| Topic | `plant/wf-falster/<turbine>/fastlog`, `wtg01` to `wtg06`, from client `wf-falster-<turbine>` |
+| When | every minute: the minute just ended, `[start_ms, end_ms)` on whole minutes of the wall clock, uploaded 2.0 s (wtg01) to 9.5 s (wtg06) into the next |
+| Payload | an [Apache Parquet](https://parquet.apache.org/docs/file-format/) file: 3,000 rows (60 s at 50 Hz), 22 columns, one row group, PLAIN encoding, uncompressed: 531,398 bytes (0.53 MB, 0.51 MiB), under mqttd's 1 MiB packet limit |
+| MQTT | QoS 1, not retained, MQTT 5: content type `application/vnd.apache.parquet`, payload format indicator 0 (binary), user properties `schema=fastlog/v1`, `site`, `turbine`, `rows=3000`, `rate_hz=50`, `start_ms`, `end_ms` |
+| File metadata | the same pairs, plus `units` (JSON, column to unit); `created_by` names the simulator |
+
+Only this stack sends them (`SIM_FASTLOG=1` on `sim-power`, [`live.py
+--fastlog`](../rules/live.py)); the [ten-minute demo](../rules/README.md) has none. The
+values follow the turbine's 1-s simulation, interpolated to 50 Hz, with what a 1-s model
+leaves out: turbulence within the second, the drivetrain's torsional mode in the generator
+speed, the tower's sway in the nacelle accelerations, the blade-passing (3P) ripple, and
+sensor noise. A turbine that stops (wtg06, 6 min 12 s into every ten-minute window) shows
+it: power to -9 kW, pitch to 88°, the rotor idling. [`sim/power.py`](../rules/sim/power.py)
+writes the files with a small Parquet writer of its own ([`sim/parquet.py`](../rules/sim/parquet.py),
+standard library only).
+
+| Column | Parquet type | Unit | What |
+|---|---|---|---|
+| `ts` | INT64, TIMESTAMP(MILLIS, UTC) | ms | sample time, every 20 ms |
+| `rotor_speed_rpm` | DOUBLE | rpm | rotor speed, low-speed shaft |
+| `generator_speed_rpm` | DOUBLE | rpm | generator speed, high-speed shaft (gear ratio 1:119) |
+| `pitch_angle_a_deg`, `pitch_angle_b_deg`, `pitch_angle_c_deg` | DOUBLE | ° | blade pitch angles |
+| `active_power_kw` | DOUBLE | kW | active power at the generator terminals |
+| `reactive_power_kvar` | DOUBLE | kvar | reactive power |
+| `generator_torque_knm` | DOUBLE | kNm | generator torque (0 when not generating) |
+| `wind_speed_ms` | DOUBLE | m/s | nacelle anemometer |
+| `wind_direction_deg` | DOUBLE | ° | wind direction, from north |
+| `yaw_angle_deg` | DOUBLE | ° | nacelle position, from north |
+| `tower_acc_fa_ms2`, `tower_acc_ss_ms2` | DOUBLE | m/s² | nacelle acceleration, fore-aft and side-side |
+| `gearbox_vibration_mms` | DOUBLE | mm/s | gearbox vibration velocity, RMS 10-1000 Hz |
+| `voltage_l1_v`, `voltage_l2_v`, `voltage_l3_v` | DOUBLE | V | phase voltages, line to neutral, 690 V system |
+| `current_l1_a`, `current_l2_a`, `current_l3_a` | DOUBLE | A | phase currents |
+| `grid_frequency_hz` | DOUBLE | Hz | grid frequency |
+
+The rule `power_wtg_fastlog` indexes each file without decoding it (SQL cannot read
+Parquet): from the payload's size, its first four bytes (`PAR1`) and the MQTT 5
+properties, it publishes a small record on `analytics/power/wf-falster/<turbine>/fastlog`:
+
+```json
+{"site":"wf-falster","turbine":"wtg03","bytes":531398,"content_type":"application/vnd.apache.parquet","schema":"fastlog/v1","rows":3000,"rate_hz":50,"start_ms":1791633540000,"end_ms":1791633600000,"from_utc":"2026-10-10T11:59:00Z","to_utc":"2026-10-10T12:00:00Z","received_at":1791633605067,"upload_lag_s":5.1,"key":"wf-falster/wtg03/2026/10/10/1159.parquet"}
+```
+
+The editor shows a fast log as its size, content type and first bytes (`50 41 52 31 …
+PAR1`), never the file. To save one and read it (`-N`: no newline after the payload,
+`-C 1`: one message, then exit):
+
+```sh
+mosquitto_sub -h 127.0.0.1 -t plant/wf-falster/wtg01/fastlog -C 1 -N > wtg01.parquet
+mosquitto_sub -h 127.0.0.1 -V mqttv5 -t plant/wf-falster/wtg01/fastlog -C 1 -F '%P' -N   # its user properties
+duckdb -c "DESCRIBE 'wtg01.parquet'; SELECT count(*), min(ts), max(ts), avg(active_power_kw) FROM 'wtg01.parquet'"
+python3 -c "import pyarrow.parquet as pq; t = pq.read_table('wtg01.parquet'); print(t.schema, t.num_rows)"
+```
+
+(DuckDB and pyarrow are not part of the stack: `pip install duckdb pyarrow` in a virtual
+environment of your own.)
 
 ## Change a rule in the editor
 

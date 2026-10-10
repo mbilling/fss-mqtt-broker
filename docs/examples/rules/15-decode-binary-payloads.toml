@@ -24,7 +24,7 @@ description = "JSON wrapped in base64"
 sql = '''
 SELECT payload.deviceId AS device, json_decode(base64_decode(payload.data)) AS data
 FROM "cloud/push"
-WHERE is_str(payload.deviceId) AND regex_match(payload.deviceId, '^[A-Za-z0-9_-]{1,64}$')
+WHERE is_str(payload.deviceId) AND regex_match(payload.deviceId, '^[A-Za-z0-9_-]{1,64}\z')
 '''
 actions = [
   { function = "republish", args = { topic = "unwrapped/${device}", payload = "${data}" } },

@@ -113,6 +113,10 @@ services:
       SIM_DOMAINS: power
       SIM_CLOCK: ${SIM_CLOCK:-now}
       SIM_QUIET: "1"
+      # Every minute each turbine also uploads its 50 Hz fast log of the minute before, a
+      # 0.53 MB Parquet file, on plant/wf-falster/<turbine>/fastlog (README.md, "Turbine
+      # fast log"). Under mqttd's default 1 MiB packet and per-connection ingress limits.
+      SIM_FASTLOG: "1"
       PYTHONDONTWRITEBYTECODE: "1"   # no __pycache__: ../rules is the checkout, read-only
     volumes:
       - ../rules:/opt/rules:ro

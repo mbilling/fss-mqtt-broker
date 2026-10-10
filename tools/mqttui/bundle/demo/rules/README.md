@@ -16,7 +16,7 @@ fleet into mqttd and shows what its [rule engine](../../docs/RULES.md) makes of 
   vehicle's online flag, retained, for a screen that opens late.
 - **Pseudonymizes** a feed for a third party.
 
-All of it runs in the broker, as you see it here: 21 rules in
+All of it runs in the broker, as you see it here: 22 rules in
 [`rules.toml`](rules.toml), no code.
 
 ```text
@@ -64,7 +64,7 @@ MQTTD_PLAINTEXT_BIND=127.0.0.1:1884 MQTTD_ALLOW_ANONYMOUS=1 MQTTD_DURABLE_SESSIO
   MQTTD_RULES_FILE=demo/rules/rules.toml target/release/mqttd
 ```
 
-Its log must say `rule engine: rules loaded (ADR 0083) rules=21`. Then, in another:
+Its log must say `rule engine: rules loaded (ADR 0083) rules=22`. Then, in another:
 
 ```sh
 mosquitto_sub -p 1884 -t 'alerts/#' -v &
@@ -79,10 +79,12 @@ clocks are the real one, with the time-of-day and season limits above; with
 joins the schedule mid-window, drops what it could not send on time rather than sending it
 late, reconnects when the broker goes away and comes back, and stops cleanly on Ctrl-C.
 Device state starts afresh with each window: odometers, meter registers and charge levels
-jump back.
+jump back. With `--fastlog` each wind turbine also uploads its 50 Hz fast log every minute,
+a half-megabyte Parquet file (`power_wtg_fastlog` below).
 
 ```sh
 python3 demo/rules/live.py --port 1884 --quiet
+python3 demo/rules/live.py --port 1884 --quiet --domains power --fastlog
 ```
 
 [`demo/rules-live`](../rules-live/) runs it as a Docker Compose stack: the broker with
@@ -228,6 +230,21 @@ at once.
 ```text
 → plant/wf-falster/wtg03/tele  {"ts":1774368203900,"WTUR":{"TurSt":{"stVal":4,"t":1774368196370},"AlmCd":2310,"W":1467.3,"VAr":-18.0}, … "WTRM":{"TmpGbxOil":82.2,"VibGbx":1.36}, …}   (shortened)
 ⇒ state/power/wf-falster/wtg03  {"site":"wf-falster","turbine":"wtg03","at":"2026-03-24T16:03:23Z","state":"derated","since":"2026-03-24T16:03:16Z","alarm":"gearbox oil temperature high: power limited","report":"change"}
+```
+
+**`power_wtg_fastlog`: index a file without reading it.** Live mode only (`live.py
+--fastlog`, which [`demo/rules-live`](../rules-live/README.md#turbine-fast-log-parquet)
+turns on; this page's ten minutes have none): every minute each turbine uploads its
+controller's 50 Hz fast log of the minute before as a 0.53 MB Apache Parquet file on
+`plant/wf-falster/<turbine>/fastlog`, QoS 1, with MQTT 5 properties that say what it is.
+SQL cannot read Parquet, and need not: the rule measures the payload (`bytesize`), checks
+its first four bytes are Parquet's `PAR1`, and reads the rest from the content type and
+the user properties. It republishes a small JSON record per file to
+`analytics/power/<site>/<turbine>/fastlog`, for a catalogue or an "every turbine uploaded
+its minute" check, while the file itself goes to whoever stores it:
+
+```text
+analytics/power/wf-falster/wtg03/fastlog  {"site":"wf-falster","turbine":"wtg03","bytes":531398,"content_type":"application/vnd.apache.parquet","schema":"fastlog/v1","rows":3000,"rate_hz":50,"start_ms":1791633540000,"end_ms":1791633600000,"from_utc":"2026-10-10T11:59:00Z","to_utc":"2026-10-10T12:00:00Z","received_at":1791633605067,"upload_lag_s":5.1,"key":"wf-falster/wtg03/2026/10/10/1159.parquet"}
 ```
 
 ### Homes

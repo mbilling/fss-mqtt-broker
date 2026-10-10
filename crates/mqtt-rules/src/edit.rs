@@ -434,7 +434,7 @@ mod tests {
     use super::*;
     use crate::RuleSet;
 
-    /// The demo's rules file: 21 rules in three sections, each section opened by a
+    /// The demo's rules file: 22 rules in three sections, each section opened by a
     /// banner, the file by a long header, every rule by its own comment block.
     fn demo() -> String {
         std::fs::read_to_string(concat!(
@@ -482,7 +482,7 @@ mod tests {
                 "{id}"
             );
             let set = RuleSet::parse(&edited).unwrap().rules;
-            assert_eq!(set.len(), 20);
+            assert_eq!(set.len(), 21);
             assert!(set.get(id).is_none());
         }
         assert!(delete_rule(&text, "power_pv_sunspec")
@@ -625,7 +625,7 @@ mod tests {
             )
         );
         let set = RuleSet::parse(&edited).unwrap().rules;
-        assert_eq!(set.len(), 22);
+        assert_eq!(set.len(), 23);
         assert!(!set.get("plant_tap").unwrap().enabled());
 
         // Into an empty file, and after a file's trailing comments.

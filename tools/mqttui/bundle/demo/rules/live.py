@@ -4,6 +4,7 @@
     python3 live.py --domains cars --port 1884   # one domain
     python3 live.py --clock fixture              # the README's ten minutes, over and over
     python3 live.py --dry-run --windows 2        # what it would send, as JSON lines
+    python3 live.py --domains power --fastlog    # and each turbine's 50 Hz fast log
 
 simulate.py plays one run and stops. This plays the same simulation endlessly, in windows of
 ten minutes aligned to the wall clock (09:40:00, 09:50:00, ... UTC), so every simulator
@@ -24,8 +25,14 @@ and counted, never sent late; more than a window behind, it jumps to where the s
 now. When the broker goes away it reconnects with backoff. It prints a start line and a
 heartbeat every minute, and on SIGTERM or SIGINT it disconnects every device cleanly and
 exits 0 (2 for a bad option). Each option can also be set in the environment: SIM_HOST,
-SIM_PORT, SIM_DOMAINS, SIM_SEED, SIM_CLOCK and SIM_QUIET (1 or 0). A flag wins over its
-variable.
+SIM_PORT, SIM_DOMAINS, SIM_SEED, SIM_CLOCK, SIM_QUIET and SIM_FASTLOG (1 or 0). A flag
+wins over its variable.
+
+--fastlog (the demo stack in demo/rules-live sets SIM_FASTLOG=1) adds, with the power
+domain, what the README's ten minutes do not have: every minute each wind turbine uploads
+its controller's fast log of the minute before, 50 samples a second of 21 channels, as an
+Apache Parquet file of about half a megabyte, on plant/wf-falster/<turbine>/fastlog
+(QoS 1, MQTT 5, content type application/vnd.apache.parquet). sim/power.py describes it.
 
 Device state starts afresh with each window: odometers, meter registers and charge levels
 jump back, a vehicle returns to the start of its route, and a faulted turbine is healthy
@@ -80,8 +87,10 @@ class Schedule:
     start at t0(k). Generating a window takes up to half a second, so the current and the
     next are kept; in fixture mode every window is the same one."""
 
-    def __init__(self, domains: list[str], seed: int, clock: str, s0: float):
+    def __init__(self, domains: list[str], seed: int, clock: str, s0: float,
+                 fastlog: bool = False):
         self.domains, self.seed, self.clock, self.s0 = domains, seed, clock, s0
+        self.fastlog = fastlog
         self._cache: dict[float, list[Event]] = {}
 
     def start(self, k: int) -> float:
@@ -94,7 +103,7 @@ class Schedule:
         t0 = self.t0(k)
         if t0 not in self._cache:
             self._cache = {t: e for t, e in self._cache.items() if t >= t0 - WINDOW}
-            self._cache[t0] = generate(self.domains, self.seed, t0, WINDOW)
+            self._cache[t0] = generate(self.domains, self.seed, t0, WINDOW, self.fastlog)
         return self._cache[t0]
 
     def ready(self, k: int) -> bool:
@@ -227,6 +236,7 @@ FROM_ENV = [
     ("seed", "SIM_SEED", int, 7),
     ("clock", "SIM_CLOCK", clock_mode, "now"),
     ("quiet", "SIM_QUIET", switch, False),
+    ("fastlog", "SIM_FASTLOG", switch, False),
 ]
 
 
@@ -243,6 +253,9 @@ def parse_args(argv=None) -> argparse.Namespace:
                     help="now or fixture: what the devices' clocks say [SIM_CLOCK, default now]")
     ap.add_argument("--quiet", action="store_true", default=None,
                     help="do not print each device message sent [SIM_QUIET]")
+    ap.add_argument("--fastlog", action="store_true", default=None,
+                    help="with the power domain: each wind turbine's 50 Hz fast log, a Parquet "
+                         "file every minute [SIM_FASTLOG]")
     ap.add_argument("--heartbeat", type=positive(float), default=60.0, metavar="SECONDS",
                     help="seconds between status lines (default 60)")
     ap.add_argument("--dry-run", action="store_true",
@@ -279,7 +292,7 @@ def parse_args(argv=None) -> argparse.Namespace:
 
 def dry_run(args) -> int:
     s0 = anchor(time.time() if args.now is None else args.now)
-    schedule = Schedule(args.domain_list, args.seed, args.clock, s0)
+    schedule = Schedule(args.domain_list, args.seed, args.clock, s0, args.fastlog)
     try:
         for k in range(args.windows or 1):
             for ev in schedule.events(k):
@@ -311,7 +324,8 @@ def main(argv=None) -> int:
         print(show(f"{ev.client:>14} →", ev.topic, ev.payload), flush=True)
 
     player = LivePlayer(args.host, args.port, None if args.quiet else on_send)
-    schedule = Schedule(args.domain_list, args.seed, args.clock, anchor(time.time()))
+    schedule = Schedule(args.domain_list, args.seed, args.clock, anchor(time.time()),
+                        args.fastlog)
     Live(schedule, player, args.heartbeat, lambda: bool(stop), say).run()
     return 0
 

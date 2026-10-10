@@ -1004,6 +1004,105 @@ fn the_live_simulators_device_clocks_run_on_from_window_to_window() {
     }
 }
 
+/// Generates one live window of the power domain with and without the turbines' fast
+/// logs, for [`the_live_simulators_fast_logs_are_parquet_files_and_change_nothing_else`].
+/// Prints JSON: whether everything else is the same, and for each fast log its event,
+/// properties and what its file's framing says.
+const FASTLOG_HARNESS: &str = r#"
+import json, struct, sys
+sys.path.insert(0, "demo/rules")
+from simulate import generate, parse_start
+from sim.core import from_json_line, to_json_line
+
+t0 = parse_start("2026-10-08T14:50:00Z")
+on = generate(["power"], 7, t0, 600, fastlog=True)
+off = generate(["power"], 7, t0, 600)
+logs = [e for e in on if e.topic.endswith("/fastlog")]
+key = lambda e: (e.at, e.client, e.kind, e.topic, e.payload, e.qos, e.retain)
+out = {"rest_same": [key(e) for e in on if not e.topic.endswith("/fastlog")] == [key(e) for e in off],
+       "t0": int(t0 * 1000), "logs": []}
+for e in logs:
+    body = e.body()
+    (footer,) = struct.unpack("<I", body[-8:-4])
+    out["logs"].append({
+        "at_ms": round(e.at * 1000), "client": e.client, "topic": e.topic, "qos": e.qos, "retain": e.retain,
+        "props": e.props, "bytes": len(body), "head": body[:4].decode("latin-1"),
+        "tail": body[-4:].decode("latin-1"), "footer_fits": 8 < footer < len(body) - 12,
+        "same_again": e.body() == body,
+        "round_trip": from_json_line(to_json_line(e)).payload == body,
+    })
+print(json.dumps(out))
+"#;
+
+/// With `--fastlog` (the demo stack's `SIM_FASTLOG=1`), each turbine publishes a Parquet
+/// file every minute, the minute just ended, and nothing else the simulator sends changes:
+/// without it, the fixture and its expected output stay what they are. Each file is framed
+/// as Parquet (`PAR1` at both ends, a footer that fits), about half a megabyte, the same
+/// bytes when built again, and carries the MQTT 5 properties the rule
+/// `power_wtg_fastlog` reads. (The files' contents are read back by `pyarrow` and `DuckDB` in
+/// the change that added them; neither is a dependency here.)
+#[test]
+fn the_live_simulators_fast_logs_are_parquet_files_and_change_nothing_else() {
+    let out: serde_json::Value =
+        serde_json::from_str(&python_out(&["-c", FASTLOG_HARNESS])).expect("harness JSON");
+    assert_eq!(out["rest_same"], true, "fast logs changed other messages");
+    let t0 = out["t0"].as_i64().expect("t0");
+    let logs = out["logs"].as_array().expect("logs");
+    assert_eq!(logs.len(), 60, "six turbines, ten minutes");
+    for (i, log) in logs.iter().enumerate() {
+        let turbine = log["topic"]
+            .as_str()
+            .and_then(|t| t.strip_prefix("plant/wf-falster/"))
+            .and_then(|t| t.strip_suffix("/fastlog"))
+            .unwrap_or_else(|| panic!("a fast log's topic: {log}"));
+        assert_eq!(log["client"], format!("wf-falster-{turbine}"), "{log}");
+        assert_eq!((&log["qos"], &log["retain"]), (&1.into(), &false.into()));
+        let bytes = log["bytes"].as_u64().unwrap_or(0);
+        assert!(
+            (450_000..=550_000).contains(&bytes),
+            "{turbine}: {bytes} bytes"
+        );
+        assert_eq!(
+            (&log["head"], &log["tail"]),
+            (&"PAR1".into(), &"PAR1".into())
+        );
+        for check in ["footer_fits", "same_again", "round_trip"] {
+            assert_eq!(log[check], true, "{turbine}: {check}");
+        }
+        let props = &log["props"];
+        assert_eq!(props["content_type"], "application/vnd.apache.parquet");
+        assert_eq!(props["payload_format"], 0);
+        let user: BTreeMap<String, String> = props["user"]
+            .as_array()
+            .expect("user properties")
+            .iter()
+            .map(|p| (p[0].as_str().unwrap().into(), p[1].as_str().unwrap().into()))
+            .collect();
+        let ms = |k: &str| user[k].parse::<i64>().expect(k);
+        let minute = i64::try_from(i / 6).unwrap();
+        assert_eq!(
+            ms("start_ms"),
+            t0 + (minute - 1) * 60_000,
+            "{turbine} {user:?}"
+        );
+        assert_eq!(ms("end_ms") - ms("start_ms"), 60_000);
+        let at_ms = log["at_ms"].as_i64().expect("at_ms");
+        assert!(
+            (2_000..10_000).contains(&(t0 + at_ms - ms("end_ms"))),
+            "{turbine} uploads its minute within 10 s"
+        );
+        assert_eq!(
+            (
+                &user["schema"][..],
+                &user["turbine"][..],
+                &user["rows"][..],
+                &user["rate_hz"][..]
+            ),
+            ("fastlog/v1", turbine, "3000", "50")
+        );
+    }
+}
+
 /// Exercises `sim/mqtt.py`'s `Client` against fake brokers on a local socket, for
 /// [`the_simulators_mqtt_client_bounds_its_waits_and_reads_while_idle`]. Each step runs in
 /// a thread joined with a limit, so a wait that never ends is reported as `hung`, not
