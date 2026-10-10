@@ -547,8 +547,11 @@ fn hashing_encoding_and_bits_emqx_docs() {
     assert_eq!(val("bitsr(-8, 6)"), "-1");
     assert_eq!(val("bitor(-10, -8)"), "-2");
     assert_eq!(val("bitxor(-10, -8)"), "14");
-    // Binary data is never silently corrupted by JSON encoding.
-    assert!(fails("SELECT base64_decode('y0jN') as r FROM \"t/#\"", "{}").contains("binary"));
+    // Bytes that are not text are U+FFFD in JSON, as in EMQX (jiffy's `force_utf8`).
+    assert_eq!(
+        one("SELECT base64_decode('y0jN') as r FROM \"t/#\"", "{}"),
+        "{\"r\":\"\u{FFFD}H\u{FFFD}\"}"
+    );
 }
 
 #[test]
@@ -595,7 +598,251 @@ fn time_functions_emqx_docs() {
 fn conditional_functions() {
     assert_eq!(val("coalesce(payload.nope, 0)"), "0");
     assert_eq!(val("coalesce_ne('', 'x')"), r#""x""#);
-    assert_eq!(val("coalesce(nope, also_nope)"), "null");
+    assert_eq!(val("coalesce(nope, also_nope)"), r#""undefined""#);
+}
+
+/// EMQX 6.3.1, `emqx_rule_sqltester:test/1` on each statement and payload, and
+/// `emqx_rule_funcs.erl`: `coalesce([]) -> null(); coalesce([undefined | T]) ->
+/// coalesce(T); coalesce([H | _T]) -> H.`, `coalesce(A, B) -> coalesce([A, B]).`, with
+/// `null() -> undefined`. There is no clause for one argument that is not a list
+/// (`bad_sql_function_argument`) and no `coalesce/0` or `/3`
+/// (`sql_function_not_supported`). `coalesce_ne` also skips `""` and `<<>>`, and `""`
+/// is the empty list. A JSON `null` is a value to both.
+#[test]
+fn coalesce_takes_a_list_or_two_candidates_as_in_emqx() {
+    let a = |expr: &str, payload: &str| one(&format!("SELECT {expr} AS a FROM \"t/#\""), payload);
+    // One argument: the list of candidates.
+    assert_eq!(
+        a("coalesce(payload.x)", r#"{"x":[]}"#),
+        r#"{"a":"undefined"}"#
+    );
+    assert_eq!(
+        a("coalesce(payload.x)", r#"{"x":[null,2]}"#),
+        r#"{"a":null}"#
+    );
+    assert_eq!(a("coalesce(payload.x)", r#"{"x":[[],2]}"#), r#"{"a":[]}"#);
+    assert_eq!(
+        a("coalesce([payload.x, payload.y])", "{}"),
+        r#"{"a":"undefined"}"#
+    );
+    assert_eq!(a("coalesce_ne(payload.x)", r#"{"x":["",2]}"#), r#"{"a":2}"#);
+    assert_eq!(a("coalesce_ne(payload.x)", r#"{"x":[[],2]}"#), r#"{"a":2}"#);
+    assert_eq!(
+        a("coalesce_ne(payload.x)", r#"{"x":[null,""]}"#),
+        r#"{"a":null}"#
+    );
+    assert_eq!(
+        a("coalesce_ne(payload.x)", r#"{"x":[]}"#),
+        r#"{"a":"undefined"}"#
+    );
+    // ... and nothing else.
+    for f in ["coalesce", "coalesce_ne"] {
+        for payload in [
+            "{}",
+            r#"{"x":5}"#,
+            r#"{"x":"s"}"#,
+            r#"{"x":""}"#,
+            r#"{"x":{"a":1}}"#,
+            r#"{"x":null}"#,
+        ] {
+            let e = fails(&format!("SELECT {f}(payload.x) AS a FROM \"t/#\""), payload);
+            assert!(e.contains("expected an array"), "{f} on {payload}: {e}");
+        }
+        // No other arity.
+        for args in ["", "payload.x, 1, 2"] {
+            let e = fails(&format!("SELECT {f}({args}) AS a FROM \"t/#\""), "{}");
+            assert!(e.contains("argument(s)"), "{f}({args}): {e}");
+        }
+    }
+    // Two arguments.
+    let two = "coalesce(payload.x, payload.y)";
+    assert_eq!(a(two, "{}"), r#"{"a":"undefined"}"#);
+    assert_eq!(a(two, r#"{"x":null,"y":2}"#), r#"{"a":null}"#);
+    let two = "coalesce_ne(payload.x, payload.y)";
+    assert_eq!(a(two, r#"{"x":""}"#), r#"{"a":"undefined"}"#);
+    assert_eq!(a(two, r#"{"x":[],"y":3}"#), r#"{"a":3}"#);
+    assert_eq!(a(two, r#"{"x":null,"y":3}"#), r#"{"a":null}"#);
+}
+
+/// The statements mqttd's grammar accepts and EMQX's does not: docs/RULES.md lists each
+/// in "Differences from EMQX" as an mqttd-only extension. EMQX 6.3.1 (rulesql 0.2.1)
+/// refuses every one of them, probed with `emqx_rule_sqltester:test/1`: `Missing FROM or
+/// WHERE` or `syntax error before: …` from the parser (`rulesql.yrl` has `AND`, `OR`,
+/// `NOT` and `IN` only under `search_condition`, `CASE` only as a whole field or
+/// argument, no parenthesised comparison, and paths only from a `NAME`), `illegal "_"`
+/// from the lexer, and `badarg` from `list_to_float/1` for `10e5` and `1.5f`, which
+/// `sql_lex.xrl` passes as numbers. They stay accepted, so rules written for mqttd keep
+/// loading; every statement EMQX accepts loads here too.
+#[test]
+fn statements_only_mqttd_accepts_keep_their_meaning() {
+    for (sql, payload, want) in ONLY_MQTTD.iter().chain(EMQX_TOO) {
+        assert_eq!(one(sql, payload), *want, "{sql}");
+    }
+}
+
+/// Statements EMQX 6.3.1 refuses and mqttd accepts: statement, payload, output.
+const ONLY_MQTTD: &[(&str, &str, &str)] = &[
+    // AND / OR / NOT / IN outside WHERE, INCASE and WHEN.
+    (
+        r#"SELECT payload.a > 1 AND payload.b < 2 AS f FROM "t/#""#,
+        r#"{"a":2,"b":1}"#,
+        r#"{"f":true}"#,
+    ),
+    (
+        r#"SELECT payload.a > 1 OR payload.b < 2 AS f FROM "t/#""#,
+        r#"{"a":0,"b":5}"#,
+        r#"{"f":false}"#,
+    ),
+    (
+        r#"SELECT NOT payload.a AS f FROM "t/#""#,
+        r#"{"a":true}"#,
+        r#"{"f":false}"#,
+    ),
+    (
+        r#"SELECT payload.a IN (1,2) AS f FROM "t/#""#,
+        r#"{"a":1}"#,
+        r#"{"f":true}"#,
+    ),
+    (
+        r#"SELECT payload.a NOT IN (1,2) AS f FROM "t/#""#,
+        r#"{"a":1}"#,
+        r#"{"f":false}"#,
+    ),
+    (
+        r#"FOREACH payload.a DO item IN (1,2) AS f FROM "t/#""#,
+        r#"{"a":[1]}"#,
+        r#"{"f":true}"#,
+    ),
+    (
+        r#"SELECT is_bool(NOT payload.a) AS f FROM "t/#""#,
+        r#"{"a":true}"#,
+        r#"{"f":true}"#,
+    ),
+    // A parenthesised comparison, one in an array, and CASE inside an expression.
+    (
+        r#"SELECT (payload.a > 1) AS f FROM "t/#""#,
+        r#"{"a":2}"#,
+        r#"{"f":true}"#,
+    ),
+    (
+        r#"SELECT [1, payload.a > 1] AS f FROM "t/#""#,
+        r#"{"a":1}"#,
+        r#"{"f":[1,false]}"#,
+    ),
+    (
+        r#"SELECT 1 + CASE WHEN true THEN 1 ELSE 2 END AS f FROM "t/#""#,
+        "{}",
+        r#"{"f":2}"#,
+    ),
+    // A keyword as a path segment (EMQX wants `payload.'from'`).
+    (
+        r#"SELECT payload.from AS f FROM "t/#""#,
+        r#"{"from":7}"#,
+        r#"{"f":7}"#,
+    ),
+    (
+        r#"SELECT payload.in AS f FROM "t/#" WHERE payload.end = 1"#,
+        r#"{"in":7,"end":1}"#,
+        r#"{"f":7}"#,
+    ),
+    // Field and index access on a computed value.
+    (
+        r#"SELECT json_decode(payload).a AS f FROM "t/#""#,
+        r#"{"a":7}"#,
+        r#"{"f":7}"#,
+    ),
+    (
+        r#"SELECT json_decode(payload)[1] AS f FROM "t/#""#,
+        "[7]",
+        r#"{"f":7}"#,
+    ),
+    (
+        r#"SELECT (payload).a AS f FROM "t/#""#,
+        r#"{"a":7}"#,
+        r#"{"f":7}"#,
+    ),
+    // A name that starts with `_`.
+    (
+        r#"SELECT payload._x AS _f FROM "t/#""#,
+        r#"{"_x":1}"#,
+        r#"{"_f":1}"#,
+    ),
+    // A float with an exponent and no fraction, and the lexer's `f`/`d` suffix.
+    (r#"SELECT 1e5 AS f FROM "t/#""#, "{}", r#"{"f":1.0e5}"#),
+    (r#"SELECT 10e5 AS f FROM "t/#""#, "{}", r#"{"f":1.0e6}"#),
+    (r#"SELECT 1.5f AS f FROM "t/#""#, "{}", r#"{"f":1.5}"#),
+    (r#"SELECT 1.5d AS f FROM "t/#""#, "{}", r#"{"f":1.5}"#),
+];
+
+/// Their neighbours, which EMQX accepts too, with the same outputs there.
+const EMQX_TOO: &[(&str, &str, &str)] = &[
+    (
+        r#"SELECT payload.a > 1 AS f FROM "t/#""#,
+        r#"{"a":2}"#,
+        r#"{"f":true}"#,
+    ),
+    (
+        r#"SELECT payload.'from' AS f FROM "t/#""#,
+        r#"{"from":7}"#,
+        r#"{"f":7}"#,
+    ),
+    (
+        r#"SELECT CASE WHEN payload.a IN (1,2) THEN 1 ELSE 2 END AS f FROM "t/#""#,
+        r#"{"a":1}"#,
+        r#"{"f":1}"#,
+    ),
+    (r#"SELECT 1.5e3 AS f FROM "t/#""#, "{}", r#"{"f":1.5e3}"#),
+    (
+        r#"SELECT is_bool(payload.a > 1) AS f FROM "t/#""#,
+        r#"{"a":2}"#,
+        r#"{"f":true}"#,
+    ),
+];
+
+/// EMQX 6.3.1: a value that is not UTF-8 text, here `sprintf('~c', 210)` (the one byte
+/// `<<210>>`), is U+FFFD wherever the rule's output is JSON-encoded
+/// (`emqx_utils_json:encode/1`: the whole output, `${.}`, a map or list in a template,
+/// `json_encode`), and its own bytes in a template (`emqx_template:render/2` of
+/// `a${x}b` gives `[<<"a">>, <<210>>, <<"b">>]`).
+#[test]
+fn text_that_is_not_utf8_is_repaired_in_json_and_exact_in_a_template() {
+    let sql = "SELECT sprintf('~c', 210) AS x, [sprintf('~c', 210), 1] AS l FROM \"t/#\"";
+    let whole = "{\"x\":\"\u{FFFD}\",\"l\":[\"\u{FFFD}\",1]}";
+    assert_eq!(one(sql, "{}"), whole);
+    assert_eq!(
+        val("json_encode(sprintf('~c', 210))"),
+        "\"\\\"\u{FFFD}\\\"\""
+    );
+    // `str/1` is `emqx_utils_conv:bin/1`, which hands a binary back as it is:
+    // `bin2hexstr(str(sprintf('~c', 210)))` is `D2` there.
+    assert_eq!(val("bin2hexstr(str(sprintf('~c', 210)))"), r#""D2""#);
+    let set = load(
+        r#"
+        [rules.r]
+        sql = '''SELECT sprintf('~c', 210) AS x, [sprintf('~c', 210), 1] AS l FROM "t/#"'''
+        actions = [
+          { function = "republish", args = { topic = "out", payload = "a${x}b" } },
+          { function = "republish", args = { topic = "out", payload = "${l}" } },
+          { function = "republish", args = { topic = "out", payload = "${.}" } },
+          { function = "console" },
+        ]
+        "#,
+    );
+    let payload = Bytes::from_static(b"{}");
+    let props = mqtt_core::AppProperties::default();
+    let (out, log) = effects(&set, &msg("t/a", &payload, &props));
+    assert_eq!(log.len(), 5, "{log:?}");
+    assert_eq!(&republished(&out[0].1).payload[..], [b'a', 210, b'b']);
+    assert_eq!(
+        &republished(&out[1].1).payload[..],
+        "[\"\u{FFFD}\",1]".as_bytes()
+    );
+    assert_eq!(&republished(&out[2].1).payload[..], whole.as_bytes());
+    assert!(
+        matches!(&out[3].1, Effect::Console(line) if line == whole),
+        "{:?}",
+        out[3].1
+    );
 }
 
 #[test]

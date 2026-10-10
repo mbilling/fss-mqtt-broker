@@ -1101,6 +1101,28 @@ fn rule_test_prints_each_output_of_a_publish_statement_as_json() {
     assert_eq!(ran.stderr, "");
 }
 
+/// `--rule-test` prints each output as the rule renders it, as EMQX 6.3.1 encodes the
+/// same values (`emqx_utils_json:encode/1`): every digit of an integer past 64 bits, the
+/// float `1.0e20`, the keys in the statement's order, and U+FFFD for the byte
+/// `sprintf('~c', 210)` gives, which is not UTF-8.
+#[test]
+fn rule_test_prints_an_output_exactly_as_the_rule_renders_it() {
+    let ran = cli(&[
+        "--rule-test",
+        "--sql",
+        "SELECT payload.z AS z, payload.z + 1 AS next, payload.f AS f, payload.m AS m, \
+         sprintf('~c', 210) AS c FROM \"t/#\"",
+        "--payload",
+        r#"{"z":123456789012345678901234567890,"f":1e20,"m":{"b":1,"a":2}}"#,
+    ]);
+    assert_eq!(ran.code, Some(0), "{ran:?}");
+    assert_eq!(
+        ran.stdout,
+        "{\"z\":123456789012345678901234567890,\"next\":123456789012345678901234567891,\
+         \"f\":1.0e20,\"m\":{\"b\":1,\"a\":2},\"c\":\"\u{FFFD}\"}\n"
+    );
+}
+
 /// `--rule-test` on a `$events` statement runs it against a sample of that event, not a
 /// fake publish: `event` is `client.connected`, the sample is an MQTT 5 client
 /// (`proto_ver` 5) with keepalive 60, and `--clientid` is its client id. Before the audit

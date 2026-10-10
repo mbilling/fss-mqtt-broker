@@ -352,15 +352,15 @@ double-quote one in particular): run `--check-rules` on the file for those, and 
   ```
 
 - **The log.** A rule whose statement fails (a payload that is not JSON, a type error, a
-  limit) or whose action fails (a rendered topic with a wildcard, `${.}` of binary data, a
-  per-message limit, a refusal by the broker) logs one WARN per rule per 10 s, with the
+  limit) or whose action fails (a rendered topic with a wildcard, a per-message limit, a
+  refusal by the broker) logs one WARN per rule per 10 s, with the
   error. That rule's further failures in the window are logged at DEBUG
   (`RUST_LOG=info,mqttd::rules=debug` shows each one); another rule's failure gets its own
   WARN:
 
   ```text
   WARN mqttd::rules: rule SQL failed (counted in mqttd_rule_evaluations_total{result="failed"}; this rule's further failures within 10s are logged at debug) rule=sqlfail error=payload is not JSON, so payload.<field> is unreadable (invalid JSON: expected ident at line 1 column 2)
-  WARN mqttd::rules: rule action failed (counted in mqttd_rule_actions_total{result="failed"}; this rule's further failures within 10s are logged at debug) rule=star error=cannot JSON-encode binary (non-UTF-8) data; select base64_encode(...) or bin2hexstr(...) of it instead
+  WARN mqttd::rules: rule action failed (counted in mqttd_rule_actions_total{result="failed"}; this rule's further failures within 10s are logged at debug) rule=route error=rendered topic "out/a+b" is not a valid topic name (empty, too long, or containing + # or NUL)
   ```
 
   A reload logs `rules reloaded (ADR 0083) rules=<n> enabled=<n> digest=<sha256>`, or
@@ -600,7 +600,9 @@ mosquitto_sub -h 127.0.0.1 -t '$SYS/brokers/+/trace/rules/high_temp' -v
 - **`result`** is `passed`, `no_result` or `failed`, with `error` for a failure.
 - **`outputs`** are what the rule's actions rendered, one per action and output row: a
   `republish` (topic, QoS, retain flag, payload as above), a `console`, whose `output` is
-  the selected fields as a JSON object, or past 1 KiB the first 1 KiB as text with
+  the selected fields as a JSON object, the text the rule rendered (every digit of an
+  integer past 64 bits, the keys in the statement's order; a dry run's
+  `POST /admin/v1/rules/test` answers the same), or past 1 KiB the first 1 KiB as text with
   `"output_bytes": <full length>, "truncated": true`, or an action that could not render
   (`{"action_index": 0, "error": "…"}`). At most 16; the rest are counted in
   `outputs_omitted`. They are what was rendered, not what was delivered: a derived message
@@ -1088,9 +1090,11 @@ expression has an alias. Without `DO`, an output is every field plus the element
 EMQX. Leading expressions can name intermediate values:
 `FOREACH payload.data AS d, d.sensors AS s DO s.name AS name FROM "t/#"`.
 
-Within the same meaning, mqttd accepts a little more than EMQX: `AND`/`OR`/`NOT` in
+Within the same meaning, mqttd accepts a little more than EMQX: `AND`/`OR`/`NOT`/`IN` in
 `SELECT`, keywords as path segments (`payload.from`), field access on a computed value
-(`json_decode(payload).a`), and `1e5` float literals.
+(`json_decode(payload).a`), and `1e5` float literals. Every statement EMQX accepts loads
+in mqttd, but a statement that uses one of these does not load in EMQX:
+[Differences from EMQX](#differences-from-emqx) lists them all.
 
 ## Fields
 
@@ -1359,8 +1363,11 @@ Traps that EMQX's reference states only in passing, each checked against this en
 path syntax of the SQL: `${payload.a.b}`, `${pub_props.'User-Property'.k}`,
 `${list[1]}`. `${.}` is the whole output as JSON. A missing value renders as
 `undefined`, as in EMQX, so a mistake shows up in the message instead of silently
-disappearing. JSON-encoding a binary (non-UTF-8) value is an error, never a lossy
-conversion: select `base64_encode(payload)` instead.
+disappearing. A string or binary placeholder renders its own bytes, whatever they are.
+JSON holds text, so where a value is JSON-encoded (`${.}`, a map or an array in a
+placeholder, the `console` line, `json_encode`) each byte sequence that is not UTF-8
+becomes U+FFFD, as in EMQX: select `base64_encode(payload)` or `bin2hexstr(payload)` to
+keep the bytes.
 
 **Size.** A derived message is not bounded by `limits.max_packet_size`, which limits what
 clients send. A subscriber whose MQTT 5 Maximum Packet Size it exceeds does not get its
@@ -1520,7 +1527,8 @@ doubles your message count doubles the routing load.
 
 Verified against EMQX's rule engine source and documentation (emqx/emqx and
 emqx/emqx-docs, release 6.2). Each row is a behaviour a rule written for EMQX could
-notice.
+notice, except the last, which is what a rule written for mqttd could: statements only
+mqttd accepts.
 
 | | EMQX | mqttd |
 |---|---|---|
@@ -1545,6 +1553,7 @@ notice.
 | Rule statistics | The dashboard and the REST API | `/metrics`; with `sys_interval_secs`, `$SYS/brokers/<node>/rules/<id>`; `GET /admin/v1/rules` |
 | Changing rules | The dashboard and the REST API, applied across the cluster | The rules file, reloaded; for a listed writer, the admin API writes that file, on the node it asks |
 | Testing a rule | The dashboard's SQL test | `mqttd --rule-test` (the statement only), or `POST /admin/v1/rules/test` (the statement and the rendered actions) |
+| Statements only mqttd accepts (mqttd-only extensions) | A parse error: the rule is not created (EMQX 6.3.1, rulesql 0.2.1) | Accepted, each with the meaning it has where EMQX allows it: `AND`, `OR`, `NOT`, `IN` and `NOT IN` outside `WHERE`/`INCASE`/`WHEN` (in `SELECT`, `DO`, a function argument, an array); a comparison in parentheses or in an array (`(a > 1) AS ok`); `CASE` inside a larger expression (`1 + CASE … END`); a keyword as a path segment (`payload.from`, which EMQX takes as `payload.'from'`); field or index access on a computed value (`json_decode(payload).a`, `nth(1, l).b`); a name starting with `_`; a float literal with an exponent and no fraction (`1e5`, `10e5`) or with an `f`/`d` suffix (`1.5f`). Every statement EMQX accepts loads in mqttd; leave these out of a rule that must also load in EMQX. |
 
 ## Migrating rules from EMQX
 

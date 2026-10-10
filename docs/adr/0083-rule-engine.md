@@ -596,3 +596,39 @@ probed on 6.3.1:
 
 This supersedes the previous amendment's `subbits` note: an integer outside 64 bits is
 now returned, and only a bit string that is not whole bytes fails.
+
+## Amendment (2026-10-10): JSON text, `coalesce`, and what only mqttd accepts
+
+Leftovers from verifying against EMQX 6.3.1, each probed there
+(`emqx_rule_sqltester:test/1`, `emqx_utils_json:encode/1`) and pinned by a test:
+
+- **JSON of bytes that are not UTF-8.** Encoding such a value was an error ("never a
+  lossy conversion"). EMQX encodes with jiffy's `force_utf8`, which repairs instead:
+  `sprintf('~c', 210)` is `"\uFFFD"` in the output, in `${.}`, in a map or array
+  placeholder and in `json_encode`, and stays the byte itself in `${x}`. mqttd now does
+  the same, following `jiffy_utf8:fix_bin/1`: one U+FFFD for a broken byte and the
+  continuation bytes after it, overlong forms decoded (`C0 80` is U+0000), a CESU-8
+  surrogate pair joined, and, once any string in a value needed the repair, U+FFFE and
+  U+FFFF replaced in all of them. The `console` line and `--rule-test` therefore show a
+  binary payload with replacement characters where they failed before.
+- **JSON escapes.** jiffy writes the controls without a short escape as `\u00XX` in
+  upper case (`\u001F`); mqttd wrote lower case.
+- **`coalesce` and `coalesce_ne`** are EMQX's clauses: one argument is the list of
+  candidates and anything else fails the rule, two arguments are the candidates, and no
+  other count loads (mqttd took any number, and a lone non-list as a candidate). With
+  no candidate left the result is `undefined` (it was `null`), and `coalesce_ne` also
+  skips the empty list, which is Erlang's `""`.
+- **`str` of a binary** is the binary (`emqx_utils_conv:bin/1`), not its text with
+  replacement characters.
+- **The trace and the dry run** showed a console output read back by serde_json: an
+  integer past 64 bits as a float, the keys sorted. Both now carry the text the rule
+  rendered (`serde_json`'s `raw_value`, in `mqttd` only).
+- **What only mqttd accepts stays, and is documented.** The grammar's superset is kept,
+  since removing it would break rules written for mqttd, and every statement EMQX accepts
+  still loads. RULES.md's "Differences from EMQX" now lists each extension, with `IN`
+  outside `WHERE` added; EMQX 6.3.1 refuses every one (a parse error, `illegal "_"`, or
+  `badarg` from `list_to_float/1` for `10e5` and `1.5f`).
+
+Not matched: `+`, `concat` and `str_utf8` of bytes that are not UTF-8 give EMQX the
+Erlang tuple `{incomplete, …}` (what `unicode:characters_to_binary/1` returns), which
+nothing downstream accepts; mqttd gives the text with replacement characters.

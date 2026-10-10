@@ -6,9 +6,10 @@
 # it: it is a debugging aid, not a data path. It publishes nothing, and the original
 # message is delivered as usual.
 #
-# The log line is JSON, and JSON cannot hold raw bytes: for a message whose payload (or
-# MQTT 5 Correlation-Data) is not UTF-8 text, the broker logs a WARN instead of the
-# line. To see such payloads, log them as hex: docs/RULES-COOKBOOK.md shows the rule.
+# The log line is JSON, and JSON holds text, not raw bytes: in a payload (or MQTT 5
+# Correlation-Data) that is not UTF-8 text, each byte sequence that is not text is
+# logged as U+FFFD. To see such payloads, log them as hex: docs/RULES-COOKBOOK.md shows
+# the rule.
 #
 # In:  factory/line1/temp  qos=1 retain=0  {"t": 20.5}
 # The broker logs one line for it:

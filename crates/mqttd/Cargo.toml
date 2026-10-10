@@ -21,7 +21,9 @@ async-trait = "0.1"
 serde = { workspace = true, features = ["derive"] }
 futures-util = { workspace = true }
 mimalloc = { workspace = true }
-serde_json.workspace = true
+# `raw_value`: a rule's console output goes into a trace record and a dry run's answer as
+# the JSON text the rule rendered, not re-read (integers past 64 bits, key order).
+serde_json = { workspace = true, features = ["raw_value"] }
 mqtt-codec = { path = "../mqtt-codec", version = "1.0.0" }
 mqtt-core = { path = "../mqtt-core", version = "1.0.0" }
 mqtt-net = { path = "../mqtt-net", version = "1.0.0" }

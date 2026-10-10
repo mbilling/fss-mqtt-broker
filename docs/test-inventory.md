@@ -892,7 +892,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::sink_records_through_a_trait_object`
 - `tests::tampering_with_any_field_changes_the_head`
 
-## `crates/mqtt-rules/src/lib.rs` — 151 test(s)
+## `crates/mqtt-rules/src/lib.rs` — 156 test(s)
 
 - `edit::tests::a_json_rule_body_is_a_rule_edit`
 - `edit::tests::an_insert_appends_the_rule_at_the_end`
@@ -936,6 +936,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::bit_sequence_functions_follow_emqx`
 - `tests::case_expression_emqx_docs`
 - `tests::catastrophic_backtracking_is_bounded_and_no_match`
+- `tests::coalesce_takes_a_list_or_two_candidates_as_in_emqx`
 - `tests::comments_and_case_insensitive_keywords`
 - `tests::comparison_semantics_follow_emqx`
 - `tests::compression_matches_emqx_byte_for_byte`
@@ -1000,8 +1001,10 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::sink_helper_functions_follow_emqx`
 - `tests::sprintf_is_erlang_io_lib_format`
 - `tests::sprintf_widths_from_the_payload_are_bounded`
+- `tests::statements_only_mqttd_accepts_keep_their_meaning`
 - `tests::string_functions_emqx_docs`
 - `tests::string_functions_work_on_grapheme_clusters_like_emqx`
+- `tests::text_that_is_not_utf8_is_repaired_in_json_and_exact_in_a_template`
 - `tests::the_growth_budget_is_per_message`
 - `tests::the_match_limit_is_otps_and_reaching_it_is_no_match`
 - `tests::the_new_events_are_named_as_emqx_names_them`
@@ -1041,9 +1044,11 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests_republish::republishing_stops_at_the_depth_cap`
 - `tests_republish::select_star_shows_an_undefined_username`
 - `tests_republish::the_budget_spans_every_reentry`
-- `value::tests::binary_is_never_silently_json_encoded`
+- `value::tests::a_json_repair_covers_the_whole_value`
 - `value::tests::floats_render_like_emqx_str`
+- `value::tests::json_of_bytes_that_are_not_utf8_is_repaired_as_jiffy_repairs_it`
 - `value::tests::json_round_trip_keeps_key_order_and_types`
+- `value::tests::json_strings_escape_as_jiffy_escapes_them`
 - `value::tests::numbers_compare_across_int_and_float`
 
 ## `crates/mqtt-storage/src/lib.rs` — 91 test(s)
@@ -1847,7 +1852,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `the_authorization_dry_run_never_allows_a_publish_into_sys`
 - `the_cluster_view_compares_every_nodes_rules_digest`
 
-## `crates/mqttd/tests/admin_rules.rs` — 15 test(s)
+## `crates/mqttd/tests/admin_rules.rs` — 16 test(s)
 
 - `a_last_error_is_shown_only_for_the_definition_it_was_about`
 - `a_rejected_reload_says_the_file_was_written_and_what_still_runs`
@@ -1860,6 +1865,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `check_says_whether_text_would_load_and_where_it_would_not`
 - `if_match_and_every_edit_are_about_the_file_on_disk`
 - `one_rule_is_edited_in_place_and_the_rest_of_the_file_kept_byte_for_byte`
+- `the_dry_run_answers_a_console_output_as_the_rule_rendered_it`
 - `the_dry_run_shows_what_the_rules_would_do_and_changes_nothing`
 - `the_rules_file_is_read_verbatim_by_an_operator_only`
 - `the_running_rules_are_read_whole_by_an_operator_and_redacted_for_a_viewer`
@@ -2262,7 +2268,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `rules_republishing_into_each_other_stop_at_the_depth_cap`
 - `the_original_s_limits_cover_the_whole_chain`
 
-## `crates/mqttd/tests/rules_binary.rs` — 46 test(s)
+## `crates/mqttd/tests/rules_binary.rs` — 47 test(s)
 
 - `a_closed_stdout_leaves_probe_and_backup_their_exit_status`
 - `a_closed_stdout_neither_panics_a_command_nor_changes_its_exit_status`
@@ -2299,6 +2305,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `in_a_two_process_cluster_a_publish_is_evaluated_once_on_its_landing_node`
 - `no_local_does_not_suppress_a_derived_message_for_its_publisher`
 - `rule_test_event_picks_among_several_events`
+- `rule_test_prints_an_output_exactly_as_the_rule_renders_it`
 - `rule_test_prints_each_output_of_a_publish_statement_as_json`
 - `rule_test_refuses_an_input_the_rule_would_never_see`
 - `rule_test_runs_a_topics_and_events_statement_against_a_publish_unless_event_is_given`
@@ -2317,7 +2324,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `every_recipe_file_has_a_case_and_every_case_a_file`
 - `every_recipe_header_shows_what_the_recipe_does`
 - `every_recipe_passes_check_rules_with_no_warning`
-- `recipe_01_binary_payloads_warn_and_the_hex_variant_logs_them`
+- `recipe_01_binary_payloads_log_replacement_characters_and_the_hex_variant_logs_the_bytes`
 - `recipe_01_rule_test_runs_a_statement_offline`
 - `the_gotchas_the_cookbook_states_hold`
 - `the_header_check_rejects_a_header_that_does_not_match`
@@ -2350,10 +2357,11 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `the_extraction_recognises_every_documented_form`
 - `the_extraction_refuses_what_it_cannot_run`
 
-## `crates/mqttd/tests/rules_sys.rs` — 16 test(s)
+## `crates/mqttd/tests/rules_sys.rs` — 17 test(s)
 
 - `a_secret_in_a_config_error_or_in_a_rule_never_reaches_sys`
 - `a_tick_the_pool_cannot_carry_is_skipped_and_counted`
+- `a_trace_record_carries_a_console_output_as_the_rule_rendered_it`
 - `a_trace_record_lists_sixteen_outputs_and_counts_the_rest`
 - `an_interval_change_applies_at_once`
 - `every_sys_message_carries_a_message_expiry`
