@@ -27,7 +27,7 @@ toml_edit.workspace = true
 pcre2 = "0.2.11"
 pcre2-sys = "0.2.10"
 # base64_encode / base64_decode — already in the shipped graph via reqwest/hyper-util.
-base64 = "0.22"
+base64 = "0.23"
 # Date/time functions — already in the shipped graph via openraft (default features).
 chrono = "0.4"
 # sha / sha256 digests and the uuid/random sources: the workspace's single crypto
