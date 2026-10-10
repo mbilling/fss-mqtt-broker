@@ -183,6 +183,14 @@ struct RuleResultLabel {
     result: String,
 }
 
+/// `{rule, guard}` for `mqttd_rule_recursive_republish_total` (ADR 0083): a rule id,
+/// bounded as in [`RuleResultLabel`], and `same_rule` or `depth`.
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct RuleGuardLabel {
+    rule: String,
+    guard: String,
+}
+
 /// `{rule}` for `mqttd_rule_eval_seconds_total`: a rule id from the operator's rules
 /// file, bounded as in [`RuleResultLabel`].
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
@@ -294,6 +302,7 @@ struct OtelInstruments {
     config_info: OtelGauge<i64>,
     rule_evaluations: OtelCounter<u64>,
     rule_actions: OtelCounter<u64>,
+    rule_recursive_republish: OtelCounter<u64>,
     rule_eval_seconds: OtelCounter<f64>,
     rules_loaded: OtelGauge<i64>,
     rules_info: OtelGauge<i64>,
@@ -394,6 +403,7 @@ impl OtelInstruments {
             config_info: meter.i64_gauge("config_info").build(),
             rule_evaluations: meter.u64_counter("rule_evaluations").build(),
             rule_actions: meter.u64_counter("rule_actions").build(),
+            rule_recursive_republish: meter.u64_counter("rule_recursive_republish").build(),
             rule_eval_seconds: meter.f64_counter("rule_eval_seconds").build(),
             rules_loaded: meter.i64_gauge("rules_loaded").build(),
             rules_info: meter.i64_gauge("rules_info").build(),
@@ -583,6 +593,9 @@ pub struct Metrics {
     rule_evaluations_total: Family<RuleResultLabel, Counter>,
     /// Rule actions run (ADR 0083), by rule and result (`ok`, `failed`).
     rule_actions_total: Family<RuleResultLabel, Counter>,
+    /// Republish actions not run because their message would loop (ADR 0083), by rule
+    /// and guard (`same_rule`, `depth`).
+    rule_recursive_republish_total: Family<RuleGuardLabel, Counter>,
     /// Time spent evaluating each rule, in seconds (ADR 0084).
     rule_eval_seconds_total: Family<RuleLabel, Counter<f64, std::sync::atomic::AtomicU64>>,
     /// Enabled rules loaded on this node (ADR 0083).
@@ -1298,6 +1311,15 @@ impl Metrics {
              brownout, a refused original, an ingress shed, a failed durable write; the \
              triggering message is unaffected)",
         );
+        let rule_recursive_republish_total = register_family(
+            &mut registry,
+            "rule_recursive_republish",
+            "Republish actions not run because their message would loop (ADR 0083), by \
+             rule id and guard: same_rule (the message re-entering the rules is one this \
+             rule republished — EMQX's recursive_republish_detected; counted as an ok \
+             action, as EMQX counts it), depth (it is 32 republishes from the message \
+             that started the chain; counted as a failed action)",
+        );
         let rule_eval_seconds_total =
             Family::<RuleLabel, Counter<f64, std::sync::atomic::AtomicU64>>::default();
         registry.register(
@@ -1459,6 +1481,7 @@ impl Metrics {
             config_info_prev: std::sync::Mutex::new(None),
             rule_evaluations_total,
             rule_actions_total,
+            rule_recursive_republish_total,
             rule_eval_seconds_total,
             rules_loaded,
             rules_info,
@@ -2295,6 +2318,24 @@ impl Metrics {
             &[
                 KeyValue::new("rule", rule.to_string()),
                 KeyValue::new("result", result),
+            ],
+        );
+    }
+
+    /// One republish action of `rule` not run because its message would loop (ADR
+    /// 0083): `guard` is `same_rule` or `depth`.
+    pub fn rule_recursive_republish(&self, rule: &str, guard: &'static str) {
+        self.rule_recursive_republish_total
+            .get_or_create(&RuleGuardLabel {
+                rule: rule.to_string(),
+                guard: guard.to_string(),
+            })
+            .inc();
+        self.otel.rule_recursive_republish.add(
+            1,
+            &[
+                KeyValue::new("rule", rule.to_string()),
+                KeyValue::new("guard", guard),
             ],
         );
     }

@@ -290,13 +290,14 @@ const CONVERSION: &[Ex] = &[
     ),
     eq("float/1", "float(20)", "20.0"),
     eq("float/1", "float('3.14')", "3.14"),
-    // The reference writes these two as `31400`, an integer. `float/1` is
+    // The reference writes these as `31400` (an integer) and `0.000314`. `float/1` is
     // `emqx_utils_conv:float/1` (emqx_rule_funcs.erl `float(Data)`), which returns an
-    // Erlang float, and a float renders as `31400.0`, as `float(20) = 20.0` above shows.
-    eq("float/1", "float('3.14e4')", "31400.0"),
-    eq("float/1", "float('3.14e+4')", "31400.0"),
-    eq("float/1", "float('3.14e-4')", "0.000314"),
-    eq("float/1", "float('3.14E-4')", "0.000314"),
+    // Erlang float, and jiffy writes a float in Erlang's shortest form: `3.14e4` and
+    // `3.14e-4` (EMQX 6.3.1), the same numbers.
+    eq("float/1", "float('3.14e4')", "3.14e4"),
+    eq("float/1", "float('3.14e+4')", "3.14e4"),
+    eq("float/1", "float('3.14e-4')", "3.14e-4"),
+    eq("float/1", "float('3.14E-4')", "3.14e-4"),
     eq(
         "float/1",
         "float('0.12345678901234566')",
@@ -308,7 +309,8 @@ const CONVERSION: &[Ex] = &[
         "0.12345678901234566",
     ),
     eq("float/2", "float('3.1415926', 3)", "3.142"),
-    eq("float/2", "float('0.000012345', 5)", "0.00001"),
+    // The reference's `0.00001`, which jiffy writes as `1.0e-5`.
+    eq("float/2", "float('0.000012345', 5)", "1.0e-5"),
     eq("float2str/2", "float2str(0.1, 5)", r#""0.1""#),
     eq(
         "float2str/2",

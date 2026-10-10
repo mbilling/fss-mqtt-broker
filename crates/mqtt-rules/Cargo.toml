@@ -11,19 +11,31 @@ mqtt-core = { path = "../mqtt-core", version = "1.0.0" }
 bytes.workspace = true
 thiserror.workspace = true
 serde = { workspace = true, features = ["derive"] }
-serde_json.workspace = true
+# `float_roundtrip`: a float reads as the double nearest its text, as EMQX's JSON
+# library reads it (without it serde_json's faster path can land one ulp off). Payloads
+# go through this crate's own reader (src/json.rs); this covers the JSON the broker
+# reads back from rule outputs (the dry-run and trace views).
+serde_json = { workspace = true, features = ["float_roundtrip"] }
+# Integers of any size, as Erlang has them (src/num.rs). Both already ship in the
+# broker (x509-parser and jsonwebtoken pull them in).
+num-bigint = { version = "0.4", default-features = false, features = ["std"] }
+num-traits = { version = "0.2", default-features = false, features = ["std"] }
 # The rules file is TOML, like every other mqttd policy file (ADR 0046).
 toml.workspace = true
 # `edit`: one rule changed in place, the rest of the file byte for byte (ADR 0084).
 toml_edit.workspace = true
-# regex_match / regex_replace / regex_extract. `regex-automata` and `regex-syntax`
-# already ship in the broker (tracing-subscriber's env filter), and `regex` itself is
-# already in Cargo.lock; default features off keeps aho-corasick out of the binary.
-# Linear-time matching is load-bearing: a rule evaluates publisher-controlled
-# payloads, so a backtracking engine would be a per-message DoS surface.
-regex = { version = "1", default-features = false, features = ["std", "unicode"] }
+# regex_match / regex_replace / regex_extract: EMQX runs them on Erlang's `re`, which is
+# PCRE2 in byte mode, so this engine runs PCRE2 too — the same library, so the same
+# syntax, semantics and limits (`funcs/re.rs`). `pcre2` is a safe wrapper (the workspace
+# forbids `unsafe`); `pcre2-sys` builds PCRE2 10.46 from its bundled source (BSD-3-Clause
+# with the PCRE2 binary exception; the crates are Unlicense OR MIT) and links it
+# statically — always on musl, and everywhere via `PCRE2_SYS_STATIC` in
+# `.cargo/config.toml`, so no build picks up a system libpcre2 of another version. It is
+# used directly only for PCRE2's error-code constants. No JIT, as in OTP.
+pcre2 = "0.2.11"
+pcre2-sys = "0.2.10"
 # base64_encode / base64_decode — already in the shipped graph via reqwest/hyper-util.
-base64 = "0.22"
+base64 = "0.23"
 # Date/time functions — already in the shipped graph via openraft (default features).
 chrono = "0.4"
 # sha / sha256 digests and the uuid/random sources: the workspace's single crypto

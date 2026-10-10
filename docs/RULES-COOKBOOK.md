@@ -183,7 +183,7 @@ factory/line1/temp  qos=1 retain=0  {"t": 20.5}
 The broker's log has one line for it. The id, the port and the times differ on every run:
 
 ```text
-2026-10-07T16:35:42.937873Z  INFO mqttd::rules: rule console action rule=debug_factory output={"id":"00065D42B4CEC1F9F092834900000000","clientid":"plc-1","payload":"{\"t\": 20.5}","peerhost":"127.0.0.1","peername":"127.0.0.1:54475","topic":"factory/line1/temp","qos":1,"flags":{"dup":false,"retain":false},"pub_props":{"User-Property":{}},"publish_received_at":1791390942937,"client_attrs":{},"event":"message.publish","timestamp":1791390942937,"node":"node-local","metadata":{"rule_id":"debug_factory"}}
+2026-10-07T16:35:42.937873Z  INFO mqttd::rules: rule console action rule=debug_factory output={"id":"00065D42B4CEC1F9F092834900000000","clientid":"plc-1","username":"undefined","payload":"{\"t\": 20.5}","peerhost":"127.0.0.1","peername":"127.0.0.1:54475","topic":"factory/line1/temp","qos":1,"flags":{"dup":false,"retain":false},"pub_props":{"User-Property":{}},"publish_received_at":1791390942937,"client_attrs":{},"event":"message.publish","timestamp":1791390942937,"node":"node-local","metadata":{"rule_id":"debug_factory"}}
 ```
 
 **Try a statement without a broker.** `mqttd --rule-test` runs one statement against a
@@ -396,7 +396,7 @@ SELECT
   payload.vals.h AS measurements.humidity,
   unix_ts_to_rfc3339(payload.ts, 'millisecond') AS time
 FROM "vendor/+/uplink"
-WHERE is_str(payload.devId) AND regex_match(payload.devId, '^[A-Za-z0-9_-]{1,64}$')
+WHERE is_str(payload.devId) AND regex_match(payload.devId, '^[A-Za-z0-9_-]{1,64}\z')
 '''
 actions = [
   { function = "republish", args = { topic = "canonical/${device.id}", qos = 1, payload = "${.}" } },
@@ -513,7 +513,7 @@ DO
   r.sensor        AS sensor,
   r.temp          AS temp,
   payload.gateway AS gateway
-INCASE is_str(r.sensor) AND regex_match(r.sensor, '^[A-Za-z0-9_-]{1,64}$')
+INCASE is_str(r.sensor) AND regex_match(r.sensor, '^[A-Za-z0-9_-]{1,64}\z')
 FROM "gw/+/batch"
 '''
 actions = [
@@ -527,7 +527,7 @@ FOREACH payload.readings AS r
 DO
   r.sensor AS sensor,
   r.temp   AS temp
-INCASE r.temp > 50 AND is_str(r.sensor) AND regex_match(r.sensor, '^[A-Za-z0-9_-]{1,64}$')
+INCASE r.temp > 50 AND is_str(r.sensor) AND regex_match(r.sensor, '^[A-Za-z0-9_-]{1,64}\z')
 FROM "gw/+/batch"
 '''
 actions = [
@@ -593,7 +593,7 @@ SELECT
   payload.device AS device,
   payload
 FROM "ingest"
-WHERE is_str(payload.device) AND regex_match(payload.device, '^[A-Za-z0-9_-]{1,64}$')
+WHERE is_str(payload.device) AND regex_match(payload.device, '^[A-Za-z0-9_-]{1,64}\z')
 '''
 actions = [
   { function = "republish", args = { topic = "devices/${kind}/${device}", qos = 1, payload = "${payload}" } },
@@ -899,7 +899,7 @@ description = "A device connected"
 sql = '''
 SELECT clientid, 'online' AS status, connected_at AS since
 FROM "$events/client/connected"
-WHERE regex_match(clientid, '^sensor-[A-Za-z0-9_-]{1,57}$')
+WHERE regex_match(clientid, '^sensor-[A-Za-z0-9_-]{1,57}\z')
 '''
 actions = [
   { function = "republish", args = { topic = "presence/${clientid}", qos = 1, retain = true, payload = "${.}" } },
@@ -910,7 +910,7 @@ description = "A device went away"
 sql = '''
 SELECT clientid, 'offline' AS status, disconnected_at AS since, reason
 FROM "$events/client/disconnected"
-WHERE regex_match(clientid, '^sensor-[A-Za-z0-9_-]{1,57}$') AND reason <> 'takenover' AND reason <> 'discarded'
+WHERE regex_match(clientid, '^sensor-[A-Za-z0-9_-]{1,57}\z') AND reason <> 'takenover' AND reason <> 'discarded'
 '''
 actions = [
   { function = "republish", args = { topic = "presence/${clientid}", qos = 1, retain = true, payload = "${.}" } },
@@ -1277,7 +1277,7 @@ description = "JSON wrapped in base64"
 sql = '''
 SELECT payload.deviceId AS device, json_decode(base64_decode(payload.data)) AS data
 FROM "cloud/push"
-WHERE is_str(payload.deviceId) AND regex_match(payload.deviceId, '^[A-Za-z0-9_-]{1,64}$')
+WHERE is_str(payload.deviceId) AND regex_match(payload.deviceId, '^[A-Za-z0-9_-]{1,64}\z')
 '''
 actions = [
   { function = "republish", args = { topic = "unwrapped/${device}", payload = "${data}" } },
@@ -1409,7 +1409,7 @@ SELECT
   payload,
   map_put('processed-by', 'order_router', pub_props.'User-Property') AS user_properties
 FROM "orders/+"
-WHERE is_str(tenant) AND regex_match(tenant, '^[A-Za-z0-9_-]{1,64}$')
+WHERE is_str(tenant) AND regex_match(tenant, '^[A-Za-z0-9_-]{1,64}\z')
 '''
 actions = [
   { function = "republish", args = {
@@ -1471,5 +1471,4 @@ else:
 | Sending to Kafka, HTTP, a database or another system | There are no sink actions ([ADR 0083](adr/0083-rule-engine.md)) | Republish to a topic and consume it with a `$share` group ([INTEGRATION.md](INTEGRATION.md)); to another MQTT broker, [mqtt-bridge](BRIDGE.md) |
 | Calling out: an HTTP request, a script, a file or an environment variable | Rules do no I/O; `getenv` reads only `EMQXVAR_…` variables, fixed while the broker runs | A consumer service |
 | Dropping or changing the original message | A rule only adds messages | Have devices publish to a raw topic that subscribers cannot read (the ACL), and let a rule republish the cleaned message to the topic they do read |
-| One rule triggering another | A republished message never re-enters the rule engine, so rules cannot loop | Write the second rule against the original topic |
 | Protobuf, Sparkplug B or a schema registry | Those functions are not implemented ([RULES.md](RULES.md)) | A consumer that decodes and republishes |

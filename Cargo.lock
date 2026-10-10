@@ -2145,7 +2145,7 @@ name = "mqtt-rules"
 version = "1.1.0"
 dependencies = [
  "aws-lc-rs",
- "base64 0.22.1",
+ "base64 0.23.1",
  "blake2",
  "bytes",
  "chrono",
@@ -2155,7 +2155,10 @@ dependencies = [
  "lz4",
  "md4",
  "mqtt-core",
- "regex",
+ "num-bigint",
+ "num-traits",
+ "pcre2",
+ "pcre2-sys",
  "ripemd",
  "serde",
  "serde_json",
@@ -2501,6 +2504,28 @@ checksum = "aab41826031698d6ffcd9cff78ef56ef998e39dc7e5067cdfebe373842d4723b"
 dependencies = [
  "getrandom 0.4.3",
  "phc",
+]
+
+[[package]]
+name = "pcre2"
+version = "0.2.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9e970b0fcce0c7ee6ef662744ff711f21ccd6f11b7cf03cd187a80e89797fc67"
+dependencies = [
+ "libc",
+ "log",
+ "pcre2-sys",
+]
+
+[[package]]
+name = "pcre2-sys"
+version = "0.2.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "18b9073c1a2549bd409bf4a32c94d903bb1a09bf845bc306ae148897fa0760a4"
+dependencies = [
+ "cc",
+ "libc",
+ "pkg-config",
 ]
 
 [[package]]

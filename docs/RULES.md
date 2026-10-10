@@ -249,8 +249,9 @@ quickstart's file with the number after `>` deleted:
 rules INVALID (rules.toml): rule `high_temp`: expected an expression (line 4, column 1, near `end of statement`)
 ```
 
-A warning — a [double-quoted string](#gotchas) compared with `=`, or
-`direct_dispatch = false` — goes to stderr and does not fail the check.
+A warning — a [double-quoted string](#gotchas) compared with `=`, or a
+`direct_dispatch` that is neither a boolean nor a placeholder — goes to stderr and does
+not fail the check.
 
 With no file argument, `mqttd --check-rules` checks the `rules.file` of the effective
 configuration (`--config` and `MQTTD_*`). It loads that configuration first, as the broker
@@ -376,6 +377,7 @@ double-quote one in particular): run `--check-rules` on the file for those, and 
   |---|---|
   | `mqttd_rule_evaluations_total{rule,result}` | `passed`: the statement produced output and the actions ran. `no_result`: `FROM` matched, but `WHERE` was false or a `FOREACH` produced nothing. `failed`: the statement raised an error. A rule with no series has never matched a message. |
   | `mqttd_rule_actions_total{rule,result}` | `ok`: a console line logged, or a republish the broker accepted and routed. `failed`: see [Operating rules](#operating-rules). |
+  | `mqttd_rule_recursive_republish_total{rule,guard}` | `republish` actions not run because their message would loop: `same_rule`, the message is one the rule republished itself (EMQX's `recursive_republish_detected`; counted `ok` in `mqttd_rule_actions_total`, as EMQX counts it); `depth`, it is 32 republishes from its original (counted `failed`). See [Republished messages](#republished-messages). |
   | `mqttd_rule_eval_seconds_total{rule}` | Time spent evaluating the rule, summed over every live evaluation: its statement plus rendering its actions, not routing what it republishes. Dry runs (`POST /admin/v1/rules/test`) are not counted. Divided by the evaluations it is the rule's cost per message, below. |
   | `mqttd_rules_loaded` | Enabled rules loaded on this node. |
   | `mqttd_rules_info{checksum}` | The loaded file's SHA-256, at 1. A checksum replaced by a reload stays exported at 0. |
@@ -765,10 +767,15 @@ mosquitto_sub -h 127.0.0.1 -t '$SYS/brokers/+/rules' -v
 - **JSON `null` is a value, not `undefined`.** For `{"x": null}`, `is_null(payload.x)` is
   false and `is_not_null(payload.x)` is true; they test for a missing field.
   `is_null_var` and `is_not_null_var` treat `null` as missing too.
-- **Integers beyond 64 bits become floats.** A JSON integer outside the signed 64-bit range
-  is decoded as a float: `{"id": 12345678901234567890}` gives `1.2345678901234567e+19` in
-  `${.}` and `12345678901234567168.0` in `${id}`. Send such ids as strings, or forward
-  `${payload}`, which keeps the original bytes.
+- **Numbers are Erlang's, as in EMQX.** An integer has no fixed width:
+  `{"id": 12345678901234567890}` stays `12345678901234567890` in `${.}` and `${id}`, and
+  `9223372036854775807 + 1` is `9223372036854775808` (mqttd's one bound: 8192 bits, about
+  2,466 digits). An integer meets a float by exact value: `9007199254740993 >
+  9007199254740992.0` is true. JSON writes a float in its shortest form, scientific where
+  that is shorter (`1.0e20`, `1.0e-5`, `3.14e4`); text (`str`, `${x}`, `'a' + x`) writes
+  it with up to ten decimals (`str(1.0e-11)` is `0.0`) and keeps `-0.0`'s sign. A string
+  is a number only in Erlang's own syntax: `'5'`, `'-5'`, `'5.0'`, `'1.5e3'`, but not
+  `' 5'`, `'1e3'` or `'.5'` (`int(' 12')` and `5 = ' 5'` fail the rule).
 - **`topic(n)` counts from 1:** `topic(2)` of `home/kitchen/temp` is `kitchen`, and
   `topic(0)` fails the rule. Indexes (`payload.list[1]`) and `nth` count from 1 too, but
   `substr` counts from 0. More function traps are under [Functions](#functions).
@@ -808,11 +815,14 @@ topic level through, in `WHERE`:
 ```sql
 SELECT payload.device AS device, payload
 FROM "ingest"
-WHERE is_str(payload.device) AND regex_match(payload.device, '^[A-Za-z0-9_-]{1,64}$')
+WHERE is_str(payload.device) AND regex_match(payload.device, '^[A-Za-z0-9_-]{1,64}\z')
 ```
 
-`is_str` keeps a missing or non-string value from failing the rule. A message that does not
-pass produces nothing. The cookbook's
+`is_str` keeps a missing or non-string value from failing the rule. The pattern ends with
+`\z`, not `$`: as in EMQX, `$` also matches before a final newline, so a value ending in
+one would pass a `$` guard and put the newline in the topic ([regular
+expressions](#functions)). `\z` is the very end, and means the same in EMQX. A
+message that does not pass produces nothing. The cookbook's
 [routing recipe](RULES-COOKBOOK.md#7-route-by-a-payload-field-safely) is the complete rule,
 and its MQTT 5 recipe guards a user property the same way.
 
@@ -831,8 +841,10 @@ and its MQTT 5 recipe guards a user property the same way.
   nodes, shared-subscription balanced, retained, queued for offline persistent sessions
   and quorum-replicated like a message a client sent. A subscriber on any node receives
   it.
-- **A republished message never re-enters the rule engine**, so no rule can loop. EMQX
-  calls this `direct_dispatch`; in mqttd it is always on.
+- **A republished message re-enters the rule engine, as in EMQX**: it is a new message,
+  and every rule whose `FROM` matches it runs on it, so rules chain ([Republished
+  messages](#republished-messages)). It is evaluated on the same connection task as the
+  message it came from, never on the hub loop.
 - **Last Wills run rules too**, as in EMQX. The hub publishes a Will, so the hub
   evaluates it; this is the one place rule SQL runs on the hub. Evaluating a Will at
   CONNECT instead, on the connection task, would give it the wrong timestamps and miss
@@ -841,12 +853,12 @@ and its MQTT 5 recipe guards a user property the same way.
   [Performance](#performance)), on top of the Will's own routing. A mass disconnect
   (a partition, a load-balancer restart) brings the Wills at once, so rules that match
   Will topics add to that burst.
-- **A publish and its derived messages reach the hub as one command.** The hub routes
-  the original first, then its derived messages, and only if it accepted the original:
-  a refused publish produces nothing, so a resend cannot duplicate what its rules
-  derived. The batch keeps the connection's place in the hub's FIFO data lane; it is
-  bounded by the per-message limits below, so it holds the hub loop for at most the
-  routing of 1,025 messages.
+- **A publish and its derived messages reach the hub as one command**, with every
+  message they lead to through other rules. The hub routes the original first, then its
+  derived messages, and only if it accepted the original: a refused publish produces
+  nothing, so a resend cannot duplicate what its rules derived. The batch keeps the
+  connection's place in the hub's FIFO data lane; it is bounded by the per-message
+  limits below, so it holds the hub loop for at most the routing of 1,025 messages.
 - **Derived messages are charged to the publisher's ingress credit** (ADR 0082), like
   the publish itself, before the batch is queued, so a rule that multiplies a publish
   cannot multiply what one connection may hold in the hub's queue. If the credit is
@@ -963,13 +975,19 @@ description = ""      # optional
 Loading is **all-or-nothing**: one rule that does not parse rejects the file. At
 startup the broker refuses to boot, and on a reload the running rules stay in force.
 Unknown keys are errors. The limits are 1,024 rules per file, 16 actions per rule,
-64 KiB of SQL per rule, and 96 distinct regular-expression literals per file (a pattern
-written in `regex_match`, `regex_replace` or `regex_extract`; the same pattern written
-twice is compiled once and counts once; past it:
-`more than 96 distinct regular expressions in one rules file`). Each literal costs a
-compile when the file loads, so the file-wide limit keeps a worst-case load, reload or
-admin API check to about a second and about 120 MiB (measured 0.6-1.1 s, 110-123 MiB).
-An expression may be at most 256 levels deep, a chain of 256
+64 KiB of SQL per rule, and 512 distinct regular-expression literals per file, of at
+most 256 KiB together (a pattern written in `regex_match`, `regex_replace` or
+`regex_extract`; the same pattern written twice is compiled once and counts once; past
+them: `more than 512 distinct regular expressions in one rules file`, `more than 262144
+bytes of distinct regular expressions in one rules file`). Each literal is compiled when
+the file loads and kept while the rules run, so the file-wide limits keep a worst-case
+load, reload or admin API check under a second and about 100 MiB (measured: 512 patterns
+at PCRE2's size limit, 0.1 s and 14 MiB; four 61 KiB patterns of named groups, whose
+compile time is quadratic, 0.6 s). A literal pattern that does not compile does not fail
+the load — EMQX accepts such a rule too — but warns
+(`regex_match(): invalid regular expression: missing closing parenthesis at position 1;
+every call fails the rule, as in EMQX`), and the rule fails on every message that
+reaches the call. An expression may be at most 256 levels deep, a chain of 256
 operands such as `1 + 1 + …` (past it: `expression is more than 256 levels deep`), and
 may nest at most 64 levels of parentheses, signs, `NOT`, function calls or array
 literals inside each other (past it: `expression nests more than 64 levels deep`).
@@ -985,7 +1003,8 @@ rule, every `FOREACH` output — not to each call:
 - a `FOREACH` iterates at most 10,000 elements and produces at most 256 outputs;
 - all of a message's rules produce at most 1,024 effects, which together carry at most
   4 MiB plus four times the message's payload (topics, payloads and properties of the
-  derived messages, and console lines); past it, further actions fail;
+  derived messages, and console lines) — counting the rules its republished messages
+  run, at any depth; past it, further actions fail;
 - its functions build at most 1 MiB beyond their inputs, together (`pad`'s length, a
   `replace` or `regex_replace` that substitutes a longer string at every match, a
   `join_to_string` separator);
@@ -1027,12 +1046,12 @@ belongs in a TOML `'''…'''` string ([Gotchas](#gotchas)).
 
 | Construct | Example | Notes |
 |---|---|---|
-| Field path | `payload.a.b`, `pub_props.'User-Property'.foo` | A path into `payload` decodes the payload as JSON once per message. If the payload is not JSON, a rule that reads into it **fails**; one that only reads `payload` as a whole does not. A JSON integer outside the signed 64-bit range decodes as a float. |
+| Field path | `payload.a.b`, `pub_props.'User-Property'.foo` | A path into `payload` decodes the payload as JSON once per message. If the payload is not JSON, a rule that reads into it **fails**; one that only reads `payload` as a whole does not. JSON integers of any size stay exact. |
 | Index | `payload.list[1]`, `payload.list[-1]` | 1-based; negative counts from the end; out of range is `undefined`. |
 | Range | `payload.list[2..3]`, `[1..5]` | A slice, or the integers from one end to the other. |
 | Array literal | `['a', 1 + 1]` | |
-| Arithmetic | `+ - * / div mod` | `/` always gives a float; `div` and `mod` take integers. `+` concatenates when either side is a string. Overflow and division by zero are errors. |
-| Comparison | `= != <> < <= > >=` | `undefined` compares false with any value and equal to `undefined`. A number against a string converts the string; a non-numeric one is an error. A boolean or `null` against a string compares their text. Any other pair of types uses Erlang's term order (number < `false` < `null` < `true` < object < array < string), so `null > 30` is true ([Gotchas](#gotchas)). |
+| Arithmetic | `+ - * / div mod` | `/` always gives a float; `div` and `mod` take integers. `+` concatenates when either side is a string. Integers never overflow; division by zero is an error. |
+| Comparison | `= != <> < <= > >=` | `undefined` compares false with any value and equal to `undefined`. A number against a string converts the string by Erlang's syntax (`'5'`, `'5.0'`, `'1.5e3'`; not `' 5'` or `'1e3'`), and one that is not a number is an error. An integer and a float compare by exact value. A boolean or `null` against a string compares their text. Any other pair of types uses Erlang's term order (number < `false` < `null` < `true` < object < array < string), so `null > 30` is true ([Gotchas](#gotchas)). |
 | Topic match | `topic =~ 'sensors/+/data'` | The MQTT filter match. |
 | Logic | `AND OR NOT`, `x IN (...)`, `x NOT IN (...)` | A condition passes only on boolean `true`. `IN` matches exactly, so `1` is not in `(1.0)`. |
 | `CASE` | `CASE WHEN x > 7 THEN 7 ELSE x END`, `CASE x WHEN 'a' THEN 1 END` | No match and no `ELSE` gives `undefined`. |
@@ -1086,13 +1105,13 @@ never matches anything, and the loader warns (`FROM "$SYS/brokers/#" never match
 | Field | Value |
 |---|---|
 | `id` | A unique message id (32 upper-case hex digits) |
-| `clientid` | The publisher's client id |
-| `username` | Its CONNECT username, if it sent one (`undefined` otherwise) |
+| `clientid` | The publisher's client id; for a message a rule republished, that rule's id ([Republished messages](#republished-messages)) |
+| `username` | Its CONNECT username, if it sent one (`undefined` otherwise, which `SELECT *` shows as `"username":"undefined"`, as EMQX's does) |
 | `payload` | The payload: text if it is UTF-8, bytes otherwise |
-| `peerhost` / `peername` | The publisher's IP / `ip:port`, as EMQX prints them (an IPv6 address unbracketed, an IPv4-mapped one as its IPv4 address); absent for a session relocated from another node, whose socket is the relaying node |
+| `peerhost` / `peername` | The publisher's IP / `ip:port`, as EMQX prints them (an IPv6 address unbracketed, an IPv4-mapped one as its IPv4 address); `undefined` for a session relocated from another node, whose socket is the relaying node |
 | `topic` | The topic, with aliases resolved |
 | `qos` | 0, 1 or 2 |
-| `flags` | `{"dup": false, "retain": …}`. `dup` is always `false`, as in EMQX, which runs the rules on the message with its DUP flag cleared (`emqx_message:clean_dup/1`) |
+| `flags` | `{"dup": false, "retain": …}`. `dup` is always `false`, as in EMQX, which runs the rules on the message with its DUP flag cleared (`emqx_message:clean_dup/1`). A message republished in a chain an event started has `{"retain": …}` alone ([Republished messages](#republished-messages)) |
 | `pub_props` | MQTT 5 properties under their spec names: `User-Property` (a map; a repeated key keeps its last value), `User-Property-Pairs` (every pair, in order), `Content-Type`, `Response-Topic`, `Correlation-Data`, `Payload-Format-Indicator`, `Message-Expiry-Interval`. A publish that carried none (every MQTT 3.1.1 publish) has only an empty `User-Property` map, so `${pub_props.'Content-Type'}` renders `undefined`. |
 | `publish_received_at` / `timestamp` | Milliseconds since the epoch: when the broker received the message / when the rules looked at it. Each is read once per message, so every reference in every rule sees the same value, and `timestamp` is never earlier than `publish_received_at` |
 | `node` | This node's id |
@@ -1245,8 +1264,33 @@ Traps that EMQX's reference states only in passing, each checked against this en
 - `substr('hello', 1, 3)` is `ell`: `substr` counts from 0, while `nth` and indexes count
   from 1.
 - `regex_extract` returns an array of the groups (`["42"]`), empty when nothing matches,
-  and `nth(1, [])` fails the rule.
-- `round` takes one argument: `round(2.567, 2)` fails the load.
+  and `nth(1, [])` fails the rule. A group that did not take part is `""`, except after
+  the last one that did: `regex_extract('abc', '(x)?(b)')` is `["","b"]`, but
+  `regex_extract('abc', '(b)(x)?')` is `["b"]`.
+- Regular expressions are Erlang's `re`, as in EMQX: **PCRE2 on bytes**. `.` is one
+  byte, so `regex_replace('é', '.', 'x')` is `xx` and `'^.$'` does not match `é`; `\d`,
+  `\w`, `\s` and `[[:alpha:]]` are ASCII (`'^\d$'` does not match `٣`), and `(?i)` folds
+  ASCII letters only. `(*UTF)` at the start of a pattern makes it match characters, and
+  fails the rule on a subject that is not UTF-8. Backreferences, look-around, atomic
+  groups, possessive quantifiers, recursion, conditionals and backtracking verbs all
+  work. A pattern that does not compile fails the rule when the call runs.
+- `$` also matches before a newline that ends the subject: `regex_match` of `abc` plus a
+  newline against `'abc$'` is `true`. `\z` is the very end; use it where a trailing
+  newline must not pass, as in a guard on a value that becomes a topic level.
+- Backtracking is bounded as OTP bounds it: a match gives up after 10,000,000 steps, or
+  10,000,000 levels deep, from one start position, and a match that gives up is **no
+  match** — `false`, no further replacement, `[]` — not a failed rule, as in EMQX. The
+  bound is per start position, so a pattern that fails slowly at every position of a long
+  subject costs that at each, here as in EMQX.
+  `'^(a+)+$'` against 40 `a`s and a `b` gives up after about 0.15 s (0.4 s in EMQX).
+  The memory a match may take for backtracking is bounded too, at 64 MiB where OTP's
+  bound is 20 GB: `'^(a|b)*$'` gives up (no match) past about 220 KB of
+  subject, `'^(?:a|b)*$'` past about 330 KB, where EMQX matches up to several MB.
+- `round` takes one argument: `round(2.567, 2)` fails the load. `round`, `ceil` and
+  `floor` give an integer of any size (`ceil(1.0e20)` is `100000000000000000000`).
+- `abs` takes an integer only: `abs(-1.5)` fails, as in EMQX. `float2str` takes a float
+  only (`float2str(5, 2)` fails), and prints as `str` does with its own decimals,
+  rounding a half away from zero (`float2str(0.125, 2)` is `0.13`).
 - `unix_ts_to_rfc3339` and `now_rfc3339` write the broker host's local time zone, as EMQX
   does (`+00:00` on a host or container set to UTC). `format_date` with an explicit offset
   (`'+01:00'`) gives the same text on every host.
@@ -1278,8 +1322,8 @@ Traps that EMQX's reference states only in passing, each checked against this en
   (`\0` is `0`, `\&` is `&`), and `$` is an ordinary character.
 - `subbits` returns `undefined` when the start is outside the binary, takes the bits to
   the end when the length is negative or too long, and fails on a NaN or infinite float.
-  Erlang can return an integer wider than 64 bits and a bit string that is not a whole
-  number of bytes; this engine cannot represent either and fails the rule instead.
+  An integer comes out at any width. Erlang can return a bit string that is not a whole
+  number of bytes; this engine cannot represent one and fails the rule instead.
 - The compression functions produce EMQX's bytes exactly (the same C zlib and liblz4). A
   decompression stops, failing the rule, once its output would pass the 1 MiB per-message
   growth budget, so a small payload cannot inflate into gigabytes.
@@ -1309,7 +1353,7 @@ Traps that EMQX's reference states only in passing, each checked against this en
 | `payload` | `"${payload}"` | A template. An empty string is the whole output as JSON (`${.}`). `${payload}` keeps a binary payload's exact bytes. An event has no payload: give an event rule's republish one. |
 | `user_properties` | `"${user_properties}"` | One placeholder naming a map (or EMQX's `[{key, value}]` list) in the output. `"${pub_props.'User-Property'}"` carries the publisher's properties in wire order, duplicates included. If absent, none are sent. |
 | `mqtt_properties` | none | `Payload-Format-Indicator`, `Message-Expiry-Interval`, `Content-Type`, `Response-Topic`, `Correlation-Data`; each value is a template. A `Payload-Format-Indicator` or `Message-Expiry-Interval` that does not render as a valid number, or a `Response-Topic` that is not a valid topic name, is dropped, as in EMQX, and the message still goes out. A placeholder for a value the publisher did not send renders as `undefined` like any other, so `"Content-Type" = "${pub_props.'Content-Type'}"` sends `Content-Type: undefined` for a publish without one: give it a default with `coalesce()` ([recipe 16](RULES-COOKBOOK.md#16-mqtt-5-user-properties-in-and-out)). |
-| `direct_dispatch` | — | Accepted for compatibility. mqttd always dispatches directly, so `false` gets a load warning and changes nothing. |
+| `direct_dispatch` | `false` | A boolean or one placeholder, rendered per message. `false`: the message re-enters the rule engine ([Republished messages](#republished-messages)). `true`: it goes straight to subscribers, as in EMQX: no rule runs on it and it is **not retained**, whatever `retain` says (it is delivered live, with the retain flag clear). Only a boolean `true` is true: a placeholder that renders anything else, or nothing, is `false`, as in EMQX (which logs `bad_direct_dispatch_resolved_value`). A literal string other than `"true"`, `"false"` or `""` is `false` on every message, with a load warning. |
 
 **Templates.** `${path}` reads the rule's **output** (what `SELECT` produced), with the
 path syntax of the SQL: `${payload.a.b}`, `${pub_props.'User-Property'.k}`,
@@ -1321,6 +1365,59 @@ conversion: select `base64_encode(payload)` instead.
 **Size.** A derived message is not bounded by `limits.max_packet_size`, which limits what
 clients send. A subscriber whose MQTT 5 Maximum Packet Size it exceeds does not get its
 copy (`mqttd_publish_dropped_total{reason="too-large"}`), as for any message.
+
+### Republished messages
+
+A republished message is a new message, and the rules see it as they see any other:
+every rule whose `FROM` matches its topic runs on it, so one rule's output can be
+another's input. This is EMQX's behaviour with `direct_dispatch = false`, its default.
+The rules see it as EMQX shows it (`emqx_rule_actions:republish_clientinfo/1`):
+
+| Field | Value |
+|---|---|
+| `clientid` | The id of the rule that republished it |
+| `username`, `peerhost`, `peername` | `undefined` (`SELECT *` shows `"undefined"`) |
+| `topic`, `qos`, `payload`, `pub_props` | What the action set; `pub_props` has `User-Property` (and `User-Property-Pairs` when it has any) and the `mqtt_properties` it set |
+| `flags` | The trigger's, with the action's `retain`: `{"dup": false, "retain": …}`, or `{"retain": …}` alone in a chain an event started, since an event has no `flags` |
+| `publish_received_at`, `timestamp`, `id` | When it was republished, and a new id |
+
+**Loops.** As in EMQX, a rule does not republish a message it republished itself: it
+still runs on it — its `WHERE`, its other actions — but its `republish` actions are
+skipped (EMQX logs this as `recursive_republish_detected`). EMQX counts the skipped
+action as a success, and so does mqttd; it is also counted in
+`mqttd_rule_recursive_republish_total{rule,guard="same_rule"}` and logged at DEBUG.
+A rule republishing into its own `FROM` therefore publishes once, not forever.
+
+Two rules republishing into each other's `FROM` are not caught by that guard. EMQX
+recurses until the publisher's connection process reaches its heap limit and is killed
+(EMQX 6.3.1 ran about 1,500 rounds, then dropped the connection and delivered nothing).
+mqttd stops the chain **32 republishes** from the message that started it: the message
+32 deep is still evaluated, but its rules' `republish` actions fail, counted as failed
+actions and in `mqttd_rule_recursive_republish_total{rule,guard="depth"}`, with the
+rule's WARN and last error. No working EMQX configuration chains that deep; real
+pipelines are a few rules long. The whole chain shares the original message's
+[limits](#the-rules-file) — 1,024 effects and 4 MiB plus four times its payload — so a
+chain or a loop multiplies a publish no more than one rule can.
+
+**Order.** EMQX publishes a republished message from inside the hook that evaluates the
+message it came from, so a subscriber to everything sees the deepest message first: for
+`t/a` → rule A → `t/b` → rule B → `out/b`, EMQX delivers `out/b`, `t/b`, `t/a`. mqttd
+routes the original first — the hub routes derived messages only once it has accepted
+the original, so a refused publish leaves nothing behind — then the derived messages in
+EMQX's order: `t/a`, `out/b`, `t/b`.
+
+**Acknowledgement.** Everything a publish leads to, through any number of rules, is
+part of its batch: charged to its ingress credit, and at QoS ≥ 1 behind a QoS ≥ 1
+publish, gated, so the PUBACK or PUBREC waits for all of it
+([Delivery guarantees](#delivery-guarantees-qos-0-1-and-2)).
+
+`direct_dispatch = true` opts a message out: no rule runs on it and it is not retained.
+
+**Upgrading from an earlier mqttd.** In mqttd 1.1.0 and earlier a republished message
+never re-entered the rules. A rules file written for that starts chaining when upgraded: a
+rule whose output topic another rule's `FROM` matches now triggers that rule too. Check
+each `republish` topic against every `FROM` (`mqttd --check-rules` lists them), and set
+`direct_dispatch = true` on the actions that must not trigger anything.
 
 ### `console`
 
@@ -1427,23 +1524,22 @@ notice.
 
 | | EMQX | mqttd |
 |---|---|---|
-| Republished messages | Re-enter the rule engine unless `direct_dispatch = true` | Never re-enter it. A rule cannot loop, and a rule chain that relied on re-triggering needs a second rule on the original topic. |
+| Republished messages | Re-enter the rule engine unless `direct_dispatch = true`; only a rule's own output is guarded, so two rules republishing into each other recurse until the publisher's process is killed; a republished message is routed before the message it came from | Re-enter it unless `direct_dispatch = true`, with the same guard, but a chain stops 32 republishes deep and shares the original's limits; the original is routed first, then the derived messages in EMQX's order ([Republished messages](#republished-messages)) |
 | Actions | `republish`, `console`, data-integration sinks | `republish`, `console`. A sink reference is refused at load. |
 | Events | 16 event topics (6.2+): `sys/alarm_activated`, `sys/alarm_deactivated`, `client/connected`, `client/disconnected`, `client/connack`, `client/ping`, `auth/check_authn_complete`, `auth/check_authz_complete`, `session/subscribed`, `session/unsubscribed`, `message/delivered`, `message/acked`, `message/dropped`, `message/delivery_dropped`, `message_transformation/failed`, `schema_validation/failed`; a wildcard filter such as `$events/client/+` selects every event it matches | The 8 client, session and authentication events (`client/connected`, `client/disconnected`, `client/connack`, `client/ping`, `auth/check_authn_complete`, `auth/check_authz_complete`, `session/subscribed`, `session/unsubscribed`), with EMQX's fields. A wildcard filter selects the ones it matches; one that matches none of them is refused at load. Not the message, alarm, schema validation or message transformation events |
 | `authz_source` | The source that decided: `file`, `built_in_database`, `http`, …, `superuser`, `default`, and `cache` for a decision its authorization cache answered | `file` or `default`: mqttd has the ACL file only, no superusers and no authorization cache |
 | Data-integration sources (`$bridges/…`, `$sources/…`) | Yes | No: refused at load |
 | Functions | 124 in the built-in reference, plus `jq`; every other export of `emqx_rule_funcs` is callable too | 120 of those 124, plus 23 EMQX exports without documenting (143 in all). `maptab_lookup`, `mongo_date`, `schema_encode`, `schema_decode`, `jq`, `term_encode`/`term_decode` and the state functions (`kv_store_*`, `proc_dict_*`; [ADR 0085](adr/0085-rule-state-store.md)) are refused at load. |
-| JSON integers | Any size (Erlang integers) | Signed 64-bit. One outside that range decodes as a float, so `12345678901234567890` becomes `1.2345678901234567e+19`. `${payload}` keeps the original bytes. |
-| Regular expressions | PCRE | Rust's `regex`: linear-time, no backreferences or look-around. `regex_replace`'s replacement syntax is `re:replace`'s, exactly. A rules file holds at most 96 distinct regular-expression literals. |
+| Regular expressions | Erlang `re`: PCRE2 10.47 (OTP 28) on bytes, compiled per call | PCRE2 10.46 on bytes, with OTP's compile options, match and depth limits and global-match loop: the same syntax and results ([above](#functions)). A match needing more than 64 MiB of backtracking memory is no match (OTP allows 20 GB); a pattern nesting parentheses more than 250 deep does not compile (OTP's limit is 10,000, though PCRE2's own workspace stops most such patterns below 2,000). A literal pattern is compiled once, when the file loads (one that does not compile warns), and a rules file holds at most 512 distinct ones, 256 KiB together. |
 | `sprintf` `~p` / `~P` of a long list, map or non-printable binary | `io_lib_pretty` breaks it across lines once it reaches the line width (80 columns, or the field width) | Printed on one line (`~0p`, which never breaks, is the same in both) |
-| `subbits` results Erlang has and this engine cannot hold | An integer of any size; a bit string of any length | Fail the rule: an integer outside 64 bits, a bit string that is not whole bytes |
+| `subbits` results Erlang has and this engine cannot hold | A bit string of any length | Fail the rule: a bit string that is not whole bytes |
 | `id` | 32 upper-case hex digits, the first 16 the microsecond clock | The same format; only how the low 64 bits are built differs (per-process salt and counter), which no rule can observe |
 | `client_attrs`, `mountpoint` | Client attributes, mountpoints | Always empty / absent |
 | Namespaces (6.x) | Rules can be confined to a namespace | No namespaces |
 | Unaliased computed field | Stored under a generated `_v_…` key | Stored under the expression's source text |
 | Ack semantics | Rules run synchronously in the publisher's channel, in the `message.publish` hook, before the original is routed; a republish is routed inside that call. The PUBACK follows, but never waits for delivery or durability, and a republish's outcome never changes its reason code | A QoS ≥ 1 republish holds the publisher's PUBACK/PUBREC until its fate is known; the answer is still the original's own, and a failed republish is a failed action ([above](#delivery-guarantees-qos-0-1-and-2)) |
 | A refused publish | Rules do not run on a publish refused by authorization, quota, publish caps, schema validation or message transformation. Only a hook running after the rule engine (ExHook, node rebalance) can refuse it afterwards, and then the republish has already been routed | The hub routes none of its derived messages (unless the refusal is a peer's, arriving later) |
-| Limits on payload-driven work | None beyond the Erlang process's memory | A `FOREACH` iterates at most 10,000 elements; a function may build at most 1 MiB beyond its inputs; `map_put`/`mput` paths have at most 64 segments; timestamps must be renderable in every time zone; expressions at most 256 levels deep and nested at most 64 levels ([The rules file](#the-rules-file)) |
+| Limits on payload-driven work | None beyond the Erlang process's memory | A `FOREACH` iterates at most 10,000 elements; a function may build at most 1 MiB beyond its inputs, and integers past 64 bits draw on the same budget; an integer has at most 8192 bits (2,466 digits: a JSON payload with a longer one is not JSON to a rule, and arithmetic past it fails the rule); `map_put`/`mput` paths have at most 64 segments; timestamps must be renderable in every time zone; expressions at most 256 levels deep and nested at most 64 levels ([The rules file](#the-rules-file)) |
 | Where it runs | Every node, once per message at the node that received it; a forwarded copy does not run the publish hook. Rules are cluster-wide configuration | The same placement. Rules are a per-node file: each node runs the file it was given |
 | `$SYS` messages | The broker's own `$SYS` messages run rules only with `rule_engine.ignore_sys_message = false` (default `true`). The default ACL denies only subscribing to `$SYS/#`, so a client may publish to `$SYS/x`, and that message runs rules whatever `ignore_sys_message` says (it checks only the flag the broker sets on its own) | Never run rules. Clients cannot publish to `$SYS`, except a Mosquitto bridge's `$SYS/broker/connection/<id>/state`, so a `FROM` on any other `$SYS` topic never matches. The broker publishes only opt-in rule statistics and trace there ([above](#watch-and-edit-rules-live)) |
 | Rule statistics | The dashboard and the REST API | `/metrics`; with `sys_interval_secs`, `$SYS/brokers/<node>/rules/<id>`; `GET /admin/v1/rules` |

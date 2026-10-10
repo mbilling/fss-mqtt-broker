@@ -147,7 +147,8 @@ hub's **data lane is FIFO per connection, bounded by ingress credit** (ADR 0082)
    every offset; decoding a payload object is linear in its keys; regular expressions
    compiled from a payload are remembered for the message (four of them), so a
    `FOREACH` compiles each once. Regular expressions use a
-   linear-time engine with a bounded automaton. Past a bound the function fails, so the
+   linear-time engine with a bounded automaton (amended 2026-10-10: PCRE2 in byte mode
+   with OTP's limits, as in EMQX; see the amendment below). Past a bound the function fails, so the
    rule fails and is counted, and the message is still routed. Unknown functions and
    wrong argument counts fail at load. `getenv` reads only `EMQXVAR_…` variables (amended
    2026-10-10; it was not provided), so a rule cannot read the rest of the broker's
@@ -413,3 +414,185 @@ lexer and parser, and the OTP 28 modules they call. Each value below was probed 
   messages in a node-local table. That is the state ADR 0085 designs as a replicated,
   namespaced store behind a trait; implementing EMQX's unreplicated table now would
   preempt it, so they stay refused at load and ADR 0085 decides their mapping.
+
+## Amendment (2026-10-10): regular expressions are PCRE2 in byte mode, as in EMQX
+
+§8 chose a linear-time engine (Rust's `regex`) so that a pattern could never make a
+message expensive: no backtracking, no backreferences, no look-around. On 2026-10-10 the
+user decided that rules must be 100% EMQX-compatible, and the regex functions were where
+the engines visibly disagreed. EMQX's `regex_match`, `regex_replace` and
+`regex_extract` (`emqx_variform_bif.erl`) call `re:run(S, RE, [global, {capture,
+none}])`, `re:replace(S, RE, Rep, [global, {return, binary}])` and `re:run(S, RE,
+[{capture, all_but_first, binary}])` with the pattern uncompiled and without `unicode`:
+Erlang's `re`, which is PCRE2 in **byte mode**. Probed on EMQX 6.3.1 (OTP 28, PCRE2
+10.47) against the old engine: `'abc$'` matches `abc` plus a newline (old: no); `.`
+matches one byte of `é`, so `regex_replace('é', '.', 'x')` is `xx` (old: `x`); `\d` and
+`\w` are ASCII (old: Unicode); `(a)\1` matches `aa` (old: refused at load).
+
+**The engine is PCRE2.** `crates/mqtt-rules/src/funcs/re.rs` compiles with the `pcre2`
+crate (a safe wrapper; the workspace forbids `unsafe`) over `pcre2-sys`, which builds
+PCRE2 10.46 from source and links it statically — on musl by itself, everywhere through
+`PCRE2_SYS_STATIC` in `.cargo/config.toml`, so no build links a system PCRE2. The compile
+options are OTP's defaults: none — no UTF, no UCP, newline LF, the C-locale tables, no
+JIT. Around `pcre2_match` it repeats what `re.erl` does: `loopexec/8`'s global loop, its
+anchored `notempty_atstart` retry after an empty match (run unanchored and kept only when
+it starts at the same offset — the crate cannot pass `anchored`, and the unanchored
+search tries that offset first, exactly as the anchored one would), its CRLF-aware step,
+its suppression of a repeated match, `do_mlist/5`'s replacement, and the capture count
+`re` reports (groups up to the last that took part). A pattern that is not UTF-8 is
+passed as `\xHH` escapes for the crate's `&str`. A differential set of 171 subjects and
+patterns, each run on the EMQX container, is pinned row for row
+(`regex_functions_match_emqx_row_for_row`).
+
+**What replaces linear-time safety is OTP's bounds, plus one.** OTP builds PCRE2 with a
+match limit and a depth limit of 10,000,000 (`erts/emulator/pcre/local_config.h`, PCRE2's
+defaults too) and turns reaching either into `nomatch` (`erl_bif_re.c`), so a
+catastrophic pattern is *no match* in EMQX, not an error; it is here too, and
+`(a+)+b|z` turning from match to no match between 21 and 22 `a`s in both engines pins the
+limits as equal. OTP's heap limit is 20,000,000 KiB — in effect none — and EMQX's
+matches yield to the scheduler; here a match runs on the publisher's connection task, so
+its backtracking frames are bounded at 64 MiB, set as a `(*LIMIT_HEAP=…)` item after the
+pattern's own start-of-pattern items so a pattern cannot raise it. A match needing more
+is no match, where EMQX goes on: `'^(a|b)*$'` past about 220 KB of subject. Compiled
+size is PCRE2's own bound, 64K code units (`LINK_SIZE` 2, as in OTP).
+
+What remains is CPU: the match limit applies per start position, so a pattern that fails
+slowly at every position of a long subject costs up to the limit (about 0.15 s) at each.
+That is EMQX's exposure too, and it needs a pattern written by the operator or taken from
+the payload by the operator's rule; it is recorded as an accepted risk in
+`docs/THREAT-MODEL.md`. A per-message regex budget was not built: PCRE2 reports no step
+count to charge one with, and any bound short of OTP's would change results.
+
+**Literal patterns.** EMQX compiles a pattern on every call; this engine compiles a
+literal once when the file loads and keeps it, and remembers a payload pattern for the
+rest of the message (four of them). A literal that does not compile no longer fails the
+load — EMQX's parser accepts it and every call raises `badarg` — but warns, and the call
+fails the rule. ADR 0084 D3's cap of 96 distinct literals existed for the linear-time
+engine's automata (1 MiB each); a PCRE2 pattern costs at most about 0.9 ms and 190 KiB, so
+the cap is 512 distinct literals, plus 256 KiB of them together for named groups, whose
+compile time is quadratic (about 0.15 s for a 64 KiB pattern): a worst-case file loads in
+under a second and about 100 MiB.
+
+**Still different from EMQX:** the 64 MiB heap bound above; PCRE2's default nesting limit
+of 250 parentheses (OTP raises it to 10,000; the `pcre2` crate cannot set it, and PCRE2's
+own workspace stops most such patterns below 2,000 anyway); PCRE2 10.46 against OTP 28's
+10.47 (bug fixes only); a literal that does not compile warns at load. Pinned by the
+tests named above and `the_match_limit_is_otps_and_reaching_it_is_no_match`,
+`a_matchs_backtracking_heap_is_bounded`,
+`an_invalid_pattern_loads_with_a_warning_and_fails_each_call`.
+
+## Amendment (2026-10-10): republished messages re-enter the rules, as in EMQX
+
+§3 and the rejected "EMQX's default re-triggering" are reversed: rules are to be
+EMQX-compatible without exception, and EMQX's republish re-enters the rule engine. Checked
+against `emqx_rule_actions.erl` (`republish/3`, `safe_publish/7`, `do_safe_publish/2`,
+`republish_clientinfo/1`), `emqx_rule_engine_schema.erl`, `emqx_broker.erl`
+(`safe_publish2/2`, `publish2/2`, `eval_hook_and_publish/2`) and
+`emqx_rule_events:eventmsg_publish/1` (emqx/emqx master), and probed on EMQX 6.3.1.
+
+- **`direct_dispatch = false`, the default, re-enters.** EMQX publishes the message through
+  `safe_publish2(Msg, #{bypass_hook => false})`, so the `message.publish` hook — every
+  rule — runs on it. mqttd evaluates it on the task that evaluated the message it came
+  from (the connection task, or the hub for a Will), never the hub loop for client
+  publishes, as the original is. The rules see EMQX's fields: `clientid` is the rule id,
+  `username`, `peerhost` and `peername` are `undefined`, `pub_props` are the action's,
+  `flags` are the trigger's with the action's `retain` (`{"retain": …}` alone in a chain
+  started by an event, which has no `flags`), `publish_received_at` is when it was
+  republished. `SELECT *` now shows an `undefined` `username`, `peerhost` and `peername`,
+  as EMQX's `eventmsg_publish/1` always sets them, for client messages too.
+- **The guards.** EMQX's own: a rule does not run its `republish` actions on a message it
+  republished (`republish_by` = its id; `recursive_republish_detected`, counted as a
+  successful action); the rule itself still runs. EMQX has no other: two rules
+  republishing into each other recurse in the publisher's process until it reaches its
+  heap limit and is killed (6.3.1: about 1,500 rounds, the connection dropped, nothing
+  delivered). mqttd stops a chain **32 republishes** deep instead (`MAX_REPUBLISH_DEPTH`):
+  the message 32 deep is evaluated, its `republish` actions fail. Both are counted in
+  `mqttd_rule_recursive_republish_total{rule,guard}` (`same_rule`, `depth`).
+- **Amplification.** The original's per-message limits (1,024 effects; 4 MiB plus four
+  times its payload) cover the whole tree, through a `Budget` shared by every evaluation
+  it leads to, so a chain or a loop cannot multiply a publish further than one rule could.
+- **Acknowledgement and durability are unchanged.** The whole tree travels in the
+  original's one `PublishBatch`, charged to its ingress credit, each QoS ≥ 1 message gated
+  behind a QoS ≥ 1 original. What an event or a Will leads to goes out ungated, as before.
+- **Order.** EMQX routes a republished message inside the original's publish hook, so
+  before the original, and its own republishes before it (`t/a` → `t/b` → `out/b` is
+  delivered `out/b`, `t/b`, `t/a`). Routing the original after what it derived would
+  break the rule that a refused original routes nothing it derived, so the hub still
+  routes the original first; the derived messages follow in EMQX's order, each after what
+  it caused (`t/a`, `out/b`, `t/b`).
+- **`direct_dispatch = true`** skips the rules, and the retained store: EMQX's retainer is
+  a `message.publish` hook, which direct dispatch bypasses (6.3.1 delivered the message
+  live and kept no retained copy). It is delivered live with the retain flag clear, as an
+  over-quota retained derived message already is.
+- **A templated `direct_dispatch`** (`union([boolean(), template()])`) is rendered per
+  message: only a boolean `true` is true; a missing value is the default `false`, and any
+  other value is `false` (EMQX logs `bad_direct_dispatch_resolved_value`). A literal string
+  other than `"true"`, `"false"` or `""` loads with a warning.
+
+Pinned by `a_republished_message_is_seen_as_emqx_shows_it`,
+`a_message_republished_from_an_event_has_no_dup_flag`,
+`a_rule_does_not_republish_its_own_republished_message`,
+`republishing_stops_at_the_depth_cap`, `the_budget_spans_every_reentry` and
+`direct_dispatch_renders_per_message` (mqtt-rules), and end to end by
+`a_republished_message_runs_the_rules_that_select_it`,
+`a_rule_republishing_into_its_own_from_cannot_loop`,
+`rules_republishing_into_each_other_stop_at_the_depth_cap`,
+`direct_dispatch_skips_the_rules_and_the_retained_store`,
+`a_templated_direct_dispatch_is_rendered_per_message` and
+`a_message_republished_from_an_event_runs_the_rules` (`tests/rules.rs`).
+
+## Amendment (2026-10-10): numbers are Erlang's
+
+A rule's numbers were `i64` and `f64` as Rust has them; EMQX's are Erlang integers (no
+width) and doubles, decoded and encoded by jiffy (`emqx_utils_json` →
+`jiffy:decode(Json, [return_maps])`, jiffy 2.0.1, whose `finish_decode({bignum, V})` is
+`binary_to_integer(V)`). Probed on EMQX 6.3.1, `12345678901234567890 + 1` is
+`12345678901234567891` and `9223372036854775807 + 1` is `9223372036854775808`; mqttd
+decoded the first as `1.2345678901234567e19` and failed the second with `integer
+overflow`. Numbers now behave as EMQX's do, each point pinned by tests whose values were
+probed on 6.3.1:
+
+- **Integers of any size.** `Value::Big` holds an integer outside `i64` (never one inside,
+  so the `i64` path is unchanged and two equal integers have one shape), through the SQL
+  lexer (`list_to_integer`), JSON decode and encode, `+ - * div mod` (`div` truncates,
+  `mod` is `rem`), unary minus, comparisons, `${…}` templates and every function that
+  takes or makes an integer: `abs`, `ceil`/`floor`/`round` of a float (`ceil(1.0e20)` is
+  `100000000000000000000`), `int`, the `bit*` functions (two's complement of unbounded
+  width; a negative shift goes the other way), `div`/`mod`, `map_to_range` and
+  `hash_to_range` (`Min + (N rem Span)`, so a negative `N` can land below `Min`, as in
+  EMQX), `subbits` (an integer of any width), `sprintf` (`~p ~w ~b ~x ~c …`).
+  `num-bigint` (already shipped through `x509-parser` and `jsonwebtoken`) does the
+  arithmetic.
+- **One bound Erlang lacks.** Printing, parsing and dividing a big integer cost the square
+  of its size, and a payload chooses the size. An integer is at most 8192 bits (2,466
+  digits): text with more digits is refused before it is parsed, a shift or product past
+  it before it is computed. Every integer past 64 bits a rule computes is also charged, by
+  size, to the per-message 1 MiB budget functions already share. No device payload comes
+  near the bound, so it is listed with the other payload limits, not as a difference.
+- **An integer meets a float the Erlang way.** Comparisons are by exact value
+  (`9007199254740993 > 9007199254740992.0`); `=:=` (`IN`, `CASE x WHEN`, `contains`) keeps
+  integers and floats apart at any depth and tells `-0.0` from `0.0`. Arithmetic converts
+  the integer as the VM's `big_to_double` does, 64-bit digit by digit with a rounding at
+  each step — not always to the nearest double — and fails when that is not finite.
+- **JSON is read by mqttd's own reader** (`src/json.rs`), because serde_json can carry an
+  integer past 64 bits only as a float, and its `arbitrary_precision` would change
+  `serde_json::Number` for every crate in the build. It accepts exactly what serde_json
+  does (a differential test over mutated documents), keeps its error messages, and reads a
+  float as the nearest double, as jiffy does (`5.960464477539063e-8` was one ulp off
+  without serde's `float_roundtrip`, which is now on for the JSON the broker still reads
+  with serde).
+- **Floats print as EMQX prints them.** JSON writes jiffy's form, Erlang's shortest
+  (`1.0e20`, `3.14e4`, `1.0e-5`, `100.0`, Ryu's tie to even), with `-0.0` as `0.0`. Text
+  (`str`, `${x}`, `+` with a string, `float2str`, `float/2`) follows the VM's
+  `float_to_binary(F, [{decimals, D}, compact])` step by step: the fraction scaled in
+  floating point and rounded half away from zero (`float2str(0.125, 2)` is `0.13`,
+  `str(1.5e-10)` is `0.0000000002`), `-0.0` keeping its sign, `compact` trimming an
+  integer's zeros past 2^53 (`float2str(1.0e20, 0)` is `"1"`), and a text over 255
+  characters failing (`str(1.0e250)`).
+- **Strings convert by Erlang's syntax.** `int`, `float` and a number compared with a
+  string use `binary_to_integer` then `binary_to_float`: `'5'`, `'+5'`, `'1.5e3'`, but not
+  `' 5'`, `'1e3'`, `'.5'` or `'1_000'`. `abs` takes an integer only and `float2str` a
+  float only, as their EMQX clauses do.
+
+This supersedes the previous amendment's `subbits` note: an integer outside 64 bits is
+now returned, and only a bit string that is not whole bytes fails.

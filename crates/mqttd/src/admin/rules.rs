@@ -794,6 +794,9 @@ fn evaluate(set: &RuleSet, rule: &Rule, input: &dyn Input) -> Value {
                 slots.push(Slot::Failed(actions % per_output, e.to_string()));
                 actions += 1;
             }
+            // A dry run's input is never a republished message, so no republish is
+            // skipped as a loop; were one, it would show nothing.
+            Outcome::Recursive(_) => actions += 1,
             // A dry run is not timed (`evaluate_one` never reports it).
             Outcome::Elapsed(_) => {}
         },

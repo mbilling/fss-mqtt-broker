@@ -281,7 +281,7 @@ DO
        WHEN vibration_zone = 'C'
          THEN 'restricted operation: plan a drivetrain inspection'
        ELSE 'check the oil cooler, its fan and the filter today' END AS action
-INCASE is_str(t.id) AND regex_match(t.id, '^[A-Za-z0-9_-]{1,32}$')
+INCASE is_str(t.id) AND regex_match(t.id, '^[A-Za-z0-9_-]{1,32}\z')
    AND ((is_num(t.VibGbx) AND t.VibGbx > 3.5)
      OR (is_num(t.TmpGbxOil) AND t.TmpGbxOil >= 75))
 FROM "plant/wf-falster/ppc/stats"
@@ -357,7 +357,7 @@ DO
   CASE WHEN status <> 'ok' AND expected_kw > 0 AND expected_kw > t.W
        THEN round((expected_kw - CASE WHEN t.W > 0 THEN t.W ELSE 0 END) / 6) / 10
        ELSE 0.0 END                                              AS lost_kwh   -- kW x 1/60 h
-INCASE is_str(t.id) AND regex_match(t.id, '^[A-Za-z0-9_-]{1,32}$')
+INCASE is_str(t.id) AND regex_match(t.id, '^[A-Za-z0-9_-]{1,32}\z')
    AND is_num(t.WdSpd) AND is_num(t.W) AND is_int(t.TurSt)
 FROM "plant/wf-falster/ppc/stats"
 '''
@@ -1215,7 +1215,7 @@ SELECT
         + (16 - strlen(find('0123456789ABCDEF', substr(hex, 31, 1))))) * 1000 / 255) / 10 AS out.fuel_pct
 FROM "vehicle/+/obd"
 WHERE regex_match(topic(2), '^[A-HJ-NPR-Z0-9]{17}$')
-  AND regex_match(hex, '^[0-9A-F]{8}07E[8-F]410C[0-9A-F]{4}0D[0-9A-F]{2}05[0-9A-F]{2}2F[0-9A-F]{2}$')
+  AND regex_match(hex, '^[0-9A-F]{8}07E[8-F]410C[0-9A-F]{4}0D[0-9A-F]{2}05[0-9A-F]{2}2F[0-9A-F]{2}\z')
 '''
 actions = [
   { function = "republish", args = { topic = "normalized/cars/${out.vehicle}/engine", qos = 0, payload = "${out}" } },
@@ -1402,7 +1402,7 @@ SELECT
   END AS out.action
 FROM "vehicle/+/obd"
 WHERE regex_match(topic(2), '^[A-HJ-NPR-Z0-9]{17}$')
-  AND regex_match(hex, '^[0-9A-F]{8}07E[8-F]410C[0-9A-F]{4}0D[0-9A-F]{2}05[0-9A-F]{2}2F[0-9A-F]{2}$')
+  AND regex_match(hex, '^[0-9A-F]{8}07E[8-F]410C[0-9A-F]{4}0D[0-9A-F]{2}05[0-9A-F]{2}2F[0-9A-F]{2}\z')
   AND coolant >= 105
   AND ((coolant >= 115 AND coolant <= 140)       -- critical: every frame
        OR coolant = 105                          -- the warning threshold: at once
@@ -1620,7 +1620,7 @@ SELECT
        WHEN reason = 'shutdown' THEN 'offline: the broker is restarting'
        ELSE 'offline: ' + reason END AS meaning
 FROM "$events/client/connected", "$events/client/disconnected"
-WHERE regex_match(clientid, '^[A-HJ-NPR-Z0-9]{17}$')
+WHERE regex_match(clientid, '^[A-HJ-NPR-Z0-9]{17}\z')
   AND (event = 'client.connected' OR (reason <> 'takenover' AND reason <> 'discarded'))
 '''
 actions = [

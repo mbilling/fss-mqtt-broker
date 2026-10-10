@@ -341,7 +341,8 @@ fn arithmetic_follows_erlang() {
     assert_eq!(val("-7 mod 2"), "-1");
     assert_eq!(val("'a' + 1"), r#""a1""#);
     assert!(fails("SELECT 1 / 0 as r FROM \"t/#\"", "{}").contains("division by zero"));
-    assert!(fails("SELECT 9223372036854775807 + 1 as r FROM \"t/#\"", "{}").contains("overflow"));
+    // Erlang integers have no width: past 64 bits arithmetic goes on.
+    assert_eq!(val("9223372036854775807 + 1"), "9223372036854775808");
     assert!(fails("SELECT 1 - 'a' as r FROM \"t/#\"", "{}").contains("arithmetic"));
 }
 
@@ -372,7 +373,8 @@ fn conversion_functions_emqx_docs() {
     assert_eq!(val("bool(0)"), "false");
     assert_eq!(val("bool('false')"), "false");
     assert_eq!(val("float(20)"), "20.0");
-    assert_eq!(val("float('3.14e4')"), "31400.0");
+    // jiffy writes the float in Erlang's shortest form.
+    assert_eq!(val("float('3.14e4')"), "3.14e4");
     assert_eq!(val("float('3.1415926', 3)"), "3.142");
     assert_eq!(val("float2str(0.1, 5)"), r#""0.1""#);
     assert_eq!(val("float2str(0.100001, 5)"), r#""0.1""#);
@@ -610,8 +612,6 @@ fn load_errors_are_specific() {
     assert!(e.contains("expected FROM"), "{e}");
     let e = check_sql("SELECT a FROM \"t\" WHERE a = b = c").unwrap_err();
     assert!(e.contains("do not chain"), "{e}");
-    let e = check_sql("SELECT regex_match(a, '(') FROM \"t\"").unwrap_err();
-    assert!(e.contains("invalid regular expression"), "{e}");
     let e = check_sql("SELECT a\nFROM \"t\" WHERE a = 'x").unwrap_err();
     assert!(e.contains("line 2"), "{e}");
 }
@@ -825,11 +825,12 @@ fn payload_values_cannot_crash_the_evaluator() {
     }
 
     // The span of a full i64 range overflowed: a panic with overflow checks on, a
-    // wrong (but in-range) answer without them.
+    // wrong (but in-range) answer without them. EMQX's `Min + (N rem Span)` takes the
+    // dividend's sign, so -5 maps to -15.
     let mtr = "SELECT map_to_range(payload.n, payload.lo, payload.hi) AS b FROM \"t/#\"";
     assert_eq!(
         one(mtr, r#"{"n":-5,"lo":-10,"hi":9223372036854775807}"#),
-        r#"{"b":9223372036854775803}"#
+        r#"{"b":-15}"#
     );
     one(
         mtr,
@@ -1031,6 +1032,7 @@ fn effects(set: &RuleSet, input: &PublishInput) -> (Vec<(Arc<str>, Effect)>, Vec
                     Outcome::Failed(e) => format!("failed({e})"),
                     Outcome::ActionOk => "action_ok".to_string(),
                     Outcome::ActionFailed(e) => format!("action_failed({e})"),
+                    Outcome::Recursive(g) => format!("recursive({})", g.as_str()),
                 }
             ));
         },
@@ -1315,16 +1317,42 @@ fn file_level_validation() {
         "unsupported action function",
     );
     bad("[rules.r]\nsql = 'SELECT a FROM \"$share/g/t\"'", "$share");
+    // EMQX's `union([boolean(), template()])`: a boolean, its text, an empty string (the
+    // default) or one placeholder load quietly; another literal loads with a warning,
+    // since it is false on every message; anything else is refused.
+    for dd in [
+        "false",
+        "true",
+        "\"true\"",
+        "\"false\"",
+        "\"\"",
+        "\"${payload.dd}\"",
+    ] {
+        let loaded = RuleSet::parse(&format!(
+            "[rules.r]\nsql = 'SELECT a FROM \"t\"'\nactions = [{{ function = \"republish\", args = {{ topic = \"x\", direct_dispatch = {dd} }} }}]"
+        ))
+        .unwrap();
+        assert!(loaded.warnings.is_empty(), "{dd}: {:?}", loaded.warnings);
+        assert_eq!(loaded.rules.digest().len(), 64);
+    }
     let loaded = RuleSet::parse(
-        "[rules.r]\nsql = 'SELECT a FROM \"t\"'\nactions = [{ function = \"republish\", args = { topic = \"x\", direct_dispatch = false } }]",
+        "[rules.r]\nsql = 'SELECT a FROM \"t\"'\nactions = [{ function = \"republish\", args = { topic = \"x\", direct_dispatch = \"yes\" } }]",
     )
     .unwrap();
     assert!(
-        loaded.warnings[0].contains("direct_dispatch"),
+        loaded.warnings[0]
+            .contains("direct_dispatch \"yes\" is neither a boolean nor a placeholder"),
         "{:?}",
         loaded.warnings
     );
-    assert_eq!(loaded.rules.digest().len(), 64);
+    bad(
+        "[rules.r]\nsql = 'SELECT a FROM \"t\"'\nactions = [{ function = \"republish\", args = { topic = \"x\", direct_dispatch = 1 } }]",
+        "`direct_dispatch` must be a boolean or a placeholder",
+    );
+    bad(
+        "[rules.r]\nsql = 'SELECT a FROM \"t\"'\nactions = [{ function = \"republish\", args = { topic = \"x\", direct_dispatch = \"a${b}\" } }]",
+        "direct_dispatch must be a literal or exactly one placeholder",
+    );
 }
 
 /// docs/RULES.md is the function reference operators read: every built-in must be in it,
@@ -1551,54 +1579,78 @@ fn a_file_may_compile_only_so_many_distinct_regular_expressions() {
     );
 
     // Patterns built at run time (from the payload) are not literals: not counted.
-    let mut text = regex_file(&distinct(MAX_REGEX_LITERALS_PER_FILE), 1);
+    let mut text = regex_file(&distinct(MAX_REGEX_LITERALS_PER_FILE), 7);
     text.push_str(
         "[rules.dyn]\nsql = 'SELECT regex_match(payload.a, payload.p) AS m FROM \"t\"'\n",
     );
     RuleSet::parse(&text).unwrap_or_else(|e| panic!("{e}"));
+
+    // The patterns' bytes are budgeted too: 1 KiB patterns fill it before their count.
+    let kib = |n: usize| -> Vec<String> {
+        (0..n)
+            .map(|i| format!("^{i:04}{}", "b".repeat(1019)))
+            .collect()
+    };
+    let fit = MAX_REGEX_LITERAL_BYTES_PER_FILE / 1024;
+    assert!(fit < MAX_REGEX_LITERALS_PER_FILE);
+    RuleSet::parse(&regex_file(&kib(fit), 8)).unwrap_or_else(|e| panic!("{e}"));
+    let e = RuleSet::parse(&regex_file(&kib(fit + 1), 8)).unwrap_err();
+    assert!(
+        e.to_string().contains(&format!(
+            "more than {MAX_REGEX_LITERAL_BYTES_PER_FILE} bytes of distinct regular expressions"
+        )),
+        "{e}"
+    );
 }
 
-/// The longest `\w{n}` this build compiles within the per-pattern size limit. The limit is
-/// fixed, but what a pattern costs against it depends on the regex features the build
-/// unifies: the broker's graph enables `regex-automata/dfa-build` (through
-/// tracing-subscriber's env filter), and with it a far shorter run is the largest that
-/// fits than in `cargo test -p mqtt-rules` alone.
-fn longest_word_run() -> usize {
-    (1..=64)
-        .rev()
-        .find(|n| funcs::compile_regex(&format!("\\w{{{n}}}")).is_ok())
-        .expect("\\w compiles")
+/// The most repetitions of `(?:\w\w)` PCRE2 compiles: a repeated group is copied once
+/// per repetition, and a compiled pattern holds at most 64K code units (`LINK_SIZE` 2,
+/// as in OTP), past which it is `regular expression is too large`.
+fn longest_group_run() -> usize {
+    let (mut lo, mut hi) = (1_usize, 65_535);
+    while lo < hi {
+        let mid = (lo + hi).div_ceil(2);
+        if funcs::compile_regex(format!("(?:\\w\\w){{{mid}}}").as_bytes()).is_ok() {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    lo
 }
 
 /// An identical pattern is compiled once and counts once, wherever it appears: a file
-/// repeating one pattern at the per-pattern size limit far past the budget loads.
+/// repeating one pattern at PCRE2's size limit far past the budget loads.
 #[test]
 fn identical_regular_expressions_are_compiled_once() {
-    let n = longest_word_run();
-    assert!(
-        funcs::compile_regex(&format!("\\w{{{}}}", n + 1)).is_err(),
-        "\\w{{{n}}} is at the limit"
-    );
-    let at_limit = format!("\\w{{{n}}}");
+    let n = longest_group_run();
+    let over = funcs::compile_regex(format!("(?:\\w\\w){{{}}}", n + 1).as_bytes()).unwrap_err();
+    assert!(over.contains("regular expression is too large"), "{over}");
+    let at_limit = format!("(?:\\w\\w){{{n}}}");
     let mut pool = parser::RegexPool::default();
-    let first = pool.get(&at_limit).unwrap();
-    assert!(Arc::ptr_eq(&first, &pool.get(&at_limit).unwrap()));
+    let first = pool.get(&at_limit).unwrap().unwrap();
+    assert!(Arc::ptr_eq(&first, &pool.get(&at_limit).unwrap().unwrap()));
     assert!(!Arc::ptr_eq(
         &first,
-        &pool.get(&format!("\\w{{{}}}", n - 1)).unwrap()
+        &pool
+            .get(&format!("(?:\\w\\w){{{}}}", n - 1))
+            .unwrap()
+            .unwrap()
     ));
 
-    let worst = vec![at_limit; 4 * MAX_REGEX_LITERALS_PER_FILE];
+    let worst = vec![at_limit; 2 * MAX_REGEX_LITERALS_PER_FILE];
     let set = load(&regex_file(&worst, 32));
     assert_eq!(set.len(), 32);
     // Each still works, and a second distinct pattern is still accepted beside it.
-    let mut text = regex_file(&worst, 2);
+    let mut text = regex_file(&worst, 8);
     text.push_str("[rules.other]\nsql = '''SELECT 1 AS x FROM \"t/#\" WHERE regex_match(payload.a, '^b$')'''\n");
     let set = load(&text);
-    let payload = Bytes::from(format!(r#"{{"a":"{}"}}"#, "x".repeat(n)));
+    let payload = Bytes::from(format!(r#"{{"a":"{}"}}"#, "x".repeat(2 * n)));
     let props = mqtt_core::AppProperties::default();
     let (_, log) = effects(&set, &msg("t/1", &payload, &props));
-    assert_eq!(log, ["other:no_result", "r0:passed", "r1:passed"]);
+    let mut want = vec!["other:no_result".to_string()];
+    want.extend((0..8).map(|r| format!("r{r}:passed")));
+    assert_eq!(log, want);
 }
 
 /// The structured error keeps the text `mqttd --check-rules` and a rejected reload have
@@ -1703,7 +1755,7 @@ fn a_loaded_set_keeps_its_action_specs_and_warnings() {
     )
     .unwrap();
     assert_eq!(loaded.rules.warnings(), loaded.warnings.as_slice());
-    assert_eq!(loaded.warnings.len(), 2, "{:?}", loaded.warnings);
+    assert_eq!(loaded.warnings.len(), 1, "{:?}", loaded.warnings);
     let r = loaded.rules.get("r").expect("rule r");
     assert_eq!(r.action_specs().len(), 2);
     assert_eq!(
@@ -1911,6 +1963,8 @@ fn outcome_kind(o: Outcome<'_>) -> &'static str {
         Outcome::ActionOk => "action_ok",
         Outcome::ActionFailed(_) => "action_failed",
         Outcome::Elapsed(_) => "elapsed",
+        Outcome::Recursive(Recursion::SameRule) => "recursive_same_rule",
+        Outcome::Recursive(Recursion::Depth) => "recursive_depth",
     }
 }
 
@@ -2611,6 +2665,682 @@ fn regex_replace_reads_its_replacement_as_erlang_re_does() {
     refused(r"regex_replace('abc', '(b)', '\g{x}')");
 }
 
+/// What EMQX 6.3.1 (OTP 28, PCRE2 10.47) gives for one subject and pattern:
+/// `regex_match`, `regex_replace` with `<&>`, and `regex_extract`; `Err` where the call
+/// raises (`badarg`), which fails the rule.
+type RegexRow = (
+    &'static [u8],
+    &'static [u8],
+    Result<bool, ()>,
+    Result<&'static [u8], ()>,
+    Result<&'static [&'static [u8]], ()>,
+);
+
+/// What this engine gives for the calls of a [`RegexRow`].
+type RegexResults = (
+    Result<bool, ()>,
+    Result<Vec<u8>, ()>,
+    Result<Vec<Vec<u8>>, ()>,
+);
+
+/// `regex_match`, `regex_replace(S, P, '<&>')` and `regex_extract` of `subject` and
+/// `pattern` as values, called with the pattern compiled per call (as from a payload)
+/// or, with `literal`, compiled once beforehand (as a literal in the rule is when the
+/// file loads).
+fn regex_calls(subject: &[u8], pattern: &[u8], literal: bool) -> RegexResults {
+    let payload = Bytes::new();
+    let props = mqtt_core::AppProperties::default();
+    let input = msg("t/a", &payload, &props);
+    let ctx = EvalCtx::new(&input);
+    let compiled = funcs::compile_regex(pattern);
+    let call = |name: &str, args: &[Value]| {
+        let func = funcs::lookup(name).unwrap();
+        let regex = literal.then_some(&compiled);
+        (func.f)(args, &funcs::FnCtx { ctx: &ctx, regex }).map_err(|_| ())
+    };
+    let bytes = |b: &[u8]| Value::from_bytes(&Bytes::copy_from_slice(b));
+    let (subject, pattern) = (bytes(subject), bytes(pattern));
+    let matched = call("regex_match", &[subject.clone(), pattern.clone()])
+        .map(|v| matches!(v, Value::Bool(true)));
+    let replaced = call(
+        "regex_replace",
+        &[subject.clone(), pattern.clone(), Value::from("<&>")],
+    )
+    .map(|v| v.as_bytes().unwrap().to_vec());
+    let extracted = call("regex_extract", &[subject, pattern]).map(|v| match v {
+        Value::Array(groups) => groups
+            .iter()
+            .map(|g| g.as_bytes().unwrap().to_vec())
+            .collect(),
+        v => panic!("{v:?}"),
+    });
+    (matched, replaced, extracted)
+}
+
+/// EMQX's regex functions run Erlang's `re`: PCRE2 on bytes, not characters. The
+/// probes that told the engines apart, each with EMQX 6.3.1's answer.
+#[test]
+fn regular_expressions_are_pcre2_on_bytes_as_in_emqx() {
+    let on = |s: &str, sql_expr: &str| -> String {
+        let out = one(
+            &format!("SELECT {sql_expr} AS r FROM \"t/#\""),
+            &format!(r#"{{"s":{}}}"#, serde_json::to_string(s).unwrap()),
+        );
+        let Value::Map(m) = json_decode(out.as_bytes()).unwrap() else {
+            panic!("{out}")
+        };
+        m.get("r").unwrap().to_json().unwrap()
+    };
+    // `$` matches before a final newline.
+    assert_eq!(on("abc\n", "regex_match(payload.s, 'abc$')"), "true");
+    // `.` is one byte: `é` is two.
+    assert_eq!(on("é", "regex_replace(payload.s, '.', 'x')"), r#""xx""#);
+    assert_eq!(on("é", "regex_match(payload.s, '^.$')"), "false");
+    // `\d` and `\w` are ASCII.
+    assert_eq!(on("٣", "regex_match(payload.s, '^\\d$')"), "false");
+    assert_eq!(on("é", "regex_match(payload.s, '\\w')"), "false");
+    // Backreferences, look-around and possessive quantifiers compile.
+    assert_eq!(on("aa", "regex_match(payload.s, '(a)\\1')"), "true");
+    assert_eq!(
+        on("foobar", "regex_extract(payload.s, 'foo(?=(bar))')"),
+        r#"["bar"]"#
+    );
+    assert_eq!(on("aaa", "regex_match(payload.s, '^a++a')"), "false");
+}
+
+/// A broad differential set: every row is EMQX 6.3.1's own output for the same call
+/// (`emqx_rule_funcs:regex_match/2`, `regex_replace/3`, `regex_extract/2`), run on the
+/// EMQX container — line ends and newline conventions, bytes against characters,
+/// PCRE2-only syntax, OTP's global-match loop around empty matches, the match limit as
+/// no match, invalid patterns as `badarg`, and patterns that are not UTF-8. Each row is
+/// checked with the pattern compiled per call and compiled once beforehand.
+#[test]
+fn regex_functions_match_emqx_row_for_row() {
+    let mut differ = Vec::new();
+    for (s, p, m, r, x) in EMQX_REGEX_ROWS {
+        let want = (
+            *m,
+            r.map(<[u8]>::to_vec),
+            x.map(|g| g.iter().map(|b| b.to_vec()).collect()),
+        );
+        for literal in [false, true] {
+            let got = regex_calls(s, p, literal);
+            if got != want {
+                differ.push(format!(
+                    "{:?} on {:?} (literal: {literal}): got {got:?}, EMQX {want:?}",
+                    String::from_utf8_lossy(p),
+                    String::from_utf8_lossy(s),
+                ));
+            }
+        }
+    }
+    assert!(differ.is_empty(), "{}", differ.join("\n"));
+}
+
+/// OTP's `re` runs PCRE2 with its build's match and depth limits (10,000,000 each, per
+/// start position) and reports reaching one as no match. `(a+)+b|z` on `a…az` tries
+/// `(a+)+b` from the first `a` in time exponential in the run: EMQX finds the `z` after
+/// 21 `a`s and gives up after 22. The same threshold here pins the same limits.
+#[test]
+fn the_match_limit_is_otps_and_reaching_it_is_no_match() {
+    let at = |n: usize| regex_calls(format!("{}z", "a".repeat(n)).as_bytes(), b"(a+)+b|z", false).0;
+    assert_eq!(at(21), Ok(true));
+    assert_eq!(at(22), Ok(false));
+    // A limit the pattern sets lower applies; reaching it is no match too (EMQX's
+    // answers).
+    let heap1 = b"(*LIMIT_HEAP=1)^(?:a|b)*$";
+    assert_eq!(regex_calls(b"ab", heap1, false).0, Ok(true));
+    assert_eq!(
+        regex_calls("ab".repeat(50).as_bytes(), heap1, false).0,
+        Ok(false)
+    );
+}
+
+/// Catastrophic backtracking stops at the match limit, so a hostile pattern from a
+/// payload costs one bounded match: the call is no match, as in EMQX — not an error —
+/// and the rule, the message and the next message carry on.
+#[test]
+fn catastrophic_backtracking_is_bounded_and_no_match() {
+    let sql = "SELECT regex_match(payload.s, payload.p) AS m, regex_replace(payload.s, payload.p, 'X') AS r, regex_extract(payload.s, payload.p) AS x FROM \"t/#\"";
+    let hostile = format!(r#"{{"s":"{}b","p":"^(a+)+$"}}"#, "a".repeat(64));
+    let started = std::time::Instant::now();
+    assert_eq!(
+        one(sql, &hostile),
+        format!(r#"{{"m":false,"r":"{}b","x":[]}}"#, "a".repeat(64))
+    );
+    assert!(started.elapsed() < std::time::Duration::from_secs(30));
+    assert_eq!(
+        one(sql, r#"{"s":"aaa","p":"^(a+)+$"}"#),
+        r#"{"m":true,"r":"X","x":["aaa"]}"#
+    );
+}
+
+/// The heap a match may take for its backtracking frames is bounded here, where OTP's
+/// 20,000,000 KiB is in effect no bound: `(?:a|b)*` over a long subject needs a frame per
+/// character. Past [`funcs::re::HEAP_LIMIT_KIB`] the match is no match — EMQX matches this
+/// 1 MB subject — and a pattern cannot raise the bound with its own `(*LIMIT_HEAP=…)`.
+#[test]
+fn a_matchs_backtracking_heap_is_bounded() {
+    let long = "ab".repeat(500_000);
+    let short = "ab".repeat(1_000);
+    assert_eq!(
+        regex_calls(short.as_bytes(), b"^(?:a|b)*$", false).0,
+        Ok(true)
+    );
+    assert_eq!(
+        regex_calls(long.as_bytes(), b"^(?:a|b)*$", false).0,
+        Ok(false)
+    );
+    assert_eq!(
+        regex_calls(long.as_bytes(), b"(*LIMIT_HEAP=100000000)^(?:a|b)*$", false).0,
+        Ok(false)
+    );
+    // Start-of-pattern items still read as the pattern's own, before the bound.
+    assert_eq!(
+        regex_calls(b"a\r\nb", b"(*CRLF)(*LIMIT_MATCH=100)(?m)a$", false).0,
+        Ok(true)
+    );
+}
+
+/// A literal pattern that does not compile no longer fails the load: EMQX accepts the
+/// rule (its parser does not compile patterns) and every call raises `badarg`. The load
+/// says so as a warning, and each message fails the rule with PCRE2's message.
+#[test]
+fn an_invalid_pattern_loads_with_a_warning_and_fails_each_call() {
+    let sql = "SELECT regex_match(payload.s, '(') AS m FROM \"t/#\"";
+    let warnings = check_sql(sql).unwrap();
+    assert!(
+        warnings.iter().any(|w| w.contains(
+            "regex_match(): invalid regular expression: missing closing parenthesis at position 1"
+        )),
+        "{warnings:?}"
+    );
+    let e = fails(sql, r#"{"s":"abc"}"#);
+    assert!(e.contains("missing closing parenthesis"), "{e}");
+    // The same from a payload.
+    let e = fails(
+        "SELECT regex_match(payload.s, payload.p) AS m FROM \"t/#\"",
+        r#"{"s":"abc","p":"a{2,1}"}"#,
+    );
+    assert!(e.contains("numbers out of order in {} quantifier"), "{e}");
+    // Positions are in the pattern as written (EMQX: `{"length of lookbehind assertion is not limited",6}`).
+    let e = funcs::compile_regex(b"(*UTF)(?<=a+)b").unwrap_err();
+    assert!(e.ends_with("at position 6"), "{e}");
+}
+
+/// A pattern that is not UTF-8 (from a binary payload) still means its own bytes:
+/// written for the `pcre2` crate's `&str` as `\xHH` escapes, closing and reopening a
+/// `\Q…\E` around them and keeping an escaping backslash.
+#[test]
+fn a_pattern_that_is_not_utf8_means_its_own_bytes() {
+    for (pattern, subject, want) in [
+        (&b"\xe9"[..], &b"\xe9"[..], true),
+        (b"\\\xe9", b"\xe9", true),
+        (b"\\Q.\xe9\\E", b".\xe9", true),
+        (b"\\Q.\xe9\\E", b"x\xe9", false),
+        (b"\\Q\\\xe9\\E", b"\\\xe9", true),
+        (b"\\Q\\\\E\xe9", b"\\\xe9", true),
+        (b"[\xe0-\xef]", b"\xe9", true),
+        (b"(?#\xff)a", b"a", true),
+    ] {
+        assert_eq!(
+            regex_calls(subject, pattern, false).0,
+            Ok(want),
+            "{pattern:?} on {subject:?}"
+        );
+    }
+}
+
+const EMQX_REGEX_ROWS: &[RegexRow] = &[
+    (b"abc\n", b"abc$", Ok(true), Ok(b"<abc>\n"), Ok(&[])),
+    (b"abc\n", b"abc\\z", Ok(false), Ok(b"abc\n"), Ok(&[])),
+    (b"abc\n", b"abc\\Z", Ok(true), Ok(b"<abc>\n"), Ok(&[])),
+    (b"abc\n\n", b"abc$", Ok(false), Ok(b"abc\n\n"), Ok(&[])),
+    (b"abc\n", b"(?m)abc$", Ok(true), Ok(b"<abc>\n"), Ok(&[])),
+    (b"a\nb", b"^b", Ok(false), Ok(b"a\nb"), Ok(&[])),
+    (b"a\nb", b"(?m)^b", Ok(true), Ok(b"a\n<b>"), Ok(&[])),
+    (b"a\nb", b"a.b", Ok(false), Ok(b"a\nb"), Ok(&[])),
+    (b"a\nb", b"(?s)a.b", Ok(true), Ok(b"<a\nb>"), Ok(&[])),
+    (b"a\r\nb", b"a$", Ok(false), Ok(b"a\r\nb"), Ok(&[])),
+    (b"a\r\nb", b"(?m)a$", Ok(false), Ok(b"a\r\nb"), Ok(&[])),
+    (b"a\rb", b"(?m)a$", Ok(false), Ok(b"a\rb"), Ok(&[])),
+    (b"a\r\nb", b"a\\Rb", Ok(true), Ok(b"<a\r\nb>"), Ok(&[])),
+    (b"a\rb", b"(*CR)(?m)a$", Ok(true), Ok(b"<a>\rb"), Ok(&[])),
+    (
+        b"a\r\nb",
+        b"(*CRLF)(?m)a$",
+        Ok(true),
+        Ok(b"<a>\r\nb"),
+        Ok(&[]),
+    ),
+    (
+        b"a\r\nb",
+        b"(*ANYCRLF)(?m)^b",
+        Ok(true),
+        Ok(b"a\r\n<b>"),
+        Ok(&[]),
+    ),
+    (
+        b"a\x85b",
+        b"(*ANY)(?m)a$",
+        Ok(true),
+        Ok(b"<a>\x85b"),
+        Ok(&[]),
+    ),
+    (b"\n", b"^$", Ok(true), Ok(b"<>\n"), Ok(&[])),
+    (b"\n\n", b"(?m)^$", Ok(true), Ok(b"<>\n<>\n"), Ok(&[])),
+    (
+        b"a\r\nb\r\n",
+        b"(*CRLF)(?m)$",
+        Ok(true),
+        Ok(b"a<>\r\nb<>\r\n<>"),
+        Ok(&[]),
+    ),
+    (
+        b"a\r\nb",
+        b"(*CRLF)",
+        Ok(true),
+        Ok(b"<>a<>\r\n<>b<>"),
+        Ok(&[]),
+    ),
+    (
+        b"a\r\nb",
+        b"(*LF)x*",
+        Ok(true),
+        Ok(b"<>a<>\r<>\n<>b<>"),
+        Ok(&[]),
+    ),
+    (b"\xc3\xa9", b"^.$", Ok(false), Ok(b"\xc3\xa9"), Ok(&[])),
+    (b"\xc3\xa9", b"^..$", Ok(true), Ok(b"<\xc3\xa9>"), Ok(&[])),
+    (b"\xc3\xa9", b"\\w", Ok(false), Ok(b"\xc3\xa9"), Ok(&[])),
+    (
+        b"\xc3\xa9",
+        b"^\\W\\W$",
+        Ok(true),
+        Ok(b"<\xc3\xa9>"),
+        Ok(&[]),
+    ),
+    (b"\xd9\xa3", b"^\\d$", Ok(false), Ok(b"\xd9\xa3"), Ok(&[])),
+    (b"\xd9\xa3", b"\\d", Ok(false), Ok(b"\xd9\xa3"), Ok(&[])),
+    (
+        b"\xc3\x89",
+        b"(?i)\xc3\xa9",
+        Ok(false),
+        Ok(b"\xc3\x89"),
+        Ok(&[]),
+    ),
+    (
+        b"\xc3\xa9",
+        b"(.)",
+        Ok(true),
+        Ok(b"<\xc3><\xa9>"),
+        Ok(&[b"\xc3"]),
+    ),
+    (b"\xc3\xa9", b".", Ok(true), Ok(b"<\xc3><\xa9>"), Ok(&[])),
+    (
+        b"\xc3\xa9a",
+        b"\\W",
+        Ok(true),
+        Ok(b"<\xc3><\xa9>a"),
+        Ok(&[]),
+    ),
+    (
+        b"\xe2\x82\xac",
+        b"[^a]",
+        Ok(true),
+        Ok(b"<\xe2><\x82><\xac>"),
+        Ok(&[]),
+    ),
+    (
+        b"\xc3\xbc",
+        b"\\xc3\\xbc",
+        Ok(true),
+        Ok(b"<\xc3\xbc>"),
+        Ok(&[]),
+    ),
+    (b"\xc3\xa9", b"\\x{e9}", Ok(false), Ok(b"\xc3\xa9"), Ok(&[])),
+    (
+        b"\xc3\xa9",
+        b"[\\x80-\\xff]+",
+        Ok(true),
+        Ok(b"<\xc3\xa9>"),
+        Ok(&[]),
+    ),
+    (b"\xc3\xa9", b"\\p{L}", Ok(true), Ok(b"<\xc3>\xa9"), Ok(&[])),
+    (
+        b"\xc3\xa9",
+        b"[[:alpha:]]",
+        Ok(false),
+        Ok(b"\xc3\xa9"),
+        Ok(&[]),
+    ),
+    (
+        b"\xc3\xa9",
+        b"[[:^ascii:]]+",
+        Ok(true),
+        Ok(b"<\xc3\xa9>"),
+        Ok(&[]),
+    ),
+    (
+        b"Stra\xc3\x9fe",
+        b"(?i)STRASSE",
+        Ok(false),
+        Ok(b"Stra\xc3\x9fe"),
+        Ok(&[]),
+    ),
+    (
+        b"\xc3\x80B",
+        b"(?i)\xc3\xa0b",
+        Ok(false),
+        Ok(b"\xc3\x80B"),
+        Ok(&[]),
+    ),
+    (b"ABC", b"(?i)abc", Ok(true), Ok(b"<ABC>"), Ok(&[])),
+    (
+        b"\xc3\xa9",
+        b"(*UTF)^.$",
+        Ok(true),
+        Ok(b"<\xc3\xa9>"),
+        Ok(&[]),
+    ),
+    (
+        b"\xc3\xa9",
+        b"(*UTF)(*UCP)^\\w$",
+        Ok(true),
+        Ok(b"<\xc3\xa9>"),
+        Ok(&[]),
+    ),
+    (
+        b"\xc3\xa9",
+        b"(*UCP)\\w",
+        Ok(true),
+        Ok(b"<\xc3>\xa9"),
+        Ok(&[]),
+    ),
+    (
+        b"x\xc2\xa0y",
+        b"x\\sy",
+        Ok(false),
+        Ok(b"x\xc2\xa0y"),
+        Ok(&[]),
+    ),
+    (b"a\x0bb", b"a\\sb", Ok(true), Ok(b"<a\x0bb>"), Ok(&[])),
+    (b"a\x0cb", b"a\\sb", Ok(true), Ok(b"<a\x0cb>"), Ok(&[])),
+    (b"a_1", b"^\\w+$", Ok(true), Ok(b"<a_1>"), Ok(&[])),
+    (b"\t", b"\\h", Ok(true), Ok(b"<\t>"), Ok(&[])),
+    (b"\x0b", b"\\v", Ok(true), Ok(b"<\x0b>"), Ok(&[])),
+    (b"a b", b"\\bb", Ok(true), Ok(b"a <b>"), Ok(&[])),
+    (b"\xc3\xa9a", b"\\ba", Ok(true), Ok(b"\xc3\xa9<a>"), Ok(&[])),
+    (b"aa", b"(a)\\1", Ok(true), Ok(b"<aa>"), Ok(&[b"a"])),
+    (b"ab", b"(a)\\1", Ok(false), Ok(b"ab"), Ok(&[])),
+    (
+        b"abab",
+        b"(?<x>ab)\\k<x>",
+        Ok(true),
+        Ok(b"<abab>"),
+        Ok(&[b"ab"]),
+    ),
+    (
+        b"abcabc",
+        b"(abc)\\g1",
+        Ok(true),
+        Ok(b"<abcabc>"),
+        Ok(&[b"abc"]),
+    ),
+    (
+        b"abab",
+        b"(ab)\\g{-1}",
+        Ok(true),
+        Ok(b"<abab>"),
+        Ok(&[b"ab"]),
+    ),
+    (b"foobar", b"foo(?=bar)", Ok(true), Ok(b"<foo>bar"), Ok(&[])),
+    (b"foobaz", b"foo(?=bar)", Ok(false), Ok(b"foobaz"), Ok(&[])),
+    (b"foobaz", b"foo(?!bar)", Ok(true), Ok(b"<foo>baz"), Ok(&[])),
+    (b"xbar", b"(?<=x)bar", Ok(true), Ok(b"x<bar>"), Ok(&[])),
+    (b"ybar", b"(?<!x)bar", Ok(true), Ok(b"y<bar>"), Ok(&[])),
+    (b"aaa", b"^a++a", Ok(false), Ok(b"aaa"), Ok(&[])),
+    (b"aaa", b"^(?>a+)a", Ok(false), Ok(b"aaa"), Ok(&[])),
+    (b"aaa", b"^a*+$", Ok(true), Ok(b"<aaa>"), Ok(&[])),
+    (
+        b"((()))",
+        b"^(\\((?1)*\\))$",
+        Ok(true),
+        Ok(b"<((()))>"),
+        Ok(&[b"((()))"]),
+    ),
+    (b"(()", b"^(\\((?1)*\\))$", Ok(false), Ok(b"(()"), Ok(&[])),
+    (
+        b"abba",
+        b"^((.)(?1)\\2|.?)$",
+        Ok(true),
+        Ok(b"<abba>"),
+        Ok(&[b"abba", b"a"]),
+    ),
+    (
+        b"ab",
+        b"^(a)?(?(1)b|c)$",
+        Ok(true),
+        Ok(b"<ab>"),
+        Ok(&[b"a"]),
+    ),
+    (b"c", b"^(a)?(?(1)b|c)$", Ok(true), Ok(b"<c>"), Ok(&[])),
+    (b"xyz", b"(?|(x)|(y))z", Ok(true), Ok(b"x<yz>"), Ok(&[b"y"])),
+    (b"abc", b"(?<=\\Ga)b", Ok(true), Ok(b"a<b>c"), Ok(&[])),
+    (
+        b"abc",
+        b"a(*SKIP)(*FAIL)|c",
+        Ok(true),
+        Ok(b"ab<c>"),
+        Ok(&[]),
+    ),
+    (b"abc", b"(*COMMIT)b", Ok(true), Ok(b"a<b>c"), Ok(&[])),
+    (b"abc", b"a(*ACCEPT)x", Ok(true), Ok(b"<a>bc"), Ok(&[])),
+    (b"aaab", b"a+(*PRUNE)b", Ok(true), Ok(b"<aaab>"), Ok(&[])),
+    (b"abc", b"(?C1)abc", Ok(true), Ok(b"<abc>"), Ok(&[])),
+    (
+        b"abc",
+        b"(*LIMIT_MATCH=10)a",
+        Ok(true),
+        Ok(b"<a>bc"),
+        Ok(&[]),
+    ),
+    (b"abc", b"(*NOTEMPTY)x*", Ok(false), Ok(b"abc"), Ok(&[])),
+    (b"abc", b"(*NO_START_OPT)b", Ok(true), Ok(b"a<b>c"), Ok(&[])),
+    (b"abc", b"[[:alpha:]]+", Ok(true), Ok(b"<abc>"), Ok(&[])),
+    (b"a.c", b"a\\.c", Ok(true), Ok(b"<a.c>"), Ok(&[])),
+    (b"abc", b"a\\Qb\\Ec", Ok(true), Ok(b"<abc>"), Ok(&[])),
+    (b"a.c", b"\\Qa.c\\E", Ok(true), Ok(b"<a.c>"), Ok(&[])),
+    (b"ab", b"(?x) a b # comment", Ok(true), Ok(b"<ab>"), Ok(&[])),
+    (b"ab", b"a(?#comment)b", Ok(true), Ok(b"<ab>"), Ok(&[])),
+    (b"aXb", b"a\\Cb", Ok(true), Ok(b"<aXb>"), Ok(&[])),
+    (b"abc", b"\\Aabc\\z", Ok(true), Ok(b"<abc>"), Ok(&[])),
+    (b"x\x00y", b"x\\x00y", Ok(true), Ok(b"<x\x00y>"), Ok(&[])),
+    (b"x\x00y", b"x.y", Ok(true), Ok(b"<x\x00y>"), Ok(&[])),
+    (b"x\x00y", b"x\\0y", Ok(true), Ok(b"<x\x00y>"), Ok(&[])),
+    (b"aaa", b"a{2}", Ok(true), Ok(b"<aa>a"), Ok(&[])),
+    (b"aaa", b"^a{,2}", Ok(true), Ok(b"<aa>a"), Ok(&[])),
+    (b"a{,2}", b"^a{,2}$", Ok(false), Ok(b"a{,2}"), Ok(&[])),
+    (b"abc", b"\\N", Ok(true), Ok(b"<a><b><c>"), Ok(&[])),
+    (b"a\nb", b"a\\Nb", Ok(false), Ok(b"a\nb"), Ok(&[])),
+    (b"ab12", b"(?i:A)B\\d+", Ok(false), Ok(b"ab12"), Ok(&[])),
+    (b"abc", b"[^\\w]", Ok(false), Ok(b"abc"), Ok(&[])),
+    (b"a-z", b"[a\\-z]+", Ok(true), Ok(b"<a-z>"), Ok(&[])),
+    (b"]", b"[]]", Ok(true), Ok(b"<]>"), Ok(&[])),
+    (b"abc", b"", Ok(true), Ok(b"<>a<>b<>c<>"), Ok(&[])),
+    (b"", b"", Ok(true), Ok(b"<>"), Ok(&[])),
+    (b"", b"^$", Ok(true), Ok(b"<>"), Ok(&[])),
+    (b"", b"a*", Ok(true), Ok(b"<>"), Ok(&[])),
+    (b"abc", b"x*", Ok(true), Ok(b"<>a<>b<>c<>"), Ok(&[])),
+    (b"aaa", b"a*", Ok(true), Ok(b"<aaa><>"), Ok(&[])),
+    (b"aaa", b"a*?", Ok(true), Ok(b"<><a><><a><><a><>"), Ok(&[])),
+    (b"abc", b"(?=a)", Ok(true), Ok(b"<>abc"), Ok(&[])),
+    (b"abc", b"\\b", Ok(true), Ok(b"<>abc<>"), Ok(&[])),
+    (
+        b"hello world",
+        b"(\\w+) (\\w+)",
+        Ok(true),
+        Ok(b"<hello world>"),
+        Ok(&[b"hello", b"world"]),
+    ),
+    (b"abc", b"(x)?b", Ok(true), Ok(b"a<b>c"), Ok(&[])),
+    (b"abc", b"(x)?(b)", Ok(true), Ok(b"a<b>c"), Ok(&[b"", b"b"])),
+    (b"abc", b"(b)(x)?", Ok(true), Ok(b"a<b>c"), Ok(&[b"b"])),
+    (
+        b"abc",
+        b"(b)(x)?(c)",
+        Ok(true),
+        Ok(b"a<bc>"),
+        Ok(&[b"b", b"", b"c"]),
+    ),
+    (b"abc", b"b", Ok(true), Ok(b"a<b>c"), Ok(&[])),
+    (b"abc", b"(?<n>b)", Ok(true), Ok(b"a<b>c"), Ok(&[b"b"])),
+    (b"abcabc", b"(b)", Ok(true), Ok(b"a<b>ca<b>c"), Ok(&[b"b"])),
+    (b"abc", b"()", Ok(true), Ok(b"<>a<>b<>c<>"), Ok(&[b""])),
+    (b"abc", b"\\Kb", Ok(true), Ok(b"a<b>c"), Ok(&[])),
+    (b"abc", b"a\\K", Ok(true), Ok(b"a<>bc"), Ok(&[])),
+    (b"abc", b"a\\K(b)", Ok(true), Ok(b"a<b>c"), Ok(&[b"b"])),
+    (
+        b"aaa",
+        b"(?=a)|a",
+        Ok(true),
+        Ok(b"<><a><><a><><a>"),
+        Ok(&[]),
+    ),
+    (b"abcabc", b"(?<=a)b", Ok(true), Ok(b"a<b>ca<b>c"), Ok(&[])),
+    (
+        b"1,22,,333",
+        b"\\d*",
+        Ok(true),
+        Ok(b"<1><>,<22><>,<>,<333><>"),
+        Ok(&[]),
+    ),
+    (
+        b"one two  three",
+        b"\\s*",
+        Ok(true),
+        Ok(b"<>o<>n<>e< ><>t<>w<>o<  ><>t<>h<>r<>e<>e<>"),
+        Ok(&[]),
+    ),
+    (b"ab", b"(?=b)|b", Ok(true), Ok(b"a<><b>"), Ok(&[])),
+    (b"ab", b"\\B", Ok(true), Ok(b"a<>b"), Ok(&[])),
+    (b"a.b.c", b"\\.", Ok(true), Ok(b"a<.>b<.>c"), Ok(&[])),
+    (
+        b"192.168.0.1",
+        b"^(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})$",
+        Ok(true),
+        Ok(b"<192.168.0.1>"),
+        Ok(&[b"192", b"168", b"0", b"1"]),
+    ),
+    (
+        b"temp=21.5C",
+        b"temp=(?<v>[0-9.]+)(?<u>[CF])",
+        Ok(true),
+        Ok(b"<temp=21.5C>"),
+        Ok(&[b"21.5", b"C"]),
+    ),
+    (
+        b"Date: 2021-05-20",
+        b"(\\d{4})-(\\d{2})-(\\d{2})",
+        Ok(true),
+        Ok(b"Date: <2021-05-20>"),
+        Ok(&[b"2021", b"05", b"20"]),
+    ),
+    (
+        b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab",
+        b"^(a+)+$",
+        Ok(false),
+        Ok(b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab"),
+        Ok(&[]),
+    ),
+    (
+        b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        b"^(a+)+$",
+        Ok(true),
+        Ok(b"<aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa>"),
+        Ok(&[b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]),
+    ),
+    (
+        b"xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab",
+        b"x|^(a+)+$",
+        Ok(true),
+        Ok(b"<x>aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab"),
+        Ok(&[]),
+    ),
+    (
+        b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab",
+        b"(a+)+$|b",
+        Ok(false),
+        Ok(b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab"),
+        Ok(&[]),
+    ),
+    (
+        b"xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab",
+        b"x|(a+)+$",
+        Ok(true),
+        Ok(b"<x>aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab"),
+        Ok(&[]),
+    ),
+    (
+        b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa!",
+        b"(a|aa)+$",
+        Ok(false),
+        Ok(b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa!"),
+        Ok(&[]),
+    ),
+    (
+        b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa!",
+        b"(?:a|a)*$",
+        Ok(false),
+        Ok(b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa!"),
+        Ok(&[]),
+    ),
+    (
+        b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab",
+        b"(*LIMIT_MATCH=1000)^(a+)+b",
+        Ok(true),
+        Ok(b"<aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab>"),
+        Ok(&[b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]),
+    ),
+    (b"abc", b"(", Err(()), Err(()), Err(())),
+    (b"abc", b"[a", Err(()), Err(()), Err(())),
+    (b"abc", b"a{2,1}", Err(()), Err(()), Err(())),
+    (b"abc", b"\\", Err(()), Err(()), Err(())),
+    (b"abc", b"(?<=a+)b", Err(()), Err(()), Err(())),
+    (b"abc", b"\\p{Foo}", Err(()), Err(()), Err(())),
+    (b"abc", b"x{70000}", Err(()), Err(()), Err(())),
+    (b"abc", b"\\k<zz>", Err(()), Err(()), Err(())),
+    (b"abc", b"*", Err(()), Err(()), Err(())),
+    (b"abc", b"\\8", Err(()), Err(()), Err(())),
+    (b"abc", b"(?P<1>a)", Err(()), Err(()), Err(())),
+    (b"abc", b"(*FOO)a", Err(()), Err(()), Err(())),
+    (b"abc", b"(*LIMIT_HEAP=x)a", Err(()), Err(()), Err(())),
+    (b"abc", b"a)", Err(()), Err(()), Err(())),
+    (b"abc", b"(?z)", Err(()), Err(()), Err(())),
+    (b"abc", b"\\c", Err(()), Err(()), Err(())),
+    (b"abc", b"[z-a]", Err(()), Err(()), Err(())),
+    (b"abc", b"(?<=a(?1))(b)", Ok(false), Ok(b"abc"), Ok(&[])),
+    (b"abc", b"(?(?{1})a)", Err(()), Err(()), Err(())),
+    (b"abc", b"\\g", Err(()), Err(()), Err(())),
+    (b"abc", b"a**", Err(()), Err(()), Err(())),
+    (b"\xe9", b"(*UTF).", Err(()), Err(()), Err(())),
+    (b"\xff\xfe", b"(*UTF)x", Err(()), Err(()), Err(())),
+    (b"x\xffy", b"x\\xffy", Ok(true), Ok(b"<x\xffy>"), Ok(&[])),
+    (b"x\xffy", b"x.y", Ok(true), Ok(b"<x\xffy>"), Ok(&[])),
+    (b"x\xe9", b"x\xe9", Ok(true), Ok(b"<x\xe9>"), Ok(&[])),
+    (b"\xe9", b"^\xe9$", Ok(true), Ok(b"<\xe9>"), Ok(&[])),
+    (b"a\xe9b", b"[\xe9]", Ok(true), Ok(b"a<\xe9>b"), Ok(&[])),
+    (b"a\xe9b", b"\\Q\xe9\\E", Ok(true), Ok(b"a<\xe9>b"), Ok(&[])),
+    (b"a\xe9b", b"\\\xe9", Ok(true), Ok(b"a<\xe9>b"), Ok(&[])),
+    (
+        b"\\\xe9",
+        b"\\Q\\\xe9\\E",
+        Ok(true),
+        Ok(b"<\\\xe9>"),
+        Ok(&[]),
+    ),
+];
+
 /// EMQX's lexer keeps a quoted token whole and its parser unquotes it with
 /// `string:trim(Text, both, "'")`: a doubled quote inside stays doubled and every quote
 /// at either end goes. Values from EMQX 6.3.1.
@@ -2867,6 +3597,11 @@ fn bit_sequence_functions_follow_emqx() {
         ("subbits(hexstr2bin('01'), 1, -1)", "1"),
         ("subbits(hexstr2bin('0102'), 9, 16)", "2"),
         ("subbits(hexstr2bin('000000000000000000FF'), 1, 80)", "255"),
+        // Wider than 64 bits: an Erlang integer of any size.
+        (
+            "subbits(hexstr2bin('FFFFFFFFFFFFFFFFFF'), 1, 72)",
+            "4722366482869645213695",
+        ),
         (
             "subbits(hexstr2bin('FFFFFFFFFFFFFFFFFFFE'), 1, 80, 'integer', 'signed')",
             "-2",
@@ -2890,7 +3625,6 @@ fn bit_sequence_functions_follow_emqx() {
         "subbits(hexstr2bin('01'), 1, 8, 'foo')",
         // Representable in Erlang, not here (docs/RULES.md).
         "subbits(hexstr2bin('FF'), 1, 4, 'bits')",
-        "subbits(hexstr2bin('FFFFFFFFFFFFFFFFFF'), 1, 72)",
     ] {
         refused(bad);
     }
@@ -3025,4 +3759,1062 @@ fn hex_prefix_and_alias_functions_follow_emqx() {
     assert_eq!(val("timezone_to_second('+08:00')"), "28800");
     assert_eq!(val("strlen(format_date('second', '+08:00', '%Y'))"), "4");
     refused("contains_topic('t/a', 't/a')");
+}
+
+// -- numbers: Erlang integers and floats, as EMQX 6.3.1 has them
+
+/// Each `(expr, payload, want)` runs as `SELECT <expr> AS r FROM "t/#"`; `want` is the
+/// exact JSON EMQX 6.3.1 renders for `r` (`emqx_rule_sqltester`, then jiffy), or `None`
+/// where EMQX fails the rule.
+fn emqx_says(cases: &[(&str, &str, Option<&str>)]) {
+    let mut wrong = Vec::new();
+    for (expr, payload, want) in cases {
+        let sql = format!("SELECT {expr} AS r FROM \"t/#\"");
+        let got = run_on(&sql, "t/a", payload).map(|out| {
+            out.first()
+                .and_then(|o| o.strip_prefix(r#"{"r":"#))
+                .and_then(|o| o.strip_suffix('}'))
+                .unwrap_or_default()
+                .to_string()
+        });
+        match (want, &got) {
+            (Some(w), Ok(g)) if g == w => {}
+            (None, Err(_)) => {}
+            _ => wrong.push(format!(
+                "  {expr} (payload {payload}): EMQX {want:?}, mqttd {got:?}"
+            )),
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "{} of {} differ from EMQX 6.3.1:\n{}",
+        wrong.len(),
+        cases.len(),
+        wrong.join("\n")
+    );
+}
+
+/// Integer literals of any size, and arithmetic past 64 bits: Erlang integers never overflow.
+/// Every value is EMQX 6.3.1's (`emqx_rule_sqltester`), probed.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn integer_literals_and_arithmetic_never_overflow() {
+    emqx_says(&[
+        ("12345678901234567890", "{}", Some("12345678901234567890")),
+        (
+            "12345678901234567890 + 1",
+            "{}",
+            Some("12345678901234567891"),
+        ),
+        ("9223372036854775807 + 1", "{}", Some("9223372036854775808")),
+        (
+            "-9223372036854775808 - 1",
+            "{}",
+            Some("-9223372036854775809"),
+        ),
+        ("-9223372036854775808", "{}", Some("-9223372036854775808")),
+        ("-(-9223372036854775808)", "{}", Some("9223372036854775808")),
+        (
+            "9223372036854775807 * 9223372036854775807",
+            "{}",
+            Some("85070591730234615847396907784232501249"),
+        ),
+        (
+            "12345678901234567890 * 12345678901234567890 * 12345678901234567890",
+            "{}",
+            Some("1881676372353657772490265749424677022198701224860897069000"),
+        ),
+        (
+            "12345678901234567890 - 12345678901234567889",
+            "{}",
+            Some("1"),
+        ),
+        (
+            "12345678901234567890 div 7",
+            "{}",
+            Some("1763668414462081127"),
+        ),
+        (
+            "-12345678901234567890 div 7",
+            "{}",
+            Some("-1763668414462081127"),
+        ),
+        ("12345678901234567890 mod 7", "{}", Some("1")),
+        ("-12345678901234567890 mod 7", "{}", Some("-1")),
+        ("12345678901234567890 mod -7", "{}", Some("1")),
+        (
+            "-9223372036854775808 div -1",
+            "{}",
+            Some("9223372036854775808"),
+        ),
+        ("-9223372036854775808 mod -1", "{}", Some("0")),
+        (
+            "12345678901234567890 / 1",
+            "{}",
+            Some("1.2345678901234567e19"),
+        ),
+        (
+            "12345678901234567890 / 12345678901234567890",
+            "{}",
+            Some("1.0"),
+        ),
+        ("7 / 2", "{}", Some("3.5")),
+        ("1 / 3", "{}", Some("0.3333333333333333")),
+        (
+            "12345678901234567890 + 0.5",
+            "{}",
+            Some("1.2345678901234567e19"),
+        ),
+        ("9007199254740993 + 0.0", "{}", Some("9.007199254740992e15")),
+        ("9007199254740993 * 1.0", "{}", Some("9.007199254740992e15")),
+        ("12345678901234567890 div 0", "{}", None),
+        ("12345678901234567890 / 0", "{}", None),
+        ("1 / 0.0", "{}", None),
+        ("1.0e308 * 10", "{}", None),
+        ("-payload.n", r#"{"n":-0.0}"#, Some("0.0")),
+        ("-payload.n", r#"{"n":0.0}"#, Some("0.0")),
+        (
+            "-payload.n",
+            r#"{"n":9223372036854775808}"#,
+            Some("-9223372036854775808"),
+        ),
+        (
+            "-payload.n",
+            r#"{"n":-9223372036854775808}"#,
+            Some("9223372036854775808"),
+        ),
+    ]);
+}
+
+/// JSON numbers in and out, as jiffy decodes and encodes them: integers exact at any size, floats the nearest double, written in Erlang's shortest form.
+/// Every value is EMQX 6.3.1's (`emqx_rule_sqltester`), probed.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn json_numbers_decode_and_encode_as_jiffy_does() {
+    emqx_says(&[
+        (
+            "payload.n",
+            r#"{"n":12345678901234567890}"#,
+            Some("12345678901234567890"),
+        ),
+        (
+            "payload.n + 1",
+            r#"{"n":12345678901234567890}"#,
+            Some("12345678901234567891"),
+        ),
+        (
+            "payload.n",
+            r#"{"n":-12345678901234567890123}"#,
+            Some("-12345678901234567890123"),
+        ),
+        (
+            "payload.n * 2",
+            r#"{"n":-12345678901234567890123}"#,
+            Some("-24691357802469135780246"),
+        ),
+        (
+            "payload.n",
+            r#"{"n":18446744073709551616}"#,
+            Some("18446744073709551616"),
+        ),
+        (
+            "payload.n",
+            r#"{"n":9223372036854775807}"#,
+            Some("9223372036854775807"),
+        ),
+        (
+            "payload.n",
+            r#"{"n":9223372036854775808}"#,
+            Some("9223372036854775808"),
+        ),
+        (
+            "payload.n",
+            r#"{"n":-9223372036854775808}"#,
+            Some("-9223372036854775808"),
+        ),
+        (
+            "payload.n",
+            r#"{"n":-9223372036854775809}"#,
+            Some("-9223372036854775809"),
+        ),
+        ("payload.n", r#"{"n":-0}"#, Some("0")),
+        ("payload.n", r#"{"n":-0.0}"#, Some("0.0")),
+        (
+            "payload.n",
+            r#"{"n":5.960464477539063e-8}"#,
+            Some("5.960464477539063e-8"),
+        ),
+        ("payload.n", r#"{"n":0.1}"#, Some("0.1")),
+        ("payload.n", r#"{"n":1e5}"#, Some("1.0e5")),
+        ("payload.n", r#"{"n":1E-5}"#, Some("1.0e-5")),
+        (
+            "payload.n",
+            r#"{"n":123456789012345678901234567890e-10}"#,
+            Some("1.2345678901234567e19"),
+        ),
+        ("payload.n", r#"{"n":1.0e400}"#, None),
+        ("payload.n", r#"{"n":1.0e-400}"#, Some("0.0")),
+        ("payload.n", r#"{"n":-1.0e-400}"#, Some("0.0")),
+        (
+            "payload.n",
+            r#"{"n":2.2250738585072011e-308}"#,
+            Some("2.225073858507201e-308"),
+        ),
+        (
+            "payload.n",
+            r#"{"n":4.9406564584124654e-324}"#,
+            Some("5.0e-324"),
+        ),
+        (
+            "payload.n",
+            r#"{"n":1.7976931348623157e308}"#,
+            Some("1.7976931348623157e308"),
+        ),
+        (
+            "payload.n",
+            r#"{"n":9007199254740993}"#,
+            Some("9007199254740993"),
+        ),
+        (
+            "payload.n",
+            r#"{"n":9007199254740993.0}"#,
+            Some("9.007199254740992e15"),
+        ),
+        (
+            "payload.n",
+            r#"{"n":0.30000000000000004}"#,
+            Some("0.30000000000000004"),
+        ),
+        ("payload.n", r#"{"n":100}"#, Some("100")),
+        ("payload.n", r#"{"n":100.0}"#, Some("100.0")),
+        ("payload.n", r#"{"n":1000.0}"#, Some("1.0e3")),
+        ("payload.n", r#"{"n":1.5e300}"#, Some("1.5e300")),
+        ("payload.n", r#"{"n":12.5e-1}"#, Some("1.25")),
+        ("payload.n", r#"{"n":[1,2.5,-3e2]}"#, Some("[1,2.5,-300.0]")),
+        (
+            "str(payload.n)",
+            r#"{"n":12345678901234567890}"#,
+            Some(r#""12345678901234567890""#),
+        ),
+        (
+            "json_encode(payload)",
+            r#"{"n":12345678901234567890,"f":1e20,"z":-0.0}"#,
+            Some(r#""\"{\\\"n\\\":12345678901234567890,\\\"f\\\":1e20,\\\"z\\\":-0.0}\"""#),
+        ),
+        (
+            "payload.n",
+            r#"{"n":"x","m":1.2345678901234567e19}"#,
+            Some(r#""x""#),
+        ),
+        (
+            "payload.m",
+            r#"{"m":1.2345678901234567e19}"#,
+            Some("1.2345678901234567e19"),
+        ),
+        (
+            "payload.m",
+            r#"{"m":12345678901234567168}"#,
+            Some("12345678901234567168"),
+        ),
+    ]);
+}
+
+/// Comparisons: an integer against a float by exact value, against a string by Erlang's own number syntax; `=:=` (`CASE`, `contains`) keeps integers, floats and `-0.0` apart.
+/// Every value is EMQX 6.3.1's (`emqx_rule_sqltester`), probed.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn numbers_compare_by_value_as_erlang_does() {
+    emqx_says(&[
+        (
+            "payload.n > 12345678901234567889.0",
+            r#"{"n":12345678901234567890}"#,
+            Some("true"),
+        ),
+        (
+            "payload.n = 12345678901234567890",
+            r#"{"n":12345678901234567890}"#,
+            Some("true"),
+        ),
+        (
+            "is_int(payload.n)",
+            r#"{"n":12345678901234567890}"#,
+            Some("true"),
+        ),
+        (
+            "is_float(payload.n)",
+            r#"{"n":12345678901234567890}"#,
+            Some("false"),
+        ),
+        (
+            "is_num(payload.n)",
+            r#"{"n":12345678901234567890}"#,
+            Some("true"),
+        ),
+        (
+            "12345678901234567890 = 12345678901234567890.0",
+            "{}",
+            Some("false"),
+        ),
+        ("12345678901234567890 > 1.0e19", "{}", Some("true")),
+        ("12345678901234567890 < 1.3e19", "{}", Some("true")),
+        ("9007199254740993 = 9007199254740992.0", "{}", Some("false")),
+        ("9007199254740993 > 9007199254740992.0", "{}", Some("true")),
+        ("9007199254740992 = 9007199254740992.0", "{}", Some("true")),
+        (
+            "-9007199254740993 < -9007199254740992.0",
+            "{}",
+            Some("true"),
+        ),
+        ("1 = 1.0", "{}", Some("true")),
+        ("0.0 = -0.0", "{}", Some("true")),
+        ("0.5 > 0", "{}", Some("true")),
+        ("-0.5 < 0", "{}", Some("true")),
+        (
+            "12345678901234567890 = '12345678901234567890'",
+            "{}",
+            Some("true"),
+        ),
+        (
+            "12345678901234567890 > '12345678901234567889'",
+            "{}",
+            Some("true"),
+        ),
+        ("12345678901234567890 > '1.0e19'", "{}", Some("true")),
+        ("5 = '5.0'", "{}", Some("true")),
+        ("5 = '+5'", "{}", Some("true")),
+        ("5 = ' 5'", "{}", None),
+        ("5 = '1e1'", "{}", None),
+        ("5 = '5.'", "{}", None),
+        ("12345678901234567890 > 'abc'", "{}", None),
+        ("12345678901234567890 > true", "{}", Some("false")),
+        ("12345678901234567890 < 'abc'", "{}", None),
+        (
+            "[1,12345678901234567890,3]",
+            "{}",
+            Some("[1,12345678901234567890,3]"),
+        ),
+        (
+            "contains(12345678901234567890, [12345678901234567890])",
+            "{}",
+            Some("true"),
+        ),
+        ("contains(1, [1.0])", "{}", Some("false")),
+        ("contains(-0.0, [0.0])", "{}", Some("false")),
+        (
+            "CASE 12345678901234567890 WHEN 12345678901234567890 THEN 'y' ELSE 'n' END",
+            "{}",
+            Some(r#""y""#),
+        ),
+        (
+            "CASE 1 WHEN 1.0 THEN 'y' ELSE 'n' END",
+            "{}",
+            Some(r#""n""#),
+        ),
+        (
+            "payload.a[12345678901234567890]",
+            r#"{"a":[1,2]}"#,
+            Some(r#""undefined""#),
+        ),
+        (
+            "eq(12345678901234567890, 12345678901234567890.0)",
+            "{}",
+            Some("false"),
+        ),
+        ("eq(1, 1.0)", "{}", Some("true")),
+    ]);
+}
+
+/// Floats as text: `str`, templates and concatenation print with ten decimals as the Erlang VM does (`-0.0` keeps its sign, past 255 characters it fails); JSON prints the shortest form (`-0.0` as `0.0`).
+/// Every value is EMQX 6.3.1's (`emqx_rule_sqltester`), probed.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn float_text_is_erlangs() {
+    emqx_says(&[
+        ("str(-0.0)", "{}", Some(r#""-0.0""#)),
+        ("str(1.0e-11)", "{}", Some(r#""0.0""#)),
+        ("str(-1.0e-11)", "{}", Some(r#""-0.0""#)),
+        ("str(5.0e-11)", "{}", Some(r#""0.0000000001""#)),
+        ("str(0.1 + 0.2)", "{}", Some(r#""0.3""#)),
+        ("str(1.0e20)", "{}", Some(r#""100000000000000000000.0""#)),
+        ("str(1.0e250)", "{}", None),
+        (
+            "str(12345678901234567890)",
+            "{}",
+            Some(r#""12345678901234567890""#),
+        ),
+        (
+            "str(-12345678901234567890)",
+            "{}",
+            Some(r#""-12345678901234567890""#),
+        ),
+        ("str(0.00048828125)", "{}", Some(r#""0.0004882813""#)),
+        (
+            "'x' + 12345678901234567890",
+            "{}",
+            Some(r#""x12345678901234567890""#),
+        ),
+        ("'x' + 1.0e300", "{}", None),
+        ("'x' + 1.0e-7", "{}", Some(r#""x0.0000001""#)),
+        ("concat(1.0e-11, -0.0)", "{}", Some(r#""0.0-0.0""#)),
+        (
+            "json_encode(12345678901234567890)",
+            "{}",
+            Some(r#""12345678901234567890""#),
+        ),
+        ("json_encode(-0.0)", "{}", Some(r#""0.0""#)),
+        ("json_encode(1.0e20)", "{}", Some(r#""1.0e20""#)),
+        (
+            "json_encode([1.0e15, 1.0e16, 100.0, 1000.0, 0.0001, 0.00001, 123456789012.5])",
+            "{}",
+            Some(r#""[1.0e15,1.0e16,100.0,1.0e3,0.0001,1.0e-5,123456789012.5]""#),
+        ),
+        (
+            "json_decode('12345678901234567890123')",
+            "{}",
+            Some("12345678901234567890123"),
+        ),
+        ("json_decode('[1.0e400]')", "{}", None),
+        ("-0.0", "{}", Some("0.0")),
+        ("0.1 + 0.2", "{}", Some("0.30000000000000004")),
+        ("1.0e22", "{}", Some("1.0e22")),
+        ("1.0e23", "{}", Some("1.0e23")),
+        ("5.0e-324", "{}", Some("5.0e-324")),
+        ("9007199254740992.0", "{}", Some("9.007199254740992e15")),
+        ("9007199254740991.0", "{}", Some("9007199254740991.0")),
+        ("4503599627370496.5", "{}", Some("4503599627370496.0")),
+        ("123456789.0", "{}", Some("123456789.0")),
+        ("1234567890.0", "{}", Some("1234567890.0")),
+        ("12345678901.0", "{}", Some("12345678901.0")),
+        ("1.0e-7", "{}", Some("1.0e-7")),
+        (
+            "str(967562026147900.25)",
+            "{}",
+            Some(r#""967562026147900.25""#),
+        ),
+        ("967562026147900.25", "{}", Some("967562026147900.2")),
+        (
+            "payload.n",
+            r#"{"n":967562026147900.25}"#,
+            Some("967562026147900.2"),
+        ),
+        (
+            "payload.n",
+            r#"{"n":4503599627370497.5}"#,
+            Some("4503599627370498.0"),
+        ),
+        ("str(1.0e15 + 0.3)", "{}", Some(r#""1000000000000000.25""#)),
+        ("float2str(1.0e-7, 20)", "{}", Some(r#""0.0000001""#)),
+        (
+            "float2str(0.1, 19)",
+            "{}",
+            Some(r#""0.1000000000000000056""#),
+        ),
+        (
+            "float2str(9007199254740993.0, 2)",
+            "{}",
+            Some(r#""9007199254740992.0""#),
+        ),
+        (
+            "float2str(0.000000000095367431640625, 21)",
+            "{}",
+            Some(r#""0.000000000095367431641""#),
+        ),
+    ]);
+}
+
+/// Every numeric function at values past 64 bits, and at the float edges EMQX treats specially.
+/// Every value is EMQX 6.3.1's (`emqx_rule_sqltester`), probed.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn numeric_functions_take_integers_of_any_size() {
+    emqx_says(&[
+        ("abs(-12345678901234567890)", "{}", Some("12345678901234567890")),
+        ("abs(-9223372036854775808)", "{}", Some("9223372036854775808")),
+        ("abs(-1.5)", "{}", None),
+        ("abs(-3)", "{}", Some("3")),
+        ("ceil(1.0e20)", "{}", Some("100000000000000000000")),
+        ("floor(-1.0e20)", "{}", Some("-100000000000000000000")),
+        ("round(1.0e20)", "{}", Some("100000000000000000000")),
+        ("round(2.5)", "{}", Some("3")),
+        ("round(-2.5)", "{}", Some("-3")),
+        ("round(0.49999999999999994)", "{}", Some("0")),
+        ("round(9007199254740993)", "{}", Some("9007199254740993")),
+        ("ceil(9007199254740993)", "{}", Some("9007199254740993")),
+        ("floor(-12345678901234567890)", "{}", Some("-12345678901234567890")),
+        ("ceil(-0.5)", "{}", Some("0")),
+        ("round(-0.4)", "{}", Some("0")),
+        ("ceil(1.7976931348623157e308)", "{}", Some("179769313486231570814527423731704356798070567525844996598917476803157260780028538760589558632766878171540458953514382464234321326889464182768467546703537516986049910576551282076245490090389328944075868508455133942304583236903222948165808559332123348274797826204144723168738177180919299881250404026184124858368")),
+        ("int(12345678901234567890)", "{}", Some("12345678901234567890")),
+        ("int(1.0e20)", "{}", Some("100000000000000000000")),
+        ("int(-1.5)", "{}", Some("-2")),
+        ("int('12345678901234567890')", "{}", Some("12345678901234567890")),
+        ("int('-12345678901234567890123')", "{}", Some("-12345678901234567890123")),
+        ("int('1.0e20')", "{}", Some("100000000000000000000")),
+        ("int('1.5E3')", "{}", Some("1500")),
+        ("int('+12')", "{}", Some("12")),
+        ("int('0012')", "{}", Some("12")),
+        ("int(' 12')", "{}", None),
+        ("int('1e5')", "{}", None),
+        ("int('1_000')", "{}", None),
+        ("int('1.e5')", "{}", None),
+        ("int('1.0e400')", "{}", None),
+        ("int('-1.0e-400')", "{}", Some("0")),
+        ("int(true)", "{}", Some("1")),
+        ("float(12345678901234567890)", "{}", Some("1.2345678901234567e19")),
+        ("float(123456789012345678901234567890123456789)", "{}", Some("1.2345678901234568e38")),
+        ("float(36893488147419107329)", "{}", Some("3.689348814741911e19")),
+        ("float(340282366920938463463374607431768211457)", "{}", Some("3.402823669209385e38")),
+        ("float('12345678901234567890123456789')", "{}", Some("1.2345678901234568e28")),
+        ("float('12')", "{}", Some("12.0")),
+        ("float('+1.5')", "{}", Some("1.5")),
+        ("float('007.50')", "{}", Some("7.5")),
+        ("float('1.5e+3')", "{}", Some("1.5e3")),
+        ("float('1.0e-400')", "{}", Some("0.0")),
+        ("float('-1.0e-400')", "{}", Some("0.0")),
+        ("float('1e5')", "{}", None),
+        ("float(' 1.5')", "{}", None),
+        ("float('.5')", "{}", None),
+        ("float('1.0e400')", "{}", None),
+        ("float(12345678901234567890, 3)", "{}", Some("1.2345678901234567e19")),
+        ("float(0.125, 2)", "{}", Some("0.13")),
+        ("float(-0.0, 1)", "{}", Some("0.0")),
+        ("float(1.5, 253)", "{}", Some("1.5")),
+        ("float(1.5, 254)", "{}", None),
+        ("float(1.0e20, 2)", "{}", Some("1.0e20")),
+        ("float(2.5, 0)", "{}", None),
+        ("float2str(12345678901234567890.0, 2)", "{}", Some(r#""12345678901234567168.0""#)),
+        ("float2str(0.125, 2)", "{}", Some(r#""0.13""#)),
+        ("float2str(2.5, 0)", "{}", Some(r#""3""#)),
+        ("float2str(-0.0, 3)", "{}", Some(r#""-0.0""#)),
+        ("float2str(1.0e20, 2)", "{}", Some(r#""100000000000000000000.0""#)),
+        ("float2str(5, 2)", "{}", None),
+        ("float2str(0.000000001, 5)", "{}", Some(r#""0.0""#)),
+        ("float2str(-0.000000001, 5)", "{}", Some(r#""-0.0""#)),
+        ("float2str(1.0e243, 10)", "{}", Some(r#""1000000000000000074650575649831695774632795300119615593163034400120115457135799236292149453307499328074479031320129942191467592834574340826335964513506590066150788638749118835418037019527222886944981240519484646566146722558989084608335389392896.0""#)),
+        ("float2str(2.0e243, 11)", "{}", None),
+        ("power(12345678901234567890, 2)", "{}", Some("1.5241578753238834e38")),
+        ("power(2, 0.5)", "{}", Some("1.4142135623730951")),
+        ("power(2, 10)", "{}", Some("1024.0")),
+        ("power(10, 400)", "{}", None),
+        ("sqrt(12345678901234567890)", "{}", Some("3513641828.820144")),
+        ("fmod(12345678901234567890, 7)", "{}", Some("0.0")),
+        ("exp(12345678901234567890)", "{}", None),
+        ("log(123456789012345678901234567890123456789012345678901234567890)", "{}", Some("136.06324150896435")),
+        ("sin(12345678901234567890)", "{}", Some("0.8952062890824876")),
+        ("bitnot(12345678901234567890)", "{}", Some("-12345678901234567891")),
+        ("bitnot(9223372036854775807)", "{}", Some("-9223372036854775808")),
+        ("bitnot(-9223372036854775809)", "{}", Some("9223372036854775808")),
+        ("bitand(12345678901234567890, 255)", "{}", Some("210")),
+        ("bitand(-1, 12345678901234567890)", "{}", Some("12345678901234567890")),
+        ("bitand(-12345678901234567890, 12345678901234567890)", "{}", Some("2")),
+        ("bitor(12345678901234567890, 1)", "{}", Some("12345678901234567891")),
+        ("bitor(-12345678901234567890, 1)", "{}", Some("-12345678901234567889")),
+        ("bitxor(12345678901234567890, 12345678901234567890)", "{}", Some("0")),
+        ("bitxor(-1, 18446744073709551615)", "{}", Some("-18446744073709551616")),
+        ("bitsl(1, 100)", "{}", Some("1267650600228229401496703205376")),
+        ("bitsl(1, 64)", "{}", Some("18446744073709551616")),
+        ("bitsl(1, 63)", "{}", Some("9223372036854775808")),
+        ("bitsl(1, -1)", "{}", Some("0")),
+        ("bitsl(-1, 3)", "{}", Some("-8")),
+        ("bitsl(3, 0)", "{}", Some("3")),
+        ("bitsl(-5, 70)", "{}", Some("-5902958103587056517120")),
+        ("bitsr(12345678901234567890, 3)", "{}", Some("1543209862654320986")),
+        ("bitsr(-12345678901234567890, 100)", "{}", Some("-1")),
+        ("bitsr(1, -3)", "{}", Some("8")),
+        ("bitsr(5, 100)", "{}", Some("0")),
+        ("bitsr(-5, 1)", "{}", Some("-3")),
+        ("bitsr(-1, 12345678901234567890)", "{}", Some("-1")),
+        ("bitsr(1, 12345678901234567890)", "{}", Some("0")),
+        ("bitsl(0, 12345678901234567890)", "{}", Some("0")),
+        ("div(12345678901234567890, 7)", "{}", Some("1763668414462081127")),
+        ("mod(-12345678901234567890, 7)", "{}", Some("-1")),
+        ("div(7, 2.0)", "{}", None),
+        ("map_to_range(12345678901234567890, 1, 10)", "{}", Some("1")),
+        ("map_to_range(-12345678901234567890, 1, 10)", "{}", Some("1")),
+        ("map_to_range(-3, 1, 10)", "{}", Some("-2")),
+        ("map_to_range(-3, -5, 5)", "{}", Some("-8")),
+        ("map_to_range(13, 1, 10)", "{}", Some("4")),
+        ("map_to_range('abc', -12345678901234567890, 12345678901234567890)", "{}", Some("-12345678901228185711")),
+        ("map_to_range('abc', 1, 10)", "{}", Some("10")),
+        ("hash_to_range('a', 1, 12345678901234567890)", "{}", Some("3072281523061963130")),
+        ("hash_to_range('a', 1, 10)", "{}", Some("10")),
+        ("hash_to_range('', 1, 10)", "{}", None),
+        ("subbits('abcdefghijklmnopqrstuvwxyz', 1, 128)", "{}", Some("129445976596022050476432668810952994672")),
+        ("subbits('abcdefghijklmnopqrstuvwxyz', 1, 72, 'integer', 'signed', 'little')", "{}", Some("1944431222027710587489")),
+        ("subbits('abcdefghijklmnopqrstuvwxyz', 1, 72, 'integer', 'unsigned', 'little')", "{}", Some("1944431222027710587489")),
+        ("subbits('abcdefghijklmnopqrstuvwxyz', 9, 100, 'integer', 'signed', 'big')", "{}", Some("487195019612513355983146632918")),
+        ("bool(12345678901234567890)", "{}", None),
+        ("bool(1.0)", "{}", Some("true")),
+        ("bool(0.0)", "{}", Some("false")),
+        ("bool(-0.0)", "{}", Some("false")),
+        ("bool(1)", "{}", Some("true")),
+        ("bytesize([12345678901234567890])", "{}", None),
+        ("nth(12345678901234567890, [1])", "{}", None),
+        ("sublist(12345678901234567890, [1,2])", "{}", Some("[1,2]")),
+        ("sublist(1, 12345678901234567890, [1,2])", "{}", Some("[1,2]")),
+        ("substr('abc', 12345678901234567890)", "{}", Some(r#""""#)),
+        ("substr('abc', 1, 12345678901234567890)", "{}", Some(r#""bc""#)),
+        ("sprintf('~p ~w ~b', 12345678901234567890, -12345678901234567890, 12345678901234567890)", "{}", Some(r#""12345678901234567890 -12345678901234567890 12345678901234567890""#)),
+        ("sprintf('~c', -12345678901234567890)", "{}", Some(r#"".""#)),
+        ("sprintf('~p|~w', 1.0e20, -0.0)", "{}", Some(r#""1.0e20|-0.0""#)),
+        ("sprintf('~30W', 12345678901234567890, 2)", "{}", Some(r#""          12345678901234567890""#)),
+        ("sprintf('~5p', 12345678901234567890)", "{}", Some(r#""12345678901234567890""#)),
+        ("sprintf('~s', 12345678901234567890)", "{}", None),
+        ("sprintf('~f|~e|~g', -0.0, -0.0, -0.0)", "{}", Some(r#""-0.000000|-0.00000e+0|-0.00000e+0""#)),
+        ("sprintf('~f', 12345678901234567890)", "{}", None),
+        ("sprintf('~10.3f', 12345678901234567890.0)", "{}", Some(r#""**********""#)),
+        ("join_to_sql_values_string([12345678901234567890, 1.0e20, -0.0, 0.1])", "{}", Some(r#""12345678901234567890, 100000000000000000000.0, -0.0, 0.1""#)),
+        (r#"map_to_redis_hset_args(json_decode('{"a":12345678901234567890,"b":1.0e20,"c":-0.0,"d":0.1234567}'))"#, "{}", Some(r#"["map_to_redis_hset_args","d","0.123457","c","-0.0","b","100000000000000000000.0","a","12345678901234567890"]"#)),
+        ("float(70889591166011248673)", "{}", Some("7.0889591166011245e19")),
+        ("70889591166011248673 + 0.0", "{}", Some("7.0889591166011245e19")),
+        ("float2str(0.995, 2)", "{}", Some(r#""1.0""#)),
+        ("float2str(1.0e20, 0)", "{}", Some(r#""1""#)),
+        ("float2str(12345.0, 0)", "{}", Some(r#""12345""#)),
+        ("float2str(0.5, 0)", "{}", Some(r#""1""#)),
+        ("float(0.995, 2)", "{}", Some("1.0")),
+        ("float(bitsl(1, 1024))", "{}", None),
+        ("bitsl(1, 1024) / 1", "{}", None),
+        ("bitsl(1, 1023) * 1.0", "{}", Some("8.98846567431158e307")),
+        ("float(bitsl(1, 1024) - 1)", "{}", None),
+        ("sqrt(bitsl(1, 1024))", "{}", None),
+    ]);
+}
+
+/// `IN` is Erlang's `lists:member`: exact (`=:=`), so `1` is not in `(1.0)`, `-0.0` not
+/// in `(0.0)`, and `[1.0]` not in `([1])`. EMQX 6.3.1, probed in a `WHERE`.
+#[test]
+fn in_is_exact_membership() {
+    for (cond, payload, passes) in [
+        ("12345678901234567890 IN (12345678901234567890)", "{}", true),
+        ("1 IN (1.0)", "{}", false),
+        ("-0.0 IN (0.0)", "{}", false),
+        ("0.0 IN (0.0)", "{}", true),
+        ("payload.a IN (1)", r#"{"a":1.0}"#, false),
+        ("payload.a IN ([1])", r#"{"a":[1.0]}"#, false),
+        ("payload.a IN ([1.0])", r#"{"a":[1.0]}"#, true),
+        (
+            "payload.n IN (12345678901234567890, 2)",
+            r#"{"n":12345678901234567890}"#,
+            true,
+        ),
+        (
+            "payload.n > 9007199254740992.0",
+            r#"{"n":9007199254740993}"#,
+            true,
+        ),
+        (
+            "payload.n = 9007199254740992.0",
+            r#"{"n":9007199254740993}"#,
+            false,
+        ),
+    ] {
+        let sql = format!("SELECT 1 AS r FROM \"t/#\" WHERE {cond}");
+        let out = run_on(&sql, "t/a", payload).unwrap();
+        assert_eq!(out.len(), usize::from(passes), "{cond} on {payload}");
+    }
+}
+
+/// Floats printed bit for bit as EMQX 6.3.1 prints them, over the cases where a
+/// textbook algorithm would not: Ryu's tie to even in the shortest form, the Erlang VM's
+/// floating-point rounding of `{decimals, D}` (`1.5e-10` to ten decimals is
+/// `0.0000000002`), its `compact` trimming an integer's zeros (`float2str(1.0e16, 0)` is
+/// `"1"`), and its 255-character limit. Columns: the bits; JSON; `str()` (ten decimals,
+/// compact); three decimals, compact; no decimals, compact (`ERR`: EMQX fails).
+#[test]
+#[allow(clippy::too_many_lines)]
+fn floats_print_as_erlang_does_bit_for_bit() {
+    const ROWS: &[(&str, &str, &str, &str, &str)] = &[
+        ("3de49da7e361ce4c", "1.5e-10", "0.0000000002", "0.0", "0"),
+        (
+            "4341c37937e08000",
+            "1.0e16",
+            "10000000000000000.0",
+            "10000000000000000.0",
+            "1",
+        ),
+        (
+            "4484ea15b273b38a",
+            "1.2345678901234568e22",
+            "12345678901234567741440.0",
+            "12345678901234567741440.0",
+            "1234567890123456774144",
+        ),
+        (
+            "45208abdc094a705",
+            "9.999e24",
+            "9999000000000000346030080.0",
+            "9999000000000000346030080.0",
+            "999900000000000034603008",
+        ),
+        (
+            "430b7ff0b6ef01e2",
+            "967562026147900.2",
+            "967562026147900.25",
+            "967562026147900.25",
+            "967562026147900",
+        ),
+        (
+            "c31ee81b057f9111",
+            "-2174863013831748.2",
+            "-2174863013831748.25",
+            "-2174863013831748.25",
+            "-2174863013831748",
+        ),
+        (
+            "7fefffffffffffff",
+            "1.7976931348623157e308",
+            "ERR",
+            "ERR",
+            "ERR",
+        ),
+        (
+            "f8403c2e427ee78b",
+            "-1.7153808869955908e271",
+            "ERR",
+            "ERR",
+            "ERR",
+        ),
+        (
+            "c2443f630e1658dd",
+            "-173925604396.69424",
+            "-173925604396.6942443848",
+            "-173925604396.694",
+            "-173925604397",
+        ),
+        (
+            "bc80fd91b0561d70",
+            "-2.947382665166891e-17",
+            "-0.0",
+            "-0.0",
+            "-0",
+        ),
+        (
+            "3ed04d7118ae9036",
+            "3.8868205462263175e-6",
+            "0.0000038868",
+            "0.0",
+            "0",
+        ),
+        (
+            "415f3f660c7a3f95",
+            "8191384.194961448",
+            "8191384.1949614482",
+            "8191384.195",
+            "8191384",
+        ),
+        (
+            "c1cad0914a4918bc",
+            "-899752596.5710673",
+            "-899752596.5710673332",
+            "-899752596.571",
+            "-899752597",
+        ),
+        (
+            "c34abedf9418c299",
+            "-1.5056433732224306e16",
+            "-15056433732224306.0",
+            "-15056433732224306.0",
+            "-15056433732224306",
+        ),
+        (
+            "bdf82b116bc50e16",
+            "-3.5169410072545727e-10",
+            "-0.0000000004",
+            "-0.0",
+            "-0",
+        ),
+        (
+            "4302263c757d1646",
+            "638573836477128.8",
+            "638573836477128.75",
+            "638573836477128.75",
+            "638573836477129",
+        ),
+        (
+            "4300490f1f9224fb",
+            "572991116297375.4",
+            "572991116297375.375",
+            "572991116297375.375",
+            "572991116297375",
+        ),
+        (
+            "433e8ea3c016a868",
+            "8601083254843496.0",
+            "8601083254843496.0",
+            "8601083254843496.0",
+            "8601083254843496",
+        ),
+        (
+            "43928fceff7ea46d",
+            "3.343788027722535e17",
+            "334378802772253504.0",
+            "334378802772253504.0",
+            "334378802772253504",
+        ),
+        (
+            "43f45ad632874412",
+            "2.346752225869779e19",
+            "23467522258697789440.0",
+            "23467522258697789440.0",
+            "2346752225869778944",
+        ),
+        (
+            "44b2a6dc789f37d1",
+            "8.808064283063703e22",
+            "88080642830637027295232.0",
+            "88080642830637027295232.0",
+            "88080642830637027295232",
+        ),
+        (
+            "41c8cdcc63992000",
+            "832280775.1962891",
+            "832280775.1962890625",
+            "832280775.196",
+            "832280775",
+        ),
+        (
+            "c30faf1f8b092ea3",
+            "-1114784286189012.4",
+            "-1114784286189012.375",
+            "-1114784286189012.375",
+            "-1114784286189012",
+        ),
+        ("3da5fd7fe1796495", "1.0e-11", "0.0", "0.0", "0"),
+        ("3dcb7cdfd9d7bdbb", "5.0e-11", "0.0000000001", "0.0", "0"),
+        ("3ee4f8b588e368f1", "1.0e-5", "0.00001", "0.0", "0"),
+        ("3f1a36e2eb1c432d", "0.0001", "0.0001", "0.0", "0"),
+        ("4059000000000000", "100.0", "100.0", "100.0", "100"),
+        ("408f400000000000", "1.0e3", "1000.0", "1000.0", "1000"),
+        (
+            "430c6bf526340000",
+            "1.0e15",
+            "1000000000000000.0",
+            "1000000000000000.0",
+            "1000000000000000",
+        ),
+        (
+            "4480f0cf064dd592",
+            "1.0e22",
+            "10000000000000000000000.0",
+            "10000000000000000000000.0",
+            "1",
+        ),
+        (
+            "4340000000000000",
+            "9.007199254740992e15",
+            "9007199254740992.0",
+            "9007199254740992.0",
+            "9007199254740992",
+        ),
+        ("3fc0000000000000", "0.125", "0.125", "0.125", "0"),
+        ("4004000000000000", "2.5", "2.5", "2.5", "3"),
+        ("3fc3333333333333", "0.15", "0.15", "0.15", "0"),
+        ("3ff0020c49ba5e35", "1.0005", "1.0005", "1.0", "1"),
+        ("4000010624dd2f1b", "2.0005", "2.0005", "2.001", "2"),
+        (
+            "44b52d02c7e14af6",
+            "1.0e23",
+            "99999999999999991611392.0",
+            "99999999999999991611392.0",
+            "99999999999999991611392",
+        ),
+        ("0000000000000001", "5.0e-324", "0.0", "0.0", "0"),
+        (
+            "0010000000000000",
+            "2.2250738585072014e-308",
+            "0.0",
+            "0.0",
+            "0",
+        ),
+        ("bfc0000000000000", "-0.125", "-0.125", "-0.125", "-0"),
+    ];
+    for &(bits, json, ten, three, zero) in ROWS {
+        let f = f64::from_bits(u64::from_str_radix(bits, 16).unwrap());
+        assert_eq!(Value::Float(f).to_json().unwrap(), json, "{bits}");
+        for (d, want) in [(10, ten), (3, three), (0, zero)] {
+            let got = crate::num::float_to_decimals(f, d, true).unwrap_or_else(|_| "ERR".into());
+            assert_eq!(got, want, "{bits} with {d} decimals");
+        }
+    }
+}
+
+/// JSON floats read as jiffy reads them (the nearest double; `ERR`: out of range), and
+/// integers past 64 bits converted to floats as the Erlang VM converts them — digit by
+/// 64-bit digit, so not always to the nearest double (`70889591166011248673` is
+/// `7.0889591166011245e19`, not `…25e19`). Bits from EMQX 6.3.1.
+#[test]
+fn floats_parse_and_convert_as_erlang_does() {
+    for (text, bits) in [
+        ("256136027328.3830870998165e44", "4b70b6b222beb45b"),
+        ("278141740925958309382024.383125e147", "63526ccfe21ebe66"),
+        (
+            "66937818471833154147735355.3154716640029685e-21",
+            "40f0579d1875ebc2",
+        ),
+        ("86471.127e-169", "1ddfde7837eb25c8"),
+        ("356.1e189", "67b3fb1b42bc504f"),
+        ("44824526448.2955933e-226", "1338b941219c976f"),
+        ("5.960464477539063e-8", "3e70000000000000"),
+        ("2.2250738585072011e-308", "000fffffffffffff"),
+        ("2.2250738585072012e-308", "0010000000000000"),
+        ("4.9406564584124654e-324", "0000000000000001"),
+        ("2.4703282292062328e-324", "0000000000000001"),
+        ("1.7976931348623158e308", "7fefffffffffffff"),
+        ("9007199254740993.0", "4340000000000000"),
+        ("0.30000000000000004", "3fd3333333333334"),
+        (
+            "1.00000000000000011102230246251565404236316680908203125",
+            "3ff0000000000000",
+        ),
+        (
+            "1.00000000000000011102230246251565404236316680908203124",
+            "3ff0000000000000",
+        ),
+        (
+            "1.00000000000000011102230246251565404236316680908203126",
+            "3ff0000000000001",
+        ),
+        ("1.0e400", "ERR"),
+        ("-1.0e400", "ERR"),
+    ] {
+        let got = match json_decode(text.as_bytes()) {
+            Ok(Value::Float(f)) => format!("{:016x}", f.to_bits()),
+            _ => "ERR".to_string(),
+        };
+        assert_eq!(got, bits, "{text}");
+    }
+    for (n, bits) in [
+        ("20285150958590414285410241185645068675621062784383904495341184577860372554048981890416682625969822291901411300849365357151810608330771060286153", "5d7a9da8138a374d"),
+        ("67296193398529983120953729518316948107003529006333423211957430508294345833633951503673134228239554653750736592122284192", "589aafc0c3de8b80"),
+        ("172634793901111761437645980635978698097108221459588354481201172811031581825966870235552637483464550107611589120066973309037240044159245892761959745496885903529251864429585", "6346df2fba9bf7c2"),
+        ("165526895961644976991114420297442649881095619259963800498067145652817006591843", "4ff6df4e72e0d224"),
+        ("19270013230608649084735106460581905353017328186043497803623643076859879972267705400014129196313500651758207307427", "5740068c103a56a4"),
+        ("70889591166011248673", "440ebe535c9c5628"),
+    ] {
+        let n: num_bigint::BigInt = n.parse().unwrap();
+        let got = crate::num::big_to_f64(&n).map(f64::to_bits);
+        assert_eq!(got, Some(u64::from_str_radix(bits, 16).unwrap()), "{n}");
+    }
+    // The float nearest -0.0's text is -0.0, and an underflow keeps its sign.
+    assert!(
+        matches!(json_decode(b"-1.0e-400"), Ok(Value::Float(f)) if f == 0.0 && f.is_sign_negative())
+    );
+    assert!(matches!(json_decode(b"-0"), Ok(Value::Int(0))));
+}
+
+/// The one bound Erlang does not have: an integer is at most 8192 bits. Text holding a
+/// longer one — a payload, a string `int()` converts, a SQL literal — is refused before
+/// it is parsed, and a shift past the bound before it is computed, so neither costs
+/// more than reading its length.
+#[test]
+fn huge_integers_are_refused_before_they_cost_anything() {
+    let started = std::time::Instant::now();
+    let digits = "9".repeat(1_000_000);
+    let e = fails(
+        "SELECT payload.n AS n FROM \"t/#\"",
+        &format!(r#"{{"n":{digits}}}"#),
+    );
+    assert!(e.contains("integer too large"), "{e}");
+    let e = fails(
+        "SELECT int(payload.s) AS n FROM \"t/#\"",
+        &format!(r#"{{"s":"{digits}"}}"#),
+    );
+    assert!(e.contains("integer too large"), "{e}");
+    let e = fails(
+        "SELECT bitsl(1, payload.s) AS n FROM \"t/#\"",
+        r#"{"s":1000000000000}"#,
+    );
+    assert!(e.contains("integer too large"), "{e}");
+    assert!(RuleSet::parse(&format!(
+        "[rules.r]\nsql = 'SELECT {} AS n FROM \"t\"'\nactions = []\n",
+        "9".repeat(3000)
+    ))
+    .is_err());
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(2),
+        "{:?}",
+        started.elapsed()
+    );
+
+    // Up to the bound, exact; one bit past it, refused.
+    let max: num_bigint::BigInt = (num_bigint::BigInt::from(1) << 8192u32) - 1i32;
+    let p = format!(r#"{{"n":{max}}}"#);
+    assert_eq!(one("SELECT payload.n AS n FROM \"t/#\"", &p), p);
+    assert!(fails("SELECT payload.n + 1 AS n FROM \"t/#\"", &p).contains("integer too large"));
+    assert!(
+        fails("SELECT payload.n * payload.n AS n FROM \"t/#\"", &p).contains("integer too large")
+    );
+    assert_eq!(
+        one("SELECT -payload.n + 1 - 1 AS n FROM \"t/#\"", &p),
+        format!(r#"{{"n":-{max}}}"#)
+    );
+}
+
+/// Big arithmetic is charged, by size, to the per-message budget every function's
+/// output draws on: a FOREACH that multiplies each of a thousand 2,700-bit payload
+/// integers fails the rule rather than computing megabytes of them.
+#[test]
+fn big_arithmetic_is_charged_to_the_message_budget() {
+    let x = ((num_bigint::BigInt::from(1) << 2700u32) - 1i32).to_string();
+    let sql = "FOREACH payload.a AS x INCASE x * x * x < 0 FROM \"t/#\"";
+    let many = |n: usize| format!(r#"{{"a":[{}]}}"#, vec![x.as_str(); n].join(","));
+    assert_eq!(
+        run_on(sql, "t/a", &many(100)).unwrap(),
+        Vec::<String>::new()
+    );
+    let e = fails(sql, &many(1000));
+    assert!(e.contains("budget"), "{e}");
+}
+
+/// The JSON reader accepts and refuses exactly what `serde_json` (strict RFC 8259) does,
+/// over a seeded corpus of mutated documents — it replaced `serde_json` only to keep big
+/// integers exact.
+#[test]
+fn json_reader_accepts_what_serde_json_accepts() {
+    let seeds: &[&[u8]] = &[
+        br#"{"a":[1,2.5,-3e2,true,false,null,"x\u00e9\n"],"b":{"c":{}},"d":[]}"#,
+        br#"[0,-0,0.0,1E+2,1e-2,"\ud83d\ude00","\"\\\/\b\f\r\t"]"#,
+        b"  {\"k\" : \"v\" , \"n\":12345678901234567890}  ",
+        "\"caf\u{e9}\"".as_bytes(),
+    ];
+    let alphabet = b"{}[],:\"\\0123456789.-+eEtrufalsn \t\nxu\x01\xff\xc3\xa9";
+    let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+    let mut rnd = |n: usize| {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        usize::try_from(x % n as u64).unwrap()
+    };
+    for _ in 0..50_000 {
+        let mut b = seeds[rnd(seeds.len())].to_vec();
+        for _ in 0..rnd(4) {
+            let at = rnd(b.len() + 1);
+            let c = alphabet[rnd(alphabet.len())];
+            match rnd(3) {
+                0 if at < b.len() => {
+                    b.remove(at);
+                }
+                1 if at < b.len() => b[at] = c,
+                _ => b.insert(at, c),
+            }
+        }
+        let ours = json_decode(&b).is_ok();
+        let serde = serde_json::from_slice::<serde_json::Value>(&b).is_ok();
+        assert_eq!(ours, serde, "{:?}", String::from_utf8_lossy(&b));
+    }
+    // Its errors read as serde's did (docs/RULES.md quotes these).
+    for (doc, want) in [
+        ("hot", "invalid JSON: expected value at line 1 column 1"),
+        (
+            "not json",
+            "invalid JSON: expected ident at line 1 column 2",
+        ),
+        (
+            "[1,2",
+            "invalid JSON: EOF while parsing a list at line 1 column 4",
+        ),
+        ("01", "invalid JSON: invalid number at line 1 column 2"),
+    ] {
+        assert_eq!(json_decode(doc.as_bytes()).unwrap_err().to_string(), want);
+    }
 }

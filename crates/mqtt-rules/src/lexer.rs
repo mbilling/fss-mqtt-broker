@@ -67,6 +67,8 @@ pub(crate) enum Tok {
     /// A bare identifier.
     Name(String),
     Int(i64),
+    /// An integer literal beyond 64 bits (Erlang's `list_to_integer` has no width).
+    BigInt(std::sync::Arc<num_bigint::BigInt>),
     Float(f64),
     Kw(Kw),
     /// `=`, `!=`, `<>`, `<`, `>`, `<=`, `>=`, `=~`
@@ -288,14 +290,17 @@ pub(crate) fn lex(sql: &str) -> Result<Vec<Spanned>, ParseError> {
                 if float {
                     Tok::Float(
                         text.parse()
-                            .map_err(|_| ParseError::at(sql, start, "malformed number"))?,
+                            .ok()
+                            .filter(|f: &f64| f.is_finite())
+                            .ok_or_else(|| ParseError::at(sql, start, "malformed number"))?,
                     )
                 } else {
-                    Tok::Int(
-                        text.parse().map_err(|_| {
-                            ParseError::at(sql, start, "integer literal out of range")
-                        })?,
-                    )
+                    match crate::num::parse_int(text.as_bytes()) {
+                        Ok(Some(crate::value::Value::Int(n))) => Tok::Int(n),
+                        Ok(Some(crate::value::Value::Big(n))) => Tok::BigInt(n),
+                        Ok(_) => return Err(ParseError::at(sql, start, "malformed number")),
+                        Err(e) => return Err(ParseError::at(sql, start, e.to_string())),
+                    }
                 }
             }
             c if is_ident_start(c) => {

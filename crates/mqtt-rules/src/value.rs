@@ -15,10 +15,12 @@
 //!   `SELECT a, b` renders as `{"a":…,"b":…}`.
 
 use bytes::Bytes;
+use num_bigint::BigInt;
 use std::cmp::Ordering;
 use std::fmt::Write as _;
 use std::sync::Arc;
 
+use crate::num;
 use crate::EvalError;
 
 /// One rule-SQL value.
@@ -31,8 +33,12 @@ pub enum Value {
     Null,
     /// A boolean.
     Bool(bool),
-    /// A signed integer. Overflowing arithmetic is an evaluation error, never a wrap.
+    /// An integer that fits 64 bits.
     Int(i64),
+    /// An integer that does not fit 64 bits — never one that does (see [`crate::num`]).
+    /// Erlang integers have no fixed width, so arithmetic that leaves `i64` continues
+    /// here instead of overflowing.
+    Big(Arc<BigInt>),
     /// A finite float. Operations that would produce NaN or infinity are errors, as
     /// they are on the Erlang VM EMQX runs on.
     Float(f64),
@@ -172,6 +178,13 @@ const LINEAR_SCAN_WORK: usize = SMALL_MAP * SMALL_MAP;
 impl PartialEq for Map {
     /// Structural, order-independent equality (Erlang map equality).
     fn eq(&self, other: &Self) -> bool {
+        self.eq_by(other, Value::loose_eq)
+    }
+}
+
+impl Map {
+    /// Order-independent equality, values compared by `same`.
+    fn eq_by(&self, other: &Self, same: fn(&Value, &Value) -> bool) -> bool {
         if self.len() != other.len() {
             return false;
         }
@@ -179,13 +192,13 @@ impl PartialEq for Map {
             return self
                 .entries
                 .iter()
-                .all(|(k, v)| other.get(k).is_some_and(|o| v.loose_eq(o)));
+                .all(|(k, v)| other.get(k).is_some_and(|o| same(v, o)));
         }
         let index: std::collections::HashMap<&str, &Value> =
             other.entries.iter().map(|(k, v)| (&**k, v)).collect();
         self.entries
             .iter()
-            .all(|(k, v)| index.get(&**k).is_some_and(|o| v.loose_eq(o)))
+            .all(|(k, v)| index.get(&**k).is_some_and(|o| same(v, o)))
     }
 }
 
@@ -261,7 +274,7 @@ impl Value {
             Value::Undefined => "undefined",
             Value::Null => "null",
             Value::Bool(_) => "boolean",
-            Value::Int(_) => "integer",
+            Value::Int(_) | Value::Big(_) => "integer",
             Value::Float(_) => "float",
             Value::Str(_) => "string",
             Value::Bin(_) => "binary",
@@ -302,22 +315,17 @@ impl Value {
         }
     }
 
-    /// The number as `f64`, if this is a number.
+    /// The number as `f64`, converted as the Erlang VM converts it; `None` for a
+    /// non-number and for an integer too large for a float.
     #[must_use]
     pub fn as_f64(&self) -> Option<f64> {
-        match self {
-            // Precision loss above 2^53 is the conversion's documented meaning.
-            #[allow(clippy::cast_precision_loss)]
-            Value::Int(n) => Some(*n as f64),
-            Value::Float(f) => Some(*f),
-            _ => None,
-        }
+        num::to_f64(self)
     }
 
     /// Whether this is a number.
     #[must_use]
     pub fn is_number(&self) -> bool {
-        matches!(self, Value::Int(_) | Value::Float(_))
+        matches!(self, Value::Int(_) | Value::Big(_) | Value::Float(_))
     }
 
     /// Whether this is a string or binary.
@@ -326,15 +334,16 @@ impl Value {
         matches!(self, Value::Str(_) | Value::Bin(_))
     }
 
-    /// Erlang `==`: numbers compare numerically (`1 == 1.0`), binaries byte-wise,
-    /// containers structurally.
+    /// Erlang `==`: numbers compare by value (`1 == 1.0`, but
+    /// `9007199254740993 == 9007199254740992.0` is false although both are the same
+    /// `f64`), binaries byte-wise, containers structurally.
     #[must_use]
     pub fn loose_eq(&self, other: &Value) -> bool {
         match (self, other) {
             (Value::Undefined, Value::Undefined) | (Value::Null, Value::Null) => true,
             (Value::Bool(a), Value::Bool(b)) => a == b,
             (Value::Int(a), Value::Int(b)) => a == b,
-            (a, b) if a.is_number() && b.is_number() => a.as_f64() == b.as_f64(),
+            (a, b) if a.is_number() && b.is_number() => a.num_cmp(b) == Ordering::Equal,
             (a, b) if a.is_binary() && b.is_binary() => a.as_bytes() == b.as_bytes(),
             (Value::Array(a), Value::Array(b)) => {
                 a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| x.loose_eq(y))
@@ -344,11 +353,40 @@ impl Value {
         }
     }
 
+    /// Erlang `=:=` (`IN`, `CASE x WHEN`, `contains`): like [`loose_eq`](Self::loose_eq)
+    /// except that an integer never equals a float and `-0.0` is not `0.0`, at any depth.
+    #[must_use]
+    pub fn exact_eq(&self, other: &Value) -> bool {
+        match (self, other) {
+            (Value::Float(a), Value::Float(b)) => a.to_bits() == b.to_bits(),
+            (Value::Float(_), _) | (_, Value::Float(_)) => false,
+            (Value::Array(a), Value::Array(b)) => {
+                a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| x.exact_eq(y))
+            }
+            (Value::Map(a), Value::Map(b)) => a.eq_by(b, Value::exact_eq),
+            (a, b) => a.loose_eq(b),
+        }
+    }
+
+    /// Two numbers by value.
+    fn num_cmp(&self, other: &Value) -> Ordering {
+        match (self, other) {
+            (Value::Int(a), Value::Int(b)) => a.cmp(b),
+            (Value::Float(a), Value::Float(b)) => a.partial_cmp(b).unwrap_or(Ordering::Equal),
+            (n, Value::Float(f)) => num::cmp_int_float(n, *f),
+            (Value::Float(f), n) => num::cmp_int_float(n, *f).reverse(),
+            (a, b) => match (num::big(a), num::big(b)) {
+                (Some(a), Some(b)) => a.cmp(&b),
+                _ => Ordering::Equal,
+            },
+        }
+    }
+
     /// Erlang term order, used where EMQX compares two values of unrelated types:
     /// number < atom (boolean, null, undefined) < map < list < binary.
     fn rank(&self) -> u8 {
         match self {
-            Value::Int(_) | Value::Float(_) => 0,
+            Value::Int(_) | Value::Big(_) | Value::Float(_) => 0,
             Value::Bool(_) | Value::Null | Value::Undefined => 1,
             Value::Map(_) => 2,
             Value::Array(_) => 3,
@@ -374,10 +412,7 @@ impl Value {
     pub fn term_cmp(&self, other: &Value) -> Ordering {
         match (self, other) {
             (Value::Int(a), Value::Int(b)) => a.cmp(b),
-            (a, b) if a.is_number() && b.is_number() => {
-                let (x, y) = (a.as_f64().unwrap_or(0.0), b.as_f64().unwrap_or(0.0));
-                x.partial_cmp(&y).unwrap_or(Ordering::Equal)
-            }
+            (a, b) if a.is_number() && b.is_number() => a.num_cmp(b),
             (a, b) if a.is_binary() && b.is_binary() => {
                 a.as_bytes().unwrap_or(&[]).cmp(b.as_bytes().unwrap_or(&[]))
             }
@@ -410,13 +445,15 @@ impl Value {
 
     /// The value as text the way EMQX's `str/1` and its templates render it:
     /// binaries as-is, integers in decimal, floats with at most ten decimals and
-    /// trailing zeros trimmed, atoms by name, maps and arrays as JSON.
+    /// trailing zeros trimmed (an error for one too large for that, past 255
+    /// characters), atoms by name, maps and arrays as JSON.
     pub fn to_text(&self) -> Result<String, EvalError> {
         Ok(match self {
             Value::Str(s) => s.to_string(),
             Value::Bin(b) => String::from_utf8_lossy(b).into_owned(),
             Value::Int(n) => n.to_string(),
-            Value::Float(f) => format_float(*f),
+            Value::Big(n) => n.to_string(),
+            Value::Float(f) => format_float(*f)?,
             Value::Bool(_) | Value::Null | Value::Undefined => {
                 self.atom_name().unwrap_or_default().to_string()
             }
@@ -444,22 +481,10 @@ impl Value {
 }
 
 /// EMQX's float text: `float_to_binary(F, [{decimals, 10}, compact])` — fixed
-/// notation, at most ten decimals, trailing zeros trimmed but one kept.
-#[must_use]
-pub fn format_float(f: f64) -> String {
-    let mut s = format!("{f:.10}");
-    if s.contains('.') {
-        while s.ends_with('0') {
-            s.pop();
-        }
-        if s.ends_with('.') {
-            s.push('0');
-        }
-    }
-    if s == "-0.0" {
-        s = "0.0".to_string();
-    }
-    s
+/// notation, at most ten decimals (a tie rounded away from zero), trailing zeros trimmed
+/// but one kept, the sign of `-0.0` kept. Like Erlang's, it fails past 255 characters.
+pub fn format_float(f: f64) -> Result<String, EvalError> {
+    num::float_to_decimals(f, 10, true)
 }
 
 fn write_json_str(s: &str, out: &mut String) {
@@ -490,12 +515,11 @@ fn write_json(v: &Value, out: &mut String) -> Result<(), EvalError> {
         Value::Int(n) => {
             let _ = write!(out, "{n}");
         }
-        Value::Float(f) => {
-            // Shortest round-trip form, as JSON encoders (and EMQX's) print it.
-            let s = serde_json::Number::from_f64(*f)
-                .map_or_else(|| "null".to_string(), |n| n.to_string());
-            out.push_str(&s);
+        Value::Big(n) => {
+            let _ = write!(out, "{n}");
         }
+        // jiffy's float: Erlang's shortest form (`1.0e20`, `0.1`), and `-0.0` as `0.0`.
+        Value::Float(f) => out.push_str(&num::short_float(if *f == 0.0 { 0.0 } else { *f })),
         Value::Str(s) => write_json_str(s, out),
         Value::Bin(b) => match std::str::from_utf8(b) {
             Ok(s) => write_json_str(s, out),
@@ -532,78 +556,10 @@ fn write_json(v: &Value, out: &mut String) -> Result<(), EvalError> {
     Ok(())
 }
 
-/// Decode JSON text into a [`Value`], preserving object key order. Integers outside
-/// `i64` become floats, as a 64-bit JSON reader must.
+/// Decode JSON text into a [`Value`] as EMQX (jiffy) does, preserving object key order:
+/// an integer of any size stays an exact integer, a float reads as the nearest double.
 pub fn json_decode(input: &[u8]) -> Result<Value, EvalError> {
-    use serde::de::DeserializeSeed;
-    let mut de = serde_json::Deserializer::from_slice(input);
-    let v = ValueSeed
-        .deserialize(&mut de)
-        .map_err(|e| EvalError::new(format!("invalid JSON: {e}")))?;
-    de.end()
-        .map_err(|e| EvalError::new(format!("invalid JSON: {e}")))?;
-    Ok(v)
-}
-
-struct ValueSeed;
-
-impl<'de> serde::de::DeserializeSeed<'de> for ValueSeed {
-    type Value = Value;
-    fn deserialize<D: serde::Deserializer<'de>>(self, d: D) -> Result<Value, D::Error> {
-        d.deserialize_any(ValueVisitor)
-    }
-}
-
-struct ValueVisitor;
-
-impl<'de> serde::de::Visitor<'de> for ValueVisitor {
-    type Value = Value;
-
-    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        f.write_str("a JSON value")
-    }
-
-    fn visit_bool<E>(self, v: bool) -> Result<Value, E> {
-        Ok(Value::Bool(v))
-    }
-    fn visit_i64<E>(self, v: i64) -> Result<Value, E> {
-        Ok(Value::Int(v))
-    }
-    fn visit_u64<E>(self, v: u64) -> Result<Value, E> {
-        // Above i64::MAX a JSON integer can only be carried as a float.
-        #[allow(clippy::cast_precision_loss)]
-        Ok(i64::try_from(v).map_or(Value::Float(v as f64), Value::Int))
-    }
-    fn visit_f64<E>(self, v: f64) -> Result<Value, E> {
-        Ok(Value::Float(v))
-    }
-    fn visit_str<E>(self, v: &str) -> Result<Value, E> {
-        Ok(Value::from(v))
-    }
-    fn visit_string<E>(self, v: String) -> Result<Value, E> {
-        Ok(Value::from(v))
-    }
-    fn visit_unit<E>(self) -> Result<Value, E> {
-        Ok(Value::Null)
-    }
-    fn visit_none<E>(self) -> Result<Value, E> {
-        Ok(Value::Null)
-    }
-    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Value, A::Error> {
-        let mut v = Vec::with_capacity(seq.size_hint().unwrap_or(0).min(4096));
-        while let Some(x) = seq.next_element_seed(ValueSeed)? {
-            v.push(x);
-        }
-        Ok(Value::from(v))
-    }
-    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Value, A::Error> {
-        let mut pairs = Vec::with_capacity(map.size_hint().unwrap_or(0).min(4096));
-        while let Some(k) = map.next_key::<String>()? {
-            let v = map.next_value_seed(ValueSeed)?;
-            pairs.push((Arc::from(k), v));
-        }
-        Ok(Value::from(Map::from_pairs(pairs)))
-    }
+    crate::json::decode(input)
 }
 
 #[cfg(test)]
@@ -613,11 +569,12 @@ mod tests {
     #[test]
     fn floats_render_like_emqx_str() {
         // The examples from EMQX's `str/1` reference.
-        assert_eq!(format_float(0.300_000_000_40), "0.3000000004");
-        assert_eq!(format_float(0.300_000_000_04), "0.3");
-        assert_eq!(format_float(12.345_678_901_234), "12.3456789012");
-        assert_eq!(format_float(0.000_000_314_159_265_359), "0.0000003142");
-        assert_eq!(format_float(20.0), "20.0");
+        let f = |x| format_float(x).unwrap();
+        assert_eq!(f(0.300_000_000_40), "0.3000000004");
+        assert_eq!(f(0.300_000_000_04), "0.3");
+        assert_eq!(f(12.345_678_901_234), "12.3456789012");
+        assert_eq!(f(0.000_000_314_159_265_359), "0.0000003142");
+        assert_eq!(f(20.0), "20.0");
     }
 
     #[test]
@@ -627,10 +584,10 @@ mod tests {
         let Value::Map(m) = &v else { panic!() };
         let keys: Vec<&str> = m.iter().map(|(k, _)| &**k).collect();
         assert_eq!(keys, ["b", "a", "big"]);
-        assert!(matches!(m.get("big"), Some(Value::Float(_))));
+        assert!(matches!(m.get("big"), Some(Value::Big(_))));
         assert_eq!(
             v.to_json().unwrap(),
-            r#"{"b":1,"a":[true,null,2.5,"x"],"big":1.8446744073709552e+19}"#
+            r#"{"b":1,"a":[true,null,2.5,"x"],"big":18446744073709551615}"#
         );
     }
 

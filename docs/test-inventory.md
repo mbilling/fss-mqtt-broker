@@ -892,7 +892,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::sink_records_through_a_trait_object`
 - `tests::tampering_with_any_field_changes_the_head`
 
-## `crates/mqtt-rules/src/lib.rs` — 125 test(s)
+## `crates/mqtt-rules/src/lib.rs` — 151 test(s)
 
 - `edit::tests::a_json_rule_body_is_a_rule_edit`
 - `edit::tests::an_insert_appends_the_rule_at_the_end`
@@ -912,6 +912,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `lexer::tests::operators`
 - `lexer::tests::quotes_follow_emqx`
 - `lexer::tests::ranges_numbers_and_comments`
+- `num::tests::decimals_round_as_the_erlang_vm_does`
 - `template::tests::quoted_keys`
 - `template::tests::renders_paths_and_missing_values`
 - `template::tests::the_literal_prefix_is_the_text_before_the_first_placeholder`
@@ -921,15 +922,20 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::a_file_may_compile_only_so_many_distinct_regular_expressions`
 - `tests::a_literal_qos_or_retain_that_can_never_be_valid_fails_the_load`
 - `tests::a_loaded_set_keeps_its_action_specs_and_warnings`
+- `tests::a_matchs_backtracking_heap_is_bounded`
 - `tests::a_message_has_one_timestamp_however_often_it_is_read`
 - `tests::a_messages_effects_share_one_byte_budget`
 - `tests::a_non_json_payload_fails_only_rules_that_reach_into_it`
+- `tests::a_pattern_that_is_not_utf8_means_its_own_bytes`
 - `tests::a_republish_into_sys_fails_its_action`
 - `tests::a_rule_never_sees_the_dup_flag`
 - `tests::addresses_print_as_emqx_prints_them`
+- `tests::an_invalid_pattern_loads_with_a_warning_and_fails_each_call`
 - `tests::arithmetic_follows_erlang`
+- `tests::big_arithmetic_is_charged_to_the_message_budget`
 - `tests::bit_sequence_functions_follow_emqx`
 - `tests::case_expression_emqx_docs`
+- `tests::catastrophic_backtracking_is_bounded_and_no_match`
 - `tests::comments_and_case_insensitive_keywords`
 - `tests::comparison_semantics_follow_emqx`
 - `tests::compression_matches_emqx_byte_for_byte`
@@ -948,6 +954,9 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::expressions_too_deep_to_evaluate_safely_fail_the_load`
 - `tests::failures_are_reported_once_per_interval_per_rule`
 - `tests::file_level_validation`
+- `tests::float_text_is_erlangs`
+- `tests::floats_parse_and_convert_as_erlang_does`
+- `tests::floats_print_as_erlang_does_bit_for_bit`
 - `tests::foreach_default_item_and_chained_aliases_emqx_docs`
 - `tests::foreach_over_a_non_array_yields_nothing_and_is_capped`
 - `tests::foreach_with_do_and_incase_emqx_docs`
@@ -955,15 +964,22 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::hash_offers_every_digest_erlang_crypto_does`
 - `tests::hashing_encoding_and_bits_emqx_docs`
 - `tests::hex_prefix_and_alias_functions_follow_emqx`
+- `tests::huge_integers_are_refused_before_they_cost_anything`
 - `tests::identical_regular_expressions_are_compiled_once`
+- `tests::in_is_exact_membership`
 - `tests::incase_and_do_read_the_merged_scope_like_emqx`
 - `tests::indices_and_ranges`
+- `tests::integer_literals_and_arithmetic_never_overflow`
 - `tests::invalid_qos_fails_the_action`
 - `tests::is_empty_reads_a_string_only_as_a_json_object`
+- `tests::json_numbers_decode_and_encode_as_jiffy_does`
+- `tests::json_reader_accepts_what_serde_json_accepts`
 - `tests::load_errors_are_specific`
 - `tests::load_errors_say_where_and_print_as_before`
 - `tests::map_and_array_functions_emqx_docs`
 - `tests::matching_dedups_orders_and_skips_disabled_rules`
+- `tests::numbers_compare_by_value_as_erlang_does`
+- `tests::numeric_functions_take_integers_of_any_size`
 - `tests::one_rule_can_be_evaluated_whether_or_not_it_is_enabled`
 - `tests::original_user_properties_keep_wire_order_and_duplicates`
 - `tests::payload_regex_patterns_are_cached_per_message_and_stay_distinct`
@@ -973,7 +989,9 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::property_maps_print_as_emqx_prints_them`
 - `tests::quadratic_string_growth_is_refused_before_it_is_allocated`
 - `tests::reason_codes_are_named_as_emqx_names_them`
+- `tests::regex_functions_match_emqx_row_for_row`
 - `tests::regex_replace_reads_its_replacement_as_erlang_re_does`
+- `tests::regular_expressions_are_pcre2_on_bytes_as_in_emqx`
 - `tests::republish_args_render`
 - `tests::republish_defaults_follow_emqx`
 - `tests::rules_aimed_at_sys_load_with_a_warning`
@@ -985,6 +1003,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::string_functions_emqx_docs`
 - `tests::string_functions_work_on_grapheme_clusters_like_emqx`
 - `tests::the_growth_budget_is_per_message`
+- `tests::the_match_limit_is_otps_and_reaching_it_is_no_match`
 - `tests::the_new_events_are_named_as_emqx_names_them`
 - `tests::the_new_events_run_the_rules_that_select_them`
 - `tests::the_sql_test_simulates_events_and_refuses_inputs_the_rule_never_sees`
@@ -1015,6 +1034,13 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests_emqx_examples::type_judgment_functions_match_emqx_examples`
 - `tests_emqx_examples::undocumented_emqx_functions_match_emqx_source`
 - `tests_emqx_examples::uuid_functions_match_emqx_examples`
+- `tests_republish::a_message_republished_from_an_event_has_no_dup_flag`
+- `tests_republish::a_republished_message_is_seen_as_emqx_shows_it`
+- `tests_republish::a_rule_does_not_republish_its_own_republished_message`
+- `tests_republish::direct_dispatch_renders_per_message`
+- `tests_republish::republishing_stops_at_the_depth_cap`
+- `tests_republish::select_star_shows_an_undefined_username`
+- `tests_republish::the_budget_spans_every_reentry`
 - `value::tests::binary_is_never_silently_json_encoded`
 - `value::tests::floats_render_like_emqx_str`
 - `value::tests::json_round_trip_keeps_key_order_and_types`
@@ -2207,28 +2233,34 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 
 - `a_rolled_node_disconnects_only_its_own_clients`
 
-## `crates/mqttd/tests/rules.rs` — 20 test(s)
+## `crates/mqttd/tests/rules.rs` — 26 test(s)
 
 - `a_closed_connection_reports_emqx_s_reason`
 - `a_connection_s_events_carry_emqx_s_fields_end_to_end`
 - `a_disconnect_reason_code_is_reported_by_its_emqx_name`
 - `a_matching_publish_is_transformed_and_republished_beside_the_original`
+- `a_message_republished_from_an_event_runs_the_rules`
 - `a_qos1_publish_acks_and_its_derived_message_is_qos1`
 - `a_qos2_publish_fires_its_rules_once_across_a_dup_resend`
 - `a_refused_connect_raises_its_connack_and_authentication_events`
 - `a_refused_derived_message_fails_its_action_and_the_original_is_still_acked`
 - `a_refused_original_routes_none_of_its_derived_messages`
 - `a_reload_reaches_connections_that_were_already_open`
+- `a_republished_message_runs_the_rules_that_select_it`
 - `a_rule_reads_the_dup_flag_as_false`
 - `a_rule_republishing_into_its_own_from_cannot_loop`
 - `a_rule_that_does_not_select_qos_republishes_a_qos1_publish_at_qos0`
+- `a_templated_direct_dispatch_is_rendered_per_message`
 - `a_will_runs_rules_when_the_hub_publishes_it`
 - `an_event_derived_message_is_counted_when_routed_and_a_refused_copy_as_a_drop`
 - `an_idle_connection_releases_a_superseded_rule_set_when_it_pings`
 - `authorization_events_name_the_acl_file_or_the_default`
 - `client_events_run_rules`
+- `direct_dispatch_skips_the_rules_and_the_retained_store`
 - `foreach_fans_one_publish_out`
 - `in_a_cluster_each_message_is_evaluated_once_on_its_landing_node`
+- `rules_republishing_into_each_other_stop_at_the_depth_cap`
+- `the_original_s_limits_cover_the_whole_chain`
 
 ## `crates/mqttd/tests/rules_binary.rs` — 46 test(s)
 

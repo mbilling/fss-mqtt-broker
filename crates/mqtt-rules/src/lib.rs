@@ -38,7 +38,9 @@ pub mod edit;
 mod eval;
 mod funcs;
 mod input;
+mod json;
 mod lexer;
+mod num;
 mod parser;
 mod template;
 mod value;
@@ -59,8 +61,23 @@ pub const MAX_RULES: usize = 1024;
 pub const MAX_ACTIONS_PER_RULE: usize = 16;
 
 /// The most effects (republished messages and console lines) one trigger may produce
-/// across every rule it matches. Bounds the amplification a single publish can cause.
+/// across every rule it matches — and, through a [`Budget`], across every rule the
+/// messages it republished re-enter. Bounds the amplification a single publish can
+/// cause.
 pub const MAX_EFFECTS_PER_TRIGGER: usize = 1024;
+
+/// How many republishes deep a chain started by one publish, Will or event may go: a
+/// message this many republishes from its original is still evaluated, but its rules'
+/// republish actions are not run ([`Recursion::Depth`]).
+///
+/// A republished message re-enters the rule engine as in EMQX (`direct_dispatch =
+/// false`), and EMQX guards only a rule republishing its own output
+/// ([`Recursion::SameRule`]). Two rules republishing into each other's `FROM` recurse
+/// there until the publisher's process reaches its heap limit and is killed (EMQX 6.3.1
+/// does about 1,500 rounds), so no working EMQX configuration chains that deep; real
+/// pipelines are a few rules long. 32 leaves them room many times over while a loop
+/// stops after 32 messages, well inside [`MAX_EFFECTS_PER_TRIGGER`].
+pub const MAX_REPUBLISH_DEPTH: u32 = 32;
 
 /// What all of one message's effects may carry together, beyond four times the
 /// message's own payload: the topics, payloads and properties of its derived messages,
@@ -73,21 +90,25 @@ pub const MAX_DERIVED_BYTES: usize = 4 << 20;
 /// The longest rule statement accepted.
 pub const MAX_SQL_BYTES: usize = 64 * 1024;
 
-/// The most distinct literal regex patterns one rules file may compile (ADR 0084 D3);
-/// an identical pattern is compiled once however often it appears, and counts once.
+/// The most distinct literal regex patterns one rules file may compile (ADR 0084 D3,
+/// amended by ADR 0083's 2026-10-10 PCRE2 amendment); an identical pattern is compiled
+/// once however often it appears, and counts once.
 ///
-/// Each pattern is already bounded (1 MiB of compiled program, 1 MiB of lazy DFA), but
-/// the file was not: a few thousand worst-case literals took seconds and gigabytes to
-/// parse. Measured on release builds (4-core x86-64, 2026-10): a pattern at the
-/// per-pattern limit costs about 6-7.5 ms and 1.05 MiB to compile, so 128 distinct ones
-/// took 0.9-1.1 s and 140 MiB, and 96 take 0.6-1.1 s and 110-123 MiB. Which patterns
-/// reach the limit depends on the build: mqtt-rules alone admits `\w{50}` or `.{2471}`,
-/// while the broker, whose dependency graph enables regex-automata's `dfa-build`, admits
-/// about `\w{20}` or `.{1048}`; the cost at the limit is the same. 96 keeps a worst-case
-/// file around a second, and the running set plus one candidate being checked or reloaded
-/// under 256 MiB. A file over it fails to load, at boot, on reload, in `--check-rules`
-/// and in the admin API alike.
-pub const MAX_REGEX_LITERALS_PER_FILE: usize = 96;
+/// EMQX compiles a pattern on every call and keeps none; this engine compiles each
+/// literal once, when the file loads, and keeps it while the rules run. PCRE2 bounds a
+/// compiled pattern itself (64K code units, `LINK_SIZE` 2, as in OTP), so the most a
+/// pattern costs is fixed: measured on a release build (Apple M-series, 2026-10), at
+/// most about 0.9 ms and 190 KiB for a short pattern at that limit (`()` repeated, each
+/// group also a capture-name slot); 512 of them are under 0.5 s and 100 MiB. Named
+/// groups compile in time quadratic in their count — about 0.1 s for one 64 KiB
+/// pattern of them — which [`MAX_REGEX_LITERAL_BYTES_PER_FILE`] bounds. A file over
+/// either fails to load, at boot, on reload, in `--check-rules` and in the admin API
+/// alike.
+pub const MAX_REGEX_LITERALS_PER_FILE: usize = 512;
+
+/// The most bytes of distinct literal regex patterns one rules file may compile,
+/// together (see [`MAX_REGEX_LITERALS_PER_FILE`]).
+pub const MAX_REGEX_LITERAL_BYTES_PER_FILE: usize = 256 * 1024;
 
 /// A rule statement that does not parse.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -142,6 +163,12 @@ impl EvalError {
 
     pub(crate) fn in_fn(self, name: &str) -> Self {
         Self(format!("{name}(): {}", self.0))
+    }
+}
+
+impl From<String> for EvalError {
+    fn from(msg: String) -> Self {
+        Self(msg)
     }
 }
 
@@ -211,6 +238,20 @@ pub trait Input {
     fn user_properties(&self) -> &[(String, String)] {
         &[]
     }
+    /// For a message a rule republished, that rule ([`PublishInput::republished_by`]).
+    fn republished_by(&self) -> Option<&str> {
+        None
+    }
+    /// How many republishes the trigger is from its original
+    /// ([`PublishInput::republish_depth`]).
+    fn republish_depth(&self) -> u32 {
+        0
+    }
+    /// Whether the trigger's `flags` have `dup`, which a message it republishes copies
+    /// ([`Republish::dup_flag`]). An event has no `flags`.
+    fn has_dup_flag(&self) -> bool {
+        false
+    }
 }
 
 /// How one rule fared for one trigger, reported as it happens (the broker turns these
@@ -228,12 +269,75 @@ pub enum Outcome<'a> {
     ActionOk,
     /// One action failed (a bad rendered topic, an invalid `qos`, …).
     ActionFailed(&'a EvalError),
+    /// One `republish` action was not run, because its message would loop
+    /// ([`Recursion`]). A `SameRule` skip is EMQX's `recursive_republish_detected`, which
+    /// EMQX counts as a successful action; a `Depth` skip has no EMQX counterpart.
+    Recursive(Recursion),
     /// How long the rule took for this trigger, reported once after its last other
     /// outcome: the SQL, plus rendering and charging its actions' effects. Not what the
     /// broker does with a derived message afterwards (routing a republish). Reported by
     /// [`RuleSet::on_publish`] and [`RuleSet::on_event`], never by a dry run
     /// ([`RuleSet::evaluate_one`]), so it describes live traffic only.
     Elapsed(std::time::Duration),
+}
+
+/// Why a `republish` action was not run on a republished message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Recursion {
+    /// The message is one this same rule republished: EMQX's guard
+    /// (`emqx_rule_actions:republish/3` matching `republish_by` against the rule id,
+    /// logging `recursive_republish_detected`). The rule still runs on it — its SQL, its
+    /// other actions — and other rules may republish it.
+    SameRule,
+    /// The message is [`MAX_REPUBLISH_DEPTH`] republishes from its original.
+    Depth,
+}
+
+impl Recursion {
+    /// The label the broker counts it under.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::SameRule => "same_rule",
+            Self::Depth => "depth",
+        }
+    }
+}
+
+/// What every effect of one original message — a client's publish, a Will, an event —
+/// may use together: [`MAX_EFFECTS_PER_TRIGGER`] effects and [`MAX_DERIVED_BYTES`] plus
+/// four times the original's payload. Shared by the evaluation of the original and of
+/// every message its rules republish that re-enters the rule engine, so a chain or a
+/// loop of rules multiplies a publish no more than one rule can.
+#[derive(Debug)]
+pub struct Budget {
+    effects: std::cell::Cell<usize>,
+    bytes: std::cell::Cell<usize>,
+    limit: usize,
+}
+
+impl Budget {
+    /// The budget of an original whose payload is `payload_len` bytes (0 for an event).
+    #[must_use]
+    pub fn new(payload_len: usize) -> Self {
+        Self {
+            effects: std::cell::Cell::new(0),
+            bytes: std::cell::Cell::new(0),
+            limit: MAX_DERIVED_BYTES.saturating_add(payload_len.saturating_mul(4)),
+        }
+    }
+
+    /// Effects charged so far.
+    #[must_use]
+    pub fn effects(&self) -> usize {
+        self.effects.get()
+    }
+
+    /// Bytes charged so far.
+    #[must_use]
+    pub fn bytes(&self) -> usize {
+        self.bytes.get()
+    }
 }
 
 /// One loaded rule.
@@ -726,10 +830,25 @@ impl RuleSet {
 
     /// Evaluate every enabled rule whose `FROM` matches the message's topic, in id
     /// order. `report` sees each rule's [`Outcome`]s; each effect is appended to `out`
-    /// with the id of the rule that produced it.
+    /// with the id of the rule that produced it. The message's effects get a
+    /// [`Budget`] of their own.
     pub fn on_publish(
         &self,
         input: &PublishInput<'_>,
+        report: &mut dyn FnMut(&Rule, Outcome<'_>),
+        out: &mut Vec<(Arc<str>, Effect)>,
+    ) {
+        let budget = Budget::new(input.payload.len());
+        self.on_publish_within(input, &budget, report, out);
+    }
+
+    /// [`on_publish`](Self::on_publish), charging the effects to `budget`: the original
+    /// message's, when `input` is a message its rules republished
+    /// ([`PublishInput::republished`]).
+    pub fn on_publish_within(
+        &self,
+        input: &PublishInput<'_>,
+        budget: &Budget,
         report: &mut dyn FnMut(&Rule, Outcome<'_>),
         out: &mut Vec<(Arc<str>, Effect)>,
     ) {
@@ -750,7 +869,7 @@ impl RuleSet {
         hits.dedup();
         let ctx = EvalCtx::new(input);
         for i in hits {
-            apply_timed(&self.rules[i], &ctx, report, out);
+            apply_timed(&self.rules[i], &ctx, budget, report, out);
         }
     }
 
@@ -761,13 +880,25 @@ impl RuleSet {
         report: &mut dyn FnMut(&Rule, Outcome<'_>),
         out: &mut Vec<(Arc<str>, Effect)>,
     ) {
+        self.on_event_within(input, &Budget::new(0), report, out);
+    }
+
+    /// [`on_event`](Self::on_event), charging the effects to `budget`, which the
+    /// messages they republish are then evaluated within.
+    pub fn on_event_within(
+        &self,
+        input: &EventInput,
+        budget: &Budget,
+        report: &mut dyn FnMut(&Rule, Outcome<'_>),
+        out: &mut Vec<(Arc<str>, Effect)>,
+    ) {
         let hits = &self.by_event[input.kind().index()];
         if hits.is_empty() {
             return;
         }
         let ctx = EvalCtx::new(input);
         for &i in hits {
-            apply_timed(&self.rules[i], &ctx, report, out);
+            apply_timed(&self.rules[i], &ctx, budget, report, out);
         }
     }
 
@@ -788,7 +919,8 @@ impl RuleSet {
         let Some(rule) = self.get(id) else {
             return false;
         };
-        apply(rule, &EvalCtx::new(input), report, out);
+        let budget = Budget::new(input.payload().map_or(0, Bytes::len));
+        apply(rule, &EvalCtx::new(input), &budget, report, out);
         true
     }
 }
@@ -797,18 +929,23 @@ impl RuleSet {
 fn apply_timed(
     rule: &Rule,
     ctx: &EvalCtx<'_>,
+    budget: &Budget,
     report: &mut dyn FnMut(&Rule, Outcome<'_>),
     out: &mut Vec<(Arc<str>, Effect)>,
 ) {
     let started = std::time::Instant::now();
-    apply(rule, ctx, report, out);
+    apply(rule, ctx, budget, report, out);
     report(rule, Outcome::Elapsed(started.elapsed()));
 }
 
 /// Run one rule against a trigger: the SQL, then each action per output.
+///
+/// A `republish` is not run on a message this rule republished, as EMQX's guard skips
+/// it before rendering anything, nor past [`MAX_REPUBLISH_DEPTH`].
 fn apply(
     rule: &Rule,
     ctx: &EvalCtx<'_>,
+    budget: &Budget,
     report: &mut dyn FnMut(&Rule, Outcome<'_>),
     out: &mut Vec<(Arc<str>, Effect)>,
 ) {
@@ -823,9 +960,20 @@ fn apply(
         return;
     }
     report(rule, Outcome::Passed);
+    let recursion = if ctx.input.republished_by() == Some(&*rule.id) {
+        Some(Recursion::SameRule)
+    } else if ctx.input.republish_depth() >= MAX_REPUBLISH_DEPTH {
+        Some(Recursion::Depth)
+    } else {
+        None
+    };
     for output in &outputs {
         for a in &rule.actions {
-            if out.len() >= MAX_EFFECTS_PER_TRIGGER {
+            if let (Some(r), action::Action::Republish(_)) = (recursion, a) {
+                report(rule, Outcome::Recursive(r));
+                continue;
+            }
+            if budget.effects.get() >= MAX_EFFECTS_PER_TRIGGER {
                 let e = EvalError::new(format!(
                     "this message already produced {MAX_EFFECTS_PER_TRIGGER} effects; \
                      the rest are dropped"
@@ -841,8 +989,9 @@ fn apply(
                     spec.render(output, ctx.input).map(Effect::Republish)
                 }
             };
-            match effect.and_then(|e| charge_derived(ctx, e)) {
+            match effect.and_then(|e| charge_derived(budget, e)) {
                 Ok(e) => {
+                    budget.effects.set(budget.effects.get() + 1);
                     report(rule, Outcome::ActionOk);
                     out.push((rule.id.clone(), e));
                 }
@@ -852,22 +1001,22 @@ fn apply(
     }
 }
 
-/// Charge an effect to the message's [`MAX_DERIVED_BYTES`] budget, refusing it past.
-fn charge_derived(ctx: &EvalCtx<'_>, effect: Effect) -> Result<Effect, EvalError> {
+/// Charge an effect to the original message's [`MAX_DERIVED_BYTES`] budget, refusing
+/// it past.
+fn charge_derived(budget: &Budget, effect: Effect) -> Result<Effect, EvalError> {
     let bytes = match &effect {
         Effect::Republish(r) => r.topic.len() + r.payload.len() + r.app.accounted_bytes(),
         Effect::Console(line) => line.len(),
     };
-    let own = ctx.input.payload().map_or(0, Bytes::len);
-    let limit = MAX_DERIVED_BYTES.saturating_add(own.saturating_mul(4));
-    let total = ctx.derived.get().saturating_add(bytes);
+    let limit = budget.limit;
+    let total = budget.bytes.get().saturating_add(bytes);
     if total > limit {
         return Err(EvalError::new(format!(
             "this message's effects would carry more than {limit} bytes \
              ({MAX_DERIVED_BYTES} plus four times its payload); the rest are dropped"
         )));
     }
-    ctx.derived.set(total);
+    budget.bytes.set(total);
     Ok(effect)
 }
 
@@ -951,3 +1100,5 @@ pub fn check_sql(sql: &str) -> Result<Vec<String>, String> {
 mod tests;
 #[cfg(test)]
 mod tests_emqx_examples;
+#[cfg(test)]
+mod tests_republish;
