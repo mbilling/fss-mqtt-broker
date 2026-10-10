@@ -136,10 +136,17 @@ pub(crate) fn run(stmt: &Statement, ctx: &EvalCtx, out: &mut Vec<Map>) -> Result
     let mut early: Vec<Option<Value>> = vec![None; stmt.fields.len()];
     let mut scope = Map::new();
     for (i, item) in stmt.fields.iter().enumerate() {
-        if let (true, Item::Field { expr, key, .. }) = (needs[i], item) {
-            let v = eval(expr, ctx, &[&scope])?;
-            put(&mut scope, key, v.clone());
-            early[i] = Some(v);
+        if !needs[i] {
+            continue;
+        }
+        match item {
+            // Needed only after a needed item whose key it may overwrite ([`where_needs`]).
+            Item::Star => scope.merge_from(&ctx.all_fields()),
+            Item::Field { expr, key, .. } => {
+                let v = eval(expr, ctx, &[&scope])?;
+                put(&mut scope, key, v.clone());
+                early[i] = Some(v);
+            }
         }
     }
     if !condition(Some(cond), ctx, &[&scope])? {

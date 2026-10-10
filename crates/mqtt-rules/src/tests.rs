@@ -1947,6 +1947,9 @@ fn where_first_gives_the_select_first_outputs() {
         r#"SELECT payload.list AS l, nth(2, l) AS second FROM "t/#" WHERE second > 1"#,
         r#"SELECT payload.v AS v, payload FROM "t/#""#,
         r#"SELECT payload.v + 1 FROM "t/#" WHERE payload.v > 2"#,
+        r#"SELECT 'shadow' AS clientid, * FROM "t/#" WHERE clientid = 'c_emqx'"#,
+        r#"SELECT payload.v AS topic, * FROM "t/#" WHERE topic = 't/a'"#,
+        r#"SELECT payload.w AS payload, * FROM "t/#" WHERE payload.v > 2"#,
     ];
     let payloads = [
         r#"{"v": 1, "w": "x", "list": [1, 2, 3]}"#,
@@ -2026,5 +2029,15 @@ fn the_where_plan_follows_alias_chains_backwards_only() {
         plan(r#"SELECT payload.v AS v, upper(clientid) AS who FROM "t/#" WHERE topic = 't/a'"#),
         Some(vec![false, false]),
         "a WHERE on the trigger alone computes nothing early"
+    );
+    assert_eq!(
+        plan(r#"SELECT 'x' AS clientid, *, payload.v AS v FROM "t/#" WHERE clientid = 'c'"#),
+        Some(vec![true, true, false]),
+        "a `*` after a needed item overwrites it, so the WHERE needs the `*` too"
+    );
+    assert_eq!(
+        plan(r#"SELECT *, payload.v AS v FROM "t/#" WHERE v > 2"#),
+        Some(vec![false, true]),
+        "a `*` before every needed item is overwritten by them: not needed"
     );
 }

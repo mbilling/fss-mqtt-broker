@@ -156,11 +156,23 @@ fn where_needs(fields: &[Item], cond: &Expr) -> Vec<bool> {
     // Last to first: an item adds the names it reads only for the items before it.
     for (i, item) in fields.iter().enumerate().rev() {
         let Item::Field { expr, key, .. } = item else {
-            continue; // `*` copies the trigger's fields, which the WHERE reads the same anyway
+            continue; // `*`: decided below, once the items before it are
         };
         if matches!(key.first(), Some(Seg::Key(head)) if names.contains(head)) {
             needed[i] = true;
             names_in(expr, &mut names);
+        }
+    }
+    // A `*` overwrites the top-level keys of the items before it with the trigger's
+    // fields: in `SELECT 1 AS clientid, *` the WHERE reads the input's `clientid`, not 1.
+    // So a `*` after a needed item is needed too, or the WHERE would read the shadowing
+    // alias. A `*` before every needed item changes nothing the WHERE reads: a later item
+    // overwrites it, and a name no item writes resolves to the trigger's field either way.
+    let mut seen_needed = false;
+    for (i, item) in fields.iter().enumerate() {
+        match item {
+            Item::Star => needed[i] = seen_needed,
+            Item::Field { .. } => seen_needed |= needed[i],
         }
     }
     needed
