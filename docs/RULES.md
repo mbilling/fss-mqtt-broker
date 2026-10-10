@@ -1210,8 +1210,9 @@ transformation events are not raised. A rule that selects one by name is refused
 ## Functions
 
 Every function below is named, typed and behaves as in EMQX's built-in function
-reference. That reference's examples run as this engine's unit tests
-(`crates/mqtt-rules/src/tests_emqx_examples.rs`); where a value differs from the
+reference — and where that reference and EMQX's source disagree, as the source runs (EMQX
+6.3.1 is the oracle the tests are checked against). That reference's examples run as this
+engine's unit tests (`crates/mqtt-rules/src/tests_emqx_examples.rs`); where a value differs from the
 reference's text, the test says why: a typo in the reference, a last-digit difference in a
 transcendental function (Erlang's math library and Rust's round the last bit differently),
 or `is_empty` of a missing value (below). A function given the wrong type fails the rule. An unknown function or a wrong argument count fails the
@@ -1222,16 +1223,20 @@ or `is_empty` of a missing value (below). A function given the wrong type fails 
 | Math | `abs`, `acos`, `acosh`, `asin`, `asinh`, `atan`, `atanh`, `ceil`, `cos`, `cosh`, `exp`, `floor`, `fmod`, `log`, `log10`, `log2`, `round`, `power`, `random`, `sin`, `sinh`, `sqrt`, `tan`, `tanh` |
 | Type checks | `is_array`, `is_bool`, `is_float`, `is_int`, `is_map`, `is_null`, `is_not_null`, `is_null_var`, `is_not_null_var`, `is_num`, `is_str`, `is_empty` |
 | Conversion | `bool`, `float`, `float2str`, `int`, `str`, `str_utf8`, `str_utf16_le`, `map` |
-| Strings | `ascii`, `concat`, `find`, `join_to_string`, `lower`, `ltrim`, `pad`, `regex_match`, `regex_replace`, `regex_extract`, `replace`, `reverse`, `rm_prefix`, `rtrim`, `split`, `sprintf`, `strlen`, `substr`, `tokens`, `trim`, `unescape`, `upper` |
-| Maps | `map_new`, `map_get`, `map_put`, `mget`, `mput`, `map_keys`, `map_values`, `map_size`, `map_to_entries` |
+| Strings | `ascii`, `concat`, `find`, `join_to_string`, `lower`, `ltrim`, `pad`, `regex_match`, `regex_replace`, `regex_extract`, `replace`, `reverse`, `rm_prefix`, `rtrim` (and `rtrim(S, Chars)`), `split`, `sprintf`, `sprintf_s` (`sprintf` with the arguments as one array), `strlen`, `substr`, `tokens`, `trim`, `unescape`, `upper` |
+| Maps | `map_new`, `map_get`, `map_put`, `mget`, `mput`, `map_keys`, `map_values`, `map_size`, `map_to_entries`, `map_to_redis_hset_args` |
 | Arrays | `contains`, `first`, `last`, `length`, `nth`, `sublist` |
-| Hashing | `md5`, `sha`, `sha256`, `hash_to_range`, `map_to_range` |
+| Hashing | `md5`, `sha`, `sha256`, `hash` (`hash('sha3_256', Data)`: any digest Erlang's `crypto:hash/2` offers — `md4`, `md5`, `sha`/`sha1`, `sha224`…`sha512`, `sha512_224`, `sha512_256`, `sha3_224`…`sha3_512`, `shake128`, `shake256`, `blake2b`, `blake2s`, `ripemd160`, `sm3`), `hash_to_range`, `map_to_range` |
 | Bits | `bitand`, `bitor`, `bitxor`, `bitnot`, `bitsl`, `bitsr` |
-| Encoding | `base64_encode`, `base64_decode` (both with `'urlsafe'` / `'no_padding'`), `json_decode`, `json_encode`, `bin2hexstr`, `hexstr2bin`, `sqlserver_bin2hexstr` |
-| Time | `now_timestamp`, `now_rfc3339`, `unix_ts_to_rfc3339`, `rfc3339_to_unix_ts`, `timezone_to_offset_seconds`, `format_date`, `date_to_unix_ts` |
+| Bit sequences | `bitsize`, `bytesize` (the reference spells it `byteszie`), `subbits` |
+| Compression | `gzip`, `gunzip`, `zip`, `unzip`, `zip_compress`, `zip_uncompress`, `lz4_compress`, `lz4_uncompress` |
+| Encoding | `base64_encode`, `base64_decode` (both with `'urlsafe'` / `'no_padding'`), `json_decode`, `json_encode`, `bin2hexstr`, `hexstr2bin` (both with an optional prefix: `bin2hexstr(B, '0x')`), `sqlserver_bin2hexstr` |
+| Time | `now_timestamp`, `now_rfc3339`, `unix_ts_to_rfc3339`, `rfc3339_to_unix_ts`, `timezone_to_offset_seconds` (alias `timezone_to_second`), `format_date` (without the time argument: now), `date_to_unix_ts` |
+| System | `getenv` (`getenv('FOO')` reads the environment variable `EMQXVAR_FOO`; unset is `''`) |
 | UUID | `uuid_v4`, `uuid_v4_no_hyphen` |
 | Conditional | `coalesce`, `coalesce_ne` |
 | Legacy accessors | `topic` (`topic(n)` is the nth level, counting from 1: `topic(1)` of `a/b/c` is `a`), `clientid`, `username`, `qos`, `msgid`, `flags`, `flag`, `peerhost`, `clientip`, `payload` (`payload('a.b')` is a path) |
+| Callable in EMQX, undocumented there | `div(a, b)`, `mod(a, b)` (the operators in call form), `eq` (Erlang `==`), `null()` (a missing value), `join_to_sql_values_string`, `contains_topic`, `contains_topic_match` — EMQX's take topic filters as maps with an *atom* key, which no rule value has, so any array gives `false` |
 
 Traps that EMQX's reference states only in passing, each checked against this engine:
 
@@ -1250,17 +1255,43 @@ Traps that EMQX's reference states only in passing, each checked against this en
   timestamp comes out an hour off from what `unix_ts_to_rfc3339` writes for it.
 - `is_empty` of a missing value fails the rule
   (`is_empty(): expected an array or a map, got a undefined`); EMQX documents it as
-  `false`. Guard it: `is_not_null(payload.list) AND is_empty(payload.list)`.
+  `false`. Guard it: `is_not_null(payload.list) AND is_empty(payload.list)`. A string
+  must be `''` or hold a JSON *object*: `is_empty('[]')` fails, as in EMQX.
+- The string functions count and match **grapheme clusters**, as Erlang's `string` module
+  does: `strlen(unescape('a\r\nb'))` is 3 and a flag emoji is one character. A search
+  matches where the pattern's last character is a whole cluster on its own: `\r` is not
+  found in `a\r\nb`, but `\n` is. `tokens` works on bytes, so each byte of a separator
+  string separates and `\r\n` is split only by `'nocrlf'`. `reverse` writes each character
+  as one byte: `é` comes out as the Latin-1 byte `E9`, and text with a character above
+  U+00FF (`€`, a combining accent) fails it. `ascii` is the first *byte*. `true` and
+  `false` are strings to these functions (`upper(true)` is `TRUE`).
+- A doubled quote does not end a string literal but stays doubled (`'it''s'` is
+  `it''s`), and every quote at either end is stripped (`'''x'''` is `x`). To put a quote
+  in a string, take it from the payload or use `unescape('it\x27s')`.
+- `sprintf` is Erlang's `io_lib:format`: `~s` takes text (a number fails it), `~p` and
+  `~w` print Erlang terms (`~p` of `'abc'` is `<<"abc">>`, `~w` is `<<97,98,99>>`, an
+  array of character codes `~p`s as `"hi"`), floats print in Erlang's notation (`1.0e5`),
+  and widths, precisions and padding (`~-8.3.0f`) follow `io:fwrite`. The output must fit
+  in bytes: `~ts` of `'€'` fails. `~p` keeps a long term on one line where EMQX breaks it.
+- `regex_replace`'s replacement is `re:replace`'s: `\1`, `\g1` and `\g{1}` are group 1,
+  `&` (or `\g{0}`) the whole match, a backslash before anything else that character
+  (`\0` is `0`, `\&` is `&`), and `$` is an ordinary character.
+- `subbits` returns `undefined` when the start is outside the binary, takes the bits to
+  the end when the length is negative or too long, and fails on a NaN or infinite float.
+  Erlang can return an integer wider than 64 bits and a bit string that is not a whole
+  number of bytes; this engine cannot represent either and fails the rule instead.
+- The compression functions produce EMQX's bytes exactly (the same C zlib and liblz4). A
+  decompression stops, failing the rule, once its output would pass the 1 MiB per-message
+  growth budget, so a small payload cannot inflate into gigabytes.
 
-**Not implemented:** `jq`; compression (`gzip`, `gunzip`, `zip`, `unzip`,
-`zip_compress`, `zip_uncompress`, `lz4_compress`, `lz4_uncompress`); bit sequences
-(`subbits`, `bitsize`, `bytesize`); schema registry and Sparkplug B
+**Not implemented:** `jq`; schema registry and Sparkplug B
 (`schema_encode`, `schema_decode`, `schema_check`, `sparkplug_encode`,
-`sparkplug_decode`); `maptab_lookup`; the MongoDB date helpers; `map_to_redis_hset_args`
-and `join_to_sql_values_string`, which only exist for EMQX's sinks; `contains_topic`;
-and `getenv`, because a rule must not be able to read the broker's environment. The
-cookbook decodes binary payloads without `subbits`
-([recipe 15](RULES-COOKBOOK.md#15-decode-base64-hex-and-binary-payloads)).
+`sparkplug_decode`); `maptab_lookup`; the MongoDB date helpers; `term_encode` and
+`term_decode`; and EMQX's state functions (`kv_store_get`, `kv_store_put`,
+`kv_store_del`, `proc_dict_*`), which keep values between messages in a node-local table
+— rule state is designed separately, replicated, in
+[ADR 0085](adr/0085-rule-state-store.md). `getenv` reads only variables named
+`EMQXVAR_…`, as EMQX's does, so the operator chooses what a rule can see.
 
 ## Actions
 
@@ -1401,13 +1432,11 @@ notice.
 | Events | 16 event topics (6.2+): `sys/alarm_activated`, `sys/alarm_deactivated`, `client/connected`, `client/disconnected`, `client/connack`, `client/ping`, `auth/check_authn_complete`, `auth/check_authz_complete`, `session/subscribed`, `session/unsubscribed`, `message/delivered`, `message/acked`, `message/dropped`, `message/delivery_dropped`, `message_transformation/failed`, `schema_validation/failed`; a wildcard filter such as `$events/client/+` selects every event it matches | The 8 client, session and authentication events (`client/connected`, `client/disconnected`, `client/connack`, `client/ping`, `auth/check_authn_complete`, `auth/check_authz_complete`, `session/subscribed`, `session/unsubscribed`), with EMQX's fields. A wildcard filter selects the ones it matches; one that matches none of them is refused at load. Not the message, alarm, schema validation or message transformation events |
 | `authz_source` | The source that decided: `file`, `built_in_database`, `http`, …, `superuser`, `default`, and `cache` for a decision its authorization cache answered | `file` or `default`: mqttd has the ACL file only, no superusers and no authorization cache |
 | Data-integration sources (`$bridges/…`, `$sources/…`) | Yes | No: refused at load |
-| Functions | 124 in the built-in reference, plus `jq` | 107 of those 124, plus the 13 legacy accessors EMQX keeps undocumented (120 in all). The rest are refused at load. |
-| `is_empty` of text that is not a JSON object | Fails the rule for `'abc'` and for `'[]'` (`map/1` raises `badarg`) | `false` for `'abc'`, `true` for `'[]'`. A missing value fails the rule in both, though EMQX's docs say `false`. |
+| Functions | 124 in the built-in reference, plus `jq`; every other export of `emqx_rule_funcs` is callable too | 120 of those 124, plus 23 EMQX exports without documenting (143 in all). `maptab_lookup`, `mongo_date`, `schema_encode`, `schema_decode`, `jq`, `term_encode`/`term_decode` and the state functions (`kv_store_*`, `proc_dict_*`; [ADR 0085](adr/0085-rule-state-store.md)) are refused at load. |
 | JSON integers | Any size (Erlang integers) | Signed 64-bit. One outside that range decodes as a float, so `12345678901234567890` becomes `1.2345678901234567e+19`. `${payload}` keeps the original bytes. |
-| Regular expressions | PCRE | Rust's `regex`: linear-time, no backreferences or look-around. In `regex_replace`, `\N` and `&` are translated to the same meaning. A rules file holds at most 96 distinct regular-expression literals. |
-| `''` inside a string literal | Kept as two quotes | One quote (standard SQL) |
-| `sprintf` | Erlang `io_lib:format` | `~s`, `~p`, `~w`, `~n` and `~~` |
-| `strlen`, `substr`, `pad` | Grapheme clusters | Unicode scalar values. These differ on combining marks, `\r\n` (one cluster), emoji flags and ZWJ emoji sequences. |
+| Regular expressions | PCRE | Rust's `regex`: linear-time, no backreferences or look-around. `regex_replace`'s replacement syntax is `re:replace`'s, exactly. A rules file holds at most 96 distinct regular-expression literals. |
+| `sprintf` `~p` / `~P` of a long list, map or non-printable binary | `io_lib_pretty` breaks it across lines once it reaches the line width (80 columns, or the field width) | Printed on one line (`~0p`, which never breaks, is the same in both) |
+| `subbits` results Erlang has and this engine cannot hold | An integer of any size; a bit string of any length | Fail the rule: an integer outside 64 bits, a bit string that is not whole bytes |
 | `id` | 32 upper-case hex digits, the first 16 the microsecond clock | The same format; only how the low 64 bits are built differs (per-process salt and counter), which no rule can observe |
 | `client_attrs`, `mountpoint` | Client attributes, mountpoints | Always empty / absent |
 | Namespaces (6.x) | Rules can be confined to a namespace | No namespaces |

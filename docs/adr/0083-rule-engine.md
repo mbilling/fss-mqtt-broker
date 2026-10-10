@@ -149,8 +149,9 @@ hub's **data lane is FIFO per connection, bounded by ingress credit** (ADR 0082)
    `FOREACH` compiles each once. Regular expressions use a
    linear-time engine with a bounded automaton. Past a bound the function fails, so the
    rule fails and is counted, and the message is still routed. Unknown functions and
-   wrong argument counts fail at load. `getenv` is not provided, because a rule must not
-   read the broker's environment. **What a publish derives is charged to its connection's
+   wrong argument counts fail at load. `getenv` reads only `EMQXVAR_…` variables (amended
+   2026-10-10; it was not provided), so a rule cannot read the rest of the broker's
+   environment. **What a publish derives is charged to its connection's
    ingress credit** before the batch is queued, like any publish (ADR 0082 §2), clamped
    to what the per-connection cap leaves beside the original so the wait always ends. The
    connection first tries for the derived charge; if it is not there, it drops its
@@ -353,3 +354,62 @@ Pinned by `every_event_carries_exactly_emqx_s_fields`,
 `a_closed_connection_reports_emqx_s_reason`, `a_rule_reads_the_dup_flag_as_false` and
 `authorization_events_name_the_acl_file_or_the_default` (`tests/rules.rs`). The message
 events stay out of this amendment.
+
+## Amendment (2026-10-10): functions and literals are EMQX's too
+
+The same decision — EMQX-compatible without exception — applies to what a function
+returns and to how a literal reads. EMQX's source is the oracle, not its reference:
+`emqx_rule_funcs.erl` and `emqx_variform_bif.erl` (emqx/emqx master), the `rulesql` 0.2.1
+lexer and parser, and the OTP 28 modules they call. Each value below was probed on EMQX
+6.3.1 (`emqx_rule_sqltester:test/1`) and is pinned by a test that fails on the old code.
+
+- **Strings are grapheme clusters.** EMQX's string functions call Erlang's `string`
+  module, which counts clusters (Unicode 16) and finds a match by code point, then
+  requires the cluster that starts there to be the pattern's last character. `strlen`,
+  `substr`, `pad`, `trim`/`ltrim`/`rtrim` (`Pattern_White_Space`, not Unicode white
+  space), `find`, `split`, `replace` and `reverse` now follow OTP's `string.erl` step by
+  step, quirks included: `\n` is found inside `\r\n` and `\r` is not; `reverse` writes
+  each character as a byte (Latin-1, failing above U+00FF); `tokens` works on bytes;
+  `ascii` is the first byte; `lower` has no final-sigma rule; `true`/`false` are strings
+  to them; `unescape` keeps a trailing backslash; `rtrim/2` exists.
+  `unicode-segmentation` is held at 1.12, whose tables are Unicode 16 as OTP 28's are.
+  Pinned by `string_functions_work_on_grapheme_clusters_like_emqx`.
+- **`regex_replace` replacements are `re:replace`'s** as `precomp_repl/1` reads them:
+  `\0` is a literal `0`, `\g{0}` and `&` the match, `\N`/`\gN`/`\g{N}` group N, `$`
+  nothing special, a malformed `\g` an error. The regular-expression engine itself is
+  unchanged here. Pinned by `regex_replace_reads_its_replacement_as_erlang_re_does`.
+- **A doubled quote stays doubled.** The `rulesql` lexer keeps a quoted token whole and the
+  parser unquotes it with `string:trim(Text, both, "'")`: `'it''s'` is `it''s` and every
+  quote at either end goes (`'''x'''` is `x`). Same for `"…"` names. Pinned by
+  `doubled_quotes_in_a_literal_stay_doubled_and_edge_quotes_go`.
+- **`sprintf` is `io_lib:format`** (and `sprintf_s` its array form): every control
+  sequence (`~s ~ts ~p ~P ~w ~W ~e ~f ~g ~b ~B ~x ~X ~# ~+ ~c ~i ~n ~~`), field width,
+  precision, padding and the `t`, `l`, `k` modifiers, over the terms EMQX holds (binaries,
+  lists, maps with binary keys, atoms), with Erlang's float notations and the
+  `iolist_to_binary` that fails on a character above U+00FF. One part is not reproduced:
+  `~p` keeps a long list or map on one line where `io_lib_pretty` breaks it at the line
+  width. Field widths from the payload are bounded by the growth budget. Pinned by
+  `sprintf_is_erlang_io_lib_format` and `sprintf_widths_from_the_payload_are_bounded`.
+- **The missing functions exist.** `bitsize`, `bytesize`, `subbits` (an integer outside
+  64 bits or a bit string that is not whole bytes fails the rule: mqttd's values cannot
+  hold them); `gzip`, `gunzip`, `zip`, `unzip`, `zip_compress`, `zip_uncompress`,
+  `lz4_compress`, `lz4_uncompress`, byte-identical to EMQX's because they use the same C
+  zlib (built from source through `libz-sys`) and C liblz4 (through `lz4`) — the pure-Rust
+  backends tried (miniz_oxide, zlib-rs, lz4_flex) emit valid but different bytes, and
+  decompression stops at the per-message growth budget, so a small payload cannot inflate
+  into gigabytes; `hash` over every `crypto:hash/2` digest (RustCrypto's `md4`, `ripemd`,
+  `sha2`, `sha3`, `shake`, `sm3` and the already-shipped `blake2` for what aws-lc-rs lacks);
+  `map_to_redis_hset_args`, `join_to_sql_values_string`; and the exports EMQX's reference
+  leaves out: `div(a, b)` and `mod(a, b)` (its grammar allows the call form), `eq`, `null`,
+  `timezone_to_second`, `contains_topic` and `contains_topic_match` (which match only
+  maps with an atom key, so any rule value gives `false`), `bin2hexstr/2`,
+  `hexstr2bin/2` (and `hexstr2bin` of an odd digit count), `format_date/3`.
+- **`getenv` is provided** (§8 said it was not): EMQX's reads only `EMQXVAR_<name>`, so the
+  operator decides what a rule may see by naming a variable so, and nothing else in the
+  broker's environment is reachable. Values are kept once read, as EMQX keeps them.
+- **`is_empty` of a string** goes through EMQX's `map/1`: `''` is empty, a JSON object is
+  read, and anything else — a JSON array, `null`, text that is not JSON — fails.
+- **Still refused:** `kv_store_get`/`put`/`del` and `proc_dict_*` keep values between
+  messages in a node-local table. That is the state ADR 0085 designs as a replicated,
+  namespaced store behind a trait; implementing EMQX's unreplicated table now would
+  preempt it, so they stay refused at load and ADR 0085 decides their mapping.

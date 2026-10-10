@@ -691,6 +691,13 @@ impl Parser<'_> {
                 Ok((Expr::List(list), self.node(h)?))
             }
             Tok::Kw(Kw::Case) => self.case(),
+            // EMQX's grammar: `div_or_mod '(' fun_args ')'` calls `div`/`mod` by name.
+            Tok::Div | Tok::Mod if *self.peek() == Tok::LParen => {
+                let t = &self.toks[self.pos - 1];
+                let name = self.sql[t.start..t.end].to_string();
+                self.bump();
+                self.call(&name, start)
+            }
             Tok::QName(s) => {
                 self.lint_quoted_literal(&s);
                 leaf(Expr::Path {

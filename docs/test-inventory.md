@@ -892,7 +892,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::sink_records_through_a_trait_object`
 - `tests::tampering_with_any_field_changes_the_head`
 
-## `crates/mqtt-rules/src/lib.rs` — 107 test(s)
+## `crates/mqtt-rules/src/lib.rs` — 125 test(s)
 
 - `edit::tests::a_json_rule_body_is_a_rule_edit`
 - `edit::tests::an_insert_appends_the_rule_at_the_end`
@@ -928,12 +928,17 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::a_rule_never_sees_the_dup_flag`
 - `tests::addresses_print_as_emqx_prints_them`
 - `tests::arithmetic_follows_erlang`
+- `tests::bit_sequence_functions_follow_emqx`
 - `tests::case_expression_emqx_docs`
 - `tests::comments_and_case_insensitive_keywords`
 - `tests::comparison_semantics_follow_emqx`
+- `tests::compression_matches_emqx_byte_for_byte`
 - `tests::conditional_functions`
 - `tests::conversion_functions_emqx_docs`
+- `tests::decompression_is_bounded_against_bombs`
+- `tests::div_and_mod_can_be_called_as_functions`
 - `tests::double_quoted_comparisons_warn_but_parse_as_fields`
+- `tests::doubled_quotes_in_a_literal_stay_doubled_and_edge_quotes_go`
 - `tests::event_values_follow_emqx_s_builders`
 - `tests::events_are_selected_by_either_emqx_spelling`
 - `tests::every_evaluated_rule_reports_its_time_once_after_its_outcomes`
@@ -946,11 +951,15 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::foreach_default_item_and_chained_aliases_emqx_docs`
 - `tests::foreach_over_a_non_array_yields_nothing_and_is_capped`
 - `tests::foreach_with_do_and_incase_emqx_docs`
+- `tests::getenv_reads_only_the_emqxvar_namespace`
+- `tests::hash_offers_every_digest_erlang_crypto_does`
 - `tests::hashing_encoding_and_bits_emqx_docs`
+- `tests::hex_prefix_and_alias_functions_follow_emqx`
 - `tests::identical_regular_expressions_are_compiled_once`
 - `tests::incase_and_do_read_the_merged_scope_like_emqx`
 - `tests::indices_and_ranges`
 - `tests::invalid_qos_fails_the_action`
+- `tests::is_empty_reads_a_string_only_as_a_json_object`
 - `tests::load_errors_are_specific`
 - `tests::load_errors_say_where_and_print_as_before`
 - `tests::map_and_array_functions_emqx_docs`
@@ -964,12 +973,17 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::property_maps_print_as_emqx_prints_them`
 - `tests::quadratic_string_growth_is_refused_before_it_is_allocated`
 - `tests::reason_codes_are_named_as_emqx_names_them`
+- `tests::regex_replace_reads_its_replacement_as_erlang_re_does`
 - `tests::republish_args_render`
 - `tests::republish_defaults_follow_emqx`
 - `tests::rules_aimed_at_sys_load_with_a_warning`
 - `tests::select_fields_and_aliases_emqx_docs`
 - `tests::select_star_has_emqx_fields`
+- `tests::sink_helper_functions_follow_emqx`
+- `tests::sprintf_is_erlang_io_lib_format`
+- `tests::sprintf_widths_from_the_payload_are_bounded`
 - `tests::string_functions_emqx_docs`
+- `tests::string_functions_work_on_grapheme_clusters_like_emqx`
 - `tests::the_growth_budget_is_per_message`
 - `tests::the_new_events_are_named_as_emqx_names_them`
 - `tests::the_new_events_run_the_rules_that_select_them`
@@ -985,6 +999,8 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::wildcard_event_filters_select_what_emqx_s_match_selects`
 - `tests_emqx_examples::array_functions_match_emqx_examples`
 - `tests_emqx_examples::bit_functions_match_emqx_examples`
+- `tests_emqx_examples::bit_sequence_functions_match_emqx_examples`
+- `tests_emqx_examples::compression_functions_match_emqx_examples`
 - `tests_emqx_examples::conditional_functions_match_emqx_examples`
 - `tests_emqx_examples::conversion_functions_match_emqx_examples`
 - `tests_emqx_examples::encoding_functions_match_emqx_examples`
@@ -994,8 +1010,10 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests_emqx_examples::map_functions_match_emqx_examples`
 - `tests_emqx_examples::math_functions_match_emqx_examples`
 - `tests_emqx_examples::string_functions_match_emqx_examples`
+- `tests_emqx_examples::system_functions_match_emqx_examples`
 - `tests_emqx_examples::time_functions_match_emqx_examples`
 - `tests_emqx_examples::type_judgment_functions_match_emqx_examples`
+- `tests_emqx_examples::undocumented_emqx_functions_match_emqx_source`
 - `tests_emqx_examples::uuid_functions_match_emqx_examples`
 - `value::tests::binary_is_never_silently_json_encoded`
 - `value::tests::floats_render_like_emqx_str`

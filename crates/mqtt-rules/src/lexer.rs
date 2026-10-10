@@ -3,7 +3,9 @@
 //! - `'single quotes'` are **string literals**; `"double quotes"` are **identifiers**
 //!   (a column, a payload field, or a topic in `FROM`). This is EMQX's grammar, not a
 //!   choice made here: `WHERE x = "abc"` compares `x` to a *field* named `abc`.
-//!   A doubled quote inside a literal (`'it''s'`) is one quote, as in standard SQL.
+//!   A doubled quote does not end the literal, but it is not unescaped either: EMQX
+//!   keeps it doubled (`'it''s'` is `it''s`) and strips every quote at either end
+//!   (`'''x'''` is `x`).
 //! - Keywords are case-insensitive; `div` and `mod` are the integer operators.
 //! - `-- comment` runs to the end of the line.
 //! - `[a..b]` (optionally signed ends) is one range token, as in EMQX.
@@ -140,7 +142,7 @@ pub(crate) fn lex(sql: &str) -> Result<Vec<Spanned>, ParseError> {
                         }
                         Some(&q) if q == quote => {
                             if b.get(i + 1) == Some(&quote) {
-                                s.push(quote);
+                                s.extend([quote, quote]);
                                 i += 2;
                             } else {
                                 i += 1;
@@ -153,6 +155,15 @@ pub(crate) fn lex(sql: &str) -> Result<Vec<Spanned>, ParseError> {
                         }
                     }
                 }
+                // EMQX's lexer keeps the token's text whole and its parser unquotes it
+                // with `string:trim(Text, both, "'")`, which strips EVERY quote at either
+                // end: a doubled quote stays doubled inside (`'it''s'` is `it''s`) and
+                // is lost at an edge (`'''x'''` is `x`, `''''` is empty).
+                let edge = |c: &u8| *c == quote;
+                let lead = s.iter().take_while(|c| edge(c)).count();
+                let trail = s[lead..].iter().rev().take_while(|c| edge(c)).count();
+                s.truncate(s.len() - trail);
+                s.drain(..lead);
                 // The input is a &str and only ASCII quote bytes were removed, so this
                 // cannot split a UTF-8 sequence.
                 let s = String::from_utf8(s)
@@ -359,7 +370,7 @@ mod tests {
     fn quotes_follow_emqx() {
         assert_eq!(
             toks(r#"'it''s' "t/#""#),
-            [Tok::Str("it's".into()), Tok::QName("t/#".into()), Tok::Eof]
+            [Tok::Str("it''s".into()), Tok::QName("t/#".into()), Tok::Eof]
         );
     }
 

@@ -29,6 +29,32 @@ chrono = "0.4"
 # sha / sha256 digests and the uuid/random sources: the workspace's single crypto
 # provider (ADR 0053), already linked into the broker.
 aws-lc-rs = { workspace = true }
+# strlen / substr / pad / trim / find / split / replace / reverse count and match
+# grapheme clusters, as Erlang's `string` module (which EMQX calls) does. Pure Rust,
+# no dependencies. Held at 1.12, whose tables are Unicode 16 — the version OTP 28 (EMQX
+# 6.3) segments by; 1.13 moved to Unicode 17.
+unicode-segmentation = { version = "~1.12", default-features = false }
+# gzip / gunzip / zip / unzip / zip_compress / zip_uncompress. EMQX calls Erlang's
+# `zlib`, which links C zlib; C zlib (built from source, `libz-sys/static`, so no system
+# library is needed and every target links the same version) is the only backend whose
+# compressed bytes are identical to EMQX's — miniz_oxide and zlib-rs emit valid but
+# different deflate streams.
+flate2 = { version = "1", default-features = false, features = ["zlib"] }
+libz-sys = { version = "1", default-features = false, features = ["static", "libc"] }
+# lz4_compress / lz4_uncompress: EMQX's NIF wraps C liblz4's frame API; the `lz4` crate
+# wraps the same library (built from source), so frames are byte-identical. The pure-Rust
+# lz4_flex writes valid but different blocks.
+lz4 = "1"
+# hash(Algorithm, Data): the digests Erlang's `crypto:hash/2` offers that aws-lc-rs does
+# not expose. RustCrypto, pure Rust, on the digest 0.11 stack the broker already ships
+# (blake2 comes in through argon2).
+md4 = "0.11"
+ripemd = "0.2"
+sha2 = "0.11"
+sha3 = "0.12"
+shake = "0.1"
+sm3 = "0.5"
+blake2 = "0.11"
 
 [dev-dependencies]
 criterion = { workspace = true }

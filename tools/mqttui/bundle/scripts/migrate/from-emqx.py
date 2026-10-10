@@ -2631,12 +2631,10 @@ def collect_bridge_tls(up: BridgeUpstream, body: dict, where: str) -> None:
 # emitted COMMENTED OUT with a TODO rather than live: a rules file loads all-or-nothing,
 # so one unsupported call would otherwise make the broker refuse every rule.
 RULE_FUNCS_UNSUPPORTED = (
-    "jq", "gzip", "gunzip", "zip", "unzip", "zip_compress", "zip_uncompress",
-    "lz4_compress", "lz4_uncompress", "subbits", "bitsize", "bytesize", "byteszie",
-    "schema_encode", "schema_decode", "schema_check", "sparkplug_encode",
-    "sparkplug_decode", "maptab_lookup", "mongo_date", "getenv",
-    "map_to_redis_hset_args", "join_to_sql_values_string", "contains_topic",
-    "contains_topic_match", "str_utf16_le_decode",
+    "jq", "byteszie", "schema_encode", "schema_decode", "schema_check",
+    "sparkplug_encode", "sparkplug_decode", "maptab_lookup", "mongo_date",
+    "str_utf16_le_decode", "term_encode", "term_decode", "kv_store_get",
+    "kv_store_put", "kv_store_del", "proc_dict_get", "proc_dict_put", "proc_dict_del",
 )
 
 # Every `$events/...` topic EMQX accepts in a FROM (emqx_rule_events:event_topics_enum/0,

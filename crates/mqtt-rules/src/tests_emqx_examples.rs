@@ -568,6 +568,11 @@ const STRINGS: &[Ex] = &[
         r"rtrim(unescape('\t  hello \r\n'))",
         r#""\t  hello""#,
     ),
+    eq(
+        "emqx_rule_funcs.erl rtrim/2",
+        "rtrim('abcxxyx', 'xy')",
+        r#""abc""#,
+    ),
     eq("split/2", "split('a;', ';')", r#"["a"]"#),
     eq("split/2", "split('a;b;c', ';')", r#"["a","b","c"]"#),
     eq("split/2", "split('a;;b;;c', ';')", r#"["a","b","c"]"#),
@@ -793,6 +798,14 @@ const MAPS: &[Ex] = &[
         "map_put('a', 1, map_new())",
         r#"{"a":1}"#,
     ),
+    // The reference's prose example: `{"a" : 1, "b": 2}` gives `HMSET name1 b 2 a 1`
+    // ("the order of the fields in the map is non-deterministic": for a small map it is
+    // keys descending). The list starts with EMQX's marker atom.
+    eq(
+        "map_to_redis_hset_args/1",
+        r#"map_to_redis_hset_args(json_decode('{"a" : 1, "b": 2}'))"#,
+        r#"["map_to_redis_hset_args","b","2","a","1"]"#,
+    ),
 ];
 
 // --- rule-sql-builtin-functions.md § Array Operation Functions -----------------------
@@ -857,6 +870,17 @@ const HASHING: &[Ex] = &[
     ),
     eq("map_to_range/3", "map_to_range(7, 0, 3)", "3"),
     eq("map_to_range/3", "map_to_range('a', 0, 3)", "1"),
+    // `hash/2` reaches every digest `crypto:hash/2` offers; values from EMQX 6.3.1.
+    eq(
+        "emqx_rule_funcs.erl hash/2",
+        "hash('sha1', 'abc')",
+        r#""a9993e364706816aba3e25717850c26c9cd0d89d""#,
+    ),
+    eq(
+        "emqx_rule_funcs.erl hash/2",
+        "hash('sha3_224', 'abc')",
+        r#""e642824c3f8cf24ad09234ee7d3c766fc9a3a5168d0c94ad73b46fdf""#,
+    ),
 ];
 
 // --- rule-sql-builtin-functions.md § Bit Operation Functions -------------------------
@@ -935,13 +959,41 @@ const ENCODING: &[Ex] = &[
         "1",
     ),
     eq("json_encode/1", "json_encode([1,2,3])", r#""[1,2,3]""#),
-    // The reference's `bin2hexstr` and `hexstr2bin` examples go through `zip` and
-    // `unzip`, which this engine does not implement (docs/RULES.md); the same bytes,
-    // round-tripped, stand in.
     eq(
         "bin2hexstr/1",
-        "bin2hexstr(hexstr2bin('CB48CDC9C90700'))",
+        "bin2hexstr(zip('hello'))",
         r#""CB48CDC9C90700""#,
+    ),
+    eq(
+        "hexstr2bin/1",
+        "unzip(hexstr2bin('CB48CDC9C90700'))",
+        r#""hello""#,
+    ),
+    // EMQX's `hexstr_to_bin/1` reads an odd digit count as if it had a leading 0.
+    eq(
+        "emqx_rule_funcs.erl hexstr2bin/1",
+        "bin2hexstr(hexstr2bin('abc'))",
+        r#""0ABC""#,
+    ),
+    eq(
+        "emqx_rule_funcs.erl bin2hexstr/2",
+        "bin2hexstr('ab', '0x')",
+        r#""0x6162""#,
+    ),
+    eq(
+        "emqx_rule_funcs.erl bin2hexstr/2",
+        "bin2hexstr('ab', payload.none)",
+        r#""6162""#,
+    ),
+    eq(
+        "emqx_rule_funcs.erl hexstr2bin/2",
+        "hexstr2bin('0x6162', '0x')",
+        r#""ab""#,
+    ),
+    fails(
+        "emqx_rule_funcs.erl hexstr2bin/2",
+        "hexstr2bin('6162', '0x')",
+        "hexstr2bin(): the string does not start with '0x'",
     ),
     eq(
         "sqlserver_bin2hexstr/1",
@@ -957,6 +1009,158 @@ const ENCODING: &[Ex] = &[
         "sqlserver_bin2hexstr/1",
         "sqlserver_bin2hexstr(str_utf16_le('你好'))",
         r#""0x604F7D59""#,
+    ),
+];
+
+// --- rule-sql-builtin-functions.md § Compression and Decompression Functions ---------
+
+const COMPRESSION: &[Ex] = &[
+    // The reference's gzip bytes were written on macOS (OS byte 0x13); EMQX's Linux
+    // images write 03, as zlib does on Linux and as this engine does everywhere
+    // (verified on emqx/emqx:6.3.1). Both decompress.
+    eq(
+        "gzip/1",
+        "bin2hexstr(gzip('hello'))",
+        r#""1F8B0800000000000003CB48CDC9C9070086A6103605000000""#,
+    ),
+    eq(
+        "gunzip/1",
+        "gunzip(hexstr2bin('1F8B0800000000000013CB48CDC9C9070086A6103605000000'))",
+        r#""hello""#,
+    ),
+    eq("zip/1", "bin2hexstr(zip('hello'))", r#""CB48CDC9C90700""#),
+    eq(
+        "unzip/1",
+        "unzip(hexstr2bin('CB48CDC9C90700'))",
+        r#""hello""#,
+    ),
+    eq(
+        "zip_compress/1",
+        "bin2hexstr(zip_compress('hello'))",
+        r#""789CCB48CDC9C90700062C0215""#,
+    ),
+    eq(
+        "zip_uncompress/1",
+        "zip_uncompress(hexstr2bin('789CCB48CDC9C90700062C0215'))",
+        r#""hello""#,
+    ),
+    eq(
+        "lz4_compress/1",
+        "lz4_uncompress(lz4_compress('hello'))",
+        r#""hello""#,
+    ),
+    eq(
+        "lz4_uncompress/1",
+        "lz4_uncompress(lz4_compress('hello'))",
+        r#""hello""#,
+    ),
+];
+
+// --- rule-sql-builtin-functions.md § Bit Sequence Operation Functions ----------------
+
+const BIT_SEQUENCES: &[Ex] = &[
+    eq("bitsize/1", "bitsize('abc')", "24"),
+    eq("bitsize/1", "bitsize('你好')", "48"),
+    // The reference's heading and examples spell it `byteszie`; EMQX's function, and
+    // so this one, is `bytesize` (`byteszie` fails the load in both).
+    eq("byteszie/1", "bytesize('abc')", "3"),
+    eq("byteszie/1", "bytesize('你好')", "6"),
+    eq("subbits/2", "subbits(hexstr2bin('9F4E58'), 8)", "159"),
+    eq("subbits/2", "subbits(hexstr2bin('9F4E58'), 16)", "40782"),
+    eq("subbits/2", "subbits(base64_decode('n05Y'), 8)", "159"),
+    eq("subbits/3", "subbits(hexstr2bin('9F4E58'), 1, 8)", "159"),
+    eq("subbits/3", "subbits(hexstr2bin('9F4E58'), 9, 8)", "78"),
+    eq("subbits/3", "subbits(base64_decode('n05Y'), 9, 4)", "4"),
+    eq(
+        "subbits/6",
+        "subbits(hexstr2bin('9F4E58'), 1, 16, 'integer', 'unsigned', 'big')",
+        "40782",
+    ),
+    eq(
+        "subbits/6",
+        "subbits(hexstr2bin('9F4E58'), 1, 16, 'integer', 'signed', 'big')",
+        "-24754",
+    ),
+    eq(
+        "subbits/6",
+        "subbits(hexstr2bin('9F4E58'), 1, 16, 'integer', 'unsigned', 'little')",
+        "20127",
+    ),
+    eq(
+        "subbits/6",
+        "subbits(hexstr2bin('9F4E58'), 1, 16, 'float', 'unsigned', 'big')",
+        "-0.00713348388671875",
+    ),
+    eq(
+        "subbits/6",
+        "subbits(hexstr2bin('9F4E58'), 1, 16, 'float', 'signed', 'big')",
+        "-0.00713348388671875",
+    ),
+    // The 4- and 5-argument forms default the rest as EMQX's source does.
+    eq(
+        "emqx_rule_funcs.erl subbits/4",
+        "bin2hexstr(subbits(hexstr2bin('9F4E58'), 9, 16, 'bits'))",
+        r#""4E58""#,
+    ),
+    eq(
+        "emqx_rule_funcs.erl subbits/5",
+        "subbits(hexstr2bin('9F4E58'), 1, 8, 'integer', 'signed')",
+        "-97",
+    ),
+];
+
+// --- rule-sql-builtin-functions.md § System Function ---------------------------------
+
+const SYSTEM: &[Ex] = &[
+    // An unset variable reads as the empty string.
+    eq("getenv/1", "getenv('MQTTD_TEST_NEVER_SET')", r#""""#),
+];
+
+// --- emqx_rule_funcs.erl: exported, so callable, but not in the reference ------------
+
+const UNDOCUMENTED: &[Ex] = &[
+    eq("emqx_rule_funcs.erl div/2", "div(7, 2)", "3"),
+    eq("emqx_rule_funcs.erl div/2", "div(-7, 2)", "-3"),
+    eq("emqx_rule_funcs.erl mod/2", "mod(-7, 2)", "-1"),
+    fails(
+        "emqx_rule_funcs.erl div/2",
+        "div(7.0, 2)",
+        "div(): expected an integer, got a float",
+    ),
+    eq("emqx_rule_funcs.erl eq/2", "eq(1, 1.0)", "true"),
+    eq("emqx_rule_funcs.erl eq/2", "eq('1', 1)", "false"),
+    eq("emqx_rule_funcs.erl null/0", "is_null(null())", "true"),
+    // Topic filters match only as maps with the atom key `topic`, which no rule value
+    // has: a list never contains the topic, and anything else fails.
+    eq(
+        "emqx_rule_funcs.erl contains_topic/2",
+        r#"contains_topic(json_decode('[{"topic":"t/a","qos":1}]'), 't/a')"#,
+        "false",
+    ),
+    eq(
+        "emqx_rule_funcs.erl contains_topic/3",
+        r#"contains_topic(json_decode('[{"topic":"t/a","qos":1}]'), 't/a', 1)"#,
+        "false",
+    ),
+    eq(
+        "emqx_rule_funcs.erl contains_topic_match/2",
+        r#"contains_topic_match(json_decode('[{"topic":"t/#","qos":1}]'), 't/a')"#,
+        "false",
+    ),
+    fails(
+        "emqx_rule_funcs.erl contains_topic_match/3",
+        "contains_topic_match('t/#', 't/a', 1)",
+        "contains_topic_match(): expected an array, got a string",
+    ),
+    eq(
+        "emqx_rule_funcs.erl join_to_sql_values_string/1",
+        r#"join_to_sql_values_string(json_decode('["x\\y",1,1.5,true,null,[1,2]]'))"#,
+        r#""'x\\\\y', 1, 1.5, 'true', 'null', '[1,2]'""#,
+    ),
+    eq(
+        "emqx_rule_funcs.erl sprintf_s/2",
+        "sprintf_s('~p-~p', [1, 2])",
+        r#""1-2""#,
     ),
 ];
 
@@ -1065,6 +1269,17 @@ const TIME: &[Ex] = &[
         "timezone_to_offset_seconds/1",
         "timezone_to_offset_seconds('+08:00')",
         "28800",
+    ),
+    eq(
+        "emqx_rule_funcs.erl timezone_to_second/1",
+        "timezone_to_second('+08:00')",
+        "28800",
+    ),
+    // `format_date/3` formats the time of the call.
+    shape(
+        "emqx_rule_funcs.erl format_date/3",
+        "format_date('second', '+00:00', '%s')",
+        now_unix_seconds_text,
     ),
     // The reference's 28800 is its writer's +08:00 zone: the offset of this host's.
     shape(
@@ -1225,6 +1440,10 @@ const ALL: &[&[Ex]] = &[
     UUID,
     CONDITIONAL,
     LEGACY,
+    COMPRESSION,
+    BIT_SEQUENCES,
+    SYSTEM,
+    UNDOCUMENTED,
 ];
 
 // --- running a row -----------------------------------------------------------------
@@ -1350,6 +1569,13 @@ fn now_in(got: &str, w: Window, unit_ns: i128) -> Result<(), String> {
 
 fn now_unix_seconds(got: &str, w: Window) -> Result<(), String> {
     now_in(got, w, 1_000_000_000)
+}
+
+fn now_unix_seconds_text(got: &str, w: Window) -> Result<(), String> {
+    let n: i64 = json_str(got)?
+        .parse()
+        .map_err(|e| format!("{got} is not a number of seconds: {e}"))?;
+    now_in(&n.to_string(), w, 1_000_000_000)
 }
 
 fn now_unix_micros(got: &str, w: Window) -> Result<(), String> {
@@ -1580,6 +1806,34 @@ fn conditional_functions_match_emqx_examples() {
 #[test]
 fn legacy_accessors_match_emqx_source() {
     check(LEGACY);
+}
+
+/// docs/RULES.md (Functions, "Compression"): the reference's compression examples,
+/// byte for byte — the backends are the C zlib and liblz4 EMQX links.
+#[test]
+fn compression_functions_match_emqx_examples() {
+    check(COMPRESSION);
+}
+
+/// docs/RULES.md (Functions, "Bit sequences"): the reference's `bitsize`, `bytesize`
+/// and `subbits` examples, including its half-precision float.
+#[test]
+fn bit_sequence_functions_match_emqx_examples() {
+    check(BIT_SEQUENCES);
+}
+
+/// docs/RULES.md (Functions, "System"): `getenv` reads `EMQXVAR_<name>`.
+#[test]
+fn system_functions_match_emqx_examples() {
+    check(SYSTEM);
+}
+
+/// docs/RULES.md (Functions, "Callable in EMQX, undocumented there"): every export of
+/// EMQX's `emqx_rule_funcs` is a SQL function there; the ones its reference leaves out
+/// behave as its source does.
+#[test]
+fn undocumented_emqx_functions_match_emqx_source() {
+    check(UNDOCUMENTED);
 }
 
 /// docs/RULES.md (Functions): "That reference's examples run as this engine's unit

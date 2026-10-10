@@ -2465,3 +2465,564 @@ fn the_new_events_run_the_rules_that_select_them() {
         Effect::Console(json) if json == r#"{"clientid":"c_emqx","topic":"t/1","action":"publish"}"#
     ));
 }
+
+/// `expr` fails the rule, as it fails EMQX's.
+fn refused(expr: &str) {
+    let sql = format!("SELECT {expr} AS r FROM \"t/#\"");
+    assert!(
+        run_on(&sql, "t/a", "{}").is_err(),
+        "{expr} should fail the rule, as it does in EMQX"
+    );
+}
+
+/// EMQX's string functions call Erlang's `string` module, which counts and matches
+/// grapheme clusters (Unicode 16), finds a match by code point and then requires the
+/// cluster that STARTS there to be the pattern's last character. Every value below is
+/// EMQX 6.3.1's (`emqx_rule_sqltester:test/1` on the same SQL).
+#[test]
+fn string_functions_work_on_grapheme_clusters_like_emqx() {
+    // strlen / pad / substr count clusters: `\r\n`, a flag, a jamo syllable, a ZWJ family
+    // and an Indic conjunct (GB9c) are one each.
+    assert_eq!(val(r"strlen(unescape('a\r\nb'))"), "3");
+    assert_eq!(val("strlen('🇪🇸')"), "1");
+    assert_eq!(val("strlen('héllo')"), "5");
+    assert_eq!(val("strlen('\u{1100}\u{1161}\u{11A8}')"), "1");
+    assert_eq!(val("strlen('👨\u{200D}👩\u{200D}👧')"), "1");
+    assert_eq!(val("strlen('क्षि')"), "1");
+    assert_eq!(val("pad('🇪🇸', 4)"), r#""🇪🇸   ""#);
+    assert_eq!(val("pad('ab', 7, 'both', 'xy')"), r#""xyxyabxyxyxy""#);
+    assert_eq!(val("pad('ab', -1)"), r#""ab""#);
+    assert_eq!(val(r"substr(unescape('a\r\nbc'), 1, 2)"), r#""\r\nb""#);
+    assert_eq!(val("substr('abc', 5)"), r#""""#);
+    refused("substr('abc', 0, -1)");
+    refused("substr('abc', -1)");
+    // reverse writes each character as one byte: Latin-1 for U+0080..U+00FF, a failure
+    // above, and a combining sequence fails too (its mark is above U+00FF).
+    assert_eq!(val(r"reverse(unescape('a\r\nb'))"), r#""b\r\na""#);
+    assert_eq!(val("bin2hexstr(reverse('aé'))"), r#""E961""#);
+    refused("reverse('a€')");
+    refused("reverse('e\u{301}')");
+    // trim removes Pattern_White_Space (with \r\n as one cluster): not a no-break space,
+    // but a left-to-right mark and NEL.
+    assert_eq!(val(r"trim(unescape('\r\n a \r\n'))"), r#""a""#);
+    assert_eq!(val("trim('\u{a0}a\u{a0}')"), "\"\u{a0}a\u{a0}\"");
+    assert_eq!(val("trim('\u{200e} a \u{200f}')"), r#""a""#);
+    assert_eq!(val("ltrim('\u{85} a')"), r#""a""#);
+    // rtrim/2: `\n` alone trims the end of a `\r\n` (the cluster starting at `\n` is
+    // `\n`), while `\r` and `\n` as two separators do not match the cluster `\r\n`.
+    assert_eq!(
+        val(r"rtrim(unescape('ab\r\n'), unescape('\n'))"),
+        r#""ab\r""#
+    );
+    assert_eq!(
+        val(r"rtrim(unescape('ab\r\n'), unescape('\r\n'))"),
+        r#""ab\r\n""#
+    );
+    assert_eq!(val("rtrim('abcxxyx', 'xy')"), r#""abc""#);
+    assert_eq!(val("rtrim('ae\u{301}', 'e')"), "\"ae\u{301}\"");
+    assert_eq!(val("rtrim('ae\u{301}', '\u{301}')"), r#""ae""#);
+    // find / split / replace.
+    assert_eq!(val(r"find(unescape('a\r\nb'), unescape('\r'))"), r#""""#);
+    assert_eq!(val(r"find(unescape('a\r\nb'), unescape('\n'))"), r#""\nb""#);
+    assert_eq!(
+        val(r"find(unescape('a\r\nb'), unescape('\r\n'))"),
+        r#""\r\nb""#
+    );
+    assert_eq!(val("find('aaa', 'aa', 'trailing')"), r#""aa""#);
+    assert_eq!(val("find('abc', '', 'trailing')"), r#""abc""#);
+    assert_eq!(
+        val(r"split(unescape('a\r\nb'), unescape('\n'))"),
+        r#"["a\r","b"]"#
+    );
+    assert_eq!(
+        val(r"split(unescape('a\r\nb'), unescape('\r'))"),
+        r#"["a\r\nb"]"#
+    );
+    assert_eq!(val("split('aaaa', 'aa', 'notrim')"), r#"["","",""]"#);
+    assert_eq!(val("split('aaa', 'aa', 'trailing_notrim')"), r#"["a",""]"#);
+    assert_eq!(val("split('xe\u{301}yez', 'e')"), "[\"xe\u{301}y\",\"z\"]");
+    assert_eq!(val("replace('xe\u{301}yez', 'e', 'E')"), "\"xe\u{301}yEz\"");
+    assert_eq!(val("replace('aaaa', 'aa', 'b')"), r#""bb""#);
+    assert_eq!(val("replace('a.b.c', '.', '-', 'trailing')"), r#""a.b-c""#);
+    // tokens works on BYTES (`binary_to_list`): each separator byte separates, and
+    // `\r\n` is a cluster no single separator matches.
+    assert_eq!(
+        val(r"tokens(unescape('a\r\nb\rc'), unescape('\r'))"),
+        r#"["a\r\nb","c"]"#
+    );
+    assert_eq!(
+        val(r"tokens(unescape('a\r\nb'), unescape('\n'))"),
+        r#"["a\r","b"]"#
+    );
+    assert_eq!(
+        val(r"tokens(unescape('a\r\nb'), unescape('\r\n'))"),
+        r#"["a\r\nb"]"#
+    );
+    assert_eq!(
+        val(r"tokens(unescape('a\r\nb\rc\nd'), ',', 'nocrlf')"),
+        r#"["a","b","c","d"]"#
+    );
+    assert_eq!(val("tokens('a b', '')"), r#"["a b"]"#);
+    assert_eq!(val("tokens('', ' ')"), "[]");
+    // Case mapping is per code point: a final sigma stays σ.
+    assert_eq!(val("lower('ΑΣ')"), r#""ασ""#);
+    assert_eq!(val("upper('ß')"), r#""SS""#);
+    // ascii is the first BYTE; the atoms true/false are strings to these functions.
+    assert_eq!(val("ascii('é')"), "195");
+    refused("ascii('')");
+    assert_eq!(val("ascii(true)"), "116");
+    assert_eq!(val("reverse(true)"), r#""eurt""#);
+    assert_eq!(val("upper(false)"), r#""FALSE""#);
+    assert_eq!(val("rm_prefix(true, 't')"), r#""rue""#);
+    refused("strlen(json_decode('null'))");
+    // unescape keeps a backslash that ends the string.
+    assert_eq!(val(r"unescape('a\')"), r#""a\\""#);
+}
+
+/// `regex_replace`'s replacement is Erlang `re:replace`'s, as OTP's `precomp_repl/1`
+/// reads it: `&` and `\g{0}` are the match, `\N`/`\gN`/`\g{N}` group N, a backslash
+/// before anything else that character (`\0` is `0`), `$` nothing special. Values from
+/// EMQX 6.3.1.
+#[test]
+fn regex_replace_reads_its_replacement_as_erlang_re_does() {
+    for (rep, want) in [
+        (r"\0", "a0c"),
+        (r"\g{0}", "abc"),
+        ("&", "abc"),
+        (r"[\1]", "a[b]c"),
+        (r"\g1", "abc"),
+        (r"\g{1}0", "ab0c"),
+        (r"\&", "a&c"),
+        (r"\\", r"a\\c"),
+        (r"\n", "anc"),
+        (r"\", r"a\\c"),
+        (r"\g", "agc"),
+        (r"\9", "ac"),
+        (r"\10", "ac"),
+        ("$1", "a$1c"),
+    ] {
+        assert_eq!(
+            val(&format!("regex_replace('abc', '(b)', '{rep}')")),
+            format!("\"{want}\""),
+            "replacement {rep}"
+        );
+    }
+    refused(r"regex_replace('abc', '(b)', '\gx')");
+    refused(r"regex_replace('abc', '(b)', '\g{x}')");
+}
+
+/// EMQX's lexer keeps a quoted token whole and its parser unquotes it with
+/// `string:trim(Text, both, "'")`: a doubled quote inside stays doubled and every quote
+/// at either end goes. Values from EMQX 6.3.1.
+#[test]
+fn doubled_quotes_in_a_literal_stay_doubled_and_edge_quotes_go() {
+    assert_eq!(val("'it''s'"), r#""it''s""#);
+    assert_eq!(val("'''x'''"), r#""x""#);
+    assert_eq!(val("''''"), r#""""#);
+    assert_eq!(val("'a''''b'"), r#""a''''b""#);
+    assert_eq!(
+        one(
+            r#"SELECT payload."a""b" AS r FROM "t/#""#,
+            r#"{"a\"\"b":1}"#
+        ),
+        r#"{"r":1}"#
+    );
+}
+
+/// `sprintf` is `io_lib:format/2` on the values as EMQX holds them (strings are
+/// binaries, arrays lists, `true`/`null` atoms), with the format read as bytes and the
+/// output required to fit in bytes. Every value is EMQX 6.3.1's.
+#[test]
+fn sprintf_is_erlang_io_lib_format() {
+    let cases: &[(&str, &str)] = &[
+        ("sprintf('~s|~s|~s', 'abc', json_decode('[104,105]'), json_decode('[\"a\",[\"b\"]]'))", r#""abc|hi|ab""#),
+        ("sprintf('~s', true)", r#""true""#),
+        ("sprintf('é~s', 'é')", r#""éé""#),
+        ("bin2hexstr(sprintf('~ts', 'é'))", r#""E9""#),
+        ("sprintf('~p|~w', 'abc', 'abc')", r#""<<\"abc\">>|<<97,98,99>>""#),
+        ("sprintf('~p', 'é')", r#""<<\"é\">>""#),
+        ("bin2hexstr(sprintf('~tp', 'é'))", r#""3C3C22E9222F757466383E3E""#),
+        (r#"sprintf('~p', unescape('a\nb"c\\d\te'))"#, r#""<<\"a\\nb\\\"c\\\\d\\te\">>""#),
+        ("sprintf('~p|~w', json_decode('{\"b\":1,\"a\":[1,2]}'), json_decode('{\"b\":1,\"a\":[1,2]}'))", r##""#{<<\"a\">> => [1,2],<<\"b\">> => 1}|#{<<97>> => [1,2],<<98>> => 1}""##),
+        ("sprintf('~p|~w', json_decode('[104,105]'), json_decode('[104,105]'))", r#""\"hi\"|[104,105]""#),
+        ("sprintf('~p', json_decode('[\"x\",1.5,true,null,-3]'))", r#""[<<\"x\">>,1.5,true,null,-3]""#),
+        ("sprintf('~p', payload.nope)", r#""undefined""#),
+        ("sprintf('~p|~p|~p|~p|~p|~p|~p', 1.0, 0.1, 100000.0, 1.0e15, 1.0e16, 9007199254740992.0, 9007199254740991.0)", r#""1.0|0.1|1.0e5|1.0e15|1.0e16|9.007199254740992e15|9007199254740991.0""#),
+        ("sprintf('~p|~p|~p|~p', 0.0001, 1000.0, 100.0, 12345678901234567.0)", r#""0.0001|1.0e3|100.0|1.2345678901234568e16""#),
+        ("sprintf('~f|~.2f|~e|~g|~.3e|~10.3f|~-10.3f|~3.1f', 3.14159, 0.125, 3.14159, 3.14159, 1234.5, 3.14159, 3.14159, 1234.5)", r#""3.141590|0.13|3.14159e+0|3.14159|1.23e+3|     3.142|3.142     |***""#),
+        ("sprintf('~g|~g|~g|~g|~.1g|~.2g', 0.05, 12345.0, 0.5, 100.0, 0.5, 0.05)", r#""5.00000e-2|1.23450e+4|0.500000|100.000|0.5|5.0e-2""#),
+        ("sprintf('~.15f|~.20e|~f|~e', 0.1, 0.1, 999.9999999, 9.9999999)", r#""0.100000000000000|1.0000000000000000555e-1|1000.000000|1.00000e+1""#),
+        ("sprintf('~b|~.16b|~.16B|~.2b|~-6b|~6b|~6.16.0B|~.36b', -42, 255, 255, 5, 7, 7, 255, 35)", r#""-42|ff|FF|101|7     |     7|0000FF|z""#),
+        ("sprintf('~.16x|~.16X|~.16#|~.16+', 255, json_decode('[48,120]'), -255, json_decode('[48,120]'), 255, 255)", r#""0xff|-0xFF|16#FF|16#ff""#),
+        ("sprintf('~c|~5c|~-3.2.xc|~c', 97, 98, 99, 321)", r#""a|bbbbb|ccx|A""#),
+        ("sprintf('a~ib|~n|~3n|~~|~3~', 'ignored')", r#""ab|\n|\n\n\n|~|~~~""#),
+        ("sprintf('~5s|~-5s|~.2s|~5.2s|~5.2.*s|~*s|~5.2.-s', 'abc', 'abc', 'abc', 'abc', 35, 'abc', 4, 'x', 'abc')", r#""  abc|abc  |ab|   ab|###ab|   x|---ab""#),
+        ("sprintf('~*.*.*s|~-*s|~*s|', 6, 2, 46, 'abc', -6, 'abc', -6, 'abc')", r#""....ab|   abc|abc   |""#),
+        ("sprintf('~5w|~-6w|~2w|~5p', 12, 12, 12345, 12)", r#""   12|12    |**|12""#),
+        ("sprintf('~W|~P', json_decode('[1,2,3,4,5]'), 3, 'abcdefgh', 3)", r#""[1,2|...]|<<\"abcdefgh\">>""#),
+        ("sprintf('~W|~P', json_decode('{\"a\":1}'), 2, json_decode('{\"a\":1}'), 2)", r##""#{<<...>> => 1,...}|#{<<...>> => 1}""##),
+        ("sprintf('~P|~P', 'abcdefghijklmnopqrstuvwxyz', 3, json_decode('[[1,2,3],[4,5,6]]'), 3)", r#""<<\"abcdefgh\"...>>|[[1|...],[...]]""#),
+        ("sprintf('~lp|~kp', json_decode('[104,105]'), json_decode('{\"b\":1,\"a\":2}'))", r#""[104,105]|#{<<\"a\">> => 2,<<\"b\">> => 1}""#),
+        ("sprintf('~.2ts', unescape('\\r\\nab'))", r#""\r\na""#),
+        ("sprintf('~10.4e|~-12.3g|~10.3.0f', 3.14159, 2.5, -1.5)", r#""  3.142e+0|2.50        |0000-1.500""#),
+        ("sprintf_s('~p-~p', json_decode('[1,2]'))", r#""1-2""#),
+    ];
+    for (expr, want) in cases {
+        assert_eq!(val(expr), *want, "{expr}");
+    }
+    for bad in [
+        "sprintf('~s', 1)",
+        "sprintf('~s', json_decode('{\"a\":1}'))",
+        "sprintf('~ts', '€')",
+        "sprintf('~tp', '€')",
+        "sprintf('~f', 1)",
+        "sprintf('~.0f', 1.5)",
+        "sprintf('~.1e', 1.5)",
+        "sprintf('~x', 255, '0x')",
+        "sprintf('~.37b', 1)",
+        "sprintf('~tc', 8364)",
+        "sprintf('~-3n')",
+        "sprintf('~Kp', 'x', json_decode('{}'))",
+        "sprintf('~s')",
+        "sprintf('x', 1)",
+        "sprintf('~q', 1)",
+        "sprintf('~')",
+        "sprintf('~.*s', 'x', 'abc')",
+        "sprintf_s('~p', 1)",
+    ] {
+        refused(bad);
+    }
+}
+
+/// A field width or precision can come from the payload; the output it asks for is
+/// refused against the message's growth budget before anything is allocated (a width
+/// of 2^62 would otherwise abort the process).
+#[test]
+fn sprintf_widths_from_the_payload_are_bounded() {
+    for sql in [
+        "SELECT sprintf('~*s', payload.w, 'x') AS r FROM \"t/#\"",
+        "SELECT sprintf('~*c', payload.w, 97) AS r FROM \"t/#\"",
+        "SELECT sprintf('~.*f', payload.w, 1.5) AS r FROM \"t/#\"",
+    ] {
+        let err = run_on(sql, "t/a", r#"{"w":4611686018427387903}"#).unwrap_err();
+        assert!(err.contains("too large"), "{sql}: {err}");
+    }
+}
+
+/// The compression functions are Erlang's `zlib` (C zlib, level 6) and EMQX's liblz4
+/// NIF, so the bytes are EMQX's own. Every value is EMQX 6.3.1's.
+#[test]
+fn compression_matches_emqx_byte_for_byte() {
+    assert_eq!(
+        val("bin2hexstr(gzip('hello'))"),
+        r#""1F8B0800000000000003CB48CDC9C9070086A6103605000000""#
+    );
+    assert_eq!(val("bin2hexstr(zip('hello'))"), r#""CB48CDC9C90700""#);
+    assert_eq!(
+        val("bin2hexstr(zip_compress('hello'))"),
+        r#""789CCB48CDC9C90700062C0215""#
+    );
+    // Longer inputs, where a different deflate or LZ4 match finder would differ: the
+    // sentence 100 and 3000 times (`pad` repeats its whole pad string), and above 64 KiB
+    // the LZ4 blocks are linked, as `LZ4F_compressFrame` links them.
+    let fox = |n: u32| {
+        format!("pad('', {n}, 'trailing', 'The quick brown fox jumps over the lazy dog. ')")
+    };
+    assert_eq!(
+        val(&format!("md5(zip_compress({}))", fox(100))),
+        r#""8a2ec17166cc873df7266dc330ea1c0d""#
+    );
+    assert_eq!(
+        val(&format!("md5(gzip({}))", fox(3000))),
+        r#""39066a19601c0cc6ffbdc1f4525afae8""#
+    );
+    assert_eq!(
+        val(&format!("md5(zip({}))", fox(3000))),
+        r#""3e9a26854526b09b147bf91d89c2ee93""#
+    );
+    assert_eq!(
+        val(&format!("md5(lz4_compress({}))", fox(3000))),
+        r#""831a77815c70c43e4dbbd00e9120daf5""#
+    );
+    assert_eq!(
+        val("bin2hexstr(lz4_compress('hello hello hello'))"),
+        r#""04224D186040821100008068656C6C6F2068656C6C6F2068656C6C6F00000000""#
+    );
+    assert_eq!(
+        val("bin2hexstr(lz4_compress(''))"),
+        r#""04224D1860408200000000""#
+    );
+    // Concatenated gzip members decode; anything else after a member fails it. zlib and
+    // raw streams ignore what follows them.
+    let hello_gz = "1F8B0800000000000003CB48CDC9C9070086A6103605000000";
+    assert_eq!(
+        val(&format!("gunzip(hexstr2bin('{hello_gz}{hello_gz}'))")),
+        r#""hellohello""#
+    );
+    refused(&format!("gunzip(hexstr2bin('{hello_gz}00'))"));
+    assert_eq!(val("unzip(hexstr2bin('CB48CDC9C9070000'))"), r#""hello""#);
+    assert_eq!(
+        val("zip_uncompress(hexstr2bin('789CCB48CDC9C90700062C021500'))"),
+        r#""hello""#
+    );
+    // lz4_uncompress reads the first frame and ignores the rest.
+    assert_eq!(
+        val("lz4_uncompress(hexstr2bin('04224D186040821100008068656C6C6F2068656C6C6F2068656C6C6F00000000FF'))"),
+        r#""hello hello hello""#
+    );
+    for bad in [
+        "gunzip('x')",
+        "zip_uncompress(hexstr2bin('789CCB48'))",
+        "unzip('')",
+        "zip_uncompress('')",
+        "gunzip('')",
+        "lz4_uncompress('hello')",
+        "lz4_uncompress(hexstr2bin('04224D1860408205000080'))",
+    ] {
+        refused(bad);
+    }
+}
+
+/// A few hundred payload bytes can inflate to gigabytes: decompression stops at the
+/// message's growth budget, while a payload within it decompresses.
+#[test]
+fn decompression_is_bounded_against_bombs() {
+    // 8 MiB of zeros, deflated to about 8 KiB; the payload carries the compressed bytes.
+    let zeros = vec![0u8; 8 << 20];
+    let mut e = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::new(9));
+    std::io::Write::write_all(&mut e, &zeros).unwrap();
+    let bomb = mqtt_core::hex_lower(&e.finish().unwrap());
+    assert!(bomb.len() < 64 * 1024);
+    let payload = format!(r#"{{"z":"{bomb}"}}"#);
+    let err = run_on(
+        "SELECT bytesize(zip_uncompress(hexstr2bin(payload.z))) AS r FROM \"t/#\"",
+        "t/a",
+        &payload,
+    )
+    .unwrap_err();
+    assert!(err.contains("decompression stopped"), "{err}");
+    let mut lz = lz4::EncoderBuilder::new().build(Vec::new()).unwrap();
+    std::io::Write::write_all(&mut lz, &zeros).unwrap();
+    let (lz, r) = lz.finish();
+    r.unwrap();
+    let payload = format!(r#"{{"z":"{}"}}"#, mqtt_core::hex_lower(&lz));
+    let err = run_on(
+        "SELECT bytesize(lz4_uncompress(hexstr2bin(payload.z))) AS r FROM \"t/#\"",
+        "t/a",
+        &payload,
+    )
+    .unwrap_err();
+    assert!(err.contains("decompression stopped"), "{err}");
+    // 512 KiB fits the budget.
+    assert_eq!(
+        one(
+            "SELECT bytesize(gunzip(gzip(pad('', 524288)))) AS r FROM \"t/#\"",
+            "{}"
+        ),
+        r#"{"r":524288}"#
+    );
+}
+
+/// `bitsize`, `bytesize` and `subbits` as EMQX's source runs them. Values from EMQX 6.3.1.
+#[test]
+fn bit_sequence_functions_follow_emqx() {
+    assert_eq!(val("bytesize(json_decode('[\"ab\",99]'))"), "3");
+    refused("bytesize(1)");
+    refused("bitsize(1)");
+    for (expr, want) in [
+        (
+            "subbits(hexstr2bin('ABCD'), 1, 12, 'integer', 'unsigned', 'little')",
+            "3243",
+        ),
+        (
+            "subbits(hexstr2bin('ABCD'), 1, 12, 'integer', 'signed', 'little')",
+            "-853",
+        ),
+        (
+            "subbits(hexstr2bin('ABCDEF'), 1, 20, 'integer', 'unsigned', 'little')",
+            "970155",
+        ),
+        (
+            "subbits(hexstr2bin('0000803F'), 1, 32, 'float', 'unsigned', 'little')",
+            "1.0",
+        ),
+        ("subbits(hexstr2bin('013C00'), 9, 32, 'float')", "1.0"),
+        (
+            "subbits(hexstr2bin('400921FB54442D18'), 1, 64, 'float')",
+            "3.141592653589793",
+        ),
+        (
+            "bin2hexstr(subbits(hexstr2bin('010203'), 9, 100, 'bits'))",
+            r#""0203""#,
+        ),
+        (
+            "bin2hexstr(subbits(hexstr2bin('010203'), 2, 8, 'bits'))",
+            r#""02""#,
+        ),
+        (
+            "subbits(hexstr2bin('FF'), 1, 100, 'integer', 'signed')",
+            "-1",
+        ),
+        ("subbits(hexstr2bin('01'), 1, 0)", "0"),
+        ("subbits(hexstr2bin('01'), 1, -1)", "1"),
+        ("subbits(hexstr2bin('0102'), 9, 16)", "2"),
+        ("subbits(hexstr2bin('000000000000000000FF'), 1, 80)", "255"),
+        (
+            "subbits(hexstr2bin('FFFFFFFFFFFFFFFFFFFE'), 1, 80, 'integer', 'signed')",
+            "-2",
+        ),
+        ("is_null(subbits(hexstr2bin('01'), 9, 4))", "true"),
+        ("is_null(subbits(hexstr2bin('01'), 0, 8))", "true"),
+        // A bad type is only looked at when the start is inside the binary.
+        ("is_null(subbits(hexstr2bin('01'), 9, 8, 'foo'))", "true"),
+    ] {
+        assert_eq!(val(expr), want, "{expr}");
+    }
+    // The smallest half-precision subnormal, 2^-24 (compared in SQL: the literal parses
+    // exactly).
+    assert_eq!(
+        val("subbits(hexstr2bin('0001'), 1, 16, 'float') = 5.960464477539063e-8"),
+        "true"
+    );
+    for bad in [
+        "subbits(hexstr2bin('7FC00000'), 1, 32, 'float')",
+        "subbits(hexstr2bin('013C00'), 1, 8, 'float')",
+        "subbits(hexstr2bin('01'), 1, 8, 'foo')",
+        // Representable in Erlang, not here (docs/RULES.md).
+        "subbits(hexstr2bin('FF'), 1, 4, 'bits')",
+        "subbits(hexstr2bin('FFFFFFFFFFFFFFFFFF'), 1, 72)",
+    ] {
+        refused(bad);
+    }
+}
+
+/// `getenv(Name)` reads `EMQXVAR_<Name>` and nothing else; an unset one is `''`.
+#[test]
+fn getenv_reads_only_the_emqxvar_namespace() {
+    assert_eq!(val("getenv('MQTTD_TEST_NEVER_SET_ANYWHERE')"), r#""""#);
+    // PATH is set in every test environment; only EMQXVAR_PATH would be read.
+    assert_eq!(val("getenv('PATH')"), r#""""#);
+    assert_eq!(val("getenv('')"), r#""""#);
+    refused("getenv(1)");
+    refused("getenv('A=B')");
+}
+
+/// `hash(Algorithm, Data)` offers every digest of `crypto:hash/2`. Values from EMQX
+/// 6.3.1 for `'abc'`.
+#[test]
+fn hash_offers_every_digest_erlang_crypto_does() {
+    for (alg, want) in [
+        ("md4", "a448017aaf21d8525fc10ae87aa6729d"),
+        ("md5", "900150983cd24fb0d6963f7d28e17f72"),
+        ("sha", "a9993e364706816aba3e25717850c26c9cd0d89d"),
+        ("sha1", "a9993e364706816aba3e25717850c26c9cd0d89d"),
+        ("sha224", "23097d223405d8228642a477bda255b32aadbce4bda0b3f7e36c9da7"),
+        ("sha256", "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"),
+        ("sha384", "cb00753f45a35e8bb5a03d699ac65007272c32ab0eded1631a8b605a43ff5bed8086072ba1e7cc2358baeca134c825a7"),
+        ("sha512", "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f"),
+        ("sha512_224", "4634270f707b6a54daae7530460842e20e37ed265ceee9a43e8924aa"),
+        ("sha512_256", "53048e2681941ef99b2e29b76b4c7dabe4c2d0c634fc6d46e0e2f13107e7af23"),
+        ("sha3_224", "e642824c3f8cf24ad09234ee7d3c766fc9a3a5168d0c94ad73b46fdf"),
+        ("sha3_256", "3a985da74fe225b2045c172d6bd390bd855f086e3e9d525b46bfe24511431532"),
+        ("sha3_384", "ec01498288516fc926459f58e2c6ad8df9b473cb0fc08c2596da7cf0e49be4b298d88cea927ac7f539f1edf228376d25"),
+        ("sha3_512", "b751850b1a57168a5693cd924b6b096e08f621827444f70d884f5d0240d2712e10e116e9192af3c91a7ec57647e3934057340b4cf408d5a56592f8274eec53f0"),
+        ("shake128", "5881092dd818bf5cf8a3ddb793fbcba7"),
+        ("shake256", "483366601360a8771c6863080cc4114d8db44530f8f1e1ee4f94ea37e78b5739"),
+        ("blake2b", "ba80a53f981c4d0d6a2797b69f12f6e94c212f14685ac4b74b12bb6fdbffa2d17d87c5392aab792dc252d5de4533cc9518d38aa8dbf1925ab92386edd4009923"),
+        ("blake2s", "508c5e8c327c14e2e1a72ba34eeb452f37458b209ed63a294d999b4c86675982"),
+        ("ripemd160", "8eb208f7e05d987a9b044a8e98c6b087f15a0bfc"),
+        ("sm3", "66c7f0f462eeedd9d1f2d46bdc10e4e24167c4875cf2f7a2297da02b8f4ba8e0"),
+    ] {
+        assert_eq!(val(&format!("hash('{alg}', 'abc')")), format!("\"{want}\""), "{alg}");
+    }
+    assert_eq!(
+        val("hash('md5', true)"),
+        r#""b326b5062b2f0e69046810717534cb09""#
+    );
+    assert_eq!(
+        val("hash('md5', json_decode('[\"a\",\"bc\"]'))"),
+        r#""900150983cd24fb0d6963f7d28e17f72""#
+    );
+    refused("hash('nope', 'abc')");
+    refused("hash('md5', 1)");
+    refused("hash('md5', null())");
+}
+
+/// The sink helpers EMQX exposes as SQL functions. Values from EMQX 6.3.1.
+#[test]
+fn sink_helper_functions_follow_emqx() {
+    assert_eq!(
+        val(
+            r#"map_to_redis_hset_args(json_decode('{"a":1,"b":1.5,"c":"x","d":true,"e":null,"f":[1],"g":{}}'))"#
+        ),
+        r#"["map_to_redis_hset_args","d","true","c","x","b","1.5","a","1"]"#
+    );
+    assert_eq!(
+        val(r#"map_to_redis_hset_args('{"a":1,"b":2.0}')"#),
+        r#"["map_to_redis_hset_args","b","2.0","a","1"]"#
+    );
+    for not_a_map in ["'nope'", "1", "'[1]'"] {
+        assert_eq!(
+            val(&format!("map_to_redis_hset_args({not_a_map})")),
+            r#"["map_to_redis_hset_args"]"#
+        );
+    }
+    assert_eq!(
+        val(
+            r#"join_to_sql_values_string(json_decode('["a''b",1,1.5,true,null,[1,2],{"a":1},"x\\y"]'))"#
+        ),
+        r#""'a\\'\\'b', 1, 1.5, 'true', 'null', '[1,2]', '{\"a\":1}', 'x\\\\y'""#
+    );
+    assert_eq!(
+        val("join_to_sql_values_string(json_decode('[0.1,1.0e20,1.0,-0.5,12345678.123]'))"),
+        r#""0.1, 100000000000000000000.0, 1.0, -0.5, 12345678.1229999997""#
+    );
+    assert_eq!(
+        val("join_to_sql_values_string([payload.nope, 1])"),
+        r#""NULL, 1""#
+    );
+    refused("join_to_sql_values_string(1)");
+}
+
+/// `div(a, b)` and `mod(a, b)`: EMQX's grammar calls the operators by name
+/// (`div_or_mod '(' fun_args ')'`); `mod` is Erlang's `rem`. Values from EMQX 6.3.1.
+#[test]
+fn div_and_mod_can_be_called_as_functions() {
+    assert_eq!(val("div(7, 2)"), "3");
+    assert_eq!(val("div(-7, 2)"), "-3");
+    assert_eq!(val("mod(-7, 2)"), "-1");
+    assert_eq!(val("mod(7, -2)"), "1");
+    assert_eq!(val("div(7, 2) + mod(7, 2) * 10"), "13");
+    refused("div(7, 0)");
+    refused("div(7.0, 2)");
+    // Upper-case `DIV` is an ordinary (unknown) name in EMQX's lexer, as here.
+    let e = check_sql("SELECT DIV(7, 2) FROM \"t\"").unwrap_err();
+    assert!(e.contains("unknown function DIV()"), "{e}");
+}
+
+/// `is_empty`: `[]` and `''` are empty, any other array is not, and anything else goes
+/// through EMQX's `map/1` — so a string must hold a JSON object. Values from EMQX 6.3.1.
+#[test]
+fn is_empty_reads_a_string_only_as_a_json_object() {
+    assert_eq!(val("is_empty('')"), "true");
+    assert_eq!(val("is_empty('{}')"), "true");
+    assert_eq!(val(r#"is_empty('{"a":1}')"#), "false");
+    for bad in ["'[]'", "'x'", "' '", "'null'", "1"] {
+        refused(&format!("is_empty({bad})"));
+    }
+}
+
+/// The smaller conversions and aliases EMQX's source has. Values from EMQX 6.3.1.
+#[test]
+fn hex_prefix_and_alias_functions_follow_emqx() {
+    assert_eq!(val("bin2hexstr(hexstr2bin('abc'))"), r#""0ABC""#);
+    assert_eq!(val("bin2hexstr('ab', '0x')"), r#""0x6162""#);
+    assert_eq!(val("hexstr2bin('4142', payload.nope)"), r#""AB""#);
+    refused("hexstr2bin('6162', '0x')");
+    refused("bin2hexstr('ab', json_decode('null'))");
+    assert_eq!(val("eq(json_decode('[1]'), json_decode('[1.0]'))"), "true");
+    assert_eq!(val("eq(true, 'true')"), "false");
+    assert_eq!(val("timezone_to_second('+08:00')"), "28800");
+    assert_eq!(val("strlen(format_date('second', '+08:00', '%Y'))"), "4");
+    refused("contains_topic('t/a', 't/a')");
+}
