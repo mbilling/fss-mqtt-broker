@@ -1330,26 +1330,28 @@ notice.
 |---|---|---|
 | Republished messages | Re-enter the rule engine unless `direct_dispatch = true` | Never re-enter it. A rule cannot loop, and a rule chain that relied on re-triggering needs a second rule on the original topic. |
 | Actions | `republish`, `console`, data-integration sinks | `republish`, `console`. A sink reference is refused at load. |
-| Events | 14 event topics | `client/connected`, `client/disconnected`, `session/subscribed`, `session/unsubscribed` |
+| Events | 16 event topics (6.2+): `sys/alarm_activated`, `sys/alarm_deactivated`, `client/connected`, `client/disconnected`, `client/connack`, `client/ping`, `auth/check_authn_complete`, `auth/check_authz_complete`, `session/subscribed`, `session/unsubscribed`, `message/delivered`, `message/acked`, `message/dropped`, `message/delivery_dropped`, `message_transformation/failed`, `schema_validation/failed`; a wildcard filter such as `$events/client/+` selects every event it matches | `client/connected`, `client/disconnected`, `session/subscribed`, `session/unsubscribed`. Any other `$events/…`, a wildcard one included, is refused at load. |
 | Event property maps (`conn_props`, `disconn_props`, `sub_props`, `unsub_props`) | The properties of the CONNECT, DISCONNECT, SUBSCRIBE or UNSUBSCRIBE | Always `{}` |
 | `sockname` in `client/connected` and `client/disconnected` | The listener's address | Absent, so `undefined` |
 | Data-bridge sources (`$bridges/…`) | Yes | No |
+| Data-integration sources (`$sources/…`) | Yes | No source hookpoint: loads as a plain topic filter, so it matches only messages published to that topic |
 | Functions | 124 in the built-in reference, plus `jq` | 107 of those 124, plus the 13 legacy accessors EMQX keeps undocumented (120 in all). The rest are refused at load. |
-| `is_empty` of a missing value | Documented as `false` | Fails the rule: `is_empty(): expected an array or a map, got a undefined` |
+| `is_empty` of text that is not a JSON object | Fails the rule for `'abc'` and for `'[]'` (`map/1` raises `badarg`) | `false` for `'abc'`, `true` for `'[]'`. A missing value fails the rule in both, though EMQX's docs say `false`. |
 | JSON integers | Any size (Erlang integers) | Signed 64-bit. One outside that range decodes as a float, so `12345678901234567890` becomes `1.2345678901234567e+19`. `${payload}` keeps the original bytes. |
 | Regular expressions | PCRE | Rust's `regex`: linear-time, no backreferences or look-around. In `regex_replace`, `\N` and `&` are translated to the same meaning. A rules file holds at most 96 distinct regular-expression literals. |
 | `''` inside a string literal | Kept as two quotes | One quote (standard SQL) |
 | `sprintf` | Erlang `io_lib:format` | `~s`, `~p`, `~w`, `~n` and `~~` |
-| `strlen`, `substr`, `pad` | Grapheme clusters | Unicode scalar values (the same for text without combining marks) |
-| `id` | EMQX GUID | 32 hex digits: clock, per-process salt and counter |
+| `strlen`, `substr`, `pad` | Grapheme clusters | Unicode scalar values. These differ on combining marks, `\r\n` (one cluster), emoji flags and ZWJ emoji sequences. |
+| `id` | 32 upper-case hex digits, the first 16 the microsecond clock | The same format; only how the low 64 bits are built differs (per-process salt and counter), which no rule can observe |
 | `client_attrs`, `mountpoint` | Client attributes, mountpoints | Always empty / absent |
 | Namespaces (6.x) | Rules can be confined to a namespace | No namespaces |
+| `flags.dup` | Always `false`: hooks run on the message with DUP cleared | The publish's DUP flag |
 | Unaliased computed field | Stored under a generated `_v_…` key | Stored under the expression's source text |
-| Ack semantics | The rule engine runs after the publish is accepted; a republish does not hold the publisher's ack | A QoS ≥ 1 republish holds the publisher's PUBACK/PUBREC until its fate is known; the answer is still the original's own, and a failed republish is a failed action ([above](#delivery-guarantees-qos-0-1-and-2)) |
-| A refused publish | Rules ran on it before it was refused downstream | The hub routes none of its derived messages (unless the refusal is a peer's, arriving later) |
+| Ack semantics | Rules run synchronously in the publisher's channel, in the `message.publish` hook, before the original is routed; a republish is routed inside that call. The PUBACK follows, but never waits for delivery or durability, and a republish's outcome never changes its reason code | A QoS ≥ 1 republish holds the publisher's PUBACK/PUBREC until its fate is known; the answer is still the original's own, and a failed republish is a failed action ([above](#delivery-guarantees-qos-0-1-and-2)) |
+| A refused publish | Rules do not run on a publish refused by authorization, quota, publish caps, schema validation or message transformation. Only a hook running after the rule engine (ExHook, node rebalance) can refuse it afterwards, and then the republish has already been routed | The hub routes none of its derived messages (unless the refusal is a peer's, arriving later) |
 | Limits on payload-driven work | None beyond the Erlang process's memory | A `FOREACH` iterates at most 10,000 elements; a function may build at most 1 MiB beyond its inputs; `map_put`/`mput` paths have at most 64 segments; timestamps must be renderable in every time zone; expressions at most 256 levels deep and nested at most 64 levels ([The rules file](#the-rules-file)) |
-| Where it runs | Every node | Every node, once per message at the node it arrived at, never on a forwarded copy |
-| `$SYS` messages | The broker's own `$SYS` messages run rules only with `rule_engine.ignore_sys_message = false` (default `true`) | Never run rules. Clients cannot publish to `$SYS`, except a Mosquitto bridge's `$SYS/broker/connection/<id>/state`, so a `FROM` on any other `$SYS` topic never matches. The broker publishes only opt-in rule statistics and trace there ([above](#watch-and-edit-rules-live)) |
+| Where it runs | Every node, once per message at the node that received it; a forwarded copy does not run the publish hook. Rules are cluster-wide configuration | The same placement. Rules are a per-node file: each node runs the file it was given |
+| `$SYS` messages | The broker's own `$SYS` messages run rules only with `rule_engine.ignore_sys_message = false` (default `true`). The default ACL denies only subscribing to `$SYS/#`, so a client may publish to `$SYS/x`, and that message runs rules whatever `ignore_sys_message` says (it checks only the flag the broker sets on its own) | Never run rules. Clients cannot publish to `$SYS`, except a Mosquitto bridge's `$SYS/broker/connection/<id>/state`, so a `FROM` on any other `$SYS` topic never matches. The broker publishes only opt-in rule statistics and trace there ([above](#watch-and-edit-rules-live)) |
 | Rule statistics | The dashboard and the REST API | `/metrics`; with `sys_interval_secs`, `$SYS/brokers/<node>/rules/<id>`; `GET /admin/v1/rules` |
 | Changing rules | The dashboard and the REST API, applied across the cluster | The rules file, reloaded; for a listed writer, the admin API writes that file, on the node it asks |
 | Testing a rule | The dashboard's SQL test | `mqttd --rule-test` (the statement only), or `POST /admin/v1/rules/test` (the statement and the rendered actions) |
