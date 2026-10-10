@@ -1105,7 +1105,7 @@ never matches anything, and the loader warns (`FROM "$SYS/brokers/#" never match
 | `peerhost` / `peername` | The publisher's IP / `ip:port`, as EMQX prints them (an IPv6 address unbracketed, an IPv4-mapped one as its IPv4 address); `undefined` for a session relocated from another node, whose socket is the relaying node |
 | `topic` | The topic, with aliases resolved |
 | `qos` | 0, 1 or 2 |
-| `flags` | `{"dup": false, "retain": …}`. `dup` is always `false`, as in EMQX, which runs the rules on the message with its DUP flag cleared (`emqx_message:clean_dup/1`) |
+| `flags` | `{"dup": false, "retain": …}`. `dup` is always `false`, as in EMQX, which runs the rules on the message with its DUP flag cleared (`emqx_message:clean_dup/1`). A message republished in a chain an event started has `{"retain": …}` alone ([Republished messages](#republished-messages)) |
 | `pub_props` | MQTT 5 properties under their spec names: `User-Property` (a map; a repeated key keeps its last value), `User-Property-Pairs` (every pair, in order), `Content-Type`, `Response-Topic`, `Correlation-Data`, `Payload-Format-Indicator`, `Message-Expiry-Interval`. A publish that carried none (every MQTT 3.1.1 publish) has only an empty `User-Property` map, so `${pub_props.'Content-Type'}` renders `undefined`. |
 | `publish_received_at` / `timestamp` | Milliseconds since the epoch: when the broker received the message / when the rules looked at it. Each is read once per message, so every reference in every rule sees the same value, and `timestamp` is never earlier than `publish_received_at` |
 | `node` | This node's id |
@@ -1402,6 +1402,12 @@ publish, gated, so the PUBACK or PUBREC waits for all of it
 ([Delivery guarantees](#delivery-guarantees-qos-0-1-and-2)).
 
 `direct_dispatch = true` opts a message out: no rule runs on it and it is not retained.
+
+**Upgrading from an earlier mqttd.** In mqttd 1.1.0 and earlier a republished message
+never re-entered the rules. A rules file written for that starts chaining when upgraded: a
+rule whose output topic another rule's `FROM` matches now triggers that rule too. Check
+each `republish` topic against every `FROM` (`mqttd --check-rules` lists them), and set
+`direct_dispatch = true` on the actions that must not trigger anything.
 
 ### `console`
 
