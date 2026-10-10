@@ -2694,7 +2694,10 @@ where
                     _ => {
                         debug!(client = %client.0, keep_alive, "keepalive expired; closing connection");
                         count_connection_error(policy, "keepalive");
-                        rule_conn.closing(mqtt_rules::disconnect_reason(reason::KEEP_ALIVE_TIMEOUT));
+                        // EMQX's name for 0x8D. Spelled out, not looked up from `reason::`: nothing is
+                        // sent on the wire here, and scripts/check-reason-codes.py counts every
+                        // `reason::` constant in conn.rs as a code the broker emits.
+                        rule_conn.closing("keepalive_timeout");
                         return Ok(false);
                     }
                 }
@@ -2988,7 +2991,8 @@ async fn handle_publish<W: AsyncWrite + Unpin>(
     if !mqtt_core::valid_topic_name(&topic) {
         warn!(client = %client.0, topic = %topic, "invalid PUBLISH topic name; closing connection");
         // EMQX closes such a publish with `topic_name_invalid` (`emqx_packet:check/1`).
-        return Ok(PacketOutcome::closed_by(reason::TOPIC_NAME_INVALID));
+        // Spelled out: the connection closes without sending 0x90 (see the keepalive arm).
+        return Ok(PacketOutcome::BrokerClose("topic_name_invalid"));
     }
     // ACL gate (ADR 0004 step 3): an unauthorized publish is dropped before the
     // hub ever sees it, and the denial is audited. What the publisher is TOLD is
@@ -3234,9 +3238,9 @@ async fn handle_publish<W: AsyncWrite + Unpin>(
                               "QoS2 dedup store write failed; withholding PUBREC (fail closed)");
                         // EMQX closes on a publish its session failed to take with
                         // `implementation_specific_error`.
-                        return Ok(PacketOutcome::closed_by(
-                            reason::IMPLEMENTATION_SPECIFIC_ERROR,
-                        ));
+                        // EMQX's name for 0x83, spelled out: nothing is sent (see the
+                        // keepalive arm on why not `reason::`).
+                        return Ok(PacketOutcome::BrokerClose("implementation_specific_error"));
                     }
                 },
                 // Read first, insert only when fresh: a blind insert would
@@ -3331,9 +3335,9 @@ async fn handle_publish<W: AsyncWrite + Unpin>(
                     if !ack_qos2_dedup(policy, qos2_inbound, client, id).await {
                         warn!(client = %client.0, id,
                               "QoS2 dedup ack write failed; withholding PUBREC (fail closed)");
-                        return Ok(PacketOutcome::closed_by(
-                            reason::IMPLEMENTATION_SPECIFIC_ERROR,
-                        ));
+                        // EMQX's name for 0x83, spelled out: nothing is sent (see the
+                        // keepalive arm on why not `reason::`).
+                        return Ok(PacketOutcome::BrokerClose("implementation_specific_error"));
                     }
                 } else {
                     // A v5 PUBREC >= 0x80 ends the flow BY SPEC — both sides agree the id
