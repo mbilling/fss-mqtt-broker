@@ -815,12 +815,13 @@ topic level through, in `WHERE`:
 ```sql
 SELECT payload.device AS device, payload
 FROM "ingest"
-WHERE is_str(payload.device) AND regex_match(payload.device, '^[A-Za-z0-9_-]{1,64}$')
+WHERE is_str(payload.device) AND regex_match(payload.device, '^[A-Za-z0-9_-]{1,64}\z')
 ```
 
-`is_str` keeps a missing or non-string value from failing the rule. As in EMQX, `$` also
-matches before a final newline, so a value ending in one passes this guard with it; end
-the pattern with `\z` instead to refuse that too ([regular expressions](#functions)). A
+`is_str` keeps a missing or non-string value from failing the rule. The pattern ends with
+`\z`, not `$`: as in EMQX, `$` also matches before a final newline, so a value ending in
+one would pass a `$` guard and put the newline in the topic ([regular
+expressions](#functions)). `\z` is the very end, and means the same in EMQX. A
 message that does not pass produces nothing. The cookbook's
 [routing recipe](RULES-COOKBOOK.md#7-route-by-a-payload-field-safely) is the complete rule,
 and its MQTT 5 recipe guards a user property the same way.
