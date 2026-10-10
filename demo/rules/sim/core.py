@@ -12,6 +12,11 @@ order; the player sorts them by `at`, then by the order they were yielded.
 A device connects on its first event unless the module yields an explicit `connect`
 (needed for a Will or a non-clean session); `disconnect` is a clean DISCONNECT and `drop`
 closes the socket without one, the way a device that loses power does.
+
+A publish with MQTT 5 properties (`props`, as `mqtt.encode_props` takes them) is sent over
+an MQTT 5 connection; its device's other publishes must carry them too. A large payload may
+be built only when it is sent (`make`, instead of `payload`): the live demo's turbine fast
+logs are half a megabyte each, too many to hold or build ahead for a whole window.
 """
 
 from __future__ import annotations
@@ -20,7 +25,7 @@ import base64
 import json
 import time
 from dataclasses import dataclass, field
-from typing import Iterable, Optional
+from typing import Callable, Iterable, Optional
 
 from .mqtt import Client
 
@@ -36,6 +41,12 @@ class Event:
     retain: bool = False
     will: Optional[tuple[str, bytes, int, bool]] = None  # for `connect`
     seq: int = field(default=0, compare=False)  # yield order, set by `merge`
+    props: Optional[dict] = None  # MQTT 5 publish properties (see mqtt.encode_props)
+    make: Optional[Callable[[], bytes]] = field(default=None, compare=False, repr=False)
+
+    def body(self) -> bytes:
+        """The payload, built now if it is built when sent."""
+        return self.make() if self.make else self.payload
 
 
 def ts_ms(t0: float, at: float) -> int:
@@ -63,10 +74,14 @@ def to_json_line(ev: Event) -> str:
     line: dict = {"at": round(ev.at, 3), "client": ev.client, "kind": ev.kind}
     if ev.kind == "publish":
         line.update(topic=ev.topic, qos=ev.qos, retain=ev.retain)
+        payload = ev.body()
         try:
-            line["payload"] = ev.payload.decode("utf-8")
+            line["payload"] = payload.decode("utf-8")
         except UnicodeDecodeError:
-            line["payload_b64"] = base64.b64encode(ev.payload).decode()
+            line["payload_b64"] = base64.b64encode(payload).decode()
+        if ev.props is not None:
+            line["props"] = {k: ([list(p) for p in v] if k == "user" else v)
+                             for k, v in ev.props.items()}
     if ev.kind == "connect" and ev.will:
         topic, payload, qos, retain = ev.will
         line["will"] = {"topic": topic, "payload": payload.decode("utf-8"), "qos": qos, "retain": retain}
@@ -84,9 +99,13 @@ def from_json_line(text: str) -> Event:
     if "will" in d:
         w = d["will"]
         will = (w["topic"], w["payload"].encode("utf-8"), w["qos"], w["retain"])
+    props = d.get("props")
+    if props is not None and "user" in props:
+        props["user"] = [tuple(p) for p in props["user"]]
     return Event(
         at=d["at"], client=d["client"], kind=d["kind"], topic=d.get("topic", ""),
         payload=payload, qos=d.get("qos", 0), retain=d.get("retain", False), will=will,
+        props=props,
     )
 
 
@@ -130,7 +149,7 @@ class Player:
     def _client(self, ev: Event, will=None) -> Client:
         c = self.clients.get(ev.client)
         if c is None:
-            c = Client(self.host, self.port, ev.client)
+            c = Client(self.host, self.port, ev.client, version=5 if ev.props is not None else 4)
             c.connect(will=will)
             self.clients[ev.client] = c
         return c
@@ -142,7 +161,7 @@ class Player:
                 old.disconnect()
             self._client(ev, will=ev.will)
         elif ev.kind == "publish":
-            self._client(ev).publish(ev.topic, ev.payload, ev.qos, ev.retain)
+            self._client(ev).publish(ev.topic, ev.body(), ev.qos, ev.retain, ev.props)
         elif ev.kind == "disconnect":
             c = self.clients.pop(ev.client, None)
             if c:

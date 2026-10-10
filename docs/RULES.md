@@ -202,7 +202,7 @@ Lines and columns count within the rule's `sql` string, not the file: line 4, co
 is the end of the statement, just after the newline that closes its `WHERE` line.
 
 Stop the broker with Ctrl-C (or `docker rm -f mqttd`). Every recipe in the
-[cookbook](RULES-COOKBOOK.md) runs the same way. To see 21 rules at work on realistic
+[cookbook](RULES-COOKBOOK.md) runs the same way. To see 22 rules at work on realistic
 telemetry from wind turbines, solar inverters, smart meters, heat pumps and a service fleet,
 run [`demo/rules/run.sh`](../demo/rules/README.md). To watch them run without end, with
 their statistics and trace on `$SYS` and a page in your browser that edits them while they

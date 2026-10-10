@@ -292,7 +292,7 @@ Want to see a real cluster with dashboards? `mqttui --run demo-stack` starts sev
 nodes with Prometheus and Grafana dashboards on `localhost:3000` and a load
 generator so the panels move — it starts 25 containers, and `mqttui` warns you
 before it does. Want to see the rule engine at work? `demo/rules-live/up.sh` (in a
-checkout) runs simulated power plants, homes and cars through 21 rules, with each rule's
+checkout) runs simulated power plants, homes and cars through 22 rules, with each rule's
 statistics and trace on `$SYS` and a page on `localhost:8070` that edits the rules while
 they run ([demo/rules-live](demo/rules-live/README.md)).
 

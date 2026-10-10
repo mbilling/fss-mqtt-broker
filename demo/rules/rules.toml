@@ -34,8 +34,10 @@
 #   plant/wf-falster/poc/grid          a PMU (phasor measurement unit) at the 50 kV connection, every 2 s
 #   plant/pv-lolland/inv01..04/sunspec solar inverters, SunSpec model 103 registers, every 30 s
 #   plant/pk-koge/g1/rtu               a gas-turbine peaker's legacy RTU, a CSV line every 15 s
+#   plant/wf-falster/wtg01..06/fastlog live demo only: each turbine's 50 Hz fast log, a
+#                                      Parquet file every minute (rule 8)
 #
-# About 790 raw messages in 10 minutes. These seven rules turn them into what each
+# About 790 raw messages in 10 minutes. These eight rules turn them into what each
 # audience needs: canonical records (normalized/), computed KPIs (kpi/), the current state
 # of every unit for a screen that opens late (state/, retained) and a few actionable alerts
 # (alerts/, QoS 1) for exactly the things that went wrong.
@@ -571,6 +573,59 @@ WHERE report = 'change' OR payload.ts mod 600000 < 10000
 '''
 actions = [
   { function = "republish", args = { topic = "state/power/${site}/${turbine}", qos = 1, retain = true, payload = "${.}" } },
+]
+
+
+# --- 8. Index each turbine's fast log, without decoding it --------------------------------
+#
+# Takes: plant/<site>/<turbine>/fastlog, every minute per turbine, live demo only
+#   (demo/rules-live; the README's ten minutes have none): the turbine controller's fast
+#   log of the minute just ended, 50 samples a second of 21 channels, as an Apache Parquet
+#   file of about 0.53 MB. MQTT 5 says what it is: content type
+#   application/vnd.apache.parquet, payload format 0 (binary) and user properties schema,
+#   site, turbine, rows, rate_hz, start_ms and end_ms.
+# Derives: analytics/power/<site>/<turbine>/fastlog, QoS 0: a small JSON index record per
+#   file: its size, schema, rows and rate, the minute it covers, when the broker received
+#   it, how long after the minute that was, and the object key a data lake would file it
+#   under.
+# Why: a rule cannot read Parquet, and should not: the file goes as it is to whoever stores
+#   or analyses it. But a catalogue, a dashboard or a "did every turbine upload its minute?"
+#   check needs to know about each file without fetching half a megabyte. Everything it
+#   needs is in the topic, the payload's size and the MQTT 5 properties; the payload is
+#   only measured (bytesize), and its first four bytes compared with Parquet's magic
+#   number, PAR1: subbits(payload, 32) reads them as a big-endian integer, 0x50415231.
+#   A file that is not Parquet, or a property that is missing, gives no record.
+#
+# In:  plant/wf-falster/wtg03/fastlog  qos=1  <531398 bytes: PAR1...PAR1>
+#        Content-Type: application/vnd.apache.parquet, Payload-Format-Indicator: 0,
+#        User-Property: schema=fastlog/v1, site=wf-falster, turbine=wtg03, rows=3000,
+#        rate_hz=50, start_ms=1791633540000, end_ms=1791633600000
+# Out: analytics/power/wf-falster/wtg03/fastlog  qos=0  {"site":"wf-falster","turbine":"wtg03","bytes":531398,"content_type":"application/vnd.apache.parquet","schema":"fastlog/v1","rows":3000,"rate_hz":50,"start_ms":1791633540000,"end_ms":1791633600000,"from_utc":"2026-10-10T11:59:00Z","to_utc":"2026-10-10T12:00:00Z","received_at":1791633605067,"upload_lag_s":5.1,"key":"wf-falster/wtg03/2026/10/10/1159.parquet"}
+
+[rules.power_wtg_fastlog]
+description = "Index each turbine's 50 Hz fast log (Parquet) from its size and MQTT 5 properties"
+sql = '''
+SELECT
+  topic(2)                                                  AS site,
+  topic(3)                                                  AS turbine,
+  bytesize(payload)                                         AS bytes,
+  pub_props.'Content-Type'                                  AS content_type,
+  pub_props.'User-Property'.schema                          AS schema,
+  int(pub_props.'User-Property'.rows)                       AS rows,
+  int(pub_props.'User-Property'.rate_hz)                    AS rate_hz,
+  int(pub_props.'User-Property'.start_ms)                   AS start_ms,
+  int(pub_props.'User-Property'.end_ms)                     AS end_ms,
+  format_date('millisecond', 'Z', '%Y-%m-%dT%H:%M:%SZ', start_ms) AS from_utc,
+  format_date('millisecond', 'Z', '%Y-%m-%dT%H:%M:%SZ', end_ms)   AS to_utc,
+  publish_received_at                                       AS received_at,
+  round((publish_received_at - end_ms) / 100) / 10          AS upload_lag_s,
+  site + '/' + turbine + '/'
+    + format_date('millisecond', 'Z', '%Y/%m/%d/%H%M', start_ms) + '.parquet' AS key
+FROM "plant/+/+/fastlog"
+WHERE content_type = 'application/vnd.apache.parquet' AND subbits(payload, 32) = 1346458161
+'''
+actions = [
+  { function = "republish", args = { topic = "analytics/power/${site}/${turbine}/fastlog", qos = 0, payload = "${.}" } },
 ]
 
 

@@ -51,11 +51,15 @@ def parse_start(text: str) -> float:
     return t.timestamp()
 
 
-def generate(domains: list[str], seed: int, t0: float, duration: float) -> list[Event]:
+def generate(domains: list[str], seed: int, t0: float, duration: float,
+             fastlog: bool = False) -> list[Event]:
+    """Every domain's events. `fastlog` adds the wind turbines' 50 Hz fast logs (Parquet,
+    half a megabyte a minute each, built when sent): the live demo's, never the fixture's."""
     streams = []
     for name in domains:
         rng = random.Random(f"{seed}:{name}")
-        streams.append(DOMAINS[name].events(rng, t0, duration))
+        extra = {"fastlog": True} if fastlog and name == "power" else {}
+        streams.append(DOMAINS[name].events(rng, t0, duration, **extra))
     return merge(streams)
 
 
@@ -63,7 +67,11 @@ def show(prefix: str, topic: str, payload: bytes, width: int = 160) -> str:
     try:
         text = payload.decode("utf-8")
     except UnicodeDecodeError:
-        text = "0x" + payload.hex()
+        # A binary payload as hex; a large one (a turbine's Parquet fast log) as its size
+        # and first bytes, not half a megabyte of hex cut to one line.
+        text = "0x" + payload[:width].hex()
+        if len(payload) > width:
+            text = f"({len(payload):,} bytes) {text}"
     # One line per message: a DSMR telegram's CRLF-separated lines are shown as ⏎.
     text = text.replace("\r\n", "⏎").replace("\n", "⏎").replace("\r", "⏎")
     line = f"{prefix} {topic}  {text}"

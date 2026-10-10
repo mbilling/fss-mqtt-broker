@@ -2325,7 +2325,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `the_pattern_matcher_checks_rendered_times`
 - `without_their_guards_the_recipes_do_what_the_cookbook_warns`
 
-## `crates/mqttd/tests/rules_demo.rs` — 13 test(s)
+## `crates/mqttd/tests/rules_demo.rs` — 14 test(s)
 
 - `the_demo_derives_exactly_what_it_shows`
 - `the_demo_rules_file_checks_clean`
@@ -2335,6 +2335,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `the_live_simulator_replays_the_fixture_in_every_window`
 - `the_live_simulator_rides_out_a_broker_restart_and_stops_cleanly` — only when `cfg(unix)`
 - `the_live_simulators_device_clocks_run_on_from_window_to_window`
+- `the_live_simulators_fast_logs_are_parquet_files_and_change_nothing_else`
 - `the_readme_quotes_only_messages_the_fixture_derives`
 - `the_rule_editors_server_refuses_foreign_requests_and_sends_strict_headers`
 - `the_rules_editor_renders_text_never_markup`
