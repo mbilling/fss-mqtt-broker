@@ -104,7 +104,16 @@ pub const PROTO_MIN: u32 = 6;
 /// publish stored on a node that then died is not stored a second time when its
 /// session moves. A proto-11 link keeps the untagged frame: a re-route over it can
 /// still duplicate (legal at `QoS` 1), never lose.
-pub const PROTO_MAX: u32 = 12;
+///
+/// Proto 13 (ADR 0083, the rule engine's message events) is additive: two frames.
+/// [`MessageEvents`](PeerMessage::MessageEvents) tells a peer whether the sender's
+/// rules select a message event, and [`OriginPublish`](PeerMessage::OriginPublish) is
+/// any of the five publish-carrying frames plus who published the message
+/// ([`WireOrigin`]). A node sends the second only to a peer that asked with the first,
+/// so a cluster without such rules puts neither on the wire and its frames are byte
+/// for byte proto 12's. A proto-12 link is sent neither: a node behind one reports the
+/// messages forwarded to it with an unknown publisher.
+pub const PROTO_MAX: u32 = 13;
 
 /// The peer-bus proto at which a build computes durable ownership over all admitted
 /// members (ADR 0073). Purely a capability marker — see [`PROTO_MAX`].
@@ -125,6 +134,11 @@ pub const PROTO_FORWARD_REACHED: u32 = 11;
 /// The peer-bus proto at which a link carries
 /// [`PublishAckedTagged`](PeerMessage::PublishAckedTagged) (#784).
 pub const PROTO_PUBLISH_ORIGIN: u32 = 12;
+
+/// The peer-bus proto at which a link carries
+/// [`MessageEvents`](PeerMessage::MessageEvents) and
+/// [`OriginPublish`](PeerMessage::OriginPublish) (ADR 0083).
+pub const PROTO_MESSAGE_ORIGIN: u32 = 13;
 
 /// Negotiate a link's protocol version from both sides' announced ranges
 /// (ADR 0038): the newest version both can speak, or `None` when the ranges are
@@ -286,6 +300,87 @@ impl PartialEq for Queued {
 }
 
 impl Eq for Queued {}
+
+/// Who published a forwarded message, for the receiver's message-event rules (ADR
+/// 0083; proto 13): `mqtt_core::Origin` on the wire.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WireOrigin {
+    /// The message id (EMQX's `id`), unique per publish.
+    pub id: u128,
+    /// The publisher's client id; for a rule's republish, the rule's id.
+    pub clientid: String,
+    /// The publisher's CONNECT username, when it sent one.
+    pub username: Option<String>,
+    /// The publisher's address, when its listener knew it.
+    pub peer: Option<std::net::SocketAddr>,
+    /// When the origin node received the publish, milliseconds since the Unix epoch.
+    pub received_at_ms: i64,
+    /// Whether a rule republished it (`clientid` is then that rule's id).
+    pub republished: bool,
+    /// How many republishes it is from the message that started its chain.
+    pub republish_depth: u32,
+}
+
+/// Which publish-carrying frame an [`OriginPublish`](PeerMessage::OriginPublish)
+/// stands for, with the fields that frame has beyond the message itself.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ForwardShape {
+    /// A [`Publish`](PeerMessage::Publish).
+    Publish {
+        /// Its `retain`.
+        retain: bool,
+    },
+    /// A [`PublishAcked`](PeerMessage::PublishAcked).
+    PublishAcked {
+        /// Its `seq`.
+        seq: u64,
+        /// Its `retain`.
+        retain: bool,
+    },
+    /// A [`PublishAckedTagged`](PeerMessage::PublishAckedTagged).
+    PublishAckedTagged {
+        /// Its `seq`.
+        seq: u64,
+        /// Its `origin` (the publish's id on the sending node).
+        origin: u64,
+        /// Its `replay`.
+        replay: bool,
+        /// Its `retain`.
+        retain: bool,
+    },
+    /// A [`SharedDeliver`](PeerMessage::SharedDeliver).
+    SharedDeliver {
+        /// Its `client`.
+        client: String,
+    },
+    /// A [`SharedDeliverAcked`](PeerMessage::SharedDeliverAcked).
+    SharedDeliverAcked {
+        /// Its `seq`.
+        seq: u64,
+        /// Its `client`.
+        client: String,
+    },
+}
+
+/// The body of an [`OriginPublish`](PeerMessage::OriginPublish): a publish-carrying
+/// frame's fields, and who published the message.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OriginFrame {
+    /// Who published it.
+    pub origin: WireOrigin,
+    /// The frame this stands for.
+    pub shape: ForwardShape,
+    /// Destination topic (no wildcards).
+    pub topic: String,
+    /// Application payload.
+    pub payload: Vec<u8>,
+    /// The frame's `qos`.
+    pub qos: u8,
+    /// The publisher's Message Expiry Interval (seconds), if any.
+    pub message_expiry: Option<u32>,
+    /// The publisher's forwardable MQTT 5 application properties.
+    pub app: WireAppProps,
+}
 
 /// A message exchanged between broker nodes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -761,6 +856,208 @@ pub enum PeerMessage {
         /// The publisher's forwardable MQTT 5 application properties.
         app: WireAppProps,
     },
+    // ---------------------------------------------------------------------
+    // Proto 13 (ADR 0083, message events). Appended, like everything since proto 7.
+    // ---------------------------------------------------------------------
+    /// Whether the sender's rules select a message event (`$events/message/delivered`,
+    /// `acked`, `dropped`, `delivery_dropped`), and so whether it wants the origin of
+    /// the publishes forwarded to it ([`OriginPublish`](Self::OriginPublish)). Sent on
+    /// link-up when it does and whenever the answer changes; a link starts at `false`.
+    MessageEvents {
+        /// Whether to carry each forwarded publish's origin to the sender.
+        wanted: bool,
+    },
+    /// A publish-carrying frame — [`Publish`](Self::Publish),
+    /// [`PublishAcked`](Self::PublishAcked),
+    /// [`PublishAckedTagged`](Self::PublishAckedTagged),
+    /// [`SharedDeliver`](Self::SharedDeliver) or
+    /// [`SharedDeliverAcked`](Self::SharedDeliverAcked) — plus who published the
+    /// message. Handled exactly as the frame it stands for
+    /// ([`into_plain`](Self::into_plain)), answered and retransmitted the same way; the
+    /// origin only travels with the message to the receiver's rules. Sent instead of
+    /// that frame on a link that negotiated proto ≥ 13 whose far end asked with
+    /// [`MessageEvents`](Self::MessageEvents), for a message that has an origin.
+    ///
+    /// Boxed: the origin would otherwise size every `PeerMessage` — and every hub
+    /// command that carries one — for a frame most clusters never send. The box is
+    /// not on the wire.
+    OriginPublish(Box<OriginFrame>),
+}
+
+impl PeerMessage {
+    /// This frame carrying `origin` as an [`OriginPublish`](Self::OriginPublish), when
+    /// it is one of the five publish-carrying frames; any other frame unchanged.
+    #[must_use]
+    pub fn with_origin(self, origin: WireOrigin) -> Self {
+        let (shape, topic, payload, qos, message_expiry, app) = match self {
+            Self::Publish {
+                topic,
+                payload,
+                qos,
+                retain,
+                message_expiry,
+                app,
+            } => (
+                ForwardShape::Publish { retain },
+                topic,
+                payload,
+                qos,
+                message_expiry,
+                app,
+            ),
+            Self::PublishAcked {
+                seq,
+                topic,
+                payload,
+                qos,
+                retain,
+                message_expiry,
+                app,
+            } => (
+                ForwardShape::PublishAcked { seq, retain },
+                topic,
+                payload,
+                qos,
+                message_expiry,
+                app,
+            ),
+            Self::PublishAckedTagged {
+                seq,
+                origin,
+                replay,
+                topic,
+                payload,
+                qos,
+                retain,
+                message_expiry,
+                app,
+            } => (
+                ForwardShape::PublishAckedTagged {
+                    seq,
+                    origin,
+                    replay,
+                    retain,
+                },
+                topic,
+                payload,
+                qos,
+                message_expiry,
+                app,
+            ),
+            Self::SharedDeliver {
+                client,
+                topic,
+                payload,
+                qos,
+                message_expiry,
+                app,
+            } => (
+                ForwardShape::SharedDeliver { client },
+                topic,
+                payload,
+                qos,
+                message_expiry,
+                app,
+            ),
+            Self::SharedDeliverAcked {
+                seq,
+                client,
+                topic,
+                payload,
+                qos,
+                message_expiry,
+                app,
+            } => (
+                ForwardShape::SharedDeliverAcked { seq, client },
+                topic,
+                payload,
+                qos,
+                message_expiry,
+                app,
+            ),
+            other => return other,
+        };
+        Self::OriginPublish(Box::new(OriginFrame {
+            origin,
+            shape,
+            topic,
+            payload,
+            qos,
+            message_expiry,
+            app,
+        }))
+    }
+
+    /// The frame an [`OriginPublish`](Self::OriginPublish) stands for, and its origin;
+    /// any other frame unchanged, with `None`.
+    #[must_use]
+    pub fn into_plain(self) -> (Self, Option<WireOrigin>) {
+        let Self::OriginPublish(frame) = self else {
+            return (self, None);
+        };
+        let OriginFrame {
+            origin,
+            shape,
+            topic,
+            payload,
+            qos,
+            message_expiry,
+            app,
+        } = *frame;
+        let plain = match shape {
+            ForwardShape::Publish { retain } => Self::Publish {
+                topic,
+                payload,
+                qos,
+                retain,
+                message_expiry,
+                app,
+            },
+            ForwardShape::PublishAcked { seq, retain } => Self::PublishAcked {
+                seq,
+                topic,
+                payload,
+                qos,
+                retain,
+                message_expiry,
+                app,
+            },
+            ForwardShape::PublishAckedTagged {
+                seq,
+                origin,
+                replay,
+                retain,
+            } => Self::PublishAckedTagged {
+                seq,
+                origin,
+                replay,
+                topic,
+                payload,
+                qos,
+                retain,
+                message_expiry,
+                app,
+            },
+            ForwardShape::SharedDeliver { client } => Self::SharedDeliver {
+                client,
+                topic,
+                payload,
+                qos,
+                message_expiry,
+                app,
+            },
+            ForwardShape::SharedDeliverAcked { seq, client } => Self::SharedDeliverAcked {
+                seq,
+                client,
+                topic,
+                payload,
+                qos,
+                message_expiry,
+                app,
+            },
+        };
+        (plain, Some(origin))
+    }
 }
 
 /// What a node did with a forward it was asked to take responsibility for
@@ -1096,9 +1393,9 @@ mod tests {
     use super::{
         decode, encode, encode_legacy, negotiate_proto, ForwardVerdict, PeerCodecError,
         PeerMessage, ReplicaEntryWire, RetainedWireEntry, SharedGroupWire, SharedMemberWire,
-        WireAppProps, MAX_FRAME, PROTO_FORWARD_REACHED, PROTO_MAX, PROTO_MIN,
-        PROTO_OWNERSHIP_DOMAIN, PROTO_PUBLISH_ORIGIN, PROTO_REPLICATION_FACTOR,
-        PROTO_REPLICA_READ_PAGED,
+        WireAppProps, WireOrigin, MAX_FRAME, PROTO_FORWARD_REACHED, PROTO_MAX,
+        PROTO_MESSAGE_ORIGIN, PROTO_MIN, PROTO_OWNERSHIP_DOMAIN, PROTO_PUBLISH_ORIGIN,
+        PROTO_REPLICATION_FACTOR, PROTO_REPLICA_READ_PAGED,
     };
     use bytes::BytesMut;
 
@@ -1540,14 +1837,164 @@ mod tests {
         encode(&msg, &mut out).unwrap();
         assert_eq!(out[4], 28, "appended after ReplicaReadChunk (27)");
         assert_eq!(
-            negotiate_proto((PROTO_MIN, PROTO_MAX), (PROTO_MIN, PROTO_MAX)),
+            negotiate_proto((PROTO_MIN, PROTO_MAX), (PROTO_MIN, PROTO_PUBLISH_ORIGIN)),
             Some(PROTO_PUBLISH_ORIGIN),
-            "this build must announce the proto-12 tagged forward (#784)"
+            "a pre-message-events build keeps the proto-12 tagged forward (#784)"
         );
         assert_eq!(
             negotiate_proto((PROTO_MIN, PROTO_MAX), (PROTO_MIN, PROTO_FORWARD_REACHED)),
             Some(PROTO_FORWARD_REACHED)
         );
+    }
+
+    fn origin() -> WireOrigin {
+        WireOrigin {
+            id: 0x0006_5D7F_9D39_05CE_4259_0000_16A4_0002,
+            clientid: "pub1".into(),
+            username: Some("pubuser".into()),
+            peer: Some("10.1.2.3:51000".parse().unwrap()),
+            received_at_ms: 1_791_652_540_253,
+            republished: false,
+            republish_depth: 0,
+        }
+    }
+
+    /// Each publish-carrying frame, with every field non-default.
+    fn publish_carrying_frames() -> Vec<PeerMessage> {
+        let app = WireAppProps {
+            content_type: Some("application/json".into()),
+            user_properties: vec![("k".into(), "v".into())],
+            ..WireAppProps::default()
+        };
+        vec![
+            PeerMessage::Publish {
+                topic: "t/a".into(),
+                payload: b"p".to_vec(),
+                qos: 1,
+                retain: true,
+                message_expiry: Some(60),
+                app: app.clone(),
+            },
+            PeerMessage::PublishAcked {
+                seq: 7,
+                topic: "t/a".into(),
+                payload: b"p".to_vec(),
+                qos: 2,
+                retain: true,
+                message_expiry: Some(60),
+                app: app.clone(),
+            },
+            PeerMessage::PublishAckedTagged {
+                seq: 8,
+                origin: 99,
+                replay: true,
+                topic: "t/a".into(),
+                payload: b"p".to_vec(),
+                qos: 1,
+                retain: true,
+                message_expiry: Some(60),
+                app: app.clone(),
+            },
+            PeerMessage::SharedDeliver {
+                client: "m1".into(),
+                topic: "t/a".into(),
+                payload: b"p".to_vec(),
+                qos: 1,
+                message_expiry: Some(60),
+                app: app.clone(),
+            },
+            PeerMessage::SharedDeliverAcked {
+                seq: 9,
+                client: "m1".into(),
+                topic: "t/a".into(),
+                payload: b"p".to_vec(),
+                qos: 1,
+                message_expiry: Some(60),
+                app,
+            },
+        ]
+    }
+
+    /// Proto 13 (ADR 0083): the two message-event frames round-trip, are APPENDED
+    /// after every earlier frame, and this build announces 13 — while a proto-12 peer
+    /// still negotiates 12 and is sent neither.
+    #[test]
+    fn the_message_event_frames_are_appended_and_announced_at_proto_13() {
+        let wanted = PeerMessage::MessageEvents { wanted: true };
+        roundtrip(&wanted);
+        roundtrip(&PeerMessage::MessageEvents { wanted: false });
+        let mut out = Vec::new();
+        encode(&wanted, &mut out).unwrap();
+        assert_eq!(out[4], 29, "appended after PublishAckedTagged (28)");
+        assert_eq!(&out[5..], [1], "one byte: wanted");
+
+        let carried = publish_carrying_frames().remove(0).with_origin(origin());
+        roundtrip(&carried);
+        let mut out = Vec::new();
+        encode(&carried, &mut out).unwrap();
+        assert_eq!(out[4], 30, "appended after MessageEvents (29)");
+
+        assert_eq!(PROTO_MESSAGE_ORIGIN, 13);
+        assert_eq!(
+            negotiate_proto((PROTO_MIN, PROTO_MAX), (PROTO_MIN, PROTO_MAX)),
+            Some(PROTO_MESSAGE_ORIGIN),
+            "this build must announce the proto-13 message-event frames"
+        );
+        assert_eq!(
+            negotiate_proto((PROTO_MIN, PROTO_MAX), (PROTO_MIN, PROTO_PUBLISH_ORIGIN)),
+            Some(PROTO_PUBLISH_ORIGIN),
+            "a proto-12 peer keeps negotiating 12"
+        );
+    }
+
+    /// Every publish-carrying frame survives the trip through `OriginPublish` with
+    /// every field intact, on the wire too; a frame that carries no publish is never
+    /// wrapped, and a plain frame unwraps to itself.
+    #[test]
+    fn a_frame_carrying_its_origin_unwraps_to_the_same_frame() {
+        for frame in publish_carrying_frames() {
+            let carried = frame.clone().with_origin(origin());
+            assert!(
+                matches!(carried, PeerMessage::OriginPublish(_)),
+                "{frame:?} was not wrapped"
+            );
+            let mut wire = BytesMut::new();
+            let mut out = Vec::new();
+            encode(&carried, &mut out).unwrap();
+            wire.extend_from_slice(&out);
+            let decoded = decode(&mut wire).unwrap().unwrap();
+            assert_eq!(decoded.into_plain(), (frame.clone(), Some(origin())));
+            assert_eq!(frame.clone().into_plain(), (frame, None));
+        }
+        let interest = PeerMessage::Interest {
+            filters: vec!["a/#".into()],
+        };
+        assert_eq!(interest.clone().with_origin(origin()), interest);
+    }
+
+    /// An origin with nothing optional set round-trips too (no username, no address,
+    /// a republished message).
+    #[test]
+    fn an_origin_without_a_username_or_an_address_round_trips() {
+        let bare = WireOrigin {
+            username: None,
+            peer: None,
+            republished: true,
+            republish_depth: 3,
+            ..origin()
+        };
+        let v6 = WireOrigin {
+            peer: Some("[2001:db8::1]:1883".parse().unwrap()),
+            ..origin()
+        };
+        for o in [bare, v6] {
+            let frame = publish_carrying_frames().remove(3).with_origin(o.clone());
+            let mut out = Vec::new();
+            encode(&frame, &mut out).unwrap();
+            let mut wire = BytesMut::from(&out[..]);
+            let (_, got) = decode(&mut wire).unwrap().unwrap().into_plain();
+            assert_eq!(got, Some(o));
+        }
     }
 
     /// ADR 0038 T4: the two **frozen** frames' encodings, pinned byte for byte.

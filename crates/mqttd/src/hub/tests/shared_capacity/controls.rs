@@ -109,10 +109,10 @@ async fn qos1_shared_rotation_and_qos0_ordinary_shedding_are_unchanged() {
         .unwrap();
     bm.drained(&qb);
     assert!(
-        matches!(*qa, Packet::Publish(ref p) if p.qos == QoS::AtLeastOnce && p.payload == b"qos1-a"[..])
+        matches!(qa.packet(), Some(Packet::Publish(p)) if p.qos == QoS::AtLeastOnce && p.payload == b"qos1-a"[..])
     );
     assert!(
-        matches!(*qb, Packet::Publish(ref p) if p.qos == QoS::AtLeastOnce && p.payload == b"qos1-b"[..])
+        matches!(qb.packet(), Some(Packet::Publish(p)) if p.qos == QoS::AtLeastOnce && p.payload == b"qos1-b"[..])
     );
     assert!(a.try_recv().is_err() && b.try_recv().is_err());
     assert_eq!(dropped_for(&rig.metrics, "outbound-full"), 0);

@@ -262,7 +262,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `two_bridge_instances_do_not_duplicate_forwarding`
 - `two_partitioned_instances_deliver_each_inbound_message_exactly_once`
 
-## `crates/mqtt-cluster/src/lib.rs` — 368 test(s)
+## `crates/mqtt-cluster/src/lib.rs` — 371 test(s)
 
 - `cluster_identity::tests::a_founder_mints_once_and_reloads_stably`
 - `cluster_identity::tests::a_joiner_adopts_once_and_persists`
@@ -455,7 +455,9 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `node_registry::tests::distinct_nodes_get_distinct_ids`
 - `node_registry::tests::raft_id_is_deterministic`
 - `node_registry::tests::registry_round_trips_and_is_idempotent`
+- `peer::tests::a_frame_carrying_its_origin_unwraps_to_the_same_frame`
 - `peer::tests::a_frozen_frame_with_a_lying_inner_length_is_rejected`
+- `peer::tests::an_origin_without_a_username_or_an_address_round_trips`
 - `peer::tests::an_oversized_frame_is_rejected_at_encode`
 - `peer::tests::paged_replica_read_frames_roundtrip_at_appended_indices`
 - `peer::tests::partial_frame_returns_none`
@@ -464,6 +466,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `peer::tests::queued_sampling_stamps_the_first_then_about_one_in_16_without_a_stride`
 - `peer::tests::roundtrips_all_variants`
 - `peer::tests::the_frozen_frames_encode_byte_for_byte_stably`
+- `peer::tests::the_message_event_frames_are_appended_and_announced_at_proto_13`
 - `peer::tests::the_reached_verdict_is_appended_and_announced_at_proto_11`
 - `peer::tests::the_tagged_forward_is_appended_and_announced_at_proto_12`
 - `peer::tests::trailing_bytes_after_a_postcard_body_are_rejected`
@@ -892,7 +895,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::sink_records_through_a_trait_object`
 - `tests::tampering_with_any_field_changes_the_head`
 
-## `crates/mqtt-rules/src/lib.rs` — 156 test(s)
+## `crates/mqtt-rules/src/lib.rs` — 169 test(s)
 
 - `edit::tests::a_json_rule_body_is_a_rule_edit`
 - `edit::tests::an_insert_appends_the_rule_at_the_end`
@@ -1037,6 +1040,19 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests_emqx_examples::type_judgment_functions_match_emqx_examples`
 - `tests_emqx_examples::undocumented_emqx_functions_match_emqx_source`
 - `tests_emqx_examples::uuid_functions_match_emqx_examples`
+- `tests_message_events::a_chain_through_the_message_events_stops_at_the_depth_guard`
+- `tests_message_events::a_delivery_reads_as_emqx_printed_it`
+- `tests_message_events::a_dropped_delivery_carries_its_reason_and_both_parties`
+- `tests_message_events::a_dropped_publish_names_its_publisher`
+- `tests_message_events::a_message_without_its_origin_shows_its_publisher_as_undefined`
+- `tests_message_events::a_republish_from_a_message_event_copies_the_message_s_user_properties`
+- `tests_message_events::a_rule_does_not_republish_from_an_event_about_its_own_message`
+- `tests_message_events::an_acknowledgement_adds_its_properties`
+- `tests_message_events::both_spellings_select_the_same_event`
+- `tests_message_events::each_message_event_has_exactly_emqx_s_columns`
+- `tests_message_events::every_event_about_a_message_reports_the_same_id`
+- `tests_message_events::the_flags_are_the_delivery_s`
+- `tests_message_events::the_sql_test_has_a_sample_of_each_message_event`
 - `tests_republish::a_message_republished_from_an_event_has_no_dup_flag`
 - `tests_republish::a_republished_message_is_seen_as_emqx_shows_it`
 - `tests_republish::a_rule_does_not_republish_its_own_republished_message`
@@ -1193,7 +1209,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 595 test(s)
+## `crates/mqttd/src/lib.rs` — 605 test(s)
 
 - `admin::cli::tests::a_refusal_shows_what_it_carries`
 - `admin::cli::tests::all_nodes_asks_for_the_cluster_scope_on_the_verbs_that_have_one`
@@ -1598,6 +1614,15 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::inherited_session_expiry_is_swept_after_takeover`
 - `hub::tests::interest_snapshots_follow_subscription_changes`
 - `hub::tests::live_delivery_carries_message_expiry_interval`
+- `hub::tests::message_events::a_backlog_eviction_is_noted_for_the_subscriber_s_connection`
+- `hub::tests::message_events::a_delivery_carries_its_origin_only_while_a_delivery_event_is_selected`
+- `hub::tests::message_events::a_forward_that_reaches_nobody_is_dropped_on_the_receiving_node`
+- `hub::tests::message_events::a_note_is_refused_by_a_full_queue`
+- `hub::tests::message_events::a_qos0_shed_for_a_stalled_subscriber_is_raised_by_the_notes_task`
+- `hub::tests::message_events::a_shared_delivery_to_a_peer_that_asked_carries_the_origin`
+- `hub::tests::message_events::only_a_proto_13_link_that_asked_is_sent_origins`
+- `hub::tests::message_events::publishes_are_stamped_while_a_linked_peer_asks`
+- `hub::tests::message_events::without_a_message_event_rule_nothing_is_carried_or_noted`
 - `hub::tests::no_local_suppresses_the_publishers_own_delivery`
 - `hub::tests::no_publish_toward_a_rehomed_session_is_ever_acked_while_this_node_routes_it`
 - `hub::tests::offline_messages_queue_only_for_persistent_sessions`
@@ -1768,6 +1793,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `reload::tests::committed_config_never_returns_a_rejected_candidate`
 - `reload::tests::every_reload_attempt_is_recorded_with_its_repeats`
 - `reload::tests::reload_increments_the_metric_by_outcome`
+- `rules::tests::a_publish_carries_an_origin_only_while_a_message_event_is_wanted`
 - `rules::tests::a_rule_definition_hash_is_keyed_per_process`
 - `rules::tests::gated_derived_actions_are_counted_by_their_fate`
 - `rules::tests::the_insecure_trace_line_is_logged_once_per_change`
@@ -2356,6 +2382,28 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `the_extraction_finds_every_documented_rules_file_and_snippet`
 - `the_extraction_recognises_every_documented_form`
 - `the_extraction_refuses_what_it_cannot_run`
+
+## `crates/mqttd/tests/rules_message_events.rs` — 19 test(s)
+
+- `a_delivery_on_another_node_names_its_publisher`
+- `a_downgraded_delivery_is_reported_at_its_own_qos_and_never_acked`
+- `a_full_offline_queue_rejecting_the_newest_is_a_dropped_delivery`
+- `a_message_an_online_subscriber_s_full_queue_rejects_is_still_a_delivery`
+- `a_message_too_large_for_its_subscriber_is_a_dropped_delivery`
+- `a_no_local_subscriber_s_own_publish_is_a_dropped_delivery`
+- `a_publish_nobody_subscribes_to_is_reported_dropped`
+- `a_qos1_delivery_and_its_acknowledgement_read_as_emqx_s`
+- `a_qos2_delivery_is_acked_at_its_pubrec_and_only_there`
+- `a_qos2_packet_id_reused_before_its_release_is_dropped_as_emqx_drops_it`
+- `a_queued_message_that_expired_is_a_dropped_delivery_at_the_resume`
+- `a_resent_delivery_is_reported_again_with_dup`
+- `a_retained_message_sent_at_subscribe_is_a_delivery`
+- `a_rule_republishing_deliveries_to_its_own_watcher_does_not_loop`
+- `a_rule_s_unrouted_republish_is_dropped_as_the_rule_s_message`
+- `a_shared_subscription_s_chosen_member_is_the_receiver`
+- `an_unrouted_publish_is_dropped_on_the_node_it_arrived_at`
+- `only_the_selected_event_is_raised`
+- `the_legacy_spellings_and_the_wildcard_select_the_events`
 
 ## `crates/mqttd/tests/rules_sys.rs` — 17 test(s)
 

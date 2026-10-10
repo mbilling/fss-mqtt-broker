@@ -137,7 +137,7 @@ async fn drive_until<T>(hub: &mut Hub, mut wait: oneshot::Receiver<T>) -> T {
 struct Rig {
     hub: Hub,
     tx: mpsc::UnboundedSender<HubCommand>,
-    local: mpsc::UnboundedReceiver<Box<Packet>>,
+    local: crate::hub::OutboundRx,
     peer: mpsc::UnboundedReceiver<PeerMessage>,
     metrics: Arc<mqtt_observability::metrics::Metrics>,
     next_seq: u64,
@@ -250,7 +250,7 @@ impl Rig {
     fn receipts(&mut self) -> Vec<(u64, Where)> {
         let mut out = Vec::new();
         while let Ok(packet) = self.local.try_recv() {
-            let Packet::Publish(p) = *packet else {
+            let Some(Packet::Publish(p)) = packet.into_packet() else {
                 panic!("a local shared member receives PUBLISH and nothing else");
             };
             assert_eq!(p.qos, QoS::AtMostOnce);

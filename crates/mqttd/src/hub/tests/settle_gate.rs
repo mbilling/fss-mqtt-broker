@@ -156,7 +156,7 @@ impl Fix {
     /// still be holding this publish's ack is the settle gate. That is what
     /// makes "the ack resolved" a statement about item 2.1 and nothing else.
     async fn subscriber(&mut self, client: &str, filter: &str, conn_id: u64) {
-        let (otx, _orx) = mpsc::unbounded_channel::<Box<Packet>>();
+        let (otx, _orx) = mpsc::unbounded_channel::<Box<crate::hub::Outgoing>>();
         let (outbound, meter) = Outbound::new(otx);
         self.meters.push(meter);
         let (reply, wait) = oneshot::channel();

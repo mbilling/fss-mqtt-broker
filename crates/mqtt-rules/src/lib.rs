@@ -49,8 +49,9 @@ pub use action::{Effect, Republish};
 pub use eval::{EvalCtx, MAX_OUTPUTS_PER_TRIGGER};
 pub use funcs::names as function_names;
 pub use input::{
-    disconnect_reason, now_ms, ntoa, ntoa_ip, printable_props, pub_props, reason_code_name,
-    ClientInfo, ConnInfo, EventInput, EventKind, EventMatch, PublishInput, EMQX_EVENT_TOPICS,
+    disconnect_reason, new_message_id, now_ms, ntoa, ntoa_ip, printable_props, pub_props,
+    reason_code_name, ClientInfo, ConnInfo, EventInput, EventKind, EventMatch, EventMessage,
+    PublishInput, EMQX_EVENT_TOPICS,
 };
 pub use value::{json_decode, Map, Value};
 
@@ -248,7 +249,8 @@ pub trait Input {
         0
     }
     /// Whether the trigger's `flags` have `dup`, which a message it republishes copies
-    /// ([`Republish::dup_flag`]). An event has no `flags`.
+    /// ([`Republish::dup_flag`]). A client or session event has no `flags`; a message
+    /// event has its message's.
     fn has_dup_flag(&self) -> bool {
         false
     }
@@ -828,6 +830,13 @@ impl RuleSet {
         !self.by_event[kind.index()].is_empty()
     }
 
+    /// Whether any enabled rule selects one of the four message events
+    /// ([`EventKind::MESSAGE`]): what a message's [`mqtt_core::Origin`] is carried for.
+    #[must_use]
+    pub fn wants_message_events(&self) -> bool {
+        EventKind::MESSAGE.iter().any(|k| self.wants_event(*k))
+    }
+
     /// Evaluate every enabled rule whose `FROM` matches the message's topic, in id
     /// order. `report` sees each rule's [`Outcome`]s; each effect is appended to `out`
     /// with the id of the rule that produced it. The message's effects get a
@@ -1100,5 +1109,7 @@ pub fn check_sql(sql: &str) -> Result<Vec<String>, String> {
 mod tests;
 #[cfg(test)]
 mod tests_emqx_examples;
+#[cfg(test)]
+mod tests_message_events;
 #[cfg(test)]
 mod tests_republish;

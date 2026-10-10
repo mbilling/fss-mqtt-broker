@@ -954,7 +954,7 @@ async fn a_batch_waiting_for_credit_releases_its_originals_credit_first() {
     let payload = Bytes::from(vec![0u8; PAYLOAD]);
     let app = AppProperties::default();
     let publisher = crate::rules::Publisher::default();
-    let derived = rules.on_publish(&crate::rules::PublishFacts {
+    let (derived, _) = rules.on_publish(&crate::rules::PublishFacts {
         client: &client,
         publisher: &publisher,
         topic: TOPIC,
@@ -979,6 +979,8 @@ async fn a_batch_waiting_for_credit_releases_its_originals_credit_first() {
         receive_maximum: u16::MAX,
         rules: Some(rules),
         parked_batch: std::sync::Mutex::new(None),
+        unacked: std::sync::Mutex::new(std::collections::HashMap::new()),
+        unacked_len: std::sync::atomic::AtomicUsize::new(0),
     };
     let (done_tx, done_rx) = oneshot::channel();
     let original = HubCommand::Publish {
