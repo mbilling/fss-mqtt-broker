@@ -1,0 +1,37 @@
+[package]
+name = "mqtt-wasm-sandbox"
+description = "Spike (ADR 0086, Proposed): rule functions run as WebAssembly modules in an interpreter — the real jq first"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+# The interpreter (MIT OR Apache-2.0, pure Rust, MSRV 1.86). Not the defaults: no `wat`
+# (text-format parsing; its crates are Apache-2.0 WITH LLVM-exception only) and no
+# memory64. `validate` is what makes `Module::new` check a module before running it.
+wasmi = { version = "2.0.0", default-features = false, features = ["std", "validate", "stable", "auto-dispatch"] }
+# Named only for `LimiterError`, the error type of wasmi's `ResourceLimiter` trait,
+# which `wasmi` does not re-export. The same crate `wasmi` itself builds on.
+wasmi_core = { version = "2.0.0", default-features = false, features = ["std"] }
+
+[dev-dependencies]
+# The rule engine's exact JSON writer and reader: the jq tests marshal as a rule would.
+mqtt-rules = { path = "../mqtt-rules" }
+# Reads the EMQX oracle file (programs and outputs are base64 there).
+base64 = "0.23"
+# The module file's hash against the recorded one.
+sha2 = "0.11"
+
+[features]
+# The tests and examples that need jq.wasm (`jq-module/build.sh`, not checked in).
+# Off by default, so a build without the Wasm toolchain stays whole.
+jq-module = []
+
+[[test]]
+name = "jq_module"
+required-features = ["jq-module"]
+
+[lints]
+workspace = true

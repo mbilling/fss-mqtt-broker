@@ -663,7 +663,7 @@ endpoint, roles, errors).
 - consensus for control (epochs, ownership), small replica sets for data
 - refuse at the edge: reason code or backpressure, never a silent drop
 - bridge is a separate process and failure domain
-- decisions: [`docs/adr/`](docs/adr/) (85 ADRs, per-task status) · tour: [ARCHITECTURE.md](docs/ARCHITECTURE.md) · [THREAT-MODEL.md](docs/THREAT-MODEL.md)
+- decisions: [`docs/adr/`](docs/adr/) (86 ADRs, per-task status) · tour: [ARCHITECTURE.md](docs/ARCHITECTURE.md) · [THREAT-MODEL.md](docs/THREAT-MODEL.md)
 
 **Workspace layout**
 
@@ -678,6 +678,7 @@ endpoint, roles, errors).
 | `mqtt-observability` | Prometheus/OTLP metrics, hash-chained audit |
 | `mqtt-config` | typed config, secure defaults |
 | `mqtt-rules` | rule engine: EMQX-compatible rule SQL, republish/console actions |
+| `mqtt-wasm-sandbox` | spike (ADR 0086, Proposed): rule functions as WebAssembly modules in an interpreter; not linked into the broker |
 | `mqtt-bridge` | zone-crossing bridge: spool, QoS 1 replay |
 | `mqttd` | the broker binary: hub, connections, peer mesh |
 | `mqttd-operator` | Kubernetes operator for `MqttdCluster` |

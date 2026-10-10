@@ -93,6 +93,7 @@
 | [0083](../adr/0083-rule-engine.md) | A rule engine on the publish path: EMQX rule SQL, evaluated once per message where it lands | Accepted | [17/17 done](0083-rule-engine.md) | — |
 | [0084](../adr/0084-watching-and-editing-rules-live.md) | Watching and editing rules live | Accepted | [10/10 done](0084-watching-and-editing-rules-live.md) | — |
 | [0085](../adr/0085-rule-state-store.md) | State for rules: a keyed, replicated store read and written from SQL | Proposed | [0/10 done](0085-rule-state-store.md) | 10 open |
+| [0086](../adr/0086-wasm-rule-functions.md) | Rule functions in a WebAssembly sandbox: the real jq first, operator plugins on the same mechanism | Proposed | [0/4 done](0086-wasm-rule-functions.md) | 4 deferred |
 
 ## Open and deferred work
 
@@ -229,3 +230,10 @@
 - `0085-T8` ⬜ planned ([#880](https://github.com/mbilling/fss-mqtt-broker/issues/880)): "Documentation: RULES.md (functions, merges, modes, the evaluation-order rule, the billing worked example), the departures from EMQX, threat model and hardening rows"
 - `0085-T9` ⬜ planned ([#880](https://github.com/mbilling/fss-mqtt-broker/issues/880)): "strong mode on the durable plane (phase 2), with partition and failover tests"
 - `0085-T10` ⬜ planned ([#880](https://github.com/mbilling/fss-mqtt-broker/issues/880)): "An optional snapshot to disk for local and eventual namespaces (phase 3)"
+
+**0086 — Rule functions in a WebAssembly sandbox: the real jq first, operator plugins on the same mechanism**
+
+- `0086-T1` 💤 deferred: "The sandbox crate and the jq module's build: loader fuzzing, the module built in CI from pinned sources and compared with the recorded hash, the EMQX oracle test in CI" — "Waits for the decision on ADR 0086 (Proposed). The spike's prototype is crates/mqtt-wasm-sandbox; an issue is opened when the ADR is accepted."
+- `0086-T2` 💤 deferred: "jq/2 and jq/3 in the rule engine behind the ABI: the instance pool, the worker hand-off, the per-message budget, grants, metrics and trace, --rule-test" — "Waits for the decision on ADR 0086 (Proposed), then for T1."
+- `0086-T3` 💤 deferred: "Operator plugins: [functions.<name>] in the rules file, pinned by sha256, load-time checks, live reload, the admin view, worked examples in Rust and C" — "Waits for the decision on ADR 0086 (Proposed), then for T2. May follow T2 at a distance: the ABI is the same either way."
+- `0086-T4` 💤 deferred: "Documentation: RULES.md (the function, its limits, its cost), the departures from EMQX, threat model and hardening rows, the cookbook" — "Waits for the decision on ADR 0086 (Proposed), then for T2."
