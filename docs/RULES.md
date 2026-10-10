@@ -767,10 +767,15 @@ mosquitto_sub -h 127.0.0.1 -t '$SYS/brokers/+/rules' -v
 - **JSON `null` is a value, not `undefined`.** For `{"x": null}`, `is_null(payload.x)` is
   false and `is_not_null(payload.x)` is true; they test for a missing field.
   `is_null_var` and `is_not_null_var` treat `null` as missing too.
-- **Integers beyond 64 bits become floats.** A JSON integer outside the signed 64-bit range
-  is decoded as a float: `{"id": 12345678901234567890}` gives `1.2345678901234567e+19` in
-  `${.}` and `12345678901234567168.0` in `${id}`. Send such ids as strings, or forward
-  `${payload}`, which keeps the original bytes.
+- **Numbers are Erlang's, as in EMQX.** An integer has no fixed width:
+  `{"id": 12345678901234567890}` stays `12345678901234567890` in `${.}` and `${id}`, and
+  `9223372036854775807 + 1` is `9223372036854775808` (mqttd's one bound: 8192 bits, about
+  2,466 digits). An integer meets a float by exact value: `9007199254740993 >
+  9007199254740992.0` is true. JSON writes a float in its shortest form, scientific where
+  that is shorter (`1.0e20`, `1.0e-5`, `3.14e4`); text (`str`, `${x}`, `'a' + x`) writes
+  it with up to ten decimals (`str(1.0e-11)` is `0.0`) and keeps `-0.0`'s sign. A string
+  is a number only in Erlang's own syntax: `'5'`, `'-5'`, `'5.0'`, `'1.5e3'`, but not
+  `' 5'`, `'1e3'` or `'.5'` (`int(' 12')` and `5 = ' 5'` fail the rule).
 - **`topic(n)` counts from 1:** `topic(2)` of `home/kitchen/temp` is `kitchen`, and
   `topic(0)` fails the rule. Indexes (`payload.list[1]`) and `nth` count from 1 too, but
   `substr` counts from 0. More function traps are under [Functions](#functions).
@@ -1040,12 +1045,12 @@ belongs in a TOML `'''…'''` string ([Gotchas](#gotchas)).
 
 | Construct | Example | Notes |
 |---|---|---|
-| Field path | `payload.a.b`, `pub_props.'User-Property'.foo` | A path into `payload` decodes the payload as JSON once per message. If the payload is not JSON, a rule that reads into it **fails**; one that only reads `payload` as a whole does not. A JSON integer outside the signed 64-bit range decodes as a float. |
+| Field path | `payload.a.b`, `pub_props.'User-Property'.foo` | A path into `payload` decodes the payload as JSON once per message. If the payload is not JSON, a rule that reads into it **fails**; one that only reads `payload` as a whole does not. JSON integers of any size stay exact. |
 | Index | `payload.list[1]`, `payload.list[-1]` | 1-based; negative counts from the end; out of range is `undefined`. |
 | Range | `payload.list[2..3]`, `[1..5]` | A slice, or the integers from one end to the other. |
 | Array literal | `['a', 1 + 1]` | |
-| Arithmetic | `+ - * / div mod` | `/` always gives a float; `div` and `mod` take integers. `+` concatenates when either side is a string. Overflow and division by zero are errors. |
-| Comparison | `= != <> < <= > >=` | `undefined` compares false with any value and equal to `undefined`. A number against a string converts the string; a non-numeric one is an error. A boolean or `null` against a string compares their text. Any other pair of types uses Erlang's term order (number < `false` < `null` < `true` < object < array < string), so `null > 30` is true ([Gotchas](#gotchas)). |
+| Arithmetic | `+ - * / div mod` | `/` always gives a float; `div` and `mod` take integers. `+` concatenates when either side is a string. Integers never overflow; division by zero is an error. |
+| Comparison | `= != <> < <= > >=` | `undefined` compares false with any value and equal to `undefined`. A number against a string converts the string by Erlang's syntax (`'5'`, `'5.0'`, `'1.5e3'`; not `' 5'` or `'1e3'`), and one that is not a number is an error. An integer and a float compare by exact value. A boolean or `null` against a string compares their text. Any other pair of types uses Erlang's term order (number < `false` < `null` < `true` < object < array < string), so `null > 30` is true ([Gotchas](#gotchas)). |
 | Topic match | `topic =~ 'sensors/+/data'` | The MQTT filter match. |
 | Logic | `AND OR NOT`, `x IN (...)`, `x NOT IN (...)` | A condition passes only on boolean `true`. `IN` matches exactly, so `1` is not in `(1.0)`. |
 | `CASE` | `CASE WHEN x > 7 THEN 7 ELSE x END`, `CASE x WHEN 'a' THEN 1 END` | No match and no `ELSE` gives `undefined`. |
@@ -1280,7 +1285,11 @@ Traps that EMQX's reference states only in passing, each checked against this en
   The memory a match may take for backtracking is bounded too, at 64 MiB where OTP's
   bound is 20 GB: `'^(a|b)*$'` gives up (no match) past about 220 KB of
   subject, `'^(?:a|b)*$'` past about 330 KB, where EMQX matches up to several MB.
-- `round` takes one argument: `round(2.567, 2)` fails the load.
+- `round` takes one argument: `round(2.567, 2)` fails the load. `round`, `ceil` and
+  `floor` give an integer of any size (`ceil(1.0e20)` is `100000000000000000000`).
+- `abs` takes an integer only: `abs(-1.5)` fails, as in EMQX. `float2str` takes a float
+  only (`float2str(5, 2)` fails), and prints as `str` does with its own decimals,
+  rounding a half away from zero (`float2str(0.125, 2)` is `0.13`).
 - `unix_ts_to_rfc3339` and `now_rfc3339` write the broker host's local time zone, as EMQX
   does (`+00:00` on a host or container set to UTC). `format_date` with an explicit offset
   (`'+01:00'`) gives the same text on every host.
@@ -1312,8 +1321,8 @@ Traps that EMQX's reference states only in passing, each checked against this en
   (`\0` is `0`, `\&` is `&`), and `$` is an ordinary character.
 - `subbits` returns `undefined` when the start is outside the binary, takes the bits to
   the end when the length is negative or too long, and fails on a NaN or infinite float.
-  Erlang can return an integer wider than 64 bits and a bit string that is not a whole
-  number of bytes; this engine cannot represent either and fails the rule instead.
+  An integer comes out at any width. Erlang can return a bit string that is not a whole
+  number of bytes; this engine cannot represent one and fails the rule instead.
 - The compression functions produce EMQX's bytes exactly (the same C zlib and liblz4). A
   decompression stops, failing the rule, once its output would pass the 1 MiB per-message
   growth budget, so a small payload cannot inflate into gigabytes.
@@ -1520,17 +1529,16 @@ notice.
 | `authz_source` | The source that decided: `file`, `built_in_database`, `http`, …, `superuser`, `default`, and `cache` for a decision its authorization cache answered | `file` or `default`: mqttd has the ACL file only, no superusers and no authorization cache |
 | Data-integration sources (`$bridges/…`, `$sources/…`) | Yes | No: refused at load |
 | Functions | 124 in the built-in reference, plus `jq`; every other export of `emqx_rule_funcs` is callable too | 120 of those 124, plus 23 EMQX exports without documenting (143 in all). `maptab_lookup`, `mongo_date`, `schema_encode`, `schema_decode`, `jq`, `term_encode`/`term_decode` and the state functions (`kv_store_*`, `proc_dict_*`; [ADR 0085](adr/0085-rule-state-store.md)) are refused at load. |
-| JSON integers | Any size (Erlang integers) | Signed 64-bit. One outside that range decodes as a float, so `12345678901234567890` becomes `1.2345678901234567e+19`. `${payload}` keeps the original bytes. |
 | Regular expressions | Erlang `re`: PCRE2 10.47 (OTP 28) on bytes, compiled per call | PCRE2 10.46 on bytes, with OTP's compile options, match and depth limits and global-match loop: the same syntax and results ([above](#functions)). A match needing more than 64 MiB of backtracking memory is no match (OTP allows 20 GB); a pattern nesting parentheses more than 250 deep does not compile (OTP's limit is 10,000, though PCRE2's own workspace stops most such patterns below 2,000). A literal pattern is compiled once, when the file loads (one that does not compile warns), and a rules file holds at most 512 distinct ones, 256 KiB together. |
 | `sprintf` `~p` / `~P` of a long list, map or non-printable binary | `io_lib_pretty` breaks it across lines once it reaches the line width (80 columns, or the field width) | Printed on one line (`~0p`, which never breaks, is the same in both) |
-| `subbits` results Erlang has and this engine cannot hold | An integer of any size; a bit string of any length | Fail the rule: an integer outside 64 bits, a bit string that is not whole bytes |
+| `subbits` results Erlang has and this engine cannot hold | A bit string of any length | Fail the rule: a bit string that is not whole bytes |
 | `id` | 32 upper-case hex digits, the first 16 the microsecond clock | The same format; only how the low 64 bits are built differs (per-process salt and counter), which no rule can observe |
 | `client_attrs`, `mountpoint` | Client attributes, mountpoints | Always empty / absent |
 | Namespaces (6.x) | Rules can be confined to a namespace | No namespaces |
 | Unaliased computed field | Stored under a generated `_v_…` key | Stored under the expression's source text |
 | Ack semantics | Rules run synchronously in the publisher's channel, in the `message.publish` hook, before the original is routed; a republish is routed inside that call. The PUBACK follows, but never waits for delivery or durability, and a republish's outcome never changes its reason code | A QoS ≥ 1 republish holds the publisher's PUBACK/PUBREC until its fate is known; the answer is still the original's own, and a failed republish is a failed action ([above](#delivery-guarantees-qos-0-1-and-2)) |
 | A refused publish | Rules do not run on a publish refused by authorization, quota, publish caps, schema validation or message transformation. Only a hook running after the rule engine (ExHook, node rebalance) can refuse it afterwards, and then the republish has already been routed | The hub routes none of its derived messages (unless the refusal is a peer's, arriving later) |
-| Limits on payload-driven work | None beyond the Erlang process's memory | A `FOREACH` iterates at most 10,000 elements; a function may build at most 1 MiB beyond its inputs; `map_put`/`mput` paths have at most 64 segments; timestamps must be renderable in every time zone; expressions at most 256 levels deep and nested at most 64 levels ([The rules file](#the-rules-file)) |
+| Limits on payload-driven work | None beyond the Erlang process's memory | A `FOREACH` iterates at most 10,000 elements; a function may build at most 1 MiB beyond its inputs, and integers past 64 bits draw on the same budget; an integer has at most 8192 bits (2,466 digits: a JSON payload with a longer one is not JSON to a rule, and arithmetic past it fails the rule); `map_put`/`mput` paths have at most 64 segments; timestamps must be renderable in every time zone; expressions at most 256 levels deep and nested at most 64 levels ([The rules file](#the-rules-file)) |
 | Where it runs | Every node, once per message at the node that received it; a forwarded copy does not run the publish hook. Rules are cluster-wide configuration | The same placement. Rules are a per-node file: each node runs the file it was given |
 | `$SYS` messages | The broker's own `$SYS` messages run rules only with `rule_engine.ignore_sys_message = false` (default `true`). The default ACL denies only subscribing to `$SYS/#`, so a client may publish to `$SYS/x`, and that message runs rules whatever `ignore_sys_message` says (it checks only the flag the broker sets on its own) | Never run rules. Clients cannot publish to `$SYS`, except a Mosquitto bridge's `$SYS/broker/connection/<id>/state`, so a `FROM` on any other `$SYS` topic never matches. The broker publishes only opt-in rule statistics and trace there ([above](#watch-and-edit-rules-live)) |
 | Rule statistics | The dashboard and the REST API | `/metrics`; with `sys_interval_secs`, `$SYS/brokers/<node>/rules/<id>`; `GET /admin/v1/rules` |

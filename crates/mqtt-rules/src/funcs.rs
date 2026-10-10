@@ -23,7 +23,8 @@ use base64::Engine as _;
 
 use self::re::{Groups, Regex};
 
-use crate::eval::{resolve_index, EvalCtx};
+use crate::eval::{charge_int, resolve_index, EvalCtx};
+use crate::num::{self, BitOp, IntOp};
 use crate::value::{json_decode, Map, Value};
 use crate::EvalError;
 
@@ -92,10 +93,6 @@ fn bounded_growth(
     Ok(())
 }
 
-/// The decimals `float()` and `float2str()` accept: Erlang's `float_to_binary`'s own
-/// range, which is what EMQX formats with.
-const MAX_DECIMALS: i64 = 253;
-
 macro_rules! funcs {
     ($( $name:literal $min:literal ..= $max:tt => $f:expr $(, regex $r:literal)? ;)*) => {
         static FUNCS: &[Func] = &[
@@ -116,26 +113,25 @@ macro_rules! funcs {
 
 funcs! {
     // -- mathematical
-    "abs" 1..=1 => |a, _| match &a[0] {
-        Value::Int(n) => n.checked_abs().map(Value::Int).ok_or_else(overflow),
-        v => Value::float(num(v)?.abs()),
-    };
+    // EMQX's `abs/1` takes an integer only: `abs(-1.5)` fails.
+    "abs" 1..=1 => |a, cx| built(cx, num::int_abs(&a[0]).map_err(|_| type_err("an integer", &a[0])));
     "acos" 1..=1 => |a, _| math(a, f64::acos);
     "acosh" 1..=1 => |a, _| math(a, f64::acosh);
     "asin" 1..=1 => |a, _| math(a, f64::asin);
     "asinh" 1..=1 => |a, _| math(a, f64::asinh);
     "atan" 1..=1 => |a, _| math(a, f64::atan);
     "atanh" 1..=1 => |a, _| math(a, f64::atanh);
-    "ceil" 1..=1 => |a, _| to_int_value(num(&a[0])?.ceil());
+    "ceil" 1..=1 => |a, cx| integral(cx, &a[0], f64::ceil);
     "cos" 1..=1 => |a, _| math(a, f64::cos);
     "cosh" 1..=1 => |a, _| math(a, f64::cosh);
     "exp" 1..=1 => |a, _| math(a, f64::exp);
-    "floor" 1..=1 => |a, _| to_int_value(num(&a[0])?.floor());
+    "floor" 1..=1 => |a, cx| integral(cx, &a[0], f64::floor);
     "fmod" 2..=2 => |a, _| Value::float(num(&a[0])? % num(&a[1])?);
     "log" 1..=1 => |a, _| math(a, f64::ln);
     "log10" 1..=1 => |a, _| math(a, f64::log10);
     "log2" 1..=1 => |a, _| math(a, f64::log2);
-    "round" 1..=1 => |a, _| to_int_value(num(&a[0])?.round());
+    // Erlang's `round/1`: half away from zero, as `f64::round`.
+    "round" 1..=1 => |a, cx| integral(cx, &a[0], f64::round);
     "power" 2..=2 => |a, _| Value::float(num(&a[0])?.powf(num(&a[1])?));
     "random" 0..=0 => |_, _| {
         let mut b = [0u8; 8];
@@ -154,7 +150,7 @@ funcs! {
     "is_array" 1..=1 => |a, _| Ok(Value::Bool(matches!(a[0], Value::Array(_))));
     "is_bool" 1..=1 => |a, _| Ok(Value::Bool(matches!(a[0], Value::Bool(_))));
     "is_float" 1..=1 => |a, _| Ok(Value::Bool(matches!(a[0], Value::Float(_))));
-    "is_int" 1..=1 => |a, _| Ok(Value::Bool(matches!(a[0], Value::Int(_))));
+    "is_int" 1..=1 => |a, _| Ok(Value::Bool(num::is_int(&a[0])));
     "is_map" 1..=1 => |a, _| Ok(Value::Bool(matches!(a[0], Value::Map(_))));
     "is_null" 1..=1 => |a, _| Ok(Value::Bool(a[0].is_undefined()));
     "is_not_null" 1..=1 => |a, _| Ok(Value::Bool(!a[0].is_undefined()));
@@ -185,38 +181,38 @@ funcs! {
     // -- data type conversion
     "bool" 1..=1 => |a, _| match &a[0] {
         Value::Bool(b) => Ok(Value::Bool(*b)),
-        v if v.is_number() && (num(v)? - 1.0).abs() < f64::EPSILON => Ok(Value::Bool(true)),
-        v if v.is_number() && num(v)?.abs() < f64::EPSILON => Ok(Value::Bool(false)),
+        // `bool(N) when N == 1` / `N == 0`: `1`, `1.0`, `0`, `0.0` and `-0.0`.
+        Value::Int(1) => Ok(Value::Bool(true)),
+        Value::Int(0) => Ok(Value::Bool(false)),
+        Value::Float(f) if f.total_cmp(&1.0).is_eq() => Ok(Value::Bool(true)),
+        Value::Float(f) if *f == 0.0 => Ok(Value::Bool(false)),
         v => match v.as_str() {
             Some("true") => Ok(Value::Bool(true)),
             Some("false") => Ok(Value::Bool(false)),
             _ => Err(EvalError::new(format!("cannot convert {} to a boolean", v.to_text()?))),
         },
     };
+    // `list_to_float(float_to_list(F, [{decimals, D}]))`, for D > 0.
     "float" 1..=2 => |a, _| {
         let f = to_float(&a[0])?;
         match a.get(1) {
             None => Value::float(f),
             Some(d) => {
                 let d = int(d)?;
-                if !(1..=MAX_DECIMALS).contains(&d) {
-                    return Err(EvalError::new(format!("decimals must be in 1..={MAX_DECIMALS}")));
+                if d < 1 {
+                    return Err(EvalError::new("float/2 takes decimals of at least 1"));
                 }
-                let s = format!("{f:.prec$}", prec = usize::try_from(d).unwrap_or(1));
+                let s = num::float_to_decimals(f, d, false)?;
                 Value::float(s.parse().map_err(|_| EvalError::new("float conversion failed"))?)
             }
         }
     };
-    "float2str" 2..=2 => |a, _| {
-        let f = to_float(&a[0])?;
-        let d = int(&a[1])?;
-        if !(0..=MAX_DECIMALS).contains(&d) {
-            return Err(EvalError::new(format!("decimals must be in 0..={MAX_DECIMALS}")));
-        }
-        let d = usize::try_from(d).unwrap_or(0);
-        Ok(Value::from(compact_decimals(&format!("{f:.d$}"))))
+    // `float_to_binary(Float, [{decimals, D}, compact])`: a float only, as in EMQX.
+    "float2str" 2..=2 => |a, _| match &a[0] {
+        Value::Float(f) => Ok(Value::from(num::float_to_decimals(*f, int(&a[1])?, true)?)),
+        v => Err(type_err("a float", v)),
     };
-    "int" 1..=1 => |a, _| Ok(Value::Int(to_int(&a[0])?));
+    "int" 1..=1 => |a, cx| built(cx, to_int(&a[0]));
     "str" 1..=1 => |a, _| Ok(Value::from(a[0].to_text()?));
     "str_utf8" 1..=1 => |a, _| Ok(Value::from(a[0].to_text()?));
     "str_utf16_le" 1..=1 => |a, _| {
@@ -439,48 +435,40 @@ funcs! {
     "md5" 1..=1 => |a, _| Ok(Value::from(mqtt_core::hex_lower(&md5(bin(&a[0])?))));
     "sha" 1..=1 => |a, _| Ok(Value::from(digest(&aws_lc_rs::digest::SHA1_FOR_LEGACY_USE_ONLY, bin(&a[0])?)));
     "sha256" 1..=1 => |a, _| Ok(Value::from(digest(&aws_lc_rs::digest::SHA256, bin(&a[0])?)));
-    "hash_to_range" 3..=3 => |a, _| {
-        let h = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, bin(&a[0])?);
-        range_map(h.as_ref(), &a[1], &a[2])
+    "hash_to_range" 3..=3 => |a, cx| {
+        let b = bin(&a[0])?;
+        if b.is_empty() {
+            return Err(EvalError::new("hash_to_range() needs a non-empty string"));
+        }
+        let h = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, b);
+        range_map(cx, h.as_ref(), &a[1], &a[2])
     };
-    "map_to_range" 3..=3 => |a, _| match &a[0] {
-        Value::Int(n) => range_map(&n.to_be_bytes(), &a[1], &a[2]).and_then(|v| {
-            // A negative integer maps by its value, not its two's-complement bytes.
-            // In i128: the span of an i64 range overflows an i64. `range_map` has
-            // already checked lo <= hi, so the result lies in [lo, hi].
-            let (lo, hi) = (i128::from(int(&a[1])?), i128::from(int(&a[2])?));
-            if *n < 0 {
-                let r = lo + i128::from(*n).rem_euclid(hi - lo + 1);
-                Ok(Value::Int(i64::try_from(r).map_err(|_| overflow())?))
-            } else {
-                Ok(v)
-            }
-        }),
+    // `Min + (Int rem (Max - Min + 1))`: `rem` takes the dividend's sign, so a negative
+    // integer can map below `Min`, exactly as in EMQX.
+    "map_to_range" 3..=3 => |a, cx| match &a[0] {
+        n @ (Value::Int(_) | Value::Big(_)) => {
+            let span = range_span(&a[1], &a[2])?;
+            let r = num::int_arith(IntOp::Rem, n, &span)?;
+            built(cx, num::int_arith(IntOp::Add, &a[1], &r))
+        }
         v => {
             let b = bin(v)?;
             if b.is_empty() {
                 return Err(EvalError::new("map_to_range() needs a non-empty string"));
             }
-            range_map(b, &a[1], &a[2])
+            range_map(cx, b, &a[1], &a[2])
         }
     };
 
     // -- bit operations
-    "bitand" 2..=2 => |a, _| Ok(Value::Int(int(&a[0])? & int(&a[1])?));
-    "bitor" 2..=2 => |a, _| Ok(Value::Int(int(&a[0])? | int(&a[1])?));
-    "bitxor" 2..=2 => |a, _| Ok(Value::Int(int(&a[0])? ^ int(&a[1])?));
-    "bitnot" 1..=1 => |a, _| Ok(Value::Int(!int(&a[0])?));
-    "bitsl" 2..=2 => |a, _| {
-        let (n, s) = (int(&a[0])?, u32::try_from(int(&a[1])?).map_err(|_| EvalError::new("shift must be >= 0"))?);
-        let r = n.checked_shl(s).ok_or_else(overflow)?;
-        if r >> s != n { return Err(overflow()); }
-        Ok(Value::Int(r))
-    };
-    "bitsr" 2..=2 => |a, _| {
-        let (n, s) = (int(&a[0])?, int(&a[1])?);
-        let s = u32::try_from(s.clamp(0, 63)).unwrap_or(63);
-        Ok(Value::Int(n >> s))
-    };
+    // On integers of any width, in two's complement, as Erlang's `band`, `bor`, `bxor`,
+    // `bnot`, `bsl` and `bsr`; a negative shift goes the other way.
+    "bitand" 2..=2 => |a, cx| built(cx, bitwise(BitOp::And, a));
+    "bitor" 2..=2 => |a, cx| built(cx, bitwise(BitOp::Or, a));
+    "bitxor" 2..=2 => |a, cx| built(cx, bitwise(BitOp::Xor, a));
+    "bitnot" 1..=1 => |a, cx| built(cx, num::int_not(&a[0]).map_err(|_| type_err("an integer", &a[0])));
+    "bitsl" 2..=2 => |a, cx| built(cx, shift(&a[0], &a[1], false));
+    "bitsr" 2..=2 => |a, cx| built(cx, shift(&a[0], &a[1], true));
 
     // -- encoding and decoding
     "base64_encode" 1..=3 => |a, _| {
@@ -559,7 +547,7 @@ funcs! {
         i64::try_from(bin(&a[0])?.len()).ok().and_then(|n| n.checked_mul(8)).ok_or_else(overflow)?,
     ));
     "bytesize" 1..=1 => |a, _| bytesize(&a[0]);
-    "subbits" 2..=6 => |a, _| subbits(a);
+    "subbits" 2..=6 => |a, cx| built(cx, subbits(a));
 
     // -- compression
     "gzip" 1..=1 => |a, cx| compress::deflate(cx, "gzip", bin(&a[0])?, compress::Wrap::Gzip);
@@ -574,26 +562,14 @@ funcs! {
     // -- callable in EMQX though its reference does not list them: every export of
     //    emqx_rule_funcs is a SQL function there.
     // `div(a, b)` / `mod(a, b)`: the integer operators in call form (`mod` is `rem`).
-    "div" 2..=2 => |a, _| {
-        let (x, y) = (int(&a[0])?, int(&a[1])?);
-        if y == 0 {
-            return Err(EvalError::new("division by zero"));
-        }
-        x.checked_div(y).map(Value::Int).ok_or_else(overflow)
-    };
-    "mod" 2..=2 => |a, _| {
-        let (x, y) = (int(&a[0])?, int(&a[1])?);
-        if y == 0 {
-            return Err(EvalError::new("division by zero"));
-        }
-        x.checked_rem(y).map(Value::Int).ok_or_else(overflow)
-    };
+    "div" 2..=2 => |a, cx| built(cx, int_pair(a).and_then(|()| num::int_arith(IntOp::Div, &a[0], &a[1])));
+    "mod" 2..=2 => |a, cx| built(cx, int_pair(a).and_then(|()| num::int_arith(IntOp::Rem, &a[0], &a[1])));
     // Erlang `==`.
     "eq" 2..=2 => |a, _| Ok(Value::Bool(a[0].loose_eq(&a[1])));
     "null" 0..=0 => |_, _| Ok(Value::Undefined);
     "hash" 2..=2 => |a, _| hash(&a[0], &a[1]);
     "getenv" 1..=1 => |a, _| getenv(bin(&a[0])?);
-    "map_to_redis_hset_args" 1..=1 => |a, _| Ok(redis_hset_args(&a[0]));
+    "map_to_redis_hset_args" 1..=1 => |a, _| redis_hset_args(&a[0]);
     "join_to_sql_values_string" 1..=1 => |a, _| sql_values(array(&a[0])?);
     // EMQX matches topic filters given as maps with the ATOM key `topic`, which no rule
     // value has (a decoded JSON object's keys are strings): every list gives `false`, and
@@ -833,17 +809,81 @@ fn overflow() -> EvalError {
     EvalError::new("integer overflow")
 }
 
+/// A function's integer result, charged to the message's build budget when it is
+/// beyond 64 bits (see [`charge_int`]).
+fn built(cx: &FnCtx, v: Result<Value, EvalError>) -> Result<Value, EvalError> {
+    charge_int(cx.ctx, v?)
+}
+
+/// Both arguments integers (`div/2`, `mod/2`).
+fn int_pair(a: &[Value]) -> Result<(), EvalError> {
+    for v in a {
+        if !num::is_int(v) {
+            return Err(type_err("an integer", v));
+        }
+    }
+    Ok(())
+}
+
+fn bitwise(op: BitOp, a: &[Value]) -> Result<Value, EvalError> {
+    int_pair(a)?;
+    num::int_bitwise(op, &a[0], &a[1])
+}
+
+/// `bitsl` (`X bsl S`) or, `right`, `bitsr` (`X bsr S`).
+fn shift(x: &Value, s: &Value, right: bool) -> Result<Value, EvalError> {
+    int_pair(&[x.clone(), s.clone()])?;
+    if right {
+        num::int_shift_left(x, &num::int_neg(s)?)
+    } else {
+        num::int_shift_left(x, s)
+    }
+}
+
+/// `ceil`, `floor`, `round`: an integer is itself; a float becomes the integer `f` makes
+/// of it, of any size (`ceil(1.0e20)` is `100000000000000000000`).
+fn integral(cx: &FnCtx, v: &Value, f: fn(f64) -> f64) -> Result<Value, EvalError> {
+    match v {
+        Value::Int(_) | Value::Big(_) => Ok(v.clone()),
+        Value::Float(x) => built(cx, num::int_of_integral(f(*x))),
+        v => Err(type_err("a number", v)),
+    }
+}
+
+/// `Max - Min + 1` for a `[Min, Max]` range, refused when `Min > Max`.
+fn range_span(lo: &Value, hi: &Value) -> Result<Value, EvalError> {
+    int_pair(&[lo.clone(), hi.clone()])?;
+    if lo.term_cmp(hi) == std::cmp::Ordering::Greater {
+        return Err(EvalError::new("range minimum must not exceed its maximum"));
+    }
+    num::int_arith(
+        IntOp::Add,
+        &num::int_arith(IntOp::Sub, hi, lo)?,
+        &Value::Int(1),
+    )
+}
+
 fn type_err(wanted: &str, got: &Value) -> EvalError {
     EvalError::new(format!("expected {wanted}, got a {}", got.type_name()))
 }
 
 fn num(v: &Value) -> Result<f64, EvalError> {
-    v.as_f64().ok_or_else(|| type_err("a number", v))
+    match v {
+        Value::Big(_) => v
+            .as_f64()
+            .ok_or_else(|| EvalError::new("integer too large to convert to a float")),
+        v => v.as_f64().ok_or_else(|| type_err("a number", v)),
+    }
 }
 
+/// An integer argument used as a count, position or option. One beyond 64 bits is
+/// taken as the nearest `i64`: as a length or position it is past any end, as EMQX's
+/// list and string functions treat it (`sublist(N, L)` is all of `L`).
 fn int(v: &Value) -> Result<i64, EvalError> {
     match v {
         Value::Int(n) => Ok(*n),
+        Value::Big(b) if b.sign() == num_bigint::Sign::Minus => Ok(i64::MIN),
+        Value::Big(_) => Ok(i64::MAX),
         v => Err(type_err("an integer", v)),
     }
 }
@@ -874,68 +914,51 @@ fn math(a: &[Value], f: fn(f64) -> f64) -> Result<Value, EvalError> {
     Value::float(f(num(&a[0])?))
 }
 
-fn to_int_value(f: f64) -> Result<Value, EvalError> {
-    if f.is_finite() && (-9.223_372_036_854_775e18..=9.223_372_036_854_775e18).contains(&f) {
-        // Range-checked just above.
-        #[allow(clippy::cast_possible_truncation)]
-        Ok(Value::Int(f as i64))
-    } else {
-        Err(overflow())
-    }
-}
-
+/// `emqx_utils_conv:float/1`: a number as a float; a string by Erlang's
+/// `binary_to_float`, else `binary_to_integer` — Erlang's syntax exactly, so `' 1.5'`,
+/// `'1e5'` and `'.5'` are not numbers.
 fn to_float(v: &Value) -> Result<f64, EvalError> {
-    match v {
-        v if v.is_number() => num(v),
-        v => v
-            .as_str()
-            .and_then(|s| s.trim().parse::<f64>().ok())
-            .filter(|f| f.is_finite())
-            .ok_or_else(|| {
-                EvalError::new(format!(
-                    "cannot convert {} to a float",
-                    v.to_text().unwrap_or_default()
-                ))
-            }),
+    if v.is_number() {
+        return num(v);
+    }
+    let b = v
+        .as_bytes()
+        .ok_or_else(|| type_err("a number or a numeric string", v))?;
+    if let Some(f) = num::parse_float(b) {
+        return Ok(f);
+    }
+    match num::parse_int(b)? {
+        Some(n) => num(&n),
+        None => Err(EvalError::new(format!(
+            "cannot convert '{}' to a float",
+            String::from_utf8_lossy(b)
+        ))),
     }
 }
 
-fn to_int(v: &Value) -> Result<i64, EvalError> {
+/// `emqx_utils_conv:int/1`: an integer as itself, a float floored (to an integer of any
+/// size), a boolean as 1 or 0, and a string by `binary_to_integer`, else
+/// `binary_to_float` floored — Erlang's syntax exactly, so `' 12'` and `'1e5'` fail.
+fn to_int(v: &Value) -> Result<Value, EvalError> {
     match v {
-        Value::Int(n) => Ok(*n),
-        Value::Float(f) => match to_int_value(f.floor())? {
-            Value::Int(n) => Ok(n),
-            _ => Err(overflow()),
-        },
-        Value::Bool(b) => Ok(i64::from(*b)),
+        Value::Int(_) | Value::Big(_) => Ok(v.clone()),
+        Value::Float(f) => num::int_of_integral(f.floor()),
+        Value::Bool(b) => Ok(Value::Int(i64::from(*b))),
         v => {
-            let s = v
-                .as_str()
-                .ok_or_else(|| type_err("a number, boolean or numeric string", v))?
-                .trim();
-            if let Ok(n) = s.parse::<i64>() {
+            let b = v
+                .as_bytes()
+                .ok_or_else(|| type_err("a number, boolean or numeric string", v))?;
+            if let Some(n) = num::parse_int(b)? {
                 return Ok(n);
             }
-            match s.parse::<f64>().ok().filter(|f| f.is_finite()) {
-                Some(f) => to_int(&Value::Float(f)),
+            match num::parse_float(b) {
+                Some(f) => num::int_of_integral(f.floor()),
                 None => Err(EvalError::new(format!(
-                    "cannot convert '{s}' to an integer"
+                    "cannot convert '{}' to an integer",
+                    String::from_utf8_lossy(b)
                 ))),
             }
         }
-    }
-}
-
-/// Trim trailing zeros the way Erlang's `compact` float option does.
-fn compact_decimals(s: &str) -> String {
-    if !s.contains('.') {
-        return s.to_string();
-    }
-    let t = s.trim_end_matches('0');
-    if t.ends_with('.') {
-        format!("{t}0")
-    } else {
-        t.to_string()
     }
 }
 
@@ -1018,10 +1041,7 @@ fn put_path(target: Value, path: &[Arc<str>], v: Value) -> Value {
 
 /// Erlang `lists:member` equality: exact, so `2` is not a member of `[2.0]`.
 fn same(a: &Value, b: &Value) -> bool {
-    match (a, b) {
-        (Value::Int(_), Value::Float(_)) | (Value::Float(_), Value::Int(_)) => false,
-        _ => a.loose_eq(b),
-    }
+    a.exact_eq(b)
 }
 
 fn candidates(a: &[Value]) -> Vec<Value> {
@@ -1035,20 +1055,17 @@ fn digest(alg: &'static aws_lc_rs::digest::Algorithm, data: &[u8]) -> String {
     mqtt_core::hex_lower(aws_lc_rs::digest::digest(alg, data).as_ref())
 }
 
-/// Map `bytes`, read as an unsigned big-endian integer, into `[lo, hi]`.
-fn range_map(bytes: &[u8], lo: &Value, hi: &Value) -> Result<Value, EvalError> {
-    let (lo, hi) = (int(lo)?, int(hi)?);
-    if lo > hi {
-        return Err(EvalError::new("range minimum must not exceed its maximum"));
-    }
-    let span = u128::try_from(i128::from(hi) - i128::from(lo) + 1).map_err(|_| overflow())?;
-    // (a·256 + b) mod n, folded byte by byte, is the big integer's remainder.
-    let rem = bytes
-        .iter()
-        .fold(0u128, |acc, b| (acc * 256 + u128::from(*b)) % span);
-    // lo + rem <= hi, so it fits; the sum is taken in i128 because rem alone may not.
-    let v = i128::from(lo) + i128::try_from(rem).map_err(|_| overflow())?;
-    Ok(Value::Int(i64::try_from(v).map_err(|_| overflow())?))
+/// Map `bytes`, read as an unsigned big-endian integer (`binary:decode_unsigned/1`),
+/// into `[lo, hi]`: `lo + (N rem (hi - lo + 1))`.
+fn range_map(cx: &FnCtx, bytes: &[u8], lo: &Value, hi: &Value) -> Result<Value, EvalError> {
+    let span = range_span(lo, hi)?;
+    let span = num::big(&span)
+        .map(std::borrow::Cow::into_owned)
+        .unwrap_or_default();
+    // Linear in the bytes: the divisor is the (small) span.
+    let n = num_bigint::BigInt::from_bytes_be(num_bigint::Sign::Plus, bytes);
+    let rem = num::from_big(n % span)?;
+    built(cx, num::int_arith(IntOp::Add, lo, &rem))
 }
 
 /// `emqx_utils:hexstr_to_bin/1`: two digits per byte, an odd count read as if it had a
@@ -1285,7 +1302,7 @@ fn getenv(name: &[u8]) -> Result<Value, EvalError> {
 /// (`float2str(V, 6)`) or boolean; others are dropped. A string is read as JSON; one that
 /// is not a JSON object, or any other value, gives the marker alone. The pairs come in
 /// the order EMQX's `maps:fold` leaves them: keys descending.
-fn redis_hset_args(v: &Value) -> Value {
+fn redis_hset_args(v: &Value) -> Result<Value, EvalError> {
     let decoded;
     let map = match v {
         Value::Map(m) => Some(m),
@@ -1305,8 +1322,8 @@ fn redis_hset_args(v: &Value) -> Value {
         for (k, x) in entries {
             let field = match x {
                 Value::Str(_) | Value::Bin(_) => x.clone(),
-                Value::Int(n) => Value::from(n.to_string()),
-                Value::Float(f) => Value::from(compact_decimals(&format!("{f:.6}"))),
+                Value::Int(_) | Value::Big(_) => Value::from(x.to_text()?),
+                Value::Float(f) => Value::from(num::float_to_decimals(*f, 6, true)?),
                 Value::Bool(b) => Value::from(b.to_string()),
                 _ => continue,
             };
@@ -1314,7 +1331,7 @@ fn redis_hset_args(v: &Value) -> Value {
             out.push(field);
         }
     }
-    Value::from(out)
+    Ok(Value::from(out))
 }
 
 /// `join_to_sql_values_string(List)`: each item as an SQL literal, joined by `, `. A
@@ -1331,7 +1348,7 @@ fn sql_values(list: &[Value]) -> Result<Value, EvalError> {
                 out.extend_from_slice(b"NULL");
                 continue;
             }
-            Value::Int(_) | Value::Float(_) => {
+            Value::Int(_) | Value::Big(_) | Value::Float(_) => {
                 out.extend_from_slice(item.to_text()?.as_bytes());
                 continue;
             }
@@ -1376,8 +1393,8 @@ fn bytesize(v: &Value) -> Result<Value, EvalError> {
 /// `Start` outside the binary gives `undefined`. A float is 16, 32 or 64 bits and finite,
 /// or the call fails.
 ///
-/// Two results Erlang has cannot be represented and fail instead: an integer outside
-/// 64-bit range, and a bit string whose length is not a whole number of bytes.
+/// A bit string whose length is not a whole number of bytes cannot be represented and
+/// fails instead, as does an integer wider than the engine's bound.
 fn subbits(a: &[Value]) -> Result<Value, EvalError> {
     let data = bin(&a[0])?;
     let (start, len) = match a {
@@ -1465,18 +1482,25 @@ fn subbits(a: &[Value]) -> Result<Value, EvalError> {
     }
 }
 
-/// An integer from its bits, most significant first.
+/// An integer from its bits, most significant first, of any width.
 fn int_from_bits(bits: &[u8], signed: bool) -> Result<Value, EvalError> {
     let negative = signed && bits.first() == Some(&1);
     // A negative two's-complement value is -(inverted bits) - 1.
-    let magnitude = bits.iter().try_fold(0u64, |acc, b| {
-        let b = if negative { 1 - b } else { *b };
-        acc.checked_mul(2).and_then(|a| a.checked_add(u64::from(b)))
-    });
-    let range =
-        || EvalError::new("the integer is outside 64-bit range, which mqttd cannot represent");
-    let m = i64::try_from(magnitude.ok_or_else(range)?).map_err(|_| range())?;
-    Ok(Value::Int(if negative { -m - 1 } else { m }))
+    let bit = |b: &u8| if negative { 1 - b } else { *b };
+    let magnitude = if bits.len() <= 63 {
+        num_bigint::BigInt::from(bits.iter().fold(0i64, |acc, b| acc * 2 + i64::from(bit(b))))
+    } else {
+        // Whole bytes, most significant first, the first padded with leading zeros.
+        let pad = (8 - bits.len() % 8) % 8;
+        let bytes: Vec<u8> = std::iter::repeat_n(0u8, pad)
+            .chain(bits.iter().map(bit))
+            .collect::<Vec<u8>>()
+            .chunks(8)
+            .map(|c| c.iter().fold(0u8, |acc, b| (acc << 1) | b))
+            .collect();
+        num_bigint::BigInt::from_bytes_be(num_bigint::Sign::Plus, &bytes)
+    };
+    num::from_big(if negative { -magnitude - 1 } else { magnitude })
 }
 
 /// An IEEE 754 half-precision float.

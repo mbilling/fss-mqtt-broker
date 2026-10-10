@@ -2155,6 +2155,8 @@ dependencies = [
  "lz4",
  "md4",
  "mqtt-core",
+ "num-bigint",
+ "num-traits",
  "pcre2",
  "pcre2-sys",
  "ripemd",

@@ -395,6 +395,8 @@ impl Parser<'_> {
         };
         match self.bump() {
             Tok::Int(n) => Ok(if neg { -n } else { n }),
+            // An index past 64 bits is past any array's end: `undefined`, as in EMQX.
+            Tok::BigInt(_) => Ok(if neg { i64::MIN } else { i64::MAX }),
             _ => Err(ParseError::at(
                 self.sql,
                 self.prev_end(),
@@ -409,6 +411,7 @@ impl Parser<'_> {
         Ok(match self.bump() {
             Tok::Name(s) | Tok::QName(s) | Tok::Str(s) => s.into(),
             Tok::Int(n) => n.to_string().into(),
+            Tok::BigInt(n) => n.to_string().into(),
             Tok::Div => "div".into(),
             Tok::Mod => "mod".into(),
             Tok::Kw(_) => {
@@ -602,7 +605,11 @@ impl Parser<'_> {
         if self.eat(&Tok::Minus) {
             let (e, h) = self.nested(Self::unary)?;
             return Ok(match e {
-                Expr::Const(Value::Int(n)) => (Expr::Const(Value::Int(-n)), h),
+                // Negating never leaves the integer range (it only shrinks `-2^63`'s
+                // literal back into an `i64`).
+                Expr::Const(n @ (Value::Int(_) | Value::Big(_))) => {
+                    (Expr::Const(crate::num::int_neg(&n).unwrap_or(n)), h)
+                }
                 Expr::Const(Value::Float(f)) => (Expr::Const(Value::Float(-f)), h),
                 e => (Expr::Neg(Box::new(e)), self.node(h)?),
             });
@@ -662,7 +669,9 @@ impl Parser<'_> {
 
     fn index(&mut self) -> Result<(Seg, usize), ParseError> {
         let seg = match self.peek() {
-            Tok::Int(_) | Tok::Minus | Tok::Plus => (Seg::Index(self.signed_int()?), 0),
+            Tok::Int(_) | Tok::BigInt(_) | Tok::Minus | Tok::Plus => {
+                (Seg::Index(self.signed_int()?), 0)
+            }
             _ => {
                 let (e, h) = self.expr_h()?;
                 (Seg::IndexExpr(Box::new(e)), h)
@@ -678,6 +687,7 @@ impl Parser<'_> {
         match self.bump() {
             Tok::Str(s) => leaf(Expr::Const(Value::from(s))),
             Tok::Int(n) => leaf(Expr::Const(Value::Int(n))),
+            Tok::BigInt(n) => leaf(Expr::Const(Value::Big(n))),
             Tok::Float(f) => leaf(Expr::Const(Value::Float(f))),
             Tok::Range(lo, hi) => leaf(Expr::RangeLit(lo, hi)),
             Tok::LParen => {
