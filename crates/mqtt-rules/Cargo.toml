@@ -33,7 +33,7 @@ aws-lc-rs = { workspace = true }
 # grapheme clusters, as Erlang's `string` module (which EMQX calls) does. Pure Rust,
 # no dependencies. Held at 1.12, whose tables are Unicode 16 — the version OTP 28 (EMQX
 # 6.3) segments by; 1.13 moved to Unicode 17.
-unicode-segmentation = { version = "~1.12", default-features = false }
+unicode-segmentation = { version = "~1.13", default-features = false }
 # gzip / gunzip / zip / unzip / zip_compress / zip_uncompress. EMQX calls Erlang's
 # `zlib`, which links C zlib; C zlib (built from source, `libz-sys/static`, so no system
 # library is needed and every target links the same version) is the only backend whose
