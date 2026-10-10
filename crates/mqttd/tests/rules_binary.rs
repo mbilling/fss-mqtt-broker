@@ -2713,12 +2713,15 @@ actions = [{ function = "republish", args = { topic = "w-out/${v}" } }]
     };
     let broker = start(dir.path(), "sys-node", &setup).await;
     let mut sub = Client::connect_v5_ok(broker.addr, "watcher").await;
+    // The trace first: nothing has run a rule yet, so nothing arrives on it. Subscribed
+    // second, its SUBACK could be preceded by a statistics tick from the first
+    // subscription (every second), which the helper would read in the SUBACK's place.
     assert_eq!(
-        subscribe(&mut sub, 1, "$SYS/brokers/+/rules/#", QoS::AtMostOnce).await,
+        subscribe(&mut sub, 1, "$SYS/brokers/+/trace/rules/+", QoS::AtMostOnce).await,
         [0]
     );
     assert_eq!(
-        subscribe(&mut sub, 2, "$SYS/brokers/+/trace/rules/+", QoS::AtMostOnce).await,
+        subscribe(&mut sub, 2, "$SYS/brokers/+/rules/#", QoS::AtMostOnce).await,
         [0]
     );
     let mut publ = Client::connect_v5_ok(broker.addr, "publisher").await;
@@ -2847,8 +2850,10 @@ actions = []
         "$SYS/brokers/watch-node/trace/rules/watched",
     );
     let mut sub = Client::connect_v5_ok(broker.addr, "watcher").await;
-    assert_eq!(subscribe(&mut sub, 1, summary, QoS::AtMostOnce).await, [0]);
-    assert_eq!(subscribe(&mut sub, 2, trace, QoS::AtMostOnce).await, [0]);
+    // The trace first: it is off, so nothing arrives on it. Subscribed second, its SUBACK
+    // could be preceded by a statistics tick from the first subscription (every second).
+    assert_eq!(subscribe(&mut sub, 1, trace, QoS::AtMostOnce).await, [0]);
+    assert_eq!(subscribe(&mut sub, 2, summary, QoS::AtMostOnce).await, [0]);
     let mut publ = Client::connect_v5_ok(broker.addr, "publisher").await;
     let first = sys_where(&mut sub, summary, |_| true).await;
     assert_eq!(first["trace"], false);
