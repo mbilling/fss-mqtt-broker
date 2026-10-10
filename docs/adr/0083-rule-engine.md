@@ -480,3 +480,63 @@ own workspace stops most such patterns below 2,000 anyway); PCRE2 10.46 against 
 tests named above and `the_match_limit_is_otps_and_reaching_it_is_no_match`,
 `a_matchs_backtracking_heap_is_bounded`,
 `an_invalid_pattern_loads_with_a_warning_and_fails_each_call`.
+
+## Amendment (2026-10-10): republished messages re-enter the rules, as in EMQX
+
+§3 and the rejected "EMQX's default re-triggering" are reversed: rules are to be
+EMQX-compatible without exception, and EMQX's republish re-enters the rule engine. Checked
+against `emqx_rule_actions.erl` (`republish/3`, `safe_publish/7`, `do_safe_publish/2`,
+`republish_clientinfo/1`), `emqx_rule_engine_schema.erl`, `emqx_broker.erl`
+(`safe_publish2/2`, `publish2/2`, `eval_hook_and_publish/2`) and
+`emqx_rule_events:eventmsg_publish/1` (emqx/emqx master), and probed on EMQX 6.3.1.
+
+- **`direct_dispatch = false`, the default, re-enters.** EMQX publishes the message through
+  `safe_publish2(Msg, #{bypass_hook => false})`, so the `message.publish` hook — every
+  rule — runs on it. mqttd evaluates it on the task that evaluated the message it came
+  from (the connection task, or the hub for a Will), never the hub loop for client
+  publishes, as the original is. The rules see EMQX's fields: `clientid` is the rule id,
+  `username`, `peerhost` and `peername` are `undefined`, `pub_props` are the action's,
+  `flags` are the trigger's with the action's `retain` (`{"retain": …}` alone in a chain
+  started by an event, which has no `flags`), `publish_received_at` is when it was
+  republished. `SELECT *` now shows an `undefined` `username`, `peerhost` and `peername`,
+  as EMQX's `eventmsg_publish/1` always sets them, for client messages too.
+- **The guards.** EMQX's own: a rule does not run its `republish` actions on a message it
+  republished (`republish_by` = its id; `recursive_republish_detected`, counted as a
+  successful action); the rule itself still runs. EMQX has no other: two rules
+  republishing into each other recurse in the publisher's process until it reaches its
+  heap limit and is killed (6.3.1: about 1,500 rounds, the connection dropped, nothing
+  delivered). mqttd stops a chain **32 republishes** deep instead (`MAX_REPUBLISH_DEPTH`):
+  the message 32 deep is evaluated, its `republish` actions fail. Both are counted in
+  `mqttd_rule_recursive_republish_total{rule,guard}` (`same_rule`, `depth`).
+- **Amplification.** The original's per-message limits (1,024 effects; 4 MiB plus four
+  times its payload) cover the whole tree, through a `Budget` shared by every evaluation
+  it leads to, so a chain or a loop cannot multiply a publish further than one rule could.
+- **Acknowledgement and durability are unchanged.** The whole tree travels in the
+  original's one `PublishBatch`, charged to its ingress credit, each QoS ≥ 1 message gated
+  behind a QoS ≥ 1 original. What an event or a Will leads to goes out ungated, as before.
+- **Order.** EMQX routes a republished message inside the original's publish hook, so
+  before the original, and its own republishes before it (`t/a` → `t/b` → `out/b` is
+  delivered `out/b`, `t/b`, `t/a`). Routing the original after what it derived would
+  break the rule that a refused original routes nothing it derived, so the hub still
+  routes the original first; the derived messages follow in EMQX's order, each after what
+  it caused (`t/a`, `out/b`, `t/b`).
+- **`direct_dispatch = true`** skips the rules, and the retained store: EMQX's retainer is
+  a `message.publish` hook, which direct dispatch bypasses (6.3.1 delivered the message
+  live and kept no retained copy). It is delivered live with the retain flag clear, as an
+  over-quota retained derived message already is.
+- **A templated `direct_dispatch`** (`union([boolean(), template()])`) is rendered per
+  message: only a boolean `true` is true; a missing value is the default `false`, and any
+  other value is `false` (EMQX logs `bad_direct_dispatch_resolved_value`). A literal string
+  other than `"true"`, `"false"` or `""` loads with a warning.
+
+Pinned by `a_republished_message_is_seen_as_emqx_shows_it`,
+`a_message_republished_from_an_event_has_no_dup_flag`,
+`a_rule_does_not_republish_its_own_republished_message`,
+`republishing_stops_at_the_depth_cap`, `the_budget_spans_every_reentry` and
+`direct_dispatch_renders_per_message` (mqtt-rules), and end to end by
+`a_republished_message_runs_the_rules_that_select_it`,
+`a_rule_republishing_into_its_own_from_cannot_loop`,
+`rules_republishing_into_each_other_stop_at_the_depth_cap`,
+`direct_dispatch_skips_the_rules_and_the_retained_store`,
+`a_templated_direct_dispatch_is_rendered_per_message` and
+`a_message_republished_from_an_event_runs_the_rules` (`tests/rules.rs`).

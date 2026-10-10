@@ -17,7 +17,7 @@ use bytes::Bytes;
 use mqtt_core::AppProperties;
 
 use crate::value::{Map, Value};
-use crate::Input;
+use crate::{Input, Republish};
 
 /// A client/session event a rule can select `FROM` (`"$events/…"`).
 ///
@@ -435,6 +435,16 @@ pub struct PublishInput<'a> {
     pub received_at_ms: Option<i64>,
     /// This node's id.
     pub node: &'a str,
+    /// For a message a rule republished, that rule (EMQX's `republish_by` header): the
+    /// rule does not republish it again.
+    pub republished_by: Option<&'a str>,
+    /// How many republishes this message is from the client's publish, the Will or the
+    /// event that started it: 0 for those, 1 for what their rules republished, and so
+    /// on (see [`crate::MAX_REPUBLISH_DEPTH`]).
+    pub republish_depth: u32,
+    /// Whether `flags` has `dup` (always `false`): every message but one republished
+    /// from an event, or from a message that was ([`Republish::dup_flag`]).
+    pub dup_flag: bool,
     id: OnceCell<Arc<str>>,
     received: OnceCell<i64>,
     /// `timestamp`, read once per message so every reference agrees.
@@ -466,11 +476,33 @@ impl<'a> PublishInput<'a> {
             message_expiry: None,
             received_at_ms: None,
             node: "",
+            republished_by: None,
+            republish_depth: 0,
+            dup_flag: true,
             id: OnceCell::new(),
             received: OnceCell::new(),
             stamped: OnceCell::new(),
             pub_props: OnceCell::new(),
         }
+    }
+
+    /// The message `rule` republished, as the rules see it when it re-enters the rule
+    /// engine (`direct_dispatch = false`), `depth` republishes from the original.
+    ///
+    /// EMQX publishes it as a message from `emqx_rule_actions:republish_clientinfo/1`
+    /// (`emqx_rule_actions:safe_publish/7`): its `clientid` is the rule's id, and it has
+    /// no `username`, `peerhost` or `peername` (`undefined`); `pub_props` are the ones
+    /// the action set, `publish_received_at` is when it was republished, and `flags`
+    /// are the trigger's with the action's `retain` ([`Republish::dup_flag`]).
+    #[must_use]
+    pub fn republished(rule: &'a str, r: &'a Republish, depth: u32) -> Self {
+        let mut input = Self::new(rule, &r.topic, &r.payload, r.qos, &r.app);
+        input.retain = r.retain;
+        input.message_expiry = r.message_expiry;
+        input.republished_by = Some(rule);
+        input.republish_depth = depth;
+        input.dup_flag = r.dup_flag;
+        input
     }
 
     fn received_at(&self) -> i64 {
@@ -483,7 +515,9 @@ impl<'a> PublishInput<'a> {
     /// the DUP flag a publisher set — a resent message is the same message.
     fn flags(&self) -> Value {
         let mut f = Map::with_capacity(2);
-        f.insert("dup", Value::Bool(false));
+        if self.dup_flag {
+            f.insert("dup", Value::Bool(false));
+        }
         f.insert("retain", Value::Bool(self.retain));
         Value::from(f)
     }
@@ -538,13 +572,14 @@ impl Input for PublishInput<'_> {
         }
     }
 
+    /// Every field, `username`, `peerhost` and `peername` included when they are
+    /// `undefined`: EMQX's `eventmsg_publish/1` always sets them, so `SELECT *` shows
+    /// `"username":"undefined"` for a client that sent none, and all three for a
+    /// republished message.
     fn all_fields(&self) -> Map {
         let mut m = Map::with_capacity(PUBLISH_FIELDS.len() + 1);
         for f in PUBLISH_FIELDS {
-            let v = self.field(f);
-            if !v.is_undefined() {
-                m.insert(*f, v);
-            }
+            m.insert(*f, self.field(f));
         }
         m
     }
@@ -555,6 +590,18 @@ impl Input for PublishInput<'_> {
 
     fn user_properties(&self) -> &[(String, String)] {
         &self.props.user_properties
+    }
+
+    fn republished_by(&self) -> Option<&str> {
+        self.republished_by
+    }
+
+    fn republish_depth(&self) -> u32 {
+        self.republish_depth
+    }
+
+    fn has_dup_flag(&self) -> bool {
+        self.dup_flag
     }
 }
 

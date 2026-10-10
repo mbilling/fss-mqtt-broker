@@ -4,8 +4,9 @@
 //! prove the broker around it — that a rule's output is delivered at every `QoS`, that a
 //! `QoS` 1/2 publisher's acknowledgement waits for what its rules produced and answers
 //! with the original's own fate, that a refused original routes nothing it derived, that a
-//! `QoS` 2 publish fires its rules once across a DUP resend, that a republished message can never
-//! re-trigger a rule, that Wills and client events run rules, and that in a cluster each
+//! `QoS` 2 publish fires its rules once across a DUP resend, that a republished message
+//! re-enters the rules as EMQX's does (bounded by EMQX's same-rule guard and a depth
+//! cap), that Wills and client events run rules, and that in a cluster each
 //! message is evaluated exactly once — on the node it arrived at — while its derived
 //! messages reach subscribers anywhere.
 
@@ -587,9 +588,20 @@ async fn an_idle_connection_releases_a_superseded_rule_set_when_it_pings() {
     );
 }
 
-/// A republished message never re-enters the rule engine (EMQX's `direct_dispatch`,
-/// always on): a rule that republishes into its own FROM produces exactly one message,
-/// not a loop.
+/// `mqttd_rule_recursive_republish_total{rule,guard}`, as rendered.
+fn recursion_count(broker: &Broker, rule: &str, guard: &str) -> u64 {
+    let text = broker.metrics.render();
+    let key = format!(r#"mqttd_rule_recursive_republish_total{{rule="{rule}",guard="{guard}"}} "#);
+    text.lines()
+        .find_map(|l| l.strip_prefix(key.as_str()))
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+/// EMQX's guard: a rule republishing into its own FROM does not republish its own
+/// message again (`recursive_republish_detected`), so it produces exactly one message,
+/// not a loop. EMQX counts the skipped action a success; it is also counted as a
+/// `same_rule` recursion.
 #[tokio::test]
 async fn a_rule_republishing_into_its_own_from_cannot_loop() {
     let broker = start_broker(
@@ -608,6 +620,267 @@ async fn a_rule_republishing_into_its_own_from_cannot_loop() {
     assert_eq!(next_publish(&mut sub).await.0, "loop/a");
     assert_eq!(next_publish(&mut sub).await.0, "loop/loop/a");
     sub.expect_silence().await;
+    assert_eq!(recursion_count(&broker, "echo", "same_rule"), 1);
+    assert_eq!(action_count(&broker, "echo", "ok"), 2, "routed + guarded");
+    assert_eq!(action_count(&broker, "echo", "failed"), 0);
+}
+
+/// Rules chain as in EMQX: rule A's republished message is a new message rule B
+/// selects, seen as EMQX shows it — from the client named after rule A, with no
+/// username or address. EMQX 6.3.1 routes it inside the original's publish hook, so a
+/// subscriber there sees `out/b`, `t/b`, `t/a`; here the original goes first and the
+/// derived messages follow in EMQX's order — each after the message it caused.
+#[tokio::test]
+async fn a_republished_message_runs_the_rules_that_select_it() {
+    let broker = start_broker(
+        r#"
+        [rules.rA]
+        sql = 'SELECT * FROM "t/a"'
+        actions = [{ function = "republish", args = { topic = "t/b", qos = 1, payload = "${payload}-A" } }]
+
+        [rules.rB]
+        sql = 'SELECT clientid, username, peerhost, topic, qos, payload, flags FROM "t/b"'
+        actions = [{ function = "republish", args = { topic = "out/b", payload = "${.}" } }]
+        "#,
+    )
+    .await;
+    let mut sub = Client::connect(broker.addr, "sub-chain").await;
+    sub.subscribe(1, "t/#", QoS::AtLeastOnce).await;
+    sub.subscribe(2, "out/#", QoS::AtLeastOnce).await;
+    let mut publ = Client::connect(broker.addr, "pub-chain").await;
+    publ.publish("t/a", b"hello", QoS::AtLeastOnce, Some(7), vec![])
+        .await;
+    assert_eq!(publ.recv().await, Packet::PubAck(7.into()));
+    let mut got = Vec::new();
+    for _ in 0..3 {
+        let p = sub.expect_publish().await;
+        if let Some(id) = p.pkid {
+            sub.puback(id).await;
+        }
+        got.push((p.topic, String::from_utf8(p.payload.to_vec()).unwrap()));
+    }
+    sub.expect_silence().await;
+    assert_eq!(got[0], ("t/a".into(), "hello".into()));
+    assert_eq!(got[1].0, "out/b");
+    assert_eq!(got[2], ("t/b".into(), "hello-A".into()));
+    let seen: serde_json::Value = serde_json::from_str(&got[1].1).unwrap();
+    assert_eq!(
+        seen,
+        serde_json::json!({
+            "clientid": "rA",
+            "username": "undefined",
+            "peerhost": "undefined",
+            "topic": "t/b",
+            "qos": 1,
+            "payload": "hello-A",
+            "flags": {"dup": false, "retain": false},
+        })
+    );
+    assert_eq!(action_count(&broker, "rA", "ok"), 1);
+    assert_eq!(action_count(&broker, "rB", "ok"), 1);
+}
+
+/// Two rules republishing into each other's FROM: EMQX guards only a rule's own output,
+/// so there they recurse until the publisher's process is killed (EMQX 6.3.1: about
+/// 1,500 rounds, then the connection drops and nothing is delivered). Here the chain
+/// stops 32 republishes deep: the original and 32 derived messages are delivered, the
+/// 33rd republish is counted as a failed action and a `depth` recursion, and the
+/// publisher is acked.
+#[tokio::test]
+async fn rules_republishing_into_each_other_stop_at_the_depth_cap() {
+    let broker = start_broker(
+        r#"
+        [rules.rP]
+        sql = 'SELECT * FROM "p/a"'
+        actions = [{ function = "republish", args = { topic = "p/b", qos = 1 } }]
+
+        [rules.rQ]
+        sql = 'SELECT * FROM "p/b"'
+        actions = [{ function = "republish", args = { topic = "p/a", qos = 1 } }]
+        "#,
+    )
+    .await;
+    let depth = mqtt_rules::MAX_REPUBLISH_DEPTH;
+    assert_eq!(depth, 32);
+    let mut sub = Client::connect(broker.addr, "sub-pq").await;
+    sub.subscribe(1, "p/#", QoS::AtMostOnce).await;
+    let mut publ = Client::connect(broker.addr, "pub-pq").await;
+    publ.publish("p/a", b"loop", QoS::AtLeastOnce, Some(3), vec![])
+        .await;
+    assert_eq!(publ.recv().await, Packet::PubAck(3.into()));
+    let mut topics = Vec::new();
+    for _ in 0..=depth {
+        topics.push(next_publish(&mut sub).await.0);
+    }
+    sub.expect_silence().await;
+    assert_eq!(topics.iter().filter(|t| *t == "p/a").count(), 17);
+    assert_eq!(topics.iter().filter(|t| *t == "p/b").count(), 16);
+    // The 32nd message is p/a (from rQ); rP is the rule that stops on it.
+    assert_eq!(recursion_count(&broker, "rP", "depth"), 1);
+    assert_eq!(recursion_count(&broker, "rQ", "depth"), 0);
+    assert_eq!(action_count(&broker, "rP", "failed"), 1);
+    assert_eq!(action_count(&broker, "rP", "ok"), 16);
+    assert_eq!(action_count(&broker, "rQ", "ok"), 16);
+}
+
+/// The original's limits cover everything it leads to: 1,024 effects across the rules
+/// it runs and the rules its republished messages run. 200 messages fanned out, each
+/// republished five times more, is 1,200; the last 176 fail as actions, and the
+/// publisher's PUBACK — which waits for every gated one — still comes.
+#[tokio::test]
+async fn the_original_s_limits_cover_the_whole_chain() {
+    let broker = start_broker(
+        r#"
+        [rules.fan]
+        sql = 'FOREACH payload.xs AS x DO x AS v FROM "fan/in"'
+        actions = [{ function = "republish", args = { topic = "fan/x", qos = 1, payload = "${v}" } }]
+
+        [rules.fan2]
+        sql = 'SELECT payload FROM "fan/x"'
+        actions = [
+          { function = "republish", args = { topic = "fan/out/1", qos = 1 } },
+          { function = "republish", args = { topic = "fan/out/2", qos = 1 } },
+          { function = "republish", args = { topic = "fan/out/3", qos = 1 } },
+          { function = "republish", args = { topic = "fan/out/4", qos = 1 } },
+          { function = "republish", args = { topic = "fan/out/5", qos = 1 } },
+        ]
+        "#,
+    )
+    .await;
+    let xs = vec!["1"; 200].join(",");
+    let mut publ = Client::connect(broker.addr, "pub-fan").await;
+    publ.publish(
+        "fan/in",
+        format!(r#"{{"xs":[{xs}]}}"#).as_bytes(),
+        QoS::AtLeastOnce,
+        Some(9),
+        vec![],
+    )
+    .await;
+    assert_eq!(publ.recv().await, Packet::PubAck(9.into()));
+    assert_eq!(action_count(&broker, "fan", "ok"), 200);
+    assert_eq!(action_count(&broker, "fan2", "ok"), 1024 - 200);
+    assert_eq!(action_count(&broker, "fan2", "failed"), 1000 - (1024 - 200));
+}
+
+/// `direct_dispatch = true` sends a message straight to subscribers, as EMQX's skips
+/// its `message.publish` hook: no rule sees it, and it is not retained (EMQX 6.3.1
+/// delivered `d/b` live, ran no rule on it and kept no retained copy). With the default
+/// `false`, the same message runs the rules and is retained.
+#[tokio::test]
+async fn direct_dispatch_skips_the_rules_and_the_retained_store() {
+    let broker = start_broker(
+        r#"
+        [rules.direct]
+        sql = 'SELECT * FROM "d/a"'
+        actions = [{ function = "republish", args = { topic = "d/b", retain = true, payload = "${payload}", direct_dispatch = true } }]
+
+        [rules.normal]
+        sql = 'SELECT * FROM "r/a"'
+        actions = [{ function = "republish", args = { topic = "r/b", retain = true, payload = "${payload}" } }]
+
+        [rules.observe]
+        sql = 'SELECT topic FROM "d/b", "r/b"'
+        actions = [{ function = "republish", args = { topic = "obs/${topic}" } }]
+        "#,
+    )
+    .await;
+    let mut sub = Client::connect(broker.addr, "sub-dd").await;
+    sub.subscribe(1, "d/#", QoS::AtMostOnce).await;
+    sub.subscribe(2, "r/#", QoS::AtMostOnce).await;
+    sub.subscribe(3, "obs/#", QoS::AtMostOnce).await;
+    let mut publ = Client::connect(broker.addr, "pub-dd").await;
+    publ.publish("d/a", b"direct", QoS::AtLeastOnce, Some(1), vec![])
+        .await;
+    assert_eq!(publ.recv().await, Packet::PubAck(1.into()));
+    assert_eq!(next_publish(&mut sub).await.0, "d/a");
+    assert_eq!(next_publish(&mut sub).await.0, "d/b");
+    sub.expect_silence().await;
+    publ.publish("r/a", b"normal", QoS::AtLeastOnce, Some(2), vec![])
+        .await;
+    assert_eq!(publ.recv().await, Packet::PubAck(2.into()));
+    assert_eq!(next_publish(&mut sub).await.0, "r/a");
+    assert_eq!(next_publish(&mut sub).await.0, "obs/r/b");
+    assert_eq!(next_publish(&mut sub).await.0, "r/b");
+    sub.expect_silence().await;
+    assert_eq!(action_count(&broker, "observe", "ok"), 1);
+
+    let mut late = Client::connect(broker.addr, "late-dd").await;
+    late.subscribe(1, "d/b", QoS::AtMostOnce).await;
+    late.expect_silence().await;
+    late.subscribe(2, "r/b", QoS::AtMostOnce).await;
+    let p = late.expect_publish().await;
+    assert_eq!((p.topic.as_str(), p.retain), ("r/b", true));
+}
+
+/// A templated `direct_dispatch` is rendered per message, as EMQX's
+/// `union([boolean(), template()])`: `true` dispatches directly, `false` re-enters, and
+/// any other value is `false` (EMQX 6.3.1 logs `bad_direct_dispatch_resolved_value` for
+/// `"yes"` and republishes it through the rules).
+#[tokio::test]
+async fn a_templated_direct_dispatch_is_rendered_per_message() {
+    let broker = start_broker(
+        r#"
+        [rules.rT]
+        sql = 'SELECT payload.dd AS dd, payload FROM "tt/#"'
+        actions = [{ function = "republish", args = { topic = "tt2/x", payload = "${payload}", direct_dispatch = "${dd}" } }]
+
+        [rules.rT2]
+        sql = 'SELECT payload FROM "tt2/#"'
+        actions = [{ function = "republish", args = { topic = "obs/tt", payload = "${payload}" } }]
+        "#,
+    )
+    .await;
+    let mut sub = Client::connect(broker.addr, "sub-tt").await;
+    sub.subscribe(1, "obs/#", QoS::AtMostOnce).await;
+    let mut publ = Client::connect(broker.addr, "pub-tt").await;
+    for (i, payload) in [r#"{"dd":true}"#, r#"{"dd":false}"#, r#"{"dd":"yes"}"#, "{}"]
+        .into_iter()
+        .enumerate()
+    {
+        let id = u16::try_from(i + 1).unwrap();
+        publ.publish(
+            "tt/1",
+            payload.as_bytes(),
+            QoS::AtLeastOnce,
+            Some(id),
+            vec![],
+        )
+        .await;
+        assert_eq!(publ.recv().await, Packet::PubAck(id.into()));
+    }
+    let mut seen = Vec::new();
+    for _ in 0..3 {
+        seen.push(String::from_utf8(next_publish(&mut sub).await.1).unwrap());
+    }
+    sub.expect_silence().await;
+    assert_eq!(seen, [r#"{"dd":false}"#, r#"{"dd":"yes"}"#, "{}"]);
+}
+
+/// What an event's rule republishes re-enters the rules too, with EMQX's `flags` for it
+/// — `{"retain": …}` alone, since an event has none to copy (EMQX 6.3.1).
+#[tokio::test]
+async fn a_message_republished_from_an_event_runs_the_rules() {
+    let broker = start_broker(
+        r#"
+        [rules.rE]
+        sql = '''SELECT * FROM "$events/client_connected" WHERE clientid = 'evc' '''
+        actions = [{ function = "republish", args = { topic = "e/b", payload = "ev" } }]
+
+        [rules.rEB]
+        sql = 'SELECT clientid, flags, payload FROM "e/b"'
+        actions = [{ function = "republish", args = { topic = "obs/e", payload = "${.}" } }]
+        "#,
+    )
+    .await;
+    let mut sub = Client::connect(broker.addr, "sub-ev").await;
+    sub.subscribe(1, "obs/#", QoS::AtMostOnce).await;
+    let _evc = Client::connect(broker.addr, "evc").await;
+    let seen: serde_json::Value = serde_json::from_slice(&next_publish(&mut sub).await.1).unwrap();
+    assert_eq!(
+        seen,
+        serde_json::json!({"clientid": "rE", "flags": {"retain": false}, "payload": "ev"})
+    );
 }
 
 /// FOREACH fans one publish out into one message per array element.

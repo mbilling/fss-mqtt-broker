@@ -9,7 +9,7 @@
 //! | `payload` | `"${payload}"` | template; empty = the whole output as JSON |
 //! | `user_properties` | `"${user_properties}"` | a placeholder naming a map; `${pub_props.'User-Property'}` = the publisher's, in wire order |
 //! | `mqtt_properties` | none | `Payload-Format-Indicator`, `Message-Expiry-Interval`, `Content-Type`, `Response-Topic`, `Correlation-Data` |
-//! | `direct_dispatch` | — | accepted; mqttd *always* dispatches directly (a republished message never re-enters the rule engine) |
+//! | `direct_dispatch` | `false` | bool or a placeholder; `false` (or any value that is not `true`) = the message re-enters the rule engine, as in EMQX |
 //!
 //! There are no external sinks (Kafka, HTTP, databases): ADR 0083 keeps them out, and
 //! an action naming one is refused at load.
@@ -63,6 +63,7 @@ pub(crate) struct RepublishSpec {
     payload: Template,
     user_properties: UserProps,
     props: Vec<(Prop, Template)>,
+    direct_dispatch: Simple,
 }
 
 /// A message an action asks the broker to publish.
@@ -81,6 +82,16 @@ pub struct Republish {
     pub app: AppProperties,
     /// MQTT 5 Message Expiry Interval, when the action set one.
     pub message_expiry: Option<u32>,
+    /// EMQX's `direct_dispatch`, rendered: `true` sends it straight to subscribers —
+    /// the rule engine does not see it again and it is not retained. `false` (the
+    /// default) publishes it as a new message, which the rules evaluate in turn
+    /// ([`PublishInput::republished`](crate::PublishInput::republished)).
+    pub direct_dispatch: bool,
+    /// Whether its `flags` carry `dup` when the rules see it. EMQX copies the trigger's
+    /// `flags` into a republished message: a message has `dup` and `retain`, while an
+    /// event has no `flags`, so a message republished from an event shows only
+    /// `{"retain": …}`.
+    pub dup_flag: bool,
 }
 
 /// What an action produced.
@@ -297,15 +308,7 @@ fn parse_republish(
             props.push((prop, Template::parse(&text)?));
         }
     }
-    match args.get("direct_dispatch") {
-        None | Some(toml::Value::Boolean(true)) => {}
-        Some(toml::Value::Boolean(false)) => warnings.push(
-            "direct_dispatch = false is accepted but has no effect: mqttd never feeds a \
-             republished message back into the rule engine, so a rule cannot loop (ADR 0083)"
-                .into(),
-        ),
-        Some(_) => return Err("`direct_dispatch` must be a boolean".into()),
-    }
+    let direct_dispatch = direct_dispatch(args.get("direct_dispatch"), warnings)?;
     Ok(RepublishSpec {
         topic,
         qos: checked(simple(args.get("qos"), "${qos}", "qos")?, |v| {
@@ -317,7 +320,38 @@ fn parse_republish(
         payload,
         user_properties,
         props,
+        direct_dispatch,
     })
+}
+
+/// A republish's `direct_dispatch`: EMQX's `union([boolean(), template()])`, default
+/// `false`. A boolean, its text, or one placeholder rendered per message; an empty
+/// string is the default. Any other literal is accepted, as EMQX accepts it, and is
+/// `false` on every message — with a warning here, where EMQX logs an error per
+/// message.
+fn direct_dispatch(v: Option<&toml::Value>, warnings: &mut Vec<String>) -> Result<Simple, String> {
+    match v {
+        None => Ok(Simple::Const(Value::Bool(false))),
+        Some(toml::Value::Boolean(b)) => Ok(Simple::Const(Value::Bool(*b))),
+        Some(toml::Value::String(s)) => match s.as_str() {
+            "" | "false" => Ok(Simple::Const(Value::Bool(false))),
+            "true" => Ok(Simple::Const(Value::Bool(true))),
+            _ => {
+                let parsed = simple(Some(&toml::Value::String(s.clone())), "", "direct_dispatch")?;
+                if let Simple::Const(_) = parsed {
+                    warnings.push(format!(
+                        "direct_dispatch \"{s}\" is neither a boolean nor a placeholder: it is \
+                         false on every message, as in EMQX"
+                    ));
+                    return Ok(Simple::Const(Value::Bool(false)));
+                }
+                Ok(parsed)
+            }
+        },
+        Some(other) => Err(format!(
+            "`direct_dispatch` must be a boolean or a placeholder, not {other}"
+        )),
+    }
 }
 
 impl RepublishSpec {
@@ -396,6 +430,9 @@ impl RepublishSpec {
                 Prop::CorrelationData => app.correlation_data = Some(Bytes::from(raw)),
             }
         }
+        // EMQX: a value that is not a boolean is `false` (and logged there); a missing
+        // one is the default, `false`.
+        let direct_dispatch = matches!(resolve(&self.direct_dispatch, out), Value::Bool(true));
         Ok(Republish {
             topic,
             payload,
@@ -403,6 +440,8 @@ impl RepublishSpec {
             retain,
             app,
             message_expiry,
+            direct_dispatch,
+            dup_flag: input.has_dup_flag(),
         })
     }
 }

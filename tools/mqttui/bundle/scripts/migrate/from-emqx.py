@@ -2861,9 +2861,10 @@ def render_rules(conv: Conversion) -> str:
         "# and try a statement against a sample message with `mqttd --rule-test`.",
         "#",
         "# Differences worth knowing before cutover (docs/RULES.md has the full list): a",
-        "# republished message never re-triggers a rule (EMQX's direct_dispatch, always on);",
-        "# there are no data-integration sinks; a rule that calls a function or selects an",
-        "# event mqttd lacks is emitted COMMENTED OUT below with the reason.",
+        "# republished message re-enters the rules as in EMQX (direct_dispatch = false), but",
+        "# a chain stops 32 republishes deep; there are no data-integration sinks; a rule",
+        "# that calls a function or selects an event mqttd lacks is emitted COMMENTED OUT",
+        "# below with the reason.",
         "",
     ]
     for t in conv.rule_todos:
