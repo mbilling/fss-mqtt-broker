@@ -31,8 +31,10 @@ tasks:
     issue: 921
   - id: 0085-T6
     title: "Observability and admin: state metrics, per-namespace $SYS statistics, the admin state endpoints and the mqttd --admin state verbs"
-    status: in-progress
+    status: done
     issue: 922
+    date: 2026-10-11
+    evidence: "PR 948: crates/mqttd/src/rule_state/admin.rs and crates/mqttd/src/admin/state.rs (the overview for a viewer, the paged key listing and single-key read for an operator, the audited delete for an operator who is a listed rules writer, replicated in an eventual namespace), the CLI verbs state, state-keys, state-get and state-del with control characters escaped, the mqttd_rule_state_* series and $SYS/brokers/<node>/rule_state/<namespace> with no key and no value; tests for roles, paging under concurrent writes and merges, the key and value representation round trip, the audit record (key_sha256 and key_bytes) and a three-node delete that converges; the rule_state inspect benchmark."
   - id: 0085-T7
     title: "mqttd --rule-test --sequence: timed sequences replayed through a statement or a rules file against an in-memory store with a driven clock"
     status: in-progress
@@ -131,7 +133,7 @@ and T15 carries the documentation of these three.
 | 0085-T3 | ✅ done | [#919](https://github.com/mbilling/fss-mqtt-broker/issues/919) | 2026-10-11 | "PR 950: crates/mqttd/src/rule_state/replica.rs and link.rs (changed keys read per link with no per-link queue, repair by a 1,024-part digest, refusals counted by reason), peer protocol 14 with StateKeys, StateDigest and StateWant pinned in crates/mqtt-cluster/src/peer.rs; tests_replica and crates/mqttd/tests/rules_state_cluster.rs (convergence, restart refill, declaration mismatch, bounds, a v13 peer sent nothing); the rule_state benchmark (publish with one kv_incr 1.80 us local, 1.84 us eventual; 100k keys caught up in 0.14 s on loopback, Apple M1 Pro); the ADR amended for what T3 decided." |
 | 0085-T4 | ⬜ planned | [#920](https://github.com/mbilling/fss-mqtt-broker/issues/920) | — |  |
 | 0085-T5 | ⬜ planned | [#921](https://github.com/mbilling/fss-mqtt-broker/issues/921) | — |  |
-| 0085-T6 | 🚧 in-progress | [#922](https://github.com/mbilling/fss-mqtt-broker/issues/922) | — |  |
+| 0085-T6 | ✅ done | [#922](https://github.com/mbilling/fss-mqtt-broker/issues/922) | 2026-10-11 | "PR 948: crates/mqttd/src/rule_state/admin.rs and crates/mqttd/src/admin/state.rs (the overview for a viewer, the paged key listing and single-key read for an operator, the audited delete for an operator who is a listed rules writer, replicated in an eventual namespace), the CLI verbs state, state-keys, state-get and state-del with control characters escaped, the mqttd_rule_state_* series and $SYS/brokers/<node>/rule_state/<namespace> with no key and no value; tests for roles, paging under concurrent writes and merges, the key and value representation round trip, the audit record (key_sha256 and key_bytes) and a three-node delete that converges; the rule_state inspect benchmark." |
 | 0085-T7 | 🚧 in-progress | [#923](https://github.com/mbilling/fss-mqtt-broker/issues/923) | — |  |
 | 0085-T8 | ⬜ planned | [#924](https://github.com/mbilling/fss-mqtt-broker/issues/924) | — |  |
 | 0085-T9 | ⬜ planned | [#925](https://github.com/mbilling/fss-mqtt-broker/issues/925) | — |  |
