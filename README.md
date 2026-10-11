@@ -342,7 +342,7 @@ Plaintext + anonymous: a first look, never a deployment. Secured version (TLS 1.
 | Integrations | |
 |---|---|
 | Bridge | `mqtt-bridge`: separate signed binary/image, deny-by-default directional rules, loop prevention, bounded spool, HA pairs |
-| Rule engine | EMQX-compatible rule SQL: filter, transform and re-route at QoS 0/1/2, evaluated once per message on the node it arrived at; opt-in per-rule statistics and trace on `$SYS`, rules editable through the admin API; unreleased ([RULES.md](docs/RULES.md), [cookbook](docs/RULES-COOKBOOK.md), [live demo](demo/rules-live/README.md)) |
+| Rule engine | EMQX-compatible rule SQL: filter, transform and re-route at QoS 0/1/2, evaluated once per message on the node it arrived at; opt-in per-rule statistics and trace on `$SYS`, rules editable through the admin API; EMQX's `jq` function (the real jq, in a WebAssembly sandbox, off unless switched on) and functions of your own as WebAssembly modules pinned by hash; unreleased ([RULES.md](docs/RULES.md), [cookbook](docs/RULES-COOKBOOK.md), [live demo](demo/rules-live/README.md)) |
 | Kafka / webhook / DB | `$share` consumer group on durable sessions ([INTEGRATION.md](docs/INTEGRATION.md)); the rule engine has no sinks, by design |
 | Migration | converters for Mosquitto, EMQX, HiveMQ configs + ACLs → reviewed draft ([MIGRATION.md](docs/MIGRATION.md)) |
 | Plugins | HTTP auth hook; `Authenticator` / `Authorizer` traits; no dynamic loader |

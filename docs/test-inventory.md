@@ -2414,7 +2414,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `with_config_watch_an_edited_rules_file_is_picked_up_without_a_signal`
 - `writers_for_a_rules_directory_the_broker_cannot_write_in_are_warned_about` — only when `cfg(unix)`
 
-## `crates/mqttd/tests/rules_cookbook.rs` — 11 test(s)
+## `crates/mqttd/tests/rules_cookbook.rs` — 12 test(s)
 
 - `every_recipe_does_on_the_real_broker_what_the_cookbook_shows`
 - `every_recipe_file_has_a_case_and_every_case_a_file`
@@ -2424,6 +2424,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `recipe_01_rule_test_runs_a_statement_offline`
 - `the_gotchas_the_cookbook_states_hold`
 - `the_header_check_rejects_a_header_that_does_not_match`
+- `the_jq_recipes_and_their_plain_sql_rewrites_print_what_the_cookbook_shows`
 - `the_page_shows_exactly_the_blocks_this_suite_runs`
 - `the_pattern_matcher_checks_rendered_times`
 - `without_their_guards_the_recipes_do_what_the_cookbook_warns`
@@ -2445,10 +2446,12 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `the_simulator_is_deterministic`
 - `the_simulators_mqtt_client_bounds_its_waits_and_reads_while_idle`
 
-## `crates/mqttd/tests/rules_docs.rs` — 5 test(s)
+## `crates/mqttd/tests/rules_docs.rs` — 7 test(s)
 
+- `documented_jq_transcripts_match_the_binary`
 - `documented_rule_test_and_check_rules_transcripts_match_the_binary`
 - `documented_rules_snippets_load`
+- `documented_rules_snippets_that_call_jq_load_where_jq_is_on`
 - `the_extraction_finds_every_documented_rules_file_and_snippet`
 - `the_extraction_recognises_every_documented_form`
 - `the_extraction_refuses_what_it_cannot_run`

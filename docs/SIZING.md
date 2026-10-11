@@ -62,6 +62,16 @@ RSS ≈ base (~15 MiB idle + ~24 KiB per idle connection — see the note below)
         outbound channel:      max_outbound_bytes, else up to 10 000 packets × avg_msg
 ```
 
+Rule functions in the WebAssembly sandbox add to this only where they are used
+(`[rules] jq = true` with rules that call `jq`, or a rules file that declares modules;
+neither by default, [RULES.md](RULES.md#what-jq-costs)): 7 to 42 MiB once, depending on
+the allocator, when the jq module is compiled; about 1.1 MiB resident (3.4 to 3.8 MiB of
+linear memory) per warm `jq` instance, one per worker thread; and, for every call that
+is running long at that moment, one more instance of up to 64 MiB (`jq`) or the module's
+`memory_mib`. The last term has no cap but the calls' timeouts and the number of
+connections publishing to such rules: bound it with those, and leave room for it under
+the cgroup limit.
+
 The three per-subscriber terms **over**-count rather than under-count: payloads are
 refcounted, so a message counted in both the in-flight table and the outbound channel holds
 one allocation. The `+ 256` is the per-entry envelope the byte accounting charges, and the

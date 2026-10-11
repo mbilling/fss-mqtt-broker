@@ -413,6 +413,25 @@ topic or payload.
   rejected with `security reload REJECTED — keeping the running policy … error=rules: …`,
   and the old rules keep running. Rules written into `mqttd.toml` itself refuse the boot:
   they belong in their own file, named by `[rules] file`.
+- **The file does not load, and the error is about `jq`.**
+  ``jq is switched off: set `rules.jq = true` to use it``: the function is off by default;
+  set `[rules] jq = true` (`MQTTD_RULES_JQ=1`) on every node and restart (it is read at
+  startup).
+  `jq is not available: the WebAssembly compiler cannot run on this host`: the switch
+  is on and the host forbids executable memory; under the shipped systemd unit set
+  `MemoryDenyWriteExecute=false` in a drop-in, elsewhere lift the seccomp or SELinux
+  rule. The same message without `jq is not available` is about a module the file
+  declares (`[functions.<name>]`), with the same fix. `this mqttd was built without the
+  jq module`: a build from source without the module; `this mqttd was built without
+  jq`: a build without the runtime. `mqttd --check-config`, run under the service's own
+  settings with the switch on, says which host and build it is on
+  ([RULES.md](RULES.md#what-jq-needs-from-the-host)).
+- **A rule that calls `jq` fails on some messages.** `result="failed"` climbs and
+  `mqttd_rule_function_errors_total{function="jq",kind}` says why: `parse` (the input
+  is not JSON, or a string field was passed where jq expects JSON text), `process` (the
+  program met a shape it does not handle), `timeout`, `memory`, `output` or `stack` (a
+  limit; [RULES.md](RULES.md#limits-of-jq-and-what-happens-at-each)). `first(jq(…))`
+  fails with `first([]) is undefined` when the program produced nothing.
 - **`grep` finds the line but not the value.** The broker writes colour codes around each
   field name even into a file, a pipe, `docker logs` or the journal, so `grep 'rules=1'`
   or `grep 'digest=…'` matches nothing in a saved log while `grep 'rules loaded'` does.
