@@ -2699,6 +2699,7 @@ async fn an_eventual_namespace_is_seen_and_managed_like_a_local_one() {
             "links": 0, "pending": 0, "lag_ms": 0, "merged": 0,
             "refused_by": {"declaration": 0, "clock_skew": 0, "namespace_full": 0,
                            "store_full": 0, "brownout": 0, "malformed": 0},
+            "expiry_members": 0,
         })
     );
     // A `local` namespace has neither field.

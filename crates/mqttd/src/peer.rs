@@ -798,7 +798,8 @@ where
                     Some(
                         msg @ (PeerMessage::StateKeys { .. }
                         | PeerMessage::StateDigest { .. }
-                        | PeerMessage::StateWant { .. }),
+                        | PeerMessage::StateWant { .. }
+                        | PeerMessage::StateExpiry { .. }),
                     ) => {
                         stats.frames_in.fetch_add(1, Ordering::Relaxed);
                         if let Some(link) = rule_state.as_mut() {
@@ -1014,7 +1015,8 @@ fn forward_inbound(
         PeerMessage::OriginPublish(_)
         | PeerMessage::StateKeys { .. }
         | PeerMessage::StateDigest { .. }
-        | PeerMessage::StateWant { .. } => {}
+        | PeerMessage::StateWant { .. }
+        | PeerMessage::StateExpiry { .. } => {}
         PeerMessage::Publish {
             topic,
             payload,

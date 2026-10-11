@@ -114,13 +114,15 @@ pub const PROTO_MIN: u32 = 6;
 /// for byte proto 12's. A proto-12 link is sent neither: a node behind one reports the
 /// messages forwarded to it with an unknown publisher.
 ///
-/// Proto 14 (ADR 0085, rule state in `eventual` namespaces) is additive: three frames.
+/// Proto 14 (ADR 0085, rule state in `eventual` namespaces) is additive: four frames.
 /// [`StateKeys`](PeerMessage::StateKeys) carries keys' whole states,
-/// [`StateDigest`](PeerMessage::StateDigest) a summary of a namespace to compare, and
-/// [`StateWant`](PeerMessage::StateWant) which parts of it differ. A node sends them
-/// only for the namespaces its rules file declares `eventual`, so a cluster without
-/// one puts none on the wire and its frames are byte for byte proto 13's. A proto-13
-/// link is sent none: the node behind it holds no such state.
+/// [`StateDigest`](PeerMessage::StateDigest) a summary of a namespace to compare,
+/// [`StateWant`](PeerMessage::StateWant) which parts of it differ, and
+/// [`StateExpiry`](PeerMessage::StateExpiry) whether the sender raises the expiry
+/// event and how far it has got. A node sends them only for the namespaces its rules
+/// file declares `eventual` (the fourth only while its rules select the event), so a
+/// cluster without one puts none on the wire and its frames are byte for byte proto
+/// 13's. A proto-13 link is sent none: the node behind it holds no such state.
 pub const PROTO_MAX: u32 = 14;
 
 /// The peer-bus proto at which a build computes durable ownership over all admitted
@@ -149,8 +151,9 @@ pub const PROTO_PUBLISH_ORIGIN: u32 = 12;
 pub const PROTO_MESSAGE_ORIGIN: u32 = 13;
 
 /// The peer-bus proto at which a link carries rule state:
-/// [`StateKeys`](PeerMessage::StateKeys), [`StateDigest`](PeerMessage::StateDigest)
-/// and [`StateWant`](PeerMessage::StateWant) (ADR 0085).
+/// [`StateKeys`](PeerMessage::StateKeys), [`StateDigest`](PeerMessage::StateDigest),
+/// [`StateWant`](PeerMessage::StateWant) and
+/// [`StateExpiry`](PeerMessage::StateExpiry) (ADR 0085).
 pub const PROTO_RULE_STATE: u32 = 14;
 
 /// The parts a namespace of rule state is summarised in
@@ -946,6 +949,27 @@ pub enum PeerMessage {
         declaration: u64,
         /// The bitmap, [`STATE_PARTS`] / 64 words.
         parts: Vec<u64>,
+    },
+    /// What the sender does about the expiry of a namespace's keys (ADR 0085 D7):
+    /// whether its rules select `$events/state/expired`, and how far it has got.
+    /// Of the members that say they raise the event, a hash of the namespace and the
+    /// key picks the one that raises it for that key; the others keep an expired key
+    /// until that member's `swept` has passed the second it expired in, and raise
+    /// the event themselves if its link goes first. Sent only by a node whose rules
+    /// select the event (and once more when they stop), so a cluster without such a
+    /// rule puts none on the wire. Like the other three it is part of proto 14,
+    /// which no release has spoken.
+    StateExpiry {
+        /// The namespace.
+        namespace: String,
+        /// The fingerprint of the sender's declaration.
+        declaration: u64,
+        /// Whether the sender raises the event for keys of this namespace.
+        raises: bool,
+        /// The second, since the Unix epoch, up to which the sender has nothing left
+        /// to raise: every key it was to raise the event of that expired in that
+        /// second or before has had it raised.
+        swept: u64,
     },
 }
 
@@ -2012,7 +2036,7 @@ mod tests {
         );
     }
 
-    /// Proto 14 (ADR 0085): the three rule-state frames round-trip, are APPENDED after
+    /// Proto 14 (ADR 0085): the four rule-state frames round-trip, are APPENDED after
     /// every earlier frame with their bytes pinned, and this build announces 14 — while
     /// a proto-13 peer still negotiates 13 and is sent none of them.
     #[test]
@@ -2061,6 +2085,28 @@ mod tests {
         assert_eq!(out[4], 33, "appended after StateDigest (32)");
         assert_eq!(&out[5..], [2, b'n', b's', 1, 2, 5, 0]);
 
+        let expiry = PeerMessage::StateExpiry {
+            namespace: "ns".into(),
+            declaration: 1,
+            raises: true,
+            swept: 300,
+        };
+        roundtrip(&expiry);
+        let mut out = Vec::new();
+        encode(&expiry, &mut out).unwrap();
+        assert_eq!(out[4], 34, "appended after StateWant (33)");
+        assert_eq!(
+            &out[5..],
+            [2, b'n', b's', 1, 1, 0xac, 0x02],
+            "a name, the fingerprint, whether it raises, how far it has got"
+        );
+        roundtrip(&PeerMessage::StateExpiry {
+            namespace: "rule:r".into(),
+            declaration: u64::MAX,
+            raises: false,
+            swept: u64::MAX,
+        });
+
         // The fuzz target's seeds (`fuzz/seeds/peer_decode`) are these frames, so that
         // it starts from inputs that reach them.
         for (seed, name) in [
@@ -2079,6 +2125,10 @@ mod tests {
             (
                 include_bytes!("../fuzz/seeds/peer_decode/state_want.bin"),
                 "StateWant",
+            ),
+            (
+                include_bytes!("../fuzz/seeds/peer_decode/state_expiry.bin"),
+                "StateExpiry",
             ),
         ] {
             let mut buf = BytesMut::from(seed);

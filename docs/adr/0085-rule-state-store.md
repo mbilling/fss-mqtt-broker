@@ -350,6 +350,12 @@ key is held, counted toward its namespace's bounds, until its event is handed ov
 order is to the second; nothing is raised after a restart. See
 [Amendments](#amendments).)*
 
+*(Amended 2026-10-12, T4 in a cluster: the member is picked among those whose rules select
+the event, by the cluster's rendezvous hash of the namespace and the key; the others keep
+an expired key until that member says it is past it, and raise the event themselves if
+its link goes first; the event is for what the picked member's copy held when the expiry
+passed there. See [Amendments](#amendments).)*
+
 ### D8. Idempotency for counters
 
 A counter cannot tell a redelivered message from a new one: a QoS 1 resend, a takeover
@@ -2296,3 +2302,217 @@ prose (RULES.md's section on operating the store, the threat model's row).
   dedupe window; a test pins that. A parameter that hides them, or lists only them,
   is a small addition to `Selector` if an operator's listing turns out to be crowded
   by them.
+
+### 2026-10-12 — T4: the expiry event in a cluster, as built
+
+The amendment "T4: the expiry event on one node" built D7 for one node and listed what
+the cluster half needs. This is that half: a key of an `eventual` namespace raises
+`$events/state/expired` on one member
+(`crates/mqttd/src/rule_state/replica.rs`, `link.rs`, `expiry.rs`; one frame added to
+peer protocol 14). D7's "at least once" stands. What it left open, and what building it
+decided, follows.
+
+**Which member raises a key's event**
+
+- **The members whose rules select the event, and among them the one the cluster's
+  rendezvous hash picks** (`mqtt_cluster::hrw::owner`, which places sessions and durable
+  ownership) for the namespace and the key. D7 said "a hash of the key"; the namespace is
+  hashed with it so that two namespaces keyed by the same client ids do not put every
+  device's two events on one member. The highest weight wins, so the member picked among
+  all is also the one picked in any smaller view that contains it: it always picks
+  itself, whatever the others see.
+- **Per-node rules files (D15).** A node says on each link, per namespace, whether its
+  rules select the event, and only those that do are picked among. A member with no rule
+  on the event is sent nothing new, keeps nothing and forgets an expired key as T3 left
+  it. If no member has such a rule nothing is raised, and if the only one that has it
+  stops, nothing is: the others have no rule to run.
+- **"Alive" is "its peer link is up".** The store had no view of the membership. It now
+  has the one its links give it: each `StateLink` registers its peer with every
+  `eventual` namespace it carries, and a link that is dropped is a member that is gone.
+  SWIM is not asked: the link is what the member's word arrives on, and a member SWIM
+  still lists behind a link that is down can neither say how far it has got nor be
+  waited for. So a partial partition (two members that each reach a third and not each
+  other) raises some events twice for as long as it lasts.
+- **A member that has just started is not picked** until its copy has been compared
+  with this one: the two roots agreed, or a repair between the two is over, or, in a
+  namespace so busy that neither comes about, two repair intervals have passed (a
+  minute). It holds nothing when its links come up, and would raise nothing for the keys
+  that expire while it is being filled. Until then the others pick among themselves and
+  the newcomer among those it has compared with, so a key that expires in that time can
+  be raised twice, and none is skipped.
+
+**The hand-over: what the other members keep, and for how long**
+
+- **Every member that raises events keeps every expired key until the picked member is
+  past it.** A member that is not picked for a key cannot forget it at its expiry: the
+  picked member raises at a pace (below), and if it stopped with the key in its backlog
+  no copy would be left to raise the event from. So the key waits there too, read as
+  absent and counted toward the bounds exactly as on the picked member.
+- **The picked member says how far it has got,** as one number per namespace: the
+  second, on the clock expiries are judged by, up to which it has nothing left to raise.
+  That is the second before the earliest key it still holds for its event, or, holding
+  none, now. It says so on every link when a pass of its sweep got somewhere, and with
+  every periodic root (30 seconds). A member lets go of a key it kept for another when
+  that member's number has reached the second the key expired in.
+- **When the picked member's link goes** (or it says its rules no longer select the
+  event), each member picks again, among the members it still has, for the keys it kept
+  for that one; the newly picked member picks itself the same way and raises them from
+  its own copy. A key that waits stays with the member it was given to otherwise: a
+  member that joins takes over nothing that was already waiting.
+- **The guarantee.** Exactly one event per expiry while every member has a link to every
+  other, their copies have been compared, and the key's last state reached the picked
+  member before it expired there. **No event is lost to the loss of the picked member**
+  between a key's expiry and the event: whatever it had not raised, the others still
+  hold. **The duplicates:** what it had raised and not yet said. Its number moves by
+  whole seconds of expiry, and only when a second is finished, so those are the keys it
+  was to raise that expired in a second it had begun and not finished: at the default
+  pace a second in which more than a hundred of its keys expired takes more than one
+  step, and in a mass expiry (a site falls silent in one second) its whole share of
+  that second is raised again by the others. Finer than a second would need an order
+  within the second that every member shares, and they share none (a shard's order is
+  its node's own).
+- **What can still be lost,** each stated in RULES.md: an event for a key whose last
+  state the picked member's copy never held when it passed that second (the member was
+  at its bounds and refused it, D15; or its link was down for longer than the key
+  lived): it raised nothing, or raised the event for an earlier expiry of the key, and
+  the others, seeing it past that second, let go. And the events a member had just
+  taken over from one that left, when it leaves too before it has raised them: a member
+  that gives such a key to another goes by the number that member last said, which was
+  said before the other took the keys over. The hand-over survives the loss of one
+  member at a time.
+- **Why not an acknowledgement per key.** It would close both of those, and costs a
+  frame per event on every link, a queue of them per link (the store keeps nothing per
+  link today, T3), and still a rule for an acknowledgement that never comes. One number
+  per namespace needs no queue and can be lost and said again. **Why not a fixed time**
+  for which the others keep a key: the pace makes the picked member's backlog as long
+  as the namespace is large (100,000 keys at the default pace are 100 seconds), and a
+  member that stopped late in it would take the rest with it.
+
+**The hold is not state**
+
+- **What waits is kept beside the map and never sent.** A key nothing is lost by
+  forgetting (T3) leaves the map when the sweep finds it expired, on every member, and
+  on those that raise events it goes to the shard's waiting keys instead of being
+  dropped. T3's digest already leaves out a key that could be forgotten, whether or not
+  it has been, so the copies agree whichever members hold it for an event.
+- **A key that cannot be forgotten yet stays in the map as it is.** One that was deleted
+  and written again carries its delete's stamp for the tombstone window, an hour by
+  default, and outlives its own expiry by it: every "silent, then spoke, then silent
+  again" key is one. Its event is raised at its expiry all the same (T3's order of
+  forgetting now has the key at its expiry first and at the window's end after), from
+  the state the map holds, which is not touched: the entry notes, in a field that is
+  not part of the state, hashed or sent, which expiry has been dealt with. When the
+  window ends the key is forgotten and nothing is raised again.
+- **Proved by a test:** four members, three that raise events and one that does not, 120
+  expired keys of both kinds waiting on the three and the sweep running on all four;
+  over five repair intervals the links carry the periodic roots and the word on expiry
+  and no key and no digest's parts, and the four copies are equal byte for byte.
+
+**"Silent for X" is silent as the picked member sees it**
+
+- An expiry is a time in the key's state, and it passes on each member by that member's
+  clock (D6). The event is raised for what the picked member's copy holds when it passes
+  there. A refresh, a delete or any other write made on another node **that the picked
+  member has merged by then** stops the event (the expiry moved, or the key is gone). One
+  that **arrives after** does not undo the expiry: what the key held is kept for its
+  event, raised with that value, and the state that arrived is merged as T3 merges it,
+  so the key lives on from the refresh. This is one rule for every type; telling a
+  refresh that was merely late from a write made after the expiry needs a stamp, and a
+  counter, a set, a sketch and an extreme carry none.
+- So an event is raised although the device spoke when the refresh was made within the
+  replication lag of the deadline (milliseconds, normally) on a node that is not the
+  picked one, or when the TTL is shorter than the two clocks disagree by. And the
+  members that are not picked apply the same rule to their own copies, which decides
+  only what they keep.
+- **A key that had already expired when it arrived** (a node being filled is sent the
+  keys the others still remember for their deletes) did not expire on this node: no
+  event is owed for it here.
+- **A remembered idempotency key** (T5) raises no event on any member, as on one node:
+  it is forgotten when it expires, waits for nothing and is never behind the pace.
+- A rule's own write to a key that has expired here is the same case on one node, and is
+  treated as the single-node half does: the key is created anew and the old value still
+  raises its event. What it held then counts as a key of its own until the event is
+  out, so the write needs room for it, and is refused (`namespace_full`) where there is
+  none; a state that arrives for such a key and finds no room is refused and counted
+  (`replication_refused_total`), and offered again by the next repair.
+
+**Rate, order and backlog** are the single-node half's, for the node: one pace across
+`local` and `eventual` namespaces (`rules.state_expiry_per_sec`), a tenth of a second's
+worth at a time, earliest second first across both. Only handing events over is paced.
+Finding the keys that expired, forgetting those that owe no event here (on a member
+without a rule: all of them) and letting go of the keys kept for another member are not,
+4,096 keys of a namespace a pass and 64 a hold of a shard's lock. **T3's open point is
+closed with it:** an `eventual` namespace's expired keys and its tombstones past their
+window are now forgotten by the sweep, within about a second, on every member, and no
+longer only when room is needed or a digest is made.
+
+**The wire**
+
+- **One frame, appended to protocol 14:** `StateExpiry { namespace, declaration, raises,
+  swept }` (tag 34, bytes pinned, a seed for the `peer_decode` fuzz target). It is the
+  only way a member can know that another raises events at all and how far it has got;
+  nothing a link carried says either, and without it the choice is between losing a
+  stopped member's backlog and raising every event on every member.
+- **Protocol 14 is not raised to 15.** No release speaks 14 (v1.1.0 speaks 12), so the
+  frame joins the three T3 added to it and a link that negotiated 14 carries all four.
+  Two builds of `main` from either side of this change must not be mixed in one cluster
+  whose rules select the event: the older one does not know the tag.
+- **When it is sent:** only by a node whose rules select the event, per `eventual`
+  namespace: when a link takes the namespace up, when a pass of the sweep finished a
+  second or the node fell behind what it had said, and with each periodic root; once
+  more, with `raises: false`, when a reload leaves no rule on the event. A cluster
+  without such a rule sends none, and its frames are what they were. It is checked
+  against the declaration like the others and applied by the link's reader.
+
+**What an operator sees (T6)**
+
+- `expired` in an `eventual` namespace now counts each key's expiry once on every
+  member, when that member is done with it: its event handed over here, or the member
+  that raises it past it, or no event owed (it counted keys forgotten, so a key that
+  outlived its expiry by a tombstone window was counted an hour late). `expiry_backlog`
+  is the expiries a member is not done with, the keys it keeps for another member
+  included, plus the tombstones due and not yet forgotten.
+- `replication.expiry_members` (admin overview, `$SYS`): how many members the node picks
+  among, itself included; `0` where its rules do not select the event.
+- **`Store::expire_now` stays a `local` namespace's.** An expiry in an `eventual`
+  namespace is part of the state every member holds, and for every type but `lww` two
+  expiries merge to the later, so one member cannot move it sooner for the others
+  (T14's `not_shortened`). T13's purge with `events=true` there needs an answer of its
+  own.
+
+**The replay** (`--sequence`) is one node: an `eventual` namespace's keys now raise the
+event there as a `local` one's do (`Store::take_expired` finds the key in either kind),
+and the `note:` that said they raise none is gone. The note that the namespace behaves
+as `local` stays.
+
+**What it costs: not measured here**
+
+The publish path's cost was not measured in this change: the machine it was built on was
+shared, and its numbers were not to be trusted. One benchmark pass on the final commit,
+on a quiet machine, covers it. What the code says to expect:
+
+- **A `local` namespace's calls are untouched.** Nothing on their path changed.
+- **A read of an `eventual` namespace is untouched.**
+- **A write to an `eventual` namespace gains one comparison:** whether what its key held
+  had expired, read off the entry the call has already looked up, with no further look
+  at the map. An entry is 16 bytes larger (the expiry dealt with, and its place among
+  the waiting keys). Only a write that finds its key expired does more: one more look
+  at the entry, and, where a rule on the node selects the event and it has not been
+  raised, room reserved and the key's state copied for it.
+- **Nothing else is on a call's path.** Picking the member (a hash per member, for an
+  expired key), keeping and letting go of keys, and telling the peers happen on the
+  store's sweeping task and on the links' tasks. A state merged in from a peer gains the
+  same one comparison. The benchmark has new cases for the sweep over an `eventual`
+  namespace (`sweep/eventual/*`), run by that pass.
+
+**Left open**
+
+- **A finer word than a second** on how far a member has got, which would shrink the
+  duplicates after a member is lost in a mass expiry.
+- **Two members lost in a row** (above).
+- **T12's `expires_within` in an `eventual` namespace** still walks the map. The order
+  the sweep walks has a key at its expiry only until that expiry has been dealt with,
+  and holds the tombstones too: it is not an order of expiries a listing could use.
+- **T13 and T14 in an `eventual` namespace** (`expire_now`).
+- **T8:** the threat model's row for a namespace held full by owed events now covers
+  the members that keep keys for another's event.

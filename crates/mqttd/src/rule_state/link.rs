@@ -39,6 +39,17 @@
 //! over for a side when it has sent its own keys and heard that. A side that hears
 //! nothing for [`REPAIR_HOLD`] takes it to be over.
 //!
+//! # Who raises a key's expiry event
+//!
+//! While this node's rules select `$events/state/expired` the link says so for each
+//! namespace ([`StateExpiry`](PeerMessage::StateExpiry)), with how far the node's
+//! sweep has got: when the link comes up, when a pass of the sweep got somewhere, and
+//! with every periodic root. What the peer says of itself is kept for the store,
+//! which picks the member that raises each key's event among those that say they do
+//! ([`Replica::join`]). A peer counts once its copy has been compared with this one
+//! (two roots that agree, or a repair that is over), or after two repair intervals:
+//! a node that has just started holds nothing yet and would raise nothing.
+//!
 //! # Bounds
 //!
 //! A frame names a namespace and how its sender declares it. One for a namespace
@@ -56,7 +67,7 @@ use std::time::{Duration, Instant};
 
 use mqtt_cluster::peer::{PeerMessage, STATE_PARTS};
 
-use super::replica::{Begin, Cursors, Refused, Replica, PART_WORDS, REPAIR_HOLD};
+use super::replica::{Begin, Cursors, Peer, Refused, Replica, PART_WORDS, REPAIR_HOLD};
 use super::{Namespace, Store, SHARDS};
 
 /// How often two members compare their copies of a namespace, unless the store was
@@ -116,6 +127,17 @@ struct NamespaceLink {
     /// A comparison the peer began while another link was repairing this
     /// namespace: taken up when that one is done.
     deferred: Option<Theirs>,
+    /// The peer, as the store picks among members by.
+    peer: Arc<Peer>,
+    /// When the link took the namespace up.
+    born: Instant,
+    /// Whether the peer was last told that this node raises the expiry event.
+    told_raises: bool,
+    /// The store's count of things worth telling ([`Replica::swept`]) when the peer
+    /// was last told how far the sweep has got.
+    told_announce: u64,
+    /// When to tell it again, whatever happened.
+    next_expiry: Instant,
 }
 
 /// How far a comparison has got.
@@ -130,8 +152,19 @@ struct Comparing {
 }
 
 impl NamespaceLink {
-    fn new(namespace: &Arc<Namespace>, replica: &Replica, now: Instant) -> Self {
+    fn new(
+        namespace: &Arc<Namespace>,
+        replica: &Replica,
+        now: Instant,
+        id: u64,
+        remote: &str,
+    ) -> Self {
         Self {
+            peer: replica.join(id, remote),
+            born: now,
+            told_raises: false,
+            told_announce: 0,
+            next_expiry: now,
             name: namespace.name.clone(),
             namespace: Arc::downgrade(namespace),
             cursors: replica.link(namespace.shared.clock.now_ms()),
@@ -161,6 +194,10 @@ impl NamespaceLink {
             return;
         };
         let lost = now >= comparing.until && self.repairing.is_none();
+        if comparing.sent && comparing.heard {
+            // Each side has what the other had: the peer's copy is one to pick by.
+            self.peer.settle();
+        }
         if (comparing.sent && comparing.heard) || lost {
             self.comparing = None;
             Self::end(ns, replica, id);
@@ -230,6 +267,37 @@ impl NamespaceLink {
         }
     }
 
+    /// What the peer is to be told now about this node and the expiry event: whether
+    /// it raises it (`raises`), and how far its sweep has got. Said when either is
+    /// news, and with every periodic root. Also where a peer that has been linked
+    /// for two repair intervals is taken to hold what this node holds.
+    fn expiry(
+        &mut self,
+        replica: &Replica,
+        raises: bool,
+        now: Instant,
+        every: Duration,
+    ) -> Option<PeerMessage> {
+        if !self.peer.settled() && now >= self.born + 2 * every {
+            self.peer.settle();
+        }
+        let (swept, announce) = replica.swept();
+        let news = raises != self.told_raises
+            || (raises && (announce != self.told_announce || now >= self.next_expiry));
+        if !news {
+            return None;
+        }
+        self.told_raises = raises;
+        self.told_announce = announce;
+        self.next_expiry = now + every;
+        Some(PeerMessage::StateExpiry {
+            namespace: self.name.to_string(),
+            declaration: replica.declaration(),
+            raises,
+            swept,
+        })
+    }
+
     /// The next keys of the repair under way, if any are left to send. `None`:
     /// there is no repair, or it has just sent its last.
     fn repair_keys(&mut self, replica: &Replica) -> Option<Vec<(Vec<u8>, Vec<u8>)>> {
@@ -262,6 +330,8 @@ pub struct StateLink {
     /// Whether this node's id sorts before the peer's: the side that answers a
     /// differing root with its digest's parts.
     answers: bool,
+    /// The peer's node id.
+    remote: Box<str>,
     /// The store's count of namespaces made, when `namespaces` was last brought up
     /// to date.
     generation: Option<u64>,
@@ -288,6 +358,7 @@ impl StateLink {
             store,
             id: NEXT.fetch_add(1, Relaxed),
             answers: local < remote,
+            remote: remote.into(),
             generation: None,
             namespaces: Vec::new(),
             turn: 0,
@@ -312,7 +383,13 @@ impl StateLink {
         for ns in &live {
             if let Some(replica) = &ns.replica {
                 if !self.namespaces.iter().any(|link| of(link, ns)) {
-                    self.namespaces.push(NamespaceLink::new(ns, replica, now));
+                    self.namespaces.push(NamespaceLink::new(
+                        ns,
+                        replica,
+                        now,
+                        self.id,
+                        &self.remote,
+                    ));
                 }
             }
         }
@@ -333,12 +410,28 @@ impl StateLink {
         any
     }
 
+    /// Whether the peer is to be told something about expiry events now: that this
+    /// node raises them, or no longer does, or how far its sweep has got.
+    fn expiry_news(&self) -> bool {
+        let raises = self.store.expiry_events();
+        self.namespaces.iter().any(|link| {
+            raises != link.told_raises
+                || (raises
+                    && link.namespace.upgrade().is_some_and(|ns| {
+                        ns.replica
+                            .as_ref()
+                            .is_some_and(|replica| replica.swept().1 != link.told_announce)
+                    }))
+        })
+    }
+
     /// The next frame to send, if there is one at `now`: an answer or a summary
     /// first (small, and what a repair waits for), then keys of parts that differ,
     /// then keys that changed.
     pub(super) fn poll(&mut self, now: Instant) -> Option<PeerMessage> {
         self.sync(now);
         let every = Duration::from_millis(self.store.shared.repair_every_ms.load(Relaxed));
+        let raises = self.store.expiry_events();
         for link in &mut self.namespaces {
             let Some(ns) = link.namespace.upgrade() else {
                 continue;
@@ -347,6 +440,9 @@ impl StateLink {
                 continue;
             };
             link.finish(&ns, replica, self.id, now);
+            if let Some(frame) = link.expiry(replica, raises, now, every) {
+                return Some(frame);
+            }
             // A comparison that waited for another link's repair to be done.
             if link.deferred.is_some()
                 && link.comparing.is_none()
@@ -468,7 +564,10 @@ impl StateLink {
             tokio::pin!(told);
             told.as_mut().enable();
             wake.told.store(false, SeqCst);
-            if self.has_changes() || self.generation != Some(store.shared.generation.load(SeqCst)) {
+            if self.has_changes()
+                || self.expiry_news()
+                || self.generation != Some(store.shared.generation.load(SeqCst))
+            {
                 continue;
             }
             // The next thing time alone brings: a root to send, or a comparison
@@ -479,6 +578,9 @@ impl StateLink {
                     Some(comparing) => comparing.until,
                     None => link.next_root,
                 });
+                if link.told_raises {
+                    until = until.min(link.next_expiry);
+                }
             }
             let until = until.max(now + Duration::from_millis(1));
             if self.namespaces.is_empty() {
@@ -515,6 +617,11 @@ impl StateLink {
                 namespace,
                 declaration,
                 ..
+            }
+            | PeerMessage::StateExpiry {
+                namespace,
+                declaration,
+                ..
             } => (namespace.as_str(), *declaration),
             _ => return,
         };
@@ -548,9 +655,15 @@ impl StateLink {
             // on their way the copies differ, and comparing them again would send
             // those keys twice. One that another link's repair keeps from starting
             // is kept, and started when that repair is done.
+            PeerMessage::StateExpiry { raises, swept, .. } => link.peer.said(raises, swept),
             PeerMessage::StateDigest { root, parts, .. }
                 if parts.is_empty() || parts.len() == STATE_PARTS =>
             {
+                // Two roots that agree: the peer's copy is one to pick by. Looked at
+                // only until then, so a link that has settled pays nothing for it.
+                if parts.is_empty() && !link.peer.settled() && replica.digest(&ns).root == root {
+                    link.peer.settle();
+                }
                 if let Some(comparing) = &mut link.comparing {
                     // The root again: the peer has sent what it had to send. If it
                     // asked for nothing before saying so, there is nothing to send.

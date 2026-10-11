@@ -666,3 +666,64 @@ and T15 carries the documentation of these three.
   - **Left open:** a map that can be entered by position would make every walk cost
     what it looks at once, with nothing per key and nothing added to a write; it would
     replace the map every state call goes through, so it is its own change.
+- 2026-10-12 — **T4's cluster half** (#920, in review): a key of an `eventual` namespace
+  raises `$events/state/expired` on one member. The ADR's amendment of this date ("T4:
+  the expiry event in a cluster, as built") has every decision. The task stays
+  `in-progress` until this is merged.
+  - **Who raises it:** the member the cluster's rendezvous hash (`mqtt_cluster::hrw`)
+    picks for the namespace and the key, among the members whose rules select the event
+    and whose peer link is up and compared. A member without such a rule is never
+    picked, keeps nothing and forgets as before. The store's view of the membership is
+    its links (`StateLink` registers its peer with each namespace).
+  - **The hand-over:** every member that raises events keeps an expired key (absent to
+    every read, counted toward the bounds) until the picked member has said it is past
+    the second the key expired in; if that member's link goes first, the members left
+    pick again and one raises the event from its own copy. Exactly one in a stable
+    cluster; nothing lost when the picked member stops between a key's expiry and its
+    event; raised twice: the keys it was to raise in a second it had begun and not
+    finished. Not covered: a key the picked member's copy never held, and a second
+    member lost before it raised what it took over.
+  - **The hold is not replicated:** a key that could be forgotten leaves the map as on
+    every member and waits beside it; one whose delete's window is open stays in the
+    map untouched, and is raised at its expiry, not at the window's end. Digests are
+    those of copies with nothing waiting.
+  - **The refresh race:** the event is raised for what the picked member's copy holds
+    when the expiry passes there. A refresh merged before that stops it; one that
+    arrives after does not, and the key lives on from it.
+  - **The sweep:** one pace for the node across `local` and `eventual` namespaces, in
+    order of expiry to the second; an `eventual` namespace's expired keys and old
+    tombstones are now forgotten within about a second on every member (T3's open
+    point).
+  - **The wire:** `StateExpiry { namespace, declaration, raises, swept }` appended to
+    peer protocol 14 (tag 34, bytes pinned, fuzz seed); the protocol is not raised, 14
+    being unreleased. Sent only by nodes whose rules select the event.
+  - **Admin (T6):** `expired` and `expiry_backlog` of an `eventual` namespace count
+    expiries dealt with and not dealt with on the node; `replication.expiry_members` is
+    new. `Store::expire_now` stays `local` (an expiry in an `eventual` namespace merges
+    to the later for every type but `lww`): T13 and T14 decide what they do there.
+  - **The replay:** an `eventual` namespace raises the event in `--sequence` as a
+    `local` one does; the `note:` that it raises none is gone.
+  - **Tests:** mqttd `rule_state::tests_replica::expiry` (17, clocks and links driven by
+    hand: one member raises in a stable cluster; the picked member gone before it
+    raised anything, and after it raised some it could not report; how far the others
+    let go; a partition and its healing; the refresh race; a write to an expired key;
+    a key that cannot be forgotten yet; no repair traffic with keys waiting; per-node
+    rules; a reload that drops the rule; a member that has just started, and one filled
+    with keys that had already expired; T5's remembered keys, which raise nothing on any
+    member; a mass expiry
+    of 1,800 keys on three nodes at the pace, in order, each once; one node's
+    `take_expired`), `tests/rules_state_cluster.rs` (3, real nodes and links: one event
+    a key in a stable cluster; a member cut off, and the cluster whole again; a member
+    without the rule), `tests/rules_sequence.rs` (the replicated replay reads as the
+    local one), mqtt-cluster `peer::tests` (the frame's bytes). Also fixed: mqtt-rules
+    `a_sample_of_the_expiry_event_is_a_key_named_by_the_topic_holding_the_payload`
+    compared two readings of the clock and failed on a loaded machine; the sample's
+    `timestamp` is now the reading its `expired_at` is.
+  - **Not measured here:** the publish path's cost. The machine was shared; one
+    benchmark pass on the final commit covers it. From the code: a `local` namespace's
+    calls and an `eventual` one's reads are untouched; a write to an `eventual`
+    namespace gains one comparison on the entry it already holds, and an entry is 16
+    bytes larger; the rest is on the sweeping task and the links. The benchmark gains
+    `sweep/eventual/*`.
+  - **Left:** T8's documentation (the threat model's row now covers the members that
+    keep keys for another's event).

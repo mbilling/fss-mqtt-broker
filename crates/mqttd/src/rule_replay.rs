@@ -590,25 +590,15 @@ impl Replay {
 
     /// Whether a key's expiry is an event in this replay: the statement, or a rule of
     /// the file, selects it. The store then holds an expired key for it, as the
-    /// broker's does, whoever finds it first. `notes` gains a line for each namespace
-    /// whose expiries raise none.
-    fn expiry_wanted(&self, notes: &mut Vec<String>) -> bool {
+    /// broker's does, whoever finds it first. A replicated namespace is one node's
+    /// here, and that node raises the event.
+    fn expiry_wanted(&self) -> bool {
         let wanted = match &self.rules {
             Rules::Statement(test) => test.events().contains(&EventKind::StateExpired),
             Rules::File(set) => set.wants_event(EventKind::StateExpired),
         };
         if let Some(store) = &self.store {
             store.set_expiry_events(wanted);
-        }
-        if let (true, Rules::File(set)) = (wanted, &self.rules) {
-            for (name, settings) in set.state_namespaces() {
-                if settings.consistency != Consistency::Local {
-                    notes.push(format!(
-                        "namespace `{name}` is replicated: the expiry of its keys raises no \
-                         $events/state/expired yet, here or in a broker"
-                    ));
-                }
-            }
         }
         wanted
     }
@@ -671,7 +661,7 @@ impl Replay {
                 }
             }
         }
-        let wanted = self.expiry_wanted(&mut notes);
+        let wanted = self.expiry_wanted();
         let mut model = Model::new();
         let mut dictionaries: HashMap<&str, Dictionary> = HashMap::new();
         let mut run = Run {
