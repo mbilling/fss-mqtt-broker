@@ -530,8 +530,8 @@ fn lower_case_booleans_and_if_are_names_where_emqx_takes_no_name() {
                 "not created: the parser fails",
             ),
             (
-                r#"SELECT payload.true AS a, true.x AS b FROM "t/#""#,
-                Out(&[r#"{"a":"undefined","b":"undefined"}"#]),
+                r#"SELECT payload.true AS a, true.x AS b, true[1] AS c, payload.div AS d FROM "t/#""#,
+                Out(&[r#"{"a":"undefined","b":"undefined","c":"undefined","d":"undefined"}"#]),
                 "not created: the parser fails",
             ),
             (
