@@ -93,7 +93,7 @@
 | [0083](../adr/0083-rule-engine.md) | A rule engine on the publish path: EMQX rule SQL, evaluated once per message where it lands | Accepted | [17/17 done](0083-rule-engine.md) | — |
 | [0084](../adr/0084-watching-and-editing-rules-live.md) | Watching and editing rules live | Accepted | [10/10 done](0084-watching-and-editing-rules-live.md) | — |
 | [0085](../adr/0085-rule-state-store.md) | State for rules: a keyed, replicated store read and written from SQL | Proposed | [0/10 done](0085-rule-state-store.md) | 10 open |
-| [0086](../adr/0086-wasm-rule-functions.md) | Rule functions in a WebAssembly sandbox: the real jq first, operator plugins on the same mechanism | Accepted | [1/4 done](0086-wasm-rule-functions.md) | 3 open |
+| [0086](../adr/0086-wasm-rule-functions.md) | Rule functions in a WebAssembly sandbox: the real jq first, operator plugins on the same mechanism | Accepted | [2/4 done](0086-wasm-rule-functions.md) | 2 open |
 
 ## Open and deferred work
 
@@ -233,6 +233,5 @@
 
 **0086 — Rule functions in a WebAssembly sandbox: the real jq first, operator plugins on the same mechanism**
 
-- `0086-T2` 🚧 in-progress ([#906](https://github.com/mbilling/fss-mqtt-broker/issues/906)): "jq/2 and jq/3 in the rule engine behind the ABI: the instance pool, the worker hand-off, the per-message budget, grants, the off-by-default switch and its load errors, the module embedded by the release build, metrics and trace, --rule-test" — "One PR carries it: `jq/2` and `jq/3` in `mqtt-rules` behind the ABI, with EMQX 6.3.1's results, tags and texts (79 probes of `emqx_rule_funcs:jq/2,3` and `emqx_rule_sqltester` on a local EMQX, all matched; the 285-case module oracle unchanged); `rules.jq` off by default with its load errors, `rules.jq_default_timeout_ms`, `rules.jq_env`; the instance pool, literal programs compiled at load; a call's output charged to the message's build budget; the hand-off (one worker thread, a ten-second jq on one connection: 6,974 publishes on another, median 152 µs, slowest 6.2 ms; without it the first is not answered in 2 s) and a Will's rules moved off the hub while rules call jq (ADR amendment); per-function and per-module metrics; `--rule-test`, `--check-rules`, `--check-config`; the module embedded by the build when present and required by the release recipe and CI; the systemd unit's comment; Rust 1.96. `strptime %z` and `strftime %Z` recorded, not closed."
 - `0086-T3` ⬜ planned ([#907](https://github.com/mbilling/fss-mqtt-broker/issues/907)): "Operator plugins: [functions.<name>] in the rules file, pinned by sha256, load-time checks, live reload, the admin view, worked examples in Rust and C" — "Follows T2, and may follow it at a distance: the ABI is the same either way."
 - `0086-T4` ⬜ planned ([#908](https://github.com/mbilling/fss-mqtt-broker/issues/908)): "Documentation: RULES.md (the function, its limits, its cost), the departures from EMQX, threat model and hardening rows, the cookbook" — "Follows T2."
