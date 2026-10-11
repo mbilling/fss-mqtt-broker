@@ -795,3 +795,89 @@ first task built it:
 The candidate for lowering rule cost (the `WHERE` first, where that cannot change an
 output, an error or a counter) is still only a candidate, and ADR 0085 adds a condition
 to it: no `SELECT` field calls a state function.
+
+## Amendment (2026-10-11): conditions EMQX's runtime fails are evaluated here, and a `CASE` operand is evaluated as EMQX does
+
+ADR 0085's first task saw two places where this engine evaluated a `WHERE` that EMQX
+fails (`x NOT IN (…)`, and a bare value as an operand of `AND`/`OR`) and left them for a
+decision. This amendment records what EMQX does over the whole space, the one thing that
+was fixed, and what is kept as a documented difference.
+
+**The rule this is decided under.** Evaluation is EMQX's by default (the first amendment
+of 2026-10-10). The maintainer relaxed it on 2026-10-11: "We can have minor exemptions
+from the 100% mindset. But it has to be weighted with priority and effort to get there."
+So each row below is weighed: who can notice the difference, and what closing it costs.
+
+**Probed** on EMQX 6.3.1 (`emqx/emqx:latest`, rulesql 0.2.1): 332 statements through
+`emqx_rule_sqlparser:parse/1` (for the tree) and `emqx_rule_sqltester:test/1` (for the
+outcome) on one message, side effects read back from `kv_store_put`'s table, and eleven
+real rules with a publish for the counters. `emqx_rule_runtime` was read from the image's
+debug information beside them.
+
+**The mechanism.** The grammar takes any expression after `WHERE`, `INCASE` and a
+`WHEN`, and `AND`, `OR`, `NOT` and `IN` only there. The runtime then evaluates that
+expression with `match_conditions/2`, which has clauses for `and`, `or`, `not`, `in`, a
+function call, a comparison, and `{const, true}` and `{const, false}`. Nothing else. And
+its `not` clause evaluates its operand with `eval/2`, the evaluator for values, which has
+no clause for `and`, `or`, `not` or `in`. Every failure below is counted `failed` and
+`failed.exception` (probed with real rules: `matched` 1, `failed` 1, `failed.exception`
+1); a false condition, including one that stopped short of a faulty operand, is `failed`
+and `failed.no_result`. None is refused, or mentioned, when the rule is created.
+
+| Form, in a `WHERE` | EMQX parses it | EMQX on a message | mqttd | Decision |
+|---|---|---|---|---|
+| `a = 1`, `a IN (1, 2)`, `f(a)` returning a boolean, `true`, `false`, in any parentheses; `AND`/`OR` of those; `NOT` of a value, a comparison or a call | yes | passes on `true`, `no_result` on `false`; `NOT` is the negation of a boolean and `false` of anything else | the same | nothing to do |
+| `CASE x WHEN v THEN …` (in a field or a condition) | yes | `eval_switch_clauses`: for each `WHEN` it comes to, `v` is evaluated, then `x`. A call in `x` runs once per `WHEN` tried; a `v` that fails leaves `x` uncalled, and its error is the rule's | evaluated `x` once, first | **fixed**: now EMQX's order, count and failure. The only row where a rule that works in EMQX behaved differently (a `kv_store_put` in `x` ran once where EMQX runs it per `WHEN`; with both failing, the other error surfaced) |
+| A bare value as the whole condition: `payload.flag`, `flag`, `1`, `'true'`, `a + 1`, `-a`, `[1]`, `a[1]`, `a[1..2]`, `null` | yes | fails: `function_clause` in `match_conditions/2`, even when the value is `true` | passes when the value is the boolean `true`, `no_result` otherwise | kept |
+| `v AND c`, `v OR c`, with `v` a bare value | yes | fails on every message, and `c` is not evaluated | `v` reads as "not `true`" unless it is; for `OR`, goes on to `c`, effects included | kept |
+| `c AND v`, `c OR v` | yes | `andalso`/`orelse`: fails only when `c` lets the right side run (`c` true for `AND`, false for `OR`) | never fails; `v` read as above | kept |
+| `x NOT IN (…)`, `NOT (x IN (…))`, `NOT x IN (…)`: one tree, `{'not', {in, …}}` | yes | fails: `function_clause` in `eval/2`, before `x` or the list is evaluated | the negation of `IN`, the list evaluated whole | kept |
+| `NOT (a AND b)`, `NOT (a OR b)`, `NOT NOT a` | yes | fails the same way | evaluated | kept |
+| A function call that does not return a boolean, as the whole condition: `abs(1)` | yes | fails: `case_clause` (the `WHERE`'s `case … of true; false`) | `no_result` | kept: no output either way, only the counter differs |
+| `c AND f()` with `c` true: the result is `f()`'s | yes | fails at the `WHERE`, or as the left side of an enclosing `AND`/`OR` | `false` | kept: the same |
+| `f() AND c`, `f() OR c` with `f()` not a boolean | yes | fails: `{badarg, V}` | `f()` reads as "not `true`"; for `OR`, goes on to `c` | kept |
+| The same forms in an `INCASE` | yes | the same failures, per element (`match_incase_error`): the rule fails at the first element that reaches the form, after the `DO` of the elements before it | the element passes when the condition is `true` | kept |
+| The same forms in a `CASE WHEN c THEN …` | yes | `eval_case_clauses` takes the branch on `true` and goes on to the next `WHEN` on *anything else*, so a function's number is "not true" there as it is here; a bare value, a non-boolean on the left of `AND`/`OR`, and `NOT` over the four still fail | takes the branch on `true`, goes on otherwise | kept |
+| `CASE x WHEN v THEN …` with `v` an `AND`, `OR`, `NOT` or `IN` | yes | fails: `v` is evaluated with `eval/2` (a comparison is a value there, the four are not), before `x` | `v` is its boolean, matched against `x` | kept |
+| `TRUE`, `True`, `FALSE` | yes, as a field name (`sql_lex.xrl` has the two words in lower case only) | `undefined`: as a whole `WHERE` it fails; `x = TRUE` is true only when `x` is `undefined`; `SELECT TRUE AS a` gives `undefined` | the boolean | kept, and the one row where EMQX *runs* the rule and gives another result |
+| `CASE … END` as a condition or beside a comparison operator, `(a = 1) = true`, `f(NOT a)`, `f(a IN (1))` | no | the rule is not created | accepted | unchanged: "statements only mqttd accepts" (the amendment on JSON text, `coalesce`, and what only mqttd accepts) |
+| `a = b = c`, `LIKE`, `BETWEEN`, `IS NULL`, `!a`, `&&`, `IN ()`, `IN [1]` | no | the rule is not created | refused | nothing to do |
+
+**Why one fix and the rest kept.** The standing rule protects a rule that is moved from
+EMQX: it must give here what it gives there. Only the `CASE` operand could break that,
+for a rule that works in EMQX, so it is fixed whatever it costs (it cost a few lines, and
+an operand evaluated once per `WHEN` instead of once). Every "kept" row is a form that
+does *not* work in EMQX: the rule is created and then fails on each message that reaches
+the form, so nobody runs one there on purpose and no ported rule holds one that is
+reached. The difference is one-way: a rule written for mqttd with `WHERE payload.flag` or
+`NOT IN` does not port *back*, as with every statement only mqttd accepts, which is
+already this record's position on a superset. Against that small gain, matching EMQX
+would cost rules that work in mqttd 1.1.0 and are the readable way to write the
+condition: the demo's own rules hold 23 bare boolean aliases (`CASE WHEN braked THEN …`,
+`AND (low OR hot)`), and each would start failing on messages. Low priority, real cost:
+exempted.
+
+`TRUE` is the weakest of the exemptions, because EMQX does not fail the rule that
+compares with it: `WHERE payload.ok = TRUE` runs there and is true exactly for the
+messages that have no `ok`. A rule written that way in EMQX does not do what its author
+meant, and a rule that relies on it is hard to imagine, so reading the word as the
+boolean is kept as the default; it is the row to revisit if exactness is wanted after
+all.
+
+**The portable forms**, each probed in EMQX and pinned here with the same result:
+`v IN (true)` for a bare `v` (only the boolean passes, which is this engine's reading;
+`v = true` also passes the string `'true'`), `NOT contains(x, […])` for `x NOT IN (…)`
+(`contains` is `lists:member/2`, as `IN` is), `NOT a OR NOT b` for `NOT (a AND b)`, a
+comparison for a function that returns a number, `CASE WHEN` for a logical `WHEN`.
+
+**No warning at load.** A warning for these forms would fire on the demo's own rules and
+would single them out among the forms only mqttd accepts, none of which warns. What a
+rule author who wants both engines needs is a check over the whole superset, asked for
+explicitly: proposed as an opt-in `mqttd --check-rules --emqx` in #931.
+
+Pinned by `crates/mqtt-rules/src/tests_conditions.rs` (one row per probe: what mqttd
+gives, with EMQX's outcome beside it), and in `tests_state.rs` by
+`a_case_operand_is_evaluated_after_each_when_as_emqx_does` (the fix) and
+`a_condition_emqx_fails_goes_on_to_the_calls_behind_it` (the side effects of the kept
+forms). RULES.md lists the forms under [Conditions EMQX fails and mqttd
+evaluates](../RULES.md#conditions-emqx-fails-and-mqttd-evaluates).

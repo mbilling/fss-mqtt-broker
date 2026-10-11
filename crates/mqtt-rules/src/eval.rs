@@ -21,7 +21,11 @@
 //!   compare equal); a number against a string converts the string (a non-numeric string
 //!   is an error); a boolean against a string compares their text; anything else uses
 //!   Erlang term order.
-//! - **Conditions pass only on boolean `true`.**
+//! - **Conditions pass only on boolean `true`.** This is wider than EMQX, whose
+//!   `match_conditions/2` fails the rule on a condition that is a bare value, on
+//!   `NOT IN` and on `NOT` over `AND`/`OR`/`NOT`: kept as documented differences
+//!   (ADR 0083, amendment of 2026-10-11; `tests_conditions.rs` has EMQX's outcome per
+//!   form).
 
 use std::cell::OnceCell;
 use std::sync::Arc;
@@ -532,11 +536,17 @@ pub(crate) fn eval(e: &Expr, ctx: &EvalCtx, frames: Frames) -> Result<Value, Eva
             whens,
             otherwise,
         } => {
-            let on = on.as_ref().map(|x| eval(x, ctx, frames)).transpose()?;
             for (when, then) in whens {
-                let hit = match &on {
-                    // `CASE x WHEN v` is an exact match (Erlang pattern match).
-                    Some(v) => strict_eq(v, &eval(when, ctx, frames)?),
+                let hit = match on {
+                    // `CASE x WHEN v` is an exact match (Erlang pattern match). EMQX's
+                    // `eval_switch_clauses` evaluates `v` and then `x`, for each `WHEN`
+                    // it comes to (probed on 6.3.1): a call in `x` runs once per `WHEN`
+                    // tried, after that `WHEN`'s own, and not at all when the first
+                    // `v` fails.
+                    Some(on) => {
+                        let v = eval(when, ctx, frames)?;
+                        strict_eq(&eval(on, ctx, frames)?, &v)
+                    }
                     None => eval(when, ctx, frames)?.is_true(),
                 };
                 if hit {

@@ -1117,7 +1117,10 @@ Within the same meaning, mqttd accepts a little more than EMQX: `AND`/`OR`/`NOT`
 `SELECT`, keywords as path segments (`payload.from`), field access on a computed value
 (`json_decode(payload).a`), and `1e5` float literals. Every statement EMQX accepts loads
 in mqttd, but a statement that uses one of these does not load in EMQX:
-[Differences from EMQX](#differences-from-emqx) lists them all.
+[Differences from EMQX](#differences-from-emqx) lists them all. A condition is read more
+widely too: `WHERE payload.flag`, `x NOT IN (…)` and `NOT (a AND b)` work in mqttd, where
+EMQX creates the rule and fails it on each message
+([Conditions EMQX fails](#conditions-emqx-fails-and-mqttd-evaluates)).
 
 ## Fields
 
@@ -2038,6 +2041,11 @@ left to right, then the `WHERE`.
   `WHERE payload.temp > 30 AND kv_incr('hot') > 5`, or
   `CASE WHEN payload.temp > 30 THEN kv_incr('hot') END AS hot`. An `IN` list is evaluated
   whole, as in EMQX.
+- A `CASE x WHEN v THEN …` evaluates `v` and then `x`, again for each `WHEN` it comes to,
+  as EMQX does: a call in `x` runs once per `WHEN` tried, so
+  `CASE kv_incr('n') WHEN 5 THEN … WHEN 10 THEN …` counts twice on a message that matches
+  neither. Count in a field of its own and compare the field:
+  `SELECT kv_incr('n') AS n, CASE n WHEN 5 THEN … END AS step`.
 - In a `FOREACH`, a call in the `INCASE` runs once per element, one in the `DO` once per
   element that passed.
 - A write stays when a later field fails the rule, when the `WHERE` is false, and when an
@@ -2328,8 +2336,8 @@ function pays nothing for them.
 
 Verified against EMQX's rule engine source and documentation (emqx/emqx and
 emqx/emqx-docs, release 6.2). Each row is a behaviour a rule written for EMQX could
-notice, except the last, which is what a rule written for mqttd could: statements only
-mqttd accepts.
+notice, except the last two, which are what a rule written for mqttd could: conditions
+EMQX fails on each message, and statements only mqttd accepts.
 
 | | EMQX | mqttd |
 |---|---|---|
@@ -2359,7 +2367,36 @@ mqttd accepts.
 | Rule statistics | The dashboard and the REST API | `/metrics`; with `sys_interval_secs`, `$SYS/brokers/<node>/rules/<id>`; `GET /admin/v1/rules` |
 | Changing rules | The dashboard and the REST API, applied across the cluster | The rules file, reloaded; for a listed writer, the admin API writes that file, on the node it asks |
 | Testing a rule | The dashboard's SQL test, which calls the real functions: a test of `kv_store_put` writes the node's table | `mqttd --rule-test` (the statement only), or `POST /admin/v1/rules/test` (the statement and the rendered actions); a state call in a test never touches the running rules' state |
+| Conditions EMQX's runtime has no clause for (mqttd-only): a bare value as a condition or as an operand of `AND`/`OR`, `NOT IN`, `NOT` over `AND`/`OR`/`NOT`, a function that does not return a boolean, `AND`/`OR`/`NOT`/`IN` in `CASE x WHEN …`, `TRUE`/`FALSE` in upper case | The rule is created, with nothing said, and fails on each message that reaches the form (`failed`, `failed.exception`); `TRUE` and `FALSE` are field names, `undefined` (EMQX 6.3.1) | Evaluated: a condition passes exactly when it is the boolean `true`, `NOT IN` is the negation of `IN`, `TRUE` is `true`. No rule that works in EMQX holds one of these, so none behaves differently here; a rule that relies on one does not port back to EMQX ([the table below](#conditions-emqx-fails-and-mqttd-evaluates), with the form to write for both) |
 | Statements only mqttd accepts (mqttd-only extensions) | A parse error: the rule is not created (EMQX 6.3.1, rulesql 0.2.1) | Accepted, each with the meaning it has where EMQX allows it: `AND`, `OR`, `NOT`, `IN` and `NOT IN` outside `WHERE`/`INCASE`/`WHEN` (in `SELECT`, `DO`, a function argument, an array); a comparison in parentheses or in an array (`(a > 1) AS ok`); `CASE` inside a larger expression (`1 + CASE … END`); a keyword as a path segment (`payload.from`, which EMQX takes as `payload.'from'`); field or index access on a computed value (`json_decode(payload).a`, `nth(1, l).b`); a name starting with `_`; a float literal with an exponent and no fraction (`1e5`, `10e5`) or with an `f`/`d` suffix (`1.5f`). Every statement EMQX accepts loads in mqttd; leave these out of a rule that must also load in EMQX. |
+
+### Conditions EMQX fails and mqttd evaluates
+
+A condition is what follows `WHERE`, `INCASE`, and the `WHEN` of a `CASE`. EMQX's grammar
+takes any expression there; its runtime takes only a comparison, `x IN (…)`, a function
+call, `true`, `false`, `AND` and `OR` of those, and `NOT` of a value, a comparison or a
+function call. Anything else is created as a rule without a word and then fails on every
+message that reaches it (probed on EMQX 6.3.1; counted `failed` and `failed.exception`).
+mqttd evaluates all of it, with one reading: **a condition passes exactly when it is the
+boolean `true`**.
+
+So every rule that works in EMQX gives the same here, and the difference is one-way: a
+rule written for mqttd that relies on a form below does not port back to EMQX. It loads
+there and fails (the last row: runs with another result). `mqttd --check-rules` does not
+warn about these forms.
+
+| Written in a condition | EMQX | mqttd | For a rule that must also run in EMQX |
+|---|---|---|---|
+| A bare value as the whole condition: `WHERE payload.flag`, `INCASE item`, `CASE WHEN flag THEN …`, `WHERE 1`, `WHERE 'true'`, `WHERE a + 1` | The rule fails on every message, even when the value is `true` | Passes when the value is the boolean `true`; false (`no_result`) for anything else | `payload.flag IN (true)` passes only the boolean, as mqttd's bare value does; `payload.flag = true` also passes the string `'true'` (a boolean against a string compares their text) |
+| A bare value as an operand of `AND`/`OR`: `payload.flag AND …`, `… OR payload.flag` | The rule fails when the operand is reached: on the left, every message, before the right side runs; on the right, only the messages the left side lets through (`n > 5 AND flag` fails when `n` is above 5) | The operand reads as "not true" unless it is the boolean `true`. On the left of an `OR` that means going on to the right operand, its function calls and their effects included | The same: `payload.flag IN (true) AND …` |
+| `x NOT IN (a, b)`, `NOT (x IN (a, b))` | The rule fails when it is reached, before `x` or the list is evaluated | The negation of `IN`; the list is evaluated whole, as for `IN` | `NOT contains(x, [a, b])`: `contains` matches exactly, as `IN` does, and evaluates the list whole |
+| `NOT (a AND b)`, `NOT (a OR b)`, `NOT NOT a` | The rule fails when it is reached, before any of it is evaluated | Evaluated; `NOT` of anything but a boolean is `false`, as in EMQX | `NOT a OR NOT b`, `NOT a AND NOT b`; for a boolean `a`, `a = true` |
+| A function that does not return a boolean: `WHERE abs(payload.x)`, `INCASE abs(item)`, `abs(payload.x) AND …`, `… AND abs(payload.x)` when reached | The rule fails (`failed.exception`). Only as a whole `CASE WHEN`, or on the right of its `AND`/`OR`, does EMQX go on to the next `WHEN` | "Not true": the condition is false (`no_result`), so as a whole `WHERE`/`INCASE` or on the right of an `AND` only the counter differs; on the left of an `OR` the right operand runs | A comparison: `abs(payload.x) > 0` |
+| `AND`, `OR`, `NOT` or `IN` as the `WHEN` of a `CASE` with an operand: `CASE x WHEN y IN (1, 2) THEN …` | The rule fails in the `WHEN` that is reached: that `WHEN` is a value to match `x` against, and only a comparison is a value there | The `WHEN` is its boolean, matched against `x` | A `CASE WHEN <condition> THEN …` |
+| `TRUE`, `True`, `FALSE`: any spelling but lower case | A field of that name, which no message has: `undefined`. `WHERE TRUE` fails the rule, but `WHERE payload.ok = TRUE` and `SELECT TRUE AS a` run: the first is true only for a message *without* `ok`, the second gives `undefined` | The booleans, as `true` and `false` are | `true`, `false` |
+
+`CASE x WHEN v THEN …` itself is evaluated as EMQX evaluates it: `v`, then `x`, again for
+each `WHEN` it comes to ([When a call runs](#state-what-a-rule-remembers)).
 
 ## Migrating rules from EMQX
 

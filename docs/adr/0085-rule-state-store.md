@@ -737,7 +737,9 @@ maintainer's to decide): in a `WHERE`, EMQX fails the rule (`function_clause`) o
 or a call (`payload.flag AND …`); mqttd evaluates `NOT IN`, and reads a bare operand as
 "not `true`" unless it is `true`. Where the left operand of an `OR` is such a value, mqttd
 therefore goes on to the right operand, state calls included, where EMQX has already
-failed the rule.
+failed the rule. *(Decided later on 2026-10-11: both are kept as documented differences
+(ADR 0083, 2026-10-11). No rule that works in EMQX holds either form; RULES.md lists them
+under "Conditions EMQX fails and mqttd evaluates".)*
 
 **What the record left open and T1 settled**
 
