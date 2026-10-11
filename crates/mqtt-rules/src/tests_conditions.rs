@@ -52,9 +52,6 @@ const LOGIC: Emqx = "the rule fails: function_clause in eval/2";
 /// `case_clause` where the `WHERE` or `INCASE` reads a result that is neither `true`
 /// nor `false`, or `{badarg, V}` from `andalso`/`orelse` on such a left side.
 const BOOL: Emqx = "the rule fails: case_clause or badarg, not a boolean";
-/// EMQX runs the rule, with a different result: `TRUE` is a field name there.
-const FIELD_NO: Emqx = "the condition is false: TRUE is a field, undefined";
-const FIELD_PASS: Emqx = "the condition is true: TRUE is a field, undefined";
 
 /// A field `a` that came out as `'y'` or `'n'`.
 const Y: Want = Out(&[r#"{"a":"y"}"#]);
@@ -70,6 +67,20 @@ fn run(sql: &str) -> Result<Vec<String>, String> {
 /// Check every row, reporting all that differ at once. No row fails the rule in mqttd,
 /// and none draws a warning when it is loaded.
 fn check(rows: &[(&str, Want, Emqx)], sql_of: impl Fn(&str) -> String) {
+    check_rows(rows, sql_of, false);
+}
+
+/// The warning a statement draws for each spelling of `TRUE` or `FALSE` it reads as a
+/// value.
+const BOOLEAN_NAME: &str = "is a field name here, as in EMQX; write `";
+
+/// [`check`], for rows that read a field spelt like a boolean: each draws that warning
+/// when it is loaded, and no other.
+fn check_warned(rows: &[(&str, Want, Emqx)], sql_of: impl Fn(&str) -> String) {
+    check_rows(rows, sql_of, true);
+}
+
+fn check_rows(rows: &[(&str, Want, Emqx)], sql_of: impl Fn(&str) -> String, warned: bool) {
     let mut wrong = Vec::new();
     for (text, want, emqx) in rows {
         let sql = sql_of(text);
@@ -86,7 +97,12 @@ fn check(rows: &[(&str, Want, Emqx)], sql_of: impl Fn(&str) -> String) {
             ));
         }
         let warnings = check_sql(&sql).unwrap_or_else(|e| panic!("{sql} does not load: {e}"));
-        if !warnings.is_empty() {
+        let as_wanted = if warned {
+            !warnings.is_empty() && warnings.iter().all(|w| w.contains(BOOLEAN_NAME))
+        } else {
+            warnings.is_empty()
+        };
+        if !as_wanted {
             wrong.push(format!("{sql}\n    warns: {warnings:?}"));
         }
     }
@@ -280,28 +296,304 @@ fn a_function_that_does_not_return_a_boolean_reads_as_not_true() {
     );
 }
 
-/// `TRUE`, `True` and `FALSE` are the booleans, as `true` and `false` are. EMQX's lexer
-/// has the two words in lower case only, so any other spelling is a field name there,
-/// which no message has: `undefined`. The one form here where EMQX runs the rule and
-/// gives a different result, instead of failing it.
+/// Only `true` and `false` in lower case are the booleans. EMQX's parser makes the
+/// constant of those two words alone (`unwrap_var/1` in `rulesql.yrl`), so `TRUE`,
+/// `True` and `FALSE` are names like `payload`: a field, which no message has, so
+/// `undefined`. It is the same here (ADR 0083, second amendment of 2026-10-11), in every
+/// place a value is read; each row is EMQX 6.3.1's outcome for the same statement. So
+/// `payload.flag = TRUE` is false for a message whose `flag` is `true`, and true for one
+/// without `flag`. Where EMQX fails the rule, the bare field is a value where a
+/// condition belongs, as for any other field.
 #[test]
-fn true_and_false_are_booleans_in_any_case() {
-    check(
+fn true_and_false_in_capitals_are_field_names_as_in_emqx() {
+    check_warned(
         &[
-            ("TRUE", Pass, VALUE),
-            ("payload.flag = TRUE", Pass, FIELD_NO),
-            ("payload.missing = TRUE", No, FIELD_PASS),
-            // `NOT` of `undefined` is false in EMQX, as `NOT true` is.
+            ("TRUE", No, VALUE),
+            ("FALSE", No, VALUE),
+            // `NOT` of `undefined` is false in EMQX, as it is of any non-boolean.
             ("NOT TRUE", No, SAME),
-            ("payload.flag = true", Pass, SAME),
+            ("NOT FALSE", No, SAME),
+            ("payload.flag = TRUE", No, SAME),
+            ("payload.f = FALSE", No, SAME),
+            ("payload.flag != TRUE", No, SAME),
+            // `undefined` equals `undefined`: the messages *without* the field pass.
+            ("payload.missing = TRUE", Pass, SAME),
+            ("payload.missing = False", Pass, SAME),
+            ("TRUE = FALSE", Pass, SAME),
+            ("TRUE = true", No, SAME),
+            ("payload.n = 1 AND TRUE", No, VALUE),
+            ("payload.n = 2 AND TRUE", No, SAME),
+            ("payload.n = 1 OR TRUE", Pass, SAME),
+            ("payload.flag IN (TRUE)", No, SAME),
+            ("payload.flag IN (TRUE, true)", Pass, SAME),
+            ("payload.missing IN (TRUE)", Pass, SAME),
+            ("TRUE IN (payload.missing)", Pass, SAME),
         ],
         where_,
     );
-    // EMQX: {"a":"undefined","b":"undefined","c":true,"d":"undefined","e":false}.
+    // Where a value of the wrong type fails the rule, `undefined` does, in both:
+    // `bool(TRUE)` is `badarg` in EMQX, `-TRUE` is `badarith`.
+    for sql in [
+        r#"SELECT bool(TRUE) AS a FROM "t/#""#,
+        r#"SELECT -TRUE AS a FROM "t/#""#,
+        r#"SELECT TRUE + 1 AS a FROM "t/#""#,
+    ] {
+        let failed = run(sql).expect_err(sql);
+        assert!(failed.contains("undefined"), "{sql}: {failed}");
+    }
+}
+
+/// The same reading in every other place a value is read, each with EMQX 6.3.1's
+/// outcome: a `SELECT` field, a `CASE` (its condition, branches, operand and a `WHEN`'s
+/// value), a `FOREACH` (its array, its `DO` and its `INCASE`), a function's argument, an
+/// array's element and a computed index.
+#[test]
+#[allow(clippy::too_many_lines)] // one row per probed position
+fn true_and_false_in_capitals_are_fields_wherever_a_value_is_read() {
+    let undefined3: Want = Out(&[
+        r#"{"v":"undefined"}"#,
+        r#"{"v":"undefined"}"#,
+        r#"{"v":"undefined"}"#,
+    ]);
+    let false3: Want = Out(&[r#"{"v":false}"#, r#"{"v":false}"#, r#"{"v":false}"#]);
+    check_warned(
+        &[
+            // A field of a `SELECT`: any spelling but the lower-case one.
+            (
+                r#"SELECT TRUE AS a, True AS b, true AS c, FALSE AS d, false AS e, tRUE AS f, False AS g FROM "t/#""#,
+                Out(&[
+                    r#"{"a":"undefined","b":"undefined","c":true,"d":"undefined","e":false,"f":"undefined","g":"undefined"}"#,
+                ]),
+                SAME,
+            ),
+            // Unaliased, it is stored under its own name, as a field is.
+            (
+                r#"SELECT TRUE, FALSE FROM "t/#""#,
+                Out(&[r#"{"TRUE":"undefined","FALSE":"undefined"}"#]),
+                SAME,
+            ),
+            // A `CASE`: its condition, its branches, its operand and a `WHEN`'s value.
+            (
+                r#"SELECT CASE WHEN TRUE THEN 'y' ELSE 'n' END AS a FROM "t/#""#,
+                N,
+                VALUE,
+            ),
+            (
+                r#"SELECT CASE WHEN payload.flag = TRUE THEN 'y' ELSE 'n' END AS a FROM "t/#""#,
+                N,
+                SAME,
+            ),
+            (
+                r#"SELECT CASE WHEN payload.n = 1 THEN TRUE ELSE FALSE END AS a FROM "t/#""#,
+                Out(&[r#"{"a":"undefined"}"#]),
+                SAME,
+            ),
+            (
+                r#"SELECT CASE WHEN payload.n = 2 THEN 1 ELSE FALSE END AS a FROM "t/#""#,
+                Out(&[r#"{"a":"undefined"}"#]),
+                SAME,
+            ),
+            (
+                r#"SELECT CASE payload.flag WHEN TRUE THEN 'y' ELSE 'n' END AS a FROM "t/#""#,
+                N,
+                SAME,
+            ),
+            (
+                r#"SELECT CASE payload.missing WHEN TRUE THEN 'y' ELSE 'n' END AS a FROM "t/#""#,
+                Y,
+                SAME,
+            ),
+            (
+                r#"SELECT CASE TRUE WHEN true THEN 'y' ELSE 'n' END AS a FROM "t/#""#,
+                N,
+                SAME,
+            ),
+            (
+                r#"SELECT CASE TRUE WHEN payload.missing THEN 'y' ELSE 'n' END AS a FROM "t/#""#,
+                Y,
+                SAME,
+            ),
+            // A `FOREACH`: its array, its `DO` and its `INCASE`.
+            (r#"FOREACH TRUE FROM "t/#""#, No, SAME),
+            (
+                r#"FOREACH payload.bools DO TRUE AS v FROM "t/#""#,
+                undefined3,
+                SAME,
+            ),
+            (
+                r#"FOREACH payload.bools DO item = TRUE AS v FROM "t/#""#,
+                false3,
+                SAME,
+            ),
+            (
+                r#"FOREACH payload.bools DO item AS v INCASE item = TRUE FROM "t/#""#,
+                No,
+                SAME,
+            ),
+            (
+                r#"FOREACH payload.bools DO item AS v INCASE TRUE FROM "t/#""#,
+                No,
+                VALUE,
+            ),
+            // A function's argument, an array's element and a computed index.
+            (
+                r#"SELECT is_bool(TRUE) AS a, is_bool(true) AS b, is_null(TRUE) AS c, is_null(FALSE) AS d FROM "t/#""#,
+                Out(&[r#"{"a":false,"b":true,"c":true,"d":true}"#]),
+                SAME,
+            ),
+            (
+                r#"SELECT str(TRUE) AS a, str(true) AS b FROM "t/#""#,
+                Out(&[r#"{"a":"undefined","b":"true"}"#]),
+                SAME,
+            ),
+            (
+                r#"SELECT coalesce(TRUE, 'x') AS a FROM "t/#""#,
+                Out(&[r#"{"a":"x"}"#]),
+                SAME,
+            ),
+            (
+                r#"SELECT [TRUE, true] AS a FROM "t/#""#,
+                Out(&[r#"{"a":["undefined",true]}"#]),
+                SAME,
+            ),
+            (
+                r#"SELECT payload.arr[TRUE] AS a FROM "t/#""#,
+                Out(&[r#"{"a":"undefined"}"#]),
+                SAME,
+            ),
+        ],
+        str::to_string,
+    );
+}
+
+/// Where `TRUE` can only be a name, it was one before and nothing is said: an alias, a
+/// path's head or segment, and a quoted identifier. A statement that reads an alias it
+/// selected itself is not warned about either. Each row is EMQX 6.3.1's outcome too.
+#[test]
+fn true_and_false_as_an_alias_a_path_or_a_quoted_name_draw_no_warning() {
+    check(
+        &[
+            (
+                r#"SELECT 1 AS TRUE FROM "t/#""#,
+                Out(&[r#"{"TRUE":1}"#]),
+                SAME,
+            ),
+            (r#"SELECT 1 TRUE FROM "t/#""#, Out(&[r#"{"TRUE":1}"#]), SAME),
+            (
+                r#"SELECT 1 AS TRUE FROM "t/#" WHERE TRUE = 1"#,
+                Out(&[r#"{"TRUE":1}"#]),
+                SAME,
+            ),
+            (
+                r#"SELECT payload.n AS TRUE.x FROM "t/#""#,
+                Out(&[r#"{"TRUE":{"x":1}}"#]),
+                SAME,
+            ),
+            (
+                r#"SELECT payload.n AS x.TRUE FROM "t/#""#,
+                Out(&[r#"{"x":{"TRUE":1}}"#]),
+                SAME,
+            ),
+            (
+                r#"SELECT TRUE.x AS a, payload.TRUE AS b, TRUE[1] AS c FROM "t/#""#,
+                Out(&[r#"{"a":"undefined","b":"undefined","c":"undefined"}"#]),
+                SAME,
+            ),
+            (
+                r#"SELECT "TRUE" AS a, "true" AS b, 'true' AS c FROM "t/#""#,
+                Out(&[r#"{"a":"undefined","b":"undefined","c":"true"}"#]),
+                SAME,
+            ),
+        ],
+        str::to_string,
+    );
+}
+
+/// Names only mqttd takes, probed with the rest: lower-case `true` and `false` where a
+/// name belongs, and `if` and `elsif`, which EMQX's lexer reserves and its grammar never
+/// uses. EMQX does not create a rule with `payload.true`, `true.x`, `AS x.true`, `if` or
+/// `payload.if` (its parser fails), and creates one with `AS true` that fails on every
+/// message (`nested_put` has no clause for a constant as a key). Here each is the name
+/// it reads as, so no rule that works in EMQX is affected.
+#[test]
+fn lower_case_booleans_and_if_are_names_where_emqx_takes_no_name() {
+    check(
+        &[
+            (
+                r#"SELECT 1 AS true FROM "t/#""#,
+                Out(&[r#"{"true":1}"#]),
+                "the rule fails: function_clause in emqx_rule_maps:nested_put/3",
+            ),
+            (
+                r#"SELECT payload.n AS x.true FROM "t/#""#,
+                Out(&[r#"{"x":{"true":1}}"#]),
+                "not created: the parser fails",
+            ),
+            (
+                r#"SELECT payload.true AS a, true.x AS b FROM "t/#""#,
+                Out(&[r#"{"a":"undefined","b":"undefined"}"#]),
+                "not created: the parser fails",
+            ),
+            (
+                r#"SELECT if AS a, ELSIF AS b, payload.if AS c, 1 AS if FROM "t/#""#,
+                Out(&[r#"{"a":"undefined","b":"undefined","c":"undefined","if":1}"#]),
+                "not created: IF and ELSIF are reserved words",
+            ),
+        ],
+        str::to_string,
+    );
+}
+
+/// The warning names the word as written and the boolean to write instead, once per
+/// spelling however often the statement reads it, and comes with the rule's id through
+/// a load's warnings (`--check-rules`, a load, a reload and the admin API show those).
+/// No other name draws it: not `true` and `false` themselves, not `null`, `NULL` or
+/// `undefined` (names in EMQX in any case, and here), not a longer name.
+#[test]
+fn a_field_spelt_like_a_boolean_is_warned_about_once_and_no_other_name_is() {
     assert_eq!(
-        run(r#"SELECT TRUE AS a, True AS b, true AS c, FALSE AS d, false AS e FROM "t/#""#)
+        check_sql(r#"SELECT TRUE AS a FROM "t/#" WHERE payload.x = TRUE OR payload.y = False"#)
             .unwrap(),
-        [r#"{"a":true,"b":true,"c":true,"d":false,"e":false}"#]
+        [
+            "`TRUE` is a field name here, as in EMQX; write `true` for the boolean",
+            "`False` is a field name here, as in EMQX; write `false` for the boolean",
+        ]
+    );
+    let loaded = RuleSet::parse(
+        r#"
+        [rules.caps]
+        sql = 'SELECT payload.v AS v FROM "t/#" WHERE payload.ok = TRUE'
+        [rules.lower]
+        sql = 'SELECT payload.v AS v FROM "t/#" WHERE payload.ok = true'
+        "#,
+    )
+    .unwrap();
+    assert_eq!(
+        loaded.warnings,
+        ["rule `caps`: `TRUE` is a field name here, as in EMQX; write `true` for the boolean"]
+    );
+    assert_eq!(loaded.rules.warnings(), loaded.warnings.as_slice());
+    for sql in [
+        r#"SELECT true AS a, false AS b FROM "t/#" WHERE payload.ok = true"#,
+        r#"SELECT null AS a, NULL AS b, Null AS c, undefined AS d, UNDEFINED AS e FROM "t/#""#,
+        r#"SELECT truth AS a, TRUEISH AS b, FALSEHOOD AS c, T AS d, F AS e, yes AS f FROM "t/#""#,
+        r#"SELECT payload.flag AS flag FROM "t/#" WHERE flag = payload.flag AND 'TRUE' = 'TRUE'"#,
+        r#"SELECT upper(payload.s) AS TRUE FROM "t/#" WHERE TRUE = 'A'"#,
+        r#"FOREACH payload.arr AS FALSE DO FALSE AS v INCASE FALSE > 2 FROM "t/#""#,
+    ] {
+        assert_eq!(check_sql(sql).unwrap(), [""; 0], "{sql}");
+    }
+    // `null` and `undefined` are fields in any case too, in both engines: `undefined`,
+    // which equals a missing field and not a JSON `null`.
+    check(
+        &[
+            ("payload.missing = null", Pass, SAME),
+            ("payload.missing = UNDEFINED", Pass, SAME),
+            ("payload.nul = null", No, SAME),
+            ("payload.nul = NULL", No, SAME),
+            ("payload.missing = 'undefined'", No, SAME),
+        ],
+        where_,
     );
 }
 

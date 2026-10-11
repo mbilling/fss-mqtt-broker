@@ -164,11 +164,22 @@ pub(crate) fn parse(
         toks,
         pos: 0,
         warnings: Vec::new(),
+        boolean_names: Vec::new(),
         nest: 0,
         loading,
     };
     let stmt = p.statement()?;
+    p.lint_boolean_names(&stmt);
     Ok((stmt, p.warnings))
+}
+
+/// `true` or `false` when `name` is that word in any spelling but lower case (`TRUE`,
+/// `True`, `fALSE`). EMQX's parser makes the boolean of the two lower-case words only
+/// (`unwrap_var/1` in `rulesql.yrl`); any other spelling is a name like `payload`.
+fn boolean_in_another_case(name: &str) -> Option<&'static str> {
+    ["true", "false"]
+        .into_iter()
+        .find(|word| name != *word && name.eq_ignore_ascii_case(word))
 }
 
 /// What one rules file is loaded with and what its statements have used so far.
@@ -297,6 +308,9 @@ struct Parser<'a, 'f> {
     toks: Vec<Spanned>,
     pos: usize,
     warnings: Vec<String>,
+    /// The bare fields read so far that are spelt like a boolean in another case
+    /// (`TRUE`, `False`), each spelling once (see [`Parser::lint_boolean_names`]).
+    boolean_names: Vec<String>,
     /// Current recursion depth (see [`MAX_NESTING`]).
     nest: usize,
     /// Where literal regex patterns are compiled (see [`RegexPool`]), and what `jq` is.
@@ -630,6 +644,31 @@ impl Parser<'_, '_> {
         }
     }
 
+    /// `TRUE` read as a value is almost always the boolean the author meant to write as
+    /// `true`. It is still parsed EMQX's way, as a field, but said out loud: once per
+    /// spelling, and not for a name the statement itself selects (`SELECT 1 AS TRUE …
+    /// WHERE TRUE = 1` reads its own alias). A path (`TRUE.x`) and a path segment
+    /// (`payload.TRUE`) can only be fields and draw nothing; a quoted `"TRUE"` is
+    /// [`Parser::lint_quoted_literal`]'s.
+    fn lint_boolean_names(&mut self, stmt: &Statement) {
+        let selected = |name: &str| {
+            stmt.fields.iter().chain(&stmt.do_fields).any(|item| {
+                matches!(item, Item::Field { key, explicit: true, .. }
+                    if matches!(key.first(), Some(Seg::Key(k)) if &**k == name))
+            })
+        };
+        for name in std::mem::take(&mut self.boolean_names) {
+            let Some(word) = boolean_in_another_case(&name) else {
+                continue;
+            };
+            if !selected(&name) {
+                self.warnings.push(format!(
+                    "`{name}` is a field name here, as in EMQX; write `{word}` for the boolean"
+                ));
+            }
+        }
+    }
+
     fn in_list(&mut self, expr: Expr, h: usize, negated: bool) -> Parsed {
         self.expect(&Tok::LParen, "'(' after IN")?;
         let (first, mut hi) = self.expr_h()?;
@@ -813,11 +852,18 @@ impl Parser<'_, '_> {
                     self.bump();
                     return self.call(&s, start);
                 }
-                if s.eq_ignore_ascii_case("true") {
-                    return leaf(Expr::Const(Value::Bool(true)));
+                // Lower case only, as in EMQX: `TRUE` and `False` are names like any
+                // other, read as fields (`undefined` in a message that has none).
+                match s.as_str() {
+                    "true" => return leaf(Expr::Const(Value::Bool(true))),
+                    "false" => return leaf(Expr::Const(Value::Bool(false))),
+                    _ => {}
                 }
-                if s.eq_ignore_ascii_case("false") {
-                    return leaf(Expr::Const(Value::Bool(false)));
+                if boolean_in_another_case(&s).is_some()
+                    && !matches!(self.peek(), Tok::Dot | Tok::LBracket | Tok::Range(..))
+                    && !self.boolean_names.contains(&s)
+                {
+                    self.boolean_names.push(s.clone());
                 }
                 leaf(Expr::Path {
                     head: s.into(),
