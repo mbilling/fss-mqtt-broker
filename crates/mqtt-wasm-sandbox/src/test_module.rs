@@ -243,9 +243,11 @@ pub fn module(shape: &Shape) -> Vec<u8> {
     // memory grows a page at a time until it holds the new top.
     let alloc = vec![
         0, 0x23, 0, 0x23, 0, 0x20, 0, 0x6a, 0x24, 0, // old top; top += len
-        0x02, 0x40, 0x03, 0x40, // block, loop
-        0x3f, 0, 0x41, 16, 0x74, 0x23, 0, 0x4f, 0x0d, 1, // (pages << 16) >= top: done
-        0x41, 1, 0x40, 0, 0x1a, 0x0c, 0, // grow one page, again
+        // The loop is entered only when the memory must grow: a loop is where the
+        // runtime looks at the clock, and an allocation that fits has nothing to wait for.
+        0x3f, 0, 0x41, 16, 0x74, 0x23, 0, 0x49, 0x04, 0x40, // if (pages << 16) < top
+        0x03, 0x40, 0x41, 1, 0x40, 0, 0x1a, // loop: grow one page
+        0x3f, 0, 0x41, 16, 0x74, 0x23, 0, 0x49, 0x0d, 0, // again while still short
         0x0b, 0x0b, 0x0b,
     ];
     let free = vec![0, 0x0b];
