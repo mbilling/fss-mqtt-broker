@@ -1671,3 +1671,205 @@ fn concurrent_callers_of_an_lru_namespace_stay_within_its_bound() {
     assert_eq!(store.bytes(), 0, "a dropped namespace gives its bytes back");
     assert_eq!(store.namespaces(), Vec::<String>::new());
 }
+
+// -- sketches, and the types that merge (T2) -------------------------------------------
+
+/// D3: `kv_hll_add` answers the estimate after, `kv_hll_count` the estimate or `0`,
+/// and `kv_get` reads a sketch as its estimate. Two values are one when they are
+/// exactly equal, as in a set.
+#[test]
+fn kv_hll_add_and_kv_hll_count_estimate_distinct_values() {
+    let rig = rig();
+    assert_eq!(rig.select("kv_hll_count('d') AS v"), r#"{"v":0}"#);
+    assert_eq!(rig.select("kv_hll_add('d', 1) AS v"), r#"{"v":1}"#);
+    assert_eq!(rig.select("kv_hll_add('d', 1) AS v"), r#"{"v":1}"#);
+    // `1.0` is not `1`, and `'1'` is neither.
+    assert_eq!(rig.select("kv_hll_add('d', 1.0) AS v"), r#"{"v":2}"#);
+    assert_eq!(rig.select("kv_hll_add('d', '1') AS v"), r#"{"v":3}"#);
+    // A map is the same value whatever order its keys are in.
+    assert_eq!(
+        rig.select_on(
+            "kv_hll_add('d', json_decode(payload)) AS v",
+            r#"{"a":1,"b":2}"#
+        ),
+        r#"{"v":4}"#
+    );
+    assert_eq!(
+        rig.select_on(
+            "kv_hll_add('d', json_decode(payload)) AS v",
+            r#"{"b":2,"a":1}"#
+        ),
+        r#"{"v":4}"#
+    );
+    assert_eq!(
+        rig.select("kv_hll_count('d') AS c, kv_get('d') AS g"),
+        r#"{"c":4,"g":4}"#
+    );
+    assert_eq!(rig.select("kv_del('d') AS v"), r#"{"v":true}"#);
+    assert_eq!(
+        rig.select("kv_hll_count('d') AS c, kv_get('d') AS g"),
+        r#"{"c":0,"g":"undefined"}"#
+    );
+    // `undefined` is no value, here as anywhere.
+    assert!(rig
+        .fails("kv_hll_add('d', payload.missing) AS v")
+        .contains("bad_value"));
+}
+
+/// D4, D9: 2^14 registers, a standard error of about 0.8%, and never more than 12 KiB
+/// of registers however many values a publisher sends.
+#[test]
+fn a_sketch_counts_within_its_error_and_within_12_kib() {
+    let store = Store::new(1 << 20);
+    let ns = store
+        .open(
+            "n",
+            &mqtt_rules::state::NamespaceSettings::defaults(1 << 20),
+        )
+        .unwrap();
+    let mut last_bytes = 0;
+    for i in 0..60_000u32 {
+        let value = mqtt_rules::Value::from(format!("device-{i}"));
+        let hash = mqtt_rules::crdt::stable_hash(&mqtt_rules::state::term_key(&value));
+        let reply = ns
+            .call(&StateOp::HllAdd {
+                key: b"devices",
+                hash,
+                ttl: None,
+            })
+            .unwrap();
+        if [100, 1_000, 10_000, 60_000].contains(&(i + 1)) {
+            let Some(mqtt_rules::Value::Int(estimate)) = reply.value else {
+                panic!("an estimate");
+            };
+            let off = (estimate - i64::from(i + 1)).abs();
+            assert!(
+                off * 40 <= i64::from(i + 1),
+                "{} estimated {estimate}",
+                i + 1
+            );
+        }
+        // What it is accounted only grows, and stops at the registers' 12 KiB.
+        let bytes = store.stats("n").unwrap().bytes;
+        assert!(bytes >= last_bytes);
+        last_bytes = bytes;
+    }
+    let most = ENTRY_OVERHEAD + b"devices".len() + 128 + 12 * 1024;
+    assert_eq!(last_bytes, u64::try_from(most).unwrap());
+    assert_eq!(store.bytes(), last_bytes);
+    // A read is charged as the number it answers, not as the registers.
+    let got = ns.call(&StateOp::Get { key: b"devices" }).unwrap();
+    assert_eq!(got.read_bytes, 8);
+    let counted = ns.call(&StateOp::HllCount { key: b"devices" }).unwrap();
+    assert_eq!(counted.read_bytes, 0);
+    assert!(got.value.unwrap().exact_eq(&counted.value.unwrap()));
+    // Deleted, it gives everything back.
+    ns.call(&StateOp::Del { key: b"devices" }).unwrap();
+    assert_eq!(store.bytes(), 0);
+}
+
+/// D3: a sketch is a type like the others, and expires like them.
+#[test]
+fn a_sketch_is_a_type_of_its_own_and_expires() {
+    let rig = rig();
+    rig.select("kv_hll_add('seen', 'a', 10) AS v, kv_incr('n') AS n");
+    for call in ["kv_incr('seen')", "kv_set('seen', 1)", "kv_add('seen', 1)"] {
+        let e = rig.fails(&format!("{call} AS v"));
+        assert!(
+            e.contains("wrong_type: the key holds a value of type `hll`"),
+            "{e}"
+        );
+    }
+    for call in ["kv_hll_add('n', 'a')", "kv_hll_count('n')"] {
+        let e = rig.fails(&format!("{call} AS v"));
+        assert!(
+            e.contains(
+                "wrong_type: the key holds a value of type `sum`, and this is an operation on \
+                 type `hll`"
+            ),
+            "{e}"
+        );
+    }
+    assert_eq!(rig.stats("rule:test").refused_wrong_type, 5);
+    assert_eq!(rig.select("kv_ttl('seen') AS v"), r#"{"v":10}"#);
+    rig.advance_secs(9);
+    // A call without a TTL leaves the expiry; one with a TTL sets it.
+    assert_eq!(rig.select("kv_hll_add('seen', 'b') AS v"), r#"{"v":2}"#);
+    assert_eq!(rig.select("kv_ttl('seen') AS v"), r#"{"v":1}"#);
+    rig.advance_secs(1);
+    assert_eq!(rig.select("kv_hll_count('seen') AS v"), r#"{"v":0}"#);
+    assert_eq!(rig.select("kv_hll_add('seen', 'c', 5) AS v"), r#"{"v":1}"#);
+    assert_eq!(rig.select("kv_ttl('seen') AS v"), r#"{"v":5}"#);
+}
+
+/// D4: a set reads in one order whatever order its elements were added in, so that
+/// two nodes' copies of it can be the same. Erlang's term order leaves two maps of one
+/// size undecided; their identities decide.
+#[test]
+fn a_set_reads_in_one_order_whatever_order_it_was_built_in() {
+    let (forwards, backwards) = (rig(), rig());
+    let elements = [
+        r#"{"x":1}"#,
+        r#"{"y":1}"#,
+        r#"{"a":[]}"#,
+        r#"{"x":2}"#,
+        r#"[{"k":1}]"#,
+        r#"[{"j":1}]"#,
+    ];
+    for element in elements {
+        forwards.select_on("kv_add('s', json_decode(payload)) AS n", element);
+    }
+    for element in elements.iter().rev() {
+        backwards.select_on("kv_add('s', json_decode(payload)) AS n", element);
+    }
+    let read = forwards.select("kv_get('s') AS v");
+    assert_eq!(read, backwards.select("kv_get('s') AS v"));
+    assert_eq!(read.matches('{').count(), 7, "{read}");
+}
+
+/// T1 pinned a count at 64 bits, and it still is: each step is refused where it would
+/// pass them, in either direction, though the counter now keeps what it added and what
+/// it took away apart.
+#[test]
+fn a_counter_goes_up_and_down_by_the_largest_step_without_end() {
+    let store = Store::new(1 << 20);
+    let ns = store
+        .open(
+            "n",
+            &mqtt_rules::state::NamespaceSettings::defaults(1 << 20),
+        )
+        .unwrap();
+    let incr = |by: i64| {
+        ns.call(&StateOp::Incr {
+            key: b"n",
+            by,
+            ttl: None,
+        })
+    };
+    for _ in 0..10_000 {
+        assert!(incr(i64::MAX)
+            .unwrap()
+            .value
+            .unwrap()
+            .exact_eq(&i64::MAX.into()));
+        assert!(incr(i64::MIN)
+            .unwrap()
+            .value
+            .unwrap()
+            .exact_eq(&(-1).into()));
+        assert!(incr(1).unwrap().value.unwrap().exact_eq(&0.into()));
+    }
+    incr(i64::MIN).unwrap();
+    assert_eq!(
+        incr(-1).unwrap_err().message,
+        "the counter would pass 64 bits"
+    );
+    incr(i64::MAX).unwrap();
+    incr(i64::MAX).unwrap();
+    assert_eq!(
+        incr(2).unwrap_err().message,
+        "the counter would pass 64 bits"
+    );
+    assert!(incr(1).unwrap().value.unwrap().exact_eq(&i64::MAX.into()));
+    assert_eq!(store.stats("n").unwrap().refused_other, 2);
+}

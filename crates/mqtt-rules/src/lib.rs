@@ -20,7 +20,8 @@
 //! publish, so it scales with connections and nodes) and how a republished message is
 //! delivered (through the same acknowledgement gate as the message that caused it).
 //! What a rule remembers between messages ([`state`], ADR 0085) lives in a store the
-//! broker supplies, behind a trait.
+//! broker supplies, behind a trait; the types that store keeps a key in, and how two
+//! nodes' copies of a key merge, are [`crdt`].
 //!
 //! The SQL dialect, the function set and every known difference from EMQX are
 //! documented in `docs/RULES.md`.
@@ -36,6 +37,7 @@ use mqtt_core::FilterKey;
 use serde::Deserialize;
 
 mod action;
+pub mod crdt;
 pub mod edit;
 mod eval;
 mod funcs;

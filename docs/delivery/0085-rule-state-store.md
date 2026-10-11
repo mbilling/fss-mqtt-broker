@@ -11,7 +11,7 @@ tasks:
     evidence: "PR 929: crates/mqtt-rules/src/state.rs (StateStore and StateNamespace handed over in Functions, [state.<name>] and the rule key state, one table of function names) and crates/mqttd/src/rule_state.rs (local namespaces, typed keys, TTLs, bounds, LRU, the rules.state_max_bytes ceiling, brownout); 141 probes of EMQX 6.3.1 (emqx_rule_funcs and emqx_rule_sqltester) pinned in rule_state::tests, none contradicting the ADR; mqtt-rules tests_state (21), mqttd rule_state::tests (33), tests/rules_state.rs (6), additions to rules_binary.rs, admin_rules.rs and the converter test; dry runs on a scratch store; the rule_state benchmark (0.11-0.14 us per call on one thread, Apple M1 Pro)."
   - id: 0085-T2
     title: "Typed merges as CRDTs (lww, first, max, min, sum, union, hll, deletes) on a per-node hybrid logical clock, and the replicated form of a key"
-    status: planned
+    status: in-progress
     issue: 918
   - id: 0085-T3
     title: "eventual mode: every member holds the namespace; changed keys sent per peer link at peer protocol 14, applied off the hub, repaired by anti-entropy after partitions and restarts"
@@ -73,7 +73,7 @@ one node, is done; the table under Progress has where each of the others stands.
 | Task | Follows | Acceptance |
 |---|---|---|
 | **0085-T1** Store and functions (D1–D3, D9, D11, D13, D14) | — | Every function in D3 but `kv_hll_*` works in a `local` namespace, in the broker and in `mqttd --rule-test`; `kv_store_put/get/del` return what EMQX 6.3.1 returns (probed there, a two-message sequence included) and are no longer refused at load or commented out by the converter. Pinned by tests: a state call in a `SELECT` field runs for a message the `WHERE` rejects; one behind `AND`, `OR` or an untaken `CASE` branch does not; a write stays when a later field fails the rule; a later rule and a re-entered rule see it; `FOREACH` calls run per element. `mqtt-rules` still holds no broker state; a file that uses state is refused at load where there is no store, naming `rules.state_max_bytes` when that is `0`. A rule names its namespace with `state`; a key never selects one. A full namespace refuses new keys (or evicts with `eviction = "lru"`), the store's ceiling refuses across namespaces, a brownout refuses new keys, each counted by reason; the 1,025th state call of a message fails its rule; a read is charged to the build budget. Across a reload a namespace keeps, changes or drops its keys as D1 says. `--rule-test`, `--check-rules` and `POST /admin/v1/rules/test` leave the running store untouched. The per-publish benchmark with no state rule does not move outside its spread, and the cost of each call, uncontended and contended, is recorded. |
-| **0085-T2** Merges (D4, D6) | T1 | Each type converges to one value from any delivery order of concurrent updates, deletes included (property tests over random interleavings); a causally later `lww` write is never lost; a delete covers exactly the writes stamped before it; `kv_hll_add` and `kv_hll_count` work, within the stated error; a key's replicated form round-trips every rule value, integers past 64 bits and binaries that are not UTF-8 included; a fuzz target feeds the decoder arbitrary bytes. |
+| **0085-T2** Merges (D4, D6) | T1 | Each type converges to one value from any delivery order of concurrent updates, deletes included (property tests over random interleavings); a causally later `lww` write is never lost; a delete covers exactly the `lww` writes stamped before it, and for the other types those and the writes of nodes that had not heard of it (the ADR's amendment of 2026-10-11 says why no bounded state does better); `kv_hll_add` and `kv_hll_count` work, within the stated error; a key's replicated form round-trips every rule value, integers past 64 bits and binaries that are not UTF-8 included; a fuzz target feeds the decoder arbitrary bytes. |
 | **0085-T3** `eventual` (D5, D15) | T2 | Two nodes updating the same keys across a partition converge after it heals; a restarted node is refilled from the others; a key written many times while a link is slow is sent once, and what waits is bounded by the key count; state frames enter no hub lane (a flood of them does not delay a publish's round trip through the hub); nothing new is on the wire of a cluster without an `eventual` namespace, and a link that negotiated 13 carries none (`cluster_upgrade.rs`); a frame for a namespace declared otherwise is refused and counted; replication lag and what is pending are metrics. |
 | **0085-T4** Expiry events (D7) | T1; its cluster half T3 | A key past its expiry reads as absent at once; `$events/state/expired` fires on one node in a stable cluster and at least once around a membership change; `"$events/#"` does not select it; a mass expiry is delivered at the configured rate, in order, none shed; its rules run off the hub loop; "silent for X" works end to end in the live demo. |
 | **0085-T5** Idempotency (D8) | T2 | A resent message with the same idempotency key does not count twice within the window on one node, nor on another node once the entry has replicated; remembered keys count toward the namespace's bounds and expire. |
@@ -95,7 +95,7 @@ phases.
 | Task | Status | Issue | When | Evidence / notes |
 |------|--------|-------|------|------------------|
 | 0085-T1 | ✅ done | [#917](https://github.com/mbilling/fss-mqtt-broker/issues/917) | 2026-10-11 | "PR 929: crates/mqtt-rules/src/state.rs (StateStore and StateNamespace handed over in Functions, [state.<name>] and the rule key state, one table of function names) and crates/mqttd/src/rule_state.rs (local namespaces, typed keys, TTLs, bounds, LRU, the rules.state_max_bytes ceiling, brownout); 141 probes of EMQX 6.3.1 (emqx_rule_funcs and emqx_rule_sqltester) pinned in rule_state::tests, none contradicting the ADR; mqtt-rules tests_state (21), mqttd rule_state::tests (33), tests/rules_state.rs (6), additions to rules_binary.rs, admin_rules.rs and the converter test; dry runs on a scratch store; the rule_state benchmark (0.11-0.14 us per call on one thread, Apple M1 Pro)." |
-| 0085-T2 | ⬜ planned | [#918](https://github.com/mbilling/fss-mqtt-broker/issues/918) | — |  |
+| 0085-T2 | 🚧 in-progress | [#918](https://github.com/mbilling/fss-mqtt-broker/issues/918) | — |  |
 | 0085-T3 | ⬜ planned | [#919](https://github.com/mbilling/fss-mqtt-broker/issues/919) | — |  |
 | 0085-T4 | ⬜ planned | [#920](https://github.com/mbilling/fss-mqtt-broker/issues/920) | — |  |
 | 0085-T5 | ⬜ planned | [#921](https://github.com/mbilling/fss-mqtt-broker/issues/921) | — |  |
@@ -206,3 +206,53 @@ phases.
     −0.5% and +0.5%, which is inside the spread from one run to the next. (The machine
     was busy, so the figures are higher than T1's; the comparison is like for like.) An
     evaluation that is handed no dictionary makes none unless a rule calls `proc_dict_*`.
+- 2026-10-11 — **T2 built** (#918, in review). What it is:
+  - **The types and their merge** (`crates/mqtt-rules/src/crdt.rs`): a key's state is the
+    latest delete it has seen, what it holds since and when that expires; `lww`, `first`,
+    `max`, `min`, `sum` (per node, what it added and what it took away), `union`, `hll`.
+    The merge is a join (commutative, associative, idempotent) over every state the decoder
+    accepts. The ADR's amendment of this date says where D4 could not be built as written:
+    a delete covers exactly the writes stamped before it for `lww`; for the other types it
+    also covers the writes of nodes that had not heard of it, because no state of bounded
+    size can do otherwise.
+  - **The clock:** 48 bits of milliseconds and a 16-bit counter, one compare-and-swap a
+    stamp, a tag of the node to break ties; it carries on when the wall clock steps back,
+    and a stamp more than 60 seconds ahead of the receiver's wall clock is refused rather
+    than followed (the bound is the amendment's).
+  - **`kv_hll_add` and `kv_hll_count`:** 2^14 registers, listed while few are set and a
+    12 KiB array after; values hashed by their exact identity with SipHash-2-4 under a
+    fixed key (pinned); Ertl's estimator. Measured error at most 0.6% from 1,000 to 300,000
+    values.
+  - **The replicated form of a key:** its whole state, at most 265,246 bytes, values as
+    ADR 0086 D3 has them; one encoding per state, and a decoder that accepts nothing else.
+  - **The store** keeps its keys in these types. A `local` namespace is not stamped and
+    not merged, so it answers as T1 did: T1's tests pass as they were, but for the two
+    lines that expected `kv_hll_add` to be an unknown function. One answer changed: a set
+    that holds maps of equal size reads them in one fixed order, where the order they were
+    added in decided before.
+  - **Proved by:** property tests over every type, all 256 pairs of concurrent operations
+    from each of 17 starting states and three clock orders, 300 random interleavings on
+    three nodes with skewed clocks, and the join's laws over reachable and arbitrary
+    states; the fuzz target `state_merge` (the decoder on arbitrary bytes; scripts of
+    writes, deletes, deliveries, injected states and forgotten tombstones on three nodes,
+    which must end with the same bytes), in the nightly matrix.
+  - **Measured** (`cargo bench -p mqttd --bench rule_state`): Apple M1 Pro, this build
+    and `main`'s run in turn and the best of six rounds taken, because the machine was
+    shared and single runs moved by tens of percent. None of T1's cases got dearer: they
+    came out 2% to 18% cheaper, a read of a missing key (which this change does not
+    touch) 12% among them, so that is the spread between two builds and not a gain. A
+    `local` namespace takes no clock, so there is no stamp on its path; a counter that
+    only this node counts is held in place, without which all threads on one key cost
+    13% to 30% more. The per-publish benchmark without a state rule
+    (`cargo bench -p mqtt-rules`, the same way): +0.0% to +1.1%. New: `kv_hll_add` is
+    0.30 µs in the store beside 0.15 µs for `kv_incr` in the same run; a stamp of the
+    clock is 4 ns alone and 0.2 to 1 µs when eight threads take nothing but stamps.
+  - **Measured on Linux** (the same benchmark in an arm64 container, eight cores; T1's
+    figures were macOS only): a call is 0.19 µs alone; on keys of their own 0.23 µs with
+    two threads, 0.32 µs with four and 0.49 µs with eight; all on one key 0.30 to
+    0.39 µs, 0.95 µs and 3.0 µs. The store tries a shard's lock 24 times before it
+    waits, a count T1 chose on macOS. On Linux, not trying at all is 7% to 12% dearer on
+    one key at four and eight threads and trying 100 times 30% to 75% dearer, so 24
+    stays.
+  - **Left for T3, as planned:** anything on the wire, stamping the writes of an
+    `eventual` namespace, tombstones in the store, the refusal count for clock skew.

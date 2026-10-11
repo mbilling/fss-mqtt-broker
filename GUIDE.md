@@ -998,7 +998,7 @@ cargo deny check          # supply-chain: licenses, advisories, bans, sources
 cargo +nightly fuzz run packet_decode --fuzz-dir crates/mqtt-codec/fuzz    # MQTT client codec
 cargo +nightly fuzz run gossip_open  --fuzz-dir crates/mqtt-cluster/fuzz   # pre-auth SWIM datagram
 cargo +nightly fuzz run peer_decode  --fuzz-dir crates/mqtt-cluster/fuzz   # peer-bus frames
-# also: swim_message (mqtt-cluster), crl_parse + acl_parse (mqtt-auth), rules_parse + rules_eval (mqtt-rules)
+# also: swim_message (mqtt-cluster), crl_parse + acl_parse (mqtt-auth), rules_parse + rules_eval + state_merge (mqtt-rules)
 
 # Hot-path benchmarks + the per-PR regression floor (ADR 0044 P6; see docs/benchmarks/BASELINE.md):
 cargo bench -p mqtt-codec                     # codec encode/decode
