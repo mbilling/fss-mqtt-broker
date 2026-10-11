@@ -815,6 +815,74 @@ fn write_term(v: &Value, out: &mut Vec<u8>) {
     }
 }
 
+/// The value a [`term_key`] was made from, for whoever shows a store's keys (a
+/// replayed sequence's, ADR 0085 D11): EMQX's table is keyed by any value. A binary
+/// that is text reads back as the string. `None` for bytes [`term_key`] never wrote.
+#[must_use]
+pub fn key_term(key: &[u8]) -> Option<Value> {
+    let mut rest = key;
+    let value = read_term(&mut rest, 0)?;
+    rest.is_empty().then_some(value)
+}
+
+fn take<'a>(rest: &mut &'a [u8], n: usize) -> Option<&'a [u8]> {
+    let (head, tail) = rest.split_at_checked(n)?;
+    *rest = tail;
+    Some(head)
+}
+
+fn read_len(rest: &mut &[u8]) -> Option<usize> {
+    let n = u64::from_be_bytes(take(rest, 8)?.try_into().ok()?);
+    // Every element takes at least a byte, so a length past what is left is not one.
+    usize::try_from(n).ok().filter(|n| *n <= rest.len())
+}
+
+fn read_term(rest: &mut &[u8], depth: usize) -> Option<Value> {
+    // Deeper than any value the rule engine builds.
+    if depth > 128 {
+        return None;
+    }
+    Some(match take(rest, 1)?[0] {
+        0 => Value::Undefined,
+        1 => Value::Null,
+        2 => Value::Bool(false),
+        3 => Value::Bool(true),
+        4 => Value::Int(i64::from_be_bytes(take(rest, 8)?.try_into().ok()?)),
+        5 => {
+            let n = read_len(rest)?;
+            Value::Big(Arc::new(num_bigint::BigInt::from_signed_bytes_be(take(
+                rest, n,
+            )?)))
+        }
+        6 => Value::Float(f64::from_bits(u64::from_be_bytes(
+            take(rest, 8)?.try_into().ok()?,
+        ))),
+        7 => {
+            let n = read_len(rest)?;
+            Value::from_bytes(&bytes::Bytes::copy_from_slice(take(rest, n)?))
+        }
+        8 => {
+            let n = read_len(rest)?;
+            let mut items = Vec::with_capacity(n);
+            for _ in 0..n {
+                items.push(read_term(rest, depth + 1)?);
+            }
+            Value::from(items)
+        }
+        9 => {
+            let n = read_len(rest)?;
+            let mut map = crate::value::Map::with_capacity(n);
+            for _ in 0..n {
+                let len = read_len(rest)?;
+                let key = std::str::from_utf8(take(rest, len)?).ok()?;
+                map.insert(key, read_term(rest, depth + 1)?);
+            }
+            Value::from(map)
+        }
+        _ => return None,
+    })
+}
+
 fn fail(reason: &str, message: impl std::fmt::Display) -> EvalError {
     EvalError::new(format!("{reason}: {message}"))
 }

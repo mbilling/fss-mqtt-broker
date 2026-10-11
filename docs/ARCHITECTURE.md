@@ -116,7 +116,7 @@ From `hub/mod.rs`:
 | `SIGHUP` / `MQTTD_CONFIG_WATCH` | Validate-before-swap reload (ADR 0032/0033). |
 | `--check-config` | Validate and exit; bind nothing. Includes startup's pre-bind checks that need nothing from the host (bind syntax, TLS/QUIC/OIDC/cluster prerequisites). |
 | `--check-config --preflight` | Also the host (issue #671): every bind resolved, every referenced file (TLS, password, ACL, JWT, cluster TLS, gossip key, rules) opened and parsed as the invoking user. |
-| `--check-rules [file]` / `--rule-test --sql …` | Load a rules file and exit; run one statement over a sample message (ADR 0083). |
+| `--check-rules [file]` / `--rule-test --sql …` | Load a rules file and exit; run one statement over a sample message (ADR 0083), or with `--sequence <file>` replay a timed sequence of messages through it, or through the rules file, on a store and a clock of the replay's own (ADR 0085). |
 
 ## Where to put a change
 

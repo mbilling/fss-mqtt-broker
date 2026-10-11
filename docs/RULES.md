@@ -251,9 +251,9 @@ quickstart's file with the number after `>` deleted:
 rules INVALID (rules.toml): rule `high_temp`: expected an expression (line 4, column 1, near `end of statement`)
 ```
 
-A warning — a [double-quoted string](#gotchas) compared with `=`, or a
-`direct_dispatch` that is neither a boolean nor a placeholder — goes to stderr and does
-not fail the check.
+A warning — a [double-quoted string](#gotchas) compared with `=`, a
+[`TRUE` or `FALSE` in capitals](#gotchas) read as a value, or a `direct_dispatch` that is
+neither a boolean nor a placeholder — goes to stderr and does not fail the check.
 
 With no file argument, `mqttd --check-rules` checks the `rules.file` of the effective
 configuration (`--config` and `MQTTD_*`). It loads that configuration first, as the broker
@@ -347,6 +347,158 @@ does not start with `-`, so an empty payload, or one such as `-5`, cannot be sim
 (either is a usage error, exit `2`). It does not print the loader's warnings (the
 double-quote one in particular): run `--check-rules` on the file for those, and a
 [`console` action](#console) on a test broker to see real messages.
+
+### Replay a sequence: `mqttd --rule-test --sequence`
+
+A rule that [keeps state](#state-what-a-rule-remembers) cannot be judged from one
+message: "above 30 for five minutes" takes several, at the right times. `--sequence
+<file>` replays a list of messages through the statement, in order, on **one store that
+starts empty** and on **a clock the sequence drives**, and prints for each step what the
+statement output and what the step changed in the store.
+
+The file has one JSON object per line. Blank lines and lines that start with `#` are
+skipped.
+
+| Key | |
+|---|---|
+| `at` | when the step happens, from the start of the sequence: a number of seconds (`1.5`), or text (`"250ms"`, `"90s"`, `"5m"`, `"1h"`, `"2d"`). Never before the step before it |
+| `after` | instead of `at`: how long after the step before it. With neither, the step happens when the one before it did |
+| `topic`, `payload`, `qos`, `retain`, `clientid`, `username` | the message. A `payload` that is a JSON string is that text; any other JSON value is sent as it is written. What a line leaves out is what `--topic`, `--payload`, `--clientid`, `--username` and `--qos` say, or their defaults |
+| `event` | instead of a message, a sample of this event, as `--event` builds it |
+
+A line with no `topic`, no `payload` and no `event` sends nothing: it only moves the
+clock. `--sequence -` reads the sequence from standard input. A sequence has at most
+10,000 steps and a line at most 1 MiB.
+
+```sh
+cat > hot.jsonl <<'EOF'
+# a sensor that runs hot for five minutes, cools, and goes quiet
+{"at": 0,     "topic": "sensors/s1/data", "clientid": "s1", "payload": {"temp": 31}}
+{"at": "2m",  "topic": "sensors/s1/data", "clientid": "s1", "payload": {"temp": 32}}
+{"at": "5m",  "topic": "sensors/s1/data", "clientid": "s1", "payload": {"temp": 33}}
+{"after": 30, "topic": "sensors/s1/data", "clientid": "s1", "payload": {"temp": 20}}
+{"after": 30, "topic": "sensors/s1/data", "clientid": "s1", "payload": {"temp": 35}}
+{"at": "2h"}
+EOF
+```
+
+```console
+$ mqttd --rule-test --sql 'SELECT clientid, payload.temp AS temp, kv_held(clientid, payload.temp > 30, 3600) AS hot_for FROM "sensors/+/data" WHERE hot_for >= 300' --sequence hot.jsonl --show-state
+#1 +0s sensors/s1/data {"temp": 31}
+  (no output)
+  state rule:test: + "s1" = 1735689600000 (first, expires +3600s)
+#2 +120s sensors/s1/data {"temp": 32}
+  (no output)
+  state rule:test: ~ "s1" = 1735689600000 (first, expires +3720s)
+#3 +300s sensors/s1/data {"temp": 33}
+  {"clientid":"s1","temp":33,"hot_for":300}
+  state rule:test: ~ "s1" = 1735689600000 (first, expires +3900s)
+#4 +330s sensors/s1/data {"temp": 20}
+  (no output)
+  state rule:test: - "s1"
+#5 +360s sensors/s1/data {"temp": 35}
+  (no output)
+  state rule:test: + "s1" = 1735689960000 (first, expires +3960s)
+#6 +7200s (nothing sent)
+  state rule:test: - "s1" (expired +3960s)
+state at the end (+7200s):
+  (empty)
+```
+
+Each step is headed by its number, its time on the sequence's clock and what was sent.
+Under it are the statement's outputs, as `--rule-test` prints them, or `(no output)`, and
+then a line for each key the step changed: `+` a new key, `~` a new value or a new expiry,
+`-` a key that is gone, with the key's namespace, its value as `kv_get` reads it, its type
+and when it expires. `--show-state` adds what the store holds after the last step. The
+replay shows what a single message cannot: the first hot reading is recorded on a message
+the `WHERE` turns away (the call is in a `SELECT` field), every reading moves the expiry,
+the cool one deletes the key, and the key the last reading made expires an hour later.
+
+**The clock.** A sequence starts at 2025-01-01T00:00:00Z, and a step happens at that time
+plus its `at`. `now_timestamp()`, `now_rfc3339()`, a `format_date` without a time,
+`timestamp`, `publish_received_at` and every TTL read that clock and never the wall
+clock, and a message's `id` counts from 1, so a replay prints the same thing every time
+it runs. A key past its expiry reads as absent from that moment, and the first step after
+it reports it as `(expired …)`. The [event a key's expiry is to raise](adr/0085-rule-state-store.md)
+is not built yet, so a replay does not run rules on it.
+
+**A whole rules file.** Without `--sql`, the sequence runs through the configured rules
+file (`rules.file`: `MQTTD_RULES_FILE`, or `--config`), as the broker would run it: every
+enabled rule whose `FROM` selects the message, in id order, with its actions, the
+namespaces the file declares, and each republished message re-entering the rules.
+
+```sh
+cat > stateful.toml <<'EOF'
+[state.alerts]
+default_ttl = "1h"
+
+[rules.hot_sensor]
+state = "alerts"
+sql = '''
+SELECT clientid, payload.temp AS temp,
+       kv_held('hot:' + clientid, payload.temp > 30) AS hot_for
+FROM "sensors/+/data"
+WHERE hot_for >= 300
+'''
+actions = [{ function = "republish", args = { topic = "alerts/hot/${clientid}", payload = "${.}" } }]
+
+[rules.alert_count]
+state = "alerts"
+sql = 'SELECT topic(3) AS sensor, kv_incr(topic) AS alerts FROM "alerts/hot/+"'
+actions = [{ function = "console" }]
+EOF
+```
+
+```console
+$ MQTTD_RULES_FILE=stateful.toml mqttd --rule-test --sequence hot.jsonl
+#1 +0s sensors/s1/data {"temp": 31}
+  hot_sensor: no_result
+  state alerts: + "hot:s1" = 1735689600000 (first, expires +3600s)
+#2 +120s sensors/s1/data {"temp": 32}
+  hot_sensor: no_result
+#3 +300s sensors/s1/data {"temp": 33}
+  hot_sensor: passed
+    republish alerts/hot/s1 qos 0 {"clientid":"s1","temp":33,"hot_for":300}
+  > alerts/hot/s1 (republished by hot_sensor)
+    alert_count: passed
+      console {"sensor":"s1","alerts":1}
+  state alerts: + "alerts/hot/s1" = 1 (sum, expires +3900s)
+#4 +330s sensors/s1/data {"temp": 20}
+  hot_sensor: no_result
+  state alerts: - "hot:s1"
+#5 +360s sensors/s1/data {"temp": 35}
+  hot_sensor: no_result
+  state alerts: + "hot:s1" = 1735689960000 (first, expires +3960s)
+#6 +7200s (nothing sent)
+  state alerts: - "alerts/hot/s1" (expired +3900s)
+  state alerts: - "hot:s1" (expired +3960s)
+```
+
+Each rule that ran is listed with how its SQL ended (`passed`, `no_result`, or
+`FAILED: <why>`) and, under it, what each action rendered: `republish <topic> qos <n>
+[retain] <payload>`, `console <output>`, or `action FAILED: <why>`. A line that starts
+with `>` is a republished message re-entering the rules, with the rules it ran indented
+under it. A message no rule selects prints `(no rule selects it)`.
+
+**What a replay is, and is not.**
+
+- It never reads or writes the state a running broker's rules keep: the store is the
+  replay's own, under the configured `rules.state_max_bytes`, and is dropped at the end.
+- `proc_dict_*` work on one dictionary per `clientid` in the sequence, which stands in for
+  one connection of that client. The report does not show the dictionaries.
+- It is one node. Once namespaces can be replicated (`consistency = "eventual"`, not in
+  this release), such a namespace behaves as `local` in a replay, and the report says so
+  in a `note:` line.
+- A step that fails does not stop the replay: it prints `FAILED: <why>`, what it wrote
+  before failing stays, and the next step runs. The replay then exits `1`, with
+  `rule test FAILED: <n> of <m> steps had a rule or an action fail` on stderr. It also
+  exits `1` when nothing in the sequence is selected by the statement's `FROM` (or by any
+  enabled rule of the file); a single step that is not selected prints `(not selected:
+  <why>)` and is no failure. A sequence that cannot be read is a usage error, exit `2`,
+  naming the line: `error: hot.jsonl: line 4: …`.
+- A test can call the same replay as a library (`mqttd::rule_replay`).
+  `crates/mqttd/tests/rules_sequence.rs` has more worked sequences that way: a quota in a
+  window, change detection with `kv_changed`, a counter in EMQX's `kv_store_*`.
 
 ### Watch a running rule
 
@@ -729,6 +881,26 @@ mosquitto_sub -h 127.0.0.1 -t '$SYS/brokers/+/rules' -v
   {"name":"undefined"}
   ```
 
+- **`TRUE` and `FALSE` in capitals are field names. Write `true` and `false`.** Only the
+  two lower-case words are the booleans, as in EMQX. Any other spelling (`TRUE`, `True`,
+  `FALSE`) is a name like `payload`: a field no message has, so `undefined`.
+  `WHERE payload.ok = TRUE` is therefore false for `{"ok": true}` and **true for a
+  message without `ok`** (`undefined` equals `undefined`), and `SELECT TRUE AS on` gives
+  `undefined`. `--check-rules`, a load and a reload warn about each such word
+  (``rule `r`: `TRUE` is a field name here, as in EMQX; write `true` for the boolean``);
+  `--rule-test` does not:
+
+  ```console
+  $ mqttd --rule-test --sql 'SELECT payload.ok AS ok FROM "t/#" WHERE payload.ok = TRUE' --payload '{"other": 1}'
+  {"ok":"undefined"}
+  ```
+
+  **Upgrading from an earlier build.** Until 2026-10-11 a build of `main` read these
+  words as the booleans in any case, which EMQX never did. A rules file written for such
+  a build that holds one changes its result without failing: run `mqttd --check-rules`
+  on it, and put each word it names in lower case. A rule moved from EMQX means here what
+  it meant there, and the converter carries it as it is.
+
 - **Not selecting `qos` republishes at QoS 0.** A republish's `qos` defaults to `${qos}`,
   and every placeholder reads the rule's **output**, not the message. A rule that does
   not select `qos` (or `*`) therefore republishes a QoS 2 message at QoS 0. Select `qos`,
@@ -1050,7 +1222,9 @@ or 2 message routed just ahead of it.
 ## SQL
 
 The grammar is EMQX's (`rulesql`), with the same operator precedence. Keywords are
-case-insensitive.
+case-insensitive. Four words are not, as in EMQX: the booleans `true` and `false` and
+the operators `div` and `mod` are lower case only, and `TRUE` or `DIV` is a field name
+([Gotchas](#gotchas)). Function names are case-sensitive too.
 
 ```sql
 SELECT <field> [AS <alias>], ... FROM "<topic filter or event>", ... [WHERE <condition>]
@@ -2179,6 +2353,11 @@ $ mqttd --rule-test --sql 'SELECT kv_incr(clientid) AS first, kv_incr(clientid) 
 {"first":1,"second":2,"changed":true}
 ```
 
+One message does not show what a rule does with what it remembers.
+[`mqttd --rule-test --sequence`](#replay-a-sequence-mqttd---rule-test---sequence) replays
+a list of messages, each at a time of its own, on one such store and prints what every
+step changed in it.
+
 **Cost.** A state call is one operation on an in-memory map under a lock held for that
 operation only; it never waits, and a rules file that calls none pays nothing. A
 `proc_dict_*` call takes no lock at all: the dictionary belongs to the connection that
@@ -2301,6 +2480,7 @@ cookbook's [What rules cannot do](RULES-COOKBOOK.md#what-rules-cannot-do).
 |---|---|
 | Validate a rules file | `mqttd --check-rules <file>` (exit 0 OK, 1 invalid, 2 usage) lists every rule it loaded. With no file it loads the effective configuration and checks its `rules.file`. `mqttd --check-config --preflight` loads it too. See [Check a file](#check-a-file-mqttd---check-rules). |
 | Try a statement | `mqttd --rule-test --sql '<statement>' [--topic t] [--payload p] [--clientid c] [--username u] [--qos n] [--event e]` prints each output as JSON. This is EMQX's "SQL test", offline; a `$events` statement runs against a sample event. See [Try a statement](#try-a-statement-mqttd---rule-test). |
+| Try a rule that keeps state | `mqttd --rule-test [--sql '<statement>'] --sequence <file> [--show-state]` replays a file of messages (one JSON object per line, each with its time) on a store of its own and a clock the sequence drives, and prints each step's outputs and what it changed in the store; without `--sql`, through every rule of the configured rules file, actions included. See [Replay a sequence](#replay-a-sequence-mqttd---rule-test---sequence). |
 | Change rules | Edit the file, then `SIGHUP` (`kill -HUP <pid>`; under the shipped systemd unit, `systemctl reload mqttd`; in a container, `docker kill --signal=HUP <container>`). With `MQTTD_CONFIG_WATCH` set, the file watcher picks the edit up on its own; the image has no shell to send a signal from, so the Helm chart turns the watcher on. With the admin API (`admin.bind` and its mTLS certificates), `mqttd --admin reload` or `POST /admin/v1/reload` does the same ([ADMIN-CLI.md](ADMIN-CLI.md#config-reload)). For a subject in `[rules] admin_writers`, `mqttd --admin rules-apply` and `PUT`/`DELETE /admin/v1/rule` write the file and reload it in one step ([Through the admin API](#through-the-admin-api)). The next publish runs the new rules. A file that does not load is rejected with the reload, keeping the running rules: the **whole** reload, so a broken rules file also holds back an ACL or credential change made at the same time. |
 | Confirm every node runs the same rules | `mqttd_rules_info{checksum}`: the file's SHA-256, one series at 1 per node (a checksum replaced by a reload stays exported at 0). The same digest is in `/statusz` (`rules.digest`), in each node's `$SYS/brokers/<node>/rules` summary, and, compared across nodes, in `summary.same_rules` of `mqttd --admin cluster --json`. Rules are per-node configuration like the ACL file, so a node with a different file evaluates its own clients' publishes with different rules. |
 | Watch rules work | On `GET /metrics`, served at `MQTTD_HEALTH_BIND` or `MQTTD_METRICS_BIND`: `mqttd_rule_evaluations_total{rule,result}` (`passed`, `no_result`, `failed`) and `mqttd_rule_actions_total{rule,result}` (`ok`, `failed`) are EMQX's per-rule counters. An action is counted once its outcome is known: a republish is `ok` when the broker routed it (accepted it, for a QoS ≥ 1 message behind a QoS ≥ 1 publish and for every message an event or a Will derives; routed it, for anything else) and `failed` when it could not render, when the broker refused it, when the hub refused its original (and so routed none of its derived messages), or when its fate is unknown. `ok` does not follow each copy to its subscribers: a subscriber's own limits can drop one later (a full offline queue), counted in `mqttd_publish_dropped_total` as for any message. `mqttd_rules_loaded` is the number of enabled rules. A rule whose statement or action fails logs one WARN per rule per 10 s with the error; the rest are at DEBUG. The same counts, with rates and the last error, are on `$SYS/brokers/<node>/rules/<id>` with `sys_interval_secs` set, and in `mqttd --admin rules` ([Watch and edit rules live](#watch-and-edit-rules-live)). |
@@ -2423,8 +2603,8 @@ EMQX fails on each message, and statements only mqttd accepts.
 | Rule statistics | The dashboard and the REST API | `/metrics`; with `sys_interval_secs`, `$SYS/brokers/<node>/rules/<id>`; `GET /admin/v1/rules` |
 | Changing rules | The dashboard and the REST API, applied across the cluster | The rules file, reloaded; for a listed writer, the admin API writes that file, on the node it asks |
 | Testing a rule | The dashboard's SQL test, which calls the real functions: a test of `kv_store_put` writes the node's table | `mqttd --rule-test` (the statement only), or `POST /admin/v1/rules/test` (the statement and the rendered actions); a state call in a test never touches the running rules' state |
-| Conditions EMQX's runtime has no clause for (mqttd-only): a bare value as a condition or as an operand of `AND`/`OR`, `NOT IN`, `NOT` over `AND`/`OR`/`NOT`, a function that does not return a boolean, `AND`/`OR`/`NOT`/`IN` in `CASE x WHEN …`, `TRUE`/`FALSE` in upper case | The rule is created, with nothing said, and fails on each message that reaches the form (`failed`, `failed.exception`); `TRUE` and `FALSE` are field names, `undefined` (EMQX 6.3.1) | Evaluated: a condition passes exactly when it is the boolean `true`, `NOT IN` is the negation of `IN`, `TRUE` is `true`. No rule that works in EMQX holds one of these, so none behaves differently here; a rule that relies on one does not port back to EMQX ([the table below](#conditions-emqx-fails-and-mqttd-evaluates), with the form to write for both) |
-| Statements only mqttd accepts (mqttd-only extensions) | A parse error: the rule is not created (EMQX 6.3.1, rulesql 0.2.1) | Accepted, each with the meaning it has where EMQX allows it: `AND`, `OR`, `NOT`, `IN` and `NOT IN` outside `WHERE`/`INCASE`/`WHEN` (in `SELECT`, `DO`, a function argument, an array); a comparison in parentheses or in an array (`(a > 1) AS ok`); `CASE` inside a larger expression (`1 + CASE … END`); a keyword as a path segment (`payload.from`, which EMQX takes as `payload.'from'`); field or index access on a computed value (`json_decode(payload).a`, `nth(1, l).b`); a name starting with `_`; a float literal with an exponent and no fraction (`1e5`, `10e5`) or with an `f`/`d` suffix (`1.5f`). Every statement EMQX accepts loads in mqttd; leave these out of a rule that must also load in EMQX. |
+| Conditions EMQX's runtime has no clause for (mqttd-only): a bare value as a condition or as an operand of `AND`/`OR`, `NOT IN`, `NOT` over `AND`/`OR`/`NOT`, a function that does not return a boolean, `AND`/`OR`/`NOT`/`IN` in `CASE x WHEN …` | The rule is created, with nothing said, and fails on each message that reaches the form (`failed`, `failed.exception`) (EMQX 6.3.1) | Evaluated: a condition passes exactly when it is the boolean `true`, `NOT IN` is the negation of `IN`. No rule that works in EMQX holds one of these, so none behaves differently here; a rule that relies on one does not port back to EMQX ([the table below](#conditions-emqx-fails-and-mqttd-evaluates), with the form to write for both) |
+| Statements only mqttd accepts (mqttd-only extensions) | A parse error: the rule is not created (EMQX 6.3.1, rulesql 0.2.1) | Accepted, each with the meaning it has where EMQX allows it: `AND`, `OR`, `NOT`, `IN` and `NOT IN` outside `WHERE`/`INCASE`/`WHEN` (in `SELECT`, `DO`, a function argument, an array); a comparison in parentheses or in an array (`(a > 1) AS ok`); `CASE` inside a larger expression (`1 + CASE … END`); a keyword, `div`, `mod`, `true` or `false` as a path segment (`payload.from`, `payload.true`, which EMQX takes as `payload.'from'`); `true` or `false` as a path's head or an alias (`true.x`; `1 AS true` is created in EMQX and fails on every message, and is the key `true` here); `if` and `elsif`, which EMQX reserves and never uses, as names; field or index access on a computed value (`json_decode(payload).a`, `nth(1, l).b`); a name starting with `_`; a float literal with an exponent and no fraction (`1e5`, `10e5`) or with an `f`/`d` suffix (`1.5f`). Every statement EMQX accepts loads in mqttd; leave these out of a rule that must also load in EMQX. |
 
 ### Conditions EMQX fails and mqttd evaluates
 
@@ -2438,8 +2618,7 @@ boolean `true`**.
 
 So every rule that works in EMQX gives the same here, and the difference is one-way: a
 rule written for mqttd that relies on a form below does not port back to EMQX. It loads
-there and fails (the last row: runs with another result). `mqttd --check-rules` does not
-warn about these forms.
+there and fails. `mqttd --check-rules` does not warn about these forms.
 
 | Written in a condition | EMQX | mqttd | For a rule that must also run in EMQX |
 |---|---|---|---|
@@ -2449,7 +2628,10 @@ warn about these forms.
 | `NOT (a AND b)`, `NOT (a OR b)`, `NOT NOT a` | The rule fails when it is reached, before any of it is evaluated | Evaluated; `NOT` of anything but a boolean is `false`, as in EMQX | `NOT a OR NOT b`, `NOT a AND NOT b`; for a boolean `a`, `a = true` |
 | A function that does not return a boolean: `WHERE abs(payload.x)`, `INCASE abs(item)`, `abs(payload.x) AND …`, `… AND abs(payload.x)` when reached | The rule fails (`failed.exception`). Only as a whole `CASE WHEN`, or on the right of its `AND`/`OR`, does EMQX go on to the next `WHEN` | "Not true": the condition is false (`no_result`), so as a whole `WHERE`/`INCASE` or on the right of an `AND` only the counter differs; on the left of an `OR` the right operand runs | A comparison: `abs(payload.x) > 0` |
 | `AND`, `OR`, `NOT` or `IN` as the `WHEN` of a `CASE` with an operand: `CASE x WHEN y IN (1, 2) THEN …` | The rule fails in the `WHEN` that is reached: that `WHEN` is a value to match `x` against, and only a comparison is a value there | The `WHEN` is its boolean, matched against `x` | A `CASE WHEN <condition> THEN …` |
-| `TRUE`, `True`, `FALSE`: any spelling but lower case | A field of that name, which no message has: `undefined`. `WHERE TRUE` fails the rule, but `WHERE payload.ok = TRUE` and `SELECT TRUE AS a` run: the first is true only for a message *without* `ok`, the second gives `undefined` | The booleans, as `true` and `false` are | `true`, `false` |
+
+`TRUE` and `FALSE` in capitals are not in this table: they are field names in both
+engines, with the same result ([Gotchas](#gotchas)). As a whole condition, `WHERE TRUE`
+is the first row's bare value: a field, which is not the boolean `true`.
 
 `CASE x WHEN v THEN …` itself is evaluated as EMQX evaluates it: `v`, then `x`, again for
 each `WHEN` it comes to ([When a call runs](#state-what-a-rule-remembers)).
