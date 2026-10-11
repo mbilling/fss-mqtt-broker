@@ -40,6 +40,8 @@ pub(crate) struct FnCtx<'a> {
     pub regex: Option<&'a Compiled>,
     /// What runs `jq`, for a call of it.
     pub jq: Option<&'a crate::jq::Jq>,
+    /// The module and function, for a call of an operator's function.
+    pub module: Option<&'a crate::plugin::ModuleCall>,
 }
 
 /// A built-in function.
@@ -643,10 +645,60 @@ fn jq(a: &[Value], cx: &FnCtx) -> Result<Value, EvalError> {
     let started = std::time::Instant::now();
     let result = jq_call(jq, a, cx);
     cx.ctx.calls.borrow_mut().push(crate::jq::FunctionCall {
-        function: "jq",
+        function: jq.name().clone(),
+        module: jq.name().clone(),
         elapsed: started.elapsed(),
         error: result.as_ref().err().map(|e| e.kind),
-        module: jq.stats(),
+        stats: jq.stats(),
+    });
+    result.map_err(|e| EvalError::new(e.text))
+}
+
+/// What every call of an operator's function goes through: its name, arity and module
+/// are the call's own ([`FnCtx::module`]).
+static MODULE_FUNC: Func = Func {
+    name: "a module's function",
+    min: 0,
+    max: MANY,
+    f: module_function,
+    regex_arg: None,
+};
+
+/// The built-in that calls a function of an operator's module (ADR 0086 D9).
+pub(crate) fn module_func() -> &'static Func {
+    &MODULE_FUNC
+}
+
+/// One call of an operator's function, in the sandbox, under its module's limits. The
+/// result is charged whole to the message's build budget, as `jq`'s is (D7), and the
+/// call is reported whatever its end.
+fn module_function(a: &[Value], cx: &FnCtx) -> Result<Value, EvalError> {
+    use crate::plugin::Reply;
+    let Some(call) = cx.module else {
+        return Err(EvalError::new("no module provides this function"));
+    };
+    let started = std::time::Instant::now();
+    let left = MAX_BUILT_BYTES.saturating_sub(cx.ctx.built.get());
+    let result = call
+        .module
+        .call(&call.function.name, a, left)
+        .and_then(|reply| {
+            let (bytes, value) = match reply {
+                Reply::Binary(bytes) => (bytes.len(), Ok(Value::from_bytes(&bytes.into()))),
+                Reply::Json(text) => (text.len(), json_decode(&text)),
+            };
+            cx.ctx.built.set(cx.ctx.built.get().saturating_add(bytes));
+            value.map_err(|e| crate::jq::Failure {
+                text: format!("the result is not JSON the rule engine reads: {e}"),
+                kind: "decode",
+            })
+        });
+    cx.ctx.calls.borrow_mut().push(crate::jq::FunctionCall {
+        function: call.function.name.clone(),
+        module: call.module.name().clone(),
+        elapsed: started.elapsed(),
+        error: result.as_ref().err().map(|e| e.kind),
+        stats: call.module.stats(),
     });
     result.map_err(|e| EvalError::new(e.text))
 }

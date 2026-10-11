@@ -342,6 +342,11 @@ queue_overflow = "drop-oldest"       # or "reject-newest"
 # The environment variables a jq program may read ($ENV.NAME, env.NAME). Empty = none:
 # unlike EMQX, which shows jq the broker's whole environment, secrets included.
 # jq_env = []
+# The environment variables a module declared in the rules file ([functions.<name>],
+# docs/RULES.md "Your own functions") may be shown. A table's `env` may name only
+# these, so whoever writes rules cannot show a module the rest of the broker's
+# environment. Empty = none. Read at startup.
+# functions_env = []
 
 [observability]
 # OTLP/HTTP push export (ADR 0020). Unset = Prometheus /metrics endpoint only.

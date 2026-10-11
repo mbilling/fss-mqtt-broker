@@ -29,6 +29,7 @@ use std::sync::Arc;
 use crate::funcs::{self, Compiled, Func};
 use crate::jq::{Functions, Jq, JqSwitch};
 use crate::lexer::{lex, Kw, Spanned, Tok};
+use crate::plugin::{Module, ModuleCall};
 use crate::value::Value;
 use crate::{ParseError, MAX_REGEX_LITERALS_PER_FILE, MAX_REGEX_LITERAL_BYTES_PER_FILE};
 
@@ -114,6 +115,9 @@ pub(crate) enum Expr {
         regex: Option<Compiled>,
         /// For `jq`: what runs it (ADR 0086), which the rules were loaded with.
         jq: Option<Arc<Jq>>,
+        /// For a function of an operator's module (ADR 0086 D9): the module and the
+        /// function. `func` is then the one that calls it.
+        module: Option<ModuleCall>,
     },
 }
 
@@ -175,6 +179,11 @@ pub(crate) struct Loading<'f> {
     pub jq: Option<Arc<Jq>>,
     /// The jq programs the statements spell out, each once.
     pub jq_programs: Vec<Arc<str>>,
+    /// The modules whose functions the statements may call: the file's own
+    /// `[functions.<name>]` tables.
+    pub modules: Vec<Arc<Module>>,
+    /// Whether a statement calls one.
+    pub calls_module: bool,
 }
 
 impl<'f> Loading<'f> {
@@ -184,7 +193,22 @@ impl<'f> Loading<'f> {
             functions,
             jq: None,
             jq_programs: Vec::new(),
+            modules: functions.declared.clone(),
+            calls_module: false,
         }
+    }
+
+    /// The module function called `name`, when a module of the file provides one.
+    fn module_function(&mut self, name: &str) -> Option<ModuleCall> {
+        let call = self.modules.iter().find_map(|module| {
+            let function = module.functions().iter().find(|f| &*f.name == name)?;
+            Some(ModuleCall {
+                module: module.clone(),
+                function: function.clone(),
+            })
+        })?;
+        self.calls_module = true;
+        Some(call)
     }
 
     /// What runs a call of `jq` in the file being loaded, or why the file cannot be
@@ -852,22 +876,33 @@ impl Parser<'_, '_> {
             }
             self.expect(&Tok::RParen, "')' closing the argument list")?;
         }
-        let Some(func) = funcs::lookup(name) else {
-            return Err(ParseError::at(
-                self.sql,
-                start,
-                format!(
-                    "unknown function {name}() — see docs/RULES.md for the supported functions"
-                ),
-            ));
+        // A built-in function first; a module cannot take a built-in's name.
+        let (func, module) = match funcs::lookup(name) {
+            Some(func) => (func, None),
+            None => match self.loading.module_function(name) {
+                Some(call) => (funcs::module_func(), Some(call)),
+                None => {
+                    return Err(ParseError::at(
+                        self.sql,
+                        start,
+                        format!(
+                            "unknown function {name}() — see docs/RULES.md for the supported \
+                             functions"
+                        ),
+                    ));
+                }
+            },
         };
-        if args.len() < func.min || args.len() > func.max {
-            let expected = if func.min == func.max {
-                func.min.to_string()
-            } else if func.max == usize::MAX {
-                format!("at least {}", func.min)
+        let (min, max) = module.as_ref().map_or((func.min, func.max), |m| {
+            (m.function.min_args, m.function.max_args)
+        });
+        if args.len() < min || args.len() > max {
+            let expected = if min == max {
+                min.to_string()
+            } else if max == usize::MAX {
+                format!("at least {min}")
             } else {
-                format!("{}..={}", func.min, func.max)
+                format!("{min}..={max}")
             };
             return Err(ParseError::at(
                 self.sql,
@@ -923,6 +958,7 @@ impl Parser<'_, '_> {
                 args,
                 regex,
                 jq,
+                module,
             },
             h,
         ))

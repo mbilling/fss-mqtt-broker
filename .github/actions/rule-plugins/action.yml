@@ -1,0 +1,31 @@
+name: Build the example rule-function modules
+description: >
+  Builds the two worked examples of operator modules (ADR 0086 D9) into
+  examples/rule-plugins/out: geo.wasm from Rust (target wasm32-unknown-unknown) and
+  telemetry.wasm from C (the pinned zig, as the jq module). The broker's tests declare
+  them in a rules file and call them through the shipped binary; without the files those
+  tests fail under CI rather than skip, so a job that runs them runs this first.
+runs:
+  using: composite
+  steps:
+    # The modules are a function of their sources, the script, the two compilers'
+    # pins. A hit skips the builds, the compiler download and the target's download.
+    - name: Cache the built modules
+      id: modules
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: examples/rule-plugins/out
+        key: rule-plugins-${{ hashFiles('examples/rule-plugins/build.sh', 'examples/rule-plugins/rust/Cargo.toml', 'examples/rule-plugins/rust/Cargo.lock', 'examples/rule-plugins/rust/.cargo/config.toml', 'examples/rule-plugins/rust/src/**', 'examples/rule-plugins/c/**', 'crates/mqtt-wasm-sandbox/jq-module/build.sh', 'crates/mqtt-wasm-sandbox/jq-module/fetch-zig.sh', 'rust-toolchain.toml') }}
+    - name: Build geo.wasm (Rust) and telemetry.wasm (C)
+      if: steps.modules.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        # The repository's pinned toolchain (rust-toolchain.toml), which the first cargo
+        # call installs, with the bare WebAssembly target added to it.
+        cargo --version
+        rustup target add wasm32-unknown-unknown
+        ZIG="$(crates/mqtt-wasm-sandbox/jq-module/fetch-zig.sh "$RUNNER_TEMP/zig-rule-plugins" | tail -n 1)"
+        ZIG="$ZIG" examples/rule-plugins/build.sh
+    - name: Both modules are there
+      shell: bash
+      run: ls -l examples/rule-plugins/out/geo.wasm examples/rule-plugins/out/telemetry.wasm

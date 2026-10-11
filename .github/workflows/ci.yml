@@ -104,6 +104,10 @@ jobs:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - uses: ./.github/actions/jq-module
+      # The two worked examples of operator modules (ADR 0086 D9), one in Rust and one
+      # in C: built here (cached), then declared in a rules file and called through the
+      # shipped binary by the tests below, which fail without them rather than skip.
+      - uses: ./.github/actions/rule-plugins
       - name: Format
         run: cargo fmt --all -- --check
       - name: Clippy

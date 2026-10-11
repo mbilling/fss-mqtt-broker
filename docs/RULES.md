@@ -985,6 +985,10 @@ enable = true         # default true; a disabled rule is loaded and listed by --
 description = ""      # optional
 ```
 
+Beside the rules a file may declare functions of its own, supplied as WebAssembly
+modules: `[functions.<name>]`, an mqttd extension
+([Your own functions](#your-own-functions-functionsname)).
+
 Loading is **all-or-nothing**: one rule that does not parse rejects the file. At
 startup the broker refuses to boot, and on a reload the running rules stay in force.
 Unknown keys are errors. The limits are 1,024 rules per file, 16 actions per rule,
@@ -1581,6 +1585,145 @@ it when `crates/mqtt-wasm-sandbox/jq-module/jq.wasm` exists when it is built
 build is whole, and `rules.jq = true` then says that this build has no jq.
 `cargo build --no-default-features` leaves the WebAssembly runtime out altogether.
 
+### Your own functions: `[functions.<name>]`
+
+A rules file can add functions of your own, supplied as WebAssembly modules and run in
+the sandbox `jq` runs in ([ADR 0086](adr/0086-wasm-rule-functions.md) D9). **This is an
+mqttd extension: EMQX has nothing like it, and a rules file that uses it does not load
+there.** A module is declared by a table beside the rules:
+
+```toml
+[functions.geo]                  # the module's name here: a lower-case letter, then letters, digits, `_`
+wasm = "plugins/geo.wasm"        # under the directory of the rules file
+sha256 = "88aa6c6d…"             # the file's SHA-256, 64 hex digits: any other content fails the load
+functions = ["geo_distance", "geo_within"]   # the functions rules may call, among those the module describes
+timeout_ms = 50                  # how long one call may run; default 100, at most 10000
+memory_mib = 16                  # the most memory one instance may hold; default 16, at most 64
+clock = false                    # true: the module reads the wall clock; false: every clock reads 0
+env = []                         # environment variables the module sees; see below
+fresh_instance = false           # true: every call gets a new instance, and no state survives a call
+```
+
+`wasm`, `sha256` and `functions` are required. A rule then calls a function like any other:
+
+```sql
+SELECT geo_distance(payload.lat, payload.lon, 55.6761, 12.5683) AS metres
+FROM "trackers/+/position"
+WHERE geo_within(payload.lat, payload.lon, 55.6761, 12.5683, 5000)
+```
+
+Declaring a module is what switches it on: there is no key for it in the broker's
+configuration, and `rules.jq` does not have to be set. A broker whose rules file declares
+none creates nothing of the WebAssembly runtime. A module needs from the host what `jq`
+needs, memory the process may map executable ([above](#jq)): under the shipped systemd
+unit, `MemoryDenyWriteExecute=false`.
+
+**What is checked when the rules are loaded**, at boot, on a reload, through the admin
+API and in `mqttd --check-rules`. Each is a load error with its reason, and the running
+rules stay:
+
+| Check | The error |
+|---|---|
+| The file has the pinned hash | ``functions `geo`: wasm = "plugins/geo.wasm": the file does not have the sha256 the table pins (…); `sha256sum` prints the file's`` |
+| It exports the function ABI | `the module does not export the function ABI: …` |
+| It speaks this broker's ABI version | `the module speaks ABI version 2, this host 1` |
+| It imports nothing but what the sandbox provides | `the module imports env.system, which is not provided` |
+| It describes every function the table names | ``the module does not provide `geo_area` (it describes: geo_distance, geo_within)`` |
+| No function has a built-in function's name, or the name of any function of EMQX's rule engine (those mqttd refuses included) | ``a module cannot provide `upper`: a built-in function has that name, and a module must not change what a rule written for EMQX means`` |
+| The path stays under the rules file's directory | ``a module is named by a relative path under the rules file's directory, without `..` ``; `a symlink leads out of the rules file's directory` |
+
+The file is read and compared with its hash on every load, so a file replaced on disk
+under an unchanged rules file fails the next reload. A rule that calls a function with a
+number of arguments the module does not describe fails the load too, as for a built-in
+function. A file declares at most 16 modules, each at most 16 MiB.
+
+**Who may name a file.** A module is code, so where it may come from is fixed: only from
+under the directory of the configured rules file, by a relative path of plain names that
+ends in `.wasm`, wherever the rules text came from. A rules writer of the admin API
+(`[rules] admin_writers`), and an operator checking or dry-running rules text, can
+therefore name only a file you placed in that directory, and only by a hash they already
+know: the error for a wrong hash does not say what the file's hash is. Keep the module
+files owned by another user than the broker's and not writable by it. A module's
+environment is held the same way. A table's `env` may name only variables the broker's own
+configuration lists:
+
+| Key | Environment | Default | |
+|---|---|---|---|
+| `rules.functions_env` | `MQTTD_RULES_FUNCTIONS_ENV` (`,`-separated) | empty | The environment variables a module may be shown. Read at startup. |
+
+**What a module can and cannot do.** It computes: its functions take values and return a
+value. It has one memory of its own and no way to name anything outside it: no file, no
+socket, no randomness, no other function, nothing of the broker or of another module. It
+reads the clock only with `clock = true` and sees only the environment variables its
+table lists. A fault in it fails the rule, never the broker. It can keep state in its
+memory between calls, and the same instance serves many messages; use
+`fresh_instance = true` where that must not happen (an instantiation per call: 52 µs for the jq module). All of this
+rests on the WebAssembly runtime and its compiler being sound; a module is code you
+vouch for, pinned by its hash.
+
+**Limits.** Each is an evaluation error: the rule fails for this message, counted by
+kind, and the message is still routed.
+
+| Limit | Value | The error, counted as |
+|---|---|---|
+| Time | `timeout_ms` per call | `sandbox_limit (timeout): the call ran past its 50 ms …`, `timeout` |
+| Memory | `memory_mib` per instance | `sandbox_limit (memory): …`, `memory` |
+| Output | what is left of the message's 1 MiB build budget; each call's result is charged to it whole | `sandbox_limit (output): …`, `output` |
+| Stack | 4 MiB of call stack | `sandbox_limit (stack): …`, `stack` |
+| The function's own refusal | any status but 0 | `status 1: <the module's message>`, `module` |
+| A trap, or a broken reply | | `the module trapped: …`, `trap` |
+
+A call that runs for more than a millisecond holds its own publisher's connection and
+nobody else's, as for `jq`. The series are `jq`'s, with the function's and the module's
+names: `mqttd_rule_function_calls_total{function}`,
+`mqttd_rule_function_errors_total{function,kind}`,
+`mqttd_rule_function_seconds_total{function}`, and per module
+`mqttd_rule_module_instances{module}`, `mqttd_rule_module_memory_bytes{module}` and
+`mqttd_rule_module_instances_replaced_total{module}`.
+
+**Changing a module while the broker runs.** Put the new file beside the old one, change
+`wasm` and `sha256` in the rules file, and reload (or write the rules through the admin
+API). The new module is loaded beside the running one; messages evaluated from then on
+call it, and a call that is in flight finishes on the module it started on, which is let
+go when the last such call has returned. A table that did not change keeps its loaded
+module and its warm instances. `mqttd --admin rules` lists each module under the rules:
+its version and hash, its functions, its limits, and its instances with the memory they
+hold (`GET /admin/v1/rules`, `modules[]`; the module's bytes are never served).
+`mqttd --check-rules` lists what it loaded, and `mqttd --rule-test` runs a statement with
+the functions the configured rules file (`rules.file`) declares.
+
+**In a cluster** rules are a per-node file, and so are modules: place the same file on
+every node. The hash in the rules file is what makes that checkable: a node holding
+another file under the same name does not load the rules, and
+[the rules digest](#operating-rules) covers the table.
+
+**Writing one.** A module exports its memory and five functions, and receives its
+arguments as one frame: a string or a payload as its bytes, any other value as the JSON
+text the rule engine writes, so an integer of any size and a float both arrive exact. It
+returns one value the same way.
+
+```text
+mqttd_abi_version() -> u32                  1
+mqttd_alloc(len) -> address                 memory the broker writes into
+mqttd_free(address)
+mqttd_describe(ret)                         {"module":"geo","version":"0.1.0","functions":[
+                                             {"name":"geo_distance","min_args":4,"max_args":4}]}
+mqttd_call(name, name_len, args, args_len, max_out, ret) -> status      0: a value; else the rule fails
+mqttd_cancel()                              optional: asked to stop at the deadline
+```
+
+[`examples/rule-plugins`](../examples/rule-plugins/) has two worked examples with the ABI
+written out, one in Rust (no dependencies, built for `wasm32-unknown-unknown`) and one in
+C (built with `zig cc -target wasm32-wasi`), and the script that builds them:
+
+```sh
+examples/rule-plugins/build.sh        # out/geo.wasm, out/telemetry.wasm, and each one's sha256
+```
+
+A C module may link its C library: the sixteen WASI functions wasi-libc calls are
+provided, and none of them reaches a file or a socket. A build without the WebAssembly
+runtime (`cargo build --no-default-features`) cannot load a module and says so.
+
 ## Actions
 
 ### `republish`
@@ -1780,6 +1923,7 @@ mqttd accepts.
 | Data-integration sources (`$bridges/…`, `$sources/…`) | Yes | No: refused at load |
 | Functions | 124 in the built-in reference, plus `jq`; every other export of `emqx_rule_funcs` is callable too | 120 of those 124, plus `jq`, plus 23 EMQX exports without documenting (144 in all). `maptab_lookup`, `mongo_date`, `schema_encode`, `schema_decode`, `term_encode`/`term_decode` and the state functions (`kv_store_*`, `proc_dict_*`; [ADR 0085](adr/0085-rule-state-store.md)) are refused at load. |
 | `jq` | A NIF in the broker's own process: always on, with no limit on memory, output or stack, the broker's whole environment in `$ENV`, and a timeout that cannot stop a program inside one long C call | The same jq in a WebAssembly sandbox, with EMQX's results, tags and texts, but **off unless `rules.jq = true`** (a rules file that calls it then fails to load), and needing a host that allows executable memory. 64 MiB of memory, 4 MiB of stack, an output charged to the message's 1 MiB build budget, `$ENV` empty unless variables are listed, a timeout that always stops the call; the last digit of some transcendental functions, `strptime %z` and `strftime %Z` differ ([jq](#jq)) |
+| Functions supplied as modules (mqttd-only extension) | None. A rules file with a `[functions.<name>]` table is not EMQX configuration | A rules file may declare WebAssembly modules, each pinned by its SHA-256, whose functions rules call; they run in the sandbox under time, memory, output and stack limits. A module cannot take the name of a built-in function or of any function of EMQX's rule engine, so it never changes what a rule written for EMQX means ([Your own functions](#your-own-functions-functionsname)) |
 | Regular expressions | Erlang `re`: PCRE2 10.47 (OTP 28) on bytes, compiled per call | PCRE2 10.46 on bytes, with OTP's compile options, match and depth limits and global-match loop: the same syntax and results ([above](#functions)). A match needing more than 64 MiB of backtracking memory is no match (OTP allows 20 GB); a pattern nesting parentheses more than 250 deep does not compile (OTP's limit is 10,000, though PCRE2's own workspace stops most such patterns below 2,000). A literal pattern is compiled once, when the file loads (one that does not compile warns), and a rules file holds at most 512 distinct ones, 256 KiB together. |
 | `sprintf` `~p` / `~P` of a long list, map or non-printable binary | `io_lib_pretty` breaks it across lines once it reaches the line width (80 columns, or the field width) | Printed on one line (`~0p`, which never breaks, is the same in both) |
 | `subbits` results Erlang has and this engine cannot hold | A bit string of any length | Fail the rule: a bit string that is not whole bytes |

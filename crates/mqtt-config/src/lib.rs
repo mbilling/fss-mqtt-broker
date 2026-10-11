@@ -665,6 +665,12 @@ pub struct Rules {
     /// EMQX, which shows jq the broker's whole environment, secrets included. A listed
     /// variable that is unset is absent. Read at startup.
     pub jq_env: Vec<String>,
+    /// The environment variables a module declared in the rules file
+    /// (`[functions.<name>]`, ADR 0086 D9) may be shown
+    /// (`MQTTD_RULES_FUNCTIONS_ENV`, `,`-separated names). A table's `env` may name
+    /// only these, so whoever writes rules cannot show a module the rest of the
+    /// broker's environment. Empty (the default) = none. Read at startup.
+    pub functions_env: Vec<String>,
 }
 
 impl Default for Rules {
@@ -678,6 +684,7 @@ impl Default for Rules {
             jq: false,
             jq_default_timeout_ms: 10_000,
             jq_env: Vec::new(),
+            functions_env: Vec::new(),
         }
     }
 }
@@ -1695,6 +1702,9 @@ impl Config {
         on!("MQTTD_RULES_JQ_ENV", v, {
             self.rules.jq_env = list(&v);
         });
+        on!("MQTTD_RULES_FUNCTIONS_ENV", v, {
+            self.rules.functions_env = list(&v);
+        });
         // -- admin API (ADR 0081) --
         on!("MQTTD_ADMIN_BIND", v, {
             self.admin.bind = Some(v);
@@ -2161,22 +2171,27 @@ impl Config {
                     .to_string(),
             );
         }
-        // A name jq could not be given, or a list that is a mistake (ADR 0086 D8).
-        if rules.jq_env.len() > 64 {
-            return Err(format!(
-                "rules.jq_env (MQTTD_RULES_JQ_ENV) lists {} variables; at most 64",
-                rules.jq_env.len()
-            ));
-        }
-        if let Some(bad) = rules
-            .jq_env
-            .iter()
-            .find(|name| name.is_empty() || name.contains(['=', '\0']))
-        {
-            return Err(format!(
-                "rules.jq_env (MQTTD_RULES_JQ_ENV) names {bad:?}: an environment variable's \
-                 name is not empty and has no `=` or NUL (list names, not NAME=value)"
-            ));
+        // A name jq, or a module, could not be given, or a list that is a mistake (ADR
+        // 0086 D8).
+        for (key, names) in [
+            ("rules.jq_env (MQTTD_RULES_JQ_ENV)", &rules.jq_env),
+            (
+                "rules.functions_env (MQTTD_RULES_FUNCTIONS_ENV)",
+                &rules.functions_env,
+            ),
+        ] {
+            if names.len() > 64 {
+                return Err(format!("{key} lists {} variables; at most 64", names.len()));
+            }
+            if let Some(bad) = names
+                .iter()
+                .find(|name| name.is_empty() || name.contains(['=', '\0']))
+            {
+                return Err(format!(
+                    "{key} names {bad:?}: an environment variable's name is not empty and has \
+                     no `=` or NUL (list names, not NAME=value)"
+                ));
+            }
         }
         Ok(())
     }
@@ -2394,6 +2409,7 @@ pub const ENV_VARS: &[&str] = &[
     "MQTTD_RULES_JQ",
     "MQTTD_RULES_JQ_DEFAULT_TIMEOUT_MS",
     "MQTTD_RULES_JQ_ENV",
+    "MQTTD_RULES_FUNCTIONS_ENV",
     // admin API (ADR 0081)
     "MQTTD_ADMIN_BIND",
     "MQTTD_ADMIN_CERT",
@@ -2687,6 +2703,33 @@ mod tests {
             ))
             .expect_err("not a variable's name");
             assert!(err.to_string().contains("MQTTD_RULES_JQ_ENV"), "{err}");
+        }
+    }
+
+    /// ADR 0086 D8, D9: a module declared in the rules file sees no environment
+    /// variable unless the broker's own configuration lists it by name.
+    #[test]
+    fn the_functions_env_key_loads_from_file_and_environment() {
+        assert!(Config::default().rules.functions_env.is_empty());
+        let c = Config::from_toml(
+            "[rules]\nfunctions_env = [\"SITE\"]\n[durable]\nallow_ephemeral = true\n",
+        )
+        .unwrap();
+        assert_eq!(c.rules.functions_env, vec!["SITE"]);
+        assert!(c.rules.jq_env.is_empty(), "a list of its own");
+        let mut c = Config::default();
+        c.overlay_from(getter(&[("MQTTD_RULES_FUNCTIONS_ENV", "SITE, REGION,")]))
+            .unwrap();
+        assert_eq!(c.rules.functions_env, vec!["SITE", "REGION"]);
+        for bad in ["[\"SITE=plant-7\"]", "[\"\"]"] {
+            let err = Config::from_toml(&format!(
+                "[rules]\nfunctions_env = {bad}\n[durable]\nallow_ephemeral = true\n"
+            ))
+            .expect_err("not a variable's name");
+            assert!(
+                err.to_string().contains("MQTTD_RULES_FUNCTIONS_ENV"),
+                "{err}"
+            );
         }
     }
 
@@ -3576,9 +3619,9 @@ mod tests {
             // plus MQTTD_RULES_FILE (ADR 0083),
             // plus MQTTD_RULES_SYS_INTERVAL, MQTTD_RULES_TRACE, MQTTD_RULES_TRACE_RATE and
             // MQTTD_RULES_ADMIN_WRITERS (ADR 0084),
-            // plus MQTTD_RULES_JQ, MQTTD_RULES_JQ_DEFAULT_TIMEOUT_MS and MQTTD_RULES_JQ_ENV
-            // (ADR 0086).
-            120,
+            // plus MQTTD_RULES_JQ, MQTTD_RULES_JQ_DEFAULT_TIMEOUT_MS, MQTTD_RULES_JQ_ENV
+            // and MQTTD_RULES_FUNCTIONS_ENV (ADR 0086).
+            121,
             "the MQTTD_* surface changed — update ENV_VARS"
         );
         // Issue #239: MQTTD_MIN_REPLICAS was wired in `overlay_from` but never

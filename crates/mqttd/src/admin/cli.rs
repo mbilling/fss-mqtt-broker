@@ -766,7 +766,61 @@ fn render_rules(value: &Value) -> Option<String> {
         &columns.iter().map(|c| (*c).to_string()).collect::<Vec<_>>(),
         &cells,
     ));
+    // The modules the rules declare (ADR 0086 D9), when there are any.
+    let modules = value
+        .get("modules")
+        .and_then(Value::as_array)
+        .filter(|m| !m.is_empty());
+    if let Some(modules) = modules {
+        out.push('\n');
+        let columns = [
+            "MODULE",
+            "VERSION",
+            "SHA256",
+            "FUNCTIONS",
+            "TIMEOUT_MS",
+            "MEMORY_LIMIT",
+            "INSTANCES",
+            "IN_CALL",
+            "MEMORY",
+        ];
+        let cells = modules.iter().map(modules_row).collect::<Vec<_>>();
+        out.push_str(&grid(
+            &columns.iter().map(|c| (*c).to_string()).collect::<Vec<_>>(),
+            &cells,
+        ));
+    }
     Some(out)
+}
+
+/// One declared module's row: what it is, the functions it provides, its limits, and
+/// its instances with the memory they hold (bytes). The whole hash, the grants and the
+/// functions' arities are in `--json`.
+fn modules_row(module: &Value) -> Vec<String> {
+    let at = |pointer: &str| {
+        module
+            .pointer(pointer)
+            .map_or_else(|| "-".to_string(), scalar)
+    };
+    let functions: Vec<String> = module
+        .get("functions")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|f| f.get("name"))
+        .map(scalar)
+        .collect();
+    vec![
+        at("/name"),
+        at("/version"),
+        at("/sha256").chars().take(12).collect(),
+        functions.join(", "),
+        at("/limits/timeout_ms"),
+        at("/limits/memory_bytes"),
+        at("/instances/count"),
+        at("/instances/in_call"),
+        at("/instances/memory_bytes"),
+    ]
 }
 
 /// One rule's row: the filters and events it selects, its cumulative counts, and its last
@@ -1263,6 +1317,49 @@ mod tests {
             .iter()
             .filter(|v| v.name != "rules-apply")
             .all(|v| v.source_file.is_none()));
+    }
+
+    /// ADR 0086 D9: the modules the rules declare are a second table under the rules,
+    /// and there is none when no module is declared.
+    #[test]
+    fn the_rules_view_lists_the_declared_modules_under_the_rules() {
+        let mut answer = json!({
+            "node": "n1",
+            "digest": "550bdb8f0123456789abcdef",
+            "file_digest": "550bdb8f0123456789abcdef",
+            "in_sync": true,
+            "reload": null,
+            "rules": [
+                {"id": "a", "enabled": true, "from": ["t/#"], "events": [], "actions": 1,
+                 "counts": {"matched": 3, "passed": 2, "no_result": 1, "failed": 0,
+                            "actions_ok": 2, "actions_failed": 0},
+                 "last_error": null}
+            ],
+            "modules": []
+        });
+        let rules = "n1: 1 rules, 1 enabled; running 550bdb8f0123, on disk the same\n\
+             \n\
+             ID  ENABLED  FROM  ACTIONS  MATCHED  PASSED  NO_RESULT  FAILED  ACTIONS_FAILED  LAST_ERROR\n\
+             a   yes      t/#   1        3        2       1          0       0               -\n";
+        assert_eq!(render_for("rules", &answer), rules);
+        answer["modules"] = json!([
+            {"name": "geo", "module": "geo", "version": "0.1.0",
+             "sha256": "9f2c0123456789abcdef9f2c0123456789abcdef9f2c0123456789abcdef0123",
+             "functions": [{"name": "geo_distance", "min_args": 4, "max_args": 4},
+                           {"name": "geo_within", "min_args": 5, "max_args": 5}],
+             "limits": {"timeout_ms": 50, "memory_bytes": 16_777_216},
+             "grants": {"clock": false, "env_count": 0},
+             "fresh_instance": false,
+             "instances": {"count": 2, "in_call": 1, "memory_bytes": 2_228_224, "replaced": 0}}
+        ]);
+        assert_eq!(
+            render_for("rules", &answer),
+            format!(
+                "{rules}\n\
+                 MODULE  VERSION  SHA256        FUNCTIONS                 TIMEOUT_MS  MEMORY_LIMIT  INSTANCES  IN_CALL  MEMORY\n\
+                 geo     0.1.0    9f2c01234567  geo_distance, geo_within  50          16777216      2          1        2228224\n"
+            )
+        );
     }
 
     /// `rules` is a table of the running rules with their counts; a viewer's answer (no

@@ -6,7 +6,7 @@ Source of truth: `mqtt_config::ENV_VARS` and `Config::overlay_from` in `crates/m
 
 The annotated template is [`mqttd.example.toml`](mqttd.example.toml). Capacity arithmetic lives in [SIZING.md](SIZING.md); day-2 procedures in [OPERATIONS.md](OPERATIONS.md). This page is the inventory of knobs, not the runbook.
 
-Documented overlay variables: **120** in `ENV_VARS`, plus `MQTTD_CONFIG` (meta) and any experimental side-channel knobs below.
+Documented overlay variables: **121** in `ENV_VARS`, plus `MQTTD_CONFIG` (meta) and any experimental side-channel knobs below.
 
 ## Node identity
 
@@ -192,6 +192,7 @@ Documented overlay variables: **120** in `ENV_VARS`, plus `MQTTD_CONFIG` (meta) 
 | `MQTTD_RULES_JQ` | `rules.jq` | EMQX's `jq` rule function (`MQTTD_RULES_JQ`, `1`/`0`; [ADR 0086](../../../docs/adr/0086-wasm-rule-functions.md)). Off by default: a rules file that calls `jq` then does not load. On, jq runs as compiled WebAssembly, which needs memory the process may map executable: under the shipped systemd unit also set `MemoryDenyWriteExecute=false`, or a rules file that calls `jq` fails to load and says so. Set it on every node of a cluster. Read at startup: a change needs a restart. |
 | `MQTTD_RULES_JQ_DEFAULT_TIMEOUT_MS` | `rules.jq_default_timeout_ms` | Milliseconds `jq/2` may run (`MQTTD_RULES_JQ_DEFAULT_TIMEOUT_MS`, default 10000, as EMQX's `rule_engine.jq_function_default_timeout`); `jq/3` names its own. Read at startup. |
 | `MQTTD_RULES_JQ_ENV` | `rules.jq_env` | The environment variables a jq program may read as `$ENV.NAME` or `env.NAME` (`MQTTD_RULES_JQ_ENV`, `,`-separated names). Empty (the default) = none: unlike EMQX, which shows jq the broker's whole environment, secrets included. A listed variable that is unset is absent. Read at startup. |
+| `MQTTD_RULES_FUNCTIONS_ENV` | `rules.functions_env` | The environment variables a module declared in the rules file (`[functions.<name>]`, ADR 0086 D9) may be shown (`MQTTD_RULES_FUNCTIONS_ENV`, `,`-separated names). A table's `env` may name only these, so whoever writes rules cannot show a module the rest of the broker's environment. Empty (the default) = none. Read at startup. |
 
 ## Meta (not a config field)
 

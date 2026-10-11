@@ -20,9 +20,11 @@
 //! Not EMQX's: the sandbox's limits (ADR 0086 D7), with the output of a call charged
 //! to the message's build budget, and an environment that is empty unless listed (D8).
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::plugin::{Module, ModuleHost, ModuleSettings};
 use crate::value::Value;
 
 /// What a caller on an async runtime wraps the rest of a long `jq` call in
@@ -90,6 +92,13 @@ pub enum JqSwitch {
 pub struct Functions {
     /// The `jq` function.
     pub jq: JqSwitch,
+    /// What loads the modules a rules file declares (`[functions.<name>]`, ADR 0086
+    /// D9). `None`: a file that declares one does not load.
+    modules: Option<Arc<ModuleHost>>,
+    /// The directory modules are read from under: the rules file's.
+    dir: Option<PathBuf>,
+    /// The modules a statement on its own may call ([`declaring`](Self::declaring)).
+    pub(crate) declared: Vec<Arc<Module>>,
 }
 
 impl Functions {
@@ -103,7 +112,53 @@ impl Functions {
                 Ok(jq) => JqSwitch::On(Arc::new(jq)),
                 Err(why) => JqSwitch::Unavailable(why),
             },
+            ..Self::default()
         }
+    }
+
+    /// The same, able to load the modules a rules file declares, each with `settings`.
+    /// Nothing is read or compiled by this: a module is loaded when a rules file that
+    /// declares it is.
+    #[must_use]
+    pub fn with_modules(mut self, settings: ModuleSettings) -> Self {
+        self.modules = Some(Arc::new(ModuleHost::new(settings)));
+        self
+    }
+
+    /// The same, for rules text that belongs in the file `rules_file`: the modules it
+    /// declares are read from under that file's directory, and nowhere else.
+    /// [`RuleSet::load_with`](crate::RuleSet::load_with) does this itself.
+    #[must_use]
+    pub fn beside(&self, rules_file: &Path) -> Self {
+        let dir = match rules_file.parent() {
+            Some(dir) if !dir.as_os_str().is_empty() => dir.to_path_buf(),
+            _ => PathBuf::from("."),
+        };
+        Self {
+            dir: Some(dir),
+            ..self.clone()
+        }
+    }
+
+    /// The same, for a statement on its own (`mqttd --rule-test`): it may call the
+    /// functions of the modules the rules file `text` declares, which are loaded now.
+    pub fn declaring(&self, text: &str) -> Result<Self, crate::LoadError> {
+        let declared = crate::declared_modules(text, self)?;
+        Ok(Self {
+            declared,
+            ..self.clone()
+        })
+    }
+
+    /// What loads this node's modules, when it can.
+    #[must_use]
+    pub fn module_host(&self) -> Option<&Arc<ModuleHost>> {
+        self.modules.as_ref()
+    }
+
+    /// Where modules are read from under.
+    pub(crate) fn dir(&self) -> Option<&Path> {
+        self.dir.as_deref()
     }
 
     /// The running `jq`, when it is switched on.
@@ -125,6 +180,8 @@ pub(crate) const SWITCHED_OFF: &str = "jq is switched off: set `rules.jq = true`
 pub struct ModuleStats {
     /// Instances held now, waiting or in a call.
     pub instances: u64,
+    /// Of those, the ones in a call now.
+    pub in_call: u64,
     /// Their linear memory in bytes, as of each one's last call.
     pub memory_bytes: u64,
     /// Instances given up after a call since the module was loaded: stopped at a limit,
@@ -134,20 +191,23 @@ pub struct ModuleStats {
 
 /// One call of a sandboxed function, as [`Outcome::Function`](crate::Outcome::Function)
 /// reports it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FunctionCall {
     /// The function.
-    pub function: &'static str,
+    pub function: Arc<str>,
+    /// The module that provides it: `jq`, or the name of a `[functions.<name>]` table.
+    pub module: Arc<str>,
     /// How long the call took.
     pub elapsed: Duration,
     /// The kind of failure, when it failed: for `jq`, `compile`, `parse`, `process`,
     /// `timeout` or `system` (EMQX's tags); `memory`, `output`, `stack` or
     /// `compile_timeout` (a limit of the sandbox); `trap`; or `argument` (a program
     /// that is not a string, a bad timeout) and `decode` (an output the rule engine's
-    /// JSON reader refuses).
+    /// JSON reader refuses). For an operator's module: `module` (the function's own
+    /// refusal), `timeout`, `memory`, `output`, `stack`, `trap`, `argument`, `decode`.
     pub error: Option<&'static str>,
     /// The module's instance pool after the call.
-    pub module: ModuleStats,
+    pub stats: ModuleStats,
 }
 
 /// Why a `jq` call failed: the text the rule fails with, and the kind it is counted
@@ -161,6 +221,8 @@ pub(crate) struct Failure {
 /// The `jq` function of one broker process: the module, compiled when a rules file
 /// first calls `jq`, and the warm instances its callers take turns on.
 pub struct Jq {
+    /// `jq`: the function's name and its module's.
+    name: Arc<str>,
     default_timeout: Duration,
     #[cfg(feature = "jq")]
     pool: mqtt_wasm_sandbox::jq::Pool,
@@ -267,6 +329,7 @@ impl Jq {
                 pool = pool.with_hand_off(hand_off);
             }
             Ok(Self {
+                name: Arc::from("jq"),
                 default_timeout: settings.default_timeout,
                 pool,
             })
@@ -276,6 +339,11 @@ impl Jq {
             let _ = settings;
             Err(String::new())
         }
+    }
+
+    /// `jq`, as the name its calls are reported under.
+    pub(crate) fn name(&self) -> &Arc<str> {
+        &self.name
     }
 
     /// What `jq/2` runs under.
@@ -306,6 +374,7 @@ impl Jq {
             let stats = self.pool.stats();
             ModuleStats {
                 instances: stats.instances,
+                in_call: stats.in_call,
                 memory_bytes: stats.memory_bytes,
                 replaced: stats.replaced,
             }

@@ -79,6 +79,11 @@ blake2 = "0.11"
 
 [dev-dependencies]
 criterion = { workspace = true }
+# A module written out by hand, for the tests of `[functions.<name>]` (ADR 0086 D9):
+# they need no Wasm toolchain.
+mqtt-wasm-sandbox = { path = "../mqtt-wasm-sandbox", features = ["test-module"] }
+# A rules directory with module files in it. Already in the tree (mqttd's tests).
+tempfile = "3"
 
 [lints]
 workspace = true

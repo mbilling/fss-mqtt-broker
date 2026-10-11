@@ -1382,7 +1382,8 @@ impl Metrics {
             &mut registry,
             "rule_function_calls",
             "Calls of rule functions that run in the WebAssembly sandbox (ADR 0086), by \
-             function: jq. Live evaluations only (dry runs excluded)",
+             function: jq, and the functions of the modules the rules file declares. Live \
+             evaluations only (dry runs excluded)",
         );
         let rule_function_errors_total = register_family(
             &mut registry,
@@ -1391,8 +1392,9 @@ impl Metrics {
              jq: compile, parse, process, timeout, system (EMQX's error tags); memory, \
              output, stack, compile_timeout (a limit of the sandbox); trap (the module \
              broke); argument (a program that is not a string, a bad timeout); decode (an \
-             output the rule engine's JSON reader refuses). Each fails its rule, never the \
-             message",
+             output the rule engine's JSON reader refuses). For a declared module's \
+             function: module (its own refusal), timeout, memory, output, stack, trap, \
+             argument, decode. Each fails its rule, never the message",
         );
         let rule_function_seconds_total =
             Family::<FunctionLabel, Counter<f64, std::sync::atomic::AtomicU64>>::default();
@@ -2454,7 +2456,7 @@ impl Metrics {
     /// failed, the kind of failure.
     pub fn rule_function_call(
         &self,
-        function: &'static str,
+        function: &str,
         elapsed: std::time::Duration,
         error: Option<&'static str>,
     ) {
@@ -2466,7 +2468,7 @@ impl Metrics {
         self.rule_function_seconds_total
             .get_or_create(&label)
             .inc_by(secs);
-        let of = [KeyValue::new("function", function)];
+        let of = [KeyValue::new("function", function.to_string())];
         self.otel.rule_function_calls.add(1, &of);
         self.otel.rule_function_seconds.add(secs, &of);
         if let Some(kind) = error {
@@ -2479,7 +2481,7 @@ impl Metrics {
             self.otel.rule_function_errors.add(
                 1,
                 &[
-                    KeyValue::new("function", function),
+                    KeyValue::new("function", function.to_string()),
                     KeyValue::new("kind", kind),
                 ],
             );
@@ -2491,7 +2493,7 @@ impl Metrics {
     /// counter is moved up to it, never back).
     pub fn rule_module(
         &self,
-        module: &'static str,
+        module: &str,
         instances: u64,
         memory_bytes: u64,
         replaced_total: u64,
@@ -2509,7 +2511,7 @@ impl Metrics {
         self.rule_module_memory_bytes
             .get_or_create(&label)
             .set(memory);
-        let of = [KeyValue::new("module", module)];
+        let of = [KeyValue::new("module", module.to_string())];
         self.otel.rule_module_instances.record(instances, &of);
         self.otel.rule_module_memory_bytes.record(memory, &of);
         // Callers on several threads report the same cumulative count in any order:

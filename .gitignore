@@ -20,6 +20,10 @@ Cargo.lock.orig
 # crates/mqtt-wasm-sandbox/jq-module/build.sh, identified by jq.wasm.sha256 beside it.
 /crates/mqtt-wasm-sandbox/jq-module/jq.wasm
 
+# The example rule-function modules of ADR 0086 D9: built by
+# examples/rule-plugins/build.sh.
+/examples/rule-plugins/out/
+
 # Python bytecode cache (scripts/)
 __pycache__/
 *.pyc

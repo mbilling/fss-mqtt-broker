@@ -74,7 +74,7 @@ use mqtt_core::{AppProperties, ClientId, Origin};
 use mqtt_observability::metrics::Metrics;
 use mqtt_rules::{
     Budget, Effect, EventInput, EventKind, EventMessage, Functions, Input, JqSettings, JqSwitch,
-    Outcome, PublishInput, Recursion, Republish, Rule, RuleSet,
+    ModuleSettings, Outcome, PublishInput, Recursion, Republish, Rule, RuleSet,
 };
 use tokio::sync::{mpsc, oneshot, watch};
 use tracing::{debug, info, warn};
@@ -343,16 +343,17 @@ fn report(
             }
             return;
         }
-        // A call of `jq` (ADR 0086 D10). One that failed has failed its rule, which the
+        // A call of `jq` or of a module's function (ADR 0086 D10). One that failed has
+        // failed its rule, which the
         // `Failed` that follows reports with the function's own error text.
         Outcome::Function(call) => {
             if let Some(m) = metrics {
-                m.rule_function_call(call.function, call.elapsed, call.error);
+                m.rule_function_call(&call.function, call.elapsed, call.error);
                 m.rule_module(
-                    call.function,
-                    call.module.instances,
-                    call.module.memory_bytes,
-                    call.module.replaced,
+                    &call.module,
+                    call.stats.instances,
+                    call.stats.memory_bytes,
+                    call.stats.replaced,
                 );
             }
             return;
@@ -1983,6 +1984,16 @@ pub fn load_with(path: Option<&str>, functions: &Functions) -> Result<RuleSet, S
     for w in &loaded.warnings {
         warn!(file = %path, "rules: {w}");
     }
+    for module in loaded.rules.modules() {
+        info!(
+            file = %path,
+            module = %module.name(),
+            sha256 = %module.sha256(),
+            version = %module.version(),
+            functions = module.functions().len(),
+            "rules: the file declares a WebAssembly module (ADR 0086 D9)"
+        );
+    }
     Ok(loaded.rules)
 }
 
@@ -2010,34 +2021,53 @@ pub fn noting_the_jq_module<T>(functions: &Functions, load: impl FnOnce() -> T) 
 ///
 /// `jq`'s environment is the listed variables that are set, with the values they have
 /// now (D8); its warm instances are as many as the runtime has workers (D5).
+///
+/// A module the rules file declares (`[functions.<name>]`, D9) needs no switch: its
+/// declaration is the switch, and it is loaded when a rules file that declares it is.
+/// What is read here is what such a module may be given: the variables
+/// `rules.functions_env` lists, the same number of warm instances, the same hand-off.
+/// A module is read from under the directory of `rules.file`.
 #[must_use]
 pub fn functions_from_config(rules: &mqtt_config::Rules) -> Functions {
-    if !rules.jq {
-        return Functions::default();
-    }
-    let environment = rules
-        .jq_env
-        .iter()
-        .filter_map(|name| match std::env::var(name) {
-            Ok(value) => Some((name.clone(), value)),
-            Err(std::env::VarError::NotPresent) => None,
-            Err(std::env::VarError::NotUnicode(_)) => {
-                warn!(variable = %name, "rules.jq_env: the variable's value is not UTF-8; \
-                      jq does not see it");
-                None
-            }
-        })
-        .collect();
+    let value = |key: &str, name: &String| match std::env::var(name) {
+        Ok(value) => Some(value),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            warn!(variable = %name, "{key}: the variable's value is not UTF-8; it is not shown");
+            None
+        }
+    };
     let workers = tokio::runtime::Handle::try_current().map_or_else(
         |_| std::thread::available_parallelism().map_or(1, std::num::NonZero::get),
         |runtime| runtime.metrics().num_workers(),
     );
-    Functions::with_jq(JqSettings {
-        default_timeout: std::time::Duration::from_millis(rules.jq_default_timeout_ms),
-        environment,
+    let functions = if rules.jq {
+        Functions::with_jq(JqSettings {
+            default_timeout: std::time::Duration::from_millis(rules.jq_default_timeout_ms),
+            environment: rules
+                .jq_env
+                .iter()
+                .filter_map(|name| Some((name.clone(), value("rules.jq_env", name)?)))
+                .collect(),
+            instances: workers,
+            hand_off: Some(Arc::new(hand_off)),
+        })
+    } else {
+        Functions::default()
+    };
+    let functions = functions.with_modules(ModuleSettings {
+        environment: rules
+            .functions_env
+            .iter()
+            .map(|name| (name.clone(), value("rules.functions_env", name)))
+            .collect(),
         instances: workers,
         hand_off: Some(Arc::new(hand_off)),
-    })
+    });
+    match &rules.file {
+        Some(file) => functions.beside(std::path::Path::new(file)),
+        None => functions,
+    }
 }
 
 /// One line on what `rules.jq = true` means on this host, for `mqttd --check-config`:
@@ -2403,6 +2433,53 @@ enable = false
             (switch, built) => panic!("{switch:?} in a build where jq is {built:?}"),
         }
         assert!(jq_host_report(&on).is_some());
+    }
+
+    /// ADR 0086 D9, D13: a module needs no switch — declaring it in the rules file is
+    /// the switch — so every configuration can load one, from under the directory of
+    /// its rules file and nowhere else; and a configuration without a rules file has
+    /// no directory, and loads none. With `rules.jq` off, `jq` stays off beside it.
+    #[cfg(feature = "jq")]
+    #[test]
+    fn a_declared_module_needs_no_switch_and_is_read_beside_the_rules_file() {
+        let outer = tempfile::tempdir().unwrap();
+        let dir = outer.path().join("rules");
+        std::fs::create_dir(&dir).unwrap();
+        let wasm = mqtt_wasm_sandbox::test_module::plugin("1", b"j7");
+        std::fs::write(dir.join("m.wasm"), &wasm).unwrap();
+        std::fs::write(outer.path().join("m.wasm"), &wasm).unwrap();
+        let text = format!(
+            "[functions.m]\nwasm = \"m.wasm\"\nsha256 = \"{}\"\nfunctions = [\"which\"]\n\
+             [rules.r]\nsql = 'SELECT which() AS n FROM \"t\"'\n",
+            crate::reload::sha256_hex(&wasm)
+        );
+        let file = dir.join("rules.toml");
+        std::fs::write(&file, &text).unwrap();
+        let config = mqtt_config::Rules {
+            file: Some(file.display().to_string()),
+            ..mqtt_config::Rules::default()
+        };
+        let functions = functions_from_config(&config);
+        assert!(matches!(functions.jq, JqSwitch::Off));
+        let set = load_with(config.file.as_deref(), &functions).expect("the module loads");
+        assert_eq!(set.modules().len(), 1);
+        assert!(set.calls_sandbox());
+        // Text that did not come from the file (the admin API's) is held to the same
+        // directory.
+        assert!(RuleSet::parse_with(&text, &functions).is_ok());
+        let up = text.replace("\"m.wasm\"", "\"../m.wasm\"");
+        assert!(RuleSet::parse_with(&up, &functions)
+            .expect_err("outside the directory")
+            .to_string()
+            .contains("a relative path under the rules file's directory"));
+        // No rules file, no directory, no module.
+        let error = RuleSet::parse_with(
+            &text,
+            &functions_from_config(&mqtt_config::Rules::default()),
+        )
+        .expect_err("no rules file is configured")
+        .to_string();
+        assert!(error.contains("this text is loaded without one"), "{error}");
     }
 
     /// ADR 0084: the `INSECURE:` line says that anyone may read the trace, and why. It is

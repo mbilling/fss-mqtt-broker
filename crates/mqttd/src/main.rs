@@ -4381,6 +4381,10 @@ fn requires_restart(old: &Config, new: &Config) -> Vec<&'static str> {
     if jq(old) != jq(new) {
         changed.push("rules.jq");
     }
+    // So is what a declared module may be shown of the environment (D9).
+    if o.rules.functions_env != n.rules.functions_env {
+        changed.push("rules.functions_env");
+    }
     changed
 }
 
@@ -4733,6 +4737,18 @@ fn check_rules_cli() -> ! {
                 reload::enabled_rules(&loaded.rules),
                 loaded.rules.digest()
             );
+            // The modules the file declares (ADR 0086 D9), each as it was loaded.
+            for module in loaded.rules.modules() {
+                let functions: Vec<&str> = module.functions().iter().map(|f| &*f.name).collect();
+                outln!(
+                    "  module {} ({} {}, sha256 {}): {}",
+                    module.name(),
+                    module.described_name(),
+                    module.version(),
+                    module.sha256(),
+                    functions.join(", ")
+                );
+            }
             // One line per rule, in the order they run (id order).
             for rule in loaded.rules.rules() {
                 let from: Vec<String> = rule
@@ -4792,7 +4808,22 @@ fn rule_test_cli() -> ! {
     input.node = "rule-test";
     // `jq` is what the effective config makes it (`rules.jq`, ADR 0086): off unless
     // switched on, and then with the configured timeout and environment.
-    let functions = mqttd::rules::functions_from_config(&rules_config_or_default());
+    let rules = rules_config_or_default();
+    let functions = mqttd::rules::functions_from_config(&rules);
+    // A statement may call the functions of the modules the configured rules file
+    // declares (D9). A file that cannot be read, or whose modules do not load, leaves
+    // the statement without them, and says so.
+    let functions = match rules
+        .file
+        .as_deref()
+        .map(|file| (file, std::fs::read_to_string(file)))
+    {
+        Some((file, Ok(text))) => functions.declaring(&text).unwrap_or_else(|e| {
+            eprintln!("warning: {file}: {e}; its [functions] are not available to the statement");
+            functions
+        }),
+        _ => functions,
+    };
     // A statement that selects events runs against a sample of one: the one --event
     // names, else its first event when it selects no topic.
     let event = match (

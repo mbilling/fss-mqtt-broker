@@ -2970,6 +2970,7 @@ fn regex_calls(subject: &[u8], pattern: &[u8], literal: bool) -> RegexResults {
             ctx: &ctx,
             regex,
             jq: None,
+            module: None,
         };
         (func.f)(args, &cx).map_err(|_| ())
     };
@@ -5155,9 +5156,8 @@ fn a_rules_file_that_calls_jq_does_not_load_while_jq_is_switched_off() {
 /// nothing for the switch to turn on, and a rules file that calls `jq` says so.
 #[test]
 fn a_build_without_jq_says_why_the_switch_has_nothing_to_turn_on() {
-    let functions = Functions {
-        jq: JqSwitch::Unavailable("this mqttd was built without the jq module".to_string()),
-    };
+    let mut functions = Functions::default();
+    functions.jq = JqSwitch::Unavailable("this mqttd was built without the jq module".to_string());
     let error = RuleSet::parse_with(
         "[rules.r]\nsql = 'SELECT jq(payload.p, payload) AS r FROM \"t\"'\n",
         &functions,

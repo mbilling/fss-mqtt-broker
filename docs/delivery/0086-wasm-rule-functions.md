@@ -17,9 +17,9 @@ tasks:
     evidence: "PR 911: `jq/2` and `jq/3` in `mqtt-rules` behind the ABI, with EMQX 6.3.1's results, tags and texts (79 probes of `emqx_rule_funcs:jq/2,3` and `emqx_rule_sqltester` on a local EMQX, all matched; the 285-case module oracle unchanged); `rules.jq` off by default with its load errors, `rules.jq_default_timeout_ms`, `rules.jq_env`; the instance pool, literal programs compiled at load; a call's output charged to the message's build budget; the hand-off (one worker thread, a ten-second jq on one connection: 6,974 publishes on another, median 152 µs, slowest 6.2 ms; without it the first is not answered in 2 s) and a Will's rules moved off the hub while rules call jq (ADR amendment); per-function and per-module metrics; `--rule-test`, `--check-rules`, `--check-config`; the module embedded by the build when present and required by the release recipe and CI; the systemd unit's comment; Rust 1.96. `strptime %z` and `strftime %Z` recorded, not closed."
   - id: 0086-T3
     title: "Operator plugins: [functions.<name>] in the rules file, pinned by sha256, load-time checks, live reload, the admin view, worked examples in Rust and C"
-    status: planned
+    status: in-progress
     issue: 907
-    notes: "Follows T2, and may follow it at a distance: the ABI is the same either way."
+    notes: "One PR carries it: `[functions.<name>]` in the rules file (`wasm`, `sha256`, `functions`, `timeout_ms`, `memory_mib`, `clock`, `env`, `fresh_instance`), loaded with the rules at boot, on a reload, through the admin API and in `--check-rules`; each load-time check a load error with its reason (hash, export, ABI version, import, a function the module does not describe, a name that is a built-in's or any EMQX function's); a module read only from under the rules file's directory, and its environment only from `rules.functions_env` (ADR amendment); limits and the output budget as for jq; a declaration that did not change keeps its module across a reload and a call in flight finishes on the old one (held in the rule engine's hand-off, and through the binary with a two-second call across an admin API write); `modules[]` in `GET /admin/v1/rules` and `mqttd --admin rules`; `--rule-test` with the configured file's modules; two examples, Rust and C, built in CI and called through the binary."
   - id: 0086-T4
     title: "Documentation: RULES.md (the function, its limits, its cost), the departures from EMQX, threat model and hardening rows, the cookbook"
     status: planned
@@ -45,8 +45,8 @@ What exists: the crate `crates/mqtt-wasm-sandbox` on wasmtime, the jq module's b
 scripts, the comparison with EMQX 6.3.1, the measurements in the ADR, a CI job that
 builds the module from pinned sources and runs the comparison, and a fuzz target for the
 loader in the nightly tier (T1); and `jq/2` and `jq/3` in the rule engine, off unless
-`rules.jq = true`, with the release build embedding the module it built (T2). T3 and T4
-are planned, each with its issue.
+`rules.jq = true`, with the release build embedding the module it built (T2). T3, the
+modules a rules file declares, is in review; T4 is planned.
 
 ## Plan
 
@@ -64,7 +64,7 @@ are planned, each with its issue.
 |------|--------|-------|------|------------------|
 | 0086-T1 | ✅ done | [#905](https://github.com/mbilling/fss-mqtt-broker/issues/905) | 2026-10-11 | "PR 904: the crate on wasmtime 49.0.2 with its limits, tests and failure mode; the `wasm sandbox` CI job, which builds jq.wasm with a compiler and sources pinned by sha256, compares it with jq.wasm.sha256, runs the 285-case EMQX oracle and the limit tests in release mode and checks the refusal under the shipped unit's hardening; and the `module_load` fuzz target in the nightly tier (crates/mqtt-wasm-sandbox/fuzz; 71,000 inputs on two hosts before the PR, no finding). The release build embedding the module is T2's, where the broker first links the crate." |
 | 0086-T2 | ✅ done | [#906](https://github.com/mbilling/fss-mqtt-broker/issues/906) | 2026-10-11 | "PR 911: `jq/2` and `jq/3` in `mqtt-rules` behind the ABI, with EMQX 6.3.1's results, tags and texts (79 probes of `emqx_rule_funcs:jq/2,3` and `emqx_rule_sqltester` on a local EMQX, all matched; the 285-case module oracle unchanged); `rules.jq` off by default with its load errors, `rules.jq_default_timeout_ms`, `rules.jq_env`; the instance pool, literal programs compiled at load; a call's output charged to the message's build budget; the hand-off (one worker thread, a ten-second jq on one connection: 6,974 publishes on another, median 152 µs, slowest 6.2 ms; without it the first is not answered in 2 s) and a Will's rules moved off the hub while rules call jq (ADR amendment); per-function and per-module metrics; `--rule-test`, `--check-rules`, `--check-config`; the module embedded by the build when present and required by the release recipe and CI; the systemd unit's comment; Rust 1.96. `strptime %z` and `strftime %Z` recorded, not closed." |
-| 0086-T3 | ⬜ planned | [#907](https://github.com/mbilling/fss-mqtt-broker/issues/907) | — | "Follows T2, and may follow it at a distance: the ABI is the same either way." |
+| 0086-T3 | 🚧 in-progress | [#907](https://github.com/mbilling/fss-mqtt-broker/issues/907) | — | "One PR carries it: `[functions.<name>]` in the rules file (`wasm`, `sha256`, `functions`, `timeout_ms`, `memory_mib`, `clock`, `env`, `fresh_instance`), loaded with the rules at boot, on a reload, through the admin API and in `--check-rules`; each load-time check a load error with its reason (hash, export, ABI version, import, a function the module does not describe, a name that is a built-in's or any EMQX function's); a module read only from under the rules file's directory, and its environment only from `rules.functions_env` (ADR amendment); limits and the output budget as for jq; a declaration that did not change keeps its module across a reload and a call in flight finishes on the old one (held in the rule engine's hand-off, and through the binary with a two-second call across an admin API write); `modules[]` in `GET /admin/v1/rules` and `mqttd --admin rules`; `--rule-test` with the configured file's modules; two examples, Rust and C, built in CI and called through the binary." |
 | 0086-T4 | ⬜ planned | [#908](https://github.com/mbilling/fss-mqtt-broker/issues/908) | — | "Follows T2." |
 <!-- /status-table:0086 -->
 
@@ -146,3 +146,47 @@ are planned, each with its issue.
   - **Not closed:** `strptime %z` and `strftime %Z` (recorded in RULES.md with the libm
     digits). Concurrent long calls are bounded by the runtime's blocking threads, not by
     the worker count (ADR amendment): a cap is a decision for T3 or T4.
+- 2026-10-11 — T3: functions an operator supplies as WebAssembly modules, declared in the
+  rules file and pinned by hash.
+  - **The table.** `[functions.<name>]` with `wasm`, `sha256` and `functions`, and
+    optionally `timeout_ms` (100; at most 10000), `memory_mib` (16; at most 64), `clock`,
+    `env` and `fresh_instance`. Declaring a module is the switch: no key in the broker's
+    configuration turns modules on, `rules.jq` need not be set, and a broker whose rules
+    declare none creates nothing of the runtime. An mqttd extension, in RULES.md's
+    departures table.
+  - **Load-time checks**, each a load error with its reason, the running rules kept: the
+    path, the file's sha256 against the pin (on every load, so a file replaced on disk
+    fails the next reload), a valid module importing only the sixteen provided functions,
+    the ABI's exports and version, every named function described, and the names. A
+    function may not have a built-in's name or that of any function of EMQX's rule
+    engine: the 144 built-ins, plus the exports of `emqx_rule_funcs` in EMQX 6.3.1 that
+    are not built in (read from the module's export table in the 6.3.1 image), the names
+    it resolves without exporting, and two that earlier releases exported.
+  - **Where a module may be read from** (ADR amendment). Only from under the directory of
+    the configured rules file: a relative path of plain names ending in `.wasm`, still
+    under that directory with every symlink resolved. The broker writes nothing there
+    that is a module, so a rules writer of the admin API, or an operator checking text,
+    can name only a file the operator placed, by a hash they must already know (the
+    mismatch error does not state the file's). The environment a table may grant is
+    bounded by a new key, `rules.functions_env` (`MQTTD_RULES_FUNCTIONS_ENV`), read at
+    startup.
+  - **The reload.** A rule set holds its modules; a declaration that did not change keeps
+    its loaded module and warm instances, a changed one is loaded beside the old, and the
+    old one goes with the last evaluation that started on it. Shown twice: in the rule
+    engine, with a call suspended in the hand-off while the rules are replaced; and
+    through the binary, where a publish whose call runs for two seconds is still
+    running when `mqttd --admin rules-apply` pins another module, a second publisher's
+    message is answered by the new module, and the first then returns the old module's
+    answer and is acknowledged.
+  - **The admin view.** `modules[]` in `GET /admin/v1/rules`: name, version, sha256,
+    functions and arities, limits, grants, and instances with their memory; the path and
+    the granted variables' names for an operator only; a second table in
+    `mqttd --admin rules`. `mqttd --check-rules` lists what it loaded.
+  - **Examples.** `examples/rule-plugins`: `geo` in Rust (`wasm32-unknown-unknown`, no
+    dependencies; 70 kB) and `telemetry` in C (`zig cc -target wasm32-wasi`; 25 kB), with
+    `build.sh`. The Rust one is outside the workspace because a guest needs `unsafe` to
+    implement the ABI: three marked blocks and the exports, in guest code that runs in the
+    sandbox. CI builds both (cached: a hit costs a cache restore) and the tests call
+    them through the binary, grants included.
+  - **Not changed:** the peer protocol (rules and modules are per-node files). **Not
+    decided:** a cap on concurrent long calls, which T2 left to T3 or T4.
