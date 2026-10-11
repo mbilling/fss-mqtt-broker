@@ -739,7 +739,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 
 - `publish_codec_round_trip_clears_the_floor`
 
-## `crates/mqtt-config/src/lib.rs` — 48 test(s)
+## `crates/mqtt-config/src/lib.rs` — 49 test(s)
 
 - `tests::a_backup_dir_inside_the_data_dir_is_a_config_error`
 - `tests::a_bad_enum_value_is_rejected`
@@ -774,6 +774,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::rules_writers_need_the_admin_listener`
 - `tests::the_admin_listener_needs_tls_a_role_and_its_own_bind`
 - `tests::the_env_surface_is_a_deduplicated_curated_list`
+- `tests::the_function_ceiling_loads_has_a_range_and_bounds_the_jq_default_timeout`
 - `tests::the_functions_env_key_loads_from_file_and_environment`
 - `tests::the_gossip_key_is_inline_xor_by_reference`
 - `tests::the_jq_keys_load_from_file_and_environment`
@@ -899,7 +900,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::sink_records_through_a_trait_object`
 - `tests::tampering_with_any_field_changes_the_head`
 
-## `crates/mqtt-rules/src/lib.rs` — 272 test(s)
+## `crates/mqtt-rules/src/lib.rs` — 277 test(s)
 
 - `crdt::tests::a_causally_later_lww_write_is_never_lost_whatever_the_wall_clocks_say`
 - `crdt::tests::a_counter_is_the_sum_of_every_nodes_increments_and_decrements`
@@ -1113,6 +1114,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests_message_events::the_flags_are_the_delivery_s`
 - `tests_message_events::the_sql_test_has_a_sample_of_each_message_event`
 - `tests_modules::a_fresh_instance_per_call_keeps_no_state_between_messages`
+- `tests_modules::a_module_call_is_held_to_the_brokers_ceiling_on_one_call`
 - `tests_modules::a_module_is_granted_only_environment_the_broker_lists`
 - `tests_modules::a_module_is_only_read_from_under_the_rules_files_directory`
 - `tests_modules::a_module_that_fails_a_check_fails_the_load_with_the_reason`
@@ -1272,7 +1274,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::the_no_wildcard_fast_path_returns_exactly_the_named_topic`
 - `tests::unacked_messages_survive_for_replay`
 
-## `crates/mqtt-wasm-sandbox/src/lib.rs` — 34 test(s)
+## `crates/mqtt-wasm-sandbox/src/lib.rs` — 37 test(s)
 
 - `tests::a_call_is_held_to_its_own_bound_on_the_result`
 - `tests::a_call_returns_the_modules_value`
@@ -1280,6 +1282,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::a_call_that_outlasts_its_first_slice_goes_on_inside_the_hand_off`
 - `tests::a_fuel_bound_stops_the_same_work_at_the_same_point_every_time`
 - `tests::a_hand_off_that_misbehaves_does_not_lose_or_repeat_the_call`
+- `tests::a_module_pool_holds_a_call_to_the_modules_ceiling_whatever_timeout_it_is_given`
 - `tests::a_module_pool_keeps_warm_instances_and_replaces_one_a_call_stopped`
 - `tests::a_module_pool_told_to_keeps_no_instance_between_calls`
 - `tests::a_module_without_the_abi_is_refused_at_load`
@@ -1301,7 +1304,9 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::every_call_is_handed_off_at_the_end_of_its_own_first_slice`
 - `tests::every_call_stops_at_its_own_deadline_and_a_call_without_one_is_left_alone`
 - `tests::instances_share_no_state`
+- `tests::making_an_instance_for_a_call_is_under_the_calls_ceiling`
 - `tests::memory_growth_stops_at_the_cap`
+- `tests::one_ceiling_holds_a_slow_allocation_and_the_call_after_it_together`
 - `tests::the_arguments_arrive_as_one_counted_frame`
 - `tests::the_test_plugin_describes_its_functions_and_returns_an_argument_as_it_came`
 - `tests::this_host_runs_both_kinds_of_code`
@@ -2488,7 +2493,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `rules_republishing_into_each_other_stop_at_the_depth_cap`
 - `the_original_s_limits_cover_the_whole_chain`
 
-## `crates/mqttd/tests/rules_binary.rs` — 67 test(s)
+## `crates/mqttd/tests/rules_binary.rs` — 70 test(s)
 
 - `a_broker_keeps_rule_state_between_publishes`
 - `a_closed_stdout_leaves_probe_and_backup_their_exit_status`
@@ -2499,6 +2504,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `a_graceful_shutdown_forwards_every_shutdown_event_to_a_watcher_on_another_node`
 - `a_graceful_shutdown_keeps_every_shutdown_event_for_an_offline_watcher`
 - `a_live_edit_swaps_a_module_while_a_publish_in_flight_finishes_on_the_old_one`
+- `a_publisher_cannot_make_a_jq_or_module_call_outlast_the_brokers_ceiling`
 - `a_qos1_derived_message_is_queued_for_an_offline_persistent_session`
 - `a_qos1_puback_is_released_only_once_each_derived_message_is_stored`
 - `a_reload_turns_rule_watching_on_and_off_and_a_rejected_one_changes_nothing`
@@ -2536,6 +2542,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `jq_runs_in_the_broker_with_emqx_results_limits_and_metrics`
 - `jq_sees_only_the_environment_variables_the_operator_listed`
 - `no_local_does_not_suppress_a_derived_message_for_its_publisher`
+- `rule_test_cuts_a_jq_call_at_the_brokers_ceiling_whatever_timeout_it_names`
 - `rule_test_event_picks_among_several_events`
 - `rule_test_prints_an_output_exactly_as_the_rule_renders_it`
 - `rule_test_prints_each_output_of_a_publish_statement_as_json`
@@ -2553,6 +2560,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `session_unsubscribed_fires_once_per_filter_actually_removed`
 - `sighup_swaps_the_rules_for_a_client_that_stays_connected`
 - `the_broker_refuses_to_boot_on_a_rules_file_that_does_not_load`
+- `the_function_ceiling_is_checked_and_reported_before_the_broker_runs`
 - `the_worked_example_modules_run_in_the_broker_with_their_grants`
 - `two_rules_failing_on_every_message_each_log_one_warn_per_ten_seconds`
 - `with_config_watch_an_edited_rules_file_is_picked_up_without_a_signal`

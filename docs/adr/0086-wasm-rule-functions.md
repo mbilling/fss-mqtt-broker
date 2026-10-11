@@ -16,7 +16,8 @@
 > `crates/mqtt-wasm-sandbox`; since T2 the rule engine calls `jq` through it, and since T3
 > the modules a rules file declares. What building T2 and T3 settled, measured and
 > corrected, and what T4 checked while documenting it, is in [Amendments](#amendments)
-> at the end.
+> at the end, with the decision of 2026-10-11 that no call runs longer than a
+> broker-wide ceiling (`rules.function_max_ms`).
 >
 > **Accepted on 2026-10-11.** Decided with it: the runtime
 > is **wasmtime, chosen for speed** over the wasmi interpreter the spike first recommended
@@ -521,7 +522,7 @@ that a ten-second jq on one connection does not delay another connection's publi
 
 | Limit | Value | On reaching it |
 |---|---|---|
-| Time | the function's timeout (`jq/3`), or the module's declared default | EMQX's `timeout` error for jq; a `timeout` error for a plugin. The rule fails |
+| Time | the function's timeout (`jq/3`), or the module's declared default; never more than the broker's ceiling on one call (`rules.function_max_ms`, [amendment of 2026-10-11](#2026-10-11--a-ceiling-on-how-long-any-one-call-may-run-rulesfunction_max_ms)) | EMQX's `timeout` error for jq; a `timeout` error for a plugin. The rule fails |
 | Compiling a jq program | 5 s per program | the rule fails; the instance is dropped |
 | Memory | 64 MiB per instance (plugins: declared, at most the broker's ceiling) | the rule fails; the instance is dropped |
 | Output | what is left of the message's 1 MiB build budget (`MAX_BUILT_BYTES`), charged when the call returns | the rule fails |
@@ -1059,6 +1060,8 @@ runners showed and a laptop does not). That bound is the mechanism's, not a tole
 T4"; T4 documents the behaviour as it is, as an accepted risk in THREAT-MODEL.md with
 the operator's mitigations, and as H-7.14 in HARDENING.md. Deciding it (a bound on
 instances in a call, with queueing or a failed rule past it) remains open.
+*Decided later the same day, the other way: a ceiling on how long a call may run, not on
+how many run; see the last amendment below.*
 
 ### 2026-10-11 — `rules.functions_env` confirmed
 
@@ -1067,3 +1070,147 @@ broker's configuration on the environment variables any module may be shown, wit
 having been asked for it: D8 and D9 had left open who lists them (the T3 amendment
 above). The user confirmed it on 2026-10-11. It stays as built: read at startup, a
 module's `env` may name only variables it lists, and a rules file cannot widen it.
+
+### 2026-10-11 — A ceiling on how long any one call may run (`rules.function_max_ms`)
+
+T2, T3 and T4 each left one thing open: nothing bounded what long calls could hold. Two
+things made it matter. A call that outlasts its first millisecond holds a thread and an
+instance of up to its memory limit, and the number of such calls is bounded only by the
+runtime's limit on blocking threads. And `jq/3`'s third argument is a value like any
+other: `jq(payload.program, payload.data, payload.ms)` is legal rule SQL, as in EMQX, so
+a publisher could name the timeout, and an integer below 2^64 was a timeout that never
+came.
+
+**Decided by the maintainer on 2026-10-11: a ceiling on time, per call, broker-wide.** No
+call of `jq` or of a module's function runs longer than `rules.function_max_ms`
+milliseconds, whatever the rule, `jq/3`'s third argument or a payload asks for. **Not a
+limit on how many calls run at once**: that was the alternative (a bound on instances in a
+call, with queueing or a failed rule past it), it was not chosen, and it is not built.
+What a count limit would have bounded, the peak, is still bounded only as before; what
+is new is that every one of those calls ends.
+
+**The key.** `rules.function_max_ms` (`MQTTD_RULES_FUNCTION_MAX_MS`), default **10000**,
+which is EMQX's default timeout for `jq/2` and was already the most a module's
+`timeout_ms` could ask for; from 1 to 600000. Read at startup, like `rules.jq`,
+`rules.jq_default_timeout_ms` and `rules.functions_env`: the instance pools are made with
+it, and a reload reports a change as needing a restart. Set it on every node.
+
+**What each call runs under.**
+
+| Call | Before | Now |
+|---|---|---|
+| `jq/2` | `rules.jq_default_timeout_ms` | the same, which may not exceed the ceiling |
+| `jq/3`, a timeout at or below the ceiling | its third argument | the same: nothing changes |
+| `jq/3`, a timeout above the ceiling, or one that never comes (2^63 ms and more) | its third argument | **the ceiling**: the call runs, and is stopped there if it is still running |
+| A module's function | the table's `timeout_ms`, at most 10000 | the table's `timeout_ms`, at most the ceiling |
+
+**`jq/3` is clamped, not refused.** A call whose timeout is above the ceiling runs with
+the ceiling as its limit. A program that finishes within the ceiling gives the result it
+always gave, so a rule ported from EMQX with a generous literal timeout keeps working.
+One that is cut at the ceiling fails its rule with the error any jq timeout fails with,
+EMQX's tag and text, naming what the call ran under: `timeout: jq program canceled as it
+took too long time to execute (timeout set to 10000 ms)`, where the rule may have said
+`3600000`. It is counted as `kind="timeout"` like any other. What EMQX answers for a bad
+third argument is untouched, because the argument is still judged first and as before:
+`bad_timeout_val` for anything that is not an integer of zero or more, the
+`{badmatch,{error,badarg}}` of 2^64 and above, both before the program is looked at. The
+difference from EMQX is confined to calls that would have run longer than the ceiling,
+and is in RULES.md's table of differences.
+
+**A configured bound above the ceiling is an error, not a clamp.** Two bounds are written
+down by someone who can be told: `rules.jq_default_timeout_ms` in the broker's
+configuration and a module's `timeout_ms` in the rules file. Above the ceiling, the first
+is refused by `Config::validate` (startup, `--check-config`, a reload's precheck) and the
+second fails the load of the rules file (startup, a reload, an admin API write,
+`--check-rules`), each naming both keys. This is how the codebase already treats a bound
+a file sets against the broker's ceiling for it: a `[state.<name>]` table's `max_bytes`
+above `rules.state_max_bytes` is a load error that names the key (ADR 0085), and a
+module's `env` naming a variable outside `rules.functions_env` is one too. A clamp with
+a warning would leave a file that says `timeout_ms = 60000` running under 10000, which
+the next reader of the file cannot see. `jq/3`'s argument is the opposite case: it is a
+value computed per message, possibly by a publisher, with nobody to tell and EMQX's
+behaviour to keep for every call that ends in time; so it is clamped. Two details: the
+default timeout is checked only where `rules.jq` is on (a broker that runs modules alone
+lowers the ceiling without having to configure a function it does not have); and a
+table that does not say `timeout_ms` gets the default of 100 ms or the ceiling,
+whichever is lower, since a table that asks for nothing cannot be in conflict.
+
+**The ceiling is per call of a rule function, not per entry into the module.** T4
+recorded that one call is several entries (allocate the argument frame, call, free), each
+armed with the timer on its own. The deadline they are armed with was already one
+instant, computed once when the call starts; that is now where the ceiling is applied,
+and it is extended to the two things a call could do outside it:
+
+- **Compiling a jq program.** The timeout does not cover compiling, as in EMQX; compiling
+  has its own five seconds (`COMPILE_TIMEOUT`). A program taken from a payload could
+  therefore spend five seconds in the compiler on a broker whose ceiling is 100 ms. In a
+  call, compiling is now stopped at the five seconds or at the call's ceiling, whichever
+  comes first, and says which: `sandbox_limit (compile_timeout): jq stopped: compiling
+  the program ran into the 100 ms one call may take`. When the rules are loaded
+  (literal programs are compiled then, off the publish path) there is no call and the
+  five seconds stand alone.
+- **Making an instance.** A call that finds no warm instance makes one, and a module's
+  start (data segments, a start function, constructors) had `init_timeout`, five
+  seconds, whatever the call's own limit: with `fresh_instance = true`, on every call.
+  Made for a call, an instance's start is now stopped at `init_timeout` or at the
+  call's ceiling, whichever comes first. Loading a module with the rules is not a call
+  and keeps `init_timeout`.
+
+Neither deadline is lowered where it cannot defeat the ceiling: with the default of ten
+seconds both are below it, and nothing changes.
+
+The promise has a margin, which is the mechanism's and is stated rather than hidden. An
+entry that starts when the deadline has already passed still gets one millisecond
+(`min_run`: what lets a timeout of zero run what is quick, as in EMQX), and a module that
+can be asked to stop gets two more to end by itself (`cancel_grace`). An entry that is
+stopped ends the call, so only entries that each return in time can follow one another:
+a module's call has four, a `jq` call that had to compile its program twelve, and an
+instance made for the call two more. **A call therefore ends within some tens of
+milliseconds of its ceiling: under 50 ms at the very most, a few in practice**, plus
+what the operating system adds to a timer. The test for it gives a module an allocator that takes time, so that
+the function starts with half the ceiling used up, and requires the call to end at the
+ceiling and not an allocation later
+(`one_ceiling_holds_a_slow_allocation_and_the_call_after_it_together`).
+
+**The worst case, now.** At any moment long calls hold at most
+
+    calls in flight × memory per call
+
+and each of them for at most the ceiling. Calls in flight are bounded as before: one per
+connection publishing to such a rule, and the runtime's limit on blocking threads
+(tokio's default, 512). Memory per call is 64 MiB for `jq` and a module's `memory_mib`
+(16 by default). With the defaults that is 512 × 64 MiB = 32 GiB at the worst moment,
+unchanged by this decision; what changed is the third factor. Before, a publisher who
+could choose `jq/3`'s timeout held a thread and an instance for as long as it liked with
+one message. Now one message buys at most ten seconds, by default, and at
+`function_max_ms = 100` a tenth of a second: to keep a thread and an instance occupied a
+publisher has to send ten messages a second to that rule, for as long as it wants them
+held, and everything is released within the ceiling of its stopping. The operator's
+levers are the ceiling itself, `memory_mib`, the ACL on the topics such rules select, the
+number of connections, and a memory limit on the process, which is still the only bound
+on the product.
+
+**What the operator sees.** `mqttd --check-config` prints the ceiling in force wherever
+a sandboxed call can exist (`rules.jq` on, or a rules file configured, which may declare
+modules): `rules.function_max_ms is 10000: no jq or module call runs longer, whatever a
+rule or a payload asks for`. `GET /admin/v1/rules` has `function_max_ms` beside
+`modules[]`, whose `limits.timeout_ms` are each at most that; it is the value the node
+started with. The startup line for `rules.jq` carries it. **The metric does not tell a
+clamp from a rule's own timeout**: both are `mqttd_rule_function_errors_total{kind="timeout"}`.
+A separate kind would have been cheap to produce and not cheap to own (every alert and
+dashboard written on `kind="timeout"` would silently stop counting the calls a ceiling
+cut). The error's text does tell them apart, in the log, the rule's last error and the
+trace: it names the milliseconds the call ran under, which is the ceiling's value and
+not the rule's.
+
+**Cost.** A call computes one more instant when it starts. The benchmark of rules that
+call no sandboxed function is unchanged (`cargo bench -p mqtt-rules`, alternated with
+main's build); so is a `jq` call's own time.
+
+**What this closes and what it leaves.** Closed: the timeout a payload may name, which
+was an accepted risk in THREAT-MODEL.md and is now a mitigated row with its test
+(`a_publisher_cannot_make_a_jq_or_module_call_outlast_the_brokers_ceiling`). Left, on
+purpose: the number of concurrent long calls, still bounded only by the blocking-thread
+limit and the number of publishing connections. It stays an accepted risk, now bounded
+in time per call. A limit on the count remains possible later and would sit beside the
+ceiling, not replace it.

@@ -4301,6 +4301,7 @@ fn rules_at_startup(
         }
         mqtt_rules::JqSwitch::On(jq) => info!(
             default_timeout_ms = snap.rules.jq_default_timeout_ms,
+            function_max_ms = snap.rules.function_max_ms,
             env = snap.rules.jq_env.len(),
             module_sha256 = mqtt_rules::Jq::module_sha256().unwrap_or("unknown"),
             loaded = jq.is_loaded(),
@@ -4405,6 +4406,11 @@ fn requires_restart(old: &Config, new: &Config) -> Vec<&'static str> {
     // So is what a declared module may be shown of the environment (D9).
     if o.rules.functions_env != n.rules.functions_env {
         changed.push("rules.functions_env");
+    }
+    // And the ceiling on one call of `jq` or of a module's function: the instance
+    // pools are made with it.
+    if o.rules.function_max_ms != n.rules.function_max_ms {
+        changed.push("rules.function_max_ms");
     }
     // The rule state's ceiling is the store's, which is made at startup (ADR 0085 D1).
     if o.rules.state_max_bytes != n.rules.state_max_bytes {
@@ -4726,17 +4732,17 @@ see docs/mqttd.example.toml and the README.",
 /// located error on failure; exit `2` if the invocation itself is malformed.
 fn check_config() -> ! {
     match check_config_inner() {
-        Ok((Some(path), jq)) => {
+        Ok((Some(path), jq, ceiling)) => {
             outln!(
                 "config OK: {} + MQTTD_* env overlay validates",
                 path.display()
             );
-            report_jq(jq);
+            report_jq(jq, ceiling);
             std::process::exit(0);
         }
-        Ok((None, jq)) => {
+        Ok((None, jq, ceiling)) => {
             outln!("config OK: defaults + MQTTD_* env overlay validates (no config file set)");
-            report_jq(jq);
+            report_jq(jq, ceiling);
             std::process::exit(0);
         }
         Err(CheckError::Usage(e)) => {
@@ -5556,16 +5562,27 @@ enum CheckError {
 /// valid either way, and the check may be running where the broker will not; a rules
 /// file that calls `jq` on a host that refuses is what fails, at `--preflight`,
 /// `--check-rules` and startup.
-fn report_jq(report: Option<Result<String, String>>) {
+///
+/// After it, the ceiling every call of a sandboxed function runs under
+/// (`rules.function_max_ms`), where the configuration can have such calls.
+fn report_jq(report: Option<Result<String, String>>, ceiling: Option<String>) {
     match report {
         Some(Ok(line)) => outln!("{line}"),
         Some(Err(line)) => outln!("warning: {line}"),
         None => {}
     }
+    if let Some(line) = ceiling {
+        outln!("{line}");
+    }
 }
 
-/// The config file checked, and what `rules.jq` means on this host ([`report_jq`]).
-type Checked = (Option<std::path::PathBuf>, Option<Result<String, String>>);
+/// The config file checked, what `rules.jq` means on this host, and the ceiling on a
+/// sandboxed call ([`report_jq`]).
+type Checked = (
+    Option<std::path::PathBuf>,
+    Option<Result<String, String>>,
+    Option<String>,
+);
 
 fn check_config_inner() -> Result<Checked, CheckError> {
     let path = config_path().map_err(CheckError::Usage)?;
@@ -5592,7 +5609,11 @@ fn check_config_inner() -> Result<Checked, CheckError> {
         });
     }
     let jq = mqttd::rules::jq_host_report(&mqttd::rules::functions_from_config(&config.rules));
-    Ok((path, jq))
+    Ok((
+        path,
+        jq,
+        mqttd::rules::function_ceiling_report(&config.rules),
+    ))
 }
 
 /// What `--check-config` runs beyond `Config::load` (issue #671): the checks startup makes
@@ -6521,7 +6542,11 @@ mod tests {
         restart.cluster.peer_bind = Some("127.0.0.1:7001".into());
         restart.durable.lease_voters = 7;
         restart.admin.bind = Some("0.0.0.0:9443".into());
+        // The ceiling on a jq or module call is what the instance pools were made with.
+        restart.rules.function_max_ms = 500;
         let sections = requires_restart(&base, &restart);
+        assert!(sections.contains(&"rules.function_max_ms"));
+        assert!(!sections.contains(&"rules.jq"));
         assert!(sections.contains(&"admin"));
         assert!(sections.contains(&"listeners"));
         assert!(sections.contains(&"cluster"));

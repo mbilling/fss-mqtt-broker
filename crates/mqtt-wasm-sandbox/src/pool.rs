@@ -102,8 +102,10 @@ impl ModulePool {
     }
 
     /// Calls the function `name` with `args` on a warm instance, or on a new one when
-    /// every one is in use. `timeout` is how long the call may run; the result may be
-    /// at most `max_output` bytes (and never more than the module's own limit).
+    /// every one is in use. `timeout` is how long the call may run, and never longer
+    /// than the module's [`Limits::max_call`](crate::Limits::max_call), which also
+    /// covers making the new instance; the result may be at most `max_output` bytes
+    /// (and never more than the module's own limit).
     pub fn call(
         &self,
         name: &str,
@@ -111,13 +113,20 @@ impl ModulePool {
         timeout: Duration,
         max_output: u32,
     ) -> Result<Reply, CallError> {
+        // The ceiling is on the whole call, from here: the start of an instance made
+        // for it is stopped there, and so is every entry into the module after.
+        let ceiling = self
+            .sandbox
+            .limits()
+            .max_call
+            .and_then(|most| Instant::now().checked_add(most));
         let taken = self.idle_instances().pop();
         let mut warm = if let Some(warm) = taken {
             warm
         } else {
             let instance = self
                 .sandbox
-                .instantiate()
+                .instantiate_within(ceiling)
                 .map_err(|e| CallError::Trap(e.to_string()))?;
             self.made.fetch_add(1, Relaxed);
             Warm {
@@ -126,7 +135,12 @@ impl ModulePool {
             }
         };
         self.busy.fetch_add(1, Relaxed);
-        let deadline = Instant::now().checked_add(timeout);
+        // The function's own time starts when there is an instance to run it in, as
+        // it always did: one deadline for every entry, never past the ceiling.
+        let deadline = match (Instant::now().checked_add(timeout), ceiling) {
+            (Some(own), Some(ceiling)) => Some(own.min(ceiling)),
+            (own, ceiling) => own.or(ceiling),
+        };
         let result = warm.instance.call_within(name, args, deadline, max_output);
         self.put_back(warm);
         result

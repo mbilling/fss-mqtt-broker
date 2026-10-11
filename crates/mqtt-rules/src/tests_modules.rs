@@ -348,11 +348,13 @@ fn a_module_that_fails_a_check_fails_the_load_with_the_reason() {
         ),
         (
             table("m", "good.wasm", &sha, &["which"], "timeout_ms = 0"),
-            "timeout_ms = 0: from 1 to 10000",
+            "timeout_ms = 0: from 1 to the broker's ceiling on one call, 10000 \
+             (`rules.function_max_ms`, MQTTD_RULES_FUNCTION_MAX_MS)",
         ),
         (
             table("m", "good.wasm", &sha, &["which"], "timeout_ms = 10001"),
-            "timeout_ms = 10001: from 1 to 10000",
+            "timeout_ms = 10001: from 1 to the broker's ceiling on one call, 10000 \
+             (`rules.function_max_ms`, MQTTD_RULES_FUNCTION_MAX_MS)",
         ),
         (
             table("m", "good.wasm", &sha, &["which"], "memory_mib = 65"),
@@ -522,6 +524,79 @@ fn a_module_is_only_read_from_under_the_rules_files_directory() {
     assert!(plain.rules.modules().is_empty() && !plain.rules.calls_sandbox());
 }
 
+/// ADR 0086 (amendment of 2026-10-11): the broker's ceiling on one call
+/// (`rules.function_max_ms`) is the most a table's `timeout_ms` may ask for, and a rules
+/// file cannot raise it: a larger one is a load error that names both keys, as a
+/// namespace's `max_bytes` above `rules.state_max_bytes` is. A table that does not ask
+/// gets the default of 100 ms, or the ceiling where that is lower, and a call that
+/// loops is cut there: failed and counted as any timeout is, with the next message
+/// served.
+#[test]
+fn a_module_call_is_held_to_the_brokers_ceiling_on_one_call() {
+    let dir = tempfile::tempdir().unwrap();
+    let sha = place(dir.path(), "t.wasm", &test_module::plugin("1", b"j7"));
+    let under = |max_call_ms: u64| {
+        host(ModuleSettings {
+            max_call: Duration::from_millis(max_call_ms),
+            instances: 1,
+            ..ModuleSettings::default()
+        })
+        .beside(&dir.path().join("rules.toml"))
+    };
+    let declare = |more: &str| {
+        table("m", "t.wasm", &sha, &["loop_forever", "which"], more)
+            + &rule("loops", "SELECT loop_forever() AS x FROM \"loops\"")
+            + &rule("ok", "SELECT which() AS x FROM \"#\"")
+    };
+    assert_eq!(under(40).max_call(), Some(Duration::from_millis(40)));
+
+    assert_eq!(
+        load_error(&declare("timeout_ms = 41"), &under(40)),
+        "functions `m`: timeout_ms = 41: from 1 to the broker's ceiling on one call, 40 \
+         (`rules.function_max_ms`, MQTTD_RULES_FUNCTION_MAX_MS)"
+    );
+    // The same table loads where the broker allows it, and the longest a table could
+    // ask for before there was a ceiling to set is no longer the limit.
+    for (more, ceiling) in [("timeout_ms = 41", 41), ("timeout_ms = 60000", 60_000)] {
+        let set = RuleSet::parse_with(&declare(more), &under(ceiling))
+            .unwrap()
+            .rules;
+        assert_eq!(
+            set.modules()[0].timeout(),
+            Duration::from_millis(ceiling),
+            "{more}"
+        );
+    }
+
+    // No `timeout_ms`: the default, where the ceiling is not lower.
+    let roomy = RuleSet::parse_with(&declare(""), &under(10_000))
+        .unwrap()
+        .rules;
+    assert_eq!(roomy.modules()[0].timeout(), Duration::from_millis(100));
+    let set = RuleSet::parse_with(&declare(""), &under(40)).unwrap().rules;
+    assert_eq!(set.modules()[0].timeout(), Duration::from_millis(40));
+    let started = std::time::Instant::now();
+    let seen = publish(&set, "loops", b"{}");
+    let took = started.elapsed();
+    assert_eq!(
+        seen.failures,
+        [
+            "loop_forever(): sandbox_limit (timeout): the call ran past its 40 ms (timeout_ms of \
+          [functions.m], which is the broker's rules.function_max_ms)"
+        ],
+        "{seen:?}"
+    );
+    assert!(
+        took >= Duration::from_millis(40),
+        "cut before the ceiling: {took:?}"
+    );
+    let errors: Vec<Option<&str>> = seen.calls.iter().map(|c| c.error).collect();
+    assert_eq!(errors, [Some("timeout"), None], "{seen:?}");
+    // The message itself went on: the other rule ran, and so does the next message's.
+    assert_eq!(seen.lines, ["{\"x\":7}"]);
+    assert_eq!(publish(&set, "next", b"{}").lines, ["{\"x\":7}"]);
+}
+
 /// ADR 0086 D7: a module's call runs under its table's limits, and reaching one fails
 /// the rule for this message, counted by kind; it is never "no result", and the next
 /// message is served.
@@ -666,7 +741,7 @@ fn a_module_is_granted_only_environment_the_broker_lists() {
             ("UNSET".to_string(), None),
         ],
         instances: 1,
-        hand_off: None,
+        ..ModuleSettings::default()
     })
     .beside(&dir.path().join("rules.toml"));
     let granted = table(
@@ -735,6 +810,7 @@ fn a_reload_swaps_a_module_and_a_call_in_flight_finishes_on_the_old_one() {
             }
             rest();
         })),
+        ..ModuleSettings::default()
     })
     .beside(&dir.path().join("rules.toml"));
     let rules = rule("slow", "SELECT spin() AS v FROM \"slow\"")

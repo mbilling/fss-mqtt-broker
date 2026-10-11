@@ -7,7 +7,8 @@
 //! wasm = "plugins/geo.wasm"        # under the rules file's directory
 //! sha256 = "9f2c…"                 # the load fails on any other content
 //! functions = ["geo_distance"]     # among those the module describes
-//! timeout_ms = 50                  # per call; default 100, at most 10000
+//! timeout_ms = 50                  # per call; default 100, at most the broker's
+//!                                  # rules.function_max_ms (10000 unless set)
 //! memory_mib = 16                  # per instance; default 16, at most 64
 //! clock = false                    # the wall clock; without it every clock reads 0
 //! env = []                         # variables the module sees; each must be listed
@@ -64,8 +65,10 @@ pub const MAX_FUNCTIONS_PER_MODULE: usize = 64;
 /// What a call runs under when the table does not say (`timeout_ms`).
 pub const DEFAULT_TIMEOUT_MS: u64 = 100;
 
-/// The longest `timeout_ms` a table may ask for: what `jq/2` is given by default.
-pub const MAX_TIMEOUT_MS: u64 = 10_000;
+/// The longest one call of a sandboxed function may take, a module's or `jq`'s, where
+/// the broker does not say (`rules.function_max_ms`): what `jq/2` is given by default
+/// in EMQX. It is the most a table's `timeout_ms` may ask for.
+pub const DEFAULT_FUNCTION_MAX_MS: u64 = 10_000;
 
 /// An instance's memory when the table does not say (`memory_mib`).
 pub const DEFAULT_MEMORY_MIB: u64 = 16;
@@ -91,8 +94,12 @@ pub(crate) struct ModuleSchema {
 }
 
 /// What a broker gives every module its rules files declare.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct ModuleSettings {
+    /// The longest one call of any module's function may take: the broker's
+    /// `rules.function_max_ms`. A table whose `timeout_ms` is larger does not load,
+    /// and a call is held to it as a whole, the instance it may have to make included.
+    pub max_call: Duration,
     /// The environment variables a table's `env` may name, each with the value it has
     /// (`None`: not set, and so not given): the broker's `rules.functions_env`.
     pub environment: Vec<(String, Option<String>)>,
@@ -103,9 +110,21 @@ pub struct ModuleSettings {
     pub hand_off: Option<HandOff>,
 }
 
+impl Default for ModuleSettings {
+    fn default() -> Self {
+        Self {
+            max_call: Duration::from_millis(DEFAULT_FUNCTION_MAX_MS),
+            environment: Vec::new(),
+            instances: 0,
+            hand_off: None,
+        }
+    }
+}
+
 impl std::fmt::Debug for ModuleSettings {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ModuleSettings")
+            .field("max_call", &self.max_call)
             // Names only: a value may be a secret.
             .field(
                 "environment",
@@ -139,6 +158,12 @@ impl ModuleHost {
 
     fn loaded(&self) -> std::sync::MutexGuard<'_, Vec<Weak<Module>>> {
         self.loaded.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The longest one call of a module's function may take.
+    #[must_use]
+    pub fn max_call(&self) -> Duration {
+        self.settings.max_call
     }
 
     /// How many modules are loaded now, in any rule set still alive.
@@ -345,9 +370,16 @@ impl Module {
                 Err(CallError::Timeout) => Err(limit(
                     "timeout",
                     format!(
-                        "the call ran past its {} ms (timeout_ms of [functions.{}])",
+                        "the call ran past its {} ms (timeout_ms of [functions.{}]{})",
                         timeout.as_millis(),
-                        self.name
+                        self.name,
+                        // Said where the two are one bound: raising the table's alone
+                        // would not load.
+                        if self.pool.sandbox().limits().max_call == Some(timeout) {
+                            ", which is the broker's rules.function_max_ms"
+                        } else {
+                            ""
+                        }
                     ),
                 )),
                 Err(e @ CallError::Memory) => Err(limit(
@@ -603,10 +635,17 @@ fn declare(name: &str, table: &ModuleSchema, host: &ModuleHost) -> Result<Declar
             ));
         }
     }
-    let timeout_ms = table.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS);
-    if timeout_ms == 0 || timeout_ms > MAX_TIMEOUT_MS {
+    // The broker's ceiling on one call is the most a table may ask for: a rules file
+    // cannot raise it, as it cannot raise the state store's. A table that does not
+    // ask gets the default, or the ceiling where that is lower.
+    let most = u64::try_from(host.settings.max_call.as_millis()).unwrap_or(u64::MAX);
+    let timeout_ms = table
+        .timeout_ms
+        .unwrap_or_else(|| DEFAULT_TIMEOUT_MS.min(most));
+    if timeout_ms == 0 || timeout_ms > most {
         return Err(format!(
-            "timeout_ms = {timeout_ms}: from 1 to {MAX_TIMEOUT_MS}"
+            "timeout_ms = {timeout_ms}: from 1 to the broker's ceiling on one call, {most} \
+             (`rules.function_max_ms`, MQTTD_RULES_FUNCTION_MAX_MS)"
         ));
     }
     let memory_mib = table.memory_mib.unwrap_or(DEFAULT_MEMORY_MIB);
@@ -677,6 +716,7 @@ fn load(declaration: Declaration, dir: &Path, host: &ModuleHost) -> Result<Modul
         let limits = Limits {
             memory_bytes: usize::try_from(declaration.memory_mib << 20).unwrap_or(usize::MAX),
             max_output_bytes: u32::try_from(crate::funcs::MAX_BUILT_BYTES).unwrap_or(u32::MAX),
+            max_call: Some(host.settings.max_call),
             ..Limits::default()
         };
         let grants = Grants {

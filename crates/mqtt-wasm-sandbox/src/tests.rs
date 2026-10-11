@@ -872,3 +872,146 @@ fn a_module_pool_told_to_keeps_no_instance_between_calls() {
     let first = address(&kept);
     assert!(address(&kept) > first);
 }
+
+/// How far the test module counts in its slow entries below: some hundreds of
+/// milliseconds on any machine, which is what the bounds of those tests are scaled
+/// from.
+const SLOW: u32 = 30_000_000;
+
+fn pool_of(shape: &Shape, max_call: Option<Duration>, fresh_instance: bool) -> crate::ModulePool {
+    let limits = Limits {
+        max_call,
+        ..Limits::default()
+    };
+    let sandbox = Sandbox::load(&module(shape), limits, Grants::default()).unwrap();
+    crate::ModulePool::new(sandbox, 1, fresh_instance)
+}
+
+/// [`Limits::max_call`] holds a call whatever timeout its caller names: a loop under
+/// a timeout of an hour is stopped at the module's ceiling, as a timeout. A timeout
+/// shorter than the ceiling is the call's own, as before, and a call that ends in
+/// time is untouched by either.
+#[test]
+fn a_module_pool_holds_a_call_to_the_modules_ceiling_whatever_timeout_it_is_given() {
+    let ceiling = Duration::from_millis(60);
+    let pool = pool_of(&Shape::default(), Some(ceiling), false);
+    assert_eq!(
+        pool.call("which", &[], Duration::from_hours(1), 64),
+        Ok(Reply::Json(b"true".to_vec()))
+    );
+    for timeout in [Duration::from_hours(1), Duration::MAX] {
+        let started = Instant::now();
+        assert_eq!(
+            pool.call("loop_forever", &[], timeout, 64),
+            Err(CallError::Timeout)
+        );
+        let took = started.elapsed();
+        assert!(
+            took >= ceiling,
+            "stopped before the ceiling, after {took:?}"
+        );
+        assert!(
+            took < ceiling + Duration::from_secs(5),
+            "stopped late, after {took:?}"
+        );
+    }
+    assert_eq!(pool.stats().replaced, 2);
+    // The shorter of the two: the call's own timeout, long before the ceiling.
+    let roomy = pool_of(&Shape::default(), Some(Duration::from_hours(1)), false);
+    let started = Instant::now();
+    assert_eq!(
+        roomy.call("loop_forever", &[], Duration::from_millis(20), 64),
+        Err(CallError::Timeout)
+    );
+    assert!(started.elapsed() < Duration::from_mins(1));
+}
+
+/// The ceiling is on the call, not on each entry the host makes into the module for
+/// it. The module here has an allocator that takes time, so the call's first entry
+/// (the argument frame) has used up half the ceiling when its second (the function,
+/// which loops) starts: the function is stopped when the *call* reaches the ceiling.
+///
+/// The ceiling is twice what the allocation took when it was measured, whatever the
+/// machine. A deadline armed anew for each entry would end the call an allocation
+/// later, at one and a half times the ceiling; the bound is half-way between.
+#[test]
+fn one_ceiling_holds_a_slow_allocation_and_the_call_after_it_together() {
+    let shape = Shape {
+        slow_alloc: SLOW,
+        ..Shape::default()
+    };
+    let unbounded = pool_of(&shape, None, false);
+    // The fastest of three: a machine busy with other tests can only make the call
+    // that is judged below slower than this, which the bound allows for.
+    let allocation = (0..3)
+        .map(|_| {
+            let started = Instant::now();
+            assert_eq!(
+                unbounded.call("which", &[], Duration::from_hours(1), 64),
+                Ok(Reply::Json(b"true".to_vec()))
+            );
+            started.elapsed()
+        })
+        .min()
+        .unwrap();
+    assert!(
+        allocation > Duration::from_millis(10),
+        "the allocator was meant to be slow: {allocation:?}"
+    );
+    let ceiling = allocation * 2;
+    let pool = pool_of(&shape, Some(ceiling), false);
+    let started = Instant::now();
+    assert_eq!(
+        pool.call("loop_forever", &[], Duration::from_hours(1), 64),
+        Err(CallError::Timeout)
+    );
+    let took = started.elapsed();
+    assert!(
+        took >= ceiling,
+        "stopped before the ceiling, after {took:?}"
+    );
+    assert!(
+        took < ceiling + allocation / 2,
+        "an allocation of {allocation:?} and a loop under a ceiling of {ceiling:?} took \
+         {took:?}: the ceiling was armed for each entry, not for the call"
+    );
+}
+
+/// What a call has to make first is under its ceiling too: a module whose start
+/// function takes time cannot use a new instance (`fresh_instance`, or the one after
+/// a stopped call) to run for longer than a call may. Loading the module is not a
+/// call and keeps [`Limits::init_timeout`].
+#[test]
+fn making_an_instance_for_a_call_is_under_the_calls_ceiling() {
+    let shape = Shape {
+        slow_start: SLOW,
+        ..Shape::default()
+    };
+    let unbounded = pool_of(&shape, None, true);
+    let started = Instant::now();
+    assert_eq!(
+        unbounded.call("which", &[], Duration::from_millis(1), 64),
+        Ok(Reply::Json(b"true".to_vec())),
+        "without a ceiling the start is not under the call's timeout"
+    );
+    let start = started.elapsed();
+    assert!(
+        start > Duration::from_millis(10),
+        "the start was meant to be slow: {start:?}"
+    );
+    let pool = pool_of(&shape, Some(Duration::from_millis(5)), true);
+    let started = Instant::now();
+    let outcome = pool.call("which", &[], Duration::from_hours(1), 64);
+    let took = started.elapsed();
+    assert_eq!(
+        outcome,
+        Err(CallError::Trap(
+            "the module did not start: the call ran past its deadline".to_owned()
+        ))
+    );
+    assert!(
+        took < start / 2,
+        "a start of {start:?} under a ceiling of 5 ms took {took:?}"
+    );
+    assert_eq!(pool.stats().instances, 0);
+}

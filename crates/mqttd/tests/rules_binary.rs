@@ -3998,16 +3998,23 @@ fn check_config_reports_whether_this_host_can_run_jq_while_it_is_switched_on() {
     }
     let ran = check(Some("1"));
     assert_eq!(ran.code, Some(0), "{ran:?}");
+    // The last line is the ceiling its calls run under (`rules.function_max_ms`).
     let report = ran
         .stdout
         .strip_prefix(ok)
+        .and_then(|rest| {
+            rest.strip_suffix(
+                "rules.function_max_ms is 10000: no jq or module call runs longer, whatever a \
+                 rule or a payload asks for\n",
+            )
+        })
         .unwrap_or_else(|| panic!("{ran:?}"));
     match mqtt_rules::Jq::built_in() {
         // On a host that forbids executable memory this is a warning naming
         // MemoryDenyWriteExecute; the hosts the tests run on allow it.
         Ok(()) => assert!(
             report.starts_with("rules.jq is on: this host allows compiled code (jq module sha256 ")
-                && report.trim_end().ends_with(')'),
+                && report.ends_with(")\n"),
             "{ran:?}"
         ),
         Err(why) => assert_eq!(
@@ -4018,6 +4025,364 @@ fn check_config_reports_whether_this_host_can_run_jq_while_it_is_switched_on() {
             "{ran:?}"
         ),
     }
+}
+
+/// What every row below runs under: a ceiling of 300 ms on one call, and `jq/2`'s
+/// default timeout lowered to fit under it.
+const CEILING_300: &[(&str, &str)] = &[
+    ("MQTTD_RULES_FUNCTION_MAX_MS", "300"),
+    ("MQTTD_RULES_JQ_DEFAULT_TIMEOUT_MS", "300"),
+];
+
+/// ADR 0086 (amendment of 2026-10-11): `rules.function_max_ms` is the longest any one
+/// jq call may take, whatever its timeout says. `jq/3`'s third argument may come from
+/// the payload, and in EMQX a publisher who sends a day gets a day; here the call runs
+/// under the ceiling and is cut there, with EMQX's `timeout` error naming the 300 ms
+/// it ran under. A timeout that "never comes" in EMQX (an integer of 2^63 or more that
+/// still fits 64 bits) is held the same way. A timeout below the ceiling is the
+/// call's own, and a program that ends in time answers as it does without a ceiling.
+/// What EMQX answers for a bad timeout is unchanged: it is looked at first.
+#[test]
+fn rule_test_cuts_a_jq_call_at_the_brokers_ceiling_whatever_timeout_it_names() {
+    if let Err(why) = mqtt_rules::Jq::built_in() {
+        skip_locally_or_fail_in_ci!("{why}: {JQ_MODULE_HOW}");
+    }
+    let select = |call: &str| format!("SELECT {call} AS r FROM \"t/#\"");
+    let timeout = |ms: u32| {
+        format!(
+            "rule test FAILED: jq(): timeout: jq program canceled as it took too long time to \
+             execute (timeout set to {ms} ms)\n"
+        )
+    };
+    let day = r#"{"wait":86400000,"v":[1,2]}"#;
+    for (call, payload, stderr) in [
+        // The publisher's own number, a day: the call ends at the ceiling.
+        (
+            "jq('def f: f; f', payload.v, payload.wait)",
+            day,
+            timeout(300),
+        ),
+        ("jq('def f: f; f', payload, 3600000)", "1", timeout(300)),
+        // 2^64 - 1 ms: Erlang's timer takes it and it never comes.
+        (
+            "jq('def f: f; f', payload, 18446744073709551615)",
+            "1",
+            timeout(300),
+        ),
+        ("jq('def f: f; f', payload)", "1", timeout(300)),
+        // Below the ceiling a timeout is the call's own.
+        ("jq('def f: f; f', payload, 30)", "1", timeout(30)),
+    ] {
+        let started = Instant::now();
+        let ran = jq_rule_test(&select(call), payload, CEILING_300);
+        let took = started.elapsed();
+        assert_eq!(
+            (ran.code, ran.stdout.as_str(), ran.stderr.as_str()),
+            (Some(1), "", stderr.as_str()),
+            "{call} on {payload}"
+        );
+        // The whole command, with starting the process and compiling the module: far
+        // from the hour or the day the statement asked for.
+        assert!(took < Duration::from_mins(2), "{call}: {took:?}");
+    }
+    // A program that ends in time: the same answer, whatever it was allowed.
+    for (call, payload, stdout) in [
+        ("jq('.v[]', payload, payload.wait)", day, "{\"r\":[1,2]}\n"),
+        (
+            "jq('.', payload, 18446744073709551615)",
+            "1",
+            "{\"r\":[1]}\n",
+        ),
+    ] {
+        let ran = jq_rule_test(&select(call), payload, CEILING_300);
+        assert_eq!(
+            (ran.code, ran.stdout.as_str(), ran.stderr.as_str()),
+            (Some(0), stdout, ""),
+            "{call} on {payload}"
+        );
+    }
+    // The argument is judged as EMQX judges it, before the program, ceiling or not.
+    let needs = "bad_timeout_val: Needs positive integer or infinity but got";
+    for (call, payload, emqx) in [
+        ("jq('%%', payload, -1)", "1", format!("{needs} -1")),
+        (
+            "jq('.', payload, payload.wait)",
+            r#"{"wait":"86400000"}"#,
+            format!("{needs} <<\"86400000\">>"),
+        ),
+        (
+            "jq('.', payload, 99999999999999999999)",
+            "1",
+            "{badmatch,{error,badarg}}".to_string(),
+        ),
+    ] {
+        let ran = jq_rule_test(&select(call), payload, CEILING_300);
+        assert_eq!(
+            (ran.code, ran.stdout.as_str(), ran.stderr.as_str()),
+            (
+                Some(1),
+                "",
+                format!("rule test FAILED: jq(): {emqx}\n").as_str()
+            ),
+            "{call} on {payload}"
+        );
+    }
+}
+
+/// What the configuration is held to, and what the operator is shown, by the commands
+/// run before a rollout: the ceiling has a range; with `jq` on, a default timeout for
+/// `jq/2` above the ceiling is refused, naming both keys; `--check-config` says the
+/// ceiling in force wherever a sandboxed call can exist; and a rules file whose module
+/// asks for more time than the ceiling does not load, naming both keys, where the same
+/// file loads on a broker that allows it.
+#[cfg(feature = "jq")]
+#[test]
+#[allow(clippy::too_many_lines)] // one case per command and reason
+fn the_function_ceiling_is_checked_and_reported_before_the_broker_runs() {
+    let check_config = |env: &[(&str, &str)]| {
+        let mut cmd = mqttd();
+        cmd.arg("--check-config").env("MQTTD_DURABLE_SESSIONS", "0");
+        for (key, value) in env {
+            cmd.env(key, value);
+        }
+        run(cmd)
+    };
+    let ok = "config OK: defaults + MQTTD_* env overlay validates (no config file set)\n";
+    for (env, error) in [
+        (
+            vec![("MQTTD_RULES_FUNCTION_MAX_MS", "0")],
+            "rules.function_max_ms (MQTTD_RULES_FUNCTION_MAX_MS) must be 1..=600000 \
+             milliseconds, got 0",
+        ),
+        (
+            vec![("MQTTD_RULES_FUNCTION_MAX_MS", "600001")],
+            "rules.function_max_ms (MQTTD_RULES_FUNCTION_MAX_MS) must be 1..=600000 \
+             milliseconds, got 600001",
+        ),
+        (
+            vec![
+                ("MQTTD_RULES_JQ", "1"),
+                ("MQTTD_RULES_FUNCTION_MAX_MS", "300"),
+            ],
+            "rules.jq_default_timeout_ms (MQTTD_RULES_JQ_DEFAULT_TIMEOUT_MS) is 10000, more \
+             than rules.function_max_ms (MQTTD_RULES_FUNCTION_MAX_MS), the 300 ms any one jq \
+             or module call may take: lower the first or raise the second",
+        ),
+    ] {
+        let ran = check_config(&env);
+        assert_eq!(
+            (ran.code, ran.stdout.as_str(), ran.stderr.as_str()),
+            (
+                Some(1),
+                "",
+                format!("config INVALID: invalid configuration: {error}\n").as_str()
+            ),
+            "{env:?}"
+        );
+    }
+    // Nothing is said of the ceiling where no sandboxed call can exist: `jq` is off
+    // and there is no rules file to declare a module.
+    let ran = check_config(&[("MQTTD_RULES_FUNCTION_MAX_MS", "300")]);
+    assert_eq!((ran.code, ran.stdout.as_str()), (Some(0), ok), "{ran:?}");
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("rules.toml").display().to_string();
+    let sha = place_module(
+        dir.path(),
+        "site.wasm",
+        &mqtt_wasm_sandbox::test_module::plugin("1", b"j1"),
+    );
+    let declare = |more: &str| {
+        write_rules(
+            dir.path(),
+            &(module_table("site", "site.wasm", &sha, &["which"], more)
+                + &module_rule("r", "SELECT which() AS n FROM \"t\"", "out", "${n}")),
+        );
+    };
+    declare("timeout_ms = 301");
+    let ran = check_config(&[
+        ("MQTTD_RULES_FILE", &path),
+        ("MQTTD_RULES_FUNCTION_MAX_MS", "300"),
+    ]);
+    assert_eq!(
+        (ran.code, ran.stdout.as_str()),
+        (
+            Some(0),
+            format!(
+                "{ok}rules.function_max_ms is 300: no jq or module call runs longer, whatever \
+                 a rule or a payload asks for\n"
+            )
+            .as_str()
+        ),
+        "{ran:?}"
+    );
+    let check_rules = |ceiling: &str| {
+        let mut cmd = mqttd();
+        cmd.args(["--check-rules", &path])
+            .env("MQTTD_RULES_FUNCTION_MAX_MS", ceiling);
+        run(cmd)
+    };
+    let ran = check_rules("300");
+    assert_eq!(
+        (ran.code, ran.stdout.as_str(), ran.stderr.as_str()),
+        (
+            Some(1),
+            "",
+            format!(
+                "rules INVALID ({path}): functions `site`: timeout_ms = 301: from 1 to the \
+                 broker's ceiling on one call, 300 (`rules.function_max_ms`, \
+                 MQTTD_RULES_FUNCTION_MAX_MS)\n"
+            )
+            .as_str()
+        ),
+    );
+    let ran = check_rules("301");
+    assert_eq!(ran.code, Some(0), "{ran:?}");
+    // A table that does not ask gets the default, or the ceiling where that is lower.
+    declare("");
+    for ceiling in ["300", "40"] {
+        let ran = check_rules(ceiling);
+        assert_eq!(ran.code, Some(0), "{ceiling}: {ran:?}");
+    }
+}
+
+/// The ceiling in a running broker (`rules.function_max_ms = 400`), on the publish
+/// path, where it matters: a publisher who can choose `jq/3`'s timeout sends a day,
+/// then a timeout that never comes, and each time the rule fails at the ceiling with
+/// EMQX's `timeout`, counted as one and logged with the 400 ms it ran under, while the
+/// message is acknowledged and delivered; a quick program under the same day answers
+/// as ever; a module's call that loops is cut at the same ceiling; and the admin API
+/// shows the ceiling beside the modules' limits.
+///
+/// A broker that took the publisher's number would not acknowledge the first publish
+/// within this test's lifetime.
+#[cfg(feature = "jq")]
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // one broker, one scenario per rule
+async fn a_publisher_cannot_make_a_jq_or_module_call_outlast_the_brokers_ceiling() {
+    const CEILING: Duration = Duration::from_millis(400);
+    if let Err(why) = mqtt_rules::Jq::built_in() {
+        skip_locally_or_fail_in_ci!("{why}: {JQ_MODULE_HOW}");
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let pki_dir = tempfile::tempdir().unwrap();
+    let sha = place_module(
+        dir.path(),
+        "modules/site.wasm",
+        &mqtt_wasm_sandbox::test_module::plugin("1.0", b"j42"),
+    );
+    let rules = module_table(
+        "site",
+        "modules/site.wasm",
+        &sha,
+        &["loop_forever"],
+        "timeout_ms = 400",
+    ) + &module_rule(
+        "asked",
+        "SELECT jq(payload.program, payload.v, payload.wait) AS r FROM \"cap/asked\"",
+        "cap/out/asked",
+        "${r}",
+    ) + &module_rule(
+        "hang",
+        "SELECT loop_forever() AS n FROM \"cap/hang\"",
+        "cap/out/hang",
+        "${n}",
+    );
+    write_rules(dir.path(), &rules);
+    let pki = admin_pki(pki_dir.path());
+    let admin = band_addr();
+    let mut env = admin_env(&pki, admin);
+    env.extend([
+        ("MQTTD_RULES_JQ", "1".to_string()),
+        ("MQTTD_RULES_FUNCTION_MAX_MS", "400".to_string()),
+        ("MQTTD_RULES_JQ_DEFAULT_TIMEOUT_MS", "400".to_string()),
+    ]);
+    let setup = Setup {
+        env,
+        ..Setup::default()
+    };
+    let broker = start(dir.path(), "ceiling-node", &setup).await;
+    broker
+        .wait_log(&format!(
+            "serving the admin API (mTLS; ADR 0081) bind={admin} viewers=0 operators=1 \
+             rules_writers=1 peers=false"
+        ))
+        .await;
+    let ran = admin_cli(&pki, admin, &["rules", "--json"]);
+    assert_eq!(ran.code, Some(0), "{ran:?}");
+    let listed: serde_json::Value =
+        serde_json::from_str(&ran.stdout).unwrap_or_else(|e| panic!("{e}: {ran:?}"));
+    assert_eq!(listed["function_max_ms"], 400, "{listed}");
+    assert_eq!(
+        listed["modules"][0]["limits"]["timeout_ms"], 400,
+        "{listed}"
+    );
+
+    let mut sub = Client::connect(broker.addr, "ceiling-sub").await;
+    assert_eq!(
+        subscribe(&mut sub, 1, "cap/out/#", QoS::AtMostOnce).await,
+        [0]
+    );
+    let mut publ = Client::connect(broker.addr, "ceiling-pub").await;
+    let cut = "jq(): timeout: jq program canceled as it took too long time to execute (timeout \
+               set to 400 ms)";
+    for (n, wait) in [(1u16, "86400000"), (2, "18446744073709551615")] {
+        let payload = format!(r#"{{"program":"def f: f; f","v":1,"wait":{wait}}}"#);
+        let sent = Instant::now();
+        assert_eq!(
+            publish_acked(&mut publ, "cap/asked", payload.as_bytes(), n).await,
+            0
+        );
+        let took = sent.elapsed();
+        assert!(
+            took >= CEILING,
+            "a wait of {wait}: cut before the ceiling, after {took:?}"
+        );
+        assert_eq!(
+            broker.sample(&jq_errors("timeout")).await,
+            Some(u64::from(n)),
+            "a wait of {wait}"
+        );
+        assert_eq!(
+            broker.sample(&evaluations("asked", "failed")).await,
+            Some(u64::from(n))
+        );
+        let logged = rule_failure(&broker, "asked");
+        assert!(logged.contains(&format!("error={cut}")), "{logged}");
+    }
+    // The same day for a program that ends: its answer, as without a ceiling.
+    assert_eq!(
+        publish_acked(
+            &mut publ,
+            "cap/asked",
+            br#"{"program":".[] | select(. > 1)","v":[1,2,3],"wait":86400000}"#,
+            3
+        )
+        .await,
+        0
+    );
+    assert_eq!(
+        next(&mut sub).await,
+        got("cap/out/asked", "[2,3]", QoS::AtMostOnce, false)
+    );
+    assert_eq!(broker.sample(&jq_errors("timeout")).await, Some(2));
+
+    // A module's call, cut at the same ceiling: its table asks for all of it.
+    let sent = Instant::now();
+    assert_eq!(publish_acked(&mut publ, "cap/hang", b"1", 4).await, 0);
+    assert!(sent.elapsed() >= CEILING, "{:?}", sent.elapsed());
+    broker
+        .wait_metric(&function_errors("loop_forever", "timeout"), 1)
+        .await;
+    let logged = rule_failure(&broker, "hang");
+    assert!(
+        logged.contains(
+            "error=loop_forever(): sandbox_limit (timeout): the call ran past its 400 ms \
+             (timeout_ms of [functions.site], which is the broker's rules.function_max_ms)"
+        ),
+        "{logged}"
+    );
+    sub.expect_silence().await;
 }
 
 // ---------------------------------------------------------------------------------------

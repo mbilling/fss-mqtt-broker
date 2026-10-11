@@ -229,6 +229,10 @@ pub async fn list(state: &AdminState, caller: &Caller, role: Role) -> Answer {
             "writable": writable,
             "rules": set.rules().iter().map(|r| rule_json(&access, r, operator)).collect::<Vec<_>>(),
             "modules": set.modules().iter().map(|m| module_json(m, operator)).collect::<Vec<_>>(),
+            // The ceiling this node holds every jq and module call to (ADR 0086): what
+            // it started with, which a reload does not change.
+            "function_max_ms": access.rules.functions().max_call()
+                .map(|most| u64::try_from(most.as_millis()).unwrap_or(u64::MAX)),
             "reload": access.last_reload.get().map(|r| {
                 let mut v = json!({
                     "at": rfc3339_millis(r.at),
@@ -1346,7 +1350,7 @@ mod tests {
             .with_modules(mqtt_rules::ModuleSettings {
                 environment: vec![("SITE".to_string(), Some("a-secret-value".to_string()))],
                 instances: 1,
-                hand_off: None,
+                ..mqtt_rules::ModuleSettings::default()
             })
             .beside(&dir.path().join("rules.toml"));
         let set = RuleSet::parse_with(&text, &functions).unwrap().rules;

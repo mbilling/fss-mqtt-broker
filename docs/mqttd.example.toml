@@ -337,7 +337,7 @@ queue_overflow = "drop-oldest"       # or "reject-newest"
 # at startup (a reload reports a change as requires-restart).
 # jq = false
 # What jq(Program, Input) runs under, in ms (EMQX's jq_function_default_timeout, 10 s);
-# jq(Program, Input, TimeoutMs) names its own.
+# jq(Program, Input, TimeoutMs) names its own. At most function_max_ms, below.
 # jq_default_timeout_ms = 10000
 # The environment variables a jq program may read ($ENV.NAME, env.NAME). Empty = none:
 # unlike EMQX, which shows jq the broker's whole environment, secrets included.
@@ -347,6 +347,16 @@ queue_overflow = "drop-oldest"       # or "reject-newest"
 # these, so whoever writes rules cannot show a module the rest of the broker's
 # environment. Empty = none. Read at startup.
 # functions_env = []
+# The ceiling on how long any one call of jq() or of a module's function may run, in ms,
+# 1-600000: jq(Program, Input) under its default timeout, jq(Program, Input, TimeoutMs)
+# WHATEVER its third argument says (it may come from a payload: a larger one runs under
+# this and is cut here with a timeout error), and every [functions.<name>] function (a
+# table's timeout_ms above it fails the rules file's load). It bounds how long a call
+# holds a thread and an instance's memory, not how many calls run at once. Where rules
+# run jq or modules on payloads from publishers you do not trust, set it to what your
+# slowest program needs (a few hundred ms is generous). With jq = true,
+# jq_default_timeout_ms must not exceed it. Read at startup.
+# function_max_ms = 10000
 # The most bytes the state rules keep between messages may take on this node, across
 # every namespace (ADR 0085, docs/RULES.md "State"): EMQX's kv_store_* table and mqttd's
 # kv_* functions, in memory. Using state is the switch: a rules file that declares no

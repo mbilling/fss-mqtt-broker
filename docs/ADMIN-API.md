@@ -699,6 +699,7 @@ The rules this node runs, with what they have done.
 | `writable` | `true` only for an operator listed in `[rules] admin_writers`, when a rules file is configured and the broker may write the directory it resolves to (`access(2)`, write and search). Always `false` for a viewer or an operator who is not a writer |
 | `rules[]` | in evaluation order (by id): `id`, `enabled`, `description`, `from` (topic filters), `events`, `actions` (how many), `def`, `counts`, `last_active_at`, `last_error`, as on [`$SYS`](RULES.md#statistics-on-sys); for an operator also `sql`, `actions_spec` (the actions as the file writes them, as JSON) and `last_error.message` (the error's text, at most 256 bytes); for a viewer `redacted: true` |
 | `modules[]` | the WebAssembly modules the running rules declare (`[functions.<name>]`, [RULES.md](RULES.md#your-own-functions-functionsname)), by name: `name` (the table's), `module` and `version` (what the module calls itself), `sha256`, `functions` (each with `name`, `min_args`, `max_args`), `limits` (`timeout_ms`, `memory_bytes`), `grants` (`clock`, `env_count`), `fresh_instance`, and `instances` (`count`, of which `in_call`; `memory_bytes`, their linear memory as of each one's last call; `replaced`, instances the modules of this name have given up after a call a limit stopped, since the process started); for an operator also `wasm` (the path the table gives) and `grants.env` (the variables' names); for a viewer `redacted: true`. The module's bytes are never served. Empty when none is declared |
+| `function_max_ms` | the ceiling this node holds every call of `jq` and of a module's function to, in milliseconds ([`rules.function_max_ms`](RULES.md#long-jq-calls)): the value the node started with, which a reload does not change. No `modules[].limits.timeout_ms` is above it |
 | `warnings` | operator only: the loader's warnings for the running rules (a warning can quote SQL text, so a viewer's answer has none) |
 | `reload` | the last reload attempt: `at`, `trigger`, `applied`, `error_kind`, `repeats`, and for an operator `error` (the full text); `null` before the first |
 | `redacted` | `true` in a viewer's answer |
@@ -715,7 +716,7 @@ yours differs):
 ```json
 {"digest":"2f027340235af0b20eafed114c6c36869b05aac8568546125274382b66e892ad",
  "file_digest":"2f027340235af0b20eafed114c6c36869b05aac8568546125274382b66e892ad",
- "in_sync":true,"modules":[],"node":"node-local","reload":null,
+ "function_max_ms":10000,"in_sync":true,"modules":[],"node":"node-local","reload":null,
  "rules":[{"actions":1,
    "actions_spec":[{"args":{"payload":"${.}","topic":"alerts/${clientid}"},"function":"republish"}],
    "counts":{"actions_failed":0,"actions_ok":1,"eval_ns":41208,"eval_us_avg":20.604,"failed":0,

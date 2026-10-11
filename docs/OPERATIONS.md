@@ -1136,8 +1136,10 @@ operating summary. The engine is unreleased: no release has it yet.
   process (the log says `its WebAssembly module is compiled` with `took_ms`). Watch
   `mqttd_rule_function_errors_total{function,kind}` for calls stopped at a limit and
   `mqttd_rule_module_instances{module}` for calls running long at once: nothing caps
-  those, so keep `jq_default_timeout_ms` and each module's `timeout_ms` low and a
-  memory limit on the process ([HARDENING.md](HARDENING.md), H-7.12 to H-7.15).
+  their number, only the time each may take (`[rules] function_max_ms`, ten seconds
+  unless set, which no rule or payload can raise), so keep that ceiling,
+  `jq_default_timeout_ms` and each module's `timeout_ms` low and a memory limit on the
+  process ([HARDENING.md](HARDENING.md), H-7.12 to H-7.15).
 - **Validate before you roll:** `mqttd --check-rules <file>` loads the file as the broker
   does and lists every rule (id, enabled or disabled, `FROM`, action count) under a line
   carrying the file's SHA-256. With no file it loads the effective configuration first
