@@ -415,9 +415,9 @@ model's rule for payload-driven work):
 - **CLI** (ADR 0084 D7's style): `mqttd --admin state`, `state-keys <ns>`,
   `state-get <ns> <key>`, `state-del <ns> <key>`.
 
-*(Amended 2026-10-11: the listing gains each key's type, size, expiry and last-write
-time and its filters; a bulk purge and a change of expiry are added, with their verbs.
-T6 builds this section as written; T12 to T15 build the additions. See
+*(Amended 2026-10-11: the listing gains each key's type, size and expiry and its
+filters; a bulk purge and a change of expiry are added, with their verbs. T6 builds this
+section as written; T12 to T15 build the additions. No last-write time is kept. See
 [Amendments](#amendments).)*
 
 ### D11. Testing: sequences, not single messages
@@ -569,7 +569,8 @@ an obvious default settles. The record is written on the recommended answer; eac
 cheap to revisit before the task named builds it. **Standing** says where each is now:
 the user was asked on 2026-10-11 and confirmed two; the other three stand by default,
 one of them delivered. Rows 6 to 8 were added the same day by the amendment "admin
-features and confirmed defaults" and are open to the user in the same way.
+features and confirmed defaults"; the user withdrew what row 6 decided about (the
+amendment "no last-write time"), and rows 7 and 8 are open to the user in the same way.
 
 | # | Choice | Decided | Standing | It costs | The other answer |
 |---|---|---|---|---|---|
@@ -578,7 +579,7 @@ features and confirmed defaults" and are open to the user in the same way.
 | 3 | EMQX's `proc_dict_*` (D13) | Provided, per connection task | By default; **delivered** (T11, #933) | One task (T11), up to 64 KiB per connection that a rule makes use it, the documented differences (a Will; events without a connection; `message_dropped` for a republished message or a Will) | Keep refusing them: a rule that uses them stays unportable. No longer cheap: rules may use them now |
 | 4 | Is state on without a switch (D1) | Yes: using it is the switch, under `rules.state_max_bytes` = 256 MiB; `0` turns it off | **Confirmed by the user, 2026-10-11** | A listed rules writer (ADR 0084) can make a node hold up to that much | Off unless switched on, as `jq` is: then a ported EMQX rule that calls `kv_store_put` does not load until the operator acts |
 | 5 | The names (D3) | `kv_*`, beside EMQX's `kv_store_*` | **Confirmed by the user, 2026-10-11** (asked, no rename requested) | Two families one word apart with different tables (a warning when a file uses both); a clash if EMQX ever adds a `kv_get` | `state_*` for mqttd's. T1 has shipped them: a rename now breaks rules |
-| 6 | Where a key's last-write time lives in an `eventual` namespace (amendment, T12) | On each node, in memory, 8 bytes a key; not in the replicated form | By default | "Not written for" is this node's answer: a node refilled after a restart knows no time before its refill (it then selects fewer keys, never more), and a write elsewhere that changed neither value nor expiry is not seen (such a key can look stale while another node's rules still call it) | Replicate it: 8 more bytes a key on the wire, a second version of the replicated form, and every write that changes nothing else would have to be sent, so traffic follows writes, not changes. Revisit before T12 |
+| 6 | ~~Where a key's last-write time lives in an `eventual` namespace (amendment, T12)~~ | ~~On each node, in memory, 8 bytes a key; not in the replicated form~~ | **Withdrawn: the user dropped the last-write time, 2026-10-11** ("drop the stale key idea completely. drop the extra bytes") | Nothing: no time is stored, on a node or on the wire | None is open: there is no last-write time to place |
 | 7 | Moving an expiry sooner on a key that is not `lww`, in an `eventual` namespace (amendment, T14) | Refused, and counted in a selection as `not_shortened`; the operator purges instead | By default | No way to make such a key expire early *with its expiry event* on every node | Delete and write back under a new delete stamp: the shorter expiry then replicates, and writes made on nodes that had not heard of it are lost (a counter loses increments). Revisit before T14 |
 | 8 | Clearing an expiry outside `kv_store` (amendment, T14) | Offered: the one admin act that leaves `max_ttl` | By default (the user approved "set, extend or clear … within `max_ttl`"; the two meet only here) | A key no rule could have made: it never expires and holds its room until a rule or an operator deletes it. The listing's "no expiry" filter finds them | Refuse `clear` wherever the namespace has a `max_ttl`, i.e. everywhere but `kv_store`, where no expiry may be set at all: then `clear` does nothing anywhere and is dropped. Revisit before T14 |
 
@@ -1042,7 +1043,9 @@ rename). The other three stand as they were: `eventual` replicates to every memb
 
 **Admin features: decided.** The user asked for three things D10 does not give: to view
 the contents of the store, to expire stale entries by hand, and to change the expiry of
-stored keys. D10 stays as written and T6 builds it (the namespaces, the keys by prefix,
+stored keys. *(The same day the user dropped selecting keys by staleness and the
+last-write time it needed: see the amendment "no last-write time" below. The text here
+is edited to what is built; that amendment records what was taken out.)* D10 stays as written and T6 builds it (the namespaces, the keys by prefix,
 one key's value, one key's delete, the verbs, the metrics, `$SYS`). Four tasks add the
 rest: T12 (view), T13 (purge), T14 (change expiry), T15 (their verbs and documentation).
 What follows is decided unless it says "by default".
@@ -1052,8 +1055,10 @@ What follows is decided unless it says "by default".
 1. **A manual purge raises no `$events/state/expired`** unless the call asks for it
    (`events=true`). An operator clearing out a namespace does not want every "silent for
    10 minutes" rule to fire for keys that did not fall silent.
-2. **"Stale" means not written for a given time,** judged by a last-write time kept per
-   key (below).
+2. ~~"Stale" means not written for a given time, judged by a last-write time kept per
+   key.~~ **Withdrawn by the user the same day:** no last-write time is kept and no
+   selector asks for one. Entries are expired by hand by prefix, by "already expired"
+   and by "expires within" (T13).
 3. **EMQX's `kv_store` table can be viewed and purged, and its keys cannot be given an
    expiry.** What a rule sees of that table stays EMQX's: a key is there until a rule or
    an operator deletes it.
@@ -1066,67 +1071,18 @@ What follows is decided unless it says "by default".
 6. **Bounds:** a call changes at most 100,000 keys and answers with a cursor to go on
    from.
 
-**A last-write time per key: what exists and what T12 adds**
-
-The approved plan took the last-write time of an `eventual` key from T2's clock stamp.
-The code says less than that, so the design is changed here and stated:
-
-- **The store keeps no write time today.** An entry (`crates/mqttd/src/rule_state.rs`)
-  is its key, its data, its expiry, its accounted size and, in an `lru` namespace, its
-  place in the order of use, which is a counter and not a time.
-- **A `local` namespace and `kv_store` take no clock** (the T2 amendment): their writes
-  carry `Stamp::ZERO`.
-- **In the types that merge (`crates/mqtt-rules/src/crdt.rs`) only `lww` and `first`
-  carry a write's stamp, and only `lww`'s is the last write.** `first`'s is its one
-  write, the earliest, which the calls that refresh it (`kv_held`, `kv_set_once`) never
-  move. `max`, `min`, `sum`, `union` and `hll` carry no write stamp at all: a key's state
-  has the stamp of its latest delete, its expiry and its content. So the clock gives a
-  last-write time for `lww` keys of an `eventual` namespace and for nothing else.
-
-T12 therefore adds one field to every entry of the store, in every namespace: **the time
-of the last write, in milliseconds, 8 bytes a key.**
-
-- **What sets it:** every write call a rule makes that the store accepts, whether or not
-  it changed the value (`kv_set_once` on a key that is held, `kv_max` of a smaller
-  number, `kv_held` on a condition that is still true), and an operator's change of
-  expiry. A read (`kv_get`, `kv_ttl`, `kv_hll_count`) does not.
-- **What it costs.** Memory: 8 bytes a key on each node that holds it, which is 0.8 MB
-  for a namespace at the default 100,000 keys and 8 MB at the most a namespace may hold.
-  The store accounts an entry as 128 bytes beyond its key and data (`ENTRY_OVERHEAD`),
-  an estimate; T12 measures whether that still covers an entry and raises it if not,
-  which would lower how many of the smallest keys a `max_bytes` holds in proportion
-  (about 6% for 8 bytes). The publish path: one 8-byte store under the shard's lock the
-  call already holds, with the time the call has already read; no clock is taken, so a
-  `local` namespace still pays for none. Nothing on the wire.
-- **In an `eventual` namespace it is each node's own, and is not replicated** *(decided
-  by default, 6)*. A node sets it at its own write calls and when a merge changes what
-  it holds: to the write's own time where the state carries one (`lww`), otherwise to
-  when the change arrived. Two consequences, both stated to the operator:
-  - *A node refilled after a restart knows no write time before its refill,* except for
-    `lww` keys. Every answer that uses the last-write time carries
-    `written_known_since`, the time from which this node's times are its own
-    observations. Asked for keys not written for longer than that, a fresh node selects
-    fewer keys than an old one, never more; a purge by staleness is best asked of the
-    node that has been up longest.
-  - *A write on another node that changed neither the value nor the expiry is not sent*
-    (D15 sends changed keys), so this node does not see it: `kv_set_once` on a held
-    key, `kv_max` of a smaller number, `kv_add` of an element already there, each
-    without a TTL. (A write that names a TTL changes the expiry, and a `kv_set` takes a
-    new stamp: both are sent.) Such a key can look stale on this node while another
-    node's rules still call it. "Not written for" is exact for keys written with a TTL
-    and for `lww` keys, and means "not changed for, as far as this node saw" for the
-    rest; the documentation says so, and a dry run shows what would go.
-- The other answer, replicating the time, costs 8 more bytes a key on the wire, a second
-  version of the replicated form, and replication traffic for every write that changes
-  nothing else: traffic would follow writes where D15 has it follow changes.
+**No last-write time per key.** The plan approved here first added one to every entry (8
+bytes a key on each node, not replicated) to answer "not written for". The user
+withdrew it; the store's entry and `ENTRY_OVERHEAD` (128 bytes) stay as T1 and T2 built
+them, nothing is added to a write call, and no answer carries a write time.
 
 **T12. View the contents.** `GET /admin/v1/rules/state/keys` (D10) answers, per key,
-`type` (D4's name), `bytes` (what the key is accounted as, D9), `expires_at` (absent for
-none) and `written_at`. `values=true` adds each value as D10's read of one key shows it;
-a page then ends at 1,000 keys or 1 MiB of values, whichever comes first, and always
-holds at least one key. Three filters, which combine with each other and with `prefix`:
-`expires_within=<duration>` ("expires before"), `not_written_for=<duration>` ("not
-written since") and `no_expiry=true`; durations as the rules file writes them. The
+`type` (D4's name), `bytes` (what the key is accounted as, D9) and `expires_at` (absent
+for none). `values=true` adds each value as D10's read of one key shows it; a page then
+ends at 1,000 keys or 1 MiB of values, whichever comes first, and always holds at least
+one key. Two filters, which combine with each other and with `prefix`:
+`expires_within=<duration>` ("expires before") and `no_expiry=true`; durations as the
+rules file writes them. Everything shown and selected is in the entry already. The
 reserved `kv_store` namespace is listed like any other (its keys are any value: they are
 shown as D10 shows them, and it is where `no_expiry` finds every key). Tombstones are
 not listed; they are in the namespace's counts. A filter costs a walk of the namespace
@@ -1135,9 +1091,12 @@ keys today, on a blocking task, never on a connection's. Operator role; values a
 to operators only, as before.
 
 **T13. Expire entries manually.** `POST /admin/v1/rules/state/purge?ns=…` removes the
-keys of one namespace that a selection names: `prefix`, `not_written_for`, `expired=true`
-(keys past their expiry that the sweep has not removed yet), combined when more than one
-is given. A call that names none is refused.
+keys of one namespace that a selection names: the listing's `prefix`,
+`expires_within` and `no_expiry`, and `expired=true` (keys past their expiry that the
+sweep has not removed yet), combined when more than one is given. A call that names none
+is refused. There is no selector for keys nothing has written for a time; a key written
+with a TTL that nothing refreshes expires by itself, and `expires_within` reaches it
+sooner.
 
 - **`dry_run=true`** changes nothing and answers the count (up to the cap) and a sample
   of 20 keys as the listing shows them, without values.
@@ -1215,17 +1174,63 @@ T2 amendment: with its write for `lww`, as the later of the two for every other 
   default.
 
 **T15. CLI and documentation.** In ADR 0084 D7's style, beside D10's verbs:
-`state-keys <ns>` gains `--values`, `--expires-within`, `--not-written-for` and
-`--no-expiry`; `mqttd --admin state-purge <ns>` and `mqttd --admin state-expire <ns>
+`state-keys <ns>` gains `--values`, `--expires-within` and `--no-expiry`; `mqttd --admin state-purge <ns>` and `mqttd --admin state-expire <ns>
 [<key>]` (named as Redis names `EXPIRE`: it sets when a key expires, it does not expire
 it now) take the selection and `--dry-run`, and for a selection past the cap go on from
 the cursor only with `--all`. Control characters are printed escaped, as everywhere.
 ADMIN-API.md documents the endpoints; RULES.md gains a section on operating the store
-(what stale means and per node, what a purge does and does not raise, the table above);
+(what each selector means, what a purge does and does not raise, the table above);
 THREAT-MODEL.md's row for a rules writer's reach gains the purge. **T8 is not changed
 and does not wait for these:** it closes phase 1's documentation, and T15 carries the
 documentation of T12 to T14, so the feature's tracker (#880) closes with T8 as planned.
 
 **Order.** T12 follows T6 (the listing, its cursor, the roles). T13 and T14 follow T12
-(the selection and the last-write time); their halves for `eventual` namespaces follow
+(the selection); their halves for `eventual` namespaces follow
 T3, and the purge's `events=true` follows T4. T15 follows T13 and T14.
+
+### 2026-10-11 — no last-write time: selecting stale keys is dropped
+
+The amendment above planned a last-write time per key, so that the listing, the purge and
+the change of expiry could select keys "not written for" a given time. The user, the same
+day, before any of T12 to T15 was built:
+
+> ok, drop the stale key idea completely. drop the extra bytes
+
+So it is withdrawn, and the amendment above and the plan are edited to match. Nothing had
+been built on it.
+
+**Taken out**
+
+- **The last-write time itself.** No field is added to an entry, in any namespace: no 8
+  bytes a key, no store on a write call, nothing set when a merge changes a key, and an
+  operator's change of expiry counts as nothing beyond the change. `ENTRY_OVERHEAD` stays
+  128 bytes and T12 no longer measures it.
+- **`written_at`** in the listing, and **`written_known_since`** in every answer.
+- **The selector** `not_written_for` ("not written since") in the listing (T12), the
+  purge (T13) and the change of expiry (T14), and `--not-written-for` in the CLI (T15).
+- **Decision 6** of the [table](#decided-by-default-2026-10-11) (the time is each node's
+  own and is not replicated). Its two consequences go with it: that a node refilled after
+  a restart knows no write time before its refill, and that a write on another node which
+  changed neither value nor expiry is not seen.
+- **Point 2** of the six the user settled ("stale" means not written for a given time).
+
+**What stays**
+
+- **T12:** per key `type`, `bytes` and `expires_at`, values with `values=true`; the
+  filters `prefix`, `expires_within` and `no_expiry`; `kv_store` listed like any other.
+  All of it is in the entry today, so T12 changes nothing on the publish path.
+- **T13:** a purge by `prefix`, `expires_within`, `no_expiry` and `expired=true`,
+  combined when more than one is given; the dry run, the cap and cursor, the audit
+  record, the roles, `events=true`, what a purge is in each mode.
+- **T14:** unchanged but for its selection, which is T13's. Decisions 7 and 8 stand by
+  default as they were.
+- **T15:** the verbs without `--not-written-for`; RULES.md says what each selector means.
+
+**"Expire stale entries by hand", as it is now served.** The user's request stands; what
+goes is one way of naming the entries. An operator removes the keys of devices that are
+gone, or of a rule's earlier key scheme, by `prefix`; drops keys that have expired and
+not been swept yet by `expired=true`; and removes keys about to expire by
+`expires_within`. A key a rule writes with a TTL and then stops writing expires by
+itself, which is the store's own answer to staleness. What cannot be asked any more is
+"the keys nothing has written for a month" among keys that never expire (`kv_store`, or
+a key whose expiry was cleared): those are found by `no_expiry` and chosen by prefix.
