@@ -46,6 +46,12 @@ impl Store {
             if namespace.keys.load(Relaxed) == 0 {
                 continue;
             }
+            if let Some(replica) = &namespace.replica {
+                // An `eventual` namespace keeps its keys apart; a deleted key it
+                // still remembers is not listed, as it reads as absent.
+                replica.held(&namespace, &mut held);
+                continue;
+            }
             for shard in &*namespace.shards {
                 let shard = lock(shard);
                 held.extend(

@@ -17,8 +17,10 @@ tasks:
     evidence: "PR 935: crates/mqtt-rules/src/crdt.rs (the types, a merge that is commutative, associative and idempotent over every state the decoder accepts, the hybrid logical clock with a 60 s skew bound, the canonical bounded encoded form, kv_hll_add and kv_hll_count on a 2^14-register sketch hashed with SipHash-2-4 under a fixed key) and the store keeping its keys in crdt::Data; mqtt-rules tests_crdt (40); the state_merge fuzz target in the nightly tier (about 1.2 million inputs locally, no finding); T1 store tests and the 141 EMQX probes pass unmodified; the ADR amended for the delete rule of non-lww types, first-write expiry, the skew bound and the counter bound."
   - id: 0085-T3
     title: "eventual mode: every member holds the namespace; changed keys sent per peer link at peer protocol 14, applied off the hub, repaired by anti-entropy after partitions and restarts"
-    status: planned
+    status: done
     issue: 919
+    date: 2026-10-11
+    evidence: "PR 950: crates/mqttd/src/rule_state/replica.rs and link.rs (changed keys read per link with no per-link queue, repair by a 1,024-part digest, refusals counted by reason), peer protocol 14 with StateKeys, StateDigest and StateWant pinned in crates/mqtt-cluster/src/peer.rs; tests_replica and crates/mqttd/tests/rules_state_cluster.rs (convergence, restart refill, declaration mismatch, bounds, a v13 peer sent nothing); the rule_state benchmark (publish with one kv_incr 1.80 us local, 1.84 us eventual; 100k keys caught up in 0.14 s on loopback, Apple M1 Pro); the ADR amended for what T3 decided."
   - id: 0085-T4
     title: "Expiry and $events/state/expired: selected by its own name only, raised by one member, rate-bounded and late rather than lost, at least once around membership changes"
     status: planned
@@ -126,7 +128,7 @@ and T15 carries the documentation of these three.
 |------|--------|-------|------|------------------|
 | 0085-T1 | ✅ done | [#917](https://github.com/mbilling/fss-mqtt-broker/issues/917) | 2026-10-11 | "PR 929: crates/mqtt-rules/src/state.rs (StateStore and StateNamespace handed over in Functions, [state.<name>] and the rule key state, one table of function names) and crates/mqttd/src/rule_state.rs (local namespaces, typed keys, TTLs, bounds, LRU, the rules.state_max_bytes ceiling, brownout); 141 probes of EMQX 6.3.1 (emqx_rule_funcs and emqx_rule_sqltester) pinned in rule_state::tests, none contradicting the ADR; mqtt-rules tests_state (21), mqttd rule_state::tests (33), tests/rules_state.rs (6), additions to rules_binary.rs, admin_rules.rs and the converter test; dry runs on a scratch store; the rule_state benchmark (0.11-0.14 us per call on one thread, Apple M1 Pro)." |
 | 0085-T2 | ✅ done | [#918](https://github.com/mbilling/fss-mqtt-broker/issues/918) | 2026-10-11 | "PR 935: crates/mqtt-rules/src/crdt.rs (the types, a merge that is commutative, associative and idempotent over every state the decoder accepts, the hybrid logical clock with a 60 s skew bound, the canonical bounded encoded form, kv_hll_add and kv_hll_count on a 2^14-register sketch hashed with SipHash-2-4 under a fixed key) and the store keeping its keys in crdt::Data; mqtt-rules tests_crdt (40); the state_merge fuzz target in the nightly tier (about 1.2 million inputs locally, no finding); T1 store tests and the 141 EMQX probes pass unmodified; the ADR amended for the delete rule of non-lww types, first-write expiry, the skew bound and the counter bound." |
-| 0085-T3 | ⬜ planned | [#919](https://github.com/mbilling/fss-mqtt-broker/issues/919) | — |  |
+| 0085-T3 | ✅ done | [#919](https://github.com/mbilling/fss-mqtt-broker/issues/919) | 2026-10-11 | "PR 950: crates/mqttd/src/rule_state/replica.rs and link.rs (changed keys read per link with no per-link queue, repair by a 1,024-part digest, refusals counted by reason), peer protocol 14 with StateKeys, StateDigest and StateWant pinned in crates/mqtt-cluster/src/peer.rs; tests_replica and crates/mqttd/tests/rules_state_cluster.rs (convergence, restart refill, declaration mismatch, bounds, a v13 peer sent nothing); the rule_state benchmark (publish with one kv_incr 1.80 us local, 1.84 us eventual; 100k keys caught up in 0.14 s on loopback, Apple M1 Pro); the ADR amended for what T3 decided." |
 | 0085-T4 | ⬜ planned | [#920](https://github.com/mbilling/fss-mqtt-broker/issues/920) | — |  |
 | 0085-T5 | ⬜ planned | [#921](https://github.com/mbilling/fss-mqtt-broker/issues/921) | — |  |
 | 0085-T6 | ⬜ planned | [#922](https://github.com/mbilling/fss-mqtt-broker/issues/922) | — |  |
@@ -368,3 +370,65 @@ and T15 carries the documentation of these three.
     `foreach_10` 8.462 to 8.467 µs: −0.3% to +0.6%, inside the spread between runs.
   - **Left for T8, as planned:** the cookbook's stateful recipes as sequences, and the
     "Differences from EMQX" rows.
+- 2026-10-11 — **T3 built** (#919, in review): `eventual` namespaces, held by every
+  member. What it is:
+  - **The copy** (`crates/mqttd/src/rule_state/replica.rs`): a key of an `eventual`
+    namespace is kept as T2's state that merges, with its tombstone, and a rule's call is
+    one stamped write to it under one shard's lock. A `local` namespace is as T1 and T2
+    left it; its path gained one branch.
+  - **Sending** (`rule_state/link.rs`, and the peer link's own task in `peer.rs`): a
+    shard numbers its keys' changes and a link reads on from where it stopped, 64 KiB a
+    frame. Nothing is queued per link, so what waits is at most the keys there are and a
+    slow or absent peer costs no memory; a key written a thousand times meanwhile is
+    sent once. A write that leaves its key as it was is not sent.
+  - **Repair:** a digest of 1,024 parts by a fixed hash of the key; roots compared when
+    a link comes up and every 30 seconds, then the parts, then the keys of the parts
+    that differ; one repair of a namespace at a time on a node, so that a node that
+    joins is filled once and not once per member.
+  - **The wire:** `StateKeys`, `StateDigest` and `StateWant` appended at peer protocol
+    14 (`PROTO_MIN` stays 6), each naming its namespace and a fingerprint of its
+    declaration (the mode, the state's form, the tombstone window). A link that
+    negotiated 13 carries none. Applied by the link's reader; never a hub command.
+  - **Refused and counted:** a frame for a namespace declared otherwise, or not at all;
+    a state stamped more than 60 seconds ahead; a key new to a node, or one that would
+    grow, with no room under `max_keys`, `max_bytes`, the store's ceiling or in a
+    brownout (what the node held is kept, and repair offers it again); anything
+    malformed.
+  - **Declared with** `consistency = "eventual"` and, new, `tombstone_window` (an hour
+    unless set). `eviction = "lru"` with it is a load error; a namespace cannot change
+    its mode while rules hold it; `strong` is still refused.
+  - **Metrics:** `mqttd_rule_state_replication_pending`, `…_lag_seconds` and
+    `…_refused_total{reason}`, per namespace.
+  - **What building it found**, each in the ADR's amendment of this date: a restarted
+    node would lose what it counts before it is refilled, so a node counts under a name
+    of its own per run (a sixth choice decided by default: it costs a counter a row per
+    restart, up to T2's 256); a delete of a key the node holds nothing of does nothing;
+    a merge that would grow a key is bounded as a new key is; clock skew can only be
+    judged on a state that carries a stamp.
+  - **Proved by:** `rule_state::tests_replica` (20: the links driven by hand over
+    several stores, so partitions, a slow link, loss, repetition, reordering, restart,
+    join and leave are what the test says they are; the bounds after each of 3,000
+    random and damaged frames; an `eventual` namespace against a `local` one,
+    statement by statement); two tests of the link's task in `peer.rs` (10,000 keys
+    cross and the hub is sent nothing for them; a peer announcing 13 is sent no state
+    in ten minutes of link time); `tests/rules_state_cluster.rs` (3: real nodes and
+    links, rules on every node counting one counter and filling one set, a partition
+    healed, a restarted node refilled); the frames' bytes pinned in `mqtt-cluster`,
+    with seeds for the `peer_decode` fuzz target.
+  - **Measured** (`cargo bench -p mqttd --bench rule_state`, Apple M1 Pro, best of
+    three rounds; the ADR's amendment has every figure): a publish with one `kv_incr`
+    is 1.80 µs in a `local` namespace and 1.84 µs in an `eventual` one; in the store a
+    `kv_set` is 0.15 µs `local`, 0.16 µs `eventual` with no link reading and 0.30 µs
+    with one; eight threads on keys of their own 0.92 µs a call beside 0.34 µs, and
+    1.65 µs when every write is stamped, where the one clock word shows; a counter is 65
+    bytes on the wire and a 44-byte value 105; a node that comes up empty beside
+    100,000 keys holds them 0.14 s later (one process, loopback TCP, the broker's own
+    link tasks); a write is read on the other node 0.4 to 0.8 ms later. Not compared
+    against `main`'s binary run in turn: no room for a second build.
+  - **Not run here:** the two-binary rolling upgrade (`cluster_upgrade.rs`, nightly):
+    the machine had no room for a second build. It declares no `eventual` namespace,
+    and its links to the previous release negotiate below 14, where there is no state
+    lane at all.
+  - **Left for later tasks:** the expiry sweep and which member raises the event (T4);
+    the admin listing and lookup of an `eventual` namespace's keys, which are kept apart
+    from a `local` one's (T6); the documentation beyond what keeps RULES.md true (T8).

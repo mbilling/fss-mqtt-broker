@@ -5319,17 +5319,27 @@ fn check_rules_loads_rule_state_and_refuses_it_where_it_is_switched_off() {
              RULES.md) (line 1, column 8, near `kv_store_put(clientid, p`)\n"
         )
     );
-    // What this release does with a mode it does not have yet.
-    assert_check_rules_refuses(
-        "[state.shared]\nconsistency = \"eventual\"\n",
-        "rules file: [state.shared]: consistency = \"eventual\" is not available yet: this \
-         release has \"local\" namespaces only (ADR 0085)",
-    );
+    // What this release does with the mode it does not have yet, and with an
+    // `eventual` namespace that asks for what only a `local` one can do.
     assert_check_rules_refuses(
         "[state.shared]\nconsistency = \"strong\"\n",
         "rules file: [state.shared]: consistency = \"strong\" is not available: it is a later \
-         phase (ADR 0085 D5); use \"local\"",
+         phase (ADR 0085 D5); use \"local\" or \"eventual\"",
     );
+    assert_check_rules_refuses(
+        "[state.shared]\nconsistency = \"eventual\"\neviction = \"lru\"\n",
+        "rules file: [state.shared]: eviction = \"lru\" is for a \"local\" namespace: a key \
+         evicted on one node of an \"eventual\" one would come back from the others",
+    );
+    // An `eventual` namespace loads, and a statement is tried on it as on any other.
+    write_rules(
+        dir.path(),
+        "[state.shared]\nconsistency = \"eventual\"\ntombstone_window = \"10m\"\n\
+         [rules.count]\nstate = \"shared\"\n\
+         sql = 'SELECT kv_incr(clientid) AS n FROM \"t/#\"'\n",
+    );
+    let ran = cli(&["--check-rules", &path]);
+    assert_eq!(ran.code, Some(0), "{ran:?}");
 }
 
 /// `mqttd --rule-test` runs every state function, on a store of its own: within one

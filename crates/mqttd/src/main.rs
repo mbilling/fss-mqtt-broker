@@ -848,6 +848,11 @@ async fn main() -> Result<(), StartupError> {
 
     // Cluster peer mesh (opt-in).
     let peer_bind = config.cluster.peer_bind.clone();
+    // The store whose `eventual` namespaces every peer link carries (ADR 0085 D15).
+    let rule_state = policy
+        .rules
+        .as_ref()
+        .and_then(|rules| rules.state().cloned());
     if let Some(bind) = &peer_bind {
         if peer_tls.is_none() {
             warn!(%bind, "INSECURE: starting PLAINTEXT peer listener (no mTLS) — testing use only");
@@ -862,16 +867,19 @@ async fn main() -> Result<(), StartupError> {
             Some(policy.clone()),
             durable_plane.clone(),
             Some(ingress.clone()),
+            rule_state.clone(),
         ));
     }
     for addr in &config.cluster.peers {
         info!(%addr, "dialing cluster peer (static)");
-        tokio::spawn(peer::dial_forever(
+        tokio::spawn(peer::dial_forever_with_ingress(
             addr.clone(),
             node_id.clone(),
             hub_tx.clone(),
             peer_tls.clone(),
             durable_plane.clone(),
+            None,
+            rule_state.clone(),
         ));
     }
 
@@ -895,6 +903,7 @@ async fn main() -> Result<(), StartupError> {
         swim_isolated.clone(),
         &mut reloader,
         ingress.clone(),
+        rule_state,
     )
     .await?;
 
@@ -3575,6 +3584,8 @@ async fn start_swim(
     reloader: &mut reload::Reloader,
     // Charged by inbound peer `QoS` 0 publishes on every dialed link (ADR 0082 T4).
     ingress: Arc<mqttd::ingress::IngressCredit>,
+    // The store whose `eventual` namespaces every dialed link carries (ADR 0085).
+    rule_state: Option<Arc<mqttd::rule_state::Store>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let Some(bind) = config.cluster.swim.bind.clone() else {
         return Ok(());
@@ -3741,6 +3752,7 @@ async fn start_swim(
         Some(metrics),
         plane,
         Some(ingress),
+        rule_state,
     ));
     Ok(())
 }
@@ -4294,6 +4306,11 @@ fn rules_at_startup(
         .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (functions, rule_state) = mqttd::rules::functions_and_state_from_config(&snap.rules);
+    // Before the rules load: a write to an `eventual` namespace is stamped with this
+    // node's clock and counted under its id (ADR 0085 D6).
+    if let Some(store) = &rule_state {
+        store.set_node(&snap.node.id);
+    }
     match &functions.jq {
         mqtt_rules::JqSwitch::Off => {}
         mqtt_rules::JqSwitch::Unavailable(why) => {

@@ -19,10 +19,16 @@
 //! old peers ignore it" is not available: it is a flap loop. Additive frames therefore
 //! ship under a raised `PROTO_MAX` and are sent only when the link negotiated it
 //! (0041-T12, issue #238).
+//!
+//! Rule state (ADR 0085 D15): on a link that negotiated proto 14, the link's own task
+//! also sends what changed in this node's `eventual` namespaces and applies what the
+//! peer sends of its own, through a [`StateLink`]. Those frames are read and applied
+//! here: they are never a hub command and wait in none of the hub's lanes.
 
 use crate::conn::ConnPolicy;
 use crate::hub::{HubCommand, PeerOutbound};
 use crate::ingress::{IngressCredit, IngressPermit};
+use crate::rule_state::{StateLink, Store as RuleState};
 use bytes::BytesMut;
 use mqtt_cluster::durable_plane::DurablePlane;
 use mqtt_cluster::peer::{self, PeerMessage};
@@ -254,11 +260,14 @@ pub async fn serve_listener(
     client_policy: Option<Arc<ConnPolicy>>,
     plane: Option<DurablePlane>,
 ) {
-    serve_listener_with_ingress(listener, local, hub, tls, client_policy, plane, None).await;
+    serve_listener_with_ingress(listener, local, hub, tls, client_policy, plane, None, None).await;
 }
 
 /// [`serve_listener`], with the node's ingress credit charged for inbound peer `QoS` 0
-/// publishes (ADR 0082 T4). `None` charges nothing.
+/// publishes (ADR 0082 T4; `None` charges nothing), and with the store whose
+/// `eventual` namespaces the links carry (ADR 0085; `None`: the links carry no rule
+/// state).
+#[allow(clippy::too_many_arguments)]
 pub async fn serve_listener_with_ingress(
     listener: TcpListener,
     local: NodeId,
@@ -267,6 +276,7 @@ pub async fn serve_listener_with_ingress(
     client_policy: Option<Arc<ConnPolicy>>,
     plane: Option<DurablePlane>,
     ingress: Option<Arc<IngressCredit>>,
+    state: Option<Arc<RuleState>>,
 ) {
     loop {
         match listener.accept().await {
@@ -277,6 +287,7 @@ pub async fn serve_listener_with_ingress(
                 let policy = client_policy.clone();
                 let plane = plane.clone();
                 let ingress = ingress.clone();
+                let state = state.clone();
                 tokio::spawn(async move {
                     let _ = stream.set_nodelay(true);
                     // Read the CURRENT acceptor per accept (ADR 0040 T4): a reload's
@@ -301,6 +312,7 @@ pub async fn serve_listener_with_ingress(
                                     policy,
                                     plane,
                                     ingress,
+                                    state,
                                 )
                                 .await
                             }
@@ -312,6 +324,7 @@ pub async fn serve_listener_with_ingress(
                         _ => {
                             handle(
                                 stream, local, hub, false, None, None, policy, plane, ingress,
+                                state,
                             )
                             .await
                         }
@@ -344,11 +357,12 @@ pub async fn dial_forever(
     tls: Option<PeerTls>,
     plane: Option<DurablePlane>,
 ) {
-    dial_forever_with_ingress(addr, local, hub, tls, plane, None).await;
+    dial_forever_with_ingress(addr, local, hub, tls, plane, None, None).await;
 }
 
 /// [`dial_forever`], with the node's ingress credit charged for inbound peer `QoS` 0
-/// publishes (ADR 0082 T4). `None` charges nothing.
+/// publishes (ADR 0082 T4; `None` charges nothing), and with the store whose
+/// `eventual` namespaces the link carries (ADR 0085; `None`: it carries no rule state).
 pub async fn dial_forever_with_ingress(
     addr: String,
     local: NodeId,
@@ -356,6 +370,7 @@ pub async fn dial_forever_with_ingress(
     tls: Option<PeerTls>,
     plane: Option<DurablePlane>,
     ingress: Option<Arc<IngressCredit>>,
+    state: Option<Arc<RuleState>>,
 ) {
     // An undialable name is permanent; retrying would only spin.
     let server_name = match tls.as_ref().map(|_| tls::server_name(&addr)).transpose() {
@@ -394,6 +409,7 @@ pub async fn dial_forever_with_ingress(
                                     None,
                                     plane.clone(),
                                     ingress.clone(),
+                                    state.clone(),
                                 )
                                 .await
                             }
@@ -415,6 +431,7 @@ pub async fn dial_forever_with_ingress(
                             None,
                             plane.clone(),
                             ingress.clone(),
+                            state.clone(),
                         )
                         .await
                     }
@@ -493,6 +510,7 @@ async fn handle<S>(
     client_policy: Option<Arc<ConnPolicy>>,
     plane: Option<DurablePlane>,
     ingress: Option<Arc<IngressCredit>>,
+    rule_state: Option<Arc<RuleState>>,
 ) -> Result<LinkOutcome, std::io::Error>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -644,6 +662,11 @@ where
         return Ok(LinkOutcome::Closed);
     }
 
+    // Rule state travels only on a link that negotiated it (ADR 0085 D15): a peer on
+    // proto 13 holds none, and would drop the link on a frame it does not know.
+    let mut rule_state = rule_state
+        .filter(|_| proto >= peer::PROTO_RULE_STATE)
+        .map(|store| StateLink::new(store, &local.0, &remote.0));
     let stats = Arc::new(LinkStats::default());
     links()
         .lock()
@@ -673,6 +696,7 @@ where
             &stats,
             plane.as_ref(),
             ingress.as_deref(),
+            rule_state.as_mut(),
         );
         // On-CPU time of the link task: every poll, timed, and none of its waiting.
         let mut link = std::pin::pin!(link);
@@ -717,6 +741,7 @@ async fn pump<R, W>(
     stats: &LinkStats,
     plane: Option<&DurablePlane>,
     ingress: Option<&IngressCredit>,
+    mut rule_state: Option<&mut StateLink>,
 ) -> Result<(), std::io::Error>
 where
     R: AsyncRead + Unpin,
@@ -744,7 +769,8 @@ where
         // before bulk data. Starving bulk is not a concern — control traffic is
         // a few frames per heartbeat interval, not a stream. Inbound reads sit
         // between the lanes so a flood in either direction cannot starve the
-        // other side's acks.
+        // other side's acks. Rule state comes last: it is sent when nothing else is
+        // waiting, and gets one frame after each bulk batch when something always is.
         tokio::select! {
             biased;
             maybe_ctl = ctl_rx.recv() => {
@@ -765,6 +791,20 @@ where
             inbound = read_frame(rh, buf) => {
                 match inbound? {
                     None => return Ok(()), // peer closed
+                    // Rule state is applied here, by the link's reader, to the store
+                    // (ADR 0085 D15): a map operation per key, and no hub command, so
+                    // it waits in no lane and can neither delay one nor be shed with
+                    // one (ADR 0082). Without a store there is nothing to apply it to.
+                    Some(
+                        msg @ (PeerMessage::StateKeys { .. }
+                        | PeerMessage::StateDigest { .. }
+                        | PeerMessage::StateWant { .. }),
+                    ) => {
+                        stats.frames_in.fetch_add(1, Ordering::Relaxed);
+                        if let Some(link) = rule_state.as_mut() {
+                            link.receive(msg);
+                        }
+                    }
                     Some(msg) => {
                         stats.frames_in.fetch_add(1, Ordering::Relaxed);
                         forward_inbound(msg, hub, remote, plane, ingress, reply_ctl, reply_bulk);
@@ -781,12 +821,56 @@ where
                     Some(msg) => {
                         let n = write_batch(wh, out_buf, &mut out_stamps, &msg, out_rx, remote, stats).await?;
                         stats.frames_out.fetch_add(n, Ordering::Relaxed);
+                        // A lane that never empties must not keep state waiting for
+                        // good: one frame of it for each batch.
+                        if let Some(frame) = rule_state.as_mut().and_then(|link| link.try_next()) {
+                            write_state(wh, out_buf, &frame, remote, stats).await?;
+                        }
                     }
                     None => return Ok(()), // taken over or hub gone
                 }
             }
+            frame = next_state(rule_state.as_deref_mut()) => {
+                write_state(wh, out_buf, &frame, remote, stats).await?;
+            }
         }
     }
+}
+
+/// The link's next rule-state frame, when it has one; never, on a link that carries
+/// none.
+async fn next_state(link: Option<&mut StateLink>) -> PeerMessage {
+    match link {
+        Some(link) => link.next().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Write one rule-state frame. While it waits on a full socket the link's task waits
+/// with it, which is the backpressure: nothing is queued behind it (ADR 0085 D15).
+async fn write_state<W: AsyncWrite + Unpin>(
+    wh: &mut W,
+    buf: &mut Vec<u8>,
+    frame: &PeerMessage,
+    remote: &NodeId,
+    stats: &LinkStats,
+) -> Result<(), std::io::Error> {
+    buf.clear();
+    if let Err(e) = peer::encode(frame, buf) {
+        // Not fatal, as for any frame: the keys are offered again by the next repair.
+        warn!(error = %e, peer = %remote.0, "dropping an unencodable rule-state frame");
+        return Ok(());
+    }
+    let started = std::time::Instant::now();
+    wh.write_all(buf).await?;
+    wh.flush().await?;
+    let waited = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    stats.write_wait_ns.fetch_add(waited, Ordering::Relaxed);
+    stats.frames_out.fetch_add(1, Ordering::Relaxed);
+    if buf.capacity() > PEER_WRITE_BUDGET * 2 {
+        buf.shrink_to(PEER_WRITE_BUDGET);
+    }
+    Ok(())
 }
 
 /// The credit an inbound peer publish takes before it is queued for the hub (ADR 0082
@@ -925,8 +1009,12 @@ fn forward_inbound(
                 wanted,
             });
         }
-        // Unwrapped above: `into_plain` never returns one.
-        PeerMessage::OriginPublish(_) => {}
+        // Unwrapped above: `into_plain` never returns one. Rule state (ADR 0085) never
+        // gets here: the link's reader applies it to the store.
+        PeerMessage::OriginPublish(_)
+        | PeerMessage::StateKeys { .. }
+        | PeerMessage::StateDigest { .. }
+        | PeerMessage::StateWant { .. } => {}
         PeerMessage::Publish {
             topic,
             payload,
@@ -1452,6 +1540,7 @@ mod tests {
                 &LinkStats::default(),
                 None,
                 None,
+                None,
             )
             .await
         });
@@ -1517,6 +1606,7 @@ mod tests {
                     &reply_bulk,
                     &std::sync::atomic::AtomicUsize::new(0),
                     &pump_stats,
+                    None,
                     None,
                     None,
                 )
@@ -1646,5 +1736,199 @@ mod tests {
             rx.try_recv(),
             Ok(HubCommand::RemotePublish { credit: None, .. })
         ));
+    }
+
+    /// A store with one `eventual` namespace, and that namespace as rules call it.
+    fn rule_state(node: &str) -> (Arc<RuleState>, Arc<dyn mqtt_rules::state::StateNamespace>) {
+        use mqtt_rules::state::{Consistency, NamespaceSettings, StateStore};
+        let store = RuleState::new(64 << 20);
+        store.set_node(node);
+        let settings = NamespaceSettings {
+            consistency: Consistency::Eventual,
+            ..NamespaceSettings::defaults(64 << 20)
+        };
+        let namespace = store.open("shared", &settings).unwrap();
+        (store, namespace)
+    }
+
+    fn set(namespace: &dyn mqtt_rules::state::StateNamespace, key: &str) {
+        let value = mqtt_rules::Value::from("v");
+        namespace
+            .call(&mqtt_rules::state::StateOp::Set {
+                key: key.as_bytes(),
+                value: crate::rule_state::stored(&value),
+                ttl: None,
+            })
+            .unwrap();
+    }
+
+    /// ADR 0085 D15, ADR 0082: rule state is applied by the link's reader and is no
+    /// hub command. Two link tasks over one stream carry 5,000 keys each way; both
+    /// stores end up with all of them, neither hub was sent anything for it, and a
+    /// frame that is the hub's, sent in the middle of it, still reaches the hub.
+    #[tokio::test]
+    async fn rule_state_is_applied_by_the_link_and_enters_no_hub_lane() {
+        const KEYS: usize = 5_000;
+        let (a, a_ns) = rule_state("a");
+        let (b, b_ns) = rule_state("b");
+        let (stream_a, stream_b) = tokio::io::duplex(64 * 1024);
+        let mut hubs = Vec::new();
+        let mut lanes = Vec::new();
+        let mut tasks = Vec::new();
+        for (stream, store, local, remote) in [
+            (stream_a, a.clone(), "a", "b"),
+            (stream_b, b.clone(), "b", "a"),
+        ] {
+            let (hub_tx, hub_rx) = mpsc::unbounded_channel();
+            let (ctl_tx, mut ctl_rx) = mpsc::unbounded_channel();
+            let (out_tx, mut out_rx) = mpsc::unbounded_channel::<PeerMessage>();
+            let (reply_ctl, reply_bulk) = (ctl_tx.downgrade(), out_tx.downgrade());
+            let remote = NodeId(remote.into());
+            let mut link = StateLink::new(store, local, &remote.0);
+            tasks.push(tokio::spawn(async move {
+                let (mut rh, mut wh) = tokio::io::split(stream);
+                let mut buf = BytesMut::new();
+                pump(
+                    &mut rh,
+                    &mut wh,
+                    &mut buf,
+                    &hub_tx,
+                    &remote,
+                    &mut ctl_rx,
+                    &mut out_rx,
+                    &reply_ctl,
+                    &reply_bulk,
+                    &std::sync::atomic::AtomicUsize::new(0),
+                    &LinkStats::default(),
+                    None,
+                    None,
+                    Some(&mut link),
+                )
+                .await
+            }));
+            hubs.push(hub_rx);
+            lanes.push((ctl_tx, out_tx));
+        }
+        for i in 0..KEYS {
+            set(&*a_ns, &format!("a:{i}"));
+            set(&*b_ns, &format!("b:{i}"));
+            if i == KEYS / 2 {
+                // The hub's own traffic, in the middle of the flood.
+                lanes[0]
+                    .1
+                    .send(PeerMessage::Interest {
+                        filters: vec!["sensors/#".into()],
+                    })
+                    .unwrap();
+            }
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let keys = |store: &RuleState| store.stats("shared").unwrap().keys;
+        while keys(&a) != 2 * KEYS || keys(&b) != 2 * KEYS {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "a holds {} keys and b {}, of {}",
+                keys(&a),
+                keys(&b),
+                2 * KEYS
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        // B's hub got the one frame that was its own, and nothing else; A's nothing.
+        let mut for_b = Vec::new();
+        while let Ok(command) = hubs[1].try_recv() {
+            for_b.push(command);
+        }
+        assert!(
+            matches!(&for_b[..], [HubCommand::RemoteInterest { filters, .. }] if filters == &vec!["sensors/#".to_string()]),
+            "{for_b:?}"
+        );
+        assert!(hubs[0].try_recv().is_err(), "nothing for A's hub");
+        assert_eq!(b.replication("shared").unwrap().refused, [0; 6]);
+        // Dropping the lanes ends the links.
+        drop(lanes);
+        for task in tasks {
+            task.await.unwrap().unwrap();
+        }
+    }
+
+    /// ADR 0085 D15: rule state travels only on a link that negotiated proto 14. A
+    /// peer that announces 13 is sent none of it, however long the link stays up and
+    /// whatever is written; one that announces 14 is sent the namespace's digest at
+    /// once and what is written after.
+    #[tokio::test(start_paused = true)]
+    async fn a_link_that_negotiated_13_carries_no_rule_state() {
+        for (announced, carries) in [(peer::PROTO_MESSAGE_ORIGIN, false), (peer::PROTO_MAX, true)] {
+            let (store, namespace) = rule_state("a");
+            set(&*namespace, "before");
+            let (mut ours, theirs) = tokio::io::duplex(1 << 20);
+            let (hub_tx, mut hub_rx) = mpsc::unbounded_channel();
+            let link = tokio::spawn(handle(
+                theirs,
+                NodeId("a".into()),
+                hub_tx,
+                true,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(store.clone()),
+            ));
+            // The peer "b": it reads our Hello and answers with what it speaks.
+            let mut buf = BytesMut::new();
+            let hello = read_frame(&mut ours, &mut buf).await.unwrap().unwrap();
+            assert!(
+                matches!(hello, PeerMessage::Hello { proto_max, .. } if proto_max == peer::PROTO_MAX)
+            );
+            write_frame(
+                &mut ours,
+                &PeerMessage::Hello {
+                    node_id: "b".into(),
+                    proto_min: peer::PROTO_MIN,
+                    proto_max: announced,
+                },
+            )
+            .await
+            .unwrap();
+            // The hub is told what the link negotiated; it holds the link's lanes.
+            let Some(HubCommand::PeerConnected { proto, tx, ctl, .. }) = hub_rx.recv().await else {
+                panic!("the link did not register");
+            };
+            assert_eq!(proto, announced);
+            set(&*namespace, "after");
+            let mut seen = Vec::new();
+            // Ten minutes of the link's time: many times the interval at which two
+            // nodes compare (the clock is the test's, so this takes no time).
+            let quiet = tokio::time::timeout(Duration::from_mins(10), async {
+                loop {
+                    let frame = read_frame(&mut ours, &mut buf).await.unwrap().unwrap();
+                    seen.push(frame);
+                    if seen.len() == 2 {
+                        break;
+                    }
+                }
+            })
+            .await;
+            if carries {
+                assert!(quiet.is_ok(), "a proto-14 link carries state: {seen:?}");
+                assert!(
+                    matches!(&seen[0], PeerMessage::StateDigest { namespace, parts, .. }
+                        if namespace == "shared" && parts.is_empty()),
+                    "{seen:?}"
+                );
+                assert!(
+                    matches!(&seen[1], PeerMessage::StateKeys { entries, .. }
+                        if entries.len() == 1 && entries[0].0 == b"after"),
+                    "{seen:?}"
+                );
+            } else {
+                assert!(quiet.is_err(), "a proto-13 link was sent {seen:?}");
+                assert!(seen.is_empty(), "a proto-13 link was sent {seen:?}");
+                assert_eq!(store.replication("shared").unwrap().links, 0);
+            }
+            drop((tx, ctl));
+            link.await.unwrap().unwrap();
+        }
     }
 }
