@@ -262,7 +262,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `two_bridge_instances_do_not_duplicate_forwarding`
 - `two_partitioned_instances_deliver_each_inbound_message_exactly_once`
 
-## `crates/mqtt-cluster/src/lib.rs` — 371 test(s)
+## `crates/mqtt-cluster/src/lib.rs` — 372 test(s)
 
 - `cluster_identity::tests::a_founder_mints_once_and_reloads_stably`
 - `cluster_identity::tests::a_joiner_adopts_once_and_persists`
@@ -468,6 +468,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `peer::tests::the_frozen_frames_encode_byte_for_byte_stably`
 - `peer::tests::the_message_event_frames_are_appended_and_announced_at_proto_13`
 - `peer::tests::the_reached_verdict_is_appended_and_announced_at_proto_11`
+- `peer::tests::the_rule_state_frames_are_appended_and_announced_at_proto_14`
 - `peer::tests::the_tagged_forward_is_appended_and_announced_at_proto_12`
 - `peer::tests::trailing_bytes_after_a_postcard_body_are_rejected`
 - `peer::tests::two_frames_in_one_buffer`
@@ -877,7 +878,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tls::tls12_hardening_tests::the_tls12_suites_are_exactly_the_allowlist`
 - `tls::tls12_hardening_tests::tls12_session_tickets_are_off`
 
-## `crates/mqtt-observability/src/lib.rs` — 19 test(s)
+## `crates/mqtt-observability/src/lib.rs` — 20 test(s)
 
 - `audit_export::tests::a_full_queue_sheds_and_counts_instead_of_blocking`
 - `audit_export::tests::frames_reach_a_tcp_listener_and_flush_waits`
@@ -889,6 +890,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `metrics::tests::otlp_export_posts_to_the_endpoint`
 - `metrics::tests::render_produces_valid_openmetrics_exposition`
 - `metrics::tests::rule_counts_read_back_without_creating_a_series`
+- `metrics::tests::rule_state_replication_is_reported_per_namespace`
 - `metrics::tests::sandboxed_function_calls_are_counted_by_function_and_kind`
 - `metrics::tests::scaling_metrics_render_with_their_documented_names`
 - `tests::a_restart_is_a_new_chain_not_a_truncation`
@@ -1357,7 +1359,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 649 test(s)
+## `crates/mqttd/src/lib.rs` — 671 test(s)
 
 - `admin::cli::tests::a_refusal_shows_what_it_carries`
 - `admin::cli::tests::all_nodes_asks_for_the_cluster_scope_on_the_verbs_that_have_one`
@@ -1924,8 +1926,10 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `memory_watch::tests::vm_rss_is_parsed_in_bytes_from_the_right_line`
 - `memory_watch::tests::without_a_watermark_nothing_is_ever_browned_out`
 - `peer::tests::a_frame_produced_during_the_yield_joins_the_same_write`
+- `peer::tests::a_link_that_negotiated_13_carries_no_rule_state`
 - `peer::tests::control_frames_jump_the_bulk_queue`
 - `peer::tests::peer_qos0_is_shed_when_the_pool_is_full_and_nothing_else_is`
+- `peer::tests::rule_state_is_applied_by_the_link_and_enters_no_hub_lane`
 - `peer::tests::write_wait_counts_pushback_and_not_a_prompt_write`
 - `reload::tests::a_bad_gossip_crl_rejects_the_whole_reload`
 - `reload::tests::a_config_reload_swaps_live_and_keeps_it_on_any_failure`
@@ -1981,6 +1985,26 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `rule_state::tests::kv_store_is_one_table_for_every_rule_and_apart_from_kv`
 - `rule_state::tests::kv_store_keeps_its_values_from_one_message_to_the_next`
 - `rule_state::tests::the_stores_ceiling_refuses_across_namespaces`
+- `rule_state::tests_replica::a_delete_reaches_every_node_and_an_old_copy_cannot_undo_it`
+- `rule_state::tests_replica::a_frame_for_a_namespace_declared_otherwise_is_refused_and_counted`
+- `rule_state::tests_replica::a_frame_is_filled_to_its_budget_and_no_further`
+- `rule_state::tests_replica::a_full_eventual_namespace_refuses_a_rules_new_key`
+- `rule_state::tests_replica::a_key_expires_on_every_node_at_once_and_nothing_is_sent_for_it`
+- `rule_state::tests_replica::a_key_written_many_times_while_a_link_is_slow_is_sent_once`
+- `rule_state::tests_replica::a_merge_keeps_to_the_namespaces_bounds_and_the_stores_ceiling`
+- `rule_state::tests_replica::a_namespace_cannot_change_its_mode_under_the_rules_that_hold_it`
+- `rule_state::tests_replica::a_node_joins_and_a_node_leaves`
+- `rule_state::tests_replica::a_restarted_node_is_refilled_from_the_others_each_key_once`
+- `rule_state::tests_replica::a_state_from_a_clock_too_far_ahead_is_refused_until_the_clock_catches_up`
+- `rule_state::tests_replica::a_store_without_an_eventual_namespace_sends_nothing`
+- `rule_state::tests_replica::a_write_that_changes_nothing_is_not_sent`
+- `rule_state::tests_replica::an_eventual_namespace_answers_a_rule_as_a_local_one_does`
+- `rule_state::tests_replica::concurrent_writers_a_reader_and_a_merger_lose_nothing`
+- `rule_state::tests_replica::copies_converge_whatever_is_reordered_repeated_or_lost`
+- `rule_state::tests_replica::copies_that_differ_in_a_few_keys_exchange_a_few_parts`
+- `rule_state::tests_replica::deleting_a_key_this_node_has_never_seen_leaves_no_tombstone`
+- `rule_state::tests_replica::malformed_frames_are_refused_and_never_pass_a_bound`
+- `rule_state::tests_replica::two_nodes_updating_the_same_keys_across_a_partition_converge_when_it_heals`
 - `rules::tests::a_declared_module_needs_no_switch_and_is_read_beside_the_rules_file`
 - `rules::tests::a_publish_carries_an_origin_only_while_a_message_event_is_wanted`
 - `rules::tests::a_rule_definition_hash_is_keyed_per_process`
@@ -2635,7 +2659,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `a_wills_rules_get_an_empty_dictionary`
 - `the_dictionaries_count_against_the_stores_ceiling`
 
-## `crates/mqttd/tests/rules_sequence.rs` — 20 test(s)
+## `crates/mqttd/tests/rules_sequence.rs` — 21 test(s)
 
 - `a_dictionary_is_one_client_ids_for_the_whole_sequence`
 - `a_failing_rule_or_action_of_a_rules_file_is_reported_with_its_reason`
@@ -2651,6 +2675,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `a_statement_on_events_runs_against_samples_at_the_sequences_time`
 - `a_step_that_fails_is_reported_and_the_replay_goes_on_with_what_it_wrote`
 - `an_emqx_kv_store_rule_counts_across_the_messages_of_a_sequence`
+- `an_eventual_namespace_replays_as_a_local_one_with_a_note`
 - `change_detection_passes_only_the_messages_whose_value_differs_from_the_last`
 - `hot_for_five_minutes_fires_once_the_condition_has_held_that_long`
 - `nothing_selected_is_told_apart_from_no_output`
@@ -2666,6 +2691,12 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `a_rule_keeps_state_between_publishes_and_counts_what_its_where_rejects`
 - `a_wills_rules_call_the_same_store`
 - `kv_store_counts_across_messages_and_is_shared_by_every_rule`
+
+## `crates/mqttd/tests/rules_state_cluster.rs` — 3 test(s)
+
+- `a_partition_heals`
+- `a_restarted_node_is_refilled_from_the_others`
+- `rules_on_every_node_count_one_counter_and_every_node_reads_the_same`
 
 ## `crates/mqttd/tests/rules_sys.rs` — 17 test(s)
 

@@ -44,8 +44,10 @@ pub async fn maintain_peer_links(
     metrics: Option<Arc<mqtt_observability::metrics::Metrics>>,
     plane: Option<mqtt_cluster::durable_plane::DurablePlane>,
 ) {
-    maintain_peer_links_with_ingress(events, local, hub, tls, placement, metrics, plane, None)
-        .await;
+    maintain_peer_links_with_ingress(
+        events, local, hub, tls, placement, metrics, plane, None, None,
+    )
+    .await;
 }
 
 /// [`maintain_peer_links`], with every dialed link charging the node's ingress credit
@@ -60,6 +62,7 @@ pub async fn maintain_peer_links_with_ingress(
     metrics: Option<Arc<mqtt_observability::metrics::Metrics>>,
     plane: Option<mqtt_cluster::durable_plane::DurablePlane>,
     ingress: Option<Arc<crate::ingress::IngressCredit>>,
+    state: Option<Arc<crate::rule_state::Store>>,
 ) {
     // Active dialer per peer we own the link to. The book aborts every dialer
     // when it drops — the dial tasks are children of THIS task, and must not
@@ -140,6 +143,7 @@ pub async fn maintain_peer_links_with_ingress(
                     tls.clone(),
                     plane.clone(),
                     ingress.clone(),
+                    state.clone(),
                 ));
                 dialers
                     .0

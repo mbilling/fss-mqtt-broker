@@ -7206,6 +7206,35 @@ impl Hub {
         }
     }
 
+    /// Rule state in `eventual` namespaces (ADR 0085 D10): how far the slowest link is
+    /// behind, and what peers sent that was not taken. Read off the store's own
+    /// counts; none of that traffic passes through the hub.
+    fn refresh_rule_state_gauges(&self, m: &mqtt_observability::metrics::Metrics) {
+        let Some(state) = self.rules.as_ref().and_then(|rules| rules.state()) else {
+            return;
+        };
+        for namespace in state.namespaces() {
+            let Some(replication) = state.replication(&namespace) else {
+                continue;
+            };
+            #[allow(clippy::cast_precision_loss)] // milliseconds, far below 2^53
+            let lag_secs = replication.lag_ms as f64 / 1e3;
+            m.set_rule_state_replication(&namespace, lag_secs, replication.pending);
+            for reason in crate::rule_state::Refused::ALL {
+                m.set_rule_state_replication_refused(
+                    &namespace,
+                    reason.as_str(),
+                    replication.refused(reason),
+                );
+            }
+        }
+        m.set_rule_state_replication_refused(
+            "(undeclared)",
+            "undeclared",
+            state.replication_undeclared(),
+        );
+    }
+
     async fn refresh_gauges(&self) {
         let Some(m) = &self.metrics else { return };
         // Distinct sessions = connected clients plus offline persistent ones.
@@ -7270,6 +7299,7 @@ impl Hub {
             m.set_peer_link_stat(&peer, "frames_in", f(&st.frames_in));
             m.set_peer_link_stat(&peer, "reads", f(&st.reads));
         }
+        self.refresh_rule_state_gauges(m);
         // Issue #504: both lanes are unbounded, so this is the only report of the
         // frames that have left the hub and not yet reached the wire — the
         // population that sits between `received` and `delivered`.

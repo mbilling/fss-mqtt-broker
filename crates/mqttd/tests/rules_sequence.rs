@@ -849,3 +849,40 @@ fn what_a_payload_or_a_key_prints_cannot_break_the_reports_lines() {
         )
     );
 }
+
+/// ADR 0085 T3: an `eventual` namespace loads, and a replay, which is one node, shows
+/// of it what it shows of a `local` one, with a note that a cluster would replicate it.
+/// A deleted key is gone from what the replay shows, as in a `local` namespace.
+#[test]
+fn an_eventual_namespace_replays_as_a_local_one_with_a_note() {
+    let file = |mode: &str| {
+        format!(
+            "[state.fleet]\nconsistency = \"{mode}\"\n[rules.count]\nstate = \"fleet\"\n\
+             sql = '''SELECT kv_incr(clientid, 1, 3600) AS n, kv_changed('s', payload.s) AS c, \
+             kv_add('seen', clientid) AS seen, kv_set('gone', 1) AS g, kv_del('gone') AS d \
+             FROM \"reports/#\"'''\nactions = [{{ function = \"console\" }}]\n"
+        )
+    };
+    let sequence = r#"
+        {"at": 0, "topic": "reports/x", "clientid": "dev-1", "payload": {"s": "on"}}
+        {"at": "1m", "topic": "reports/x", "clientid": "dev-2", "payload": {"s": "on"}}
+        {"at": "2h", "topic": "reports/x", "clientid": "dev-1", "payload": {"s": "off"}}
+    "#;
+    let local = rules(&file("local"), sequence);
+    let eventual = rules(&file("eventual"), sequence);
+    assert!(local.notes.is_empty());
+    assert_eq!(
+        eventual.notes,
+        [
+            "namespace `fleet` is replicated in a cluster; a replay is one node, where it \
+          behaves as consistency = \"local\""
+        ]
+    );
+    assert_eq!(eventual.failed(), 0);
+    assert_eq!(
+        format!("{:?}", eventual.steps),
+        format!("{:?}", local.steps)
+    );
+    assert_eq!(eventual.store, local.store);
+    assert_eq!(eventual.store.len(), 3, "{:?}", eventual.store);
+}

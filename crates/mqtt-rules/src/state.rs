@@ -86,13 +86,21 @@ pub const DEFAULT_TTL_SECS: u64 = 24 * 60 * 60;
 /// A namespace's `max_ttl` when its table does not say, and the most it may be: 30 days.
 pub const MAX_TTL_SECS: u64 = 30 * 24 * 60 * 60;
 
-/// Where a namespace's keys live and how they agree across nodes (D5). Phase 1's first
-/// task has `local` only: `eventual` is declared-but-not-yet-available, `strong` is
-/// phase 2, and a file that names either does not load.
+/// A namespace's tombstone window when its table does not say: one hour. For that
+/// long a deleted key of an `eventual` namespace is remembered as deleted, so that a
+/// copy from before the delete cannot bring it back.
+pub const DEFAULT_TOMBSTONE_WINDOW_SECS: u64 = 60 * 60;
+
+/// Where a namespace's keys live and how they agree across nodes (D5). `strong` is
+/// phase 2, and a file that names it does not load.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Consistency {
     /// This node only.
     Local,
+    /// Every member of the cluster holds the namespace: a write is applied on this
+    /// node and sent to the others in the background, and their copies converge by
+    /// merge (D4, D15).
+    Eventual,
 }
 
 /// What a namespace does with a new key when it is full.
@@ -120,6 +128,9 @@ pub struct NamespaceSettings {
     pub max_ttl_secs: u64,
     /// What a full namespace does with a new key.
     pub eviction: Eviction,
+    /// How long an `eventual` namespace remembers a deleted key as deleted, in
+    /// seconds. Nothing in a `local` one.
+    pub tombstone_window_secs: u64,
 }
 
 impl NamespaceSettings {
@@ -134,6 +145,7 @@ impl NamespaceSettings {
             default_ttl_secs: Some(DEFAULT_TTL_SECS),
             max_ttl_secs: MAX_TTL_SECS,
             eviction: Eviction::Fail,
+            tombstone_window_secs: DEFAULT_TOMBSTONE_WINDOW_SECS,
         }
     }
 
@@ -392,6 +404,7 @@ pub(crate) struct StateSchema {
     default_ttl: Option<toml::Value>,
     max_ttl: Option<toml::Value>,
     eviction: Option<String>,
+    tombstone_window: Option<toml::Value>,
 }
 
 /// Whether `name` can be a namespace's: a lower-case letter, then up to 63 lower-case
@@ -454,6 +467,7 @@ fn duration(v: &toml::Value) -> Result<u64, String> {
 impl StateSchema {
     /// The table as settings, over `base` (what it leaves out), under a store whose
     /// ceiling is `ceiling` bytes.
+    #[allow(clippy::too_many_lines)] // one check per key of the table
     fn settings(
         &self,
         name: &str,
@@ -470,24 +484,18 @@ impl StateSchema {
                         .to_string(),
                 );
             }
-            Some("eventual") => {
-                return Err(
-                    "consistency = \"eventual\" is not available yet: this release has \
-                     \"local\" namespaces only (ADR 0085)"
-                        .to_string(),
-                );
-            }
+            Some("eventual") => s.consistency = Consistency::Eventual,
             Some("strong") => {
                 return Err(
                     "consistency = \"strong\" is not available: it is a later phase (ADR 0085 \
-                     D5); use \"local\""
+                     D5); use \"local\" or \"eventual\""
                         .to_string(),
                 );
             }
             Some(other) => {
                 return Err(format!(
-                    "consistency = \"{other}\": expected \"local\" (\"eventual\" and \
-                     \"strong\" are not available yet)"
+                    "consistency = \"{other}\": expected \"local\" or \"eventual\" \
+                     (\"strong\" is not available yet)"
                 ));
             }
         }
@@ -545,6 +553,29 @@ impl StateSchema {
                     "eviction = \"{other}\": expected \"fail\" or \"lru\""
                 ));
             }
+        }
+        if let Some(v) = &self.tombstone_window {
+            let n = duration(v).map_err(|e| format!("tombstone_window: {e}"))?;
+            if s.consistency != Consistency::Eventual {
+                return Err(
+                    "tombstone_window is for an \"eventual\" namespace: a \"local\" one keeps \
+                     nothing of a deleted key"
+                        .to_string(),
+                );
+            }
+            if !(1..=MAX_TTL_SECS).contains(&n) {
+                return Err(format!(
+                    "tombstone_window = {v}: expected 1 second to 30 days ({MAX_TTL_SECS} seconds)"
+                ));
+            }
+            s.tombstone_window_secs = n;
+        }
+        if s.consistency == Consistency::Eventual && s.eviction == Eviction::Lru {
+            return Err(
+                "eviction = \"lru\" is for a \"local\" namespace: a key evicted on one node of \
+                 an \"eventual\" one would come back from the others"
+                    .to_string(),
+            );
         }
         Ok(s)
     }

@@ -113,7 +113,15 @@ pub const PROTO_MIN: u32 = 6;
 /// so a cluster without such rules puts neither on the wire and its frames are byte
 /// for byte proto 12's. A proto-12 link is sent neither: a node behind one reports the
 /// messages forwarded to it with an unknown publisher.
-pub const PROTO_MAX: u32 = 13;
+///
+/// Proto 14 (ADR 0085, rule state in `eventual` namespaces) is additive: three frames.
+/// [`StateKeys`](PeerMessage::StateKeys) carries keys' whole states,
+/// [`StateDigest`](PeerMessage::StateDigest) a summary of a namespace to compare, and
+/// [`StateWant`](PeerMessage::StateWant) which parts of it differ. A node sends them
+/// only for the namespaces its rules file declares `eventual`, so a cluster without
+/// one puts none on the wire and its frames are byte for byte proto 13's. A proto-13
+/// link is sent none: the node behind it holds no such state.
+pub const PROTO_MAX: u32 = 14;
 
 /// The peer-bus proto at which a build computes durable ownership over all admitted
 /// members (ADR 0073). Purely a capability marker — see [`PROTO_MAX`].
@@ -139,6 +147,16 @@ pub const PROTO_PUBLISH_ORIGIN: u32 = 12;
 /// [`MessageEvents`](PeerMessage::MessageEvents) and
 /// [`OriginPublish`](PeerMessage::OriginPublish) (ADR 0083).
 pub const PROTO_MESSAGE_ORIGIN: u32 = 13;
+
+/// The peer-bus proto at which a link carries rule state:
+/// [`StateKeys`](PeerMessage::StateKeys), [`StateDigest`](PeerMessage::StateDigest)
+/// and [`StateWant`](PeerMessage::StateWant) (ADR 0085).
+pub const PROTO_RULE_STATE: u32 = 14;
+
+/// The parts a namespace of rule state is summarised in
+/// ([`StateDigest`](PeerMessage::StateDigest)): a key's part is the top bits of a
+/// fixed hash of the key, so every node puts a key in the same one.
+pub const STATE_PARTS: usize = 1024;
 
 /// Negotiate a link's protocol version from both sides' announced ranges
 /// (ADR 0038): the newest version both can speak, or `None` when the ranges are
@@ -882,6 +900,53 @@ pub enum PeerMessage {
     /// command that carries one — for a frame most clusters never send. The box is
     /// not on the wire.
     OriginPublish(Box<OriginFrame>),
+    // ---------------------------------------------------------------------
+    // Proto 14 (ADR 0085, rule state). Appended.
+    //
+    // All three name a namespace of the sender's rules file and carry a fingerprint
+    // of how the sender declares it; a receiver that does not declare it, or declares
+    // it otherwise, refuses the frame and counts it. None is a hub command: the
+    // link's reader applies them to the store.
+    // ---------------------------------------------------------------------
+    /// Keys of an `eventual` namespace, each with its whole state as
+    /// `mqtt_rules::crdt::KeyState` encodes it. The receiver merges each into its
+    /// own copy: the merge is idempotent and order does not matter, so a state sent
+    /// twice or late is harmless.
+    StateKeys {
+        /// The namespace: a declared name, or `rule:<id>`.
+        namespace: String,
+        /// The fingerprint of the sender's declaration.
+        declaration: u64,
+        /// `(key, state)` pairs.
+        entries: Vec<(Vec<u8>, Vec<u8>)>,
+    },
+    /// A summary of the sender's copy of a namespace. `root` covers the whole copy;
+    /// `parts` is empty, or one number for each of the [`STATE_PARTS`] parts. Sent
+    /// with `root` alone at link-up and periodically; the side that finds its own
+    /// root different answers with its parts, so that only what differs is compared
+    /// key by key.
+    StateDigest {
+        /// The namespace.
+        namespace: String,
+        /// The fingerprint of the sender's declaration.
+        declaration: u64,
+        /// A hash over every part.
+        root: u64,
+        /// Each part's hash, or none.
+        parts: Vec<u64>,
+    },
+    /// The parts of a namespace in which the sender's copy differs from the
+    /// receiver's, as a bitmap of [`STATE_PARTS`] bits (the lowest bit of the first
+    /// word is part 0). The receiver sends its keys of those parts; the sender is
+    /// already sending its own.
+    StateWant {
+        /// The namespace.
+        namespace: String,
+        /// The fingerprint of the sender's declaration.
+        declaration: u64,
+        /// The bitmap, [`STATE_PARTS`] / 64 words.
+        parts: Vec<u64>,
+    },
 }
 
 impl PeerMessage {
@@ -1395,7 +1460,7 @@ mod tests {
         PeerMessage, ReplicaEntryWire, RetainedWireEntry, SharedGroupWire, SharedMemberWire,
         WireAppProps, WireOrigin, MAX_FRAME, PROTO_FORWARD_REACHED, PROTO_MAX,
         PROTO_MESSAGE_ORIGIN, PROTO_MIN, PROTO_OWNERSHIP_DOMAIN, PROTO_PUBLISH_ORIGIN,
-        PROTO_REPLICATION_FACTOR, PROTO_REPLICA_READ_PAGED,
+        PROTO_REPLICATION_FACTOR, PROTO_REPLICA_READ_PAGED, PROTO_RULE_STATE, STATE_PARTS,
     };
     use bytes::BytesMut;
 
@@ -1936,14 +2001,102 @@ mod tests {
 
         assert_eq!(PROTO_MESSAGE_ORIGIN, 13);
         assert_eq!(
-            negotiate_proto((PROTO_MIN, PROTO_MAX), (PROTO_MIN, PROTO_MAX)),
+            negotiate_proto((PROTO_MIN, PROTO_MAX), (PROTO_MIN, PROTO_MESSAGE_ORIGIN)),
             Some(PROTO_MESSAGE_ORIGIN),
-            "this build must announce the proto-13 message-event frames"
+            "this build must still speak the proto-13 message-event frames"
         );
         assert_eq!(
             negotiate_proto((PROTO_MIN, PROTO_MAX), (PROTO_MIN, PROTO_PUBLISH_ORIGIN)),
             Some(PROTO_PUBLISH_ORIGIN),
             "a proto-12 peer keeps negotiating 12"
+        );
+    }
+
+    /// Proto 14 (ADR 0085): the three rule-state frames round-trip, are APPENDED after
+    /// every earlier frame with their bytes pinned, and this build announces 14 — while
+    /// a proto-13 peer still negotiates 13 and is sent none of them.
+    #[test]
+    fn the_rule_state_frames_are_appended_and_announced_at_proto_14() {
+        let keys = PeerMessage::StateKeys {
+            namespace: "ns".into(),
+            declaration: 0x0102,
+            entries: vec![(b"k".to_vec(), vec![1, 2, 3]), (b"kk".to_vec(), Vec::new())],
+        };
+        roundtrip(&keys);
+        let mut out = Vec::new();
+        encode(&keys, &mut out).unwrap();
+        assert_eq!(out[4], 31, "appended after OriginPublish (30)");
+        assert_eq!(
+            &out[5..],
+            [2, b'n', b's', 0x82, 0x02, 2, 1, b'k', 3, 1, 2, 3, 2, b'k', b'k', 0],
+            "a name, the fingerprint as a varint, then length-prefixed pairs"
+        );
+
+        let root = PeerMessage::StateDigest {
+            namespace: "ns".into(),
+            declaration: 1,
+            root: 7,
+            parts: Vec::new(),
+        };
+        roundtrip(&root);
+        let mut out = Vec::new();
+        encode(&root, &mut out).unwrap();
+        assert_eq!(out[4], 32, "appended after StateKeys (31)");
+        assert_eq!(&out[5..], [2, b'n', b's', 1, 7, 0]);
+        roundtrip(&PeerMessage::StateDigest {
+            namespace: "rule:r".into(),
+            declaration: u64::MAX,
+            root: u64::MAX,
+            parts: vec![u64::MAX; STATE_PARTS],
+        });
+
+        let want = PeerMessage::StateWant {
+            namespace: "ns".into(),
+            declaration: 1,
+            parts: vec![0b101, 0],
+        };
+        roundtrip(&want);
+        let mut out = Vec::new();
+        encode(&want, &mut out).unwrap();
+        assert_eq!(out[4], 33, "appended after StateDigest (32)");
+        assert_eq!(&out[5..], [2, b'n', b's', 1, 2, 5, 0]);
+
+        // The fuzz target's seeds (`fuzz/seeds/peer_decode`) are these frames, so that
+        // it starts from inputs that reach them.
+        for (seed, name) in [
+            (
+                &include_bytes!("../fuzz/seeds/peer_decode/state_keys.bin")[..],
+                "StateKeys",
+            ),
+            (
+                include_bytes!("../fuzz/seeds/peer_decode/state_digest_root.bin"),
+                "StateDigest",
+            ),
+            (
+                include_bytes!("../fuzz/seeds/peer_decode/state_digest_parts.bin"),
+                "StateDigest",
+            ),
+            (
+                include_bytes!("../fuzz/seeds/peer_decode/state_want.bin"),
+                "StateWant",
+            ),
+        ] {
+            let mut buf = BytesMut::from(seed);
+            let frame = decode(&mut buf).unwrap().unwrap();
+            assert!(buf.is_empty());
+            assert!(format!("{frame:?}").starts_with(name), "{frame:?}");
+        }
+
+        assert_eq!(PROTO_RULE_STATE, 14);
+        assert_eq!(
+            negotiate_proto((PROTO_MIN, PROTO_MAX), (PROTO_MIN, PROTO_MAX)),
+            Some(PROTO_RULE_STATE),
+            "this build must announce the proto-14 rule-state frames"
+        );
+        assert_eq!(
+            negotiate_proto((PROTO_MIN, PROTO_MAX), (PROTO_MIN, PROTO_MESSAGE_ORIGIN)),
+            Some(PROTO_MESSAGE_ORIGIN),
+            "a proto-13 peer keeps negotiating 13"
         );
     }
 

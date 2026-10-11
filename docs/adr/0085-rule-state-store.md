@@ -265,6 +265,10 @@ idempotently, so a resent or reordered update is harmless.
 for the other types it also covers the writes of nodes that had not heard of it. `first`'s
 expiry is the later of the two. See [Amendments](#amendments).)*
 
+*(Amended 2026-10-11, T3: a counter keeps a count for each run of each node, not for
+each node, so that a restart loses no counts; a delete of a key this node holds nothing
+of does nothing. See [Amendments](#amendments).)*
+
 ### D5. Consistency is chosen per namespace
 
 | Mode | Write | Read | During a partition | Cost on the publish path |
@@ -565,6 +569,10 @@ was.
   otherwise it refuses and counts it, and repair retries later. A namespace run at its
   bound is therefore not guaranteed to hold the same keys on every node.
 
+*(Amended 2026-10-11, T3: how keys are sent without a queue, the digest and the exchange
+that repairs, the three frames, the fingerprint, and what a merge refuses. See
+[Amendments](#amendments).)*
+
 ## Decided by default, 2026-10-11
 
 These are choices with a real cost either way that neither EMQX's behaviour, the code nor
@@ -585,6 +593,7 @@ amendment "no last-write time"), and rows 7 and 8 are open to the user in the sa
 | 6 | ~~Where a key's last-write time lives in an `eventual` namespace (amendment, T12)~~ | ~~On each node, in memory, 8 bytes a key; not in the replicated form~~ | **Withdrawn: the user dropped the last-write time, 2026-10-11** ("drop the stale key idea completely. drop the extra bytes") | Nothing: no time is stored, on a node or on the wire | None is open: there is no last-write time to place |
 | 7 | Moving an expiry sooner on a key that is not `lww`, in an `eventual` namespace (amendment, T14) | Refused, and counted in a selection as `not_shortened`; the operator purges instead | By default | No way to make such a key expire early *with its expiry event* on every node | Delete and write back under a new delete stamp: the shorter expiry then replicates, and writes made on nodes that had not heard of it are lost (a counter loses increments). Revisit before T14 |
 | 8 | Clearing an expiry outside `kv_store` (amendment, T14) | Offered: the one admin act that leaves `max_ttl` | By default (the user approved "set, extend or clear … within `max_ttl`"; the two meet only here) | A key no rule could have made: it never expires and holds its room until a rule or an operator deletes it. The listing's "no expiry" filter finds them | Refuse `clear` wherever the namespace has a `max_ttl`, i.e. everywhere but `kv_store`, where no expiry may be set at all: then `clear` does nothing anywhere and is dropped. Revisit before T14 |
+| 9 | Whose counts a counter keeps in an `eventual` namespace (amendment, T3) | Each run of each node counts under a name of its own | By default | A counter gains a row for each node restart that then increments it, and refuses a new run's increment past 256 rows until it is deleted | Count under the node id alone: no growth, and a restarted node silently loses what it counts before it has been refilled. Revisit before T8 documents it |
 
 ## Phasing
 
@@ -1316,3 +1325,233 @@ run in turn, six rounds, the fastest median of each case; the machine was shared
 `no_match` 113.3 to 114.0 ns, `filter_reject` 987.8 to 984.6 ns, `filter_republish`
 1.8335 to 1.8328 µs, `select_star_republish` 4.597 to 4.594 µs, `foreach_10` 8.462 to
 8.467 µs. Between −0.3% and +0.6%, inside the spread from one run to the next.
+
+### 2026-10-11 — T3: `eventual` as built, and what D15 left to decide
+
+T3 built D5's `eventual` mode and D15: every member holds the namespace, what changed is
+sent per peer link, and copies are compared and repaired
+(`crates/mqttd/src/rule_state/replica.rs` and `link.rs`, three frames at peer protocol 14
+in `crates/mqtt-cluster/src/peer.rs`). Nothing in D5 or D15 was contradicted. D15 named
+its mechanisms without fixing them, and building it met four things the record did not
+foresee. They come first.
+
+**What the record did not foresee**
+
+- **A node that restarts forgets what it had counted, and the others do not.** A counter
+  keeps, per node, how much that node added, and two copies merge by keeping the larger
+  of each node's numbers (D4). The store is in memory (D5), so a restarted node starts
+  its own number again at zero under the same node id, and whatever it counts before it
+  has been refilled is smaller than the number the others still hold for it: the merge
+  keeps theirs and the new increments are lost, silently. No rule on the restarted node
+  can avoid it (it would have to wait for a refill it cannot see), and no merge of
+  bounded size can tell the two apart afterwards. So **a node counts under a name that
+  is its id and when this run of it began** (`<node id>#<milliseconds, in hex>`): each
+  run has numbers of its own, and what an earlier run counted stays counted. The price:
+  a counter gains a row for each run of each node that increments it, and T2's bound of
+  256 rows is then reached by restarts, not only by nodes. A counter with a TTL goes
+  with its key long before that. One that is refreshed for ever and lives through 256
+  node restarts refuses the next run's increment (the rule fails, counted) until the key
+  is deleted. Rows of runs that are over could be folded together only by every member
+  at once, which is a coordinated step this record does not have; it is left open.
+  *(Decided by default, 9: counts are kept exact across restarts, and the bound is the
+  price. The other answer counts under the node id alone: no growth, and a
+  restarted node loses what it counted before its refill arrived.)*
+- **A delete of a key this node holds nothing of does nothing** (the question T2 left).
+  `kv_del` answers `false` and leaves no tombstone, and so does `kv_held` on a false
+  condition, which is such a delete for every reading of every device that is not hot:
+  a tombstone each would fill the namespace with keys nobody wrote and send one to
+  every member per message. What it gives up: a write of the same key made elsewhere
+  and not yet arrived is not covered by that delete, and survives. A key this node has
+  seen deleted is not deleted again either, so a delete is sent once.
+- **A write that leaves the key as it was is not sent.** A value that is not the largest,
+  an element the set holds, a value the sketch has seen, a second `kv_set_once`: on a
+  busy namespace most calls of `kv_max`, `kv_add` and `kv_hll_add` are these, and each
+  would otherwise send its key's whole state (12 KiB for a sketch) to every member.
+  `KeyState::apply` reports whether the state changed; only then does the key take a
+  new place in the order the links read.
+- **A node that joins has a link to every member, and each would send it everything.**
+  Repair is between two nodes (D15), so a restarted node in a cluster of N would be sent
+  the namespace N−1 times. A node therefore repairs a namespace over one link at a
+  time; a comparison another link's peer asks for meanwhile is kept and started when
+  the first is over, and by then finds little or nothing to send.
+
+**Sending (D15's "a task per peer link")**
+
+- **No queue, and so no bound to hit.** A shard numbers its keys' local changes; a key
+  has one place in that order, its latest change. A link keeps a position per shard and
+  reads on from it, at most 64 KiB of keys and states a frame (one key's state can be
+  larger, up to 265 KiB, and then travels alone). The store keeps nothing per link, so
+  what waits for a link is its distance from the end of the order: at most the keys
+  there are, whatever was written and however long the peer has been slow or away. The
+  task asked what happens when a link's backlog bound is hit: there is no backlog that
+  can pass a bound, and nothing is ever dropped for a slow peer. A link that is gone
+  costs nothing either; when it comes back it starts at the end of the order and
+  repair finds what it missed.
+- **A key that no link has read past keeps its place** when it is written again, so the
+  hot path of a key written faster than the links read is the write alone.
+- **The link's task is the peer link's own** (`peer.rs`'s pump), with state as its
+  lowest lane: it writes a state frame when nothing else is waiting, and one after each
+  batch of the bulk lane when something always is. While it waits on a full socket
+  nothing accumulates behind it.
+- **Waking it costs a write nothing most of the time.** The first write after a link
+  went to sleep wakes the links; the writes after it read one flag. A link that has sent
+  everything waits 5 ms before it looks again, so a burst leaves as one frame.
+- **A state merged in from a peer is not sent on.** Every member has a link to the node
+  that wrote it. Where two members have none (a partial partition), repair through a
+  member they both reach carries it, within the repair interval.
+- **Receiving** is as D15 says: the link's reader applies each key to the store. A state
+  frame is never a hub command (ADR 0082), which a test pins by counting what the hub is
+  sent while 10,000 keys cross.
+
+**Repair (D15's "compare per-namespace digests"), as chosen**
+
+- **The digest.** A namespace is summarised in 1,024 parts. A key's part is the top ten
+  bits of the fixed hash of the key (SipHash-2-4 under T2's fixed key), so every node
+  puts a key in the same part whatever its own shards are. A part's number is the
+  exclusive-or of its keys' hashes, a key's hash being that of its key and its encoded
+  state (one encoding per state, T2); the root is a hash over the parts. Keys that
+  could be forgotten are not in it, whether or not they have been removed yet, so two
+  nodes that forget at slightly different moments still agree.
+- **The exchange.** When a link comes up and every 30 seconds, each side sends its root
+  (`StateDigest` with no parts). Of the two, the node whose id sorts first answers a
+  root that is not its own with its parts (8 KiB); the other compares, asks for the
+  parts that differ (`StateWant`, a bitmap) and sends its own keys of those parts, and
+  the first then sends its own. Each side lists the keys it will send when it starts,
+  so it does not send back what the other is sending it, and says it has sent them by
+  sending its root once more; a side that hears nothing for 5 seconds takes the repair
+  to be over. Two copies that agree exchange a few bytes; two that differ in a few keys
+  exchange the digest and the keys of the parts those are in, about a thousandth of the
+  namespace each.
+- **What it does not bound well.** The digest is made by looking at every key once, a
+  shard at a time, on the link's task, when something changed since the last one
+  (its cost is inside the catch-up measured below, and was not measured alone). A namespace run at its bound is offered, every interval, the keys it
+  refused (D15 accepts that such a namespace differs between nodes; the cost is the
+  parts those keys are in, every 30 seconds).
+
+**The wire**
+
+- Three frames, appended (`PeerMessage` tags 31 to 33, bytes pinned by a test), sent
+  only on a link that negotiated 14 and only for namespaces the sender's rules declare
+  `eventual`: `StateKeys { namespace, declaration, entries: [(key, state)] }`,
+  `StateDigest { namespace, declaration, root, parts }` and
+  `StateWant { namespace, declaration, parts }`. A state is T2's replicated form.
+- **Mixed versions.** A link to a node on protocol 13 has no state lane at all: that
+  node is sent nothing and holds nothing, and its rules file cannot declare the
+  namespace (a release with T1 and T2 refuses `eventual` at load; one before T1 refuses
+  `[state.*]`). The members on 14 replicate among themselves. Upgrade every node, then
+  deploy the rules. The two-binary rolling upgrade (`cluster_upgrade.rs`) declares no
+  such namespace and its links carry what they carried before, byte for byte; a test of
+  the link itself pins that a peer announcing 13 is sent no state frame in ten minutes
+  of link time while one announcing 14 is sent the digest at once.
+- **The declaration's fingerprint** covers the mode, the form a state travels in and the
+  tombstone window (two nodes that forget deletes at different times would bring each
+  other's deleted keys back). The bounds are not in it: D15 lets a node hold fewer keys.
+  A frame whose fingerprint is not this node's is refused whole
+  (`reason="declaration"`). One for a namespace this node does not declare `eventual`
+  at all has no namespace of the operator's to be counted under: it is counted for the
+  store, exported as `{namespace="(undeclared)", reason="undeclared"}`.
+- **`tombstone_window`** is a key of `[state.<name>]` (D9 named the window and its
+  default, an hour; one second to 30 days), allowed in an `eventual` namespace only.
+
+**Bounds and refusals (D9, D15's "a node at a bound")**
+
+- **A merge keeps to this node's own declaration**, the one its rules loaded last. A
+  key that is new here needs room under `max_keys`, `max_bytes` and the store's ceiling
+  (keys that can be forgotten make room first) and is refused in a brownout. **A key
+  that would grow needs the bytes too**: a rule's write to a key that exists is bounded
+  per key and never refused for room (T1), but a peer is not a rule, and without this a
+  peer could raise every key this node holds to its largest. What is refused is counted
+  (`namespace_full`, `store_full`, `brownout`) and **what this node held is kept as it
+  was**; the peers offer it again at the next repair.
+- **Malformed** (`malformed`): a key that is empty or longer than 256 bytes, a state
+  T2's decoder refuses, a digest that has neither no parts nor 1,024, a request that is
+  not 16 words. Each key of a frame is judged on its own, and the good ones are taken.
+  A frame is bounded by the peer bus (16 MiB), a state by T2 (265 KiB), and decoding
+  allocates no more than the frame holds. A test feeds a bounded namespace 3,000 frames
+  of random and of damaged states and checks its bounds after every one; the peer bus's
+  fuzz target (`peer_decode`, nightly) has seeds for the three frames.
+- **Clock skew** (`clock_skew`): T2's 60 seconds, applied to the states that carry a
+  stamp: an `lww` or `first` value, and anything that has seen a delete. A counter, a
+  set, a sketch or an extreme that was never deleted carries no stamp, so there is no
+  clock in it to follow and it is merged; its expiry is still a time by its writer's
+  clock, as D6 says of every duration between nodes.
+- **`eviction = "lru"` with `consistency = "eventual"`** is a load error (D9 said why).
+  **A namespace's mode cannot change** while rules hold it: the load, and so the reload,
+  is refused (D1), at the store.
+- **Accounting.** A key of an `eventual` namespace is accounted 96 bytes more than a
+  `local` one (its delete's stamp, its hashes, its places in the orders of change and
+  of forgetting), a tombstone as a key without a value, a counter 32 bytes and the
+  node's name for each run beyond the first.
+
+**What a rule sees**
+
+- **Reads are local, and an `eventual` namespace answers a rule as a `local` one does**
+  on one node: a test runs the same statements through both. Two things differ and
+  neither changes an answer: a value is held as it reads back from the replicated form
+  (T2), and a deleted key still counts toward `max_keys` until its window has passed.
+- **`kv_changed` with a TTL on a value that did not change is a write** (a new stamp):
+  an `lww` expiry travels with its write, so there is no other way to move it.
+- **Expiry** is by the clock's physical part, the same moment on every node; the key
+  reads as absent from then on. It is removed when a namespace needs room and whenever
+  a digest is made, as are tombstones past their window. The sweep and the event are T4.
+
+**Observability** (the three series D10 names for `eventual` namespaces; the rest is T6)
+
+- `mqttd_rule_state_replication_pending{namespace}`: the keys the link furthest behind
+  has yet to read. Counted exactly while a shard has fewer than 64 unread changes,
+  taken as the shard's changed keys past that.
+- `mqttd_rule_state_replication_lag_seconds{namespace}`: how long that link has had
+  something to send, that is, the time since it last had sent everything.
+- `mqttd_rule_state_replication_refused_total{namespace,reason}`, with the reasons
+  above.
+
+**Measured** (`cargo bench -p mqttd --bench rule_state`; the delivery doc has the run)
+
+Apple M1 Pro, eight cores, the best of three rounds on a machine other work was sharing.
+
+- **On the publish path** a write to an `eventual` namespace costs what one to a `local`
+  namespace does, within the spread: a publish evaluated with one `kv_incr` 1.80 µs
+  `local` and 1.84 µs `eventual`, with `kv_held` 1.91 and 1.94 µs, with `kv_hll_add`
+  2.06 and 2.10 µs (1.42 µs with no state call).
+- **In the store, one thread:** `kv_set` 0.15 µs `local`; 0.16 µs `eventual` on a node
+  no link reads from, 0.30 µs with a link reading all the while (the key goes to the end
+  of the order of change each time it has been sent). `kv_incr` 0.13, 0.16 and 0.27 µs.
+  A read 0.15 µs `local` and 0.12 µs `eventual`. A `kv_hll_add` of a value the sketch
+  has seen, 0.24 µs, sends nothing.
+- **Every thread writing, a link reading,** each on keys of its own: 0.19, 0.38, 0.69 and
+  0.92 µs a call on one, two, four and eight threads (`local`: 0.11, 0.14, 0.19 and
+  0.34 µs). The difference is the order of change, which a write joins under its
+  shard's lock and the link reads under the same lock. With every write stamped
+  (`kv_set`): 0.19, 0.41, 0.86 and 1.65 µs, so **the one clock word does show** at
+  eight threads writing nothing but stamped values; T2's clock per shard is the way
+  out and was not taken, since a publish is two microseconds of other work. All
+  threads on one key: 0.15, 0.35, 0.97 and 2.7 µs (`local`: 0.11, 0.18, 0.67 and
+  1.9 µs).
+- **On the wire, per key** (a 17-byte key, in a frame of 100): a counter one node counts
+  65 bytes, a 44-byte value 105, a `kv_held` time 74, a deleted key 38, a set of ten
+  client ids 175, a sketch of 1,000 values 2,970. One frame per link for whatever
+  changed in the 5 ms before it.
+- **Catching up:** a node that comes up empty beside one that holds 100,000 keys (a
+  44-byte value each, 10.5 MB on the wire) holds them all 0.14 s after its link is
+  dialled: two processes' worth of work in one process, over loopback TCP, each end the
+  link task the broker runs, digests included.
+- **A write on one node is read on the other** 0.4 to 0.8 ms later, the link having been
+  idle.
+- **Not measured:** the same against `main`'s binary run in turn, as T2 did (the machine
+  ran out of disk for a second build; the `local` figures above are T2's to within its
+  own spread), a cluster on separate machines, and a namespace of a million keys.
+
+**Left open**
+
+- **Folding the rows of a counter's past runs** (above), and whether 256 is the right
+  bound once restarts count toward it.
+- **The digest's cost at the largest namespace** (a million keys): it is a pass over
+  every key on the link's task. Keeping it up to date as keys change would remove the
+  pass; it was not needed at the sizes measured.
+- **T6:** an `eventual` namespace's keys are kept apart from a `local` one's (they hold
+  the state that merges, not a value), so the admin listing and lookup need their own
+  read of them, and an operator's delete there is `kv_del`'s.
+- **T4:** which member raises the expiry event, and the sweep that removes expired keys
+  and tombstones on time instead of when room is needed or a digest is made.
+- **A node without a store** (`rules.state_max_bytes = 0`) that is sent state frames
+  drops them without a count: it has no store to count in.

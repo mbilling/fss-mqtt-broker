@@ -220,7 +220,7 @@
 
 **0085 — State for rules: a keyed, replicated store read and written from SQL**
 
-- `0085-T3` ⬜ planned ([#919](https://github.com/mbilling/fss-mqtt-broker/issues/919)): "eventual mode: every member holds the namespace; changed keys sent per peer link at peer protocol 14, applied off the hub, repaired by anti-entropy after partitions and restarts"
+- `0085-T3` 🚧 in-progress ([#919](https://github.com/mbilling/fss-mqtt-broker/issues/919)): "eventual mode: every member holds the namespace; changed keys sent per peer link at peer protocol 14, applied off the hub, repaired by anti-entropy after partitions and restarts"
 - `0085-T4` ⬜ planned ([#920](https://github.com/mbilling/fss-mqtt-broker/issues/920)): "Expiry and $events/state/expired: selected by its own name only, raised by one member, rate-bounded and late rather than lost, at least once around membership changes"
 - `0085-T5` ⬜ planned ([#921](https://github.com/mbilling/fss-mqtt-broker/issues/921)): "kv_incr idempotency keys, remembered as entries of the namespace for its dedupe window"
 - `0085-T6` ⬜ planned ([#922](https://github.com/mbilling/fss-mqtt-broker/issues/922)): "Observability and admin: state metrics, per-namespace $SYS statistics, the admin state endpoints and the mqttd --admin state verbs"

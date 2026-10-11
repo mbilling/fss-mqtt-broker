@@ -299,9 +299,12 @@ fn a_namespace_declaration_is_checked_when_the_file_loads() {
     for (name, body, wanted) in [
         ("Alerts", "", "a namespace's name is a lower-case letter followed by up to 63"),
         ("a-b", "", "a namespace's name is a lower-case letter followed by up to 63"),
-        ("a", "consistency = \"eventual\"", "consistency = \"eventual\" is not available yet: this release has \"local\" namespaces only (ADR 0085)"),
-        ("a", "consistency = \"strong\"", "consistency = \"strong\" is not available: it is a later phase (ADR 0085 D5); use \"local\""),
-        ("a", "consistency = \"quorum\"", "consistency = \"quorum\": expected \"local\""),
+        ("a", "consistency = \"strong\"", "consistency = \"strong\" is not available: it is a later phase (ADR 0085 D5); use \"local\" or \"eventual\""),
+        ("a", "consistency = \"quorum\"", "consistency = \"quorum\": expected \"local\" or \"eventual\""),
+        ("a", "consistency = \"eventual\"\neviction = \"lru\"", "eviction = \"lru\" is for a \"local\" namespace"),
+        ("a", "tombstone_window = \"1h\"", "tombstone_window is for an \"eventual\" namespace"),
+        ("a", "consistency = \"eventual\"\ntombstone_window = 0", "tombstone_window = 0: expected 1 second to 30 days"),
+        ("a", "consistency = \"eventual\"\ntombstone_window = \"later\"", "tombstone_window: \"later\" is not a duration"),
         ("a", "max_keys = 0", "max_keys = 0: expected 1 to 1000000"),
         ("a", "max_keys = 1000001", "max_keys = 1000001: expected 1 to 1000000"),
         ("a", "max_bytes = \"2MiB\"", "max_bytes = \"2MiB\": expected 1 byte to the store's ceiling, 1048576 bytes (`rules.state_max_bytes`)"),
@@ -338,6 +341,7 @@ fn a_namespace_declaration_is_checked_when_the_file_loads() {
             default_ttl_secs: Some(600),
             max_ttl_secs: 3600,
             eviction: state::Eviction::Lru,
+            tombstone_window_secs: 3600,
         }
     );
     // A rule's own namespace gets `[state.default]`; the store's ceiling (1 MiB here)
@@ -358,6 +362,23 @@ fn a_namespace_declaration_is_checked_when_the_file_loads() {
             ..NamespaceSettings::defaults(1 << 20)
         }
     );
+    // D5: an `eventual` namespace, and how long it remembers a delete.
+    let store = Arc::new(Recorder::default());
+    let text = "[state.shared]\nconsistency = \"eventual\"\ntombstone_window = \"10m\"\n\
+                [state.plain]\nconsistency = \"eventual\"\n\
+                [rules.r]\nsql = '''SELECT 1 AS v FROM \"t/#\"'''\n";
+    load(text, &store).unwrap();
+    let opened = store.opened.lock().unwrap().clone();
+    let settings = |name: &str| opened.iter().find(|(n, _)| n == name).unwrap().1.clone();
+    assert_eq!(
+        settings("shared"),
+        NamespaceSettings {
+            consistency: state::Consistency::Eventual,
+            tombstone_window_secs: 600,
+            ..NamespaceSettings::defaults(1 << 20)
+        }
+    );
+    assert_eq!(settings("plain").tombstone_window_secs, 3600);
 }
 
 #[test]
