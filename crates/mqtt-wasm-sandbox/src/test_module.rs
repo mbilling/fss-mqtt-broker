@@ -113,6 +113,12 @@ pub struct Shape {
     pub answer: Vec<u8>,
     /// How far `s` counts down before it answers.
     pub spin: u32,
+    /// How far `mqttd_alloc` counts down before it allocates (0: not at all): an
+    /// allocator that takes time, in an entry of its own before the call's.
+    pub slow_alloc: u32,
+    /// How far a start function counts down while an instance is made (0: the module
+    /// has no start function).
+    pub slow_start: u32,
 }
 
 impl Default for Shape {
@@ -124,8 +130,25 @@ impl Default for Shape {
             description: b"{}".to_vec(),
             answer: b"jtrue".to_vec(),
             spin: 1,
+            slow_alloc: 0,
+            slow_start: 0,
         }
     }
+}
+
+/// Counts down from `n` (at least 1), thirty-two steps to the count, in the locals
+/// `outer` and `inner`: some ten nanoseconds per count.
+fn countdown(n: u32, outer: u8, inner: u8) -> Vec<u8> {
+    let mut code = Vec::new();
+    konst(n.max(1).cast_signed(), &mut code);
+    // outer = n; loop { inner = 32; loop { inner -= 1; br_if (inner != 0) }
+    // outer -= 1; br_if (outer != 0) }
+    code.extend_from_slice(&[
+        0x21, outer, 0x03, 0x40, // outer = n; loop
+        0x41, 32, 0x21, inner, 0x03, 0x40, 0x20, inner, 0x41, 1, 0x6b, 0x22, inner, 0x0d, 0, 0x0b,
+        0x20, outer, 0x41, 1, 0x6b, 0x22, outer, 0x0d, 0, 0x0b,
+    ]);
+    code
 }
 
 /// The body of `mqttd_call(name, name_len, args, args_len, max_out, ret)`, with three
@@ -168,16 +191,7 @@ fn call_body(shape: &Shape) -> Vec<u8> {
         0x41, 0, 0x0f, // return 0
     ];
     when(b'i', &ident);
-    let mut spin = Vec::new();
-    konst(shape.spin.max(1).cast_signed(), &mut spin);
-    // local 7 = n; loop { local 8 = 32; loop { local 8 -= 1; br_if (local 8 != 0) }
-    // local 7 -= 1; br_if (local 7 != 0) }
-    spin.extend_from_slice(&[
-        0x21, 7, 0x03, 0x40, // local 7 = n; loop
-        0x41, 32, 0x21, 8, 0x03, 0x40, 0x20, 8, 0x41, 1, 0x6b, 0x22, 8, 0x0d, 0, 0x0b, 0x20, 7,
-        0x41, 1, 0x6b, 0x22, 7, 0x0d, 0, 0x0b,
-    ]);
-    when(b's', &spin);
+    when(b's', &countdown(shape.spin, 7, 8));
     set_result(ANSWER_AT, len_of(&shape.answer).cast_signed(), &mut b);
     b.extend_from_slice(&[0x41, 0, 0x0b]);
     b
@@ -189,6 +203,7 @@ fn call_body(shape: &Shape) -> Vec<u8> {
 ///
 /// When the answer or the description is longer than its room.
 #[must_use]
+#[allow(clippy::too_many_lines)] // one section of the module after another
 pub fn module(shape: &Shape) -> Vec<u8> {
     assert!(shape.answer.len() <= MAX_ANSWER, "the answer is too long");
     assert!(
@@ -196,15 +211,18 @@ pub fn module(shape: &Shape) -> Vec<u8> {
         "the description is too long"
     );
     let mut out = b"\0asm\x01\0\0\0".to_vec();
-    // Types: 0 () -> i32, 1 (i32) -> i32, 2 (i32) -> (), 3 (i32 x 6) -> i32.
-    section(
-        1,
-        &[
-            4, 0x60, 0, 1, 0x7f, 0x60, 1, 0x7f, 1, 0x7f, 0x60, 1, 0x7f, 0, 0x60, 6, 0x7f, 0x7f,
-            0x7f, 0x7f, 0x7f, 0x7f, 1, 0x7f,
-        ],
-        &mut out,
-    );
+    // Types: 0 () -> i32, 1 (i32) -> i32, 2 (i32) -> (), 3 (i32 x 6) -> i32, and for a
+    // start function 4 () -> ().
+    let starting = shape.slow_start > 0;
+    let mut types = vec![4 + u8::from(starting)];
+    types.extend_from_slice(&[
+        0x60, 0, 1, 0x7f, 0x60, 1, 0x7f, 1, 0x7f, 0x60, 1, 0x7f, 0, 0x60, 6, 0x7f, 0x7f, 0x7f,
+        0x7f, 0x7f, 0x7f, 1, 0x7f,
+    ]);
+    if starting {
+        types.extend_from_slice(&[0x60, 0, 0]);
+    }
+    section(1, &types, &mut out);
     let imported = u8::from(shape.import.is_some());
     if let Some((from, what)) = shape.import {
         let mut body = vec![1];
@@ -213,8 +231,12 @@ pub fn module(shape: &Shape) -> Vec<u8> {
         body.extend_from_slice(&[0, 1]); // a function of type 1
         section(2, &body, &mut out);
     }
-    // Functions: version, alloc, free, describe, call, recurse.
-    section(3, &[6, 0, 1, 2, 2, 3, 0], &mut out);
+    // Functions: version, alloc, free, describe, call, recurse, and a start function.
+    let mut functions = vec![6 + u8::from(starting), 0, 1, 2, 2, 3, 0];
+    if starting {
+        functions.push(4);
+    }
+    section(3, &functions, &mut out);
     section(5, &[1, 0, 1], &mut out); // one memory, one page, no maximum
     section(6, &[1, 0x7f, 1, 0x41, 0x80, 0x08, 0x0b], &mut out); // global 0: mut i32 = 1024
     let mut exports = Vec::new();
@@ -235,21 +257,31 @@ pub fn module(shape: &Shape) -> Vec<u8> {
     let mut body = vec![count];
     body.extend_from_slice(&exports);
     section(7, &body, &mut out);
+    if starting {
+        section(8, &[imported + 6], &mut out);
+    }
 
     let mut version = vec![0];
     konst(shape.version.cast_signed(), &mut version);
     version.push(0x0b);
     // The old top of the heap is the answer; the top moves up by the length, and the
     // memory grows a page at a time until it holds the new top.
-    let alloc = vec![
-        0, 0x23, 0, 0x23, 0, 0x20, 0, 0x6a, 0x24, 0, // old top; top += len
+    let mut alloc = if shape.slow_alloc > 0 {
+        let mut slow = vec![1, 2, 0x7f]; // two extra locals, both i32
+        slow.extend_from_slice(&countdown(shape.slow_alloc, 1, 2));
+        slow
+    } else {
+        vec![0]
+    };
+    alloc.extend_from_slice(&[
+        0x23, 0, 0x23, 0, 0x20, 0, 0x6a, 0x24, 0, // old top; top += len
         // The loop is entered only when the memory must grow: a loop is where the
         // runtime looks at the clock, and an allocation that fits has nothing to wait for.
         0x3f, 0, 0x41, 16, 0x74, 0x23, 0, 0x49, 0x04, 0x40, // if (pages << 16) < top
         0x03, 0x40, 0x41, 1, 0x40, 0, 0x1a, // loop: grow one page
         0x3f, 0, 0x41, 16, 0x74, 0x23, 0, 0x49, 0x0d, 0, // again while still short
         0x0b, 0x0b, 0x0b,
-    ];
+    ]);
     let free = vec![0, 0x0b];
     let mut describe = vec![0];
     let described = len_of(&shape.description).cast_signed();
@@ -267,8 +299,15 @@ pub fn module(shape: &Shape) -> Vec<u8> {
         }
     }
     let recurse = vec![0, 0x10, imported + 5, 0x0b];
-    let mut code = vec![6];
-    for function in [version, alloc, free, describe, call, recurse] {
+    let mut bodies = vec![version, alloc, free, describe, call, recurse];
+    if starting {
+        let mut start = vec![1, 2, 0x7f]; // two locals, both i32
+        start.extend_from_slice(&countdown(shape.slow_start, 0, 1));
+        start.push(0x0b);
+        bodies.push(start);
+    }
+    let mut code = vec![u8::try_from(bodies.len()).unwrap_or_default()];
+    for function in bodies {
         uleb(len_of(&function), &mut code);
         code.extend_from_slice(&function);
     }

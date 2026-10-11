@@ -1706,15 +1706,17 @@ node with it off refuses a rules file its neighbours load):
 jq = true                        # MQTTD_RULES_JQ=1
 # jq_default_timeout_ms = 10000  # what jq/2 runs under: EMQX's default, ten seconds
 # jq_env = ["SITE"]              # the only variables $ENV and env show a program
+# function_max_ms = 10000        # the longest any one jq or module call may run
 ```
 
 | Key | Environment | Default | |
 |---|---|---|---|
 | `rules.jq` | `MQTTD_RULES_JQ` | `false` | Whether rules may call `jq`. |
-| `rules.jq_default_timeout_ms` | `MQTTD_RULES_JQ_DEFAULT_TIMEOUT_MS` | `10000` | The timeout of `jq/2`, in milliseconds; `jq/3` names its own. |
+| `rules.jq_default_timeout_ms` | `MQTTD_RULES_JQ_DEFAULT_TIMEOUT_MS` | `10000` | The timeout of `jq/2`, in milliseconds; `jq/3` names its own. At most `rules.function_max_ms`. |
 | `rules.jq_env` | `MQTTD_RULES_JQ_ENV` (`,`-separated) | empty | The environment variables a program reads as `$ENV.NAME` or `env.NAME`. |
+| `rules.function_max_ms` | `MQTTD_RULES_FUNCTION_MAX_MS` | `10000` | The ceiling: the longest any one call of `jq`, or of a function of [a module of your own](#your-own-functions-functionsname), may run, in milliseconds, 1 to 600000. `jq/3` cannot ask for more, whatever its third argument says or a payload supplies ([Long jq calls](#long-jq-calls)). |
 
-All three are read at startup; a reload reports a change to them as needing a restart.
+All four are read at startup; a reload reports a change to them as needing a restart.
 `--check-rules` and `--rule-test` read them from the effective configuration (`--config`,
 `MQTTD_*`), so a file or a statement is checked as the broker would load it.
 
@@ -1723,6 +1725,23 @@ is far more than a program over one message needs (a call on a 1 KB payload take
 under a millisecond), and a call holds a thread and an instance's memory for as long as
 it runs ([Long jq calls](#long-jq-calls)). Unless a ported rule depends on it, set
 `jq_default_timeout_ms` to what your slowest program needs, with room: `100` is generous.
+
+`function_max_ms` is the bound nothing in a rule or a payload can raise. `jq/2` runs
+under `jq_default_timeout_ms` and `jq/3` under its third argument, and both under the
+ceiling: a `jq/3` that asks for more **runs, with the ceiling as its timeout**, and if
+it is still running then it fails as any timeout does, with the ceiling's milliseconds
+in the error. A program that ends in time is not affected, whatever it asked for. With
+`jq` on, a `jq_default_timeout_ms` above the ceiling is a configuration error that names
+both keys, so lower the two together:
+
+```console
+$ MQTTD_RULES_JQ=1 MQTTD_RULES_FUNCTION_MAX_MS=200 mqttd --check-config
+config INVALID: invalid configuration: rules.jq_default_timeout_ms (MQTTD_RULES_JQ_DEFAULT_TIMEOUT_MS) is 10000, more than rules.function_max_ms (MQTTD_RULES_FUNCTION_MAX_MS), the 200 ms any one jq or module call may take: lower the first or raise the second
+```
+
+`mqttd --check-config` prints the ceiling in force (`rules.function_max_ms is 200: no jq
+or module call runs longer, whatever a rule or a payload asks for`), and
+`GET /admin/v1/rules` has it as `function_max_ms`.
 
 #### What jq needs from the host
 
@@ -1834,8 +1853,8 @@ turns into "no result", so a `WHERE` is never passed because a call was cut off.
 
 | Limit | Value | The rule's error | `kind` |
 |---|---|---|---|
-| Time | `jq/2`: `rules.jq_default_timeout_ms`. `jq/3`: its third argument. A call always gets one millisecond, so a timeout of `0` still runs what is quick, as in EMQX | `jq(): timeout: jq program canceled as it took too long time to execute (timeout set to 50 ms)` (EMQX's text) | `timeout` |
-| Compiling a program | 5 s per program; outside the timeout above, as in EMQX. One compilation takes about a millisecond | `jq(): sandbox_limit (compile_timeout): jq stopped: compiling the program took longer than 5000 ms` | `compile_timeout` |
+| Time | `jq/2`: `rules.jq_default_timeout_ms`. `jq/3`: its third argument. Either way at most the broker's ceiling, `rules.function_max_ms` (10 s unless set): a `jq/3` that asks for more, or for a timeout that never comes (2^63 ms and above), runs under the ceiling. A call always gets one millisecond, so a timeout of `0` still runs what is quick, as in EMQX | `jq(): timeout: jq program canceled as it took too long time to execute (timeout set to 50 ms)` (EMQX's text). The number is what the call ran under: the ceiling's, where the ceiling cut it | `timeout` |
+| Compiling a program | 5 s per program; outside the timeout above, as in EMQX, but inside the ceiling: a call that has to compile its program first ends at `rules.function_max_ms` all the same. One compilation takes about a millisecond | `jq(): sandbox_limit (compile_timeout): jq stopped: compiling the program took longer than 5000 ms`, or `… compiling the program ran into the 200 ms one call may take` | `compile_timeout` |
 | Memory | 64 MiB per instance, which is per call: one call runs in one instance | `jq(): sandbox_limit (memory): jq stopped: the module reached its memory limit` | `memory` |
 | Output | What is left of the message's 1 MiB build budget, which all function calls of one message share. A call's output is charged whole, so `jq('.', payload)` on a 600 KB payload passes once in a statement and fails the second time | `jq(): sandbox_limit (output): jq output is larger than the limit` | `output` |
 | Stack | 4 MiB of call stack, and 1 MiB of C stack inside the module's memory. `reduce range(20000) as $i (null; [.]) \| 1`, which ends an EMQX 6.3.1 node, returns `[1]`; at 300,000 deep the call fails | `jq(): sandbox_limit (stack): …`, or, when it is the C stack that runs out, `jq(): jq_err_system: the module trapped: … out of bounds memory access` | `stack`, `trap` |
@@ -1863,6 +1882,7 @@ EMQX).
 | Stack | The NIF's C stack: `reduce range(20000) as $i (null; [.])` ends an EMQX 6.3.1 node | 4 MiB; that program returns its result, and a deeper one fails the rule |
 | Compiling a program | Unbounded | 5 s per program (one takes about a millisecond) |
 | The timeout | Seen only between two steps of a program: one long regex match is never stopped | Always stops the call |
+| The longest a call may run | Whatever `jq/3`'s third argument says, which may come from a payload: any number of milliseconds below 2^64, and from 2^63 a timer that never fires | `rules.function_max_ms`, 10 s unless set. A `jq/3` that asks for more runs under the ceiling and, if cut there, fails with EMQX's `timeout` naming the ceiling. Only a call that would have run longer than the ceiling can tell. What EMQX answers for a bad third argument (`bad_timeout_val`, `{badmatch,{error,badarg}}`) is the same |
 | A wrong number of arguments | Fails the rule on each message | Fails the load |
 | Transcendental functions | glibc's | musl's: of 135 probed values, 18 differ in the last one or two digits (`tgamma`, `cbrt`, `exp10`, `j0`, `lgamma`, `y0`, `log10`, `tan`). `pow`, `sqrt`, `sin`, `cos`, `exp`, `log`, `atan`, the rounding functions and all arithmetic gave the same digits |
 | `strptime` with `%z` | Parses the offset | Fails the rule (`jq_err_process: … does not match format …`) |
@@ -1901,14 +1921,43 @@ its PUBACK, and its next packets wait behind it. Measured with one worker thread
 one connection's `jq` ran into the ten-second timeout, another completed 6,974 QoS 1
 publishes, median 152 µs, slowest 6.2 ms (Apple M1 Pro, debug build).
 
-**There is no cap on how many calls run long at once.** Each occupies a thread, up to the
-runtime's limit on blocking threads (tokio's default of 512; mqttd does not change it),
-and an instance of up to 64 MiB, beyond the warm ones. A publisher runs one call at a
-time, so the bound in practice is how many connections may publish to a rule's topics at
-the same moment, each for as long as its timeout allows. What keeps that small is yours
-to set: a low `rules.jq_default_timeout_ms`, literal timeouts in `jq/3`, programs written
-in the rules file and not taken from payloads, the ACL on the topics such rules select,
-and a memory limit on the service (the shipped unit's `MemoryMax`, a container limit).
+**No call runs longer than the ceiling, `rules.function_max_ms`** (10 s unless set):
+not a `jq/2`, not a `jq/3` whatever timeout it names, not a module's function. A rule
+such as `jq(payload.program, payload.data, payload.ms)` is legal, as in EMQX, and there
+the publisher chooses how long the node works on one message; here the publisher's
+number is honoured up to the ceiling and no further. The ceiling is on the whole call:
+compiling a program the instance has not seen and making an instance for the call are
+inside it. A call ends within a few milliseconds of the ceiling (under 50 ms at the very
+most: each of the handful of steps a call consists of may finish what it is doing).
+
+**There is no cap on how many calls run long at once**, and that is a decision: the
+bound is on the time each may take, not on their number
+([ADR 0086](adr/0086-wasm-rule-functions.md#2026-10-11--a-ceiling-on-how-long-any-one-call-may-run-rulesfunction_max_ms)).
+Each long call occupies a thread, up to the runtime's limit on blocking threads
+(tokio's default of 512; mqttd does not change it), and an instance of up to 64 MiB
+(a module's: its `memory_mib`), beyond the warm ones. A publisher runs one call at a
+time. So the worst case is
+
+    calls running long at once × memory per call, each held for at most the ceiling
+
+where the first factor is at most the number of connections publishing to such a rule
+at the same moment, and at most 512. With everything at its default and jq programs that
+fill their memory, that is 512 × 64 MiB = 32 GiB, each call for up to 10 s. The ceiling
+does not lower that peak. It bounds what one message can buy: at 10 s, a publisher holds
+a thread and an instance with one message every ten seconds; at `function_max_ms = 100`
+it has to send ten a second to that rule for as long as it wants them held, which is a
+rate your ACL, your connection limits and your monitoring can see, and everything is
+released a tenth of a second after it stops. What keeps the product small is yours to
+set:
+
+- the ceiling, at what your slowest program or function needs, with room (and
+  `rules.jq_default_timeout_ms` with it);
+- a module's `memory_mib`; for `jq`, programs written in the rules file and not taken
+  from payloads;
+- the ACL on the topics such rules select, and how many connections may exist;
+- a memory limit on the service (the shipped unit's `MemoryMax`, a container limit),
+  which is the only bound on the product itself.
+
 A Will's rules run on a task of their own while the loaded rules call `jq`. Message
 events about clients that are not connected are evaluated by one task, so a long call in
 such a rule delays the events queued behind it and nothing else.
@@ -1964,7 +2013,7 @@ there.** A module is declared by a table beside the rules:
 wasm = "plugins/geo.wasm"        # under the directory of the rules file
 sha256 = "88aa6c6d…"             # the file's SHA-256, 64 hex digits: any other content fails the load
 functions = ["geo_distance", "geo_within"]   # the functions rules may call, among those the module describes
-timeout_ms = 50                  # how long one call may run; default 100, at most 10000
+timeout_ms = 50                  # how long one call may run; default 100, at most the broker's rules.function_max_ms
 memory_mib = 16                  # the most memory one instance may hold; default 16, at most 64
 clock = false                    # true: the module reads the wall clock; false: every clock reads 0
 env = []                         # environment variables the module sees; see below
@@ -2053,7 +2102,7 @@ kind, and the message is still routed.
 
 | Limit | Value | The error, counted as |
 |---|---|---|
-| Time | `timeout_ms` per call | `sandbox_limit (timeout): the call ran past its 50 ms …`, `timeout` |
+| Time | `timeout_ms` per call, at most the broker's ceiling `rules.function_max_ms` (10000 unless set): a table that asks for more does not load, and the error names both. A table that does not say gets 100 ms, or the ceiling where that is lower. The whole call is under it, an instance made for it included | `sandbox_limit (timeout): the call ran past its 50 ms …`, `timeout` |
 | Memory | `memory_mib` per instance | `sandbox_limit (memory): …`, `memory` |
 | Output | what is left of the message's 1 MiB build budget; each call's result is charged to it whole | `sandbox_limit (output): …`, `output` |
 | Stack | 4 MiB of call stack | `sandbox_limit (stack): …`, `stack` |
@@ -2062,9 +2111,10 @@ kind, and the message is still routed.
 
 A call that runs for more than a millisecond holds its own publisher's connection and
 nobody else's, as for `jq`, and as for `jq` nothing caps how many such calls run at once:
-each holds a thread and an instance of up to `memory_mib`
-([Long jq calls](#long-jq-calls)). Keep `timeout_ms` and `memory_mib` at what the function
-needs; the defaults (100 ms, 16 MiB) are already far below the ceilings (10 s, 64 MiB).
+each holds a thread and an instance of up to `memory_mib`, for at most its `timeout_ms`
+([Long jq calls](#long-jq-calls), which has the arithmetic). Keep `timeout_ms` and
+`memory_mib` at what the function needs; the defaults (100 ms, 16 MiB) are already far
+below the ceilings (`rules.function_max_ms`, 10 s unless set; 64 MiB).
 
 The series are `jq`'s, with the function's and the module's
 names: `mqttd_rule_function_calls_total{function}`,
@@ -2648,7 +2698,7 @@ EMQX fails on each message, and statements only mqttd accepts.
 | `kv_store_put`, `kv_store_get`, `kv_store_del` | One table per node that grows until the node runs out of memory; a wrong argument count fails the rule on each message; the SQL test writes the node's real table | The same table and the same results, but bounded: a key of at most 256 bytes and a value of at most 4 KiB as JSON, 100,000 keys and 64 MiB unless `[state.kv_store]` says otherwise, under `rules.state_max_bytes`; past a bound the call fails the rule, where EMQX would have stored the value. A wrong argument count fails the load, as for every function. A dry run (`--rule-test`, the admin API's rule test) works on an empty table of its own. `rules.state_max_bytes = 0` switches it off: a rules file that calls them then does not load ([State](#state-what-a-rule-remembers)) |
 | `proc_dict_put`, `proc_dict_get`, `proc_dict_del` | The dictionary of the process that evaluates the rule: the client's connection process, for its publishes and what their rules republish, its events, the deliveries to it and its Will. It grows until the node runs out of memory. A session that outlives its connection keeps the process and the dictionary until it is resumed. A wrong argument count fails the rule on each message | The same results on one dictionary per client connection, for everything that connection evaluates, but bounded: 64 keys, and 64 KiB of keys and values as JSON, counted against `rules.state_max_bytes`; past a bound the call fails the rule, where EMQX would have stored the value. The dictionary is gone when the connection ends. Three evaluations have no connection to run on and get an empty dictionary that is discarded afterwards, where EMQX's still see the client's: a Will's rules; an event about a session that has no connection (`delivery_dropped` for an offline session); `message/dropped` for a message a rule republished, or for a Will. A wrong argument count fails the load, as for every function. A dry run works on an empty dictionary of its own, as each SQL test over EMQX's API does. `rules.state_max_bytes = 0` switches them off: a rules file that calls them then does not load ([State](#state-what-a-rule-remembers)) |
 | State of mqttd's own (mqttd-only extension) | None. `kv_get`, `kv_set`, `kv_set_once`, `kv_incr`, `kv_max`, `kv_min`, `kv_add`, `kv_del`, `kv_ttl`, `kv_held` and `kv_changed` are unknown functions, and `[state.<name>]` and the rule key `state` are not EMQX configuration | Typed, expiring, bounded keys in namespaces the rules file declares. A rule that uses them does not port back to EMQX |
-| `jq` | A NIF in the broker's own process: always on, with no limit on memory, output or stack, the broker's whole environment in `$ENV`, and a timeout that cannot stop a program inside one long C call | The same jq in a WebAssembly sandbox, with EMQX's results, tags and texts, but **off unless `rules.jq = true`** (a rules file that calls it then fails to load), and needing a host that allows executable memory. 64 MiB of memory, 4 MiB of stack, an output charged to the message's 1 MiB build budget, a 5 s bound on compiling a program, `$ENV` empty unless variables are listed in `rules.jq_env` (a ported rule that reads `$ENV.X` gets `null` until `X` is listed), a timeout that always stops the call, a wrong number of arguments refused at load instead of on each message; the last one or two digits of some transcendental functions differ (musl's libm against glibc's), `strptime` fails on `%z`, `strftime("%Z")` of a UTC time is `UTC` where EMQX's is `GMT`, and local time is UTC. Each limit fails the rule for that message, with its kind counted ([Limits of jq](#limits-of-jq-and-what-happens-at-each), [the whole table](#jq)) |
+| `jq` | A NIF in the broker's own process: always on, with no limit on memory, output or stack, the broker's whole environment in `$ENV`, and a timeout that cannot stop a program inside one long C call | The same jq in a WebAssembly sandbox, with EMQX's results, tags and texts, but **off unless `rules.jq = true`** (a rules file that calls it then fails to load), and needing a host that allows executable memory. 64 MiB of memory, 4 MiB of stack, an output charged to the message's 1 MiB build budget, a 5 s bound on compiling a program, `$ENV` empty unless variables are listed in `rules.jq_env` (a ported rule that reads `$ENV.X` gets `null` until `X` is listed), a timeout that always stops the call and is never longer than `rules.function_max_ms` (10 s unless set) whatever `jq/3`'s third argument or a payload asks for, a wrong number of arguments refused at load instead of on each message; the last one or two digits of some transcendental functions differ (musl's libm against glibc's), `strptime` fails on `%z`, `strftime("%Z")` of a UTC time is `UTC` where EMQX's is `GMT`, and local time is UTC. Each limit fails the rule for that message, with its kind counted ([Limits of jq](#limits-of-jq-and-what-happens-at-each), [the whole table](#jq)) |
 | Functions supplied as modules (mqttd-only extension) | None. A rules file with a `[functions.<name>]` table is not EMQX configuration | A rules file may declare WebAssembly modules, each pinned by its SHA-256, whose functions rules call; they run in the sandbox under time, memory, output and stack limits. A module cannot take the name of a built-in function or of any function of EMQX's rule engine, so it never changes what a rule written for EMQX means. A module is read only from under the rules file's directory, sees no file, socket or host function, the clock only with `clock = true` and only the environment variables `rules.functions_env` allows. A rules file that declares one does not load in EMQX ([Your own functions](#your-own-functions-functionsname)) |
 | Regular expressions | Erlang `re`: PCRE2 10.47 (OTP 28) on bytes, compiled per call | PCRE2 10.46 on bytes, with OTP's compile options, match and depth limits and global-match loop: the same syntax and results ([above](#functions)). A match needing more than 64 MiB of backtracking memory is no match (OTP allows 20 GB); a pattern nesting parentheses more than 250 deep does not compile (OTP's limit is 10,000, though PCRE2's own workspace stops most such patterns below 2,000). A literal pattern is compiled once, when the file loads (one that does not compile warns), and a rules file holds at most 512 distinct ones, 256 KiB together. |
 | `sprintf` `~p` / `~P` of a long list, map or non-printable binary | `io_lib_pretty` breaks it across lines once it reaches the line width (80 columns, or the field width) | Printed on one line (`~0p`, which never breaks, is the same in both) |
@@ -2723,6 +2773,8 @@ from loading. Its `TODO(migrate)` line says what to do. In full:
    systemd unit, `MemoryDenyWriteExecute=false`).
 2. EMQX's `rule_engine.jq_function_default_timeout` is not converted; it is reported.
    Set `[rules] jq_default_timeout_ms` (milliseconds; the default is EMQX's ten seconds).
+   No call runs longer than `[rules] function_max_ms` (ten seconds unless set), so a
+   rule whose `jq/3` names a longer timeout, or takes it from the payload, is cut there.
 3. List in `[rules] jq_env` every variable your programs read through `$ENV` or `env`:
    EMQX shows a program the broker's whole environment, mqttd none unless listed.
 4. Uncomment the rule and run `mqttd --check-rules`, with the switch on, on a host like

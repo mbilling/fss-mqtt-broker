@@ -63,8 +63,8 @@ pub use input::{
 pub use jq::{FunctionCall, Functions, HandOff, Jq, JqSettings, JqSwitch, ModuleStats};
 pub use plugin::{
     emqx_only_function_names, reserved as reserved_function_name, Module, ModuleFunction,
-    ModuleHost, ModuleSettings, DEFAULT_MEMORY_MIB, DEFAULT_TIMEOUT_MS, MAX_FUNCTIONS_PER_MODULE,
-    MAX_MEMORY_MIB, MAX_MODULES, MAX_MODULE_BYTES, MAX_TIMEOUT_MS,
+    ModuleHost, ModuleSettings, DEFAULT_FUNCTION_MAX_MS, DEFAULT_MEMORY_MIB, DEFAULT_TIMEOUT_MS,
+    MAX_FUNCTIONS_PER_MODULE, MAX_MEMORY_MIB, MAX_MODULES, MAX_MODULE_BYTES,
 };
 pub use state::{StateStore, StateSwitch, MAX_STATE_CALLS_PER_TRIGGER};
 pub use value::{json_decode, Map, Value};

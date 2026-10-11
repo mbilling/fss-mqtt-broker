@@ -239,3 +239,28 @@ documentation for operators, the threat model and the hardening baseline, is in 
   - **Not decided, still:** the cap on concurrent long calls. It is documented as it
     behaves, as an accepted risk with the operator's mitigations (low timeouts, low
     `memory_mib`, the ACL, a memory limit on the process).
+- 2026-10-11 — **Decided: a ceiling on how long any one call may run**, not a limit on
+  how many run at once (ADR amendment of the same date). What T2, T3 and T4 left open
+  is closed on the side of time:
+  - **The key.** `rules.function_max_ms` (`MQTTD_RULES_FUNCTION_MAX_MS`), default 10000,
+    1 to 600000, read at startup. No `jq/2`, no `jq/3` whatever its third argument (it
+    may come from a payload), and no module function runs longer.
+  - **`jq/3` above the ceiling is clamped**: the call runs under the ceiling and, cut
+    there, fails with EMQX's `timeout` naming the ceiling's milliseconds; a program that
+    ends in time is unaffected, and EMQX's answers for a bad third argument are as
+    pinned. In RULES.md's differences.
+  - **A configured bound above the ceiling is an error naming both keys**, as a
+    namespace's `max_bytes` above `rules.state_max_bytes` is: a module's `timeout_ms`
+    fails the rules file's load; `rules.jq_default_timeout_ms` is refused by the
+    configuration's validation where `rules.jq` is on. A table without `timeout_ms`
+    gets 100 ms or the ceiling, whichever is lower.
+  - **Per call, not per entry.** One deadline from the call's start, which now also
+    stops compiling a jq program in a call (otherwise 5 s) and making an instance for a
+    call (otherwise `init_timeout`, 5 s). Margin: under 50 ms at the very most.
+  - **Seen** in `--check-config`, `GET /admin/v1/rules` (`function_max_ms`) and the
+    startup line; the error counter does not tell a clamp from a rule's own timeout
+    (`kind="timeout"` either way), the error text does.
+  - **Still not bounded:** the number of concurrent long calls, by decision. The worst
+    moment is unchanged (calls in flight × memory per call); each call's share of it now
+    ends. THREAT-MODEL.md: the payload-chosen timeout is a mitigated row; concurrency
+    stays an accepted risk, bounded in time per call.

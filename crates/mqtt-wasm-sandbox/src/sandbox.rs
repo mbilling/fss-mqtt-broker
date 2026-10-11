@@ -81,6 +81,19 @@ pub struct Limits {
     /// How long a call runs before it is suspended once and the rest of it is given to
     /// the module's [`HandOff`]. Nothing is suspended in a module without one.
     pub first_slice: Duration,
+    /// The longest one call of a function may take as a whole, whatever deadline its
+    /// caller asks for: every entry the host makes into the module for it (allocate,
+    /// call, free), and what the call has to make first when it finds none (an
+    /// instance; for `jq`, a compiled program). Held by the two things that are one
+    /// call of a rule function, [`ModulePool::call`](crate::ModulePool::call) and
+    /// [`jq::Pool::eval_within`](crate::jq::Pool::eval_within); an [`Instance`] on its
+    /// own knows only the deadline it is given. `None`: no such ceiling.
+    ///
+    /// An entry that starts with the ceiling passed still gets [`min_run`](Self::min_run)
+    /// and, of a module that can be asked to stop, [`cancel_grace`](Self::cancel_grace):
+    /// together three milliseconds by default, and a call has a handful of entries
+    /// left by then, so a call ends within some tens of milliseconds of its ceiling.
+    pub max_call: Option<Duration>,
 }
 
 /// What a caller wraps the rest of a long call in ([`Sandbox::with_hand_off`]): it is
@@ -100,6 +113,7 @@ impl Default for Limits {
             init_timeout: Duration::from_secs(5),
             max_fuel: None,
             first_slice: Duration::from_millis(1),
+            max_call: None,
         }
     }
 }
@@ -492,6 +506,13 @@ impl Sandbox {
 
     /// A fresh instance: its own memory, nothing shared with any other.
     pub fn instantiate(&self) -> Result<Instance, LoadError> {
+        self.instantiate_within(None)
+    }
+
+    /// [`instantiate`](Self::instantiate) for a call that has `deadline` as a whole:
+    /// the module's start (data segments, a start function, constructors) is stopped
+    /// at [`Limits::init_timeout`] or at `deadline`, whichever comes first.
+    pub fn instantiate_within(&self, deadline: Option<Instant>) -> Result<Instance, LoadError> {
         let host = Host {
             grants: self.grants.clone(),
             discarded_output: 0,
@@ -509,6 +530,7 @@ impl Sandbox {
         store.limiter(|host| &mut host.limiter);
         store.epoch_deadline_callback(at_epoch);
         let within = Instant::now() + self.limits.init_timeout;
+        let within = deadline.map_or(within, |at| at.min(within));
         let start = |e: wasmtime::Error| LoadError::Start(classify(&e));
         // Data segments and a start function, when the module has one.
         let instance = {

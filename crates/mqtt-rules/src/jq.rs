@@ -19,6 +19,10 @@
 //!
 //! Not EMQX's: the sandbox's limits (ADR 0086 D7), with the output of a call charged
 //! to the message's build budget, and an environment that is empty unless listed (D8).
+//! Nor is the broker's ceiling on one call ([`JqSettings::max_call`],
+//! `rules.function_max_ms`): a call runs under its timeout or the ceiling, whichever is
+//! shorter, so a `jq/3` whose third argument is larger (it may come from a payload) is
+//! stopped at the ceiling, with EMQX's `timeout` error naming the ceiling.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -35,8 +39,14 @@ pub type HandOff = Arc<dyn Fn(&mut dyn FnMut()) + Send + Sync>;
 /// How `jq` runs once it is switched on.
 #[derive(Clone)]
 pub struct JqSettings {
-    /// What `jq/2` runs under (EMQX's `rule_engine.jq_function_default_timeout`).
+    /// What `jq/2` runs under (EMQX's `rule_engine.jq_function_default_timeout`). Never
+    /// more than `max_call`: a broker refuses such a configuration, and here the
+    /// shorter of the two holds.
     pub default_timeout: Duration,
+    /// The longest any one call may take, whatever `jq/3`'s third argument asks for:
+    /// the broker's `rules.function_max_ms`. It covers the whole call, compiling a
+    /// program the instance has not seen included.
+    pub max_call: Duration,
     /// What `$ENV` and `env` hold inside jq, as (name, value): nothing unless listed.
     pub environment: Vec<(String, String)>,
     /// How many warm instances are kept between calls: a broker's worker threads.
@@ -51,6 +61,7 @@ impl std::fmt::Debug for JqSettings {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("JqSettings")
             .field("default_timeout", &self.default_timeout)
+            .field("max_call", &self.max_call)
             // Names only: a value may be a secret.
             .field(
                 "environment",
@@ -66,6 +77,7 @@ impl Default for JqSettings {
     fn default() -> Self {
         Self {
             default_timeout: Duration::from_secs(10),
+            max_call: Duration::from_millis(crate::plugin::DEFAULT_FUNCTION_MAX_MS),
             environment: Vec::new(),
             instances: 1,
             hand_off: None,
@@ -186,6 +198,17 @@ impl Functions {
         self.dir.as_deref()
     }
 
+    /// The longest one call of a sandboxed function may take on this broker
+    /// (`rules.function_max_ms`): `jq`'s and every module's. `None` where neither is
+    /// set up.
+    #[must_use]
+    pub fn max_call(&self) -> Option<Duration> {
+        self.modules
+            .as_ref()
+            .map(|host| host.max_call())
+            .or_else(|| self.jq().map(|jq| jq.max_call()))
+    }
+
     /// The running `jq`, when it is switched on.
     #[must_use]
     pub fn jq(&self) -> Option<&Arc<Jq>> {
@@ -249,6 +272,7 @@ pub struct Jq {
     /// `jq`: the function's name and its module's.
     name: Arc<str>,
     default_timeout: Duration,
+    max_call: Duration,
     #[cfg(feature = "jq")]
     pool: mqtt_wasm_sandbox::jq::Pool,
 }
@@ -257,6 +281,7 @@ impl std::fmt::Debug for Jq {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Jq")
             .field("default_timeout", &self.default_timeout)
+            .field("max_call", &self.max_call)
             .field("stats", &self.stats())
             .finish_non_exhaustive()
     }
@@ -341,6 +366,7 @@ impl Jq {
             };
             let limits = Limits {
                 max_output_bytes: u32::try_from(crate::funcs::MAX_BUILT_BYTES).unwrap_or(u32::MAX),
+                max_call: Some(settings.max_call),
                 ..Limits::default()
             };
             let mut pool = jq::Pool::new(
@@ -355,7 +381,8 @@ impl Jq {
             }
             Ok(Self {
                 name: Arc::from("jq"),
-                default_timeout: settings.default_timeout,
+                default_timeout: settings.default_timeout.min(settings.max_call),
+                max_call: settings.max_call,
                 pool,
             })
         }
@@ -375,6 +402,12 @@ impl Jq {
     #[must_use]
     pub fn default_timeout(&self) -> Duration {
         self.default_timeout
+    }
+
+    /// The longest any one call may take, whatever timeout it names.
+    #[must_use]
+    pub fn max_call(&self) -> Duration {
+        self.max_call
     }
 
     /// Whether the module has been compiled: whether any rules file that calls `jq`
@@ -465,8 +498,10 @@ impl Jq {
         }
     }
 
-    /// One call: `program` on `input`, under `timeout` (`None`: no deadline), with at
-    /// most `max_output` bytes of result. The text of a JSON array of the outputs.
+    /// One call: `program` on `input`, under `timeout` (`None`: as long as a call
+    /// may take at all, [`max_call`](Self::max_call), which also holds a longer
+    /// `timeout`), with at most `max_output` bytes of result. The text of a JSON array
+    /// of the outputs.
     pub(crate) fn call(
         &self,
         program: &[u8],

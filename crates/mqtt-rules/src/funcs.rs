@@ -720,7 +720,8 @@ fn jq_call(jq: &crate::jq::Jq, a: &[Value], cx: &FnCtx) -> Result<Value, crate::
             u64::try_from(*ms).unwrap_or(u64::MAX),
         )),
         // An integer of 64 bits or fewer is a timeout Erlang's timer takes, and one
-        // that never comes.
+        // that never comes: here the call runs under the broker's ceiling on one call,
+        // as does any timeout longer than that (`Jq::call`).
         Some(Value::Big(ms)) if ms.sign() == num_bigint::Sign::Plus && ms.bits() <= 64 => None,
         // Past that `timer:apply_after/4` refuses it and the NIF's match on its
         // answer fails.

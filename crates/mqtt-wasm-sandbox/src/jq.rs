@@ -12,6 +12,12 @@
 //!   looks at the cancel flag only between a program's steps. Here compiling runs
 //!   under a bound of its own instead ([`COMPILE_TIMEOUT`]).
 //!
+//! Not EMQX's: a module loaded with [`Limits::max_call`] holds every call to that
+//! ceiling, whatever timeout the call names. The call runs under the shorter of the
+//! two, a call stopped there fails with the same `timeout` and names the bound it ran
+//! under, and the ceiling, unlike the timeout, also covers compiling the program and
+//! making the instance.
+//!
 //! [`Jq`] is the function for one caller, with one warm instance. [`Pool`] is what a
 //! broker holds: the module, compiled on first use, and the warm instances its
 //! callers take turns on.
@@ -244,10 +250,21 @@ impl Jq {
         max_output: u32,
     ) -> Result<Vec<u8>, JqError> {
         let started = Instant::now();
-        // A timeout no clock can hold (EMQX accepts any integer below 2^64) is none.
-        let deadline = timeout.and_then(|t| started.checked_add(t));
+        // The call runs under its timeout or the module's ceiling, whichever is
+        // shorter: one deadline for all of it.
+        let most = self.sandbox.limits().max_call;
+        let timeout = match (timeout, most) {
+            (Some(own), Some(most)) => Some(own.min(most)),
+            (own, most) => own.or(most),
+        };
+        let bounds = Bounds {
+            // A timeout no clock can hold (EMQX accepts any integer below 2^64) is none.
+            deadline: timeout.and_then(|t| started.checked_add(t)),
+            timeout,
+            ceiling: most.and_then(|most| Some((started.checked_add(most)?, most))),
+        };
         self.last = Timing::default();
-        let result = self.eval_on_instance(program, input, deadline, timeout, max_output);
+        let result = self.eval_on_instance(program, input, bounds, max_output);
         self.let_go_of_a_stopped_instance();
         result
     }
@@ -256,8 +273,8 @@ impl Jq {
     /// broker does with the programs its rules spell out, when the rules are loaded.
     pub fn compile(&mut self, program: &[u8]) -> Result<(), JqError> {
         let result = self
-            .warm_instance()
-            .and_then(|instance| compile(instance, program, None));
+            .warm_instance(None)
+            .and_then(|instance| compile(instance, program, Bounds::default()));
         self.let_go_of_a_stopped_instance();
         result.map(|_| ())
     }
@@ -273,13 +290,14 @@ impl Jq {
         }
     }
 
-    /// The warm instance, made now when there is none.
-    fn warm_instance(&mut self) -> Result<&mut Instance, JqError> {
+    /// The warm instance, made now when there is none (within `ceiling`, when the
+    /// call it is made for has one).
+    fn warm_instance(&mut self, ceiling: Option<Instant>) -> Result<&mut Instance, JqError> {
         if self.instance.is_none() {
             let at = Instant::now();
             let made = self
                 .sandbox
-                .instantiate()
+                .instantiate_within(ceiling)
                 .map_err(|e| JqError::system(e.to_string()))?;
             self.instance = Some(made);
             self.instances += 1;
@@ -294,11 +312,13 @@ impl Jq {
         &mut self,
         program: &[u8],
         input: Arg<'_>,
-        deadline: Option<Instant>,
-        timeout: Option<Duration>,
+        bounds: Bounds,
         max_output: u32,
     ) -> Result<Vec<u8>, JqError> {
-        let instance = self.warm_instance()?;
+        let Bounds {
+            deadline, timeout, ..
+        } = bounds;
+        let instance = self.warm_instance(bounds.ceiling.map(|(at, _)| at))?;
         let args = [Arg::Binary(program), input];
         let at = Instant::now();
         let mut reply = instance.call_within("jq", &args, deadline, max_output);
@@ -310,7 +330,7 @@ impl Jq {
                 ..
             })
         ) {
-            compiling = compile(instance, program, timeout)?;
+            compiling = compile(instance, program, bounds)?;
             reply = instance.call_within("jq", &args, deadline, max_output);
         }
         self.last.compile = compiling;
@@ -323,30 +343,47 @@ impl Jq {
     }
 }
 
-/// Compiles `program` into `instance`'s cache, under [`COMPILE_TIMEOUT`]; how long it
-/// took.
-fn compile(
-    instance: &mut Instance,
-    program: &[u8],
+/// What one call runs under.
+#[derive(Debug, Clone, Copy, Default)]
+struct Bounds {
+    /// When the program is stopped: the end of `timeout`.
+    deadline: Option<Instant>,
+    /// What the call runs under and a `timeout` error names: the caller's timeout, or
+    /// the module's ceiling where that is shorter.
     timeout: Option<Duration>,
-) -> Result<Duration, JqError> {
+    /// The end of the module's [`Limits::max_call`] for this call, and its length:
+    /// what also stops compiling the program and making the instance.
+    ceiling: Option<(Instant, Duration)>,
+}
+
+/// Compiles `program` into `instance`'s cache, under [`COMPILE_TIMEOUT`] and the
+/// call's ceiling; how long it took.
+fn compile(instance: &mut Instance, program: &[u8], bounds: Bounds) -> Result<Duration, JqError> {
     let at = Instant::now();
-    let compiled = instance.call(
-        "jq_compile",
-        &[Arg::Binary(program)],
-        Some(at + COMPILE_TIMEOUT),
-    );
+    let own = at + COMPILE_TIMEOUT;
+    // The timeout does not cover compiling (as in EMQX); the ceiling covers the call.
+    let (within, ceiling) = match bounds.ceiling {
+        Some((ceiling, length)) if ceiling < own => (ceiling, Some(length)),
+        _ => (own, None),
+    };
+    let compiled = instance.call("jq_compile", &[Arg::Binary(program)], Some(within));
     compiled.map_err(|e| match e {
         CallError::Timeout => JqError {
             tag: Tag::Limit,
-            message: format!(
-                "jq stopped: compiling the program took longer than {} ms",
-                COMPILE_TIMEOUT.as_millis()
-            )
+            message: match ceiling {
+                Some(length) => format!(
+                    "jq stopped: compiling the program ran into the {} ms one call may take",
+                    length.as_millis()
+                ),
+                None => format!(
+                    "jq stopped: compiling the program took longer than {} ms",
+                    COMPILE_TIMEOUT.as_millis()
+                ),
+            }
             .into_bytes(),
             kind: "compile_timeout",
         },
-        e => error(e, timeout),
+        e => error(e, bounds.timeout),
     })?;
     Ok(at.elapsed())
 }

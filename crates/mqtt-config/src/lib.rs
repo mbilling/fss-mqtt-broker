@@ -658,7 +658,7 @@ pub struct Rules {
     pub jq: bool,
     /// Milliseconds `jq/2` may run (`MQTTD_RULES_JQ_DEFAULT_TIMEOUT_MS`, default
     /// 10000, as EMQX's `rule_engine.jq_function_default_timeout`); `jq/3` names its
-    /// own. Read at startup.
+    /// own. At most `rules.function_max_ms`. Read at startup.
     pub jq_default_timeout_ms: u64,
     /// The environment variables a jq program may read as `$ENV.NAME` or `env.NAME`
     /// (`MQTTD_RULES_JQ_ENV`, `,`-separated names). Empty (the default) = none: unlike
@@ -671,6 +671,17 @@ pub struct Rules {
     /// only these, so whoever writes rules cannot show a module the rest of the
     /// broker's environment. Empty (the default) = none. Read at startup.
     pub functions_env: Vec<String>,
+    /// The most milliseconds any one call of a sandboxed rule function may take on
+    /// this node (`MQTTD_RULES_FUNCTION_MAX_MS`, default 10000, 1..=600000;
+    /// [ADR 0086](../../../docs/adr/0086-wasm-rule-functions.md)): `jq/2`, `jq/3`
+    /// whatever its third argument says (it may come from a payload), and every
+    /// function of a module the rules file declares. A call that reaches it fails its
+    /// rule with a timeout. It bounds how long a call holds a thread and an instance's
+    /// memory, not how many calls run at once. A rules file cannot raise it: a
+    /// module's `timeout_ms` above it fails the load of the rules file, and with
+    /// `rules.jq` on a `rules.jq_default_timeout_ms` above it is refused. Read at
+    /// startup: a change needs a restart.
+    pub function_max_ms: u64,
     /// The most bytes the state rules keep between messages may take on this node,
     /// across every namespace and every connection's dictionary
     /// (`MQTTD_RULES_STATE_MAX_BYTES`, default 268435456 = 256 MiB;
@@ -694,6 +705,7 @@ impl Default for Rules {
             jq_default_timeout_ms: 10_000,
             jq_env: Vec::new(),
             functions_env: Vec::new(),
+            function_max_ms: 10_000,
             state_max_bytes: 256 << 20,
         }
     }
@@ -1715,6 +1727,9 @@ impl Config {
         on!("MQTTD_RULES_FUNCTIONS_ENV", v, {
             self.rules.functions_env = list(&v);
         });
+        on!("MQTTD_RULES_FUNCTION_MAX_MS", v, {
+            self.rules.function_max_ms = num("MQTTD_RULES_FUNCTION_MAX_MS", &v)?;
+        });
         // -- rule state (ADR 0085) --
         on!("MQTTD_RULES_STATE_MAX_BYTES", v, {
             self.rules.state_max_bytes = num("MQTTD_RULES_STATE_MAX_BYTES", &v)?;
@@ -2185,6 +2200,26 @@ impl Config {
                     .to_string(),
             );
         }
+        // The ceiling on one call of a sandboxed function, and what must fit under it
+        // (ADR 0086, amendment of 2026-10-11): `jq/2` could otherwise never be given
+        // what the configuration says it gets.
+        if !(1..=600_000).contains(&rules.function_max_ms) {
+            return Err(format!(
+                "rules.function_max_ms (MQTTD_RULES_FUNCTION_MAX_MS) must be 1..=600000 \
+                 milliseconds, got {}",
+                rules.function_max_ms
+            ));
+        }
+        // Asked only where `jq` is on: a broker that runs modules alone lowers the
+        // ceiling without having to say what a function it does not have would get.
+        if rules.jq && rules.jq_default_timeout_ms > rules.function_max_ms {
+            return Err(format!(
+                "rules.jq_default_timeout_ms (MQTTD_RULES_JQ_DEFAULT_TIMEOUT_MS) is {}, more \
+                 than rules.function_max_ms (MQTTD_RULES_FUNCTION_MAX_MS), the {} ms any one \
+                 jq or module call may take: lower the first or raise the second",
+                rules.jq_default_timeout_ms, rules.function_max_ms
+            ));
+        }
         // A name jq, or a module, could not be given, or a list that is a mistake (ADR
         // 0086 D8).
         for (key, names) in [
@@ -2424,6 +2459,7 @@ pub const ENV_VARS: &[&str] = &[
     "MQTTD_RULES_JQ_DEFAULT_TIMEOUT_MS",
     "MQTTD_RULES_JQ_ENV",
     "MQTTD_RULES_FUNCTIONS_ENV",
+    "MQTTD_RULES_FUNCTION_MAX_MS",
     // rule state (ADR 0085)
     "MQTTD_RULES_STATE_MAX_BYTES",
     // admin API (ADR 0081)
@@ -2766,6 +2802,62 @@ mod tests {
             assert!(
                 err.to_string().contains("MQTTD_RULES_FUNCTIONS_ENV"),
                 "{err}"
+            );
+        }
+    }
+
+    /// ADR 0086 (amendment of 2026-10-11): the ceiling on one call of a sandboxed
+    /// function is EMQX's ten seconds unless set, has a range, and nothing the
+    /// configuration gives `jq/2` may be above it: the error names both keys.
+    #[test]
+    fn the_function_ceiling_loads_has_a_range_and_bounds_the_jq_default_timeout() {
+        let toml = |rules: &str| format!("[rules]\n{rules}\n[durable]\nallow_ephemeral = true\n");
+        assert_eq!(Config::default().rules.function_max_ms, 10_000);
+        let c = Config::from_toml(&toml("function_max_ms = 250\njq_default_timeout_ms = 250"))
+            .expect("a default timeout equal to the ceiling fits under it");
+        assert_eq!(c.rules.function_max_ms, 250);
+        let mut c = Config::default();
+        c.overlay_from(getter(&[("MQTTD_RULES_FUNCTION_MAX_MS", "600000")]))
+            .unwrap();
+        assert_eq!(c.rules.function_max_ms, 600_000);
+        Config::from_toml(&toml("function_max_ms = 600000\njq = true"))
+            .expect("the largest ceiling");
+        let err = Config::default()
+            .overlay_from(getter(&[("MQTTD_RULES_FUNCTION_MAX_MS", "10s")]))
+            .expect_err("a number of milliseconds");
+        assert!(
+            err.to_string().contains("MQTTD_RULES_FUNCTION_MAX_MS"),
+            "{err}"
+        );
+        for bad in ["0", "600001"] {
+            let err = Config::from_toml(&toml(&format!(
+                "function_max_ms = {bad}\njq_default_timeout_ms = 0"
+            )))
+            .expect_err("outside the range");
+            assert_eq!(
+                err.to_string(),
+                format!(
+                    "invalid configuration: rules.function_max_ms (MQTTD_RULES_FUNCTION_MAX_MS) must \
+                     be 1..=600000 milliseconds, got {bad}"
+                )
+            );
+        }
+        // With `jq` on, lowering the ceiling under the default timeout of `jq/2` is
+        // refused too: the operator who wants a low ceiling says what `jq/2` gets
+        // under it. With `jq` off there is no `jq/2` to give anything.
+        Config::from_toml(&toml("function_max_ms = 500")).expect("jq is off");
+        for rules in [
+            "jq = true\nfunction_max_ms = 500",
+            "jq = true\nfunction_max_ms = 500\njq_default_timeout_ms = 501",
+            "jq = true\njq_default_timeout_ms = 10001",
+        ] {
+            let err = Config::from_toml(&toml(rules)).expect_err("more than the ceiling");
+            let text = err.to_string();
+            assert!(
+                text.contains("rules.jq_default_timeout_ms (MQTTD_RULES_JQ_DEFAULT_TIMEOUT_MS)")
+                    && text.contains("rules.function_max_ms (MQTTD_RULES_FUNCTION_MAX_MS)")
+                    && text.contains("lower the first or raise the second"),
+                "{rules}: {text}"
             );
         }
     }
@@ -3504,6 +3596,7 @@ mod tests {
             | "MQTTD_RULES_SYS_INTERVAL"
             | "MQTTD_RULES_TRACE_RATE"
             | "MQTTD_RULES_JQ_DEFAULT_TIMEOUT_MS"
+            | "MQTTD_RULES_FUNCTION_MAX_MS"
             | "MQTTD_RULES_STATE_MAX_BYTES" => "7",
             // The default is already 7 (backup.keep) / 300 (restore timeout), so "7" would
             // change nothing and the totality sweep would read as a missing mapping.
@@ -3659,8 +3752,9 @@ mod tests {
             // MQTTD_RULES_ADMIN_WRITERS (ADR 0084),
             // plus MQTTD_RULES_JQ, MQTTD_RULES_JQ_DEFAULT_TIMEOUT_MS, MQTTD_RULES_JQ_ENV
             // and MQTTD_RULES_FUNCTIONS_ENV (ADR 0086),
-            // plus MQTTD_RULES_STATE_MAX_BYTES (ADR 0085).
-            122,
+            // plus MQTTD_RULES_STATE_MAX_BYTES (ADR 0085),
+            // plus MQTTD_RULES_FUNCTION_MAX_MS (ADR 0086, the ceiling on one call).
+            123,
             "the MQTTD_* surface changed — update ENV_VARS"
         );
         // Issue #239: MQTTD_MIN_REPLICAS was wired in `overlay_from` but never

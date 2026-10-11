@@ -806,3 +806,129 @@ fn a_pool_serves_callers_on_several_threads() {
     assert!(pool.is_loaded());
     assert!((1..=4).contains(&pool.idle()), "{} idle", pool.idle());
 }
+
+fn jq_under(max_call: Option<Duration>) -> Jq {
+    let limits = Limits {
+        max_call,
+        ..Limits::default()
+    };
+    Jq::from_sandbox(Sandbox::load(&module(), limits, Grants::default()).expect("it loads"))
+}
+
+/// A module loaded with a ceiling ([`Limits::max_call`]) holds every call to it,
+/// whatever timeout the call names: an hour, or none at all (EMQX's `infinity`, which
+/// a timeout of 2^63 ms or more amounts to). The call runs under the shorter of the
+/// two and a call stopped there fails as any timeout does, with EMQX's tag and text,
+/// naming what it ran under. A timeout below the ceiling is the call's own, and a
+/// program that ends in time answers exactly as it does without a ceiling.
+#[test]
+fn a_ceiling_holds_a_call_whatever_timeout_it_names() {
+    // Half a minute of ceiling for the programs that end: no busy machine makes
+    // them late, and every timeout below is above it.
+    let mut roomy = jq_under(Some(Duration::from_secs(30)));
+    let mut free = jq_under(None);
+    for (program, input) in [
+        (". + 1", "1"),
+        (".a[] | select(. > 1)", r#"{"a":[1,2,3]}"#),
+        ("[limit(1000; repeat(.))] | length", "7"),
+    ] {
+        for timeout in [Some(Duration::from_hours(1)), None] {
+            assert_eq!(
+                roomy.eval(program.as_bytes(), Arg::Binary(input.as_bytes()), timeout),
+                free.eval(program.as_bytes(), Arg::Binary(input.as_bytes()), timeout),
+                "{program} under {timeout:?}"
+            );
+        }
+    }
+    let ceiling = Duration::from_millis(80);
+    let mut jq = jq_under(Some(ceiling));
+    for (asked, ran_under) in [
+        (Some(Duration::from_hours(1)), 80),
+        (Some(Duration::from_millis(u64::MAX)), 80),
+        (None, 80),
+        (Some(ceiling), 80),
+        (Some(Duration::from_millis(20)), 20),
+    ] {
+        for program in ["repeat(.)", "def f: f; f"] {
+            let started = Instant::now();
+            let error = jq
+                .eval(program.as_bytes(), Arg::Binary(b"1"), asked)
+                .expect_err(program);
+            let took = started.elapsed();
+            assert_eq!(
+                (error.tag, error.kind),
+                (Tag::Timeout, "timeout"),
+                "{error}"
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&error.message),
+                format!(
+                    "jq program canceled as it took too long time to execute (timeout set to \
+                     {ran_under} ms)"
+                ),
+                "{program} asked for {asked:?}"
+            );
+            assert!(
+                took >= Duration::from_millis(ran_under),
+                "{program} asked for {asked:?}: stopped early, after {took:?}"
+            );
+            assert!(
+                took < Duration::from_millis(ran_under) + Duration::from_secs(5),
+                "{program} asked for {asked:?}: stopped late, after {took:?}"
+            );
+        }
+    }
+    // One long C call that never looks at the cancel flag is stopped there as well.
+    let stuck = br#""a" * 8000000 | test("a+b")"#;
+    let error = jq
+        .eval(stuck, Arg::Binary(b"1"), Some(Duration::from_hours(1)))
+        .expect_err("stuck");
+    assert_eq!(error.tag, Tag::Timeout);
+    assert_eq!(text(jq.eval(b". + 1", Arg::Binary(b"1"), None)), "[2]");
+}
+
+/// The ceiling covers the whole call, and so the compiling of a program the instance
+/// has not seen, which a timeout does not cover in EMQX or here (compiling has the
+/// five seconds of `COMPILE_TIMEOUT` instead). A program that takes tens of
+/// milliseconds to compile is stopped in the compiler under a ceiling of one
+/// millisecond, and the error says which bound it met; without a ceiling it compiles
+/// and runs.
+#[test]
+fn a_ceiling_covers_compiling_the_program() {
+    // An array of six thousand additions: near the largest function jq compiles.
+    let program = format!("[{}] | length", vec![".+1"; 6_000].join(","));
+    let mut free = jq_under(None);
+    let started = Instant::now();
+    assert_eq!(
+        text(free.eval(program.as_bytes(), Arg::Binary(b"1"), Some(DEFAULT_TIMEOUT))),
+        "[6000]"
+    );
+    let compiling = started.elapsed();
+    assert!(
+        free.last.compile > Duration::from_millis(20),
+        "the program was meant to take long to compile: {:?}",
+        free.last.compile
+    );
+    let mut jq = jq_under(Some(Duration::from_millis(1)));
+    let started = Instant::now();
+    let error = jq
+        .eval(
+            program.as_bytes(),
+            Arg::Binary(b"1"),
+            Some(Duration::from_hours(1)),
+        )
+        .expect_err("the compiler runs into the ceiling");
+    let took = started.elapsed();
+    assert_eq!((error.tag, error.kind), (Tag::Limit, "compile_timeout"));
+    assert_eq!(
+        String::from_utf8_lossy(&error.message),
+        "jq stopped: compiling the program ran into the 1 ms one call may take"
+    );
+    assert!(
+        took < compiling,
+        "compiling takes {compiling:?}, and under a ceiling of 1 ms the call took {took:?}"
+    );
+    // The instance the compiler was stopped in is gone; the next call has a new one.
+    assert_eq!(text(jq.eval(b".", Arg::Binary(b"1"), None)), "[1]");
+    assert_eq!((jq.instances, jq.replaced), (2, 1));
+}

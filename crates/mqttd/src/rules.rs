@@ -2105,6 +2105,10 @@ pub fn noting_the_jq_module<T>(functions: &Functions, load: impl FnOnce() -> T) 
 /// `rules.functions_env` lists, the same number of warm instances, the same hand-off.
 /// A module is read from under the directory of `rules.file`.
 ///
+/// Both are held to `rules.function_max_ms`: the longest any one call of `jq` or of a
+/// module's function may take, whatever a rule, `jq/3`'s third argument or a payload
+/// asks for (ADR 0086, amendment of 2026-10-11).
+///
 /// Rule state (ADR 0085) needs no switch either: using it is the switch, under
 /// `rules.state_max_bytes`. Every call of this makes a store of its own, empty: the
 /// commands that check a rules file or try a statement (`--check-rules`, `--rule-test`,
@@ -2134,9 +2138,11 @@ pub fn functions_and_state_from_config(
         |_| std::thread::available_parallelism().map_or(1, std::num::NonZero::get),
         |runtime| runtime.metrics().num_workers(),
     );
+    let max_call = std::time::Duration::from_millis(rules.function_max_ms);
     let functions = if rules.jq {
         Functions::with_jq(JqSettings {
             default_timeout: std::time::Duration::from_millis(rules.jq_default_timeout_ms),
+            max_call,
             environment: rules
                 .jq_env
                 .iter()
@@ -2149,6 +2155,7 @@ pub fn functions_and_state_from_config(
         Functions::default()
     };
     let functions = functions.with_modules(ModuleSettings {
+        max_call,
         environment: rules
             .functions_env
             .iter()
@@ -2194,6 +2201,20 @@ pub fn jq_host_report(functions: &Functions) -> Option<Result<String, String>> {
             )),
         }),
     }
+}
+
+/// One line on the ceiling every call of a sandboxed function runs under, for `mqttd
+/// --check-config`: said where such a call can exist at all, which is where `rules.jq`
+/// is on or a rules file (which may declare modules) is configured.
+#[must_use]
+pub fn function_ceiling_report(rules: &mqtt_config::Rules) -> Option<String> {
+    (rules.jq || rules.file.is_some()).then(|| {
+        format!(
+            "rules.function_max_ms is {}: no jq or module call runs longer, whatever a rule \
+             or a payload asks for",
+            rules.function_max_ms
+        )
+    })
 }
 
 /// What a `jq` call that has run for a millisecond goes on under (ADR 0086 D6): on a
