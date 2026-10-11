@@ -14,7 +14,8 @@
 > This record states the decision and the measurements it rests on. The sandbox is
 > `crates/mqtt-wasm-sandbox`; since T2 the rule engine calls `jq` through it, and since T3
 > the modules a rules file declares. What building T2 and T3 settled, measured and
-> corrected is in [Amendments](#amendments) at the end.
+> corrected, and what T4 checked while documenting it, is in [Amendments](#amendments)
+> at the end.
 >
 > **Accepted on 2026-10-11.** Decided with it: the runtime
 > is **wasmtime, chosen for speed** over the wasmi interpreter the spike first recommended
@@ -1019,3 +1020,41 @@ and modules make it matter more: each connection whose call has passed its first
 millisecond occupies a blocking thread and an instance of up to `memory_mib`. ABI 1 still
 declares no argument types (open question 6). The threat-model and hardening chapters are
 T4's; T3 adds the one row its path decision needs.
+
+### 2026-10-11 — T4: what documenting it checked, and two sentences made exact
+
+T4 wrote the documentation (RULES.md, the cookbook, THREAT-MODEL.md, HARDENING.md, the
+deployment guides) and changed no behaviour. Three things belong in this record.
+
+**§8's table, checked again with the broker itself.** The rows "the release image, run as
+`deploy/compose` does" and "Kubernetes with the chart's `securityContext`" were measured
+with the sandbox's examples. With a static `aarch64-unknown-linux-musl` build of `mqttd`
+in the release image's base image: under Compose's settings `mqttd --check-config`
+reports that the host allows compiled code and a `jq` statement evaluates; and on a kind
+cluster (Kubernetes 1.36, containerd 2.3) the same holds for pods with the chart's pod
+and container security context, with and without `seccompProfile: RuntimeDefault`. A
+managed cluster was not tested. D13's instruction for the shipped unit (the drop-in that
+sets `MemoryDenyWriteExecute=false`) is now checked where the refusal is: CI runs the
+broker under the unit's hardening properties with that one set to `false` and requires
+rules that call `jq`, and a rules file that declares a module, to load and run. That
+static binary is 24.3 MB with the `jq` cargo feature and 16.9 MB without: 7.4 MB for
+the runtime and the module on aarch64, where §8 estimated 6.0 MB and 985 kB from the
+sandbox alone.
+
+**The hand-off is per entry into the module, not per call of a function** (D6 and the T2
+amendment say "a call is suspended once" and "one timer registration per call"). The host
+enters a module several times to make one call of a rule function: to allocate the
+argument frame, to call, and to free what it read. Each entry is armed on its own, with
+its own first slice, and is suspended at most once. In practice only the call itself
+outlasts a millisecond, so a long call is handed off once; an allocation is handed off
+too only if its thread loses the processor for a millisecond in the middle of it, and
+then the cost is one `block_in_place` around a few microseconds of work. The test of the
+hand-off allows two for a call that fails in its second entry
+(`a_call_that_outlasts_its_first_slice_goes_on_inside_the_hand_off`: with a first slice
+of zero the timer's tick may already be there when the allocation starts, which CI's
+runners showed and a laptop does not). That bound is the mechanism's, not a tolerance.
+
+**The cap on concurrent long calls is still not decided.** T2 and T3 left it "to T3 or
+T4"; T4 documents the behaviour as it is, as an accepted risk in THREAT-MODEL.md with
+the operator's mitigations, and as H-7.14 in HARDENING.md. Deciding it (a bound on
+instances in a call, with queueing or a failed rule past it) remains open.

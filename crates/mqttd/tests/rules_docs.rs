@@ -68,6 +68,16 @@
 //! document checked must yield at least one rules snippet and one command shown with its
 //! output, so an extraction that stopped recognising the documents' format fails instead
 //! of passing on nothing.
+//!
+//! **`jq`** (ADR 0086) is off unless switched on, and needs a build with the jq module,
+//! which is built from pinned sources and not checked in. A rules snippet that calls
+//! `jq(` is loaded with `jq` switched on, and a command switches it on as an operator
+//! would for one command, `MQTTD_RULES_JQ=1 mqttd …`. Those snippets and commands are
+//! checked by two tests of their own, which skip on a laptop whose build has no module
+//! and fail under CI, where the module is built first; everything else is checked by the
+//! other two in every build.
+
+mod common;
 
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
@@ -570,6 +580,13 @@ struct Cmd {
 }
 
 impl Cmd {
+    /// Whether the command switches `jq` on for itself: `MQTTD_RULES_JQ=1 mqttd …`.
+    fn switches_jq_on(&self) -> bool {
+        self.env
+            .iter()
+            .any(|(k, v)| k == "MQTTD_RULES_JQ" && matches!(v.as_str(), "1" | "true"))
+    }
+
     fn tests_a_rule(&self) -> bool {
         self.args.iter().any(|a| a == "--rule-test")
     }
@@ -711,6 +728,24 @@ struct Snippet {
     line: usize,
     kind: Kind,
     toml: String,
+}
+
+impl Snippet {
+    /// Whether it calls `jq`, and so loads only where `rules.jq` is on.
+    fn calls_jq(&self) -> bool {
+        self.toml.contains("jq(")
+    }
+
+    /// Load it as the broker would: with `jq` switched on when it calls `jq`.
+    fn load(&self) -> Result<(), String> {
+        let loaded = if self.calls_jq() {
+            let jq = mqtt_rules::Functions::with_jq(mqtt_rules::JqSettings::default());
+            mqtt_rules::RuleSet::parse_with(&self.toml, &jq)
+        } else {
+            mqtt_rules::RuleSet::parse(&self.toml)
+        };
+        loaded.map(|_| ()).map_err(|e| e.to_string())
+    }
 }
 
 /// The keys a rule's table takes.
@@ -1262,24 +1297,28 @@ fn check_unpaired(doc: &str, cmd: &Cmd, files: &[Heredoc], root: &Path) -> Resul
 // The tests.
 // ---------------------------------------------------------------------------------------
 
-/// docs/RULES.md ("The rules file", Actions, Gotchas) and every RULES-COOKBOOK.md recipe:
-/// the rules files, rule bodies and action lists the documents show are ones the broker
-/// loads. A snippet that drifted from the schema (an unknown key, a SQL statement that no
-/// longer parses, an action argument the loader refuses) fails here with its file and
-/// line, before a reader copies it into a broker that refuses to boot.
-#[test]
-fn documented_rules_snippets_load() {
+/// The documents' rules snippets that do not load: those that call `jq` when `with_jq`,
+/// the others when not. Fails when a document yields no snippet at all, or no `jq`
+/// snippet anywhere when those are asked for.
+fn snippets_that_do_not_load(with_jq: bool) -> Vec<String> {
     let mut failures = Vec::new();
+    let mut checked = 0;
     for (doc, text) in docs() {
         let (found, errors) = snippets(doc, &text);
-        failures.extend(errors);
+        if !with_jq {
+            failures.extend(errors);
+        }
         let loaded = found.iter().filter(|s| s.kind != Kind::Sketch).count();
         assert!(
             loaded > 0,
             "{doc}: no rules snippet found; the extraction no longer recognises the document"
         );
-        for s in found.iter().filter(|s| s.kind != Kind::Sketch) {
-            if let Err(e) = mqtt_rules::RuleSet::parse(&s.toml) {
+        for s in found
+            .iter()
+            .filter(|s| s.kind != Kind::Sketch && s.calls_jq() == with_jq)
+        {
+            checked += 1;
+            if let Err(e) = s.load() {
                 failures.push(format!(
                     "{}:{}: {:?} does not load: {e}",
                     s.doc, s.line, s.kind
@@ -1288,10 +1327,88 @@ fn documented_rules_snippets_load() {
         }
     }
     assert!(
+        checked > 0,
+        "no rules snippet that {} jq; the extraction no longer recognises the documents",
+        if with_jq { "calls" } else { "does not call" }
+    );
+    failures
+}
+
+/// docs/RULES.md ("The rules file", Actions, Gotchas) and every RULES-COOKBOOK.md recipe:
+/// the rules files, rule bodies and action lists the documents show are ones the broker
+/// loads. A snippet that drifted from the schema (an unknown key, a SQL statement that no
+/// longer parses, an action argument the loader refuses) fails here with its file and
+/// line, before a reader copies it into a broker that refuses to boot.
+#[test]
+fn documented_rules_snippets_load() {
+    let failures = snippets_that_do_not_load(false);
+    assert!(
         failures.is_empty(),
         "documented rules snippets that do not load:\n{}",
         failures.join("\n")
     );
+}
+
+/// The same for the snippets that call `jq` (docs/RULES.md "jq", the cookbook's `jq`
+/// section): each loads with `jq` switched on, its literal program compiled by the real
+/// module. A program that jq no longer parses, or a statement around it that the loader
+/// refuses, fails here with its file and line.
+#[test]
+fn documented_rules_snippets_that_call_jq_load_where_jq_is_on() {
+    if let Err(why) = mqtt_rules::Jq::built_in() {
+        crate::skip_locally_or_fail_in_ci!("{why}");
+    }
+    let failures = snippets_that_do_not_load(true);
+    assert!(
+        failures.is_empty(),
+        "documented rules snippets that call jq and do not load:\n{}",
+        failures.join("\n")
+    );
+}
+
+/// The documents' commands that do not do what the documents show: those that switch
+/// `jq` on when `with_jq`, the others when not.
+fn commands_that_differ(with_jq: bool) -> Vec<String> {
+    let root = repo_root();
+    let mut failures = Vec::new();
+    let mut checked = 0;
+    for (doc, text) in docs() {
+        let (found, errors) = commands(doc, &text);
+        if !with_jq {
+            failures.extend(errors);
+        }
+        assert!(
+            !found.transcripts.is_empty(),
+            "{doc}: no command shown with its output; the extraction no longer recognises \
+             the document"
+        );
+        for t in found
+            .transcripts
+            .iter()
+            .filter(|t| t.cmds.iter().any(Cmd::switches_jq_on) == with_jq)
+        {
+            checked += 1;
+            if let Err(e) = check_transcript(t, &found.files, &root) {
+                failures.push(format!("{}:{}: {e}", t.doc, t.line));
+            }
+        }
+        for (doc, cmd) in found
+            .unpaired
+            .iter()
+            .filter(|(_, cmd)| cmd.switches_jq_on() == with_jq)
+        {
+            if let Err(e) = check_unpaired(doc, cmd, &found.files, &root) {
+                failures.push(format!("{doc}:{}: {e}", cmd.line));
+            }
+        }
+    }
+    assert!(
+        checked > 0,
+        "no command shown with its output that {} jq on; the extraction no longer \
+         recognises the documents",
+        if with_jq { "switches" } else { "leaves" }
+    );
+    failures
 }
 
 /// docs/RULES.md ("Try it in two minutes", "Testing and debugging rules", Gotchas) and
@@ -1302,30 +1419,27 @@ fn documented_rules_snippets_load() {
 /// with the document's line.
 #[test]
 fn documented_rule_test_and_check_rules_transcripts_match_the_binary() {
-    let root = repo_root();
-    let mut failures = Vec::new();
-    for (doc, text) in docs() {
-        let (found, errors) = commands(doc, &text);
-        failures.extend(errors);
-        assert!(
-            !found.transcripts.is_empty(),
-            "{doc}: no command shown with its output; the extraction no longer recognises \
-             the document"
-        );
-        for t in &found.transcripts {
-            if let Err(e) = check_transcript(t, &found.files, &root) {
-                failures.push(format!("{}:{}: {e}", t.doc, t.line));
-            }
-        }
-        for (doc, cmd) in &found.unpaired {
-            if let Err(e) = check_unpaired(doc, cmd, &found.files, &root) {
-                failures.push(format!("{doc}:{}: {e}", cmd.line));
-            }
-        }
-    }
+    let failures = commands_that_differ(false);
     assert!(
         failures.is_empty(),
         "documented commands that do not do what the documents show:\n{}",
+        failures.join("\n\n")
+    );
+}
+
+/// The same for the commands that switch `jq` on (`MQTTD_RULES_JQ=1 mqttd --rule-test …`
+/// in docs/RULES.md "jq" and the cookbook's `jq` section): each prints exactly what the
+/// document shows, from the real jq in the real binary. A jq result, an error text or a
+/// limit's wording that changed fails here with the document's line.
+#[test]
+fn documented_jq_transcripts_match_the_binary() {
+    if let Err(why) = mqtt_rules::Jq::built_in() {
+        crate::skip_locally_or_fail_in_ci!("{why}");
+    }
+    let failures = commands_that_differ(true);
+    assert!(
+        failures.is_empty(),
+        "documented jq commands that do not do what the documents show:\n{}",
         failures.join("\n\n")
     );
 }

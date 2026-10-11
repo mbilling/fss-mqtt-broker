@@ -1,11 +1,13 @@
 # Rule cookbook
 
-**Dated 2026-10-07.** For the rule engine, which no release has yet: see
+**Dated 2026-10-11.** For the rule engine, which no release has yet: see
 [RULES.md](RULES.md) for how to get a build that has it.
 
 Sixteen working recipes for mqttd's [rule engine](RULES.md). Each one is a rules file in
 [`docs/examples/rules/`](examples/rules/) that you can copy as it is, with the messages to
-publish and the exact output to expect.
+publish and the exact output to expect. After them, a section on the `jq` function, which
+is off unless you switch it on: four rules that are worth a `jq` call, and nine common
+statements that are not, each beside the plain rule SQL that does the same.
 
 Every recipe on this page is run against the real `mqttd` binary by
 [`crates/mqttd/tests/rules_cookbook.rs`](../crates/mqttd/tests/rules_cookbook.rs). The same
@@ -41,6 +43,7 @@ privacy-safe feeds they derive), see the [rule-engine demo](../demo/rules/README
 - [14. Parse CSV and key=value text](#14-parse-csv-and-keyvalue-text)
 - [15. Decode base64, hex and binary payloads](#15-decode-base64-hex-and-binary-payloads)
 - [16. MQTT 5 user properties in and out](#16-mqtt-5-user-properties-in-and-out)
+- [jq: when it earns its cost](#jq-when-it-earns-its-cost)
 - [What rules cannot do](#what-rules-cannot-do)
 
 ---
@@ -1455,6 +1458,280 @@ value (`tag=fragile`). To forward every property as sent, use
 `user_properties = "${pub_props.'User-Property'}"`, as the audit copy does. And a
 placeholder for a property the publisher did not send renders as the text `undefined`, so
 give it a default with `coalesce()`.
+
+---
+
+## jq: when it earns its cost
+
+`jq(Program, Input)` runs a [jq](https://jqlang.org) program over a value, in a sandbox
+inside the broker ([RULES.md](RULES.md#jq)). It is **off by default**: set
+`rules.jq = true` in the broker's configuration (`MQTTD_RULES_JQ=1`), on every node, and
+read [what it needs from the host](RULES.md#what-jq-needs-from-the-host) first: under the
+systemd unit this repository ships, one more setting. The commands in this section switch
+it on for themselves, and need a build that carries the jq module
+([RULES.md](RULES.md#jq), Builds).
+
+A `jq` call on a 1 KB payload costs 27 to 102 µs (Apple M1 Pro, one thread); the built-in
+functions and operators of rule SQL cost a microsecond or two. So this section has two
+halves: four rules that are worth a `jq` call, because rule SQL has no way to say what
+they do, and nine statements that are not, each beside the rule SQL that gives the same
+result without leaving the rule engine.
+
+Three things hold for every `jq` rule:
+
+- **The result is an array**, one element per output of the program, even when there is
+  one. `first(jq(…))` takes that one; `FOREACH jq(…)` makes one output per element.
+- **The statement is written in a TOML literal string** (`'''…'''`), so jq's own `"`, `$name` and
+  `\(…)` need no escaping. Rule SQL has no escape for a single quote inside a string;
+  write one inside a program as `\u0027`.
+- **A limit fails the rule, not the message.** A call that runs past its timeout, or
+  builds more than its memory or output allows, fails the rule for that message, counted
+  in `mqttd_rule_function_errors_total{function="jq",kind}`
+  ([RULES.md](RULES.md#limits-of-jq-and-what-happens-at-each)). The original is delivered
+  as always.
+
+The first two recipes, and every statement of the second half, run on this message,
+published to `sensors/dev-1/data`: four readings from two sensors, one of them marked
+invalid.
+
+| Reading | `id` | `temp` | `ok` |
+|---|---|---|---|
+| 1 | `a` | 61.5 | `true` |
+| 2 | `b` | 48.0 | `true` |
+| 3 | `a` | 72.0 | `true` |
+| 4 | `b` | -999 | `false` |
+
+### An average over an array
+
+Rule SQL reads one value at a time. `FOREACH` can split an array into messages, but
+nothing in it adds the elements up. jq does: this rule publishes the mean of the readings
+a device marked valid, one number per message it sends. The `if` keeps a message with no
+valid reading from dividing by zero; its mean is `null`.
+
+```toml
+[rules.mean_temperature]
+sql = '''
+SELECT topic(2) AS device, first(jq('[.readings[] | select(.ok) | .temp] | if length > 0 then add / length else null end', payload)) AS mean FROM "sensors/+/data"
+'''
+actions = [{ function = "republish", args = { topic = "sensors/${device}/mean", payload = "${.}" } }]
+```
+
+Try the statement (`$'…'` is bash's and zsh's quoting in which `\'` is a single quote):
+
+```sh
+MQTTD_RULES_JQ=1 mqttd --rule-test --sql $'SELECT topic(2) AS device, first(jq(\'[.readings[] | select(.ok) | .temp] | if length > 0 then add / length else null end\', payload)) AS mean FROM "sensors/+/data"' --topic sensors/dev-1/data --payload '{"device": "dev-1", "readings": [{"id": "a", "temp": 61.5, "ok": true}, {"id": "b", "temp": 48.0, "ok": true}, {"id": "a", "temp": 72.0, "ok": true}, {"id": "b", "temp": -999, "ok": false}]}'
+```
+
+```text
+{"device":"dev-1","mean":60.5}
+```
+
+### One summary per group
+
+`group_by` gathers the readings of each sensor, and the program emits one object per
+group. `FOREACH` over jq's outputs then makes each a message of its own: two sensors in
+the payload, two summaries out.
+
+```toml
+[rules.per_sensor_summary]
+sql = '''
+FOREACH jq('.readings | map(select(.ok)) | group_by(.id)[] | {id: .[0].id, n: length, max: (map(.temp) | max)}', payload) DO topic(2) AS device, item.id AS sensor, item.n AS n, item.max AS max FROM "sensors/+/data"
+'''
+actions = [{ function = "republish", args = { topic = "sensors/${device}/summary", payload = "${.}" } }]
+```
+
+Try the statement (`$'…'` is bash's and zsh's quoting in which `\'` is a single quote):
+
+```sh
+MQTTD_RULES_JQ=1 mqttd --rule-test --sql $'FOREACH jq(\'.readings | map(select(.ok)) | group_by(.id)[] | {id: .[0].id, n: length, max: (map(.temp) | max)}\', payload) DO topic(2) AS device, item.id AS sensor, item.n AS n, item.max AS max FROM "sensors/+/data"' --topic sensors/dev-1/data --payload '{"device": "dev-1", "readings": [{"id": "a", "temp": 61.5, "ok": true}, {"id": "b", "temp": 48.0, "ok": true}, {"id": "a", "temp": 72.0, "ok": true}, {"id": "b", "temp": -999, "ok": false}]}'
+```
+
+```text
+{"device":"dev-1","sensor":"a","n":2,"max":72.0}
+{"device":"dev-1","sensor":"b","n":1,"max":48.0}
+```
+
+### Flatten a document of any shape
+
+[Recipe 5](#5-flatten-nested-json) flattens a payload whose fields you know. This one
+needs to know nothing: every scalar in the document ends up under its dotted path,
+arrays by index, however deep the nesting goes.
+
+```toml
+[rules.flatten_any_depth]
+sql = '''
+SELECT topic(2) AS device, first(jq('[paths(scalars) as $p | {key: ($p | map(tostring) | join(".")), value: getpath($p)}] | from_entries', payload)) AS flat FROM "sensors/+/data"
+'''
+actions = [{ function = "republish", args = { topic = "sensors/${device}/flat", payload = "${flat}" } }]
+```
+
+Try the statement (`$'…'` is bash's and zsh's quoting in which `\'` is a single quote):
+
+```sh
+MQTTD_RULES_JQ=1 mqttd --rule-test --sql $'SELECT topic(2) AS device, first(jq(\'[paths(scalars) as $p | {key: ($p | map(tostring) | join(".")), value: getpath($p)}] | from_entries\', payload)) AS flat FROM "sensors/+/data"' --topic sensors/dev-1/data --payload '{"site": {"name": "oslo", "pos": {"lat": 59.9, "lon": 10.7}}, "tags": ["roof", "south"]}'
+```
+
+```text
+{"device":"dev-1","flat":{"site.name":"oslo","site.pos.lat":59.9,"site.pos.lon":10.7,"tags.0":"roof","tags.1":"south"}}
+```
+
+### Remove a key wherever it occurs
+
+`..` visits every value of a document, so one `del` removes `password` and `token` at
+any depth, inside arrays too. The rule publishes the cleaned copy; the original is still
+delivered on its own topic, as with every rule, so keep subscribers off that one with the
+ACL.
+
+```toml
+[rules.strip_secrets]
+sql = '''
+SELECT topic(2) AS device, first(jq('del(.. | objects | .password, .token)', payload)) AS clean FROM "sensors/+/data"
+'''
+actions = [{ function = "republish", args = { topic = "sensors/${device}/clean", payload = "${clean}" } }]
+```
+
+Try the statement (`$'…'` is bash's and zsh's quoting in which `\'` is a single quote):
+
+```sh
+MQTTD_RULES_JQ=1 mqttd --rule-test --sql $'SELECT topic(2) AS device, first(jq(\'del(.. | objects | .password, .token)\', payload)) AS clean FROM "sensors/+/data"' --topic sensors/dev-1/data --payload '{"user": "kim", "password": "hunter2", "session": {"token": "t-1", "ttl": 60}, "devices": [{"id": 1, "token": "t-2"}]}'
+```
+
+```text
+{"device":"dev-1","clean":{"user":"kim","session":{"ttl":60},"devices":[{"id":1}]}}
+```
+
+### You do not need jq for this
+
+Each pair below gives the same output for the sample message, printed under it. The
+second statement of a pair never enters the sandbox: it costs about a microsecond where
+the first costs tens, it runs with `jq` switched off, and it needs nothing from the host.
+If a rule arrived from EMQX with one of the first forms in it, it runs here unchanged;
+rewrite it when the topic is busy.
+
+**Reading a field.** A path is a field of the payload.
+
+```sql
+-- with jq
+SELECT first(jq('.device', payload)) AS device FROM "sensors/+/data"
+-- in rule SQL
+SELECT payload.device AS device FROM "sensors/+/data"
+```
+
+```text
+{"device":"dev-1"}
+```
+
+**An element of an array.** `nth` counts from 1; `first` and `last` take the ends.
+
+```sql
+-- with jq
+SELECT first(jq('.readings[1].id', payload)) AS id FROM "sensors/+/data"
+-- in rule SQL
+SELECT nth(2, payload.readings).id AS id FROM "sensors/+/data"
+```
+
+```text
+{"id":"b"}
+```
+
+**Counting.** `length` is a built-in function.
+
+```sql
+-- with jq
+SELECT first(jq('.readings | length', payload)) AS n FROM "sensors/+/data"
+-- in rule SQL
+SELECT length(payload.readings) AS n FROM "sensors/+/data"
+```
+
+```text
+{"n":4}
+```
+
+**Filtering messages.** A condition belongs in `WHERE`, which is evaluated before anything is selected.
+
+```sql
+-- with jq
+SELECT payload.device AS device FROM "sensors/+/data" WHERE first(jq('.readings | length > 3', payload)) = true
+-- in rule SQL
+SELECT payload.device AS device FROM "sensors/+/data" WHERE length(payload.readings) > 3
+```
+
+```text
+{"device":"dev-1"}
+```
+
+**One message per element, some of them.** `FOREACH` splits an array and `INCASE` filters the elements.
+
+```sql
+-- with jq
+FOREACH jq('.readings[] | select(.ok)', payload) DO item.id AS id, item.temp AS temp FROM "sensors/+/data"
+-- in rule SQL
+FOREACH payload.readings DO item.id AS id, item.temp AS temp INCASE item.ok = true FROM "sensors/+/data"
+```
+
+```text
+{"id":"a","temp":61.5}
+{"id":"b","temp":48.0}
+{"id":"a","temp":72.0}
+```
+
+**Reshaping.** An alias with a dot builds a nested object.
+
+```sql
+-- with jq
+SELECT first(jq('{id: .device, n: (.readings | length)}', payload)) AS summary FROM "sensors/+/data"
+-- in rule SQL
+SELECT payload.device AS summary.id, length(payload.readings) AS summary.n FROM "sensors/+/data"
+```
+
+```text
+{"summary":{"id":"dev-1","n":4}}
+```
+
+**Building a string.** `concat`, or `sprintf` for formats.
+
+```sql
+-- with jq
+SELECT first(jq('"\(.device)/raw"', payload)) AS name FROM "sensors/+/data"
+-- in rule SQL
+SELECT concat(payload.device, '/raw') AS name FROM "sensors/+/data"
+```
+
+```text
+{"name":"dev-1/raw"}
+```
+
+**A default for a missing field.** `coalesce` takes the first argument that has a value.
+
+```sql
+-- with jq
+SELECT first(jq('.unit // "C"', payload)) AS unit FROM "sensors/+/data"
+-- in rule SQL
+SELECT coalesce(payload.unit, 'C') AS unit FROM "sensors/+/data"
+```
+
+```text
+{"unit":"C"}
+```
+
+**Matching a pattern.** `regex_match`, and `regex_extract` and `regex_replace` beside it.
+
+```sql
+-- with jq
+SELECT first(jq('.device | test("^dev-[0-9]+$")', payload)) AS ok FROM "sensors/+/data"
+-- in rule SQL
+SELECT regex_match(payload.device, '^dev-[0-9]+$') AS ok FROM "sensors/+/data"
+```
+
+```text
+{"ok":true}
+```
+
+The rule of thumb: if the statement reads fields, compares them, picks elements or
+builds strings, rule SQL has a function for it ([RULES.md](RULES.md#functions)). Reach for
+`jq` when the program has to walk, group or fold a structure. And when neither says it,
+or the input is not JSON at all, a function of your own, as a WebAssembly module
+([RULES.md](RULES.md#your-own-functions-functionsname)).
 
 ---
 

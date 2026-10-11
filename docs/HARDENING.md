@@ -1,6 +1,6 @@
 # Hardening baseline
 
-**Verified against `v1.1.0` (2026-10-07); ADR 0084's items added 2026-10-08.** The checkable companion to the
+**Verified against `v1.1.0` (2026-10-07); ADR 0084's items added 2026-10-08, ADR 0086's (H-7.12 to H-7.15) 2026-10-11.** The checkable companion to the
 [threat model](THREAT-MODEL.md) (ADR 0066 T2): numbered items, each stating the
 control, the knob that enforces it, the shipped default, and a **verification an
 auditor can run**. The [SECURED-CLUSTER-TUTORIAL](SECURED-CLUSTER-TUTORIAL.md)
@@ -99,13 +99,60 @@ Single-node deployments: verify none of the cluster binds are set and skip to §
 | H-7.2 | L1 | Unknown config keys refuse (typo net) | `MQTTD_CONFIG_UNKNOWN_KEYS` unset (= refuse); `warn` only during a rollback/skew window | env/flag absent outside upgrade windows |
 | H-7.3 | L1 | Secrets by path, never inline | config discipline (schema enforces for keys) | `grep -iE 'key *= *"-----|password *= *"[^/]' <config>` returns nothing |
 | H-7.4 | L2 | Health/metrics ports on the ops network only, never internet-exposed | `MQTTD_HEALTH_BIND`, `MQTTD_METRICS_BIND` on internal interfaces | external scan: 200-serving `/statusz` unreachable from outside |
-| H-7.5 | L2 | systemd deployments use the shipped hardened unit | `deploy/systemd/mqttd.service` | `systemctl show mqttd -p ProtectSystem,NoNewPrivileges,User` → `strict`, `yes`, `mqttd` |
+| H-7.5 | L2 | systemd deployments use the shipped hardened unit | `deploy/systemd/mqttd.service` | `systemctl show mqttd -p ProtectSystem,NoNewPrivileges,User,MemoryDenyWriteExecute` → `strict`, `yes`, `mqttd`, `yes` (`no` only with H-7.15 recorded) |
 | H-7.7 | L1 | The admin API, when on, is reachable only from operator networks and its CA issues admin certificates only | `MQTTD_ADMIN_BIND` on an internal interface; a dedicated `MQTTD_ADMIN_CLIENT_CA` (not the client-listener CA, and not the cluster CA — with the cluster CA every unlisted node certificate is admitted as `peer` instead of refused) | external scan: the admin port is unreachable from outside; `openssl x509 -in <admin CA> -noout -subject` names an admin-only CA |
 | H-7.8 | L2 | Admin roles are least-privilege | `MQTTD_ADMIN_OPERATORS` lists only the people/automation that act; everyone else in `MQTTD_ADMIN_VIEWERS` | `mqttd --admin whoami` for each issued certificate shows the intended role; operators list reviewed with access reviews |
 | H-7.9 | L1 | The rule trace is off: it copies message payloads, client ids and usernames onto `$SYS` | `MQTTD_RULES_TRACE` unset (default off); on, it logs a WARN, and `INSECURE:` with no ACL file or `default = "allow"` | `mqttd --print-config` (or `mqttd --admin config --json`) shows `rules.trace = false` |
 | H-7.10 | L1 | Rules writes over the admin API are off, or limited to the people who may edit the ACL file: a rules writer can derive messages onto any topic | `MQTTD_RULES_ADMIN_WRITERS` empty (the default: no writes); a listed subject must also be in `admin.operators` | `mqttd --admin config --json \| jq .config.rules.admin_writers` is `[]`, or each entry is reviewed with the ACL file's editors |
 | H-7.11 | L2 | A rules file the admin API may write sits in a directory of its own, owned by the broker user, never beside the config, ACL, password or key files (making a directory writable lets a compromised broker rewrite whatever is in it) | `rules.file` when `MQTTD_RULES_ADMIN_WRITERS` is set; the broker WARNs at boot when that directory is not writable | `ls -la "$(dirname <rules.file>)"` lists only the rules file and its `.prev`, owned by the broker user, file mode ≤ 640 (a file the API creates is 0600), directory mode ≤ 750 |
+| H-7.12 | L2 | The WebAssembly sandbox is not in use unless a rule needs it: the rule engine's `jq` function is off and the rules file declares no module. With neither, the broker creates nothing of the runtime (no compiler run, no thread, no fault handler, no executable page) and is exactly as hardened as without the feature | `MQTTD_RULES_JQ` unset (default off); no `[functions.<name>]` table in the rules file (default: none) | `mqttd --print-config` shows `jq = false` under `[rules]`; `grep -c '^\[functions\.' <rules file>` prints `0`; a rules file that calls `jq` is refused by `mqttd --check-rules` with `jq is switched off` |
+| H-7.13 | L2 | An installation that must not contain a compiler at all runs a build without the runtime. Release binaries and images contain it (unused unless H-7.12 is deviated from), so this is a build of your own from the release tag, outside the release's signature and reproducibility proof | `cargo build --release -p mqttd --no-default-features`: the `jq` cargo feature, the only default one, is the runtime | `MQTTD_RULES_JQ=1 mqttd --check-config` prints ``warning: rules.jq is on, but this mqttd was built without jq (the `jq` cargo feature is off): a rules file that calls jq will not load``; the binary is 7 MB or more smaller (7.4 MB for a static `aarch64-unknown-linux-musl` build) |
+| H-7.14 | L2 | Where the sandbox is on, what a publisher can make it spend is bounded on purpose: timeouts set to what the programs need, not EMQX's ten seconds; no secret among the variables shown to programs and modules; module files not writable by the broker; a memory limit on the process, because concurrent long calls are not capped ([threat model](THREAT-MODEL.md#rule-functions-in-the-webassembly-sandbox-adr-0086)) | `MQTTD_RULES_JQ_DEFAULT_TIMEOUT_MS` (default 10000) and each module's `timeout_ms`, `memory_mib`; `MQTTD_RULES_JQ_ENV`, `MQTTD_RULES_FUNCTIONS_ENV` (default empty); file ownership; `MemoryMax` or a container limit | `mqttd --print-config` shows the timeout and the two lists, each entry reviewed; no rule takes a `jq` program or timeout from a payload (`grep -n 'jq(' <rules file>` shows literal first and third arguments); `ls -l <rules dir>/**/*.wasm` shows an owner other than the broker's user and no write bit for it; `systemctl show mqttd -p MemoryMax` (or the pod's `resources.limits.memory`) is set |
+| H-7.15 | L2 | systemd: where the sandbox is on, the one restriction it cannot live with is lifted in a drop-in, alone, and recorded as a deviation from H-7.5; the shipped unit file is not edited | `MemoryDenyWriteExecute=false` under `[Service]` in `/etc/systemd/system/mqttd.service.d/override.conf` (`systemctl edit mqttd`); the unit ships `true` | `systemctl cat mqttd` shows the drop-in with that one line; `systemctl show mqttd -p MemoryDenyWriteExecute,ProtectSystem,NoNewPrivileges,SystemCallFilter` shows `no` and the unit's other values unchanged; run under the service's own settings, `MQTTD_RULES_JQ=1 mqttd --check-config` prints `rules.jq is on: this host allows compiled code` |
 | H-7.6 | L2 | Containers run the shipped image (distroless, nonroot) pinned to a release tag | compose/chart defaults | image ref is `ghcr.io/mbilling/fss-mqtt-broker:<X.Y.Z>` — exact version, never `latest`; cosign verification per [RELEASING](../RELEASING.md) |
+
+### When to leave rule functions in the sandbox out (H-7.12 to H-7.15)
+
+The rule engine's `jq` function and the modules a rules file may declare
+([RULES.md](RULES.md#jq)) run as WebAssembly compiled to machine code inside the broker
+([ADR 0086](adr/0086-wasm-rule-functions.md)). They are off by default, and that is the
+hardened position. Leave them off unless a rule needs what only they can do; most
+`jq` calls in rules ported from EMQX have a plain rule SQL form that needs none of this
+([RULES-COOKBOOK.md](RULES-COOKBOOK.md#you-do-not-need-jq-for-this)).
+
+There are three positions, from most to least restrictive:
+
+| Position | How | What it means |
+|---|---|---|
+| The runtime is not in the binary | Build with `--no-default-features` (H-7.13) | No compiler in the build, a binary 7 MB or more smaller, and no way to switch it on by configuration. `rules.jq = true` and a `[functions.<name>]` table are each refused with the reason. You run a build of your own, not the signed release |
+| In the binary, not in use (the default) | Do not set `rules.jq`; declare no modules (H-7.12) | Nothing of the runtime is created in the process. The broker is exactly as it is without the feature, and the shipped systemd unit keeps `MemoryDenyWriteExecute=true` |
+| In use | `rules.jq = true`, or a `[functions.<name>]` table (H-7.14, H-7.15) | What follows |
+
+What is given up when it is in use:
+
+- **Under systemd, `MemoryDenyWriteExecute=true`.** Compiled code needs memory the process
+  may map executable, and the two exclude each other: there is no slower mode that keeps
+  both. The operator sets it to `false` in a drop-in; with it still `true`, a rules file
+  that calls `jq` or declares a module fails to load and says so. The unit's other
+  restrictions stay. The container image and the Helm chart's security context impose no
+  such restriction, so nothing changes there (a seccomp profile or SELinux policy of your
+  own that denies executable memory has to allow it for the broker).
+- **A compiler in the trust base.** The broker's memory safety then also rests on the
+  WebAssembly runtime and on the machine code its compiler generates, on input a
+  publisher influences. Its security advisories become yours to follow
+  ([threat model, accepted risks](THREAT-MODEL.md#accepted-risks-client-surface)).
+- **A process without fault handlers of its own.** The runtime installs process-wide
+  handlers for `SIGSEGV`, `SIGBUS`, `SIGILL` and `SIGFPE` once a module is loaded.
+- **The microsecond bound on what one message costs.** A sandboxed call may run for as long as
+  its timeout allows and hold up to its memory limit, and concurrent long calls are not
+  capped. Rule SQL's own functions are bounded in microseconds and kilobytes.
+- **Memory and start-up**: 7 to 42 MiB once, depending on the allocator, a megabyte or
+  more resident per warm instance (one per worker thread), and about half a second
+  when rules that call `jq` are first loaded.
+
+What is **not** given up: a module, jq's or yours, reaches no file, no socket, no
+environment variable that was not listed for it, and nothing of the broker's memory; a
+fault in it fails the rule it was called from. Those hold as long as the runtime is sound.
 
 ## 8. Audit and monitoring
 

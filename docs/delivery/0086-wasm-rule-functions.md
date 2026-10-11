@@ -23,9 +23,9 @@ tasks:
     evidence: "PR 913: `[functions.<name>]` in the rules file (`wasm`, `sha256`, `functions`, `timeout_ms`, `memory_mib`, `clock`, `env`, `fresh_instance`), loaded with the rules at boot, on a reload, through the admin API and in `--check-rules`; each load-time check a load error with its reason (hash, export, ABI version, import, a function the module does not describe, a name that is a built-in's or any EMQX function's); a module read only from under the rules file's directory, and its environment only from `rules.functions_env` (ADR amendment); limits and the output budget as for jq; a declaration that did not change keeps its module across a reload and a call in flight finishes on the old one (held in the rule engine's hand-off, and through the binary with a two-second call across an admin API write); `modules[]` in `GET /admin/v1/rules` and `mqttd --admin rules`; `--rule-test` with the configured file's modules; two examples, Rust and C, built in CI and called through the binary."
   - id: 0086-T4
     title: "Documentation: RULES.md (the function, its limits, its cost), the departures from EMQX, threat model and hardening rows, the cookbook"
-    status: planned
+    status: in-progress
     issue: 908
-    notes: "Follows T2."
+    notes: "One PR carries it. RULES.md: `jq` for an operator who has not read the ADR (what it is for, the switch, what it needs from the host per packaging, its limits with each one's error and kind, its cost with the conditions of each figure, long calls, the series to watch, the cluster note, the steps for a rule ported from EMQX), and for modules when to write one, the ABI and frame on one page, and who can make the broker run what. RULES-COOKBOOK.md: four rules worth a `jq` call and nine statements that are not, each beside its plain rule SQL, all run through the binary by the cookbook's tests. THREAT-MODEL.md: rows for a hostile payload driving jq, a hostile or broken module, and the supply chains of the module and the runtime, each with the tests that hold it, and the accepted risks (the compiler in the trust base, process-wide fault handlers, concurrent long calls not capped, programs and timeouts from payloads). HARDENING.md: H-7.12 to H-7.15 and when to leave the feature out. deploy/systemd/README.md, KUBERNETES.md, OPERATIONS.md, TROUBLESHOOTING.md, SIZING.md, MIGRATION.md. Checked for it: the container image's settings and the chart's security context on a kind cluster (jq runs; nothing to change), and in CI the shipped unit's hardening with `MemoryDenyWriteExecute=false` (the documented drop-in)."
 ---
 
 # Delivery 0086 — rule functions in a WebAssembly sandbox
@@ -46,8 +46,9 @@ What exists: the crate `crates/mqtt-wasm-sandbox` on wasmtime, the jq module's b
 scripts, the comparison with EMQX 6.3.1, the measurements in the ADR, a CI job that
 builds the module from pinned sources and runs the comparison, and a fuzz target for the
 loader in the nightly tier (T1); and `jq/2` and `jq/3` in the rule engine, off unless
-`rules.jq = true`, with the release build embedding the module it built (T2). T3, the
-modules a rules file declares, is in review; T4 is planned.
+`rules.jq = true`, with the release build embedding the module it built (T2); and the
+modules a rules file declares, pinned by hash, with two worked examples (T3). T4, the
+documentation for operators, the threat model and the hardening baseline, is in review.
 
 ## Plan
 
@@ -66,7 +67,7 @@ modules a rules file declares, is in review; T4 is planned.
 | 0086-T1 | ✅ done | [#905](https://github.com/mbilling/fss-mqtt-broker/issues/905) | 2026-10-11 | "PR 904: the crate on wasmtime 49.0.2 with its limits, tests and failure mode; the `wasm sandbox` CI job, which builds jq.wasm with a compiler and sources pinned by sha256, compares it with jq.wasm.sha256, runs the 285-case EMQX oracle and the limit tests in release mode and checks the refusal under the shipped unit's hardening; and the `module_load` fuzz target in the nightly tier (crates/mqtt-wasm-sandbox/fuzz; 71,000 inputs on two hosts before the PR, no finding). The release build embedding the module is T2's, where the broker first links the crate." |
 | 0086-T2 | ✅ done | [#906](https://github.com/mbilling/fss-mqtt-broker/issues/906) | 2026-10-11 | "PR 911: `jq/2` and `jq/3` in `mqtt-rules` behind the ABI, with EMQX 6.3.1's results, tags and texts (79 probes of `emqx_rule_funcs:jq/2,3` and `emqx_rule_sqltester` on a local EMQX, all matched; the 285-case module oracle unchanged); `rules.jq` off by default with its load errors, `rules.jq_default_timeout_ms`, `rules.jq_env`; the instance pool, literal programs compiled at load; a call's output charged to the message's build budget; the hand-off (one worker thread, a ten-second jq on one connection: 6,974 publishes on another, median 152 µs, slowest 6.2 ms; without it the first is not answered in 2 s) and a Will's rules moved off the hub while rules call jq (ADR amendment); per-function and per-module metrics; `--rule-test`, `--check-rules`, `--check-config`; the module embedded by the build when present and required by the release recipe and CI; the systemd unit's comment; Rust 1.96. `strptime %z` and `strftime %Z` recorded, not closed." |
 | 0086-T3 | ✅ done | [#907](https://github.com/mbilling/fss-mqtt-broker/issues/907) | 2026-10-11 | "PR 913: `[functions.<name>]` in the rules file (`wasm`, `sha256`, `functions`, `timeout_ms`, `memory_mib`, `clock`, `env`, `fresh_instance`), loaded with the rules at boot, on a reload, through the admin API and in `--check-rules`; each load-time check a load error with its reason (hash, export, ABI version, import, a function the module does not describe, a name that is a built-in's or any EMQX function's); a module read only from under the rules file's directory, and its environment only from `rules.functions_env` (ADR amendment); limits and the output budget as for jq; a declaration that did not change keeps its module across a reload and a call in flight finishes on the old one (held in the rule engine's hand-off, and through the binary with a two-second call across an admin API write); `modules[]` in `GET /admin/v1/rules` and `mqttd --admin rules`; `--rule-test` with the configured file's modules; two examples, Rust and C, built in CI and called through the binary." |
-| 0086-T4 | ⬜ planned | [#908](https://github.com/mbilling/fss-mqtt-broker/issues/908) | — | "Follows T2." |
+| 0086-T4 | 🚧 in-progress | [#908](https://github.com/mbilling/fss-mqtt-broker/issues/908) | — | "One PR carries it. RULES.md: `jq` for an operator who has not read the ADR (what it is for, the switch, what it needs from the host per packaging, its limits with each one's error and kind, its cost with the conditions of each figure, long calls, the series to watch, the cluster note, the steps for a rule ported from EMQX), and for modules when to write one, the ABI and frame on one page, and who can make the broker run what. RULES-COOKBOOK.md: four rules worth a `jq` call and nine statements that are not, each beside its plain rule SQL, all run through the binary by the cookbook's tests. THREAT-MODEL.md: rows for a hostile payload driving jq, a hostile or broken module, and the supply chains of the module and the runtime, each with the tests that hold it, and the accepted risks (the compiler in the trust base, process-wide fault handlers, concurrent long calls not capped, programs and timeouts from payloads). HARDENING.md: H-7.12 to H-7.15 and when to leave the feature out. deploy/systemd/README.md, KUBERNETES.md, OPERATIONS.md, TROUBLESHOOTING.md, SIZING.md, MIGRATION.md. Checked for it: the container image's settings and the chart's security context on a kind cluster (jq runs; nothing to change), and in CI the shipped unit's hardening with `MemoryDenyWriteExecute=false` (the documented drop-in)." |
 <!-- /status-table:0086 -->
 
 ## Changelog
@@ -191,3 +192,49 @@ modules a rules file declares, is in review; T4 is planned.
     them through the binary, grants included.
   - **Not changed:** the peer protocol (rules and modules are per-node files). **Not
     decided:** a cap on concurrent long calls, which T2 left to T3 or T4.
+- 2026-10-11 — T4: the documentation, written for an operator who has not read the ADR.
+  - **RULES.md.** The `jq` section says what it is for, how to switch it on, what it
+    needs from the host under each packaging and exactly what to do there, each limit
+    with its error text and counted kind, what it costs (a call, the first load, memory
+    once and per instance, the binary) with the conditions of each figure, what a long
+    call does and that nothing caps how many run at once, the series to watch, and the
+    steps from a converted EMQX rule to a running one. The modules section gained when to
+    write one (rule SQL, then `jq`, then a module), the ABI and the frame on one page,
+    and one statement of who can make the broker run what.
+  - **The cookbook.** Four rules that are worth a `jq` call (a mean over an array, a
+    summary per group, flattening a document of any shape, removing a key at every
+    depth) and nine statements that are not, each beside the rule SQL that prints the
+    same. The cookbook's tests run every one through the binary, the rule SQL forms with
+    `jq` switched off; two more tests load the documents' `jq` snippets with the real
+    module and run their `MQTTD_RULES_JQ=1 mqttd --rule-test` commands; like the other
+    `jq` tests they skip on a laptop whose build has no module and fail under CI.
+  - **THREAT-MODEL.md and HARDENING.md.** Eleven rows under "Rule functions in the
+    WebAssembly sandbox", each naming the tests that fail without its mitigation, and
+    six accepted risks: the compiler in the trust base; executable pages and
+    process-wide fault handlers once a module is loaded; concurrent long calls bounded
+    only by the runtime's blocking-thread limit, each holding an instance of up to its
+    memory limit; a program and a timeout taken from a payload; one task for the events
+    of clients that are not connected; the source tarballs' host. H-7.12 to H-7.15, and
+    the three positions an installation can take (not in the binary, in it and unused,
+    in use) with what the last gives up.
+  - **Checked while writing, not assumed.** A static `aarch64-unknown-linux-musl` build
+    of this tree in the release image's base image, run as `deploy/compose` runs it
+    (read-only root, all capabilities dropped, `no-new-privileges`, uid 65532, Docker's
+    default seccomp profile): `jq` compiles and runs. Pods with the Helm chart's security
+    context on a kind cluster (Kubernetes 1.36, containerd 2.3, Linux arm64), with and
+    without `seccompProfile: RuntimeDefault`: the same. Not tested on a managed cluster.
+    A module beside the rules file in a ConfigMap volume's symlinked layout loads. That
+    binary is 24.3 MB, and 16.9 MB built without the `jq` cargo feature. CI's
+    `wasm sandbox` job now also runs the broker under the shipped unit's hardening with
+    `MemoryDenyWriteExecute=false`, the drop-in the documents tell an operator to write,
+    and requires `jq` and a module to load and run there.
+  - **Found wrong or imprecise, and corrected.** docs/CONFIGURATION.md linked ADR 0086
+    by a path that leads out of the repository (the generator now rewrites the doc
+    comment's crate-relative link). The stack limit's error for `jq` is
+    `sandbox_limit (stack)` or, when the module's own C stack runs out first, a trap
+    reported as `jq_err_system` and counted as `trap`; RULES.md said only that the rule
+    fails. The hand-off is per entry into a module, not per call of a function (ADR
+    amendment): the test bound of two that #913 set is the mechanism's, not a tolerance.
+  - **Not decided, still:** the cap on concurrent long calls. It is documented as it
+    behaves, as an accepted risk with the operator's mitigations (low timeouts, low
+    `memory_mib`, the ACL, a memory limit on the process).

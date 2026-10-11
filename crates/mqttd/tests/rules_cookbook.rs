@@ -998,6 +998,126 @@ const RULE_TESTS: [(&str, &str, &str, i32, &str); 3] = [
     ),
 ];
 
+/// The cookbook's `jq` section (ADR 0086): statements run offline with `rules.jq`
+/// switched on, as its commands switch it on.
+const JQ_SECTION: &str = "jq: when it earns its cost";
+
+/// What switches `jq` on for one command.
+const JQ_ON: (&str, &str) = ("MQTTD_RULES_JQ", "1");
+
+/// The topic every statement of the section runs on.
+const JQ_TOPIC: &str = "sensors/dev-1/data";
+
+/// The message most of them run on: four readings of two sensors, one of them invalid.
+const JQ_SAMPLE: &str = r#"{"device": "dev-1", "readings": [{"id": "a", "temp": 61.5, "ok": true}, {"id": "b", "temp": 48.0, "ok": true}, {"id": "a", "temp": 72.0, "ok": true}, {"id": "b", "temp": -999, "ok": false}]}"#;
+
+/// A rule that is worth its `jq` call: rule SQL has no way to say what its program does.
+struct JqRecipe {
+    id: &'static str,
+    sql: &'static str,
+    /// Its one action, as the rules file writes it.
+    action: &'static str,
+    payload: &'static str,
+    /// What `mqttd --rule-test` prints for `sql` on `payload`, a line per output.
+    shown: &'static [&'static str],
+}
+
+const JQ_RECIPES: [JqRecipe; 4] = [
+    // An aggregate over an array: the mean of the readings that are valid.
+    JqRecipe {
+        id: "mean_temperature",
+        sql: r#"SELECT topic(2) AS device, first(jq('[.readings[] | select(.ok) | .temp] | if length > 0 then add / length else null end', payload)) AS mean FROM "sensors/+/data""#,
+        action: r#"{ function = "republish", args = { topic = "sensors/${device}/mean", payload = "${.}" } }"#,
+        payload: JQ_SAMPLE,
+        shown: &[r#"{"device":"dev-1","mean":60.5}"#],
+    },
+    // Grouping: one output per sensor in the message, with its count and its maximum.
+    JqRecipe {
+        id: "per_sensor_summary",
+        sql: r#"FOREACH jq('.readings | map(select(.ok)) | group_by(.id)[] | {id: .[0].id, n: length, max: (map(.temp) | max)}', payload) DO topic(2) AS device, item.id AS sensor, item.n AS n, item.max AS max FROM "sensors/+/data""#,
+        action: r#"{ function = "republish", args = { topic = "sensors/${device}/summary", payload = "${.}" } }"#,
+        payload: JQ_SAMPLE,
+        shown: &[
+            r#"{"device":"dev-1","sensor":"a","n":2,"max":72.0}"#,
+            r#"{"device":"dev-1","sensor":"b","n":1,"max":48.0}"#,
+        ],
+    },
+    // A shape not known in advance: every scalar of a document, under its dotted path.
+    JqRecipe {
+        id: "flatten_any_depth",
+        sql: r#"SELECT topic(2) AS device, first(jq('[paths(scalars) as $p | {key: ($p | map(tostring) | join(".")), value: getpath($p)}] | from_entries', payload)) AS flat FROM "sensors/+/data""#,
+        action: r#"{ function = "republish", args = { topic = "sensors/${device}/flat", payload = "${flat}" } }"#,
+        payload: r#"{"site": {"name": "oslo", "pos": {"lat": 59.9, "lon": 10.7}}, "tags": ["roof", "south"]}"#,
+        shown: &[
+            r#"{"device":"dev-1","flat":{"site.name":"oslo","site.pos.lat":59.9,"site.pos.lon":10.7,"tags.0":"roof","tags.1":"south"}}"#,
+        ],
+    },
+    // A change at every depth: two keys removed wherever they occur.
+    JqRecipe {
+        id: "strip_secrets",
+        sql: r#"SELECT topic(2) AS device, first(jq('del(.. | objects | .password, .token)', payload)) AS clean FROM "sensors/+/data""#,
+        action: r#"{ function = "republish", args = { topic = "sensors/${device}/clean", payload = "${clean}" } }"#,
+        payload: r#"{"user": "kim", "password": "hunter2", "session": {"token": "t-1", "ttl": 60}, "devices": [{"id": 1, "token": "t-2"}]}"#,
+        shown: &[
+            r#"{"device":"dev-1","clean":{"user":"kim","session":{"ttl":60},"devices":[{"id":1}]}}"#,
+        ],
+    },
+];
+
+/// What does not need `jq`: (the statement with it, the same in rule SQL, what both
+/// print for [`JQ_SAMPLE`]).
+const JQ_REWRITES: [(&str, &str, &[&str]); 9] = [
+    (
+        r#"SELECT first(jq('.device', payload)) AS device FROM "sensors/+/data""#,
+        r#"SELECT payload.device AS device FROM "sensors/+/data""#,
+        &[r#"{"device":"dev-1"}"#],
+    ),
+    (
+        r#"SELECT first(jq('.readings[1].id', payload)) AS id FROM "sensors/+/data""#,
+        r#"SELECT nth(2, payload.readings).id AS id FROM "sensors/+/data""#,
+        &[r#"{"id":"b"}"#],
+    ),
+    (
+        r#"SELECT first(jq('.readings | length', payload)) AS n FROM "sensors/+/data""#,
+        r#"SELECT length(payload.readings) AS n FROM "sensors/+/data""#,
+        &[r#"{"n":4}"#],
+    ),
+    (
+        r#"SELECT payload.device AS device FROM "sensors/+/data" WHERE first(jq('.readings | length > 3', payload)) = true"#,
+        r#"SELECT payload.device AS device FROM "sensors/+/data" WHERE length(payload.readings) > 3"#,
+        &[r#"{"device":"dev-1"}"#],
+    ),
+    (
+        r#"FOREACH jq('.readings[] | select(.ok)', payload) DO item.id AS id, item.temp AS temp FROM "sensors/+/data""#,
+        r#"FOREACH payload.readings DO item.id AS id, item.temp AS temp INCASE item.ok = true FROM "sensors/+/data""#,
+        &[
+            r#"{"id":"a","temp":61.5}"#,
+            r#"{"id":"b","temp":48.0}"#,
+            r#"{"id":"a","temp":72.0}"#,
+        ],
+    ),
+    (
+        r#"SELECT first(jq('{id: .device, n: (.readings | length)}', payload)) AS summary FROM "sensors/+/data""#,
+        r#"SELECT payload.device AS summary.id, length(payload.readings) AS summary.n FROM "sensors/+/data""#,
+        &[r#"{"summary":{"id":"dev-1","n":4}}"#],
+    ),
+    (
+        r#"SELECT first(jq('"\(.device)/raw"', payload)) AS name FROM "sensors/+/data""#,
+        r#"SELECT concat(payload.device, '/raw') AS name FROM "sensors/+/data""#,
+        &[r#"{"name":"dev-1/raw"}"#],
+    ),
+    (
+        r#"SELECT first(jq('.unit // "C"', payload)) AS unit FROM "sensors/+/data""#,
+        r#"SELECT coalesce(payload.unit, 'C') AS unit FROM "sensors/+/data""#,
+        &[r#"{"unit":"C"}"#],
+    ),
+    (
+        r#"SELECT first(jq('.device | test("^dev-[0-9]+$")', payload)) AS ok FROM "sensors/+/data""#,
+        r#"SELECT regex_match(payload.device, '^dev-[0-9]+$') AS ok FROM "sensors/+/data""#,
+        &[r#"{"ok":true}"#],
+    ),
+];
+
 /// The broker's log line for recipe 01's console action.
 const CONSOLE_LINE: &str = r#"<logtime>  INFO mqttd::rules: rule console action rule=debug_factory output={"id":"<id>","clientid":"plc-1","username":"undefined","payload":"{\"t\": 20.5}","peerhost":"127.0.0.1","peername":"127.0.0.1:<port>","topic":"factory/line1/temp","qos":1,"flags":{"dup":false,"retain":false},"pub_props":{"User-Property":{}},"publish_received_at":<ms>,"client_attrs":{},"event":"message.publish","timestamp":<ms>,"node":"node-local","metadata":{"rule_id":"debug_factory"}}"#;
 
@@ -1232,6 +1352,71 @@ fn rule_test_cmd(sql: &str, topic: &str, payload: &str) -> String {
         quoted(topic),
         quoted(payload)
     )
+}
+
+/// A statement as one shell argument. A statement with a `'` in it, as every call of
+/// `jq` has, is written in `$'…'`, where `\'` is a quote and `\\` a backslash and
+/// nothing else of a jq program (`"`, `$name`, `|`) means anything to the shell.
+fn sql_arg(sql: &str) -> String {
+    if sql.contains('\'') {
+        format!("$'{}'", sql.replace('\\', "\\\\").replace('\'', "\\'"))
+    } else {
+        quoted(sql)
+    }
+}
+
+/// The command the cookbook shows for a statement that calls `jq`.
+fn jq_cmd(sql: &str, payload: &str) -> String {
+    format!(
+        "{}={} mqttd --rule-test --sql {} --topic {} --payload {}",
+        JQ_ON.0,
+        JQ_ON.1,
+        sql_arg(sql),
+        quoted(JQ_TOPIC),
+        quoted(payload)
+    )
+}
+
+/// A [`JqRecipe`] as a rules file.
+fn jq_rule(r: &JqRecipe) -> String {
+    format!(
+        "[rules.{}]\nsql = '''\n{}\n'''\nactions = [{}]\n",
+        r.id, r.sql, r.action
+    )
+}
+
+/// The `jq` section's blocks: each recipe as a rules file, the command that tries its
+/// statement and what that prints; then each rewrite, with `jq` and without, and what
+/// both print.
+fn jq_blocks() -> Vec<WantBlock> {
+    let mut want = Vec::new();
+    for r in &JQ_RECIPES {
+        want.push(WantBlock::exact(
+            "toml",
+            jq_rule(r).lines().map(String::from),
+        ));
+        want.push(WantBlock::exact("sh", [jq_cmd(r.sql, r.payload)]));
+        want.push(WantBlock::exact(
+            "text",
+            r.shown.iter().map(ToString::to_string),
+        ));
+    }
+    for (with_jq, plain, shown) in JQ_REWRITES {
+        want.push(WantBlock::exact(
+            "sql",
+            [
+                "-- with jq".to_string(),
+                with_jq.to_string(),
+                "-- in rule SQL".to_string(),
+                plain.to_string(),
+            ],
+        ));
+        want.push(WantBlock::exact(
+            "text",
+            shown.iter().map(ToString::to_string),
+        ));
+    }
+    want
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -1707,6 +1892,9 @@ fn section_blocks(heading: &str) -> Vec<WantBlock> {
     if heading == QUICK_START {
         return quick_start_blocks();
     }
+    if heading == JQ_SECTION {
+        return jq_blocks();
+    }
     let Some(n) = heading
         .split_once(". ")
         .and_then(|(n, _)| n.parse::<u8>().ok())
@@ -1903,7 +2091,13 @@ fn mqttd() -> Command {
 /// cookbook writes it) and return its exit code, stdout and stderr. A regression that
 /// starts a broker instead of exiting is killed by the bounded wait.
 fn run_cli(args: &[&str]) -> (Option<i32>, String, String) {
+    run_cli_with(&[], args)
+}
+
+/// [`run_cli`] with `env` set for the command, as `NAME=value mqttd …` sets it.
+fn run_cli_with(env: &[(&str, &str)], args: &[&str]) -> (Option<i32>, String, String) {
     let child = mqttd()
+        .envs(env.iter().copied())
         .current_dir(repo_root())
         .args(args)
         .stdin(Stdio::null())
@@ -2548,6 +2742,65 @@ fn recipe_01_rule_test_runs_a_statement_offline() {
             format!("{shown}\n"),
             "{payload}"
         );
+    }
+}
+
+/// The `jq` section (ADR 0086 T4). Each rule worth its `jq` call prints, through
+/// `mqttd --rule-test` with `rules.jq` switched on, exactly what the page shows, and as
+/// the rules file the page shows it passes `--check-rules` with no warning. Each
+/// statement the page says does not need `jq` prints the same with `jq` and in rule
+/// SQL, and the rule SQL form runs with `jq` switched off, so it does not call the
+/// sandbox. A rewrite that stopped being equivalent, or a recipe whose output changed,
+/// fails here.
+#[test]
+fn the_jq_recipes_and_their_plain_sql_rewrites_print_what_the_cookbook_shows() {
+    if let Err(why) = mqtt_rules::Jq::built_in() {
+        crate::skip_locally_or_fail_in_ci!(
+            "{why}: run crates/mqtt-wasm-sandbox/jq-module/build.sh (zig 0.16.0) and build \
+             again"
+        );
+    }
+    let rule_test = |env: &[(&str, &str)], sql: &str, payload: &str| {
+        let (code, stdout, stderr) = run_cli_with(
+            env,
+            &[
+                "--rule-test",
+                "--sql",
+                sql,
+                "--topic",
+                JQ_TOPIC,
+                "--payload",
+                payload,
+            ],
+        );
+        assert_eq!(code, Some(0), "{sql}: {stdout}{stderr}");
+        assert_eq!(stderr, "", "{sql}");
+        stdout
+    };
+    let lines = |shown: &[&str]| shown.join("\n") + "\n";
+    for r in &JQ_RECIPES {
+        assert_eq!(
+            rule_test(&[JQ_ON], r.sql, r.payload),
+            lines(r.shown),
+            "{}",
+            r.id
+        );
+        let file = tempfile::NamedTempFile::new().expect("a temp rules file");
+        std::fs::write(file.path(), jq_rule(r)).expect("write the rules file");
+        let path = file.path().to_str().expect("a UTF-8 temp path");
+        let (code, stdout, stderr) = run_cli_with(&[JQ_ON], &["--check-rules", path]);
+        assert_eq!(code, Some(0), "{}: {stdout}{stderr}", r.id);
+        assert_eq!(stderr, "", "{} warns", r.id);
+        assert!(
+            stdout.contains(&format!("\n  {} (enabled): ", r.id)),
+            "{}: {stdout}",
+            r.id
+        );
+    }
+    for (with_jq, plain, shown) in JQ_REWRITES {
+        assert!(with_jq.contains("jq(") && !plain.contains("jq("), "{plain}");
+        assert_eq!(rule_test(&[JQ_ON], with_jq, JQ_SAMPLE), lines(shown));
+        assert_eq!(rule_test(&[], plain, JQ_SAMPLE), lines(shown), "{plain}");
     }
 }
 

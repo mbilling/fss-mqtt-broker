@@ -11,6 +11,12 @@ modules to copy from, one in Rust and one in C.
 | [`rust/`](rust/src/lib.rs) → `geo.wasm` (target `wasm32-unknown-unknown`, no dependencies) | `geo_distance(lat1, lon1, lat2, lon2)`: metres between two points. `geo_within(lat, lon, lat0, lon0, radius_m)`: a boolean | Numbers in and out as JSON; a function's own refusal (a latitude of 91) failing the rule with its message |
 | [`c/`](c/telemetry.c) → `telemetry.wasm` (target `wasm32-wasi`, wasi-libc) | `crc16_modbus(Payload)`: an integer. `site_label(Text)`: `<SITE>/<Text>`. `clock_ms()`: milliseconds since the epoch | A payload's bytes as they are; the two grants a module can be given, an environment variable and the wall clock, and what it reads without them (`/<Text>` and `0`) |
 
+Write a module when neither rule SQL nor `jq` says what you need, or says it too slowly:
+[when to write one](../../docs/RULES.md#your-own-functions-functionsname) has the order
+to try them in, the ABI on one page, the limits, and who can make the broker run what.
+A module is the last resort: it is code you build, pin, place on every node and keep
+building.
+
 ## Build
 
 ```sh
@@ -54,6 +60,15 @@ actions = [{ function = "republish", args = { topic = "depot/near/${clientid}" }
 
 `mqttd --check-rules <the rules file>` loads the modules and says what it loaded, or why
 it did not.
+
+A module is read only from under the rules file's directory, and only with the hash the
+table pins: keep the files there owned by another user than the broker's and not
+writable by it. Declaring a module needs no switch in the broker's configuration, but
+it needs a host that lets the broker map executable memory: under the systemd unit this
+repository ships, `MemoryDenyWriteExecute=false` in a drop-in
+([deploy/systemd/README.md](../../deploy/systemd/README.md)). What a module can and
+cannot do once loaded, and what that rests on, is in
+[THREAT-MODEL.md](../../docs/THREAT-MODEL.md#rule-functions-in-the-webassembly-sandbox-adr-0086).
 
 ## About `unsafe` in the Rust example
 

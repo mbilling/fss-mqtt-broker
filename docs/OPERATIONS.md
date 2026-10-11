@@ -1124,6 +1124,20 @@ operating summary. The engine is unreleased: no release has it yet.
   [RULES.md § Shipping the rules file](RULES.md#shipping-the-rules-file). A release binary
   ignores `MQTTD_RULES_FILE` without a word: a broker running rules logs
   `rule engine: rules loaded` at startup.
+- **`jq` and WebAssembly modules are off unless you ask for them** (ADR 0086). A rules
+  file that calls `jq` loads only where `[rules] jq = true` (`MQTTD_RULES_JQ=1`), which
+  is per node and read at startup: set it on every node, and restart, before such a
+  file arrives. Both `jq` and a module a rules file declares (`[functions.<name>]`) run
+  as compiled code, which the shipped systemd unit's `MemoryDenyWriteExecute=true`
+  forbids: set it to `false` in a drop-in there; the container image and the Helm
+  chart need nothing ([RULES.md](RULES.md#what-jq-needs-from-the-host)). Where the host
+  forbids it the rules file fails to load and names the setting; nothing crashes.
+  The first load of rules that call `jq` takes about half a second longer, once per
+  process (the log says `its WebAssembly module is compiled` with `took_ms`). Watch
+  `mqttd_rule_function_errors_total{function,kind}` for calls stopped at a limit and
+  `mqttd_rule_module_instances{module}` for calls running long at once: nothing caps
+  those, so keep `jq_default_timeout_ms` and each module's `timeout_ms` low and a
+  memory limit on the process ([HARDENING.md](HARDENING.md), H-7.12 to H-7.15).
 - **Validate before you roll:** `mqttd --check-rules <file>` loads the file as the broker
   does and lists every rule (id, enabled or disabled, `FROM`, action count) under a line
   carrying the file's SHA-256. With no file it loads the effective configuration first

@@ -104,6 +104,47 @@ ConfigMap volume is read-only (a rules write through the admin API answers
 ([ADR 0084](adr/0084-watching-and-editing-rules-live.md)). The per-rule statistics and
 trace on `$SYS` work as anywhere else ([RULES.md](RULES.md#watch-and-edit-rules-live)).
 
+**`jq` and WebAssembly modules.** The rule engine's `jq` function is off by default, and a
+rules file that calls it does not load until every pod has the switch
+([RULES.md](RULES.md#jq)):
+
+```yaml
+extraEnv:
+  - name: MQTTD_RULES_FILE
+    value: /etc/mqttd/rules/rules.toml
+  - name: MQTTD_RULES_JQ
+    value: "1"
+```
+
+**The chart's security context does not have to change for it.** `jq`, and any module a
+rules file declares, run as compiled code and need memory the process may map
+executable. Non-root, `allowPrivilegeEscalation: false`, `readOnlyRootFilesystem: true`
+and all capabilities dropped do not forbid that; the chart sets no seccomp profile, and
+adding `seccompProfile: {type: RuntimeDefault}` to `podSecurityContext` (which the
+"restricted" Pod Security Standard requires) does not forbid it either. Checked on a kind
+cluster (Kubernetes 1.36, containerd 2.3, Linux arm64) with pods carrying exactly the
+chart's `podSecurityContext` and `securityContext`, with and without `RuntimeDefault`:
+`mqttd --check-config` reported `rules.jq is on: this host allows compiled code`, and a
+`jq` statement evaluated. **Not tested on a managed cluster**, on nodes with SELinux
+enforcing, or under a seccomp profile of your own; a profile that denies
+`mprotect(PROT_EXEC)`, or an SELinux policy that denies `execmem`, makes a rules file that
+calls `jq` fail to load, with the reason in the pod's log. To ask a cluster directly, run
+the image as a one-off pod with the chart's security context, `MQTTD_RULES_JQ=1`,
+`MQTTD_DURABLE_SESSIONS=0` and the argument `--check-config`, and read its log.
+
+Roll the switch out before the rules that need it: a pod that starts with a rules file
+calling `jq` and no switch does not boot, and a running pod without it rejects the
+reload and keeps its old rules while its neighbours take the new ones
+(`mqttd_rules_info{checksum}` shows the split). The switch is read at startup, so
+changing `extraEnv` restarts the pods, one at a time.
+
+A module file has to lie under the rules file's directory, so it travels in the same
+ConfigMap, as `binaryData` (`kubectl create configmap mqttd-rules --from-file=rules.toml
+--from-file=geo.wasm`), and the rules file names it by its file name and its SHA-256. A
+ConfigMap holds 1 MiB in all, which bounds the modules shipped this way. The kubelet's
+symlinked layout of a ConfigMap volume passes the "under the rules file's directory"
+check (tried with that layout on a local file system, not in a pod).
+
 The operator path cannot do this yet: the `MqttdCluster` CRD has no field that mounts a
 volume or sets an environment variable beside its fixed secrets, so a rules file needs the
 chart.

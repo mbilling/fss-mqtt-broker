@@ -205,14 +205,82 @@ this node owns to its post-departure replicas and waits — then stop the unit a
 from the other nodes' seed lists. Nothing rewrites seed lists at runtime; a joiner whose
 every seed has been decommissioned retries forever without joining.
 
+## Rules that call `jq`, or declare a WebAssembly module: one line to change
+
+The rule engine ([docs/RULES.md](../../docs/RULES.md)) has two things that run as
+WebAssembly compiled to machine code inside the broker: EMQX's `jq` function, and
+functions of your own that a rules file declares as modules (`[functions.<name>]`). Both
+are **off unless you ask for them**: `jq` needs `rules.jq = true` (`MQTTD_RULES_JQ=1`),
+and a module needs a table in the rules file. A broker that uses neither creates none of
+it, and nothing in this section applies to it.
+
+Compiled code needs memory the process may map executable, and this unit forbids exactly
+that with `MemoryDenyWriteExecute=true`. The decision recorded in
+[ADR 0086](../../docs/adr/0086-wasm-rule-functions.md) (D13) is:
+
+- **The unit stays as it is.** `jq` is off by default, and an installation that does not
+  use it keeps the restriction.
+- **You change it, on purpose, when you switch `jq` on or declare a module.** The broker
+  cannot lift a restriction its service manager imposed, and you should see that you are
+  trading it for the feature. There is no slower mode that keeps both.
+
+On every node that will run such rules:
+
+```sh
+sudo systemctl edit mqttd          # opens /etc/systemd/system/mqttd.service.d/override.conf
+```
+
+```ini
+[Service]
+MemoryDenyWriteExecute=false
+```
+
+```sh
+echo 'MQTTD_RULES_JQ=1' | sudo tee -a /etc/mqttd/mqttd.env    # for jq; a module needs no switch
+sudo systemctl restart mqttd       # the unit's properties and rules.jq are read at start
+systemctl show mqttd -p MemoryDenyWriteExecute                # MemoryDenyWriteExecute=no
+```
+
+Use the drop-in; do not edit the unit file, so that an upgrade of the unit keeps your
+change and `systemctl cat mqttd` shows it as yours. Everything else the unit restricts
+stays in force.
+
+**If you forget the drop-in, nothing crashes.** A rules file that calls `jq` or declares a
+module fails to load and says why. At start the broker exits with that error (and
+`Restart=on-failure` retries it five times in five minutes, then stops: read the journal);
+on `systemctl reload` the running rules stay and the reload is rejected. Rules that use
+neither load as before. The message names the line to change:
+
+> ``rule `shape`: jq is not available: the WebAssembly compiler cannot run on this host (it needs memory it may map executable): unable to make memory executable: failed to make memory executable: Permission denied (os error 13). Compiled code needs memory the process may map executable: under systemd set `MemoryDenyWriteExecute=false` for the service (`systemctl edit mqttd`), or lift the seccomp or SELinux rule that forbids it; see RULES.md``
+
+To ask a host the question before a rule depends on the answer, run the config check
+under the property itself. It prints a `warning:` line with the same explanation when
+compiled code is refused, and `rules.jq is on: this host allows compiled code` when it is
+not, and exits 0 either way:
+
+```sh
+sudo systemd-run --wait --pipe --collect --quiet -p MemoryDenyWriteExecute=true \
+  -E MQTTD_RULES_JQ=1 -E MQTTD_DURABLE_SESSIONS=0 /usr/local/bin/mqttd --check-config
+```
+
+CI runs the broker this way under this unit's hardening properties on every change to the
+unit or the sandbox, and requires both halves: refused with the message above while the
+property is `true`, loading and running the same rules once it is `false`.
+
+What you give up by setting it to `false`, and how to bound what `jq` and modules can
+cost, is in [docs/HARDENING.md](../../docs/HARDENING.md) (H-7.12 to H-7.15). In
+particular keep `MemoryMax` below: concurrent long `jq` calls are not capped by the
+broker, and the cgroup limit is the hard bound.
+
 ## What the unit does for you
 
 `ProtectSystem=strict` with `/var/lib/mqttd` as the only writable path,
 `CapabilityBoundingSet=` (empty — the reference ports are `8883` and `8080`, so no
 capabilities at all; add `AmbientCapabilities=CAP_NET_BIND_SERVICE` only if you bind `:443`
 for WSS),
-`SystemCallFilter=@system-service`, `MemoryDenyWriteExecute`, `NoNewPrivileges`, and
-address families restricted to INET/INET6/UNIX.
+`SystemCallFilter=@system-service`, `MemoryDenyWriteExecute` (which the rule engine's
+`jq` and WebAssembly modules cannot live with: [above](#rules-that-call-jq-or-declare-a-webassembly-module-one-line-to-change)),
+`NoNewPrivileges`, and address families restricted to INET/INET6/UNIX.
 
 `MemoryMax=2G` is a real bound, not decoration: the broker has no total-memory knob yet
 (`docs/SIZING.md` says so plainly), so the cgroup limit is what stands between a runaway

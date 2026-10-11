@@ -334,6 +334,32 @@ jobs:
           grep -qF 'functions `geo`: the WebAssembly compiler cannot run on this host' "$WORK/module.err"
           grep -qF 'MemoryDenyWriteExecute=false' "$WORK/module.err"
           echo "::endgroup::"
+
+          # The way out the messages above and the documentation give (docs/RULES.md,
+          # deploy/systemd/README.md): the SAME hardening with that one property set to
+          # false, as a drop-in sets it. Checked rather than assumed, because the unit's
+          # other restrictions (the system-call filter among them) must leave the compiler
+          # alone, or the documented one-line change would not be enough.
+          echo "::group::the documented drop-in: the unit's hardening with MemoryDenyWriteExecute=false runs jq and a module"
+          RELAXED=("${PROPS[@]/MemoryDenyWriteExecute=true/MemoryDenyWriteExecute=false}")
+          echo "systemd-run ${RELAXED[*]}"
+          case " ${RELAXED[*]} " in
+            *" MemoryDenyWriteExecute=false "*) ;;
+            *) echo "MemoryDenyWriteExecute was not set to false"; exit 1 ;;
+          esac
+          relaxed() {
+            sudo systemd-run --wait --pipe --collect --quiet "${RELAXED[@]}" \
+              -E MQTTD_RULES_JQ=1 -E MQTTD_DURABLE_SESSIONS=0 "$BIN" "$@"
+          }
+          relaxed --check-rules "$WORK/jq.toml"
+          relaxed --rule-test --sql "SELECT jq('.a[]', payload) AS r FROM \"t/#\"" \
+            --payload '{"a":[1,"two"]}' > "$WORK/relaxed.out"
+          cat "$WORK/relaxed.out"
+          [ "$(cat "$WORK/relaxed.out")" = '{"r":[1,"two"]}' ]
+          relaxed --check-config | tee "$WORK/relaxed-host.out"
+          grep -qF 'rules.jq is on: this host allows compiled code' "$WORK/relaxed-host.out"
+          relaxed --check-rules "$WORK/modules/rules.toml"
+          echo "::endgroup::"
       # What loading costs on this runner (the compile a broker pays once, when rules
       # that call jq are loaded), for the record in the log.
       - name: Measurements (module load, instantiate, timeouts, limits)
