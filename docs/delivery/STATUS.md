@@ -93,7 +93,7 @@
 | [0083](../adr/0083-rule-engine.md) | A rule engine on the publish path: EMQX rule SQL, evaluated once per message where it lands | Accepted | [17/17 done](0083-rule-engine.md) | — |
 | [0084](../adr/0084-watching-and-editing-rules-live.md) | Watching and editing rules live | Accepted | [10/10 done](0084-watching-and-editing-rules-live.md) | — |
 | [0085](../adr/0085-rule-state-store.md) | State for rules: a keyed, replicated store read and written from SQL | Proposed | [0/10 done](0085-rule-state-store.md) | 10 open |
-| [0086](../adr/0086-wasm-rule-functions.md) | Rule functions in a WebAssembly sandbox: the real jq first, operator plugins on the same mechanism | Accepted | [2/4 done](0086-wasm-rule-functions.md) | 2 open |
+| [0086](../adr/0086-wasm-rule-functions.md) | Rule functions in a WebAssembly sandbox: the real jq first, operator plugins on the same mechanism | Accepted | [3/4 done](0086-wasm-rule-functions.md) | 1 open |
 
 ## Open and deferred work
 
@@ -233,5 +233,4 @@
 
 **0086 — Rule functions in a WebAssembly sandbox: the real jq first, operator plugins on the same mechanism**
 
-- `0086-T3` 🚧 in-progress ([#907](https://github.com/mbilling/fss-mqtt-broker/issues/907)): "Operator plugins: [functions.<name>] in the rules file, pinned by sha256, load-time checks, live reload, the admin view, worked examples in Rust and C" — "One PR carries it: `[functions.<name>]` in the rules file (`wasm`, `sha256`, `functions`, `timeout_ms`, `memory_mib`, `clock`, `env`, `fresh_instance`), loaded with the rules at boot, on a reload, through the admin API and in `--check-rules`; each load-time check a load error with its reason (hash, export, ABI version, import, a function the module does not describe, a name that is a built-in's or any EMQX function's); a module read only from under the rules file's directory, and its environment only from `rules.functions_env` (ADR amendment); limits and the output budget as for jq; a declaration that did not change keeps its module across a reload and a call in flight finishes on the old one (held in the rule engine's hand-off, and through the binary with a two-second call across an admin API write); `modules[]` in `GET /admin/v1/rules` and `mqttd --admin rules`; `--rule-test` with the configured file's modules; two examples, Rust and C, built in CI and called through the binary."
 - `0086-T4` ⬜ planned ([#908](https://github.com/mbilling/fss-mqtt-broker/issues/908)): "Documentation: RULES.md (the function, its limits, its cost), the departures from EMQX, threat model and hardening rows, the cookbook" — "Follows T2."
