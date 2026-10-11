@@ -229,6 +229,9 @@ pub struct Store {
     kept: Option<Mutex<Vec<Arc<Namespace>>>>,
     /// How often a connection's dictionary was refused room.
     dictionary_refused: AtomicU64,
+    /// What the connections' dictionaries hold together, in bytes: the part of the
+    /// store's total that is in no namespace.
+    dictionary_bytes: AtomicU64,
 }
 
 /// One namespace's counts ([`Store::stats`]).
@@ -309,6 +312,7 @@ impl Store {
             namespaces: Mutex::new(HashMap::new()),
             kept: None,
             dictionary_refused: AtomicU64::new(0),
+            dictionary_bytes: AtomicU64::new(0),
         })
     }
 
@@ -475,11 +479,13 @@ impl StateStore for Store {
                 ),
             );
         }
+        self.dictionary_bytes.fetch_add(bytes, Relaxed);
         Ok(())
     }
 
     fn dictionary_shrink(&self, bytes: u64) {
         self.shared.bytes.fetch_sub(bytes, Relaxed);
+        self.dictionary_bytes.fetch_sub(bytes, Relaxed);
     }
 }
 
@@ -561,12 +567,24 @@ struct Shard {
     used: BTreeMap<u64, Arc<[u8]>>,
     /// The keys that expire, by [`expiry_slot`].
     expiry: BTreeSet<(u64, Arc<[u8]>)>,
+    /// The calls answered here, by operation ([`admin::OPS`]): counted under the lock
+    /// the call already holds, so counting shares no cache line between shards.
+    ops: [u64; admin::OPS.len()],
+    /// The keys removed here because their expiry had passed.
+    expired: u64,
+    /// How often a key was put into or taken out of `map`: what tells a listing, which
+    /// walks the map a few keys at a time between holds of the lock, that the map
+    /// changed under it. **Every insertion and removal goes through [`put`](Self::put)
+    /// or [`take`](Self::take)**, which count it; one that did not could hide a key
+    /// from a listing.
+    changes: u64,
 }
 
 impl Shard {
     /// Take `key` out of the map and both orders.
     fn take(&mut self, key: &[u8]) -> Option<Entry> {
         let entry = self.map.remove(key)?;
+        self.changes = self.changes.wrapping_add(1);
         if entry.used != 0 {
             self.used.remove(&entry.used);
         }
@@ -575,6 +593,12 @@ impl Shard {
                 .remove(&(expiry_slot(entry.expires_ms), entry.key.clone()));
         }
         Some(entry)
+    }
+
+    /// Put a new key's entry into the map.
+    fn put(&mut self, entry: Entry) {
+        self.changes = self.changes.wrapping_add(1);
+        self.map.insert(entry.key.clone(), entry);
     }
 }
 
@@ -600,6 +624,16 @@ struct Namespace {
     /// An `eventual` namespace's keys: every call goes there, and `shards` stays
     /// empty. The counts and the refusals above are kept either way.
     replica: Option<replica::Replica>,
+    /// Which namespace of this name this is: drawn at random when it is made, so a
+    /// listing's cursor is not taken up by a later namespace of the same name, whose
+    /// keys lie in other shards.
+    instance: u64,
+    /// The calls the store refused, by operation and reason ([`admin::OPS`] by
+    /// [`REFUSALS`]). A refusal is the rare path; the calls answered are counted in
+    /// the shards.
+    failed: Box<[AtomicU64]>,
+    /// The keys an operator deleted (D10).
+    admin_deleted: AtomicU64,
 }
 
 impl Drop for Namespace {
@@ -683,6 +717,11 @@ impl Namespace {
             purged_ms: AtomicU64::new(0),
             refused: Default::default(),
             evicted: AtomicU64::new(0),
+            instance: RandomState::new().hash_one(name),
+            failed: (0..admin::OPS.len() * REFUSALS)
+                .map(|_| AtomicU64::new(0))
+                .collect(),
+            admin_deleted: AtomicU64::new(0),
         }
     }
 
@@ -812,8 +851,9 @@ impl Namespace {
             let Some((_, key)) = due.then(|| shard.expiry.pop_first()).flatten() else {
                 break;
             };
-            if shard.map.get(&*key).is_some_and(|e| e.expired(now_ms)) {
-                any |= self.remove(shard, &key);
+            if shard.map.get(&*key).is_some_and(|e| e.expired(now_ms)) && self.remove(shard, &key) {
+                shard.expired += 1;
+                any = true;
             }
         }
         any
@@ -932,7 +972,7 @@ impl Namespace {
         }
         let key: Arc<[u8]> = Arc::from(key);
         let mut entry = Entry {
-            key: key.clone(),
+            key,
             data,
             expires_ms: 0,
             bytes,
@@ -946,7 +986,7 @@ impl Namespace {
             ttl.or(settings.default_ttl_secs),
             now_ms,
         );
-        shard.map.insert(key, entry);
+        shard.put(entry);
         Ok(())
     }
 }
@@ -1027,6 +1067,9 @@ impl Handle {
         let at = ns.shard_of(key);
         let mut shard = lock_shard(&ns.shards[at]);
         let step = self.apply(op, key, &mut shard, now_ms);
+        if matches!(step, Ok(Step::Done(_))) {
+            shard.ops[admin::op_index(op)] += 1;
+        }
         if !shard.used.is_empty() || ns.oldest[at].load(Relaxed) != NOT_IN_ORDER {
             ns.note_oldest(at, &shard);
         }
@@ -1045,8 +1088,8 @@ impl Handle {
         let ns = &*self.namespace;
         let settings = &self.settings;
         // A key past its expiry reads as absent, and is removed by whoever finds it.
-        if shard.map.get(key).is_some_and(|e| e.expired(now_ms)) {
-            ns.remove(shard, key);
+        if shard.map.get(key).is_some_and(|e| e.expired(now_ms)) && ns.remove(shard, key) {
+            shard.expired += 1;
         }
         // A new key: reserve, insert, and answer `$reply`; or ask for room.
         macro_rules! insert {
@@ -1343,6 +1386,14 @@ impl Handle {
 
 impl StateNamespace for Handle {
     fn call(&self, op: &StateOp<'_>) -> Result<StateReply, StateError> {
+        self.answer(op)
+            .inspect_err(|refused| self.namespace.count_failed(op, refused.reason))
+    }
+}
+
+impl Handle {
+    /// [`call`](StateNamespace::call), before a refusal is counted by operation.
+    fn answer(&self, op: &StateOp<'_>) -> Result<StateReply, StateError> {
         if let Some(replica) = &self.namespace.replica {
             return replica.call(self, op);
         }
@@ -1384,6 +1435,13 @@ pub fn stored(value: &Value) -> Stored<'_> {
 
 mod held;
 pub use held::HeldKey;
+mod admin;
+pub mod report;
+
+pub use admin::{
+    Cursor, KeyInfo, KeyView, KeysError, Limits, NamespaceCounts, Page, Selector, StoreTotals,
+    MAX_PAGE_BYTES, MAX_PAGE_KEYS, OPS, PAGE_TIME, RESULTS,
+};
 
 #[cfg(test)]
 mod tests;

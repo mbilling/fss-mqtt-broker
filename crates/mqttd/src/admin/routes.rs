@@ -150,6 +150,26 @@ const ENDPOINTS: &[Endpoint] = &[
         min_role: Role::Operator,
     },
     Endpoint {
+        method: "GET",
+        path: "/admin/v1/rules/state",
+        min_role: Role::Viewer,
+    },
+    Endpoint {
+        method: "GET",
+        path: "/admin/v1/rules/state/keys",
+        min_role: Role::Operator,
+    },
+    Endpoint {
+        method: "GET",
+        path: "/admin/v1/rules/state/key",
+        min_role: Role::Operator,
+    },
+    Endpoint {
+        method: "DELETE",
+        path: "/admin/v1/rules/state/key",
+        min_role: Role::Operator,
+    },
+    Endpoint {
         method: "PUT",
         path: "/admin/v1/rule",
         min_role: Role::Operator,
@@ -287,6 +307,10 @@ pub async fn route(state: &AdminState, caller: &Caller, role: Role, req: &Reques
         "/admin/v1/rules/source" => super::rules::source(state).await,
         "/admin/v1/rules/check" => super::rules::check(state, req).await,
         "/admin/v1/rules/test" => super::rules::test(state, req).await,
+        "/admin/v1/rules/state" => super::state::overview(state).await,
+        "/admin/v1/rules/state/keys" => super::state::keys(state, req).await,
+        "/admin/v1/rules/state/key" if req.method == "GET" => super::state::key(state, req).await,
+        "/admin/v1/rules/state/key" => super::state::delete_key(state, caller, req).await,
         "/admin/v1/rule" if req.method == "PUT" => super::rules::put_rule(state, caller, req).await,
         "/admin/v1/rule" => super::rules::delete_rule(state, caller, req).await,
         _ => error(404, "not-found", "no such admin endpoint"),

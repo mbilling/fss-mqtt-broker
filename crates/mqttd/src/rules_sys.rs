@@ -14,6 +14,12 @@
 //!   `$SYS/brokers/<node>/trace/rules/<id>`, at most max(`trace_rate`, 200) a second for
 //!   the node.
 //!
+//! [`run_stats`] also publishes, in the same tick and under the same rules, one message
+//! per namespace of the rule state store on `$SYS/brokers/<node>/rule_state/<namespace>`
+//! ([ADR 0085](../../../docs/adr/0085-rule-state-store.md) D10): its mode, bounds, counts
+//! and rates. That is a subtree of its own, which a grant on `…/rules/#` does not cover,
+//! and it never carries a key or a value.
+//!
 //! Every message is `QoS` 0, never retained, routed by [`HubCommand::SysPublish`], and
 //! takes node-pool ingress credit first (ADR 0082): when the pool is short the rest of a
 //! statistics tick is skipped and a trace record dropped, each counted, so both yield to
@@ -44,6 +50,8 @@ use tokio_util::sync::CancellationToken;
 use crate::hub::HubCommand;
 use crate::ingress::IngressCredit;
 use crate::reload::LastReload;
+use crate::rule_state::report::NamespaceReport;
+use crate::rule_state::NamespaceCounts;
 use crate::rules::{
     rule_def, ErrorKind, LastError, Rules, RulesObserve, TraceOutput, TracePayload, TraceRecord,
     TraceTrigger, TracedMessage, FAILURE_WARN_INTERVAL_SECS,
@@ -206,6 +214,58 @@ struct Stats {
     /// The running set's digest and each rule's definition hash, recomputed on a reload.
     defs_of: String,
     defs: HashMap<Arc<str>, String>,
+    /// Each state namespace's counts at the previous tick (ADR 0085 D10).
+    state_prev: HashMap<String, NamespaceCounts>,
+}
+
+/// How long the rule state series of `/metrics` go without being brought up to date
+/// when nothing scrapes them: the OTLP export reads them too.
+const STATE_METRICS_EVERY: Duration = Duration::from_secs(15);
+
+/// Keep the rule state series of `/metrics` up to date until `shutdown` (ADR 0085
+/// D10). A scrape brings them up to date itself; this is for the OTLP export.
+pub async fn run_state_metrics(rules: Rules, shutdown: CancellationToken) {
+    if rules.state().is_none() || rules.metrics().is_none() {
+        return;
+    }
+    loop {
+        tokio::select! {
+            () = shutdown.cancelled() => return,
+            () = tokio::time::sleep(STATE_METRICS_EVERY) => rules.export_state_metrics(),
+        }
+    }
+}
+
+/// One state namespace as `$SYS` shows it (ADR 0085 D10): what the admin API's
+/// overview says of it, with the node, the time and the rates over the last interval.
+/// No key and no value.
+#[allow(clippy::cast_precision_loss)] // counter growth per tick, far below 2^52
+fn state_json(
+    node: &str,
+    at_s: &str,
+    report: &NamespaceReport,
+    before: Option<&NamespaceCounts>,
+    secs: f64,
+) -> Value {
+    let rate = |now: u64, then: u64| {
+        if secs > 0.0 && before.is_some() {
+            (now.saturating_sub(then) as f64 / secs * 1000.0).round() / 1000.0
+        } else {
+            0.0
+        }
+    };
+    let now = &report.counts;
+    let then = before.copied().unwrap_or_default();
+    let mut doc = report.json();
+    doc["node"] = json!(node);
+    doc["at"] = json!(at_s);
+    doc["rates"] = json!({
+        "calls": rate(now.calls_ok(), then.calls_ok()),
+        "refused": rate(now.refused().iter().sum(), then.refused().iter().sum()),
+        "expired": rate(now.expired, then.expired),
+        "evicted": rate(now.evicted, then.evicted),
+    });
+    doc
 }
 
 fn matched(c: &RuleCounts) -> u64 {
@@ -373,6 +433,23 @@ impl Stats {
             counted.insert(id.clone(), counts);
         }
         self.prev = counted;
+        // The state the rules keep, one message per namespace (ADR 0085 D10).
+        let mut state_counted = HashMap::new();
+        if let Some(store) = ctx.rules.state() {
+            for report in crate::rule_state::report::namespaces(store, &set) {
+                // A namespace dropped and declared again counts from zero.
+                let before = self
+                    .state_prev
+                    .get(&report.name)
+                    .filter(|before| before.instance == report.counts.instance);
+                messages.push((
+                    format!("$SYS/brokers/{}/rule_state/{}", self.node, report.name),
+                    state_json(&self.node, &at_s, &report, before, secs).to_string(),
+                ));
+                state_counted.insert(report.name, report.counts);
+            }
+        }
+        self.state_prev = state_counted;
         if self.seen.len() > SEEN_MAX {
             self.seen.retain(|id, _| self.prev.contains_key(id));
         }

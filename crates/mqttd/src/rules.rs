@@ -114,6 +114,9 @@ pub struct Rules {
     /// The store the running rules keep their state in (ADR 0085); `None` where rule
     /// state is switched off. The same store `functions` carries.
     state: Option<Arc<crate::rule_state::Store>>,
+    /// What of the store's counts `/metrics` has (ADR 0085 D10): one exporter for the
+    /// node, whoever asks it to look.
+    state_metrics: Arc<std::sync::Mutex<crate::rule_state::report::Exporter>>,
 }
 
 impl std::fmt::Debug for Rules {
@@ -640,6 +643,19 @@ impl Rules {
             peers_want_origin: Arc::new(AtomicBool::new(false)),
             functions: Functions::default(),
             state: None,
+            state_metrics: Arc::default(),
+        }
+    }
+
+    /// Bring the rule state series of `/metrics` up to what the store holds now (ADR
+    /// 0085 D10). Called at a scrape and on a timer; nothing where rule state or
+    /// metrics are off.
+    pub fn export_state_metrics(&self) {
+        if let (Some(store), Some(metrics)) = (&self.state, &self.metrics) {
+            self.state_metrics
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .export(store, &self.current(), metrics);
         }
     }
 

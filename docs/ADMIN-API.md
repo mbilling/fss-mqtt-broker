@@ -101,7 +101,8 @@ broker warns at startup).
 - **Paths** are versioned: `/admin/v1/…`.
 - **Methods**: reads are `GET`; actions are `POST` with no body. The rules endpoints are the
   exception: `rules/check` and `rules/test` are `POST`s and the writes are `PUT`s, each with
-  a JSON body (`Content-Type: application/json`), and `DELETE /admin/v1/rule` has no body.
+  a JSON body (`Content-Type: application/json`), and `DELETE /admin/v1/rule` and
+  `DELETE /admin/v1/rules/state/key` have no body.
 - **Parameters** are query parameters, percent-encoded. A `+` is a literal `+` (not a space):
   encode a space as `%20`.
 - **Responses** are JSON, with `Content-Type: application/json` and `Cache-Control: no-store`.
@@ -129,11 +130,13 @@ the refusals it makes itself (all but a `503`). Match on `code`; the message is 
 |---|---|---|
 | 400 | `bad-request` | a missing or malformed parameter, a wildcard where a topic name is needed, an invalid filter, an unreadable request |
 | 403 | `forbidden` | the certificate's subject is in no role list, or its role is below the endpoint's |
-| 404 | `not-found` | no such endpoint, no such session / connection, or no such rule (`DELETE /admin/v1/rule`, `rules/test`'s `only`) |
+| 404 | `not-found` | no such endpoint, no such session / connection, no such rule (`DELETE /admin/v1/rule`, `rules/test`'s `only`), or no such state namespace or key (`rules/state/keys`, `rules/state/key`) |
 | 405 | `method-not-allowed` | a known path with the wrong method |
 | 400 | `topic-reserved` | `rules/test` was given a topic in the broker-reserved `$SYS` tree, which no client can publish to |
-| 403 | `rules-read-only` | a rules write while `[rules] admin_writers` is empty |
-| 403 | `not-a-rules-writer` | a rules write by an operator whose subject is not in `[rules] admin_writers` |
+| 403 | `rules-read-only` | a rules write, or a delete of a state key, while `[rules] admin_writers` is empty |
+| 403 | `not-a-rules-writer` | a rules write, or a delete of a state key, by an operator whose subject is not in `[rules] admin_writers` |
+| 409 | `cursor-stale` | a `rules/state/keys` cursor from a namespace that a reload has dropped and declared again since: start the listing over |
+| 409 | `rule-state-off` | a state key endpoint on a node where rule state is switched off (`rules.state_max_bytes = 0`) |
 | 409 | `reload-rejected` | the reloaded config or policy was refused; the running one is kept (the body also carries `outcome`). After a rules write, the file **was** written (`written: true`) and the reload was refused for another reason |
 | 409 | `rules-file-unset` | no rules file is configured (`rules.file` / `MQTTD_RULES_FILE`): `rules/source`, a `check` or `test` with `rule`, and every write |
 | 409 | `rules-file-unreadable` | the configured rules file is missing or cannot be read: `rules/source`, a `check` or `test` with `rule`, and a per-rule `PUT` or `DELETE` (a whole-file `PUT` with `if_match=*` creates a missing file instead) |
@@ -165,6 +168,7 @@ HTTP/1.1 403 Forbidden
 | concurrent connections | 32 (more wait in the accept backlog) |
 | time to answer | 30 s |
 | rows per page | 1000 |
+| one page of state keys | 1000 keys, 256 KiB of keys, 50 ms of looking; a page that reaches a bound early is short and still has a `next_cursor` |
 | cluster view, per peer | 3 s |
 
 Listing and ranking (`clients`, `backlog`, `subscribers`) visit every session on the node once
@@ -188,6 +192,19 @@ is replaced, and its reload a `security.reload` with `trigger=admin-rules`:
 
 ```text
 kind="rules.write" subject="CN=rules-ui"  op=put-rule rule=high_temp old=2f027340… new=8c1d55e0… applied=true
+```
+
+**The audit log names no rule state key.** A key is built from client ids, topic levels
+and payload fields, and the audit log is read by more people than may read payload data.
+So the record of a request to `rules/state/keys` or `rules/state/key` carries
+`key_sha256` and `key_bytes` (and `prefix_sha256`, `prefix_bytes`) in place of `key` and
+`prefix`: the SHA-256 and the length of the bytes the parameter named, whatever its
+encoding. A delete of a key is also a `state.delete` record with the same hash, so whoever
+knows a key can find what was done to it (`printf %s 'hot:dev-1' | sha256sum`):
+
+```text
+kind="admin.request" subject="CN=rules-ui"  role=operator DELETE /admin/v1/rules/state/key?ns=alerts&key_sha256=b5975f61…&key_bytes=9 -> 200
+kind="state.delete"  subject="CN=rules-ui"  ns=alerts key_sha256=b5975f61… key_bytes=9 deleted=true
 ```
 
 ## The cluster view
@@ -363,6 +380,58 @@ given: that is why `test`, like the source, needs the operator role.
 each node. `/statusz` carries the running `rules` digest, and the
 [cluster view](#get-adminv1cluster) compares it across nodes (`same_rules`).
 
+## Rule state
+
+The state endpoints ([ADR 0085](adr/0085-rule-state-store.md) D10) show what the rules on
+this node remember between messages ([RULES.md](RULES.md#state-what-a-rule-remembers)) and
+let a rules writer delete a key. Like the rules endpoints they answer for the node they
+run on and name it.
+
+**Who sees what.** A key is built from client ids, topic levels and payload fields, and a
+value is payload data. A viewer therefore reads counts only (`rules/state`); listing keys
+and reading a value need the operator role, as the rules' SQL does; and a delete, which
+changes what the rules decide next, needs what a rules write needs: the operator role and
+a subject listed in `[rules] admin_writers`. `$SYS` and `/metrics` carry the counts and
+never a key or a value.
+
+**How a key is written.** A key is bytes. It is shown as `key` with `key_encoding`, and
+addressed with the same two as parameters, so what a listing shows is what a read or a
+delete takes:
+
+| `key_encoding` | `key` is | For |
+|---|---|---|
+| `utf8` (the default) | the key's text | a key that is UTF-8, control characters included |
+| `base64` | the key's bytes, in base64 | a key that is not UTF-8 |
+| `term` | base64 of the bytes the store matches the key by | in `kv_store` only: a key that is not a string. EMQX's table takes a key of any type and matches it exactly (`1`, `1.0` and `'1'` are three keys). Such a key also has `term`, the key as the rule engine writes it (`1.0`, `[1,"x"]`, `undefined`), to read; `key` is what names it |
+
+**How a value is written.** As the rule engine writes it (the form a rule's `${payload}`
+has): a string or a binary as its bytes, anything else as JSON text, so an integer of any
+size keeps every digit and a map its order. `value_encoding` says how those bytes are
+carried (`utf8`, or `base64` for bytes that are not UTF-8) and `value_type` what the value
+is: `string`, `binary`, `integer`, `float`, `boolean`, `null`, `array`, `map`, or
+`undefined` (in `kv_store`, where it can be stored). Inside an array or a map, bytes that
+are not UTF-8 read as U+FFFD, as in every JSON the rule engine writes. A counter reads as
+its count, a set as its elements, a sketch as its estimate: what `kv_get` returns.
+
+**Paging.** Keys are listed shard by shard of the store, and within a shard in the order
+of their bytes: a stable order, not one sorted across the namespace. `next_cursor` is a
+place in it. Whatever is written while a listing runs, a key that is there from the first
+page to the last is listed exactly once and no key is listed twice; a key inserted
+meanwhile is listed if its place is after the cursor; a key deleted before the listing
+reaches it is not listed. A page can be short, or empty, and still have a `next_cursor`
+(a `prefix` few keys match): the listing ends when `next_cursor` is `null`. A key past its
+expiry is not listed and reads as `404`, as it reads as absent to a rule; so does a
+deleted key an `eventual` namespace still remembers. An `eventual` namespace is listed in
+the same order with the same promise, whether what changes meanwhile is a rule's write on
+this node or a state merged in from another.
+
+**It does not hold up the publish path.** A listing takes one shard's lock at a time, for
+64 keys at a time; reading a key or the counts is not a use (an `lru` namespace's order
+is as it was) and removes nothing. Measured beside publishes:
+[RULES.md](RULES.md#watching-and-managing-state). A listing of a namespace near its
+largest (1,000,000 keys) is slow, in pages that stop looking after 50 ms: narrow it with
+`prefix` only to read less, not to look less.
+
 ## Endpoint reference
 
 | Method | Path | Role | CLI |
@@ -393,6 +462,10 @@ each node. `/statusz` carries the running `rules` digest, and the
 | PUT | [`/admin/v1/rules`](#put-adminv1rules) | operator + writer | `rules-apply` |
 | PUT | [`/admin/v1/rule`](#put-adminv1rule-delete-adminv1rule) | operator + writer | — |
 | DELETE | [`/admin/v1/rule`](#put-adminv1rule-delete-adminv1rule) | operator + writer | `rule-delete` |
+| GET | [`/admin/v1/rules/state`](#get-adminv1rulesstate) | viewer | `state` |
+| GET | [`/admin/v1/rules/state/keys`](#get-adminv1rulesstatekeys) | operator | `state-keys` |
+| GET | [`/admin/v1/rules/state/key`](#get-adminv1rulesstatekey-delete-adminv1rulesstatekey) | operator | `state-get` |
+| DELETE | [`/admin/v1/rules/state/key`](#get-adminv1rulesstatekey-delete-adminv1rulesstatekey) | operator + writer | `state-del` |
 
 The per-rule `PUT`, `check` and `test` take structured JSON bodies and have no verb
 (ADR 0084 D7); call them over HTTPS, as the [demo's editor](../demo/rules-live/README.md)
@@ -835,6 +908,81 @@ file on disk, or `*`). `PUT` inserts or updates `[rules.<id>]` from the body
 file's shape: `[{"function": "republish", "args": {…}}]`). `DELETE` removes it. The rest of
 the file stays byte for byte ([a per-rule edit](#rules)). The answer is the whole-file
 `PUT`'s.
+
+### `GET /admin/v1/rules/state`
+
+Viewer. What the [rule state](#rule-state) store holds on this node: its total against the
+ceiling, what the connections' dictionaries (`proc_dict_*`) hold, and one object per
+namespace the running rules hold, in name order: the ones the file declares, `kv_store`
+(EMQX's table) when a rule calls `kv_store_*`, and `rule:<id>` for a rule that keeps state
+of its own. No key and no value.
+
+```json
+{"node": "mqttd-1", "enabled": true,
+ "store": {"bytes": 412, "max_bytes": 268435456, "brownout": false},
+ "dictionaries": {"bytes": 16, "refused": 0},
+ "namespaces": [
+   {"namespace": "alerts", "kind": "declared", "consistency": "local", "eviction": "fail",
+    "max_keys": 100000, "max_bytes": 67108864, "default_ttl_secs": 3600, "max_ttl_secs": 2592000,
+    "keys": 2, "bytes": 290, "calls": 340, "refused": 2,
+    "refused_by": {"namespace_full": 2, "store_full": 0, "brownout": 0, "wrong_type": 0, "refused": 0},
+    "expired": 5, "expiry_backlog": 1, "evicted": 0, "deleted": 3}]}
+```
+
+| Field | |
+|---|---|
+| `kind` | `declared`, `kv_store` or `rule` |
+| `consistency`, `eviction`, `max_keys`, `max_bytes`, `default_ttl_secs`, `max_ttl_secs` | the namespace's declaration, as the running rules file has it (`default_ttl_secs` is `null` for `kv_store`, which has no expiry) |
+| `keys`, `bytes` | what it holds now, as the bounds count it; keys past their expiry that are not removed yet are included |
+| `calls` | state calls answered since the namespace was made |
+| `refused`, `refused_by` | calls the store refused, and why; each failed its rule. A call the rule engine refused for its arguments (a key too long, a bad TTL) is not counted here: it is its rule's failed evaluation |
+| `expired`, `expiry_backlog` | keys removed because their expiry had passed, and keys past their expiry that are still held |
+| `evicted`, `deleted` | keys an `lru` namespace evicted to make room, and keys deleted through this API |
+| `tombstone_window_secs`, `replication` | an `eventual` namespace only: how long it remembers a deleted key (such keys count in `keys` and are never listed), and how its replication stands: `links` (the peer links that carry it), `pending` (the most keys any one link has yet to send), `lag_ms` (how long the link furthest behind has had something to send), `merged` (states of other nodes merged in) and `refused_by` (states and frames refused: `declaration`, `clock_skew`, `namespace_full`, `store_full`, `brownout`, `malformed`). The same numbers are `mqttd_rule_state_replication_*` on `/metrics` |
+
+With rule state switched off (`rules.state_max_bytes = 0`) the answer is
+`{"node": …, "enabled": false, "namespaces": []}`.
+
+### `GET /admin/v1/rules/state/keys`
+
+Operator. Parameters: `ns` (required: the namespace), `prefix` and `prefix_encoding`
+(`utf8`, the default, or `base64`; in `kv_store` a prefix is of a string key's text),
+`limit`, `cursor`. One page of the namespace's keys; each is an object with its `type`,
+the type of the function that created it (`lww`, `first`, `max`, `min`, `sum`, `union`,
+`hll`). See [Rule state](#rule-state) for how a key is written and what a page is.
+
+```json
+{"node": "mqttd-1", "namespace": "alerts", "count": 2,
+ "keys": [{"key": "hot:dev-1", "key_encoding": "utf8", "type": "first"},
+          {"key": "/wD+", "key_encoding": "base64", "type": "sum"}],
+ "next_cursor": null}
+```
+
+### `GET /admin/v1/rules/state/key`, `DELETE /admin/v1/rules/state/key`
+
+Parameters: `ns` and `key` (required), `key_encoding` (`utf8` unless given).
+
+`GET` (operator): what the key holds, as a rule would read it, its type and when it
+expires (`null`: never). `404 not-found` when there is no such key, or its expiry has
+passed.
+
+```json
+{"node": "mqttd-1", "namespace": "alerts", "key": "hot:dev-1", "key_encoding": "utf8",
+ "type": "lww", "value": "{\"temp\":31.5,\"serial\":123456789012345678901234567890}",
+ "value_encoding": "utf8", "value_type": "map", "expires_at": "2026-10-11T13:00:00.000Z"}
+```
+
+`DELETE` (operator and listed in `[rules] admin_writers`): deletes the key, whatever its
+type; the next call of a rule finds none. `deleted` says whether a value was there.
+Audited as `state.delete` ([Audit](#audit)), whether or not one was. In a `local`
+namespace, and in `kv_store`, the delete is this node's. In an `eventual` namespace it is
+a replicated delete, as a rule's `kv_del` there: it reaches every node, and the key stays
+counted in `keys`, as a deleted key the namespace remembers, for its `tombstone_window`.
+A key this node does not hold is left alone (`deleted: false`), as `kv_del` leaves it.
+
+```json
+{"node": "mqttd-1", "namespace": "alerts", "key": "hot:dev-1", "key_encoding": "utf8", "deleted": true}
+```
 
 ## Compatibility
 

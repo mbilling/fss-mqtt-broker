@@ -603,6 +603,77 @@ fn a_kv_store_key_is_the_exact_term() {
     assert_eq!(k("1"), term_key(&Value::Int(1)));
 }
 
+/// ADR 0085 D10: a `kv_store_*` key is shown to an operator as the term it was made
+/// of. Every term's key reads back as a term with that very key; bytes that are no
+/// term's key, a key cut short and a key with something after it read back as nothing.
+#[test]
+fn a_kv_store_key_reads_back_as_its_term() {
+    use crate::state::key_term;
+    let mut terms: Vec<Value> = [
+        "1",
+        "-1",
+        "1.0",
+        "0.0",
+        "9223372036854775807",
+        "-9223372036854775808",
+        "9223372036854775808",
+        "-123456789012345678901234567890",
+        "true",
+        "false",
+        "null",
+        "\"\"",
+        "\"text \\u001b with a control character\"",
+        "[]",
+        "[1,[2.5,[\"x\",null]],{}]",
+        "{}",
+        r#"{"b":1,"a":{"z":[1,2],"y":"v"}}"#,
+    ]
+    .iter()
+    .map(|text| json_decode(text.as_bytes()).unwrap())
+    .collect();
+    terms.push(Value::Undefined);
+    terms.push(Value::Float(-0.0));
+    terms.push(Value::Bin(Bytes::from_static(b"\xff\x00\xfe")));
+    terms.push(Value::from(vec![
+        Value::Undefined,
+        Value::Bin(Bytes::from_static(b"\xff")),
+    ]));
+    for term in &terms {
+        let key = term_key(term);
+        let back = key_term(&key).unwrap_or_else(|| panic!("{term:?}"));
+        assert_eq!(term_key(&back), key, "{term:?} came back as {back:?}");
+        assert_eq!(back.type_name(), term.type_name(), "{term:?}");
+        // Cut short anywhere, or with a byte after it, it is no key.
+        for cut in 0..key.len() {
+            assert!(key_term(&key[..cut]).is_none(), "{term:?} cut at {cut}");
+        }
+        let mut longer = key.clone();
+        longer.push(0);
+        assert!(key_term(&longer).is_none(), "{term:?}");
+    }
+    // Text comes back as text, and bytes that are not text as a binary.
+    assert!(matches!(
+        key_term(&term_key(&Value::Bin(Bytes::from_static(b"ab")))),
+        Some(Value::Str(_))
+    ));
+    // An unknown tag; a length the bytes do not hold; nesting without end.
+    let mut huge = vec![8];
+    huge.extend_from_slice(&u64::MAX.to_be_bytes());
+    let mut deep = Vec::new();
+    for _ in 0..10_000 {
+        deep.push(8);
+        deep.extend_from_slice(&1u64.to_be_bytes());
+    }
+    deep.push(1);
+    for bytes in [vec![10], vec![255], huge, deep] {
+        assert!(
+            key_term(&bytes).is_none(),
+            "{:?}",
+            &bytes[..bytes.len().min(12)]
+        );
+    }
+}
+
 #[test]
 fn a_value_is_measured_as_the_rule_engine_writes_it() {
     for (text, bytes) in [

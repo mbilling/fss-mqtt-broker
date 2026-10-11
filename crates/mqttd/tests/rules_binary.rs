@@ -3110,6 +3110,215 @@ async fn an_admin_rules_edit_applies_to_the_next_message() {
     );
 }
 
+const KEEPS_STATE: &str = r#"[state.alerts]
+max_keys = 100
+
+[rules.remember]
+state = "alerts"
+sql = '''SELECT kv_set(payload.k, payload.v) AS v FROM "s/#"'''
+actions = [{ function = "republish", args = { topic = "out/s", payload = "${v}" } }]
+"#;
+
+/// ADR 0085 D10, on the real binary: what an operator sees of the state the rules keep.
+/// `mqttd --admin state` lists the namespace with its counts; `state-keys` lists its keys
+/// and `state-get` reads one, with every control character a publisher put into a key or
+/// a value printed as its escape, in the tables and in `--json`; `state-del` deletes one,
+/// and a read of it then says so. A scrape of `/metrics` has the store's series as they
+/// are at that moment, and `$SYS/brokers/<node>/rule_state/<namespace>` carries the
+/// counts and neither a key nor a value.
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // one operator's session, start to end
+async fn an_operator_sees_and_deletes_rule_state_from_the_command_line() {
+    let dir = tempfile::tempdir().unwrap();
+    let pki_dir = tempfile::tempdir().unwrap();
+    write_rules(dir.path(), KEEPS_STATE);
+    let pki = admin_pki(pki_dir.path());
+    let admin = band_addr();
+    let setup = Setup {
+        toml: "\n[rules]\nsys_interval_secs = 1\n".to_string(),
+        env: admin_env(&pki, admin),
+        rules_by_env: true,
+        ..Setup::default()
+    };
+    let broker = start(dir.path(), "state-node", &setup).await;
+    broker
+        .wait_log(&format!(
+            "serving the admin API (mTLS; ADR 0081) bind={admin} viewers=0 operators=1 \
+             rules_writers=1 peers=false"
+        ))
+        .await;
+    let mut out = Client::connect(broker.addr, "state-out").await;
+    assert_eq!(subscribe(&mut out, 1, "out/#", QoS::AtMostOnce).await, [0]);
+    let mut publ = Client::connect(broker.addr, "state-pub").await;
+    // A key and a value that would drive a terminal: ESC [ 2 J, a carriage return, a C1
+    // control, a line separator.
+    let hostile = "hot:\u{1b}[2J\rdev\u{9b}\u{2028}";
+    let escaped = "hot:\\u{1b}[2J\\rdev\\u{9b}\\u{2028}";
+    let payload = serde_json::json!({"k": hostile, "v": format!("reading {hostile}")});
+    publ.publish(
+        "s/1",
+        payload.to_string().as_bytes(),
+        QoS::AtMostOnce,
+        None,
+        vec![],
+    )
+    .await;
+    publ.publish(
+        "s/1",
+        br#"{"k":"plain","v":7}"#,
+        QoS::AtMostOnce,
+        None,
+        vec![],
+    )
+    .await;
+    // Both were evaluated: their derived messages arrived.
+    assert_eq!(next(&mut out).await.0, "out/s");
+    assert_eq!(
+        next(&mut out).await,
+        got("out/s", "7", QoS::AtMostOnce, false)
+    );
+
+    // What must never reach a terminal as itself.
+    let clean = |ran: &Ran| {
+        for text in [&ran.stdout, &ran.stderr] {
+            assert!(
+                !text
+                    .chars()
+                    .any(|c| c != '\n' && (c.is_control() || matches!(c, '\u{2028}' | '\u{2029}'))),
+                "{ran:?}"
+            );
+        }
+    };
+    let overview = admin_cli(&pki, admin, &["state"]);
+    assert_eq!(overview.code, Some(0), "{overview:?}");
+    assert!(
+        overview.stdout.starts_with("state-node: 1 namespaces, "),
+        "{overview:?}"
+    );
+    let row: Vec<&str> = overview
+        .stdout
+        .lines()
+        .find(|l| l.starts_with("alerts "))
+        .unwrap_or_else(|| panic!("no row for the namespace: {overview:?}"))
+        .split_whitespace()
+        .collect();
+    assert_eq!(
+        row[..5],
+        ["alerts", "local", "fail", "2", "100"],
+        "{overview:?}"
+    );
+    assert!(!overview.stdout.contains("plain"), "{overview:?}");
+
+    let keys = admin_cli(&pki, admin, &["state-keys", "alerts"]);
+    assert_eq!(keys.code, Some(0), "{keys:?}");
+    clean(&keys);
+    assert!(
+        keys.stdout
+            .lines()
+            .any(|l| l == format!("{escaped}  utf8          lww")),
+        "{keys:?}"
+    );
+    assert!(
+        keys.stdout.lines().any(|l| l.starts_with("plain ")),
+        "{keys:?}"
+    );
+    let keys = admin_cli(
+        &pki,
+        admin,
+        &["state-keys", "alerts", "--prefix", "hot:", "--json"],
+    );
+    assert_eq!(keys.code, Some(0), "{keys:?}");
+    clean(&keys);
+    let listed: serde_json::Value = serde_json::from_str(&keys.stdout).unwrap();
+    assert_eq!(
+        listed["keys"],
+        serde_json::json!([{"key": hostile, "key_encoding": "utf8", "type": "lww"}])
+    );
+
+    // The key as it is, control characters and all, is what names it.
+    let one = admin_cli(&pki, admin, &["state-get", "alerts", hostile]);
+    assert_eq!(one.code, Some(0), "{one:?}");
+    clean(&one);
+    for line in [
+        format!("key             {escaped}"),
+        format!("value           reading {escaped}"),
+        "value_type      string".to_string(),
+        "type            lww".to_string(),
+    ] {
+        assert!(one.stdout.lines().any(|l| l == line), "{line}: {one:?}");
+    }
+    let one = admin_cli(&pki, admin, &["state-get", "alerts", hostile, "--json"]);
+    clean(&one);
+    let read: serde_json::Value = serde_json::from_str(&one.stdout).unwrap();
+    assert_eq!(read["value"], format!("reading {hostile}"));
+
+    let deleted = admin_cli(&pki, admin, &["state-del", "alerts", "plain"]);
+    assert_eq!(deleted.code, Some(0), "{deleted:?}");
+    assert!(
+        deleted.stdout.lines().any(|l| l == "deleted       true"),
+        "{deleted:?}"
+    );
+    let gone = admin_cli(&pki, admin, &["state-get", "alerts", "plain"]);
+    assert_eq!(gone.code, Some(1), "{gone:?}");
+    assert!(gone.stderr.contains("404 not-found"), "{gone:?}");
+    let nowhere = admin_cli(&pki, admin, &["state-keys", "nope"]);
+    assert_eq!(nowhere.code, Some(1), "{nowhere:?}");
+    assert!(nowhere.stderr.contains("404 not-found"), "{nowhere:?}");
+
+    // A scrape reads the store as it is now: no wait for a timer.
+    let metrics = broker.metrics().await;
+    for (series, want) in [
+        (r#"mqttd_rule_state_keys{namespace="alerts"}"#, 1),
+        (r#"mqttd_rule_state_expired_total{namespace="alerts"}"#, 0),
+        (r#"mqttd_rule_state_expiry_backlog{namespace="alerts"}"#, 0),
+        (
+            r#"mqttd_rule_state_ops_total{namespace="alerts",op="set",result="ok"}"#,
+            2,
+        ),
+        ("mqttd_rule_state_dictionary_bytes", 0),
+        ("mqttd_rule_state_dictionary_refused_total", 0),
+    ] {
+        assert_eq!(sample(&metrics, series), Some(want), "{series}:\n{metrics}");
+    }
+    assert!(
+        sample(&metrics, r#"mqttd_rule_state_bytes{namespace="alerts"}"#) > Some(128),
+        "{metrics}"
+    );
+    let series = series_lines(&metrics, "mqttd_rule_state_").join("\n");
+    assert!(
+        !series.contains("hot:") && !series.contains("plain"),
+        "{series}"
+    );
+
+    // `$SYS`: the namespace's counts, and nothing of what it holds.
+    let topic = "$SYS/brokers/state-node/rule_state/alerts";
+    let mut sys = Client::connect_v5_ok(broker.addr, "state-sys").await;
+    assert_eq!(
+        subscribe(&mut sys, 1, "$SYS/brokers/+/rule_state/+", QoS::AtMostOnce).await,
+        [0]
+    );
+    let doc = sys_where(&mut sys, topic, |doc| doc["keys"] == 1).await;
+    assert_eq!(
+        (
+            &doc["node"],
+            &doc["calls"],
+            &doc["deleted"],
+            &doc["max_keys"]
+        ),
+        (
+            &serde_json::json!("state-node"),
+            &serde_json::json!(2),
+            &serde_json::json!(1),
+            &serde_json::json!(100)
+        )
+    );
+    let text = doc.to_string();
+    assert!(
+        !text.contains("hot:") && !text.contains("reading"),
+        "{text}"
+    );
+}
+
 /// ADR 0084: rules writers configured for a rules file whose directory the broker may not
 /// write in — the documented read-only mounts — are a configuration that refuses every
 /// write, and the broker says so at boot and again on each reload, before anyone tries.

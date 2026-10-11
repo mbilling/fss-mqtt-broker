@@ -541,6 +541,10 @@ under it. A message no rule selects prints `(no rule selects it)`.
   | `mqttd_rule_function_errors_total{function,kind}` | Those that failed, by kind: `compile`, `parse`, `process`, `timeout`, `system` (EMQX's error tags); `memory`, `output`, `stack`, `compile_timeout` (a limit of the sandbox); `trap`; `argument` (a program that is not a string, a bad timeout); `decode` (an output that is not JSON a rule can hold). Each is also a `failed` evaluation of its rule. |
   | `mqttd_rule_function_seconds_total{function}` | Time spent in those calls; part of the rule's `mqttd_rule_eval_seconds_total`. |
   | `mqttd_rule_module_instances{module}`, `mqttd_rule_module_memory_bytes{module}`, `mqttd_rule_module_instances_replaced_total{module}` | The sandbox instances `jq` holds, their memory, and how many were given up after a call stopped at a limit. As of the last call. |
+  | `mqttd_rule_state_keys{namespace}`, `mqttd_rule_state_bytes{namespace}` | What a [state](#state-what-a-rule-remembers) namespace holds: its keys, and the bytes its bounds count. `namespace` is a name the rules file declares, `kv_store`, or `rule:<id>`; never a key. |
+  | `mqttd_rule_state_ops_total{namespace,op,result}` | State calls that reached the store, by operation (`get`, `set`, `set_once`, `incr`, `max`, `min`, `add`, `del`, `ttl`, `held`, `changed`, `hll_add`, `hll_count`; `kv_store_put`, `kv_store_get` and `kv_store_del` count as `set`, `get` and `del`) and result: `ok`, or why the store refused it (`namespace_full`, `store_full`, `brownout`, `wrong_type`, `refused`). A refused call is also a `failed` evaluation of its rule. A call refused for its arguments (a key too long, a bad TTL, the message's budget) is a `failed` evaluation only. |
+  | `mqttd_rule_state_expired_total{namespace}`, `mqttd_rule_state_expiry_backlog{namespace}` | Keys removed because their expiry had passed, and keys past their expiry that are still held (they read as absent). |
+  | `mqttd_rule_state_dictionary_bytes`, `mqttd_rule_state_dictionary_refused_total` | What the connections' `proc_dict_*` dictionaries hold together, and puts refused room (`store_full`, `brownout`). |
   | `mqttd_rules_loaded` | Enabled rules loaded on this node. |
   | `mqttd_rules_info{checksum}` | The loaded file's SHA-256, at 1. A checksum replaced by a reload stays exported at 0. |
 
@@ -2209,8 +2213,8 @@ A rule sees one message at a time. The state functions let it keep values betwee
 messages: a count, the last value, when a condition first held
 ([ADR 0085](adr/0085-rule-state-store.md)). This is the first part of that work: state
 lives **in memory, on the node that evaluated the rule**, and starts empty at every
-restart. Replication between nodes, an event when a key expires, metrics and the admin
-verbs are not built yet; this section will grow with them.
+restart. An event when a key expires is not built yet; this section will grow with it.
+What the store holds can be [watched and managed](#watching-and-managing-state).
 
 There are three families, and they do not share keys (`kv_get('x')` does not read what
 `kv_store_put('x', …)` wrote, and `--check-rules` warns about a file that calls both;
@@ -2482,6 +2486,39 @@ links read; with eight threads writing keys of their own, 0.9 µs a call, and 1.
 every write is a `kv_set` (each takes a stamp of the node's one clock). On the wire a
 counter is about 65 bytes and a 44-byte value about 105, once per peer for whatever was
 written in the 5 ms before.
+
+### Watching and managing state
+
+How full each namespace is, why a call was refused and what a key holds
+([ADR 0085](adr/0085-rule-state-store.md) D10):
+
+- **Metrics**: the `mqttd_rule_state_*` series in the [metrics table](#watch-a-running-rule),
+  by namespace. A scrape reads the store as it is at that moment.
+- **`$SYS`**: with `[rules] sys_interval_secs`, one message per namespace on
+  `$SYS/brokers/<node>/rule_state/<namespace>` each interval: its mode, bounds, keys,
+  bytes, counts and rates. It is a subtree of its own: a grant on
+  `$SYS/brokers/+/rules/#` does not cover it.
+- **The trace** shows a refused call as its rule's error, with the reason first:
+  ``kv_set(): namespace_full: namespace `alerts` holds 100000 keys …``.
+- **The admin API and CLI**: `mqttd --admin state` (the namespaces and their counts, a
+  viewer's), `state-keys <ns>` and `state-get <ns> <key>` (an operator's), and
+  `state-del <ns> <key>` (a rules writer's, audited; in an `eventual` namespace the
+  delete reaches every node, as a rule's `kv_del` does):
+  [ADMIN-CLI.md](ADMIN-CLI.md#state-state-keys-state-get-state-del),
+  [ADMIN-API.md](ADMIN-API.md#rule-state).
+
+**Keys and values are payload data.** A key is built from client ids, topic levels and
+payload fields. Metrics and `$SYS` therefore carry counts and never a key or a value, a
+viewer of the admin API sees counts only, and the audit log names a key by its SHA-256.
+Only an operator lists keys and reads a value.
+
+**What looking costs.** None of it is on the publish path, and a listing takes a shard's
+lock for 64 keys at a time. Measured beside publishes (the same benchmark, `-- inspect`):
+in a namespace of 100,000 keys a state call takes 0.14 µs alone and 0.30 µs while another
+thread lists every key without pause (0.35 and 0.49 µs with four threads calling, 0.63
+and 0.98 µs with eight); at 1,000,000 keys, the most a namespace may hold, 0.26 and
+2.6 µs (1.14 and 3.1 µs with eight). Reading the counts, as a scrape and a `$SYS` tick
+do, takes under 1 µs.
 
 ## Actions
 

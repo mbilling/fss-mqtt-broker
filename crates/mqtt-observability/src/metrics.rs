@@ -236,6 +236,16 @@ struct ModuleLabel {
     module: String,
 }
 
+/// `{namespace, op, result}` for `mqttd_rule_state_ops_total` (ADR 0085 D10): a
+/// namespace as in [`StateNamespaceLabel`], one of the store's thirteen operations, and
+/// `ok` or one of the store's five reasons for refusing a call.
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct StateOpLabel {
+    namespace: String,
+    op: String,
+    result: String,
+}
+
 /// One rule's cumulative counts since the process started (ADR 0084), as
 /// `mqttd_rule_evaluations_total` and `mqttd_rule_actions_total` hold them; see
 /// [`Metrics::rule_counts`].
@@ -348,6 +358,13 @@ struct OtelInstruments {
     rule_module_instances: OtelGauge<i64>,
     rule_module_memory_bytes: OtelGauge<i64>,
     rule_module_instances_replaced: OtelCounter<u64>,
+    rule_state_keys: OtelGauge<i64>,
+    rule_state_bytes: OtelGauge<i64>,
+    rule_state_ops: OtelCounter<u64>,
+    rule_state_expired: OtelCounter<u64>,
+    rule_state_expiry_backlog: OtelGauge<i64>,
+    rule_state_dictionary_bytes: OtelGauge<i64>,
+    rule_state_dictionary_refused: OtelCounter<u64>,
     rules_loaded: OtelGauge<i64>,
     rules_info: OtelGauge<i64>,
     swim_keys_accepted: OtelGauge<i64>,
@@ -457,6 +474,15 @@ impl OtelInstruments {
             rule_module_memory_bytes: meter.i64_gauge("rule_module_memory_bytes").build(),
             rule_module_instances_replaced: meter
                 .u64_counter("rule_module_instances_replaced")
+                .build(),
+            rule_state_keys: meter.i64_gauge("rule_state_keys").build(),
+            rule_state_bytes: meter.i64_gauge("rule_state_bytes").build(),
+            rule_state_ops: meter.u64_counter("rule_state_ops").build(),
+            rule_state_expired: meter.u64_counter("rule_state_expired").build(),
+            rule_state_expiry_backlog: meter.i64_gauge("rule_state_expiry_backlog").build(),
+            rule_state_dictionary_bytes: meter.i64_gauge("rule_state_dictionary_bytes").build(),
+            rule_state_dictionary_refused: meter
+                .u64_counter("rule_state_dictionary_refused")
                 .build(),
             rules_loaded: meter.i64_gauge("rules_loaded").build(),
             rules_info: meter.i64_gauge("rules_info").build(),
@@ -667,6 +693,18 @@ pub struct Metrics {
     rule_module_memory_bytes: Family<ModuleLabel, Gauge>,
     /// Instances given up after a call, per module.
     rule_module_instances_replaced_total: Family<ModuleLabel, Counter>,
+    /// The rule state store (ADR 0085 D10), per namespace: keys held, bytes accounted,
+    /// calls by operation and result, keys removed at their expiry, and keys past
+    /// their expiry that are still held.
+    rule_state_keys: Family<StateNamespaceLabel, Gauge>,
+    rule_state_bytes: Family<StateNamespaceLabel, Gauge>,
+    rule_state_ops_total: Family<StateOpLabel, Counter>,
+    rule_state_expired_total: Family<StateNamespaceLabel, Counter>,
+    rule_state_expiry_backlog: Family<StateNamespaceLabel, Gauge>,
+    /// What connections' dictionaries (`proc_dict_*`) hold, and how often one was
+    /// refused room.
+    rule_state_dictionary_bytes: Gauge,
+    rule_state_dictionary_refused_total: Counter,
     /// Enabled rules loaded on this node (ADR 0083).
     rules_loaded: Gauge,
     /// The loaded rules file's checksum (ADR 0083), `config_info`-style: after a
@@ -1475,6 +1513,53 @@ impl Metrics {
             "Sandbox instances given up after a call (ADR 0086), by module: stopped at a \
              limit (time, memory, stack) or grown too large to keep",
         );
+        let rule_state_keys = register_gauge_family(
+            &mut registry,
+            "rule_state_keys",
+            "Keys a namespace of the rule state store holds (ADR 0085), by namespace: a \
+             name the rules file declares, kv_store (EMQX's table), or rule:<id> for a \
+             rule's own. Keys past their expiry that are not removed yet are counted",
+        );
+        let rule_state_bytes = register_gauge_family(
+            &mut registry,
+            "rule_state_bytes",
+            "Bytes accounted to a namespace's keys and values (ADR 0085), by namespace: \
+             what max_bytes and rules.state_max_bytes bound",
+        );
+        let rule_state_ops_total = register_family(
+            &mut registry,
+            "rule_state_ops",
+            "State calls that reached the store (ADR 0085), by namespace, operation (get, \
+             set, set_once, incr, max, min, add, del, ttl, held, changed, hll_add, \
+             hll_count; kv_store_put, kv_store_get and kv_store_del count as set, get and \
+             del) and result: ok, or why the store refused the call (namespace_full, \
+             store_full, brownout, wrong_type, refused). A refused call fails its rule. \
+             A call the rule engine refused for its arguments is not counted here",
+        );
+        let rule_state_expired_total = register_family(
+            &mut registry,
+            "rule_state_expired",
+            "Keys removed because their expiry had passed (ADR 0085), by namespace",
+        );
+        let rule_state_expiry_backlog = register_gauge_family(
+            &mut registry,
+            "rule_state_expiry_backlog",
+            "Keys whose expiry has passed and that are still held (ADR 0085), by \
+             namespace: they read as absent and are removed by the next call that finds \
+             them or needs room",
+        );
+        let rule_state_dictionary_bytes = register_gauge(
+            &mut registry,
+            "rule_state_dictionary_bytes",
+            "Bytes the connections' dictionaries hold together (proc_dict_*, ADR 0085): \
+             in no namespace, counted against rules.state_max_bytes",
+        );
+        let rule_state_dictionary_refused_total = register_counter(
+            &mut registry,
+            "rule_state_dictionary_refused",
+            "proc_dict_put calls refused room (ADR 0085): the store at its ceiling, or a \
+             memory brownout. Each fails its rule",
+        );
         let rules_loaded = register_gauge(
             &mut registry,
             "rules_loaded",
@@ -1637,6 +1722,13 @@ impl Metrics {
             rule_module_instances,
             rule_module_memory_bytes,
             rule_module_instances_replaced_total,
+            rule_state_keys,
+            rule_state_bytes,
+            rule_state_ops_total,
+            rule_state_expired_total,
+            rule_state_expiry_backlog,
+            rule_state_dictionary_bytes,
+            rule_state_dictionary_refused_total,
             rules_loaded,
             rules_info,
             rules_info_prev: std::sync::Mutex::new(None),
@@ -2581,6 +2673,86 @@ impl Metrics {
         }
     }
 
+    /// What a namespace of the rule state store holds now (ADR 0085 D10): its keys,
+    /// their bytes, and the keys past their expiry that are still held. Creates the
+    /// namespace's `mqttd_rule_state_expired_total` series at zero, so a namespace
+    /// that is there has every series a dashboard reads.
+    pub fn set_rule_state(&self, namespace: &str, keys: u64, bytes: u64, expiry_backlog: u64) {
+        let label = StateNamespaceLabel {
+            namespace: namespace.to_string(),
+        };
+        let of = [KeyValue::new("namespace", namespace.to_string())];
+        let int = |n: u64| i64::try_from(n).unwrap_or(i64::MAX);
+        self.rule_state_keys.get_or_create(&label).set(int(keys));
+        self.rule_state_bytes.get_or_create(&label).set(int(bytes));
+        self.rule_state_expiry_backlog
+            .get_or_create(&label)
+            .set(int(expiry_backlog));
+        drop(self.rule_state_expired_total.get_or_create(&label));
+        self.otel.rule_state_keys.record(int(keys), &of);
+        self.otel.rule_state_bytes.record(int(bytes), &of);
+        self.otel
+            .rule_state_expiry_backlog
+            .record(int(expiry_backlog), &of);
+    }
+
+    /// A namespace the rules no longer hold: its gauges go, so a dropped namespace
+    /// does not read as holding its last keys for ever. Its counters stay, as
+    /// counters do.
+    pub fn forget_rule_state(&self, namespace: &str) {
+        let label = StateNamespaceLabel {
+            namespace: namespace.to_string(),
+        };
+        self.rule_state_keys.remove(&label);
+        self.rule_state_bytes.remove(&label);
+        self.rule_state_expiry_backlog.remove(&label);
+    }
+
+    /// `n` more state calls on `namespace` of operation `op` that ended as `result`
+    /// (`mqttd_rule_state_ops_total`).
+    pub fn rule_state_ops(&self, namespace: &str, op: &'static str, result: &'static str, n: u64) {
+        self.rule_state_ops_total
+            .get_or_create(&StateOpLabel {
+                namespace: namespace.to_string(),
+                op: op.to_string(),
+                result: result.to_string(),
+            })
+            .inc_by(n);
+        self.otel.rule_state_ops.add(
+            n,
+            &[
+                KeyValue::new("namespace", namespace.to_string()),
+                KeyValue::new("op", op),
+                KeyValue::new("result", result),
+            ],
+        );
+    }
+
+    /// `n` more keys of `namespace` removed at their expiry
+    /// (`mqttd_rule_state_expired_total`).
+    pub fn rule_state_expired(&self, namespace: &str, n: u64) {
+        self.rule_state_expired_total
+            .get_or_create(&StateNamespaceLabel {
+                namespace: namespace.to_string(),
+            })
+            .inc_by(n);
+        self.otel
+            .rule_state_expired
+            .add(n, &[KeyValue::new("namespace", namespace.to_string())]);
+    }
+
+    /// What the connections' dictionaries hold now (`proc_dict_*`, ADR 0085), and
+    /// `refused` more puts that were refused room.
+    pub fn rule_state_dictionaries(&self, bytes: u64, refused: u64) {
+        let bytes = i64::try_from(bytes).unwrap_or(i64::MAX);
+        self.rule_state_dictionary_bytes.set(bytes);
+        self.otel.rule_state_dictionary_bytes.record(bytes, &[]);
+        self.rule_state_dictionary_refused_total.inc_by(refused);
+        if refused > 0 {
+            self.otel.rule_state_dictionary_refused.add(refused, &[]);
+        }
+    }
+
     /// What a rule-function module's instance pool holds now (ADR 0086), and how many
     /// instances it has given up since it was loaded (`replaced_total`, cumulative: the
     /// counter is moved up to it, never back).
@@ -3169,6 +3341,51 @@ mod tests {
         ] {
             assert!(text.contains(line), "missing {line}:\n{text}");
         }
+    }
+
+    /// ADR 0085 D10: the rule state series, by namespace; a namespace that is there
+    /// has its expiry counter at zero, a call is a series once it happened, and a
+    /// namespace that is gone keeps its counters and loses its gauges.
+    #[test]
+    fn rule_state_is_exported_by_namespace_operation_and_result() {
+        let m = Metrics::new("test");
+        assert!(
+            !m.render().contains("namespace=\""),
+            "no series before a namespace is reported"
+        );
+        m.set_rule_state("alerts", 3, 4096, 1);
+        m.rule_state_ops("alerts", "incr", "ok", 7);
+        m.rule_state_ops("alerts", "incr", "namespace_full", 2);
+        m.rule_state_ops("rule:hot", "held", "ok", 1);
+        m.rule_state_expired("alerts", 5);
+        m.rule_state_dictionaries(640, 2);
+        let text = m.render();
+        for line in [
+            "mqttd_rule_state_keys{namespace=\"alerts\"} 3",
+            "mqttd_rule_state_bytes{namespace=\"alerts\"} 4096",
+            "mqttd_rule_state_expiry_backlog{namespace=\"alerts\"} 1",
+            "mqttd_rule_state_expired_total{namespace=\"alerts\"} 5",
+            "mqttd_rule_state_ops_total{namespace=\"alerts\",op=\"incr\",result=\"ok\"} 7",
+            "mqttd_rule_state_ops_total{namespace=\"alerts\",op=\"incr\",result=\"namespace_full\"} 2",
+            "mqttd_rule_state_ops_total{namespace=\"rule:hot\",op=\"held\",result=\"ok\"} 1",
+            "mqttd_rule_state_dictionary_bytes 640",
+            "mqttd_rule_state_dictionary_refused_total 2",
+        ] {
+            assert!(text.contains(line), "missing {line}:\n{text}");
+        }
+        m.set_rule_state("quiet", 0, 0, 0);
+        assert!(m
+            .render()
+            .contains("mqttd_rule_state_expired_total{namespace=\"quiet\"} 0"));
+        m.forget_rule_state("alerts");
+        let text = m.render();
+        assert!(
+            !text.contains("mqttd_rule_state_keys{namespace=\"alerts\"}")
+                && !text.contains("mqttd_rule_state_bytes{namespace=\"alerts\"}")
+                && !text.contains("mqttd_rule_state_expiry_backlog{namespace=\"alerts\"}"),
+            "a dropped namespace's gauges are gone:\n{text}"
+        );
+        assert!(text.contains("mqttd_rule_state_expired_total{namespace=\"alerts\"} 5"));
     }
 
     #[test]

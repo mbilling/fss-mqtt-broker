@@ -850,7 +850,13 @@ async fn route(state: &HealthState, path: &str) -> (u16, String, &'static str) {
         }
         // Metrics exposition (ADR 0020); 404 when metrics are not enabled.
         "/metrics" => match &state.metrics {
-            Some(m) => (200, m.render(), OPENMETRICS),
+            Some(m) => {
+                // The rule state store counts its calls itself; a scrape reads them.
+                if let Some(rules) = state.rules_slot().get() {
+                    rules.export_state_metrics();
+                }
+                (200, m.render(), OPENMETRICS)
+            }
             None => (404, "{\"error\":\"not found\"}".to_string(), JSON),
         },
         // Structured operator-facing state (ADR 0054); 404 until wired via

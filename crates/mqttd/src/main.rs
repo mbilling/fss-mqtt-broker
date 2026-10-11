@@ -807,6 +807,10 @@ async fn main() -> Result<(), StartupError> {
             ingress.clone(),
             shutdown.clone(),
         ));
+        tokio::spawn(mqttd::rules_sys::run_state_metrics(
+            rules.clone(),
+            shutdown.clone(),
+        ));
     }
 
     // Fold the cluster-bus gossip CRL (ADR 0022 T7) into the same validate-before-swap

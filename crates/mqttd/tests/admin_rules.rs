@@ -1823,3 +1823,929 @@ async fn a_dry_run_works_on_a_scratch_dictionary_of_its_own() {
     drop(conn);
     assert_eq!(store.bytes(), 0);
 }
+
+// ---------------------------------------------------------------------------------------
+// The state the rules keep (ADR 0085 D10)
+// ---------------------------------------------------------------------------------------
+
+/// Rules that keep state of every kind an operator can meet: a declared namespace with
+/// string and binary keys and a counter, EMQX's table with keys of any type, a rule's
+/// own namespace, and a connection's dictionary.
+const KEEPING: &str = r#"[state.alerts]
+max_keys = 4000
+default_ttl = "1h"
+
+[rules.put]
+state = "alerts"
+sql = '''SELECT kv_set(payload.k, payload.v) AS v FROM "set/#"'''
+actions = [{ function = "console" }]
+
+[rules.count]
+state = "alerts"
+sql = '''SELECT kv_incr(base64_decode(payload.k)) AS n FROM "bin/#"'''
+actions = [{ function = "console" }]
+
+[rules.emqx]
+sql = '''SELECT kv_store_put(payload.k, payload.v) AS ok FROM "emqx/#"'''
+actions = [{ function = "console" }]
+
+[rules.own]
+sql = '''SELECT kv_add('members', clientid) AS n FROM "own/#"'''
+actions = [{ function = "console" }]
+
+[rules.dict]
+sql = '''SELECT proc_dict_put('k', payload.v) AS was FROM "dict/#"'''
+actions = [{ function = "console" }]
+"#;
+
+/// `path` with `params` as its query string, percent-encoded.
+fn with_query(path: &str, params: &[(&str, &str)]) -> String {
+    let query: Vec<String> = params
+        .iter()
+        .map(|(k, v)| format!("{k}={}", mqttd::admin::http::percent_encode(v)))
+        .collect();
+    format!("{path}?{}", query.join("&"))
+}
+
+/// The namespace `name` of a `GET /admin/v1/rules/state` answer.
+fn namespace<'a>(answer: &'a Value, name: &str) -> &'a Value {
+    answer["namespaces"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|ns| ns["namespace"] == name)
+        .unwrap_or_else(|| panic!("no namespace {name} in {answer}"))
+}
+
+/// Every page of `GET /admin/v1/rules/state/keys` for `params`, as `who`: the keys in
+/// the order listed, and how many pages there were.
+async fn list_keys(n: &Node, who: &Who, params: &[(&str, &str)]) -> (Vec<Value>, usize) {
+    let (mut keys, mut pages, mut cursor) = (Vec::new(), 0, None::<String>);
+    loop {
+        let mut params = params.to_vec();
+        if let Some(cursor) = &cursor {
+            params.retain(|(name, _)| *name != "cursor");
+            params.push(("cursor", cursor));
+        }
+        let path = with_query("/admin/v1/rules/state/keys", &params);
+        let (status, body) = n.call(who, "GET", &path, None).await;
+        assert_eq!(status, 200, "{body}");
+        let page = body["keys"].as_array().unwrap();
+        assert_eq!(body["count"], page.len());
+        assert!(page.len() <= 1000, "a page holds at most 1,000 keys");
+        keys.extend(page.iter().cloned());
+        pages += 1;
+        match body["next_cursor"].as_str() {
+            Some(next) => cursor = Some(next.to_string()),
+            None => return (keys, pages),
+        }
+        assert!(pages < 200, "the listing does not end");
+    }
+}
+
+/// D10's roles. A viewer reads each namespace's mode, bounds and counts, and no key or
+/// value: the overview holds none, and listing or reading keys is refused. An operator
+/// lists keys and reads a value. A delete needs the operator role and a listed rules
+/// writer, and is audited as `state.delete` with the key's hash, never the key.
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // one walk through every role and refusal
+async fn a_viewer_reads_counts_an_operator_keys_and_values_and_a_writer_deletes() {
+    let n = Node::start(KEEPING).await;
+    n.publish(
+        "set/1",
+        br#"{"k":"hot:dev-1","v":{"temp":31.5,"serial":123456789012345678901234567890}}"#,
+    );
+    n.publish("set/1", br#"{"k":"hot:dev-2","v":"a secret reading"}"#);
+    n.publish("emqx/1", br#"{"k":"dev-9","v":7}"#);
+    n.publish("own/1", b"{}");
+    let conn = n.rules.for_connection();
+    let _ = conn.on_publish(&PublishFacts {
+        client: &ClientId("c1".into()),
+        publisher: &Publisher::default(),
+        topic: "dict/1",
+        payload: &Bytes::from_static(br#"{"v":"in a dictionary"}"#),
+        qos: QoS::AtMostOnce,
+        retain: false,
+        app: &AppProperties::default(),
+        message_expiry: None,
+    });
+
+    // The overview: a viewer's, and the same for an operator.
+    let (status, overview) = n
+        .call(&n.viewer, "GET", "/admin/v1/rules/state", None)
+        .await;
+    assert_eq!(status, 200, "{overview}");
+    assert_eq!(overview["node"], "rules-node");
+    assert_eq!(overview["enabled"], true);
+    let names: Vec<&str> = overview["namespaces"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|ns| ns["namespace"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["alerts", "kv_store", "rule:own"]);
+    let alerts = namespace(&overview, "alerts");
+    let held = alerts["bytes"].as_u64().unwrap();
+    assert_eq!(
+        *alerts,
+        json!({
+            "namespace": "alerts", "kind": "declared", "consistency": "local",
+            "eviction": "fail", "max_keys": 4000, "max_bytes": 64 << 20,
+            "default_ttl_secs": 3600, "max_ttl_secs": 30 * 24 * 3600,
+            "keys": 2, "bytes": held, "calls": 2, "refused": 0,
+            "refused_by": {"namespace_full": 0, "store_full": 0, "brownout": 0,
+                           "wrong_type": 0, "refused": 0},
+            "expired": 0, "expiry_backlog": 0, "evicted": 0, "deleted": 0,
+        })
+    );
+    assert!(held > 2 * 128, "two keys and their values: {held}");
+    let emqx = namespace(&overview, "kv_store");
+    assert_eq!(
+        (&emqx["kind"], &emqx["keys"], &emqx["default_ttl_secs"]),
+        (&json!("kv_store"), &json!(1), &Value::Null)
+    );
+    assert_eq!(namespace(&overview, "rule:own")["kind"], "rule");
+    let total = overview["store"]["bytes"].as_u64().unwrap();
+    let dictionaries = overview["dictionaries"]["bytes"].as_u64().unwrap();
+    assert_eq!(
+        dictionaries,
+        "k".len() as u64 + "in a dictionary".len() as u64
+    );
+    let in_namespaces: u64 = overview["namespaces"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|ns| ns["bytes"].as_u64().unwrap())
+        .sum();
+    assert_eq!(total, in_namespaces + dictionaries);
+    assert_eq!(
+        (
+            &overview["store"]["max_bytes"],
+            &overview["store"]["brownout"]
+        ),
+        (&json!(256 << 20), &json!(false))
+    );
+    assert_eq!(overview["dictionaries"]["refused"], 0);
+    // No key and no value, of any namespace or dictionary.
+    let text = overview.to_string();
+    for secret in [
+        "hot:dev",
+        "secret",
+        "31.5",
+        "1234567890",
+        "dev-9",
+        "members",
+        "c1",
+        "dictionary\"",
+    ] {
+        assert!(!text.contains(secret), "{secret} in {text}");
+    }
+    let (_, as_operator) = n
+        .call(&n.operator, "GET", "/admin/v1/rules/state", None)
+        .await;
+    assert_eq!(as_operator, overview);
+
+    // Keys and values are not a viewer's.
+    let keys_path = with_query("/admin/v1/rules/state/keys", &[("ns", "alerts")]);
+    let key_path = with_query(
+        "/admin/v1/rules/state/key",
+        &[("ns", "alerts"), ("key", "hot:dev-1")],
+    );
+    for (method, path) in [
+        ("GET", &keys_path),
+        ("GET", &key_path),
+        ("DELETE", &key_path),
+    ] {
+        let (status, body) = n.call(&n.viewer, method, path, None).await;
+        assert_eq!((status, code(&body)), (403, "forbidden"), "{method} {path}");
+        assert!(!body.to_string().contains("secret"), "{body}");
+    }
+
+    // An operator lists the keys, each an object with its type, and reads one.
+    let (status, body) = n.call(&n.operator, "GET", &keys_path, None).await;
+    assert_eq!(status, 200, "{body}");
+    let mut listed = body["keys"].as_array().unwrap().clone();
+    listed.sort_by_key(|k| k["key"].as_str().unwrap().to_string());
+    assert_eq!(
+        listed,
+        [
+            json!({"key": "hot:dev-1", "key_encoding": "utf8", "type": "lww"}),
+            json!({"key": "hot:dev-2", "key_encoding": "utf8", "type": "lww"}),
+        ]
+    );
+    assert_eq!(
+        (&body["namespace"], &body["node"], &body["next_cursor"]),
+        (&json!("alerts"), &json!("rules-node"), &Value::Null)
+    );
+    let (status, body) = n.call(&n.operator, "GET", &key_path, None).await;
+    assert_eq!(status, 200, "{body}");
+    let expires = body["expires_at"]
+        .as_str()
+        .expect("default_ttl gave it one");
+    assert!(expires.ends_with('Z') && expires.len() == 24, "{expires}");
+    assert_eq!(
+        body,
+        json!({
+            "node": "rules-node", "namespace": "alerts",
+            "key": "hot:dev-1", "key_encoding": "utf8", "type": "lww",
+            // As the rule engine writes it: the integer keeps every digit.
+            "value": "{\"temp\":31.5,\"serial\":123456789012345678901234567890}",
+            "value_encoding": "utf8", "value_type": "map",
+            "expires_at": expires,
+        })
+    );
+
+    // A delete: not an operator's who is no listed writer, and the key stays.
+    let (status, body) = n.call(&n.operator, "DELETE", &key_path, None).await;
+    assert_eq!((status, code(&body)), (403, "not-a-rules-writer"), "{body}");
+    assert_eq!(n.call(&n.operator, "GET", &key_path, None).await.0, 200);
+    assert!(n.audit.of_kind("state.delete").is_empty());
+    // A listed writer's.
+    let (status, body) = n.call(&n.writer, "DELETE", &key_path, None).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        body,
+        json!({"node": "rules-node", "namespace": "alerts", "key": "hot:dev-1",
+               "key_encoding": "utf8", "deleted": true})
+    );
+    let (status, body) = n.call(&n.operator, "GET", &key_path, None).await;
+    assert_eq!((status, code(&body)), (404, "not-found"), "{body}");
+    // Again: nothing was there, and that is said and recorded too.
+    let (status, body) = n.call(&n.writer, "DELETE", &key_path, None).await;
+    assert_eq!((status, &body["deleted"]), (200, &json!(false)), "{body}");
+    let hash = sha256_hex("hot:dev-1");
+    assert_eq!(
+        n.audit.of_kind("state.delete"),
+        [
+            (
+                Some("CN=writer".to_string()),
+                format!("ns=alerts key_sha256={hash} key_bytes=9 deleted=true")
+            ),
+            (
+                Some("CN=writer".to_string()),
+                format!("ns=alerts key_sha256={hash} key_bytes=9 deleted=false")
+            ),
+        ]
+    );
+    // The audit log names the key by that hash everywhere, the requests' own records
+    // included, and the refused ones.
+    let requests = n.audit.of_kind("admin.request");
+    assert!(
+        requests.iter().any(|(who, detail)| {
+            who.as_deref() == Some("CN=writer")
+                && *detail
+                    == format!(
+                        "role=operator DELETE /admin/v1/rules/state/key?ns=alerts&\
+                         key_sha256={hash}&key_bytes=9 -> 200"
+                    )
+        }),
+        "{requests:?}"
+    );
+    assert!(
+        requests.iter().all(|(_, detail)| !detail.contains("hot")),
+        "{requests:?}"
+    );
+    let overview = n
+        .call(&n.viewer, "GET", "/admin/v1/rules/state", None)
+        .await
+        .1;
+    let alerts = namespace(&overview, "alerts");
+    assert_eq!(
+        (&alerts["keys"], &alerts["deleted"]),
+        (&json!(1), &json!(1))
+    );
+
+    // With no writer listed, deletes are off, whoever asks.
+    n.live.write().unwrap().rules.admin_writers.clear();
+    let other = with_query(
+        "/admin/v1/rules/state/key",
+        &[("ns", "alerts"), ("key", "hot:dev-2")],
+    );
+    let (status, body) = n.call(&n.writer, "DELETE", &other, None).await;
+    assert_eq!((status, code(&body)), (403, "rules-read-only"), "{body}");
+    assert_eq!(n.call(&n.operator, "GET", &other, None).await.0, 200);
+    drop(conn);
+}
+
+/// What the endpoints refuse: a namespace that is not there, a parameter left out or
+/// malformed, a method they do not take.
+#[tokio::test]
+async fn the_state_endpoints_refuse_what_names_nothing() {
+    let n = Node::start(KEEPING).await;
+    n.publish("set/1", br#"{"k":"a","v":1}"#);
+    let keys = "/admin/v1/rules/state/keys";
+    let key = "/admin/v1/rules/state/key";
+    for (method, path, status, expected) in [
+        ("GET", keys.to_string(), 400, "bad-request"),
+        ("GET", with_query(keys, &[("ns", "nope")]), 404, "not-found"),
+        (
+            "GET",
+            with_query(keys, &[("ns", "alerts"), ("limit", "0")]),
+            400,
+            "bad-request",
+        ),
+        (
+            "GET",
+            with_query(keys, &[("ns", "alerts"), ("cursor", "not-a-cursor")]),
+            400,
+            "bad-request",
+        ),
+        (
+            "GET",
+            with_query(
+                keys,
+                &[("ns", "alerts"), ("cursor", "1-0000000000000000-0-")],
+            ),
+            409,
+            "cursor-stale",
+        ),
+        (
+            "GET",
+            with_query(
+                keys,
+                &[
+                    ("ns", "alerts"),
+                    ("prefix", "!"),
+                    ("prefix_encoding", "base64"),
+                ],
+            ),
+            400,
+            "bad-request",
+        ),
+        (
+            "GET",
+            with_query(key, &[("ns", "alerts")]),
+            400,
+            "bad-request",
+        ),
+        ("GET", with_query(key, &[("key", "a")]), 400, "bad-request"),
+        (
+            "GET",
+            with_query(key, &[("ns", "nope"), ("key", "a")]),
+            404,
+            "not-found",
+        ),
+        (
+            "GET",
+            with_query(key, &[("ns", "alerts"), ("key", "missing")]),
+            404,
+            "not-found",
+        ),
+        (
+            "GET",
+            with_query(
+                key,
+                &[("ns", "alerts"), ("key", "AQ=="), ("key_encoding", "term")],
+            ),
+            400,
+            "bad-request",
+        ),
+        (
+            "DELETE",
+            with_query(key, &[("ns", "nope"), ("key", "a")]),
+            404,
+            "not-found",
+        ),
+        (
+            "POST",
+            with_query(key, &[("ns", "alerts"), ("key", "a")]),
+            405,
+            "method-not-allowed",
+        ),
+        (
+            "DELETE",
+            "/admin/v1/rules/state".to_string(),
+            405,
+            "method-not-allowed",
+        ),
+    ] {
+        let (got, body) = n.call(&n.writer, method, &path, None).await;
+        assert_eq!(
+            (got, code(&body)),
+            (status, expected),
+            "{method} {path}: {body}"
+        );
+    }
+    // A delete that named no namespace's key recorded no `state.delete`.
+    assert!(n.audit.of_kind("state.delete").is_empty());
+}
+
+/// Paging over the wire: 2,500 keys come in pages of at most 1,000, each key once, and
+/// a prefix and a smaller `limit` page the same way.
+#[tokio::test]
+async fn the_keys_of_a_namespace_are_listed_in_pages_of_at_most_a_thousand() {
+    let n = Node::start(KEEPING).await;
+    for i in 0..2_500 {
+        let payload = format!(r#"{{"k":"dev:{i:04}","v":{i}}}"#);
+        n.publish("set/1", payload.as_bytes());
+    }
+    n.publish("set/1", br#"{"k":"other","v":0}"#);
+    // A page is 100 keys unless `limit` says otherwise, and never more than 1,000.
+    let first = with_query("/admin/v1/rules/state/keys", &[("ns", "alerts")]);
+    let (_, page) = n.call(&n.operator, "GET", &first, None).await;
+    assert_eq!(page["count"], 100, "{page}");
+    let (keys, pages) = list_keys(&n, &n.operator, &[("ns", "alerts"), ("limit", "5000")]).await;
+    assert_eq!(keys.len(), 2_501);
+    assert!((3..=4).contains(&pages), "{pages} pages");
+    let distinct: std::collections::BTreeSet<&str> =
+        keys.iter().map(|k| k["key"].as_str().unwrap()).collect();
+    assert_eq!(distinct.len(), 2_501, "no key is listed twice");
+    assert!(keys.iter().all(|k| k["type"] == "lww"));
+    let (some, pages) = list_keys(
+        &n,
+        &n.operator,
+        &[("ns", "alerts"), ("prefix", "dev:00"), ("limit", "30")],
+    )
+    .await;
+    assert_eq!(some.len(), 100);
+    assert!(pages >= 4, "{pages} pages of at most 30");
+    assert!(some
+        .iter()
+        .all(|k| k["key"].as_str().unwrap().starts_with("dev:00")));
+    // A key deleted and a key written between two pages: neither is listed twice, and
+    // every key that stayed is listed.
+    let first = with_query(
+        "/admin/v1/rules/state/keys",
+        &[("ns", "alerts"), ("limit", "1000")],
+    );
+    let (_, page) = n.call(&n.operator, "GET", &first, None).await;
+    let cursor = page["next_cursor"].as_str().unwrap().to_string();
+    let mut seen: Vec<String> = page["keys"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|k| k["key"].as_str().unwrap().to_string())
+        .collect();
+    let gone = seen[0].clone();
+    let path = with_query(
+        "/admin/v1/rules/state/key",
+        &[("ns", "alerts"), ("key", &gone)],
+    );
+    assert_eq!(n.call(&n.writer, "DELETE", &path, None).await.0, 200);
+    for i in 0..500 {
+        let payload = format!(r#"{{"k":"new:{i}","v":{i}}}"#);
+        n.publish("set/1", payload.as_bytes());
+    }
+    let (rest, _) = list_keys(&n, &n.operator, &[("ns", "alerts"), ("cursor", &cursor)]).await;
+    seen.extend(rest.iter().map(|k| k["key"].as_str().unwrap().to_string()));
+    let distinct: std::collections::BTreeSet<&String> = seen.iter().collect();
+    assert_eq!(distinct.len(), seen.len(), "no key is listed twice");
+    assert!((0..2_500).all(|i| distinct.contains(&format!("dev:{i:04}"))));
+}
+
+/// The representation round-trips over the wire. Whatever a key is — text with spaces,
+/// separators and control characters, bytes that are not UTF-8, and in EMQX's table a
+/// number, a boolean, `null`, an array, a map — the `key` and `key_encoding` a listing
+/// shows read that key and delete it. And a value reads as the rule engine writes it,
+/// with what it is.
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // every kind of key and value, once
+async fn every_key_a_listing_shows_can_be_read_and_deleted_as_shown() {
+    let n = Node::start(KEEPING).await;
+    for payload in [
+        r#"{"k":"plain","v":"1"}"#,
+        r#"{"k":" sp ace/&?=+%#","v":1}"#,
+        r#"{"k":"ctl\u001b[2J\r\n\u009b","v":1.0}"#,
+        r#"{"k":"ключ-🔑","v":[1,"x",null]}"#,
+        r#"{"k":"big","v":123456789012345678901234567890}"#,
+        r#"{"k":"esc","v":"line\u001b[2J"}"#,
+        r#"{"k":"flag","v":true}"#,
+    ] {
+        n.publish("set/1", payload.as_bytes());
+    }
+    // A key that is not UTF-8, counted three times.
+    for _ in 0..3 {
+        n.publish("bin/1", br#"{"k":"/wD+"}"#);
+    }
+    // EMQX's table: `1`, `1.0` and `'1'` are three keys.
+    for payload in [
+        r#"{"k":"dev-1","v":"a string key"}"#,
+        r#"{"k":"1","v":"the string 1"}"#,
+        r#"{"k":1,"v":"the integer 1"}"#,
+        r#"{"k":1.0,"v":"the float 1.0"}"#,
+        r#"{"k":true,"v":"true"}"#,
+        r#"{"k":null,"v":"null"}"#,
+        r#"{"k":[1,"x"],"v":"an array"}"#,
+        r#"{"k":{"b":1,"a":2},"v":"a map"}"#,
+        r#"{"v":"the key undefined"}"#,
+        r#"{"k":"no value"}"#,
+    ] {
+        n.publish("emqx/1", payload.as_bytes());
+    }
+    n.publish("own/1", b"{}");
+
+    let read = |ns: &'static str, shown: Value| {
+        let n = &n;
+        async move {
+            let path = with_query(
+                "/admin/v1/rules/state/key",
+                &[
+                    ("ns", ns),
+                    ("key", shown["key"].as_str().unwrap()),
+                    ("key_encoding", shown["key_encoding"].as_str().unwrap()),
+                ],
+            );
+            let (status, body) = n.call(&n.operator, "GET", &path, None).await;
+            assert_eq!(status, 200, "{shown}: {body}");
+            // The answer names the key as the listing did.
+            for field in ["key", "key_encoding", "type"] {
+                assert_eq!(body[field], shown[field], "{shown}: {body}");
+            }
+            assert_eq!(body.get("term"), shown.get("term"), "{shown}: {body}");
+            (path, body)
+        }
+    };
+
+    // -- a declared namespace
+    let (keys, _) = list_keys(&n, &n.operator, &[("ns", "alerts")]).await;
+    let mut values = std::collections::BTreeMap::new();
+    for shown in &keys {
+        let (_, body) = read("alerts", shown.clone()).await;
+        values.insert(
+            (
+                shown["key"].as_str().unwrap().to_string(),
+                shown["key_encoding"].as_str().unwrap().to_string(),
+            ),
+            (
+                body["type"].as_str().unwrap().to_string(),
+                body["value"].as_str().unwrap().to_string(),
+                body["value_encoding"].as_str().unwrap().to_string(),
+                body["value_type"].as_str().unwrap().to_string(),
+            ),
+        );
+    }
+    let expected: std::collections::BTreeMap<_, _> = [
+        (("plain", "utf8"), ("lww", "1", "utf8", "string")),
+        ((" sp ace/&?=+%#", "utf8"), ("lww", "1", "utf8", "integer")),
+        (
+            ("ctl\u{1b}[2J\r\n\u{9b}", "utf8"),
+            ("lww", "1.0", "utf8", "float"),
+        ),
+        (
+            ("ключ-🔑", "utf8"),
+            ("lww", "[1,\"x\",null]", "utf8", "array"),
+        ),
+        (
+            ("big", "utf8"),
+            ("lww", "123456789012345678901234567890", "utf8", "integer"),
+        ),
+        (("esc", "utf8"), ("lww", "line\u{1b}[2J", "utf8", "string")),
+        (("flag", "utf8"), ("lww", "true", "utf8", "boolean")),
+        // The bytes ff 00 fe, and the counter's count.
+        (("/wD+", "base64"), ("sum", "3", "utf8", "integer")),
+    ]
+    .into_iter()
+    .map(|((k, ke), (t, v, ve, vt))| {
+        (
+            (k.to_string(), ke.to_string()),
+            (t.to_string(), v.to_string(), ve.to_string(), vt.to_string()),
+        )
+    })
+    .collect();
+    assert_eq!(values, expected);
+
+    // -- a rule's own namespace: a set reads as its elements
+    let (keys, _) = list_keys(&n, &n.operator, &[("ns", "rule:own")]).await;
+    assert_eq!(
+        keys,
+        [json!({"key": "members", "key_encoding": "utf8", "type": "union"})]
+    );
+    let (_, body) = read("rule:own", keys[0].clone()).await;
+    assert_eq!(
+        (&body["value"], &body["value_type"]),
+        (&json!("[\"c1\"]"), &json!("array"))
+    );
+
+    // -- EMQX's table: a key of any type
+    let (keys, _) = list_keys(&n, &n.operator, &[("ns", "kv_store")]).await;
+    let mut shown = std::collections::BTreeMap::new();
+    for key in &keys {
+        let (_, body) = read("kv_store", key.clone()).await;
+        let name = match key["key_encoding"].as_str().unwrap() {
+            "term" => format!("term {}", key["term"].as_str().unwrap()),
+            encoding => format!("{encoding} {}", key["key"].as_str().unwrap()),
+        };
+        shown.insert(
+            name,
+            (
+                body["value"].as_str().unwrap().to_string(),
+                body["value_type"].as_str().unwrap().to_string(),
+            ),
+        );
+    }
+    let expected: std::collections::BTreeMap<String, (String, String)> = [
+        ("utf8 dev-1", "a string key", "string"),
+        ("utf8 1", "the string 1", "string"),
+        ("term 1", "the integer 1", "string"),
+        ("term 1.0", "the float 1.0", "string"),
+        ("term true", "true", "string"),
+        ("term null", "null", "string"),
+        ("term [1,\"x\"]", "an array", "string"),
+        ("term {\"a\":2,\"b\":1}", "a map", "string"),
+        ("term undefined", "the key undefined", "string"),
+        // EMQX's table stores `undefined`.
+        ("utf8 no value", "undefined", "undefined"),
+    ]
+    .into_iter()
+    .map(|(k, v, t)| (k.to_string(), (v.to_string(), t.to_string())))
+    .collect();
+    assert_eq!(shown, expected);
+    // A prefix there is of a string key's text.
+    let (dev, _) = list_keys(&n, &n.operator, &[("ns", "kv_store"), ("prefix", "dev")]).await;
+    assert_eq!(
+        dev,
+        [json!({"key": "dev-1", "key_encoding": "utf8", "type": "lww"})]
+    );
+
+    // -- and every one of them is deleted as it was shown
+    for ns in ["alerts", "kv_store", "rule:own"] {
+        let (keys, _) = list_keys(&n, &n.operator, &[("ns", ns)]).await;
+        assert!(!keys.is_empty());
+        for key in keys {
+            let (path, _) = read(ns, key.clone()).await;
+            let (status, body) = n.call(&n.writer, "DELETE", &path, None).await;
+            assert_eq!(
+                (status, &body["deleted"]),
+                (200, &json!(true)),
+                "{key}: {body}"
+            );
+            assert_eq!(
+                n.call(&n.operator, "GET", &path, None).await.0,
+                404,
+                "{key}"
+            );
+        }
+        let (keys, _) = list_keys(&n, &n.operator, &[("ns", ns)]).await;
+        assert_eq!(keys, Vec::<Value>::new(), "{ns}");
+    }
+    // The audit log holds none of the keys, in a delete's record or a request's.
+    for kind in ["state.delete", "admin.request"] {
+        for (_, detail) in n.audit.of_kind(kind) {
+            for key in ["plain", "sp%20ace", "ctl", "wD", "dev-1", "members"] {
+                assert!(!detail.contains(key), "{key} in {detail}");
+            }
+        }
+    }
+    assert_eq!(n.audit.of_kind("state.delete").len(), 8 + 10 + 1);
+}
+
+/// D10's metrics, each exported for a namespace the rules hold: keys, bytes, calls by
+/// operation and result, expiries and the expiry backlog; and the dictionaries'. No
+/// label is a key.
+#[tokio::test]
+async fn the_state_metrics_are_exported_by_namespace() {
+    let n = Node::start(KEEPING).await;
+    let state_series = |n: &Node| -> Vec<String> {
+        n.rules.export_state_metrics();
+        n.metrics
+            .render()
+            .lines()
+            .filter(|l| l.starts_with("mqttd_rule_state_"))
+            .map(String::from)
+            .collect()
+    };
+    // Before a call: the namespaces are there, at zero.
+    let series = state_series(&n);
+    for line in [
+        "mqttd_rule_state_keys{namespace=\"alerts\"} 0",
+        "mqttd_rule_state_bytes{namespace=\"alerts\"} 0",
+        "mqttd_rule_state_expired_total{namespace=\"alerts\"} 0",
+        "mqttd_rule_state_expiry_backlog{namespace=\"alerts\"} 0",
+        "mqttd_rule_state_keys{namespace=\"kv_store\"} 0",
+        "mqttd_rule_state_keys{namespace=\"rule:own\"} 0",
+        "mqttd_rule_state_dictionary_bytes 0",
+        "mqttd_rule_state_dictionary_refused_total 0",
+    ] {
+        assert!(
+            series.iter().any(|l| l == line),
+            "missing {line}: {series:#?}"
+        );
+    }
+    assert!(
+        !series
+            .iter()
+            .any(|l| l.starts_with("mqttd_rule_state_ops_total")),
+        "a call is a series once it happened: {series:#?}"
+    );
+    n.publish("set/1", br#"{"k":"hot:dev-1","v":1}"#);
+    n.publish("set/1", br#"{"k":"hot:dev-1","v":2}"#);
+    n.publish("set/1", br#"{"k":"hot:dev-2","v":2}"#);
+    // The key holds a value `kv_set` wrote: `kv_incr` on it is another type's call.
+    n.publish("bin/1", br#"{"k":"aG90OmRldi0x"}"#);
+    n.publish("emqx/1", br#"{"k":"p","v":1}"#);
+    let series = state_series(&n);
+    let bytes = n.rules.state().unwrap().counts("alerts").unwrap().bytes;
+    for line in [
+        "mqttd_rule_state_keys{namespace=\"alerts\"} 2".to_string(),
+        format!("mqttd_rule_state_bytes{{namespace=\"alerts\"}} {bytes}"),
+        "mqttd_rule_state_ops_total{namespace=\"alerts\",op=\"set\",result=\"ok\"} 3".to_string(),
+        "mqttd_rule_state_ops_total{namespace=\"alerts\",op=\"incr\",result=\"wrong_type\"} 1"
+            .to_string(),
+        "mqttd_rule_state_ops_total{namespace=\"kv_store\",op=\"set\",result=\"ok\"} 1".to_string(),
+    ] {
+        assert!(series.contains(&line), "missing {line}: {series:#?}");
+    }
+    assert_eq!(
+        series
+            .iter()
+            .filter(|l| l.starts_with("mqttd_rule_state_ops_total"))
+            .count(),
+        3,
+        "{series:#?}"
+    );
+    // Exporting again adds nothing: a counter moves by what happened since.
+    assert_eq!(state_series(&n), series);
+    // Bounded labels: a namespace, an operation, a result. Never a key or a value.
+    let text = series.join("\n");
+    assert!(!text.contains("hot") && !text.contains("dev-"), "{text}");
+    // A namespace the rules no longer hold: its gauges go, its counters stay.
+    let without = KEEPING.replace("[rules.emqx]", "[rules.emqx]\nenable = true");
+    let without = without.replace("kv_store_put(payload.k, payload.v)", "payload.k");
+    std::fs::write(&n.file, without).unwrap();
+    assert!(n.reloader.reload_with_outcome("test").applied);
+    let series = state_series(&n);
+    for gauge in ["keys", "bytes", "expiry_backlog"] {
+        let gone = format!("mqttd_rule_state_{gauge}{{namespace=\"kv_store\"}}");
+        assert!(!series.iter().any(|l| l.starts_with(&gone)), "{series:#?}");
+    }
+    assert!(series
+        .iter()
+        .any(|l| l
+            == "mqttd_rule_state_ops_total{namespace=\"kv_store\",op=\"set\",result=\"ok\"} 1"));
+    assert!(series
+        .iter()
+        .any(|l| l == "mqttd_rule_state_keys{namespace=\"alerts\"} 2"));
+}
+
+/// D10: the trace records a failed state call as its rule's error: the function, the
+/// store's reason, and what happened. The error holds no key and no value.
+#[tokio::test]
+async fn the_trace_carries_a_failed_state_calls_reason() {
+    let rules = KEEPING.replace("max_keys = 4000", "max_keys = 1");
+    let mut n = Node::start(&rules).await;
+    let next = |n: &mut Node, topic: &str, payload: &[u8]| {
+        n.publish(topic, payload);
+        let record = n.trace_rx.try_recv().expect("the rule's trace record");
+        assert!(matches!(
+            n.trace_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        let doc: Value =
+            serde_json::from_str(&mqttd::rules_sys::record_json("rules-node", &record)).unwrap();
+        doc
+    };
+    let doc = next(&mut n, "set/1", br#"{"k":"first-key","v":"kept"}"#);
+    assert_eq!(
+        (&doc["result"], &doc["error"]),
+        (&json!("passed"), &Value::Null)
+    );
+    // A second key does not fit a namespace of one.
+    let doc = next(&mut n, "set/1", br#"{"k":"second-key","v":"refused"}"#);
+    assert_eq!(
+        (&doc["rule"], &doc["result"]),
+        (&json!("put"), &json!("failed"))
+    );
+    let bytes = n.rules.state().unwrap().counts("alerts").unwrap().bytes;
+    assert_eq!(
+        doc["error"],
+        format!(
+            "kv_set(): namespace_full: namespace `alerts` holds 1 keys and {bytes} bytes (max_keys 1, \
+             max_bytes 67108864); a new key does not fit"
+        )
+    );
+    // Another type's operation on the key that is there.
+    let doc = next(&mut n, "bin/1", br#"{"k":"Zmlyc3Qta2V5"}"#);
+    assert_eq!(
+        (&doc["rule"], &doc["result"]),
+        (&json!("count"), &json!("failed"))
+    );
+    assert_eq!(
+        doc["error"],
+        "kv_incr(): wrong_type: the key holds a value of type `lww`, and this is an operation \
+         on type `sum` (kv_del deletes a key of any type)"
+    );
+    // A call the rule engine refuses before the store sees it reads the same way.
+    let doc = next(&mut n, "set/1", br#"{"k":"","v":1}"#);
+    assert_eq!(
+        doc["error"],
+        "kv_set(): bad_key: a key is 1 to 256 bytes, got 0"
+    );
+    // The statistics keep the kind and the time, and the admin API shows the text to
+    // an operator only.
+    let (_, as_viewer) = n.call(&n.viewer, "GET", "/admin/v1/rules", None).await;
+    let last = &rule(&as_viewer, "count")["last_error"];
+    assert_eq!(last["kind"], "sql");
+    assert!(last.get("message").is_none(), "{last}");
+    let (_, as_operator) = n.call(&n.operator, "GET", "/admin/v1/rules", None).await;
+    assert!(rule(&as_operator, "count")["last_error"]["message"]
+        .as_str()
+        .unwrap()
+        .starts_with("kv_incr(): wrong_type: "));
+}
+
+/// D10 for an `eventual` namespace, over the wire: the overview says how its
+/// replication stands, its keys are listed and read as a `local` one's, and a writer's
+/// delete is a replicated delete: the key reads as absent at once, and stays counted,
+/// as a tombstone, for the namespace's tombstone window.
+#[tokio::test]
+async fn an_eventual_namespace_is_seen_and_managed_like_a_local_one() {
+    let rules = KEEPING.replace(
+        "[state.alerts]",
+        "[state.alerts]\nconsistency = \"eventual\"\ntombstone_window = \"2h\"",
+    );
+    let n = Node::start(&rules).await;
+    n.publish("set/1", br#"{"k":"hot:dev-1","v":{"temp":31.5}}"#);
+    n.publish("set/1", br#"{"k":"hot:dev-2","v":"two"}"#);
+    n.publish("bin/1", br#"{"k":"/wD+"}"#);
+    let (status, overview) = n
+        .call(&n.viewer, "GET", "/admin/v1/rules/state", None)
+        .await;
+    assert_eq!(status, 200, "{overview}");
+    let alerts = namespace(&overview, "alerts");
+    assert_eq!(
+        (
+            &alerts["consistency"],
+            &alerts["tombstone_window_secs"],
+            &alerts["keys"],
+            &alerts["calls"]
+        ),
+        (&json!("eventual"), &json!(7200), &json!(3), &json!(3))
+    );
+    assert_eq!(
+        alerts["replication"],
+        json!({
+            "links": 0, "pending": 0, "lag_ms": 0, "merged": 0,
+            "refused_by": {"declaration": 0, "clock_skew": 0, "namespace_full": 0,
+                           "store_full": 0, "brownout": 0, "malformed": 0},
+        })
+    );
+    // A `local` namespace has neither field.
+    n.publish("own/1", b"{}");
+    let (_, overview) = n
+        .call(&n.viewer, "GET", "/admin/v1/rules/state", None)
+        .await;
+    let own = namespace(&overview, "rule:own");
+    assert!(
+        own.get("replication").is_none() && own.get("tombstone_window_secs").is_none(),
+        "{own}"
+    );
+
+    let (mut keys, _) = list_keys(&n, &n.operator, &[("ns", "alerts")]).await;
+    keys.sort_by_key(|k| k["key"].as_str().unwrap().to_string());
+    assert_eq!(
+        keys,
+        [
+            json!({"key": "/wD+", "key_encoding": "base64", "type": "sum"}),
+            json!({"key": "hot:dev-1", "key_encoding": "utf8", "type": "lww"}),
+            json!({"key": "hot:dev-2", "key_encoding": "utf8", "type": "lww"}),
+        ]
+    );
+    let path = with_query(
+        "/admin/v1/rules/state/key",
+        &[("ns", "alerts"), ("key", "hot:dev-1")],
+    );
+    let (status, body) = n.call(&n.operator, "GET", &path, None).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        (&body["type"], &body["value"], &body["value_type"]),
+        (&json!("lww"), &json!("{\"temp\":31.5}"), &json!("map"))
+    );
+    assert!(body["expires_at"].is_string(), "{body}");
+
+    let (status, body) = n.call(&n.operator, "DELETE", &path, None).await;
+    assert_eq!((status, code(&body)), (403, "not-a-rules-writer"), "{body}");
+    let (status, body) = n.call(&n.writer, "DELETE", &path, None).await;
+    assert_eq!((status, &body["deleted"]), (200, &json!(true)), "{body}");
+    assert_eq!(n.call(&n.operator, "GET", &path, None).await.0, 404);
+    let (status, body) = n.call(&n.writer, "DELETE", &path, None).await;
+    assert_eq!((status, &body["deleted"]), (200, &json!(false)), "{body}");
+    let hash = sha256_hex("hot:dev-1");
+    assert_eq!(
+        n.audit.of_kind("state.delete"),
+        [
+            (
+                Some("CN=writer".to_string()),
+                format!("ns=alerts key_sha256={hash} key_bytes=9 deleted=true")
+            ),
+            (
+                Some("CN=writer".to_string()),
+                format!("ns=alerts key_sha256={hash} key_bytes=9 deleted=false")
+            ),
+        ]
+    );
+    // Not listed any more; still a key the namespace counts, until its window is over.
+    let (keys, _) = list_keys(&n, &n.operator, &[("ns", "alerts")]).await;
+    assert_eq!(keys.len(), 2);
+    let (_, overview) = n
+        .call(&n.viewer, "GET", "/admin/v1/rules/state", None)
+        .await;
+    let alerts = namespace(&overview, "alerts");
+    assert_eq!(
+        (&alerts["keys"], &alerts["deleted"], &alerts["calls"]),
+        (&json!(3), &json!(1), &json!(3))
+    );
+    // A rule sees the delete as its own `kv_del`: the key is new again.
+    n.publish("set/1", br#"{"k":"hot:dev-1","v":"again"}"#);
+    let (status, body) = n.call(&n.operator, "GET", &path, None).await;
+    assert_eq!((status, &body["value"]), (200, &json!("again")), "{body}");
+}

@@ -1151,3 +1151,148 @@ async fn records_queued_before_the_trace_turned_off_are_not_published() {
         "a discarded record is not a drop"
     );
 }
+
+const KEEPING_STATE: &str = r#"
+[state.alerts]
+max_keys = 2
+
+[rules.put]
+state = "alerts"
+sql = '''SELECT kv_set(payload.k, payload.v) AS v FROM "set/#"'''
+actions = [{ function = "console" }]
+
+[rules.own]
+sql = '''SELECT kv_incr(clientid) AS n, kv_store_put(payload.k, payload.v) AS ok FROM "own/#"'''
+actions = [{ function = "console" }]
+"#;
+
+/// One tick of [`KEEPING_STATE`]: the rules' own messages, then one per namespace, by
+/// namespace.
+async fn next_state_tick(
+    sys: &mut mpsc::UnboundedReceiver<HubCommand>,
+) -> BTreeMap<String, (String, Value)> {
+    next_tick(sys, 2).await;
+    let mut namespaces = BTreeMap::new();
+    for _ in 0..3 {
+        let (topic, doc) = next_sys(sys).await;
+        namespaces.insert(doc["namespace"].as_str().unwrap().to_string(), (topic, doc));
+    }
+    namespaces
+}
+
+/// ADR 0085 D10: with the statistics on, each namespace of the rule state store has a
+/// message per tick on `$SYS/brokers/<node>/rule_state/<namespace>`: its mode, bounds,
+/// counts and rates. It is a subtree of its own, which a grant on the rule statistics
+/// does not cover, and it never carries a key or a value.
+#[tokio::test(start_paused = true)]
+#[allow(clippy::too_many_lines)] // three ticks, each read whole
+async fn each_state_namespace_has_its_statistics_in_a_subtree_of_its_own() {
+    let config = settings(2, false, 20);
+    let (functions, store) =
+        mqttd::rules::functions_and_state_from_config(&mqtt_config::Rules::default());
+    let set = Arc::new(
+        RuleSet::parse_with(KEEPING_STATE, &functions)
+            .unwrap()
+            .rules,
+    );
+    let metrics = Arc::new(Metrics::new("test"));
+    let (rules_tx, rx) = watch::channel(set);
+    let (observe, trace_rx) = RulesObserve::new();
+    observe.apply(&config, None);
+    let rules = Rules::new(rx, Arc::from("n1"), Some(metrics.clone()))
+        .with_observe(observe.clone())
+        .with_functions(functions)
+        .with_state(store);
+    let w = Watched {
+        rules,
+        observe,
+        trace_rx: Some(trace_rx),
+        metrics,
+        rules_tx,
+    };
+    let (mut sys, _stop) = spawn_stats(&w, plenty(), Arc::new(LastReload::default()));
+    let first = next_state_tick(&mut sys).await;
+    assert_eq!(
+        first.keys().collect::<Vec<_>>(),
+        ["alerts", "kv_store", "rule:own"]
+    );
+    for (name, (topic, doc)) in &first {
+        assert_eq!(*topic, format!("$SYS/brokers/n1/rule_state/{name}"));
+        // Outside the rule statistics' subtree and the trace's.
+        assert!(!mqtt_core::topic_matches("$SYS/brokers/+/rules/#", topic));
+        assert!(!mqtt_core::topic_matches("$SYS/brokers/+/trace/#", topic));
+        assert!(mqtt_core::topic_matches(
+            "$SYS/brokers/+/rule_state/+",
+            topic
+        ));
+        assert_eq!((&doc["node"], &doc["keys"]), (&json!("n1"), &json!(0)));
+    }
+
+    let conn = w.rules.for_connection();
+    publish(
+        &conn,
+        "set/1",
+        br#"{"k":"hot:dev-1","v":"a secret reading"}"#,
+    );
+    publish(&conn, "set/1", br#"{"k":"hot:dev-2","v":"another"}"#);
+    // A third key does not fit a namespace of two: refused, twice.
+    publish(&conn, "set/1", br#"{"k":"hot:dev-3","v":"refused"}"#);
+    publish(&conn, "set/1", br#"{"k":"hot:dev-3","v":"refused"}"#);
+    publish(&conn, "own/1", br#"{"k":"table-key","v":"table-value"}"#);
+    let second = next_state_tick(&mut sys).await;
+    let (_, alerts) = &second["alerts"];
+    let at = alerts["at"].as_str().unwrap();
+    assert!(at.ends_with('Z') && at.len() == 24, "{at}");
+    let bytes = alerts["bytes"].as_u64().unwrap();
+    assert_eq!(
+        *alerts,
+        json!({
+            "node": "n1", "at": at,
+            "namespace": "alerts", "kind": "declared", "consistency": "local",
+            "eviction": "fail", "max_keys": 2, "max_bytes": 64 << 20,
+            "default_ttl_secs": 24 * 3600, "max_ttl_secs": 30 * 24 * 3600,
+            "keys": 2, "bytes": bytes, "calls": 2, "refused": 2,
+            "refused_by": {"namespace_full": 2, "store_full": 0, "brownout": 0,
+                           "wrong_type": 0, "refused": 0},
+            "expired": 0, "expiry_backlog": 0, "evicted": 0, "deleted": 0,
+            // Growth over the 2 s measured between ticks.
+            "rates": {"calls": 1.0, "refused": 1.0, "expired": 0.0, "evicted": 0.0},
+        })
+    );
+    assert!(bytes > 0);
+    let (_, own) = &second["rule:own"];
+    assert_eq!(
+        (
+            &own["kind"],
+            &own["keys"],
+            &own["calls"],
+            &own["rates"]["calls"]
+        ),
+        (&json!("rule"), &json!(1), &json!(1), &json!(0.5))
+    );
+    let (_, emqx) = &second["kv_store"];
+    assert_eq!(
+        (&emqx["kind"], &emqx["keys"], &emqx["default_ttl_secs"]),
+        (&json!("kv_store"), &json!(1), &Value::Null)
+    );
+    // No key and no value: not a namespace's, not EMQX's table's, not a client id a
+    // key was built from.
+    for (topic, doc) in second.values() {
+        let text = format!("{topic} {doc}");
+        for secret in ["hot:", "dev-", "secret", "another", "table-", "c1"] {
+            assert!(!text.contains(secret), "{secret} in {text}");
+        }
+    }
+    // Quiet: the counts stay and the rates fall to zero.
+    let third = next_state_tick(&mut sys).await;
+    let (_, alerts) = &third["alerts"];
+    assert_eq!(
+        (&alerts["calls"], &alerts["refused"], &alerts["rates"]),
+        (
+            &json!(2),
+            &json!(2),
+            &json!({"calls": 0.0, "refused": 0.0, "expired": 0.0, "evicted": 0.0})
+        )
+    );
+    drop(w);
+}
