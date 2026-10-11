@@ -33,7 +33,7 @@ tasks:
     issue: 922
   - id: 0085-T7
     title: "mqttd --rule-test --sequence: timed sequences replayed through a statement or a rules file against an in-memory store with a driven clock"
-    status: planned
+    status: in-progress
     issue: 923
   - id: 0085-T8
     title: "Documentation: RULES.md (functions, types, modes, when a state call runs, the worked sequences, the billing example), the departures from EMQX, threat model and hardening rows, the converter"
@@ -130,7 +130,7 @@ and T15 carries the documentation of these three.
 | 0085-T4 | ⬜ planned | [#920](https://github.com/mbilling/fss-mqtt-broker/issues/920) | — |  |
 | 0085-T5 | ⬜ planned | [#921](https://github.com/mbilling/fss-mqtt-broker/issues/921) | — |  |
 | 0085-T6 | ⬜ planned | [#922](https://github.com/mbilling/fss-mqtt-broker/issues/922) | — |  |
-| 0085-T7 | ⬜ planned | [#923](https://github.com/mbilling/fss-mqtt-broker/issues/923) | — |  |
+| 0085-T7 | 🚧 in-progress | [#923](https://github.com/mbilling/fss-mqtt-broker/issues/923) | — |  |
 | 0085-T8 | ⬜ planned | [#924](https://github.com/mbilling/fss-mqtt-broker/issues/924) | — |  |
 | 0085-T9 | ⬜ planned | [#925](https://github.com/mbilling/fss-mqtt-broker/issues/925) | — |  |
 | 0085-T10 | ⬜ planned | [#926](https://github.com/mbilling/fss-mqtt-broker/issues/926) | — |  |
@@ -328,3 +328,43 @@ and T15 carries the documentation of these three.
     verbs and documentation.
   - **"Expire stale entries by hand"** is served by purging by prefix, already expired
     and expires within.
+- 2026-10-11 — **T7 built, but for the expiry event** (#923, in review):
+  `mqttd --rule-test --sequence`. The ADR's amendment of this date has the format and the
+  report in full.
+  - **The replay** (`crates/mqttd/src/rule_replay.rs`, a library that the binary and the
+    tests both call): a file of JSON lines, each a message or a sample event with its time
+    (`at` from the start, or `after` the step before), bounded (10,000 steps, 1 MiB a
+    line), every error naming its line; one store for the sequence, empty at the start
+    and dropped at the end, and one dictionary per client id; the rules run as on a
+    connection's task (every matching rule, re-entry, EMQX's order). `--sql` replays one
+    statement, as `--rule-test` runs one; without it the configured rules file, actions
+    and `[state.*]` tables included. Each step prints its outputs and what it changed in
+    the store (`+`, `~`, `-` a key, with value, type and expiry); `--show-state` prints
+    the store at the end. Exit 1 when a step had a rule fail or nothing was selected, 2
+    for a sequence that cannot be read.
+  - **The clock is the sequence's.** The store, `now_timestamp()`, `now_rfc3339()`,
+    `format_date`, `timestamp` and `publish_received_at` read the step's time, and message
+    ids count from 1, so a replay prints the same every time. The engine reads a replay's
+    clock only from an input that carries one (`Input::clock_ms`); no input of a running
+    broker does.
+  - **What waits for T4:** "expiry events fire in the replay". A key past its expiry reads
+    as absent and the next step reports it as expired, in order of expiry; no rule runs
+    on it, because `$events/state/expired` does not exist yet. `rule_replay::expire` is
+    where T4 raises it. The task stays `in-progress` until then.
+  - **Tests:** `crates/mqttd/tests/rules_sequence.rs` (20: the ADR's worked examples as
+    transcripts, "hot for five minutes" with `kv_held`, a quota in a window, change
+    detection with `kv_changed`, an EMQX `kv_store_*` counter; a rules file with
+    re-entry; the clock; TTL expiry; dictionaries; events; failures; the file's format,
+    errors and bounds; the running store untouched), four in `rules_binary.rs` (options,
+    standard input, the rules file from the environment and from `--config`, exit
+    codes), four in mqtt-rules `tests_state`; RULES.md's two transcripts run in
+    `rules_docs.rs`.
+  - **Also:** `--rule-test` accepts `--config` (it always read the effective
+    configuration, and a replay of the rules file needs to name it).
+  - **Measured** (`cargo bench -p mqtt-rules`, Apple M1 Pro, `main`'s binary and this
+    change's in turn, six rounds, the fastest median of each case; the machine was
+    shared): `no_match` 113.3 to 114.0 ns, `filter_reject` 987.8 to 984.6 ns,
+    `filter_republish` 1.8335 to 1.8328 µs, `select_star_republish` 4.597 to 4.594 µs,
+    `foreach_10` 8.462 to 8.467 µs: −0.3% to +0.6%, inside the spread between runs.
+  - **Left for T8, as planned:** the cookbook's stateful recipes as sequences, and the
+    "Differences from EMQX" rows.

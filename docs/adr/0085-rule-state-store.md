@@ -430,6 +430,9 @@ clock passes them. This is how a rule with state is written and reviewed: the ex
 become a sequence with expected outputs, and RULES.md's worked examples are such
 sequences, run by CI.
 
+*(Amended 2026-10-11, T7: the file's format, the replay's clock and the report as built;
+the expiry events in a replay wait for T4. See [Amendments](#amendments).)*
+
 **No test touches the running store.** `--rule-test`, `--check-rules` and the admin API's
 `POST /admin/v1/rules/test` (ADR 0084 D6: "a dry run touches no counter, no last error,
 no trace") load and evaluate against an empty in-memory store that is dropped afterwards. EMQX's
@@ -1234,3 +1237,82 @@ not been swept yet by `expired=true`; and removes keys about to expire by
 itself, which is the store's own answer to staleness. What cannot be asked any more is
 "the keys nothing has written for a month" among keys that never expire (`kv_store`, or
 a key whose expiry was cleared): those are found by `no_expiry` and chosen by prefix.
+
+### 2026-10-11 — T7: `--sequence` as built
+
+D11 decided that `mqttd --rule-test` replays "a timed list of messages and events …
+against an in-memory store with a clock the sequence drives", and left the file's format,
+the clock and the report open. T7 built it (`crates/mqttd/src/rule_replay.rs`); this is
+what it settled.
+
+**The file.** One JSON object per line; blank lines and lines that start with `#` are
+skipped; `--sequence -` reads standard input.
+
+| Key | |
+|---|---|
+| `at` | the step's time from the sequence's start: a number of seconds (fractions allowed), or text with a unit (`"250ms"`, `"90s"`, `"5m"`, `"1h"`, `"2d"`). Never before the step before it: a sequence's clock does not go back |
+| `after` | instead of `at`: how long after the step before it. With neither, the step happens when the one before it did (the first one at the start) |
+| `topic`, `payload`, `qos`, `retain`, `clientid`, `username` | the publish. A `payload` that is a JSON string is those bytes; any other JSON value is its text exactly as the line has it. What a line leaves out is what `--rule-test`'s options of the same names say, or their defaults |
+| `event` | instead of a publish, a sample of that event, as `--rule-test --event` builds it |
+
+A line with no `topic`, no `payload` and no `event` sends nothing and only moves the clock
+(a step in which keys expire). An unknown key is an error, as everywhere. Bounds: 10,000
+steps, 1 MiB a line, a hundred years from the start. An error names the line, and a
+sequence that cannot be read is a usage error (exit 2): nothing is replayed.
+
+**The clock.** A sequence starts at 2025-01-01T00:00:00Z, and a step happens at that time
+plus its `at`. Everything that reads time reads the step's: the store (TTLs, `kv_held`,
+`kv_ttl`), `now_timestamp()`, `now_rfc3339()`, a `format_date` without a time,
+`timestamp` and `publish_received_at`; a message's `id` counts from 1. Nothing reads the
+wall clock or draws a random number, so a replay prints the same thing every time. D6's
+"`now_timestamp()` is the wall clock read at each call" stands for a running broker: the
+engine reads a replay's clock only from an input that carries one (`Input::clock_ms`),
+and no input of a running broker does. The per-publish benchmark did not move (below).
+
+**What a replay is.** One store, empty at the start and dropped at the end, under the
+configured ceiling; never the store the rules of a running broker hold (D11), whichever
+store the functions it is given carry. One dictionary per client id in the sequence,
+counted against that store as a connection's is: a sequence has no connections, so the
+steps of one client id are taken as one connection of it. The rules run as the broker
+runs them on a connection's task: every enabled rule whose `FROM` selects the trigger, in
+id order; a republished message re-enters on the same dictionary and within the same
+per-message budget, depth first; state calls in EMQX's order. With `--sql` it is the
+statement only, as `--rule-test` has always been (no actions); without, the configured
+rules file with its actions and its `[state.*]` tables. One node: a namespace that is not
+`local` has nobody to replicate to and behaves as `local`, which the report notes.
+
+**The report.** Per step: its number, its time, what was sent; then, for a statement, its
+outputs as `--rule-test` prints them, or `(no output)`, `(not selected: <why>)` or
+`FAILED: <why>`; for a rules file, each rule that ran with `passed`, `no_result` or
+`FAILED: <why>` and under it what each action rendered (`republish <topic> qos <n>
+[retain] <payload>`, `console <output>`, `action FAILED: <why>`), then each re-entering
+message under a `>` line. Then what the step changed in the store, a key a line, by
+namespace and key: `+` new, `~` a changed value or expiry, `-` gone, with the value as
+`kv_get` reads it, the key's type and its expiry. `--show-state` adds the store after the
+last step. A failing step does not stop the replay (what it wrote stays, as in the
+broker). Exit 1 when a step had a rule or an action fail, or when nothing in the sequence
+was selected at all; 0 otherwise.
+
+**Expiry, and what waits for T4.** A key past its expiry reads as absent at once (T1),
+and the first step after it reports it as `- <key> (expired <when>)`, in order of expiry.
+D7's event does not exist yet, so a replay raises none: "expiry events fire in the
+replay" is T4's to finish, where the replay takes the expired keys out of what it shows
+(`rule_replay::expire`): for each, at its expiry time and before the step's own message,
+evaluate the rules that select `$events/state/expired` and report what they produced.
+
+**The same replay is a library call** (`mqttd::rule_replay`: `parse_sequence`, `Replay`,
+`Report`), so tests assert sequences without the binary. The worked examples are pinned
+that way (`crates/mqttd/tests/rules_sequence.rs`: "hot for N seconds", a quota in a
+window, change detection, an EMQX `kv_store_*` counter), and RULES.md's two transcripts
+are run by `rules_docs.rs` against the binary.
+
+**Also settled.** `--rule-test` accepts `--config`, as `--check-rules` does: it has always
+read the effective configuration (for `rules.jq` and the modules of `rules.file`), and a
+replay of the rules file needs to be told which. A `kv_store_*` key is shown as the value
+it is (`1`, `1.0` and `"1"` are three keys), read back from the store's exact form.
+
+**Measured** (`cargo bench -p mqtt-rules`, Apple M1 Pro, `main`'s binary and this change's
+run in turn, six rounds, the fastest median of each case; the machine was shared):
+`no_match` 113.3 to 114.0 ns, `filter_reject` 987.8 to 984.6 ns, `filter_republish`
+1.8335 to 1.8328 µs, `select_star_republish` 4.597 to 4.594 µs, `foreach_10` 8.462 to
+8.467 µs. Between −0.3% and +0.6%, inside the spread from one run to the next.

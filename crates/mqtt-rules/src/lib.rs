@@ -276,6 +276,14 @@ pub trait Input {
     fn has_dup_flag(&self) -> bool {
         false
     }
+    /// When this trigger is evaluated, in milliseconds since the epoch, where that is
+    /// not the wall clock's time: a replayed sequence's own clock
+    /// (`mqttd --rule-test --sequence`, ADR 0085 D11), which `now_timestamp()`,
+    /// `now_rfc3339()` and a `format_date` without a time then read. `None`, which is
+    /// every trigger of a running broker: the wall clock.
+    fn clock_ms(&self) -> Option<i64> {
+        None
+    }
 }
 
 /// How one rule fared for one trigger, reported as it happens (the broker turns these
@@ -1349,23 +1357,77 @@ pub fn test_sql_with(
     input: &dyn Input,
     functions: &Functions,
 ) -> Result<Vec<String>, String> {
-    let Compiled {
-        stmt,
-        topics,
-        events,
-        ..
-    } = compile_alone(sql, functions)?;
-    if let Some(why) = from_mismatch(&topics, &events, input) {
-        return Err(why);
+    SqlTest::compile(sql, functions)?.run(input, &state::Dictionary::new())
+}
+
+/// One statement on its own, compiled once and run against as many inputs as the
+/// caller has: [`test_sql_with`] for a sequence (`mqttd --rule-test --sequence`, ADR
+/// 0085 D11). Its state calls work on the store `functions` carried when it was
+/// compiled, in the namespace `rule:test`, which keeps its keys for as long as this
+/// lives; so what one input wrote, the next reads.
+#[derive(Debug)]
+pub struct SqlTest {
+    stmt: parser::Statement,
+    topics: Vec<String>,
+    events: Vec<EventKind>,
+}
+
+impl SqlTest {
+    /// Compile `sql`, which may call what `functions` has.
+    pub fn compile(sql: &str, functions: &Functions) -> Result<Self, String> {
+        let Compiled {
+            stmt,
+            topics,
+            events,
+            ..
+        } = compile_alone(sql, functions)?;
+        Ok(Self {
+            stmt,
+            topics,
+            events,
+        })
     }
-    let ctx = EvalCtx::new(input);
-    *ctx.rule_id.borrow_mut() = Arc::from("test");
-    let mut outputs = Vec::new();
-    eval::run(&stmt, &ctx, &mut outputs).map_err(|e| e.to_string())?;
-    outputs
-        .into_iter()
-        .map(|o| Value::from(o).to_json().map_err(|e| e.to_string()))
-        .collect()
+
+    /// The events the statement's `FROM` selects, in the order it names them.
+    #[must_use]
+    pub fn events(&self) -> &[EventKind] {
+        &self.events
+    }
+
+    /// Whether the statement's `FROM` selects any topic.
+    #[must_use]
+    pub fn selects_topics(&self) -> bool {
+        !self.topics.is_empty()
+    }
+
+    /// Why the broker would never run the statement on `input` ([`test_sql`]); `None`
+    /// when its `FROM` selects it.
+    #[must_use]
+    pub fn from_mismatch(&self, input: &dyn Input) -> Option<String> {
+        from_mismatch(&self.topics, &self.events, input)
+    }
+
+    /// The statement's outputs for `input`, as JSON; `Err` when it fails, and when the
+    /// broker would never have run it on `input` ([`from_mismatch`](Self::from_mismatch)).
+    /// `dictionary` is what EMQX's `proc_dict_*` work on: in a sequence, the one of
+    /// whoever sent `input`.
+    pub fn run(
+        &self,
+        input: &dyn Input,
+        dictionary: &state::Dictionary,
+    ) -> Result<Vec<String>, String> {
+        if let Some(why) = from_mismatch(&self.topics, &self.events, input) {
+            return Err(why);
+        }
+        let ctx = EvalCtx::new(input).on(dictionary);
+        *ctx.rule_id.borrow_mut() = Arc::from("test");
+        let mut outputs = Vec::new();
+        eval::run(&self.stmt, &ctx, &mut outputs).map_err(|e| e.to_string())?;
+        outputs
+            .into_iter()
+            .map(|o| Value::from(o).to_json().map_err(|e| e.to_string()))
+            .collect()
+    }
 }
 
 /// Validate one statement without running it; returns its warnings.

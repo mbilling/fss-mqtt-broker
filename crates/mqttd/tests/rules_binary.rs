@@ -5067,3 +5067,319 @@ fn rule_test_runs_proc_dict_on_a_dictionary_of_its_own() {
         "{ran:?}"
     );
 }
+
+/// The sequence the `--sequence` tests replay: a sensor that runs hot for five minutes.
+const HOT_SEQUENCE: &str = r#"# hot, and still hot five minutes on
+{"at": 0, "topic": "sensors/s1/data", "clientid": "s1", "payload": {"temp": 31}}
+{"at": "5m", "topic": "sensors/s1/data", "clientid": "s1", "payload": {"temp": 33}}
+"#;
+
+const HOT_SQL: &str = "SELECT clientid, kv_held('hot:' + clientid, payload.temp > 30, 3600) AS \
+                       hot_for FROM \"sensors/+/data\" WHERE hot_for >= 300";
+
+/// `mqttd --rule-test --sql … --sequence <file>` (ADR 0085 D11) replays the file's
+/// messages through the statement on one store and the sequence's own clock, and
+/// prints each step's outputs and what it changed in the store; `--show-state` adds
+/// the store at the end; `-` reads the sequence from standard input; the options a
+/// single message takes are what a line leaves out. The same output every run.
+#[test]
+fn rule_test_replays_a_sequence_through_a_statement() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("hot.jsonl");
+    std::fs::write(&file, HOT_SEQUENCE).unwrap();
+    let steps = "#1 +0s sensors/s1/data {\"temp\": 31}\n  (no output)\n  \
+                 state rule:test: + \"hot:s1\" = 1735689600000 (first, expires +3600s)\n\
+                 #2 +300s sensors/s1/data {\"temp\": 33}\n  \
+                 {\"clientid\":\"s1\",\"hot_for\":300}\n  \
+                 state rule:test: ~ \"hot:s1\" = 1735689600000 (first, expires +3900s)\n";
+    let end = "state at the end (+300s):\n  \
+               rule:test: \"hot:s1\" = 1735689600000 (first, expires +3900s)\n";
+    for _ in 0..2 {
+        let ran = cli(&[
+            "--rule-test",
+            "--sql",
+            HOT_SQL,
+            "--sequence",
+            file.to_str().unwrap(),
+        ]);
+        assert_eq!((ran.code, ran.stdout.as_str()), (Some(0), steps), "{ran:?}");
+        assert_eq!(ran.stderr, "");
+    }
+    let mut piped = mqttd();
+    piped
+        .args([
+            "--rule-test",
+            "--show-state",
+            "--sequence",
+            "-",
+            "--sql",
+            HOT_SQL,
+        ])
+        .stdin(std::fs::File::open(&file).unwrap());
+    let ran = run(piped);
+    assert_eq!(
+        (ran.code, ran.stdout),
+        (Some(0), format!("{steps}{end}")),
+        "{}",
+        ran.stderr
+    );
+    // What a line leaves out is what the options say.
+    std::fs::write(
+        &file,
+        "{\"payload\": {\"temp\": 40}}\n{\"after\": \"1h\"}\n",
+    )
+    .unwrap();
+    let ran = cli(&[
+        "--rule-test",
+        "--sql",
+        "SELECT clientid, username, qos, kv_incr(topic) AS n FROM \"sensors/#\"",
+        "--sequence",
+        file.to_str().unwrap(),
+        "--topic",
+        "sensors/x",
+        "--clientid",
+        "dev",
+        "--username",
+        "u",
+        "--qos",
+        "2",
+    ]);
+    assert_eq!(
+        (ran.code, ran.stdout.as_str()),
+        (
+            Some(0),
+            "#1 +0s sensors/x {\"temp\": 40}\n  \
+             {\"clientid\":\"dev\",\"username\":\"u\",\"qos\":2,\"n\":1}\n  \
+             state rule:test: + \"sensors/x\" = 1 (sum, expires +86400s)\n\
+             #2 +3600s (nothing sent)\n"
+        ),
+        "{ran:?}"
+    );
+}
+
+/// Without `--sql` the sequence runs through the configured rules file: every enabled
+/// rule, its actions and what they republish, with the namespaces the file declares.
+/// The file is the effective config's (`rules.file`, here from the environment and
+/// from `--config`), and its warnings are printed.
+#[test]
+fn rule_test_replays_a_sequence_through_the_configured_rules_file() {
+    let dir = tempfile::tempdir().unwrap();
+    write_rules(
+        dir.path(),
+        r#"
+[state.alerts]
+default_ttl = "2h"
+
+[rules.hot_sensor]
+state = "alerts"
+sql = '''
+SELECT clientid, kv_held('hot:' + clientid, payload.temp > 30) AS hot_for
+FROM "sensors/+/data" WHERE hot_for >= 300
+'''
+actions = [{ function = "republish", args = { topic = "alerts/hot", qos = 1, retain = true, payload = "${clientid} for ${hot_for}s" } }]
+
+[rules.seen]
+sql = '''SELECT kv_store_put('alerts', kv_store_get('alerts', 0) + 1) AS put, kv_store_get('alerts') AS alerts FROM "alerts/#"'''
+actions = [{ function = "console" }]
+"#,
+    );
+    let rules = dir.path().join("rules.toml");
+    let file = dir.path().join("hot.jsonl");
+    std::fs::write(&file, HOT_SEQUENCE).unwrap();
+    let want = "#1 +0s sensors/s1/data {\"temp\": 31}\n  hot_sensor: no_result\n  \
+                state alerts: + \"hot:s1\" = 1735689600000 (first, expires +7200s)\n\
+                #2 +300s sensors/s1/data {\"temp\": 33}\n  hot_sensor: passed\n    \
+                republish alerts/hot qos 1 retain s1 for 300s\n  \
+                > alerts/hot (republished by hot_sensor)\n    seen: passed\n      \
+                console {\"put\":true,\"alerts\":1}\n  \
+                state kv_store: + \"alerts\" = 1 (lww)\n\
+                state at the end (+300s):\n  \
+                alerts: \"hot:s1\" = 1735689600000 (first, expires +7200s)\n  \
+                kv_store: \"alerts\" = 1 (lww)\n";
+    let warning = "warning: the file calls both EMQX's kv_store_* functions and mqttd's kv_* \
+                   functions: they do not share keys (kv_get does not read what kv_store_put \
+                   wrote)\n";
+    let mut by_env = mqttd();
+    by_env
+        .args([
+            "--rule-test",
+            "--sequence",
+            file.to_str().unwrap(),
+            "--show-state",
+        ])
+        .env("MQTTD_RULES_FILE", &rules);
+    let ran = run(by_env);
+    assert_eq!((ran.code, ran.stdout.as_str()), (Some(0), want), "{ran:?}");
+    assert_eq!(ran.stderr, warning);
+    let config = dir.path().join("mqttd.toml");
+    std::fs::write(
+        &config,
+        format!("[rules]\nfile = {:?}\n", rules.to_str().unwrap()),
+    )
+    .unwrap();
+    let ran = cli(&[
+        "--rule-test",
+        "--sequence",
+        file.to_str().unwrap(),
+        "--show-state",
+        "--config",
+        config.to_str().unwrap(),
+    ]);
+    assert_eq!((ran.code, ran.stdout.as_str()), (Some(0), want), "{ran:?}");
+
+    // A rules file that does not load, and no rules file at all.
+    std::fs::write(&rules, "[rules.r]\nsql = 'SELECT'\n").unwrap();
+    let mut bad = mqttd();
+    bad.args(["--rule-test", "--sequence", file.to_str().unwrap()])
+        .env("MQTTD_RULES_FILE", &rules);
+    let ran = run(bad);
+    assert_eq!((ran.code, ran.stdout.as_str()), (Some(1), ""), "{ran:?}");
+    assert!(ran.stderr.starts_with("rules INVALID ("), "{ran:?}");
+    let ran = cli(&["--rule-test", "--sequence", file.to_str().unwrap()]);
+    assert_eq!(ran.code, Some(2), "{ran:?}");
+    assert_eq!(
+        ran.stderr,
+        "error: --rule-test --sequence without --sql replays the sequence through the \
+         configured rules file, and none is set (rules.file / MQTTD_RULES_FILE)\n"
+    );
+}
+
+/// How a replay exits: `1`, after the whole report, when a step had a rule fail, and
+/// when nothing in the sequence was selected; `1` for a statement that does not
+/// compile; `2` for a sequence that cannot be read (the line named).
+#[test]
+fn rule_test_sequence_exits_by_what_the_replay_found() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("steps.jsonl");
+    let path = file.to_str().unwrap();
+    let replay = |sequence: &str, sql: &str| {
+        std::fs::write(&file, sequence).unwrap();
+        cli(&["--rule-test", "--sql", sql, "--sequence", path])
+    };
+    let counting = "SELECT kv_incr('n') AS n, payload.x + 1 AS next FROM \"t/#\"";
+    // A failing step does not stop the replay: what it wrote is there for the next.
+    let ran = replay(
+        "{\"payload\": {\"x\": 1}}\n{\"payload\": \"hot\"}\n{\"payload\": {\"x\": 3}}\n",
+        counting,
+    );
+    assert_eq!(ran.code, Some(1), "{ran:?}");
+    assert_eq!(
+        ran.stdout,
+        "#1 +0s t/1 {\"x\": 1}\n  {\"n\":1,\"next\":2}\n  \
+         state rule:test: + \"n\" = 1 (sum, expires +86400s)\n\
+         #2 +0s t/1 hot\n  \
+         FAILED: payload is not JSON, so payload.<field> is unreadable (invalid JSON: \
+         expected value at line 1 column 1)\n  \
+         state rule:test: ~ \"n\" = 2 (sum, expires +86400s)\n\
+         #3 +0s t/1 {\"x\": 3}\n  {\"n\":3,\"next\":4}\n  \
+         state rule:test: ~ \"n\" = 3 (sum, expires +86400s)\n"
+    );
+    assert_eq!(
+        ran.stderr,
+        "rule test FAILED: 1 of 3 steps had a rule or an action fail\n"
+    );
+    let ran = replay("{\"topic\": \"elsewhere\"}\n", counting);
+    assert_eq!(ran.code, Some(1), "{ran:?}");
+    assert_eq!(
+        ran.stdout,
+        "#1 +0s elsewhere {}\n  (not selected: topic \"elsewhere\" matches none of the FROM \
+         filters (t/#))\n"
+    );
+    assert_eq!(
+        ran.stderr,
+        "rule test FAILED: nothing in the sequence is selected by the statement's FROM\n"
+    );
+    let ran = replay("{}\n", "SELECT nope( FROM \"t/#\"");
+    assert_eq!((ran.code, ran.stdout.as_str()), (Some(1), ""), "{ran:?}");
+    assert!(ran.stderr.starts_with("rule test FAILED: "), "{ran:?}");
+
+    // A sequence that cannot be read is a usage error, and nothing is replayed.
+    let ran = replay(
+        "{}\n\n{\"at\": \"5m\"}\n{\"at\": 1, \"tpoic\": \"t\"}\n",
+        counting,
+    );
+    assert_eq!((ran.code, ran.stdout.as_str()), (Some(2), ""), "{ran:?}");
+    assert!(
+        ran.stderr.starts_with(&format!(
+            "error: {path}: line 4: not a step (a JSON object on one line): unknown field \
+             `tpoic`"
+        )),
+        "{ran:?}"
+    );
+    let ran = cli(&[
+        "--rule-test",
+        "--sql",
+        counting,
+        "--sequence",
+        dir.path().join("missing.jsonl").to_str().unwrap(),
+    ]);
+    assert_eq!(ran.code, Some(2), "{ran:?}");
+    assert!(ran.stderr.starts_with("error: "), "{ran:?}");
+    // Standard input, which is empty here.
+    let ran = cli(&["--rule-test", "--sql", counting, "--sequence", "-"]);
+    assert_eq!(ran.code, Some(2), "{ran:?}");
+    assert_eq!(
+        ran.stderr,
+        "error: the sequence on standard input: the sequence has no step (one JSON object \
+         per line)\n"
+    );
+}
+
+/// A misuse of the `--sequence` options is a usage error (exit `2`) before anything is
+/// read or replayed, and `--help` lists the command.
+#[test]
+fn rule_test_sequence_refuses_a_misuse_of_its_options() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("steps.jsonl");
+    std::fs::write(&file, "{}\n").unwrap();
+    let path = file.to_str().unwrap();
+    let counting = "SELECT kv_incr('n') AS n FROM \"t/#\"";
+    for (args, why) in [
+        (
+            &["--rule-test", "--sql", counting, "--show-state"][..],
+            "mqttd: --show-state is valid only with --rule-test --sequence\n",
+        ),
+        (
+            &["--check-rules", "--sequence", path],
+            "mqttd: --sequence is not valid with --check-rules\n",
+        ),
+        (
+            &["--rule-test", "--sql", counting, "--sequence"],
+            "mqttd: --sequence requires a value\n",
+        ),
+        (
+            &[
+                "--rule-test",
+                "--sql",
+                counting,
+                "--sequence",
+                path,
+                "--qos",
+                "3",
+            ],
+            "error: --qos takes 0, 1 or 2, not \"3\"\n",
+        ),
+        (
+            &[
+                "--rule-test",
+                "--sql",
+                counting,
+                "--sequence",
+                path,
+                "--event",
+                "client.nope",
+            ],
+            "error: --event takes one of ",
+        ),
+    ] {
+        let ran = cli(args);
+        assert_eq!((ran.code, ran.stdout.as_str()), (Some(2), ""), "{ran:?}");
+        assert!(ran.stderr.starts_with(why), "{args:?}: {ran:?}");
+    }
+    let help = cli(&["--help"]);
+    assert!(
+        help.stdout
+            .contains("mqttd --rule-test [--sql <statement>] --sequence <file> [--show-state]"),
+        "{help:?}"
+    );
+}
