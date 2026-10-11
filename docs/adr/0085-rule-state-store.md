@@ -413,7 +413,7 @@ sequences, run by CI.
 
 **No test touches the running store.** `--rule-test`, `--check-rules` and the admin API's
 `POST /admin/v1/rules/test` (ADR 0084 D6: "a dry run touches no counter, no last error,
-no trace") evaluate against an empty in-memory store that is dropped afterwards. EMQX's
+no trace") load and evaluate against an empty in-memory store that is dropped afterwards. EMQX's
 SQL tester calls the real functions, so a test of `kv_store_put` there writes the node's
 table; here it does not, and that is listed as a difference.
 
