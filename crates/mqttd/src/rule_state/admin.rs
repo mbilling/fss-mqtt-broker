@@ -389,6 +389,9 @@ impl Namespace {
                         *total += n;
                     }
                     counts.expired += shard.expired;
+                    // The keys held for their expiry events: out of the map, and
+                    // still to be removed.
+                    counts.expiry_backlog += super::wide(shard.held.len());
                 }
                 let (due, last) = due_in(&shard, from.as_ref(), now_ms);
                 counts.expiry_backlog += super::wide(due);
@@ -695,11 +698,14 @@ impl Store {
         let at = ns.shard_of(key);
         let mut shard = lock_shard(&ns.shards[at]);
         let expired = shard.map.get(key).is_some_and(|e| e.expired(now_ms));
-        let removed = ns.remove(&mut shard, key);
-        if removed && expired {
-            // It read as absent already: its expiry removed it, not the operator.
-            shard.expired += 1;
-        }
+        let removed = if expired {
+            // It read as absent already: its expiry removes it, not the operator, and
+            // where a rule selects the expiry event it is held for that.
+            ns.expire(&mut shard, key);
+            true
+        } else {
+            ns.remove(&mut shard, key)
+        };
         ns.note_oldest(at, &shard);
         drop(shard);
         let deleted = removed && !expired;

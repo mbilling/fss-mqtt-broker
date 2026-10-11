@@ -35,6 +35,11 @@
 //!   namespace of `<keys>` keys, with nothing else running (`idle`), with another thread
 //!   listing every key over and over (`listing`), and with one reading the counts over
 //!   and over (`counting`). The difference from `idle` is what the look costs a publish.
+//! - `sweep/*` — the expiry sweep (D7), which runs on a task of its own about once a
+//!   second: `idle` is one pass over a namespace of 100,000 keys none of which is due
+//!   (64 shard locks, each for one read), `expired` and `expired_event` the time per
+//!   key of a pass that removes 1,000 expired keys, without and with a rule on
+//!   `$events/state/expired` (the event's value is then read out).
 //!
 //! `cargo bench -p mqttd --bench rule_state`. The numbers in `docs/RULES.md` are from
 //! this.
@@ -889,6 +894,54 @@ fn replication(c: &mut Criterion) {
     }
 }
 
+/// The expiry sweep: a pass that finds nothing, and what a key it removes costs.
+fn sweep(c: &mut Criterion) {
+    let value = Value::from("a value of a few dozen bytes, as a status is");
+    let store = Store::new(CEILING);
+    let ns = namespace(&store, &NamespaceSettings::defaults(CEILING));
+    for i in 0..100_000 {
+        ns.call(&StateOp::Set {
+            key: format!("state:device-{i:06}").as_bytes(),
+            value: stored(&value),
+            ttl: Some(3600),
+        })
+        .expect("room for the keys");
+    }
+    c.bench_function("sweep/idle", |b| {
+        b.iter(|| black_box(store.sweep(1000).more));
+    });
+    for (name, events) in [("sweep/expired", false), ("sweep/expired_event", true)] {
+        c.bench_function(name, |b| {
+            b.iter_custom(|iters| {
+                let now_ms = Arc::new(std::sync::atomic::AtomicU64::new(1_800_000_000_000));
+                let store = Store::with_manual_clock(CEILING, now_ms.clone());
+                store.set_expiry_events(events);
+                let ns = namespace(&store, &NamespaceSettings::defaults(CEILING));
+                let mut total = Duration::ZERO;
+                let mut left = iters;
+                while left > 0 {
+                    let batch = left.min(1000);
+                    for i in 0..batch {
+                        ns.call(&StateOp::Set {
+                            key: format!("state:device-{i:06}").as_bytes(),
+                            value: stored(&value),
+                            ttl: Some(1),
+                        })
+                        .expect("room for the keys");
+                    }
+                    now_ms.fetch_add(2000, std::sync::atomic::Ordering::Relaxed);
+                    let started = Instant::now();
+                    let swept = store.sweep(usize::MAX);
+                    total += started.elapsed();
+                    black_box(swept.expired.len() + swept.removed);
+                    left -= batch;
+                }
+                total
+            });
+        });
+    }
+}
+
 fn bench(c: &mut Criterion) {
     publish(
         c,
@@ -960,6 +1013,7 @@ fn bench(c: &mut Criterion) {
             }
         }
     }
+    sweep(c);
     let cores = std::thread::available_parallelism().map_or(4, std::num::NonZero::get);
     let mut counts = vec![1, 2, 4, 8, cores];
     counts.retain(|threads| *threads <= cores);

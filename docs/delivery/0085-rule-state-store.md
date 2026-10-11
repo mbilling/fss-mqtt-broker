@@ -23,7 +23,7 @@ tasks:
     evidence: "PR 950: crates/mqttd/src/rule_state/replica.rs and link.rs (changed keys read per link with no per-link queue, repair by a 1,024-part digest, refusals counted by reason), peer protocol 14 with StateKeys, StateDigest and StateWant pinned in crates/mqtt-cluster/src/peer.rs; tests_replica and crates/mqttd/tests/rules_state_cluster.rs (convergence, restart refill, declaration mismatch, bounds, a v13 peer sent nothing); the rule_state benchmark (publish with one kv_incr 1.80 us local, 1.84 us eventual; 100k keys caught up in 0.14 s on loopback, Apple M1 Pro); the ADR amended for what T3 decided."
   - id: 0085-T4
     title: "Expiry and $events/state/expired: selected by its own name only, raised by one member, rate-bounded and late rather than lost, at least once around membership changes"
-    status: planned
+    status: in-progress
     issue: 920
   - id: 0085-T5
     title: "kv_incr idempotency keys, remembered as entries of the namespace for its dedupe window"
@@ -131,7 +131,7 @@ and T15 carries the documentation of these three.
 | 0085-T1 | ✅ done | [#917](https://github.com/mbilling/fss-mqtt-broker/issues/917) | 2026-10-11 | "PR 929: crates/mqtt-rules/src/state.rs (StateStore and StateNamespace handed over in Functions, [state.<name>] and the rule key state, one table of function names) and crates/mqttd/src/rule_state.rs (local namespaces, typed keys, TTLs, bounds, LRU, the rules.state_max_bytes ceiling, brownout); 141 probes of EMQX 6.3.1 (emqx_rule_funcs and emqx_rule_sqltester) pinned in rule_state::tests, none contradicting the ADR; mqtt-rules tests_state (21), mqttd rule_state::tests (33), tests/rules_state.rs (6), additions to rules_binary.rs, admin_rules.rs and the converter test; dry runs on a scratch store; the rule_state benchmark (0.11-0.14 us per call on one thread, Apple M1 Pro)." |
 | 0085-T2 | ✅ done | [#918](https://github.com/mbilling/fss-mqtt-broker/issues/918) | 2026-10-11 | "PR 935: crates/mqtt-rules/src/crdt.rs (the types, a merge that is commutative, associative and idempotent over every state the decoder accepts, the hybrid logical clock with a 60 s skew bound, the canonical bounded encoded form, kv_hll_add and kv_hll_count on a 2^14-register sketch hashed with SipHash-2-4 under a fixed key) and the store keeping its keys in crdt::Data; mqtt-rules tests_crdt (40); the state_merge fuzz target in the nightly tier (about 1.2 million inputs locally, no finding); T1 store tests and the 141 EMQX probes pass unmodified; the ADR amended for the delete rule of non-lww types, first-write expiry, the skew bound and the counter bound." |
 | 0085-T3 | ✅ done | [#919](https://github.com/mbilling/fss-mqtt-broker/issues/919) | 2026-10-11 | "PR 950: crates/mqttd/src/rule_state/replica.rs and link.rs (changed keys read per link with no per-link queue, repair by a 1,024-part digest, refusals counted by reason), peer protocol 14 with StateKeys, StateDigest and StateWant pinned in crates/mqtt-cluster/src/peer.rs; tests_replica and crates/mqttd/tests/rules_state_cluster.rs (convergence, restart refill, declaration mismatch, bounds, a v13 peer sent nothing); the rule_state benchmark (publish with one kv_incr 1.80 us local, 1.84 us eventual; 100k keys caught up in 0.14 s on loopback, Apple M1 Pro); the ADR amended for what T3 decided." |
-| 0085-T4 | ⬜ planned | [#920](https://github.com/mbilling/fss-mqtt-broker/issues/920) | — |  |
+| 0085-T4 | 🚧 in-progress | [#920](https://github.com/mbilling/fss-mqtt-broker/issues/920) | — |  |
 | 0085-T5 | ⬜ planned | [#921](https://github.com/mbilling/fss-mqtt-broker/issues/921) | — |  |
 | 0085-T6 | ✅ done | [#922](https://github.com/mbilling/fss-mqtt-broker/issues/922) | 2026-10-11 | "PR 948: crates/mqttd/src/rule_state/admin.rs and crates/mqttd/src/admin/state.rs (the overview for a viewer, the paged key listing and single-key read for an operator, the audited delete for an operator who is a listed rules writer, replicated in an eventual namespace), the CLI verbs state, state-keys, state-get and state-del with control characters escaped, the mqttd_rule_state_* series and $SYS/brokers/<node>/rule_state/<namespace> with no key and no value; tests for roles, paging under concurrent writes and merges, the key and value representation round trip, the audit record (key_sha256 and key_bytes) and a three-node delete that converges; the rule_state inspect benchmark." |
 | 0085-T7 | 🚧 in-progress | [#923](https://github.com/mbilling/fss-mqtt-broker/issues/923) | — |  |
@@ -485,3 +485,65 @@ and T15 carries the documentation of these three.
     series; the two tasks' series share one label type and no name.
   - **Not in T6:** a `state` field for `PUT /admin/v1/rule`, left to T8; and T12's finer
     walk, on which the ADR's amendment has a note.
+- 2026-10-11 — **T4 built on one node** (#920, in review): a key's expiry as an event,
+  `$events/state/expired`, for `local` namespaces. The ADR's amendment of this date ("T4:
+  the expiry event on one node, as built") has every decision. T3 merged while this was
+  built (#950); the cluster half is not in this change, and the task stays `in-progress`.
+  - **The event** (`mqtt-rules`: `EventKind::StateExpired`): `event`, `namespace`, `key`,
+    `value`, `type`, `expired_at`, `timestamp`, `node`. Selected by its exact name and by
+    no wildcard: it is not in the table of EMQX's event topics that a wildcard is matched
+    against, so `"$events/#"` selects what it selects in EMQX. `"$events/state/#"` is
+    refused, naming the topic.
+  - **The sweep** (`crates/mqttd/src/rule_state/expiry.rs`): walks the order of expiry
+    each shard already keeps, one shard's lock at a time, 64 keys a hold; nothing was
+    added to an entry or to a call. Without a rule on the event it only removes. With
+    one, an expired key is held (absent to every read, still counted toward `max_keys`
+    and `max_bytes`) until its event is handed over, at `rules.state_expiry_per_sec`
+    (`MQTTD_RULES_STATE_EXPIRY_PER_SEC`, 1,000; read at startup), a tenth of a second's
+    worth at a time, earliest second first, none shed. Nothing is raised after a restart.
+  - **Where its rules run** (`Rules::spawn_expiry`): on one task the hub starts with the
+    rules, on an empty dictionary, never on the hub loop or a connection; what they
+    republish is posted ungated. The task waits for a reload, with no timer, while no
+    rule keeps state.
+  - **The replay:** `mqttd --rule-test --sequence` raises the event per key, at the key's
+    expiry time and before the step's own message (`rule_replay::expire`), 10,000 a step
+    at the most. **That is the last of T7's acceptance.**
+  - **For T13:** `Store::expire_now` is what a purge with `events=true` calls.
+  - **The live demo:** two rules in `demo/rules/rules.toml` (24 now): `car_last_heard`
+    sets a key per vehicle with a two-minute expiry on every telemetry record and OBD
+    frame, `car_silent` turns its expiry into `alerts/cars/<VIN>/silent`. Seen on the
+    wall clock only; the ten-minute replay's expected output is unchanged. Run in a
+    Compose project of its own (this build, the car simulator): the car that loses
+    its connection at 16:02:21 was last heard at 16:02:16 and its alert arrived at
+    16:04:17, a second after the key's expiry; two vehicles whose ignition went off got
+    theirs the same way.
+  - **Tests:** mqttd `rule_state::expiry::tests` (9: the sweep with and without a rule on
+    the event, held keys, a mass expiry of 5,000 keys at the rate in order with none
+    shed, the bound, `lru`, `expire_now`, the pace), `rules::tests` (1: the event's rules
+    run with no hub at all), `tests/rules_state.rs` (2: end to end on a broker, a rule on
+    `"$events/#"` beside it; a reload switching the event on and off),
+    `tests/rules_sequence.rs` (4), mqtt-rules `tests_state` (3: the exact name and no
+    wildcard, the fields, the sample); RULES.md's new transcript runs in `rules_docs.rs`.
+  - **Measured** (Apple M1 Pro, `main`'s binary and this change's in turn, four rounds, the
+    fastest median of each case; the machine was shared): a publish evaluated against
+    one rule (`cargo bench -p mqttd --bench rule_state`) without a state call 1.431 to
+    1.401 µs, with `kv_incr` 1.791 to 1.801 µs, `kv_held` 1.896 to 1.921 µs: −2.1% to
+    +1.3% over the six cases. The per-publish benchmark without a state rule
+    (`cargo bench -p mqtt-rules`): −3.3% to +2.7%, inside the spread between rounds. A
+    call on the store alone came out 4% to 14% cheaper, the spread between two builds.
+    New: a sweep pass that finds nothing due in a namespace of 100,000 keys is 0.50 µs,
+    once a second; a key the sweep removes 0.135 µs, with or without its event. A
+    namespace is 2 KiB larger.
+  - **Left: the cluster half.** In an `eventual` namespace a key expires on every
+    member at once and no member raises the event yet. What it needs: the sweep over a
+    replicated namespace's own order of forgetting (`rule_state/replica.rs`, which also
+    holds tombstones), a replicated key held for its event without the hold being
+    replicated, the member a hash of the key picks among those alive (the store has no
+    view of the membership today), and tests on a cluster for "one node when stable, at
+    least once around a membership change". A replay notes a replicated namespace whose
+    expiries raise nothing.
+  - **With T6,** which merged while this was in review: its expired count takes the
+    sweep's removals, its backlog gauge the keys held for their events, and an
+    operator's delete of an expired key holds it for its event.
+  - **Left, as planned:** full documentation (T8: the threat model's row for a namespace
+    held full by owed events, the cookbook recipe).

@@ -2705,7 +2705,7 @@ fn wildcard_event_filters_select_what_emqx_s_match_selects() {
         .unsupported
         .is_empty());
     let all = EventKind::matching("$events/#");
-    assert_eq!(all.kinds, EventKind::ALL);
+    assert_eq!(all.kinds, EventKind::EMQX, "EMQX's events, and no other");
     assert!(all.unsupported.contains(&"$events/sys/alarm_activated"));
 
     let set = load(
@@ -2726,7 +2726,7 @@ fn wildcard_event_filters_select_what_emqx_s_match_selects() {
         "[rules.all]\nsql = 'SELECT clientid FROM \"$events/#\"'\nactions = [{ function = \"console\" }]\n",
     )
     .unwrap();
-    assert!(EventKind::ALL.iter().all(|k| loaded.rules.wants_event(*k)));
+    assert!(EventKind::EMQX.iter().all(|k| loaded.rules.wants_event(*k)));
     let (unraised, selected) = loaded.warnings[0]
         .split_once("; it selects")
         .expect("the warning names both lists");

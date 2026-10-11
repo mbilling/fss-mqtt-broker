@@ -1141,11 +1141,13 @@ actions = [
 #   $events/client/...       the broker's own connect and disconnect events: ignition on
 #                            and off, or a lost connection
 #
-# In the 10-minute fixture: 749 raw messages and 22 connects and disconnects in. These
-# seven rules turn them into what each audience needs: engine data a person or a database
-# can read (normalized/, 170), 18 actionable alerts (alerts/, QoS 1) for exactly the things
-# that went wrong, presence (events/ and state/, 22 each), and a privacy-safe mobility feed
-# for the city (analytics/, 79).
+# In the 10-minute fixture: 749 raw messages and 22 connects and disconnects in. The
+# first seven rules turn them into what each audience needs: engine data a person or a
+# database can read (normalized/, 170), 18 actionable alerts (alerts/, QoS 1) for exactly
+# the things that went wrong, presence (events/ and state/, 22 each), and a privacy-safe
+# mobility feed for the city (analytics/, 79). Rules 8 and 9 keep state between messages
+# to say what no message can: that a vehicle has gone silent. They fire on the wall
+# clock, so in the live demo only.
 #
 # The VIN's descriptor section is the fleet's own (sim/cars.py): position 4 is the body
 # (C car, V van), 5 the powertrain (E battery-electric, D diesel), 6 the usable battery
@@ -1681,4 +1683,67 @@ WHERE regex_match(topic(2), '^[A-HJ-NPR-Z0-9]{17}$')
 '''
 actions = [
   { function = "republish", args = { topic = "analytics/cars/mobility", qos = 0, payload = "${.}" } },
+]
+
+
+# --- 8 and 9. Silent for two minutes: a vehicle that stopped sending ----------------------
+#
+# Takes: every telemetry record and OBD frame (rule 8), and the broker's own
+#   $events/state/expired (rule 9).
+# Derives: alerts/cars/<VIN>/silent, QoS 1: the vehicle, when it was last heard, which
+#   stream that was, and its body and powertrain (from its VIN).
+# Why: nothing arrives when a vehicle goes quiet, so no rule on its messages can say so,
+#   and a disconnect event (rule 6) says the connection ended, not that the data did: a
+#   unit can stay connected and send nothing (a frozen application, a dead CAN bus). Rule
+#   8 keeps one key per vehicle in the rule state store and sets it again, with a
+#   two-minute expiry, on every message; while the vehicle sends, the key never expires.
+#   When it stops, the key expires two minutes after the last message and the broker
+#   raises $events/state/expired for it, which rule 9 turns into the alert. A vehicle
+#   that speaks again starts a new key, and can go silent again.
+# Rule 8 derives nothing itself. Its kv_set is inside a CASE so that only a VIN-shaped
+#   topic level becomes a key: a SELECT field runs before the WHERE, for every message
+#   the FROM selects (RULES.md, "State").
+# The alert's times are the broker's clock (the expiry time), not a device's: there is no
+#   device message to take one from. So this alert is seen on the wall clock only, in the
+#   live demo (demo/rules-live); the ten-minute replay is over in seconds, no key expires
+#   in it, and its expected output has no such alert.
+# Try it without a broker: mqttd --rule-test --sequence replays a file of messages on a
+#   clock of its own and raises the event when that clock passes a key's expiry.
+#
+# In:  vehicle/XDKCE5K38RH287145/telemetry  qos=1  {...}   and then nothing for two minutes
+# Out: alerts/cars/XDKCE5K38RH287145/silent  qos=1  {"vehicle":"XDKCE5K38RH287145","alert":"no data for 2 minutes","severity":"warning","last_heard":"2026-03-24T15:57:16Z","at":"2026-03-24T15:59:16Z","last_stream":"telemetry","body":"car","powertrain":"battery-electric","action":"see events/cars/<VIN>/presence: ignition off, or a lost connection"}
+
+[state.car_last_heard]
+max_keys = 10000
+default_ttl = "2m"
+
+[rules.car_last_heard]
+description = "Remember each vehicle's last message for two minutes (the state car_silent's alert comes from)"
+state = "car_last_heard"
+sql = '''
+SELECT
+  CASE WHEN regex_match(topic(2), '^[A-HJ-NPR-Z0-9]{17}$')
+       THEN kv_set(topic(2), topic(3), 120) END AS stream
+FROM "vehicle/+/telemetry", "vehicle/+/obd"
+'''
+
+[rules.car_silent]
+description = "A vehicle that has sent nothing for two minutes"
+sql = '''
+SELECT
+  key AS vehicle,
+  'no data for 2 minutes' AS alert,
+  'warning' AS severity,
+  format_date('millisecond', 'Z', '%Y-%m-%dT%H:%M:%SZ', expired_at - 120000) AS last_heard,
+  format_date('millisecond', 'Z', '%Y-%m-%dT%H:%M:%SZ', expired_at) AS at,
+  value AS last_stream,
+  CASE substr(key, 3, 1) WHEN 'V' THEN 'van' ELSE 'car' END AS body,
+  CASE substr(key, 4, 1) WHEN 'E' THEN 'battery-electric' WHEN 'D' THEN 'diesel'
+       ELSE 'other' END AS powertrain,
+  'see events/cars/<VIN>/presence: ignition off, or a lost connection' AS action
+FROM "$events/state/expired"
+WHERE namespace = 'car_last_heard'
+'''
+actions = [
+  { function = "republish", args = { topic = "alerts/cars/${vehicle}/silent", qos = 1, payload = "${.}" } },
 ]

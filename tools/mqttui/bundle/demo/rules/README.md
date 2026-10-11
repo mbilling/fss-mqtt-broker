@@ -16,7 +16,7 @@ fleet into mqttd and shows what its [rule engine](../../docs/RULES.md) makes of 
   vehicle's online flag, retained, for a screen that opens late.
 - **Pseudonymizes** a feed for a third party.
 
-All of it runs in the broker, as you see it here: 22 rules in
+All of it runs in the broker, as you see it here: 24 rules in
 [`rules.toml`](rules.toml), no code.
 
 ```text
@@ -64,7 +64,7 @@ MQTTD_PLAINTEXT_BIND=127.0.0.1:1884 MQTTD_ALLOW_ANONYMOUS=1 MQTTD_DURABLE_SESSIO
   MQTTD_RULES_FILE=demo/rules/rules.toml target/release/mqttd
 ```
 
-Its log must say `rule engine: rules loaded (ADR 0083) rules=22`. Then, in another:
+Its log must say `rule engine: rules loaded (ADR 0083) rules=24`. Then, in another:
 
 ```sh
 mosquitto_sub -p 1884 -t 'alerts/#' -v &
@@ -392,6 +392,18 @@ of the VIN, a position rounded to about 100 m, and a speed band.
 ⇒ analytics/cars/mobility  {"id":"0929ff0e6cb95584","class":"car","slot":"2026-03-24T15:57:30Z","lat":55.682,"lon":12.577,"heading":135,"speed_kmh":25,"source":"backfill"}
 ⇒ analytics/cars/mobility  {"id":"0929ff0e6cb95584","class":"car","slot":"2026-03-24T16:01:30Z","lat":55.675,"lon":12.587,"heading":135,"speed_kmh":25,"source":"live"}
 ```
+
+**`car_last_heard` and `car_silent`: silent for two minutes.** Nothing arrives when a
+vehicle goes quiet, so no rule on its messages can say so. `car_last_heard` keeps one key
+per vehicle in the [rule state store](../../docs/RULES.md#state-what-a-rule-remembers) and
+sets it again on every telemetry record and OBD frame, with a two-minute expiry
+(`kv_set(topic(2), topic(3), 120)`). When a vehicle stops sending, its key expires and the
+broker raises [`$events/state/expired`](../../docs/RULES.md#when-a-key-expires-eventsstateexpired),
+which `car_silent` turns into `alerts/cars/<VIN>/silent`: the vehicle, when it was last
+heard and on which stream. These two rules derive nothing in the ten-minute replay, which
+is over in seconds, so the numbers below are without them; the
+[live demo](../rules-live/README.md#silent-for-two-minutes) shows the alert a few times in
+every ten-minute window.
 
 ## What the numbers say
 

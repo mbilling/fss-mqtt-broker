@@ -6,7 +6,7 @@ Source of truth: `mqtt_config::ENV_VARS` and `Config::overlay_from` in `crates/m
 
 The annotated template is [`mqttd.example.toml`](mqttd.example.toml). Capacity arithmetic lives in [SIZING.md](SIZING.md); day-2 procedures in [OPERATIONS.md](OPERATIONS.md). This page is the inventory of knobs, not the runbook.
 
-Documented overlay variables: **123** in `ENV_VARS`, plus `MQTTD_CONFIG` (meta) and any experimental side-channel knobs below.
+Documented overlay variables: **124** in `ENV_VARS`, plus `MQTTD_CONFIG` (meta) and any experimental side-channel knobs below.
 
 ## Node identity
 
@@ -195,6 +195,7 @@ Documented overlay variables: **123** in `ENV_VARS`, plus `MQTTD_CONFIG` (meta) 
 | `MQTTD_RULES_FUNCTIONS_ENV` | `rules.functions_env` | The environment variables a module declared in the rules file (`[functions.<name>]`, ADR 0086 D9) may be shown (`MQTTD_RULES_FUNCTIONS_ENV`, `,`-separated names). A table's `env` may name only these, so whoever writes rules cannot show a module the rest of the broker's environment. Empty (the default) = none. Read at startup. |
 | `MQTTD_RULES_FUNCTION_MAX_MS` | `rules.function_max_ms` | The most milliseconds any one call of a sandboxed rule function may take on this node (`MQTTD_RULES_FUNCTION_MAX_MS`, default 10000, 1..=600000; [ADR 0086](adr/0086-wasm-rule-functions.md)): `jq/2`, `jq/3` whatever its third argument says (it may come from a payload), and every function of a module the rules file declares. A call that reaches it fails its rule with a timeout. It bounds how long a call holds a thread and an instance's memory, not how many calls run at once. A rules file cannot raise it: a module's `timeout_ms` above it fails the load of the rules file, and with `rules.jq` on a `rules.jq_default_timeout_ms` above it is refused. Read at startup: a change needs a restart. |
 | `MQTTD_RULES_STATE_MAX_BYTES` | `rules.state_max_bytes` | The most bytes the state rules keep between messages may take on this node, across every namespace and every connection's dictionary (`MQTTD_RULES_STATE_MAX_BYTES`, default 268435456 = 256 MiB; [ADR 0085](adr/0085-rule-state-store.md)). Using state is the switch: a rules file that declares no `[state.<name>]` and calls no state function (`kv_store_*`, `proc_dict_*`, `kv_*`) holds none. A rules file cannot raise this ceiling; `0` switches rule state off, and a rules file that uses it then does not load. Read at startup: a change needs a restart. |
+| `MQTTD_RULES_STATE_EXPIRY_PER_SEC` | `rules.state_expiry_per_sec` | The most `$events/state/expired` events this node raises a second (`MQTTD_RULES_STATE_EXPIRY_PER_SEC`, default 1000, 1..=100000; [ADR 0085](adr/0085-rule-state-store.md) D7), a tenth of a second's worth at a time. When more keys expire at once than that, their events are raised late, in order of expiry, and none is dropped: an expired key reads as absent at once and keeps its room until its event has been raised. It matters only while a rule selects the event. Read at startup: a change needs a restart. |
 
 ## Meta (not a config field)
 

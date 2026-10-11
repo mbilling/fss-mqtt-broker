@@ -19,7 +19,7 @@ type Data = Arc<Mutex<HashMap<(String, Vec<u8>), Value>>>;
 /// A store that keeps what it is told in plain maps and writes down every call, as
 /// `<namespace> <op> <key>`.
 #[derive(Debug, Default)]
-struct Recorder {
+pub(crate) struct Recorder {
     log: Arc<Mutex<Vec<String>>>,
     data: Data,
     opened: Mutex<Vec<(String, NamespaceSettings)>>,
@@ -110,7 +110,7 @@ impl StateNamespace for Recorded {
     }
 }
 
-fn with_store(store: &Arc<Recorder>) -> Functions {
+pub(crate) fn with_store(store: &Arc<Recorder>) -> Functions {
     Functions::default().with_state(store.clone())
 }
 
@@ -1496,4 +1496,202 @@ fn a_statement_compiled_once_keeps_its_state_from_one_input_to_the_next() {
         [EventKind::ClientConnected, EventKind::ClientDisconnected]
     );
     assert!(SqlTest::compile("SELECT", &Functions::default()).is_err());
+}
+
+/// One rule selecting `from`, loaded; or why it does not load.
+fn selecting(from: &str) -> Result<Loaded, String> {
+    RuleSet::parse(&format!(
+        "[rules.r]\nsql = 'SELECT * FROM \"{from}\"'\nactions = [{{ function = \"console\" }}]\n"
+    ))
+    .map_err(|e| e.to_string())
+}
+
+/// ADR 0085 D7: `$events/state/expired` is mqttd's own event, selected only by its
+/// exact name. No wildcard selects it, `"$events/#"` included, so a filter keeps
+/// selecting exactly what it selects in EMQX; it has no second spelling; and a
+/// wildcard that could only mean it is refused, saying how to name it.
+#[test]
+fn the_expiry_event_is_selected_by_its_exact_name_and_by_no_wildcard() {
+    let exact = selecting("$events/state/expired").unwrap();
+    assert!(exact.warnings.is_empty(), "{:?}", exact.warnings);
+    for kind in EventKind::ALL {
+        assert_eq!(
+            exact.rules.wants_event(kind),
+            kind == EventKind::StateExpired,
+            "{kind:?}"
+        );
+    }
+    assert!(!exact.rules.wants_message_events());
+    assert_eq!(EventKind::StateExpired.topic(), STATE_EXPIRED_TOPIC);
+    assert_eq!(
+        EventKind::parse("state.expired"),
+        Some(EventKind::StateExpired)
+    );
+    assert_eq!(
+        EventKind::parse("state/expired"),
+        Some(EventKind::StateExpired)
+    );
+    assert!(!EventKind::EMQX.contains(&EventKind::StateExpired));
+    assert!(!EMQX_EVENT_TOPICS
+        .iter()
+        .any(|(topic, _)| *topic == STATE_EXPIRED_TOPIC));
+
+    // Wildcards that match other events load, and do not select it.
+    for filter in ["$events/#", "$events/+/+", "$events/+/#", "#"] {
+        let Ok(loaded) = selecting(filter) else {
+            // `#` alone is a topic filter, not an event filter.
+            assert_eq!(filter, "#");
+            continue;
+        };
+        assert!(
+            !loaded.rules.wants_event(EventKind::StateExpired),
+            "{filter} must not select mqttd's own event"
+        );
+        assert!(!EventKind::matching(filter)
+            .kinds
+            .contains(&EventKind::StateExpired));
+    }
+    let all = selecting("$events/#").unwrap();
+    assert!(EventKind::EMQX.iter().all(|k| all.rules.wants_event(*k)));
+    assert!(
+        !all.warnings.iter().any(|w| w.contains("state")),
+        "a rule ported from EMQX is told nothing new: {:?}",
+        all.warnings
+    );
+
+    // Wildcards that could only mean it are refused, naming the exact topic.
+    for filter in ["$events/state/#", "$events/state/+", "$events/+/expired"] {
+        let refused = selecting(filter).unwrap_err();
+        assert!(
+            refused.contains("matches no event mqttd raises")
+                && refused.contains(
+                    "\"$events/state/expired\" is mqttd's own and is selected only by its exact \
+                     name"
+                ),
+            "{filter}: {refused}"
+        );
+    }
+    // No underscore spelling: EMQX has none to be compatible with.
+    let refused = selecting("$events/state_expired").unwrap_err();
+    assert!(refused.contains("is not a supported event"), "{refused}");
+
+    // Listed together with a wildcard, each selects its own.
+    let both = RuleSet::parse(
+        "[rules.r]\nsql = 'SELECT * FROM \"$events/client/+\", \"$events/state/expired\"'\n\
+         actions = [{ function = \"console\" }]\n",
+    )
+    .unwrap();
+    assert!(both.rules.wants_event(EventKind::StateExpired));
+    assert!(both.rules.wants_event(EventKind::ClientConnected));
+    assert!(!both.rules.wants_event(EventKind::MessageDropped));
+}
+
+/// ADR 0085 D7: the event's fields. `event`, `namespace`, `key`, `value` (what
+/// `kv_get` read last), `type`, `expired_at`, `timestamp`, `node`, and the rule's own
+/// `metadata.rule_id`; it is about no client. A replayed one carries the sequence's
+/// time.
+#[test]
+fn the_expiry_event_carries_the_key_its_value_and_when_it_expired() {
+    let expiry = StateExpiry {
+        namespace: "seen",
+        key: b"seen:d1",
+        value: Value::Int(41),
+        kind: "sum",
+        expired_at_ms: 1_735_689_600_000,
+    };
+    let before = now_ms();
+    let event = EventInput::state_expired("n1", &expiry);
+    assert_eq!(event.kind(), EventKind::StateExpired);
+    assert_eq!(event.clock_ms(), None);
+    let mut names: Vec<String> = event
+        .all_fields()
+        .iter()
+        .map(|(k, _)| k.to_string())
+        .collect();
+    names.sort();
+    assert_eq!(
+        names,
+        [
+            "event",
+            "expired_at",
+            "key",
+            "namespace",
+            "node",
+            "timestamp",
+            "type",
+            "value"
+        ]
+    );
+    let Value::Int(raised) = event.field("timestamp") else {
+        panic!("timestamp is a time")
+    };
+    assert!((before..=now_ms()).contains(&raised));
+
+    let at = 1_735_689_601_000;
+    let event = EventInput::state_expired_at("n1", &expiry, at);
+    assert_eq!(event.clock_ms(), Some(at));
+    let out = test_sql(
+        "SELECT event, namespace, key, value, type, expired_at, timestamp, node, \
+         metadata.rule_id AS rule, clientid, timestamp - expired_at AS late \
+         FROM \"$events/state/expired\" WHERE value > 40",
+        &event,
+    )
+    .unwrap();
+    assert_eq!(
+        out,
+        [
+            r#"{"event":"state.expired","namespace":"seen","key":"seen:d1","value":41,"type":"sum","expired_at":1735689600000,"timestamp":1735689601000,"node":"n1","rule":"test","clientid":"undefined","late":1000}"#
+        ]
+    );
+    // A statement that selects other events does not run on it.
+    let other = SqlTest::compile("SELECT * FROM \"$events/#\"", &Functions::default()).unwrap();
+    assert_eq!(
+        other.from_mismatch(&event).as_deref(),
+        Some("the statement's FROM does not select the state.expired event")
+    );
+    // A key that is not UTF-8 is its bytes; a set's value is its elements.
+    let binary = EventInput::state_expired(
+        "n1",
+        &StateExpiry {
+            key: &[0xff, 0x00],
+            value: Value::from(vec![Value::Int(1), Value::from("a")]),
+            kind: "union",
+            ..expiry
+        },
+    );
+    assert!(matches!(binary.field("key"), Value::Bin(_)));
+    assert_eq!(binary.field("value").to_json().unwrap(), r#"[1,"a"]"#);
+}
+
+/// `mqttd --rule-test --event state.expired` and a dry run of a rule on the event:
+/// the sample is a key named by the topic, in the namespace `sample`, that held the
+/// payload and expired just now.
+#[test]
+fn a_sample_of_the_expiry_event_is_a_key_named_by_the_topic_holding_the_payload() {
+    let client = ClientInfo {
+        clientid: "c",
+        username: None,
+        peer: None,
+        sockname: None,
+        node: "n",
+    };
+    let sample = EventInput::sample_message(
+        EventKind::StateExpired,
+        &client,
+        "seen:d1",
+        0,
+        &Bytes::from_static(b"42"),
+    );
+    let out = test_sql(
+        "SELECT namespace, key, value, type, expired_at = timestamp AS now, node \
+         FROM \"$events/state/expired\"",
+        &sample,
+    )
+    .unwrap();
+    assert_eq!(
+        out,
+        [
+            r#"{"namespace":"sample","key":"seen:d1","value":"42","type":"lww","now":true,"node":"n"}"#
+        ]
+    );
 }

@@ -220,7 +220,7 @@
 
 **0085 — State for rules: a keyed, replicated store read and written from SQL**
 
-- `0085-T4` ⬜ planned ([#920](https://github.com/mbilling/fss-mqtt-broker/issues/920)): "Expiry and $events/state/expired: selected by its own name only, raised by one member, rate-bounded and late rather than lost, at least once around membership changes"
+- `0085-T4` 🚧 in-progress ([#920](https://github.com/mbilling/fss-mqtt-broker/issues/920)): "Expiry and $events/state/expired: selected by its own name only, raised by one member, rate-bounded and late rather than lost, at least once around membership changes"
 - `0085-T5` ⬜ planned ([#921](https://github.com/mbilling/fss-mqtt-broker/issues/921)): "kv_incr idempotency keys, remembered as entries of the namespace for its dedupe window"
 - `0085-T7` 🚧 in-progress ([#923](https://github.com/mbilling/fss-mqtt-broker/issues/923)): "mqttd --rule-test --sequence: timed sequences replayed through a statement or a rules file against an in-memory store with a driven clock"
 - `0085-T8` ⬜ planned ([#924](https://github.com/mbilling/fss-mqtt-broker/issues/924)): "Documentation: RULES.md (functions, types, modes, when a state call runs, the worked sequences, the billing example), the departures from EMQX, threat model and hardening rows, the converter"

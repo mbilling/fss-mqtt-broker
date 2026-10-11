@@ -6,8 +6,9 @@
 //! that a rule on a connection keeps state from one publish to the next, that a state
 //! call in a `SELECT` field counts a message its `WHERE` turns away, that a later rule
 //! and a rule a republished message re-enters see a write, that a Will's rules (on the
-//! hub) work on the same store, that a reload keeps or drops a namespace's keys, and
-//! that a memory brownout refuses new keys.
+//! hub) work on the same store, that a reload keeps or drops a namespace's keys, that
+//! a memory brownout refuses new keys, and that a key's expiry raises
+//! `$events/state/expired` for the rules that name it, and only for those.
 
 mod common;
 
@@ -376,4 +377,110 @@ async fn a_memory_brownout_refuses_new_keys_and_existing_ones_still_update() {
     sub.subscribe(3, "sync/2", QoS::AtMostOnce).await;
     publish(&mut dev, "in/a", r#"{"k":"b"}"#).await;
     assert_eq!(next(&mut sub).await, out("out/count", r#"{"k":"b","n":1}"#));
+}
+
+/// "Silent for one second": a key refreshed with a TTL by every message of a device,
+/// and a rule on its expiry.
+const SILENT: &str = "[state.seen]\n\
+     [rules.a_seen]\nstate = \"seen\"\n\
+     sql = '''SELECT kv_set(clientid, payload.n, 1) AS n FROM \"in/#\"'''\n\
+     [rules.b_silent]\n\
+     sql = '''SELECT namespace, key, value, type, node, expired_at <= timestamp AS after, \
+     clientid, kv_get(key) AS own FROM \"$events/state/expired\"'''\n\
+     actions = [{ function = \"republish\", args = { topic = \"silent/${key}\", payload = \"${.}\" } }]\n";
+
+/// D7: a key past its expiry raises `$events/state/expired` on this node, once, with
+/// the key, what it held, its type and its namespace; the event is about no client;
+/// its rules call the store like any rule's (here a namespace of their own, where the
+/// key is not); and a rule on `"$events/#"` is not sent it. The key is gone from the
+/// store when the event has been raised, and raises it again after it is written
+/// again.
+#[tokio::test]
+async fn a_key_that_expires_raises_the_expiry_event_for_the_rule_that_names_it() {
+    let broker = start_broker(&format!(
+        "{SILENT}[rules.c_every_event]\nsql = '''SELECT event FROM \"$events/#\"'''\n\
+         actions = [{{ function = \"republish\", args = {{ topic = \"every/${{event}}\" }} }}]\n"
+    ))
+    .await;
+    let mut sub = Client::connect(broker.addr, "watch").await;
+    sub.subscribe(1, "silent/#", QoS::AtMostOnce).await;
+    sub.subscribe(2, "every/#", QoS::AtMostOnce).await;
+    assert!(
+        broker.state.expiry_events(),
+        "a loaded rule names the event"
+    );
+    let mut dev = Client::connect(broker.addr, "dev-1").await;
+    for n in [7, 8] {
+        publish(&mut dev, "in/a", &format!(r#"{{"n":{n}}}"#)).await;
+        // Whatever the wildcard rule is sent meanwhile, it is never this event.
+        let silent = loop {
+            let (topic, payload) = next(&mut sub).await;
+            assert_ne!(topic, "every/state.expired");
+            if topic.starts_with("silent/") {
+                break (topic, payload);
+            }
+        };
+        assert_eq!(
+            silent,
+            out(
+                "silent/dev-1",
+                &format!(
+                    r#"{{"namespace":"seen","key":"dev-1","value":{n},"type":"lww","node":"state-test","after":true,"clientid":"undefined","own":"undefined"}}"#
+                )
+            )
+        );
+        assert_eq!(
+            broker.state.stats("seen").unwrap().keys,
+            0,
+            "removed as its event was handed over"
+        );
+    }
+}
+
+/// D7: the event's machinery is off until a loaded rule names the event, and a
+/// reload that adds such a rule switches it on: keys that expire afterwards raise
+/// it. A reload that removes the rule switches it off again, and an expired key is
+/// then only removed.
+#[tokio::test]
+async fn a_reload_that_adds_a_rule_on_the_expiry_event_starts_raising_it() {
+    let seen_only = "[state.seen]\n[rules.a_seen]\nstate = \"seen\"\n\
+                     sql = '''SELECT kv_set(clientid, payload.n, 1) AS n FROM \"in/#\"'''\n";
+    let broker = start_broker(seen_only).await;
+    let mut sub = Client::connect(broker.addr, "watch").await;
+    sub.subscribe(1, "silent/#", QoS::AtMostOnce).await;
+    let mut dev = Client::connect(broker.addr, "dev-1").await;
+    assert!(!broker.state.expiry_events(), "no rule names the event");
+    drop(broker.rules_tx.send_replace(broker.load(SILENT)));
+    publish(&mut dev, "in/a", r#"{"n":1}"#).await;
+    let (topic, payload) = next(&mut sub).await;
+    assert_eq!(topic, "silent/dev-1");
+    assert!(payload.contains(r#""value":1"#), "{payload}");
+    assert!(broker.state.expiry_events());
+    // Without the rule again, a key that expires is only removed by the sweep.
+    drop(broker.rules_tx.send_replace(broker.load(seen_only)));
+    // At QoS 1: the key is stored by the time the publish is acknowledged.
+    dev.publish("in/a", br#"{"n":2}"#, QoS::AtLeastOnce, Some(1), vec![])
+        .await;
+    assert!(matches!(dev.recv().await, Packet::PubAck(_)));
+    assert_eq!(broker.state.stats("seen").unwrap().keys, 1);
+    let mut removed = false;
+    for _ in 0..500 {
+        if !broker.state.expiry_events() && broker.state.stats("seen").unwrap().keys == 0 {
+            removed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        removed,
+        "the sweep removes an expired key no event is owed for"
+    );
+    drop(broker.rules_tx.send_replace(broker.load(SILENT)));
+    publish(&mut dev, "in/a", r#"{"n":3}"#).await;
+    let (topic, payload) = next(&mut sub).await;
+    assert_eq!(topic, "silent/dev-1");
+    assert!(
+        payload.contains(r#""value":3"#),
+        "no event for 2: {payload}"
+    );
 }

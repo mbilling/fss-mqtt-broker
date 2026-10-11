@@ -364,6 +364,12 @@ queue_overflow = "drop-oldest"       # or "reject-newest"
 # ceiling; 0 switches rule state off, and a rules file that uses it then does not load.
 # Read at startup.
 # state_max_bytes = 268435456
+# The most $events/state/expired events this node raises a second (ADR 0085,
+# docs/RULES.md "When a key expires"), 1..=100000. When more keys expire at once, their
+# events are raised late, in order of expiry, and none is dropped: an expired key reads
+# as absent at once and keeps its room until its event has been raised. It matters only
+# while a rule selects the event. Read at startup.
+# state_expiry_per_sec = 1000
 
 [observability]
 # OTLP/HTTP push export (ADR 0020). Unset = Prometheus /metrics endpoint only.

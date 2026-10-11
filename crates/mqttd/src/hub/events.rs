@@ -43,6 +43,9 @@ pub(super) struct State {
     /// The queue of the task that raises notes about clients with no connection;
     /// started with the rules.
     notes: Option<mpsc::Sender<Box<MessageNote>>>,
+    /// What keeps the task running that sweeps the rule state's expired keys and
+    /// raises `$events/state/expired` (ADR 0085 D7); started with the rules.
+    expiry: Option<tokio::sync::oneshot::Sender<()>>,
     /// When a note was last dropped because that queue was full: the log says so once
     /// per interval.
     notes_shed_at: Option<Instant>,
@@ -120,6 +123,7 @@ impl Hub {
         self.events.wants = watch.wants();
         self.events.watch = Some(watch);
         self.events.notes = Some(rules.spawn_notes(self.self_tx.clone()));
+        self.events.expiry = rules.spawn_expiry(self.self_tx.clone());
         // The memory watermark may have been passed before the rules were attached.
         if let Some(state) = rules.state() {
             state.set_brownout(

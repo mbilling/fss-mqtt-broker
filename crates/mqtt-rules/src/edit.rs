@@ -441,14 +441,23 @@ mod tests {
     use super::*;
     use crate::RuleSet;
 
-    /// The demo's rules file: 22 rules in three sections, each section opened by a
-    /// banner, the file by a long header, every rule by its own comment block.
+    /// The demo's rules file: 24 rules in three sections, each section opened by a
+    /// banner, the file by a long header, every rule by its own comment block. Two of
+    /// them keep state, so it loads only where there is a store ([`loaded`]).
     fn demo() -> String {
         std::fs::read_to_string(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../../demo/rules/rules.toml"
         ))
         .expect("demo/rules/rules.toml is readable from the crate")
+    }
+
+    /// The rules of `text`, loaded as a broker with rule state loads them.
+    fn loaded(text: &str) -> RuleSet {
+        let store = std::sync::Arc::new(crate::tests_state::Recorder::default());
+        RuleSet::parse_with(text, &crate::tests_state::with_store(&store))
+            .unwrap()
+            .rules
     }
 
     /// Where rule `id`'s header starts and its last key's line ends.
@@ -488,8 +497,8 @@ mod tests {
                 format!("{}{}", &text[..span.start], &text[span.end..]),
                 "{id}"
             );
-            let set = RuleSet::parse(&edited).unwrap().rules;
-            assert_eq!(set.len(), 21);
+            let set = loaded(&edited);
+            assert_eq!(set.len(), 23);
             assert!(set.get(id).is_none());
         }
         assert!(delete_rule(&text, "power_pv_sunspec")
@@ -527,7 +536,7 @@ mod tests {
     #[test]
     fn an_update_writes_only_the_values_that_differ() {
         let text = demo();
-        let set = RuleSet::parse(&text).unwrap().rules;
+        let set = loaded(&text);
         let r = set.get("home_grid_feed").unwrap();
         let mut edit = RuleEdit {
             sql: r.sql().to_string(),
@@ -631,8 +640,8 @@ mod tests {
                  {{ topic = \"copy/${{topic}}\", qos = 1, payload = \"${{.}}\" }} }},\n]\n"
             )
         );
-        let set = RuleSet::parse(&edited).unwrap().rules;
-        assert_eq!(set.len(), 23);
+        let set = loaded(&edited);
+        assert_eq!(set.len(), 25);
         assert!(!set.get("plant_tap").unwrap().enabled());
 
         // Into an empty file, and after a file's trailing comments.

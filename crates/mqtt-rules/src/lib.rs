@@ -58,7 +58,7 @@ pub use funcs::names as function_names;
 pub use input::{
     disconnect_reason, new_message_id, now_ms, ntoa, ntoa_ip, printable_props, pub_props,
     reason_code_name, ClientInfo, ConnInfo, EventInput, EventKind, EventMatch, EventMessage,
-    PublishInput, EMQX_EVENT_TOPICS,
+    PublishInput, StateExpiry, EMQX_EVENT_TOPICS, STATE_EXPIRED_TOPIC,
 };
 pub use jq::{FunctionCall, Functions, HandOff, Jq, JqSettings, JqSwitch, ModuleStats};
 pub use plugin::{
@@ -665,8 +665,10 @@ impl From<&str> for CompileError {
 /// The events one `FROM "$events/…"` entry selects. A wildcard filter selects every
 /// event whose EMQX topic it matches, as EMQX's `emqx_rule_events:match_event_names/1`
 /// does with `emqx_topic:match/2`, so `"$events/client/+"` selects the client events and
-/// `"$events/#"` all of them; one that matches only events mqttd does not raise is
-/// refused, and one that also matches such events is warned about.
+/// `"$events/#"` all of EMQX's; one that matches only events mqttd does not raise is
+/// refused, and one that also matches such events is warned about. mqttd's own
+/// `"$events/state/expired"` (ADR 0085 D7) is selected by that exact name and by no
+/// wildcard, so a filter keeps selecting exactly what it selects in EMQX.
 fn event_sources(from: &str, warnings: &mut Vec<String>) -> Result<Vec<EventKind>, CompileError> {
     let supported = || {
         EventKind::ALL
@@ -689,8 +691,16 @@ fn event_sources(from: &str, warnings: &mut Vec<String>) -> Result<Vec<EventKind
     }
     let m = EventKind::matching(from);
     if m.kinds.is_empty() {
+        // mqttd's own event is no EMQX event topic, so no wildcard reaches it.
+        let own = if mqtt_core::topic_matches(from, STATE_EXPIRED_TOPIC) {
+            format!(
+                "; \"{STATE_EXPIRED_TOPIC}\" is mqttd's own and is selected only by its exact name"
+            )
+        } else {
+            String::new()
+        };
         return Err(format!(
-            "\"{from}\" matches no event mqttd raises (supported: {})",
+            "\"{from}\" matches no event mqttd raises (supported: {}){own}",
             supported()
         )
         .into());

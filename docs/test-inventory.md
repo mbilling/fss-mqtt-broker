@@ -903,7 +903,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::sink_records_through_a_trait_object`
 - `tests::tampering_with_any_field_changes_the_head`
 
-## `crates/mqtt-rules/src/lib.rs` — 278 test(s)
+## `crates/mqtt-rules/src/lib.rs` — 281 test(s)
 
 - `crdt::tests::a_causally_later_lww_write_is_never_lost_whatever_the_wall_clocks_say`
 - `crdt::tests::a_counter_is_the_sum_of_every_nodes_increments_and_decrements`
@@ -1164,6 +1164,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests_state::a_republished_message_counts_its_state_calls_in_the_originals_budget`
 - `tests_state::a_rule_names_its_namespace_and_a_key_never_selects_one`
 - `tests_state::a_sample_event_replayed_at_a_time_carries_that_time`
+- `tests_state::a_sample_of_the_expiry_event_is_a_key_named_by_the_topic_holding_the_payload`
 - `tests_state::a_state_key_must_name_a_declared_namespace`
 - `tests_state::a_statement_alone_takes_the_files_default_settings`
 - `tests_state::a_statement_compiled_once_keeps_its_state_from_one_input_to_the_next`
@@ -1175,6 +1176,8 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests_state::foreach_calls_run_per_element`
 - `tests_state::the_1025th_state_call_of_a_message_fails_its_rule`
 - `tests_state::the_emqx_functions_answer_as_emqx_does`
+- `tests_state::the_expiry_event_carries_the_key_its_value_and_when_it_expired`
+- `tests_state::the_expiry_event_is_selected_by_its_exact_name_and_by_no_wildcard`
 - `tests_state::the_sketch_functions_check_their_arguments_and_hand_the_store_a_hash`
 - `tests_state::the_state_functions_are_built_in`
 - `value::tests::a_json_repair_covers_the_whole_value`
@@ -1366,7 +1369,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 693 test(s)
+## `crates/mqttd/src/lib.rs` — 703 test(s)
 
 - `admin::cli::tests::a_refusal_shows_what_it_carries`
 - `admin::cli::tests::all_nodes_asks_for_the_cluster_scope_on_the_verbs_that_have_one`
@@ -1973,6 +1976,15 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `rule_state::admin::tests::listings_stay_exact_for_stable_keys_while_other_threads_write`
 - `rule_state::admin::tests::reading_a_key_is_not_a_use_and_counts_as_no_call`
 - `rule_state::admin::tests::the_totals_tell_namespaces_from_dictionaries`
+- `rule_state::expiry::tests::a_key_written_again_after_it_expired_still_raises_the_event_it_owed`
+- `rule_state::expiry::tests::a_mass_expiry_is_handed_over_at_the_rate_in_order_and_none_is_shed`
+- `rule_state::expiry::tests::an_expired_key_reads_as_absent_at_once_and_is_held_until_the_sweep_returns_it`
+- `rule_state::expiry::tests::an_lru_namespace_holds_an_expired_key_for_its_event_and_evicts_a_live_one`
+- `rule_state::expiry::tests::expire_now_raises_the_event_as_if_the_key_had_expired_at_that_moment`
+- `rule_state::expiry::tests::expired_keys_are_not_room_while_their_events_are_owed`
+- `rule_state::expiry::tests::held_keys_are_removed_without_events_once_no_rule_selects_the_event`
+- `rule_state::expiry::tests::the_pace_allows_a_tenth_of_a_seconds_events_at_a_time_and_saves_none_up`
+- `rule_state::expiry::tests::without_a_rule_on_the_event_the_sweep_only_removes`
 - `rule_state::tests::a_brownout_refuses_new_keys_and_nothing_else`
 - `rule_state::tests::a_counter_goes_up_and_down_by_the_largest_step_without_end`
 - `rule_state::tests::a_full_namespace_refuses_new_keys_and_still_updates_existing_ones`
@@ -2039,6 +2051,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `rules::tests::a_rule_definition_hash_is_keyed_per_process`
 - `rules::tests::gated_derived_actions_are_counted_by_their_fate`
 - `rules::tests::jq_is_not_asked_for_unless_the_config_switches_it_on`
+- `rules::tests::the_expiry_events_rules_run_on_the_stores_task_not_on_the_hub`
 - `rules::tests::the_hand_off_just_goes_on_where_there_is_no_worker_to_free`
 - `rules::tests::the_hand_off_lets_the_workers_other_tasks_run`
 - `rules::tests::the_insecure_trace_line_is_logged_once_per_change`
@@ -2699,7 +2712,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `a_wills_rules_get_an_empty_dictionary`
 - `the_dictionaries_count_against_the_stores_ceiling`
 
-## `crates/mqttd/tests/rules_sequence.rs` — 21 test(s)
+## `crates/mqttd/tests/rules_sequence.rs` — 25 test(s)
 
 - `a_dictionary_is_one_client_ids_for_the_whole_sequence`
 - `a_failing_rule_or_action_of_a_rules_file_is_reported_with_its_reason`
@@ -2707,27 +2720,33 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `a_kv_store_key_of_any_type_is_shown_as_the_value_it_is`
 - `a_quota_counts_in_a_window_and_starts_again_when_the_window_expires`
 - `a_replay_never_touches_the_store_its_functions_carried`
+- `a_rule_on_the_expiry_event_may_write_the_key_again_and_a_step_bounds_the_events`
 - `a_rule_that_republishes_into_its_own_from_counts_twice_and_is_stopped_there`
 - `a_rules_file_runs_every_matching_rule_its_actions_and_what_they_republish`
 - `a_sequence_is_bounded_in_steps_and_in_the_length_of_a_line`
 - `a_sequence_line_gives_the_message_and_what_it_leaves_out_is_the_defaults`
 - `a_sequence_that_cannot_be_read_names_the_line_and_the_reason`
 - `a_statement_on_events_runs_against_samples_at_the_sequences_time`
+- `a_step_can_send_a_sample_of_the_expiry_event`
 - `a_step_that_fails_is_reported_and_the_replay_goes_on_with_what_it_wrote`
+- `a_wildcard_on_every_event_is_not_sent_the_expiry_event`
 - `an_emqx_kv_store_rule_counts_across_the_messages_of_a_sequence`
 - `an_eventual_namespace_replays_as_a_local_one_with_a_note`
 - `change_detection_passes_only_the_messages_whose_value_differs_from_the_last`
 - `hot_for_five_minutes_fires_once_the_condition_has_held_that_long`
 - `nothing_selected_is_told_apart_from_no_output`
+- `silent_for_ten_minutes_raises_the_expiry_event_at_each_keys_expiry_time`
 - `the_clock_is_the_sequences_and_a_replay_prints_the_same_every_time`
 - `what_a_payload_or_a_key_prints_cannot_break_the_reports_lines`
 - `where_rule_state_is_switched_off_a_replay_of_a_stateful_rule_does_not_load`
 
-## `crates/mqttd/tests/rules_state.rs` — 6 test(s)
+## `crates/mqttd/tests/rules_state.rs` — 8 test(s)
 
+- `a_key_that_expires_raises_the_expiry_event_for_the_rule_that_names_it`
 - `a_later_rule_and_a_re_entered_rule_see_a_write`
 - `a_memory_brownout_refuses_new_keys_and_existing_ones_still_update`
 - `a_reload_keeps_a_declared_namespace_and_drops_one_that_is_gone`
+- `a_reload_that_adds_a_rule_on_the_expiry_event_starts_raising_it`
 - `a_rule_keeps_state_between_publishes_and_counts_what_its_where_rejects`
 - `a_wills_rules_call_the_same_store`
 - `kv_store_counts_across_messages_and_is_shared_by_every_rule`

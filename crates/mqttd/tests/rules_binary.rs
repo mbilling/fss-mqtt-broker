@@ -875,7 +875,8 @@ fn check_rules_refuses_an_event_mqttd_does_not_raise() {
          $events/client/ping, $events/auth/check_authn_complete, \
          $events/auth/check_authz_complete, $events/session/subscribed, \
          $events/session/unsubscribed, $events/message/delivered, $events/message/acked, \
-         $events/message/dropped, $events/message/delivery_dropped)",
+         $events/message/dropped, $events/message/delivery_dropped, \
+         $events/state/expired)",
     );
 }
 
@@ -892,7 +893,8 @@ fn check_rules_refuses_wildcards_matching_no_raised_event_and_sources() {
          $events/client/ping, $events/auth/check_authn_complete, \
          $events/auth/check_authz_complete, $events/session/subscribed, \
          $events/session/unsubscribed, $events/message/delivered, $events/message/acked, \
-         $events/message/dropped, $events/message/delivery_dropped)",
+         $events/message/dropped, $events/message/delivery_dropped, \
+         $events/state/expired)",
     );
     assert_check_rules_refuses(
         "[rules.src]\nsql = 'SELECT * FROM \"$sources/mqtt:in\"'\n",
