@@ -202,7 +202,7 @@ Lines and columns count within the rule's `sql` string, not the file: line 4, co
 is the end of the statement, just after the newline that closes its `WHERE` line.
 
 Stop the broker with Ctrl-C (or `docker rm -f mqttd`). Every recipe in the
-[cookbook](RULES-COOKBOOK.md) runs the same way. To see 22 rules at work on realistic
+[cookbook](RULES-COOKBOOK.md) runs the same way. To see 24 rules at work on realistic
 telemetry from wind turbines, solar inverters, smart meters, heat pumps and a service fleet,
 run [`demo/rules/run.sh`](../demo/rules/README.md). To watch them run without end, with
 their statistics and trace on `$SYS` and a page in your browser that edits them while they
@@ -419,8 +419,8 @@ plus its `at`. `now_timestamp()`, `now_rfc3339()`, a `format_date` without a tim
 `timestamp`, `publish_received_at` and every TTL read that clock and never the wall
 clock, and a message's `id` counts from 1, so a replay prints the same thing every time
 it runs. A key past its expiry reads as absent from that moment, and the first step after
-it reports it as `(expired …)`. The [event a key's expiry is to raise](adr/0085-rule-state-store.md)
-is not built yet, so a replay does not run rules on it.
+it reports it as `(expired …)`, and raises the key's
+[expiry event](#when-a-key-expires-eventsstateexpired) where a rule selects it (below).
 
 **A whole rules file.** Without `--sql`, the sequence runs through the configured rules
 file (`rules.file`: `MQTTD_RULES_FILE`, or `--config`), as the broker would run it: every
@@ -479,6 +479,70 @@ Each rule that ran is listed with how its SQL ended (`passed`, `no_result`, or
 [retain] <payload>`, `console <output>`, or `action FAILED: <why>`. A line that starts
 with `>` is a republished message re-entering the rules, with the rules it ran indented
 under it. A message no rule selects prints `(no rule selects it)`.
+
+**When a key expires.** Where the statement, or a rule of the file, selects
+[`$events/state/expired`](#when-a-key-expires-eventsstateexpired), the replay raises it for
+each key the clock has passed since the step before: in order of expiry, at the key's own
+expiry time, and before the step's own message. "No reading for ten minutes":
+
+```sh
+cat > silent.toml <<'EOF'
+[state.seen]
+default_ttl = "10m"
+
+[rules.last_seen]
+state = "seen"
+sql = 'SELECT kv_set(clientid, payload.temp, 600) AS temp FROM "sensors/+/data"'
+
+[rules.silent]
+sql = '''
+SELECT key AS sensor, value AS last_temp, expired_at
+FROM "$events/state/expired"
+WHERE namespace = 'seen'
+'''
+actions = [{ function = "republish", args = { topic = "alerts/silent/${sensor}", payload = "${.}" } }]
+EOF
+cat > silent.jsonl <<'EOF'
+# two sensors report; s2 stops, s1 goes on until it stops too
+{"at": 0,     "topic": "sensors/s1/data", "clientid": "s1", "payload": {"temp": 20}}
+{"at": "1m",  "topic": "sensors/s2/data", "clientid": "s2", "payload": {"temp": 21}}
+{"at": "8m",  "topic": "sensors/s1/data", "clientid": "s1", "payload": {"temp": 22}}
+{"at": "15m", "topic": "sensors/s1/data", "clientid": "s1", "payload": {"temp": 23}}
+{"at": "1h"}
+EOF
+```
+
+```console
+$ MQTTD_RULES_FILE=silent.toml mqttd --rule-test --sequence silent.jsonl
+#1 +0s sensors/s1/data {"temp": 20}
+  last_seen: passed
+  state seen: + "s1" = 20 (lww, expires +600s)
+#2 +60s sensors/s2/data {"temp": 21}
+  last_seen: passed
+  state seen: + "s2" = 21 (lww, expires +660s)
+#3 +480s sensors/s1/data {"temp": 22}
+  last_seen: passed
+  state seen: ~ "s1" = 22 (lww, expires +1080s)
+#4 +900s sensors/s1/data {"temp": 23}
+  event state.expired seen: "s2" at +660s
+    silent: passed
+      republish alerts/silent/s2 qos 0 {"sensor":"s2","last_temp":21,"expired_at":1735690260000}
+  last_seen: passed
+  state seen: - "s2" (expired +660s)
+  state seen: ~ "s1" = 23 (lww, expires +1500s)
+#5 +3600s (nothing sent)
+  event state.expired seen: "s1" at +1500s
+    silent: passed
+      republish alerts/silent/s1 qos 0 {"sensor":"s1","last_temp":23,"expired_at":1735691100000}
+  state seen: - "s1" (expired +1500s)
+```
+
+An `event state.expired <namespace>: <key> at <time>` line heads what the event's rules
+did, and comes before the step's own rules. A rule on the event may write state, and what
+it writes may expire within the same step: that is raised too, each at its own time, up to
+10,000 events a step. A replay raises the event exactly at the expiry; a broker raises it
+up to a second later, and no faster than `rules.state_expiry_per_sec`. Without a rule on
+the event a replay only reports the expired keys.
 
 **What a replay is, and is not.**
 
@@ -1333,7 +1397,9 @@ Both EMQX spellings work, for example `$events/client/connected` and
 with a wildcard selects every event whose topic it matches, as EMQX's does:
 `"$events/client/+"` selects the four client events, `"$events/auth/#"` the two
 authentication and authorization events, `"$events/message/+"` the four
-[message events](#message-events), `"$events/#"` all of them. A filter that matches only
+[message events](#message-events), `"$events/#"` all of EMQX's. mqttd's own
+[`$events/state/expired`](#when-a-key-expires-eventsstateexpired) is selected only by that
+exact name, never by a wildcard. A filter that matches only
 events mqttd does not raise (`"$events/sys/+"`, the alarms) is refused at load; one that
 also matches some it does (`"$events/#"`) loads, with a warning that names the ones it
 does not.
@@ -2213,7 +2279,7 @@ A rule sees one message at a time. The state functions let it keep values betwee
 messages: a count, the last value, when a condition first held
 ([ADR 0085](adr/0085-rule-state-store.md)). This is the first part of that work: state
 lives **in memory, on the node that evaluated the rule**, and starts empty at every
-restart. An event when a key expires is not built yet; this section will grow with it.
+restart. A key that expires [raises an event](#when-a-key-expires-eventsstateexpired).
 What the store holds can be [watched and managed](#watching-and-managing-state).
 
 There are three families, and they do not share keys (`kv_get('x')` does not read what
@@ -2450,6 +2516,73 @@ bounds of its own; here a `kv_store_put` key is at most 256 bytes as JSON and a 
 broker is over its memory watermark (`brownout`), and every `proc_dict_*` call is one of
 the message's 1,024.
 
+#### When a key expires: `$events/state/expired`
+
+A key past its expiry reads as absent from that moment. The broker removes it within
+about a second, and a rule can be told: `FROM "$events/state/expired"`. That is how a rule
+reacts to something that did **not** happen. "No message from this device for ten
+minutes" is a key set again, with a ten-minute expiry, on every message, and a rule on the
+key's expiry:
+
+```toml
+[state.seen]
+
+[rules.last_seen]
+state = "seen"
+sql = 'SELECT kv_set(clientid, timestamp, 600) AS at FROM "devices/+/data"'
+
+[rules.silent]
+sql = '''SELECT key AS device, value AS last_seen FROM "$events/state/expired" WHERE namespace = 'seen' '''
+actions = [{ function = "republish", args = { topic = "alerts/silent/${device}", payload = "${.}" } }]
+```
+
+| Field | |
+|---|---|
+| `event` | `state.expired` |
+| `namespace` | the key's namespace: the declared name, or `rule:<id>` for a rule's own. Every rule that selects the event is sent every namespace's expiries, so say which one in the `WHERE` |
+| `key` | the key |
+| `value` | what `kv_get` read last: the value, a counter's count, a set's elements, a sketch's estimate |
+| `type` | the key's type: `lww` (`kv_set`, `kv_changed`), `first` (`kv_set_once`, `kv_held`), `sum` (`kv_incr`), `max`, `min`, `union` (`kv_add`), `hll` |
+| `expired_at` | when it expired, in milliseconds |
+| `timestamp`, `node` | when the event was raised, and where |
+
+It is about no client: `clientid` and `username` read `undefined`.
+
+- **It is mqttd's own event, and only its exact name selects it.** EMQX has no such event,
+  so no wildcard reaches it: `"$events/#"` selects exactly the events it selects in EMQX,
+  and a rule ported from there is never sent this one. `"$events/state/#"` is refused at
+  load, naming the topic to use. It has no underscore spelling.
+- **For `local` namespaces, in this release.** A key of a namespace declared
+  `consistency = "eventual"` expires on every member at the same moment, and none of
+  them raises the event yet: choosing the one member that does is not built. A replay
+  says so in a `note:` line.
+- **Without a rule on it, it costs nothing.** No rule's call does anything for it, and
+  the broker's one sweeping task only removes what has expired.
+- **Late rather than lost.** At most `rules.state_expiry_per_sec` events are raised a
+  second (1,000 by default; `MQTTD_RULES_STATE_EXPIRY_PER_SEC`), a tenth of a second's
+  worth at a time, earliest expiry first (to the second: keys that expire within the same
+  second come in no promised order). When a whole site falls silent at once its events
+  come late, and none is dropped. Until a key's event has been raised the key reads as
+  absent **and still counts toward its namespace's `max_keys` and `max_bytes`**: a full
+  namespace whose keys have all expired takes no new key (`namespace_full`) until events
+  have been raised for some. A key written again after it expired is a new key; the old
+  one still raises its event, with the value it held.
+- **Not across a restart, a reload that drops the namespace, or an eviction.** State is
+  in memory: a broker that stops before it has raised an event never raises it, and a
+  device that was already silent when the broker started is not noticed until it has
+  spoken once. A namespace a reload drops goes with its keys, silently. A key an `lru`
+  namespace evicts before it expired raises nothing; one that had expired is kept for its
+  event and another key is evicted. `kv_del` is not an expiry, and EMQX's `kv_store` table
+  has none.
+- **Its rules run on a task of their own**, not on a connection and not in the broker's
+  routing loop, with an empty `proc_dict_*` dictionary. What they republish is routed like
+  any event's. They may call the state functions, and may set the key that expired again:
+  the shortest TTL is a second, so a rule that does gets one event a second for that key.
+- **Try it:** `mqttd --rule-test --event state.expired --topic <key> --payload <value>`
+  builds a sample (in a namespace called `sample`), and
+  [`--sequence`](#replay-a-sequence-mqttd---rule-test---sequence) raises the real one when
+  its clock passes a key's expiry.
+
 **Testing.** `mqttd --rule-test`, `mqttd --check-rules` and the admin API's rule test work
 on an empty store of their own that is dropped afterwards: they never read or write the
 state the running rules keep (EMQX's SQL test writes the node's real table). `proc_dict_*`
@@ -2478,7 +2611,10 @@ calling at once, each on keys of its own (a key per device), a call takes 0.14 �
 threads, 0.20 µs on four and 0.33 µs on eight; with all of them incrementing **one** key,
 0.19 µs, 0.63 µs and 1.9 µs. A new key in a full `lru` namespace costs an eviction: 0.9 µs
 alone, about 10 µs when eight threads do nothing else. `kv_hll_add` is the dearest call,
-about twice a `kv_incr` in the store: it works out its estimate each time.
+about twice a `kv_incr` in the store: it works out its estimate each time. Expiry is not
+on a call's path: one task looks through each namespace about once a second (0.5 µs for a
+namespace of 100,000 keys with nothing due) and removes an expired key in 0.14 µs, with or
+without a rule on [its event](#when-a-key-expires-eventsstateexpired).
 In an `eventual` namespace a call costs the same on the publish path (1.84 µs beside
 1.80 µs for the publish with a `kv_incr`). In the store a write is 0.16 µs, and 0.27 to
 0.30 µs while the other nodes keep up, since the key is put back in the order the peer
@@ -2735,6 +2871,7 @@ EMQX fails on each message, and statements only mqttd accepts.
 | `kv_store_put`, `kv_store_get`, `kv_store_del` | One table per node that grows until the node runs out of memory; a wrong argument count fails the rule on each message; the SQL test writes the node's real table | The same table and the same results, but bounded: a key of at most 256 bytes and a value of at most 4 KiB as JSON, 100,000 keys and 64 MiB unless `[state.kv_store]` says otherwise, under `rules.state_max_bytes`; past a bound the call fails the rule, where EMQX would have stored the value. A wrong argument count fails the load, as for every function. A dry run (`--rule-test`, the admin API's rule test) works on an empty table of its own. `rules.state_max_bytes = 0` switches it off: a rules file that calls them then does not load ([State](#state-what-a-rule-remembers)) |
 | `proc_dict_put`, `proc_dict_get`, `proc_dict_del` | The dictionary of the process that evaluates the rule: the client's connection process, for its publishes and what their rules republish, its events, the deliveries to it and its Will. It grows until the node runs out of memory. A session that outlives its connection keeps the process and the dictionary until it is resumed. A wrong argument count fails the rule on each message | The same results on one dictionary per client connection, for everything that connection evaluates, but bounded: 64 keys, and 64 KiB of keys and values as JSON, counted against `rules.state_max_bytes`; past a bound the call fails the rule, where EMQX would have stored the value. The dictionary is gone when the connection ends. Three evaluations have no connection to run on and get an empty dictionary that is discarded afterwards, where EMQX's still see the client's: a Will's rules; an event about a session that has no connection (`delivery_dropped` for an offline session); `message/dropped` for a message a rule republished, or for a Will. A wrong argument count fails the load, as for every function. A dry run works on an empty dictionary of its own, as each SQL test over EMQX's API does. `rules.state_max_bytes = 0` switches them off: a rules file that calls them then does not load ([State](#state-what-a-rule-remembers)) |
 | State of mqttd's own (mqttd-only extension) | None. `kv_get`, `kv_set`, `kv_set_once`, `kv_incr`, `kv_max`, `kv_min`, `kv_add`, `kv_del`, `kv_ttl`, `kv_held` and `kv_changed` are unknown functions, and `[state.<name>]` and the rule key `state` are not EMQX configuration | Typed, expiring, bounded keys in namespaces the rules file declares. A rule that uses them does not port back to EMQX |
+| `$events/state/expired` (mqttd-only extension) | No such event: a `FROM` that names it is refused. `"$events/#"` selects EMQX's 16 event topics | Raised when a key of mqttd's own state passes its expiry ([When a key expires](#when-a-key-expires-eventsstateexpired)), with `namespace`, `key`, `value`, `type` and `expired_at`. Selected only by its exact name: `"$events/#"` and every other wildcard select what they select in EMQX, never this event, so a rule ported from EMQX is not sent it. At most `rules.state_expiry_per_sec` a second, late rather than dropped. EMQX's `kv_store` table has no expiry and raises none |
 | `jq` | A NIF in the broker's own process: always on, with no limit on memory, output or stack, the broker's whole environment in `$ENV`, and a timeout that cannot stop a program inside one long C call | The same jq in a WebAssembly sandbox, with EMQX's results, tags and texts, but **off unless `rules.jq = true`** (a rules file that calls it then fails to load), and needing a host that allows executable memory. 64 MiB of memory, 4 MiB of stack, an output charged to the message's 1 MiB build budget, a 5 s bound on compiling a program, `$ENV` empty unless variables are listed in `rules.jq_env` (a ported rule that reads `$ENV.X` gets `null` until `X` is listed), a timeout that always stops the call and is never longer than `rules.function_max_ms` (10 s unless set) whatever `jq/3`'s third argument or a payload asks for, a wrong number of arguments refused at load instead of on each message; the last one or two digits of some transcendental functions differ (musl's libm against glibc's), `strptime` fails on `%z`, `strftime("%Z")` of a UTC time is `UTC` where EMQX's is `GMT`, and local time is UTC. Each limit fails the rule for that message, with its kind counted ([Limits of jq](#limits-of-jq-and-what-happens-at-each), [the whole table](#jq)) |
 | Functions supplied as modules (mqttd-only extension) | None. A rules file with a `[functions.<name>]` table is not EMQX configuration | A rules file may declare WebAssembly modules, each pinned by its SHA-256, whose functions rules call; they run in the sandbox under time, memory, output and stack limits. A module cannot take the name of a built-in function or of any function of EMQX's rule engine, so it never changes what a rule written for EMQX means. A module is read only from under the rules file's directory, sees no file, socket or host function, the clock only with `clock = true` and only the environment variables `rules.functions_env` allows. A rules file that declares one does not load in EMQX ([Your own functions](#your-own-functions-functionsname)) |
 | Regular expressions | Erlang `re`: PCRE2 10.47 (OTP 28) on bytes, compiled per call | PCRE2 10.46 on bytes, with OTP's compile options, match and depth limits and global-match loop: the same syntax and results ([above](#functions)). A match needing more than 64 MiB of backtracking memory is no match (OTP allows 20 GB); a pattern nesting parentheses more than 250 deep does not compile (OTP's limit is 10,000, though PCRE2's own workspace stops most such patterns below 2,000). A literal pattern is compiled once, when the file loads (one that does not compile warns), and a rules file holds at most 512 distinct ones, 256 KiB together. |

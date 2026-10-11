@@ -4437,6 +4437,10 @@ fn requires_restart(old: &Config, new: &Config) -> Vec<&'static str> {
     if o.rules.state_max_bytes != n.rules.state_max_bytes {
         changed.push("rules.state_max_bytes");
     }
+    // So is the pace of its expiry events, which the store's task is started with (D7).
+    if o.rules.state_expiry_per_sec != n.rules.state_expiry_per_sec {
+        changed.push("rules.state_expiry_per_sec");
+    }
     changed
 }
 

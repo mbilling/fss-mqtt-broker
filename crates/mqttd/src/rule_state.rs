@@ -42,12 +42,12 @@
 //!
 //! # Expiry
 //!
-//! A key past its expiry reads as absent from that moment. It is removed by the call
-//! that finds it, and when room is needed: each shard keeps its keys in order of
-//! expiry (to the second), so removing expired ones costs what there is to remove, and
-//! a call removes a bounded number of them however many have expired.
-//! The sweep that removes them on time and raises `$events/state/expired` is D7's, a
-//! later task, and will walk the same order.
+//! A key past its expiry reads as absent from that moment. Each shard keeps its keys
+//! in order of expiry (to the second), so finding the expired ones costs what there is
+//! to find. The sweep ([`Store::sweep`], D7) walks that order and removes them; a call
+//! that finds its own key expired, or needs room, removes a bounded number itself.
+//! While a loaded rule selects `$events/state/expired` no call removes one: an expired
+//! key is **held** until the sweep has handed its event over (see [`expiry`]).
 //!
 //! # A namespace's life
 //!
@@ -60,7 +60,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::hash::{BuildHasher, RandomState};
 use std::sync::atomic::{
-    AtomicBool, AtomicU64, AtomicUsize,
+    AtomicBool, AtomicU32, AtomicU64, AtomicUsize,
     Ordering::{Relaxed, SeqCst},
 };
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
@@ -207,6 +207,13 @@ struct Shared {
     repair_every_ms: AtomicU64,
     /// State frames refused because this node declares no such `eventual` namespace.
     undeclared: AtomicU64,
+    /// Whether a loaded rule selects `$events/state/expired`: an expired key is then
+    /// held for the sweep instead of removed by whoever finds it. Read only where a
+    /// key is found expired or room is needed, never by a call that finds neither.
+    expiry_events: AtomicBool,
+    /// The most expiry events the sweep hands over a second
+    /// (`rules.state_expiry_per_sec`).
+    expiry_per_sec: AtomicU32,
 }
 
 impl Shared {
@@ -308,6 +315,8 @@ impl Store {
                 generation: AtomicU64::new(0),
                 repair_every_ms: AtomicU64::new(link::REPAIR_EVERY_MS),
                 undeclared: AtomicU64::new(0),
+                expiry_events: AtomicBool::new(false),
+                expiry_per_sec: AtomicU32::new(mqtt_config::Rules::default().state_expiry_per_sec),
             }),
             namespaces: Mutex::new(HashMap::new()),
             kept: None,
@@ -578,6 +587,13 @@ struct Shard {
     /// or [`take`](Self::take)**, which count it; one that did not could hide a key
     /// from a listing.
     changes: u64,
+    /// The keys that have expired and are held for their event ([`expiry`]): out of
+    /// the map, so they read as absent, and still accounted. By [`expiry_slot`] and
+    /// the order they were taken out in. Empty, and no allocation, unless a rule
+    /// selects the event.
+    held: BTreeMap<(u64, u64), Entry>,
+    /// The next place in `held`.
+    held_seq: u64,
 }
 
 impl Shard {
@@ -842,6 +858,11 @@ impl Namespace {
     /// the caller holds the shard's lock, and a whole site's keys can expire at once.
     /// Returns whether any went.
     fn purge(&self, shard: &mut Shard, now_ms: u64) -> bool {
+        // Held for their events, expired keys are not room until the sweep has handed
+        // those over.
+        if self.shared.expiry_events.load(Relaxed) {
+            return false;
+        }
         let mut any = false;
         for _ in 0..PURGE_BATCH {
             let due = shard
@@ -863,6 +884,9 @@ impl Namespace {
     /// first that had some: room for the caller's key, at a bounded price. A look that
     /// finds none anywhere is not repeated within a second. Returns whether any went.
     fn purge_all(&self) -> bool {
+        if self.shared.expiry_events.load(Relaxed) {
+            return false;
+        }
         let now_ms = self.shared.clock.now_ms();
         let last = self.purged_ms.load(Relaxed);
         if last != 0 && now_ms < last.saturating_add(PURGE_EVERY_MS) {
@@ -916,15 +940,25 @@ impl Namespace {
     /// Evict the namespace's least recently used key: the oldest of the shards'
     /// oldest, read without their locks, then one shard's lock to remove it.
     fn evict_one(&self) -> bool {
-        let oldest = self
-            .oldest
-            .iter()
-            .enumerate()
-            .map(|(at, used)| (used.load(Relaxed), at))
-            .filter(|(used, _)| *used != NOT_IN_ORDER)
-            .min();
-        if let Some((_, at)) = oldest {
+        // Looked for again after a shard's oldest keys turned out to be expired ones
+        // held for their events: the namespace's oldest may then be in another shard.
+        for _ in 0..=SHARDS {
+            let oldest = self
+                .oldest
+                .iter()
+                .enumerate()
+                .map(|(at, used)| (used.load(Relaxed), at))
+                .filter(|(used, _)| *used != NOT_IN_ORDER)
+                .min();
+            let Some((_, at)) = oldest else {
+                break;
+            };
             let mut shard = lock_shard(&self.shards[at]);
+            // An expired key whose event is owed is held for it, not evicted.
+            if self.hold_expired_oldest(&mut shard) {
+                self.note_oldest(at, &shard);
+                continue;
+            }
             // Whatever is oldest there now: the key seen above may have been used since.
             let key = shard.used.first_key_value().map(|(_, key)| key.clone());
             let evicted = key.is_some_and(|key| self.remove(&mut shard, &key));
@@ -933,12 +967,20 @@ impl Namespace {
                 self.evicted.fetch_add(1, Relaxed);
                 return true;
             }
+            break;
         }
         // Keys written before the namespace was declared `lru` are in no order of use:
-        // any of them makes room.
+        // any of them makes room (but one held back for its expiry event).
+        let events = self.shared.expiry_events.load(Relaxed);
+        let now_ms = self.shared.clock.now_ms();
         for shard in &self.shards {
             let mut shard = lock_shard(shard);
-            let key = shard.map.keys().next().cloned();
+            let key = shard
+                .map
+                .values()
+                .take(PURGE_BATCH)
+                .find(|e| !(events && e.expired(now_ms)))
+                .map(|e| e.key.clone());
             if key.is_some_and(|key| self.remove(&mut shard, &key)) {
                 self.evicted.fetch_add(1, Relaxed);
                 return true;
@@ -1087,9 +1129,10 @@ impl Handle {
     ) -> Result<Step<StateReply>, StateError> {
         let ns = &*self.namespace;
         let settings = &self.settings;
-        // A key past its expiry reads as absent, and is removed by whoever finds it.
-        if shard.map.get(key).is_some_and(|e| e.expired(now_ms)) && ns.remove(shard, key) {
-            shard.expired += 1;
+        // A key past its expiry reads as absent, and is removed by whoever finds it
+        // (or held for its event).
+        if shard.map.get(key).is_some_and(|e| e.expired(now_ms)) {
+            ns.expire(shard, key);
         }
         // A new key: reserve, insert, and answer `$reply`; or ask for room.
         macro_rules! insert {
@@ -1433,7 +1476,9 @@ pub fn stored(value: &Value) -> Stored<'_> {
     }
 }
 
+pub mod expiry;
 mod held;
+pub use expiry::{Expired, Pace, Swept};
 pub use held::HeldKey;
 mod admin;
 pub mod report;

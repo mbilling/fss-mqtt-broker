@@ -691,6 +691,15 @@ pub struct Rules {
     /// ceiling; `0` switches rule state off, and a rules file that uses it then does not
     /// load. Read at startup: a change needs a restart.
     pub state_max_bytes: u64,
+    /// The most `$events/state/expired` events this node raises a second
+    /// (`MQTTD_RULES_STATE_EXPIRY_PER_SEC`, default 1000, 1..=100000;
+    /// [ADR 0085](../../../docs/adr/0085-rule-state-store.md) D7), a tenth of a
+    /// second's worth at a time. When more keys expire at once than that, their events
+    /// are raised late, in order of expiry, and none is dropped: an expired key reads
+    /// as absent at once and keeps its room until its event has been raised. It
+    /// matters only while a rule selects the event. Read at startup: a change needs a
+    /// restart.
+    pub state_expiry_per_sec: u32,
 }
 
 impl Default for Rules {
@@ -707,6 +716,7 @@ impl Default for Rules {
             functions_env: Vec::new(),
             function_max_ms: 10_000,
             state_max_bytes: 256 << 20,
+            state_expiry_per_sec: 1000,
         }
     }
 }
@@ -1734,6 +1744,9 @@ impl Config {
         on!("MQTTD_RULES_STATE_MAX_BYTES", v, {
             self.rules.state_max_bytes = num("MQTTD_RULES_STATE_MAX_BYTES", &v)?;
         });
+        on!("MQTTD_RULES_STATE_EXPIRY_PER_SEC", v, {
+            self.rules.state_expiry_per_sec = num("MQTTD_RULES_STATE_EXPIRY_PER_SEC", &v)?;
+        });
         // -- admin API (ADR 0081) --
         on!("MQTTD_ADMIN_BIND", v, {
             self.admin.bind = Some(v);
@@ -2174,6 +2187,13 @@ impl Config {
                 rules.sys_interval_secs
             ));
         }
+        if !(1..=100_000).contains(&rules.state_expiry_per_sec) {
+            return Err(format!(
+                "rules.state_expiry_per_sec (MQTTD_RULES_STATE_EXPIRY_PER_SEC) must be \
+                 1..=100000 events per second, got {}",
+                rules.state_expiry_per_sec
+            ));
+        }
         if !(1..=1000).contains(&rules.trace_rate) {
             return Err(format!(
                 "rules.trace_rate (MQTTD_RULES_TRACE_RATE) must be 1..=1000 records per rule \
@@ -2462,6 +2482,7 @@ pub const ENV_VARS: &[&str] = &[
     "MQTTD_RULES_FUNCTION_MAX_MS",
     // rule state (ADR 0085)
     "MQTTD_RULES_STATE_MAX_BYTES",
+    "MQTTD_RULES_STATE_EXPIRY_PER_SEC",
     // admin API (ADR 0081)
     "MQTTD_ADMIN_BIND",
     "MQTTD_ADMIN_CERT",
@@ -2873,6 +2894,16 @@ mod tests {
             ("sys_interval_secs", "3601", "MQTTD_RULES_SYS_INTERVAL"),
             ("trace_rate", "0", "MQTTD_RULES_TRACE_RATE"),
             ("trace_rate", "1001", "MQTTD_RULES_TRACE_RATE"),
+            (
+                "state_expiry_per_sec",
+                "0",
+                "MQTTD_RULES_STATE_EXPIRY_PER_SEC",
+            ),
+            (
+                "state_expiry_per_sec",
+                "100001",
+                "MQTTD_RULES_STATE_EXPIRY_PER_SEC",
+            ),
         ] {
             let err = Config::from_toml(&toml(key, bad)).expect_err("must be refused");
             assert!(err.to_string().contains(named), "{key} = {bad}: {err}");
@@ -2883,6 +2914,8 @@ mod tests {
             ("sys_interval_secs", "3600"),
             ("trace_rate", "1"),
             ("trace_rate", "1000"),
+            ("state_expiry_per_sec", "1"),
+            ("state_expiry_per_sec", "100000"),
         ] {
             assert!(
                 Config::from_toml(&toml(key, good)).is_ok(),
@@ -3597,7 +3630,8 @@ mod tests {
             | "MQTTD_RULES_TRACE_RATE"
             | "MQTTD_RULES_JQ_DEFAULT_TIMEOUT_MS"
             | "MQTTD_RULES_FUNCTION_MAX_MS"
-            | "MQTTD_RULES_STATE_MAX_BYTES" => "7",
+            | "MQTTD_RULES_STATE_MAX_BYTES"
+            | "MQTTD_RULES_STATE_EXPIRY_PER_SEC" => "7",
             // The default is already 7 (backup.keep) / 300 (restore timeout), so "7" would
             // change nothing and the totality sweep would read as a missing mapping.
             // MQTTD_REPLICAS (ADR 0080): a valid factor that is not the default (2).
@@ -3752,9 +3786,10 @@ mod tests {
             // MQTTD_RULES_ADMIN_WRITERS (ADR 0084),
             // plus MQTTD_RULES_JQ, MQTTD_RULES_JQ_DEFAULT_TIMEOUT_MS, MQTTD_RULES_JQ_ENV
             // and MQTTD_RULES_FUNCTIONS_ENV (ADR 0086),
-            // plus MQTTD_RULES_STATE_MAX_BYTES (ADR 0085),
+            // plus MQTTD_RULES_STATE_MAX_BYTES and MQTTD_RULES_STATE_EXPIRY_PER_SEC
+            // (ADR 0085),
             // plus MQTTD_RULES_FUNCTION_MAX_MS (ADR 0086, the ceiling on one call).
-            123,
+            124,
             "the MQTTD_* surface changed — update ENV_VARS"
         );
         // Issue #239: MQTTD_MIN_REPLICAS was wired in `overlay_from` but never

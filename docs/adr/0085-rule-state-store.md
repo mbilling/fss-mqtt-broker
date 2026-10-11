@@ -345,6 +345,11 @@ therefore detects silence: "no message for 10 minutes" is
 - **A rule on this event may write state**, including the key that expired. The shortest
   TTL is one second, which bounds any loop built that way.
 
+*(Amended 2026-10-11, T4: built for one node. The event also carries `type`; an expired
+key is held, counted toward its namespace's bounds, until its event is handed over; the
+order is to the second; nothing is raised after a restart. See
+[Amendments](#amendments).)*
+
 ### D8. Idempotency for counters
 
 A counter cannot tell a redelivered message from a new one: a QoS 1 resend, a takeover
@@ -438,8 +443,8 @@ clock passes them. This is how a rule with state is written and reviewed: the ex
 become a sequence with expected outputs, and RULES.md's worked examples are such
 sequences, run by CI.
 
-*(Amended 2026-10-11, T7: the file's format, the replay's clock and the report as built;
-the expiry events in a replay wait for T4. See [Amendments](#amendments).)*
+*(Amended 2026-10-11, T7: the file's format, the replay's clock and the report as built.
+T4: the expiry events in a replay. See [Amendments](#amendments).)*
 
 **No test touches the running store.** `--rule-test`, `--check-rules` and the admin API's
 `POST /admin/v1/rules/test` (ADR 0084 D6: "a dry run touches no counter, no last error,
@@ -1748,3 +1753,162 @@ first rounds, which had been within 20% to 40% of these).
   pages of 50 ms). An order a shard could be walked in without starting over would
   remove both, and would cost every insert and delete on the publish path; T12, whose
   filters walk whole namespaces, is where that is weighed.
+
+
+### 2026-10-11 — T4: the expiry event on one node, as built
+
+D7 decided that a key's expiry raises `$events/state/expired`, selected by its own name
+only, on a task the store owns, bounded and late rather than lost. T4 built that for one
+node (`crates/mqttd/src/rule_state/expiry.rs`, `Rules::spawn_expiry`), which is: for
+`local` namespaces. T3 merged while it was being built; raising the event for an
+`eventual` namespace is the cluster half and is not built (the last section says what it
+takes). This is what building the first half settled.
+
+**The event**
+
+- **Fields.** `event` (`state.expired`), `namespace`, `key`, `value` (what `kv_get` read
+  last: a counter's count, a set's elements, a sketch's estimate), `expired_at`,
+  `timestamp`, `node`, and `metadata.rule_id`, which is the evaluating rule's as in every
+  evaluation. **`type` is added** (D4's name): a namespace several rules share holds keys
+  of several types, and a count and a stored number are otherwise indistinguishable. It
+  is about no client, so `clientid` and `username` read `undefined`.
+- **Its one name.** `"$events/state/expired"`, exactly. It is not in the table of EMQX's
+  event topics, which is what a wildcard is matched against, so `"$events/#"` and every
+  other wildcard select what they select in EMQX and a file that uses one is told nothing
+  new at load. A wildcard that could only mean this event (`"$events/state/#"`) is
+  refused like any filter that matches nothing mqttd raises, and the refusal names the
+  topic to write. It has no underscore spelling: there is no EMQX form to be compatible
+  with.
+- **A sample of it** (`--rule-test --event state.expired`, the admin API's rule test, a
+  step of a sequence) is a key named by the sample's topic, in a namespace called
+  `sample`, holding the payload as text, expired just now.
+
+**The sweep**
+
+- **Finding what expired.** T1 left each shard's keys in order of expiry, to the second.
+  A sweep reads every shard's earliest second (one lock at a time, for that one read)
+  and then takes keys out of the shards that have some due, earliest second first across
+  every namespace: at most 64 keys under one hold of a lock, and nothing but taking them
+  out of the maps under it. Values are read, room is given back and the keys are dropped
+  after the lock is released. A pass costs the number of shards plus the number of keys
+  that expired, never the number of keys held; a rule's call waits for one batch of 64
+  at the most. No index was added and nothing was added to an entry.
+- **One task, started with the rules,** by the hub, beside the notes task; it owns no
+  connection and evaluates on an empty dictionary. After a pass it sleeps until the next
+  key it saw is due, a second at the most (a key can be made to expire sooner than any
+  the pass saw: the shortest TTL, and later an operator's change of expiry). D1's "no
+  task" for a rules file that keeps no state becomes: **the task waits for the next
+  reload and sets no timer** while no loaded rule set holds a namespace; and there is no
+  task at all where `rules.state_max_bytes` is `0`.
+- **How late.** An expiry is found with the second it falls in, so the event is raised
+  up to a second after `expired_at`, plus the pace below. `timestamp - expired_at` is the
+  delay, in the event.
+- **Without a rule on the event, nothing of this is on a call's path.** The flag that
+  says a rule selects the event is read only by a call that has found its key expired or
+  needs room, never by one that finds neither. A key found expired is removed by the
+  call that finds it, as in T1, and the sweep removes the rest: all that is due, with no
+  value read and no pacing, yielding to the runtime every 4,096 keys.
+
+**With a rule on the event: held, late rather than lost**
+
+D7 says "a key is removed only as its event is handed over". Built as:
+
+- **An expired key is removed only by the sweep.** T1's two other removals would lose
+  the event, so while a rule selects it they do not remove: a call that finds its key
+  expired (a read, a write of that key, `kv_del`, `kv_ttl`) takes it out of the map and
+  **holds** it in its shard, in order of expiry; and expired keys are no longer "room"
+  for a new key.
+- **A held key reads as absent** and is not listed. A write then creates the key anew,
+  and the old one still raises its event, with the value it held. `kv_del` of an expired
+  key answers `false`: it expired first, and its event is still raised.
+- **It counts toward `max_keys`, `max_bytes` and the store's ceiling until its event has
+  been handed over.** That is the bound on the backlog: a namespace never owes more
+  events than it may hold keys, and nothing else queues them (the backlog *is* the keys).
+  The price: a full namespace whose keys have expired refuses new keys (`namespace_full`)
+  until the sweep has caught up, where without a rule on the event those keys are room
+  at once. At the default pace a namespace of 100,000 keys that all expire in one second
+  is back under its bound in a hundred seconds.
+- **The pace** is `rules.state_expiry_per_sec` (`MQTTD_RULES_STATE_EXPIRY_PER_SEC`,
+  default 1,000, 1 to 100,000, read at startup), handed over **a tenth of a second's
+  worth at a time** (one event at least), with nothing saved up over an idle time: so no
+  second sees more than its allowance plus one step. It is one pace for the node, across
+  namespaces.
+- **In order of expiry, to the second.** Across shards and namespaces the earliest
+  second comes first. Within one second the order is the shards', not the
+  milliseconds': an exact order would mean looking at every key of that second before
+  handing over the first.
+- **"Handed over" is "evaluated".** The task that sweeps evaluates the event's rules
+  itself, synchronously, and gives a key's room back as the sweep returns it, just
+  before. There is no queue between the sweep and the rules, so nothing can be shed
+  there; what the rules republish is posted to the hub ungated, as every event's is.
+- **What ends a backlog without events,** each stated in RULES.md: the process stops
+  (the store is in memory: **nothing is raised after a restart** for keys that expired,
+  or were about to, before it; a device that was already silent is not noticed until it
+  has spoken once); a reload drops the namespace (D1: with its keys); a reload leaves no
+  rule on the event (held keys are then simply removed).
+- **`lru`.** An eviction is not an expiry: a key evicted before it expired raises
+  nothing. One that had expired is held for its event instead, and the next least
+  recently used key is evicted.
+- **A rule on the event that writes state.** Its calls go through the store like any
+  rule's, with the per-message budget every event has (1,024 state calls, EMQX's order).
+  A pass takes a bounded number of keys and evaluates after it has let go of every lock,
+  the shortest TTL is a second, and the pace bounds events a second: a rule that sets
+  the key it is told about again gets one event a second for it.
+
+**The replay (`--sequence`, T7's hook).** `rule_replay::expire` now returns the keys one
+at a time, earliest first, and the replay raises the event for each, at the key's own
+expiry time on the sequence's clock and before the step's own message, where the
+statement or a rule of the file selects it; a line `event state.expired <namespace>:
+<key> at <time>` heads what its rules did. What those rules write may expire within the
+same step and is raised in turn, at most 10,000 events a step. A replay has neither the
+broker's second of delay nor its pace. This is the last of T7's acceptance ("expiry
+events fire in the replay").
+
+**For the tasks that follow**
+
+- **T13 (`events=true`).** `Store::expire_now(namespace, key)` makes a key expire at
+  once: it reads as absent, and its event is raised by the sweep at the sweep's pace with
+  that moment as `expired_at`; without a rule on the event the key is removed. It refuses
+  `kv_store`. A purge without the flag deletes instead.
+- **T14.** A key whose expiry is moved sooner is found by the next pass, a second later
+  at the most.
+- **T6** merged while this was in review, and the two meet in three places.
+  `mqttd_rule_state_expired_total` counts a key when it is removed, the sweep's removals
+  included, so a key held for its event is counted when the event has been handed over.
+  `mqttd_rule_state_expiry_backlog` is the keys held for their events and those due and
+  not yet taken. And an operator's delete of a key that has already expired is an
+  expiry, as T6 had it: where a rule selects the event the key is held for it, and the
+  delete answers that there was no such key.
+- **The cluster half of T4.** An `eventual` namespace keeps its keys apart from a
+  `local` one's (T3: `rule_state/replica.rs`), in one order of forgetting that also
+  holds tombstones, and this sweep does not walk it: **a key of an `eventual` namespace
+  expires on every member at the same moment and raises no event yet**, and is removed
+  as T3 left it (when room is needed or a digest is made). RULES.md says so and a replay
+  notes it. What the half needs: a sweep over that order; a replicated key held for its
+  event on one node without the hold being state that merges (an expiry found by a
+  write is a delete there); the member that a hash of the key picks among those alive,
+  for which the store needs a view of the membership it does not have; and tests on a
+  cluster for "one node when stable, at least once around a membership change".
+  `Store::expire_now` and `Store::take_expired` are for `local` namespaces likewise.
+
+**What a namespace costs, then and now.** Before: nothing but its keys. Now, without a
+rule on the event: 2 KiB more per namespace (32 bytes a shard, for the keys it could
+hold) and one pass of the sweep a second, which for a namespace that holds keys is 64
+locks taken and released; nothing more on any call. With a rule on the event: the same,
+plus the evaluation of the event's rules per expired key, on the store's task, and the
+room an expired key keeps until then.
+
+**Measured** (Apple M1 Pro; `main`'s binary, which has T3, and this change's run in turn,
+four rounds, the fastest median of each case; the machine was shared, and two rounds of
+one binary differed by up to a factor of two). `cargo bench -p mqttd --bench rule_state`,
+a publish evaluated against one rule: without a state call 1.431 to 1.401 µs, with
+`kv_incr` 1.791 to 1.801 µs, `kv_held` 1.896 to 1.921 µs, `kv_changed` 1.770 to 1.781 µs,
+`kv_store_*` 1.825 to 1.827 µs, `kv_hll_add` 2.087 to 2.061 µs: −2.1% to +1.3%. A call
+on the store alone came out 4% to 14% cheaper (a `kv_set` with a TTL 149 to 131 ns),
+which is the spread between two builds and not a gain: nothing on that path changed.
+`cargo bench -p mqtt-rules`, which has no state rule: `no_match` 88.0 to 86.2 ns,
+`filter_reject` 781 to 755 ns, `filter_republish` 1.456 to 1.450 µs,
+`select_star_republish` 3.554 to 3.559 µs, `foreach_10` 6.480 to 6.653 µs: −3.3% to
++2.7%, inside the spread. New (`sweep/*`): a pass that finds nothing due in a namespace
+of 100,000 keys takes 0.50 µs; a key the sweep removes costs 0.135 µs, with or without
+its event (the value is read out after the lock is released).

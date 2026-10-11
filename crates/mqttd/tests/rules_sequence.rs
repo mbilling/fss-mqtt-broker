@@ -15,7 +15,8 @@
 
 use mqtt_rules::Functions;
 use mqttd::rule_replay::{
-    parse_sequence, Defaults, Replay, Report, Step, MAX_LINE_BYTES, MAX_STEPS, START_MS,
+    parse_sequence, Defaults, Replay, Report, Step, MAX_EXPIRY_EVENTS, MAX_LINE_BYTES, MAX_STEPS,
+    START_MS,
 };
 
 fn steps(sequence: &str) -> Vec<Step> {
@@ -885,4 +886,221 @@ fn an_eventual_namespace_replays_as_a_local_one_with_a_note() {
     );
     assert_eq!(eventual.store, local.store);
     assert_eq!(eventual.store.len(), 3, "{:?}", eventual.store);
+}
+
+/// "No message for ten minutes" (ADR 0085 D7): one rule refreshes a key with a TTL on
+/// every reading, another selects the key's expiry.
+const SILENT: &str = r#"
+[state.seen]
+default_ttl = "10m"
+
+[rules.a_seen]
+state = "seen"
+sql = '''SELECT kv_set(clientid, payload.temp, 600) AS last FROM "sensors/+/data"'''
+
+[rules.b_silent]
+sql = '''SELECT key AS device, value AS last_temp, timestamp - expired_at AS late
+         FROM "$events/state/expired" WHERE namespace = 'seen' '''
+actions = [{ function = "republish", args = { topic = "alerts/silent/${device}", payload = "${.}" } }]
+
+[rules.c_alerts]
+sql = '''SELECT kv_incr('alerts') AS n FROM "alerts/silent/#"'''
+
+[rules.d_emqx_events]
+sql = '''SELECT event FROM "$events/#"'''
+actions = [{ function = "console" }]
+"#;
+
+/// D7 and D11: an expiry event fires in the replay, per key, at the key's expiry
+/// time and before the step's own message, in order of expiry; what its rules
+/// republish re-enters the rules; and a rule on `"$events/#"` does not see it.
+#[test]
+fn silent_for_ten_minutes_raises_the_expiry_event_at_each_keys_expiry_time() {
+    let report = rules(
+        SILENT,
+        r#"
+        {"topic": "sensors/d1/data", "clientid": "d1", "payload": {"temp": 20}}
+        {"at": "1m", "topic": "sensors/d2/data", "clientid": "d2", "payload": {"temp": 21}}
+        {"at": "5m", "topic": "sensors/d1/data", "clientid": "d1", "payload": {"temp": 22}}
+        {"at": "20m", "topic": "sensors/d1/data", "clientid": "d1", "payload": {"temp": 23}}
+        "#,
+    );
+    assert_eq!(
+        report.text(true),
+        transcript(
+            r#"
+            #1 +0s sensors/d1/data {"temp": 20}
+              a_seen: passed
+              state seen: + "d1" = 20 (lww, expires +600s)
+            #2 +60s sensors/d2/data {"temp": 21}
+              a_seen: passed
+              state seen: + "d2" = 21 (lww, expires +660s)
+            #3 +300s sensors/d1/data {"temp": 22}
+              a_seen: passed
+              state seen: ~ "d1" = 22 (lww, expires +900s)
+            #4 +1200s sensors/d1/data {"temp": 23}
+              event state.expired seen: "d2" at +660s
+                b_silent: passed
+                  republish alerts/silent/d2 qos 0 {"device":"d2","last_temp":21,"late":0}
+                > alerts/silent/d2 (republished by b_silent)
+                  c_alerts: passed
+              event state.expired seen: "d1" at +900s
+                b_silent: passed
+                  republish alerts/silent/d1 qos 0 {"device":"d1","last_temp":22,"late":0}
+                > alerts/silent/d1 (republished by b_silent)
+                  c_alerts: passed
+              a_seen: passed
+              state seen: - "d2" (expired +660s)
+              state rule:c_alerts: + "alerts" = 1 (sum, expires +87060s)
+              state seen: - "d1" (expired +900s)
+              state rule:c_alerts: ~ "alerts" = 2 (sum, expires +87060s)
+              state seen: + "d1" = 23 (lww, expires +1800s)
+            state at the end (+1200s):
+              rule:c_alerts: "alerts" = 2 (sum, expires +87060s)
+              seen: "d1" = 23 (lww, expires +1800s)
+            "#
+        )
+    );
+    assert_eq!(report.failed(), 0);
+
+    // The same file with the namespace replicated: its keys expire, and the event is
+    // not raised for them yet (which member raises it is not built). A note says so.
+    let replicated = rules(
+        &SILENT.replace("[state.seen]", "[state.seen]\nconsistency = \"eventual\""),
+        "{\"topic\": \"sensors/d1/data\", \"clientid\": \"d1\", \"payload\": {\"temp\": 20}}\n\
+         {\"at\": \"20m\"}\n",
+    );
+    assert_eq!(
+        replicated.notes,
+        [
+            "namespace `seen` is replicated in a cluster; a replay is one node, where it \
+             behaves as consistency = \"local\"",
+            "namespace `seen` is replicated: the expiry of its keys raises no \
+             $events/state/expired yet, here or in a broker"
+        ]
+    );
+    assert_eq!(
+        replicated.steps[1].state,
+        [r#"state seen: - "d1" (expired +600s)"#]
+    );
+    assert!(replicated.steps[1].results.is_empty());
+}
+
+/// D7: a rule on the event may write state, the key that expired included. In a
+/// replay what it writes expires in turn within the same step, each at its own time;
+/// a step raises at most `MAX_EXPIRY_EVENTS`, and says so.
+#[test]
+fn a_rule_on_the_expiry_event_may_write_the_key_again_and_a_step_bounds_the_events() {
+    let sql = r#"SELECT CASE WHEN event = 'state.expired' THEN kv_set(key, value + 1, 1)
+                            ELSE kv_set('k', 0, 1) END AS n,
+                        now_timestamp() AS at
+                 FROM "t/#", "$events/state/expired""#;
+    let report = statement(
+        sql,
+        r#"
+        {"topic": "t/1"}
+        {"at": 3}
+        "#,
+    );
+    assert_eq!(
+        report.text(true),
+        transcript(
+            r#"
+            #1 +0s t/1 {}
+              {"n":0,"at":1735689600}
+              state rule:test: + "k" = 0 (lww, expires +1s)
+            #2 +3s (nothing sent)
+              event state.expired rule:test: "k" at +1s
+                {"n":1,"at":1735689601}
+              event state.expired rule:test: "k" at +2s
+                {"n":2,"at":1735689602}
+              event state.expired rule:test: "k" at +3s
+                {"n":3,"at":1735689603}
+              state rule:test: - "k" (expired +1s)
+              state rule:test: + "k" = 1 (lww, expires +2s)
+              state rule:test: - "k" (expired +2s)
+              state rule:test: + "k" = 2 (lww, expires +3s)
+              state rule:test: - "k" (expired +3s)
+              state rule:test: + "k" = 3 (lww, expires +4s)
+            state at the end (+3s):
+              rule:test: "k" = 3 (lww, expires +4s)
+            "#
+        )
+    );
+    assert!(report.steps[1].selected, "the event's rules ran");
+
+    let long = statement(sql, "{\"topic\": \"t/1\"}\n{\"at\": \"5h\"}\n");
+    let events = |prefix: &str| {
+        long.steps[1]
+            .results
+            .iter()
+            .filter(|line| line.starts_with(prefix))
+            .count()
+    };
+    assert_eq!(events("event state.expired"), MAX_EXPIRY_EVENTS);
+    assert_eq!(
+        events("(more keys expired: a step of a replay raises at most 10000 expiry events)"),
+        1
+    );
+    assert!(
+        long.store.is_empty(),
+        "the last key expired and was not written again"
+    );
+}
+
+/// D7: without a rule on the event a replay reports the expired keys and raises
+/// nothing, also where a rule selects every EMQX event with `"$events/#"`.
+#[test]
+fn a_wildcard_on_every_event_is_not_sent_the_expiry_event() {
+    let report = rules(
+        r#"
+        [rules.a_set]
+        sql = '''SELECT kv_set('k', 1, 10) AS v FROM "t/#"'''
+
+        [rules.b_events]
+        sql = '''SELECT event FROM "$events/#"'''
+        actions = [{ function = "console" }]
+        "#,
+        r#"
+        {"topic": "t/1"}
+        {"at": 20}
+        {"at": 21, "event": "client.connected"}
+        "#,
+    );
+    assert_eq!(
+        report.text(true),
+        transcript(
+            r#"
+            #1 +0s t/1 {}
+              a_set: passed
+              state rule:a_set: + "k" = 1 (lww, expires +10s)
+            #2 +20s (nothing sent)
+              state rule:a_set: - "k" (expired +10s)
+            #3 +21s event client.connected (test-client)
+              b_events: passed
+                console {"event":"client.connected"}
+            state at the end (+21s):
+              (empty)
+            "#
+        )
+    );
+}
+
+/// A step may send a sample of the event itself, as `--rule-test --event` builds
+/// it: a key named by the topic, holding the payload.
+#[test]
+fn a_step_can_send_a_sample_of_the_expiry_event() {
+    let report = statement(
+        r#"SELECT namespace, key, value FROM "$events/state/expired""#,
+        r#"{"event": "state.expired", "topic": "seen:d1", "payload": "gone"}"#,
+    );
+    assert_eq!(
+        report.text(false),
+        transcript(
+            r#"
+            #1 +0s event state.expired (test-client)
+              {"namespace":"sample","key":"seen:d1","value":"gone"}
+            "#
+        )
+    );
 }

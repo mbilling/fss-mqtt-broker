@@ -55,6 +55,13 @@
 //!   events say about a message's publisher travels with the message as its
 //!   [`Origin`], stamped at the publish only while a rule here or on a peer selects one
 //!   of them ([`Rules::origin_wanted`]).
+//! - **A key's expiry** ([ADR 0085](../../../docs/adr/0085-rule-state-store.md) D7).
+//!   `$events/state/expired` is raised by one task that exists for it
+//!   ([`Rules::spawn_expiry`]): it sweeps the store's expired keys and evaluates the
+//!   rules that select the event, off the hub loop and off every connection, at no
+//!   more than `rules.state_expiry_per_sec` events a second. While no rule selects the
+//!   event the same task only removes what has expired, and while no rule keeps state
+//!   it waits for a reload and does nothing else.
 //! - **The dictionary** ([ADR 0085](../../../docs/adr/0085-rule-state-store.md) D13).
 //!   EMQX's `proc_dict_*` work on the dictionary of the process that evaluates the
 //!   rule, which there is the client's connection process. Here it is the connection
@@ -756,6 +763,52 @@ impl Rules {
         tx
     }
 
+    /// Start the task that sweeps the rule state's expired keys and raises
+    /// `$events/state/expired` for them (ADR 0085 D7), and return what keeps it
+    /// running: the task ends when that is dropped. `None`, and no task, where rule
+    /// state is switched off.
+    ///
+    /// The task owns no connection: it evaluates on an empty dictionary, off the hub
+    /// loop, and posts what the rules derive to `hub`, ungated, as every event does.
+    /// It tells the store whether a loaded rule selects the event (so that expired
+    /// keys are held for it, or not), again at every reload. While no loaded rule
+    /// keeps state it waits for the next reload and sets no timer.
+    #[must_use]
+    pub fn spawn_expiry(
+        &self,
+        hub: mpsc::UnboundedSender<HubCommand>,
+    ) -> Option<oneshot::Sender<()>> {
+        let store = self.state.clone()?;
+        let rules = ConnRules {
+            keeps_dictionary: false,
+            ..self.for_connection()
+        };
+        let mut reloaded = self.rx.clone();
+        reloaded.mark_unchanged();
+        store.set_expiry_events(rules.wants(EventKind::StateExpired));
+        let (running, mut stopped) = oneshot::channel::<()>();
+        tokio::spawn(async move {
+            let mut pace = crate::rule_state::Pace::new(store.expiry_per_sec());
+            let mut reloads = true;
+            loop {
+                let wait = rules.sweep_expired(&store, &mut pace, &hub).await;
+                tokio::select! {
+                    _ = &mut stopped => break,
+                    changed = reloaded.changed(), if reloads => match changed {
+                        Ok(()) => {
+                            rules.refresh();
+                            store.set_expiry_events(rules.wants(EventKind::StateExpired));
+                        }
+                        // Nothing can reload the rules any more.
+                        Err(_) => reloads = false,
+                    },
+                    () = tokio::time::sleep(wait.unwrap_or_default()), if wait.is_some() => {}
+                }
+            }
+        });
+        Some(running)
+    }
+
     /// The same engine, watched (ADR 0084): its last errors are kept and, while the
     /// trace is on, its evaluations are traced into `observe`.
     #[must_use]
@@ -1107,6 +1160,50 @@ impl ConnRules {
         });
     }
 
+    /// One pass of the store's expiry task ([`Rules::spawn_expiry`]): remove what has
+    /// expired and, where a rule selects `$events/state/expired`, raise it for as
+    /// many keys as `pace` allows now. Returns how long to wait before the next pass;
+    /// `None` while no loaded rule keeps state (the next reload is what to wait for).
+    async fn sweep_expired(
+        &self,
+        store: &crate::rule_state::Store,
+        pace: &mut crate::rule_state::Pace,
+        hub: &mpsc::UnboundedSender<HubCommand>,
+    ) -> Option<std::time::Duration> {
+        /// The keys removed between two yields while no event is owed.
+        const CHUNK: usize = 4096;
+        /// The longest the task sleeps while a rule keeps state: a key can be made to
+        /// expire sooner than any the last pass saw.
+        const IDLE_MS: u64 = 1000;
+        if !store.has_namespaces() {
+            return None;
+        }
+        let now_ms = store.now_ms();
+        let next_due_ms = if store.expiry_events() {
+            let swept = store.sweep(pace.allow(now_ms));
+            pace.spend(swept.expired.len());
+            for expired in &swept.expired {
+                self.fire_event(&expiry_event(self.node(), expired), hub);
+            }
+            if swept.more {
+                return Some(std::time::Duration::from_millis(pace.wait_ms()));
+            }
+            swept.next_due_ms
+        } else {
+            loop {
+                let swept = store.sweep(CHUNK);
+                if !swept.more {
+                    break swept.next_due_ms;
+                }
+                tokio::task::yield_now().await;
+            }
+        };
+        let wait = next_due_ms.map_or(IDLE_MS, |due| {
+            due.saturating_sub(now_ms).saturating_add(1).min(IDLE_MS)
+        });
+        Some(std::time::Duration::from_millis(wait))
+    }
+
     /// Drop derived messages unsent — a `QoS` 0 publish under `shed-qos0` found no
     /// credit for them — counting each as a failed action.
     pub fn shed(&self, derived: Vec<Derived>) {
@@ -1169,6 +1266,21 @@ impl ConnRules {
             holds,
         )
     }
+}
+
+/// `$events/state/expired` for a key the store's sweep removed, as `node` raises it.
+#[must_use]
+pub fn expiry_event(node: &str, expired: &crate::rule_state::Expired) -> EventInput {
+    EventInput::state_expired(
+        node,
+        &mqtt_rules::StateExpiry {
+            namespace: &expired.namespace,
+            key: &expired.key,
+            value: expired.value.clone(),
+            kind: expired.kind,
+            expired_at_ms: i64::try_from(expired.expired_ms).unwrap_or(i64::MAX),
+        },
+    )
 }
 
 /// A packet's MQTT 5 properties as an event shows them (`conn_props`, `disconn_props`,
@@ -2182,6 +2294,9 @@ pub fn functions_and_state_from_config(
     });
     let state =
         (rules.state_max_bytes > 0).then(|| crate::rule_state::Store::new(rules.state_max_bytes));
+    if let Some(store) = &state {
+        store.set_expiry_per_sec(rules.state_expiry_per_sec);
+    }
     let functions = match &state {
         Some(store) => functions.with_state(store.clone()),
         None => functions.without_state(),
@@ -2280,6 +2395,61 @@ mod tests {
         let set = Arc::new(RuleSet::parse(text).unwrap().rules);
         let (tx, rx) = watch::channel(set);
         (Rules::new(rx, Arc::from("n1"), None), tx)
+    }
+
+    /// ADR 0085 D7: the rules on `$events/state/expired` run on the store's own task,
+    /// never on the hub loop. Here there is no hub at all, only the queue the task
+    /// posts to: a key written by a connection's rule expires, and what the event's
+    /// rule republishes arrives on that queue, ungated, from the rule that produced
+    /// it. Where rule state is off there is no task.
+    #[tokio::test]
+    async fn the_expiry_events_rules_run_on_the_stores_task_not_on_the_hub() {
+        let store = crate::rule_state::Store::new(1 << 20);
+        let functions = Functions::default().with_state(store.clone());
+        let text = "[rules.a_seen]\nsql = '''SELECT kv_set(clientid, 1, 1) AS n FROM \"in/#\"'''\n\
+                    [rules.b_silent]\nsql = '''SELECT key FROM \"$events/state/expired\"'''\n\
+                    actions = [{ function = \"republish\", args = { topic = \"silent/${key}\" } }]\n";
+        let set = Arc::new(RuleSet::parse_with(text, &functions).unwrap().rules);
+        let (_tx, rx) = watch::channel(set);
+        let rules = Rules::new(rx, Arc::from("n1"), None)
+            .with_functions(functions)
+            .with_state(Some(store.clone()));
+        let (hub, mut posted) = mpsc::unbounded_channel();
+        let running = rules.spawn_expiry(hub).expect("rule state is on");
+        assert!(store.expiry_events());
+
+        let client = ClientId("dev-1".into());
+        let payload = Bytes::from_static(b"{}");
+        let app = AppProperties::default();
+        let (derived, _) = rules.for_connection().on_publish(&PublishFacts {
+            client: &client,
+            publisher: &Publisher::default(),
+            topic: "in/a",
+            payload: &payload,
+            qos: QoS::AtMostOnce,
+            retain: false,
+            app: &app,
+            message_expiry: None,
+        });
+        assert!(derived.is_empty());
+        let command = tokio::time::timeout(std::time::Duration::from_secs(10), posted.recv())
+            .await
+            .expect("the event's rule republishes within its second")
+            .expect("the task is running");
+        let HubCommand::RuleDerived(derived) = command else {
+            panic!("what an event derives is posted ungated")
+        };
+        assert_eq!((&*derived.rule, derived.gated), ("b_silent", false));
+        let HubCommand::Publish { topic, .. } = &derived.publish else {
+            panic!("a publish")
+        };
+        assert_eq!(topic, "silent/dev-1");
+        assert_eq!(store.stats("rule:a_seen").unwrap().keys, 0);
+        drop(running);
+
+        let (off, _tx) = rules_of("");
+        let (hub, _posted) = mpsc::unbounded_channel();
+        assert!(off.spawn_expiry(hub).is_none(), "no store, no task");
     }
 
     /// A publish is stamped with its origin only while it is wanted — a rule here

@@ -23,7 +23,9 @@ use crate::{Input, Republish};
 ///
 /// The set, names and topics are EMQX's (`emqx_rule_events:event_names/0`,
 /// `event_topics_enum/0`, `event_name/1`). The events EMQX raises that mqttd does not
-/// are listed, as unsupported, in [`EMQX_EVENT_TOPICS`].
+/// are listed, as unsupported, in [`EMQX_EVENT_TOPICS`]. One event is mqttd's own,
+/// [`StateExpired`](Self::StateExpired): it is in neither list, so no wildcard selects
+/// it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum EventKind {
     /// `$events/client/connected` (also `$events/client_connected`).
@@ -57,7 +59,16 @@ pub enum EventKind {
     /// `$events/message/delivery_dropped` (also `$events/delivery_dropped`): a
     /// message dropped on its way to one subscriber.
     DeliveryDropped,
+    /// `$events/state/expired`: a key of the rule state store passed its expiry (ADR
+    /// 0085 D7). **mqttd's own**: EMQX has no such event, so it is selected only by
+    /// this exact topic. A wildcard such as `"$events/#"` selects what EMQX's would
+    /// ([`EventKind::matching`]) and never this.
+    StateExpired,
 }
+
+/// The topic of mqttd's own event, [`EventKind::StateExpired`]: the one name that
+/// selects it.
+pub const STATE_EXPIRED_TOPIC: &str = "$events/state/expired";
 
 /// Every event topic EMQX accepts in a `FROM` — `emqx_rule_events:event_topics_enum/0`,
 /// the 5.10+ namespaced topics and then the older underscore ones — with the event
@@ -146,7 +157,23 @@ pub struct EventMatch {
 
 impl EventKind {
     /// How many kinds there are.
-    pub const COUNT: usize = 12;
+    pub const COUNT: usize = 13;
+
+    /// EMQX's events: every kind a wildcard `FROM "$events/…"` can select.
+    pub const EMQX: [EventKind; 12] = [
+        EventKind::ClientConnected,
+        EventKind::ClientDisconnected,
+        EventKind::ClientConnack,
+        EventKind::ClientPing,
+        EventKind::CheckAuthnComplete,
+        EventKind::CheckAuthzComplete,
+        EventKind::SessionSubscribed,
+        EventKind::SessionUnsubscribed,
+        EventKind::MessageDelivered,
+        EventKind::MessageAcked,
+        EventKind::MessageDropped,
+        EventKind::DeliveryDropped,
+    ];
 
     /// The four message events: the ones a message's [`mqtt_core::Origin`] is carried
     /// for.
@@ -171,13 +198,17 @@ impl EventKind {
         EventKind::MessageAcked,
         EventKind::MessageDropped,
         EventKind::DeliveryDropped,
+        EventKind::StateExpired,
     ];
 
     /// Parse a `FROM` entry naming one event. Both EMQX spellings (5.10+ namespaced and
     /// the older underscore form) are accepted wherever EMQX accepts both
-    /// (`emqx_rule_events:event_name/1`).
+    /// (`emqx_rule_events:event_name/1`). mqttd's own event has its one topic.
     #[must_use]
     pub fn from_topic(t: &str) -> Option<Self> {
+        if t == STATE_EXPIRED_TOPIC {
+            return Some(Self::StateExpired);
+        }
         EMQX_EVENT_TOPICS
             .iter()
             .find(|(topic, _)| *topic == t)
@@ -186,7 +217,9 @@ impl EventKind {
 
     /// The events a wildcard `FROM "$events/…"` filter selects: every EMQX event topic
     /// it matches (`emqx_rule_events:match_event_names/1`), split into the ones mqttd
-    /// raises and the ones it does not.
+    /// raises and the ones it does not. Never [`StateExpired`](Self::StateExpired),
+    /// which is not an EMQX event topic: a rule ported from EMQX with `"$events/#"`
+    /// selects here what it selected there.
     #[must_use]
     pub fn matching(filter: &str) -> EventMatch {
         let mut m = EventMatch::default();
@@ -231,6 +264,7 @@ impl EventKind {
             Self::MessageAcked => "$events/message/acked",
             Self::MessageDropped => "$events/message/dropped",
             Self::DeliveryDropped => "$events/message/delivery_dropped",
+            Self::StateExpired => STATE_EXPIRED_TOPIC,
         }
     }
 
@@ -250,6 +284,7 @@ impl EventKind {
             Self::MessageAcked => "message.acked",
             Self::MessageDropped => "message.dropped",
             Self::DeliveryDropped => "delivery.dropped",
+            Self::StateExpired => "state.expired",
         }
     }
 
@@ -267,6 +302,7 @@ impl EventKind {
             Self::MessageAcked => 9,
             Self::MessageDropped => 10,
             Self::DeliveryDropped => 11,
+            Self::StateExpired => 12,
         }
     }
 }
@@ -773,6 +809,24 @@ pub struct EventMessage<'a> {
     pub user_properties: &'a [(String, String)],
 }
 
+/// A key of the rule state store whose expiry has passed, as
+/// `$events/state/expired` reports it ([`EventInput::state_expired`]).
+#[derive(Debug, Clone)]
+pub struct StateExpiry<'a> {
+    /// The key's namespace: a declared name, or `rule:<id>` for a rule's own.
+    pub namespace: &'a str,
+    /// The key.
+    pub key: &'a [u8],
+    /// What `kv_get` read last: the value, a counter's count, a set's elements, a
+    /// sketch's estimate.
+    pub value: Value,
+    /// The type the key's creating operation gave it (`lww`, `first`, `max`, `min`,
+    /// `sum`, `union`, `hll`).
+    pub kind: &'a str,
+    /// When it expired, in milliseconds since the epoch.
+    pub expired_at_ms: i64,
+}
+
 fn int(n: impl Into<i64>) -> Value {
     Value::Int(n.into())
 }
@@ -957,6 +1011,39 @@ impl EventInput {
             .delivery(receiver, msg);
         ev.fields.insert("reason", Value::from(reason));
         ev
+    }
+
+    /// `$events/state/expired`, mqttd's own (ADR 0085 D7): a key of the rule state
+    /// store passed its expiry. `event`, `namespace`, `key`, `value`, `type`,
+    /// `expired_at`, `timestamp` and `node`. It is about no client: `clientid` and
+    /// `username` read `undefined`.
+    #[must_use]
+    pub fn state_expired(node: &str, expiry: &StateExpiry<'_>) -> Self {
+        let mut m = Map::with_capacity(8);
+        m.insert("event", Value::from(EventKind::StateExpired.event_name()));
+        m.insert("namespace", Value::from(expiry.namespace));
+        m.insert(
+            "key",
+            Value::from_bytes(&Bytes::copy_from_slice(expiry.key)),
+        );
+        m.insert("value", expiry.value.clone());
+        m.insert("type", Value::from(expiry.kind));
+        m.insert("expired_at", Value::Int(expiry.expired_at_ms));
+        m.insert("timestamp", Value::Int(now_ms()));
+        m.insert("node", Value::from(node));
+        Self::of(EventKind::StateExpired, m)
+    }
+
+    /// [`state_expired`](Self::state_expired) as a replayed sequence raises it
+    /// (`mqttd --rule-test --sequence`): at `now_ms` on the sequence's clock, which is
+    /// its `timestamp` and what the functions that read the clock then read
+    /// ([`Input::clock_ms`]).
+    #[must_use]
+    pub fn state_expired_at(node: &str, expiry: &StateExpiry<'_>, now_ms: i64) -> Self {
+        let mut event = Self::state_expired(node, expiry);
+        event.fields.insert("timestamp", Value::Int(now_ms));
+        event.clock_ms = Some(now_ms);
+        event
     }
 
     /// `$events/client/connected` (`eventmsg_connected/2`). `expiry_interval` is in
@@ -1151,7 +1238,9 @@ impl EventInput {
     /// the rest ([`ConnInfo::sample`], a `normal` disconnect one second after
     /// connecting, a `success` CONNACK and authentication, a publish the ACL file
     /// allowed). A message event's message has the payload `{"msg": "hello"}`
-    /// ([`sample_message`](Self::sample_message) takes one).
+    /// ([`sample_message`](Self::sample_message) takes one). A sample of mqttd's own
+    /// `state.expired` is a key named by `topic`, in the namespace `sample`, that held
+    /// the payload as text and expired just now.
     #[must_use]
     pub fn sample(kind: EventKind, c: &ClientInfo, topic: &str, qos: u8) -> Self {
         Self::sample_message(
@@ -1252,6 +1341,16 @@ impl EventInput {
                 Self::message_dropped(c.node, &msg, no_props(), "no_subscribers")
             }
             EventKind::DeliveryDropped => Self::delivery_dropped(c, &msg, no_props(), "queue_full"),
+            EventKind::StateExpired => Self::state_expired(
+                c.node,
+                &StateExpiry {
+                    namespace: "sample",
+                    key: topic.as_bytes(),
+                    value: Value::from_bytes(payload),
+                    kind: "lww",
+                    expired_at_ms: now,
+                },
+            ),
         }
     }
 }

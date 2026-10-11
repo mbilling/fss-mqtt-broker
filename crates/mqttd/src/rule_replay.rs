@@ -27,11 +27,16 @@
 //! * **One node.** A namespace declared with another `consistency` than `local` has no
 //!   other member to replicate to here, and behaves as `local`.
 //!
-//! # What waits for the expiry event
+//! # When a key expires
 //!
 //! A key past its expiry reads as absent at once, and a step reports the keys the
-//! clock has passed since the step before. Raising `$events/state/expired` for them
-//! (D7) is ADR 0085 T4's; `expire`, below, is where it attaches.
+//! clock has passed since the step before, in order of expiry. Where the rules select
+//! `$events/state/expired` (D7) the replay raises it for each of them, at the key's
+//! own expiry time and before the step's own message, and reports what its rules
+//! produced; what they write may expire in the same step, and is raised in turn
+//! ([`MAX_EXPIRY_EVENTS`] a step at the most). A broker raises the event up to a
+//! second after the expiry and no faster than `rules.state_expiry_per_sec`; a replay
+//! has neither delay.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
@@ -61,6 +66,11 @@ pub const START_MS: u64 = 1_735_689_600_000;
 
 /// The furthest from its start a sequence may run: a hundred years.
 pub const MAX_AT_MS: u64 = 100 * 365 * 24 * 60 * 60 * 1000;
+
+/// The most expiry events one step of a replay raises. A rule on the event that
+/// writes a key with a short TTL gets one every time it expires, and a step may be
+/// years after the one before it.
+pub const MAX_EXPIRY_EVENTS: usize = 10_000;
 
 /// `node`, as `mqttd --rule-test` has it.
 const NODE: &str = "rule-test";
@@ -400,28 +410,18 @@ impl std::fmt::Display for Shown {
 /// What the store holds, as the replay last saw it: by namespace, then by key.
 type Model = BTreeMap<(Arc<str>, Arc<[u8]>), Shown>;
 
-/// The keys whose expiry the sequence's clock has passed by `now_ms`, in order of
-/// expiry, taken out of `model`: from this moment each reads as absent (the store
-/// removes it when a call finds it, or when its namespace needs room).
-///
-/// **Where ADR 0085 T4 attaches.** D7 raises `$events/state/expired` for each of
-/// these, in this order, on the node's own task, and a rule on that event may write
-/// state (the key that expired included). In a replay that is: for each key returned
-/// here, at the key's `expires_ms` on the sequence's clock and before the step's own
-/// message, evaluate the rules that select the event (on a dictionary of its own, as
-/// the store's expiry task has) and report what they produced. Until the event
-/// exists, a replay only reports the keys.
-fn expire(model: &mut Model, now_ms: u64) -> Vec<(Arc<str>, Arc<[u8]>, u64)> {
-    let mut expired: Vec<_> = model
+/// The key whose expiry the sequence's clock passed first by `now_ms` (by expiry,
+/// then namespace, then key), taken out of `model`: from that moment it reads as
+/// absent. Asked for again until there is none, because the event raised for one key
+/// (D7, [`Run::expired`]) may write another that expires before the next.
+fn expire(model: &mut Model, now_ms: u64) -> Option<(Arc<str>, Arc<[u8]>, u64)> {
+    let (at, expires_ms) = model
         .iter()
         .filter(|(_, shown)| shown.expires_ms != 0 && shown.expires_ms <= now_ms)
-        .map(|((namespace, key), shown)| (namespace.clone(), key.clone(), shown.expires_ms))
-        .collect();
-    for (namespace, key, _) in &expired {
-        model.remove(&(namespace.clone(), key.clone()));
-    }
-    expired.sort_by(|a, b| (a.2, &a.0, &a.1).cmp(&(b.2, &b.0, &b.1)));
-    expired
+        .min_by(|a, b| (a.1.expires_ms, a.0).cmp(&(b.1.expires_ms, b.0)))
+        .map(|(at, shown)| (at.clone(), shown.expires_ms))?;
+    model.remove(&at);
+    Some((at.0, at.1, expires_ms))
 }
 
 /// What one step did.
@@ -438,7 +438,9 @@ pub struct StepReport {
     /// What the rules produced, one entry a line: for a statement its outputs as
     /// JSON; for a rules file each rule that ran, its result and what its actions
     /// rendered, then the same for each republished message that re-entered the
-    /// rules.
+    /// rules. Before those, for each key that expired since the step before, where
+    /// the rules select `$events/state/expired`: a line naming the event, and under
+    /// it what its rules produced.
     pub results: Vec<String>,
     /// What the step changed in the store, one key a line, by namespace and key:
     /// `+` a new key, `~` a changed value or expiry, `-` a key that is gone. The keys
@@ -581,6 +583,75 @@ impl Replay {
         &self.warnings
     }
 
+    /// Whether a key's expiry is an event in this replay: the statement, or a rule of
+    /// the file, selects it. The store then holds an expired key for it, as the
+    /// broker's does, whoever finds it first. `notes` gains a line for each namespace
+    /// whose expiries raise none.
+    fn expiry_wanted(&self, notes: &mut Vec<String>) -> bool {
+        let wanted = match &self.rules {
+            Rules::Statement(test) => test.events().contains(&EventKind::StateExpired),
+            Rules::File(set) => set.wants_event(EventKind::StateExpired),
+        };
+        if let Some(store) = &self.store {
+            store.set_expiry_events(wanted);
+        }
+        if let (true, Rules::File(set)) = (wanted, &self.rules) {
+            for (name, settings) in set.state_namespaces() {
+                if settings.consistency != Consistency::Local {
+                    notes.push(format!(
+                        "namespace `{name}` is replicated: the expiry of its keys raises no \
+                         $events/state/expired yet, here or in a broker"
+                    ));
+                }
+            }
+        }
+        wanted
+    }
+
+    /// The keys the clock has passed by `now_ms`, earliest first: each is reported in
+    /// `state` and, where the expiry event is `wanted`, raised at its own expiry time
+    /// ([`Run::expired`]). What the event's rules write is in `model` before the next
+    /// key is looked for, so a key they set that expires by `now_ms` takes its turn.
+    fn expire_keys(
+        &self,
+        run: &mut Run<'_>,
+        model: &mut Model,
+        state: &mut Vec<String>,
+        now_ms: u64,
+        wanted: bool,
+    ) {
+        let mut events = 0usize;
+        while let Some((namespace, key, at_ms)) = expire(model, now_ms) {
+            state.push(format!(
+                "state {namespace}: - {} (expired {})",
+                key_text(&namespace, &key),
+                clock(at_ms.saturating_sub(START_MS))
+            ));
+            let Some(store) = self.store.as_ref().filter(|_| wanted) else {
+                continue;
+            };
+            self.now_ms.store(at_ms, Relaxed);
+            run.now_ms = i64::try_from(at_ms).unwrap_or(i64::MAX);
+            let Some(expired) = store.take_expired(&namespace, &key) else {
+                continue;
+            };
+            if events == MAX_EXPIRY_EVENTS {
+                run.results.push(format!(
+                    "(more keys expired: a step of a replay raises at most \
+                     {MAX_EXPIRY_EVENTS} expiry events)"
+                ));
+            }
+            events += 1;
+            if events > MAX_EXPIRY_EVENTS {
+                continue;
+            }
+            let dictionary = Dictionary::counted_in(store.clone());
+            if run.expired(&expired, &dictionary) {
+                changes(model, store, state);
+            }
+        }
+    }
+
     /// Replay `steps`, in order. The replay is used up: its store held one sequence.
     #[must_use]
     pub fn run(self, steps: &[Step]) -> Report {
@@ -595,6 +666,7 @@ impl Replay {
                 }
             }
         }
+        let wanted = self.expiry_wanted(&mut notes);
         let mut model = Model::new();
         let mut dictionaries: HashMap<&str, Dictionary> = HashMap::new();
         let mut run = Run {
@@ -609,17 +681,9 @@ impl Replay {
         for (index, step) in steps.iter().enumerate() {
             let now_ms = START_MS.saturating_add(step.at_ms);
             self.now_ms.store(now_ms, Relaxed);
-            // The T4 hook: see `expire`.
-            let mut state: Vec<String> = expire(&mut model, now_ms)
-                .into_iter()
-                .map(|(namespace, key, at_ms)| {
-                    format!(
-                        "state {namespace}: - {} (expired {})",
-                        key_text(&namespace, &key),
-                        clock(at_ms.saturating_sub(START_MS))
-                    )
-                })
-                .collect();
+            let mut state: Vec<String> = Vec::new();
+            self.expire_keys(&mut run, &mut model, &mut state, now_ms, wanted);
+            self.now_ms.store(now_ms, Relaxed);
             run.now_ms = i64::try_from(now_ms).unwrap_or(i64::MAX);
             let sent = match &step.send {
                 None => "(nothing sent)".to_string(),
@@ -839,6 +903,47 @@ impl Run<'_> {
             }
         }
         heading
+    }
+
+    /// Raise `$events/state/expired` for a key the sequence's clock has passed, at
+    /// the key's expiry time (`self.now_ms`), on `dictionary`: an empty one of its
+    /// own, as the store's expiry task has. Whether its rules may have changed the
+    /// store.
+    fn expired(&mut self, expired: &crate::rule_state::Expired, dictionary: &Dictionary) -> bool {
+        let event = EventInput::state_expired_at(
+            NODE,
+            &mqtt_rules::StateExpiry {
+                namespace: &expired.namespace,
+                key: &expired.key,
+                value: expired.value.clone(),
+                kind: expired.kind,
+                expired_at_ms: i64::try_from(expired.expired_ms).unwrap_or(i64::MAX),
+            },
+            self.now_ms,
+        );
+        self.results.push(format!(
+            "event state.expired {}: {} at {}",
+            expired.namespace,
+            key_text(&expired.namespace, &expired.key),
+            clock(expired.expired_ms.saturating_sub(START_MS))
+        ));
+        let at = self.results.len();
+        let wrote = match self.rules {
+            Rules::Statement(test) => {
+                self.statement(test, Fired::Event(&event), dictionary);
+                true
+            }
+            Rules::File(file) => {
+                let budget = Budget::new(0);
+                self.rule_set(file, Fired::Event(&event), &budget, dictionary, 0);
+                budget.state_calls() > 0
+            }
+        };
+        // Under the event's own line.
+        for line in &mut self.results[at..] {
+            line.insert_str(0, "  ");
+        }
+        wrote
     }
 
     /// One statement on one trigger: its outputs, one a line, as `--rule-test`

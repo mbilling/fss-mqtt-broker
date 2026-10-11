@@ -197,7 +197,7 @@ script = "demo/rules-live/up.sh"
 needs_checkout = true
 about = """
 Builds mqttd from this checkout and starts a Docker Compose stack: the broker with the
-demo's 22 rules, three publishers playing simulated power-plant, home and car telemetry
+demo's 24 rules, three publishers playing simulated power-plant, home and car telemetry
 in real time, and a web page (http://localhost:8070) where you edit, check, test and apply
 rules and watch what each one runs. Point any MQTT client at 127.0.0.1:1883 and subscribe
 to `$SYS/brokers/+/rules/#` for the per-rule statistics and `$SYS/brokers/+/trace/rules/+`

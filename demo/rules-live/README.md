@@ -5,7 +5,7 @@ fleet into mqttd and stops. This stack keeps them playing, and opens the broker 
 can watch what its [rule engine](../../docs/RULES.md) does with each message, and change
 the rules while it runs ([ADR 0084](../../docs/adr/0084-watching-and-editing-rules-live.md)):
 
-- **mqttd**, built from this checkout, running the demo's 22 rules. Every 2 s it publishes
+- **mqttd**, built from this checkout, running the demo's 24 rules. Every 2 s it publishes
   each rule's statistics on `$SYS/brokers/<node>/rules/<id>`, and with the rule trace on it
   publishes what each rule ran on and what it rendered on
   `$SYS/brokers/<node>/trace/rules/<id>`.
@@ -66,6 +66,32 @@ One rule's statistics and trace only, here the grid-frequency alert:
 mosquitto_sub -v -t '$SYS/brokers/+/rules/power_grid_frequency' \
   -t '$SYS/brokers/+/trace/rules/power_grid_frequency'
 ```
+
+## Silent for two minutes
+
+Two of the rules keep state between messages
+([`car_last_heard` and `car_silent`](../rules/README.md#cars)). The first sets a key per
+vehicle on every telemetry record and OBD frame, expiring two minutes later; the second
+selects [`$events/state/expired`](../../docs/RULES.md#when-a-key-expires-eventsstateexpired),
+the event the broker raises when such a key expires, and publishes an alert:
+
+```sh
+mosquitto_sub -v -t 'alerts/cars/+/silent'
+```
+
+```json
+{"vehicle":"XDKCE5K38RH287145","alert":"no data for 2 minutes","severity":"warning","last_heard":"2026-10-11T16:02:16Z","at":"2026-10-11T16:04:16Z","last_stream":"telemetry","body":"car","powertrain":"battery-electric","action":"see events/cars/<VIN>/presence: ignition off, or a lost connection"}
+```
+
+In every ten-minute window (they start on whole ten minutes of the wall clock) the car
+`XDKCE5K38RH287145` loses its connection 2 min 21 s in and is back at 5 min 05 s, so its
+alert comes about 4 min 20 s into the window, two minutes after its last record; a van parks for a job at about 5 min and
+drives on at 8 min, and the vehicles whose ignition goes off stay silent until the next
+window brings them back. The alert's times are the broker's: up to a second after the
+expiry, and no more than `rules.state_expiry_per_sec` events a second (1,000 by default).
+The rule's own trace and statistics are under `car_silent` on `$SYS`, and in the editor.
+The state is in memory: restarting the broker forgets the keys, and a vehicle that was
+already silent then raises nothing until it has spoken again.
 
 ## Turbine fast log (Parquet)
 
