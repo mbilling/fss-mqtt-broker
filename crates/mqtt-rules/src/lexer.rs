@@ -6,7 +6,9 @@
 //!   A doubled quote does not end the literal, but it is not unescaped either: EMQX
 //!   keeps it doubled (`'it''s'` is `it''s`) and strips every quote at either end
 //!   (`'''x'''` is `x`).
-//! - Keywords are case-insensitive; `div` and `mod` are the integer operators.
+//! - Keywords are case-insensitive; `div` and `mod` are the integer operators, in lower
+//!   case only. So are the booleans: the parser makes them of the names `true` and
+//!   `false` alone, and `TRUE` is a name like any other.
 //! - `-- comment` runs to the end of the line.
 //! - `[a..b]` (optionally signed ends) is one range token, as in EMQX.
 

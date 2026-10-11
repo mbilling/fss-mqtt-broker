@@ -520,8 +520,8 @@ funcs! {
     "sqlserver_bin2hexstr" 1..=1 => |a, _| Ok(Value::from(format!("0x{}", mqtt_core::hex_lower(bin(&a[0])?).to_uppercase())));
 
     // -- date and time
-    "now_timestamp" 0..=1 => |a, _| Ok(Value::Int(scale_from_nanos(now_nanos(), unit(a.first())?)));
-    "now_rfc3339" 0..=1 => |a, _| rfc3339(now_nanos(), unit(a.first())?);
+    "now_timestamp" 0..=1 => |a, cx| Ok(Value::Int(scale_from_nanos(now_nanos(cx), unit(a.first())?)));
+    "now_rfc3339" 0..=1 => |a, cx| rfc3339(now_nanos(cx), unit(a.first())?);
     "unix_ts_to_rfc3339" 1..=2 => |a, _| {
         let u = unit(a.get(1))?;
         rfc3339(i128::from(int(&a[0])?) * nanos_per(u), u)
@@ -535,13 +535,13 @@ funcs! {
     // EMQX keeps the older name as an alias.
     "timezone_to_second" 1..=1 => |a, _| Ok(Value::Int(i64::from(offset_seconds(&a[0])?)));
     // Without the time, `format_date/3` formats now.
-    "format_date" 3..=4 => |a, _| {
+    "format_date" 3..=4 => |a, cx| {
         let u = unit(Some(&a[0]))?;
         let offset = chrono::FixedOffset::east_opt(offset_seconds(&a[1])?)
             .ok_or_else(|| EvalError::new("time zone offset out of range"))?;
         let nanos = match a.get(3) {
             Some(t) => i128::from(int(t)?) * nanos_per(u),
-            None => i128::from(scale_from_nanos(now_nanos(), u)) * nanos_per(u),
+            None => i128::from(scale_from_nanos(now_nanos(cx), u)) * nanos_per(u),
         };
         let t = utc_from_nanos(nanos)?.with_timezone(&offset);
         format_time(&t, text(&a[2])?).map(Value::from)
@@ -1822,7 +1822,12 @@ fn nanos_per(u: Unit) -> i128 {
     }
 }
 
-fn now_nanos() -> i128 {
+/// Now: the wall clock, or the clock of the sequence the trigger is replayed in
+/// ([`Input::clock_ms`](crate::Input::clock_ms)).
+fn now_nanos(cx: &FnCtx) -> i128 {
+    if let Some(ms) = cx.ctx.input.clock_ms() {
+        return i128::from(ms) * 1_000_000;
+    }
     let d = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();

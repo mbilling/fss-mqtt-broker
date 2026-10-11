@@ -11,8 +11,10 @@ tasks:
     evidence: "PR 929: crates/mqtt-rules/src/state.rs (StateStore and StateNamespace handed over in Functions, [state.<name>] and the rule key state, one table of function names) and crates/mqttd/src/rule_state.rs (local namespaces, typed keys, TTLs, bounds, LRU, the rules.state_max_bytes ceiling, brownout); 141 probes of EMQX 6.3.1 (emqx_rule_funcs and emqx_rule_sqltester) pinned in rule_state::tests, none contradicting the ADR; mqtt-rules tests_state (21), mqttd rule_state::tests (33), tests/rules_state.rs (6), additions to rules_binary.rs, admin_rules.rs and the converter test; dry runs on a scratch store; the rule_state benchmark (0.11-0.14 us per call on one thread, Apple M1 Pro)."
   - id: 0085-T2
     title: "Typed merges as CRDTs (lww, first, max, min, sum, union, hll, deletes) on a per-node hybrid logical clock, and the replicated form of a key"
-    status: in-progress
+    status: done
     issue: 918
+    date: 2026-10-11
+    evidence: "PR 935: crates/mqtt-rules/src/crdt.rs (the types, a merge that is commutative, associative and idempotent over every state the decoder accepts, the hybrid logical clock with a 60 s skew bound, the canonical bounded encoded form, kv_hll_add and kv_hll_count on a 2^14-register sketch hashed with SipHash-2-4 under a fixed key) and the store keeping its keys in crdt::Data; mqtt-rules tests_crdt (40); the state_merge fuzz target in the nightly tier (about 1.2 million inputs locally, no finding); T1 store tests and the 141 EMQX probes pass unmodified; the ADR amended for the delete rule of non-lww types, first-write expiry, the skew bound and the counter bound."
   - id: 0085-T3
     title: "eventual mode: every member holds the namespace; changed keys sent per peer link at peer protocol 14, applied off the hub, repaired by anti-entropy after partitions and restarts"
     status: planned
@@ -31,7 +33,7 @@ tasks:
     issue: 922
   - id: 0085-T7
     title: "mqttd --rule-test --sequence: timed sequences replayed through a statement or a rules file against an in-memory store with a driven clock"
-    status: planned
+    status: in-progress
     issue: 923
   - id: 0085-T8
     title: "Documentation: RULES.md (functions, types, modes, when a state call runs, the worked sequences, the billing example), the departures from EMQX, threat model and hardening rows, the converter"
@@ -51,6 +53,22 @@ tasks:
     issue: 927
     date: 2026-10-11
     evidence: "PR 933: crates/mqtt-rules/src/state/dict.rs (a Dictionary per evaluating task, the three names in state::FUNCS) and one dictionary per connection in crates/mqttd/src/rules.rs; 99 probes of EMQX 6.3.1 (direct calls, emqx_rule_sqltester, the REST SQL test, and clients on a running node for whose process holds the dictionary per trigger) pinned in mqtt-rules tests_proc_dict (14) and crates/mqttd/tests/rules_proc_dict.rs (10), plus one test each in admin_rules.rs and rules_binary.rs; bounds of 64 keys and 64 KiB with dictionary_full; the ADR amended where the probes contradicted it; the converter carries proc_dict_* rules live."
+  - id: 0085-T12
+    title: "View the contents of the store: each key's type, size and expiry in the listing, optionally values, filters by expiry (expires within, no expiry), kv_store included"
+    status: planned
+    issue: 940
+  - id: 0085-T13
+    title: "Expire entries manually: a bulk purge of one namespace by prefix, by expiry (expires within, no expiry), or already expired; dry run, batches off the publish path, 100,000 keys a call with a cursor, audited; no expiry event unless asked"
+    status: planned
+    issue: 941
+  - id: 0085-T14
+    title: "Change expiry on stored keys: set, extend or clear the expiry of one key or a selection, within max_ttl; dry run, audited; a sooner expiry refused where it would not replicate"
+    status: planned
+    issue: 942
+  - id: 0085-T15
+    title: "CLI and documentation for viewing, purging and changing expiry: state-keys filters, mqttd --admin state-purge and state-expire; ADMIN-API.md, RULES.md, the threat model row"
+    status: planned
+    issue: 943
 ---
 
 # Delivery 0085 — state for rules
@@ -65,7 +83,9 @@ The ADR was accepted on 2026-10-11, after a review against the EMQX evaluation o
 Five choices were decided by default and are listed in the ADR with what the other answer
 costs: `eventual` replicates to every member; `strong` is phase 2 behind a design
 amendment; EMQX's `proc_dict_*` are provided; state needs no switch beyond its ceiling
-(`rules.state_max_bytes`); the names stay `kv_*`. T1, the store and its functions on
+(`rules.state_max_bytes`); the names stay `kv_*`. The user confirmed the last two on
+2026-10-11 and approved the operator's tools on the store (T12 to T15: view the
+contents, purge, change expiry), which the ADR's amendment of that date decides. T1, the store and its functions on
 one node, is done; the table under Progress has where each of the others stands.
 
 ## Plan
@@ -83,11 +103,21 @@ one node, is done; the table under Progress has where each of the others stands.
 | **0085-T9** `strong` (phase 2) | T3, and an amendment to the ADR | First: the ADR is amended with how an evaluation waits for a quorum (the bound on concurrent waits ADR 0086 left open, the timeout, a Will's rules), and accepted. Then: a quorum-acknowledged write survives the leader's loss; a minority partition's calls fail and are counted; no wait holds the hub or another connection. |
 | **0085-T10** Snapshot (phase 3) | T3 | A restarted node restores its `local` and `eventual` namespaces from the last snapshot. |
 | **0085-T11** `proc_dict_*` (D13) | T1 | `proc_dict_put/get/del` return what EMQX 6.3.1 returns (probed there across two publishes of one connection and across a reconnect); the dictionary is the connection's, empty at connect, gone at disconnect, seen by a re-entered rule; a Will and an event without a connection get an empty one; 64 keys and 64 KiB per connection, counted against the store's ceiling; no longer refused at load. |
+| **0085-T12** View the contents (amendment of 2026-10-11) | T6; its `eventual` half T3 | The listing shows `type`, `bytes` and `expires_at` for every key of a declared namespace, a rule's own and `kv_store`, and values only with `values=true` and only to an operator; `expires_within` and `no_expiry`, alone and combined with each other and `prefix`, select exactly the keys a test wrote that way, with the store's clock driven; a page with values ends at 1,000 keys or 1 MiB, whichever comes first; the walk holds a shard's lock for at most 64 keys at a time and runs on no connection's task; no field is added to an entry and no write call is changed (`ENTRY_OVERHEAD` stays 128 bytes). With T3: the listing of an `eventual` namespace shows a replicated key with its type and expiry on every node, tombstones are not listed, and nothing new is on the wire. |
+| **0085-T13** Purge (amendment of 2026-10-11) | T12; its `eventual` half T3; `events=true` T4 | `prefix`, `expires_within`, `no_expiry` and `expired=true`, alone and combined, remove exactly the keys a test wrote that way; a call with no selector is refused; a dry run changes nothing, writes no audit record and answers the count the purge then removes, with a sample of 20 keys and no values; more than 100,000 matching keys take two calls, the second from the first's cursor; a second purge on the node while one runs is refused; a rule's state call during a purge of a full namespace waits for one batch of 64 keys at the most (measured); the `state.purge` audit record carries the subject, the namespace, the selection, the count and whether events were asked for; an operator who is not a listed rules writer is refused, and may still run the dry run; no `$events/state/expired` by default, and with `events=true` one per purged key at the sweep's rate, on the node that ran the purge; `kv_store` can be purged by prefix (every key of it has no expiry), and refuses `events=true`. With T3: a purge on one node of an `eventual` namespace removes the keys on every node, stays removed after a partition heals, and its tombstones count toward `max_keys` until the tombstone window has passed. |
+| **0085-T14** Change expiry (amendment of 2026-10-11) | T12; its `eventual` half T3 | `ttl`, `extend` and `clear` on one key and on a selection do what the listing then shows, with the store's clock driven; a result past `max_ttl` is refused for one key and counted as `past_max_ttl` in a selection whose other keys are changed; every call on `kv_store` is refused; a dry run changes nothing and answers the counts the call then reports; a rule's next write with a TTL sets the expiry again; a key whose expiry was moved sooner expires then and, with T4, raises its event; the `state.expire` audit record carries the subject, the namespace, the selection, the change and the counts by outcome; an operator who is not a listed rules writer is refused. With T3, on two nodes: a later expiry and `clear` hold on both after repair for every type; any change of an `lww` key holds on both; a sooner expiry of a key of each other type is refused as `not_shortened` and leaves both copies as they were. |
+| **0085-T15** CLI and documentation of T12–T14 | T13, T14 | `state-keys` takes `--values`, `--expires-within` and `--no-expiry`; `state-purge <ns>` and `state-expire <ns> [<key>]` reach their endpoints with every parameter those take, `--dry-run` included; without `--all` they stop at one call's cap and print the cursor, with it they go on until there is none; `--all-nodes` asks every node; `--json` prints valid JSON and the terminal views print control characters escaped; `mqttd --admin help` lists the verbs. ADMIN-API.md has the endpoints with their parameters, roles, audit records and refusals; RULES.md says what each selector means, what a purge raises and does not, that a purge there leaves tombstones, and which expiry changes replicate; THREAT-MODEL.md's row for a rules writer's reach names the purge. |
 
 **Order.** T1 first. Then T2, T6 (without the replication series), T7, T11 and the
 single-node half of T4 can run in parallel; T3 and T5 follow T2; the cluster half of T4
 and the replication series of T6 follow T3; T8 closes phase 1. T9 and T10 are later
 phases.
+
+**The operator's tools (T12–T15),** added on 2026-10-11: T12 follows T6; T13 and T14
+follow T12 and can run side by side, each with an `eventual` half that waits for T3 (and
+the purge's `events=true` for T4); T15 follows both. They are not part of what T8
+follows: T8 closes phase 1's documentation and the feature's tracker (#880) as planned,
+and T15 carries the documentation of these three.
 
 ## Progress
 
@@ -95,16 +125,20 @@ phases.
 | Task | Status | Issue | When | Evidence / notes |
 |------|--------|-------|------|------------------|
 | 0085-T1 | ✅ done | [#917](https://github.com/mbilling/fss-mqtt-broker/issues/917) | 2026-10-11 | "PR 929: crates/mqtt-rules/src/state.rs (StateStore and StateNamespace handed over in Functions, [state.<name>] and the rule key state, one table of function names) and crates/mqttd/src/rule_state.rs (local namespaces, typed keys, TTLs, bounds, LRU, the rules.state_max_bytes ceiling, brownout); 141 probes of EMQX 6.3.1 (emqx_rule_funcs and emqx_rule_sqltester) pinned in rule_state::tests, none contradicting the ADR; mqtt-rules tests_state (21), mqttd rule_state::tests (33), tests/rules_state.rs (6), additions to rules_binary.rs, admin_rules.rs and the converter test; dry runs on a scratch store; the rule_state benchmark (0.11-0.14 us per call on one thread, Apple M1 Pro)." |
-| 0085-T2 | 🚧 in-progress | [#918](https://github.com/mbilling/fss-mqtt-broker/issues/918) | — |  |
+| 0085-T2 | ✅ done | [#918](https://github.com/mbilling/fss-mqtt-broker/issues/918) | 2026-10-11 | "PR 935: crates/mqtt-rules/src/crdt.rs (the types, a merge that is commutative, associative and idempotent over every state the decoder accepts, the hybrid logical clock with a 60 s skew bound, the canonical bounded encoded form, kv_hll_add and kv_hll_count on a 2^14-register sketch hashed with SipHash-2-4 under a fixed key) and the store keeping its keys in crdt::Data; mqtt-rules tests_crdt (40); the state_merge fuzz target in the nightly tier (about 1.2 million inputs locally, no finding); T1 store tests and the 141 EMQX probes pass unmodified; the ADR amended for the delete rule of non-lww types, first-write expiry, the skew bound and the counter bound." |
 | 0085-T3 | ⬜ planned | [#919](https://github.com/mbilling/fss-mqtt-broker/issues/919) | — |  |
 | 0085-T4 | ⬜ planned | [#920](https://github.com/mbilling/fss-mqtt-broker/issues/920) | — |  |
 | 0085-T5 | ⬜ planned | [#921](https://github.com/mbilling/fss-mqtt-broker/issues/921) | — |  |
 | 0085-T6 | ⬜ planned | [#922](https://github.com/mbilling/fss-mqtt-broker/issues/922) | — |  |
-| 0085-T7 | ⬜ planned | [#923](https://github.com/mbilling/fss-mqtt-broker/issues/923) | — |  |
+| 0085-T7 | 🚧 in-progress | [#923](https://github.com/mbilling/fss-mqtt-broker/issues/923) | — |  |
 | 0085-T8 | ⬜ planned | [#924](https://github.com/mbilling/fss-mqtt-broker/issues/924) | — |  |
 | 0085-T9 | ⬜ planned | [#925](https://github.com/mbilling/fss-mqtt-broker/issues/925) | — |  |
 | 0085-T10 | ⬜ planned | [#926](https://github.com/mbilling/fss-mqtt-broker/issues/926) | — |  |
 | 0085-T11 | ✅ done | [#927](https://github.com/mbilling/fss-mqtt-broker/issues/927) | 2026-10-11 | "PR 933: crates/mqtt-rules/src/state/dict.rs (a Dictionary per evaluating task, the three names in state::FUNCS) and one dictionary per connection in crates/mqttd/src/rules.rs; 99 probes of EMQX 6.3.1 (direct calls, emqx_rule_sqltester, the REST SQL test, and clients on a running node for whose process holds the dictionary per trigger) pinned in mqtt-rules tests_proc_dict (14) and crates/mqttd/tests/rules_proc_dict.rs (10), plus one test each in admin_rules.rs and rules_binary.rs; bounds of 64 keys and 64 KiB with dictionary_full; the ADR amended where the probes contradicted it; the converter carries proc_dict_* rules live." |
+| 0085-T12 | ⬜ planned | [#940](https://github.com/mbilling/fss-mqtt-broker/issues/940) | — |  |
+| 0085-T13 | ⬜ planned | [#941](https://github.com/mbilling/fss-mqtt-broker/issues/941) | — |  |
+| 0085-T14 | ⬜ planned | [#942](https://github.com/mbilling/fss-mqtt-broker/issues/942) | — |  |
+| 0085-T15 | ⬜ planned | [#943](https://github.com/mbilling/fss-mqtt-broker/issues/943) | — |  |
 <!-- /status-table:0085 -->
 
 ## Changelog
@@ -256,3 +290,81 @@ phases.
     stays.
   - **Left for T3, as planned:** anything on the wire, stamping the writes of an
     `eventual` namespace, tombstones in the store, the refusal count for clock skew.
+- 2026-10-11 — **Admin features approved, two defaults confirmed** (the ADR's amendment
+  "admin features and confirmed defaults").
+  - **Confirmed by the user:** state is on without a switch, under
+    `rules.state_max_bytes` = 256 MiB (`0` turns it off); the names stay `kv_*`. The
+    other three defaults stand; `proc_dict_*` is delivered (#933).
+  - **T12 to T15 are new** (#940 to #943): view the contents, purge, change expiry, and
+    their verbs and documentation. T6 is unchanged and builds D10 as written; T8 is
+    unchanged and does not wait for them.
+  - **Decided with them:** a purge raises no expiry event unless asked; stale means not
+    written for a given time; `kv_store` can be viewed and purged but its keys get no
+    expiry; in an `eventual` namespace a purge or a change of expiry replicates, in a
+    `local` one it is per node; operator and a listed rules writer; 100,000 keys a call
+    with a cursor.
+  - **What the code changed in the plan:** the last-write time was to come from T2's
+    clock stamp in `eventual` namespaces. Only `lww` keys carry the stamp of their last
+    write, and `local` namespaces and `kv_store` carry none, so T12 adds a last-write
+    time to every entry: 8 bytes a key, nothing on the wire, each node's own in an
+    `eventual` namespace.
+  - **Three new choices decided by default** (the ADR's table, 6 to 8): the last-write
+    time is not replicated; moving an expiry sooner on a key that is not `lww` in an
+    `eventual` namespace is refused, because an expiry merges as the later of the two;
+    `clear` is offered although it leaves `max_ttl`.
+- 2026-10-11 — **No last-write time: selecting stale keys is dropped** (the ADR's
+  amendment "no last-write time").
+  - **The user:** "ok, drop the stale key idea completely. drop the extra bytes". Nothing
+    had been built on it.
+  - **Taken out of T12 to T15** (#940 to #943, titles and text edited): the last-write
+    time per key (8 bytes a key, `written_at`, `written_known_since`), the selector
+    `not_written_for` in the listing, the purge and the change of expiry, the CLI's
+    `--not-written-for`, and T12's measurement of `ENTRY_OVERHEAD`. Decision 6 of the
+    ADR's table is withdrawn; 7 and 8 stand by default. The entry above says what was
+    planned before this.
+  - **What stays:** T12 shows type, size and expiry, values on request, and filters by
+    `prefix`, `expires_within` and `no_expiry`, `kv_store` included; T13 purges by those
+    and by `expired=true`; T14 changes expiry on T13's selection; T15 carries their
+    verbs and documentation.
+  - **"Expire stale entries by hand"** is served by purging by prefix, already expired
+    and expires within.
+- 2026-10-11 — **T7 built, but for the expiry event** (#923, in review):
+  `mqttd --rule-test --sequence`. The ADR's amendment of this date has the format and the
+  report in full.
+  - **The replay** (`crates/mqttd/src/rule_replay.rs`, a library that the binary and the
+    tests both call): a file of JSON lines, each a message or a sample event with its time
+    (`at` from the start, or `after` the step before), bounded (10,000 steps, 1 MiB a
+    line), every error naming its line; one store for the sequence, empty at the start
+    and dropped at the end, and one dictionary per client id; the rules run as on a
+    connection's task (every matching rule, re-entry, EMQX's order). `--sql` replays one
+    statement, as `--rule-test` runs one; without it the configured rules file, actions
+    and `[state.*]` tables included. Each step prints its outputs and what it changed in
+    the store (`+`, `~`, `-` a key, with value, type and expiry); `--show-state` prints
+    the store at the end. Exit 1 when a step had a rule fail or nothing was selected, 2
+    for a sequence that cannot be read.
+  - **The clock is the sequence's.** The store, `now_timestamp()`, `now_rfc3339()`,
+    `format_date`, `timestamp` and `publish_received_at` read the step's time, and message
+    ids count from 1, so a replay prints the same every time. The engine reads a replay's
+    clock only from an input that carries one (`Input::clock_ms`); no input of a running
+    broker does.
+  - **What waits for T4:** "expiry events fire in the replay". A key past its expiry reads
+    as absent and the next step reports it as expired, in order of expiry; no rule runs
+    on it, because `$events/state/expired` does not exist yet. `rule_replay::expire` is
+    where T4 raises it. The task stays `in-progress` until then.
+  - **Tests:** `crates/mqttd/tests/rules_sequence.rs` (20: the ADR's worked examples as
+    transcripts, "hot for five minutes" with `kv_held`, a quota in a window, change
+    detection with `kv_changed`, an EMQX `kv_store_*` counter; a rules file with
+    re-entry; the clock; TTL expiry; dictionaries; events; failures; the file's format,
+    errors and bounds; the running store untouched), four in `rules_binary.rs` (options,
+    standard input, the rules file from the environment and from `--config`, exit
+    codes), four in mqtt-rules `tests_state`; RULES.md's two transcripts run in
+    `rules_docs.rs`.
+  - **Also:** `--rule-test` accepts `--config` (it always read the effective
+    configuration, and a replay of the rules file needs to name it).
+  - **Measured** (`cargo bench -p mqtt-rules`, Apple M1 Pro, `main`'s binary and this
+    change's in turn, six rounds, the fastest median of each case; the machine was
+    shared): `no_match` 113.3 to 114.0 ns, `filter_reject` 987.8 to 984.6 ns,
+    `filter_republish` 1.8335 to 1.8328 µs, `select_star_republish` 4.597 to 4.594 µs,
+    `foreach_10` 8.462 to 8.467 µs: −0.3% to +0.6%, inside the spread between runs.
+  - **Left for T8, as planned:** the cookbook's stateful recipes as sequences, and the
+    "Differences from EMQX" rows.

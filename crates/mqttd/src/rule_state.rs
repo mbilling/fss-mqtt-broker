@@ -185,7 +185,20 @@ impl Store {
         let max_bytes = like.map_or(mqtt_config::Rules::default().state_max_bytes, |store| {
             store.shared.max_bytes
         });
-        let mut store = Self::with_clock(max_bytes, Clock::System);
+        Self::scratch_on(max_bytes, Clock::System)
+    }
+
+    /// An empty store for one replayed sequence (`mqttd --rule-test --sequence`, D11),
+    /// under a ceiling of `max_bytes`, on the sequence's clock: `now_ms`, in
+    /// milliseconds, which the replay moves from step to step. Nothing in it reads the
+    /// wall clock, so a key expires when the sequence says so.
+    #[must_use]
+    pub fn scratch_at(max_bytes: u64, now_ms: Arc<AtomicU64>) -> Arc<Self> {
+        Self::scratch_on(max_bytes, Clock::Manual(now_ms))
+    }
+
+    fn scratch_on(max_bytes: u64, clock: Clock) -> Arc<Self> {
+        let mut store = Self::with_clock(max_bytes, clock);
         if let Some(store) = Arc::get_mut(&mut store) {
             store.kept = Some(Mutex::new(Vec::new()));
         }
@@ -1203,6 +1216,9 @@ pub fn stored(value: &Value) -> Stored<'_> {
         bytes: mqtt_rules::state::written_len(value),
     }
 }
+
+mod held;
+pub use held::HeldKey;
 
 #[cfg(test)]
 mod tests;
