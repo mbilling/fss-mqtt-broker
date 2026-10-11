@@ -1,15 +1,19 @@
-//! `eventual` rule state across real nodes (ADR 0085 T3): real sockets, the real peer
-//! links, each node with its own hub, its own rules and its own store.
+//! `eventual` rule state across real nodes (ADR 0085 T3, and T4's expiry event): real
+//! sockets, the real peer links, each node with its own hub, its own rules and its own
+//! store.
 //!
 //! The store's own tests (`mqttd::rule_state::tests_replica`) prove what converges and
-//! what is refused, with the links driven by hand. These prove the broker around it:
-//! that rules on different nodes count one counter and fill one set, that every node
-//! then reads the same, that a partition heals, and that a node that comes back with
-//! nothing is filled by the others. Nothing here waits for time: every wait is for a
-//! node to read what it is expected to read, with a bound.
+//! what is refused, and which member raises a key's expiry event, with the links and
+//! the clocks driven by hand. These prove the broker around it: that rules on
+//! different nodes count one counter and fill one set, that every node then reads the
+//! same, that a partition heals, that a node that comes back with nothing is filled by
+//! the others, and that a key's expiry is one event in the cluster. Nothing here waits
+//! for time: every wait is for a node to read or to send what it is expected to, with
+//! a bound. (The expiry tests' keys live three seconds, the time they take.)
 
 mod common;
 
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -64,6 +68,11 @@ struct Node {
 /// A node as the broker wires one: one store for its rules, named after the node,
 /// carried by every peer link it accepts or dials.
 async fn start_node(name: &str) -> Node {
+    start_node_with(name, RULES).await
+}
+
+/// The same, with the rules file `rules`.
+async fn start_node_with(name: &str, rules: &str) -> Node {
     let (functions, state) =
         mqttd::rules::functions_and_state_from_config(&mqtt_config::Rules::default());
     let state = state.expect("rule state is on by default");
@@ -72,7 +81,7 @@ async fn start_node(name: &str) -> Node {
     let sessions = Arc::new(MemorySessionStore::new());
     let (hub, hub_tx) = Hub::with_config(id.clone(), sessions.clone());
     tokio::spawn(hub.run());
-    let set = mqtt_rules::RuleSet::parse_with(RULES, &functions)
+    let set = mqtt_rules::RuleSet::parse_with(rules, &functions)
         .unwrap_or_else(|e| panic!("test rules must load: {e}"))
         .rules;
     let (rules_tx, rx) = tokio::sync::watch::channel(Arc::new(set));
@@ -399,4 +408,264 @@ async fn a_restarted_node_is_refilled_from_the_others() {
     let more = r#"{"n":41,"seen":["w-a","w-b"],"last":"20"}"#;
     read_b.reads("w-b", more).await;
     Reader::on(&a, "r-a2").await.reads("w-b", more).await;
+}
+/// T4's rules: a key per device, refreshed by every message and gone after three
+/// seconds of silence; and a rule on its expiry that says so on a topic of the node
+/// that raised it.
+const SILENT: &str = r#"
+[state.seen]
+consistency = "eventual"
+
+[rules.seen]
+state = "seen"
+sql = '''SELECT kv_set(payload, clientid, 3) AS was FROM "seen/#"'''
+
+[rules.silent]
+sql = '''SELECT key, node FROM "$events/state/expired" WHERE namespace = 'seen' '''
+actions = [{ function = "republish", args = { topic = "silent/${node}/${key}", payload = "${key}" } }]
+"#;
+
+/// The same without the rule on the event.
+const SEEN_ONLY: &str = r#"
+[state.seen]
+consistency = "eventual"
+
+[rules.seen]
+state = "seen"
+sql = '''SELECT kv_set(payload, clientid, 3) AS was FROM "seen/#"'''
+"#;
+
+const WAIT: Duration = Duration::from_secs(30);
+
+/// Wait until `ready` holds, which something in the cluster is on its way to.
+async fn until(what: &str, ready: impl Fn() -> bool) {
+    let deadline = Instant::now() + WAIT;
+    while !ready() {
+        assert!(Instant::now() < deadline, "never: {what}");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+/// What a node's rules say was silent: a client on the node that hears the events
+/// the node itself raised.
+struct Listener {
+    client: Client,
+    node: String,
+}
+
+impl Listener {
+    async fn on(node: &Node) -> Self {
+        let mut client = Client::connect(node.addr, &format!("hear-{}", node.id.0)).await;
+        client
+            .subscribe(1, &format!("silent/{}/#", node.id.0), QoS::AtMostOnce)
+            .await;
+        Self {
+            client,
+            node: node.id.0.clone(),
+        }
+    }
+
+    /// The next key this node raised an event for; `None` for the listener's own
+    /// mark ([`mark`](Self::mark)).
+    async fn next(&mut self) -> Option<String> {
+        match tokio::time::timeout(WAIT, self.client.recv()).await {
+            Ok(Packet::Publish(p)) if p.topic == format!("silent/{}/(mark)", self.node) => None,
+            Ok(Packet::Publish(p)) => Some(String::from_utf8_lossy(&p.payload).into_owned()),
+            other => panic!("{}: expected an event, got {other:?}", self.node),
+        }
+    }
+
+    /// Publish a mark through the node: what the node raised before it is heard
+    /// before it.
+    async fn mark(&mut self) {
+        let topic = format!("silent/{}/(mark)", self.node);
+        publish(&mut self.client, &topic, "").await;
+    }
+}
+
+/// The events `listeners`' nodes raise until `keys` of them have been heard, and
+/// then whatever else they raised by then: which nodes raised an event for each key.
+async fn silent(listeners: &mut [Listener], keys: usize) -> BTreeMap<String, Vec<String>> {
+    let mut raised: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let deadline = Instant::now() + WAIT;
+    while raised.len() < keys {
+        assert!(
+            Instant::now() < deadline,
+            "{} of {keys} keys' events were raised",
+            raised.len()
+        );
+        for listener in listeners.iter_mut() {
+            while let Some(Packet::Publish(p)) = listener.client.try_recv().await {
+                let key = String::from_utf8_lossy(&p.payload).into_owned();
+                raised.entry(key).or_default().push(listener.node.clone());
+            }
+        }
+    }
+    for listener in listeners.iter_mut() {
+        listener.mark().await;
+        while let Some(key) = listener.next().await {
+            raised.entry(key).or_default().push(listener.node.clone());
+        }
+    }
+    raised
+}
+
+/// How many members a node picks among for a key's expiry event, itself included.
+fn members(node: &Node) -> usize {
+    node.state.replication("seen").unwrap().expiry_members
+}
+
+fn links(node: &Node) -> usize {
+    node.state.replication("seen").unwrap().links
+}
+
+/// Every node has dealt with `expired` keys' expiries and keeps none for an event.
+async fn dealt(nodes: &[&Node], expired: u64) {
+    until("every node has dealt with every expiry", || {
+        nodes.iter().all(|node| {
+            let counts = node.state.counts("seen").unwrap();
+            (counts.expired, counts.expiry_backlog, counts.keys) == (expired, 0, 0)
+        })
+    })
+    .await;
+}
+
+/// T4's cluster acceptance: `$events/state/expired` fires on one node in a stable
+/// cluster. Sixty devices seen through three nodes fall silent; each key's event is
+/// raised once, and all three nodes raise some.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_keys_expiry_is_one_event_in_a_stable_cluster() {
+    let nodes = [
+        start_node_with("node-a", SILENT).await,
+        start_node_with("node-b", SILENT).await,
+        start_node_with("node-c", SILENT).await,
+    ];
+    let _links = [
+        link(&nodes[0], &nodes[1]),
+        link(&nodes[0], &nodes[2]),
+        link(&nodes[1], &nodes[2]),
+    ];
+    until("every node picks among three", || {
+        nodes.iter().all(|node| members(node) == 3)
+    })
+    .await;
+    let mut listeners = Vec::new();
+    let mut writers = Vec::new();
+    for node in &nodes {
+        listeners.push(Listener::on(node).await);
+        writers.push(Client::connect(node.addr, &format!("w-{}", node.id.0)).await);
+    }
+    for n in 0..60 {
+        publish(&mut writers[n % 3], "seen/x", &format!("dev-{n}")).await;
+    }
+    let raised = silent(&mut listeners, 60).await;
+    assert_eq!(raised.len(), 60);
+    for (key, by) in &raised {
+        assert_eq!(by.len(), 1, "{key} was raised by {by:?}");
+    }
+    for node in &nodes {
+        let share = raised.values().filter(|by| by[0] == node.id.0).count();
+        assert!(share > 0, "{} raised none", node.id.0);
+    }
+    dealt(&nodes.iter().collect::<Vec<_>>(), 60).await;
+}
+
+/// T4: at least once around a membership change. A member is cut off while it holds
+/// keys it was to raise the event of: the members that still reach each other raise
+/// every key's event between them, each once, and the one cut off raises them on its
+/// side. When the cluster is whole again a key's expiry is one event again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_member_that_goes_leaves_its_keys_events_to_the_others() {
+    let nodes = [
+        start_node_with("node-a", SILENT).await,
+        start_node_with("node-b", SILENT).await,
+        start_node_with("node-c", SILENT).await,
+    ];
+    let _ab = link(&nodes[0], &nodes[1]);
+    let (ac, bc) = (link(&nodes[0], &nodes[2]), link(&nodes[1], &nodes[2]));
+    until("every node picks among three", || {
+        nodes.iter().all(|node| members(node) == 3)
+    })
+    .await;
+    let mut listeners = Vec::new();
+    let mut writers = Vec::new();
+    for node in &nodes {
+        listeners.push(Listener::on(node).await);
+        writers.push(Client::connect(node.addr, &format!("w-{}", node.id.0)).await);
+    }
+    for n in 0..45 {
+        publish(&mut writers[n % 3], "seen/x", &format!("dev-{n}")).await;
+    }
+    until("every node holds every key", || {
+        nodes
+            .iter()
+            .all(|node| node.state.stats("seen").unwrap().keys == 45)
+    })
+    .await;
+    // C is cut off, before any key has expired.
+    ac.abort();
+    bc.abort();
+    until("the links to C are down", || {
+        links(&nodes[0]) == 1 && links(&nodes[1]) == 1 && links(&nodes[2]) == 0
+    })
+    .await;
+    let (rest, cut) = listeners.split_at_mut(2);
+    let raised = silent(rest, 45).await;
+    assert_eq!(raised.len(), 45, "none was left to the member that is gone");
+    for (key, by) in &raised {
+        assert_eq!(by.len(), 1, "{key} was raised by {by:?}");
+    }
+    let alone = silent(cut, 45).await;
+    assert!(alone.values().all(|by| by == &["node-c".to_string()]));
+    dealt(&nodes.iter().collect::<Vec<_>>(), 45).await;
+
+    // Healed: one event a key again, from any of the three.
+    let _healed = [link(&nodes[0], &nodes[2]), link(&nodes[1], &nodes[2])];
+    until("every node picks among three again", || {
+        nodes.iter().all(|node| members(node) == 3)
+    })
+    .await;
+    for n in 0..45 {
+        publish(&mut writers[n % 3], "seen/x", &format!("again-{n}")).await;
+    }
+    let raised = silent(&mut listeners, 45).await;
+    assert_eq!(raised.len(), 45);
+    for (key, by) in &raised {
+        assert!(key.starts_with("again-"), "{key}");
+        assert_eq!(by.len(), 1, "{key} was raised by {by:?}");
+    }
+    dealt(&nodes.iter().collect::<Vec<_>>(), 90).await;
+}
+
+/// Per-node rules files: a member whose rules do not select the event is never the
+/// one picked, so no key's event is left to it; it forgets the keys as they expire.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_member_without_a_rule_on_the_event_is_not_picked() {
+    let nodes = [
+        start_node_with("node-a", SILENT).await,
+        start_node_with("node-b", SEEN_ONLY).await,
+        start_node_with("node-c", SILENT).await,
+    ];
+    let _links = [
+        link(&nodes[0], &nodes[1]),
+        link(&nodes[0], &nodes[2]),
+        link(&nodes[1], &nodes[2]),
+    ];
+    until("A and C pick among two, B among none", || {
+        members(&nodes[0]) == 2 && members(&nodes[2]) == 2 && links(&nodes[1]) == 2
+    })
+    .await;
+    assert_eq!(members(&nodes[1]), 0);
+    let mut listeners = vec![Listener::on(&nodes[0]).await, Listener::on(&nodes[2]).await];
+    // Every key is written on the node that raises nothing.
+    let mut writer = Client::connect(nodes[1].addr, "w-b").await;
+    for n in 0..30 {
+        publish(&mut writer, "seen/x", &format!("dev-{n}")).await;
+    }
+    let raised = silent(&mut listeners, 30).await;
+    assert_eq!(raised.len(), 30);
+    for (key, by) in &raised {
+        assert_eq!(by.len(), 1, "{key} was raised by {by:?}");
+    }
+    dealt(&nodes.iter().collect::<Vec<_>>(), 30).await;
 }

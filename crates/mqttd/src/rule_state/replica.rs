@@ -29,21 +29,36 @@
 //! counts as a key until then. A key whose value has expired reads as absent at once
 //! and is forgotten when nothing would be lost by it
 //! ([`KeyState::forgettable`]).
+//!
+//! # A key's expiry as an event (D7)
+//!
+//! While a rule on this node selects `$events/state/expired`, an expired key is not
+//! simply forgotten: it **waits** ([`Waiting`]) until one member has raised its event.
+//! Every member whose rules select the event says so on its links, and the one that a
+//! hash of the namespace and the key picks among them ([`View::owner`], the cluster's
+//! rendezvous hash) raises it; the others keep the key until the picked member says
+//! how far it has got ([`Peer::said`]), and take it over if that member's link goes
+//! first. What waits is this node's own business. It is kept beside the map, not in
+//! it, and is never sent: a key that could be forgotten leaves the map when it would
+//! have anyway, and one that could not (its delete's window is still open) stays in
+//! the map exactly as every other member holds it, with a note here that its event
+//! is owed. So the digest of a copy with keys waiting is the digest of one without.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::{
-    AtomicU64, AtomicUsize,
+    AtomicBool, AtomicU64, AtomicUsize,
     Ordering::{Relaxed, SeqCst},
 };
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use mqtt_cluster::peer::STATE_PARTS;
+use mqtt_cluster::NodeId;
 use mqtt_rules::crdt::{
     normal, stable_hash, Counts, CountsError, Data, KeyState, Write, WriteError, Writer,
 };
 use mqtt_rules::state::{
-    written_len, NamespaceSettings, StateError, StateOp, StateReply, MAX_KEY_BYTES,
+    remembered, written_len, NamespaceSettings, StateError, StateOp, StateReply, MAX_KEY_BYTES,
     MAX_SET_ELEMENTS,
 };
 use mqtt_rules::Value;
@@ -68,6 +83,10 @@ const COUNTER_ROW_BYTES: usize = 32;
 /// The most keys a link encodes under one hold of a shard's lock: what a rule's call
 /// on that shard can be made to wait for.
 const HELD_KEYS: usize = 32;
+
+/// The most keys one pass of the sweep looks at in one copy: a mass expiry is worked
+/// through over several passes, and the task that sweeps is never kept for longer.
+const SWEEP_KEYS: usize = 4096;
 
 /// How many of a shard's unread changes [`Replica::stats`] counts one by one.
 const COUNTED: usize = 64;
@@ -138,6 +157,11 @@ pub struct Replication {
     pub merged: u64,
     /// States and frames refused, in the order of [`Refused::ALL`].
     pub refused: [u64; Refused::ALL.len()],
+    /// The members one of which raises a key's expiry event (D7), as this node
+    /// sees them: itself and every peer whose rules select the event, over a link
+    /// whose copies have been compared. `0` while this node's own rules do not
+    /// select it: it then raises none and keeps no key for one.
+    pub expiry_members: usize,
 }
 
 impl Replication {
@@ -164,6 +188,132 @@ struct Entry {
     changed: u64,
     /// Its place in the shard's order of forgetting; `0`: not in it.
     due: u64,
+    /// The expiry that has been dealt with: counted, and where its event is owed
+    /// noted in the shard's waiting keys. `0`: none. A write or a merge that moves
+    /// the expiry makes this an old one. Not part of the state: never sent, never
+    /// hashed.
+    evented: u64,
+    /// Where the shard's waiting keys note this key while it stays in the map; `0`:
+    /// they do not.
+    waiting: u64,
+}
+
+/// An expired key whose event has yet to be raised, by this node or by another.
+#[derive(Debug)]
+struct Waiting {
+    key: Arc<[u8]>,
+    /// When it expired.
+    expired_ms: u64,
+    /// The link to the member that is to raise the event; `0`: this node is.
+    owner: u64,
+    /// What it held and what that is accounted as, once the key is out of the map
+    /// or holds something else; `None` while the map still holds it as it expired.
+    body: Option<(KeyState, usize)>,
+}
+
+/// An expired key the sweep hands over for its event.
+#[derive(Debug)]
+pub(super) struct Raised {
+    pub(super) key: Arc<[u8]>,
+    /// The key's state as it expired: what it held is read out of it with no lock
+    /// held.
+    pub(super) state: KeyState,
+    pub(super) expired_ms: u64,
+}
+
+/// Another member, as this node's link to it knows it: what picking the member that
+/// raises a key's expiry event goes by. Held by the link; the copy holds it weakly,
+/// so a link that is gone is a member that is gone.
+#[derive(Debug)]
+pub(super) struct Peer {
+    /// Which of the node's links this is.
+    link: u64,
+    node: NodeId,
+    /// Whether its rules select the expiry event, as it last said.
+    raises: AtomicBool,
+    /// Whether its copy has been compared with this one since the link came up: a
+    /// member that has just started holds nothing yet, and would raise nothing.
+    settled: AtomicBool,
+    /// The second up to which it has nothing left to raise, as it last said.
+    swept: AtomicU64,
+}
+
+impl Peer {
+    /// What the peer said of itself
+    /// ([`StateExpiry`](mqtt_cluster::peer::PeerMessage::StateExpiry)).
+    pub(super) fn said(&self, raises: bool, swept: u64) {
+        self.raises.store(raises, Relaxed);
+        self.swept.store(swept, Relaxed);
+    }
+
+    /// Its copy and this one have been compared.
+    pub(super) fn settle(&self) {
+        self.settled.store(true, Relaxed);
+    }
+
+    pub(super) fn settled(&self) -> bool {
+        self.settled.load(Relaxed)
+    }
+}
+
+/// The members that raise a namespace's expiry events, as this node sees them now:
+/// itself, and every peer that says it does over a link whose copies were compared.
+struct View {
+    /// This node first, then `peers`' nodes.
+    nodes: Vec<NodeId>,
+    peers: Vec<Arc<Peer>>,
+    namespace: Arc<str>,
+}
+
+impl View {
+    /// Who raises the event of `key`: the link to that member, or `0` for this node.
+    /// The same rendezvous hash that places sessions (`mqtt_cluster::hrw`), over the
+    /// namespace and the key, so every member with the same view picks the same one.
+    fn owner(&self, key: &[u8]) -> u64 {
+        if self.peers.is_empty() {
+            return 0;
+        }
+        let mut named = Vec::with_capacity(self.namespace.len() + 1 + key.len());
+        named.extend_from_slice(self.namespace.as_bytes());
+        named.push(0);
+        named.extend_from_slice(key);
+        let picked = mqtt_cluster::hrw::owner(&named, &self.nodes);
+        self.nodes
+            .iter()
+            .zip(std::iter::once(0).chain(self.peers.iter().map(|peer| peer.link)))
+            .find(|(node, _)| Some(*node) == picked)
+            .map_or(0, |(_, link)| link)
+    }
+
+    fn peer(&self, link: u64) -> Option<&Peer> {
+        self.peers
+            .iter()
+            .find(|peer| peer.link == link)
+            .map(|peer| &**peer)
+    }
+}
+
+/// What looking at a shard's keys that are due did.
+#[derive(Debug, Default, Clone, Copy)]
+struct Visited {
+    /// Keys looked at.
+    looked: usize,
+    /// Keys taken out with their room given back.
+    removed: usize,
+}
+
+/// What a pass of the sweep over one copy found ([`Replica::forget_due`]).
+#[derive(Debug, Default)]
+pub(super) struct Forgotten {
+    /// Keys forgotten with no event owed by this node.
+    pub(super) removed: usize,
+    /// The second the next key is due in; `None`: none is.
+    pub(super) next_due: Option<u64>,
+    /// Whether keys are due that this pass did not get to.
+    pub(super) more: bool,
+    /// Per shard that has some, the second its earliest key this node is to raise
+    /// the event of expired in.
+    pub(super) held: Vec<(usize, u64)>,
 }
 
 #[derive(Debug, Default)]
@@ -183,6 +333,37 @@ struct Shard {
     /// keys per hold of the lock, that the map changed under it (D10). **Every
     /// `map.insert` and `map.remove` in this file counts here.**
     changes: u64,
+    /// The expired keys whose event this node is to raise, by the second they
+    /// expired in and the order they were found in. Empty, and no allocation, unless
+    /// a rule on this node selects the event.
+    held: BTreeMap<(u64, u64), Waiting>,
+    /// Those another member is to raise: kept until it says it has, or is gone.
+    standby: BTreeMap<(u64, u64), Waiting>,
+    /// The next place in `held` and `standby`.
+    waits: u64,
+}
+
+impl Shard {
+    /// Note a key whose event is owed; where.
+    fn wait(&mut self, waiting: Waiting) -> u64 {
+        self.waits += 1;
+        let at = (waiting.expired_ms.div_ceil(1000), self.waits);
+        if waiting.owner == 0 {
+            self.held.insert(at, waiting);
+        } else {
+            self.standby.insert(at, waiting);
+        }
+        self.waits
+    }
+
+    /// The note of a key that is still in the map, which expired at `expired_ms`.
+    fn waiting_mut(&mut self, expired_ms: u64, place: u64) -> Option<&mut Waiting> {
+        let at = (expired_ms.div_ceil(1000), place);
+        match self.held.get_mut(&at) {
+            Some(waiting) => Some(waiting),
+            None => self.standby.get_mut(&at),
+        }
+    }
 }
 
 /// What a shard tells readers that do not take its lock. A cache line of its own:
@@ -240,9 +421,23 @@ pub(super) struct Replica {
     repairing: Mutex<Option<(u64, Instant)>>,
     refused: [AtomicU64; Refused::ALL.len()],
     merged: AtomicU64,
-    /// Keys forgotten whose value had expired (D10's `expired`): not the deleted
+    /// Keys whose expiry has been dealt with (D10's `expired`): forgotten, or their
+    /// event handed over, or left to the member that raised it. Not the deleted
     /// ones, whose tombstone's window ran out.
     expired: AtomicU64,
+    /// The other members, as the links to them know them.
+    peers: Mutex<Vec<Weak<Peer>>>,
+    /// The keys that wait for their event, here or on another member.
+    waiting: AtomicU64,
+    /// Those of them another member is to raise.
+    standing_by: AtomicU64,
+    /// The links of the members last picked among: a change means every key that
+    /// stands by is looked at again.
+    picked_among: Mutex<Vec<u64>>,
+    /// The second up to which this node has nothing left to raise.
+    swept: AtomicU64,
+    /// Raised when `swept` is worth telling the peers at once.
+    announce: AtomicU64,
 }
 
 /// What a link that wants to start a repair is told ([`Replica::repair_begin`]).
@@ -305,15 +500,23 @@ fn weigh(data: &Data) -> usize {
     }
 }
 
-/// The second from which `state` is forgettable if nothing changes; `0`: never.
-fn due_slot(state: &KeyState, window_ms: u64) -> u64 {
+/// The second in which `state` is next to be looked at if nothing changes: when what
+/// it holds expires, unless that expiry has been dealt with (`evented`), and then
+/// when it is forgettable. `0`: never.
+fn due_slot(state: &KeyState, window_ms: u64, evented: u64) -> u64 {
     let window_over = state.deleted().ms().saturating_add(window_ms);
     let at = match state.data() {
         None => window_over,
         Some(_) if state.expires_ms() == 0 => return 0,
+        Some(_) if state.expires_ms() != evented => state.expires_ms(),
         Some(_) => state.expires_ms().max(window_over),
     };
     at.div_ceil(1000).max(1)
+}
+
+/// Whether what `state` holds has expired by `now_ms`.
+fn expired(state: &KeyState, now_ms: u64) -> bool {
+    state.data().is_some() && state.expires_ms() != 0 && state.expires_ms() <= now_ms
 }
 
 /// Put `entry` at `slot` in the order of forgetting.
@@ -349,11 +552,9 @@ fn resize(ns: &Namespace, entry: &mut Entry, bytes: usize) {
     entry.bytes = bytes;
 }
 
-/// Take `key` out of `shard` and give its room back.
-fn remove(ns: &Namespace, shard: &mut Shard, key: &[u8]) {
-    let Some(entry) = shard.map.remove(key) else {
-        return;
-    };
+/// Take `key` out of `shard`'s map and orders. Its room is still accounted.
+fn detach(shard: &mut Shard, key: &[u8]) -> Option<Entry> {
+    let entry = shard.map.remove(key)?;
     shard.changes = shard.changes.wrapping_add(1);
     if entry.changed != 0 {
         shard.changed.remove(&entry.changed);
@@ -361,9 +562,21 @@ fn remove(ns: &Namespace, shard: &mut Shard, key: &[u8]) {
     if entry.due != 0 {
         shard.due.remove(&(entry.due, entry.key.clone()));
     }
+    Some(entry)
+}
+
+/// Give back the room of a key that is gone.
+fn release(ns: &Namespace, bytes: usize) {
     ns.keys.fetch_sub(1, Relaxed);
-    ns.bytes.fetch_sub(wide(entry.bytes), Relaxed);
-    ns.shared.bytes.fetch_sub(wide(entry.bytes), Relaxed);
+    ns.bytes.fetch_sub(wide(bytes), Relaxed);
+    ns.shared.bytes.fetch_sub(wide(bytes), Relaxed);
+}
+
+/// Take `key` out of `shard` and give its room back.
+fn remove(ns: &Namespace, shard: &mut Shard, key: &[u8]) {
+    if let Some(entry) = detach(shard, key) {
+        release(ns, entry.bytes);
+    }
 }
 
 /// The time a call is made at.
@@ -402,6 +615,12 @@ impl Replica {
             refused: Default::default(),
             merged: AtomicU64::new(0),
             expired: AtomicU64::new(0),
+            peers: Mutex::new(Vec::new()),
+            waiting: AtomicU64::new(0),
+            standing_by: AtomicU64::new(0),
+            picked_among: Mutex::new(Vec::new()),
+            swept: AtomicU64::new(0),
+            announce: AtomicU64::new(0),
         }
     }
 
@@ -492,6 +711,7 @@ impl Replica {
             if held.is_some_and(|entry| entry.state.live(now.ms).is_some()) {
                 return Ok(Step::Done(false));
             }
+            let lapsed = held.is_some_and(|entry| expired(&entry.state, now.ms));
             let since = Value::Int(i64::try_from(now.ms).unwrap_or(i64::MAX));
             let window = Some(handle.settings.dedupe_window_secs);
             let write = Write::SetOnce(&since);
@@ -504,6 +724,7 @@ impl Replica {
                 window,
                 NUMBER_BYTES,
                 &now,
+                lapsed,
                 |_| true,
             )
         })?;
@@ -555,16 +776,21 @@ impl Replica {
         let step = {
             let mut guard = lock_shard(&self.shards[at]);
             let shard = &mut *guard;
+            let held = shard.map.get(key);
+            // Whether what the key held has expired: a write then starts it afresh,
+            // and what it held may be owed an event (D7).
+            let lapsed = held.is_some_and(|entry| expired(&entry.state, now.ms));
             // What the key holds now, and what that is accounted as.
-            let live = shard.map.get(key).and_then(|entry| {
+            let live = held.and_then(|entry| {
                 let data = entry.state.live(now.ms)?;
                 Some((data, entry.bytes.saturating_sub(BASE + key.len())))
             });
             macro_rules! write {
                 ($write:expr, $ttl:expr, $carried:expr, $reply:expr) => {{
                     let write = $write;
-                    let step =
-                        self.write(handle, shard, at, key, &write, $ttl, $carried, &now, $reply)?;
+                    let step = self.write(
+                        handle, shard, at, key, &write, $ttl, $carried, &now, lapsed, $reply,
+                    )?;
                     wrote = true;
                     step
                 }};
@@ -719,8 +945,8 @@ impl Replica {
 
     /// One write to `key` in its shard: the state changes, its room is accounted and
     /// the key takes its place in the orders of change and of forgetting. `carried`
-    /// is the size of the value or element the write brings. `answer` reads the reply
-    /// off the state the write left.
+    /// is the size of the value or element the write brings. `lapsed`: what the key
+    /// held has expired. `answer` reads the reply off the state the write left.
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     fn write<R>(
         &self,
@@ -732,6 +958,7 @@ impl Replica {
         ttl: Option<u64>,
         carried: usize,
         now: &Now<'_>,
+        lapsed: bool,
         answer: impl FnOnce(&KeyState) -> R,
     ) -> Result<Step<R>, StateError> {
         let ns = &*handle.namespace;
@@ -773,8 +1000,17 @@ impl Replica {
                     hash: 0,
                     changed: 0,
                     due: 0,
+                    evented: 0,
+                    waiting: 0,
                 },
             );
+        } else if lapsed {
+            // What the key held is kept for its event, where that is owed: it needs
+            // room of its own beside what is being written, as a new key would.
+            let kept = self.displace(ns, shard, key, now.ms, |bytes| ns.reserve(settings, bytes));
+            if let Err(refusal) = kept {
+                return Ok(Step::NeedRoom(refusal));
+            }
         }
         let Shard {
             map,
@@ -837,10 +1073,455 @@ impl Replica {
             // `SeqCst`, and before the links are told: see `Wake::ping`.
             self.marks[at].last.store(*last, SeqCst);
         }
-        let slot = due_slot(&entry.state, self.window_ms.load(Relaxed));
+        let slot = due_slot(&entry.state, self.window_ms.load(Relaxed), entry.evented);
         set_due(due, entry, slot);
         self.marks[at].mutations.fetch_add(1, Relaxed);
         Ok(Step::Done(reply))
+    }
+
+    // -- a key's expiry as an event (D7) --------------------------------------------------
+
+    /// The link to another member registers it: `remote`, over the node's link
+    /// `link`.
+    pub(super) fn join(&self, link: u64, remote: &str) -> Arc<Peer> {
+        let peer = Arc::new(Peer {
+            link,
+            node: NodeId(remote.to_string()),
+            raises: AtomicBool::new(false),
+            settled: AtomicBool::new(false),
+            swept: AtomicU64::new(0),
+        });
+        let mut peers = lock(&self.peers);
+        peers.retain(|peer| peer.strong_count() > 0);
+        peers.push(Arc::downgrade(&peer));
+        peer
+    }
+
+    /// The members that raise this namespace's expiry events now. Of two links to
+    /// one node (an old one not yet gone) the newer counts.
+    fn view(&self, ns: &Namespace) -> View {
+        let mut peers: Vec<Arc<Peer>> = lock(&self.peers)
+            .iter()
+            .filter_map(Weak::upgrade)
+            .filter(|peer| peer.raises.load(Relaxed) && peer.settled.load(Relaxed))
+            .collect();
+        peers.sort_by(|a, b| (&a.node.0, b.link).cmp(&(&b.node.0, a.link)));
+        peers.dedup_by(|later, first| later.node == first.node);
+        let me = NodeId(ns.shared.node().id.to_string());
+        View {
+            nodes: std::iter::once(me)
+                .chain(peers.iter().map(|peer| peer.node.clone()))
+                .collect(),
+            peers,
+            namespace: ns.name.clone(),
+        }
+    }
+
+    /// The second up to which this node has nothing left to raise, and the count
+    /// that is raised when that is worth telling the peers at once.
+    pub(super) fn swept(&self) -> (u64, u64) {
+        // The count first: it is raised after the second is stored, so a reader
+        // that sees the count has the second it stands for, or a later one.
+        let announce = self.announce.load(SeqCst);
+        (self.swept.load(SeqCst), announce)
+    }
+
+    /// A key waits for its event, to be raised by `owner`.
+    fn count_waiting(&self, owner: u64) {
+        self.waiting.fetch_add(1, Relaxed);
+        if owner != 0 {
+            self.standing_by.fetch_add(1, Relaxed);
+        }
+    }
+
+    /// A key that waited no longer does: its expiry has been dealt with.
+    fn count_dealt(&self, owner: u64) {
+        self.waiting.fetch_sub(1, Relaxed);
+        if owner != 0 {
+            self.standing_by.fetch_sub(1, Relaxed);
+        }
+        self.expired.fetch_add(1, Relaxed);
+    }
+
+    /// `key` is about to hold something else than what expired in it (a rule writes
+    /// it, or a state arrives): what it held is kept for its event, where that is
+    /// owed and has not been raised. `reserve` finds the room that takes: the key
+    /// then counts twice, as what waits and as what it holds next. `Err`: there is
+    /// none, and nothing was changed.
+    fn displace(
+        &self,
+        ns: &Namespace,
+        shard: &mut Shard,
+        key: &[u8],
+        now_ms: u64,
+        reserve: impl FnOnce(usize) -> Result<(), Refusal>,
+    ) -> Result<(), Refusal> {
+        let Some(entry) = shard.map.get_mut(key) else {
+            return Ok(());
+        };
+        if !expired(&entry.state, now_ms) {
+            return Ok(());
+        }
+        let expired_ms = entry.state.expires_ms();
+        let bytes = entry.bytes;
+        if entry.waiting != 0 {
+            // Owed, and noted while the map held it: the note takes what it held.
+            reserve(bytes)?;
+            let place = std::mem::take(&mut entry.waiting);
+            let state = entry.state.clone();
+            match shard.waiting_mut(expired_ms, place) {
+                Some(waiting) => waiting.body = Some((state, bytes)),
+                None => release(ns, bytes),
+            }
+            return Ok(());
+        }
+        if entry.evented == expired_ms {
+            return Ok(());
+        }
+        // A remembered idempotency key (D8) raises no event: nothing is kept of it.
+        if !ns.shared.expiry_events.load(Relaxed) || remembered(key).is_some() {
+            entry.evented = expired_ms;
+            self.expired.fetch_add(1, Relaxed);
+            return Ok(());
+        }
+        reserve(bytes)?;
+        entry.evented = expired_ms;
+        let (key, state) = (entry.key.clone(), entry.state.clone());
+        let owner = self.view(ns).owner(&key);
+        shard.wait(Waiting {
+            key,
+            expired_ms,
+            owner,
+            body: Some((state, bytes)),
+        });
+        self.count_waiting(owner);
+        Ok(())
+    }
+
+    /// Look at the keys of `shard` that are due, at most [`PURGE_BATCH`] of them: the
+    /// caller holds the shard's lock. A key whose value expired has that expiry
+    /// dealt with, once: counted, or, where a rule selects the event, noted as
+    /// waiting for it. A key nothing is lost by forgetting leaves the map.
+    fn visit(
+        &self,
+        ns: &Namespace,
+        shard: &mut Shard,
+        now_ms: u64,
+        view: &mut Option<View>,
+    ) -> Visited {
+        let window_ms = self.window_ms.load(Relaxed);
+        let raises = ns.shared.expiry_events.load(Relaxed);
+        let mut visited = Visited::default();
+        while visited.looked < PURGE_BATCH {
+            let is_due = shard
+                .due
+                .first()
+                .is_some_and(|(slot, _)| slot.saturating_mul(1000) <= now_ms);
+            let Some((slot, key)) = is_due.then(|| shard.due.pop_first()).flatten() else {
+                break;
+            };
+            visited.looked += 1;
+            let Some(entry) = shard.map.get_mut(&*key) else {
+                continue;
+            };
+            if entry.due != slot {
+                continue;
+            }
+            entry.due = 0;
+            let expired_ms = entry.state.expires_ms();
+            let forgettable = entry.state.forgettable(now_ms, window_ms);
+            let owed = expired(&entry.state, now_ms) && entry.evented != expired_ms;
+            if owed {
+                entry.evented = expired_ms;
+            }
+            // A remembered idempotency key (D8) raises no event, on any member: it is
+            // forgotten as where no rule selects the event, and waits for nothing.
+            let events = raises && remembered(&key).is_none();
+            if owed && !events {
+                self.expired.fetch_add(1, Relaxed);
+            }
+            if owed && events {
+                let owner = view.get_or_insert_with(|| self.view(ns)).owner(&key);
+                self.count_waiting(owner);
+                let body = if forgettable {
+                    // Out of the map, as on every member; its room stays accounted
+                    // until its event has been dealt with.
+                    detach(shard, &key).map(|entry| (entry.state, entry.bytes))
+                } else {
+                    None
+                };
+                let place = shard.wait(Waiting {
+                    key: key.clone(),
+                    expired_ms,
+                    owner,
+                    body,
+                });
+                if forgettable {
+                    continue;
+                }
+                if let Some(entry) = shard.map.get_mut(&*key) {
+                    entry.waiting = place;
+                }
+            } else if forgettable {
+                if entry.waiting != 0 {
+                    // Its event is still owed: the note takes what it held, and its
+                    // room with it.
+                    let place = entry.waiting;
+                    let noted = entry.evented;
+                    let body = detach(shard, &key).map(|entry| (entry.state, entry.bytes));
+                    match (shard.waiting_mut(noted, place), body) {
+                        (Some(waiting), Some(body)) => waiting.body = Some(body),
+                        (_, Some((_, bytes))) => release(ns, bytes),
+                        _ => {}
+                    }
+                } else {
+                    remove(ns, shard, &key);
+                    visited.removed += 1;
+                }
+                continue;
+            }
+            // Not to be forgotten yet (its delete's window is open, or was made
+            // longer since): it is due again when it can be.
+            if let Some(entry) = shard.map.get_mut(&*key) {
+                let slot = due_slot(&entry.state, window_ms, entry.evented);
+                set_due(&mut shard.due, entry, slot);
+            }
+        }
+        visited
+    }
+
+    /// What `waiting` held, taken out of `shard`: from the note, or from the map
+    /// where the key still is as it expired. Its room is given back.
+    fn take_waiting(
+        ns: &Namespace,
+        shard: &mut Shard,
+        at: (u64, u64),
+        waiting: Waiting,
+    ) -> Option<Raised> {
+        let state = match waiting.body {
+            Some((state, bytes)) => {
+                release(ns, bytes);
+                Some(state)
+            }
+            None => shard
+                .map
+                .get_mut(&*waiting.key)
+                .filter(|entry| entry.waiting == at.1)
+                .map(|entry| {
+                    entry.waiting = 0;
+                    entry.state.clone()
+                }),
+        }?;
+        Some(Raised {
+            key: waiting.key,
+            state,
+            expired_ms: waiting.expired_ms,
+        })
+    }
+
+    /// One pass of the sweep over this copy, apart from handing events over: every
+    /// key that is due is looked at ([`visit`](Self::visit)), a batch per hold of a
+    /// shard's lock, and the keys that stand by for another member's event are let
+    /// go where that member has got past them, or taken over where it is gone.
+    /// Without a rule on the event nothing waits, and what did is let go.
+    pub(super) fn forget_due(&self, ns: &Namespace) -> Forgotten {
+        let now_ms = Self::now_ms(ns);
+        let events = ns.shared.expiry_events.load(Relaxed);
+        let mut view = events.then(|| self.view(ns));
+        // How far the keys that stand by are looked at: as far as any member has
+        // got, and all of them when the members are not those of the last pass.
+        let mut reach = u64::MAX;
+        if let Some(view) = &view {
+            let links: Vec<u64> = view.peers.iter().map(|peer| peer.link).collect();
+            let mut last = lock(&self.picked_among);
+            if *last == links {
+                let swept = view.peers.iter().map(|peer| peer.swept.load(Relaxed));
+                reach = swept.max().unwrap_or(0);
+            }
+            *last = links;
+        }
+        let mut found = Forgotten::default();
+        let mut looked = 0;
+        for (at, shard) in self.shards.iter().enumerate() {
+            let mut guard = lock_shard(shard);
+            while looked < SWEEP_KEYS {
+                let visited = self.visit(ns, &mut guard, now_ms, &mut view);
+                found.removed += visited.removed;
+                looked += visited.looked;
+                if visited.looked < PURGE_BATCH {
+                    break;
+                }
+                // A rule's call on this shard waits for one batch at the most.
+                drop(guard);
+                guard = lock_shard(shard);
+            }
+            if !events && (!guard.held.is_empty() || !guard.standby.is_empty()) {
+                self.let_go(ns, &mut guard);
+            }
+            if let Some(view) = view.as_ref().filter(|_| !guard.standby.is_empty()) {
+                drop(guard);
+                self.stand_by(ns, shard, view, reach);
+                guard = lock_shard(shard);
+            }
+            if let Some((slot, _)) = guard.due.first() {
+                found.next_due = Some(found.next_due.map_or(*slot, |due| due.min(*slot)));
+                found.more |= slot.saturating_mul(1000) <= now_ms;
+            }
+            if let Some(((slot, _), _)) = guard.held.first_key_value() {
+                found.held.push((at, *slot));
+            }
+        }
+        found
+    }
+
+    /// No rule selects the event any more: what waited in `shard` is let go.
+    fn let_go(&self, ns: &Namespace, shard: &mut Shard) {
+        let held = std::mem::take(&mut shard.held);
+        let standby = std::mem::take(&mut shard.standby);
+        for (at, waiting) in held.into_iter().chain(standby) {
+            let owner = waiting.owner;
+            let _ = Self::take_waiting(ns, shard, at, waiting);
+            self.count_dealt(owner);
+        }
+    }
+
+    /// The keys of `shard` that stand by for another member's event, those that
+    /// expired in the second `reach` or before: one whose member has got past it is
+    /// let go; one whose member is gone, or no longer raises, is given to the member
+    /// picked now, which may be this node. A batch per hold of the lock.
+    fn stand_by(&self, ns: &Namespace, shard: &Mutex<Shard>, view: &View, reach: u64) {
+        let mut from = (0, 0);
+        loop {
+            let mut guard = lock_shard(shard);
+            let shard = &mut *guard;
+            let some: Vec<(u64, u64)> = shard
+                .standby
+                .range(from..=(reach, u64::MAX))
+                .take(PURGE_BATCH)
+                .map(|(at, _)| *at)
+                .collect();
+            for at in &some {
+                let Some(waiting) = shard.standby.get_mut(at) else {
+                    continue;
+                };
+                let mut owner = view.peer(waiting.owner);
+                if owner.is_none() {
+                    let picked = view.owner(&waiting.key);
+                    if picked == 0 {
+                        // This node's to raise now.
+                        if let Some(mut waiting) = shard.standby.remove(at) {
+                            waiting.owner = 0;
+                            shard.held.insert(*at, waiting);
+                            self.standing_by.fetch_sub(1, Relaxed);
+                        }
+                        continue;
+                    }
+                    waiting.owner = picked;
+                    owner = view.peer(picked);
+                }
+                if owner.is_some_and(|peer| peer.swept.load(Relaxed) >= at.0) {
+                    if let Some(waiting) = shard.standby.remove(at) {
+                        let owner = waiting.owner;
+                        let _ = Self::take_waiting(ns, shard, *at, waiting);
+                        self.count_dealt(owner);
+                    }
+                }
+            }
+            match some.last() {
+                Some(last) if some.len() == PURGE_BATCH => from = (last.0, last.1 + 1),
+                _ => return,
+            }
+        }
+    }
+
+    /// Take out of shard `at` the keys this node is to raise the event of that
+    /// expired in the second `slot` or before, earliest first, at most `max`, giving
+    /// each to `each`. Returns the second the shard's next such key expired in.
+    pub(super) fn pop_held(
+        &self,
+        ns: &Namespace,
+        at: usize,
+        slot: u64,
+        max: usize,
+        each: &mut dyn FnMut(Raised),
+    ) -> Option<u64> {
+        let mut guard = lock_shard(&self.shards[at]);
+        let shard = &mut *guard;
+        let mut taken = 0;
+        while taken < max {
+            let Some(first) = shard
+                .held
+                .first_entry()
+                .filter(|first| first.key().0 <= slot)
+            else {
+                break;
+            };
+            let (place, waiting) = first.remove_entry();
+            self.count_dealt(0);
+            if let Some(raised) = Self::take_waiting(ns, shard, place, waiting) {
+                each(raised);
+                taken += 1;
+            }
+        }
+        shard.held.first_key_value().map(|((slot, _), _)| *slot)
+    }
+
+    /// After a pass of the sweep: this node has nothing left to raise that expired
+    /// in the second `swept` or before. `raised`: whether the pass handed any event
+    /// of this namespace over. Whether the peers are to be told at once: they are
+    /// when the pass got somewhere, and when this node took keys over and is behind
+    /// where it said it was.
+    pub(super) fn note_swept(&self, swept: u64, raised: bool) -> bool {
+        let before = self.swept.swap(swept, SeqCst);
+        let tell = swept != before && (raised || swept < before);
+        if tell {
+            self.announce.fetch_add(1, SeqCst);
+        }
+        tell
+    }
+
+    /// Take `key` out if its value has expired and its event has not been raised,
+    /// wherever it is: for a replayed sequence, which is one node and raises every
+    /// key's event itself.
+    pub(super) fn take_expired(&self, ns: &Namespace, key: &[u8]) -> Option<Raised> {
+        let now_ms = Self::now_ms(ns);
+        let window_ms = self.window_ms.load(Relaxed);
+        let mut guard = lock_shard(&self.shards[ns.shard_of(key)]);
+        let shard = &mut *guard;
+        let noted = shard
+            .held
+            .iter()
+            .chain(shard.standby.iter())
+            .find(|(_, waiting)| &*waiting.key == key)
+            .map(|(at, waiting)| (*at, waiting.owner));
+        if let Some((at, owner)) = noted {
+            let waiting = if owner == 0 {
+                shard.held.remove(&at)
+            } else {
+                shard.standby.remove(&at)
+            }?;
+            self.count_dealt(owner);
+            return Self::take_waiting(ns, shard, at, waiting);
+        }
+        let entry = shard.map.get_mut(key)?;
+        let expired_ms = entry.state.expires_ms();
+        if !expired(&entry.state, now_ms) || entry.evented == expired_ms {
+            return None;
+        }
+        entry.evented = expired_ms;
+        self.expired.fetch_add(1, Relaxed);
+        let raised = Raised {
+            key: entry.key.clone(),
+            state: entry.state.clone(),
+            expired_ms,
+        };
+        if entry.state.forgettable(now_ms, window_ms) {
+            remove(ns, shard, key);
+        } else {
+            let slot = due_slot(&entry.state, window_ms, expired_ms);
+            set_due(&mut shard.due, entry, slot);
+        }
+        Some(raised)
     }
 
     /// A write its key refused, as the rule's error.
@@ -885,38 +1566,10 @@ impl Replica {
     // -- forgetting ---------------------------------------------------------------------
 
     /// Forget keys of `shard` that nothing is lost by forgetting, at most
-    /// [`PURGE_BATCH`] of them: the caller holds the shard's lock. Whether any went.
+    /// [`PURGE_BATCH`] of them: the caller holds the shard's lock. Whether any went
+    /// and gave its room back (one that waits for its event keeps its room).
     fn purge(&self, ns: &Namespace, shard: &mut Shard, now_ms: u64) -> bool {
-        let window_ms = self.window_ms.load(Relaxed);
-        let mut any = false;
-        for _ in 0..PURGE_BATCH {
-            let is_due = shard
-                .due
-                .first()
-                .is_some_and(|(slot, _)| slot.saturating_mul(1000) <= now_ms);
-            let Some((slot, key)) = is_due.then(|| shard.due.pop_first()).flatten() else {
-                break;
-            };
-            let Some(entry) = shard.map.get_mut(&*key) else {
-                continue;
-            };
-            if entry.due != slot {
-                continue;
-            }
-            entry.due = 0;
-            if entry.state.forgettable(now_ms, window_ms) {
-                if entry.state.data().is_some() {
-                    self.expired.fetch_add(1, Relaxed);
-                }
-                remove(ns, shard, &key);
-                any = true;
-            } else {
-                // The window was made longer since: it is due later.
-                let slot = due_slot(&entry.state, window_ms);
-                set_due(&mut shard.due, entry, slot);
-            }
-        }
-        any
+        self.visit(ns, shard, now_ms, &mut None).removed > 0
     }
 
     /// Look through the shards for keys to forget, one lock at a time, and stop at
@@ -1009,8 +1662,16 @@ impl Replica {
                 hash: their_hash,
                 changed: 0,
                 due: 0,
+                evented: 0,
+                waiting: 0,
             };
-            let slot = due_slot(&entry.state, window_ms);
+            // What had already expired when it arrived (a key remembered for its
+            // delete, sent to a node that is being filled) expired before this node
+            // held it: no event is owed for it here.
+            if expired(&entry.state, now_ms) {
+                entry.evented = entry.state.expires_ms();
+            }
+            let slot = due_slot(&entry.state, window_ms, entry.evented);
             set_due(&mut shard.due, &mut entry, slot);
             shard.changes = shard.changes.wrapping_add(1);
             shard.map.insert(key, entry);
@@ -1022,6 +1683,24 @@ impl Replica {
         // Merged aside, so that a state that does not fit leaves this one as it was.
         let mut merged = entry.state.clone();
         merged.merge(&theirs);
+        // What this copy held had expired here before this state arrived, and the
+        // state would undo that (a later expiry, another value, a delete): the expiry
+        // stands, as this node saw it, and what the key held is kept for its event.
+        if expired(&entry.state, now_ms)
+            && (merged.data().is_none() || merged.expires_ms() != entry.state.expires_ms())
+        {
+            let (max_keys, max_bytes) = (self.max_keys.load(Relaxed), self.max_bytes.load(Relaxed));
+            self.displace(ns, shard, key, now_ms, |bytes| {
+                ns.reserve_within(max_keys, max_bytes, bytes)
+            })
+            .map_err(|refusal| match refusal {
+                Refusal::StoreFull => Refused::StoreFull,
+                _ => Refused::NamespaceFull,
+            })?;
+        }
+        let Some(entry) = shard.map.get_mut(key) else {
+            return Ok(false);
+        };
         let bytes = base + merged.data().map_or(0, weigh);
         if bytes > entry.bytes {
             let more = wide(bytes - entry.bytes);
@@ -1038,7 +1717,7 @@ impl Replica {
         }
         entry.state = merged;
         entry.hash = 0;
-        let slot = due_slot(&entry.state, window_ms);
+        let slot = due_slot(&entry.state, window_ms, entry.evented);
         set_due(&mut shard.due, entry, slot);
         Ok(true)
     }
@@ -1373,15 +2052,24 @@ impl Replica {
                     .count(),
             );
         }
-        (ops, self.expired.load(Relaxed), backlog)
+        (
+            ops,
+            self.expired.load(Relaxed),
+            backlog + self.waiting.load(Relaxed),
+        )
     }
 
     /// How replication stands, the wall clock reading `wall_ms`.
-    pub(super) fn stats(&self, wall_ms: u64) -> Replication {
+    pub(super) fn stats(&self, ns: &Namespace, wall_ms: u64) -> Replication {
         let links: Vec<Arc<Cursors>> = lock(&self.links).iter().filter_map(Weak::upgrade).collect();
         let mut stats = Replication {
             links: links.len(),
             merged: self.merged.load(Relaxed),
+            expiry_members: if ns.shared.expiry_events.load(Relaxed) {
+                self.view(ns).nodes.len()
+            } else {
+                0
+            },
             ..Replication::default()
         };
         for (count, refused) in stats.refused.iter_mut().zip(&self.refused) {

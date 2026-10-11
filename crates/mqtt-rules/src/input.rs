@@ -1341,16 +1341,22 @@ impl EventInput {
                 Self::message_dropped(c.node, &msg, no_props(), "no_subscribers")
             }
             EventKind::DeliveryDropped => Self::delivery_dropped(c, &msg, no_props(), "queue_full"),
-            EventKind::StateExpired => Self::state_expired(
-                c.node,
-                &StateExpiry {
-                    namespace: "sample",
-                    key: topic.as_bytes(),
-                    value: Value::from_bytes(payload),
-                    kind: "lww",
-                    expired_at_ms: now,
-                },
-            ),
+            EventKind::StateExpired => {
+                let mut sample = Self::state_expired(
+                    c.node,
+                    &StateExpiry {
+                        namespace: "sample",
+                        key: topic.as_bytes(),
+                        value: Value::from_bytes(payload),
+                        kind: "lww",
+                        expired_at_ms: now,
+                    },
+                );
+                // "Expired just now": raised at the moment it expired, by one reading
+                // of the clock, not by a second one that may fall a millisecond later.
+                sample.fields.insert("timestamp", Value::Int(now));
+                sample
+            }
         }
     }
 }

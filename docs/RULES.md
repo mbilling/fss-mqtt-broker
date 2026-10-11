@@ -551,7 +551,8 @@ the event a replay only reports the expired keys.
 - `proc_dict_*` work on one dictionary per `clientid` in the sequence, which stands in for
   one connection of that client. The report does not show the dictionaries.
 - It is one node. A namespace that a cluster replicates (`consistency = "eventual"`)
-  behaves as `local` in a replay, and the report says so in a `note:` line.
+  behaves as `local` in a replay, its keys' expiry events included (the one node is the
+  member that raises them), and the report says so in a `note:` line.
 - A step that fails does not stop the replay: it prints `FAILED: <why>`, what it wrote
   before failing stays, and the next step runs. The replay then exits `1`, with
   `rule test FAILED: <n> of <m> steps had a rule or an action fail` on stderr. It also
@@ -2277,9 +2278,11 @@ runtime (`cargo build --no-default-features`) cannot load a module and says so.
 
 A rule sees one message at a time. The state functions let it keep values between
 messages: a count, the last value, when a condition first held
-([ADR 0085](adr/0085-rule-state-store.md)). This is the first part of that work: state
-lives **in memory, on the node that evaluated the rule**, and starts empty at every
-restart. A key that expires [raises an event](#when-a-key-expires-eventsstateexpired).
+([ADR 0085](adr/0085-rule-state-store.md)). State lives **in memory**, in namespaces: a
+namespace is this node's alone, or, declared `consistency = "eventual"`, held by every
+node of the cluster. A node starts with none of it, and is given a replicated namespace
+again by the others. A key that expires
+[raises an event](#when-a-key-expires-eventsstateexpired).
 What the store holds can be [watched and managed](#watching-and-managing-state).
 
 There are three families, and they do not share keys (`kv_get('x')` does not read what
@@ -2664,12 +2667,40 @@ It is about no client: `clientid` and `username` read `undefined`.
   so no wildcard reaches it: `"$events/#"` selects exactly the events it selects in EMQX,
   and a rule ported from there is never sent this one. `"$events/state/#"` is refused at
   load, naming the topic to use. It has no underscore spelling.
-- **For `local` namespaces, in this release.** A key of a namespace declared
-  `consistency = "eventual"` expires on every member at the same moment, and none of
-  them raises the event yet: choosing the one member that does is not built. A replay
-  says so in a `note:` line.
+- **In a cluster, one member raises it.** A key of a `local` namespace is this node's,
+  and so is its event. A key of a namespace declared `consistency = "eventual"` expires
+  on every member at the same moment, and **one** of them raises the event: the member
+  that a hash of the namespace and the key picks among the members whose rules select
+  the event. Each node has its own rules file, so a member with no rule on the event is
+  never picked, and if no member has one nothing is raised. The members not picked keep
+  the key, read as absent and still counted, until the picked member has said it is past
+  it, and then forget it without an event. `expiry_members` in a namespace's
+  [replication](#watching-and-managing-state) is how many members a node picks among.
+  - **"Silent for X" is silent as the picked member sees it.** The event is raised when
+    the key's expiry passes on the picked member, for what that member's copy holds. A
+    refresh (or a delete) made on another node that reached it before then stops the
+    event. One that has **not arrived yet** does not: the event is raised with the value
+    the key held, and the key lives on from the refresh. Replication is normally a few
+    milliseconds behind, and an expiry is a time on each node's own clock, so this is
+    seen for a device that speaks within that margin of its deadline, and for a TTL
+    shorter than the nodes' clocks disagree by.
+  - **Exactly one in a stable cluster, at least once around a change of members.** A
+    member is there, to another, while their peer link is up. When the picked member's
+    link goes before it has said it raised a key's event, the members that are left pick
+    among themselves, and one raises it from its own copy: an event the member had not
+    yet raised is not lost. What it had raised and not yet said is raised a second time:
+    it says how far it has got by whole seconds of expiry, so that is every key it was
+    to raise that expired within a second it had not finished (in a mass expiry, its
+    share of that second). Two sides of a partition each raise an event for a key. A
+    member that has just started is picked only once its copy has been compared with
+    the others' (at most a minute); a key that expires meanwhile can be raised by two.
+  - **What is not raised.** An event for a key that never reached the picked member's
+    copy (a namespace at its bounds there, a link down for longer than the key lived).
+    The events a member had taken over from one that left, if it leaves too before it
+    has raised them. And nothing is raised by a member whose rules do not select the
+    event, even when it is the only one left.
 - **Not for a remembered idempotency key.** The keys `kv_incr` remembers
-  ([Counting a message once](#counting-a-message-once)) expire without an event; behind
+  ([Counting a message once](#counting-a-message-once)) expire without an event, on every member; behind
   a backlog of events they are removed in their turn, and count as keys until then.
 - **Without a rule on it, it costs nothing.** No rule's call does anything for it, and
   the broker's one sweeping task only removes what has expired.
@@ -2990,7 +3021,7 @@ EMQX fails on each message, and statements only mqttd accepts.
 | `kv_store_put`, `kv_store_get`, `kv_store_del` | One table per node that grows until the node runs out of memory; a wrong argument count fails the rule on each message; the SQL test writes the node's real table | The same table and the same results, but bounded: a key of at most 256 bytes and a value of at most 4 KiB as JSON, 100,000 keys and 64 MiB unless `[state.kv_store]` says otherwise, under `rules.state_max_bytes`; past a bound the call fails the rule, where EMQX would have stored the value. A wrong argument count fails the load, as for every function. A dry run (`--rule-test`, the admin API's rule test) works on an empty table of its own. `rules.state_max_bytes = 0` switches it off: a rules file that calls them then does not load ([State](#state-what-a-rule-remembers)) |
 | `proc_dict_put`, `proc_dict_get`, `proc_dict_del` | The dictionary of the process that evaluates the rule: the client's connection process, for its publishes and what their rules republish, its events, the deliveries to it and its Will. It grows until the node runs out of memory. A session that outlives its connection keeps the process and the dictionary until it is resumed. A wrong argument count fails the rule on each message | The same results on one dictionary per client connection, for everything that connection evaluates, but bounded: 64 keys, and 64 KiB of keys and values as JSON, counted against `rules.state_max_bytes`; past a bound the call fails the rule, where EMQX would have stored the value. The dictionary is gone when the connection ends. Three evaluations have no connection to run on and get an empty dictionary that is discarded afterwards, where EMQX's still see the client's: a Will's rules; an event about a session that has no connection (`delivery_dropped` for an offline session); `message/dropped` for a message a rule republished, or for a Will. A wrong argument count fails the load, as for every function. A dry run works on an empty dictionary of its own, as each SQL test over EMQX's API does. `rules.state_max_bytes = 0` switches them off: a rules file that calls them then does not load ([State](#state-what-a-rule-remembers)) |
 | State of mqttd's own (mqttd-only extension) | None. `kv_get`, `kv_set`, `kv_set_once`, `kv_incr`, `kv_max`, `kv_min`, `kv_add`, `kv_del`, `kv_ttl`, `kv_held` and `kv_changed` are unknown functions, and `[state.<name>]` and the rule key `state` are not EMQX configuration | Typed, expiring, bounded keys in namespaces the rules file declares. A rule that uses them does not port back to EMQX |
-| `$events/state/expired` (mqttd-only extension) | No such event: a `FROM` that names it is refused. `"$events/#"` selects EMQX's 16 event topics | Raised when a key of mqttd's own state passes its expiry ([When a key expires](#when-a-key-expires-eventsstateexpired)), with `namespace`, `key`, `value`, `type` and `expired_at`. Selected only by its exact name: `"$events/#"` and every other wildcard select what they select in EMQX, never this event, so a rule ported from EMQX is not sent it. At most `rules.state_expiry_per_sec` a second, late rather than dropped. EMQX's `kv_store` table has no expiry and raises none |
+| `$events/state/expired` (mqttd-only extension) | No such event: a `FROM` that names it is refused. `"$events/#"` selects EMQX's 16 event topics | Raised when a key of mqttd's own state passes its expiry ([When a key expires](#when-a-key-expires-eventsstateexpired)), with `namespace`, `key`, `value`, `type` and `expired_at`. Selected only by its exact name: `"$events/#"` and every other wildcard select what they select in EMQX, never this event, so a rule ported from EMQX is not sent it. At most `rules.state_expiry_per_sec` a second on a node, late rather than dropped. In a replicated namespace one member raises it: exactly one while the cluster is stable, at least once around a change of members, and for what that member's copy held. EMQX's `kv_store` table has no expiry and raises none |
 | `jq` | A NIF in the broker's own process: always on, with no limit on memory, output or stack, the broker's whole environment in `$ENV`, and a timeout that cannot stop a program inside one long C call | The same jq in a WebAssembly sandbox, with EMQX's results, tags and texts, but **off unless `rules.jq = true`** (a rules file that calls it then fails to load), and needing a host that allows executable memory. 64 MiB of memory, 4 MiB of stack, an output charged to the message's 1 MiB build budget, a 5 s bound on compiling a program, `$ENV` empty unless variables are listed in `rules.jq_env` (a ported rule that reads `$ENV.X` gets `null` until `X` is listed), a timeout that always stops the call and is never longer than `rules.function_max_ms` (10 s unless set) whatever `jq/3`'s third argument or a payload asks for, a wrong number of arguments refused at load instead of on each message; the last one or two digits of some transcendental functions differ (musl's libm against glibc's), `strptime` fails on `%z`, `strftime("%Z")` of a UTC time is `UTC` where EMQX's is `GMT`, and local time is UTC. Each limit fails the rule for that message, with its kind counted ([Limits of jq](#limits-of-jq-and-what-happens-at-each), [the whole table](#jq)) |
 | Functions supplied as modules (mqttd-only extension) | None. A rules file with a `[functions.<name>]` table is not EMQX configuration | A rules file may declare WebAssembly modules, each pinned by its SHA-256, whose functions rules call; they run in the sandbox under time, memory, output and stack limits. A module cannot take the name of a built-in function or of any function of EMQX's rule engine, so it never changes what a rule written for EMQX means. A module is read only from under the rules file's directory, sees no file, socket or host function, the clock only with `clock = true` and only the environment variables `rules.functions_env` allows. A rules file that declares one does not load in EMQX ([Your own functions](#your-own-functions-functionsname)) |
 | Regular expressions | Erlang `re`: PCRE2 10.47 (OTP 28) on bytes, compiled per call | PCRE2 10.46 on bytes, with OTP's compile options, match and depth limits and global-match loop: the same syntax and results ([above](#functions)). A match needing more than 64 MiB of backtracking memory is no match (OTP allows 20 GB); a pattern nesting parentheses more than 250 deep does not compile (OTP's limit is 10,000, though PCRE2's own workspace stops most such patterns below 2,000). A literal pattern is compiled once, when the file loads (one that does not compile warns), and a rules file holds at most 512 distinct ones, 256 KiB together. |

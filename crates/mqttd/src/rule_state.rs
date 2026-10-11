@@ -154,6 +154,9 @@ impl Clock {
 /// namespace are stamped with (D6), and whose counts its counters raise.
 #[derive(Debug)]
 struct Node {
+    /// The node's id: what picking the member that raises a key's expiry event
+    /// hashes (D7).
+    id: Box<str>,
     /// Whose counts a counter's increments on this node raise: the node's id and
     /// when this run of it began. The store is in memory, so a node that restarts
     /// has forgotten what it had counted, and the others have not: counting on
@@ -176,6 +179,7 @@ impl Node {
             Some(began)
         });
         Self {
+            id: id.into(),
             counts_as: format!("{id}#{began:x}").into_boxed_str(),
             clock: Hlc::new(id),
         }
@@ -367,7 +371,7 @@ impl Store {
     pub fn replication(&self, namespace: &str) -> Option<Replication> {
         let ns = lock(&self.namespaces).get(namespace)?.upgrade()?;
         let replica = ns.replica.as_ref()?;
-        Some(replica.stats(self.shared.clock.now_ms()))
+        Some(replica.stats(&ns, self.shared.clock.now_ms()))
     }
 
     /// State frames refused because they named a namespace this node's rules do not

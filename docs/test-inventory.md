@@ -1373,7 +1373,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 728 test(s)
+## `crates/mqttd/src/lib.rs` — 745 test(s)
 
 - `admin::cli::tests::a_page_of_keys_is_a_table_of_type_size_and_expiry`
 - `admin::cli::tests::a_refusal_shows_what_it_carries`
@@ -2068,6 +2068,23 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `rule_state::tests_replica::copies_converge_whatever_is_reordered_repeated_or_lost`
 - `rule_state::tests_replica::copies_that_differ_in_a_few_keys_exchange_a_few_parts`
 - `rule_state::tests_replica::deleting_a_key_this_node_has_never_seen_leaves_no_tombstone`
+- `rule_state::tests_replica::expiry::a_key_that_cannot_be_forgotten_yet_raises_its_event_at_its_expiry`
+- `rule_state::tests_replica::expiry::a_key_that_waits_for_its_event_reads_as_absent_and_keeps_its_room`
+- `rule_state::tests_replica::expiry::a_mass_expiry_is_handed_over_at_each_nodes_pace_in_order_and_none_is_shed`
+- `rule_state::tests_replica::expiry::a_member_that_has_just_started_is_not_picked_until_its_copy_was_compared`
+- `rule_state::tests_replica::expiry::a_node_filled_with_keys_that_had_already_expired_raises_nothing_for_them`
+- `rule_state::tests_replica::expiry::a_picked_member_that_goes_before_it_raised_leaves_its_keys_to_the_others`
+- `rule_state::tests_replica::expiry::a_refresh_on_another_node_stops_the_event_only_if_it_arrives_before_the_expiry`
+- `rule_state::tests_replica::expiry::a_remembered_idempotency_key_expires_on_every_member_without_an_event`
+- `rule_state::tests_replica::expiry::a_write_to_an_expired_key_does_not_lose_its_event`
+- `rule_state::tests_replica::expiry::each_side_of_a_partition_raises_and_healing_raises_nothing_more`
+- `rule_state::tests_replica::expiry::events_a_member_raised_and_could_not_say_so_are_raised_again`
+- `rule_state::tests_replica::expiry::in_a_stable_cluster_one_member_raises_each_keys_event`
+- `rule_state::tests_replica::expiry::keys_that_wait_for_their_event_cause_no_repair_traffic`
+- `rule_state::tests_replica::expiry::keys_that_waited_are_let_go_when_no_rule_selects_the_event_any_more`
+- `rule_state::tests_replica::expiry::one_node_takes_an_expired_key_of_an_eventual_namespace_for_its_event`
+- `rule_state::tests_replica::expiry::only_members_whose_rules_select_the_event_are_picked`
+- `rule_state::tests_replica::expiry::the_others_let_go_only_of_what_the_picked_member_has_got_past`
 - `rule_state::tests_replica::malformed_frames_are_refused_and_never_pass_a_bound`
 - `rule_state::tests_replica::once::a_message_counted_on_one_node_is_not_counted_again_where_the_entry_has_arrived`
 - `rule_state::tests_replica::once::a_refused_increment_is_not_remembered_in_an_eventual_namespace`
@@ -2787,8 +2804,11 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `a_wills_rules_call_the_same_store`
 - `kv_store_counts_across_messages_and_is_shared_by_every_rule`
 
-## `crates/mqttd/tests/rules_state_cluster.rs` — 4 test(s)
+## `crates/mqttd/tests/rules_state_cluster.rs` — 7 test(s)
 
+- `a_keys_expiry_is_one_event_in_a_stable_cluster`
+- `a_member_that_goes_leaves_its_keys_events_to_the_others`
+- `a_member_without_a_rule_on_the_event_is_not_picked`
 - `a_message_resent_to_another_node_is_counted_once_when_the_entry_has_arrived`
 - `a_partition_heals`
 - `a_restarted_node_is_refilled_from_the_others`

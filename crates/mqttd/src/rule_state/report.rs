@@ -105,6 +105,7 @@ impl NamespaceReport {
                 "lag_ms": r.lag_ms,
                 "merged": r.merged,
                 "refused_by": refused,
+                "expiry_members": r.expiry_members,
             });
         }
         doc

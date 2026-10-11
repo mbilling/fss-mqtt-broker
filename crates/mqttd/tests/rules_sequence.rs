@@ -1047,27 +1047,29 @@ fn silent_for_ten_minutes_raises_the_expiry_event_at_each_keys_expiry_time() {
     );
     assert_eq!(report.failed(), 0);
 
-    // The same file with the namespace replicated: its keys expire, and the event is
-    // not raised for them yet (which member raises it is not built). A note says so.
+    // The same file with the namespace replicated: a replay is one node, which is
+    // then the member that raises the event, so it reads the same but for the note.
     let replicated = rules(
         &SILENT.replace("[state.seen]", "[state.seen]\nconsistency = \"eventual\""),
-        "{\"topic\": \"sensors/d1/data\", \"clientid\": \"d1\", \"payload\": {\"temp\": 20}}\n\
-         {\"at\": \"20m\"}\n",
+        r#"
+        {"topic": "sensors/d1/data", "clientid": "d1", "payload": {"temp": 20}}
+        {"at": "1m", "topic": "sensors/d2/data", "clientid": "d2", "payload": {"temp": 21}}
+        {"at": "5m", "topic": "sensors/d1/data", "clientid": "d1", "payload": {"temp": 22}}
+        {"at": "20m", "topic": "sensors/d1/data", "clientid": "d1", "payload": {"temp": 23}}
+        "#,
     );
     assert_eq!(
         replicated.notes,
         [
             "namespace `seen` is replicated in a cluster; a replay is one node, where it \
-             behaves as consistency = \"local\"",
-            "namespace `seen` is replicated: the expiry of its keys raises no \
-             $events/state/expired yet, here or in a broker"
+          behaves as consistency = \"local\""
         ]
     );
     assert_eq!(
-        replicated.steps[1].state,
-        [r#"state seen: - "d1" (expired +600s)"#]
+        replicated.text(true),
+        format!("note: {}\n{}", replicated.notes[0], report.text(true))
     );
-    assert!(replicated.steps[1].results.is_empty());
+    assert_eq!(replicated.failed(), 0);
 }
 
 /// D7: a rule on the event may write state, the key that expired included. In a

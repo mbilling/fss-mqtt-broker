@@ -3,11 +3,16 @@
 //!
 //! # Which namespaces
 //!
-//! `local` ones: the keys this file's sweep walks are those of
-//! [`Namespace::shards`](super::Namespace). An `eventual` namespace keeps its keys
-//! apart ([`replica`](super::replica)), expires them on every member at once, and
-//! raises nothing yet: which member raises the event there, and holding a replicated
-//! key for it, is the cluster half of D7 and is not built.
+//! All of them, at one pace for the node. What follows is said of a `local`
+//! namespace, whose keys are those of [`Namespace::shards`](super::Namespace). An
+//! `eventual` namespace keeps its keys apart ([`replica`](super::replica)) and expires
+//! them on every member at the same moment; there **one** member raises a key's
+//! event, the one a hash of the namespace and the key picks among the members whose
+//! rules select it, and the sweep does three things for such a namespace: it looks at
+//! every key that is due (forgetting it, or noting that its event is owed), it lets go
+//! of the keys another member was to raise once that member has, and it hands over
+//! this node's own at the pace, in the order below, with the `local` ones
+//! ([`Replica::forget_due`](super::replica::Replica::forget_due)).
 //!
 //! # Finding what expired
 //!
@@ -68,6 +73,7 @@ use std::sync::{Arc, Weak};
 use mqtt_rules::state::{remembered, KV_STORE_NAMESPACE};
 use mqtt_rules::Value;
 
+use super::replica::Raised;
 use super::{
     expiry_slot, lock, lock_shard, wide, Entry, Namespace, Shard, Store, NOT_IN_ORDER, PURGE_BATCH,
 };
@@ -99,6 +105,24 @@ impl Expired {
             expired_ms: entry.expires_ms,
         }
     }
+
+    /// A key of an `eventual` namespace, from the state it expired with.
+    fn of_replica(namespace: &Namespace, raised: Raised) -> Option<Self> {
+        let data = raised.state.data()?;
+        Some(Self {
+            namespace: namespace.name.clone(),
+            kind: data.type_name(),
+            value: data.read(),
+            key: raised.key,
+            expired_ms: raised.expired_ms,
+        })
+    }
+}
+
+/// A key the sweep took out, until its lock is released.
+enum Taken {
+    Local(Entry),
+    Replica(Raised),
 }
 
 /// What one [`Store::sweep`] did.
@@ -277,7 +301,10 @@ impl Store {
     /// keys are held until [`sweep`](Self::sweep) returns them; while none does, they
     /// are removed by whoever finds them and the sweep returns none.
     pub fn set_expiry_events(&self, wanted: bool) {
-        self.shared.expiry_events.store(wanted, Relaxed);
+        if self.shared.expiry_events.swap(wanted, Relaxed) != wanted {
+            // The members of an `eventual` namespace are told who raises its events.
+            self.shared.wake.links.notify_waiters();
+        }
     }
 
     /// Whether expired keys are held for their events now.
@@ -332,7 +359,31 @@ impl Store {
         let mut swept = Swept::default();
         // (the second, the namespace, the shard) of every shard with a key due.
         let mut due: Due = BinaryHeap::new();
+        // Whether an event of the namespace was handed over, for those that tell
+        // other members how far this one has got.
+        let mut raised = vec![false; namespaces.len()];
+        // The second each such namespace's next key is due in.
+        let mut behind = vec![None; namespaces.len()];
         for (n, namespace) in namespaces.iter().enumerate() {
+            if let Some(replica) = &namespace.replica {
+                if namespace.keys.load(Relaxed) == 0 {
+                    // Nothing to look at; what its peers are told of how far this
+                    // node has got still moves on, below.
+                    continue;
+                }
+                let found = replica.forget_due(namespace);
+                swept.removed += found.removed;
+                swept.more |= found.more;
+                behind[n] = found.next_due;
+                if let Some(slot) = found.next_due.filter(|_| !found.more) {
+                    let due_ms = slot.saturating_mul(1000);
+                    swept.next_due_ms = Some(swept.next_due_ms.map_or(due_ms, |ms| ms.min(due_ms)));
+                }
+                for (at, slot) in found.held {
+                    due.push(Reverse((slot, n, at)));
+                }
+                continue;
+            }
             if namespace.keys.load(Relaxed) == 0 {
                 continue;
             }
@@ -342,15 +393,28 @@ impl Store {
             }
         }
         let mut left = max;
-        let mut taken: Vec<(usize, Entry)> = Vec::new();
-        while let Some(Reverse((slot, n, at))) = due.pop() {
+        let mut taken: Vec<(usize, Taken)> = Vec::new();
+        while let Some(Reverse((slot, n, at))) = due.peek().copied() {
             if left == 0 {
                 swept.more = true;
                 break;
             }
+            due.pop();
             let namespace = &namespaces[n];
-            let mut shard = lock_shard(&namespace.shards[at]);
             let before = taken.len();
+            if let Some(replica) = &namespace.replica {
+                let batch = PURGE_BATCH.min(left);
+                let next = replica.pop_held(namespace, at, slot, batch, &mut |raised| {
+                    taken.push((n, Taken::Replica(raised)));
+                });
+                left -= taken.len() - before;
+                raised[n] |= taken.len() > before;
+                if let Some(slot) = next {
+                    due.push(Reverse((slot, n, at)));
+                }
+                continue;
+            }
+            let mut shard = lock_shard(&namespace.shards[at]);
             // What counts toward `max`: every key, or, where events are raised, the
             // keys that raise one. A remembered idempotency key (D8) raises none, and
             // the events' pace must not hold up its removal.
@@ -360,7 +424,7 @@ impl Store {
                     break;
                 };
                 counted += usize::from(!events || remembered(&entry.key).is_none());
-                taken.push((n, entry));
+                taken.push((n, Taken::Local(entry)));
             }
             left -= counted;
             shard.expired += wide(taken.len() - before);
@@ -371,16 +435,54 @@ impl Store {
             drop(shard);
             sort(&mut due, &mut swept, now_ms, first, (n, at));
         }
-        for (n, entry) in &taken {
-            let namespace = &namespaces[*n];
-            namespace.release(entry);
-            if events && remembered(&entry.key).is_none() {
-                swept.expired.push(Expired::of(namespace, entry));
-            } else {
-                swept.removed += 1;
+        if events {
+            self.tell_swept(&namespaces, &due, &behind, &raised);
+        }
+        for (n, taken) in taken {
+            let namespace = &namespaces[n];
+            let expired = match taken {
+                Taken::Local(entry) => {
+                    namespace.release(&entry);
+                    (events && remembered(&entry.key).is_none())
+                        .then(|| Expired::of(namespace, &entry))
+                }
+                // Its room was given back as it was taken out.
+                Taken::Replica(raised) => Expired::of_replica(namespace, raised),
+            };
+            match expired {
+                Some(expired) => swept.expired.push(expired),
+                None => swept.removed += 1,
             }
         }
         swept
+    }
+
+    /// What each `eventual` namespace's peers are told after a pass: this node has
+    /// nothing left to raise that expired before the earliest key it still holds for
+    /// its event (`due`, what the pass left) or has yet to look at (`behind`), or,
+    /// with neither, before now. `raised`: whether the pass handed an event of the
+    /// namespace over.
+    fn tell_swept(
+        &self,
+        namespaces: &[Arc<Namespace>],
+        due: &Due,
+        behind: &[Option<u64>],
+        raised: &[bool],
+    ) {
+        let mut told = false;
+        for (n, namespace) in namespaces.iter().enumerate() {
+            let Some(replica) = &namespace.replica else {
+                continue;
+            };
+            let now = super::replica::Replica::now_ms(namespace) / 1000;
+            let held = due.iter().filter(|Reverse((_, of, _))| *of == n);
+            let first = held.map(|Reverse((slot, _, _))| *slot).chain(behind[n]);
+            let to = first.fold(now, |to, slot: u64| to.min(slot.saturating_sub(1)));
+            told |= replica.note_swept(to, raised[n]);
+        }
+        if told {
+            self.shared.wake.links.notify_waiters();
+        }
     }
 
     /// Take `key` of `namespace` out if its expiry has passed, wherever it is (still
@@ -392,6 +494,13 @@ impl Store {
     #[must_use]
     pub fn take_expired(&self, namespace: &str, key: &[u8]) -> Option<Expired> {
         let namespace = lock(&self.namespaces).get(namespace)?.upgrade()?;
+        if let Some(replica) = &namespace.replica {
+            let raised = replica.take_expired(&namespace, key)?;
+            return remembered(&raised.key)
+                .is_none()
+                .then(|| Expired::of_replica(&namespace, raised))
+                .flatten();
+        }
         let now_ms = self.shared.clock.now_ms();
         let mut shard = lock_shard(&namespace.shards[namespace.shard_of(key)]);
         let entry = if shard.map.get(key).is_some_and(|e| e.expired(now_ms)) {
@@ -420,7 +529,9 @@ impl Store {
     /// **The entry point for an operator's purge that asks for events** (ADR 0085,
     /// amended 2026-10-11: `events=true`, T13). A purge that asks for none deletes
     /// its keys instead. EMQX's `kv_store` table has no expiry and raises none, so
-    /// its keys are left alone here.
+    /// its keys are left alone here. So are an `eventual` namespace's: an expiry
+    /// there is part of the state every member holds, and all but an `lww` value's
+    /// merges to the later of two, so one member cannot move it sooner for the rest.
     pub fn expire_now(&self, namespace: &str, key: &[u8]) -> bool {
         if namespace == KV_STORE_NAMESPACE {
             return false;
@@ -428,6 +539,7 @@ impl Store {
         let Some(namespace) = lock(&self.namespaces)
             .get(namespace)
             .and_then(Weak::upgrade)
+            .filter(|namespace| namespace.replica.is_none())
         else {
             return false;
         };

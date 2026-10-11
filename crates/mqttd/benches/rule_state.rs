@@ -1128,13 +1128,36 @@ fn sweep(c: &mut Criterion) {
     c.bench_function("sweep/idle", |b| {
         b.iter(|| black_box(store.sweep(1000).more));
     });
-    for (name, events) in [("sweep/expired", false), ("sweep/expired_event", true)] {
+    // The same in a replicated namespace, on a node that raises its keys' events.
+    let replicated = Store::new(CEILING);
+    replicated.set_node("node-0");
+    replicated.set_expiry_events(true);
+    let ns = namespace(&replicated, &eventual());
+    for i in 0..100_000 {
+        ns.call(&StateOp::Set {
+            key: format!("state:device-{i:06}").as_bytes(),
+            value: stored(&value),
+            ttl: Some(3600),
+        })
+        .expect("room for the keys");
+    }
+    c.bench_function("sweep/eventual/idle", |b| {
+        b.iter(|| black_box(replicated.sweep(1000).more));
+    });
+    let local = || NamespaceSettings::defaults(CEILING);
+    for (name, events, settings) in [
+        ("sweep/expired", false, local()),
+        ("sweep/expired_event", true, local()),
+        ("sweep/eventual/expired", false, eventual()),
+        ("sweep/eventual/expired_event", true, eventual()),
+    ] {
         c.bench_function(name, |b| {
             b.iter_custom(|iters| {
                 let now_ms = Arc::new(std::sync::atomic::AtomicU64::new(1_800_000_000_000));
                 let store = Store::with_manual_clock(CEILING, now_ms.clone());
+                store.set_node("node-0");
                 store.set_expiry_events(events);
-                let ns = namespace(&store, &NamespaceSettings::defaults(CEILING));
+                let ns = namespace(&store, &settings);
                 let mut total = Duration::ZERO;
                 let mut left = iters;
                 while left > 0 {
