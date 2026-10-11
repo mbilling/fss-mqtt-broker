@@ -74,6 +74,7 @@ jobs:
               crates/mqttd/src/rules.rs|crates/mqttd/src/main.rs) SANDBOX=true; break ;;
               Cargo.lock|Cargo.toml|rust-toolchain.toml|deny.toml) SANDBOX=true; break ;;
               .github/workflows/ci.yml|.github/actions/jq-module/*) SANDBOX=true; break ;;
+              examples/rule-plugins/*|.github/actions/rule-plugins/*) SANDBOX=true; break ;;
               deploy/systemd/mqttd.service) SANDBOX=true; break ;;
             esac
           done <<< "$FILES"
@@ -201,6 +202,8 @@ jobs:
       # Built from pinned sources with the pinned compiler, and compared with the
       # recorded hash (the steps are shared with the `test` job).
       - uses: ./.github/actions/jq-module
+      # The example operator modules (ADR 0086 D9), for the hardening step below.
+      - uses: ./.github/actions/rule-plugins
       # Release mode: the tests include two programs that run into EMQX's own
       # ten-second timeout, and the whole oracle a second time in the interpreter.
       - name: Sandbox tests, the EMQX oracle and the limits (release)
@@ -297,6 +300,39 @@ jobs:
           grep -qF 'config OK' "$WORK/hard-host.out"
           grep -qF 'warning: rules.jq is on, but' "$WORK/hard-host.out"
           grep -qF 'MemoryDenyWriteExecute=false' "$WORK/hard-host.out"
+          echo "::endgroup::"
+
+          # A module a rules file declares (ADR 0086 D9) needs the same of the host and
+          # no switch: with rules.jq off it loads on this runner, and under the unit's
+          # hardening the same file fails to load with the same reason and way out.
+          echo "::group::a declared module: loads here with rules.jq off, refused under the hardening"
+          mkdir "$WORK/modules"
+          cp examples/rule-plugins/out/geo.wasm "$WORK/modules/geo.wasm"
+          cat > "$WORK/modules/rules.toml" <<RULES
+          [functions.geo]
+          wasm = "geo.wasm"
+          sha256 = "$(sha256sum "$WORK/modules/geo.wasm" | cut -d' ' -f1)"
+          functions = ["geo_distance"]
+
+          [rules.far]
+          sql = 'SELECT geo_distance(payload.lat, payload.lon, 0, 0) AS metres FROM "t/#"'
+          RULES
+          chmod 755 "$WORK/modules"
+          chmod 644 "$WORK/modules"/*
+          "$BIN" --check-rules "$WORK/modules/rules.toml"
+          set +e
+          sudo systemd-run --wait --pipe --collect --quiet "${PROPS[@]}" \
+            -E MQTTD_DURABLE_SESSIONS=0 "$BIN" --check-rules "$WORK/modules/rules.toml" \
+            > "$WORK/module.out" 2> "$WORK/module.err"
+          code=$?
+          set -e
+          cat "$WORK/module.out" "$WORK/module.err"
+          if [ "$code" -ne 1 ]; then
+            echo "expected exit 1 (rules INVALID), got $code"; exit 1
+          fi
+          grep -qF 'rules INVALID' "$WORK/module.err"
+          grep -qF 'functions `geo`: the WebAssembly compiler cannot run on this host' "$WORK/module.err"
+          grep -qF 'MemoryDenyWriteExecute=false' "$WORK/module.err"
           echo "::endgroup::"
       # What loading costs on this runner (the compile a broker pays once, when rules
       # that call jq are loaded), for the record in the log.

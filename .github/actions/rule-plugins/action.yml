@@ -15,7 +15,7 @@ runs:
       uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: examples/rule-plugins/out
-        key: rule-plugins-${{ hashFiles('examples/rule-plugins/build.sh', 'examples/rule-plugins/rust/Cargo.toml', 'examples/rule-plugins/rust/Cargo.lock', 'examples/rule-plugins/rust/.cargo/config.toml', 'examples/rule-plugins/rust/src/**', 'examples/rule-plugins/c/**', 'crates/mqtt-wasm-sandbox/jq-module/build.sh', 'crates/mqtt-wasm-sandbox/jq-module/fetch-zig.sh', 'rust-toolchain.toml') }}
+        key: rule-plugins-${{ hashFiles('examples/rule-plugins/build.sh', 'examples/rule-plugins/rust/Cargo.toml', 'examples/rule-plugins/rust/Cargo.lock', 'examples/rule-plugins/rust/src/**', 'examples/rule-plugins/c/**', 'crates/mqtt-wasm-sandbox/jq-module/build.sh', 'crates/mqtt-wasm-sandbox/jq-module/fetch-zig.sh', 'rust-toolchain.toml') }}
     - name: Build geo.wasm (Rust) and telemetry.wasm (C)
       if: steps.modules.outputs.cache-hit != 'true'
       shell: bash

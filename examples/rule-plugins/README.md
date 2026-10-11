@@ -8,8 +8,8 @@ modules to copy from, one in Rust and one in C.
 
 | | Functions | Shows |
 |---|---|---|
-| [`rust/`](rust/src/lib.rs) → `geo.wasm` | `geo_distance(lat1, lon1, lat2, lon2)`: metres between two points. `geo_within(lat, lon, lat0, lon0, radius_m)`: a boolean | Numbers in and out as JSON; a function's own refusal (a latitude of 91) failing the rule with its message |
-| [`c/`](c/telemetry.c) → `telemetry.wasm` | `crc16_modbus(Payload)`: an integer. `site_label(Text)`: `<SITE>/<Text>`. `clock_ms()`: milliseconds since the epoch | A payload's bytes as they are; the two grants a module can be given, an environment variable and the wall clock, and what it reads without them (`/<Text>` and `0`) |
+| [`rust/`](rust/src/lib.rs) → `geo.wasm` (target `wasm32-unknown-unknown`, no dependencies) | `geo_distance(lat1, lon1, lat2, lon2)`: metres between two points. `geo_within(lat, lon, lat0, lon0, radius_m)`: a boolean | Numbers in and out as JSON; a function's own refusal (a latitude of 91) failing the rule with its message |
+| [`c/`](c/telemetry.c) → `telemetry.wasm` (target `wasm32-wasi`, wasi-libc) | `crc16_modbus(Payload)`: an integer. `site_label(Text)`: `<SITE>/<Text>`. `clock_ms()`: milliseconds since the epoch | A payload's bytes as they are; the two grants a module can be given, an environment variable and the wall clock, and what it reads without them (`/<Text>` and `0`) |
 
 ## Build
 
@@ -21,7 +21,9 @@ examples/rule-plugins/build.sh                # out/geo.wasm, out/telemetry.wasm
 `build.sh` needs zig 0.16.0, the compiler the broker's own jq module is built with (it
 is the whole C toolchain: its clang and its bundled wasi-libc).
 `crates/mqtt-wasm-sandbox/jq-module/fetch-zig.sh DIR` downloads it and checks the
-archive's sha256; `ZIG=DIR/zig/zig examples/rule-plugins/build.sh` uses it.
+archive's sha256; `ZIG=DIR/zig/zig examples/rule-plugins/build.sh` uses it. The script
+holds the compiler flags for both, the WebAssembly features a module may use among
+them: build a module of your own the way it does.
 
 ## Use
 

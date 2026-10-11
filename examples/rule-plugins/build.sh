@@ -31,9 +31,16 @@ sha256() {
 
 mkdir -p "$out"
 
-# Rust. The target and the WebAssembly features are in rust/.cargo/config.toml, which
-# cargo reads from the directory it runs in.
-(cd "$here/rust" && cargo build --release --locked)
+# Rust, for the bare WebAssembly target: no WASI, so the module imports nothing. The
+# WebAssembly features are spelled out, as for the broker's own jq module: the sandbox
+# accepts bulk memory, sign extension, non-trapping conversions, mutable globals and
+# multi-value, and nothing newer (ADR 0086 D1). They are given as RUSTFLAGS here, and
+# not in a cargo configuration file, because a RUSTFLAGS in the caller's environment
+# (CI has one) would replace what such a file says.
+(cd "$here/rust" &&
+  env -u CARGO_ENCODED_RUSTFLAGS \
+    RUSTFLAGS="-C target-cpu=mvp -C target-feature=+bulk-memory,+sign-ext,+nontrapping-fptoint,+mutable-globals -D warnings" \
+    cargo build --release --locked --target wasm32-unknown-unknown)
 cp "$here/rust/target/wasm32-unknown-unknown/release/mqttd_rule_plugin_geo.wasm" "$out/geo.wasm"
 
 # C. The same WebAssembly features as the broker's jq module, spelled out; a reactor
