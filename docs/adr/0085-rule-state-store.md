@@ -971,8 +971,10 @@ bytes. Property tests check it over every type, every pair of concurrent operati
   kept such elements in the order they arrived in, which two nodes would not share. They
   are now ordered by their identity. This is the one change to what T1 answered on a
   single node, and only for a set that holds maps of equal size.
-- **`max` and `min`** of `1` and `1.0` (one number, two values): every node keeps the
-  same one, by identity.
+- **`max` and `min`** of `1` and `1.0` (one number, two values). On one node the number
+  held stays when an equal one is offered, as T1 pinned it: a write replaces only what
+  it is strictly beyond. When two nodes' copies merge, both keep the integer. So which of
+  two equal numbers a node holds can change at a merge, and never changes back.
 - **The sketch.** A value is hashed by its exact identity (as a set tells elements
   apart) with SipHash-2-4 under a fixed key, written by hand and pinned by the reference
   vector and by fixed outputs: no node, architecture or release may hash differently,

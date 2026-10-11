@@ -1258,7 +1258,11 @@ fn join(a: Data, a_expires: u64, b: &Data, b_expires: u64) -> (Data, u64) {
                     }
                 }
                 (Data::Max(value), Data::Max(their_value)) => {
-                    Data::Max(if exact_order(&value, their_value) == Ordering::Less {
+                    // The larger; of two equal numbers (`1` and `1.0`) the one `min`
+                    // keeps too, so an integer is not replaced by its float.
+                    let order = term_order(&value, their_value)
+                        .then_with(|| exact_order(their_value, &value));
+                    Data::Max(if order == Ordering::Less {
                         their_value.clone()
                     } else {
                         value

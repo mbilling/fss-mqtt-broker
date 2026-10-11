@@ -703,7 +703,29 @@ fn max_and_min_keep_the_extreme_of_every_nodes_numbers() {
     b.write(b"k", &max(&float), None, Some(600), T0).unwrap();
     hand(&a, &mut b, T0);
     hand(&b, &mut a, T0);
-    assert_eq!(read(&a, T0), read(&b, T0));
+    // The integer, for `max` as for `min`: merged, it is not replaced by its float.
+    assert_eq!(read(&a, T0).as_deref(), Some("1"));
+    assert_eq!(read(&b, T0).as_deref(), Some("1"));
+    let min = |value| Write::Extreme {
+        value,
+        largest: false,
+    };
+    a.write(b"m", &min(&float), None, Some(600), T0).unwrap();
+    b.write(b"m", &min(&int), None, Some(600), T0).unwrap();
+    let (sa, sb) = (
+        a.state(b"m").cloned().unwrap(),
+        b.state(b"m").cloned().unwrap(),
+    );
+    a.receive(b"m", &sb, T0).unwrap();
+    b.receive(b"m", &sa, T0).unwrap();
+    assert_eq!(a.read(b"m", T0).unwrap().to_json().unwrap(), "1");
+    assert_eq!(b.read(b"m", T0).unwrap().to_json().unwrap(), "1");
+    // On one node the number held stays when an equal one is offered, whichever came
+    // first: a write replaces only what it is strictly beyond.
+    let mut c = Replica::new("c");
+    c.write(b"k", &max(&float), None, Some(600), T0).unwrap();
+    c.write(b"k", &max(&int), None, Some(600), T0).unwrap();
+    assert_eq!(read(&c, T0).as_deref(), Some("1.0"));
     // Not a number: refused.
     assert!(matches!(
         a.write(b"k", &max(&Value::from("9")), None, None, T0),
