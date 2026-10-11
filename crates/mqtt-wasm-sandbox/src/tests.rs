@@ -316,7 +316,11 @@ fn a_call_that_outlasts_its_first_slice_goes_on_inside_the_hand_off() {
         .instantiate()
         .unwrap();
     assert_eq!(instance.call("grow", &[], None), Err(CallError::Memory));
-    assert!(handed.load(Ordering::SeqCst) <= 1);
+    // The host enters the module twice before `grow` fails: once to allocate the
+    // argument frame, once for the function. Each entry is suspended at most once, and
+    // with a slice of zero the timer's tick may already be there when the allocation
+    // starts (seen on CI's runners, never on a laptop): at most two, never more.
+    assert!(handed.load(Ordering::SeqCst) <= 2);
 }
 
 /// A hand-off that does not run what it is given, or runs it twice, changes nothing:
