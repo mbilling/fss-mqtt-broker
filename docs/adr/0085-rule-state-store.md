@@ -30,7 +30,10 @@
 > [Amendments](#amendments). Five choices in it are the maintainer's and were **decided by
 > default** so that the record is not left open; each is marked where it applies and they
 > are listed together in [Decided by default](#decided-by-default-2026-10-11), with what
-> the other answer would cost.
+> the other answer would cost. Two of them were **confirmed by the user** the same day
+> (state is on without a switch; the names stay `kv_*`), and the operator's tools on the
+> store (view, purge, change expiry) were added: see the amendment "admin features and
+> confirmed defaults".
 
 ## Context
 
@@ -79,7 +82,8 @@ per namespace, not once for the broker.
 
 The broker keeps a keyed store of small values, organised in **namespaces**. Rules read
 and write it from SQL (D3, D13); clients cannot reach it, and nothing else writes it but
-an operator's delete (D10). A namespace is declared in the rules file with its
+an operator's delete (D10) and, since the amendment of 2026-10-11, an operator's purge
+and expiry change. A namespace is declared in the rules file with its
 consistency mode (D5) and bounds (D9), and a rule names the one it uses in its own table:
 
 ```toml
@@ -113,7 +117,8 @@ sql = '''...'''
   total size has a ceiling in the broker's configuration, `rules.state_max_bytes`
   (`MQTTD_RULES_STATE_MAX_BYTES`, default 256 MiB, read at startup), which a rules file
   cannot raise; `0` switches state off, and a rules file that uses it is then refused at
-  load, naming the key. *(Decided by default, 2026-10-11: on, with that ceiling.)*
+  load, naming the key. *(Decided by default, 2026-10-11: on, with that ceiling.
+  Confirmed by the user, 2026-10-11.)*
 - **Across a reload** (ADR 0084): a namespace whose declaration did not change keeps its
   keys; changed bounds apply at once (lowering `max_keys` evicts nothing, it only refuses
   new keys until the count is below it); a changed `consistency` is refused, with the
@@ -170,7 +175,8 @@ at load with the reason, as a file that calls `jq` is where `jq` is off.
 - **These names are mqttd's.** EMQX has no function called `kv_get` or any other in the
   table, and the functions it does have keep their own names and their exact behaviour
   (D13). A module (ADR 0086 D9) can no longer take one of these names: they are built in.
-  *(Decided by default, 2026-10-11: the names stay `kv_*`, beside EMQX's `kv_store_*`.)*
+  *(Decided by default, 2026-10-11: the names stay `kv_*`, beside EMQX's `kv_store_*`.
+  Confirmed by the user, 2026-10-11.)*
 
 **When a state call runs: when evaluation reaches it, in EMQX's order, and it is never
 undone.** mqttd evaluates a statement exactly as `emqx_rule_runtime` does (ADR 0083,
@@ -409,6 +415,11 @@ model's rule for payload-driven work):
 - **CLI** (ADR 0084 D7's style): `mqttd --admin state`, `state-keys <ns>`,
   `state-get <ns> <key>`, `state-del <ns> <key>`.
 
+*(Amended 2026-10-11: the listing gains each key's type, size and expiry and its
+filters; a bulk purge and a change of expiry are added, with their verbs. T6 builds this
+section as written; T12 to T15 build the additions. No last-write time is kept. See
+[Amendments](#amendments).)*
+
 ### D11. Testing: sequences, not single messages
 
 `mqttd --rule-test` gains `--sequence <file>`: a timed list of messages and events
@@ -473,7 +484,7 @@ was.
   disconnect, not carried by a takeover or a resumed session (EMQX starts a new process
   there too). A republished message is evaluated on the same task and sees it, as in
   EMQX. *(Decided by default, 2026-10-11: provided. The other answer keeps them
-  refused.)*
+  refused. Delivered: T11, #933.)*
 - **What differs from EMQX,** each listed in RULES.md:
   - *Bounds.* EMQX's table and dictionaries grow until the node runs out of memory.
     Here `kv_store` has the bounds of any namespace (D9), with a key of at most 256
@@ -555,22 +566,31 @@ was.
 
 These are choices with a real cost either way that neither EMQX's behaviour, the code nor
 an obvious default settles. The record is written on the recommended answer; each is
-cheap to revisit before the task named builds it.
+cheap to revisit before the task named builds it. **Standing** says where each is now:
+the user was asked on 2026-10-11 and confirmed two; the other three stand by default,
+one of them delivered. Rows 6 to 8 were added the same day by the amendment "admin
+features and confirmed defaults"; the user withdrew what row 6 decided about (the
+amendment "no last-write time"), and rows 7 and 8 are open to the user in the same way.
 
-| # | Choice | Decided by default | It costs | The other answer |
-|---|---|---|---|---|
-| 1 | Where an `eventual` namespace is replicated (D5) | To every member | Every node holds the whole namespace; a write is sent to N−1 nodes | A replica set per key (`replication_factor`): less memory, but a rule on a node outside the set reads nothing unless reads go over the network on the publish path. Revisit before T3 |
-| 2 | `strong` mode (D5) | Phase 2, behind a design amendment; refused at load until then | No exact cluster-wide counter in phase 1: an `eventual` quota can over-admit by what was in flight | Build it now on the hand-off: every call a thread hand-over, and concurrent waits uncapped (ADR 0086's open question). Revisit at T9 |
-| 3 | EMQX's `proc_dict_*` (D13) | Provided, per connection task | One task (T11), up to 64 KiB per connection that a rule makes use it, two documented differences (a Will; events without a connection) | Keep refusing them: a rule that uses them stays unportable. Drop T11 |
-| 4 | Is state on without a switch (D1) | Yes: using it is the switch, under `rules.state_max_bytes` = 256 MiB | A listed rules writer (ADR 0084) can make a node hold up to that much | Off unless switched on, as `jq` is: then a ported EMQX rule that calls `kv_store_put` does not load until the operator acts. Revisit before T1 |
-| 5 | The names (D3) | `kv_*`, beside EMQX's `kv_store_*` | Two families one word apart with different tables (a warning when a file uses both); a clash if EMQX ever adds a `kv_get` | `state_*` for mqttd's. Revisit before T1; after it, a rename breaks rules |
+| # | Choice | Decided | Standing | It costs | The other answer |
+|---|---|---|---|---|---|
+| 1 | Where an `eventual` namespace is replicated (D5) | To every member | By default | Every node holds the whole namespace; a write is sent to N−1 nodes | A replica set per key (`replication_factor`): less memory, but a rule on a node outside the set reads nothing unless reads go over the network on the publish path. Revisit before T3 |
+| 2 | `strong` mode (D5) | Phase 2, behind a design amendment; refused at load until then | By default | No exact cluster-wide counter in phase 1: an `eventual` quota can over-admit by what was in flight | Build it now on the hand-off: every call a thread hand-over, and concurrent waits uncapped (ADR 0086's open question). Revisit at T9 |
+| 3 | EMQX's `proc_dict_*` (D13) | Provided, per connection task | By default; **delivered** (T11, #933) | One task (T11), up to 64 KiB per connection that a rule makes use it, the documented differences (a Will; events without a connection; `message_dropped` for a republished message or a Will) | Keep refusing them: a rule that uses them stays unportable. No longer cheap: rules may use them now |
+| 4 | Is state on without a switch (D1) | Yes: using it is the switch, under `rules.state_max_bytes` = 256 MiB; `0` turns it off | **Confirmed by the user, 2026-10-11** | A listed rules writer (ADR 0084) can make a node hold up to that much | Off unless switched on, as `jq` is: then a ported EMQX rule that calls `kv_store_put` does not load until the operator acts |
+| 5 | The names (D3) | `kv_*`, beside EMQX's `kv_store_*` | **Confirmed by the user, 2026-10-11** (asked, no rename requested) | Two families one word apart with different tables (a warning when a file uses both); a clash if EMQX ever adds a `kv_get` | `state_*` for mqttd's. T1 has shipped them: a rename now breaks rules |
+| 6 | ~~Where a key's last-write time lives in an `eventual` namespace (amendment, T12)~~ | ~~On each node, in memory, 8 bytes a key; not in the replicated form~~ | **Withdrawn: the user dropped the last-write time, 2026-10-11** ("drop the stale key idea completely. drop the extra bytes") | Nothing: no time is stored, on a node or on the wire | None is open: there is no last-write time to place |
+| 7 | Moving an expiry sooner on a key that is not `lww`, in an `eventual` namespace (amendment, T14) | Refused, and counted in a selection as `not_shortened`; the operator purges instead | By default | No way to make such a key expire early *with its expiry event* on every node | Delete and write back under a new delete stamp: the shorter expiry then replicates, and writes made on nodes that had not heard of it are lost (a counter loses increments). Revisit before T14 |
+| 8 | Clearing an expiry outside `kv_store` (amendment, T14) | Offered: the one admin act that leaves `max_ttl` | By default (the user approved "set, extend or clear … within `max_ttl`"; the two meet only here) | A key no rule could have made: it never expires and holds its room until a rule or an operator deletes it. The listing's "no expiry" filter finds them | Refuse `clear` wherever the namespace has a `max_ttl`, i.e. everywhere but `kv_store`, where no expiry may be set at all: then `clear` does nothing anywhere and is dropped. Revisit before T14 |
 
 ## Phasing
 
 1. **`local` and `eventual`, every type, EMQX's own functions, expiry events, bounds,
    metrics, the admin verbs and `--sequence` testing** (T1 to T8, T11). The stateful
    patterns ("above Y for X", change, counting windows, silence, distinct counts) all
-   work in this phase, and `kv_store_*` rules port from EMQX.
+   work in this phase, and `kv_store_*` rules port from EMQX. The operator's view of
+   the contents, the purge and the change of expiry (T12 to T15, amended 2026-10-11)
+   follow T6 and carry their own documentation, so they do not hold T8.
 2. **`strong`** (T9), after its design amendment (D5), with partition and failover tests
    in the style of the durable plane's own before it is called supported.
 3. **An optional snapshot to disk** for `local` and `eventual` namespaces (T10).
@@ -1009,3 +1029,208 @@ word, if that shows on the rig); storing values as they read back from the repli
 form; whether `kv_del` of a key the node has never seen leaves a tombstone (the merge
 needs one to cover a concurrent write elsewhere; the bounds may refuse it); the refusal
 count for clock skew.
+
+### 2026-10-11 — admin features and confirmed defaults
+
+Two things the user decided on 2026-10-11, after acceptance.
+
+**Confirmed defaults.** Of the five choices decided by default, the user confirmed two:
+**state is on without a switch** (using it is the opt-in, under `rules.state_max_bytes`
+= 256 MiB; `0` turns it off), and **the names stay `kv_*`** (asked, the user requested no
+rename). The other three stand as they were: `eventual` replicates to every member,
+`strong` is phase 2, and `proc_dict_*` are provided, which T11 has since delivered
+(#933). The [table](#decided-by-default-2026-10-11) carries each one's standing.
+
+**Admin features: decided.** The user asked for three things D10 does not give: to view
+the contents of the store, to expire stale entries by hand, and to change the expiry of
+stored keys. *(The same day the user dropped selecting keys by staleness and the
+last-write time it needed: see the amendment "no last-write time" below. The text here
+is edited to what is built; that amendment records what was taken out.)* D10 stays as written and T6 builds it (the namespaces, the keys by prefix,
+one key's value, one key's delete, the verbs, the metrics, `$SYS`). Four tasks add the
+rest: T12 (view), T13 (purge), T14 (change expiry), T15 (their verbs and documentation).
+What follows is decided unless it says "by default".
+
+**The six points the user settled**
+
+1. **A manual purge raises no `$events/state/expired`** unless the call asks for it
+   (`events=true`). An operator clearing out a namespace does not want every "silent for
+   10 minutes" rule to fire for keys that did not fall silent.
+2. ~~"Stale" means not written for a given time, judged by a last-write time kept per
+   key.~~ **Withdrawn by the user the same day:** no last-write time is kept and no
+   selector asks for one. Entries are expired by hand by prefix, by "already expired"
+   and by "expires within" (T13).
+3. **EMQX's `kv_store` table can be viewed and purged, and its keys cannot be given an
+   expiry.** What a rule sees of that table stays EMQX's: a key is there until a rule or
+   an operator deletes it.
+4. **The cluster:** in an `eventual` namespace a purge or a change of expiry replicates
+   as any write does; in a `local` namespace, and in `kv_store`, it acts on the node that
+   was asked (the CLI's `--all-nodes` asks each).
+5. **Roles:** a purge and a change of expiry need the operator role **and** a listed
+   rules writer, as D10's delete does. Viewing, a dry run included, needs the operator
+   role, as D10's listing does.
+6. **Bounds:** a call changes at most 100,000 keys and answers with a cursor to go on
+   from.
+
+**No last-write time per key.** The plan approved here first added one to every entry (8
+bytes a key on each node, not replicated) to answer "not written for". The user
+withdrew it; the store's entry and `ENTRY_OVERHEAD` (128 bytes) stay as T1 and T2 built
+them, nothing is added to a write call, and no answer carries a write time.
+
+**T12. View the contents.** `GET /admin/v1/rules/state/keys` (D10) answers, per key,
+`type` (D4's name), `bytes` (what the key is accounted as, D9) and `expires_at` (absent
+for none). `values=true` adds each value as D10's read of one key shows it; a page then
+ends at 1,000 keys or 1 MiB of values, whichever comes first, and always holds at least
+one key. Two filters, which combine with each other and with `prefix`:
+`expires_within=<duration>` ("expires before") and `no_expiry=true`; durations as the
+rules file writes them. Everything shown and selected is in the entry already. The
+reserved `kv_store` namespace is listed like any other (its keys are any value: they are
+shown as D10 shows them, and it is where `no_expiry` finds every key). Tombstones are
+not listed; they are in the namespace's counts. A filter costs a walk of the namespace
+in batches, a shard's lock for at most 64 keys at a time as the store removes expired
+keys today, on a blocking task, never on a connection's. Operator role; values are shown
+to operators only, as before.
+
+**T13. Expire entries manually.** `POST /admin/v1/rules/state/purge?ns=…` removes the
+keys of one namespace that a selection names: the listing's `prefix`,
+`expires_within` and `no_expiry`, and `expired=true` (keys past their expiry that the
+sweep has not removed yet), combined when more than one is given. A call that names none
+is refused. There is no selector for keys nothing has written for a time; a key written
+with a TTL that nothing refreshes expires by itself, and `expires_within` reaches it
+sooner.
+
+- **`dry_run=true`** changes nothing and answers the count (up to the cap) and a sample
+  of 20 keys as the listing shows them, without values.
+- **Bounded and off the publish path.** At most 100,000 keys a call, then a `cursor`;
+  one purge at a time per node (a second is refused as busy); it runs on a task of the
+  store's, taking a shard's lock for at most 64 keys at a time, so a rule's call waits
+  for one batch at the most.
+- **Audited** as `state.purge`: the subject, the namespace, the selection as given, the
+  count removed, whether events were asked for. A dry run is not a change and is not
+  audited.
+- **What a purge is in each mode.** In a `local` namespace and in `kv_store`, the keys
+  are removed on this node. In an `eventual` namespace each is a replicated delete, with
+  what D4 and the T2 amendment say of a delete: it leaves a tombstone, which counts
+  toward `max_keys` for the namespace's tombstone window (so a purge frees bytes at once
+  and key room an hour later, by default), and for every type but `lww` it also covers
+  writes made on nodes that had not heard of it yet.
+- **Events.** None by default (point 1): purging `expired=true` keys is also how an
+  operator drops a backlog of expiry events on purpose. With `events=true` each purged
+  key raises `$events/state/expired` as if it had expired at the purge: the key reads as
+  absent at once and its event is handed over by D7's sweep at D7's rate, late rather
+  than lost, on the node that ran the purge (the other members see a delete and raise
+  nothing). `kv_store` raises none (D7), so the flag is refused there. This half needs
+  T4.
+
+**T14. Change expiry on stored keys.** `POST /admin/v1/rules/state/expiry?ns=…` with
+`key=` for one key, or T13's selection for many, and one of `ttl=<duration>` (expires
+that long from now), `extend=<duration>` (that much later than it would have) or
+`clear=true` (never). `dry_run`, the cap, the cursor, the task and the roles are T13's;
+audited as `state.expire` with the selection, the change and the counts.
+
+- **Within `max_ttl`:** a `ttl` or an `extend` that would put the expiry further than
+  the namespace's `max_ttl` from now is refused for one key and skipped and counted
+  (`past_max_ttl`) in a selection. `clear` is the exception, and is the only way a key
+  outside `kv_store` comes to have no expiry *(decided by default, 8)*.
+- **`kv_store`:** refused (point 3).
+- **It lasts until the next write that names a TTL.** D3: a write with a TTL sets the
+  expiry. A key a rule refreshes on every message (the windows, `kv_held`, "silent
+  for X") has the operator's expiry until the next message.
+- **A key that then expires, expires as any key:** D7's sweep removes it and raises its
+  event. Where moving an expiry sooner is possible, that is how an operator ends keys
+  early *with* their events, without the purge's flag.
+
+What an `eventual` namespace can carry of it follows from how an expiry merges (D4, the
+T2 amendment: with its write for `lww`, as the later of the two for every other type,
+"never" being the latest):
+
+| | `local` (this node) | `eventual`, `lww` | `eventual`, any other type |
+|---|---|---|---|
+| Later (`extend`, a later `ttl`) | exact | replicates | replicates: the later expiry wins |
+| `clear` | exact | replicates | replicates: "never" is the latest |
+| Sooner (an earlier `ttl`) | exact | replicates | **does not replicate: refused** |
+
+- **`lww`:** the change is made as a write of the value the node holds, under a new
+  stamp, with the new expiry. It wins over every earlier write, so it replicates in
+  both directions. It is a write in every other respect too: it also wins over a write
+  another node made just before that this node had not received, whose value is then
+  lost as it would be to any `kv_set`.
+- **Every other type, sooner:** every other copy still has the later expiry, and the
+  merge takes the later, on the node that was asked as well, at the next repair. The
+  change would hold on one node until then and nowhere after. So it is **refused**
+  (`not_shortened`: an error for one key, skipped and counted in a selection) *(decided
+  by default, 7)*, and the answer names what does work: purge the keys (T13).
+- **Why not a delete at the new time.** It is not an expiry. A delete raises no
+  `$events/state/expired`, which is the point of ending a "silent for X" key; it cannot
+  be taken back by the rule's next refresh, where an expiry is moved by it; it would
+  cover writes made on nodes that had not heard of it; and something would have to hold
+  the pending delete, on one node, until its time.
+- **The other answer: delete and write back.** A node can stamp a delete and write its
+  copy of the content back after it with the shorter expiry: the state with the later
+  delete replaces the others' content, expiry included, so the shorter expiry does
+  replicate. The price is the T2 amendment's: that delete covers writes made on nodes
+  that had not heard of it, so a counter loses increments in flight, a set elements, and
+  `first` gets a new write time. It is exact only for a key nothing is writing. Not
+  built unless the user asks for it; if they do, it is a flag on T14's call, off by
+  default.
+
+**T15. CLI and documentation.** In ADR 0084 D7's style, beside D10's verbs:
+`state-keys <ns>` gains `--values`, `--expires-within` and `--no-expiry`; `mqttd --admin state-purge <ns>` and `mqttd --admin state-expire <ns>
+[<key>]` (named as Redis names `EXPIRE`: it sets when a key expires, it does not expire
+it now) take the selection and `--dry-run`, and for a selection past the cap go on from
+the cursor only with `--all`. Control characters are printed escaped, as everywhere.
+ADMIN-API.md documents the endpoints; RULES.md gains a section on operating the store
+(what each selector means, what a purge does and does not raise, the table above);
+THREAT-MODEL.md's row for a rules writer's reach gains the purge. **T8 is not changed
+and does not wait for these:** it closes phase 1's documentation, and T15 carries the
+documentation of T12 to T14, so the feature's tracker (#880) closes with T8 as planned.
+
+**Order.** T12 follows T6 (the listing, its cursor, the roles). T13 and T14 follow T12
+(the selection); their halves for `eventual` namespaces follow
+T3, and the purge's `events=true` follows T4. T15 follows T13 and T14.
+
+### 2026-10-11 — no last-write time: selecting stale keys is dropped
+
+The amendment above planned a last-write time per key, so that the listing, the purge and
+the change of expiry could select keys "not written for" a given time. The user, the same
+day, before any of T12 to T15 was built:
+
+> ok, drop the stale key idea completely. drop the extra bytes
+
+So it is withdrawn, and the amendment above and the plan are edited to match. Nothing had
+been built on it.
+
+**Taken out**
+
+- **The last-write time itself.** No field is added to an entry, in any namespace: no 8
+  bytes a key, no store on a write call, nothing set when a merge changes a key, and an
+  operator's change of expiry counts as nothing beyond the change. `ENTRY_OVERHEAD` stays
+  128 bytes and T12 no longer measures it.
+- **`written_at`** in the listing, and **`written_known_since`** in every answer.
+- **The selector** `not_written_for` ("not written since") in the listing (T12), the
+  purge (T13) and the change of expiry (T14), and `--not-written-for` in the CLI (T15).
+- **Decision 6** of the [table](#decided-by-default-2026-10-11) (the time is each node's
+  own and is not replicated). Its two consequences go with it: that a node refilled after
+  a restart knows no write time before its refill, and that a write on another node which
+  changed neither value nor expiry is not seen.
+- **Point 2** of the six the user settled ("stale" means not written for a given time).
+
+**What stays**
+
+- **T12:** per key `type`, `bytes` and `expires_at`, values with `values=true`; the
+  filters `prefix`, `expires_within` and `no_expiry`; `kv_store` listed like any other.
+  All of it is in the entry today, so T12 changes nothing on the publish path.
+- **T13:** a purge by `prefix`, `expires_within`, `no_expiry` and `expired=true`,
+  combined when more than one is given; the dry run, the cap and cursor, the audit
+  record, the roles, `events=true`, what a purge is in each mode.
+- **T14:** unchanged but for its selection, which is T13's. Decisions 7 and 8 stand by
+  default as they were.
+- **T15:** the verbs without `--not-written-for`; RULES.md says what each selector means.
+
+**"Expire stale entries by hand", as it is now served.** The user's request stands; what
+goes is one way of naming the entries. An operator removes the keys of devices that are
+gone, or of a rule's earlier key scheme, by `prefix`; drops keys that have expired and
+not been swept yet by `expired=true`; and removes keys about to expire by
+`expires_within`. A key a rule writes with a TTL and then stops writing expires by
+itself, which is the store's own answer to staleness. What cannot be asked any more is
+"the keys nothing has written for a month" among keys that never expire (`kv_store`, or
+a key whose expiry was cleared): those are found by `no_expiry` and chosen by prefix.

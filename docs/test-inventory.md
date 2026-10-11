@@ -899,7 +899,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::sink_records_through_a_trait_object`
 - `tests::tampering_with_any_field_changes_the_head`
 
-## `crates/mqtt-rules/src/lib.rs` — 268 test(s)
+## `crates/mqtt-rules/src/lib.rs` — 272 test(s)
 
 - `crdt::tests::a_causally_later_lww_write_is_never_lost_whatever_the_wall_clocks_say`
 - `crdt::tests::a_counter_is_the_sum_of_every_nodes_increments_and_decrements`
@@ -1072,11 +1072,15 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests_conditions::a_bare_value_as_a_condition_passes_only_when_it_is_true`
 - `tests_conditions::a_case_when_takes_any_expression_and_goes_on_unless_it_is_true`
 - `tests_conditions::a_case_with_an_operand_takes_a_logical_when_as_a_boolean`
+- `tests_conditions::a_field_spelt_like_a_boolean_is_warned_about_once_and_no_other_name_is`
 - `tests_conditions::a_function_that_does_not_return_a_boolean_reads_as_not_true`
 - `tests_conditions::an_incase_reads_its_condition_as_a_where_does`
+- `tests_conditions::lower_case_booleans_and_if_are_names_where_emqx_takes_no_name`
 - `tests_conditions::not_in_and_not_over_and_or_not_are_evaluated`
 - `tests_conditions::the_portable_forms_give_the_same_in_both_engines`
-- `tests_conditions::true_and_false_are_booleans_in_any_case`
+- `tests_conditions::true_and_false_as_an_alias_a_path_or_a_quoted_name_draw_no_warning`
+- `tests_conditions::true_and_false_in_capitals_are_field_names_as_in_emqx`
+- `tests_conditions::true_and_false_in_capitals_are_fields_wherever_a_value_is_read`
 - `tests_emqx_examples::array_functions_match_emqx_examples`
 - `tests_emqx_examples::bit_functions_match_emqx_examples`
 - `tests_emqx_examples::bit_sequence_functions_match_emqx_examples`

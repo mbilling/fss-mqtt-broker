@@ -1059,3 +1059,11 @@ runners showed and a laptop does not). That bound is the mechanism's, not a tole
 T4"; T4 documents the behaviour as it is, as an accepted risk in THREAT-MODEL.md with
 the operator's mitigations, and as H-7.14 in HARDENING.md. Deciding it (a bound on
 instances in a call, with queueing or a failed rule past it) remains open.
+
+### 2026-10-11 — `rules.functions_env` confirmed
+
+T3 added `rules.functions_env` (`MQTTD_RULES_FUNCTIONS_ENV`), the ceiling in the
+broker's configuration on the environment variables any module may be shown, without
+having been asked for it: D8 and D9 had left open who lists them (the T3 amendment
+above). The user confirmed it on 2026-10-11. It stays as built: read at startup, a
+module's `env` may name only variables it lists, and a rules file cannot widen it.

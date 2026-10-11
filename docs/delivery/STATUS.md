@@ -92,7 +92,7 @@
 | [0082](../adr/0082-bounded-hub-ingress.md) | # 0082. Bounded hub ingress: a control lane that never waits behind data, and byte credits that push back on publishers | Accepted | [6/6 done](0082-bounded-hub-ingress.md) | — |
 | [0083](../adr/0083-rule-engine.md) | A rule engine on the publish path: EMQX rule SQL, evaluated once per message where it lands | Accepted | [17/17 done](0083-rule-engine.md) | — |
 | [0084](../adr/0084-watching-and-editing-rules-live.md) | Watching and editing rules live | Accepted | [10/10 done](0084-watching-and-editing-rules-live.md) | — |
-| [0085](../adr/0085-rule-state-store.md) | State for rules: a keyed, replicated store read and written from SQL | Accepted | [2/11 done](0085-rule-state-store.md) | 9 open |
+| [0085](../adr/0085-rule-state-store.md) | State for rules: a keyed, replicated store read and written from SQL | Accepted | [3/15 done](0085-rule-state-store.md) | 12 open |
 | [0086](../adr/0086-wasm-rule-functions.md) | Rule functions in a WebAssembly sandbox: the real jq first, operator plugins on the same mechanism | Accepted | [4/4 done](0086-wasm-rule-functions.md) | — |
 
 ## Open and deferred work
@@ -220,7 +220,6 @@
 
 **0085 — State for rules: a keyed, replicated store read and written from SQL**
 
-- `0085-T2` 🚧 in-progress ([#918](https://github.com/mbilling/fss-mqtt-broker/issues/918)): "Typed merges as CRDTs (lww, first, max, min, sum, union, hll, deletes) on a per-node hybrid logical clock, and the replicated form of a key"
 - `0085-T3` ⬜ planned ([#919](https://github.com/mbilling/fss-mqtt-broker/issues/919)): "eventual mode: every member holds the namespace; changed keys sent per peer link at peer protocol 14, applied off the hub, repaired by anti-entropy after partitions and restarts"
 - `0085-T4` ⬜ planned ([#920](https://github.com/mbilling/fss-mqtt-broker/issues/920)): "Expiry and $events/state/expired: selected by its own name only, raised by one member, rate-bounded and late rather than lost, at least once around membership changes"
 - `0085-T5` ⬜ planned ([#921](https://github.com/mbilling/fss-mqtt-broker/issues/921)): "kv_incr idempotency keys, remembered as entries of the namespace for its dedupe window"
@@ -229,3 +228,7 @@
 - `0085-T8` ⬜ planned ([#924](https://github.com/mbilling/fss-mqtt-broker/issues/924)): "Documentation: RULES.md (functions, types, modes, when a state call runs, the worked sequences, the billing example), the departures from EMQX, threat model and hardening rows, the converter"
 - `0085-T9` ⬜ planned ([#925](https://github.com/mbilling/fss-mqtt-broker/issues/925)): "strong mode (phase 2): first the design amendment that settles how an evaluation waits, then the durable plane, with partition and failover tests"
 - `0085-T10` ⬜ planned ([#926](https://github.com/mbilling/fss-mqtt-broker/issues/926)): "An optional snapshot to disk for local and eventual namespaces (phase 3)"
+- `0085-T12` ⬜ planned ([#940](https://github.com/mbilling/fss-mqtt-broker/issues/940)): "View the contents of the store: each key's type, size and expiry in the listing, optionally values, filters by expiry (expires within, no expiry), kv_store included"
+- `0085-T13` ⬜ planned ([#941](https://github.com/mbilling/fss-mqtt-broker/issues/941)): "Expire entries manually: a bulk purge of one namespace by prefix, by expiry (expires within, no expiry), or already expired; dry run, batches off the publish path, 100,000 keys a call with a cursor, audited; no expiry event unless asked"
+- `0085-T14` ⬜ planned ([#942](https://github.com/mbilling/fss-mqtt-broker/issues/942)): "Change expiry on stored keys: set, extend or clear the expiry of one key or a selection, within max_ttl; dry run, audited; a sooner expiry refused where it would not replicate"
+- `0085-T15` ⬜ planned ([#943](https://github.com/mbilling/fss-mqtt-broker/issues/943)): "CLI and documentation for viewing, purging and changing expiry: state-keys filters, mqttd --admin state-purge and state-expire; ADMIN-API.md, RULES.md, the threat model row"
