@@ -92,7 +92,7 @@
 | [0082](../adr/0082-bounded-hub-ingress.md) | # 0082. Bounded hub ingress: a control lane that never waits behind data, and byte credits that push back on publishers | Accepted | [6/6 done](0082-bounded-hub-ingress.md) | — |
 | [0083](../adr/0083-rule-engine.md) | A rule engine on the publish path: EMQX rule SQL, evaluated once per message where it lands | Accepted | [17/17 done](0083-rule-engine.md) | — |
 | [0084](../adr/0084-watching-and-editing-rules-live.md) | Watching and editing rules live | Accepted | [10/10 done](0084-watching-and-editing-rules-live.md) | — |
-| [0085](../adr/0085-rule-state-store.md) | State for rules: a keyed, replicated store read and written from SQL | Accepted | [1/11 done](0085-rule-state-store.md) | 10 open |
+| [0085](../adr/0085-rule-state-store.md) | State for rules: a keyed, replicated store read and written from SQL | Accepted | [2/11 done](0085-rule-state-store.md) | 9 open |
 | [0086](../adr/0086-wasm-rule-functions.md) | Rule functions in a WebAssembly sandbox: the real jq first, operator plugins on the same mechanism | Accepted | [4/4 done](0086-wasm-rule-functions.md) | — |
 
 ## Open and deferred work
@@ -229,4 +229,3 @@
 - `0085-T8` ⬜ planned ([#924](https://github.com/mbilling/fss-mqtt-broker/issues/924)): "Documentation: RULES.md (functions, types, modes, when a state call runs, the worked sequences, the billing example), the departures from EMQX, threat model and hardening rows, the converter"
 - `0085-T9` ⬜ planned ([#925](https://github.com/mbilling/fss-mqtt-broker/issues/925)): "strong mode (phase 2): first the design amendment that settles how an evaluation waits, then the durable plane, with partition and failover tests"
 - `0085-T10` ⬜ planned ([#926](https://github.com/mbilling/fss-mqtt-broker/issues/926)): "An optional snapshot to disk for local and eventual namespaces (phase 3)"
-- `0085-T11` 🚧 in-progress ([#927](https://github.com/mbilling/fss-mqtt-broker/issues/927)): "EMQX's proc_dict_* as a dictionary per evaluating task, with EMQX's return values, bounded per connection"
